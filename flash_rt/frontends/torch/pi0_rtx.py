@@ -930,6 +930,9 @@ def _embed_prompt(prompt_text,
             device="cuda")
         prompt_len = int(token_ids.numel())
     else:
+        # PaliGemma tokenizer resolution — see
+        # `flash_rt.utils.paligemma_tokenizer` for the search order
+        # and the download instructions emitted on failure.
         try:
             from openpi.models.tokenizer import PaligemmaTokenizer
             tokenizer = PaligemmaTokenizer(max_len=max_len)
@@ -937,16 +940,11 @@ def _embed_prompt(prompt_text,
             prompt_len = int(mask_np.sum())
             token_ids = torch.tensor(
                 tokens_np[:prompt_len], dtype=torch.long, device="cuda")
-        except ImportError:
-            import sentencepiece as spm
-            sp = spm.SentencePieceProcessor()
-            for sp_path in [
-                "/workspace/paligemma_tokenizer.model",
-                "/root/.cache/openpi/big_vision/paligemma_tokenizer.model",
-            ]:
-                if os.path.exists(sp_path):
-                    sp.Load(sp_path)
-                    break
+        except (ImportError, FileNotFoundError, OSError, RuntimeError):
+            from flash_rt.utils.paligemma_tokenizer import (
+                load_paligemma_sentencepiece,
+            )
+            sp = load_paligemma_sentencepiece()
             tokens = [sp.bos_id()] + sp.Encode(prompt_text) + [108]
             token_ids = torch.tensor(tokens, dtype=torch.long, device="cuda")
             prompt_len = len(token_ids)

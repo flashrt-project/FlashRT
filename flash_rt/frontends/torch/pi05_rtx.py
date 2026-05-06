@@ -295,22 +295,28 @@ def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict
 def _embed_prompt(prompt_text: str, embedding_weight: torch.Tensor,
                   max_len: int = 48) -> tuple[torch.Tensor, int]:
     """Tokenise + embed via PaliGemma embedding table (CUDA, bf16)."""
+    # PaliGemma tokenizer resolution — see
+    # `flash_rt.utils.paligemma_tokenizer` for the search order and
+    # the download instructions emitted on failure.
     try:
+        # Preferred: openpi's PaligemmaTokenizer (exact same vocab,
+        # same prompt prefix logic FlashRT was built against).
         from openpi.models.tokenizer import PaligemmaTokenizer
         tokenizer = PaligemmaTokenizer(max_len=max_len)
         tokens_np, mask_np = tokenizer.tokenize(prompt_text)
         prompt_len = int(mask_np.sum())
-        token_ids = torch.tensor(tokens_np[:prompt_len], dtype=torch.long, device="cuda")
-    except ImportError:
-        import sentencepiece as spm
-        sp = spm.SentencePieceProcessor()
-        for sp_path in [
-            "/workspace/paligemma_tokenizer.model",
-            "/root/.cache/openpi/big_vision/paligemma_tokenizer.model",
-        ]:
-            if os.path.exists(sp_path):
-                sp.Load(sp_path)
-                break
+        token_ids = torch.tensor(
+            tokens_np[:prompt_len], dtype=torch.long, device="cuda")
+    except (ImportError, FileNotFoundError, OSError, RuntimeError):
+        # Fallback: locate the SentencePiece model directly via the
+        # FlashRT helper (clear error if not found — never silent
+        # segfault).
+        from flash_rt.utils.paligemma_tokenizer import (
+            load_paligemma_sentencepiece,
+        )
+        sp = load_paligemma_sentencepiece()
+        # 108 is PaliGemma's `\n` token, used by openpi as the
+        # prompt-end separator before the action prefix.
         tokens = [sp.bos_id()] + sp.Encode(prompt_text) + [108]
         token_ids = torch.tensor(tokens, dtype=torch.long, device="cuda")
         prompt_len = len(token_ids)

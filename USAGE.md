@@ -38,6 +38,76 @@ After installation, `import flash_rt` works from any directory.
 
 ---
 
+## Pi0 / Pi0.5 prerequisite — PaliGemma tokenizer
+
+> **TL;DR — required one-time download for Pi0 / Pi0.5 only.**
+> Qwen3-8B and other text-only models do NOT need this.
+
+Pi0 and Pi0.5 prefix prompts via the **PaliGemma SentencePiece
+tokenizer** (`paligemma_tokenizer.model`, ~4.1 MiB). This file is
+**not bundled inside the openpi pi0 / pi05 checkpoints** — it lives
+in Google's public big_vision storage bucket, and you have to
+fetch it once before running any Pi0 / Pi0.5 inference.
+
+### One-shot download (recommended)
+
+```bash
+bash scripts/download_paligemma_tokenizer.sh
+# → ~/.cache/flash_rt/paligemma_tokenizer.model
+```
+
+The script downloads from the public GCS HTTP endpoint
+(`https://storage.googleapis.com/big_vision/paligemma_tokenizer.model`),
+verifies the MD5, and is idempotent (re-runs are no-ops if the file
+is already valid).
+
+### Custom location
+
+```bash
+# Set this env var to point at any local copy:
+export FLASH_RT_PALIGEMMA_TOKENIZER=/data/checkpoints/paligemma_tokenizer.model
+```
+
+The frontend's resolution order is:
+
+1. `$FLASH_RT_PALIGEMMA_TOKENIZER` (explicit override)
+2. `~/.cache/flash_rt/paligemma_tokenizer.model`
+3. `~/.cache/openpi/big_vision/paligemma_tokenizer.model`
+   (compatible with `openpi.shared.download.maybe_download`)
+4. `/workspace/paligemma_tokenizer.model` (legacy container path)
+5. openpi auto-download via `gs://big_vision/...`
+   (only if `gcsfs` is installed)
+
+If none resolves, the loader raises a `FileNotFoundError` whose
+message contains the exact `curl` command above — no silent
+failure modes, no segfaults.
+
+### Q&A
+
+**Q: I downloaded the openpi Pi0 / Pi0.5 checkpoint. Don't I already have this?**
+A: No. openpi ships only `model.safetensors` + `assets/` + configs;
+the tokenizer is a separate fetch by design (one tokenizer file,
+many checkpoints).
+
+**Q: Can I use the HuggingFace `google/paligemma-3b-pt-224` mirror instead?**
+A: That repo contains the same `tokenizer.model` file, but PaliGemma
+is a gated HF model (you must accept the license + supply an HF
+token). The GCS public bucket is auth-free and a one-line `curl` —
+strictly easier for fresh setups. The frontend accepts a tokenizer
+loaded from either source as long as you point
+`$FLASH_RT_PALIGEMMA_TOKENIZER` at it.
+
+**Q: I'm getting `FileNotFoundError: paligemma_tokenizer.model not found`.**
+A: Run the download script above (or `curl` directly into one of
+the search paths). The error message is itself the fix — it spells
+out the exact command.
+
+**Q: Old setups had `/workspace/paligemma_tokenizer.model` —
+do I need to migrate?**
+A: No. The legacy path is still in the search list.
+
+---
+
 ## Quick Start
 
 ```python
