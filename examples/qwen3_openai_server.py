@@ -132,7 +132,9 @@ class StreamParser:
         # OAI tool_call indexer.
         self._tool_call_idx = 0
 
-    def feed(self, new_token_ids: List[int]) -> Tuple[str, List[dict], bool]:
+    def feed(
+        self, new_token_ids: List[int], *, final: bool = False,
+    ) -> Tuple[str, List[dict], bool]:
         """Decode the running token list and return (delta_text,
         new_tool_calls, stop_hit).
 
@@ -140,6 +142,14 @@ class StreamParser:
         new_tool_calls: list of {index, id, type, function: {name, arguments}}
             objects newly closed in this feed.
         stop_hit: True iff any stop string was found.
+
+        Args:
+          new_token_ids: tokens to append to the running stream (may be empty
+            on the final flush).
+          final: True iff no more tokens will arrive (EOS / max_tokens / stop
+            string already hit upstream). When set, the entire buffer is
+            flushed — no partial-tag hold-back, no max-stop-string-len
+            hold-back.
         """
         # Append decoded fragment.
         if new_token_ids:
@@ -152,6 +162,35 @@ class StreamParser:
         delta_text = ''
         new_tool_calls: List[dict] = []
         stop_hit = False
+
+        # Stop-string detection — scan the FULL buffer (not just the
+        # flushable head) for any user-supplied stop. If a stop is in
+        # the buffer, truncate the buffer there and mark stop_hit. The
+        # stop string itself is dropped from the output (OpenAI semantics).
+        if self._stop_strings and not self._in_tool:
+            best_idx = -1
+            for ss in self._stop_strings:
+                idx = self._buffer.find(ss)
+                if idx >= 0 and (best_idx < 0 or idx < best_idx):
+                    best_idx = idx
+            if best_idx >= 0:
+                self._buffer = self._buffer[:best_idx]
+                stop_hit = True
+
+        # The buffer may need a tail hold for two reasons:
+        #   (a) the tail of `_buffer` could be a partial `<tool_call>`
+        #       opening tag whose final chars haven't streamed yet;
+        #   (b) the tail could complete a stop string on the next feed.
+        # Hold-back size = max(len(open_tag), max(stop_string_lens)) - 1.
+        # On `final=True` (or once stop_hit fired) the hold-back is 0.
+        max_stop_len = (
+            max((len(s) for s in self._stop_strings), default=0)
+            if self._stop_strings else 0
+        )
+        hold = (
+            0 if (final or stop_hit)
+            else max(len(_TOOL_CALL_OPEN), max_stop_len) - 1
+        )
 
         while True:
             if self._in_tool:
@@ -173,9 +212,8 @@ class StreamParser:
 
             open_idx = self._buffer.find(_TOOL_CALL_OPEN)
             if open_idx < 0:
-                # No open tag in buffer — flush all but a tail that might
-                # be a partial tag (last len(open_tag)-1 chars).
-                safe = max(0, len(self._buffer) - (len(_TOOL_CALL_OPEN) - 1))
+                # No open tag in buffer — flush all but the hold-back tail.
+                safe = max(0, len(self._buffer) - hold)
                 if safe > 0:
                     delta_text += self._buffer[:safe]
                     self._buffer = self._buffer[safe:]
@@ -185,16 +223,6 @@ class StreamParser:
             self._buffer = self._buffer[open_idx + len(_TOOL_CALL_OPEN):]
             self._in_tool = True
             # loop continues into in_tool branch
-
-        # Stop-string check on the accumulated delta_text.
-        # (Stops are matched on cleaned content only; tool-call internals
-        # are not subject to user-supplied stop strings.)
-        if delta_text and self._stop_strings:
-            for ss in self._stop_strings:
-                if ss in delta_text:
-                    stop_hit = True
-                    delta_text = delta_text.split(ss)[0]
-                    break
 
         return delta_text, new_tool_calls, stop_hit
 
@@ -303,9 +331,20 @@ class Qwen3Engine:
 
     def _render(self, messages: List[Dict[str, Any]],
                   tools: Optional[List[Dict[str, Any]]]):
-        """Apply the chat template (with optional tools) to messages."""
+        """Apply the chat template (with optional tools) to messages.
+
+        OpenAI lets `assistant.content` be `null` when `tool_calls` is
+        set, but the Qwen3 chat template iterates `content` directly
+        and crashes on `None`. Normalize by mapping `None` → '' before
+        rendering — semantically equivalent (no text content).
+        """
+        normalized = []
+        for m in messages:
+            if m.get('content') is None:
+                m = {**m, 'content': ''}
+            normalized.append(m)
         return self.fe._tokenizer.apply_chat_template(
-            messages,
+            normalized,
             tools=tools or None,
             add_generation_prompt=True,
             tokenize=False,
@@ -378,7 +417,7 @@ class Qwen3Engine:
 
                 # EOS check (engine-side, before emitting).
                 if eos is not None and tok == eos:
-                    delta, tcs, _ = parser.feed([])
+                    delta, tcs, _ = parser.feed([], final=True)
                     if delta:
                         yield ('content', delta)
                     if tcs:
@@ -414,7 +453,7 @@ class Qwen3Engine:
             else:
                 # Loop exhausted max_tokens.
                 # Final flush of any buffered text.
-                delta, tcs, _ = parser.feed([])
+                delta, tcs, _ = parser.feed([], final=True)
                 if delta:
                     yield ('content', delta)
                 if tcs:
