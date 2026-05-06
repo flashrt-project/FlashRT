@@ -350,6 +350,16 @@ if(ENABLE_FA2)
   # against any subset of the matrix.
   list(APPEND FA2_SRCS csrc/attention/fa2_wrapper.cu)
 
+  # P1-a (Qwen3-8B prefill): causal FA2 forward — built only for
+  # hdim=128 + bf16 to keep the public .so size in check.
+  if("128" IN_LIST FA2_HDIMS AND "bf16" IN_LIST FA2_DTYPES)
+    list(APPEND FA2_SRCS
+      csrc/attention/fa2_causal_inst/flash_fwd_hdim128_bf16_sm80_causal.cu
+      csrc/attention/fa2_causal_inst/flash_fwd_split_hdim128_bf16_sm80_causal.cu
+      csrc/attention/fa2_wrapper_causal.cu
+    )
+  endif()
+
   add_library(fa2_vendor_obj OBJECT ${FA2_SRCS})
   set_target_properties(fa2_vendor_obj PROPERTIES
     CUDA_STANDARD 17
@@ -503,6 +513,10 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/gated_deltanet_qwen36.cu
   csrc/kernels/rms_norm_gated_silu_qwen36.cu
   csrc/kernels/silu_mul_qwen36.cu
+  csrc/kernels/silu_mul_to_nvfp4_swizzled.cu
+  csrc/kernels/qwen3_qkv_post_proc.cu
+  csrc/kernels/fp4_w4a4_matvec_sm120.cu
+  csrc/kernels/fp4_w4a4_mma_sm120.cu
   csrc/kernels/bf16_matvec_qwen36.cu
   csrc/kernels/bf16_matmul_qwen36.cu
   csrc/attention/fmha_dispatch.cu

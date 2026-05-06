@@ -23,6 +23,10 @@
 #include "kernels/silu_mul_qwen36.cuh"
 #include "kernels/bf16_matvec_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36.cuh"
+#include "kernels/silu_mul_to_nvfp4_swizzled.cuh"
+#include "kernels/qwen3_qkv_post_proc.cuh"
+#include "kernels/fp4_w4a4_matvec_sm120.cuh"
+#include "kernels/fp4_w4a4_mma_sm120.cuh"
 #include "quantize/fp8_block128_dequant.cuh"
 #include "quantize/fp8_block128_to_nvfp4_swizzled.cuh"
 #include "quantize/bf16_weight_to_nvfp4_swizzled.cuh"
@@ -2095,6 +2099,131 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     m.def("nvfp4_sf_swizzled_bytes",
         &flash_rt::fp4::nvfp4_sf_swizzled_bytes,
         py::arg("rows"), py::arg("D"));
+
+    // ── Qwen3-8B NVFP4 W4A4 M=1 matvec / MMA (decode hot path) ──
+    // Custom SM120 kernels specialized for M=1 LLM decode where
+    // CUTLASS NVFP4 GEMM tiles assume M ≥ 16 and run at ~30 % of HBM
+    // BW. The matvec is the R2 SIMT fallback / oracle; the MMA path
+    // (full_n) is the production decode kernel after P2-S6 wire.
+    m.def("fp4_w4a4_matvec_sm120_bf16out",
+        [](uintptr_t A_packed, uintptr_t B_packed, uintptr_t D,
+           int N, int K,
+           uintptr_t SFA, uintptr_t SFB,
+           float alpha,
+           uintptr_t stream) -> int {
+            return flash_rt::gemm::fp4_w4a4_matvec_sm120_bf16out(
+                to_ptr(A_packed), to_ptr(B_packed), to_ptr(D),
+                N, K, to_ptr(SFA), to_ptr(SFB),
+                alpha, to_stream(stream));
+        },
+        py::arg("A_packed"), py::arg("B_packed"), py::arg("D"),
+        py::arg("N"), py::arg("K"),
+        py::arg("SFA"), py::arg("SFB"),
+        py::arg("alpha") = 1.0f,
+        py::arg("stream") = 0);
+
+    m.def("fp4_w4a4_matvec_sm120_init",
+        []() { flash_rt::gemm::fp4_w4a4_matvec_init_luts(); },
+        "Idempotent UE4M3 LUT initialization for the matvec kernel.");
+
+    m.def("fp4_w4a4_mma_sm120_single_tile_bf16out",
+        [](uintptr_t A_packed, uintptr_t B_packed, uintptr_t D,
+           uintptr_t SFA, uintptr_t SFB,
+           float alpha,
+           uintptr_t stream) -> int {
+            return flash_rt::gemm::fp4_w4a4_mma_sm120_single_tile_bf16out(
+                to_ptr(A_packed), to_ptr(B_packed), to_ptr(D),
+                to_ptr(SFA), to_ptr(SFB),
+                alpha, to_stream(stream));
+        },
+        py::arg("A_packed"), py::arg("B_packed"), py::arg("D"),
+        py::arg("SFA"), py::arg("SFB"),
+        py::arg("alpha") = 1.0f,
+        py::arg("stream") = 0);
+
+    m.def("fp4_w4a4_mma_sm120_multi_k_bf16out",
+        [](uintptr_t A_packed, uintptr_t B_packed, uintptr_t D,
+           uintptr_t SFA, uintptr_t SFB,
+           float alpha, int K,
+           uintptr_t stream) -> int {
+            return flash_rt::gemm::fp4_w4a4_mma_sm120_multi_k_bf16out(
+                to_ptr(A_packed), to_ptr(B_packed), to_ptr(D),
+                to_ptr(SFA), to_ptr(SFB),
+                alpha, K, to_stream(stream));
+        },
+        py::arg("A_packed"), py::arg("B_packed"), py::arg("D"),
+        py::arg("SFA"), py::arg("SFB"),
+        py::arg("alpha") = 1.0f, py::arg("K"),
+        py::arg("stream") = 0);
+
+    m.def("fp4_w4a4_mma_sm120_full_n_bf16out",
+        [](uintptr_t A_packed, uintptr_t B_packed, uintptr_t D,
+           int N, int K,
+           uintptr_t SFA, uintptr_t SFB,
+           float alpha,
+           uintptr_t stream) -> int {
+            return flash_rt::gemm::fp4_w4a4_mma_sm120_full_n_bf16out(
+                to_ptr(A_packed), to_ptr(B_packed), to_ptr(D),
+                N, K, to_ptr(SFA), to_ptr(SFB),
+                alpha, to_stream(stream));
+        },
+        py::arg("A_packed"), py::arg("B_packed"), py::arg("D"),
+        py::arg("N"), py::arg("K"),
+        py::arg("SFA"), py::arg("SFB"),
+        py::arg("alpha") = 1.0f,
+        py::arg("stream") = 0);
+
+    // ── P3A-S2 (F1-lite): fused qkv post-processing for Qwen3-8B ──
+    // Replaces (q_norm + RoPE + Q_buf copy) with one launch and
+    // (k_norm + RoPE + K_cache write + V_cache write) with another.
+    // head_dim hardcoded at 128; S=1 decode hot path only.
+    m.def("qwen3_q_norm_rope_qstage_bf16",
+        [](uintptr_t q_pre, uintptr_t q_norm_w,
+           uintptr_t cos, uintptr_t sin,
+           uintptr_t q_buf_dst,
+           int n_q_heads, float eps, uintptr_t stream) -> int {
+            return flash_rt::kernels::qwen3_q_norm_rope_qstage_bf16(
+                to_ptr(q_pre), to_ptr(q_norm_w),
+                to_ptr(cos), to_ptr(sin),
+                to_ptr(q_buf_dst),
+                n_q_heads, eps, to_stream(stream));
+        },
+        py::arg("q_pre"), py::arg("q_norm_w"),
+        py::arg("cos"), py::arg("sin"),
+        py::arg("q_buf_dst"),
+        py::arg("n_q_heads"), py::arg("eps") = 1e-6f,
+        py::arg("stream") = 0);
+
+    m.def("qwen3_k_norm_rope_kvwrite_bf16",
+        [](uintptr_t k_pre, uintptr_t v_pre, uintptr_t k_norm_w,
+           uintptr_t cos, uintptr_t sin,
+           uintptr_t k_cache_dst, uintptr_t v_cache_dst,
+           int n_kv_heads, float eps, uintptr_t stream) -> int {
+            return flash_rt::kernels::qwen3_k_norm_rope_kvwrite_bf16(
+                to_ptr(k_pre), to_ptr(v_pre), to_ptr(k_norm_w),
+                to_ptr(cos), to_ptr(sin),
+                to_ptr(k_cache_dst), to_ptr(v_cache_dst),
+                n_kv_heads, eps, to_stream(stream));
+        },
+        py::arg("k_pre"), py::arg("v_pre"), py::arg("k_norm_w"),
+        py::arg("cos"), py::arg("sin"),
+        py::arg("k_cache_dst"), py::arg("v_cache_dst"),
+        py::arg("n_kv_heads"), py::arg("eps") = 1e-6f,
+        py::arg("stream") = 0);
+
+    // ── P3A-S3 (F3): silu_mul + nvfp4 swizzled quantize fused ──
+    m.def("silu_mul_to_nvfp4_swizzled_bf16",
+        [](uintptr_t gate, uintptr_t up,
+           uintptr_t packed, uintptr_t sf_swz,
+           int rows, int cols, uintptr_t stream) -> int {
+            return flash_rt::kernels::silu_mul_to_nvfp4_swizzled_bf16(
+                to_ptr(gate), to_ptr(up),
+                to_ptr(packed), to_ptr(sf_swz),
+                rows, cols, to_stream(stream));
+        },
+        py::arg("gate"), py::arg("up"),
+        py::arg("packed"), py::arg("sf_swz"),
+        py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
 
 #endif
 }
