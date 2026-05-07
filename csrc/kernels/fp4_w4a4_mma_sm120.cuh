@@ -1,21 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// P2: tensor-core NVFP4 W4A4 M=1 GEMM for sm_120 (RTX 5090).
+// Tensor-core NVFP4 W4A4 M=1 GEMM for sm_120 (RTX 5090).
 //
 // Based on `mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.
 // m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3` (CUTLASS atom
 // `SM120::BLOCKSCALED::SM120_16x8x64_TN_VS<e2m1, e2m1, float, ue4m3,
 // VS=16>` at cute/arch/mma_sm120.hpp:3187). Hardware does FP4 dequant
-// inside the MMA fragment with zero software cost — exactly the lever
-// the R2 SIMT kernel could not use.
+// inside the MMA fragment with zero software cost — the lever a SIMT
+// kernel cannot use.
 //
-// P2-S1 scope: single (M=16 padded from M=1, N=8, K=64) tile, no K
-// accumulation. Gates: cos = 1.000 vs CUTLASS reference at iso shape.
-// Subsequent P2-Sx steps add K accumulation, N-tile parallelism,
-// cp.async pipelining, and per-shape variant tuning.
-//
-// Add-only: this header sits alongside fp4_w4a4_matvec_sm120.cuh
-// (the R2 SIMT version, kept as an oracle / fallback).
+// Sits alongside fp4_w4a4_matvec_sm120.cuh, the SIMT fallback /
+// oracle. Three entry points below, ordered from single-tile
+// correctness probe to the full-N production kernel.
 
 #pragma once
 
@@ -56,10 +52,11 @@ int fp4_w4a4_mma_sm120_single_tile_bf16out(
     float        alpha,
     cudaStream_t stream);
 
-// P2-S2: multi-K accumulation. Same single-warp / single-N-tile shape
-// as S1, but loops over K in chunks of K_TILE=64, accumulating into
-// the f32 fragment across all K-tiles. Used by gate-S2 to verify
-// cos = 1.000 vs reference at K=4096 and K=12288 (production shapes).
+// Multi-K accumulation. Same single-warp / single-N-tile shape as
+// the single-tile entry above, but loops over K in chunks of
+// K_TILE=64, accumulating into the f32 fragment across all K-tiles.
+// Used by the standalone unit test to verify cos = 1.000 vs
+// reference at K=4096 and K=12288 (production shapes).
 //
 //   A_packed  : (1, K/2)        e2m1 packed bytes for the full K
 //   B_packed  : (N=8, K/2)      e2m1 packed bytes per col, full K
@@ -78,7 +75,7 @@ int fp4_w4a4_mma_sm120_multi_k_bf16out(
     int          K,
     cudaStream_t stream);
 
-// P2-S3: full-N + multi-K kernel.
+// Full-N + multi-K production kernel.
 //
 // gridDim.x = N / 32 blocks, blockDim.x = 128 (4 warps). Each warp
 // owns an 8-col N-tile within its block (warp 0 → cols 0..7 of the
@@ -87,10 +84,8 @@ int fp4_w4a4_mma_sm120_multi_k_bf16out(
 // and reused by every warp's K loop. B and SFB are loaded per-warp
 // per-K-tile (each warp owns its own 8-col strip).
 //
-// This is the first kernel that produces a full N-vector output —
-// the previous (S2) kernel only computed one (M=1, N=8) tile. Used
-// as the production replacement for fp4_w4a4_matvec_sm120_bf16out
-// (R2 SIMT) once gates S3-S6 close.
+// This is the production decode hot-path kernel; the SIMT and
+// single-tile/multi-K paths above are kept as oracles / fallbacks.
 //
 // Constraints:
 //   * N must be a multiple of 32 (production shapes 1024, 4096,

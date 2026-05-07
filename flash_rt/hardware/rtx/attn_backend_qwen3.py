@@ -102,7 +102,7 @@ class RtxFlashAttnBackendQwen3:
         from flash_rt import flash_rt_fa2 as _fa2
         self._fa2 = _fa2
         self._fa2_fwd = _fa2.fwd_bf16
-        # P1-a: causal binding for q_seq>1 prefill. Built only for
+        # Causal binding for q_seq>1 prefill. Built only for
         # (bf16, head_dim=128); other shapes fall back to the SDPA path.
         self._fa2_fwd_causal = getattr(_fa2, 'fwd_bf16_causal', None)
         self._num_sms = torch.cuda.get_device_properties(
@@ -197,9 +197,10 @@ class RtxFlashAttnBackendQwen3:
 
         # Decode (q_seq=1): single-query, causal vs non-causal identical,
         # so use the existing non-causal fwd_bf16 (template Is_causal=false).
-        # Prefill (q_seq>1, causal=True): use the P1-a fwd_bf16_causal
-        # binding (template Is_causal=true). Both paths handle GQA natively
-        # via FA2's h_h_k_ratio — no repeat_interleave / SDPA detour.
+        # Prefill (q_seq>1, causal=True): use the fwd_bf16_causal
+        # binding (template Is_causal=true). Both paths handle GQA
+        # natively via FA2's h_h_k_ratio — no repeat_interleave / SDPA
+        # detour.
         if self._use_fvk_fa2 and q_seq == 1:
             self._fa2_fwd(
                 Q=q.data_ptr(), K=k.data_ptr(), V=v.data_ptr(),

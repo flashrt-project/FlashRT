@@ -2103,8 +2103,8 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     // ── Qwen3-8B NVFP4 W4A4 M=1 matvec / MMA (decode hot path) ──
     // Custom SM120 kernels specialized for M=1 LLM decode where
     // CUTLASS NVFP4 GEMM tiles assume M ≥ 16 and run at ~30 % of HBM
-    // BW. The matvec is the R2 SIMT fallback / oracle; the MMA path
-    // (full_n) is the production decode kernel after P2-S6 wire.
+    // BW. The matvec is the SIMT fallback / oracle; the MMA path
+    // (full_n) is the production decode kernel.
     m.def("fp4_w4a4_matvec_sm120_bf16out",
         [](uintptr_t A_packed, uintptr_t B_packed, uintptr_t D,
            int N, int K,
@@ -2173,7 +2173,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("alpha") = 1.0f,
         py::arg("stream") = 0);
 
-    // ── P3A-S2 (F1-lite): fused qkv post-processing for Qwen3-8B ──
+    // ── Fused qkv post-processing for Qwen3-8B ──
     // Replaces (q_norm + RoPE + Q_buf copy) with one launch and
     // (k_norm + RoPE + K_cache write + V_cache write) with another.
     // head_dim hardcoded at 128; S=1 decode hot path only.
@@ -2211,7 +2211,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("n_kv_heads"), py::arg("eps") = 1e-6f,
         py::arg("stream") = 0);
 
-    // ── P3A-S3 (F3): silu_mul + nvfp4 swizzled quantize fused ──
+    // ── Fused silu_mul + nvfp4 swizzled quantize ──
     m.def("silu_mul_to_nvfp4_swizzled_bf16",
         [](uintptr_t gate, uintptr_t up,
            uintptr_t packed, uintptr_t sf_swz,

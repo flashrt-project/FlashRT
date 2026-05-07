@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// P3A-S3 (F3): silu(gate) * up + nvfp4 swizzled quantize fused.
+// Fused silu(gate) * up + nvfp4 swizzled quantize.
 // See header for design notes.
 //
 // Implementation pattern: row-per-block, two-pass (amax then quantize)

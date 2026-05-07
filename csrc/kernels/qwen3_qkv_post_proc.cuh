@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// P3A-S2 (F1-lite): fused q_norm + RoPE + Q_buf write
-//                   fused k_norm + RoPE + KV_cache write (V copy inline)
+// Fused q_norm + RoPE + Q_buf write
+// Fused k_norm + RoPE + KV_cache write (V copy inline)
 //
 // Replaces the per-decode-layer chain
 //   rms_norm(q_pre, q_norm_w, q_norm_out)

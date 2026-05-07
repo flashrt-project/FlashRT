@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// P2-S1: tensor-core NVFP4 W4A4 single-tile MMA for sm_120.
-// Header at fp4_w4a4_mma_sm120.cuh.
+// Tensor-core NVFP4 W4A4 GEMMs for sm_120 — single-tile, multi-K,
+// and full-N production entry points. Header at
+// fp4_w4a4_mma_sm120.cuh.
 
 #include "fp4_w4a4_mma_sm120.cuh"
 
@@ -32,8 +33,8 @@ using AtomType = cute::SM120::BLOCKSCALED::SM120_16x8x64_TN_VS<
 // shape's natural (column-major) layout. For target (M=16, K=64) the
 // natural layout is Layout<Shape<_16, _64>> with stride (1, 16) ⇒
 // offset = m*1 + k*16, hence m = offset%16, k = offset/16.
-// (My initial pass used row-major m=offset/64 — gave cos = -0.1 on
-//  the gate-S1 unit test. Fixed here.)
+// (Row-major m=offset/64 — i.e. the natural reading — would
+//  invert M and K for this layout. Use the column-major decoding.)
 //
 // ALayout = Layout<Shape<Shape<_4,_8>, Shape<_8,_2,_2>>,
 //                  Stride<Stride<_128,_1>, Stride<_16,_8,_512>>>
@@ -266,19 +267,19 @@ __global__ void single_tile_kernel(
   }
 }
 
-// ── P2-S2: multi-K accumulation kernel ────────────────────────────
+// ── Multi-K accumulation kernel ────────────────────────────
 //
-// Same single-warp / N=8 / M=1-padded-to-16 layout as S1, but loops
-// over K in K_TILE=64 chunks, accumulating into the f32 D fragment
-// across all tiles. The C operand of each iter's MMA is the
-// previous iter's D, so the accumulation is hardware-fused inside
-// the MMA. After the last K-tile, alpha is applied and the row 0
-// portion of D is written to gmem (8 bf16 outputs).
+// Same single-warp / N=8 / M=1-padded-to-16 layout as the
+// single-tile entry, but loops over K in K_TILE=64 chunks,
+// accumulating into the f32 D fragment across all tiles. The C
+// operand of each iter's MMA is the previous iter's D, so the
+// accumulation is hardware-fused inside the MMA. After the last
+// K-tile, alpha is applied and the row 0 portion of D is written
+// to gmem (8 bf16 outputs).
 //
-// The K loop is NOT pipelined (cp.async pipelining lands in P2-S4);
-// each iter does a synchronous gmem→smem load, fragment composition,
-// and one MMA. This is correct but leaves perf on the table — that's
-// fine for gate-S2 which only checks correctness.
+// The K loop is NOT pipelined here (the production full-N kernel
+// below adds cp.async double-buffering). Used as a
+// correctness-only oracle in the standalone unit test.
 
 __global__ void multi_k_kernel(
     const uint8_t* __restrict__ A_packed,    // (K/2,)
@@ -373,7 +374,7 @@ __global__ void multi_k_kernel(
   }
 }
 
-// ── P2-S3: full-N, multi-warp, multi-K kernel ─────────────────────
+// ── Full-N, multi-warp, multi-K production kernel ─────────────────
 //
 // Block: 4 warps = 128 threads, gridDim.x = ceil(N / 32).
 //   * A and SFA shared across all 4 warps (one block-wide load).
@@ -384,9 +385,10 @@ __global__ void multi_k_kernel(
 //
 // SF replication (UE4M3 SFA byte 0 = sentinel for "row 0 has data,
 // rows 1..15 are zero") relies on the same M=1 padding scheme as
-// S1/S2 — A rows 1..15 zero in s_A, SFA rows 1..15 zero in s_SFA.
+// the single-tile / multi-K paths — A rows 1..15 zero in s_A, SFA
+// rows 1..15 zero in s_SFA.
 
-// P2-S5 occupancy tuning: 1 warp / block (= 8 cols / block).
+// Occupancy tuning: 1 warp / block (= 8 cols / block).
 // Trade-off: A and SFA aren't shared across warps in a block, but
 // they're tiny (32 B and 4 B per K-tile) so the duplicated HBM
 // traffic is negligible vs the 9.4 MB weight read.
@@ -548,8 +550,9 @@ __global__ void full_n_kernel(
 
   // SFA / SFB swizzle parameters. The loader stores both SFs in the
   // SM120 NVFP4 SF swizzle layout produced by
-  // `nvfp4_sf_linear_to_swizzled` (csrc/quantize/) — same scheme R2
-  // SIMT decoded in csrc/kernels/fp4_w4a4_matvec_sm120.cu.
+  // `nvfp4_sf_linear_to_swizzled` (csrc/quantize/) — same scheme the
+  // SIMT matvec kernel decodes in
+  // csrc/kernels/fp4_w4a4_matvec_sm120.cu.
   //
   // For a single (M=1) NVFP4 GEMM:
   //   K_blocks = K / 16   (number of 16-K-element SF groups)

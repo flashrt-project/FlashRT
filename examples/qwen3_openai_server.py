@@ -29,7 +29,7 @@ Usage::
     pip install fastapi uvicorn
 
     python examples/qwen3_openai_server.py \\
-        --checkpoint /workspace/modelscope/.../Qwen3-8B-...-NVFP4 \\
+        --checkpoint /path/to/Qwen3-8B-Instruct-NVFP4 \\
         --port 8000 \\
         --warmup 32:128,128:256,256:256
 
@@ -384,8 +384,8 @@ class Qwen3Engine:
             t0 = time.perf_counter()
             self.fe.reset_state()
             with torch.inference_mode():
-                # P1-c: prefill_with_graph picks the smallest bucket
-                # >= P and replays the captured graph; falls back to
+                # prefill_with_graph picks the smallest bucket >= P
+                # and replays the captured graph; falls back to
                 # eager forward_prefill_nvfp4 internally if P exceeds
                 # the largest bucket. _logits_buf[:1] holds the next-
                 # token logits either way.

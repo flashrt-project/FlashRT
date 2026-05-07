@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// P3A-S3 (F3): fused silu(gate) * up + nvfp4 swizzled quantize.
+// Fused silu(gate) * up + nvfp4 swizzled quantize.
 //
 // Replaces the (silu_mul → quantize_bf16_to_nvfp4_swizzled) pair on
 // the post-mlp_gate_up path:

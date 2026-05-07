@@ -286,16 +286,16 @@ def extract_weights_qwen3_nvfp4(
     handles.ptrs['lm_head_w'] = _anchor(handles, lm_head)
     handles.ptrs['lm_head_tied'] = bool(cfg.get('tie_word_embeddings', False))
 
-    # Round-1 perf lever A: also quantize lm_head to NVFP4 swizzled at
-    # load time, with a per-tensor global_scale derived by amax. The
-    # ckpt has lm_head in the ``ignore`` list (BF16 only), but for
-    # decode we want a 4× smaller weight read — ~600 MiB BF16 →
-    # ~150 MiB NVFP4 per token. Quality: argmax-correct on greedy
-    # decode (G3 confirms post-integration). Mirror the qwen36 sibling's
-    # _quant_bf16_lin_proj pattern: fvk.bf16_weight_to_nvfp4_swizzled
-    # produces packed + sf_swz + per-tensor global_scale; alpha at the
-    # GEMM call site is `out_gs` itself (the kernel writes the inverse-
-    # scaled SF, so the GEMM post-mul = global_scale).
+    # Optional NVFP4-quantized lm_head: compute the swizzled
+    # representation at load time so a future kernel switch can pick
+    # it up without a conversion pass. The ckpt has lm_head in the
+    # `ignore` list (BF16 only); the production decode path keeps
+    # lm_head BF16 because the W4A4 noise on a 152K-class argmax
+    # accumulates over greedy decode steps (see qwen3_rtx.py lm_head
+    # call site for details). `bf16_weight_to_nvfp4_swizzled`
+    # produces packed + sf_swz + per-tensor global_scale; the
+    # corresponding GEMM alpha is `out_gs` itself (the kernel emits
+    # the inverse-scaled SF, so the GEMM post-mul = global_scale).
     N_lm, K_lm = lm_head.shape  # (vocab, hidden)
     packed_lm = torch.empty(
         N_lm, K_lm // 2, dtype=torch.uint8, device=device)

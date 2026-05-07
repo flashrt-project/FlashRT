@@ -27,13 +27,13 @@ class Qwen3TorchFrontendRtx:
     Public surface (frozen against the qwen36 sibling for analogy):
       __init__(checkpoint_path, *, device='cuda:0', max_seq=2048,
                max_q_seq=1, alloc_own_forward_buffers=True)
-      set_prompt(text)             -- tokenizes for the next infer()
-      reset_state()                -- clears KV cache + cur_pos cursor
-      forward_own_decode_nvfp4(...)  -- D3 (placeholder raises NotImplementedError)
+      set_prompt(text)              -- tokenizes for the next infer()
+      reset_state()                 -- clears KV cache + cur_pos cursor
+      forward_own_decode_nvfp4(...) -- per-step S=1 NVFP4 decode
     """
 
-    # NVFP4 (N, K) shapes used as scratch buckets. Used only for the
-    # M=1 decode hot path; prefill (S=N) lands in D4 with its own
+    # NVFP4 (N, K) shapes used as scratch buckets. Sized for the M=1
+    # decode hot path; the S=N prefill path uses its own
     # max_q_seq-sized scratch.
     _NVFP4_SHAPES: tuple[tuple[int, int], ...] = (
         (4096, 4096),     # q_proj  (32 heads × 128) AND o_proj (K=hidden)
@@ -42,9 +42,9 @@ class Qwen3TorchFrontendRtx:
         (4096, 12288),    # mlp down (hidden × intermediate)
     )
 
-    # Buckets exposed to the prefill path. D4 will pre-capture a CUDA
-    # graph for each. Sized as a power-of-2 ladder up to 1024 for the
-    # user's ≤1k TTFT target. Adjustable via __init__ kwarg.
+    # Buckets exposed to the prefill path; one CUDA Graph is captured
+    # per bucket at startup. Sized as a power-of-2 ladder up to 1024
+    # for the ≤1k-token TTFT target. Adjustable via __init__ kwarg.
     DEFAULT_PREFILL_BUCKETS: tuple[int, ...] = (32, 64, 128, 256, 512, 1024)
 
     # ── Init ──
@@ -63,13 +63,12 @@ class Qwen3TorchFrontendRtx:
           device: CUDA device string.
           max_seq: KV cache length in tokens (caps prompt + generated).
           max_q_seq: max Q rows passed to FA2 in one call. 1 = decode
-            only. Bumped to >1 for prefill in D4.
+            only; bump to >1 to enable S=N prefill.
           alloc_own_forward_buffers: pre-allocate the decode + prefill
             scratch dicts at construction. Set False only for memory
             introspection unit tests.
           prefill_buckets: override the default {32,64,128,256,512,1024}
-            ladder. The skeleton just records this — actual capture is
-            D4 work.
+            CUDA Graph capture ladder.
         """
         self.checkpoint_path = str(checkpoint_path)
         self.device = device
@@ -270,7 +269,7 @@ class Qwen3TorchFrontendRtx:
             1, 1, device=device, dtype=torch.long,
         )
 
-        # P1-c: static prefill prompt buffer. (1, Sq_max) long. Each
+        # Static prefill prompt buffer. (1, Sq_max) long. Each
         # captured prefill graph reads from a slice [:, :S_bucket] of
         # this buffer; the driver copy_'s the real prompt ids in (with
         # tail padding) before replay so capture sees a stable address.
@@ -278,27 +277,26 @@ class Qwen3TorchFrontendRtx:
             1, Sq_max, device=device, dtype=torch.long,
         )
 
-        # P3A-S1 (F2): boundary fusion of residual_2 + next-layer
-        # input_norm + nvfp4 quant via existing
-        # `residual_add_rms_norm_to_nvfp4_swizzled_bf16` kernel.
-        # Saves 1 launch / layer-boundary × 36 = 36 launches / token.
-        # Default ON; set False for A/B comparison.
+        # Boundary fusion: collapse the layer-L → layer-L+1 transition
+        # (residual_2 + next-layer input_norm + nvfp4 quant) into a
+        # single launch via the existing
+        # `residual_add_rms_norm_to_nvfp4_swizzled_bf16` kernel. Saves
+        # one launch per layer boundary. Default ON; flip to False for
+        # A/B comparison against the unfused chain.
         self._enable_boundary_fusion: bool = True
 
-        # P3A-S2 (F1-lite): fused q_norm+RoPE+Q_buf write and
-        # k_norm+RoPE+KV_cache write via new
-        # `qwen3_q_norm_rope_qstage_bf16` /
-        # `qwen3_k_norm_rope_kvwrite_bf16` kernels. Replaces ~14
-        # small ops/layer (q_norm, k_norm, RoPE-q multi-op chain,
-        # RoPE-k multi-op chain, Q_buf/K_cache/V_cache copies) with
-        # 2 fused kernel launches. Profile showed this group eats
-        # ~10% of decode time (0.99 ms / token at eager).
+        # qkv post-processing fusion: collapse (q_norm + RoPE + Q_buf
+        # write) and (k_norm + RoPE + K/V cache write) into two fused
+        # launches via `qwen3_q_norm_rope_qstage_bf16` /
+        # `qwen3_k_norm_rope_kvwrite_bf16`. Replaces ~14 small per-layer
+        # ops (RMSNorm, multi-op RoPE, three KV/Q cache copies). Default
+        # ON.
         self._enable_qkv_post_fusion: bool = True
 
-        # P3A-S3 (F3): fused silu(gate)*up + nvfp4 swizzled quant
-        # via `silu_mul_to_nvfp4_swizzled_bf16`. Saves 1 launch /
-        # layer × 36 (post-mlp_gate_up path) plus removes a 24-KiB
-        # bf16 round-trip through HBM per layer.
+        # silu_mul + nvfp4 quant fusion: collapse `silu(gate) * up`
+        # and the subsequent nvfp4 swizzled quantization into one
+        # launch (`silu_mul_to_nvfp4_swizzled_bf16`); also avoids a
+        # bf16 round-trip through HBM. Default ON.
         self._enable_silu_mul_quant_fusion: bool = True
 
         # Fused QKV / gate-up output buffers (decode-path only, M=1).
@@ -321,7 +319,7 @@ class Qwen3TorchFrontendRtx:
         else:
             self._gate_up_fused_out = None
 
-        # CUDA Graph capture state (D5 + P1-c).
+        # CUDA Graph capture state.
         #   _captured_decode_graphs  : dict[cur_pos    -> torch.cuda.CUDAGraph]
         #   _captured_prefill_graphs : dict[S_bucket   -> torch.cuda.CUDAGraph]
         #   _graph_stream            : shared dedicated capture stream
@@ -405,13 +403,12 @@ class Qwen3TorchFrontendRtx:
         )
         self._prompt_ids = ids
 
-    # ── G0 smoke (D2): exercise loader + one NVFP4 GEMM end-to-end ──
+    # ── Load smoke: exercise loader + one NVFP4 GEMM end-to-end ──
 
     def _g0_smoke_forward(self) -> dict:
         """Single-token smoke: embed → input_norm → q_proj NVFP4 GEMM.
 
-        Doesn't exercise FA2 / RoPE / MLP / lm_head — that's D3. Just
-        proves:
+        Doesn't exercise FA2 / RoPE / MLP / lm_head. Just proves:
           * Weights load + invariants pass.
           * `quantize_bf16_to_nvfp4_swizzled` produces a valid (packed,
             sf_swz) pair against the activation scratch.
@@ -483,7 +480,7 @@ class Qwen3TorchFrontendRtx:
             'gsw_layer0_q': float(lw['q_proj_gsw']),
         }
 
-    # ── D3: real S=1 decode forward ──
+    # ── S=1 decode forward ──
 
     def _rope_apply_inline(self, x_in, x_out, tmp, cos4, sin4):
         """Apply full-RoPE (rotary_dim == head_dim) to a Q or K tensor.
@@ -535,7 +532,7 @@ class Qwen3TorchFrontendRtx:
         Qwen3-specific dims and (a) no Q-output-gate split, (b) full
         RoPE (rotary_dim=128 = head_dim), (c) plain RMSNorm (no 1+w).
 
-        P3A-S1 (F2) boundary fusion (opt-in via kwargs; default off):
+        Boundary fusion (opt-in via kwargs; default off):
           * If `prequant_ap` / `prequant_sf` are passed, skip step 1+2
             (input_norm + nvfp4 quant) — caller already filled them.
           * If `next_input_norm_w != 0`, replace step 16's torch.add
@@ -563,12 +560,12 @@ class Qwen3TorchFrontendRtx:
         lw = self._weights.ptrs['layers'][L]
         h2 = h_in.view(1, hidden).contiguous()
 
-        # 1+2) FUSED input layernorm + NVFP4 quantize (Round-1 lever B).
+        # 1+2) Fused input layernorm + NVFP4 quantize:
         # rms_norm_to_nvfp4_swizzled_bf16 reads h2, applies rms_norm
         # with input_norm_w, quantizes the result to NVFP4 + writes
-        # swizzled SF — one launch instead of two.
-        # P3A-S1 (F2): if prequant_ap/sf passed by caller (boundary
-        # fusion), the previous layer's tail already wrote them; skip.
+        # swizzled SF — one launch instead of two. Skipped when the
+        # caller passes prequant_ap/sf (boundary fusion: the previous
+        # layer's tail already wrote them).
         if prequant_ap is not None and prequant_sf is not None:
             ap_h, sf_h = prequant_ap, prequant_sf
         else:
@@ -579,13 +576,13 @@ class Qwen3TorchFrontendRtx:
                 1, hidden, eps, s,
             )
 
-        # 3+4) Fused QKV NVFP4 GEMM → (1, Nq+Nk+Nv) in one launch.
-        # Three (q/k/v) projections share the same activation and the
-        # same alpha at every layer (verified at load time). Single
-        # M=1 N=6144 K=4096 GEMM replaces 3× separate GEMMs.
-        # P2-S6: hand-rolled tensor-core W4A4 kernel (cp.async double-
-        # buffered, M=1 specialized) replaces the CUTLASS W4A16 GEMM —
-        # 1.77× faster at this shape per gate-S3 bench.
+        # 3+4) Fused QKV NVFP4 W4A4 MMA GEMM → (1, Nq+Nk+Nv) in one
+        # launch. Three (q/k/v) projections share the same activation
+        # and the same alpha at every layer (verified at load time).
+        # Single M=1 N=6144 K=4096 W4A4 MMA replaces 3× separate
+        # GEMMs; the hand-rolled SM120 tensor-core kernel
+        # (cp.async double-buffered) is ~1.77× faster than CUTLASS
+        # W4A16 at this shape.
         qkv_N = int(lw['qkv_proj_N'])
         Nq = n_q * hd      # 4096
         Nk = n_kv * hd     # 1024
@@ -609,8 +606,8 @@ class Qwen3TorchFrontendRtx:
 
         # 5+6+7+8) qkv post-processing.
         if self._enable_qkv_post_fusion:
-            # P3A-S2 (F1-lite): two fused kernel calls replace the
-            # 17-op chain (q_norm, k_norm, 2× RoPE multi-op, 3× copies).
+            # Two fused kernel calls replace the 17-op chain
+            # (q_norm, k_norm, 2× RoPE multi-op, 3× copies).
             # q_pre / k_pre / v_slice are contiguous slices of qkv_out
             # so .data_ptr() points to the right (head, head_dim) base.
             q_pre_ptr = qkv_out[:, :Nq].data_ptr()
@@ -702,9 +699,9 @@ class Qwen3TorchFrontendRtx:
             s,
         )
 
-        # 11+12) FUSED residual_1 + post_attn_norm + NVFP4 quantize
-        # (Round-1 lever B). residual_add_rms_norm_to_nvfp4_swizzled_bf16
-        # writes h_post = h_in + attn_proj AND quantizes the rms-normed
+        # 11+12) Fused residual_1 + post_attn_norm + NVFP4 quantize.
+        # `residual_add_rms_norm_to_nvfp4_swizzled_bf16` writes
+        # h_post = h_in + attn_proj AND quantizes the rms-normed
         # result to NVFP4 in one launch — collapses 3 separate ops.
         attn_proj = out_op_buf[:1].view(1, 1, hidden)
         h_post = self._res_mid[:, :1]
@@ -737,9 +734,9 @@ class Qwen3TorchFrontendRtx:
         # 14+15a) silu(gate) * up + nvfp4 swizzled quant.
         ap_dn, sf_dn, _ = self._nvfp4_scratch[(hidden, inter)]
         if self._enable_silu_mul_quant_fusion:
-            # P3A-S3 (F3): one fused launch produces packed FP4 + swizzled
-            # SF directly from gate/up — bf16 silu*up never materialized
-            # to HBM.
+            # One fused launch produces packed FP4 + swizzled SF
+            # directly from gate/up — the bf16 silu*up intermediate
+            # is never materialized to HBM.
             fvk.silu_mul_to_nvfp4_swizzled_bf16(
                 gate=gate_v.data_ptr(), up=up_v.data_ptr(),
                 packed=ap_dn.data_ptr(), sf_swz=sf_dn.data_ptr(),
@@ -768,7 +765,7 @@ class Qwen3TorchFrontendRtx:
         )
         mlp_out = down_out_buf[:1].view(1, 1, hidden)
 
-        # 16) Residual 2 (+ optional P3A-S1 (F2) boundary fusion).
+        # 16) Residual 2 (+ optional boundary fusion).
         # Use ping-pong layer-out buffers to keep producer/consumer
         # tensors distinct across the next layer's `h_in`.
         h_out = self._layer_out_a if (L % 2 == 0) else self._layer_out_b
@@ -836,10 +833,10 @@ class Qwen3TorchFrontendRtx:
         n_layers = cfg['num_hidden_layers']
         layers_ptrs = self._weights.ptrs['layers']
         if self._enable_boundary_fusion:
-            # P3A-S1 (F2): pre-quant the layer-0 input here, then have
-            # each layer's tail produce the next layer's pre-quant via
-            # the fused residual+norm+quant op. Saves 1 launch per
-            # layer-boundary (35 boundaries on a 36-layer model).
+            # Pre-quant the layer-0 input here, then have each layer's
+            # tail produce the next layer's pre-quant via the fused
+            # residual+norm+quant op. Saves 1 launch per layer-boundary
+            # (35 boundaries on a 36-layer model).
             n_q = cfg['num_q_heads']
             hd = cfg['head_dim']
             ap0, sf0, _ = self._nvfp4_scratch[(n_q * hd, hidden)]
@@ -876,11 +873,14 @@ class Qwen3TorchFrontendRtx:
         self._last_hidden_buf[:, :1].copy_(x_norm.view(1, 1, hidden))
 
         # 3) lm_head BF16 mat-vec.
-        # Earlier round-1 attempt loaded lm_head as NVFP4 (saving ~450
-        # MiB BW/tok) but G2 cos dropped 0.987→0.978 and G3 24→8 —
-        # the W4A4 noise on the 152K-output argmax accumulates over
-        # decode. Net: -0.25 ms BW vs. fewer-correct outputs. Reverted
-        # to BF16. NVFP4 lm_head with FP8 calibration is a Tier-2 study.
+        # An earlier attempt to NVFP4-quantize lm_head (~450 MiB BW
+        # saved per token) regressed greedy decode quality on the
+        # 152K-class argmax: full-logits cosine vs HF dropped from
+        # 0.987 to 0.978 and 32-token byte match dropped from 24 to 8.
+        # The W4A4 noise compounds over decode steps faster than the
+        # BW saving justifies. Reverted to BF16. A future NVFP4
+        # lm_head with FP8 per-row calibration could potentially
+        # recover the gap.
         fvk.bf16_matmul_qwen36_bf16(
             x_norm.data_ptr(),
             int(self._weights.ptrs['lm_head_w']),
@@ -1375,7 +1375,7 @@ class Qwen3TorchFrontendRtx:
         # pattern: prefill once then warm graphs), capture_begin
         # would error with "Inplace update to inference tensor
         # outside InferenceMode". Decode warmup doesn't hit this in
-        # the existing G6 test path because decode buffers were
+        # the standard test path because decode buffers were
         # allocated and only ever written from inside the same
         # inference_mode block.
         with torch.inference_mode(), torch.cuda.stream(gs):
@@ -1479,9 +1479,9 @@ class Qwen3TorchFrontendRtx:
             if 1 <= b <= self.max_q_seq:
                 self._ensure_prefill_graph(b)
 
-    # ── Driver: greedy decode (G3 + as a building block for the OAI server) ──
+    # ── Driver: greedy decode (used by the OAI server) ──
 
-    # ── D / R4: n-gram lookup speculative decode ───────────────────
+    # ── n-gram lookup speculative decode ───────────────────
 
     def _lookup_2gram(self, ids: list, key, K_spec: int):
         """Find a (a,b)-2gram in `ids` history; return next K_spec tokens.
@@ -1667,16 +1667,16 @@ class Qwen3TorchFrontendRtx:
         Args:
           prompt_ids : (1, S) long.
           max_new_tokens : new tokens to generate.
-          use_prefill : if True (default, D4+) use the S=N prefill path
-            for prompt ingest; if False, fall back to the D3 S=1 loop
-            (used by G4 cosine equivalence test).
+          use_prefill : if True (default), use the S=N prefill path
+            for prompt ingest; if False, fall back to a per-token
+            S=1 ingest loop (used by the prefill-vs-S=1 cosine
+            equivalence test).
           use_prefill_graph : if True, route prompt ingest through
-            prefill_with_graph (P1-c). Caller is responsible for having
-            run warmup_prefill_graphs at startup so the first request
+            prefill_with_graph. Caller is responsible for having run
+            warmup_prefill_graphs at startup so the first request
             doesn't pay capture cost. Defaults to False to preserve
-            existing G3 / OAI server behavior; opt-in until the OAI
-            server's startup warmup is updated to pre-capture prefill
-            graphs alongside decode graphs.
+            the eager-prefill greedy-decode behavior; opt-in once
+            the caller's startup pre-captures the prefill graphs.
         """
         import torch
 

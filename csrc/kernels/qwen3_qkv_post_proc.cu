@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// P3A-S2 (F1-lite): fused q_norm/k_norm + RoPE + Q_buf/KV cache write.
+// Fused q_norm/k_norm + RoPE + Q_buf/KV cache write.
 // See qwen3_qkv_post_proc.cuh for design notes.
 
 #include "qwen3_qkv_post_proc.cuh"
