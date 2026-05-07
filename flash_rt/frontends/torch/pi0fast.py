@@ -167,7 +167,7 @@ class Pi0FastTorchFrontend:
             logger.info(
                 "PaliGemma SentencePiece loaded (vocab=%d)",
                 self._vocab_size)
-        except (ImportError, FileNotFoundError, OSError) as e:
+        except (ImportError, FileNotFoundError, OSError, RuntimeError) as e:
             logger.warning(
                 "PaliGemma SentencePiece not available (%s); "
                 "falling back to vocab=257152 default", e)
