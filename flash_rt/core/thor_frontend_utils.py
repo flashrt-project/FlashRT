@@ -66,24 +66,22 @@ def quant_fp8(w):
 #  Prompt tokenization + embedding
 # ════════════════════════════════════════════════════════════════════
 
-_SP_PATHS = (
-    '/workspace/paligemma_tokenizer.model',
-    '/root/.cache/openpi/big_vision/paligemma_tokenizer.model',
-)
-
-
 def _tokenize_sentencepiece(prompt_text: str):
-    """Fallback tokenizer path when openpi.models.tokenizer is unavailable.
+    """SentencePiece-direct tokenizer path.
 
     Returns a python list[int] of token ids: [bos] + encode(text) + [108].
     Token 108 is the PaliGemma BOT/SOP marker used by openpi prompts.
+
+    The tokenizer model file is resolved via
+    `flash_rt.utils.paligemma_tokenizer.load_paligemma_sentencepiece`,
+    which raises a `FileNotFoundError` with a copy-pasteable download
+    command if the file is missing — see
+    USAGE.md → 'PaliGemma tokenizer setup' for details.
     """
-    import sentencepiece as spm
-    sp = spm.SentencePieceProcessor()
-    for p in _SP_PATHS:
-        if os.path.exists(p):
-            sp.Load(p)
-            break
+    from flash_rt.utils.paligemma_tokenizer import (
+        load_paligemma_sentencepiece,
+    )
+    sp = load_paligemma_sentencepiece()
     return [sp.bos_id()] + sp.Encode(prompt_text) + [108]
 
 
@@ -91,17 +89,20 @@ def embed_prompt_torch(prompt_text, embedding_weight, max_len: int = 48):
     """Torch-side tokenize + embed.
 
     Tries openpi's PaligemmaTokenizer first (matches training exactly);
-    falls back to raw sentencepiece if openpi isn't importable. Returns
-    (embeds, prompt_len) where embeds is fp16 CUDA tensor, already
-    multiplied by sqrt(hidden_dim) per Gemma convention.
+    falls back to raw sentencepiece (via the FlashRT helper) if openpi
+    isn't importable, can't fetch its tokenizer, or raises any other
+    initialization error. Returns (embeds, prompt_len) where embeds is
+    fp16 CUDA tensor, already multiplied by sqrt(hidden_dim) per Gemma
+    convention.
     """
     try:
         from openpi.models.tokenizer import PaligemmaTokenizer
         tokenizer = PaligemmaTokenizer(max_len=max_len)
         tokens_np, mask_np = tokenizer.tokenize(prompt_text)
         prompt_len = int(mask_np.sum())
-        token_ids = torch.tensor(tokens_np[:prompt_len], dtype=torch.long, device='cuda')
-    except ImportError:
+        token_ids = torch.tensor(
+            tokens_np[:prompt_len], dtype=torch.long, device='cuda')
+    except (ImportError, FileNotFoundError, OSError, RuntimeError):
         tokens = _tokenize_sentencepiece(prompt_text)
         token_ids = torch.tensor(tokens, dtype=torch.long, device='cuda')
         prompt_len = len(token_ids)

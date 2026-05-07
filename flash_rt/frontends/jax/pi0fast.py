@@ -143,25 +143,25 @@ class Pi0FastJaxFrontend:
         self.norm_stats = None
 
     def _load_tokenizer(self):
-        sp_paths = [
-            '/workspace/paligemma_tokenizer.model',
-            '/root/.cache/openpi/big_vision/paligemma_tokenizer.model',
-        ]
+        # Locate via the shared FlashRT helper (env var → XDG cache →
+        # legacy paths → openpi auto-download). Raises a clear
+        # FileNotFoundError with a copy-pasteable curl command if the
+        # tokenizer isn't installed; see USAGE.md → 'PaliGemma
+        # tokenizer setup'.
         self._sp_tokenizer = None
         try:
-            import sentencepiece as spm
-            for sp_path in sp_paths:
-                if os.path.exists(sp_path):
-                    self._sp_tokenizer = spm.SentencePieceProcessor()
-                    self._sp_tokenizer.Load(sp_path)
-                    self._vocab_size = self._sp_tokenizer.GetPieceSize()
-                    logger.info("Sentencepiece loaded from %s (vocab=%d)", sp_path, self._vocab_size)
-                    break
-            if self._sp_tokenizer is None:
-                logger.warning("Sentencepiece tokenizer not found")
-                self._vocab_size = 257152
-        except ImportError:
-            logger.warning("sentencepiece not installed")
+            from flash_rt.utils.paligemma_tokenizer import (
+                load_paligemma_sentencepiece,
+            )
+            self._sp_tokenizer = load_paligemma_sentencepiece()
+            self._vocab_size = self._sp_tokenizer.GetPieceSize()
+            logger.info(
+                "PaliGemma SentencePiece loaded (vocab=%d)",
+                self._vocab_size)
+        except (ImportError, FileNotFoundError, OSError) as e:
+            logger.warning(
+                "PaliGemma SentencePiece not available (%s); "
+                "falling back to vocab=257152 default", e)
             self._vocab_size = 257152
 
         # Try loading FAST tokenizer (local only, skip network)
