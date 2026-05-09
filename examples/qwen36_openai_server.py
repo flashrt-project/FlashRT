@@ -16,7 +16,7 @@ Usage:
         --checkpoint /path/to/qwen36_nvfp4 \\
         --port 8000 \\
         --K 6 \\
-        --warmup 32:128,128:256
+        --warmup 8:512
 
     # The --warmup flag pre-captures CUDA Graphs for the listed
     # (prompt_len:max_tokens) shapes at startup so the FIRST real
@@ -24,9 +24,9 @@ Usage:
     # warmup, that first request pays a ~5-25 s graph-capture
     # penalty (standard CUDA Graph cold-start cost — same trade-off
     # as SGLang / vLLM compile mode). Each warmed shape covers
-    # cur_pos in [0, prompt_len + max_tokens], so picking 1-2
-    # representative shapes from your traffic distribution is
-    # usually enough.
+    # cur_pos in [prompt_len, prompt_len + max_tokens]; the default
+    # 8:512 covers the common short-chat range in one pass.
+    # Pick shape(s) that span your traffic distribution.
 
     # Test (non-streaming):
     curl http://localhost:8000/v1/chat/completions \\
@@ -367,13 +367,15 @@ def main():
                    help='Identifier returned by /v1/models and echoed '
                    'in completion responses.')
     p.add_argument(
-        '--warmup', default='32:128,128:256',
+        '--warmup', default='8:512',
         help='Comma-separated list of "prompt_len:max_tokens" shapes '
         'to pre-capture CUDA Graphs for at startup. Without this, the '
         'first request at each new shape pays a ~5-25 s graph-capture '
         'penalty before reaching the headline 90-130 tok/s warm speed. '
-        'Default warms typical short-chat (32:128) and longer-context '
-        '(128:256) shapes. Set to empty string to skip warmup.')
+        'Default 8:512 pre-captures cur_pos in [8, 520], covering the '
+        'common short-chat range so requests with prompt_len < 32 '
+        '(which the prior 32:128,128:256 default missed) start warm. '
+        'Set to empty string to skip warmup.')
     args = p.parse_args()
 
     warmup_shapes = []
