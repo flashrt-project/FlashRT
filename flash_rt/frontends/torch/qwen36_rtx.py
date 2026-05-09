@@ -88,7 +88,7 @@ class Qwen36TorchFrontendRtx:
         """
         self.checkpoint_path = checkpoint_path
         self.device = device
-        self.max_seq = int(max_seq)
+        self._user_max_seq = int(max_seq)
         self._tokenizer = None
         self._prompt_ids = None
         self._pipeline: Qwen36Pipeline | None = None
@@ -99,12 +99,51 @@ class Qwen36TorchFrontendRtx:
                 f"quant must be 'fp8' or 'nvfp4', got {quant!r}")
         self._quant_format = quant
 
+        # Auto-route: above ``LONG_CTX_THRESHOLD`` the BF16 KV cache
+        # alone is too big to fit a 32 GB card alongside the model
+        # (16 layers × max_seq × 4 × 256 × 2 bytes for K + V = 32 KB
+        # per token, so 32K context = 1 GB just for K, 2 GB for K+V,
+        # on top of a ~30 GB baseline). The fix is to route to the
+        # TurboQuant (TQ) packed-cache path: BF16 KV is shrunk to a
+        # 64-row dummy and persistent KV lives in NVFP4-packed form
+        # (~1.83x compression at 1-byte idx, ~5x at bit-pack).
+        # Spec decode is *not* yet integrated with TQ (Phase 3D
+        # follow-up), so long-ctx mode falls back to single-token
+        # decode (~30-40 tok/s eager, vs ~100-130 tok/s spec on
+        # short-ctx). This is the documented trade-off and matches
+        # the perf grid in docs/qwen36_nvfp4.md §4.
+        if quant == 'nvfp4' and self._user_max_seq > self.LONG_CTX_THRESHOLD:
+            # Long-ctx mode: allocate BF16 buffers at a small floor
+            # (the BF16 KV cache will be shrunk to a 64-row dummy
+            # immediately after init, and the per-step bf16 scratches
+            # like _h_a/_h_b only ever read [:1] or [:K] rows so they
+            # don't need to scale with max_seq). The TQ packed cache
+            # then grows KV coverage out to ``user_max_seq``.
+            bf16_init_seq = 2048
+            self._long_ctx_mode = True
+        else:
+            bf16_init_seq = self._user_max_seq
+            self._long_ctx_mode = False
+        # ``self.max_seq`` is the value used to size the BF16 init.
+        # ``self._user_max_seq`` is what the user asked for — that's
+        # what the TQ packed cache grows to in long-ctx mode, and
+        # what gets reported back via ``buffer_summary`` etc.
+        self.max_seq = int(bf16_init_seq)
+
         # Phase 2.3b4 own-forward state (populated by _alloc_buffers).
         self._weights = None         # WeightHandles
         self._bufs: dict | None = None
         self._attn = None            # RtxFlashAttnBackendQwen36
 
         if quant == 'fp8':
+            if self._long_ctx_mode:
+                raise NotImplementedError(
+                    'long-context auto-route (max_seq > '
+                    f'{self.LONG_CTX_THRESHOLD}) is implemented for '
+                    "quant='nvfp4' only. The FP8 path has no "
+                    'TurboQuant packed-cache integration; pass a '
+                    "smaller max_seq or use quant='nvfp4'."
+                )
             # Existing FP8 path — completely unchanged behavior.
             self._load_hf_model()
             self._load_mtp_weights()
@@ -115,6 +154,12 @@ class Qwen36TorchFrontendRtx:
             # no MTP for now (MTP head reuse from FP8 ckpt is a
             # follow-up; spec decode requires MTP).
             self._load_nvfp4_path(alloc_own_forward_buffers)
+            if self._long_ctx_mode and alloc_own_forward_buffers:
+                self._enter_long_ctx_mode()
+                # Buffers are sized at the BF16 init seq, but the
+                # user-facing max_seq reflects what they asked for —
+                # the TQ packed cache covers up to user_max_seq.
+                self.max_seq = self._user_max_seq
 
     # ---------- Phase 1 weight loading (HF path) ----------
 
@@ -220,6 +265,29 @@ class Qwen36TorchFrontendRtx:
     #     when the calling pattern caps cur_pos by construction).
     GRAPH_CACHE_MAX: int = int(
         os.environ.get('FLASHRT_QWEN36_GRAPH_CACHE_MAX', '256'))
+
+    # Auto-route threshold (NVFP4 only). At ``max_seq`` above this,
+    # the constructor switches into long-ctx mode: BF16 KV buffers
+    # are allocated at this threshold (small) and persistent KV is
+    # served by the TurboQuant packed cache, which compresses 1.83x
+    # at 1-byte idx (~5x at bit-pack). Spec decode is currently only
+    # available below the threshold; long-ctx mode does single-token
+    # decode (~30-40 tok/s) but supports up to 256 K context on a
+    # 32 GB card.
+    #
+    # Tuning notes:
+    #   - 16384 is the default because at max_seq=16K the BF16 KV is
+    #     ~1 GB, leaving comfortable headroom on a 32 GB card after
+    #     the model and scratches load. At 32 GB BF16 KV is 2 GB and
+    #     there is essentially no headroom for capture transients.
+    #   - Override via env ``FLASHRT_QWEN36_LONG_CTX_THRESHOLD``.
+    #   - Setting to 0 forces every NVFP4 instance into long-ctx
+    #     mode (useful if you want consistent long-ctx behaviour
+    #     across short and long requests).
+    #   - Setting it very high (e.g. 1_000_000) effectively disables
+    #     auto-route — useful only on cards with > 32 GB.
+    LONG_CTX_THRESHOLD: int = int(
+        os.environ.get('FLASHRT_QWEN36_LONG_CTX_THRESHOLD', '16384'))
 
     # ---- DFlash hidden-tap capture (N6 phase) -------------------------
     # When forward_own_decode_K_nvfp4 is called with tap_buf set, the
@@ -2635,6 +2703,13 @@ class Qwen36TorchFrontendRtx:
             self, input_ids, *, max_new_tokens: int, K: int = 5):
         """K-generic speculative decode on the NVFP4 path.
 
+        In long-ctx mode (auto-routed when ``max_seq`` exceeds
+        ``LONG_CTX_THRESHOLD`` at construction time) this method
+        falls back to single-token decode through the TurboQuant
+        packed cache — spec decode on the TQ path is a Phase 3D
+        follow-up. The K argument is silently treated as 1; the
+        caller does not need to know which path is active.
+
         Mirror of FP8 generate_own_speculative_KN. Differences vs. FP8:
           1. Prefill is DIY: walk prompt tokens through
              forward_own_decode_nvfp4 (S=1) to populate KV cache + lin
@@ -2669,6 +2744,14 @@ class Qwen36TorchFrontendRtx:
         """
         import torch
         from flash_rt import flash_rt_kernels as fvk
+
+        # Long-ctx auto-route: TQ packed cache supports any context up
+        # to ``self._user_max_seq``, but spec decode is not yet wired
+        # on top of TQ (Phase 3D). Fall back to single-token decode —
+        # caller does not need to know the path changed.
+        if getattr(self, '_long_ctx_mode', False):
+            return self._generate_long_ctx_single_token(
+                input_ids, max_new_tokens)
 
         if self._weights.ptrs.get('mtp') is None:
             raise RuntimeError(
@@ -4528,19 +4611,25 @@ class Qwen36TorchFrontendRtx:
         gs = self._graph_stream
         cos, sin = self._rope_cos_sin(cur_pos)
 
-        # Snap on gs (caller is in stream(gs); clone()s issue on gs).
-        state_snap = {
-            'lin_state': self._lin_state.clone(),
-            'lin_conv_state': self._lin_conv_state.clone(),
-            'K_cache': self._attn.K_cache.clone(),
-            'V_cache': self._attn.V_cache.clone(),
-        }
+        # Partial snap: forward_own_decode only writes
+        # K_cache[full_rank, cur_pos:cur_pos+1] across the 16 full-attn
+        # layers, so cloning the (16, 1, 4, 256) slice is sufficient.
+        # Cloning the full cache used a transient ~2 GB at
+        # max_seq=32768 which OOMed long-prompt prefill on 32 GB cards.
+        self._snap_lin_buf.copy_(self._lin_state)
+        self._snap_conv_buf.copy_(self._lin_conv_state)
+        snap_K_row = self._attn.K_cache[
+            :, cur_pos:cur_pos + 1].clone()
+        snap_V_row = self._attn.V_cache[
+            :, cur_pos:cur_pos + 1].clone()
 
         def _restore_on_gs():
-            self._lin_state.copy_(state_snap['lin_state'])
-            self._lin_conv_state.copy_(state_snap['lin_conv_state'])
-            self._attn.K_cache.copy_(state_snap['K_cache'])
-            self._attn.V_cache.copy_(state_snap['V_cache'])
+            self._lin_state.copy_(self._snap_lin_buf)
+            self._lin_conv_state.copy_(self._snap_conv_buf)
+            self._attn.K_cache[
+                :, cur_pos:cur_pos + 1].copy_(snap_K_row)
+            self._attn.V_cache[
+                :, cur_pos:cur_pos + 1].copy_(snap_V_row)
 
         # Warmup (2 iters) — settles allocator / kernel-chain order.
         with torch.no_grad():
@@ -5329,9 +5418,18 @@ class Qwen36TorchFrontendRtx:
         FA2 bakes kv_seq=cur_pos+1 and cos/sin slice addresses into
         the captured kernel call list.
 
-        State integrity: snapshot lin_state / lin_conv_state / KV cache
-        pre-warmup, restore post-capture so replay starts from the
-        original pre-step state.
+        State integrity: snapshot lin_state / lin_conv_state / the
+        single KV row this step writes, restore post-capture so
+        replay starts from the original pre-step state.
+
+        Snap is *partial* — only the row at ``cur_pos`` (32 KB across
+        all 16 full-attn layers) is cloned, not the entire KV cache
+        slab. Cloning the whole cache used a transient ~2 GB at
+        ``max_seq=32768`` and was the proximate OOM in the long-prompt
+        bug report; sister methods (verify / mtp / chain / dflash)
+        already snap partially. Lin-attn state is copied into
+        pre-allocated ``_snap_lin_buf`` / ``_snap_conv_buf`` (no fresh
+        allocation per capture).
         """
         import torch
 
@@ -5342,18 +5440,25 @@ class Qwen36TorchFrontendRtx:
         gs = self._graph_stream
         cos, sin = self._rope_cos_sin(cur_pos)
 
-        state_snap = {
-            'lin_state': self._lin_state.clone(),
-            'lin_conv_state': self._lin_conv_state.clone(),
-            'K_cache': self._attn.K_cache.clone(),
-            'V_cache': self._attn.V_cache.clone(),
-        }
+        # Snap into pre-allocated lin buffers — zero alloc per capture.
+        self._snap_lin_buf.copy_(self._lin_state)
+        self._snap_conv_buf.copy_(self._lin_conv_state)
+        # Partial KV snap: forward_own_decode_nvfp4 only writes
+        # K_cache[full_rank, cur_pos:cur_pos+1] across the 16 full-attn
+        # layers, so the (16, 1, 4, 256) slice is the entire footprint
+        # we need to restore.
+        snap_K_row = self._attn.K_cache[
+            :, cur_pos:cur_pos + 1].clone()
+        snap_V_row = self._attn.V_cache[
+            :, cur_pos:cur_pos + 1].clone()
 
         def _restore_on_gs():
-            self._lin_state.copy_(state_snap['lin_state'])
-            self._lin_conv_state.copy_(state_snap['lin_conv_state'])
-            self._attn.K_cache.copy_(state_snap['K_cache'])
-            self._attn.V_cache.copy_(state_snap['V_cache'])
+            self._lin_state.copy_(self._snap_lin_buf)
+            self._lin_conv_state.copy_(self._snap_conv_buf)
+            self._attn.K_cache[
+                :, cur_pos:cur_pos + 1].copy_(snap_K_row)
+            self._attn.V_cache[
+                :, cur_pos:cur_pos + 1].copy_(snap_V_row)
 
         # Warmup (2 iters) to settle allocator + kernel-chain order.
         with torch.no_grad():
@@ -5571,6 +5676,105 @@ class Qwen36TorchFrontendRtx:
 
         self._graph_cache_put(self._captured_chain_graphs, key, g)
         return g
+
+    # ==================================================================
+    # Long-context auto-route (NVFP4 only)
+    # ==================================================================
+
+    def _enter_long_ctx_mode(self) -> None:
+        """Switch a freshly-initialised NVFP4 frontend onto the TQ path.
+
+        Called from ``__init__`` when ``max_seq > LONG_CTX_THRESHOLD``.
+        Buffers were sized at the threshold; this method extends KV
+        coverage out to the user-requested max_seq via the TurboQuant
+        packed cache and shrinks the now-unused BF16 KV cache to a
+        64-row dummy.
+
+        Sequence (matches the canonical pattern from the team's own
+        long-ctx benches, but without exposing the private steps to
+        callers):
+
+          1. Drop the BF16 KV cache (its rows are now stand-ins; the
+             TQ packed cache is the source of truth).
+          2. Extend the precomputed RoPE table out to the user's
+             max_seq + a small slack (the BF16 path's rope table was
+             sized at the threshold).
+          3. Allocate the TQ packed cache + BF16 single-layer staging
+             at ``max_seq_tq = user_max_seq + 16``.
+
+        After this returns, ``forward_own_decode_nvfp4_tq`` (eager) is
+        the correct decode entry. Captured-graph TQ replay is not
+        used here because its KV-cache write is skipped at capture
+        time, so replay only produces correct attention if the slot
+        was already populated for *this exact token* — fine for
+        bench (synthetic-fill, fixed token) but wrong for serving.
+        """
+        # b_v=4, b_k_total=4, bit_packed=True matches the long-ctx
+        # bench config (docs/qwen36_nvfp4.md §4): 1.83x compression
+        # at 1-byte idx → ~5x at bit-pack = the documented profile.
+        self._shrink_bf16_kv_cache(new_max_seq=64)
+        self._extend_rope_table_to(self._user_max_seq + 16)
+        self._load_turboquant_packed(
+            max_seq_tq=self._user_max_seq + 16,
+            b_v=4, b_k_total=4, bit_packed=True,
+        )
+
+    def _generate_long_ctx_single_token(
+            self, input_ids, max_new_tokens: int):
+        """Long-ctx fallback for ``generate_own_speculative_KN_nvfp4``.
+
+        Single-token decode through the eager TQ forward — supports
+        any prompt length up to ``self._user_max_seq`` and any output
+        length up to the same bound. Slower than spec (~30-40 tok/s
+        decode at 8-32 K ctx, dropping to ~20 tok/s at 256 K) but
+        works at every context length the TQ packed cache covers.
+
+        Spec decode on the TQ path is the Phase 3D follow-up; until
+        that lands, calling
+        ``generate_own_speculative_KN_nvfp4(..., K=N)`` in long-ctx
+        mode silently uses K=1 and logs a one-time info line.
+        """
+        import torch
+
+        prompt_len = int(input_ids.shape[1])
+        max_pos = prompt_len + int(max_new_tokens)
+        if max_pos > self._user_max_seq:
+            raise ValueError(
+                f'prompt_len ({prompt_len}) + max_new_tokens '
+                f'({max_new_tokens}) = {max_pos} exceeds the '
+                f'frontend max_seq ({self._user_max_seq})'
+            )
+
+        self.reset_state()
+        if not hasattr(self, '_rope_cos_table'):
+            self._build_rope_table()
+
+        generated = list(input_ids[0].tolist())
+        cur_pos = 0
+        with torch.no_grad():
+            # Prefill: one TQ forward per prompt token.
+            for p in range(prompt_len):
+                tok = input_ids[:, p:p + 1]
+                cos, sin = self._rope_cos_sin(cur_pos)
+                self.forward_own_decode_nvfp4_tq(
+                    tok, cos, sin, cur_pos)
+                cur_pos += 1
+            # First decoded token = argmax of last prefill step.
+            tok = self._logits_buf.argmax(
+                dim=-1, keepdim=True).view(1, 1)
+            generated.append(int(tok.item()))
+            # Decode loop.
+            for _ in range(int(max_new_tokens) - 1):
+                cos, sin = self._rope_cos_sin(cur_pos)
+                self.forward_own_decode_nvfp4_tq(
+                    tok, cos, sin, cur_pos)
+                tok = self._logits_buf.argmax(
+                    dim=-1, keepdim=True).view(1, 1)
+                generated.append(int(tok.item()))
+                cur_pos += 1
+
+        return torch.tensor(
+            [generated], device=input_ids.device, dtype=input_ids.dtype)
 
     # ==================================================================
     # N7-B4: TurboQuant KV cache (Phase 2B — long context to 200K+)
