@@ -1154,6 +1154,14 @@ void GemmRunner::fp8_nn_gelu_bias(void* A, void* B, void* D, void* bias,
 // ================================================================
 //  FP8 GEMM with device descale → FP16 output
 //  Uses GemmRunner's handle_ for consistent algo. Col-major layout matching pi05.
+//
+//  SM89 FP8 fallback:
+//  If cuBLASLt returns no algorithm (ret=0) for FP8 shapes, we raise an
+//  explicit error with "CUBLAS_STATUS_NOT_SUPPORTED_FP8". The Python frontend
+//  can catch this and switch to FP16 weights for SM89 hardware.
+//
+//  NOTE: For production use on SM89, frontends should detect the architecture
+//  and use FP16 weights directly, avoiding FP8 GEMM entirely.
 // ================================================================
 void GemmRunner::fp8_descale_fp16(void* A, void* B, void* D,
                                     int M, int N, int K,
@@ -1173,10 +1181,31 @@ void GemmRunner::fp8_descale_fp16(void* A, void* B, void* D,
         cublasLtMatmulPreference_t pref;
         CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&pref));
         CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size_, sizeof(workspace_size_)));
-        cublasLtMatmulHeuristicResult_t result; int ret = 0;
-        CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(handle_, entry.matmul_desc, entry.A_desc, entry.B_desc, entry.D_desc, entry.D_desc, pref, 1, &result, &ret));
-        entry.algo = result.algo;
+
+        cublasLtMatmulHeuristicResult_t result;
+        int ret = 0;
+        cublasStatus_t heuristic_status = cublasLtMatmulAlgoGetHeuristic(
+            handle_, entry.matmul_desc, entry.A_desc, entry.B_desc,
+            entry.D_desc, entry.D_desc, pref, 1, &result, &ret);
+
         cublasLtMatmulPreferenceDestroy(pref);
+
+        // ── SM89 FP8 detection: raise explicit error if unsupported ──
+        if (heuristic_status != CUBLAS_STATUS_SUCCESS || ret == 0) {
+            // Destroy descriptors before throwing
+            cublasLtMatrixLayoutDestroy(entry.A_desc);
+            cublasLtMatrixLayoutDestroy(entry.B_desc);
+            cublasLtMatrixLayoutDestroy(entry.D_desc);
+            cublasLtMatmulDescDestroy(entry.matmul_desc);
+
+            throw std::runtime_error(
+                std::string("CUBLAS_STATUS_NOT_SUPPORTED_FP8: FP8 GEMM shape (M=") +
+                std::to_string(M) + ", N=" + std::to_string(N) + ", K=" + std::to_string(K) +
+                ") not supported on this GPU (likely SM89 hardware limitation). "
+                "Use FP16 weights for SM89, or run on SM120/SM110 hardware.");
+        }
+
+        entry.algo = result.algo;
         gemm_cache_[key] = entry;
         it = gemm_cache_.find(key);
     }
