@@ -422,11 +422,13 @@ class Pi05TorchFrontendRtx:
                  checkpoint_dir: Union[str, pathlib.Path],
                  num_views: int = 2,
                  chunk_size: int = CHUNK_SIZE,
-                 max_prompt_len: int = MAX_PROMPT_LEN_DEFAULT):
+                 max_prompt_len: int = MAX_PROMPT_LEN_DEFAULT,
+                 use_fp8: bool = True):
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         self.num_views = int(num_views)
         self.chunk_size = int(chunk_size)
         self.max_prompt_len = int(max_prompt_len)
+        self.use_fp8 = bool(use_fp8)
 
         self.latency_records: list[float] = []
         self.calibrated = False
@@ -472,7 +474,8 @@ class Pi05TorchFrontendRtx:
         # ── FP8 quantize large GEMM weights ──
         self._fp8_weights: dict = {}
         self._fp8_store: list = []  # holds tensors alive
-        self._quantize_all_fp8()
+        if self.use_fp8:
+            self._quantize_all_fp8()
 
         # ── Pre-compute decoder styles (time MLP + style modulation) ──
         self._precomputed_styles = _precompute_decoder_styles(
@@ -498,7 +501,8 @@ class Pi05TorchFrontendRtx:
             self.chunk_size, ACTION_DIM, dtype=bf16, device="cuda")
         self._noise_out = torch.empty(
             self.chunk_size, ACTION_DIM, dtype=bf16, device="cuda")
-        self._cudart = ctypes.CDLL("libcudart.so")
+        from flash_rt.core.cuda_buffer import _cudart
+        self._cudart = _cudart
 
         logger.info("Pi05TorchFrontendRtx initialised (num_views=%d, chunk=%d)",
                     self.num_views, self.chunk_size)
@@ -722,7 +726,7 @@ class Pi05TorchFrontendRtx:
                 num_views=self.num_views,
                 max_prompt_len=prompt_len,
                 chunk_size=self.chunk_size,
-                use_fp8=True, use_fp8_decoder=True)
+                use_fp8=self.use_fp8, use_fp8_decoder=self.use_fp8)
 
         # Upload language embeds into pipeline's encoder_x slot
         embeds_np = embeds.contiguous().view(torch.uint16).cpu().numpy()
@@ -793,7 +797,7 @@ class Pi05TorchFrontendRtx:
                     num_views=self.num_views,
                     max_prompt_len=target_len,
                     chunk_size=self.chunk_size,
-                    use_fp8=True, use_fp8_decoder=True,
+                    use_fp8=self.use_fp8, use_fp8_decoder=self.use_fp8,
                     cfg_beta=cfg["cfg_beta"])
             else:
                 self.pipeline = Pi05CFGPipeline(
@@ -803,7 +807,7 @@ class Pi05TorchFrontendRtx:
                     num_views=self.num_views,
                     max_prompt_len=target_len,
                     chunk_size=self.chunk_size,
-                    use_fp8=True, use_fp8_decoder=True,
+                    use_fp8=self.use_fp8, use_fp8_decoder=self.use_fp8,
                     cfg_beta=cfg["cfg_beta"])
 
         cond_np = cond_embeds.contiguous().view(torch.uint16).cpu().numpy()
@@ -1253,7 +1257,7 @@ class Pi05TorchFrontendRtx:
                 num_views=self.num_views,
                 max_prompt_len=target_len,
                 chunk_size=self.chunk_size,
-                use_fp8=True, use_fp8_decoder=True)
+                use_fp8=self.use_fp8, use_fp8_decoder=self.use_fp8)
 
         # Also seed the parent's B=1 lang slot from sample 0; the parent's
         # B=1 pipeline path is what calibrate_fp8 uses for FP8 scale collection.

@@ -9,6 +9,43 @@ logger = logging.getLogger(__name__)
 _cudart = ctypes.CDLL("libcudart.so")
 
 
+def _configure_cudart_signatures() -> None:
+    """Declare ctypes signatures for CUDA runtime calls used here."""
+    ptr_p = ctypes.POINTER(ctypes.c_void_p)
+    signatures = {
+        "cudaMallocManaged": (
+            [ptr_p, ctypes.c_size_t, ctypes.c_uint], ctypes.c_int),
+        "cudaMalloc": ([ptr_p, ctypes.c_size_t], ctypes.c_int),
+        "cudaFree": ([ctypes.c_void_p], ctypes.c_int),
+        "cudaMemcpy": (
+            [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+             ctypes.c_int],
+            ctypes.c_int,
+        ),
+        "cudaMemcpyAsync": (
+            [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+             ctypes.c_int, ctypes.c_void_p],
+            ctypes.c_int,
+        ),
+        "cudaMemset": (
+            [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t], ctypes.c_int),
+        "cudaMemsetAsync": (
+            [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t,
+             ctypes.c_void_p],
+            ctypes.c_int,
+        ),
+        "cudaDeviceSynchronize": ([], ctypes.c_int),
+        "cudaStreamSynchronize": ([ctypes.c_void_p], ctypes.c_int),
+    }
+    for name, (argtypes, restype) in signatures.items():
+        fn = getattr(_cudart, name)
+        fn.argtypes = argtypes
+        fn.restype = restype
+
+
+_configure_cudart_signatures()
+
+
 def _check(ret, msg=""):
     if ret != 0:
         raise RuntimeError(f"CUDA error {ret}: {msg}")

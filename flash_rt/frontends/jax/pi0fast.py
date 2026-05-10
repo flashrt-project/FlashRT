@@ -79,10 +79,12 @@ class Pi0FastJaxFrontend:
                  use_cuda_graph: bool = True, autotune: int = 3,
                  max_decode_steps: int = 256,
                  decode_cuda_graph: bool = False,
-                 decode_graph_steps: int = 80):
+                 decode_graph_steps: int = 80,
+                 use_fp8: bool = True):
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         self.num_views = num_views
         self.use_cuda_graph = use_cuda_graph
+        self.use_fp8 = bool(use_fp8)
         self.autotune = int(autotune) if autotune is not True else 3
         if autotune is False:
             self.autotune = 0

@@ -80,7 +80,7 @@ class GrootTorchFrontendThor:
     """GROOT N1.6 inference pipeline on Thor SM110."""
 
     def __init__(self, checkpoint, num_views=2, autotune=3,
-                 embodiment_tag="new_embodiment"):
+                 embodiment_tag="new_embodiment", use_fp8=True):
         """Initialize GROOT pipeline.
 
         Args:
@@ -97,6 +97,7 @@ class GrootTorchFrontendThor:
         self._checkpoint_path = pathlib.Path(checkpoint)
         self._num_views = num_views
         self._autotune = autotune
+        self.use_fp8 = bool(use_fp8)
         self._embodiment_tag = embodiment_tag
         self._embodiment_id = EMBODIMENT_TAG_TO_INDEX[embodiment_tag]
         self._real_data_calibrated = False

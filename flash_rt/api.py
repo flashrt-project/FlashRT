@@ -179,7 +179,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                fp4_layers=None,
                use_awq=None,
                awq_alpha=0.5,
-               use_p1_split_gu=None):
+               use_p1_split_gu=None,
+               use_fp8=True):
     """Load a FlashRT model.
 
     Args:
@@ -234,6 +235,9 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         fp4_layers: Tuple of encoder layer indices to FP4-quantize (only
             applies when use_fp4=True). Default (7, 8, 9) = middle FFN
             subset, LIBERO-validated. Other subsets untested at task level.
+        use_fp8: Enable FP8 execution where the selected frontend supports
+            an FP8/BF16 switch. Defaults to True to preserve existing
+            performance-oriented behavior.
 
     Returns:
         VLAModel instance with .predict() method.
@@ -325,9 +329,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                     framework, sorted(fp4_layers))
 
     # Build the kwarg set per-model so we only pass args the target class
-    # actually accepts. Keeps the dispatch table simple and avoids fragile
-    # introspection while still letting users specify groot/pi0fast knobs.
+    # actually accepts. Keeps the dispatch table simple while still letting
+    # users specify groot/pi0fast knobs.
+    import inspect
+    sig = inspect.signature(pipe_cls)
     kwargs: dict = {"num_views": num_views}
+    if "use_fp8" in sig.parameters:
+        kwargs["use_fp8"] = use_fp8
     if config == "pi0fast":
         kwargs.update(
             autotune=autotune,
@@ -339,8 +347,6 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         # rtx-side GROOT accepts embodiment_tag + action_horizon; Thor-side
         # GROOT accepts embodiment_tag + autotune. Feature-detect via the
         # concrete class signature so one call site works for both.
-        import inspect
-        sig = inspect.signature(pipe_cls)
         if "autotune" in sig.parameters:
             kwargs["autotune"] = autotune
         if "embodiment_tag" in sig.parameters and embodiment_tag is not None:
@@ -350,8 +356,6 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     else:
         # pi05, pi0 — both Thor and rtx variants take (checkpoint, num_views, autotune)
         # or (checkpoint, num_views). Feature-detect.
-        import inspect
-        sig = inspect.signature(pipe_cls)
         if "autotune" in sig.parameters:
             kwargs["autotune"] = autotune
         if "weight_cache" in sig.parameters:

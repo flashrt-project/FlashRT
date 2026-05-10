@@ -440,6 +440,7 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         num_views: int = 2,
         chunk_size: int = CHUNK_SIZE,
         max_prompt_len: int = MAX_PROMPT_LEN_DEFAULT,
+        use_fp8: bool = True,
     ):
         # Don't chain to Pi05TorchFrontendRtx.__init__ — it expects a safetensors
         # file. We replicate the body and swap the loader.
@@ -447,6 +448,7 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         self.num_views = int(num_views)
         self.chunk_size = int(chunk_size)
         self.max_prompt_len = int(max_prompt_len)
+        self.use_fp8 = bool(use_fp8)
 
         self.latency_records: list[float] = []
         self.calibrated = False
@@ -492,7 +494,8 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         # ── FP8 quantize large GEMM weights (shared method) ──
         self._fp8_weights: dict = {}
         self._fp8_store: list = []
-        self._quantize_all_fp8()
+        if self.use_fp8:
+            self._quantize_all_fp8()
 
         # ── Pre-compute decoder styles (shared helper) ──
         from flash_rt.frontends.torch.pi05_rtx import _precompute_decoder_styles
@@ -503,7 +506,6 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         # ── Attention backend, fvk, GemmRunner, reusable buffers ──
         from flash_rt.hardware.rtx.attn_backend import RtxFlashAttnBackend
         from flash_rt import flash_rt_kernels as fvk
-        import ctypes
 
         enc_seq_max = self.num_views * 256 + self.max_prompt_len
         self.attn_backend = RtxFlashAttnBackend(
@@ -525,7 +527,8 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         self._noise_out = torch.empty(
             self.chunk_size, ACTION_DIM, dtype=bf16, device="cuda"
         )
-        self._cudart = ctypes.CDLL("libcudart.so")
+        from flash_rt.core.cuda_buffer import _cudart
+        self._cudart = _cudart
 
         logger.info(
             "Pi05JaxFrontendRtx initialised (num_views=%d, chunk=%d)",

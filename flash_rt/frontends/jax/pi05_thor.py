@@ -62,7 +62,7 @@ class Pi05JaxFrontendThor:
 
     def __init__(self, checkpoint_dir, engine_path=None, fmha_path=None,
                  use_cuda_graph=True, num_views=2, autotune=3,
-                 weight_cache=True, **kwargs):
+                 weight_cache=True, use_fp8=True, **kwargs):
         """
         Args:
             autotune: CUDA Graph autotune trials per set_prompt().
@@ -78,6 +78,7 @@ class Pi05JaxFrontendThor:
         self._sync = sync
 
         checkpoint_dir = pathlib.Path(checkpoint_dir)
+        self.use_fp8 = bool(use_fp8)
 
         # ── Load norm stats (openpi or lerobot HF release) ──
         from flash_rt.core.utils.norm_stats import (

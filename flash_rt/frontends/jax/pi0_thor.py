@@ -66,11 +66,12 @@ class Pi0JaxFrontendThor:
 
     def __init__(self, checkpoint_dir, engine_path=None, fmha_path=None,
                  use_cuda_graph=True, num_views=2, autotune=3,
-                 weight_cache=True, **kwargs):
+                 weight_cache=True, use_fp8=True, **kwargs):
         from flash_rt.core.cuda_buffer import CudaBuffer, sync
         from flash_rt.core.weights.transformer import quantize_fp8_e4m3, compute_time_embeddings
         self._CudaBuffer = CudaBuffer
         self._sync = sync
+        self.use_fp8 = bool(use_fp8)
 
         checkpoint_dir = pathlib.Path(checkpoint_dir)
 

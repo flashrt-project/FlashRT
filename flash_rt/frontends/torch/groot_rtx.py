@@ -511,6 +511,7 @@ class GrootTorchFrontendRtx:
         num_views: int = 2,
         embodiment_tag: str = "new_embodiment",
         action_horizon: int = ACTION_HORIZON_MAX,
+        use_fp8: bool = True,
     ):
         if not (1 <= int(action_horizon) <= ACTION_HORIZON_MAX):
             raise ValueError(
@@ -523,6 +524,7 @@ class GrootTorchFrontendRtx:
                 f"Trained in GR00T-N1.6-3B: {PUBLIC_TRAINED_TAGS}.")
         self._checkpoint_dir = pathlib.Path(checkpoint_dir)
         self._num_views = int(num_views)
+        self.use_fp8 = bool(use_fp8)
         self._embodiment_tag = embodiment_tag
         self._embodiment_id = EMBODIMENT_TAG_TO_INDEX[embodiment_tag]
         self._calibrated = False

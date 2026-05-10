@@ -77,7 +77,8 @@ class Pi05TorchFrontendThor:
     # -----------------------------------------------------------------------
 
     def __init__(self, checkpoint_dir: str, num_views: int = 2,
-                 use_cuda_graph: bool = True, autotune: int = 3):
+                 use_cuda_graph: bool = True, autotune: int = 3,
+                 use_fp8: bool = True):
         """
         Args:
             autotune: CUDA Graph autotune trials per set_prompt().
@@ -87,6 +88,7 @@ class Pi05TorchFrontendThor:
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         self.num_views = num_views
         self.use_cuda_graph = use_cuda_graph
+        self.use_fp8 = bool(use_fp8)
         self.autotune = int(autotune) if autotune is not True else 3
         if autotune is False:
             self.autotune = 0

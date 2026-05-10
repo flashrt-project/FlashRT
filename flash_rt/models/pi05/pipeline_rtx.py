@@ -200,7 +200,8 @@ class Pi05Pipeline:
         # CUDA graph state (set by record_infer_graph)
         self._graph = None
         self._graph_stream = None  # ctypes.c_void_p
-        self._cudart = ctypes.CDLL("libcudart.so")
+        from flash_rt.core.cuda_buffer import _cudart
+        self._cudart = _cudart
 
         # Pre-expand vision position embedding across num_views (see
         # ``vision_encoder``'s patch embed path). Blackwell uses
