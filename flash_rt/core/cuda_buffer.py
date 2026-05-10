@@ -8,6 +8,9 @@ logger = logging.getLogger(__name__)
 
 _cudart = ctypes.CDLL("libcudart.so")
 
+_cudart.cudaMemcpyAsync.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p]
+_cudart.cudaMemcpyAsync.restype = ctypes.c_int
+
 
 def _check(ret, msg=""):
     if ret != 0:

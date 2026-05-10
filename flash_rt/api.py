@@ -179,7 +179,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                fp4_layers=None,
                use_awq=None,
                awq_alpha=0.5,
-               use_p1_split_gu=None):
+               use_p1_split_gu=None,
+               use_fp8=True):
     """Load a FlashRT model.
 
     Args:
@@ -327,7 +328,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     # Build the kwarg set per-model so we only pass args the target class
     # actually accepts. Keeps the dispatch table simple and avoids fragile
     # introspection while still letting users specify groot/pi0fast knobs.
-    kwargs: dict = {"num_views": num_views}
+    kwargs: dict = {"num_views": num_views, "use_fp8": use_fp8}
     if config == "pi0fast":
         kwargs.update(
             autotune=autotune,
