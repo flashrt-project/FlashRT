@@ -9,6 +9,8 @@
 #include <cublas_v2.h>
 #include <cublasLt.h>
 #include <cmath>
+#include <stdexcept>
+#include <string>
 
 // ── C1: Fused AdaRMSNorm → FP8 with static scale ──
 // Combines: RMSNorm(x) * (1+scale) + shift → FP8, gate output
@@ -220,42 +222,99 @@ struct CachedLtGemm {
 };
 static std::unordered_map<LtGemmKey, CachedLtGemm, LtGemmKeyHash> g_lt_cache;
 
+static std::string fp8_gemm_shape(const char* name, int M, int N, int K) {
+    return std::string(name) + " [" + std::to_string(M) + "," +
+           std::to_string(N) + "," + std::to_string(K) + "]";
+}
+
+static void check_cublaslt(cublasStatus_t status, const char* name,
+                           int M, int N, int K, const char* op) {
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error(
+            fp8_gemm_shape(name, M, N, K) + ": " + op +
+            " failed with cuBLAS status " +
+            std::to_string(static_cast<int>(status)));
+    }
+}
+
+static void check_cuda(cudaError_t status, const char* name,
+                       int M, int N, int K, const char* op) {
+    if (status != cudaSuccess) {
+        throw std::runtime_error(
+            fp8_gemm_shape(name, M, N, K) + ": " + op +
+            " failed with CUDA error " + cudaGetErrorString(status));
+    }
+}
+
+static void ensure_fp8_lt(const char* name, int M, int N, int K) {
+    if (!g_fp8_lt) {
+        check_cublaslt(cublasLtCreate(&g_fp8_lt), name, M, N, K,
+                       "cublasLtCreate");
+        check_cuda(cudaMalloc(&g_fp8_ws, g_fp8_ws_sz), name, M, N, K,
+                   "cudaMalloc workspace");
+    }
+}
+
+static void check_heuristic(cublasStatus_t status, int returned_results,
+                            const char* name, int M, int N, int K) {
+    check_cublaslt(status, name, M, N, K, "cublasLtMatmulAlgoGetHeuristic");
+    if (returned_results == 0) {
+        throw std::runtime_error(
+            fp8_gemm_shape(name, M, N, K) +
+            ": cuBLASLt returned no FP8 GEMM algorithm");
+    }
+}
+
 void fp8_gemm_descale_fp16(const void* A_fp8, const void* B_fp8, void* C_fp16,
                              int M, int N, int K,
                              const float* act_descale, const float* w_descale,
                              cudaStream_t stream) {
-    if (!g_fp8_lt) { cublasLtCreate(&g_fp8_lt); cudaMalloc(&g_fp8_ws, g_fp8_ws_sz); }
+    const char* name = "fp8_gemm_descale_fp16";
+    ensure_fp8_lt(name, M, N, K);
 
     LtGemmKey key{M, N, K};
     auto it = g_lt_cache.find(key);
     if (it == g_lt_cache.end()) {
-        CachedLtGemm cg;
-        cublasLtMatmulDescCreate(&cg.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+        CachedLtGemm cg{};
+        check_cublaslt(cublasLtMatmulDescCreate(&cg.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F),
+                       name, M, N, K, "cublasLtMatmulDescCreate");
         cublasOperation_t opN = CUBLAS_OP_N;
-        cublasLtMatmulDescSetAttribute(cg.desc, CUBLASLT_MATMUL_DESC_TRANSA, &opN, sizeof(opN));
-        cublasLtMatmulDescSetAttribute(cg.desc, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
-        cublasLtMatrixLayoutCreate(&cg.Adesc, CUDA_R_8F_E4M3, N, K, N);
-        cublasLtMatrixLayoutCreate(&cg.Bdesc, CUDA_R_8F_E4M3, K, M, K);
-        cublasLtMatrixLayoutCreate(&cg.Cdesc, CUDA_R_16F, N, M, N);
+        check_cublaslt(cublasLtMatmulDescSetAttribute(cg.desc, CUBLASLT_MATMUL_DESC_TRANSA, &opN, sizeof(opN)),
+                       name, M, N, K, "set TRANSA");
+        check_cublaslt(cublasLtMatmulDescSetAttribute(cg.desc, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN)),
+                       name, M, N, K, "set TRANSB");
+        check_cublaslt(cublasLtMatrixLayoutCreate(&cg.Adesc, CUDA_R_8F_E4M3, N, K, N),
+                       name, M, N, K, "create A layout");
+        check_cublaslt(cublasLtMatrixLayoutCreate(&cg.Bdesc, CUDA_R_8F_E4M3, K, M, K),
+                       name, M, N, K, "create B layout");
+        check_cublaslt(cublasLtMatrixLayoutCreate(&cg.Cdesc, CUDA_R_16F, N, M, N),
+                       name, M, N, K, "create C layout");
         cublasLtMatmulPreference_t pref;
-        cublasLtMatmulPreferenceCreate(&pref);
-        cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                                              &g_fp8_ws_sz, sizeof(g_fp8_ws_sz));
+        check_cublaslt(cublasLtMatmulPreferenceCreate(&pref),
+                       name, M, N, K, "cublasLtMatmulPreferenceCreate");
+        check_cublaslt(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                              &g_fp8_ws_sz, sizeof(g_fp8_ws_sz)),
+                       name, M, N, K, "set workspace preference");
         cublasLtMatmulHeuristicResult_t result; int ret = 0;
-        cublasLtMatmulAlgoGetHeuristic(g_fp8_lt, cg.desc, cg.Adesc, cg.Bdesc, cg.Cdesc, cg.Cdesc,
-                                        pref, 1, &result, &ret);
-        cg.algo = result.algo;
+        cublasStatus_t heuristic_status = cublasLtMatmulAlgoGetHeuristic(
+            g_fp8_lt, cg.desc, cg.Adesc, cg.Bdesc, cg.Cdesc, cg.Cdesc,
+            pref, 1, &result, &ret);
         cublasLtMatmulPreferenceDestroy(pref);
+        check_heuristic(heuristic_status, ret, name, M, N, K);
+        cg.algo = result.algo;
         g_lt_cache[key] = cg;
         it = g_lt_cache.find(key);
     }
     auto& cg = it->second;
-    cublasLtMatmulDescSetAttribute(cg.desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &w_descale, sizeof(w_descale));
-    cublasLtMatmulDescSetAttribute(cg.desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &act_descale, sizeof(act_descale));
+    check_cublaslt(cublasLtMatmulDescSetAttribute(cg.desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &w_descale, sizeof(w_descale)),
+                   name, M, N, K, "set A scale pointer");
+    check_cublaslt(cublasLtMatmulDescSetAttribute(cg.desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &act_descale, sizeof(act_descale)),
+                   name, M, N, K, "set B scale pointer");
     float alpha = 1.0f, beta = 0.0f;
-    cublasLtMatmul(g_fp8_lt, cg.desc, &alpha, B_fp8, cg.Adesc, A_fp8, cg.Bdesc,
+    check_cublaslt(cublasLtMatmul(g_fp8_lt, cg.desc, &alpha, B_fp8, cg.Adesc, A_fp8, cg.Bdesc,
                     &beta, C_fp16, cg.Cdesc, C_fp16, cg.Cdesc,
-                    &cg.algo, g_fp8_ws, g_fp8_ws_sz, stream);
+                    &cg.algo, g_fp8_ws, g_fp8_ws_sz, stream),
+                   name, M, N, K, "cublasLtMatmul");
 }
 
 // FP32 output variant
@@ -263,39 +322,52 @@ void fp8_gemm_descale_f32out(const void* A_fp8, const void* B_fp8, void* C_fp32,
                               int M, int N, int K,
                               const float* act_descale, const float* w_descale,
                               cudaStream_t stream) {
-    if (!g_fp8_lt) { cublasLtCreate(&g_fp8_lt); cudaMalloc(&g_fp8_ws, g_fp8_ws_sz); }
+    const char* name = "fp8_gemm_descale_f32out";
+    ensure_fp8_lt(name, M, N, K);
 
     LtGemmKey key{M, N + 9200000, K};  // unique key for f32out
     auto it = g_lt_cache.find(key);
     if (it == g_lt_cache.end()) {
-        CachedLtGemm cg;
-        cublasLtMatmulDescCreate(&cg.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+        CachedLtGemm cg{};
+        check_cublaslt(cublasLtMatmulDescCreate(&cg.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F),
+                       name, M, N, K, "cublasLtMatmulDescCreate");
         cublasOperation_t opN = CUBLAS_OP_N;
-        cublasLtMatmulDescSetAttribute(cg.desc, CUBLASLT_MATMUL_DESC_TRANSA, &opN, sizeof(opN));
-        cublasLtMatmulDescSetAttribute(cg.desc, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
-        cublasLtMatrixLayoutCreate(&cg.Adesc, CUDA_R_8F_E4M3, N, K, N);
-        cublasLtMatrixLayoutCreate(&cg.Bdesc, CUDA_R_8F_E4M3, K, M, K);
-        cublasLtMatrixLayoutCreate(&cg.Cdesc, CUDA_R_32F, N, M, N);
+        check_cublaslt(cublasLtMatmulDescSetAttribute(cg.desc, CUBLASLT_MATMUL_DESC_TRANSA, &opN, sizeof(opN)),
+                       name, M, N, K, "set TRANSA");
+        check_cublaslt(cublasLtMatmulDescSetAttribute(cg.desc, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN)),
+                       name, M, N, K, "set TRANSB");
+        check_cublaslt(cublasLtMatrixLayoutCreate(&cg.Adesc, CUDA_R_8F_E4M3, N, K, N),
+                       name, M, N, K, "create A layout");
+        check_cublaslt(cublasLtMatrixLayoutCreate(&cg.Bdesc, CUDA_R_8F_E4M3, K, M, K),
+                       name, M, N, K, "create B layout");
+        check_cublaslt(cublasLtMatrixLayoutCreate(&cg.Cdesc, CUDA_R_32F, N, M, N),
+                       name, M, N, K, "create C layout");
         cublasLtMatmulPreference_t pref;
-        cublasLtMatmulPreferenceCreate(&pref);
-        cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                                              &g_fp8_ws_sz, sizeof(g_fp8_ws_sz));
+        check_cublaslt(cublasLtMatmulPreferenceCreate(&pref),
+                       name, M, N, K, "cublasLtMatmulPreferenceCreate");
+        check_cublaslt(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                              &g_fp8_ws_sz, sizeof(g_fp8_ws_sz)),
+                       name, M, N, K, "set workspace preference");
         cublasLtMatmulHeuristicResult_t result; int ret = 0;
-        cublasLtMatmulAlgoGetHeuristic(g_fp8_lt, cg.desc, cg.Adesc, cg.Bdesc, cg.Cdesc, cg.Cdesc,
-                                        pref, 1, &result, &ret);
-        if (ret == 0) printf("[fp8_gemm_descale_f32out] Heuristic FAILED for [%d,%d,%d]\n", M, N, K);
-        cg.algo = result.algo;
+        cublasStatus_t heuristic_status = cublasLtMatmulAlgoGetHeuristic(
+            g_fp8_lt, cg.desc, cg.Adesc, cg.Bdesc, cg.Cdesc, cg.Cdesc,
+            pref, 1, &result, &ret);
         cublasLtMatmulPreferenceDestroy(pref);
+        check_heuristic(heuristic_status, ret, name, M, N, K);
+        cg.algo = result.algo;
         g_lt_cache[key] = cg;
         it = g_lt_cache.find(key);
     }
     auto& cg = it->second;
-    cublasLtMatmulDescSetAttribute(cg.desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &w_descale, sizeof(w_descale));
-    cublasLtMatmulDescSetAttribute(cg.desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &act_descale, sizeof(act_descale));
+    check_cublaslt(cublasLtMatmulDescSetAttribute(cg.desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &w_descale, sizeof(w_descale)),
+                   name, M, N, K, "set A scale pointer");
+    check_cublaslt(cublasLtMatmulDescSetAttribute(cg.desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &act_descale, sizeof(act_descale)),
+                   name, M, N, K, "set B scale pointer");
     float alpha = 1.0f, beta = 0.0f;
-    cublasLtMatmul(g_fp8_lt, cg.desc, &alpha, B_fp8, cg.Adesc, A_fp8, cg.Bdesc,
+    check_cublaslt(cublasLtMatmul(g_fp8_lt, cg.desc, &alpha, B_fp8, cg.Adesc, A_fp8, cg.Bdesc,
                     &beta, C_fp32, cg.Cdesc, C_fp32, cg.Cdesc,
-                    &cg.algo, g_fp8_ws, g_fp8_ws_sz, stream);
+                    &cg.algo, g_fp8_ws, g_fp8_ws_sz, stream),
+                   name, M, N, K, "cublasLtMatmul");
 }
 
 // BF16 output variant — for models trained in BF16 with activations exceeding
@@ -305,37 +377,50 @@ void fp8_gemm_descale_bf16out(const void* A_fp8, const void* B_fp8, void* C_bf16
                                int M, int N, int K,
                                const float* act_descale, const float* w_descale,
                                cudaStream_t stream) {
-    if (!g_fp8_lt) { cublasLtCreate(&g_fp8_lt); cudaMalloc(&g_fp8_ws, g_fp8_ws_sz); }
+    const char* name = "fp8_gemm_descale_bf16out";
+    ensure_fp8_lt(name, M, N, K);
 
     LtGemmKey key{M, N + 9100000, K};  // unique key for bf16out (avoid clash with fp16/f32out)
     auto it = g_lt_cache.find(key);
     if (it == g_lt_cache.end()) {
-        CachedLtGemm cg;
-        cublasLtMatmulDescCreate(&cg.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+        CachedLtGemm cg{};
+        check_cublaslt(cublasLtMatmulDescCreate(&cg.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F),
+                       name, M, N, K, "cublasLtMatmulDescCreate");
         cublasOperation_t opN = CUBLAS_OP_N;
-        cublasLtMatmulDescSetAttribute(cg.desc, CUBLASLT_MATMUL_DESC_TRANSA, &opN, sizeof(opN));
-        cublasLtMatmulDescSetAttribute(cg.desc, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
-        cublasLtMatrixLayoutCreate(&cg.Adesc, CUDA_R_8F_E4M3, N, K, N);
-        cublasLtMatrixLayoutCreate(&cg.Bdesc, CUDA_R_8F_E4M3, K, M, K);
-        cublasLtMatrixLayoutCreate(&cg.Cdesc, CUDA_R_16BF, N, M, N);
+        check_cublaslt(cublasLtMatmulDescSetAttribute(cg.desc, CUBLASLT_MATMUL_DESC_TRANSA, &opN, sizeof(opN)),
+                       name, M, N, K, "set TRANSA");
+        check_cublaslt(cublasLtMatmulDescSetAttribute(cg.desc, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN)),
+                       name, M, N, K, "set TRANSB");
+        check_cublaslt(cublasLtMatrixLayoutCreate(&cg.Adesc, CUDA_R_8F_E4M3, N, K, N),
+                       name, M, N, K, "create A layout");
+        check_cublaslt(cublasLtMatrixLayoutCreate(&cg.Bdesc, CUDA_R_8F_E4M3, K, M, K),
+                       name, M, N, K, "create B layout");
+        check_cublaslt(cublasLtMatrixLayoutCreate(&cg.Cdesc, CUDA_R_16BF, N, M, N),
+                       name, M, N, K, "create C layout");
         cublasLtMatmulPreference_t pref;
-        cublasLtMatmulPreferenceCreate(&pref);
-        cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                                              &g_fp8_ws_sz, sizeof(g_fp8_ws_sz));
+        check_cublaslt(cublasLtMatmulPreferenceCreate(&pref),
+                       name, M, N, K, "cublasLtMatmulPreferenceCreate");
+        check_cublaslt(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                              &g_fp8_ws_sz, sizeof(g_fp8_ws_sz)),
+                       name, M, N, K, "set workspace preference");
         cublasLtMatmulHeuristicResult_t result; int ret = 0;
-        cublasLtMatmulAlgoGetHeuristic(g_fp8_lt, cg.desc, cg.Adesc, cg.Bdesc, cg.Cdesc, cg.Cdesc,
-                                        pref, 1, &result, &ret);
-        if (ret == 0) printf("[fp8_gemm_descale_bf16out] Heuristic FAILED for [%d,%d,%d]\n", M, N, K);
-        cg.algo = result.algo;
+        cublasStatus_t heuristic_status = cublasLtMatmulAlgoGetHeuristic(
+            g_fp8_lt, cg.desc, cg.Adesc, cg.Bdesc, cg.Cdesc, cg.Cdesc,
+            pref, 1, &result, &ret);
         cublasLtMatmulPreferenceDestroy(pref);
+        check_heuristic(heuristic_status, ret, name, M, N, K);
+        cg.algo = result.algo;
         g_lt_cache[key] = cg;
         it = g_lt_cache.find(key);
     }
     auto& cg = it->second;
-    cublasLtMatmulDescSetAttribute(cg.desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &w_descale, sizeof(w_descale));
-    cublasLtMatmulDescSetAttribute(cg.desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &act_descale, sizeof(act_descale));
+    check_cublaslt(cublasLtMatmulDescSetAttribute(cg.desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &w_descale, sizeof(w_descale)),
+                   name, M, N, K, "set A scale pointer");
+    check_cublaslt(cublasLtMatmulDescSetAttribute(cg.desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &act_descale, sizeof(act_descale)),
+                   name, M, N, K, "set B scale pointer");
     float alpha = 1.0f, beta = 0.0f;
-    cublasLtMatmul(g_fp8_lt, cg.desc, &alpha, B_fp8, cg.Adesc, A_fp8, cg.Bdesc,
+    check_cublaslt(cublasLtMatmul(g_fp8_lt, cg.desc, &alpha, B_fp8, cg.Adesc, A_fp8, cg.Bdesc,
                     &beta, C_bf16, cg.Cdesc, C_bf16, cg.Cdesc,
-                    &cg.algo, g_fp8_ws, g_fp8_ws_sz, stream);
+                    &cg.algo, g_fp8_ws, g_fp8_ws_sz, stream),
+                   name, M, N, K, "cublasLtMatmul");
 }
