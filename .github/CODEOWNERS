@@ -1,0 +1,3 @@
+# Require owner review for every path when branch protection enables
+# "Require review from Code Owners".
+* @LiangSu8899
