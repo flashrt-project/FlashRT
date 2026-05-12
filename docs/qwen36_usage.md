@@ -128,6 +128,69 @@ prompt = fe._tokenizer.apply_chat_template(
 input_ids = fe._tokenizer(prompt, return_tensors='pt').input_ids.cuda()
 ```
 
+## OpenAI server tool calling
+
+The bundled OpenAI-compatible server accepts OpenAI-shaped `tools` on
+`/v1/chat/completions`. Qwen's chat template injects the function
+schema into the prompt, and the server parses model-emitted
+`<tool_call>...</tool_call>` blocks into OpenAI `tool_calls`.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url='http://localhost:8000/v1', api_key='-')
+
+tools = [{
+    'type': 'function',
+    'function': {
+        'name': 'get_weather',
+        'description': 'Get the current weather for a city.',
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'city': {'type': 'string'},
+            },
+            'required': ['city'],
+        },
+    },
+}]
+
+resp1 = client.chat.completions.create(
+    model='qwen3.6-27b-nvfp4',
+    messages=[{'role': 'user', 'content': 'What is the weather in Tokyo?'}],
+    tools=tools,
+    max_tokens=128,
+)
+
+tool_call = resp1.choices[0].message.tool_calls[0]
+
+resp2 = client.chat.completions.create(
+    model='qwen3.6-27b-nvfp4',
+    messages=[
+        {'role': 'user', 'content': 'What is the weather in Tokyo?'},
+        {
+            'role': 'assistant',
+            'content': None,
+            'tool_calls': [tool_call.model_dump()],
+        },
+        {
+            'role': 'tool',
+            'tool_call_id': tool_call.id,
+            'content': '{"city":"Tokyo","temp_c":22,"condition":"sunny"}',
+        },
+    ],
+    tools=tools,
+    max_tokens=128,
+)
+
+print(resp2.choices[0].message.content)
+```
+
+For `stream=True`, the v1 server still emits a single response chunk
+rather than token-by-token deltas, but any parsed `tool_calls` are
+returned as OpenAI-style SSE `delta.tool_calls` entries before the
+final chunk.
+
 ## Cold-start vs warm-state
 
 The headline 90-130 tok/s decode rate is the **warm-state** number —
