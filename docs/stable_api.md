@@ -31,19 +31,35 @@ def load_model(
     weight_cache: bool = True,      # JAX only
     config: str = "pi05",           # "pi05" | "pi0" | "groot" | "pi0fast"
     device=None,                    # reserved
-    hardware: str = "auto",         # "auto" | "thor" | "rtx_sm120" | "rtx_sm89"
-    # GROOT-specific:
-    embodiment_tag: str | None = None,
-    action_horizon: int | None = None,
     # Pi0-FAST-specific:
     decode_cuda_graph: bool = False,
     decode_graph_steps: int = 80,
     max_decode_steps: int = 256,
+    hardware: str = "auto",         # "auto" | "thor" | "rtx_sm120" | "rtx_sm89"
+    # GROOT-specific:
+    embodiment_tag: str | None = None,
+    action_horizon: int | None = None,
+    # Pi0.5 torch-specific:
+    use_fp4: bool = False,
+    fp4_layers: tuple[int, ...] | None = None,
+    use_awq: bool | None = None,
+    awq_alpha: float = 0.5,
+    use_p1_split_gu: bool | None = None,
+    # Frontends with an FP8/BF16 switch:
+    use_fp8: bool = True,
 ) -> VLAModel
 ```
 
 Returns a `VLAModel` wrapping the appropriate frontend for the detected
 (or explicitly specified) GPU architecture.
+
+- `decode_cuda_graph`, `decode_graph_steps`, `max_decode_steps` apply to
+  Pi0-FAST.
+- `embodiment_tag` and `action_horizon` apply to GROOT.
+- `use_fp4`, `fp4_layers`, `use_awq`, `awq_alpha`, and
+  `use_p1_split_gu` apply to the Pi0.5 torch NVFP4 encoder path.
+- `use_fp8=False` disables FP8 where the selected frontend exposes a
+  BF16 fallback; unsupported frontends ignore it.
 
 ### `flash_rt.VLAModel`
 

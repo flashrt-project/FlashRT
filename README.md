@@ -40,6 +40,7 @@ Pi0.5: 44 ms / 23 Hz on Jetson AGX Thor (2v, FP8) · 39.78 ms / 25 Hz (2v, NVFP4
 - [API snippets — Pi0 / Pi0.5 / GROOT / Pi0-FAST / Qwen3.6](#api-snippets)
 - [Qwen3.6-27B NVFP4 LLM path — quickstart, K selection, measured throughput](docs/qwen36_nvfp4.md) · [parameter reference](docs/qwen36_usage.md) · [OpenAI-compatible server example](examples/qwen36_openai_server.py)
 - [Adding a new model](docs/adding_new_model.md)
+- [Contributing](CONTRIBUTING.md)
 - [Architecture](docs/architecture.md)
 
 ## Quick Start
@@ -73,6 +74,7 @@ First call: ~3 s (calibration + CUDA Graph capture). Every subsequent call: 44 m
 | **Run Qwen3.6-27B NVFP4 (LLM, ~100 tok/s typical / 129 tok/s peak on RTX 5090)** | [`docs/qwen36_nvfp4.md`](docs/qwen36_nvfp4.md) — quickstart, K selection, measured throughput · [`docs/qwen36_usage.md`](docs/qwen36_usage.md) — full parameter reference · [`examples/qwen36_openai_server.py`](examples/qwen36_openai_server.py) — OpenAI-compatible HTTP server |
 | **Look up the stable Python API surface** | [`docs/stable_api.md`](docs/stable_api.md) |
 | **Integrate a new model into FlashRT** | [`docs/adding_new_model.md`](docs/adding_new_model.md) — end-to-end walkthrough; external plugin pattern in [`docs/plugin_model_template.md`](docs/plugin_model_template.md) |
+| **Contribute a bug fix, benchmark, or model path** | [`CONTRIBUTING.md`](CONTRIBUTING.md) — development rules, validation expectations, and PR checklist |
 | **Understand the architecture** | [`docs/architecture.md`](docs/architecture.md) — the 8 infrastructure components and how they compose |
 | **Use a load-bearing API** (weight loading, attention, calibration) | [`docs/extension/weight_spec.md`](docs/extension/weight_spec.md) · [`docs/extension/attention_backend.md`](docs/extension/attention_backend.md) · [`docs/extension/calibration.md`](docs/extension/calibration.md) |
 | **See the supported models + measured performance** | [Performance](#performance) below |
