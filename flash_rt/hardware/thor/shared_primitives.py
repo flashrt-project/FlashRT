@@ -49,7 +49,8 @@ import numpy as np
 # SigLIP Vision Encoder (27 layers)
 # ══════════════════════════════════════════════════════════════════
 
-def siglip_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None):
+def siglip_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None,
+                   use_fp8=True):
     """Full SigLIP vision encoder ≡ siglip_forward_fp8_v7.
 
     Per-view independent attention (v7 strided FMHA).
@@ -61,13 +62,21 @@ def siglip_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None):
         bufs: dict of GPU buffer pointers
             x (S,D), x_fp8 (S,D), qkv (S,3D), attn_out (S,D),
             hidden (S,H), hid_fp8 (S,H), scratch (S, max(D,H))
+            When use_fp8=False: also expects ``x_norm`` (S,D fp16) and
+            ``fg`` (S,D fp16) scratch buffers; ``x_fp8`` / ``hid_fp8``
+            may be ignored.
         weights: dict — per-layer lists of GPU pointers
             ln_attn_w[L], ln_attn_b[L], qkv_w[L], qkv_b[L],
             o_w[L], o_b[L], ln_ffn_w[L], ln_ffn_b[L],
             up_w[L], up_b[L], down_w[L], down_b[L],
-            alpha[L*4] (host floats)
+            alpha[L*4] (host floats; unused when use_fp8=False)
         dims: dict — S, D, H, NH, HD, L, num_views, seq_per_view
+        use_fp8: When False, run a pure FP16 forward (no FP8 cast, no
+            descale alpha; weights are FP16 [K,N] in the same layout).
     """
+    if not use_fp8:
+        return _siglip_forward_fp16(gemm, fvk, bufs, weights, dims, stream,
+                                     attn=attn)
     S = dims['S']
     D = dims['D']
     H = dims['H']
@@ -198,7 +207,133 @@ def _make_ones(D):
     import torch
     return torch.ones(D, dtype=torch.float16, device='cuda')
 
-def encoder_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None):
+def _siglip_forward_fp16(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None):
+    """FP16-only SigLIP forward. Mirrors siglip_forward structure with
+    every FP8 op split into its FP16 equivalent.
+    """
+    S = dims['S']; D = dims['D']; H = dims['H']
+    NH = dims['NH']; HD = dims['HD']; L = dims['L']
+    nv = dims['num_views']
+    spv = dims['seq_per_view']
+
+    x = bufs['x']
+    x_norm = bufs['x_norm']       # S*D fp16 scratch (FP16 path only)
+    qkv = bufs['qkv']
+    attn_out = bufs['attn_out']
+    hidden = bufs['hidden']
+    fg = bufs['fg']               # S*D fp16 scratch for O/Down GEMM output
+
+    for l in range(L):
+        # ── Attention LayerNorm → x_norm ──
+        fvk.layer_norm_fp16(x, weights['ln_attn_w'][l], weights['ln_attn_b'][l],
+                            x_norm, S, D, 1e-6, stream)
+
+        # ── QKV GEMM (FP16 NN) + bias ──
+        gemm.fp16_nn(x_norm, weights['qkv_w'][l], qkv, S, 3 * D, D, stream)
+        fvk.add_bias_fp16(qkv, weights['qkv_b'][l], S, 3 * D, stream)
+
+        # ── Strided FMHA ──
+        scale = 1.0 / math.sqrt(float(HD))
+        if attn is not None:
+            attn.run("siglip", 0, q_seq=spv, stream=stream)
+        else:
+            stride = 3 * D
+            Q_ptr = qkv
+            K_ptr = qkv + D * 2
+            V_ptr = qkv + 2 * D * 2
+            fvk.fmha_strided_full(Q_ptr, K_ptr, V_ptr, attn_out,
+                                  nv, spv, spv, NH, NH, HD,
+                                  stride, stride, stream)
+
+        # ── O projection + residual + bias ──
+        gemm.fp16_nn(attn_out, weights['o_w'][l], fg, S, D, D, stream)
+        fvk.bias_residual_fp16(x, fg, weights['o_b'][l], S, D, stream)
+
+        # ── FFN LayerNorm → x_norm ──
+        fvk.layer_norm_fp16(x, weights['ln_ffn_w'][l], weights['ln_ffn_b'][l],
+                            x_norm, S, D, 1e-6, stream)
+
+        # ── Up GEMM + bias + GELU ──
+        gemm.fp16_nn(x_norm, weights['up_w'][l], hidden, S, H, D, stream)
+        fvk.add_bias_fp16(hidden, weights['up_b'][l], S, H, stream)
+        fvk.gelu_inplace_fp16(hidden, S * H, stream)
+
+        # ── Down GEMM + residual + bias ──
+        gemm.fp16_nn(hidden, weights['down_w'][l], fg, S, D, H, stream)
+        fvk.bias_residual_fp16(x, fg, weights['down_b'][l], S, D, stream)
+
+
+def _encoder_forward_fp16(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None):
+    """FP16-only Paligemma encoder forward. Mirrors encoder_forward
+    structure with FP8 cast/descale dropped.
+    """
+    Se = dims['Se']; D = dims['D']; H = dims['H']
+    NH = dims['NH']; HD = dims['HD']; L = dims['L']
+    total_keys = dims['total_keys']
+    Q_dim = NH * HD
+    K_dim = HD
+    attn_scale = 1.0 / math.sqrt(float(HD))
+
+    x = bufs['x']
+    x_norm = bufs['x_norm']
+    qkv = bufs['qkv']
+    logits = bufs['logits']
+    attn_out = bufs['attn_out']
+    gate = bufs['gate']
+    hidden = bufs['hidden']
+    fg = bufs['fg']
+    ones = bufs['ones']
+
+    for l in range(L):
+        last = (l == L - 1)
+
+        # 1. RMSNorm (noweight via ones buf)
+        fvk.rms_norm_fp16(x, ones, x_norm, Se, D, 1e-6, stream)
+
+        # 2. QKV GEMM
+        gemm.fp16_nn(x_norm, weights['qkv_w'][l], qkv, Se, 2560, D, stream)
+
+        # 3+4. Split+RoPE+KV
+        kv_elem_off = l * total_keys * HD
+        fvk.qkv_split_rope_kvcache_fp16(
+            qkv, weights['rope'], attn_out,
+            weights['Kc'], weights['Vc'],
+            Se, Q_dim, K_dim, HD, 2560,
+            kv_elem_off, HD, stream)
+
+        if not last:
+            # 5. Attention
+            if attn is not None:
+                attn.run("encoder", l, q_seq=Se, stream=stream)
+            else:
+                K_ptr = weights['Kc'] + kv_elem_off * 2
+                V_ptr = weights['Vc'] + kv_elem_off * 2
+                fvk.attention_qkv_fp16(bufs['ctx'], attn_out, K_ptr, V_ptr,
+                                        logits, attn_out,
+                                        Se, Se, NH, HD, attn_scale, stream)
+
+            # 6. O proj
+            gemm.fp16_nn(attn_out, weights['o_w'][l], fg, Se, D, D, stream)
+
+            # 7. Residual + RMSNorm
+            fvk.residual_add_fp16(x, fg, Se * D, stream)
+            fvk.rms_norm_fp16(x, ones, x_norm, Se, D, 1e-6, stream)
+
+            # 8. Gate+Up GEMM
+            gemm.fp16_nn(x_norm, weights['gate_w'][l], gate, Se, H * 2, D, stream)
+
+            # 9. GELU(gate) × up
+            fvk.gate_geglu_merged_fp16(gate, hidden, Se, H, stream)
+
+            # 10. Down GEMM
+            gemm.fp16_nn(hidden, weights['down_w'][l], fg, Se, D, H, stream)
+
+            # 11. Residual (next layer's RMSNorm done at top of next iter)
+            fvk.residual_add_fp16(x, fg, Se * D, stream)
+
+
+def encoder_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None,
+                    use_fp8=True):
     """Full encoder forward ≡ encoder_full_static_cutlass.
 
     Static FP8 descale scheme:
@@ -215,7 +350,15 @@ def encoder_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None):
         weights: dict — qkv_w[L], o_w[L], gate_w[L], down_w[L], rope, Kc, Vc,
                         act_scales (device float ptr), alpha_host (host list[L*4])
         dims: dict — Se, D, H, NH, HD, L, total_keys
+        use_fp8: When False, run a pure FP16 forward. Bufs must
+            additionally provide ``x_norm`` (Se*D fp16) and ``ones``
+            (D fp16, all 1.0) for noweight RMSNorm; weights must point
+            at FP16 [K,N] tensors and ``act_scales``/``alpha_host`` are
+            ignored.
     """
+    if not use_fp8:
+        return _encoder_forward_fp16(gemm, fvk, bufs, weights, dims, stream,
+                                      attn=attn)
     Se = dims['Se']
     D = dims['D']
     H = dims['H']

@@ -37,7 +37,8 @@ from flash_rt.hardware.thor.shared_primitives import (
 # Decoder (18 layers, 10 diffusion steps, static FP8)
 # ══════════════════════════════════════════════════════════════════
 
-def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None):
+def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
+                    use_fp8=True):
     """Full AE decoder forward pass ≡ pi05 ae_forward_static.
 
     Args:
@@ -45,14 +46,23 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None):
         fvk: flash_rt_kernels module
         bufs: dict of GPU buffer pointers (uintptr_t)
             noise, x, xn, gate, qkv, logits, attn_out, hid, fg,
-            xn_fp8, hid_fp8, ctx_fp8
+            xn_fp8, hid_fp8, ctx_fp8     [xn_fp8/hid_fp8/ctx_fp8 only when use_fp8=True]
         weights: dict of GPU buffer pointers
             ain_w, ain_b, sa, qw, Kc, Vc, ow, sf, gw, dw,
             aow, aob, fs, rope, w_scales, act_scales
+            (w_scales/act_scales unused when use_fp8=False — weights are FP16)
         dims: dict
             S, D, H, NH, HD, steps, layers, enc_seq, total_keys
         stream: CUDA stream (int)
+        use_fp8: When True (default) run the production static-FP8 path.
+            When False, every GEMM uses ``fvk.gmm_fp16`` and the fused
+            FP8 norm/quantize kernels are split into their FP16
+            equivalents (``adarms_fp16``, ``gate_res_fp16``,
+            ``gate_geglu_merged_fp16``). Used for FP16 baseline runs.
     """
+    if not use_fp8:
+        return _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream,
+                                      attn=attn)
     S = dims['S']
     D = dims['D']
     H = dims['H']
@@ -179,6 +189,101 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None):
         fs_ptr = fs + fi * 2
         fvk.adarms_fp16(x, fs_ptr, xn, gate, S, D, stream)
 
+        fvk.gmm_fp16(ctx, xn, aow, noise, S, 32, D, 1.0, stream)
+        fvk.add_bias_fp16(noise, aob, S, 32, stream)
+
+
+# ══════════════════════════════════════════════════════════════════
+# FP16 decoder path (no quantization, FP16 weights, baseline only)
+# ══════════════════════════════════════════════════════════════════
+
+def _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None):
+    """FP16-only decoder forward. Structure mirrors the FP8 path; every
+    GEMM is ``fvk.gmm_fp16`` and the fused FP8 norm kernels are split.
+
+    Weight pointers (``qw/ow/gw/dw``) must reference FP16 [K,N] tensors
+    (NN layout — same as the FP8 layout, just unquantized; see the
+    ``use_fp8=False`` weight spec).
+    """
+    S = dims['S']; D = dims['D']; H = dims['H']
+    NH = dims['NH']; HD = dims['HD']
+    steps = dims['steps']; layers = dims['layers']
+    enc_seq = dims['enc_seq']; total_keys = dims['total_keys']
+    D3 = 3 * D
+    Q_dim = NH * HD
+    K_dim = HD
+    attn_scale = 1.0 / math.sqrt(float(HD))
+
+    noise = bufs['noise']; x = bufs['x']; xn = bufs['xn']
+    gate = bufs['gate']; qkv = bufs['qkv']; logits = bufs['logits']
+    attn_out = bufs['attn_out']; fg = bufs['fg']; hid = bufs['hid']
+
+    ain_w = weights['ain_w']; ain_b = weights['ain_b']
+    sa = weights['sa']; qw = weights['qw']
+    Kc = weights['Kc']; Vc = weights['Vc']
+    ow = weights['ow']; sf = weights['sf']
+    gw = weights['gw']; dw = weights['dw']
+    aow = weights['aow']; aob = weights['aob']
+    fs = weights['fs']; rope = weights['rope']
+
+    for s in range(steps):
+        fvk.gmm_fp16(ctx, noise, ain_w, x, S, D, 32, 0.0, stream)
+        fvk.add_bias_fp16(x, ain_b, S, D, stream)
+
+        for l in range(layers):
+            si = (s * layers + l) * S * D3
+            sa_ptr = sa + si * 2
+            sf_ptr = sf + si * 2
+
+            # C1: AdaRMSNorm (FP16, no FP8 quantize)
+            fvk.adarms_fp16(x, sa_ptr, xn, gate, S, D, stream)
+
+            # C2: QKV GEMM (FP16 NN; weight is [K, 2560])
+            qw_ptr = qw + l * D * 2560 * 2  # FP16 = 2 bytes/elem
+            fvk.gmm_fp16(ctx, xn, qw_ptr, qkv, S, 2560, D, 0.0, stream)
+
+            # C2b: Split + RoPE + KV cache write
+            kv_offset = l * total_keys * HD + enc_seq * HD
+            fvk.qkv_split_rope_kvcache_fp16(qkv, rope, attn_out, Kc, Vc,
+                                             S, Q_dim, K_dim, HD, 2560,
+                                             kv_offset, HD, stream)
+
+            # C3: Attention
+            if attn is not None:
+                attn.run("decoder", l, q_seq=S, kv_seq=total_keys, stream=stream)
+            else:
+                K_ptr = Kc + l * total_keys * HD * 2
+                V_ptr = Vc + l * total_keys * HD * 2
+                fvk.attention_qkv_fp16(ctx, attn_out, K_ptr, V_ptr,
+                                        logits, attn_out,
+                                        S, total_keys, NH, HD, attn_scale, stream)
+
+            # C4: O proj
+            ow_ptr = ow + l * NH * HD * D * 2  # FP16
+            fvk.gmm_fp16(ctx, attn_out, ow_ptr, fg, S, D, NH * HD, 0.0, stream)
+
+            # C4→C5: gated residual + post-attn AdaRMSNorm
+            fvk.gate_res_fp16(fg, gate, x, S * D, stream)
+            fvk.adarms_fp16(x, sf_ptr, xn, gate, S, D, stream)
+
+            # C5: Gate+Up merged GEMM (weight is [K, 2H])
+            gw_ptr = gw + l * D * H * 2 * 2  # FP16 = 2 bytes/elem; weight has 2H cols
+            fvk.gmm_fp16(ctx, xn, gw_ptr, fg, S, H * 2, D, 0.0, stream)
+
+            # C6: GELU(gate) × up (FP16)
+            fvk.gate_geglu_merged_fp16(fg, hid, S, H, stream)
+
+            # C6: Down GEMM (weight is [H, D])
+            dw_ptr = dw + l * H * D * 2  # FP16
+            fvk.gmm_fp16(ctx, hid, dw_ptr, fg, S, D, H, 0.0, stream)
+
+            # C7: residual into x (next layer's C1 will do AdaRMS)
+            fvk.gate_res_fp16(fg, gate, x, S * D, stream)
+
+        # Final: AdaRMSNorm + action output
+        fi = s * S * D3
+        fs_ptr = fs + fi * 2
+        fvk.adarms_fp16(x, fs_ptr, xn, gate, S, D, stream)
         fvk.gmm_fp16(ctx, xn, aow, noise, S, 32, D, 1.0, stream)
         fvk.add_bias_fp16(noise, aob, S, 32, stream)
 

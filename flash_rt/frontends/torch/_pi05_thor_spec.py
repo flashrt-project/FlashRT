@@ -26,14 +26,24 @@ from flash_rt.frontends.torch._thor_spec_common import (
 )
 
 
-def _decoder_block() -> LayerBlock:
+def _decoder_block(*, use_fp8: bool = True) -> LayerBlock:
     """Gemma-expert decoder / action expert (18 layers, cuBLASLt path).
 
     Unlike Pi0, Pi0.5 does **not** fuse the per-layer norm weight into
     QKV/GateUp — modulation happens via AdaRMSNorm Dense layers instead.
     Weights go through ``.t().contiguous()`` + FP8 quant, then FlatCat
     into ``_dec_{qkv,o,gu,d}_flat``.
+
+    With ``use_fp8=False`` the ``Quant()`` step is dropped; weights stay
+    FP16 in the same ``[K, N]`` row-major layout (``tT()`` is kept).
+    The FlatCat'd tensors are then FP16 instead of FP8, and
+    ``_ae_w_scales`` is not populated.
     """
+    qkv_tx = [tT(), Quant()]            if use_fp8 else [tT()]
+    o_tx   = [ToFp16(), tT(), Quant()]  if use_fp8 else [ToFp16(), tT()]
+    gu_tx  = [tT(), Quant()]            if use_fp8 else [tT()]
+    d_tx   = [ToFp16(), tT(), Quant()]  if use_fp8 else [ToFp16(), tT()]
+    scale_into = "_ae_w_scales" if use_fp8 else None
     dp = "paligemma_with_expert.gemma_expert.model.layers.{i}"
     items = [
         Item("qkv_w",
@@ -42,19 +52,19 @@ def _decoder_block() -> LayerBlock:
                       v=f"{dp}.self_attn.v_proj.weight",
                       interleave_q_heads=8,
                       interleave_k_heads=1),
-             [tT(), Quant()],
-             FlatCat("_dec_qkv_flat"), scale_into="_ae_w_scales"),
+             qkv_tx,
+             FlatCat("_dec_qkv_flat"), scale_into=scale_into),
         Item("o_w", f"{dp}.self_attn.o_proj.weight",
-             [ToFp16(), tT(), Quant()],
-             FlatCat("_dec_o_flat"), scale_into="_ae_w_scales"),
+             o_tx,
+             FlatCat("_dec_o_flat"), scale_into=scale_into),
         Item("gu_w",
              FusedGateUp(gate=f"{dp}.mlp.gate_proj.weight",
                          up=f"{dp}.mlp.up_proj.weight"),
-             [tT(), Quant()],
-             FlatCat("_dec_gu_flat"), scale_into="_ae_w_scales"),
+             gu_tx,
+             FlatCat("_dec_gu_flat"), scale_into=scale_into),
         Item("d_w", f"{dp}.mlp.down_proj.weight",
-             [ToFp16(), tT(), Quant()],
-             FlatCat("_dec_d_flat"), scale_into="_ae_w_scales"),
+             d_tx,
+             FlatCat("_dec_d_flat"), scale_into=scale_into),
     ]
     return LayerBlock(prefix_fmt="", num_layers=18, items=items, name="decoder")
 
@@ -75,13 +85,13 @@ def _decoder_mods_block() -> LayerBlock:
     return LayerBlock(prefix_fmt="", num_layers=18, items=items, name="decoder_mods")
 
 
-def build_spec() -> ModelWeightSpec:
+def build_spec(*, use_fp8: bool = True) -> ModelWeightSpec:
     return ModelWeightSpec(
         framework="torch",
         blocks=[
-            paligemma_siglip_block(),
-            paligemma_encoder_block(),
-            _decoder_block(),
+            paligemma_siglip_block(use_fp8=use_fp8),
+            paligemma_encoder_block(use_fp8=use_fp8),
+            _decoder_block(use_fp8=use_fp8),
             _decoder_mods_block(),
         ],
     )
