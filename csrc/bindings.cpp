@@ -289,6 +289,9 @@ extern "C" int cutlass_fp16_k64_mul_aux(void*, void*, void*, void*, int, int, in
 extern "C" int encoder_mlp_fused_fp16(void*, void*, void*, void*,
                                        void*, void*, void*, void*,
                                        int, int, int, int, cudaStream_t);
+extern "C" int flashrt_megakernel_single_fp16(void*, void*, void*,
+                                               int, int, int,
+                                               float, float, cudaStream_t);
 extern "C" int cutlass_fp16_sweep(int variant, void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp16_sweep_count();
 extern "C" int cutlass_fp8_plain(void*, void*, void*, int, int, int, float, float, cudaStream_t);
@@ -1464,6 +1467,21 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                                          M, N, K, to_stream(stream));
     }, py::arg("A"), py::arg("B"), py::arg("Aux"), py::arg("D"),
        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+
+    // Path C foundation: vendored production sm100_gemm_tma_warpspecialized
+    // kernel struct, single GEMM.  Must match cutlass_fp16_sq isolation
+    // perf before extending to multi-mainloop megakernel.
+    m.def("flashrt_megakernel_single_fp16",
+          [](uintptr_t A, uintptr_t B, uintptr_t D, int M, int N, int K,
+             float alpha, float beta, uintptr_t stream) {
+              return flashrt_megakernel_single_fp16(
+                  to_ptr(A), to_ptr(B), to_ptr(D), M, N, K,
+                  alpha, beta, to_stream(stream));
+          },
+          py::arg("A"), py::arg("B"), py::arg("D"),
+          py::arg("M"), py::arg("N"), py::arg("K"),
+          py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f,
+          py::arg("stream") = 0);
 
     // Path C encoder MLP megakernel (currently a 3-step fallback;
     // real SMEM-staged kernel TBD in future sessions).

@@ -230,6 +230,28 @@ if(ENABLE_SM100_CUTLASS)
   )
   message(STATUS "SM100 CUTLASS FP16 GEMMs: building for sm_${GPU_ARCH}")
 
+  # Path C: vendored production sm100_gemm_tma_warpspecialized.hpp +
+  # single-GEMM instantiation for "match production" gate test.  The
+  # header is a literal copy of CUTLASS production; the .cu file
+  # instantiates it for the split-G7 shape via CollectiveBuilder.
+  add_library(flashrt_megakernel_obj OBJECT csrc/gemm/mega/flashrt_megakernel_single.cu)
+  set_target_properties(flashrt_megakernel_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(flashrt_megakernel_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/mega
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(flashrt_megakernel_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+
   # Path C encoder MLP megakernel (scaffold, fallback to 3-step GEMMs).
   add_library(encoder_mlp_sm100_obj OBJECT csrc/gemm/mega/encoder_mlp_sm100.cu)
   set_target_properties(encoder_mlp_sm100_obj PROPERTIES
@@ -750,7 +772,8 @@ if(ENABLE_SM100_CUTLASS)
     $<TARGET_OBJECTS:cutlass_sm100_obj>
     $<TARGET_OBJECTS:cutlass_sm100_fp16_obj>
     $<TARGET_OBJECTS:cutlass_sm100_fp16_sweep_obj>
-    $<TARGET_OBJECTS:encoder_mlp_sm100_obj>)
+    $<TARGET_OBJECTS:encoder_mlp_sm100_obj>
+    $<TARGET_OBJECTS:flashrt_megakernel_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_SM100_CUTLASS=1)
 endif()
 
