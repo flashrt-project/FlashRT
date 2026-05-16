@@ -324,12 +324,24 @@ def _encoder_forward_fp16(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None
             fvk.residual_add_fp16(x, fg, Se * D, stream)
             fvk.rms_norm_fp16(x, ones, x_norm, Se, D, 1e-6, stream)
 
-            # 8. Gate+Up GEMM (wide-N, big GEMM — R1.2 sweep winner: k64)
-            fvk.cutlass_fp16_k64(x_norm, weights['gate_w'][l], gate,
-                                  Se, H * 2, D, 1.0, 0.0, stream)
-
-            # 9. GELU(gate) × up
-            fvk.gate_geglu_merged_fp16(gate, hidden, Se, H, stream)
+            # 8+9. R3.1 Phase 1 split-G7: GELU(X @ W_gate) -> gate_buf,
+            # X @ W_up -> up_buf, then mul into hidden. Saves the
+            # gate_up [Se, 2H] write/read traffic vs single G7+GeGLU.
+            # weights['gate_w'][l] is [2H, D] row-major; W_gate at offset 0,
+            # W_up at row offset H (byte offset H * D * 2 for FP16).
+            #
+            # Note: Phase 2 (k64_mul_aux folding the mul into up-GEMM's
+            # epilogue) is implemented but disabled — back-to-back A/B with
+            # 15-warmup (Thor hot regime) showed P1 (-3.4 ms) clearly beats
+            # P2 (+0.3 ms regression).  The Aux TMA load added enough
+            # resource pressure to keep Thor in the slower power state.
+            up_w_ptr = weights['gate_w'][l] + H * D * 2
+            up_buf = gate + Se * H * 2   # split the [Se,2H] gate buffer
+            fvk.cutlass_fp16_k64_gelu(x_norm, weights['gate_w'][l], gate,
+                                       Se, H, D, 1.0, 0.0, stream)
+            fvk.cutlass_fp16_k64(x_norm, up_w_ptr, up_buf,
+                                  Se, H, D, 1.0, 0.0, stream)
+            fvk.mul_fp16(gate, up_buf, hidden, Se * H, stream)
 
             # 10. Down GEMM (wide-K — R1.2 sweep winner: 2sm21 explicit 2SM-Sm100)
             fvk.cutlass_fp16_2sm21(hidden, weights['down_w'][l], fg,

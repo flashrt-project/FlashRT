@@ -33,6 +33,37 @@ using namespace cute;
 using cutlass_fp16_t = cutlass::half_t;
 #endif
 
+// GELU tanh-approximation activation matching gate_silu_mul_merged_kernel
+// (csrc/kernels/activation.cu): x * sigmoid(1.59576... * x * (1 + 0.04471 x^2))
+// Equivalent to x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 x^3))).
+// Compute type is FP32 (matches the FP32 accumulator path).
+template <typename T>
+struct GeluTanhApprox {
+  static const bool kIsHeavy = true;
+  CUTLASS_HOST_DEVICE
+  T operator()(T const& x) const {
+    float xf = static_cast<float>(x);
+    float k = 1.5957691216057308f;   // 2 * sqrt(2/pi)
+    float c = 0.044715f;
+    float z = k * xf * (1.0f + c * xf * xf);
+    float sig = 1.0f / (1.0f + expf(-z));
+    return static_cast<T>(xf * sig);
+  }
+};
+
+template <typename T, int N>
+struct GeluTanhApprox<cutlass::Array<T, N>> {
+  static const bool kIsHeavy = true;
+  CUTLASS_HOST_DEVICE
+  cutlass::Array<T, N> operator()(cutlass::Array<T, N> const& v) const {
+    cutlass::Array<T, N> r;
+    GeluTanhApprox<T> op;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < N; ++i) r[i] = op(v[i]);
+    return r;
+  }
+};
+
 // ============================================================
 //  PlainFp16: 256×128×64, Cluster 2×2×1
 //  General FP16→FP16 GEMM (Identity epilogue)
@@ -143,6 +174,75 @@ using Main = typename cutlass::gemm::collective::CollectiveBuilder<
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<
     cutlass::gemm::kernel::GemmUniversal<Shape<int,int,int,int>, Main, Epi>>;
 }  // namespace sm100_fp16_k64
+
+// ============================================================
+//  K64GeluFp16: same tile as k64 but with GELU-tanh epilogue.
+//  Used by R3.1 split-G7: gate_buf = GELU(X @ W_gate).
+// ============================================================
+namespace sm100_fp16_k64_gelu {
+using Tile = Shape<_256, _256, _64>;
+using Cluster = Shape<_2, _2, _1>;
+using Fusion = cutlass::epilogue::fusion::LinCombEltAct<
+    GeluTanhApprox, cutlass_fp16_t, float>;
+using Epi = typename cutlass::epilogue::collective::CollectiveBuilder<
+    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+    Tile, Cluster, cutlass::epilogue::collective::EpilogueTileAuto,
+    float, float, cutlass_fp16_t, cutlass::layout::RowMajor, 8,
+    cutlass_fp16_t, cutlass::layout::RowMajor, 8,
+    cutlass::epilogue::collective::EpilogueScheduleAuto, Fusion>::CollectiveOp;
+using Main = typename cutlass::gemm::collective::CollectiveBuilder<
+    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+    cutlass_fp16_t, cutlass::layout::RowMajor, 8,
+    cutlass_fp16_t, cutlass::layout::ColumnMajor, 8,
+    float, Tile, Cluster,
+    cutlass::gemm::collective::StageCountAutoCarveout<
+        static_cast<int>(sizeof(typename Epi::SharedStorage))>,
+    cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+using Gemm = cutlass::gemm::device::GemmUniversalAdapter<
+    cutlass::gemm::kernel::GemmUniversal<Shape<int,int,int,int>, Main, Epi>>;
+}  // namespace sm100_fp16_k64_gelu
+
+// ============================================================
+//  K64MulAuxFp16: same tile as k64 with binary `multiplies` epilogue
+//  pulling an auxiliary tensor (gate_buf) via TMA.  R3.1 Phase 2:
+//  D = acc * Aux, where Aux is GELU(X @ W_gate) loaded element-wise
+//  alongside the up-GEMM accumulator.  Replaces the post-GEMM
+//  mul_fp16 kernel by folding the multiply into the epilogue.
+//
+//  Uses Sm90 EVT visitor tree via LinCombDeEltAct (Sm100 callbacks
+//  inherit Sm90 implementations for non-block-scale ops).
+// ============================================================
+namespace sm100_fp16_k64_mul_aux {
+using Tile = Shape<_256, _256, _64>;
+using Cluster = Shape<_2, _2, _1>;
+// LinCombDeEltAct semantics: D = ActivationFn(beta*C + alpha*acc, Aux).
+// With beta=0, alpha=1 and ActivationFn=multiplies: D = acc * Aux.
+using Fusion = cutlass::epilogue::fusion::LinCombDeEltAct<
+    cutlass::layout::RowMajor,
+    cutlass::multiplies,
+    cutlass_fp16_t,   // ElementOutput
+    float,            // ElementCompute
+    cutlass_fp16_t,   // ElementAux
+    cutlass_fp16_t,   // ElementSource (unused; beta=0)
+    float             // ElementScalar
+>;
+using Epi = typename cutlass::epilogue::collective::CollectiveBuilder<
+    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+    Tile, Cluster, cutlass::epilogue::collective::EpilogueTileAuto,
+    float, float, cutlass_fp16_t, cutlass::layout::RowMajor, 8,
+    cutlass_fp16_t, cutlass::layout::RowMajor, 8,
+    cutlass::epilogue::collective::EpilogueScheduleAuto, Fusion>::CollectiveOp;
+using Main = typename cutlass::gemm::collective::CollectiveBuilder<
+    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+    cutlass_fp16_t, cutlass::layout::RowMajor, 8,
+    cutlass_fp16_t, cutlass::layout::ColumnMajor, 8,
+    float, Tile, Cluster,
+    cutlass::gemm::collective::StageCountAutoCarveout<
+        static_cast<int>(sizeof(typename Epi::SharedStorage))>,
+    cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+using Gemm = cutlass::gemm::device::GemmUniversalAdapter<
+    cutlass::gemm::kernel::GemmUniversal<Shape<int,int,int,int>, Main, Epi>>;
+}  // namespace sm100_fp16_k64_mul_aux
 
 // ============================================================
 //  Sm2x1Fp16: 256×256×128, Cluster 2×1×1, explicit 2SM-Sm100

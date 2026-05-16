@@ -40,6 +40,12 @@ void gelu_inplace_fp16(__half* x, int n, cudaStream_t stream = 0);
 void gate_silu_mul_merged_fp16(const __half* merged, __half* out,
                                 int seq, int half_dim, cudaStream_t stream = 0);
 
+// Element-wise multiply: out[i] = a[i] * b[i] for i in [0, n).
+// FP16 inputs and output, FP32 multiply.  Used by R3.1 split-G7 path
+// to combine GELU(gate) with up after two separate GEMMs.
+void mul_fp16(const __half* a, const __half* b, __half* out,
+              int n, cudaStream_t stream = 0);
+
 void gate_silu_mul_merged_fp8_fp16(const __half* merged, __nv_fp8_e4m3* out,
                                     int seq, int half_dim,
                                     const float* d_scale, cudaStream_t stream = 0);

@@ -136,6 +136,48 @@ void gate_silu_mul_merged_fp16(const __half* merged, __half* out,
     gate_silu_mul_merged_kernel<__half><<<blocks, 256, 0, stream>>>(merged, out, seq, half_dim);
 }
 
+// Vectorized 8-half / thread element-wise multiply.  BW-bound; pairs
+// with two split-G7 GEMMs in R3.1 to replace gate_silu_mul_merged_fp16.
+__global__ void mul_fp16_kernel(const __half* __restrict__ a,
+                                 const __half* __restrict__ b,
+                                 __half* __restrict__ out, int n) {
+    int i = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    if (i + 8 > n) {
+        for (int k = 0; k < 8 && i + k < n; ++k) {
+            float av = __half2float(a[i + k]);
+            float bv = __half2float(b[i + k]);
+            out[i + k] = __float2half(av * bv);
+        }
+        return;
+    }
+    const float4* a4 = reinterpret_cast<const float4*>(a + i);
+    const float4* b4 = reinterpret_cast<const float4*>(b + i);
+    float4 av = *a4, bv = *b4;
+    __half2 ah[4], bh[4], oh[4];
+    ah[0] = *reinterpret_cast<__half2*>(&av.x);
+    ah[1] = *reinterpret_cast<__half2*>(&av.y);
+    ah[2] = *reinterpret_cast<__half2*>(&av.z);
+    ah[3] = *reinterpret_cast<__half2*>(&av.w);
+    bh[0] = *reinterpret_cast<__half2*>(&bv.x);
+    bh[1] = *reinterpret_cast<__half2*>(&bv.y);
+    bh[2] = *reinterpret_cast<__half2*>(&bv.z);
+    bh[3] = *reinterpret_cast<__half2*>(&bv.w);
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) oh[k] = __hmul2(ah[k], bh[k]);
+    float4 ov;
+    ov.x = *reinterpret_cast<float*>(&oh[0]);
+    ov.y = *reinterpret_cast<float*>(&oh[1]);
+    ov.z = *reinterpret_cast<float*>(&oh[2]);
+    ov.w = *reinterpret_cast<float*>(&oh[3]);
+    *reinterpret_cast<float4*>(out + i) = ov;
+}
+
+void mul_fp16(const __half* a, const __half* b, __half* out, int n, cudaStream_t stream) {
+    int per_block = 256 * 8;
+    int blocks = (n + per_block - 1) / per_block;
+    mul_fp16_kernel<<<blocks, 256, 0, stream>>>(a, b, out, n);
+}
+
 // ── Gate GELU Mul Merged -> FP8 ──
 // 4 elem/thread vectorized, matching production silu_mul_split_fp8_k throughput.
 // Merged layout: merged[s, 0..H-1] = gate, merged[s, H..2H-1] = up

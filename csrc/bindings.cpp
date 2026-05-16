@@ -283,6 +283,8 @@ extern "C" int cutlass_fp16_t1(void*, void*, void*, int, int, int, float, float,
 extern "C" int cutlass_fp16_wide(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp16_k64(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp16_2sm21(void*, void*, void*, int, int, int, float, float, cudaStream_t);
+extern "C" int cutlass_fp16_k64_gelu(void*, void*, void*, int, int, int, float, float, cudaStream_t);
+extern "C" int cutlass_fp16_k64_mul_aux(void*, void*, void*, void*, int, int, int, cudaStream_t);
 extern "C" int cutlass_fp16_sweep(int variant, void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp16_sweep_count();
 extern "C" int cutlass_fp8_plain(void*, void*, void*, int, int, int, float, float, cudaStream_t);
@@ -1108,6 +1110,13 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                                    reinterpret_cast<__half*>(out), seq, half_dim, to_stream(stream));
     }, py::arg("merged"), py::arg("out"), py::arg("seq"), py::arg("half_dim"), py::arg("stream") = 0);
 
+    m.def("mul_fp16", [](uintptr_t a, uintptr_t b, uintptr_t out,
+                         int n, uintptr_t stream) {
+        mul_fp16(reinterpret_cast<const __half*>(a),
+                 reinterpret_cast<const __half*>(b),
+                 reinterpret_cast<__half*>(out), n, to_stream(stream));
+    }, py::arg("a"), py::arg("b"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+
     // Merged GEGLU (tanh-approx GELU) → FP8 (FP16 input, matches pi05 FFN quant path)
     m.def("gate_geglu_merged_fp8_fp16", [](uintptr_t merged, uintptr_t out,
                                             int seq, int half_dim,
@@ -1430,6 +1439,20 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("A"), py::arg("B"), py::arg("D"),
        py::arg("M"), py::arg("N"), py::arg("K"),
        py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
+
+    m.def("cutlass_fp16_k64_gelu", [](uintptr_t A, uintptr_t B, uintptr_t D,
+                                       int M, int N, int K, float alpha, float beta, uintptr_t stream) {
+        return cutlass_fp16_k64_gelu(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, alpha, beta, to_stream(stream));
+    }, py::arg("A"), py::arg("B"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"),
+       py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
+
+    m.def("cutlass_fp16_k64_mul_aux", [](uintptr_t A, uintptr_t B, uintptr_t Aux, uintptr_t D,
+                                          int M, int N, int K, uintptr_t stream) {
+        return cutlass_fp16_k64_mul_aux(to_ptr(A), to_ptr(B), to_ptr(Aux), to_ptr(D),
+                                         M, N, K, to_stream(stream));
+    }, py::arg("A"), py::arg("B"), py::arg("Aux"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
 
     // R1.1 tile-sweep dispatch (transient; remove once winner is promoted).
     m.def("cutlass_fp16_sweep", [](int variant, uintptr_t A, uintptr_t B, uintptr_t D,
