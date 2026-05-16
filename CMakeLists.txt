@@ -230,6 +230,24 @@ if(ENABLE_SM100_CUTLASS)
   )
   message(STATUS "SM100 CUTLASS FP16 GEMMs: building for sm_${GPU_ARCH}")
 
+  # Path C encoder MLP megakernel (scaffold, fallback to 3-step GEMMs).
+  add_library(encoder_mlp_sm100_obj OBJECT csrc/gemm/mega/encoder_mlp_sm100.cu)
+  set_target_properties(encoder_mlp_sm100_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(encoder_mlp_sm100_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(encoder_mlp_sm100_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+
   # FP16 CUTLASS GEMM tile-sweep (transient, used by R1.1 sweep bench).
   add_library(cutlass_sm100_fp16_sweep_obj OBJECT csrc/gemm/cutlass_sm100_fp16_sweep.cu)
   set_target_properties(cutlass_sm100_fp16_sweep_obj PROPERTIES
@@ -731,7 +749,8 @@ if(ENABLE_SM100_CUTLASS)
   target_sources(flash_rt_kernels PRIVATE
     $<TARGET_OBJECTS:cutlass_sm100_obj>
     $<TARGET_OBJECTS:cutlass_sm100_fp16_obj>
-    $<TARGET_OBJECTS:cutlass_sm100_fp16_sweep_obj>)
+    $<TARGET_OBJECTS:cutlass_sm100_fp16_sweep_obj>
+    $<TARGET_OBJECTS:encoder_mlp_sm100_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_SM100_CUTLASS=1)
 endif()
 

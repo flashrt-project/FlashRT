@@ -286,6 +286,9 @@ extern "C" int cutlass_fp16_2sm21(void*, void*, void*, int, int, int, float, flo
 extern "C" int cutlass_fp16_k64_gelu(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp16_sq_gelu(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp16_k64_mul_aux(void*, void*, void*, void*, int, int, int, cudaStream_t);
+extern "C" int encoder_mlp_fused_fp16(void*, void*, void*, void*,
+                                       void*, void*, void*, void*,
+                                       int, int, int, int, cudaStream_t);
 extern "C" int cutlass_fp16_sweep(int variant, void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp16_sweep_count();
 extern "C" int cutlass_fp8_plain(void*, void*, void*, int, int, int, float, float, cudaStream_t);
@@ -1461,6 +1464,22 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                                          M, N, K, to_stream(stream));
     }, py::arg("A"), py::arg("B"), py::arg("Aux"), py::arg("D"),
        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+
+    // Path C encoder MLP megakernel (currently a 3-step fallback;
+    // real SMEM-staged kernel TBD in future sessions).
+    m.def("encoder_mlp_fused_fp16",
+          [](uintptr_t X, uintptr_t W_gate, uintptr_t W_up, uintptr_t W_down,
+             uintptr_t gate_buf, uintptr_t up_buf, uintptr_t hid_buf, uintptr_t out,
+             int M, int N_out, int K, int H, uintptr_t stream) {
+              return encoder_mlp_fused_fp16(
+                  to_ptr(X), to_ptr(W_gate), to_ptr(W_up), to_ptr(W_down),
+                  to_ptr(gate_buf), to_ptr(up_buf), to_ptr(hid_buf), to_ptr(out),
+                  M, N_out, K, H, to_stream(stream));
+          },
+          py::arg("X"), py::arg("W_gate"), py::arg("W_up"), py::arg("W_down"),
+          py::arg("gate_buf"), py::arg("up_buf"), py::arg("hid_buf"), py::arg("out"),
+          py::arg("M"), py::arg("N_out"), py::arg("K"), py::arg("H"),
+          py::arg("stream") = 0);
 
     // R1.1 tile-sweep dispatch (transient; remove once winner is promoted).
     m.def("cutlass_fp16_sweep", [](int variant, uintptr_t A, uintptr_t B, uintptr_t D,
