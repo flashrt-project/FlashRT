@@ -265,7 +265,10 @@ def _siglip_forward_fp16(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None)
 
 def _encoder_forward_fp16(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None):
     """FP16-only Paligemma encoder forward. Mirrors encoder_forward
-    structure with FP8 cast/descale dropped.
+    structure with FP8 cast/descale dropped. GEMMs use the CUTLASS-FP16
+    NT path (weights stored ``[N, K]`` row-major, matching the FP8 NT
+    convention) rather than cuBLASLt; FP8-equivalent shape-specific
+    tactics (sq/t1/wide) are chosen per-GEMM.
     """
     Se = dims['Se']; D = dims['D']; H = dims['H']
     NH = dims['NH']; HD = dims['HD']; L = dims['L']
@@ -290,8 +293,9 @@ def _encoder_forward_fp16(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None
         # 1. RMSNorm (noweight via ones buf)
         fvk.rms_norm_fp16(x, ones, x_norm, Se, D, 1e-6, stream)
 
-        # 2. QKV GEMM
-        gemm.fp16_nn(x_norm, weights['qkv_w'][l], qkv, Se, 2560, D, stream)
+        # 2. QKV GEMM (CUTLASS FP16 sq tile)
+        fvk.cutlass_fp16_sq(x_norm, weights['qkv_w'][l], qkv,
+                             Se, 2560, D, 1.0, 0.0, stream)
 
         # 3+4. Split+RoPE+KV
         kv_elem_off = l * total_keys * HD
@@ -312,21 +316,24 @@ def _encoder_forward_fp16(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None
                                         logits, attn_out,
                                         Se, Se, NH, HD, attn_scale, stream)
 
-            # 6. O proj
-            gemm.fp16_nn(attn_out, weights['o_w'][l], fg, Se, D, D, stream)
+            # 6. O proj (square shape — sq tile)
+            fvk.cutlass_fp16_sq(attn_out, weights['o_w'][l], fg,
+                                 Se, D, D, 1.0, 0.0, stream)
 
             # 7. Residual + RMSNorm
             fvk.residual_add_fp16(x, fg, Se * D, stream)
             fvk.rms_norm_fp16(x, ones, x_norm, Se, D, 1e-6, stream)
 
-            # 8. Gate+Up GEMM
-            gemm.fp16_nn(x_norm, weights['gate_w'][l], gate, Se, H * 2, D, stream)
+            # 8. Gate+Up GEMM (wide-N, big GEMM — t1 tile)
+            fvk.cutlass_fp16_t1(x_norm, weights['gate_w'][l], gate,
+                                 Se, H * 2, D, 1.0, 0.0, stream)
 
             # 9. GELU(gate) × up
             fvk.gate_geglu_merged_fp16(gate, hidden, Se, H, stream)
 
-            # 10. Down GEMM
-            gemm.fp16_nn(hidden, weights['down_w'][l], fg, Se, D, H, stream)
+            # 10. Down GEMM (wide-K — wide tile)
+            fvk.cutlass_fp16_wide(hidden, weights['down_w'][l], fg,
+                                   Se, D, H, 1.0, 0.0, stream)
 
             # 11. Residual (next layer's RMSNorm done at top of next iter)
             fvk.residual_add_fp16(x, fg, Se * D, stream)

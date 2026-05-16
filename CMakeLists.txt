@@ -210,6 +210,25 @@ if(ENABLE_SM100_CUTLASS)
     >
   )
   message(STATUS "SM100 CUTLASS FP8 GEMMs: building for sm_${GPU_ARCH}")
+
+  # FP16 CUTLASS GEMMs (encoder/SigLIP FP16 path).
+  add_library(cutlass_sm100_fp16_obj OBJECT csrc/gemm/cutlass_sm100_fp16.cu)
+  set_target_properties(cutlass_sm100_fp16_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(cutlass_sm100_fp16_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(cutlass_sm100_fp16_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+  message(STATUS "SM100 CUTLASS FP16 GEMMs: building for sm_${GPU_ARCH}")
 endif()
 
 # ── libfmha_fp16_strided.so — CUTLASS SM100 FP16 FMHA for SigLIP ──
@@ -691,7 +710,9 @@ set_target_properties(flash_rt_kernels PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
 
 if(ENABLE_SM100_CUTLASS)
-  target_sources(flash_rt_kernels PRIVATE $<TARGET_OBJECTS:cutlass_sm100_obj>)
+  target_sources(flash_rt_kernels PRIVATE
+    $<TARGET_OBJECTS:cutlass_sm100_obj>
+    $<TARGET_OBJECTS:cutlass_sm100_fp16_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_SM100_CUTLASS=1)
 endif()
 

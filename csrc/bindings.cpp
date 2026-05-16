@@ -276,6 +276,11 @@ extern "C" float launch_w4a8_gemm(void*, void*, void*, void*, void*, void*, int,
 extern "C" int cutlass_fp8_sq(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp8_t1(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp8_wide(void*, void*, void*, int, int, int, float, float, cudaStream_t);
+// CUTLASS FP16 variants (encoder/SigLIP FP16 path)
+extern "C" int cutlass_fp16_plain(void*, void*, void*, int, int, int, float, float, cudaStream_t);
+extern "C" int cutlass_fp16_sq(void*, void*, void*, int, int, int, float, float, cudaStream_t);
+extern "C" int cutlass_fp16_t1(void*, void*, void*, int, int, int, float, float, cudaStream_t);
+extern "C" int cutlass_fp16_wide(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp8_plain(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp8_gelu(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp8_sq_f32out(void*, void*, void*, int, int, int, float, float, cudaStream_t);
@@ -1375,6 +1380,35 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     m.def("cutlass_fp8_gelu", [](uintptr_t A, uintptr_t B, uintptr_t D,
                                    int M, int N, int K, float alpha, float beta, uintptr_t stream) {
         return cutlass_fp8_gelu(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, alpha, beta, to_stream(stream));
+    }, py::arg("A"), py::arg("B"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"),
+       py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
+
+    // ── CUTLASS FP16 GEMMs (FP16 path, NT layout — B is [N,K] row-major) ──
+    m.def("cutlass_fp16_plain", [](uintptr_t A, uintptr_t B, uintptr_t D,
+                                     int M, int N, int K, float alpha, float beta, uintptr_t stream) {
+        return cutlass_fp16_plain(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, alpha, beta, to_stream(stream));
+    }, py::arg("A"), py::arg("B"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"),
+       py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
+
+    m.def("cutlass_fp16_sq", [](uintptr_t A, uintptr_t B, uintptr_t D,
+                                  int M, int N, int K, float alpha, float beta, uintptr_t stream) {
+        return cutlass_fp16_sq(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, alpha, beta, to_stream(stream));
+    }, py::arg("A"), py::arg("B"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"),
+       py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
+
+    m.def("cutlass_fp16_t1", [](uintptr_t A, uintptr_t B, uintptr_t D,
+                                  int M, int N, int K, float alpha, float beta, uintptr_t stream) {
+        return cutlass_fp16_t1(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, alpha, beta, to_stream(stream));
+    }, py::arg("A"), py::arg("B"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"),
+       py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
+
+    m.def("cutlass_fp16_wide", [](uintptr_t A, uintptr_t B, uintptr_t D,
+                                    int M, int N, int K, float alpha, float beta, uintptr_t stream) {
+        return cutlass_fp16_wide(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, alpha, beta, to_stream(stream));
     }, py::arg("A"), py::arg("B"), py::arg("D"),
        py::arg("M"), py::arg("N"), py::arg("K"),
        py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
