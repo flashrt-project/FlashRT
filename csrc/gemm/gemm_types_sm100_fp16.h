@@ -176,6 +176,35 @@ using Gemm = cutlass::gemm::device::GemmUniversalAdapter<
 }  // namespace sm100_fp16_k64
 
 // ============================================================
+//  SqGeluFp16: sq tile (256×256×128 C(2,2,1)) with GELU-tanh epilogue.
+//  R3.1-tile-sweep winner for split-G7 shape M=1024 N=H=16384 K=2048
+//  (sq 606.7us beats k64 710.1us and cuBLAS 676.7us per isolation
+//  bench, n_trials=500).
+// ============================================================
+namespace sm100_fp16_sq_gelu {
+using Tile = Shape<_256, _256, _128>;
+using Cluster = Shape<_2, _2, _1>;
+using Fusion = cutlass::epilogue::fusion::LinCombEltAct<
+    GeluTanhApprox, cutlass_fp16_t, float>;
+using Epi = typename cutlass::epilogue::collective::CollectiveBuilder<
+    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+    Tile, Cluster, cutlass::epilogue::collective::EpilogueTileAuto,
+    float, float, cutlass_fp16_t, cutlass::layout::RowMajor, 8,
+    cutlass_fp16_t, cutlass::layout::RowMajor, 8,
+    cutlass::epilogue::collective::EpilogueScheduleAuto, Fusion>::CollectiveOp;
+using Main = typename cutlass::gemm::collective::CollectiveBuilder<
+    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+    cutlass_fp16_t, cutlass::layout::RowMajor, 8,
+    cutlass_fp16_t, cutlass::layout::ColumnMajor, 8,
+    float, Tile, Cluster,
+    cutlass::gemm::collective::StageCountAutoCarveout<
+        static_cast<int>(sizeof(typename Epi::SharedStorage))>,
+    cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+using Gemm = cutlass::gemm::device::GemmUniversalAdapter<
+    cutlass::gemm::kernel::GemmUniversal<Shape<int,int,int,int>, Main, Epi>>;
+}  // namespace sm100_fp16_sq_gelu
+
+// ============================================================
 //  K64GeluFp16: same tile as k64 but with GELU-tanh epilogue.
 //  Used by R3.1 split-G7: gate_buf = GELU(X @ W_gate).
 // ============================================================

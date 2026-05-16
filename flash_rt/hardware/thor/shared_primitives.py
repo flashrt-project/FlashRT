@@ -335,12 +335,16 @@ def _encoder_forward_fp16(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None
             # 15-warmup (Thor hot regime) showed P1 (-3.4 ms) clearly beats
             # P2 (+0.3 ms regression).  The Aux TMA load added enough
             # resource pressure to keep Thor in the slower power state.
+            # Tile re-sweep on the split shape (M=1024 N=H=16384 K=2048)
+            # showed sq tile (256x256x128 C(2,2,1)) wins by 14% vs the
+            # k64 borrowed from the encoder R1 sweep (sq 606us vs k64
+            # 710us).  Both gate and up use sq; gate has GELU baked in.
             up_w_ptr = weights['gate_w'][l] + H * D * 2
             up_buf = gate + Se * H * 2   # split the [Se,2H] gate buffer
-            fvk.cutlass_fp16_k64_gelu(x_norm, weights['gate_w'][l], gate,
-                                       Se, H, D, 1.0, 0.0, stream)
-            fvk.cutlass_fp16_k64(x_norm, up_w_ptr, up_buf,
-                                  Se, H, D, 1.0, 0.0, stream)
+            fvk.cutlass_fp16_sq_gelu(x_norm, weights['gate_w'][l], gate,
+                                      Se, H, D, 1.0, 0.0, stream)
+            fvk.cutlass_fp16_sq(x_norm, up_w_ptr, up_buf,
+                                 Se, H, D, 1.0, 0.0, stream)
             fvk.mul_fp16(gate, up_buf, hidden, Se * H, stream)
 
             # 10. Down GEMM (wide-K — R1.2 sweep winner: 2sm21 explicit 2SM-Sm100)

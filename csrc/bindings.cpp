@@ -284,6 +284,7 @@ extern "C" int cutlass_fp16_wide(void*, void*, void*, int, int, int, float, floa
 extern "C" int cutlass_fp16_k64(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp16_2sm21(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp16_k64_gelu(void*, void*, void*, int, int, int, float, float, cudaStream_t);
+extern "C" int cutlass_fp16_sq_gelu(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp16_k64_mul_aux(void*, void*, void*, void*, int, int, int, cudaStream_t);
 extern "C" int cutlass_fp16_sweep(int variant, void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp16_sweep_count();
@@ -1443,6 +1444,13 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     m.def("cutlass_fp16_k64_gelu", [](uintptr_t A, uintptr_t B, uintptr_t D,
                                        int M, int N, int K, float alpha, float beta, uintptr_t stream) {
         return cutlass_fp16_k64_gelu(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, alpha, beta, to_stream(stream));
+    }, py::arg("A"), py::arg("B"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"),
+       py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
+
+    m.def("cutlass_fp16_sq_gelu", [](uintptr_t A, uintptr_t B, uintptr_t D,
+                                      int M, int N, int K, float alpha, float beta, uintptr_t stream) {
+        return cutlass_fp16_sq_gelu(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, alpha, beta, to_stream(stream));
     }, py::arg("A"), py::arg("B"), py::arg("D"),
        py::arg("M"), py::arg("N"), py::arg("K"),
        py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);

@@ -100,6 +100,11 @@ int cutlass_fp16_k64_gelu(void* A, void* B, void* D, int M, int N, int K,
     return cutlass_run_impl_fp16<sm100_fp16_k64_gelu::Gemm>(A, B, D, M, N, K, alpha, beta, stream);
 }
 
+int cutlass_fp16_sq_gelu(void* A, void* B, void* D, int M, int N, int K,
+                          float alpha, float beta, cudaStream_t stream) {
+    return cutlass_run_impl_fp16<sm100_fp16_sq_gelu::Gemm>(A, B, D, M, N, K, alpha, beta, stream);
+}
+
 // R3.1 Phase 2 runner: GEMM with LinCombDeEltAct epilogue that multiplies
 // the accumulator by an auxiliary tensor (gate_buf [M, N] row-major).
 // D[m,n] = (acc[m,n]) * Aux[m,n].
