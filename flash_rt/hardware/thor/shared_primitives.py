@@ -316,24 +316,24 @@ def _encoder_forward_fp16(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None
                                         logits, attn_out,
                                         Se, Se, NH, HD, attn_scale, stream)
 
-            # 6. O proj (square shape — sq tile)
-            fvk.cutlass_fp16_sq(attn_out, weights['o_w'][l], fg,
-                                 Se, D, D, 1.0, 0.0, stream)
+            # 6. O proj (square shape — R1.2 sweep winner: k64 small-K pipeline)
+            fvk.cutlass_fp16_k64(attn_out, weights['o_w'][l], fg,
+                                  Se, D, D, 1.0, 0.0, stream)
 
             # 7. Residual + RMSNorm
             fvk.residual_add_fp16(x, fg, Se * D, stream)
             fvk.rms_norm_fp16(x, ones, x_norm, Se, D, 1e-6, stream)
 
-            # 8. Gate+Up GEMM (wide-N, big GEMM — t1 tile)
-            fvk.cutlass_fp16_t1(x_norm, weights['gate_w'][l], gate,
-                                 Se, H * 2, D, 1.0, 0.0, stream)
+            # 8. Gate+Up GEMM (wide-N, big GEMM — R1.2 sweep winner: k64)
+            fvk.cutlass_fp16_k64(x_norm, weights['gate_w'][l], gate,
+                                  Se, H * 2, D, 1.0, 0.0, stream)
 
             # 9. GELU(gate) × up
             fvk.gate_geglu_merged_fp16(gate, hidden, Se, H, stream)
 
-            # 10. Down GEMM (wide-K — wide tile)
-            fvk.cutlass_fp16_wide(hidden, weights['down_w'][l], fg,
-                                   Se, D, H, 1.0, 0.0, stream)
+            # 10. Down GEMM (wide-K — R1.2 sweep winner: 2sm21 explicit 2SM-Sm100)
+            fvk.cutlass_fp16_2sm21(hidden, weights['down_w'][l], fg,
+                                    Se, D, H, 1.0, 0.0, stream)
 
             # 11. Residual (next layer's RMSNorm done at top of next iter)
             fvk.residual_add_fp16(x, fg, Se * D, stream)

@@ -116,6 +116,65 @@ using Gemm = cutlass::gemm::device::GemmUniversalAdapter<
 }  // namespace sm100_fp16_t1
 
 // ============================================================
+//  K64Fp16: 256×256×64, Cluster 2×2×1 — small K-tile, deep pipeline
+//  R1.2 sweep winner for encoder G6 (O) and G7 (Gate+Up).
+//  K-tile=64 admits more pipeline stages, hiding BW latency on
+//  square/wide-N shapes (M=1024).
+// ============================================================
+namespace sm100_fp16_k64 {
+using Tile = Shape<_256, _256, _64>;
+using Cluster = Shape<_2, _2, _1>;
+using Fusion = cutlass::epilogue::fusion::LinCombEltAct<
+    cutlass::epilogue::thread::Identity, cutlass_fp16_t, float>;
+using Epi = typename cutlass::epilogue::collective::CollectiveBuilder<
+    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+    Tile, Cluster, cutlass::epilogue::collective::EpilogueTileAuto,
+    float, float, cutlass_fp16_t, cutlass::layout::RowMajor, 8,
+    cutlass_fp16_t, cutlass::layout::RowMajor, 8,
+    cutlass::epilogue::collective::EpilogueScheduleAuto, Fusion>::CollectiveOp;
+using Main = typename cutlass::gemm::collective::CollectiveBuilder<
+    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+    cutlass_fp16_t, cutlass::layout::RowMajor, 8,
+    cutlass_fp16_t, cutlass::layout::ColumnMajor, 8,
+    float, Tile, Cluster,
+    cutlass::gemm::collective::StageCountAutoCarveout<
+        static_cast<int>(sizeof(typename Epi::SharedStorage))>,
+    cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+using Gemm = cutlass::gemm::device::GemmUniversalAdapter<
+    cutlass::gemm::kernel::GemmUniversal<Shape<int,int,int,int>, Main, Epi>>;
+}  // namespace sm100_fp16_k64
+
+// ============================================================
+//  Sm2x1Fp16: 256×256×128, Cluster 2×1×1, explicit 2SM-Sm100
+//  R1.2 sweep winner for encoder G8 (Down M=1024 N=2048 K=16384).
+//  K-heavy shapes prefer the 2x1x1 cluster (less cross-SM
+//  contention, more SMEM per stage) with the explicit 2SM
+//  kernel/epilogue schedule.
+// ============================================================
+namespace sm100_fp16_2sm21 {
+using Tile = Shape<_256, _256, _128>;
+using Cluster = Shape<_2, _1, _1>;
+using Fusion = cutlass::epilogue::fusion::LinCombEltAct<
+    cutlass::epilogue::thread::Identity, cutlass_fp16_t, float>;
+using Epi = typename cutlass::epilogue::collective::CollectiveBuilder<
+    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+    Tile, Cluster, cutlass::epilogue::collective::EpilogueTileAuto,
+    float, float, cutlass_fp16_t, cutlass::layout::RowMajor, 8,
+    cutlass_fp16_t, cutlass::layout::RowMajor, 8,
+    cutlass::epilogue::TmaWarpSpecialized2Sm, Fusion>::CollectiveOp;
+using Main = typename cutlass::gemm::collective::CollectiveBuilder<
+    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+    cutlass_fp16_t, cutlass::layout::RowMajor, 8,
+    cutlass_fp16_t, cutlass::layout::ColumnMajor, 8,
+    float, Tile, Cluster,
+    cutlass::gemm::collective::StageCountAutoCarveout<
+        static_cast<int>(sizeof(typename Epi::SharedStorage))>,
+    cutlass::gemm::KernelTmaWarpSpecialized2SmSm100>::CollectiveOp;
+using Gemm = cutlass::gemm::device::GemmUniversalAdapter<
+    cutlass::gemm::kernel::GemmUniversal<Shape<int,int,int,int>, Main, Epi>>;
+}  // namespace sm100_fp16_2sm21
+
+// ============================================================
 //  WideFp16: 256×128×128 — deeper K for wide-K shapes
 //  Targets encoder G8 (Down M=1024 N=2048 K=16384)
 // ============================================================

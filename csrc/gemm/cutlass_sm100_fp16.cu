@@ -85,4 +85,14 @@ int cutlass_fp16_wide(void* A, void* B, void* D, int M, int N, int K,
     return cutlass_run_impl_fp16<sm100_fp16_wide::Gemm>(A, B, D, M, N, K, alpha, beta, stream);
 }
 
+int cutlass_fp16_k64(void* A, void* B, void* D, int M, int N, int K,
+                      float alpha, float beta, cudaStream_t stream) {
+    return cutlass_run_impl_fp16<sm100_fp16_k64::Gemm>(A, B, D, M, N, K, alpha, beta, stream);
+}
+
+int cutlass_fp16_2sm21(void* A, void* B, void* D, int M, int N, int K,
+                        float alpha, float beta, cudaStream_t stream) {
+    return cutlass_run_impl_fp16<sm100_fp16_2sm21::Gemm>(A, B, D, M, N, K, alpha, beta, stream);
+}
+
 }  // extern "C"

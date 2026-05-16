@@ -281,6 +281,10 @@ extern "C" int cutlass_fp16_plain(void*, void*, void*, int, int, int, float, flo
 extern "C" int cutlass_fp16_sq(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp16_t1(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp16_wide(void*, void*, void*, int, int, int, float, float, cudaStream_t);
+extern "C" int cutlass_fp16_k64(void*, void*, void*, int, int, int, float, float, cudaStream_t);
+extern "C" int cutlass_fp16_2sm21(void*, void*, void*, int, int, int, float, float, cudaStream_t);
+extern "C" int cutlass_fp16_sweep(int variant, void*, void*, void*, int, int, int, float, float, cudaStream_t);
+extern "C" int cutlass_fp16_sweep_count();
 extern "C" int cutlass_fp8_plain(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp8_gelu(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp8_sq_f32out(void*, void*, void*, int, int, int, float, float, cudaStream_t);
@@ -1412,6 +1416,30 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("A"), py::arg("B"), py::arg("D"),
        py::arg("M"), py::arg("N"), py::arg("K"),
        py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
+
+    m.def("cutlass_fp16_k64", [](uintptr_t A, uintptr_t B, uintptr_t D,
+                                  int M, int N, int K, float alpha, float beta, uintptr_t stream) {
+        return cutlass_fp16_k64(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, alpha, beta, to_stream(stream));
+    }, py::arg("A"), py::arg("B"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"),
+       py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
+
+    m.def("cutlass_fp16_2sm21", [](uintptr_t A, uintptr_t B, uintptr_t D,
+                                    int M, int N, int K, float alpha, float beta, uintptr_t stream) {
+        return cutlass_fp16_2sm21(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, alpha, beta, to_stream(stream));
+    }, py::arg("A"), py::arg("B"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"),
+       py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
+
+    // R1.1 tile-sweep dispatch (transient; remove once winner is promoted).
+    m.def("cutlass_fp16_sweep", [](int variant, uintptr_t A, uintptr_t B, uintptr_t D,
+                                    int M, int N, int K, float alpha, float beta, uintptr_t stream) {
+        return cutlass_fp16_sweep(variant, to_ptr(A), to_ptr(B), to_ptr(D),
+                                  M, N, K, alpha, beta, to_stream(stream));
+    }, py::arg("variant"), py::arg("A"), py::arg("B"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"),
+       py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
+    m.def("cutlass_fp16_sweep_count", []() { return cutlass_fp16_sweep_count(); });
 
     // FP32 output variants — for models with activations exceeding FP16 range
     m.def("cutlass_fp8_sq_f32out", [](uintptr_t A, uintptr_t B, uintptr_t D,
