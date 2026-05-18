@@ -252,6 +252,58 @@ if(ENABLE_SM100_CUTLASS)
     >
   )
 
+  # MK-1 encoder split-G7 megakernel (gate+up GeGLU fused).  Stage A.0
+  # scaffold: byte-copy of the vendored single-GEMM kernel under a new
+  # name; Stage A.1 will extend to the two-Mainloop/Epilogue chain.
+  # Plan: megakernel_dev/notes/MK1_DESIGN_V2.md.
+  add_library(flashrt_megakernel_geglu_obj OBJECT csrc/gemm/mega/flashrt_megakernel_geglu.cu)
+  set_target_properties(flashrt_megakernel_geglu_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  # Include-path priority (mirrors libfmha_fp16_strided rules):
+  #   1. csrc/gemm/mega/  — vendored CUTLASS hooks under cutlass/pipeline,
+  #      cutlass/epilogue/collective, cutlass/gemm/collective. MUST be
+  #      before ${CUTLASS_INCLUDE} so the patched headers shadow the
+  #      stock CUTLASS versions only for this translation unit.
+  #   2. ${CUTLASS_INCLUDE} — upstream CUTLASS for everything else.
+  target_include_directories(flashrt_megakernel_geglu_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/mega
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(flashrt_megakernel_geglu_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+
+  # MK-2 scaffold (F-1): fused GeGLU + G8 down-proj + residual megakernel.
+  # F-1 is currently a byte-equivalent copy of MK-1 (same per-tile
+  # behaviour) with the class renamed.  F-2..F-6 will extend the kernel
+  # to fold the down GEMM via persistent CTA + h_chunk loop.  Same
+  # include-precedence rules as MK-1 (mega dir before upstream CUTLASS).
+  # Plan: megakernel_dev/notes/MK2_DESIGN.md.
+  add_library(flashrt_megakernel_geglu_g8_obj OBJECT csrc/gemm/mega/flashrt_megakernel_geglu_g8.cu)
+  set_target_properties(flashrt_megakernel_geglu_g8_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(flashrt_megakernel_geglu_g8_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/mega
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(flashrt_megakernel_geglu_g8_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+
   # Path C encoder MLP megakernel (scaffold, fallback to 3-step GEMMs).
   add_library(encoder_mlp_sm100_obj OBJECT csrc/gemm/mega/encoder_mlp_sm100.cu)
   set_target_properties(encoder_mlp_sm100_obj PROPERTIES
@@ -773,7 +825,9 @@ if(ENABLE_SM100_CUTLASS)
     $<TARGET_OBJECTS:cutlass_sm100_fp16_obj>
     $<TARGET_OBJECTS:cutlass_sm100_fp16_sweep_obj>
     $<TARGET_OBJECTS:encoder_mlp_sm100_obj>
-    $<TARGET_OBJECTS:flashrt_megakernel_obj>)
+    $<TARGET_OBJECTS:flashrt_megakernel_obj>
+    $<TARGET_OBJECTS:flashrt_megakernel_geglu_obj>
+    $<TARGET_OBJECTS:flashrt_megakernel_geglu_g8_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_SM100_CUTLASS=1)
 endif()
 

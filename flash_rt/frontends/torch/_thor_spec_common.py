@@ -39,6 +39,11 @@ def paligemma_siglip_block(
     row-major layout (the ``T()`` transpose is kept so ``gemm.fp16_nn``
     can read them directly). ``Quant()`` is dropped and ``_sig_alpha``
     is not populated.
+
+    Tested 2026-05-18: dropping T() + switching to CUTLASS NT
+    (`cutlass_fp16_wide`) gives bit-exact output (cos=1.0) but no net
+    hot-regime win at Pi0.5 SigLIP shape (3-round mean 84.13 vs 83.87
+    cublas; within ±0.5 ms noise).  Kept cuBLAS to avoid layout risk.
     """
     qkv_tx  = [T(), Quant()]              if use_fp8 else [T()]
     o_tx    = [ToFp16(), T(), Quant()]    if use_fp8 else [ToFp16(), T()]

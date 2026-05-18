@@ -292,6 +292,31 @@ extern "C" int encoder_mlp_fused_fp16(void*, void*, void*, void*,
 extern "C" int flashrt_megakernel_single_fp16(void*, void*, void*,
                                                int, int, int,
                                                float, float, cudaStream_t);
+extern "C" int flashrt_megakernel_geglu_fp16(void*, void*, void*,
+                                              void*, void*,
+                                              int, int, int,
+                                              cudaStream_t);
+// (Stage B-v2 signature: X, W_gate, W_up, D_gate_scratch, hidden, M, N, K, stream)
+// MK-2 fused entry: (X, W_gate, W_up, W_down, hidden_scratch, x_inout, M, H, D, stream)
+// Computes x_inout += GeGLU(X @ W_gate, X @ W_up) @ W_down.
+// F-2: bundles MK-1 mega + 2sm21(beta=1) internally (two launches).
+// F-3+: replaces with a single persistent-CTA fused kernel.
+extern "C" int flashrt_megakernel_geglu_g8_fp16(void*, void*, void*,
+                                                 void*,
+                                                 void*, void*,
+                                                 int, int, int,
+                                                 cudaStream_t);
+
+// MK-2 F-3 bundle: rms_norm + mega + G8 + resid into one C entry.
+extern "C" int flashrt_encoder_ffn_block_fp16(void*, void*, void*,
+                                               void*, void*, void*,
+                                               void*, void*,
+                                               int, int, int, float,
+                                               cudaStream_t);
+
+// Bundle: rms_norm + QKV (k64) into one C entry.
+extern "C" int flashrt_rms_qkv_fp16(void*, void*, void*, void*, void*,
+                                     int, int, int, float, cudaStream_t);
 extern "C" int cutlass_fp16_sweep(int variant, void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp16_sweep_count();
 extern "C" int cutlass_fp8_plain(void*, void*, void*, int, int, int, float, float, cudaStream_t);
@@ -1482,6 +1507,79 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
           py::arg("M"), py::arg("N"), py::arg("K"),
           py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f,
           py::arg("stream") = 0);
+
+    // MK-1 megakernel (Stage A.1).  Two-phase chain: one kernel launch
+    // computes D_gate = GELU(X @ W_gate) AND D_up = X @ W_up.  Both
+    // sub-GEMMs share one tcgen05.alloc; per-CTA work tile runs phase1
+    // then phase2 in series via a single AccumulatorPipeline.  Stage B
+    // (SMEM_gate routing) will fold the GeGLU multiply into the kernel.
+    // Plan: megakernel_dev/notes/MK1_DESIGN_V2.md.
+    m.def("flashrt_megakernel_geglu_fp16",
+          [](uintptr_t X, uintptr_t W_gate, uintptr_t W_up,
+             uintptr_t D_gate_scratch, uintptr_t hidden,
+             int M, int N, int K, uintptr_t stream) {
+              return flashrt_megakernel_geglu_fp16(
+                  to_ptr(X), to_ptr(W_gate), to_ptr(W_up),
+                  to_ptr(D_gate_scratch), to_ptr(hidden),
+                  M, N, K, to_stream(stream));
+          },
+          py::arg("X"), py::arg("W_gate"), py::arg("W_up"),
+          py::arg("D_gate_scratch"), py::arg("hidden"),
+          py::arg("M"), py::arg("N"), py::arg("K"),
+          py::arg("stream") = 0);
+
+    // MK-2 fused GeGLU + G8 + resid.  F-2 bundles two launches inside
+    // the .cu entry; F-3+ folds them into one persistent-CTA kernel.
+    // Plan: megakernel_dev/notes/MK2_DESIGN.md.
+    m.def("flashrt_megakernel_geglu_g8_fp16",
+          [](uintptr_t X, uintptr_t W_gate, uintptr_t W_up,
+             uintptr_t W_down,
+             uintptr_t hidden_scratch, uintptr_t x_inout,
+             int M, int H, int D, uintptr_t stream) {
+              return flashrt_megakernel_geglu_g8_fp16(
+                  to_ptr(X), to_ptr(W_gate), to_ptr(W_up),
+                  to_ptr(W_down),
+                  to_ptr(hidden_scratch), to_ptr(x_inout),
+                  M, H, D, to_stream(stream));
+          },
+          py::arg("X"), py::arg("W_gate"), py::arg("W_up"),
+          py::arg("W_down"),
+          py::arg("hidden_scratch"), py::arg("x_inout"),
+          py::arg("M"), py::arg("H"), py::arg("D"),
+          py::arg("stream") = 0);
+
+    // Bundle: rms_norm + QKV (k64) in one C entry.
+    m.def("flashrt_rms_qkv_fp16",
+          [](uintptr_t x, uintptr_t rms_weight, uintptr_t x_norm,
+             uintptr_t qkv_weight, uintptr_t qkv_out,
+             int M, int D, int N_qkv, float rms_eps, uintptr_t stream) {
+              return flashrt_rms_qkv_fp16(
+                  to_ptr(x), to_ptr(rms_weight), to_ptr(x_norm),
+                  to_ptr(qkv_weight), to_ptr(qkv_out),
+                  M, D, N_qkv, rms_eps, to_stream(stream));
+          },
+          py::arg("x"), py::arg("rms_weight"), py::arg("x_norm"),
+          py::arg("qkv_weight"), py::arg("qkv_out"),
+          py::arg("M"), py::arg("D"), py::arg("N_qkv"),
+          py::arg("rms_eps") = 1e-6f, py::arg("stream") = 0);
+
+    // MK-2 F-3: bundled FFN block — rms_norm + mega + G8 + resid in one C.
+    m.def("flashrt_encoder_ffn_block_fp16",
+          [](uintptr_t x_resid, uintptr_t rms_weight, uintptr_t x_norm,
+             uintptr_t W_gate, uintptr_t W_up, uintptr_t W_down,
+             uintptr_t gate_scratch, uintptr_t hidden_scratch,
+             int M, int H, int D, float rms_eps, uintptr_t stream) {
+              return flashrt_encoder_ffn_block_fp16(
+                  to_ptr(x_resid), to_ptr(rms_weight), to_ptr(x_norm),
+                  to_ptr(W_gate), to_ptr(W_up), to_ptr(W_down),
+                  to_ptr(gate_scratch), to_ptr(hidden_scratch),
+                  M, H, D, rms_eps, to_stream(stream));
+          },
+          py::arg("x_resid"), py::arg("rms_weight"), py::arg("x_norm"),
+          py::arg("W_gate"), py::arg("W_up"), py::arg("W_down"),
+          py::arg("gate_scratch"), py::arg("hidden_scratch"),
+          py::arg("M"), py::arg("H"), py::arg("D"),
+          py::arg("rms_eps") = 1e-6f, py::arg("stream") = 0);
 
     // Path C encoder MLP megakernel (currently a 3-step fallback;
     // real SMEM-staged kernel TBD in future sessions).
