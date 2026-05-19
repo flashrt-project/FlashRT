@@ -62,7 +62,7 @@ def main():
     parser.add_argument('--max_steps', type=int, default=50,
                         help="Pi0-FAST: max decode steps for benchmark")
     parser.add_argument('--hardware', default='auto',
-                        choices=['auto', 'thor', 'rtx_sm120', 'rtx_sm89'],
+                        choices=['auto', 'thor', 'rtx_sm120', 'rtx_sm89', 'rtx_sm87'],
                         help="Backend selection; default auto-detects SM level")
     parser.add_argument('--embodiment_tag', default=None,
                         help="GROOT only. Trained slots in GR00T-N1.6-3B base: "

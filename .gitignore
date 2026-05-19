@@ -42,3 +42,4 @@ training/_runs/**
 # release surface). Mirror the FlashVLA dev convention.
 internal-tests/
 internal-docs/
+notes/

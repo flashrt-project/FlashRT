@@ -69,12 +69,15 @@ endif()
 message(STATUS "Using gencode flag: ${GPU_GENCODE}")
 
 # Flash-Attention 2 vendor (csrc/attention/flash_attn_2_src/): ships
-# SM80-family fp16 fwd kernels. SM89 (4090) runs sm_80 SASS natively
-# via Ampere ISA compatibility; SM120 (5090) uses PTX JIT from
+# SM80-family fp16 fwd kernels. Ampere-family consumer GPUs including
+# SM86/87/89 share the same source instantiations; we emit arch-specific
+# codegen per target so Jetson Orin (SM87) is not forced through an
+# incompatible cubin. SM120 (5090) uses PTX JIT from
 # compute_80. Thor SM110 has its own attention path (fvk.attention_qkv_fp16
 # cuBLAS decomposed), hand-tuned for unified LPDDR memory — building
 # FA2 there would add ~10 MB to the .so and unused compile time.
 if(GPU_ARCH STREQUAL "80"  OR GPU_ARCH STREQUAL "86" OR
+   GPU_ARCH STREQUAL "87"  OR
    GPU_ARCH STREQUAL "89"  OR GPU_ARCH STREQUAL "120")
   set(ENABLE_FA2 ON)
   message(STATUS "FA2 in-SO attention: ENABLED (sm_${GPU_ARCH})")
@@ -417,7 +420,8 @@ if(ENABLE_FA2)
     # Just emit native SASS for the detected GPU. Use the real arch
     # (compute_80 for SM80/86/89 since they share Ampere ISA; direct
     # compute_120 for SM120). Matches upstream FA2 setup.py behaviour.
-    if(GPU_ARCH STREQUAL "80" OR GPU_ARCH STREQUAL "86" OR GPU_ARCH STREQUAL "89")
+    if(GPU_ARCH STREQUAL "80" OR GPU_ARCH STREQUAL "86" OR
+       GPU_ARCH STREQUAL "87" OR GPU_ARCH STREQUAL "89")
       target_compile_options(fa2_vendor_obj PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:
           "SHELL:-gencode arch=compute_80,code=sm_${GPU_ARCH}"

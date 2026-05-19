@@ -36,6 +36,7 @@ def detect_arch() -> str:
         ``"thor"``      — Jetson AGX Thor, SM110 (cc 11.0)
         ``"rtx_sm120"`` — RTX 5090 / Blackwell consumer, SM120 (cc 12.0)
         ``"rtx_sm89"``  — RTX 4090 / Ada, SM89 (cc 8.9)
+        ``"rtx_sm87"``  — Jetson Orin via RTX consumer backend, SM87 (cc 8.7)
 
     Raises RuntimeError if CUDA is unavailable or the card has an
     unsupported SM level. Deliberately strict: silently falling back to
@@ -55,12 +56,14 @@ def detect_arch() -> str:
         return "thor"
     if (major, minor) == (12, 0):
         return "rtx_sm120"
+    if (major, minor) == (8, 7):
+        return "rtx_sm87"
     if (major, minor) == (8, 9):
         return "rtx_sm89"
     raise RuntimeError(
         f"FlashRT: unsupported GPU SM {major}.{minor}. "
         f"Supported architectures: SM110 (Thor), SM120 (RTX 5090), "
-        f"SM89 (RTX 4090)."
+        f"SM89 (RTX 4090), SM87 (Jetson Orin experimental)."
     )
 
 
@@ -74,11 +77,15 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
         ("flash_rt.frontends.torch.pi05_thor", "Pi05TorchFrontendThor"),
     ("pi05", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
+    ("pi05", "torch", "rtx_sm87"):
+        ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
     ("pi05", "torch", "rtx_sm89"):
         ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
     ("pi05", "jax", "thor"):
         ("flash_rt.frontends.jax.pi05_thor", "Pi05JaxFrontendThor"),
     ("pi05", "jax", "rtx_sm120"):
+        ("flash_rt.frontends.jax.pi05_rtx", "Pi05JaxFrontendRtx"),
+    ("pi05", "jax", "rtx_sm87"):
         ("flash_rt.frontends.jax.pi05_rtx", "Pi05JaxFrontendRtx"),
     ("pi05", "jax", "rtx_sm89"):
         ("flash_rt.frontends.jax.pi05_rtx", "Pi05JaxFrontendRtx"),
@@ -88,11 +95,15 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
         ("flash_rt.frontends.torch.pi0_thor", "Pi0TorchFrontendThor"),
     ("pi0", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.pi0_rtx", "Pi0TorchFrontendRtx"),
+    ("pi0", "torch", "rtx_sm87"):
+        ("flash_rt.frontends.torch.pi0_rtx", "Pi0TorchFrontendRtx"),
     ("pi0", "torch", "rtx_sm89"):
         ("flash_rt.frontends.torch.pi0_rtx", "Pi0TorchFrontendRtx"),
     ("pi0", "jax", "thor"):
         ("flash_rt.frontends.jax.pi0_thor", "Pi0JaxFrontendThor"),
     ("pi0", "jax", "rtx_sm120"):
+        ("flash_rt.frontends.jax.pi0_rtx", "Pi0JaxFrontendRtx"),
+    ("pi0", "jax", "rtx_sm87"):
         ("flash_rt.frontends.jax.pi0_rtx", "Pi0JaxFrontendRtx"),
     ("pi0", "jax", "rtx_sm89"):
         ("flash_rt.frontends.jax.pi0_rtx", "Pi0JaxFrontendRtx"),

@@ -225,7 +225,12 @@ def _read_json(path: pathlib.Path) -> dict:
 
 def _try_json_candidate(path: pathlib.Path) -> Optional[dict]:
     """Parse a single JSON candidate; return openpi-shaped dict or None."""
-    if not path.exists():
+    try:
+        exists = path.exists()
+    except OSError as e:
+        logger.warning("norm_stats: cannot access %s: %s", path, e)
+        return None
+    if not exists:
         return None
     try:
         data = _read_json(path)
@@ -328,4 +333,27 @@ def lerobot_candidates(checkpoint_dir: pathlib.Path) -> list[pathlib.Path]:
     return [
         checkpoint_dir / "meta" / "stats.json",
         checkpoint_dir / "stats.json",
+    ]
+
+
+def pi05_candidates(checkpoint_dir: pathlib.Path) -> list[pathlib.Path]:
+    """Common norm-stats locations for Pi0.5 checkpoints.
+
+    Supports both the original ``pi05_libero`` openpi layout and the
+    ``pi05_droid`` / ``pi05_droid_pytorch`` layout used by DROID
+    checkpoints. The latter stores stats under ``assets/droid`` instead
+    of ``assets/physical-intelligence/libero``.
+    """
+    home = pathlib.Path.home()
+    return [
+        checkpoint_dir / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
+        checkpoint_dir / "assets" / "droid" / "norm_stats.json",
+        checkpoint_dir.parent / "pi05_libero" / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
+        checkpoint_dir.parent / "pi05_droid" / "assets" / "droid" / "norm_stats.json",
+        checkpoint_dir.parent / "pi05_droid_pytorch" / "assets" / "droid" / "norm_stats.json",
+        checkpoint_dir / "norm_stats.json",
+        home / ".cache" / "openpi" / "openpi-assets" / "checkpoints" / "pi05_libero" / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
+        home / ".cache" / "openpi" / "openpi-assets" / "checkpoints" / "pi05_droid" / "assets" / "droid" / "norm_stats.json",
+        home / ".cache" / "openpi" / "openpi-assets" / "checkpoints" / "pi05_droid_pytorch" / "assets" / "droid" / "norm_stats.json",
+        *lerobot_candidates(checkpoint_dir),
     ]
