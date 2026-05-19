@@ -108,6 +108,12 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("groot", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.groot_rtx", "GrootTorchFrontendRtx"),
 
+    # ── Motus (Wan2.2 + Qwen-VL + action/understanding experts) ──
+    # RTX 5090 path only for now. Motus uses a bundle-based E2E contract
+    # rather than the image-list VLA API used by Pi0/Pi0.5/GROOT.
+    ("motus", "torch", "rtx_sm120"):
+        ("flash_rt.frontends.torch.motus_rtx", "MotusTorchFrontendRtx"),
+
     # ── Pi0-FAST ── (SM120 runtime fork inside pipeline, no AttentionBackend protocol.)
     ("pi0fast", "torch", "thor"):
         ("flash_rt.frontends.torch.pi0fast", "Pi0FastTorchFrontend"),

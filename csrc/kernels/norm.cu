@@ -38,8 +38,9 @@ __global__ void rms_norm_kernel(const T* __restrict__ x,
 }
 
 // Explicit instantiation
-FVK_KERNEL_INSTANTIATE(__global__ void rms_norm_kernel<__half>(const __half*, const __half*, __half*, int, float))
-FVK_KERNEL_INSTANTIATE(__global__ void rms_norm_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, float))
+template __global__ void rms_norm_kernel<__half>(const __half*, const __half*, __half*, int, float);
+template __global__ void rms_norm_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, float);
+
 void rms_norm(const __nv_bfloat16* x, const __nv_bfloat16* weight,
               __nv_bfloat16* out, int seq_len, int dim, float eps,
               cudaStream_t stream) {
@@ -55,6 +56,57 @@ void rms_norm_inplace(const __nv_bfloat16* weight,
                       __nv_bfloat16* x, int seq_len, int dim, float eps,
                       cudaStream_t stream) {
     rms_norm_kernel<__nv_bfloat16><<<seq_len, 256, 256 * sizeof(float), stream>>>(x, weight, x, dim, eps);
+}
+
+__global__ void bias_rms_norm_bf16_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ bias,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ out,
+    int dim, float eps) {
+    using T2 = typename packed2<__nv_bfloat16>::type;
+    int row = blockIdx.x;
+    const T2* x2 = reinterpret_cast<const T2*>(x + row * dim);
+    const T2* b2 = reinterpret_cast<const T2*>(bias);
+    const T2* w2 = reinterpret_cast<const T2*>(weight);
+    T2* out2 = reinterpret_cast<T2*>(out + row * dim);
+    int dim2 = dim >> 1;
+
+    extern __shared__ float shared[];
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+        T2 xv = x2[i], bv = b2[i];
+        __nv_bfloat16 xb0_b = __float2bfloat16(
+            __bfloat162float(xv.x) + __bfloat162float(bv.x));
+        __nv_bfloat16 xb1_b = __float2bfloat16(
+            __bfloat162float(xv.y) + __bfloat162float(bv.y));
+        float xb0 = __bfloat162float(xb0_b);
+        float xb1 = __bfloat162float(xb1_b);
+        local_sum += xb0 * xb0 + xb1 * xb1;
+    }
+    float rms = rsqrtf(block_reduce_sum(local_sum, shared) / dim + eps);
+
+    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+        T2 xv = x2[i], bv = b2[i], wv = w2[i];
+        __nv_bfloat16 xb0_b = __float2bfloat16(
+            __bfloat162float(xv.x) + __bfloat162float(bv.x));
+        __nv_bfloat16 xb1_b = __float2bfloat16(
+            __bfloat162float(xv.y) + __bfloat162float(bv.y));
+        float v0 = __bfloat162float(xb0_b) * rms * __bfloat162float(wv.x);
+        float v1 = __bfloat162float(xb1_b) * rms * __bfloat162float(wv.y);
+        out2[i] = __halves2bfloat162(__float2bfloat16(v0),
+                                     __float2bfloat16(v1));
+    }
+}
+
+void bias_rms_norm_bf16(const __nv_bfloat16* x,
+                        const __nv_bfloat16* bias,
+                        const __nv_bfloat16* weight,
+                        __nv_bfloat16* out,
+                        int seq_len, int dim, float eps,
+                        cudaStream_t stream) {
+    bias_rms_norm_bf16_kernel<<<seq_len, 256, 256 * sizeof(float), stream>>>(
+        x, bias, weight, out, dim, eps);
 }
 
 // ── LayerNorm ──
@@ -96,8 +148,9 @@ __global__ void layer_norm_kernel(const T* __restrict__ x,
     }
 }
 
-FVK_KERNEL_INSTANTIATE(__global__ void layer_norm_kernel<__half>(const __half*, const __half*, const __half*, __half*, int, float))
-FVK_KERNEL_INSTANTIATE(__global__ void layer_norm_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, float))
+template __global__ void layer_norm_kernel<__half>(const __half*, const __half*, const __half*, __half*, int, float);
+template __global__ void layer_norm_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, float);
+
 void layer_norm(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                 const __nv_bfloat16* bias, __nv_bfloat16* out,
                 int seq_len, int dim, float eps, cudaStream_t stream) {
@@ -167,7 +220,8 @@ __global__ void layer_norm_fp8_kernel(const T* __restrict__ x,
     }
 }
 
-FVK_KERNEL_INSTANTIATE(__global__ void layer_norm_fp8_kernel<__nv_bfloat16>(const __nv_bfloat16*, __nv_fp8_e4m3*, const __nv_bfloat16*, const __nv_bfloat16*, int, float))
+template __global__ void layer_norm_fp8_kernel<__nv_bfloat16>(const __nv_bfloat16*, __nv_fp8_e4m3*, const __nv_bfloat16*, const __nv_bfloat16*, int, float);
+
 void layer_norm_fp8(const __half* x, __nv_fp8_e4m3* out,
                      const __half* gamma, const __half* beta,
                      int seq_len, int dim, float eps, cudaStream_t stream) {
@@ -178,6 +232,54 @@ void layer_norm_fp8_bf16(const __nv_bfloat16* x, __nv_fp8_e4m3* out,
                           const __nv_bfloat16* gamma, const __nv_bfloat16* beta,
                           int seq_len, int dim, float eps, cudaStream_t stream) {
     layer_norm_fp8_kernel<__nv_bfloat16><<<seq_len, 256, 256 * sizeof(float), stream>>>(x, out, gamma, beta, dim, eps);
+}
+
+__global__ void awq_layer_norm_fp8_bf16_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    __nv_fp8_e4m3* __restrict__ out,
+    const __nv_bfloat16* __restrict__ gamma,
+    const __nv_bfloat16* __restrict__ beta,
+    const __nv_bfloat16* __restrict__ inv_s,
+    const float* __restrict__ d_scale,
+    int dim, float eps) {
+    int row = blockIdx.x;
+    const __nv_bfloat16* x_row = x + (long long)row * dim;
+    __nv_fp8_e4m3* o_row = out + (long long)row * dim;
+
+    extern __shared__ float shared[];
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x)
+        local_sum += __bfloat162float(x_row[i]);
+    float mean = block_reduce_sum(local_sum, shared) / dim;
+
+    float local_var = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float d = __bfloat162float(x_row[i]) - mean;
+        local_var += d * d;
+    }
+    float inv_std = rsqrtf(block_reduce_sum(local_var, shared) / dim + eps);
+    float inv_a = 1.0f / (*d_scale);
+
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float normed = (__bfloat162float(x_row[i]) - mean) * inv_std
+            * __bfloat162float(gamma[i]) + __bfloat162float(beta[i]);
+        float rounded = __bfloat162float(__float2bfloat16(normed));
+        float q = rounded * __bfloat162float(inv_s[i]) * inv_a;
+        q = fminf(fmaxf(q, -448.0f), 448.0f);
+        o_row[i] = __nv_fp8_e4m3(q);
+    }
+}
+
+void awq_layer_norm_fp8_bf16(const __nv_bfloat16* x,
+                             __nv_fp8_e4m3* out,
+                             const __nv_bfloat16* gamma,
+                             const __nv_bfloat16* beta,
+                             const __nv_bfloat16* inv_s,
+                             const float* d_scale,
+                             int seq_len, int dim, float eps,
+                             cudaStream_t stream) {
+    awq_layer_norm_fp8_bf16_kernel<<<seq_len, 256, 256 * sizeof(float), stream>>>(
+        x, out, gamma, beta, inv_s, d_scale, dim, eps);
 }
 
 // ── AdaRMSNorm + Style ──
@@ -219,89 +321,15 @@ __global__ void ada_rms_norm_style_kernel(
     }
 }
 
-FVK_KERNEL_INSTANTIATE(__global__ void ada_rms_norm_style_kernel<__half>(const __half*, const __half*, const __half*, __half*, __half*, int, float))
-FVK_KERNEL_INSTANTIATE(__global__ void ada_rms_norm_style_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, int, float))
+template __global__ void ada_rms_norm_style_kernel<__half>(const __half*, const __half*, const __half*, __half*, __half*, int, float);
+template __global__ void ada_rms_norm_style_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, int, float);
+
 void ada_rms_norm_style(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                         const __nv_bfloat16* style,
                         __nv_bfloat16* out, __nv_bfloat16* gate_out,
                         int seq_len, int dim, float eps, cudaStream_t stream) {
     ada_rms_norm_style_kernel<__nv_bfloat16><<<seq_len, 256, 256 * sizeof(float), stream>>>(
         x, weight, style, out, gate_out, dim, eps);
-}
-
-template<typename T>
-__global__ void ada_rms_norm_style_int8_kernel(
-    const T* __restrict__ x, const T* __restrict__ weight,
-    const T* __restrict__ style, int8_t* __restrict__ out, T* __restrict__ gate_out,
-    int dim, float eps, float* __restrict__ d_scales) {
-    using T2 = typename packed2<T>::type;
-    int row = blockIdx.x;
-    const T2* x2 = reinterpret_cast<const T2*>(x + row * dim);
-    const T* style_row = style + row * 3 * dim;
-    const T2* sc2 = reinterpret_cast<const T2*>(style_row);
-    const T2* sh2 = reinterpret_cast<const T2*>(style_row + dim);
-    const T2* gt2 = reinterpret_cast<const T2*>(style_row + 2 * dim);
-    const T2* w2 = reinterpret_cast<const T2*>(weight);
-    T2* gate2 = reinterpret_cast<T2*>(gate_out + row * dim);
-    int8_t* out_row = out + row * dim;
-    int dim2 = dim >> 1;
-
-    extern __shared__ float shared[];
-    float local_sum = 0.0f;
-    float local_amax = 0.0f;
-    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
-        T2 val = x2[i];
-        float v0 = to_f32(val.x), v1 = to_f32(val.y);
-        local_sum += v0 * v0 + v1 * v1;
-    }
-    float rms = rsqrtf(block_reduce_sum(local_sum, shared) / dim + eps);
-
-    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
-        T2 xv = x2[i], wv = w2[i];
-        T2 sv = sc2[i], hv = sh2[i];
-        float n0 = to_f32(xv.x) * rms * to_f32(wv.x);
-        float n1 = to_f32(xv.y) * rms * to_f32(wv.y);
-        float val0 = n0 * (1.0f + to_f32(sv.x)) + to_f32(hv.x);
-        float val1 = n1 * (1.0f + to_f32(sv.y)) + to_f32(hv.y);
-        local_amax = fmaxf(local_amax, fabsf(val0));
-        local_amax = fmaxf(local_amax, fabsf(val1));
-    }
-    float amax = block_reduce_max(local_amax, shared);
-    __shared__ float scale_s;
-    if (threadIdx.x == 0) {
-        float s = fmaxf(amax / 127.0f, 1e-10f);
-        d_scales[row] = s;
-        scale_s = s;
-    }
-    __syncthreads();
-    float inv_scale = 1.0f / scale_s;
-
-    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
-        T2 xv = x2[i], wv = w2[i];
-        T2 sv = sc2[i], hv = sh2[i], gv = gt2[i];
-        float n0 = to_f32(xv.x) * rms * to_f32(wv.x);
-        float n1 = to_f32(xv.y) * rms * to_f32(wv.y);
-        float val0 = (n0 * (1.0f + to_f32(sv.x)) + to_f32(hv.x)) * inv_scale;
-        float val1 = (n1 * (1.0f + to_f32(sv.y)) + to_f32(hv.y)) * inv_scale;
-        int q0 = __float2int_rn(val0);
-        int q1 = __float2int_rn(val1);
-        out_row[2 * i] = static_cast<int8_t>((q0 < -127) ? -127 : ((q0 > 127) ? 127 : q0));
-        out_row[2 * i + 1] = static_cast<int8_t>((q1 < -127) ? -127 : ((q1 > 127) ? 127 : q1));
-        gate2[i] = gv;
-    }
-}
-
-FVK_KERNEL_INSTANTIATE(__global__ void ada_rms_norm_style_int8_kernel<__half>(
-    const __half*, const __half*, const __half*, int8_t*, __half*, int, float, float*))
-FVK_KERNEL_INSTANTIATE(__global__ void ada_rms_norm_style_int8_kernel<__nv_bfloat16>(
-    const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, int8_t*, __nv_bfloat16*, int, float, float*))
-void ada_rms_norm_style_int8(const __nv_bfloat16* x, const __nv_bfloat16* weight,
-                             const __nv_bfloat16* style,
-                             int8_t* out, __nv_bfloat16* gate_out,
-                             int seq_len, int dim, float eps,
-                             float* d_scales, cudaStream_t stream) {
-    ada_rms_norm_style_int8_kernel<__nv_bfloat16><<<seq_len, 256, 256 * sizeof(float), stream>>>(
-        x, weight, style, out, gate_out, dim, eps, d_scales);
 }
 
 // ── RMSNorm → FP8 ──
@@ -337,8 +365,9 @@ __global__ void rms_norm_fp8_kernel(const T* __restrict__ x,
     }
 }
 
-FVK_KERNEL_INSTANTIATE(__global__ void rms_norm_fp8_kernel<__half>(const __half*, const __half*, __nv_fp8_e4m3*, int, float, const float*))
-FVK_KERNEL_INSTANTIATE(__global__ void rms_norm_fp8_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, __nv_fp8_e4m3*, int, float, const float*))
+template __global__ void rms_norm_fp8_kernel<__half>(const __half*, const __half*, __nv_fp8_e4m3*, int, float, const float*);
+template __global__ void rms_norm_fp8_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, __nv_fp8_e4m3*, int, float, const float*);
+
 void rms_norm_fp8(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                    __nv_fp8_e4m3* out, int seq_len, int dim, float eps,
                    const float* d_scale, cudaStream_t stream) {
@@ -391,8 +420,9 @@ __global__ void ada_rms_norm_style_fp8_kernel(
     }
 }
 
-FVK_KERNEL_INSTANTIATE(__global__ void ada_rms_norm_style_fp8_kernel<__half>(const __half*, const __half*, const __half*, __nv_fp8_e4m3*, __half*, int, float, const float*))
-FVK_KERNEL_INSTANTIATE(__global__ void ada_rms_norm_style_fp8_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_fp8_e4m3*, __nv_bfloat16*, int, float, const float*))
+template __global__ void ada_rms_norm_style_fp8_kernel<__half>(const __half*, const __half*, const __half*, __nv_fp8_e4m3*, __half*, int, float, const float*);
+template __global__ void ada_rms_norm_style_fp8_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_fp8_e4m3*, __nv_bfloat16*, int, float, const float*);
+
 void ada_rms_norm_style_fp8(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                              const __nv_bfloat16* style,
                              __nv_fp8_e4m3* out, __nv_bfloat16* gate_out,
@@ -437,8 +467,9 @@ __global__ void residual_add_rms_norm_fp8_kernel(
     }
 }
 
-FVK_KERNEL_INSTANTIATE(__global__ void residual_add_rms_norm_fp8_kernel<__half>(__half*, const __half*, const __half*, __nv_fp8_e4m3*, int, float, const float*))
-FVK_KERNEL_INSTANTIATE(__global__ void residual_add_rms_norm_fp8_kernel<__nv_bfloat16>(__nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_fp8_e4m3*, int, float, const float*))
+template __global__ void residual_add_rms_norm_fp8_kernel<__half>(__half*, const __half*, const __half*, __nv_fp8_e4m3*, int, float, const float*);
+template __global__ void residual_add_rms_norm_fp8_kernel<__nv_bfloat16>(__nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_fp8_e4m3*, int, float, const float*);
+
 void residual_add_rms_norm_fp8(__nv_bfloat16* residual, const __nv_bfloat16* x,
                                 const __nv_bfloat16* weight, __nv_fp8_e4m3* out,
                                 int seq_len, int dim, float eps,
@@ -487,8 +518,9 @@ __global__ void residual_add_rms_norm_kernel(
     }
 }
 
-FVK_KERNEL_INSTANTIATE(__global__ void residual_add_rms_norm_kernel<__half>(__half*, const __half*, const __half*, __half*, int, float))
-FVK_KERNEL_INSTANTIATE(__global__ void residual_add_rms_norm_kernel<__nv_bfloat16>(__nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, float))
+template __global__ void residual_add_rms_norm_kernel<__half>(__half*, const __half*, const __half*, __half*, int, float);
+template __global__ void residual_add_rms_norm_kernel<__nv_bfloat16>(__nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, float);
+
 void residual_add_rms_norm(__nv_bfloat16* residual, const __nv_bfloat16* x,
                             const __nv_bfloat16* weight, __nv_bfloat16* out,
                             int seq_len, int dim, float eps,
@@ -975,9 +1007,84 @@ void ada_layer_norm_fp16(const __half* x, const __half* scale, const __half* shi
         x, scale, shift, out, dim, eps);
 }
 
-// ── Fused RMSNorm → INT8 (per-row dynamic scale) ──
-//
-// Avoids the intermediate BF16 write that the separate
+
+// ---- Public Orin/INT8 helpers restored for API compatibility ----
+template<typename T>
+__global__ void ada_rms_norm_style_int8_kernel(
+    const T* __restrict__ x, const T* __restrict__ weight,
+    const T* __restrict__ style, int8_t* __restrict__ out, T* __restrict__ gate_out,
+    int dim, float eps, float* __restrict__ d_scales) {
+    using T2 = typename packed2<T>::type;
+    int row = blockIdx.x;
+    const T2* x2 = reinterpret_cast<const T2*>(x + row * dim);
+    const T* style_row = style + row * 3 * dim;
+    const T2* sc2 = reinterpret_cast<const T2*>(style_row);
+    const T2* sh2 = reinterpret_cast<const T2*>(style_row + dim);
+    const T2* gt2 = reinterpret_cast<const T2*>(style_row + 2 * dim);
+    const T2* w2 = reinterpret_cast<const T2*>(weight);
+    T2* gate2 = reinterpret_cast<T2*>(gate_out + row * dim);
+    int8_t* out_row = out + row * dim;
+    int dim2 = dim >> 1;
+
+    extern __shared__ float shared[];
+    float local_sum = 0.0f;
+    float local_amax = 0.0f;
+    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+        T2 val = x2[i];
+        float v0 = to_f32(val.x), v1 = to_f32(val.y);
+        local_sum += v0 * v0 + v1 * v1;
+    }
+    float rms = rsqrtf(block_reduce_sum(local_sum, shared) / dim + eps);
+
+    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+        T2 xv = x2[i], wv = w2[i];
+        T2 sv = sc2[i], hv = sh2[i];
+        float n0 = to_f32(xv.x) * rms * to_f32(wv.x);
+        float n1 = to_f32(xv.y) * rms * to_f32(wv.y);
+        float val0 = n0 * (1.0f + to_f32(sv.x)) + to_f32(hv.x);
+        float val1 = n1 * (1.0f + to_f32(sv.y)) + to_f32(hv.y);
+        local_amax = fmaxf(local_amax, fabsf(val0));
+        local_amax = fmaxf(local_amax, fabsf(val1));
+    }
+    float amax = block_reduce_max(local_amax, shared);
+    __shared__ float scale_s;
+    if (threadIdx.x == 0) {
+        float s = fmaxf(amax / 127.0f, 1e-10f);
+        d_scales[row] = s;
+        scale_s = s;
+    }
+    __syncthreads();
+    float inv_scale = 1.0f / scale_s;
+
+    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+        T2 xv = x2[i], wv = w2[i];
+        T2 sv = sc2[i], hv = sh2[i], gv = gt2[i];
+        float n0 = to_f32(xv.x) * rms * to_f32(wv.x);
+        float n1 = to_f32(xv.y) * rms * to_f32(wv.y);
+        float val0 = (n0 * (1.0f + to_f32(sv.x)) + to_f32(hv.x)) * inv_scale;
+        float val1 = (n1 * (1.0f + to_f32(sv.y)) + to_f32(hv.y)) * inv_scale;
+        int q0 = __float2int_rn(val0);
+        int q1 = __float2int_rn(val1);
+        out_row[2 * i] = static_cast<int8_t>((q0 < -127) ? -127 : ((q0 > 127) ? 127 : q0));
+        out_row[2 * i + 1] = static_cast<int8_t>((q1 < -127) ? -127 : ((q1 > 127) ? 127 : q1));
+        gate2[i] = gv;
+    }
+}
+
+FVK_KERNEL_INSTANTIATE(__global__ void ada_rms_norm_style_int8_kernel<__half>(
+    const __half*, const __half*, const __half*, int8_t*, __half*, int, float, float*))
+FVK_KERNEL_INSTANTIATE(__global__ void ada_rms_norm_style_int8_kernel<__nv_bfloat16>(
+    const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, int8_t*, __nv_bfloat16*, int, float, float*))
+void ada_rms_norm_style_int8(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                             const __nv_bfloat16* style,
+                             int8_t* out, __nv_bfloat16* gate_out,
+                             int seq_len, int dim, float eps,
+                             float* d_scales, cudaStream_t stream) {
+    ada_rms_norm_style_int8_kernel<__nv_bfloat16><<<seq_len, 256, 256 * sizeof(float), stream>>>(
+        x, weight, style, out, gate_out, dim, eps, d_scales);
+}
+
+// ── RMSNorm → FP8 ──
 // rms_norm + quantize_int8_rowwise pair requires.  Each block
 // handles one row; shared memory holds the float-converted values
 // so the data is only loaded from global memory once.
@@ -1261,4 +1368,5 @@ void avg_pool_vision_tokens(
     int out_tokens = nv * H_out * W_out;
     avg_pool_vision_tokens_kernel<<<out_tokens, 256, 0, stream>>>(
         x, out, nv, H, W, dim, pool_factor);
+
 }

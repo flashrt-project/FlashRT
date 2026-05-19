@@ -17,29 +17,11 @@ void gate_silu_mul(const __nv_bfloat16* gate, const __nv_bfloat16* up,
 
 void gelu_inplace(__nv_bfloat16* x, int n, cudaStream_t stream = 0);
 
-// Fused bias-add + GELU on the SigLIP FFN-up output. Two flavours,
-// differing only in how the bias-add result is handed to GELU:
-//
-// * `bias_gelu_bf16` (fp32 intermediate): more numerically accurate
-//   than the original kernel pair, but downstream INT8 calibration is
-//   fitted against the original bf16-rounded intermediate. The drift
-//   accumulates over 27 SigLIP layers to ~0.94-0.99 action cosine.
-//   Microbench 3.19× over the pair; pipeline ~0.7 ms saving. NOT
-//   enabled by default.
-//
-// * `bias_gelu_bf16_strict` (bf16 round-trip in middle): bit-identical
-//   to add_bias_bf16 + gelu_inplace pair. Microbench 2.85× over the
-//   pair; pipeline ~1.4 ms saving (6/6 frames bit-equal vs baseline
-//   action). **Use this for lossless pipelines.**
-void bias_gelu_bf16(__nv_bfloat16* x, const __nv_bfloat16* bias,
-                    int seq_len, int dim, cudaStream_t stream = 0);
-void bias_gelu_fp16(__half* x, const __half* bias,
-                    int seq_len, int dim, cudaStream_t stream = 0);
-
-void bias_gelu_bf16_strict(__nv_bfloat16* x, const __nv_bfloat16* bias,
-                            int seq_len, int dim, cudaStream_t stream = 0);
-void bias_gelu_fp16_strict(__half* x, const __half* bias,
-                            int seq_len, int dim, cudaStream_t stream = 0);
+// G7.11 — fused (bias add + GELU(tanh)) in-place on bf16 tensor.
+// x: (M, N) bf16; bias: (N,) bf16 broadcast over rows. Replaces
+// add_bias_bf16 + gelu_inplace pair (2 launches -> 1).
+void bias_gelu_inplace_bf16(__nv_bfloat16* x, const __nv_bfloat16* bias,
+                              int M, int N, cudaStream_t stream = 0);
 
 void gate_silu_mul_merged(const __nv_bfloat16* merged, __nv_bfloat16* out,
                            int seq, int half_dim, cudaStream_t stream = 0);

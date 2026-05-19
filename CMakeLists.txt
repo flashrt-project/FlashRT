@@ -128,6 +128,17 @@ set(FA2_HDIMS "96;128;256" CACHE STRING
 set(FA2_DTYPES "fp16;bf16" CACHE STRING
     "Semicolon-separated FA2 dtype instantiations to build. Pi0 uses fp16; pi0.5/groot use bf16.")
 
+# Motus beta integration. Motus-specific kernels are additive and must keep
+# their symbols prefixed with ``motus_``. Keeping a build tag lets the public
+# package compile without Motus kernels when debugging unrelated model paths.
+option(FLASHRT_ENABLE_MOTUS
+       "Build Motus-specific RTX SM120 kernels and bindings" ON)
+if(FLASHRT_ENABLE_MOTUS)
+  message(STATUS "Motus beta kernels: ENABLED")
+else()
+  message(STATUS "Motus beta kernels: DISABLED")
+endif()
+
 # ── MSVC / Windows host-compiler flags ──
 # Linux is the primary platform; this block only activates under MSVC.
 #   /bigobj  — FA2 + CUTLASS template instantiations blow past the
@@ -303,6 +314,139 @@ if(GPU_ARCH STREQUAL "120")
     >
   )
   message(STATUS "SM120a CUTLASS NVFP4 W4A16 GEMM: ENABLED")
+endif()
+
+# ── Motus beta SM120 kernels ──
+# These are model-specific RTX kernels and must remain additive. They are
+# compiled into flash_rt_kernels so Motus does not depend on separate
+# runtime kernel libraries.
+if(FLASHRT_ENABLE_MOTUS AND GPU_ARCH STREQUAL "120")
+  add_library(motus_aux_sm120_obj OBJECT
+    csrc/attention/sage2/sage2_attn_raw.cu
+    csrc/conv/fp8_conv2d_3x3_sm120_v1.cu
+    csrc/conv/fp8_conv3d_sm120_v17.cu
+    csrc/conv/fp8_conv3d_sm120_v18.cu
+    csrc/conv/motus/motus_bf16_rms_silu_quant_nvfp4_sm120.cu
+    csrc/conv/motus/motus_fp4_conv3d_v19sf_sm120.cu
+    csrc/conv/motus/motus_fp4_conv3d_v19sfb_sm120.cu
+    csrc/conv/motus/motus_fp4_conv3d_v19sfb_k128_sm120.cu
+    csrc/quantize/ada_layer_norm_fp8.cu
+    csrc/quantize/awq_quant_fp8_static_bf16.cu
+    csrc/quantize/bf16_ndhwc_to_ncdhw_transpose.cu
+    csrc/quantize/bf16_quant_fp8_ncdhw_to_ndhwc.cu
+    csrc/quantize/bf16_rms_silu_ncdhw.cu
+    csrc/quantize/bf16_rms_silu_quant_fp8_ncdhw_to_ndhwc_v4.cu
+    csrc/quantize/bias_gelu_quantize_fp8.cu
+    csrc/quantize/qkv_split_norm_rope_bf16.cu
+    csrc/quantize/rope_apply_bf16.cu)
+  set_target_properties(motus_aux_sm120_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(motus_aux_sm120_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/sage2
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/sage2/qattn
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/conv
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/conv/motus
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/quantize
+  )
+  target_compile_options(motus_aux_sm120_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+
+  add_library(motus_fp8_smallm_sm120_obj OBJECT
+    csrc/gemm/fp8_smallM_handtuned_sm120.cu
+    csrc/gemm/fp8_smallM_handtuned_splitk_sm120.cu
+    csrc/gemm/fp8_smallM_handtuned_ldmatrix_sm120.cu)
+  set_target_properties(motus_fp8_smallm_sm120_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(motus_fp8_smallm_sm120_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
+  )
+  target_compile_options(motus_fp8_smallm_sm120_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+
+  add_library(motus_nvfp4_ffn_sm120_obj OBJECT
+    csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_bf16out_sm120.cu
+    csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_fp4out_sm120.cu
+    csrc/gemm/fp4/cutlass_nvfp4_gemm_dn_streamk_bias_sm120.cu)
+  set_target_properties(motus_nvfp4_ffn_sm120_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(motus_nvfp4_ffn_sm120_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/fp4
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(motus_nvfp4_ffn_sm120_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+
+  add_library(motus_action_ffn_v6t_sm120_obj OBJECT
+    csrc/kernels/megakernel/action_ffn_megakernel_v6t_sm120.cu)
+  set_target_properties(motus_action_ffn_v6t_sm120_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(motus_action_ffn_v6t_sm120_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
+  )
+  target_compile_options(motus_action_ffn_v6t_sm120_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+      -DV6T_VARIANT_NAME=ku128_sd4
+      -DV6T_BLOCK_K_UP=128
+      -DV6T_BLOCK_K_DN=256
+      -DV6T_NUM_WARPS=4
+      -DV6T_STAGES_UP=3
+      -DV6T_STAGES_DN=4
+      -DV6T_BLOCK_N_UP=32
+      -DV6T_BLOCK_N_DN=32
+      -DV6T_LAUNCH_MIN=8
+    >
+  )
+
+  add_library(motus_und_ffn_sm120_obj OBJECT
+    csrc/kernels/megakernel/und_ffn_megakernel_v5t_sm120.cu
+    csrc/kernels/megakernel/und_ffn_megakernel_v5split_stage3_sm120.cu
+    csrc/kernels/megakernel/tinyfp8_kernels_sm120.cu)
+  set_target_properties(motus_und_ffn_sm120_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(motus_und_ffn_sm120_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
+  )
+  target_compile_options(motus_und_ffn_sm120_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+      -DV5S_BLOCK_K_UP=64
+      -DV5S_BLOCK_K_DN=128
+      -DV5S_BLOCK_N_UP=64
+      -DV5S_BLOCK_N_DN=32
+      -DV5S_LAUNCH_MIN=8
+    >
+  )
+  message(STATUS "Motus beta SM120 kernels: building into flash_rt_kernels")
 endif()
 
 # ── CUTLASS block-scaled kernels (sm_120a only) ──
@@ -581,6 +725,24 @@ if(GPU_ARCH STREQUAL "120")
     ENABLE_CUTLASS_SM120_NVFP4_W4A16=1)
 endif()
 
+if(FLASHRT_ENABLE_MOTUS AND GPU_ARCH STREQUAL "120")
+  target_sources(flash_rt_kernels PRIVATE
+    $<TARGET_OBJECTS:motus_aux_sm120_obj>
+    $<TARGET_OBJECTS:motus_fp8_smallm_sm120_obj>
+    $<TARGET_OBJECTS:motus_nvfp4_ffn_sm120_obj>
+    $<TARGET_OBJECTS:motus_action_ffn_v6t_sm120_obj>
+    $<TARGET_OBJECTS:motus_und_ffn_sm120_obj>)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    ENABLE_MOTUS=1
+    ENABLE_MOTUS_SAGE2_RAW=1
+    ENABLE_FP8_CONV3D_V17=1
+    ENABLE_FP8_CONV3D_V18=1
+    ENABLE_FP8_CONV2D_3X3_V1=1
+    ENABLE_ACTION_FFN_MEGAKERNEL_V6T=1
+    ENABLE_UND_FFN_MEGAKERNEL_V5T=1
+    ENABLE_TINYFP8_KERNELS=1)
+endif()
+
 # (ENABLE_FA2 object-lib is linked into flash_rt_fa2.so only — see
 # the dedicated pybind11_add_module(flash_rt_fa2 ...) above. The main
 # flash_rt_kernels.so deliberately does NOT pull FA2 in, so rebuilds
@@ -589,8 +751,12 @@ endif()
 target_include_directories(flash_rt_kernels PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/csrc
   ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+  ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/fp4
   ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
   ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention
+  ${CMAKE_CURRENT_SOURCE_DIR}/csrc/conv
+  ${CMAKE_CURRENT_SOURCE_DIR}/csrc/conv/motus
+  ${CMAKE_CURRENT_SOURCE_DIR}/csrc/quantize
   ${CUTLASS_INCLUDE}
   ${CUTLASS_DIR}/tools/util/include
 )

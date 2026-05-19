@@ -80,11 +80,6 @@ public:
                  int M, int N, int K,
                  cudaStream_t stream = 0);
 
-    // INT8: D_i32 = A_i8(M,K) @ B_i8(K,N) with int32 accumulation/output.
-    void int8_nn(void* A, void* B, void* D,
-                 int M, int N, int K,
-                 cudaStream_t stream = 0);
-
     // BF16 with residual: D += A(M,K) @ B(K,N)  (row-major, no transpose)
     // Fuses residual add into GEMM accumulator (FP32), avoiding BF16 round-trip
     void bf16_nn_res(void* A, void* B, void* D,
@@ -126,19 +121,21 @@ public:
                     float* d_scale_a, float* d_scale_b,
                     cudaStream_t stream = 0);
 
-    // FP8 transpose-B path for SM89-compatible cuBLASLt layouts:
-    // D_bf16 = A_fp8(M,K) @ B_fp8(N,K)^T with device scale pointers.
-    // B is stored as (N,K) row-major.
-    void fp8_nt_dev(void* A, void* B, void* D,
-                    int M, int N, int K,
-                    float* d_scale_a, float* d_scale_b,
-                    cudaStream_t stream = 0);
-
     // FP8 with host alpha + BIAS epilogue: D = alpha * A_fp8 @ B_fp8 + bias
     // Matches pi05 gmm_fp8_kn_bias: host scalar alpha, per-GEMM bias vector
     void fp8_nn_bias(void* A, void* B, void* D, void* bias,
                      int M, int N, int K, float alpha,
                      cudaStream_t stream = 0);
+
+    // G6.7: FP8 GEMM with host alpha + BIAS epilogue, BF16 output
+    // Same as fp8_nn_bias but with BF16 output and BF16 bias dtype.
+    // Targets Motus Wan FP8 sites (which run bf16 throughout; the fp16
+    // variant above forces an extra cast). Throws if cuBLASLt sm_120
+    // returns no algorithm for the requested shape (caller must fall
+    // back to fp8_nn_dev + add_bias_bf16).
+    void fp8_nn_bias_bf16(void* A, void* B, void* D, void* bias,
+                           int M, int N, int K, float alpha,
+                           cudaStream_t stream = 0);
 
     // FP8 with host alpha + BIAS + residual: D += alpha * A_fp8 @ B_fp8 + bias
     // Matches pi05 gmm_fp8_kn_bias_res: beta=1 for residual accumulate
@@ -170,13 +167,7 @@ public:
     // Call before CUDA Graph capture. Uses dummy data at the provided pointers.
     void autotune_bf16_nn(void* A, void* B, void* D,
                           int M, int N, int K, int num_algos = 16);
-    void autotune_int8_nn(void* A, void* B, void* D,
-                          int M, int N, int K, int num_algos = 16);
     void autotune_fp8_nn_dev(void* A, void* B, void* D,
-                             int M, int N, int K,
-                             float* d_scale_a, float* d_scale_b,
-                             int num_algos = 16);
-    void autotune_fp8_nt_dev(void* A, void* B, void* D,
                              int M, int N, int K,
                              float* d_scale_a, float* d_scale_b,
                              int num_algos = 16);
@@ -195,10 +186,9 @@ private:
     float* d_scale_b_;
 
     // ── GEMM descriptor + algorithm cache ──
-    enum GemmType { BF16_NN = 0, BF16_NN_RES = 1, FP8_NN_DEV = 2,
-                    INT8_NN = 3, FP16_NN = 4, FP8_NT_DEV = 5
+    enum GemmType { BF16_NN = 0, BF16_NN_RES = 1, FP8_NN_DEV = 2, FP16_NN = 4
 #ifdef ENABLE_NVFP4
-        , FP4_NN_DEV = 6
+        , FP4_NN_DEV = 3
 #endif
     };
 

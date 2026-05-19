@@ -43,11 +43,11 @@ GemmRunner::CachedGemm& GemmRunner::get_or_create_cached(GemmType type, int M, i
     CachedGemm entry;
     cublasLtOrder_t row_order = CUBLASLT_ORDER_ROW;
     cublasOperation_t op_N = CUBLAS_OP_N;
-    cublasOperation_t op_T = CUBLAS_OP_T;
 
 #ifdef ENABLE_NVFP4
     if (type == FP4_NN_DEV) {
         CUBLAS_CHECK(cublasLtMatmulDescCreate(&entry.matmul_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+        cublasOperation_t op_T = CUBLAS_OP_T;
         CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_T, sizeof(op_T)));
         CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_N, sizeof(op_N)));
 
@@ -71,26 +71,6 @@ GemmRunner::CachedGemm& GemmRunner::get_or_create_cached(GemmType type, int M, i
         CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.A_desc, CUDA_R_8F_E4M3, M, K, K));
         CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(entry.A_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
         CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.B_desc, CUDA_R_8F_E4M3, K, N, N));
-        CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(entry.B_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
-        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.D_desc, CUDA_R_16BF, M, N, N));
-        CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(entry.D_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
-    } else if (type == INT8_NN) {
-        CUBLAS_CHECK(cublasLtMatmulDescCreate(&entry.matmul_desc, CUBLAS_COMPUTE_32I, CUDA_R_32I));
-        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_N, sizeof(op_N)));
-        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_N, sizeof(op_N)));
-        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.A_desc, CUDA_R_8I, M, K, K));
-        CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(entry.A_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
-        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.B_desc, CUDA_R_8I, K, N, N));
-        CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(entry.B_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
-        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.D_desc, CUDA_R_32I, M, N, N));
-        CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(entry.D_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
-    } else if (type == FP8_NT_DEV) {
-        CUBLAS_CHECK(cublasLtMatmulDescCreate(&entry.matmul_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
-        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_N, sizeof(op_N)));
-        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_T, sizeof(op_T)));
-        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.A_desc, CUDA_R_8F_E4M3, M, K, K));
-        CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(entry.A_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
-        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.B_desc, CUDA_R_8F_E4M3, N, K, K));
         CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(entry.B_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
         CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.D_desc, CUDA_R_16BF, M, N, N));
         CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(entry.D_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
@@ -231,91 +211,11 @@ void GemmRunner::autotune_bf16_nn(void* A, void* B, void* D,
     autotune_cached(entry, A, B, D, 1.0f, 0.0f, num_algos);
 }
 
-void GemmRunner::autotune_int8_nn(void* A, void* B, void* D,
-                                   int M, int N, int K, int num_algos) {
-    auto& entry = get_or_create_cached(INT8_NN, M, N, K);
-    auto C_layout = entry.D_desc;
-
-    cublasLtMatmulPreference_t preference;
-    CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&preference));
-    CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(preference,
-        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size_, sizeof(workspace_size_)));
-
-    std::vector<cublasLtMatmulHeuristicResult_t> heuristics(num_algos);
-    int returned_results = 0;
-    CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(handle_, entry.matmul_desc,
-        entry.A_desc, entry.B_desc, C_layout, entry.D_desc,
-        preference, num_algos, heuristics.data(), &returned_results));
-    cublasLtMatmulPreferenceDestroy(preference);
-
-    if (returned_results == 0) {
-        std::cerr << "  autotune_int8: no algorithms found, keeping default" << std::endl;
-        return;
-    }
-
-    cudaEvent_t start, stop;
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
-
-    float best_ms = 1e9f;
-    int best_idx = 0;
-    const int warmup_iters = 3;
-    const int bench_iters = 10;
-    const int32_t alpha = 1;
-    const int32_t beta = 0;
-
-    for (int i = 0; i < returned_results; ++i) {
-        bool algo_ok = true;
-        for (int w = 0; w < warmup_iters; ++w) {
-            cublasStatus_t st = cublasLtMatmul(handle_, entry.matmul_desc,
-                &alpha, A, entry.A_desc, B, entry.B_desc,
-                &beta, D, C_layout, D, entry.D_desc,
-                &heuristics[i].algo, workspace_, workspace_size_, 0);
-            if (st != CUBLAS_STATUS_SUCCESS) { algo_ok = false; break; }
-        }
-        if (!algo_ok) continue;
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        CUDA_CHECK(cudaEventRecord(start));
-        for (int b = 0; b < bench_iters; ++b) {
-            cublasLtMatmul(handle_, entry.matmul_desc,
-                &alpha, A, entry.A_desc, B, entry.B_desc,
-                &beta, D, C_layout, D, entry.D_desc,
-                &heuristics[i].algo, workspace_, workspace_size_, 0);
-        }
-        CUDA_CHECK(cudaEventRecord(stop));
-        CUDA_CHECK(cudaEventSynchronize(stop));
-        float ms = 0;
-        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-        ms /= bench_iters;
-
-        if (ms < best_ms) {
-            best_ms = ms;
-            best_idx = i;
-        }
-    }
-
-    CUDA_CHECK(cudaEventDestroy(start));
-    CUDA_CHECK(cudaEventDestroy(stop));
-
-    entry.algo = heuristics[best_idx].algo;
-    std::cout << "  autotune_int8: tested " << returned_results << " algos, best="
-              << best_idx << " (" << best_ms * 1000.0f << " us)" << std::endl;
-}
-
 void GemmRunner::autotune_fp8_nn_dev(void* A, void* B, void* D,
                                       int M, int N, int K,
                                       float* d_scale_a, float* d_scale_b,
                                       int num_algos) {
     auto& entry = get_or_create_cached(FP8_NN_DEV, M, N, K);
-    autotune_cached(entry, A, B, D, 1.0f, 0.0f, num_algos, d_scale_a, d_scale_b);
-}
-
-void GemmRunner::autotune_fp8_nt_dev(void* A, void* B, void* D,
-                                      int M, int N, int K,
-                                      float* d_scale_a, float* d_scale_b,
-                                      int num_algos) {
-    auto& entry = get_or_create_cached(FP8_NT_DEV, M, N, K);
     autotune_cached(entry, A, B, D, 1.0f, 0.0f, num_algos, d_scale_a, d_scale_b);
 }
 
@@ -787,20 +687,6 @@ void GemmRunner::fp16_nn(void* A, void* B, void* D,
 }
 
 // ================================================================
-//  INT8 no-transpose: D_i32(M,N) = A_i8(M,K) @ B_i8(K,N)
-//  Output is int32 accumulation buffer for a later dequant step.
-// ================================================================
-void GemmRunner::int8_nn(void* A, void* B, void* D,
-                         int M, int N, int K, cudaStream_t stream) {
-    auto& entry = get_or_create_cached(INT8_NN, M, N, K);
-    int32_t alpha = 1, beta = 0;
-    CUBLAS_CHECK(cublasLtMatmul(handle_, entry.matmul_desc,
-        &alpha, A, entry.A_desc, B, entry.B_desc,
-        &beta, D, entry.D_desc, D, entry.D_desc,
-        &entry.algo, workspace_, workspace_size_, stream));
-}
-
-// ================================================================
 //  BF16 no-transpose with fused residual: D(M,N) += A(M,K) @ B(K,N)
 //  Uses beta=1 to accumulate matmul result into D in FP32, avoiding
 //  a BF16 round-trip that separate matmul+residual_add would cause.
@@ -1151,26 +1037,6 @@ void GemmRunner::fp8_nn_dev(void* A, void* B, void* D,
         &entry.algo, workspace_, workspace_size_, stream));
 }
 
-// FP8 transpose-B path: D_bf16 = A_fp8(M,K) @ B_fp8(N,K)^T
-// with device scale pointers. This layout is used by the SM89 route,
-// where cuBLASLt FP8 rejects the no-transpose NN descriptor.
-void GemmRunner::fp8_nt_dev(void* A, void* B, void* D,
-                             int M, int N, int K,
-                             float* d_scale_a, float* d_scale_b,
-                             cudaStream_t stream) {
-    auto& entry = get_or_create_cached(FP8_NT_DEV, M, N, K);
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc,
-        CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &d_scale_a, sizeof(d_scale_a)));
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc,
-        CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &d_scale_b, sizeof(d_scale_b)));
-
-    float alpha = 1.0f, beta = 0.0f;
-    CUBLAS_CHECK(cublasLtMatmul(handle_, entry.matmul_desc,
-        &alpha, A, entry.A_desc, B, entry.B_desc,
-        &beta, D, entry.D_desc, D, entry.D_desc,
-        &entry.algo, workspace_, workspace_size_, stream));
-}
-
 // ================================================================
 //  FP8 GEMM + BIAS epilogue: D = alpha * A_fp8(M,K) @ B_fp8(K,N) + bias(N)
 //  Cached descriptor (pi05 pattern): same shape → same algo. Bias ptr set per-call.
@@ -1197,6 +1063,58 @@ void GemmRunner::fp8_nn_bias(void* A, void* B, void* D, void* bias,
         CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size_, sizeof(workspace_size_)));
         cublasLtMatmulHeuristicResult_t result; int ret = 0;
         CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(handle_, entry.matmul_desc, entry.A_desc, entry.B_desc, entry.D_desc, entry.D_desc, pref, 1, &result, &ret));
+        entry.algo = result.algo;
+        cublasLtMatmulPreferenceDestroy(pref);
+        gemm_cache_[key] = entry;
+        it = gemm_cache_.find(key);
+    }
+    auto& e = it->second;
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(e.matmul_desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+    float beta = 0.0f;
+    CUBLAS_CHECK(cublasLtMatmul(handle_, e.matmul_desc, &alpha, B, e.A_desc, A, e.B_desc,
+        &beta, D, e.D_desc, D, e.D_desc, &e.algo, workspace_, workspace_size_, stream));
+}
+
+// ================================================================
+//  G6.7: FP8 GEMM + BIAS epilogue, BF16 output (and BF16 bias dtype).
+//  Same logic as fp8_nn_bias above but D and bias are __nv_bfloat16.
+//  cuBLASLt sm_120 historically returned NOT_SUPPORTED with FP8+bias
+//  on Wan FFN shapes under CUDA 12; CUDA 13 may behave differently.
+//  cublasLtMatmulAlgoGetHeuristic returns 0 algos → propagated as
+//  cuBLAS error so caller can fall back.
+// ================================================================
+void GemmRunner::fp8_nn_bias_bf16(void* A, void* B, void* D, void* bias,
+                                   int M, int N, int K, float alpha,
+                                   cudaStream_t stream) {
+    GemmKey key{103, M, N + 5000000, K};
+    auto it = gemm_cache_.find(key);
+    if (it == gemm_cache_.end()) {
+        CachedGemm entry;
+        cublasOperation_t opN = CUBLAS_OP_N;
+        CUBLAS_CHECK(cublasLtMatmulDescCreate(&entry.matmul_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA, &opN, sizeof(opN)));
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN)));
+        cublasLtEpilogue_t epi = CUBLASLT_EPILOGUE_BIAS;
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epi, sizeof(epi)));
+        cudaDataType_t btype = CUDA_R_16BF;
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &btype, sizeof(btype)));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.A_desc, CUDA_R_8F_E4M3, N, K, N));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.B_desc, CUDA_R_8F_E4M3, K, M, K));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.D_desc, CUDA_R_16BF, N, M, N));
+        cublasLtMatmulPreference_t pref;
+        CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&pref));
+        CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size_, sizeof(workspace_size_)));
+        cublasLtMatmulHeuristicResult_t result; int ret = 0;
+        CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(handle_, entry.matmul_desc, entry.A_desc, entry.B_desc, entry.D_desc, entry.D_desc, pref, 1, &result, &ret));
+        if (ret == 0) {
+            cublasLtMatmulPreferenceDestroy(pref);
+            cublasLtMatmulDescDestroy(entry.matmul_desc);
+            cublasLtMatrixLayoutDestroy(entry.A_desc);
+            cublasLtMatrixLayoutDestroy(entry.B_desc);
+            cublasLtMatrixLayoutDestroy(entry.D_desc);
+            throw std::runtime_error(
+                "fp8_nn_bias_bf16: cuBLASLt returned 0 algorithms (NOT_SUPPORTED on this shape)");
+        }
         entry.algo = result.algo;
         cublasLtMatmulPreferenceDestroy(pref);
         gemm_cache_[key] = entry;

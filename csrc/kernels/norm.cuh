@@ -16,6 +16,13 @@ void rms_norm(const __nv_bfloat16* x, const __nv_bfloat16* weight,
               __nv_bfloat16* out, int seq_len, int dim, float eps,
               cudaStream_t stream = 0);
 
+void bias_rms_norm_bf16(const __nv_bfloat16* x,
+                        const __nv_bfloat16* bias,
+                        const __nv_bfloat16* weight,
+                        __nv_bfloat16* out,
+                        int seq_len, int dim, float eps,
+                        cudaStream_t stream = 0);
+
 void rms_norm_fp16(const __half* x, const __half* weight,
                     __half* out, int seq_len, int dim, float eps,
                     cudaStream_t stream = 0);
@@ -44,6 +51,15 @@ void layer_norm_fp8_bf16(const __nv_bfloat16* x, __nv_fp8_e4m3* out,
                           const __nv_bfloat16* gamma, const __nv_bfloat16* beta,
                           int seq_len, int dim, float eps, cudaStream_t stream = 0);
 
+void awq_layer_norm_fp8_bf16(const __nv_bfloat16* x,
+                             __nv_fp8_e4m3* out,
+                             const __nv_bfloat16* gamma,
+                             const __nv_bfloat16* beta,
+                             const __nv_bfloat16* inv_s,
+                             const float* d_scale,
+                             int seq_len, int dim, float eps,
+                             cudaStream_t stream = 0);
+
 // ── AdaRMSNorm + Style ──
 
 void ada_rms_norm_style(const __nv_bfloat16* x, const __nv_bfloat16* weight,
@@ -51,12 +67,6 @@ void ada_rms_norm_style(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                         __nv_bfloat16* out, __nv_bfloat16* gate_out,
                         int seq_len, int dim, float eps,
                         cudaStream_t stream = 0);
-
-void ada_rms_norm_style_int8(const __nv_bfloat16* x, const __nv_bfloat16* weight,
-                             const __nv_bfloat16* style,
-                             int8_t* out, __nv_bfloat16* gate_out,
-                             int seq_len, int dim, float eps,
-                             float* d_scales, cudaStream_t stream = 0);
 
 // ── Fused Norm → FP8 (with scale) ──
 
@@ -116,61 +126,6 @@ void residual_add_rms_norm_fp8_noweight_bf16(__nv_bfloat16* residual, const __nv
                                                const float* d_scale,
                                                cudaStream_t stream = 0);
 
-// ── Vision Token Spatial Average Pooling ──
-
-// Reduce (nv * H * W, dim) BF16 to (nv * (H/f) * (W/f), dim) BF16
-// via f×f spatial average pooling within each view's H×W token grid.
-// H = W = sqrt(spv) (e.g. 16 for spv=256); pool_factor f must divide H.
-void avg_pool_vision_tokens(
-        const __nv_bfloat16* x, __nv_bfloat16* out,
-        int nv, int H, int W, int dim, int pool_factor,
-        cudaStream_t stream = 0);
-
-// ── Fused RMSNorm → INT8 rowwise (Orin encoder hot-path) ──
-
-// RMSNorm(x, weight) → INT8 with per-row dynamic scales.
-// Saves the intermediate BF16 write that separate rms_norm +
-// quantize_int8_rowwise requires.
-void rms_norm_int8_rowwise(const __nv_bfloat16* x,
-                            const __nv_bfloat16* weight,
-                            int8_t* out, float* scales,
-                            int seq_len, int dim, float eps,
-                            cudaStream_t stream = 0);
-
-// Fused residual += x; RMSNorm(residual, weight) → INT8 per-row.
-// Combines the B4 residual_add + rms_norm + quantize_int8_rowwise
-// triple into a single kernel pass.
-void residual_add_rms_norm_int8_rowwise(
-        __nv_bfloat16* residual, const __nv_bfloat16* x,
-        const __nv_bfloat16* weight,
-        int8_t* out, float* scales,
-        int seq_len, int dim, float eps,
-        cudaStream_t stream = 0);
-
-// ── Fused bias-residual + LayerNorm (SigLIP between-block hot-path) ──
-//
-// Strict-precision fusion of bias_residual + layer_norm:
-//   residual = bf16(residual + x + bias_pre)    (bf16 round-trip middle)
-//   out      = LayerNorm(residual, ln_w, ln_b)
-//
-// Bit-identical to running bias_residual + layer_norm sequentially
-// (same precision boundary). Eliminates the inter-kernel residual
-// round-trip through DRAM — bias_residual has 34% L2 hit / layer_norm
-// has 52% L2 hit on Orin SM87, so this round-trip is mostly DRAM-bound.
-void bias_residual_layer_norm_bf16(
-        __nv_bfloat16* residual, const __nv_bfloat16* x,
-        const __nv_bfloat16* bias_pre,
-        const __nv_bfloat16* ln_weight, const __nv_bfloat16* ln_bias,
-        __nv_bfloat16* out, int seq_len, int dim, float eps,
-        cudaStream_t stream = 0);
-
-void bias_residual_layer_norm_fp16(
-        __half* residual, const __half* x,
-        const __half* bias_pre,
-        const __half* ln_weight, const __half* ln_bias,
-        __half* out, int seq_len, int dim, float eps,
-        cudaStream_t stream = 0);
-
 // ── Production-exact kernels (no weight, no scale) ──
 
 // RMSNorm → FP8 (no weight, no d_scale). Matches pi05 fused_rms_fp8.
@@ -185,3 +140,31 @@ void plain_res_rms_fp8_fp16(__half* residual, const __half* x,
 // Cast FP16 → FP8 (no scale). Matches pi05 cast_fp16_fp8_k.
 void cast_fp16_fp8(const __half* input, __nv_fp8_e4m3* output,
                     int n, cudaStream_t stream = 0);
+
+// ---- Public Orin/INT8 helper declarations ----
+void ada_rms_norm_style_int8(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                             const __nv_bfloat16* style,
+                             int8_t* out, __nv_bfloat16* gate_out,
+                             int seq_len, int dim, float eps,
+                             float* d_scales, cudaStream_t stream = 0);
+void avg_pool_vision_tokens(
+        const __nv_bfloat16* x, __nv_bfloat16* out,
+        int nv, int H, int W, int dim, int pool_factor,
+        cudaStream_t stream = 0);
+void rms_norm_int8_rowwise(const __nv_bfloat16* x,
+                            const __nv_bfloat16* weight,
+                            int8_t* out, float* scales,
+                            int seq_len, int dim, float eps,
+                            cudaStream_t stream = 0);
+void residual_add_rms_norm_int8_rowwise(
+        __nv_bfloat16* residual, const __nv_bfloat16* x,
+        const __nv_bfloat16* weight,
+        int8_t* out, float* scales,
+        int seq_len, int dim, float eps,
+        cudaStream_t stream = 0);
+void bias_residual_layer_norm_bf16(
+        __nv_bfloat16* residual, const __nv_bfloat16* x,
+        const __nv_bfloat16* bias_pre,
+        const __nv_bfloat16* ln_weight, const __nv_bfloat16* ln_bias,
+        __nv_bfloat16* out, int seq_len, int dim, float eps,
+        cudaStream_t stream = 0);

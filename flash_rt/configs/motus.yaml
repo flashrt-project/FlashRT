@@ -1,0 +1,85 @@
+# FlashRT — Motus model configuration (metadata only).
+# The frontend (flash_rt/frontends/torch/motus_rtx.py) holds the source of
+# truth for shapes; this file is metadata for logging / registries.
+name: motus
+
+# Architecture summary
+total_params_billion: 8.02
+num_layers: 30                # MoT — same depth across video / action / und
+
+# Video Generation Model — Wan2.2-TI2V-5B DiT
+video:
+  backbone: Wan2.2-TI2V-5B
+  hidden_dim: 3072
+  num_heads: 24
+  head_dim: 128
+  ffn_intermediate: 14336      # SwiGLU dim
+  num_frames: 8                # predicted including condition frame slot
+  height: 384
+  width: 320
+  vae_channels: 48
+  vae_temporal_downsample: 4
+  vae_spatial_downsample: 16   # patch=2 inside DiT × VAE 8
+
+# Vision-Language Model — Qwen3-VL-2B-Instruct (frozen)
+vlm:
+  backbone: Qwen3-VL-2B-Instruct
+  hidden_dim: 2048
+  frozen: true
+
+# Action Expert
+action:
+  hidden_dim: 1024
+  num_heads: 8
+  head_dim: 128
+  ffn_dim_multiplier: 4
+  state_dim: 14
+  action_dim: 14
+  # Stage-2 ckpt was trained in pretrain mode → no register tokens, no
+  # state token, action_chunk = num_video_frames. See
+  # baseline_artifacts/README.md §2 for derivation.
+  num_registers: 0
+  action_chunk_size: 8
+
+# Understanding Expert (consumes Qwen3-VL last-layer tokens via mlp3x_silu)
+und:
+  hidden_dim: 512
+  num_heads: 4
+  head_dim: 128
+  ffn_dim_multiplier: 4
+  vlm_input_dim: 2048
+  projector: mlp3x_silu
+
+# Text encoder (one-shot per episode, never inside denoise loop)
+t5:
+  backbone: umt5-xxl
+  ctx_length: 512
+  raw_dim: 4096                # projected to 3072 inside Wan text_embedding
+
+# Inference
+inference:
+  num_steps: 10                # rectified flow / UniPC, no distillation
+  scheduler: FlowUniPCMultistep
+  shift: 1.0
+
+# Quantization plan (filled in G4 / G6)
+quant:
+  enabled: false               # G1: false; G4 → fp8 video+action+und; G6 → fp4 video FFN
+  dtype: bf16
+  calibration: real_distribution   # MUST use baseline_artifacts/inputs/
+
+# Reference baseline (PyTorch BF16, captured 2026-05-07)
+baseline:
+  framework: pytorch_bf16
+  device: NVIDIA RTX 5090
+  p50_ms: 1226.9
+  hz: 0.82
+  gpu_peak_gb: 24.8
+  cos_determinism: 1.000000
+  artifacts: user_supplied_input_bundle
+
+# Target after FlashRT integration (G5/G6)
+target:
+  p50_ms_max: 100              # ≥ 10 Hz
+  cos_min: 0.997               # FP8 noise floor (3× A/B std < 0.001)
+  gpu_peak_gb_max: 16

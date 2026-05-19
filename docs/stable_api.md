@@ -29,7 +29,7 @@ def load_model(
     autotune: int = 3,              # 0=off, 3=default, 5+=thorough
     recalibrate: bool = False,
     weight_cache: bool = True,      # JAX only
-    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "pi0fast"
+    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "pi0fast" | "motus"
     device=None,                    # reserved
     # Pi0-FAST-specific:
     decode_cuda_graph: bool = False,
@@ -69,6 +69,9 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   `cache_frames >= 1`.
 - `use_fp8=False` disables FP8 where the selected frontend exposes a
   BF16 fallback; unsupported frontends ignore it.
+- `config="motus"` is a beta RTX SM120 frontend. It expects a Motus
+  checkpoint plus Wan and VLM checkpoint paths supplied to the Motus
+  quickstart/frontend; see `docs/motus_usage_beta.md`.
 
 ### `flash_rt.VLAModel`
 
@@ -111,6 +114,8 @@ only for `config="pi05", framework="torch"`.
 
 Lazily imports and returns the concrete frontend class for the given
 `(config, framework, arch)` triple. Used internally by `load_model`.
+Motus beta is registered for `(config="motus", framework="torch",
+arch="rtx_sm120")`.
 
 ### `_PIPELINE_MAP`
 
@@ -230,6 +235,28 @@ FP8 quant, residual, gate-geglu, true-silu, etc.) and Thor-specific attention
 All `fvk.<symbol>(...)` calls seen in pipeline code live here.
 Signatures are internal — plug-ins should go through the
 `AttentionBackend` protocol, not call `fvk.*` directly.
+
+Motus beta SM120 kernels are built into `flash_rt_kernels` when CMake is
+configured with `-DFLASHRT_ENABLE_MOTUS=ON` (currently the default).
+They do not require a separate runtime kernel library directory.
+
+---
+
+## Runtime utilities
+
+```python
+from flash_rt.runtime.rtc import (
+    ActionChunkAdapter,
+    CallablePolicyAdapter,
+    AsyncChunkRunner,
+    RTCStats,
+)
+```
+
+RTC-lite is a beta inference scheduling utility for action-chunk
+policies. It does not change model numerics or calibration; it only
+serves action chunks at a fixed controller rate while a background worker
+prepares the next chunk. See `docs/rtc_lite_design.md`.
 
 ### `flash_rt.flash_rt_fa2`
 
