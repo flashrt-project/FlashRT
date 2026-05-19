@@ -48,6 +48,7 @@ from flash_rt.hardware.rtx.attn_backend_batched_pi05 import (
     PI05_BATCH_SIZE,
     RtxFlashAttnBatchedBackendPi05,
 )
+from flash_rt.core.utils.hardware import supports_fp8
 
 logger = logging.getLogger(__name__)
 
@@ -381,11 +382,31 @@ def _precompute_decoder_styles(ckpt: dict, chunk_size: int,
     All computation runs on CUDA in bf16, then is moved to CPU and viewed
     as uint16 so it can be uploaded verbatim to CudaBuffer (bf16 = 2 bytes,
     numpy doesn't natively support bf16 but the bytes round-trip).
+
+    Time embeddings are regenerated from scratch for the given num_steps so
+    that any step count works correctly (e.g. num_steps=5 gives
+    t=1.0, 0.8, 0.6, 0.4, 0.2 with dt=-0.2, not a truncation of the
+    10-step table stored in the checkpoint).
     """
     W = {k: v.to("cuda", bf16) if isinstance(v, torch.Tensor) else v
          for k, v in ckpt.items()}
 
-    time_emb_schedule = W["decoder_time_embeds"]              # (num_steps, 1024)
+    # Regenerate sinusoidal time embeddings for the given num_steps / dt.
+    # The checkpoint stores a 10-step table; generate fresh ones so any
+    # step count gets the correct (t=1, t=1-dt, …) time schedule.
+    dt = -1.0 / num_steps
+    t = torch.tensor(1.0, dtype=torch.float32)
+    min_period, max_period = 4e-3, 4.0
+    fraction = torch.linspace(0.0, 1.0, DEC_D // 2, dtype=torch.float32)
+    period = min_period * (max_period / min_period) ** fraction
+    _time_emb_rows = []
+    for _ in range(num_steps):
+        # period has shape (DEC_D//2,); t is a scalar tensor → sinusoid: (DEC_D//2,)
+        sinusoid = t * (1.0 / period) * 2 * math.pi
+        _time_emb_rows.append(
+            torch.cat([torch.sin(sinusoid), torch.cos(sinusoid)], dim=-1).to(bf16))
+        t = t + dt
+    time_emb_schedule = torch.stack(_time_emb_rows, dim=0).to("cuda")  # (steps, DEC_D)
     t_in_w = W["decoder_time_mlp_in_w"]                       # (1024, 1024)
     t_in_b = W["decoder_time_mlp_in_b"]                       # (1024,)
     t_out_w = W["decoder_time_mlp_out_w"]
@@ -448,6 +469,10 @@ class Pi05TorchFrontendRtx:
                  num_views: int = 2,
                  chunk_size: int = CHUNK_SIZE,
                  max_prompt_len: int = MAX_PROMPT_LEN_DEFAULT,
+                 num_steps: int = NUM_STEPS_DEFAULT,
+                 vision_pool_factor: int = 1,
+                 vision_num_layers: Optional[int] = None,
+                 cache_frames: int = 1,
                  use_fp8: bool = True,
                  hardware: Optional[str] = None,
                  fp8_layout: Optional[str] = None):
@@ -455,6 +480,17 @@ class Pi05TorchFrontendRtx:
         self.num_views = int(num_views)
         self.chunk_size = int(chunk_size)
         self.max_prompt_len = int(max_prompt_len)
+        self._num_steps = int(num_steps)
+        self._vision_pool_factor = int(vision_pool_factor)
+        # Temporal K/V caching: run full pipeline every `cache_frames` frames,
+        # intermediate frames reuse the cached encoder K/V (decoder-only).
+        # cache_frames=1 (default) = no caching, every frame is full.
+        # cache_frames=2 = full, decode, full, decode, ...
+        self._cache_frames = max(1, int(cache_frames))
+        self._frame_count = 0
+        from flash_rt.models.pi05.pipeline_rtx import VIS_L as _VIS_L
+        self._vision_num_layers = _VIS_L if vision_num_layers is None else int(vision_num_layers)
+        # _use_int8_vision_static is set after _force_int8_decoder below
         self.use_fp8 = bool(use_fp8)
         self.fp8_layout = _select_fp8_layout(hardware, fp8_layout)
 
@@ -469,6 +505,31 @@ class Pi05TorchFrontendRtx:
         # a Pi05CFGPipeline and runs classifier-free guidance.
         self._rl_config: Optional[dict] = None
         self._rl_current_prompt_text: Optional[str] = None
+        self._force_int8_decoder = os.environ.get(
+            "FVK_PI05_RTX_FORCE_INT8", "0") == "1"
+        # FVK_PI05_RTX_INT8_ENCODER_ONLY=1: enable INT8 for encoder (large M,
+        # 92% GPU utilisation) but keep decoder in BF16 (M=10 → INT8 CUTLASS
+        # tile waste makes it slower than cuBLASLt BF16 for small M).
+        _enc_only = os.environ.get("FVK_PI05_RTX_INT8_ENCODER_ONLY", "0") == "1"
+        if _enc_only:
+            self._force_int8_decoder = False   # BF16 decoder
+        # On non-FP8 GPUs (e.g. Orin SM87), enable encoder INT8 alongside
+        # decoder INT8 so all large GEMMs benefit from tensor-core acceleration.
+        self._use_int8_encoder = self._force_int8_decoder or _enc_only
+        self._int8_encoder_only = _enc_only
+        # Vision GEMMs (VIS_D=1152, seq=512): static per-tensor INT8 was
+        # measured to break encoder cosine (0.991 → 0.282) — disabled
+        # permanently. Dynamic per-row INT8 is opt-in via
+        # FVK_PI05_RTX_INT8_VISION=1 (untested at branch time; enabling
+        # it requires cosine validation on the actual deployment).
+        self._use_int8_vision = (
+            os.environ.get("FVK_PI05_RTX_INT8_VISION", "0") == "1")
+        self._use_int8_vision_static = False
+        env_force_bf16 = os.environ.get("FVK_PI05_RTX_FORCE_BF16", "0") == "1"
+        self._force_bf16 = (
+            (env_force_bf16 or not supports_fp8()) and
+            not self._force_int8_decoder
+        )
 
         # ── Load norm_stats ──
         self._load_norm_stats(checkpoint_dir)
@@ -492,22 +553,34 @@ class Pi05TorchFrontendRtx:
                 self._ckpt_bf16[k] = v
         self.embedding_weight = self._ckpt_bf16["embedding_weight"]
 
-        # Pre-scale decoder action output projection by -1/num_steps
-        num_steps = NUM_STEPS_DEFAULT
+        # Pre-scale decoder action output projection by -1/num_steps.
+        # Scaling is specific to the step count (ODE integration step size).
+        num_steps = self._num_steps
         self._ckpt_bf16["decoder_action_out_proj_w"] = \
             self._ckpt_bf16["decoder_action_out_proj_w"] * (-1.0 / num_steps)
         self._ckpt_bf16["decoder_action_out_proj_b"] = \
             self._ckpt_bf16["decoder_action_out_proj_b"] * (-1.0 / num_steps)
 
-        # ── FP8 quantize large GEMM weights ──
+        # ── Low-precision weight stores ──
         self._fp8_weights: dict = {}
         self._fp8_store: list = []  # holds tensors alive
-        if self.use_fp8:
+        self._int8_weights: dict = {}
+        self._int8_store: list = []
+        self._int8_weight_scales: dict[str, torch.Tensor] = {}
+        if self.use_fp8 and not self._force_bf16 and not self._force_int8_decoder:
             self._quantize_all_fp8()
+        if self._force_int8_decoder:
+            self._quantize_decoder_int8()
+        if self._use_int8_encoder:
+            self._quantize_encoder_int8()
+        if self._use_int8_vision:
+            self._quantize_vision_int8()
+        if self._use_int8_vision_static:
+            self._quantize_vision_int8()  # pre-quantize weights; activations use static calibrated scales
 
         # ── Pre-compute decoder styles (time MLP + style modulation) ──
         self._precomputed_styles = _precompute_decoder_styles(
-            self._ckpt_bf16, self.chunk_size, num_steps=num_steps)
+            self._ckpt_bf16, self.chunk_size, num_steps=self._num_steps)
 
         # ── Attention backend (torch, owns Q/K/V/O) ──
         enc_seq_max = self.num_views * 256 + self.max_prompt_len
@@ -536,25 +609,57 @@ class Pi05TorchFrontendRtx:
             "Pi05TorchFrontendRtx initialised (num_views=%d, chunk=%d, fp8_layout=%s)",
             self.num_views, self.chunk_size, self.fp8_layout)
 
+    def _pipeline_precision_kwargs(self) -> dict:
+        if self._force_int8_decoder or getattr(self, "_int8_encoder_only", False):
+            mode = ("INT8 encoder+decoder" if self._force_int8_decoder
+                    else "INT8 encoder only (decoder stays BF16 for M=10 efficiency)")
+            logger.warning("FVK_PI05_RTX_FORCE_INT8/INT8_ENCODER_ONLY set: %s", mode)
+            return {
+                "use_fp8": False,
+                "use_fp8_decoder": False,
+                "use_int8_decoder": self._force_int8_decoder,
+                "use_int8_encoder": self._use_int8_encoder,
+                "use_int8_vision": self._use_int8_vision,
+                "use_int8_vision_static": self._use_int8_vision_static,
+            }
+        if self._force_bf16:
+            reason = (
+                "FVK_PI05_RTX_FORCE_BF16=1 set"
+                if os.environ.get("FVK_PI05_RTX_FORCE_BF16", "0") == "1"
+                else "GPU does not advertise FP8 support"
+            )
+            logger.warning(
+                "%s: disabling FP8 paths for the Pi0.5 RTX pipeline.",
+                reason,
+            )
+            return {
+                "use_fp8": False,
+                "use_fp8_decoder": False,
+                "use_int8_decoder": False,
+                "use_int8_encoder": False,
+                "use_int8_vision": False,
+                "use_int8_vision_static": False,
+            }
+        return {
+            "use_fp8": self.use_fp8,
+            "use_fp8_decoder": self.use_fp8,
+            "use_int8_decoder": False,
+            "use_int8_encoder": False,
+            "use_int8_vision": False,
+            "use_int8_vision_static": False,
+        }
+
     # -----------------------------------------------------------------
     # Checkpoint helpers
     # -----------------------------------------------------------------
 
     def _load_norm_stats(self, checkpoint_dir: pathlib.Path) -> None:
         from flash_rt.core.utils.norm_stats import (
-            load_norm_stats, lerobot_candidates,
+            load_norm_stats, pi05_candidates,
         )
-        candidates = [
-            checkpoint_dir / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
-            checkpoint_dir.parent / "pi05_libero" / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
-            checkpoint_dir / "norm_stats.json",
-            pathlib.Path("/root/.cache/openpi/openpi-assets/checkpoints/pi05_libero/"
-                         "assets/physical-intelligence/libero/norm_stats.json"),
-            *lerobot_candidates(checkpoint_dir),
-        ]
         try:
             self.norm_stats = load_norm_stats(
-                candidates, checkpoint_dir=checkpoint_dir)
+                pi05_candidates(checkpoint_dir), checkpoint_dir=checkpoint_dir)
         except FileNotFoundError as e:
             raise FileNotFoundError(
                 f"norm_stats not found near checkpoint: {e}") from e
@@ -604,6 +709,117 @@ class Pi05TorchFrontendRtx:
             quant(f"decoder_ffn_down_w_{i}", W["decoder_ffn_down_w"][i])
 
         logger.info("FP8 quantized %d GEMM weights (layout=%s)", len(fp8), self.fp8_layout)
+
+    def _quantize_decoder_int8(self) -> None:
+        """Pre-quantize the decoder hot-path GEMM weights to INT8."""
+        W = self._ckpt_bf16
+        store = self._int8_store
+        int8_weights = self._int8_weights
+
+        def quant(name: str, w: torch.Tensor):
+            # CUTLASS fused INT8 path expects weights as [N, K] ColumnMajor,
+            # so transpose once up front and keep per-output-channel scales.
+            w_f32 = w.float().transpose(0, 1).contiguous()
+            scale_t = torch.clamp(
+                w_f32.abs().amax(dim=1) / 127.0, min=1e-12
+            ).to(device=w.device, dtype=torch.float32).contiguous()
+            q = torch.clamp(
+                torch.round(w_f32 / scale_t[:, None]), -127, 127
+            ).to(torch.int8).contiguous()
+            store.append(q)
+            store.append(scale_t)
+            int8_weights[name] = (q.data_ptr(), scale_t.data_ptr())
+            self._int8_weight_scales[name] = scale_t
+
+        for i in range(DEC_L):
+            quant(f"decoder_attn_qkv_w_{i}", W["decoder_attn_qkv_w"][i])
+            quant(f"decoder_attn_o_w_{i}", W["decoder_attn_o_w"][i])
+            # Separate gate and up for SiLU-gated EVT fusion (same as encoder).
+            quant(f"decoder_ffn_gate_w_{i}", W["decoder_ffn_gate_w"][i])
+            quant(f"decoder_ffn_up_w_{i}", W["decoder_ffn_up_w"][i])
+            quant(f"decoder_ffn_down_w_{i}", W["decoder_ffn_down_w"][i])
+
+        logger.info("INT8 quantized %d decoder GEMM weights", len(int8_weights))
+
+    def _quantize_encoder_int8(self) -> None:
+        """Pre-quantize the Gemma-2B encoder GEMM weights to INT8.
+
+        Uses the same per-output-channel symmetric INT8 scheme as the
+        decoder path. The merged gate+up weight mirrors the FP8 path to
+        enable the single fused gate_geglu_merged → INT8 CUTLASS route.
+
+        Keys written into ``self._int8_weights`` (``encoder_`` prefix):
+            encoder_attn_qkv_w_{0..17}, encoder_attn_o_w_{0..17},
+            encoder_ffn_gate_up_w_{0..17}  (merged),
+            encoder_ffn_down_w_{0..17}
+        """
+        W = self._ckpt_bf16
+        store = self._int8_store   # shared with decoder, keeps tensors alive
+        int8_weights = self._int8_weights  # shared dict, encoder_ prefix avoids collision
+
+        def quant(name: str, w: torch.Tensor):
+            # CUTLASS rowwise INT8 expects B in [N, K] ColumnMajor layout.
+            w_f32 = w.float().transpose(0, 1).contiguous()
+            scale_t = torch.clamp(
+                w_f32.abs().amax(dim=1) / 127.0, min=1e-12
+            ).to(device=w.device, dtype=torch.float32).contiguous()
+            q = torch.clamp(
+                torch.round(w_f32 / scale_t[:, None]), -127, 127
+            ).to(torch.int8).contiguous()
+            store.append(q)
+            store.append(scale_t)
+            int8_weights[name] = (q.data_ptr(), scale_t.data_ptr())
+            self._int8_weight_scales[name] = scale_t
+
+        for i in range(ENC_L):
+            quant(f"encoder_attn_qkv_w_{i}", W["encoder_attn_qkv_w"][i])
+            quant(f"encoder_attn_o_w_{i}", W["encoder_attn_o_w"][i])
+            # Keep gate and up SEPARATE for SiLU-gated EVT fusion.
+            # The new cutlass_int8_silu_gated_bf16out kernel reads gate_buf
+            # produced by the gate GEMM and fuses SiLU(gate)*up in the
+            # epilogue, eliminating the separate gate_geglu_merged kernel.
+            quant(f"encoder_ffn_gate_w_{i}", W["encoder_ffn_gate_w"][i])
+            quant(f"encoder_ffn_up_w_{i}", W["encoder_ffn_up_w"][i])
+            quant(f"encoder_ffn_down_w_{i}", W["encoder_ffn_down_w"][i])
+
+        logger.info("INT8 quantized %d encoder GEMM weights", 5 * ENC_L)
+
+    def _quantize_vision_int8(self) -> None:
+        """Pre-quantize the SigLIP vision encoder GEMM weights to INT8.
+
+        Uses the same per-output-channel symmetric INT8 scheme.  The
+        vision GEMMs (seq=512, VIS_D=1152, VIS_H=4304) all fit inside
+        the encoder INT8 scratch buffers that ``Pi05Pipeline`` allocates,
+        so no additional device memory is needed.
+
+        Keys written into ``self._int8_weights`` (``vision_`` prefix):
+            vision_attn_qkv_w_{0..26}, vision_attn_o_w_{0..26},
+            vision_ffn_up_w_{0..26}, vision_ffn_down_w_{0..26}
+        """
+        W = self._ckpt_bf16
+        store = self._int8_store
+        int8_weights = self._int8_weights
+
+        def quant(name: str, w: torch.Tensor):
+            w_f32 = w.float().transpose(0, 1).contiguous()
+            scale_t = torch.clamp(
+                w_f32.abs().amax(dim=1) / 127.0, min=1e-12
+            ).to(device=w.device, dtype=torch.float32).contiguous()
+            q = torch.clamp(
+                torch.round(w_f32 / scale_t[:, None]), -127, 127
+            ).to(torch.int8).contiguous()
+            store.append(q)
+            store.append(scale_t)
+            int8_weights[name] = (q.data_ptr(), scale_t.data_ptr())
+            self._int8_weight_scales[name] = scale_t
+
+        for i in range(VIS_L):
+            quant(f"vision_attn_qkv_w_{i}", W["vision_attn_qkv_w"][i])
+            quant(f"vision_attn_o_w_{i}", W["vision_attn_o_w"][i])
+            quant(f"vision_ffn_up_w_{i}", W["vision_ffn_up_w"][i])
+            quant(f"vision_ffn_down_w_{i}", W["vision_ffn_down_w"][i])
+
+        logger.info("INT8 quantized %d vision GEMM weights", 4 * VIS_L)
 
     def _build_pipeline_weights(self) -> dict:
         """Produce the pointer dict that Pi05Pipeline expects."""
@@ -660,6 +876,7 @@ class Pi05TorchFrontendRtx:
 
             # FP8 quantized weights
             "fp8": self._fp8_weights,
+            "int8": self._int8_weights,
             "fp8_layout": self.fp8_layout,
 
             # Precomputed decoder styles (numpy bf16 as uint16 view)
@@ -760,7 +977,15 @@ class Pi05TorchFrontendRtx:
                 num_views=self.num_views,
                 max_prompt_len=prompt_len,
                 chunk_size=self.chunk_size,
-                use_fp8=self.use_fp8, use_fp8_decoder=self.use_fp8)
+                num_steps=self._num_steps,
+                vision_pool_factor=self._vision_pool_factor,
+                vision_num_layers=self._vision_num_layers,
+                **self._pipeline_precision_kwargs())
+            # Static INT8 vision scales are per-pipeline-instance.
+            # Reset so calibrate_single_frame collects fresh scales.
+            if self.pipeline.use_int8_vision_static:
+                self.pipeline.vis_int8_static_calibrated = False
+                self.pipeline.vis_int8_static_scales = {}
 
         # Upload language embeds into pipeline's encoder_x slot
         embeds_np = embeds.contiguous().view(torch.uint16).cpu().numpy()
@@ -831,7 +1056,7 @@ class Pi05TorchFrontendRtx:
                     num_views=self.num_views,
                     max_prompt_len=target_len,
                     chunk_size=self.chunk_size,
-                    use_fp8=self.use_fp8, use_fp8_decoder=self.use_fp8,
+                    **self._pipeline_precision_kwargs(),
                     cfg_beta=cfg["cfg_beta"])
             else:
                 self.pipeline = Pi05CFGPipeline(
@@ -841,7 +1066,7 @@ class Pi05TorchFrontendRtx:
                     num_views=self.num_views,
                     max_prompt_len=target_len,
                     chunk_size=self.chunk_size,
-                    use_fp8=self.use_fp8, use_fp8_decoder=self.use_fp8,
+                    **self._pipeline_precision_kwargs(),
                     cfg_beta=cfg["cfg_beta"])
 
         cond_np = cond_embeds.contiguous().view(torch.uint16).cpu().numpy()
@@ -902,6 +1127,14 @@ class Pi05TorchFrontendRtx:
         if not 0.0 <= percentile <= 100.0:
             raise ValueError(f"percentile must be in [0, 100], got {percentile}")
 
+        if getattr(self.pipeline, "use_int8_decoder", False):
+            if n > 1:
+                logger.info(
+                    "INT8 decoder path uses runtime-dynamic activation scales; "
+                    "using the first sample to warm buffers and capture the graph.")
+            self._calibrate_single_frame(obs_list[0])
+            return
+
         if n == 1:
             self._calibrate_single_frame(obs_list[0])
         else:
@@ -913,7 +1146,7 @@ class Pi05TorchFrontendRtx:
         self.calibrate(sample_observations)
 
     def _calibrate_single_frame(self, sample) -> None:
-        logger.info("Calibrating FP8 with a single real sample...")
+        logger.info("Preparing Pi0.5 runtime with a single real sample...")
 
         # Create a dedicated torch stream for both the calibration pass and
         # graph capture so flash_attn_func + our fvk kernels land on the
@@ -942,9 +1175,44 @@ class Pi05TorchFrontendRtx:
             self._cudart.cudaStreamSynchronize(
                 ctypes.c_void_p(stream_int))
 
-            # Flip calibrated flag (scales populated by run_pipeline above,
-            # or by calibrate_fp8's own B=1 forward for batched pipelines)
+            # FP8 calibration (no-op for INT8 pipelines).
             self.pipeline.calibrate_fp8()
+            # Static INT8 vision: the run_pipeline() call above already ran one
+            # vision forward with quantize_int8_device, writing per-site scales
+            # into vis_int8_static_scales. Flip the flag to switch to the fast
+            # static path (quantize_int8_static) for all subsequent calls.
+            if self.pipeline.use_int8_vision_static:
+                self.pipeline.vis_int8_static_calibrated = True
+                logger.info("Static INT8 vision calibrated: %d sites",
+                            len(self.pipeline.vis_int8_static_scales))
+            # Static encoder INT8 (opt-in via FVK_PI05_RTX_INT8_ENCODER_STATIC=1).
+            # After run_pipeline() above wrote per-row scales via the
+            # dynamic kernel, freeze them and flip the hot path to
+            # quantize_int8_rowwise_static (single-pass, no per-row amax
+            # reduction).
+            #
+            # WARNING — measured on Orin SM87, single-frame calibration:
+            #   * Latency saving: ~1.4 ms p50 (125.9 → 124.5 ms). Smaller
+            #     than the roofline-predicted 4-8 ms because most of the
+            #     encoder time is in the CUTLASS GEMM, not the quantize.
+            #   * Cosine vs dynamic baseline: drops from 0.991 to
+            #     ~0.93-0.98 across a 6-frame test sequence. Failed the
+            #     "lossless" bar — frozen per-row scales calibrated on
+            #     one sample don't generalize: vision-token rows whose
+            #     magnitude exceeds the calibration max get clipped.
+            # Default OFF. Opt-in only when the application explicitly
+            # accepts this trade-off (or after a future multi-sample
+            # calibration with proper safety inflation makes the cosine
+            # drop acceptable).
+            if (self.pipeline.use_int8_encoder
+                    and os.environ.get(
+                        "FVK_PI05_RTX_INT8_ENCODER_STATIC", "0") == "1"):
+                self.pipeline.int8_encoder_static_calibrated = True
+                logger.warning(
+                    "Static INT8 encoder enabled — frozen per-row scales "
+                    "from one calibration sample. Expect cosine drop "
+                    "(~0.96 vs dynamic 0.991 on test sequence). Set "
+                    "FVK_PI05_RTX_INT8_ENCODER_STATIC=0 to disable.")
             self.pipeline.autotune_gemms()
             self.pipeline.record_infer_graph(external_stream_int=stream_int)
 
@@ -966,7 +1234,7 @@ class Pi05TorchFrontendRtx:
 
         n = len(obs_list)
         logger.info(
-            "Calibrating FP8 across %d real samples (percentile=%.2f)...",
+            "Preparing Pi0.5 runtime across %d real samples (percentile=%.2f)...",
             n, percentile)
         self._graph_torch_stream = torch.cuda.Stream()
         self.pipeline.fp8_calibrated = False
@@ -1023,9 +1291,10 @@ class Pi05TorchFrontendRtx:
             "(N=%d, percentile=%.2f)", n, percentile)
 
     def _zero_pipeline_scales(self) -> None:
-        zero = np.zeros(1, dtype=np.float32)
         for buf in self.pipeline.fp8_act_scales.values():
-            buf.upload(zero)
+            buf.zero_()
+        for buf in getattr(self.pipeline, "int8_act_scales", {}).values():
+            buf.zero_()
 
     def _warn_if_scale_ceiling_exceeded(self, label: str = "pi05_rtx") -> None:
         """Diagnostic warning if any FP8 scale exceeds the sanity ceiling."""
@@ -1042,6 +1311,37 @@ class Pi05TorchFrontendRtx:
             ModelPrecisionSpec,
             PrecisionSpec,
         )
+
+        if getattr(self.pipeline, "use_int8_decoder", False):
+            spec = ModelPrecisionSpec(source="manual")
+            for name, scale_t in self._int8_weight_scales.items():
+                scale_val = scale_t.detach().cpu().numpy().astype(np.float32, copy=False)
+                entry = PrecisionSpec(
+                    dtype="int8",
+                    granularity="per_tensor",
+                    scheme="symmetric",
+                    scale_source="manual",
+                    scale=scale_val,
+                )
+                entry.validate()
+                spec.weight_specs[name] = entry
+
+            for name, buf in self.pipeline.int8_act_scales.items():
+                count = buf.nbytes // np.dtype(np.float32).itemsize
+                scale_val = buf.download_new((count,), np.float32)
+                entry = PrecisionSpec(
+                    dtype="int8",
+                    granularity="per_tensor",
+                    scheme="symmetric",
+                    scale_source="runtime_dynamic",
+                    scale=scale_val,
+                    calibration_method=method,
+                    calibration_samples=n,
+                    calibration_percentile=percentile,
+                )
+                entry.validate()
+                spec.decoder_layer_specs[name] = entry
+            return spec
 
         spec = ModelPrecisionSpec(source="calibration")
         for name, buf in self.pipeline.fp8_act_scales.items():
@@ -1095,19 +1395,29 @@ class Pi05TorchFrontendRtx:
 
         t0 = time.perf_counter()
 
+        # Temporal K/V caching: every cache_frames-th frame runs the full
+        # pipeline (vision + encoder + decoder); intermediate frames skip
+        # vision and encoder and replay only the decoder with fresh noise,
+        # reusing the encoder K/V cache from the last full forward.
+        self._frame_count += 1
+        use_full = (self._cache_frames <= 1 or
+                    self._frame_count % self._cache_frames == 1)
+
         with torch.cuda.stream(self._graph_torch_stream):
             stream_int = self._graph_torch_stream.cuda_stream
 
-            self._fill_img_buf(observation)
             self._noise_buf.normal_()
-
-            self._copy_tensor_to_pipeline_buf_stream(
-                self._img_buf, self.pipeline.input_images_buf, stream_int)
             self._copy_tensor_to_pipeline_buf_stream(
                 self._noise_buf, self.pipeline.input_noise_buf, stream_int)
 
-            # Graph replay (on the same captured stream)
-            out_ptr = self.pipeline.forward()
+            if use_full:
+                self._fill_img_buf(observation)
+                self._copy_tensor_to_pipeline_buf_stream(
+                    self._img_buf, self.pipeline.input_images_buf, stream_int)
+                out_ptr = self.pipeline.forward()
+            else:
+                # Decode-only: skip vision+encoder, reuse cached K/V
+                out_ptr = self.pipeline.forward_decode_only()
 
             # D2D download → staging torch tensor
             self._cudart.cudaMemcpyAsync(
@@ -1291,9 +1601,7 @@ class Pi05TorchFrontendRtx:
                 num_views=self.num_views,
                 max_prompt_len=target_len,
                 chunk_size=self.chunk_size,
-                use_fp8=self.use_fp8, use_fp8_decoder=self.use_fp8)
-
-        # Also seed the parent's B=1 lang slot from sample 0; the parent's
+                **self._pipeline_precision_kwargs())
         # B=1 pipeline path is what calibrate_fp8 uses for FP8 scale collection.
         self.pipeline.set_language_embeds(padded_np_list[0])
         self.pipeline.set_language_embeds_batch(padded_np_list)
