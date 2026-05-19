@@ -204,6 +204,206 @@ void quantize_fp8_device_fp16(const __half* input, __nv_fp8_e4m3* output,
     quantize_fp8_kernel_generic<__half><<<blocks, threads, 0, stream>>>(input, output, d_scale, n);
 }
 
+// ── INT8 dynamic quant + dequant (graph-compatible, BF16 activations) ──
+
+__global__ void compute_scale_int8_kernel(const float* d_absmax, float* d_scale) {
+    float amax = *d_absmax;
+    float scale = amax / 127.0f;
+    if (scale < 1e-12f) scale = 1e-12f;
+    *d_scale = scale;
+}
+
+template<typename T>
+__global__ void quantize_int8_kernel_generic(
+    const T* __restrict__ input,
+    int8_t* __restrict__ output,
+    const float* __restrict__ scale,
+    int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float inv_s = 1.0f / fmaxf(*scale, 1e-12f);
+    float v = to_f32(input[idx]) * inv_s;
+    int q = __float2int_rn(v);
+    q = (q < -127) ? -127 : ((q > 127) ? 127 : q);
+    output[idx] = static_cast<int8_t>(q);
+}
+
+template __global__ void quantize_int8_kernel_generic<__nv_bfloat16>(
+    const __nv_bfloat16*, int8_t*, const float*, int);
+
+void quantize_int8_device(const __nv_bfloat16* input, int8_t* output,
+                          float* d_scale, int n, cudaStream_t stream) {
+    cudaMemsetAsync(d_scale, 0, sizeof(float), stream);
+
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    if (blocks > 1024) blocks = 1024;
+    absmax_kernel<__nv_bfloat16><<<blocks, threads, threads * sizeof(float), stream>>>(
+        input, d_scale, n);
+
+    compute_scale_int8_kernel<<<1, 1, 0, stream>>>(d_scale, d_scale);
+    blocks = (n + threads - 1) / threads;
+    quantize_int8_kernel_generic<__nv_bfloat16><<<blocks, threads, 0, stream>>>(
+        input, output, d_scale, n);
+}
+
+// ── Static INT8 quantization (pre-calibrated scale, no amax reduction) ──
+//
+// Drop-in replacement for quantize_int8_device when d_scale has already
+// been calibrated offline. Skips the 2-kernel amax+scale pass and runs
+// only the element-wise quantize kernel → 1 launch vs 3.
+// CUDA Graph compatible (all ops are pure device-side).
+void quantize_int8_static(const __nv_bfloat16* input, int8_t* output,
+                           const float* d_scale, int n, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    if (blocks > 65535) blocks = 65535;
+    quantize_int8_kernel_generic<__nv_bfloat16><<<blocks, threads, 0, stream>>>(
+        input, output, d_scale, n);
+}
+
+__global__ void quantize_int8_rowwise_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    int8_t* __restrict__ output,
+    float* __restrict__ scales,
+    int rows, int cols)
+{
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    const __nv_bfloat16* in_row = input + static_cast<size_t>(row) * cols;
+    int8_t* out_row = output + static_cast<size_t>(row) * cols;
+
+    float tmax = 0.0f;
+    for (int j = threadIdx.x; j < cols; j += blockDim.x) {
+        tmax = fmaxf(tmax, fabsf(__bfloat162float(in_row[j])));
+    }
+
+    for (int off = 16; off > 0; off >>= 1) {
+        tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffff, tmax, off));
+    }
+
+    __shared__ float warp_max[8];
+    int wid = threadIdx.x >> 5;
+    int lid = threadIdx.x & 31;
+    if (lid == 0) {
+        warp_max[wid] = tmax;
+    }
+    __syncthreads();
+
+    if (wid == 0) {
+        tmax = (lid < (blockDim.x >> 5)) ? warp_max[lid] : 0.0f;
+        for (int off = 4; off > 0; off >>= 1) {
+            tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffff, tmax, off));
+        }
+    }
+
+    __shared__ float scale_s;
+    if (threadIdx.x == 0) {
+        float s = fmaxf(tmax / 127.0f, 1e-10f);
+        scales[row] = s;
+        scale_s = s;
+    }
+    __syncthreads();
+
+    float inv_s = 1.0f / scale_s;
+    for (int j = threadIdx.x; j < cols; j += blockDim.x) {
+        float v = __bfloat162float(in_row[j]) * inv_s;
+        int q = __float2int_rn(v);
+        q = (q < -127) ? -127 : ((q > 127) ? 127 : q);
+        out_row[j] = static_cast<int8_t>(q);
+    }
+}
+
+void quantize_int8_rowwise(const __nv_bfloat16* input, int8_t* output,
+                           float* d_scales, int rows, int cols,
+                           cudaStream_t stream) {
+    int threads = (cols < 256) ? cols : 256;
+    threads = ((threads + 31) / 32) * 32;
+    if (threads < 32) threads = 32;
+    quantize_int8_rowwise_kernel<<<rows, threads, 0, stream>>>(
+        input, output, d_scales, rows, cols);
+}
+
+// ── Static per-row INT8 quantization (pre-calibrated scales, single-pass) ──
+//
+// Drop-in replacement for quantize_int8_rowwise when the per-row scale
+// buffer has been pre-filled at calibration time. Skips the per-row
+// amax reduction (warp shuffle + cross-warp shared-memory merge) and
+// the second pass over global memory; reads each input element once,
+// quantizes against the pre-computed scale, writes once.
+//
+// Memory traffic per row: 1 BF16 read (cols * 2 B) + 1 INT8 write
+// (cols * 1 B) = 3*cols B  vs the dynamic version's 5*cols B.
+// Compute per row: 1 fmax (clamp), 1 mul, 1 cvt — no warp shuffles.
+//
+// Calibration must guarantee the per-row scales bound the per-call
+// activation magnitude (max over calibration samples). The frontend
+// can either:
+//   (a) freeze the dynamic per-row scales from one calibration call
+//       (works when row N's distribution is stable across calls — true
+//       for prompt rows, approximately true for vision rows on stable
+//       camera setups), or
+//   (b) fill all rows with a single per-tensor max scalar (loses some
+//       per-row precision but trivially safe).
+__global__ void quantize_int8_rowwise_static_kernel(
+        const __nv_bfloat16* __restrict__ input,
+        int8_t*  __restrict__ output,
+        const float* __restrict__ scales,   // (rows,) — one scalar per row
+        int rows, int cols)
+{
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    const __nv_bfloat16* in_row = input + static_cast<size_t>(row) * cols;
+    int8_t* out_row = output + static_cast<size_t>(row) * cols;
+
+    // Read scale once per block via __ldg (treated as constant during
+    // this kernel call). The 1e-12f floor mirrors the dynamic kernel
+    // and guards against degenerate calibration values.
+    float inv_s = 1.0f / fmaxf(__ldg(&scales[row]), 1e-12f);
+
+    for (int j = threadIdx.x; j < cols; j += blockDim.x) {
+        float v = __bfloat162float(in_row[j]) * inv_s;
+        int q = __float2int_rn(v);
+        q = (q < -127) ? -127 : ((q > 127) ? 127 : q);
+        out_row[j] = static_cast<int8_t>(q);
+    }
+}
+
+void quantize_int8_rowwise_static(const __nv_bfloat16* input, int8_t* output,
+                                   const float* d_scales, int rows, int cols,
+                                   cudaStream_t stream) {
+    int threads = (cols < 256) ? cols : 256;
+    threads = ((threads + 31) / 32) * 32;
+    if (threads < 32) threads = 32;
+    quantize_int8_rowwise_static_kernel<<<rows, threads, 0, stream>>>(
+        input, output, d_scales, rows, cols);
+}
+
+__global__ void dequant_int32_to_bf16_kernel(
+    const int32_t* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    const float* __restrict__ d_act_scale,
+    const float* __restrict__ d_weight_scale,
+    int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float scale = (*d_act_scale) * (*d_weight_scale);
+    output[idx] = __float2bfloat16(static_cast<float>(input[idx]) * scale);
+}
+
+void dequant_int32_to_bf16(const int32_t* input, __nv_bfloat16* output,
+                           const float* d_act_scale, const float* d_weight_scale,
+                           int n, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    dequant_int32_to_bf16_kernel<<<blocks, threads, 0, stream>>>(
+        input, output, d_act_scale, d_weight_scale, n);
+}
+
 #ifdef ENABLE_NVFP4
 // ================================================================
 //  NVFP4 (E2M1) Quantization with per-16-block UE4M3 scale factors

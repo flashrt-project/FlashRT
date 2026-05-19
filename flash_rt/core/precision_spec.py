@@ -7,8 +7,9 @@ calibration-produced FP8 scales and tomorrow's QAT-checkpoint-loaded
 scales share one representation.
 
 Scope for v1:
-    * The current shipped kernels only support
-      ``dtype="fp8_e4m3"`` + ``granularity="per_tensor"`` + ``scheme="symmetric"``.
+    * The current shipped kernels support experimental
+      ``dtype in {"fp8_e4m3", "int8"}`` with
+      ``granularity="per_tensor"`` + ``scheme="symmetric"``.
     * ``PrecisionSpec.validate()`` raises ``NotImplementedError`` for any
       other combination — this is intentional. It forces future extensions
       (QAT, per-channel, asymmetric) to touch this file first, keeping
@@ -34,9 +35,9 @@ DType = Literal[
 ]
 Granularity = Literal["per_tensor", "per_channel", "per_group"]
 Scheme = Literal["symmetric", "asymmetric"]
-ScaleSource = Literal["calibration", "qat_checkpoint", "runtime_dynamic"]
+ScaleSource = Literal["calibration", "qat_checkpoint", "runtime_dynamic", "manual"]
 
-_SUPPORTED_DTYPES = {"fp8_e4m3"}
+_SUPPORTED_DTYPES = {"fp8_e4m3", "int8"}
 _SUPPORTED_GRANULARITIES = {"per_tensor"}
 _SUPPORTED_SCHEMES = {"symmetric"}
 

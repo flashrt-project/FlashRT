@@ -37,9 +37,19 @@ def test_explicit_canonical_validates():
 
 
 def test_unsupported_dtype_raises_notimplemented():
-    for dtype in ("fp16", "bf16", "fp8_e5m2", "nvfp4", "int8", "int4"):
+    for dtype in ("fp16", "bf16", "fp8_e5m2", "nvfp4", "int4"):
         with pytest.raises(NotImplementedError):
             PrecisionSpec(dtype=dtype).validate()
+
+
+def test_int8_per_tensor_symmetric_validates():
+    s = PrecisionSpec(
+        dtype="int8",
+        granularity="per_tensor",
+        scheme="symmetric",
+        scale_source="runtime_dynamic",
+    )
+    s.validate()
 
 
 def test_per_channel_raises_notimplemented():
@@ -115,6 +125,6 @@ def test_model_precision_spec_json_roundtrip():
 
 def test_model_precision_spec_validate_propagates():
     m = ModelPrecisionSpec()
-    m.encoder_layer_specs["bad"] = PrecisionSpec(dtype="int8")
+    m.encoder_layer_specs["bad"] = PrecisionSpec(dtype="int4")
     with pytest.raises(NotImplementedError):
         m.validate()

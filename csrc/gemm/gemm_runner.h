@@ -80,6 +80,11 @@ public:
                  int M, int N, int K,
                  cudaStream_t stream = 0);
 
+    // INT8: D_i32 = A_i8(M,K) @ B_i8(K,N) with int32 accumulation/output.
+    void int8_nn(void* A, void* B, void* D,
+                 int M, int N, int K,
+                 cudaStream_t stream = 0);
+
     // BF16 with residual: D += A(M,K) @ B(K,N)  (row-major, no transpose)
     // Fuses residual add into GEMM accumulator (FP32), avoiding BF16 round-trip
     void bf16_nn_res(void* A, void* B, void* D,
@@ -165,6 +170,8 @@ public:
     // Call before CUDA Graph capture. Uses dummy data at the provided pointers.
     void autotune_bf16_nn(void* A, void* B, void* D,
                           int M, int N, int K, int num_algos = 16);
+    void autotune_int8_nn(void* A, void* B, void* D,
+                          int M, int N, int K, int num_algos = 16);
     void autotune_fp8_nn_dev(void* A, void* B, void* D,
                              int M, int N, int K,
                              float* d_scale_a, float* d_scale_b,
@@ -189,9 +196,9 @@ private:
 
     // ── GEMM descriptor + algorithm cache ──
     enum GemmType { BF16_NN = 0, BF16_NN_RES = 1, FP8_NN_DEV = 2,
-                    FP8_NT_DEV = 5, FP16_NN = 4
+                    INT8_NN = 3, FP16_NN = 4, FP8_NT_DEV = 5
 #ifdef ENABLE_NVFP4
-        , FP4_NN_DEV = 3
+        , FP4_NN_DEV = 6
 #endif
     };
 
