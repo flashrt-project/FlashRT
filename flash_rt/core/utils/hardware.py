@@ -6,6 +6,14 @@ import subprocess
 def get_gpu_sm_version() -> int:
     """Detect GPU SM version (e.g., 89 for 4090, 110 for Thor, 120 for 5090)."""
     try:
+        import torch
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability()
+            return major * 10 + minor
+    except Exception:
+        pass
+
+    try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5

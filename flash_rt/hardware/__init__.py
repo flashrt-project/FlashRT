@@ -85,8 +85,6 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
         ("flash_rt.frontends.jax.pi05_thor", "Pi05JaxFrontendThor"),
     ("pi05", "jax", "rtx_sm120"):
         ("flash_rt.frontends.jax.pi05_rtx", "Pi05JaxFrontendRtx"),
-    ("pi05", "jax", "rtx_sm87"):
-        ("flash_rt.frontends.jax.pi05_rtx", "Pi05JaxFrontendRtx"),
     ("pi05", "jax", "rtx_sm89"):
         ("flash_rt.frontends.jax.pi05_rtx", "Pi05JaxFrontendRtx"),
 
@@ -95,15 +93,11 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
         ("flash_rt.frontends.torch.pi0_thor", "Pi0TorchFrontendThor"),
     ("pi0", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.pi0_rtx", "Pi0TorchFrontendRtx"),
-    ("pi0", "torch", "rtx_sm87"):
-        ("flash_rt.frontends.torch.pi0_rtx", "Pi0TorchFrontendRtx"),
     ("pi0", "torch", "rtx_sm89"):
         ("flash_rt.frontends.torch.pi0_rtx", "Pi0TorchFrontendRtx"),
     ("pi0", "jax", "thor"):
         ("flash_rt.frontends.jax.pi0_thor", "Pi0JaxFrontendThor"),
     ("pi0", "jax", "rtx_sm120"):
-        ("flash_rt.frontends.jax.pi0_rtx", "Pi0JaxFrontendRtx"),
-    ("pi0", "jax", "rtx_sm87"):
         ("flash_rt.frontends.jax.pi0_rtx", "Pi0JaxFrontendRtx"),
     ("pi0", "jax", "rtx_sm89"):
         ("flash_rt.frontends.jax.pi0_rtx", "Pi0JaxFrontendRtx"),
@@ -133,6 +127,12 @@ def resolve_pipeline_class(config: str, framework: str, arch: str):
     does not pull in torch/jax/rtx code until a load happens.
     """
     key = (config, framework, arch)
+    if arch == "rtx_sm87" and key != ("pi05", "torch", "rtx_sm87"):
+        raise RuntimeError(
+            "FlashRT: Jetson Orin SM87 currently supports only "
+            "config='pi05' with framework='torch'. "
+            f"config={config!r} framework={framework!r} is not supported yet."
+        )
     if key not in _PIPELINE_MAP:
         supported = sorted(
             (c, f, a) for (c, f, a) in _PIPELINE_MAP

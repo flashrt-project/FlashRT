@@ -482,14 +482,26 @@ class Pi05TorchFrontendRtx:
         self.max_prompt_len = int(max_prompt_len)
         self._num_steps = int(num_steps)
         self._vision_pool_factor = int(vision_pool_factor)
+        if self._num_steps <= 0:
+            raise ValueError(f"num_steps must be positive, got {self._num_steps}")
+        if self._vision_pool_factor not in (1, 2, 4):
+            raise ValueError(
+                "vision_pool_factor must be one of {1, 2, 4}; "
+                f"got {self._vision_pool_factor}")
         # Temporal K/V caching: run full pipeline every `cache_frames` frames,
         # intermediate frames reuse the cached encoder K/V (decoder-only).
         # cache_frames=1 (default) = no caching, every frame is full.
         # cache_frames=2 = full, decode, full, decode, ...
-        self._cache_frames = max(1, int(cache_frames))
+        self._cache_frames = int(cache_frames)
+        if self._cache_frames < 1:
+            raise ValueError(f"cache_frames must be >= 1, got {self._cache_frames}")
         self._frame_count = 0
         from flash_rt.models.pi05.pipeline_rtx import VIS_L as _VIS_L
         self._vision_num_layers = _VIS_L if vision_num_layers is None else int(vision_num_layers)
+        if not 1 <= self._vision_num_layers <= _VIS_L:
+            raise ValueError(
+                f"vision_num_layers must be in [1, {_VIS_L}], "
+                f"got {self._vision_num_layers}")
         # _use_int8_vision_static is set after _force_int8_decoder below
         self.use_fp8 = bool(use_fp8)
         self.fp8_layout = _select_fp8_layout(hardware, fp8_layout)
@@ -990,6 +1002,7 @@ class Pi05TorchFrontendRtx:
         # Upload language embeds into pipeline's encoder_x slot
         embeds_np = embeds.contiguous().view(torch.uint16).cpu().numpy()
         self.pipeline.set_language_embeds(embeds_np)
+        self._frame_count = 0
         logger.info("Set prompt: '%s' (%d tokens)", prompt_text, prompt_len)
 
     def _set_prompt_rl(self, prompt_text: str) -> None:
@@ -1089,6 +1102,7 @@ class Pi05TorchFrontendRtx:
 
         self.pipeline.set_language_embeds_pair(cond_np, uncond_np)
         self._rl_current_prompt_text = prompt_text
+        self._frame_count = 0
         logger.info(
             "Set RL prompt: '%s' (cond_len=%d, uncond_len=%d, padded=%d, batched=%s)",
             prompt_text, cond_len, uncond_len, target_len, use_batched_cfg)
@@ -1605,6 +1619,7 @@ class Pi05TorchFrontendRtx:
         # B=1 pipeline path is what calibrate_fp8 uses for FP8 scale collection.
         self.pipeline.set_language_embeds(padded_np_list[0])
         self.pipeline.set_language_embeds_batch(padded_np_list)
+        self._frame_count = 0
         logger.info(
             "Set batch prompt (B=%d, padded_len=%d): %s",
             PI05_BATCH_SIZE, target_len,

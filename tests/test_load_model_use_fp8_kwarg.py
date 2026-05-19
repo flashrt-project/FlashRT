@@ -2,6 +2,8 @@ from unittest.mock import patch
 import ast
 from pathlib import Path
 
+import pytest
+
 
 def test_load_model_only_passes_use_fp8_when_frontend_accepts_it():
     from flash_rt.api import load_model
@@ -67,6 +69,53 @@ def test_load_model_propagates_hardware_when_frontend_accepts_it():
 
     assert isinstance(model._pipe, HardwareFrontend)
     assert HardwareFrontend.seen_hardware == "rtx_sm89"
+
+
+def test_load_model_propagates_pi05_orin_tuning_kwargs_when_supported():
+    from flash_rt.api import load_model
+
+    class OrinTuningFrontend:
+        seen = None
+
+        def __init__(self, checkpoint, num_views=2, num_steps=10,
+                     vision_pool_factor=1, vision_num_layers=27,
+                     cache_frames=1):
+            type(self).seen = {
+                "num_steps": num_steps,
+                "vision_pool_factor": vision_pool_factor,
+                "vision_num_layers": vision_num_layers,
+                "cache_frames": cache_frames,
+            }
+
+        def infer(self, obs):
+            return {"actions": None}
+
+    with patch("flash_rt.hardware.resolve_pipeline_class",
+              return_value=OrinTuningFrontend):
+        model = load_model(
+            "/tmp/nonexistent", config="pi05", framework="torch",
+            hardware="rtx_sm87", num_steps=5, vision_pool_factor=2,
+            vision_num_layers=18, cache_frames=2)
+
+    assert isinstance(model._pipe, OrinTuningFrontend)
+    assert OrinTuningFrontend.seen == {
+        "num_steps": 5,
+        "vision_pool_factor": 2,
+        "vision_num_layers": 18,
+        "cache_frames": 2,
+    }
+
+
+def test_sm87_rejects_unvalidated_pi0_and_jax_backends():
+    from flash_rt.hardware import resolve_pipeline_class
+
+    for config, framework in [
+        ("pi05", "jax"),
+        ("pi0", "torch"),
+        ("pi0", "jax"),
+    ]:
+        with pytest.raises(RuntimeError, match="Jetson Orin SM87"):
+            resolve_pipeline_class(config, framework, "rtx_sm87")
 
 
 def test_pi05_rtx_fp8_layout_selection():

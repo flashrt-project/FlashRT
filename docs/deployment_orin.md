@@ -46,8 +46,9 @@ cmake -B build_orin_sm87 -S . \
 cmake --build build_orin_sm87 -j4
 ```
 
-CMake auto-detects SM87 and emits SASS for `compute_80,sm_87` (Ampere ISA
-compatible). Build time ≈ 4-6 minutes on Orin.
+CMake auto-detects SM87 and emits SASS for `compute_87,sm_87`. The FA2
+wrapper still builds the SM80-family source instantiations with SM87 codegen.
+Build time ≈ 4-6 minutes on Orin.
 
 ## Usage
 
@@ -139,20 +140,21 @@ export FVK_PI05_RTX_FORCE_INT8=1
 # Lossless cache_frames=1 (8.04 Hz)
 python examples/orin/bench_pi05.py \
   --checkpoint /path/to/pi05_droid_pytorch \
-  --num_views 2 --num_steps 10 \
-  --vision_pool_factor 1 --vision_num_layers 27 \
-  --cache_frames 1
+  --num-views 2 --steps 10 \
+  --pool 1 --layers 27 \
+  --cache-frames 1
 
 # Production cache_frames=2 (12.2 Hz, cos 0.991)
 python examples/orin/bench_pi05.py \
   --checkpoint /path/to/pi05_droid_pytorch \
-  --num_views 2 --num_steps 10 \
-  --vision_pool_factor 1 --vision_num_layers 27 \
-  --cache_frames 2
+  --num-views 2 --steps 10 \
+  --pool 1 --layers 27 \
+  --cache-frames 2
 ```
 
-`bench_pi05.py` reports p50 / p99 latency, computed Hz, and cosine vs the
-BF16 reference path.
+`bench_pi05.py` reports p50 / p95 / min latency and computed Hz. The cosine
+numbers above were measured separately against the BF16 reference path on the
+same fixed-seed sequence.
 
 ## Known limitations on SM87
 

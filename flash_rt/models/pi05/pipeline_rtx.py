@@ -145,7 +145,8 @@ class Pi05Pipeline:
             fp8.decoder_ffn_gate_up_w_{0..17}, fp8.decoder_ffn_down_w_{0..17},
         Decoder INT8:
             int8.decoder_attn_qkv_w_{0..17}, int8.decoder_attn_o_w_{0..17},
-            int8.decoder_ffn_gate_up_w_{0..17}, int8.decoder_ffn_down_w_{0..17},
+            int8.decoder_ffn_gate_w_{0..17}, int8.decoder_ffn_up_w_{0..17},
+            int8.decoder_ffn_down_w_{0..17},
         Language (rebound per-prompt by frontend):
             language_embeds_ptr   — pointer to bf16 (max_prompt_len, 2048) buffer
     """
@@ -195,6 +196,16 @@ class Pi05Pipeline:
         self.int8_encoder_static_calibrated = False
         self.vision_pool_factor = int(vision_pool_factor)
         self.vision_num_layers = int(vision_num_layers)
+        if self.num_steps <= 0:
+            raise ValueError(f"num_steps must be positive, got {self.num_steps}")
+        if self.vision_pool_factor not in (1, 2, 4):
+            raise ValueError(
+                "vision_pool_factor must be one of {1, 2, 4}; "
+                f"got {self.vision_pool_factor}")
+        if not 1 <= self.vision_num_layers <= VIS_L:
+            raise ValueError(
+                f"vision_num_layers must be in [1, {VIS_L}], "
+                f"got {self.vision_num_layers}")
         self.fp8_layout = weights.get("fp8_layout", "kn")
         if self.fp8_layout not in ("kn", "nk"):
             raise ValueError(f"unsupported FP8 layout: {self.fp8_layout!r}")
@@ -763,6 +774,20 @@ class Pi05Pipeline:
             act_i8_ptr, weight_name, out_bf16_ptr, M, N, K,
             layer_scale.ptr.value, stream)
 
+    def _int8_silu_gated_gemm_fused(self, act_i8_ptr: int, up_name: str,
+                                    gate_bf16_ptr: int, out_bf16_ptr: int,
+                                    M: int, N: int, K: int,
+                                    act_scale_ptr: int, stream: int) -> None:
+        """INT8 up GEMM fused with SiLU(gate) epilogue."""
+        w_i8_ptr, w_scale_ptr = self._weight_int8(up_name)
+        status = self.fvk.cutlass_int8_silu_gated_bf16out(
+            act_i8_ptr, w_i8_ptr, act_scale_ptr, w_scale_ptr,
+            gate_bf16_ptr, out_bf16_ptr, M, N, K, stream=stream)
+        if status != 0:
+            raise RuntimeError(
+                f"CUTLASS INT8 SiLU-gated GEMM failed for {up_name}: "
+                f"status={status} shape=({M},{N},{K})")
+
     def _bias_add_bf16(self, x_ptr: int, bias_ptr: int,
                        seq: int, dim: int, stream: int) -> None:
         """Broadcast-add bias to an (seq, dim) bf16 buffer in place.
@@ -1225,13 +1250,11 @@ class Pi05Pipeline:
                 seq, ENC_H, ENC_D,
                 act_scale.ptr.value, stream)
             # Up GEMM + SiLU(gate)*up in EVT epilogue → encoder_hidden (seq, ENC_H)
-            up_w_ptr, up_wt_scale_ptr = self._weight_int8(up_name)
-            fvk.cutlass_int8_silu_gated_bf16out(
-                act_i8_ptr, up_w_ptr,
-                act_scale.ptr.value, up_wt_scale_ptr,
+            self._int8_silu_gated_gemm_fused(
+                act_i8_ptr, up_name,
                 B["encoder_gate_buf"].ptr.value,
                 B["encoder_hidden"].ptr.value,
-                seq, ENC_H, ENC_D, stream=stream)
+                seq, ENC_H, ENC_D, act_scale.ptr.value, stream)
         elif fused:
             # Fused: residual + RMS → FP8 in one kernel, then FP8 GEMM
             gu_name = f"encoder_ffn_gate_up_w_{i}"
@@ -1492,14 +1515,14 @@ class Pi05Pipeline:
         else:
             if self.use_int8_decoder:
                 act_i8_ptr = B["dec_act_int8"].ptr.value
-                act_scale_gu = self._int8_scale_buf(gu_name, ds).ptr.value
+                act_scale_gate = self._int8_scale_buf(gate_name, ds).ptr.value
                 fvk.gate_residual_ada_norm_int8(
                     B["decoder_x"].ptr.value, B["x_normed_buf"].ptr.value,
                     B["gate_buf"].ptr.value,
                     self._rms_ones_dec.ptr.value,
                     self._style_slice_ptr("decoder_style_ffn", step, i),
                     act_i8_ptr, B["gate_buf"].ptr.value,
-                    ds, DEC_D, 1e-6, act_scale_gu, stream=stream)
+                    ds, DEC_D, 1e-6, act_scale_gate, stream=stream)
             else:
                 fvk.gate_mul_residual(
                     B["decoder_x"].ptr.value, B["x_normed_buf"].ptr.value,
@@ -1526,13 +1549,11 @@ class Pi05Pipeline:
                     B["decoder_gate_buf"].ptr.value,
                     ds, DEC_H, DEC_D,
                     act_scale_gu_ptr, stream)
-                up_w_ptr, up_wt_s_ptr = self._weight_int8(up_name)
-                fvk.cutlass_int8_silu_gated_bf16out(
-                    act_i8, up_w_ptr,
-                    act_scale_gu_ptr, up_wt_s_ptr,
+                self._int8_silu_gated_gemm_fused(
+                    act_i8, up_name,
                     B["decoder_gate_buf"].ptr.value,
                     B["decoder_hidden"].ptr.value,
-                    ds, DEC_H, DEC_D, stream=stream)
+                    ds, DEC_H, DEC_D, act_scale_gu_ptr, stream)
             else:
                 gemm.bf16_nn(
                     B["x_normed_buf"].ptr.value, W["decoder_ffn_gate_w"][i],

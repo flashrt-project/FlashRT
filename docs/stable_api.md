@@ -35,7 +35,7 @@ def load_model(
     decode_cuda_graph: bool = False,
     decode_graph_steps: int = 80,
     max_decode_steps: int = 256,
-    hardware: str = "auto",         # "auto" | "thor" | "rtx_sm120" | "rtx_sm89"
+    hardware: str = "auto",         # "auto" | "thor" | "rtx_sm120" | "rtx_sm89" | "rtx_sm87"
     # GROOT-specific:
     embodiment_tag: str | None = None,
     action_horizon: int | None = None,
@@ -45,6 +45,10 @@ def load_model(
     use_awq: bool | None = None,
     awq_alpha: float = 0.5,
     use_p1_split_gu: bool | None = None,
+    num_steps: int | None = None,
+    vision_pool_factor: int | None = None,
+    vision_num_layers: int | None = None,
+    cache_frames: int | None = None,
     # Frontends with an FP8/BF16 switch:
     use_fp8: bool = True,
 ) -> VLAModel
@@ -58,6 +62,11 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
 - `embodiment_tag` and `action_horizon` apply to GROOT.
 - `use_fp4`, `fp4_layers`, `use_awq`, `awq_alpha`, and
   `use_p1_split_gu` apply to the Pi0.5 torch NVFP4 encoder path.
+- `num_steps`, `vision_pool_factor`, `vision_num_layers`, and
+  `cache_frames` apply only to frontends that expose those constructor
+  parameters today. The Pi0.5 torch RTX/Orin frontend validates
+  `vision_pool_factor in {1, 2, 4}`, `vision_num_layers in [1, 27]`, and
+  `cache_frames >= 1`.
 - `use_fp8=False` disables FP8 where the selected frontend exposes a
   BF16 fallback; unsupported frontends ignore it.
 
@@ -94,8 +103,9 @@ from flash_rt.hardware import detect_arch, resolve_pipeline_class
 
 ### `detect_arch() -> str`
 
-Returns `"thor"`, `"rtx_sm120"`, or `"rtx_sm89"` based on the current
-CUDA device's compute capability.
+Returns `"thor"`, `"rtx_sm120"`, `"rtx_sm89"`, or `"rtx_sm87"` based on
+the current CUDA device's compute capability. SM87 is currently supported
+only for `config="pi05", framework="torch"`.
 
 ### `resolve_pipeline_class(config, framework, arch)`
 
@@ -226,7 +236,7 @@ Signatures are internal — plug-ins should go through the
 Vendored Flash-Attention 2 v2.7.4.post1 (forward only, fp16 + bf16,
 SM80-family SASS). Binary name pattern:
 `flash_rt_fa2.cpython-<abi>.so`, ~135 MB. Only built when
-`GPU_ARCH ∈ {80, 86, 89, 120}`. Exposes:
+`GPU_ARCH ∈ {80, 86, 87, 89, 120}`. Exposes:
 
 ```python
 flash_rt_fa2.fwd_fp16(

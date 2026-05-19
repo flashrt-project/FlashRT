@@ -86,6 +86,22 @@ else()
   message(STATUS "FA2 in-SO attention: DISABLED (Thor SM110 uses fvk.attention_qkv_fp16 cuBLAS path)")
 endif()
 
+# SM80-family CUTLASS INT8 kernels used by the Jetson Orin SM87 Pi0.5 fast
+# path. Keep them out of the shared flash_rt_kernels module on other targets
+# so Thor/RTX builds do not inherit unrelated compile/link risk.
+if(NOT DEFINED ENABLE_SM80_INT8_CUTLASS)
+  if(GPU_ARCH STREQUAL "87")
+    set(ENABLE_SM80_INT8_CUTLASS ON)
+  else()
+    set(ENABLE_SM80_INT8_CUTLASS OFF)
+  endif()
+endif()
+if(ENABLE_SM80_INT8_CUTLASS)
+  message(STATUS "SM80-family CUTLASS INT8: ENABLED (sm_${GPU_ARCH})")
+else()
+  message(STATUS "SM80-family CUTLASS INT8: DISABLED (current: sm_${GPU_ARCH})")
+endif()
+
 # ── FA2 build slimming flags (opt-in; defaults keep today's behaviour) ──
 # FA2's vendored CUTLASS 3.x templates dominate FlashRT's build cost
 # (~8–10 min on a warm container for the default matrix of 3 hdims ×
@@ -490,9 +506,6 @@ endif()
 # ── Main module ──
 pybind11_add_module(flash_rt_kernels
   csrc/gemm/gemm_runner.cu
-  csrc/gemm/cutlass_sm80_int8_rowwise.cu
-  csrc/gemm/cutlass_sm80_int8_rowwise_t64x128.cu
-  csrc/gemm/cutlass_sm80_int8_silu_gated.cu
   csrc/kernels/norm.cu
   csrc/kernels/activation.cu
   csrc/kernels/rope.cu
@@ -541,6 +554,14 @@ endif()
 if(ENABLE_NVFP4)
   target_sources(flash_rt_kernels PRIVATE $<TARGET_OBJECTS:gemm_kernels_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_NVFP4=1)
+endif()
+
+if(ENABLE_SM80_INT8_CUTLASS)
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/gemm/cutlass_sm80_int8_rowwise.cu
+    csrc/gemm/cutlass_sm80_int8_rowwise_t64x128.cu
+    csrc/gemm/cutlass_sm80_int8_silu_gated.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_SM80_INT8_CUTLASS=1)
 endif()
 
 # SM120a CUTLASS block-128 FP8 GEMM (Path B for Qwen3.6).

@@ -6,6 +6,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <cstdint>
+#include <stdexcept>
 #include "context.h"
 #include "gemm/gemm_runner.h"
 #include "gemm/fp8_block128_gemm.cuh"
@@ -129,6 +130,7 @@ extern "C" void tq_cutlass_k_combine_launch(
     const void* sr_fp32,
     const void* norm_k_fp32, const void* coef_rnorm_fp32,
     void* d_bf16, int M, int N, int K, cudaStream_t stream);
+#ifdef ENABLE_SM80_INT8_CUTLASS
 extern "C" int cutlass_int8_silu_gated_bf16out(
     void const*, void const*, void const*, void const*, void const*, void*, int, int, int, cudaStream_t);
 
@@ -138,6 +140,7 @@ extern "C" int cutlass_int8_rowwise_bf16out(
 extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
     void const* A, void const* B, void const* act_scale, void const* weight_scale,
     void* D, int M, int N, int K, cudaStream_t stream);
+#endif
 extern "C" void tq_dequant_kv_fused_launch(
     const void* k_idx_packed, const void* k_qjl_packed,
     const void* k_norm, const void* k_rnorm,
@@ -1046,9 +1049,16 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     m.def("cutlass_int8_silu_gated_bf16out",
           [](uintptr_t act, uintptr_t up_w, uintptr_t act_s, uintptr_t wt_s,
              uintptr_t gate, uintptr_t D, int M, int N, int K, uintptr_t stream) {
+#ifdef ENABLE_SM80_INT8_CUTLASS
               return cutlass_int8_silu_gated_bf16out(
                   to_ptr(act), to_ptr(up_w), to_ptr(act_s), to_ptr(wt_s),
                   to_ptr(gate), to_ptr(D), M, N, K, to_stream(stream));
+#else
+              throw std::runtime_error(
+                  "cutlass_int8_silu_gated_bf16out was not built. "
+                  "Reconfigure with -DENABLE_SM80_INT8_CUTLASS=ON "
+                  "(enabled by default for GPU_ARCH=87 / Jetson Orin).");
+#endif
           }, py::arg("act"), py::arg("up_w"), py::arg("act_scale"), py::arg("wt_scale"),
              py::arg("gate_buf"), py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),
              py::arg("stream") = 0);
@@ -1056,9 +1066,16 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     m.def("cutlass_int8_rowwise_bf16out",
           [](uintptr_t A, uintptr_t B, uintptr_t act_scale, uintptr_t weight_scale,
              uintptr_t D, int M, int N, int K, uintptr_t stream) {
+#ifdef ENABLE_SM80_INT8_CUTLASS
               return cutlass_int8_rowwise_bf16out(
                   to_ptr(A), to_ptr(B), to_ptr(act_scale), to_ptr(weight_scale),
                   to_ptr(D), M, N, K, to_stream(stream));
+#else
+              throw std::runtime_error(
+                  "cutlass_int8_rowwise_bf16out was not built. "
+                  "Reconfigure with -DENABLE_SM80_INT8_CUTLASS=ON "
+                  "(enabled by default for GPU_ARCH=87 / Jetson Orin).");
+#endif
           },
           py::arg("A"), py::arg("B"), py::arg("act_scale"), py::arg("weight_scale"),
           py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),
@@ -1067,9 +1084,16 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     m.def("cutlass_int8_rowwise_bf16out_t64x128",
           [](uintptr_t A, uintptr_t B, uintptr_t act_scale, uintptr_t weight_scale,
              uintptr_t D, int M, int N, int K, uintptr_t stream) {
+#ifdef ENABLE_SM80_INT8_CUTLASS
               return cutlass_int8_rowwise_bf16out_t64x128(
                   to_ptr(A), to_ptr(B), to_ptr(act_scale), to_ptr(weight_scale),
                   to_ptr(D), M, N, K, to_stream(stream));
+#else
+              throw std::runtime_error(
+                  "cutlass_int8_rowwise_bf16out_t64x128 was not built. "
+                  "Reconfigure with -DENABLE_SM80_INT8_CUTLASS=ON "
+                  "(enabled by default for GPU_ARCH=87 / Jetson Orin).");
+#endif
           },
           py::arg("A"), py::arg("B"), py::arg("act_scale"), py::arg("weight_scale"),
           py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),

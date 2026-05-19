@@ -219,7 +219,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                                       where needed, e.g. Pi0-FAST.)
               SM89  (RTX 4090)     → ``flash_rt.hardware.rtx.*``
               SM87  (Jetson Orin)  → ``flash_rt.hardware.rtx.*`` (experimental,
-                                     BF16-only for Pi0.5 torch)
+                                     Pi0.5 torch only; BF16 default, INT8
+                                     via Orin env flags)
             Pass ``"thor"`` / ``"rtx_sm120"`` / ``"rtx_sm89"`` /
             ``"rtx_sm87"`` explicitly to
             force a specific backend (useful for cross-hardware debugging).
@@ -245,6 +246,18 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         use_fp8: Enable FP8 execution where the selected frontend supports
             an FP8/BF16 switch. Defaults to True to preserve existing
             performance-oriented behavior.
+        num_steps: Pi0/Pi0.5 torch only when supported. Number of
+            flow-matching ODE steps. ``None`` uses the frontend default.
+        vision_pool_factor: Pi0.5 torch RTX/Orin only. Spatial pooling factor
+            for vision tokens; valid values are 1, 2, or 4. ``None`` keeps
+            the frontend default.
+        vision_num_layers: Pi0.5 torch RTX/Orin only. Number of SigLIP vision
+            layers to execute; valid range is 1-27. ``None`` keeps the
+            frontend default.
+        cache_frames: Pi0.5 torch RTX/Orin only. Temporal K/V reuse period.
+            1 runs the full vision+encoder+decoder path on every frame; 2
+            alternates full and decoder-only frames. ``None`` keeps the
+            frontend default.
 
     Returns:
         VLAModel instance with .predict() method.
