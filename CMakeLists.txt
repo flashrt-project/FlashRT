@@ -490,6 +490,9 @@ endif()
 # ── Main module ──
 pybind11_add_module(flash_rt_kernels
   csrc/gemm/gemm_runner.cu
+  csrc/gemm/cutlass_sm80_int8_rowwise.cu
+  csrc/gemm/cutlass_sm80_int8_rowwise_t64x128.cu
+  csrc/gemm/cutlass_sm80_int8_silu_gated.cu
   csrc/kernels/norm.cu
   csrc/kernels/activation.cu
   csrc/kernels/rope.cu
