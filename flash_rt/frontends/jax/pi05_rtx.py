@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import pathlib
 from typing import Optional, Union
 
@@ -49,6 +50,7 @@ from flash_rt.frontends.torch.pi05_rtx import (
     _interleave_qk,
     _select_fp8_layout,
 )
+from flash_rt.core.utils.hardware import supports_fp8
 
 logger = logging.getLogger(__name__)
 
@@ -441,6 +443,10 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         num_views: int = 2,
         chunk_size: int = CHUNK_SIZE,
         max_prompt_len: int = MAX_PROMPT_LEN_DEFAULT,
+        num_steps: int = NUM_STEPS_DEFAULT,
+        vision_pool_factor: int = 1,
+        vision_num_layers: Optional[int] = None,
+        cache_frames: int = 1,
         use_fp8: bool = True,
         hardware: Optional[str] = None,
         fp8_layout: Optional[str] = None,
@@ -451,6 +457,25 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         self.num_views = int(num_views)
         self.chunk_size = int(chunk_size)
         self.max_prompt_len = int(max_prompt_len)
+        self._num_steps = int(num_steps)
+        self._vision_pool_factor = int(vision_pool_factor)
+        if self._num_steps <= 0:
+            raise ValueError(f"num_steps must be positive, got {self._num_steps}")
+        if self._vision_pool_factor not in (1, 2, 4):
+            raise ValueError(
+                "vision_pool_factor must be one of {1, 2, 4}; "
+                f"got {self._vision_pool_factor}")
+        self._cache_frames = int(cache_frames)
+        if self._cache_frames < 1:
+            raise ValueError(f"cache_frames must be >= 1, got {self._cache_frames}")
+        self._frame_count = 0
+        self._vision_num_layers = (
+            VIS_L if vision_num_layers is None else int(vision_num_layers)
+        )
+        if not 1 <= self._vision_num_layers <= VIS_L:
+            raise ValueError(
+                f"vision_num_layers must be in [1, {VIS_L}], "
+                f"got {self._vision_num_layers}")
         self.use_fp8 = bool(use_fp8)
         self.fp8_layout = _select_fp8_layout(hardware, fp8_layout)
 
@@ -465,6 +490,13 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         # default to None (= standard non-CFG inference).
         self._rl_config: Optional[dict] = None
         self._rl_current_prompt_text: Optional[str] = None
+        self._force_int8_decoder = False
+        self._use_int8_encoder = False
+        self._int8_encoder_only = False
+        self._use_int8_vision = False
+        self._use_int8_vision_static = False
+        env_force_bf16 = os.environ.get("FVK_PI05_RTX_FORCE_BF16", "0") == "1"
+        self._force_bf16 = env_force_bf16 or not supports_fp8()
 
         # ── norm_stats (same locations as torch frontend) ──
         self._load_norm_stats(checkpoint_dir)
@@ -487,24 +519,26 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         # Pre-scale decoder action output projection by -1/num_steps
         # (matches the torch frontend's pre-scaling step that bakes the
         # flow-matching residual coefficient into the weights).
-        num_steps = NUM_STEPS_DEFAULT
         self._ckpt_bf16["decoder_action_out_proj_w"] = (
-            self._ckpt_bf16["decoder_action_out_proj_w"] * (-1.0 / num_steps)
+            self._ckpt_bf16["decoder_action_out_proj_w"] * (-1.0 / self._num_steps)
         )
         self._ckpt_bf16["decoder_action_out_proj_b"] = (
-            self._ckpt_bf16["decoder_action_out_proj_b"] * (-1.0 / num_steps)
+            self._ckpt_bf16["decoder_action_out_proj_b"] * (-1.0 / self._num_steps)
         )
 
         # ── FP8 quantize large GEMM weights (shared method) ──
         self._fp8_weights: dict = {}
         self._fp8_store: list = []
-        if self.use_fp8:
+        self._int8_weights: dict = {}
+        self._int8_store: list = []
+        self._int8_weight_scales: dict[str, torch.Tensor] = {}
+        if self.use_fp8 and not self._force_bf16:
             self._quantize_all_fp8()
 
         # ── Pre-compute decoder styles (shared helper) ──
         from flash_rt.frontends.torch.pi05_rtx import _precompute_decoder_styles
         self._precomputed_styles = _precompute_decoder_styles(
-            self._ckpt_bf16, self.chunk_size, num_steps=num_steps
+            self._ckpt_bf16, self.chunk_size, num_steps=self._num_steps
         )
 
         # ── Attention backend, fvk, GemmRunner, reusable buffers ──

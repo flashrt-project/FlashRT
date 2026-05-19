@@ -156,3 +156,44 @@ def test_vla_frontend_constructors_accept_use_fp8():
         args = [arg.arg for arg in init.args.args]
         args += [arg.arg for arg in init.args.kwonlyargs]
         assert "use_fp8" in args, f"{class_name} must accept use_fp8"
+
+
+def test_pi05_jax_rtx_frontend_mirrors_runtime_knobs():
+    repo_root = Path(__file__).resolve().parents[1]
+    tree = ast.parse(
+        (repo_root / "flash_rt/frontends/jax/pi05_rtx.py").read_text())
+    cls = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "Pi05JaxFrontendRtx")
+    init = next(
+        node for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__")
+    args = [arg.arg for arg in init.args.args]
+    assigned = set()
+    for node in ast.walk(init):
+        targets = list(getattr(node, "targets", []))
+        if isinstance(node, ast.AnnAssign):
+            targets.append(node.target)
+        for target in targets:
+            if (isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "self"):
+                assigned.add(target.attr)
+
+    for arg in (
+        "num_steps",
+        "vision_pool_factor",
+        "vision_num_layers",
+        "cache_frames",
+    ):
+        assert arg in args
+    for attr in (
+        "_num_steps",
+        "_vision_pool_factor",
+        "_vision_num_layers",
+        "_cache_frames",
+        "_frame_count",
+        "_int8_weights",
+        "_int8_weight_scales",
+    ):
+        assert attr in assigned
