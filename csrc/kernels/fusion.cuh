@@ -27,3 +27,10 @@ void gate_residual_ada_norm_fp8_fp16(__half* residual, const __half* x,
                                       __nv_fp8_e4m3* out, __half* gate_out,
                                       int seq_len, int dim, float eps,
                                       const float* d_scale, cudaStream_t stream = 0);
+
+void gate_residual_ada_norm_int8(__nv_bfloat16* residual, const __nv_bfloat16* x,
+                                 const __nv_bfloat16* gate, const __nv_bfloat16* weight,
+                                 const __nv_bfloat16* style,
+                                 int8_t* out, __nv_bfloat16* gate_out,
+                                 int seq_len, int dim, float eps,
+                                 float* d_scales, cudaStream_t stream = 0);

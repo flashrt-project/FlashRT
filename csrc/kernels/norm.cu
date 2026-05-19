@@ -229,6 +229,81 @@ void ada_rms_norm_style(const __nv_bfloat16* x, const __nv_bfloat16* weight,
         x, weight, style, out, gate_out, dim, eps);
 }
 
+template<typename T>
+__global__ void ada_rms_norm_style_int8_kernel(
+    const T* __restrict__ x, const T* __restrict__ weight,
+    const T* __restrict__ style, int8_t* __restrict__ out, T* __restrict__ gate_out,
+    int dim, float eps, float* __restrict__ d_scales) {
+    using T2 = typename packed2<T>::type;
+    int row = blockIdx.x;
+    const T2* x2 = reinterpret_cast<const T2*>(x + row * dim);
+    const T* style_row = style + row * 3 * dim;
+    const T2* sc2 = reinterpret_cast<const T2*>(style_row);
+    const T2* sh2 = reinterpret_cast<const T2*>(style_row + dim);
+    const T2* gt2 = reinterpret_cast<const T2*>(style_row + 2 * dim);
+    const T2* w2 = reinterpret_cast<const T2*>(weight);
+    T2* gate2 = reinterpret_cast<T2*>(gate_out + row * dim);
+    int8_t* out_row = out + row * dim;
+    int dim2 = dim >> 1;
+
+    extern __shared__ float shared[];
+    float local_sum = 0.0f;
+    float local_amax = 0.0f;
+    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+        T2 val = x2[i];
+        float v0 = to_f32(val.x), v1 = to_f32(val.y);
+        local_sum += v0 * v0 + v1 * v1;
+    }
+    float rms = rsqrtf(block_reduce_sum(local_sum, shared) / dim + eps);
+
+    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+        T2 xv = x2[i], wv = w2[i];
+        T2 sv = sc2[i], hv = sh2[i];
+        float n0 = to_f32(xv.x) * rms * to_f32(wv.x);
+        float n1 = to_f32(xv.y) * rms * to_f32(wv.y);
+        float val0 = n0 * (1.0f + to_f32(sv.x)) + to_f32(hv.x);
+        float val1 = n1 * (1.0f + to_f32(sv.y)) + to_f32(hv.y);
+        local_amax = fmaxf(local_amax, fabsf(val0));
+        local_amax = fmaxf(local_amax, fabsf(val1));
+    }
+    float amax = block_reduce_max(local_amax, shared);
+    __shared__ float scale_s;
+    if (threadIdx.x == 0) {
+        float s = fmaxf(amax / 127.0f, 1e-10f);
+        d_scales[row] = s;
+        scale_s = s;
+    }
+    __syncthreads();
+    float inv_scale = 1.0f / scale_s;
+
+    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+        T2 xv = x2[i], wv = w2[i];
+        T2 sv = sc2[i], hv = sh2[i], gv = gt2[i];
+        float n0 = to_f32(xv.x) * rms * to_f32(wv.x);
+        float n1 = to_f32(xv.y) * rms * to_f32(wv.y);
+        float val0 = (n0 * (1.0f + to_f32(sv.x)) + to_f32(hv.x)) * inv_scale;
+        float val1 = (n1 * (1.0f + to_f32(sv.y)) + to_f32(hv.y)) * inv_scale;
+        int q0 = __float2int_rn(val0);
+        int q1 = __float2int_rn(val1);
+        out_row[2 * i] = static_cast<int8_t>((q0 < -127) ? -127 : ((q0 > 127) ? 127 : q0));
+        out_row[2 * i + 1] = static_cast<int8_t>((q1 < -127) ? -127 : ((q1 > 127) ? 127 : q1));
+        gate2[i] = gv;
+    }
+}
+
+FVK_KERNEL_INSTANTIATE(__global__ void ada_rms_norm_style_int8_kernel<__half>(
+    const __half*, const __half*, const __half*, int8_t*, __half*, int, float, float*))
+FVK_KERNEL_INSTANTIATE(__global__ void ada_rms_norm_style_int8_kernel<__nv_bfloat16>(
+    const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, int8_t*, __nv_bfloat16*, int, float, float*))
+void ada_rms_norm_style_int8(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                             const __nv_bfloat16* style,
+                             int8_t* out, __nv_bfloat16* gate_out,
+                             int seq_len, int dim, float eps,
+                             float* d_scales, cudaStream_t stream) {
+    ada_rms_norm_style_int8_kernel<__nv_bfloat16><<<seq_len, 256, 256 * sizeof(float), stream>>>(
+        x, weight, style, out, gate_out, dim, eps, d_scales);
+}
+
 // ── RMSNorm → FP8 ──
 template<typename T>
 __global__ void rms_norm_fp8_kernel(const T* __restrict__ x,
@@ -898,4 +973,292 @@ void ada_layer_norm_fp16(const __half* x, const __half* scale, const __half* shi
                           cudaStream_t stream) {
     ada_layer_norm_fp16_kernel<<<seq_len, 256, 256 * sizeof(float), stream>>>(
         x, scale, shift, out, dim, eps);
+}
+
+// ── Fused RMSNorm → INT8 (per-row dynamic scale) ──
+//
+// Avoids the intermediate BF16 write that the separate
+// rms_norm + quantize_int8_rowwise pair requires.  Each block
+// handles one row; shared memory holds the float-converted values
+// so the data is only loaded from global memory once.
+//
+// smem layout: [0..cols-1] float data; [cols..cols+31] warp partials.
+// Launch: grid=(seq_len,), block=(256,), smem=(cols+32)*sizeof(float)
+__global__ void rms_norm_int8_rowwise_kernel(
+        const __nv_bfloat16* __restrict__ x,
+        const __nv_bfloat16* __restrict__ weight,
+        int8_t*  __restrict__ out,
+        float*   __restrict__ scales,
+        int rows, int cols, float eps) {
+    extern __shared__ float smem[];
+    float* partial = smem + cols;
+
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    const __nv_bfloat16* xr = x + (int64_t)row * cols;
+    int8_t* outr = out + (int64_t)row * cols;
+
+    // Pass 1: load x → smem, accumulate sum of squares
+    float sum_sq = 0.f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float xi = __bfloat162float(xr[i]);
+        smem[i] = xi;
+        sum_sq += xi * xi;
+    }
+    float rms = rsqrtf(block_reduce_sum(sum_sq, partial) / cols + eps);
+
+    // Pass 2: normalize (reuse smem), accumulate max_abs
+    float max_abs = 0.f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float v = smem[i] * rms * __bfloat162float(weight[i]);
+        smem[i] = v;
+        max_abs = fmaxf(max_abs, fabsf(v));
+    }
+    float scale = fmaxf(block_reduce_max(max_abs, partial) / 127.f, 1e-12f);
+    if (threadIdx.x == 0) scales[row] = scale;
+    float inv_s = 1.f / scale;
+
+    // Pass 3: write INT8
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float v = smem[i] * inv_s;
+        outr[i] = (int8_t)__float2int_rn(fmaxf(-127.f, fminf(127.f, v)));
+    }
+}
+
+void rms_norm_int8_rowwise(const __nv_bfloat16* x,
+                            const __nv_bfloat16* weight,
+                            int8_t* out, float* scales,
+                            int seq_len, int dim, float eps,
+                            cudaStream_t stream) {
+    int smem = (dim + 32) * sizeof(float);
+    rms_norm_int8_rowwise_kernel<<<seq_len, 256, smem, stream>>>(
+        x, weight, out, scales, seq_len, dim, eps);
+}
+
+// ── Fused residual-add + RMSNorm → INT8 (per-row dynamic scale) ──
+//
+// Fuses three operations that appear at encoder B4:
+//   residual += x_norm
+//   normed    = RMSNorm(residual, weight)
+//   out_i8    = INT8_quantize_rowwise(normed)
+// into a single kernel pass over global memory.
+__global__ void residual_add_rms_norm_int8_rowwise_kernel(
+        __nv_bfloat16* __restrict__ residual,
+        const __nv_bfloat16* __restrict__ x,
+        const __nv_bfloat16* __restrict__ weight,
+        int8_t* __restrict__ out,
+        float*  __restrict__ scales,
+        int rows, int cols, float eps) {
+    extern __shared__ float smem[];
+    float* partial = smem + cols;
+
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    __nv_bfloat16* res_row = residual + (int64_t)row * cols;
+    const __nv_bfloat16* x_row = x + (int64_t)row * cols;
+    int8_t* out_row = out + (int64_t)row * cols;
+
+    // Pass 1: residual += x, load into smem, accumulate sum_sq
+    float sum_sq = 0.f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float ri = __bfloat162float(res_row[i]) + __bfloat162float(x_row[i]);
+        res_row[i] = __float2bfloat16(ri);
+        smem[i] = ri;
+        sum_sq += ri * ri;
+    }
+    float rms = rsqrtf(block_reduce_sum(sum_sq, partial) / cols + eps);
+
+    // Pass 2: normalize, accumulate max_abs
+    float max_abs = 0.f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float v = smem[i] * rms * __bfloat162float(weight[i]);
+        smem[i] = v;
+        max_abs = fmaxf(max_abs, fabsf(v));
+    }
+    float scale = fmaxf(block_reduce_max(max_abs, partial) / 127.f, 1e-12f);
+    if (threadIdx.x == 0) scales[row] = scale;
+    float inv_s = 1.f / scale;
+
+    // Pass 3: write INT8
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float v = smem[i] * inv_s;
+        out_row[i] = (int8_t)__float2int_rn(fmaxf(-127.f, fminf(127.f, v)));
+    }
+}
+
+void residual_add_rms_norm_int8_rowwise(
+        __nv_bfloat16* residual, const __nv_bfloat16* x,
+        const __nv_bfloat16* weight,
+        int8_t* out, float* scales,
+        int seq_len, int dim, float eps,
+        cudaStream_t stream) {
+    int smem = (dim + 32) * sizeof(float);
+    residual_add_rms_norm_int8_rowwise_kernel<<<seq_len, 256, smem, stream>>>(
+        residual, x, weight, out, scales, seq_len, dim, eps);
+}
+
+// ── Fused bias-residual + LayerNorm (strict bf16 round-trip in middle) ──
+//
+// Fuses three SigLIP ops that appear between consecutive sub-blocks:
+//   residual += x + bias_pre        (bias_residual kernel, ncu L2 hit ~34%)
+//   out      = LayerNorm(residual)  (layer_norm kernel,    ncu L2 hit ~52%)
+// into a single block-per-row kernel. The intermediate `residual` write
+// + read between the two original kernels is the worst-L2-hit (DRAM-
+// bound) traffic in the SigLIP path; fusing eliminates that round-trip
+// entirely.
+//
+// **Strict-precision contract** (matches the bias_residual + layer_norm
+// pair bit-for-bit):
+//   1. bias-add result is rounded to bf16 BEFORE the LN computation
+//      (mirrors bias_residual storing bf16 to global, layer_norm
+//      promoting bf16 → fp32 on read).
+//   2. The LN sum/var reductions, normalization, weight/bias apply,
+//      and final bf16 round are bit-identical to the existing
+//      layer_norm_kernel.
+//
+// SMEM layout (for blockDim.x = 256):
+//   smem[0..31] = block_reduce_sum partials (one per warp, max 8 for
+//                 blockDim.x = 256). 1024 bytes total — same as
+//                 layer_norm_kernel.
+template<typename T>
+__global__ void bias_residual_layer_norm_kernel(
+        T* __restrict__ residual,
+        const T* __restrict__ x,
+        const T* __restrict__ bias_pre,
+        const T* __restrict__ ln_weight,
+        const T* __restrict__ ln_bias,
+        T* __restrict__ out,
+        int dim, float eps) {
+    extern __shared__ float partial[];
+
+    int row = blockIdx.x;
+    using T2 = typename packed2<T>::type;
+    T2* res2 = reinterpret_cast<T2*>(residual + (size_t)row * dim);
+    const T2* x2 = reinterpret_cast<const T2*>(x + (size_t)row * dim);
+    const T2* b2 = reinterpret_cast<const T2*>(bias_pre);
+    const T2* w2 = reinterpret_cast<const T2*>(ln_weight);
+    const T2* lnb2 = reinterpret_cast<const T2*>(ln_bias);
+    T2* out2 = reinterpret_cast<T2*>(out + (size_t)row * dim);
+    int dim2 = dim >> 1;
+
+    // Pass 1: residual = bf16(residual + x + bias_pre) (write to global),
+    // accumulate sum for mean. We re-read residual from global on passes
+    // 2 and 3 — strictly matching layer_norm_kernel's behavior. (An
+    // earlier smem-cached variant produced 1-ULP drift on the SigLIP
+    // shape; subtle precision difference between 'fp32 stored to smem'
+    // and 'bf16 stored to global, re-read'. Re-reading from global is
+    // bit-equivalent to running the kernel pair sequentially.)
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+        T2 rv = res2[i], xv = x2[i], bv = b2[i];
+        T r0 = from_f32<T>(to_f32(rv.x) + to_f32(xv.x) + to_f32(bv.x));
+        T r1 = from_f32<T>(to_f32(rv.y) + to_f32(xv.y) + to_f32(bv.y));
+        res2[i] = make_packed2<T>(r0, r1);
+        local_sum += to_f32(r0) + to_f32(r1);
+    }
+    float mean = block_reduce_sum(local_sum, partial) / dim;
+
+    // Pass 2: re-read residual from global (now bf16), compute
+    // (val - mean)^2, accumulate var. Bit-identical to layer_norm_kernel.
+    float local_var = 0.0f;
+    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+        T2 val = res2[i];
+        float d0 = to_f32(val.x) - mean, d1 = to_f32(val.y) - mean;
+        local_var += d0 * d0 + d1 * d1;
+    }
+    float inv_std = rsqrtf(block_reduce_sum(local_var, partial) / dim + eps);
+
+    // Pass 3: re-read residual, normalize, apply weight/bias, write out.
+    // Identical to layer_norm_kernel's final loop.
+    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+        T2 val = res2[i];
+        T2 wv = w2[i], lbv = lnb2[i];
+        float v0 = to_f32(val.x), v1 = to_f32(val.y);
+        float n0 = (v0 - mean) * inv_std * to_f32(wv.x) + to_f32(lbv.x);
+        float n1 = (v1 - mean) * inv_std * to_f32(wv.y) + to_f32(lbv.y);
+        out2[i] = make_packed2<T>(from_f32<T>(n0), from_f32<T>(n1));
+    }
+}
+
+FVK_KERNEL_INSTANTIATE(__global__ void bias_residual_layer_norm_kernel<__half>(__half*, const __half*, const __half*, const __half*, const __half*, __half*, int, float))
+FVK_KERNEL_INSTANTIATE(__global__ void bias_residual_layer_norm_kernel<__nv_bfloat16>(__nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, float))
+
+void bias_residual_layer_norm_bf16(
+        __nv_bfloat16* residual, const __nv_bfloat16* x,
+        const __nv_bfloat16* bias_pre,
+        const __nv_bfloat16* ln_weight, const __nv_bfloat16* ln_bias,
+        __nv_bfloat16* out, int seq_len, int dim, float eps,
+        cudaStream_t stream) {
+    int smem = 256 * sizeof(float);
+    bias_residual_layer_norm_kernel<__nv_bfloat16><<<seq_len, 256, smem, stream>>>(
+        residual, x, bias_pre, ln_weight, ln_bias, out, dim, eps);
+}
+
+void bias_residual_layer_norm_fp16(
+        __half* residual, const __half* x,
+        const __half* bias_pre,
+        const __half* ln_weight, const __half* ln_bias,
+        __half* out, int seq_len, int dim, float eps,
+        cudaStream_t stream) {
+    int smem = 256 * sizeof(float);
+    bias_residual_layer_norm_kernel<__half><<<seq_len, 256, smem, stream>>>(
+        residual, x, bias_pre, ln_weight, ln_bias, out, dim, eps);
+}
+
+// ── Vision Token Spatial Average Pooling (BF16) ──
+//
+// Reduces SigLIP output from (nv * spv, dim) to (nv * spv / (f*f), dim)
+// by applying f×f average pooling in the spatial (H, W) grid.
+//
+// Token layout: each view's spv tokens are arranged as an (H, W) grid
+// with H = W = sqrt(spv). The kernel averages each f×f block of tokens
+// into one output token, reducing spv to spv/(f*f) per view.
+//
+// Launch: gridDim = (nv * out_spv, 1), blockDim = (256, 1)
+//         where out_spv = spv / (f*f)
+// smem: not needed (pure BW-limited kernel)
+__global__ void avg_pool_vision_tokens_kernel(
+        const __nv_bfloat16* __restrict__ x,   // (nv * spv, dim) BF16
+        __nv_bfloat16* __restrict__ out,        // (nv * out_spv, dim) BF16
+        int nv, int H, int W, int dim, int f) {
+    // output token index in [0, nv * (H/f) * (W/f))
+    int out_tok = blockIdx.x;
+    int H_out = H / f;
+    int W_out = W / f;
+    int spv_out = H_out * W_out;
+
+    int v   = out_tok / spv_out;          // view index
+    int rc  = out_tok % spv_out;          // spatial index within view
+    int r_out = rc / W_out;
+    int c_out = rc % W_out;
+
+    float inv_f2 = 1.0f / float(f * f);
+
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        float sum = 0.f;
+        for (int dr = 0; dr < f; dr++) {
+            for (int dc = 0; dc < f; dc++) {
+                int r_in  = r_out * f + dr;
+                int c_in  = c_out * f + dc;
+                int in_tok = v * H * W + r_in * W + c_in;
+                sum += __bfloat162float(x[in_tok * dim + d]);
+            }
+        }
+        out[out_tok * dim + d] = __float2bfloat16(sum * inv_f2);
+    }
+}
+
+// pool_factor: 1 = no-op, 2 = 2x2 (spv 256→64), 4 = 4x4 (spv 256→16)
+// H = W = sqrt(spv) must be divisible by pool_factor.
+void avg_pool_vision_tokens(
+        const __nv_bfloat16* x, __nv_bfloat16* out,
+        int nv, int H, int W, int dim, int pool_factor,
+        cudaStream_t stream) {
+    int H_out = H / pool_factor;
+    int W_out = W / pool_factor;
+    int out_tokens = nv * H_out * W_out;
+    avg_pool_vision_tokens_kernel<<<out_tokens, 256, 0, stream>>>(
+        x, out, nv, H, W, dim, pool_factor);
 }
