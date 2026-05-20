@@ -28,7 +28,7 @@ before treating any number here as a contract.
 
 | Profile | Purpose | Wall (sample_00) | cos action | cos frames | VRAM peak |
 |---|---|---|---|---|---|
-| `fast` | **Validated Stage3 fast profile (default)** | ~170 ms | 0.99993 | 0.99911 | 28.2 GB |
+| `fast` | **Validated Stage3 fast profile (default)** | ~167 ms | 0.99993 | 0.99911 | 28.2 GB |
 | `fast` + TeaCache | Step caching on top of `fast` (env-gated) | **~100 ms** | 0.99992 | 0.99902 | 28.2 GB |
 | `off` | Explicit FP8 trajectory baseline (FP4/NVFP4 disabled) | record per machine | — | — | record per machine |
 | `fast-cache` | Latency-oriented FP4/NVFP4 without tiny-FP8 dispatch | record per bundle | — | — | record per bundle |
@@ -215,7 +215,7 @@ Expected steady-state output on the RoboTwin2 mini `sample_00` bundle,
 RTX 5090:
 
 ```text
-graph P50          ~= 170 ms
+graph P50          ~= 167 ms
 peak_allocated     ~= 28.2 GB
 cos action         ~= 0.99993
 cos frames         ~= 0.99911
@@ -224,15 +224,16 @@ cos frames         ~= 0.99911
 Cross-sample stability from the four-bundle validation run
 (calibration done on each bundle's own `first_frame`, no recalibration
 between). Wall time has normal run-to-run variance; use the quickstart
-P50 on your machine as the latency contract and the cosine columns as
-the stability check:
+P50 on your machine as the latency contract. The current `sample_00`
+quickstart P50 is 167.08 ms; the table below keeps the cosine stability
+columns that are independent of timing noise:
 
-| Bundle    | validation P50 (ms) | cos action | cos frames |
-|-----------|--------------:|-----------:|-----------:|
-| sample_00 | 171.19        | 0.999929   | 0.999117   |
-| sample_01 | 171.28        | 0.999935   | 0.998644   |
-| sample_02 | 171.09        | 0.999921   | 0.999144   |
-| sample_03 | 171.07        | 0.999913   | 0.998844   |
+| Bundle    | cos action | cos frames |
+|-----------|-----------:|-----------:|
+| sample_00 | 0.999929   | 0.999117   |
+| sample_01 | 0.999935   | 0.998644   |
+| sample_02 | 0.999921   | 0.999144   |
+| sample_03 | 0.999913   | 0.998844   |
 
 All four samples pass the red lines (`cos(action) ≥ 0.999`,
 `cos(frames) ≥ 0.99`).
@@ -285,11 +286,11 @@ python examples/motus_quickstart.py \
 
 | Skip schedule           | #skip | Wall (ms) | cos action | cos frames | Δ vs `fast` |
 |-------------------------|------:|----------:|-----------:|-----------:|-----------:|
-| (off)                   | 0     | 169.7     | 0.99994    | 0.99912    | —          |
-| `3,5,7`                 | 3     | 141.8     | 0.99993    | 0.99912    | -27.9 ms   |
-| `2,3,5,6,8`             | 5     | 121.1     | 0.99994    | 0.99913    | -48.6 ms   |
-| `2,3,4,5,6,7,8` (default) | 7   | **99.6** | 0.99992    | 0.99902    | **-70.1 ms** |
-| `1,2,3,4,5,6,7,8`       | 8     |  90.1     | 0.99993    | 0.99894    | -79.6 ms   |
+| (off)                   | 0     | 167.1     | 0.99994    | 0.99912    | —          |
+| `3,5,7`                 | 3     | 141.8     | 0.99993    | 0.99912    | -25.3 ms   |
+| `2,3,5,6,8`             | 5     | 121.1     | 0.99994    | 0.99913    | -46.0 ms   |
+| `2,3,4,5,6,7,8` (default) | 7   | **99.6** | 0.99992    | 0.99902    | **-67.5 ms** |
+| `1,2,3,4,5,6,7,8`       | 8     |  90.1     | 0.99993    | 0.99894    | -77.0 ms   |
 
 Cross-sample stability with the default skip schedule:
 
@@ -346,7 +347,7 @@ Motus Stage3 `sample_00` currently returns:
 ```text
 horizon=16
 action_dim=14
-profile fast latency ~= 170 ms
+profile fast latency ~= 167 ms
 profile fast + TeaCache latency ~= 100 ms
 ```
 
@@ -370,7 +371,7 @@ python examples/motus_rtc_lite.py \
 Expected supply-layer output:
 
 ```text
-horizon=16 action_dim=14 target_hz=50.00 latency_probe~=170 ms start_next_at~=6
+horizon=16 action_dim=14 target_hz=50.00 latency_probe~=167 ms start_next_at~=6
 served=64 elapsed=1.280s effective_hz=49.99
 deadline_misses=0 held_actions=0
 ```
@@ -484,14 +485,50 @@ Motus:
 - **Weights**: per-tensor FP8 scales are computed once at checkpoint
   load (`quant_fp8`) and stored alongside the weight tensors.
 - **Activations**: per-GEMM-input FP8 scales are computed during the
-  **first `infer()` call**, before CUDA Graph capture, by recording
-  the per-tensor amax of the captured forward pass.
-- The Motus frontend currently runs **single-sample calibration**: the
-  one observation passed to the first `infer()` is the calibration
-  sample. There is no public `calibrate(observations=[...], percentile=...)`
-  API yet; the multi-sample dataset path documented in
-  `docs/calibration.md` §10 is implemented for `pi05_thor`,
-  `groot_thor`, and `groot_rtx`, not for Motus.
+  **first `infer()` call** by default, before CUDA Graph capture, by
+  recording the per-tensor amax of that forward pass.
+- Motus also exposes the same explicit public API as the other RTX
+  frontends:
+
+  ```python
+  pipe.set_prompt(instruction, t5_embeds=t5_embeds, vlm_inputs=vlm_inputs)
+
+  # Single-sample calibration, equivalent to legacy first-infer calibration.
+  pipe.calibrate([{"first_frame": first_frame, "state": state}])
+
+  # Dataset calibration: reduce per-sample activation scales by percentile.
+  pipe.calibrate(calibration_samples, percentile=99.9, max_samples=16)
+  ```
+
+  Each calibration sample may be a dict with `first_frame` and optional
+  `state`, a bare `first_frame` tensor, or a `(first_frame, state)` tuple.
+  `calibrate()` must be called after `set_prompt()` and before the first
+  captured `infer()`. It calibrates FP8 GEMM sites, Motus AWQ-FP8 sites,
+  G7.24 action/und QKV scales, and VAE FP8 resample scales, then records
+  the CUDA Graph on the first calibration sample. Subsequent `infer()`
+  calls are graph replays.
+- The quickstart also exposes dataset calibration directly from Motus
+  input bundles:
+
+  ```bash
+  python examples/motus_quickstart.py \
+    --checkpoint "${MOTUS_CHECKPOINT}" \
+    --motus-root "${MOTUS_ROOT}" \
+    --wan-path "${MOTUS_WAN_PATH}" \
+    --vlm-path "${MOTUS_VLM_PATH}" \
+    --input-bundle "${MOTUS_INPUT_BUNDLE}" \
+    --fp4-profile fast \
+    --calibration-glob "/absolute/path/to/robotwin_mini_bundles/sample_*" \
+    --calibration-max-samples 4 \
+    --calibration-percentile 99.9 \
+    --benchmark 10
+  ```
+
+  `--calibration-bundle /path/to/sample_00` can be repeated, or passed as
+  a comma-separated list, when you want exact sample control. Dataset
+  calibration uses the current `set_prompt()` conditioning from
+  `--input-bundle`; use calibration bundles from the same task/prompt
+  family unless you are intentionally widening activation coverage.
 - The validated Stage3 bundle has shown stable cross-sample behaviour
   with single-sample calibration: cosine variance across `sample_00` to
   `sample_03` is at most 2e-5 on action and 5e-4 on frames (see §5/§6
@@ -499,10 +536,10 @@ Motus:
   the other three samples too.
 - If your downstream evaluation bundle distribution is wider than the
   Stage3 RoboTwin2 mini set (e.g. covers many lighting / occlusion
-  conditions that single-sample calibration cannot represent),
-  port the `pi05_thor._calibrate_multi_frame` percentile-reduced
-  multi-sample path to the Motus frontend before relying on the
-  current numbers.
+  conditions that single-sample calibration cannot represent), run
+  `calibrate()` on a small representative dataset and record the same
+  `graph P50`, action cosine, frame cosine, and trajectory deviation
+  metrics against your reference bundle.
 
 ---
 

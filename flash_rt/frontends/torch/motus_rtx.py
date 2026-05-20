@@ -45,6 +45,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import torch
 
 from flash_rt.models.motus.pipeline_rtx import (
@@ -744,6 +745,388 @@ class MotusTorchFrontendRtx:
         if self._graph_state is not None:
             logger.info("[motus] set_prompt changed; dropping captured graph")
             self._graph_state = None
+
+    # ──────────────────────────────────────────────────────────────
+    # Explicit calibration API
+    # ──────────────────────────────────────────────────────────────
+
+    def calibrate(
+        self,
+        observations,
+        *,
+        percentile: float = 99.9,
+        max_samples: Optional[int] = None,
+        verbose: bool = False,
+    ) -> None:
+        """Calibrate Motus FP8/AWQ activation scales on real samples.
+
+        ``N == 1`` is equivalent to the legacy first-``infer`` calibration
+        sample. ``N > 1`` runs each observation through the calibration
+        graph, percentile-reduces the per-site activation scales, then
+        records the CUDA Graph using the first observation. The inference
+        graph structure and replay latency are unchanged; only scale values
+        differ.
+        """
+        if self._t5_embeds is None or self._vlm_inputs is None:
+            raise RuntimeError(
+                "Call set_prompt(prompt, t5_embeds=, vlm_inputs=) before calibrate()")
+        if self._graph_state is not None:
+            raise RuntimeError(
+                "calibrate() must be called before CUDA Graph capture. "
+                "Create a new frontend or call set_prompt() to invalidate the graph.")
+        if not 0.0 <= percentile <= 100.0:
+            raise ValueError(f"percentile must be in [0, 100], got {percentile}")
+
+        obs_list = self._normalize_calibration_observations(observations)
+        if max_samples is not None:
+            obs_list = obs_list[:max_samples]
+        if not obs_list:
+            raise ValueError("observations must contain at least 1 sample")
+
+        samples = [self._extract_calibration_sample(o) for o in obs_list]
+        n = len(samples)
+        logger.info(
+            "[motus] explicit calibration: N=%d percentile=%.2f",
+            n, percentile)
+
+        if (self._fp8_swap_stats is not None) and (not self._fp8_calibrated):
+            self._calibrate_fp8_samples(
+                samples, percentile=percentile, verbose=verbose)
+        else:
+            logger.info("[motus] no pending G4 FP8 calibration work")
+
+        # Finish the same one-time installs that normally happen between
+        # calibration and graph capture, then capture with the first sample.
+        first_frame, state = samples[0]
+        with torch.no_grad():
+            _ = self.infer(first_frame, state=state)
+
+        self._precision_spec = self._snapshot_precision_spec(
+            method=("single_frame" if n == 1 else "percentile"),
+            n=n,
+            percentile=(None if n == 1 else percentile),
+        )
+
+    def calibrate_with_real_data(self, sample_observations) -> None:
+        """Legacy alias retained for consistency with other frontends."""
+        self.calibrate(sample_observations)
+
+    @property
+    def precision_spec(self):
+        """:class:`ModelPrecisionSpec` captured at calibration time."""
+        return getattr(self, "_precision_spec", None)
+
+    def _normalize_calibration_observations(self, observations) -> list:
+        if isinstance(observations, dict) or torch.is_tensor(observations):
+            return [observations]
+        if isinstance(observations, list):
+            return observations
+        return list(observations)
+
+    def _extract_calibration_sample(self, obs):
+        if torch.is_tensor(obs):
+            return obs, None
+        if isinstance(obs, (tuple, list)) and 1 <= len(obs) <= 2:
+            first_frame = obs[0]
+            state = obs[1] if len(obs) == 2 else None
+            if not torch.is_tensor(first_frame):
+                raise TypeError("calibration tuple[0] must be first_frame tensor")
+            if state is not None and not torch.is_tensor(state):
+                raise TypeError("calibration tuple[1] must be state tensor")
+            return first_frame, state
+        if not isinstance(obs, dict):
+            raise TypeError(
+                "Motus calibration observations must be a dict, tensor, "
+                "or (first_frame, state) tuple")
+        first_frame = None
+        for key in ("first_frame", "image", "images"):
+            value = obs.get(key)
+            if torch.is_tensor(value):
+                first_frame = value
+                break
+        if first_frame is None:
+            raise KeyError(
+                "Motus calibration observation requires a first_frame tensor "
+                "under key 'first_frame' (or 'image'/'images')")
+        state = obs.get("state")
+        if state is not None and not torch.is_tensor(state):
+            raise TypeError("Motus calibration observation 'state' must be a tensor")
+        return first_frame, state
+
+    def _to_runtime_inputs(self, first_frame, state):
+        first_frame = first_frame.to(self.device).to(self.dtype)
+        if state is not None:
+            state = state.to(self.device).to(self.dtype)
+        return first_frame, state
+
+    def _run_pipeline_once_for_calibration(self, first_frame, state):
+        first_frame, state = self._to_runtime_inputs(first_frame, state)
+        with torch.no_grad():
+            return self.pipeline.run(
+                first_frame=first_frame,
+                state=state,
+                t5_embeds=self._t5_embeds,
+                vlm_inputs=self._vlm_inputs,
+            )
+
+    def _calibrate_fp8_samples(self, samples, *, percentile: float,
+                               verbose: bool) -> None:
+        """Run Motus's two-phase calibration over one or more samples."""
+        from flash_rt.core.calibration import (
+            accumulate_amax,
+            format_summary,
+            summarize_amax_dispersion,
+        )
+
+        n = len(samples)
+        resample_pre: list[dict[str, float]] = []
+
+        # 0) AWQ/G7.24 BF16 calibration pass. For N>1 collect per-sample
+        # per-K amax vectors, reduce them, then apply the same FP8 swaps.
+        if (self._awq_calib_states is not None) and (not self._awq_applied):
+            logger.info("[motus] G7.13.awq: calibration pass over %d sample(s)", n)
+            from flash_rt.models.motus._vae_fp8_resample_swap import (
+                set_calibrating as set_resample_calibrating)
+
+            awq_rows: dict[str, list[np.ndarray]] = {
+                k: [] for k in self._awq_calib_states.keys()
+            }
+            g724_rows: dict[str, list[np.ndarray]] = {
+                k: [] for k in (self._g724_states or {}).keys()
+            }
+            for i, (first_frame, state) in enumerate(samples):
+                self._reset_awq_states()
+                self._reset_g724_states()
+                self._reset_resample_amax()
+                set_resample_calibrating(True)
+                try:
+                    _ = self._run_pipeline_once_for_calibration(
+                        first_frame, state)
+                    torch.cuda.synchronize()
+                finally:
+                    set_resample_calibrating(False)
+                for name, st in self._awq_calib_states.items():
+                    awq_rows[name].append(
+                        st.act_amax_K.detach().float().cpu().numpy())
+                for name, st in (self._g724_states or {}).items():
+                    g724_rows[name].append(
+                        st.act_amax_K.detach().float().cpu().numpy())
+                resample_pre.append(self._collect_resample_amax())
+                if verbose:
+                    logger.info("[motus] AWQ calibration sample %d/%d", i + 1, n)
+
+            for name, rows in awq_rows.items():
+                final = accumulate_amax(rows, percentile=percentile)
+                st = self._awq_calib_states[name]
+                st.act_amax_K.copy_(torch.from_numpy(final).to(st.act_amax_K))
+                st.count = max(st.count, 1)
+            for name, rows in g724_rows.items():
+                final = accumulate_amax(rows, percentile=percentile)
+                st = self._g724_states[name]
+                st.act_amax_K.copy_(torch.from_numpy(final).to(st.act_amax_K))
+                st.count = max(st.count, 1)
+
+            from flash_rt.models.motus._awq_fp8_swap import (
+                install_awq_fp8_swap, remove_awq_calibration_hooks)
+            remove_awq_calibration_hooks(self.model)
+            self._awq_swap_stats = install_awq_fp8_swap(
+                self.model, self._awq_calib_states)
+            self._awq_applied = True
+            logger.info("[motus] G7.13.awq applied: %s", self._awq_swap_stats)
+
+            if (self._g724_states is not None) and (not self._g724_applied):
+                from flash_rt.models.motus._action_und_qkv_fp8_swap import (
+                    install_g724_fp8)
+                self._g724_swap_stats = install_g724_fp8(self.model)
+                self._g724_applied = True
+                logger.info("[motus] G7.24 applied: %s", self._g724_swap_stats)
+
+        # 1) G4 calibration for all FP8 sites after AWQ/G724 swaps exist.
+        logger.info("[motus] G4: calibration pass over %d sample(s)", n)
+        from flash_rt.models.motus._fp8_swap import set_calibrating
+        from flash_rt.models.motus._vae_fp8_resample_swap import (
+            set_calibrating as set_resample_calibrating)
+
+        scale_rows: list[np.ndarray] = []
+        scale_names: Optional[list[str]] = None
+        resample_post: list[dict[str, float]] = []
+        set_calibrating(True)
+        set_resample_calibrating(True)
+        try:
+            for i, (first_frame, state) in enumerate(samples):
+                self._reset_resample_amax()
+                _ = self._run_pipeline_once_for_calibration(first_frame, state)
+                torch.cuda.synchronize()
+                names, values = self._collect_runtime_fp8_scales()
+                if scale_names is None:
+                    scale_names = names
+                elif scale_names != names:
+                    raise RuntimeError(
+                        "Motus FP8 calibration site set changed between samples")
+                scale_rows.append(np.asarray(values, dtype=np.float32))
+                resample_post.append(self._collect_resample_amax())
+                if verbose:
+                    logger.info("[motus] G4 calibration sample %d/%d", i + 1, n)
+        finally:
+            set_calibrating(False)
+            set_resample_calibrating(False)
+
+        if scale_rows and scale_names is not None:
+            final_scales = accumulate_amax(scale_rows, percentile=percentile)
+            self._write_runtime_fp8_scales(scale_names, final_scales)
+            if verbose:
+                logger.info(format_summary(
+                    summarize_amax_dispersion(scale_rows, final_scales)))
+
+        self._write_resample_reduced_amax(
+            resample_pre, resample_post, percentile=percentile)
+        self._fp8_calibrated = True
+        logger.info("[motus] G4: calibration complete; switching to static")
+
+        from flash_rt.models.motus._fp8_swap import (
+            autotune_motus_hot_fp8_gemms)
+        self._fp8_gemm_autotune_stats = autotune_motus_hot_fp8_gemms(
+            self.model)
+        logger.info("[motus] G7.29 FP8 GEMM autotune: %s",
+                    self._fp8_gemm_autotune_stats)
+
+    def _reset_awq_states(self) -> None:
+        for st in (self._awq_calib_states or {}).values():
+            st.act_amax_K.zero_()
+            st.count = 0
+
+    def _reset_g724_states(self) -> None:
+        for st in (self._g724_states or {}).values():
+            st.act_amax_K.zero_()
+            st.count = 0
+
+    def _reset_resample_amax(self) -> None:
+        for site in self._iter_resample_sites():
+            site.act_amax_bf16.zero_()
+
+    def _iter_resample_sites(self):
+        seen: set[int] = set()
+        for mod in self.model.modules():
+            site = getattr(mod, "_fp8_resample_site", None)
+            if site is not None and id(site) not in seen:
+                seen.add(id(site))
+                yield site
+
+    def _collect_resample_amax(self) -> dict[str, float]:
+        return {
+            site.name: float(site.act_amax_bf16.float().item())
+            for site in self._iter_resample_sites()
+        }
+
+    def _write_resample_reduced_amax(self, pre_rows, post_rows,
+                                     *, percentile: float) -> None:
+        sites = {site.name: site for site in self._iter_resample_sites()}
+        if not sites:
+            return
+        combined_rows: list[dict[str, float]] = []
+        for idx in range(max(len(pre_rows), len(post_rows))):
+            row: dict[str, float] = {}
+            if idx < len(pre_rows):
+                for name, value in pre_rows[idx].items():
+                    row[name] = max(row.get(name, 0.0), float(value))
+            if idx < len(post_rows):
+                for name, value in post_rows[idx].items():
+                    row[name] = max(row.get(name, 0.0), float(value))
+            if row:
+                combined_rows.append(row)
+        if not combined_rows:
+            return
+        names = sorted(sites.keys())
+        vectors = [
+            np.asarray([row.get(name, 0.0) for name in names],
+                       dtype=np.float32)
+            for row in combined_rows
+        ]
+        final = np.percentile(np.stack(vectors, axis=0).astype(np.float64),
+                              percentile, axis=0).astype(np.float32)
+        for name, value in zip(names, final):
+            sites[name].act_amax_bf16.copy_(
+                torch.tensor([float(value)], dtype=torch.bfloat16,
+                             device=sites[name].act_amax_bf16.device))
+
+    def _iter_runtime_fp8_sites(self):
+        seen: set[int] = set()
+        for mod in self.model.modules():
+            for attr in ("_fp8_site", "_awq_fp8_site",
+                         "_awq_up_site", "_awq_dn_site"):
+                site = getattr(mod, attr, None)
+                if site is not None and hasattr(site, "act_scale") \
+                        and id(site) not in seen:
+                    seen.add(id(site))
+                    yield getattr(site, "label", attr), site
+            st = getattr(mod, "_g724_state", None)
+            if st is not None and getattr(st, "act_scale", None) is not None \
+                    and id(st) not in seen:
+                seen.add(id(st))
+                yield getattr(st, "label", "_g724_state"), st
+
+    def _collect_runtime_fp8_scales(self) -> tuple[list[str], list[float]]:
+        pairs = sorted(self._iter_runtime_fp8_sites(), key=lambda p: p[0])
+        names = [name for name, _site in pairs]
+        values = [
+            float(site.act_scale.detach().float().reshape(-1)[0].item())
+            for _name, site in pairs
+        ]
+        return names, values
+
+    def _write_runtime_fp8_scales(self, names: list[str],
+                                  values: np.ndarray) -> None:
+        sites = {name: site for name, site in self._iter_runtime_fp8_sites()}
+        for name, value in zip(names, values):
+            site = sites[name]
+            site.act_scale.fill_(float(value))
+
+    def _snapshot_precision_spec(self, *, method: str, n: int,
+                                  percentile: Optional[float]):
+        from flash_rt.core.precision_spec import (
+            ModelPrecisionSpec,
+            PrecisionSpec,
+        )
+
+        spec = ModelPrecisionSpec(source="calibration")
+        for name, site in self._iter_runtime_fp8_sites():
+            scale_val = np.array(
+                [float(site.act_scale.detach().float().reshape(-1)[0].item())],
+                dtype=np.float32)
+            entry = PrecisionSpec(
+                dtype="fp8_e4m3",
+                granularity="per_tensor",
+                scheme="symmetric",
+                scale_source="calibration",
+                scale=scale_val,
+                calibration_method=method,
+                calibration_samples=n,
+                calibration_percentile=percentile,
+            )
+            entry.validate()
+            if name.startswith("video_model.") or ".wan_model." in name:
+                spec.decoder_layer_specs[name] = entry
+            else:
+                spec.activation_specs[name] = entry
+
+        for site in self._iter_resample_sites():
+            if getattr(site, "act_scale", None) is None:
+                continue
+            scale_val = np.array([float(site.act_scale_scalar)],
+                                 dtype=np.float32)
+            entry = PrecisionSpec(
+                dtype="fp8_e4m3",
+                granularity="per_tensor",
+                scheme="symmetric",
+                scale_source="calibration",
+                scale=scale_val,
+                calibration_method=method,
+                calibration_samples=n,
+                calibration_percentile=percentile,
+            )
+            entry.validate()
+            spec.activation_specs[f"vae_resample.{site.name}"] = entry
+        return spec
 
     def infer(
         self,

@@ -25,6 +25,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import glob
 import inspect
 import json
 import os
@@ -78,6 +79,23 @@ def _load_inputs(bundle: pathlib.Path):
     if not isinstance(vlm_inputs, list):
         vlm_inputs = [vlm_inputs]
     return first_frame, state, instruction, t5_embeds, vlm_inputs
+
+
+def _load_calibration_sample(bundle: pathlib.Path):
+    first_frame, state, _instruction, _t5_embeds, _vlm_inputs = _load_inputs(bundle)
+    return {"first_frame": first_frame, "state": state}
+
+
+def _resolve_calibration_bundles(args) -> list[pathlib.Path]:
+    paths: list[str] = []
+    for item in args.calibration_bundle or []:
+        paths.extend(p for p in item.split(",") if p)
+    if args.calibration_glob:
+        paths.extend(sorted(glob.glob(args.calibration_glob)))
+    bundles = [pathlib.Path(p).expanduser() for p in paths]
+    if args.calibration_max_samples is not None:
+        bundles = bundles[:args.calibration_max_samples]
+    return bundles
 
 
 def _load_optional_refs(bundle: pathlib.Path):
@@ -396,6 +414,31 @@ def main() -> None:
                         help="Optional .pt path for {'frames','actions'}")
     parser.add_argument("--no-compare", action="store_true",
                         help="Do not compare against optional bundle outputs")
+    parser.add_argument(
+        "--calibration-bundle",
+        action="append",
+        default=[],
+        help="Motus input bundle used for explicit calibration. Can be "
+             "specified multiple times or as a comma-separated list. Each "
+             "bundle must contain inputs/first_frame.pt and inputs/state.pt. "
+             "If omitted, the first infer() performs legacy single-sample "
+             "calibration on --input-bundle.")
+    parser.add_argument(
+        "--calibration-glob",
+        default=None,
+        help="Glob for dataset calibration bundles, e.g. "
+             "'/data/robotwin_mini_bundles/sample_*'. Bundles are sorted "
+             "lexicographically before max-sample truncation.")
+    parser.add_argument(
+        "--calibration-percentile",
+        type=float,
+        default=99.9,
+        help="Percentile reducer for explicit dataset calibration.")
+    parser.add_argument(
+        "--calibration-max-samples",
+        type=int,
+        default=None,
+        help="Maximum number of calibration bundles to load.")
     args = parser.parse_args()
 
     required = {
@@ -430,6 +473,12 @@ def main() -> None:
     print(f"[motus.quickstart] input_bundle={bundle}")
     print(f"[motus.quickstart] fp4_profile={args.fp4_profile}")
     print(f"[motus.quickstart] num_inference_steps={args.num_inference_steps}")
+    calibration_bundles = _resolve_calibration_bundles(args)
+    if calibration_bundles:
+        print("[motus.quickstart] calibration_bundles="
+              f"{[str(p) for p in calibration_bundles]}")
+        print("[motus.quickstart] calibration_percentile="
+              f"{args.calibration_percentile}")
 
     t0 = time.perf_counter()
     from flash_rt.frontends.torch.motus_rtx import MotusTorchFrontendRtx
@@ -446,7 +495,27 @@ def main() -> None:
 
     pipe.set_prompt(instruction, t5_embeds=t5_embeds, vlm_inputs=vlm_inputs)
 
-    print("[motus.quickstart] warmup #1: FP8 calibration + CUDA graph capture")
+    if calibration_bundles:
+        print("[motus.quickstart] explicit calibration: loading samples")
+        calibration_samples = [
+            _load_calibration_sample(path) for path in calibration_bundles
+        ]
+        t_cal0 = _now()
+        pipe.calibrate(
+            calibration_samples,
+            percentile=args.calibration_percentile,
+            max_samples=args.calibration_max_samples,
+            verbose=True,
+        )
+        t_cal = (_now() - t_cal0) * 1000.0
+        print("[motus.quickstart] explicit calibration + graph capture done: "
+              f"{t_cal:.1f} ms (N={len(calibration_samples)})")
+
+    warmup_label = (
+        "graph replay after explicit calibration"
+        if calibration_bundles else
+        "FP8 calibration + CUDA graph capture")
+    print(f"[motus.quickstart] warmup #1: {warmup_label}")
     _, _, t_calib = _infer_once(pipe, first_frame, state, args.seed)
     print(f"[motus.quickstart] warmup #1 done: {t_calib:.1f} ms")
 

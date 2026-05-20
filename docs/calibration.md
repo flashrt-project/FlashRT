@@ -602,7 +602,11 @@ available for `groot_rtx` (see
 [`flash_rt/frontends/torch/groot_rtx.py`](../flash_rt/frontends/torch/groot_rtx.py)
 `_calibrate_multi_frame`), which percentile-reduces both the Qwen3 and
 the DiT activation scales after running per-sample shadow forwards
-through both stages. The remaining Thor frontends (`pi0_thor`,
+through both stages. Motus RTX also supports
+`MotusTorchFrontendRtx.calibrate(obs_list, percentile=99.9)` for
+Stage3 bundles; it percentile-reduces Motus FP8 GEMM scales, AWQ-FP8
+action/und scales, G7.24 action/und QKV scales, and VAE FP8 resample
+scales before CUDA Graph capture. The remaining Thor frontends (`pi0_thor`,
 `pi0fast`, `groot_thor`, and their JAX counterparts) still route N ≥ 2
 through the `implicit_calibrate` shim and raise `NotImplementedError`
 — each needs a per-model audit of its calibrate-pass scale buffer
