@@ -159,17 +159,17 @@ model = flash_rt.load_model(
 | `awq_alpha` | `float` | `0.5` | AWQ scaling exponent `s[k] = (a[k]/a.mean())^alpha`. |
 | `use_p1_split_gu` | `bool` \| `None` | `None` | P1 split-GU 2-GEMM path (parity on Pi0.5, kernel reusable for Pi0.6). `None` → resolved by the `use_fp4` preset. |
 | `use_fp8` | `bool` | `True` | Enable the selected frontend's FP8 path when available. Set `False` for BF16 fallback or for the opt-in Pi0.5 RTX FP16 path. |
-| `use_fp16` | `bool` | `False` | **Pi0.5 torch RTX SM120 only.** Opt-in full-FP16 CUDA Graph path. Requires `use_fp8=False`; other hardware/configs raise a clear error. |
+| `use_fp16` | `bool` | `False` | **Pi0.5 torch RTX SM120/SM89 only.** Opt-in full-FP16 CUDA Graph path. Requires `use_fp8=False`; other hardware/configs raise a clear error. |
 | `num_steps` | `int\|None` | `None` | Pi0/Pi0.5 torch frontends. Flow-matching denoise steps; `None` uses the frontend default. |
 | `vision_pool_factor` | `int\|None` | `None` | Pi0.5 torch RTX/Orin. Spatial pooling factor for vision tokens. The FP16 RTX path currently supports only `1`. |
 | `vision_num_layers` | `int\|None` | `None` | Pi0.5 torch RTX/Orin. Number of SigLIP vision layers to run. |
 | `cache_frames` | `int\|None` | `None` | Pi0.5 torch RTX/Orin. Temporal encoder K/V cache period; `1` means no temporal reuse. |
 
-### Pi0.5 RTX 5090 full-FP16 opt-in path
+### Pi0.5 RTX full-FP16 opt-in path
 
-The default Pi0.5 RTX path remains FP8/BF16. For RTX 5090 / SM120
-experiments that need a full-FP16 baseline, explicitly disable FP8 and
-enable FP16:
+The default Pi0.5 RTX path remains FP8/BF16. For RTX 5090 / SM120 and
+RTX 4090/L40-class SM89 experiments that need a full-FP16 baseline,
+explicitly disable FP8 and enable FP16:
 
 ```python
 import flash_rt
@@ -178,7 +178,7 @@ model = flash_rt.load_model(
     "/path/to/pi05_libero_pytorch",
     framework="torch",
     config="pi05",
-    hardware="rtx_sm120",
+    hardware="auto",  # or "rtx_sm120" / "rtx_sm89"
     num_views=3,
     num_steps=10,
     cache_frames=1,
@@ -203,10 +203,20 @@ python examples/blackwell/bench_pi05_fp16.py \
   --iters 100
 ```
 
-This path is intentionally isolated from Thor, Orin, RTX 4090/L40, and
-the default RTX FP8 path. Passing `use_fp16=True` without
-`use_fp8=False`, or on unsupported hardware/configs, raises a
-`ValueError`.
+This path is intentionally isolated from Thor, Orin, and the default RTX
+FP8 path. Passing `use_fp16=True` without `use_fp8=False`, or on
+unsupported hardware/configs, raises a `ValueError`.
+
+Officially enabled FP16 RTX routes are:
+
+| Hardware string | Example GPUs | Status |
+|---|---|---|
+| `rtx_sm120` | RTX 5090 | validated reference path |
+| `rtx_sm89` | RTX 4090, L40 | enabled through the same RTX FP16 path; validate benchmark/accuracy on the target card |
+
+The underlying FP16 kernels are SM80-family friendly, but FlashRT only
+exposes this Pi0.5 FP16 route for architectures already mapped to the
+RTX Pi0.5 frontend.
 
 ### `model.predict()`
 

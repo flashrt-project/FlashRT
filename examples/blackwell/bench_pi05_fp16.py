@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt-in Pi0.5 RTX 5090 full-FP16 CUDA Graph benchmark."""
+"""Opt-in Pi0.5 RTX full-FP16 CUDA Graph benchmark."""
 
 from __future__ import annotations
 
@@ -33,6 +33,12 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument(
+        "--hardware",
+        default="auto",
+        choices=("auto", "rtx_sm120", "rtx_sm89"),
+        help="Hardware route. Use auto on the target GPU; override for debugging.",
+    )
+    parser.add_argument(
         "--prompt",
         default="pick up the red block and place it in the tray",
     )
@@ -49,14 +55,14 @@ def main() -> None:
     print("=== Pi0.5 RTX full-FP16 opt-in benchmark ===", flush=True)
     print("device", torch.cuda.get_device_name(0), torch.cuda.get_device_capability(0), flush=True)
     print("checkpoint", args.checkpoint, flush=True)
-    print("num_views", args.num_views, "steps", args.steps, flush=True)
+    print("num_views", args.num_views, "steps", args.steps, "hardware", args.hardware, flush=True)
 
     t0 = time.perf_counter()
     model = flash_rt.load_model(
         args.checkpoint,
         framework="torch",
         config="pi05",
-        hardware="rtx_sm120",
+        hardware=args.hardware,
         num_views=args.num_views,
         num_steps=args.steps,
         cache_frames=1,

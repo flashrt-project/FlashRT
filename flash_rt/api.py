@@ -248,7 +248,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             an FP8/BF16 switch. Defaults to True to preserve existing
             performance-oriented behavior.
         use_fp16: Experimental Pi0.5 torch RTX full-FP16 baseline. This is
-            only valid with ``use_fp8=False`` on RTX SM120.
+            only valid with ``use_fp8=False`` on RTX SM120/SM89.
         num_steps: Pi0/Pi0.5 torch only when supported. Number of
             flow-matching ODE steps. ``None`` uses the frontend default.
         vision_pool_factor: Pi0.5 torch RTX/Orin only. Spatial pooling factor
@@ -319,10 +319,12 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     if use_fp16:
         if use_fp8:
             raise ValueError("use_fp16=True requires use_fp8=False")
-        if config != "pi05" or framework != "torch" or arch != "rtx_sm120":
+        fp16_arches = ("rtx_sm120", "rtx_sm89")
+        if config != "pi05" or framework != "torch" or arch not in fp16_arches:
             raise ValueError(
                 "use_fp16=True is currently experimental and only supports "
-                "config='pi05', framework='torch', hardware='rtx_sm120'")
+                "config='pi05', framework='torch', "
+                "hardware in {'rtx_sm120', 'rtx_sm89'}")
         from flash_rt.frontends.torch.pi05_rtx_fp16 import (
             Pi05TorchFrontendRtxFP16,
         )
