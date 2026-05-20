@@ -329,16 +329,7 @@ if(FLASHRT_ENABLE_MOTUS AND GPU_ARCH STREQUAL "120")
     csrc/conv/motus/motus_bf16_rms_silu_quant_nvfp4_sm120.cu
     csrc/conv/motus/motus_fp4_conv3d_v19sf_sm120.cu
     csrc/conv/motus/motus_fp4_conv3d_v19sfb_sm120.cu
-    csrc/conv/motus/motus_fp4_conv3d_v19sfb_k128_sm120.cu
-    csrc/quantize/ada_layer_norm_fp8.cu
-    csrc/quantize/awq_quant_fp8_static_bf16.cu
-    csrc/quantize/bf16_ndhwc_to_ncdhw_transpose.cu
-    csrc/quantize/bf16_quant_fp8_ncdhw_to_ndhwc.cu
-    csrc/quantize/bf16_rms_silu_ncdhw.cu
-    csrc/quantize/bf16_rms_silu_quant_fp8_ncdhw_to_ndhwc_v4.cu
-    csrc/quantize/bias_gelu_quantize_fp8.cu
-    csrc/quantize/qkv_split_norm_rope_bf16.cu
-    csrc/quantize/rope_apply_bf16.cu)
+    csrc/conv/motus/motus_fp4_conv3d_v19sfb_k128_sm120.cu)
   set_target_properties(motus_aux_sm120_obj PROPERTIES
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
@@ -672,6 +663,15 @@ pybind11_add_module(flash_rt_kernels
   csrc/quantize/tq_dequant_kv.cu
   csrc/quantize/wmma_probe.cu
   csrc/quantize/tq_dequant_cutlass.cu
+  csrc/quantize/ada_layer_norm_fp8.cu
+  csrc/quantize/awq_quant_fp8_static_bf16.cu
+  csrc/quantize/bf16_ndhwc_to_ncdhw_transpose.cu
+  csrc/quantize/bf16_quant_fp8_ncdhw_to_ndhwc.cu
+  csrc/quantize/bf16_rms_silu_ncdhw.cu
+  csrc/quantize/bf16_rms_silu_quant_fp8_ncdhw_to_ndhwc_v4.cu
+  csrc/quantize/bias_gelu_quantize_fp8.cu
+  csrc/quantize/qkv_split_norm_rope_bf16.cu
+  csrc/quantize/rope_apply_bf16.cu
   csrc/gemm/fp8_block128_gemm.cu
   csrc/kernels/causal_conv1d_qwen36.cu
   csrc/kernels/gated_deltanet_qwen36.cu
