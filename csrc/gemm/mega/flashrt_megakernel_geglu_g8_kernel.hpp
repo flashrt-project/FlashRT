@@ -32,28 +32,16 @@
 #pragma once
 
 // ============================================================================
-// FlashRtMegakernelGeGLUG8FusedGemm — the megakernel kernel struct for the
-// Pi0.5 encoder split-G7 path.
+// FlashRtMegakernelGeGLUG8FusedGemm — the GeGLU megakernel kernel struct for
+// the Pi0.5 encoder FFN.
 //
-// Stage A.0 (this commit): byte-for-byte copy of the vendored production
-// SM100 single-GEMM kernel (`flashrt_megakernel_kernel.hpp`) with ONLY the
-// class name renamed.  Functionally identical to single GEMM at this
-// stage; serves as a build/wiring scaffold.
-//
-// Stage A.1 (next): extend struct to TWO Mainloop+Epilogue template
-// params; operator() body chains phase1 (gate) + phase2 (up) serially
-// per work tile, sharing one tcgen05.alloc.  Both phases still write to
-// gmem (no SMEM_gate routing yet).
-//
-// Stage B: redirect phase1 epilogue store target from gmem D_gate to a
-// SharedStorage::smem_gate buffer (suppress TMA store).
-//
-// Stage C: add `Sm100SmemGateLoad` EVT visitor to phase2 epilogue and
-// fuse the gate × up multiply in-register.  This is the cosine-correct
-// MK-1 ship candidate.
-//
-// Stage D: share SMEM_A across phases (X is the same input for both
-// gate and up).  Performance optimization on top of Stage C.
+// Built on the vendored SM100 single-GEMM kernel, extended to two
+// Mainloop+Epilogue template params. Each work tile runs phase1 (gate)
+// then phase2 (up) serially, sharing one tcgen05.alloc and one SMEM_A
+// staging buffer (X is the same input for both). Phase1 stores its result
+// into a SharedStorage::smem_gate buffer instead of gmem; phase2's epilogue
+// uses an `Sm100SmemGateLoad` EVT visitor to fuse the gate * up multiply
+// in-register, so only the final hidden tensor is written out.
 // ============================================================================
 
 #include "cutlass/cutlass.h"
@@ -310,7 +298,7 @@ public:
       EpilogueTensorStorage   epilogue;
       EpilogueTensorStorage2  epilogue_2;
 
-      // Stage E3: shared smem_A + per-phase smem_B
+      // shared smem_A + per-phase smem_B
       using SmemAllocTypeA  = typename CollectiveMainloop::SmemAllocTypeA;
       using SmemAllocTypeB  = typename CollectiveMainloop::SmemAllocTypeB;
       using SmemAllocTypeB2 = typename CollectiveMainloop2::SmemAllocTypeB;
@@ -616,12 +604,12 @@ public:
       mainloop_pipeline_params.role = MainloopPipeline::ThreadCategory::Consumer;
     }
     mainloop_pipeline_params.is_leader = lane_predicate && is_mma_leader_cta && is_participant.main_load;
-    // Stage E3: shared pipeline carries (A + B_phase1 + B_phase2) per slot.
+    // shared pipeline carries (A + B_phase1 + B_phase2) per slot.
     mainloop_pipeline_params.transaction_bytes =
         CollectiveMainloop::TmaTransactionBytesA
       + CollectiveMainloop::TmaTransactionBytesB
       + CollectiveMainloop2::TmaTransactionBytesB;
-    // Stage E3: 2 consumer groups per slot — phase 1 mma + phase 2 mma must
+    // 2 consumer groups per slot — phase 1 mma + phase 2 mma must
     // each release every slot (K-tile interleaved in MMA warp body below).
     mainloop_pipeline_params.num_consumers = 2;
     mainloop_pipeline_params.initializing_warp = 0;
@@ -781,7 +769,7 @@ public:
     // To all producers and consumer threadblocks in the cluster
     pipeline_init_arrive_relaxed(cluster_size);
 
-    // Stage E3: phase 1 and phase 2 mainloops both see shared smem_A.
+    // phase 1 and phase 2 mainloops both see shared smem_A.
     typename SharedStorage::template PhaseTensorStorageView<
         decltype(shared_storage.tensors.shared_smem_A),
         decltype(shared_storage.tensors.smem_B_phase1)>
@@ -855,7 +843,7 @@ public:
           }
         }
 
-        // -------- Stage E3: inline 3-TMA shared-pipeline main_load --------
+        // -------- inline 3-TMA shared-pipeline main_load --------
         {
           auto& tma_load_a    = params.mainloop.tma_load_a;
           auto& tma_load_b_p1 = params.mainloop.tma_load_b;
@@ -893,7 +881,7 @@ public:
             ++k_tile_iter;
           }
         }
-        (void)k_tile_prologue;  // unused in Stage E3 inline main_load
+        (void)k_tile_prologue;  // unused in the inline main_load
 
         // Sync warp to prevent non-participating threads entering next wave early
         __syncwarp();
@@ -909,7 +897,7 @@ public:
           ++clc_pipe_consumer_state;
         }
       } while (work_tile_info.is_valid());
-      // Stage E3: single shared pipeline; mainloop_pipeline_2 unused.
+      // single shared pipeline; mainloop_pipeline_2 unused.
       collective_mainloop.load_tail(mainloop_pipeline, mainloop_pipe_producer_state);
 
     }
@@ -1006,7 +994,7 @@ public:
           }
         }();
 
-        // -------- Stage E3: inline K-tile interleaved phase1+phase2 MMA --------
+        // -------- inline K-tile interleaved phase1+phase2 MMA --------
         // Single shared mainloop_pipeline.  Per K-tile slot: phase 1 mma
         // (A, B_phase1) → acc_p1, then phase 2 mma (A, B_phase2) → acc_p2.
         // Both phases release the slot each iteration so pipeline reaches

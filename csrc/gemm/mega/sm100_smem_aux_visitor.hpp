@@ -1,5 +1,5 @@
 // ============================================================================
-// FlashRT — MK-1 Stage B SMEM-only EVT visitors + FusionOperation tags
+// FlashRT — SMEM-only EVT visitors + FusionOperation tags
 // + FusionCallbacks specializations.
 //
 // Two visitor classes:

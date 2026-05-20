@@ -237,7 +237,7 @@ struct CollectiveMma<
   static constexpr uint32_t TmaTransactionBytesB =
     cutlass::bits_to_bytes(size(AtomThrShapeMNK{}) * cosize(take<0,3>(SmemLayoutB{})) * cute::sizeof_bits_v<ElementB>);
   static constexpr uint32_t TmaTransactionBytes = TmaTransactionBytesA + TmaTransactionBytesB;
-  // FlashRT MK-1 Stage E: phase-2 mainloop skips A TMA (uses shared smem_A
+  // FlashRT patch: phase-2 mainloop skips A TMA (uses shared smem_A
   // pre-filled by phase 1); only B bytes counted in transaction barrier.
   static constexpr uint32_t TmaTransactionBytesBOnly = TmaTransactionBytesB;
 
@@ -496,7 +496,7 @@ struct CollectiveMma<
   /// tBsB - partitioned smem tensor for B
   /// mcast_mask_a - tma multicast mask for A
   /// mcast_mask_b - tma multicast mask for B
-  // FlashRT MK-1 patch: template-ize TensorStorage so kernels can pass a
+  // FlashRT patch: template-ize TensorStorage so kernels can pass a
   // duck-typed view that shares SMEM_A across multiple CollectiveMma
   // instances.  Default (no explicit template arg) preserves CUTLASS
   // behavior.
@@ -586,7 +586,7 @@ struct CollectiveMma<
 
   /// Perform a collective-scoped matrix multiply-accumulate
   /// Producer Perspective
-  // FlashRT MK-1 Stage E: SkipA template flag — when true, the load issues
+  // FlashRT patch: SkipA template flag — when true, the load issues
   // only the B TMA copy (A is assumed pre-loaded in shared SMEM by a peer
   // mainloop).  Caller MUST configure MainloopPipeline transaction_bytes
   // to TmaTransactionBytesBOnly so the barrier completes correctly.

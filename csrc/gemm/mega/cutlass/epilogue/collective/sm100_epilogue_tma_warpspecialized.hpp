@@ -436,7 +436,7 @@ public:
   CollectiveEpilogue(Params const& params_, TensorStorage& shared_tensors)
       : params(params_), fusion_callbacks(params_.thread, shared_tensors.thread) {}
 
-public:  // FlashRT MK-1 patch: expose fusion_callbacks for cross-phase SMEM bridge.
+public:  // FlashRT patch: expose fusion_callbacks for cross-phase SMEM bridge.
   FusionCallbacks fusion_callbacks;
 
 private:

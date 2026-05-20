@@ -259,10 +259,8 @@ if(ENABLE_SM100_CUTLASS)
     >
   )
 
-  # MK-1 encoder split-G7 megakernel (gate+up GeGLU fused).  Stage A.0
-  # scaffold: byte-copy of the vendored single-GEMM kernel under a new
-  # name; Stage A.1 will extend to the two-Mainloop/Epilogue chain.
-  # Plan: megakernel_dev/notes/MK1_DESIGN_V2.md.
+  # Encoder GeGLU megakernel: fuses the gate and up GEMMs (one launch
+  # computes hidden = GELU(X @ W_gate) * (X @ W_up)).
   add_library(flashrt_megakernel_geglu_obj OBJECT csrc/gemm/mega/flashrt_megakernel_geglu.cu)
   set_target_properties(flashrt_megakernel_geglu_obj PROPERTIES
     CUDA_STANDARD 17
@@ -287,12 +285,9 @@ if(ENABLE_SM100_CUTLASS)
     >
   )
 
-  # MK-2 scaffold (F-1): fused GeGLU + G8 down-proj + residual megakernel.
-  # F-1 is currently a byte-equivalent copy of MK-1 (same per-tile
-  # behaviour) with the class renamed.  F-2..F-6 will extend the kernel
-  # to fold the down GEMM via persistent CTA + h_chunk loop.  Same
-  # include-precedence rules as MK-1 (mega dir before upstream CUTLASS).
-  # Plan: megakernel_dev/notes/MK2_DESIGN.md.
+  # Encoder GeGLU + down-proj megakernel: bundles the GeGLU megakernel and
+  # the down GEMM (beta=1 residual) into one C entry.  Uses the same
+  # include precedence as the GeGLU object (mega dir before upstream CUTLASS).
   add_library(flashrt_megakernel_geglu_g8_obj OBJECT csrc/gemm/mega/flashrt_megakernel_geglu_g8.cu)
   set_target_properties(flashrt_megakernel_geglu_g8_obj PROPERTIES
     CUDA_STANDARD 17

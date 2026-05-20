@@ -1,24 +1,14 @@
 // ============================================================================
-// FlashRT — encoder split-G7 megakernel (Stage B prototype).
+// FlashRT — encoder GeGLU megakernel (host-side launcher).
 //
-// Stage B-v2: visitor-owned SMEM (mirrors Sm90AuxStore pattern).
-//   - Phase 1 (gate) fusion = Sm90EVT<Sm100SmemAuxStore, Sm90EVT<Sm90Compute<GELU>,
-//                                     Sm90LinearCombination>>
-//     captures post-GELU to phase 1 visitor's OWN SharedStorage.
-//   - Phase 2 (up) fusion = Sm90EVT<Sm90Compute<multiplies>, Sm90LinearCombination,
-//                                   Sm100SmemAuxLoad>
-//     loads aux from phase 2 visitor's OWN SharedStorage (NOT phase 1's).
-//
-// Cross-phase data sharing is NOT YET wired at this stage — phase 1 writes
-// to phase1.epilogue.fusion.smem_aux; phase 2 reads from
-// phase2.epilogue_2.fusion.smem_aux (different memory regions).  So numerical
-// output will be wrong, but the test is: does the kernel RUN without
-// illegal address?  That validates the visitor mechanic isolated from
-// the cross-phase plumbing.
-//
-// Once kernel runs: add a kernel-body S2S copy from phase1's smem_aux to
-// phase2's smem_aux at phase transition, OR overlay the two via kernel
-// TensorStorage union.
+// The kernel (struct in flashrt_megakernel_geglu_kernel.hpp) uses
+// visitor-owned SMEM to fuse the gate and up GEMMs:
+//   - Phase 1 (gate) epilogue captures post-GELU into SMEM
+//     (Sm90EVT<Sm100SmemAuxStore, Sm90EVT<Sm90Compute<GELU>,
+//     Sm90LinearCombination>>).
+//   - Phase 2 (up) epilogue loads it back and fuses the gate * up multiply
+//     in-register (Sm90EVT<Sm90Compute<multiplies>, Sm90LinearCombination,
+//     Sm100SmemAuxLoad>), writing only the final hidden tensor.
 // ============================================================================
 
 #include "cutlass/cutlass.h"
@@ -46,7 +36,7 @@ using fp16_t = cutlass::half_t;
 
 namespace {
 
-// Stage E3 best tile: (128, 128, 128) Cluster (2,2,1) with shared SMEM_A.
+// Best tile: (128, 128, 128) Cluster (2,2,1) with shared SMEM_A.
 // Per-CTA (64, 64, 128) — TileK=128 (production sq's K).
 // Low Thor regime: 1.06-1.07x faster than production back-to-back.
 using Tile    = Shape<_128, _128, _128>;
@@ -117,7 +107,7 @@ extern "C" int flashrt_megakernel_geglu_fp16(
         {M, N, K, 1},
         {(ElementA*)X, sA, (ElementB*)W_gate, sB},
         {
-            // Stage B-v2: visitor has empty Arguments (owns SMEM internally)
+            // visitor has empty Arguments (owns its SMEM internally)
             { 1.0f, 0.0f, nullptr, nullptr, {}, {}, {} },
             nullptr, {},
             (ElementD*)D_gate_scratch, sD

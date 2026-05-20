@@ -345,10 +345,10 @@ def _encoder_forward_fp16(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None
                                         logits, attn_out,
                                         Se, Se, NH, HD, attn_scale, stream)
 
-            # Env-switch ENC_PATH: "pre_mk1" runs the unfused split-G7 + 2sm21
-            # + separate residual_add (pre-MK-1 baseline).  Default "head"
-            # is MK-1 mega + A (G8 resid fuse) + D (O resid fuse) + F-2
-            # bundled entry.
+            # Env-switch ENC_PATH: "pre_mk1" runs the unfused split GEMMs +
+            # separate residual_add (the pre-megakernel baseline).  Default
+            # "head" fuses the O-proj residual and runs rms + the GeGLU
+            # megakernel + down GEMM with the residual folded in.
             up_w_ptr = weights['gate_w'][l] + H * D * 2
             if enc_path == "pre_mk1":
                 # 6. O proj (no resid fuse)
@@ -398,9 +398,9 @@ def _encoder_forward_fp16(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None
                         Se, H, D, 1e-6, stream)
                     continue
                 fvk.rms_norm_fp16(x, ones, x_norm, Se, D, 1e-6, stream)
-                # MK-2 F-2 bundled: mega + G8 (2sm21 beta=1) in one C entry.
-                # Hot-regime bundle wins ~0.5 ms over the same two launches
-                # issued separately.  G8 kernel choice via env (bundled
+                # Bundled GeGLU megakernel + down GEMM (2sm21 beta=1) in one C
+                # entry.  The bundle wins ~0.5 ms in the hot regime over the
+                # same two launches issued separately.  G8 kernel via env (bundled
                 # entry always uses 2sm21 internally; G8_KERNEL switches
                 # to unbundled python path with a different kernel).
                 _g8 = g8_kernel

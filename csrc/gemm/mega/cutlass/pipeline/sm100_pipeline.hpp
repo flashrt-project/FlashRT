@@ -564,7 +564,7 @@ public:
       auto atom_thr_shape = AtomThrShape_MNK{};
       uint32_t const multicast_consumer_arrival_count = (cute::size<0>(cluster_shape) / cute::size<0>(atom_thr_shape)) +
                                      (cute::size<1>(cluster_shape) / cute::size<1>(atom_thr_shape)) - 1;
-      // FlashRT MK-1 Stage E2 patch: if params.num_consumers > 1, multiply
+      // FlashRT patch: if params.num_consumers > 1, multiply
       // arrival count so the slot only releases after ALL N consumer groups
       // arrive (used for shared-pipeline across two CollectiveMma instances).
       uint32_t const effective_consumer_arrival_count =

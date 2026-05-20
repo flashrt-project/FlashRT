@@ -1,24 +1,17 @@
 // ============================================================================
-// FlashRT — encoder split-G7 megakernel (Stage B prototype).
+// FlashRT — encoder GeGLU + down-proj megakernel (host-side launchers).
 //
-// Stage B-v2: visitor-owned SMEM (mirrors Sm90AuxStore pattern).
-//   - Phase 1 (gate) fusion = Sm90EVT<Sm100SmemAuxStore, Sm90EVT<Sm90Compute<GELU>,
-//                                     Sm90LinearCombination>>
-//     captures post-GELU to phase 1 visitor's OWN SharedStorage.
-//   - Phase 2 (up) fusion = Sm90EVT<Sm90Compute<multiplies>, Sm90LinearCombination,
-//                                   Sm100SmemAuxLoad>
-//     loads aux from phase 2 visitor's OWN SharedStorage (NOT phase 1's).
+// The GeGLU megakernel (kernel struct in flashrt_megakernel_geglu_g8_kernel.hpp)
+// uses visitor-owned SMEM to fuse the two FFN GEMMs:
+//   - Phase 1 (gate) epilogue captures post-GELU into a SharedStorage aux
+//     buffer (Sm90EVT<Sm100SmemAuxStore, Sm90EVT<Sm90Compute<GELU>,
+//     Sm90LinearCombination>>).
+//   - Phase 2 (up) epilogue loads that aux buffer and fuses the gate * up
+//     multiply in-register (Sm90EVT<Sm90Compute<multiplies>,
+//     Sm90LinearCombination, Sm100SmemAuxLoad>).
 //
-// Cross-phase data sharing is NOT YET wired at this stage — phase 1 writes
-// to phase1.epilogue.fusion.smem_aux; phase 2 reads from
-// phase2.epilogue_2.fusion.smem_aux (different memory regions).  So numerical
-// output will be wrong, but the test is: does the kernel RUN without
-// illegal address?  That validates the visitor mechanic isolated from
-// the cross-phase plumbing.
-//
-// Once kernel runs: add a kernel-body S2S copy from phase1's smem_aux to
-// phase2's smem_aux at phase transition, OR overlay the two via kernel
-// TensorStorage union.
+// This file provides the C entry points that drive that kernel and bundle
+// it with the downstream GEMMs (see per-function comments below).
 // ============================================================================
 
 #include "cutlass/cutlass.h"
@@ -46,7 +39,7 @@ using fp16_t = cutlass::half_t;
 
 namespace {
 
-// Stage E3 best tile: (128, 128, 128) Cluster (2,2,1) with shared SMEM_A.
+// Best tile: (128, 128, 128) Cluster (2,2,1) with shared SMEM_A.
 // Per-CTA (64, 64, 128) — TileK=128 (production sq's K).
 // Low Thor regime: 1.06-1.07x faster than production back-to-back.
 using Tile    = Shape<_128, _128, _128>;
@@ -98,8 +91,7 @@ using GemmOp = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
 }  // anonymous namespace
 
-// Forward decls for the existing production kernels we chain in F-2.
-// F-3+ will replace these external launches with a single fused kernel.
+// Forward decls for the production kernels chained by the bundled entries.
 extern "C" int cutlass_fp16_2sm21(void* A, void* B, void* D,
                                     int M, int N, int K,
                                     float alpha, float beta,
@@ -115,7 +107,7 @@ extern "C" int cutlass_fp16_k64(void*, void*, void*,
                                   int, int, int, float, float,
                                   cudaStream_t);
 
-// Bundle: rms_norm + QKV (k64) in one C entry.  Same pattern as F-2 bundle.
+// Bundle: rms_norm + QKV (k64) in one C entry.
 extern "C" int flashrt_rms_qkv_fp16(
     void* x,
     void* rms_weight,
@@ -135,25 +127,18 @@ extern "C" int flashrt_rms_qkv_fp16(
 }
 
 // ============================================================================
-// flashrt_megakernel_geglu_g8_fp16 — MK-2 fused entry.
+// flashrt_megakernel_geglu_g8_fp16 — fused GeGLU + down-proj entry.
 //
-// Computes  x_inout += GeGLU(X @ W_gate, X @ W_up) @ W_down
-// in one C-callable.
-//
-// Stage progression:
-//   F-1  : entry exists, signature == MK-1, internally identical (DONE).
-//   F-2  : signature extended with W_down + x_inout; internally bundles
-//          MK-1 mega + cutlass_fp16_2sm21(beta=1, D=x_inout).  Two kernel
-//          launches but bundled API (THIS COMMIT).  Functionally equiv
-//          to current Python path "mega + 2sm21_resid_fused".
-//   F-3+ : drop the second launch; persistent-CTA fused kernel.
+// Computes  x_inout += GeGLU(X @ W_gate, X @ W_up) @ W_down  in one
+// C-callable.  Runs the GeGLU megakernel, then the production 2sm21 down
+// GEMM with a beta=1 residual fold (two launches behind one bundled API).
 //
 // Arguments (M=Se, H=hidden dim, D=embed dim):
-//   X              [M, D]   fp16  (RowMajor, MK-1 input)
+//   X              [M, D]   fp16  (RowMajor, GeGLU input)
 //   W_gate         [H, D]   fp16  (RowMajor → [N,K] CUTLASS-NT)
 //   W_up           [H, D]   fp16
-//   W_down         [D, H]   fp16  (RowMajor → [D, H] = G8's [N_d, K_g8])
-//   hidden_scratch [M, H]   fp16  (scratch, gmem; F-3+ keeps it in SMEM)
+//   W_down         [D, H]   fp16  (RowMajor → [D, H] = down [N_d, K])
+//   hidden_scratch [M, H]   fp16  (gmem scratch for the GeGLU output)
 //   x_inout        [M, D]   fp16  (residual in/out, beta=1 fold)
 // ============================================================================
 extern "C" int flashrt_megakernel_geglu_g8_fp16(
@@ -167,7 +152,7 @@ extern "C" int flashrt_megakernel_geglu_g8_fp16(
     using ElementB = typename GemmOp::ElementB;
     using ElementD = typename GemmOp::ElementD;
 
-    // Phase 1+2: MK-1 mega — produces hidden = GELU(X @ W_gate) * (X @ W_up).
+    // Phase 1+2: GeGLU megakernel — produces hidden = GELU(X @ W_gate) * (X @ W_up).
     // Re-uses the same kernel class instance; problem shape (M, H, D).
     auto sA = cutlass::make_cute_packed_stride(typename GemmOp::GemmKernel::StrideA{}, {M, D, 1});
     auto sB = cutlass::make_cute_packed_stride(typename GemmOp::GemmKernel::StrideB{}, {H, D, 1});
@@ -186,18 +171,14 @@ extern "C" int flashrt_megakernel_geglu_g8_fp16(
         {
             { 1.0f, 0.0f, nullptr, nullptr, {}, {}, {} },
             nullptr, {},
-            (ElementD*)x_inout, sD  // phase-2 hidden gmem — reuses x_inout
-                                    // as throw-away buffer at this stage;
-                                    // overwritten by the G8 launch below.
-                                    // NOTE: F-3 will keep hidden in SMEM
-                                    // and never touch this path.
+            (ElementD*)x_inout, sD  // phase-2 hidden gmem — placeholder ptr;
+                                    // overridden below to hidden_scratch.
         }
     };
 
-    // For F-2 we still need hidden in a real gmem buffer for the 2sm21
-    // launch.  Override phase-2 epilogue's output ptr to point at the
-    // caller's hidden_scratch (same buffer phase-1 uses; phase-2 writes
-    // last so wins).  This wastes a 24 MB roundtrip — eliminated in F-3.
+    // The down GEMM reads hidden from gmem, so point the phase-2 epilogue
+    // output at the caller's hidden_scratch (same buffer phase-1 uses;
+    // phase-2 writes last so wins).
     args.epilogue_2.dD = sD;
     args.epilogue_2.ptr_D = (ElementD*)hidden_scratch;
 
@@ -220,20 +201,19 @@ extern "C" int flashrt_megakernel_geglu_g8_fp16(
         return -3;
     }
 
-    // Phase 3 (F-2 placeholder): launch the production 2sm21 G8 with
-    // resid fuse (alpha=1, beta=1, D = x_inout).  F-3+ folds this into
-    // the same kernel via persistent CTA + h_chunk loop.
+    // Phase 3: production 2sm21 down GEMM with residual fuse
+    // (alpha=1, beta=1, D = x_inout).
     return cutlass_fp16_2sm21(hidden_scratch, W_down, x_inout,
                               M, D, H, 1.0f, 1.0f, stream);
 }
 
 // ============================================================================
-// MK-2 F-3: bundled FFN-block entry (rms_norm + mega + G8 + resid)
+// flashrt_encoder_ffn_block_fp16 — bundled FFN-block entry
+// (rms_norm + GeGLU megakernel + down GEMM + residual).
 //
-// Collapses four production launches into a single C function.  Pure
-// bundling, no kernel-level fusion yet — but F-2 measurements showed
-// each removed C-boundary is worth ~0.5 ms in hot regime, so 4→1 may
-// recover ~1.5 ms on top of F-2.
+// Collapses four production launches into a single C function (pure
+// bundling, no kernel-level fusion). Each removed C boundary is worth
+// ~0.5 ms in the hot regime.
 //
 // Semantics:
 //   x_norm = rms_norm(x_resid, rms_weight, eps)
