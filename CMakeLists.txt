@@ -47,6 +47,13 @@ else()
   set(ENABLE_SM100_CUTLASS OFF)
 endif()
 
+# Developer-only SM100 kernels. OFF by default so production flash_rt_kernels
+# neither compiles nor exports them; turn on locally for kernel bring-up.
+option(FLASHRT_BUILD_SM100_SWEEP
+       "Build the transient FP16 CUTLASS tile-sweep bench kernel" OFF)
+option(FLASHRT_BUILD_SM100_ENCODER_MLP
+       "Build the WIP Path C encoder MLP megakernel scaffold" OFF)
+
 # SM120+ (Blackwell): NVFP4/W4A8 block-scaled GEMM
 if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "120a")
   set(ENABLE_NVFP4 ON)
@@ -304,41 +311,45 @@ if(ENABLE_SM100_CUTLASS)
     >
   )
 
-  # Path C encoder MLP megakernel (scaffold, fallback to 3-step GEMMs).
-  add_library(encoder_mlp_sm100_obj OBJECT csrc/gemm/mega/encoder_mlp_sm100.cu)
-  set_target_properties(encoder_mlp_sm100_obj PROPERTIES
-    CUDA_STANDARD 17
-    POSITION_INDEPENDENT_CODE ON
-  )
-  target_include_directories(encoder_mlp_sm100_obj PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
-    ${CUTLASS_INCLUDE}
-    ${CUTLASS_DIR}/tools/util/include
-  )
-  target_compile_options(encoder_mlp_sm100_obj PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:
-      --expt-relaxed-constexpr -O3 --use_fast_math
-      ${GPU_GENCODE}
-    >
-  )
+  # Path C encoder MLP megakernel scaffold (WIP, unused by the runtime).
+  if(FLASHRT_BUILD_SM100_ENCODER_MLP)
+    add_library(encoder_mlp_sm100_obj OBJECT csrc/gemm/mega/encoder_mlp_sm100.cu)
+    set_target_properties(encoder_mlp_sm100_obj PROPERTIES
+      CUDA_STANDARD 17
+      POSITION_INDEPENDENT_CODE ON
+    )
+    target_include_directories(encoder_mlp_sm100_obj PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+      ${CUTLASS_INCLUDE}
+      ${CUTLASS_DIR}/tools/util/include
+    )
+    target_compile_options(encoder_mlp_sm100_obj PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:
+        --expt-relaxed-constexpr -O3 --use_fast_math
+        ${GPU_GENCODE}
+      >
+    )
+  endif()
 
-  # FP16 CUTLASS GEMM tile-sweep (transient, used by R1.1 sweep bench).
-  add_library(cutlass_sm100_fp16_sweep_obj OBJECT csrc/gemm/cutlass_sm100_fp16_sweep.cu)
-  set_target_properties(cutlass_sm100_fp16_sweep_obj PROPERTIES
-    CUDA_STANDARD 17
-    POSITION_INDEPENDENT_CODE ON
-  )
-  target_include_directories(cutlass_sm100_fp16_sweep_obj PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
-    ${CUTLASS_INCLUDE}
-    ${CUTLASS_DIR}/tools/util/include
-  )
-  target_compile_options(cutlass_sm100_fp16_sweep_obj PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:
-      --expt-relaxed-constexpr -O3 --use_fast_math
-      ${GPU_GENCODE}
-    >
-  )
+  # FP16 CUTLASS GEMM tile-sweep bench kernel (transient bring-up tool).
+  if(FLASHRT_BUILD_SM100_SWEEP)
+    add_library(cutlass_sm100_fp16_sweep_obj OBJECT csrc/gemm/cutlass_sm100_fp16_sweep.cu)
+    set_target_properties(cutlass_sm100_fp16_sweep_obj PROPERTIES
+      CUDA_STANDARD 17
+      POSITION_INDEPENDENT_CODE ON
+    )
+    target_include_directories(cutlass_sm100_fp16_sweep_obj PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+      ${CUTLASS_INCLUDE}
+      ${CUTLASS_DIR}/tools/util/include
+    )
+    target_compile_options(cutlass_sm100_fp16_sweep_obj PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:
+        --expt-relaxed-constexpr -O3 --use_fast_math
+        ${GPU_GENCODE}
+      >
+    )
+  endif()
 endif()
 
 # ── libfmha_fp16_strided.so — CUTLASS SM100 FP16 FMHA for SigLIP ──
@@ -823,12 +834,18 @@ if(ENABLE_SM100_CUTLASS)
   target_sources(flash_rt_kernels PRIVATE
     $<TARGET_OBJECTS:cutlass_sm100_obj>
     $<TARGET_OBJECTS:cutlass_sm100_fp16_obj>
-    $<TARGET_OBJECTS:cutlass_sm100_fp16_sweep_obj>
-    $<TARGET_OBJECTS:encoder_mlp_sm100_obj>
     $<TARGET_OBJECTS:flashrt_megakernel_obj>
     $<TARGET_OBJECTS:flashrt_megakernel_geglu_obj>
     $<TARGET_OBJECTS:flashrt_megakernel_geglu_g8_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_SM100_CUTLASS=1)
+  if(FLASHRT_BUILD_SM100_SWEEP)
+    target_sources(flash_rt_kernels PRIVATE $<TARGET_OBJECTS:cutlass_sm100_fp16_sweep_obj>)
+    target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_SM100_SWEEP=1)
+  endif()
+  if(FLASHRT_BUILD_SM100_ENCODER_MLP)
+    target_sources(flash_rt_kernels PRIVATE $<TARGET_OBJECTS:encoder_mlp_sm100_obj>)
+    target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_SM100_ENCODER_MLP=1)
+  endif()
 endif()
 
 if(ENABLE_NVFP4)

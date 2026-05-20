@@ -65,10 +65,10 @@ class CollectiveEpilogue {
 #include "cutlass/epilogue/collective/sm90_epilogue_tma_warpspecialized.hpp"
 #include "cutlass/epilogue/collective/sm90_epilogue_tma_warpspecialized_bias_elementwise.hpp"
 #include "cutlass/epilogue/collective/sm90_epilogue_array_tma_warpspecialized.hpp"
-#include "cutlass/epilogue/collective/sm100_epilogue_nosmem.hpp"  
-#include "cutlass/epilogue/collective/sm100_epilogue_array_nosmem.hpp"  
-#include "cutlass/epilogue/collective/sm100_epilogue_tma_warpspecialized.hpp" 
-#include "cutlass/epilogue/collective/sm100_epilogue_array_tma_warpspecialized.hpp" 
+#include "cutlass/epilogue/collective/sm100_epilogue_nosmem.hpp"
+#include "cutlass/epilogue/collective/sm100_epilogue_array_nosmem.hpp"
+#include "cutlass/epilogue/collective/sm100_epilogue_tma_warpspecialized.hpp"
+#include "cutlass/epilogue/collective/sm100_epilogue_array_tma_warpspecialized.hpp"
 //
 // Conv
 //

@@ -42,6 +42,7 @@ NOT in scope (live elsewhere):
 """
 
 import math
+import os
 import numpy as np
 
 
@@ -292,20 +293,25 @@ def _encoder_forward_fp16(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None
     fg = bufs['fg']
     ones = bufs['ones']
 
+    # Kernel-dispatch env switches, read once per call so graph capture sees
+    # a fixed path. SKIP_LAST_QKV is kept off by default: setting it to 1 was
+    # tested 2026-05-18 and showed inconsistent (sometimes reversed) timing,
+    # suggesting it also affects downstream output via the decoder's K/V cache.
+    skip_last_qkv = os.environ.get("SKIP_LAST_QKV", "0") == "1"
+    qkv_kernel = os.environ.get("QKV_KERNEL", "k64")
+    use_rms_qkv_bundle = os.environ.get("USE_RMS_QKV_BUNDLE", "1") == "1"
+    enc_path = os.environ.get("ENC_PATH", "head")
+    use_ffn_block = os.environ.get("USE_FFN_BLOCK", "0") == "1"
+    o_kernel = os.environ.get("O_KERNEL", "plain")
+    g8_kernel = os.environ.get("G8_KERNEL", "bundled")
+
     for l in range(L):
         last = (l == L - 1)
-        import os as _os
 
-        # NOTE: last-layer QKV writes K/V cache that the DECODER reads via
-        # cross-attention.  Do NOT skip even though the encoder-side
-        # consumer is gated off — SKIP_LAST_QKV=1 was tested 2026-05-18 and
-        # showed inconsistent (sometimes reversed) timing, suggesting it
-        # also affects downstream output.  Default 0 (run as-is) for
-        # correctness; the env switch is kept for future re-verification.
-        if not last or _os.environ.get("SKIP_LAST_QKV", "0") != "1":
+        if not last or not skip_last_qkv:
             # 1+2. RMSNorm + QKV (k64) — env-switchable bundle.
-            _qkv = _os.environ.get("QKV_KERNEL", "k64")
-            if _os.environ.get("USE_RMS_QKV_BUNDLE", "1") == "1" and _qkv == "k64":
+            _qkv = qkv_kernel
+            if use_rms_qkv_bundle and _qkv == "k64":
                 fvk.flashrt_rms_qkv_fp16(
                     x, ones, x_norm,
                     weights['qkv_w'][l], qkv,
@@ -343,10 +349,8 @@ def _encoder_forward_fp16(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None
             # + separate residual_add (pre-MK-1 baseline).  Default "head"
             # is MK-1 mega + A (G8 resid fuse) + D (O resid fuse) + F-2
             # bundled entry.
-            import os as _os
-            _enc_path = _os.environ.get("ENC_PATH", "head")
             up_w_ptr = weights['gate_w'][l] + H * D * 2
-            if _enc_path == "pre_mk1":
+            if enc_path == "pre_mk1":
                 # 6. O proj (no resid fuse)
                 fvk.cutlass_fp16_k64(attn_out, weights['o_w'][l], fg,
                                       Se, D, D, 1.0, 0.0, stream)
@@ -374,8 +378,8 @@ def _encoder_forward_fp16(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None
                 # USE_FFN_BLOCK=1: bundle rms+mega+G8 in one C entry
                 # (flashrt_encoder_ffn_block_fp16).  Default 0 = current
                 # head with rms separate and mega+G8 bundled.
-                _ffn_bundle = _os.environ.get("USE_FFN_BLOCK", "0") == "1"
-                _o = _os.environ.get("O_KERNEL", "plain")
+                _ffn_bundle = use_ffn_block
+                _o = o_kernel
                 if _o == "sq":
                     fvk.cutlass_fp16_sq   (attn_out, weights['o_w'][l], x, Se, D, D, 1.0, 1.0, stream)
                 elif _o == "wide":
@@ -399,7 +403,7 @@ def _encoder_forward_fp16(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None
                 # issued separately.  G8 kernel choice via env (bundled
                 # entry always uses 2sm21 internally; G8_KERNEL switches
                 # to unbundled python path with a different kernel).
-                _g8 = _os.environ.get("G8_KERNEL", "bundled")
+                _g8 = g8_kernel
                 if _g8 == "bundled":
                     fvk.flashrt_megakernel_geglu_g8_fp16(
                         x_norm, weights['gate_w'][l], up_w_ptr,

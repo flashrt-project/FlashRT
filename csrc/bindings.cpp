@@ -286,9 +286,11 @@ extern "C" int cutlass_fp16_2sm21(void*, void*, void*, int, int, int, float, flo
 extern "C" int cutlass_fp16_k64_gelu(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp16_sq_gelu(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp16_k64_mul_aux(void*, void*, void*, void*, int, int, int, cudaStream_t);
+#ifdef FLASHRT_HAVE_SM100_ENCODER_MLP
 extern "C" int encoder_mlp_fused_fp16(void*, void*, void*, void*,
                                        void*, void*, void*, void*,
                                        int, int, int, int, cudaStream_t);
+#endif
 extern "C" int flashrt_megakernel_single_fp16(void*, void*, void*,
                                                int, int, int,
                                                float, float, cudaStream_t);
@@ -296,18 +298,17 @@ extern "C" int flashrt_megakernel_geglu_fp16(void*, void*, void*,
                                               void*, void*,
                                               int, int, int,
                                               cudaStream_t);
-// (Stage B-v2 signature: X, W_gate, W_up, D_gate_scratch, hidden, M, N, K, stream)
-// MK-2 fused entry: (X, W_gate, W_up, W_down, hidden_scratch, x_inout, M, H, D, stream)
-// Computes x_inout += GeGLU(X @ W_gate, X @ W_up) @ W_down.
-// F-2: bundles MK-1 mega + 2sm21(beta=1) internally (two launches).
-// F-3+: replaces with a single persistent-CTA fused kernel.
+// Fused encoder GeGLU + down-proj with residual.
+// Args: (X, W_gate, W_up, W_down, hidden_scratch, x_inout, M, H, D, stream).
+// Computes x_inout += GeGLU(X @ W_gate, X @ W_up) @ W_down, bundling the
+// GeGLU megakernel and the down GEMM (beta=1) into one C entry.
 extern "C" int flashrt_megakernel_geglu_g8_fp16(void*, void*, void*,
                                                  void*,
                                                  void*, void*,
                                                  int, int, int,
                                                  cudaStream_t);
 
-// MK-2 F-3 bundle: rms_norm + mega + G8 + resid into one C entry.
+// Bundle: rms_norm + GeGLU + down-proj + residual into one C entry.
 extern "C" int flashrt_encoder_ffn_block_fp16(void*, void*, void*,
                                                void*, void*, void*,
                                                void*, void*,
@@ -317,8 +318,10 @@ extern "C" int flashrt_encoder_ffn_block_fp16(void*, void*, void*,
 // Bundle: rms_norm + QKV (k64) into one C entry.
 extern "C" int flashrt_rms_qkv_fp16(void*, void*, void*, void*, void*,
                                      int, int, int, float, cudaStream_t);
+#ifdef FLASHRT_HAVE_SM100_SWEEP
 extern "C" int cutlass_fp16_sweep(int variant, void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp16_sweep_count();
+#endif
 extern "C" int cutlass_fp8_plain(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp8_gelu(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp8_sq_f32out(void*, void*, void*, int, int, int, float, float, cudaStream_t);
@@ -1508,12 +1511,9 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
           py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f,
           py::arg("stream") = 0);
 
-    // MK-1 megakernel (Stage A.1).  Two-phase chain: one kernel launch
-    // computes D_gate = GELU(X @ W_gate) AND D_up = X @ W_up.  Both
-    // sub-GEMMs share one tcgen05.alloc; per-CTA work tile runs phase1
-    // then phase2 in series via a single AccumulatorPipeline.  Stage B
-    // (SMEM_gate routing) will fold the GeGLU multiply into the kernel.
-    // Plan: megakernel_dev/notes/MK1_DESIGN_V2.md.
+    // GeGLU megakernel: one launch computes hidden = GELU(X @ W_gate) * (X @ W_up).
+    // The two sub-GEMMs share one tcgen05.alloc; each CTA work tile runs the
+    // gate GEMM then the up GEMM in series via a single AccumulatorPipeline.
     m.def("flashrt_megakernel_geglu_fp16",
           [](uintptr_t X, uintptr_t W_gate, uintptr_t W_up,
              uintptr_t D_gate_scratch, uintptr_t hidden,
@@ -1528,9 +1528,8 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
           py::arg("M"), py::arg("N"), py::arg("K"),
           py::arg("stream") = 0);
 
-    // MK-2 fused GeGLU + G8 + resid.  F-2 bundles two launches inside
-    // the .cu entry; F-3+ folds them into one persistent-CTA kernel.
-    // Plan: megakernel_dev/notes/MK2_DESIGN.md.
+    // Fused GeGLU + down-proj with residual: the GeGLU megakernel and the
+    // down GEMM (beta=1) are bundled inside one .cu entry (two launches).
     m.def("flashrt_megakernel_geglu_g8_fp16",
           [](uintptr_t X, uintptr_t W_gate, uintptr_t W_up,
              uintptr_t W_down,
@@ -1563,7 +1562,8 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
           py::arg("M"), py::arg("D"), py::arg("N_qkv"),
           py::arg("rms_eps") = 1e-6f, py::arg("stream") = 0);
 
-    // MK-2 F-3: bundled FFN block — rms_norm + mega + G8 + resid in one C.
+    // Bundled FFN block: rms_norm + GeGLU megakernel + down-proj + residual
+    // in one C entry.
     m.def("flashrt_encoder_ffn_block_fp16",
           [](uintptr_t x_resid, uintptr_t rms_weight, uintptr_t x_norm,
              uintptr_t W_gate, uintptr_t W_up, uintptr_t W_down,
@@ -1581,8 +1581,9 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
           py::arg("M"), py::arg("H"), py::arg("D"),
           py::arg("rms_eps") = 1e-6f, py::arg("stream") = 0);
 
-    // Path C encoder MLP megakernel (currently a 3-step fallback;
-    // real SMEM-staged kernel TBD in future sessions).
+#ifdef FLASHRT_HAVE_SM100_ENCODER_MLP
+    // Path C encoder MLP megakernel scaffold (WIP, off by default; built only
+    // with -DFLASHRT_BUILD_SM100_ENCODER_MLP=ON).
     m.def("encoder_mlp_fused_fp16",
           [](uintptr_t X, uintptr_t W_gate, uintptr_t W_up, uintptr_t W_down,
              uintptr_t gate_buf, uintptr_t up_buf, uintptr_t hid_buf, uintptr_t out,
@@ -1596,8 +1597,11 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
           py::arg("gate_buf"), py::arg("up_buf"), py::arg("hid_buf"), py::arg("out"),
           py::arg("M"), py::arg("N_out"), py::arg("K"), py::arg("H"),
           py::arg("stream") = 0);
+#endif
 
-    // R1.1 tile-sweep dispatch (transient; remove once winner is promoted).
+#ifdef FLASHRT_HAVE_SM100_SWEEP
+    // FP16 tile-sweep bench dispatch (off by default; built only with
+    // -DFLASHRT_BUILD_SM100_SWEEP=ON).
     m.def("cutlass_fp16_sweep", [](int variant, uintptr_t A, uintptr_t B, uintptr_t D,
                                     int M, int N, int K, float alpha, float beta, uintptr_t stream) {
         return cutlass_fp16_sweep(variant, to_ptr(A), to_ptr(B), to_ptr(D),
@@ -1606,6 +1610,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("M"), py::arg("N"), py::arg("K"),
        py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
     m.def("cutlass_fp16_sweep_count", []() { return cutlass_fp16_sweep_count(); });
+#endif
 
     // FP32 output variants — for models with activations exceeding FP16 range
     m.def("cutlass_fp8_sq_f32out", [](uintptr_t A, uintptr_t B, uintptr_t D,

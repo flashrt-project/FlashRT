@@ -2,15 +2,15 @@
 // FlashRT — CUTLASS FP16 GEMM TILE SWEEP (transient infrastructure)
 //
 // Provides ~8 tile/cluster/schedule variants in a single dispatch
-// entry point.  Used by megakernel_dev/bench/r1_tile_sweep.py to
-// find the best CUTLASS configuration per encoder GEMM shape.
+// entry point, used to find the best CUTLASS configuration per encoder
+// GEMM shape.  Developer-only: built behind -DFLASHRT_BUILD_SM100_SWEEP=ON.
 //
 // Layout matches cutlass_sm100_fp16.cu:
 //   A row-major (M, K), B column-major (K, N) stored as [N, K]
 //   row-major, D row-major (M, N).  FP16 in/out, FP32 accumulate.
 //
-// After R1.1 sweep concludes, the winning variant should be
-// promoted into gemm_types_sm100_fp16.h and this file deleted.
+// Once the sweep concludes, the winning variant should be promoted
+// into gemm_types_sm100_fp16.h and this file deleted.
 // ================================================================
 
 #include "cutlass/cutlass.h"

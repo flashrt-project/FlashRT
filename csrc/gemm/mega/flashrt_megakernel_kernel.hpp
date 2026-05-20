@@ -248,7 +248,7 @@ public:
     MainloopParams mainloop{};
     EpilogueParams epilogue{};
     TileSchedulerParams scheduler{};
-    KernelHardwareInfo hw_info{}; 
+    KernelHardwareInfo hw_info{};
   };
 
   enum class WarpCategory : int32_t {
@@ -335,7 +335,7 @@ public:
       implementable &= size(args.hw_info.cluster_shape_fallback) <= MaxClusterSize;
       implementable &= cutlass::detail::preferred_cluster_can_implement<AtomThrShapeMNK>(args.hw_info.cluster_shape, args.hw_info.cluster_shape_fallback);
     }
-    
+
     constexpr bool IsBlockscaled = !cute::is_void_v<ElementSF>;
     if constexpr (IsBlockscaled) {
       if constexpr (IsDynamicCluster) {

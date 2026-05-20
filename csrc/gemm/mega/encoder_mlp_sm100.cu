@@ -2,14 +2,11 @@
 // FlashRT — Path C megakernel: encoder MLP fused (G7+GeGLU+G8)
 // on a single SM100 kernel without materializing the hidden tensor.
 //
-// Status: SCAFFOLD ONLY.  This first commit lands the extern C
-// signature, the build wiring, and a *fallback* implementation that
-// calls the existing 3-step path (sq_gelu + sq + mul_fp16 + 2sm21).
-// The fallback exists so that integration tests and bindings can be
-// exercised end-to-end while the real kernel is still being written.
-//
-// Replacing the fallback is the main goal of subsequent sessions.
-// See megakernel_dev/notes/PATH_C_DESIGN.md for the architectural plan.
+// Status: WIP scaffold, not wired into the runtime. The current body is
+// a fallback that calls the existing 3-step path (sq_gelu + sq +
+// mul_fp16 + 2sm21); the single-kernel SMEM/tmem-staged version is not
+// implemented yet. Built only behind -DFLASHRT_BUILD_SM100_ENCODER_MLP=ON
+// so production flash_rt_kernels neither compiles nor exports it.
 //
 // Why Path C is the next step:
 // - Tile-sweep + epilogue-activation fusion already pushed FP16 3v
@@ -104,8 +101,7 @@ extern "C" int encoder_mlp_fused_fp16(
 }
 
 // ================================================================
-// Implementation roadmap (must follow this approach — see
-// megakernel_dev/notes/PATH_C_DESIGN.md for full rationale)
+// Implementation roadmap
 // ================================================================
 //
 // CORRECT approach: reuse production CUTLASS CollectiveMma by calling

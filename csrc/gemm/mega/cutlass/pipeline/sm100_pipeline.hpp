@@ -67,7 +67,7 @@ uint16_t calculate_multicast_mask(ClusterShape cluster_shape, AtomThrShape_MNK a
       return (y/size<1>(atom_thr_shape) == block_id_in_cluster.y/size<1>(atom_thr_shape));  // is same MMA cluster col
     }
   };
-  
+
   uint16_t block_id_mask = 0;
   auto cluster_layout = make_layout(cluster_shape);
   // When MMA_2x1SM instructions are used, the definition of "same row" changes.
@@ -160,9 +160,9 @@ public:
     }
   }
 
-  // Constructor by default initializes barriers and calculates masks. 
-  // These operations can be explicity deferred by specifying InitBarriers and InitMasks. 
-  // If deferred, user code needs to guarantee init_masks and/or init_barriers is/are called. 
+  // Constructor by default initializes barriers and calculates masks.
+  // These operations can be explicity deferred by specifying InitBarriers and InitMasks.
+  // If deferred, user code needs to guarantee init_masks and/or init_barriers is/are called.
   template<class ClusterShape, class InitBarriers = cute::true_type, class InitMasks = cute::true_type>
   CUTLASS_DEVICE
   PipelineUmmaAsync(SharedStorage& storage, Params params, ClusterShape cluster_shape, InitBarriers = {}, InitMasks = {})
@@ -431,7 +431,7 @@ public:
   template <class ClusterShape>
   CUTLASS_DEVICE
   bool is_same_row(int dst_block_id, dim3 block_id, ClusterShape cluster_shape) {
-    return (((dst_block_id % cute::size<0>(cluster_shape)) == block_id.x) 
+    return (((dst_block_id % cute::size<0>(cluster_shape)) == block_id.x)
               // If we are in the same cluster column and using 2CTA MMA, only odd or only even CTAs sync with each other
                  && ((dst_block_id % cute::size<0>(cluster_shape)) % cute::size<0>(AtomThrShape_MNK{}) ==
                       block_id.x % cute::size<0>(AtomThrShape_MNK{}))
@@ -622,9 +622,9 @@ public:
     }
   }
 
-  // Constructor by default initializes barriers and calculates masks. 
-  // These operations can be explicity deferred by specifying InitBarriers and InitMasks. 
-  // If deferred, user code needs to guarantee init_masks and/or init_barriers is/are called. 
+  // Constructor by default initializes barriers and calculates masks.
+  // These operations can be explicity deferred by specifying InitBarriers and InitMasks.
+  // If deferred, user code needs to guarantee init_masks and/or init_barriers is/are called.
   template<typename InitBarriers = cute::true_type, typename InitMasks = cute::true_type>
   CUTLASS_DEVICE
   PipelineTmaUmmaAsync(SharedStorage& storage, Params params, ClusterShape cluster_shape, InitBarriers = {}, InitMasks = {})
@@ -796,9 +796,9 @@ public:
     }
   }
 
-  // Constructor by default initializes barriers and calculates masks. 
-  // These operations can be explicity deferred by specifying InitBarriers and InitMasks. 
-  // If deferred, user code needs to guarantee init_masks and/or init_barriers is/are called. 
+  // Constructor by default initializes barriers and calculates masks.
+  // These operations can be explicity deferred by specifying InitBarriers and InitMasks.
+  // If deferred, user code needs to guarantee init_masks and/or init_barriers is/are called.
   template<class ClusterShape, class InitBarriers = cute::true_type, class InitMasks = cute::true_type>
   CUTLASS_DEVICE
   PipelineUmmaConsumerAsync(SharedStorage& storage, Params params, ClusterShape cluster_shape, InitBarriers = {}, InitMasks = {})
@@ -1221,9 +1221,9 @@ public:
     impl_.init_masks(cluster_shape, block_id_in_cluster);
   }
 
-  // Constructor by default initializes barriers and calculates masks. 
-  // These operations can be deferred by specifying InitBarriers and InitMasks. 
-  // If deferred, user code needs to guarantee init_masks and/or init_barriers is/are called. 
+  // Constructor by default initializes barriers and calculates masks.
+  // These operations can be deferred by specifying InitBarriers and InitMasks.
+  // If deferred, user code needs to guarantee init_masks and/or init_barriers is/are called.
   template<typename InitBarriers = cute::true_type, typename InitMasks = cute::true_type>
   CUTLASS_DEVICE
   PipelineTmaSparseUmmaAsync(SharedStorage& storage, Params params, ParamsMetadata params_metadata, ClusterShape cluster_shape, InitBarriers = {}, InitMasks = {})

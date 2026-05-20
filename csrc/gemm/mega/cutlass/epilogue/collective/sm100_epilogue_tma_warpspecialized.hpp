@@ -138,7 +138,7 @@ private:
   constexpr static int StagesD = StagesD_;
   static_assert(StagesC >= 1, "StagesC must be >= 1");
   static_assert(StagesD >= 1, "StagesD must be >= 1");
-  
+
   constexpr static bool ReuseSmemC = ReuseSmemC_;
   constexpr static bool is_source_supported = not cute::is_void_v<ElementC>;
 
@@ -280,7 +280,7 @@ private:
                                   make_layout(problem_shape_mnl, append<3>(args.dD, _0{})));
     return make_tma_copy(CopyOpS2G{}, tensor_d, SmemLayoutStageD{}, TmaEpilogueTile{}, _1{});
   }
-  
+
 public:
   // Device side epilogue params
   struct Params {
@@ -326,7 +326,7 @@ public:
 
   template <class ProblemShape>
   static cutlass::Status
-  initialize_workspace(ProblemShape const& problem_shape, Arguments const& args, void* workspace, cudaStream_t stream, 
+  initialize_workspace(ProblemShape const& problem_shape, Arguments const& args, void* workspace, cudaStream_t stream,
       CudaHostAdapter* cuda_adapter = nullptr) {
     return FusionCallbacks::initialize_workspace(problem_shape, args.thread, workspace, stream, cuda_adapter);
   }
@@ -772,22 +772,22 @@ public:
         if (issue_tma_store) {
           copy(params.tma_store_d, bSG_sD(_,_,_,store_pipe_producer_state.index()), bSG_gD(_,_,_,epi_m,epi_n));
         }
-  
+
         // Post async fence, pre TMA commit callback entry point
         cst_callbacks.tma_store(epi_m, epi_n, store_pipe_producer_state.count(), issue_tma_store);
-  
+
         // Commit the TMA stores for this stage
         if (issue_tma_store) {
           store_pipeline.producer_commit(store_pipe_producer_state);
         }
         ++store_pipe_producer_state;
-  
+
         // Wait for the next smem buffer to be available
         if (issue_tma_store) {
           store_pipeline.producer_acquire(store_pipe_producer_state);
         }
         synchronize();
-  
+
         if constexpr (ReuseSmemC) {
           // producer_acquire returns when at most StagesD-1 committed stores are pending
           bool store_finished = store_pipe_producer_state.count() > StorePipeline::UnacquiredStages;
@@ -1211,7 +1211,7 @@ public:
         }
 
         Tensor tTR_rAcc_epi_tile = tTR_rAcc(_,_,_,epi_m,epi_n);
-        Tensor tTR_rAcc_frg = recast<Array<ElementAccumulator, FragmentSize>>(coalesce(tTR_rAcc_epi_tile));     // (EPI_V)        
+        Tensor tTR_rAcc_frg = recast<Array<ElementAccumulator, FragmentSize>>(coalesce(tTR_rAcc_epi_tile));     // (EPI_V)
 
         // Vectorized fragment loop with visitor callback entry point
         CUTLASS_PRAGMA_UNROLL
