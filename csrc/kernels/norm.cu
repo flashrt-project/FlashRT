@@ -332,6 +332,15 @@ void ada_rms_norm_style(const __nv_bfloat16* x, const __nv_bfloat16* weight,
         x, weight, style, out, gate_out, dim, eps);
 }
 
+void ada_rms_norm_style_fp16(const __half* x, const __half* weight,
+                             const __half* style,
+                             __half* out, __half* gate_out,
+                             int seq_len, int dim, float eps,
+                             cudaStream_t stream) {
+    ada_rms_norm_style_kernel<__half><<<seq_len, 256, 256 * sizeof(float), stream>>>(
+        x, weight, style, out, gate_out, dim, eps);
+}
+
 // ── RMSNorm → FP8 ──
 template<typename T>
 __global__ void rms_norm_fp8_kernel(const T* __restrict__ x,

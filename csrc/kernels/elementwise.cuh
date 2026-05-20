@@ -267,6 +267,10 @@ void bias_residual_fp16(__half* residual, const __half* x,
                         const __half* bias, int seq_len, int dim,
                         cudaStream_t stream = 0);
 
+void bias_residual_strict_fp16(__half* residual, const __half* x,
+                               const __half* bias, int seq_len, int dim,
+                               cudaStream_t stream = 0);
+
 // G6.7: residual += (x + bias) * gate, in-place
 void bias_gate_mul_residual_bf16(__nv_bfloat16* residual,
                                  const __nv_bfloat16* x,
