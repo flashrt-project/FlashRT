@@ -51,6 +51,8 @@ def load_model(
     cache_frames: int | None = None,
     # Frontends with an FP8/BF16 switch:
     use_fp8: bool = True,
+    # Pi0.5 torch RTX SM120 opt-in:
+    use_fp16: bool = False,
 ) -> VLAModel
 ```
 
@@ -69,6 +71,10 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   `cache_frames >= 1`.
 - `use_fp8=False` disables FP8 where the selected frontend exposes a
   BF16 fallback; unsupported frontends ignore it.
+- `use_fp16=True` selects the opt-in Pi0.5 torch RTX SM120 full-FP16
+  CUDA Graph path. It requires `use_fp8=False` and is currently valid
+  only for `config="pi05"`, `framework="torch"`, and
+  `hardware="rtx_sm120"`.
 - `config="motus"` is a beta RTX SM120 frontend. It expects a Motus
   checkpoint plus Wan and VLM checkpoint paths supplied to the Motus
   quickstart/frontend; see `docs/motus_usage_beta.md`.

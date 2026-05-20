@@ -68,6 +68,12 @@ void ada_rms_norm_style(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                         int seq_len, int dim, float eps,
                         cudaStream_t stream = 0);
 
+void ada_rms_norm_style_fp16(const __half* x, const __half* weight,
+                             const __half* style,
+                             __half* out, __half* gate_out,
+                             int seq_len, int dim, float eps,
+                             cudaStream_t stream = 0);
+
 // ── Fused Norm → FP8 (with scale) ──
 
 void rms_norm_fp8_fp16(const __half* x, const __half* weight,
@@ -167,4 +173,11 @@ void bias_residual_layer_norm_bf16(
         const __nv_bfloat16* bias_pre,
         const __nv_bfloat16* ln_weight, const __nv_bfloat16* ln_bias,
         __nv_bfloat16* out, int seq_len, int dim, float eps,
+        cudaStream_t stream = 0);
+
+void bias_residual_layer_norm_fp16(
+        __half* residual, const __half* x,
+        const __half* bias_pre,
+        const __half* ln_weight, const __half* ln_bias,
+        __half* out, int seq_len, int dim, float eps,
         cudaStream_t stream = 0);

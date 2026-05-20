@@ -444,6 +444,12 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
             self.autotune_bf16_nn(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, num_algos);
         }, py::arg("A"), py::arg("B"), py::arg("D"),
            py::arg("M"), py::arg("N"), py::arg("K"), py::arg("num_algos") = 16)
+        .def("autotune_fp16_nn", [](GemmRunner& self,
+                                     uintptr_t A, uintptr_t B, uintptr_t D,
+                                     int M, int N, int K, int num_algos) {
+            self.autotune_fp16_nn(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, num_algos);
+        }, py::arg("A"), py::arg("B"), py::arg("D"),
+           py::arg("M"), py::arg("N"), py::arg("K"), py::arg("num_algos") = 16)
         .def("autotune_fp8_nn_dev", [](GemmRunner& self,
                                         uintptr_t A, uintptr_t B, uintptr_t D,
                                         int M, int N, int K,
@@ -715,6 +721,25 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("style"), py::arg("out"), py::arg("gate_out"),
        py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f,
        py::arg("d_scale") = 0, py::arg("stream") = 0);
+
+    m.def("gate_residual_ada_norm_fp16", [](uintptr_t residual, uintptr_t x,
+                                             uintptr_t gate, uintptr_t weight,
+                                             uintptr_t style,
+                                             uintptr_t out, uintptr_t gate_out,
+                                             int seq_len, int dim, float eps,
+                                             uintptr_t stream) {
+        gate_residual_ada_norm_fp16(reinterpret_cast<__half*>(residual),
+                                     reinterpret_cast<const __half*>(x),
+                                     reinterpret_cast<const __half*>(gate),
+                                     reinterpret_cast<const __half*>(weight),
+                                     reinterpret_cast<const __half*>(style),
+                                     reinterpret_cast<__half*>(out),
+                                     reinterpret_cast<__half*>(gate_out),
+                                     seq_len, dim, eps, to_stream(stream));
+    }, py::arg("residual"), py::arg("x"), py::arg("gate"), py::arg("weight"),
+       py::arg("style"), py::arg("out"), py::arg("gate_out"),
+       py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f,
+       py::arg("stream") = 0);
 
     // Quantize
     m.def("quantize_fp8", [](uintptr_t input, uintptr_t output,
@@ -1041,6 +1066,22 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("out"),
        py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f, py::arg("stream") = 0);
 
+    m.def("ada_rms_norm_style_fp16",
+          [](uintptr_t x, uintptr_t weight, uintptr_t style,
+             uintptr_t out, uintptr_t gate_out,
+             int seq_len, int dim, float eps, uintptr_t stream) {
+        ada_rms_norm_style_fp16(
+            reinterpret_cast<const __half*>(x),
+            reinterpret_cast<const __half*>(weight),
+            reinterpret_cast<const __half*>(style),
+            reinterpret_cast<__half*>(out),
+            reinterpret_cast<__half*>(gate_out),
+            seq_len, dim, eps, to_stream(stream));
+    }, py::arg("x"), py::arg("weight"), py::arg("style"),
+       py::arg("out"), py::arg("gate_out"),
+       py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f,
+       py::arg("stream") = 0);
+
     m.def("layer_norm_fp8", [](uintptr_t x, uintptr_t out, uintptr_t gamma, uintptr_t beta,
                                 int seq_len, int dim, float eps, uintptr_t stream) {
         layer_norm_fp8(reinterpret_cast<const __half*>(x), reinterpret_cast<__nv_fp8_e4m3*>(out),
@@ -1073,10 +1114,49 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("residual"), py::arg("x"), py::arg("bias"),
        py::arg("seq_len"), py::arg("dim"), py::arg("stream") = 0);
 
+    m.def("bias_residual_strict_fp16",
+          [](uintptr_t residual, uintptr_t x, uintptr_t bias,
+             int seq_len, int dim, uintptr_t stream) {
+        bias_residual_strict_fp16(
+            reinterpret_cast<__half*>(residual),
+            reinterpret_cast<const __half*>(x),
+            reinterpret_cast<const __half*>(bias),
+            seq_len, dim, to_stream(stream));
+    }, py::arg("residual"), py::arg("x"), py::arg("bias"),
+       py::arg("seq_len"), py::arg("dim"), py::arg("stream") = 0);
+
+    m.def("bias_residual_layer_norm_fp16",
+          [](uintptr_t residual, uintptr_t x, uintptr_t bias_pre,
+             uintptr_t ln_weight, uintptr_t ln_bias, uintptr_t out,
+             int seq_len, int dim, float eps, uintptr_t stream) {
+        bias_residual_layer_norm_fp16(
+            reinterpret_cast<__half*>(residual),
+            reinterpret_cast<const __half*>(x),
+            reinterpret_cast<const __half*>(bias_pre),
+            reinterpret_cast<const __half*>(ln_weight),
+            reinterpret_cast<const __half*>(ln_bias),
+            reinterpret_cast<__half*>(out),
+            seq_len, dim, eps, to_stream(stream));
+    }, py::arg("residual"), py::arg("x"), py::arg("bias_pre"),
+       py::arg("ln_weight"), py::arg("ln_bias"), py::arg("out"),
+       py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f,
+       py::arg("stream") = 0);
+
     m.def("residual_add_fp16", [](uintptr_t residual, uintptr_t x, int n, uintptr_t stream) {
         residual_add_fp16(reinterpret_cast<__half*>(residual), reinterpret_cast<const __half*>(x),
                            n, to_stream(stream));
     }, py::arg("residual"), py::arg("x"), py::arg("n"), py::arg("stream") = 0);
+
+    m.def("gate_mul_residual_fp16",
+          [](uintptr_t residual, uintptr_t x, uintptr_t gate,
+             int n, uintptr_t stream) {
+        gate_mul_residual_fp16(
+            reinterpret_cast<__half*>(residual),
+            reinterpret_cast<const __half*>(x),
+            reinterpret_cast<const __half*>(gate),
+            n, to_stream(stream));
+    }, py::arg("residual"), py::arg("x"), py::arg("gate"),
+       py::arg("n"), py::arg("stream") = 0);
 
     m.def("cfg_combine_into_residual_fp16",
           [](uintptr_t residual, uintptr_t v_cond, uintptr_t v_uncond,
@@ -1092,6 +1172,16 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     m.def("gelu_inplace_fp16", [](uintptr_t x, int n, uintptr_t stream) {
         gelu_inplace_fp16(reinterpret_cast<__half*>(x), n, to_stream(stream));
     }, py::arg("x"), py::arg("n"), py::arg("stream") = 0);
+
+    m.def("bias_gelu_fp16_strict", [](uintptr_t x, uintptr_t bias,
+                                       int seq_len, int dim, uintptr_t stream) {
+        cudaStream_t s = to_stream(stream);
+        add_bias_fp16(reinterpret_cast<__half*>(x),
+                      reinterpret_cast<const __half*>(bias),
+                      seq_len, dim, s);
+        gelu_inplace_fp16(reinterpret_cast<__half*>(x), seq_len * dim, s);
+    }, py::arg("x"), py::arg("bias"), py::arg("seq_len"), py::arg("dim"),
+       py::arg("stream") = 0);
 
     m.def("gate_geglu_merged_fp16", [](uintptr_t merged, uintptr_t out,
                                         int seq, int half_dim, uintptr_t stream) {

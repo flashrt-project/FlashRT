@@ -215,6 +215,33 @@ void bias_residual_fp16(__half* residual, const __half* x,
     bias_res_kernel<__half><<<seq_len, 256, 0, stream>>>(residual, x, bias, dim);
 }
 
+__global__ void bias_res_strict_fp16_kernel(__half* __restrict__ residual,
+                                            const __half* __restrict__ x,
+                                            const __half* __restrict__ bias,
+                                            int dim) {
+    using T2 = typename packed2<__half>::type;
+    int row = blockIdx.x;
+    T2* res2 = reinterpret_cast<T2*>(residual + row * dim);
+    const T2* x2 = reinterpret_cast<const T2*>(x + row * dim);
+    const T2* b2 = reinterpret_cast<const T2*>(bias);
+    int dim2 = dim >> 1;
+    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+        T2 rv = res2[i], xv = x2[i], bv = b2[i];
+        __half xb0 = from_f32<__half>(to_f32(xv.x) + to_f32(bv.x));
+        __half xb1 = from_f32<__half>(to_f32(xv.y) + to_f32(bv.y));
+        res2[i] = make_packed2<__half>(
+            from_f32<__half>(to_f32(rv.x) + to_f32(xb0)),
+            from_f32<__half>(to_f32(rv.y) + to_f32(xb1)));
+    }
+}
+
+void bias_residual_strict_fp16(__half* residual, const __half* x,
+                               const __half* bias, int seq_len, int dim,
+                               cudaStream_t stream) {
+    bias_res_strict_fp16_kernel<<<seq_len, 256, 0, stream>>>(
+        residual, x, bias, dim);
+}
+
 template<typename T>
 __global__ void bias_res_out_kernel(const T* __restrict__ residual,
                                     const T* __restrict__ x,

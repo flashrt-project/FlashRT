@@ -211,6 +211,12 @@ void GemmRunner::autotune_bf16_nn(void* A, void* B, void* D,
     autotune_cached(entry, A, B, D, 1.0f, 0.0f, num_algos);
 }
 
+void GemmRunner::autotune_fp16_nn(void* A, void* B, void* D,
+                                   int M, int N, int K, int num_algos) {
+    auto& entry = get_or_create_cached(FP16_NN, M, N, K);
+    autotune_cached(entry, A, B, D, 1.0f, 0.0f, num_algos);
+}
+
 void GemmRunner::autotune_fp8_nn_dev(void* A, void* B, void* D,
                                       int M, int N, int K,
                                       float* d_scale_a, float* d_scale_b,

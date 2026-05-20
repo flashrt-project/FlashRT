@@ -167,6 +167,8 @@ public:
     // Call before CUDA Graph capture. Uses dummy data at the provided pointers.
     void autotune_bf16_nn(void* A, void* B, void* D,
                           int M, int N, int K, int num_algos = 16);
+    void autotune_fp16_nn(void* A, void* B, void* D,
+                          int M, int N, int K, int num_algos = 16);
     void autotune_fp8_nn_dev(void* A, void* B, void* D,
                              int M, int N, int K,
                              float* d_scale_a, float* d_scale_b,

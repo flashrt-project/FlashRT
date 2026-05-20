@@ -89,6 +89,70 @@ void gate_residual_ada_norm_fp8_fp16(__half* residual, const __half* x,
         residual, x, gate, weight, style, out, gate_out, dim, eps, d_scale);
 }
 
+// ── Fused Gate*Residual + AdaRMSNorm + Style -> FP16 ──
+// Same math as gate_mul_residual_fp16 + ada_rms_norm_style_fp16, but
+// keeps the residual update and RMS reduction in one launch.
+__global__ void gate_residual_ada_norm_fp16_kernel(
+    __half* __restrict__ residual,
+    const __half* __restrict__ x,
+    const __half* __restrict__ gate,
+    const __half* __restrict__ weight,
+    const __half* __restrict__ style,
+    __half* __restrict__ out,
+    __half* __restrict__ gate_out,
+    int dim, float eps) {
+    using T2 = typename packed2<__half>::type;
+    int row = blockIdx.x;
+    T2* res2 = reinterpret_cast<T2*>(residual + row * dim);
+    const T2* x2 = reinterpret_cast<const T2*>(x + row * dim);
+    const T2* g2 = reinterpret_cast<const T2*>(gate + row * dim);
+    const T2* w2 = reinterpret_cast<const T2*>(weight);
+    const __half* style_row = style + row * 3 * dim;
+    const T2* sc2 = reinterpret_cast<const T2*>(style_row);
+    const T2* sh2 = reinterpret_cast<const T2*>(style_row + dim);
+    const T2* gt2 = reinterpret_cast<const T2*>(style_row + 2 * dim);
+    T2* out2 = reinterpret_cast<T2*>(out + row * dim);
+    T2* gate_out2 = reinterpret_cast<T2*>(gate_out + row * dim);
+    int dim2 = dim >> 1;
+
+    extern __shared__ float shared[];
+
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+        T2 rv = res2[i], xv = x2[i], gv = g2[i];
+        float r0 = to_f32(rv.x) + to_f32(xv.x) * to_f32(gv.x);
+        float r1 = to_f32(rv.y) + to_f32(xv.y) * to_f32(gv.y);
+        __half rh0 = from_f32<__half>(r0);
+        __half rh1 = from_f32<__half>(r1);
+        res2[i] = make_packed2<__half>(rh0, rh1);
+        float rr0 = to_f32(rh0);
+        float rr1 = to_f32(rh1);
+        local_sum += rr0 * rr0 + rr1 * rr1;
+    }
+    float rms = rsqrtf(block_reduce_sum(local_sum, shared) / dim + eps);
+
+    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+        T2 rv = res2[i], wv = w2[i];
+        T2 sv = sc2[i], hv = sh2[i], gv = gt2[i];
+        float n0 = to_f32(rv.x) * rms * to_f32(wv.x);
+        float n1 = to_f32(rv.y) * rms * to_f32(wv.y);
+        out2[i] = make_packed2<__half>(
+            from_f32<__half>(n0 * (1.0f + to_f32(sv.x)) + to_f32(hv.x)),
+            from_f32<__half>(n1 * (1.0f + to_f32(sv.y)) + to_f32(hv.y)));
+        gate_out2[i] = gv;
+    }
+}
+
+void gate_residual_ada_norm_fp16(__half* residual, const __half* x,
+                                  const __half* gate, const __half* weight,
+                                  const __half* style,
+                                  __half* out, __half* gate_out,
+                                  int seq_len, int dim, float eps,
+                                  cudaStream_t stream) {
+    gate_residual_ada_norm_fp16_kernel<<<seq_len, 256, 256 * sizeof(float), stream>>>(
+        residual, x, gate, weight, style, out, gate_out, dim, eps);
+}
+
 template<typename T>
 __global__ void gate_residual_ada_norm_int8_kernel(
     T* __restrict__ residual,
