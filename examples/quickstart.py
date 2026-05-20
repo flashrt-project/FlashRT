@@ -75,7 +75,7 @@ def main():
                         help="Pi0.5 torch only. Enable NVFP4 quantization "
                              "with the production preset: full 18 encoder "
                              "FFN layers + AWQ + P1 split-GU "
-                             "(LIBERO Spatial 491/500 = 98.2%, matches FP8 "
+                             "(LIBERO Spatial 491/500 = 98.2%%, matches FP8 "
                              "baseline). Requires Thor SM110 / SM100+.")
     args = parser.parse_args()
 
