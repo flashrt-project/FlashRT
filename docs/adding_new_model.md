@@ -434,7 +434,44 @@ Recompiling the same MLIR → Myelin picks a different tactic → ±2ms P50 drif
 
 Thor has 122Gi of unified memory. Loading two models concurrently will OOM. Tests must run serially.
 
-### 4.3 Don't rebuild the kernel .so
+### 4.3 Kernel binding and CMake ownership
+
+Adding a new model should usually reuse existing `fvk.*` entries. If you do
+need a new kernel or a new pybind entry, keep the CMake target ownership in
+lockstep with the binding:
+
+- An unconditional `m.def(...)` in `csrc/bindings.cpp` must link against an
+  implementation that exists in every supported `GPU_ARCH` build, or it must
+  call an unconditional stub that raises a clear "not built / not supported"
+  error.
+- If the `.cu` implementation is hardware- or feature-gated, the binding must
+  be gated the same way. Do not let a public `flash_rt_kernels` symbol depend
+  on a model-specific object target that only builds for one architecture.
+- Shared quantize, layout, RoPE, activation, and utility kernels belong in
+  the main `flash_rt_kernels` target unless every binding and every caller is
+  gated with the same condition.
+- Model-specific object libraries should contain only model- and
+  hardware-specific kernels.
+
+For any CMake / binding ownership change, validate every affected hardware
+family:
+
+```bash
+cmake -B build_<arch> -S . -DGPU_ARCH=<arch>
+cmake --build build_<arch> -j$(nproc) --target flash_rt_kernels
+PYTHONPATH=. python - <<'PY'
+from flash_rt import flash_rt_kernels
+print(flash_rt_kernels.__file__)
+PY
+nm -D -u flash_rt/flash_rt_kernels*.so | c++filt | grep 'flash_rt::' || true
+```
+
+When moving a source out of a model-specific object target into
+`flash_rt_kernels`, test both sides of the change: the architecture that was
+missing the symbol must import cleanly, and the architecture that already had
+the source must not fail with duplicate definitions.
+
+### 4.4 Don't rebuild the kernel .so
 
 `flash_rt/flash_rt_kernels.cpython-312-aarch64-linux-gnu.so` (3.6MB) is a production binary. Adding a new model should not trigger a kernel rebuild — every fvk function you need is already in this .so. If you genuinely need a new kernel, that's a separate CUDA development flow, with explicit version backups.
 
@@ -467,6 +504,8 @@ If the backbone is a new architecture (Qwen3-like), add **1-2 more weeks** for s
 - [ ] (4) Frontend is fully implemented, **each `(framework, hardware)` has its own `<m>_<hw>.py` file**, and all buffers are pre-allocated in `_load_weights`.
 - [ ] **No file uses `if self._has_sm100` or `hasattr(fvk, '...')` to branch on hardware.**
 - [ ] **`shared_primitives.py` has not gained any model-specific functions.**
+- [ ] Any new `csrc/bindings.cpp` entry and its `.cu` implementation have matching CMake guards / target ownership.
+- [ ] If a kernel source moved between object targets and `flash_rt_kernels`, every affected `GPU_ARCH` builds `flash_rt_kernels`, imports it from Python, and has no missing or duplicate symbols.
 - [ ] (6) The four `_PIPELINE_MAP` entries are one-to-one, with no two rows pointing at the same class.
 - [ ] (7) YAML dims match the constants in the code.
 - [ ] (8) `test_all_models_precision.py` passes three consecutive A/B runs.

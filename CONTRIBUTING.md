@@ -97,6 +97,42 @@ Unsupported shapes/layouts should raise a clear exception with the operation
 name and shape. Undefined outputs, all-zero fallthroughs, and warning-only
 failures are not acceptable for runtime kernels.
 
+### Kernel Bindings And CMake Ownership
+
+Every pybind entry must have matching CMake target ownership.
+
+- If `csrc/bindings.cpp` exposes a function unconditionally, the `.cu` file
+  that implements it must be compiled into `flash_rt_kernels` for every
+  supported `GPU_ARCH`, or the binding must call an unconditional stub that
+  raises a clear "not built / not supported" error.
+- If a kernel implementation is compiled only behind a hardware or feature
+  gate, the binding must use the same compile-time guard. Do not leave an
+  unconditional `m.def(...)` that references symbols from a gated object
+  library.
+- Model-specific object libraries, such as Motus SM120-only targets, should
+  contain only model- and hardware-specific kernels. Shared quantize, layout,
+  RoPE, activation, and utility kernels belong in the main target unless
+  every binding and caller is gated with the same condition.
+- When moving sources between object libraries and `flash_rt_kernels`, verify
+  both sides: the target that was missing the symbols imports successfully,
+  and the target that already had them does not fail with duplicate
+  definitions.
+
+Minimum validation for binding / CMake changes:
+
+```bash
+cmake -B build -S . -DGPU_ARCH=<arch>
+cmake --build build -j$(nproc) --target flash_rt_kernels
+python - <<'PY'
+from flash_rt import flash_rt_kernels
+print(flash_rt_kernels.__file__)
+PY
+```
+
+Run this for each affected hardware family, not only for the GPU in your
+workstation. Undefined symbols often show up at Python import time even when
+the CMake build itself completed.
+
 ### Calibration And Precision
 
 FP8/NVFP4 changes must preserve the calibration cache contract described in
@@ -199,6 +235,9 @@ Before requesting review:
 - Update docs when the user-facing API, build flow, supported hardware, or
   performance claims change.
 - Add or update tests for new behavior.
+- For CMake / kernel binding changes, confirm each affected `GPU_ARCH` builds
+  `flash_rt_kernels` and imports it from Python; check for missing or duplicate
+  symbols when a source moves between targets.
 - Include validation commands and results in the PR description.
 - Mention unsupported hardware or missing local fixtures explicitly.
 - Avoid committing generated build outputs, local checkpoints, logs, or
