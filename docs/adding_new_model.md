@@ -319,7 +319,7 @@ Skeleton: copy the nearest sibling (same framework, same hardware) and edit:
 - Allocate new tensors inside `infer` (violates the CUDA Graph contract).
 - Change graph topology inside `_calibrate` (triggers Myelin tactic drift).
 - Skip `.contiguous()` (column-major vs row-major layout bugs).
-- **Detect hardware at runtime inside a frontend (`hasattr(fvk, ...)`) and branch on it** — this is the pi0fast anti-pattern. New models must ship two independent thor/rtx frontends.
+- **Detect required hardware routing at runtime inside a frontend (`hasattr(fvk, ...)`) and branch on it** — this is the pi0fast anti-pattern. New models must ship two independent thor/rtx frontends. Optional fast-path probes are allowed only with an equivalent tested fallback.
 
 ---
 
@@ -453,6 +453,40 @@ lockstep with the binding:
 - Model-specific object libraries should contain only model- and
   hardware-specific kernels.
 
+### 4.4 Kernel alias, fused helper, and shape contract checks
+
+Many model integrations reuse older `fvk.*` names as thin wrappers around new
+shared helpers. Treat those names as ABI: callers may depend on their argument
+order, tensor shape convention, dtype, rounding, and in-place behavior.
+
+Incident note: #30 introduced this exact class of integration bug when the
+legacy `bias_gelu_bf16(_strict)` public names were routed to a shared
+`bias_gelu_inplace_bf16(M, N)` helper but the wrapper passed
+`(seq_len * dim, dim)` instead of `(seq_len, dim)`. #40 is the reference fix.
+
+Before replacing an old kernel implementation with a shared helper:
+
+- Write down the public binding contract: pointer arguments, `seq_len` / `dim`
+  or `M` / `N` meaning, bias shape, output shape, stream argument, and whether
+  the op is in-place.
+- Compare the old kernel indexing with the new helper indexing. A legacy
+  `(seq_len, dim)` tensor usually maps to helper `(M=seq_len, N=dim)`, not
+  `(M=seq_len * dim, N=dim)`.
+- Preserve suffix semantics. `*_strict` must keep any explicit intermediate
+  rounding or reference-order behavior; `*_bf16` and `*_fp16` must not silently
+  swap dtype; `*_static` must not read or write device-side dynamic scales.
+- Keep optional fast paths optional. `hasattr(fvk, "...")` is acceptable only
+  when the fallback produces the same result and is still covered by tests.
+  Required hardware routing belongs in `_PIPELINE_MAP`, frontend selection, or
+  a clear constructor error.
+- Add or update a small binding-level test when the wrapper changes argument
+  mapping. The test does not need a full model checkpoint; a tiny tensor is
+  enough to catch shape expansion, OOB writes, and wrong bias broadcasting.
+
+This check is mandatory for fused replacements such as
+`add_bias + activation`, `residual + norm`, `qkv split + rope`, and any
+decoder INT8 / FP8 helper that reuses a legacy public name.
+
 For any CMake / binding ownership change, validate every affected hardware
 family:
 
@@ -471,7 +505,7 @@ When moving a source out of a model-specific object target into
 missing the symbol must import cleanly, and the architecture that already had
 the source must not fail with duplicate definitions.
 
-### 4.4 Don't rebuild the kernel .so
+### 4.5 Don't rebuild the kernel .so
 
 `flash_rt/flash_rt_kernels.cpython-312-aarch64-linux-gnu.so` (3.6MB) is a production binary. Adding a new model should not trigger a kernel rebuild — every fvk function you need is already in this .so. If you genuinely need a new kernel, that's a separate CUDA development flow, with explicit version backups.
 
@@ -502,9 +536,15 @@ If the backbone is a new architecture (Qwen3-like), add **1-2 more weeks** for s
 - [ ] (2) Pipeline forward functions use the pointer-only interface, do no dynamic allocation, and **each hardware has its own `pipeline_<hw>.py` file**.
 - [ ] (3) `_<model>_<hw>_spec.py` smoke-builds via `build_spec()`.
 - [ ] (4) Frontend is fully implemented, **each `(framework, hardware)` has its own `<m>_<hw>.py` file**, and all buffers are pre-allocated in `_load_weights`.
-- [ ] **No file uses `if self._has_sm100` or `hasattr(fvk, '...')` to branch on hardware.**
+- [ ] **No file uses `if self._has_sm100` or `hasattr(fvk, '...')` for required hardware routing.**
 - [ ] **`shared_primitives.py` has not gained any model-specific functions.**
 - [ ] Any new `csrc/bindings.cpp` entry and its `.cu` implementation have matching CMake guards / target ownership.
+- [ ] Any reused or renamed `fvk.*` alias preserves the old binding shape
+      contract, dtype, strict rounding behavior, and in-place semantics.
+- [ ] Any fused helper has been compared with the unfused reference on a tiny
+      tensor for shape, bias broadcasting, and numeric parity.
+- [ ] Any `hasattr(fvk, "...")` branch is an optional fast path with a tested
+      fallback, not required hardware routing.
 - [ ] If a kernel source moved between object targets and `flash_rt_kernels`, every affected `GPU_ARCH` builds `flash_rt_kernels`, imports it from Python, and has no missing or duplicate symbols.
 - [ ] (6) The four `_PIPELINE_MAP` entries are one-to-one, with no two rows pointing at the same class.
 - [ ] (7) YAML dims match the constants in the code.
@@ -516,8 +556,8 @@ If the backbone is a new architecture (Qwen3-like), add **1-2 more weeks** for s
 
 ## 7. FAQ
 
-**Q: Why are runtime hardware forks like `if hasattr(fvk, 'cutlass_fp8_sq')` disallowed?**
-A: Because of the lesson learned from pi0fast. A single file with many branches grows maintenance cost explosively: adding a new hardware means touching 14 spots; adding a new optimization means redoing it on every branch; stack traces no longer tell you which hardware path you were on; and CUDA Graphs capture different kernel sequences per hardware anyway, so `if` branching can't actually unify them. Splitting per hardware lets each file focus on exactly one execution path.
+**Q: Why are runtime hardware forks like `if hasattr(fvk, 'cutlass_fp8_sq')` disallowed for required routing?**
+A: Because of the lesson learned from pi0fast. A single file with many branches grows maintenance cost explosively: adding a new hardware means touching 14 spots; adding a new optimization means redoing it on every branch; stack traces no longer tell you which hardware path you were on; and CUDA Graphs capture different kernel sequences per hardware anyway, so `if` branching cannot actually unify them. Splitting per hardware lets each file focus on exactly one execution path. Optional `hasattr(fvk, "...")` probes are acceptable only when they select a fast path and the fallback is correct, tested, and documented.
 
 **Q: The thor and rtx frontends are 90% identical — wouldn't merging them save a lot of code?**
 A: Short-term, yes. But "shared between two ends" means adding a third hardware requires splitting again, every change risks breaking the other side, and the test matrix becomes N×M. With per-hardware files, adding a new hardware is just adding a new file while the existing files stay stable. The total line count is slightly higher, but maintenance entropy is dramatically lower.
