@@ -1753,6 +1753,30 @@ class Pi05Pipeline:
                 self._autotune_fp8_matmul(
                     act_buf.ptr.value, w_fp8_ptr, B[out_key].ptr.value,
                     M_val, N_val, K_val, act_scale_ptr, w_scale_ptr)
+        # Plain encoder GEMMs fall back to BF16 when neither FP8 nor
+        # INT8 owns the encoder matmuls.
+        elif not self.use_fp8 and not self.use_int8_encoder:
+            for M_val, N_val, K_val, act_key, out_key, weight_ptr in [
+                (seq, (ENC_NH + 2 * ENC_NKV) * ENC_HD, ENC_D,
+                 "encoder_x_norm", "encoder_QKV",
+                 W["encoder_attn_qkv_w"][0]),
+                (seq, ENC_D, ENC_D,
+                 "encoder_x_norm", "encoder_x_norm",
+                 W["encoder_attn_o_w"][0]),
+                (seq, ENC_H, ENC_D,
+                 "encoder_x_norm", "encoder_gate_merged",
+                 W["encoder_ffn_gate_w"][0]),
+                (seq, ENC_H, ENC_D,
+                 "encoder_x_norm", "encoder_hidden",
+                 W["encoder_ffn_up_w"][0]),
+                (seq, ENC_D, ENC_H,
+                 "encoder_hidden", "encoder_x_norm",
+                 W["encoder_ffn_down_w"][0]),
+            ]:
+                gemm.autotune_bf16_nn(
+                    B[act_key].ptr.value, weight_ptr,
+                    B[out_key].ptr.value,
+                    M_val, N_val, K_val)
 
         # Decoder FP8 shapes
         if self.use_fp8 and self.use_fp8_decoder and self.fp8_calibrated:
@@ -1768,6 +1792,40 @@ class Pi05Pipeline:
                 self._autotune_fp8_matmul(
                     act_buf.ptr.value, w_fp8_ptr, B[out_key].ptr.value,
                     M_val, N_val, K_val, act_scale_ptr, w_scale_ptr)
+        # Plain decoder GEMMs fall back to BF16 when neither FP8 nor
+        # INT8 owns the decoder matmuls.
+        elif not self.use_fp8_decoder and not self.use_int8_decoder:
+            # BF16 decoder shapes dominate Orin baseline runtime. Tune them
+            # explicitly before graph capture instead of relying on the
+            # cuBLASLt heuristic top-1 selected at first use.
+            decoder_shapes = [
+                (ds, DEC_D, ACTION_DIM,
+                 "diffusion_noise", "decoder_x",
+                 W["decoder_action_in_proj_w"]),
+                (ds, (DEC_NH + 2 * DEC_NKV) * DEC_HD, DEC_D,
+                 "x_normed_buf", "decoder_QKV",
+                 W["decoder_attn_qkv_w"][0]),
+                (ds, DEC_D, DEC_NH * DEC_HD,
+                 "decoder_QKV", "x_normed_buf",
+                 W["decoder_attn_o_w"][0]),
+                (ds, DEC_H, DEC_D,
+                 "x_normed_buf", "decoder_gate_merged",
+                 W["decoder_ffn_gate_w"][0]),
+                (ds, DEC_H, DEC_D,
+                 "x_normed_buf", "decoder_hidden",
+                 W["decoder_ffn_up_w"][0]),
+                (ds, DEC_D, DEC_H,
+                 "decoder_hidden", "x_normed_buf",
+                 W["decoder_ffn_down_w"][0]),
+                (ds, ACTION_DIM, DEC_D,
+                 "x_normed_buf", "decoder_action_buf",
+                 W["decoder_action_out_proj_w"]),
+            ]
+            for M_val, N_val, K_val, act_key, out_key, weight_ptr in decoder_shapes:
+                gemm.autotune_bf16_nn(
+                    B[act_key].ptr.value, weight_ptr,
+                    B[out_key].ptr.value,
+                    M_val, N_val, K_val)
 
         if self.use_int8_decoder and "decoder_attn_qkv_w_0" in self.weights.get("int8", {}):
             logger.info(
