@@ -118,6 +118,29 @@ Every pybind entry must have matching CMake target ownership.
   and the target that already had them does not fail with duplicate
   definitions.
 
+### Kernel Alias And Shape Contracts
+
+Legacy pybind names are part of the public runtime ABI. When a new shared
+helper replaces an older model- or hardware-specific kernel, the wrapper must
+preserve both the shape contract and the numerical contract of the old name.
+This rule exists because #30 introduced an integration regression by wiring an
+older `bias_gelu_bf16(_strict)` alias to a newer shared helper with the wrong
+shape mapping; #40 is the reference fix for that class of bug.
+
+- Do not silently reinterpret `(seq_len, dim)` as `(seq_len * dim, dim)` or
+  `(M, N)` without proving the old and new kernels use the same indexing.
+  If the helper expects `(M, N)`, pass `M=seq_len` and `N=dim` for a
+  row-major `(seq_len, dim)` tensor.
+- Names containing `strict`, `bf16`, `fp16`, `rowwise`, `static`, or
+  `inplace` must keep that behavior after refactors. If the behavior changes,
+  add a new binding name or update all callers and docs in the same PR.
+- A fused replacement must be validated against the unfused reference path
+  for the exact dtype and rounding semantics it claims to preserve. For BF16
+  strict paths, this means checking whether the old path rounded to BF16
+  between operations.
+- Bindings that exist only for backward compatibility should say so in a
+  comment next to the `m.def(...)`, including the expected argument shapes.
+
 Minimum validation for binding / CMake changes:
 
 ```bash
@@ -238,6 +261,16 @@ Before requesting review:
 - For CMake / kernel binding changes, confirm each affected `GPU_ARCH` builds
   `flash_rt_kernels` and imports it from Python; check for missing or duplicate
   symbols when a source moves between targets.
+- For kernel alias or fused-kernel refactors, compare the old public binding
+  signature, wrapper argument mapping, tensor shape comments, and numerical
+  semantics against the new helper before review. Use #30 / #40 as the
+  concrete checklist example: legacy alias, new shared helper, shape mapping,
+  and strict BF16 semantics must all be checked together.
+- For hardware additions, confirm the change is additive: unrelated hardware
+  must not inherit new compile units, runtime branches, env vars, or default
+  feature paths unless the PR explicitly validates those devices.
+- `hasattr(fvk, "...")` is allowed only for optional fast paths with a correct
+  fallback. Do not use it as hardware routing for required model behavior.
 - Include validation commands and results in the PR description.
 - Mention unsupported hardware or missing local fixtures explicitly.
 - Avoid committing generated build outputs, local checkpoints, logs, or
