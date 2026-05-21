@@ -4638,7 +4638,7 @@ N must be a multiple of 32; K must be a multiple of 64.
                                 int seq_len, int dim, uintptr_t stream) {
         bias_gelu_inplace_bf16(typed_ptr<__nv_bfloat16>(x),
                                typed_ptr<__nv_bfloat16>(bias),
-                               seq_len, dim, to_stream(stream));
+                               seq_len * dim, dim, to_stream(stream));
     }, py::arg("x"), py::arg("bias"), py::arg("seq_len"), py::arg("dim"),
        py::arg("stream") = 0);
 
@@ -4646,7 +4646,7 @@ N must be a multiple of 32; K must be a multiple of 64.
                                        int seq_len, int dim, uintptr_t stream) {
         bias_gelu_inplace_bf16(typed_ptr<__nv_bfloat16>(x),
                                typed_ptr<__nv_bfloat16>(bias),
-                               seq_len, dim, to_stream(stream));
+                               seq_len * dim, dim, to_stream(stream));
     }, py::arg("x"), py::arg("bias"), py::arg("seq_len"), py::arg("dim"),
        py::arg("stream") = 0);
 
