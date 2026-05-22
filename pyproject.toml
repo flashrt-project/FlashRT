@@ -27,6 +27,13 @@ eval = ["opencv-python", "tqdm"]
 # https://github.com/Dao-AILab/flash-attention/releases — building
 # the sdist takes 30+ minutes on cold cloud images.
 flash-attn = ["flash-attn"]
+# Thor-only optional fast path: FlashAttention-4 (CuTe-DSL) denoise/prefix
+# attention for LingBot-VLA on Thor (sm_110a). The flash_attn.cute SOURCE is
+# vendored at third_party/fa4 (no flash-attn wheel needed); these are its
+# runtime deps. Without them, LingBot silently falls back to the fmha path
+# (correct, ~+18ms@25). Set CUTE_DSL_ARCH=sm_101a at runtime (the loader
+# defaults it). pip install ".[thor-fa4]".
+thor-fa4 = ["nvidia-cutlass-dsl==4.5.1", "quack-kernels==0.4.1"]
 all = ["flash-rt[torch,jax,server,eval]"]
 
 [tool.setuptools.packages.find]

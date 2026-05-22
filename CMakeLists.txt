@@ -985,6 +985,24 @@ endif()
 
 
 # ──────────────────────────────────────────────────────────────────────
+#  LingBot-VLA model-specific kernels (fused AdaRMSNorm / SwiGLU tail / QKV+RoPE).
+#  Compiled INTO flash_rt_kernels (NOT a separate .so) — same pattern as the
+#  qwen36 model kernels in csrc/kernels/. lingbot_-prefixed symbols + bindings
+#  (csrc/bindings.cpp, #ifdef ENABLE_LINGBOT). Gated to SM100-class (Thor sm_110a).
+#  Inherits flash_rt_kernels' CUDA flags (--ftz/--prec-div=false/--prec-sqrt=false),
+#  numerically equivalent to these kernels' original --use_fast_math build.
+# ──────────────────────────────────────────────────────────────────────
+if(ENABLE_SM100_CUTLASS)
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/lingbot_norm_fp8.cu
+    csrc/kernels/lingbot_rope_qkv.cu
+    csrc/kernels/lingbot_silu_mul_fp8.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_LINGBOT=1)
+  message(STATUS "LingBot-VLA kernels: compiled into flash_rt_kernels (sm_${GPU_ARCH})")
+endif()
+
+
+# ──────────────────────────────────────────────────────────────────────
 #  JAX FFI add-on (separate .so, additive, does NOT touch flash_rt_kernels)
 #
 #  Built only when JAX is importable from the configure-time Python and

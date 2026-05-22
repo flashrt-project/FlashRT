@@ -331,6 +331,10 @@ extern "C" int cutlass_fp8_wide_bf16out(void*, void*, void*, int, int, int, floa
 extern "C" int cutlass_fp8_t1_bf16out(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 #endif
 
+#ifdef ENABLE_LINGBOT
+#include "kernels/lingbot_kernels.h"   // LingBot-VLA model kernel decls (lingbot_-prefixed, Thor sm_110a)
+#endif
+
 PYBIND11_MODULE(flash_rt_kernels, m) {
     m.doc() = "FlashRT C++/CUDA inference kernels";
 
@@ -4816,5 +4820,9 @@ N must be a multiple of 32; K must be a multiple of 64.
                 to_ptr(y_fp4), to_ptr(y_sf),
                 B, C, T, H, W, eps, to_stream(stream));
         });
+#endif
+
+#ifdef ENABLE_LINGBOT
+#include "kernels/lingbot_bindings.inc"   // m.def("lingbot_...", &lingbot_...) for the LingBot-VLA model
 #endif
 }
