@@ -100,6 +100,25 @@ class VLAModel:
         result = self._pipe.infer(obs)
         return result['actions']
 
+    def set_prompt(self, *args, **kwargs):
+        """Delegate prompt setup to the selected frontend."""
+        if not hasattr(self._pipe, "set_prompt"):
+            raise NotImplementedError(
+                "This frontend does not expose set_prompt().")
+        result = self._pipe.set_prompt(*args, **kwargs)
+        if "prompt" in kwargs:
+            self._current_prompt = kwargs["prompt"]
+        elif args and isinstance(args[0], str):
+            self._current_prompt = args[0]
+        return result
+
+    def infer(self, *args, **kwargs):
+        """Delegate inference to the selected frontend."""
+        if not hasattr(self._pipe, "infer"):
+            raise NotImplementedError(
+                "This frontend does not expose infer().")
+        return self._pipe.infer(*args, **kwargs)
+
     def calibrate(
         self,
         observations,
@@ -203,7 +222,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             and force fresh FP8 quantization + calibration.
         weight_cache: if True (default), cache FP8-quantized weights to disk
             after first load. Only affects JAX.
-        config: model config name: "pi05", "pi0", "groot", "pi0fast", "motus"
+        config: model config name: "pi05", "pi0", "groot", "groot_n17",
+            "pi0fast", "motus"
         device: ignored (auto-detects GPU). Reserved for future multi-GPU.
         decode_cuda_graph: Pi0-FAST only. Capture action-phase decode as CUDA
             Graph for max throughput (trades startup time for per-token speed).
@@ -265,10 +285,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     Returns:
         VLAModel instance with .predict() method.
     """
-    if config not in ("pi05", "groot", "pi0", "pi0fast", "motus"):
+    if config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast", "motus"):
         raise ValueError(
             f"Unknown config: {config}. "
-            f"Supported: pi05, groot, pi0, pi0fast, motus")
+            f"Supported: pi05, groot, groot_n17, pi0, pi0fast, motus")
     if framework not in ("torch", "jax"):
         raise ValueError(
             f"Unknown framework: {framework}. Supported: torch, jax")
@@ -383,7 +403,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             decode_graph_steps=decode_graph_steps,
             max_decode_steps=max_decode_steps,
         )
-    elif config == "groot":
+    elif config in ("groot", "groot_n17"):
         # rtx-side GROOT accepts embodiment_tag + action_horizon; Thor-side
         # GROOT accepts embodiment_tag + autotune. Feature-detect via the
         # concrete class signature so one call site works for both.

@@ -118,6 +118,58 @@ def test_sm87_rejects_unvalidated_pi0_and_jax_backends():
             resolve_pipeline_class(config, framework, "rtx_sm87")
 
 
+def test_groot_n17_rtx_sm120_is_registered():
+    from flash_rt.hardware import resolve_pipeline_class
+
+    cls = resolve_pipeline_class("groot_n17", "torch", "rtx_sm120")
+    assert cls.__name__ == "GrootN17TorchFrontendRtx"
+
+
+def test_groot_n17_sm89_is_not_registered_without_validation():
+    from flash_rt.hardware import resolve_pipeline_class
+
+    with pytest.raises(RuntimeError, match="rtx_sm120"):
+        resolve_pipeline_class("groot_n17", "torch", "rtx_sm89")
+
+
+def test_load_model_accepts_groot_n17_config():
+    from flash_rt.api import load_model
+
+    class GrootN17Frontend:
+        seen = None
+
+        def __init__(self, checkpoint, num_views=2, embodiment_tag=None):
+            type(self).seen = {
+                "checkpoint": checkpoint,
+                "num_views": num_views,
+                "embodiment_tag": embodiment_tag,
+            }
+
+        def set_prompt(self, *args, **kwargs):
+            return None
+
+        def infer(self, *args, **kwargs):
+            return None
+
+    with patch("flash_rt.hardware.resolve_pipeline_class",
+              return_value=GrootN17Frontend):
+        model = load_model(
+            "unused-checkpoint",
+            config="groot_n17",
+            framework="torch",
+            hardware="rtx_sm120",
+            num_views=2,
+            embodiment_tag="oxe_droid_relative_eef_relative_joint",
+        )
+
+    assert isinstance(model._pipe, GrootN17Frontend)
+    assert GrootN17Frontend.seen == {
+        "checkpoint": "unused-checkpoint",
+        "num_views": 2,
+        "embodiment_tag": "oxe_droid_relative_eef_relative_joint",
+    }
+
+
 def test_pi05_rtx_fp8_layout_selection():
     from flash_rt.frontends.torch.pi05_rtx import _select_fp8_layout
 

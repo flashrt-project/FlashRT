@@ -29,7 +29,7 @@ def load_model(
     autotune: int = 3,              # 0=off, 3=default, 5+=thorough
     recalibrate: bool = False,
     weight_cache: bool = True,      # JAX only
-    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "pi0fast" | "motus"
+    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "groot_n17" | "pi0fast" | "motus"
     device=None,                    # reserved
     # Pi0-FAST-specific:
     decode_cuda_graph: bool = False,
@@ -78,11 +78,16 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
 - `config="motus"` is a beta RTX SM120 frontend. It expects a Motus
   checkpoint plus Wan and VLM checkpoint paths supplied to the Motus
   quickstart/frontend; see `docs/motus_usage_beta.md`.
+- `config="groot_n17"` is registered for `framework="torch"` and
+  `hardware="rtx_sm120"`. This route validates the N1.7 DiT
+  self/cross-attention path on the vendored FA2 backend.
 
 ### `flash_rt.VLAModel`
 
 ```python
 class VLAModel:
+    def set_prompt(self, *args, **kwargs): ...
+    def infer(self, *args, **kwargs): ...
     def predict(self, images, prompt=None, state=None) -> np.ndarray: ...
     def recalibrate(self) -> None: ...
 
@@ -91,6 +96,16 @@ class VLAModel:
     @property
     def prompt(self) -> str | None: ...
 ```
+
+- `set_prompt(*args, **kwargs)` — delegate prompt setup to the selected
+  frontend. GROOT N1.7 currently uses `set_prompt(aux=..., prompt=...)`,
+  where `aux` contains the captured Qwen3-VL setup tensors consumed by
+  the N1.7 calibration path.
+
+- `infer(*args, **kwargs)` — delegate inference to the selected frontend.
+  GROOT N1.7 currently uses
+  `infer(state_normalized, initial_noise=..., use_dit_graph=...)` and
+  returns normalized actions.
 
 - `predict(images, prompt, state)` — run one inference step.
   `images`: list of `(224,224,3)` uint8 numpy arrays, or a dict with
@@ -122,6 +137,8 @@ Lazily imports and returns the concrete frontend class for the given
 `(config, framework, arch)` triple. Used internally by `load_model`.
 Motus beta is registered for `(config="motus", framework="torch",
 arch="rtx_sm120")`.
+GROOT N1.7 RTX is registered for `(config="groot_n17",
+framework="torch", arch="rtx_sm120")`.
 
 ### `_PIPELINE_MAP`
 

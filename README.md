@@ -4,7 +4,7 @@
 
 A general kernel library composed into static graphs — no ONNX export, no engine compilation, no per-driver rebuild. Hand-written kernels (norm / activation / fusion / RoPE / FP8 / NVFP4 GEMM / attention) cover standard transformer, DiT, and SigLIP primitives. The composition pattern itself is hardware-agnostic; today the codebase ships with NVIDIA implementations spanning edge to server (Jetson AGX Thor through A100 / RTX 4090 / 5090).
 
-The flagship integration today is **VLA control** — production frontends for Pi0, Pi0.5, GROOT N1.6, and Pi0-FAST, validated on LIBERO. The same kernel set also powers the BAGEL world-model image-generation pipeline (research preview) and audio / video generation (4× over PyTorch). FlashRT now also serves **single-stream LLM inference** — the v1 release ships **Qwen3.6-27B (NVFP4)** with **256 K context on a single RTX 5090**, an OpenAI-compatible HTTP server, and decode throughput of **~100 tok/s typical / 129 tok/s peak** (real warm-state range across mixed chat / reasoning / code prompts; see [Performance](#performance) for the breakdown). The pattern is workload-shaped (small-batch realtime), not model-class-shaped.
+The flagship integration today is **VLA control** — production frontends for Pi0, Pi0.5, GROOT N1.6, GROOT N1.7, and Pi0-FAST, validated on LIBERO where applicable. The same kernel set also powers the BAGEL world-model image-generation pipeline (research preview) and audio / video generation (4× over PyTorch). FlashRT now also serves **single-stream LLM inference** — the v1 release ships **Qwen3.6-27B (NVFP4)** with **256 K context on a single RTX 5090**, an OpenAI-compatible HTTP server, and decode throughput of **~100 tok/s typical / 129 tok/s peak** (real warm-state range across mixed chat / reasoning / code prompts; see [Performance](#performance) for the breakdown). The pattern is workload-shaped (small-batch realtime), not model-class-shaped.
 
 Existing inference tooling is shaped for different workloads — TensorRT for tactic-search compile to frozen engines, vLLM / SGLang for high-batch LLM serving. FlashRT targets the small-batch realtime cell with hand-tuned kernels and no compile step.
 
@@ -26,7 +26,7 @@ Existing inference tooling is shaped for different workloads — TensorRT for ta
 
 ## FlashRT supports:
 
-- **VLA models**: Pi0, Pi0.5, GROOT N1.6, Pi0-FAST — all production-validated on LIBERO. Motus RTX beta — Wan2.2-based robot policy path at ~167 ms / ~100 ms with TeaCache. BAGEL world-model (research preview) — image-gen pipeline at ~4× vs PyTorch.
+- **VLA models**: Pi0, Pi0.5, GROOT N1.6, GROOT N1.7, Pi0-FAST. Pi0/Pi0.5/GROOT N1.6/Pi0-FAST are production-validated on LIBERO; GROOT N1.7 currently exposes an RTX SM120 DiT FA2 path. Motus RTX beta — Wan2.2-based robot policy path at ~167 ms / ~100 ms with TeaCache. BAGEL world-model (research preview) — image-gen pipeline at ~4× vs PyTorch.
 - **LLM**: **Qwen3.6-27B NVFP4 — ~100 tok/s typical / 129 tok/s peak decode, 256 K context, single RTX 5090** — speculative decoding via the FP8 ckpt's MTP head, OpenAI-compatible HTTP server. **Qwen3-8B NVFP4** text-only serving reaches **150 tok/s** warm decode.
 - **Hardware (today)**: NVIDIA Jetson AGX Thor (SM110), RTX 5090 (SM120), RTX 4090 (SM89), and SM80 / SM86 / SM89 cards (A100, RTX 3090, 4060 Ti, etc.). The kernel composition pattern is portable to other accelerators.
 - **Frameworks**: PyTorch (safetensors) + JAX (Orbax) — same compiled kernels
@@ -37,6 +37,7 @@ Pi0.5: 44 ms / 23 Hz on Jetson AGX Thor (2v, FP8) · 39.78 ms / 25 Hz (2v, NVFP4
 
 - [2026/05] **Qwen3.6-27B NVFP4** is supported with 256 K context on a single RTX 5090, OpenAI-compatible serving, and **~100 tok/s typical / 129 tok/s peak** decode. See [Qwen3.6 NVFP4](docs/qwen36_nvfp4.md) and [Performance](#qwen36-performance).
 - [2026/05] **Qwen3-8B NVFP4** text-only serving is supported on RTX 5090, with **9.1 ms TTFT at P=64** and **150 tok/s** warm decode. See [Qwen3-8B NVFP4](docs/qwen3_8b_nvfp4.md) and [Performance](#qwen3-8b-performance).
+- [2026/05] **Lingbot-VLA** is supported. See [Lingbot usage](https://github.com/LiangSu8899/FlashRT/blob/main/docs/lingbot_usage.md).
 - [2026/05] Community Pi0.5 hardware benchmarks: thanks to [@cuihengrui35](https://github.com/cuihengrui35) for **RTX 5060 Ti** results (**41.4 ms / ~24 Hz**, plus LIBERO Spatial **344/350 = 98.3%**) and [@wangerforcs](https://github.com/wangerforcs) for **NVIDIA L40** results (**26.6 ms / 38 Hz**) on 2-view FP8. See [community benchmarks](#community-benchmarks).
 - [2026/05] Special thanks to [@gugudeshubao](https://github.com/gugudeshubao) for the **Pi0.5 Jetson AGX Orin (SM87) port**: INT8 W8A8 kernels, Orin tile dispatch, frame-cache inference, deployment docs, and benchmark results. Thanks also to [@strayberry](https://github.com/strayberry) for Orin BF16 Pi0.5 testing. See [Orin deployment](docs/deployment_orin.md) and [community benchmarks](#community-benchmarks).
 - [2026/05] **Motus RTX beta** lands in FlashRT: Stage3 fast profile reaches **~167 ms** E2E on RTX 5090, **~100 ms** with TeaCache, and RTC-lite supports 50 Hz action streaming. See [Motus usage](docs/motus_usage_beta.md) and [Performance](#motus-performance).
@@ -60,7 +61,7 @@ import flash_rt   # Python module name; project is FlashRT (see About)
 
 model = flash_rt.load_model(
     checkpoint="/path/to/pi05_checkpoint",
-    config="pi05",          # or "pi0", "groot", "pi0fast"
+    config="pi05",          # or "pi0", "groot", "groot_n17", "pi0fast"
     framework="torch",      # or "jax"
 )
 
@@ -278,14 +279,20 @@ These runs are external hardware submissions using the public quickstart
 or deployment scripts. They are useful compatibility data points; exact
 latency depends on driver, CUDA, clock state, warmup count, and checkpoint.
 
-| Contributor | Hardware | Model / mode | Command shape | Result |
+| Contributor | Hardware | Model / mode | Settings | P50 | P95 / range | Throughput | Notes |
+|---|---|---|---|---:|---:|---:|---|
+| [@cuihengrui35](https://github.com/cuihengrui35) | RTX 5060 Ti, SM120, 16 GB | Pi0.5 FP8 | 2 cameras, benchmark 20, warmup 200 | **41.4 ms** | 40.9-43.2 ms | ~24 Hz | mean 41.4 ms |
+| [@wangerforcs](https://github.com/wangerforcs) | NVIDIA L40, SM89 | Pi0.5 FP8 | 2 cameras, 20 timed iterations, 500 warmup | **26.6 ms** | 26.2-27.3 ms | 38 Hz | mean 26.7 ms |
+| [@gugudeshubao](https://github.com/gugudeshubao) | Jetson AGX Orin 64 GB, SM87 | Pi0.5 DROID INT8 | 2 cameras, pool=1, 27 layers, 10 steps, cache_frames=1 | **124 ms** | - | 8.04 Hz | cosine 1.000 vs BF16 reference |
+| [@gugudeshubao](https://github.com/gugudeshubao) | Jetson AGX Orin 64 GB, SM87 | Pi0.5 DROID INT8 | 2 cameras, pool=1, 27 layers, 10 steps, cache_frames=2 | **127 / 39 ms** | - | 12.2 Hz | amortized, cosine 0.991 |
+| [@strayberry](https://github.com/strayberry) | Jetson AGX Orin 32 GB, 14 SMs, SM87 | Pi0.5 BF16 | 2 cameras, pool=1, 27 layers, 10 steps, cache_frames=1 | **215.9 ms** | 217.1 ms | 4.6 Hz | - |
+| [@strayberry](https://github.com/strayberry) | Jetson AGX Orin 32 GB, 14 SMs, SM87 | Pi0.5 BF16 | 2 cameras, pool=1, 27 layers, 10 steps, cache_frames=2 | **137 ms** | 218 ms | 7.3 Hz | - |
+
+Task-level submissions:
+
+| Contributor | Hardware | Task | Command shape | Result |
 |---|---|---|---|---|
-| [@cuihengrui35](https://github.com/cuihengrui35) | RTX 5060 Ti, SM120, 16 GB | Pi0.5, 2-view FP8 | `examples/quickstart.py --hardware rtx_sm120 --benchmark 20 --warmup 200` | **P50 41.4 ms**, mean 41.4, min 40.9, max 43.2, ~24 Hz |
 | [@cuihengrui35](https://github.com/cuihengrui35) | RTX 5060 Ti, SM120, 16 GB | Pi0.5 LIBERO Spatial | `examples/thor/eval_libero.py --task_suite libero_spatial --num_trials 50` | **344/350 = 98.3%** over 7 reported tasks |
-| [@wangerforcs](https://github.com/wangerforcs) | NVIDIA L40, SM89 | Pi0.5, 2-view FP8 | 20 timed iterations, 500 warmup | **P50 26.6 ms**, min 26.2, mean 26.7, max 27.3, 38 Hz |
-| [@gugudeshubao](https://github.com/gugudeshubao) | Jetson AGX Orin 64 GB, SM87 | Pi0.5 DROID, INT8, `cache_frames=1` | 2 cameras, pool=1, 27 layers, 10 steps | **124 ms**, 8.04 Hz, cosine 1.000 vs BF16 reference |
-| [@gugudeshubao](https://github.com/gugudeshubao) | Jetson AGX Orin 64 GB, SM87 | Pi0.5 DROID, INT8, `cache_frames=2` | 2 cameras, pool=1, 27 layers, 10 steps | **127 / 39 ms**, 12.2 Hz amortized, cosine 0.991 |
-| [@strayberry](https://github.com/strayberry) | Jetson AGX Orin 64 GB, SM87 | Pi0.5 BF16 reference smoke | 2 views, pool=1, 27 layers, 10 steps, cache_frames=1 | **P50 246.8 ms**, p95 247.0, 4.05 Hz |
 
 [@gugudeshubao](https://github.com/gugudeshubao)'s Orin work was a
 full SM87 enablement, not only a benchmark: it added the INT8 W8A8
@@ -523,6 +530,32 @@ Any other tag in the map (`libero_panda`, `oxe_google`, `oxe_widowx`,
 `unitree_g1`, `oxe_droid`) is **untrained** in the base 3B checkpoint
 and logs a warning at load time. Fine-tune one of those slots
 yourself or pick a trained tag for immediate use.
+
+### GROOT N1.7 RTX
+
+```python
+import flash_rt
+
+model = flash_rt.load_model(
+    "/path/to/GR00T-N1.7-3B",
+    framework="torch",
+    config="groot_n17",
+    hardware="rtx_sm120",
+    num_views=2,
+    embodiment_tag="oxe_droid_relative_eef_relative_joint",
+)
+
+model.set_prompt(aux=aux, prompt="put the blue block in the green bowl")
+actions_normalized = model.infer(
+    state_normalized,
+    initial_noise=initial_noise,
+    use_dit_graph=True,
+)
+```
+
+GROOT N1.7 is registered as `config="groot_n17"` for the RTX SM120
+torch path. It uses the N1.7 `set_prompt(aux=...)` / normalized-state
+`infer(...)` contract; see [USAGE.md](USAGE.md#groot-n17-rtx).
 
 ### Autotune
 

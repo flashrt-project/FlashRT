@@ -150,7 +150,7 @@ model = flash_rt.load_model(
 | `autotune` | `int\|bool` | `3` | CUDA Graph autotune intensity. See [Autotune](#autotune). |
 | `recalibrate` | `bool` | `False` | Force fresh FP8 calibration (and weight cache for JAX), ignoring cache. See [Calibration](#calibration). |
 | `weight_cache` | `bool` | `True` | Cache FP8-quantized weights to disk. **JAX only** — reduces cold start from ~42s to ~6s. Torch loads in ~3s and ignores this. See [Weight Cache](#weight-cache-jax-only). |
-| `config` | `str` | `"pi05"` | Model architecture config: `"pi05"`, `"pi0"`, `"groot"`, `"pi0fast"`. |
+| `config` | `str` | `"pi05"` | Model architecture config: `"pi05"`, `"pi0"`, `"groot"`, `"groot_n17"`, `"pi0fast"`, `"motus"`. |
 | `decode_cuda_graph` | `bool` | `False` | **Pi0-FAST only.** Capture action-phase decode as CUDA Graph. Trades startup time for per-token speed. See [Pi0-FAST](#pi0-fast). |
 | `decode_graph_steps` | `int` | `80` | **Pi0-FAST only.** Number of action tokens to capture in the decode graph. Should cover your longest expected action sequence. |
 | `use_fp4` | `bool` | `False` | **Pi0.5 torch + jax on Thor.** Enable NVFP4 quantization on the encoder FFN stack. When `True`, resolves to the production preset (`fp4_layers=tuple(range(18))` + `use_awq=True` + `use_p1_split_gu=True`). Requires SM100+ GPU. Other configs emit a warning and fall back to FP8. See [NVFP4](#nvfp4-pi05-only). |
@@ -217,6 +217,68 @@ Officially enabled FP16 RTX routes are:
 The underlying FP16 kernels are SM80-family friendly, but FlashRT only
 exposes this Pi0.5 FP16 route for architectures already mapped to the
 RTX Pi0.5 frontend.
+
+### GROOT N1.7 RTX
+
+GROOT N1.7 is currently registered for the RTX SM120 torch path:
+
+```python
+import flash_rt
+
+model = flash_rt.load_model(
+    "/path/to/GR00T-N1.7-3B",
+    framework="torch",
+    config="groot_n17",
+    hardware="rtx_sm120",
+    num_views=2,
+    embodiment_tag="oxe_droid_relative_eef_relative_joint",
+)
+
+model.set_prompt(aux=aux, prompt="put the blue block in the green bowl")
+actions_normalized = model.infer(
+    state_normalized,
+    initial_noise=initial_noise,
+    use_dit_graph=True,
+)
+```
+
+`aux` is the precomputed Qwen3-VL setup bundle consumed by the N1.7
+calibration path: LLM input embeddings, visual masks, M-RoPE tables,
+pixel features, and `grid_thw`. `infer()` expects normalized state and
+returns normalized actions; denormalization remains the caller's
+responsibility for this N1.7 path.
+
+The RTX backend scope is DiT-only in this release: DiT self/cross
+attention uses FlashRT's vendored FA2 slots, while ViT, LLM, and VL
+self-attention stay on the shared N1.7 frontend/calibration path.
+
+Supported hardware is `rtx_sm120` (RTX 5090-class Blackwell). SM89 is
+not registered until it has target-specific benchmark and cosine
+validation.
+
+Build FA2 with at least the N1.7 head dimensions and dtypes:
+
+```bash
+cmake -S . -B build \
+  -DFA2_HDIMS="96;128" \
+  -DFA2_DTYPES="fp16;bf16"
+cmake --build build --target flash_rt_fa2 -j
+```
+
+RTX 5090 validation against the N1.7 reference fixture:
+
+| Metric | Result |
+|---|---:|
+| DiT step-0 input cosine | 0.999995 |
+| Denormalized action cosine, combined | 0.999952 |
+| Denormalized action cosine, EEF 9D | 0.999901 |
+| Denormalized action cosine, gripper | 0.941401 |
+| Denormalized action cosine, joints | 0.999969 |
+| DiT graph latency p50 | 10.55 ms |
+| DiT eager latency p50 | 17.60 ms |
+
+This path does not change CMake targets, C++ bindings, or existing
+Pi0/Pi0.5/GROOT N1.6 runtime dispatch.
 
 ### `model.predict()`
 
