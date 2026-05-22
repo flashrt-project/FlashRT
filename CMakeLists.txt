@@ -138,6 +138,8 @@ set(FA2_DTYPES "fp16;bf16" CACHE STRING
 # Motus beta integration. Motus-specific kernels are additive and must keep
 # their symbols prefixed with ``motus_``. Keeping a build tag lets the public
 # package compile without Motus kernels when debugging unrelated model paths.
+option(FLASHRT_ENABLE_LINGBOT
+       "Build LingBot-VLA Thor (sm_110) model kernels and bindings" ON)
 option(FLASHRT_ENABLE_MOTUS
        "Build Motus-specific RTX SM120 kernels and bindings" ON)
 if(FLASHRT_ENABLE_MOTUS)
@@ -981,6 +983,29 @@ if(ENABLE_SM100_CUTLASS)
   )
   target_link_libraries(flash_rt_fp4 PRIVATE CUDA::cudart)
   install(TARGETS flash_rt_fp4 DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+endif()
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  LingBot-VLA model-specific kernels (fused AdaRMSNorm / SwiGLU tail / QKV+RoPE).
+#  Compiled INTO flash_rt_kernels (NOT a separate .so) — same pattern as the
+#  qwen36 model kernels in csrc/kernels/. lingbot_-prefixed symbols + bindings
+#  (csrc/bindings.cpp, #ifdef ENABLE_LINGBOT). Thor-only: gated on
+#  FLASHRT_ENABLE_LINGBOT AND GPU_ARCH==110 so RTX (sm_120) / Orin / L40 builds
+#  neither compile the lingbot_* sources nor define ENABLE_LINGBOT (the bindings
+#  are #ifdef'd the same way). Disable with -DFLASHRT_ENABLE_LINGBOT=OFF.
+#  Inherits flash_rt_kernels' CUDA flags (--ftz/--prec-div=false/--prec-sqrt=false),
+#  numerically equivalent to these kernels' original --use_fast_math build.
+# ──────────────────────────────────────────────────────────────────────
+if(FLASHRT_ENABLE_LINGBOT AND GPU_ARCH STREQUAL "110")
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/lingbot_norm_fp8.cu
+    csrc/kernels/lingbot_rope_qkv.cu
+    csrc/kernels/lingbot_silu_mul_fp8.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_LINGBOT=1)
+  message(STATUS "LingBot-VLA kernels: compiled into flash_rt_kernels (sm_${GPU_ARCH})")
+else()
+  message(STATUS "LingBot-VLA kernels: DISABLED (Thor sm_110 only; current sm_${GPU_ARCH})")
 endif()
 
 
