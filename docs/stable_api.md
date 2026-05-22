@@ -29,7 +29,7 @@ def load_model(
     autotune: int = 3,              # 0=off, 3=default, 5+=thorough
     recalibrate: bool = False,
     weight_cache: bool = True,      # JAX only
-    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "groot_n17" | "pi0fast" | "motus"
+    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "groot_n17" | "pi0fast" | "motus" | "wan22_ti2v_5b"
     device=None,                    # reserved
     # Pi0-FAST-specific:
     decode_cuda_graph: bool = False,
@@ -78,6 +78,11 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
 - `config="motus"` is a beta RTX SM120 frontend. It expects a Motus
   checkpoint plus Wan and VLM checkpoint paths supplied to the Motus
   quickstart/frontend; see `docs/motus_usage_beta.md`.
+- `config="wan22_ti2v_5b"` is an RTX SM120 official-pipeline Wan2.2
+  baseline. It exposes `set_prompt(prompt, negative_prompt=...)` and
+  `infer(mode="t2v"|"i2v", width=..., height=..., frames=..., steps=...,
+  shift=..., guide_scale=..., seed=...)`; `predict()` is not part of this
+  video-generation API. See `docs/wan22_usage.md`.
 - `config="groot_n17"` is registered for `framework="torch"` and
   `hardware="rtx_sm120"`. This route validates the N1.7 DiT
   self/cross-attention path on the vendored FA2 backend.
@@ -138,6 +143,8 @@ Lazily imports and returns the concrete frontend class for the given
 Motus beta is registered for `(config="motus", framework="torch",
 arch="rtx_sm120")`.
 GROOT N1.7 RTX is registered for `(config="groot_n17",
+framework="torch", arch="rtx_sm120")`.
+Wan2.2 TI2V-5B is registered for `(config="wan22_ti2v_5b",
 framework="torch", arch="rtx_sm120")`.
 
 ### `_PIPELINE_MAP`

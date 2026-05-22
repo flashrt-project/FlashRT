@@ -150,7 +150,7 @@ model = flash_rt.load_model(
 | `autotune` | `int\|bool` | `3` | CUDA Graph autotune intensity. See [Autotune](#autotune). |
 | `recalibrate` | `bool` | `False` | Force fresh FP8 calibration (and weight cache for JAX), ignoring cache. See [Calibration](#calibration). |
 | `weight_cache` | `bool` | `True` | Cache FP8-quantized weights to disk. **JAX only** — reduces cold start from ~42s to ~6s. Torch loads in ~3s and ignores this. See [Weight Cache](#weight-cache-jax-only). |
-| `config` | `str` | `"pi05"` | Model architecture config: `"pi05"`, `"pi0"`, `"groot"`, `"groot_n17"`, `"pi0fast"`, `"motus"`. |
+| `config` | `str` | `"pi05"` | Model architecture config: `"pi05"`, `"pi0"`, `"groot"`, `"groot_n17"`, `"pi0fast"`, `"motus"`, `"wan22_ti2v_5b"`. |
 | `decode_cuda_graph` | `bool` | `False` | **Pi0-FAST only.** Capture action-phase decode as CUDA Graph. Trades startup time for per-token speed. See [Pi0-FAST](#pi0-fast). |
 | `decode_graph_steps` | `int` | `80` | **Pi0-FAST only.** Number of action tokens to capture in the decode graph. Should cover your longest expected action sequence. |
 | `use_fp4` | `bool` | `False` | **Pi0.5 torch + jax on Thor.** Enable NVFP4 quantization on the encoder FFN stack. When `True`, resolves to the production preset (`fp4_layers=tuple(range(18))` + `use_awq=True` + `use_p1_split_gu=True`). Requires SM100+ GPU. Other configs emit a warning and fall back to FP8. See [NVFP4](#nvfp4-pi05-only). |
@@ -279,6 +279,38 @@ RTX 5090 validation against the N1.7 reference fixture:
 
 This path does not change CMake targets, C++ bindings, or existing
 Pi0/Pi0.5/GROOT N1.6 runtime dispatch.
+
+### Wan2.2 TI2V-5B
+
+Wan2.2 TI2V-5B is exposed as an RTX SM120 official-pipeline baseline:
+
+```python
+import flash_rt
+
+model = flash_rt.load_model(
+    "/path/to/Wan2.2-TI2V-5B",
+    framework="torch",
+    config="wan22_ti2v_5b",
+    hardware="rtx_sm120",
+)
+
+model.set_prompt("A blue sphere rolls across a wooden table")
+video = model.infer(
+    mode="t2v",
+    width=832,
+    height=480,
+    frames=81,
+    steps=20,
+    shift=5.0,
+    guide_scale=5.0,
+    seed=1234,
+)
+```
+
+This route uses the official Wan Python pipeline and original ModelScope
+checkpoint layout. It is separate from ComfyUI; ComfyUI integration should
+be provided by an external custom-node package. See
+[`docs/wan22_usage.md`](docs/wan22_usage.md).
 
 ### `model.predict()`
 

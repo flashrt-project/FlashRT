@@ -223,7 +223,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         weight_cache: if True (default), cache FP8-quantized weights to disk
             after first load. Only affects JAX.
         config: model config name: "pi05", "pi0", "groot", "groot_n17",
-            "pi0fast", "motus"
+            "pi0fast", "motus", "wan22_ti2v_5b"
         device: ignored (auto-detects GPU). Reserved for future multi-GPU.
         decode_cuda_graph: Pi0-FAST only. Capture action-phase decode as CUDA
             Graph for max throughput (trades startup time for per-token speed).
@@ -285,10 +285,12 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     Returns:
         VLAModel instance with .predict() method.
     """
-    if config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast", "motus"):
+    if config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
+                      "motus", "wan22_ti2v_5b"):
         raise ValueError(
             f"Unknown config: {config}. "
-            f"Supported: pi05, groot, groot_n17, pi0, pi0fast, motus")
+            f"Supported: pi05, groot, groot_n17, pi0, pi0fast, motus, "
+            f"wan22_ti2v_5b")
     if framework not in ("torch", "jax"):
         raise ValueError(
             f"Unknown framework: {framework}. Supported: torch, jax")
@@ -413,6 +415,9 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             kwargs["embodiment_tag"] = embodiment_tag
         if "action_horizon" in sig.parameters and action_horizon is not None:
             kwargs["action_horizon"] = action_horizon
+    elif config == "wan22_ti2v_5b":
+        if "autotune" in sig.parameters:
+            kwargs["autotune"] = autotune
     else:
         # pi05, pi0 — both Thor and rtx variants take (checkpoint, num_views, autotune)
         # or (checkpoint, num_views). Feature-detect.

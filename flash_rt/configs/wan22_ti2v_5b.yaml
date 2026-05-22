@@ -1,0 +1,24 @@
+name: wan22_ti2v_5b
+family: wan
+frameworks: ["torch"]
+hardware: ["rtx_sm120"]
+
+model:
+  backbone: Wan2.2-TI2V-5B
+  source: official_wan
+  latent_channels: 48
+  num_layers: 30
+  hidden_size: 3072
+  num_heads: 24
+  head_dim: 128
+  text_len: 512
+  vae_stride: [4, 16, 16]
+
+defaults:
+  width: 832
+  height: 480
+  frames: 81
+  steps: 20
+  shift: 5.0
+  guide_scale: 5.0
+  sample_solver: unipc

@@ -37,6 +37,7 @@ Pi0.5: 44 ms / 23 Hz on Jetson AGX Thor (2v, FP8) · 39.78 ms / 25 Hz (2v, NVFP4
 
 - [2026/05] **Qwen3.6-27B NVFP4** is supported with 256 K context on a single RTX 5090, OpenAI-compatible serving, and **~100 tok/s typical / 129 tok/s peak** decode. See [Qwen3.6 NVFP4](docs/qwen36_nvfp4.md) and [Performance](#qwen36-performance).
 - [2026/05] **Qwen3-8B NVFP4** text-only serving is supported on RTX 5090, with **9.1 ms TTFT at P=64** and **150 tok/s** warm decode. See [Qwen3-8B NVFP4](docs/qwen3_8b_nvfp4.md) and [Performance](#qwen3-8b-performance).
+- [2026/05] **Wan2.2 TI2V-5B** official-pipeline baseline is available on RTX SM120. See [Wan2.2 usage](docs/wan22_usage.md).
 - [2026/05] **Lingbot-VLA** is supported. See [Lingbot usage](https://github.com/LiangSu8899/FlashRT/blob/main/docs/lingbot_usage.md).
 - [2026/05] Community Pi0.5 hardware benchmarks: thanks to [@cuihengrui35](https://github.com/cuihengrui35) for **RTX 5060 Ti** results (**41.4 ms / ~24 Hz**, plus LIBERO Spatial **344/350 = 98.3%**) and [@wangerforcs](https://github.com/wangerforcs) for **NVIDIA L40** results (**26.6 ms / 38 Hz**) on 2-view FP8. See [community benchmarks](#community-benchmarks).
 - [2026/05] Special thanks to [@gugudeshubao](https://github.com/gugudeshubao) for the **Pi0.5 Jetson AGX Orin (SM87) port**: INT8 W8A8 kernels, Orin tile dispatch, frame-cache inference, deployment docs, and benchmark results. Thanks also to [@strayberry](https://github.com/strayberry) for Orin BF16 Pi0.5 testing. See [Orin deployment](docs/deployment_orin.md) and [community benchmarks](#community-benchmarks).
@@ -83,6 +84,7 @@ First call: ~3 s (calibration + CUDA Graph capture). Every subsequent call: 44 m
 | **Run Qwen3.6-27B NVFP4 (LLM, ~100 tok/s typical / 129 tok/s peak on RTX 5090)** | [`docs/qwen36_nvfp4.md`](docs/qwen36_nvfp4.md) — quickstart, K selection, measured throughput · [`docs/qwen36_usage.md`](docs/qwen36_usage.md) — full parameter reference · [`examples/qwen36_openai_server.py`](examples/qwen36_openai_server.py) — OpenAI-compatible HTTP server |
 | **Run Qwen3-8B NVFP4 text serving** | [`docs/qwen3_8b_nvfp4.md`](docs/qwen3_8b_nvfp4.md) · [`examples/qwen3_openai_server.py`](examples/qwen3_openai_server.py) |
 | **Run Motus RTX beta, TeaCache, or RTC-lite** | [`docs/motus_usage_beta.md`](docs/motus_usage_beta.md) · [`docs/rtc_lite_design.md`](docs/rtc_lite_design.md) |
+| **Run Wan2.2 TI2V-5B official-pipeline baseline** | [`docs/wan22_usage.md`](docs/wan22_usage.md) |
 | **Look up the stable Python API surface** | [`docs/stable_api.md`](docs/stable_api.md) |
 | **Integrate a new model into FlashRT** | [`docs/adding_new_model.md`](docs/adding_new_model.md) — end-to-end walkthrough; external plugin pattern in [`docs/plugin_model_template.md`](docs/plugin_model_template.md) |
 | **Contribute a bug fix, benchmark, or model path** | [`CONTRIBUTING.md`](CONTRIBUTING.md) — development rules, validation expectations, and PR checklist |
