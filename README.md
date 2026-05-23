@@ -412,6 +412,9 @@ actions = model.predict(
 )
 # Pi0.5: actions shape (10, 7) — 10 future steps, 7 DOF
 
+# State is part of the VLA observation. Pi0/GROOT N1.6 consume it during
+# inference; token-based variants encode it in the prompt prefix.
+
 # Pi0 (continuous state input):
 model = flash_rt.load_model(
     checkpoint="/path/to/pi0_checkpoint",
@@ -420,16 +423,20 @@ model = flash_rt.load_model(
 actions = model.predict(
     images=[base_img, wrist_img],
     prompt="pick up the red block",
+    state=state,
 )
 # Pi0: actions shape (10, 7)
-# Note: Pi0 also accepts 'state' in observation dict for continuous state input
 
 # GROOT N1.6:
 model = flash_rt.load_model(
     checkpoint="/path/to/groot_checkpoint",
     config="groot",
 )
-actions = model.predict(images=[base_img, wrist_img], prompt="pick up the red block")
+actions = model.predict(
+    images=[base_img, wrist_img],
+    prompt="pick up the red block",
+    state=state,
+)
 # GROOT: actions shape (50, 128) — 50 steps, 128-dim padded
 
 # Pi0-FAST (autoregressive — discrete token generation, not diffusion):

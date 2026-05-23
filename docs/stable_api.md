@@ -118,8 +118,25 @@ class VLAModel:
   `images`: list of `(224,224,3)` uint8 numpy arrays, or a dict with
   `"image"` / `"wrist_image"` / `"wrist_image_right"` keys.
   `prompt`: required on first call, reused on subsequent calls if `None`.
-  `state`: robot state array (Pi0/Pi0-FAST only).
+  `state`: optional robot state array. `predict()` attaches it to the
+  observation as `"state"` when the caller passes image lists, while preserving
+  an explicit `"state"` already present in a dict observation.
+  For frontends whose `set_prompt()` accepts `state`, `predict()` refreshes the
+  prompt prefix when either the prompt text or that prompt-state value changes.
   Returns `np.ndarray` of shape `(action_horizon, action_dim)`.
+
+  `state` is part of the VLA observation schema; each model encodes it through
+  its own reference contract:
+  - Pi0 uses a continuous state token in the action-expert suffix.
+  - Pi0.5's openpi reference encodes state as discretized prompt tokens. The
+    current FlashRT Pi0.5 frontend still tokenizes prompts without that state
+    argument, so this is the remaining Pi0.5 API gap.
+  - Pi0-FAST encodes state in the FAST token prefix.
+  - GROOT N1.6 consumes proprioceptive state from `obs["state"]`; if omitted,
+    the backend uses zeros.
+  - GROOT N1.7 currently uses the lower-level
+    `normalize_state(...)` + `infer(state_normalized, initial_noise=...)`
+    contract rather than the image-list `predict()` contract.
 
 - `recalibrate()` — clear FP8 calibration cache and force re-calibration
   on the next `predict()` call.

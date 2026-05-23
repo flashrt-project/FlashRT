@@ -38,6 +38,7 @@ class VLAModel:
         self._pipe = pipe
         self._framework = framework
         self._current_prompt = None
+        self._current_prompt_state = None
         # rtx Pi0.5 (RtxTorchPi05) requires an explicit
         # ``calibrate_with_real_data([obs])`` call before the first
         # ``infer()``; Thor / rtx GROOT lazy-calibrate inside ``infer()``.
@@ -47,6 +48,24 @@ class VLAModel:
             pipe, "calibrate_with_real_data"
         )
 
+    @staticmethod
+    def _snapshot_prompt_state(state):
+        if state is None:
+            return None
+        try:
+            return np.asarray(state).copy()
+        except Exception:
+            return state
+
+    @staticmethod
+    def _prompt_state_equal(a, b) -> bool:
+        if a is None or b is None:
+            return a is b
+        try:
+            return np.array_equal(np.asarray(a), np.asarray(b))
+        except Exception:
+            return a is b
+
     def predict(self, images, prompt=None, state=None):
         """Run inference.
 
@@ -55,26 +74,43 @@ class VLAModel:
                     Or a dict with 'image'/'wrist_image' keys.
             prompt: text prompt. Only needed on first call or when changing prompt.
                     If None, reuses the last prompt.
-            state: robot state array (Pi0/Pi0-FAST only). Passed to set_prompt().
-                   Pi0 uses continuous state projection; Pi0-FAST discretizes to text.
+            state: optional robot state array. It is forwarded to
+                   set_prompt() for frontends that encode state in prompt
+                   tokens, and attached to the observation for frontends that
+                   consume state during infer().
 
         Returns:
             np.ndarray: actions
         """
-        if prompt is not None and prompt != self._current_prompt:
-            if hasattr(self._pipe, 'set_prompt'):
-                import inspect
-                sig = inspect.signature(self._pipe.set_prompt)
-                if 'state' in sig.parameters:
-                    self._pipe.set_prompt(prompt, state=state)
-                else:
-                    self._pipe.set_prompt(prompt)
-            self._current_prompt = prompt
-        elif self._current_prompt is None:
+        if prompt is None and self._current_prompt is None:
             raise ValueError("prompt is required on first call")
 
+        prompt_for_call = self._current_prompt if prompt is None else prompt
+        prompt_changed = prompt is not None and prompt != self._current_prompt
+        prompt_state_changed = False
+
+        if hasattr(self._pipe, 'set_prompt'):
+            import inspect
+            sig = inspect.signature(self._pipe.set_prompt)
+            prompt_accepts_state = 'state' in sig.parameters
+            if prompt_accepts_state and state is not None:
+                prompt_state_changed = not self._prompt_state_equal(
+                    self._current_prompt_state, state)
+        else:
+            sig = None
+            prompt_accepts_state = False
+
+        if prompt_changed or prompt_state_changed:
+            if hasattr(self._pipe, 'set_prompt'):
+                if prompt_accepts_state:
+                    self._pipe.set_prompt(prompt_for_call, state=state)
+                else:
+                    self._pipe.set_prompt(prompt_for_call)
+            self._current_prompt = prompt_for_call
+            self._current_prompt_state = self._snapshot_prompt_state(state)
+
         if isinstance(images, dict):
-            obs = images
+            obs = dict(images)
         elif isinstance(images, (list, tuple)):
             if len(images) == 0:
                 raise ValueError("images list must have at least one frame")
@@ -90,6 +126,9 @@ class VLAModel:
                 obs['wrist_image_right'] = images[2]
         else:
             raise ValueError("images must be a list of numpy arrays or a dict")
+
+        if state is not None and "state" not in obs:
+            obs["state"] = state
 
         # rtx Pi0.5 expects an explicit calibration bootstrap before the
         # first infer(); fire it lazily here so user code stays "3 lines".

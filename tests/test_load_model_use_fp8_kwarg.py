@@ -5,6 +5,92 @@ from pathlib import Path
 import pytest
 
 
+def test_predict_forwards_state_to_prompt_and_observation():
+    from flash_rt.api import VLAModel
+
+    image0 = object()
+    image1 = object()
+    state = object()
+    actions = object()
+
+    class StateFrontend:
+        prompt_state = None
+        seen_obs = None
+
+        def set_prompt(self, prompt, state=None):
+            type(self).prompt_state = state
+
+        def infer(self, obs):
+            type(self).seen_obs = obs
+            return {"actions": actions}
+
+    model = VLAModel(StateFrontend(), framework="torch")
+    result = model.predict(
+        images=[image0, image1],
+        prompt="pick up the red block",
+        state=state,
+    )
+
+    assert result is actions
+    assert StateFrontend.prompt_state is state
+    assert StateFrontend.seen_obs["state"] is state
+    assert StateFrontend.seen_obs["image"] is image0
+    assert StateFrontend.seen_obs["wrist_image"] is image1
+
+
+def test_predict_refreshes_prompt_when_prompt_state_changes():
+    from flash_rt.api import VLAModel
+
+    image = object()
+    state0 = [0.0, 1.0]
+    state1 = [1.0, 2.0]
+
+    class TokenStateFrontend:
+        prompt_states = []
+
+        def set_prompt(self, prompt, state=None):
+            type(self).prompt_states.append(list(state))
+
+        def infer(self, obs):
+            return {"actions": None}
+
+    TokenStateFrontend.prompt_states = []
+    model = VLAModel(TokenStateFrontend(), framework="torch")
+    model.predict(images=[image], prompt="pick", state=state0)
+    model.predict(images=[image], state=state0)
+    model.predict(images=[image], state=state1)
+
+    assert TokenStateFrontend.prompt_states == [state0, state1]
+
+
+def test_predict_preserves_state_from_observation_dict():
+    from flash_rt.api import VLAModel
+
+    image = object()
+    dict_state = object()
+    kwarg_state = object()
+
+    class ObservationFrontend:
+        seen_obs = None
+
+        def set_prompt(self, prompt):
+            return None
+
+        def infer(self, obs):
+            type(self).seen_obs = obs
+            return {"actions": None}
+
+    model = VLAModel(ObservationFrontend(), framework="torch")
+    model.predict(
+        images={"image": image, "state": dict_state},
+        prompt="pick up the red block",
+        state=kwarg_state,
+    )
+
+    assert ObservationFrontend.seen_obs["state"] is dict_state
+    assert ObservationFrontend.seen_obs["image"] is image
+
+
 def test_load_model_only_passes_use_fp8_when_frontend_accepts_it():
     from flash_rt.api import load_model
 
