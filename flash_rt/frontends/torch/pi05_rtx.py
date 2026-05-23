@@ -1386,12 +1386,16 @@ class Pi05TorchFrontendRtx:
         """:class:`ModelPrecisionSpec` captured at calibration time."""
         return getattr(self, "_precision_spec", None)
 
-    def infer(self, observation: dict, debug: bool = False) -> dict:
+    def infer(self, observation: dict, debug: bool = False,
+              force_full: bool = False) -> dict:
         """Run inference on a single observation.
 
         All GPU work happens on ``self._graph_torch_stream`` — the same
         stream the graph was captured on — so replay + pre/post D2D copies
         are serialized correctly.
+
+        ``force_full`` refreshes the cached encoder K/V for this frame and
+        starts a new temporal-cache window.
 
         When the active pipeline is :class:`Pi05CFGBatchedPipeline`
         (RL mode + batched mode both on), this routes through a B=2
@@ -1414,8 +1418,12 @@ class Pi05TorchFrontendRtx:
         # vision and encoder and replay only the decoder with fresh noise,
         # reusing the encoder K/V cache from the last full forward.
         self._frame_count += 1
-        use_full = (self._cache_frames <= 1 or
-                    self._frame_count % self._cache_frames == 1)
+        scheduled_full = (self._cache_frames <= 1 or
+                          self._frame_count % self._cache_frames == 1)
+        use_full = scheduled_full or bool(force_full)
+        if use_full and self._cache_frames > 1:
+            # An early refresh starts a new cache reuse window.
+            self._frame_count = 1
 
         with torch.cuda.stream(self._graph_torch_stream):
             stream_int = self._graph_torch_stream.cuda_stream
@@ -1453,7 +1461,11 @@ class Pi05TorchFrontendRtx:
             logger.info("Raw actions[0,:5]: %s", raw_actions[0, :5])
             logger.info("Latency: %.1f ms", latency_ms)
 
-        return {"actions": robot_actions}
+        return {
+            "actions": robot_actions,
+            "used_full_pipeline": use_full,
+            "cache_forced_full": bool(force_full and not scheduled_full),
+        }
 
     def _infer_cfg_batched(self, observation: dict,
                            debug: bool = False) -> dict:
