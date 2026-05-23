@@ -184,6 +184,21 @@ def test_load_model_accepts_wan22_ti2v_5b_config():
     }
 
 
+def test_wan22_infer_exposes_teacache_parameters():
+    import inspect
+    from flash_rt.frontends.torch.wan22_rtx import Wan22TorchFrontendRtx
+
+    sig = inspect.signature(Wan22TorchFrontendRtx.infer)
+    for name in (
+        "teacache",
+        "teacache_threshold",
+        "teacache_start_step",
+        "teacache_end_step",
+        "teacache_cache_device",
+    ):
+        assert name in sig.parameters
+
+
 def test_load_model_accepts_groot_n17_config():
     from flash_rt.api import load_model
 

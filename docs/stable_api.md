@@ -81,8 +81,10 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
 - `config="wan22_ti2v_5b"` is an RTX SM120 official-pipeline Wan2.2
   baseline. It exposes `set_prompt(prompt, negative_prompt=...)` and
   `infer(mode="t2v"|"i2v", width=..., height=..., frames=..., steps=...,
-  shift=..., guide_scale=..., seed=...)`; `predict()` is not part of this
-  video-generation API. See `docs/wan22_usage.md`.
+  shift=..., guide_scale=..., seed=..., teacache=False,
+  teacache_threshold=..., teacache_start_step=...,
+  teacache_end_step=..., teacache_cache_device=...)`; `predict()` is not
+  part of this video-generation API. See `docs/wan22_usage.md`.
 - `config="groot_n17"` is registered for `framework="torch"` and
   `hardware="rtx_sm120"`. This route validates the N1.7 DiT
   self/cross-attention path on the vendored FA2 backend.

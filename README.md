@@ -37,7 +37,7 @@ Pi0.5: 44 ms / 23 Hz on Jetson AGX Thor (2v, FP8) · 39.78 ms / 25 Hz (2v, NVFP4
 
 - [2026/05] **Qwen3.6-27B NVFP4** is supported with 256 K context on a single RTX 5090, OpenAI-compatible serving, and **~100 tok/s typical / 129 tok/s peak** decode. See [Qwen3.6 NVFP4](docs/qwen36_nvfp4.md) and [Performance](#qwen36-performance).
 - [2026/05] **Qwen3-8B NVFP4** text-only serving is supported on RTX 5090, with **9.1 ms TTFT at P=64** and **150 tok/s** warm decode. See [Qwen3-8B NVFP4](docs/qwen3_8b_nvfp4.md) and [Performance](#qwen3-8b-performance).
-- [2026/05] **Wan2.2 TI2V-5B** official-pipeline baseline is available on RTX SM120. See [Wan2.2 usage](docs/wan22_usage.md).
+- [2026/05] **Wan2.2 TI2V-5B** official-pipeline baseline is available on RTX SM120, with opt-in TeaCache acceleration. See [Wan2.2 usage](docs/wan22_usage.md).
 - [2026/05] **Lingbot-VLA** is supported. See [Lingbot usage](https://github.com/LiangSu8899/FlashRT/blob/main/docs/lingbot_usage.md).
 - [2026/05] Community Pi0.5 hardware benchmarks: thanks to [@cuihengrui35](https://github.com/cuihengrui35) for **RTX 5060 Ti** results (**41.4 ms / ~24 Hz**, plus LIBERO Spatial **344/350 = 98.3%**) and [@wangerforcs](https://github.com/wangerforcs) for **NVIDIA L40** results (**26.6 ms / 38 Hz**) on 2-view FP8. See [community benchmarks](#community-benchmarks).
 - [2026/05] Special thanks to [@gugudeshubao](https://github.com/gugudeshubao) for the **Pi0.5 Jetson AGX Orin (SM87) port**: INT8 W8A8 kernels, Orin tile dispatch, frame-cache inference, deployment docs, and benchmark results. Thanks also to [@strayberry](https://github.com/strayberry) for Orin BF16 Pi0.5 testing. See [Orin deployment](docs/deployment_orin.md) and [community benchmarks](#community-benchmarks).
@@ -119,6 +119,7 @@ First call: ~3 s (calibration + CUDA Graph capture). Every subsequent call: 44 m
 | **Pi0-FAST** | **Jetson AGX Thor** (SM110) | **8.1 ms/token** (28 ms prefill + 8.1 × N decode) | **123 tok/s** |
 | **Pi0-FAST** | **RTX 5090** (SM120) | **2.39 ms/token** (11 ms prefill + 2.39 × N decode) | **418 tok/s** |
 | **Motus Stage3** | **RTX 5090** (SM120) | **~167 ms** (fast) / **~100 ms** (+TeaCache) | RTC-lite **50 Hz** action streaming |
+| **Wan2.2 TI2V-5B** | **RTX 5090** (SM120) | **178.6 s** 720p/121f/20-step official path; **114.2 s** with TeaCache `0.3` | see [Wan2.2](#wan22-performance) |
 
 <a name="qwen36-performance"></a>
 
@@ -199,6 +200,26 @@ Text-only OpenAI-compatible serving path for
 
 See [`docs/qwen3_8b_nvfp4.md`](docs/qwen3_8b_nvfp4.md) for the
 quickstart, server command, architecture notes, and caveats.
+
+<a name="wan22-performance"></a>
+
+### Wan2.2 TI2V-5B official pipeline (RTX 5090)
+
+Official 720p T2V configuration: `1280x704`, `frames=121`, `steps=20`,
+`shift=5.0`, `guide_scale=5.0`, `sample_solver=unipc`. Timings exclude
+checkpoint load and include text encoding, DiT sampling, and VAE decode.
+
+| Path | TeaCache threshold | DiT calls | Time | Note |
+|---|---:|---:|---:|---|
+| FlashRT official pipeline | off | 20/20 | **178.6 s** | baseline |
+| FlashRT official pipeline | 0.3 | 8/20 | **114.2 s** | 1.56x faster; visible prompt-dependent quality drift |
+| Upstream public reference | off | n/a | under 9 min | Wan2.2 TI2V-5B model-card 720p single consumer GPU reference |
+
+TeaCache is opt-in through `model.infer(teacache=True,
+teacache_threshold=...)`. Use the no-TeaCache output as the quality
+reference; Wan2.2 5B currently uses coefficient-free TeaCache. Upstream
+reference: [Wan2.2-TI2V-5B model card](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B).
+Full usage and caveats are in [`docs/wan22_usage.md`](docs/wan22_usage.md).
 
 <a name="motus-performance"></a>
 

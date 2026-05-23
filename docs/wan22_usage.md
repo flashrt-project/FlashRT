@@ -62,6 +62,34 @@ video = out["video"]       # torch.Tensor [C, F, H, W]
 metadata = out["metadata"]
 ```
 
+TeaCache is available as an explicit experimental acceleration option:
+
+```python
+out = model.infer(
+    mode="t2v",
+    width=1280,
+    height=704,
+    frames=121,
+    steps=20,
+    shift=5.0,
+    guide_scale=5.0,
+    teacache=True,
+    teacache_threshold=0.3,
+    teacache_start_step=1,
+    teacache_end_step=-1,
+    teacache_cache_device="cuda",
+    return_metadata=True,
+)
+
+print(out["metadata"]["teacache"])
+```
+
+`teacache_threshold` controls the speed/quality trade-off. Larger values
+skip more DiT steps and may change composition or motion. The Wan2.2 5B
+route uses training-free relative-L1 TeaCache without model-specific
+coefficients, so treat it as a validation tool until the threshold is
+qualified for your prompt class.
+
 For image-to-video:
 
 ```python
@@ -106,6 +134,26 @@ shift=5.0
 guide_scale=5.0
 sample_solver=unipc
 ```
+
+## Benchmarks
+
+RTX 5090, official Wan2.2-TI2V-5B checkpoint, T2V, `1280x704`,
+`frames=121`, `steps=20`, `shift=5.0`, `guide_scale=5.0`,
+`sample_solver=unipc`. Timings are `infer_seconds`, which includes text
+encoding, DiT sampling, and VAE decode but excludes checkpoint load.
+
+| Path | TeaCache threshold | DiT calls | Time | Peak VRAM | Note |
+|---|---:|---:|---:|---:|---|
+| FlashRT official pipeline | off | 20/20 | **178.6 s** | 24.37 GiB | baseline |
+| FlashRT official pipeline | 0.3 | 8/20 | **114.2 s** | 24.37 GiB | 1.56x faster; visible quality drift on the test prompt |
+| Upstream public reference | off | n/a | under 9 min | n/a | Wan2.2 TI2V-5B model-card 720p single consumer GPU reference |
+
+Use `teacache_threshold=0.15`-`0.30` as a starting search range. In local
+testing `0.03` did not skip steps on a small smoke run, while `0.3`
+skipped aggressively and changed the result. Keep the no-TeaCache output
+as the quality reference for each prompt class.
+
+Upstream reference: [Wan2.2-TI2V-5B model card](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B).
 
 Keep ComfyUI wall time separate from this official-pipeline timing. ComfyUI
 adds graph-node scheduling, model-file repackaging, optional FP8/GGUF/Sage

@@ -32,6 +32,14 @@ def main() -> None:
     parser.add_argument("--shift", type=float, default=5.0)
     parser.add_argument("--guide-scale", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--teacache", action="store_true",
+                        help="Enable Wan2.2 TeaCache acceleration")
+    parser.add_argument("--teacache-threshold", type=float, default=0.0)
+    parser.add_argument("--teacache-start-step", type=int, default=1)
+    parser.add_argument("--teacache-end-step", type=int, default=-1)
+    parser.add_argument("--teacache-cache-device", default="cuda",
+                        choices=("cuda", "cpu", "main_device",
+                                 "offload_device"))
     parser.add_argument("--out", default="wan22_out.mp4")
     args = parser.parse_args()
 
@@ -62,12 +70,23 @@ def main() -> None:
         shift=args.shift,
         guide_scale=args.guide_scale,
         seed=args.seed,
+        teacache=args.teacache,
+        teacache_threshold=args.teacache_threshold,
+        teacache_start_step=args.teacache_start_step,
+        teacache_end_step=args.teacache_end_step,
+        teacache_cache_device=args.teacache_cache_device,
         save_path=args.out,
         return_metadata=True,
     )
     meta = result["metadata"]
     print(f"[wan22] infer={meta['infer_seconds']:.2f}s "
           f"peak={meta['peak_allocated_gib']:.2f} GiB")
+    if meta["teacache"]["enabled"]:
+        tc = meta["teacache"]
+        print("[wan22] teacache "
+              f"threshold={tc['threshold']} "
+              f"cond_skipped={len(tc['cond_skipped'])} "
+              f"uncond_skipped={len(tc['uncond_skipped'])}")
     print(f"[wan22] saved {pathlib.Path(args.out)}")
 
 
