@@ -13,8 +13,18 @@ compatible HTTP server, see
 ## 0. Quickstart
 
 The minimum to run Qwen3.6-27B NVFP4 with K=6 speculative decode at
-~129 tok/s decode on RTX 5090. Step 1 is one-time; step 2 is the
+~134 tok/s decode on the short standard prompt. Step 1 is one-time; step 2 is the
 inference call.
+
+Install the Torch frontend extra before building/running Qwen. It
+includes the Qwen long-context runtime dependencies (`einops`,
+`triton>=3.2`, and `packaging`):
+
+```bash
+pip install -e ".[torch]"
+# Add the server extra too if you use examples/qwen36_openai_server.py:
+# pip install -e ".[torch,server]"
+```
 
 ```python
 # 1) Build the kernels (one-time, from the FlashRT repo root)
@@ -45,7 +55,7 @@ text = fe._tokenizer.decode(out[0, input_ids.shape[1]:].tolist())
 print(text)
 ```
 
-`K=6` is the recommended default (peaks at ~129 tok/s decode on RTX
+`K=6` is the recommended default (peaks at ~134 tok/s decode on RTX
 5090 for short prompts). For sustained / long generations, drop to
 `K=5` or `K=3` — see §3 for the full curve.
 
@@ -56,16 +66,19 @@ The NVFP4 inference path needs **two** checkpoints:
 | Role | Format | Source |
 |---|---|---|
 | Main model | NVFP4 W4A16 (`compressed-tensors` `nvfp4-pack-quantized`) | [`prithivMLmods/Qwen3.6-27B-NVFP4`](https://huggingface.co/prithivMLmods/Qwen3.6-27B-NVFP4) |
-| MTP head | FP8 e4m3 block-128 (only `mtp.safetensors` is consumed) | the upstream FP8 ckpt (Qwen3.6-Next-27B-FP8) |
+| MTP head | FP8 e4m3 block-128 or community BF16/native `mtp.safetensors` | paired Qwen3.6-Next-27B MTP ckpt |
 
 Pass the main NVFP4 ckpt directory as the `checkpoint_path` argument
 to `Qwen36TorchFrontendRtx`. The NVFP4 ckpt does **not** ship an MTP
-module — `compressed-tensors` strips it — so the FP8 ckpt directory
-that contains `mtp.safetensors` is loaded separately via the
-`FLASHRT_QWEN36_MTP_CKPT_DIR` environment variable; we convert
-FP8 → BF16 → NVFP4 once at load (no FP8 in the hot path). Without
-the env var, MTP is None and speculative decode is disabled (pure
-single-token decode still works at ~36 tok/s).
+module — `compressed-tensors` strips it — so the ckpt directory that
+contains `mtp.safetensors` is loaded separately via the
+`FLASHRT_QWEN36_MTP_CKPT_DIR` environment variable. FP8-source MTP is
+converted FP8 → BF16 → NVFP4 once at load (no FP8 in the hot path).
+BF16/native MTP checkpoints keep BF16 projection weights by default for
+better drafter alignment; set `FLASHRT_QWEN36_MTP_KEEP_BF16=0` to force
+the lower-memory NVFP4-converted path. Without the env var, MTP is None
+and speculative decode is disabled (pure single-token decode still
+works at ~36 tok/s).
 
 ### Can I use a different NVFP4 Qwen3.6 checkpoint?
 
@@ -101,12 +114,11 @@ Single representative prompt (`"Explain quantum entanglement in one
 short paragraph."`, 11 tokens), max_new_tokens=128, default `K=6`:
 
 ```
-TTFT (prefill)        :   ~237 ms      (one-shot, doesn't recur)
-TPOT                  :   ~7.74 ms/token
-★ decode tok/s        :   128.87       ← v1 headline
-end-to-end tok/s      :   ~104         (with prefill amortized)
+TTFT (prefill)        :   ~233 ms      (one-shot, doesn't recur)
+TPOT                  :   ~7.45 ms/token
+★ decode tok/s        :   134.18
 
-spec stats: K=6  attempts=31  p_full=0.290  p_ind=0.522  AL=4.10
+spec stats: K=6  attempts=29  p_full=0.345  p_ind=0.575  AL=4.38
 ```
 
 `AL=4.10` means each spec cycle emits 4.1 tokens on average; `p_full`
@@ -217,46 +229,110 @@ Set via `TEST_K=<n>` env var when running `standard_bench`, or pass
 
 ## 4. Long-context throughput
 
-Decode tok/s at fixed context length (synthetic-filled KV cache, no
-spec — single-token forward then reported as if spec amortization
-applied at AL=3.17). Uses the TurboQuant packed KV cache.
+When `max_seq` is above the long-context threshold, the frontend keeps
+a small BF16 KV/spec working window and allocates a compressed KV cache
+for requests routed beyond it. The default compressed route is FP8 KV;
+TurboQuant remains available for memory/accuracy bisection. The default
+long-route threshold is 512 prompt tokens, preserving the peak BF16/spec
+decode path for very short prompts while using chunked FP8-KV for
+512-token and larger prompts. Short prompts route to FP8-KV only if the
+full request exceeds the retained BF16 window.
 
-```
-   ctx     forward ms    decode tok/s  (eager)    CUDA-Graph replay
-  8 K        26.6              119.3                36.0 ms /  88.6
- 16 K        30.4              105.4                ─    (capture only at 32 K+)
- 32 K        38.7               81.3                35.7 ms /  88.7
- 64 K        55.5               57.1                51.8 ms /  61.2
-128 K        87.7               36.2                85.3 ms /  37.1
-200 K       120.5               26.3                ─
-256 K       153.4               20.7               150.8 ms /  21.0
-```
-
-Replay cos vs eager = **1.000000** at every ctx (32 K / 64 K / 128 K /
-256 K) — bit-identical token output across replays.
-
-Spec decode (K=3..6) is **not yet integrated with the long-ctx
-TurboQuant path** — that's a Phase 3D follow-up. The numbers above are
-single-token forward throughput at long ctx, projected to AL=3.17.
+Spec decode is wired to the long-ctx compressed-KV path. Short requests
+that fit in the retained BF16 window still use the normal CUDA-Graph
+MTP spec path; longer requests use MTP draft plus compressed-KV verify.
+The default long-context route is `FLASHRT_QWEN36_LONG_KV_CACHE=fp8`,
+matching the community-style e4m3 FP8 KV serving direction. That path
+stores persistent full-attn KV as FP8. On SM120, long verify attention
+uses the vendored FlashInfer XQA native FP8-KV kernel once the KV length
+passes the measured `FLASHRT_QWEN36_FP8_XQA_MIN_CTX=auto` bucket policy,
+and keeps the older FP8->BF16-stage + FA2 bridge in buckets where that
+path measured faster.
+Set `FLASHRT_QWEN36_LONG_KV_CACHE=tq` to use the TurboQuant
+packed path for memory/accuracy bisection.
+The current measured FP8-KV warm decode table, including 256K, is in
+the TTFT section below.
+The long TQ/spec path uses measured K buckets by default: `3` below 6K
+prompt tokens, `4` from 6K to 12K, `5` from 12K to 24K, `4` from 24K
+to 48K, `7` from 48K to below 160K, and `6` elsewhere, then
+adaptively drops from K≥4 to `K=3` inside a request when early accept
+stats show a low-hit prompt; set
+`FLASHRT_QWEN36_TQ_SPEC_K` to force a fixed K. TQ verify and the MTP
+draft chain are CUDA-Graph captured per `(cur_pos, K)` in warm state.
+Long-context MTP prompt-tail prefill seeds the drafter's private K/V
+cache with 1024 prompt-tail rows for 12K+ prompts by default, which
+keeps long-context draft acceptance materially higher without full MTP
+prompt prefill.
+Long-context prefill uses the same TQ S=K forward in chunks (default
+chunk size = `MAX_Q_SEQ`, currently 2048) instead of one full forward
+per prompt token; full-attention layers use the vendored FA2 causal
+hdim=256 path for one q_seq=S attention call per chunk, and
+linear-attention layers use vendored FLA-style chunk/WY Gated DeltaNet
+scans for prefill chunks. Long-context NVFP4 defaults to the fused MLP
+gate/up GEMM when the checkpoint's gate/up scales allow it; the separate
+non-widen tile remains available by setting
+`FLASHRT_QWEN36_FUSE_MLP_GATE_UP=0`.
+Linear-attention A/B projections use a deterministic fused AB96 BF16
+kernel in prefill chunks, and the default Gated DeltaNet prefill route
+uses the vendored FLA-style chunk/WY backend because it is currently
+much faster for large prompt chunks. Intermediate prompt chunks skip
+final-norm/lm-head logits entirely, and the final chunk computes logits
+only for the last prompt row. The large K-row logits workspace is
+allocated lazily only for explicit all-logits diagnostic calls. Set
+`FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND=native` to force the fully
+FlashRT-kernel direct-conv path for cleanup/bisection work.
 
 ## 5. TTFT (prefill latency)
 
-Prefill is one S=1 forward per prompt token, captured per-cur_pos as
-CUDA Graphs. Cost scales linearly:
+The recommended full-context serving profile keeps the 2048-row BF16
+working window for chunk size, uses FP8 persistent KV, and routes
+512-token and larger prompts through the chunked compressed-KV path:
 
-```
-prompt_len   TTFT (ms)       per-token (ms)
-        11   ~237            21.5
-        17   ~370            21.8
-        22   ~480            21.8
-        41   ~890            21.7
-       100   ~2200           22.0
+```bash
+export FLASHRT_QWEN36_LONG_KV_CACHE=fp8
+export FLASHRT_QWEN36_LONG_CTX_ROUTE_MIN_SEQ=512
 ```
 
-≈ 22 ms / token of prefill, prompt-length-independent rate. For a 128
-prompt-token call, TTFT ≈ 2.8 s. The TPOT (decode) measured from the
-spec loop is independent of TTFT and dominates total wall time when
-output ≫ prompt.
+Warm measurements on RTX 5090, `max_new_tokens=64`, repeated text
+prompt. The 128-token row uses BF16/spec because it is still the highest
+decode-throughput route there; 512 tokens and above use FP8-KV.
+
+| prompt ctx | route | K | MTP tail | TTFT / prefill | prefill tok/s | decode ms | decode tok/s | spec attempts / accepts / full |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| 128 | BF16/spec | 6 | full | 2.72 s | 47 | 454.0 | 141.0 | 14 / 49 / 7 |
+| 512 | FP8-KV | 4 | 512 | 66.6 ms | 7,683 | 534.6 | 119.7 | 19 / 44 / 9 |
+| 1 K | FP8-KV | 5 | 2048 | 122.9 ms | 8,334 | 554.9 | 115.3 | 18 / 46 / 7 |
+| 2 K | FP8-KV | 6 | 2048 | 238.9 ms | 8,572 | 427.7 | 149.6 | 13 / 51 / 8 |
+| 4 K | FP8-KV | 3 | 512 | 333.4 ms | 12,285 | 561.9 | 113.9 | 21 / 43 / 10 |
+| 8 K | FP8-KV | 5 | 2048 | 749.7 ms | 10,926 | 406.2 | 157.5 | 13 / 50 / 6 |
+| 16 K | FP8-KV | 7 | 2048 | 1.55 s | 10,587 | 375.2 | 170.6 | 10 / 53 / 5 |
+| 32 K | FP8-KV | 6 | 2048 | 3.54 s | 9,262 | 406.4 | 157.5 | 12 / 52 / 5 |
+| 64 K | FP8-KV | 7 | 2048 | 9.11 s | 7,195 | 363.3 | 176.1 | 10 / 53 / 3 |
+| 128 K | FP8-KV | 7 | 2048 | 26.64 s | 4,920 | 415.9 | 153.9 | 11 / 52 / 2 |
+| 200 K | FP8-KV | 6 | 2048 | 56.81 s | 3,605 | 558.0 | 114.7 | 14 / 49 / 3 |
+| 256 K | FP8-KV | 6 | 2048 | 87.71 s | 2,989 | 493.5 | 129.7 | 12 / 51 / 4 |
+
+`decode tok/s` excludes TTFT and is the TPOT-style LLM serving metric.
+The low-TTFT FP8-KV route is available below 512 tokens, but it trades
+away decode throughput on the measured prompt distribution.
+
+FP8 KV also improves prefill versus the TurboQuant cache, but the gain
+is modest until very large contexts because prefill is dominated by the
+full prompt forward. Local FP8-vs-TQ prefill deltas:
+
+| ctx | FP8 prefill | TQ prefill | FP8 gain |
+|---:|---:|---:|---:|
+| 4 K | 320.6 ms | 329.9 ms | 2.8% |
+| 16 K | 1.506 s | 1.557 s | 3.3% |
+| 64 K | 9.073 s | 9.451 s | 4.0% |
+| 128 K | 26.70 s | 27.78 s | 3.9% |
+| 200 K | 56.75 s | 63.60 s | 10.8% |
+| 256 K | 87.55 s | 99.63 s | 12.1% |
+
+The table is measured with the public frontend API below: run one
+same-shape warmup generation, then time a second generation with CUDA
+events around the prefill and decode windows. Developer-only micro-bench
+probes live outside the tracked public tree.
 
 ## 6. Reproduction
 
@@ -296,4 +372,5 @@ HF_HUB_OFFLINE=1
 TRANSFORMERS_OFFLINE=1
 ```
 
-`internal-tests/` is gitignored — micro-bench probes are dev-local.
+Developer-only micro-bench probes are intentionally kept out of the
+tracked public tree.

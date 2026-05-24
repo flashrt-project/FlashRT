@@ -24,4 +24,11 @@ void silu_mul_qwen36_bf16(
     int n,
     cudaStream_t stream);
 
+void sigmoid_mul_qwen36_bf16(
+    const __nv_bfloat16* gate,
+    const __nv_bfloat16* x,
+    __nv_bfloat16* out,
+    int n,
+    cudaStream_t stream);
+
 }  // namespace flash_rt::kernels

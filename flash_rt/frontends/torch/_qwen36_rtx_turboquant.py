@@ -50,6 +50,7 @@ Validation entry points:
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
@@ -548,12 +549,12 @@ class TurboQuantKVCache:
     def write_kv_fast(self, layer: int, pos_start: int, pos_end: int,
                       k: torch.Tensor, v: torch.Tensor) -> None:
         """Phase 3A B9-S10: capture-safe quantize+pack via 4 small CUDA
-        kernels + 3 cuBLAS GEMMs (torch.matmul).
+        kernels + 3 explicit GEMM wrappers by default.
 
-        Bit-exact with the slow Python reference because the GEMMs go
-        through the same cuBLAS path (same tile order, same TF32
-        reduction).  No torch tensor allocations on the hot path
-        (all scratch pre-alloc'd here, GEMM outputs use `out=` views).
+        The default kernel GEMM route uses cuBLASLt tactics (A=3, B=0,
+        C=3) validated against the torch reference on real 2048-token
+        long-prefill chunks.  Set FLASHRT_QWEN36_TQ_KERNEL_WRITE=0 to
+        force the older torch.matmul GEMM route for bisection.
         """
         if not self.packed:
             raise RuntimeError(
@@ -568,13 +569,13 @@ class TurboQuantKVCache:
         M = S * nkv
         d = self.setup.head_dim
 
-        # Lazy scratch — write_kv operates per-call on a single new
-        # token (S=1 for decode, ≤16 for prefill), so cap is small
-        # regardless of max_seq.  Sized to W_CAP_S * nkv = 256 rows
-        # comfortably (covers any q_seq ≤ 64).
-        W_CAP_S = 64
-        cap_M = W_CAP_S * nkv
-        if not hasattr(self, '_w_kv_unit'):
+        # Lazy scratch.  Decode writes one token, but chunked long
+        # prefill can write larger S.  Grow the scratch to the largest
+        # observed M; fixed 64-token capacity silently overflowed when
+        # experimenting with 128-token prefill chunks.
+        cap_M = max(64 * nkv, M)
+        if (not hasattr(self, '_w_kv_unit')
+                or int(getattr(self, '_w_cap_M', 0)) < cap_M):
             t = lambda *shape: torch.empty(  # noqa: E731
                 *shape, dtype=torch.float32, device=self.device)
             self._w_kv_unit = t(2 * cap_M, d)        # [k_unit; v_unit]
@@ -584,12 +585,20 @@ class TurboQuantKVCache:
             self._w_residual = t(cap_M, d)
             self._w_Sr = t(cap_M, d)
             self._w_norms = t(3 * cap_M)            # [norm_k|norm_v|rnorm_k]
+            self._w_cap_M = cap_M
+        else:
+            cap_M = int(self._w_cap_M)
 
         rot_fp32 = self.setup.rotations[layer]
         jl_fp32 = self.setup.jl[layer]
         cb_k = self.setup.codebooks[self.setup.b_k_mse]
         cb_v = self.setup.codebooks[self.setup.b_v]
         s = torch.cuda.current_stream().cuda_stream
+        use_kernel_gemm = (
+            os.environ.get('FLASHRT_QWEN36_TQ_KERNEL_WRITE', '1') == '1'
+            and hasattr(fvk, 'tq_fp32_gemm_lt_bt_algo')
+            and hasattr(fvk, 'tq_fp32_gemm_lt_algo')
+        )
 
         # Slice the scratch (views, no alloc).
         k_unit = self._w_kv_unit[:M]
@@ -612,9 +621,15 @@ class TurboQuantKVCache:
             M, self.setup.b_k_mse, self.setup.b_v, s,
         )
         # GEMM A: [k_unit; v_unit] @ rotation^T → [y_k; y_v]
-        # rot_fp32.T is a view (no alloc).
-        torch.matmul(self._w_kv_unit[:2 * M], rot_fp32.T,
-                     out=self._w_kv_rotated[:2 * M])
+        if use_kernel_gemm:
+            fvk.tq_fp32_gemm_lt_bt_algo(
+                self._w_kv_unit[:2 * M].data_ptr(), rot_fp32.data_ptr(),
+                self._w_kv_rotated[:2 * M].data_ptr(),
+                2 * M, d, d, 3, s,
+            )
+        else:
+            torch.matmul(self._w_kv_unit[:2 * M], rot_fp32.T,
+                         out=self._w_kv_rotated[:2 * M])
 
         # K2: argmin → idx, pack 4-bit to cache, gather cb_k[idx_k] for dq
         fvk.tq_write_k2_argmin_pack(
@@ -627,7 +642,13 @@ class TurboQuantKVCache:
             self.setup.b_k_mse, self.setup.b_v, s,
         )
         # GEMM B: cb_k[idx_k] @ rotation → dq_k
-        torch.matmul(dq_in, rot_fp32, out=dq_out)
+        if use_kernel_gemm:
+            fvk.tq_fp32_gemm_lt_algo(
+                dq_in.data_ptr(), rot_fp32.data_ptr(), dq_out.data_ptr(),
+                M, d, d, 0, s,
+            )
+        else:
+            torch.matmul(dq_in, rot_fp32, out=dq_out)
 
         # K3: residual = k_unit - dq_k ; rnorm_k = ‖residual‖
         fvk.tq_write_k3_residual_rnorm(
@@ -636,7 +657,13 @@ class TurboQuantKVCache:
             M, s,
         )
         # GEMM C: residual @ jl^T → Sr
-        torch.matmul(residual, jl_fp32.T, out=Sr)
+        if use_kernel_gemm:
+            fvk.tq_fp32_gemm_lt_bt_algo(
+                residual.data_ptr(), jl_fp32.data_ptr(), Sr.data_ptr(),
+                M, d, d, 3, s,
+            )
+        else:
+            torch.matmul(residual, jl_fp32.T, out=Sr)
 
         # K4: pack qjl bits + write all norms (fp16) to cache slot
         fvk.tq_write_k4_qjl_norms(
@@ -654,6 +681,22 @@ class TurboQuantKVCache:
     # Writes into caller-supplied (max_seq, num_kv, head_dim) bf16
     # staging buffers — saves the read_kv allocator round-trip.
     # ────────────────────────────────────────────────────────────────
+    def _ensure_fast_dequant_scratch(self, cap_M: int) -> None:
+        """Grow fp32 dequant scratch to the active window, not max_seq."""
+        d = self.setup.head_dim
+        cap_M = int(cap_M)
+        if int(getattr(self, '_fast_cap_M', 0)) >= cap_M:
+            return
+        self._fast_yk_yv = torch.empty(
+            2 * cap_M, d, dtype=torch.float32, device=self.device)
+        self._fast_qjl = torch.empty(
+            cap_M, d, dtype=torch.float32, device=self.device)
+        self._fast_rotated_fp32 = torch.empty(
+            2 * cap_M, d, dtype=torch.float32, device=self.device)
+        self._fast_kqjl_fp32 = torch.empty(
+            cap_M, d, dtype=torch.float32, device=self.device)
+        self._fast_cap_M = cap_M
+
     def read_kv_fast(self, layer: int, pos_end: int,
                      k_stage: torch.Tensor, v_stage: torch.Tensor) -> None:
         """B9 dequant: packed[layer, :pos_end] → k_stage[:pos_end] / v_stage.
@@ -665,25 +708,28 @@ class TurboQuantKVCache:
         if not self.packed:
             raise RuntimeError(
                 'read_kv_fast requires packed=True (B8 layout)')
+        if pos_end <= 0:
+            return
+        # cuBLASLt's bitwise match to torch.matmul is shape/tactic
+        # sensitive.  The validated production unit is the 2048-token
+        # long-prefill window, so larger full-prefix reads are assembled
+        # from the same exact window kernel.
+        chunk = 2048
+        if pos_end > chunk:
+            for ps in range(0, pos_end, chunk):
+                self.read_kv_fast_window(
+                    layer, ps, min(ps + chunk, pos_end),
+                    k_stage, v_stage)
+            return
         from flash_rt import flash_rt_kernels as fvk
         d = self.setup.head_dim
         nkv = self.num_kv
         M = pos_end * nkv
 
-        # Scratch pre-allocated to max_seq (CUDA-Graph friendly: no
-        # dynamic resize on the hot path).  All buffers fp32 since the
-        # unpack kernel emits fp32 directly (skips the bf16-intermediate
-        # + `.float()` cast that previously cost a 256 MB temp / call).
-        cap_M = self.max_seq * nkv
-        if not hasattr(self, '_fast_yk_yv'):
-            self._fast_yk_yv = torch.empty(
-                2 * cap_M, d, dtype=torch.float32, device=self.device)
-            self._fast_qjl = torch.empty(
-                cap_M, d, dtype=torch.float32, device=self.device)
-            self._fast_rotated_fp32 = torch.empty(
-                2 * cap_M, d, dtype=torch.float32, device=self.device)
-            self._fast_kqjl_fp32 = torch.empty(
-                cap_M, d, dtype=torch.float32, device=self.device)
+        # Scratch is sized to the active dequant window.  The full-prefix
+        # path above decomposes long reads into 2048-token windows, so
+        # allocating by max_seq would waste multiple GB at 128K/256K.
+        self._ensure_fast_dequant_scratch(M)
 
         yk = self._fast_yk_yv[:M]
         yv = self._fast_yk_yv[M:2 * M]
@@ -708,11 +754,17 @@ class TurboQuantKVCache:
             yk.data_ptr(), qjl_f.data_ptr(), yv.data_ptr(),
             M, self.setup.b_k_mse, self.setup.b_v, s,
         )
-        # 2) fp32 GEMMs via torch.matmul (capture-safe, well-tested with
-        #    CUDA Graph; same perf as our cuBLAS TF32 wrapper since
-        #    PyTorch 2.x uses TF32 on sm≥80 by default for fp32 matmul).
-        torch.matmul(self._fast_yk_yv[:2 * M], rot_fp32, out=rotated)
-        torch.matmul(qjl_f, jl_fp32, out=kqjl)
+        # 2) fp32 GEMMs via explicit wrappers.  PyTorch chooses different
+        # tactics for the two shapes: Lt algo 1 matches the rotation GEMM,
+        # while ordinary cuBLAS matches the JL GEMM bit-for-bit.
+        fvk.tq_fp32_gemm_lt_algo(
+            self._fast_yk_yv[:2 * M].data_ptr(), rot_fp32.data_ptr(),
+            rotated.data_ptr(), 2 * M, d, d, 1, s,
+        )
+        fvk.tq_fp32_gemm_fp32(
+            qjl_f.data_ptr(), jl_fp32.data_ptr(), kqjl.data_ptr(),
+            M, d, d, s,
+        )
         # 3) combine fp32 in → bf16 out
         coef = math.sqrt(math.pi / 2.0) / d
         k_flat = k_stage[:pos_end].view(M, d)
@@ -753,18 +805,7 @@ class TurboQuantKVCache:
         nkv = self.num_kv
         M = (pos_end - pos_start) * nkv
 
-        # Reuse the same fp32 scratches as read_kv_fast — sized to
-        # max_seq * nkv, which always covers any window M.
-        cap_M = self.max_seq * nkv
-        if not hasattr(self, '_fast_yk_yv'):
-            self._fast_yk_yv = torch.empty(
-                2 * cap_M, d, dtype=torch.float32, device=self.device)
-            self._fast_qjl = torch.empty(
-                cap_M, d, dtype=torch.float32, device=self.device)
-            self._fast_rotated_fp32 = torch.empty(
-                2 * cap_M, d, dtype=torch.float32, device=self.device)
-            self._fast_kqjl_fp32 = torch.empty(
-                cap_M, d, dtype=torch.float32, device=self.device)
+        self._ensure_fast_dequant_scratch(M)
 
         yk = self._fast_yk_yv[:M]
         yv = self._fast_yk_yv[M:2 * M]
@@ -794,8 +835,14 @@ class TurboQuantKVCache:
             yk.data_ptr(), qjl_f.data_ptr(), yv.data_ptr(),
             M, self.setup.b_k_mse, self.setup.b_v, s,
         )
-        torch.matmul(self._fast_yk_yv[:2 * M], rot_fp32, out=rotated)
-        torch.matmul(qjl_f, jl_fp32, out=kqjl)
+        fvk.tq_fp32_gemm_lt_algo(
+            self._fast_yk_yv[:2 * M].data_ptr(), rot_fp32.data_ptr(),
+            rotated.data_ptr(), 2 * M, d, d, 1, s,
+        )
+        fvk.tq_fp32_gemm_fp32(
+            qjl_f.data_ptr(), jl_fp32.data_ptr(), kqjl.data_ptr(),
+            M, d, d, s,
+        )
         coef = math.sqrt(math.pi / 2.0) / d
         k_flat = k_stage[pos_start:pos_end].view(M, d)
         v_flat = v_stage[pos_start:pos_end].view(M, d)
@@ -828,4 +875,3 @@ class TurboQuantKVCache:
         v_hat = self.setup.dequant_v(idx_v, norm_v, layer)
 
         return k_hat.to(torch.bfloat16), v_hat.to(torch.bfloat16)
-

@@ -165,6 +165,35 @@ void dequantize_fp8_static_bf16(const __nv_fp8_e4m3* input,
         input, output, d_scale, n);
 }
 
+__global__ void dequantize_fp8_static_bf16_2_kernel(
+        const __nv_fp8_e4m3* __restrict__ in0,
+        const __nv_fp8_e4m3* __restrict__ in1,
+        __nv_bfloat16* __restrict__ out0,
+        __nv_bfloat16* __restrict__ out1,
+        const float* __restrict__ s0,
+        const float* __restrict__ s1,
+        int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    float fs0 = *s0;
+    float fs1 = *s1;
+    for (int i = idx; i < n; i += gridDim.x * blockDim.x) {
+        out0[i] = __float2bfloat16(static_cast<float>(in0[i]) * fs0);
+        out1[i] = __float2bfloat16(static_cast<float>(in1[i]) * fs1);
+    }
+}
+
+void dequantize_fp8_static_bf16_2(
+        const __nv_fp8_e4m3* in0, const __nv_fp8_e4m3* in1,
+        __nv_bfloat16* out0, __nv_bfloat16* out1,
+        const float* s0, const float* s1,
+        int n, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    if (blocks > 4096) blocks = 4096;
+    dequantize_fp8_static_bf16_2_kernel<<<blocks, threads, 0, stream>>>(
+        in0, in1, out0, out1, s0, s1, n);
+}
+
 __global__ void dequantize_fp8_static_bf16_6_kernel(
         const __nv_fp8_e4m3* __restrict__ in0,
         const __nv_fp8_e4m3* __restrict__ in1,

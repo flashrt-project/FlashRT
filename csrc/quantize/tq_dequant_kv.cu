@@ -37,8 +37,11 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #include <cstdint>
 #include <cstdio>
+#include <mutex>
+#include <unordered_map>
 
 namespace {
 
@@ -48,6 +51,87 @@ constexpr int IDX_PACKED_BYTES = D / 2;     // 128
 constexpr int QJL_PACKED_BYTES = D / 8;     // 32
 constexpr int CB_K_MAX = 16;       // up to 4-bit codebook
 constexpr int CB_V_MAX = 16;
+
+struct TqLtFp32Plan {
+    cublasLtMatmulDesc_t desc = nullptr;
+    cublasLtMatrixLayout_t a_desc = nullptr;
+    cublasLtMatrixLayout_t b_desc = nullptr;
+    cublasLtMatrixLayout_t c_desc = nullptr;
+    cublasLtMatmulAlgo_t algo{};
+    bool valid = false;
+};
+
+static inline uint64_t tq_lt_plan_key(
+    int M, int N, int K, int algo_idx, int trans_b)
+{
+    return ((uint64_t)(uint32_t)M << 32)
+        ^ ((uint64_t)(uint32_t)N << 22)
+        ^ ((uint64_t)(uint32_t)K << 12)
+        ^ ((uint64_t)(uint32_t)(algo_idx & 0xff) << 4)
+        ^ (uint64_t)(trans_b & 0xf);
+}
+
+static TqLtFp32Plan* tq_get_lt_fp32_plan(
+    cublasLtHandle_t lt,
+    int M, int N, int K, int algo_idx, bool trans_b,
+    size_t workspace_size)
+{
+    static std::mutex mu;
+    static std::unordered_map<uint64_t, TqLtFp32Plan> cache;
+
+    if (algo_idx < 0) algo_idx = 0;
+    const uint64_t key = tq_lt_plan_key(M, N, K, algo_idx, trans_b ? 1 : 0);
+    std::lock_guard<std::mutex> lock(mu);
+    auto it = cache.find(key);
+    if (it != cache.end()) return &it->second;
+
+    TqLtFp32Plan plan;
+    cublasOperation_t opN = CUBLAS_OP_N;
+    cublasOperation_t opB = trans_b ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasLtOrder_t row_order = CUBLASLT_ORDER_ROW;
+
+    cublasLtMatmulDescCreate(&plan.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    cublasLtMatmulDescSetAttribute(
+        plan.desc, CUBLASLT_MATMUL_DESC_TRANSA, &opN, sizeof(opN));
+    cublasLtMatmulDescSetAttribute(
+        plan.desc, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB));
+
+    cublasLtMatrixLayoutCreate(&plan.a_desc, CUDA_R_32F, M, K, K);
+    cublasLtMatrixLayoutSetAttribute(
+        plan.a_desc, CUBLASLT_MATRIX_LAYOUT_ORDER,
+        &row_order, sizeof(row_order));
+    cublasLtMatrixLayoutCreate(
+        &plan.b_desc, CUDA_R_32F, trans_b ? N : K, trans_b ? K : N,
+        trans_b ? K : N);
+    cublasLtMatrixLayoutSetAttribute(
+        plan.b_desc, CUBLASLT_MATRIX_LAYOUT_ORDER,
+        &row_order, sizeof(row_order));
+    cublasLtMatrixLayoutCreate(&plan.c_desc, CUDA_R_32F, M, N, N);
+    cublasLtMatrixLayoutSetAttribute(
+        plan.c_desc, CUBLASLT_MATRIX_LAYOUT_ORDER,
+        &row_order, sizeof(row_order));
+
+    cublasLtMatmulPreference_t pref = nullptr;
+    cublasLtMatmulPreferenceCreate(&pref);
+    cublasLtMatmulPreferenceSetAttribute(
+        pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        &workspace_size, sizeof(workspace_size));
+    constexpr int kMaxAlgos = 32;
+    cublasLtMatmulHeuristicResult_t heuristics[kMaxAlgos]{};
+    int returned = 0;
+    cublasLtMatmulAlgoGetHeuristic(
+        lt, plan.desc, plan.a_desc, plan.b_desc, plan.c_desc, plan.c_desc,
+        pref, kMaxAlgos, heuristics, &returned);
+    cublasLtMatmulPreferenceDestroy(pref);
+    if (returned > 0) {
+        if (algo_idx >= returned) algo_idx = returned - 1;
+        plan.algo = heuristics[algo_idx].algo;
+        plan.valid = true;
+    }
+
+    auto [inserted_it, _] = cache.emplace(key, plan);
+    return &inserted_it->second;
+}
 
 // ── Unpack kernel ───────────────────────────────────────────────────
 // Block: D threads, one per output coord.  Grid: M blocks (M = S*NUM_KV).
@@ -1049,6 +1133,164 @@ void tq_fp32_gemm_tf32_launch(
         c_fp32, CUDA_R_32F, N,
         CUBLAS_COMPUTE_32F_FAST_TF32,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
+extern "C"
+void tq_fp32_gemm_fp32_launch(
+    const void* a_fp32, const void* b_fp32,
+    void* c_fp32,
+    int M, int N, int K,
+    cudaStream_t stream)
+{
+    static cublasHandle_t handle = nullptr;
+    if (handle == nullptr) {
+        cublasCreate(&handle);
+        cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
+    }
+    cublasSetStream(handle, stream);
+
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasGemmEx(
+        handle,
+        CUBLAS_OP_N,
+        CUBLAS_OP_N,
+        N, M, K,
+        &alpha,
+        b_fp32, CUDA_R_32F, N,
+        a_fp32, CUDA_R_32F, K,
+        &beta,
+        c_fp32, CUDA_R_32F, N,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT);
+}
+
+extern "C"
+void tq_fp32_gemm_fp32_bt_launch(
+    const void* a_fp32, const void* b_fp32,
+    void* c_fp32,
+    int M, int N, int K,
+    cudaStream_t stream)
+{
+    static cublasHandle_t handle = nullptr;
+    if (handle == nullptr) {
+        cublasCreate(&handle);
+        cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
+    }
+    cublasSetStream(handle, stream);
+
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasGemmEx(
+        handle,
+        CUBLAS_OP_T,
+        CUBLAS_OP_N,
+        N, M, K,
+        &alpha,
+        b_fp32, CUDA_R_32F, K,
+        a_fp32, CUDA_R_32F, K,
+        &beta,
+        c_fp32, CUDA_R_32F, N,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT);
+}
+
+extern "C"
+void tq_fp32_gemm_lt_algo_launch(
+    const void* a_fp32, const void* b_fp32,
+    void* c_fp32,
+    int M, int N, int K,
+    int algo_idx,
+    cudaStream_t stream);
+
+extern "C"
+void tq_fp32_gemm_lt_bt_algo_launch(
+    const void* a_fp32, const void* b_fp32,
+    void* c_fp32,
+    int M, int N, int K,
+    int algo_idx,
+    cudaStream_t stream);
+
+extern "C"
+void tq_fp32_gemm_lt_launch(
+    const void* a_fp32, const void* b_fp32,
+    void* c_fp32,
+    int M, int N, int K,
+    cudaStream_t stream)
+{
+    tq_fp32_gemm_lt_algo_launch(
+        a_fp32, b_fp32, c_fp32, M, N, K, 0, stream);
+}
+
+extern "C"
+void tq_fp32_gemm_lt_bt_launch(
+    const void* a_fp32, const void* b_fp32,
+    void* c_fp32,
+    int M, int N, int K,
+    cudaStream_t stream)
+{
+    tq_fp32_gemm_lt_bt_algo_launch(
+        a_fp32, b_fp32, c_fp32, M, N, K, 0, stream);
+}
+
+extern "C"
+void tq_fp32_gemm_lt_algo_launch(
+    const void* a_fp32, const void* b_fp32,
+    void* c_fp32,
+    int M, int N, int K,
+    int algo_idx,
+    cudaStream_t stream)
+{
+    static cublasLtHandle_t lt = nullptr;
+    static void* workspace = nullptr;
+    static size_t workspace_size = 32 * 1024 * 1024;
+    if (lt == nullptr) {
+        cublasLtCreate(&lt);
+        cudaMalloc(&workspace, workspace_size);
+    }
+
+    TqLtFp32Plan* plan = tq_get_lt_fp32_plan(
+        lt, M, N, K, algo_idx, false, workspace_size);
+    const float alpha = 1.0f, beta = 0.0f;
+    if (plan->valid) {
+        cublasLtMatmul(
+            lt, plan->desc, &alpha,
+            a_fp32, plan->a_desc,
+            b_fp32, plan->b_desc,
+            &beta,
+            c_fp32, plan->c_desc,
+            c_fp32, plan->c_desc,
+            &plan->algo, workspace, workspace_size, stream);
+    }
+}
+
+extern "C"
+void tq_fp32_gemm_lt_bt_algo_launch(
+    const void* a_fp32, const void* b_fp32,
+    void* c_fp32,
+    int M, int N, int K,
+    int algo_idx,
+    cudaStream_t stream)
+{
+    static cublasLtHandle_t lt = nullptr;
+    static void* workspace = nullptr;
+    static size_t workspace_size = 32 * 1024 * 1024;
+    if (lt == nullptr) {
+        cublasLtCreate(&lt);
+        cudaMalloc(&workspace, workspace_size);
+    }
+
+    TqLtFp32Plan* plan = tq_get_lt_fp32_plan(
+        lt, M, N, K, algo_idx, true, workspace_size);
+    const float alpha = 1.0f, beta = 0.0f;
+    if (plan->valid) {
+        cublasLtMatmul(
+            lt, plan->desc, &alpha,
+            a_fp32, plan->a_desc,
+            b_fp32, plan->b_desc,
+            &beta,
+            c_fp32, plan->c_desc,
+            c_fp32, plan->c_desc,
+            &plan->algo, workspace, workspace_size, stream);
+    }
 }
 
 // ── BF16 act × FP32 weight → FP32 out  (cuBLAS gemmEx mixed-type) ──

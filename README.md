@@ -4,7 +4,7 @@
 
 A general kernel library composed into static graphs — no ONNX export, no engine compilation, no per-driver rebuild. Hand-written kernels (norm / activation / fusion / RoPE / FP8 / NVFP4 GEMM / attention) cover standard transformer, DiT, and SigLIP primitives. The composition pattern itself is hardware-agnostic; today the codebase ships with NVIDIA implementations spanning edge to server (Jetson AGX Thor through A100 / RTX 4090 / 5090).
 
-The flagship integration today is **VLA control** — production frontends for Pi0, Pi0.5, GROOT N1.6, GROOT N1.7, and Pi0-FAST, validated on LIBERO where applicable. The same kernel set also powers the BAGEL world-model image-generation pipeline (research preview) and audio / video generation (4× over PyTorch). FlashRT now also serves **single-stream LLM inference** — the v1 release ships **Qwen3.6-27B (NVFP4)** with **256 K context on a single RTX 5090**, an OpenAI-compatible HTTP server, and decode throughput of **~100 tok/s typical / 129 tok/s peak** (real warm-state range across mixed chat / reasoning / code prompts; see [Performance](#performance) for the breakdown). The pattern is workload-shaped (small-batch realtime), not model-class-shaped.
+The flagship integration today is **VLA control** — production frontends for Pi0, Pi0.5, GROOT N1.6, GROOT N1.7, and Pi0-FAST, validated on LIBERO where applicable. The same kernel set also powers the BAGEL world-model image-generation pipeline (research preview) and audio / video generation (4× over PyTorch). FlashRT now also serves **single-stream LLM inference** — the v1 release ships **Qwen3.6-27B (NVFP4)** with **256 K context on a single RTX 5090**, an OpenAI-compatible HTTP server, and warm decode throughput from **~120 tok/s at 512-token prompts to ~130 tok/s at 256 K** (peak measured bucket: **176 tok/s at 64 K**; see [Performance](#performance)). The pattern is workload-shaped (small-batch realtime), not model-class-shaped.
 
 Existing inference tooling is shaped for different workloads — TensorRT for tactic-search compile to frozen engines, vLLM / SGLang for high-batch LLM serving. FlashRT targets the small-batch realtime cell with hand-tuned kernels and no compile step.
 
@@ -27,7 +27,7 @@ Existing inference tooling is shaped for different workloads — TensorRT for ta
 ## FlashRT supports:
 
 - **VLA models**: Pi0, Pi0.5, GROOT N1.6, GROOT N1.7, Pi0-FAST. Pi0/Pi0.5/GROOT N1.6/Pi0-FAST are production-validated on LIBERO; GROOT N1.7 currently exposes an RTX SM120 DiT FA2 path. Motus RTX beta — Wan2.2-based robot policy path at ~167 ms / ~100 ms with TeaCache. BAGEL world-model (research preview) — image-gen pipeline at ~4× vs PyTorch.
-- **LLM**: **Qwen3.6-27B NVFP4 — ~100 tok/s typical / 129 tok/s peak decode, 256 K context, single RTX 5090** — speculative decoding via the FP8 ckpt's MTP head, OpenAI-compatible HTTP server. **Qwen3-8B NVFP4** text-only serving reaches **150 tok/s** warm decode.
+- **LLM**: **Qwen3.6-27B NVFP4 — FP8-KV long-context decode to 256 K on one RTX 5090** — speculative decoding via the FP8 ckpt's MTP head, OpenAI-compatible HTTP server, **130 tok/s at 256 K** and **176 tok/s at 64 K** in the warm 64-token table. **Qwen3-8B NVFP4** text-only serving reaches **150 tok/s** warm decode.
 - **Hardware (today)**: NVIDIA Jetson AGX Thor (SM110), RTX 5090 (SM120), RTX 4090 (SM89), and SM80 / SM86 / SM89 cards (A100, RTX 3090, 4060 Ti, etc.). The kernel composition pattern is portable to other accelerators.
 - **Frameworks**: PyTorch (safetensors) + JAX (Orbax) — same compiled kernels
 
@@ -35,7 +35,7 @@ Pi0.5: 44 ms / 23 Hz on Jetson AGX Thor (2v, FP8) · 39.78 ms / 25 Hz (2v, NVFP4
 
 ## News
 
-- [2026/05] **Qwen3.6-27B NVFP4** is supported with 256 K context on a single RTX 5090, OpenAI-compatible serving, and **~100 tok/s typical / 129 tok/s peak** decode. See [Qwen3.6 NVFP4](docs/qwen36_nvfp4.md) and [Performance](#qwen36-performance).
+- [2026/05] **Qwen3.6-27B NVFP4** is supported with 256 K context on a single RTX 5090, OpenAI-compatible serving, FP8-KV long-context verify, and **130 tok/s warm decode at 256 K**. See [Qwen3.6 NVFP4](docs/qwen36_nvfp4.md) and [Performance](#qwen36-performance).
 - [2026/05] **Qwen3-8B NVFP4** text-only serving is supported on RTX 5090, with **9.1 ms TTFT at P=64** and **150 tok/s** warm decode. See [Qwen3-8B NVFP4](docs/qwen3_8b_nvfp4.md) and [Performance](#qwen3-8b-performance).
 - [2026/05] **Wan2.2 TI2V-5B** official-pipeline baseline is available on RTX SM120, with opt-in TeaCache acceleration. See [Wan2.2 usage](docs/wan22_usage.md).
 - [2026/05] **Lingbot-VLA** is supported. See [Lingbot usage](https://github.com/LiangSu8899/FlashRT/blob/main/docs/lingbot_usage.md).
@@ -81,7 +81,7 @@ First call: ~3 s (calibration + CUDA Graph capture). Every subsequent call: 44 m
 |---|---|
 | **Run your first inference** | [Build & install](#build--install) — Docker and native Linux paths |
 | **See API examples for all 4 VLA models + the Qwen3.6 LLM** | [API snippets](#api-snippets) |
-| **Run Qwen3.6-27B NVFP4 (LLM, ~100 tok/s typical / 129 tok/s peak on RTX 5090)** | [`docs/qwen36_nvfp4.md`](docs/qwen36_nvfp4.md) — quickstart, K selection, measured throughput · [`docs/qwen36_usage.md`](docs/qwen36_usage.md) — full parameter reference · [`examples/qwen36_openai_server.py`](examples/qwen36_openai_server.py) — OpenAI-compatible HTTP server |
+| **Run Qwen3.6-27B NVFP4 (LLM, 256 K on RTX 5090)** | [`docs/qwen36_nvfp4.md`](docs/qwen36_nvfp4.md) — quickstart, K selection, measured throughput · [`docs/qwen36_usage.md`](docs/qwen36_usage.md) — full parameter reference · [`examples/qwen36_openai_server.py`](examples/qwen36_openai_server.py) — OpenAI-compatible HTTP server |
 | **Run Qwen3-8B NVFP4 text serving** | [`docs/qwen3_8b_nvfp4.md`](docs/qwen3_8b_nvfp4.md) · [`examples/qwen3_openai_server.py`](examples/qwen3_openai_server.py) |
 | **Run Motus RTX beta, TeaCache, or RTC-lite** | [`docs/motus_usage_beta.md`](docs/motus_usage_beta.md) · [`docs/rtc_lite_design.md`](docs/rtc_lite_design.md) |
 | **Run Wan2.2 TI2V-5B official-pipeline baseline** | [`docs/wan22_usage.md`](docs/wan22_usage.md) |
@@ -127,59 +127,37 @@ First call: ~3 s (calibration + CUDA Graph capture). Every subsequent call: 44 m
 
 Single-stream chat-completion latency. NVFP4 W4A16 main weights +
 FP8→NVFP4-converted MTP head for K-step speculative decoding. All
-numbers are decode-only tok/s (excluding prefill); same metric vLLM
-and TensorRT-LLM report.
+numbers below use warm-state decode after startup graph warmup. TTFT is
+the measured prefill-to-first-token window. The table uses the measured
+best configuration per bucket.
 
-**Peak (single prompt, NTOK=128, no chat template)** — `"Explain
-quantum entanglement in one short paragraph."`, 11 prompt tokens:
+**Warm context sweep** — repeated text prompt, `max_new_tokens=64`,
+single RTX 5090:
 
-| Configuration | Decode latency | Throughput |
-|---|---|---|
-| **Qwen3.6-27B NVFP4** + spec K=3 | **8.49 ms/token** | **117.8 tok/s** |
-| **Qwen3.6-27B NVFP4** + spec K=6 | **7.74 ms/token** | **128.9 tok/s** |
+| prompt ctx | K | MTP tail | TTFT / prefill | prefill tok/s | decode tok/s |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 6 | full | 2.72 s | 47 | 141.0 |
+| 512 | 4 | 512 | 66.6 ms | 7,683 | 119.7 |
+| 1 K | 5 | 2048 | 122.9 ms | 8,334 | 115.3 |
+| 2 K | 6 | 2048 | 238.9 ms | 8,572 | 149.6 |
+| 4 K | 3 | 512 | 333.4 ms | 12,285 | 113.9 |
+| 8 K | 5 | 2048 | 749.7 ms | 10,926 | 157.5 |
+| 16 K | 7 | 2048 | 1.55 s | 10,587 | 170.6 |
+| 32 K | 6 | 2048 | 3.54 s | 9,262 | 157.5 |
+| 64 K | 7 | 2048 | 9.11 s | 7,195 | 176.1 |
+| 128 K | 7 | 2048 | 26.64 s | 4,920 | 153.9 |
+| 200 K | 6 | 2048 | 56.81 s | 3,605 | 114.7 |
+| 256 K | 6 | 2048 | 87.71 s | 2,989 | 129.7 |
 
-**Real-world warm-state (chat-template + NTOK=256, mixed-task workload)**
-— measured across 6 prompts (EN chat / EN reasoning / CN chat / CN
-factual / CN poetry / Code) at K=6:
+The decode column excludes TTFT, matching the usual TPOT-derived LLM
+metric. The table above keeps the fastest measured decode configuration
+for each bucket.
 
-| Stat | tok/s |
-|---|---:|
-| **mean** | **~93** |
-| min (Code prompt) | 75 |
-| max (CN factual prompt) | 101 |
-
-So users can expect roughly **~100 tok/s typical** in production with
-peak around **129 tok/s** on the easiest prompt class. The cliff is
-content-dependent (drafter alignment with the input distribution):
-
-* **Instruction-following / factual / chat** prompts hit the headline
-  rate — drafter aligns well with the prompt distribution.
-* **Code generation** drops to ~75 tok/s — drafter has lower acceptance
-  on punctuation / indentation / bracket tokens. Same trade-off seen
-  in vLLM and SGLang spec decode.
-* **Long generations** (NTOK ≥ 256) shave ~5-10 tok/s vs short outputs
-  — drafter quality decays past the prompt's local distribution.
-* **First call** at a new (prompt_len, max_tokens) shape pays a
-  ~5-25 s CUDA-Graph capture cost. The bundled OpenAI server
-  ([`examples/qwen36_openai_server.py`](examples/qwen36_openai_server.py))
-  pre-captures common shapes at startup via `--warmup`.
-
-Long-context decode at fixed context length (TurboQuant packed KV
-cache, single-token forward, AL=3.17 amortization):
-
-| ctx | forward latency | est. tok/s with spec |
-|---|---|---|
-| 8 K | 26.6 ms | 119 |
-| 32 K | 38.7 ms | 81 |
-| 128 K | 87.7 ms | 36 |
-| **256 K** | **153 ms** | **21** ← single-card |
-
-CUDA Graph capture+replay at 32 K / 64 K / 128 K / 256 K passes the
-cosine = 1.000000 gate (bit-identical token output across replays).
-TTFT scales linearly at ~22 ms / prompt-token.
-
-The full per-prompt variance breakdown (5 prompts × NTOK 128/256 ×
-K=3/6) is in [`docs/qwen36_nvfp4.md`](docs/qwen36_nvfp4.md) §3.
+First live request at a new `(prompt_len, max_tokens)` shape can pay
+CUDA Graph capture cost. The bundled OpenAI server
+([`examples/qwen36_openai_server.py`](examples/qwen36_openai_server.py))
+pre-captures bucketed short/long shapes at startup via
+`--warmup-preset auto` and optional explicit `--warmup` buckets.
 
 <a name="qwen3-8b-performance"></a>
 
@@ -830,6 +808,10 @@ pip install pybind11 cmake "numpy>=1.24" safetensors
 #    path broke in 4.56+; drop the upper bound once we verify the new
 #    tokenizer API.
 pip install "transformers<4.56" pandas pillow pyarrow
+
+# 3b. Qwen3.6 long-context runtime deps. These are also installed by
+#     `pip install -e ".[torch]"` below.
+pip install einops "triton>=3.2" packaging
 
 # 4. JAX-side (optional — only if you will load Orbax checkpoints).
 #    Versions are pinned because the Orbax/jaxlib/PJRT plugin ABI is

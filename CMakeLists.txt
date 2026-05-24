@@ -641,14 +641,22 @@ if(ENABLE_FA2)
   # against any subset of the matrix.
   list(APPEND FA2_SRCS csrc/attention/fa2_wrapper.cu)
 
-  # P1-a (Qwen3-8B prefill): causal FA2 forward — built only for
-  # hdim=128 + bf16 to keep the public .so size in check.
+  # Causal FA2 forward. hdim=128 serves Qwen3-8B prefill; hdim=256
+  # serves Qwen3.6 full-attention prefill/verify chunks.
   if("128" IN_LIST FA2_HDIMS AND "bf16" IN_LIST FA2_DTYPES)
     list(APPEND FA2_SRCS
       csrc/attention/fa2_causal_inst/flash_fwd_hdim128_bf16_sm80_causal.cu
       csrc/attention/fa2_causal_inst/flash_fwd_split_hdim128_bf16_sm80_causal.cu
-      csrc/attention/fa2_wrapper_causal.cu
     )
+  endif()
+  if("256" IN_LIST FA2_HDIMS AND "bf16" IN_LIST FA2_DTYPES)
+    list(APPEND FA2_SRCS
+      csrc/attention/fa2_causal_inst/flash_fwd_hdim256_bf16_sm80_causal.cu
+      csrc/attention/fa2_causal_inst/flash_fwd_split_hdim256_bf16_sm80_causal.cu
+    )
+  endif()
+  if("bf16" IN_LIST FA2_DTYPES AND ("128" IN_LIST FA2_HDIMS OR "256" IN_LIST FA2_HDIMS))
+    list(APPEND FA2_SRCS csrc/attention/fa2_wrapper_causal.cu)
   endif()
 
   add_library(fa2_vendor_obj OBJECT ${FA2_SRCS})
@@ -775,6 +783,43 @@ if(ENABLE_FA2)
   message(STATUS "FA2 pybind module: flash_rt_fa2 (separate .so)")
 endif()
 
+# ── Qwen3.6 SM120 FlashInfer XQA FP8-KV probe ──
+if(GPU_ARCH STREQUAL "120")
+  add_library(qwen36_flashinfer_xqa_obj OBJECT
+    csrc/attention/flashinfer_xqa_src/mha.cu
+    csrc/kernels/qwen36_flashinfer_xqa.cu)
+  set_target_properties(qwen36_flashinfer_xqa_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON)
+  target_include_directories(qwen36_flashinfer_xqa_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/flashinfer_xqa_src)
+  target_compile_definitions(qwen36_flashinfer_xqa_obj PRIVATE
+    NDEBUG=1
+    BEAM_WIDTH=1
+    USE_INPUT_KV=0
+    USE_CUSTOM_BARRIER=1
+    MLA_WRAPPER=0
+    USE_SM90_MHA=0
+    INPUT_FP16=0
+    DTYPE=__nv_bfloat16
+    CACHE_ELEM_ENUM=2
+    TOKENS_PER_PAGE=128
+    HEAD_ELEMS=256
+    HEAD_GRP_SIZE=6
+    SLIDING_WINDOW=0
+    LOW_PREC_OUTPUT=0
+    SPEC_DEC=1)
+  target_compile_options(qwen36_flashinfer_xqa_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3
+      --ftz=true --prec-div=false --prec-sqrt=false
+      -U__CUDA_NO_BFLOAT16_OPERATORS__
+      -U__CUDA_NO_BFLOAT162_OPERATORS__
+      ${GPU_GENCODE}
+    >)
+endif()
+
 # ── Main module ──
 pybind11_add_module(flash_rt_kernels
   csrc/gemm/gemm_runner.cu
@@ -815,6 +860,7 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/rms_norm_gated_silu_qwen36.cu
   csrc/kernels/silu_mul_qwen36.cu
   csrc/kernels/silu_mul_to_nvfp4_swizzled.cu
+  csrc/kernels/qwen36_misc.cu
   csrc/kernels/qwen3_qkv_post_proc.cu
   csrc/kernels/fp4_w4a4_matvec_sm120.cu
   csrc/kernels/fp4_w4a4_mma_sm120.cu
@@ -873,6 +919,13 @@ if(GPU_ARCH STREQUAL "120")
     csrc/quantize/nvfp4_sf_reshape_sm120.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE
     ENABLE_CUTLASS_SM120_NVFP4_W4A16=1)
+endif()
+
+if(GPU_ARCH STREQUAL "120")
+  target_sources(flash_rt_kernels PRIVATE
+    $<TARGET_OBJECTS:qwen36_flashinfer_xqa_obj>)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    ENABLE_QWEN36_FLASHINFER_XQA=1)
 endif()
 
 if(FLASHRT_ENABLE_MOTUS AND GPU_ARCH STREQUAL "120")

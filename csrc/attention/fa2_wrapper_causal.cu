@@ -7,11 +7,8 @@
 // and is exposed to Python as `flash_rt_fa2.fwd_bf16_causal`
 // (binding added in csrc/fa2_bindings.cpp).
 //
-// Build set is intentionally minimal — only (bf16, head_dim=128)
-// — because that is the only shape Qwen3-8B prefill needs. Other
-// hdims / dtypes can be added later by adding new instantiation
-// files under csrc/attention/fa2_causal_inst/ and extending the
-// dispatch below.
+// Build set is intentionally small: bf16 hdim=128 for Qwen3-8B and
+// bf16 hdim=256 for Qwen3.6 full-attention chunked prefill.
 //
 // The non-causal wrapper's helpers (fill_params, splitkv heuristic)
 // are duplicated here intentionally to keep this file standalone
@@ -183,10 +180,10 @@ extern "C" void fvk_attention_fa2_fwd_bf16_causal(
     int o_batch_stride, int o_row_stride, int o_head_stride,
     float softmax_scale, int num_sms, cudaStream_t stream)
 {
-    if (head_dim != 128) {
+    if (head_dim != 128 && head_dim != 256) {
         fprintf(stderr,
             "fvk_attention_fa2_fwd_bf16_causal: head_dim=%d not built. "
-            "Only head_dim=128 is currently instantiated for the causal "
+            "Only head_dim=128 and 256 are currently instantiated for the causal "
             "path. Add a new file under csrc/attention/fa2_causal_inst/ "
             "and extend the dispatch in fa2_wrapper_causal.cu to support "
             "additional shapes.\n", head_dim);
@@ -207,9 +204,13 @@ extern "C" void fvk_attention_fa2_fwd_bf16_causal(
     int num_splits = setup_splitkv_causal(params, softmax_lse_accum_ptr, o_accum_ptr,
                                           num_sms, seqlen_q, seqlen_k,
                                           head_dim, batch, num_heads_q);
-    if (num_splits > 1) {
+    if (head_dim == 128 && num_splits > 1) {
         FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, true>(params, stream);
-    } else {
+    } else if (head_dim == 128) {
         FLASH_NAMESPACE::run_mha_fwd_<cutlass::bfloat16_t, 128, true>(params, stream);
+    } else if (num_splits > 1) {
+        FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, true>(params, stream);
+    } else {
+        FLASH_NAMESPACE::run_mha_fwd_<cutlass::bfloat16_t, 256, true>(params, stream);
     }
 }

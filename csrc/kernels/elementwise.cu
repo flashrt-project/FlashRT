@@ -2247,6 +2247,34 @@ void gpu_copy_async(void* dst, const void* src, size_t nbytes, cudaStream_t stre
     cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyDeviceToDevice, stream);
 }
 
+__global__ void concat2_bf16_kernel(
+    const __nv_bfloat16* __restrict__ a,
+    const __nv_bfloat16* __restrict__ b,
+    __nv_bfloat16* __restrict__ out,
+    int rows, int cols_a, int cols_b) {
+    int r = blockIdx.x;
+    int c = threadIdx.x;
+    if (r >= rows) return;
+    const int cols = cols_a + cols_b;
+    for (int cc = c; cc < cols; cc += blockDim.x) {
+        if (cc < cols_a) {
+            out[r * cols + cc] = a[r * cols_a + cc];
+        } else {
+            const int bc = cc - cols_a;
+            out[r * cols + cc] = b[r * cols_b + bc];
+        }
+    }
+}
+
+void concat2_bf16(const __nv_bfloat16* a, const __nv_bfloat16* b,
+                  __nv_bfloat16* out,
+                  int rows, int cols_a, int cols_b,
+                  cudaStream_t stream) {
+    const int cols = cols_a + cols_b;
+    concat2_bf16_kernel<<<rows, min(256, cols), 0, stream>>>(
+        a, b, out, rows, cols_a, cols_b);
+}
+
 // Fill FP16 buffer with large negative (for softmax masking in attention)
 __global__ void fill_neginf_fp16_kernel(__half* data, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;

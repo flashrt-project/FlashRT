@@ -41,5 +41,15 @@ int silu_mul_to_nvfp4_swizzled_bf16(
     int         cols,
     cudaStream_t stream);
 
+// merged_gate_up : (rows, 2 * cols) bf16, row layout [gate | up].
+// packed/sf_swz are the same outputs as silu_mul_to_nvfp4_swizzled_bf16.
+int silu_mul_merged_to_nvfp4_swizzled_bf16(
+    const void* merged_gate_up,
+    void*       packed,
+    void*       sf_swz,
+    int         rows,
+    int         cols,
+    cudaStream_t stream);
+
 }  // namespace kernels
 }  // namespace flash_rt

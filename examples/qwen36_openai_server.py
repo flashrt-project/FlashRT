@@ -14,19 +14,20 @@ Usage:
 
     python examples/qwen36_openai_server.py \\
         --checkpoint /path/to/qwen36_nvfp4 \\
+        --max-seq 32768 \\
         --port 8000 \\
         --K 6 \\
-        --warmup 8:512
+        --warmup-preset auto
 
-    # The --warmup flag pre-captures CUDA Graphs for the listed
-    # (prompt_len:max_tokens) shapes at startup so the FIRST real
-    # request hits the warm 90-130 tok/s speed range. Without
-    # warmup, that first request pays a ~5-25 s graph-capture
-    # penalty (standard CUDA Graph cold-start cost — same trade-off
-    # as SGLang / vLLM compile mode). Each warmed shape covers
-    # cur_pos in [prompt_len, prompt_len + max_tokens]; the default
-    # 8:512 covers the common short-chat range in one pass.
-    # Pick shape(s) that span your traffic distribution.
+    # Startup warmup pre-captures CUDA Graphs for bucketed
+    # (prompt_len:max_tokens) shapes so the FIRST real request usually
+    # hits warm graphs. Short buckets run a dummy generation; long
+    # buckets default to decode-graph-only warmup, avoiding minutes of
+    # synthetic 200K/256K prompt prefill. 128K+ buckets warm every early
+    # decode position by default; tune with
+    # FLASHRT_QWEN36_LONG_WARMUP_STRIDE/MAX_GRAPHS. Add --warmup
+    # "32768:64,65536:64,131072:64,204800:64,262144:16" for an explicit
+    # serving envelope, or --warmup-preset none to skip.
 
     # Test (non-streaming):
     curl http://localhost:8000/v1/chat/completions \\
@@ -56,6 +57,8 @@ Limits in v1 (see docs/qwen36_usage.md):
       multiple workers against one GPU).
     * Greedy decode only — temperature / top_p / top_k / n / seed
       / stop / logit_bias are accepted but ignored.
+    * Qwen thinking mode is disabled by default. Pass
+      "enable_thinking": true in the JSON body to opt in.
     * stream=True returns one chunk with the full response (true
       token-by-token streaming requires a frontend modification).
 """
@@ -70,7 +73,7 @@ import re
 import sys
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # ────────────────────────────────────────────────────────────────────
 # Logger
@@ -175,15 +178,41 @@ class Qwen36Engine:
         else:
             self.spec_enabled = True
             log.info('MTP head loaded; spec K=%d enabled', self.K)
+        log.info(
+            'long-ctx route=%s tq_stage_layers=%s tq_stage_cap=%s '
+            'tq_hot_layers=%s tq_hot_cap=%s',
+            getattr(self.fe, '_long_kv_cache_mode', 'bf16'),
+            getattr(self.fe, '_tq_per_layer_stage_layers', 'n/a'),
+            getattr(self.fe, '_tq_per_layer_stage_cap', 'n/a'),
+            getattr(self.fe, '_tq_hot_stage_layers', 'n/a'),
+            getattr(self.fe, '_tq_hot_stage_cap', 'n/a'),
+        )
 
-    def warmup(self, shapes: List[tuple]) -> None:
+    def _dummy_input_ids(self, prompt_len: int):
+        """Build exact-length CUDA token ids without tokenizer drift."""
+        torch = self._torch
+        prompt_len = int(prompt_len)
+        if prompt_len <= 0:
+            raise ValueError(f'prompt_len must be >0, got {prompt_len}')
+        token_ids = self.fe._tokenizer(
+            ' warmup', add_special_tokens=False).input_ids
+        token = int(token_ids[0] if token_ids else 1)
+        return torch.full(
+            (1, prompt_len), token, device='cuda', dtype=torch.long)
+
+    def _effective_long_k(self, prompt_len: int) -> int:
+        """Mirror frontend long TQ default K policy for logging."""
+        if hasattr(self.fe, '_long_tq_effective_k'):
+            return self.fe._long_tq_effective_k(prompt_len, self.K)
+        return min(self.K, 6)
+
+    def warmup(self, shapes: List[Tuple[int, int]]) -> None:
         """Pre-capture CUDA Graphs for typical (prompt_len, max_tokens)
-        shapes by running dummy generations. Without this, the FIRST
-        request at each new (prompt_len, max_tokens) shape pays a
-        ~5-25 s graph-capture penalty (the headline 90-130 tok/s
-        warm number applies only to requests AFTER the cur_pos range
-        is captured). Standard practice for graph-based inference
-        engines (SGLang, vLLM compile mode, etc.).
+        shapes. Short-context buckets run dummy generations; long-context
+        buckets default to decode-graph-only warmup to avoid paying full
+        synthetic prompt prefill at startup. Without this, the FIRST
+        request at each new (prompt_len, max_tokens) shape pays CUDA
+        Graph capture latency.
 
         Args:
           shapes: list of (prompt_len, max_tokens) tuples to pre-warm.
@@ -194,23 +223,46 @@ class Qwen36Engine:
         torch = self._torch
         log.info('warmup: pre-capturing graphs for %d shape(s) ...',
                  len(shapes))
-        # Dummy text — only the token count matters for graph capture,
-        # not the content. Pad with 'a's.
+        long_graph_only = (
+            os.environ.get(
+                'FLASHRT_QWEN36_SERVER_LONG_WARMUP', 'graphs').lower()
+            in ('graphs', 'graph', 'decode_graphs', '1', 'true', 'yes')
+        )
         for prompt_len, max_tok in shapes:
+            if prompt_len + max_tok > self.fe._user_max_seq:
+                log.warning(
+                    '  skip warmup shape=(prompt=%d, max_tok=%d): '
+                    'exceeds max_seq=%d',
+                    prompt_len, max_tok, self.fe._user_max_seq)
+                continue
             t0 = time.perf_counter()
-            dummy_text = 'a ' * (prompt_len - 1)  # ~1 token each
-            input_ids = self.fe._tokenizer(
-                dummy_text, return_tensors='pt').input_ids.cuda()
-            # Trim/pad to exact prompt_len.
-            if input_ids.shape[1] >= prompt_len:
-                input_ids = input_ids[:, :prompt_len]
-            else:
-                pad = torch.full(
-                    (1, prompt_len - input_ids.shape[1]),
-                    self.fe._tokenizer.pad_token_id or 0,
-                    device='cuda', dtype=torch.long)
-                input_ids = torch.cat([input_ids, pad], dim=1)
             torch.cuda.synchronize()
+            if hasattr(self.fe, '_should_use_long_ctx_route'):
+                is_long = self.fe._should_use_long_ctx_route(
+                    prompt_len, max_tok)
+            else:
+                route_min = getattr(
+                    self.fe, '_long_ctx_route_min_seq',
+                    getattr(self.fe, '_short_ctx_spec_max_seq', 2048))
+                bf16_cap = getattr(
+                    self.fe, '_short_ctx_spec_max_seq', route_min)
+                is_long = (
+                    getattr(self.fe, '_long_ctx_mode', False)
+                    and (prompt_len >= route_min
+                         or prompt_len + max_tok > bf16_cap)
+                )
+            if self.spec_enabled and is_long and long_graph_only:
+                warmed = self.fe.warmup_long_ctx_decode_graphs(
+                    [(prompt_len, max_tok)], K=self.K)
+                torch.cuda.synchronize()
+                log.info(
+                    '  warmup shape=(prompt=%d, max_tok=%d, eff_K=%s) '
+                    'decode-graphs=%d in %.1f s',
+                    prompt_len, max_tok, self._effective_long_k(prompt_len),
+                    len(warmed), time.perf_counter() - t0)
+                continue
+
+            input_ids = self._dummy_input_ids(prompt_len)
             if self.spec_enabled:
                 _ = self.fe.generate_own_speculative_KN_nvfp4(
                     input_ids, max_new_tokens=max_tok, K=self.K)
@@ -218,15 +270,21 @@ class Qwen36Engine:
                 _ = self._single_token_decode(input_ids, max_tok)
             torch.cuda.synchronize()
             log.info(
-                '  warmup shape=(prompt=%d, max_tok=%d) in %.1f s',
-                prompt_len, max_tok, time.perf_counter() - t0)
-        log.info('warmup done — first real request will be at the warm '
-                 '(~90-130 tok/s) speed range')
+                '  warmup shape=(prompt=%d, max_tok=%d, eff_K=%s) '
+                'in %.1f s',
+                prompt_len, max_tok,
+                self._effective_long_k(prompt_len)
+                if getattr(self.fe, '_long_ctx_mode', False) else self.K,
+                time.perf_counter() - t0)
+        log.info('warmup done — warmed buckets should avoid most '
+                 'first-request CUDA Graph capture latency')
 
     def _render_chat(
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]],
+        *,
+        enable_thinking: bool = False,
     ) -> str:
         """Apply Qwen's chat template to a list of messages."""
         normalized = []
@@ -239,6 +297,7 @@ class Qwen36Engine:
             tools=tools or None,
             tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=enable_thinking,
         )
 
     async def generate(
@@ -246,12 +305,15 @@ class Qwen36Engine:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]],
         max_tokens: int,
+        *,
+        enable_thinking: bool = False,
     ) -> Dict[str, Any]:
         """Run one chat-completion. Returns a dict with the new
         text and basic timing/stat fields."""
         torch = self._torch
         async with self.lock:
-            prompt = self._render_chat(messages, tools)
+            prompt = self._render_chat(
+                messages, tools, enable_thinking=enable_thinking)
             input_ids = self.fe._tokenizer(
                 prompt, return_tensors='pt').input_ids.cuda()
             prompt_len = int(input_ids.shape[1])
@@ -270,22 +332,47 @@ class Qwen36Engine:
             new_tokens = out[0, prompt_len:].tolist()
             raw_text = self.fe._tokenizer.decode(
                 new_tokens, skip_special_tokens=False)
+            for boundary in ('<|im_start|>', '<|im_end|>'):
+                idx = raw_text.find(boundary)
+                if idx >= 0:
+                    raw_text = raw_text[:idx]
             for special in (
                 self.fe._tokenizer.eos_token,
                 self.fe._tokenizer.pad_token,
             ):
                 if special:
                     raw_text = raw_text.replace(special, '')
+            if not enable_thinking:
+                raw_text = re.sub(
+                    r'<think>.*?</think>\s*', '', raw_text,
+                    flags=re.DOTALL,
+                )
+                raw_text = raw_text.replace('<think>', '').replace(
+                    '</think>', '')
             text, tool_calls = ToolCallParser().parse(raw_text)
             text = text.strip()
+            completion_tokens = len(new_tokens)
+            prefill_ms = float(getattr(self.fe, '_long_ctx_prefill_ms', 0.0)
+                               or 0.0)
+            decode_ms = float(getattr(self.fe, '_long_ctx_decode_ms', 0.0)
+                              or 0.0)
+            decode_tok_per_s = (
+                completion_tokens * 1000.0 / decode_ms
+                if decode_ms > 0 else 0.0
+            )
+            e2e_tok_per_s = completion_tokens / wall_s if wall_s else 0.0
 
             return {
                 'text': text,
                 'tool_calls': tool_calls,
                 'prompt_tokens': prompt_len,
-                'completion_tokens': len(new_tokens),
+                'completion_tokens': completion_tokens,
+                'prefill_ms': prefill_ms,
+                'decode_ms': decode_ms,
                 'wall_s': wall_s,
-                'tok_per_s': len(new_tokens) / wall_s if wall_s else 0,
+                'decode_tok_per_s': decode_tok_per_s,
+                'e2e_tok_per_s': e2e_tok_per_s,
+                'route': getattr(self.fe, '_long_ctx_route', 'unknown'),
             }
 
     def _single_token_decode(self, input_ids, max_tokens):
@@ -347,6 +434,7 @@ def build_app(engine: Qwen36Engine):
         tools = req.get('tools')
         max_tokens = int(req.get('max_tokens') or 256)
         stream = bool(req.get('stream', False))
+        enable_thinking = bool(req.get('enable_thinking', False))
         # Validate roles — Qwen template accepts OpenAI chat roles.
         for m in messages:
             role = m.get('role')
@@ -360,16 +448,25 @@ def build_app(engine: Qwen36Engine):
                 raise HTTPException(
                     400, 'message.content must be a string')
 
-        result = await engine.generate(messages, tools, max_tokens)
+        result = await engine.generate(
+            messages, tools, max_tokens,
+            enable_thinking=enable_thinking,
+        )
         completion_id = f'chatcmpl-{uuid.uuid4().hex[:24]}'
         created = int(time.time())
 
         log.info(
-            'chat.completions: %d -> %d tokens in %.2fs (%.1f tok/s)',
+            'chat.completions: prompt=%d completion=%d route=%s '
+            'prefill=%.1fms + decode=%.1fms wall=%.1fms '
+            'decode_tok/s=%.1f e2e_tok/s=%.1f',
             result['prompt_tokens'],
             result['completion_tokens'],
-            result['wall_s'],
-            result['tok_per_s'],
+            result['route'],
+            result['prefill_ms'],
+            result['decode_ms'],
+            result['wall_s'] * 1000.0,
+            result['decode_tok_per_s'],
+            result['e2e_tok_per_s'],
         )
 
         usage = {
@@ -463,9 +560,88 @@ def build_app(engine: Qwen36Engine):
     async def health():
         return {'status': 'ok', 'model': engine.model_name,
                 'spec_enabled': engine.spec_enabled,
-                'K': engine.K}
+                'K': engine.K,
+                'long_kv_cache': getattr(
+                    engine.fe, '_long_kv_cache_mode', 'bf16'),
+                'tq_stage_layers': getattr(
+                    engine.fe, '_tq_per_layer_stage_layers', None),
+                'tq_stage_cap': getattr(
+                    engine.fe, '_tq_per_layer_stage_cap', None),
+                'tq_hot_stage_layers': getattr(
+                    engine.fe, '_tq_hot_stage_layers', None),
+                'tq_hot_stage_cap': getattr(
+                    engine.fe, '_tq_hot_stage_cap', None)}
 
     return app
+
+
+def _parse_warmup_shapes(spec_csv: str) -> List[Tuple[int, int]]:
+    shapes: List[Tuple[int, int]] = []
+    if not spec_csv.strip():
+        return shapes
+    for spec in spec_csv.split(','):
+        spec = spec.strip()
+        if not spec:
+            continue
+        try:
+            pl, mt = spec.split(':')
+            shapes.append((int(pl), int(mt)))
+        except ValueError:
+            sys.exit(f'invalid --warmup spec: {spec!r} '
+                     '(expected "prompt_len:max_tokens")')
+    return shapes
+
+
+def _warmup_preset_shapes(preset: str, max_seq: int) -> List[Tuple[int, int]]:
+    """Return startup graph-warm buckets that fit inside max_seq.
+
+    The default buckets use 64 generated tokens because that captures
+    the common early decode range where user-visible cold latency is
+    most painful without making server startup spend minutes on long
+    synthetic short-prompt completions. Add explicit --warmup entries
+    for larger completion caps.
+    """
+    preset = (preset or 'auto').lower()
+    if preset in ('none', 'off', 'false', '0'):
+        return []
+    if preset not in ('auto', 'short', 'long', 'all'):
+        sys.exit(
+            f'invalid --warmup-preset {preset!r}; expected '
+            'auto, short, long, all, or none')
+
+    short = [(8, 64), (128, 64), (512, 64), (1024, 64)]
+    long = [
+        (2048, 64),
+        (4096, 64),
+        (8192, 64),
+        (16384, 64),
+        (32768, 64),
+        (65536, 64),
+        (131072, 64),
+        (204800, 64),
+        (262144, 16),
+    ]
+    if preset == 'short':
+        candidates = short
+    elif preset == 'long':
+        candidates = long
+    elif preset == 'all':
+        candidates = short + long
+    else:
+        candidates = short + long
+
+    max_seq = int(max_seq)
+    return [(p, n) for p, n in candidates if p + n <= max_seq]
+
+
+def _dedupe_shapes(shapes: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    out: List[Tuple[int, int]] = []
+    seen = set()
+    for shape in shapes:
+        if shape not in seen:
+            out.append(shape)
+            seen.add(shape)
+    return out
 
 
 def main():
@@ -477,36 +653,29 @@ def main():
     p.add_argument('--K', type=int, default=6,
                    help='MTP draft chain length per spec cycle. '
                    'Default 6 (peak for short generations on RTX 5090).')
-    p.add_argument('--max-seq', type=int, default=2048,
+    p.add_argument('--max-seq', type=int, default=32768,
                    help='KV cache + scratch dim. Increase for long ctx.')
     p.add_argument('--device', default='cuda:0')
     p.add_argument('--model-name', default='qwen3.6-27b-nvfp4',
                    help='Identifier returned by /v1/models and echoed '
                    'in completion responses.')
     p.add_argument(
-        '--warmup', default='8:512',
+        '--warmup-preset', default='auto',
+        help='Startup graph warmup preset: auto, short, long, all, or '
+        'none. auto warms short buckets plus long buckets that fit in '
+        '--max-seq. Use all with --max-seq 262208+ to include 256K.')
+    p.add_argument(
+        '--warmup', default='',
         help='Comma-separated list of "prompt_len:max_tokens" shapes '
-        'to pre-capture CUDA Graphs for at startup. Without this, the '
-        'first request at each new shape pays a ~5-25 s graph-capture '
-        'penalty before reaching the headline 90-130 tok/s warm speed. '
-        'Default 8:512 pre-captures cur_pos in [8, 520], covering the '
-        'common short-chat range so requests with prompt_len < 32 '
-        '(which the prior 32:128,128:256 default missed) start warm. '
-        'Set to empty string to skip warmup.')
+        'to additionally pre-capture at startup. These are appended to '
+        '--warmup-preset. Set --warmup-preset none and --warmup "" to '
+        'skip all startup warmup.')
     args = p.parse_args()
 
-    warmup_shapes = []
-    if args.warmup.strip():
-        for spec in args.warmup.split(','):
-            spec = spec.strip()
-            if not spec:
-                continue
-            try:
-                pl, mt = spec.split(':')
-                warmup_shapes.append((int(pl), int(mt)))
-            except ValueError:
-                sys.exit(f'invalid --warmup spec: {spec!r} '
-                         '(expected "prompt_len:max_tokens")')
+    warmup_shapes = _dedupe_shapes(
+        _warmup_preset_shapes(args.warmup_preset, args.max_seq)
+        + _parse_warmup_shapes(args.warmup)
+    )
 
     if 'FLASHRT_QWEN36_MTP_CKPT_DIR' not in os.environ:
         log.warning(

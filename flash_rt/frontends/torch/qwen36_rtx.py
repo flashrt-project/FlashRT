@@ -40,6 +40,18 @@ if _PATCH_PATH and os.path.isfile(_PATCH_PATH):
 from flash_rt.models.qwen36 import Qwen36Pipeline  # noqa: E402
 
 
+_QWEN36_FLA_CHUNK = None
+
+
+def _load_qwen36_fla_chunk():
+    """Load the vendored FLA chunk/WY Gated DeltaNet prefill kernel."""
+    global _QWEN36_FLA_CHUNK
+    if _QWEN36_FLA_CHUNK is None:
+        from flash_rt.ops.fla.chunk import chunk_gated_delta_rule_inference
+        _QWEN36_FLA_CHUNK = chunk_gated_delta_rule_inference
+    return _QWEN36_FLA_CHUNK
+
+
 class Qwen36TorchFrontendRtx:
     """Qwen3.6-27B inference frontend (PyTorch + RTX SM120).
 
@@ -104,26 +116,41 @@ class Qwen36TorchFrontendRtx:
         # (16 layers × max_seq × 4 × 256 × 2 bytes for K + V = 32 KB
         # per token, so 32K context = 1 GB just for K, 2 GB for K+V,
         # on top of a ~30 GB baseline). The fix is to route to the
-        # TurboQuant (TQ) packed-cache path: BF16 KV is shrunk to a
-        # 64-row dummy and persistent KV lives in NVFP4-packed form
-        # (~1.83x compression at 1-byte idx, ~5x at bit-pack).
-        # Spec decode is *not* yet integrated with TQ (Phase 3D
-        # follow-up), so long-ctx mode falls back to single-token
-        # decode (~30-40 tok/s eager, vs ~100-130 tok/s spec on
-        # short-ctx). This is the documented trade-off and matches
-        # the perf grid in docs/qwen36_nvfp4.md §4.
+        # TurboQuant (TQ) packed-cache path: BF16 KV is retained only
+        # for a small short-request spec window and persistent long KV
+        # lives in NVFP4-packed form (~1.83x compression at 1-byte idx,
+        # ~5x at bit-pack).
+        # Requests beyond the retained BF16 spec window run MTP draft
+        # plus TQ-packed verify. Short requests still use the normal
+        # BF16-KV/CUDA-Graph MTP spec path even when the frontend was
+        # constructed for long context.
         if quant == 'nvfp4' and self._user_max_seq > self.LONG_CTX_THRESHOLD:
-            # Long-ctx mode: allocate BF16 buffers at a small floor
-            # (the BF16 KV cache will be shrunk to a 64-row dummy
-            # immediately after init, and the per-step bf16 scratches
-            # like _h_a/_h_b only ever read [:1] or [:K] rows so they
-            # don't need to scale with max_seq). The TQ packed cache
-            # then grows KV coverage out to ``user_max_seq``.
-            bf16_init_seq = 2048
+            # Long-ctx mode: allocate BF16 buffers at a small spec
+            # window. The TQ packed cache then grows KV coverage out
+            # to ``user_max_seq``. Keeping this small BF16 window avoids
+            # penalising ordinary short requests just because the server
+            # was configured for occasional long-context traffic.
+            default_window = min(2048, self.MAX_Q_SEQ)
+            bf16_init_seq = int(os.environ.get(
+                'FLASHRT_QWEN36_LONG_CTX_BF16_WINDOW',
+                str(default_window),
+            ) or str(default_window))
+            bf16_init_seq = max(1, min(bf16_init_seq, self._user_max_seq))
             self._long_ctx_mode = True
         else:
             bf16_init_seq = self._user_max_seq
             self._long_ctx_mode = False
+        self._short_ctx_spec_max_seq = int(bf16_init_seq)
+        route_default = (
+            min(self._short_ctx_spec_max_seq, 512)
+            if self._long_ctx_mode else self._short_ctx_spec_max_seq
+        )
+        self._long_ctx_route_min_seq = int(os.environ.get(
+            'FLASHRT_QWEN36_LONG_CTX_ROUTE_MIN_SEQ',
+            str(route_default),
+        ) or str(route_default))
+        self._long_ctx_route_min_seq = max(
+            0, min(self._long_ctx_route_min_seq, self._user_max_seq))
         # ``self.max_seq`` is the value used to size the BF16 init.
         # ``self._user_max_seq`` is what the user asked for — that's
         # what the TQ packed cache grows to in long-ctx mode, and
@@ -233,14 +260,14 @@ class Qwen36TorchFrontendRtx:
     # ---------- Phase 2.3b4 own-forward state ----------
 
     # Phase 6 D4: maximum query-seq length for S=K decode paths
-    # (speculative verify, multi-token batched decode). Originally 8 to
-    # support K=5 spec (verify q_seq = K+1 = 6). Bumped to 16 in N6-A4
-    # to host the DFlash drafter's block_size=16 verify forward
-    # (input layout [prev_token, draft_0..draft_14]). Per-K-row scratches
-    # scale linearly: full set is ~12 MB at K=16 (the dominant
-    # _K_logits_buf at vocab=248320 is 16*248320*2 = 7.6 MB), tiny vs
-    # the 28-30 GB main weight footprint.
-    MAX_Q_SEQ: int = 16
+    # (speculative verify, multi-token batched decode, and long-context
+    # TQ prefill chunks). Originally 8 to support K=5 spec, then 16 to
+    # host DFlash's block_size=16 verify forward. Bumped to 1024 so
+    # long-context prefill can amortize the 64-layer forward over larger
+    # chunks. Public speculative K remains conservatively capped by
+    # _MAX_PUBLIC_SPEC_K.
+    MAX_Q_SEQ: int = int(os.environ.get('FLASHRT_QWEN36_MAX_Q_SEQ', '2048'))
+    _MAX_PUBLIC_SPEC_K: int = 15
 
     # Per-cache LRU bound on lazily captured CUDA Graphs. Each
     # ``_ensure_*_graph_*`` method captures a graph keyed by cur_pos
@@ -270,10 +297,9 @@ class Qwen36TorchFrontendRtx:
     # the constructor switches into long-ctx mode: BF16 KV buffers
     # are allocated at this threshold (small) and persistent KV is
     # served by the TurboQuant packed cache, which compresses 1.83x
-    # at 1-byte idx (~5x at bit-pack). Spec decode is currently only
-    # available below the threshold; long-ctx mode does single-token
-    # decode (~30-40 tok/s) but supports up to 256 K context on a
-    # 32 GB card.
+    # at 1-byte idx (~5x at bit-pack). Requests inside the retained
+    # short BF16 window use the normal graph-captured spec path;
+    # requests beyond that window use eager MTP draft + TQ-packed verify.
     #
     # Tuning notes:
     #   - 16384 is the default because at max_seq=16K the BF16 KV is
@@ -706,6 +732,24 @@ class Qwen36TorchFrontendRtx:
         self._K_lin_attn_out = torch.empty(
             Kmax, 48, 128, device=device, dtype=bf16,
         )
+        self._K_lin_q16 = torch.empty(
+            Kmax, 16, 128, device=device, dtype=bf16,
+        )
+        self._K_lin_k16 = torch.empty(
+            Kmax, 16, 128, device=device, dtype=bf16,
+        )
+        self._K_fla_q16_l2 = torch.empty(
+            1, Kmax, 16, 128, device=device, dtype=bf16,
+        )
+        self._K_fla_k16_l2 = torch.empty(
+            1, Kmax, 16, 128, device=device, dtype=bf16,
+        )
+        self._K_fla_g_cumsum = torch.empty(
+            1, Kmax, 48, device=device, dtype=fp32,
+        )
+        self._K_lin_v48 = torch.empty(
+            Kmax, 48, 128, device=device, dtype=bf16,
+        )
         self._K_lin_norm_out = torch.empty(
             Kmax, 48, 128, device=device, dtype=bf16,
         )
@@ -840,6 +884,7 @@ class Qwen36TorchFrontendRtx:
         from flash_rt import flash_rt_kernels as fvk
         from flash_rt.frontends.torch._qwen36_rtx_nvfp4_weights import (
             assert_extraction_invariants_nvfp4,
+            extract_mtp_weights_bf16_nvfp4,
             extract_mtp_weights_nvfp4,
             extract_weights_nvfp4,
         )
@@ -856,17 +901,20 @@ class Qwen36TorchFrontendRtx:
         assert_extraction_invariants_nvfp4(handles)
         self._weights = handles
 
-        # MTP head from FP8 ckpt → NVFP4 swizzled (pure-NVFP4 spec).
-        # The compressed-tensors NVFP4 ckpt has no MTP module; we pull
-        # it from a paired FP8 ckpt (Qwen3.6-Next-27B-FP8) via the
-        # FLASHRT_QWEN36_MTP_CKPT_DIR env var. If unset, MTP is None
-        # and speculative decode is unavailable (pure-decode still works).
+        # MTP head from an external ckpt → NVFP4 swizzled (pure-NVFP4
+        # spec). Supports both official FP8 MTP files and community
+        # BF16/native MTP-preserved files.
         mtp_dir = os.environ.get('FLASHRT_QWEN36_MTP_CKPT_DIR')
-        mtp_path = (os.path.join(mtp_dir, 'mtp.safetensors')
-                    if mtp_dir else None)
+        mtp_path = None
+        if mtp_dir:
+            for filename in ('mtp.safetensors', 'model_mtp.safetensors'):
+                candidate = os.path.join(mtp_dir, filename)
+                if os.path.exists(candidate):
+                    mtp_path = candidate
+                    break
         if mtp_path is not None and os.path.exists(mtp_path):
             import safetensors.torch
-            raw = safetensors.torch.load_file(mtp_path, device=self.device)
+            raw = safetensors.torch.load_file(mtp_path, device='cpu')
             mtp_dict: dict = {}
             for k, t in raw.items():
                 if not k.startswith('mtp.'):
@@ -879,8 +927,34 @@ class Qwen36TorchFrontendRtx:
                 else:
                     mtp_dict[short] = t.to(torch.bfloat16).contiguous()
             self._mtp_tensors = mtp_dict
-            handles.ptrs['mtp'] = extract_mtp_weights_nvfp4(
-                mtp_dict, handles, fvk, device=self.device)
+            mtp_proj_bases = (
+                'layers.0.self_attn.q_proj',
+                'layers.0.self_attn.k_proj',
+                'layers.0.self_attn.v_proj',
+                'layers.0.self_attn.o_proj',
+                'layers.0.mlp.gate_proj',
+                'layers.0.mlp.up_proj',
+                'layers.0.mlp.down_proj',
+            )
+            has_fp8_scales = all(
+                base + '.weight_scale_inv' in mtp_dict
+                for base in mtp_proj_bases)
+            if has_fp8_scales:
+                handles.ptrs['mtp'] = extract_mtp_weights_nvfp4(
+                    mtp_dict, handles, fvk, device=self.device)
+            else:
+                missing = [
+                    base + '.weight'
+                    for base in mtp_proj_bases
+                    if base + '.weight' not in mtp_dict
+                ]
+                if missing:
+                    raise RuntimeError(
+                        'MTP checkpoint is missing projection weights: '
+                        + ', '.join(missing)
+                    )
+                handles.ptrs['mtp'] = extract_mtp_weights_bf16_nvfp4(
+                    mtp_dict, handles, fvk, device=self.device)
         else:
             self._mtp_tensors = None
             handles.ptrs['mtp'] = None
@@ -932,6 +1006,8 @@ class Qwen36TorchFrontendRtx:
         # Hidden ping-pong (same shape as FP8 path).
         self._h_a = torch.empty(max_seq, hidden, device=device, dtype=bf16)
         self._h_b = torch.empty(max_seq, hidden, device=device, dtype=bf16)
+        self._embed_buf = torch.empty(
+            1, 1, hidden, device=device, dtype=bf16)
 
         # NVFP4 scratch per (N, K) shape:
         #   act_packed  (max_seq, K/2)         u8
@@ -945,12 +1021,35 @@ class Qwen36TorchFrontendRtx:
             n_col_super = (n_blocks + 3) // 4
             return n_row_super * n_col_super * 512
 
+        layers = self._weights.ptrs['layers']
+        gate_up_default = '1' if self._long_ctx_mode else '0'
+        self._enable_mlp_gate_up_fusion = (
+            bool(int(os.environ.get(
+                'FLASHRT_QWEN36_FUSE_MLP_GATE_UP',
+                gate_up_default) or '0'))
+            and all(ld.get('mlp_gate_up_homogeneous_alpha') for ld in layers)
+        )
+        self._enable_silu_mul_quant_fusion = bool(int(os.environ.get(
+            'FLASHRT_QWEN36_FUSE_SILU_MUL_QUANT', '0') or '0'))
+        if self._enable_mlp_gate_up_fusion:
+            self._enable_silu_mul_quant_fusion = True
+        self._lin_ab_torch_mm_min_k = int(os.environ.get(
+            'FLASHRT_QWEN36_LIN_AB_TORCH_MM_MIN_K', '0') or '0')
+        self._enable_lin_ab96_kernel = bool(int(os.environ.get(
+            'FLASHRT_QWEN36_LIN_AB96_KERNEL', '1') or '0'))
+        self._enable_full_gate_sigmoid_mul = bool(int(os.environ.get(
+            'FLASHRT_QWEN36_FULL_GATE_SIGMOID_MUL', '0') or '0'))
+
         self._nvfp4_scratch: dict[tuple[int, int],
                                   tuple[torch.Tensor, ...]] = {}
         for N, K in self._NVFP4_SHAPES:
             ap = torch.empty(max_seq, K // 2, device=device, dtype=u8)
             sf = torch.zeros(_swz_bytes(max_seq, K), device=device, dtype=u8)
-            out = torch.empty(max_seq, N, device=device, dtype=bf16)
+            out_rows = 1 if (
+                self._enable_mlp_gate_up_fusion
+                and (N, K) == (17408, 5120)
+            ) else max_seq
+            out = torch.empty(out_rows, N, device=device, dtype=bf16)
             self._nvfp4_scratch[(N, K)] = (ap, sf, out)
 
         # BF16 scratch for unquantized linear-attn projections. Inputs
@@ -987,6 +1086,8 @@ class Qwen36TorchFrontendRtx:
             1, 48, 128, device=device, dtype=bf16)
         self._lin_k48 = torch.empty(
             1, 48, 128, device=device, dtype=bf16)
+        self._lin_v48 = torch.empty(
+            1, 48, 128, device=device, dtype=bf16)
         self._lin_broadcast_idx = torch.arange(
             16, device=device, dtype=torch.long).repeat_interleave(3)
 
@@ -996,7 +1097,13 @@ class Qwen36TorchFrontendRtx:
         # Separate up output buf (gate scratch comes from NVFP4 scratch
         # of (17408, 5120)).
         self._mlp_up_out = torch.empty(
-            self.max_seq, 17408, device=device, dtype=bf16)
+            1 if self._enable_mlp_gate_up_fusion else self.max_seq,
+            17408, device=device, dtype=bf16)
+        self._K_mlp_gate_up_out = (
+            torch.empty(self.MAX_Q_SEQ, 34816, device=device, dtype=bf16)
+            if self._enable_mlp_gate_up_fusion
+            else None
+        )
 
         # Layer-output ping-pong + intermediate residual.
         self._layer_out_a = torch.empty(
@@ -1065,11 +1172,14 @@ class Qwen36TorchFrontendRtx:
             1, Kmax, hidden, device=device, dtype=bf16)
         self._K_layer_out_b = torch.empty(
             1, Kmax, hidden, device=device, dtype=bf16)
+        self._K_embed_buf = torch.empty(
+            1, Kmax, hidden, device=device, dtype=bf16)
         self._K_res_mid = torch.empty(
             1, Kmax, hidden, device=device, dtype=bf16)
         # linear-attn small per-row scratches (K rows × 48 heads)
-        self._K_lin_a_vec = torch.empty(Kmax, 48, device=device, dtype=bf16)
-        self._K_lin_b_vec = torch.empty(Kmax, 48, device=device, dtype=bf16)
+        self._K_lin_ab_vec = torch.empty(Kmax, 96, device=device, dtype=bf16)
+        self._K_lin_a_vec = self._K_lin_ab_vec[:, :48]
+        self._K_lin_b_vec = self._K_lin_ab_vec[:, 48:]
         self._K_lin_beta = torch.empty(Kmax, 48, device=device, dtype=bf16)
         self._K_lin_a_f32 = torch.empty(Kmax, 48, device=device, dtype=fp32)
         self._K_lin_g_f32 = torch.empty(Kmax, 48, device=device, dtype=fp32)
@@ -1081,16 +1191,45 @@ class Qwen36TorchFrontendRtx:
         # Linear-attn S=K accumulators (each (48, 128) per row).
         self._K_lin_attn_out = torch.empty(
             Kmax, 48, 128, device=device, dtype=bf16)
+        self._K_lin_q16 = torch.empty(
+            Kmax, 16, 128, device=device, dtype=bf16)
+        self._K_lin_k16 = torch.empty(
+            Kmax, 16, 128, device=device, dtype=bf16)
+        self._K_fla_q16_l2 = torch.empty(
+            1, Kmax, 16, 128, device=device, dtype=bf16)
+        self._K_fla_k16_l2 = torch.empty(
+            1, Kmax, 16, 128, device=device, dtype=bf16)
+        self._K_fla_g_cumsum = torch.empty(
+            1, Kmax, 48, device=device, dtype=fp32)
+        self._K_lin_v48 = torch.empty(
+            Kmax, 48, 128, device=device, dtype=bf16)
         self._K_lin_norm_out = torch.empty(
             Kmax, 48, 128, device=device, dtype=bf16)
         # Conv1d update output staging: K rows of (1, 10240).
         self._K_lin_conv_out = torch.empty(
             Kmax, 10240, device=device, dtype=bf16)
         # logits at K rows + last hidden at K rows (spec chaining).
+        # Public spec only needs K+1 rows (<= _MAX_PUBLIC_SPEC_K+1).
+        # Large-K prefill now asks for last/none logits, so keep the
+        # eager all-logits buffer small and allocate a large fallback
+        # lazily only for explicit diagnostic calls.
+        logits_rows = min(Kmax, self._MAX_PUBLIC_SPEC_K + 1)
         self._K_logits_buf = torch.empty(
-            Kmax, vocab, device=device, dtype=bf16)
+            logits_rows, vocab, device=device, dtype=bf16)
+        self._K_logits_large_buf = None
         self._K_last_hidden_buf = torch.empty(
             1, Kmax, hidden, device=device, dtype=bf16)
+        self._spec_argmax_buf = torch.empty(
+            self.MAX_Q_SEQ, device=device, dtype=torch.long)
+        self._spec_accept_n_buf = torch.empty(
+            1, device=device, dtype=torch.int32)
+        self._spec_argmax_partial_vals = torch.empty(
+            self.MAX_Q_SEQ * 128, device=device, dtype=fp32)
+        self._spec_argmax_partial_idx = torch.empty(
+            self.MAX_Q_SEQ * 128, device=device, dtype=torch.int32)
+        self._gen_out_buf = torch.empty(
+            1, int(getattr(self, '_user_max_seq', max_seq)),
+            device=device, dtype=torch.long)
 
         # ---------- N5-stage6: spec-decode snap buffers (NVFP4) ----------
         # Pre-allocated snap buffers + dedicated stream so the partial-
@@ -1131,6 +1270,8 @@ class Qwen36TorchFrontendRtx:
         self._K_lin_q48 = torch.empty(
             self.MAX_Q_SEQ, 48, 128, device=device, dtype=bf16)
         self._K_lin_k48 = torch.empty(
+            self.MAX_Q_SEQ, 48, 128, device=device, dtype=bf16)
+        self._K_lin_v48 = torch.empty(
             self.MAX_Q_SEQ, 48, 128, device=device, dtype=bf16)
         self._K_lin_attn_out = torch.empty(
             self.MAX_Q_SEQ, 48, 128, device=device, dtype=bf16)
@@ -1178,6 +1319,9 @@ class Qwen36TorchFrontendRtx:
         self._captured_verify_graphs: collections.OrderedDict[
             tuple[int, int], torch.cuda.CUDAGraph,
         ] = collections.OrderedDict()
+        self._captured_verify_graphs_tq: collections.OrderedDict[
+            tuple[int, int], torch.cuda.CUDAGraph,
+        ] = collections.OrderedDict()
 
         # MTP scratches (only when MTP is loaded). Mirror FP8 path's
         # MTP buffers — these are BF16/FP32 scratches and independent
@@ -1201,6 +1345,8 @@ class Qwen36TorchFrontendRtx:
                 n_splits, 1, 24, 1, 256, device=device, dtype=fp32)
             self._mtp_h_norm_buf = torch.empty(
                 1, 1, hidden, device=device, dtype=bf16)
+            self._mtp_embed_buf = torch.empty(
+                1, 1, hidden, device=device, dtype=bf16)
             self._mtp_e_norm_buf = torch.empty(
                 1, 1, hidden, device=device, dtype=bf16)
             self._mtp_cat_buf = torch.empty(
@@ -1219,14 +1365,15 @@ class Qwen36TorchFrontendRtx:
             self._captured_mtp_graphs: collections.OrderedDict[
                 int, torch.cuda.CUDAGraph,
             ] = collections.OrderedDict()
-            # G9: per-(base_pos, K) chain graph that captures the
-            # entire K-step MTP chain (forward + argmax + inter-step
-            # state copies) in one graph. Eliminates K-1 Python-level
-            # replay/copy/argmax launches per spec cycle.
+            # G9: chain graph that captures the entire K-step MTP chain
+            # (forward + argmax + inter-step state copies) in one graph.
+            # Short ctx keys by (base_pos, K); long ctx keys by
+            # (base_pos, cache_base_pos, K) because RoPE position and
+            # compact MTP-cache position intentionally differ there.
             self._chain_drafts_buf = torch.zeros(
                 self.MAX_Q_SEQ - 1, 1, device=device, dtype=torch.long)
             self._captured_chain_graphs: collections.OrderedDict[
-                tuple[int, int], torch.cuda.CUDAGraph,
+                tuple[int, ...], torch.cuda.CUDAGraph,
             ] = collections.OrderedDict()
 
         # Bundle the integer-pointer view forward consumers expect.
@@ -1348,34 +1495,25 @@ class Qwen36TorchFrontendRtx:
             1, 10240, 4, True, s,
         )
 
-        # 6) split conv_out -> q (2048), k (2048), v (6144).
-        q_flat = conv_out[:, :2048]
-        k_flat = conv_out[:, 2048:4096]
-        v_flat = conv_out[:, 4096:10240]
-        q = q_flat.view(1, 1, 16, 128)
-        k = k_flat.view(1, 1, 16, 128)
-        v = v_flat.view(1, 1, 48, 128)
-
-        # 7) beta = sigmoid(b); g = -A_log.exp() * softplus(a + dt_bias).
-        torch.sigmoid(b_vec, out=self._lin_beta)
-        self._lin_a_f32.copy_(a_vec)
-        self._lin_a_f32.add_(lw['dt_bias_fp32_t'])
-        torch.exp(self._lin_a_f32, out=self._lin_sp_buf)
-        torch.log1p(self._lin_sp_buf, out=self._lin_sp_buf)
-        torch.mul(lw['neg_A_log_exp_fp32_t'], self._lin_sp_buf,
-                  out=self._lin_g_f32)
-        self._lin_g_bf.copy_(self._lin_g_f32)
-        beta = self._lin_beta
-        g_bf = self._lin_g_bf
-
-        # 8) Broadcast Q,K from 16 to 48 heads.
-        q_2d = q.view(1, 16, 128)
-        k_2d = k.view(1, 16, 128)
-        torch.index_select(q_2d, 1, self._lin_broadcast_idx, out=self._lin_q48)
-        torch.index_select(k_2d, 1, self._lin_broadcast_idx, out=self._lin_k48)
+        # 6) Split conv_out and broadcast q/k 16 -> 48 heads.
         q3 = self._lin_q48
         k3 = self._lin_k48
-        v3 = v.view(1, 48, 128).contiguous()
+        v3 = self._lin_v48
+        fvk.qwen36_lin_split_qkv_broadcast_bf16(
+            conv_out.data_ptr(), q3.data_ptr(), k3.data_ptr(),
+            v3.data_ptr(), 1, s,
+        )
+
+        # 7) beta = sigmoid(b); g = -A_log.exp() * softplus(a + dt_bias).
+        fvk.qwen36_gdn_gating_bf16(
+            a_vec.data_ptr(), b_vec.data_ptr(),
+            lw['neg_A_log_exp_fp32_t'].data_ptr(),
+            lw['dt_bias_fp32_t'].data_ptr(),
+            self._lin_g_bf.data_ptr(), self._lin_beta.data_ptr(),
+            1, 48, s,
+        )
+        beta = self._lin_beta
+        g_bf = self._lin_g_bf
         attn_out_buf = self._lin_attn_out
 
         fvk.gated_deltanet_recurrent_qwen36_bf16(
@@ -1416,7 +1554,10 @@ class Qwen36TorchFrontendRtx:
 
         # 11) residual.
         attn_proj = out_op_buf[:1].view(1, 1, 5120)
-        torch.add(h_in, attn_proj, out=self._res_mid)
+        fvk.add_bf16_out(
+            h_in.data_ptr(), attn_proj.data_ptr(),
+            self._res_mid.data_ptr(), 5120, s,
+        )
         h_post = self._res_mid
 
         # 12) post-attn layernorm.
@@ -1487,7 +1628,10 @@ class Qwen36TorchFrontendRtx:
 
         # 16) final residual.
         h_out = self._layer_out_a if (L % 2 == 0) else self._layer_out_b
-        torch.add(h_post, mlp_out, out=h_out)
+        fvk.add_bf16_out(
+            h_post.data_ptr(), mlp_out.data_ptr(),
+            h_out.data_ptr(), 5120, s,
+        )
         return h_out
 
     def _layer_forward_full_nvfp4(self, L: int, h_in, cos, sin, cur_pos: int):
@@ -1534,9 +1678,11 @@ class Qwen36TorchFrontendRtx:
             float(lw['q_proj_alpha']),
             s,
         )
-        q_full = q_proj_out_buf[:1].view(1, 1, 24, 512)
-        q_pre, gate = torch.chunk(q_full, 2, dim=-1)
-        gate_flat = gate.reshape(1, 1, 24 * 256)
+        q_pre_2d = self._full_q_rot.view(24, 256)
+        gate_flat = self._full_gate_sig.view(1, 1, 24 * 256)
+        fvk.qwen36_split_q_gate_bf16(
+            q_proj_out_buf[:1].data_ptr(), q_pre_2d.data_ptr(),
+            gate_flat.data_ptr(), 1, s)
 
         # 4) k_proj -> (1, 1024).
         kv_proj_out_buf = self._nvfp4_scratch[(1024, 5120)][2]
@@ -1551,7 +1697,6 @@ class Qwen36TorchFrontendRtx:
         k_pre = kv_proj_out_buf[:1].view(1, 1, 4, 256).contiguous()
 
         # 5) q_norm / k_norm.
-        q_pre_2d = q_pre.contiguous().view(24, 256)
         fvk.rms_norm(
             q_pre_2d.data_ptr(), int(lw['q_norm_eff_w']),
             self._full_q_norm_out.data_ptr(), 24, 256, eps, s,
@@ -1562,32 +1707,17 @@ class Qwen36TorchFrontendRtx:
             self._full_k_norm_out.data_ptr(), 4, 256, eps, s,
         )
 
-        # 6) Inline RoPE on partial (rotary_dim=64) Q/K.
-        q_for_rope = self._full_q_norm_out.view(1, 1, 24, 256)
-        k_for_rope = self._full_k_norm_out.view(1, 1, 4, 256)
-        cos4 = cos.view(1, 1, 1, 64)
-        sin4 = sin.view(1, 1, 1, 64)
-
-        def _rope_inline(x_in, x_out, tmp):
-            x_out[..., 64:].copy_(x_in[..., 64:])
-            torch.index_select(
-                x_in[..., :64], -1, self._rope_rotate_idx, out=tmp,
-            )
-            tmp[..., :32].neg_()
-            tmp.mul_(sin4)
-            tmp.addcmul_(x_in[..., :64], cos4)
-            x_out[..., :64].copy_(tmp)
-
-        _rope_inline(q_for_rope, self._full_q_rot, self._full_rope_tmp_q)
-        _rope_inline(k_for_rope, self._full_k_rot, self._full_rope_tmp_k)
-        q_rot = self._full_q_rot
-        k_rot = self._full_k_rot
-
-        # 7) Stage Q + write K, V to KV cache.
-        self._attn.Q_buf[:, :1].copy_(q_rot)
-        self._attn.K_cache[full_rank, cur_pos:cur_pos + 1].copy_(
-            k_rot.view(1, 4, 256)
+        # 6) Partial RoPE, staging Q and K directly to their hot buffers.
+        q_dst = self._attn.Q_buf[:, :1]
+        k_dst = self._attn.K_cache[full_rank, cur_pos:cur_pos + 1]
+        fvk.qwen36_partial_rope_qk_bf16(
+            self._full_q_norm_out.data_ptr(),
+            self._full_k_norm_out.data_ptr(),
+            cos.data_ptr(), sin.data_ptr(),
+            q_dst.data_ptr(), k_dst.data_ptr(),
+            1, 24, 4, 256, 64, s,
         )
+        # 7) Write V to KV cache.
         # v_proj — reuse kv_proj_out_buf (k already in cache).
         fvk.fp4_w4a16_gemm_sm120_bf16out(
             ap_5120.data_ptr(), int(lw['v_proj_packed']),
@@ -1598,7 +1728,11 @@ class Qwen36TorchFrontendRtx:
             s,
         )
         v_new = kv_proj_out_buf[:1].view(1, 4, 256)
-        self._attn.V_cache[full_rank, cur_pos:cur_pos + 1].copy_(v_new)
+        fvk.gpu_copy(
+            self._attn.V_cache[
+                full_rank, cur_pos:cur_pos + 1].data_ptr(),
+            v_new.data_ptr(), 4 * 256 * 2, s,
+        )
 
         # N7-B4: TurboQuant inject (no-op when disabled or graph-capturing).
         # Replaces just-written K/V in cache with their TQ round-tripped
@@ -1617,8 +1751,10 @@ class Qwen36TorchFrontendRtx:
 
         # 9) Output gate: attn * sigmoid(gate).
         attn_flat = attn_out.reshape(1, 1, 24 * 256)
-        torch.sigmoid(gate_flat, out=self._full_gate_sig)
-        torch.mul(attn_flat, self._full_gate_sig, out=self._full_gated)
+        fvk.sigmoid_mul_qwen36_bf16(
+            gate_flat.data_ptr(), attn_flat.data_ptr(),
+            self._full_gated.data_ptr(), 24 * 256, s,
+        )
         gated = self._full_gated
 
         # 10) o_proj NVFP4: K=6144 -> N=5120.
@@ -1640,7 +1776,10 @@ class Qwen36TorchFrontendRtx:
 
         # 11) Residual.
         attn_proj = out_op_buf[:1].view(1, 1, 5120)
-        torch.add(h_in, attn_proj, out=self._res_mid)
+        fvk.add_bf16_out(
+            h_in.data_ptr(), attn_proj.data_ptr(),
+            self._res_mid.data_ptr(), 5120, s,
+        )
         h_post = self._res_mid
 
         # 12) post-attn layernorm.
@@ -1704,7 +1843,10 @@ class Qwen36TorchFrontendRtx:
 
         # 16) Final residual.
         h_out = self._layer_out_a if (L % 2 == 0) else self._layer_out_b
-        torch.add(h_post, mlp_out, out=h_out)
+        fvk.add_bf16_out(
+            h_post.data_ptr(), mlp_out.data_ptr(),
+            h_out.data_ptr(), 5120, s,
+        )
         return h_out
 
     # ---------- N5-stage3: NVFP4 S=K linear-attn layer ----------
@@ -1735,7 +1877,7 @@ class Qwen36TorchFrontendRtx:
         )
         eps = float(self._cfg['rms_norm_eps'])
 
-        h2 = h_in_K.view(K, 5120).contiguous()
+        h2 = h_in_K.view(K, 5120)
         x_norm = self._h_b[:K].view(K, 5120)
 
         # 1) input layernorm M=K.
@@ -1778,14 +1920,29 @@ class Qwen36TorchFrontendRtx:
         # matmul each.
         a_vec_K = self._K_lin_a_vec[:K]
         b_vec_K = self._K_lin_b_vec[:K]
-        fvk.bf16_matmul_qwen36_bf16(
-            x_norm.data_ptr(), int(lw['in_proj_a_w']),
-            a_vec_K.data_ptr(), K, 48, 5120, s,
-        )
-        fvk.bf16_matmul_qwen36_bf16(
-            x_norm.data_ptr(), int(lw['in_proj_b_w']),
-            b_vec_K.data_ptr(), K, 48, 5120, s,
-        )
+        if self._enable_lin_ab96_kernel:
+            fvk.bf16_matmul_qwen36_ab96_bf16(
+                x_norm.data_ptr(), int(lw['in_proj_ab_w']),
+                self._K_lin_ab_vec[:K].data_ptr(), K, s,
+            )
+        elif (
+            self._lin_ab_torch_mm_min_k > 0
+            and K >= self._lin_ab_torch_mm_min_k
+            and 'in_proj_ab_w_t' in lw
+        ):
+            torch.mm(
+                x_norm, lw['in_proj_ab_w_t'].t(),
+                out=self._K_lin_ab_vec[:K],
+            )
+        else:
+            fvk.bf16_matmul_qwen36_bf16(
+                x_norm.data_ptr(), int(lw['in_proj_a_w']),
+                a_vec_K.data_ptr(), K, 48, 5120, s,
+            )
+            fvk.bf16_matmul_qwen36_bf16(
+                x_norm.data_ptr(), int(lw['in_proj_b_w']),
+                b_vec_K.data_ptr(), K, 48, 5120, s,
+            )
 
         # 5) Per-token conv1d_update with chained per-step state save.
         # A2c-3: conv1d in/out variant chains state through the
@@ -1819,36 +1976,132 @@ class Qwen36TorchFrontendRtx:
             conv_state.copy_(
                 self._K_lin_conv_state_per_step[K - 1, lin_rank])
         else:
-            for k in range(K):
-                qkv_row = qkv_K_view[k:k + 1]
-                conv_out_row = self._K_lin_conv_out[k:k + 1]
-                fvk.causal_conv1d_qwen36_update_bf16(
-                    qkv_row.data_ptr(), int(lw['conv1d_w']),
+            use_conv_chunk = (
+                hasattr(fvk, 'causal_conv1d_qwen36_update_chunk_bf16')
+                and os.environ.get(
+                    'FVK_QWEN36_CHUNK_CONV_PREFILL', '1') == '1'
+            )
+            if use_conv_chunk:
+                conv_chunk = fvk.causal_conv1d_qwen36_update_chunk_bf16
+                if (
+                    hasattr(
+                        fvk,
+                        'causal_conv1d_qwen36_update_chunk_parallel_bf16')
+                    and os.environ.get(
+                        'FVK_QWEN36_CHUNK_CONV_PARALLEL', '1') == '1'
+                ):
+                    conv_chunk = (
+                        fvk.causal_conv1d_qwen36_update_chunk_parallel_bf16
+                    )
+                conv_chunk(
+                    qkv_K_view.data_ptr(), int(lw['conv1d_w']),
                     int(lw['conv1d_b']),
-                    conv_out_row.data_ptr(), conv_state.data_ptr(),
-                    1, 10240, 4, True, s,
+                    self._K_lin_conv_out[:K].data_ptr(),
+                    conv_state.data_ptr(),
+                    1, K, 10240, 4, True, s,
                 )
+            else:
+                for k in range(K):
+                    qkv_row = qkv_K_view[k:k + 1]
+                    conv_out_row = self._K_lin_conv_out[k:k + 1]
+                    fvk.causal_conv1d_qwen36_update_bf16(
+                        qkv_row.data_ptr(), int(lw['conv1d_w']),
+                        int(lw['conv1d_b']),
+                        conv_out_row.data_ptr(), conv_state.data_ptr(),
+                        1, 10240, 4, True, s,
+                    )
 
-        # 5b) Split conv output into Q (K, 16, 128), K (K, 16, 128),
-        # V (K, 48, 128). Layout: [Q_dim=2048, K_dim=2048, V_dim=6144].
+        # 5b) Split conv output into Q/K/V and broadcast Q/K heads from
+        # 16 to 48. The chunk kernel avoids three contiguous materializes
+        # and two torch.index_select launches in long prefill chunks.
         conv_K = self._K_lin_conv_out[:K]
-        q_K_heads = conv_K[:, :2048].contiguous().view(1, K, 16, 128)
-        k_K_heads = conv_K[:, 2048:4096].contiguous().view(1, K, 16, 128)
-        v_K_heads = conv_K[:, 4096:10240].contiguous().view(1, K, 48, 128)
+        use_direct_gdn = (
+            K > self._K_save_max
+            and os.environ.get(
+                'FVK_QWEN36_CHUNK_GDN_PREFILL', '1') == '1'
+            and hasattr(fvk, 'qwen36_gdn_chunk_from_conv_smem_bf16')
+            and hasattr(fvk, 'qwen36_gdn_chunk_from_conv_smem_strided_bf16')
+            and os.environ.get('FVK_QWEN36_GDN_DIRECT_CONV', '1') == '1'
+        )
+        if not use_direct_gdn:
+            q_K_48 = self._K_lin_q48[:K]
+            k_K_48 = self._K_lin_k48[:K]
+            v_K_3d = self._K_lin_v48[:K]
+            use_split_kernel = (
+                hasattr(fvk, 'qwen36_lin_split_qkv_broadcast_bf16')
+                and os.environ.get(
+                    'FVK_QWEN36_LIN_SPLIT_BROADCAST', '1') == '1'
+            )
+            if use_split_kernel:
+                fvk.qwen36_lin_split_qkv_broadcast_bf16(
+                    conv_K.data_ptr(), q_K_48.data_ptr(),
+                    k_K_48.data_ptr(), v_K_3d.data_ptr(), K, s,
+                )
+            else:
+                q_K_heads = conv_K[:, :2048].contiguous().view(
+                    1, K, 16, 128)
+                k_K_heads = conv_K[:, 2048:4096].contiguous().view(
+                    1, K, 16, 128)
+                v_K_heads = conv_K[:, 4096:10240].contiguous().view(
+                    1, K, 48, 128)
+                q_K_2d = q_K_heads.view(K, 16, 128)
+                k_K_2d = k_K_heads.view(K, 16, 128)
+                torch.index_select(q_K_2d, 1, self._lin_broadcast_idx,
+                                   out=q_K_48)
+                torch.index_select(k_K_2d, 1, self._lin_broadcast_idx,
+                                   out=k_K_48)
+                v_K_3d = v_K_heads.view(K, 48, 128)
 
-        # 5c) Compute g, beta for all K tokens (M=K vector ops).
-        beta_K = self._K_lin_beta[:K]
-        torch.sigmoid(b_vec_K, out=beta_K)
-        a_f32_K = self._K_lin_a_f32[:K]
-        a_f32_K.copy_(a_vec_K)
-        a_f32_K.add_(lw['dt_bias_fp32_t'])
-        sp_K = self._K_lin_sp_buf[:K]
-        torch.exp(a_f32_K, out=sp_K)
-        torch.log1p(sp_K, out=sp_K)
-        g_f32_K = self._K_lin_g_f32[:K]
-        torch.mul(lw['neg_A_log_exp_fp32_t'], sp_K, out=g_f32_K)
-        g_bf_K = self._K_lin_g_bf[:K]
-        g_bf_K.copy_(g_f32_K)
+            # 5c) Compute g, beta for all K tokens (M=K vector ops).
+            beta_K = self._K_lin_beta[:K]
+            g_bf_K = self._K_lin_g_bf[:K]
+            exact_verify_gating = (
+                os.environ.get(
+                    'FLASHRT_QWEN36_TQ_VERIFY_EXACT_GATING', '0') == '1'
+            )
+            use_fused_gating = (
+                not exact_verify_gating
+                and hasattr(fvk, 'qwen36_gdn_gating_bf16')
+                and (
+                    (a_vec_K.stride(0) == 48 and b_vec_K.stride(0) == 48)
+                    or hasattr(fvk, 'qwen36_gdn_gating_strided_bf16')
+                )
+                and os.environ.get(
+                    'FVK_QWEN36_GDN_FUSED_GATING', '1') == '1'
+            )
+            if use_fused_gating:
+                a_stride = a_vec_K.stride(0)
+                b_stride = b_vec_K.stride(0)
+                if (
+                    (a_stride != 48 or b_stride != 48)
+                    and hasattr(fvk, 'qwen36_gdn_gating_strided_bf16')
+                ):
+                    fvk.qwen36_gdn_gating_strided_bf16(
+                        a_vec_K.data_ptr(), b_vec_K.data_ptr(),
+                        lw['neg_A_log_exp_fp32_t'].data_ptr(),
+                        lw['dt_bias_fp32_t'].data_ptr(),
+                        g_bf_K.data_ptr(), beta_K.data_ptr(),
+                        K, 48, a_stride, b_stride, s,
+                    )
+                else:
+                    fvk.qwen36_gdn_gating_bf16(
+                        a_vec_K.data_ptr(), b_vec_K.data_ptr(),
+                        lw['neg_A_log_exp_fp32_t'].data_ptr(),
+                        lw['dt_bias_fp32_t'].data_ptr(),
+                        g_bf_K.data_ptr(), beta_K.data_ptr(),
+                        K, 48, s,
+                    )
+            else:
+                torch.sigmoid(b_vec_K, out=beta_K)
+                a_f32_K = self._K_lin_a_f32[:K]
+                a_f32_K.copy_(a_vec_K)
+                a_f32_K.add_(lw['dt_bias_fp32_t'])
+                sp_K = self._K_lin_sp_buf[:K]
+                torch.exp(a_f32_K, out=sp_K)
+                torch.log1p(sp_K, out=sp_K)
+                g_f32_K = self._K_lin_g_f32[:K]
+                torch.mul(lw['neg_A_log_exp_fp32_t'], sp_K, out=g_f32_K)
+                g_bf_K.copy_(g_f32_K)
 
         # 5d) K-iter recurrent (replaces FLA chunk_gated_delta_rule).
         # A2c-3: chain state through per-step save slots via the in/out
@@ -1857,19 +2110,77 @@ class Qwen36TorchFrontendRtx:
         # lin_state for k=0) and writes to slot k. After K steps,
         # lin_state ← per_step[K-1] (1 final copy per layer instead
         # of K copies inside the loop).
-        q_K_2d = q_K_heads.view(K, 16, 128)
-        k_K_2d = k_K_heads.view(K, 16, 128)
-        q_K_48 = self._K_lin_q48[:K]
-        k_K_48 = self._K_lin_k48[:K]
-        torch.index_select(q_K_2d, 1, self._lin_broadcast_idx,
-                           out=q_K_48)
-        torch.index_select(k_K_2d, 1, self._lin_broadcast_idx,
-                           out=k_K_48)
         rec_state_view = self._lin_state[lin_rank]  # (1, 48, 128, 128)
-        v_K_3d = v_K_heads.view(K, 48, 128)
         attn_out_K_buf = self._K_lin_attn_out[:K]
+        attn_out_K = None
+        gdn_backend = os.environ.get(
+            'FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND', 'fla_chunk')
+        use_fla_chunk = (
+            K > self._K_save_max
+            and gdn_backend in ('fla', 'fla_chunk', 'fla_ref')
+        )
         use_inout = K <= self._K_save_max
-        if use_inout:
+        if use_fla_chunk:
+            if (
+                hasattr(fvk, 'qwen36_lin_split_qkv_gqa_bf16')
+                and os.environ.get(
+                    'FVK_QWEN36_LIN_SPLIT_GQA', '1') == '1'
+            ):
+                q16_K = self._K_lin_q16[:K]
+                k16_K = self._K_lin_k16[:K]
+                v48_K = self._K_lin_v48[:K]
+                fvk.qwen36_lin_split_qkv_gqa_bf16(
+                    conv_K.data_ptr(), q16_K.data_ptr(),
+                    k16_K.data_ptr(), v48_K.data_ptr(), K, s,
+                )
+                q_K_heads = q16_K.view(1, K, 16, 128)
+                k_K_heads = k16_K.view(1, K, 16, 128)
+                v_K_heads = v48_K.view(1, K, 48, 128)
+            else:
+                q_K_heads = conv_K[:, :2048].contiguous().view(
+                    1, K, 16, 128)
+                k_K_heads = conv_K[:, 2048:4096].contiguous().view(
+                    1, K, 16, 128)
+                v_K_heads = conv_K[:, 4096:10240].contiguous().view(
+                    1, K, 48, 128)
+
+            beta_K = self._K_lin_beta[:K]
+            g_bf_K = self._K_lin_g_bf[:K]
+            a_stride = a_vec_K.stride(0)
+            b_stride = b_vec_K.stride(0)
+            if (
+                (a_stride != 48 or b_stride != 48)
+                and hasattr(fvk, 'qwen36_gdn_gating_strided_bf16')
+            ):
+                fvk.qwen36_gdn_gating_strided_bf16(
+                    a_vec_K.data_ptr(), b_vec_K.data_ptr(),
+                    lw['neg_A_log_exp_fp32_t'].data_ptr(),
+                    lw['dt_bias_fp32_t'].data_ptr(),
+                    g_bf_K.data_ptr(), beta_K.data_ptr(),
+                    K, 48, a_stride, b_stride, s,
+                )
+            else:
+                fvk.qwen36_gdn_gating_bf16(
+                    a_vec_K.data_ptr(), b_vec_K.data_ptr(),
+                    lw['neg_A_log_exp_fp32_t'].data_ptr(),
+                    lw['dt_bias_fp32_t'].data_ptr(),
+                    g_bf_K.data_ptr(), beta_K.data_ptr(),
+                    K, 48, s,
+                )
+            chunk_gated_delta_rule = _load_qwen36_fla_chunk()
+            attn_out_K, new_state = chunk_gated_delta_rule(
+                q_K_heads, k_K_heads, v_K_heads,
+                g_bf_K.view(1, K, 48), beta_K.view(1, K, 48),
+                initial_state=rec_state_view,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+                q_l2_out=self._K_fla_q16_l2[:, :K],
+                k_l2_out=self._K_fla_k16_l2[:, :K],
+                g_cumsum_out=self._K_fla_g_cumsum[:, :K],
+                o_out=self._K_lin_attn_out[:K].view(1, K, 48, 128),
+            )
+            rec_state_view.copy_(new_state)
+        elif use_inout:
             for k in range(K):
                 state_in_ptr = (
                     rec_state_view.data_ptr() if k == 0
@@ -1889,20 +2200,80 @@ class Qwen36TorchFrontendRtx:
             rec_state_view.copy_(
                 self._K_lin_state_per_step[K - 1, lin_rank])
         else:
-            # Fallback for K beyond save buffer: original in-place + copy path.
-            for k in range(K):
-                fvk.gated_deltanet_recurrent_qwen36_bf16(
-                    q_K_48[k].data_ptr(), k_K_48[k].data_ptr(),
-                    v_K_3d[k].data_ptr(),
-                    g_bf_K[k].data_ptr(), beta_K[k].data_ptr(),
-                    rec_state_view.data_ptr(),
-                    attn_out_K_buf[k].data_ptr(),
-                    1, 48, 128, 128, True, s,
+            use_chunk_scan = (
+                hasattr(fvk, 'gated_deltanet_chunk_qwen36_bf16')
+                and os.environ.get(
+                    'FVK_QWEN36_CHUNK_GDN_PREFILL', '1') == '1'
+            )
+            if use_chunk_scan:
+                use_direct_gdn = (
+                    hasattr(fvk, 'qwen36_gdn_chunk_from_conv_smem_bf16')
+                    and hasattr(
+                        fvk, 'qwen36_gdn_chunk_from_conv_smem_strided_bf16')
+                    and os.environ.get(
+                        'FVK_QWEN36_GDN_DIRECT_CONV', '1') == '1'
                 )
-        attn_out_K = attn_out_K_buf.view(1, K, 48, 128)
+                if use_direct_gdn:
+                    a_stride = a_vec_K.stride(0)
+                    b_stride = b_vec_K.stride(0)
+                    if (
+                        (a_stride != 48 or b_stride != 48)
+                        and hasattr(
+                            fvk,
+                            'qwen36_gdn_chunk_from_conv_smem_strided_bf16')
+                    ):
+                        fvk.qwen36_gdn_chunk_from_conv_smem_strided_bf16(
+                            conv_K.data_ptr(),
+                            a_vec_K.data_ptr(), b_vec_K.data_ptr(),
+                            lw['neg_A_log_exp_fp32_t'].data_ptr(),
+                            lw['dt_bias_fp32_t'].data_ptr(),
+                            rec_state_view.data_ptr(),
+                            attn_out_K_buf.data_ptr(),
+                            K, 48, a_stride, b_stride, True, s,
+                        )
+                    else:
+                        fvk.qwen36_gdn_chunk_from_conv_smem_bf16(
+                            conv_K.data_ptr(),
+                            a_vec_K.data_ptr(), b_vec_K.data_ptr(),
+                            lw['neg_A_log_exp_fp32_t'].data_ptr(),
+                            lw['dt_bias_fp32_t'].data_ptr(),
+                            rec_state_view.data_ptr(),
+                            attn_out_K_buf.data_ptr(),
+                            K, 48, True, s,
+                        )
+                else:
+                    gdn_chunk = fvk.gated_deltanet_chunk_qwen36_bf16
+                    if (
+                        os.environ.get(
+                            'FVK_QWEN36_CHUNK_GDN_SMEM', '1') == '1'
+                        and hasattr(
+                            fvk, 'gated_deltanet_chunk_smem_qwen36_bf16')
+                    ):
+                        gdn_chunk = fvk.gated_deltanet_chunk_smem_qwen36_bf16
+                    gdn_chunk(
+                        q_K_48.data_ptr(), k_K_48.data_ptr(),
+                        v_K_3d.data_ptr(),
+                        g_bf_K.data_ptr(), beta_K.data_ptr(),
+                        rec_state_view.data_ptr(),
+                        attn_out_K_buf.data_ptr(),
+                        K, 48, 128, 128, True, s,
+                    )
+            else:
+                # Fallback for K beyond save buffer: original in-place path.
+                for k in range(K):
+                    fvk.gated_deltanet_recurrent_qwen36_bf16(
+                        q_K_48[k].data_ptr(), k_K_48[k].data_ptr(),
+                        v_K_3d[k].data_ptr(),
+                        g_bf_K[k].data_ptr(), beta_K[k].data_ptr(),
+                        rec_state_view.data_ptr(),
+                        attn_out_K_buf[k].data_ptr(),
+                        1, 48, 128, 128, True, s,
+                    )
+        if attn_out_K is None:
+            attn_out_K = attn_out_K_buf.view(1, K, 48, 128)
 
         # 5e) rms_norm_gated_silu over (K*48, 128) rows in one call.
-        attn_out_flat = attn_out_K.contiguous().view(K * 48, 128)
+        attn_out_flat = attn_out_K.view(K * 48, 128)
         z_flat = out_z_K.view(K * 48, 128)
         norm_out_flat = self._K_lin_norm_out[:K].view(K * 48, 128)
         fvk.rms_norm_gated_silu_qwen36_bf16(
@@ -1945,39 +2316,67 @@ class Qwen36TorchFrontendRtx:
             K, 5120, eps, s,
         )
         h_post = res_mid_K
-        gate_out_buf = self._nvfp4_scratch[(17408, 5120)][2]
-        up_out_buf = self._mlp_up_out
         # 8b) MLP gate / up: NVFP4 GEMM at M=K.
-        fvk.fp4_w4a16_gemm_sm120_bf16out_widen(
-            ap_5120.data_ptr(), int(lw['mlp_gate_packed']),
-            gate_out_buf.data_ptr(),
-            K, 17408, 5120,
-            sf_5120.data_ptr(), int(lw['mlp_gate_sf']),
-            float(lw['mlp_gate_alpha']),
-            s,
-        )
-        fvk.fp4_w4a16_gemm_sm120_bf16out_widen(
-            ap_5120.data_ptr(), int(lw['mlp_up_packed']),
-            up_out_buf.data_ptr(),
-            K, 17408, 5120,
-            sf_5120.data_ptr(), int(lw['mlp_up_sf']),
-            float(lw['mlp_up_alpha']),
-            s,
-        )
-        # 8c) silu(gate) * up over K*17408 elements.
-        gate_v = gate_out_buf[:K].view(K, 17408)
-        up_v = up_out_buf[:K].view(K, 17408)
-        silu_out = self._K_mlp_silu_mul_out[:K]
-        fvk.silu_mul_qwen36_bf16(
-            gate_v.data_ptr(), up_v.data_ptr(),
-            silu_out.data_ptr(), K * 17408, s,
-        )
-        # 8d) MLP down: NVFP4 quant act (M=K, K_in=17408), NVFP4 GEMM.
+        if self._enable_mlp_gate_up_fusion:
+            gate_up_buf = self._K_mlp_gate_up_out[:K]
+            fvk.fp4_w4a16_gemm_sm120_bf16out(
+                ap_5120.data_ptr(), int(lw['mlp_gate_up_packed']),
+                gate_up_buf.data_ptr(),
+                K, int(lw['mlp_gate_up_N']), 5120,
+                sf_5120.data_ptr(), int(lw['mlp_gate_up_sf']),
+                float(lw['mlp_gate_up_alpha']),
+                s,
+            )
+            gate_out_buf = gate_up_buf[:, :17408]
+            up_out_buf = gate_up_buf[:, 17408:]
+        else:
+            gate_out_buf = self._nvfp4_scratch[(17408, 5120)][2]
+            up_out_buf = self._mlp_up_out
+            fvk.fp4_w4a16_gemm_sm120_bf16out(
+                ap_5120.data_ptr(), int(lw['mlp_gate_packed']),
+                gate_out_buf.data_ptr(),
+                K, 17408, 5120,
+                sf_5120.data_ptr(), int(lw['mlp_gate_sf']),
+                float(lw['mlp_gate_alpha']),
+                s,
+            )
+            fvk.fp4_w4a16_gemm_sm120_bf16out(
+                ap_5120.data_ptr(), int(lw['mlp_up_packed']),
+                up_out_buf.data_ptr(),
+                K, 17408, 5120,
+                sf_5120.data_ptr(), int(lw['mlp_up_sf']),
+                float(lw['mlp_up_alpha']),
+                s,
+            )
         ap_17408, sf_17408, _ = self._nvfp4_scratch[(5120, 17408)]
-        fvk.quantize_bf16_to_nvfp4_swizzled(
-            silu_out.data_ptr(), ap_17408.data_ptr(),
-            sf_17408.data_ptr(), K, 17408, s,
-        )
+        if self._enable_silu_mul_quant_fusion:
+            if self._enable_mlp_gate_up_fusion:
+                fvk.silu_mul_merged_to_nvfp4_swizzled_bf16(
+                    gate_up_buf.data_ptr(),
+                    ap_17408.data_ptr(), sf_17408.data_ptr(),
+                    K, 17408, s,
+                )
+            else:
+                gate_v = gate_out_buf[:K].view(K, 17408)
+                up_v = up_out_buf[:K].view(K, 17408)
+                fvk.silu_mul_to_nvfp4_swizzled_bf16(
+                    gate_v.data_ptr(), up_v.data_ptr(),
+                    ap_17408.data_ptr(), sf_17408.data_ptr(),
+                    K, 17408, s,
+                )
+        else:
+            gate_v = gate_out_buf[:K].view(K, 17408)
+            up_v = up_out_buf[:K].view(K, 17408)
+            silu_out = self._K_mlp_silu_mul_out[:K]
+            fvk.silu_mul_qwen36_bf16(
+                gate_v.data_ptr(), up_v.data_ptr(),
+                silu_out.data_ptr(), K * 17408, s,
+            )
+            fvk.quantize_bf16_to_nvfp4_swizzled(
+                silu_out.data_ptr(), ap_17408.data_ptr(),
+                sf_17408.data_ptr(), K, 17408, s,
+            )
+        # 8d) MLP down: NVFP4 GEMM.
         down_out_buf = self._nvfp4_scratch[(5120, 17408)][2]
         fvk.fp4_w4a16_gemm_sm120_bf16out(
             ap_17408.data_ptr(), int(lw['mlp_down_packed']),
@@ -1993,7 +2392,10 @@ class Qwen36TorchFrontendRtx:
         h_out = (self._K_layer_out_a if (L % 2 == 0)
                  else self._K_layer_out_b)
         h_out_K = h_out[:, :K]
-        torch.add(h_post, mlp_out, out=h_out_K)
+        fvk.add_bf16_out(
+            h_post.data_ptr(), mlp_out.data_ptr(),
+            h_out_K.data_ptr(), K * 5120, s,
+        )
         return h_out_K
 
     # ---------- N5-stage4: NVFP4 S=K full-attn layer ----------
@@ -2009,9 +2411,9 @@ class Qwen36TorchFrontendRtx:
             activation, then ``fp4_w4a16_gemm_sm120_bf16out`` at M=K.
           * MLP gate / up / down: same NVFP4 quant + GEMM pattern.
 
-        The K serial q_seq=1 FA2 calls (workaround for fwd_bf16's
-        missing causal flag) are identical to the FP8 path — kernel
-        ABI is format-agnostic.
+        The attention step prefers one causal q_seq=K FA2 call, with a
+        guarded fallback to the historical K serial q_seq=1 calls on
+        older builds.
         """
         import torch
         from flash_rt import flash_rt_kernels as fvk
@@ -2024,7 +2426,7 @@ class Qwen36TorchFrontendRtx:
         eps = float(self._cfg['rms_norm_eps'])
         full_rank = self._full_layer_rank(L)
 
-        h2 = h_in_K.view(K, 5120).contiguous()
+        h2 = h_in_K.view(K, 5120)
 
         # 1) input layernorm + NVFP4 quant — fused (B1).
         # Output (packed + swizzled SF) is reused by q/k/v projections;
@@ -2046,9 +2448,11 @@ class Qwen36TorchFrontendRtx:
             float(lw['q_proj_alpha']),
             s,
         )
-        q_full = q_proj_out_buf[:K].view(1, K, 24, 512)
-        q_pre, gate = torch.chunk(q_full, 2, dim=-1)
-        gate_flat = gate.reshape(1, K, 24 * 256)
+        q_pre_2d = self._K_full_q_rot[:, :K].view(K * 24, 256)
+        gate_flat = self._K_full_gate_sig[:, :K]
+        fvk.qwen36_split_q_gate_bf16(
+            q_proj_out_buf[:K].data_ptr(), q_pre_2d.data_ptr(),
+            gate_flat.data_ptr(), K, s)
 
         # 4) k_proj — M=K, N=1024.
         kv_proj_out_buf = self._nvfp4_scratch[(1024, 5120)][2]
@@ -2060,10 +2464,9 @@ class Qwen36TorchFrontendRtx:
             float(lw['k_proj_alpha']),
             s,
         )
-        k_pre = kv_proj_out_buf[:K].view(1, K, 4, 256).contiguous()
+        k_pre = kv_proj_out_buf[:K].view(1, K, 4, 256)
 
         # 5) q_norm / k_norm — per-head RMSNorm (M = K * heads).
-        q_pre_2d = q_pre.contiguous().view(K * 24, 256)
         q_norm_out = self._K_full_q_norm_out[:K * 24]
         fvk.rms_norm(
             q_pre_2d.data_ptr(), int(lw['q_norm_eff_w']),
@@ -2078,33 +2481,25 @@ class Qwen36TorchFrontendRtx:
             K * 4, 256, eps, s,
         )
 
-        # 6) RoPE inline over K positions (cos_K / sin_K shape (1, K, 64)).
-        q_for_rope = q_norm_out.view(1, K, 24, 256)
-        k_for_rope = k_norm_out.view(1, K, 4, 256)
-        cos4 = cos_K.view(1, K, 1, 64)
-        sin4 = sin_K.view(1, K, 1, 64)
-        q_rot_K = self._K_full_q_rot[:, :K]
-        k_rot_K = self._K_full_k_rot[:, :K]
-        tmp_q = self._K_full_rope_tmp_q[:, :K]
-        tmp_k = self._K_full_rope_tmp_k[:, :K]
-
-        def _rope_inline_K(x_in, x_out, tmp):
-            x_out[..., 64:].copy_(x_in[..., 64:])
-            torch.index_select(
-                x_in[..., :64], -1, self._rope_rotate_idx, out=tmp,
-            )
-            tmp[..., :32].neg_()
-            tmp.mul_(sin4)
-            tmp.addcmul_(x_in[..., :64], cos4)
-            x_out[..., :64].copy_(tmp)
-
-        _rope_inline_K(q_for_rope, q_rot_K, tmp_q)
-        _rope_inline_K(k_for_rope, k_rot_K, tmp_k)
-
-        # 7) Stage Q in backend Q_buf [:, :K]; write K rows of K/V.
-        self._attn.Q_buf[:, :K].copy_(q_rot_K)
-        self._attn.K_cache[full_rank, cur_pos:cur_pos + K].copy_(
-            k_rot_K.view(K, 4, 256))
+        # 6) Partial RoPE over K positions. Q is staged directly for FA2;
+        # K writes either to the BF16 cache or to a compressed-KV scratch
+        # before being quantized into the long-context cache.
+        use_tq_verify = bool(getattr(self, '_tq_verify_active', False))
+        use_fp8_verify = bool(getattr(
+            self, '_fp8_kv_verify_active', False))
+        use_compressed_kv = use_tq_verify or use_fp8_verify
+        q_dst = self._attn.Q_buf[:, :K]
+        if use_compressed_kv:
+            k_new_K = self._K_full_k_rot[:, :K].view(K, 4, 256)
+        else:
+            k_new_K = self._attn.K_cache[
+                full_rank, cur_pos:cur_pos + K]
+        fvk.qwen36_partial_rope_qk_bf16(
+            q_norm_out.data_ptr(), k_norm_out.data_ptr(),
+            cos_K.view(K, 64).data_ptr(), sin_K.view(K, 64).data_ptr(),
+            q_dst.data_ptr(), k_new_K.data_ptr(),
+            K, 24, 4, 256, 64, s,
+        )
 
         # v_proj — M=K (overwrite kv_proj_out_buf, K already in cache).
         fvk.fp4_w4a16_gemm_sm120_bf16out(
@@ -2116,30 +2511,65 @@ class Qwen36TorchFrontendRtx:
             s,
         )
         v_new_K = kv_proj_out_buf[:K].view(K, 4, 256)
-        self._attn.V_cache[full_rank, cur_pos:cur_pos + K].copy_(v_new_K)
+        if use_tq_verify:
+            cache = self._tq_cache_packed
+            if cache.packed and hasattr(fvk, 'tq_write_k1_unit_norm'):
+                cache.write_kv_fast(
+                    full_rank, cur_pos, cur_pos + K, k_new_K, v_new_K)
+            else:
+                cache.write_kv(
+                    full_rank, cur_pos, cur_pos + K, k_new_K, v_new_K)
+            k_stage, v_stage = self._tq_stage_for_layer(
+                full_rank, cur_pos + K)
+        elif use_fp8_verify:
+            self._fp8_write_kv(
+                full_rank, cur_pos, cur_pos + K, k_new_K, v_new_K)
+            if self._fp8_xqa_enabled(K, cur_pos + K):
+                k_stage = None
+                v_stage = None
+            else:
+                k_stage, v_stage = self._fp8_stage_for_layer(
+                    full_rank, cur_pos + K)
+        else:
+            fvk.gpu_copy(
+                self._attn.V_cache[
+                    full_rank, cur_pos:cur_pos + K].data_ptr(),
+                v_new_K.data_ptr(), K * 4 * 256 * 2, s,
+            )
+            # N7-B4: TurboQuant inject for the K rows just written.
+            self._tq_inject_kv(full_rank, cur_pos, count=K)
 
-        # N7-B4: TurboQuant inject for the K rows just written.
-        self._tq_inject_kv(full_rank, cur_pos, count=K)
-
-        # 8) FA2 — K serial q_seq=1 calls (fwd_bf16 has no causal flag).
-        # Each call's kv_seq is bound by Q's own position so K[j>i] is
-        # not read. Mirror of FP8 path (commit 2e16c11).
+        # 8) FA2. Prefer one causal q_seq=K call when the vendored
+        # hdim=256 causal entry is present; older builds fall back to K
+        # serial q_seq=1 calls, binding kv_seq to each Q position.
         scaling = float(self._cfg['head_dim']) ** -0.5
-        for k in range(K):
-            q_view = self._attn.Q_buf[:, k:k + 1]
-            kv_seq_k = cur_pos + k + 1
-            k_view = self._attn.K_cache[
-                full_rank:full_rank + 1, :kv_seq_k]
-            v_view = self._attn.V_cache[
-                full_rank:full_rank + 1, :kv_seq_k]
-            o_view = self._attn.O_buf[:, k:k + 1]
-            self._attn._fa2_fwd(
+        use_causal_fa2 = (
+            K > 1
+            and getattr(self._attn, '_fa2_fwd_causal', None) is not None
+            and os.environ.get('FVK_QWEN36_CAUSAL_PREFILL_FA2', '1') == '1'
+        )
+        if use_fp8_verify and self._fp8_xqa_enabled(K, cur_pos + K):
+            self._fp8_xqa_attn(full_rank, cur_pos + K, K, s)
+        elif use_causal_fa2:
+            if use_compressed_kv:
+                k_view = k_stage[:cur_pos + K].view(
+                    1, cur_pos + K, 4, 256)
+                v_view = v_stage[:cur_pos + K].view(
+                    1, cur_pos + K, 4, 256)
+            else:
+                k_view = self._attn.K_cache[
+                    full_rank:full_rank + 1, :cur_pos + K]
+                v_view = self._attn.V_cache[
+                    full_rank:full_rank + 1, :cur_pos + K]
+            q_view = self._attn.Q_buf[:, :K]
+            o_view = self._attn.O_buf[:, :K]
+            self._attn._fa2_fwd_causal(
                 Q=q_view.data_ptr(), K=k_view.data_ptr(),
                 V=v_view.data_ptr(), O=o_view.data_ptr(),
                 softmax_lse=self._attn.lse_buf.data_ptr(),
                 softmax_lse_accum=self._attn.lse_accum.data_ptr(),
                 o_accum=self._attn.o_accum.data_ptr(),
-                batch=1, seqlen_q=1, seqlen_k=kv_seq_k,
+                batch=1, seqlen_q=K, seqlen_k=cur_pos + K,
                 num_heads_q=24, num_heads_kv=4,
                 head_dim=256,
                 q_strides=(q_view.stride(0), q_view.stride(1),
@@ -2154,18 +2584,55 @@ class Qwen36TorchFrontendRtx:
                 num_sms=self._attn._num_sms,
                 stream=s,
             )
+        else:
+            for k in range(K):
+                q_view = self._attn.Q_buf[:, k:k + 1]
+                kv_seq_k = cur_pos + k + 1
+                if use_compressed_kv:
+                    k_view = k_stage[:kv_seq_k].view(
+                        1, kv_seq_k, 4, 256)
+                    v_view = v_stage[:kv_seq_k].view(
+                        1, kv_seq_k, 4, 256)
+                else:
+                    k_view = self._attn.K_cache[
+                        full_rank:full_rank + 1, :kv_seq_k]
+                    v_view = self._attn.V_cache[
+                        full_rank:full_rank + 1, :kv_seq_k]
+                o_view = self._attn.O_buf[:, k:k + 1]
+                self._attn._fa2_fwd(
+                    Q=q_view.data_ptr(), K=k_view.data_ptr(),
+                    V=v_view.data_ptr(), O=o_view.data_ptr(),
+                    softmax_lse=self._attn.lse_buf.data_ptr(),
+                    softmax_lse_accum=self._attn.lse_accum.data_ptr(),
+                    o_accum=self._attn.o_accum.data_ptr(),
+                    batch=1, seqlen_q=1, seqlen_k=kv_seq_k,
+                    num_heads_q=24, num_heads_kv=4,
+                    head_dim=256,
+                    q_strides=(q_view.stride(0), q_view.stride(1),
+                               q_view.stride(2)),
+                    k_strides=(k_view.stride(0), k_view.stride(1),
+                               k_view.stride(2)),
+                    v_strides=(v_view.stride(0), v_view.stride(1),
+                               v_view.stride(2)),
+                    o_strides=(o_view.stride(0), o_view.stride(1),
+                               o_view.stride(2)),
+                    softmax_scale=scaling,
+                    num_sms=self._attn._num_sms,
+                    stream=s,
+                )
         attn_out = self._attn.O_buf[:, :K]  # (1, K, 24, 256)
 
         # 9) Output gate: attn * sigmoid(gate). K rows.
         attn_flat = attn_out.reshape(1, K, 24 * 256)
-        gate_sig = self._K_full_gate_sig[:, :K]
         gated = self._K_full_gated[:, :K]
-        torch.sigmoid(gate_flat, out=gate_sig)
-        torch.mul(attn_flat, gate_sig, out=gated)
+        fvk.sigmoid_mul_qwen36_bf16(
+            gate_flat.data_ptr(), attn_flat.data_ptr(),
+            gated.data_ptr(), K * 24 * 256, s,
+        )
 
         # 10) o_proj NVFP4 — M=K, N=5120, K_in=6144.
         ap_6144, sf_6144, _ = self._nvfp4_scratch[(5120, 6144)]
-        gated_2d = gated.view(K, 6144).contiguous()
+        gated_2d = gated.view(K, 6144)
         fvk.quantize_bf16_to_nvfp4_swizzled(
             gated_2d.data_ptr(), ap_6144.data_ptr(),
             sf_6144.data_ptr(), K, 6144, s,
@@ -2192,40 +2659,68 @@ class Qwen36TorchFrontendRtx:
             K, 5120, eps, s,
         )
         h_post = res_mid_K
-        gate_out_buf = self._nvfp4_scratch[(17408, 5120)][2]
-        up_out_buf = self._mlp_up_out
-        fvk.fp4_w4a16_gemm_sm120_bf16out_widen(
-            ap_mlp.data_ptr(), int(lw['mlp_gate_packed']),
-            gate_out_buf.data_ptr(),
-            K, 17408, 5120,
-            sf_mlp.data_ptr(), int(lw['mlp_gate_sf']),
-            float(lw['mlp_gate_alpha']),
-            s,
-        )
-        fvk.fp4_w4a16_gemm_sm120_bf16out_widen(
-            ap_mlp.data_ptr(), int(lw['mlp_up_packed']),
-            up_out_buf.data_ptr(),
-            K, 17408, 5120,
-            sf_mlp.data_ptr(), int(lw['mlp_up_sf']),
-            float(lw['mlp_up_alpha']),
-            s,
-        )
+        if self._enable_mlp_gate_up_fusion:
+            gate_up_buf = self._K_mlp_gate_up_out[:K]
+            fvk.fp4_w4a16_gemm_sm120_bf16out(
+                ap_mlp.data_ptr(), int(lw['mlp_gate_up_packed']),
+                gate_up_buf.data_ptr(),
+                K, int(lw['mlp_gate_up_N']), 5120,
+                sf_mlp.data_ptr(), int(lw['mlp_gate_up_sf']),
+                float(lw['mlp_gate_up_alpha']),
+                s,
+            )
+            gate_out_buf = gate_up_buf[:, :17408]
+            up_out_buf = gate_up_buf[:, 17408:]
+        else:
+            gate_out_buf = self._nvfp4_scratch[(17408, 5120)][2]
+            up_out_buf = self._mlp_up_out
+            fvk.fp4_w4a16_gemm_sm120_bf16out(
+                ap_mlp.data_ptr(), int(lw['mlp_gate_packed']),
+                gate_out_buf.data_ptr(),
+                K, 17408, 5120,
+                sf_mlp.data_ptr(), int(lw['mlp_gate_sf']),
+                float(lw['mlp_gate_alpha']),
+                s,
+            )
+            fvk.fp4_w4a16_gemm_sm120_bf16out(
+                ap_mlp.data_ptr(), int(lw['mlp_up_packed']),
+                up_out_buf.data_ptr(),
+                K, 17408, 5120,
+                sf_mlp.data_ptr(), int(lw['mlp_up_sf']),
+                float(lw['mlp_up_alpha']),
+                s,
+            )
 
-        # 14) silu(gate) * up over K*17408 elements.
-        gate_v = gate_out_buf[:K].view(K, 17408)
-        up_v = up_out_buf[:K].view(K, 17408)
-        silu_out = self._K_mlp_silu_mul_out[:K]
-        fvk.silu_mul_qwen36_bf16(
-            gate_v.data_ptr(), up_v.data_ptr(),
-            silu_out.data_ptr(), K * 17408, s,
-        )
-
-        # 15) MLP down: NVFP4 quant + GEMM at M=K.
         ap_dn, sf_dn, _ = self._nvfp4_scratch[(5120, 17408)]
-        fvk.quantize_bf16_to_nvfp4_swizzled(
-            silu_out.data_ptr(), ap_dn.data_ptr(),
-            sf_dn.data_ptr(), K, 17408, s,
-        )
+        if self._enable_silu_mul_quant_fusion:
+            if self._enable_mlp_gate_up_fusion:
+                fvk.silu_mul_merged_to_nvfp4_swizzled_bf16(
+                    gate_up_buf.data_ptr(),
+                    ap_dn.data_ptr(), sf_dn.data_ptr(),
+                    K, 17408, s,
+                )
+            else:
+                gate_v = gate_out_buf[:K].view(K, 17408)
+                up_v = up_out_buf[:K].view(K, 17408)
+                fvk.silu_mul_to_nvfp4_swizzled_bf16(
+                    gate_v.data_ptr(), up_v.data_ptr(),
+                    ap_dn.data_ptr(), sf_dn.data_ptr(),
+                    K, 17408, s,
+                )
+        else:
+            gate_v = gate_out_buf[:K].view(K, 17408)
+            up_v = up_out_buf[:K].view(K, 17408)
+            silu_out = self._K_mlp_silu_mul_out[:K]
+            fvk.silu_mul_qwen36_bf16(
+                gate_v.data_ptr(), up_v.data_ptr(),
+                silu_out.data_ptr(), K * 17408, s,
+            )
+            fvk.quantize_bf16_to_nvfp4_swizzled(
+                silu_out.data_ptr(), ap_dn.data_ptr(),
+                sf_dn.data_ptr(), K, 17408, s,
+            )
+
+        # 15) MLP down: NVFP4 GEMM at M=K.
         down_out_buf = self._nvfp4_scratch[(5120, 17408)][2]
         fvk.fp4_w4a16_gemm_sm120_bf16out(
             ap_dn.data_ptr(), int(lw['mlp_down_packed']),
@@ -2241,7 +2736,10 @@ class Qwen36TorchFrontendRtx:
         h_out = (self._K_layer_out_a if (L % 2 == 0)
                  else self._K_layer_out_b)
         h_out_K = h_out[:, :K]
-        torch.add(h_post, mlp_out, out=h_out_K)
+        fvk.add_bf16_out(
+            h_post.data_ptr(), mlp_out.data_ptr(),
+            h_out_K.data_ptr(), K * 5120, s,
+        )
         return h_out_K
 
     def forward_own_decode_nvfp4(self, token_id, cos_pos, sin_pos,
@@ -2268,15 +2766,13 @@ class Qwen36TorchFrontendRtx:
                 [token_id], device=self.device, dtype=torch.long)
         if token_id.ndim == 1:
             token_id = token_id.view(1, 1)
-        # embed_w (vocab, hidden) bf16; anchors[0] is embed_w
-        # (per extract_weights_nvfp4 ordering: top-level first).
-        embed_w_ptr = self._weights.ptrs['embed_w']
-        # Reconstruct an indexable view by walking handles.anchors —
-        # the embed weight is the first anchor pushed in our loader.
-        embed_t = self._weights.anchors[0]  # (vocab, hidden) bf16
-        h = embed_t[token_id.view(-1)].view(1, 1, hidden).contiguous()
-        if h.dtype != bf16:
-            h = h.to(bf16)
+        fvk.qwen36_embedding_lookup_bf16(
+            token_id.view(-1).data_ptr(),
+            int(self._weights.ptrs['embed_w']),
+            self._embed_buf.data_ptr(),
+            1, hidden, s,
+        )
+        h = self._embed_buf
 
         for L in range(self._cfg['num_hidden_layers']):
             t = types[L]
@@ -2295,6 +2791,14 @@ class Qwen36TorchFrontendRtx:
             h2.data_ptr(), int(self._weights.ptrs['final_norm_eff_w']),
             x_norm.data_ptr(), 1, hidden, eps, s,
         )
+
+        if 'lm_head_w_bf16' in self._weights.ptrs:
+            fvk.bf16_matvec_qwen36_bf16(
+                x_norm.data_ptr(),
+                int(self._weights.ptrs['lm_head_w_bf16']),
+                self._logits_buf.data_ptr(), vocab, hidden, s,
+            )
+            return self._logits_buf
 
         # G8: lm_head NVFP4 GEMM (was BF16 matvec). Reuse the K=5120
         # activation scratch from any existing (*, 5120) entry — they
@@ -2318,7 +2822,8 @@ class Qwen36TorchFrontendRtx:
 
     def forward_own_decode_K_nvfp4(self, token_ids_K, cos_K, sin_K,
                                     cur_pos: int, K: int,
-                                    tap_buf=None):
+                                    tap_buf=None,
+                                    logits_mode: str = 'all'):
         """NVFP4 S=K decode: 64 layers + final norm + lm_head at K rows.
 
         Mirror of FP8 ``forward_own_decode_K`` but routes through the
@@ -2351,10 +2856,13 @@ class Qwen36TorchFrontendRtx:
             token_ids_K = torch.tensor(
                 token_ids_K, device=self.device, dtype=torch.long)
         token_ids_K = token_ids_K.view(K)
-        embed_t = self._weights.anchors[0]  # (vocab, hidden) bf16
-        h = embed_t[token_ids_K].view(1, K, hidden).contiguous()
-        if h.dtype != bf16:
-            h = h.to(bf16)
+        fvk.qwen36_embedding_lookup_bf16(
+            token_ids_K.data_ptr(),
+            int(self._weights.ptrs['embed_w']),
+            self._K_embed_buf.data_ptr(),
+            K, hidden, s,
+        )
+        h = self._K_embed_buf[:, :K]
 
         # 1) 64 decoder layers at S=K.
         for L in range(self._cfg['num_hidden_layers']):
@@ -2375,18 +2883,56 @@ class Qwen36TorchFrontendRtx:
                 if tap_idx >= 0:
                     tap_buf[tap_idx, :K].copy_(h.view(K, hidden))
 
+        if logits_mode not in ('all', 'last', 'none', 'hidden', 'hidden_last'):
+            raise ValueError(
+                "logits_mode must be 'all', 'last', 'none', 'hidden', "
+                "'hidden_last', got "
+                f"{logits_mode!r}")
+
         # 2) Stash pre-final-norm hidden so MTP head / chained spec
-        # can consume per-row hiddens.
-        self._K_last_hidden_buf[:, :K].copy_(h)
+        # can consume per-row hiddens. Long prefill only needs the last
+        # row and intermediate prompt chunks need no logits at all.
+        if logits_mode in ('all', 'hidden', 'hidden_last'):
+            self._K_last_hidden_buf[:, :K].copy_(h)
+        else:
+            self._K_last_hidden_buf[:, :1].copy_(h[:, K - 1:K, :])
+        if logits_mode in ('none', 'hidden'):
+            return None
 
         # 3) Final RMSNorm M=K.
-        h2 = h.view(K, hidden).contiguous()
-        x_norm = self._h_b[:K].view(K, hidden)
+        if logits_mode in ('last', 'hidden_last'):
+            rows = 1
+            h2 = h[:, K - 1:K, :].view(1, hidden)
+            x_norm = self._h_b[:1].view(1, hidden)
+        else:
+            rows = K
+            h2 = h.view(K, hidden)
+            x_norm = self._h_b[:K].view(K, hidden)
         fvk.rms_norm(
             h2.data_ptr(), int(self._weights.ptrs['final_norm_eff_w']),
             x_norm.data_ptr(),
-            K, hidden, eps, s,
+            rows, hidden, eps, s,
         )
+
+        if logits_mode in ('last', 'hidden_last'):
+            out_K = self._logits_buf
+        elif K <= self._K_logits_buf.shape[0]:
+            out_K = self._K_logits_buf[:K]
+        else:
+            large = getattr(self, '_K_logits_large_buf', None)
+            if large is None or large.shape[0] < K:
+                import torch
+                large = torch.empty(
+                    K, vocab, device=self.device, dtype=torch.bfloat16)
+                self._K_logits_large_buf = large
+            out_K = large[:K]
+        if 'lm_head_w_bf16' in self._weights.ptrs:
+            fvk.bf16_matmul_qwen36_bf16(
+                x_norm.data_ptr(),
+                int(self._weights.ptrs['lm_head_w_bf16']),
+                out_K.data_ptr(), rows, vocab, hidden, s,
+            )
+            return out_K
 
         # 4) G8: lm_head NVFP4 GEMM (M=K). NVFP4 weight is 4× smaller
         # than BF16 (0.6 GB vs 2.5 GB). Reads weight ONCE for all K
@@ -2394,20 +2940,69 @@ class Qwen36TorchFrontendRtx:
         ap, sf, _ = self._nvfp4_scratch[(10240, 5120)]
         fvk.quantize_bf16_to_nvfp4_swizzled(
             x_norm.data_ptr(), ap.data_ptr(), sf.data_ptr(),
-            K, hidden, s,
+            rows, hidden, s,
         )
-        out_K = self._K_logits_buf[:K]
         fvk.fp4_w4a16_gemm_sm120_bf16out_widen(
             ap.data_ptr(), int(self._weights.ptrs['lm_head_packed']),
             out_K.data_ptr(),
-            K, vocab, hidden,
+            rows, vocab, hidden,
             sf.data_ptr(), int(self._weights.ptrs['lm_head_sf']),
             float(self._weights.ptrs['lm_head_alpha']),
             s,
         )
-        return self._K_logits_buf[:K]
+        return out_K
 
-    def forward_mtp_head_nvfp4(self, prev_h, prev_token_id, cur_pos: int):
+    def forward_own_decode_K_nvfp4_tq(self, token_ids_K, cos_K, sin_K,
+                                      cur_pos: int, K: int,
+                                      tap_buf=None,
+                                      logits_mode: str = 'all'):
+        """S=K NVFP4 verify forward over the TurboQuant packed KV cache.
+
+        Linear-attention state handling and per-step recovery saves are
+        identical to ``forward_own_decode_K_nvfp4``. Full-attention
+        layers write the K new rows into the TQ packed cache and read
+        dequantized BF16 staging buffers instead of ``_attn.K_cache``.
+        """
+        self._tq_verify_active = True
+        try:
+            return self.forward_own_decode_K_nvfp4(
+                token_ids_K, cos_K, sin_K, cur_pos, K, tap_buf=tap_buf,
+                logits_mode=logits_mode)
+        finally:
+            self._tq_verify_active = False
+
+    def forward_own_decode_K_nvfp4_fp8kv(self, token_ids_K, cos_K, sin_K,
+                                         cur_pos: int, K: int,
+                                         tap_buf=None,
+                                         logits_mode: str = 'all'):
+        """S=K NVFP4 verify forward over an FP8 persistent KV cache.
+
+        This is the first-stage FP8-KV bridge: K/V writes are quantized
+        into e4m3 storage, then dequantized into the shared BF16 stage
+        consumed by the existing FA2 BF16 ABI.  Direct FP8 attention
+        replaces the staging step in the follow-up kernel pass.
+        """
+        self._fp8_kv_verify_active = True
+        try:
+            return self.forward_own_decode_K_nvfp4(
+                token_ids_K, cos_K, sin_K, cur_pos, K, tap_buf=tap_buf,
+                logits_mode=logits_mode)
+        finally:
+            self._fp8_kv_verify_active = False
+
+    def _forward_long_kv_K_nvfp4(self, token_ids_K, cos_K, sin_K,
+                                 cur_pos: int, K: int,
+                                 logits_mode: str = 'all'):
+        if getattr(self, '_long_kv_cache_mode', 'tq') == 'fp8':
+            return self.forward_own_decode_K_nvfp4_fp8kv(
+                token_ids_K, cos_K, sin_K, cur_pos, K,
+                logits_mode=logits_mode)
+        return self.forward_own_decode_K_nvfp4_tq(
+            token_ids_K, cos_K, sin_K, cur_pos, K,
+            logits_mode=logits_mode)
+
+    def forward_mtp_head_nvfp4(self, prev_h, prev_token_id, cur_pos: int,
+                               mtp_cache_pos: int | None = None):
         """NVFP4 MTP head forward (1-layer DeepSeek-V3 draft).
 
         Same math as ``forward_mtp_head`` (FP8 path) but every FP8 GEMM
@@ -2425,20 +3020,24 @@ class Qwen36TorchFrontendRtx:
         if mtp is None:
             raise RuntimeError(
                 'MTP head not loaded — set FLASHRT_QWEN36_MTP_CKPT_DIR')
+        use_bf16_mtp = 'q_proj_w_bf16' in mtp
         eps = float(self._cfg['rms_norm_eps'])
         vocab = self._cfg['vocab_size']
 
         # 0) Embed prev_token via anchored embed_w table.
         if prev_token_id.ndim == 1:
             prev_token_id = prev_token_id.view(1, 1)
-        embed_t = self._weights.anchors[0]   # (vocab, hidden) bf16
-        e = embed_t[prev_token_id.view(-1)].view(1, 1, 5120).contiguous()
-        if e.dtype != torch.bfloat16:
-            e = e.to(torch.bfloat16)
+        fvk.qwen36_embedding_lookup_bf16(
+            prev_token_id.view(-1).data_ptr(),
+            int(self._weights.ptrs['embed_w']),
+            self._mtp_embed_buf.data_ptr(),
+            1, 5120, s,
+        )
+        e = self._mtp_embed_buf
 
         # 1) pre-fc norms.
-        prev_h_2d = prev_h.view(1, 5120).contiguous()
-        e_2d = e.view(1, 5120).contiguous()
+        prev_h_2d = prev_h.view(1, 5120)
+        e_2d = e.view(1, 5120)
         h_norm = self._mtp_h_norm_buf.view(1, 5120)
         e_norm = self._mtp_e_norm_buf.view(1, 5120)
         fvk.rms_norm(
@@ -2465,6 +3064,7 @@ class Qwen36TorchFrontendRtx:
         # 4) Full-attn layer body (NVFP4) on MTP-private KV cache.
         h_in_full = self._mtp_fc_out_buf
         cos, sin = self._rope_cos_sin(cur_pos)
+        cache_pos = cur_pos if mtp_cache_pos is None else int(mtp_cache_pos)
 
         # 4a) input layernorm.
         h2 = h_in_full.view(1, 5120)
@@ -2483,32 +3083,43 @@ class Qwen36TorchFrontendRtx:
 
         # 4c) q_proj fused.
         q_proj_out_buf = self._nvfp4_scratch[(12288, 5120)][2]
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
-            ap_5120.data_ptr(), int(mtp['q_proj_packed']),
-            q_proj_out_buf.data_ptr(),
-            1, 12288, 5120,
-            sf_5120.data_ptr(), int(mtp['q_proj_sf']),
-            float(mtp['q_proj_alpha']),
-            s,
-        )
-        q_full = q_proj_out_buf[:1].view(1, 1, 24, 512)
-        q_pre, gate = torch.chunk(q_full, 2, dim=-1)
-        gate_flat = gate.reshape(1, 1, 24 * 256)
+        if use_bf16_mtp:
+            fvk.bf16_matvec_qwen36_bf16(
+                x_norm.data_ptr(), int(mtp['q_proj_w_bf16']),
+                q_proj_out_buf.data_ptr(), 12288, 5120, s)
+        else:
+            fvk.fp4_w4a16_gemm_sm120_bf16out(
+                ap_5120.data_ptr(), int(mtp['q_proj_packed']),
+                q_proj_out_buf.data_ptr(),
+                1, 12288, 5120,
+                sf_5120.data_ptr(), int(mtp['q_proj_sf']),
+                float(mtp['q_proj_alpha']),
+                s,
+            )
+        q_pre_2d = self._full_q_rot.view(24, 256)
+        gate_flat = self._full_gate_sig.view(1, 1, 24 * 256)
+        fvk.qwen36_split_q_gate_bf16(
+            q_proj_out_buf[:1].data_ptr(), q_pre_2d.data_ptr(),
+            gate_flat.data_ptr(), 1, s)
 
         # 4d) k_proj.
         kv_proj_out_buf = self._nvfp4_scratch[(1024, 5120)][2]
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
-            ap_5120.data_ptr(), int(mtp['k_proj_packed']),
-            kv_proj_out_buf.data_ptr(),
-            1, 1024, 5120,
-            sf_5120.data_ptr(), int(mtp['k_proj_sf']),
-            float(mtp['k_proj_alpha']),
-            s,
-        )
-        k_pre = kv_proj_out_buf[:1].view(1, 1, 4, 256).contiguous()
+        if use_bf16_mtp:
+            fvk.bf16_matvec_qwen36_bf16(
+                x_norm.data_ptr(), int(mtp['k_proj_w_bf16']),
+                kv_proj_out_buf.data_ptr(), 1024, 5120, s)
+        else:
+            fvk.fp4_w4a16_gemm_sm120_bf16out(
+                ap_5120.data_ptr(), int(mtp['k_proj_packed']),
+                kv_proj_out_buf.data_ptr(),
+                1, 1024, 5120,
+                sf_5120.data_ptr(), int(mtp['k_proj_sf']),
+                float(mtp['k_proj_alpha']),
+                s,
+            )
+        k_pre = kv_proj_out_buf[:1].view(1, 1, 4, 256)
 
         # 4e) q_norm / k_norm.
-        q_pre_2d = q_pre.contiguous().view(24, 256)
         fvk.rms_norm(
             q_pre_2d.data_ptr(), int(mtp['q_norm_eff_w']),
             self._full_q_norm_out.data_ptr(), 24, 256, eps, s,
@@ -2519,46 +3130,38 @@ class Qwen36TorchFrontendRtx:
             self._full_k_norm_out.data_ptr(), 4, 256, eps, s,
         )
 
-        # 4f) RoPE inline.
-        q_for_rope = self._full_q_norm_out.view(1, 1, 24, 256)
-        k_for_rope = self._full_k_norm_out.view(1, 1, 4, 256)
-        cos4 = cos.view(1, 1, 1, 64)
-        sin4 = sin.view(1, 1, 1, 64)
-
-        def _rope_inline(x_in, x_out, tmp):
-            x_out[..., 64:].copy_(x_in[..., 64:])
-            torch.index_select(
-                x_in[..., :64], -1, self._rope_rotate_idx, out=tmp,
-            )
-            tmp[..., :32].neg_()
-            tmp.mul_(sin4)
-            tmp.addcmul_(x_in[..., :64], cos4)
-            x_out[..., :64].copy_(tmp)
-
-        _rope_inline(q_for_rope, self._full_q_rot, self._full_rope_tmp_q)
-        _rope_inline(k_for_rope, self._full_k_rot, self._full_rope_tmp_k)
-        q_rot = self._full_q_rot
-        k_rot = self._full_k_rot
-
-        # 4g) Stage Q + write K to MTP cache.
-        self._mtp_Q_buf[:, :1].copy_(q_rot)
-        self._mtp_K_cache[cur_pos:cur_pos + 1].copy_(
-            k_rot.view(1, 4, 256))
-
-        # v_proj (NVFP4).
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
-            ap_5120.data_ptr(), int(mtp['v_proj_packed']),
-            kv_proj_out_buf.data_ptr(),
-            1, 1024, 5120,
-            sf_5120.data_ptr(), int(mtp['v_proj_sf']),
-            float(mtp['v_proj_alpha']),
-            s,
+        # 4f) Partial RoPE, staging Q and K directly.
+        fvk.qwen36_partial_rope_qk_bf16(
+            self._full_q_norm_out.data_ptr(),
+            self._full_k_norm_out.data_ptr(),
+            cos.data_ptr(), sin.data_ptr(),
+            self._mtp_Q_buf[:, :1].data_ptr(),
+            self._mtp_K_cache[cache_pos:cache_pos + 1].data_ptr(),
+            1, 24, 4, 256, 64, s,
         )
+
+        # 4g) v_proj (NVFP4).
+        if use_bf16_mtp:
+            fvk.bf16_matvec_qwen36_bf16(
+                x_norm.data_ptr(), int(mtp['v_proj_w_bf16']),
+                kv_proj_out_buf.data_ptr(), 1024, 5120, s)
+        else:
+            fvk.fp4_w4a16_gemm_sm120_bf16out(
+                ap_5120.data_ptr(), int(mtp['v_proj_packed']),
+                kv_proj_out_buf.data_ptr(),
+                1, 1024, 5120,
+                sf_5120.data_ptr(), int(mtp['v_proj_sf']),
+                float(mtp['v_proj_alpha']),
+                s,
+            )
         v_new = kv_proj_out_buf[:1].view(1, 4, 256)
-        self._mtp_V_cache[cur_pos:cur_pos + 1].copy_(v_new)
+        fvk.gpu_copy(
+            self._mtp_V_cache[cache_pos:cache_pos + 1].data_ptr(),
+            v_new.data_ptr(), 4 * 256 * 2, s,
+        )
 
         # 4h) FA2 on MTP cache.
-        kv_seq = cur_pos + 1
+        kv_seq = cache_pos + 1
         scaling = float(self._cfg['head_dim']) ** -0.5
         q_view = self._mtp_Q_buf[:, :1]
         k_view = self._mtp_K_cache[:kv_seq].view(1, kv_seq, 4, 256)
@@ -2589,30 +3192,40 @@ class Qwen36TorchFrontendRtx:
 
         # 4i) output gate.
         attn_flat = attn_out.reshape(1, 1, 24 * 256)
-        torch.sigmoid(gate_flat, out=self._full_gate_sig)
-        torch.mul(attn_flat, self._full_gate_sig, out=self._full_gated)
+        fvk.sigmoid_mul_qwen36_bf16(
+            gate_flat.data_ptr(), attn_flat.data_ptr(),
+            self._full_gated.data_ptr(), 24 * 256, s,
+        )
         gated = self._full_gated
 
         # 4j) o_proj NVFP4.
         ap_6144, sf_6144, _ = self._nvfp4_scratch[(5120, 6144)]
-        gated_2d = gated.view(1, 6144).contiguous()
-        fvk.quantize_bf16_to_nvfp4_swizzled(
-            gated_2d.data_ptr(), ap_6144.data_ptr(),
-            sf_6144.data_ptr(), 1, 6144, s,
-        )
+        gated_2d = gated.view(1, 6144)
         out_op_buf = self._nvfp4_scratch[(5120, 6144)][2]
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
-            ap_6144.data_ptr(), int(mtp['o_proj_packed']),
-            out_op_buf.data_ptr(),
-            1, 5120, 6144,
-            sf_6144.data_ptr(), int(mtp['o_proj_sf']),
-            float(mtp['o_proj_alpha']),
-            s,
-        )
+        if use_bf16_mtp:
+            fvk.bf16_matvec_qwen36_bf16(
+                gated_2d.data_ptr(), int(mtp['o_proj_w_bf16']),
+                out_op_buf.data_ptr(), 5120, 6144, s)
+        else:
+            fvk.quantize_bf16_to_nvfp4_swizzled(
+                gated_2d.data_ptr(), ap_6144.data_ptr(),
+                sf_6144.data_ptr(), 1, 6144, s,
+            )
+            fvk.fp4_w4a16_gemm_sm120_bf16out(
+                ap_6144.data_ptr(), int(mtp['o_proj_packed']),
+                out_op_buf.data_ptr(),
+                1, 5120, 6144,
+                sf_6144.data_ptr(), int(mtp['o_proj_sf']),
+                float(mtp['o_proj_alpha']),
+                s,
+            )
 
         # 4k) residual.
         attn_proj = out_op_buf[:1].view(1, 1, 5120)
-        torch.add(h_in_full, attn_proj, out=self._res_mid)
+        fvk.add_bf16_out(
+            h_in_full.data_ptr(), attn_proj.data_ptr(),
+            self._res_mid.data_ptr(), 5120, s,
+        )
         h_post = self._res_mid
 
         # 4l) post-attn norm + MLP NVFP4.
@@ -2629,22 +3242,30 @@ class Qwen36TorchFrontendRtx:
         )
         gate_out_buf = self._nvfp4_scratch[(17408, 5120)][2]
         up_out_buf = self._mlp_up_out
-        fvk.fp4_w4a16_gemm_sm120_bf16out_widen(
-            ap_mlp.data_ptr(), int(mtp['mlp_gate_packed']),
-            gate_out_buf.data_ptr(),
-            1, 17408, 5120,
-            sf_mlp.data_ptr(), int(mtp['mlp_gate_sf']),
-            float(mtp['mlp_gate_alpha']),
-            s,
-        )
-        fvk.fp4_w4a16_gemm_sm120_bf16out_widen(
-            ap_mlp.data_ptr(), int(mtp['mlp_up_packed']),
-            up_out_buf.data_ptr(),
-            1, 17408, 5120,
-            sf_mlp.data_ptr(), int(mtp['mlp_up_sf']),
-            float(mtp['mlp_up_alpha']),
-            s,
-        )
+        if use_bf16_mtp:
+            fvk.bf16_matvec_qwen36_bf16(
+                x_mlp.data_ptr(), int(mtp['mlp_gate_w_bf16']),
+                gate_out_buf.data_ptr(), 17408, 5120, s)
+            fvk.bf16_matvec_qwen36_bf16(
+                x_mlp.data_ptr(), int(mtp['mlp_up_w_bf16']),
+                up_out_buf.data_ptr(), 17408, 5120, s)
+        else:
+            fvk.fp4_w4a16_gemm_sm120_bf16out_widen(
+                ap_mlp.data_ptr(), int(mtp['mlp_gate_packed']),
+                gate_out_buf.data_ptr(),
+                1, 17408, 5120,
+                sf_mlp.data_ptr(), int(mtp['mlp_gate_sf']),
+                float(mtp['mlp_gate_alpha']),
+                s,
+            )
+            fvk.fp4_w4a16_gemm_sm120_bf16out_widen(
+                ap_mlp.data_ptr(), int(mtp['mlp_up_packed']),
+                up_out_buf.data_ptr(),
+                1, 17408, 5120,
+                sf_mlp.data_ptr(), int(mtp['mlp_up_sf']),
+                float(mtp['mlp_up_alpha']),
+                s,
+            )
         gate_v = gate_out_buf[:1].view(1, 17408)
         up_v = up_out_buf[:1].view(1, 17408)
         fvk.silu_mul_qwen36_bf16(
@@ -2654,24 +3275,32 @@ class Qwen36TorchFrontendRtx:
         gate_silu_up = self._mlp_silu_mul_out
 
         ap_dn, sf_dn, _ = self._nvfp4_scratch[(5120, 17408)]
-        fvk.quantize_bf16_to_nvfp4_swizzled(
-            gate_silu_up.data_ptr(), ap_dn.data_ptr(),
-            sf_dn.data_ptr(), 1, 17408, s,
-        )
         down_out_buf = self._nvfp4_scratch[(5120, 17408)][2]
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
-            ap_dn.data_ptr(), int(mtp['mlp_down_packed']),
-            down_out_buf.data_ptr(),
-            1, 5120, 17408,
-            sf_dn.data_ptr(), int(mtp['mlp_down_sf']),
-            float(mtp['mlp_down_alpha']),
-            s,
-        )
+        if use_bf16_mtp:
+            fvk.bf16_matvec_qwen36_bf16(
+                gate_silu_up.data_ptr(), int(mtp['mlp_down_w_bf16']),
+                down_out_buf.data_ptr(), 5120, 17408, s)
+        else:
+            fvk.quantize_bf16_to_nvfp4_swizzled(
+                gate_silu_up.data_ptr(), ap_dn.data_ptr(),
+                sf_dn.data_ptr(), 1, 17408, s,
+            )
+            fvk.fp4_w4a16_gemm_sm120_bf16out(
+                ap_dn.data_ptr(), int(mtp['mlp_down_packed']),
+                down_out_buf.data_ptr(),
+                1, 5120, 17408,
+                sf_dn.data_ptr(), int(mtp['mlp_down_sf']),
+                float(mtp['mlp_down_alpha']),
+                s,
+            )
         mlp_out = down_out_buf[:1].view(1, 1, 5120)
 
         # 4m) final residual.
         next_h = self._mtp_layer_out_buf
-        torch.add(h_post, mlp_out, out=next_h)
+        fvk.add_bf16_out(
+            h_post.data_ptr(), mlp_out.data_ptr(),
+            next_h.data_ptr(), 5120, s,
+        )
 
         # 5) MTP final norm + lm_head.
         next_h_view = next_h.view(1, 5120)
@@ -2680,6 +3309,14 @@ class Qwen36TorchFrontendRtx:
             next_h_view.data_ptr(), int(mtp['final_norm_eff_w']),
             x_final_norm.data_ptr(), 1, 5120, eps, s,
         )
+        if 'lm_head_w_bf16' in self._weights.ptrs:
+            fvk.bf16_matvec_qwen36_bf16(
+                x_final_norm.data_ptr(),
+                int(self._weights.ptrs['lm_head_w_bf16']),
+                self._mtp_logits_buf.data_ptr(), vocab, 5120, s,
+            )
+            return next_h, self._mtp_logits_buf
+
         # G8: lm_head NVFP4 GEMM. Reuses (10240, 5120) scratch for
         # the K=5120 activation packed/SF buffers.
         ap_lm, sf_lm, _ = self._nvfp4_scratch[(10240, 5120)]
@@ -2697,18 +3334,144 @@ class Qwen36TorchFrontendRtx:
         )
         return next_h, self._mtp_logits_buf
 
+    def _ensure_mtp_tail_kv_buffers(self, rows: int) -> None:
+        import torch
+
+        rows = int(rows)
+        hidden = self._cfg['hidden_size']
+        bf16 = torch.bfloat16
+        cap = int(getattr(self, '_mtp_tail_kv_rows', 0))
+        if cap >= rows:
+            return
+        self._mtp_tail_kv_rows = rows
+        self._mtp_tail_embed_buf = torch.empty(
+            rows, hidden, device=self.device, dtype=bf16)
+        self._mtp_tail_h_norm_buf = torch.empty_like(
+            self._mtp_tail_embed_buf)
+        self._mtp_tail_e_norm_buf = torch.empty_like(
+            self._mtp_tail_embed_buf)
+        self._mtp_tail_cat_buf = torch.empty(
+            rows, hidden * 2, device=self.device, dtype=bf16)
+        self._mtp_tail_fc_out_buf = torch.empty(
+            rows, hidden, device=self.device, dtype=bf16)
+        self._mtp_tail_x_norm_buf = torch.empty_like(
+            self._mtp_tail_fc_out_buf)
+        self._mtp_tail_k_proj_buf = torch.empty(
+            rows, 4 * 256, device=self.device, dtype=bf16)
+        self._mtp_tail_v_proj_buf = torch.empty_like(
+            self._mtp_tail_k_proj_buf)
+        self._mtp_tail_k_norm_buf = torch.empty(
+            rows * 4, 256, device=self.device, dtype=bf16)
+        self._mtp_tail_dummy_q_in = torch.empty(
+            rows, 1, 256, device=self.device, dtype=bf16)
+        self._mtp_tail_dummy_q_out = torch.empty_like(
+            self._mtp_tail_dummy_q_in)
+
+    def _prefill_mtp_tail_kv_nvfp4(
+            self, prev_h_rows, token_ids, pos_start: int,
+            cache_base_pos: int) -> bool:
+        """Populate MTP prompt-tail K/V cache without full MTP decode."""
+        import torch
+
+        from flash_rt import flash_rt_kernels as fvk
+
+        mtp = self._weights.ptrs.get('mtp')
+        if mtp is None or 'k_proj_w_bf16' not in mtp:
+            return False
+        rows = int(token_ids.numel())
+        if rows <= 0:
+            return True
+
+        hidden = self._cfg['hidden_size']
+        eps = float(self._cfg['rms_norm_eps'])
+        s = torch.cuda.current_stream().cuda_stream
+        self._ensure_mtp_tail_kv_buffers(rows)
+
+        embed = self._mtp_tail_embed_buf[:rows]
+        h_norm = self._mtp_tail_h_norm_buf[:rows]
+        e_norm = self._mtp_tail_e_norm_buf[:rows]
+        cat_buf = self._mtp_tail_cat_buf[:rows]
+        fc_out = self._mtp_tail_fc_out_buf[:rows]
+        x_norm = self._mtp_tail_x_norm_buf[:rows]
+        k_proj = self._mtp_tail_k_proj_buf[:rows]
+        v_proj = self._mtp_tail_v_proj_buf[:rows]
+        k_norm = self._mtp_tail_k_norm_buf[:rows * 4]
+
+        fvk.qwen36_embedding_lookup_bf16(
+            token_ids.view(-1).data_ptr(),
+            int(self._weights.ptrs['embed_w']),
+            embed.data_ptr(), rows, hidden, s,
+        )
+        fvk.rms_norm(
+            prev_h_rows.view(rows, hidden).data_ptr(),
+            int(mtp['pre_fc_norm_hidden_eff_w']),
+            h_norm.data_ptr(), rows, hidden, eps, s,
+        )
+        fvk.rms_norm(
+            embed.data_ptr(), int(mtp['pre_fc_norm_embedding_eff_w']),
+            e_norm.data_ptr(), rows, hidden, eps, s,
+        )
+
+        fvk.concat2_bf16(
+            e_norm.data_ptr(), h_norm.data_ptr(),
+            cat_buf.data_ptr(), rows, hidden, hidden, s,
+        )
+        fvk.bf16_matmul_qwen36_bf16(
+            cat_buf.data_ptr(), int(mtp['fc_w']),
+            fc_out.data_ptr(), rows, hidden, hidden * 2, s,
+        )
+        fvk.rms_norm(
+            fc_out.data_ptr(), int(mtp['input_norm_eff_w']),
+            x_norm.data_ptr(), rows, hidden, eps, s,
+        )
+
+        fvk.bf16_matmul_qwen36_bf16(
+            x_norm.data_ptr(), int(mtp['k_proj_w_bf16']),
+            k_proj.data_ptr(), rows, 4 * 256, hidden, s,
+        )
+        fvk.bf16_matmul_qwen36_bf16(
+            x_norm.data_ptr(), int(mtp['v_proj_w_bf16']),
+            v_proj.data_ptr(), rows, 4 * 256, hidden, s,
+        )
+        fvk.rms_norm(
+            k_proj.view(rows * 4, 256).data_ptr(),
+            int(mtp['k_norm_eff_w']),
+            k_norm.data_ptr(), rows * 4, 256, eps, s,
+        )
+
+        cos = self._rope_cos_table[
+            pos_start:pos_start + rows].view(rows, self._rope_dim)
+        sin = self._rope_sin_table[
+            pos_start:pos_start + rows].view(rows, self._rope_dim)
+        q_dummy = self._mtp_tail_dummy_q_in[:rows]
+        q_dummy_out = self._mtp_tail_dummy_q_out[:rows]
+        fvk.qwen36_partial_rope_qk_bf16(
+            q_dummy.data_ptr(), k_norm.data_ptr(),
+            cos.data_ptr(), sin.data_ptr(),
+            q_dummy_out.data_ptr(),
+            self._mtp_K_cache[
+                cache_base_pos:cache_base_pos + rows].data_ptr(),
+            rows, 1, 4, 256, self._rope_dim, s,
+        )
+        fvk.gpu_copy(
+            self._mtp_V_cache[
+                cache_base_pos:cache_base_pos + rows].data_ptr(),
+            v_proj.data_ptr(), rows * 4 * 256 * 2, s,
+        )
+        return True
+
     # ---------- N5-stage6: NVFP4 speculative decode (K-generic) ----------
 
     def generate_own_speculative_KN_nvfp4(
-            self, input_ids, *, max_new_tokens: int, K: int = 5):
+            self, input_ids, *, max_new_tokens: int, K: int = 6):
         """K-generic speculative decode on the NVFP4 path.
 
         In long-ctx mode (auto-routed when ``max_seq`` exceeds
-        ``LONG_CTX_THRESHOLD`` at construction time) this method
-        falls back to single-token decode through the TurboQuant
-        packed cache — spec decode on the TQ path is a Phase 3D
-        follow-up. The K argument is silently treated as 1; the
-        caller does not need to know which path is active.
+        ``LONG_CTX_THRESHOLD`` at construction time), requests that fit
+        below ``FLASHRT_QWEN36_LONG_CTX_ROUTE_MIN_SEQ`` still use this
+        BF16-KV MTP path. Larger requests use MTP draft plus the
+        compressed-KV verify route selected by
+        ``FLASHRT_QWEN36_LONG_KV_CACHE``.
 
         Mirror of FP8 generate_own_speculative_KN. Differences vs. FP8:
           1. Prefill is DIY: walk prompt tokens through
@@ -2736,8 +3499,8 @@ class Qwen36TorchFrontendRtx:
         Args:
             input_ids: (1, prompt_len) cuda long.
             max_new_tokens: how many tokens to generate.
-            K: MTP chain length per cycle. K+1 must be <= MAX_Q_SEQ.
-                Default 5 (Qwen3-Next official spec).
+            K: MTP chain length per cycle. K+1 must fit the verify
+                buffer. Default 5 (Qwen3-Next official spec).
 
         Returns:
             (1, prompt_len + N) cuda long, trimmed to max_new_tokens.
@@ -2745,25 +3508,36 @@ class Qwen36TorchFrontendRtx:
         import torch
         from flash_rt import flash_rt_kernels as fvk
 
-        # Long-ctx auto-route: TQ packed cache supports any context up
-        # to ``self._user_max_seq``, but spec decode is not yet wired
-        # on top of TQ (Phase 3D). Fall back to single-token decode —
-        # caller does not need to know the path changed.
+        prompt_len = int(input_ids.shape[1])
+        max_pos = prompt_len + int(max_new_tokens)
+
+        # Long-ctx auto-route: keep the fast BF16/MTP spec path for
+        # actual short prompts, even when the caller asks for a larger
+        # completion, as long as the retained BF16 window can hold the
+        # full request. Route by prompt bucket once the prompt reaches
+        # the measured long-context threshold.
         if getattr(self, '_long_ctx_mode', False):
-            return self._generate_long_ctx_single_token(
-                input_ids, max_new_tokens)
+            use_long_route = self._should_use_long_ctx_route(
+                prompt_len, max_new_tokens)
+            if use_long_route and self._weights.ptrs.get('mtp') is not None:
+                return self._generate_long_ctx_speculative_KN_nvfp4(
+                    input_ids, max_new_tokens=max_new_tokens, K=K)
+            if use_long_route and self._weights.ptrs.get('mtp') is None:
+                return self._generate_long_ctx_single_token(
+                    input_ids, max_new_tokens)
 
         if self._weights.ptrs.get('mtp') is None:
             raise RuntimeError(
                 'MTP head not loaded — speculative decode unavailable')
-        if K < 1 or K + 1 > self.MAX_Q_SEQ:
+        max_spec_k = min(self.MAX_Q_SEQ - 1, self._MAX_PUBLIC_SPEC_K)
+        if K < 1 or K > max_spec_k:
             raise ValueError(
-                f'K={K} out of range — need 1<=K<={self.MAX_Q_SEQ - 1}')
+                f'K={K} out of range — need 1<=K<={max_spec_k}')
 
         bf16 = torch.bfloat16
-        prompt_len = int(input_ids.shape[1])
         hidden = self._cfg['hidden_size']
         eps = float(self._cfg['rms_norm_eps'])
+        s = torch.cuda.current_stream().cuda_stream
 
         self.reset_state()
         self.reset_mtp_state()
@@ -2771,6 +3545,10 @@ class Qwen36TorchFrontendRtx:
             self._build_rope_table()
 
         with torch.no_grad():
+            ev_pf0 = torch.cuda.Event(enable_timing=True)
+            ev_pf1 = torch.cuda.Event(enable_timing=True)
+            ev_dec1 = torch.cuda.Event(enable_timing=True)
+            ev_pf0.record()
             # 1) Prefill: walk prompt tokens S=1 through main forward
             # using PER-CUR_POS captured graphs. Each step writes
             # pre-final-norm hidden to _last_hidden_buf; we capture
@@ -2815,6 +3593,7 @@ class Qwen36TorchFrontendRtx:
                 prompt_len - 1:prompt_len].view(1, 1, hidden).contiguous()
             self.forward_mtp_head_nvfp4(h_last_prompt, tok, prompt_len)
             h = h_last_prompt
+            ev_pf1.record()
 
             self._spec_attempts = 0
             self._spec_accepts = 0
@@ -2914,10 +3693,16 @@ class Qwen36TorchFrontendRtx:
                     # harmlessly overwritten by the next cycle's writes
                     # before any read (FA2 writes BEFORE reading at each
                     # q_seq=1 step).
-                    self._lin_state.copy_(
-                        self._K_lin_state_per_step[N])
-                    self._lin_conv_state.copy_(
-                        self._K_lin_conv_state_per_step[N])
+                    fvk.gpu_copy(
+                        self._lin_state.data_ptr(),
+                        self._K_lin_state_per_step[N].data_ptr(),
+                        self._lin_state.numel() * 2, s,
+                    )
+                    fvk.gpu_copy(
+                        self._lin_conv_state.data_ptr(),
+                        self._K_lin_conv_state_per_step[N].data_ptr(),
+                        self._lin_conv_state.numel() * 2, s,
+                    )
                     h = self._K_last_hidden_buf[
                         :, N:N + 1, :].contiguous()
                     tok = argmax_at(N)
@@ -2925,6 +3710,12 @@ class Qwen36TorchFrontendRtx:
 
             if len(generated) > max_new_tokens:
                 generated = generated[:max_new_tokens]
+
+            ev_dec1.record()
+            torch.cuda.synchronize()
+            self._long_ctx_prefill_ms = ev_pf0.elapsed_time(ev_pf1)
+            self._long_ctx_decode_ms = ev_pf1.elapsed_time(ev_dec1)
+            self._long_ctx_route = 'short_spec'
 
         return torch.cat([input_ids] + generated, dim=1)
 
@@ -3257,7 +4048,7 @@ class Qwen36TorchFrontendRtx:
         )
         eps = float(self._pipeline.hf.config.rms_norm_eps)
 
-        h2 = h_in_K.view(K, 5120).contiguous()
+        h2 = h_in_K.view(K, 5120)
 
         # Buffers / scratch.
         x_norm = self._h_b[:K].view(K, 5120)
@@ -3343,29 +4134,58 @@ class Qwen36TorchFrontendRtx:
         # V (K, 48, 128). Layout in conv_out: [Q_dim=2048, K_dim=2048,
         # V_dim=6144] per row.
         conv_K = self._K_lin_conv_out[:K]  # (K, 10240)
-        q_K_heads = conv_K[:, :2048].contiguous().view(1, K, 16, 128)
-        k_K_heads = conv_K[:, 2048:4096].contiguous().view(1, K, 16, 128)
-        v_K_heads = conv_K[:, 4096:10240].contiguous().view(1, K, 48, 128)
+        if (
+            hasattr(fvk, 'qwen36_lin_split_qkv_gqa_bf16')
+            and os.environ.get('FVK_QWEN36_LIN_SPLIT_GQA', '1') == '1'
+        ):
+            q16_K = self._K_lin_q16[:K]
+            k16_K = self._K_lin_k16[:K]
+            v48_K = self._K_lin_v48[:K]
+            fvk.qwen36_lin_split_qkv_gqa_bf16(
+                conv_K.data_ptr(), q16_K.data_ptr(), k16_K.data_ptr(),
+                v48_K.data_ptr(), K, s,
+            )
+            q_K_heads = q16_K.view(1, K, 16, 128)
+            k_K_heads = k16_K.view(1, K, 16, 128)
+            v_K_heads = v48_K.view(1, K, 48, 128)
+        else:
+            q_K_heads = conv_K[:, :2048].contiguous().view(1, K, 16, 128)
+            k_K_heads = conv_K[:, 2048:4096].contiguous().view(
+                1, K, 16, 128)
+            v_K_heads = conv_K[:, 4096:10240].contiguous().view(
+                1, K, 48, 128)
 
         # 6c) Compute g, beta for all K tokens at once (M=K vector ops).
         beta_K = self._K_lin_beta[:K]
-        torch.sigmoid(b_vec_K, out=beta_K)
-        a_f32_K = self._K_lin_a_f32[:K]
-        a_f32_K.copy_(a_vec_K)
-        a_f32_K.add_(lw['dt_bias_fp32_t'])
-        sp_K = self._K_lin_sp_buf[:K]
-        torch.exp(a_f32_K, out=sp_K)
-        torch.log1p(sp_K, out=sp_K)
-        g_f32_K = self._K_lin_g_f32[:K]
-        torch.mul(lw['neg_A_log_exp_fp32_t'], sp_K, out=g_f32_K)
         g_bf_K = self._K_lin_g_bf[:K]
-        g_bf_K.copy_(g_f32_K)
+        if (
+            hasattr(fvk, 'qwen36_gdn_gating_strided_bf16')
+            and os.environ.get('FVK_QWEN36_GDN_FUSED_GATING', '1') == '1'
+        ):
+            fvk.qwen36_gdn_gating_strided_bf16(
+                a_vec_K.data_ptr(), b_vec_K.data_ptr(),
+                lw['neg_A_log_exp_fp32_t'].data_ptr(),
+                lw['dt_bias_fp32_t'].data_ptr(),
+                g_bf_K.data_ptr(), beta_K.data_ptr(),
+                K, 48, a_vec_K.stride(0), b_vec_K.stride(0), s,
+            )
+        else:
+            torch.sigmoid(b_vec_K, out=beta_K)
+            a_f32_K = self._K_lin_a_f32[:K]
+            a_f32_K.copy_(a_vec_K)
+            a_f32_K.add_(lw['dt_bias_fp32_t'])
+            sp_K = self._K_lin_sp_buf[:K]
+            torch.exp(a_f32_K, out=sp_K)
+            torch.log1p(sp_K, out=sp_K)
+            g_f32_K = self._K_lin_g_f32[:K]
+            torch.mul(lw['neg_A_log_exp_fp32_t'], sp_K, out=g_f32_K)
+            g_bf_K.copy_(g_f32_K)
 
         # 6d) FLA chunked recurrent — one call processes all K tokens
         # natively, with internal L2-norm on q/k. GVA (16 K-heads,
         # 48 V-heads) handled by the kernel without needing the
         # 16->48 explicit broadcast.
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+        chunk_gated_delta_rule = _load_qwen36_fla_chunk()
         rec_state_view = self._lin_state[lin_rank]  # (1, 48, 128, 128)
         beta_FLA = beta_K.view(1, K, 48)
         g_FLA = g_bf_K.view(1, K, 48)
@@ -3375,12 +4195,16 @@ class Qwen36TorchFrontendRtx:
             initial_state=rec_state_view,
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
+            q_l2_out=self._K_fla_q16_l2[:, :K],
+            k_l2_out=self._K_fla_k16_l2[:, :K],
+            g_cumsum_out=self._K_fla_g_cumsum[:, :K],
+            o_out=self._K_lin_attn_out[:K].view(1, K, 48, 128),
         )
         # attn_out_K: (1, K, 48, 128); new_state: (1, 48, 128, 128).
         rec_state_view.copy_(new_state)
 
         # 6e) rms_norm_gated_silu over (K*48, 128) rows in one call.
-        attn_out_flat = attn_out_K.contiguous().view(K * 48, 128)
+        attn_out_flat = attn_out_K.view(K * 48, 128)
         z_flat = out_z_buf[:K].view(K * 48, 128)
         norm_out_flat = self._K_lin_norm_out[:K].view(K * 48, 128)
         fvk.rms_norm_gated_silu_qwen36_bf16(
@@ -3734,7 +4558,7 @@ class Qwen36TorchFrontendRtx:
         eps = float(self._pipeline.hf.config.rms_norm_eps)
         full_rank = self._full_layer_rank(L)
 
-        h2 = h_in_K.view(K, 5120).contiguous()
+        h2 = h_in_K.view(K, 5120)
 
         # 1) input layernorm — M=K rows.
         x_norm = self._h_b[:K].view(K, 5120)
@@ -3760,9 +4584,11 @@ class Qwen36TorchFrontendRtx:
             scale_5120.data_ptr(), int(lw['q_proj_s']),
             s,
         )
-        q_full = q_proj_out_buf[:K].view(1, K, 24, 512)
-        q_pre, gate = torch.chunk(q_full, 2, dim=-1)
-        gate_flat = gate.reshape(1, K, 24 * 256)
+        q_pre_2d = self._K_full_q_rot[:, :K].view(K * 24, 256)
+        gate_flat = self._K_full_gate_sig[:, :K]
+        fvk.qwen36_split_q_gate_bf16(
+            q_proj_out_buf[:K].data_ptr(), q_pre_2d.data_ptr(),
+            gate_flat.data_ptr(), K, s)
 
         # 4) k_proj — M=K.
         kv_proj_out_buf = self._fp8_scratch[(1024, 5120)][2]
@@ -3773,10 +4599,9 @@ class Qwen36TorchFrontendRtx:
             scale_5120.data_ptr(), int(lw['k_proj_s']),
             s,
         )
-        k_pre = kv_proj_out_buf[:K].view(1, K, 4, 256).contiguous()
+        k_pre = kv_proj_out_buf[:K].view(1, K, 4, 256)
 
         # 5) q_norm / k_norm — per-head RMSNorm. M = K*heads.
-        q_pre_2d = q_pre.contiguous().view(K * 24, 256)
         q_norm_out = self._K_full_q_norm_out[:K * 24]
         fvk.rms_norm(
             q_pre_2d.data_ptr(), int(lw['q_norm_eff_w']),
@@ -3831,30 +4656,29 @@ class Qwen36TorchFrontendRtx:
         v_new_K = kv_proj_out_buf[:K].view(K, 4, 256)
         self._attn.V_cache[full_rank, cur_pos:cur_pos + K].copy_(v_new_K)
 
-        # 8) FA2 — vendored fvk fa2 fwd_bf16 has no causal flag, so a
-        # single q_seq=K call would let Q[i] attend to K[j>i] (future)
-        # because K[cur_pos+j] for j>i was just written by step 7
-        # batched K_cache write. Predicting at position cur_pos+i+1
-        # would then be corrupted by K[cur_pos+i+1..cur_pos+K-1].
-        # Workaround: K serial q_seq=1 calls, each with
-        # kv_seq=cur_pos+k+1 — bound by Q's own position. Each call's
-        # FA2 only reads the valid causal prefix of K_cache.
+        # 8) FA2. Prefer one causal q_seq=K call when available. The
+        # fallback keeps the historical K serial q_seq=1 calls, binding
+        # kv_seq to each Q position.
         scaling = float(self._pipeline.hf.config.head_dim) ** -0.5
-        for k in range(K):
-            q_view = self._attn.Q_buf[:, k:k + 1]
-            kv_seq_k = cur_pos + k + 1
+        use_causal_fa2 = (
+            K > 1
+            and getattr(self._attn, '_fa2_fwd_causal', None) is not None
+            and os.environ.get('FVK_QWEN36_CAUSAL_PREFILL_FA2', '1') == '1'
+        )
+        if use_causal_fa2:
+            q_view = self._attn.Q_buf[:, :K]
             k_view = self._attn.K_cache[
-                full_rank:full_rank + 1, :kv_seq_k]
+                full_rank:full_rank + 1, :cur_pos + K]
             v_view = self._attn.V_cache[
-                full_rank:full_rank + 1, :kv_seq_k]
-            o_view = self._attn.O_buf[:, k:k + 1]
-            self._attn._fa2_fwd(
+                full_rank:full_rank + 1, :cur_pos + K]
+            o_view = self._attn.O_buf[:, :K]
+            self._attn._fa2_fwd_causal(
                 Q=q_view.data_ptr(), K=k_view.data_ptr(),
                 V=v_view.data_ptr(), O=o_view.data_ptr(),
                 softmax_lse=self._attn.lse_buf.data_ptr(),
                 softmax_lse_accum=self._attn.lse_accum.data_ptr(),
                 o_accum=self._attn.o_accum.data_ptr(),
-                batch=1, seqlen_q=1, seqlen_k=kv_seq_k,
+                batch=1, seqlen_q=K, seqlen_k=cur_pos + K,
                 num_heads_q=24, num_heads_kv=4,
                 head_dim=256,
                 q_strides=(q_view.stride(0), q_view.stride(1),
@@ -3869,6 +4693,36 @@ class Qwen36TorchFrontendRtx:
                 num_sms=self._attn._num_sms,
                 stream=s,
             )
+        else:
+            for k in range(K):
+                q_view = self._attn.Q_buf[:, k:k + 1]
+                kv_seq_k = cur_pos + k + 1
+                k_view = self._attn.K_cache[
+                    full_rank:full_rank + 1, :kv_seq_k]
+                v_view = self._attn.V_cache[
+                    full_rank:full_rank + 1, :kv_seq_k]
+                o_view = self._attn.O_buf[:, k:k + 1]
+                self._attn._fa2_fwd(
+                    Q=q_view.data_ptr(), K=k_view.data_ptr(),
+                    V=v_view.data_ptr(), O=o_view.data_ptr(),
+                    softmax_lse=self._attn.lse_buf.data_ptr(),
+                    softmax_lse_accum=self._attn.lse_accum.data_ptr(),
+                    o_accum=self._attn.o_accum.data_ptr(),
+                    batch=1, seqlen_q=1, seqlen_k=kv_seq_k,
+                    num_heads_q=24, num_heads_kv=4,
+                    head_dim=256,
+                    q_strides=(q_view.stride(0), q_view.stride(1),
+                               q_view.stride(2)),
+                    k_strides=(k_view.stride(0), k_view.stride(1),
+                               k_view.stride(2)),
+                    v_strides=(v_view.stride(0), v_view.stride(1),
+                               v_view.stride(2)),
+                    o_strides=(o_view.stride(0), o_view.stride(1),
+                               o_view.stride(2)),
+                    softmax_scale=scaling,
+                    num_sms=self._attn._num_sms,
+                    stream=s,
+                )
         attn_out = self._attn.O_buf[:, :K]  # (1, K, 24, 256)
 
         # 9) output gate: attn * sigmoid(gate). K rows.
@@ -4158,8 +5012,8 @@ class Qwen36TorchFrontendRtx:
             e = e.to(torch.bfloat16)
 
         # 1) pre-fc norms on (h, e) -> bf16 (1, 5120) each.
-        prev_h_2d = prev_h.view(1, 5120).contiguous()
-        e_2d = e.view(1, 5120).contiguous()
+        prev_h_2d = prev_h.view(1, 5120)
+        e_2d = e.view(1, 5120)
         h_norm = self._mtp_h_norm_buf.view(1, 5120)
         e_norm = self._mtp_e_norm_buf.view(1, 5120)
         fvk.rms_norm(
@@ -4572,6 +5426,8 @@ class Qwen36TorchFrontendRtx:
                 '_captured_mtp_graphs',
                 '_captured_chain_graphs',
                 '_captured_graphs_tq',
+                '_captured_verify_graphs_tq',
+                '_captured_verify_graphs_fp8kv',
                 '_captured_verify_graphs_dflash',
                 '_captured_drafter_graphs_dflash',
         ):
@@ -4891,8 +5747,8 @@ class Qwen36TorchFrontendRtx:
         Args:
             input_ids: (1, prompt_len) cuda long.
             max_new_tokens: how many tokens to generate.
-            K: number of MTP chain drafts per cycle. K+1 must be
-                <= MAX_Q_SEQ. Default 5 (Qwen3-Next official spec).
+            K: number of MTP chain drafts per cycle. K+1 must fit the
+                verify buffer. Default 5 (Qwen3-Next official spec).
 
         Returns:
             (1, prompt_len + N) cuda long, trimmed to max_new_tokens.
@@ -4902,9 +5758,10 @@ class Qwen36TorchFrontendRtx:
         if self._weights.ptrs.get('mtp') is None:
             raise RuntimeError(
                 'MTP head not loaded — speculative decode unavailable')
-        if K < 1 or K + 1 > self.MAX_Q_SEQ:
+        max_spec_k = min(self.MAX_Q_SEQ - 1, self._MAX_PUBLIC_SPEC_K)
+        if K < 1 or K > max_spec_k:
             raise ValueError(
-                f'K={K} out of range — need 1<=K<={self.MAX_Q_SEQ - 1}')
+                f'K={K} out of range — need 1<=K<={max_spec_k}')
 
         prompt_len = int(input_ids.shape[1])
         self.reset_state()
@@ -5546,6 +6403,299 @@ class Qwen36TorchFrontendRtx:
         self._graph_cache_put(self._captured_verify_graphs, key, g)
         return g
 
+    def _tq_mark_dequant_valid_end(self, end_pos: int) -> None:
+        """Set every TQ per-layer staging high-water mark.
+
+        Graph-captured TQ verify records the dequant kernels for a fixed
+        window. Python bookkeeping is not replayed by CUDA Graphs, so the
+        orchestration updates the high-water mark explicitly before
+        capture and after accept/reject handling.
+        """
+        cache = getattr(self, '_tq_cache_packed', None)
+        valid = getattr(cache, '_dequant_valid_end', None)
+        if valid is None:
+            return
+        end_pos = int(end_pos)
+        for i in range(len(valid)):
+            valid[i] = end_pos
+        hot_valid = getattr(self, '_tq_hot_stage_valid_end', None)
+        if hot_valid is not None:
+            for i in range(len(hot_valid)):
+                hot_valid[i] = end_pos
+
+    def _long_tq_effective_k(self, prompt_len: int, K: int) -> int:
+        """Return the long-context TQ spec K used by generation."""
+        tq_spec_k = os.environ.get('FLASHRT_QWEN36_TQ_SPEC_K', '')
+        if tq_spec_k:
+            return int(tq_spec_k)
+        prompt_len = int(prompt_len)
+        caller_k = int(K)
+        if prompt_len < 768:
+            target_k = 4
+        elif prompt_len < 1536:
+            target_k = 5
+        elif prompt_len < 3072:
+            target_k = 6
+        elif prompt_len < 6144:
+            target_k = 3
+        elif prompt_len < 12288:
+            target_k = 5
+        elif prompt_len < 24576:
+            target_k = 7
+        elif prompt_len < 49152:
+            target_k = 6
+        elif 49152 <= prompt_len < 160000:
+            target_k = 7
+        else:
+            target_k = 6
+        if caller_k < 6:
+            return min(caller_k, target_k)
+        return target_k
+
+    def _should_use_long_ctx_route(
+            self, prompt_len: int, max_new_tokens: int) -> bool:
+        if not getattr(self, '_long_ctx_mode', False):
+            return False
+        prompt_len = int(prompt_len)
+        max_pos = prompt_len + int(max_new_tokens)
+        route_min = int(getattr(
+            self, '_long_ctx_route_min_seq',
+            getattr(self, '_short_ctx_spec_max_seq',
+                    self.LONG_CTX_THRESHOLD)))
+        bf16_cap = int(getattr(
+            self, '_short_ctx_spec_max_seq', route_min))
+        return prompt_len >= route_min or max_pos > bf16_cap
+
+    def warmup_long_ctx_decode_graphs(
+            self, shapes: list[tuple[int, int]], K: int = 6
+    ) -> list[tuple[int, int, int]]:
+        """Pre-capture long-context TQ decode graphs without prompt prefill.
+
+        Full dummy generation for a 200K/256K warmup bucket spends most of
+        its time in prefill.  Serving still needs that real prefill per
+        request, but the avoidable cold-start cost is CUDA Graph capture for
+        the first decode positions.  For 128K+ buckets, auto warmup captures
+        every early decode position because partial MTP accepts otherwise
+        land on graph keys that a high-acceptance-only warmup misses.
+
+        Returns a list of ``(cur_pos, verify_qseq, mtp_K)`` graph keys that
+        were requested. Existing cached graphs are reused.
+        """
+        import torch
+
+        from flash_rt import flash_rt_kernels as fvk
+
+        if not getattr(self, '_long_ctx_mode', False):
+            return []
+        kv_mode = getattr(self, '_long_kv_cache_mode', 'tq')
+        if kv_mode not in ('tq', 'fp8'):
+            return []
+        if kv_mode == 'tq' and not hasattr(self, '_tq_cache_packed'):
+            return []
+        if kv_mode == 'fp8' and not hasattr(self, '_fp8_K_cache'):
+            return []
+        if not hasattr(self, '_rope_cos_table'):
+            self._build_rope_table()
+
+        warmed: list[tuple[int, int, int]] = []
+        d = self._rope_dim
+        s = torch.cuda.current_stream().cuda_stream
+        has_mtp = self._weights.ptrs.get('mtp') is not None
+        stride_raw = os.environ.get(
+            'FLASHRT_QWEN36_LONG_WARMUP_STRIDE', 'auto').lower()
+        max_graphs_per_shape = int(os.environ.get(
+            'FLASHRT_QWEN36_LONG_WARMUP_MAX_GRAPHS', '96') or '96')
+        min_free_mb = int(os.environ.get(
+            'FLASHRT_QWEN36_LONG_WARMUP_MIN_FREE_MB', '1024') or '0')
+
+        with torch.no_grad():
+            for prompt_len, max_new_tokens in shapes:
+                prompt_len = int(prompt_len)
+                max_new_tokens = int(max_new_tokens)
+                if not self._should_use_long_ctx_route(
+                        prompt_len, max_new_tokens):
+                    continue
+                if prompt_len + max_new_tokens > self._user_max_seq:
+                    continue
+                eff_k = self._long_tq_effective_k(prompt_len, K)
+                verify_qseq = eff_k + 1
+                if verify_qseq < 1 or verify_qseq > self.MAX_Q_SEQ:
+                    continue
+                self._ensure_long_mtp_cache_capacity(
+                    prompt_len, max_new_tokens, eff_k)
+                mtp_tail = self._long_mtp_prefill_tail_for_prompt(prompt_len)
+                if stride_raw == 'auto':
+                    step = 1 if prompt_len >= 131072 else verify_qseq
+                else:
+                    step = max(1, int(stride_raw))
+                limit = max(1, max_new_tokens)
+                emitted = 0
+                for offset in range(0, limit, step):
+                    if max_graphs_per_shape > 0 and emitted >= max_graphs_per_shape:
+                        break
+                    if min_free_mb > 0:
+                        try:
+                            free_bytes, _ = torch.cuda.mem_get_info()
+                            if int(free_bytes) < (min_free_mb << 20):
+                                break
+                        except Exception:
+                            pass
+                    cur_pos = prompt_len + offset
+                    if cur_pos + verify_qseq > self._user_max_seq:
+                        break
+                    cos = self._rope_cos_table[
+                        cur_pos:cur_pos + verify_qseq].view(
+                            1, verify_qseq, d)
+                    sin = self._rope_sin_table[
+                        cur_pos:cur_pos + verify_qseq].view(
+                            1, verify_qseq, d)
+                    fvk.gpu_copy(
+                        self._verify_static_cos[:, :verify_qseq].data_ptr(),
+                        cos.data_ptr(), verify_qseq * d * 2, s,
+                    )
+                    fvk.gpu_copy(
+                        self._verify_static_sin[:, :verify_qseq].data_ptr(),
+                        sin.data_ptr(), verify_qseq * d * 2, s,
+                    )
+                    if kv_mode == 'tq':
+                        self._tq_mark_dequant_valid_end(cur_pos)
+                        self._ensure_verify_graph_nvfp4_tq(
+                            cur_pos, verify_qseq)
+                    else:
+                        self._ensure_verify_graph_nvfp4_fp8kv(
+                            cur_pos, verify_qseq)
+                    if has_mtp:
+                        self._ensure_mtp_chain_graph_nvfp4(
+                            cur_pos, eff_k,
+                            cache_base_pos=mtp_tail + offset)
+                    warmed.append((cur_pos, verify_qseq, eff_k))
+                    emitted += 1
+
+        self.reset_state()
+        self.reset_mtp_state()
+        return warmed
+
+    def _long_tq_graph_capture_allowed(self) -> bool:
+        min_free_mb = int(os.environ.get(
+            'FLASHRT_QWEN36_LONG_GRAPH_MIN_FREE_MB', '768') or '0')
+        if min_free_mb <= 0:
+            return True
+        try:
+            import torch
+            free_bytes, _ = torch.cuda.mem_get_info()
+            return int(free_bytes) >= (min_free_mb << 20)
+        except Exception:
+            return True
+
+    def _ensure_verify_graph_nvfp4_tq(self, cur_pos: int, K: int):
+        """Lazy CUDA Graph capture for TQ-packed S=K verify.
+
+        Captures ``forward_own_decode_K_nvfp4_tq`` against the static
+        verify token/RoPE buffers. The graph includes the TQ write,
+        window dequant ``[cur_pos, cur_pos + K)``, FA2, and the full
+        64-layer verify forward. Recurrent lin/conv state is restored
+        after warmup/capture; future TQ rows do not need restoration
+        because replay overwrites the same rows before attention reads.
+        """
+        import torch
+
+        if not hasattr(self, '_captured_verify_graphs_tq'):
+            self._captured_verify_graphs_tq = collections.OrderedDict()
+
+        key = (cur_pos, K)
+        g = self._graph_cache_get(self._captured_verify_graphs_tq, key)
+        if g is not None:
+            return g
+
+        gs = self._graph_stream
+        snap_lin = self._lin_state.clone()
+        snap_conv = self._lin_conv_state.clone()
+
+        def _restore():
+            self._lin_state.copy_(snap_lin)
+            self._lin_conv_state.copy_(snap_conv)
+            self._tq_mark_dequant_valid_end(cur_pos)
+
+        gs.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(gs), torch.no_grad():
+            tokens_K = self._verify_static_tokens[:, :K]
+            cos_K = self._verify_static_cos[:, :K]
+            sin_K = self._verify_static_sin[:, :K]
+            for _ in range(2):
+                self._tq_mark_dequant_valid_end(cur_pos)
+                self.forward_own_decode_K_nvfp4_tq(
+                    tokens_K, cos_K, sin_K, cur_pos, K=K)
+                _restore()
+
+        gs.synchronize()
+        self._tq_mark_dequant_valid_end(cur_pos)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(
+                g, stream=gs, pool=self._graph_mempool,
+        ), torch.no_grad():
+            self.forward_own_decode_K_nvfp4_tq(
+                tokens_K, cos_K, sin_K, cur_pos, K=K)
+        with torch.cuda.stream(gs), torch.no_grad():
+            _restore()
+        gs.synchronize()
+        torch.cuda.current_stream().wait_stream(gs)
+
+        self._graph_cache_put(self._captured_verify_graphs_tq, key, g)
+        return g
+
+    def _ensure_verify_graph_nvfp4_fp8kv(self, cur_pos: int, K: int):
+        """Lazy CUDA Graph capture for FP8-KV S=K verify.
+
+        This mirrors the TQ graph path but binds
+        ``forward_own_decode_K_nvfp4_fp8kv``. The graph records FP8 KV
+        writes, FP8->BF16 staging, FA2, and the 64-layer verifier.
+        """
+        import torch
+
+        if not hasattr(self, '_captured_verify_graphs_fp8kv'):
+            self._captured_verify_graphs_fp8kv = collections.OrderedDict()
+
+        key = (cur_pos, K)
+        g = self._graph_cache_get(self._captured_verify_graphs_fp8kv, key)
+        if g is not None:
+            return g
+
+        gs = self._graph_stream
+        snap_lin = self._lin_state.clone()
+        snap_conv = self._lin_conv_state.clone()
+
+        def _restore():
+            self._lin_state.copy_(snap_lin)
+            self._lin_conv_state.copy_(snap_conv)
+            self._fp8_mark_dequant_valid_end(cur_pos)
+
+        gs.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(gs), torch.no_grad():
+            tokens_K = self._verify_static_tokens[:, :K]
+            cos_K = self._verify_static_cos[:, :K]
+            sin_K = self._verify_static_sin[:, :K]
+            for _ in range(2):
+                self._fp8_mark_dequant_valid_end(cur_pos)
+                self.forward_own_decode_K_nvfp4_fp8kv(
+                    tokens_K, cos_K, sin_K, cur_pos, K=K)
+                _restore()
+
+        gs.synchronize()
+        self._fp8_mark_dequant_valid_end(cur_pos)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(
+                g, stream=gs, pool=self._graph_mempool,
+        ), torch.no_grad():
+            self.forward_own_decode_K_nvfp4_fp8kv(
+                tokens_K, cos_K, sin_K, cur_pos, K=K)
+        with torch.cuda.stream(gs), torch.no_grad():
+            _restore()
+        gs.synchronize()
+        torch.cuda.current_stream().wait_stream(gs)
+
+        self._graph_cache_put(self._captured_verify_graphs_fp8kv, key, g)
+        return g
+
     # ---------- Stage 7 G2: NVFP4 MTP chain graph capture ----------
 
     def _ensure_mtp_graph_nvfp4(self, mtp_pos: int):
@@ -5602,7 +6752,8 @@ class Qwen36TorchFrontendRtx:
 
     # ---------- G9: NVFP4 MTP CHAIN graph (K steps in one graph) ------
 
-    def _ensure_mtp_chain_graph_nvfp4(self, base_pos: int, K: int):
+    def _ensure_mtp_chain_graph_nvfp4(
+            self, base_pos: int, K: int, cache_base_pos: int | None = None):
         """Capture the entire K-step MTP chain as ONE CUDA Graph.
 
         Inputs (filled by caller before replay):
@@ -5620,42 +6771,88 @@ class Qwen36TorchFrontendRtx:
         calls inside the graph — no Python in the inner loop at replay
         time.
 
-        State integrity: each MTP step writes to mtp_K_cache[base_pos+k]
-        / mtp_V_cache[base_pos+k]. Snap+restore those K rows so the
-        warmup/capture writes don't perturb the live cache.
+        ``base_pos`` is the absolute RoPE position. ``cache_base_pos``
+        defaults to ``base_pos`` for the short-context path. Long-context
+        TQ spec keeps a compact MTP cache over generated tokens only, so
+        it passes a separate cache base while preserving absolute RoPE.
+
+        State integrity: each MTP step writes to
+        mtp_K_cache[cache_base_pos+k] / mtp_V_cache[cache_base_pos+k].
+        Snap+restore those K rows so warmup/capture does not perturb the
+        live cache.
         """
         import torch
 
-        key = (base_pos, K)
+        from flash_rt import flash_rt_kernels as fvk
+
+        if cache_base_pos is None:
+            cache_base_pos = base_pos
+            key = (base_pos, K)
+        else:
+            cache_base_pos = int(cache_base_pos)
+            key = (base_pos, cache_base_pos, K)
         g = self._graph_cache_get(self._captured_chain_graphs, key)
         if g is not None:
             return g
 
         gs = self._graph_stream
 
-        snap_K = self._mtp_K_cache[base_pos:base_pos + K].clone()
-        snap_V = self._mtp_V_cache[base_pos:base_pos + K].clone()
+        snap_K = self._mtp_K_cache[
+            cache_base_pos:cache_base_pos + K].clone()
+        snap_V = self._mtp_V_cache[
+            cache_base_pos:cache_base_pos + K].clone()
 
         def _restore():
-            self._mtp_K_cache[base_pos:base_pos + K].copy_(snap_K)
-            self._mtp_V_cache[base_pos:base_pos + K].copy_(snap_V)
+            self._mtp_K_cache[
+                cache_base_pos:cache_base_pos + K].copy_(snap_K)
+            self._mtp_V_cache[
+                cache_base_pos:cache_base_pos + K].copy_(snap_V)
 
         def _run_chain():
+            mtp_argmax_parts = int(os.environ.get(
+                'FLASHRT_QWEN36_MTP_ARGMAX_PARTS', '96') or '96')
             for k in range(K):
                 self.forward_mtp_head_nvfp4(
                     self._mtp_static_prev_h,
                     self._mtp_static_prev_token,
-                    base_pos + k)
-                # argmax → drafts buf row k
-                d_k = self._mtp_logits_buf.argmax(
-                    dim=-1, keepdim=True).view(1, 1)
-                self._chain_drafts_buf[k:k + 1].copy_(d_k.view(1, 1))
+                    base_pos + k,
+                    mtp_cache_pos=cache_base_pos + k)
+                if (
+                    mtp_argmax_parts > 1
+                    and hasattr(fvk, 'qwen36_spec_accept_partitioned_bf16')
+                ):
+                    fvk.qwen36_spec_accept_partitioned_bf16(
+                        self._mtp_logits_buf.data_ptr(),
+                        self._chain_drafts_buf.data_ptr(),
+                        self._chain_drafts_buf[k:k + 1].data_ptr(),
+                        self._spec_accept_n_buf.data_ptr(),
+                        self._spec_argmax_partial_vals.data_ptr(),
+                        self._spec_argmax_partial_idx.data_ptr(),
+                        1, self._cfg['vocab_size'], 0,
+                        mtp_argmax_parts,
+                        torch.cuda.current_stream().cuda_stream,
+                    )
+                else:
+                    fvk.qwen36_argmax_bf16(
+                        self._mtp_logits_buf.data_ptr(),
+                        self._chain_drafts_buf[k:k + 1].data_ptr(),
+                        1, self._cfg['vocab_size'],
+                        torch.cuda.current_stream().cuda_stream,
+                    )
                 if k < K - 1:
                     # Chain: prev_h ← layer_out, prev_token ← d_k
-                    self._mtp_static_prev_h.copy_(
-                        self._mtp_layer_out_buf)
-                    self._mtp_static_prev_token.copy_(
-                        self._chain_drafts_buf[k:k + 1])
+                    stream = torch.cuda.current_stream().cuda_stream
+                    fvk.gpu_copy(
+                        self._mtp_static_prev_h.data_ptr(),
+                        self._mtp_layer_out_buf.data_ptr(),
+                        self._mtp_static_prev_h.numel() * 2,
+                        stream,
+                    )
+                    fvk.gpu_copy(
+                        self._mtp_static_prev_token.data_ptr(),
+                        self._chain_drafts_buf[k:k + 1].data_ptr(),
+                        8, stream,
+                    )
 
         gs.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(gs), torch.no_grad():
@@ -5685,39 +6882,712 @@ class Qwen36TorchFrontendRtx:
         """Switch a freshly-initialised NVFP4 frontend onto the TQ path.
 
         Called from ``__init__`` when ``max_seq > LONG_CTX_THRESHOLD``.
-        Buffers were sized at the threshold; this method extends KV
-        coverage out to the user-requested max_seq via the TurboQuant
-        packed cache and shrinks the now-unused BF16 KV cache to a
-        64-row dummy.
+        Buffers were sized at a short spec window; this method extends
+        KV coverage out to the user-requested max_seq via the
+        TurboQuant packed cache while retaining that BF16 window for
+        ordinary short speculative requests.
 
         Sequence (matches the canonical pattern from the team's own
         long-ctx benches, but without exposing the private steps to
         callers):
 
-          1. Drop the BF16 KV cache (its rows are now stand-ins; the
-             TQ packed cache is the source of truth).
+          1. Keep/shrink the BF16 KV cache to the retained short spec
+             window. The TQ packed cache is the source of truth for
+             requests beyond that window.
           2. Extend the precomputed RoPE table out to the user's
              max_seq + a small slack (the BF16 path's rope table was
              sized at the threshold).
           3. Allocate the TQ packed cache + BF16 single-layer staging
              at ``max_seq_tq = user_max_seq + 16``.
 
-        After this returns, ``forward_own_decode_nvfp4_tq`` (eager) is
-        the correct decode entry. Captured-graph TQ replay is not
-        used here because its KV-cache write is skipped at capture
-        time, so replay only produces correct attention if the slot
-        was already populated for *this exact token* — fine for
-        bench (synthetic-fill, fixed token) but wrong for serving.
+        After this returns, long requests use the compressed KV route
+        selected by ``FLASHRT_QWEN36_LONG_KV_CACHE``.  ``fp8`` is the
+        default long-context route and allocates an e4m3 persistent KV
+        cache; until the direct FP8 attention kernel lands, it
+        dequantizes into the shared BF16 stage before calling FA2.
+        ``tq`` keeps the TurboQuant packed cache available for memory
+        and accuracy bisection.
         """
         # b_v=4, b_k_total=4, bit_packed=True matches the long-ctx
         # bench config (docs/qwen36_nvfp4.md §4): 1.83x compression
-        # at 1-byte idx → ~5x at bit-pack = the documented profile.
-        self._shrink_bf16_kv_cache(new_max_seq=64)
+        # at 1-byte idx -> ~5x at bit-pack = the documented profile.
+        # Keep the retained BF16 window so long-context-capable servers
+        # do not lose MTP spec throughput on short requests.
+        self._shrink_bf16_kv_cache(
+            new_max_seq=int(getattr(
+                self, '_short_ctx_spec_max_seq', 2048)))
         self._extend_rope_table_to(self._user_max_seq + 16)
-        self._load_turboquant_packed(
-            max_seq_tq=self._user_max_seq + 16,
-            b_v=4, b_k_total=4, bit_packed=True,
+        mode = os.environ.get(
+            'FLASHRT_QWEN36_LONG_KV_CACHE', 'fp8').strip().lower()
+        if mode not in ('tq', 'fp8'):
+            raise ValueError(
+                'FLASHRT_QWEN36_LONG_KV_CACHE must be tq or fp8, '
+                f'got {mode!r}')
+        self._long_kv_cache_mode = mode
+        if mode == 'fp8':
+            self._load_fp8_kv_cache(max_seq=self._user_max_seq + 16)
+        else:
+            self._load_turboquant_packed(
+                max_seq_tq=self._user_max_seq + 16,
+                b_v=4, b_k_total=4, bit_packed=True,
+            )
+        if self._weights.ptrs.get('mtp') is not None:
+            # Long-context MTP uses compact cache positions for prompt
+            # tail + generated tokens; the main long KV cache owns the
+            # full prompt.  Allocating BF16 MTP KV for the full 128K+
+            # user max_seq wastes several hundred MB on 32 GB cards.
+            compact_mtp = int(os.environ.get(
+                'FLASHRT_QWEN36_LONG_MTP_CACHE_TOKENS', '4096') or '4096')
+            compact_mtp = max(
+                int(getattr(self, '_short_ctx_spec_max_seq', 2048)),
+                compact_mtp,
+            )
+            self._extend_mtp_cache_to(
+                min(self._user_max_seq + 16, compact_mtp))
+
+    def _extend_mtp_cache_to(self, target_max_seq: int) -> None:
+        """Resize the MTP private KV cache for long-context spec decode."""
+        import torch
+
+        if self._weights.ptrs.get('mtp') is None:
+            return
+        bf16 = torch.bfloat16
+        fp32 = torch.float32
+        target_max_seq = int(target_max_seq)
+        cur = int(getattr(getattr(self, '_mtp_K_cache', None), 'shape',
+                          (0,))[0])
+        if cur >= target_max_seq:
+            return
+        self._mtp_K_cache = torch.empty(
+            target_max_seq, 4, 256, device=self.device, dtype=bf16)
+        self._mtp_V_cache = torch.empty_like(self._mtp_K_cache)
+        n_splits = min(128, (target_max_seq + 63) // 64)
+        self._mtp_n_splits = n_splits
+        self._mtp_lse_accum = torch.empty(
+            n_splits, 1, 24, 1, device=self.device, dtype=fp32)
+        self._mtp_o_accum = torch.empty(
+            n_splits, 1, 24, 1, 256, device=self.device, dtype=fp32)
+        if hasattr(self, '_captured_mtp_graphs'):
+            self._captured_mtp_graphs.clear()
+        if hasattr(self, '_captured_chain_graphs'):
+            self._captured_chain_graphs.clear()
+
+    def _ensure_long_mtp_cache_capacity(
+            self, prompt_len: int, max_new_tokens: int, K: int) -> None:
+        if self._weights.ptrs.get('mtp') is None:
+            return
+        mtp_tail = self._long_mtp_prefill_tail_for_prompt(int(prompt_len))
+        need = mtp_tail + int(max_new_tokens) + int(K) + 8
+        need = max(int(getattr(self, '_short_ctx_spec_max_seq', 2048)), need)
+        self._extend_mtp_cache_to(min(self._user_max_seq + 16, need))
+
+    def _long_mtp_prefill_tail_for_prompt(self, prompt_len: int) -> int:
+        raw = os.environ.get(
+            'FLASHRT_QWEN36_LONG_MTP_PREFILL_TAIL', 'auto') or 'auto'
+        if raw.lower() != 'auto':
+            return max(0, int(raw))
+        prompt_len = int(prompt_len)
+        if prompt_len < 512:
+            return 0
+        if prompt_len < 768:
+            return 512
+        if prompt_len < 3072:
+            return 2048
+        if prompt_len < 6144:
+            return 512
+        return 2048
+
+    def _prefill_long_ctx_tq_chunked(self, input_ids):
+        """Chunked prompt prefill for long-context TQ mode.
+
+        Reuses the S=K TQ verify forward to process prompt tokens in
+        chunks up to ``MAX_Q_SEQ``. This is still an eager bridge, but it
+        avoids the pathological one-full-forward-per-token prefill.
+        """
+        import os
+        import torch
+
+        from flash_rt import flash_rt_kernels as fvk
+
+        prompt_len = int(input_ids.shape[1])
+        if prompt_len <= 0:
+            raise ValueError('input_ids must contain at least one token')
+        hidden = self._cfg['hidden_size']
+        chunk = int(os.environ.get(
+            'FLASHRT_QWEN36_TQ_PREFILL_CHUNK', str(self.MAX_Q_SEQ)))
+        mtp_tail = self._long_mtp_prefill_tail_for_prompt(prompt_len)
+        self._long_mtp_prefill_tail_effective = mtp_tail
+        hidden_save_start = max(0, prompt_len - mtp_tail - 1)
+        if mtp_tail > 0:
+            tail_rows = prompt_len - hidden_save_start
+            if (not hasattr(self, '_long_mtp_h_tail')
+                    or int(self._long_mtp_h_tail.shape[0]) < tail_rows):
+                import torch
+                self._long_mtp_h_tail = torch.empty(
+                    tail_rows, hidden, device=self.device,
+                    dtype=torch.bfloat16)
+            self._long_mtp_h_tail_start = hidden_save_start
+            self._long_mtp_h_tail_rows = tail_rows
+        # Long-ctx BF16 working buffers are intentionally capped at the
+        # retained short spec window (2048 by default). Allow larger
+        # MAX_Q_SEQ experiments to allocate, but never choose a prefill
+        # chunk that cannot fit the hidden ping-pong buffers.
+        chunk_cap = min(self.MAX_Q_SEQ, int(self._h_b.shape[0]))
+        chunk = max(1, min(chunk, chunk_cap))
+        d = self._rope_dim
+        s = torch.cuda.current_stream().cuda_stream
+
+        last_h = None
+        last_logits = None
+        for start in range(0, prompt_len, chunk):
+            end = min(start + chunk, prompt_len)
+            S = end - start
+            cos_S = self._rope_cos_table[start:end].view(1, S, d)
+            sin_S = self._rope_sin_table[start:end].view(1, S, d)
+            is_last = end == prompt_len
+            save_hidden = mtp_tail > 0 and end > hidden_save_start
+            if save_hidden:
+                mode = 'hidden_last' if is_last else 'hidden'
+            else:
+                mode = 'last' if is_last else 'none'
+            if getattr(self, '_long_kv_cache_mode', 'tq') == 'fp8':
+                logits = self.forward_own_decode_K_nvfp4_fp8kv(
+                    input_ids[:, start:end], cos_S, sin_S, start, S,
+                    logits_mode=mode)
+            else:
+                logits = self.forward_own_decode_K_nvfp4_tq(
+                    input_ids[:, start:end], cos_S, sin_S, start, S,
+                    logits_mode=mode)
+            if save_hidden:
+                copy_start = max(start, hidden_save_start)
+                src_start = copy_start - start
+                rows = end - copy_start
+                dst_start = copy_start - hidden_save_start
+                fvk.gpu_copy(
+                    self._long_mtp_h_tail[
+                        dst_start:dst_start + rows].data_ptr(),
+                    self._K_last_hidden_buf[
+                        :, src_start:src_start + rows, :].data_ptr(),
+                    rows * hidden * 2, s,
+                )
+            if is_last:
+                if save_hidden:
+                    last_h = self._K_last_hidden_buf[:, S - 1:S, :]
+                else:
+                    last_h = self._K_last_hidden_buf[:, :1, :]
+                last_logits = logits
+
+        assert last_h is not None and last_logits is not None
+        fvk.gpu_copy(
+            self._last_hidden_buf.data_ptr(), last_h.data_ptr(),
+            hidden * 2, s,
         )
+        if last_logits.data_ptr() != self._logits_buf.data_ptr():
+            fvk.gpu_copy(
+                self._logits_buf.data_ptr(), last_logits.data_ptr(),
+                self._cfg['vocab_size'] * 2, s,
+            )
+        return last_h.view(1, 1, hidden), last_logits
+
+    def _generate_long_ctx_speculative_KN_nvfp4(
+            self, input_ids, *, max_new_tokens: int, K: int = 6):
+        """Long-context MTP spec decode over the compressed KV cache.
+
+        The default route uses the TQ packed cache.  With
+        ``FLASHRT_QWEN36_LONG_KV_CACHE=fp8``, prefill and verify use an
+        e4m3 FP8 persistent cache with BF16 staging.  MTP draft
+        generation keeps its private BF16 KV cache.
+        """
+        import torch
+
+        from flash_rt import flash_rt_kernels as fvk
+
+        prompt_len = int(input_ids.shape[1])
+        tq_spec_k = os.environ.get('FLASHRT_QWEN36_TQ_SPEC_K', '')
+        if tq_spec_k:
+            K = int(tq_spec_k)
+        else:
+            K = self._long_tq_effective_k(prompt_len, K)
+        adaptive_k = (
+            not tq_spec_k
+            and K >= 4
+            and os.environ.get('FLASHRT_QWEN36_TQ_ADAPTIVE_K', '1') == '1'
+        )
+        use_kernel_accept = (
+            os.environ.get('FLASHRT_QWEN36_KERNEL_ACCEPT', '1') == '1'
+        )
+        strict_next = (
+            os.environ.get('FLASHRT_QWEN36_TQ_STRICT_NEXT', '0') == '1'
+        )
+        strict_next_graph = (
+            strict_next
+            and os.environ.get(
+                'FLASHRT_QWEN36_TQ_STRICT_NEXT_GRAPH', '1') == '1'
+        )
+        accept_parts = int(os.environ.get(
+            'FLASHRT_QWEN36_ACCEPT_PARTS', '32') or '32')
+        use_partitioned_accept = (
+            use_kernel_accept
+            and accept_parts > 1
+            and hasattr(fvk, 'qwen36_spec_accept_partitioned_bf16')
+            and hasattr(self, '_spec_argmax_partial_vals')
+        )
+        max_spec_k = min(self.MAX_Q_SEQ - 1, self._MAX_PUBLIC_SPEC_K)
+        if K < 1 or K > max_spec_k:
+            raise ValueError(
+                f'K={K} out of range — need 1<=K<={max_spec_k}')
+        max_pos = prompt_len + int(max_new_tokens)
+        if max_pos > self._user_max_seq:
+            raise ValueError(
+                f'prompt_len ({prompt_len}) + max_new_tokens '
+                f'({max_new_tokens}) = {max_pos} exceeds the '
+                f'frontend max_seq ({self._user_max_seq})'
+            )
+        self._ensure_long_mtp_cache_capacity(prompt_len, max_new_tokens, K)
+
+        hidden = self._cfg['hidden_size']
+        self.reset_state()
+        self.reset_mtp_state()
+        if not hasattr(self, '_rope_cos_table'):
+            self._build_rope_table()
+
+        generated_len = 0
+
+        with torch.no_grad():
+            s = torch.cuda.current_stream().cuda_stream
+            fvk.gpu_copy(
+                self._gen_out_buf[:, :prompt_len].data_ptr(),
+                input_ids.data_ptr(), prompt_len * 8, s,
+            )
+            ev_pf0 = torch.cuda.Event(enable_timing=True)
+            ev_pf1 = torch.cuda.Event(enable_timing=True)
+            ev_dec1 = torch.cuda.Event(enable_timing=True)
+            ev_pf0.record()
+            # Main TQ prefill. Use the existing S=K verify forward as a
+            # chunked prompt forward so we do not run one full decode
+            # call per prompt token.
+            last_h, last_logits = self._prefill_long_ctx_tq_chunked(
+                input_ids)
+            if use_kernel_accept:
+                if use_partitioned_accept:
+                    fvk.qwen36_spec_accept_partitioned_bf16(
+                        last_logits.data_ptr(),
+                        self._spec_argmax_buf.data_ptr(),
+                        self._spec_argmax_buf.data_ptr(),
+                        self._spec_accept_n_buf.data_ptr(),
+                        self._spec_argmax_partial_vals.data_ptr(),
+                        self._spec_argmax_partial_idx.data_ptr(),
+                        1, self._cfg['vocab_size'], 0, accept_parts, s,
+                    )
+                else:
+                    fvk.qwen36_spec_accept_greedy_bf16(
+                        last_logits.data_ptr(),
+                        self._spec_argmax_buf.data_ptr(),
+                        self._spec_argmax_buf.data_ptr(),
+                        self._spec_accept_n_buf.data_ptr(),
+                        1, self._cfg['vocab_size'], 0, s,
+                    )
+                tok = self._spec_argmax_buf[:1].view(1, 1)
+            else:
+                tok = last_logits.argmax(
+                    dim=-1, keepdim=True).view(1, 1)
+            fvk.gpu_copy(
+                self._gen_out_buf[:, prompt_len:prompt_len + 1].data_ptr(),
+                tok.data_ptr(), 8, s,
+            )
+            generated_len = 1
+            cur_pos = prompt_len
+            mtp_tail = self._long_mtp_prefill_tail_for_prompt(prompt_len)
+            mtp_base = 0
+            if mtp_tail > 0:
+                # Experimental bridge toward the standard short-context
+                # MTP semantics: seed the drafter cache with the prompt
+                # tail instead of starting it empty at the first generated
+                # token.  We keep this tail-bounded because full prompt MTP
+                # prefill would dominate long-context TTFT.
+                first = max(1, prompt_len - mtp_tail)
+                tail_start = int(getattr(
+                    self, '_long_mtp_h_tail_start', first - 1))
+                tail_h = self._long_mtp_h_tail
+                used_kv_only = False
+                if os.environ.get(
+                        'FLASHRT_QWEN36_LONG_MTP_TAIL_KV_ONLY',
+                        '1') == '1':
+                    rows = prompt_len - first
+                    h_start = (first - 1) - tail_start
+                    used_kv_only = self._prefill_mtp_tail_kv_nvfp4(
+                        tail_h[h_start:h_start + rows],
+                        input_ids[:, first:prompt_len].view(-1),
+                        first, mtp_base)
+                    if used_kv_only:
+                        mtp_base += rows
+                if not used_kv_only:
+                    for p in range(first, prompt_len):
+                        h_idx = (p - 1) - tail_start
+                        prev_h_p = tail_h[
+                            h_idx:h_idx + 1].view(
+                                1, 1, hidden).contiguous()
+                        prev_tok_p = input_ids[:, p:p + 1]
+                        self.forward_mtp_head_nvfp4(
+                            prev_h_p, prev_tok_p, p,
+                            mtp_cache_pos=mtp_base)
+                        mtp_base += 1
+            self.forward_mtp_head_nvfp4(
+                last_h, tok, cur_pos, mtp_cache_pos=mtp_base)
+            h = last_h
+            ev_pf1.record()
+
+            self._spec_attempts = 0
+            self._spec_accepts = 0
+            self._spec_full = 0
+
+            while generated_len < max_new_tokens:
+                # MTP chain. Graph replay is the fastest warm path; set
+                # FLASHRT_QWEN36_TQ_MTP_CHAIN_GRAPH=0 only when optimizing
+                # first-request latency without prewarm.
+                if os.environ.get(
+                        'FLASHRT_QWEN36_TQ_MTP_CHAIN_GRAPH', '1') == '1':
+                    gs = self._graph_stream
+                    cg = self._ensure_mtp_chain_graph_nvfp4(
+                        cur_pos, K, cache_base_pos=mtp_base)
+                    gs.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(gs):
+                        fvk.gpu_copy(
+                            self._mtp_static_prev_h.data_ptr(),
+                            h.data_ptr(), hidden * 2, gs.cuda_stream,
+                        )
+                        fvk.gpu_copy(
+                            self._mtp_static_prev_token.data_ptr(),
+                            tok.data_ptr(), 8, gs.cuda_stream,
+                        )
+                        cg.replay()
+                    torch.cuda.current_stream().wait_stream(gs)
+                    drafts_t = self._chain_drafts_buf[:K]
+                else:
+                    drafts = []
+                    h_mtp = h
+                    tok_mtp = tok
+                    for j in range(K):
+                        h_mtp, logits_mtp = self.forward_mtp_head_nvfp4(
+                            h_mtp, tok_mtp, cur_pos + j,
+                            mtp_cache_pos=mtp_base + j)
+                        tok_mtp = logits_mtp.argmax(
+                            dim=-1, keepdim=True).view(1, 1)
+                        drafts.append(tok_mtp)
+                    drafts_t = torch.cat(drafts, dim=0).view(K, 1)
+
+                d = self._rope_dim
+                cos_KN = self._rope_cos_table[
+                    cur_pos:cur_pos + K + 1].view(1, K + 1, d)
+                sin_KN = self._rope_sin_table[
+                    cur_pos:cur_pos + K + 1].view(1, K + 1, d)
+                Kv = K + 1
+                fvk.gpu_copy(
+                    self._verify_static_tokens[:, 0:1].data_ptr(),
+                    tok.data_ptr(), 8, s,
+                )
+                fvk.gpu_copy(
+                    self._verify_static_tokens[:, 1:Kv].data_ptr(),
+                    drafts_t.view(1, K).data_ptr(), K * 8, s,
+                )
+                fvk.gpu_copy(
+                    self._verify_static_cos[:, :Kv].data_ptr(),
+                    cos_KN.data_ptr(), Kv * d * 2, s,
+                )
+                fvk.gpu_copy(
+                    self._verify_static_sin[:, :Kv].data_ptr(),
+                    sin_KN.data_ptr(), Kv * d * 2, s,
+                )
+                if strict_next:
+                    fvk.gpu_copy(
+                        self._snap_lin_buf.data_ptr(),
+                        self._lin_state.data_ptr(),
+                        self._lin_state.numel() * 2, s,
+                    )
+                    fvk.gpu_copy(
+                        self._snap_conv_buf.data_ptr(),
+                        self._lin_conv_state.data_ptr(),
+                        self._lin_conv_state.numel() * 2, s,
+                    )
+
+                kv_mode = getattr(self, '_long_kv_cache_mode', 'tq')
+                use_verify_graph = (
+                    os.environ.get(
+                        'FLASHRT_QWEN36_TQ_VERIFY_GRAPH', '1') == '1'
+                )
+                if kv_mode == 'tq' and use_verify_graph:
+                    self._tq_mark_dequant_valid_end(cur_pos)
+                    graph_key = (cur_pos, Kv)
+                    vg = self._graph_cache_get(
+                        self._captured_verify_graphs_tq, graph_key)
+                    if vg is None and self._long_tq_graph_capture_allowed():
+                        vg = self._ensure_verify_graph_nvfp4_tq(cur_pos, Kv)
+                    if vg is not None:
+                        gs = self._graph_stream
+                        gs.wait_stream(torch.cuda.current_stream())
+                        with torch.cuda.stream(gs):
+                            vg.replay()
+                        torch.cuda.current_stream().wait_stream(gs)
+                        self._tq_mark_dequant_valid_end(cur_pos + Kv)
+                        logits_KN = self._K_logits_buf[:Kv]
+                    else:
+                        logits_KN = self._forward_long_kv_K_nvfp4(
+                            self._verify_static_tokens[:, :Kv],
+                            self._verify_static_cos[:, :Kv],
+                            self._verify_static_sin[:, :Kv],
+                            cur_pos, Kv)
+                elif kv_mode == 'fp8' and use_verify_graph:
+                    graph_key = (cur_pos, Kv)
+                    cache = getattr(
+                        self, '_captured_verify_graphs_fp8kv', None)
+                    vg = (self._graph_cache_get(cache, graph_key)
+                          if cache is not None else None)
+                    if vg is None and self._long_tq_graph_capture_allowed():
+                        vg = self._ensure_verify_graph_nvfp4_fp8kv(
+                            cur_pos, Kv)
+                    if vg is not None:
+                        gs = self._graph_stream
+                        gs.wait_stream(torch.cuda.current_stream())
+                        with torch.cuda.stream(gs):
+                            vg.replay()
+                        torch.cuda.current_stream().wait_stream(gs)
+                        self._fp8_mark_dequant_valid_end(cur_pos + Kv)
+                        logits_KN = self._K_logits_buf[:Kv]
+                    else:
+                        logits_KN = self._forward_long_kv_K_nvfp4(
+                            self._verify_static_tokens[:, :Kv],
+                            self._verify_static_cos[:, :Kv],
+                            self._verify_static_sin[:, :Kv],
+                            cur_pos, Kv)
+                else:
+                    logits_KN = self._forward_long_kv_K_nvfp4(
+                        self._verify_static_tokens[:, :Kv],
+                        self._verify_static_cos[:, :Kv],
+                        self._verify_static_sin[:, :Kv],
+                        cur_pos, Kv)
+
+                if use_kernel_accept:
+                    if use_partitioned_accept:
+                        fvk.qwen36_spec_accept_partitioned_bf16(
+                            logits_KN.data_ptr(),
+                            drafts_t.view(-1).data_ptr(),
+                            self._spec_argmax_buf.data_ptr(),
+                            self._spec_accept_n_buf.data_ptr(),
+                            self._spec_argmax_partial_vals.data_ptr(),
+                            self._spec_argmax_partial_idx.data_ptr(),
+                            Kv, self._cfg['vocab_size'], K,
+                            accept_parts, s,
+                        )
+                    else:
+                        fvk.qwen36_spec_accept_greedy_bf16(
+                            logits_KN.data_ptr(),
+                            drafts_t.view(-1).data_ptr(),
+                            self._spec_argmax_buf.data_ptr(),
+                            self._spec_accept_n_buf.data_ptr(),
+                            Kv, self._cfg['vocab_size'], K, s,
+                        )
+                    all_argmax = self._spec_argmax_buf[:Kv]
+                    N = int(fvk.cuda_read_i32_sync(
+                        self._spec_accept_n_buf.data_ptr(), s))
+                else:
+                    all_argmax = logits_KN.argmax(dim=-1)
+                    drafts_stack = drafts_t.view(-1)
+                    matches = (all_argmax[:K] == drafts_stack).long()
+                    matches_pad = torch.cat([
+                        matches,
+                        torch.zeros(1, device=matches.device,
+                                    dtype=matches.dtype),
+                    ])
+                    N = int(matches_pad.argmin().item())
+                self._spec_attempts += 1
+                self._spec_accepts += N
+
+                argmax_at = (lambda j: all_argmax[j:j + 1].view(1, 1))
+                strict_tok = None
+                if strict_next:
+                    process = K + 1 if N == K else N + 1
+                    fvk.gpu_copy(
+                        self._lin_state.data_ptr(),
+                        self._snap_lin_buf.data_ptr(),
+                        self._lin_state.numel() * 2, s,
+                    )
+                    fvk.gpu_copy(
+                        self._lin_conv_state.data_ptr(),
+                        self._snap_conv_buf.data_ptr(),
+                        self._lin_conv_state.numel() * 2, s,
+                    )
+                    for j in range(process):
+                        if strict_next_graph:
+                            if j != 0:
+                                fvk.gpu_copy(
+                                    self._verify_static_tokens[
+                                        :, :1].data_ptr(),
+                                    self._verify_static_tokens[
+                                        :, j:j + 1].data_ptr(), 8, s,
+                                )
+                                fvk.gpu_copy(
+                                    self._verify_static_cos[
+                                        :, :1].data_ptr(),
+                                    self._verify_static_cos[
+                                        :, j:j + 1].data_ptr(),
+                                    d * 2, s,
+                                )
+                            fvk.gpu_copy(
+                                self._verify_static_sin[
+                                    :, :1].data_ptr(),
+                                self._verify_static_sin[
+                                    :, j:j + 1].data_ptr(),
+                                d * 2, s,
+                            )
+                            if getattr(
+                                    self, '_long_kv_cache_mode',
+                                    'tq') == 'fp8':
+                                self._fp8_mark_dequant_valid_end(
+                                    cur_pos + j)
+                                sg = self._ensure_verify_graph_nvfp4_fp8kv(
+                                    cur_pos + j, 1)
+                            else:
+                                self._tq_mark_dequant_valid_end(cur_pos + j)
+                                sg = self._ensure_verify_graph_nvfp4_tq(
+                                    cur_pos + j, 1)
+                            gs = self._graph_stream
+                            gs.wait_stream(torch.cuda.current_stream())
+                            with torch.cuda.stream(gs):
+                                sg.replay()
+                            torch.cuda.current_stream().wait_stream(gs)
+                            if getattr(
+                                    self, '_long_kv_cache_mode',
+                                    'tq') == 'fp8':
+                                self._fp8_mark_dequant_valid_end(
+                                    cur_pos + j + 1)
+                            else:
+                                self._tq_mark_dequant_valid_end(
+                                    cur_pos + j + 1)
+                        else:
+                            mode = 'last' if j == process - 1 else 'none'
+                            self._forward_long_kv_K_nvfp4(
+                                self._verify_static_tokens[:, j:j + 1],
+                                self._verify_static_cos[:, j:j + 1],
+                                self._verify_static_sin[:, j:j + 1],
+                                cur_pos + j, 1, logits_mode=mode)
+                    strict_logits = (self._K_logits_buf[:1]
+                                     if strict_next_graph
+                                     else self._logits_buf)
+                    fvk.qwen36_spec_accept_greedy_bf16(
+                        strict_logits.data_ptr(),
+                        self._spec_argmax_buf[Kv:Kv + 1].data_ptr(),
+                        self._spec_argmax_buf[Kv:Kv + 1].data_ptr(),
+                        self._spec_accept_n_buf.data_ptr(),
+                        1, self._cfg['vocab_size'], 0, s,
+                    )
+                    strict_tok = self._spec_argmax_buf[
+                        Kv:Kv + 1].view(1, 1)
+                if N == K:
+                    self._spec_full += 1
+                    take = min(K + 1, max_new_tokens - generated_len)
+                    if take > 0:
+                        if strict_next:
+                            prefix = min(K, take)
+                            if prefix > 0:
+                                fvk.gpu_copy(
+                                    self._gen_out_buf[
+                                        :, prompt_len + generated_len:
+                                        prompt_len + generated_len + prefix
+                                    ].data_ptr(),
+                                    all_argmax[:prefix].data_ptr(),
+                                    prefix * 8, s,
+                                )
+                            if take > K:
+                                fvk.gpu_copy(
+                                    self._gen_out_buf[
+                                        :, prompt_len + generated_len + K:
+                                        prompt_len + generated_len + K + 1
+                                    ].data_ptr(),
+                                    strict_tok.data_ptr(), 8, s,
+                                )
+                        else:
+                            fvk.gpu_copy(
+                                self._gen_out_buf[
+                                    :, prompt_len + generated_len:
+                                    prompt_len + generated_len + take
+                                ].data_ptr(),
+                                all_argmax[:take].data_ptr(),
+                                take * 8, s,
+                            )
+                        generated_len += take
+                    tok = strict_tok if strict_next else argmax_at(K)
+                    h = (self._K_last_hidden_buf[:, :1, :] if strict_next
+                         else self._K_last_hidden_buf[:, K:K + 1, :])
+                    cur_pos += K + 1
+                    mtp_base += K + 1
+                    self._tq_mark_dequant_valid_end(cur_pos)
+                    self._fp8_mark_dequant_valid_end(cur_pos)
+                else:
+                    take = min(N + 1, max_new_tokens - generated_len)
+                    if take > 0:
+                        if strict_next:
+                            prefix = min(N, take)
+                            if prefix > 0:
+                                fvk.gpu_copy(
+                                    self._gen_out_buf[
+                                        :, prompt_len + generated_len:
+                                        prompt_len + generated_len + prefix
+                                    ].data_ptr(),
+                                    all_argmax[:prefix].data_ptr(),
+                                    prefix * 8, s,
+                                )
+                            if take > N:
+                                fvk.gpu_copy(
+                                    self._gen_out_buf[
+                                        :, prompt_len + generated_len + N:
+                                        prompt_len + generated_len + N + 1
+                                    ].data_ptr(),
+                                    strict_tok.data_ptr(), 8, s,
+                                )
+                        else:
+                            fvk.gpu_copy(
+                                self._gen_out_buf[
+                                    :, prompt_len + generated_len:
+                                    prompt_len + generated_len + take
+                                ].data_ptr(),
+                                all_argmax[:take].data_ptr(),
+                                take * 8, s,
+                            )
+                        generated_len += take
+                    if not strict_next:
+                        fvk.gpu_copy(
+                            self._lin_state.data_ptr(),
+                            self._K_lin_state_per_step[N].data_ptr(),
+                            self._lin_state.numel() * 2, s,
+                        )
+                        fvk.gpu_copy(
+                            self._lin_conv_state.data_ptr(),
+                            self._K_lin_conv_state_per_step[N].data_ptr(),
+                            self._lin_conv_state.numel() * 2, s,
+                        )
+                    h = (self._K_last_hidden_buf[:, :1, :] if strict_next
+                         else self._K_last_hidden_buf[:, N:N + 1, :])
+                    tok = strict_tok if strict_next else argmax_at(N)
+                    cur_pos += N + 1
+                    mtp_base += N + 1
+                    self._tq_mark_dequant_valid_end(cur_pos)
+                    self._fp8_mark_dequant_valid_end(cur_pos)
+
+                if (adaptive_k and K > 3
+                        and self._spec_attempts >= 8
+                        and self._spec_full == 0
+                        and (self._spec_accepts / self._spec_attempts)
+                        < 1.25):
+                    K = 3
+
+            ev_dec1.record()
+            torch.cuda.synchronize()
+            self._long_ctx_prefill_ms = ev_pf0.elapsed_time(ev_pf1)
+            self._long_ctx_decode_ms = ev_pf1.elapsed_time(ev_dec1)
+            self._long_ctx_route = (
+                f'{getattr(self, "_long_kv_cache_mode", "tq")}_spec')
+
+        return self._gen_out_buf[:, :prompt_len + generated_len]
 
     def _generate_long_ctx_single_token(
             self, input_ids, max_new_tokens: int):
@@ -5725,14 +7595,13 @@ class Qwen36TorchFrontendRtx:
 
         Single-token decode through the eager TQ forward — supports
         any prompt length up to ``self._user_max_seq`` and any output
-        length up to the same bound. Slower than spec (~30-40 tok/s
-        decode at 8-32 K ctx, dropping to ~20 tok/s at 256 K) but
-        works at every context length the TQ packed cache covers.
+        length up to the same bound. Slower than spec, but works at
+        every context length the TQ packed cache covers.
 
         Spec decode on the TQ path is the Phase 3D follow-up; until
         that lands, calling
-        ``generate_own_speculative_KN_nvfp4(..., K=N)`` in long-ctx
-        mode silently uses K=1 and logs a one-time info line.
+        ``generate_own_speculative_KN_nvfp4(..., K=N)`` for a request
+        beyond the short spec window silently uses K=1.
         """
         import torch
 
@@ -5746,12 +7615,19 @@ class Qwen36TorchFrontendRtx:
             )
 
         self.reset_state()
+        self._spec_attempts = 0
+        self._spec_accepts = 0
+        self._spec_full = 0
         if not hasattr(self, '_rope_cos_table'):
             self._build_rope_table()
 
         generated = list(input_ids[0].tolist())
         cur_pos = 0
         with torch.no_grad():
+            ev_pf0 = torch.cuda.Event(enable_timing=True)
+            ev_pf1 = torch.cuda.Event(enable_timing=True)
+            ev_dec1 = torch.cuda.Event(enable_timing=True)
+            ev_pf0.record()
             # Prefill: one TQ forward per prompt token.
             for p in range(prompt_len):
                 tok = input_ids[:, p:p + 1]
@@ -5763,6 +7639,7 @@ class Qwen36TorchFrontendRtx:
             tok = self._logits_buf.argmax(
                 dim=-1, keepdim=True).view(1, 1)
             generated.append(int(tok.item()))
+            ev_pf1.record()
             # Decode loop.
             for _ in range(int(max_new_tokens) - 1):
                 cos, sin = self._rope_cos_sin(cur_pos)
@@ -5772,6 +7649,11 @@ class Qwen36TorchFrontendRtx:
                     dim=-1, keepdim=True).view(1, 1)
                 generated.append(int(tok.item()))
                 cur_pos += 1
+            ev_dec1.record()
+            torch.cuda.synchronize()
+            self._long_ctx_prefill_ms = ev_pf0.elapsed_time(ev_pf1)
+            self._long_ctx_decode_ms = ev_pf1.elapsed_time(ev_dec1)
+            self._long_ctx_route = 'tq_single'
 
         return torch.tensor(
             [generated], device=input_ids.device, dtype=input_ids.dtype)
@@ -5879,6 +7761,339 @@ class Qwen36TorchFrontendRtx:
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    def _load_fp8_kv_cache(self, max_seq: int) -> None:
+        """Allocate an e4m3 persistent KV cache for long-context serving.
+
+        This is the community-style memory layout: full-attn KV is stored
+        at one byte per element instead of BF16.  The first implementation
+        deliberately keeps attention math on the existing BF16 FA2 ABI by
+        dequantizing a layer prefix into a shared BF16 stage.  That makes
+        it a clean pipeline/memory bridge; replacing ``_fp8_stage_for_layer``
+        with a direct FP8-attention call is the next optimization step.
+        """
+        import os
+        import torch
+
+        max_seq = int(max_seq)
+        xqa_page = 128
+        max_seq = ((max_seq + xqa_page - 1) // xqa_page) * xqa_page
+        fp8 = torch.float8_e4m3fn
+        bf16 = torch.bfloat16
+        d = self.device
+        nl = self._attn.NUM_FULL_LAYERS
+        nkv = self._attn.NUM_KV_HEADS
+        hd = self._attn.HEAD_DIM
+
+        self._fp8_K_cache = torch.empty(
+            nl, max_seq, nkv, hd, dtype=fp8, device=d)
+        self._fp8_V_cache = torch.empty_like(self._fp8_K_cache)
+        self._fp8_k_stage = torch.empty(
+            max_seq, nkv, hd, dtype=bf16, device=d)
+        self._fp8_v_stage = torch.empty_like(self._fp8_k_stage)
+        self._fp8_kv_scale = torch.ones(1, dtype=torch.float32, device=d)
+        self._fp8_kv_max_seq = max_seq
+        self._fp8_xqa_page = xqa_page
+        self._fp8_xqa_pages = max_seq // xqa_page
+        self._fp8_xqa_page_table = torch.arange(
+            self._fp8_xqa_pages, dtype=torch.int32, device=d).view(
+                1, self._fp8_xqa_pages)
+        self._fp8_xqa_seqlens: dict[int, torch.Tensor] = {}
+        self._fp8_xqa_masks: dict[int, torch.Tensor] = {}
+        xqa_sem_count = nkv * (
+            (max(self._MAX_PUBLIC_SPEC_K + 1, int(self.MAX_Q_SEQ))
+             * (self._attn.NUM_Q_HEADS // nkv) + 31) // 32)
+        self._fp8_xqa_semaphores = torch.zeros(
+            max(256, xqa_sem_count), dtype=torch.uint32, device=d)
+        scratch_mb = int(os.environ.get(
+            'FLASHRT_QWEN36_FP8_XQA_SCRATCH_MB', '256') or '256')
+        self._fp8_xqa_scratch = torch.zeros(
+            max(1, scratch_mb) << 20, dtype=torch.uint8, device=d)
+        self._fp8_xqa_enable_pdl = (
+            os.environ.get('FLASHRT_QWEN36_FP8_XQA_PDL', '1') == '1')
+
+        stage_cap_raw = os.environ.get(
+            'FLASHRT_QWEN36_FP8_STAGE_CAP', 'auto').lower()
+        if stage_cap_raw == 'auto':
+            stage_cap = min(max_seq, 204864)
+        else:
+            stage_cap = max(1, min(max_seq, int(stage_cap_raw)))
+        stage_layers_raw = os.environ.get(
+            'FLASHRT_QWEN36_FP8_STAGE_LAYERS', 'auto').lower()
+        if stage_layers_raw == 'auto':
+            policy_cap = 2 if stage_cap <= 132096 else 1
+            bytes_per_layer = stage_cap * nkv * hd * 2 * 2
+            reserve_mb = int(os.environ.get(
+                'FLASHRT_QWEN36_FP8_STAGE_RESERVE_MB', '1024') or '0')
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info()
+                mem_cap = max(
+                    0, (int(free_bytes) - (reserve_mb << 20))
+                    // bytes_per_layer)
+            except Exception:
+                mem_cap = policy_cap
+            stage_layers = max(0, min(16, policy_cap, int(mem_cap)))
+        else:
+            stage_layers = max(0, min(16, int(stage_layers_raw)))
+        self._fp8_stage_layers = stage_layers
+        self._fp8_stage_cap = stage_cap
+        self._fp8_stage_valid_end = [0] * stage_layers
+        if stage_layers > 0:
+            self._fp8_k_stage_per_layer = torch.empty(
+                stage_layers, stage_cap, nkv, hd,
+                dtype=bf16, device=d)
+            self._fp8_v_stage_per_layer = torch.empty_like(
+                self._fp8_k_stage_per_layer)
+
+        hot_cap_raw = os.environ.get(
+            'FLASHRT_QWEN36_FP8_HOT_STAGE_CAP', 'auto').lower()
+        if hot_cap_raw == 'auto':
+            hot_cap = min(max_seq, 132096)
+        else:
+            hot_cap = max(1, min(max_seq, int(hot_cap_raw)))
+        hot_layers_raw = os.environ.get(
+            'FLASHRT_QWEN36_FP8_HOT_STAGE_LAYERS', 'auto').lower()
+        if hot_layers_raw == 'auto':
+            hot_policy = 1 if hot_cap < stage_cap else 0
+            hot_bytes_per_layer = hot_cap * nkv * hd * 2 * 2
+            reserve_mb = int(os.environ.get(
+                'FLASHRT_QWEN36_FP8_HOT_STAGE_RESERVE_MB', '1024') or '0')
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info()
+                hot_mem_cap = max(
+                    0, (int(free_bytes) - (reserve_mb << 20))
+                    // hot_bytes_per_layer)
+            except Exception:
+                hot_mem_cap = hot_policy
+            hot_layers = max(
+                0, min(16 - stage_layers, hot_policy, int(hot_mem_cap)))
+        else:
+            hot_layers = max(
+                0, min(16 - stage_layers, int(hot_layers_raw)))
+        self._fp8_hot_stage_start_layer = stage_layers
+        self._fp8_hot_stage_layers = hot_layers
+        self._fp8_hot_stage_cap = hot_cap
+        self._fp8_hot_stage_valid_end = [0] * hot_layers
+        if hot_layers > 0:
+            self._fp8_k_stage_hot = torch.empty(
+                hot_layers, hot_cap, nkv, hd,
+                dtype=bf16, device=d)
+            self._fp8_v_stage_hot = torch.empty_like(
+                self._fp8_k_stage_hot)
+
+    def _fp8_xqa_enabled(
+            self, q_seq: int | None = None,
+            end_pos: int | None = None) -> bool:
+        if os.environ.get('FLASHRT_QWEN36_FP8_XQA', '1') == '0':
+            return False
+        if q_seq is not None and int(q_seq) > self._MAX_PUBLIC_SPEC_K + 1:
+            return False
+        if end_pos is not None:
+            min_ctx_raw = os.environ.get(
+                'FLASHRT_QWEN36_FP8_XQA_MIN_CTX', 'auto') or '0'
+            if min_ctx_raw.lower() == 'auto':
+                if not self._fp8_xqa_auto_bucket_enabled(
+                        q_seq, int(end_pos)):
+                    return False
+            else:
+                min_ctx = int(min_ctx_raw)
+                if int(end_pos) < min_ctx:
+                    return False
+        try:
+            from flash_rt import flash_rt_kernels as fvk
+            return hasattr(fvk, 'qwen36_flashinfer_xqa_bf16_fp8kv_spec')
+        except Exception:
+            return False
+
+    def _fp8_xqa_auto_bucket_enabled(
+            self, q_seq: int | None, end_pos: int) -> bool:
+        """Measured default XQA policy for short and long FP8-KV verify."""
+        end_pos = int(end_pos)
+        if end_pos < 6144:
+            return False
+        if end_pos < 12288:
+            return True
+        if end_pos < 24576:
+            return False
+        return True
+
+    def _fp8_xqa_seq_lens(self, end_pos: int):
+        import torch
+
+        end_pos = int(end_pos)
+        t = self._fp8_xqa_seqlens.get(end_pos)
+        if t is None:
+            t = torch.full(
+                (1, 1), end_pos, dtype=torch.uint32, device=self.device)
+            self._fp8_xqa_seqlens[end_pos] = t
+        return t
+
+    def _fp8_xqa_mask(self, q_seq: int):
+        import torch
+
+        q_seq = int(q_seq)
+        t = self._fp8_xqa_masks.get(q_seq)
+        if t is None:
+            words = (q_seq + 31) // 32
+            rows = torch.zeros((q_seq, words), dtype=torch.int32)
+            for i in range(q_seq):
+                upto = i + 1
+                full = upto // 32
+                rem = upto % 32
+                if full:
+                    rows[i, :full] = -1
+                if rem:
+                    rows[i, full] = (1 << rem) - 1
+            t = rows.to(device=self.device)
+            self._fp8_xqa_masks[q_seq] = t
+        return t
+
+    def _fp8_xqa_attn(self, layer: int, end_pos: int, q_seq: int,
+                      stream: int) -> None:
+        from flash_rt import flash_rt_kernels as fvk
+
+        page = int(self._fp8_xqa_page)
+        max_seq_len = ((int(end_pos) + page - 1) // page) * page
+        q_view = self._attn.Q_buf[:, :q_seq].view(1, 1, q_seq, 24, 256)
+        o_view = self._attn.O_buf[:, :q_seq].view(1, 1, q_seq, 24, 256)
+        fvk.qwen36_flashinfer_xqa_bf16_fp8kv_spec(
+            q_view.data_ptr(),
+            self._fp8_K_cache[layer].data_ptr(),
+            self._fp8_V_cache[layer].data_ptr(),
+            self._fp8_xqa_page_table.data_ptr(),
+            self._fp8_xqa_seq_lens(end_pos).data_ptr(),
+            self._fp8_xqa_mask(q_seq).data_ptr(),
+            o_view.data_ptr(),
+            self._fp8_xqa_semaphores.data_ptr(),
+            self._fp8_xqa_scratch.data_ptr(),
+            max_seq_len,
+            int(q_seq),
+            int(self._attn._num_sms),
+            1.0,
+            1.0,
+            bool(self._fp8_xqa_enable_pdl),
+            page * 4 * 256,
+            4 * 256,
+            256,
+            stream,
+        )
+
+    def _fp8_mark_dequant_valid_end(self, end_pos: int) -> None:
+        end_pos = int(end_pos)
+        valid = getattr(self, '_fp8_stage_valid_end', None)
+        if valid is not None:
+            for i in range(len(valid)):
+                valid[i] = end_pos
+        hot_valid = getattr(self, '_fp8_hot_stage_valid_end', None)
+        if hot_valid is not None:
+            for i in range(len(hot_valid)):
+                hot_valid[i] = end_pos
+
+    def _fp8_write_kv(self, layer: int, pos_start: int, pos_end: int,
+                      k, v) -> None:
+        from flash_rt import flash_rt_kernels as fvk
+        import torch
+
+        S = int(pos_end) - int(pos_start)
+        if S <= 0:
+            return
+        s = torch.cuda.current_stream().cuda_stream
+        n = S * 4 * 256
+        k_dst = self._fp8_K_cache[layer, pos_start:pos_end]
+        v_dst = self._fp8_V_cache[layer, pos_start:pos_end]
+        # k/v are produced by fixed contiguous scratch buffers in the
+        # verify forward. Avoid a defensive Tensor.contiguous() here so
+        # the FP8-KV write path stays allocation-free before graph capture.
+        fvk.quantize_fp8_static(
+            k.data_ptr(), k_dst.data_ptr(),
+            self._fp8_kv_scale.data_ptr(), n, s)
+        fvk.quantize_fp8_static(
+            v.data_ptr(), v_dst.data_ptr(),
+            self._fp8_kv_scale.data_ptr(), n, s)
+
+    def _fp8_stage_for_layer(self, layer: int, end_pos: int):
+        from flash_rt import flash_rt_kernels as fvk
+        import torch
+
+        end_pos = int(end_pos)
+        if end_pos <= 0:
+            return self._fp8_k_stage, self._fp8_v_stage
+        stage_layers = int(getattr(self, '_fp8_stage_layers', 0))
+        if (stage_layers > 0
+                and layer < stage_layers
+                and end_pos <= int(getattr(self, '_fp8_stage_cap', 0))):
+            return self._fp8_stage_for_layer_into(
+                layer, end_pos,
+                self._fp8_k_stage_per_layer[layer],
+                self._fp8_v_stage_per_layer[layer],
+                self._fp8_stage_valid_end,
+                layer)
+        hot_start = int(getattr(self, '_fp8_hot_stage_start_layer', 0))
+        hot_layers = int(getattr(self, '_fp8_hot_stage_layers', 0))
+        hot_idx = layer - hot_start
+        if (hot_layers > 0
+                and hot_idx >= 0
+                and hot_idx < hot_layers
+                and end_pos <= int(getattr(
+                    self, '_fp8_hot_stage_cap', 0))):
+            return self._fp8_stage_for_layer_into(
+                layer, end_pos,
+                self._fp8_k_stage_hot[hot_idx],
+                self._fp8_v_stage_hot[hot_idx],
+                self._fp8_hot_stage_valid_end,
+                hot_idx)
+        s = torch.cuda.current_stream().cuda_stream
+        n = end_pos * 4 * 256
+        if hasattr(fvk, 'dequantize_fp8_static_bf16_2'):
+            fvk.dequantize_fp8_static_bf16_2(
+                self._fp8_K_cache[layer, :end_pos].data_ptr(),
+                self._fp8_V_cache[layer, :end_pos].data_ptr(),
+                self._fp8_k_stage[:end_pos].data_ptr(),
+                self._fp8_v_stage[:end_pos].data_ptr(),
+                self._fp8_kv_scale.data_ptr(),
+                self._fp8_kv_scale.data_ptr(), n, s)
+        else:
+            fvk.dequantize_fp8_static_bf16(
+                self._fp8_K_cache[layer, :end_pos].data_ptr(),
+                self._fp8_k_stage[:end_pos].data_ptr(),
+                self._fp8_kv_scale.data_ptr(), n, s)
+            fvk.dequantize_fp8_static_bf16(
+                self._fp8_V_cache[layer, :end_pos].data_ptr(),
+                self._fp8_v_stage[:end_pos].data_ptr(),
+                self._fp8_kv_scale.data_ptr(), n, s)
+        return self._fp8_k_stage, self._fp8_v_stage
+
+    def _fp8_stage_for_layer_into(
+            self, layer: int, end_pos: int, k_stage, v_stage,
+            valid_list: list[int], valid_idx: int):
+        from flash_rt import flash_rt_kernels as fvk
+        import torch
+
+        valid = int(valid_list[valid_idx])
+        end_pos = int(end_pos)
+        if valid < end_pos:
+            s = torch.cuda.current_stream().cuda_stream
+            rows = end_pos - valid
+            n = rows * 4 * 256
+            if hasattr(fvk, 'dequantize_fp8_static_bf16_2'):
+                fvk.dequantize_fp8_static_bf16_2(
+                    self._fp8_K_cache[layer, valid:end_pos].data_ptr(),
+                    self._fp8_V_cache[layer, valid:end_pos].data_ptr(),
+                    k_stage[valid:end_pos].data_ptr(),
+                    v_stage[valid:end_pos].data_ptr(),
+                    self._fp8_kv_scale.data_ptr(),
+                    self._fp8_kv_scale.data_ptr(), n, s)
+            else:
+                fvk.dequantize_fp8_static_bf16(
+                    self._fp8_K_cache[layer, valid:end_pos].data_ptr(),
+                    k_stage[valid:end_pos].data_ptr(),
+                    self._fp8_kv_scale.data_ptr(), n, s)
+                fvk.dequantize_fp8_static_bf16(
+                    self._fp8_V_cache[layer, valid:end_pos].data_ptr(),
+                    v_stage[valid:end_pos].data_ptr(),
+                    self._fp8_kv_scale.data_ptr(), n, s)
+            valid_list[valid_idx] = end_pos
+        return k_stage, v_stage
+
     def _load_turboquant_packed(self, max_seq_tq: int = 65536,
                                   b_v: int = 4, b_k_total: int = 4,
                                   bit_packed: bool = False) -> None:
@@ -5929,28 +8144,117 @@ class Qwen36TorchFrontendRtx:
             self._tq_max_seq = max_seq_tq
 
             # Phase 3B-β: per-layer BF16 staging for incremental dequant.
-            # Enabled only at ≤ BETA_MAX_SEQ (β-0.2 probe: 64K user ctx
-            # = 65552 max_seq leaves 6.8 GB headroom — safe; 128K user
-            # ctx leaves 1 GB and OOMs under forward overhead).  100000
-            # is the cushion-safe upper bound for 64K user ctx.  Above
-            # threshold, fallback to the shared single-layer stage above.
-            BETA_MAX_SEQ = 100000
-            self._tq_use_per_layer = (max_seq_tq <= BETA_MAX_SEQ)
+            # Staged layers dequant only newly-written rows while unstaged
+            # layers fall back to shared full-prefix dequant.  This is the
+            # main speed/memory knob for 128K+ decode.
+            #
+            # The stage capacity may be smaller than max_seq_tq.  This lets
+            # a 256K-capable server prioritize the 128K/200K buckets with
+            # multiple staged layers instead of spending all VRAM on a single
+            # 256K-wide staged layer.  Requests beyond the staged capacity
+            # remain correct and use the shared full-prefix fallback.
+            stage_reserve_mb = int(os.environ.get(
+                'FLASHRT_QWEN36_TQ_PER_LAYER_STAGE_RESERVE_MB', '1024'))
+            stage_cap_raw = os.environ.get(
+                'FLASHRT_QWEN36_TQ_PER_LAYER_STAGE_CAP', 'auto').lower()
+            if stage_cap_raw == 'auto':
+                # 200K serving envelope: prompt=204800 plus decode warm slack.
+                stage_cap = min(max_seq_tq, 204864)
+            else:
+                stage_cap = max(1, min(max_seq_tq, int(stage_cap_raw)))
+            stage_layers_raw = os.environ.get(
+                'FLASHRT_QWEN36_TQ_PER_LAYER_STAGE_LAYERS', 'auto').lower()
+            if stage_layers_raw == 'auto':
+                if stage_cap <= 100000:
+                    policy_cap = 16
+                elif stage_cap <= 132000:
+                    policy_cap = 8
+                elif stage_cap <= 205000:
+                    policy_cap = 4
+                else:
+                    policy_cap = 3
+                if max_seq_tq > stage_cap + 4096 and stage_cap > 132000:
+                    policy_cap = min(policy_cap, 3)
+                # One staged layer holds K and V:
+                # stage_cap * num_kv * head_dim * sizeof(bf16) * 2.
+                bytes_per_layer = stage_cap * 4 * 256 * 2 * 2
+                try:
+                    free_bytes, _ = torch.cuda.mem_get_info()
+                    reserve = max(0, stage_reserve_mb) << 20
+                    mem_cap = max(0, (int(free_bytes) - reserve)
+                                  // bytes_per_layer)
+                except Exception:
+                    # If CUDA memory introspection is unavailable, keep the
+                    # old safe envelope plus a small 200K-priority tier.
+                    if stage_cap <= 100000:
+                        mem_cap = 16
+                    elif stage_cap <= 132000:
+                        mem_cap = 8
+                    else:
+                        mem_cap = 3
+                stage_layers = max(0, min(16, policy_cap, int(mem_cap)))
+            else:
+                stage_layers = max(0, min(16, int(stage_layers_raw)))
+            self._tq_per_layer_stage_layers = stage_layers
+            self._tq_per_layer_stage_cap = stage_cap
+            self._tq_use_per_layer = stage_layers > 0
             if self._tq_use_per_layer:
                 self._tq_k_stage_per_layer = torch.empty(
-                    16, max_seq_tq, 4, 256,
+                    stage_layers, stage_cap, 4, 256,
                     dtype=torch.bfloat16, device=self.device)
                 self._tq_v_stage_per_layer = torch.empty_like(
                     self._tq_k_stage_per_layer)
+
+            hot_cap_raw = os.environ.get(
+                'FLASHRT_QWEN36_TQ_HOT_STAGE_CAP', 'auto').lower()
+            if hot_cap_raw == 'auto':
+                hot_cap = min(max_seq_tq, 132096)
+            else:
+                hot_cap = max(1, min(max_seq_tq, int(hot_cap_raw)))
+            hot_layers_raw = os.environ.get(
+                'FLASHRT_QWEN36_TQ_HOT_STAGE_LAYERS', 'auto').lower()
+            if hot_layers_raw == 'auto':
+                # If the server is sized for a 200K/256K envelope, the
+                # long-cap per-layer stage can only cover a few layers on
+                # 32GB cards. Reuse the remaining VRAM for a 128K hot tier
+                # so common 128K requests still avoid shared full-prefix
+                # dequant on more layers while 200K+ remains correct.
+                hot_policy = 0
+                if hot_cap <= 132096 and stage_cap > hot_cap:
+                    hot_policy = max(0, min(1, 8 - stage_layers))
+                hot_bytes_per_layer = hot_cap * 4 * 256 * 2 * 2
+                try:
+                    free_bytes, _ = torch.cuda.mem_get_info()
+                    hot_reserve_mb = int(os.environ.get(
+                        'FLASHRT_QWEN36_TQ_HOT_STAGE_RESERVE_MB', '1536'))
+                    reserve = max(0, hot_reserve_mb) << 20
+                    hot_mem_cap = max(0, (int(free_bytes) - reserve)
+                                      // hot_bytes_per_layer)
+                except Exception:
+                    hot_mem_cap = hot_policy
+                hot_layers = max(
+                    0, min(16 - stage_layers, hot_policy, int(hot_mem_cap)))
+            else:
+                hot_layers = max(
+                    0, min(16 - stage_layers, int(hot_layers_raw)))
+            self._tq_hot_stage_start_layer = stage_layers
+            self._tq_hot_stage_layers = hot_layers
+            self._tq_hot_stage_cap = hot_cap
+            if hot_layers > 0:
+                self._tq_k_stage_hot = torch.empty(
+                    hot_layers, hot_cap, 4, 256,
+                    dtype=torch.bfloat16, device=self.device)
+                self._tq_v_stage_hot = torch.empty_like(
+                    self._tq_k_stage_hot)
+                self._tq_hot_stage_valid_end = [0] * hot_layers
 
     def _tq_dequant_into_stage(self, layer: int, end_pos: int) -> None:
         """Batched dequant TQ cache layer rows [0, end_pos) into BF16
         staging buffers _tq_k_stage / _tq_v_stage.
 
         Phase 3A B9: when the kernels are available and the cache is in
-        packed (B8) layout, use the CUDA unpack + cuBLAS GEMM + combine
-        fast path (≈ 0.68 ms @ 32K vs 3.0 ms Python).  Otherwise fall
-        back to the Python read_kv path.
+        packed (B8) layout, use the CUDA unpack + explicit GEMM + combine
+        fast path.  Otherwise fall back to the Python read_kv path.
 
         Phase 3B α-S3 (CUTLASS): set FVK_QWEN36_TQ_CUTLASS=1 to route
         through CUTLASS EVT-fused dequant — eliminates the fp32
@@ -5962,15 +8266,24 @@ class Qwen36TorchFrontendRtx:
         try:
             from flash_rt import flash_rt_kernels as _fvk
             fast_ok = (cache.packed
-                       and hasattr(_fvk, 'tq_unpack_packed_bf16')
-                       and hasattr(_fvk, 'tq_combine_kv_bf16'))
+                       and hasattr(_fvk, 'tq_unpack_packed_fp32')
+                       and hasattr(_fvk, 'tq_fp32_gemm_lt_algo')
+                       and hasattr(_fvk, 'tq_fp32_gemm_fp32')
+                       and hasattr(_fvk, 'tq_combine_kv_fp32_in'))
             cutlass_ok = (fast_ok
                           and hasattr(_fvk, 'tq_cutlass_k_combine')
                           and hasattr(_fvk, 'tq_cutlass_v_combine'))
         except ImportError:
             fast_ok = False
             cutlass_ok = False
-        if cutlass_ok and os.environ.get('FVK_QWEN36_TQ_CUTLASS', '1') == '1':
+        cutlass_mode = os.environ.get(
+            'FVK_QWEN36_TQ_CUTLASS', 'auto').lower()
+        use_cutlass = (
+            cutlass_mode == '1'
+            or (cutlass_mode == 'auto'
+                and int(getattr(cache, 'max_seq', 0)) <= 132000)
+        )
+        if cutlass_ok and use_cutlass:
             self._tq_dequant_cutlass(layer, end_pos)
             return
         if fast_ok:
@@ -6058,16 +8371,22 @@ class Qwen36TorchFrontendRtx:
         )
 
         # 2. Compute per-row scalars (in fp32, on device).
-        # cache.k_norm/k_rnorm are fp16; cast to fp32 for CUTLASS aux load.
-        norm_k_fp32.copy_(cache.k_norm[layer, :end_pos].view(-1).float())
-        norm_v_fp32.copy_(cache.v_norm[layer, :end_pos].view(-1).float())
-        torch.mul(
-            cache.k_rnorm[layer, :end_pos].view(-1).float(), coef,
-            out=coef_rnorm)
+        # cache.k_norm/k_rnorm/v_norm are fp16; convert and scale in one
+        # CUDA kernel instead of three PyTorch dispatches.
+        fvk.qwen36_tq_prepare_scalars(
+            cache.k_norm[layer, :end_pos].data_ptr(),
+            cache.k_rnorm[layer, :end_pos].data_ptr(),
+            cache.v_norm[layer, :end_pos].data_ptr(),
+            norm_k_fp32.data_ptr(), coef_rnorm.data_ptr(),
+            norm_v_fp32.data_ptr(), M, coef, s,
+        )
 
         # 3. Sr = qjl_fp32 @ jl_fp32 → fp32 (B9 precision, no bf16 cast).
         jl_fp32_layer = setup.jl[layer]
-        torch.matmul(qjl_fp, jl_fp32_layer, out=sr_fp)
+        fvk.tq_fp32_gemm_tf32(
+            qjl_fp.data_ptr(), jl_fp32_layer.data_ptr(),
+            sr_fp.data_ptr(), M, d, d, s,
+        )
 
         # 4. CUTLASS K combine: yk @ Π^T → bf16 K_stage with combine inline.
         rot_T = setup._cu_rot_T_bf16[layer]
@@ -6085,6 +8404,83 @@ class Qwen36TorchFrontendRtx:
             self._tq_v_stage[:end_pos].data_ptr(),
             M, d, d, s,
         )
+
+    def _tq_stage_for_layer(self, layer: int, end_pos: int):
+        """Return BF16 K/V staging for ``layer`` up to ``end_pos``.
+
+        In long-context mode we keep an optional per-layer BF16 stage.
+        When available, only newly-written TQ rows are dequantized via
+        ``read_kv_fast_window``; previous rows stay resident and FA2 can
+        read the full prefix from the per-layer stage. This removes the
+        repeated full-prefix dequant from chunked prefill and TQ verify.
+        """
+        cache = self._tq_cache_packed
+        use_per_layer = bool(getattr(self, '_tq_use_per_layer', False))
+        has_stage = (
+            use_per_layer
+            and hasattr(self, '_tq_k_stage_per_layer')
+            and hasattr(self, '_tq_v_stage_per_layer')
+            and layer < int(getattr(
+                self, '_tq_per_layer_stage_layers', 0))
+            and end_pos <= int(getattr(
+                self, '_tq_per_layer_stage_cap', 0))
+        )
+        if not has_stage:
+            hot_start = int(getattr(self, '_tq_hot_stage_start_layer', 0))
+            hot_layers = int(getattr(self, '_tq_hot_stage_layers', 0))
+            hot_idx = layer - hot_start
+            has_hot_stage = (
+                hot_layers > 0
+                and hasattr(self, '_tq_k_stage_hot')
+                and hasattr(self, '_tq_v_stage_hot')
+                and hot_idx >= 0
+                and hot_idx < hot_layers
+                and end_pos <= int(getattr(self, '_tq_hot_stage_cap', 0))
+            )
+            if not has_hot_stage:
+                self._tq_dequant_into_stage(layer, end_pos)
+                return self._tq_k_stage, self._tq_v_stage
+            return self._tq_stage_for_layer_into(
+                layer, end_pos,
+                self._tq_k_stage_hot[hot_idx],
+                self._tq_v_stage_hot[hot_idx],
+                self._tq_hot_stage_valid_end,
+                hot_idx)
+
+        k_stage = self._tq_k_stage_per_layer[layer]
+        v_stage = self._tq_v_stage_per_layer[layer]
+        return self._tq_stage_for_layer_into(
+            layer, end_pos, k_stage, v_stage,
+            cache._dequant_valid_end, layer)
+
+    def _tq_stage_for_layer_into(self, layer: int, end_pos: int,
+                                 k_stage, v_stage,
+                                 valid_list: list[int], valid_idx: int):
+        cache = self._tq_cache_packed
+        valid_end = int(valid_list[valid_idx])
+        if valid_end < end_pos:
+            try:
+                from flash_rt import flash_rt_kernels as _fvk
+                window_ok = (
+                    cache.packed
+                    and hasattr(_fvk, 'tq_unpack_packed_fp32')
+                    and hasattr(_fvk, 'tq_fp32_gemm_lt_algo')
+                    and hasattr(_fvk, 'tq_fp32_gemm_fp32')
+                    and hasattr(_fvk, 'tq_combine_kv_fp32_in')
+                    and hasattr(cache, 'read_kv_fast_window')
+                )
+            except ImportError:
+                window_ok = False
+
+            if window_ok:
+                cache.read_kv_fast_window(
+                    layer, valid_end, end_pos, k_stage, v_stage)
+            else:
+                k_hat, v_hat = cache.read_kv(layer, end_pos)
+                k_stage[:end_pos].copy_(k_hat)
+                v_stage[:end_pos].copy_(v_hat)
+            valid_list[valid_idx] = end_pos
+        return k_stage, v_stage
 
     def _layer_forward_full_nvfp4_tq(self, L: int, h_in, cos, sin,
                                        cur_pos: int):
@@ -6159,26 +8555,16 @@ class Qwen36TorchFrontendRtx:
             self._full_k_norm_out.data_ptr(), 4, 256, eps, s,
         )
 
-        # ---- 5) inline RoPE ----
-        q_for_rope = self._full_q_norm_out.view(1, 1, 24, 256)
-        k_for_rope = self._full_k_norm_out.view(1, 1, 4, 256)
-        cos4 = cos.view(1, 1, 1, 64)
-        sin4 = sin.view(1, 1, 1, 64)
-
-        def _rope_inline(x_in, x_out, tmp):
-            x_out[..., 64:].copy_(x_in[..., 64:])
-            torch.index_select(
-                x_in[..., :64], -1, self._rope_rotate_idx, out=tmp,
-            )
-            tmp[..., :32].neg_()
-            tmp.mul_(sin4)
-            tmp.addcmul_(x_in[..., :64], cos4)
-            x_out[..., :64].copy_(tmp)
-
-        _rope_inline(q_for_rope, self._full_q_rot, self._full_rope_tmp_q)
-        _rope_inline(k_for_rope, self._full_k_rot, self._full_rope_tmp_k)
-        q_rot = self._full_q_rot
-        k_rot = self._full_k_rot
+        # ---- 5) Partial RoPE: Q staged for FA2, K staged for TQ write ----
+        k_for_cache = self._full_k_rot.view(1, 4, 256)
+        fvk.qwen36_partial_rope_qk_bf16(
+            self._full_q_norm_out.data_ptr(),
+            self._full_k_norm_out.data_ptr(),
+            cos.data_ptr(), sin.data_ptr(),
+            self._attn.Q_buf[:, :1].data_ptr(),
+            k_for_cache.data_ptr(),
+            1, 24, 4, 256, 64, s,
+        )
 
         # ---- 6) v_proj ----
         fvk.fp4_w4a16_gemm_sm120_bf16out(
@@ -6192,13 +8578,11 @@ class Qwen36TorchFrontendRtx:
         v_new = kv_proj_out_buf[:1].view(1, 4, 256)
 
         # ---- 7) Write K/V to TQ packed cache (no BF16 cache write) ----
-        # k_rot shape (1, 1, 4, 256) -> (1, 4, 256)
-        k_for_cache = k_rot.view(1, 4, 256)
         v_for_cache = v_new
         cache = self._tq_cache_packed
         # B9-S10: bit-exact capture-safe write_kv_fast (4 small CUDA
-        # kernels + 3 cuBLAS GEMMs via torch.matmul).  Auto-route when
-        # available — read-back cosine 1.000000 vs Python ref.
+        # kernels + explicit GEMM wrappers by default).  Auto-route when
+        # available.
         if cache.packed and hasattr(fvk, 'tq_write_k1_unit_norm'):
             cache.write_kv_fast(
                 full_rank, cur_pos, cur_pos + 1, k_for_cache, v_for_cache)
@@ -6208,15 +8592,12 @@ class Qwen36TorchFrontendRtx:
 
         # ---- 8) Dequant TQ[0:cur_pos+1] into BF16 staging ----
         kv_seq = cur_pos + 1
-        self._tq_dequant_into_stage(full_rank, kv_seq)
+        k_stage, v_stage = self._tq_stage_for_layer(full_rank, kv_seq)
 
-        # ---- 9) Stage Q + run FA2 directly (read from staging) ----
-        self._attn.Q_buf[:, :1].copy_(q_rot)
+        # ---- 9) Run FA2 directly (Q staged above; K/V from staging) ----
         scaling = float(self._cfg['head_dim']) ** -0.5
-
-        # Build views for _fa2_fwd: K, V shape (1, kv_seq, 4, 256).
-        k_view = self._tq_k_stage[:kv_seq].view(1, kv_seq, 4, 256)
-        v_view = self._tq_v_stage[:kv_seq].view(1, kv_seq, 4, 256)
+        k_view = k_stage[:kv_seq].view(1, kv_seq, 4, 256)
+        v_view = v_stage[:kv_seq].view(1, kv_seq, 4, 256)
         q_view = self._attn.Q_buf[:, :1]  # (1, 1, 24, 256)
         o_view = self._attn.O_buf[:, :1]
         self._attn._fa2_fwd(
@@ -6229,10 +8610,14 @@ class Qwen36TorchFrontendRtx:
             num_heads_q=self._attn.NUM_Q_HEADS,
             num_heads_kv=self._attn.NUM_KV_HEADS,
             head_dim=self._attn.HEAD_DIM,
-            q_strides=(q_view.stride(0), q_view.stride(1), q_view.stride(2)),
-            k_strides=(k_view.stride(0), k_view.stride(1), k_view.stride(2)),
-            v_strides=(v_view.stride(0), v_view.stride(1), v_view.stride(2)),
-            o_strides=(o_view.stride(0), o_view.stride(1), o_view.stride(2)),
+            q_strides=(q_view.stride(0), q_view.stride(1),
+                       q_view.stride(2)),
+            k_strides=(k_view.stride(0), k_view.stride(1),
+                       k_view.stride(2)),
+            v_strides=(v_view.stride(0), v_view.stride(1),
+                       v_view.stride(2)),
+            o_strides=(o_view.stride(0), o_view.stride(1),
+                       o_view.stride(2)),
             softmax_scale=scaling,
             num_sms=self._attn._num_sms,
             stream=s,
@@ -6242,8 +8627,10 @@ class Qwen36TorchFrontendRtx:
         # ---- 10) output gate + o_proj + residual + post-attn + MLP ----
         # (rest identical to _layer_forward_full_nvfp4)
         attn_flat = attn_out.reshape(1, 1, 24 * 256)
-        torch.sigmoid(gate_flat, out=self._full_gate_sig)
-        torch.mul(attn_flat, self._full_gate_sig, out=self._full_gated)
+        fvk.sigmoid_mul_qwen36_bf16(
+            gate_flat.data_ptr(), attn_flat.data_ptr(),
+            self._full_gated.data_ptr(), 24 * 256, s,
+        )
         gated = self._full_gated
 
         ap_6144, sf_6144, _ = self._nvfp4_scratch[(5120, 6144)]
@@ -6263,7 +8650,10 @@ class Qwen36TorchFrontendRtx:
         )
 
         attn_proj = out_op_buf[:1].view(1, 1, 5120)
-        torch.add(h_in, attn_proj, out=self._res_mid)
+        fvk.add_bf16_out(
+            h_in.data_ptr(), attn_proj.data_ptr(),
+            self._res_mid.data_ptr(), 5120, s,
+        )
         h_post = self._res_mid
 
         h_post_view = h_post.view(1, 5120)
@@ -6321,7 +8711,10 @@ class Qwen36TorchFrontendRtx:
         mlp_out = down_out_buf[:1].view(1, 1, 5120)
 
         h_out = self._layer_out_a if (L % 2 == 0) else self._layer_out_b
-        torch.add(h_post, mlp_out, out=h_out)
+        fvk.add_bf16_out(
+            h_post.data_ptr(), mlp_out.data_ptr(),
+            h_out.data_ptr(), 5120, s,
+        )
         return h_out
 
     def forward_own_decode_nvfp4_tq(self, token_id, cos_pos, sin_pos,
@@ -6348,10 +8741,13 @@ class Qwen36TorchFrontendRtx:
                 [token_id], device=self.device, dtype=torch.long)
         if token_id.ndim == 1:
             token_id = token_id.view(1, 1)
-        embed_t = self._weights.anchors[0]
-        h = embed_t[token_id.view(-1)].view(1, 1, hidden).contiguous()
-        if h.dtype != bf16:
-            h = h.to(bf16)
+        fvk.qwen36_embedding_lookup_bf16(
+            token_id.view(-1).data_ptr(),
+            int(self._weights.ptrs['embed_w']),
+            self._embed_buf.data_ptr(),
+            1, hidden, s,
+        )
+        h = self._embed_buf
 
         for L in range(self._cfg['num_hidden_layers']):
             t = types[L]
@@ -6763,9 +9159,10 @@ class Qwen36TorchFrontendRtx:
             raise RuntimeError(
                 'DFlash drafter not loaded — call _load_dflash_drafter '
                 'first or set FLASHRT_QWEN36_DFLASH_CKPT_DIR')
-        if K < 1 or K + 1 > self.MAX_Q_SEQ:
+        max_spec_k = min(self.MAX_Q_SEQ - 1, self._MAX_PUBLIC_SPEC_K)
+        if K < 1 or K > max_spec_k:
             raise ValueError(
-                f'K={K} out of range — need 1<=K<={self.MAX_Q_SEQ - 1}')
+                f'K={K} out of range — need 1<=K<={max_spec_k}')
 
         prompt_len = int(input_ids.shape[1])
 
@@ -6988,6 +9385,18 @@ class Qwen36TorchFrontendRtx:
         # β: independent prompt → per-layer dequant stage is stale.
         if hasattr(self, '_tq_cache_packed'):
             self._tq_cache_packed.invalidate_all()
+        hot_valid = getattr(self, '_tq_hot_stage_valid_end', None)
+        if hot_valid is not None:
+            for i in range(len(hot_valid)):
+                hot_valid[i] = 0
+        fp8_valid = getattr(self, '_fp8_stage_valid_end', None)
+        if fp8_valid is not None:
+            for i in range(len(fp8_valid)):
+                fp8_valid[i] = 0
+        fp8_hot_valid = getattr(self, '_fp8_hot_stage_valid_end', None)
+        if fp8_hot_valid is not None:
+            for i in range(len(fp8_hot_valid)):
+                fp8_hot_valid[i] = 0
 
     def buffer_summary(self) -> dict:
         """Return a summary of pre-allocated buffer sizes (debug / tests)."""

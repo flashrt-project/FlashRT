@@ -32,6 +32,9 @@
 #ifdef ENABLE_TINYFP8_KERNELS
 #include "kernels/megakernel/tinyfp8_kernels_sm120.cuh"
 #endif
+#ifdef ENABLE_QWEN36_FLASHINFER_XQA
+#include "kernels/qwen36_flashinfer_xqa.cuh"
+#endif
 #ifdef ENABLE_CUTLASS_SM120_NVFP4_W4A16
 #include "quantize/nvfp4_sf_reshape_sm120.cuh"
 #endif
@@ -125,6 +128,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/silu_mul_to_nvfp4_swizzled.cuh"
 #include "kernels/rms_norm_gated_silu_qwen36.cuh"
 #include "kernels/silu_mul_qwen36.cuh"
+#include "kernels/qwen36_misc.cuh"
 #include "kernels/bf16_matvec_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36.cuh"
 #include "kernels/fp4_w4a4_matvec_sm120.cuh"
@@ -228,6 +232,38 @@ extern "C" void tq_fp32_gemm_tf32_launch(
     const void* a_fp32, const void* b_fp32,
     void* c_fp32,
     int M, int N, int K,
+    cudaStream_t stream);
+extern "C" void tq_fp32_gemm_fp32_launch(
+    const void* a_fp32, const void* b_fp32,
+    void* c_fp32,
+    int M, int N, int K,
+    cudaStream_t stream);
+extern "C" void tq_fp32_gemm_fp32_bt_launch(
+    const void* a_fp32, const void* b_fp32,
+    void* c_fp32,
+    int M, int N, int K,
+    cudaStream_t stream);
+extern "C" void tq_fp32_gemm_lt_launch(
+    const void* a_fp32, const void* b_fp32,
+    void* c_fp32,
+    int M, int N, int K,
+    cudaStream_t stream);
+extern "C" void tq_fp32_gemm_lt_bt_launch(
+    const void* a_fp32, const void* b_fp32,
+    void* c_fp32,
+    int M, int N, int K,
+    cudaStream_t stream);
+extern "C" void tq_fp32_gemm_lt_algo_launch(
+    const void* a_fp32, const void* b_fp32,
+    void* c_fp32,
+    int M, int N, int K,
+    int algo_idx,
+    cudaStream_t stream);
+extern "C" void tq_fp32_gemm_lt_bt_algo_launch(
+    const void* a_fp32, const void* b_fp32,
+    void* c_fp32,
+    int M, int N, int K,
+    int algo_idx,
     cudaStream_t stream);
 extern "C" void wmma_probe_launch(
     const void* a_bf16, const void* b_bf16, void* c_fp32,
@@ -1858,6 +1894,34 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                         nbytes, to_stream(stream));
     }, py::arg("dst"), py::arg("src"), py::arg("nbytes"), py::arg("stream") = 0);
 
+    m.def("concat2_bf16", [](uintptr_t a, uintptr_t b, uintptr_t out,
+                             int rows, int cols_a, int cols_b,
+                             uintptr_t stream) {
+        concat2_bf16(
+            reinterpret_cast<const __nv_bfloat16*>(a),
+            reinterpret_cast<const __nv_bfloat16*>(b),
+            reinterpret_cast<__nv_bfloat16*>(out),
+            rows, cols_a, cols_b, to_stream(stream));
+    }, py::arg("a"), py::arg("b"), py::arg("out"),
+       py::arg("rows"), py::arg("cols_a"), py::arg("cols_b"),
+       py::arg("stream") = 0);
+
+    m.def("cuda_read_i32_sync", [](uintptr_t src, uintptr_t stream) {
+        int host = 0;
+        cudaStream_t st = to_stream(stream);
+        cudaError_t err = cudaMemcpyAsync(
+            &host, reinterpret_cast<const void*>(src), sizeof(int),
+            cudaMemcpyDeviceToHost, st);
+        if (err != cudaSuccess) {
+            throw std::runtime_error(cudaGetErrorString(err));
+        }
+        err = cudaStreamSynchronize(st);
+        if (err != cudaSuccess) {
+            throw std::runtime_error(cudaGetErrorString(err));
+        }
+        return host;
+    }, py::arg("src"), py::arg("stream") = 0);
+
     m.def("gpu_fill_neginf_fp16", [](uintptr_t dst, int n, uintptr_t stream) {
         extern void gpu_fill_neginf_fp16(__half*, int, cudaStream_t);
         gpu_fill_neginf_fp16(reinterpret_cast<__half*>(dst), n, to_stream(stream));
@@ -2367,6 +2431,78 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("M"), py::arg("N"), py::arg("K"),
         py::arg("stream") = 0);
 
+    m.def("tq_fp32_gemm_fp32",
+        [](uintptr_t a_fp32, uintptr_t b_fp32, uintptr_t c_fp32,
+           int M, int N, int K, uintptr_t stream) {
+            tq_fp32_gemm_fp32_launch(
+                to_ptr(a_fp32), to_ptr(b_fp32),
+                reinterpret_cast<void*>(c_fp32),
+                M, N, K, to_stream(stream));
+        },
+        py::arg("a_fp32"), py::arg("b_fp32"), py::arg("c_fp32"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("stream") = 0);
+
+    m.def("tq_fp32_gemm_fp32_bt",
+        [](uintptr_t a_fp32, uintptr_t b_fp32, uintptr_t c_fp32,
+           int M, int N, int K, uintptr_t stream) {
+            tq_fp32_gemm_fp32_bt_launch(
+                to_ptr(a_fp32), to_ptr(b_fp32),
+                reinterpret_cast<void*>(c_fp32),
+                M, N, K, to_stream(stream));
+        },
+        py::arg("a_fp32"), py::arg("b_fp32"), py::arg("c_fp32"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("stream") = 0);
+
+    m.def("tq_fp32_gemm_lt",
+        [](uintptr_t a_fp32, uintptr_t b_fp32, uintptr_t c_fp32,
+           int M, int N, int K, uintptr_t stream) {
+            tq_fp32_gemm_lt_launch(
+                to_ptr(a_fp32), to_ptr(b_fp32),
+                reinterpret_cast<void*>(c_fp32),
+                M, N, K, to_stream(stream));
+        },
+        py::arg("a_fp32"), py::arg("b_fp32"), py::arg("c_fp32"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("stream") = 0);
+
+    m.def("tq_fp32_gemm_lt_bt",
+        [](uintptr_t a_fp32, uintptr_t b_fp32, uintptr_t c_fp32,
+           int M, int N, int K, uintptr_t stream) {
+            tq_fp32_gemm_lt_bt_launch(
+                to_ptr(a_fp32), to_ptr(b_fp32),
+                reinterpret_cast<void*>(c_fp32),
+                M, N, K, to_stream(stream));
+        },
+        py::arg("a_fp32"), py::arg("b_fp32"), py::arg("c_fp32"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("stream") = 0);
+
+    m.def("tq_fp32_gemm_lt_algo",
+        [](uintptr_t a_fp32, uintptr_t b_fp32, uintptr_t c_fp32,
+           int M, int N, int K, int algo_idx, uintptr_t stream) {
+            tq_fp32_gemm_lt_algo_launch(
+                to_ptr(a_fp32), to_ptr(b_fp32),
+                reinterpret_cast<void*>(c_fp32),
+                M, N, K, algo_idx, to_stream(stream));
+        },
+        py::arg("a_fp32"), py::arg("b_fp32"), py::arg("c_fp32"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("algo_idx"), py::arg("stream") = 0);
+
+    m.def("tq_fp32_gemm_lt_bt_algo",
+        [](uintptr_t a_fp32, uintptr_t b_fp32, uintptr_t c_fp32,
+           int M, int N, int K, int algo_idx, uintptr_t stream) {
+            tq_fp32_gemm_lt_bt_algo_launch(
+                to_ptr(a_fp32), to_ptr(b_fp32),
+                reinterpret_cast<void*>(c_fp32),
+                M, N, K, algo_idx, to_stream(stream));
+        },
+        py::arg("a_fp32"), py::arg("b_fp32"), py::arg("c_fp32"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("algo_idx"), py::arg("stream") = 0);
+
     m.def("tq_bf16_fp32_gemm",
         [](uintptr_t a_bf16, uintptr_t b_bf16, uintptr_t c_fp32,
            int M, int N, int K, uintptr_t stream) {
@@ -2701,6 +2837,25 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                 n, to_stream(stream));
         },
         py::arg("input"), py::arg("output"), py::arg("d_scale"),
+        py::arg("n"), py::arg("stream") = 0);
+
+    m.def("dequantize_fp8_static_bf16_2",
+        [](uintptr_t in0, uintptr_t in1,
+           uintptr_t out0, uintptr_t out1,
+           uintptr_t s0, uintptr_t s1,
+           int n, uintptr_t stream) {
+            dequantize_fp8_static_bf16_2(
+                typed_ptr<__nv_fp8_e4m3>(in0),
+                typed_ptr<__nv_fp8_e4m3>(in1),
+                typed_ptr<__nv_bfloat16>(out0),
+                typed_ptr<__nv_bfloat16>(out1),
+                reinterpret_cast<const float*>(s0),
+                reinterpret_cast<const float*>(s1),
+                n, to_stream(stream));
+        },
+        py::arg("in0"), py::arg("in1"),
+        py::arg("out0"), py::arg("out1"),
+        py::arg("s0"), py::arg("s1"),
         py::arg("n"), py::arg("stream") = 0);
 
     m.def("dequantize_fp8_static_bf16_6",
@@ -3384,6 +3539,39 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("out_bf16"), py::arg("q_scale"), py::arg("k_scale"),
         py::arg("B"), py::arg("Lq"), py::arg("Lk"), py::arg("H"),
         py::arg("softmax_scale"), py::arg("stream") = 0);
+
+    m.def("sage2_qk_int8_sv_f16_bf16_gqa_nhd_d256",
+        [](uintptr_t q_int8, uintptr_t k_int8, uintptr_t v_half,
+           uintptr_t out_bf16, uintptr_t q_scale, uintptr_t k_scale,
+           int B, int Lq, int Lk, int Hq, int Hkv, float softmax_scale,
+           uintptr_t stream) {
+            return flash_rt::attention::sage2::qk_int8_sv_f16_bf16_gqa_nhd_d256(
+                to_ptr(q_int8), to_ptr(k_int8), to_ptr(v_half),
+                to_ptr(out_bf16), to_ptr(q_scale), to_ptr(k_scale),
+                B, Lq, Lk, Hq, Hkv, softmax_scale, to_stream(stream));
+        },
+        py::arg("q_int8"), py::arg("k_int8"), py::arg("v_half"),
+        py::arg("out_bf16"), py::arg("q_scale"), py::arg("k_scale"),
+        py::arg("B"), py::arg("Lq"), py::arg("Lk"),
+        py::arg("Hq"), py::arg("Hkv"), py::arg("softmax_scale"),
+        py::arg("stream") = 0);
+
+    m.def("sage2_qk_int8_sv_f8_bf16_gqa_nhd_d256",
+        [](uintptr_t q_int8, uintptr_t k_int8, uintptr_t v_fp8,
+           uintptr_t out_bf16, uintptr_t q_scale, uintptr_t k_scale,
+           uintptr_t v_scale, int B, int Lq, int Lk, int Hq, int Hkv,
+           float softmax_scale, uintptr_t stream) {
+            return flash_rt::attention::sage2::qk_int8_sv_f8_bf16_gqa_nhd_d256(
+                to_ptr(q_int8), to_ptr(k_int8), to_ptr(v_fp8),
+                to_ptr(out_bf16), to_ptr(q_scale), to_ptr(k_scale),
+                to_ptr(v_scale), B, Lq, Lk, Hq, Hkv, softmax_scale,
+                to_stream(stream));
+        },
+        py::arg("q_int8"), py::arg("k_int8"), py::arg("v_fp8"),
+        py::arg("out_bf16"), py::arg("q_scale"), py::arg("k_scale"),
+        py::arg("v_scale"), py::arg("B"), py::arg("Lq"),
+        py::arg("Lk"), py::arg("Hq"), py::arg("Hkv"),
+        py::arg("softmax_scale"), py::arg("stream") = 0);
 #endif
 
     m.def("quant_per_block_int8_bf16_d128",
@@ -3713,6 +3901,38 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("B"), py::arg("conv_dim"), py::arg("k"),
         py::arg("apply_silu") = true, py::arg("stream") = 0);
 
+    m.def("causal_conv1d_qwen36_update_chunk_bf16",
+        [](uintptr_t x, uintptr_t w, uintptr_t bias,
+           uintptr_t out, uintptr_t state,
+           int B, int S, int conv_dim, int k, bool apply_silu,
+           uintptr_t stream) {
+            flash_rt::kernels::causal_conv1d_qwen36_update_chunk_bf16(
+                to_ptr(x), to_ptr(w),
+                bias ? to_ptr(bias) : nullptr,
+                to_ptr(out), to_ptr(state),
+                B, S, conv_dim, k, apply_silu, to_stream(stream));
+        },
+        py::arg("x"), py::arg("w"), py::arg("bias"),
+        py::arg("out"), py::arg("state"),
+        py::arg("B"), py::arg("S"), py::arg("conv_dim"), py::arg("k"),
+        py::arg("apply_silu") = true, py::arg("stream") = 0);
+
+    m.def("causal_conv1d_qwen36_update_chunk_parallel_bf16",
+        [](uintptr_t x, uintptr_t w, uintptr_t bias,
+           uintptr_t out, uintptr_t state,
+           int B, int S, int conv_dim, int k, bool apply_silu,
+           uintptr_t stream) {
+            flash_rt::kernels::causal_conv1d_qwen36_update_chunk_parallel_bf16(
+                to_ptr(x), to_ptr(w),
+                bias ? to_ptr(bias) : nullptr,
+                to_ptr(out), to_ptr(state),
+                B, S, conv_dim, k, apply_silu, to_stream(stream));
+        },
+        py::arg("x"), py::arg("w"), py::arg("bias"),
+        py::arg("out"), py::arg("state"),
+        py::arg("B"), py::arg("S"), py::arg("conv_dim"), py::arg("k"),
+        py::arg("apply_silu") = true, py::arg("stream") = 0);
+
     // Phase 4.4 — stream-invariant bf16 matvec for Qwen3.6 (replaces F.linear
     // / cuBLASLt for the small in_proj_a/b and the lm_head bf16 GEMM whose
     // per-stream / per-graph algo selection breaks CUDA Graph correctness).
@@ -3746,6 +3966,111 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("x"), py::arg("W"), py::arg("out"),
         py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
 
+    m.def("bf16_matmul_qwen36_ab96_bf16",
+        [](uintptr_t x, uintptr_t W_ab, uintptr_t out_ab,
+           int M, uintptr_t stream) {
+            flash_rt::kernels::bf16_matmul_qwen36_ab96_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(x),
+                reinterpret_cast<const __nv_bfloat16*>(W_ab),
+                reinterpret_cast<__nv_bfloat16*>(out_ab),
+                M, to_stream(stream));
+        },
+        py::arg("x"), py::arg("W_ab"), py::arg("out_ab"),
+        py::arg("M"), py::arg("stream") = 0);
+
+    m.def("qwen36_embedding_lookup_bf16",
+        [](uintptr_t token_ids, uintptr_t embed, uintptr_t out,
+           int rows, int hidden, uintptr_t stream) {
+            flash_rt::kernels::qwen36_embedding_lookup_bf16(
+                reinterpret_cast<const int64_t*>(token_ids),
+                reinterpret_cast<const __nv_bfloat16*>(embed),
+                reinterpret_cast<__nv_bfloat16*>(out),
+                rows, hidden, to_stream(stream));
+        },
+        py::arg("token_ids"), py::arg("embed"), py::arg("out"),
+        py::arg("rows"), py::arg("hidden"), py::arg("stream") = 0);
+
+    m.def("qwen36_partial_rope_qk_bf16",
+        [](uintptr_t q_in, uintptr_t k_in, uintptr_t cos, uintptr_t sin,
+           uintptr_t q_out, uintptr_t k_out, int rows, int q_heads,
+           int k_heads, int head_dim, int rope_dim, uintptr_t stream) {
+            flash_rt::kernels::qwen36_partial_rope_qk_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(q_in),
+                reinterpret_cast<const __nv_bfloat16*>(k_in),
+                reinterpret_cast<const __nv_bfloat16*>(cos),
+                reinterpret_cast<const __nv_bfloat16*>(sin),
+                reinterpret_cast<__nv_bfloat16*>(q_out),
+                reinterpret_cast<__nv_bfloat16*>(k_out),
+                rows, q_heads, k_heads, head_dim, rope_dim,
+                to_stream(stream));
+        },
+        py::arg("q_in"), py::arg("k_in"), py::arg("cos"), py::arg("sin"),
+        py::arg("q_out"), py::arg("k_out"), py::arg("rows"),
+        py::arg("q_heads"), py::arg("k_heads"), py::arg("head_dim"),
+        py::arg("rope_dim"), py::arg("stream") = 0);
+
+    m.def("qwen36_tq_prepare_scalars",
+        [](uintptr_t k_norm, uintptr_t k_rnorm, uintptr_t v_norm,
+           uintptr_t norm_k, uintptr_t coef_rnorm, uintptr_t norm_v,
+           int n, float coef, uintptr_t stream) {
+            flash_rt::kernels::qwen36_tq_prepare_scalars(
+                reinterpret_cast<const __half*>(k_norm),
+                reinterpret_cast<const __half*>(k_rnorm),
+                reinterpret_cast<const __half*>(v_norm),
+                reinterpret_cast<float*>(norm_k),
+                reinterpret_cast<float*>(coef_rnorm),
+                reinterpret_cast<float*>(norm_v),
+                n, coef, to_stream(stream));
+        },
+        py::arg("k_norm"), py::arg("k_rnorm"), py::arg("v_norm"),
+        py::arg("norm_k"), py::arg("coef_rnorm"), py::arg("norm_v"),
+        py::arg("n"), py::arg("coef"), py::arg("stream") = 0);
+
+    m.def("qwen36_argmax_bf16",
+        [](uintptr_t logits, uintptr_t argmax_out,
+           int rows, int vocab, uintptr_t stream) {
+            flash_rt::kernels::qwen36_argmax_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(logits),
+                reinterpret_cast<int64_t*>(argmax_out),
+                rows, vocab, to_stream(stream));
+        },
+        py::arg("logits"), py::arg("argmax_out"),
+        py::arg("rows"), py::arg("vocab"), py::arg("stream") = 0);
+
+    m.def("qwen36_spec_accept_greedy_bf16",
+        [](uintptr_t logits, uintptr_t drafts, uintptr_t argmax_out,
+           uintptr_t accept_n, int rows, int vocab, int spec_k,
+           uintptr_t stream) {
+            flash_rt::kernels::qwen36_spec_accept_greedy_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(logits),
+                reinterpret_cast<const int64_t*>(drafts),
+                reinterpret_cast<int64_t*>(argmax_out),
+                reinterpret_cast<int*>(accept_n),
+                rows, vocab, spec_k, to_stream(stream));
+        },
+        py::arg("logits"), py::arg("drafts"), py::arg("argmax_out"),
+        py::arg("accept_n"), py::arg("rows"), py::arg("vocab"),
+        py::arg("spec_k"), py::arg("stream") = 0);
+
+    m.def("qwen36_spec_accept_partitioned_bf16",
+        [](uintptr_t logits, uintptr_t drafts, uintptr_t argmax_out,
+           uintptr_t accept_n, uintptr_t partial_vals,
+           uintptr_t partial_idx, int rows, int vocab, int spec_k,
+           int parts, uintptr_t stream) {
+            flash_rt::kernels::qwen36_spec_accept_partitioned_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(logits),
+                reinterpret_cast<const int64_t*>(drafts),
+                reinterpret_cast<int64_t*>(argmax_out),
+                reinterpret_cast<int*>(accept_n),
+                reinterpret_cast<float*>(partial_vals),
+                reinterpret_cast<int*>(partial_idx),
+                rows, vocab, spec_k, parts, to_stream(stream));
+        },
+        py::arg("logits"), py::arg("drafts"), py::arg("argmax_out"),
+        py::arg("accept_n"), py::arg("partial_vals"),
+        py::arg("partial_idx"), py::arg("rows"), py::arg("vocab"),
+        py::arg("spec_k"), py::arg("parts"), py::arg("stream") = 0);
+
     // Phase 4.3 — SiLU-gate elementwise multiply for Qwen3.6 SwiGLU MLP.
     // out[i] = silu(gate[i]) * up[i], bf16 in/out, fp32 internal.
     // Replaces the F.silu(gate) * up Python composite (2 allocs/call).
@@ -3759,6 +4084,18 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                 n, to_stream(stream));
         },
         py::arg("gate"), py::arg("up"), py::arg("out"),
+        py::arg("n"), py::arg("stream") = 0);
+
+    m.def("sigmoid_mul_qwen36_bf16",
+        [](uintptr_t gate, uintptr_t x, uintptr_t out,
+           int n, uintptr_t stream) {
+            flash_rt::kernels::sigmoid_mul_qwen36_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(gate),
+                reinterpret_cast<const __nv_bfloat16*>(x),
+                reinterpret_cast<__nv_bfloat16*>(out),
+                n, to_stream(stream));
+        },
+        py::arg("gate"), py::arg("x"), py::arg("out"),
         py::arg("n"), py::arg("stream") = 0);
 
     // Fused RMSNorm + weight + silu(gate) for Qwen3.6 linear-attn output.
@@ -3813,6 +4150,160 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("state_in"), py::arg("state_out"), py::arg("out"),
         py::arg("B"), py::arg("num_v_heads"),
         py::arg("head_k_dim"), py::arg("head_v_dim"),
+        py::arg("use_qk_l2norm") = true, py::arg("stream") = 0);
+
+    m.def("gated_deltanet_chunk_qwen36_bf16",
+        [](uintptr_t q, uintptr_t k, uintptr_t v,
+           uintptr_t g, uintptr_t beta,
+           uintptr_t state, uintptr_t out,
+           int S, int num_v_heads, int head_k_dim, int head_v_dim,
+           bool use_qk_l2norm, uintptr_t stream) {
+            flash_rt::kernels::gated_deltanet_chunk_qwen36_bf16(
+                to_ptr(q), to_ptr(k), to_ptr(v),
+                to_ptr(g), to_ptr(beta),
+                to_ptr(state), to_ptr(out),
+                S, num_v_heads, head_k_dim, head_v_dim,
+                use_qk_l2norm, to_stream(stream));
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"),
+        py::arg("g"), py::arg("beta"),
+        py::arg("state"), py::arg("out"),
+        py::arg("S"), py::arg("num_v_heads"),
+        py::arg("head_k_dim"), py::arg("head_v_dim"),
+        py::arg("use_qk_l2norm") = true, py::arg("stream") = 0);
+
+    m.def("gated_deltanet_chunk_smem_qwen36_bf16",
+        [](uintptr_t q, uintptr_t k, uintptr_t v,
+           uintptr_t g, uintptr_t beta,
+           uintptr_t state, uintptr_t out,
+           int S, int num_v_heads, int head_k_dim, int head_v_dim,
+           bool use_qk_l2norm, uintptr_t stream) {
+            flash_rt::kernels::gated_deltanet_chunk_smem_qwen36_bf16(
+                to_ptr(q), to_ptr(k), to_ptr(v),
+                to_ptr(g), to_ptr(beta),
+                to_ptr(state), to_ptr(out),
+                S, num_v_heads, head_k_dim, head_v_dim,
+                use_qk_l2norm, to_stream(stream));
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"),
+        py::arg("g"), py::arg("beta"),
+        py::arg("state"), py::arg("out"),
+        py::arg("S"), py::arg("num_v_heads"),
+        py::arg("head_k_dim"), py::arg("head_v_dim"),
+        py::arg("use_qk_l2norm") = true, py::arg("stream") = 0);
+
+    m.def("qwen36_lin_split_qkv_broadcast_bf16",
+        [](uintptr_t conv_out, uintptr_t q48,
+           uintptr_t k48, uintptr_t v48,
+           int S, uintptr_t stream) {
+            flash_rt::kernels::qwen36_lin_split_qkv_broadcast_bf16(
+                to_ptr(conv_out), to_ptr(q48),
+                to_ptr(k48), to_ptr(v48),
+                S, to_stream(stream));
+        },
+        py::arg("conv_out"), py::arg("q48"),
+        py::arg("k48"), py::arg("v48"),
+        py::arg("S"), py::arg("stream") = 0);
+
+    m.def("qwen36_lin_split_qkv_gqa_bf16",
+        [](uintptr_t conv_out, uintptr_t q16,
+           uintptr_t k16, uintptr_t v48,
+           int S, uintptr_t stream) {
+            flash_rt::kernels::qwen36_lin_split_qkv_gqa_bf16(
+                to_ptr(conv_out), to_ptr(q16),
+                to_ptr(k16), to_ptr(v48),
+                S, to_stream(stream));
+        },
+        py::arg("conv_out"), py::arg("q16"),
+        py::arg("k16"), py::arg("v48"),
+        py::arg("S"), py::arg("stream") = 0);
+
+    m.def("qwen36_split_q_gate_bf16",
+        [](uintptr_t q_proj, uintptr_t q_pre,
+           uintptr_t gate, int S, uintptr_t stream) {
+            flash_rt::kernels::qwen36_split_q_gate_bf16(
+                to_ptr(q_proj), to_ptr(q_pre), to_ptr(gate),
+                S, to_stream(stream));
+        },
+        py::arg("q_proj"), py::arg("q_pre"), py::arg("gate"),
+        py::arg("S"), py::arg("stream") = 0);
+
+    m.def("qwen36_gdn_gating_bf16",
+        [](uintptr_t a, uintptr_t b,
+           uintptr_t neg_exp_A_log, uintptr_t dt_bias,
+           uintptr_t g_out, uintptr_t beta_out,
+           int S, int num_heads, uintptr_t stream) {
+            flash_rt::kernels::qwen36_gdn_gating_bf16(
+                to_ptr(a), to_ptr(b),
+                reinterpret_cast<const float*>(neg_exp_A_log),
+                reinterpret_cast<const float*>(dt_bias),
+                to_ptr(g_out), to_ptr(beta_out),
+                S, num_heads, to_stream(stream));
+        },
+        py::arg("a"), py::arg("b"),
+        py::arg("neg_exp_A_log"), py::arg("dt_bias"),
+        py::arg("g_out"), py::arg("beta_out"),
+        py::arg("S"), py::arg("num_heads"),
+        py::arg("stream") = 0);
+
+    m.def("qwen36_gdn_gating_strided_bf16",
+        [](uintptr_t a, uintptr_t b,
+           uintptr_t neg_exp_A_log, uintptr_t dt_bias,
+           uintptr_t g_out, uintptr_t beta_out,
+           int S, int num_heads, int a_stride, int b_stride,
+           uintptr_t stream) {
+            flash_rt::kernels::qwen36_gdn_gating_strided_bf16(
+                to_ptr(a), to_ptr(b),
+                reinterpret_cast<const float*>(neg_exp_A_log),
+                reinterpret_cast<const float*>(dt_bias),
+                to_ptr(g_out), to_ptr(beta_out),
+                S, num_heads, a_stride, b_stride, to_stream(stream));
+        },
+        py::arg("a"), py::arg("b"),
+        py::arg("neg_exp_A_log"), py::arg("dt_bias"),
+        py::arg("g_out"), py::arg("beta_out"),
+        py::arg("S"), py::arg("num_heads"),
+        py::arg("a_stride"), py::arg("b_stride"),
+        py::arg("stream") = 0);
+
+    m.def("qwen36_gdn_chunk_from_conv_smem_bf16",
+        [](uintptr_t conv_out, uintptr_t a, uintptr_t b,
+           uintptr_t neg_exp_A_log, uintptr_t dt_bias,
+           uintptr_t state, uintptr_t out,
+           int S, int num_v_heads, bool use_qk_l2norm,
+           uintptr_t stream) {
+            flash_rt::kernels::qwen36_gdn_chunk_from_conv_smem_bf16(
+                to_ptr(conv_out), to_ptr(a), to_ptr(b),
+                reinterpret_cast<const float*>(neg_exp_A_log),
+                reinterpret_cast<const float*>(dt_bias),
+                to_ptr(state), to_ptr(out),
+                S, num_v_heads, use_qk_l2norm, to_stream(stream));
+        },
+        py::arg("conv_out"), py::arg("a"), py::arg("b"),
+        py::arg("neg_exp_A_log"), py::arg("dt_bias"),
+        py::arg("state"), py::arg("out"),
+        py::arg("S"), py::arg("num_v_heads"),
+        py::arg("use_qk_l2norm") = true, py::arg("stream") = 0);
+
+    m.def("qwen36_gdn_chunk_from_conv_smem_strided_bf16",
+        [](uintptr_t conv_out, uintptr_t a, uintptr_t b,
+           uintptr_t neg_exp_A_log, uintptr_t dt_bias,
+           uintptr_t state, uintptr_t out,
+           int S, int num_v_heads, int a_stride, int b_stride,
+           bool use_qk_l2norm, uintptr_t stream) {
+            flash_rt::kernels::qwen36_gdn_chunk_from_conv_smem_strided_bf16(
+                to_ptr(conv_out), to_ptr(a), to_ptr(b),
+                reinterpret_cast<const float*>(neg_exp_A_log),
+                reinterpret_cast<const float*>(dt_bias),
+                to_ptr(state), to_ptr(out),
+                S, num_v_heads, a_stride, b_stride,
+                use_qk_l2norm, to_stream(stream));
+        },
+        py::arg("conv_out"), py::arg("a"), py::arg("b"),
+        py::arg("neg_exp_A_log"), py::arg("dt_bias"),
+        py::arg("state"), py::arg("out"),
+        py::arg("S"), py::arg("num_v_heads"),
+        py::arg("a_stride"), py::arg("b_stride"),
         py::arg("use_qk_l2norm") = true, py::arg("stream") = 0);
 
 #ifdef ENABLE_CUTLASS_SM120_BLOCK_FP8
@@ -4553,6 +5044,19 @@ N must be a multiple of 32; K must be a multiple of 64.
         py::arg("packed"), py::arg("sf_swz"),
         py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
 
+    m.def("silu_mul_merged_to_nvfp4_swizzled_bf16",
+        [](uintptr_t merged_gate_up,
+           uintptr_t packed, uintptr_t sf_swz,
+           int rows, int cols, uintptr_t stream) -> int {
+            return flash_rt::kernels::silu_mul_merged_to_nvfp4_swizzled_bf16(
+                to_ptr(merged_gate_up),
+                to_ptr(packed), to_ptr(sf_swz),
+                rows, cols, to_stream(stream));
+        },
+        py::arg("merged_gate_up"),
+        py::arg("packed"), py::arg("sf_swz"),
+        py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
+
     m.def("qwen3_k_norm_rope_kvwrite_bf16",
         [](uintptr_t k_pre, uintptr_t v_pre, uintptr_t k_norm_w,
            uintptr_t cos, uintptr_t sin,
@@ -4820,6 +5324,36 @@ N must be a multiple of 32; K must be a multiple of 64.
                 to_ptr(y_fp4), to_ptr(y_sf),
                 B, C, T, H, W, eps, to_stream(stream));
         });
+#endif
+
+#ifdef ENABLE_QWEN36_FLASHINFER_XQA
+    m.def("qwen36_flashinfer_xqa_bf16_fp8kv_spec",
+        [](uintptr_t q, uintptr_t k_cache, uintptr_t v_cache,
+           uintptr_t page_table, uintptr_t seq_lens, uintptr_t mask,
+           uintptr_t out, uintptr_t semaphores, uintptr_t scratch,
+           int max_seq_len, int q_seq_len, int sm_count,
+           float q_scale, float kv_scale, bool enable_pdl,
+           int64_t k_stride_page, int64_t k_stride_token,
+           int64_t k_stride_head, uintptr_t stream) {
+            qwen36_flashinfer_xqa_bf16_fp8kv_spec(
+                to_ptr(q), to_ptr(k_cache), to_ptr(v_cache),
+                reinterpret_cast<const int32_t*>(to_ptr(page_table)),
+                reinterpret_cast<const uint32_t*>(to_ptr(seq_lens)),
+                reinterpret_cast<const uint32_t*>(to_ptr(mask)),
+                to_ptr(out),
+                reinterpret_cast<uint32_t*>(to_ptr(semaphores)),
+                to_ptr(scratch),
+                max_seq_len, q_seq_len, sm_count, q_scale, kv_scale,
+                enable_pdl, k_stride_page, k_stride_token, k_stride_head,
+                to_stream(stream));
+        },
+        py::arg("q"), py::arg("k_cache"), py::arg("v_cache"),
+        py::arg("page_table"), py::arg("seq_lens"), py::arg("mask"),
+        py::arg("out"), py::arg("semaphores"), py::arg("scratch"),
+        py::arg("max_seq_len"), py::arg("q_seq_len"), py::arg("sm_count"),
+        py::arg("q_scale"), py::arg("kv_scale"), py::arg("enable_pdl"),
+        py::arg("k_stride_page"), py::arg("k_stride_token"),
+        py::arg("k_stride_head"), py::arg("stream") = 0);
 #endif
 
 #ifdef ENABLE_LINGBOT

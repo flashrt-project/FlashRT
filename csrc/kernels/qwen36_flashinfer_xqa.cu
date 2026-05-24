@@ -1,0 +1,52 @@
+#include "qwen36_flashinfer_xqa.cuh"
+
+#include "mha.h"
+
+void qwen36_flashinfer_xqa_bf16_fp8kv_spec(
+    const void* q,
+    const void* k_cache,
+    const void* v_cache,
+    const int32_t* page_table,
+    const uint32_t* seq_lens,
+    const uint32_t* mask,
+    void* out,
+    uint32_t* semaphores,
+    void* scratch,
+    int max_seq_len,
+    int q_seq_len,
+    int sm_count,
+    float q_scale,
+    float kv_scale,
+    bool enable_pdl,
+    int64_t k_stride_page,
+    int64_t k_stride_token,
+    int64_t k_stride_head,
+    cudaStream_t stream) {
+  launchMHAFlashInfer(
+      static_cast<uint32_t>(sm_count),
+      4,
+      0,
+      q_scale,
+      nullptr,
+      reinterpret_cast<OutputHead*>(out),
+      reinterpret_cast<InputHead const*>(q),
+      nullptr,
+      reinterpret_cast<GMemCacheHead*>(const_cast<void*>(k_cache)),
+      reinterpret_cast<GMemCacheHead*>(const_cast<void*>(v_cache)),
+      reinterpret_cast<KVCachePageIndex const*>(page_table),
+      static_cast<uint32_t>(max_seq_len),
+      seq_lens,
+      1,
+      kv_scale,
+      nullptr,
+      static_cast<uint32_t>(q_seq_len),
+      nullptr,
+      reinterpret_cast<MaskType const*>(mask),
+      semaphores,
+      scratch,
+      enable_pdl,
+      static_cast<uint64_t>(k_stride_page),
+      static_cast<uint64_t>(k_stride_token),
+      static_cast<uint64_t>(k_stride_head),
+      stream);
+}

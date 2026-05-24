@@ -25,6 +25,12 @@ void quantize_fp8_static(const __nv_bfloat16* input, __nv_fp8_e4m3* output,
 void dequantize_fp8_static_bf16(const __nv_fp8_e4m3* input, __nv_bfloat16* output,
                                 const float* d_scale, int n, cudaStream_t stream = 0);
 
+void dequantize_fp8_static_bf16_2(
+    const __nv_fp8_e4m3* in0, const __nv_fp8_e4m3* in1,
+    __nv_bfloat16* out0, __nv_bfloat16* out1,
+    const float* s0, const float* s1,
+    int n, cudaStream_t stream = 0);
+
 void dequantize_fp8_static_bf16_6(
     const __nv_fp8_e4m3* in0, const __nv_fp8_e4m3* in1,
     const __nv_fp8_e4m3* in2, const __nv_fp8_e4m3* in3,

@@ -164,6 +164,85 @@ __global__ void silu_mul_to_nvfp4_swizzled_kernel(
   }
 }
 
+// Same output as silu_mul_to_nvfp4_swizzled_kernel, but reads gate/up
+// from one row-major [gate | up] buffer. This is the correct consumer
+// for a fused gate_up GEMM at rows > 1; split pointers would otherwise
+// see a row stride of 2*cols.
+__global__ void silu_mul_merged_to_nvfp4_swizzled_kernel(
+    const __nv_bfloat16* __restrict__ merged_gate_up,
+    uint8_t* __restrict__ packed,
+    uint8_t* __restrict__ sf_swz,
+    int cols,
+    int num_blocks,
+    int n_col_blocks) {
+  int row = blockIdx.x;
+  const __nv_bfloat16* gate_row =
+      merged_gate_up + (size_t)row * (2 * cols);
+  const __nv_bfloat16* up_row = gate_row + cols;
+  uint8_t* packed_row = packed + (size_t)row * (cols / 2);
+
+  extern __shared__ __align__(16) uint8_t smem_raw[];
+  float* smem_scales = reinterpret_cast<float*>(smem_raw);
+  __nv_bfloat16* smem_silu_mul = reinterpret_cast<__nv_bfloat16*>(
+      smem_raw + num_blocks * sizeof(float));
+
+  for (int b = threadIdx.x; b < num_blocks; b += blockDim.x) {
+    smem_scales[b] = 0.0f;
+  }
+  __syncthreads();
+
+  for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+    float g = __bfloat162float(gate_row[i]);
+    float u = __bfloat162float(up_row[i]);
+    float silu_g = silu_f32(g);
+    float silu_g_bf = static_cast<float>(__float2bfloat16(silu_g));
+    __nv_bfloat16 silu_mul_bf = __float2bfloat16(silu_g_bf * u);
+    smem_silu_mul[i] = silu_mul_bf;
+
+    float val = fabsf(static_cast<float>(silu_mul_bf));
+    int blk = i >> 4;
+    atomicMax((int*)&smem_scales[blk], __float_as_int(val));
+  }
+  __syncthreads();
+
+  int rb = row / 128;
+  int ri = row % 128;
+  for (int b = threadIdx.x; b < num_blocks; b += blockDim.x) {
+    float amax = __int_as_float(*(int*)&smem_scales[b]);
+    float scale = amax / 6.0f;
+    uint8_t ue_scale = float_to_ue4m3_ceil(scale);
+    int cb = b / 4;
+    int ci = b % 4;
+    int out_idx = (rb * n_col_blocks + cb) * 512
+                + (ri % 32) * 16 + (ri / 32) * 4 + ci;
+    sf_swz[out_idx] = ue_scale;
+    smem_scales[b] = ue4m3_to_float(ue_scale);
+  }
+  __syncthreads();
+
+  int half_cols = cols >> 1;
+  for (int p = threadIdx.x; p < half_cols; p += blockDim.x) {
+    int i = p * 2;
+    int blk = i >> 4;
+    float scale = smem_scales[blk];
+    float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+
+    float v0 = __bfloat162float(smem_silu_mul[i]) * inv_scale;
+    float v1 = __bfloat162float(smem_silu_mul[i + 1]) * inv_scale;
+
+    int blk1 = (i + 1) >> 4;
+    if (blk1 != blk) {
+      float scale1 = smem_scales[blk1];
+      float inv1 = (scale1 > 0.0f) ? (1.0f / scale1) : 0.0f;
+      v1 = __bfloat162float(smem_silu_mul[i + 1]) * inv1;
+    }
+
+    uint8_t fp4_lo = float_to_fp4_e2m1(v0);
+    uint8_t fp4_hi = float_to_fp4_e2m1(v1);
+    packed_row[p] = (fp4_hi << 4) | (fp4_lo & 0x0F);
+  }
+}
+
 }  // namespace
 
 int silu_mul_to_nvfp4_swizzled_bf16(
@@ -194,6 +273,36 @@ int silu_mul_to_nvfp4_swizzled_bf16(
   silu_mul_to_nvfp4_swizzled_kernel<<<rows, threads, smem_size, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(gate),
       reinterpret_cast<const __nv_bfloat16*>(up),
+      reinterpret_cast<uint8_t*>(packed),
+      reinterpret_cast<uint8_t*>(sf_swz),
+      cols, num_blocks, n_col_blocks);
+  return 0;
+}
+
+int silu_mul_merged_to_nvfp4_swizzled_bf16(
+    const void* merged_gate_up,
+    void*       packed,
+    void*       sf_swz,
+    int         rows,
+    int         cols,
+    cudaStream_t stream) {
+  if (!merged_gate_up || !packed || !sf_swz) return 1;
+  if (rows <= 0 || cols <= 0 || (cols & 0xF) != 0) return 2;
+
+  int num_blocks = (cols + 15) / 16;
+  int n_col_blocks = (num_blocks + 3) / 4;
+  int threads = 256;
+  size_t smem_size = num_blocks * sizeof(float)
+                   + cols * sizeof(__nv_bfloat16);
+  if (smem_size > 48 * 1024) {
+    cudaFuncSetAttribute(
+        silu_mul_merged_to_nvfp4_swizzled_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        100 * 1024);
+  }
+  silu_mul_merged_to_nvfp4_swizzled_kernel<<<
+      rows, threads, smem_size, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(merged_gate_up),
       reinterpret_cast<uint8_t*>(packed),
       reinterpret_cast<uint8_t*>(sf_swz),
       cols, num_blocks, n_col_blocks);

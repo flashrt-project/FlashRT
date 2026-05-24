@@ -73,5 +73,131 @@ void gated_deltanet_recurrent_inout_qwen36_bf16(
     bool use_qk_l2norm,
     cudaStream_t stream);
 
+// Multi-token recurrent scan for prefill chunks. Reads initial state,
+// loops S tokens inside one launch, writes all S outputs and final state.
+// It intentionally does not materialize per-token state snapshots, so
+// speculative verify with partial-reject recovery keeps using the
+// recurrent_inout variant above.
+void gated_deltanet_chunk_qwen36_bf16(
+    const void* q,
+    const void* k,
+    const void* v,
+    const void* g,
+    const void* beta,
+    void*       state,
+    void*       out,
+    int S, int num_v_heads, int head_k_dim, int head_v_dim,
+    bool use_qk_l2norm,
+    cudaStream_t stream);
+
+// Shared-memory state variant for profiling/tuning long prefill.
+// Same ABI and math as gated_deltanet_chunk_qwen36_bf16.
+void gated_deltanet_chunk_smem_qwen36_bf16(
+    const void* q,
+    const void* k,
+    const void* v,
+    const void* g,
+    const void* beta,
+    void*       state,
+    void*       out,
+    int S, int num_v_heads, int head_k_dim, int head_v_dim,
+    bool use_qk_l2norm,
+    cudaStream_t stream);
+
+// Split linear-attention conv output and broadcast Q/K heads.
+// conv_out: (S, 10240) = Q(16*128), K(16*128), V(48*128)
+// q48/k48/v48: contiguous (S, 48, 128), with Q/K head h sourced
+// from floor(h / 3).
+void qwen36_lin_split_qkv_broadcast_bf16(
+    const void* conv_out,
+    void*       q48,
+    void*       k48,
+    void*       v48,
+    int S,
+    cudaStream_t stream);
+
+// Split linear-attention conv output for the chunk/WY GQA path.
+// conv_out: (S, 10240) = Q(16*128), K(16*128), V(48*128)
+// q16/k16:  contiguous (S, 16, 128)
+// v48:      contiguous (S, 48, 128)
+void qwen36_lin_split_qkv_gqa_bf16(
+    const void* conv_out,
+    void*       q16,
+    void*       k16,
+    void*       v48,
+    int S,
+    cudaStream_t stream);
+
+// Split full-attention q_proj output:
+// q_proj: (S, 24, 512) = [q_pre(256), gate(256)] per head.
+// q_pre:  (S, 24, 256), contiguous.
+// gate:   (S, 24*256), contiguous.
+void qwen36_split_q_gate_bf16(
+    const void* q_proj,
+    void*       q_pre,
+    void*       gate,
+    int S,
+    cudaStream_t stream);
+
+// Fused Gated DeltaNet gate preparation:
+//   beta = sigmoid(b)
+//   g    = neg_exp_A_log[h] * log1p(exp(a + dt_bias[h]))
+// Inputs a/b are (S, 48) bf16, per-head constants are (48) fp32,
+// outputs beta/g are (S, 48) bf16.
+void qwen36_gdn_gating_bf16(
+    const void* a,
+    const void* b,
+    const float* neg_exp_A_log,
+    const float* dt_bias,
+    void*       g_out,
+    void*       beta_out,
+    int S,
+    int num_heads,
+    cudaStream_t stream);
+
+void qwen36_gdn_gating_strided_bf16(
+    const void* a,
+    const void* b,
+    const float* neg_exp_A_log,
+    const float* dt_bias,
+    void*       g_out,
+    void*       beta_out,
+    int S,
+    int num_heads,
+    int a_stride,
+    int b_stride,
+    cudaStream_t stream);
+
+// Long-prefill fused path: read conv_out directly, broadcast Q/K,
+// compute g/beta from a/b, and run the shared-memory Gated DeltaNet
+// recurrent scan in one kernel.
+void qwen36_gdn_chunk_from_conv_smem_bf16(
+    const void* conv_out,
+    const void* a,
+    const void* b,
+    const float* neg_exp_A_log,
+    const float* dt_bias,
+    void*       state,
+    void*       out,
+    int S,
+    int num_v_heads,
+    bool use_qk_l2norm,
+    cudaStream_t stream);
+
+void qwen36_gdn_chunk_from_conv_smem_strided_bf16(
+    const void* conv_out,
+    const void* a,
+    const void* b,
+    const float* neg_exp_A_log,
+    const float* dt_bias,
+    void*       state,
+    void*       out,
+    int S,
+    int num_v_heads,
+    int a_stride,
+    int b_stride,
+    bool use_qk_l2norm,
+    cudaStream_t stream);
+
 }  // namespace kernels
 }  // namespace flash_rt

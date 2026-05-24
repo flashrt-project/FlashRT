@@ -54,6 +54,11 @@ void add_bf16_out(const __nv_bfloat16* a, const __nv_bfloat16* b,
                   __nv_bfloat16* out, int n,
                   cudaStream_t stream = 0);
 
+void concat2_bf16(const __nv_bfloat16* a, const __nv_bfloat16* b,
+                  __nv_bfloat16* out,
+                  int rows, int cols_a, int cols_b,
+                  cudaStream_t stream = 0);
+
 void euler_step_bf16_out(const __nv_bfloat16* latent,
                          const __nv_bfloat16* velocity,
                          __nv_bfloat16* out,

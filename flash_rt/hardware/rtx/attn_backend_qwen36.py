@@ -113,6 +113,7 @@ class RtxFlashAttnBackendQwen36:
         from flash_rt import flash_rt_fa2 as _fa2
         self._fa2 = _fa2
         self._fa2_fwd = _fa2.fwd_bf16
+        self._fa2_fwd_causal = getattr(_fa2, "fwd_bf16_causal", None)
         self._num_sms = torch.cuda.get_device_properties(
             torch.cuda.current_device()
         ).multi_processor_count

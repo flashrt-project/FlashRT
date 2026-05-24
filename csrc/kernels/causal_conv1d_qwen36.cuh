@@ -76,5 +76,33 @@ void causal_conv1d_qwen36_update_inout_bf16(
     bool apply_silu,
     cudaStream_t stream);
 
+// Multi-token decode update with persistent state cache.
+// Processes S consecutive tokens and writes only the final state, so
+// speculative verify paths that need per-step state snapshots should
+// keep using causal_conv1d_qwen36_update_inout_bf16.
+void causal_conv1d_qwen36_update_chunk_bf16(
+    const void* x,
+    const void* w,
+    const void* bias,
+    void*       out,
+    void*       state,
+    int B, int S, int conv_dim, int k,
+    bool apply_silu,
+    cudaStream_t stream);
+
+// Parallel prefill variant: computes each (S, channel) output
+// independently, then updates the final state in a second tiny kernel.
+// This trades extra global loads for much higher S-dimension
+// parallelism on long chunks.
+void causal_conv1d_qwen36_update_chunk_parallel_bf16(
+    const void* x,
+    const void* w,
+    const void* bias,
+    void*       out,
+    void*       state,
+    int B, int S, int conv_dim, int k,
+    bool apply_silu,
+    cudaStream_t stream);
+
 }  // namespace kernels
 }  // namespace flash_rt

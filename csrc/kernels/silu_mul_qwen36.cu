@@ -39,6 +39,21 @@ __global__ void silu_mul_kernel(
   out[idx] = __float2bfloat16(silu_g_bf_rt * u);
 }
 
+__global__ void sigmoid_mul_kernel(
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ out,
+    int n)
+{
+  const int idx = blockIdx.x * kThreadsX + threadIdx.x;
+  if (idx >= n) return;
+  const float g = static_cast<float>(gate[idx]);
+  const float xv = static_cast<float>(x[idx]);
+  const float sig = 1.0f / (1.0f + expf(-g));
+  const float sig_bf_rt = static_cast<float>(__float2bfloat16(sig));
+  out[idx] = __float2bfloat16(xv * sig_bf_rt);
+}
+
 }  // namespace
 
 void silu_mul_qwen36_bf16(
@@ -50,6 +65,17 @@ void silu_mul_qwen36_bf16(
 {
   const int grid = (n + kThreadsX - 1) / kThreadsX;
   silu_mul_kernel<<<grid, kThreadsX, 0, stream>>>(gate, up, out, n);
+}
+
+void sigmoid_mul_qwen36_bf16(
+    const __nv_bfloat16* gate,
+    const __nv_bfloat16* x,
+    __nv_bfloat16* out,
+    int n,
+    cudaStream_t stream)
+{
+  const int grid = (n + kThreadsX - 1) / kThreadsX;
+  sigmoid_mul_kernel<<<grid, kThreadsX, 0, stream>>>(gate, x, out, n);
 }
 
 }  // namespace flash_rt::kernels

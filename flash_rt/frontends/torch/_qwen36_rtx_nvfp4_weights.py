@@ -145,6 +145,103 @@ def _load_quantized_proj(
     out_dict[prefix + '_alpha'] = inv_global
 
 
+def _load_quantized_mlp_gate_up(
+    handles: WeightHandles,
+    out_dict: dict,
+    safetensors_handle,
+    base_mlp_key: str,
+    fvk,
+    device: str,
+    stream: int = 0,
+) -> None:
+    """Load MLP gate/up as one row-concatenated NVFP4 projection.
+
+    Qwen3.6's gate_proj and up_proj share the same global scale across
+    all observed layers. Keeping them as one physical tensor lets the
+    prefill path issue one large GEMM while the legacy fields remain
+    valid pointers into the fused tensor, without duplicating weights.
+    """
+    gate_key = base_mlp_key + '.gate_proj'
+    up_key = base_mlp_key + '.up_proj'
+    gate_glb_cpu = safetensors_handle.get_tensor(
+        gate_key + '.weight_global_scale')
+    up_glb_cpu = safetensors_handle.get_tensor(
+        up_key + '.weight_global_scale')
+    gate_global = float(gate_glb_cpu.to(torch.float32).item())
+    up_global = float(up_glb_cpu.to(torch.float32).item())
+    gate_alpha = 1.0 / gate_global if gate_global != 0.0 else 0.0
+    up_alpha = 1.0 / up_global if up_global != 0.0 else 0.0
+
+    if abs(gate_alpha - up_alpha) > 1e-12 * max(gate_alpha, 1e-12):
+        _load_quantized_proj(
+            handles, out_dict, 'mlp_gate',
+            safetensors_handle, gate_key, fvk, device, stream)
+        _load_quantized_proj(
+            handles, out_dict, 'mlp_up',
+            safetensors_handle, up_key, fvk, device, stream)
+        out_dict['mlp_gate_up_homogeneous_alpha'] = False
+        return
+
+    gate_packed = safetensors_handle.get_tensor(
+        gate_key + '.weight_packed').to(device, non_blocking=True).contiguous()
+    up_packed = safetensors_handle.get_tensor(
+        up_key + '.weight_packed').to(device, non_blocking=True).contiguous()
+    gate_sf_lin = safetensors_handle.get_tensor(
+        gate_key + '.weight_scale').to(device, non_blocking=True).contiguous()
+    up_sf_lin = safetensors_handle.get_tensor(
+        up_key + '.weight_scale').to(device, non_blocking=True).contiguous()
+
+    rows_gate, cols_div16 = gate_sf_lin.shape
+    rows_up, cols_div16_up = up_sf_lin.shape
+    if rows_gate != rows_up or cols_div16 != cols_div16_up:
+        raise RuntimeError(
+            'Qwen3.6 MLP gate/up shape mismatch: '
+            f'gate={tuple(gate_sf_lin.shape)} up={tuple(up_sf_lin.shape)}')
+
+    packed = torch.cat([gate_packed, up_packed], dim=0).contiguous()
+    sf_lin = torch.cat([gate_sf_lin, up_sf_lin], dim=0).contiguous()
+    rows_fused = rows_gate + rows_up
+    cols_in = cols_div16 * 16
+    n_blocks = cols_in // 16
+    n_col_super = (n_blocks + 3) // 4
+    n_row_super_fused = (rows_fused + 127) // 128
+    sf_bytes = n_row_super_fused * n_col_super * 512
+    sf_swz = torch.zeros(sf_bytes, dtype=torch.uint8, device=device)
+
+    fvk.nvfp4_sf_linear_to_swizzled(
+        int(sf_lin.data_ptr()),
+        int(sf_swz.data_ptr()),
+        rows_fused, cols_in, False, stream,
+    )
+
+    packed_base = _ensure_anchored(handles, packed)
+    sf_base = _ensure_anchored(handles, sf_swz)
+    gate_packed_bytes = int(gate_packed.numel() * gate_packed.element_size())
+    gate_row_super = (rows_gate + 127) // 128
+    gate_sf_bytes = int(gate_row_super * n_col_super * 512)
+
+    out_dict['mlp_gate_up_packed'] = packed_base
+    out_dict['mlp_gate_up_sf'] = sf_base
+    out_dict['mlp_gate_up_alpha'] = gate_alpha
+    out_dict['mlp_gate_up_N'] = int(rows_fused)
+    out_dict['mlp_gate_up_homogeneous_alpha'] = True
+
+    out_dict['mlp_gate_packed'] = packed_base
+    out_dict['mlp_up_packed'] = packed_base + gate_packed_bytes
+    out_dict['mlp_gate_sf'] = sf_base
+    out_dict['mlp_up_sf'] = sf_base + gate_sf_bytes
+    glb_f32 = gate_glb_cpu.to(torch.float32).to(device).contiguous()
+    glb_ptr = _ensure_anchored(handles, glb_f32)
+    out_dict['mlp_gate_global'] = glb_ptr
+    out_dict['mlp_up_global'] = glb_ptr
+    out_dict['mlp_gate_global_value'] = gate_global
+    out_dict['mlp_up_global_value'] = up_global
+    out_dict['mlp_gate_alpha'] = gate_alpha
+    out_dict['mlp_up_alpha'] = up_alpha
+
+    del gate_packed, up_packed, gate_sf_lin, up_sf_lin, sf_lin
+
+
 def _bf16_anchor(handles: WeightHandles, t: torch.Tensor,
                  device: str = 'cuda:0') -> int:
     """Move CPU tensor to GPU bf16 contiguous, anchor, return ptr."""
@@ -259,6 +356,10 @@ def extract_weights_nvfp4(
             handles, final_norm_eff)
 
         lm_head_cpu = f.get_tensor('lm_head.weight')
+        if bool(int(os.environ.get(
+                'FLASHRT_QWEN36_KEEP_BF16_LM_HEAD', '0') or '0')):
+            handles.ptrs['lm_head_w_bf16'] = _bf16_anchor(
+                handles, lm_head_cpu, device)
         # G8: quantize lm_head to NVFP4 at load time. lm_head is the
         # single largest weight in MTP-spec hot path (2.5 GB BF16 read
         # per call × K+1 calls per cycle). NVFP4 cuts it to 0.6 GB.
@@ -296,11 +397,13 @@ def extract_weights_nvfp4(
             ld['input_norm_eff_w'] = _ensure_anchored(handles, in_eff)
             ld['post_attn_norm_eff_w'] = _ensure_anchored(handles, post_eff)
 
-            # MLP (NVFP4 quantized in every layer).
-            for short in ('gate', 'up', 'down'):
-                _load_quantized_proj(
-                    handles, ld, 'mlp_' + short,
-                    f, base + f'mlp.{short}_proj', fvk, device)
+            # MLP (NVFP4 quantized in every layer). Gate/up share one
+            # fused physical tensor and expose legacy offset pointers.
+            _load_quantized_mlp_gate_up(
+                handles, ld, f, base + 'mlp', fvk, device)
+            _load_quantized_proj(
+                handles, ld, 'mlp_down',
+                f, base + 'mlp.down_proj', fvk, device)
 
             if t == 'linear_attention':
                 la = base + 'linear_attn.'
@@ -331,6 +434,7 @@ def extract_weights_nvfp4(
                 # cheap and shared across all 48 lin layers' init.
                 ab_w = torch.cat([a_w, b_w], dim=0).contiguous()
                 ld['in_proj_ab_w'] = _ensure_anchored(handles, ab_w)
+                ld['in_proj_ab_w_t'] = ab_w
                 _quant_bf16_lin_proj(
                     handles, ld, 'out_proj',
                     f.get_tensor(la + 'out_proj.weight'),
@@ -518,6 +622,72 @@ def extract_mtp_weights_nvfp4(mtp: dict, handles: WeightHandles, fvk,
     return out
 
 
+def extract_mtp_weights_bf16_nvfp4(mtp: dict, handles: WeightHandles, fvk,
+                                   device: str = 'cuda:0') -> dict:
+    """Quantize a BF16/native MTP head to NVFP4 and add to handles.
+
+    Some community Qwen3.6 MTP-preserved checkpoints publish the MTP
+    head as plain BF16 tensors rather than the official FP8
+    ``weight + weight_scale_inv`` layout. The runtime hot path still
+    expects the same NVFP4 MTP schema as :func:`extract_mtp_weights_nvfp4`,
+    so this loader mirrors it but uses the BF16 -> NVFP4 converter used
+    elsewhere in the NVFP4 frontend.
+    """
+    out: dict = {
+        'type': 'mtp',
+        'quant_format': 'nvfp4',
+        'source_format': 'bf16',
+    }
+
+    in_eff = _eff_rmsnorm_weight(mtp['layers.0.input_layernorm.weight'])
+    post_eff = _eff_rmsnorm_weight(
+        mtp['layers.0.post_attention_layernorm.weight'])
+    out['input_norm_eff_w'] = _ensure_anchored(handles, in_eff.to(device))
+    out['post_attn_norm_eff_w'] = _ensure_anchored(
+        handles, post_eff.to(device))
+
+    bf16_pairs = (
+        ('q_proj',   'layers.0.self_attn.q_proj'),
+        ('k_proj',   'layers.0.self_attn.k_proj'),
+        ('v_proj',   'layers.0.self_attn.v_proj'),
+        ('o_proj',   'layers.0.self_attn.o_proj'),
+        ('mlp_gate', 'layers.0.mlp.gate_proj'),
+        ('mlp_up',   'layers.0.mlp.up_proj'),
+        ('mlp_down', 'layers.0.mlp.down_proj'),
+    )
+
+    keep_bf16 = bool(int(os.environ.get(
+        'FLASHRT_QWEN36_MTP_KEEP_BF16', '1') or '0'))
+
+    for prefix, base in bf16_pairs:
+        _quant_bf16_lin_proj(
+            handles, out, prefix, mtp[base + '.weight'], fvk, device)
+        if keep_bf16:
+            w = mtp[base + '.weight'].to(torch.bfloat16).to(
+                device).contiguous()
+            out[prefix + '_w_bf16'] = _ensure_anchored(handles, w)
+
+    q_eff = _eff_rmsnorm_weight(mtp['layers.0.self_attn.q_norm.weight'])
+    k_eff = _eff_rmsnorm_weight(mtp['layers.0.self_attn.k_norm.weight'])
+    out['q_norm_eff_w'] = _ensure_anchored(handles, q_eff.to(device))
+    out['k_norm_eff_w'] = _ensure_anchored(handles, k_eff.to(device))
+
+    pre_h_eff = _eff_rmsnorm_weight(mtp['pre_fc_norm_hidden.weight'])
+    pre_e_eff = _eff_rmsnorm_weight(mtp['pre_fc_norm_embedding.weight'])
+    final_eff = _eff_rmsnorm_weight(mtp['norm.weight'])
+    out['pre_fc_norm_hidden_eff_w'] = _ensure_anchored(
+        handles, pre_h_eff.to(device))
+    out['pre_fc_norm_embedding_eff_w'] = _ensure_anchored(
+        handles, pre_e_eff.to(device))
+    out['final_norm_eff_w'] = _ensure_anchored(
+        handles, final_eff.to(device))
+
+    fc_w = mtp['fc.weight'].to(torch.bfloat16).to(device).contiguous()
+    out['fc_w'] = _ensure_anchored(handles, fc_w)
+
+    return out
+
+
 def assert_extraction_invariants_nvfp4(handles: WeightHandles) -> None:
     """Verify all NVFP4 ptr fields populated. Run once at frontend init."""
     p = handles.ptrs
@@ -533,6 +703,8 @@ def assert_extraction_invariants_nvfp4(handles: WeightHandles) -> None:
         'input_norm_eff_w', 'post_attn_norm_eff_w', 'quant_format',
         'mlp_gate_packed', 'mlp_gate_sf', 'mlp_gate_global',
         'mlp_up_packed', 'mlp_up_sf', 'mlp_up_global',
+        'mlp_gate_up_packed', 'mlp_gate_up_sf', 'mlp_gate_up_alpha',
+        'mlp_gate_up_N', 'mlp_gate_up_homogeneous_alpha',
         'mlp_down_packed', 'mlp_down_sf', 'mlp_down_global',
     }
     lin_keys = common_keys | {

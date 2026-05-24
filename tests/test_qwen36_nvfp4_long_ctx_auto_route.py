@@ -39,10 +39,19 @@ all three must pass after.
     regression net: ensures the auto-route logic does not silently
     rewire short-context.
 
+  * ``test_long_ctx_short_request_still_specs`` — ``max_seq=32768``,
+    short prompt, ``max_new=128``. Enabling long-context serving must
+    not silently route ordinary short requests away from the documented
+    MTP spec path.
+
   * ``test_long_prompt_doesnt_oom`` — ``max_seq=32768``,
-    ``prompt_len=1024``, ``max_new=16``. This is the exact failure
-    the bug report described; on main it OOMs, post-fix it must
-    succeed and produce ``max_new`` tokens.
+    ``prompt_len=1024``, ``max_new=16``. This stays inside the retained
+    short spec window but uses the long-context-capable frontend.
+
+  * Requests beyond the retained short spec window route through eager
+    TQ-spec (MTP draft + TurboQuant verify). The full long-context
+    performance grid is kept as an explicit benchmark because real
+    prompt prefill is expensive.
 
   * ``test_auto_route_init_at_each_tier`` — constructor at
     ``max_seq ∈ [2K, 8K, 16K, 32K, 64K, 128K]`` all succeed, all
@@ -162,6 +171,59 @@ def test_short_ctx_spec_path_unchanged():
             f'(expected ≥70, docs claim 90-130)'
         )
         assert new_tokens == 128
+    finally:
+        _free_frontend(fe)
+
+
+def test_long_ctx_short_request_still_specs():
+    """max_seq=32768 keeps short requests on the MTP spec path."""
+    import time
+    import torch
+
+    os.environ.setdefault('FLASHRT_QWEN36_MTP_CKPT_DIR', CKPT_MTP)
+    from flash_rt.frontends.torch.qwen36_rtx import Qwen36TorchFrontendRtx
+
+    fe = Qwen36TorchFrontendRtx(
+        CKPT_NVFP4, quant='nvfp4', max_seq=32768)
+    try:
+        assert getattr(fe, '_long_ctx_mode', False) is True
+        assert getattr(fe, '_short_ctx_spec_max_seq', 0) >= 2048
+
+        prompt = 'Explain quantum entanglement in one short paragraph.'
+        ids = fe._tokenizer(
+            prompt, return_tensors='pt').input_ids.cuda()
+        assert ids.shape[1] + 128 <= fe._short_ctx_spec_max_seq
+
+        # Warmup.
+        _ = fe.generate_own_speculative_KN_nvfp4(
+            ids, max_new_tokens=128, K=6)
+        torch.cuda.synchronize()
+
+        fe.reset_state()
+        fe.reset_mtp_state()
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        out = fe.generate_own_speculative_KN_nvfp4(
+            ids, max_new_tokens=128, K=6)
+        torch.cuda.synchronize()
+        dt = time.perf_counter() - t0
+
+        new_tokens = out.shape[1] - ids.shape[1]
+        tps = new_tokens / dt
+        print(
+            f'\n[long-ctx short-request] prompt={ids.shape[1]} '
+            f'new={new_tokens} time={dt:.3f}s tok/s={tps:.1f} '
+            f'attempts={fe._spec_attempts}'
+        )
+
+        assert new_tokens == 128
+        assert fe._spec_attempts > 0, (
+            'short request in long-ctx frontend must use MTP spec'
+        )
+        assert tps >= 70.0, (
+            f'long-ctx short-request warm decode degraded: {tps:.1f} '
+            'tok/s (expected spec path)'
+        )
     finally:
         _free_frontend(fe)
 
