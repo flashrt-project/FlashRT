@@ -119,9 +119,10 @@ class Qwen36TorchFrontendRtx:
         # lives in NVFP4-packed form (~1.83x compression at 1-byte idx,
         # ~5x at bit-pack).
         # Requests beyond the retained BF16 spec window run MTP draft
-        # plus TQ-packed verify. Short requests still use the normal
-        # BF16-KV/CUDA-Graph MTP spec path even when the frontend was
-        # constructed for long context.
+        # plus TQ/FP8-KV packed verify. Short requests still use the
+        # normal BF16-KV/CUDA-Graph MTP spec path even when the frontend
+        # was constructed for long context, except for the measured
+        # 128-token bucket handled by _should_use_long_ctx_route().
         if quant == 'nvfp4' and self._user_max_seq > self.LONG_CTX_THRESHOLD:
             # Long-ctx mode: allocate BF16 buffers at a small spec
             # window. The TQ packed cache then grows KV coverage out
@@ -7083,7 +7084,9 @@ class Qwen36TorchFrontendRtx:
             return int(tq_spec_k)
         prompt_len = int(prompt_len)
         caller_k = int(K)
-        if prompt_len < 768:
+        if prompt_len < 192:
+            target_k = 6
+        elif prompt_len < 768:
             target_k = 4
         elif prompt_len < 1536:
             target_k = 5
@@ -7117,6 +7120,13 @@ class Qwen36TorchFrontendRtx:
                     self.LONG_CTX_THRESHOLD)))
         bf16_cap = int(getattr(
             self, '_short_ctx_spec_max_seq', route_min))
+        # The legacy BF16/spec short path prefilled prompts one token at
+        # a time.  At the 128-token benchmark bucket that costs seconds
+        # of TTFT.  Route only this narrow bucket through the chunked
+        # FP8-KV path; larger short prompts keep the previous policy so
+        # their tuned K/tail choices do not move unexpectedly.
+        if 128 <= prompt_len < 192:
+            return True
         return prompt_len >= route_min or max_pos > bf16_cap
 
     def warmup_long_ctx_decode_graphs(
@@ -7683,7 +7693,7 @@ class Qwen36TorchFrontendRtx:
 
         def _run_chain():
             mtp_argmax_parts = int(os.environ.get(
-                'FLASHRT_QWEN36_MTP_ARGMAX_PARTS', '96') or '96')
+                'FLASHRT_QWEN36_MTP_ARGMAX_PARTS', '128') or '128')
             for k in range(K):
                 self.forward_mtp_head_nvfp4(
                     self._mtp_static_prev_h,
@@ -7863,6 +7873,8 @@ class Qwen36TorchFrontendRtx:
         if not isinstance(mtp, dict) or 'k_proj_w_bf16' not in mtp:
             return 0
         prompt_len = int(prompt_len)
+        if prompt_len >= 128 and prompt_len < 512:
+            return min(128, prompt_len)
         if prompt_len < 512:
             return 0
         if prompt_len < 768:
@@ -8845,6 +8857,8 @@ class Qwen36TorchFrontendRtx:
             self, q_seq: int | None, end_pos: int) -> bool:
         """Measured default XQA policy for short and long FP8-KV verify."""
         end_pos = int(end_pos)
+        if end_pos < 256 and q_seq is not None and int(q_seq) <= 7:
+            return True
         if end_pos < 6144:
             return False
         if end_pos < 12288:
