@@ -5690,6 +5690,19 @@ N must be a multiple of 32; K must be a multiple of 64.
         py::arg("packed"), py::arg("sf_swz"),
         py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
 
+    m.def("silu_mul_merged_to_nvfp4_swizzled_grouped_bf16",
+        [](uintptr_t merged_gate_up,
+           uintptr_t packed, uintptr_t sf_swz,
+           int rows, int cols, uintptr_t stream) -> int {
+            return flash_rt::kernels::silu_mul_merged_to_nvfp4_swizzled_grouped_bf16(
+                to_ptr(merged_gate_up),
+                to_ptr(packed), to_ptr(sf_swz),
+                rows, cols, to_stream(stream));
+        },
+        py::arg("merged_gate_up"),
+        py::arg("packed"), py::arg("sf_swz"),
+        py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
+
     m.def("qwen3_k_norm_rope_kvwrite_bf16",
         [](uintptr_t k_pre, uintptr_t v_pre, uintptr_t k_norm_w,
            uintptr_t cos, uintptr_t sin,
