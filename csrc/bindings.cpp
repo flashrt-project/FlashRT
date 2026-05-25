@@ -4460,6 +4460,17 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("A"), py::arg("Ai"), py::arg("Ai_pack"),
         py::arg("S"), py::arg("num_v_heads"), py::arg("stream") = 0);
 
+    m.def("linear_attn_gdn_wy_solve_tril_b64_f32_fused_pack",
+        [](uintptr_t A, uintptr_t Ai, uintptr_t Ai_pack,
+           int S, int num_v_heads, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_solve_tril_b64_f32_fused_pack(
+                    to_ptr(A), to_ptr(Ai), to_ptr(Ai_pack),
+                    S, num_v_heads, to_stream(stream));
+        },
+        py::arg("A"), py::arg("Ai"), py::arg("Ai_pack"),
+        py::arg("S"), py::arg("num_v_heads"), py::arg("stream") = 0);
+
     m.def("linear_attn_gdn_wy_output_o_b64_bf16_cublaslt",
         [](uintptr_t q_l2, uintptr_t k_l2, uintptr_t v_new,
            uintptr_t h0, uintptr_t g_cumsum,

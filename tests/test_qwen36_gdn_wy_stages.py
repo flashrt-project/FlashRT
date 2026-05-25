@@ -309,6 +309,32 @@ def test_linear_attn_gdn_wy_solve_tril_parallel_pack_matches_reference(S):
         Ai_pack, Ai.to(torch.bfloat16), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("S", [6, 64, 65, 128])
+def test_linear_attn_gdn_wy_solve_tril_fused_pack_matches_reference(S):
+    fvk = _load_fvk()
+    if not hasattr(fvk, "linear_attn_gdn_wy_solve_tril_b64_f32_fused_pack"):
+        pytest.skip("fused solve_tril pack kernel is not built")
+    torch.manual_seed(8789 + S)
+    chunks = (S + 63) // 64
+    A = torch.zeros(chunks, 48, 64, 64, device="cuda", dtype=torch.float32)
+    for ci in range(chunks):
+        T = min(64, S - ci * 64)
+        block = torch.randn(48, T, T, device="cuda") * 0.01
+        A[ci, :, :T, :T] = torch.tril(block, diagonal=-1)
+
+    Ai = torch.empty_like(A)
+    Ai_pack = torch.empty(chunks, 48, 64, 64, device="cuda",
+                          dtype=torch.bfloat16)
+    fvk.linear_attn_gdn_wy_solve_tril_b64_f32_fused_pack(
+        _ptr(A), _ptr(Ai), _ptr(Ai_pack), S, 48, 0)
+    torch.cuda.synchronize()
+
+    Ai_ref = _solve_ref(A, S)
+    torch.testing.assert_close(Ai, Ai_ref, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(
+        Ai_pack, Ai.to(torch.bfloat16), rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("S", [6, 64, 65])
 def test_qwen36_wy_recompute_wu_matches_reference(S):
     fvk = _load_fvk()

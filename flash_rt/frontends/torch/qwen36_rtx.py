@@ -2292,12 +2292,27 @@ class Qwen36TorchFrontendRtx:
                         'linear_attn_gdn_wy_recompute_wu_b64_bf16_cublaslt_packed_rhs')
                 )
                 if use_wy_lt_ai_pack_from_solve:
-                    fvk.linear_attn_gdn_wy_solve_tril_b64_f32_parallel_pack(
-                        self._K_wy_A[:chunks].data_ptr(),
-                        self._K_wy_Ai[:chunks].data_ptr(),
-                        self._K_wy_Ai_pack[:chunks].data_ptr(),
-                        K, 48, s,
-                    )
+                    use_fused_solve_pack = (
+                        hasattr(
+                            fvk,
+                            'linear_attn_gdn_wy_solve_tril_b64_f32_fused_pack')
+                        and os.environ.get(
+                            'FLASHRT_QWEN36_TQ_PREFILL_GDN_FUSED_SOLVE',
+                            '1').strip().lower() not in ('0', 'false', 'off'))
+                    if use_fused_solve_pack:
+                        fvk.linear_attn_gdn_wy_solve_tril_b64_f32_fused_pack(
+                            self._K_wy_A[:chunks].data_ptr(),
+                            self._K_wy_Ai[:chunks].data_ptr(),
+                            self._K_wy_Ai_pack[:chunks].data_ptr(),
+                            K, 48, s,
+                        )
+                    else:
+                        fvk.linear_attn_gdn_wy_solve_tril_b64_f32_parallel_pack(
+                            self._K_wy_A[:chunks].data_ptr(),
+                            self._K_wy_Ai[:chunks].data_ptr(),
+                            self._K_wy_Ai_pack[:chunks].data_ptr(),
+                            K, 48, s,
+                        )
                 elif (
                     use_wy_lt_kkt
                     and hasattr(
