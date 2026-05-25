@@ -2343,8 +2343,8 @@ class Qwen36TorchFrontendRtx:
                         self._K_wy_h0[:chunks].data_ptr(),
                         self._K_wy_v_new[:K].data_ptr(),
                         self._K_wy_rhs_w[:chunks].data_ptr(),
-                        self._K_wy_out_q_pack[:chunks].data_ptr(),
                         self._K_wy_rhs_u[:chunks].data_ptr(),
+                        self._K_wy_w_pack[:chunks].data_ptr(),
                         K, 16, 48, 128, 3, s,
                     )
                 elif use_wy_lt_packed_wu_f32gemm:
@@ -2428,6 +2428,26 @@ class Qwen36TorchFrontendRtx:
                         K, s,
                     )
                 if (
+                    use_wy_lt_packed_wu_bf16
+                    and hasattr(
+                        fvk,
+                        'linear_attn_gdn_wy_output_o_b64_bf16_cublaslt_packed_kv')
+                ):
+                    fvk.linear_attn_gdn_wy_output_o_b64_bf16_cublaslt_packed_kv(
+                        self._K_fla_q16_l2[:, :K].data_ptr(),
+                        self._K_wy_rhs_w[:chunks].data_ptr(),
+                        self._K_wy_rhs_u[:chunks].data_ptr(),
+                        self._K_wy_h0[:chunks].data_ptr(),
+                        self._K_wy_g_cumsum[:K].data_ptr(),
+                        self._K_wy_out_q_pack[:chunks].data_ptr(),
+                        self._K_wy_A[:chunks].data_ptr(),
+                        self._K_wy_Ai_pack[:chunks].data_ptr(),
+                        self._K_wy_w_pack[:chunks].data_ptr(),
+                        self._K_wy_u_pack[:chunks].data_ptr(),
+                        self._K_lin_attn_out[:K].data_ptr(),
+                        K, 16, 48, 128, 3, s,
+                    )
+                elif (
                     use_wy_lt_packed_wu
                     and hasattr(
                         fvk,

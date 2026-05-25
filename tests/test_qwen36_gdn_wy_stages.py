@@ -22,6 +22,7 @@ def _load_fvk():
         "linear_attn_gdn_wy_recompute_wu_b64_bf16_cublaslt",
         "linear_attn_gdn_wy_solve_tril_b64_f32_parallel",
         "linear_attn_gdn_wy_output_o_b64_bf16_cublaslt",
+        "linear_attn_gdn_wy_output_o_b64_bf16_cublaslt_packed_kv",
         "linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt",
         "linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu",
         "linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_f32state",
@@ -583,12 +584,11 @@ def test_linear_attn_gdn_wy_chunk_h_cublaslt_packed_wu_matches_reference(S):
         w_pack[ci, :, :end - start] = w[start:end].transpose(0, 1)
         u_pack[ci, :, :end - start] = u[start:end].transpose(0, 1)
     wh_pack = torch.empty_like(k_pack_hv)
-    decayed_v_pack = torch.empty_like(k_pack_hv)
 
     fvk.linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu(
         _ptr(k_l2), _ptr(w_pack), _ptr(u_pack), _ptr(g_cumsum), _ptr(state),
         _ptr(h0), _ptr(v_new), _ptr(k_pack_hv), _ptr(wh_pack),
-        _ptr(decayed_v_pack), S, 16, 48, 128, 3, 0)
+        _ptr(w_pack), S, 16, 48, 128, 3, 0)
     torch.cuda.synchronize()
 
     state_base = state0.clone()
@@ -609,6 +609,12 @@ def test_linear_attn_gdn_wy_chunk_h_cublaslt_packed_wu_matches_reference(S):
     torch.testing.assert_close(h0, h0_base, rtol=0, atol=0)
     torch.testing.assert_close(v_new, v_new_base, rtol=0, atol=0)
     torch.testing.assert_close(state, state_base, rtol=0, atol=0)
+
+    v_pack_ref = torch.zeros_like(k_pack_hv)
+    for ci, start in enumerate(range(0, S, 64)):
+        end = min(start + 64, S)
+        v_pack_ref[ci, :, :end - start] = v_new_base[start:end].transpose(0, 1)
+    torch.testing.assert_close(wh_pack, v_pack_ref, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("S", [6, 64, 65])
@@ -745,6 +751,53 @@ def test_linear_attn_gdn_wy_output_o_cublaslt_packed_k_matches_reference(S):
         _ptr(q_l2), _ptr(k_pack_hv), _ptr(v_new), _ptr(h0),
         _ptr(g_cumsum), _ptr(q_pack), _ptr(v_pack), _ptr(qk_base),
         _ptr(local_a_pack), _ptr(qh_pack), _ptr(local_pack), _ptr(out),
+        S, 16, 48, 128, 3, 0)
+    torch.cuda.synchronize()
+
+    out_ref = _output_o_ref(q_l2, k_l2, v_new, h0, g_cumsum)
+    torch.testing.assert_close(out, out_ref, rtol=0, atol=3e-2)
+
+
+@pytest.mark.parametrize("S", [6, 64, 65])
+def test_linear_attn_gdn_wy_output_o_cublaslt_packed_kv_matches_reference(S):
+    fvk = _load_fvk()
+    torch.manual_seed(8567 + S)
+    q = torch.randn(S, 16, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(S, 16, 128, device="cuda", dtype=torch.bfloat16)
+    v_new = torch.randn(S, 48, 128, device="cuda", dtype=torch.bfloat16)
+    h0 = (torch.randn((S + 63) // 64, 48, 128, 128, device="cuda")
+          * 0.02).to(torch.bfloat16)
+    g = (torch.randn(S, 48, device="cuda") * 0.02).to(torch.bfloat16)
+
+    q_l2 = (q.float() / torch.sqrt(
+        torch.sum(q.float() * q.float(), dim=-1, keepdim=True) + 1e-6)
+    ).to(torch.bfloat16)
+    k_l2 = (k.float() / torch.sqrt(
+        torch.sum(k.float() * k.float(), dim=-1, keepdim=True) + 1e-6)
+    ).to(torch.bfloat16)
+    g_cumsum = _local_cumsum_bf16(g)
+    chunks = (S + 63) // 64
+    k_pack_hv = torch.zeros(chunks, 48, 64, 128, device="cuda",
+                            dtype=torch.bfloat16)
+    v_pack = torch.zeros_like(k_pack_hv)
+    for ci, start in enumerate(range(0, S, 64)):
+        end = min(start + 64, S)
+        for vh in range(48):
+            k_pack_hv[ci, vh, :end - start] = k_l2[start:end, vh // 3]
+        v_pack[ci, :, :end - start] = v_new[start:end].transpose(0, 1)
+    q_pack = torch.empty_like(k_pack_hv)
+    qk_base = torch.empty(chunks, 48, 64, 64, device="cuda",
+                          dtype=torch.float32)
+    local_a_pack = torch.empty(chunks, 48, 64, 64, device="cuda",
+                               dtype=torch.bfloat16)
+    qh_pack = torch.empty_like(k_pack_hv)
+    local_pack = torch.empty_like(k_pack_hv)
+    out = torch.empty(S, 48, 128, device="cuda", dtype=torch.bfloat16)
+
+    fvk.linear_attn_gdn_wy_output_o_b64_bf16_cublaslt_packed_kv(
+        _ptr(q_l2), _ptr(k_pack_hv), _ptr(v_pack), _ptr(h0),
+        _ptr(g_cumsum), _ptr(q_pack), _ptr(qk_base), _ptr(local_a_pack),
+        _ptr(qh_pack), _ptr(local_pack), _ptr(out),
         S, 16, 48, 128, 3, 0)
     torch.cuda.synchronize()
 

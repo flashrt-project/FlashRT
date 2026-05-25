@@ -925,6 +925,35 @@ __global__ void pack_output_qv_kernel(
       v_new[(static_cast<size_t>(s) * num_v_heads + vh) * head_dim + d];
 }
 
+__global__ void pack_output_q_kernel(
+    const __nv_bfloat16* __restrict__ q_l2,
+    __nv_bfloat16* __restrict__ q_pack,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int chunks = (S + kChunk - 1) / kChunk;
+  const int total = chunks * num_v_heads * kChunk * head_dim;
+  if (idx >= total) return;
+
+  const int d = idx % head_dim;
+  const int t = (idx / head_dim) % kChunk;
+  const int vh = (idx / (head_dim * kChunk)) % num_v_heads;
+  const int chunk = idx / (head_dim * kChunk * num_v_heads);
+  const int s = chunk * kChunk + t;
+  const int kh = vh / qk_group;
+  if (s >= S || kh >= num_k_heads) {
+    q_pack[idx] = __float2bfloat16(0.0f);
+    return;
+  }
+
+  q_pack[idx] =
+      q_l2[(static_cast<size_t>(s) * num_k_heads + kh) * head_dim + d];
+}
+
 __global__ void pack_chunk_h_inputs_kernel(
     const __nv_bfloat16* __restrict__ k_l2,
     const __nv_bfloat16* __restrict__ u,
@@ -999,6 +1028,7 @@ __global__ void make_vnew_decay_and_scale_state_kernel(
     __nv_bfloat16* __restrict__ state,
     __nv_bfloat16* __restrict__ h0_chunk,
     __nv_bfloat16* __restrict__ v_new,
+    __nv_bfloat16* __restrict__ v_pack_out,
     __nv_bfloat16* __restrict__ decayed_v_pack,
     int S,
     int chunk,
@@ -1022,6 +1052,9 @@ __global__ void make_vnew_decay_and_scale_state_kernel(
         * head_dim + d;
     const int T = min(kChunk, S - start);
     if (t >= T || s >= S) {
+      if (v_pack_out != nullptr) {
+        v_pack_out[pidx] = __float2bfloat16(0.0f);
+      }
       decayed_v_pack[pidx] = __float2bfloat16(0.0f);
       return;
     }
@@ -1029,7 +1062,11 @@ __global__ void make_vnew_decay_and_scale_state_kernel(
         static_cast<float>(u_pack[pidx]) - static_cast<float>(wh_pack[pidx]);
     const size_t out_off =
         (static_cast<size_t>(s) * num_v_heads + vh) * head_dim + d;
-    v_new[out_off] = __float2bfloat16(val);
+    const __nv_bfloat16 val_bf16 = __float2bfloat16(val);
+    v_new[out_off] = val_bf16;
+    if (v_pack_out != nullptr) {
+      v_pack_out[pidx] = val_bf16;
+    }
     const float g_last =
         static_cast<float>(g_cumsum[
             static_cast<size_t>(start + T - 1) * num_v_heads + vh]);
@@ -1547,7 +1584,7 @@ void gdn_wy_chunk_h_b64_bf16_cublaslt(
         u_pack_bf16, wh_pack_bf16,
         reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
         state_bf16, h0_bf16 + static_cast<size_t>(ci) * state_elems,
-        reinterpret_cast<__nv_bfloat16*>(v_new), decayed_bf16,
+        reinterpret_cast<__nv_bfloat16*>(v_new), nullptr, decayed_bf16,
         S, ci, num_v_heads, head_dim);
 
     FLASHRT_CUBLASLT_CHECK(cublasLtMatmul(
@@ -1934,7 +1971,7 @@ void gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu(
         u_pack_bf16, wh_pack_bf16,
         reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
         state_bf16, h0_bf16 + static_cast<size_t>(ci) * state_elems,
-        reinterpret_cast<__nv_bfloat16*>(v_new), decayed_bf16,
+        reinterpret_cast<__nv_bfloat16*>(v_new), wh_pack_bf16, decayed_bf16,
         S, ci, num_v_heads, head_dim);
 
     FLASHRT_CUBLASLT_CHECK(cublasLtMatmul(
@@ -2071,6 +2108,90 @@ void gdn_wy_output_o_b64_bf16_cublaslt_packed_k(
       reinterpret_cast<const __nv_bfloat16*>(v_new),
       reinterpret_cast<__nv_bfloat16*>(q_pack),
       reinterpret_cast<__nv_bfloat16*>(v_pack),
+      S, num_k_heads, num_v_heads, head_dim, qk_group);
+
+  const float alpha = 1.0f;
+  const float beta0 = 0.0f;
+
+  LtPlan& qh_plan = get_qh_plan(batches, head_dim);
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmul(
+      g_lt, qh_plan.desc, &alpha,
+      q_pack, qh_plan.a_desc,
+      h0, qh_plan.b_desc,
+      &beta0,
+      qh_pack, qh_plan.c_desc,
+      qh_pack, qh_plan.c_desc,
+      &qh_plan.algo, g_workspace, g_workspace_size, stream));
+
+  LtPlan& qk_plan = get_kkt_plan(batches, head_dim);
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmul(
+      g_lt, qk_plan.desc, &alpha,
+      q_pack, qk_plan.a_desc,
+      k_pack_hv, qk_plan.b_desc,
+      &beta0,
+      qk_base, qk_plan.c_desc,
+      qk_base, qk_plan.c_desc,
+      &qk_plan.algo, g_workspace, g_workspace_size, stream));
+
+  apply_output_local_a_kernel<<<
+      dim3((kChunk * kChunk + kThreads - 1) / kThreads,
+           num_v_heads, chunks),
+      kThreads, 0, stream>>>(
+      reinterpret_cast<const float*>(qk_base),
+      reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
+      reinterpret_cast<__nv_bfloat16*>(local_a_pack),
+      S, num_v_heads);
+
+  LtPlan& mm_plan = get_mm64d_plan(batches, head_dim);
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmul(
+      g_lt, mm_plan.desc, &alpha,
+      local_a_pack, mm_plan.a_desc,
+      v_pack, mm_plan.b_desc,
+      &beta0,
+      local_pack, mm_plan.c_desc,
+      local_pack, mm_plan.c_desc,
+      &mm_plan.algo, g_workspace, g_workspace_size, stream));
+
+  combine_output_kernel<<<
+      (S * num_v_heads * head_dim + kThreads - 1) / kThreads,
+      kThreads, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(qh_pack),
+      reinterpret_cast<const __nv_bfloat16*>(local_pack),
+      reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
+      reinterpret_cast<__nv_bfloat16*>(out),
+      S, num_v_heads, head_dim);
+}
+
+void gdn_wy_output_o_b64_bf16_cublaslt_packed_kv(
+    const void* q_l2,
+    const void* k_pack_hv,
+    const void* v_pack,
+    const void* h0,
+    const void* g_cumsum,
+    void*       q_pack,
+    void*       qk_base,
+    void*       local_a_pack,
+    void*       qh_pack,
+    void*       local_pack,
+    void*       out,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group,
+    cudaStream_t stream)
+{
+  if (S <= 0 || num_k_heads <= 0 || num_v_heads <= 0 ||
+      head_dim <= 0 || qk_group <= 0) {
+    return;
+  }
+  const int chunks = (S + kChunk - 1) / kChunk;
+  const int batches = chunks * num_v_heads;
+  const int pack_total = batches * kChunk * head_dim;
+  pack_output_q_kernel<<<(pack_total + kThreads - 1) / kThreads,
+                          kThreads, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(q_l2),
+      reinterpret_cast<__nv_bfloat16*>(q_pack),
       S, num_k_heads, num_v_heads, head_dim, qk_group);
 
   const float alpha = 1.0f;
