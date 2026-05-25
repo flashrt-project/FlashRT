@@ -199,5 +199,69 @@ void qwen36_gdn_chunk_from_conv_smem_strided_bf16(
     bool use_qk_l2norm,
     cudaStream_t stream);
 
+// Chunk/WY Gated DeltaNet building blocks. These are the native
+// FlashRT replacement path for the Python/Triton FLA chunk implementation.
+// First specialization targets Qwen3.6 shapes:
+//   q/k:      (S, 16, 128) bf16
+//   g/beta:   (S, 48) bf16
+//   q/k out:  (S, 16, 128) bf16
+//   g_cumsum: (S, 48) bf16
+//   A/Ai:     (ceil(S / 64), 48, 64, 64) fp32
+void qwen36_gdn_wy_norm_cumsum_bf16(
+    const void* q16,
+    const void* k16,
+    const void* g,
+    void*       q16_l2,
+    void*       k16_l2,
+    void*       g_cumsum,
+    int S,
+    cudaStream_t stream);
+
+void qwen36_gdn_wy_kkt_b64_bf16(
+    const void* k16_l2,
+    const void* beta,
+    const void* g_cumsum,
+    void*       A,
+    int S,
+    cudaStream_t stream);
+
+void qwen36_gdn_wy_solve_tril_b64_f32(
+    const void* A,
+    void*       Ai,
+    int S,
+    cudaStream_t stream);
+
+void qwen36_gdn_wy_recompute_wu_b64_bf16(
+    const void* k16_l2,
+    const void* v48,
+    const void* beta,
+    const void* g_cumsum,
+    const void* Ai,
+    void*       w48,
+    void*       u48,
+    int S,
+    cudaStream_t stream);
+
+void qwen36_gdn_wy_chunk_h_b64_bf16(
+    const void* k16_l2,
+    const void* u48,
+    const void* w48,
+    const void* g_cumsum,
+    void*       state,
+    void*       h0,
+    void*       v_new,
+    int S,
+    cudaStream_t stream);
+
+void qwen36_gdn_wy_output_o_b64_bf16(
+    const void* q16_l2,
+    const void* k16_l2,
+    const void* v_new,
+    const void* h0,
+    const void* g_cumsum,
+    void*       out,
+    int S,
+    cudaStream_t stream);
+
 }  // namespace kernels
 }  // namespace flash_rt

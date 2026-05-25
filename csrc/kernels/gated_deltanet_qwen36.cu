@@ -21,6 +21,9 @@ namespace kernels {
 namespace {
 
 constexpr int kHD = 128;   // Qwen3.6 head_k_dim == head_v_dim
+constexpr int kQHeads = 16;
+constexpr int kVHeads = 48;
+constexpr int kWyChunk = 64;
 constexpr float kEps = 1e-6f;
 constexpr int kSplitThreads = 256;
 
@@ -739,6 +742,339 @@ __global__ void qwen36_gdn_chunk_from_conv_smem_kernel(
   }
 }
 
+__global__ void qwen36_gdn_wy_norm_qk_kernel(
+    const __nv_bfloat16* __restrict__ q16,
+    const __nv_bfloat16* __restrict__ k16,
+    __nv_bfloat16* __restrict__ q16_l2,
+    __nv_bfloat16* __restrict__ k16_l2,
+    int S)
+{
+  const int t = threadIdx.x;
+  const int h = blockIdx.x;
+  const int s = blockIdx.y;
+  if (t >= kHD || h >= kQHeads || s >= S) return;
+
+  __shared__ float scratch[32];
+  const size_t off = (static_cast<size_t>(s) * kQHeads + h) * kHD + t;
+  const float qv = static_cast<float>(q16[off]);
+  const float kv = static_cast<float>(k16[off]);
+  float q_sq = qv * qv;
+  float k_sq = kv * kv;
+  q_sq = block_reduce_sum<kHD>(q_sq, scratch);
+  __syncthreads();
+  k_sq = block_reduce_sum<kHD>(k_sq, scratch);
+  __syncthreads();
+  const float q_inv = rsqrtf(q_sq + kEps);
+  const float k_inv = rsqrtf(k_sq + kEps);
+  q16_l2[off] = __float2bfloat16(qv * q_inv);
+  k16_l2[off] = __float2bfloat16(kv * k_inv);
+}
+
+__global__ void qwen36_gdn_wy_cumsum_g_kernel(
+    const __nv_bfloat16* __restrict__ g,
+    __nv_bfloat16* __restrict__ g_cumsum,
+    int S)
+{
+  const int h = blockIdx.x * blockDim.x + threadIdx.x;
+  if (h >= kVHeads) return;
+  float acc = 0.0f;
+  for (int s = 0; s < S; ++s) {
+    if ((s % kWyChunk) == 0) {
+      acc = 0.0f;
+    }
+    const size_t off = static_cast<size_t>(s) * kVHeads + h;
+    acc += static_cast<float>(g[off]);
+    g_cumsum[off] = __float2bfloat16(acc);
+  }
+}
+
+__global__ void qwen36_gdn_wy_kkt_b64_kernel(
+    const __nv_bfloat16* __restrict__ k16_l2,
+    const __nv_bfloat16* __restrict__ beta,
+    const __nv_bfloat16* __restrict__ g_cumsum,
+    float* __restrict__ A,
+    int S)
+{
+  const int pair = blockIdx.x * blockDim.x + threadIdx.x;
+  if (pair >= kWyChunk * kWyChunk) return;
+  const int i = pair / kWyChunk;
+  const int j = pair - i * kWyChunk;
+  const int vh = blockIdx.y;
+  const int chunk = blockIdx.z;
+  const int si = chunk * kWyChunk + i;
+  const int sj = chunk * kWyChunk + j;
+  const size_t a_off =
+      (((static_cast<size_t>(chunk) * kVHeads + vh) * kWyChunk + i)
+       * kWyChunk + j);
+  if (i <= j || si >= S || sj >= S) {
+    A[a_off] = 0.0f;
+    return;
+  }
+
+  const int kh = vh / 3;
+  const size_t ki_base =
+      (static_cast<size_t>(si) * kQHeads + kh) * kHD;
+  const size_t kj_base =
+      (static_cast<size_t>(sj) * kQHeads + kh) * kHD;
+  float dot = 0.0f;
+  #pragma unroll 16
+  for (int d = 0; d < kHD; ++d) {
+    dot = fmaf(
+        static_cast<float>(k16_l2[ki_base + d]),
+        static_cast<float>(k16_l2[kj_base + d]),
+        dot);
+  }
+  const float beta_i =
+      static_cast<float>(beta[static_cast<size_t>(si) * kVHeads + vh]);
+  const float gi =
+      static_cast<float>(g_cumsum[static_cast<size_t>(si) * kVHeads + vh]);
+  const float gj =
+      static_cast<float>(g_cumsum[static_cast<size_t>(sj) * kVHeads + vh]);
+  A[a_off] = beta_i * dot * __expf(gi - gj);
+}
+
+__global__ void qwen36_gdn_wy_solve_tril_b64_kernel(
+    const float* __restrict__ A,
+    float* __restrict__ Ai,
+    int S)
+{
+  const int vh = blockIdx.x;
+  const int chunk = blockIdx.y;
+  const int base_s = chunk * kWyChunk;
+  const size_t base =
+      (static_cast<size_t>(chunk) * kVHeads + vh) * kWyChunk * kWyChunk;
+
+  if (threadIdx.x != 0) return;
+
+  float inv[kWyChunk][kWyChunk];
+  #pragma unroll
+  for (int r = 0; r < kWyChunk; ++r) {
+    #pragma unroll
+    for (int c = 0; c < kWyChunk; ++c) {
+      inv[r][c] = (r == c && base_s + r < S) ? 1.0f : 0.0f;
+    }
+  }
+
+  // FLA's solve_tril computes the inverse of (I + lower(A)) with the
+  // strictly-lower part carrying the negative sign in the recurrence.
+  for (int r = 1; r < kWyChunk && base_s + r < S; ++r) {
+    for (int c = 0; c < r; ++c) {
+      float val = -A[base + r * kWyChunk + c];
+      for (int m = c + 1; m < r; ++m) {
+        val -= A[base + r * kWyChunk + m] * inv[m][c];
+      }
+      inv[r][c] = val;
+    }
+  }
+
+  for (int r = 0; r < kWyChunk; ++r) {
+    for (int c = 0; c < kWyChunk; ++c) {
+      Ai[base + r * kWyChunk + c] = inv[r][c];
+    }
+  }
+}
+
+__global__ void qwen36_gdn_wy_recompute_wu_b64_kernel(
+    const __nv_bfloat16* __restrict__ k16_l2,
+    const __nv_bfloat16* __restrict__ v48,
+    const __nv_bfloat16* __restrict__ beta,
+    const __nv_bfloat16* __restrict__ g_cumsum,
+    const float* __restrict__ Ai,
+    __nv_bfloat16* __restrict__ w48,
+    __nv_bfloat16* __restrict__ u48,
+    int S)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = S * kVHeads * kHD;
+  if (idx >= total) return;
+
+  const int d = idx % kHD;
+  const int vh = (idx / kHD) % kVHeads;
+  const int s = idx / (kVHeads * kHD);
+  const int chunk = s / kWyChunk;
+  const int i = s - chunk * kWyChunk;
+  const int kh = vh / 3;
+  const int chunk_start = chunk * kWyChunk;
+  const int T = min(kWyChunk, S - chunk_start);
+  const size_t ai_base =
+      (static_cast<size_t>(chunk) * kVHeads + vh) * kWyChunk * kWyChunk
+      + static_cast<size_t>(i) * kWyChunk;
+
+  float u_acc = 0.0f;
+  float w_acc = 0.0f;
+  for (int j = 0; j < T; ++j) {
+    const int sj = chunk_start + j;
+    const float aij = Ai[ai_base + j];
+    const float beta_j =
+        static_cast<float>(beta[static_cast<size_t>(sj) * kVHeads + vh]);
+    const float vj =
+        static_cast<float>(v48[(static_cast<size_t>(sj) * kVHeads + vh)
+                               * kHD + d]);
+    const float kj =
+        static_cast<float>(k16_l2[
+            (static_cast<size_t>(sj) * kQHeads + kh) * kHD + d]);
+    const float gj =
+        static_cast<float>(g_cumsum[static_cast<size_t>(sj) * kVHeads + vh]);
+    u_acc = fmaf(aij, vj * beta_j, u_acc);
+    w_acc = fmaf(aij, kj * beta_j * __expf(gj), w_acc);
+  }
+  u48[idx] = __float2bfloat16(u_acc);
+  w48[idx] = __float2bfloat16(w_acc);
+}
+
+__global__ void qwen36_gdn_wy_chunk_h_b64_kernel(
+    const __nv_bfloat16* __restrict__ k16_l2,
+    const __nv_bfloat16* __restrict__ u48,
+    const __nv_bfloat16* __restrict__ w48,
+    const __nv_bfloat16* __restrict__ g_cumsum,
+    __nv_bfloat16* __restrict__ state,
+    __nv_bfloat16* __restrict__ h0,
+    __nv_bfloat16* __restrict__ v_new,
+    int S)
+{
+  const int vh = blockIdx.x;
+  const int d = threadIdx.x;
+  if (vh >= kVHeads || d >= kHD) return;
+
+  extern __shared__ float smem[];
+  float* state_s = smem;
+  const int kh = vh / 3;
+  const int chunks = (S + kWyChunk - 1) / kWyChunk;
+  const size_t state_base = static_cast<size_t>(vh) * kHD * kHD;
+
+  #pragma unroll 16
+  for (int r = 0; r < kHD; ++r) {
+    state_s[r * kHD + d] =
+        static_cast<float>(state[state_base + static_cast<size_t>(r) * kHD + d]);
+  }
+  __syncthreads();
+
+  float vbuf[kWyChunk];
+  for (int ci = 0; ci < chunks; ++ci) {
+    const int start = ci * kWyChunk;
+    const int T = min(kWyChunk, S - start);
+    const size_t h_base =
+        (static_cast<size_t>(ci) * kVHeads + vh) * kHD * kHD;
+
+    #pragma unroll 16
+    for (int r = 0; r < kHD; ++r) {
+      h0[h_base + static_cast<size_t>(r) * kHD + d] =
+          __float2bfloat16(state_s[r * kHD + d]);
+    }
+    __syncthreads();
+
+    for (int t = 0; t < kWyChunk; ++t) {
+      float val = 0.0f;
+      if (t < T) {
+        const int s = start + t;
+        const size_t wh_base =
+            (static_cast<size_t>(s) * kVHeads + vh) * kHD;
+        #pragma unroll 16
+        for (int r = 0; r < kHD; ++r) {
+          val = fmaf(static_cast<float>(w48[wh_base + r]),
+                     state_s[r * kHD + d], val);
+        }
+        val = static_cast<float>(u48[wh_base + d]) - val;
+        v_new[wh_base + d] = __float2bfloat16(val);
+      }
+      vbuf[t] = val;
+    }
+    __syncthreads();
+
+    if (T > 0) {
+      const float g_last =
+          static_cast<float>(g_cumsum[
+              static_cast<size_t>(start + T - 1) * kVHeads + vh]);
+      const float eg_last = __expf(g_last);
+      #pragma unroll 16
+      for (int r = 0; r < kHD; ++r) {
+        state_s[r * kHD + d] *= eg_last;
+      }
+      __syncthreads();
+
+      #pragma unroll 16
+      for (int r = 0; r < kHD; ++r) {
+        float acc = state_s[r * kHD + d];
+        for (int t = 0; t < T; ++t) {
+          const int s = start + t;
+          const float gt =
+              static_cast<float>(g_cumsum[static_cast<size_t>(s) * kVHeads + vh]);
+          const float decay = __expf(g_last - gt);
+          const float kval = static_cast<float>(
+              k16_l2[(static_cast<size_t>(s) * kQHeads + kh) * kHD + r]);
+          acc = fmaf(kval, vbuf[t] * decay, acc);
+        }
+        state_s[r * kHD + d] = acc;
+      }
+      __syncthreads();
+    }
+  }
+
+  #pragma unroll 16
+  for (int r = 0; r < kHD; ++r) {
+    state[state_base + static_cast<size_t>(r) * kHD + d] =
+        __float2bfloat16(state_s[r * kHD + d]);
+  }
+}
+
+__global__ void qwen36_gdn_wy_output_o_b64_kernel(
+    const __nv_bfloat16* __restrict__ q16_l2,
+    const __nv_bfloat16* __restrict__ k16_l2,
+    const __nv_bfloat16* __restrict__ v_new,
+    const __nv_bfloat16* __restrict__ h0,
+    const __nv_bfloat16* __restrict__ g_cumsum,
+    __nv_bfloat16* __restrict__ out,
+    int S)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = S * kVHeads * kHD;
+  if (idx >= total) return;
+
+  const int d = idx % kHD;
+  const int vh = (idx / kHD) % kVHeads;
+  const int s = idx / (kVHeads * kHD);
+  const int kh = vh / 3;
+  const int chunk = s / kWyChunk;
+  const int i = s - chunk * kWyChunk;
+  const int start = chunk * kWyChunk;
+  const size_t q_base = (static_cast<size_t>(s) * kQHeads + kh) * kHD;
+  const size_t h_base =
+      (static_cast<size_t>(chunk) * kVHeads + vh) * kHD * kHD;
+  const float gi =
+      static_cast<float>(g_cumsum[static_cast<size_t>(s) * kVHeads + vh]);
+
+  float qh = 0.0f;
+  #pragma unroll 16
+  for (int r = 0; r < kHD; ++r) {
+    qh = fmaf(static_cast<float>(q16_l2[q_base + r]),
+              static_cast<float>(h0[h_base + static_cast<size_t>(r) * kHD + d]),
+              qh);
+  }
+  qh *= __expf(gi);
+
+  float local = 0.0f;
+  for (int tj = 0; tj <= i; ++tj) {
+    const int sj = start + tj;
+    if (sj >= S) break;
+    const size_t kj_base = (static_cast<size_t>(sj) * kQHeads + kh) * kHD;
+    float qk = 0.0f;
+    #pragma unroll 16
+    for (int r = 0; r < kHD; ++r) {
+      qk = fmaf(static_cast<float>(q16_l2[q_base + r]),
+                static_cast<float>(k16_l2[kj_base + r]), qk);
+    }
+    const float gj =
+        static_cast<float>(g_cumsum[static_cast<size_t>(sj) * kVHeads + vh]);
+    const float vv =
+        static_cast<float>(v_new[(static_cast<size_t>(sj) * kVHeads + vh)
+                                 * kHD + d]);
+    local = fmaf(qk * __expf(gi - gj), vv, local);
+  }
+
+  constexpr float kScale = 0.08838834764831845f;  // 1 / sqrt(128)
+  out[idx] = __float2bfloat16((qh + local) * kScale);
+}
+
 }  // namespace
 
 void gated_deltanet_chunk_qwen36_bf16(
@@ -994,6 +1330,145 @@ void gated_deltanet_chunk_smem_qwen36_bf16(
       reinterpret_cast<__nv_bfloat16*>(state),
       reinterpret_cast<__nv_bfloat16*>(out),
       S, num_v_heads, use_qk_l2norm);
+}
+
+void qwen36_gdn_wy_norm_cumsum_bf16(
+    const void* q16,
+    const void* k16,
+    const void* g,
+    void*       q16_l2,
+    void*       k16_l2,
+    void*       g_cumsum,
+    int S,
+    cudaStream_t stream)
+{
+  if (S <= 0) return;
+  qwen36_gdn_wy_norm_qk_kernel<<<dim3(kQHeads, S), kHD, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(q16),
+      reinterpret_cast<const __nv_bfloat16*>(k16),
+      reinterpret_cast<__nv_bfloat16*>(q16_l2),
+      reinterpret_cast<__nv_bfloat16*>(k16_l2),
+      S);
+  qwen36_gdn_wy_cumsum_g_kernel<<<1, 64, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(g),
+      reinterpret_cast<__nv_bfloat16*>(g_cumsum),
+      S);
+}
+
+void qwen36_gdn_wy_kkt_b64_bf16(
+    const void* k16_l2,
+    const void* beta,
+    const void* g_cumsum,
+    void*       A,
+    int S,
+    cudaStream_t stream)
+{
+  if (S <= 0) return;
+  const int chunks = (S + kWyChunk - 1) / kWyChunk;
+  const int pairs = kWyChunk * kWyChunk;
+  qwen36_gdn_wy_kkt_b64_kernel<<<
+      dim3((pairs + 255) / 256, kVHeads, chunks), 256, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(k16_l2),
+      reinterpret_cast<const __nv_bfloat16*>(beta),
+      reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
+      reinterpret_cast<float*>(A),
+      S);
+}
+
+void qwen36_gdn_wy_solve_tril_b64_f32(
+    const void* A,
+    void*       Ai,
+    int S,
+    cudaStream_t stream)
+{
+  if (S <= 0) return;
+  const int chunks = (S + kWyChunk - 1) / kWyChunk;
+  qwen36_gdn_wy_solve_tril_b64_kernel<<<
+      dim3(kVHeads, chunks), 1, 0, stream>>>(
+      reinterpret_cast<const float*>(A),
+      reinterpret_cast<float*>(Ai),
+      S);
+}
+
+void qwen36_gdn_wy_recompute_wu_b64_bf16(
+    const void* k16_l2,
+    const void* v48,
+    const void* beta,
+    const void* g_cumsum,
+    const void* Ai,
+    void*       w48,
+    void*       u48,
+    int S,
+    cudaStream_t stream)
+{
+  if (S <= 0) return;
+  const int total = S * kVHeads * kHD;
+  qwen36_gdn_wy_recompute_wu_b64_kernel<<<
+      (total + 255) / 256, 256, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(k16_l2),
+      reinterpret_cast<const __nv_bfloat16*>(v48),
+      reinterpret_cast<const __nv_bfloat16*>(beta),
+      reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
+      reinterpret_cast<const float*>(Ai),
+      reinterpret_cast<__nv_bfloat16*>(w48),
+      reinterpret_cast<__nv_bfloat16*>(u48),
+      S);
+}
+
+void qwen36_gdn_wy_chunk_h_b64_bf16(
+    const void* k16_l2,
+    const void* u48,
+    const void* w48,
+    const void* g_cumsum,
+    void*       state,
+    void*       h0,
+    void*       v_new,
+    int S,
+    cudaStream_t stream)
+{
+  if (S <= 0) return;
+  constexpr size_t kSmemBytes = kHD * kHD * sizeof(float);
+  static bool attr_set = false;
+  if (!attr_set) {
+    cudaFuncSetAttribute(
+        qwen36_gdn_wy_chunk_h_b64_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(kSmemBytes));
+    attr_set = true;
+  }
+  qwen36_gdn_wy_chunk_h_b64_kernel<<<
+      kVHeads, kHD, kSmemBytes, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(k16_l2),
+      reinterpret_cast<const __nv_bfloat16*>(u48),
+      reinterpret_cast<const __nv_bfloat16*>(w48),
+      reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
+      reinterpret_cast<__nv_bfloat16*>(state),
+      reinterpret_cast<__nv_bfloat16*>(h0),
+      reinterpret_cast<__nv_bfloat16*>(v_new),
+      S);
+}
+
+void qwen36_gdn_wy_output_o_b64_bf16(
+    const void* q16_l2,
+    const void* k16_l2,
+    const void* v_new,
+    const void* h0,
+    const void* g_cumsum,
+    void*       out,
+    int S,
+    cudaStream_t stream)
+{
+  if (S <= 0) return;
+  const int total = S * kVHeads * kHD;
+  qwen36_gdn_wy_output_o_b64_kernel<<<
+      (total + 255) / 256, 256, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(q16_l2),
+      reinterpret_cast<const __nv_bfloat16*>(k16_l2),
+      reinterpret_cast<const __nv_bfloat16*>(v_new),
+      reinterpret_cast<const __nv_bfloat16*>(h0),
+      reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
+      reinterpret_cast<__nv_bfloat16*>(out),
+      S);
 }
 
 }  // namespace kernels

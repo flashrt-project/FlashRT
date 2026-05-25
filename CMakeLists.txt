@@ -856,6 +856,7 @@ pybind11_add_module(flash_rt_kernels
   csrc/quantize/rope_apply_bf16.cu
   csrc/gemm/fp8_block128_gemm.cu
   csrc/kernels/causal_conv1d_qwen36.cu
+  csrc/kernels/linear_attention/gated_delta_wy_bf16.cu
   csrc/kernels/gated_deltanet_qwen36.cu
   csrc/kernels/rms_norm_gated_silu_qwen36.cu
   csrc/kernels/silu_mul_qwen36.cu

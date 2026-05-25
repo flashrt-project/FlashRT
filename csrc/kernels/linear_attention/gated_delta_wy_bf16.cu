@@ -1,0 +1,1319 @@
+// SPDX-License-Identifier: Apache-2.0
+
+#include "gated_delta_wy_bf16.cuh"
+
+#include <cuda_bf16.h>
+#include <cublasLt.h>
+
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+
+namespace flash_rt {
+namespace kernels {
+namespace linear_attention {
+
+namespace {
+
+constexpr int kChunk = 64;
+constexpr int kThreads = 256;
+
+#define FLASHRT_CUBLASLT_CHECK(expr)                                      \
+  do {                                                                    \
+    cublasStatus_t _st = (expr);                                          \
+    if (_st != CUBLAS_STATUS_SUCCESS) {                                   \
+      throw std::runtime_error(std::string("cuBLASLt error ") +           \
+                               std::to_string(static_cast<int>(_st)) +    \
+                               " at " + __FILE__ + ":" +                \
+                               std::to_string(__LINE__));                 \
+    }                                                                     \
+  } while (0)
+
+struct LtKey {
+  int kind;
+  int batches;
+  int head_dim;
+  bool operator==(const LtKey& o) const {
+    return kind == o.kind && batches == o.batches && head_dim == o.head_dim;
+  }
+};
+
+struct LtKeyHash {
+  size_t operator()(const LtKey& k) const {
+    return (static_cast<size_t>(k.kind) << 40) ^
+           (static_cast<size_t>(k.batches) << 20) ^
+           static_cast<size_t>(k.head_dim);
+  }
+};
+
+struct LtPlan {
+  cublasLtMatmulDesc_t desc = nullptr;
+  cublasLtMatrixLayout_t a_desc = nullptr;
+  cublasLtMatrixLayout_t b_desc = nullptr;
+  cublasLtMatrixLayout_t c_desc = nullptr;
+  cublasLtMatmulAlgo_t algo{};
+};
+
+static cublasLtHandle_t g_lt = nullptr;
+static void* g_workspace = nullptr;
+static size_t g_workspace_size = 64 * 1024 * 1024;
+static std::mutex g_mu;
+static std::unordered_map<LtKey, LtPlan, LtKeyHash> g_plans;
+
+static void ensure_lt() {
+  if (g_lt) return;
+  FLASHRT_CUBLASLT_CHECK(cublasLtCreate(&g_lt));
+  cudaError_t err = cudaMalloc(&g_workspace, g_workspace_size);
+  if (err != cudaSuccess) {
+    throw std::runtime_error(std::string("cudaMalloc failed for WY workspace: ") +
+                             cudaGetErrorString(err));
+  }
+}
+
+static LtPlan& get_kkt_plan(int batches, int head_dim) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  ensure_lt();
+  LtKey key{0, batches, head_dim};
+  auto it = g_plans.find(key);
+  if (it != g_plans.end()) return it->second;
+
+  LtPlan plan;
+  cublasOperation_t op_n = CUBLAS_OP_N;
+  cublasOperation_t op_t = CUBLAS_OP_T;
+  cublasLtOrder_t row_order = CUBLASLT_ORDER_ROW;
+  int32_t batch_count = batches;
+  int64_t a_stride = static_cast<int64_t>(kChunk) * head_dim;
+  int64_t b_stride = a_stride;
+  int64_t c_stride = static_cast<int64_t>(kChunk) * kChunk;
+
+  FLASHRT_CUBLASLT_CHECK(
+      cublasLtMatmulDescCreate(&plan.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(
+      plan.desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_n, sizeof(op_n)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(
+      plan.desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_t, sizeof(op_t)));
+
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(
+      &plan.a_desc, CUDA_R_16BF, kChunk, head_dim, head_dim));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.a_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order,
+      sizeof(row_order)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.a_desc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count,
+      sizeof(batch_count)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.a_desc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &a_stride,
+      sizeof(a_stride)));
+
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(
+      &plan.b_desc, CUDA_R_16BF, kChunk, head_dim, head_dim));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.b_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order,
+      sizeof(row_order)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.b_desc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count,
+      sizeof(batch_count)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.b_desc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &b_stride,
+      sizeof(b_stride)));
+
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(
+      &plan.c_desc, CUDA_R_32F, kChunk, kChunk, kChunk));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.c_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order,
+      sizeof(row_order)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.c_desc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count,
+      sizeof(batch_count)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.c_desc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &c_stride,
+      sizeof(c_stride)));
+
+  cublasLtMatmulPreference_t pref;
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmulPreferenceCreate(&pref));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmulPreferenceSetAttribute(
+      pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &g_workspace_size,
+      sizeof(g_workspace_size)));
+  cublasLtMatmulHeuristicResult_t heuristic;
+  int returned = 0;
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmulAlgoGetHeuristic(
+      g_lt, plan.desc, plan.a_desc, plan.b_desc, plan.c_desc, plan.c_desc,
+      pref, 1, &heuristic, &returned));
+  cublasLtMatmulPreferenceDestroy(pref);
+  if (returned == 0) {
+    throw std::runtime_error("cuBLASLt: no WY KKT batched BF16 algorithm");
+  }
+  plan.algo = heuristic.algo;
+
+  auto [inserted, _] = g_plans.emplace(key, plan);
+  return inserted->second;
+}
+
+static LtPlan& get_mm64d_plan(int batches, int head_dim) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  ensure_lt();
+  LtKey key{1, batches, head_dim};
+  auto it = g_plans.find(key);
+  if (it != g_plans.end()) return it->second;
+
+  LtPlan plan;
+  cublasOperation_t op_n = CUBLAS_OP_N;
+  cublasLtOrder_t row_order = CUBLASLT_ORDER_ROW;
+  int32_t batch_count = batches;
+  int64_t a_stride = static_cast<int64_t>(kChunk) * kChunk;
+  int64_t b_stride = static_cast<int64_t>(kChunk) * head_dim;
+  int64_t c_stride = static_cast<int64_t>(kChunk) * head_dim;
+
+  FLASHRT_CUBLASLT_CHECK(
+      cublasLtMatmulDescCreate(&plan.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(
+      plan.desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_n, sizeof(op_n)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(
+      plan.desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_n, sizeof(op_n)));
+
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(
+      &plan.a_desc, CUDA_R_16BF, kChunk, kChunk, kChunk));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.a_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order,
+      sizeof(row_order)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.a_desc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count,
+      sizeof(batch_count)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.a_desc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &a_stride,
+      sizeof(a_stride)));
+
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(
+      &plan.b_desc, CUDA_R_16BF, kChunk, head_dim, head_dim));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.b_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order,
+      sizeof(row_order)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.b_desc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count,
+      sizeof(batch_count)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.b_desc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &b_stride,
+      sizeof(b_stride)));
+
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(
+      &plan.c_desc, CUDA_R_16BF, kChunk, head_dim, head_dim));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.c_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order,
+      sizeof(row_order)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.c_desc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count,
+      sizeof(batch_count)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.c_desc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &c_stride,
+      sizeof(c_stride)));
+
+  cublasLtMatmulPreference_t pref;
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmulPreferenceCreate(&pref));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmulPreferenceSetAttribute(
+      pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &g_workspace_size,
+      sizeof(g_workspace_size)));
+  cublasLtMatmulHeuristicResult_t heuristic;
+  int returned = 0;
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmulAlgoGetHeuristic(
+      g_lt, plan.desc, plan.a_desc, plan.b_desc, plan.c_desc, plan.c_desc,
+      pref, 1, &heuristic, &returned));
+  cublasLtMatmulPreferenceDestroy(pref);
+  if (returned == 0) {
+    throw std::runtime_error("cuBLASLt: no WY 64xD batched BF16 algorithm");
+  }
+  plan.algo = heuristic.algo;
+  auto [inserted, _] = g_plans.emplace(key, plan);
+  return inserted->second;
+}
+
+static LtPlan& get_qh_plan(int batches, int head_dim) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  ensure_lt();
+  LtKey key{2, batches, head_dim};
+  auto it = g_plans.find(key);
+  if (it != g_plans.end()) return it->second;
+
+  LtPlan plan;
+  cublasOperation_t op_n = CUBLAS_OP_N;
+  cublasLtOrder_t row_order = CUBLASLT_ORDER_ROW;
+  int32_t batch_count = batches;
+  int64_t a_stride = static_cast<int64_t>(kChunk) * head_dim;
+  int64_t b_stride = static_cast<int64_t>(head_dim) * head_dim;
+  int64_t c_stride = static_cast<int64_t>(kChunk) * head_dim;
+
+  FLASHRT_CUBLASLT_CHECK(
+      cublasLtMatmulDescCreate(&plan.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(
+      plan.desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_n, sizeof(op_n)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(
+      plan.desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_n, sizeof(op_n)));
+
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(
+      &plan.a_desc, CUDA_R_16BF, kChunk, head_dim, head_dim));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.a_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order,
+      sizeof(row_order)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.a_desc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count,
+      sizeof(batch_count)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.a_desc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &a_stride,
+      sizeof(a_stride)));
+
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(
+      &plan.b_desc, CUDA_R_16BF, head_dim, head_dim, head_dim));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.b_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order,
+      sizeof(row_order)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.b_desc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count,
+      sizeof(batch_count)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.b_desc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &b_stride,
+      sizeof(b_stride)));
+
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(
+      &plan.c_desc, CUDA_R_16BF, kChunk, head_dim, head_dim));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.c_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order,
+      sizeof(row_order)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.c_desc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count,
+      sizeof(batch_count)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.c_desc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &c_stride,
+      sizeof(c_stride)));
+
+  cublasLtMatmulPreference_t pref;
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmulPreferenceCreate(&pref));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmulPreferenceSetAttribute(
+      pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &g_workspace_size,
+      sizeof(g_workspace_size)));
+  cublasLtMatmulHeuristicResult_t heuristic;
+  int returned = 0;
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmulAlgoGetHeuristic(
+      g_lt, plan.desc, plan.a_desc, plan.b_desc, plan.c_desc, plan.c_desc,
+      pref, 1, &heuristic, &returned));
+  cublasLtMatmulPreferenceDestroy(pref);
+  if (returned == 0) {
+    throw std::runtime_error("cuBLASLt: no WY QH batched BF16 algorithm");
+  }
+  plan.algo = heuristic.algo;
+  auto [inserted, _] = g_plans.emplace(key, plan);
+  return inserted->second;
+}
+
+static LtPlan& get_ktv_plan(int batches, int head_dim) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  ensure_lt();
+  LtKey key{3, batches, head_dim};
+  auto it = g_plans.find(key);
+  if (it != g_plans.end()) return it->second;
+
+  LtPlan plan;
+  cublasOperation_t op_t = CUBLAS_OP_T;
+  cublasOperation_t op_n = CUBLAS_OP_N;
+  cublasLtOrder_t row_order = CUBLASLT_ORDER_ROW;
+  int32_t batch_count = batches;
+  int64_t ab_stride = static_cast<int64_t>(kChunk) * head_dim;
+  int64_t c_stride = static_cast<int64_t>(head_dim) * head_dim;
+
+  FLASHRT_CUBLASLT_CHECK(
+      cublasLtMatmulDescCreate(&plan.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(
+      plan.desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_t, sizeof(op_t)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(
+      plan.desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_n, sizeof(op_n)));
+
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(
+      &plan.a_desc, CUDA_R_16BF, kChunk, head_dim, head_dim));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.a_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order,
+      sizeof(row_order)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.a_desc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count,
+      sizeof(batch_count)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.a_desc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &ab_stride,
+      sizeof(ab_stride)));
+
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(
+      &plan.b_desc, CUDA_R_16BF, kChunk, head_dim, head_dim));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.b_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order,
+      sizeof(row_order)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.b_desc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count,
+      sizeof(batch_count)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.b_desc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &ab_stride,
+      sizeof(ab_stride)));
+
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(
+      &plan.c_desc, CUDA_R_16BF, head_dim, head_dim, head_dim));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.c_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order,
+      sizeof(row_order)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.c_desc, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count,
+      sizeof(batch_count)));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+      plan.c_desc, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &c_stride,
+      sizeof(c_stride)));
+
+  cublasLtMatmulPreference_t pref;
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmulPreferenceCreate(&pref));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmulPreferenceSetAttribute(
+      pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &g_workspace_size,
+      sizeof(g_workspace_size)));
+  cublasLtMatmulHeuristicResult_t heuristic;
+  int returned = 0;
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmulAlgoGetHeuristic(
+      g_lt, plan.desc, plan.a_desc, plan.b_desc, plan.c_desc, plan.c_desc,
+      pref, 1, &heuristic, &returned));
+  cublasLtMatmulPreferenceDestroy(pref);
+  if (returned == 0) {
+    throw std::runtime_error("cuBLASLt: no WY KtV batched BF16 algorithm");
+  }
+  plan.algo = heuristic.algo;
+  auto [inserted, _] = g_plans.emplace(key, plan);
+  return inserted->second;
+}
+
+__global__ void pack_k_chunks_kernel(
+    const __nv_bfloat16* __restrict__ k_l2,
+    __nv_bfloat16* __restrict__ k_pack,
+    int S,
+    int num_k_heads,
+    int head_dim)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int chunks = (S + kChunk - 1) / kChunk;
+  const int total = chunks * num_k_heads * kChunk * head_dim;
+  if (idx >= total) return;
+
+  const int d = idx % head_dim;
+  const int t = (idx / head_dim) % kChunk;
+  const int kh = (idx / (head_dim * kChunk)) % num_k_heads;
+  const int chunk = idx / (head_dim * kChunk * num_k_heads);
+  const int s = chunk * kChunk + t;
+  const __nv_bfloat16 zero = __float2bfloat16(0.0f);
+  k_pack[idx] = (s < S)
+      ? k_l2[(static_cast<size_t>(s) * num_k_heads + kh) * head_dim + d]
+      : zero;
+}
+
+__global__ void apply_kkt_gating_kernel(
+    const float* __restrict__ kkt_base,
+    const __nv_bfloat16* __restrict__ beta,
+    const __nv_bfloat16* __restrict__ g_cumsum,
+    float* __restrict__ A,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int qk_group)
+{
+  const int pair = blockIdx.x * blockDim.x + threadIdx.x;
+  if (pair >= kChunk * kChunk) return;
+  const int i = pair / kChunk;
+  const int j = pair - i * kChunk;
+  const int vh = blockIdx.y;
+  const int chunk = blockIdx.z;
+  const int kh = vh / qk_group;
+  const int si = chunk * kChunk + i;
+  const int sj = chunk * kChunk + j;
+  const size_t a_off =
+      (((static_cast<size_t>(chunk) * num_v_heads + vh) * kChunk + i)
+       * kChunk + j);
+  if (kh >= num_k_heads || i <= j || si >= S || sj >= S) {
+    A[a_off] = 0.0f;
+    return;
+  }
+
+  const size_t base_off =
+      (((static_cast<size_t>(chunk) * num_k_heads + kh) * kChunk + i)
+       * kChunk + j);
+  const float dot = kkt_base[base_off];
+  const float beta_i =
+      static_cast<float>(beta[static_cast<size_t>(si) * num_v_heads + vh]);
+  const float gi =
+      static_cast<float>(g_cumsum[static_cast<size_t>(si) * num_v_heads + vh]);
+  const float gj =
+      static_cast<float>(g_cumsum[static_cast<size_t>(sj) * num_v_heads + vh]);
+  A[a_off] = beta_i * dot * __expf(gi - gj);
+}
+
+__global__ void pack_recompute_wu_kernel(
+    const __nv_bfloat16* __restrict__ k_l2,
+    const __nv_bfloat16* __restrict__ v,
+    const __nv_bfloat16* __restrict__ beta,
+    const __nv_bfloat16* __restrict__ g_cumsum,
+    const float* __restrict__ Ai,
+    __nv_bfloat16* __restrict__ Ai_pack,
+    __nv_bfloat16* __restrict__ rhs_w,
+    __nv_bfloat16* __restrict__ rhs_u,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int chunks = (S + kChunk - 1) / kChunk;
+  const int ai_total = chunks * num_v_heads * kChunk * kChunk;
+  const int rhs_total = chunks * num_v_heads * kChunk * head_dim;
+  const int total = ai_total + rhs_total;
+  if (idx >= total) return;
+
+  if (idx < ai_total) {
+    const int j = idx % kChunk;
+    const int i = (idx / kChunk) % kChunk;
+    const int vh = (idx / (kChunk * kChunk)) % num_v_heads;
+    const int chunk = idx / (kChunk * kChunk * num_v_heads);
+    const size_t src =
+        (((static_cast<size_t>(chunk) * num_v_heads + vh) * kChunk + i)
+         * kChunk + j);
+    Ai_pack[idx] = __float2bfloat16(Ai[src]);
+    return;
+  }
+
+  const int ridx = idx - ai_total;
+  const int d = ridx % head_dim;
+  const int t = (ridx / head_dim) % kChunk;
+  const int vh = (ridx / (head_dim * kChunk)) % num_v_heads;
+  const int chunk = ridx / (head_dim * kChunk * num_v_heads);
+  const int s = chunk * kChunk + t;
+  const int kh = vh / qk_group;
+  const __nv_bfloat16 zero = __float2bfloat16(0.0f);
+  if (s >= S || kh >= num_k_heads) {
+    rhs_w[ridx] = zero;
+    rhs_u[ridx] = zero;
+    return;
+  }
+  const float b =
+      static_cast<float>(beta[static_cast<size_t>(s) * num_v_heads + vh]);
+  const float g =
+      static_cast<float>(g_cumsum[static_cast<size_t>(s) * num_v_heads + vh]);
+  const float vv =
+      static_cast<float>(v[(static_cast<size_t>(s) * num_v_heads + vh)
+                           * head_dim + d]);
+  const float kk =
+      static_cast<float>(k_l2[(static_cast<size_t>(s) * num_k_heads + kh)
+                              * head_dim + d]);
+  rhs_u[ridx] = __float2bfloat16(vv * b);
+  rhs_w[ridx] = __float2bfloat16(kk * b * __expf(g));
+}
+
+__global__ void unpack_recompute_wu_kernel(
+    const __nv_bfloat16* __restrict__ w_pack,
+    const __nv_bfloat16* __restrict__ u_pack,
+    __nv_bfloat16* __restrict__ w,
+    __nv_bfloat16* __restrict__ u,
+    int S,
+    int num_v_heads,
+    int head_dim)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = S * num_v_heads * head_dim;
+  if (idx >= total) return;
+  const int d = idx % head_dim;
+  const int vh = (idx / head_dim) % num_v_heads;
+  const int s = idx / (num_v_heads * head_dim);
+  const int chunk = s / kChunk;
+  const int t = s - chunk * kChunk;
+  const size_t pidx =
+      ((static_cast<size_t>(chunk) * num_v_heads + vh) * kChunk + t)
+      * head_dim + d;
+  w[idx] = w_pack[pidx];
+  u[idx] = u_pack[pidx];
+}
+
+__global__ void solve_tril_b64_parallel_kernel(
+    const float* __restrict__ A,
+    float* __restrict__ Ai,
+    int S,
+    int num_v_heads)
+{
+  const int c = threadIdx.x;
+  const int vh = blockIdx.x;
+  const int chunk = blockIdx.y;
+  const int base_s = chunk * kChunk;
+  const int T = min(kChunk, S - base_s);
+  const size_t base =
+      (static_cast<size_t>(chunk) * num_v_heads + vh) * kChunk * kChunk;
+
+  for (int idx = c; idx < kChunk * kChunk; idx += kChunk) {
+    const int r = idx / kChunk;
+    const int col = idx - r * kChunk;
+    Ai[base + idx] = (r == col && r < T) ? 1.0f : 0.0f;
+  }
+  __syncthreads();
+
+  if (c >= T) return;
+  for (int r = c + 1; r < T; ++r) {
+    float val = -A[base + r * kChunk + c];
+    for (int m = c + 1; m < r; ++m) {
+      val -= A[base + r * kChunk + m] * Ai[base + m * kChunk + c];
+    }
+    Ai[base + r * kChunk + c] = val;
+  }
+}
+
+__global__ void pack_output_qkv_kernel(
+    const __nv_bfloat16* __restrict__ q_l2,
+    const __nv_bfloat16* __restrict__ k_l2,
+    const __nv_bfloat16* __restrict__ v_new,
+    __nv_bfloat16* __restrict__ q_pack,
+    __nv_bfloat16* __restrict__ k_pack_hv,
+    __nv_bfloat16* __restrict__ v_pack,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int chunks = (S + kChunk - 1) / kChunk;
+  const int total = chunks * num_v_heads * kChunk * head_dim;
+  if (idx >= total) return;
+
+  const int d = idx % head_dim;
+  const int t = (idx / head_dim) % kChunk;
+  const int vh = (idx / (head_dim * kChunk)) % num_v_heads;
+  const int chunk = idx / (head_dim * kChunk * num_v_heads);
+  const int s = chunk * kChunk + t;
+  const int kh = vh / qk_group;
+  const __nv_bfloat16 zero = __float2bfloat16(0.0f);
+  if (s >= S || kh >= num_k_heads) {
+    q_pack[idx] = zero;
+    k_pack_hv[idx] = zero;
+    v_pack[idx] = zero;
+    return;
+  }
+
+  q_pack[idx] =
+      q_l2[(static_cast<size_t>(s) * num_k_heads + kh) * head_dim + d];
+  k_pack_hv[idx] =
+      k_l2[(static_cast<size_t>(s) * num_k_heads + kh) * head_dim + d];
+  v_pack[idx] =
+      v_new[(static_cast<size_t>(s) * num_v_heads + vh) * head_dim + d];
+}
+
+__global__ void pack_chunk_h_inputs_kernel(
+    const __nv_bfloat16* __restrict__ k_l2,
+    const __nv_bfloat16* __restrict__ u,
+    const __nv_bfloat16* __restrict__ w,
+    __nv_bfloat16* __restrict__ k_pack_hv,
+    __nv_bfloat16* __restrict__ w_pack,
+    __nv_bfloat16* __restrict__ u_pack,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int chunks = (S + kChunk - 1) / kChunk;
+  const int total = chunks * num_v_heads * kChunk * head_dim;
+  if (idx >= total) return;
+
+  const int d = idx % head_dim;
+  const int t = (idx / head_dim) % kChunk;
+  const int vh = (idx / (head_dim * kChunk)) % num_v_heads;
+  const int chunk = idx / (head_dim * kChunk * num_v_heads);
+  const int s = chunk * kChunk + t;
+  const int kh = vh / qk_group;
+  const __nv_bfloat16 zero = __float2bfloat16(0.0f);
+  if (s >= S || kh >= num_k_heads) {
+    k_pack_hv[idx] = zero;
+    w_pack[idx] = zero;
+    u_pack[idx] = zero;
+    return;
+  }
+  k_pack_hv[idx] =
+      k_l2[(static_cast<size_t>(s) * num_k_heads + kh) * head_dim + d];
+  const size_t uv_off =
+      (static_cast<size_t>(s) * num_v_heads + vh) * head_dim + d;
+  w_pack[idx] = w[uv_off];
+  u_pack[idx] = u[uv_off];
+}
+
+__global__ void make_vnew_decay_and_scale_state_kernel(
+    const __nv_bfloat16* __restrict__ u_pack,
+    const __nv_bfloat16* __restrict__ wh_pack,
+    const __nv_bfloat16* __restrict__ g_cumsum,
+    __nv_bfloat16* __restrict__ state,
+    __nv_bfloat16* __restrict__ v_new,
+    __nv_bfloat16* __restrict__ decayed_v_pack,
+    int S,
+    int chunk,
+    int num_v_heads,
+    int head_dim)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int pack_total = num_v_heads * kChunk * head_dim;
+  const int state_total = num_v_heads * head_dim * head_dim;
+  const int total = pack_total + state_total;
+  if (idx >= total) return;
+  const int start = chunk * kChunk;
+
+  if (idx < pack_total) {
+    const int d = idx % head_dim;
+    const int t = (idx / head_dim) % kChunk;
+    const int vh = idx / (head_dim * kChunk);
+    const int s = start + t;
+    const size_t pidx =
+        ((static_cast<size_t>(chunk) * num_v_heads + vh) * kChunk + t)
+        * head_dim + d;
+    const int T = min(kChunk, S - start);
+    if (t >= T || s >= S) {
+      decayed_v_pack[pidx] = __float2bfloat16(0.0f);
+      return;
+    }
+    const float val =
+        static_cast<float>(u_pack[pidx]) - static_cast<float>(wh_pack[pidx]);
+    const size_t out_off =
+        (static_cast<size_t>(s) * num_v_heads + vh) * head_dim + d;
+    v_new[out_off] = __float2bfloat16(val);
+    const float g_last =
+        static_cast<float>(g_cumsum[
+            static_cast<size_t>(start + T - 1) * num_v_heads + vh]);
+    const float gt =
+        static_cast<float>(g_cumsum[static_cast<size_t>(s) * num_v_heads + vh]);
+    decayed_v_pack[pidx] = __float2bfloat16(val * __expf(g_last - gt));
+    return;
+  }
+
+  const int sidx = idx - pack_total;
+  const int col = sidx % head_dim;
+  const int row = (sidx / head_dim) % head_dim;
+  const int vh = sidx / (head_dim * head_dim);
+  const int T = min(kChunk, S - start);
+  if (T <= 0) return;
+  const float g_last =
+      static_cast<float>(g_cumsum[
+          static_cast<size_t>(start + T - 1) * num_v_heads + vh]);
+  const size_t off =
+      (static_cast<size_t>(vh) * head_dim + row) * head_dim + col;
+  state[off] = __float2bfloat16(static_cast<float>(state[off]) *
+                                __expf(g_last));
+}
+
+__global__ void init_state_f32_kernel(
+    const __nv_bfloat16* __restrict__ state,
+    float* __restrict__ state_f32,
+    int total)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  state_f32[idx] = static_cast<float>(state[idx]);
+}
+
+__global__ void downcast_state_f32_kernel(
+    const float* __restrict__ state_f32,
+    __nv_bfloat16* __restrict__ dst,
+    int total)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  dst[idx] = __float2bfloat16(state_f32[idx]);
+}
+
+__global__ void compute_wh_f32_state_kernel(
+    const __nv_bfloat16* __restrict__ w_pack,
+    const float* __restrict__ state_f32,
+    float* __restrict__ wh_f32,
+    int S,
+    int chunk,
+    int num_v_heads,
+    int head_dim)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = num_v_heads * kChunk * head_dim;
+  if (idx >= total) return;
+  const int d = idx % head_dim;
+  const int t = (idx / head_dim) % kChunk;
+  const int vh = idx / (head_dim * kChunk);
+  const int start = chunk * kChunk;
+  const int s = start + t;
+  if (s >= S) {
+    wh_f32[idx] = 0.0f;
+    return;
+  }
+
+  float acc = 0.0f;
+  const size_t state_base = static_cast<size_t>(vh) * head_dim * head_dim;
+  const size_t w_base =
+      (static_cast<size_t>(chunk) * num_v_heads + vh) * kChunk * head_dim
+      + static_cast<size_t>(t) * head_dim;
+  for (int r = 0; r < head_dim; ++r) {
+    acc = fmaf(static_cast<float>(w_pack[w_base + r]),
+               state_f32[state_base + static_cast<size_t>(r) * head_dim + d],
+               acc);
+  }
+  wh_f32[idx] = acc;
+}
+
+__global__ void make_vnew_decay_and_scale_state_f32_wh_kernel(
+    const __nv_bfloat16* __restrict__ u_pack,
+    float* __restrict__ wh_decayed_f32,
+    const __nv_bfloat16* __restrict__ g_cumsum,
+    float* __restrict__ state_f32,
+    __nv_bfloat16* __restrict__ v_new,
+    __nv_bfloat16* __restrict__ decayed_v_pack,
+    int S,
+    int chunk,
+    int num_v_heads,
+    int head_dim)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int pack_total = num_v_heads * kChunk * head_dim;
+  const int state_total = num_v_heads * head_dim * head_dim;
+  const int total = pack_total + state_total;
+  if (idx >= total) return;
+  const int start = chunk * kChunk;
+
+  if (idx < pack_total) {
+    const int d = idx % head_dim;
+    const int t = (idx / head_dim) % kChunk;
+    const int vh = idx / (head_dim * kChunk);
+    const int s = start + t;
+    const size_t pidx =
+        ((static_cast<size_t>(chunk) * num_v_heads + vh) * kChunk + t)
+        * head_dim + d;
+    const int T = min(kChunk, S - start);
+    if (t >= T || s >= S) {
+      decayed_v_pack[pidx] = __float2bfloat16(0.0f);
+      return;
+    }
+    const float val = static_cast<float>(u_pack[pidx]) - wh_decayed_f32[idx];
+    const size_t out_off =
+        (static_cast<size_t>(s) * num_v_heads + vh) * head_dim + d;
+    v_new[out_off] = __float2bfloat16(val);
+    const float g_last =
+        static_cast<float>(g_cumsum[
+            static_cast<size_t>(start + T - 1) * num_v_heads + vh]);
+    const float gt =
+        static_cast<float>(g_cumsum[static_cast<size_t>(s) * num_v_heads + vh]);
+    const float decayed = val * __expf(g_last - gt);
+    wh_decayed_f32[idx] = decayed;
+    decayed_v_pack[pidx] = __float2bfloat16(decayed);
+    return;
+  }
+
+  const int sidx = idx - pack_total;
+  const int col = sidx % head_dim;
+  const int row = (sidx / head_dim) % head_dim;
+  const int vh = sidx / (head_dim * head_dim);
+  const int T = min(kChunk, S - start);
+  if (T <= 0) return;
+  const float g_last =
+      static_cast<float>(g_cumsum[
+          static_cast<size_t>(start + T - 1) * num_v_heads + vh]);
+  const size_t off =
+      (static_cast<size_t>(vh) * head_dim + row) * head_dim + col;
+  state_f32[off] *= __expf(g_last);
+}
+
+__global__ void update_state_f32_direct_kernel(
+    const __nv_bfloat16* __restrict__ k_pack_hv,
+    const float* __restrict__ decayed_f32,
+    float* __restrict__ state_f32,
+    int S,
+    int chunk,
+    int num_v_heads,
+    int head_dim)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = num_v_heads * head_dim * head_dim;
+  if (idx >= total) return;
+  const int col = idx % head_dim;
+  const int row = (idx / head_dim) % head_dim;
+  const int vh = idx / (head_dim * head_dim);
+  const int start = chunk * kChunk;
+  const int T = min(kChunk, S - start);
+  if (T <= 0) return;
+
+  float acc = state_f32[idx];
+  const size_t k_base =
+      (static_cast<size_t>(chunk) * num_v_heads + vh) * kChunk * head_dim;
+  const size_t v_base = static_cast<size_t>(vh) * kChunk * head_dim;
+  for (int t = 0; t < T; ++t) {
+    acc = fmaf(static_cast<float>(k_pack_hv[k_base + t * head_dim + row]),
+               decayed_f32[v_base + t * head_dim + col],
+               acc);
+  }
+  state_f32[idx] = acc;
+}
+
+__global__ void apply_output_local_a_kernel(
+    const float* __restrict__ qk_base,
+    const __nv_bfloat16* __restrict__ g_cumsum,
+    __nv_bfloat16* __restrict__ local_a_pack,
+    int S,
+    int num_v_heads)
+{
+  const int pair = blockIdx.x * blockDim.x + threadIdx.x;
+  if (pair >= kChunk * kChunk) return;
+  const int i = pair / kChunk;
+  const int j = pair - i * kChunk;
+  const int vh = blockIdx.y;
+  const int chunk = blockIdx.z;
+  const int si = chunk * kChunk + i;
+  const int sj = chunk * kChunk + j;
+  const size_t off =
+      (((static_cast<size_t>(chunk) * num_v_heads + vh) * kChunk + i)
+       * kChunk + j);
+  if (j > i || si >= S || sj >= S) {
+    local_a_pack[off] = __float2bfloat16(0.0f);
+    return;
+  }
+  const float gi =
+      static_cast<float>(g_cumsum[static_cast<size_t>(si) * num_v_heads + vh]);
+  const float gj =
+      static_cast<float>(g_cumsum[static_cast<size_t>(sj) * num_v_heads + vh]);
+  local_a_pack[off] = __float2bfloat16(qk_base[off] * __expf(gi - gj));
+}
+
+__global__ void combine_output_kernel(
+    const __nv_bfloat16* __restrict__ qh_pack,
+    const __nv_bfloat16* __restrict__ local_pack,
+    const __nv_bfloat16* __restrict__ g_cumsum,
+    __nv_bfloat16* __restrict__ out,
+    int S,
+    int num_v_heads,
+    int head_dim)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = S * num_v_heads * head_dim;
+  if (idx >= total) return;
+  const int d = idx % head_dim;
+  const int vh = (idx / head_dim) % num_v_heads;
+  const int s = idx / (num_v_heads * head_dim);
+  const int chunk = s / kChunk;
+  const int t = s - chunk * kChunk;
+  const size_t pidx =
+      ((static_cast<size_t>(chunk) * num_v_heads + vh) * kChunk + t)
+      * head_dim + d;
+  const float gi =
+      static_cast<float>(g_cumsum[static_cast<size_t>(s) * num_v_heads + vh]);
+  const float qh = static_cast<float>(qh_pack[pidx]) * __expf(gi);
+  const float local = static_cast<float>(local_pack[pidx]);
+  constexpr float kScale = 0.08838834764831845f;  // 1 / sqrt(128)
+  out[idx] = __float2bfloat16((qh + local) * kScale);
+}
+
+}  // namespace
+
+void gdn_wy_kkt_b64_bf16_cublaslt(
+    const void* k_l2,
+    const void* beta,
+    const void* g_cumsum,
+    void*       k_pack,
+    void*       kkt_base,
+    void*       A,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group,
+    cudaStream_t stream)
+{
+  if (S <= 0 || num_k_heads <= 0 || num_v_heads <= 0 ||
+      head_dim <= 0 || qk_group <= 0) {
+    return;
+  }
+  const int chunks = (S + kChunk - 1) / kChunk;
+  const int batches = chunks * num_k_heads;
+  const int pack_total = batches * kChunk * head_dim;
+  pack_k_chunks_kernel<<<(pack_total + kThreads - 1) / kThreads,
+                         kThreads, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(k_l2),
+      reinterpret_cast<__nv_bfloat16*>(k_pack),
+      S, num_k_heads, head_dim);
+
+  LtPlan& plan = get_kkt_plan(batches, head_dim);
+  const float alpha = 1.0f;
+  const float beta0 = 0.0f;
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmul(
+      g_lt, plan.desc, &alpha,
+      k_pack, plan.a_desc,
+      k_pack, plan.b_desc,
+      &beta0,
+      kkt_base, plan.c_desc,
+      kkt_base, plan.c_desc,
+      &plan.algo, g_workspace, g_workspace_size, stream));
+
+  apply_kkt_gating_kernel<<<
+      dim3((kChunk * kChunk + kThreads - 1) / kThreads,
+           num_v_heads, chunks),
+      kThreads, 0, stream>>>(
+      reinterpret_cast<const float*>(kkt_base),
+      reinterpret_cast<const __nv_bfloat16*>(beta),
+      reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
+      reinterpret_cast<float*>(A),
+      S, num_k_heads, num_v_heads, qk_group);
+}
+
+void gdn_wy_recompute_wu_b64_bf16_cublaslt(
+    const void* k_l2,
+    const void* v,
+    const void* beta,
+    const void* g_cumsum,
+    const void* Ai,
+    void*       Ai_pack,
+    void*       rhs_w,
+    void*       rhs_u,
+    void*       w_pack,
+    void*       u_pack,
+    void*       w,
+    void*       u,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group,
+    cudaStream_t stream)
+{
+  if (S <= 0 || num_k_heads <= 0 || num_v_heads <= 0 ||
+      head_dim <= 0 || qk_group <= 0) {
+    return;
+  }
+  const int chunks = (S + kChunk - 1) / kChunk;
+  const int batches = chunks * num_v_heads;
+  const int ai_total = batches * kChunk * kChunk;
+  const int rhs_total = batches * kChunk * head_dim;
+  pack_recompute_wu_kernel<<<
+      (ai_total + rhs_total + kThreads - 1) / kThreads,
+      kThreads, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(k_l2),
+      reinterpret_cast<const __nv_bfloat16*>(v),
+      reinterpret_cast<const __nv_bfloat16*>(beta),
+      reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
+      reinterpret_cast<const float*>(Ai),
+      reinterpret_cast<__nv_bfloat16*>(Ai_pack),
+      reinterpret_cast<__nv_bfloat16*>(rhs_w),
+      reinterpret_cast<__nv_bfloat16*>(rhs_u),
+      S, num_k_heads, num_v_heads, head_dim, qk_group);
+
+  LtPlan& plan = get_mm64d_plan(batches, head_dim);
+  const float alpha = 1.0f;
+  const float beta0 = 0.0f;
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmul(
+      g_lt, plan.desc, &alpha,
+      Ai_pack, plan.a_desc,
+      rhs_u, plan.b_desc,
+      &beta0,
+      u_pack, plan.c_desc,
+      u_pack, plan.c_desc,
+      &plan.algo, g_workspace, g_workspace_size, stream));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmul(
+      g_lt, plan.desc, &alpha,
+      Ai_pack, plan.a_desc,
+      rhs_w, plan.b_desc,
+      &beta0,
+      w_pack, plan.c_desc,
+      w_pack, plan.c_desc,
+      &plan.algo, g_workspace, g_workspace_size, stream));
+  unpack_recompute_wu_kernel<<<
+      (S * num_v_heads * head_dim + kThreads - 1) / kThreads,
+      kThreads, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(w_pack),
+      reinterpret_cast<const __nv_bfloat16*>(u_pack),
+      reinterpret_cast<__nv_bfloat16*>(w),
+      reinterpret_cast<__nv_bfloat16*>(u),
+      S, num_v_heads, head_dim);
+}
+
+void gdn_wy_solve_tril_b64_f32_parallel(
+    const void* A,
+    void*       Ai,
+    int S,
+    int num_v_heads,
+    cudaStream_t stream)
+{
+  if (S <= 0 || num_v_heads <= 0) return;
+  const int chunks = (S + kChunk - 1) / kChunk;
+  solve_tril_b64_parallel_kernel<<<dim3(num_v_heads, chunks), kChunk,
+                                    0, stream>>>(
+      reinterpret_cast<const float*>(A),
+      reinterpret_cast<float*>(Ai),
+      S, num_v_heads);
+}
+
+void gdn_wy_chunk_h_b64_bf16_cublaslt(
+    const void* k_l2,
+    const void* u,
+    const void* w,
+    const void* g_cumsum,
+    void*       state,
+    void*       h0,
+    void*       v_new,
+    void*       k_pack_hv,
+    void*       w_pack,
+    void*       u_pack,
+    void*       wh_pack,
+    void*       decayed_v_pack,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group,
+    cudaStream_t stream)
+{
+  if (S <= 0 || num_k_heads <= 0 || num_v_heads <= 0 ||
+      head_dim <= 0 || qk_group <= 0) {
+    return;
+  }
+  const int chunks = (S + kChunk - 1) / kChunk;
+  const int all_batches = chunks * num_v_heads;
+  const int pack_total = all_batches * kChunk * head_dim;
+  pack_chunk_h_inputs_kernel<<<(pack_total + kThreads - 1) / kThreads,
+                               kThreads, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(k_l2),
+      reinterpret_cast<const __nv_bfloat16*>(u),
+      reinterpret_cast<const __nv_bfloat16*>(w),
+      reinterpret_cast<__nv_bfloat16*>(k_pack_hv),
+      reinterpret_cast<__nv_bfloat16*>(w_pack),
+      reinterpret_cast<__nv_bfloat16*>(u_pack),
+      S, num_k_heads, num_v_heads, head_dim, qk_group);
+
+  LtPlan& wh_plan = get_qh_plan(num_v_heads, head_dim);
+  LtPlan& ktv_plan = get_ktv_plan(num_v_heads, head_dim);
+  const float alpha = 1.0f;
+  const float beta0 = 0.0f;
+  const float beta1 = 1.0f;
+  const size_t pack_chunk_elems =
+      static_cast<size_t>(num_v_heads) * kChunk * head_dim;
+  const size_t state_elems =
+      static_cast<size_t>(num_v_heads) * head_dim * head_dim;
+  const size_t state_bytes = state_elems * sizeof(__nv_bfloat16);
+
+  auto* state_bf16 = reinterpret_cast<__nv_bfloat16*>(state);
+  auto* h0_bf16 = reinterpret_cast<__nv_bfloat16*>(h0);
+  auto* k_pack_bf16 = reinterpret_cast<__nv_bfloat16*>(k_pack_hv);
+  auto* w_pack_bf16 = reinterpret_cast<__nv_bfloat16*>(w_pack);
+  auto* u_pack_bf16 = reinterpret_cast<__nv_bfloat16*>(u_pack);
+  auto* wh_pack_bf16 = reinterpret_cast<__nv_bfloat16*>(wh_pack);
+  auto* decayed_bf16 = reinterpret_cast<__nv_bfloat16*>(decayed_v_pack);
+
+  for (int ci = 0; ci < chunks; ++ci) {
+    cudaError_t copy_err = cudaMemcpyAsync(
+        h0_bf16 + static_cast<size_t>(ci) * state_elems,
+        state_bf16, state_bytes, cudaMemcpyDeviceToDevice, stream);
+    if (copy_err != cudaSuccess) {
+      throw std::runtime_error(std::string("cudaMemcpyAsync failed in WY h0: ") +
+                               cudaGetErrorString(copy_err));
+    }
+
+    const size_t off = static_cast<size_t>(ci) * pack_chunk_elems;
+    FLASHRT_CUBLASLT_CHECK(cublasLtMatmul(
+        g_lt, wh_plan.desc, &alpha,
+        w_pack_bf16 + off, wh_plan.a_desc,
+        state_bf16, wh_plan.b_desc,
+        &beta0,
+        wh_pack_bf16 + off, wh_plan.c_desc,
+        wh_pack_bf16 + off, wh_plan.c_desc,
+        &wh_plan.algo, g_workspace, g_workspace_size, stream));
+
+    const int work = static_cast<int>(pack_chunk_elems + state_elems);
+    make_vnew_decay_and_scale_state_kernel<<<
+        (work + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+        u_pack_bf16, wh_pack_bf16,
+        reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
+        state_bf16, reinterpret_cast<__nv_bfloat16*>(v_new),
+        decayed_bf16, S, ci, num_v_heads, head_dim);
+
+    FLASHRT_CUBLASLT_CHECK(cublasLtMatmul(
+        g_lt, ktv_plan.desc, &alpha,
+        k_pack_bf16 + off, ktv_plan.a_desc,
+        decayed_bf16 + off, ktv_plan.b_desc,
+        &beta1,
+        state_bf16, ktv_plan.c_desc,
+        state_bf16, ktv_plan.c_desc,
+        &ktv_plan.algo, g_workspace, g_workspace_size, stream));
+  }
+}
+
+void gdn_wy_chunk_h_b64_bf16_cublaslt_f32state(
+    const void* k_l2,
+    const void* u,
+    const void* w,
+    const void* g_cumsum,
+    void*       state,
+    void*       h0,
+    void*       v_new,
+    void*       k_pack_hv,
+    void*       w_pack,
+    void*       u_pack,
+    void*       wh_pack,
+    void*       decayed_v_pack,
+    void*       state_f32,
+    void*       delta_f32,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group,
+    cudaStream_t stream)
+{
+  if (S <= 0 || num_k_heads <= 0 || num_v_heads <= 0 ||
+      head_dim <= 0 || qk_group <= 0) {
+    return;
+  }
+  const int chunks = (S + kChunk - 1) / kChunk;
+  const int all_batches = chunks * num_v_heads;
+  const int pack_total = all_batches * kChunk * head_dim;
+  pack_chunk_h_inputs_kernel<<<(pack_total + kThreads - 1) / kThreads,
+                               kThreads, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(k_l2),
+      reinterpret_cast<const __nv_bfloat16*>(u),
+      reinterpret_cast<const __nv_bfloat16*>(w),
+      reinterpret_cast<__nv_bfloat16*>(k_pack_hv),
+      reinterpret_cast<__nv_bfloat16*>(w_pack),
+      reinterpret_cast<__nv_bfloat16*>(u_pack),
+      S, num_k_heads, num_v_heads, head_dim, qk_group);
+
+  const size_t pack_chunk_elems =
+      static_cast<size_t>(num_v_heads) * kChunk * head_dim;
+  const int state_elems = num_v_heads * head_dim * head_dim;
+
+  auto* state_bf16 = reinterpret_cast<__nv_bfloat16*>(state);
+  auto* h0_bf16 = reinterpret_cast<__nv_bfloat16*>(h0);
+  auto* k_pack_bf16 = reinterpret_cast<__nv_bfloat16*>(k_pack_hv);
+  auto* w_pack_bf16 = reinterpret_cast<__nv_bfloat16*>(w_pack);
+  auto* u_pack_bf16 = reinterpret_cast<__nv_bfloat16*>(u_pack);
+  auto* decayed_bf16 = reinterpret_cast<__nv_bfloat16*>(decayed_v_pack);
+  auto* state_fp32 = reinterpret_cast<float*>(state_f32);
+  auto* delta_fp32 = reinterpret_cast<float*>(delta_f32);
+
+  init_state_f32_kernel<<<(state_elems + kThreads - 1) / kThreads,
+                           kThreads, 0, stream>>>(
+      state_bf16, state_fp32, state_elems);
+
+  for (int ci = 0; ci < chunks; ++ci) {
+    __nv_bfloat16* h0_chunk =
+        h0_bf16 + static_cast<size_t>(ci) * state_elems;
+    downcast_state_f32_kernel<<<(state_elems + kThreads - 1) / kThreads,
+                                 kThreads, 0, stream>>>(
+        state_fp32, h0_chunk, state_elems);
+
+    compute_wh_f32_state_kernel<<<
+        (static_cast<int>(pack_chunk_elems) + kThreads - 1) / kThreads,
+        kThreads, 0, stream>>>(
+        w_pack_bf16, state_fp32, delta_fp32,
+        S, ci, num_v_heads, head_dim);
+
+    const int work = static_cast<int>(pack_chunk_elems) + state_elems;
+    make_vnew_decay_and_scale_state_f32_wh_kernel<<<
+        (work + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+        u_pack_bf16, delta_fp32,
+        reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
+        state_fp32, reinterpret_cast<__nv_bfloat16*>(v_new),
+        decayed_bf16, S, ci, num_v_heads, head_dim);
+
+    update_state_f32_direct_kernel<<<(state_elems + kThreads - 1) / kThreads,
+                                      kThreads, 0, stream>>>(
+        k_pack_bf16, delta_fp32, state_fp32,
+        S, ci, num_v_heads, head_dim);
+  }
+
+  downcast_state_f32_kernel<<<(state_elems + kThreads - 1) / kThreads,
+                               kThreads, 0, stream>>>(
+      state_fp32, state_bf16, state_elems);
+}
+
+void gdn_wy_output_o_b64_bf16_cublaslt(
+    const void* q_l2,
+    const void* k_l2,
+    const void* v_new,
+    const void* h0,
+    const void* g_cumsum,
+    void*       q_pack,
+    void*       k_pack_hv,
+    void*       v_pack,
+    void*       qk_base,
+    void*       local_a_pack,
+    void*       qh_pack,
+    void*       local_pack,
+    void*       out,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group,
+    cudaStream_t stream)
+{
+  if (S <= 0 || num_k_heads <= 0 || num_v_heads <= 0 ||
+      head_dim <= 0 || qk_group <= 0) {
+    return;
+  }
+  const int chunks = (S + kChunk - 1) / kChunk;
+  const int batches = chunks * num_v_heads;
+  const int pack_total = batches * kChunk * head_dim;
+  pack_output_qkv_kernel<<<(pack_total + kThreads - 1) / kThreads,
+                           kThreads, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(q_l2),
+      reinterpret_cast<const __nv_bfloat16*>(k_l2),
+      reinterpret_cast<const __nv_bfloat16*>(v_new),
+      reinterpret_cast<__nv_bfloat16*>(q_pack),
+      reinterpret_cast<__nv_bfloat16*>(k_pack_hv),
+      reinterpret_cast<__nv_bfloat16*>(v_pack),
+      S, num_k_heads, num_v_heads, head_dim, qk_group);
+
+  const float alpha = 1.0f;
+  const float beta0 = 0.0f;
+
+  LtPlan& qh_plan = get_qh_plan(batches, head_dim);
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmul(
+      g_lt, qh_plan.desc, &alpha,
+      q_pack, qh_plan.a_desc,
+      h0, qh_plan.b_desc,
+      &beta0,
+      qh_pack, qh_plan.c_desc,
+      qh_pack, qh_plan.c_desc,
+      &qh_plan.algo, g_workspace, g_workspace_size, stream));
+
+  LtPlan& qk_plan = get_kkt_plan(batches, head_dim);
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmul(
+      g_lt, qk_plan.desc, &alpha,
+      q_pack, qk_plan.a_desc,
+      k_pack_hv, qk_plan.b_desc,
+      &beta0,
+      qk_base, qk_plan.c_desc,
+      qk_base, qk_plan.c_desc,
+      &qk_plan.algo, g_workspace, g_workspace_size, stream));
+
+  apply_output_local_a_kernel<<<
+      dim3((kChunk * kChunk + kThreads - 1) / kThreads,
+           num_v_heads, chunks),
+      kThreads, 0, stream>>>(
+      reinterpret_cast<const float*>(qk_base),
+      reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
+      reinterpret_cast<__nv_bfloat16*>(local_a_pack),
+      S, num_v_heads);
+
+  LtPlan& mm_plan = get_mm64d_plan(batches, head_dim);
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmul(
+      g_lt, mm_plan.desc, &alpha,
+      local_a_pack, mm_plan.a_desc,
+      v_pack, mm_plan.b_desc,
+      &beta0,
+      local_pack, mm_plan.c_desc,
+      local_pack, mm_plan.c_desc,
+      &mm_plan.algo, g_workspace, g_workspace_size, stream));
+
+  combine_output_kernel<<<
+      (S * num_v_heads * head_dim + kThreads - 1) / kThreads,
+      kThreads, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(qh_pack),
+      reinterpret_cast<const __nv_bfloat16*>(local_pack),
+      reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
+      reinterpret_cast<__nv_bfloat16*>(out),
+      S, num_v_heads, head_dim);
+}
+
+}  // namespace linear_attention
+}  // namespace kernels
+}  // namespace flash_rt

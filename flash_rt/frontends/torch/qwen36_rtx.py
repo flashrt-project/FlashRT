@@ -2115,16 +2115,48 @@ class Qwen36TorchFrontendRtx:
         attn_out_K = None
         gdn_backend = os.environ.get(
             'FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND', 'fla_chunk')
+        use_wy_chunk = (
+            K > self._K_save_max
+            and gdn_backend in ('wy', 'native_wy', 'flashrt_wy', 'wy_lt')
+            and hasattr(fvk, 'qwen36_gdn_wy_norm_cumsum_bf16')
+            and hasattr(fvk, 'qwen36_gdn_wy_kkt_b64_bf16')
+            and hasattr(fvk, 'qwen36_gdn_wy_solve_tril_b64_f32')
+            and hasattr(fvk, 'qwen36_gdn_wy_recompute_wu_b64_bf16')
+            and hasattr(fvk, 'qwen36_gdn_wy_chunk_h_b64_bf16')
+            and hasattr(fvk, 'qwen36_gdn_wy_output_o_b64_bf16')
+        )
+        use_wy_lt_kkt = (
+            use_wy_chunk
+            and gdn_backend == 'wy_lt'
+            and hasattr(fvk, 'linear_attn_gdn_wy_kkt_b64_bf16_cublaslt')
+        )
+        fast_chunk_mode = os.environ.get(
+            'FLASHRT_QWEN36_TQ_PREFILL_GDN_FAST_CHUNK', 'f32')
+        use_wy_lt_chunk_h_f32 = (
+            use_wy_lt_kkt
+            and fast_chunk_mode not in ('0', 'false', 'off', 'bf16')
+            and hasattr(
+                fvk,
+                'linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_f32state')
+        )
+        use_wy_lt_chunk_h = (
+            use_wy_lt_kkt
+            and fast_chunk_mode in ('1', 'true', 'on', 'bf16')
+            and hasattr(fvk, 'linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt')
+        )
         use_fla_chunk = (
             K > self._K_save_max
             and gdn_backend in ('fla', 'fla_chunk', 'fla_ref')
         )
         use_inout = K <= self._K_save_max
-        if use_fla_chunk:
+        if use_wy_chunk or use_fla_chunk:
             if (
-                hasattr(fvk, 'qwen36_lin_split_qkv_gqa_bf16')
-                and os.environ.get(
-                    'FVK_QWEN36_LIN_SPLIT_GQA', '1') == '1'
+                use_wy_chunk
+                or (
+                    hasattr(fvk, 'qwen36_lin_split_qkv_gqa_bf16')
+                    and os.environ.get(
+                        'FVK_QWEN36_LIN_SPLIT_GQA', '1') == '1'
+                )
             ):
                 q16_K = self._K_lin_q16[:K]
                 k16_K = self._K_lin_k16[:K]
@@ -2167,19 +2199,206 @@ class Qwen36TorchFrontendRtx:
                     g_bf_K.data_ptr(), beta_K.data_ptr(),
                     K, 48, s,
                 )
-            chunk_gated_delta_rule = _load_qwen36_fla_chunk()
-            attn_out_K, new_state = chunk_gated_delta_rule(
-                q_K_heads, k_K_heads, v_K_heads,
-                g_bf_K.view(1, K, 48), beta_K.view(1, K, 48),
-                initial_state=rec_state_view,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                q_l2_out=self._K_fla_q16_l2[:, :K],
-                k_l2_out=self._K_fla_k16_l2[:, :K],
-                g_cumsum_out=self._K_fla_g_cumsum[:, :K],
-                o_out=self._K_lin_attn_out[:K].view(1, K, 48, 128),
-            )
-            rec_state_view.copy_(new_state)
+            if use_wy_chunk:
+                chunks = (K + 63) // 64
+                if (
+                    not hasattr(self, '_K_wy_A')
+                    or not hasattr(self, '_K_wy_out_q_pack')
+                    or not hasattr(self, '_K_wy_state_f32')
+                    or self._K_wy_A.shape[0] < chunks
+                    or self._K_wy_A.device != q16_K.device
+                ):
+                    device = q16_K.device
+                    bf16 = q16_K.dtype
+                    fp32 = torch.float32
+                    self._K_wy_A = torch.empty(
+                        chunks, 48, 64, 64, device=device, dtype=fp32)
+                    self._K_wy_Ai = torch.empty_like(self._K_wy_A)
+                    self._K_wy_k_pack = torch.empty(
+                        chunks, 16, 64, 128, device=device, dtype=bf16)
+                    self._K_wy_kkt_base = torch.empty(
+                        chunks, 16, 64, 64, device=device, dtype=fp32)
+                    self._K_wy_g_cumsum = torch.empty(
+                        K, 48, device=device, dtype=bf16)
+                    self._K_wy_w48 = torch.empty(
+                        K, 48, 128, device=device, dtype=bf16)
+                    self._K_wy_u48 = torch.empty_like(self._K_wy_w48)
+                    self._K_wy_Ai_pack = torch.empty(
+                        chunks, 48, 64, 64, device=device, dtype=bf16)
+                    self._K_wy_rhs_w = torch.empty(
+                        chunks, 48, 64, 128, device=device, dtype=bf16)
+                    self._K_wy_rhs_u = torch.empty_like(self._K_wy_rhs_w)
+                    self._K_wy_w_pack = torch.empty_like(self._K_wy_rhs_w)
+                    self._K_wy_u_pack = torch.empty_like(self._K_wy_rhs_w)
+                    self._K_wy_out_q_pack = torch.empty_like(
+                        self._K_wy_rhs_w)
+                    self._K_wy_state_f32 = torch.empty(
+                        48, 128, 128, device=device, dtype=fp32)
+                    self._K_wy_delta_f32 = torch.empty_like(
+                        self._K_wy_state_f32)
+                    self._K_wy_h0 = torch.empty(
+                        chunks, 48, 128, 128, device=device, dtype=bf16)
+                    self._K_wy_v_new = torch.empty_like(self._K_wy_w48)
+                fvk.qwen36_gdn_wy_norm_cumsum_bf16(
+                    q16_K.data_ptr(), k16_K.data_ptr(), g_bf_K.data_ptr(),
+                    self._K_fla_q16_l2[:, :K].data_ptr(),
+                    self._K_fla_k16_l2[:, :K].data_ptr(),
+                    self._K_wy_g_cumsum[:K].data_ptr(),
+                    K, s,
+                )
+                if use_wy_lt_kkt:
+                    fvk.linear_attn_gdn_wy_kkt_b64_bf16_cublaslt(
+                        self._K_fla_k16_l2[:, :K].data_ptr(),
+                        beta_K.data_ptr(),
+                        self._K_wy_g_cumsum[:K].data_ptr(),
+                        self._K_wy_k_pack[:chunks].data_ptr(),
+                        self._K_wy_kkt_base[:chunks].data_ptr(),
+                        self._K_wy_A[:chunks].data_ptr(),
+                        K, 16, 48, 128, 3, s,
+                    )
+                else:
+                    fvk.qwen36_gdn_wy_kkt_b64_bf16(
+                        self._K_fla_k16_l2[:, :K].data_ptr(),
+                        beta_K.data_ptr(), self._K_wy_g_cumsum[:K].data_ptr(),
+                        self._K_wy_A[:chunks].data_ptr(), K, s,
+                    )
+                if (
+                    use_wy_lt_kkt
+                    and hasattr(
+                        fvk,
+                        'linear_attn_gdn_wy_solve_tril_b64_f32_parallel')
+                ):
+                    fvk.linear_attn_gdn_wy_solve_tril_b64_f32_parallel(
+                        self._K_wy_A[:chunks].data_ptr(),
+                        self._K_wy_Ai[:chunks].data_ptr(), K, 48, s,
+                    )
+                else:
+                    fvk.qwen36_gdn_wy_solve_tril_b64_f32(
+                        self._K_wy_A[:chunks].data_ptr(),
+                        self._K_wy_Ai[:chunks].data_ptr(), K, s,
+                    )
+                if (
+                    use_wy_lt_kkt
+                    and hasattr(
+                        fvk,
+                        'linear_attn_gdn_wy_recompute_wu_b64_bf16_cublaslt')
+                ):
+                    fvk.linear_attn_gdn_wy_recompute_wu_b64_bf16_cublaslt(
+                        self._K_fla_k16_l2[:, :K].data_ptr(),
+                        v48_K.data_ptr(), beta_K.data_ptr(),
+                        self._K_wy_g_cumsum[:K].data_ptr(),
+                        self._K_wy_Ai[:chunks].data_ptr(),
+                        self._K_wy_Ai_pack[:chunks].data_ptr(),
+                        self._K_wy_rhs_w[:chunks].data_ptr(),
+                        self._K_wy_rhs_u[:chunks].data_ptr(),
+                        self._K_wy_w_pack[:chunks].data_ptr(),
+                        self._K_wy_u_pack[:chunks].data_ptr(),
+                        self._K_wy_w48[:K].data_ptr(),
+                        self._K_wy_u48[:K].data_ptr(),
+                        K, 16, 48, 128, 3, s,
+                    )
+                else:
+                    fvk.qwen36_gdn_wy_recompute_wu_b64_bf16(
+                        self._K_fla_k16_l2[:, :K].data_ptr(),
+                        v48_K.data_ptr(), beta_K.data_ptr(),
+                        self._K_wy_g_cumsum[:K].data_ptr(),
+                        self._K_wy_Ai[:chunks].data_ptr(),
+                        self._K_wy_w48[:K].data_ptr(),
+                        self._K_wy_u48[:K].data_ptr(),
+                        K, s,
+                    )
+                if use_wy_lt_chunk_h_f32:
+                    fvk.linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_f32state(
+                        self._K_fla_k16_l2[:, :K].data_ptr(),
+                        self._K_wy_u48[:K].data_ptr(),
+                        self._K_wy_w48[:K].data_ptr(),
+                        self._K_wy_g_cumsum[:K].data_ptr(),
+                        rec_state_view.data_ptr(),
+                        self._K_wy_h0[:chunks].data_ptr(),
+                        self._K_wy_v_new[:K].data_ptr(),
+                        self._K_wy_rhs_w[:chunks].data_ptr(),
+                        self._K_wy_rhs_u[:chunks].data_ptr(),
+                        self._K_wy_w_pack[:chunks].data_ptr(),
+                        self._K_wy_u_pack[:chunks].data_ptr(),
+                        self._K_wy_out_q_pack[:chunks].data_ptr(),
+                        self._K_wy_state_f32.data_ptr(),
+                        self._K_wy_delta_f32.data_ptr(),
+                        K, 16, 48, 128, 3, s,
+                    )
+                elif use_wy_lt_chunk_h:
+                    fvk.linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt(
+                        self._K_fla_k16_l2[:, :K].data_ptr(),
+                        self._K_wy_u48[:K].data_ptr(),
+                        self._K_wy_w48[:K].data_ptr(),
+                        self._K_wy_g_cumsum[:K].data_ptr(),
+                        rec_state_view.data_ptr(),
+                        self._K_wy_h0[:chunks].data_ptr(),
+                        self._K_wy_v_new[:K].data_ptr(),
+                        self._K_wy_rhs_w[:chunks].data_ptr(),
+                        self._K_wy_rhs_u[:chunks].data_ptr(),
+                        self._K_wy_w_pack[:chunks].data_ptr(),
+                        self._K_wy_u_pack[:chunks].data_ptr(),
+                        self._K_wy_out_q_pack[:chunks].data_ptr(),
+                        K, 16, 48, 128, 3, s,
+                    )
+                else:
+                    fvk.qwen36_gdn_wy_chunk_h_b64_bf16(
+                        self._K_fla_k16_l2[:, :K].data_ptr(),
+                        self._K_wy_u48[:K].data_ptr(),
+                        self._K_wy_w48[:K].data_ptr(),
+                        self._K_wy_g_cumsum[:K].data_ptr(),
+                        rec_state_view.data_ptr(),
+                        self._K_wy_h0[:chunks].data_ptr(),
+                        self._K_wy_v_new[:K].data_ptr(),
+                        K, s,
+                    )
+                if (
+                    use_wy_lt_kkt
+                    and hasattr(
+                        fvk,
+                        'linear_attn_gdn_wy_output_o_b64_bf16_cublaslt')
+                ):
+                    fvk.linear_attn_gdn_wy_output_o_b64_bf16_cublaslt(
+                        self._K_fla_q16_l2[:, :K].data_ptr(),
+                        self._K_fla_k16_l2[:, :K].data_ptr(),
+                        self._K_wy_v_new[:K].data_ptr(),
+                        self._K_wy_h0[:chunks].data_ptr(),
+                        self._K_wy_g_cumsum[:K].data_ptr(),
+                        self._K_wy_out_q_pack[:chunks].data_ptr(),
+                        self._K_wy_rhs_w[:chunks].data_ptr(),
+                        self._K_wy_rhs_u[:chunks].data_ptr(),
+                        self._K_wy_A[:chunks].data_ptr(),
+                        self._K_wy_Ai_pack[:chunks].data_ptr(),
+                        self._K_wy_w_pack[:chunks].data_ptr(),
+                        self._K_wy_u_pack[:chunks].data_ptr(),
+                        self._K_lin_attn_out[:K].data_ptr(),
+                        K, 16, 48, 128, 3, s,
+                    )
+                else:
+                    fvk.qwen36_gdn_wy_output_o_b64_bf16(
+                        self._K_fla_q16_l2[:, :K].data_ptr(),
+                        self._K_fla_k16_l2[:, :K].data_ptr(),
+                        self._K_wy_v_new[:K].data_ptr(),
+                        self._K_wy_h0[:chunks].data_ptr(),
+                        self._K_wy_g_cumsum[:K].data_ptr(),
+                        self._K_lin_attn_out[:K].data_ptr(),
+                        K, s,
+                    )
+                attn_out_K = self._K_lin_attn_out[:K].view(1, K, 48, 128)
+            else:
+                chunk_gated_delta_rule = _load_qwen36_fla_chunk()
+                attn_out_K, new_state = chunk_gated_delta_rule(
+                    q_K_heads, k_K_heads, v_K_heads,
+                    g_bf_K.view(1, K, 48), beta_K.view(1, K, 48),
+                    initial_state=rec_state_view,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                    q_l2_out=self._K_fla_q16_l2[:, :K],
+                    k_l2_out=self._K_fla_k16_l2[:, :K],
+                    g_cumsum_out=self._K_fla_g_cumsum[:, :K],
+                    o_out=self._K_lin_attn_out[:K].view(1, K, 48, 128),
+                )
+                rec_state_view.copy_(new_state)
         elif use_inout:
             for k in range(K):
                 state_in_ptr = (
