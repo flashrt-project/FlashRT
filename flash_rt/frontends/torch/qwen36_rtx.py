@@ -7498,7 +7498,7 @@ class Qwen36TorchFrontendRtx:
         s = torch.cuda.current_stream().cuda_stream
         use_prefill_graph = (
             os.environ.get(
-                'FLASHRT_QWEN36_TQ_PREFILL_GRAPH', '1').lower()
+                'FLASHRT_QWEN36_TQ_PREFILL_GRAPH', '0').lower()
             in ('1', 'true', 'yes', 'on')
             and self._long_prefill_graph_capture_allowed(prompt_len)
         )
