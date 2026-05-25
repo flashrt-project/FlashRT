@@ -13,9 +13,11 @@ Install the Torch frontend extra from the repository root:
 pip install -e ".[torch]"
 ```
 
-The Qwen3.6 long-context path uses the vendored FLA-style
-Python/Triton subset in `flash_rt.ops.fla`; the `torch` extra declares
-its runtime dependencies (`einops`, `triton>=3.2`, and `packaging`).
+The Qwen3.6 long-context default path uses native FlashRT CUDA/CUTLASS
+kernels. The vendored FLA Python/Triton subset in `flash_rt.ops.fla`
+is retained as an explicit comparison backend; the `torch` extra
+declares its runtime dependencies (`einops`, `triton>=3.2`, and
+`packaging`).
 For the OpenAI-compatible server, install:
 
 ```bash
