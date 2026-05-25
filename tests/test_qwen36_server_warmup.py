@@ -51,6 +51,20 @@ def test_long_server_warmup_modes(monkeypatch):
     assert _long_warmup_flags() == (False, False)
 
 
+def test_qwen36_prefill_gdn_backend_defaults_to_native_wy(monkeypatch):
+    from flash_rt.frontends.torch.qwen36_rtx import (
+        _qwen36_tq_prefill_gdn_backend,
+    )
+
+    monkeypatch.delenv('FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND',
+                       raising=False)
+    assert _qwen36_tq_prefill_gdn_backend() == 'wy_lt'
+
+    monkeypatch.setenv(
+        'FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND', 'fla_chunk')
+    assert _qwen36_tq_prefill_gdn_backend() == 'fla_chunk'
+
+
 def test_server_chat_template_disables_thinking_by_default():
     class FakeTokenizer:
         def __init__(self):

@@ -43,8 +43,13 @@ from flash_rt.models.qwen36 import Qwen36Pipeline  # noqa: E402
 _QWEN36_FLA_CHUNK = None
 
 
+def _qwen36_tq_prefill_gdn_backend() -> str:
+    return os.environ.get(
+        'FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND', 'wy_lt').strip().lower()
+
+
 def _load_qwen36_fla_chunk():
-    """Load the vendored FLA chunk/WY Gated DeltaNet prefill kernel."""
+    """Load the vendored FLA chunk/WY Gated DeltaNet comparison path."""
     global _QWEN36_FLA_CHUNK
     if _QWEN36_FLA_CHUNK is None:
         from flash_rt.ops.fla.chunk import chunk_gated_delta_rule_inference
@@ -2113,8 +2118,7 @@ class Qwen36TorchFrontendRtx:
         rec_state_view = self._lin_state[lin_rank]  # (1, 48, 128, 128)
         attn_out_K_buf = self._K_lin_attn_out[:K]
         attn_out_K = None
-        gdn_backend = os.environ.get(
-            'FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND', 'fla_chunk')
+        gdn_backend = _qwen36_tq_prefill_gdn_backend()
         use_wy_chunk = (
             K > self._K_save_max
             and gdn_backend in ('wy', 'native_wy', 'flashrt_wy', 'wy_lt')

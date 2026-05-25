@@ -267,20 +267,21 @@ Long-context prefill uses the same TQ S=K forward in chunks (default
 chunk size = `MAX_Q_SEQ`, currently 2048) instead of one full forward
 per prompt token; full-attention layers use the vendored FA2 causal
 hdim=256 path for one q_seq=S attention call per chunk, and
-linear-attention layers use vendored FLA-style chunk/WY Gated DeltaNet
-scans for prefill chunks. Long-context NVFP4 defaults to the fused MLP
-gate/up GEMM when the checkpoint's gate/up scales allow it; the separate
-non-widen tile remains available by setting
+linear-attention layers use the native FlashRT WY/cuBLASLt Gated
+DeltaNet scan for prefill chunks. Long-context NVFP4 defaults to the
+fused MLP gate/up GEMM when the checkpoint's gate/up scales allow it;
+the separate non-widen tile remains available by setting
 `FLASHRT_QWEN36_FUSE_MLP_GATE_UP=0`.
 Linear-attention A/B projections use a deterministic fused AB96 BF16
 kernel in prefill chunks, and the default Gated DeltaNet prefill route
-uses the vendored FLA-style chunk/WY backend because it is currently
-much faster for large prompt chunks. Intermediate prompt chunks skip
-final-norm/lm-head logits entirely, and the final chunk computes logits
-only for the last prompt row. The large K-row logits workspace is
-allocated lazily only for explicit all-logits diagnostic calls. Set
-`FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND=native` to force the fully
-FlashRT-kernel direct-conv path for cleanup/bisection work.
+uses `FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND=wy_lt` with the f32 GEMM
+chunk-state update. Intermediate prompt chunks skip final-norm/lm-head
+logits entirely, and the final chunk computes logits only for the last
+prompt row. The large K-row logits workspace is allocated lazily only
+for explicit all-logits diagnostic calls. Set
+`FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND=native` to force the direct-conv
+FlashRT chunk scan, or `fla_chunk` to run the vendored FLA comparison
+path for bisection.
 
 ## 5. TTFT (prefill latency)
 

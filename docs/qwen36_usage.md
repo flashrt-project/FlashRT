@@ -83,12 +83,13 @@ Long-context prefill is chunked with the same S=K
 forward (`FLASHRT_QWEN36_TQ_PREFILL_CHUNK`, capped by `MAX_Q_SEQ`;
 default cap 2048), and full-attention prefill chunks use the vendored FA2
 causal hdim=256 path. Linear-attention prefill chunks use chunked
-causal-conv and the vendored FLA-style chunk/WY Gated DeltaNet backend
-by default because it is currently much faster for large chunks. Set
-`FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND=native` to force the fully
-FlashRT-kernel direct-conv recurrent scan for bisection/cleanup work, or
-`FVK_QWEN36_CHUNK_CONV_PARALLEL=0` to force the older serial chunk
-conv update. Experimental fused gate/up and cuBLAS AB paths are
+causal-conv and the native FlashRT WY/cuBLASLt Gated DeltaNet backend
+by default (`FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND=wy_lt`). Set
+`FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND=native` to force the direct-conv
+FlashRT recurrent scan, or `fla_chunk` to run the vendored FLA
+comparison path for bisection. `FVK_QWEN36_CHUNK_CONV_PARALLEL=0`
+forces the older serial chunk conv update. Experimental fused gate/up
+and cuBLAS AB paths are
 available behind environment variables but default off because they
 were either slower or not elementwise-stable in local checks. The
 default linear-attention A/B path uses a deterministic AB96 kernel that
