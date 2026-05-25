@@ -162,11 +162,13 @@ __global__ void chunk_h_kernel(
   // Cooperative chunk loaders, now with 128 threads. Each thread loads one
   // BT row of each (w, u, k). For BT=64 < 128 only the first 64 threads
   // participate.
-  auto issue_chunk = [&](int t_start, int t_count, int stage) {
+  auto issue_chunk = [&](int i_t_chunk, int t_count, int stage) {
     if (tid < kBT) {
       int row = tid;
+      // w_pack: (NT, H, BT, K) bf16. Contiguous BT rows per (chunk, head).
       if (row < t_count) {
-        const __nv_bfloat16* src = w + ((size_t)t_start + row) * H * kK + i_h * kK;
+        const __nv_bfloat16* src = w
+            + ((size_t)i_t_chunk * H + i_h) * kBT * kK + row * kK;
         #pragma unroll
         for (int q = 0; q < kK / 8; ++q)
           cp_async_16(&sW[stage][row * kK + q * 8], &src[q * 8]);
@@ -175,8 +177,10 @@ __global__ void chunk_h_kernel(
         for (int q = 0; q < kK; ++q)
           sW[stage][row * kK + q] = __float2bfloat16(0.f);
       }
+      // u_pack: (NT, H, BT, V) bf16; we only need BV columns.
       if (row < t_count) {
-        const __nv_bfloat16* src = u + ((size_t)t_start + row) * H * kV + i_h * kV + v_base;
+        const __nv_bfloat16* src = u
+            + ((size_t)i_t_chunk * H + i_h) * kBT * kV + row * kV + v_base;
         #pragma unroll
         for (int q = 0; q < kBV / 8; ++q)
           cp_async_16(&sV[stage][row * kBV + q * 8], &src[q * 8]);
@@ -185,8 +189,12 @@ __global__ void chunk_h_kernel(
         for (int q = 0; q < kBV; ++q)
           sV[stage][row * kBV + q] = __float2bfloat16(0.f);
       }
+      // k_l2 stays in RAW (S, Hg, K) layout because it's not produced by the
+      // recompute_wu pipeline; it's the L2-normalized prefill k buffer.
+      int t_start = i_t_chunk * kBT;
       if (row < t_count) {
-        const __nv_bfloat16* src = k_l2 + ((size_t)t_start + row) * Hg * kK + kh * kK;
+        const __nv_bfloat16* src = k_l2
+            + ((size_t)t_start + row) * Hg * kK + kh * kK;
         #pragma unroll
         for (int q = 0; q < kK / 8; ++q)
           cp_async_16(&sK[stage][row * kK + q * 8], &src[q * 8]);
@@ -195,6 +203,7 @@ __global__ void chunk_h_kernel(
         for (int q = 0; q < kK; ++q)
           sK[stage][row * kK + q] = __float2bfloat16(0.f);
       }
+      // g_cumsum stays raw (S, H) bf16.
       if (row < t_count) {
         sG[stage][row] =
             g_bf16[(size_t)(t_start + row) * H + i_h];
@@ -211,7 +220,7 @@ __global__ void chunk_h_kernel(
   }
   if (NT > 1) {
     int t_count = (kBT + kBT <= S) ? kBT : (S - kBT);
-    issue_chunk(kBT, t_count, 1);
+    issue_chunk(1, t_count, 1);
     cp_async_commit();
   }
 
@@ -442,7 +451,7 @@ __global__ void chunk_h_kernel(
     if (i_t + 2 < NT) {
       int t_start_n = (i_t + 2) * kBT;
       int t_count_n = (t_start_n + kBT <= S) ? kBT : (S - t_start_n);
-      issue_chunk(t_start_n, t_count_n, stage);
+      issue_chunk(i_t + 2, t_count_n, stage);
       cp_async_commit();
     } else {
       cp_async_commit();

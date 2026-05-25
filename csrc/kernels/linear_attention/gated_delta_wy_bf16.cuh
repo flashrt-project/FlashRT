@@ -286,11 +286,12 @@ void gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu(
     cudaStream_t stream);
 
 // FLA-style hand-tuned mma.sync + cp.async kernel.
-// Drop-in replacement for gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu but
-// taking RAW (un-packed) inputs. head_dim must be 128.
+// Drop-in replacement for gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu using
+// the SAME packed (NT, num_v_heads, 64, head_dim) w/u layout produced by
+// the recompute_wu_packed_rhs / packed kernels. head_dim must be 128.
 // Inputs:
-//   k_l2:     (S, num_k_heads, head_dim) bf16
-//   w, u:     (S, num_v_heads, head_dim) bf16
+//   k_l2:     (S, num_k_heads, head_dim) bf16 raw
+//   w, u:     (NT, num_v_heads, 64, head_dim) bf16 packed-per-chunk
 //   g_cumsum: (S, num_v_heads) bf16 chunk-local cumsum
 //   state:    (num_v_heads, head_dim, head_dim) bf16, IN/OUT (in-place update)
 // Outputs (raw v_new + two nullable packed side outputs for downstream

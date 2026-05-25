@@ -55,14 +55,15 @@ def test_mma_fla_matches_packed_wu_and_reference(S):
     ).to(torch.bfloat16)
     g_cumsum_bf16 = _local_cumsum_bf16(g)
 
-    # --- mma_fla path (RAW inputs, bf16 g, bf16 state in-place) ---
+    # --- mma_fla path (PACKED w/u inputs, bf16 g, bf16 state in-place) ---
     chunks = (S + 63) // 64
+    w_pack_mma, u_pack_mma = _pack_wu(w, u, chunks)
     state_mma = state0.clone()
     h_mma = torch.empty(chunks, H, K, V, device="cuda",
                         dtype=torch.bfloat16)
     v_mma = torch.empty(S, H, V, device="cuda", dtype=torch.bfloat16)
     fvk.linear_attn_gdn_wy_chunk_h_b64_bf16_mma_fla(
-        _ptr(k_l2), _ptr(w), _ptr(u), _ptr(g_cumsum_bf16),
+        _ptr(k_l2), _ptr(w_pack_mma), _ptr(u_pack_mma), _ptr(g_cumsum_bf16),
         _ptr(state_mma), _ptr(h_mma), _ptr(v_mma), 0, 0,
         S, Hk, H, K, H // Hk, 0)
     torch.cuda.synchronize()
