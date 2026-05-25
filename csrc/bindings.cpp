@@ -4467,6 +4467,35 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("head_dim"), py::arg("qk_group"),
         py::arg("stream") = 0);
 
+    m.def("linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_f32gemm",
+        [](uintptr_t k_l2, uintptr_t u, uintptr_t w,
+           uintptr_t g_cumsum, uintptr_t state,
+           uintptr_t h0, uintptr_t v_new,
+           uintptr_t k_pack_hv, uintptr_t w_pack, uintptr_t u_pack,
+           uintptr_t wh_pack, uintptr_t decayed_v_pack,
+           uintptr_t state_f32, uintptr_t chunk_f32, uintptr_t acc_f32,
+           int S, int num_k_heads, int num_v_heads,
+           int head_dim, int qk_group, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_chunk_h_b64_bf16_cublaslt_f32gemm(
+                    to_ptr(k_l2), to_ptr(u), to_ptr(w), to_ptr(g_cumsum),
+                    to_ptr(state), to_ptr(h0), to_ptr(v_new),
+                    to_ptr(k_pack_hv), to_ptr(w_pack), to_ptr(u_pack),
+                    to_ptr(wh_pack), to_ptr(decayed_v_pack),
+                    to_ptr(state_f32), to_ptr(chunk_f32), to_ptr(acc_f32),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("k_l2"), py::arg("u"), py::arg("w"),
+        py::arg("g_cumsum"), py::arg("state"),
+        py::arg("h0"), py::arg("v_new"),
+        py::arg("k_pack_hv"), py::arg("w_pack"), py::arg("u_pack"),
+        py::arg("wh_pack"), py::arg("decayed_v_pack"),
+        py::arg("state_f32"), py::arg("chunk_f32"), py::arg("acc_f32"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"),
+        py::arg("stream") = 0);
+
     m.def("qwen36_gdn_wy_solve_tril_b64_f32",
         [](uintptr_t A, uintptr_t Ai, int S, uintptr_t stream) {
             flash_rt::kernels::qwen36_gdn_wy_solve_tril_b64_f32(

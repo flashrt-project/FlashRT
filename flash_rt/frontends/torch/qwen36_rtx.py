@@ -2131,9 +2131,17 @@ class Qwen36TorchFrontendRtx:
             and hasattr(fvk, 'linear_attn_gdn_wy_kkt_b64_bf16_cublaslt')
         )
         fast_chunk_mode = os.environ.get(
-            'FLASHRT_QWEN36_TQ_PREFILL_GDN_FAST_CHUNK', 'f32')
+            'FLASHRT_QWEN36_TQ_PREFILL_GDN_FAST_CHUNK', 'f32gemm')
+        use_wy_lt_chunk_h_f32gemm = (
+            use_wy_lt_kkt
+            and fast_chunk_mode not in ('0', 'false', 'off', 'bf16', 'direct')
+            and hasattr(
+                fvk,
+                'linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_f32gemm')
+        )
         use_wy_lt_chunk_h_f32 = (
             use_wy_lt_kkt
+            and not use_wy_lt_chunk_h_f32gemm
             and fast_chunk_mode not in ('0', 'false', 'off', 'bf16')
             and hasattr(
                 fvk,
@@ -2205,6 +2213,7 @@ class Qwen36TorchFrontendRtx:
                     not hasattr(self, '_K_wy_A')
                     or not hasattr(self, '_K_wy_out_q_pack')
                     or not hasattr(self, '_K_wy_state_f32')
+                    or not hasattr(self, '_K_wy_chunk_f32')
                     or self._K_wy_A.shape[0] < chunks
                     or self._K_wy_A.device != q16_K.device
                 ):
@@ -2236,6 +2245,10 @@ class Qwen36TorchFrontendRtx:
                         48, 128, 128, device=device, dtype=fp32)
                     self._K_wy_delta_f32 = torch.empty_like(
                         self._K_wy_state_f32)
+                    self._K_wy_chunk_f32 = torch.empty(
+                        48, 64, 128, device=device, dtype=fp32)
+                    self._K_wy_acc_f32 = torch.empty_like(
+                        self._K_wy_chunk_f32)
                     self._K_wy_h0 = torch.empty(
                         chunks, 48, 128, 128, device=device, dtype=bf16)
                     self._K_wy_v_new = torch.empty_like(self._K_wy_w48)
@@ -2307,7 +2320,26 @@ class Qwen36TorchFrontendRtx:
                         self._K_wy_u48[:K].data_ptr(),
                         K, s,
                     )
-                if use_wy_lt_chunk_h_f32:
+                if use_wy_lt_chunk_h_f32gemm:
+                    fvk.linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_f32gemm(
+                        self._K_fla_k16_l2[:, :K].data_ptr(),
+                        self._K_wy_u48[:K].data_ptr(),
+                        self._K_wy_w48[:K].data_ptr(),
+                        self._K_wy_g_cumsum[:K].data_ptr(),
+                        rec_state_view.data_ptr(),
+                        self._K_wy_h0[:chunks].data_ptr(),
+                        self._K_wy_v_new[:K].data_ptr(),
+                        self._K_wy_rhs_w[:chunks].data_ptr(),
+                        self._K_wy_rhs_u[:chunks].data_ptr(),
+                        self._K_wy_w_pack[:chunks].data_ptr(),
+                        self._K_wy_u_pack[:chunks].data_ptr(),
+                        self._K_wy_out_q_pack[:chunks].data_ptr(),
+                        self._K_wy_state_f32.data_ptr(),
+                        self._K_wy_chunk_f32.data_ptr(),
+                        self._K_wy_acc_f32.data_ptr(),
+                        K, 16, 48, 128, 3, s,
+                    )
+                elif use_wy_lt_chunk_h_f32:
                     fvk.linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_f32state(
                         self._K_fla_k16_l2[:, :K].data_ptr(),
                         self._K_wy_u48[:K].data_ptr(),
