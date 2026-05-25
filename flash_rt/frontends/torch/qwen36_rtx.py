@@ -5329,9 +5329,11 @@ class Qwen36TorchFrontendRtx:
             scale_5120.data_ptr(), int(mtp['q_proj_s']),
             s,
         )
-        q_full = q_proj_out_buf[:1].view(1, 1, 24, 512)
-        q_pre, gate = torch.chunk(q_full, 2, dim=-1)
-        gate_flat = gate.reshape(1, 1, 24 * 256)
+        q_pre_2d = self._full_q_rot.view(24, 256)
+        gate_flat = self._full_gate_sig.view(1, 1, 24 * 256)
+        fvk.qwen36_split_q_gate_bf16(
+            q_proj_out_buf[:1].data_ptr(), q_pre_2d.data_ptr(),
+            gate_flat.data_ptr(), 1, s)
 
         # 4d) k_proj.
         kv_proj_out_buf = self._fp8_scratch[(1024, 5120)][2]
@@ -9048,7 +9050,6 @@ class Qwen36TorchFrontendRtx:
         k_pre = kv_proj_out_buf[:1].view(1, 1, 4, 256).contiguous()
 
         # ---- 4) q_norm / k_norm ----
-        q_pre_2d = q_pre.contiguous().view(24, 256)
         fvk.rms_norm(
             q_pre_2d.data_ptr(), int(lw['q_norm_eff_w']),
             self._full_q_norm_out.data_ptr(), 24, 256, eps, s,
