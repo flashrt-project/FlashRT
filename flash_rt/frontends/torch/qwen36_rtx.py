@@ -1044,6 +1044,12 @@ class Qwen36TorchFrontendRtx:
                 'FLASHRT_QWEN36_MLP_GATE_UP_PINGPONG',
                 '1').strip().lower() not in ('0', 'false', 'off')
         )
+        self._enable_prefill_proj_pingpong = (
+            hasattr(fvk, 'fp4_w4a16_gemm_sm120_bf16out_pingpong')
+            and os.environ.get(
+                'FLASHRT_QWEN36_PREFILL_PROJ_PINGPONG',
+                '1').strip().lower() not in ('0', 'false', 'off')
+        )
         self._enable_silu_mul_quant_fusion = bool(int(os.environ.get(
             'FLASHRT_QWEN36_FUSE_SILU_MUL_QUANT', '0') or '0'))
         if self._enable_mlp_gate_up_fusion:
@@ -1937,6 +1943,10 @@ class Qwen36TorchFrontendRtx:
         from flash_rt import flash_rt_kernels as fvk
 
         s = torch.cuda.current_stream().cuda_stream
+        prefill_proj_gemm = (
+            fvk.fp4_w4a16_gemm_sm120_bf16out_pingpong
+            if self._enable_prefill_proj_pingpong
+            else fvk.fp4_w4a16_gemm_sm120_bf16out)
         lw = self._weights.ptrs['layers'][L]
         assert lw['type'] == 'linear_attention', (
             f'_layer_forward_lin_K_nvfp4 layer {L} type {lw["type"]!r}'
@@ -1962,7 +1972,7 @@ class Qwen36TorchFrontendRtx:
         # in_proj_qkv (G7: NVFP4 N=10240, K=5120, M=K).
         out_qkv_buf = self._nvfp4_scratch[(10240, 5120)][2]
         out_qkv_K = out_qkv_buf[:K]
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
+        prefill_proj_gemm(
             ap_5120.data_ptr(), int(lw['in_proj_qkv_packed']),
             out_qkv_K.data_ptr(),
             K, 10240, 5120,
@@ -1973,7 +1983,7 @@ class Qwen36TorchFrontendRtx:
         # 3) in_proj_z (G7: NVFP4 N=6144, K=5120, M=K) — reuse same act.
         out_z_buf = self._nvfp4_scratch[(6144, 5120)][2]
         out_z_K = out_z_buf[:K]
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
+        prefill_proj_gemm(
             ap_5120.data_ptr(), int(lw['in_proj_z_packed']),
             out_z_K.data_ptr(),
             K, 6144, 5120,
@@ -2847,7 +2857,7 @@ class Qwen36TorchFrontendRtx:
         )
         out_op_buf = self._nvfp4_scratch[(5120, 6144)][2]
         out_op_K = out_op_buf[:K]
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
+        prefill_proj_gemm(
             ap_6144.data_ptr(), int(lw['out_proj_packed']),
             out_op_K.data_ptr(),
             K, 5120, 6144,
@@ -2989,6 +2999,10 @@ class Qwen36TorchFrontendRtx:
         from flash_rt import flash_rt_kernels as fvk
 
         s = torch.cuda.current_stream().cuda_stream
+        prefill_proj_gemm = (
+            fvk.fp4_w4a16_gemm_sm120_bf16out_pingpong
+            if self._enable_prefill_proj_pingpong
+            else fvk.fp4_w4a16_gemm_sm120_bf16out)
         lw = self._weights.ptrs['layers'][L]
         assert lw['type'] == 'full_attention', (
             f'_layer_forward_full_K_nvfp4 layer {L} type {lw["type"]!r}'
@@ -3010,7 +3024,7 @@ class Qwen36TorchFrontendRtx:
 
         # 3) q_proj fused (Q + output_gate) — M=K, N=12288.
         q_proj_out_buf = self._nvfp4_scratch[(12288, 5120)][2]
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
+        prefill_proj_gemm(
             ap_5120.data_ptr(), int(lw['q_proj_packed']),
             q_proj_out_buf.data_ptr(),
             K, 12288, 5120,
@@ -3208,7 +3222,7 @@ class Qwen36TorchFrontendRtx:
             sf_6144.data_ptr(), K, 6144, s,
         )
         out_op_buf = self._nvfp4_scratch[(5120, 6144)][2]
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
+        prefill_proj_gemm(
             ap_6144.data_ptr(), int(lw['o_proj_packed']),
             out_op_buf.data_ptr(),
             K, 5120, 6144,
