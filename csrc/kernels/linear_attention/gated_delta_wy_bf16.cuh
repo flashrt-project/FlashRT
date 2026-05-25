@@ -323,6 +323,32 @@ void gdn_wy_chunk_h_b64_bf16_mma_fla(
     int qk_group,
     cudaStream_t stream);
 
+// FLA-style hand-tuned recompute_wu kernel. Fuses pack_recompute_rhs +
+// the 2 cublasLt mmas (Ai @ rhs_u, Ai @ rhs_w) into a single CTA kernel.
+// head_dim must be 128. Writes only w_pack and u_pack (no rhs_w/rhs_u
+// intermediates).
+//   k_l2:     (S, num_k_heads, head_dim) bf16
+//   v:        (S, num_v_heads, head_dim) bf16
+//   beta:     (S, num_v_heads) bf16
+//   g_cumsum: (S, num_v_heads) bf16
+//   Ai_pack:  (NT, num_v_heads, 64, 64) bf16
+//   w_pack:   (NT, num_v_heads, 64, head_dim) bf16
+//   u_pack:   (NT, num_v_heads, 64, head_dim) bf16
+void gdn_wy_recompute_wu_b64_bf16_mma_fla(
+    const void* k_l2,
+    const void* v,
+    const void* beta,
+    const void* g_cumsum,
+    const void* Ai_pack,
+    void*       w_pack,
+    void*       u_pack,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group,
+    cudaStream_t stream);
+
 // FLA-style hand-tuned output_o kernel. Drop-in replacement for
 // gdn_wy_output_o_b64_bf16_cublaslt_packed_qkv.
 //   q_pack:    (NT, num_v_heads, 64, head_dim) bf16 packed q (post norm_pack_q)

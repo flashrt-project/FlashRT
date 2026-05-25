@@ -2356,6 +2356,11 @@ class Qwen36TorchFrontendRtx:
                         fvk,
                         'linear_attn_gdn_wy_output_o_b64_bf16_cublaslt_packed_qkv')
                 )
+                # NOTE: recompute_wu_mma_fla is shipped but DISABLED in
+                # dispatch because cublasLt packed_rhs is already highly
+                # tuned for this small (64,128,64) GEMM and our hand-tuned
+                # kernel currently regresses (~+5 ms). Kept as a draft for
+                # future optimization (warp specialization, tile re-tuning).
                 if use_wy_lt_packed_wu and use_wy_lt_ai_pack_from_solve:
                     fvk.linear_attn_gdn_wy_recompute_wu_b64_bf16_cublaslt_packed_rhs(
                         self._K_fla_k16_l2[:, :K].data_ptr(),

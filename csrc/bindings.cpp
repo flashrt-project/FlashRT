@@ -4564,6 +4564,26 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("head_dim"), py::arg("qk_group"),
         py::arg("stream") = 0);
 
+    // FLA-style hand-tuned recompute_wu. Fuses pack_rhs + 2 cublasLt mmas
+    // into a single kernel; only writes w_pack / u_pack.
+    m.def("linear_attn_gdn_wy_recompute_wu_b64_bf16_mma_fla",
+        [](uintptr_t k_l2, uintptr_t v, uintptr_t beta, uintptr_t g_cumsum,
+           uintptr_t Ai_pack, uintptr_t w_pack, uintptr_t u_pack,
+           int S, int num_k_heads, int num_v_heads, int head_dim,
+           int qk_group, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_recompute_wu_b64_bf16_mma_fla(
+                    to_ptr(k_l2), to_ptr(v), to_ptr(beta), to_ptr(g_cumsum),
+                    to_ptr(Ai_pack), to_ptr(w_pack), to_ptr(u_pack),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("k_l2"), py::arg("v"), py::arg("beta"), py::arg("g_cumsum"),
+        py::arg("Ai_pack"), py::arg("w_pack"), py::arg("u_pack"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"),
+        py::arg("stream") = 0);
+
     // FLA-style hand-tuned output_o. Drop-in for output_o packed_qkv but
     // no scratch buffers needed.
     m.def("linear_attn_gdn_wy_output_o_b64_bf16_mma_fla",
