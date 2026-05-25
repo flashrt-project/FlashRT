@@ -694,7 +694,7 @@ __global__ void pack_recompute_wu_kernel(
   rhs_w[ridx] = __float2bfloat16(kk * b * __expf(g));
 }
 
-__global__ void pack_recompute_rhs_kernel(
+__global__ void pack_recompute_rhs_row_kernel(
     const __nv_bfloat16* __restrict__ k_l2,
     const __nv_bfloat16* __restrict__ v,
     const __nv_bfloat16* __restrict__ beta,
@@ -707,35 +707,50 @@ __global__ void pack_recompute_rhs_kernel(
     int head_dim,
     int qk_group)
 {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const int chunks = (S + kChunk - 1) / kChunk;
-  const int total = chunks * num_v_heads * kChunk * head_dim;
-  if (idx >= total) return;
+  __shared__ float b_s;
+  __shared__ float eg_s;
 
-  const int d = idx % head_dim;
-  const int t = (idx / head_dim) % kChunk;
-  const int vh = (idx / (head_dim * kChunk)) % num_v_heads;
-  const int chunk = idx / (head_dim * kChunk * num_v_heads);
+  const int row = blockIdx.x;
+  const int t = row % kChunk;
+  const int vh = (row / kChunk) % num_v_heads;
+  const int chunk = row / (kChunk * num_v_heads);
   const int s = chunk * kChunk + t;
   const int kh = vh / qk_group;
   const __nv_bfloat16 zero = __float2bfloat16(0.0f);
-  if (s >= S || kh >= num_k_heads) {
-    rhs_w[idx] = zero;
-    rhs_u[idx] = zero;
-    return;
+  const size_t out_base =
+      (static_cast<size_t>(chunk) * num_v_heads + vh) * kChunk * head_dim
+      + static_cast<size_t>(t) * head_dim;
+
+  if (threadIdx.x == 0) {
+    if (s < S && kh < num_k_heads) {
+      b_s = static_cast<float>(
+          beta[static_cast<size_t>(s) * num_v_heads + vh]);
+      const float g = static_cast<float>(
+          g_cumsum[static_cast<size_t>(s) * num_v_heads + vh]);
+      eg_s = __expf(g);
+    } else {
+      b_s = 0.0f;
+      eg_s = 0.0f;
+    }
   }
-  const float b =
-      static_cast<float>(beta[static_cast<size_t>(s) * num_v_heads + vh]);
-  const float g =
-      static_cast<float>(g_cumsum[static_cast<size_t>(s) * num_v_heads + vh]);
-  const float vv =
-      static_cast<float>(v[(static_cast<size_t>(s) * num_v_heads + vh)
-                           * head_dim + d]);
-  const float kk =
-      static_cast<float>(k_l2[(static_cast<size_t>(s) * num_k_heads + kh)
-                              * head_dim + d]);
-  rhs_u[idx] = __float2bfloat16(vv * b);
-  rhs_w[idx] = __float2bfloat16(kk * b * __expf(g));
+  __syncthreads();
+
+  for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+    if (s >= S || kh >= num_k_heads) {
+      rhs_w[out_base + d] = zero;
+      rhs_u[out_base + d] = zero;
+      continue;
+    }
+    const float vv =
+        static_cast<float>(v[(static_cast<size_t>(s) * num_v_heads + vh)
+                             * head_dim + d]);
+    const float kk =
+        static_cast<float>(k_l2[(static_cast<size_t>(s) * num_k_heads + kh)
+                                * head_dim + d]);
+    const float b = b_s;
+    rhs_u[out_base + d] = __float2bfloat16(vv * b);
+    rhs_w[out_base + d] = __float2bfloat16((kk * b) * eg_s);
+  }
 }
 
 __global__ void pack_recompute_rhs_nogate_kernel(
@@ -2108,10 +2123,8 @@ void gdn_wy_recompute_wu_b64_bf16_cublaslt_packed_rhs(
   }
   const int chunks = (S + kChunk - 1) / kChunk;
   const int batches = chunks * num_v_heads;
-  const int rhs_total = batches * kChunk * head_dim;
-  pack_recompute_rhs_kernel<<<
-      (rhs_total + kThreads - 1) / kThreads,
-      kThreads, 0, stream>>>(
+  pack_recompute_rhs_row_kernel<<<
+      batches * kChunk, 128, 0, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(k_l2),
       reinterpret_cast<const __nv_bfloat16*>(v),
       reinterpret_cast<const __nv_bfloat16*>(beta),
