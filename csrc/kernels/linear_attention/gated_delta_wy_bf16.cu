@@ -738,6 +738,83 @@ __global__ void pack_recompute_rhs_kernel(
   rhs_w[idx] = __float2bfloat16(kk * b * __expf(g));
 }
 
+__global__ void pack_recompute_rhs_nogate_kernel(
+    const __nv_bfloat16* __restrict__ k_l2,
+    const __nv_bfloat16* __restrict__ v,
+    const __nv_bfloat16* __restrict__ beta,
+    const __nv_bfloat16* __restrict__ g_cumsum,
+    __nv_bfloat16* __restrict__ rhs_w,
+    __nv_bfloat16* __restrict__ rhs_u,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int chunks = (S + kChunk - 1) / kChunk;
+  const int total = chunks * num_v_heads * kChunk * head_dim;
+  if (idx >= total) return;
+
+  const int d = idx % head_dim;
+  const int t = (idx / head_dim) % kChunk;
+  const int vh = (idx / (head_dim * kChunk)) % num_v_heads;
+  const int chunk = idx / (head_dim * kChunk * num_v_heads);
+  const int s = chunk * kChunk + t;
+  const int kh = vh / qk_group;
+  const __nv_bfloat16 zero = __float2bfloat16(0.0f);
+  if (s >= S || kh >= num_k_heads) {
+    rhs_w[idx] = zero;
+    rhs_u[idx] = zero;
+    return;
+  }
+  const float b =
+      static_cast<float>(beta[static_cast<size_t>(s) * num_v_heads + vh]);
+  const float g =
+      static_cast<float>(g_cumsum[static_cast<size_t>(s) * num_v_heads + vh]);
+  const float vv =
+      static_cast<float>(v[(static_cast<size_t>(s) * num_v_heads + vh)
+                           * head_dim + d]);
+  const float kk =
+      static_cast<float>(k_l2[(static_cast<size_t>(s) * num_k_heads + kh)
+                              * head_dim + d]);
+  // For Ai_no_gate:
+  //   u_gated = exp(g_i) * Ai_no @ (v * beta * exp(-g))
+  //   w_gated = exp(g_i) * Ai_no @ (k * beta)
+  rhs_u[idx] = __float2bfloat16(vv * b * __expf(-g));
+  rhs_w[idx] = __float2bfloat16(kk * b);
+}
+
+__global__ void scale_recompute_wu_nogate_kernel(
+    const __nv_bfloat16* __restrict__ g_cumsum,
+    __nv_bfloat16* __restrict__ w_pack,
+    __nv_bfloat16* __restrict__ u_pack,
+    int S,
+    int num_v_heads,
+    int head_dim)
+{
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int chunks = (S + kChunk - 1) / kChunk;
+  const int total = chunks * num_v_heads * kChunk * head_dim;
+  if (idx >= total) return;
+
+  const int d = idx % head_dim;
+  const int t = (idx / head_dim) % kChunk;
+  const int vh = (idx / (head_dim * kChunk)) % num_v_heads;
+  const int chunk = idx / (head_dim * kChunk * num_v_heads);
+  const int s = chunk * kChunk + t;
+  if (s >= S) {
+    w_pack[idx] = __float2bfloat16(0.0f);
+    u_pack[idx] = __float2bfloat16(0.0f);
+    return;
+  }
+  (void)d;
+  const float eg = __expf(static_cast<float>(
+      g_cumsum[static_cast<size_t>(s) * num_v_heads + vh]));
+  w_pack[idx] = __float2bfloat16(static_cast<float>(w_pack[idx]) * eg);
+  u_pack[idx] = __float2bfloat16(static_cast<float>(u_pack[idx]) * eg);
+}
+
 __global__ void unpack_recompute_wu_kernel(
     const __nv_bfloat16* __restrict__ w_pack,
     const __nv_bfloat16* __restrict__ u_pack,
@@ -1827,6 +1904,70 @@ void gdn_wy_recompute_wu_b64_bf16_cublaslt_packed_rhs(
       w_pack, plan.c_desc,
       w_pack, plan.c_desc,
       &plan.algo, g_workspace, g_workspace_size, stream));
+}
+
+void gdn_wy_recompute_wu_b64_bf16_cublaslt_packed_rhs_nogate(
+    const void* k_l2,
+    const void* v,
+    const void* beta,
+    const void* g_cumsum,
+    const void* Ai_pack,
+    void*       rhs_w,
+    void*       rhs_u,
+    void*       w_pack,
+    void*       u_pack,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group,
+    cudaStream_t stream)
+{
+  if (S <= 0 || num_k_heads <= 0 || num_v_heads <= 0 ||
+      head_dim <= 0 || qk_group <= 0) {
+    return;
+  }
+  const int chunks = (S + kChunk - 1) / kChunk;
+  const int batches = chunks * num_v_heads;
+  const int rhs_total = batches * kChunk * head_dim;
+  pack_recompute_rhs_nogate_kernel<<<
+      (rhs_total + kThreads - 1) / kThreads,
+      kThreads, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(k_l2),
+      reinterpret_cast<const __nv_bfloat16*>(v),
+      reinterpret_cast<const __nv_bfloat16*>(beta),
+      reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
+      reinterpret_cast<__nv_bfloat16*>(rhs_w),
+      reinterpret_cast<__nv_bfloat16*>(rhs_u),
+      S, num_k_heads, num_v_heads, head_dim, qk_group);
+
+  LtPlan& plan = get_mm64d_plan(batches, head_dim);
+  const float alpha = 1.0f;
+  const float beta0 = 0.0f;
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmul(
+      g_lt, plan.desc, &alpha,
+      Ai_pack, plan.a_desc,
+      rhs_u, plan.b_desc,
+      &beta0,
+      u_pack, plan.c_desc,
+      u_pack, plan.c_desc,
+      &plan.algo, g_workspace, g_workspace_size, stream));
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmul(
+      g_lt, plan.desc, &alpha,
+      Ai_pack, plan.a_desc,
+      rhs_w, plan.b_desc,
+      &beta0,
+      w_pack, plan.c_desc,
+      w_pack, plan.c_desc,
+      &plan.algo, g_workspace, g_workspace_size, stream));
+
+  scale_recompute_wu_nogate_kernel<<<
+      (rhs_total + kThreads - 1) / kThreads,
+      kThreads, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
+      reinterpret_cast<__nv_bfloat16*>(w_pack),
+      reinterpret_cast<__nv_bfloat16*>(u_pack),
+      S, num_v_heads, head_dim);
 }
 
 void gdn_wy_solve_tril_b64_f32_parallel(

@@ -651,6 +651,73 @@ def test_linear_attn_gdn_wy_recompute_wu_cublaslt_packed_rhs_matches_reference(S
     torch.testing.assert_close(u_pack, u_pack_base, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("S", [64, 128])
+def test_linear_attn_gdn_wy_recompute_wu_nogate_packed_rhs_matches_gated(S):
+    fvk = _load_fvk()
+    if not hasattr(
+            fvk,
+            "linear_attn_gdn_wy_recompute_wu_b64_bf16_cublaslt_packed_rhs_nogate"):
+        pytest.skip("nogate packed_rhs recompute_wu kernel is not built")
+    torch.manual_seed(20260529 + S)
+    chunks = (S + 63) // 64
+    k = torch.randn(S, 16, 128, device="cuda", dtype=torch.bfloat16) * 0.2
+    v = torch.randn(S, 48, 128, device="cuda", dtype=torch.bfloat16) * 0.2
+    beta = torch.rand(S, 48, device="cuda", dtype=torch.bfloat16) * 0.8
+    g = (torch.randn(S, 48, device="cuda") * 0.015).to(torch.bfloat16)
+    k_l2 = (k.float() / torch.sqrt(
+        torch.sum(k.float() * k.float(), dim=-1, keepdim=True) + 1e-6)
+    ).to(torch.bfloat16)
+    g_cumsum = _local_cumsum_bf16(g)
+
+    k_pack = torch.empty(chunks, 16, 64, 128, device="cuda",
+                         dtype=torch.bfloat16)
+    kkt_base = torch.empty(chunks, 16, 64, 64, device="cuda",
+                           dtype=torch.float32)
+    A_gated = torch.empty(chunks, 48, 64, 64, device="cuda",
+                          dtype=torch.float32)
+    A_nogate = torch.empty_like(A_gated)
+    Ai_gated = torch.empty_like(A_gated)
+    Ai_nogate = torch.empty_like(A_gated)
+    Ai_pack_gated = torch.empty(chunks, 48, 64, 64, device="cuda",
+                                dtype=torch.bfloat16)
+    Ai_pack_nogate = torch.empty_like(Ai_pack_gated)
+
+    fvk.linear_attn_gdn_wy_kkt_b64_bf16_cublaslt(
+        _ptr(k_l2), _ptr(beta), _ptr(g_cumsum),
+        _ptr(k_pack), _ptr(kkt_base), _ptr(A_gated),
+        S, 16, 48, 128, 3, 0)
+    fvk.linear_attn_gdn_wy_solve_tril_b64_f32_fused_pack(
+        _ptr(A_gated), _ptr(Ai_gated), _ptr(Ai_pack_gated), S, 48, 0)
+    fvk.linear_attn_gdn_wy_kkt_b64_bf16_cublaslt_nogate(
+        _ptr(k_l2), _ptr(beta), _ptr(k_pack), _ptr(kkt_base),
+        _ptr(A_nogate), S, 16, 48, 128, 3, 0)
+    fvk.linear_attn_gdn_wy_solve_tril_b64_f32_fused_pack(
+        _ptr(A_nogate), _ptr(Ai_nogate), _ptr(Ai_pack_nogate), S, 48, 0)
+
+    rhs_w_g = torch.empty(chunks, 48, 64, 128, device="cuda",
+                          dtype=torch.bfloat16)
+    rhs_u_g = torch.empty_like(rhs_w_g)
+    w_g = torch.empty_like(rhs_w_g)
+    u_g = torch.empty_like(rhs_w_g)
+    fvk.linear_attn_gdn_wy_recompute_wu_b64_bf16_cublaslt_packed_rhs(
+        _ptr(k_l2), _ptr(v), _ptr(beta), _ptr(g_cumsum),
+        _ptr(Ai_pack_gated), _ptr(rhs_w_g), _ptr(rhs_u_g),
+        _ptr(w_g), _ptr(u_g), S, 16, 48, 128, 3, 0)
+
+    rhs_w_n = torch.empty_like(rhs_w_g)
+    rhs_u_n = torch.empty_like(rhs_w_g)
+    w_n = torch.empty_like(rhs_w_g)
+    u_n = torch.empty_like(rhs_w_g)
+    fvk.linear_attn_gdn_wy_recompute_wu_b64_bf16_cublaslt_packed_rhs_nogate(
+        _ptr(k_l2), _ptr(v), _ptr(beta), _ptr(g_cumsum),
+        _ptr(Ai_pack_nogate), _ptr(rhs_w_n), _ptr(rhs_u_n),
+        _ptr(w_n), _ptr(u_n), S, 16, 48, 128, 3, 0)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(w_n, w_g, rtol=0, atol=0.035)
+    torch.testing.assert_close(u_n, u_g, rtol=0, atol=0.035)
+
+
 @pytest.mark.parametrize("S", [6, 64, 65])
 def test_qwen36_wy_chunk_h_and_output_match_reference(S):
     fvk = _load_fvk()

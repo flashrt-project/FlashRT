@@ -107,6 +107,31 @@ void gdn_wy_recompute_wu_b64_bf16_cublaslt_packed_rhs(
     int qk_group,
     cudaStream_t stream);
 
+// Bridge path for the FlashQLA-style no-gate representation. Consumes
+// Ai_pack from gdn_wy_kkt_b64_bf16_cublaslt_nogate + solve, then reproduces
+// the same gated w_pack/u_pack consumed by the existing chunk_h kernels:
+//   rhs_u = v * beta * exp(-g)
+//   rhs_w = k * beta
+//   u,w = exp(g_i) * Ai_no_gate @ rhs
+// This is additive and not wired by default; the fused GDR kernel should
+// eventually consume Ai_no_gate directly and avoid materializing w/u.
+void gdn_wy_recompute_wu_b64_bf16_cublaslt_packed_rhs_nogate(
+    const void* k_l2,
+    const void* v,
+    const void* beta,
+    const void* g_cumsum,
+    const void* Ai_pack,
+    void*       rhs_w,
+    void*       rhs_u,
+    void*       w_pack,
+    void*       u_pack,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group,
+    cudaStream_t stream);
+
 void gdn_wy_solve_tril_b64_f32_parallel(
     const void* A,
     void*       Ai,
