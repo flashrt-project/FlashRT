@@ -2243,16 +2243,16 @@ class Qwen36TorchFrontendRtx:
             and fast_chunk_mode in ('1', 'true', 'on', 'bf16')
             and hasattr(fvk, 'linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt')
         )
-        # FLA-style hand-tuned mma.sync + cp.async chunk_h/output_o kernels.
-        # Default on for the SM120 Qwen3.6 long-prefill path; keep the env
-        # switch so perf/debug runs can fall back to the cublasLt reference.
-        use_mma_fla_chunk_h = (
+        # Hand-tuned CUDA mma.sync + cp.async chunk_h/output_o kernels.
+        # Default on for the SM120 Qwen3.6 long-prefill path. The cublasLt
+        # route is kept only as a reference/debug fallback.
+        use_cuda_wy_chunk_h = (
             use_wy_chunk
             and hasattr(fvk,
                         'linear_attn_gdn_wy_chunk_h_b64_bf16_mma_fla')
             and os.environ.get(
-                'FLASHRT_QWEN36_TQ_PREFILL_GDN_CHUNK_H_MMA_FLA',
-                '1').strip().lower() in ('1', 'true', 'on'))
+                'FLASHRT_QWEN36_TQ_PREFILL_GDN_CHUNK_H_CUBLASLT_REF',
+                '0').strip().lower() not in ('1', 'true', 'on'))
         use_inout = K <= self._K_save_max
         if use_wy_chunk:
             if conv_gqa_ready:
@@ -2486,7 +2486,7 @@ class Qwen36TorchFrontendRtx:
                         fvk,
                         'linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu')
                 )
-                # mma_fla reads PACKED w_pack / u_pack (same layout as
+                # The CUDA chunk_h kernel reads PACKED w_pack / u_pack (same layout as
                 # cublasLt packed_wu) so the existing packed recompute_wu
                 # pipeline can still run. We just replace the chunk_h call
                 # itself; recompute and downstream output_o stay on packed.
@@ -2500,7 +2500,7 @@ class Qwen36TorchFrontendRtx:
                         fvk,
                         'linear_attn_gdn_wy_output_o_b64_bf16_cublaslt_packed_kv')
                 )
-                # mma_fla writes v_pack into rhs_u and k_pack_hv into rhs_w
+                # The CUDA chunk_h kernel writes v_pack into rhs_u and k_pack_hv into rhs_w
                 # as side outputs; with packed inputs from packed_wu
                 # recompute we already have w_pack / u_pack populated, so
                 # the full packed downstream path stays active.
@@ -2511,8 +2511,8 @@ class Qwen36TorchFrontendRtx:
                         fvk,
                         'linear_attn_gdn_wy_output_o_b64_bf16_cublaslt_packed_qkv')
                 )
-                use_mma_fla_output_o_rawk = (
-                    use_mma_fla_chunk_h
+                use_cuda_wy_output_o_rawk = (
+                    use_cuda_wy_chunk_h
                     and use_wy_lt_output_packed_qkv
                     and hasattr(
                         fvk,
@@ -2580,16 +2580,16 @@ class Qwen36TorchFrontendRtx:
                         self._K_wy_u48[:K].data_ptr(),
                         K, s,
                     )
-                if use_mma_fla_chunk_h:
-                    # mma_fla now consumes packed w_pack / u_pack.
+                if use_cuda_wy_chunk_h:
+                    # The CUDA kernel consumes packed w_pack / u_pack.
                     # When the downstream output_o packed_kv path is active,
-                    # mma_fla also writes v_new in packed layout to rhs_u and
+                    # it also writes v_new in packed layout to rhs_u and
                     # the GQA-expanded k to rhs_w so output_o sees the same
                     # packed inputs the cublasLt path produces.
                     if use_wy_lt_output_packed_kv:
                         v_packed_ptr = self._K_wy_rhs_u[:chunks].data_ptr()
                         k_pack_hv_ptr = (
-                            0 if use_mma_fla_output_o_rawk
+                            0 if use_cuda_wy_output_o_rawk
                             else self._K_wy_rhs_w[:chunks].data_ptr())
                         # Raw v_new is unused downstream when packed path is
                         # active; skip the redundant 25 MB HBM write at 4K.
@@ -2704,13 +2704,13 @@ class Qwen36TorchFrontendRtx:
                         self._K_wy_v_new[:K].data_ptr(),
                         K, s,
                     )
-                use_mma_fla_output_o = (
-                    use_mma_fla_chunk_h
+                use_cuda_wy_output_o = (
+                    use_cuda_wy_chunk_h
                     and use_wy_lt_output_packed_qkv
                     and hasattr(
                         fvk,
                         'linear_attn_gdn_wy_output_o_b64_bf16_mma_fla'))
-                if use_mma_fla_output_o_rawk:
+                if use_cuda_wy_output_o_rawk:
                     fvk.linear_attn_gdn_wy_output_o_b64_bf16_mma_fla_rawk(
                         self._K_wy_out_q_pack[:chunks].data_ptr(),
                         self._K_fla_k16_l2[:, :K].data_ptr(),
@@ -2720,7 +2720,7 @@ class Qwen36TorchFrontendRtx:
                         self._K_lin_attn_out[:K].data_ptr(),
                         K, 16, 48, 128, 3, float(128 ** -0.5), s,
                     )
-                elif use_mma_fla_output_o:
+                elif use_cuda_wy_output_o:
                     fvk.linear_attn_gdn_wy_output_o_b64_bf16_mma_fla(
                         self._K_wy_out_q_pack[:chunks].data_ptr(),
                         self._K_wy_rhs_w[:chunks].data_ptr(),
