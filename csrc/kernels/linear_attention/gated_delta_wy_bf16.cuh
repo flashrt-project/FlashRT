@@ -295,7 +295,7 @@ void gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu(
 //   state:    (num_v_heads, head_dim, head_dim) bf16, IN/OUT (in-place update)
 // Outputs:
 //   h_out:    (NT, num_v_heads, head_dim, head_dim) bf16 (chunk prologue states)
-//   v_new:    (S, num_v_heads, head_dim) bf16 (written BEFORE decay)
+//   v_new:    (S, num_v_heads, head_dim) bf16 raw (written BEFORE decay).
 //
 // No scratch buffers; smem-resident pipeline. NT = ceil(S / 64).
 void gdn_wy_chunk_h_b64_bf16_mma_fla(
