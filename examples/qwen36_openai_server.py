@@ -91,6 +91,19 @@ log = logging.getLogger('qwen36_openai_server')
 #   <tool_call>{"name": "fn_name", "arguments": {...}}</tool_call>
 _TOOL_CALL_OPEN = '<tool_call>'
 _TOOL_CALL_CLOSE = '</tool_call>'
+_JSON_SEPARATORS = (',', ':')
+_SSE_HEADERS = {
+    'Cache-Control': 'no-cache, no-transform',
+    'X-Accel-Buffering': 'no',
+}
+
+
+def _json_dumps(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, separators=_JSON_SEPARATORS)
+
+
+def _sse(obj: Any) -> str:
+    return f'data: {_json_dumps(obj)}\n\n'
 
 
 class ToolCallParser:
@@ -504,7 +517,7 @@ def build_app(engine: Qwen36Engine):
                 }
                 if result['text']:
                     first['choices'][0]['delta']['content'] = result['text']
-                yield f'data: {json.dumps(first)}\n\n'
+                yield _sse(first)
                 for tc in result['tool_calls']:
                     chunk = {
                         'id': completion_id,
@@ -517,7 +530,7 @@ def build_app(engine: Qwen36Engine):
                             'finish_reason': None,
                         }],
                     }
-                    yield f'data: {json.dumps(chunk)}\n\n'
+                    yield _sse(chunk)
                 last = {
                     'id': completion_id,
                     'object': 'chat.completion.chunk',
@@ -533,10 +546,11 @@ def build_app(engine: Qwen36Engine):
                     }],
                     'usage': usage,
                 }
-                yield f'data: {json.dumps(last)}\n\n'
+                yield _sse(last)
                 yield 'data: [DONE]\n\n'
 
-            return StreamingResponse(gen(), media_type='text/event-stream')
+            return StreamingResponse(
+                gen(), media_type='text/event-stream', headers=_SSE_HEADERS)
 
         content = (
             result['text'] if result['text'] or not result['tool_calls']

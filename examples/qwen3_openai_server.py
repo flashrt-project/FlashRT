@@ -31,7 +31,7 @@ Usage::
     python examples/qwen3_openai_server.py \\
         --checkpoint /path/to/Qwen3-8B-Instruct-NVFP4 \\
         --port 8000 \\
-        --warmup 32:128,128:256,256:256
+        --warmup-preset auto
 
     curl http://localhost:8000/v1/chat/completions \\
         -H 'Content-Type: application/json' \\
@@ -65,6 +65,19 @@ log = logging.getLogger('qwen3_openai_server')
 # anywhere in the assistant turn. We parse incrementally during stream.
 _TOOL_CALL_OPEN = '<tool_call>'
 _TOOL_CALL_CLOSE = '</tool_call>'
+_JSON_SEPARATORS = (',', ':')
+_SSE_HEADERS = {
+    'Cache-Control': 'no-cache, no-transform',
+    'X-Accel-Buffering': 'no',
+}
+
+
+def _json_dumps(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, separators=_JSON_SEPARATORS)
+
+
+def _sse(obj: Any) -> str:
+    return f'data: {_json_dumps(obj)}\n\n'
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -390,19 +403,12 @@ class Qwen3Engine:
                 # the largest bucket. _logits_buf[:1] holds the next-
                 # token logits either way.
                 self.fe.prefill_with_graph(input_ids)
-                ttft = time.perf_counter() - t0
-
-                # Make sure decode graphs over [P, P+max_tokens) are
-                # warm. Must stay inside inference_mode — torch 2.9+
-                # rejects graph capture that touches inference tensors
-                # (the prefill above marks _logits_buf / KV cache /
-                # hidden buffers as inference tensors) from outside
-                # an inference_mode context.
-                self.fe.warmup_decode_graphs(P, P + max_tokens)
+                prefill_s = time.perf_counter() - t0
 
             new_tokens: List[int] = []
             cur_pos = P
             finish_reason = 'length'
+            first_token_s: Optional[float] = None
 
             for step in range(max_tokens):
                 # Sample from the current logits buffer.
@@ -413,6 +419,8 @@ class Qwen3Engine:
                     top_k=top_k,
                     rng=rng,
                 )
+                if first_token_s is None:
+                    first_token_s = time.perf_counter() - t0
                 new_tokens.append(tok)
 
                 # EOS check (engine-side, before emitting).
@@ -464,7 +472,8 @@ class Qwen3Engine:
                 'prompt_tokens': P,
                 'completion_tokens': len(new_tokens),
                 'total_tokens': P + len(new_tokens),
-                'ttft_ms': round(ttft * 1000, 1),
+                'prefill_ms': round(prefill_s * 1000, 1),
+                'ttft_ms': round((first_token_s or prefill_s) * 1000, 1),
                 'wall_s': round(wall, 3),
                 'tok_per_s': round(len(new_tokens) / wall, 1) if wall else 0,
             }
@@ -561,26 +570,18 @@ def build_app(engine: 'Qwen3Engine'):
 
         # ── Streaming SSE ──
         async def gen():
-            # Emit role first.
-            first = {
-                'id': completion_id,
-                'object': 'chat.completion.chunk',
-                'created': created,
-                'model': engine.model_name,
-                'choices': [{
-                    'index': 0,
-                    'delta': {'role': 'assistant', 'content': ''},
-                    'finish_reason': None,
-                }],
-            }
-            yield f'data: {json.dumps(first)}\n\n'
-
+            role_sent = False
             tc_seen = False
             async for ev in engine.stream_generate(
                 messages, tools, max_tokens, temperature, top_p, top_k,
                 seed, stop,
             ):
                 if ev[0] == 'content':
+                    delta = {}
+                    if not role_sent:
+                        delta['role'] = 'assistant'
+                        role_sent = True
+                    delta['content'] = ev[1]
                     chunk = {
                         'id': completion_id,
                         'object': 'chat.completion.chunk',
@@ -588,14 +589,19 @@ def build_app(engine: 'Qwen3Engine'):
                         'model': engine.model_name,
                         'choices': [{
                             'index': 0,
-                            'delta': {'content': ev[1]},
+                            'delta': delta,
                             'finish_reason': None,
                         }],
                     }
-                    yield f'data: {json.dumps(chunk)}\n\n'
+                    yield _sse(chunk)
                 elif ev[0] == 'tool_calls':
                     tc_seen = True
                     for tc in ev[1]:
+                        delta = {}
+                        if not role_sent:
+                            delta['role'] = 'assistant'
+                            role_sent = True
+                        delta['tool_calls'] = [tc]
                         chunk = {
                             'id': completion_id,
                             'object': 'chat.completion.chunk',
@@ -603,13 +609,27 @@ def build_app(engine: 'Qwen3Engine'):
                             'model': engine.model_name,
                             'choices': [{
                                 'index': 0,
-                                'delta': {'tool_calls': [tc]},
+                                'delta': delta,
                                 'finish_reason': None,
                             }],
                         }
-                        yield f'data: {json.dumps(chunk)}\n\n'
+                        yield _sse(chunk)
                 elif ev[0] == 'finish':
                     _, finish, usage = ev
+                    if not role_sent:
+                        empty = {
+                            'id': completion_id,
+                            'object': 'chat.completion.chunk',
+                            'created': created,
+                            'model': engine.model_name,
+                            'choices': [{
+                                'index': 0,
+                                'delta': {'role': 'assistant'},
+                                'finish_reason': None,
+                            }],
+                        }
+                        role_sent = True
+                        yield _sse(empty)
                     last = {
                         'id': completion_id,
                         'object': 'chat.completion.chunk',
@@ -626,19 +646,99 @@ def build_app(engine: 'Qwen3Engine'):
                         }],
                         'usage': usage,
                     }
-                    yield f'data: {json.dumps(last)}\n\n'
+                    yield _sse(last)
                     yield 'data: [DONE]\n\n'
                     log.info(
-                        'stream done: %s -> %s tok in %ss (%s tok/s)',
+                        'stream done: prompt=%s completion=%s '
+                        'prefill=%sms ttft=%sms wall=%ss (%s tok/s)',
                         usage.get('prompt_tokens'),
                         usage.get('completion_tokens'),
+                        usage.get('prefill_ms'), usage.get('ttft_ms'),
                         usage.get('wall_s'), usage.get('tok_per_s'),
                     )
                     return
 
-        return StreamingResponse(gen(), media_type='text/event-stream')
+        return StreamingResponse(
+            gen(), media_type='text/event-stream', headers=_SSE_HEADERS)
 
     return app
+
+
+def _parse_warmup_shapes(spec_csv: str) -> List[Tuple[int, int]]:
+    shapes: List[Tuple[int, int]] = []
+    if not spec_csv.strip():
+        return shapes
+    for spec in spec_csv.split(','):
+        spec = spec.strip()
+        if not spec:
+            continue
+        try:
+            pl, mt = spec.split(':')
+            shapes.append((int(pl), int(mt)))
+        except ValueError:
+            sys.exit(f'invalid --warmup spec: {spec!r} '
+                     '(expected "prompt_len:max_tokens")')
+    return shapes
+
+
+def _warmup_preset_shapes(
+    preset: str, max_seq: int, max_q_seq: int,
+) -> List[Tuple[int, int]]:
+    """Return startup graph-warm buckets for the Qwen3-8B server.
+
+    The default is intentionally short-context heavy: these are the
+    request sizes where OpenAI/SSE users notice TTFT most. Larger or
+    exact production envelopes can still be appended via --warmup.
+    """
+    preset = (preset or 'auto').lower()
+    if preset in ('none', 'off', 'false', '0'):
+        return []
+    if preset not in ('auto', 'short', 'all'):
+        sys.exit(
+            f'invalid --warmup-preset {preset!r}; expected '
+            'auto, short, all, or none')
+
+    candidates = [
+        (32, 128),
+        (64, 128),
+        (128, 256),
+        (256, 256),
+        (512, 256),
+        (1024, 256),
+    ]
+    max_seq = int(max_seq)
+    max_q_seq = int(max_q_seq)
+    return [
+        (p, n) for p, n in candidates
+        if p <= max_q_seq and p + n <= max_seq
+    ]
+
+
+def _dedupe_shapes(shapes: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    out: List[Tuple[int, int]] = []
+    seen = set()
+    for shape in shapes:
+        if shape not in seen:
+            out.append(shape)
+            seen.add(shape)
+    return out
+
+
+def _validate_warmup_shapes(
+    shapes: List[Tuple[int, int]], max_seq: int, max_q_seq: int,
+) -> None:
+    for p, n in shapes:
+        if p < 1 or n < 1:
+            sys.exit(
+                f'invalid warmup shape {p}:{n}; values must be positive')
+        if p > max_q_seq:
+            sys.exit(
+                f'invalid warmup shape {p}:{n}; prompt_len exceeds '
+                f'--max-q-seq={max_q_seq}')
+        if p + n > max_seq:
+            sys.exit(
+                f'invalid warmup shape {p}:{n}; prompt_len + max_tokens '
+                f'exceeds --max-seq={max_seq}')
 
 
 def main():
@@ -652,20 +752,21 @@ def main():
                     help='Max prompt prefill length (in tokens).')
     p.add_argument('--device', default='cuda:0')
     p.add_argument('--model-name', default='qwen3-8b-nvfp4')
-    p.add_argument('--warmup', default='32:128,128:256',
-                    help='Comma-separated "P:max_tok" shapes to warm.')
+    p.add_argument(
+        '--warmup-preset', default='auto',
+        help='Startup graph warmup preset: auto, short, all, or none. '
+        'auto warms common short-prompt decode ranges before serving.')
+    p.add_argument(
+        '--warmup', default='',
+        help='Comma-separated "P:max_tok" shapes to additionally warm.')
     args = p.parse_args()
 
-    warm: List[Tuple[int, int]] = []
-    for spec in args.warmup.split(','):
-        spec = spec.strip()
-        if not spec:
-            continue
-        try:
-            pl, mt = spec.split(':')
-            warm.append((int(pl), int(mt)))
-        except ValueError:
-            sys.exit(f'invalid --warmup spec: {spec!r}')
+    warm = _dedupe_shapes(
+        _warmup_preset_shapes(
+            args.warmup_preset, args.max_seq, args.max_q_seq)
+        + _parse_warmup_shapes(args.warmup)
+    )
+    _validate_warmup_shapes(warm, args.max_seq, args.max_q_seq)
 
     try:
         import uvicorn
