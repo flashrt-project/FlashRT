@@ -101,6 +101,14 @@ def _recompute_wu_ref(k_l2, v, beta, g_cumsum, Ai, chunk=64):
     return w, u
 
 
+def _unpack_wy_pack(x_pack, S, chunk=64):
+    x = torch.empty(S, 48, 128, device=x_pack.device, dtype=x_pack.dtype)
+    for ci, start in enumerate(range(0, S, chunk)):
+        end = min(start + chunk, S)
+        x[start:end] = x_pack[ci, :, :end - start].transpose(0, 1)
+    return x
+
+
 def _chunk_h_ref(k_l2, u, w, g_cumsum, state, chunk=64):
     S = k_l2.shape[0]
     chunks = (S + chunk - 1) // chunk
@@ -325,6 +333,47 @@ def test_linear_attn_gdn_wy_recompute_wu_cublaslt_matches_reference(S):
     torch.testing.assert_close(u, u_ref, rtol=0, atol=2e-2)
 
 
+@pytest.mark.parametrize("S", [6, 64, 65, 128])
+def test_linear_attn_gdn_wy_recompute_wu_cublaslt_packed_matches_reference(S):
+    fvk = _load_fvk()
+    if not hasattr(
+            fvk,
+            "linear_attn_gdn_wy_recompute_wu_b64_bf16_cublaslt_packed"):
+        pytest.skip("packed WY recompute kernel is not built")
+    torch.manual_seed(5567 + S)
+    k = torch.randn(S, 16, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(S, 48, 128, device="cuda", dtype=torch.bfloat16)
+    g = (torch.randn(S, 48, device="cuda") * 0.05).to(torch.bfloat16)
+    beta = torch.sigmoid(torch.randn(S, 48, device="cuda")).to(torch.bfloat16)
+    k_l2 = (k.float() / torch.sqrt(
+        torch.sum(k.float() * k.float(), dim=-1, keepdim=True) + 1e-6)
+    ).to(torch.bfloat16)
+    g_cumsum = _local_cumsum_bf16(g)
+    A = _kkt_ref(k_l2, beta, g_cumsum)
+    Ai = _solve_ref(A, S)
+    chunks = (S + 63) // 64
+    ai_pack = torch.empty(chunks, 48, 64, 64, device="cuda",
+                          dtype=torch.bfloat16)
+    rhs_w = torch.empty(chunks, 48, 64, 128, device="cuda",
+                        dtype=torch.bfloat16)
+    rhs_u = torch.empty_like(rhs_w)
+    w_pack = torch.empty_like(rhs_w)
+    u_pack = torch.empty_like(rhs_w)
+
+    fvk.linear_attn_gdn_wy_recompute_wu_b64_bf16_cublaslt_packed(
+        _ptr(k_l2), _ptr(v), _ptr(beta), _ptr(g_cumsum), _ptr(Ai),
+        _ptr(ai_pack), _ptr(rhs_w), _ptr(rhs_u),
+        _ptr(w_pack), _ptr(u_pack),
+        S, 16, 48, 128, 3, 0)
+    torch.cuda.synchronize()
+
+    w_ref, u_ref = _recompute_wu_ref(k_l2, v, beta, g_cumsum, Ai)
+    torch.testing.assert_close(
+        _unpack_wy_pack(w_pack, S), w_ref, rtol=0, atol=2e-2)
+    torch.testing.assert_close(
+        _unpack_wy_pack(u_pack, S), u_ref, rtol=0, atol=2e-2)
+
+
 @pytest.mark.parametrize("S", [6, 64, 65])
 def test_qwen36_wy_chunk_h_and_output_match_reference(S):
     fvk = _load_fvk()
@@ -493,6 +542,57 @@ def test_linear_attn_gdn_wy_chunk_h_cublaslt_f32gemm_matches_reference(S):
         _ptr(h0), _ptr(v_new),
         _ptr(k_pack_hv), _ptr(w_pack), _ptr(u_pack),
         _ptr(wh_pack), _ptr(decayed_v_pack),
+        _ptr(state_f32), _ptr(chunk_f32), _ptr(acc_f32),
+        S, 16, 48, 128, 3, 0)
+    torch.cuda.synchronize()
+
+    h0_ref, v_new_ref, state_ref = _chunk_h_ref(
+        k_l2, u, w, g_cumsum, state0)
+    torch.testing.assert_close(h0, h0_ref, rtol=0, atol=5e-2)
+    torch.testing.assert_close(v_new, v_new_ref, rtol=0, atol=6e-2)
+    torch.testing.assert_close(state, state_ref, rtol=0, atol=6e-2)
+
+
+@pytest.mark.parametrize("S", [6, 64, 65])
+def test_linear_attn_gdn_wy_chunk_h_cublaslt_f32gemm_packed_wu_matches_reference(S):
+    fvk = _load_fvk()
+    if not hasattr(
+            fvk,
+            "linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_f32gemm_packed_wu"):
+        pytest.skip("packed WY chunk_h kernel is not built")
+    torch.manual_seed(6654 + S)
+    k = torch.randn(S, 16, 128, device="cuda", dtype=torch.bfloat16)
+    u = torch.randn(S, 48, 128, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(S, 48, 128, device="cuda", dtype=torch.bfloat16)
+    g = (torch.randn(S, 48, device="cuda") * 0.02).to(torch.bfloat16)
+    state0 = (torch.randn(48, 128, 128, device="cuda") * 0.02
+              ).to(torch.bfloat16)
+
+    k_l2 = (k.float() / torch.sqrt(
+        torch.sum(k.float() * k.float(), dim=-1, keepdim=True) + 1e-6)
+    ).to(torch.bfloat16)
+    g_cumsum = _local_cumsum_bf16(g)
+    state = state0.clone()
+    chunks = (S + 63) // 64
+    h0 = torch.empty(chunks, 48, 128, 128, device="cuda",
+                     dtype=torch.bfloat16)
+    v_new = torch.empty(S, 48, 128, device="cuda", dtype=torch.bfloat16)
+    k_pack_hv = torch.empty(chunks, 48, 64, 128, device="cuda",
+                            dtype=torch.bfloat16)
+    w_pack = torch.empty_like(k_pack_hv)
+    u_pack = torch.empty_like(k_pack_hv)
+    for ci, start in enumerate(range(0, S, 64)):
+        end = min(start + 64, S)
+        w_pack[ci, :, :end - start] = w[start:end].transpose(0, 1)
+        u_pack[ci, :, :end - start] = u[start:end].transpose(0, 1)
+    decayed_v_pack = torch.empty_like(k_pack_hv)
+    state_f32 = torch.empty(48, 128, 128, device="cuda", dtype=torch.float32)
+    chunk_f32 = torch.empty(48, 64, 128, device="cuda", dtype=torch.float32)
+    acc_f32 = torch.empty_like(chunk_f32)
+
+    fvk.linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_f32gemm_packed_wu(
+        _ptr(k_l2), _ptr(w_pack), _ptr(u_pack), _ptr(g_cumsum), _ptr(state),
+        _ptr(h0), _ptr(v_new), _ptr(k_pack_hv), _ptr(decayed_v_pack),
         _ptr(state_f32), _ptr(chunk_f32), _ptr(acc_f32),
         S, 16, 48, 128, 3, 0)
     torch.cuda.synchronize()

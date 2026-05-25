@@ -1864,6 +1864,51 @@ class Qwen36TorchFrontendRtx:
 
     # ---------- N5-stage3: NVFP4 S=K linear-attn layer ----------
 
+    def _ensure_K_wy_buffers(self, K: int, device, dtype) -> None:
+        import torch
+
+        chunks = (int(K) + 63) // 64
+        if (
+            hasattr(self, '_K_wy_A')
+            and hasattr(self, '_K_wy_out_q_pack')
+            and hasattr(self, '_K_wy_state_f32')
+            and hasattr(self, '_K_wy_chunk_f32')
+            and self._K_wy_A.shape[0] >= chunks
+            and self._K_wy_A.device == device
+        ):
+            return
+
+        fp32 = torch.float32
+        self._K_wy_A = torch.empty(
+            chunks, 48, 64, 64, device=device, dtype=fp32)
+        self._K_wy_Ai = torch.empty_like(self._K_wy_A)
+        self._K_wy_k_pack = torch.empty(
+            chunks, 16, 64, 128, device=device, dtype=dtype)
+        self._K_wy_kkt_base = torch.empty(
+            chunks, 16, 64, 64, device=device, dtype=fp32)
+        self._K_wy_g_cumsum = torch.empty(
+            K, 48, device=device, dtype=dtype)
+        self._K_wy_w48 = torch.empty(
+            K, 48, 128, device=device, dtype=dtype)
+        self._K_wy_u48 = torch.empty_like(self._K_wy_w48)
+        self._K_wy_Ai_pack = torch.empty(
+            chunks, 48, 64, 64, device=device, dtype=dtype)
+        self._K_wy_rhs_w = torch.empty(
+            chunks, 48, 64, 128, device=device, dtype=dtype)
+        self._K_wy_rhs_u = torch.empty_like(self._K_wy_rhs_w)
+        self._K_wy_w_pack = torch.empty_like(self._K_wy_rhs_w)
+        self._K_wy_u_pack = torch.empty_like(self._K_wy_rhs_w)
+        self._K_wy_out_q_pack = torch.empty_like(self._K_wy_rhs_w)
+        self._K_wy_state_f32 = torch.empty(
+            48, 128, 128, device=device, dtype=fp32)
+        self._K_wy_delta_f32 = torch.empty_like(self._K_wy_state_f32)
+        self._K_wy_chunk_f32 = torch.empty(
+            48, 64, 128, device=device, dtype=fp32)
+        self._K_wy_acc_f32 = torch.empty_like(self._K_wy_chunk_f32)
+        self._K_wy_h0 = torch.empty(
+            chunks, 48, 128, 128, device=device, dtype=dtype)
+        self._K_wy_v_new = torch.empty_like(self._K_wy_w48)
+
     def _layer_forward_lin_K_nvfp4(self, L: int, h_in_K, K: int):
         """NVFP4 S=K linear-attention decoder layer (verify path).
 
@@ -2184,49 +2229,7 @@ class Qwen36TorchFrontendRtx:
                 )
             if use_wy_chunk:
                 chunks = (K + 63) // 64
-                if (
-                    not hasattr(self, '_K_wy_A')
-                    or not hasattr(self, '_K_wy_out_q_pack')
-                    or not hasattr(self, '_K_wy_state_f32')
-                    or not hasattr(self, '_K_wy_chunk_f32')
-                    or self._K_wy_A.shape[0] < chunks
-                    or self._K_wy_A.device != q16_K.device
-                ):
-                    device = q16_K.device
-                    bf16 = q16_K.dtype
-                    fp32 = torch.float32
-                    self._K_wy_A = torch.empty(
-                        chunks, 48, 64, 64, device=device, dtype=fp32)
-                    self._K_wy_Ai = torch.empty_like(self._K_wy_A)
-                    self._K_wy_k_pack = torch.empty(
-                        chunks, 16, 64, 128, device=device, dtype=bf16)
-                    self._K_wy_kkt_base = torch.empty(
-                        chunks, 16, 64, 64, device=device, dtype=fp32)
-                    self._K_wy_g_cumsum = torch.empty(
-                        K, 48, device=device, dtype=bf16)
-                    self._K_wy_w48 = torch.empty(
-                        K, 48, 128, device=device, dtype=bf16)
-                    self._K_wy_u48 = torch.empty_like(self._K_wy_w48)
-                    self._K_wy_Ai_pack = torch.empty(
-                        chunks, 48, 64, 64, device=device, dtype=bf16)
-                    self._K_wy_rhs_w = torch.empty(
-                        chunks, 48, 64, 128, device=device, dtype=bf16)
-                    self._K_wy_rhs_u = torch.empty_like(self._K_wy_rhs_w)
-                    self._K_wy_w_pack = torch.empty_like(self._K_wy_rhs_w)
-                    self._K_wy_u_pack = torch.empty_like(self._K_wy_rhs_w)
-                    self._K_wy_out_q_pack = torch.empty_like(
-                        self._K_wy_rhs_w)
-                    self._K_wy_state_f32 = torch.empty(
-                        48, 128, 128, device=device, dtype=fp32)
-                    self._K_wy_delta_f32 = torch.empty_like(
-                        self._K_wy_state_f32)
-                    self._K_wy_chunk_f32 = torch.empty(
-                        48, 64, 128, device=device, dtype=fp32)
-                    self._K_wy_acc_f32 = torch.empty_like(
-                        self._K_wy_chunk_f32)
-                    self._K_wy_h0 = torch.empty(
-                        chunks, 48, 128, 128, device=device, dtype=bf16)
-                    self._K_wy_v_new = torch.empty_like(self._K_wy_w48)
+                self._ensure_K_wy_buffers(K, q16_K.device, q16_K.dtype)
                 fvk.qwen36_gdn_wy_norm_cumsum_bf16(
                     q16_K.data_ptr(), k16_K.data_ptr(), g_bf_K.data_ptr(),
                     self._K_fla_q16_l2[:, :K].data_ptr(),
@@ -2265,7 +2268,29 @@ class Qwen36TorchFrontendRtx:
                         self._K_wy_A[:chunks].data_ptr(),
                         self._K_wy_Ai[:chunks].data_ptr(), K, s,
                     )
-                if (
+                use_wy_lt_packed_wu = (
+                    use_wy_lt_chunk_h_f32gemm
+                    and hasattr(
+                        fvk,
+                        'linear_attn_gdn_wy_recompute_wu_b64_bf16_cublaslt_packed')
+                    and hasattr(
+                        fvk,
+                        'linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_f32gemm_packed_wu')
+                )
+                if use_wy_lt_packed_wu:
+                    fvk.linear_attn_gdn_wy_recompute_wu_b64_bf16_cublaslt_packed(
+                        self._K_fla_k16_l2[:, :K].data_ptr(),
+                        v48_K.data_ptr(), beta_K.data_ptr(),
+                        self._K_wy_g_cumsum[:K].data_ptr(),
+                        self._K_wy_Ai[:chunks].data_ptr(),
+                        self._K_wy_Ai_pack[:chunks].data_ptr(),
+                        self._K_wy_rhs_w[:chunks].data_ptr(),
+                        self._K_wy_rhs_u[:chunks].data_ptr(),
+                        self._K_wy_w_pack[:chunks].data_ptr(),
+                        self._K_wy_u_pack[:chunks].data_ptr(),
+                        K, 16, 48, 128, 3, s,
+                    )
+                elif (
                     use_wy_lt_kkt
                     and hasattr(
                         fvk,
@@ -2295,7 +2320,23 @@ class Qwen36TorchFrontendRtx:
                         self._K_wy_u48[:K].data_ptr(),
                         K, s,
                     )
-                if use_wy_lt_chunk_h_f32gemm:
+                if use_wy_lt_packed_wu:
+                    fvk.linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_f32gemm_packed_wu(
+                        self._K_fla_k16_l2[:, :K].data_ptr(),
+                        self._K_wy_w_pack[:chunks].data_ptr(),
+                        self._K_wy_u_pack[:chunks].data_ptr(),
+                        self._K_wy_g_cumsum[:K].data_ptr(),
+                        rec_state_view.data_ptr(),
+                        self._K_wy_h0[:chunks].data_ptr(),
+                        self._K_wy_v_new[:K].data_ptr(),
+                        self._K_wy_rhs_w[:chunks].data_ptr(),
+                        self._K_wy_out_q_pack[:chunks].data_ptr(),
+                        self._K_wy_state_f32.data_ptr(),
+                        self._K_wy_chunk_f32.data_ptr(),
+                        self._K_wy_acc_f32.data_ptr(),
+                        K, 16, 48, 128, 3, s,
+                    )
+                elif use_wy_lt_chunk_h_f32gemm:
                     fvk.linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_f32gemm(
                         self._K_fla_k16_l2[:, :K].data_ptr(),
                         self._K_wy_u48[:K].data_ptr(),
@@ -6675,6 +6716,12 @@ class Qwen36TorchFrontendRtx:
         warmed: list[tuple[int, int, int]] = []
         d = self._rope_dim
         s = torch.cuda.current_stream().cuda_stream
+        prefill_chunk = int(os.environ.get(
+            'FLASHRT_QWEN36_TQ_PREFILL_CHUNK', str(self.MAX_Q_SEQ)))
+        prefill_chunk = max(1, min(
+            prefill_chunk, self.MAX_Q_SEQ, int(self._h_b.shape[0])))
+        self._ensure_K_wy_buffers(
+            prefill_chunk, torch.device(self.device), torch.bfloat16)
         has_mtp = self._weights.ptrs.get('mtp') is not None
         stride_raw = os.environ.get(
             'FLASHRT_QWEN36_LONG_WARMUP_STRIDE', 'auto').lower()
@@ -6795,6 +6842,8 @@ class Qwen36TorchFrontendRtx:
                 if not self._should_use_long_ctx_route(
                         prompt_len, max_new_tokens):
                     continue
+                if not self._long_prefill_graph_capture_allowed(prompt_len):
+                    continue
                 if prompt_len + max_new_tokens > self._user_max_seq:
                     continue
                 mtp_tail = self._long_mtp_prefill_tail_for_prompt(prompt_len)
@@ -6854,6 +6903,14 @@ class Qwen36TorchFrontendRtx:
             return int(free_bytes) >= (min_free_mb << 20)
         except Exception:
             return True
+
+    def _long_prefill_graph_capture_allowed(self, prompt_len: int) -> bool:
+        max_ctx = int(os.environ.get(
+            'FLASHRT_QWEN36_LONG_PREFILL_GRAPH_MAX_CTX',
+            '131072') or '0')
+        if max_ctx > 0 and int(prompt_len) > max_ctx:
+            return False
+        return self._long_tq_graph_capture_allowed()
 
     def _ensure_verify_graph_nvfp4_tq(self, cur_pos: int, K: int):
         """Lazy CUDA Graph capture for TQ-packed S=K verify.
@@ -7129,7 +7186,8 @@ class Qwen36TorchFrontendRtx:
     # ---------- G9: NVFP4 MTP CHAIN graph (K steps in one graph) ------
 
     def _ensure_mtp_chain_graph_nvfp4(
-            self, base_pos: int, K: int, cache_base_pos: int | None = None):
+            self, base_pos: int, K: int, cache_base_pos: int | None = None,
+            allow_capture: bool = True):
         """Capture the entire K-step MTP chain as ONE CUDA Graph.
 
         Inputs (filled by caller before replay):
@@ -7170,6 +7228,8 @@ class Qwen36TorchFrontendRtx:
         g = self._graph_cache_get(self._captured_chain_graphs, key)
         if g is not None:
             return g
+        if not allow_capture:
+            return None
 
         gs = self._graph_stream
 
@@ -7362,6 +7422,9 @@ class Qwen36TorchFrontendRtx:
             'FLASHRT_QWEN36_LONG_MTP_PREFILL_TAIL', 'auto') or 'auto'
         if raw.lower() != 'auto':
             return max(0, int(raw))
+        mtp = self._weights.ptrs.get('mtp') if self._weights else None
+        if not isinstance(mtp, dict) or 'k_proj_w_bf16' not in mtp:
+            return 0
         prompt_len = int(prompt_len)
         if prompt_len < 512:
             return 0
@@ -7416,6 +7479,7 @@ class Qwen36TorchFrontendRtx:
             os.environ.get(
                 'FLASHRT_QWEN36_TQ_PREFILL_GRAPH', '1').lower()
             in ('1', 'true', 'yes', 'on')
+            and self._long_prefill_graph_capture_allowed(prompt_len)
         )
 
         last_h = None
@@ -7671,20 +7735,34 @@ class Qwen36TorchFrontendRtx:
                         'FLASHRT_QWEN36_TQ_MTP_CHAIN_GRAPH', '1') == '1':
                     gs = self._graph_stream
                     cg = self._ensure_mtp_chain_graph_nvfp4(
-                        cur_pos, K, cache_base_pos=mtp_base)
-                    gs.wait_stream(torch.cuda.current_stream())
-                    with torch.cuda.stream(gs):
-                        fvk.gpu_copy(
-                            self._mtp_static_prev_h.data_ptr(),
-                            h.data_ptr(), hidden * 2, gs.cuda_stream,
-                        )
-                        fvk.gpu_copy(
-                            self._mtp_static_prev_token.data_ptr(),
-                            tok.data_ptr(), 8, gs.cuda_stream,
-                        )
-                        cg.replay()
-                    torch.cuda.current_stream().wait_stream(gs)
-                    drafts_t = self._chain_drafts_buf[:K]
+                        cur_pos, K, cache_base_pos=mtp_base,
+                        allow_capture=self._long_tq_graph_capture_allowed())
+                    if cg is not None:
+                        gs.wait_stream(torch.cuda.current_stream())
+                        with torch.cuda.stream(gs):
+                            fvk.gpu_copy(
+                                self._mtp_static_prev_h.data_ptr(),
+                                h.data_ptr(), hidden * 2, gs.cuda_stream,
+                            )
+                            fvk.gpu_copy(
+                                self._mtp_static_prev_token.data_ptr(),
+                                tok.data_ptr(), 8, gs.cuda_stream,
+                            )
+                            cg.replay()
+                        torch.cuda.current_stream().wait_stream(gs)
+                        drafts_t = self._chain_drafts_buf[:K]
+                    else:
+                        drafts = []
+                        h_mtp = h
+                        tok_mtp = tok
+                        for j in range(K):
+                            h_mtp, logits_mtp = self.forward_mtp_head_nvfp4(
+                                h_mtp, tok_mtp, cur_pos + j,
+                                mtp_cache_pos=mtp_base + j)
+                            tok_mtp = logits_mtp.argmax(
+                                dim=-1, keepdim=True).view(1, 1)
+                            drafts.append(tok_mtp)
+                        drafts_t = torch.cat(drafts, dim=0).view(K, 1)
                 else:
                     drafts = []
                     h_mtp = h

@@ -102,6 +102,9 @@ def test_long_mtp_tail_auto_policy(monkeypatch):
     monkeypatch.delenv('FLASHRT_QWEN36_LONG_MTP_PREFILL_TAIL',
                        raising=False)
     fe = Qwen36TorchFrontendRtx.__new__(Qwen36TorchFrontendRtx)
+    fe._weights = type('Weights', (), {
+        'ptrs': {'mtp': {'k_proj_w_bf16': 1}},
+    })()
 
     assert fe._long_mtp_prefill_tail_for_prompt(128) == 0
     assert fe._long_mtp_prefill_tail_for_prompt(512) == 512
@@ -109,6 +112,23 @@ def test_long_mtp_tail_auto_policy(monkeypatch):
     assert fe._long_mtp_prefill_tail_for_prompt(4096) == 512
     assert fe._long_mtp_prefill_tail_for_prompt(8192) == 2048
     assert fe._long_mtp_prefill_tail_for_prompt(204800) == 2048
+
+    monkeypatch.setenv('FLASHRT_QWEN36_LONG_MTP_PREFILL_TAIL', '512')
+    assert fe._long_mtp_prefill_tail_for_prompt(204800) == 512
+
+
+def test_long_mtp_tail_auto_disables_without_bf16_kv(monkeypatch):
+    from flash_rt.frontends.torch.qwen36_rtx import Qwen36TorchFrontendRtx
+
+    monkeypatch.delenv('FLASHRT_QWEN36_LONG_MTP_PREFILL_TAIL',
+                       raising=False)
+    fe = Qwen36TorchFrontendRtx.__new__(Qwen36TorchFrontendRtx)
+
+    fe._weights = type('Weights', (), {'ptrs': {'mtp': None}})()
+    assert fe._long_mtp_prefill_tail_for_prompt(204800) == 0
+
+    fe._weights = type('Weights', (), {'ptrs': {'mtp': {}}})()
+    assert fe._long_mtp_prefill_tail_for_prompt(204800) == 0
 
     monkeypatch.setenv('FLASHRT_QWEN36_LONG_MTP_PREFILL_TAIL', '512')
     assert fe._long_mtp_prefill_tail_for_prompt(204800) == 512
@@ -170,7 +190,7 @@ def test_long_mtp_cache_capacity_is_compact(monkeypatch):
     monkeypatch.delenv('FLASHRT_QWEN36_LONG_MTP_PREFILL_TAIL',
                        raising=False)
     fe = Qwen36TorchFrontendRtx.__new__(Qwen36TorchFrontendRtx)
-    fe._weights = SimpleNamespace(ptrs={'mtp': object()})
+    fe._weights = SimpleNamespace(ptrs={'mtp': {}})
     fe._short_ctx_spec_max_seq = 2048
     fe._user_max_seq = 262208
     calls = []
@@ -182,11 +202,16 @@ def test_long_mtp_cache_capacity_is_compact(monkeypatch):
 
     fe._ensure_long_mtp_cache_capacity(
         prompt_len=204800, max_new_tokens=64, K=6)
-    assert calls[-1] == 2126
+    assert calls[-1] == 2048
 
     fe._ensure_long_mtp_cache_capacity(
         prompt_len=204800, max_new_tokens=4096, K=6)
-    assert calls[-1] == 6158
+    assert calls[-1] == 4110
+
+    fe._weights = SimpleNamespace(ptrs={'mtp': {'k_proj_w_bf16': 1}})
+    fe._ensure_long_mtp_cache_capacity(
+        prompt_len=204800, max_new_tokens=64, K=6)
+    assert calls[-1] == 2126
 
 
 def test_long_graph_capture_waterline_can_be_disabled(monkeypatch):
@@ -196,6 +221,21 @@ def test_long_graph_capture_waterline_can_be_disabled(monkeypatch):
     monkeypatch.setenv('FLASHRT_QWEN36_LONG_GRAPH_MIN_FREE_MB', '0')
 
     assert fe._long_tq_graph_capture_allowed() is True
+
+
+def test_long_prefill_graph_capture_has_ctx_ceiling(monkeypatch):
+    from flash_rt.frontends.torch.qwen36_rtx import Qwen36TorchFrontendRtx
+
+    fe = Qwen36TorchFrontendRtx.__new__(Qwen36TorchFrontendRtx)
+    monkeypatch.setenv('FLASHRT_QWEN36_LONG_GRAPH_MIN_FREE_MB', '0')
+    monkeypatch.delenv('FLASHRT_QWEN36_LONG_PREFILL_GRAPH_MAX_CTX',
+                       raising=False)
+
+    assert fe._long_prefill_graph_capture_allowed(131072) is True
+    assert fe._long_prefill_graph_capture_allowed(204800) is False
+
+    monkeypatch.setenv('FLASHRT_QWEN36_LONG_PREFILL_GRAPH_MAX_CTX', '0')
+    assert fe._long_prefill_graph_capture_allowed(262144) is True
 
 
 def test_clear_graphs_drops_long_prefill_caches():

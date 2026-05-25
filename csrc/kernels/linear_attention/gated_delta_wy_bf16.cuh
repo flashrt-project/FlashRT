@@ -54,6 +54,24 @@ void gdn_wy_recompute_wu_b64_bf16_cublaslt(
     int qk_group,
     cudaStream_t stream);
 
+void gdn_wy_recompute_wu_b64_bf16_cublaslt_packed(
+    const void* k_l2,
+    const void* v,
+    const void* beta,
+    const void* g_cumsum,
+    const void* Ai,
+    void*       Ai_pack,
+    void*       rhs_w,
+    void*       rhs_u,
+    void*       w_pack,
+    void*       u_pack,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group,
+    cudaStream_t stream);
+
 void gdn_wy_solve_tril_b64_f32_parallel(
     const void* A,
     void*       Ai,
@@ -136,6 +154,26 @@ void gdn_wy_chunk_h_b64_bf16_cublaslt_f32gemm(
     void*       w_pack,
     void*       u_pack,
     void*       wh_pack,
+    void*       decayed_v_pack,
+    void*       state_f32,
+    void*       chunk_f32,
+    void*       acc_f32,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group,
+    cudaStream_t stream);
+
+void gdn_wy_chunk_h_b64_bf16_cublaslt_f32gemm_packed_wu(
+    const void* k_l2,
+    const void* w_pack,
+    const void* u_pack,
+    const void* g_cumsum,
+    void*       state,
+    void*       h0,
+    void*       v_new,
+    void*       k_pack_hv,
     void*       decayed_v_pack,
     void*       state_f32,
     void*       chunk_f32,
