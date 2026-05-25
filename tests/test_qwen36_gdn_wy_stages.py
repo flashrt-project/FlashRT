@@ -21,12 +21,14 @@ def _load_fvk():
         "linear_attn_gdn_wy_kkt_b64_bf16_cublaslt",
         "linear_attn_gdn_wy_recompute_wu_b64_bf16_cublaslt",
         "linear_attn_gdn_wy_solve_tril_b64_f32_parallel",
+        "linear_attn_gdn_wy_solve_tril_b64_f32_parallel_pack",
         "linear_attn_gdn_wy_output_o_b64_bf16_cublaslt",
         "linear_attn_gdn_wy_output_o_b64_bf16_cublaslt_packed_kv",
         "linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt",
         "linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu",
         "linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_f32state",
         "linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_f32gemm",
+        "linear_attn_gdn_wy_recompute_wu_b64_bf16_cublaslt_packed_rhs",
     )
     missing = [name for name in required if not hasattr(fvk, name)]
     if missing:
@@ -243,6 +245,30 @@ def test_linear_attn_gdn_wy_solve_tril_parallel_matches_reference(S):
     torch.testing.assert_close(Ai, Ai_ref, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("S", [6, 64, 65, 128])
+def test_linear_attn_gdn_wy_solve_tril_parallel_pack_matches_reference(S):
+    fvk = _load_fvk()
+    torch.manual_seed(7789 + S)
+    chunks = (S + 63) // 64
+    A = torch.zeros(chunks, 48, 64, 64, device="cuda", dtype=torch.float32)
+    for ci in range(chunks):
+        T = min(64, S - ci * 64)
+        block = torch.randn(48, T, T, device="cuda") * 0.01
+        A[ci, :, :T, :T] = torch.tril(block, diagonal=-1)
+
+    Ai = torch.empty_like(A)
+    Ai_pack = torch.empty(chunks, 48, 64, 64, device="cuda",
+                          dtype=torch.bfloat16)
+    fvk.linear_attn_gdn_wy_solve_tril_b64_f32_parallel_pack(
+        _ptr(A), _ptr(Ai), _ptr(Ai_pack), S, 48, 0)
+    torch.cuda.synchronize()
+
+    Ai_ref = _solve_ref(A, S)
+    torch.testing.assert_close(Ai, Ai_ref, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(
+        Ai_pack, Ai.to(torch.bfloat16), rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("S", [6, 64, 65])
 def test_qwen36_wy_recompute_wu_matches_reference(S):
     fvk = _load_fvk()
@@ -374,6 +400,49 @@ def test_linear_attn_gdn_wy_recompute_wu_cublaslt_packed_matches_reference(S):
         _unpack_wy_pack(w_pack, S), w_ref, rtol=0, atol=2e-2)
     torch.testing.assert_close(
         _unpack_wy_pack(u_pack, S), u_ref, rtol=0, atol=2e-2)
+
+
+@pytest.mark.parametrize("S", [6, 64, 65, 128])
+def test_linear_attn_gdn_wy_recompute_wu_cublaslt_packed_rhs_matches_reference(S):
+    fvk = _load_fvk()
+    torch.manual_seed(6567 + S)
+    k = torch.randn(S, 16, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(S, 48, 128, device="cuda", dtype=torch.bfloat16)
+    g = (torch.randn(S, 48, device="cuda") * 0.05).to(torch.bfloat16)
+    beta = torch.sigmoid(torch.randn(S, 48, device="cuda")).to(torch.bfloat16)
+    k_l2 = (k.float() / torch.sqrt(
+        torch.sum(k.float() * k.float(), dim=-1, keepdim=True) + 1e-6)
+    ).to(torch.bfloat16)
+    g_cumsum = _local_cumsum_bf16(g)
+    A = _kkt_ref(k_l2, beta, g_cumsum)
+    Ai = _solve_ref(A, S)
+    chunks = (S + 63) // 64
+    ai_pack = Ai.to(torch.bfloat16)
+    rhs_w = torch.empty(chunks, 48, 64, 128, device="cuda",
+                        dtype=torch.bfloat16)
+    rhs_u = torch.empty_like(rhs_w)
+    w_pack = torch.empty_like(rhs_w)
+    u_pack = torch.empty_like(rhs_w)
+    rhs_w_base = torch.empty_like(rhs_w)
+    rhs_u_base = torch.empty_like(rhs_w)
+    w_pack_base = torch.empty_like(rhs_w)
+    u_pack_base = torch.empty_like(rhs_w)
+
+    fvk.linear_attn_gdn_wy_recompute_wu_b64_bf16_cublaslt_packed_rhs(
+        _ptr(k_l2), _ptr(v), _ptr(beta), _ptr(g_cumsum), _ptr(ai_pack),
+        _ptr(rhs_w), _ptr(rhs_u), _ptr(w_pack), _ptr(u_pack),
+        S, 16, 48, 128, 3, 0)
+    torch.cuda.synchronize()
+
+    fvk.linear_attn_gdn_wy_recompute_wu_b64_bf16_cublaslt_packed(
+        _ptr(k_l2), _ptr(v), _ptr(beta), _ptr(g_cumsum), _ptr(Ai),
+        _ptr(ai_pack), _ptr(rhs_w_base), _ptr(rhs_u_base),
+        _ptr(w_pack_base), _ptr(u_pack_base),
+        S, 16, 48, 128, 3, 0)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(w_pack, w_pack_base, rtol=0, atol=0)
+    torch.testing.assert_close(u_pack, u_pack_base, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("S", [6, 64, 65])

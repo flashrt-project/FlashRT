@@ -2253,7 +2253,23 @@ class Qwen36TorchFrontendRtx:
                         beta_K.data_ptr(), self._K_wy_g_cumsum[:K].data_ptr(),
                         self._K_wy_A[:chunks].data_ptr(), K, s,
                     )
-                if (
+                use_wy_lt_ai_pack_from_solve = (
+                    use_wy_lt_kkt
+                    and hasattr(
+                        fvk,
+                        'linear_attn_gdn_wy_solve_tril_b64_f32_parallel_pack')
+                    and hasattr(
+                        fvk,
+                        'linear_attn_gdn_wy_recompute_wu_b64_bf16_cublaslt_packed_rhs')
+                )
+                if use_wy_lt_ai_pack_from_solve:
+                    fvk.linear_attn_gdn_wy_solve_tril_b64_f32_parallel_pack(
+                        self._K_wy_A[:chunks].data_ptr(),
+                        self._K_wy_Ai[:chunks].data_ptr(),
+                        self._K_wy_Ai_pack[:chunks].data_ptr(),
+                        K, 48, s,
+                    )
+                elif (
                     use_wy_lt_kkt
                     and hasattr(
                         fvk,
@@ -2290,7 +2306,19 @@ class Qwen36TorchFrontendRtx:
                     use_wy_lt_packed_wu_bf16
                     or use_wy_lt_packed_wu_f32gemm
                 )
-                if use_wy_lt_packed_wu:
+                if use_wy_lt_packed_wu and use_wy_lt_ai_pack_from_solve:
+                    fvk.linear_attn_gdn_wy_recompute_wu_b64_bf16_cublaslt_packed_rhs(
+                        self._K_fla_k16_l2[:, :K].data_ptr(),
+                        v48_K.data_ptr(), beta_K.data_ptr(),
+                        self._K_wy_g_cumsum[:K].data_ptr(),
+                        self._K_wy_Ai_pack[:chunks].data_ptr(),
+                        self._K_wy_rhs_w[:chunks].data_ptr(),
+                        self._K_wy_rhs_u[:chunks].data_ptr(),
+                        self._K_wy_w_pack[:chunks].data_ptr(),
+                        self._K_wy_u_pack[:chunks].data_ptr(),
+                        K, 16, 48, 128, 3, s,
+                    )
+                elif use_wy_lt_packed_wu:
                     fvk.linear_attn_gdn_wy_recompute_wu_b64_bf16_cublaslt_packed(
                         self._K_fla_k16_l2[:, :K].data_ptr(),
                         v48_K.data_ptr(), beta_K.data_ptr(),
