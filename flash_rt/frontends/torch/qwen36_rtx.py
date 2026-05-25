@@ -2425,9 +2425,13 @@ class Qwen36TorchFrontendRtx:
                     if use_wy_lt_output_packed_kv:
                         v_packed_ptr = self._K_wy_rhs_u[:chunks].data_ptr()
                         k_pack_hv_ptr = self._K_wy_rhs_w[:chunks].data_ptr()
+                        # Raw v_new is unused downstream when packed path is
+                        # active; skip the redundant 25 MB HBM write at 4K.
+                        v_new_ptr = 0
                     else:
                         v_packed_ptr = 0
                         k_pack_hv_ptr = 0
+                        v_new_ptr = self._K_wy_v_new[:K].data_ptr()
                     fvk.linear_attn_gdn_wy_chunk_h_b64_bf16_mma_fla(
                         self._K_fla_k16_l2[:, :K].data_ptr(),
                         self._K_wy_w_pack[:chunks].data_ptr(),
@@ -2435,7 +2439,7 @@ class Qwen36TorchFrontendRtx:
                         self._K_wy_g_cumsum[:K].data_ptr(),
                         rec_state_view.data_ptr(),
                         self._K_wy_h0[:chunks].data_ptr(),
-                        self._K_wy_v_new[:K].data_ptr(),
+                        v_new_ptr,
                         v_packed_ptr, k_pack_hv_ptr,
                         K, 16, 48, 128, 3, s,
                     )
