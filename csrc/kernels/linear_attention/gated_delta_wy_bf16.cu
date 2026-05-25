@@ -743,12 +743,16 @@ __device__ __forceinline__ float b16_mul(
   return acc;
 }
 
-__global__ void solve_tril_b64_merge16_kernel(
+__global__ void solve_tril_b64_merge16_shared_kernel(
     const float* __restrict__ A,
     float* __restrict__ Ai,
     int S,
     int num_v_heads)
 {
+  extern __shared__ float smem[];
+  float* A_s = smem;
+  float* Ai_s = smem + kChunk * kChunk;
+
   const int vh = blockIdx.x;
   const int chunk = blockIdx.y;
   const int chunk_start = chunk * kChunk;
@@ -761,9 +765,8 @@ __global__ void solve_tril_b64_merge16_kernel(
   for (int idx = threadIdx.x; idx < kChunk * kChunk; idx += blockDim.x) {
     const int r = idx / kChunk;
     const int c = idx - r * kChunk;
-    if (r / 16 != c / 16) {
-      Ai_blk[idx] = 0.0f;
-    }
+    A_s[idx] = A_blk[idx];
+    Ai_s[idx] = (r / 16 == c / 16) ? Ai_blk[idx] : 0.0f;
   }
   __syncthreads();
 
@@ -777,16 +780,16 @@ __global__ void solve_tril_b64_merge16_kernel(
         float tmp[16];
         #pragma unroll
         for (int k = 0; k < 16; ++k) {
-          tmp[k] = b16_mul(Ai_blk, A_blk, br, br, br, br - 1, i, k);
+          tmp[k] = b16_mul(Ai_s, A_s, br, br, br, br - 1, i, k);
         }
         float acc = 0.0f;
         #pragma unroll
         for (int k = 0; k < 16; ++k) {
           acc = fmaf(tmp[k],
-                     Ai_blk[((br - 1) * 16 + k) * kChunk + c],
+                     Ai_s[((br - 1) * 16 + k) * kChunk + c],
                      acc);
         }
-        Ai_blk[r * kChunk + c] = -acc;
+        Ai_s[r * kChunk + c] = -acc;
       }
     }
   };
@@ -803,21 +806,21 @@ __global__ void solve_tril_b64_merge16_kernel(
       const int r = br * 16 + i;
       const int c = (br - 2) * 16 + j;
       if (r < T && c < T) {
-      float sum[16];
-      #pragma unroll
-      for (int k = 0; k < 16; ++k) {
-        sum[k] = b16_mul(A_blk, Ai_blk, br, br - 2,
+        float sum[16];
+        #pragma unroll
+        for (int k = 0; k < 16; ++k) {
+          sum[k] = b16_mul(A_s, Ai_s, br, br - 2,
                            br - 2, br - 2, k, j);
-        sum[k] += b16_mul(A_blk, Ai_blk, br, br - 1,
+          sum[k] += b16_mul(A_s, Ai_s, br, br - 1,
                             br - 1, br - 2, k, j);
-      }
+        }
         float acc = 0.0f;
         #pragma unroll
         for (int k = 0; k < 16; ++k) {
-          acc = fmaf(Ai_blk[(br * 16 + i) * kChunk + (br * 16 + k)],
+          acc = fmaf(Ai_s[(br * 16 + i) * kChunk + (br * 16 + k)],
                      sum[k], acc);
         }
-        Ai_blk[r * kChunk + c] = -acc;
+        Ai_s[r * kChunk + c] = -acc;
       }
     }
   };
@@ -835,18 +838,23 @@ __global__ void solve_tril_b64_merge16_kernel(
       float sum[16];
       #pragma unroll
       for (int k = 0; k < 16; ++k) {
-        sum[k] = b16_mul(A_blk, Ai_blk, 3, 0, 0, 0, k, j);
-        sum[k] += b16_mul(A_blk, Ai_blk, 3, 1, 1, 0, k, j);
-        sum[k] += b16_mul(A_blk, Ai_blk, 3, 2, 2, 0, k, j);
+        sum[k] = b16_mul(A_s, Ai_s, 3, 0, 0, 0, k, j);
+        sum[k] += b16_mul(A_s, Ai_s, 3, 1, 1, 0, k, j);
+        sum[k] += b16_mul(A_s, Ai_s, 3, 2, 2, 0, k, j);
       }
       float acc = 0.0f;
       #pragma unroll
       for (int k = 0; k < 16; ++k) {
-        acc = fmaf(Ai_blk[(3 * 16 + i) * kChunk + (3 * 16 + k)],
+        acc = fmaf(Ai_s[(3 * 16 + i) * kChunk + (3 * 16 + k)],
                    sum[k], acc);
       }
-      Ai_blk[r * kChunk + c] = -acc;
+      Ai_s[r * kChunk + c] = -acc;
     }
+  }
+  __syncthreads();
+
+  for (int idx = threadIdx.x; idx < kChunk * kChunk; idx += blockDim.x) {
+    Ai_blk[idx] = Ai_s[idx];
   }
 }
 
@@ -1505,8 +1513,9 @@ void gdn_wy_solve_tril_b64_f32_parallel(
       reinterpret_cast<const float*>(A),
       reinterpret_cast<float*>(Ai),
       S, num_v_heads);
-  solve_tril_b64_merge16_kernel<<<dim3(num_v_heads, chunks), 256,
-                                   0, stream>>>(
+  solve_tril_b64_merge16_shared_kernel<<<dim3(num_v_heads, chunks), 256,
+                                          2 * kChunk * kChunk * sizeof(float),
+                                          stream>>>(
       reinterpret_cast<const float*>(A),
       reinterpret_cast<float*>(Ai),
       S, num_v_heads);
