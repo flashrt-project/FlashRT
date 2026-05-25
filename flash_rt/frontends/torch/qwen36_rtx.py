@@ -2243,16 +2243,16 @@ class Qwen36TorchFrontendRtx:
             and fast_chunk_mode in ('1', 'true', 'on', 'bf16')
             and hasattr(fvk, 'linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt')
         )
-        # FLA-style hand-tuned mma.sync + cp.async chunk_h kernel.
-        # Opt-in via env var. Requires raw w48/u48 buffers, so we suppress
-        # the cublasLt packed_wu paths below when this is active.
+        # FLA-style hand-tuned mma.sync + cp.async chunk_h/output_o kernels.
+        # Default on for the SM120 Qwen3.6 long-prefill path; keep the env
+        # switch so perf/debug runs can fall back to the cublasLt reference.
         use_mma_fla_chunk_h = (
             use_wy_chunk
             and hasattr(fvk,
                         'linear_attn_gdn_wy_chunk_h_b64_bf16_mma_fla')
             and os.environ.get(
                 'FLASHRT_QWEN36_TQ_PREFILL_GDN_CHUNK_H_MMA_FLA',
-                '0').strip().lower() in ('1', 'true', 'on'))
+                '1').strip().lower() in ('1', 'true', 'on'))
         use_inout = K <= self._K_save_max
         if use_wy_chunk:
             if conv_gqa_ready:
