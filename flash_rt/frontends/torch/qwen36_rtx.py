@@ -1979,7 +1979,15 @@ class Qwen36TorchFrontendRtx:
         a_vec_K = self._K_lin_a_vec[:K]
         b_vec_K = self._K_lin_b_vec[:K]
         if self._enable_lin_ab96_kernel:
-            fvk.bf16_matmul_qwen36_ab96_bf16(
+            ab96_fn = (
+                fvk.bf16_matmul_qwen36_ab96_m4_bf16
+                if (
+                    hasattr(fvk, 'bf16_matmul_qwen36_ab96_m4_bf16')
+                    and os.environ.get(
+                        'FLASHRT_QWEN36_PREFILL_AB96_M4',
+                        '1').strip().lower() not in ('0', 'false', 'off'))
+                else fvk.bf16_matmul_qwen36_ab96_bf16)
+            ab96_fn(
                 x_norm.data_ptr(), int(lw['in_proj_ab_w']),
                 self._K_lin_ab_vec[:K].data_ptr(), K, s,
             )

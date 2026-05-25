@@ -183,6 +183,84 @@ __global__ void bf16_matmul_ab96_pair_kernel(
     }
 }
 
+template<int K_FIXED, int M_TILE>
+__global__ void bf16_matmul_ab96_mtile_kernel(
+    const __nv_bfloat16* __restrict__ x,        // (M, K)
+    const __nv_bfloat16* __restrict__ W,        // (96, K)
+    __nv_bfloat16* __restrict__ out,            // (M, 96)
+    int M) {
+    extern __shared__ __align__(16) __nv_bfloat16 x_sh[];
+
+    const int m0 = blockIdx.y * M_TILE;
+    const int K_int4 = K_FIXED / 8;
+    const int4* x_i4 = reinterpret_cast<const int4*>(x);
+    int4* x_sh_i4 = reinterpret_cast<int4*>(x_sh);
+
+    const int x_i4_total = M_TILE * K_int4;
+    for (int j = threadIdx.x; j < x_i4_total; j += kThreads) {
+        int mt = j / K_int4;
+        int ki4 = j - mt * K_int4;
+        int m = m0 + mt;
+        if (m < M) {
+            x_sh_i4[j] = x_i4[m * K_int4 + ki4];
+        } else {
+            x_sh_i4[j] = make_int4(0, 0, 0, 0);
+        }
+    }
+    __syncthreads();
+
+    const int warp_id = threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    const int n = blockIdx.x * kWarpsPerBlock + warp_id;
+    if (n >= 96) return;
+
+    const int4* w_row_i4 = reinterpret_cast<const int4*>(W + n * K_FIXED);
+    float acc[M_TILE];
+#pragma unroll
+    for (int mt = 0; mt < M_TILE; ++mt) acc[mt] = 0.0f;
+
+    #pragma unroll 1
+    for (int i4 = lane; i4 < K_int4; i4 += 32) {
+        int4 wv = w_row_i4[i4];
+        int4 xv[M_TILE];
+#pragma unroll
+        for (int mt = 0; mt < M_TILE; ++mt) {
+            xv[mt] = x_sh_i4[mt * K_int4 + i4];
+        }
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            __nv_bfloat162 wb = *reinterpret_cast<__nv_bfloat162*>(
+                &(reinterpret_cast<int*>(&wv)[k]));
+            float2 wf = __bfloat1622float2(wb);
+#pragma unroll
+            for (int mt = 0; mt < M_TILE; ++mt) {
+                __nv_bfloat162 xb = *reinterpret_cast<__nv_bfloat162*>(
+                    &(reinterpret_cast<int*>(&xv[mt])[k]));
+                float2 xf = __bfloat1622float2(xb);
+                acc[mt] = fmaf(xf.x, wf.x, acc[mt]);
+                acc[mt] = fmaf(xf.y, wf.y, acc[mt]);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int off = 16; off > 0; off /= 2) {
+#pragma unroll
+        for (int mt = 0; mt < M_TILE; ++mt) {
+            acc[mt] += __shfl_xor_sync(0xffffffff, acc[mt], off);
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int mt = 0; mt < M_TILE; ++mt) {
+            int m = m0 + mt;
+            if (m < M) {
+                out[m * 96 + n] = __float2bfloat16(acc[mt]);
+            }
+        }
+    }
+}
+
 }  // namespace
 
 void bf16_matmul_qwen36_bf16(
@@ -219,6 +297,20 @@ void bf16_matmul_qwen36_ab96_bf16(
     dim3 grid((96 + (kWarpsPerBlock * 2) - 1) / (kWarpsPerBlock * 2), M);
     bf16_matmul_ab96_pair_kernel<5120>
         <<<grid, kThreads, 0, stream>>>(x, W_ab, out_ab, M);
+}
+
+void bf16_matmul_qwen36_ab96_m4_bf16(
+    const __nv_bfloat16* x,
+    const __nv_bfloat16* W_ab,
+    __nv_bfloat16* out_ab,
+    int M,
+    cudaStream_t stream) {
+    constexpr int kMTile = 4;
+    dim3 grid((96 + kWarpsPerBlock - 1) / kWarpsPerBlock,
+              (M + kMTile - 1) / kMTile);
+    size_t smem = kMTile * 5120 * sizeof(__nv_bfloat16);
+    bf16_matmul_ab96_mtile_kernel<5120, kMTile>
+        <<<grid, kThreads, smem, stream>>>(x, W_ab, out_ab, M);
 }
 
 }  // namespace flash_rt::kernels

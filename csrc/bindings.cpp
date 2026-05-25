@@ -3979,6 +3979,18 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("x"), py::arg("W_ab"), py::arg("out_ab"),
         py::arg("M"), py::arg("stream") = 0);
 
+    m.def("bf16_matmul_qwen36_ab96_m4_bf16",
+        [](uintptr_t x, uintptr_t W_ab, uintptr_t out_ab,
+           int M, uintptr_t stream) {
+            flash_rt::kernels::bf16_matmul_qwen36_ab96_m4_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(x),
+                reinterpret_cast<const __nv_bfloat16*>(W_ab),
+                reinterpret_cast<__nv_bfloat16*>(out_ab),
+                M, to_stream(stream));
+        },
+        py::arg("x"), py::arg("W_ab"), py::arg("out_ab"),
+        py::arg("M"), py::arg("stream") = 0);
+
     m.def("qwen36_embedding_lookup_bf16",
         [](uintptr_t token_ids, uintptr_t embed, uintptr_t out,
            int rows, int hidden, uintptr_t stream) {
