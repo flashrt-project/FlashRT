@@ -2990,17 +2990,28 @@ class Qwen36TorchFrontendRtx:
         ap_17408, sf_17408, _ = self._nvfp4_scratch[(5120, 17408)]
         if self._enable_silu_mul_quant_fusion:
             if self._enable_mlp_gate_up_fusion:
-                silu_mul_merged_to_nvfp4 = (
-                    fvk.silu_mul_merged_to_nvfp4_swizzled_grouped_bf16
-                    if (
-                        hasattr(
-                            fvk,
-                            'silu_mul_merged_to_nvfp4_swizzled_grouped_bf16')
-                        and os.environ.get(
-                            'FLASHRT_QWEN36_GROUPED_MLP_SILU_QUANT',
-                            '1').strip().lower()
-                        not in ('0', 'false', 'off'))
-                    else fvk.silu_mul_merged_to_nvfp4_swizzled_bf16)
+                grouped_silu_mode = os.environ.get(
+                    'FLASHRT_QWEN36_GROUPED_MLP_SILU_QUANT',
+                    '32').strip().lower()
+                if (
+                    grouped_silu_mode in ('32', 'grouped32')
+                    and hasattr(
+                        fvk,
+                        'silu_mul_merged_to_nvfp4_swizzled_grouped32_bf16')
+                ):
+                    silu_mul_merged_to_nvfp4 = (
+                        fvk.silu_mul_merged_to_nvfp4_swizzled_grouped32_bf16)
+                elif (
+                    grouped_silu_mode not in ('0', 'false', 'off')
+                    and hasattr(
+                        fvk,
+                        'silu_mul_merged_to_nvfp4_swizzled_grouped_bf16')
+                ):
+                    silu_mul_merged_to_nvfp4 = (
+                        fvk.silu_mul_merged_to_nvfp4_swizzled_grouped_bf16)
+                else:
+                    silu_mul_merged_to_nvfp4 = (
+                        fvk.silu_mul_merged_to_nvfp4_swizzled_bf16)
                 silu_mul_merged_to_nvfp4(
                     gate_up_buf.data_ptr(),
                     ap_17408.data_ptr(), sf_17408.data_ptr(),
@@ -3352,17 +3363,28 @@ class Qwen36TorchFrontendRtx:
         ap_dn, sf_dn, _ = self._nvfp4_scratch[(5120, 17408)]
         if self._enable_silu_mul_quant_fusion:
             if self._enable_mlp_gate_up_fusion:
-                silu_mul_merged_to_nvfp4 = (
-                    fvk.silu_mul_merged_to_nvfp4_swizzled_grouped_bf16
-                    if (
-                        hasattr(
-                            fvk,
-                            'silu_mul_merged_to_nvfp4_swizzled_grouped_bf16')
-                        and os.environ.get(
-                            'FLASHRT_QWEN36_GROUPED_MLP_SILU_QUANT',
-                            '1').strip().lower()
-                        not in ('0', 'false', 'off'))
-                    else fvk.silu_mul_merged_to_nvfp4_swizzled_bf16)
+                grouped_silu_mode = os.environ.get(
+                    'FLASHRT_QWEN36_GROUPED_MLP_SILU_QUANT',
+                    '32').strip().lower()
+                if (
+                    grouped_silu_mode in ('32', 'grouped32')
+                    and hasattr(
+                        fvk,
+                        'silu_mul_merged_to_nvfp4_swizzled_grouped32_bf16')
+                ):
+                    silu_mul_merged_to_nvfp4 = (
+                        fvk.silu_mul_merged_to_nvfp4_swizzled_grouped32_bf16)
+                elif (
+                    grouped_silu_mode not in ('0', 'false', 'off')
+                    and hasattr(
+                        fvk,
+                        'silu_mul_merged_to_nvfp4_swizzled_grouped_bf16')
+                ):
+                    silu_mul_merged_to_nvfp4 = (
+                        fvk.silu_mul_merged_to_nvfp4_swizzled_grouped_bf16)
+                else:
+                    silu_mul_merged_to_nvfp4 = (
+                        fvk.silu_mul_merged_to_nvfp4_swizzled_bf16)
                 silu_mul_merged_to_nvfp4(
                     gate_up_buf.data_ptr(),
                     ap_dn.data_ptr(), sf_dn.data_ptr(),

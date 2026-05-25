@@ -324,6 +324,91 @@ __global__ void silu_mul_merged_to_nvfp4_swizzled_grouped_kernel(
   }
 }
 
+// Wider grouped variant: 32 FP4 scale blocks per CTA. This halves CTA count
+// versus grouped_kernel for wide MLP rows while preserving one 16-element
+// scale group per output block.
+__global__ void silu_mul_merged_to_nvfp4_swizzled_grouped32_kernel(
+    const __nv_bfloat16* __restrict__ merged_gate_up,
+    uint8_t* __restrict__ packed,
+    uint8_t* __restrict__ sf_swz,
+    int cols,
+    int num_blocks,
+    int n_col_blocks) {
+  constexpr int kGroupsPerCta = 32;
+  constexpr int kElemsPerGroup = 16;
+  constexpr int kElemsPerCta = kGroupsPerCta * kElemsPerGroup;
+
+  int row = blockIdx.x;
+  int group_tile = blockIdx.y;
+  int local = threadIdx.x;
+
+  const __nv_bfloat16* gate_row =
+      merged_gate_up + (size_t)row * (2 * cols);
+  const __nv_bfloat16* up_row = gate_row + cols;
+  uint8_t* packed_row = packed + (size_t)row * (cols / 2);
+
+  __shared__ __nv_bfloat16 smem_vals[kElemsPerCta];
+  __shared__ float smem_abs[kElemsPerCta];
+  __shared__ float smem_scale[kGroupsPerCta];
+
+  #pragma unroll
+  for (int pass = 0; pass < 2; ++pass) {
+    int idx = local + pass * blockDim.x;
+    int group = idx >> 4;
+    int elem = idx & 15;
+    int block_col = group_tile * kGroupsPerCta + group;
+    int col = block_col * kElemsPerGroup + elem;
+    if (block_col < num_blocks) {
+      float g = __bfloat162float(gate_row[col]);
+      float u = __bfloat162float(up_row[col]);
+      float silu_g = silu_f32(g);
+      float silu_g_bf = static_cast<float>(__float2bfloat16(silu_g));
+      __nv_bfloat16 silu_mul_bf = __float2bfloat16(silu_g_bf * u);
+      smem_vals[idx] = silu_mul_bf;
+      smem_abs[idx] = fabsf(static_cast<float>(silu_mul_bf));
+    }
+  }
+  __syncthreads();
+
+  if (local < kGroupsPerCta) {
+    int b = group_tile * kGroupsPerCta + local;
+    if (b < num_blocks) {
+      float amax = 0.0f;
+#pragma unroll
+      for (int i = 0; i < kElemsPerGroup; ++i) {
+        amax = fmaxf(amax, smem_abs[local * kElemsPerGroup + i]);
+      }
+      float scale = amax / 6.0f;
+      uint8_t ue_scale = float_to_ue4m3_ceil(scale);
+      int rb = row / 128;
+      int ri = row % 128;
+      int cb = b / 4;
+      int ci = b % 4;
+      int out_idx = (rb * n_col_blocks + cb) * 512
+                  + (ri % 32) * 16 + (ri / 32) * 4 + ci;
+      sf_swz[out_idx] = ue_scale;
+      smem_scale[local] = ue4m3_to_float(ue_scale);
+    }
+  }
+  __syncthreads();
+
+  if (local < kGroupsPerCta * 8) {
+    int pack_group = local >> 3;
+    int pair = local & 7;
+    int b = group_tile * kGroupsPerCta + pack_group;
+    if (b < num_blocks) {
+      int base = pack_group * kElemsPerGroup + pair * 2;
+      float scale = smem_scale[pack_group];
+      float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+      float v0 = __bfloat162float(smem_vals[base]) * inv_scale;
+      float v1 = __bfloat162float(smem_vals[base + 1]) * inv_scale;
+      uint8_t fp4_lo = float_to_fp4_e2m1(v0);
+      uint8_t fp4_hi = float_to_fp4_e2m1(v1);
+      packed_row[b * 8 + pair] = (fp4_hi << 4) | (fp4_lo & 0x0F);
+    }
+  }
+}
+
 }  // namespace
 
 int silu_mul_to_nvfp4_swizzled_bf16(
@@ -405,6 +490,29 @@ int silu_mul_merged_to_nvfp4_swizzled_grouped_bf16(
   int n_col_blocks = (num_blocks + 3) / 4;
   dim3 grid(rows, (num_blocks + kGroupsPerCta - 1) / kGroupsPerCta);
   silu_mul_merged_to_nvfp4_swizzled_grouped_kernel<<<
+      grid, 256, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(merged_gate_up),
+      reinterpret_cast<uint8_t*>(packed),
+      reinterpret_cast<uint8_t*>(sf_swz),
+      cols, num_blocks, n_col_blocks);
+  return 0;
+}
+
+int silu_mul_merged_to_nvfp4_swizzled_grouped32_bf16(
+    const void* merged_gate_up,
+    void*       packed,
+    void*       sf_swz,
+    int         rows,
+    int         cols,
+    cudaStream_t stream) {
+  if (!merged_gate_up || !packed || !sf_swz) return 1;
+  if (rows <= 0 || cols <= 0 || (cols & 0xF) != 0) return 2;
+
+  constexpr int kGroupsPerCta = 32;
+  int num_blocks = (cols + 15) / 16;
+  int n_col_blocks = (num_blocks + 3) / 4;
+  dim3 grid(rows, (num_blocks + kGroupsPerCta - 1) / kGroupsPerCta);
+  silu_mul_merged_to_nvfp4_swizzled_grouped32_kernel<<<
       grid, 256, 0, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(merged_gate_up),
       reinterpret_cast<uint8_t*>(packed),
