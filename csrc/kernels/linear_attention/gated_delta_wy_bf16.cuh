@@ -100,6 +100,26 @@ void gdn_wy_output_o_b64_bf16_cublaslt(
     int qk_group,
     cudaStream_t stream);
 
+void gdn_wy_output_o_b64_bf16_cublaslt_packed_k(
+    const void* q_l2,
+    const void* k_pack_hv,
+    const void* v_new,
+    const void* h0,
+    const void* g_cumsum,
+    void*       q_pack,
+    void*       v_pack,
+    void*       qk_base,
+    void*       local_a_pack,
+    void*       qh_pack,
+    void*       local_pack,
+    void*       out,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group,
+    cudaStream_t stream);
+
 void gdn_wy_chunk_h_b64_bf16_cublaslt(
     const void* k_l2,
     const void* u,
