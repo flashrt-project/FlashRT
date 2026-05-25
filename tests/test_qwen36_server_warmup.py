@@ -61,8 +61,14 @@ def test_qwen36_prefill_gdn_backend_defaults_to_native_wy(monkeypatch):
     assert _qwen36_tq_prefill_gdn_backend() == 'wy_lt'
 
     monkeypatch.setenv(
+        'FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND', 'native')
+    assert _qwen36_tq_prefill_gdn_backend() == 'native'
+
+    monkeypatch.setenv(
         'FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND', 'fla_chunk')
-    assert _qwen36_tq_prefill_gdn_backend() == 'fla_chunk'
+    import pytest
+    with pytest.raises(ValueError, match='no longer supports'):
+        _qwen36_tq_prefill_gdn_backend()
 
 
 def test_server_chat_template_disables_thinking_by_default():

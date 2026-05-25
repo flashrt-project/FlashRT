@@ -13,11 +13,8 @@ Install the Torch frontend extra from the repository root:
 pip install -e ".[torch]"
 ```
 
-The Qwen3.6 long-context default path uses native FlashRT CUDA/CUTLASS
-kernels. The vendored FLA Python/Triton subset in `flash_rt.ops.fla`
-is retained as an explicit comparison backend; the `torch` extra
-declares its runtime dependencies (`einops`, `triton>=3.2`, and
-`packaging`).
+The Qwen3.6 long-context path uses native FlashRT CUDA/CUTLASS
+kernels; it does not require Triton/FLA Python kernels.
 For the OpenAI-compatible server, install:
 
 ```bash
@@ -88,8 +85,7 @@ causal hdim=256 path. Linear-attention prefill chunks use chunked
 causal-conv and the native FlashRT WY/cuBLASLt Gated DeltaNet backend
 by default (`FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND=wy_lt`). Set
 `FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND=native` to force the direct-conv
-FlashRT recurrent scan, or `fla_chunk` to run the vendored FLA
-comparison path for bisection. `FVK_QWEN36_CHUNK_CONV_PARALLEL=0`
+FlashRT recurrent scan for bisection. `FVK_QWEN36_CHUNK_CONV_PARALLEL=0`
 forces the older serial chunk conv update. Experimental fused gate/up
 and cuBLAS AB paths are
 available behind environment variables but default off because they
@@ -165,7 +161,7 @@ frontend is built has no effect.
 | `FLASHRT_QWEN36_LONG_MTP_TAIL_KV_ONLY` | Optional | `1` | When prompt-tail prefill is enabled and the MTP checkpoint has BF16 projection weights, populate only the MTP K/V cache rows needed by the drafter. Set `0` to force the older full-MTP-head tail loop for bisection. |
 | `FLASHRT_QWEN36_TQ_STRICT_NEXT` | Optional | `0` | Debug/validation mode that recomputes the correction or bonus token on the sequential target path after batched TQ verify. This preserves greedy next-token invariance for tail-prefill experiments but is much slower than the default batched verify path. |
 | `FLASHRT_QWEN36_TQ_STRICT_NEXT_GRAPH` | Optional | `1` | Use per-position K=1 TQ verify graphs for the strict-next recompute. Only consulted when `FLASHRT_QWEN36_TQ_STRICT_NEXT=1`. |
-| `FLASHRT_QWEN36_TQ_VERIFY_EXACT_GATING` | Optional | `0` | Use the torch-style gating math in the small-K long TQ verify linear-attention path for GDN bisection. This is slower than the fused gating kernel and does not force full bit equality for the whole batched verifier. |
+| `FLASHRT_QWEN36_TQ_VERIFY_EXACT_GATING` | Unsupported | `0` | Legacy torch-style GDN gating bisection path. The kernel-only Qwen3.6 route rejects `1`; use the fused FlashRT gating kernel. |
 | `FLASHRT_QWEN36_TQ_VERIFY_GRAPH` | Optional | `1` | Capture/replay the long-context TQ verify forward as per-`(cur_pos, K)` CUDA Graphs. This is the fastest warm path. Set `0` only when optimizing first-request latency without prewarm or debugging graph capture. |
 | `FLASHRT_QWEN36_TQ_MTP_CHAIN_GRAPH` | Optional | `1` | Capture/replay the long-context MTP draft chain. This is the fastest warm path. Set `0` only when optimizing first-request latency without prewarm or debugging graph capture. |
 | `FLASHRT_QWEN36_LONG_WARMUP_MIN_FREE_MB` | Optional | `1024` | Stop long-context startup graph warmup once free VRAM falls below this waterline. This prevents 200K+ buckets from over-capturing graphs and leaving too little memory for the first real request. |
@@ -178,11 +174,11 @@ frontend is built has no effect.
 | `FLASHRT_QWEN36_FP8_HOT_STAGE_LAYERS` | Optional | `auto` | Extra 128K-tier FP8-KV stage count. Auto keeps one hot layer when a larger 200K stage is active. Higher values can block CUDA Graph capture on 32GB GPUs. |
 | `FLASHRT_QWEN36_FP8_STAGE_RESERVE_MB` / `FLASHRT_QWEN36_FP8_HOT_STAGE_RESERVE_MB` | Optional | `1024` | Free-memory reserves used by FP8 stage auto-sizing. Lower only for controlled benchmarking. |
 | `FVK_QWEN36_TQ_CUTLASS` | Optional | `auto` | Use CUTLASS fused TQ dequant for shared staging. `auto` enables it up to the 128K profile and leaves 256K on the lower-memory path. Set `0`/`1` to force. |
-| `FLASHRT_QWEN36_TQ_KERNEL_WRITE` | Optional | `1` | Use explicit cuBLASLt/cuBLAS wrappers for TurboQuant write-side GEMMs. Set `0` to force the older `torch.matmul` write GEMMs for correctness bisection. |
+| `FLASHRT_QWEN36_TQ_KERNEL_WRITE` | Required | `1` | Use explicit cuBLASLt/cuBLAS wrappers for TurboQuant write-side GEMMs. The older `torch.matmul` write path is removed from the kernel-only route. |
 | `FLASHRT_QWEN36_FUSE_MLP_GATE_UP` | Optional | long NVFP4: `1`; otherwise `0` | Runs MLP gate/up as one fused NVFP4 GEMM when the checkpoint has homogeneous gate/up scales. This is the default long-context path because it improves warm TQ/spec decode and reduces scratch memory; set `0` to force the older two-GEMM path. |
 | `FLASHRT_QWEN36_FUSE_SILU_MUL_QUANT` | Optional | `0` | Experimental fused `silu(gate)*up -> NVFP4` activation path. Forced on when fused gate/up is enabled for correct merged-buffer stride handling; otherwise default off because it was slower locally. |
 | `FLASHRT_QWEN36_LIN_AB96_KERNEL` | Optional | `1` | Deterministic fused kernel for the tiny linear-attention A/B projections in long-prefill chunks. Bit-identical to the old two-call BF16 path; set `0` to force the previous path. |
-| `FLASHRT_QWEN36_LIN_AB_TORCH_MM_MIN_K` | Optional | `0` | Experimental cuBLAS/Torch path for the tiny linear-attention A/B projections when `K` is at least this value. Default `0` disables it; local checks showed it is much faster but not elementwise-stable enough to default on. |
+| `FLASHRT_QWEN36_LIN_AB_TORCH_MM_MIN_K` | Unsupported | `0` | Legacy Torch matmul bisection path for linear-attention A/B projections. The kernel-only route rejects values above `0`; use `FLASHRT_QWEN36_LIN_AB96_KERNEL=1`. |
 | `FLASHRT_QWEN36_FULL_GATE_SIGMOID_MUL` | Optional | `0` | Experimental fused full-attention output gate `sigmoid(gate) * attn` kernel. Bit-identical in random checks but did not improve the 1024-token chunk benchmark, so it defaults off. |
 | `FLASHRT_NVFP4_LOAD_DEBUG` | Optional | `0` | Set to `1` for verbose VRAM-tracking prints during NVFP4 weight load. |
 | `FLASHRT_DFLASH_LOAD_DEBUG` | Optional | `0` | Same, for DFlash drafter load. |

@@ -16,9 +16,9 @@ The minimum to run Qwen3.6-27B NVFP4 with K=6 speculative decode at
 ~134 tok/s decode on the short standard prompt. Step 1 is one-time; step 2 is the
 inference call.
 
-Install the Torch frontend extra before building/running Qwen. It
-includes the Qwen long-context runtime dependencies (`einops`,
-`triton>=3.2`, and `packaging`):
+Install the Torch frontend extra before building/running Qwen. The
+long-context runtime uses native FlashRT CUDA/CUTLASS kernels and does
+not require Triton/FLA Python kernels:
 
 ```bash
 pip install -e ".[torch]"
@@ -280,8 +280,7 @@ logits entirely, and the final chunk computes logits only for the last
 prompt row. The large K-row logits workspace is allocated lazily only
 for explicit all-logits diagnostic calls. Set
 `FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND=native` to force the direct-conv
-FlashRT chunk scan, or `fla_chunk` to run the vendored FLA comparison
-path for bisection.
+FlashRT chunk scan for bisection.
 
 ## 5. TTFT (prefill latency)
 

@@ -809,10 +809,6 @@ pip install pybind11 cmake "numpy>=1.24" safetensors
 #    tokenizer API.
 pip install "transformers<4.56" pandas pillow pyarrow
 
-# 3b. Qwen3.6 long-context runtime deps. These are also installed by
-#     `pip install -e ".[torch]"` below.
-pip install einops "triton>=3.2" packaging
-
 # 4. JAX-side (optional — only if you will load Orbax checkpoints).
 #    Versions are pinned because the Orbax/jaxlib/PJRT plugin ABI is
 #    not stable across minor releases; upgrading any of the four

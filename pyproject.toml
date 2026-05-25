@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-torch = ["torch", "safetensors", "sentencepiece", "einops", "triton>=3.2", "packaging"]
+torch = ["torch", "safetensors", "sentencepiece"]
 jax = ["jax", "jaxlib", "ml_dtypes", "orbax-checkpoint", "flax"]
 server = ["fastapi", "uvicorn"]
 eval = ["opencv-python", "tqdm"]
@@ -42,4 +42,3 @@ include = ["flash_rt*"]
 
 [tool.setuptools.package-data]
 flash_rt = ["*.so", "*.yaml", "*.model"]
-"flash_rt.ops.fla" = ["VENDOR.md", "NOTICE", "LICENSE.flash-linear-attention"]

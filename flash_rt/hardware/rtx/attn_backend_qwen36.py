@@ -26,11 +26,9 @@ Decode contract (q_seq=1):
     (1, kv_seq, 4, 256) K/V, writing output to a fixed ``O_buf``
     pointer and returning that pointer for the next GEMM.
 
-Multi-token prefill is currently delegated to HF (via fla
-chunk_gated_delta_rule for linear-attn, FA2 for full-attn). This
-backend's q_seq parameter is therefore expected to be 1 for the
-common case; q_seq>1 is supported (the buffers are sized for
-``max_q_seq``) but not exercised by step 1.
+Multi-token prefill is driven by the Qwen frontend. Linear-attention
+chunks use FlashRT native Gated DeltaNet kernels; full-attention chunks
+call the vendored FA2 path through this backend.
 """
 
 from __future__ import annotations

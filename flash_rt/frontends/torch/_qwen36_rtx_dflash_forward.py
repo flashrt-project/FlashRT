@@ -410,7 +410,10 @@ def _drafter_layer_forward(frontend, fvk, L: int, h_in,
     _gemm_nvfp4(fvk, ap_q.data_ptr(), sf_q.data_ptr(),
                 lw['o_proj_packed'], lw['o_proj_sf'], lw['o_proj_alpha'],
                 buf['o_out'].data_ptr(), M, H, QD, s)
-    torch.add(h_in, buf['o_out'], out=buf['h_mid'])
+    fvk.add_bf16_out(
+        h_in.data_ptr(), buf['o_out'].data_ptr(),
+        buf['h_mid'].data_ptr(), M * H, s,
+    )
 
     # ---- 11) post-attn rms_norm + MLP gate/up/down ----
     fvk.rms_norm(
@@ -439,7 +442,10 @@ def _drafter_layer_forward(frontend, fvk, L: int, h_in,
                 lw['mlp_down_alpha'],
                 buf['down_out'].data_ptr(), M, H, INTER, s)
     h_out = buf['h_a'] if (L % 2 == 0) else buf['h_b']
-    torch.add(buf['h_mid'], buf['down_out'], out=h_out)
+    fvk.add_bf16_out(
+        buf['h_mid'].data_ptr(), buf['down_out'].data_ptr(),
+        h_out.data_ptr(), M * H, s,
+    )
     return h_out
 
 
@@ -649,9 +655,12 @@ def dflash_drafter_forward_capture_eager(frontend,
         raise ValueError(
             f'valid_ctx={valid_ctx} must be in [1, eff_ctx={eff_ctx}]')
 
-    # 1) Embed via static ids buffer
-    embed_t = frontend._weights.anchors[0]
-    torch.index_select(embed_t, 0, buf['ids_static'], out=buf['embed_buf'])
+    # 1) Embed via static ids buffer.
+    fvk.qwen36_embedding_lookup_bf16(
+        buf['ids_static'].data_ptr(),
+        int(frontend._weights.ptrs['embed_w']),
+        buf['embed_buf'].data_ptr(), M, H, s,
+    )
 
     # 2) fc(hidden_taps_static) -> rms_norm -> shift-write into window
     tap_flat = buf['hidden_taps_static'].view(1, FC_IN)
@@ -670,7 +679,10 @@ def dflash_drafter_forward_capture_eager(frontend,
     )
 
     # 3) h = embed
-    buf['h_b'].copy_(buf['embed_buf'])
+    fvk.gpu_copy(
+        buf['h_b'].data_ptr(), buf['embed_buf'].data_ptr(),
+        M * H * 2, s,
+    )
     h = buf['h_b']
 
     # 4) Layer forward with ONLY the most-recent valid_ctx slots
@@ -731,8 +743,11 @@ def dflash_drafter_forward_capture(frontend) -> torch.Tensor:
             'eff_ctx_capture not set; call alloc_drafter_capture_window first')
 
     # ---- 1) Embed via static ids buffer ----
-    embed_t = frontend._weights.anchors[0]    # (vocab, hidden) bf16
-    torch.index_select(embed_t, 0, buf['ids_static'], out=buf['embed_buf'])
+    fvk.qwen36_embedding_lookup_bf16(
+        buf['ids_static'].data_ptr(),
+        int(frontend._weights.ptrs['embed_w']),
+        buf['embed_buf'].data_ptr(), M, H, s,
+    )
 
     # ---- 2) fc(hidden_taps_static) -> rms_norm -> shift-write window ----
     tap_flat = buf['hidden_taps_static'].view(1, FC_IN)
@@ -756,7 +771,10 @@ def dflash_drafter_forward_capture(frontend) -> torch.Tensor:
     )
 
     # ---- 3) h = embed (no residual add of target_feat) ----
-    buf['h_b'].copy_(buf['embed_buf'])
+    fvk.gpu_copy(
+        buf['h_b'].data_ptr(), buf['embed_buf'].data_ptr(),
+        M * H * 2, s,
+    )
     h = buf['h_b']
 
     # ---- 4) Drafter layers 0..4 with eff_ctx context ----

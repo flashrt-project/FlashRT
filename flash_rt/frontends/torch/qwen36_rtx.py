@@ -40,21 +40,14 @@ if _PATCH_PATH and os.path.isfile(_PATCH_PATH):
 from flash_rt.models.qwen36 import Qwen36Pipeline  # noqa: E402
 
 
-_QWEN36_FLA_CHUNK = None
-
-
 def _qwen36_tq_prefill_gdn_backend() -> str:
-    return os.environ.get(
+    backend = os.environ.get(
         'FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND', 'wy_lt').strip().lower()
-
-
-def _load_qwen36_fla_chunk():
-    """Load the vendored FLA chunk/WY Gated DeltaNet comparison path."""
-    global _QWEN36_FLA_CHUNK
-    if _QWEN36_FLA_CHUNK is None:
-        from flash_rt.ops.fla.chunk import chunk_gated_delta_rule_inference
-        _QWEN36_FLA_CHUNK = chunk_gated_delta_rule_inference
-    return _QWEN36_FLA_CHUNK
+    if backend in ('fla', 'fla_chunk', 'fla_ref'):
+        raise ValueError(
+            'FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND no longer supports '
+            f'{backend!r}; use wy_lt or native for FlashRT CUDA kernels')
+    return backend
 
 
 class Qwen36TorchFrontendRtx:
@@ -408,6 +401,9 @@ class Qwen36TorchFrontendRtx:
         # --- hidden ping-pong ---
         self._h_a = torch.empty(max_seq, hidden, device=device, dtype=bf16)
         self._h_b = torch.empty(max_seq, hidden, device=device, dtype=bf16)
+        self._embed_buf = torch.empty(
+            1, 1, hidden, device=device, dtype=bf16,
+        )
 
         # --- FP8 scratch per (N, K) shape ---
         # Each shape gets (qinput e4m3, scale fp32, out bf16) sized to
@@ -702,6 +698,9 @@ class Qwen36TorchFrontendRtx:
         self._K_layer_out_b = torch.empty(
             1, Kmax, hidden, device=device, dtype=bf16,
         )
+        self._K_embed_buf = torch.empty(
+            1, Kmax, hidden, device=device, dtype=bf16,
+        )
         self._K_res_mid = torch.empty(
             1, Kmax, hidden, device=device, dtype=bf16,
         )
@@ -808,6 +807,9 @@ class Qwen36TorchFrontendRtx:
             # are reused — MTP runs sequentially after main forward,
             # so those buffers are free at MTP time.
             self._mtp_h_norm_buf = torch.empty(
+                1, 1, 5120, device=device, dtype=bf16,
+            )
+            self._mtp_embed_buf = torch.empty(
                 1, 1, 5120, device=device, dtype=bf16,
             )
             self._mtp_e_norm_buf = torch.empty(
@@ -1038,8 +1040,13 @@ class Qwen36TorchFrontendRtx:
             'FLASHRT_QWEN36_FUSE_SILU_MUL_QUANT', '0') or '0'))
         if self._enable_mlp_gate_up_fusion:
             self._enable_silu_mul_quant_fusion = True
-        self._lin_ab_torch_mm_min_k = int(os.environ.get(
+        lin_ab_torch = int(os.environ.get(
             'FLASHRT_QWEN36_LIN_AB_TORCH_MM_MIN_K', '0') or '0')
+        if lin_ab_torch > 0:
+            raise ValueError(
+                'FLASHRT_QWEN36_LIN_AB_TORCH_MM_MIN_K is no longer '
+                'supported on the kernel-only Qwen3.6 path')
+        self._lin_ab_torch_mm_min_k = 0
         self._enable_lin_ab96_kernel = bool(int(os.environ.get(
             'FLASHRT_QWEN36_LIN_AB96_KERNEL', '1') or '0'))
         self._enable_full_gate_sigmoid_mul = bool(int(os.environ.get(
@@ -1152,7 +1159,8 @@ class Qwen36TorchFrontendRtx:
         # _alloc_buffers). These are format-agnostic (BF16 / FP32) — same
         # shapes work for the NVFP4 verify path because only the GEMM
         # kernel changes; everything else (rms_norm, conv1d_update,
-        # FLA chunk, gated-silu, residuals, layernorm) is identical ABI.
+        # native GDN chunk scan, gated-silu, residuals, layernorm) is
+        # identical ABI.
         Kmax = self.MAX_Q_SEQ
         fp32 = torch.float32
         # full-attn intra-layer S=K scratches
@@ -1656,7 +1664,7 @@ class Qwen36TorchFrontendRtx:
             f'_layer_forward_full_nvfp4 layer {L} type {lw["type"]!r}'
         )
 
-        h2 = h_in.view(1, 5120).contiguous()
+        h2 = h_in.view(1, 5120)
         eps = float(self._cfg['rms_norm_eps'])
         full_rank = self._full_layer_rank(L)
 
@@ -1868,8 +1876,8 @@ class Qwen36TorchFrontendRtx:
           2. MLP gate / up / down are NVFP4: per-token NVFP4 quant of
              the M=K activation, then ``fp4_w4a16_gemm_sm120_bf16out``
              at M=K with alpha = 1/global_scale.
-          3. The conv1d / FLA chunk / rms_norm_gated_silu / sigmoid /
-             softplus / index_select sub-steps are 100% shared with
+          3. The conv1d / native GDN chunk / rms_norm_gated_silu /
+             sigmoid / softplus / split sub-steps are 100% shared with
              the FP8 path — kernel ABIs are identical.
         """
         import torch
@@ -1929,15 +1937,6 @@ class Qwen36TorchFrontendRtx:
             fvk.bf16_matmul_qwen36_ab96_bf16(
                 x_norm.data_ptr(), int(lw['in_proj_ab_w']),
                 self._K_lin_ab_vec[:K].data_ptr(), K, s,
-            )
-        elif (
-            self._lin_ab_torch_mm_min_k > 0
-            and K >= self._lin_ab_torch_mm_min_k
-            and 'in_proj_ab_w_t' in lw
-        ):
-            torch.mm(
-                x_norm, lw['in_proj_ab_w_t'].t(),
-                out=self._K_lin_ab_vec[:K],
             )
         else:
             fvk.bf16_matmul_qwen36_bf16(
@@ -2017,8 +2016,7 @@ class Qwen36TorchFrontendRtx:
                     )
 
         # 5b) Split conv output into Q/K/V and broadcast Q/K heads from
-        # 16 to 48. The chunk kernel avoids three contiguous materializes
-        # and two torch.index_select launches in long prefill chunks.
+        # 16 to 48 through FlashRT kernels.
         conv_K = self._K_lin_conv_out[:K]
         use_direct_gdn = (
             K > self._K_save_max
@@ -2037,25 +2035,14 @@ class Qwen36TorchFrontendRtx:
                 and os.environ.get(
                     'FVK_QWEN36_LIN_SPLIT_BROADCAST', '1') == '1'
             )
-            if use_split_kernel:
-                fvk.qwen36_lin_split_qkv_broadcast_bf16(
-                    conv_K.data_ptr(), q_K_48.data_ptr(),
-                    k_K_48.data_ptr(), v_K_3d.data_ptr(), K, s,
-                )
-            else:
-                q_K_heads = conv_K[:, :2048].contiguous().view(
-                    1, K, 16, 128)
-                k_K_heads = conv_K[:, 2048:4096].contiguous().view(
-                    1, K, 16, 128)
-                v_K_heads = conv_K[:, 4096:10240].contiguous().view(
-                    1, K, 48, 128)
-                q_K_2d = q_K_heads.view(K, 16, 128)
-                k_K_2d = k_K_heads.view(K, 16, 128)
-                torch.index_select(q_K_2d, 1, self._lin_broadcast_idx,
-                                   out=q_K_48)
-                torch.index_select(k_K_2d, 1, self._lin_broadcast_idx,
-                                   out=k_K_48)
-                v_K_3d = v_K_heads.view(K, 48, 128)
+            if not use_split_kernel:
+                raise RuntimeError(
+                    'qwen36_lin_split_qkv_broadcast_bf16 is required for '
+                    'the kernel-only Qwen3.6 linear-attention path')
+            fvk.qwen36_lin_split_qkv_broadcast_bf16(
+                conv_K.data_ptr(), q_K_48.data_ptr(),
+                k_K_48.data_ptr(), v_K_3d.data_ptr(), K, s,
+            )
 
             # 5c) Compute g, beta for all K tokens (M=K vector ops).
             beta_K = self._K_lin_beta[:K]
@@ -2065,8 +2052,7 @@ class Qwen36TorchFrontendRtx:
                     'FLASHRT_QWEN36_TQ_VERIFY_EXACT_GATING', '0') == '1'
             )
             use_fused_gating = (
-                not exact_verify_gating
-                and hasattr(fvk, 'qwen36_gdn_gating_bf16')
+                hasattr(fvk, 'qwen36_gdn_gating_bf16')
                 and (
                     (a_vec_K.stride(0) == 48 and b_vec_K.stride(0) == 48)
                     or hasattr(fvk, 'qwen36_gdn_gating_strided_bf16')
@@ -2074,41 +2060,33 @@ class Qwen36TorchFrontendRtx:
                 and os.environ.get(
                     'FVK_QWEN36_GDN_FUSED_GATING', '1') == '1'
             )
-            if use_fused_gating:
-                a_stride = a_vec_K.stride(0)
-                b_stride = b_vec_K.stride(0)
-                if (
-                    (a_stride != 48 or b_stride != 48)
-                    and hasattr(fvk, 'qwen36_gdn_gating_strided_bf16')
-                ):
-                    fvk.qwen36_gdn_gating_strided_bf16(
-                        a_vec_K.data_ptr(), b_vec_K.data_ptr(),
-                        lw['neg_A_log_exp_fp32_t'].data_ptr(),
-                        lw['dt_bias_fp32_t'].data_ptr(),
-                        g_bf_K.data_ptr(), beta_K.data_ptr(),
-                        K, 48, a_stride, b_stride, s,
-                    )
-                else:
-                    fvk.qwen36_gdn_gating_bf16(
-                        a_vec_K.data_ptr(), b_vec_K.data_ptr(),
-                        lw['neg_A_log_exp_fp32_t'].data_ptr(),
-                        lw['dt_bias_fp32_t'].data_ptr(),
-                        g_bf_K.data_ptr(), beta_K.data_ptr(),
-                        K, 48, s,
-                    )
+            if exact_verify_gating or not use_fused_gating:
+                raise RuntimeError(
+                    'FlashRT fused GDN gating is required for the '
+                    'kernel-only Qwen3.6 linear-attention path')
+            a_stride = a_vec_K.stride(0)
+            b_stride = b_vec_K.stride(0)
+            if (
+                (a_stride != 48 or b_stride != 48)
+                and hasattr(fvk, 'qwen36_gdn_gating_strided_bf16')
+            ):
+                fvk.qwen36_gdn_gating_strided_bf16(
+                    a_vec_K.data_ptr(), b_vec_K.data_ptr(),
+                    lw['neg_A_log_exp_fp32_t'].data_ptr(),
+                    lw['dt_bias_fp32_t'].data_ptr(),
+                    g_bf_K.data_ptr(), beta_K.data_ptr(),
+                    K, 48, a_stride, b_stride, s,
+                )
             else:
-                torch.sigmoid(b_vec_K, out=beta_K)
-                a_f32_K = self._K_lin_a_f32[:K]
-                a_f32_K.copy_(a_vec_K)
-                a_f32_K.add_(lw['dt_bias_fp32_t'])
-                sp_K = self._K_lin_sp_buf[:K]
-                torch.exp(a_f32_K, out=sp_K)
-                torch.log1p(sp_K, out=sp_K)
-                g_f32_K = self._K_lin_g_f32[:K]
-                torch.mul(lw['neg_A_log_exp_fp32_t'], sp_K, out=g_f32_K)
-                g_bf_K.copy_(g_f32_K)
+                fvk.qwen36_gdn_gating_bf16(
+                    a_vec_K.data_ptr(), b_vec_K.data_ptr(),
+                    lw['neg_A_log_exp_fp32_t'].data_ptr(),
+                    lw['dt_bias_fp32_t'].data_ptr(),
+                    g_bf_K.data_ptr(), beta_K.data_ptr(),
+                    K, 48, s,
+                )
 
-        # 5d) K-iter recurrent (replaces FLA chunk_gated_delta_rule).
+        # 5d) K-iter recurrent / native WY chunk scan.
         # A2c-3: chain state through per-step save slots via the in/out
         # variant — eliminates the in-loop .copy_(state_save, state)
         # launch per step. Step k reads state from slot k-1 (or
@@ -2156,12 +2134,8 @@ class Qwen36TorchFrontendRtx:
             and fast_chunk_mode in ('1', 'true', 'on', 'bf16')
             and hasattr(fvk, 'linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt')
         )
-        use_fla_chunk = (
-            K > self._K_save_max
-            and gdn_backend in ('fla', 'fla_chunk', 'fla_ref')
-        )
         use_inout = K <= self._K_save_max
-        if use_wy_chunk or use_fla_chunk:
+        if use_wy_chunk:
             if (
                 use_wy_chunk
                 or (
@@ -2181,12 +2155,9 @@ class Qwen36TorchFrontendRtx:
                 k_K_heads = k16_K.view(1, K, 16, 128)
                 v_K_heads = v48_K.view(1, K, 48, 128)
             else:
-                q_K_heads = conv_K[:, :2048].contiguous().view(
-                    1, K, 16, 128)
-                k_K_heads = conv_K[:, 2048:4096].contiguous().view(
-                    1, K, 16, 128)
-                v_K_heads = conv_K[:, 4096:10240].contiguous().view(
-                    1, K, 48, 128)
+                raise RuntimeError(
+                    'qwen36_lin_split_qkv_gqa_bf16 is required for the '
+                    'kernel-only WY chunk path')
 
             beta_K = self._K_lin_beta[:K]
             g_bf_K = self._K_lin_g_bf[:K]
@@ -2421,20 +2392,6 @@ class Qwen36TorchFrontendRtx:
                         K, s,
                     )
                 attn_out_K = self._K_lin_attn_out[:K].view(1, K, 48, 128)
-            else:
-                chunk_gated_delta_rule = _load_qwen36_fla_chunk()
-                attn_out_K, new_state = chunk_gated_delta_rule(
-                    q_K_heads, k_K_heads, v_K_heads,
-                    g_bf_K.view(1, K, 48), beta_K.view(1, K, 48),
-                    initial_state=rec_state_view,
-                    output_final_state=True,
-                    use_qk_l2norm_in_kernel=True,
-                    q_l2_out=self._K_fla_q16_l2[:, :K],
-                    k_l2_out=self._K_fla_k16_l2[:, :K],
-                    g_cumsum_out=self._K_fla_g_cumsum[:, :K],
-                    o_out=self._K_lin_attn_out[:K].view(1, K, 48, 128),
-                )
-                rec_state_view.copy_(new_state)
         elif use_inout:
             for k in range(K):
                 state_in_ptr = (
@@ -3040,7 +2997,7 @@ class Qwen36TorchFrontendRtx:
                 raise ValueError(f'unknown layer_type {t!r} at L={L}')
 
         self._last_hidden_buf.copy_(h)
-        h2 = h.view(1, hidden).contiguous()
+        h2 = h.view(1, hidden)
         x_norm = self._h_b[:1].view(1, hidden)
         fvk.rms_norm(
             h2.data_ptr(), int(self._weights.ptrs['final_norm_eff_w']),
@@ -3306,8 +3263,10 @@ class Qwen36TorchFrontendRtx:
 
         # 2) cat [e_norm, h_norm].
         cat_buf = self._mtp_cat_buf.view(1, 10240)
-        cat_buf[:, :5120].copy_(e_norm)
-        cat_buf[:, 5120:].copy_(h_norm)
+        fvk.concat2_bf16(
+            e_norm.data_ptr(), h_norm.data_ptr(),
+            cat_buf.data_ptr(), 1, 5120, 5120, s,
+        )
 
         # 3) fc: BF16 matvec, M=1, K=10240, N=5120.
         fc_out_2d = self._mtp_fc_out_buf.view(1, 5120)
@@ -3810,15 +3769,11 @@ class Qwen36TorchFrontendRtx:
             # into _prefill_h_cache so MTP prefill can read
             # h_main_{p-1} below.
             #
-            # NB: we deliberately do NOT use the batched
-            # forward_own_decode_K_nvfp4 here even though it would
-            # cut prefill BW by prompt_len × — its lin-layer FLA
-            # chunk_gated_delta_rule has a different bf16 reduction
-            # order than the S=1 single-step gated_deltanet_recurrent
-            # kernel used at decode time. The MTP head trained
-            # against the latter; feeding it FLA-chunk hiddens drops
-            # AL from p_ind 0.75 → 0.51 at K=3 (verified empirically).
-            # Prefill cost amortizes over output length anyway.
+            # NB: this legacy BF16 path deliberately does NOT use the
+            # batched forward_own_decode_K_nvfp4 path. Its chunk scan has
+            # a different bf16 reduction order than the S=1 decode-time
+            # recurrent kernel; the MTP head is more sensitive to that
+            # than the main model.
             gs_pf = self._graph_stream
             for p in range(prompt_len):
                 self._static_token_id.copy_(input_ids[:, p:p + 1])
@@ -4031,7 +3986,6 @@ class Qwen36TorchFrontendRtx:
         import torch
         from flash_rt import flash_rt_kernels as fvk
 
-        bf16 = torch.bfloat16
         # Pass current torch stream to all fvk kernels so they launch
         # on the same stream as the (potential) graph-capture context.
         # See _alloc_buffers's _graph_stream comment for the why.
@@ -4041,7 +3995,7 @@ class Qwen36TorchFrontendRtx:
             f'_layer_forward_lin called on layer {L} of type {lw["type"]!r}'
         )
 
-        h2 = h_in.view(1, 5120).contiguous()  # (1, 5120) bf16
+        h2 = h_in.view(1, 5120)  # (1, 5120) bf16
         eps = float(self._pipeline.hf.config.rms_norm_eps)
 
         # Buffers / scratch.
@@ -4125,48 +4079,25 @@ class Qwen36TorchFrontendRtx:
             1, 10240, 4, True, s,
         )
 
-        # 7) split conv_out -> q (2048), k (2048), v (6144).
-        # Layout of conv_dim=10240 = [K_dim=2048, K_dim=2048, V_dim=6144].
-        q_flat = conv_out[:, :2048]            # (1, 2048)
-        k_flat = conv_out[:, 2048:4096]
-        v_flat = conv_out[:, 4096:10240]
-        q = q_flat.view(1, 1, 16, 128)
-        k = k_flat.view(1, 1, 16, 128)
-        v = v_flat.view(1, 1, 48, 128)
-
-        # 8) beta = sigmoid(b); g = -A_log.exp() * softplus(a + dt_bias).
-        # Phase 4.4 step 2: zero-alloc form. Uses extractor-precomputed
-        # `dt_bias_fp32_t` and `neg_A_log_exp_fp32_t` tensor handles
-        # (constant per layer, anchored at frontend load) and a manual
-        # softplus = log1p(exp(x)) into a pre-alloc buf. Eliminates the
-        # 3 PyTorch elementwise allocations (la.dt_bias.float(),
-        # F.softplus(...), -la.A_log.float().exp()) that previously hit
-        # the per-call allocator and made the captured kernel see
-        # graph-private-pool addresses different from the eager pool.
-        torch.sigmoid(b_vec, out=self._lin_beta)
-        self._lin_a_f32.copy_(a_vec)              # bf16 -> fp32 widening
-        self._lin_a_f32.add_(lw['dt_bias_fp32_t'])  # +dt_bias broadcast
-        # softplus(x) = log1p(exp(x)) -- stable for the practical range
-        # (a_vec + dt_bias is ~O(1..few) in trained models; if any
-        # prompt drives x > 20 we must add the threshold fallback).
-        torch.exp(self._lin_a_f32, out=self._lin_sp_buf)
-        torch.log1p(self._lin_sp_buf, out=self._lin_sp_buf)
-        torch.mul(lw['neg_A_log_exp_fp32_t'], self._lin_sp_buf,
-                  out=self._lin_g_f32)
-        self._lin_g_bf.copy_(self._lin_g_f32)
-        beta = self._lin_beta
-        g_bf = self._lin_g_bf
-
-        # 9) Broadcast q, k from 16 heads to 48 (interleave 3x).
-        # In-place via torch.index_select with the precomputed broadcast
-        # index (no Python alloc; pre-allocated _lin_q48/_lin_k48 targets).
-        q_2d = q.view(1, 16, 128)
-        k_2d = k.view(1, 16, 128)
-        torch.index_select(q_2d, 1, self._lin_broadcast_idx, out=self._lin_q48)
-        torch.index_select(k_2d, 1, self._lin_broadcast_idx, out=self._lin_k48)
+        # 7) Split conv_out and broadcast q/k 16 -> 48 heads.
         q3 = self._lin_q48
         k3 = self._lin_k48
-        v3 = v.view(1, 48, 128).contiguous()
+        v3 = self._lin_v48
+        fvk.qwen36_lin_split_qkv_broadcast_bf16(
+            conv_out.data_ptr(), q3.data_ptr(), k3.data_ptr(),
+            v3.data_ptr(), 1, s,
+        )
+
+        # 8) beta = sigmoid(b); g = -A_log.exp() * softplus(a + dt_bias).
+        fvk.qwen36_gdn_gating_bf16(
+            a_vec.data_ptr(), b_vec.data_ptr(),
+            lw['neg_A_log_exp_fp32_t'].data_ptr(),
+            lw['dt_bias_fp32_t'].data_ptr(),
+            self._lin_g_bf.data_ptr(), self._lin_beta.data_ptr(),
+            1, 48, s,
+        )
+        beta = self._lin_beta
+        g_bf = self._lin_g_bf
         attn_out_buf = self._lin_attn_out  # (1, 48, 128) dedicated scratch
 
         fvk.gated_deltanet_recurrent_qwen36_bf16(
@@ -4207,7 +4138,10 @@ class Qwen36TorchFrontendRtx:
 
         # 13) residual: h_post = h_in + attn_out (in-place, write to _res_mid)
         attn_proj = out_op_buf[:1].view(1, 1, 5120)
-        torch.add(h_in, attn_proj, out=self._res_mid)
+        fvk.add_bf16_out(
+            h_in.data_ptr(), attn_proj.data_ptr(),
+            self._res_mid.data_ptr(), 5120, s,
+        )
         h_post = self._res_mid
 
         # 14) post-attn layernorm + MLP swiglu + residual.
@@ -4268,7 +4202,10 @@ class Qwen36TorchFrontendRtx:
 
         # 15) final residual: write to ping-pong layer-output buf.
         h_out = self._layer_out_a if (L % 2 == 0) else self._layer_out_b
-        torch.add(h_post, mlp_out, out=h_out)
+        fvk.add_bf16_out(
+            h_post.data_ptr(), mlp_out.data_ptr(),
+            h_out.data_ptr(), 5120, s,
+        )
         return h_out
 
     # ---------- Phase 6 D4: S=K linear-attn layer ----------
@@ -4362,10 +4299,9 @@ class Qwen36TorchFrontendRtx:
                 b_vec_K[k:k + 1].data_ptr(), 48, 5120, s,
             )
 
-        # 6) Per-token conv1d_update (state evolves), then a SINGLE
-        # FLA chunk_gated_delta_rule call processing all K tokens at
-        # once (~K× faster than K sequential single-step recurrent
-        # calls), then a SINGLE rms_norm_gated_silu over K*48 rows.
+        # 6) Per-token conv1d_update (state evolves), then a native
+        # chunked Gated DeltaNet scan processing all K tokens at once,
+        # then a SINGLE rms_norm_gated_silu over K*48 rows.
         # This replaces the K-iter inner loop that was the dominant
         # cost at S=K (~3.9 ms/row × K compute, see profile probe).
         lin_rank = self._linear_layer_rank(L)
@@ -4385,38 +4321,56 @@ class Qwen36TorchFrontendRtx:
                 1, 10240, 4, True, s,
             )
 
-        # 6b) Split K-token conv output into Q (K, 16, 128), K (same),
-        # V (K, 48, 128). Layout in conv_out: [Q_dim=2048, K_dim=2048,
-        # V_dim=6144] per row.
+        # 6b) Native chunked Gated DeltaNet scan. Prefer the direct-conv
+        # kernel so Q/K/V split, head broadcast, gating, L2 norm, scan,
+        # and state update stay in FlashRT kernels.
         conv_K = self._K_lin_conv_out[:K]  # (K, 10240)
-        if (
-            hasattr(fvk, 'qwen36_lin_split_qkv_gqa_bf16')
-            and os.environ.get('FVK_QWEN36_LIN_SPLIT_GQA', '1') == '1'
-        ):
-            q16_K = self._K_lin_q16[:K]
-            k16_K = self._K_lin_k16[:K]
-            v48_K = self._K_lin_v48[:K]
-            fvk.qwen36_lin_split_qkv_gqa_bf16(
-                conv_K.data_ptr(), q16_K.data_ptr(), k16_K.data_ptr(),
-                v48_K.data_ptr(), K, s,
-            )
-            q_K_heads = q16_K.view(1, K, 16, 128)
-            k_K_heads = k16_K.view(1, K, 16, 128)
-            v_K_heads = v48_K.view(1, K, 48, 128)
+        rec_state_view = self._lin_state[lin_rank]  # (1, 48, 128, 128)
+        attn_out_K_buf = self._K_lin_attn_out[:K]
+        use_direct_gdn = (
+            hasattr(fvk, 'qwen36_gdn_chunk_from_conv_smem_bf16')
+            and hasattr(fvk, 'qwen36_gdn_chunk_from_conv_smem_strided_bf16')
+            and os.environ.get('FVK_QWEN36_GDN_DIRECT_CONV', '1') == '1'
+        )
+        if use_direct_gdn:
+            a_stride = a_vec_K.stride(0)
+            b_stride = b_vec_K.stride(0)
+            if (
+                (a_stride != 48 or b_stride != 48)
+                and hasattr(fvk, 'qwen36_gdn_chunk_from_conv_smem_strided_bf16')
+            ):
+                fvk.qwen36_gdn_chunk_from_conv_smem_strided_bf16(
+                    conv_K.data_ptr(),
+                    a_vec_K.data_ptr(), b_vec_K.data_ptr(),
+                    lw['neg_A_log_exp_fp32_t'].data_ptr(),
+                    lw['dt_bias_fp32_t'].data_ptr(),
+                    rec_state_view.data_ptr(),
+                    attn_out_K_buf.data_ptr(),
+                    K, 48, a_stride, b_stride, True, s,
+                )
+            else:
+                fvk.qwen36_gdn_chunk_from_conv_smem_bf16(
+                    conv_K.data_ptr(),
+                    a_vec_K.data_ptr(), b_vec_K.data_ptr(),
+                    lw['neg_A_log_exp_fp32_t'].data_ptr(),
+                    lw['dt_bias_fp32_t'].data_ptr(),
+                    rec_state_view.data_ptr(),
+                    attn_out_K_buf.data_ptr(),
+                    K, 48, True, s,
+                )
+            attn_out_K = attn_out_K_buf.view(1, K, 48, 128)
         else:
-            q_K_heads = conv_K[:, :2048].contiguous().view(1, K, 16, 128)
-            k_K_heads = conv_K[:, 2048:4096].contiguous().view(
-                1, K, 16, 128)
-            v_K_heads = conv_K[:, 4096:10240].contiguous().view(
-                1, K, 48, 128)
+            q_K_48 = self._K_lin_q48[:K]
+            k_K_48 = self._K_lin_k48[:K]
+            v_K_3d = self._K_lin_v48[:K]
+            fvk.qwen36_lin_split_qkv_broadcast_bf16(
+                conv_K.data_ptr(), q_K_48.data_ptr(),
+                k_K_48.data_ptr(), v_K_3d.data_ptr(), K, s,
+            )
 
-        # 6c) Compute g, beta for all K tokens at once (M=K vector ops).
-        beta_K = self._K_lin_beta[:K]
-        g_bf_K = self._K_lin_g_bf[:K]
-        if (
-            hasattr(fvk, 'qwen36_gdn_gating_strided_bf16')
-            and os.environ.get('FVK_QWEN36_GDN_FUSED_GATING', '1') == '1'
-        ):
+            # 6c) Compute g, beta for all K tokens (M=K vector ops).
+            beta_K = self._K_lin_beta[:K]
+            g_bf_K = self._K_lin_g_bf[:K]
             fvk.qwen36_gdn_gating_strided_bf16(
                 a_vec_K.data_ptr(), b_vec_K.data_ptr(),
                 lw['neg_A_log_exp_fp32_t'].data_ptr(),
@@ -4424,39 +4378,20 @@ class Qwen36TorchFrontendRtx:
                 g_bf_K.data_ptr(), beta_K.data_ptr(),
                 K, 48, a_vec_K.stride(0), b_vec_K.stride(0), s,
             )
-        else:
-            torch.sigmoid(b_vec_K, out=beta_K)
-            a_f32_K = self._K_lin_a_f32[:K]
-            a_f32_K.copy_(a_vec_K)
-            a_f32_K.add_(lw['dt_bias_fp32_t'])
-            sp_K = self._K_lin_sp_buf[:K]
-            torch.exp(a_f32_K, out=sp_K)
-            torch.log1p(sp_K, out=sp_K)
-            g_f32_K = self._K_lin_g_f32[:K]
-            torch.mul(lw['neg_A_log_exp_fp32_t'], sp_K, out=g_f32_K)
-            g_bf_K.copy_(g_f32_K)
-
-        # 6d) FLA chunked recurrent — one call processes all K tokens
-        # natively, with internal L2-norm on q/k. GVA (16 K-heads,
-        # 48 V-heads) handled by the kernel without needing the
-        # 16->48 explicit broadcast.
-        chunk_gated_delta_rule = _load_qwen36_fla_chunk()
-        rec_state_view = self._lin_state[lin_rank]  # (1, 48, 128, 128)
-        beta_FLA = beta_K.view(1, K, 48)
-        g_FLA = g_bf_K.view(1, K, 48)
-        attn_out_K, new_state = chunk_gated_delta_rule(
-            q_K_heads, k_K_heads, v_K_heads,
-            g_FLA, beta_FLA,
-            initial_state=rec_state_view,
-            output_final_state=True,
-            use_qk_l2norm_in_kernel=True,
-            q_l2_out=self._K_fla_q16_l2[:, :K],
-            k_l2_out=self._K_fla_k16_l2[:, :K],
-            g_cumsum_out=self._K_fla_g_cumsum[:, :K],
-            o_out=self._K_lin_attn_out[:K].view(1, K, 48, 128),
-        )
-        # attn_out_K: (1, K, 48, 128); new_state: (1, 48, 128, 128).
-        rec_state_view.copy_(new_state)
+            gdn_chunk = fvk.gated_deltanet_chunk_qwen36_bf16
+            if (
+                os.environ.get('FVK_QWEN36_CHUNK_GDN_SMEM', '1') == '1'
+                and hasattr(fvk, 'gated_deltanet_chunk_smem_qwen36_bf16')
+            ):
+                gdn_chunk = fvk.gated_deltanet_chunk_smem_qwen36_bf16
+            gdn_chunk(
+                q_K_48.data_ptr(), k_K_48.data_ptr(),
+                v_K_3d.data_ptr(), g_bf_K.data_ptr(),
+                beta_K.data_ptr(), rec_state_view.data_ptr(),
+                attn_out_K_buf.data_ptr(),
+                K, 48, 128, 128, True, s,
+            )
+            attn_out_K = attn_out_K_buf.view(1, K, 48, 128)
 
         # 6e) rms_norm_gated_silu over (K*48, 128) rows in one call.
         attn_out_flat = attn_out_K.view(K * 48, 128)
@@ -4483,12 +4418,12 @@ class Qwen36TorchFrontendRtx:
             scale_6144.data_ptr(), int(lw['out_proj_s']),
             s,
         )
-
-        # 8) residual: h_post = h_in_K + attn_proj.
         attn_proj = out_op_buf[:K].view(1, K, 5120)
-        res_mid_K = self._K_res_mid[:, :K]
-        torch.add(h_in_K, attn_proj, out=res_mid_K)
-        h_post = res_mid_K
+        fvk.add_bf16_out(
+            h_in_K.data_ptr(), attn_proj.data_ptr(),
+            self._K_res_mid[:, :K].data_ptr(), K * 5120, s,
+        )
+        h_post = self._K_res_mid[:, :K]
 
         # 9) post-attn layernorm + MLP swiglu + residual (M=K).
         h_post_view = h_post.view(K, 5120)
@@ -4545,7 +4480,10 @@ class Qwen36TorchFrontendRtx:
         h_out = (self._K_layer_out_a if (L % 2 == 0)
                  else self._K_layer_out_b)
         h_out_K = h_out[:, :K]
-        torch.add(h_post, mlp_out, out=h_out_K)
+        fvk.add_bf16_out(
+            h_post.data_ptr(), mlp_out.data_ptr(),
+            h_out_K.data_ptr(), K * 5120, s,
+        )
         return h_out_K
 
     def _layer_forward_full(self, L: int, h_in, cos, sin, cur_pos: int):
@@ -4577,7 +4515,7 @@ class Qwen36TorchFrontendRtx:
             f'{lw["type"]!r}'
         )
 
-        h2 = h_in.view(1, 5120).contiguous()
+        h2 = h_in.view(1, 5120)
         eps = float(self._pipeline.hf.config.rms_norm_eps)
         full_rank = self._full_layer_rank(L)
 
@@ -4607,12 +4545,12 @@ class Qwen36TorchFrontendRtx:
             s,
         )
 
-        # 4) Split q_proj into Q + output_gate per HF:
-        #     q_proj.view(B, S, num_q_heads, head_dim*2).chunk(2, dim=-1)
-        q_full = q_proj_out_buf[:1].view(1, 1, 24, 512)
-        q_pre, gate = torch.chunk(q_full, 2, dim=-1)
-        # q_pre: (1, 1, 24, 256); gate: (1, 1, 24, 256)
-        gate_flat = gate.reshape(1, 1, 24 * 256)         # (1, 1, 6144)
+        # 4) Split q_proj into Q + output_gate with a fixed kernel.
+        q_pre_2d = self._full_q_rot.view(24, 256)
+        gate_flat = self._full_gate_sig.view(1, 1, 24 * 256)
+        fvk.qwen36_split_q_gate_bf16(
+            q_proj_out_buf[:1].data_ptr(), q_pre_2d.data_ptr(),
+            gate_flat.data_ptr(), 1, s)
 
         # 5) k_proj -> (1, 1024). Same K=5120 quant, distinct N=1024.
         kv_proj_out_buf = self._fp8_scratch[(1024, 5120)][2]
@@ -4623,10 +4561,9 @@ class Qwen36TorchFrontendRtx:
             scale_5120.data_ptr(), int(lw['k_proj_s']),
             s,
         )
-        k_pre = kv_proj_out_buf[:1].view(1, 1, 4, 256).contiguous()
+        k_pre = kv_proj_out_buf[:1].view(1, 1, 4, 256)
 
         # 6) q_norm / k_norm: head_dim RMSNorm (1+w precomputed).
-        q_pre_2d = q_pre.contiguous().view(24, 256)
         fvk.rms_norm(
             q_pre_2d.data_ptr(), int(lw['q_norm_eff_w']),
             self._full_q_norm_out.data_ptr(),
@@ -4639,45 +4576,15 @@ class Qwen36TorchFrontendRtx:
             4, 256, eps, s,
         )
 
-        # 7) RoPE inline on (B=1, S=1, H, D), partial_rotary_factor=0.25.
-        # cos/sin shape (1, 1, 64); unsqueeze_dim=2 -> (1, 1, 1, 64) broadcasts.
-        # rotated[i] = q[i]*cos[i] + rotate_half(q[i])*sin[i] for i in [0,64)
-        # passthrough = q[..., 64:] unchanged.
-        # rotate_half via torch.index_select(idx=[32..63, 0..31], out=tmp)
-        # then negate tmp[..., :32] in-place.
-        q_for_rope = self._full_q_norm_out.view(1, 1, 24, 256)
-        k_for_rope = self._full_k_norm_out.view(1, 1, 4, 256)
-        cos4 = cos.view(1, 1, 1, 64)
-        sin4 = sin.view(1, 1, 1, 64)
-
-        def _rope_inline(x_in, x_out, tmp):
-            # passthrough cols 64..256
-            x_out[..., 64:].copy_(x_in[..., 64:])
-            # tmp = rotate_half(x_in[..., :64])
-            torch.index_select(
-                x_in[..., :64], -1, self._rope_rotate_idx, out=tmp,
-            )
-            tmp[..., :32].neg_()
-            # Compute into the contiguous tmp buf, then copy to x_out's
-            # strided last-dim slice. Avoids the non-contiguous addcmul_
-            # path which appears to be lossy on prompt 2.
-            tmp.mul_(sin4)
-            tmp.addcmul_(x_in[..., :64], cos4)
-            x_out[..., :64].copy_(tmp)
-
-        _rope_inline(q_for_rope, self._full_q_rot, self._full_rope_tmp_q)
-        _rope_inline(k_for_rope, self._full_k_rot, self._full_rope_tmp_k)
-        q_rot = self._full_q_rot
-        k_rot = self._full_k_rot
-
-        # 8) Stage Q in backend Q_buf and write new K/V into KV cache.
-        # Backend Q_buf shape: (1, max_q_seq=1, 24, 256). q_rot already
-        # matches.
-        self._attn.Q_buf[:, :1].copy_(q_rot)
-
-        # KV cache shape (NUM_FULL=16, max_seq, 4, 256). Write row cur_pos.
-        self._attn.K_cache[full_rank, cur_pos:cur_pos + 1].copy_(
-            k_rot.view(1, 4, 256)
+        # 7) Partial RoPE, staging Q and K directly to their hot buffers.
+        q_dst = self._attn.Q_buf[:, :1]
+        k_dst = self._attn.K_cache[full_rank, cur_pos:cur_pos + 1]
+        fvk.qwen36_partial_rope_qk_bf16(
+            self._full_q_norm_out.data_ptr(),
+            self._full_k_norm_out.data_ptr(),
+            cos.data_ptr(), sin.data_ptr(),
+            q_dst.data_ptr(), k_dst.data_ptr(),
+            1, 24, 4, 256, 64, s,
         )
 
         # v_proj -> (1, 1024). Reuse same kv_proj_out_buf scratch (k is
@@ -4690,7 +4597,11 @@ class Qwen36TorchFrontendRtx:
             s,
         )
         v_new = kv_proj_out_buf[:1].view(1, 4, 256)
-        self._attn.V_cache[full_rank, cur_pos:cur_pos + 1].copy_(v_new)
+        fvk.gpu_copy(
+            self._attn.V_cache[
+                full_rank, cur_pos:cur_pos + 1].data_ptr(),
+            v_new.data_ptr(), 4 * 256 * 2, s,
+        )
 
         # 9) Run attention: q_seq=1, kv_seq=cur_pos+1.
         kv_seq = cur_pos + 1
@@ -4703,13 +4614,15 @@ class Qwen36TorchFrontendRtx:
 
         # 10) Apply output gate: attn * sigmoid(gate). In-place.
         attn_flat = attn_out.reshape(1, 1, 24 * 256)
-        torch.sigmoid(gate_flat, out=self._full_gate_sig)
-        torch.mul(attn_flat, self._full_gate_sig, out=self._full_gated)
+        fvk.sigmoid_mul_qwen36_bf16(
+            gate_flat.data_ptr(), attn_flat.data_ptr(),
+            self._full_gated.data_ptr(), 24 * 256, s,
+        )
         gated = self._full_gated
 
         # 11) o_proj FP8 GEMM: K=6144 -> N=5120.
         qinp_6144, scale_6144, _ = self._fp8_scratch[(5120, 6144)]
-        gated_2d = gated.view(1, 6144).contiguous()
+        gated_2d = gated.view(1, 6144)
         fvk.fp8_per_token_block128_quant_bf16(
             gated_2d.data_ptr(), qinp_6144.data_ptr(),
             scale_6144.data_ptr(), 1, 6144, s,
@@ -4725,7 +4638,10 @@ class Qwen36TorchFrontendRtx:
 
         # 12) Residual: h_post = h_in + o_proj_out (in-place).
         attn_proj = out_op_buf[:1].view(1, 1, 5120)
-        torch.add(h_in, attn_proj, out=self._res_mid)
+        fvk.add_bf16_out(
+            h_in.data_ptr(), attn_proj.data_ptr(),
+            self._res_mid.data_ptr(), 5120, s,
+        )
         h_post = self._res_mid
 
         # 13) post-attn layernorm + MLP swiglu + residual.
@@ -4760,7 +4676,11 @@ class Qwen36TorchFrontendRtx:
 
         gate_v = gate_out_buf[:1].view(1, 17408)
         up_v = up_out_buf[:1].view(1, 17408)
-        gate_silu_up = torch.nn.functional.silu(gate_v) * up_v
+        fvk.silu_mul_qwen36_bf16(
+            gate_v.data_ptr(), up_v.data_ptr(),
+            self._mlp_silu_mul_out.data_ptr(), 17408, s,
+        )
+        gate_silu_up = self._mlp_silu_mul_out
 
         qinp_17408, scale_17408, _ = self._fp8_scratch[(5120, 17408)]
         fvk.fp8_per_token_block128_quant_bf16(
@@ -4779,7 +4699,10 @@ class Qwen36TorchFrontendRtx:
 
         # final residual: write to ping-pong layer-output buf.
         h_out = self._layer_out_a if (L % 2 == 0) else self._layer_out_b
-        torch.add(h_post, mlp_out, out=h_out)
+        fvk.add_bf16_out(
+            h_post.data_ptr(), mlp_out.data_ptr(),
+            h_out.data_ptr(), 5120, s,
+        )
         return h_out
 
     # ---------- Phase 6 D4: S=K full-attn layer ----------
@@ -4871,34 +4794,16 @@ class Qwen36TorchFrontendRtx:
             K * 4, 256, eps, s,
         )
 
-        # 6) RoPE inline over K positions. cos_K, sin_K shape (1, K, 64).
-        q_for_rope = q_norm_out.view(1, K, 24, 256)
-        k_for_rope = k_norm_out.view(1, K, 4, 256)
-        cos4 = cos_K.view(1, K, 1, 64)
-        sin4 = sin_K.view(1, K, 1, 64)
-        q_rot_K = self._K_full_q_rot[:, :K]
-        k_rot_K = self._K_full_k_rot[:, :K]
-        tmp_q = self._K_full_rope_tmp_q[:, :K]
-        tmp_k = self._K_full_rope_tmp_k[:, :K]
-
-        def _rope_inline_K(x_in, x_out, tmp):
-            x_out[..., 64:].copy_(x_in[..., 64:])
-            torch.index_select(
-                x_in[..., :64], -1, self._rope_rotate_idx, out=tmp,
-            )
-            tmp[..., :32].neg_()
-            tmp.mul_(sin4)
-            tmp.addcmul_(x_in[..., :64], cos4)
-            x_out[..., :64].copy_(tmp)
-
-        _rope_inline_K(q_for_rope, q_rot_K, tmp_q)
-        _rope_inline_K(k_for_rope, k_rot_K, tmp_k)
-
-        # 7) Stage Q in backend Q_buf [:, :K]; write K rows of K/V into
-        # KV cache at rows [cur_pos, cur_pos+K).
-        self._attn.Q_buf[:, :K].copy_(q_rot_K)
-        self._attn.K_cache[full_rank, cur_pos:cur_pos + K].copy_(
-            k_rot_K.view(K, 4, 256))
+        # 6) Partial RoPE over K positions. Q is staged directly for
+        # FA2 and K writes directly to the cache.
+        q_rot_K = self._attn.Q_buf[:, :K]
+        k_rot_K = self._attn.K_cache[full_rank, cur_pos:cur_pos + K]
+        fvk.qwen36_partial_rope_qk_bf16(
+            q_norm_out.data_ptr(), k_norm_out.data_ptr(),
+            cos_K.view(K, 64).data_ptr(), sin_K.view(K, 64).data_ptr(),
+            q_rot_K.data_ptr(), k_rot_K.data_ptr(),
+            K, 24, 4, 256, 64, s,
+        )
 
         # v_proj — M=K (overwrite kv_proj_out_buf, K already committed).
         fvk.fp8_block128_gemm_cutlass_sm120_bf16out(
@@ -4909,7 +4814,11 @@ class Qwen36TorchFrontendRtx:
             s,
         )
         v_new_K = kv_proj_out_buf[:K].view(K, 4, 256)
-        self._attn.V_cache[full_rank, cur_pos:cur_pos + K].copy_(v_new_K)
+        fvk.gpu_copy(
+            self._attn.V_cache[
+                full_rank, cur_pos:cur_pos + K].data_ptr(),
+            v_new_K.data_ptr(), K * 4 * 256 * 2, s,
+        )
 
         # 8) FA2. Prefer one causal q_seq=K call when available. The
         # fallback keeps the historical K serial q_seq=1 calls, binding
@@ -4982,14 +4891,15 @@ class Qwen36TorchFrontendRtx:
 
         # 9) output gate: attn * sigmoid(gate). K rows.
         attn_flat = attn_out.reshape(1, K, 24 * 256)
-        gate_sig = self._K_full_gate_sig[:, :K]
         gated = self._K_full_gated[:, :K]
-        torch.sigmoid(gate_flat, out=gate_sig)
-        torch.mul(attn_flat, gate_sig, out=gated)
+        fvk.sigmoid_mul_qwen36_bf16(
+            gate_flat.data_ptr(), attn_flat.data_ptr(),
+            gated.data_ptr(), K * 24 * 256, s,
+        )
 
         # 10) o_proj — M=K, N=5120, K_in=6144.
         qinp_6144, scale_6144, _ = self._fp8_scratch[(5120, 6144)]
-        gated_2d = gated.view(K, 6144).contiguous()
+        gated_2d = gated.view(K, 6144)
         fvk.fp8_per_token_block128_quant_bf16(
             gated_2d.data_ptr(), qinp_6144.data_ptr(),
             scale_6144.data_ptr(), K, 6144, s,
@@ -5006,7 +4916,10 @@ class Qwen36TorchFrontendRtx:
         # 11) residual: h_post = h_in_K + o_proj_out (K rows).
         attn_proj = out_op_buf[:K].view(1, K, 5120)
         res_mid_K = self._K_res_mid[:, :K]
-        torch.add(h_in_K, attn_proj, out=res_mid_K)
+        fvk.add_bf16_out(
+            h_in_K.data_ptr(), attn_proj.data_ptr(),
+            res_mid_K.data_ptr(), K * 5120, s,
+        )
         h_post = res_mid_K
 
         # 12) post-attn layernorm + MLP swiglu + residual.
@@ -5064,7 +4977,10 @@ class Qwen36TorchFrontendRtx:
         h_out = (self._K_layer_out_a if (L % 2 == 0)
                  else self._K_layer_out_b)
         h_out_K = h_out[:, :K]
-        torch.add(h_post, mlp_out, out=h_out_K)
+        fvk.add_bf16_out(
+            h_post.data_ptr(), mlp_out.data_ptr(),
+            h_out_K.data_ptr(), K * 5120, s,
+        )
         return h_out_K
 
     # ---------- Phase 6 D4: S=K full forward ----------
@@ -5098,12 +5014,14 @@ class Qwen36TorchFrontendRtx:
         types = self._pipeline.hf.config.layer_types
         eps = float(self._pipeline.hf.config.rms_norm_eps)
 
-        # 0) Embed K tokens.
-        h = self._pipeline.hf.model.embed_tokens(token_ids_K)
-        # h shape (1, K, 5120)
-        h = h.contiguous()
-        if h.dtype != bf16:
-            h = h.to(bf16)
+        # 0) Embed K tokens through a fixed FlashRT kernel.
+        fvk.qwen36_embedding_lookup_bf16(
+            token_ids_K.view(-1).data_ptr(),
+            int(self._weights.ptrs['embed_w']),
+            self._K_embed_buf.data_ptr(),
+            K, 5120, s,
+        )
+        h = self._K_embed_buf[:, :K]
 
         # 1) 64 decoder layers.
         for L in range(self._pipeline.DIMS.num_layers):
@@ -5121,7 +5039,7 @@ class Qwen36TorchFrontendRtx:
         self._K_last_hidden_buf[:, :K].copy_(h)
 
         # 3) Final RMSNorm M=K.
-        h2 = h.view(K, 5120).contiguous()
+        h2 = h.view(K, 5120)
         x_norm = self._h_b[:K].view(K, 5120)
         fvk.rms_norm(
             h2.data_ptr(), int(self._weights.ptrs['final_norm_eff_w']),
@@ -5171,21 +5089,20 @@ class Qwen36TorchFrontendRtx:
         types = self._pipeline.hf.config.layer_types
         eps = float(self._pipeline.hf.config.rms_norm_eps)
 
-        # 0) Embed: gather embed_tokens row for the input token.
-        #    embed_tokens.weight shape (vocab=248320, hidden=5120) bf16.
-        #    For decode S=1 just index a single row -- use HF's
-        #    embed_tokens module so the implementation matches its
-        #    nn.Embedding semantics (handles vocab size, padding_idx).
+        # 0) Embed: gather embed_tokens row through a fixed kernel.
         if not isinstance(token_id, torch.Tensor):
             token_id = torch.tensor(
                 [token_id], device=self.device, dtype=torch.long,
             )
         if token_id.ndim == 1:
             token_id = token_id.view(1, 1)
-        h = self._pipeline.hf.model.embed_tokens(token_id)  # (1, 1, 5120)
-        h = h.contiguous()
-        if h.dtype != bf16:
-            h = h.to(bf16)
+        fvk.qwen36_embedding_lookup_bf16(
+            token_id.view(-1).data_ptr(),
+            int(self._weights.ptrs['embed_w']),
+            self._embed_buf.data_ptr(),
+            1, 5120, s,
+        )
+        h = self._embed_buf
 
         # 1) 64 decoder layers.
         for L in range(self._pipeline.DIMS.num_layers):
@@ -5202,7 +5119,7 @@ class Qwen36TorchFrontendRtx:
         # (forward_mtp_head) can consume it. _last_hidden_buf has a
         # fixed pointer; the .copy_ is just a memcpy of (1,1,5120) bf16.
         self._last_hidden_buf.copy_(h)
-        h2 = h.view(1, 5120).contiguous()
+        h2 = h.view(1, 5120)
         x_norm = self._h_b[:1].view(1, 5120)
         fvk.rms_norm(
             h2.data_ptr(), int(self._weights.ptrs['final_norm_eff_w']),
@@ -5259,12 +5176,16 @@ class Qwen36TorchFrontendRtx:
         eps = float(self._pipeline.hf.config.rms_norm_eps)
         vocab = self._pipeline.DIMS.vocab_size
 
-        # 0) Embed prev_token (use HF embed for consistency w/ main path).
+        # 0) Embed prev_token through a fixed FlashRT kernel.
         if prev_token_id.ndim == 1:
             prev_token_id = prev_token_id.view(1, 1)
-        e = self._pipeline.hf.model.embed_tokens(prev_token_id)
-        if e.dtype != torch.bfloat16:
-            e = e.to(torch.bfloat16)
+        fvk.qwen36_embedding_lookup_bf16(
+            prev_token_id.view(-1).data_ptr(),
+            int(self._weights.ptrs['embed_w']),
+            self._mtp_embed_buf.data_ptr(),
+            1, 5120, s,
+        )
+        e = self._mtp_embed_buf
 
         # 1) pre-fc norms on (h, e) -> bf16 (1, 5120) each.
         prev_h_2d = prev_h.view(1, 5120)
@@ -5286,8 +5207,10 @@ class Qwen36TorchFrontendRtx:
         # Order: embedding FIRST, then hidden (matches DeepSeek-V3 MTP
         # reference: torch.cat([normed_emb, normed_hidden], dim=-1)).
         cat_buf = self._mtp_cat_buf.view(1, 10240)
-        cat_buf[:, :5120].copy_(e_norm)
-        cat_buf[:, 5120:].copy_(h_norm)
+        fvk.concat2_bf16(
+            e_norm.data_ptr(), h_norm.data_ptr(),
+            cat_buf.data_ptr(), 1, 5120, 5120, s,
+        )
 
         # 3) fc: BF16 matvec, M=1, K=10240 (= 40*256), N=5120.
         # K%256 == 0 -> bf16_matvec_qwen36 fast path.
@@ -5344,10 +5267,9 @@ class Qwen36TorchFrontendRtx:
             scale_5120.data_ptr(), int(mtp['k_proj_s']),
             s,
         )
-        k_pre = kv_proj_out_buf[:1].view(1, 1, 4, 256).contiguous()
+        k_pre = kv_proj_out_buf[:1].view(1, 1, 4, 256)
 
         # 4e) q_norm / k_norm.
-        q_pre_2d = q_pre.contiguous().view(24, 256)
         fvk.rms_norm(
             q_pre_2d.data_ptr(), int(mtp['q_norm_eff_w']),
             self._full_q_norm_out.data_ptr(),
@@ -5360,31 +5282,15 @@ class Qwen36TorchFrontendRtx:
             4, 256, eps, s,
         )
 
-        # 4f) RoPE inline (partial_rotary_factor=0.25 -> rope_dim=64).
-        q_for_rope = self._full_q_norm_out.view(1, 1, 24, 256)
-        k_for_rope = self._full_k_norm_out.view(1, 1, 4, 256)
-        cos4 = cos.view(1, 1, 1, 64)
-        sin4 = sin.view(1, 1, 1, 64)
-
-        def _rope_inline(x_in, x_out, tmp):
-            x_out[..., 64:].copy_(x_in[..., 64:])
-            torch.index_select(
-                x_in[..., :64], -1, self._rope_rotate_idx, out=tmp,
-            )
-            tmp[..., :32].neg_()
-            tmp.mul_(sin4)
-            tmp.addcmul_(x_in[..., :64], cos4)
-            x_out[..., :64].copy_(tmp)
-
-        _rope_inline(q_for_rope, self._full_q_rot, self._full_rope_tmp_q)
-        _rope_inline(k_for_rope, self._full_k_rot, self._full_rope_tmp_k)
-        q_rot = self._full_q_rot
-        k_rot = self._full_k_rot
-
-        # 4g) Stage Q in MTP Q_buf, write K/V into MTP cache row cur_pos.
-        self._mtp_Q_buf[:, :1].copy_(q_rot)
-        self._mtp_K_cache[cur_pos:cur_pos + 1].copy_(
-            k_rot.view(1, 4, 256))
+        # 4f) Partial RoPE, staging Q and K directly to MTP buffers.
+        fvk.qwen36_partial_rope_qk_bf16(
+            self._full_q_norm_out.data_ptr(),
+            self._full_k_norm_out.data_ptr(),
+            cos.data_ptr(), sin.data_ptr(),
+            self._mtp_Q_buf[:, :1].data_ptr(),
+            self._mtp_K_cache[cur_pos:cur_pos + 1].data_ptr(),
+            1, 24, 4, 256, 64, s,
+        )
 
         # v_proj (overwrite kv_proj_out_buf, K already committed).
         fvk.fp8_block128_gemm_cutlass_sm120_bf16out(
@@ -5395,7 +5301,10 @@ class Qwen36TorchFrontendRtx:
             s,
         )
         v_new = kv_proj_out_buf[:1].view(1, 4, 256)
-        self._mtp_V_cache[cur_pos:cur_pos + 1].copy_(v_new)
+        fvk.gpu_copy(
+            self._mtp_V_cache[cur_pos:cur_pos + 1].data_ptr(),
+            v_new.data_ptr(), 4 * 256 * 2, s,
+        )
 
         # 4h) FA2 — call directly with MTP buffers (q_seq=1,
         # kv_seq=cur_pos+1).
@@ -5431,13 +5340,15 @@ class Qwen36TorchFrontendRtx:
 
         # 4i) output gate: attn * sigmoid(gate).
         attn_flat = attn_out.reshape(1, 1, 24 * 256)
-        torch.sigmoid(gate_flat, out=self._full_gate_sig)
-        torch.mul(attn_flat, self._full_gate_sig, out=self._full_gated)
+        fvk.sigmoid_mul_qwen36_bf16(
+            gate_flat.data_ptr(), attn_flat.data_ptr(),
+            self._full_gated.data_ptr(), 24 * 256, s,
+        )
         gated = self._full_gated
 
         # 4j) o_proj FP8 GEMM: K=6144 -> N=5120.
         qinp_6144, scale_6144, _ = self._fp8_scratch[(5120, 6144)]
-        gated_2d = gated.view(1, 6144).contiguous()
+        gated_2d = gated.view(1, 6144)
         fvk.fp8_per_token_block128_quant_bf16(
             gated_2d.data_ptr(), qinp_6144.data_ptr(),
             scale_6144.data_ptr(), 1, 6144, s,
@@ -5453,7 +5364,10 @@ class Qwen36TorchFrontendRtx:
 
         # 4k) residual: h_post = h_in + o_proj_out.
         attn_proj = out_op_buf[:1].view(1, 1, 5120)
-        torch.add(h_in_full, attn_proj, out=self._res_mid)
+        fvk.add_bf16_out(
+            h_in_full.data_ptr(), attn_proj.data_ptr(),
+            self._res_mid.data_ptr(), 5120, s,
+        )
         h_post = self._res_mid
 
         # 4l) post-attn norm + MLP swiglu + residual.
@@ -5508,7 +5422,10 @@ class Qwen36TorchFrontendRtx:
 
         # 4m) final residual into MTP layer-out buf.
         next_h = self._mtp_layer_out_buf
-        torch.add(h_post, mlp_out, out=next_h)
+        fvk.add_bf16_out(
+            h_post.data_ptr(), mlp_out.data_ptr(),
+            next_h.data_ptr(), 5120, s,
+        )
 
         # 5) MTP final norm + lm_head.
         next_h_view = next_h.view(1, 5120)
@@ -5900,10 +5817,9 @@ class Qwen36TorchFrontendRtx:
                      use_graph: bool = True):
         """Greedy decode using our own forward for every step after prefill.
 
-        Prefill stays on HF (chunk_gated_delta_rule for linear-attn,
-        FA2 for full-attn -- these paths haven't been ported yet and
-        are one-shot anyway). After prefill we ingest the cache state
-        once and then loop through forward_own_decode.
+        Prefill is handled by the frontend's native FlashRT kernels.
+        After prefill we ingest the cache state once and then loop
+        through forward_own_decode.
 
         When ``use_graph`` is True (default), each decode step replays
         a per-cur_pos captured CUDA Graph that wraps the entire 64-
@@ -9007,7 +8923,7 @@ class Qwen36TorchFrontendRtx:
         lw = self._weights.ptrs['layers'][L]
         assert lw['type'] == 'full_attention'
 
-        h2 = h_in.view(1, 5120).contiguous()
+        h2 = h_in.view(1, 5120)
         eps = float(self._cfg['rms_norm_eps'])
         full_rank = self._full_layer_rank(L)
 
@@ -9033,9 +8949,11 @@ class Qwen36TorchFrontendRtx:
             float(lw['q_proj_alpha']),
             s,
         )
-        q_full = q_proj_out_buf[:1].view(1, 1, 24, 512)
-        q_pre, gate = torch.chunk(q_full, 2, dim=-1)
-        gate_flat = gate.reshape(1, 1, 24 * 256)
+        q_pre_2d = self._full_q_rot.view(24, 256)
+        gate_flat = self._full_gate_sig.view(1, 1, 24 * 256)
+        fvk.qwen36_split_q_gate_bf16(
+            q_proj_out_buf[:1].data_ptr(), q_pre_2d.data_ptr(),
+            gate_flat.data_ptr(), 1, s)
 
         # ---- 3) k_proj -> (1, 1024) ----
         kv_proj_out_buf = self._nvfp4_scratch[(1024, 5120)][2]
@@ -9047,7 +8965,7 @@ class Qwen36TorchFrontendRtx:
             float(lw['k_proj_alpha']),
             s,
         )
-        k_pre = kv_proj_out_buf[:1].view(1, 1, 4, 256).contiguous()
+        k_pre = kv_proj_out_buf[:1].view(1, 1, 4, 256)
 
         # ---- 4) q_norm / k_norm ----
         fvk.rms_norm(
@@ -9139,7 +9057,7 @@ class Qwen36TorchFrontendRtx:
         gated = self._full_gated
 
         ap_6144, sf_6144, _ = self._nvfp4_scratch[(5120, 6144)]
-        gated_2d = gated.view(1, 6144).contiguous()
+        gated_2d = gated.view(1, 6144)
         fvk.quantize_bf16_to_nvfp4_swizzled(
             gated_2d.data_ptr(), ap_6144.data_ptr(),
             sf_6144.data_ptr(), 1, 6144, s,
@@ -9265,7 +9183,7 @@ class Qwen36TorchFrontendRtx:
                 raise ValueError(f'unknown layer_type {t!r} at L={L}')
 
         self._last_hidden_buf.copy_(h)
-        h2 = h.view(1, hidden).contiguous()
+        h2 = h.view(1, hidden)
         x_norm = self._h_b[:1].view(1, hidden)
         fvk.rms_norm(
             h2.data_ptr(), int(self._weights.ptrs['final_norm_eff_w']),

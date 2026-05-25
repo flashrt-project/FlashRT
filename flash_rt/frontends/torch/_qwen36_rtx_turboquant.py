@@ -551,10 +551,9 @@ class TurboQuantKVCache:
         """Phase 3A B9-S10: capture-safe quantize+pack via 4 small CUDA
         kernels + 3 explicit GEMM wrappers by default.
 
-        The default kernel GEMM route uses cuBLASLt tactics (A=3, B=0,
-        C=3) validated against the torch reference on real 2048-token
-        long-prefill chunks.  Set FLASHRT_QWEN36_TQ_KERNEL_WRITE=0 to
-        force the older torch.matmul GEMM route for bisection.
+        The kernel GEMM route uses cuBLASLt tactics (A=3, B=0, C=3)
+        validated against the reference on real 2048-token long-prefill
+        chunks.
         """
         if not self.packed:
             raise RuntimeError(
@@ -594,11 +593,17 @@ class TurboQuantKVCache:
         cb_k = self.setup.codebooks[self.setup.b_k_mse]
         cb_v = self.setup.codebooks[self.setup.b_v]
         s = torch.cuda.current_stream().cuda_stream
+        if os.environ.get('FLASHRT_QWEN36_TQ_KERNEL_WRITE', '1') != '1':
+            raise ValueError(
+                'FLASHRT_QWEN36_TQ_KERNEL_WRITE=0 is no longer supported '
+                'on the kernel-only Qwen3.6 path')
         use_kernel_gemm = (
-            os.environ.get('FLASHRT_QWEN36_TQ_KERNEL_WRITE', '1') == '1'
-            and hasattr(fvk, 'tq_fp32_gemm_lt_bt_algo')
+            hasattr(fvk, 'tq_fp32_gemm_lt_bt_algo')
             and hasattr(fvk, 'tq_fp32_gemm_lt_algo')
         )
+        if not use_kernel_gemm:
+            raise RuntimeError(
+                'TurboQuant write requires FlashRT cuBLASLt GEMM wrappers')
 
         # Slice the scratch (views, no alloc).
         k_unit = self._w_kv_unit[:M]
@@ -621,15 +626,11 @@ class TurboQuantKVCache:
             M, self.setup.b_k_mse, self.setup.b_v, s,
         )
         # GEMM A: [k_unit; v_unit] @ rotation^T → [y_k; y_v]
-        if use_kernel_gemm:
-            fvk.tq_fp32_gemm_lt_bt_algo(
-                self._w_kv_unit[:2 * M].data_ptr(), rot_fp32.data_ptr(),
-                self._w_kv_rotated[:2 * M].data_ptr(),
-                2 * M, d, d, 3, s,
-            )
-        else:
-            torch.matmul(self._w_kv_unit[:2 * M], rot_fp32.T,
-                         out=self._w_kv_rotated[:2 * M])
+        fvk.tq_fp32_gemm_lt_bt_algo(
+            self._w_kv_unit[:2 * M].data_ptr(), rot_fp32.data_ptr(),
+            self._w_kv_rotated[:2 * M].data_ptr(),
+            2 * M, d, d, 3, s,
+        )
 
         # K2: argmin → idx, pack 4-bit to cache, gather cb_k[idx_k] for dq
         fvk.tq_write_k2_argmin_pack(
@@ -642,13 +643,10 @@ class TurboQuantKVCache:
             self.setup.b_k_mse, self.setup.b_v, s,
         )
         # GEMM B: cb_k[idx_k] @ rotation → dq_k
-        if use_kernel_gemm:
-            fvk.tq_fp32_gemm_lt_algo(
-                dq_in.data_ptr(), rot_fp32.data_ptr(), dq_out.data_ptr(),
-                M, d, d, 0, s,
-            )
-        else:
-            torch.matmul(dq_in, rot_fp32, out=dq_out)
+        fvk.tq_fp32_gemm_lt_algo(
+            dq_in.data_ptr(), rot_fp32.data_ptr(), dq_out.data_ptr(),
+            M, d, d, 0, s,
+        )
 
         # K3: residual = k_unit - dq_k ; rnorm_k = ‖residual‖
         fvk.tq_write_k3_residual_rnorm(
@@ -657,13 +655,10 @@ class TurboQuantKVCache:
             M, s,
         )
         # GEMM C: residual @ jl^T → Sr
-        if use_kernel_gemm:
-            fvk.tq_fp32_gemm_lt_bt_algo(
-                residual.data_ptr(), jl_fp32.data_ptr(), Sr.data_ptr(),
-                M, d, d, 3, s,
-            )
-        else:
-            torch.matmul(residual, jl_fp32.T, out=Sr)
+        fvk.tq_fp32_gemm_lt_bt_algo(
+            residual.data_ptr(), jl_fp32.data_ptr(), Sr.data_ptr(),
+            M, d, d, 3, s,
+        )
 
         # K4: pack qjl bits + write all norms (fp16) to cache slot
         fvk.tq_write_k4_qjl_norms(
