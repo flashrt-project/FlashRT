@@ -2158,7 +2158,7 @@ class Qwen36TorchFrontendRtx:
             and hasattr(fvk, 'linear_attn_gdn_wy_kkt_b64_bf16_cublaslt')
         )
         fast_chunk_mode = os.environ.get(
-            'FLASHRT_QWEN36_TQ_PREFILL_GDN_FAST_CHUNK', 'f32gemm')
+            'FLASHRT_QWEN36_TQ_PREFILL_GDN_FAST_CHUNK', 'bf16')
         use_wy_lt_chunk_h_f32gemm = (
             use_wy_lt_kkt
             and fast_chunk_mode not in ('0', 'false', 'off', 'bf16', 'direct')
