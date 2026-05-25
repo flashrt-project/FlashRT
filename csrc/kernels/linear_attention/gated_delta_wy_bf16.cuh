@@ -34,6 +34,23 @@ void gdn_wy_kkt_b64_bf16_cublaslt(
     int qk_group,
     cudaStream_t stream);
 
+// KKT variant that consumes a pre-packed key buffer:
+//   k_pack: (ceil(S / 64), num_k_heads, 64, head_dim)
+// This lets model-specific q/k normalization pack K once while k_l2 is still
+// hot, avoiding a separate pack_k_chunks_kernel launch and HBM pass.
+void gdn_wy_kkt_b64_bf16_cublaslt_packed_k(
+    const void* k_pack,
+    const void* beta,
+    const void* g_cumsum,
+    void*       kkt_base,
+    void*       A,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group,
+    cudaStream_t stream);
+
 // Same cublasLt K @ K^T path as gdn_wy_kkt_b64_bf16_cublaslt, but leaves the
 // cumulative gate out of A:
 //   A[i,j] = beta[i] * dot(k[i], k[j]), i > j

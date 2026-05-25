@@ -1672,6 +1672,49 @@ void gdn_wy_kkt_b64_bf16_cublaslt(
       S, num_k_heads, num_v_heads, qk_group);
 }
 
+void gdn_wy_kkt_b64_bf16_cublaslt_packed_k(
+    const void* k_pack,
+    const void* beta,
+    const void* g_cumsum,
+    void*       kkt_base,
+    void*       A,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group,
+    cudaStream_t stream)
+{
+  if (S <= 0 || num_k_heads <= 0 || num_v_heads <= 0 ||
+      head_dim <= 0 || qk_group <= 0) {
+    return;
+  }
+  const int chunks = (S + kChunk - 1) / kChunk;
+  const int batches = chunks * num_k_heads;
+
+  LtPlan& plan = get_kkt_plan(batches, head_dim);
+  const float alpha = 1.0f;
+  const float beta0 = 0.0f;
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmul(
+      g_lt, plan.desc, &alpha,
+      k_pack, plan.a_desc,
+      k_pack, plan.b_desc,
+      &beta0,
+      kkt_base, plan.c_desc,
+      kkt_base, plan.c_desc,
+      &plan.algo, g_workspace, g_workspace_size, stream));
+
+  apply_kkt_gating_kernel<<<
+      dim3((kChunk * kChunk + kThreads - 1) / kThreads,
+           num_v_heads, chunks),
+      kThreads, 0, stream>>>(
+      reinterpret_cast<const float*>(kkt_base),
+      reinterpret_cast<const __nv_bfloat16*>(beta),
+      reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
+      reinterpret_cast<float*>(A),
+      S, num_k_heads, num_v_heads, qk_group);
+}
+
 void gdn_wy_kkt_b64_bf16_cublaslt_nogate(
     const void* k_l2,
     const void* beta,

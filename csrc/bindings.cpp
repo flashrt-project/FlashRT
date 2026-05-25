@@ -4336,6 +4336,22 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("q_pack_hv"), py::arg("g_cumsum"),
         py::arg("S"), py::arg("stream") = 0);
 
+    m.def("qwen36_gdn_wy_norm_cumsum_pack_qk_bf16",
+        [](uintptr_t q16, uintptr_t k16, uintptr_t g,
+           uintptr_t q16_l2, uintptr_t k16_l2,
+           uintptr_t q_pack_hv, uintptr_t k_pack_hk,
+           uintptr_t g_cumsum, int S, uintptr_t stream) {
+            flash_rt::kernels::qwen36_gdn_wy_norm_cumsum_pack_qk_bf16(
+                to_ptr(q16), to_ptr(k16), to_ptr(g),
+                to_ptr(q16_l2), to_ptr(k16_l2),
+                to_ptr(q_pack_hv), to_ptr(k_pack_hk),
+                to_ptr(g_cumsum), S, to_stream(stream));
+        },
+        py::arg("q16"), py::arg("k16"), py::arg("g"),
+        py::arg("q16_l2"), py::arg("k16_l2"),
+        py::arg("q_pack_hv"), py::arg("k_pack_hk"),
+        py::arg("g_cumsum"), py::arg("S"), py::arg("stream") = 0);
+
     m.def("qwen36_gdn_wy_kkt_b64_bf16",
         [](uintptr_t k16_l2, uintptr_t beta, uintptr_t g_cumsum,
            uintptr_t A, int S, uintptr_t stream) {
@@ -4359,6 +4375,24 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         },
         py::arg("k_l2"), py::arg("beta"), py::arg("g_cumsum"),
         py::arg("k_pack"), py::arg("kkt_base"), py::arg("A"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"),
+        py::arg("stream") = 0);
+
+    m.def("linear_attn_gdn_wy_kkt_b64_bf16_cublaslt_packed_k",
+        [](uintptr_t k_pack, uintptr_t beta, uintptr_t g_cumsum,
+           uintptr_t kkt_base, uintptr_t A,
+           int S, int num_k_heads, int num_v_heads,
+           int head_dim, int qk_group, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_kkt_b64_bf16_cublaslt_packed_k(
+                    to_ptr(k_pack), to_ptr(beta), to_ptr(g_cumsum),
+                    to_ptr(kkt_base), to_ptr(A),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("k_pack"), py::arg("beta"), py::arg("g_cumsum"),
+        py::arg("kkt_base"), py::arg("A"),
         py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
         py::arg("head_dim"), py::arg("qk_group"),
         py::arg("stream") = 0);

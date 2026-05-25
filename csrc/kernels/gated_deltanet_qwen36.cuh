@@ -228,6 +228,18 @@ void qwen36_gdn_wy_norm_cumsum_pack_q_bf16(
     int S,
     cudaStream_t stream);
 
+void qwen36_gdn_wy_norm_cumsum_pack_qk_bf16(
+    const void* q16,
+    const void* k16,
+    const void* g,
+    void*       q16_l2,
+    void*       k16_l2,
+    void*       q_pack_hv,
+    void*       k_pack_hk,
+    void*       g_cumsum,
+    int S,
+    cudaStream_t stream);
+
 void qwen36_gdn_wy_kkt_b64_bf16(
     const void* k16_l2,
     const void* beta,

@@ -450,6 +450,62 @@ def test_linear_attn_gdn_wy_kkt_cublaslt_matches_reference(S):
 
 
 @pytest.mark.parametrize("S", [64, 128])
+def test_qwen36_wy_norm_pack_qk_and_kkt_packed_k_match_existing_path(S):
+    fvk = _load_fvk()
+    if not hasattr(fvk, "qwen36_gdn_wy_norm_cumsum_pack_qk_bf16"):
+        pytest.skip("qk norm/pack kernel is not built")
+    if not hasattr(fvk, "linear_attn_gdn_wy_kkt_b64_bf16_cublaslt_packed_k"):
+        pytest.skip("packed-k kkt kernel is not built")
+    torch.manual_seed(20260530 + S)
+    chunks = (S + 63) // 64
+    q = torch.randn(S, 16, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    g = (torch.randn(S, 48, device="cuda") * 0.02).to(torch.bfloat16)
+    beta = torch.rand(S, 48, device="cuda", dtype=torch.bfloat16)
+
+    q_l2 = torch.empty_like(q)
+    k_l2 = torch.empty_like(k)
+    q_pack = torch.empty(chunks, 48, 64, 128, device="cuda",
+                         dtype=torch.bfloat16)
+    g_cumsum = torch.empty(S, 48, device="cuda", dtype=torch.bfloat16)
+    fvk.qwen36_gdn_wy_norm_cumsum_pack_q_bf16(
+        _ptr(q), _ptr(k), _ptr(g), _ptr(q_l2), _ptr(k_l2),
+        _ptr(q_pack), _ptr(g_cumsum), S, 0)
+
+    q_l2_fast = torch.empty_like(q)
+    k_l2_fast = torch.empty_like(k)
+    q_pack_fast = torch.empty_like(q_pack)
+    k_pack = torch.empty(chunks, 16, 64, 128, device="cuda",
+                         dtype=torch.bfloat16)
+    g_cumsum_fast = torch.empty_like(g_cumsum)
+    fvk.qwen36_gdn_wy_norm_cumsum_pack_qk_bf16(
+        _ptr(q), _ptr(k), _ptr(g), _ptr(q_l2_fast), _ptr(k_l2_fast),
+        _ptr(q_pack_fast), _ptr(k_pack), _ptr(g_cumsum_fast), S, 0)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(q_l2_fast, q_l2, rtol=0, atol=0)
+    torch.testing.assert_close(k_l2_fast, k_l2, rtol=0, atol=0)
+    torch.testing.assert_close(q_pack_fast, q_pack, rtol=0, atol=0)
+    torch.testing.assert_close(g_cumsum_fast, g_cumsum, rtol=0, atol=0)
+
+    k_pack_base = torch.empty_like(k_pack)
+    kkt_base = torch.empty(chunks, 16, 64, 64, device="cuda",
+                           dtype=torch.float32)
+    kkt_fast = torch.empty_like(kkt_base)
+    A = torch.empty(chunks, 48, 64, 64, device="cuda", dtype=torch.float32)
+    A_fast = torch.empty_like(A)
+    fvk.linear_attn_gdn_wy_kkt_b64_bf16_cublaslt(
+        _ptr(k_l2), _ptr(beta), _ptr(g_cumsum),
+        _ptr(k_pack_base), _ptr(kkt_base), _ptr(A),
+        S, 16, 48, 128, 3, 0)
+    fvk.linear_attn_gdn_wy_kkt_b64_bf16_cublaslt_packed_k(
+        _ptr(k_pack), _ptr(beta), _ptr(g_cumsum_fast),
+        _ptr(kkt_fast), _ptr(A_fast), S, 16, 48, 128, 3, 0)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(A_fast, A, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("S", [64, 128])
 def test_linear_attn_gdn_wy_kkt_nogate_matches_reference_and_gated_factorization(S):
     fvk = _load_fvk()
     if not hasattr(fvk, "linear_attn_gdn_wy_kkt_b64_bf16_cublaslt_nogate"):

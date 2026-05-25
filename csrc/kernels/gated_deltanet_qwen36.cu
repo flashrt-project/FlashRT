@@ -748,6 +748,7 @@ __global__ void qwen36_gdn_wy_norm_qk_kernel(
     __nv_bfloat16* __restrict__ q16_l2,
     __nv_bfloat16* __restrict__ k16_l2,
     __nv_bfloat16* __restrict__ q_pack_hv,
+    __nv_bfloat16* __restrict__ k_pack_hk,
     int S)
 {
   const int t = threadIdx.x;
@@ -768,8 +769,16 @@ __global__ void qwen36_gdn_wy_norm_qk_kernel(
   const float q_inv = rsqrtf(q_sq + kEps);
   const float k_inv = rsqrtf(k_sq + kEps);
   const __nv_bfloat16 q_norm = __float2bfloat16(qv * q_inv);
+  const __nv_bfloat16 k_norm = __float2bfloat16(kv * k_inv);
   q16_l2[off] = q_norm;
-  k16_l2[off] = __float2bfloat16(kv * k_inv);
+  k16_l2[off] = k_norm;
+  if (k_pack_hk != nullptr) {
+    const int chunk = s / kWyChunk;
+    const int tt = s - chunk * kWyChunk;
+    k_pack_hk[
+        ((static_cast<size_t>(chunk) * kQHeads + h) * kWyChunk + tt)
+        * kHD + t] = k_norm;
+  }
   if (q_pack_hv != nullptr) {
     const int chunk = s / kWyChunk;
     const int tt = s - chunk * kWyChunk;
@@ -1362,6 +1371,7 @@ void qwen36_gdn_wy_norm_cumsum_bf16(
       reinterpret_cast<__nv_bfloat16*>(q16_l2),
       reinterpret_cast<__nv_bfloat16*>(k16_l2),
       nullptr,
+      nullptr,
       S);
   qwen36_gdn_wy_cumsum_g_kernel<<<1, 64, 0, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(g),
@@ -1387,6 +1397,34 @@ void qwen36_gdn_wy_norm_cumsum_pack_q_bf16(
       reinterpret_cast<__nv_bfloat16*>(q16_l2),
       reinterpret_cast<__nv_bfloat16*>(k16_l2),
       reinterpret_cast<__nv_bfloat16*>(q_pack_hv),
+      nullptr,
+      S);
+  qwen36_gdn_wy_cumsum_g_kernel<<<1, 64, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(g),
+      reinterpret_cast<__nv_bfloat16*>(g_cumsum),
+      S);
+}
+
+void qwen36_gdn_wy_norm_cumsum_pack_qk_bf16(
+    const void* q16,
+    const void* k16,
+    const void* g,
+    void*       q16_l2,
+    void*       k16_l2,
+    void*       q_pack_hv,
+    void*       k_pack_hk,
+    void*       g_cumsum,
+    int S,
+    cudaStream_t stream)
+{
+  if (S <= 0) return;
+  qwen36_gdn_wy_norm_qk_kernel<<<dim3(kQHeads, S), kHD, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(q16),
+      reinterpret_cast<const __nv_bfloat16*>(k16),
+      reinterpret_cast<__nv_bfloat16*>(q16_l2),
+      reinterpret_cast<__nv_bfloat16*>(k16_l2),
+      reinterpret_cast<__nv_bfloat16*>(q_pack_hv),
+      reinterpret_cast<__nv_bfloat16*>(k_pack_hk),
       S);
   qwen36_gdn_wy_cumsum_g_kernel<<<1, 64, 0, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(g),

@@ -2247,7 +2247,28 @@ class Qwen36TorchFrontendRtx:
                         fvk,
                         'linear_attn_gdn_wy_output_o_b64_bf16_cublaslt_packed_qkv')
                 )
-                if use_wy_lt_norm_pack_q:
+                use_wy_lt_norm_pack_qk = (
+                    use_wy_lt_norm_pack_q
+                    and use_wy_lt_kkt
+                    and hasattr(fvk, 'qwen36_gdn_wy_norm_cumsum_pack_qk_bf16')
+                    and hasattr(
+                        fvk,
+                        'linear_attn_gdn_wy_kkt_b64_bf16_cublaslt_packed_k')
+                    and os.environ.get(
+                        'FLASHRT_QWEN36_TQ_PREFILL_GDN_PACK_K_IN_NORM',
+                        '1').strip().lower() not in ('0', 'false', 'off'))
+                if use_wy_lt_norm_pack_qk:
+                    fvk.qwen36_gdn_wy_norm_cumsum_pack_qk_bf16(
+                        q16_K.data_ptr(), k16_K.data_ptr(),
+                        g_bf_K.data_ptr(),
+                        self._K_fla_q16_l2[:, :K].data_ptr(),
+                        self._K_fla_k16_l2[:, :K].data_ptr(),
+                        self._K_wy_out_q_pack[:chunks].data_ptr(),
+                        self._K_wy_k_pack[:chunks].data_ptr(),
+                        self._K_wy_g_cumsum[:K].data_ptr(),
+                        K, s,
+                    )
+                elif use_wy_lt_norm_pack_q:
                     fvk.qwen36_gdn_wy_norm_cumsum_pack_q_bf16(
                         q16_K.data_ptr(), k16_K.data_ptr(),
                         g_bf_K.data_ptr(),
@@ -2266,7 +2287,16 @@ class Qwen36TorchFrontendRtx:
                         self._K_wy_g_cumsum[:K].data_ptr(),
                         K, s,
                     )
-                if use_wy_lt_kkt:
+                if use_wy_lt_norm_pack_qk:
+                    fvk.linear_attn_gdn_wy_kkt_b64_bf16_cublaslt_packed_k(
+                        self._K_wy_k_pack[:chunks].data_ptr(),
+                        beta_K.data_ptr(),
+                        self._K_wy_g_cumsum[:K].data_ptr(),
+                        self._K_wy_kkt_base[:chunks].data_ptr(),
+                        self._K_wy_A[:chunks].data_ptr(),
+                        K, 16, 48, 128, 3, s,
+                    )
+                elif use_wy_lt_kkt:
                     fvk.linear_attn_gdn_wy_kkt_b64_bf16_cublaslt(
                         self._K_fla_k16_l2[:, :K].data_ptr(),
                         beta_K.data_ptr(),
