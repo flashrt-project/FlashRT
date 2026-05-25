@@ -286,25 +286,26 @@ void gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu(
     cudaStream_t stream);
 
 // FLA-style hand-tuned mma.sync + cp.async kernel.
-// Inputs are RAW (un-packed) bf16:
-//   k_l2:   (S, num_k_heads, head_dim) bf16
-//   w, u:   (S, num_v_heads, head_dim) bf16
-//   g_fp32: (S, num_v_heads) FP32 chunk-local cumsum (not bf16!)
-//   state0: (num_v_heads, head_dim, head_dim) bf16 initial state
+// Drop-in replacement for gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu but
+// taking RAW (un-packed) inputs. head_dim must be 128.
+// Inputs:
+//   k_l2:     (S, num_k_heads, head_dim) bf16
+//   w, u:     (S, num_v_heads, head_dim) bf16
+//   g_cumsum: (S, num_v_heads) bf16 chunk-local cumsum
+//   state:    (num_v_heads, head_dim, head_dim) bf16, IN/OUT (in-place update)
 // Outputs:
-//   h_out:            (NT, num_v_heads, head_dim, head_dim) bf16
-//   v_new:            (S, num_v_heads, head_dim) bf16 written BEFORE decay
-//   state_final_fp32: (num_v_heads, head_dim, head_dim) FP32 final state
-// head_dim must be 128.
+//   h_out:    (NT, num_v_heads, head_dim, head_dim) bf16 (chunk prologue states)
+//   v_new:    (S, num_v_heads, head_dim) bf16 (written BEFORE decay)
+//
+// No scratch buffers; smem-resident pipeline. NT = ceil(S / 64).
 void gdn_wy_chunk_h_b64_bf16_mma_fla(
     const void* k_l2,
     const void* w,
     const void* u,
-    const void* g_fp32,
-    const void* state0,
+    const void* g_cumsum,
+    void*       state,
     void*       h_out,
     void*       v_new,
-    void*       state_final_fp32,
     int S,
     int num_k_heads,
     int num_v_heads,

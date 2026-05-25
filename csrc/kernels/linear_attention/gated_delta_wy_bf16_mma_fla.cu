@@ -111,11 +111,10 @@ __global__ void chunk_h_kernel(
     const __nv_bfloat16* __restrict__ k_l2,
     const __nv_bfloat16* __restrict__ w,
     const __nv_bfloat16* __restrict__ u,
-    const float*         __restrict__ g,
-    const __nv_bfloat16* __restrict__ state0,
+    const __nv_bfloat16* __restrict__ g_bf16,
+    __nv_bfloat16*       __restrict__ state,    // in/out
     __nv_bfloat16*       __restrict__ h_out,
     __nv_bfloat16*       __restrict__ v_new_out,
-    float*               __restrict__ state_final,
     int S, int H, int Hg, int qk_group, int NT)
 {
   const int i_h = blockIdx.x;
@@ -132,15 +131,18 @@ __global__ void chunk_h_kernel(
   __nv_bfloat16* sW[2] = {sH2 + 64*64,         sH2 + 64*64 + kBT*kK};
   __nv_bfloat16* sV[2] = {sW[1] + kBT*kK,      sW[1] + kBT*kK + kBT*kBV};
   __nv_bfloat16* sK[2] = {sV[1] + kBT*kBV,     sV[1] + kBT*kBV + kBT*kK};
-  float* sG[2] = {reinterpret_cast<float*>(sK[1] + kBT*kK),
-                  reinterpret_cast<float*>(sK[1] + kBT*kK) + kBT};
+  // g cumsum is bf16 in HBM, but only one value per (chunk row, head).
+  // 128 bytes per stage = 8 lanes load 1 int4 each. Stash as bf16 in
+  // shared and cast to fp32 inline when read.
+  __nv_bfloat16* sG[2] = {sK[1] + kBT*kK,
+                          sK[1] + kBT*kK + kBT};
 
   float b_h1[2][8][4];
   float b_h2[2][8][4];
 
-  // Initialize state from state0.
+  // Initialize state from state (in-place buffer, also written back at end).
   {
-    const __nv_bfloat16* base = state0 + (size_t)i_h * kK * kV;
+    const __nv_bfloat16* base = state + (size_t)i_h * kK * kV;
     #pragma unroll
     for (int mi = 0; mi < 2; ++mi) {
       int m_row_base = warp_id * 32 + mi * 16;
@@ -197,11 +199,14 @@ __global__ void chunk_h_kernel(
         for (int q = 0; q < kK; ++q)
           sK[stage][row * kK + q] = __float2bfloat16(0.f);
       }
+      // g_bf16 is (S, H) bf16; we need one value per row at offset i_h.
+      // Strided sparse layout (stride H bf16 between rows), 2 bytes each.
+      // Use a sync 2-byte read; not a hot path (64 elements per chunk).
       if (row < t_count) {
-        const float* src = g + (size_t)(t_start + row) * H + i_h;
-        cp_async_4(&sG[stage][row], src);
+        sG[stage][row] =
+            g_bf16[(size_t)(t_start + row) * H + i_h];
       } else {
-        sG[stage][row] = 0.f;
+        sG[stage][row] = __float2bfloat16(0.f);
       }
     }
   };
@@ -341,7 +346,7 @@ __global__ void chunk_h_kernel(
 
     // v_new compute: raw -> global; decayed -> sV[stage] alias sVnew.
     __nv_bfloat16* sVnew = sV[stage];
-    const float g_last = sG[stage][t_count - 1];
+    const float g_last = __bfloat162float(sG[stage][t_count - 1]);
     #pragma unroll
     for (int mi = 0; mi < 2; ++mi) {
       int m_row_base = warp_id * 32 + mi * 16;
@@ -364,7 +369,7 @@ __global__ void chunk_h_kernel(
           // (no clamp). For monotone-decreasing log gates (production), this
           // agrees with FLA's safe_exp; the clamp only matters for the
           // pathological case g_last > g_t which production never hits.
-          float gr = sG[stage][row];
+          float gr = __bfloat162float(sG[stage][row]);
           float scale = __expf(g_last - gr);
           float vdec = vraw * scale;
           if (row >= t_count) vdec = 0.f;
@@ -460,9 +465,9 @@ __global__ void chunk_h_kernel(
 
   cp_async_wait<0>();
 
-  // Final state.
+  // Final state -> write back to the same (H, K, V) bf16 buffer (in-place).
   {
-    float* base = state_final + (size_t)i_h * kK * kV;
+    __nv_bfloat16* base = state + (size_t)i_h * kK * kV;
     #pragma unroll
     for (int mi = 0; mi < 2; ++mi) {
       int m_row_base = warp_id * 32 + mi * 16;
@@ -474,14 +479,14 @@ __global__ void chunk_h_kernel(
         int r0 = m_row_base + r;
         int r1 = m_row_base + r + 8;
         int v0 = v_base + n_col_base + c;
-        base[r0       * kV + v0    ] = b_h1[mi][nj][0];
-        base[r0       * kV + v0 + 1] = b_h1[mi][nj][1];
-        base[r1       * kV + v0    ] = b_h1[mi][nj][2];
-        base[r1       * kV + v0 + 1] = b_h1[mi][nj][3];
-        base[(r0 + 64)* kV + v0    ] = b_h2[mi][nj][0];
-        base[(r0 + 64)* kV + v0 + 1] = b_h2[mi][nj][1];
-        base[(r1 + 64)* kV + v0    ] = b_h2[mi][nj][2];
-        base[(r1 + 64)* kV + v0 + 1] = b_h2[mi][nj][3];
+        base[r0       * kV + v0    ] = __float2bfloat16(b_h1[mi][nj][0]);
+        base[r0       * kV + v0 + 1] = __float2bfloat16(b_h1[mi][nj][1]);
+        base[r1       * kV + v0    ] = __float2bfloat16(b_h1[mi][nj][2]);
+        base[r1       * kV + v0 + 1] = __float2bfloat16(b_h1[mi][nj][3]);
+        base[(r0 + 64)* kV + v0    ] = __float2bfloat16(b_h2[mi][nj][0]);
+        base[(r0 + 64)* kV + v0 + 1] = __float2bfloat16(b_h2[mi][nj][1]);
+        base[(r1 + 64)* kV + v0    ] = __float2bfloat16(b_h2[mi][nj][2]);
+        base[(r1 + 64)* kV + v0 + 1] = __float2bfloat16(b_h2[mi][nj][3]);
       }
     }
   }
@@ -493,11 +498,10 @@ void gdn_wy_chunk_h_b64_bf16_mma_fla(
     const void* k_l2,
     const void* w,
     const void* u,
-    const void* g_fp32,
-    const void* state0,
+    const void* g_cumsum,
+    void*       state,
     void*       h_out,
     void*       v_new,
-    void*       state_final_fp32,
     int S,
     int num_k_heads,
     int num_v_heads,
@@ -537,11 +541,10 @@ void gdn_wy_chunk_h_b64_bf16_mma_fla(
       reinterpret_cast<const __nv_bfloat16*>(k_l2),
       reinterpret_cast<const __nv_bfloat16*>(w),
       reinterpret_cast<const __nv_bfloat16*>(u),
-      reinterpret_cast<const float*>(g_fp32),
-      reinterpret_cast<const __nv_bfloat16*>(state0),
+      reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
+      reinterpret_cast<__nv_bfloat16*>(state),
       reinterpret_cast<__nv_bfloat16*>(h_out),
       reinterpret_cast<__nv_bfloat16*>(v_new),
-      reinterpret_cast<float*>(state_final_fp32),
       S, num_v_heads, num_k_heads, qk_group, NT);
 }
 

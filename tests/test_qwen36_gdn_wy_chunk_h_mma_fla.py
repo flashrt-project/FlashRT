@@ -1,14 +1,15 @@
 """Equivalence test for the FLA-style hand-tuned chunk_h kernel.
 
-Compares ``linear_attn_gdn_wy_chunk_h_b64_bf16_mma_fla`` (new RAW-input
+Compares ``linear_attn_gdn_wy_chunk_h_b64_bf16_mma_fla`` (RAW-input
 mma.sync + cp.async kernel) against the existing
-``linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu`` baseline on
-identical inputs and the FLA Triton reference.
+``linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu`` baseline and
+the torch fp32 reference, on identical inputs.
 
-The new kernel takes RAW (un-packed) bf16 inputs and FP32 g_cumsum, and
-writes the final state as FP32. The baseline takes pre-packed inputs and
-BF16 g_cumsum / state. Both should agree bit-exact on the inputs that map
-to the same logical computation.
+Both kernels use fp32 mma accumulators but different reduction tile
+orders, so per-element drift across NT chunks accumulates differently.
+The test asserts the new kernel is no worse than packed_wu relative to
+the fp32 reference (and direct mma_fla vs packed_wu stays within ~2x
+of the packed_wu-vs-ref drift).
 """
 
 import pytest
@@ -53,18 +54,16 @@ def test_mma_fla_matches_packed_wu_and_reference(S):
         torch.sum(k.float() * k.float(), dim=-1, keepdim=True) + 1e-6)
     ).to(torch.bfloat16)
     g_cumsum_bf16 = _local_cumsum_bf16(g)
-    g_cumsum_fp32 = g_cumsum_bf16.float()
 
-    # --- mma_fla path (RAW inputs, fp32 g, fp32 state out) ---
+    # --- mma_fla path (RAW inputs, bf16 g, bf16 state in-place) ---
     chunks = (S + 63) // 64
+    state_mma = state0.clone()
     h_mma = torch.empty(chunks, H, K, V, device="cuda",
                         dtype=torch.bfloat16)
     v_mma = torch.empty(S, H, V, device="cuda", dtype=torch.bfloat16)
-    state_mma_f32 = torch.empty(H, K, V, device="cuda",
-                                dtype=torch.float32)
     fvk.linear_attn_gdn_wy_chunk_h_b64_bf16_mma_fla(
-        _ptr(k_l2), _ptr(w), _ptr(u), _ptr(g_cumsum_fp32),
-        _ptr(state0), _ptr(h_mma), _ptr(v_mma), _ptr(state_mma_f32),
+        _ptr(k_l2), _ptr(w), _ptr(u), _ptr(g_cumsum_bf16),
+        _ptr(state_mma), _ptr(h_mma), _ptr(v_mma),
         S, Hk, H, K, H // Hk, 0)
     torch.cuda.synchronize()
 
@@ -107,7 +106,7 @@ def test_mma_fla_matches_packed_wu_and_reference(S):
     base_diff_s = _max_diff(state_base.float(), state_ref.float())
     mma_diff_h  = _max_diff(h_mma, h_ref)
     mma_diff_v  = _max_diff(v_mma, v_ref)
-    mma_diff_s  = _max_diff(state_mma_f32, state_ref.float())
+    mma_diff_s  = _max_diff(state_mma, state_ref.float())
 
     # Floor for small-NT cases where the baseline diff itself is sub-ULP.
     slack = 0.05
@@ -123,7 +122,7 @@ def test_mma_fla_matches_packed_wu_and_reference(S):
     # opposite directions). Keep a reasonable upper bound.
     h_kk = _max_diff(h_mma, h_base)
     v_kk = _max_diff(v_mma, v_base)
-    s_kk = _max_diff(state_mma_f32, state_base.float())
+    s_kk = _max_diff(state_mma, state_base.float())
     assert h_kk <= 2 * base_diff_h + slack
     assert v_kk <= 2 * base_diff_v + slack
     assert s_kk <= 2 * base_diff_s + slack
