@@ -893,6 +893,34 @@ print(resp.json()['shape'], resp.json()['latency_ms'], 'ms')
 
 The server uses an asyncio lock to ensure only one inference runs at a time (single GPU). Concurrent requests are queued automatically.
 
+### Qwen3.6 OpenAI-compatible server
+
+Qwen3.6-27B NVFP4 uses a separate OpenAI-shaped chat server:
+[`examples/qwen36_openai_server.py`](examples/qwen36_openai_server.py).
+Install the server extra, point `FLASHRT_QWEN36_MTP_CKPT_DIR` at a
+paired Qwen3.6 MTP checkpoint, and choose a `--max-seq` that covers the
+largest prompt plus completion you intend to serve.
+
+```bash
+pip install -e ".[torch,server]"
+
+export FLASHRT_QWEN36_MTP_CKPT_DIR=/path/to/qwen36_fp8_ckpt
+export FLASHRT_QWEN36_LONG_KV_CACHE=fp8
+
+python examples/qwen36_openai_server.py \
+  --checkpoint /path/to/qwen36_nvfp4 \
+  --max-seq 262208 \
+  --warmup-preset auto \
+  --port 8000
+```
+
+The Qwen server exposes `/v1/models` and `/v1/chat/completions`. Its
+logs report `prefill=... + decode=...`, so decode tok/s is directly
+comparable to TPOT-style LLM serving numbers and does not include TTFT.
+For the full parameter reference, warmup buckets, and the 128-token to
+256K context sweep, see [`docs/qwen36_usage.md`](docs/qwen36_usage.md)
+and [`docs/qwen36_nvfp4.md`](docs/qwen36_nvfp4.md).
+
 ---
 
 ## CLI Reference

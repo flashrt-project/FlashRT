@@ -4,7 +4,7 @@
 
 A general kernel library composed into static graphs — no ONNX export, no engine compilation, no per-driver rebuild. Hand-written kernels (norm / activation / fusion / RoPE / FP8 / NVFP4 GEMM / attention) cover standard transformer, DiT, and SigLIP primitives. The composition pattern itself is hardware-agnostic; today the codebase ships with NVIDIA implementations spanning edge to server (Jetson AGX Thor through A100 / RTX 4090 / 5090).
 
-The flagship integration today is **VLA control** — production frontends for Pi0, Pi0.5, GROOT N1.6, GROOT N1.7, and Pi0-FAST, validated on LIBERO where applicable. The same kernel set also powers the BAGEL world-model image-generation pipeline (research preview) and audio / video generation (4× over PyTorch). FlashRT now also serves **single-stream LLM inference** — the v1 release ships **Qwen3.6-27B (NVFP4)** with **256 K context on a single RTX 5090**, an OpenAI-compatible HTTP server, and warm decode throughput from **~120 tok/s at 512-token prompts to ~130 tok/s at 256 K** (peak measured bucket: **176 tok/s at 64 K**; see [Performance](#performance)). The pattern is workload-shaped (small-batch realtime), not model-class-shaped.
+The flagship integration today is **VLA control** — production frontends for Pi0, Pi0.5, GROOT N1.6, GROOT N1.7, and Pi0-FAST, validated on LIBERO where applicable. The same kernel set also powers the BAGEL world-model image-generation pipeline (research preview) and audio / video generation (4× over PyTorch). FlashRT now also serves **single-stream LLM inference** — the v1 release ships **Qwen3.6-27B (NVFP4)** with **256 K context on a single RTX 5090**, an OpenAI-compatible HTTP server, and warm decode throughput from **~121 tok/s at 512-token prompts to ~145 tok/s at 256 K** (peak measured bucket: **175 tok/s at 16 K**; see [Performance](#performance)). The pattern is workload-shaped (small-batch realtime), not model-class-shaped.
 
 Existing inference tooling is shaped for different workloads — TensorRT for tactic-search compile to frozen engines, vLLM / SGLang for high-batch LLM serving. FlashRT targets the small-batch realtime cell with hand-tuned kernels and no compile step.
 
@@ -27,7 +27,7 @@ Existing inference tooling is shaped for different workloads — TensorRT for ta
 ## FlashRT supports:
 
 - **VLA models**: Pi0, Pi0.5, GROOT N1.6, GROOT N1.7, Pi0-FAST. Pi0/Pi0.5/GROOT N1.6/Pi0-FAST are production-validated on LIBERO; GROOT N1.7 currently exposes an RTX SM120 DiT FA2 path. Motus RTX beta — Wan2.2-based robot policy path at ~167 ms / ~100 ms with TeaCache. BAGEL world-model (research preview) — image-gen pipeline at ~4× vs PyTorch.
-- **LLM**: **Qwen3.6-27B NVFP4 — FP8-KV long-context decode to 256 K on one RTX 5090** — speculative decoding via the FP8 ckpt's MTP head, OpenAI-compatible HTTP server, **130 tok/s at 256 K** and **176 tok/s at 64 K** in the warm 64-token table. **Qwen3-8B NVFP4** text-only serving reaches **150 tok/s** warm decode.
+- **LLM**: **Qwen3.6-27B NVFP4 — FP8-KV long-context decode to 256 K on one RTX 5090** — speculative decoding via the FP8 ckpt's MTP head, OpenAI-compatible HTTP server, **145 tok/s at 256 K** and **158 tok/s at 128 K** in the warm 64-token table. **Qwen3-8B NVFP4** text-only serving reaches **150 tok/s** warm decode.
 - **Hardware (today)**: NVIDIA Jetson AGX Thor (SM110), RTX 5090 (SM120), RTX 4090 (SM89), and SM80 / SM86 / SM89 cards (A100, RTX 3090, 4060 Ti, etc.). The kernel composition pattern is portable to other accelerators.
 - **Frameworks**: PyTorch (safetensors) + JAX (Orbax) — same compiled kernels
 
@@ -35,7 +35,7 @@ Pi0.5: 44 ms / 23 Hz on Jetson AGX Thor (2v, FP8) · 39.78 ms / 25 Hz (2v, NVFP4
 
 ## News
 
-- [2026/05] **Qwen3.6-27B NVFP4** is supported with 256 K context on a single RTX 5090, OpenAI-compatible serving, FP8-KV long-context verify, and **130 tok/s warm decode at 256 K**. See [Qwen3.6 NVFP4](docs/qwen36_nvfp4.md) and [Performance](#qwen36-performance).
+- [2026/05] **Qwen3.6-27B NVFP4** is supported with 256 K context on a single RTX 5090, OpenAI-compatible serving, FP8-KV long-context verify, and **145 tok/s warm decode at 256 K**. See [Qwen3.6 NVFP4](docs/qwen36_nvfp4.md) and [Performance](#qwen36-performance).
 - [2026/05] **Qwen3-8B NVFP4** text-only serving is supported on RTX 5090, with **9.1 ms TTFT at P=64** and **150 tok/s** warm decode. See [Qwen3-8B NVFP4](docs/qwen3_8b_nvfp4.md) and [Performance](#qwen3-8b-performance).
 - [2026/05] **Wan2.2 TI2V-5B** official-pipeline baseline is available on RTX SM120, with opt-in TeaCache acceleration. See [Wan2.2 usage](docs/wan22_usage.md).
 - [2026/05] **Lingbot-VLA** is supported. See [Lingbot usage](https://github.com/LiangSu8899/FlashRT/blob/main/docs/lingbot_usage.md).
@@ -132,22 +132,17 @@ the measured prefill-to-first-token window. The table uses the measured
 best configuration per bucket.
 
 **Warm context sweep** — repeated text prompt, `max_new_tokens=64`,
-single RTX 5090:
+single RTX 5090. The complete sweep is in
+[`docs/qwen36_nvfp4.md`](docs/qwen36_nvfp4.md).
 
-| prompt ctx | K | MTP tail | TTFT / prefill | prefill tok/s | decode tok/s |
-|---:|---:|---:|---:|---:|---:|
-| 128 | 6 | full | 2.72 s | 47 | 141.0 |
-| 512 | 4 | 512 | 66.6 ms | 7,683 | 119.7 |
-| 1 K | 5 | 2048 | 122.9 ms | 8,334 | 115.3 |
-| 2 K | 6 | 2048 | 238.9 ms | 8,572 | 149.6 |
-| 4 K | 3 | 512 | 333.4 ms | 12,285 | 113.9 |
-| 8 K | 5 | 2048 | 749.7 ms | 10,926 | 157.5 |
-| 16 K | 7 | 2048 | 1.55 s | 10,587 | 170.6 |
-| 32 K | 6 | 2048 | 3.54 s | 9,262 | 157.5 |
-| 64 K | 7 | 2048 | 9.11 s | 7,195 | 176.1 |
-| 128 K | 7 | 2048 | 26.64 s | 4,920 | 153.9 |
-| 200 K | 6 | 2048 | 56.81 s | 3,605 | 114.7 |
-| 256 K | 6 | 2048 | 87.71 s | 2,989 | 129.7 |
+| prompt ctx | route | K | MTP tail | TTFT / prefill | prefill tok/s | decode tok/s |
+|---:|---|---:|---:|---:|---:|---:|
+| 128 | BF16/spec | 6 | full | 2.686 s | 47.7 | 145.4 |
+| 2 K | FP8-KV | 6 | 2048 | 253.8 ms | 8,070 | 164.9 |
+| 16 K | FP8-KV | 7 | 2048 | 1.570 s | 10,437 | 175.4 |
+| 64 K | FP8-KV | 7 | 2048 | 9.133 s | 7,176 | 150.9 |
+| 128 K | FP8-KV | 7 | 2048 | 26.731 s | 4,903 | 158.0 |
+| 256 K | FP8-KV | 6 | 2048 | 87.976 s | 2,980 | 144.6 |
 
 The decode column excludes TTFT, matching the usual TPOT-derived LLM
 metric. The table above keeps the fastest measured decode configuration
