@@ -1012,7 +1012,9 @@ __global__ void solve_tril_b64_merge16_shared_kernel(
 
   for (int idx = threadIdx.x; idx < kChunk * kChunk; idx += blockDim.x) {
     const float val = Ai_s[idx];
-    Ai_blk[idx] = val;
+    if (Ai_blk != nullptr) {
+      Ai_blk[idx] = val;
+    }
     if (Ai_pack != nullptr) {
       Ai_pack[base + idx] = __float2bfloat16(val);
     }
@@ -1037,7 +1039,7 @@ __global__ void solve_tril_b64_fused_shared_kernel(
   const size_t base =
       (static_cast<size_t>(chunk) * num_v_heads + vh) * kChunk * kChunk;
   const float* A_blk = A + base;
-  float* Ai_blk = Ai + base;
+  float* Ai_blk = (Ai != nullptr) ? (Ai + base) : nullptr;
 
   for (int idx = threadIdx.x; idx < kChunk * kChunk; idx += blockDim.x) {
     const int r = idx / kChunk;
@@ -1152,7 +1154,9 @@ __global__ void solve_tril_b64_fused_shared_kernel(
 
   for (int idx = threadIdx.x; idx < kChunk * kChunk; idx += blockDim.x) {
     const float val = Ai_s[idx];
-    Ai_blk[idx] = val;
+    if (Ai_blk != nullptr) {
+      Ai_blk[idx] = val;
+    }
     if (Ai_pack != nullptr) {
       Ai_pack[base + idx] = __float2bfloat16(val);
     }
@@ -2075,6 +2079,24 @@ void gdn_wy_solve_tril_b64_f32_fused_pack(
                                        stream>>>(
       reinterpret_cast<const float*>(A),
       reinterpret_cast<float*>(Ai),
+      reinterpret_cast<__nv_bfloat16*>(Ai_pack),
+      S, num_v_heads);
+}
+
+void gdn_wy_solve_tril_b64_f32_fused_pack_only(
+    const void* A,
+    void*       Ai_pack,
+    int S,
+    int num_v_heads,
+    cudaStream_t stream)
+{
+  if (S <= 0 || num_v_heads <= 0) return;
+  const int chunks = (S + kChunk - 1) / kChunk;
+  solve_tril_b64_fused_shared_kernel<<<dim3(num_v_heads, chunks), 256,
+                                       2 * kChunk * kChunk * sizeof(float),
+                                       stream>>>(
+      reinterpret_cast<const float*>(A),
+      nullptr,
       reinterpret_cast<__nv_bfloat16*>(Ai_pack),
       S, num_v_heads);
 }

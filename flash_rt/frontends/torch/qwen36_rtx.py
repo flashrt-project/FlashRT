@@ -2329,7 +2329,21 @@ class Qwen36TorchFrontendRtx:
                         and os.environ.get(
                             'FLASHRT_QWEN36_TQ_PREFILL_GDN_FUSED_SOLVE',
                             '1').strip().lower() not in ('0', 'false', 'off'))
-                    if use_fused_solve_pack:
+                    use_fused_solve_pack_only = (
+                        use_fused_solve_pack
+                        and hasattr(
+                            fvk,
+                            'linear_attn_gdn_wy_solve_tril_b64_f32_fused_pack_only')
+                        and os.environ.get(
+                            'FLASHRT_QWEN36_TQ_PREFILL_GDN_SOLVE_PACK_ONLY',
+                            '1').strip().lower() not in ('0', 'false', 'off'))
+                    if use_fused_solve_pack_only:
+                        fvk.linear_attn_gdn_wy_solve_tril_b64_f32_fused_pack_only(
+                            self._K_wy_A[:chunks].data_ptr(),
+                            self._K_wy_Ai_pack[:chunks].data_ptr(),
+                            K, 48, s,
+                        )
+                    elif use_fused_solve_pack:
                         fvk.linear_attn_gdn_wy_solve_tril_b64_f32_fused_pack(
                             self._K_wy_A[:chunks].data_ptr(),
                             self._K_wy_Ai[:chunks].data_ptr(),

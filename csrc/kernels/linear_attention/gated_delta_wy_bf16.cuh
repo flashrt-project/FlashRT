@@ -172,6 +172,13 @@ void gdn_wy_solve_tril_b64_f32_fused_pack(
     int num_v_heads,
     cudaStream_t stream);
 
+void gdn_wy_solve_tril_b64_f32_fused_pack_only(
+    const void* A,
+    void*       Ai_pack,
+    int S,
+    int num_v_heads,
+    cudaStream_t stream);
+
 void gdn_wy_output_o_b64_bf16_cublaslt(
     const void* q_l2,
     const void* k_l2,
