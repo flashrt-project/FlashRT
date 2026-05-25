@@ -468,14 +468,19 @@ class Qwen3Engine:
                     yield ('tool_calls', tcs)
 
             wall = time.perf_counter() - t0
+            decode_s = max(0.0, wall - prefill_s)
             usage = {
                 'prompt_tokens': P,
                 'completion_tokens': len(new_tokens),
                 'total_tokens': P + len(new_tokens),
                 'prefill_ms': round(prefill_s * 1000, 1),
                 'ttft_ms': round((first_token_s or prefill_s) * 1000, 1),
+                'decode_ms': round(decode_s * 1000, 1),
                 'wall_s': round(wall, 3),
-                'tok_per_s': round(len(new_tokens) / wall, 1) if wall else 0,
+                'tok_per_s': (
+                    round(len(new_tokens) / decode_s, 1)
+                    if decode_s > 0 else 0
+                ),
             }
             yield ('finish', finish_reason, usage)
 
@@ -551,9 +556,13 @@ def build_app(engine: 'Qwen3Engine'):
             if tool_calls:
                 msg['tool_calls'] = tool_calls
             log.info(
-                'non-stream done: %s -> %s tok in %ss (%s tok/s)',
+                'non-stream done: prompt=%s completion=%s '
+                'prefill=%sms ttft=%sms decode=%sms wall=%ss '
+                'decode_tok/s=%s',
                 usage.get('prompt_tokens'), usage.get('completion_tokens'),
-                usage.get('wall_s'), usage.get('tok_per_s'),
+                usage.get('prefill_ms'), usage.get('ttft_ms'),
+                usage.get('decode_ms'), usage.get('wall_s'),
+                usage.get('tok_per_s'),
             )
             return {
                 'id': completion_id,
@@ -650,11 +659,13 @@ def build_app(engine: 'Qwen3Engine'):
                     yield 'data: [DONE]\n\n'
                     log.info(
                         'stream done: prompt=%s completion=%s '
-                        'prefill=%sms ttft=%sms wall=%ss (%s tok/s)',
+                        'prefill=%sms ttft=%sms decode=%sms wall=%ss '
+                        'decode_tok/s=%s',
                         usage.get('prompt_tokens'),
                         usage.get('completion_tokens'),
                         usage.get('prefill_ms'), usage.get('ttft_ms'),
-                        usage.get('wall_s'), usage.get('tok_per_s'),
+                        usage.get('decode_ms'), usage.get('wall_s'),
+                        usage.get('tok_per_s'),
                     )
                     return
 
