@@ -2,7 +2,7 @@
 //
 // FLA-style hand-tuned chunk_h kernel for the GDN/WY gated DeltaNet
 // recurrence used by Qwen3.6. Replaces the cuBLASLt loop with a single
-// CTA-resident kernel using mma.sync + cp.async 2-stage pipelining.
+// CTA-resident kernel using raw mma.sync + cp.async 2-stage pipelining.
 //
 // Algorithm (per FLA chunk_gated_delta_rule_fwd_kernel_h_blockdim64):
 //   b_h kept in fp32 registers across the chunk loop (two 64x64 state blocks
@@ -10,12 +10,15 @@
 //     1. store b_h (cast bf16) to h_out
 //     2. v_acc = w[:, :64] @ b_h1 + w[:, 64:128] @ b_h2
 //     3. write raw v_new = u - v_acc to global (BEFORE decay)
-//     4. v_dec = v_new * safe_exp(g_last - g_t)  (clamp positive to 0)
+//     4. v_dec = v_new * safe_exp(g_last - g_t)
 //     5. b_h *= exp(g_last)
 //     6. b_h += k_T @ v_dec
 //
-// Geometry: K=128, V=128 fixed, BT=64. Grid (H, V/BV=2). 2 warps per CTA.
-// GQA via qk_group = H/Hg.
+// Geometry: K=128, V=128 fixed, BT=64. Grid (H, V/BV=2). 4 warps per CTA.
+// 4-warp layout: each warp owns 16 M-rows of the 64-row output. Per warp:
+// 1 m16 x 8 n8 = 8 mma tiles per K iter, half the register pressure of a
+// 2-warp split, enabling 2 CTAs per SM (matches FLA Triton's winning
+// autotune config on sm_120: BV=64 num_warps=4 num_stages=2).
 
 #include "gated_delta_wy_bf16.cuh"
 
@@ -36,14 +39,6 @@ __device__ __forceinline__ void cp_async_16(
 {
   uint32_t smem_int = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::
-               "r"(smem_int), "l"(gmem_src));
-}
-
-__device__ __forceinline__ void cp_async_4(
-    void* smem_dst, const void* gmem_src)
-{
-  uint32_t smem_int = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
-  asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::
                "r"(smem_int), "l"(gmem_src));
 }
 
@@ -104,7 +99,7 @@ constexpr int kBT = 64;
 constexpr int kK  = 128;
 constexpr int kV  = 128;
 constexpr int kBV = 64;
-constexpr int kThreads = 64;
+constexpr int kThreads = 128;     // 4 warps
 constexpr size_t kSmemBytes = 98816;
 
 __global__ void chunk_h_kernel(
@@ -121,7 +116,7 @@ __global__ void chunk_h_kernel(
   const int i_v = blockIdx.y;
   const int kh  = i_h / qk_group;
   const int tid = threadIdx.x;
-  const int warp_id = tid / 32;
+  const int warp_id = tid / 32;     // 0..3
   const int lane = tid & 31;
   const int v_base = i_v * kBV;
 
@@ -131,41 +126,40 @@ __global__ void chunk_h_kernel(
   __nv_bfloat16* sW[2] = {sH2 + 64*64,         sH2 + 64*64 + kBT*kK};
   __nv_bfloat16* sV[2] = {sW[1] + kBT*kK,      sW[1] + kBT*kK + kBT*kBV};
   __nv_bfloat16* sK[2] = {sV[1] + kBT*kBV,     sV[1] + kBT*kBV + kBT*kK};
-  // g cumsum is bf16 in HBM, but only one value per (chunk row, head).
-  // 128 bytes per stage = 8 lanes load 1 int4 each. Stash as bf16 in
-  // shared and cast to fp32 inline when read.
   __nv_bfloat16* sG[2] = {sK[1] + kBT*kK,
                           sK[1] + kBT*kK + kBT};
 
-  float b_h1[2][8][4];
-  float b_h2[2][8][4];
+  // Per warp owns 16 of the 64 output rows. mi dimension collapses to 1.
+  // Per thread: 8 (n8 tiles) * 4 (fp32 in 16x8 c-frag) = 32 fp32 per block.
+  float b_h1[8][4];
+  float b_h2[8][4];
 
   // Initialize state from state (in-place buffer, also written back at end).
   {
     const __nv_bfloat16* base = state + (size_t)i_h * kK * kV;
+    const int m_row_base = warp_id * 16;
     #pragma unroll
-    for (int mi = 0; mi < 2; ++mi) {
-      int m_row_base = warp_id * 32 + mi * 16;
-      #pragma unroll
-      for (int nj = 0; nj < 8; ++nj) {
-        int n_col_base = nj * 8;
-        int r = lane / 4;
-        int c = (lane % 4) * 2;
-        int r0 = m_row_base + r;
-        int r1 = m_row_base + r + 8;
-        int v0 = v_base + n_col_base + c;
-        b_h1[mi][nj][0] = static_cast<float>(base[r0       * kV + v0    ]);
-        b_h1[mi][nj][1] = static_cast<float>(base[r0       * kV + v0 + 1]);
-        b_h1[mi][nj][2] = static_cast<float>(base[r1       * kV + v0    ]);
-        b_h1[mi][nj][3] = static_cast<float>(base[r1       * kV + v0 + 1]);
-        b_h2[mi][nj][0] = static_cast<float>(base[(r0 + 64)* kV + v0    ]);
-        b_h2[mi][nj][1] = static_cast<float>(base[(r0 + 64)* kV + v0 + 1]);
-        b_h2[mi][nj][2] = static_cast<float>(base[(r1 + 64)* kV + v0    ]);
-        b_h2[mi][nj][3] = static_cast<float>(base[(r1 + 64)* kV + v0 + 1]);
-      }
+    for (int nj = 0; nj < 8; ++nj) {
+      int n_col_base = nj * 8;
+      int r = lane / 4;
+      int c = (lane % 4) * 2;
+      int r0 = m_row_base + r;
+      int r1 = m_row_base + r + 8;
+      int v0 = v_base + n_col_base + c;
+      b_h1[nj][0] = static_cast<float>(base[r0       * kV + v0    ]);
+      b_h1[nj][1] = static_cast<float>(base[r0       * kV + v0 + 1]);
+      b_h1[nj][2] = static_cast<float>(base[r1       * kV + v0    ]);
+      b_h1[nj][3] = static_cast<float>(base[r1       * kV + v0 + 1]);
+      b_h2[nj][0] = static_cast<float>(base[(r0 + 64)* kV + v0    ]);
+      b_h2[nj][1] = static_cast<float>(base[(r0 + 64)* kV + v0 + 1]);
+      b_h2[nj][2] = static_cast<float>(base[(r1 + 64)* kV + v0    ]);
+      b_h2[nj][3] = static_cast<float>(base[(r1 + 64)* kV + v0 + 1]);
     }
   }
 
+  // Cooperative chunk loaders, now with 128 threads. Each thread loads one
+  // BT row of each (w, u, k). For BT=64 < 128 only the first 64 threads
+  // participate.
   auto issue_chunk = [&](int t_start, int t_count, int stage) {
     if (tid < kBT) {
       int row = tid;
@@ -199,9 +193,6 @@ __global__ void chunk_h_kernel(
         for (int q = 0; q < kK; ++q)
           sK[stage][row * kK + q] = __float2bfloat16(0.f);
       }
-      // g_bf16 is (S, H) bf16; we need one value per row at offset i_h.
-      // Strided sparse layout (stride H bf16 between rows), 2 bytes each.
-      // Use a sync 2-byte read; not a hot path (64 elements per chunk).
       if (row < t_count) {
         sG[stage][row] =
             g_bf16[(size_t)(t_start + row) * H + i_h];
@@ -231,9 +222,8 @@ __global__ void chunk_h_kernel(
     __syncthreads();
 
     // Cast b_h1, b_h2 -> sH1, sH2 in one pass.
-    #pragma unroll
-    for (int mi = 0; mi < 2; ++mi) {
-      int m_row_base = warp_id * 32 + mi * 16;
+    {
+      const int m_row_base = warp_id * 16;
       #pragma unroll
       for (int nj = 0; nj < 8; ++nj) {
         int n_col_base = nj * 8;
@@ -241,24 +231,24 @@ __global__ void chunk_h_kernel(
         int c = (lane % 4) * 2;
         int r0 = m_row_base + r;
         int r1 = m_row_base + r + 8;
-        sH1[r0 * 64 + n_col_base + c    ] = __float2bfloat16(b_h1[mi][nj][0]);
-        sH1[r0 * 64 + n_col_base + c + 1] = __float2bfloat16(b_h1[mi][nj][1]);
-        sH1[r1 * 64 + n_col_base + c    ] = __float2bfloat16(b_h1[mi][nj][2]);
-        sH1[r1 * 64 + n_col_base + c + 1] = __float2bfloat16(b_h1[mi][nj][3]);
-        sH2[r0 * 64 + n_col_base + c    ] = __float2bfloat16(b_h2[mi][nj][0]);
-        sH2[r0 * 64 + n_col_base + c + 1] = __float2bfloat16(b_h2[mi][nj][1]);
-        sH2[r1 * 64 + n_col_base + c    ] = __float2bfloat16(b_h2[mi][nj][2]);
-        sH2[r1 * 64 + n_col_base + c + 1] = __float2bfloat16(b_h2[mi][nj][3]);
+        sH1[r0 * 64 + n_col_base + c    ] = __float2bfloat16(b_h1[nj][0]);
+        sH1[r0 * 64 + n_col_base + c + 1] = __float2bfloat16(b_h1[nj][1]);
+        sH1[r1 * 64 + n_col_base + c    ] = __float2bfloat16(b_h1[nj][2]);
+        sH1[r1 * 64 + n_col_base + c + 1] = __float2bfloat16(b_h1[nj][3]);
+        sH2[r0 * 64 + n_col_base + c    ] = __float2bfloat16(b_h2[nj][0]);
+        sH2[r0 * 64 + n_col_base + c + 1] = __float2bfloat16(b_h2[nj][1]);
+        sH2[r1 * 64 + n_col_base + c    ] = __float2bfloat16(b_h2[nj][2]);
+        sH2[r1 * 64 + n_col_base + c + 1] = __float2bfloat16(b_h2[nj][3]);
       }
     }
     __syncthreads();
 
-    // Coalesced h_out write from sH1, sH2.
+    // Coalesced h_out write from sH1, sH2. 128 threads * 1 int4/pass * 4 passes.
     {
       __nv_bfloat16* dst_base = h_out + ((size_t)i_t * H + i_h) * kK * kV;
       #pragma unroll
-      for (int pass = 0; pass < 8; ++pass) {
-        int row = pass * 8 + (tid / 8);
+      for (int pass = 0; pass < 4; ++pass) {
+        int row = pass * 16 + (tid / 8);
         int col_block = tid % 8;
         int src = row * 64 + col_block * 8;
         int dst0 = row * kV + v_base + col_block * 8;
@@ -271,93 +261,80 @@ __global__ void chunk_h_kernel(
     }
 
     // v_acc = sW[stage][:, 0:64] @ sH1 + sW[stage][:, 64:128] @ sH2.
-    float v_acc[2][8][4];
+    float v_acc[8][4];
     #pragma unroll
-    for (int mi = 0; mi < 2; ++mi)
+    for (int nj = 0; nj < 8; ++nj)
       #pragma unroll
-      for (int nj = 0; nj < 8; ++nj)
-        #pragma unroll
-        for (int kk = 0; kk < 4; ++kk)
-          v_acc[mi][nj][kk] = 0.f;
+      for (int kk = 0; kk < 4; ++kk)
+        v_acc[nj][kk] = 0.f;
+
+    const int m_row_base = warp_id * 16;
     #pragma unroll
     for (int kk = 0; kk < 4; ++kk) {
-      uint32_t af[2][4];
-      #pragma unroll
-      for (int mi = 0; mi < 2; ++mi) {
-        int m_row_base = warp_id * 32 + mi * 16;
-        int k_col_base = kk * 16;
-        int row = lane % 16;
-        int col_grp = (lane / 16) * 8;
-        ldmatrix_x4_a(
-            &sW[stage][(m_row_base + row) * kK + k_col_base + col_grp],
-            af[mi][0], af[mi][1], af[mi][2], af[mi][3]);
-      }
+      uint32_t af[4];
+      int k_col_base = kk * 16;
+      int row = lane % 16;
+      int col_grp = (lane / 16) * 8;
+      ldmatrix_x4_a(
+          &sW[stage][(m_row_base + row) * kK + k_col_base + col_grp],
+          af[0], af[1], af[2], af[3]);
       uint32_t bf[8][2];
       #pragma unroll
       for (int nj = 0; nj < 8; ++nj) {
         int k_row_base = kk * 16;
         int n_col_base = nj * 8;
-        int row = (lane % 8) + ((lane / 8) % 2) * 8;
+        int b_row = (lane % 8) + ((lane / 8) % 2) * 8;
         ldmatrix_x2_trans_b(
-            &sH1[(k_row_base + row) * 64 + n_col_base],
+            &sH1[(k_row_base + b_row) * 64 + n_col_base],
             bf[nj][0], bf[nj][1]);
       }
       #pragma unroll
-      for (int mi = 0; mi < 2; ++mi)
-        #pragma unroll
-        for (int nj = 0; nj < 8; ++nj)
-          mma_m16n8k16(v_acc[mi][nj][0], v_acc[mi][nj][1],
-                       v_acc[mi][nj][2], v_acc[mi][nj][3],
-                       af[mi][0], af[mi][1], af[mi][2], af[mi][3],
-                       bf[nj][0], bf[nj][1]);
+      for (int nj = 0; nj < 8; ++nj)
+        mma_m16n8k16(v_acc[nj][0], v_acc[nj][1],
+                     v_acc[nj][2], v_acc[nj][3],
+                     af[0], af[1], af[2], af[3],
+                     bf[nj][0], bf[nj][1]);
     }
     #pragma unroll
     for (int kk = 0; kk < 4; ++kk) {
-      uint32_t af[2][4];
-      #pragma unroll
-      for (int mi = 0; mi < 2; ++mi) {
-        int m_row_base = warp_id * 32 + mi * 16;
-        int k_col_base = 64 + kk * 16;
-        int row = lane % 16;
-        int col_grp = (lane / 16) * 8;
-        ldmatrix_x4_a(
-            &sW[stage][(m_row_base + row) * kK + k_col_base + col_grp],
-            af[mi][0], af[mi][1], af[mi][2], af[mi][3]);
-      }
+      uint32_t af[4];
+      int k_col_base = 64 + kk * 16;
+      int row = lane % 16;
+      int col_grp = (lane / 16) * 8;
+      ldmatrix_x4_a(
+          &sW[stage][(m_row_base + row) * kK + k_col_base + col_grp],
+          af[0], af[1], af[2], af[3]);
       uint32_t bf[8][2];
       #pragma unroll
       for (int nj = 0; nj < 8; ++nj) {
         int k_row_base = kk * 16;
         int n_col_base = nj * 8;
-        int row = (lane % 8) + ((lane / 8) % 2) * 8;
+        int b_row = (lane % 8) + ((lane / 8) % 2) * 8;
         ldmatrix_x2_trans_b(
-            &sH2[(k_row_base + row) * 64 + n_col_base],
+            &sH2[(k_row_base + b_row) * 64 + n_col_base],
             bf[nj][0], bf[nj][1]);
       }
       #pragma unroll
-      for (int mi = 0; mi < 2; ++mi)
-        #pragma unroll
-        for (int nj = 0; nj < 8; ++nj)
-          mma_m16n8k16(v_acc[mi][nj][0], v_acc[mi][nj][1],
-                       v_acc[mi][nj][2], v_acc[mi][nj][3],
-                       af[mi][0], af[mi][1], af[mi][2], af[mi][3],
-                       bf[nj][0], bf[nj][1]);
+      for (int nj = 0; nj < 8; ++nj)
+        mma_m16n8k16(v_acc[nj][0], v_acc[nj][1],
+                     v_acc[nj][2], v_acc[nj][3],
+                     af[0], af[1], af[2], af[3],
+                     bf[nj][0], bf[nj][1]);
     }
 
     // v_new compute: raw -> global; decayed -> sV[stage] alias sVnew.
     __nv_bfloat16* sVnew = sV[stage];
     const float g_last = __bfloat162float(sG[stage][t_count - 1]);
-    #pragma unroll
-    for (int mi = 0; mi < 2; ++mi) {
-      int m_row_base = warp_id * 32 + mi * 16;
+    {
+      const int mrb = warp_id * 16;
       #pragma unroll
       for (int nj = 0; nj < 8; ++nj) {
         int n_col_base = nj * 8;
         #pragma unroll
         for (int kp = 0; kp < 4; ++kp) {
-          int row = m_row_base + (lane / 4) + (kp / 2) * 8;
+          int row = mrb + (lane / 4) + (kp / 2) * 8;
           int col = n_col_base + (lane % 4) * 2 + (kp % 2);
-          float vacc = v_acc[mi][nj][kp];
+          float vacc = v_acc[nj][kp];
           float vorig = (row < t_count)
               ? static_cast<float>(sV[stage][row * kBV + col]) : 0.f;
           float vraw = vorig - vacc;
@@ -365,10 +342,6 @@ __global__ void chunk_h_kernel(
             v_new_out[((size_t)(t_start + row) * H + i_h) * kV + v_base + col]
                 = __float2bfloat16(vraw);
           }
-          // Match existing FlashRT chunk_h convention: plain exp(g_last - g_t)
-          // (no clamp). For monotone-decreasing log gates (production), this
-          // agrees with FLA's safe_exp; the clamp only matters for the
-          // pathological case g_last > g_t which production never hits.
           float gr = __bfloat162float(sG[stage][row]);
           float scale = __expf(g_last - gr);
           float vdec = vraw * scale;
@@ -381,75 +354,63 @@ __global__ void chunk_h_kernel(
 
     const float decay = __expf(g_last);
     #pragma unroll
-    for (int mi = 0; mi < 2; ++mi)
+    for (int nj = 0; nj < 8; ++nj)
       #pragma unroll
-      for (int nj = 0; nj < 8; ++nj)
-        #pragma unroll
-        for (int kk = 0; kk < 4; ++kk) {
-          b_h1[mi][nj][kk] *= decay;
-          b_h2[mi][nj][kk] *= decay;
-        }
+      for (int kk = 0; kk < 4; ++kk) {
+        b_h1[nj][kk] *= decay;
+        b_h2[nj][kk] *= decay;
+      }
 
     // kv mma: b_h += k_T @ v_dec using ldmatrix.x4.trans on raw k.
     #pragma unroll
     for (int kk = 0; kk < 4; ++kk) {
-      uint32_t af[2][4];
-      #pragma unroll
-      for (int mi = 0; mi < 2; ++mi) {
-        int m_row_base = warp_id * 32 + mi * 16;
-        int k_col_base = kk * 16;
-        int bt_row = k_col_base + (lane % 8) + (lane / 16) * 8;
-        int k_col  = m_row_base + (lane / 8 % 2) * 8;
-        ldmatrix_x4_a_trans(&sK[stage][bt_row * kK + k_col],
-                            af[mi][0], af[mi][1], af[mi][2], af[mi][3]);
-      }
+      uint32_t af[4];
+      int kstate_m_row_base = warp_id * 16;        // K_state offset within block 0
+      int k_col_base = kk * 16;                    // BT offset
+      int bt_row = k_col_base + (lane % 8) + (lane / 16) * 8;
+      int k_col  = kstate_m_row_base + (lane / 8 % 2) * 8;
+      ldmatrix_x4_a_trans(&sK[stage][bt_row * kK + k_col],
+                          af[0], af[1], af[2], af[3]);
       uint32_t bf[8][2];
       #pragma unroll
       for (int nj = 0; nj < 8; ++nj) {
         int k_row_base = kk * 16;
         int n_col_base = nj * 8;
-        int row = (lane % 8) + ((lane / 8) % 2) * 8;
-        ldmatrix_x2_trans_b(&sVnew[(k_row_base + row) * kBV + n_col_base],
+        int b_row = (lane % 8) + ((lane / 8) % 2) * 8;
+        ldmatrix_x2_trans_b(&sVnew[(k_row_base + b_row) * kBV + n_col_base],
                             bf[nj][0], bf[nj][1]);
       }
       #pragma unroll
-      for (int mi = 0; mi < 2; ++mi)
-        #pragma unroll
-        for (int nj = 0; nj < 8; ++nj)
-          mma_m16n8k16(b_h1[mi][nj][0], b_h1[mi][nj][1],
-                       b_h1[mi][nj][2], b_h1[mi][nj][3],
-                       af[mi][0], af[mi][1], af[mi][2], af[mi][3],
-                       bf[nj][0], bf[nj][1]);
+      for (int nj = 0; nj < 8; ++nj)
+        mma_m16n8k16(b_h1[nj][0], b_h1[nj][1],
+                     b_h1[nj][2], b_h1[nj][3],
+                     af[0], af[1], af[2], af[3],
+                     bf[nj][0], bf[nj][1]);
     }
     #pragma unroll
     for (int kk = 0; kk < 4; ++kk) {
-      uint32_t af[2][4];
-      #pragma unroll
-      for (int mi = 0; mi < 2; ++mi) {
-        int m_row_base = 64 + warp_id * 32 + mi * 16;
-        int k_col_base = kk * 16;
-        int bt_row = k_col_base + (lane % 8) + (lane / 16) * 8;
-        int k_col  = m_row_base + (lane / 8 % 2) * 8;
-        ldmatrix_x4_a_trans(&sK[stage][bt_row * kK + k_col],
-                            af[mi][0], af[mi][1], af[mi][2], af[mi][3]);
-      }
+      uint32_t af[4];
+      int kstate_m_row_base = 64 + warp_id * 16;   // K_state offset within block 1
+      int k_col_base = kk * 16;
+      int bt_row = k_col_base + (lane % 8) + (lane / 16) * 8;
+      int k_col  = kstate_m_row_base + (lane / 8 % 2) * 8;
+      ldmatrix_x4_a_trans(&sK[stage][bt_row * kK + k_col],
+                          af[0], af[1], af[2], af[3]);
       uint32_t bf[8][2];
       #pragma unroll
       for (int nj = 0; nj < 8; ++nj) {
         int k_row_base = kk * 16;
         int n_col_base = nj * 8;
-        int row = (lane % 8) + ((lane / 8) % 2) * 8;
-        ldmatrix_x2_trans_b(&sVnew[(k_row_base + row) * kBV + n_col_base],
+        int b_row = (lane % 8) + ((lane / 8) % 2) * 8;
+        ldmatrix_x2_trans_b(&sVnew[(k_row_base + b_row) * kBV + n_col_base],
                             bf[nj][0], bf[nj][1]);
       }
       #pragma unroll
-      for (int mi = 0; mi < 2; ++mi)
-        #pragma unroll
-        for (int nj = 0; nj < 8; ++nj)
-          mma_m16n8k16(b_h2[mi][nj][0], b_h2[mi][nj][1],
-                       b_h2[mi][nj][2], b_h2[mi][nj][3],
-                       af[mi][0], af[mi][1], af[mi][2], af[mi][3],
-                       bf[nj][0], bf[nj][1]);
+      for (int nj = 0; nj < 8; ++nj)
+        mma_m16n8k16(b_h2[nj][0], b_h2[nj][1],
+                     b_h2[nj][2], b_h2[nj][3],
+                     af[0], af[1], af[2], af[3],
+                     bf[nj][0], bf[nj][1]);
     }
     __syncthreads();
 
@@ -468,26 +429,23 @@ __global__ void chunk_h_kernel(
   // Final state -> write back to the same (H, K, V) bf16 buffer (in-place).
   {
     __nv_bfloat16* base = state + (size_t)i_h * kK * kV;
+    const int m_row_base = warp_id * 16;
     #pragma unroll
-    for (int mi = 0; mi < 2; ++mi) {
-      int m_row_base = warp_id * 32 + mi * 16;
-      #pragma unroll
-      for (int nj = 0; nj < 8; ++nj) {
-        int n_col_base = nj * 8;
-        int r = lane / 4;
-        int c = (lane % 4) * 2;
-        int r0 = m_row_base + r;
-        int r1 = m_row_base + r + 8;
-        int v0 = v_base + n_col_base + c;
-        base[r0       * kV + v0    ] = __float2bfloat16(b_h1[mi][nj][0]);
-        base[r0       * kV + v0 + 1] = __float2bfloat16(b_h1[mi][nj][1]);
-        base[r1       * kV + v0    ] = __float2bfloat16(b_h1[mi][nj][2]);
-        base[r1       * kV + v0 + 1] = __float2bfloat16(b_h1[mi][nj][3]);
-        base[(r0 + 64)* kV + v0    ] = __float2bfloat16(b_h2[mi][nj][0]);
-        base[(r0 + 64)* kV + v0 + 1] = __float2bfloat16(b_h2[mi][nj][1]);
-        base[(r1 + 64)* kV + v0    ] = __float2bfloat16(b_h2[mi][nj][2]);
-        base[(r1 + 64)* kV + v0 + 1] = __float2bfloat16(b_h2[mi][nj][3]);
-      }
+    for (int nj = 0; nj < 8; ++nj) {
+      int n_col_base = nj * 8;
+      int r = lane / 4;
+      int c = (lane % 4) * 2;
+      int r0 = m_row_base + r;
+      int r1 = m_row_base + r + 8;
+      int v0 = v_base + n_col_base + c;
+      base[r0       * kV + v0    ] = __float2bfloat16(b_h1[nj][0]);
+      base[r0       * kV + v0 + 1] = __float2bfloat16(b_h1[nj][1]);
+      base[r1       * kV + v0    ] = __float2bfloat16(b_h1[nj][2]);
+      base[r1       * kV + v0 + 1] = __float2bfloat16(b_h1[nj][3]);
+      base[(r0 + 64)* kV + v0    ] = __float2bfloat16(b_h2[nj][0]);
+      base[(r0 + 64)* kV + v0 + 1] = __float2bfloat16(b_h2[nj][1]);
+      base[(r1 + 64)* kV + v0    ] = __float2bfloat16(b_h2[nj][2]);
+      base[(r1 + 64)* kV + v0 + 1] = __float2bfloat16(b_h2[nj][3]);
     }
   }
 }
