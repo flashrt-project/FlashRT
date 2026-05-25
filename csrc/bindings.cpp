@@ -4574,6 +4574,32 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("head_dim"), py::arg("qk_group"),
         py::arg("stream") = 0);
 
+    m.def("linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu",
+        [](uintptr_t k_l2, uintptr_t w_pack, uintptr_t u_pack,
+           uintptr_t g_cumsum, uintptr_t state,
+           uintptr_t h0, uintptr_t v_new,
+           uintptr_t k_pack_hv, uintptr_t wh_pack,
+           uintptr_t decayed_v_pack,
+           int S, int num_k_heads, int num_v_heads,
+           int head_dim, int qk_group, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu(
+                    to_ptr(k_l2), to_ptr(w_pack), to_ptr(u_pack),
+                    to_ptr(g_cumsum), to_ptr(state), to_ptr(h0),
+                    to_ptr(v_new), to_ptr(k_pack_hv), to_ptr(wh_pack),
+                    to_ptr(decayed_v_pack),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("k_l2"), py::arg("w_pack"), py::arg("u_pack"),
+        py::arg("g_cumsum"), py::arg("state"),
+        py::arg("h0"), py::arg("v_new"),
+        py::arg("k_pack_hv"), py::arg("wh_pack"),
+        py::arg("decayed_v_pack"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"),
+        py::arg("stream") = 0);
+
     m.def("qwen36_gdn_wy_solve_tril_b64_f32",
         [](uintptr_t A, uintptr_t Ai, int S, uintptr_t stream) {
             flash_rt::kernels::qwen36_gdn_wy_solve_tril_b64_f32(

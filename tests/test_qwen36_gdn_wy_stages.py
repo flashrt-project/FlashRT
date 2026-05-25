@@ -23,6 +23,7 @@ def _load_fvk():
         "linear_attn_gdn_wy_solve_tril_b64_f32_parallel",
         "linear_attn_gdn_wy_output_o_b64_bf16_cublaslt",
         "linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt",
+        "linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu",
         "linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_f32state",
         "linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_f32gemm",
     )
@@ -551,6 +552,63 @@ def test_linear_attn_gdn_wy_chunk_h_cublaslt_f32gemm_matches_reference(S):
     torch.testing.assert_close(h0, h0_ref, rtol=0, atol=5e-2)
     torch.testing.assert_close(v_new, v_new_ref, rtol=0, atol=6e-2)
     torch.testing.assert_close(state, state_ref, rtol=0, atol=6e-2)
+
+
+@pytest.mark.parametrize("S", [6, 64, 65])
+def test_linear_attn_gdn_wy_chunk_h_cublaslt_packed_wu_matches_reference(S):
+    fvk = _load_fvk()
+    torch.manual_seed(5654 + S)
+    k = torch.randn(S, 16, 128, device="cuda", dtype=torch.bfloat16)
+    u = torch.randn(S, 48, 128, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(S, 48, 128, device="cuda", dtype=torch.bfloat16)
+    g = (torch.randn(S, 48, device="cuda") * 0.02).to(torch.bfloat16)
+    state0 = (torch.randn(48, 128, 128, device="cuda") * 0.02
+              ).to(torch.bfloat16)
+
+    k_l2 = (k.float() / torch.sqrt(
+        torch.sum(k.float() * k.float(), dim=-1, keepdim=True) + 1e-6)
+    ).to(torch.bfloat16)
+    g_cumsum = _local_cumsum_bf16(g)
+    state = state0.clone()
+    chunks = (S + 63) // 64
+    h0 = torch.empty(chunks, 48, 128, 128, device="cuda",
+                     dtype=torch.bfloat16)
+    v_new = torch.empty(S, 48, 128, device="cuda", dtype=torch.bfloat16)
+    k_pack_hv = torch.empty(chunks, 48, 64, 128, device="cuda",
+                            dtype=torch.bfloat16)
+    w_pack = torch.zeros_like(k_pack_hv)
+    u_pack = torch.zeros_like(k_pack_hv)
+    for ci, start in enumerate(range(0, S, 64)):
+        end = min(start + 64, S)
+        w_pack[ci, :, :end - start] = w[start:end].transpose(0, 1)
+        u_pack[ci, :, :end - start] = u[start:end].transpose(0, 1)
+    wh_pack = torch.empty_like(k_pack_hv)
+    decayed_v_pack = torch.empty_like(k_pack_hv)
+
+    fvk.linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu(
+        _ptr(k_l2), _ptr(w_pack), _ptr(u_pack), _ptr(g_cumsum), _ptr(state),
+        _ptr(h0), _ptr(v_new), _ptr(k_pack_hv), _ptr(wh_pack),
+        _ptr(decayed_v_pack), S, 16, 48, 128, 3, 0)
+    torch.cuda.synchronize()
+
+    state_base = state0.clone()
+    h0_base = torch.empty_like(h0)
+    v_new_base = torch.empty_like(v_new)
+    k_pack_base = torch.empty_like(k_pack_hv)
+    w_pack_base = torch.empty_like(k_pack_hv)
+    u_pack_base = torch.empty_like(k_pack_hv)
+    wh_pack_base = torch.empty_like(k_pack_hv)
+    decayed_base = torch.empty_like(k_pack_hv)
+    fvk.linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt(
+        _ptr(k_l2), _ptr(u), _ptr(w), _ptr(g_cumsum), _ptr(state_base),
+        _ptr(h0_base), _ptr(v_new_base), _ptr(k_pack_base),
+        _ptr(w_pack_base), _ptr(u_pack_base), _ptr(wh_pack_base),
+        _ptr(decayed_base), S, 16, 48, 128, 3, 0)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(h0, h0_base, rtol=0, atol=0)
+    torch.testing.assert_close(v_new, v_new_base, rtol=0, atol=0)
+    torch.testing.assert_close(state, state_base, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("S", [6, 64, 65])

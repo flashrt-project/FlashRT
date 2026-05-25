@@ -1868,6 +1868,86 @@ void gdn_wy_chunk_h_b64_bf16_cublaslt_f32gemm_packed_wu(
       state_fp32, state_bf16, state_elems);
 }
 
+void gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu(
+    const void* k_l2,
+    const void* w_pack,
+    const void* u_pack,
+    const void* g_cumsum,
+    void*       state,
+    void*       h0,
+    void*       v_new,
+    void*       k_pack_hv,
+    void*       wh_pack,
+    void*       decayed_v_pack,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group,
+    cudaStream_t stream)
+{
+  if (S <= 0 || num_k_heads <= 0 || num_v_heads <= 0 ||
+      head_dim <= 0 || qk_group <= 0) {
+    return;
+  }
+  const int chunks = (S + kChunk - 1) / kChunk;
+  const int all_batches = chunks * num_v_heads;
+  const int pack_total = all_batches * kChunk * head_dim;
+  pack_k_hv_kernel<<<(pack_total + kThreads - 1) / kThreads,
+                      kThreads, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(k_l2),
+      reinterpret_cast<__nv_bfloat16*>(k_pack_hv),
+      S, num_k_heads, num_v_heads, head_dim, qk_group);
+
+  LtPlan& wh_plan = get_qh_plan(num_v_heads, head_dim);
+  LtPlan& ktv_plan = get_ktv_plan(num_v_heads, head_dim);
+  const float alpha = 1.0f;
+  const float beta0 = 0.0f;
+  const float beta1 = 1.0f;
+  const size_t pack_chunk_elems =
+      static_cast<size_t>(num_v_heads) * kChunk * head_dim;
+  const size_t state_elems =
+      static_cast<size_t>(num_v_heads) * head_dim * head_dim;
+
+  auto* state_bf16 = reinterpret_cast<__nv_bfloat16*>(state);
+  auto* h0_bf16 = reinterpret_cast<__nv_bfloat16*>(h0);
+  auto* k_pack_bf16 = reinterpret_cast<__nv_bfloat16*>(k_pack_hv);
+  auto* w_pack_bf16 = reinterpret_cast<const __nv_bfloat16*>(w_pack);
+  auto* u_pack_bf16 = reinterpret_cast<const __nv_bfloat16*>(u_pack);
+  auto* wh_pack_bf16 = reinterpret_cast<__nv_bfloat16*>(wh_pack);
+  auto* decayed_bf16 = reinterpret_cast<__nv_bfloat16*>(decayed_v_pack);
+
+  for (int ci = 0; ci < chunks; ++ci) {
+    const size_t off = static_cast<size_t>(ci) * pack_chunk_elems;
+    FLASHRT_CUBLASLT_CHECK(cublasLtMatmul(
+        g_lt, wh_plan.desc, &alpha,
+        w_pack_bf16 + off, wh_plan.a_desc,
+        state_bf16, wh_plan.b_desc,
+        &beta0,
+        wh_pack_bf16 + off, wh_plan.c_desc,
+        wh_pack_bf16 + off, wh_plan.c_desc,
+        &wh_plan.algo, g_workspace, g_workspace_size, stream));
+
+    const int work = static_cast<int>(pack_chunk_elems + state_elems);
+    make_vnew_decay_and_scale_state_kernel<<<
+        (work + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+        u_pack_bf16, wh_pack_bf16,
+        reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
+        state_bf16, h0_bf16 + static_cast<size_t>(ci) * state_elems,
+        reinterpret_cast<__nv_bfloat16*>(v_new), decayed_bf16,
+        S, ci, num_v_heads, head_dim);
+
+    FLASHRT_CUBLASLT_CHECK(cublasLtMatmul(
+        g_lt, ktv_plan.desc, &alpha,
+        k_pack_bf16 + off, ktv_plan.a_desc,
+        decayed_bf16 + off, ktv_plan.b_desc,
+        &beta1,
+        state_bf16, ktv_plan.c_desc,
+        state_bf16, ktv_plan.c_desc,
+        &ktv_plan.algo, g_workspace, g_workspace_size, stream));
+  }
+}
+
 void gdn_wy_output_o_b64_bf16_cublaslt(
     const void* q_l2,
     const void* k_l2,

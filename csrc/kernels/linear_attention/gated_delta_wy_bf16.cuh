@@ -205,6 +205,24 @@ void gdn_wy_chunk_h_b64_bf16_cublaslt_f32gemm_packed_wu(
     int qk_group,
     cudaStream_t stream);
 
+void gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu(
+    const void* k_l2,
+    const void* w_pack,
+    const void* u_pack,
+    const void* g_cumsum,
+    void*       state,
+    void*       h0,
+    void*       v_new,
+    void*       k_pack_hv,
+    void*       wh_pack,
+    void*       decayed_v_pack,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group,
+    cudaStream_t stream);
+
 }  // namespace linear_attention
 }  // namespace kernels
 }  // namespace flash_rt
