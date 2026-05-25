@@ -1,6 +1,7 @@
 from examples.qwen36_openai_server import (
     Qwen36Engine,
     _dedupe_shapes,
+    _long_warmup_flags,
     _parse_warmup_shapes,
     _warmup_preset_shapes,
 )
@@ -32,6 +33,22 @@ def test_parse_and_dedupe_custom_shapes():
     shapes = _dedupe_shapes(
         _parse_warmup_shapes('4096:64,8192:64,4096:64'))
     assert shapes == [(4096, 64), (8192, 64)]
+
+
+def test_long_server_warmup_modes(monkeypatch):
+    monkeypatch.delenv('FLASHRT_QWEN36_SERVER_LONG_WARMUP', raising=False)
+    assert _long_warmup_flags() == (True, False)
+
+    monkeypatch.setenv(
+        'FLASHRT_QWEN36_SERVER_LONG_WARMUP', 'prefill_graphs')
+    assert _long_warmup_flags() == (False, True)
+
+    monkeypatch.setenv(
+        'FLASHRT_QWEN36_SERVER_LONG_WARMUP', 'all_graphs')
+    assert _long_warmup_flags() == (True, True)
+
+    monkeypatch.setenv('FLASHRT_QWEN36_SERVER_LONG_WARMUP', 'off')
+    assert _long_warmup_flags() == (False, False)
 
 
 def test_server_chat_template_disables_thinking_by_default():
@@ -159,3 +176,20 @@ def test_long_graph_capture_waterline_can_be_disabled(monkeypatch):
     monkeypatch.setenv('FLASHRT_QWEN36_LONG_GRAPH_MIN_FREE_MB', '0')
 
     assert fe._long_tq_graph_capture_allowed() is True
+
+
+def test_clear_graphs_drops_long_prefill_caches():
+    import collections
+
+    from flash_rt.frontends.torch.qwen36_rtx import Qwen36TorchFrontendRtx
+
+    fe = Qwen36TorchFrontendRtx.__new__(Qwen36TorchFrontendRtx)
+    fe._captured_prefill_graphs_tq = collections.OrderedDict(
+        {(0, 8, 'none'): object()})
+    fe._captured_prefill_graphs_fp8kv = collections.OrderedDict(
+        {(0, 8, 'none'): object()})
+
+    fe.clear_graphs()
+
+    assert fe._captured_prefill_graphs_tq == collections.OrderedDict()
+    assert fe._captured_prefill_graphs_fp8kv == collections.OrderedDict()

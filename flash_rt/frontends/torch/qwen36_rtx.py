@@ -5678,7 +5678,9 @@ class Qwen36TorchFrontendRtx:
                 '_captured_chain_graphs',
                 '_captured_graphs_tq',
                 '_captured_verify_graphs_tq',
+                '_captured_prefill_graphs_tq',
                 '_captured_verify_graphs_fp8kv',
+                '_captured_prefill_graphs_fp8kv',
                 '_captured_verify_graphs_dflash',
                 '_captured_drafter_graphs_dflash',
         ):
@@ -6826,6 +6828,99 @@ class Qwen36TorchFrontendRtx:
         self.reset_mtp_state()
         return warmed
 
+    def warmup_long_ctx_prefill_graphs(
+            self, shapes: list[tuple[int, int]]
+    ) -> list[tuple[int, int, str]]:
+        """Pre-capture long-context prefill chunk graphs.
+
+        This warms the graph keys that ``_prefill_long_ctx_tq_chunked``
+        will replay for a bucketed prompt length. It does not replace real
+        request prefill, but it moves graph capture and allocator overhead
+        out of the first request for explicit serving envelopes.
+        """
+        import torch
+
+        from flash_rt import flash_rt_kernels as fvk
+
+        if not getattr(self, '_long_ctx_mode', False):
+            return []
+        kv_mode = getattr(self, '_long_kv_cache_mode', 'tq')
+        if kv_mode not in ('tq', 'fp8'):
+            return []
+        if kv_mode == 'tq' and not hasattr(self, '_tq_cache_packed'):
+            return []
+        if kv_mode == 'fp8' and not hasattr(self, '_fp8_K_cache'):
+            return []
+        if not hasattr(self, '_rope_cos_table'):
+            self._build_rope_table()
+
+        chunk = int(os.environ.get(
+            'FLASHRT_QWEN36_TQ_PREFILL_CHUNK', str(self.MAX_Q_SEQ)))
+        chunk_cap = min(self.MAX_Q_SEQ, int(self._h_b.shape[0]))
+        chunk = max(1, min(chunk, chunk_cap))
+        d = self._rope_dim
+        s = torch.cuda.current_stream().cuda_stream
+        warmed: list[tuple[int, int, str]] = []
+        max_chunks_per_shape = int(os.environ.get(
+            'FLASHRT_QWEN36_LONG_PREFILL_WARMUP_MAX_CHUNKS', '0') or '0')
+        min_free_mb = int(os.environ.get(
+            'FLASHRT_QWEN36_LONG_WARMUP_MIN_FREE_MB', '1024') or '0')
+
+        with torch.no_grad():
+            for prompt_len, max_new_tokens in shapes:
+                prompt_len = int(prompt_len)
+                max_new_tokens = int(max_new_tokens)
+                if not self._should_use_long_ctx_route(
+                        prompt_len, max_new_tokens):
+                    continue
+                if prompt_len + max_new_tokens > self._user_max_seq:
+                    continue
+                mtp_tail = self._long_mtp_prefill_tail_for_prompt(prompt_len)
+                hidden_save_start = max(0, prompt_len - mtp_tail - 1)
+                emitted = 0
+                for start in range(0, prompt_len, chunk):
+                    if (max_chunks_per_shape > 0
+                            and emitted >= max_chunks_per_shape):
+                        break
+                    if min_free_mb > 0:
+                        try:
+                            free_bytes, _ = torch.cuda.mem_get_info()
+                            if int(free_bytes) < (min_free_mb << 20):
+                                break
+                        except Exception:
+                            pass
+                    end = min(start + chunk, prompt_len)
+                    S = end - start
+                    is_last = end == prompt_len
+                    save_hidden = mtp_tail > 0 and end > hidden_save_start
+                    if save_hidden:
+                        mode = 'hidden_last' if is_last else 'hidden'
+                    else:
+                        mode = 'last' if is_last else 'none'
+                    cos_S = self._rope_cos_table[start:end].view(1, S, d)
+                    sin_S = self._rope_sin_table[start:end].view(1, S, d)
+                    self._verify_static_tokens[:, :S].fill_(1)
+                    fvk.gpu_copy(
+                        self._verify_static_cos[:, :S].data_ptr(),
+                        cos_S.data_ptr(), S * d * 2, s,
+                    )
+                    fvk.gpu_copy(
+                        self._verify_static_sin[:, :S].data_ptr(),
+                        sin_S.data_ptr(), S * d * 2, s,
+                    )
+                    if kv_mode == 'fp8':
+                        self._ensure_prefill_graph_nvfp4_fp8kv(
+                            start, S, mode)
+                    else:
+                        self._tq_mark_dequant_valid_end(start)
+                        self._ensure_prefill_graph_nvfp4_tq(start, S, mode)
+                    warmed.append((start, S, mode))
+                    emitted += 1
+
+        self.reset_state()
+        self.reset_mtp_state()
+        return warmed
+
     def _long_tq_graph_capture_allowed(self) -> bool:
         min_free_mb = int(os.environ.get(
             'FLASHRT_QWEN36_LONG_GRAPH_MIN_FREE_MB', '768') or '0')
@@ -6945,6 +7040,114 @@ class Qwen36TorchFrontendRtx:
         torch.cuda.current_stream().wait_stream(gs)
 
         self._graph_cache_put(self._captured_verify_graphs_fp8kv, key, g)
+        return g
+
+    def _ensure_prefill_graph_nvfp4_tq(
+            self, cur_pos: int, K: int, logits_mode: str):
+        """Lazy CUDA Graph capture for long-context TQ prefill chunks.
+
+        This intentionally has a separate cache from verify graphs because
+        prefill uses ``logits_mode='none'`` for intermediate chunks and
+        ``last``/``hidden_last`` for the tail. Reusing verify's all-logits
+        graph would reintroduce a large lm_head cost during prefill.
+        """
+        import torch
+
+        if not hasattr(self, '_captured_prefill_graphs_tq'):
+            self._captured_prefill_graphs_tq = collections.OrderedDict()
+
+        key = (cur_pos, K, logits_mode)
+        g = self._graph_cache_get(self._captured_prefill_graphs_tq, key)
+        if g is not None:
+            return g
+
+        gs = self._graph_stream
+        snap_lin = self._lin_state.clone()
+        snap_conv = self._lin_conv_state.clone()
+
+        def _restore():
+            self._lin_state.copy_(snap_lin)
+            self._lin_conv_state.copy_(snap_conv)
+            self._tq_mark_dequant_valid_end(cur_pos)
+
+        gs.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(gs), torch.no_grad():
+            tokens_K = self._verify_static_tokens[:, :K]
+            cos_K = self._verify_static_cos[:, :K]
+            sin_K = self._verify_static_sin[:, :K]
+            for _ in range(2):
+                self._tq_mark_dequant_valid_end(cur_pos)
+                self.forward_own_decode_K_nvfp4_tq(
+                    tokens_K, cos_K, sin_K, cur_pos, K=K,
+                    logits_mode=logits_mode)
+                _restore()
+
+        gs.synchronize()
+        self._tq_mark_dequant_valid_end(cur_pos)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(
+                g, stream=gs, pool=self._graph_mempool,
+        ), torch.no_grad():
+            self.forward_own_decode_K_nvfp4_tq(
+                tokens_K, cos_K, sin_K, cur_pos, K=K,
+                logits_mode=logits_mode)
+        with torch.cuda.stream(gs), torch.no_grad():
+            _restore()
+        gs.synchronize()
+        torch.cuda.current_stream().wait_stream(gs)
+
+        self._graph_cache_put(self._captured_prefill_graphs_tq, key, g)
+        return g
+
+    def _ensure_prefill_graph_nvfp4_fp8kv(
+            self, cur_pos: int, K: int, logits_mode: str):
+        """Lazy CUDA Graph capture for long-context FP8-KV prefill chunks."""
+        import torch
+
+        if not hasattr(self, '_captured_prefill_graphs_fp8kv'):
+            self._captured_prefill_graphs_fp8kv = collections.OrderedDict()
+
+        key = (cur_pos, K, logits_mode)
+        g = self._graph_cache_get(self._captured_prefill_graphs_fp8kv, key)
+        if g is not None:
+            return g
+
+        gs = self._graph_stream
+        snap_lin = self._lin_state.clone()
+        snap_conv = self._lin_conv_state.clone()
+
+        def _restore():
+            self._lin_state.copy_(snap_lin)
+            self._lin_conv_state.copy_(snap_conv)
+            self._fp8_mark_dequant_valid_end(cur_pos)
+
+        gs.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(gs), torch.no_grad():
+            tokens_K = self._verify_static_tokens[:, :K]
+            cos_K = self._verify_static_cos[:, :K]
+            sin_K = self._verify_static_sin[:, :K]
+            for _ in range(2):
+                self._fp8_mark_dequant_valid_end(cur_pos)
+                self.forward_own_decode_K_nvfp4_fp8kv(
+                    tokens_K, cos_K, sin_K, cur_pos, K=K,
+                    logits_mode=logits_mode)
+                _restore()
+
+        gs.synchronize()
+        self._fp8_mark_dequant_valid_end(cur_pos)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(
+                g, stream=gs, pool=self._graph_mempool,
+        ), torch.no_grad():
+            self.forward_own_decode_K_nvfp4_fp8kv(
+                tokens_K, cos_K, sin_K, cur_pos, K=K,
+                logits_mode=logits_mode)
+        with torch.cuda.stream(gs), torch.no_grad():
+            _restore()
+        gs.synchronize()
+        torch.cuda.current_stream().wait_stream(gs)
+
+        self._graph_cache_put(self._captured_prefill_graphs_fp8kv, key, g)
         return g
 
     # ---------- Stage 7 G2: NVFP4 MTP chain graph capture ----------
@@ -7287,6 +7490,11 @@ class Qwen36TorchFrontendRtx:
         chunk = max(1, min(chunk, chunk_cap))
         d = self._rope_dim
         s = torch.cuda.current_stream().cuda_stream
+        use_prefill_graph = (
+            os.environ.get(
+                'FLASHRT_QWEN36_TQ_PREFILL_GRAPH', '1').lower()
+            in ('1', 'true', 'yes', 'on')
+        )
 
         last_h = None
         last_logits = None
@@ -7301,7 +7509,44 @@ class Qwen36TorchFrontendRtx:
                 mode = 'hidden_last' if is_last else 'hidden'
             else:
                 mode = 'last' if is_last else 'none'
-            if getattr(self, '_long_kv_cache_mode', 'tq') == 'fp8':
+            kv_mode = getattr(self, '_long_kv_cache_mode', 'tq')
+            if use_prefill_graph:
+                fvk.gpu_copy(
+                    self._verify_static_tokens[:, :S].data_ptr(),
+                    input_ids[:, start:end].data_ptr(), S * 8, s,
+                )
+                fvk.gpu_copy(
+                    self._verify_static_cos[:, :S].data_ptr(),
+                    cos_S.data_ptr(), S * d * 2, s,
+                )
+                fvk.gpu_copy(
+                    self._verify_static_sin[:, :S].data_ptr(),
+                    sin_S.data_ptr(), S * d * 2, s,
+                )
+                if kv_mode == 'fp8':
+                    graph = self._ensure_prefill_graph_nvfp4_fp8kv(
+                        start, S, mode)
+                    gs = self._graph_stream
+                    gs.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(gs):
+                        graph.replay()
+                    torch.cuda.current_stream().wait_stream(gs)
+                    self._fp8_mark_dequant_valid_end(end)
+                    logits = (None if mode in ('none', 'hidden')
+                              else self._logits_buf)
+                else:
+                    self._tq_mark_dequant_valid_end(start)
+                    graph = self._ensure_prefill_graph_nvfp4_tq(
+                        start, S, mode)
+                    gs = self._graph_stream
+                    gs.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(gs):
+                        graph.replay()
+                    torch.cuda.current_stream().wait_stream(gs)
+                    self._tq_mark_dequant_valid_end(end)
+                    logits = (None if mode in ('none', 'hidden')
+                              else self._logits_buf)
+            elif kv_mode == 'fp8':
                 logits = self.forward_own_decode_K_nvfp4_fp8kv(
                     input_ids[:, start:end], cos_S, sin_S, start, S,
                     logits_mode=mode)

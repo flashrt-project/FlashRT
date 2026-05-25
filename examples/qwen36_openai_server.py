@@ -23,7 +23,9 @@ Usage:
     # (prompt_len:max_tokens) shapes so the FIRST real request usually
     # hits warm graphs. Short buckets run a dummy generation; long
     # buckets default to decode-graph-only warmup, avoiding minutes of
-    # synthetic 200K/256K prompt prefill. 128K+ buckets warm every early
+    # synthetic 200K/256K prompt prefill. Set
+    # FLASHRT_QWEN36_SERVER_LONG_WARMUP=all_graphs to also capture long
+    # prefill chunk graphs at startup. 128K+ buckets warm every early
     # decode position by default; tune with
     # FLASHRT_QWEN36_LONG_WARMUP_STRIDE/MAX_GRAPHS. Add --warmup
     # "32768:64,65536:64,131072:64,204800:64,262144:16" for an explicit
@@ -223,11 +225,7 @@ class Qwen36Engine:
         torch = self._torch
         log.info('warmup: pre-capturing graphs for %d shape(s) ...',
                  len(shapes))
-        long_graph_only = (
-            os.environ.get(
-                'FLASHRT_QWEN36_SERVER_LONG_WARMUP', 'graphs').lower()
-            in ('graphs', 'graph', 'decode_graphs', '1', 'true', 'yes')
-        )
+        long_decode_graphs, long_prefill_graphs = _long_warmup_flags()
         for prompt_len, max_tok in shapes:
             if prompt_len + max_tok > self.fe._user_max_seq:
                 log.warning(
@@ -251,15 +249,25 @@ class Qwen36Engine:
                     and (prompt_len >= route_min
                          or prompt_len + max_tok > bf16_cap)
                 )
-            if self.spec_enabled and is_long and long_graph_only:
-                warmed = self.fe.warmup_long_ctx_decode_graphs(
-                    [(prompt_len, max_tok)], K=self.K)
+            if (self.spec_enabled and is_long
+                    and (long_decode_graphs or long_prefill_graphs)):
+                prefill_warmed = []
+                decode_warmed = []
+                if (long_prefill_graphs
+                        and hasattr(self.fe,
+                                    'warmup_long_ctx_prefill_graphs')):
+                    prefill_warmed = self.fe.warmup_long_ctx_prefill_graphs(
+                        [(prompt_len, max_tok)])
+                if long_decode_graphs:
+                    decode_warmed = self.fe.warmup_long_ctx_decode_graphs(
+                        [(prompt_len, max_tok)], K=self.K)
                 torch.cuda.synchronize()
                 log.info(
                     '  warmup shape=(prompt=%d, max_tok=%d, eff_K=%s) '
-                    'decode-graphs=%d in %.1f s',
+                    'prefill-graphs=%d decode-graphs=%d in %.1f s',
                     prompt_len, max_tok, self._effective_long_k(prompt_len),
-                    len(warmed), time.perf_counter() - t0)
+                    len(prefill_warmed), len(decode_warmed),
+                    time.perf_counter() - t0)
                 continue
 
             input_ids = self._dummy_input_ids(prompt_len)
@@ -590,6 +598,24 @@ def _parse_warmup_shapes(spec_csv: str) -> List[Tuple[int, int]]:
             sys.exit(f'invalid --warmup spec: {spec!r} '
                      '(expected "prompt_len:max_tokens")')
     return shapes
+
+
+def _long_warmup_flags() -> Tuple[bool, bool]:
+    """Return (decode_graphs, prefill_graphs) for long warmup mode."""
+    mode = os.environ.get(
+        'FLASHRT_QWEN36_SERVER_LONG_WARMUP', 'graphs').strip().lower()
+    if mode in ('off', 'none', 'false', '0', 'full_generation'):
+        return False, False
+    if mode in ('prefill', 'prefill_graphs'):
+        return False, True
+    if mode in ('all', 'all_graphs', 'full_graphs'):
+        return True, True
+    if mode in ('graphs', 'graph', 'decode', 'decode_graphs',
+                '1', 'true', 'yes', 'on'):
+        return True, False
+    sys.exit(
+        'invalid FLASHRT_QWEN36_SERVER_LONG_WARMUP '
+        f'{mode!r}; expected graphs, prefill_graphs, all_graphs, or off')
 
 
 def _warmup_preset_shapes(preset: str, max_seq: int) -> List[Tuple[int, int]]:
