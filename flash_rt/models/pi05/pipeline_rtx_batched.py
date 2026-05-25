@@ -178,8 +178,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         # input (cos vs B=1-with-slot-1's-prompt = -0.24). Latent in
         # symmetric inputs (both slots OOB-read the same garbage so the
         # corrupted streams stay equal); only asymmetric prompts (e.g.
-        # CFG cond/uncond) expose it. Diagnosed in PHASE3_DEBUG_NOTES
-        # Bug 5.
+        # CFG cond/uncond) expose it.
         max_count = max(
             B * nv * vs * 3 * VIS_D,            # vision QKV bias
             B * nv * vs * VIS_H,                # vision FFN up bias
@@ -208,8 +207,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         # Symptom: slot 1 vs B=1-with-slot-1's-prompt cos ≈ -0.2 even
         # under symmetric mirrored noise; latent under symmetric
         # prompts because both slots OOB-read the same bytes from the
-        # next step's slice and stay in sync. Diagnosed in
-        # PHASE3_DEBUG_NOTES Bug 6.
+        # next step's slice and stay in sync.
         # Fix: replicate each per-step (and per-layer) slice ``B`` times
         # along the row dim into ``*_b2`` style buffers — so rows
         # ``[b*ds:(b+1)*ds]`` of the b2 slice equal the parent's
@@ -668,8 +666,8 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         # rows in the right slot.
         per_sample_qkv_bytes = seq * (ENC_NH + 2 * ENC_NKV) * ENC_HD * 2
         # Q dst stride MUST come from the attention backend's actual
-        # buffer layout (es_max-based), not from the per-call ``seq`` —
-        # see PHASE3_DEBUG_NOTES Bug 7. enc_Q_b2 is sized for
+        # buffer layout (es_max-based), not from the per-call ``seq``.
+        # enc_Q_b2 is sized for
         # encoder_seq_max along the time dim; offsetting slot 1 by
         # ``seq * NH * HD * 2`` (when seq < es_max) lands the writes
         # inside slot 0's tail and leaves slot 1 uninitialised.

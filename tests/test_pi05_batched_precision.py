@@ -9,8 +9,7 @@ M=seq) from CFG-specific algorithmic drift tested in
 ``test_pi05_cfg_batched_inference.py``.
 
 Run both branches in separate child processes; sharing a CUDA context
-between two frontend instances in one process is known-flaky (see
-``internal-tests/rl/PHASE3_DEBUG_NOTES.md``).
+between two frontend instances in one process is known-flaky.
 """
 
 import os

@@ -2145,8 +2145,9 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("stream") = 0);
 
     // ------------------------------------------------------------------
-    //  FP8 block-128 dequantization + GEMM (Phase 2.2 / Path D)
-    //  Used by Qwen3.6-27B; see internal-docs/qwen36_fp8_block128_gemm_design.md
+    //  FP8 block-128 dequantization + GEMM.
+    //  Used by Qwen3.6-27B as a portable fallback when native
+    //  block-scaled FP8 GEMM is unavailable or not selected.
     //  All entries are additive — existing fp8_gemm_descale_* untouched.
     // ------------------------------------------------------------------
     m.def("fp8_block128_dequantize_to_bf16",

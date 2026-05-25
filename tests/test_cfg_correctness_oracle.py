@@ -64,10 +64,10 @@ TAU_C1_MAX_ABS_DIFF = 0.0          # bf16 round-to-nearest exact
 # at the final step (k=num_steps) is what we lock.
 TAU_C2_NOISE_PER_STEP = {
     # (path, beta) -> per-step floor (min over k). Margin ≈ 0.005 below
-    # the measured value at fixture-generation time. After Bug 7
-    # (enc_Q stride mismatch — see PHASE3_DEBUG_NOTES) was fixed,
-    # batched per-step noise tracking matches serial within FP8
-    # rounding noise across the entire paper β ∈ [1.0, 2.5] range.
+    # the measured value at fixture-generation time. After the enc_Q
+    # stride mismatch was fixed, batched per-step noise tracking matches
+    # serial within FP8 rounding noise across the entire paper
+    # β ∈ [1.0, 2.5] range.
     ("serial", 1.0):  0.99,  ("serial", 1.5):  0.98,
     ("serial", 2.0):  0.97,  ("serial", 2.5):  0.95,
     ("batched", 1.0): 0.99,  ("batched", 1.5): 0.98,

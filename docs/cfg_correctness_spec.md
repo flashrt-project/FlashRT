@@ -117,8 +117,8 @@ slot 0 satisfies C3 (cos ≥ 0.999); slot 1 currently does **not**
 (measured cos ≈ 0.92 — the M2 fix target).
 
 **Test**: existing `tests/test_pi05_batched_precision.py` (slot 0)
-plus the asymmetric-prompt smoke check in `internal-tests/rl/`
-(slot 1, not yet promoted to a `tests/` gate; will land with M2).
+plus an asymmetric-prompt smoke check for slot 1. The slot-1 case is
+tracked as a candidate public `tests/` gate.
 
 ### C4 — CFG identity at $\beta = 1$
 
@@ -181,12 +181,11 @@ is a snapshot.
 | 2.0 | 0.97 | 0.98 |
 | 2.5 | 0.96 | 0.97 |
 
-After PHASE3_DEBUG_NOTES Bug 7 (the encoder enc_Q stride mismatch
-that left slot 1's Q buffer uninitialised under prompt asymmetry)
-was fixed, the batched path tracks the FP32 reference at least as
-tightly as serial across the full paper β range. Both paths share
-the FP8 quantisation budget; the per-β floors above pin the budget
-without any path-specific carve-out.
+After the encoder enc_Q stride mismatch that left slot 1's Q buffer
+uninitialised under prompt asymmetry was fixed, the batched path tracks
+the FP32 reference at least as tightly as serial across the full paper
+β range. Both paths share the FP8 quantisation budget; the per-β floors
+above pin the budget without any path-specific carve-out.
 
 ---
 
@@ -200,10 +199,9 @@ without any path-specific carve-out.
 | **M4** | Documentation + release prep | ✅ done — `docs/rl_inference.md` updated; release notes in repo. |
 | **M5** | Real-LIBERO validation | pending — C5 with real obs ≥ 0.999 |
 
-The exact diagnostic plan for M2 (root-cause hypothesis tree, 
-per-step probe usage, sanitizer / autotune experiments) lives in
-`internal-tests/rl/PHASE3_DEBUG_NOTES.md` (gitignored,
-internal-only).
+The M2 diagnostic plan covered the root-cause hypothesis tree,
+per-step probes, sanitizer runs, and autotune experiments; the public
+result is summarized in the milestones above.
 
 ---
 

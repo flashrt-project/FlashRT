@@ -95,9 +95,9 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
         # NOT by ``encoder_seq_len`` rows; otherwise slot 1's writes
         # land in slot 0's tail (which is silently unused) and slot 1
         # itself stays uninitialised — FA2 then reads garbage Q for
-        # batch index 1, wrecking slot 1's attention output. Was the
-        # root cause of the slot-asymmetric drift in PHASE3_DEBUG_NOTES
-        # Bug 7.
+        # batch index 1, wrecking slot 1's attention output. This was
+        # the root cause of the slot-asymmetric drift seen during CFG
+        # batched validation.
         self._enc_q_sample_stride_bytes_b2 = es_max * 8 * 256 * elem_size
 
         # ── FA2 output / LSE buffers (B-folded) ──

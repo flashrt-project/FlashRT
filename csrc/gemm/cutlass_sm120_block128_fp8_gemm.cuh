@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // CUTLASS-based block-128 FP8 GEMM for SM120a (RTX 5090 / Blackwell
-// consumer), Path B per internal-docs/qwen36_fp8_block128_gemm_design.md.
+// consumer).
 //
 // Native block-scaled FP8 GEMM with DeepSeek-V3 / Qwen3.6 layout:
 //   * activation: per-token (1) x per-128 K block scale

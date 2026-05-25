@@ -107,9 +107,9 @@ def test_batched_cfg_inference_returns_finite_actions():
 #
 # The test shells out to two child processes: running a serial
 # Pi05CFGPipeline frontend and a Pi05CFGBatchedPipeline frontend in the
-# same Python process has a known CUDA-state crosstalk (see
-# internal-tests/rl/PHASE3_DEBUG_NOTES.md), so we use subprocess
-# isolation — matching the pattern the repo's latency benchmarks use.
+# same Python process has known CUDA-state crosstalk, so we use
+# subprocess isolation — matching the pattern the repo's latency
+# benchmarks use.
 
 _PRECISION_CHILD = r"""
 import os, sys, numpy as np, torch
@@ -198,11 +198,11 @@ def test_batched_cfg_beta_one_matches_cond_only():
 def test_batched_cfg_cos_vs_serial():
     """Batched CFG vs serial CFG at production beta=1.5.
 
-    Both implementations are paper-faithful (Eq. 13). After
-    PHASE3_DEBUG_NOTES Bug 7 (the enc_Q stride mismatch that left
-    slot 1's Q uninitialised under prompt asymmetry) was fixed, the
-    two paths track each other within FP8 rounding noise across the
-    paper's full β ∈ [1.0, 2.5] moderate range. See
+    Both implementations are paper-faithful (Eq. 13). After the enc_Q
+    stride mismatch that left slot 1's Q uninitialised under prompt
+    asymmetry was fixed, the two paths track each other within FP8
+    rounding noise across the paper's full β ∈ [1.0, 2.5] moderate
+    range. See
     docs/cfg_correctness_spec.md.
     """
     import tempfile
@@ -226,10 +226,10 @@ def test_batched_cfg_cos_vs_serial():
                     reason=f"pi05 ckpt missing at {CKPT_PI05}")
 def test_batched_cfg_beta_sweep_trend():
     """Lock the (batched vs serial) cosine across the paper's full β
-    ∈ [1.0, 2.5] range. After PHASE3_DEBUG_NOTES Bug 7 (encoder
-    enc_Q stride mismatch) was fixed, both paths track each other
-    within FP8 rounding noise; the floors below catch any future
-    slot-asymmetric regression — especially anything that lets one
+    ∈ [1.0, 2.5] range. After the encoder enc_Q stride mismatch was
+    fixed, both paths track each other within FP8 rounding noise; the
+    floors below catch any future slot-asymmetric regression —
+    especially anything that lets one
     slot read uninitialised memory along the encoder's Q path.
     """
     import tempfile

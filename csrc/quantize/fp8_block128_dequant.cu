@@ -6,8 +6,7 @@
 // Phase 2.2 / Path D for Qwen3.6 FP8 ckpt: dequantize on the fly so a
 // stock cuBLASLt BF16 GEMM can compute the matmul. Slow (3x bandwidth
 // vs in-place block-FP8 GEMM) but correct on SM120 / cuBLAS 13 where
-// BLK128x128_32F dispatch is unsupported (see internal-docs/
-// qwen36_fp8_block128_gemm_design.md §3 probe result).
+// BLK128x128_32F dispatch is unavailable in the deployed cuBLASLt path.
 //
 // Implementation choices:
 //   * One fp8 element per thread (kept simple; vectorization can come

@@ -70,8 +70,8 @@ class Pi05CFGBatchedPipeline(Pi05BatchedPipeline):
     # The π0.6 RECAP paper recommends β ∈ [1.5, 2.5] as the "moderate"
     # CFG range (Appendix E); the production batched path now meets
     # the ≥0.99 cosine release floor against the FP32 reference across
-    # the entire range (after PHASE3_DEBUG_NOTES Bug 7's enc_Q stride
-    # fix). Measured cosine vs FP32 R_fp32 reference:
+    # the entire range after the enc_Q stride fix. Measured cosine vs
+    # FP32 R_fp32 reference:
     #   β=1.0 → 0.9996  (paper default; CFG collapses to v_cond)
     #   β=1.5 → 0.9989
     #   β=2.0 → 0.9977
@@ -403,7 +403,7 @@ class Pi05CFGBatchedPipeline(Pi05BatchedPipeline):
             # save/restore contract of Pi05CFGPipeline. Without this the
             # uncond trajectory drifts (plain-Euler vs guided) and the
             # cosine vs serial CFG degrades from 1.0 to ~0.97 over 10
-            # denoising steps (diagnosed in PHASE3_DEBUG_NOTES Bug 3).
+            # denoising steps.
             # cudaMemcpyDeviceToDevice = 3; graph-capturable.
             self._cudart.cudaMemcpyAsync(
                 ctypes.c_void_p(noise_uncond_ptr),

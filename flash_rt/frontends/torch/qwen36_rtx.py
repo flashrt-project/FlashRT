@@ -586,9 +586,8 @@ class Qwen36TorchFrontendRtx:
         #      warmup, capture, and replay use different streams, the
         #      replayed bf16 reductions diverge from the reference.
         # Solution: pin a single non-default stream and use it for
-        # warmup + capture + replay. Verified in
-        # internal-tests/rtx_qwen36_graph_stream_test.py: rms_norm
-        # captured this way produces cos=1.0 vs non-graph baseline.
+        # warmup + capture + replay. The graph-capture regression suite
+        # validates this against the non-graph baseline.
         self._graph_stream = torch.cuda.Stream(device=device)
 
         # Phase 4.4 step 6: per-cur_pos lazy CUDA Graph cache for
@@ -6780,7 +6779,7 @@ class Qwen36TorchFrontendRtx:
                                  max_new_tokens: int):
         """**WIP / does not save time** — kept for architecture validation.
 
-        Critical realization (verified via rtx_qwen36_spec_debug):
+        Critical realization from speculative-decode validation:
         MTP draft and main verify both predict the SAME position
         (cur_pos+1 given input tok@cur_pos). They are competing
         predictions, not complementary. Even with high accept rate

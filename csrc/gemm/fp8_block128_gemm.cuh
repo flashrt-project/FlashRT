@@ -6,10 +6,9 @@
 //
 //   D_bf16[M, N] = (A_fp8 ⊙ act_block_scale) @ (B_fp8 ⊙ w_block_scale)^T
 //
-// using the dequant-then-BF16-GEMM stop-gap path (see internal-docs/
-// qwen36_fp8_block128_gemm_design.md). Replace with a real block-FP8
-// GEMM (Path B, custom CUTLASS) in a later phase once profiling shows
-// this path's 3x memory-bandwidth tax dominates tok/s.
+// using the dequant-then-BF16-GEMM stop-gap path. Replace with the
+// native block-FP8 GEMM path once profiling shows this path's 3x
+// memory-bandwidth tax dominates tok/s.
 
 #pragma once
 

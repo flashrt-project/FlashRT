@@ -133,7 +133,7 @@ class Pi05CFGPipeline(Pi05Pipeline):
         # Result before this fix: v_cond and v_uncond both used uncond
         # KV, the CFG combine became a near-no-op (cos vs cond-only at
         # beta=1.0 measured 0.95 instead of the mathematically expected
-        # ~1.0). See PHASE3_DEBUG_NOTES Bug 4.
+        # ~1.0).
         # Fix: snapshot the full enc_K / enc_V tensor after each encoder
         # pass, then memcpy the appropriate snapshot back into the
         # shared cache at the start of each per-step decoder forward.

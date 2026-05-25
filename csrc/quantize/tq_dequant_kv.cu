@@ -3,7 +3,7 @@
 // Phase 3A B9 step S3.  Add-only (new file).  Existing TQ Python helpers
 // and FA2 wrapper untouched.
 //
-// Strategy decision (data-driven, see internal-tests/rtx_qwen36_b9_*):
+// Strategy decision:
 //
 //   The naive "fully-fused single CUDA kernel" approach (v1, deleted)
 //   runs the 256×256 dequant GEMM portion on FP32 ALU and clocks 5.5 ms
@@ -1105,7 +1105,7 @@ void tq_combine_kv_bf16_launch(
 // matrix's small magnitudes (~N(0, 1/d)), TF32 rounding accumulates to
 // ~1e-2 relative — comparable to BF16's 7-bit-mantissa quantum but
 // without rounding the products before accumulation.  Validated to
-// keep B8 token-argmax 16/16 (see internal-tests/).
+// keep token argmax stable in the long-context validation suite.
 extern "C"
 void tq_fp32_gemm_tf32_launch(
     const void* a_fp32, const void* b_fp32,
