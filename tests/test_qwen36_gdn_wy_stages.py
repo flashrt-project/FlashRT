@@ -185,6 +185,47 @@ def _output_o_ref(q_l2, k_l2, v_new, h0, g_cumsum, chunk=64):
     return out
 
 
+def _flashqla_fused_gdr_ref(q_l2, k_l2, v, beta, g_cumsum, Ai_nogate, state,
+                            chunk=64):
+    S = k_l2.shape[0]
+    chunks = (S + chunk - 1) // chunk
+    state_f = state.float().clone()
+    out = torch.empty(S, 48, 128, device=k_l2.device, dtype=torch.bfloat16)
+    scale = 128 ** -0.5
+    for ci in range(chunks):
+        start = ci * chunk
+        end = min(start + chunk, S)
+        T = end - start
+        for vh in range(48):
+            kh = vh // 3
+            qh = q_l2[start:end, kh].float()
+            kh_l2 = k_l2[start:end, kh].float()
+            vv = v[start:end, vh].float()
+            gg = g_cumsum[start:end, vh].float()
+            bb = beta[start:end, vh].float()
+            state_prev = state_f[vh].clone()
+
+            # FlashQLA-style form:
+            # W = V - exp(g_t) * (K @ S)
+            # Vd = (exp(g_i-g_j) * Ai_no_gate[i,j] * beta[j]) @ W
+            w0 = vv - torch.exp(gg)[:, None] * (kh_l2 @ state_prev)
+            decay = torch.exp(gg[:, None] - gg[None, :])
+            ag = Ai_nogate[ci, vh, :T, :T] * decay * bb[None, :]
+            vd = ag @ w0
+
+            q_state = torch.exp(gg)[:, None] * (qh @ state_prev)
+            p = qh @ kh_l2.T
+            causal_decay = torch.tril(decay)
+            local = (p * causal_decay) @ vd
+            out[start:end, vh] = ((q_state + local) * scale).to(torch.bfloat16)
+
+            g_last = gg[-1]
+            state_f[vh] *= torch.exp(g_last)
+            v_prime = vd * torch.exp(g_last - gg)[:, None]
+            state_f[vh] += kh_l2.T @ v_prime
+    return out, state_f.to(torch.bfloat16)
+
+
 @pytest.mark.parametrize("S", [6, 64, 65])
 def test_qwen36_wy_norm_cumsum_and_kkt_match_reference(S):
     fvk = _load_fvk()
@@ -453,6 +494,39 @@ def test_linear_attn_gdn_wy_kkt_nogate_matches_reference_and_gated_factorization
         decay = torch.exp(gg.T[:, :, None] - gg.T[:, None, :])
         rhs = Ai_nogate[ci, :, :T, :T] * decay * bb.T[:, None, :]
         torch.testing.assert_close(lhs, rhs, rtol=3e-3, atol=3e-3)
+
+
+@pytest.mark.parametrize("S", [64, 128])
+def test_flashqla_fused_gdr_math_matches_existing_wy_reference(S):
+    torch.manual_seed(20260528 + S)
+    q = torch.randn(S, 16, 128, device="cuda", dtype=torch.bfloat16) * 0.2
+    k = torch.randn(S, 16, 128, device="cuda", dtype=torch.bfloat16) * 0.2
+    v = torch.randn(S, 48, 128, device="cuda", dtype=torch.bfloat16) * 0.2
+    beta = torch.rand(S, 48, device="cuda", dtype=torch.bfloat16) * 0.8
+    g = (torch.randn(S, 48, device="cuda") * 0.015).to(torch.bfloat16)
+    state0 = (torch.randn(48, 128, 128, device="cuda") * 0.01
+              ).to(torch.bfloat16)
+    q_l2 = (q.float() / torch.sqrt(
+        torch.sum(q.float() * q.float(), dim=-1, keepdim=True) + 1e-6)
+    ).to(torch.bfloat16)
+    k_l2 = (k.float() / torch.sqrt(
+        torch.sum(k.float() * k.float(), dim=-1, keepdim=True) + 1e-6)
+    ).to(torch.bfloat16)
+    g_cumsum = _local_cumsum_bf16(g)
+
+    A_gated = _kkt_ref(k_l2, beta, g_cumsum)
+    Ai_gated = _solve_ref(A_gated, S)
+    w, u = _recompute_wu_ref(k_l2, v, beta, g_cumsum, Ai_gated)
+    h0, v_new, state_existing = _chunk_h_ref(k_l2, u, w, g_cumsum, state0)
+    out_existing = _output_o_ref(q_l2, k_l2, v_new, h0, g_cumsum)
+
+    A_nogate = _kkt_nogate_ref(k_l2, beta)
+    Ai_nogate = _solve_ref(A_nogate, S)
+    out_fused, state_fused = _flashqla_fused_gdr_ref(
+        q_l2, k_l2, v, beta, g_cumsum, Ai_nogate, state0)
+
+    torch.testing.assert_close(state_fused, state_existing, rtol=0, atol=0.08)
+    torch.testing.assert_close(out_fused, out_existing, rtol=0, atol=0.08)
 
 
 @pytest.mark.parametrize("S", [6, 64, 65, 128])
