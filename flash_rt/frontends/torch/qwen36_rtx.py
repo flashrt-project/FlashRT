@@ -2356,6 +2356,15 @@ class Qwen36TorchFrontendRtx:
                         fvk,
                         'linear_attn_gdn_wy_output_o_b64_bf16_cublaslt_packed_qkv')
                 )
+                use_mma_fla_output_o_rawk = (
+                    use_mma_fla_chunk_h
+                    and use_wy_lt_output_packed_qkv
+                    and hasattr(
+                        fvk,
+                        'linear_attn_gdn_wy_output_o_b64_bf16_mma_fla_rawk')
+                    and os.environ.get(
+                        'FLASHRT_QWEN36_TQ_PREFILL_GDN_OUTPUT_RAWK',
+                        '1').strip().lower() not in ('0', 'false', 'off'))
                 # NOTE: recompute_wu_mma_fla is shipped but DISABLED in
                 # dispatch because cublasLt packed_rhs is already highly
                 # tuned for this small (64,128,64) GEMM and our hand-tuned
@@ -2424,7 +2433,9 @@ class Qwen36TorchFrontendRtx:
                     # packed inputs the cublasLt path produces.
                     if use_wy_lt_output_packed_kv:
                         v_packed_ptr = self._K_wy_rhs_u[:chunks].data_ptr()
-                        k_pack_hv_ptr = self._K_wy_rhs_w[:chunks].data_ptr()
+                        k_pack_hv_ptr = (
+                            0 if use_mma_fla_output_o_rawk
+                            else self._K_wy_rhs_w[:chunks].data_ptr())
                         # Raw v_new is unused downstream when packed path is
                         # active; skip the redundant 25 MB HBM write at 4K.
                         v_new_ptr = 0
@@ -2544,7 +2555,17 @@ class Qwen36TorchFrontendRtx:
                     and hasattr(
                         fvk,
                         'linear_attn_gdn_wy_output_o_b64_bf16_mma_fla'))
-                if use_mma_fla_output_o:
+                if use_mma_fla_output_o_rawk:
+                    fvk.linear_attn_gdn_wy_output_o_b64_bf16_mma_fla_rawk(
+                        self._K_wy_out_q_pack[:chunks].data_ptr(),
+                        self._K_fla_k16_l2[:, :K].data_ptr(),
+                        self._K_wy_rhs_u[:chunks].data_ptr(),
+                        self._K_wy_h0[:chunks].data_ptr(),
+                        self._K_wy_g_cumsum[:K].data_ptr(),
+                        self._K_lin_attn_out[:K].data_ptr(),
+                        K, 16, 48, 128, 3, float(128 ** -0.5), s,
+                    )
+                elif use_mma_fla_output_o:
                     fvk.linear_attn_gdn_wy_output_o_b64_bf16_mma_fla(
                         self._K_wy_out_q_pack[:chunks].data_ptr(),
                         self._K_wy_rhs_w[:chunks].data_ptr(),

@@ -21,6 +21,7 @@
 // Inputs match the cublasLt packed_qkv signature where possible:
 //   q_pack:     (NT, num_v_heads, 64, head_dim) bf16  packed-per-chunk
 //   k_pack_hv:  (NT, num_v_heads, 64, head_dim) bf16  GQA-expanded packed k
+//                or raw k_l2 (S, num_k_heads, head_dim) for the rawk entry
 //   v_pack:     (NT, num_v_heads, 64, head_dim) bf16  packed v
 //   h:          (NT, num_v_heads, head_dim, head_dim) bf16  chunk-prologue states
 //   g_cumsum:   (S, num_v_heads) bf16
@@ -131,16 +132,18 @@ constexpr size_t kSmemBytes = 41088;
 
 __global__ void output_o_kernel(
     const __nv_bfloat16* __restrict__ q_pack,
-    const __nv_bfloat16* __restrict__ k_pack_hv,
+    const __nv_bfloat16* __restrict__ k_input,
     const __nv_bfloat16* __restrict__ v_pack,
     const __nv_bfloat16* __restrict__ h,
     const __nv_bfloat16* __restrict__ g_bf16,
     __nv_bfloat16*       __restrict__ out,
-    int S, int H, int NT, float scale)
+    int S, int H, int NT, float scale,
+    int num_k_heads, int qk_group, bool k_input_is_raw)
 {
   const int i_v = blockIdx.x;
   const int i_t = blockIdx.y;
   const int i_h = blockIdx.z;
+  const int kh = i_h / qk_group;
   const int tid = threadIdx.x;
   const int warp_id = tid / 32;          // 0..3
   const int lane = tid & 31;
@@ -185,15 +188,25 @@ __global__ void output_o_kernel(
       for (int q = 0; q < kBK / 8; ++q)
         cp_async_16(&sQ[row * kBK + q * 8], &src[q * 8]);
     }
-    // Load sK: k_pack_hv[i_t, i_h, 0..63, k_base..k_base+64]
+    // Load sK. The packed entry consumes k_pack_hv[i_t, i_h, row, k].
+    // The rawk entry reads k_l2[t, kh, k] directly and avoids the chunk_h
+    // GQA-expanded K side-write plus this packed K reread.
     if (tid < kBT) {
       int row = tid;
-      const __nv_bfloat16* src = k_pack_hv
-          + ((size_t)i_t * H + i_h) * kBT * kK
-          + row * kK + k_base;
+      const int t_global = i_t * kBT + row;
+      const __nv_bfloat16* src = k_input_is_raw
+          ? (k_input + ((size_t)t_global * num_k_heads + kh) * kK + k_base)
+          : (k_input + ((size_t)i_t * H + i_h) * kBT * kK
+             + row * kK + k_base);
       #pragma unroll
       for (int q = 0; q < kBK / 8; ++q)
-        cp_async_16(&sK[row * kBK + q * 8], &src[q * 8]);
+        if (t_global < S)
+          cp_async_16(&sK[row * kBK + q * 8], &src[q * 8]);
+        else {
+          #pragma unroll
+          for (int j = 0; j < 8; ++j)
+            sK[row * kBK + q * 8 + j] = __float2bfloat16(0.f);
+        }
     }
     // Load sH: h[i_t, i_h, k_base..k_base+64, v_base..v_base+64]
     if (tid < kBK) {
@@ -462,7 +475,62 @@ void gdn_wy_output_o_b64_bf16_mma_fla(
       reinterpret_cast<const __nv_bfloat16*>(h),
       reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
       reinterpret_cast<__nv_bfloat16*>(out),
-      S, num_v_heads, NT, scale);
+      S, num_v_heads, NT, scale, num_v_heads, 1, false);
+}
+
+void gdn_wy_output_o_b64_bf16_mma_fla_rawk(
+    const void* q_pack,
+    const void* k_l2,
+    const void* v_pack,
+    const void* h,
+    const void* g_cumsum,
+    void*       out,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group,
+    float scale,
+    cudaStream_t stream)
+{
+  if (S <= 0 || num_k_heads <= 0 || num_v_heads <= 0 || qk_group <= 0) return;
+  if (head_dim != output_o_mma_fla::kK) {
+    throw std::runtime_error(
+        std::string("gdn_wy_output_o_b64_bf16_mma_fla_rawk: head_dim must be ") +
+        std::to_string(output_o_mma_fla::kK));
+  }
+  if (num_v_heads % qk_group != 0 ||
+      num_v_heads / qk_group != num_k_heads) {
+    throw std::runtime_error(
+        "gdn_wy_output_o_b64_bf16_mma_fla_rawk: invalid GQA shape");
+  }
+  const int NT = (S + output_o_mma_fla::kBT - 1) / output_o_mma_fla::kBT;
+
+  static bool s_attr_set = false;
+  if (!s_attr_set) {
+    cudaError_t err = cudaFuncSetAttribute(
+        output_o_mma_fla::output_o_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(output_o_mma_fla::kSmemBytes));
+    if (err != cudaSuccess) {
+      throw std::runtime_error(
+          std::string("gdn_wy_output_o_b64_bf16_mma_fla_rawk: "
+                      "cudaFuncSetAttribute failed: ") +
+          cudaGetErrorString(err));
+    }
+    s_attr_set = true;
+  }
+  dim3 grid(output_o_mma_fla::kV / output_o_mma_fla::kBV, NT, num_v_heads);
+  dim3 block(output_o_mma_fla::kThreads, 1, 1);
+  output_o_mma_fla::output_o_kernel<<<grid, block,
+                                       output_o_mma_fla::kSmemBytes, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(q_pack),
+      reinterpret_cast<const __nv_bfloat16*>(k_l2),
+      reinterpret_cast<const __nv_bfloat16*>(v_pack),
+      reinterpret_cast<const __nv_bfloat16*>(h),
+      reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
+      reinterpret_cast<__nv_bfloat16*>(out),
+      S, num_v_heads, NT, scale, num_k_heads, qk_group, true);
 }
 
 }  // namespace linear_attention

@@ -64,6 +64,15 @@ def test_output_o_mma_fla_matches_cublaslt(S):
         S, H, K, float(scale), 0)
     torch.cuda.synchronize()
 
+    out_rawk = None
+    if hasattr(fvk, "linear_attn_gdn_wy_output_o_b64_bf16_mma_fla_rawk"):
+        out_rawk = torch.empty(S, H, V, device="cuda", dtype=torch.bfloat16)
+        fvk.linear_attn_gdn_wy_output_o_b64_bf16_mma_fla_rawk(
+            _ptr(q_pack), _ptr(k_l2), _ptr(v_pack),
+            _ptr(h0), _ptr(g_cumsum), _ptr(out_rawk),
+            S, Hk, H, K, qk_group, float(scale), 0)
+        torch.cuda.synchronize()
+
     # cublasLt packed_qkv baseline. Needs scratch buffers.
     qk_base = torch.empty(chunks * H, 64, 64, device="cuda", dtype=torch.float32)
     local_a_pack = torch.empty(chunks, H, 64, 64, device="cuda", dtype=torch.bfloat16)
@@ -86,3 +95,5 @@ def test_output_o_mma_fla_matches_cublaslt(S):
     # Bound by bf16 ulp * inner-dim. Loose tolerance like the chunk_h test.
     torch.testing.assert_close(out_mma, out_base, rtol=0,
                                atol=0.05 + 0.02 * (S // 64))
+    if out_rawk is not None:
+        torch.testing.assert_close(out_rawk, out_mma, rtol=0, atol=0.001)

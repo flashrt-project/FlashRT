@@ -371,6 +371,24 @@ void gdn_wy_output_o_b64_bf16_mma_fla(
     float scale,
     cudaStream_t stream);
 
+// Variant that reads raw k_l2 (S, num_k_heads, head_dim) directly instead of
+// a GQA-expanded packed K side buffer. This avoids chunk_h writing k_pack_hv
+// solely for output_o and keeps the same math as the packed entry.
+void gdn_wy_output_o_b64_bf16_mma_fla_rawk(
+    const void* q_pack,
+    const void* k_l2,
+    const void* v_pack,
+    const void* h,
+    const void* g_cumsum,
+    void*       out,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group,
+    float scale,
+    cudaStream_t stream);
+
 }  // namespace linear_attention
 }  // namespace kernels
 }  // namespace flash_rt

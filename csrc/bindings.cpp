@@ -4604,6 +4604,26 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("scale"),
         py::arg("stream") = 0);
 
+    // Raw-K variant: output_o reads k_l2 (S, num_k_heads, head_dim)
+    // directly and does GQA expansion in-kernel.
+    m.def("linear_attn_gdn_wy_output_o_b64_bf16_mma_fla_rawk",
+        [](uintptr_t q_pack, uintptr_t k_l2, uintptr_t v_pack,
+           uintptr_t h, uintptr_t g_cumsum, uintptr_t out,
+           int S, int num_k_heads, int num_v_heads, int head_dim,
+           int qk_group, double scale, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_output_o_b64_bf16_mma_fla_rawk(
+                    to_ptr(q_pack), to_ptr(k_l2), to_ptr(v_pack),
+                    to_ptr(h), to_ptr(g_cumsum), to_ptr(out),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    static_cast<float>(scale), to_stream(stream));
+        },
+        py::arg("q_pack"), py::arg("k_l2"), py::arg("v_pack"),
+        py::arg("h"), py::arg("g_cumsum"), py::arg("out"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"), py::arg("scale"),
+        py::arg("stream") = 0);
+
     m.def("linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt",
         [](uintptr_t k_l2, uintptr_t u, uintptr_t w,
            uintptr_t g_cumsum, uintptr_t state,
