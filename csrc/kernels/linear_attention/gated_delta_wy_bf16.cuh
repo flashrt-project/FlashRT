@@ -323,6 +323,28 @@ void gdn_wy_chunk_h_b64_bf16_mma_fla(
     int qk_group,
     cudaStream_t stream);
 
+// FLA-style hand-tuned output_o kernel. Drop-in replacement for
+// gdn_wy_output_o_b64_bf16_cublaslt_packed_qkv.
+//   q_pack:    (NT, num_v_heads, 64, head_dim) bf16 packed q (post norm_pack_q)
+//   k_pack_hv: (NT, num_v_heads, 64, head_dim) bf16 GQA-expanded packed k
+//   v_pack:    (NT, num_v_heads, 64, head_dim) bf16 packed v_new (un-decayed)
+//   h:         (NT, num_v_heads, head_dim, head_dim) bf16 chunk prologue states
+//   g_cumsum:  (S, num_v_heads) bf16
+//   out:       (S, num_v_heads, head_dim) bf16
+// head_dim must be 128.
+void gdn_wy_output_o_b64_bf16_mma_fla(
+    const void* q_pack,
+    const void* k_pack_hv,
+    const void* v_pack,
+    const void* h,
+    const void* g_cumsum,
+    void*       out,
+    int S,
+    int num_v_heads,
+    int head_dim,
+    float scale,
+    cudaStream_t stream);
+
 }  // namespace linear_attention
 }  // namespace kernels
 }  // namespace flash_rt

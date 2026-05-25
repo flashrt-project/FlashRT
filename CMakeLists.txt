@@ -858,6 +858,7 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/causal_conv1d_qwen36.cu
   csrc/kernels/linear_attention/gated_delta_wy_bf16.cu
   csrc/kernels/linear_attention/gated_delta_wy_bf16_mma_fla.cu
+  csrc/kernels/linear_attention/gated_delta_wy_output_o_mma_fla.cu
   csrc/kernels/gated_deltanet_qwen36.cu
   csrc/kernels/rms_norm_gated_silu_qwen36.cu
   csrc/kernels/silu_mul_qwen36.cu

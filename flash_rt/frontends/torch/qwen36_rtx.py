@@ -2529,7 +2529,23 @@ class Qwen36TorchFrontendRtx:
                         self._K_wy_v_new[:K].data_ptr(),
                         K, s,
                     )
-                if use_wy_lt_output_packed_qkv:
+                use_mma_fla_output_o = (
+                    use_mma_fla_chunk_h
+                    and use_wy_lt_output_packed_qkv
+                    and hasattr(
+                        fvk,
+                        'linear_attn_gdn_wy_output_o_b64_bf16_mma_fla'))
+                if use_mma_fla_output_o:
+                    fvk.linear_attn_gdn_wy_output_o_b64_bf16_mma_fla(
+                        self._K_wy_out_q_pack[:chunks].data_ptr(),
+                        self._K_wy_rhs_w[:chunks].data_ptr(),
+                        self._K_wy_rhs_u[:chunks].data_ptr(),
+                        self._K_wy_h0[:chunks].data_ptr(),
+                        self._K_wy_g_cumsum[:K].data_ptr(),
+                        self._K_lin_attn_out[:K].data_ptr(),
+                        K, 48, 128, float(128 ** -0.5), s,
+                    )
+                elif use_wy_lt_output_packed_qkv:
                     fvk.linear_attn_gdn_wy_output_o_b64_bf16_cublaslt_packed_qkv(
                         self._K_wy_out_q_pack[:chunks].data_ptr(),
                         self._K_wy_rhs_w[:chunks].data_ptr(),

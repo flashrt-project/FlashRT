@@ -4564,6 +4564,26 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("head_dim"), py::arg("qk_group"),
         py::arg("stream") = 0);
 
+    // FLA-style hand-tuned output_o. Drop-in for output_o packed_qkv but
+    // no scratch buffers needed.
+    m.def("linear_attn_gdn_wy_output_o_b64_bf16_mma_fla",
+        [](uintptr_t q_pack, uintptr_t k_pack_hv, uintptr_t v_pack,
+           uintptr_t h, uintptr_t g_cumsum, uintptr_t out,
+           int S, int num_v_heads, int head_dim, double scale,
+           uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_output_o_b64_bf16_mma_fla(
+                    to_ptr(q_pack), to_ptr(k_pack_hv), to_ptr(v_pack),
+                    to_ptr(h), to_ptr(g_cumsum), to_ptr(out),
+                    S, num_v_heads, head_dim,
+                    static_cast<float>(scale), to_stream(stream));
+        },
+        py::arg("q_pack"), py::arg("k_pack_hv"), py::arg("v_pack"),
+        py::arg("h"), py::arg("g_cumsum"), py::arg("out"),
+        py::arg("S"), py::arg("num_v_heads"), py::arg("head_dim"),
+        py::arg("scale"),
+        py::arg("stream") = 0);
+
     m.def("linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt",
         [](uintptr_t k_l2, uintptr_t u, uintptr_t w,
            uintptr_t g_cumsum, uintptr_t state,
