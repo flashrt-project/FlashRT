@@ -31,9 +31,11 @@ ckpt: JunHowie/Qwen3-8B-Instruct-2512-SFT-NVFP4
 | OAI server warm tok/s   | n/a | **150 tok/s** |
 | VRAM @ P=1024 + N=256   | 5.99 GiB | 7.30 GiB |
 
-The OAI server warm tok/s lands at the engine's standalone bench —
-the FastAPI / uvicorn / asyncio / SSE / per-token decode layers add
-no measurable overhead at this throughput class.
+The TTFT rows are direct fixed-shape CUDA Graph replay measurements.
+OpenAI HTTP/SSE clients also include tokenizer/chat-template work,
+Python/FastAPI/SSE serialization, network stack, client parsing, and
+OS scheduling. The server warm decode tok/s lands at the engine's
+standalone bench at this throughput class.
 
 ---
 
@@ -43,7 +45,8 @@ no measurable overhead at this throughput class.
 # 1. Start the server (after the FlashRT install in ../USAGE.md)
 python examples/qwen3_openai_server.py \
     --checkpoint /path/to/Qwen3-8B-Instruct-2512-SFT-NVFP4 \
-    --port 8000
+    --port 8000 \
+    --warmup-preset auto
 
 # 2. Call it like any OpenAI v1 endpoint
 curl http://localhost:8000/v1/chat/completions \
@@ -248,7 +251,7 @@ python examples/qwen3_openai_server.py \
     --max-q-seq 128 \
     --device cuda:0 \
     --model-name qwen3-8b-nvfp4 \
-    --warmup 32:128,128:256
+    --warmup-preset auto
 ```
 
 | Flag | Default | Notes |
@@ -258,14 +261,21 @@ python examples/qwen3_openai_server.py \
 | `--host` | 0.0.0.0 | |
 | `--max-seq` | 2048 | Total prompt + generation length budget |
 | `--max-q-seq` | 128 | Max prefill chunk |
-| `--warmup` | `32:128,128:256` | Comma-separated `prompt_len:max_tokens` pairs to pre-capture at startup. Set to `""` to skip. |
+| `--warmup-preset` | `auto` | Startup graph warmup preset: `auto`, `short`, `all`, or `none` |
+| `--warmup` | `""` | Additional comma-separated `prompt_len:max_tokens` pairs to pre-capture at startup |
 
-Pre-startup `--warmup` pre-captures CUDA Graphs for the listed
-shapes plus all six prefill buckets (32 / 64 / 128 / 256 / 512 /
-1024) — so the first real request hits warm graphs immediately. A
-prompt that lands outside the listed `(prompt_len, max_tokens)`
-shapes pays a one-time graph capture (~10-20 ms) on the first hit
-at that shape; subsequent hits at the same shape are warm.
+Startup warmup captures the prefill graph buckets that fit within
+`--max-q-seq`, then captures decode graphs for the selected warmup
+shapes. With the default `--max-q-seq 128`, `auto` covers 32 / 64 /
+128-token prompts for short-chat TTFT. If you benchmark larger prompt
+graphs such as P=512 or P=1024, start with `--max-q-seq 1024`; the
+same `auto` preset then expands to 256 / 512 / 1024 prompt buckets.
+You can append exact production shapes with `--warmup`.
+
+Online requests do not pre-capture the whole decode range before the
+first token. Warm shapes replay immediately; missing decode positions
+are captured lazily when reached so first-content latency is not
+blocked by an entire request-length graph-capture sweep.
 
 ### Concurrency
 

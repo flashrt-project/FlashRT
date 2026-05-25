@@ -171,6 +171,11 @@ Text-only OpenAI-compatible serving path for
 | OAI server warm decode | **150 tok/s** |
 | VRAM @ P=1024 + N=256 | 7.30 GiB |
 
+TTFT rows are direct CUDA Graph replay numbers. OpenAI HTTP/SSE
+clients add tokenizer, Python server, SSE, network, and client-side
+overhead; use the server log's `prefill + ttft + decode` fields when
+comparing the HTTP path.
+
 See [`docs/qwen3_8b_nvfp4.md`](docs/qwen3_8b_nvfp4.md) for the
 quickstart, server command, architecture notes, and caveats.
 
