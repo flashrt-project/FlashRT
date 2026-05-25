@@ -4320,6 +4320,22 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("q16_l2"), py::arg("k16_l2"), py::arg("g_cumsum"),
         py::arg("S"), py::arg("stream") = 0);
 
+    m.def("qwen36_gdn_wy_norm_cumsum_pack_q_bf16",
+        [](uintptr_t q16, uintptr_t k16, uintptr_t g,
+           uintptr_t q16_l2, uintptr_t k16_l2,
+           uintptr_t q_pack_hv, uintptr_t g_cumsum,
+           int S, uintptr_t stream) {
+            flash_rt::kernels::qwen36_gdn_wy_norm_cumsum_pack_q_bf16(
+                to_ptr(q16), to_ptr(k16), to_ptr(g),
+                to_ptr(q16_l2), to_ptr(k16_l2),
+                to_ptr(q_pack_hv), to_ptr(g_cumsum),
+                S, to_stream(stream));
+        },
+        py::arg("q16"), py::arg("k16"), py::arg("g"),
+        py::arg("q16_l2"), py::arg("k16_l2"),
+        py::arg("q_pack_hv"), py::arg("g_cumsum"),
+        py::arg("S"), py::arg("stream") = 0);
+
     m.def("qwen36_gdn_wy_kkt_b64_bf16",
         [](uintptr_t k16_l2, uintptr_t beta, uintptr_t g_cumsum,
            uintptr_t A, int S, uintptr_t stream) {
@@ -4520,6 +4536,30 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("q_pack"), py::arg("qk_base"),
         py::arg("local_a_pack"), py::arg("qh_pack"),
         py::arg("local_pack"), py::arg("out"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"),
+        py::arg("stream") = 0);
+
+    m.def("linear_attn_gdn_wy_output_o_b64_bf16_cublaslt_packed_qkv",
+        [](uintptr_t q_pack, uintptr_t k_pack_hv, uintptr_t v_pack,
+           uintptr_t h0, uintptr_t g_cumsum,
+           uintptr_t qk_base, uintptr_t local_a_pack,
+           uintptr_t qh_pack, uintptr_t local_pack, uintptr_t out,
+           int S, int num_k_heads, int num_v_heads,
+           int head_dim, int qk_group, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_output_o_b64_bf16_cublaslt_packed_qkv(
+                    to_ptr(q_pack), to_ptr(k_pack_hv), to_ptr(v_pack),
+                    to_ptr(h0), to_ptr(g_cumsum),
+                    to_ptr(qk_base), to_ptr(local_a_pack),
+                    to_ptr(qh_pack), to_ptr(local_pack), to_ptr(out),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("q_pack"), py::arg("k_pack_hv"), py::arg("v_pack"),
+        py::arg("h0"), py::arg("g_cumsum"),
+        py::arg("qk_base"), py::arg("local_a_pack"),
+        py::arg("qh_pack"), py::arg("local_pack"), py::arg("out"),
         py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
         py::arg("head_dim"), py::arg("qk_group"),
         py::arg("stream") = 0);

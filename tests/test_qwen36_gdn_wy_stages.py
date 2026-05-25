@@ -13,6 +13,7 @@ def _load_fvk():
         pytest.skip(f"flash_rt_kernels is not built: {exc}")
     required = (
         "qwen36_gdn_wy_norm_cumsum_bf16",
+        "qwen36_gdn_wy_norm_cumsum_pack_q_bf16",
         "qwen36_gdn_wy_kkt_b64_bf16",
         "qwen36_gdn_wy_solve_tril_b64_f32",
         "qwen36_gdn_wy_recompute_wu_b64_bf16",
@@ -24,6 +25,7 @@ def _load_fvk():
         "linear_attn_gdn_wy_solve_tril_b64_f32_parallel_pack",
         "linear_attn_gdn_wy_output_o_b64_bf16_cublaslt",
         "linear_attn_gdn_wy_output_o_b64_bf16_cublaslt_packed_kv",
+        "linear_attn_gdn_wy_output_o_b64_bf16_cublaslt_packed_qkv",
         "linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt",
         "linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu",
         "linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_f32state",
@@ -204,6 +206,44 @@ def test_qwen36_wy_norm_cumsum_and_kkt_match_reference(S):
 
     A_ref = _kkt_ref(k_ref, beta, g_ref)
     torch.testing.assert_close(A, A_ref, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("S", [6, 64, 65])
+def test_qwen36_wy_norm_cumsum_pack_q_matches_reference(S):
+    fvk = _load_fvk()
+    torch.manual_seed(2234 + S)
+    q = torch.randn(S, 16, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(S, 16, 128, device="cuda", dtype=torch.bfloat16)
+    g = (torch.randn(S, 48, device="cuda") * 0.05).to(torch.bfloat16)
+
+    chunks = (S + 63) // 64
+    q_l2 = torch.empty_like(q)
+    k_l2 = torch.empty_like(k)
+    q_pack = torch.empty(chunks, 48, 64, 128, device="cuda",
+                         dtype=torch.bfloat16)
+    g_cumsum = torch.empty_like(g)
+    fvk.qwen36_gdn_wy_norm_cumsum_pack_q_bf16(
+        _ptr(q), _ptr(k), _ptr(g), _ptr(q_l2), _ptr(k_l2),
+        _ptr(q_pack), _ptr(g_cumsum), S, 0)
+    torch.cuda.synchronize()
+
+    q_ref = (q.float() / torch.sqrt(
+        torch.sum(q.float() * q.float(), dim=-1, keepdim=True) + 1e-6)
+    ).to(torch.bfloat16)
+    k_ref = (k.float() / torch.sqrt(
+        torch.sum(k.float() * k.float(), dim=-1, keepdim=True) + 1e-6)
+    ).to(torch.bfloat16)
+    g_ref = _local_cumsum_bf16(g)
+    torch.testing.assert_close(q_l2, q_ref, rtol=0, atol=1e-3)
+    torch.testing.assert_close(k_l2, k_ref, rtol=0, atol=1e-3)
+    torch.testing.assert_close(g_cumsum, g_ref, rtol=0, atol=0)
+    for ci, start in enumerate(range(0, S, 64)):
+        end = min(start + 64, S)
+        for vh in range(48):
+            torch.testing.assert_close(
+                q_pack[ci, vh, :end - start],
+                q_ref[start:end, vh // 3],
+                rtol=0, atol=1e-3)
 
 
 @pytest.mark.parametrize("S", [6, 64, 65])
@@ -882,6 +922,54 @@ def test_linear_attn_gdn_wy_output_o_cublaslt_packed_kv_matches_reference(S):
     fvk.linear_attn_gdn_wy_output_o_b64_bf16_cublaslt_packed_kv(
         _ptr(q_l2), _ptr(k_pack_hv), _ptr(v_pack), _ptr(h0),
         _ptr(g_cumsum), _ptr(q_pack), _ptr(qk_base), _ptr(local_a_pack),
+        _ptr(qh_pack), _ptr(local_pack), _ptr(out),
+        S, 16, 48, 128, 3, 0)
+    torch.cuda.synchronize()
+
+    out_ref = _output_o_ref(q_l2, k_l2, v_new, h0, g_cumsum)
+    torch.testing.assert_close(out, out_ref, rtol=0, atol=3e-2)
+
+
+@pytest.mark.parametrize("S", [6, 64, 65])
+def test_linear_attn_gdn_wy_output_o_cublaslt_packed_qkv_matches_reference(S):
+    fvk = _load_fvk()
+    torch.manual_seed(8667 + S)
+    q = torch.randn(S, 16, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(S, 16, 128, device="cuda", dtype=torch.bfloat16)
+    v_new = torch.randn(S, 48, 128, device="cuda", dtype=torch.bfloat16)
+    h0 = (torch.randn((S + 63) // 64, 48, 128, 128, device="cuda")
+          * 0.02).to(torch.bfloat16)
+    g = (torch.randn(S, 48, device="cuda") * 0.02).to(torch.bfloat16)
+
+    q_l2 = (q.float() / torch.sqrt(
+        torch.sum(q.float() * q.float(), dim=-1, keepdim=True) + 1e-6)
+    ).to(torch.bfloat16)
+    k_l2 = (k.float() / torch.sqrt(
+        torch.sum(k.float() * k.float(), dim=-1, keepdim=True) + 1e-6)
+    ).to(torch.bfloat16)
+    g_cumsum = _local_cumsum_bf16(g)
+    chunks = (S + 63) // 64
+    q_pack = torch.zeros(chunks, 48, 64, 128, device="cuda",
+                         dtype=torch.bfloat16)
+    k_pack_hv = torch.zeros_like(q_pack)
+    v_pack = torch.zeros_like(q_pack)
+    for ci, start in enumerate(range(0, S, 64)):
+        end = min(start + 64, S)
+        for vh in range(48):
+            q_pack[ci, vh, :end - start] = q_l2[start:end, vh // 3]
+            k_pack_hv[ci, vh, :end - start] = k_l2[start:end, vh // 3]
+        v_pack[ci, :, :end - start] = v_new[start:end].transpose(0, 1)
+    qk_base = torch.empty(chunks, 48, 64, 64, device="cuda",
+                          dtype=torch.float32)
+    local_a_pack = torch.empty(chunks, 48, 64, 64, device="cuda",
+                               dtype=torch.bfloat16)
+    qh_pack = torch.empty_like(q_pack)
+    local_pack = torch.empty_like(q_pack)
+    out = torch.empty(S, 48, 128, device="cuda", dtype=torch.bfloat16)
+
+    fvk.linear_attn_gdn_wy_output_o_b64_bf16_cublaslt_packed_qkv(
+        _ptr(q_pack), _ptr(k_pack_hv), _ptr(v_pack), _ptr(h0),
+        _ptr(g_cumsum), _ptr(qk_base), _ptr(local_a_pack),
         _ptr(qh_pack), _ptr(local_pack), _ptr(out),
         S, 16, 48, 128, 3, 0)
     torch.cuda.synchronize()

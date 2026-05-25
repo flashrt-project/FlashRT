@@ -2387,6 +2387,82 @@ void gdn_wy_output_o_b64_bf16_cublaslt_packed_kv(
       S, num_v_heads, head_dim);
 }
 
+void gdn_wy_output_o_b64_bf16_cublaslt_packed_qkv(
+    const void* q_pack,
+    const void* k_pack_hv,
+    const void* v_pack,
+    const void* h0,
+    const void* g_cumsum,
+    void*       qk_base,
+    void*       local_a_pack,
+    void*       qh_pack,
+    void*       local_pack,
+    void*       out,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group,
+    cudaStream_t stream)
+{
+  if (S <= 0 || num_k_heads <= 0 || num_v_heads <= 0 ||
+      head_dim <= 0 || qk_group <= 0) {
+    return;
+  }
+  const int chunks = (S + kChunk - 1) / kChunk;
+  const int batches = chunks * num_v_heads;
+  const float alpha = 1.0f;
+  const float beta0 = 0.0f;
+
+  LtPlan& qh_plan = get_qh_plan(batches, head_dim);
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmul(
+      g_lt, qh_plan.desc, &alpha,
+      q_pack, qh_plan.a_desc,
+      h0, qh_plan.b_desc,
+      &beta0,
+      qh_pack, qh_plan.c_desc,
+      qh_pack, qh_plan.c_desc,
+      &qh_plan.algo, g_workspace, g_workspace_size, stream));
+
+  LtPlan& qk_plan = get_kkt_plan(batches, head_dim);
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmul(
+      g_lt, qk_plan.desc, &alpha,
+      q_pack, qk_plan.a_desc,
+      k_pack_hv, qk_plan.b_desc,
+      &beta0,
+      qk_base, qk_plan.c_desc,
+      qk_base, qk_plan.c_desc,
+      &qk_plan.algo, g_workspace, g_workspace_size, stream));
+
+  apply_output_local_a_kernel<<<
+      dim3((kChunk * kChunk + kThreads - 1) / kThreads,
+           num_v_heads, chunks),
+      kThreads, 0, stream>>>(
+      reinterpret_cast<const float*>(qk_base),
+      reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
+      reinterpret_cast<__nv_bfloat16*>(local_a_pack),
+      S, num_v_heads);
+
+  LtPlan& mm_plan = get_mm64d_plan(batches, head_dim);
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmul(
+      g_lt, mm_plan.desc, &alpha,
+      local_a_pack, mm_plan.a_desc,
+      v_pack, mm_plan.b_desc,
+      &beta0,
+      local_pack, mm_plan.c_desc,
+      local_pack, mm_plan.c_desc,
+      &mm_plan.algo, g_workspace, g_workspace_size, stream));
+
+  combine_output_kernel<<<
+      (S * num_v_heads * head_dim + kThreads - 1) / kThreads,
+      kThreads, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(qh_pack),
+      reinterpret_cast<const __nv_bfloat16*>(local_pack),
+      reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
+      reinterpret_cast<__nv_bfloat16*>(out),
+      S, num_v_heads, head_dim);
+}
+
 }  // namespace linear_attention
 }  // namespace kernels
 }  // namespace flash_rt
