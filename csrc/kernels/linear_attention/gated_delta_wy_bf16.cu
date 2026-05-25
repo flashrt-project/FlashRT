@@ -997,6 +997,7 @@ __global__ void make_vnew_decay_and_scale_state_kernel(
     const __nv_bfloat16* __restrict__ wh_pack,
     const __nv_bfloat16* __restrict__ g_cumsum,
     __nv_bfloat16* __restrict__ state,
+    __nv_bfloat16* __restrict__ h0_chunk,
     __nv_bfloat16* __restrict__ v_new,
     __nv_bfloat16* __restrict__ decayed_v_pack,
     int S,
@@ -1049,7 +1050,11 @@ __global__ void make_vnew_decay_and_scale_state_kernel(
           static_cast<size_t>(start + T - 1) * num_v_heads + vh]);
   const size_t off =
       (static_cast<size_t>(vh) * head_dim + row) * head_dim + col;
-  state[off] = __float2bfloat16(static_cast<float>(state[off]) *
+  const __nv_bfloat16 old_state = state[off];
+  if (h0_chunk != nullptr) {
+    h0_chunk[off] = old_state;
+  }
+  state[off] = __float2bfloat16(static_cast<float>(old_state) *
                                 __expf(g_last));
 }
 
@@ -1516,7 +1521,6 @@ void gdn_wy_chunk_h_b64_bf16_cublaslt(
       static_cast<size_t>(num_v_heads) * kChunk * head_dim;
   const size_t state_elems =
       static_cast<size_t>(num_v_heads) * head_dim * head_dim;
-  const size_t state_bytes = state_elems * sizeof(__nv_bfloat16);
 
   auto* state_bf16 = reinterpret_cast<__nv_bfloat16*>(state);
   auto* h0_bf16 = reinterpret_cast<__nv_bfloat16*>(h0);
@@ -1527,14 +1531,6 @@ void gdn_wy_chunk_h_b64_bf16_cublaslt(
   auto* decayed_bf16 = reinterpret_cast<__nv_bfloat16*>(decayed_v_pack);
 
   for (int ci = 0; ci < chunks; ++ci) {
-    cudaError_t copy_err = cudaMemcpyAsync(
-        h0_bf16 + static_cast<size_t>(ci) * state_elems,
-        state_bf16, state_bytes, cudaMemcpyDeviceToDevice, stream);
-    if (copy_err != cudaSuccess) {
-      throw std::runtime_error(std::string("cudaMemcpyAsync failed in WY h0: ") +
-                               cudaGetErrorString(copy_err));
-    }
-
     const size_t off = static_cast<size_t>(ci) * pack_chunk_elems;
     FLASHRT_CUBLASLT_CHECK(cublasLtMatmul(
         g_lt, wh_plan.desc, &alpha,
@@ -1550,8 +1546,9 @@ void gdn_wy_chunk_h_b64_bf16_cublaslt(
         (work + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
         u_pack_bf16, wh_pack_bf16,
         reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
-        state_bf16, reinterpret_cast<__nv_bfloat16*>(v_new),
-        decayed_bf16, S, ci, num_v_heads, head_dim);
+        state_bf16, h0_bf16 + static_cast<size_t>(ci) * state_elems,
+        reinterpret_cast<__nv_bfloat16*>(v_new), decayed_bf16,
+        S, ci, num_v_heads, head_dim);
 
     FLASHRT_CUBLASLT_CHECK(cublasLtMatmul(
         g_lt, ktv_plan.desc, &alpha,
