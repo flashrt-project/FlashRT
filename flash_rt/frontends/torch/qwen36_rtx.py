@@ -1000,6 +1000,7 @@ class Qwen36TorchFrontendRtx:
         """
         import torch
 
+        from flash_rt import flash_rt_kernels as fvk
         from flash_rt.hardware.rtx.attn_backend_qwen36 import (
             RtxFlashAttnBackendQwen36,
         )
@@ -1035,6 +1036,13 @@ class Qwen36TorchFrontendRtx:
                 'FLASHRT_QWEN36_FUSE_MLP_GATE_UP',
                 gate_up_default) or '0'))
             and all(ld.get('mlp_gate_up_homogeneous_alpha') for ld in layers)
+        )
+        self._enable_mlp_gate_up_pingpong = (
+            self._enable_mlp_gate_up_fusion
+            and hasattr(fvk, 'fp4_w4a16_gemm_sm120_bf16out_pingpong')
+            and os.environ.get(
+                'FLASHRT_QWEN36_MLP_GATE_UP_PINGPONG',
+                '1').strip().lower() not in ('0', 'false', 'off')
         )
         self._enable_silu_mul_quant_fusion = bool(int(os.environ.get(
             'FLASHRT_QWEN36_FUSE_SILU_MUL_QUANT', '0') or '0'))
@@ -2866,7 +2874,11 @@ class Qwen36TorchFrontendRtx:
         # 8b) MLP gate / up: NVFP4 GEMM at M=K.
         if self._enable_mlp_gate_up_fusion:
             gate_up_buf = self._K_mlp_gate_up_out[:K]
-            fvk.fp4_w4a16_gemm_sm120_bf16out(
+            mlp_gate_up_gemm = (
+                fvk.fp4_w4a16_gemm_sm120_bf16out_pingpong
+                if self._enable_mlp_gate_up_pingpong
+                else fvk.fp4_w4a16_gemm_sm120_bf16out)
+            mlp_gate_up_gemm(
                 ap_5120.data_ptr(), int(lw['mlp_gate_up_packed']),
                 gate_up_buf.data_ptr(),
                 K, int(lw['mlp_gate_up_N']), 5120,
@@ -3219,7 +3231,11 @@ class Qwen36TorchFrontendRtx:
         h_post = res_mid_K
         if self._enable_mlp_gate_up_fusion:
             gate_up_buf = self._K_mlp_gate_up_out[:K]
-            fvk.fp4_w4a16_gemm_sm120_bf16out(
+            mlp_gate_up_gemm = (
+                fvk.fp4_w4a16_gemm_sm120_bf16out_pingpong
+                if self._enable_mlp_gate_up_pingpong
+                else fvk.fp4_w4a16_gemm_sm120_bf16out)
+            mlp_gate_up_gemm(
                 ap_mlp.data_ptr(), int(lw['mlp_gate_up_packed']),
                 gate_up_buf.data_ptr(),
                 K, int(lw['mlp_gate_up_N']), 5120,

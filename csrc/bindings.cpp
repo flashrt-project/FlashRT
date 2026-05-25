@@ -5305,6 +5305,25 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("alpha") = 1.0f,
         py::arg("stream") = 0);
 
+    m.def("fp4_w4a16_gemm_sm120_bf16out_pingpong",
+        [](uintptr_t A_packed, uintptr_t B_packed, uintptr_t D,
+           int M, int N, int K,
+           uintptr_t SFA, uintptr_t SFB,
+           float alpha,
+           uintptr_t stream) {
+            flash_rt::gemm::fp4_w4a16_gemm_sm120_bf16out_pingpong(
+                to_ptr(A_packed), to_ptr(B_packed), to_ptr(D),
+                M, N, K,
+                to_ptr(SFA), to_ptr(SFB),
+                alpha,
+                to_stream(stream));
+        },
+        py::arg("A_packed"), py::arg("B_packed"), py::arg("D"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("SFA"), py::arg("SFB"),
+        py::arg("alpha") = 1.0f,
+        py::arg("stream") = 0);
+
     // Recipe C step 1: NVFP4 W4A16 GEMM with fused per-col bias + GELU(tanh)
     // epilogue, BF16 output. Replaces (cutlass GEMM_up + bias_gelu_inplace)
     // 2-launch chain in motus Wan FFN forward. Schedule:

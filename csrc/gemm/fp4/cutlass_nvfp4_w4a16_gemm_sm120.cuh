@@ -81,5 +81,18 @@ void fp4_w4a16_gemm_sm120_bf16out_widen(
     float        alpha,
     cudaStream_t stream);
 
+// Same tile shape as the default kernel, but with
+// KernelTmaWarpSpecializedPingpong. Kept as an explicit opt-in variant so
+// callers can A/B schedule effects per shape without perturbing the default.
+void fp4_w4a16_gemm_sm120_bf16out_pingpong(
+    const void*  A_packed,
+    const void*  B_packed,
+    void*        D_bf16,
+    int M, int N, int K,
+    const void*  SFA,
+    const void*  SFB,
+    float        alpha,
+    cudaStream_t stream);
+
 }  // namespace gemm
 }  // namespace flash_rt
