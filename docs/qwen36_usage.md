@@ -150,12 +150,12 @@ frontend is built has no effect.
 | `FLASHRT_QWEN36_DFLASH_CKPT_DIR` | Optional | unset | Drafter ckpt directory for the DFlash add-on path. Required only if you call `init_dflash_drafter()`; raises a clear error if unset and `ckpt_dir` is also not passed. |
 | `FLASHRT_QWEN36_MAX_Q_SEQ` | Optional | `2048` | Maximum S=K working-set rows for verify/prefill buffers. Long prefill chunking is additionally capped by the retained BF16 working window. |
 | `FLASHRT_QWEN36_LONG_CTX_BF16_WINDOW` | Optional | `min(2048, MAX_Q_SEQ)` | Retained BF16 working-window rows in long-context mode. Raising this can enable larger prompt chunks but costs substantial VRAM. |
-| `FLASHRT_QWEN36_LONG_CTX_ROUTE_MIN_SEQ` | Optional | `512` in long-ctx mode | Prompt length at or above which a long-context frontend routes through the chunked compressed-KV path. Short prompts stay on BF16/spec unless the full request exceeds the retained BF16 window. |
-| `FLASHRT_QWEN36_LONG_KV_CACHE` | Optional | `fp8` | Long-context persistent KV format. `fp8` uses an e4m3 FP8 KV cache. On SM120, long verify attention uses the vendored FlashInfer XQA FP8-KV kernel above the XQA threshold and falls back to BF16 FA2 staging below it. Set `tq` to use the TurboQuant packed path for memory/accuracy bisection. |
+| `FLASHRT_QWEN36_LONG_CTX_ROUTE_MIN_SEQ` | Optional | `512` in long-ctx mode | Prompt length at or above which a long-context frontend routes through the chunked compressed-KV path. The measured 128-token bucket is also routed through FP8-KV to avoid the legacy one-token BF16/spec prefill. Other short prompts stay on BF16/spec unless the full request exceeds the retained BF16 window. |
+| `FLASHRT_QWEN36_LONG_KV_CACHE` | Optional | `fp8` | Long-context persistent KV format. `fp8` uses an e4m3 FP8 KV cache. On SM120, long verify attention uses the vendored FlashInfer XQA FP8-KV kernel for the tuned 128-token bucket and above the XQA threshold, and falls back to BF16 FA2 staging in buckets where that path is faster. Set `tq` to use the TurboQuant packed path for memory/accuracy bisection. |
 | `FLASHRT_QWEN36_FP8_XQA` | Optional | `1` | Enable the SM120 FlashInfer XQA native FP8-KV verify path for long-context FP8 KV. Set `0` to force the previous FP8->BF16-stage + FA2 path. |
 | `FLASHRT_QWEN36_FP8_XQA_MIN_CTX` | Optional | `auto` | XQA gating for FP8-KV verify. `auto` uses measured buckets: off below 6K, on from 6K to 12K, off from 12K to 24K, and on from 24K upward. Set a number to force the older minimum-KV-length threshold. |
 | `FLASHRT_QWEN36_FP8_XQA_SCRATCH_MB` | Optional | `256` | Scratch workspace reserved for XQA multi-block reductions. |
-| `FLASHRT_QWEN36_TQ_SPEC_K` | Optional | unset | Override the effective speculative K for long-context TQ/spec requests. If unset, long TQ/spec uses measured buckets: `4` around 512 tokens, `5` around 1K/8K, `6` around 2K/32K/200K+, `3` around 4K, and `7` around 16K/64K/128K. Passing K below 6 keeps that lower caller cap. Short BF16/spec requests keep the caller K unchanged. |
+| `FLASHRT_QWEN36_TQ_SPEC_K` | Optional | unset | Override the effective speculative K for long-context TQ/spec requests. If unset, long TQ/spec uses measured buckets: `6` at the 128-token FP8-KV exception, `4` around 512 tokens, `5` around 1K/8K, `6` around 2K/32K/200K+, `3` around 4K, and `7` around 16K/64K/128K. Passing K below 6 keeps that lower caller cap. Short BF16/spec requests keep the caller K unchanged. |
 | `FLASHRT_QWEN36_TQ_ADAPTIVE_K` | Optional | `1` | When long TQ/spec uses the default K≥4 policy, drop to K=3 inside a request if the early accept statistics show a low-hit prompt. Explicit `FLASHRT_QWEN36_TQ_SPEC_K` disables this adaptation. |
 | `FLASHRT_QWEN36_LONG_MTP_PREFILL_TAIL` | Optional | `auto` | Long-context MTP prompt-tail prefill. `auto` uses measured KV-only buckets: disabled below 512 tokens, 512 rows around 512/4K, and 2048 rows for 1K-2K and 8K+. Set `0` to disable or a positive value to force a fixed tail length. |
 | `FLASHRT_QWEN36_LONG_MTP_TAIL_KV_ONLY` | Optional | `1` | When prompt-tail prefill is enabled and the MTP checkpoint has BF16 projection weights, populate only the MTP K/V cache rows needed by the drafter. Set `0` to force the older full-MTP-head tail loop for bisection. |
@@ -296,10 +296,12 @@ python examples/qwen36_openai_server.py \
   --warmup "262144:16"
 ```
 
-The default long-context route threshold is 512 prompt tokens: very
-short prompts stay on BF16/spec for peak decode unless the requested
-completion exceeds the retained BF16 window, while 512-token and larger
-prompts use the tuned chunked FP8-KV path. `--warmup-preset auto`
+The default long-context route threshold is 512 prompt tokens, with a
+128-token FP8-KV exception to avoid the legacy slow BF16/spec prefill.
+Other very short prompts stay on BF16/spec for peak decode unless the
+requested completion exceeds the retained BF16 window, while 512-token
+and larger prompts use the tuned chunked FP8-KV path.
+`--warmup-preset auto`
 warms 64-token short-chat buckets plus 2K/4K/8K/16K/32K/64K/128K/256K
 buckets that fit inside `--max-seq`. Add explicit `--warmup`
 `prompt_len:max_tokens` entries for longer completion caps.

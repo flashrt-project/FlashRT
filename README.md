@@ -137,7 +137,7 @@ single RTX 5090. The complete sweep is in
 
 | prompt ctx | route | K | MTP tail | TTFT / prefill | prefill tok/s | decode tok/s |
 |---:|---|---:|---:|---:|---:|---:|
-| 128 | BF16/spec | 6 | full | 2.686 s | 47.7 | 145.4 |
+| 128 | FP8-KV | 6 | 128 | 31.4 ms | 4,080 | 144.9 |
 | 2 K | FP8-KV | 6 | 2048 | 253.8 ms | 8,070 | 164.9 |
 | 16 K | FP8-KV | 7 | 2048 | 1.570 s | 10,437 | 175.4 |
 | 64 K | FP8-KV | 7 | 2048 | 9.133 s | 7,176 | 150.9 |

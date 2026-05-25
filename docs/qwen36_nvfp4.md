@@ -233,10 +233,11 @@ When `max_seq` is above the long-context threshold, the frontend keeps
 a small BF16 KV/spec working window and allocates a compressed KV cache
 for requests routed beyond it. The default compressed route is FP8 KV;
 TurboQuant remains available for memory/accuracy bisection. The default
-long-route threshold is 512 prompt tokens, preserving the peak BF16/spec
-decode path for very short prompts while using chunked FP8-KV for
-512-token and larger prompts. Short prompts route to FP8-KV only if the
-full request exceeds the retained BF16 window.
+long-route threshold is 512 prompt tokens, with a measured 128-token
+exception: 128-token prompts use chunked FP8-KV to avoid the legacy
+one-token-at-a-time BF16 prefill while preserving the same ~145 tok/s
+decode bucket. Other short prompts route to FP8-KV only if the full
+request exceeds the retained BF16 window.
 
 Spec decode is wired to the long-ctx compressed-KV path. Short requests
 that fit in the retained BF16 window still use the normal CUDA-Graph
@@ -294,13 +295,14 @@ export FLASHRT_QWEN36_LONG_CTX_ROUTE_MIN_SEQ=512
 ```
 
 Warm measurements on RTX 5090, `max_new_tokens=64`, repeated text
-prompt, one same-shape warmup generation followed by one timed
-generation. The 128-token row uses BF16/spec because it is still the
-highest decode-throughput route there; 512 tokens and above use FP8-KV.
+prompt, same-shape warmup generations followed by one timed generation.
+The 128-token row uses the short FP8-KV exception to avoid the slow
+BF16/spec prompt walk; 512 tokens and above use the regular FP8-KV
+long route.
 
 | prompt ctx | route | K | MTP tail | TTFT / prefill | prefill tok/s | decode ms | decode tok/s | spec attempts / accepts / full |
 |---:|---|---:|---:|---:|---:|---:|---:|---:|
-| 128 | BF16/spec | 6 | full | 2.686 s | 47.7 | 440.3 | 145.4 | 14 / 49 / 7 |
+| 128 | FP8-KV | 6 | 128 | 31.4 ms | 4,080 | 441.7 | 144.9 | 14 / 55 / 7 |
 | 512 | FP8-KV | 4 | 512 | 72.6 ms | 7,057 | 530.4 | 120.7 | 19 / 45 / 9 |
 | 1 K | FP8-KV | 5 | 2048 | 131.9 ms | 7,762 | 603.8 | 106.0 | 20 / 44 / 6 |
 | 2 K | FP8-KV | 6 | 2048 | 253.8 ms | 8,070 | 388.2 | 164.9 | 12 / 52 / 6 |
@@ -314,8 +316,9 @@ highest decode-throughput route there; 512 tokens and above use FP8-KV.
 | 256 K | FP8-KV | 6 | 2048 | 87.976 s | 2,980 | 442.7 | 144.6 | 11 / 52 / 4 |
 
 `decode tok/s` excludes TTFT and is the TPOT-style LLM serving metric.
-The low-TTFT FP8-KV route is available below 512 tokens, but it trades
-away decode throughput on the measured prompt distribution.
+The 128-token FP8-KV exception keeps low TTFT without giving up the
+short-bucket decode rate. Other sub-512 prompts keep the BF16/spec
+route by default unless the request exceeds the retained BF16 window.
 
 FP8 KV also improves prefill versus the TurboQuant cache, but the gain
 is modest until very large contexts because prefill is dominated by the
