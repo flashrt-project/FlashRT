@@ -652,6 +652,7 @@ def test_linear_attn_gdn_wy_chunk_h_cublaslt_packed_wu_matches_reference(S):
         end = min(start + 64, S)
         w_pack[ci, :, :end - start] = w[start:end].transpose(0, 1)
         u_pack[ci, :, :end - start] = u[start:end].transpose(0, 1)
+    w_pack_input = w_pack.clone()
     wh_pack = torch.empty_like(k_pack_hv)
 
     fvk.linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu(
@@ -684,6 +685,21 @@ def test_linear_attn_gdn_wy_chunk_h_cublaslt_packed_wu_matches_reference(S):
         end = min(start + 64, S)
         v_pack_ref[ci, :, :end - start] = v_new_base[start:end].transpose(0, 1)
     torch.testing.assert_close(wh_pack, v_pack_ref, rtol=0, atol=0)
+
+    state_no_v = state0.clone()
+    h0_no_v = torch.empty_like(h0)
+    k_pack_no_v = torch.empty_like(k_pack_hv)
+    v_pack_no_v = torch.empty_like(k_pack_hv)
+    decayed_no_v = torch.empty_like(k_pack_hv)
+    fvk.linear_attn_gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu(
+        _ptr(k_l2), _ptr(w_pack_input), _ptr(u_pack), _ptr(g_cumsum),
+        _ptr(state_no_v), _ptr(h0_no_v), 0, _ptr(k_pack_no_v),
+        _ptr(v_pack_no_v), _ptr(decayed_no_v),
+        S, 16, 48, 128, 3, 0)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(h0_no_v, h0_base, rtol=0, atol=0)
+    torch.testing.assert_close(state_no_v, state_base, rtol=0, atol=0)
+    torch.testing.assert_close(v_pack_no_v, v_pack_ref, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("S", [6, 64, 65])

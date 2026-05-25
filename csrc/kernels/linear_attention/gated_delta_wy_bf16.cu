@@ -1120,7 +1120,9 @@ __global__ void make_vnew_decay_and_scale_state_kernel(
     const size_t out_off =
         (static_cast<size_t>(s) * num_v_heads + vh) * head_dim + d;
     const __nv_bfloat16 val_bf16 = __float2bfloat16(val);
-    v_new[out_off] = val_bf16;
+    if (v_new != nullptr) {
+      v_new[out_off] = val_bf16;
+    }
     if (v_pack_out != nullptr) {
       v_pack_out[pidx] = val_bf16;
     }
