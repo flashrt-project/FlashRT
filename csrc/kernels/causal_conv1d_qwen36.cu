@@ -232,6 +232,54 @@ __global__ void causal_conv1d_update_chunk_parallel_kernel(
       __float2bfloat16(acc);
 }
 
+__global__ void causal_conv1d_update_chunk_parallel_gqa_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ w,
+    const __nv_bfloat16* __restrict__ bias,
+    const __nv_bfloat16* __restrict__ state,
+    __nv_bfloat16* __restrict__ q16,
+    __nv_bfloat16* __restrict__ k16,
+    __nv_bfloat16* __restrict__ v48,
+    int B, int S, int conv_dim, int k,
+    bool apply_silu)
+{
+  const int c = blockIdx.x * kThreadsX + threadIdx.x;
+  const int s = blockIdx.y;
+  const int b = blockIdx.z;
+  if (c >= conv_dim) return;
+
+  const int sk = k - 1;
+  const int state_base = (b * conv_dim + c) * sk;
+  float acc = (bias != nullptr) ? static_cast<float>(bias[c]) : 0.0f;
+
+  #pragma unroll
+  for (int i = 0; i < kMaxK; ++i) {
+    if (i < k) {
+      const int t = s + i - sk;
+      float xv = 0.0f;
+      if (t >= 0) {
+        xv = static_cast<float>(
+            x[(size_t)b * S * conv_dim + (size_t)t * conv_dim + c]);
+      } else if (t >= -sk) {
+        xv = static_cast<float>(state[state_base + (t + sk)]);
+      }
+      const float wv = static_cast<float>(w[c * k + i]);
+      acc = fmaf(xv, wv, acc);
+    }
+  }
+
+  if (apply_silu) acc = silu(acc);
+  const __nv_bfloat16 y = __float2bfloat16(acc);
+  const size_t bs = (size_t)b * S + s;
+  if (c < 2048) {
+    q16[bs * 2048 + c] = y;
+  } else if (c < 4096) {
+    k16[bs * 2048 + (c - 2048)] = y;
+  } else {
+    v48[bs * 6144 + (c - 4096)] = y;
+  }
+}
+
 __global__ void causal_conv1d_update_chunk_state_kernel(
     const __nv_bfloat16* __restrict__ x,
     __nv_bfloat16* __restrict__ state,
@@ -328,6 +376,34 @@ void causal_conv1d_qwen36_update_chunk_parallel_bf16(
       reinterpret_cast<const __nv_bfloat16*>(bias),
       reinterpret_cast<const __nv_bfloat16*>(state),
       reinterpret_cast<__nv_bfloat16*>(out),
+      B, S, conv_dim, k, apply_silu);
+
+  dim3 state_grid((conv_dim + kThreadsX - 1) / kThreadsX, B);
+  causal_conv1d_update_chunk_state_kernel<<<
+      state_grid, block, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(x),
+      reinterpret_cast<__nv_bfloat16*>(state),
+      B, S, conv_dim, k);
+}
+
+void causal_conv1d_qwen36_update_chunk_parallel_gqa_bf16(
+    const void* x, const void* w, const void* bias,
+    void* q16, void* k16, void* v48, void* state,
+    int B, int S, int conv_dim, int k,
+    bool apply_silu,
+    cudaStream_t stream)
+{
+  dim3 conv_grid((conv_dim + kThreadsX - 1) / kThreadsX, S, B);
+  dim3 block(kThreadsX);
+  causal_conv1d_update_chunk_parallel_gqa_kernel<<<
+      conv_grid, block, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(x),
+      reinterpret_cast<const __nv_bfloat16*>(w),
+      reinterpret_cast<const __nv_bfloat16*>(bias),
+      reinterpret_cast<const __nv_bfloat16*>(state),
+      reinterpret_cast<__nv_bfloat16*>(q16),
+      reinterpret_cast<__nv_bfloat16*>(k16),
+      reinterpret_cast<__nv_bfloat16*>(v48),
       B, S, conv_dim, k, apply_silu);
 
   dim3 state_grid((conv_dim + kThreadsX - 1) / kThreadsX, B);

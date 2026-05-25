@@ -2044,6 +2044,18 @@ class Qwen36TorchFrontendRtx:
         conv_state = self._lin_conv_state[lin_rank]
         qkv_K_view = out_qkv_K  # (K, 10240)
         save_steps = K if K <= self._K_save_max else 0
+        gdn_backend = _qwen36_tq_prefill_gdn_backend()
+        use_wy_chunk = (
+            K > self._K_save_max
+            and gdn_backend in ('wy', 'native_wy', 'flashrt_wy', 'wy_lt')
+            and hasattr(fvk, 'qwen36_gdn_wy_norm_cumsum_bf16')
+            and hasattr(fvk, 'qwen36_gdn_wy_kkt_b64_bf16')
+            and hasattr(fvk, 'qwen36_gdn_wy_solve_tril_b64_f32')
+            and hasattr(fvk, 'qwen36_gdn_wy_recompute_wu_b64_bf16')
+            and hasattr(fvk, 'qwen36_gdn_wy_chunk_h_b64_bf16')
+            and hasattr(fvk, 'qwen36_gdn_wy_output_o_b64_bf16')
+        )
+        conv_gqa_ready = False
 
         if save_steps > 0:
             for k in range(K):
@@ -2083,13 +2095,34 @@ class Qwen36TorchFrontendRtx:
                     conv_chunk = (
                         fvk.causal_conv1d_qwen36_update_chunk_parallel_bf16
                     )
-                conv_chunk(
-                    qkv_K_view.data_ptr(), int(lw['conv1d_w']),
-                    int(lw['conv1d_b']),
-                    self._K_lin_conv_out[:K].data_ptr(),
-                    conv_state.data_ptr(),
-                    1, K, 10240, 4, True, s,
-                )
+                use_conv_gqa = (
+                    use_wy_chunk
+                    and hasattr(
+                        fvk,
+                        'causal_conv1d_qwen36_update_chunk_parallel_gqa_bf16')
+                    and os.environ.get(
+                        'FVK_QWEN36_CHUNK_CONV_GQA', '1'
+                    ).strip().lower() not in ('0', 'false', 'off'))
+                if use_conv_gqa:
+                    q16_K = self._K_lin_q16[:K]
+                    k16_K = self._K_lin_k16[:K]
+                    v48_K = self._K_lin_v48[:K]
+                    fvk.causal_conv1d_qwen36_update_chunk_parallel_gqa_bf16(
+                        qkv_K_view.data_ptr(), int(lw['conv1d_w']),
+                        int(lw['conv1d_b']),
+                        q16_K.data_ptr(), k16_K.data_ptr(), v48_K.data_ptr(),
+                        conv_state.data_ptr(),
+                        1, K, 10240, 4, True, s,
+                    )
+                    conv_gqa_ready = True
+                else:
+                    conv_chunk(
+                        qkv_K_view.data_ptr(), int(lw['conv1d_w']),
+                        int(lw['conv1d_b']),
+                        self._K_lin_conv_out[:K].data_ptr(),
+                        conv_state.data_ptr(),
+                        1, K, 10240, 4, True, s,
+                    )
             else:
                 for k in range(K):
                     qkv_row = qkv_K_view[k:k + 1]
@@ -2103,16 +2136,17 @@ class Qwen36TorchFrontendRtx:
 
         # 5b) Split conv output into Q/K/V and broadcast Q/K heads from
         # 16 to 48 through FlashRT kernels.
-        conv_K = self._K_lin_conv_out[:K]
+        conv_K = None if conv_gqa_ready else self._K_lin_conv_out[:K]
         use_direct_gdn = (
-            K > self._K_save_max
+            not conv_gqa_ready
+            and K > self._K_save_max
             and os.environ.get(
                 'FVK_QWEN36_CHUNK_GDN_PREFILL', '1') == '1'
             and hasattr(fvk, 'qwen36_gdn_chunk_from_conv_smem_bf16')
             and hasattr(fvk, 'qwen36_gdn_chunk_from_conv_smem_strided_bf16')
             and os.environ.get('FVK_QWEN36_GDN_DIRECT_CONV', '1') == '1'
         )
-        if not use_direct_gdn:
+        if not use_direct_gdn and not conv_gqa_ready:
             q_K_48 = self._K_lin_q48[:K]
             k_K_48 = self._K_lin_k48[:K]
             v_K_3d = self._K_lin_v48[:K]
@@ -2182,17 +2216,6 @@ class Qwen36TorchFrontendRtx:
         rec_state_view = self._lin_state[lin_rank]  # (1, 48, 128, 128)
         attn_out_K_buf = self._K_lin_attn_out[:K]
         attn_out_K = None
-        gdn_backend = _qwen36_tq_prefill_gdn_backend()
-        use_wy_chunk = (
-            K > self._K_save_max
-            and gdn_backend in ('wy', 'native_wy', 'flashrt_wy', 'wy_lt')
-            and hasattr(fvk, 'qwen36_gdn_wy_norm_cumsum_bf16')
-            and hasattr(fvk, 'qwen36_gdn_wy_kkt_b64_bf16')
-            and hasattr(fvk, 'qwen36_gdn_wy_solve_tril_b64_f32')
-            and hasattr(fvk, 'qwen36_gdn_wy_recompute_wu_b64_bf16')
-            and hasattr(fvk, 'qwen36_gdn_wy_chunk_h_b64_bf16')
-            and hasattr(fvk, 'qwen36_gdn_wy_output_o_b64_bf16')
-        )
         use_wy_lt_kkt = (
             use_wy_chunk
             and gdn_backend == 'wy_lt'
@@ -2232,7 +2255,14 @@ class Qwen36TorchFrontendRtx:
                 '0').strip().lower() in ('1', 'true', 'on'))
         use_inout = K <= self._K_save_max
         if use_wy_chunk:
-            if (
+            if conv_gqa_ready:
+                q16_K = self._K_lin_q16[:K]
+                k16_K = self._K_lin_k16[:K]
+                v48_K = self._K_lin_v48[:K]
+                q_K_heads = q16_K.view(1, K, 16, 128)
+                k_K_heads = k16_K.view(1, K, 16, 128)
+                v_K_heads = v48_K.view(1, K, 48, 128)
+            elif (
                 use_wy_chunk
                 or (
                     hasattr(fvk, 'qwen36_lin_split_qkv_gqa_bf16')

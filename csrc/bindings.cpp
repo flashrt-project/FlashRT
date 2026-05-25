@@ -3934,6 +3934,22 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("B"), py::arg("S"), py::arg("conv_dim"), py::arg("k"),
         py::arg("apply_silu") = true, py::arg("stream") = 0);
 
+    m.def("causal_conv1d_qwen36_update_chunk_parallel_gqa_bf16",
+        [](uintptr_t x, uintptr_t w, uintptr_t bias,
+           uintptr_t q16, uintptr_t k16, uintptr_t v48, uintptr_t state,
+           int B, int S, int conv_dim, int k, bool apply_silu,
+           uintptr_t stream) {
+            flash_rt::kernels::causal_conv1d_qwen36_update_chunk_parallel_gqa_bf16(
+                to_ptr(x), to_ptr(w),
+                bias ? to_ptr(bias) : nullptr,
+                to_ptr(q16), to_ptr(k16), to_ptr(v48), to_ptr(state),
+                B, S, conv_dim, k, apply_silu, to_stream(stream));
+        },
+        py::arg("x"), py::arg("w"), py::arg("bias"),
+        py::arg("q16"), py::arg("k16"), py::arg("v48"), py::arg("state"),
+        py::arg("B"), py::arg("S"), py::arg("conv_dim"), py::arg("k"),
+        py::arg("apply_silu") = true, py::arg("stream") = 0);
+
     // Phase 4.4 — stream-invariant bf16 matvec for Qwen3.6 (replaces F.linear
     // / cuBLASLt for the small in_proj_a/b and the lm_head bf16 GEMM whose
     // per-stream / per-graph algo selection breaks CUDA Graph correctness).

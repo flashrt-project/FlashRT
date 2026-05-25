@@ -104,5 +104,22 @@ void causal_conv1d_qwen36_update_chunk_parallel_bf16(
     bool apply_silu,
     cudaStream_t stream);
 
+// Parallel prefill variant for the Qwen3.6 WY path. Computes the same
+// depthwise conv output as causal_conv1d_qwen36_update_chunk_parallel_bf16,
+// but writes directly to split GQA buffers:
+//   q16: (B, S, 16, 128), k16: (B, S, 16, 128), v48: (B, S, 48, 128).
+// This avoids materializing and rereading the full (B, S, 10240) conv tensor.
+void causal_conv1d_qwen36_update_chunk_parallel_gqa_bf16(
+    const void* x,
+    const void* w,
+    const void* bias,
+    void*       q16,
+    void*       k16,
+    void*       v48,
+    void*       state,
+    int B, int S, int conv_dim, int k,
+    bool apply_silu,
+    cudaStream_t stream);
+
 }  // namespace kernels
 }  // namespace flash_rt
