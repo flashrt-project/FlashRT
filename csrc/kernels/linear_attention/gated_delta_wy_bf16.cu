@@ -1176,6 +1176,8 @@ __global__ void solve_tril_b64_from_kkt_gated_pack_kernel(
   extern __shared__ float smem[];
   float* A_s = smem;
   float* Ai_s = smem + kChunk * kChunk;
+  float* beta_s = Ai_s + kChunk * kChunk;
+  float* g_s = beta_s + kChunk;
 
   const int vh = blockIdx.x;
   const int chunk = blockIdx.y;
@@ -1187,21 +1189,27 @@ __global__ void solve_tril_b64_from_kkt_gated_pack_kernel(
   const size_t kkt_head_base =
       (static_cast<size_t>(chunk) * num_k_heads + kh) * kChunk * kChunk;
 
+  for (int idx = threadIdx.x; idx < kChunk; idx += blockDim.x) {
+    const int s = chunk_start + idx;
+    if (idx < T && s < S) {
+      beta_s[idx] =
+          static_cast<float>(beta[static_cast<size_t>(s) * num_v_heads + vh]);
+      g_s[idx] = static_cast<float>(
+          g_cumsum[static_cast<size_t>(s) * num_v_heads + vh]);
+    } else {
+      beta_s[idx] = 0.0f;
+      g_s[idx] = 0.0f;
+    }
+  }
+  __syncthreads();
+
   for (int idx = threadIdx.x; idx < kChunk * kChunk; idx += blockDim.x) {
     const int r = idx / kChunk;
     const int c = idx - r * kChunk;
-    const int si = chunk_start + r;
-    const int sj = chunk_start + c;
     float a = 0.0f;
-    if (kh < num_k_heads && c < r && r < T && c < T && si < S && sj < S) {
+    if (kh < num_k_heads && c < r && r < T && c < T) {
       const float dot = kkt_base[kkt_head_base + idx];
-      const float beta_i =
-          static_cast<float>(beta[static_cast<size_t>(si) * num_v_heads + vh]);
-      const float gi = static_cast<float>(
-          g_cumsum[static_cast<size_t>(si) * num_v_heads + vh]);
-      const float gj = static_cast<float>(
-          g_cumsum[static_cast<size_t>(sj) * num_v_heads + vh]);
-      a = beta_i * dot * __expf(gi - gj);
+      a = beta_s[r] * dot * __expf(g_s[r] - g_s[c]);
     }
     A_s[idx] = a;
     Ai_s[idx] = (r == c && r < T) ? 1.0f : 0.0f;
@@ -2298,7 +2306,7 @@ void gdn_wy_solve_tril_b64_from_kkt_pack_only(
   const int chunks = (S + kChunk - 1) / kChunk;
   solve_tril_b64_from_kkt_gated_pack_kernel<<<
       dim3(num_v_heads, chunks), 256,
-      2 * kChunk * kChunk * sizeof(float), stream>>>(
+      (2 * kChunk * kChunk + 2 * kChunk) * sizeof(float), stream>>>(
       reinterpret_cast<const float*>(kkt_base),
       reinterpret_cast<const __nv_bfloat16*>(beta),
       reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
