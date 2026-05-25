@@ -4409,6 +4409,18 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("head_dim"), py::arg("qk_group"),
         py::arg("stream") = 0);
 
+    m.def("linear_attn_gdn_wy_kkt_b64_bf16_cublaslt_packed_k_only",
+        [](uintptr_t k_pack, uintptr_t kkt_base,
+           int S, int num_k_heads, int head_dim, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_kkt_b64_bf16_cublaslt_packed_k_only(
+                    to_ptr(k_pack), to_ptr(kkt_base),
+                    S, num_k_heads, head_dim, to_stream(stream));
+        },
+        py::arg("k_pack"), py::arg("kkt_base"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("head_dim"),
+        py::arg("stream") = 0);
+
     m.def("linear_attn_gdn_wy_kkt_b64_bf16_cublaslt_nogate",
         [](uintptr_t k_l2, uintptr_t beta,
            uintptr_t k_pack, uintptr_t kkt_base, uintptr_t A,
@@ -4569,6 +4581,23 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         },
         py::arg("A"), py::arg("Ai_pack"),
         py::arg("S"), py::arg("num_v_heads"), py::arg("stream") = 0);
+
+    m.def("linear_attn_gdn_wy_solve_tril_b64_from_kkt_pack_only",
+        [](uintptr_t kkt_base, uintptr_t beta, uintptr_t g_cumsum,
+           uintptr_t Ai_pack,
+           int S, int num_k_heads, int num_v_heads, int qk_group,
+           uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_solve_tril_b64_from_kkt_pack_only(
+                    to_ptr(kkt_base), to_ptr(beta), to_ptr(g_cumsum),
+                    to_ptr(Ai_pack),
+                    S, num_k_heads, num_v_heads, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("kkt_base"), py::arg("beta"), py::arg("g_cumsum"),
+        py::arg("Ai_pack"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("qk_group"), py::arg("stream") = 0);
 
     m.def("linear_attn_gdn_wy_output_o_b64_bf16_cublaslt",
         [](uintptr_t q_l2, uintptr_t k_l2, uintptr_t v_new,

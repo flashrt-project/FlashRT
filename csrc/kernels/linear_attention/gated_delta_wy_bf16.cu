@@ -1163,6 +1163,159 @@ __global__ void solve_tril_b64_fused_shared_kernel(
   }
 }
 
+__global__ void solve_tril_b64_from_kkt_gated_pack_kernel(
+    const float* __restrict__ kkt_base,
+    const __nv_bfloat16* __restrict__ beta,
+    const __nv_bfloat16* __restrict__ g_cumsum,
+    __nv_bfloat16* __restrict__ Ai_pack,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int qk_group)
+{
+  extern __shared__ float smem[];
+  float* A_s = smem;
+  float* Ai_s = smem + kChunk * kChunk;
+
+  const int vh = blockIdx.x;
+  const int chunk = blockIdx.y;
+  const int kh = vh / qk_group;
+  const int chunk_start = chunk * kChunk;
+  const int T = min(kChunk, S - chunk_start);
+  const size_t out_base =
+      (static_cast<size_t>(chunk) * num_v_heads + vh) * kChunk * kChunk;
+  const size_t kkt_head_base =
+      (static_cast<size_t>(chunk) * num_k_heads + kh) * kChunk * kChunk;
+
+  for (int idx = threadIdx.x; idx < kChunk * kChunk; idx += blockDim.x) {
+    const int r = idx / kChunk;
+    const int c = idx - r * kChunk;
+    const int si = chunk_start + r;
+    const int sj = chunk_start + c;
+    float a = 0.0f;
+    if (kh < num_k_heads && c < r && r < T && c < T && si < S && sj < S) {
+      const float dot = kkt_base[kkt_head_base + idx];
+      const float beta_i =
+          static_cast<float>(beta[static_cast<size_t>(si) * num_v_heads + vh]);
+      const float gi = static_cast<float>(
+          g_cumsum[static_cast<size_t>(si) * num_v_heads + vh]);
+      const float gj = static_cast<float>(
+          g_cumsum[static_cast<size_t>(sj) * num_v_heads + vh]);
+      a = beta_i * dot * __expf(gi - gj);
+    }
+    A_s[idx] = a;
+    Ai_s[idx] = (r == c && r < T) ? 1.0f : 0.0f;
+  }
+  __syncthreads();
+
+  if (threadIdx.x < 64) {
+    const int br = threadIdx.x >> 4;
+    const int c = threadIdx.x & 15;
+    const int block_start = br * 16;
+    const int Tb = max(0, min(16, T - block_start));
+    if (c < Tb) {
+      for (int r = c + 1; r < Tb; ++r) {
+        const int gr = block_start + r;
+        const int gc = block_start + c;
+        float val = -A_s[gr * kChunk + gc];
+        for (int m = c + 1; m < r; ++m) {
+          const int gm = block_start + m;
+          val -= A_s[gr * kChunk + gm] * Ai_s[gm * kChunk + gc];
+        }
+        Ai_s[gr * kChunk + gc] = val;
+      }
+    }
+  }
+  __syncthreads();
+
+  auto compute_immediate = [&](int br) {
+    for (int idx = threadIdx.x; idx < 16 * 16; idx += blockDim.x) {
+      const int i = idx / 16;
+      const int j = idx - i * 16;
+      const int r = br * 16 + i;
+      const int c = (br - 1) * 16 + j;
+      if (r < T && c < T) {
+        float tmp[16];
+        #pragma unroll
+        for (int k = 0; k < 16; ++k) {
+          tmp[k] = b16_mul(Ai_s, A_s, br, br, br, br - 1, i, k);
+        }
+        float acc = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < 16; ++k) {
+          acc = fmaf(tmp[k],
+                     Ai_s[((br - 1) * 16 + k) * kChunk + c],
+                     acc);
+        }
+        Ai_s[r * kChunk + c] = -acc;
+      }
+    }
+  };
+
+  compute_immediate(1);
+  compute_immediate(2);
+  compute_immediate(3);
+  __syncthreads();
+
+  auto compute_second = [&](int br) {
+    for (int idx = threadIdx.x; idx < 16 * 16; idx += blockDim.x) {
+      const int i = idx / 16;
+      const int j = idx - i * 16;
+      const int r = br * 16 + i;
+      const int c = (br - 2) * 16 + j;
+      if (r < T && c < T) {
+        float sum[16];
+        #pragma unroll
+        for (int k = 0; k < 16; ++k) {
+          sum[k] = b16_mul(A_s, Ai_s, br, br - 2,
+                           br - 2, br - 2, k, j);
+          sum[k] += b16_mul(A_s, Ai_s, br, br - 1,
+                            br - 1, br - 2, k, j);
+        }
+        float acc = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < 16; ++k) {
+          acc = fmaf(Ai_s[(br * 16 + i) * kChunk + (br * 16 + k)],
+                     sum[k], acc);
+        }
+        Ai_s[r * kChunk + c] = -acc;
+      }
+    }
+  };
+
+  compute_second(2);
+  compute_second(3);
+  __syncthreads();
+
+  for (int idx = threadIdx.x; idx < 16 * 16; idx += blockDim.x) {
+    const int i = idx / 16;
+    const int j = idx - i * 16;
+    const int r = 3 * 16 + i;
+    const int c = j;
+    if (r < T && c < T) {
+      float sum[16];
+      #pragma unroll
+      for (int k = 0; k < 16; ++k) {
+        sum[k] = b16_mul(A_s, Ai_s, 3, 0, 0, 0, k, j);
+        sum[k] += b16_mul(A_s, Ai_s, 3, 1, 1, 0, k, j);
+        sum[k] += b16_mul(A_s, Ai_s, 3, 2, 2, 0, k, j);
+      }
+      float acc = 0.0f;
+      #pragma unroll
+      for (int k = 0; k < 16; ++k) {
+        acc = fmaf(Ai_s[(3 * 16 + i) * kChunk + (3 * 16 + k)],
+                   sum[k], acc);
+      }
+      Ai_s[r * kChunk + c] = -acc;
+    }
+  }
+  __syncthreads();
+
+  for (int idx = threadIdx.x; idx < kChunk * kChunk; idx += blockDim.x) {
+    Ai_pack[out_base + idx] = __float2bfloat16(Ai_s[idx]);
+  }
+}
+
 __global__ void pack_output_qkv_kernel(
     const __nv_bfloat16* __restrict__ q_l2,
     const __nv_bfloat16* __restrict__ k_l2,
@@ -1719,6 +1872,33 @@ void gdn_wy_kkt_b64_bf16_cublaslt_packed_k(
       S, num_k_heads, num_v_heads, qk_group);
 }
 
+void gdn_wy_kkt_b64_bf16_cublaslt_packed_k_only(
+    const void* k_pack,
+    void*       kkt_base,
+    int S,
+    int num_k_heads,
+    int head_dim,
+    cudaStream_t stream)
+{
+  if (S <= 0 || num_k_heads <= 0 || head_dim <= 0) {
+    return;
+  }
+  const int chunks = (S + kChunk - 1) / kChunk;
+  const int batches = chunks * num_k_heads;
+
+  LtPlan& plan = get_kkt_plan(batches, head_dim);
+  const float alpha = 1.0f;
+  const float beta0 = 0.0f;
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmul(
+      g_lt, plan.desc, &alpha,
+      k_pack, plan.a_desc,
+      k_pack, plan.b_desc,
+      &beta0,
+      kkt_base, plan.c_desc,
+      kkt_base, plan.c_desc,
+      &plan.algo, g_workspace, g_workspace_size, stream));
+}
+
 void gdn_wy_kkt_b64_bf16_cublaslt_nogate(
     const void* k_l2,
     const void* beta,
@@ -2099,6 +2279,31 @@ void gdn_wy_solve_tril_b64_f32_fused_pack_only(
       nullptr,
       reinterpret_cast<__nv_bfloat16*>(Ai_pack),
       S, num_v_heads);
+}
+
+void gdn_wy_solve_tril_b64_from_kkt_pack_only(
+    const void* kkt_base,
+    const void* beta,
+    const void* g_cumsum,
+    void*       Ai_pack,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int qk_group,
+    cudaStream_t stream)
+{
+  if (S <= 0 || num_k_heads <= 0 || num_v_heads <= 0 || qk_group <= 0) {
+    return;
+  }
+  const int chunks = (S + kChunk - 1) / kChunk;
+  solve_tril_b64_from_kkt_gated_pack_kernel<<<
+      dim3(num_v_heads, chunks), 256,
+      2 * kChunk * kChunk * sizeof(float), stream>>>(
+      reinterpret_cast<const float*>(kkt_base),
+      reinterpret_cast<const __nv_bfloat16*>(beta),
+      reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
+      reinterpret_cast<__nv_bfloat16*>(Ai_pack),
+      S, num_k_heads, num_v_heads, qk_group);
 }
 
 void gdn_wy_chunk_h_b64_bf16_cublaslt(

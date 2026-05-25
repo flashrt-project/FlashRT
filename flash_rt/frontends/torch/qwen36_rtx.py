@@ -2313,7 +2313,24 @@ class Qwen36TorchFrontendRtx:
                         self._K_wy_g_cumsum[:K].data_ptr(),
                         K, s,
                     )
-                if use_wy_lt_norm_pack_qk:
+                use_fused_kkt_solve = (
+                    use_wy_lt_norm_pack_qk
+                    and hasattr(
+                        fvk,
+                        'linear_attn_gdn_wy_kkt_b64_bf16_cublaslt_packed_k_only')
+                    and hasattr(
+                        fvk,
+                        'linear_attn_gdn_wy_solve_tril_b64_from_kkt_pack_only')
+                    and os.environ.get(
+                        'FLASHRT_QWEN36_TQ_PREFILL_GDN_FUSED_KKT_SOLVE',
+                        '1').strip().lower() not in ('0', 'false', 'off'))
+                if use_fused_kkt_solve:
+                    fvk.linear_attn_gdn_wy_kkt_b64_bf16_cublaslt_packed_k_only(
+                        self._K_wy_k_pack[:chunks].data_ptr(),
+                        self._K_wy_kkt_base[:chunks].data_ptr(),
+                        K, 16, 128, s,
+                    )
+                elif use_wy_lt_norm_pack_qk:
                     fvk.linear_attn_gdn_wy_kkt_b64_bf16_cublaslt_packed_k(
                         self._K_wy_k_pack[:chunks].data_ptr(),
                         beta_K.data_ptr(),
@@ -2363,7 +2380,15 @@ class Qwen36TorchFrontendRtx:
                         and os.environ.get(
                             'FLASHRT_QWEN36_TQ_PREFILL_GDN_SOLVE_PACK_ONLY',
                             '1').strip().lower() not in ('0', 'false', 'off'))
-                    if use_fused_solve_pack_only:
+                    if use_fused_kkt_solve:
+                        fvk.linear_attn_gdn_wy_solve_tril_b64_from_kkt_pack_only(
+                            self._K_wy_kkt_base[:chunks].data_ptr(),
+                            beta_K.data_ptr(),
+                            self._K_wy_g_cumsum[:K].data_ptr(),
+                            self._K_wy_Ai_pack[:chunks].data_ptr(),
+                            K, 16, 48, 3, s,
+                        )
+                    elif use_fused_solve_pack_only:
                         fvk.linear_attn_gdn_wy_solve_tril_b64_f32_fused_pack_only(
                             self._K_wy_A[:chunks].data_ptr(),
                             self._K_wy_Ai_pack[:chunks].data_ptr(),

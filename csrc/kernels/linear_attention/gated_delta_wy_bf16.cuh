@@ -51,6 +51,15 @@ void gdn_wy_kkt_b64_bf16_cublaslt_packed_k(
     int qk_group,
     cudaStream_t stream);
 
+// KKT-only variant for fused downstream gating+solve.
+void gdn_wy_kkt_b64_bf16_cublaslt_packed_k_only(
+    const void* k_pack,
+    void*       kkt_base,
+    int S,
+    int num_k_heads,
+    int head_dim,
+    cudaStream_t stream);
+
 // Same cublasLt K @ K^T path as gdn_wy_kkt_b64_bf16_cublaslt, but leaves the
 // cumulative gate out of A:
 //   A[i,j] = beta[i] * dot(k[i], k[j]), i > j
@@ -177,6 +186,22 @@ void gdn_wy_solve_tril_b64_f32_fused_pack_only(
     void*       Ai_pack,
     int S,
     int num_v_heads,
+    cudaStream_t stream);
+
+// Fuses apply_kkt_gating_kernel + solve_tril_b64_f32_fused_pack_only.
+// Consumes cublasLt KKT output laid out as
+//   kkt_base: (ceil(S/64), num_k_heads, 64, 64) fp32
+// and writes the solved gated inverse directly to
+//   Ai_pack:  (ceil(S/64), num_v_heads, 64, 64) bf16.
+void gdn_wy_solve_tril_b64_from_kkt_pack_only(
+    const void* kkt_base,
+    const void* beta,
+    const void* g_cumsum,
+    void*       Ai_pack,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int qk_group,
     cudaStream_t stream);
 
 void gdn_wy_output_o_b64_bf16_cublaslt(
