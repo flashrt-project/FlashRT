@@ -1435,7 +1435,7 @@ class Qwen36TorchFrontendRtx:
             f'_layer_forward_lin_nvfp4 layer {L} type {lw["type"]!r}'
         )
 
-        h2 = h_in.view(1, 5120).contiguous()
+        h2 = h_in.view(1, 5120)
         eps = float(self._cfg['rms_norm_eps'])
 
         x_norm = self._h_b[:1]
@@ -1699,7 +1699,7 @@ class Qwen36TorchFrontendRtx:
             float(lw['k_proj_alpha']),
             s,
         )
-        k_pre = kv_proj_out_buf[:1].view(1, 1, 4, 256).contiguous()
+        k_pre = kv_proj_out_buf[:1].view(1, 1, 4, 256)
 
         # 5) q_norm / k_norm.
         fvk.rms_norm(
@@ -1764,7 +1764,7 @@ class Qwen36TorchFrontendRtx:
 
         # 10) o_proj NVFP4: K=6144 -> N=5120.
         ap_6144, sf_6144, _ = self._nvfp4_scratch[(5120, 6144)]
-        gated_2d = gated.view(1, 6144).contiguous()
+        gated_2d = gated.view(1, 6144)
         fvk.quantize_bf16_to_nvfp4_swizzled(
             gated_2d.data_ptr(), ap_6144.data_ptr(),
             sf_6144.data_ptr(), 1, 6144, s,
