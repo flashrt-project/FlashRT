@@ -285,6 +285,33 @@ void gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu(
     int qk_group,
     cudaStream_t stream);
 
+// FLA-style hand-tuned mma.sync + cp.async kernel.
+// Inputs are RAW (un-packed) bf16:
+//   k_l2:   (S, num_k_heads, head_dim) bf16
+//   w, u:   (S, num_v_heads, head_dim) bf16
+//   g_fp32: (S, num_v_heads) FP32 chunk-local cumsum (not bf16!)
+//   state0: (num_v_heads, head_dim, head_dim) bf16 initial state
+// Outputs:
+//   h_out:            (NT, num_v_heads, head_dim, head_dim) bf16
+//   v_new:            (S, num_v_heads, head_dim) bf16 written BEFORE decay
+//   state_final_fp32: (num_v_heads, head_dim, head_dim) FP32 final state
+// head_dim must be 128.
+void gdn_wy_chunk_h_b64_bf16_mma_fla(
+    const void* k_l2,
+    const void* w,
+    const void* u,
+    const void* g_fp32,
+    const void* state0,
+    void*       h_out,
+    void*       v_new,
+    void*       state_final_fp32,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group,
+    cudaStream_t stream);
+
 }  // namespace linear_attention
 }  // namespace kernels
 }  // namespace flash_rt

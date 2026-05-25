@@ -4701,6 +4701,30 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("head_dim"), py::arg("qk_group"),
         py::arg("stream") = 0);
 
+    // FLA-style mma.sync + cp.async chunk_h kernel.
+    // RAW input layout, head_dim must be 128. See .cuh for shape contract.
+    m.def("linear_attn_gdn_wy_chunk_h_b64_bf16_mma_fla",
+        [](uintptr_t k_l2, uintptr_t w, uintptr_t u,
+           uintptr_t g_fp32, uintptr_t state0,
+           uintptr_t h_out, uintptr_t v_new, uintptr_t state_final_fp32,
+           int S, int num_k_heads, int num_v_heads,
+           int head_dim, int qk_group, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_chunk_h_b64_bf16_mma_fla(
+                    to_ptr(k_l2), to_ptr(w), to_ptr(u),
+                    to_ptr(g_fp32), to_ptr(state0),
+                    to_ptr(h_out), to_ptr(v_new),
+                    to_ptr(state_final_fp32),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("k_l2"), py::arg("w"), py::arg("u"),
+        py::arg("g_fp32"), py::arg("state0"),
+        py::arg("h_out"), py::arg("v_new"), py::arg("state_final_fp32"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"),
+        py::arg("stream") = 0);
+
     m.def("qwen36_gdn_wy_solve_tril_b64_f32",
         [](uintptr_t A, uintptr_t Ai, int S, uintptr_t stream) {
             flash_rt::kernels::qwen36_gdn_wy_solve_tril_b64_f32(
