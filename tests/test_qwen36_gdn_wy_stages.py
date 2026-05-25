@@ -71,6 +71,25 @@ def _kkt_ref(k_l2, beta, g_cumsum, chunk=64):
     return A
 
 
+def _kkt_nogate_ref(k_l2, beta, chunk=64):
+    S = k_l2.shape[0]
+    chunks = (S + chunk - 1) // chunk
+    A = torch.zeros(chunks, 48, chunk, chunk, device=k_l2.device,
+                    dtype=torch.float32)
+    for ci, start in enumerate(range(0, S, chunk)):
+        end = min(start + chunk, S)
+        T = end - start
+        kk = k_l2[start:end].float()
+        bb = beta[start:end].float()
+        for vh in range(48):
+            kh = vh // 3
+            dots = kk[:, kh] @ kk[:, kh].T
+            block = bb[:, vh, None] * dots
+            block = torch.tril(block, diagonal=-1)
+            A[ci, vh, :T, :T] = block
+    return A
+
+
 def _solve_ref(A, S, chunk=64):
     chunks = (S + chunk - 1) // chunk
     Ai = torch.zeros_like(A)
@@ -387,6 +406,53 @@ def test_linear_attn_gdn_wy_kkt_cublaslt_matches_reference(S):
     torch.cuda.synchronize()
     A_ref = _kkt_ref(k_l2, beta, g_cumsum)
     torch.testing.assert_close(A, A_ref, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.parametrize("S", [64, 128])
+def test_linear_attn_gdn_wy_kkt_nogate_matches_reference_and_gated_factorization(S):
+    fvk = _load_fvk()
+    if not hasattr(fvk, "linear_attn_gdn_wy_kkt_b64_bf16_cublaslt_nogate"):
+        pytest.skip("nogate kkt cublasLt kernel is not built")
+    torch.manual_seed(20260527 + S)
+    chunks = (S + 63) // 64
+    k = torch.randn(S, 16, 128, device="cuda", dtype=torch.bfloat16) * 0.25
+    beta = torch.rand(S, 48, device="cuda", dtype=torch.bfloat16) * 0.8
+    g = (torch.randn(S, 48, device="cuda") * 0.02).to(torch.bfloat16)
+    g_cumsum = _local_cumsum_bf16(g)
+    k_l2 = (k.float() / torch.sqrt(
+        torch.sum(k.float() * k.float(), dim=-1, keepdim=True) + 1e-6)
+    ).to(torch.bfloat16)
+
+    k_pack = torch.empty(chunks, 16, 64, 128, device="cuda",
+                         dtype=torch.bfloat16)
+    kkt_base = torch.empty(chunks, 16, 64, 64, device="cuda",
+                           dtype=torch.float32)
+    A_nogate = torch.empty(chunks, 48, 64, 64, device="cuda",
+                           dtype=torch.float32)
+    fvk.linear_attn_gdn_wy_kkt_b64_bf16_cublaslt_nogate(
+        _ptr(k_l2), _ptr(beta), _ptr(k_pack), _ptr(kkt_base), _ptr(A_nogate),
+        S, 16, 48, 128, 3, 0)
+    torch.cuda.synchronize()
+    A_nogate_ref = _kkt_nogate_ref(k_l2, beta)
+    torch.testing.assert_close(A_nogate, A_nogate_ref, rtol=2e-3, atol=2e-3)
+
+    A_gated = torch.empty_like(A_nogate)
+    fvk.linear_attn_gdn_wy_kkt_b64_bf16_cublaslt(
+        _ptr(k_l2), _ptr(beta), _ptr(g_cumsum),
+        _ptr(k_pack), _ptr(kkt_base), _ptr(A_gated),
+        S, 16, 48, 128, 3, 0)
+    torch.cuda.synchronize()
+    Ai_gated = _solve_ref(A_gated, S)
+    Ai_nogate = _solve_ref(A_nogate, S)
+
+    for ci, start in enumerate(range(0, S, 64)):
+        T = min(64, S - start)
+        gg = g_cumsum[start:start + T].float()
+        bb = beta[start:start + T].float()
+        lhs = Ai_gated[ci, :, :T, :T] * bb.T[:, None, :]
+        decay = torch.exp(gg.T[:, :, None] - gg.T[:, None, :])
+        rhs = Ai_nogate[ci, :, :T, :T] * decay * bb.T[:, None, :]
+        torch.testing.assert_close(lhs, rhs, rtol=3e-3, atol=3e-3)
 
 
 @pytest.mark.parametrize("S", [6, 64, 65, 128])

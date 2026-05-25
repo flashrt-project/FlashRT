@@ -4363,6 +4363,24 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("head_dim"), py::arg("qk_group"),
         py::arg("stream") = 0);
 
+    m.def("linear_attn_gdn_wy_kkt_b64_bf16_cublaslt_nogate",
+        [](uintptr_t k_l2, uintptr_t beta,
+           uintptr_t k_pack, uintptr_t kkt_base, uintptr_t A,
+           int S, int num_k_heads, int num_v_heads,
+           int head_dim, int qk_group, uintptr_t stream) {
+            flash_rt::kernels::linear_attention::
+                gdn_wy_kkt_b64_bf16_cublaslt_nogate(
+                    to_ptr(k_l2), to_ptr(beta), to_ptr(k_pack),
+                    to_ptr(kkt_base), to_ptr(A),
+                    S, num_k_heads, num_v_heads, head_dim, qk_group,
+                    to_stream(stream));
+        },
+        py::arg("k_l2"), py::arg("beta"),
+        py::arg("k_pack"), py::arg("kkt_base"), py::arg("A"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("qk_group"),
+        py::arg("stream") = 0);
+
     m.def("linear_attn_gdn_wy_recompute_wu_b64_bf16_cublaslt",
         [](uintptr_t k_l2, uintptr_t v, uintptr_t beta,
            uintptr_t g_cumsum, uintptr_t Ai,

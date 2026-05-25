@@ -598,6 +598,41 @@ __global__ void apply_kkt_gating_kernel(
   A[a_off] = beta_i * dot * __expf(gi - gj);
 }
 
+__global__ void apply_kkt_beta_kernel(
+    const float* __restrict__ kkt_base,
+    const __nv_bfloat16* __restrict__ beta,
+    float* __restrict__ A,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int qk_group)
+{
+  const int pair = blockIdx.x * blockDim.x + threadIdx.x;
+  if (pair >= kChunk * kChunk) return;
+  const int i = pair / kChunk;
+  const int j = pair - i * kChunk;
+  const int vh = blockIdx.y;
+  const int chunk = blockIdx.z;
+  const int kh = vh / qk_group;
+  const int si = chunk * kChunk + i;
+  const int sj = chunk * kChunk + j;
+  const size_t a_off =
+      (((static_cast<size_t>(chunk) * num_v_heads + vh) * kChunk + i)
+       * kChunk + j);
+  if (kh >= num_k_heads || i <= j || si >= S || sj >= S) {
+    A[a_off] = 0.0f;
+    return;
+  }
+
+  const size_t base_off =
+      (((static_cast<size_t>(chunk) * num_k_heads + kh) * kChunk + i)
+       * kChunk + j);
+  const float dot = kkt_base[base_off];
+  const float beta_i =
+      static_cast<float>(beta[static_cast<size_t>(si) * num_v_heads + vh]);
+  A[a_off] = beta_i * dot;
+}
+
 __global__ void pack_recompute_wu_kernel(
     const __nv_bfloat16* __restrict__ k_l2,
     const __nv_bfloat16* __restrict__ v,
@@ -1556,6 +1591,54 @@ void gdn_wy_kkt_b64_bf16_cublaslt(
       reinterpret_cast<const float*>(kkt_base),
       reinterpret_cast<const __nv_bfloat16*>(beta),
       reinterpret_cast<const __nv_bfloat16*>(g_cumsum),
+      reinterpret_cast<float*>(A),
+      S, num_k_heads, num_v_heads, qk_group);
+}
+
+void gdn_wy_kkt_b64_bf16_cublaslt_nogate(
+    const void* k_l2,
+    const void* beta,
+    void*       k_pack,
+    void*       kkt_base,
+    void*       A,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group,
+    cudaStream_t stream)
+{
+  if (S <= 0 || num_k_heads <= 0 || num_v_heads <= 0 ||
+      head_dim <= 0 || qk_group <= 0) {
+    return;
+  }
+  const int chunks = (S + kChunk - 1) / kChunk;
+  const int batches = chunks * num_k_heads;
+  const int pack_total = batches * kChunk * head_dim;
+  pack_k_chunks_kernel<<<(pack_total + kThreads - 1) / kThreads,
+                         kThreads, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(k_l2),
+      reinterpret_cast<__nv_bfloat16*>(k_pack),
+      S, num_k_heads, head_dim);
+
+  LtPlan& plan = get_kkt_plan(batches, head_dim);
+  const float alpha = 1.0f;
+  const float beta0 = 0.0f;
+  FLASHRT_CUBLASLT_CHECK(cublasLtMatmul(
+      g_lt, plan.desc, &alpha,
+      k_pack, plan.a_desc,
+      k_pack, plan.b_desc,
+      &beta0,
+      kkt_base, plan.c_desc,
+      kkt_base, plan.c_desc,
+      &plan.algo, g_workspace, g_workspace_size, stream));
+
+  apply_kkt_beta_kernel<<<
+      dim3((kChunk * kChunk + kThreads - 1) / kThreads,
+           num_v_heads, chunks),
+      kThreads, 0, stream>>>(
+      reinterpret_cast<const float*>(kkt_base),
+      reinterpret_cast<const __nv_bfloat16*>(beta),
       reinterpret_cast<float*>(A),
       S, num_k_heads, num_v_heads, qk_group);
 }

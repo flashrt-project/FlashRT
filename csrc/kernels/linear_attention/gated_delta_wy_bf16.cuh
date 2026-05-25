@@ -34,6 +34,24 @@ void gdn_wy_kkt_b64_bf16_cublaslt(
     int qk_group,
     cudaStream_t stream);
 
+// Same cublasLt K @ K^T path as gdn_wy_kkt_b64_bf16_cublaslt, but leaves the
+// cumulative gate out of A:
+//   A[i,j] = beta[i] * dot(k[i], k[j]), i > j
+// The FlashQLA-style fused GDR applies the gate by diagonal similarity later:
+//   Ai_gated[i,j] * beta[j] == exp(g[i]-g[j]) * Ai_nogate[i,j] * beta[j].
+void gdn_wy_kkt_b64_bf16_cublaslt_nogate(
+    const void* k_l2,
+    const void* beta,
+    void*       k_pack,
+    void*       kkt_base,
+    void*       A,
+    int S,
+    int num_k_heads,
+    int num_v_heads,
+    int head_dim,
+    int qk_group,
+    cudaStream_t stream);
+
 void gdn_wy_recompute_wu_b64_bf16_cublaslt(
     const void* k_l2,
     const void* v,
