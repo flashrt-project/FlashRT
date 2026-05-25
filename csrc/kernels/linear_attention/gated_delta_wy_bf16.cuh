@@ -293,11 +293,18 @@ void gdn_wy_chunk_h_b64_bf16_cublaslt_packed_wu(
 //   w, u:     (S, num_v_heads, head_dim) bf16
 //   g_cumsum: (S, num_v_heads) bf16 chunk-local cumsum
 //   state:    (num_v_heads, head_dim, head_dim) bf16, IN/OUT (in-place update)
-// Outputs:
-//   h_out:    (NT, num_v_heads, head_dim, head_dim) bf16 (chunk prologue states)
-//   v_new:    (S, num_v_heads, head_dim) bf16 raw (written BEFORE decay).
+// Outputs (raw v_new + two nullable packed side outputs for downstream
+// cublasLt packed_qkv output_o):
+//   h_out:        (NT, num_v_heads, head_dim, head_dim) bf16 chunk prologue states
+//   v_new:        (S, num_v_heads, head_dim) bf16 raw v_new (BEFORE decay). Nullable.
+//   v_new_packed: (NT, num_v_heads, 64, head_dim) bf16 packed-per-chunk view
+//                 of the same raw v_new. Nullable.
+//   k_pack_hv:    (NT, num_v_heads, 64, head_dim) bf16 GQA-expanded packed k
+//                 (matches the layout output_o_*_packed_qkv expects). Nullable.
 //
-// No scratch buffers; smem-resident pipeline. NT = ceil(S / 64).
+// At least one of v_new / v_new_packed must be non-null for the downstream
+// attention output to have access to v_new. No scratch buffers; smem-resident
+// pipeline. NT = ceil(S / 64).
 void gdn_wy_chunk_h_b64_bf16_mma_fla(
     const void* k_l2,
     const void* w,
@@ -306,6 +313,8 @@ void gdn_wy_chunk_h_b64_bf16_mma_fla(
     void*       state,
     void*       h_out,
     void*       v_new,
+    void*       v_new_packed,
+    void*       k_pack_hv,
     int S,
     int num_k_heads,
     int num_v_heads,

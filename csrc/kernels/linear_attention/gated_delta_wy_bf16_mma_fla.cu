@@ -107,9 +107,11 @@ __global__ void chunk_h_kernel(
     const __nv_bfloat16* __restrict__ w,
     const __nv_bfloat16* __restrict__ u,
     const __nv_bfloat16* __restrict__ g_bf16,
-    __nv_bfloat16*       __restrict__ state,    // in/out
+    __nv_bfloat16*       __restrict__ state,        // in/out
     __nv_bfloat16*       __restrict__ h_out,
-    __nv_bfloat16*       __restrict__ v_new_out,
+    __nv_bfloat16*       __restrict__ v_new_out,    // (S, H, V) raw; nullable
+    __nv_bfloat16*       __restrict__ v_new_packed, // (NT, H, BT, V) packed; nullable
+    __nv_bfloat16*       __restrict__ k_pack_hv,    // (NT, H, BT, K) packed k with GQA expansion; nullable
     int S, int H, int Hg, int qk_group, int NT)
 {
   const int i_h = blockIdx.x;
@@ -220,6 +222,21 @@ __global__ void chunk_h_kernel(
 
     cp_async_wait<1>();
     __syncthreads();
+
+    // Optional packed k_pack_hv side output (chunks, H, BT, K). Only needed
+    // when the downstream output_o variant consumes the packed K with GQA
+    // expansion. Coalesced int4 stores from sK[stage] (which already holds
+    // the GQA-expanded k for this v-head).
+    if (k_pack_hv != nullptr) {
+      __nv_bfloat16* dst = k_pack_hv + ((size_t)i_t * H + i_h) * kBT * kK;
+      // 64 * 128 = 8192 bf16 = 1024 int4. 128 threads -> 8 int4 / thread.
+      #pragma unroll
+      for (int pass = 0; pass < 8; ++pass) {
+        int off = (pass * 128 + tid) * 8;
+        *reinterpret_cast<int4*>(&dst[off]) =
+            *reinterpret_cast<const int4*>(&sK[stage][off]);
+      }
+    }
 
     // Cast b_h1, b_h2 -> sH1, sH2 in one pass.
     {
@@ -338,9 +355,17 @@ __global__ void chunk_h_kernel(
           float vorig = (row < t_count)
               ? static_cast<float>(sV[stage][row * kBV + col]) : 0.f;
           float vraw = vorig - vacc;
+          __nv_bfloat16 vraw_bf16 = __float2bfloat16(vraw);
           if (row < t_count) {
-            v_new_out[((size_t)(t_start + row) * H + i_h) * kV + v_base + col]
-                = __float2bfloat16(vraw);
+            if (v_new_out != nullptr) {
+              v_new_out[((size_t)(t_start + row) * H + i_h) * kV
+                        + v_base + col] = vraw_bf16;
+            }
+            if (v_new_packed != nullptr) {
+              // (NT, H, BT, V): packed[i_t, i_h, row, v_base+col]
+              v_new_packed[(((size_t)i_t * H + i_h) * kBT + row) * kV
+                           + v_base + col] = vraw_bf16;
+            }
           }
           float gr = __bfloat162float(sG[stage][row]);
           float scale = __expf(g_last - gr);
@@ -460,6 +485,8 @@ void gdn_wy_chunk_h_b64_bf16_mma_fla(
     void*       state,
     void*       h_out,
     void*       v_new,
+    void*       v_new_packed,
+    void*       k_pack_hv,
     int S,
     int num_k_heads,
     int num_v_heads,
@@ -503,6 +530,8 @@ void gdn_wy_chunk_h_b64_bf16_mma_fla(
       reinterpret_cast<__nv_bfloat16*>(state),
       reinterpret_cast<__nv_bfloat16*>(h_out),
       reinterpret_cast<__nv_bfloat16*>(v_new),
+      reinterpret_cast<__nv_bfloat16*>(v_new_packed),
+      reinterpret_cast<__nv_bfloat16*>(k_pack_hv),
       S, num_v_heads, num_k_heads, qk_group, NT);
 }
 

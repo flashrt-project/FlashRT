@@ -2347,6 +2347,13 @@ class Qwen36TorchFrontendRtx:
                         fvk,
                         'linear_attn_gdn_wy_output_o_b64_bf16_cublaslt_packed_kv')
                 )
+                # mma_fla writes v_pack into rhs_u and k_pack_hv into rhs_w
+                # as side outputs, so output_o packed_kv path stays valid.
+                if (use_mma_fla_chunk_h
+                        and hasattr(
+                            fvk,
+                            'linear_attn_gdn_wy_output_o_b64_bf16_cublaslt_packed_kv')):
+                    use_wy_lt_output_packed_kv = True
                 use_wy_lt_output_packed_qkv = (
                     use_wy_lt_output_packed_kv
                     and use_wy_lt_norm_pack_q
@@ -2410,6 +2417,16 @@ class Qwen36TorchFrontendRtx:
                         K, s,
                     )
                 if use_mma_fla_chunk_h:
+                    # When output_o packed_kv is active, mma_fla also writes
+                    # v_new in packed layout to rhs_u and the GQA-expanded k
+                    # to rhs_w, so output_o sees the same packed inputs the
+                    # cublasLt recompute_wu_packed_rhs path would have produced.
+                    if use_wy_lt_output_packed_kv:
+                        v_packed_ptr = self._K_wy_rhs_u[:chunks].data_ptr()
+                        k_pack_hv_ptr = self._K_wy_rhs_w[:chunks].data_ptr()
+                    else:
+                        v_packed_ptr = 0
+                        k_pack_hv_ptr = 0
                     fvk.linear_attn_gdn_wy_chunk_h_b64_bf16_mma_fla(
                         self._K_fla_k16_l2[:, :K].data_ptr(),
                         self._K_wy_w48[:K].data_ptr(),
@@ -2418,6 +2435,7 @@ class Qwen36TorchFrontendRtx:
                         rec_state_view.data_ptr(),
                         self._K_wy_h0[:chunks].data_ptr(),
                         self._K_wy_v_new[:K].data_ptr(),
+                        v_packed_ptr, k_pack_hv_ptr,
                         K, 16, 48, 128, 3, s,
                     )
                 elif use_wy_lt_packed_wu_bf16:

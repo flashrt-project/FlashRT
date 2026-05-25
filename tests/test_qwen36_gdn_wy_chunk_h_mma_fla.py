@@ -63,7 +63,7 @@ def test_mma_fla_matches_packed_wu_and_reference(S):
     v_mma = torch.empty(S, H, V, device="cuda", dtype=torch.bfloat16)
     fvk.linear_attn_gdn_wy_chunk_h_b64_bf16_mma_fla(
         _ptr(k_l2), _ptr(w), _ptr(u), _ptr(g_cumsum_bf16),
-        _ptr(state_mma), _ptr(h_mma), _ptr(v_mma),
+        _ptr(state_mma), _ptr(h_mma), _ptr(v_mma), 0, 0,
         S, Hk, H, K, H // Hk, 0)
     torch.cuda.synchronize()
 
