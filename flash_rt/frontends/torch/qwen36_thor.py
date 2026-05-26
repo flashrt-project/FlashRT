@@ -33,9 +33,22 @@ kernel-level cost data the integration is targeting.
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 
 from flash_rt.frontends.torch.qwen36_rtx import Qwen36TorchFrontendRtx
+
+# Thor-only default for the long-context chunked prefill's GDN backend.
+# The RTX default ``wy_lt`` (cublasLt WY-decomposition chunk scan) is
+# numerically non-equivalent to the per-token recurrent path on SM110:
+# every linear-attention layer drifts by ~5e-4 vs. the per-token output,
+# the drift compounds, and downstream MTP spec acceptance collapses.
+# The ``native`` per-step recurrent backend is bit-exact to the
+# per-token path on Thor (see step5e_chunked_prefill_drift_root_cause.md
+# for the per-layer cosine measurement). Setting via ``setdefault`` lets
+# the user still pin a specific backend for bisection work.
+os.environ.setdefault(
+    "FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND", "native")
 
 
 @contextmanager
@@ -85,6 +98,18 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
     See ``dev_log_qwen36_thor/step5c_thor_complete_AB_findings.md``
     for the diff numbers and the per-position cosine trace that
     motivated this override.
+
+    Linear-attention chunked backend (Thor default)
+    -----------------------------------------------
+    The module-level ``setdefault`` for
+    ``FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND`` pins the per-step
+    recurrent GDN backend on Thor. The RTX default ``wy_lt`` chunk
+    backend produces a measurable per-position drift on SM110
+    (mean cos 0.999979 → 0.999721 at layer 2; compounds layer-by-layer
+    to a cos = 0.43 floor by layer 63) while ``native`` is bit-exact
+    to the per-token recurrent path. See
+    ``dev_log_qwen36_thor/step5e_chunked_prefill_drift_root_cause.md``
+    for the per-layer hidden-state cosine table.
     """
 
     # Default cap below which the Thor frontend forces the short-ctx
