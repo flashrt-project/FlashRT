@@ -909,6 +909,57 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
             return _ThorFirstChunkReplay(src, dst)
         return super()._ensure_graph_for_pos_nvfp4(p)
 
+    # ---------- Graphed MTP prefill ----------
+    #
+    # The parent's prefill MTP loop calls forward_mtp_head_nvfp4 once per
+    # prompt position with NO graph capture. At ctx=128 that's 127
+    # un-captured per-position MTP forwards = ~638 ms on Thor (~5 ms /
+    # call, mostly Python orchestration / per-call kernel-launch
+    # overhead on top of ~1.5 ms of actual compute). Parent already has
+    # _ensure_mtp_graph_nvfp4(cur_pos) that captures forward_mtp_head_nvfp4
+    # per-position via _mtp_static_prev_h / _mtp_static_prev_token
+    # static buffers — it just isn't wired into the prefill loop.
+    # Below we monkey-patch forward_mtp_head_nvfp4 (only during our
+    # generate window) to route through that captured graph.
+    #
+    # Guard against re-entry from inside _ensure_mtp_graph_nvfp4's own
+    # warmup + capture (which call forward_mtp_head_nvfp4) and from
+    # _ensure_mtp_chain_graph_nvfp4's capture (CUDA stream is in
+    # capture mode there).
+    def forward_mtp_head_nvfp4(self, prev_h, prev_token_id, cur_pos: int,
+                                mtp_cache_pos: int | None = None):
+        import torch
+        active = getattr(self, '_thor_mtp_prefill_active', False)
+        in_inner = getattr(self, '_thor_in_graphed_mtp', False)
+        # Fall through to the original implementation during capture or
+        # when re-entering from the graph helper.
+        if (not active or in_inner
+                or torch.cuda.is_current_stream_capturing()):
+            return super().forward_mtp_head_nvfp4(
+                prev_h, prev_token_id, cur_pos, mtp_cache_pos)
+        # The captured per-pos graph is keyed on cur_pos, not on
+        # mtp_cache_pos; only used when the two coincide (i.e. the
+        # prefill path).
+        if mtp_cache_pos is not None and int(mtp_cache_pos) != int(cur_pos):
+            return super().forward_mtp_head_nvfp4(
+                prev_h, prev_token_id, cur_pos, mtp_cache_pos)
+        hidden = self._cfg["hidden_size"]
+        # Re-entry guard: _ensure_mtp_graph_nvfp4 internally calls
+        # forward_mtp_head_nvfp4 to warm + capture; we must not loop
+        # back into the graphed path during that.
+        self._thor_in_graphed_mtp = True
+        try:
+            self._mtp_static_prev_h.copy_(prev_h.view(1, 1, hidden))
+            self._mtp_static_prev_token.copy_(prev_token_id.view(1, 1))
+            g = self._ensure_mtp_graph_nvfp4(int(cur_pos))
+            gs = self._graph_stream
+            gs.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(gs):
+                g.replay()
+            torch.cuda.current_stream().wait_stream(gs)
+        finally:
+            self._thor_in_graphed_mtp = False
+
     def generate_own_speculative_KN_nvfp4(
             self, input_ids, *, max_new_tokens: int, K: int = 6):
         prompt_len = int(input_ids.shape[1])
@@ -919,12 +970,14 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
             self._build_rope_table()
         self._thor_first_chunk_input_ids = input_ids
         self._thor_first_chunk_active = True
+        self._thor_mtp_prefill_active = True
         try:
             return super().generate_own_speculative_KN_nvfp4(
                 input_ids, max_new_tokens=max_new_tokens, K=K)
         finally:
             self._thor_first_chunk_active = False
             self._thor_first_chunk_input_ids = None
+            self._thor_mtp_prefill_active = False
 
     def _should_use_long_ctx_route(
             self, prompt_len: int, max_new_tokens: int) -> bool:
