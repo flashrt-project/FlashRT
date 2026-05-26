@@ -51,6 +51,24 @@ os.environ.setdefault(
     "FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND", "native")
 
 
+class _ThorFirstChunkReplay:
+    """Stand-in for a captured CUDA graph at positions inside the
+    Thor first-chunk pre-fill window. Implements ``.replay()`` so the
+    parent's prefill loop can call it the same way it calls a real
+    captured graph; the body just copies the corresponding per-position
+    hidden out of the pre-computed batched K-row output into the M=1
+    decode buffer the parent expects to read from.
+    """
+    __slots__ = ("_src", "_dst")
+
+    def __init__(self, src, dst):
+        self._src = src
+        self._dst = dst
+
+    def replay(self) -> None:
+        self._dst.copy_(self._src)
+
+
 @contextmanager
 def _use_thor_attn_backend():
     """Replace the RTX attn backend symbol with the Thor backend for
@@ -150,10 +168,23 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
     # single-token forwards.
     _THOR_K_ROW_FAST_PATH_MAX: int = 7
 
+    # First-chunk prefill K-row size for short-ctx TTFT optimization.
+    # The Thor K-row at K=22 cur_pos=0 is verified byte-for-byte
+    # equivalent to running K=22 single-token forwards (probe
+    # ``probe_thor_K_row_bit_exact`` reports zero diff across all
+    # layers and all four state caches). Running the first 22 prefill
+    # positions through one batched K-row call instead of 22 graph
+    # replays is a 12.7x speedup (≈ 113 ms vs 1430 ms) per chunk on
+    # the Thor BW-bound regime, so the prompt is short enough to fit
+    # the BF16 retention window we trade off 22 graph replays for one.
+    _THOR_FIRST_CHUNK_K: int = 22
+
     def __init__(self, *args, **kwargs):
         with _use_thor_attn_backend():
             super().__init__(*args, **kwargs)
         self._thor_alloc_K_row_scratch()
+        self._thor_first_chunk_active: bool = False
+        self._thor_first_chunk_input_ids = None
 
     # ---------- Thor-native K-row scratch ----------
     #
@@ -277,9 +308,10 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
             self._K_lin_ab_vec[:K].data_ptr(), K, 96, 5120, s,
         )
 
-        # (6) Per-position causal_conv1d_update — recurrent over
-        # ``_lin_conv_state[lin_rank]``. K consecutive in-place updates
-        # are byte-for-byte equivalent to K per-token calls.
+        # (6) Per-position causal_conv1d_update — recurrent in-place over
+        # ``_lin_conv_state[lin_rank]``. Verified bit-equivalent to the
+        # parent K=1 fast-path's ``_inout`` chain at the kernel level
+        # (``probe_state_kernel_inplace_vs_inout`` reports 0 bytes diff).
         lin_rank = self._linear_layer_rank(L)
         conv_state = self._lin_conv_state[lin_rank]
         conv_out_K = self._K_lin_conv_out[:K]
@@ -319,9 +351,9 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
             K, 48, a_stride, b_stride, s,
         )
 
-        # (9) Per-position GDN recurrent — recurrent over
-        # ``_lin_state[lin_rank]``. K consecutive in-place updates byte-
-        # for-byte equivalent to K per-token calls.
+        # (9) Per-position GDN recurrent — recurrent in-place over
+        # ``_lin_state[lin_rank]``. Verified bit-equivalent to the parent
+        # K=1 fast-path's ``_inout`` chain at the kernel level.
         rec_state = self._lin_state[lin_rank]
         attn_out_K = self._K_lin_attn_out[:K]
         for k in range(K):
@@ -762,6 +794,88 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
                     full_rank, pos:pos + 1].view(1, 4, 256)
                 self._fp8_write_kv(full_rank, pos, pos + 1, k_row, v_row)
         return h_out_K
+
+    # ---------- Short-ctx first-chunk K-row prefill optimization ----------
+    #
+    # The parent's ``generate_own_speculative_KN_nvfp4`` iterates one
+    # captured single-token graph per prompt position. On Thor that
+    # walks the 9.4 s BW-bound TTFT roofline at ctx=128. The Thor-
+    # native K-row layer at K=22 cur_pos=0 is byte-equivalent to that
+    # walk (probe verified) and runs in ~113 ms instead of ~1430 ms
+    # for the first 22 positions (12.7x speedup). We splice that
+    # speedup in by:
+    #
+    #   1. Overriding ``generate_own_speculative_KN_nvfp4`` to set a
+    #      pending flag and stash ``input_ids`` before delegating to
+    #      the parent.
+    #   2. Overriding ``_ensure_graph_for_pos_nvfp4`` so that the
+    #      parent's prefill-loop iteration at p == 0 (with the flag
+    #      set) runs the Thor K=22 K-row directly — state and the
+    #      K_chunk pre-final-norm hiddens land in
+    #      ``_K_last_hidden_buf``. Subsequent iterations at
+    #      0 <= p < K_chunk return a tiny replay-shaped object whose
+    #      ``.replay()`` copies the cached hidden into
+    #      ``_last_hidden_buf`` so the parent's
+    #      ``_prefill_h_cache[p:p+1].copy_(_last_hidden_buf...)``
+    #      keeps working unchanged. Iterations at p >= K_chunk fall
+    #      through to the captured single-token graphs.
+    #
+    # The optimization stays off when the long-ctx route would
+    # already chunk the prefill, or when the prompt is shorter than
+    # the chunk size, or when no MTP head is loaded (the parent path
+    # bails out before us in that case anyway).
+    def _thor_first_chunk_eligible(
+            self, prompt_len: int, max_new_tokens: int) -> bool:
+        if prompt_len <= self._THOR_FIRST_CHUNK_K:
+            return False
+        if self._weights.ptrs.get('mtp') is None:
+            return False
+        if getattr(self, '_long_ctx_mode', False):
+            if self._should_use_long_ctx_route(prompt_len, max_new_tokens):
+                return False
+        return True
+
+    def _ensure_graph_for_pos_nvfp4(self, p: int):
+        if (self._thor_first_chunk_active
+                and 0 <= p < self._THOR_FIRST_CHUNK_K):
+            import torch
+            K_chunk = self._THOR_FIRST_CHUNK_K
+            hidden = self._cfg["hidden_size"]
+            if p == 0:
+                # State has been zeroed by the parent's reset_state()
+                # right above the prefill loop. Run the K-row once now
+                # to populate state for positions [0, K_chunk) and stash
+                # the per-row pre-final-norm hidden in
+                # ``_K_last_hidden_buf`` for the no-op replays below.
+                d = self._rope_dim
+                ids = self._thor_first_chunk_input_ids
+                cos_S = self._rope_cos_table[:K_chunk].view(1, K_chunk, d)
+                sin_S = self._rope_sin_table[:K_chunk].view(1, K_chunk, d)
+                with torch.no_grad():
+                    self.forward_own_decode_K_nvfp4(
+                        ids[:, :K_chunk], cos_S, sin_S, 0, K_chunk,
+                        logits_mode="hidden")
+            src = self._K_last_hidden_buf[:, p:p + 1].view(1, hidden)
+            dst = self._last_hidden_buf.view(1, hidden)
+            return _ThorFirstChunkReplay(src, dst)
+        return super()._ensure_graph_for_pos_nvfp4(p)
+
+    def generate_own_speculative_KN_nvfp4(
+            self, input_ids, *, max_new_tokens: int, K: int = 6):
+        prompt_len = int(input_ids.shape[1])
+        if not self._thor_first_chunk_eligible(prompt_len, max_new_tokens):
+            return super().generate_own_speculative_KN_nvfp4(
+                input_ids, max_new_tokens=max_new_tokens, K=K)
+        if not hasattr(self, '_rope_cos_table'):
+            self._build_rope_table()
+        self._thor_first_chunk_input_ids = input_ids
+        self._thor_first_chunk_active = True
+        try:
+            return super().generate_own_speculative_KN_nvfp4(
+                input_ids, max_new_tokens=max_new_tokens, K=K)
+        finally:
+            self._thor_first_chunk_active = False
+            self._thor_first_chunk_input_ids = None
 
     def _should_use_long_ctx_route(
             self, prompt_len: int, max_new_tokens: int) -> bool:
