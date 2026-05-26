@@ -106,6 +106,60 @@ def _sse(obj: Any) -> str:
     return f'data: {_json_dumps(obj)}\n\n'
 
 
+def _parse_bool_field(req: Dict[str, Any], name: str,
+                      default: bool) -> bool:
+    value = req.get(name, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ('1', 'true', 'yes', 'on'):
+            return True
+        if v in ('0', 'false', 'no', 'off'):
+            return False
+    raise ValueError(f'{name} must be boolean')
+
+
+def _parse_int_field(req: Dict[str, Any], name: str, default: int,
+                     *, min_value: Optional[int] = None) -> int:
+    value = req.get(name, default)
+    try:
+        out = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'{name} must be an integer') from exc
+    if min_value is not None and out < min_value:
+        raise ValueError(f'{name} must be >= {min_value}')
+    return out
+
+
+def _validate_messages(messages: Any) -> List[Dict[str, Any]]:
+    if not isinstance(messages, list) or not messages:
+        raise ValueError('messages is required (non-empty list)')
+    for m in messages:
+        if not isinstance(m, dict):
+            raise ValueError('each message must be an object')
+        role = m.get('role')
+        if role not in ('system', 'user', 'assistant', 'tool'):
+            raise ValueError(f'unsupported role: {role!r}')
+        content = m.get('content')
+        if content is None and role == 'assistant':
+            continue
+        if not isinstance(content, str):
+            raise ValueError('message.content must be a string')
+    return messages
+
+
+def _validate_tools(tools: Any) -> Optional[List[Dict[str, Any]]]:
+    if tools is None:
+        return None
+    if not isinstance(tools, list):
+        raise ValueError('tools must be a list')
+    for tool in tools:
+        if not isinstance(tool, dict):
+            raise ValueError('each tool must be an object')
+    return tools
+
+
 class ToolCallParser:
     """Split Qwen tool-call blocks from a complete assistant response."""
 
@@ -321,6 +375,26 @@ class Qwen36Engine:
             enable_thinking=enable_thinking,
         )
 
+    def prepare_request(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        max_tokens: int,
+        *,
+        enable_thinking: bool = False,
+    ):
+        prompt = self._render_chat(
+            messages, tools, enable_thinking=enable_thinking)
+        input_ids_cpu = self.fe._tokenizer(
+            prompt, return_tensors='pt').input_ids
+        prompt_len = int(input_ids_cpu.shape[1])
+        max_seq = int(getattr(self.fe, '_user_max_seq', 0) or 0)
+        if max_seq and prompt_len + int(max_tokens) > max_seq:
+            raise ValueError(
+                f'prompt + max_tokens = {prompt_len + int(max_tokens)} '
+                f'exceeds --max-seq {max_seq}')
+        return input_ids_cpu
+
     async def generate(
         self,
         messages: List[Dict[str, Any]],
@@ -328,15 +402,18 @@ class Qwen36Engine:
         max_tokens: int,
         *,
         enable_thinking: bool = False,
+        input_ids_cpu=None,
     ) -> Dict[str, Any]:
         """Run one chat-completion. Returns a dict with the new
         text and basic timing/stat fields."""
         torch = self._torch
         async with self.lock:
-            prompt = self._render_chat(
-                messages, tools, enable_thinking=enable_thinking)
-            input_ids = self.fe._tokenizer(
-                prompt, return_tensors='pt').input_ids.cuda()
+            if input_ids_cpu is None:
+                input_ids_cpu = self.prepare_request(
+                    messages, tools, max_tokens,
+                    enable_thinking=enable_thinking,
+                )
+            input_ids = input_ids_cpu.cuda()
             prompt_len = int(input_ids.shape[1])
 
             torch.cuda.synchronize()
@@ -452,29 +529,25 @@ def build_app(engine: Qwen36Engine):
 
     @app.post('/v1/chat/completions')
     async def chat_completions(req: Dict[str, Any]):
-        messages = req.get('messages')
-        if not messages or not isinstance(messages, list):
-            raise HTTPException(400, 'messages is required')
-        tools = req.get('tools')
-        max_tokens = int(req.get('max_tokens') or 256)
-        stream = bool(req.get('stream', False))
-        enable_thinking = bool(req.get('enable_thinking', False))
-        # Validate roles — Qwen template accepts OpenAI chat roles.
-        for m in messages:
-            role = m.get('role')
-            if role not in ('system', 'user', 'assistant', 'tool'):
-                raise HTTPException(
-                    400, f'unsupported role: {role!r}')
-            content = m.get('content')
-            if content is None and role == 'assistant':
-                continue
-            if not isinstance(content, str):
-                raise HTTPException(
-                    400, 'message.content must be a string')
+        try:
+            messages = _validate_messages(req.get('messages'))
+            tools = _validate_tools(req.get('tools'))
+            max_tokens = _parse_int_field(
+                req, 'max_tokens', 256, min_value=1)
+            stream = _parse_bool_field(req, 'stream', False)
+            enable_thinking = _parse_bool_field(
+                req, 'enable_thinking', False)
+            input_ids_cpu = engine.prepare_request(
+                messages, tools, max_tokens,
+                enable_thinking=enable_thinking,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
         result = await engine.generate(
             messages, tools, max_tokens,
             enable_thinking=enable_thinking,
+            input_ids_cpu=input_ids_cpu,
         )
         completion_id = f'chatcmpl-{uuid.uuid4().hex[:24]}'
         created = int(time.time())

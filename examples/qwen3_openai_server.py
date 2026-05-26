@@ -80,6 +80,90 @@ def _sse(obj: Any) -> str:
     return f'data: {_json_dumps(obj)}\n\n'
 
 
+def _parse_bool_field(req: Dict[str, Any], name: str,
+                      default: bool) -> bool:
+    value = req.get(name, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ('1', 'true', 'yes', 'on'):
+            return True
+        if v in ('0', 'false', 'no', 'off'):
+            return False
+    raise ValueError(f'{name} must be boolean')
+
+
+def _parse_int_field(req: Dict[str, Any], name: str, default: int,
+                     *, min_value: Optional[int] = None) -> int:
+    value = req.get(name, default)
+    try:
+        out = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'{name} must be an integer') from exc
+    if min_value is not None and out < min_value:
+        raise ValueError(f'{name} must be >= {min_value}')
+    return out
+
+
+def _parse_float_field(req: Dict[str, Any], name: str, default: float,
+                       *, min_value: Optional[float] = None,
+                       max_value: Optional[float] = None) -> float:
+    value = req.get(name, default)
+    try:
+        out = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'{name} must be a number') from exc
+    if out != out:
+        raise ValueError(f'{name} must not be NaN')
+    if min_value is not None and out < min_value:
+        raise ValueError(f'{name} must be >= {min_value}')
+    if max_value is not None and out > max_value:
+        raise ValueError(f'{name} must be <= {max_value}')
+    return out
+
+
+def _validate_messages(messages: Any) -> List[Dict[str, Any]]:
+    if not isinstance(messages, list) or not messages:
+        raise ValueError('messages is required (non-empty list)')
+    for m in messages:
+        if not isinstance(m, dict):
+            raise ValueError('each message must be an object')
+        role = m.get('role')
+        if role not in ('system', 'user', 'assistant', 'tool'):
+            raise ValueError(f'unsupported role: {role!r}')
+        content = m.get('content')
+        if content is None and role == 'assistant':
+            continue
+        if not isinstance(content, str):
+            raise ValueError('message.content must be a string')
+    return messages
+
+
+def _validate_tools(tools: Any) -> Optional[List[Dict[str, Any]]]:
+    if tools is None:
+        return None
+    if not isinstance(tools, list):
+        raise ValueError('tools must be a list')
+    for tool in tools:
+        if not isinstance(tool, dict):
+            raise ValueError('each tool must be an object')
+    return tools
+
+
+def _normalize_stop(stop: Any) -> List[str]:
+    if stop is None:
+        return []
+    if isinstance(stop, str):
+        stop = [stop]
+    elif not isinstance(stop, list):
+        raise ValueError('stop must be string or list')
+    for s in stop:
+        if not isinstance(s, str) or not s:
+            raise ValueError('stop entries must be non-empty strings')
+    return stop
+
+
 # ────────────────────────────────────────────────────────────────────
 # Sampling
 # ────────────────────────────────────────────────────────────────────
@@ -555,27 +639,26 @@ def build_app(engine: 'Qwen3Engine'):
 
     @app.post('/v1/chat/completions')
     async def chat_completions(req: Dict[str, Any]):
-        messages = req.get('messages')
-        if not isinstance(messages, list) or not messages:
-            raise HTTPException(400, 'messages is required (non-empty list)')
-        for m in messages:
-            role = m.get('role')
-            if role not in ('system', 'user', 'assistant', 'tool'):
-                raise HTTPException(400, f'unsupported role: {role!r}')
-        tools = req.get('tools')          # OAI tools spec
-        max_tokens = int(req.get('max_tokens') or 256)
-        stream = bool(req.get('stream', False))
-        temperature = float(req.get('temperature', 0.0))
-        top_p = float(req.get('top_p', 1.0))
-        top_k = int(req.get('top_k', 0))
+        try:
+            messages = _validate_messages(req.get('messages'))
+            tools = _validate_tools(req.get('tools'))
+            max_tokens = _parse_int_field(
+                req, 'max_tokens', 256, min_value=1)
+            stream = _parse_bool_field(req, 'stream', False)
+            temperature = _parse_float_field(
+                req, 'temperature', 0.0, min_value=0.0)
+            top_p = _parse_float_field(
+                req, 'top_p', 1.0, min_value=0.0, max_value=1.0)
+            top_k = _parse_int_field(req, 'top_k', 0, min_value=0)
+            stop = _normalize_stop(req.get('stop'))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
         seed = req.get('seed')
-        stop = req.get('stop')
-        if isinstance(stop, str):
-            stop = [stop]
-        elif stop is None:
-            stop = []
-        elif not isinstance(stop, list):
-            raise HTTPException(400, 'stop must be string or list')
+        if seed is not None:
+            try:
+                seed = int(seed)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(400, 'seed must be an integer') from exc
 
         completion_id = f'chatcmpl-{uuid.uuid4().hex[:24]}'
         created = int(time.time())
