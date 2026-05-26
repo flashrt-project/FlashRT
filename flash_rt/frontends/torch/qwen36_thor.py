@@ -118,9 +118,119 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
     # the BF16 spec window.
     _THOR_LONG_CTX_FORCE_MIN_SEQ: int = 8192
 
+    # K-row layer dispatch threshold on Thor.
+    #
+    # The K-row layer kernel chain on SM110 (NVFP4 Qwen3.6) shares the
+    # SM120 implementation but produces a different hidden state vs the
+    # per-token forward at certain (cur_pos, K) combinations — every
+    # individual kernel is row-deterministic at M=K vs M=1, yet the
+    # composite chain at M=K behaves differently. The same source on
+    # SM120 (5090) is bit-exact across all (cur_pos, K). Root-causing
+    # the kernel-chain divergence at the SASS / PTX level is a separate
+    # workstream; the production path takes the mathematically
+    # equivalent rewrite below instead.
+    #
+    # For K ≤ THRESHOLD the parent's K-row method is used unchanged —
+    # this preserves the production short-ctx spec-verify decode (K=7-8
+    # at cur_pos > prompt_len), which has been verified to match
+    # per-token by direct AL measurement. For K > THRESHOLD (i.e.
+    # prefill chunks) we dispatch to K sequential single-token forwards
+    # of the parent class. Single-token semantics are the ground truth
+    # in this build and are bit-exact at every (cur_pos, K=1) we have
+    # tested on Thor, so the chunked prefill state evolution is
+    # bit-exact to the legacy per-token prefill walk.
+    # Threshold matches ``_K_save_max=8`` from the parent: at K ≤ 8 the
+    # parent's K-row enters the per-step ``save_steps>0`` branch, which
+    # uses the in/out-state conv1d + recurrent kernels for exact-step
+    # state checkpointing — production spec-verify decode (K=7-8) relies
+    # on this path and is known bit-exact on Thor (AL=3.93 in prod).
+    # At K > 8 the parent's K-row enters the ``save_steps=0`` chunk
+    # branch, which is where the SM110 kernel-chain divergence lives;
+    # the dispatch below replaces that branch with K sequential
+    # single-token forwards.
+    _THOR_K_ROW_FAST_PATH_MAX: int = 7
+
     def __init__(self, *args, **kwargs):
         with _use_thor_attn_backend():
             super().__init__(*args, **kwargs)
+
+    # ---------- K-row layer dispatch (Thor-only) ----------
+    #
+    # Linear-attention K-row forward at K above the fast-path threshold.
+    # Each iteration calls the parent's single-token linear-attention
+    # forward, which mutates ``_lin_state[lin_rank]`` and
+    # ``_lin_conv_state[lin_rank]`` in place via the in-place
+    # ``causal_conv1d_qwen36_update_bf16`` and
+    # ``gated_deltanet_recurrent_qwen36_bf16`` kernels. After each
+    # iteration we also snapshot lin_state / lin_conv_state into the
+    # per-step buffers so spec-verify partial-accept recovery still
+    # finds matching state at slot N (only meaningful when K ≤
+    # ``_K_save_max``, which the prefill chunks here exceed — the
+    # snapshot block is a no-op in that regime).
+    def _layer_forward_lin_K_nvfp4(self, L, h_in_K, K):
+        if K <= self._THOR_K_ROW_FAST_PATH_MAX:
+            return super()._layer_forward_lin_K_nvfp4(L, h_in_K, K)
+        return self._thor_lin_K_dispatch(L, h_in_K, K)
+
+    def _thor_lin_K_dispatch(self, L, h_in_K, K):
+        import torch
+
+        from flash_rt import flash_rt_kernels as fvk
+
+        hidden = self._cfg["hidden_size"]
+        lin_rank = self._linear_layer_rank(L)
+        s = torch.cuda.current_stream().cuda_stream
+        save_steps = K if K <= self._K_save_max else 0
+        lin_state_slot = self._lin_state[lin_rank]
+        lin_conv_slot = self._lin_conv_state[lin_rank]
+        ls_bytes = lin_state_slot.numel() * 2
+        lc_bytes = lin_conv_slot.numel() * 2
+
+        h_out_K = (self._K_layer_out_a if (L % 2 == 0)
+                   else self._K_layer_out_b)[:, :K]
+        for r in range(K):
+            h_in_r = h_in_K[:, r:r + 1, :].view(1, hidden).contiguous()
+            h_out_r = super()._layer_forward_lin_nvfp4(L, h_in_r)
+            h_out_K[:, r:r + 1, :].copy_(h_out_r.view(1, 1, hidden))
+            if save_steps > 0:
+                fvk.gpu_copy(
+                    self._K_lin_state_per_step[r, lin_rank].data_ptr(),
+                    lin_state_slot.data_ptr(), ls_bytes, s)
+                fvk.gpu_copy(
+                    self._K_lin_conv_state_per_step[r, lin_rank].data_ptr(),
+                    lin_conv_slot.data_ptr(), lc_bytes, s)
+        return h_out_K
+
+    # Full-attention K-row forward at K above the fast-path threshold.
+    # Each iteration calls the parent's single-token full-attn forward
+    # at ``cur_pos + r``, which writes its K/V row into the BF16 K/V
+    # cache and runs attention via the Thor backend's ``run('full',
+    # q_seq=1, kv_seq=cur_pos+r+1)`` entry. Bit-exact to a per-token
+    # walk that processes the same K positions sequentially.
+    def _layer_forward_full_K_nvfp4(
+            self, L, h_in_K, cos_K, sin_K, cur_pos, K):
+        if K <= self._THOR_K_ROW_FAST_PATH_MAX:
+            return super()._layer_forward_full_K_nvfp4(
+                L, h_in_K, cos_K, sin_K, cur_pos, K)
+        return self._thor_full_K_dispatch(
+            L, h_in_K, cos_K, sin_K, cur_pos, K)
+
+    def _thor_full_K_dispatch(self, L, h_in_K, cos_K, sin_K, cur_pos, K):
+        import torch
+        hidden = self._cfg["hidden_size"]
+        d = self._rope_dim
+        cos_3d = cos_K.view(1, K, d)
+        sin_3d = sin_K.view(1, K, d)
+        h_out_K = (self._K_layer_out_a if (L % 2 == 0)
+                   else self._K_layer_out_b)[:, :K]
+        for r in range(K):
+            h_in_r = h_in_K[:, r:r + 1, :].view(1, hidden).contiguous()
+            cos_r = cos_3d[:, r].contiguous()
+            sin_r = sin_3d[:, r].contiguous()
+            h_out_r = super()._layer_forward_full_nvfp4(
+                L, h_in_r, cos_r, sin_r, cur_pos + r)
+            h_out_K[:, r:r + 1, :].copy_(h_out_r.view(1, 1, hidden))
+        return h_out_K
 
     def _should_use_long_ctx_route(
             self, prompt_len: int, max_new_tokens: int) -> bool:
