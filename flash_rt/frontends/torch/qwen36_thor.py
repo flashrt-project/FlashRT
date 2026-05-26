@@ -581,49 +581,41 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         # ``_fp8_V_cache`` so we have to mirror after writing BF16.
         write_fp8 = bool(getattr(self, "_fp8_kv_verify_active", False))
 
-        # (7+8) Per-position partial RoPE, V copy, attention. Each
-        # iteration writes Q to ``Q_buf[:, :1]`` and runs q_seq=1 XQA,
-        # capturing the output row before the next iteration overwrites
-        # ``O_buf[:, :1]``.
+        # (7+8) Batched partial RoPE + V copy + q_seq=K causal XQA.
+        # The per-position loop was 128 separate XQA calls per
+        # full-attn layer × 16 layers = 2048 launches at K=128, each
+        # re-quantizing K_cache[:, :128] to FP8 inside Thor's run().
+        # The q_seq=K batched call runs ONE XQA with the causal mask
+        # (``_mask_for(q_seq)``) that gives identical attention
+        # outputs as the K serial q_seq=1 walk.
         d = self._rope_dim
-        cos_3d = cos_K.view(1, K, d)
-        sin_3d = sin_K.view(1, K, d)
         scaling = float(self._cfg['head_dim']) ** -0.5
-        # Stage per-iteration attention outputs into _K_full_q_rot —
-        # already consumed by partial_rope above (Q rows landed in
-        # _attn.Q_buf), so the (1, Kmax, 24, 256) slot is free for the
-        # rest of the layer. Keeping this distinct from _K_full_gated
-        # avoids aliasing with the sigmoid_mul output buffer.
-        attn_out_K = self._K_full_q_rot[:, :K].view(K, 24, 256)
-        for k in range(K):
-            pos_k = cur_pos + k
-            cos_k = cos_3d[:, k].contiguous()
-            sin_k = sin_3d[:, k].contiguous()
-            q_dst = self._attn.Q_buf[:, :1]
-            k_dst = self._attn.K_cache[full_rank, pos_k:pos_k + 1]
-            fvk.qwen36_partial_rope_qk_bf16(
-                q_norm_K[k].data_ptr(), k_norm_K[k].data_ptr(),
-                cos_k.data_ptr(), sin_k.data_ptr(),
-                q_dst.data_ptr(), k_dst.data_ptr(),
-                1, 24, 4, 256, 64, s,
+        # Batched partial RoPE: Q rows land in Q_buf[:, :K], K rows in
+        # K_cache[full_rank, cur_pos:cur_pos+K].
+        q_dst = self._attn.Q_buf[:, :K]
+        k_dst = self._attn.K_cache[full_rank, cur_pos:cur_pos + K]
+        fvk.qwen36_partial_rope_qk_bf16(
+            q_norm_out.data_ptr(), k_norm_out.data_ptr(),
+            cos_K.view(K, d).data_ptr(), sin_K.view(K, d).data_ptr(),
+            q_dst.data_ptr(), k_dst.data_ptr(),
+            K, 24, 4, 256, 64, s,
+        )
+        # Batched V copy: K rows.
+        fvk.gpu_copy(
+            self._attn.V_cache[
+                full_rank, cur_pos:cur_pos + K].data_ptr(),
+            v_new_K.data_ptr(), K * 4 * 256 * 2, s,
+        )
+        if write_fp8:
+            self._fp8_write_kv(
+                full_rank, cur_pos, cur_pos + K,
+                k_dst.view(K, 4, 256), v_new_K.view(K, 4, 256),
             )
-            fvk.gpu_copy(
-                self._attn.V_cache[
-                    full_rank, pos_k:pos_k + 1].data_ptr(),
-                v_new_K[k:k + 1].data_ptr(), 4 * 256 * 2, s,
-            )
-            if write_fp8:
-                self._fp8_write_kv(
-                    full_rank, pos_k, pos_k + 1,
-                    k_dst.view(1, 4, 256),
-                    v_new_K[k:k + 1].view(1, 4, 256),
-                )
-            self._attn.run(
-                'full', layer_idx=full_rank, q_seq=1,
-                kv_seq=pos_k + 1, stream=s, softmax_scale=scaling,
-            )
-            attn_out_K[k].copy_(
-                self._attn.O_buf[:, 0].view(24, 256))
+        self._attn.run(
+            'full', layer_idx=full_rank, q_seq=K,
+            kv_seq=cur_pos + K, stream=s, softmax_scale=scaling,
+        )
+        attn_out_K = self._attn.O_buf[:, :K].view(K, 24, 256)
 
         # (9) Output gate: attn * sigmoid(gate). K rows in one launch.
         attn_flat = attn_out_K.view(1, K, 24 * 256)
