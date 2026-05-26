@@ -354,6 +354,20 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         # (9) Per-position GDN recurrent — recurrent in-place over
         # ``_lin_state[lin_rank]``. Verified bit-equivalent to the parent
         # K=1 fast-path's ``_inout`` chain at the kernel level.
+        #
+        # NB: an FP32-state variant of this kernel is bound as
+        # ``gated_deltanet_recurrent_qwen36_f32state_bf16io`` and
+        # eliminates the per-iter BF16 round-trip; it would unlock
+        # bit-exact K-row chains at arbitrary K (the ULP-jitter at K>22
+        # vs per-token is exactly that round-trip). Empirically
+        # however the FP32 path produces prefill hiddens that diverge
+        # from per-token by ~1 ULP from layer 0 row 1 onward, and the
+        # MTP head — trained on the BF16-rounded distribution —
+        # accepts fewer drafts: AL collapses from 3.93 to 3.19 at
+        # K=6 ctx=128 and tok/s drops to 36. We keep the BF16 in-place
+        # path here for AL preservation; if MTP head is ever
+        # re-calibrated against FP32-precision hiddens, the FP32
+        # kernel can be swapped in with no other changes.
         rec_state = self._lin_state[lin_rank]
         attn_out_K = self._K_lin_attn_out[:K]
         for k in range(K):

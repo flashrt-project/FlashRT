@@ -4216,6 +4216,27 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("head_k_dim"), py::arg("head_v_dim"),
         py::arg("use_qk_l2norm") = true, py::arg("stream") = 0);
 
+    // FP32-state variant (Thor K-row no-LSB-jitter path).
+    m.def("gated_deltanet_recurrent_qwen36_f32state_bf16io",
+        [](uintptr_t q, uintptr_t k, uintptr_t v,
+           uintptr_t g, uintptr_t beta,
+           uintptr_t state_f32, uintptr_t out,
+           int B, int num_v_heads, int head_k_dim, int head_v_dim,
+           bool use_qk_l2norm, uintptr_t stream) {
+            flash_rt::kernels::gated_deltanet_recurrent_qwen36_f32state_bf16io(
+                to_ptr(q), to_ptr(k), to_ptr(v),
+                to_ptr(g), to_ptr(beta),
+                to_ptr(state_f32), to_ptr(out),
+                B, num_v_heads, head_k_dim, head_v_dim,
+                use_qk_l2norm, to_stream(stream));
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"),
+        py::arg("g"), py::arg("beta"),
+        py::arg("state_f32"), py::arg("out"),
+        py::arg("B"), py::arg("num_v_heads"),
+        py::arg("head_k_dim"), py::arg("head_v_dim"),
+        py::arg("use_qk_l2norm") = true, py::arg("stream") = 0);
+
     m.def("gated_deltanet_chunk_qwen36_bf16",
         [](uintptr_t q, uintptr_t k, uintptr_t v,
            uintptr_t g, uintptr_t beta,

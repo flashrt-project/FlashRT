@@ -73,6 +73,23 @@ void gated_deltanet_recurrent_inout_qwen36_bf16(
     bool use_qk_l2norm,
     cudaStream_t stream);
 
+// FP32-state variant: identical math to the BF16-state path, but the
+// persistent recurrent state is stored as fp32. q/k/v/g/beta and the
+// per-step ``out`` stay bf16. Used by the Thor K-row to avoid the
+// per-iteration bf16 round-trip on state, which is what makes BF16-
+// state K-row diverge from per-token at K beyond ~22 on Thor.
+void gated_deltanet_recurrent_qwen36_f32state_bf16io(
+    const void* q,
+    const void* k,
+    const void* v,
+    const void* g,
+    const void* beta,
+    void*       state_f32,
+    void*       out,
+    int B, int num_v_heads, int head_k_dim, int head_v_dim,
+    bool use_qk_l2norm,
+    cudaStream_t stream);
+
 // Multi-token recurrent scan for prefill chunks. Reads initial state,
 // loops S tokens inside one launch, writes all S outputs and final state.
 // It intentionally does not materialize per-token state snapshots, so
