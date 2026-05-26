@@ -94,10 +94,45 @@ __global__ void bias_gelu_kernel(T* __restrict__ x,
     (void)row;  // silence unused warning if compiler optimizes it out
 }
 
+template<typename T>
+__global__ void bias_gelu_strict_kernel(T* __restrict__ x,
+                                        const T* __restrict__ bias,
+                                        int M, int N) {
+    using T2 = typename packed2<T>::type;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total2 = (M * N) >> 1;
+    if (idx >= total2) return;
+    int n2 = N >> 1;
+    int row = idx / n2;
+    int col_pair = idx - row * n2;
+    T2* x2 = reinterpret_cast<T2*>(x);
+    const T2* b2 = reinterpret_cast<const T2*>(bias);
+    T2 v = x2[idx];
+    T2 b = b2[col_pair];
+    T v0_bf16 = from_f32<T>(to_f32(v.x) + to_f32(b.x));
+    T v1_bf16 = from_f32<T>(to_f32(v.y) + to_f32(b.y));
+    float v0 = to_f32(v0_bf16);
+    float v1 = to_f32(v1_bf16);
+    float t0 = tanhf(0.7978845608f * (v0 + 0.044715f * v0 * v0 * v0));
+    float t1 = tanhf(0.7978845608f * (v1 + 0.044715f * v1 * v1 * v1));
+    x2[idx] = make_packed2<T>(
+        from_f32<T>(v0 * 0.5f * (1.0f + t0)),
+        from_f32<T>(v1 * 0.5f * (1.0f + t1)));
+    (void)row;
+}
+
 void bias_gelu_inplace_bf16(__nv_bfloat16* x, const __nv_bfloat16* bias,
                               int M, int N, cudaStream_t stream) {
     int total2 = (M * N) >> 1;
     bias_gelu_kernel<__nv_bfloat16><<<(total2 + 255) / 256, 256, 0, stream>>>(
+        x, bias, M, N);
+}
+
+void bias_gelu_inplace_bf16_strict(__nv_bfloat16* x,
+                                   const __nv_bfloat16* bias,
+                                   int M, int N, cudaStream_t stream) {
+    int total2 = (M * N) >> 1;
+    bias_gelu_strict_kernel<__nv_bfloat16><<<(total2 + 255) / 256, 256, 0, stream>>>(
         x, bias, M, N);
 }
 

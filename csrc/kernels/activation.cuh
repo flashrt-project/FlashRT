@@ -23,6 +23,12 @@ void gelu_inplace(__nv_bfloat16* x, int n, cudaStream_t stream = 0);
 void bias_gelu_inplace_bf16(__nv_bfloat16* x, const __nv_bfloat16* bias,
                               int M, int N, cudaStream_t stream = 0);
 
+// Strict variant matching add_bias_bf16 + gelu_inplace numerics: the
+// bias-add result is rounded back to BF16 before applying GELU.
+void bias_gelu_inplace_bf16_strict(__nv_bfloat16* x,
+                                   const __nv_bfloat16* bias,
+                                   int M, int N, cudaStream_t stream = 0);
+
 void gate_silu_mul_merged(const __nv_bfloat16* merged, __nv_bfloat16* out,
                            int seq, int half_dim, cudaStream_t stream = 0);
 
