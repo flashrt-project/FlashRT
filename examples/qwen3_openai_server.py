@@ -400,7 +400,8 @@ class Qwen3Engine:
                 rng = torch.Generator(device='cuda')
                 rng.manual_seed(int(seed))
 
-            parser = StreamParser(
+            fast_text_stream = not tools and not stop
+            parser = None if fast_text_stream else StreamParser(
                 self.fe._tokenizer,
                 stop_strings=stop,
                 enable_tools=bool(tools),
@@ -438,33 +439,39 @@ class Qwen3Engine:
 
                 # EOS check (engine-side, before emitting).
                 if eos is not None and tok == eos:
-                    delta, tcs, _ = parser.feed([], final=True)
-                    if delta:
-                        yield ('content', delta)
-                    if tcs:
-                        yield ('tool_calls', tcs)
+                    if parser is not None:
+                        delta, tcs, _ = parser.feed([], final=True)
+                        if delta:
+                            yield ('content', delta)
+                        if tcs:
+                            yield ('tool_calls', tcs)
                     finish_reason = (
-                        'tool_calls' if parser._tool_calls_emitted
+                        'tool_calls' if parser is not None
+                        and parser._tool_calls_emitted
                         and not parser._buffer.strip() else 'stop'
                     )
                     break
 
                 # Stream parse the new token.
-                delta, tcs, stop_hit = parser.feed([tok])
-                if delta:
-                    yield ('content', delta)
-                if tcs:
-                    yield ('tool_calls', tcs)
-                if stop_hit:
-                    finish_reason = 'stop'
-                    break
+                if fast_text_stream:
+                    delta = self.fe._tokenizer.decode(
+                        [tok], skip_special_tokens=False)
+                    if delta:
+                        yield ('content', delta)
+                else:
+                    assert parser is not None
+                    delta, tcs, stop_hit = parser.feed([tok])
+                    if delta:
+                        yield ('content', delta)
+                    if tcs:
+                        yield ('tool_calls', tcs)
+                    if stop_hit:
+                        finish_reason = 'stop'
+                        break
 
                 # Advance KV cache via the warm decode graph.
                 with torch.inference_mode():
-                    self.fe.decode_step_with_graph(
-                        torch.tensor([[tok]], device='cuda', dtype=torch.long),
-                        cur_pos,
-                    )
+                    self.fe.decode_step_with_graph(tok, cur_pos)
                 cur_pos += 1
 
                 # Yield to event loop so the SSE chunks can flush.
@@ -474,11 +481,12 @@ class Qwen3Engine:
             else:
                 # Loop exhausted max_tokens.
                 # Final flush of any buffered text.
-                delta, tcs, _ = parser.feed([], final=True)
-                if delta:
-                    yield ('content', delta)
-                if tcs:
-                    yield ('tool_calls', tcs)
+                if parser is not None:
+                    delta, tcs, _ = parser.feed([], final=True)
+                    if delta:
+                        yield ('content', delta)
+                    if tcs:
+                        yield ('tool_calls', tcs)
 
             wall = time.perf_counter() - t0
             decode_s = max(0.0, wall - prefill_s)

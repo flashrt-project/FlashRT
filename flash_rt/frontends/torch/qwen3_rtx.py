@@ -1260,15 +1260,14 @@ class Qwen3TorchFrontendRtx:
         Returns ``self._logits_buf[:1]`` (1, vocab) bf16.
         """
         import torch
-        if not isinstance(token_id, torch.Tensor):
-            token_id = torch.tensor(
-                [[int(token_id)]], device=self.device, dtype=torch.long,
-            )
-        if token_id.ndim == 1:
-            token_id = token_id.view(1, 1)
         # Stage the new token id into the static input buffer the
         # captured graph reads from.
-        self._static_token_id.copy_(token_id)
+        if isinstance(token_id, torch.Tensor):
+            if token_id.ndim == 1:
+                token_id = token_id.view(1, 1)
+            self._static_token_id.copy_(token_id)
+        else:
+            self._static_token_id.fill_(int(token_id))
         g = self._ensure_decode_graph(cur_pos)
         g.replay()
         return self._logits_buf[:1]

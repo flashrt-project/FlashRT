@@ -370,7 +370,10 @@ class Qwen36Engine:
                 )
                 raw_text = raw_text.replace('<think>', '').replace(
                     '</think>', '')
-            text, tool_calls = ToolCallParser().parse(raw_text)
+            if tools:
+                text, tool_calls = ToolCallParser().parse(raw_text)
+            else:
+                text, tool_calls = raw_text, []
             text = text.strip()
             completion_tokens = len(new_tokens)
             prefill_ms = float(getattr(self.fe, '_long_ctx_prefill_ms', 0.0)
