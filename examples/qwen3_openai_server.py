@@ -372,6 +372,26 @@ class Qwen3Engine:
             tokenize=False,
         )
 
+    def prepare_request(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        max_tokens: int,
+    ):
+        prompt = self._render(messages, tools)
+        input_ids_cpu = self.fe._tokenizer(
+            prompt, return_tensors='pt').input_ids
+        P = int(input_ids_cpu.shape[1])
+        if P > self.fe.max_q_seq:
+            raise ValueError(
+                f'prompt has {P} tokens, exceeds --max-q-seq '
+                f'{self.fe.max_q_seq}')
+        if P + int(max_tokens) > self.fe.max_seq:
+            raise ValueError(
+                f'prompt + max_tokens = {P + int(max_tokens)} exceeds '
+                f'--max-seq {self.fe.max_seq}')
+        return input_ids_cpu
+
     async def stream_generate(
         self,
         messages: List[Dict[str, Any]],
@@ -382,6 +402,7 @@ class Qwen3Engine:
         top_k: int,
         seed: Optional[int],
         stop: Optional[List[str]],
+        input_ids_cpu=None,
     ):
         """Async generator yielding (kind, payload) events:
           ('content', str)               — content delta
@@ -390,9 +411,10 @@ class Qwen3Engine:
         """
         torch = self._torch
         async with self.lock:
-            prompt = self._render(messages, tools)
-            input_ids = self.fe._tokenizer(
-                prompt, return_tensors='pt').input_ids.to('cuda')
+            if input_ids_cpu is None:
+                input_ids_cpu = self.prepare_request(
+                    messages, tools, max_tokens)
+            input_ids = input_ids_cpu.to('cuda')
             P = int(input_ids.shape[1])
 
             rng = None
@@ -557,6 +579,11 @@ def build_app(engine: 'Qwen3Engine'):
 
         completion_id = f'chatcmpl-{uuid.uuid4().hex[:24]}'
         created = int(time.time())
+        try:
+            input_ids_cpu = engine.prepare_request(
+                messages, tools, max_tokens)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
         if not stream:
             content = ''
@@ -565,7 +592,7 @@ def build_app(engine: 'Qwen3Engine'):
             usage: dict = {}
             async for ev in engine.stream_generate(
                 messages, tools, max_tokens, temperature, top_p, top_k,
-                seed, stop,
+                seed, stop, input_ids_cpu,
             ):
                 if ev[0] == 'content':
                     content += ev[1]
@@ -604,7 +631,7 @@ def build_app(engine: 'Qwen3Engine'):
             tc_seen = False
             async for ev in engine.stream_generate(
                 messages, tools, max_tokens, temperature, top_p, top_k,
-                seed, stop,
+                seed, stop, input_ids_cpu,
             ):
                 if ev[0] == 'content':
                     delta = {}
