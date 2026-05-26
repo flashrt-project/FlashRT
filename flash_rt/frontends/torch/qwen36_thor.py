@@ -826,6 +826,61 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
                 return False
         return True
 
+    def _thor_ensure_first_chunk_graph(self):
+        """Lazily capture the K=K_chunk K-row + final norm + lm_head
+        as one CUDA graph. Replay amortizes ~1200 per-launch Python
+        orchestration overheads (~30-50 ms at K=128) into a single
+        graph replay.
+
+        State buffers (lin_state / lin_conv_state / K_cache / V_cache)
+        are zeroed before the graph capture (so the captured kernels
+        see fresh-state inputs the same way they will at replay time
+        after a ``reset_state()``). The captured graph writes those
+        state buffers in place at fixed addresses, so subsequent
+        replays — preceded by a ``reset_state()`` per the parent
+        prefill flow — produce the same outputs.
+        """
+        if hasattr(self, '_thor_first_chunk_graph'):
+            return
+        import torch
+        K = self._THOR_FIRST_CHUNK_K
+        d = self._rope_dim
+        device = self._h_b.device
+        # Static input buffer the captured graph reads from.
+        self._thor_static_ids_K = torch.zeros(
+            1, K, dtype=torch.long, device=device)
+        cos_S = self._rope_cos_table[:K].view(1, K, d)
+        sin_S = self._rope_sin_table[:K].view(1, K, d)
+        gs = torch.cuda.Stream(device=device)
+        # Warmup the K-row a couple of times into the graph mempool so
+        # the allocator wires up reusable scratch.
+        gs.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(gs):
+            with torch.no_grad():
+                for _ in range(3):
+                    self.reset_state()
+                    self.reset_mtp_state()
+                    self.forward_own_decode_K_nvfp4(
+                        self._thor_static_ids_K, cos_S, sin_S, 0, K,
+                        logits_mode="hidden_last")
+        torch.cuda.current_stream().wait_stream(gs)
+        # Capture against the parent's shared mempool so the recorded
+        # tensor addresses survive across replays.
+        g = torch.cuda.CUDAGraph()
+        self.reset_state()
+        self.reset_mtp_state()
+        gs.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(gs):
+            with torch.cuda.graph(
+                    g, stream=gs, pool=self._graph_mempool):
+                with torch.no_grad():
+                    self.forward_own_decode_K_nvfp4(
+                        self._thor_static_ids_K, cos_S, sin_S, 0, K,
+                        logits_mode="hidden_last")
+        torch.cuda.current_stream().wait_stream(gs)
+        self._thor_first_chunk_graph = g
+        self._thor_first_chunk_graph_stream = gs
+
     def _ensure_graph_for_pos_nvfp4(self, p: int):
         if (self._thor_first_chunk_active
                 and 0 <= p < self._THOR_FIRST_CHUNK_K):
@@ -833,30 +888,22 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
             K_chunk = self._THOR_FIRST_CHUNK_K
             hidden = self._cfg["hidden_size"]
             if p == 0:
-                # State has been zeroed by the parent's reset_state()
-                # right above the prefill loop. Run the K-row once now
-                # to populate state for positions [0, K_chunk) and stash
-                # the per-row pre-final-norm hidden in
-                # ``_K_last_hidden_buf`` for the no-op replays below.
-                d = self._rope_dim
-                ids = self._thor_first_chunk_input_ids
-                cos_S = self._rope_cos_table[:K_chunk].view(1, K_chunk, d)
-                sin_S = self._rope_sin_table[:K_chunk].view(1, K_chunk, d)
-                # ``hidden_last`` populates _K_last_hidden_buf[:, :K]
-                # AND computes lm_head logits at the last row into
-                # _logits_buf. The lm_head is required because when
-                # K_chunk == prompt_len the parent's prefill loop
-                # never replays a real graph and would otherwise read
-                # a stale _logits_buf for the first-decoded-token
-                # argmax (this collapses MTP AL when K_chunk equals
-                # the full prompt length). When K_chunk < prompt_len
-                # the per-token loop will overwrite _logits_buf at
-                # the last position anyway, so the extra lm_head
-                # here is a no-cost no-op.
-                with torch.no_grad():
-                    self.forward_own_decode_K_nvfp4(
-                        ids[:, :K_chunk], cos_S, sin_S, 0, K_chunk,
-                        logits_mode="hidden_last")
+                # Capture the K-row graph on first use; subsequent
+                # generations replay it (one CUDA-Graph launch instead
+                # of ~1200 Python-orchestrated kernel launches).
+                self._thor_ensure_first_chunk_graph()
+                # Copy this generation's prompt prefix into the static
+                # input buffer the captured graph reads from.
+                self._thor_static_ids_K.copy_(
+                    self._thor_first_chunk_input_ids[:, :K_chunk])
+                # Parent already reset_state() right above the prefill
+                # loop, so the captured graph sees a fresh
+                # lin_state / K_cache at replay time.
+                gs = self._thor_first_chunk_graph_stream
+                gs.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(gs):
+                    self._thor_first_chunk_graph.replay()
+                torch.cuda.current_stream().wait_stream(gs)
             src = self._K_last_hidden_buf[:, p:p + 1].view(1, hidden)
             dst = self._last_hidden_buf.view(1, hidden)
             return _ThorFirstChunkReplay(src, dst)
