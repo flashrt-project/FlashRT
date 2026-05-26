@@ -316,8 +316,20 @@ class Qwen3TorchFrontendRtx:
             self._gate_up_fused_out = torch.empty(
                 1, gu_N, device=device, dtype=bf16,
             )
+            self._gate_up_prefill_out = torch.empty(
+                Sq_max, gu_N, device=device, dtype=bf16,
+            )
         else:
             self._gate_up_fused_out = None
+            self._gate_up_prefill_out = None
+        # On this dense 8B prefill ladder (S<=1024), the regular
+        # CUTLASS W4A16 kernel beats the pingpong variant for the
+        # short buckets and is tied at the largest bucket.
+        self._prefill_gemm = self._fvk.fp4_w4a16_gemm_sm120_bf16out
+        self._prefill_silu_merged = getattr(
+            self._fvk, 'silu_mul_merged_to_nvfp4_swizzled_grouped32_bf16',
+            self._fvk.silu_mul_merged_to_nvfp4_swizzled_bf16,
+        )
 
         # CUDA Graph capture state.
         #   _captured_decode_graphs  : dict[cur_pos    -> torch.cuda.CUDAGraph]
@@ -925,23 +937,17 @@ class Qwen3TorchFrontendRtx:
 
         h2 = h_in_S.view(S, hidden).contiguous()
 
-        # 1) input layernorm (M=S).
-        x_norm = self._h_b[:S].view(S, hidden)
-        fvk.rms_norm(
-            h2.data_ptr(), int(lw['input_norm_w']),
-            x_norm.data_ptr(), S, hidden, eps, s,
-        )
-
-        # 2) NVFP4 quantize x_norm at M=S (K=hidden).
+        # 1+2) input layernorm + NVFP4 quantize at M=S.
         ap_h, sf_h, _ = self._nvfp4_scratch[(n_q * hd, hidden)]
-        fvk.quantize_bf16_to_nvfp4_swizzled(
-            x_norm.data_ptr(), ap_h.data_ptr(), sf_h.data_ptr(),
-            S, hidden, s,
+        fvk.rms_norm_to_nvfp4_swizzled_bf16(
+            h2.data_ptr(), int(lw['input_norm_w']),
+            ap_h.data_ptr(), sf_h.data_ptr(), S, hidden, eps, s,
         )
 
         # 3) q/k/v_proj NVFP4 GEMMs at M=S.
+        prefill_gemm = self._prefill_gemm
         q_proj_out_buf = self._nvfp4_scratch[(n_q * hd, hidden)][2]
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
+        prefill_gemm(
             ap_h.data_ptr(), int(lw['q_proj_packed']),
             q_proj_out_buf.data_ptr(),
             S, n_q * hd, hidden,
@@ -950,7 +956,7 @@ class Qwen3TorchFrontendRtx:
             s,
         )
         kv_proj_out_buf = self._nvfp4_scratch[(n_kv * hd, hidden)][2]
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
+        prefill_gemm(
             ap_h.data_ptr(), int(lw['k_proj_packed']),
             kv_proj_out_buf.data_ptr(),
             S, n_kv * hd, hidden,
@@ -995,7 +1001,7 @@ class Qwen3TorchFrontendRtx:
         )
 
         # 7) v_proj — reuse kv_proj_out_buf, write into V_cache.
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
+        prefill_gemm(
             ap_h.data_ptr(), int(lw['v_proj_packed']),
             kv_proj_out_buf.data_ptr(),
             S, n_kv * hd, hidden,
@@ -1022,7 +1028,7 @@ class Qwen3TorchFrontendRtx:
             S, n_q * hd, s,
         )
         out_op_buf = self._nvfp4_scratch[(hidden, hidden)][2]
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
+        prefill_gemm(
             ap_h2.data_ptr(), int(lw['o_proj_packed']),
             out_op_buf.data_ptr(),
             S, hidden, n_q * hd,
@@ -1033,60 +1039,61 @@ class Qwen3TorchFrontendRtx:
 
         # 10) Residual 1.
         attn_proj = out_op_buf[:S].view(1, S, hidden)
-        torch.add(h_in_S, attn_proj, out=self._res_mid[:, :S])
         h_post = self._res_mid[:, :S]
-
-        # 11) post-attn layernorm at M=S.
-        h_post_view = h_post.view(S, hidden)
-        x_mlp = self._h_b[:S].view(S, hidden)
-        fvk.rms_norm(
-            h_post_view.data_ptr(), int(lw['post_attn_norm_w']),
-            x_mlp.data_ptr(), S, hidden, eps, s,
-        )
-
-        # 12) MLP gate / up at M=S, K=hidden, N=intermediate.
         ap_mlp, sf_mlp, _ = self._nvfp4_scratch[(inter, hidden)]
-        fvk.quantize_bf16_to_nvfp4_swizzled(
-            x_mlp.data_ptr(), ap_mlp.data_ptr(), sf_mlp.data_ptr(),
-            S, hidden, s,
-        )
-        gate_out_buf = self._nvfp4_scratch[(inter, hidden)][2]
-        up_out_buf = self._mlp_up_out
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
-            ap_mlp.data_ptr(), int(lw['mlp_gate_packed']),
-            gate_out_buf.data_ptr(),
-            S, inter, hidden,
-            sf_mlp.data_ptr(), int(lw['mlp_gate_sf']),
-            float(lw['mlp_gate_alpha']),
-            s,
-        )
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
-            ap_mlp.data_ptr(), int(lw['mlp_up_packed']),
-            up_out_buf.data_ptr(),
-            S, inter, hidden,
-            sf_mlp.data_ptr(), int(lw['mlp_up_sf']),
-            float(lw['mlp_up_alpha']),
-            s,
+        fvk.residual_add_rms_norm_to_nvfp4_swizzled_bf16(
+            h_in_S.data_ptr(), attn_proj.data_ptr(), h_post.data_ptr(),
+            int(lw['post_attn_norm_w']),
+            ap_mlp.data_ptr(), sf_mlp.data_ptr(), S, hidden, eps, s,
         )
 
-        # 13) silu(gate)*up at flat n_elements = S*inter (kernel is dim-agnostic).
-        gate_v = gate_out_buf[:S].view(S * inter)
-        up_v = up_out_buf[:S].view(S * inter)
-        out_v = self._mlp_silu_mul_out[:S].view(S * inter)
-        fvk.silu_mul_qwen36_bf16(
-            gate_v.data_ptr(), up_v.data_ptr(),
-            out_v.data_ptr(), S * inter, s,
-        )
-        gate_silu_up = self._mlp_silu_mul_out[:S]
-
-        # 14) MLP down at M=S, K=intermediate, N=hidden.
+        # 11) MLP gate/up at M=S. Use the packed fused weight when the
+        # checkpoint has homogeneous gate/up alpha, then consume the
+        # merged [gate|up] output directly in the silu+quant kernel.
         ap_dn, sf_dn, _ = self._nvfp4_scratch[(hidden, inter)]
-        fvk.quantize_bf16_to_nvfp4_swizzled(
-            gate_silu_up.data_ptr(), ap_dn.data_ptr(), sf_dn.data_ptr(),
-            S, inter, s,
-        )
+        if self._gate_up_prefill_out is not None:
+            gate_up_buf = self._gate_up_prefill_out[:S]
+            prefill_gemm(
+                ap_mlp.data_ptr(), int(lw['gate_up_packed']),
+                gate_up_buf.data_ptr(),
+                S, int(lw['gate_up_N']), hidden,
+                sf_mlp.data_ptr(), int(lw['gate_up_sf']),
+                float(lw['gate_up_alpha']),
+                s,
+            )
+            self._prefill_silu_merged(
+                gate_up_buf.data_ptr(),
+                ap_dn.data_ptr(), sf_dn.data_ptr(),
+                S, inter, s,
+            )
+        else:
+            gate_out_buf = self._nvfp4_scratch[(inter, hidden)][2]
+            up_out_buf = self._mlp_up_out
+            prefill_gemm(
+                ap_mlp.data_ptr(), int(lw['mlp_gate_packed']),
+                gate_out_buf.data_ptr(),
+                S, inter, hidden,
+                sf_mlp.data_ptr(), int(lw['mlp_gate_sf']),
+                float(lw['mlp_gate_alpha']),
+                s,
+            )
+            prefill_gemm(
+                ap_mlp.data_ptr(), int(lw['mlp_up_packed']),
+                up_out_buf.data_ptr(),
+                S, inter, hidden,
+                sf_mlp.data_ptr(), int(lw['mlp_up_sf']),
+                float(lw['mlp_up_alpha']),
+                s,
+            )
+            fvk.silu_mul_to_nvfp4_swizzled_bf16(
+                gate_out_buf[:S].data_ptr(), up_out_buf[:S].data_ptr(),
+                ap_dn.data_ptr(), sf_dn.data_ptr(),
+                S, inter, s,
+            )
+
+        # 12) MLP down at M=S, K=intermediate, N=hidden.
         down_out_buf = self._nvfp4_scratch[(hidden, inter)][2]
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
+        prefill_gemm(
             ap_dn.data_ptr(), int(lw['mlp_down_packed']),
             down_out_buf.data_ptr(),
             S, hidden, inter,
