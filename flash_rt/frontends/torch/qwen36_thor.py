@@ -223,6 +223,16 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         sin_3d = sin_K.view(1, K, d)
         h_out_K = (self._K_layer_out_a if (L % 2 == 0)
                    else self._K_layer_out_b)[:, :K]
+        # When the parent's chunked long-ctx prefill set
+        # ``_fp8_kv_verify_active=True`` the K-row layer normally writes
+        # FP8 K/V into ``_fp8_K_cache`` / ``_fp8_V_cache`` via
+        # ``_fp8_write_kv`` so the decode-time spec-verify XQA reads
+        # FP8 values. The per-token forward writes BF16 K/V into
+        # ``_attn.K_cache`` instead, so we mirror the FP8 cache update
+        # ourselves after each per-position call to keep the long-ctx
+        # decode path consistent.
+        write_fp8 = bool(getattr(self, "_fp8_kv_verify_active", False))
+        full_rank = self._full_layer_rank(L) if write_fp8 else None
         for r in range(K):
             h_in_r = h_in_K[:, r:r + 1, :].view(1, hidden).contiguous()
             cos_r = cos_3d[:, r].contiguous()
@@ -230,6 +240,13 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
             h_out_r = super()._layer_forward_full_nvfp4(
                 L, h_in_r, cos_r, sin_r, cur_pos + r)
             h_out_K[:, r:r + 1, :].copy_(h_out_r.view(1, 1, hidden))
+            if write_fp8:
+                pos = cur_pos + r
+                k_row = self._attn.K_cache[
+                    full_rank, pos:pos + 1].view(1, 4, 256)
+                v_row = self._attn.V_cache[
+                    full_rank, pos:pos + 1].view(1, 4, 256)
+                self._fp8_write_kv(full_rank, pos, pos + 1, k_row, v_row)
         return h_out_K
 
     def _should_use_long_ctx_route(
