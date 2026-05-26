@@ -134,13 +134,15 @@ class StreamParser:
     Plus stop-string detection for early termination.
     """
 
-    def __init__(self, tokenizer, stop_strings: Optional[List[str]] = None):
+    def __init__(self, tokenizer, stop_strings: Optional[List[str]] = None,
+                 enable_tools: bool = False):
         self.tok = tokenizer
         self._buffer = ''         # un-flushed text (may contain partial tags)
         self._content_pos = 0     # index up to which we have flushed content
         self._in_tool = False
         self._tool_buffer = ''
         self._stop_strings = stop_strings or []
+        self._enable_tools = bool(enable_tools)
         self._tool_calls_emitted: List[dict] = []
         # OAI tool_call indexer.
         self._tool_call_idx = 0
@@ -202,8 +204,12 @@ class StreamParser:
         )
         hold = (
             0 if (final or stop_hit)
-            else max(len(_TOOL_CALL_OPEN), max_stop_len) - 1
+            else max(
+                len(_TOOL_CALL_OPEN) if self._enable_tools else 0,
+                max_stop_len,
+            ) - 1
         )
+        hold = max(0, hold)
 
         while True:
             if self._in_tool:
@@ -223,7 +229,10 @@ class StreamParser:
                     self._tool_calls_emitted.append(tc)
                 continue
 
-            open_idx = self._buffer.find(_TOOL_CALL_OPEN)
+            open_idx = (
+                self._buffer.find(_TOOL_CALL_OPEN)
+                if self._enable_tools else -1
+            )
             if open_idx < 0:
                 # No open tag in buffer — flush all but the hold-back tail.
                 safe = max(0, len(self._buffer) - hold)
@@ -391,7 +400,11 @@ class Qwen3Engine:
                 rng = torch.Generator(device='cuda')
                 rng.manual_seed(int(seed))
 
-            parser = StreamParser(self.fe._tokenizer, stop_strings=stop)
+            parser = StreamParser(
+                self.fe._tokenizer,
+                stop_strings=stop,
+                enable_tools=bool(tools),
+            )
             eos = self.fe._tokenizer.eos_token_id
 
             t0 = time.perf_counter()
