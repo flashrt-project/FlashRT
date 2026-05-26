@@ -177,7 +177,14 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
     # replays is a 12.7x speedup (≈ 113 ms vs 1430 ms) per chunk on
     # the Thor BW-bound regime, so the prompt is short enough to fit
     # the BF16 retention window we trade off 22 graph replays for one.
-    _THOR_FIRST_CHUNK_K: int = 22
+    # Production sweet spot: K=128 first-chunk for ctx=128 prompts —
+    # entire prefill in one K-row call, AL=3.93 preserved (verified
+    # across the K∈{96, 110, 120, 124, 126, 127, 128} sweep). At
+    # K=128 the row 42 of layer 63 picks up ~ULP drift vs per-token
+    # (the only divergent layer), but MTP head absorbs that noise.
+    # Override via env if needed for bisection.
+    _THOR_FIRST_CHUNK_K: int = int(
+        os.environ.get("FLASHRT_QWEN36_THOR_FIRST_CHUNK_K", "128"))
 
     def __init__(self, *args, **kwargs):
         with _use_thor_attn_backend():
@@ -308,77 +315,35 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
             self._K_lin_ab_vec[:K].data_ptr(), K, 96, 5120, s,
         )
 
-        # (6) Per-position causal_conv1d_update — recurrent in-place over
-        # ``_lin_conv_state[lin_rank]``. Verified bit-equivalent to the
-        # parent K=1 fast-path's ``_inout`` chain at the kernel level
-        # (``probe_state_kernel_inplace_vs_inout`` reports 0 bytes diff).
+        # (6) causal_conv1d_update — chunk variant (1 launch for K
+        # iters). Byte-equal to per-token at K=22 cur_pos=0; tiny
+        # ULP drift at larger K but well below MTP tolerance.
         lin_rank = self._linear_layer_rank(L)
         conv_state = self._lin_conv_state[lin_rank]
         conv_out_K = self._K_lin_conv_out[:K]
-        for k in range(K):
-            fvk.causal_conv1d_qwen36_update_bf16(
-                out_qkv_K[k:k + 1].data_ptr(), int(lw['conv1d_w']),
-                int(lw['conv1d_b']),
-                conv_out_K[k:k + 1].data_ptr(), conv_state.data_ptr(),
-                1, 10240, 4, True, s,
-            )
-
-        # (7) Split conv output into Q/K/V with 16->48 head broadcast.
-        q_K_48 = self._K_lin_q48[:K]
-        k_K_48 = self._K_lin_k48[:K]
-        v_K_3d = self._K_lin_v48[:K]
-        fvk.qwen36_lin_split_qkv_broadcast_bf16(
-            conv_out_K.data_ptr(), q_K_48.data_ptr(),
-            k_K_48.data_ptr(), v_K_3d.data_ptr(), K, s,
+        fvk.causal_conv1d_qwen36_update_chunk_bf16(
+            out_qkv_K.data_ptr(), int(lw['conv1d_w']),
+            int(lw['conv1d_b']),
+            conv_out_K.data_ptr(), conv_state.data_ptr(),
+            1, K, 10240, 4, True, s,
         )
 
-        # (8) GDN gating @ M=K (g = -A_log.exp()*softplus(a+dt_bias);
-        # beta = sigmoid(b)). a_vec_K / b_vec_K are views into
-        # _K_lin_ab_vec[:, :48] / [:, 48:] so their row-stride is 96, not
-        # 48 — must use the strided gating kernel; the non-strided
-        # variant would silently read [k*48..k*48+48] instead of the
-        # correct [k*96..k*96+48] and produce shifted/garbage g and
-        # beta for k>=1.
-        beta_K = self._K_lin_beta[:K]
-        g_bf_K = self._K_lin_g_bf[:K]
+        # (7-9) Fused conv_out -> split + Q/K broadcast + GDN gating
+        # + GDN chunk recurrent in one launch. Replaces three separate
+        # launches with the fused chunk-scan kernel.
+        rec_state = self._lin_state[lin_rank]
+        attn_out_K = self._K_lin_attn_out[:K]
         a_stride = a_vec_K.stride(0)
         b_stride = b_vec_K.stride(0)
-        fvk.qwen36_gdn_gating_strided_bf16(
+        fvk.qwen36_gdn_chunk_from_conv_smem_strided_bf16(
+            conv_out_K.data_ptr(),
             a_vec_K.data_ptr(), b_vec_K.data_ptr(),
             lw['neg_A_log_exp_fp32_t'].data_ptr(),
             lw['dt_bias_fp32_t'].data_ptr(),
-            g_bf_K.data_ptr(), beta_K.data_ptr(),
-            K, 48, a_stride, b_stride, s,
+            rec_state.data_ptr(),
+            attn_out_K.data_ptr(),
+            K, 48, a_stride, b_stride, True, s,
         )
-
-        # (9) Per-position GDN recurrent — recurrent in-place over
-        # ``_lin_state[lin_rank]``. Verified bit-equivalent to the parent
-        # K=1 fast-path's ``_inout`` chain at the kernel level.
-        #
-        # NB: an FP32-state variant of this kernel is bound as
-        # ``gated_deltanet_recurrent_qwen36_f32state_bf16io`` and
-        # eliminates the per-iter BF16 round-trip; it would unlock
-        # bit-exact K-row chains at arbitrary K (the ULP-jitter at K>22
-        # vs per-token is exactly that round-trip). Empirically
-        # however the FP32 path produces prefill hiddens that diverge
-        # from per-token by ~1 ULP from layer 0 row 1 onward, and the
-        # MTP head — trained on the BF16-rounded distribution —
-        # accepts fewer drafts: AL collapses from 3.93 to 3.19 at
-        # K=6 ctx=128 and tok/s drops to 36. We keep the BF16 in-place
-        # path here for AL preservation; if MTP head is ever
-        # re-calibrated against FP32-precision hiddens, the FP32
-        # kernel can be swapped in with no other changes.
-        rec_state = self._lin_state[lin_rank]
-        attn_out_K = self._K_lin_attn_out[:K]
-        for k in range(K):
-            fvk.gated_deltanet_recurrent_qwen36_bf16(
-                q_K_48[k].data_ptr(), k_K_48[k].data_ptr(),
-                v_K_3d[k].data_ptr(),
-                g_bf_K[k].data_ptr(), beta_K[k].data_ptr(),
-                rec_state.data_ptr(),
-                attn_out_K[k].data_ptr(),
-                1, 48, 128, 128, True, s,
-            )
 
         # (10) rms_norm_gated_silu @ M=K*48, dim=128.
         attn_out_flat = attn_out_K.view(K * 48, 128)
@@ -413,6 +378,18 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         )
 
         # (13) Post-attn residual h_in + attn_proj -> _K_res_mid.
+        # NB: parent K-row fuses (add + rms_norm + quant) into one
+        # ``residual_add_rms_norm_to_nvfp4_swizzled_bf16`` launch, but
+        # the per-token forward (which production reads
+        # ``_prefill_h_cache`` from) uses the split path; the fused
+        # kernel keeps the intermediate in FP32 while split rounds
+        # through BF16, which yields slightly different SF entries
+        # and hence different MLP-input hidden. The K-row first-chunk
+        # writes into the same ``_prefill_h_cache`` that the MTP head
+        # then consumes, so we MUST match the per-token kernel choice
+        # exactly — otherwise MTP sees a distribution shift and AL
+        # collapses (measured: 3.93 -> 2.15 at K=6 when swapping in
+        # the fused kernel).
         attn_proj = out_op_K.view(1, K, 5120)
         res_mid_K = self._K_res_mid[:, :K]
         fvk.add_bf16_out(
@@ -421,8 +398,7 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         )
         h_post = res_mid_K
 
-        # (14) post-attn rms_norm. Reuse _h_b[:K] since x_norm is no
-        # longer needed past step (5).
+        # (14) post-attn rms_norm.
         x_mlp = self._h_b[:K].view(K, 5120)
         h_post_view = h_post.view(K, 5120)
         fvk.rms_norm(
@@ -520,7 +496,11 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         full_rank = self._full_layer_rank(L)
 
         h2 = h_in_K.view(K, 5120)
-        # (1) input rms_norm @ M=K.
+        # (1) input rms_norm @ M=K. Per-token full-attn at line 1687
+        # uses the SPLIT (rms_norm + separate quant) path even though
+        # the fused kernel exists — keeping the same kernel choice
+        # here so _prefill_h_cache fed to MTP head sees the same
+        # rounding profile.
         x_norm = self._h_b[:K].view(K, 5120)
         fvk.rms_norm(
             h2.data_ptr(), int(lw['input_norm_eff_w']),
@@ -671,6 +651,8 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         )
 
         # (11) Post-attn residual h_in + attn_proj -> _K_res_mid.
+        # See lin-attn note above on why we keep split (matches per-
+        # token kernel choice).
         attn_proj = out_op_buf[:K].view(1, K, 5120)
         res_mid_K = self._K_res_mid[:, :K]
         fvk.add_bf16_out(
@@ -679,8 +661,7 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         )
         h_post = res_mid_K
 
-        # (12) post-attn rms_norm. Reuse _h_b[:K] (x_norm no longer
-        # needed past step (6)).
+        # (12) post-attn rms_norm.
         x_mlp = self._h_b[:K].view(K, 5120)
         h_post_view = h_post.view(K, 5120)
         fvk.rms_norm(
@@ -840,7 +821,11 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
     # bails out before us in that case anyway).
     def _thor_first_chunk_eligible(
             self, prompt_len: int, max_new_tokens: int) -> bool:
-        if prompt_len <= self._THOR_FIRST_CHUNK_K:
+        # First-chunk only useful when prompt is at least as long as
+        # the chunk size — otherwise we'd run a K-row larger than the
+        # prompt, which is wasted work.
+        K_chunk = self._THOR_FIRST_CHUNK_K
+        if K_chunk <= self._THOR_K_ROW_FAST_PATH_MAX or prompt_len < K_chunk:
             return False
         if self._weights.ptrs.get('mtp') is None:
             return False
@@ -865,10 +850,21 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
                 ids = self._thor_first_chunk_input_ids
                 cos_S = self._rope_cos_table[:K_chunk].view(1, K_chunk, d)
                 sin_S = self._rope_sin_table[:K_chunk].view(1, K_chunk, d)
+                # ``hidden_last`` populates _K_last_hidden_buf[:, :K]
+                # AND computes lm_head logits at the last row into
+                # _logits_buf. The lm_head is required because when
+                # K_chunk == prompt_len the parent's prefill loop
+                # never replays a real graph and would otherwise read
+                # a stale _logits_buf for the first-decoded-token
+                # argmax (this collapses MTP AL when K_chunk equals
+                # the full prompt length). When K_chunk < prompt_len
+                # the per-token loop will overwrite _logits_buf at
+                # the last position anyway, so the extra lm_head
+                # here is a no-cost no-op.
                 with torch.no_grad():
                     self.forward_own_decode_K_nvfp4(
                         ids[:, :K_chunk], cos_S, sin_S, 0, K_chunk,
-                        logits_mode="hidden")
+                        logits_mode="hidden_last")
             src = self._K_last_hidden_buf[:, p:p + 1].view(1, hidden)
             dst = self._last_hidden_buf.view(1, hidden)
             return _ThorFirstChunkReplay(src, dst)
