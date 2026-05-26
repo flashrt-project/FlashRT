@@ -61,9 +61,14 @@ void quantize_fp8_device_fp16(const __half* input, __nv_fp8_e4m3* output,
 
 void prefetch_l2(const void* data, size_t num_bytes, cudaStream_t stream = 0);
 
-// ── NVFP4 (BF16-only, SM120+) ──
-
-#ifdef ENABLE_NVFP4
+// ── NVFP4 (BF16-only, SM120+ / SM100 Thor W4A16) ──
+//
+// Declarations exposed on any Blackwell target that enables a
+// block-scaled FP4 path. The kernel bodies live in quantize.cu and
+// are compiled into flash_rt_kernels unconditionally; the gate here
+// is so the prototypes are visible to bindings.cpp on every arch
+// that wires them into pybind.
+#if defined(ENABLE_NVFP4) || defined(ENABLE_CUTLASS_SM100_NVFP4_W4A16)
 void quantize_bf16_to_nvfp4(const __nv_bfloat16* input, uint8_t* fp4_data,
                               uint8_t* scale_factors, int rows, int cols,
                               cudaStream_t stream = 0);

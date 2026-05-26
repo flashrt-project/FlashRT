@@ -313,7 +313,12 @@ void quantize_fp8_device_fp16(const __half* input, __nv_fp8_e4m3* output,
     quantize_fp8_kernel_generic<__half><<<blocks, threads, 0, stream>>>(input, output, d_scale, n);
 }
 
-#ifdef ENABLE_NVFP4
+// NVFP4 conversion kernels — pure CUDA-cores, no SM-specific intrinsics.
+// Compiled on every Blackwell target that participates in a block-scaled
+// FP4 path. The kernel bodies were originally gated to ENABLE_NVFP4 (a
+// SM120-only define) but are also needed by the Thor SM100 W4A16 path
+// for the BF16 -> NVFP4 fused norm/quant + activation conversion.
+#if defined(ENABLE_NVFP4) || defined(ENABLE_CUTLASS_SM100_NVFP4_W4A16)
 // ================================================================
 //  NVFP4 (E2M1) Quantization with per-16-block UE4M3 scale factors
 //  For cuBLASLt block-scaled GEMM on Blackwell (sm_120)

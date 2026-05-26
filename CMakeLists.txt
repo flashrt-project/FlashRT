@@ -453,6 +453,34 @@ if(GPU_ARCH STREQUAL "120")
   message(STATUS "SM120a CUTLASS NVFP4 W4A16 GEMM: ENABLED")
 endif()
 
+# ── CUTLASS SM100 NVFP4 W4A16 GEMM (Qwen3.6 NVFP4 ckpt, Thor SM110) ──
+# Sibling of the SM120 W4A16 object above. Same wire format, BF16 output.
+# Uses arch::Sm100 + OpClassBlockScaledTensorOp + KernelScheduleAuto,
+# the same dispatch already in production on Thor via the Pi0.5 / LingBot
+# NVFP4 path (csrc/gemm/fp4/cutlass_fp4_gemm.cu). Compiled with
+# -gencode arch=compute_110a,code=sm_110a via GPU_GENCODE.
+if(GPU_ARCH STREQUAL "110")
+  add_library(cutlass_nvfp4_w4a16_sm100_obj OBJECT
+    csrc/gemm/fp4/cutlass_nvfp4_w4a16_gemm_sm100.cu)
+  set_target_properties(cutlass_nvfp4_w4a16_sm100_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(cutlass_nvfp4_w4a16_sm100_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/fp4
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(cutlass_nvfp4_w4a16_sm100_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+  message(STATUS "SM100 CUTLASS NVFP4 W4A16 GEMM (Thor): ENABLED")
+endif()
+
 # ── Motus beta SM120 kernels ──
 # These are model-specific RTX kernels and must remain additive. They are
 # compiled into flash_rt_kernels so Motus does not depend on separate
@@ -783,8 +811,12 @@ if(ENABLE_FA2)
   message(STATUS "FA2 pybind module: flash_rt_fa2 (separate .so)")
 endif()
 
-# ── Qwen3.6 SM120 FlashInfer XQA FP8-KV probe ──
-if(GPU_ARCH STREQUAL "120")
+# ── Qwen3.6 FlashInfer XQA FP8-KV (SM120 + SM110/Thor) ──
+# Vendored FlashInfer XQA mha.cu has explicit `__CUDA_ARCH__ == 1100`
+# branches alongside the SM120 ones, so the same translation unit
+# compiles for both GPU_ARCH values; the differentiation is purely the
+# -gencode flag forwarded via GPU_GENCODE.
+if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "110")
   add_library(qwen36_flashinfer_xqa_obj OBJECT
     csrc/attention/flashinfer_xqa_src/mha.cu
     csrc/kernels/qwen36_flashinfer_xqa.cu)
@@ -925,7 +957,19 @@ if(GPU_ARCH STREQUAL "120")
     ENABLE_CUTLASS_SM120_NVFP4_W4A16=1)
 endif()
 
-if(GPU_ARCH STREQUAL "120")
+# SM100 CUTLASS NVFP4 W4A16 GEMM (Qwen3.6 NVFP4 ckpt on Thor).
+# The SF-reshape kernel is a pure memory permutation (no MMA, no
+# arch-specific intrinsics), so the same translation unit compiles
+# under both gencode flags.
+if(GPU_ARCH STREQUAL "110")
+  target_sources(flash_rt_kernels PRIVATE
+    $<TARGET_OBJECTS:cutlass_nvfp4_w4a16_sm100_obj>
+    csrc/quantize/nvfp4_sf_reshape_sm120.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    ENABLE_CUTLASS_SM100_NVFP4_W4A16=1)
+endif()
+
+if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "110")
   target_sources(flash_rt_kernels PRIVATE
     $<TARGET_OBJECTS:qwen36_flashinfer_xqa_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE
