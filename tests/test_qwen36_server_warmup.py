@@ -106,7 +106,7 @@ def test_long_mtp_tail_auto_policy(monkeypatch):
         'ptrs': {'mtp': {'k_proj_w_bf16': 1}},
     })()
 
-    assert fe._long_mtp_prefill_tail_for_prompt(128) == 0
+    assert fe._long_mtp_prefill_tail_for_prompt(128) == 128
     assert fe._long_mtp_prefill_tail_for_prompt(512) == 512
     assert fe._long_mtp_prefill_tail_for_prompt(1024) == 2048
     assert fe._long_mtp_prefill_tail_for_prompt(4096) == 512
@@ -164,7 +164,10 @@ def test_long_ctx_route_uses_prompt_bucket_before_total_length():
     fe._long_ctx_route_min_seq = 512
     fe._short_ctx_spec_max_seq = 2048
 
-    assert fe._should_use_long_ctx_route(128, 512) is False
+    assert fe._should_use_long_ctx_route(127, 512) is False
+    assert fe._should_use_long_ctx_route(128, 512) is True
+    assert fe._should_use_long_ctx_route(191, 512) is True
+    assert fe._should_use_long_ctx_route(192, 512) is False
     assert fe._should_use_long_ctx_route(511, 64) is False
     assert fe._should_use_long_ctx_route(512, 64) is True
     assert fe._should_use_long_ctx_route(128, 2048) is True
