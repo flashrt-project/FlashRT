@@ -85,6 +85,9 @@ __global__ void gated_deltanet_recurrent_kernel(
     float q_sq = qs[t] * qs[t];
     float k_sq = ks[t] * ks[t];
     q_sq = block_reduce_sum<HD>(q_sq, scratch);
+    // Required between consecutive block_reduce_sum calls that share
+    // the same ``scratch`` smem region — see chunked kernel comment.
+    __syncthreads();
     k_sq = block_reduce_sum<HD>(k_sq, scratch);
     const float q_inv = rsqrtf(q_sq + kEps);
     const float k_inv = rsqrtf(k_sq + kEps);
@@ -220,6 +223,9 @@ __global__ void gated_deltanet_recurrent_inout_kernel(
     float q_sq = qs[t] * qs[t];
     float k_sq = ks[t] * ks[t];
     q_sq = block_reduce_sum<HD>(q_sq, scratch);
+    // Required between consecutive block_reduce_sum calls that share
+    // the same ``scratch`` smem region — see chunked kernel comment.
+    __syncthreads();
     k_sq = block_reduce_sum<HD>(k_sq, scratch);
     const float q_inv = rsqrtf(q_sq + kEps);
     const float k_inv = rsqrtf(k_sq + kEps);
@@ -346,6 +352,9 @@ __global__ void gated_deltanet_recurrent_f32state_kernel(
     float q_sq = qs[t] * qs[t];
     float k_sq = ks[t] * ks[t];
     q_sq = block_reduce_sum<HD>(q_sq, scratch);
+    // Required between consecutive block_reduce_sum calls that share
+    // the same ``scratch`` smem region — see chunked kernel comment.
+    __syncthreads();
     k_sq = block_reduce_sum<HD>(k_sq, scratch);
     const float q_inv = rsqrtf(q_sq + kEps);
     const float k_inv = rsqrtf(k_sq + kEps);
@@ -475,6 +484,13 @@ __global__ void gated_deltanet_chunk_kernel(
       float q_sq = qs[t] * qs[t];
       float k_sq = ks[t] * ks[t];
       q_sq = block_reduce_sum<HD>(q_sq, scratch);
+      // Required between consecutive block_reduce_sum calls that share
+      // the same ``scratch`` smem region. Without this barrier, warp 0
+      // can begin writing scratch[warp] inside the second call while a
+      // slower warp is still reading scratch[0] (the first call's
+      // result) from ``return smem[0]`` — a write-after-read race
+      // that produces ~1% non-deterministic output at S>=512.
+      __syncthreads();
       k_sq = block_reduce_sum<HD>(k_sq, scratch);
       const float q_inv = rsqrtf(q_sq + kEps);
       const float k_inv = rsqrtf(k_sq + kEps);
@@ -579,6 +595,13 @@ __global__ void gated_deltanet_chunk_smem_kernel(
       float q_sq = qs[t] * qs[t];
       float k_sq = ks[t] * ks[t];
       q_sq = block_reduce_sum<HD>(q_sq, scratch);
+      // Required between consecutive block_reduce_sum calls that share
+      // the same ``scratch`` smem region. Without this barrier, warp 0
+      // can begin writing scratch[warp] inside the second call while a
+      // slower warp is still reading scratch[0] (the first call's
+      // result) from ``return smem[0]`` — a write-after-read race
+      // that produces ~1% non-deterministic output at S>=512.
+      __syncthreads();
       k_sq = block_reduce_sum<HD>(k_sq, scratch);
       const float q_inv = rsqrtf(q_sq + kEps);
       const float k_inv = rsqrtf(k_sq + kEps);
@@ -800,6 +823,13 @@ __global__ void qwen36_gdn_chunk_from_conv_smem_kernel(
       float q_sq = qs[t] * qs[t];
       float k_sq = ks[t] * ks[t];
       q_sq = block_reduce_sum<HD>(q_sq, scratch);
+      // Required between consecutive block_reduce_sum calls that share
+      // the same ``scratch`` smem region. Without this barrier, warp 0
+      // can begin writing scratch[warp] inside the second call while a
+      // slower warp is still reading scratch[0] (the first call's
+      // result) from ``return smem[0]`` — a write-after-read race
+      // that produces ~1% non-deterministic output at S>=512.
+      __syncthreads();
       k_sq = block_reduce_sum<HD>(k_sq, scratch);
       const float q_inv = rsqrtf(q_sq + kEps);
       const float k_inv = rsqrtf(k_sq + kEps);
