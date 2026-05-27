@@ -1037,7 +1037,17 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
             cat_buf.data_ptr(), rows, hidden, hidden, s,
         )
 
-        # 3) FC (BF16 matmul, K_in=2*hidden, N=hidden).
+        # 3) FC (BF16 matmul, K_in=2*hidden, N=hidden). ``bf16_matmul``
+        # at K=10240 is the generic chunked path (no K=10240 spec at
+        # csrc/kernels/bf16_matmul_qwen36.cu:472) — slow at M=127
+        # (117 ms measured) but bit-identical to the per-token
+        # ``bf16_matvec`` reduction. ``torch.mm`` (cuBLAS) runs the
+        # same shape in 0.45 ms with cosine 1.0000 vs the custom
+        # kernel, but the bit-level rounding differs enough to drop
+        # MTP AL 3.93 → 3.20 — see csrc/kernels/bf16_matmul_qwen36.cu
+        # line 466 specialization comment. A real GEMM with matching
+        # fma order would need a new kernel; until then the slow but
+        # AL-preserving custom kernel stays.
         fvk.bf16_matmul_qwen36_bf16(
             cat_buf.data_ptr(), int(mtp['fc_w']),
             fc_out.data_ptr(), rows, hidden, hidden * 2, s,
