@@ -191,13 +191,8 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         if K > self.MAX_Q_SEQ:
             return self._thor_full_K_dispatch(
                 L, h_in_K, cos_K, sin_K, cur_pos, K)
-        # ``_thor_full_K_forward`` picks the BF16-cache fast path
-        # (rotated K → K_cache, batched XQA via _attn.run) when
-        # cur_pos+K fits the BF16 K_cache extent. The frontend ctor
-        # bumps the cache to user_max_seq, so this branch fires for
-        # every chunk in normal production. The fallback FP8-paged
-        # per-position FA2 branch exists only for callers that under-
-        # size max_seq at construction.
+        # ``_thor_full_K_forward`` is single-XQA-path and requires
+        # FP8-KV mode (mirrors parent K-row pattern; see _thor_full_K_forward).
         return self._thor_full_K_forward(
             L, h_in_K, cos_K, sin_K, cur_pos, K)
 
