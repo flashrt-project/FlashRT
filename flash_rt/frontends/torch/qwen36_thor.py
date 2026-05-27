@@ -150,6 +150,14 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
             Kmax, 17408, device=device, dtype=bf16)
         self._thor_silu_K = torch.empty(
             Kmax, 17408, device=device, dtype=bf16)
+        # Rotated K staging buffer for long-ctx FP8-KV chunks where
+        # the BF16 ``_attn.K_cache`` (sized at the spec window, 2048
+        # rows) cannot hold ``cur_pos + K``. Rotated K lands here,
+        # then ``_fp8_write_kv`` quantizes [K rows] into parent's
+        # persistent FP8 paged cache.
+        self._thor_full_k_stage = torch.empty(
+            Kmax, self._attn.NUM_KV_HEADS, self._attn.HEAD_DIM,
+            device=device, dtype=bf16)
 
     # ---------- K-row layer overrides (Thor-only) ----------
     #
@@ -174,18 +182,9 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         if K > self.MAX_Q_SEQ:
             return self._thor_full_K_dispatch(
                 L, h_in_K, cos_K, sin_K, cur_pos, K)
-        # Long-ctx: BF16 K_cache is sized at the spec window
-        # (default 2048), while the parent routes long-ctx K/V writes
-        # to ``_fp8_K_cache`` / TQ packed cache. ``_thor_full_K_forward``
-        # writes BF16 unconditionally and slices past the cache when
-        # the requested window exceeds the BF16 buffer; defer to the
-        # parent's branching. ``self.max_seq`` is misleading here
-        # (becomes user_max_seq after long-ctx setup) — read the
-        # actual BF16 cache extent off the backend.
-        bf16_cap = int(self._attn.K_cache.shape[1])
-        if cur_pos + K > bf16_cap:
-            return super()._layer_forward_full_K_nvfp4(
-                L, h_in_K, cos_K, sin_K, cur_pos, K)
+        # _thor_full_K_forward now handles both the short-ctx BF16
+        # K_cache path (cur_pos + K within bf16 cap and FP8-KV mode
+        # off) and the long-ctx FP8-paged path internally.
         return self._thor_full_K_forward(
             L, h_in_K, cos_K, sin_K, cur_pos, K)
 
@@ -520,46 +519,98 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         q_norm_K = q_norm_out.view(K, 24, 256)
         k_norm_K = k_norm_out.view(K, 4, 256)
 
-        # Long-context FP8 KV mirror is required when the parent's
-        # chunked prefill set ``_fp8_kv_verify_active=True``: the
-        # decode-time spec verify reads from ``_fp8_K_cache`` /
-        # ``_fp8_V_cache`` so we have to mirror after writing BF16.
-        write_fp8 = bool(getattr(self, "_fp8_kv_verify_active", False))
-
-        # (7+8) Batched partial RoPE + V copy + q_seq=K causal XQA.
-        # The per-position loop was 128 separate XQA calls per
-        # full-attn layer × 16 layers = 2048 launches at K=128, each
-        # re-quantizing K_cache[:, :128] to FP8 inside Thor's run().
-        # The q_seq=K batched call runs ONE XQA with the causal mask
-        # (``_mask_for(q_seq)``) that gives identical attention
-        # outputs as the K serial q_seq=1 walk.
+        # (7+8) Attention. Two paths:
+        # * BF16-cache (short-ctx): write rotated K to ``_attn.K_cache``
+        #   and V to ``_attn.V_cache``, then one batched ``_attn.run``
+        #   call (Thor XQA at q_seq=K). Optionally mirror to FP8 paged
+        #   cache for downstream verify-time FP8-KV reads.
+        # * FP8 paged (long-ctx, cur_pos + K exceeds the BF16 spec
+        #   window): rotated K lands in ``_thor_full_k_stage`` only,
+        #   ``_fp8_write_kv`` populates parent's persistent FP8 paged
+        #   cache for the new [cur_pos..cur_pos+K] rows, then
+        #   ``_fp8_stage_for_layer`` dequantizes [0..cur_pos+K] back
+        #   into BF16 staging for the attention loop. Per-position FA2
+        #   is the only available path on Thor (``_fa2_fwd_causal``
+        #   is None — XQA at q_seq=K is unavailable when reading from
+        #   the staging buffer because XQA expects FP8 paged input,
+        #   not BF16).
         d = self._rope_dim
         scaling = float(self._cfg['head_dim']) ** -0.5
-        # Batched partial RoPE: Q rows land in Q_buf[:, :K], K rows in
-        # K_cache[full_rank, cur_pos:cur_pos+K].
+        write_fp8 = bool(getattr(self, "_fp8_kv_verify_active", False))
+        bf16_cap = int(self._attn.K_cache.shape[1])
+        use_bf16_cache = (cur_pos + K) <= bf16_cap and not write_fp8
+
         q_dst = self._attn.Q_buf[:, :K]
-        k_dst = self._attn.K_cache[full_rank, cur_pos:cur_pos + K]
-        fvk.qwen36_partial_rope_qk_bf16(
-            q_norm_out.data_ptr(), k_norm_out.data_ptr(),
-            cos_K.view(K, d).data_ptr(), sin_K.view(K, d).data_ptr(),
-            q_dst.data_ptr(), k_dst.data_ptr(),
-            K, 24, 4, 256, 64, s,
-        )
-        # Batched V copy: K rows.
-        fvk.gpu_copy(
-            self._attn.V_cache[
-                full_rank, cur_pos:cur_pos + K].data_ptr(),
-            v_new_K.data_ptr(), K * 4 * 256 * 2, s,
-        )
-        if write_fp8:
+        if use_bf16_cache:
+            # Short-ctx fast path: rotated K straight into K_cache.
+            k_dst = self._attn.K_cache[full_rank, cur_pos:cur_pos + K]
+            fvk.qwen36_partial_rope_qk_bf16(
+                q_norm_out.data_ptr(), k_norm_out.data_ptr(),
+                cos_K.view(K, d).data_ptr(), sin_K.view(K, d).data_ptr(),
+                q_dst.data_ptr(), k_dst.data_ptr(),
+                K, 24, 4, 256, 64, s,
+            )
+            fvk.gpu_copy(
+                self._attn.V_cache[
+                    full_rank, cur_pos:cur_pos + K].data_ptr(),
+                v_new_K.data_ptr(), K * 4 * 256 * 2, s,
+            )
+            self._attn.run(
+                'full', layer_idx=full_rank, q_seq=K,
+                kv_seq=cur_pos + K, stream=s, softmax_scale=scaling,
+            )
+        else:
+            # Long-ctx FP8-paged path: rotated K to Thor staging buf
+            # (BF16 K_cache too small at cur_pos + K > bf16_cap).
+            k_stage_new = self._thor_full_k_stage[:K]
+            fvk.qwen36_partial_rope_qk_bf16(
+                q_norm_out.data_ptr(), k_norm_out.data_ptr(),
+                cos_K.view(K, d).data_ptr(), sin_K.view(K, d).data_ptr(),
+                q_dst.data_ptr(), k_stage_new.data_ptr(),
+                K, 24, 4, 256, 64, s,
+            )
+            # Populate parent's persistent FP8 paged cache for the
+            # [cur_pos..cur_pos+K] window. v_new_K is BF16 in the
+            # NVFP4 GEMM output buffer.
             self._fp8_write_kv(
                 full_rank, cur_pos, cur_pos + K,
-                k_dst.view(K, 4, 256), v_new_K.view(K, 4, 256),
+                k_stage_new.view(K, 4, 256),
+                v_new_K.view(K, 4, 256),
             )
-        self._attn.run(
-            'full', layer_idx=full_rank, q_seq=K,
-            kv_seq=cur_pos + K, stream=s, softmax_scale=scaling,
-        )
+            # Dequant [0..cur_pos+K] from FP8 paged cache into BF16
+            # staging. ``_fp8_stage_for_layer`` caches the prior valid
+            # range so only the new K rows actually dequantize.
+            k_stage, v_stage = self._fp8_stage_for_layer(
+                full_rank, cur_pos + K)
+            # Per-position FA2 loop reading from BF16 staging
+            # (Thor's _fa2_fwd_causal is None, so q_seq=K causal
+            # FA2 is unavailable).
+            for kk in range(K):
+                q_view = self._attn.Q_buf[:, kk:kk + 1]
+                kv_seq_k = cur_pos + kk + 1
+                k_view = k_stage[:kv_seq_k].view(1, kv_seq_k, 4, 256)
+                v_view = v_stage[:kv_seq_k].view(1, kv_seq_k, 4, 256)
+                o_view = self._attn.O_buf[:, kk:kk + 1]
+                self._attn._fa2_fwd(
+                    Q=q_view.data_ptr(), K=k_view.data_ptr(),
+                    V=v_view.data_ptr(), O=o_view.data_ptr(),
+                    softmax_lse=self._attn.lse_buf.data_ptr(),
+                    softmax_lse_accum=self._attn.lse_accum.data_ptr(),
+                    o_accum=self._attn.o_accum.data_ptr(),
+                    batch=1, seqlen_q=1, seqlen_k=kv_seq_k,
+                    num_heads_q=24, num_heads_kv=4, head_dim=256,
+                    q_strides=(q_view.stride(0), q_view.stride(1),
+                               q_view.stride(2)),
+                    k_strides=(k_view.stride(0), k_view.stride(1),
+                               k_view.stride(2)),
+                    v_strides=(v_view.stride(0), v_view.stride(1),
+                               v_view.stride(2)),
+                    o_strides=(o_view.stride(0), o_view.stride(1),
+                               o_view.stride(2)),
+                    softmax_scale=scaling,
+                    num_sms=self._attn._num_sms,
+                    stream=s,
+                )
         attn_out_K = self._attn.O_buf[:, :K].view(K, 24, 256)
 
         # (9) Output gate: attn * sigmoid(gate). K rows in one launch.
