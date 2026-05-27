@@ -124,6 +124,37 @@ spec stats: K=6  attempts=29  p_full=0.345  p_ind=0.575  AL=4.38
 `AL=4.10` means each spec cycle emits 4.1 tokens on average; `p_full`
 is the fraction of cycles where the full draft chain is accepted.
 
+### Jetson AGX Thor numbers
+
+Same NVFP4 weights + same FP8→NVFP4 MTP head. The Thor frontend
+(`Qwen36TorchFrontendThor`) extends the RTX path with a
+hardware-isolated MTP-fc M-tile kernel (160 KB dynamic shared memory,
+gated on SM110's per-block opt-in limit) and a batched FP8-KV XQA
+attention path. Measured on a single Jetson AGX Thor (SM110,
+128 GB LPDDR5X), warm-state decode, `max_new_tokens=64`, repeated text
+prompt, default `K=6`:
+
+| prompt ctx | K | MTP tail | TTFT / prefill | decode tok/s | AL | K=1/K=6 parity |
+|---:|---:|---:|---:|---:|---:|:---:|
+| 128 | 6 | 128 | 268 ms | 42.8 | 3.86 | PASS |
+| 2 K | 6 | 2048 | 3.46 s | 42.5 | 3.71 | PASS |
+| 8 K | 6 | 2048 | 9.78 s | 52.2 | 4.33 | PASS |
+| 16 K | 6 | 2048 | 19.23 s | 52.9 | 4.82 | PASS |
+
+The `K=1/K=6 parity` column is the greedy spec-decode invariant test:
+under temperature-0 decoding, the accepted-token sequence must be
+independent of the spec-chain length, so K=1 (no spec) and K=6 (full
+spec) must produce bit-identical outputs. A PASS at every tested
+context confirms the speculative pipeline introduces no precision
+drift relative to a single-token greedy reference.
+
+Thor's effective memory bandwidth is ~6.5x lower than RTX 5090's
+(LPDDR5X ~273 GB/s vs GDDR7 ~1.79 TB/s), so absolute decode tok/s is
+proportionally lower; AL scales with context the same way it does on
+RTX (3.86 → 4.82 across 128 → 16 K) because the MTP draft distribution
+is identical between the two SKUs (same FP8→NVFP4 head, same
+calibration).
+
 ## 3. Choosing `K` (speculative chain length)
 
 `K` is the MTP draft chain length per spec cycle. Verify processes

@@ -154,6 +154,31 @@ CUDA Graph capture cost. The bundled OpenAI server
 pre-captures bucketed short/long shapes at startup via
 `--warmup-preset auto` and optional explicit `--warmup` buckets.
 
+#### LLM — Qwen3.6-27B NVFP4 (Jetson AGX Thor)
+
+Same NVFP4 W4A16 main weights + FP8 MTP head as the RTX 5090 path; the
+Thor frontend (`Qwen36TorchFrontendThor`) extends the RTX frontend with
+a hardware-isolated MTP fc fast path (160 KB dynamic shared memory, gated
+on SM110's per-block opt-in limit) and a batched FP8-KV XQA attention
+path. Numbers measured on a single Jetson AGX Thor (SM110, 128 GB
+LPDDR5X), warm-state decode after graph warmup, `max_new_tokens=64`,
+repeated text prompt. Decode column is pure decode time (TTFT
+subtracted); TTFT is the prefill + first-token wall.
+
+| prompt ctx | K | MTP tail | TTFT / prefill | decode tok/s | AL | K=1/K=6 parity |
+|---:|---:|---:|---:|---:|---:|:---:|
+| 128 | 6 | 128 | 268 ms | 42.8 | 3.86 | PASS |
+| 2 K | 6 | 2048 | 3.46 s | 42.5 | 3.71 | PASS |
+| 8 K | 6 | 2048 | 9.78 s | 52.2 | 4.33 | PASS |
+| 16 K | 6 | 2048 | 19.23 s | 52.9 | 4.82 | PASS |
+
+`K=1/K=6 parity` is the greedy spec-decode invariant test: under
+temperature-0 decoding the accepted token sequence must be independent
+of the spec-chain length, so K=1 (no spec) and K=6 (full spec) must
+produce bit-identical outputs. A PASS at every tested context confirms
+the speculative pipeline introduces no precision drift relative to a
+single-token greedy reference.
+
 <a name="qwen3-8b-performance"></a>
 
 ### LLM — Qwen3-8B NVFP4 (RTX 5090)

@@ -36,6 +36,28 @@ fe = Qwen36TorchFrontendRtx(
 )
 ```
 
+On Jetson AGX Thor (SM110), use the Thor subclass instead. It inherits
+the entire RTX API surface and overrides the hardware-specific paths
+(MTP fc M-tile kernel, batched FP8-KV XQA attention):
+
+```python
+from flash_rt.frontends.torch.qwen36_thor import Qwen36TorchFrontendThor
+
+fe = Qwen36TorchFrontendThor(
+    checkpoint_path,
+    device='cuda:0',
+    max_seq=2048,
+    quant='nvfp4',
+)
+```
+
+The bundled OpenAI server
+([`examples/qwen36_openai_server.py`](../examples/qwen36_openai_server.py))
+detects the compute capability at startup and dispatches automatically:
+SM110 (and SM100-class) loads `Qwen36TorchFrontendThor`; everything else
+loads `Qwen36TorchFrontendRtx`. The CLI / config surface is identical
+across both.
+
 | Argument | Type | Default | Meaning |
 |---|---|---|---|
 | `checkpoint_path` | `str` | (required) | Directory of the NVFP4 main ckpt. Must contain `compressed-tensors` `nvfp4-pack-quantized` safetensors **and** the tokenizer files (`tokenizer.json` / `tokenizer_config.json` / etc). The HuggingFace ckpt `prithivMLmods/Qwen3.6-27B-NVFP4` ships these together. |

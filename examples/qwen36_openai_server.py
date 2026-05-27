@@ -222,13 +222,29 @@ class Qwen36Engine:
     def __init__(self, checkpoint: str, *, K: int, max_seq: int,
                  device: str, model_name: str):
         import torch
-        from flash_rt.frontends.torch.qwen36_rtx import (
-            Qwen36TorchFrontendRtx,
-        )
 
+        # Dispatch to the hardware-matched frontend. SM110 (Thor /
+        # SM100-class) uses Qwen36TorchFrontendThor, which extends the
+        # RTX frontend with hardware-isolated MTP kernels and a
+        # batched FP8-KV XQA path. All other compute capabilities
+        # use the RTX frontend directly.
+        cap = torch.cuda.get_device_capability()
+        if cap == (11, 0) or cap == (10, 0):
+            from flash_rt.frontends.torch.qwen36_thor import (
+                Qwen36TorchFrontendThor as _Frontend,
+            )
+            fe_name = 'Qwen36TorchFrontendThor'
+        else:
+            from flash_rt.frontends.torch.qwen36_rtx import (
+                Qwen36TorchFrontendRtx as _Frontend,
+            )
+            fe_name = 'Qwen36TorchFrontendRtx'
+
+        log.info(
+            'device cc=%d.%d -> %s', cap[0], cap[1], fe_name)
         log.info('loading NVFP4 ckpt from %s ...', checkpoint)
         t0 = time.perf_counter()
-        self.fe = Qwen36TorchFrontendRtx(
+        self.fe = _Frontend(
             checkpoint, quant='nvfp4',
             device=device, max_seq=max_seq,
         )
