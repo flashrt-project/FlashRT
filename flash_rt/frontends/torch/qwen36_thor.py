@@ -909,18 +909,219 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
             return _ThorFirstChunkReplay(src, dst)
         return super()._ensure_graph_for_pos_nvfp4(p)
 
-    # ---------- Graphed MTP prefill ----------
+    # ---------- Batched NVFP4 MTP prefill ----------
     #
     # The parent's prefill MTP loop calls forward_mtp_head_nvfp4 once per
-    # prompt position with NO graph capture. At ctx=128 that's 127
-    # un-captured per-position MTP forwards = ~638 ms on Thor (~5 ms /
-    # call, mostly Python orchestration / per-call kernel-launch
-    # overhead on top of ~1.5 ms of actual compute). Parent already has
-    # _ensure_mtp_graph_nvfp4(cur_pos) that captures forward_mtp_head_nvfp4
-    # per-position via _mtp_static_prev_h / _mtp_static_prev_token
-    # static buffers — it just isn't wired into the prefill loop.
-    # Below we monkey-patch forward_mtp_head_nvfp4 (only during our
-    # generate window) to route through that captured graph.
+    # prompt position (positions 1..prompt_len). At ctx=128 that's 128
+    # serial per-position MTP forwards = ~638 ms on Thor (each call
+    # ~5 ms, mostly kernel-launch / Python orchestration plus the M=1
+    # MTP MLP / lm_head BW). The 5090 dodges this via the long-ctx
+    # route's batched ``_prefill_mtp_tail_kv_nvfp4`` (parent qwen36_rtx
+    # line 4063), which observes that MTP prefill outputs (next_h /
+    # logits) are discarded — only the K/V cache writes matter. That
+    # batched routine populates _mtp_K_cache / _mtp_V_cache rows at M=K
+    # while skipping Q proj, attention, output gate, O proj, MLP and
+    # lm_head entirely. The parent's variant is gated on
+    # ``'k_proj_w_bf16' in mtp`` though — Thor's MTP weights are NVFP4
+    # so the parent branch is a no-op.
+    #
+    # Below: a Thor-only NVFP4 equivalent. Dedicated buffers (parent
+    # uses ``_mtp_tail_*_buf`` — we mirror with ``_thor_mtp_tail_*``)
+    # so the batched prefill does not alias the K-row scratch the
+    # first-chunk graph holds across the spec decode loop.
+    #
+    # Wiring: ``forward_mtp_head_nvfp4`` override below detects the
+    # first prefill call (cur_pos == 1, ``_thor_mtp_prefill_active``)
+    # and runs ONE batched call for positions [1..prompt_len - 1].
+    # Subsequent calls in that range no-op. The final call at
+    # cur_pos == prompt_len (which carries the freshly decoded ``tok``
+    # not yet available at p=1) still goes through the per-position
+    # captured graph below. Net: 128 serial MTP forwards → 1 batched
+    # call + 1 per-position graph replay.
+    def _thor_ensure_mtp_prefill_buffers(self, rows: int) -> None:
+        """Lazy alloc of dedicated MTP prefill scratch — mirror of
+        parent ``_ensure_mtp_tail_kv_buffers`` but owned by the Thor
+        subclass. Sized to the largest ``rows`` ever requested."""
+        import torch
+
+        rows = int(rows)
+        cap = int(getattr(self, '_thor_mtp_tail_rows', 0))
+        if cap >= rows:
+            return
+        hidden = self._cfg['hidden_size']
+        bf16 = torch.bfloat16
+        device = self._h_b.device
+        self._thor_mtp_tail_rows = rows
+        self._thor_mtp_tail_embed_buf = torch.empty(
+            rows, hidden, device=device, dtype=bf16)
+        self._thor_mtp_tail_h_norm_buf = torch.empty_like(
+            self._thor_mtp_tail_embed_buf)
+        self._thor_mtp_tail_e_norm_buf = torch.empty_like(
+            self._thor_mtp_tail_embed_buf)
+        self._thor_mtp_tail_cat_buf = torch.empty(
+            rows, hidden * 2, device=device, dtype=bf16)
+        self._thor_mtp_tail_fc_out_buf = torch.empty(
+            rows, hidden, device=device, dtype=bf16)
+        self._thor_mtp_tail_x_norm_buf = torch.empty_like(
+            self._thor_mtp_tail_fc_out_buf)
+        self._thor_mtp_tail_k_proj_buf = torch.empty(
+            rows, 4 * 256, device=device, dtype=bf16)
+        self._thor_mtp_tail_v_proj_buf = torch.empty_like(
+            self._thor_mtp_tail_k_proj_buf)
+        self._thor_mtp_tail_k_norm_buf = torch.empty(
+            rows * 4, 256, device=device, dtype=bf16)
+        # Q is not computed during prefill — we still hand the kernel a
+        # 1-head dummy because qwen36_partial_rope_qk_bf16 always
+        # rotates Q (cheap at num_heads_q=1). Parent does the same.
+        self._thor_mtp_tail_dummy_q_in = torch.empty(
+            rows, 1, 256, device=device, dtype=bf16)
+        self._thor_mtp_tail_dummy_q_out = torch.empty_like(
+            self._thor_mtp_tail_dummy_q_in)
+
+    def _thor_mtp_prefill_K_nvfp4(
+            self, prev_h_rows, token_ids, pos_start: int, K: int) -> bool:
+        """Populate ``_mtp_K_cache`` / ``_mtp_V_cache`` rows
+        ``[pos_start..pos_start + K)`` in a single batched walk.
+        Mirror of parent ``_prefill_mtp_tail_kv_nvfp4`` (qwen36_rtx
+        line 4063) with NVFP4 k/v projections instead of BF16. Returns
+        ``True`` on success, ``False`` when MTP weights are missing.
+        Skips Q proj, attention, output gate, O proj, MLP, lm_head —
+        none feed K/V cache state, so the parent's per-position loop
+        discards them anyway."""
+        import torch
+
+        from flash_rt import flash_rt_kernels as fvk
+
+        mtp = self._weights.ptrs.get('mtp')
+        if mtp is None:
+            return False
+        rows = int(K)
+        if rows <= 0:
+            return True
+        hidden = self._cfg['hidden_size']
+        eps = float(self._cfg['rms_norm_eps'])
+        s = torch.cuda.current_stream().cuda_stream
+        self._thor_ensure_mtp_prefill_buffers(rows)
+
+        embed = self._thor_mtp_tail_embed_buf[:rows]
+        h_norm = self._thor_mtp_tail_h_norm_buf[:rows]
+        e_norm = self._thor_mtp_tail_e_norm_buf[:rows]
+        cat_buf = self._thor_mtp_tail_cat_buf[:rows]
+        fc_out = self._thor_mtp_tail_fc_out_buf[:rows]
+        x_norm = self._thor_mtp_tail_x_norm_buf[:rows]
+        k_proj = self._thor_mtp_tail_k_proj_buf[:rows]
+        v_proj = self._thor_mtp_tail_v_proj_buf[:rows]
+        k_norm = self._thor_mtp_tail_k_norm_buf[:rows * 4]
+
+        # 0) Embed prev tokens.
+        fvk.qwen36_embedding_lookup_bf16(
+            token_ids.view(-1).data_ptr(),
+            int(self._weights.ptrs['embed_w']),
+            embed.data_ptr(), rows, hidden, s,
+        )
+
+        # 1) Pre-FC norms on prev_h and embed.
+        fvk.rms_norm(
+            prev_h_rows.view(rows, hidden).data_ptr(),
+            int(mtp['pre_fc_norm_hidden_eff_w']),
+            h_norm.data_ptr(), rows, hidden, eps, s,
+        )
+        fvk.rms_norm(
+            embed.data_ptr(), int(mtp['pre_fc_norm_embedding_eff_w']),
+            e_norm.data_ptr(), rows, hidden, eps, s,
+        )
+
+        # 2) Concat [e_norm, h_norm].
+        fvk.concat2_bf16(
+            e_norm.data_ptr(), h_norm.data_ptr(),
+            cat_buf.data_ptr(), rows, hidden, hidden, s,
+        )
+
+        # 3) FC (BF16 matmul, K_in=2*hidden, N=hidden).
+        fvk.bf16_matmul_qwen36_bf16(
+            cat_buf.data_ptr(), int(mtp['fc_w']),
+            fc_out.data_ptr(), rows, hidden, hidden * 2, s,
+        )
+
+        # 4) input_norm.
+        fvk.rms_norm(
+            fc_out.data_ptr(), int(mtp['input_norm_eff_w']),
+            x_norm.data_ptr(), rows, hidden, eps, s,
+        )
+
+        # 5) NVFP4 quantize x_norm — reused for k_proj and v_proj.
+        # Share the (1024, 5120) NVFP4 scratch's ap/sf (sized
+        # max_seq × hidden, so 128 rows is well within). The MTP
+        # batched prefill runs sequentially after the K-row first-chunk
+        # graph and before the spec decode loop, so the shared scratch
+        # is not racing any concurrent user.
+        ap_5120, sf_5120, _ = self._nvfp4_scratch[(1024, 5120)]
+        fvk.quantize_bf16_to_nvfp4_swizzled(
+            x_norm.data_ptr(), ap_5120.data_ptr(),
+            sf_5120.data_ptr(), rows, hidden, s,
+        )
+
+        # 6) k_proj NVFP4 → dedicated k_proj_buf.
+        fvk.fp4_w4a16_gemm_sm120_bf16out(
+            ap_5120.data_ptr(), int(mtp['k_proj_packed']),
+            k_proj.data_ptr(),
+            rows, 4 * 256, hidden,
+            sf_5120.data_ptr(), int(mtp['k_proj_sf']),
+            float(mtp['k_proj_alpha']),
+            s,
+        )
+
+        # 7) v_proj NVFP4 → dedicated v_proj_buf.
+        fvk.fp4_w4a16_gemm_sm120_bf16out(
+            ap_5120.data_ptr(), int(mtp['v_proj_packed']),
+            v_proj.data_ptr(),
+            rows, 4 * 256, hidden,
+            sf_5120.data_ptr(), int(mtp['v_proj_sf']),
+            float(mtp['v_proj_alpha']),
+            s,
+        )
+
+        # 8) k_norm.
+        fvk.rms_norm(
+            k_proj.view(rows * 4, 256).data_ptr(),
+            int(mtp['k_norm_eff_w']),
+            k_norm.data_ptr(), rows * 4, 256, eps, s,
+        )
+
+        # 9) Partial RoPE on K with a 1-head dummy Q. Lands rotated K
+        # directly into _mtp_K_cache[pos_start..pos_start+rows].
+        cos = self._rope_cos_table[
+            pos_start:pos_start + rows].view(rows, self._rope_dim)
+        sin = self._rope_sin_table[
+            pos_start:pos_start + rows].view(rows, self._rope_dim)
+        q_dummy = self._thor_mtp_tail_dummy_q_in[:rows]
+        q_dummy_out = self._thor_mtp_tail_dummy_q_out[:rows]
+        fvk.qwen36_partial_rope_qk_bf16(
+            q_dummy.data_ptr(), k_norm.data_ptr(),
+            cos.data_ptr(), sin.data_ptr(),
+            q_dummy_out.data_ptr(),
+            self._mtp_K_cache[
+                pos_start:pos_start + rows].data_ptr(),
+            rows, 1, 4, 256, self._rope_dim, s,
+        )
+
+        # 10) V copy.
+        fvk.gpu_copy(
+            self._mtp_V_cache[
+                pos_start:pos_start + rows].data_ptr(),
+            v_proj.data_ptr(), rows * 4 * 256 * 2, s,
+        )
+        return True
+
+    # ---------- Per-position MTP graph fallback (unchanged) ----------
+    #
+    # Parent has ``_ensure_mtp_graph_nvfp4(cur_pos)`` that captures a
+    # full forward_mtp_head_nvfp4 per position via
+    # ``_mtp_static_prev_h`` / ``_mtp_static_prev_token`` static
+    # buffers. We still need it for the cur_pos == prompt_len call
+    # because that one carries the freshly decoded ``tok`` (not in
+    # ``input_ids``) — the batched prefill above can only cover
+    # positions [1..prompt_len - 1].
     #
     # Guard against re-entry from inside _ensure_mtp_graph_nvfp4's own
     # warmup + capture (which call forward_mtp_head_nvfp4) and from
@@ -944,6 +1145,33 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
             return super().forward_mtp_head_nvfp4(
                 prev_h, prev_token_id, cur_pos, mtp_cache_pos)
         hidden = self._cfg["hidden_size"]
+        ids = self._thor_first_chunk_input_ids
+        prompt_len = int(ids.shape[1]) if ids is not None else 0
+        prefilled_to = int(getattr(self, '_thor_mtp_prefilled_to', 0))
+        cur_pos_i = int(cur_pos)
+        # Batched-prefill window covers [1..prompt_len - 1]. On the
+        # first eligible call (cur_pos == 1 with not-yet-prefilled
+        # state), run ONE batched call and then no-op the rest of the
+        # window. Position prompt_len falls through to the per-pos
+        # graph below — it carries the freshly decoded tok which isn't
+        # available at p=1.
+        if (ids is not None and prompt_len > 1 and prefilled_to == 0
+                and cur_pos_i == 1):
+            with torch.no_grad():
+                tail_K = prompt_len - 1
+                prev_h_K = self._prefill_h_cache[
+                    :tail_K].view(tail_K, hidden).contiguous()
+                prev_tok_K = ids[:, 1:prompt_len].contiguous().view(tail_K)
+                ok = self._thor_mtp_prefill_K_nvfp4(
+                    prev_h_K, prev_tok_K, 1, tail_K)
+                if ok:
+                    self._thor_mtp_prefilled_to = prompt_len - 1
+                    return
+            # If batched failed (no MTP weights / bail), fall through
+            # to the per-pos graph path for this call.
+        if (prefilled_to > 0 and 1 <= cur_pos_i <= prefilled_to):
+            # Already covered by the batched call above. No-op.
+            return
         # Re-entry guard: _ensure_mtp_graph_nvfp4 internally calls
         # forward_mtp_head_nvfp4 to warm + capture; we must not loop
         # back into the graphed path during that.
@@ -971,6 +1199,7 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         self._thor_first_chunk_input_ids = input_ids
         self._thor_first_chunk_active = True
         self._thor_mtp_prefill_active = True
+        self._thor_mtp_prefilled_to = 0
         try:
             return super().generate_own_speculative_KN_nvfp4(
                 input_ids, max_new_tokens=max_new_tokens, K=K)
@@ -978,6 +1207,7 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
             self._thor_first_chunk_active = False
             self._thor_first_chunk_input_ids = None
             self._thor_mtp_prefill_active = False
+            self._thor_mtp_prefilled_to = 0
 
     def _should_use_long_ctx_route(
             self, prompt_len: int, max_new_tokens: int) -> bool:
