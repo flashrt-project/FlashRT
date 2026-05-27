@@ -241,6 +241,18 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         if K > self.MAX_Q_SEQ:
             return self._thor_full_K_dispatch(
                 L, h_in_K, cos_K, sin_K, cur_pos, K)
+        # Long-ctx: BF16 K_cache is sized at the spec window
+        # (default 2048), while the parent routes long-ctx K/V writes
+        # to ``_fp8_K_cache`` / TQ packed cache. ``_thor_full_K_forward``
+        # writes BF16 unconditionally and slices past the cache when
+        # the requested window exceeds the BF16 buffer; defer to the
+        # parent's branching. ``self.max_seq`` is misleading here
+        # (becomes user_max_seq after long-ctx setup) — read the
+        # actual BF16 cache extent off the backend.
+        bf16_cap = int(self._attn.K_cache.shape[1])
+        if cur_pos + K > bf16_cap:
+            return super()._layer_forward_full_K_nvfp4(
+                L, h_in_K, cos_K, sin_K, cur_pos, K)
         return self._thor_full_K_forward(
             L, h_in_K, cos_K, sin_K, cur_pos, K)
 
