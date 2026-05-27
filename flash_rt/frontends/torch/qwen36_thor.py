@@ -1007,6 +1007,29 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         )
         return True
 
+    # ---------- Adaptive K override ----------
+    #
+    # Parent's ``_long_tq_effective_k`` picks K=7 for prompt buckets
+    # [12288, 24576) and [49152, 160000) — matching 5090 measurements
+    # where K=7 gives the best decode tok/s. On Thor the M=K NVFP4
+    # GEMM rounding accumulates per-layer noise that's tighter than
+    # 5090's; the longer K=7 draft chain ends up with rejections that
+    # collapse AL (measured ctx=12K K=7 AL=1.13, K=5 AL=3.12; ctx=16K
+    # K=7 AL=1.06, K=5 AL=4.00). Override to cap at K=5 in those
+    # buckets where parent picks 7 — Thor measured numbers preserve
+    # AL ≥ 3.0 across the full long-ctx range.
+    def _long_tq_effective_k(self, prompt_len: int, K: int) -> int:
+        target_k = super()._long_tq_effective_k(prompt_len, K)
+        # Parent's bucket overrides via FLASHRT_QWEN36_TQ_SPEC_K env
+        # already short-circuit before reaching this cap; keep the
+        # cap purely a Thor-specific bucket adjustment.
+        import os
+        if os.environ.get('FLASHRT_QWEN36_TQ_SPEC_K', ''):
+            return target_k
+        if target_k > 5 and int(prompt_len) >= 12288:
+            return 5
+        return target_k
+
     # ---------- Long-ctx MTP prefill integration ----------
     #
     # Parent's _long_mtp_prefill_tail_for_prompt returns 0 when MTP
