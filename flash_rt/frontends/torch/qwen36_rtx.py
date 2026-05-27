@@ -4060,6 +4060,23 @@ class Qwen36TorchFrontendRtx:
         self._mtp_tail_dummy_q_out = torch.empty_like(
             self._mtp_tail_dummy_q_in)
 
+    def _mtp_tail_fc_matmul(
+            self, x_ptr: int, w_ptr: int, out_ptr: int,
+            rows: int, hidden: int, stream: int) -> None:
+        """Hook for the MTP prompt-tail fc matmul.
+
+        Default implementation routes through the shared
+        bf16_matmul_qwen36_bf16 (N=hidden, K=2*hidden). Hardware-
+        specific frontends may override to dispatch a sibling kernel,
+        provided the kernel is bit-identical in the per-output fma
+        order (a value mismatch here corrupts the MTP drafter's KV
+        seed and silently degrades speculative-decode acceptance).
+        """
+        from flash_rt import flash_rt_kernels as fvk
+        fvk.bf16_matmul_qwen36_bf16(
+            x_ptr, w_ptr, out_ptr, rows, hidden, hidden * 2, stream,
+        )
+
     def _prefill_mtp_tail_kv_nvfp4(
             self, prev_h_rows, token_ids, pos_start: int,
             cache_base_pos: int) -> bool:
@@ -4109,9 +4126,9 @@ class Qwen36TorchFrontendRtx:
             e_norm.data_ptr(), h_norm.data_ptr(),
             cat_buf.data_ptr(), rows, hidden, hidden, s,
         )
-        fvk.bf16_matmul_qwen36_bf16(
+        self._mtp_tail_fc_matmul(
             cat_buf.data_ptr(), int(mtp['fc_w']),
-            fc_out.data_ptr(), rows, hidden, hidden * 2, s,
+            fc_out.data_ptr(), rows, hidden, s,
         )
         fvk.rms_norm(
             fc_out.data_ptr(), int(mtp['input_norm_eff_w']),

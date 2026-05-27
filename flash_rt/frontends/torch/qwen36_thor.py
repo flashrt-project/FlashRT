@@ -146,6 +146,32 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         # MTP K/V cache range.
         self._attn.ensure_fa2_paged_capacity(int(self._user_max_seq))
 
+    def _mtp_tail_fc_matmul(
+            self, x_ptr: int, w_ptr: int, out_ptr: int,
+            rows: int, hidden: int, stream: int) -> None:
+        """Thor override of the MTP prompt-tail fc matmul.
+
+        At rows >= 2 dispatches an M-tile kernel that reuses the
+        (rows x 10240) W slab across an M_TILE block, cutting W
+        bandwidth by 1/M_TILE while preserving the per-output fma
+        order (bit-identical to the shared kernel). The kernel
+        requires 160 KB of dynamic shared memory per block, which
+        exceeds the SM120-class opt-in limit, so the binding is
+        gated on the device's reported capability and falls back to
+        the shared kernel on any non-zero return.
+        """
+        from flash_rt import flash_rt_kernels as fvk
+        K = hidden * 2
+        if rows >= 2 and K == 10240:
+            rc = fvk.bf16_matmul_qwen36_thor_mtp_fc_bf16(
+                x_ptr, w_ptr, out_ptr, rows, hidden, stream,
+            )
+            if rc == 0:
+                return
+        fvk.bf16_matmul_qwen36_bf16(
+            x_ptr, w_ptr, out_ptr, rows, hidden, K, stream,
+        )
+
     # ---------- Thor-native K-row scratch ----------
     #
     # The parent class allocates a number of K-row scratch buffers

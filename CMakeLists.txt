@@ -902,6 +902,7 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/fp4_w4a4_mma_sm120.cu
   csrc/kernels/bf16_matvec_qwen36.cu
   csrc/kernels/bf16_matmul_qwen36.cu
+  csrc/kernels/bf16_matmul_qwen36_thor.cu
   csrc/attention/fmha_dispatch.cu
   csrc/bindings.cpp
 )

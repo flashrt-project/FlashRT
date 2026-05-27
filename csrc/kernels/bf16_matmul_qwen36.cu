@@ -455,67 +455,6 @@ __global__ void bf16_matmul_ab96_mtile_pair_kernel(
     }
 }
 
-// M-tile kernel preserving the generic-chunked fma order. For a given
-// (m, n) output, lane t covers j = lane, lane+32, ..., K_FIXED-32+lane
-// with single-bf16 reads and one float fma per iteration — bit-identical
-// to bf16_matmul_warp_kernel_generic at the same K and one m. The
-// across-mt loop is independent accumulators, so each acc[mt] sees the
-// same fma sequence as the generic kernel would. The gain comes from
-// reading W once per (n, m_tile) block instead of once per (n, m), so
-// W bandwidth scales 1/M_TILE.
-template<int K_FIXED, int M_TILE>
-__global__ void bf16_matmul_warp_kernel_mtile_compat(
-    const __nv_bfloat16* __restrict__ x,
-    const __nv_bfloat16* __restrict__ W,
-    __nv_bfloat16* __restrict__ out,
-    int M, int N) {
-    extern __shared__ __align__(16) __nv_bfloat16 x_sh[];
-
-    const int m0 = blockIdx.y * M_TILE;
-
-    // Cooperative load of up to M_TILE x rows into smem.
-    for (int j = threadIdx.x; j < M_TILE * K_FIXED; j += kThreads) {
-        int mt = j / K_FIXED;
-        int kk = j - mt * K_FIXED;
-        int m = m0 + mt;
-        x_sh[j] = (m < M) ? x[m * K_FIXED + kk]
-                          : __float2bfloat16(0.0f);
-    }
-    __syncthreads();
-
-    const int warp_id = threadIdx.x / 32;
-    const int lane = threadIdx.x & 31;
-    const int n = blockIdx.x * kWarpsPerBlock + warp_id;
-    if (n >= N) return;
-
-    const __nv_bfloat16* w_row = W + n * K_FIXED;
-
-    float acc[M_TILE];
-    #pragma unroll
-    for (int mt = 0; mt < M_TILE; ++mt) acc[mt] = 0.0f;
-
-    #pragma unroll 1
-    for (int j = lane; j < K_FIXED; j += 32) {
-        float wv = static_cast<float>(w_row[j]);
-        #pragma unroll
-        for (int mt = 0; mt < M_TILE; ++mt) {
-            float xv = static_cast<float>(x_sh[mt * K_FIXED + j]);
-            acc[mt] = fmaf(xv, wv, acc[mt]);
-        }
-    }
-
-    #pragma unroll
-    for (int mt = 0; mt < M_TILE; ++mt) {
-        #pragma unroll
-        for (int off = 16; off > 0; off /= 2) {
-            acc[mt] += __shfl_xor_sync(0xffffffff, acc[mt], off);
-        }
-        if (lane == 0 && (m0 + mt) < M) {
-            out[(m0 + mt) * N + n] = __float2bfloat16(acc[mt]);
-        }
-    }
-}
-
 }  // namespace
 
 void bf16_matmul_qwen36_bf16(
@@ -536,29 +475,6 @@ void bf16_matmul_qwen36_bf16(
     } else if (K == 4096) {
         bf16_matmul_warp_kernel<4096>
             <<<grid, kThreads, 0, stream>>>(x, W, out, M, N);
-    } else if (K == 10240 && M >= 2) {
-        // MTP fc kernel hot path. Generic chunked at K=10240 reads
-        // the 100 MB W slab once per output m row → linear scaling
-        // with M (measured 118 ms at M=128). The mtile-compat kernel
-        // reuses W across an M_TILE block while preserving the
-        // per-output fma order. M_TILE=8 fits in Thor SM110 dynamic
-        // smem (160 KB < 232 KB max). For M=1 the single-row path
-        // below still dispatches to matvec via the frontend; the
-        // M>=2 guard here just keeps the launch sane.
-        constexpr int K_FIXED = 10240;
-        constexpr int M_TILE = 8;
-        constexpr int smem_bytes = M_TILE * K_FIXED * sizeof(__nv_bfloat16);
-        static int max_smem_set = 0;
-        if (!max_smem_set) {
-            cudaFuncSetAttribute(
-                bf16_matmul_warp_kernel_mtile_compat<K_FIXED, M_TILE>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
-            max_smem_set = 1;
-        }
-        dim3 grid_m((N + kWarpsPerBlock - 1) / kWarpsPerBlock,
-                    (M + M_TILE - 1) / M_TILE);
-        bf16_matmul_warp_kernel_mtile_compat<K_FIXED, M_TILE>
-            <<<grid_m, kThreads, smem_bytes, stream>>>(x, W, out, M, N);
     } else {
         const int smem_bytes = 4096 * sizeof(__nv_bfloat16);
         bf16_matmul_warp_kernel_generic

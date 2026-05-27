@@ -135,6 +135,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/qwen36_misc.cuh"
 #include "kernels/bf16_matvec_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36.cuh"
+#include "kernels/bf16_matmul_qwen36_thor.cuh"
 #include "kernels/fp4_w4a4_matvec_sm120.cuh"
 #include "kernels/fp4_w4a4_mma_sm120.cuh"
 #include "quantize/fp8_block128_dequant.cuh"
@@ -3993,6 +3994,22 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         },
         py::arg("x"), py::arg("W"), py::arg("out"),
         py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+
+    // Thor-only MTP prompt-tail fc matmul. Returns 0 on success, a
+    // non-zero value if the device cannot support the kernel's
+    // shared-memory configuration; the caller must fall back to
+    // bf16_matmul_qwen36_bf16 in that case.
+    m.def("bf16_matmul_qwen36_thor_mtp_fc_bf16",
+        [](uintptr_t x, uintptr_t W, uintptr_t out,
+           int M, int N, uintptr_t stream) -> int {
+            return flash_rt::kernels::bf16_matmul_qwen36_thor_mtp_fc_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(x),
+                reinterpret_cast<const __nv_bfloat16*>(W),
+                reinterpret_cast<__nv_bfloat16*>(out),
+                M, N, to_stream(stream));
+        },
+        py::arg("x"), py::arg("W"), py::arg("out"),
+        py::arg("M"), py::arg("N"), py::arg("stream") = 0);
 
     m.def("bf16_matmul_qwen36_ab96_bf16",
         [](uintptr_t x, uintptr_t W_ab, uintptr_t out_ab,
