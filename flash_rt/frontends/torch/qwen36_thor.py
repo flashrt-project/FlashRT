@@ -51,24 +51,6 @@ os.environ.setdefault(
     "FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND", "native")
 
 
-class _ThorFirstChunkReplay:
-    """Stand-in for a captured CUDA graph at positions inside the
-    Thor first-chunk pre-fill window. Implements ``.replay()`` so the
-    parent's prefill loop can call it the same way it calls a real
-    captured graph; the body just copies the corresponding per-position
-    hidden out of the pre-computed batched K-row output into the M=1
-    decode buffer the parent expects to read from.
-    """
-    __slots__ = ("_src", "_dst")
-
-    def __init__(self, src, dst):
-        self._src = src
-        self._dst = dst
-
-    def replay(self) -> None:
-        self._dst.copy_(self._src)
-
-
 @contextmanager
 def _use_thor_attn_backend():
     """Replace the RTX attn backend symbol with the Thor backend for
@@ -94,29 +76,6 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
     buffer surface (K_cache, V_cache, Q_buf, O_buf, lse_buf, ...) so
     the loader does not need per-arch branches.
 
-    Routing policy override
-    -----------------------
-    The RTX frontend's ``_should_use_long_ctx_route`` carries a
-    "128-token exception" that forces prompts in ``[128, 192)`` through
-    the chunked FP8-KV long-ctx path because on RTX 5090 the chunked
-    forward is materially faster than the per-token spec walk
-    (``docs/qwen36_nvfp4.md`` §5: TTFT 31 ms vs. seconds on the per-
-    token path). On Thor, profiling shows the opposite trade: the
-    chunked forward on Thor leaves a per-position hidden-state drift
-    versus the per-token forward (mean cosine 0.94, min 0.51 over a
-    128-token prompt), which collapses MTP spec acceptance from
-    AL=4.07 (per-token path) to AL=1.21 (chunked path). Until that
-    drift is root-caused at the kernel level, this subclass takes the
-    "AL > TTFT" branch on Thor for short prompts: anything short
-    enough to fit the BF16 spec window keeps the per-token spec path.
-    The chunked path stays available for prompts that exceed the
-    BF16 window (long-ctx serving was the original target of that
-    mode anyway).
-
-    See ``dev_log_qwen36_thor/step5c_thor_complete_AB_findings.md``
-    for the diff numbers and the per-position cosine trace that
-    motivated this override.
-
     Linear-attention chunked backend (Thor default)
     -----------------------------------------------
     The module-level ``setdefault`` for
@@ -124,17 +83,11 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
     recurrent GDN backend on Thor. The RTX default ``wy_lt`` chunk
     backend produces a measurable per-position drift on SM110
     (mean cos 0.999979 → 0.999721 at layer 2; compounds layer-by-layer
-    to a cos = 0.43 floor by layer 63) while ``native`` is bit-exact
-    to the per-token recurrent path. See
+    to a cos = 0.43 floor by layer 63) while ``native`` is mathematically
+    equivalent (cos > 0.9999) to the per-token recurrent path. See
     ``dev_log_qwen36_thor/step5e_chunked_prefill_drift_root_cause.md``
     for the per-layer hidden-state cosine table.
     """
-
-    # Default cap below which the Thor frontend forces the short-ctx
-    # (per-token spec) route. Above this the long-ctx chunked path
-    # engages — that's still the only viable option for prompts past
-    # the BF16 spec window.
-    _THOR_LONG_CTX_FORCE_MIN_SEQ: int = 8192
 
     # K-row layer dispatch threshold on Thor.
     #
@@ -168,30 +121,10 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
     # single-token forwards.
     _THOR_K_ROW_FAST_PATH_MAX: int = 7
 
-    # First-chunk prefill K-row size for short-ctx TTFT optimization.
-    # The Thor K-row at K=22 cur_pos=0 is verified byte-for-byte
-    # equivalent to running K=22 single-token forwards (probe
-    # ``probe_thor_K_row_bit_exact`` reports zero diff across all
-    # layers and all four state caches). Running the first 22 prefill
-    # positions through one batched K-row call instead of 22 graph
-    # replays is a 12.7x speedup (≈ 113 ms vs 1430 ms) per chunk on
-    # the Thor BW-bound regime, so the prompt is short enough to fit
-    # the BF16 retention window we trade off 22 graph replays for one.
-    # Production sweet spot: K=128 first-chunk for ctx=128 prompts —
-    # entire prefill in one K-row call, AL=3.93 preserved (verified
-    # across the K∈{96, 110, 120, 124, 126, 127, 128} sweep). At
-    # K=128 the row 42 of layer 63 picks up ~ULP drift vs per-token
-    # (the only divergent layer), but MTP head absorbs that noise.
-    # Override via env if needed for bisection.
-    _THOR_FIRST_CHUNK_K: int = int(
-        os.environ.get("FLASHRT_QWEN36_THOR_FIRST_CHUNK_K", "128"))
-
     def __init__(self, *args, **kwargs):
         with _use_thor_attn_backend():
             super().__init__(*args, **kwargs)
         self._thor_alloc_K_row_scratch()
-        self._thor_first_chunk_active: bool = False
-        self._thor_first_chunk_input_ids = None
 
     # ---------- Thor-native K-row scratch ----------
     #
@@ -794,162 +727,17 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
                 self._fp8_write_kv(full_rank, pos, pos + 1, k_row, v_row)
         return h_out_K
 
-    # ---------- Short-ctx first-chunk K-row prefill optimization ----------
+    # ---------- Batched NVFP4 MTP prefill (long-ctx integration TBD) ----------
     #
-    # The parent's ``generate_own_speculative_KN_nvfp4`` iterates one
-    # captured single-token graph per prompt position. On Thor that
-    # walks the 9.4 s BW-bound TTFT roofline at ctx=128. The Thor-
-    # native K-row layer at K=22 cur_pos=0 is byte-equivalent to that
-    # walk (probe verified) and runs in ~113 ms instead of ~1430 ms
-    # for the first 22 positions (12.7x speedup). We splice that
-    # speedup in by:
-    #
-    #   1. Overriding ``generate_own_speculative_KN_nvfp4`` to set a
-    #      pending flag and stash ``input_ids`` before delegating to
-    #      the parent.
-    #   2. Overriding ``_ensure_graph_for_pos_nvfp4`` so that the
-    #      parent's prefill-loop iteration at p == 0 (with the flag
-    #      set) runs the Thor K=22 K-row directly — state and the
-    #      K_chunk pre-final-norm hiddens land in
-    #      ``_K_last_hidden_buf``. Subsequent iterations at
-    #      0 <= p < K_chunk return a tiny replay-shaped object whose
-    #      ``.replay()`` copies the cached hidden into
-    #      ``_last_hidden_buf`` so the parent's
-    #      ``_prefill_h_cache[p:p+1].copy_(_last_hidden_buf...)``
-    #      keeps working unchanged. Iterations at p >= K_chunk fall
-    #      through to the captured single-token graphs.
-    #
-    # The optimization stays off when the long-ctx route would
-    # already chunk the prefill, or when the prompt is shorter than
-    # the chunk size, or when no MTP head is loaded (the parent path
-    # bails out before us in that case anyway).
-    def _thor_first_chunk_eligible(
-            self, prompt_len: int, max_new_tokens: int) -> bool:
-        # First-chunk only useful when prompt is at least as long as
-        # the chunk size — otherwise we'd run a K-row larger than the
-        # prompt, which is wasted work.
-        K_chunk = self._THOR_FIRST_CHUNK_K
-        if K_chunk <= self._THOR_K_ROW_FAST_PATH_MAX or prompt_len < K_chunk:
-            return False
-        if self._weights.ptrs.get('mtp') is None:
-            return False
-        if getattr(self, '_long_ctx_mode', False):
-            if self._should_use_long_ctx_route(prompt_len, max_new_tokens):
-                return False
-        return True
-
-    def _thor_ensure_first_chunk_graph(self):
-        """Lazily capture the K=K_chunk K-row + final norm + lm_head
-        as one CUDA graph. Replay amortizes ~1200 per-launch Python
-        orchestration overheads (~30-50 ms at K=128) into a single
-        graph replay.
-
-        State buffers (lin_state / lin_conv_state / K_cache / V_cache)
-        are zeroed before the graph capture (so the captured kernels
-        see fresh-state inputs the same way they will at replay time
-        after a ``reset_state()``). The captured graph writes those
-        state buffers in place at fixed addresses, so subsequent
-        replays — preceded by a ``reset_state()`` per the parent
-        prefill flow — produce the same outputs.
-        """
-        if hasattr(self, '_thor_first_chunk_graph'):
-            return
-        import torch
-        K = self._THOR_FIRST_CHUNK_K
-        d = self._rope_dim
-        device = self._h_b.device
-        # Static input buffer the captured graph reads from.
-        self._thor_static_ids_K = torch.zeros(
-            1, K, dtype=torch.long, device=device)
-        cos_S = self._rope_cos_table[:K].view(1, K, d)
-        sin_S = self._rope_sin_table[:K].view(1, K, d)
-        gs = torch.cuda.Stream(device=device)
-        # Warmup the K-row a couple of times into the graph mempool so
-        # the allocator wires up reusable scratch.
-        gs.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(gs):
-            with torch.no_grad():
-                for _ in range(3):
-                    self.reset_state()
-                    self.reset_mtp_state()
-                    self.forward_own_decode_K_nvfp4(
-                        self._thor_static_ids_K, cos_S, sin_S, 0, K,
-                        logits_mode="hidden_last")
-        torch.cuda.current_stream().wait_stream(gs)
-        # Capture against the parent's shared mempool so the recorded
-        # tensor addresses survive across replays.
-        g = torch.cuda.CUDAGraph()
-        self.reset_state()
-        self.reset_mtp_state()
-        gs.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(gs):
-            with torch.cuda.graph(
-                    g, stream=gs, pool=self._graph_mempool):
-                with torch.no_grad():
-                    self.forward_own_decode_K_nvfp4(
-                        self._thor_static_ids_K, cos_S, sin_S, 0, K,
-                        logits_mode="hidden_last")
-        torch.cuda.current_stream().wait_stream(gs)
-        self._thor_first_chunk_graph = g
-        self._thor_first_chunk_graph_stream = gs
-
-    def _ensure_graph_for_pos_nvfp4(self, p: int):
-        if (self._thor_first_chunk_active
-                and 0 <= p < self._THOR_FIRST_CHUNK_K):
-            import torch
-            K_chunk = self._THOR_FIRST_CHUNK_K
-            hidden = self._cfg["hidden_size"]
-            if p == 0:
-                # Capture the K-row graph on first use; subsequent
-                # generations replay it (one CUDA-Graph launch instead
-                # of ~1200 Python-orchestrated kernel launches).
-                self._thor_ensure_first_chunk_graph()
-                # Copy this generation's prompt prefix into the static
-                # input buffer the captured graph reads from.
-                self._thor_static_ids_K.copy_(
-                    self._thor_first_chunk_input_ids[:, :K_chunk])
-                # Parent already reset_state() right above the prefill
-                # loop, so the captured graph sees a fresh
-                # lin_state / K_cache at replay time.
-                gs = self._thor_first_chunk_graph_stream
-                gs.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(gs):
-                    self._thor_first_chunk_graph.replay()
-                torch.cuda.current_stream().wait_stream(gs)
-            src = self._K_last_hidden_buf[:, p:p + 1].view(1, hidden)
-            dst = self._last_hidden_buf.view(1, hidden)
-            return _ThorFirstChunkReplay(src, dst)
-        return super()._ensure_graph_for_pos_nvfp4(p)
-
-    # ---------- Batched NVFP4 MTP prefill ----------
-    #
-    # The parent's prefill MTP loop calls forward_mtp_head_nvfp4 once per
-    # prompt position (positions 1..prompt_len). At ctx=128 that's 128
-    # serial per-position MTP forwards = ~638 ms on Thor (each call
-    # ~5 ms, mostly kernel-launch / Python orchestration plus the M=1
-    # MTP MLP / lm_head BW). The 5090 dodges this via the long-ctx
-    # route's batched ``_prefill_mtp_tail_kv_nvfp4`` (parent qwen36_rtx
-    # line 4063), which observes that MTP prefill outputs (next_h /
-    # logits) are discarded — only the K/V cache writes matter. That
-    # batched routine populates _mtp_K_cache / _mtp_V_cache rows at M=K
-    # while skipping Q proj, attention, output gate, O proj, MLP and
-    # lm_head entirely. The parent's variant is gated on
-    # ``'k_proj_w_bf16' in mtp`` though — Thor's MTP weights are NVFP4
-    # so the parent branch is a no-op.
-    #
-    # Below: a Thor-only NVFP4 equivalent. Dedicated buffers (parent
-    # uses ``_mtp_tail_*_buf`` — we mirror with ``_thor_mtp_tail_*``)
-    # so the batched prefill does not alias the K-row scratch the
-    # first-chunk graph holds across the spec decode loop.
-    #
-    # Wiring: ``forward_mtp_head_nvfp4`` override below detects the
-    # first prefill call (cur_pos == 1, ``_thor_mtp_prefill_active``)
-    # and runs ONE batched call for positions [1..prompt_len - 1].
-    # Subsequent calls in that range no-op. The final call at
-    # cur_pos == prompt_len (which carries the freshly decoded ``tok``
-    # not yet available at p=1) still goes through the per-position
-    # captured graph below. Net: 128 serial MTP forwards → 1 batched
-    # call + 1 per-position graph replay.
+    # Mirror of parent ``_prefill_mtp_tail_kv_nvfp4`` (qwen36_rtx
+    # line 4063) for NVFP4 MTP weights. Parent's variant is gated on
+    # ``'k_proj_w_bf16' in mtp`` and returns False on Thor's
+    # NVFP4-only MTP. The function below provides the equivalent
+    # NVFP4 path; wiring it into ``_generate_long_ctx_speculative_KN_nvfp4``
+    # belongs to a separate phase that overrides
+    # ``_prefill_mtp_tail_kv_nvfp4`` and ``_long_mtp_prefill_tail_for_prompt``.
+    # Dedicated ``_thor_mtp_tail_*`` buffers so the batched prefill
+    # never aliases the K-row scratch.
     def _thor_ensure_mtp_prefill_buffers(self, rows: int) -> None:
         """Lazy alloc of dedicated MTP prefill scratch — mirror of
         parent ``_ensure_mtp_tail_kv_buffers`` but owned by the Thor
@@ -1141,128 +929,3 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         )
         return True
 
-    # ---------- Per-position MTP graph fallback (unchanged) ----------
-    #
-    # Parent has ``_ensure_mtp_graph_nvfp4(cur_pos)`` that captures a
-    # full forward_mtp_head_nvfp4 per position via
-    # ``_mtp_static_prev_h`` / ``_mtp_static_prev_token`` static
-    # buffers. We still need it for the cur_pos == prompt_len call
-    # because that one carries the freshly decoded ``tok`` (not in
-    # ``input_ids``) — the batched prefill above can only cover
-    # positions [1..prompt_len - 1].
-    #
-    # Guard against re-entry from inside _ensure_mtp_graph_nvfp4's own
-    # warmup + capture (which call forward_mtp_head_nvfp4) and from
-    # _ensure_mtp_chain_graph_nvfp4's capture (CUDA stream is in
-    # capture mode there).
-    def forward_mtp_head_nvfp4(self, prev_h, prev_token_id, cur_pos: int,
-                                mtp_cache_pos: int | None = None):
-        import torch
-        active = getattr(self, '_thor_mtp_prefill_active', False)
-        in_inner = getattr(self, '_thor_in_graphed_mtp', False)
-        # Fall through to the original implementation during capture or
-        # when re-entering from the graph helper.
-        if (not active or in_inner
-                or torch.cuda.is_current_stream_capturing()):
-            return super().forward_mtp_head_nvfp4(
-                prev_h, prev_token_id, cur_pos, mtp_cache_pos)
-        # The captured per-pos graph is keyed on cur_pos, not on
-        # mtp_cache_pos; only used when the two coincide (i.e. the
-        # prefill path).
-        if mtp_cache_pos is not None and int(mtp_cache_pos) != int(cur_pos):
-            return super().forward_mtp_head_nvfp4(
-                prev_h, prev_token_id, cur_pos, mtp_cache_pos)
-        hidden = self._cfg["hidden_size"]
-        ids = self._thor_first_chunk_input_ids
-        prompt_len = int(ids.shape[1]) if ids is not None else 0
-        prefilled_to = int(getattr(self, '_thor_mtp_prefilled_to', 0))
-        cur_pos_i = int(cur_pos)
-        # Batched-prefill window covers [1..prompt_len - 1]. On the
-        # first eligible call (cur_pos == 1 with not-yet-prefilled
-        # state), run ONE batched call and then no-op the rest of the
-        # window. Position prompt_len falls through to the per-pos
-        # graph below — it carries the freshly decoded tok which isn't
-        # available at p=1.
-        if (ids is not None and prompt_len > 1 and prefilled_to == 0
-                and cur_pos_i == 1):
-            with torch.no_grad():
-                tail_K = prompt_len - 1
-                prev_h_K = self._prefill_h_cache[
-                    :tail_K].view(tail_K, hidden).contiguous()
-                prev_tok_K = ids[:, 1:prompt_len].contiguous().view(tail_K)
-                ok = self._thor_mtp_prefill_K_nvfp4(
-                    prev_h_K, prev_tok_K, 1, tail_K)
-                if ok:
-                    self._thor_mtp_prefilled_to = prompt_len - 1
-                    return
-            # If batched failed (no MTP weights / bail), fall through
-            # to the per-pos graph path for this call.
-        if (prefilled_to > 0 and 1 <= cur_pos_i <= prefilled_to):
-            # Already covered by the batched call above. No-op.
-            return
-        # Re-entry guard: _ensure_mtp_graph_nvfp4 internally calls
-        # forward_mtp_head_nvfp4 to warm + capture; we must not loop
-        # back into the graphed path during that.
-        self._thor_in_graphed_mtp = True
-        try:
-            self._mtp_static_prev_h.copy_(prev_h.view(1, 1, hidden))
-            self._mtp_static_prev_token.copy_(prev_token_id.view(1, 1))
-            g = self._ensure_mtp_graph_nvfp4(int(cur_pos))
-            gs = self._graph_stream
-            gs.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(gs):
-                g.replay()
-            torch.cuda.current_stream().wait_stream(gs)
-        finally:
-            self._thor_in_graphed_mtp = False
-
-    def generate_own_speculative_KN_nvfp4(
-            self, input_ids, *, max_new_tokens: int, K: int = 6):
-        prompt_len = int(input_ids.shape[1])
-        if not self._thor_first_chunk_eligible(prompt_len, max_new_tokens):
-            return super().generate_own_speculative_KN_nvfp4(
-                input_ids, max_new_tokens=max_new_tokens, K=K)
-        if not hasattr(self, '_rope_cos_table'):
-            self._build_rope_table()
-        self._thor_first_chunk_input_ids = input_ids
-        self._thor_first_chunk_active = True
-        self._thor_mtp_prefill_active = True
-        self._thor_mtp_prefilled_to = 0
-        try:
-            return super().generate_own_speculative_KN_nvfp4(
-                input_ids, max_new_tokens=max_new_tokens, K=K)
-        finally:
-            self._thor_first_chunk_active = False
-            self._thor_first_chunk_input_ids = None
-            self._thor_mtp_prefill_active = False
-            self._thor_mtp_prefilled_to = 0
-
-    def _should_use_long_ctx_route(
-            self, prompt_len: int, max_new_tokens: int) -> bool:
-        """Thor-specific routing.
-
-        Skips the RTX "128-token chunked exception" that triggers the
-        AL collapse on Thor; falls back to the per-token spec path for
-        every prompt that still fits the configured BF16 window. The
-        upstream policy is otherwise preserved for long prompts that
-        would not fit the BF16 cache at all.
-        """
-        import os
-        if not getattr(self, '_long_ctx_mode', False):
-            return False
-        # Allow the env var to override the threshold (mainly for
-        # bisection of the chunked-prefill drift; production use takes
-        # the default).
-        thor_min = int(os.environ.get(
-            'FLASHRT_QWEN36_THOR_LONG_CTX_FORCE_MIN_SEQ',
-            str(self._THOR_LONG_CTX_FORCE_MIN_SEQ)))
-        prompt_len = int(prompt_len)
-        max_pos = prompt_len + int(max_new_tokens)
-        bf16_cap = int(getattr(
-            self, '_short_ctx_spec_max_seq', thor_min))
-        # If the prompt + decode horizon fits the BF16 window AND the
-        # prompt is shorter than the Thor threshold, take the
-        # per-token path. Otherwise fall back to the chunked path.
-        if prompt_len < thor_min and max_pos <= bf16_cap:
-            return False
-        return True
