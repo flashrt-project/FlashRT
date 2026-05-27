@@ -544,44 +544,46 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         q_norm_K = q_norm_out.view(K, 24, 256)
         k_norm_K = k_norm_out.view(K, 4, 256)
 
-        # (7+8) Attention. Two paths:
-        # * BF16-cache (short-ctx): write rotated K to ``_attn.K_cache``
-        #   and V to ``_attn.V_cache``, then one batched ``_attn.run``
-        #   call (Thor XQA at q_seq=K). Optionally mirror to FP8 paged
-        #   cache for downstream verify-time FP8-KV reads.
-        # * FP8 paged (long-ctx, cur_pos + K exceeds the BF16 spec
-        #   window): rotated K lands in ``_thor_full_k_stage`` only,
-        #   ``_fp8_write_kv`` populates parent's persistent FP8 paged
-        #   cache for the new [cur_pos..cur_pos+K] rows, then
-        #   ``_fp8_stage_for_layer`` dequantizes [0..cur_pos+K] back
-        #   into BF16 staging for the attention loop. Per-position FA2
-        #   is the only available path on Thor (``_fa2_fwd_causal``
-        #   is None — XQA at q_seq=K is unavailable when reading from
-        #   the staging buffer because XQA expects FP8 paged input,
-        #   not BF16).
+        # (7+8) Attention. Three paths, in priority order:
+        # * FP8-KV XQA (production long-ctx route): mirror of parent's
+        #   K-row standard pattern. Rotated K lands in ``_K_full_k_rot``
+        #   scratch (NOT in ``_attn.K_cache``); ``_fp8_write_kv``
+        #   quantizes the new [cur_pos..cur_pos+K] rows directly into
+        #   parent's persistent FP8 cache ``_fp8_K_cache``;
+        #   ``_fp8_xqa_attn`` reads that cache. Zero re-quantization
+        #   in attention. This is the path taken by every prefill chunk
+        #   and verify chunk in FP8-KV mode.
+        # * BF16-cache fast path (non-FP8-KV mode, e.g. TQ verify or
+        #   pure-BF16 testing): rotated K to ``_attn.K_cache``, then
+        #   ``_attn.run`` (Thor backend XQA with per-call BF16->FP8
+        #   re-quantize of the K_cache slab — wasteful but only fires
+        #   in non-production modes).
+        # * FP8 paged fallback (cur_pos + K > bf16_cap and FP8-KV
+        #   inactive — extreme edge): per-position FA2 loop over a
+        #   dequantized BF16 staging buffer. Never fires in production
+        #   because the BF16 K_cache is bumped to user_max_seq at ctor.
         d = self._rope_dim
         scaling = float(self._cfg['head_dim']) ** -0.5
         write_fp8 = bool(getattr(self, "_fp8_kv_verify_active", False))
         bf16_cap = int(self._attn.K_cache.shape[1])
-        # BF16-cache fast path applies whenever ``cur_pos + K`` fits
-        # in the BF16 K_cache, regardless of ``_fp8_kv_verify_active``.
-        # In FP8-KV mode we additionally mirror the rotated K + V to
-        # the persistent FP8 paged cache so subsequent chunks past
-        # bf16_cap can still read the [0..cur_pos+K] window via the
-        # staging buffer. Without this, even ctx=2K (which fits in
-        # bf16_cap entirely) would degrade to the per-pos FA2 loop
-        # below — measured 32K FA2 calls per prefill at ctx=2K.
-        use_bf16_cache = (cur_pos + K) <= bf16_cap
+        use_xqa = write_fp8 and self._fp8_xqa_enabled(K, cur_pos + K)
+        use_bf16_cache = (not use_xqa) and (cur_pos + K) <= bf16_cap
 
         q_dst = self._attn.Q_buf[:, :K]
-        if use_bf16_cache:
-            # Fast path: rotated K straight into K_cache.
-            # When ``_fp8_kv_verify_active`` is set (long-ctx generate
-            # where the first chunk happens to fit in BF16 cap), we
-            # still mirror to the persistent FP8 paged cache so the
-            # later chunks that exceed bf16_cap see initialised FP8
-            # positions when they read [0..cur_pos+K] via the staging
-            # buffer.
+        if use_xqa:
+            # FP8-KV XQA path: production long-ctx route.
+            # Mirror of parent K-row [qwen36_rtx.py:3158-3217].
+            k_new_K = self._K_full_k_rot[:, :K].view(K, 4, 256)
+            fvk.qwen36_partial_rope_qk_bf16(
+                q_norm_out.data_ptr(), k_norm_out.data_ptr(),
+                cos_K.view(K, d).data_ptr(), sin_K.view(K, d).data_ptr(),
+                q_dst.data_ptr(), k_new_K.data_ptr(),
+                K, 24, 4, 256, 64, s,
+            )
+            self._fp8_write_kv(
+                full_rank, cur_pos, cur_pos + K, k_new_K, v_new_K)
+            self._fp8_xqa_attn(full_rank, cur_pos + K, K, s)
+        elif use_bf16_cache:
             k_dst = self._attn.K_cache[full_rank, cur_pos:cur_pos + K]
             fvk.qwen36_partial_rope_qk_bf16(
                 q_norm_out.data_ptr(), k_norm_out.data_ptr(),
@@ -594,11 +596,6 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
                     full_rank, cur_pos:cur_pos + K].data_ptr(),
                 v_new_K.data_ptr(), K * 4 * 256 * 2, s,
             )
-            if write_fp8:
-                self._fp8_write_kv(
-                    full_rank, cur_pos, cur_pos + K,
-                    k_dst.view(K, 4, 256), v_new_K.view(K, 4, 256),
-                )
             self._attn.run(
                 'full', layer_idx=full_rank, q_seq=K,
                 kv_seq=cur_pos + K, stream=s, softmax_scale=scaling,
@@ -1059,6 +1056,52 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         if target_k > 5 and int(prompt_len) >= 12288:
             return 5
         return target_k
+
+    # ---------- FP8-KV XQA override ----------
+    #
+    # Parent's _fp8_xqa_enabled gates q_seq at _MAX_PUBLIC_SPEC_K+1
+    # (=16) and applies a measured bucket policy that prefers
+    # FA2-causal/per-pos-FA2 over XQA at some ctx ranges (5090
+    # measurements). On Thor:
+    #
+    #   * q_seq > _MAX_PUBLIC_SPEC_K (prefill chunks at K up to
+    #     MAX_Q_SEQ=2048): parent returns False, which would force
+    #     a per-position FA2 loop on the dequantized staging buffer
+    #     — orders of magnitude slower than batched XQA. Override
+    #     to return True so the prefill chunks land directly in
+    #     parent's persistent FP8 cache via _fp8_write_kv and read
+    #     back through _fp8_xqa_attn at q_seq=K. The XQA scratch /
+    #     semaphores are sized for MAX_Q_SEQ at _load_fp8_kv_cache
+    #     time (qwen36_rtx.py:8751-8755).
+    #
+    #   * q_seq <= _MAX_PUBLIC_SPEC_K (verify chunks): defer to
+    #     parent's bucket policy. The 5090-measured bucket trades
+    #     XQA vs FA2 per ctx range and that tradeoff also holds on
+    #     Thor (measured end_pos<6144 + q_seq=7: per-pos FA2 on
+    #     staging beats XQA — staging dequant is amortised across
+    #     K verify positions, while XQA pays the full kernel
+    #     overhead even at small ctx).
+    def _fp8_xqa_enabled(
+            self, q_seq: int | None = None,
+            end_pos: int | None = None) -> bool:
+        if (q_seq is not None
+                and int(q_seq) > self._MAX_PUBLIC_SPEC_K + 1):
+            if os.environ.get('FLASHRT_QWEN36_FP8_XQA', '1') == '0':
+                return False
+            if end_pos is not None:
+                min_ctx_raw = os.environ.get(
+                    'FLASHRT_QWEN36_FP8_XQA_MIN_CTX', '') or ''
+                if (min_ctx_raw
+                        and min_ctx_raw.lower() != 'auto'
+                        and int(end_pos) < int(min_ctx_raw)):
+                    return False
+            try:
+                from flash_rt import flash_rt_kernels as fvk
+                return hasattr(
+                    fvk, 'qwen36_flashinfer_xqa_bf16_fp8kv_spec')
+            except Exception:
+                return False
+        return super()._fp8_xqa_enabled(q_seq, end_pos)
 
     # ---------- Long-ctx MTP prefill integration ----------
     #
