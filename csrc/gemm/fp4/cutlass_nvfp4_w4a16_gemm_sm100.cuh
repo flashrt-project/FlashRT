@@ -10,7 +10,7 @@
 //            KernelTmaWarpSpecializedPingpong
 //   - sm100: arch::Sm100 + KernelScheduleAuto
 // On Thor (sm_110a) the Sm100 dispatch path produces the correct
-// blockscaled tcgen05 mainloop. Verified in dev_log/step0.
+// blockscaled tcgen05 mainloop.
 //
 // Wire-format contract is identical to the sm120 variant, so the
 // Python-side weight/scale layout and the activation quantizer are

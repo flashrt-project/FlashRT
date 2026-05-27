@@ -43,7 +43,3 @@ training/_runs/**
 internal-tests/
 internal-docs/
 notes/
-
-# Thor-specific local dev logs and probe scripts — never commit.
-dev_log_qwen36_thor/
-dev_scratch_qwen36_thor/

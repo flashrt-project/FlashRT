@@ -326,17 +326,16 @@ class ThorFlashAttnBackendQwen36:
             softmax_scale: float | None = None) -> int:
         """Run full-attention on Thor via the FlashInfer XQA kernel.
 
-        The pipeline has already written the per-token BF16 K/V into
-        ``self.K_cache[layer, cur_pos]`` / ``self.V_cache[layer, cur_pos]``
-        (same contract as the RTX backend). This method
-        copy-quantizes the relevant slab into the FP8 paged storage
-        on demand, then issues the XQA call.
+        Fallback path for non-FP8-KV mode (TQ verify, pure-BF16 test):
+        the pipeline has written per-token BF16 K/V into
+        ``self.K_cache[layer, cur_pos]`` / ``self.V_cache[layer, cur_pos]``;
+        this method re-quantizes the ``[:kv_seq]`` prefix into FP8 paged
+        storage on demand, then issues the XQA call.
 
-        For the initial Thor bring-up the per-call quantize is wasteful
-        (re-quantizes the full ``[:kv_seq]`` prefix every call).
-        Production will move this onto the K/V writer side so each new
-        token quantizes once. Logged as Step 5 optimization on the dev
-        branch.
+        In FP8-KV production the Thor frontend writes FP8 directly into
+        parent's persistent ``_fp8_K_cache`` at K/V write time and
+        attention reads back via ``_fp8_xqa_attn`` — this method is not
+        on that hot path, so the per-call re-quantize cost is acceptable.
         """
         if site != "full":
             raise KeyError(

@@ -46,10 +46,10 @@ This module owns Thor-specific overrides on top of the parent:
   * ``_thor_mtp_prefill_K_nvfp4``: NVFP4 batched MTP K/V tail prefill.
     Mirrors parent's ``_prefill_mtp_tail_kv_nvfp4`` (which requires
     BF16 shadow MTP weights) for the NVFP4-only Thor MTP head.
-  * ``_long_tq_effective_k``: caps adaptive K at 5 for
-    ``prompt_len ≥ 12288`` (5090 picks 7 there; Thor's M=K rounding
-    profile cannot sustain a K=7 chain — measured AL 1.06 → 4.00
-    when K is capped at 5).
+  * ``_long_tq_effective_k``: caps adaptive K at 6 for
+    ``prompt_len ≥ 12288`` (5090 picks 7 there; the K=7 verify
+    chain at q_seq=8 collapses on Thor, while K=6 verify at q_seq=7
+    is stable and gives higher AL than K=5).
   * ``_long_mtp_prefill_tail_for_prompt`` / ``_prefill_mtp_tail_kv_nvfp4``:
     NVFP4 MTP variant of parent's bucketed tail-prefill helpers
     (parent gates them on BF16 shadow MTP weights).
@@ -67,18 +67,6 @@ import os
 from contextlib import contextmanager
 
 from flash_rt.frontends.torch.qwen36_rtx import Qwen36TorchFrontendRtx
-
-# Thor-only default for the long-context chunked prefill's GDN backend.
-# The RTX default ``wy_lt`` (cublasLt WY-decomposition chunk scan) is
-# numerically non-equivalent to the per-token recurrent path on SM110:
-# every linear-attention layer drifts by ~5e-4 vs. the per-token output,
-# the drift compounds, and downstream MTP spec acceptance collapses.
-# The ``native`` per-step recurrent backend is bit-exact to the
-# per-token path on Thor (see step5e_chunked_prefill_drift_root_cause.md
-# for the per-layer cosine measurement). Setting via ``setdefault`` lets
-# the user still pin a specific backend for bisection work.
-os.environ.setdefault(
-    "FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND", "native")
 
 
 @contextmanager
@@ -108,15 +96,16 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
 
     Linear-attention chunked backend (Thor default)
     -----------------------------------------------
-    The module-level ``setdefault`` for
-    ``FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND`` pins the per-step
-    recurrent GDN backend on Thor. The RTX default ``wy_lt`` chunk
-    backend produces a measurable per-position drift on SM110
-    (mean cos 0.999979 → 0.999721 at layer 2; compounds layer-by-layer
-    to a cos = 0.43 floor by layer 63) while ``native`` is mathematically
-    equivalent (cos > 0.9999) to the per-token recurrent path. See
-    ``dev_log_qwen36_thor/step5e_chunked_prefill_drift_root_cause.md``
-    for the per-layer hidden-state cosine table.
+    ``__init__`` calls ``os.environ.setdefault`` to pin
+    ``FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND=native`` on Thor: the RTX
+    default ``wy_lt`` (cublasLt WY-decomposition chunk scan) drifts
+    measurably from the per-token recurrent path on SM110 (mean cos
+    0.999979 → 0.999721 at layer 2, compounding to a 0.43 floor by
+    layer 63), while ``native`` (per-step recurrent) stays cos > 0.9999
+    against the per-token path. ``setdefault`` lets a user-set value
+    win; the call is in ``__init__`` (not module scope) so importing
+    this module without instantiating the frontend never mutates the
+    process env.
     """
 
     # K-row layer dispatch threshold on Thor.
@@ -134,6 +123,20 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
     _THOR_K_ROW_FAST_PATH_MAX: int = 7
 
     def __init__(self, *args, **kwargs):
+        # Thor-only default for the long-context chunked prefill GDN
+        # backend. The RTX default ``wy_lt`` (cublasLt WY-decomposition
+        # chunk scan) is numerically non-equivalent to the per-token
+        # recurrent path on SM110: every linear-attention layer drifts
+        # by ~5e-4 vs. the per-token output, the drift compounds, and
+        # downstream MTP spec acceptance collapses. The ``native``
+        # per-step recurrent backend is mathematically equivalent
+        # (cos > 0.9999) to the per-token path on Thor. Set via
+        # ``setdefault`` so a user-set value still wins; scoped to
+        # ``__init__`` so just importing the module never mutates the
+        # global env (other Qwen3.6 frontends in the same process keep
+        # their RTX default).
+        os.environ.setdefault(
+            "FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND", "native")
         with _use_thor_attn_backend():
             super().__init__(*args, **kwargs)
         self._thor_alloc_K_row_scratch()
@@ -1061,4 +1064,3 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         return self._thor_mtp_prefill_K_nvfp4(
             prev_h_rows, token_ids, pos_start, rows,
             cache_base_pos=cache_base_pos)
-
