@@ -779,11 +779,16 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
             self._thor_mtp_tail_dummy_q_in)
 
     def _thor_mtp_prefill_K_nvfp4(
-            self, prev_h_rows, token_ids, pos_start: int, K: int) -> bool:
+            self, prev_h_rows, token_ids, pos_start: int, K: int,
+            cache_base_pos: int | None = None) -> bool:
         """Populate ``_mtp_K_cache`` / ``_mtp_V_cache`` rows
-        ``[pos_start..pos_start + K)`` in a single batched walk.
-        Mirror of parent ``_prefill_mtp_tail_kv_nvfp4`` (qwen36_rtx
-        line 4063) with NVFP4 k/v projections instead of BF16. Returns
+        ``[cache_base_pos..cache_base_pos + K)`` (defaults to
+        ``pos_start`` for the absolute-RoPE path) in a single batched
+        walk. Mirror of parent ``_prefill_mtp_tail_kv_nvfp4`` (qwen36_rtx
+        line 4063) with NVFP4 k/v projections instead of BF16.
+        ``pos_start`` is the absolute RoPE position; ``cache_base_pos``
+        is the MTP K/V cache row offset (long-ctx TQ uses a compact
+        MTP cache where this differs from ``pos_start``). Returns
         ``True`` on success, ``False`` when MTP weights are missing.
         Skips Q proj, attention, output gate, O proj, MLP, lm_head —
         none feed K/V cache state, so the parent's per-position loop
@@ -904,8 +909,11 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
             k_norm.data_ptr(), rows * 4, 256, eps, s,
         )
 
-        # 9) Partial RoPE on K with a 1-head dummy Q. Lands rotated K
-        # directly into _mtp_K_cache[pos_start..pos_start+rows].
+        # 9) Partial RoPE on K with a 1-head dummy Q. Rotated K lands
+        # into _mtp_K_cache[cache_base..cache_base+rows]. RoPE position
+        # is pos_start (absolute prompt position).
+        cache_base = (int(cache_base_pos)
+                      if cache_base_pos is not None else int(pos_start))
         cos = self._rope_cos_table[
             pos_start:pos_start + rows].view(rows, self._rope_dim)
         sin = self._rope_sin_table[
@@ -917,15 +925,78 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
             cos.data_ptr(), sin.data_ptr(),
             q_dummy_out.data_ptr(),
             self._mtp_K_cache[
-                pos_start:pos_start + rows].data_ptr(),
+                cache_base:cache_base + rows].data_ptr(),
             rows, 1, 4, 256, self._rope_dim, s,
         )
 
         # 10) V copy.
         fvk.gpu_copy(
             self._mtp_V_cache[
-                pos_start:pos_start + rows].data_ptr(),
+                cache_base:cache_base + rows].data_ptr(),
             v_proj.data_ptr(), rows * 4 * 256 * 2, s,
         )
         return True
+
+    # ---------- Long-ctx MTP prefill integration ----------
+    #
+    # Parent's _long_mtp_prefill_tail_for_prompt returns 0 when MTP
+    # weights lack a ``_w_bf16`` shadow — the long-ctx generate then
+    # writes only one MTP K/V row (cur_pos = prompt_len) and leaves
+    # positions [1..prompt_len-1] uninitialised. The spec loop then
+    # attends to zeros for the first generated token's MTP cache
+    # window and AL collapses (ctx=128 K=6: 3.93 -> 1.75 measured).
+    #
+    # Thor's NVFP4 MTP head has no BF16 shadow but the math is the
+    # same. Override so the bucket logic applies regardless of the
+    # weight format, then route ``_prefill_mtp_tail_kv_nvfp4`` to the
+    # NVFP4 batched helper above.
+    def _long_mtp_prefill_tail_for_prompt(self, prompt_len: int) -> int:
+        import os
+        raw = os.environ.get(
+            'FLASHRT_QWEN36_LONG_MTP_PREFILL_TAIL', 'auto') or 'auto'
+        if raw.lower() != 'auto':
+            return max(0, int(raw))
+        mtp = self._weights.ptrs.get('mtp') if self._weights else None
+        if not isinstance(mtp, dict):
+            return 0
+        # Mirror parent's bucket table (qwen36_rtx.py:7867) but drop
+        # the BF16-shadow gate. The NVFP4 batched MTP function provides
+        # the equivalent K/V cache fill.
+        prompt_len = int(prompt_len)
+        if prompt_len >= 128 and prompt_len < 512:
+            return min(128, prompt_len)
+        if prompt_len < 512:
+            return 0
+        if prompt_len < 768:
+            return 512
+        if prompt_len < 3072:
+            return 2048
+        if prompt_len < 6144:
+            return 512
+        return 2048
+
+    def _prefill_mtp_tail_kv_nvfp4(
+            self, prev_h_rows, token_ids, pos_start: int,
+            cache_base_pos: int) -> bool:
+        """Thor override of parent's MTP K/V tail prefill.
+
+        Parent's variant requires BF16 MTP projection weights and
+        returns False when only NVFP4 weights are loaded. Route to
+        our NVFP4 batched helper instead so long-ctx generate seeds
+        the MTP cache properly and AL is preserved at the bucket
+        sizes parent assumes."""
+        mtp = self._weights.ptrs.get('mtp')
+        if mtp is None:
+            return False
+        # If BF16 shadow weights are present, defer to parent (matches
+        # the original behaviour byte-for-byte on 5090-style ckpts).
+        if 'k_proj_w_bf16' in mtp:
+            return super()._prefill_mtp_tail_kv_nvfp4(
+                prev_h_rows, token_ids, pos_start, cache_base_pos)
+        rows = int(token_ids.numel())
+        if rows <= 0:
+            return True
+        return self._thor_mtp_prefill_K_nvfp4(
+            prev_h_rows, token_ids, pos_start, rows,
+            cache_base_pos=cache_base_pos)
 
