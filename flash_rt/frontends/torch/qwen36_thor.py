@@ -1041,13 +1041,19 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         # at K=10240 is the generic chunked path (no K=10240 spec at
         # csrc/kernels/bf16_matmul_qwen36.cu:472) — slow at M=127
         # (117 ms measured) but bit-identical to the per-token
-        # ``bf16_matvec`` reduction. ``torch.mm`` (cuBLAS) runs the
-        # same shape in 0.45 ms with cosine 1.0000 vs the custom
-        # kernel, but the bit-level rounding differs enough to drop
-        # MTP AL 3.93 → 3.20 — see csrc/kernels/bf16_matmul_qwen36.cu
-        # line 466 specialization comment. A real GEMM with matching
-        # fma order would need a new kernel; until then the slow but
-        # AL-preserving custom kernel stays.
+        # ``bf16_matvec`` reduction. Alternatives tried:
+        #   * ``torch.mm`` (cuBLAS, 0.45 ms): cosine 1.0000 vs custom
+        #     kernel but bit-level rounding drops MTP AL 3.93 -> 3.20.
+        #   * Split fc_w along K dim into two contiguous (H, H) halves
+        #     and run two K=5120 spec GEMMs + sum (52 ms): K=5120
+        #     specialization plus separate FP32 partial-sum changes
+        #     the fma order vs the K=10240 generic chunked path, AL
+        #     drops 3.93 -> 3.50.
+        # MTP head is calibrated against the K=10240 generic chunked
+        # reduction. A faster AL-preserving fc would require either a
+        # new kernel that matches the K=10240 reduction at higher M,
+        # or recalibrating the MTP head against a different reduction
+        # — both out of scope for this ship. The custom kernel stays.
         fvk.bf16_matmul_qwen36_bf16(
             cat_buf.data_ptr(), int(mtp['fc_w']),
             fc_out.data_ptr(), rows, hidden, hidden * 2, s,
