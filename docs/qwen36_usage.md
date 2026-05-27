@@ -54,7 +54,7 @@ fe = Qwen36TorchFrontendThor(
 The bundled OpenAI server
 ([`examples/qwen36_openai_server.py`](../examples/qwen36_openai_server.py))
 detects the compute capability at startup and dispatches automatically:
-SM110 (and SM100-class) loads `Qwen36TorchFrontendThor`; everything else
+SM110 (Jetson AGX Thor) loads `Qwen36TorchFrontendThor`; everything else
 loads `Qwen36TorchFrontendRtx`. The CLI / config surface is identical
 across both.
 

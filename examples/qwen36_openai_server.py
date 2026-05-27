@@ -223,13 +223,14 @@ class Qwen36Engine:
                  device: str, model_name: str):
         import torch
 
-        # Dispatch to the hardware-matched frontend. SM110 (Thor /
-        # SM100-class) uses Qwen36TorchFrontendThor, which extends the
+        # Dispatch to the hardware-matched frontend. SM110 (Jetson
+        # AGX Thor) uses Qwen36TorchFrontendThor, which extends the
         # RTX frontend with hardware-isolated MTP kernels and a
-        # batched FP8-KV XQA path. All other compute capabilities
-        # use the RTX frontend directly.
+        # batched FP8-KV XQA path; this also matches the CMake build
+        # gate (GPU_ARCH=110) that compiles those kernels in. All
+        # other compute capabilities use the RTX frontend directly.
         cap = torch.cuda.get_device_capability()
-        if cap == (11, 0) or cap == (10, 0):
+        if cap == (11, 0):
             from flash_rt.frontends.torch.qwen36_thor import (
                 Qwen36TorchFrontendThor as _Frontend,
             )
