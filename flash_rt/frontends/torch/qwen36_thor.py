@@ -934,24 +934,27 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
     # ---------- Adaptive K override ----------
     #
     # Parent's ``_long_tq_effective_k`` picks K=7 for prompt buckets
-    # [12288, 24576) and [49152, 160000) — matching 5090 measurements
-    # where K=7 gives the best decode tok/s. On Thor the M=K NVFP4
-    # GEMM rounding accumulates per-layer noise that's tighter than
-    # 5090's; the longer K=7 draft chain ends up with rejections that
-    # collapse AL (measured ctx=12K K=7 AL=1.13, K=5 AL=3.12; ctx=16K
-    # K=7 AL=1.06, K=5 AL=4.00). Override to cap at K=5 in those
-    # buckets where parent picks 7 — Thor measured numbers preserve
-    # AL ≥ 3.0 across the full long-ctx range.
+    # [12288, 24576) and [49152, 160000) — 5090 measures K=7 best at
+    # those ctx. On Thor K=7 verify (q_seq=8) drops AL catastrophically
+    # (ctx=12K AL=0.72, ctx=16K AL=0.19 — chain drafts no longer align
+    # with verify outputs at q_seq=8). K=6 verify (q_seq=7) works fine
+    # and is in fact better than the previous K=5 cap (measured ctx=12K
+    # K=6 AL=4.50 decode=52 tok/s vs K=5 AL=4.00 decode=46 tok/s;
+    # ctx=16K K=6 AL=4.83 decode=52 vs K=5 AL=4.00 decode=46). Cap
+    # parent's K=7 buckets at K=6.
+    #
+    # The ``FLASHRT_QWEN36_TQ_SPEC_K`` env is parent's (qwen36_rtx)
+    # spec-K override — historical name from the original TurboQuant
+    # long-ctx implementation, retained on the FP8-KV path. It does
+    # NOT enable TurboQuant; FP8-KV is selected by
+    # ``FLASHRT_QWEN36_LONG_KV_CACHE=fp8``. The env is honoured here
+    # for explicit user overrides (bisection, ablation).
     def _long_tq_effective_k(self, prompt_len: int, K: int) -> int:
         target_k = super()._long_tq_effective_k(prompt_len, K)
-        # Parent's bucket overrides via FLASHRT_QWEN36_TQ_SPEC_K env
-        # already short-circuit before reaching this cap; keep the
-        # cap purely a Thor-specific bucket adjustment.
-        import os
         if os.environ.get('FLASHRT_QWEN36_TQ_SPEC_K', ''):
             return target_k
-        if target_k > 5 and int(prompt_len) >= 12288:
-            return 5
+        if target_k > 6 and int(prompt_len) >= 12288:
+            return 6
         return target_k
 
     # ---------- FP8-KV XQA override ----------
