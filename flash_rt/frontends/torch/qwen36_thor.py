@@ -546,11 +546,19 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         scaling = float(self._cfg['head_dim']) ** -0.5
         write_fp8 = bool(getattr(self, "_fp8_kv_verify_active", False))
         bf16_cap = int(self._attn.K_cache.shape[1])
-        use_bf16_cache = (cur_pos + K) <= bf16_cap and not write_fp8
+        # BF16-cache fast path applies whenever ``cur_pos + K`` fits
+        # in the BF16 K_cache, regardless of ``_fp8_kv_verify_active``.
+        # In FP8-KV mode we additionally mirror the rotated K + V to
+        # the persistent FP8 paged cache so subsequent chunks past
+        # bf16_cap can still read the [0..cur_pos+K] window via the
+        # staging buffer. Without this, even ctx=2K (which fits in
+        # bf16_cap entirely) would degrade to the per-pos FA2 loop
+        # below — measured 32K FA2 calls per prefill at ctx=2K.
+        use_bf16_cache = (cur_pos + K) <= bf16_cap
 
         q_dst = self._attn.Q_buf[:, :K]
         if use_bf16_cache:
-            # Short-ctx fast path: rotated K straight into K_cache.
+            # Fast path: rotated K straight into K_cache.
             # When ``_fp8_kv_verify_active`` is set (long-ctx generate
             # where the first chunk happens to fit in BF16 cap), we
             # still mirror to the persistent FP8 paged cache so the
