@@ -125,13 +125,21 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         with _use_thor_attn_backend():
             super().__init__(*args, **kwargs)
         self._thor_alloc_K_row_scratch()
-        # Pre-grow Thor backend's ``_fa2_fp8_K`` paged scratch to the
-        # full user_max_seq so the chunked-prefill / verify / MTP-chain
-        # graph captures never reallocate this buffer mid-capture
-        # (which bakes stale device pointers into the captured kernel
-        # call list and triggers an illegal memory access on replay).
-        # Cost: max_seq * NUM_KV_HEADS * HEAD_DIM * 1 byte ~ a few tens
-        # of MB for typical max_seq.
+        # Bump Thor backend's BF16 K/V cache + internal FP8 paged
+        # cache from the parent's long-ctx spec-window size (default
+        # 2048 rows) up to ``user_max_seq``. Parent leaves the BF16
+        # cache small to save 5090 memory; on Thor with 128 GB unified
+        # memory the cost (~3 GB at max_seq=32768) is fine and the
+        # benefit is large: the K-row's batched XQA path
+        # (``_attn.run('full', q_seq=K)``) reads from ``self.K_cache``
+        # — without the bump, long-ctx prompts past cur_pos > 2048
+        # would have to fall back to the per-pos FA2 loop in the
+        # FP8-paged branch (measured: ~32K per-pos FA2 calls instead
+        # of 16 batched XQA calls at ctx=2K K=2048).
+        self._attn.ensure_kv_capacity(int(self._user_max_seq))
+        # Pre-grow ``_fa2_fp8_K`` paged scratch too — used by FA2
+        # adapter path (MTP attention etc.). Same rationale: avoid
+        # mid-graph-capture reallocations.
         self._attn.ensure_fa2_paged_capacity(int(self._user_max_seq))
 
     # ---------- Thor-native K-row scratch ----------

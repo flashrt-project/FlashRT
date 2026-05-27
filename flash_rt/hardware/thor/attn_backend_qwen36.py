@@ -242,6 +242,43 @@ class ThorFlashAttnBackendQwen36:
 
         self._xqa_inited = True
 
+    def ensure_kv_capacity(self, max_seq_len: int) -> None:
+        """Resize BF16 K_cache + V_cache + Thor's internal FP8 paged
+        cache to cover ``max_seq_len`` rows. Frontend long-ctx generate
+        should call this for ``user_max_seq`` after construction —
+        parent's long-ctx setup sizes the attn backend at the small
+        BF16 spec window (default 2048) but the K-row's batched XQA
+        path (``self.run('full', ...)``) reads from ``self.K_cache``
+        so larger ctx prompts require a larger BF16 cache. Memory cost
+        at max_seq=32768: ~3 GB total (1 GB BF16 K + 1 GB BF16 V + 0.5
+        GB FP8 K + 0.5 GB FP8 V), well within Thor's 128 GB unified
+        memory budget."""
+        self._ensure_xqa_paged()
+        torch = self._torch
+        bf16 = self._dtype
+        page = self.XQA_TOKENS_PER_PAGE
+        max_seq_len = (
+            (int(max_seq_len) + page - 1) // page) * page
+        if max_seq_len <= self._max_seq:
+            return
+        self._max_seq = max_seq_len
+        # BF16 per-layer K/V cache.
+        self.K_cache = torch.empty(
+            self.NUM_FULL_LAYERS, max_seq_len,
+            self.NUM_KV_HEADS, self.HEAD_DIM,
+            dtype=bf16, device="cuda")
+        self.V_cache = torch.empty_like(self.K_cache)
+        # Thor backend's internal FP8 paged cache (re-quantized from
+        # K_cache on every ``run()`` call).
+        n_pages = max_seq_len // page
+        self._fp8_K = torch.empty(
+            self.NUM_FULL_LAYERS, n_pages, page,
+            self.NUM_KV_HEADS, self.HEAD_DIM,
+            dtype=torch.float8_e4m3fn, device="cuda")
+        self._fp8_V = torch.empty_like(self._fp8_K)
+        self._page_table = torch.arange(
+            n_pages, dtype=torch.int32, device="cuda").view(1, n_pages)
+
     def ensure_fa2_paged_capacity(self, max_seq_len: int) -> None:
         """Pre-grow the ``_fa2_fp8_K`` / ``_fa2_fp8_V`` paged scratch
         and ``_page_table`` to cover ``max_seq_len`` rows. Frontend
