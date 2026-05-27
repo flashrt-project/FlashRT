@@ -1017,9 +1017,18 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         # Mirror parent's bucket table (qwen36_rtx.py:7867) but drop
         # the BF16-shadow gate. The NVFP4 batched MTP function provides
         # the equivalent K/V cache fill.
+        #
+        # Thor adjustment for [128, 512): parent caps mtp_tail at 128
+        # to bound TTFT cost on 5090. At ctx=256-511 this gives only
+        # 25-50% MTP cache coverage and AL collapses (measured ctx=256
+        # K=6 AL=1.71). On Thor the MTP fc kernel (M-tile K=10240
+        # specialised, ~70 ms at M=256) costs ~+100 ms TTFT for full
+        # coverage, but lifts decode tok/s ~1.5x (~29 -> ~45 tok/s at
+        # ctx=256), which more than pays back for any generation
+        # length >= ~16 tokens. Full coverage is the right Thor default.
         prompt_len = int(prompt_len)
         if prompt_len >= 128 and prompt_len < 512:
-            return min(128, prompt_len)
+            return prompt_len
         if prompt_len < 512:
             return 0
         if prompt_len < 768:
