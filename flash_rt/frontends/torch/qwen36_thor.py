@@ -8,27 +8,46 @@ path on RTX 5090; this module hosts the parallel Thor entry point.
 Construction strategy
 ---------------------
 The RTX frontend is monolithic (~10k LOC). The single Thor-incompatible
-construction step is the attention-backend ctor at
-``qwen36_rtx.py:1314``, which directly imports the vendored FA2
-extension (``flash_rt_fa2`` — not built on Thor).
+construction step is the attention-backend ctor inside the parent
+``__init__``, which directly imports the vendored FA2 extension
+(``flash_rt_fa2`` — not built on Thor). ``_use_thor_attn_backend``
+patches the RTX attention-backend symbol to
+:class:`ThorFlashAttnBackendQwen36` for the duration of parent init.
+Every other load step (NVFP4 weight extraction, MTP head conversion,
+tokenizer, buffer allocation, CUDA Graph mempool setup) runs
+unchanged on Thor.
 
-We swap that one construction site by patching the RTX attention
-backend symbol to the Thor backend
-(:class:`ThorFlashAttnBackendQwen36`) for the duration of the parent
-``__init__``. Every other load step (NVFP4 weight extraction, MTP
-head conversion, tokenizer, large buffer allocation, CUDA Graph
-mempool setup) runs unchanged on Thor.
+Dispatch (mirrors 5090's ``_should_use_long_ctx_route`` exactly)
+--------------------------------------------------------------
+``prompt_len < 128``                : short-ctx legacy per-pos walk.
+``128 ≤ prompt_len < 192``          : long-ctx route (5090's exception).
+``prompt_len ≥ LONG_CTX_THRESHOLD``  : long-ctx route.
+``max_pos > bf16_cap``              : long-ctx route.
 
-What still needs work after ctor lands cleanly
-----------------------------------------------
-The RTX frontend has four hot paths that bypass ``self._attn.run()``
-and call ``self._attn._fa2_fwd[_causal]`` directly. The Thor
-backend's ``_fa2_fwd`` / ``_fa2_fwd_causal`` attributes are currently
-``None``; calling any of the four hot paths today will raise. Wiring
-them to ``fvk.qwen36_flashinfer_xqa_bf16_fp8kv_spec`` with bf16->fp8
-paged staging is the focused next milestone. See
-``dev_log_qwen36_thor/step3b_corrected_per_token_budget.md`` for the
-kernel-level cost data the integration is targeting.
+This module owns five Thor-specific overrides on top of the parent:
+
+  * ``_layer_forward_lin_K_nvfp4`` / ``_layer_forward_full_K_nvfp4``:
+    route K > 7 to the from-scratch ``_thor_lin_K_forward`` /
+    ``_thor_full_K_forward`` (parent's K-row kernel chain at M=K
+    diverges from M=1 on SM110 due to fused-kernel reductions;
+    ours uses split kernels that match per-token byte-for-byte at
+    K=128, and stays cos > 0.99 through K=2048).
+  * ``_thor_mtp_prefill_K_nvfp4``: NVFP4 batched MTP K/V tail prefill.
+    Mirrors parent's ``_prefill_mtp_tail_kv_nvfp4`` (which requires
+    BF16 shadow MTP weights) for the NVFP4-only Thor MTP head.
+  * ``_long_tq_effective_k``: caps adaptive K at 5 for
+    ``prompt_len ≥ 12288`` (5090 picks 7 there; Thor's M=K rounding
+    profile cannot sustain a K=7 chain — measured AL 1.06 → 4.00
+    when K is capped at 5).
+  * ``_long_mtp_prefill_tail_for_prompt`` / ``_prefill_mtp_tail_kv_nvfp4``:
+    NVFP4 MTP variant of parent's bucketed tail-prefill helpers
+    (parent gates them on BF16 shadow MTP weights).
+
+Backend init also bumps Thor's BF16 K/V cache + internal FP8 paged
+cache to ``user_max_seq`` (parent sizes them at the 2048-row spec
+window). This is mandatory: without the bump every chunk at
+``cur_pos+K > 2048`` falls back to the per-position FA2 loop and
+TTFT regresses 4–5× at long ctx.
 """
 
 from __future__ import annotations
@@ -91,34 +110,18 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
 
     # K-row layer dispatch threshold on Thor.
     #
-    # The K-row layer kernel chain on SM110 (NVFP4 Qwen3.6) shares the
-    # SM120 implementation but produces a different hidden state vs the
-    # per-token forward at certain (cur_pos, K) combinations — every
-    # individual kernel is row-deterministic at M=K vs M=1, yet the
-    # composite chain at M=K behaves differently. The same source on
-    # SM120 (5090) is bit-exact across all (cur_pos, K). Root-causing
-    # the kernel-chain divergence at the SASS / PTX level is a separate
-    # workstream; the production path takes the mathematically
-    # equivalent rewrite below instead.
-    #
-    # For K ≤ THRESHOLD the parent's K-row method is used unchanged —
-    # this preserves the production short-ctx spec-verify decode (K=7-8
-    # at cur_pos > prompt_len), which has been verified to match
-    # per-token by direct AL measurement. For K > THRESHOLD (i.e.
-    # prefill chunks) we dispatch to K sequential single-token forwards
-    # of the parent class. Single-token semantics are the ground truth
-    # in this build and are bit-exact at every (cur_pos, K=1) we have
-    # tested on Thor, so the chunked prefill state evolution is
-    # bit-exact to the legacy per-token prefill walk.
-    # Threshold matches ``_K_save_max=8`` from the parent: at K ≤ 8 the
-    # parent's K-row enters the per-step ``save_steps>0`` branch, which
-    # uses the in/out-state conv1d + recurrent kernels for exact-step
-    # state checkpointing — production spec-verify decode (K=7-8) relies
-    # on this path and is known bit-exact on Thor (AL=3.93 in prod).
-    # At K > 8 the parent's K-row enters the ``save_steps=0`` chunk
-    # branch, which is where the SM110 kernel-chain divergence lives;
-    # the dispatch below replaces that branch with K sequential
-    # single-token forwards.
+    # At K ≤ 7 (the spec-verify chain length range used by short-ctx
+    # spec decode) parent's K-row enters the ``save_steps>0`` branch
+    # which uses per-step recurrent kernels and stays per-token-
+    # equivalent on SM110 — that path is byte-stable on Thor (AL=3.86
+    # in prod at ctx=128 K=6), so we delegate.
+    # At K > 7 parent's K-row enters the ``save_steps=0`` chunk
+    # branch with fused kernels (residual_add_rms_norm_to_nvfp4,
+    # mlp_gate_up_packed, silu_mul_to_nvfp4) whose M=K BF16 rounding
+    # diverges from M=1 on SM110. The Thor-native ``_thor_lin_K_forward``
+    # and ``_thor_full_K_forward`` below replace that branch with
+    # split kernels that match per-token reduction order — verified
+    # cos ≥ 0.999999 at K=128, ≥ 0.99 for the bulk of layers at K=2048.
     _THOR_K_ROW_FAST_PATH_MAX: int = 7
 
     def __init__(self, *args, **kwargs):
@@ -166,11 +169,13 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
             Kmax, 17408, device=device, dtype=bf16)
         self._thor_silu_K = torch.empty(
             Kmax, 17408, device=device, dtype=bf16)
-        # Rotated K staging buffer for long-ctx FP8-KV chunks where
-        # the BF16 ``_attn.K_cache`` (sized at the spec window, 2048
-        # rows) cannot hold ``cur_pos + K``. Rotated K lands here,
-        # then ``_fp8_write_kv`` quantizes [K rows] into parent's
-        # persistent FP8 paged cache.
+        # Rotated K staging buffer used by ``_thor_full_K_forward``'s
+        # safety-net FP8-paged branch (cur_pos + K > BF16 K_cache cap).
+        # In normal production this branch never fires — Thor frontend
+        # __init__ bumps the K_cache to user_max_seq so the BF16 fast
+        # path covers every chunk. The staging buffer is the fallback
+        # path for callers that construct the frontend at a smaller
+        # ``max_seq`` than the actual prompt length.
         self._thor_full_k_stage = torch.empty(
             Kmax, self._attn.NUM_KV_HEADS, self._attn.HEAD_DIM,
             device=device, dtype=bf16)
@@ -198,9 +203,13 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         if K > self.MAX_Q_SEQ:
             return self._thor_full_K_dispatch(
                 L, h_in_K, cos_K, sin_K, cur_pos, K)
-        # _thor_full_K_forward now handles both the short-ctx BF16
-        # K_cache path (cur_pos + K within bf16 cap and FP8-KV mode
-        # off) and the long-ctx FP8-paged path internally.
+        # ``_thor_full_K_forward`` picks the BF16-cache fast path
+        # (rotated K → K_cache, batched XQA via _attn.run) when
+        # cur_pos+K fits the BF16 K_cache extent. The frontend ctor
+        # bumps the cache to user_max_seq, so this branch fires for
+        # every chunk in normal production. The fallback FP8-paged
+        # per-position FA2 branch exists only for callers that under-
+        # size max_seq at construction.
         return self._thor_full_K_forward(
             L, h_in_K, cos_K, sin_K, cur_pos, K)
 
@@ -813,17 +822,22 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
                 self._fp8_write_kv(full_rank, pos, pos + 1, k_row, v_row)
         return h_out_K
 
-    # ---------- Batched NVFP4 MTP prefill (long-ctx integration TBD) ----------
+    # ---------- Batched NVFP4 MTP prefill ----------
     #
-    # Mirror of parent ``_prefill_mtp_tail_kv_nvfp4`` (qwen36_rtx
-    # line 4063) for NVFP4 MTP weights. Parent's variant is gated on
-    # ``'k_proj_w_bf16' in mtp`` and returns False on Thor's
-    # NVFP4-only MTP. The function below provides the equivalent
-    # NVFP4 path; wiring it into ``_generate_long_ctx_speculative_KN_nvfp4``
-    # belongs to a separate phase that overrides
-    # ``_prefill_mtp_tail_kv_nvfp4`` and ``_long_mtp_prefill_tail_for_prompt``.
+    # Mirror of parent's ``_prefill_mtp_tail_kv_nvfp4`` for NVFP4 MTP
+    # weights. Parent gates that function on ``'k_proj_w_bf16' in mtp``
+    # (5090 keeps BF16 shadow weights alongside the NVFP4 packed
+    # weights). On Thor we only load NVFP4 MTP weights so parent's
+    # function always returns False; this NVFP4 batched variant fills
+    # the same role.
+    #
+    # The Thor override of ``_prefill_mtp_tail_kv_nvfp4`` (below) calls
+    # this; the override of ``_long_mtp_prefill_tail_for_prompt``
+    # (below) drops parent's BF16-shadow gate so the bucket table
+    # applies to Thor too.
+    #
     # Dedicated ``_thor_mtp_tail_*`` buffers so the batched prefill
-    # never aliases the K-row scratch.
+    # never aliases the K-row scratch buffers.
     def _thor_ensure_mtp_prefill_buffers(self, rows: int) -> None:
         """Lazy alloc of dedicated MTP prefill scratch — mirror of
         parent ``_ensure_mtp_tail_kv_buffers`` but owned by the Thor

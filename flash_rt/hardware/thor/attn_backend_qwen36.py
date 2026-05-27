@@ -2,10 +2,9 @@
 
 Mirrors the surface of :class:`RtxFlashAttnBackendQwen36` (see
 ``flash_rt.hardware.rtx.attn_backend_qwen36``) so the Qwen3.6 frontend
-can stay model-shape-agnostic, but routes full-attention calls through
-the FlashInfer XQA kernel
-(``fvk.qwen36_flashinfer_xqa_bf16_fp8kv_spec``) instead of the
-RTX-only vendored FA2 ``fwd_bf16``.
+can stay model-shape-agnostic, but routes full-attention through the
+FlashInfer XQA kernel (``fvk.qwen36_flashinfer_xqa_bf16_fp8kv_spec``)
+on SM110 instead of the RTX-only vendored FA2 ``fwd_bf16``.
 
 Architecture
 ------------
@@ -15,32 +14,28 @@ Qwen3.6 has two attention regimes per decoder layer:
     On Thor this site goes through XQA with paged FP8 K/V cache.
   * ``linear_attention`` (48 layers): Gated DeltaNet recurrent. Runs
     through the existing ``fvk.gated_deltanet_recurrent_qwen36_bf16``
-    kernels (graph-capture-safe, no FA2 dependency on either GPU
-    target). This backend does not own those tensors.
+    kernels (graph-capture-safe). This backend does not own those
+    tensors.
 
-Implementation status
----------------------
-Step 1c on the Thor branch wires the FlashInfer XQA kernel into
-``flash_rt_kernels`` on sm_110a. The XQA C-side dispatch is verified
-runnable on Thor (see ``dev_log_qwen36_thor/step1bc_thor_build_and_smoke.md``).
+Public surface
+--------------
+The frontend addresses this backend by attribute name (``K_cache``,
+``V_cache``, ``Q_buf``, ``O_buf``, ``lse_buf``, ``_num_sms``, ...)
+identical to the RTX backend, so the loader / KV-write helpers stay
+arch-agnostic. ``run('full', ...)`` is the K-row batched XQA entry
+(used by the K-row layer chain for prefill / verify chunks); the
+``_fa2_fwd_adapter`` callable mirrors the RTX backend's ``_fa2_fwd``
+ABI for callers that pass external K/V slabs (MTP attention, parent's
+per-position chunked-prefill fallback).
 
-What remains to wire here:
-  * Construction-time allocation of the FP8 paged K/V slabs (same
-    formulas as RTX's ``_fp8_setup_long_kv`` block).
-  * Per-token K/V quantize + page-write on the decode hot path.
-  * ``run("full", ...)`` that constructs the XQA arguments
-    (page_table, seq_lens, mask, semaphores, scratch) and calls
-    ``fvk.qwen36_flashinfer_xqa_bf16_fp8kv_spec`` directly.
-  * Adapter for prefill-chunk calls that today reach
-    ``self._attn._fa2_fwd_causal`` inside the RTX frontend (we either
-    re-route the matching frontend method or expose a thin
-    ``_xqa_fwd_causal`` shim with the same call signature).
-
-To keep the dev branch's smoke tests honest, the current ``run``
-method raises NotImplementedError; the kernel surface is in place,
-the integration of the four call sites is the focused next milestone.
-The frontend split (this file + :mod:`flash_rt.frontends.torch.qwen36_thor`)
-is in place so per-arch hardware contracts are obeyed.
+Capacity helpers
+----------------
+The Thor frontend calls ``ensure_kv_capacity(user_max_seq)`` and
+``ensure_fa2_paged_capacity(user_max_seq)`` at construction so the
+BF16 K/V cache, the internal FP8 paged cache, and the FA2 adapter
+scratch all cover the full configured ``max_seq``. Growing those
+buffers post-init (inside a captured graph in particular) would bake
+stale device pointers; pre-growing is mandatory.
 """
 
 from __future__ import annotations
