@@ -865,26 +865,25 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
             cat_buf.data_ptr(), rows, hidden, hidden, s,
         )
 
-        # 3) FC (BF16 matmul, K_in=2*hidden, N=hidden). ``bf16_matmul``
-        # at K=10240 is the generic chunked path (no K=10240 spec at
-        # csrc/kernels/bf16_matmul_qwen36.cu:472) — slow at M=127
-        # (117 ms measured) but bit-identical to the per-token
-        # ``bf16_matvec`` reduction. Alternatives tried:
-        #   * ``torch.mm`` (cuBLAS, 0.45 ms): cosine 1.0000 vs custom
-        #     kernel but bit-level rounding drops MTP AL 3.93 -> 3.20.
-        #   * Split fc_w along K dim into two contiguous (H, H) halves
-        #     and run two K=5120 spec GEMMs + sum (52 ms): K=5120
-        #     specialization plus separate FP32 partial-sum changes
-        #     the fma order vs the K=10240 generic chunked path, AL
-        #     drops 3.93 -> 3.50.
-        # MTP head is calibrated against the K=10240 generic chunked
-        # reduction. A faster AL-preserving fc would require either a
-        # new kernel that matches the K=10240 reduction at higher M,
-        # or recalibrating the MTP head against a different reduction
-        # — both out of scope for this ship. The custom kernel stays.
-        fvk.bf16_matmul_qwen36_bf16(
+        # 3) FC (BF16 matmul, K_in=2*hidden=10240, N=hidden=5120).
+        # Routed through the ``_mtp_tail_fc_matmul`` hook so that
+        # hardware-specific frontends can dispatch a sibling kernel
+        # that matches the per-output fma order of the shared
+        # K=10240 generic chunked path. Thor opts into an M-tile
+        # variant (160 KB dynamic smem) via the override on this
+        # class; any non-Thor / capability-insufficient device falls
+        # back to the shared kernel transparently.
+        #
+        # Numerically-divergent shortcuts that were ruled out here:
+        #   * cuBLAS ``torch.mm`` (0.45 ms) is fast but its rounding
+        #     drops MTP AL 3.93 -> 3.20.
+        #   * Splitting fc_w along K into two K=5120 halves and
+        #     summing partials changes the fma order vs the K=10240
+        #     reduction the MTP head was calibrated against and
+        #     drops AL 3.93 -> 3.50.
+        self._mtp_tail_fc_matmul(
             cat_buf.data_ptr(), int(mtp['fc_w']),
-            fc_out.data_ptr(), rows, hidden, hidden * 2, s,
+            fc_out.data_ptr(), rows, hidden, s,
         )
 
         # 4) input_norm.
