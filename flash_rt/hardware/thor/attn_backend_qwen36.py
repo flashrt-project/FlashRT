@@ -242,6 +242,27 @@ class ThorFlashAttnBackendQwen36:
 
         self._xqa_inited = True
 
+    def ensure_fa2_paged_capacity(self, max_seq_len: int) -> None:
+        """Pre-grow the ``_fa2_fp8_K`` / ``_fa2_fp8_V`` paged scratch
+        and ``_page_table`` to cover ``max_seq_len`` rows. Frontend
+        long-ctx generate should call this for ``user_max_seq`` before
+        any CUDA graph capture — growing inside a captured graph bakes
+        stale device pointers into the captured kernel call list and
+        causes ``illegal memory access`` on replay."""
+        self._ensure_xqa_paged()
+        page = self.XQA_TOKENS_PER_PAGE
+        target_pages = (int(max_seq_len) + page - 1) // page
+        if target_pages <= self._fa2_fp8_K.shape[0]:
+            return
+        torch = self._torch
+        self._fa2_fp8_K = torch.empty(
+            target_pages, page, self.NUM_KV_HEADS, self.HEAD_DIM,
+            dtype=torch.float8_e4m3fn, device="cuda")
+        self._fa2_fp8_V = torch.empty_like(self._fa2_fp8_K)
+        self._page_table = torch.arange(
+            target_pages, dtype=torch.int32, device="cuda"
+        ).view(1, target_pages)
+
     def _seq_lens_for(self, end_pos: int):
         t = self._seq_lens_cache.get(end_pos)
         if t is None:
@@ -403,19 +424,13 @@ class ThorFlashAttnBackendQwen36:
         # backend's own ``self._max_seq`` (which sized the per-layer
         # cache from ctor) — those slabs come from the frontend's TQ /
         # FP8-packed cache instead. Allocate enough pages for the
-        # largest seqlen_k we have seen.
-        torch = self._torch
+        # largest seqlen_k we have seen. ``ensure_fa2_paged_capacity``
+        # exists so callers (the frontend) can pre-grow before any
+        # graph capture; growing inside a captured graph would bake
+        # stale pointers.
         needed_pages = max_seq_len // page
         if self._fa2_fp8_K.shape[0] < needed_pages:
-            self._fa2_fp8_K = torch.empty(
-                needed_pages, page, self.NUM_KV_HEADS, self.HEAD_DIM,
-                dtype=torch.float8_e4m3fn, device="cuda")
-            self._fa2_fp8_V = torch.empty_like(self._fa2_fp8_K)
-            # The XQA page_table also needs to cover the new range —
-            # rebuild lazily for the larger size.
-            self._page_table = torch.arange(
-                needed_pages, dtype=torch.int32, device="cuda"
-            ).view(1, needed_pages)
+            self.ensure_fa2_paged_capacity(needed_pages * page)
 
         # Convert bf16 K/V at the caller's pointer into FP8 e4m3 in
         # the adapter's paged scratch. Read only the actually-populated

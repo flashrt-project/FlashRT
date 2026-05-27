@@ -125,6 +125,14 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         with _use_thor_attn_backend():
             super().__init__(*args, **kwargs)
         self._thor_alloc_K_row_scratch()
+        # Pre-grow Thor backend's ``_fa2_fp8_K`` paged scratch to the
+        # full user_max_seq so the chunked-prefill / verify / MTP-chain
+        # graph captures never reallocate this buffer mid-capture
+        # (which bakes stale device pointers into the captured kernel
+        # call list and triggers an illegal memory access on replay).
+        # Cost: max_seq * NUM_KV_HEADS * HEAD_DIM * 1 byte ~ a few tens
+        # of MB for typical max_seq.
+        self._attn.ensure_fa2_paged_capacity(int(self._user_max_seq))
 
     # ---------- Thor-native K-row scratch ----------
     #
@@ -543,6 +551,12 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         q_dst = self._attn.Q_buf[:, :K]
         if use_bf16_cache:
             # Short-ctx fast path: rotated K straight into K_cache.
+            # When ``_fp8_kv_verify_active`` is set (long-ctx generate
+            # where the first chunk happens to fit in BF16 cap), we
+            # still mirror to the persistent FP8 paged cache so the
+            # later chunks that exceed bf16_cap see initialised FP8
+            # positions when they read [0..cur_pos+K] via the staging
+            # buffer.
             k_dst = self._attn.K_cache[full_rank, cur_pos:cur_pos + K]
             fvk.qwen36_partial_rope_qk_bf16(
                 q_norm_out.data_ptr(), k_norm_out.data_ptr(),
@@ -555,6 +569,11 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
                     full_rank, cur_pos:cur_pos + K].data_ptr(),
                 v_new_K.data_ptr(), K * 4 * 256 * 2, s,
             )
+            if write_fp8:
+                self._fp8_write_kv(
+                    full_rank, cur_pos, cur_pos + K,
+                    k_dst.view(K, 4, 256), v_new_K.view(K, 4, 256),
+                )
             self._attn.run(
                 'full', layer_idx=full_rank, q_seq=K,
                 kv_seq=cur_pos + K, stream=s, softmax_scale=scaling,
