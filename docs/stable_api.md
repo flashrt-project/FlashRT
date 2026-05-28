@@ -152,7 +152,9 @@ class VLAModel:
   a previously unseen state-token length still pays one first-time bucket
   build/capture cost. Serving code should keep state serialization stable
   (fixed state dimension and numeric rounding/precision policy) and prewarm
-  representative states from the deployment range.
+  representative states from the deployment range, for example reset,
+  mid-rollout, near-goal, and a few recorded rollout observations whose
+  discretized values may tokenize to different lengths.
 
 - `recalibrate()` — clear FP8 calibration cache and force re-calibration
   on the next `predict()` call.

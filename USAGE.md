@@ -243,6 +243,27 @@ ad-hoc extra fields) and prewarm representative states from the deployment
 range. This avoids turning continuous state changes into an unbounded stream
 of one-off prompt lengths.
 
+Example bucket prewarm for states that may tokenize to different lengths:
+
+```python
+# Use realistic states from reset / mid-rollout / near-goal observations.
+# These examples deliberately include values with different digit counts after
+# discretization, which can land in different prompt-token buckets.
+state_bucket_samples = [
+    np.zeros(8, dtype=np.float32),
+    np.array([0.0, 0.1, -0.1, 0.25, -0.25, 0.5, -0.5, 1.0], dtype=np.float32),
+    np.array([-1.0, -0.75, -0.5, -0.25, 0.25, 0.5, 0.75, 1.0], dtype=np.float32),
+    np.asarray(first_rollout_obs["state"], dtype=np.float32),
+]
+
+warmed_lengths = model.warm_state_prompt_buckets(
+    images=[base_img, wrist_img],
+    prompt="pick up the red block",
+    states=state_bucket_samples,
+)
+print("prewarmed state prompt token lengths:", warmed_lengths)
+```
+
 ### Pi0.5 RTX full-FP16 opt-in path
 
 The default Pi0.5 RTX path remains FP8/BF16. For RTX 5090 / SM120 and
