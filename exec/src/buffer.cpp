@@ -37,8 +37,8 @@ int frt_buffer_copy(frt_ctx c, frt_buffer dst, size_t dst_off,
     if (!c || !dst || !src) return FRT_ERR_INVALID;
     if (dst_off + bytes > dst->bytes || src_off + bytes > src->bytes)
         return FRT_ERR_INVALID;
+    if (!c->has_stream(stream_id)) return FRT_ERR_INVALID;
     void* s = c->stream(stream_id);
-    if (!s) return FRT_ERR_INVALID;
     void* d = static_cast<char*>(dst->dptr) + dst_off;
     const void* sp = static_cast<const char*>(src->dptr) + src_off;
     return frt::be::memcpy_dtod_async(d, sp, bytes, s) ? FRT_OK : FRT_ERR_BACKEND;

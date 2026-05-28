@@ -4416,16 +4416,31 @@ class Qwen36TorchFrontendRtx:
                     # harmlessly overwritten by the next cycle's writes
                     # before any read (FA2 writes BEFORE reading at each
                     # q_seq=1 step).
-                    fvk.gpu_copy(
-                        self._lin_state.data_ptr(),
-                        self._K_lin_state_per_step[N].data_ptr(),
-                        self._lin_state.numel() * 2, s,
-                    )
-                    fvk.gpu_copy(
-                        self._lin_conv_state.data_ptr(),
-                        self._K_lin_conv_state_per_step[N].data_ptr(),
-                        self._lin_conv_state.numel() * 2, s,
-                    )
+                    if _use_exec:
+                        # Restore lin/conv state via the contract's device-copy
+                        # primitive (frt_buffer_copy) on the same stream. Source
+                        # is the N-th per-step save (offset into the contiguous
+                        # save tensor). Byte-equivalent to fvk.gpu_copy.
+                        sid = self._exec_stream_id(s)
+                        lin_n = self._lin_state.numel() * 2
+                        conv_n = self._lin_conv_state.numel() * 2
+                        self._exec_ctx.copy(
+                            self._exec_lin_buf, 0, self._exec_lin_save,
+                            N * lin_n, lin_n, sid)
+                        self._exec_ctx.copy(
+                            self._exec_conv_buf, 0, self._exec_conv_save,
+                            N * conv_n, conv_n, sid)
+                    else:
+                        fvk.gpu_copy(
+                            self._lin_state.data_ptr(),
+                            self._K_lin_state_per_step[N].data_ptr(),
+                            self._lin_state.numel() * 2, s,
+                        )
+                        fvk.gpu_copy(
+                            self._lin_conv_state.data_ptr(),
+                            self._K_lin_conv_state_per_step[N].data_ptr(),
+                            self._lin_conv_state.numel() * 2, s,
+                        )
                     h = self._K_last_hidden_buf[
                         :, N:N + 1, :].contiguous()
                     tok = argmax_at(N)
@@ -6980,6 +6995,30 @@ class Qwen36TorchFrontendRtx:
         self._exec_decode = self._exec_ctx.graph('qwen36_decode_s1', cap)
         self._exec_mtp_chain = self._exec_ctx.graph('qwen36_mtp_chain', cap)
         self._exec_verify = self._exec_ctx.graph('qwen36_verify', cap)
+        # Buffers for the spec-decode rollback (lin/conv state restore), so the
+        # restore can run through frt_buffer_copy — the contract's device-copy
+        # primitive — instead of fvk.gpu_copy. Wrapped once; per-step source is
+        # an offset into the contiguous per-step save tensor.
+        self._exec_lin_buf = self._exec_ctx.wrap(
+            'lin_state', self._lin_state.data_ptr(), self._lin_state.numel() * 2)
+        self._exec_conv_buf = self._exec_ctx.wrap(
+            'lin_conv_state', self._lin_conv_state.data_ptr(),
+            self._lin_conv_state.numel() * 2)
+        self._exec_lin_save = self._exec_ctx.wrap(
+            'lin_save', self._K_lin_state_per_step.data_ptr(),
+            self._K_lin_state_per_step.numel() * 2)
+        self._exec_conv_save = self._exec_ctx.wrap(
+            'conv_save', self._K_lin_conv_state_per_step.data_ptr(),
+            self._K_lin_conv_state_per_step.numel() * 2)
+        self._exec_stream_ids: dict = {}
+
+    def _exec_stream_id(self, cuda_stream_int: int) -> int:
+        """Wrap (and cache) an external torch stream handle as an frt stream_id."""
+        sid = self._exec_stream_ids.get(cuda_stream_int)
+        if sid is None:
+            sid = self._exec_ctx.wrap_stream(cuda_stream_int)
+            self._exec_stream_ids[cuda_stream_int] = sid
+        return sid
 
     @staticmethod
     def _exec_key(pos: int, k: int = 0) -> int:

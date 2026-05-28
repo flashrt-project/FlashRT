@@ -28,7 +28,7 @@ void frt_plan_destroy(frt_plan p) {
 
 int frt_plan_add(frt_plan p, frt_graph g, frt_shape_key key, int stream_id) {
     if (!p || !g) return FRT_ERR_INVALID;
-    if (!p->ctx->stream(stream_id)) return FRT_ERR_INVALID;
+    if (!p->ctx->has_stream(stream_id)) return FRT_ERR_INVALID;
     p->nodes.push_back(frt_plan_node{g, key, stream_id});
     return (int)p->nodes.size() - 1;
 }

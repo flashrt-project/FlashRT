@@ -84,10 +84,10 @@ int frt_graph_replay(frt_graph g, frt_shape_key key, int stream_id) {
     if (!g) return FRT_ERR_INVALID;
     auto it = g->variants.find(key);
     if (it == g->variants.end()) return FRT_ERR_NO_VARIANT;  // never a silent no-op
-    void* s = g->ctx->stream(stream_id);
-    if (!s) return FRT_ERR_INVALID;
+    if (!g->ctx->has_stream(stream_id)) return FRT_ERR_INVALID;
     g->touch(key);
-    return frt::be::graph_launch(it->second.exec, s) ? FRT_OK : FRT_ERR_BACKEND;
+    return frt::be::graph_launch(it->second.exec, g->ctx->stream(stream_id))
+           ? FRT_OK : FRT_ERR_BACKEND;
 }
 
 int frt_graph_has_variant(frt_graph g, frt_shape_key key) {

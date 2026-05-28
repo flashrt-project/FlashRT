@@ -43,7 +43,7 @@ int frt_ctx_stream(frt_ctx c, int priority) {
 }
 
 int frt_ctx_wrap_stream(frt_ctx c, void* external_stream) {
-    if (!c || !external_stream) return FRT_ERR_INVALID;
+    if (!c) return FRT_ERR_INVALID;  // external_stream==0 is the valid default stream
     c->streams.push_back(external_stream);
     c->stream_owned.push_back(0);  // non-owned; never destroyed by frt
     return (int)c->streams.size() - 1;
@@ -72,15 +72,13 @@ void frt_event_destroy(frt_event e) {
 }
 
 int frt_event_record(frt_event e, int stream_id) {
-    if (!e || !e->ctx) return FRT_ERR_INVALID;
-    void* s = e->ctx->stream(stream_id);
-    if (!s) return FRT_ERR_INVALID;
-    return frt::be::event_record(e->handle, s) ? FRT_OK : FRT_ERR_BACKEND;
+    if (!e || !e->ctx || !e->ctx->has_stream(stream_id)) return FRT_ERR_INVALID;
+    return frt::be::event_record(e->handle, e->ctx->stream(stream_id))
+           ? FRT_OK : FRT_ERR_BACKEND;
 }
 
 int frt_stream_wait(frt_ctx c, int stream_id, frt_event e) {
-    if (!c || !e) return FRT_ERR_INVALID;
-    void* s = c->stream(stream_id);
-    if (!s) return FRT_ERR_INVALID;
-    return frt::be::stream_wait_event(s, e->handle) ? FRT_OK : FRT_ERR_BACKEND;
+    if (!c || !e || !c->has_stream(stream_id)) return FRT_ERR_INVALID;
+    return frt::be::stream_wait_event(c->stream(stream_id), e->handle)
+           ? FRT_OK : FRT_ERR_BACKEND;
 }

@@ -62,8 +62,14 @@ struct frt_ctx_s {
     std::vector<frt_graph_s*> graphs;      // tracked for cleanup safety
     std::vector<frt_plan_s*>  plans;       // tracked for cleanup safety
 
+    bool has_stream(int id) const {
+        return id >= 0 && id < (int)streams.size();
+    }
+    // Returns the backend stream handle for id; may legitimately be null
+    // (handle 0 == the CUDA default stream). Validate the id with has_stream
+    // first — do NOT treat a null return as "invalid", since 0 is a real stream.
     void* stream(int id) const {
-        if (id < 0 || id >= (int)streams.size()) return nullptr;
+        if (!has_stream(id)) return nullptr;
         return streams[id];
     }
 };
