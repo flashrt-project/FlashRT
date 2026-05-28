@@ -51,13 +51,15 @@ def main():
     ap.add_argument("--num-views", type=int, default=3)
     ap.add_argument("--steps", type=int, default=10)
     ap.add_argument("--iters", type=int, default=30)
+    ap.add_argument("--fp8", action="store_true")
     args = ap.parse_args()
 
     images = _fixed_images(args.num_views)
+    print(f"precision={'fp8' if args.fp8 else 'fp16'}")
     model = flash_rt.load_model(
         args.checkpoint, framework="torch", config="pi05", hardware="auto",
         num_views=args.num_views, num_steps=args.steps, cache_frames=1,
-        use_fp8=False, use_fp16=True)
+        use_fp8=bool(args.fp8), use_fp16=not args.fp8)
     pipe = model._pipe
 
     _seed(); out0 = np.asarray(model.predict(images, prompt=PROMPT))  # builds graph

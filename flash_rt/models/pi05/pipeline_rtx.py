@@ -1834,6 +1834,26 @@ class Pi05Pipeline:
         self._cudart.cudaDeviceSynchronize()
         logger.info("Autotune complete")
 
+    # ── opt-in: route graph REPLAY through the FlashRT exec contract ──
+    # FLASHRT_PI05_USE_EXEC=1 drives the captured infer/decoder graphs' replay
+    # through the exec layer (adopt the ctypes CUDAGraph's instantiated exec,
+    # replay on the same wrapped stream) instead of ctypes CUDAGraph.replay().
+    # Used by the FP8/default Pi05 path. Default path is byte-identical.
+    def _exec_lazy_init(self) -> None:
+        if getattr(self, "_exec_inited", False):
+            return
+        self._exec_inited = True
+        import os
+        self._use_exec = os.environ.get(
+            "FLASHRT_PI05_USE_EXEC", "0") not in ("0", "", "false", "False")
+        if not self._use_exec:
+            return
+        from flash_rt.runtime import exec as _frt
+        self._exec_ctx = _frt.Ctx()
+        self._exec_gs_id = self._exec_ctx.wrap_stream(int(self._graph_stream.value))
+        self._exec_full = self._exec_ctx.graph("pi05_infer", 1)
+        self._exec_dec = self._exec_ctx.graph("pi05_decode_only", 1)
+
     def record_infer_graph(self, external_stream_int: int | None = None) -> None:
         """Capture the full pipeline as a CUDA Graph.
 
@@ -1882,6 +1902,9 @@ class Pi05Pipeline:
         self._graph.end_capture(stream_handle)
         self._cudart.cudaStreamSynchronize(stream_handle)
         logger.info("CUDA Graph captured for Pi05Pipeline")
+        self._exec_lazy_init()
+        if getattr(self, "_use_exec", False):
+            self._exec_full.adopt(0, self._graph._graph_exec.value)
 
         # Also capture a decoder-only graph for temporal K/V caching.
         # This graph skips vision_encoder + transformer_encoder and runs only
@@ -1896,6 +1919,8 @@ class Pi05Pipeline:
         self._decoder_only_graph.end_capture(stream_handle)
         self._cudart.cudaStreamSynchronize(stream_handle)
         logger.info("CUDA Graph captured for Pi05Pipeline (decoder-only)")
+        if getattr(self, "_use_exec", False):
+            self._exec_dec.adopt(0, self._decoder_only_graph._graph_exec.value)
 
     # ══════════════════════════════════════════════════════════════════
     #   Public API
@@ -1980,7 +2005,12 @@ class Pi05Pipeline:
         Returns the device pointer of that buffer for the frontend to read.
         """
         if self._graph is not None:
-            self._graph.replay(self._graph_stream)
+            if getattr(self, "_use_exec", False):
+                rc = self._exec_full.replay(0, self._exec_gs_id)
+                if rc != 0:
+                    raise RuntimeError(f"frt pi05 infer replay rc={rc}")
+            else:
+                self._graph.replay(self._graph_stream)
             self._cudart.cudaStreamSynchronize(self._graph_stream)
         else:
             self.run_pipeline(stream=0)
@@ -1998,7 +2028,12 @@ class Pi05Pipeline:
         Returns the device pointer of ``diffusion_noise`` (final actions).
         """
         if hasattr(self, "_decoder_only_graph") and self._decoder_only_graph is not None:
-            self._decoder_only_graph.replay(self._graph_stream)
+            if getattr(self, "_use_exec", False):
+                rc = self._exec_dec.replay(0, self._exec_gs_id)
+                if rc != 0:
+                    raise RuntimeError(f"frt pi05 decode-only replay rc={rc}")
+            else:
+                self._decoder_only_graph.replay(self._graph_stream)
             self._cudart.cudaStreamSynchronize(self._graph_stream)
         else:
             self.transformer_decoder(stream=0)
