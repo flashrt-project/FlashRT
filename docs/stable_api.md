@@ -148,6 +148,11 @@ class VLAModel:
   representative robot state. The return value is the sorted list of
   warmed prompt lengths. The method preserves the OpenPI state prompt
   text format; it does not zero-pad or otherwise rewrite state tokens.
+  A recurring prompt token length reuses its cached runtime pipeline, but
+  a previously unseen state-token length still pays one first-time bucket
+  build/capture cost. Serving code should keep state serialization stable
+  (fixed state dimension and numeric rounding/precision policy) and prewarm
+  representative states from the deployment range.
 
 - `recalibrate()` — clear FP8 calibration cache and force re-calibration
   on the next `predict()` call.

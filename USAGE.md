@@ -235,6 +235,14 @@ model still sees the same prompt distribution as OpenPI. For best results,
 use several states sampled from the deployment domain or from the first
 few rollout frames.
 
+Serving note: FlashRT reuses the cached pipeline for recurring prompt token
+lengths. A previously unseen state-token length still needs one first-time
+bucket build and graph capture. In production, keep state serialization
+stable (same state dimension, same numeric precision/rounding policy, no
+ad-hoc extra fields) and prewarm representative states from the deployment
+range. This avoids turning continuous state changes into an unbounded stream
+of one-off prompt lengths.
+
 ### Pi0.5 RTX full-FP16 opt-in path
 
 The default Pi0.5 RTX path remains FP8/BF16. For RTX 5090 / SM120 and
