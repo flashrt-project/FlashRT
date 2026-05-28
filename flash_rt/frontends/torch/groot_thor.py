@@ -738,7 +738,7 @@ class GrootTorchFrontendThor:
             state = torch.from_numpy(state).to(torch.float32).cuda()
         elif not isinstance(state, torch.Tensor):
             state = torch.as_tensor(state, dtype=torch.float32, device='cuda')
-        state_fp16 = state.to(fp16).contiguous()
+        state_fp16 = state.to(device='cuda', dtype=fp16).contiguous()
         if state_fp16.dim() == 1:
             state_fp16 = state_fp16.unsqueeze(0)
         h = torch.empty(1, 1024, dtype=fp16, device='cuda')
