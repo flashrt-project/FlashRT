@@ -4324,11 +4324,23 @@ class Qwen36TorchFrontendRtx:
                 # calls + 2(K-1) inter-step copy_ launches.
                 gs = self._graph_stream
                 cg = self._ensure_mtp_chain_graph_nvfp4(cur_pos, K)
+                self._exec_lazy_init()
+                _use_exec = getattr(self, '_use_exec', False)
                 gs.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(gs):
                     self._mtp_static_prev_h.copy_(h)
                     self._mtp_static_prev_token.copy_(tok)
-                    cg.replay()
+                    if not _use_exec:
+                        cg.replay()
+                if _use_exec:
+                    # Copies above are queued on gs; frt launches on gs too
+                    # (same stream → ordered after them).
+                    self._exec_mtp_chain.adopt(
+                        self._exec_key(cur_pos, K), cg.raw_cuda_graph_exec())
+                    rc = self._exec_mtp_chain.replay(
+                        self._exec_key(cur_pos, K), self._exec_gs_id)
+                    if rc != 0:
+                        raise RuntimeError(f'frt mtp_chain replay rc={rc}')
                 torch.cuda.current_stream().wait_stream(gs)
                 # drafts now sit in _chain_drafts_buf[:K] as (K, 1) long.
                 drafts_t = self._chain_drafts_buf[:K]  # (K, 1)
@@ -4354,8 +4366,16 @@ class Qwen36TorchFrontendRtx:
                 self._verify_static_sin[:, :Kv].copy_(sin_KN)
                 vg = self._ensure_verify_graph_nvfp4(cur_pos, Kv)
                 gs.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(gs):
-                    vg.replay()
+                if _use_exec:
+                    self._exec_verify.adopt(
+                        self._exec_key(cur_pos, Kv), vg.raw_cuda_graph_exec())
+                    rc = self._exec_verify.replay(
+                        self._exec_key(cur_pos, Kv), self._exec_gs_id)
+                    if rc != 0:
+                        raise RuntimeError(f'frt verify replay rc={rc}')
+                else:
+                    with torch.cuda.stream(gs):
+                        vg.replay()
                 torch.cuda.current_stream().wait_stream(gs)
                 logits_KN = self._K_logits_buf[:Kv]
 
@@ -6958,6 +6978,13 @@ class Qwen36TorchFrontendRtx:
             self._graph_stream.cuda_stream)
         cap = self.GRAPH_CACHE_MAX if self.GRAPH_CACHE_MAX > 0 else 0
         self._exec_decode = self._exec_ctx.graph('qwen36_decode_s1', cap)
+        self._exec_mtp_chain = self._exec_ctx.graph('qwen36_mtp_chain', cap)
+        self._exec_verify = self._exec_ctx.graph('qwen36_verify', cap)
+
+    @staticmethod
+    def _exec_key(pos: int, k: int = 0) -> int:
+        """Encode a (pos, k) graph key into the exec layer's u64 ShapeKey."""
+        return ((int(pos) & 0xFFFFFFFF) << 8) | (int(k) & 0xFF)
 
     def _replay_pos_graph(self, g, cur_pos: int) -> None:
         """Replay the decode-S=1 graph for cur_pos with the gs choreography.
