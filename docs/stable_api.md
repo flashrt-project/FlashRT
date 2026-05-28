@@ -128,9 +128,11 @@ class VLAModel:
   `state` is part of the VLA observation schema; each model encodes it through
   its own reference contract:
   - Pi0 uses a continuous state token in the action-expert suffix.
-  - Pi0.5's openpi reference encodes state as discretized prompt tokens. The
-    current FlashRT Pi0.5 frontend still tokenizes prompts without that state
-    argument, so this is the remaining Pi0.5 API gap.
+  - Pi0.5 encodes state as openpi-compatible discretized prompt tokens:
+    `Task: <prompt>, State: <0..255 bins>;\nAction: `. RTX/Thor torch
+    frontends accept `state` in `set_prompt()` and through `predict()`.
+    Same-length state prompt updates reuse the captured graph; recurring
+    RTX prompt lengths reuse the cached pipeline instead of rebuilding.
   - Pi0-FAST encodes state in the FAST token prefix.
   - GROOT N1.6 consumes proprioceptive state from `obs["state"]`; if omitted,
     the backend uses zeros.

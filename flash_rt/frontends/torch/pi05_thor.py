@@ -39,6 +39,7 @@ import torch.nn.functional as F
 import flash_rt.flash_rt_kernels as fvk
 from flash_rt.core.cuda_buffer import CudaBuffer
 from flash_rt.core.utils.actions import unnormalize_actions, LIBERO_ACTION_DIM
+from flash_rt.core.utils.pi05_prompt import PI05_STATE_PROMPT_MAX_LEN
 from flash_rt.core.quant.calibrator import load_calibration, save_calibration
 
 logger = logging.getLogger(__name__)
@@ -889,7 +890,7 @@ class Pi05TorchFrontendThor:
                 self._cfg_pipeline.cfg_beta)
         return {"actions": robot_actions}
 
-    def set_prompt(self, prompt_text):
+    def set_prompt(self, prompt_text, state=None):
         """Tokenize prompt, compute time conditioning, calibrate scales, capture graphs.
 
         When :meth:`set_rl_mode` has activated CFG inference and the
@@ -903,6 +904,9 @@ class Pi05TorchFrontendThor:
         if (self._rl_config is not None
                 and not getattr(self, "_in_rl_set_prompt", False)
                 and isinstance(prompt_text, str)):
+            if state is not None:
+                raise ValueError(
+                    "Pi0.5 RL CFG mode does not support state-in-prompt yet")
             self._in_rl_set_prompt = True
             try:
                 self._set_prompt_rl(prompt_text)
@@ -921,12 +925,28 @@ class Pi05TorchFrontendThor:
                 torch.from_numpy(token_ids).long().cuda(), self.embedding_weight)
             embeds = embeds * float(embeds.shape[-1] ** 0.5)
         else:
-            embeds, prompt_len = embed_prompt(prompt_text, self.embedding_weight, max_len=48)
+            max_len = PI05_STATE_PROMPT_MAX_LEN if state is not None else 48
+            embeds, prompt_len = embed_prompt(
+                prompt_text, self.embedding_weight, max_len=max_len,
+                state=state)
 
         # Se must be EVEN for cuBLASLt FP8
         Se = S_sig + prompt_len
         if Se % 2 != 0:
             Se += 1
+        actual_lang = Se - S_sig
+        if actual_lang > prompt_len:
+            embeds = torch.cat([embeds, embeds[-1:]], dim=0)
+
+        if (self.graph_captured and self._lang_emb is not None
+                and self._S_lang == actual_lang and self.Se == Se):
+            self._lang_emb.copy_(embeds)
+            logger.info(
+                "Updated Pi0.5 Thor prompt in place: '%s' "
+                "(%d tokens, Se=%d, state=%s)",
+                prompt_text, prompt_len, Se, state is not None)
+            return
+
         self.Se = Se
         self.total_keys = Se + self.Sa
 
@@ -970,9 +990,6 @@ class Pi05TorchFrontendThor:
             },
         )
 
-        actual_lang = Se - S_sig
-        if actual_lang > prompt_len:
-            embeds = torch.cat([embeds, embeds[-1:]], dim=0)
         self._lang_emb = embeds
         self._S_lang = actual_lang
 

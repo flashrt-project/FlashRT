@@ -49,6 +49,7 @@ from flash_rt.hardware.rtx.attn_backend_batched_pi05 import (
     RtxFlashAttnBatchedBackendPi05,
 )
 from flash_rt.core.utils.hardware import supports_fp8
+from flash_rt.core.utils.pi05_prompt import PI05_STATE_PROMPT_MAX_LEN, format_pi05_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -294,7 +295,7 @@ def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict
 
 
 def _embed_prompt(prompt_text: str, embedding_weight: torch.Tensor,
-                  max_len: int = 48) -> tuple[torch.Tensor, int]:
+                  max_len: int = 48, state=None) -> tuple[torch.Tensor, int]:
     """Tokenise + embed via PaliGemma embedding table (CUDA, bf16)."""
     # PaliGemma tokenizer resolution — see
     # `flash_rt.utils.paligemma_tokenizer` for the search order and
@@ -304,7 +305,7 @@ def _embed_prompt(prompt_text: str, embedding_weight: torch.Tensor,
         # same prompt prefix logic FlashRT was built against).
         from openpi.models.tokenizer import PaligemmaTokenizer
         tokenizer = PaligemmaTokenizer(max_len=max_len)
-        tokens_np, mask_np = tokenizer.tokenize(prompt_text)
+        tokens_np, mask_np = tokenizer.tokenize(prompt_text, state=state)
         prompt_len = int(mask_np.sum())
         token_ids = torch.tensor(
             tokens_np[:prompt_len], dtype=torch.long, device="cuda")
@@ -316,9 +317,13 @@ def _embed_prompt(prompt_text: str, embedding_weight: torch.Tensor,
             load_paligemma_sentencepiece,
         )
         sp = load_paligemma_sentencepiece()
-        # 108 is PaliGemma's `\n` token, used by openpi as the
-        # prompt-end separator before the action prefix.
-        tokens = [sp.bos_id()] + sp.Encode(prompt_text) + [108]
+        if state is None:
+            # 108 is PaliGemma's `\n` token, used by openpi as the
+            # prompt-end separator before the action prefix.
+            tokens = [sp.bos_id()] + sp.Encode(prompt_text) + [108]
+        else:
+            tokens = sp.Encode(format_pi05_prompt(prompt_text, state),
+                               add_bos=True)
         token_ids = torch.tensor(tokens, dtype=torch.long, device="cuda")
         prompt_len = len(token_ids)
 
@@ -511,6 +516,7 @@ class Pi05TorchFrontendRtx:
         self.graph_recorded = False
         self.current_prompt_len = 0
         self.pipeline: Optional[Pi05Pipeline] = None
+        self._prompt_pipeline_cache: dict[int, Pi05Pipeline] = {}
         # RL inference configuration. ``None`` = default behaviour (single
         # forward, no advantage-conditioned prompt injection). When set
         # by :meth:`set_rl_mode`, the next :meth:`set_prompt` call builds
@@ -620,6 +626,25 @@ class Pi05TorchFrontendRtx:
         logger.info(
             "Pi05TorchFrontendRtx initialised (num_views=%d, chunk=%d, fp8_layout=%s)",
             self.num_views, self.chunk_size, self.fp8_layout)
+
+    def _ensure_prompt_capacity(self, required_prompt_len: int) -> None:
+        """Grow RTX attention buffers before building longer prompt pipelines."""
+        if required_prompt_len <= self.max_prompt_len:
+            return
+        self.max_prompt_len = int(required_prompt_len)
+        enc_seq_max = self.num_views * 256 + self.max_prompt_len
+        self.attn_backend = RtxFlashAttnBackend(
+            num_views=self.num_views,
+            encoder_seq_max=enc_seq_max,
+            chunk_size=self.chunk_size,
+            num_encoder_layers=ENC_L)
+        self._prompt_pipeline_cache.clear()
+        self.pipeline = None
+        self.current_prompt_len = 0
+        self.graph_recorded = False
+        self.calibrated = False
+        logger.info("Grew Pi0.5 RTX prompt capacity to %d tokens",
+                    self.max_prompt_len)
 
     def _pipeline_precision_kwargs(self) -> dict:
         if self._force_int8_decoder or getattr(self, "_int8_encoder_only", False):
@@ -960,7 +985,7 @@ class Pi05TorchFrontendRtx:
             "RL mode enabled: cfg_beta=%.2f, advantage_positive=%s",
             new_config["cfg_beta"], new_config["advantage_positive"])
 
-    def set_prompt(self, prompt_text: str) -> None:
+    def set_prompt(self, prompt_text: str, state=None) -> None:
         """Tokenise prompt + (re)build the pipeline for the exact prompt length.
 
         When RL mode is enabled (see :meth:`set_rl_mode`), this also
@@ -968,42 +993,65 @@ class Pi05TorchFrontendRtx:
         the CFG-aware pipeline.
         """
         if self._rl_config is not None:
+            if state is not None:
+                raise ValueError(
+                    "Pi0.5 RL CFG mode does not support state-in-prompt yet")
             self._set_prompt_rl(prompt_text)
             return
 
+        max_len = (PI05_STATE_PROMPT_MAX_LEN if state is not None
+                   else MAX_PROMPT_LEN_DEFAULT)
         embeds, prompt_len = _embed_prompt(
-            prompt_text, self.embedding_weight, max_len=MAX_PROMPT_LEN_DEFAULT)
+            prompt_text, self.embedding_weight, max_len=max_len, state=state)
+        required_capacity = (PI05_STATE_PROMPT_MAX_LEN if state is not None
+                             else prompt_len)
+        self._ensure_prompt_capacity(required_capacity)
 
         if self.pipeline is None or prompt_len != self.current_prompt_len:
-            logger.info("Building Pi05Pipeline for prompt_len=%d...", prompt_len)
-            # Rebuild the pipeline with the exact prompt length to avoid
-            # wasted compute on padding tokens.
+            cached = self._prompt_pipeline_cache.get(prompt_len)
             self.current_prompt_len = prompt_len
-            self.graph_recorded = False
-            self.calibrated = False
+            if cached is not None:
+                self.pipeline = cached
+                self.graph_recorded = getattr(cached, "_graph", None) is not None
+                self.calibrated = (
+                    self.graph_recorded
+                    or bool(getattr(cached, "fp8_calibrated", False)))
+                logger.info("Reusing cached Pi05Pipeline for prompt_len=%d",
+                            prompt_len)
+            else:
+                logger.info("Building Pi05Pipeline for prompt_len=%d...",
+                            prompt_len)
+                # Rebuild the pipeline with the exact prompt length to avoid
+                # wasted compute on padding tokens. The instance is cached so
+                # Pi0.5 discrete-state prompt lengths do not repeatedly pay
+                # build/autotune/capture when they recur.
+                self.graph_recorded = False
+                self.calibrated = False
 
-            pipeline_weights = self._build_pipeline_weights()
-            self.pipeline = Pi05Pipeline(
-                gemm=self.gemm, fvk=self.fvk, attn_backend=self.attn_backend,
-                weights=pipeline_weights,
-                num_views=self.num_views,
-                max_prompt_len=prompt_len,
-                chunk_size=self.chunk_size,
-                num_steps=self._num_steps,
-                vision_pool_factor=self._vision_pool_factor,
-                vision_num_layers=self._vision_num_layers,
-                **self._pipeline_precision_kwargs())
-            # Static INT8 vision scales are per-pipeline-instance.
-            # Reset so calibrate_single_frame collects fresh scales.
-            if self.pipeline.use_int8_vision_static:
-                self.pipeline.vis_int8_static_calibrated = False
-                self.pipeline.vis_int8_static_scales = {}
+                pipeline_weights = self._build_pipeline_weights()
+                self.pipeline = Pi05Pipeline(
+                    gemm=self.gemm, fvk=self.fvk, attn_backend=self.attn_backend,
+                    weights=pipeline_weights,
+                    num_views=self.num_views,
+                    max_prompt_len=prompt_len,
+                    chunk_size=self.chunk_size,
+                    num_steps=self._num_steps,
+                    vision_pool_factor=self._vision_pool_factor,
+                    vision_num_layers=self._vision_num_layers,
+                    **self._pipeline_precision_kwargs())
+                self._prompt_pipeline_cache[prompt_len] = self.pipeline
+                # Static INT8 vision scales are per-pipeline-instance.
+                # Reset so calibrate_single_frame collects fresh scales.
+                if self.pipeline.use_int8_vision_static:
+                    self.pipeline.vis_int8_static_calibrated = False
+                    self.pipeline.vis_int8_static_scales = {}
 
         # Upload language embeds into pipeline's encoder_x slot
         embeds_np = embeds.contiguous().view(torch.uint16).cpu().numpy()
         self.pipeline.set_language_embeds(embeds_np)
         self._frame_count = 0
-        logger.info("Set prompt: '%s' (%d tokens)", prompt_text, prompt_len)
+        logger.info("Set prompt: '%s' (%d tokens, state=%s)",
+                    prompt_text, prompt_len, state is not None)
 
     def _set_prompt_rl(self, prompt_text: str) -> None:
         """RL-mode set_prompt: build conditioned + unconditioned embeddings.

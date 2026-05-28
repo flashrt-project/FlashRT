@@ -303,7 +303,11 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         import numpy as np
         for b, e in enumerate(embeds_np_list):
             arr = np.ascontiguousarray(e)
-            self._lang_embeds_buf_b2[b] = CudaBuffer.from_numpy(arr)
+            old = self._lang_embeds_buf_b2[b]
+            if old is not None and old.nbytes == arr.nbytes:
+                old.upload(arr)
+            else:
+                self._lang_embeds_buf_b2[b] = CudaBuffer.from_numpy(arr)
         self._current_prompt_len_b2 = prompt_len
         # Reuse the parent's decoder-RoPE setup for this prompt length.
         self._set_decoder_rope_for_prompt(prompt_len)

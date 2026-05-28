@@ -19,6 +19,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from flash_rt.core.utils.pi05_prompt import format_pi05_prompt
+
 
 # Resolved once at import time; all Thor frontends use the same FP8 dtype.
 _FP8 = torch.float8_e4m3fn
@@ -85,7 +87,8 @@ def _tokenize_sentencepiece(prompt_text: str):
     return [sp.bos_id()] + sp.Encode(prompt_text) + [108]
 
 
-def embed_prompt_torch(prompt_text, embedding_weight, max_len: int = 48):
+def embed_prompt_torch(prompt_text, embedding_weight, max_len: int = 48,
+                       state=None):
     """Torch-side tokenize + embed.
 
     Tries openpi's PaligemmaTokenizer first (matches training exactly);
@@ -98,12 +101,20 @@ def embed_prompt_torch(prompt_text, embedding_weight, max_len: int = 48):
     try:
         from openpi.models.tokenizer import PaligemmaTokenizer
         tokenizer = PaligemmaTokenizer(max_len=max_len)
-        tokens_np, mask_np = tokenizer.tokenize(prompt_text)
+        tokens_np, mask_np = tokenizer.tokenize(prompt_text, state=state)
         prompt_len = int(mask_np.sum())
         token_ids = torch.tensor(
             tokens_np[:prompt_len], dtype=torch.long, device='cuda')
     except (ImportError, FileNotFoundError, OSError, RuntimeError):
-        tokens = _tokenize_sentencepiece(prompt_text)
+        if state is None:
+            tokens = _tokenize_sentencepiece(prompt_text)
+        else:
+            from flash_rt.utils.paligemma_tokenizer import (
+                load_paligemma_sentencepiece,
+            )
+            sp = load_paligemma_sentencepiece()
+            tokens = sp.Encode(format_pi05_prompt(prompt_text, state),
+                               add_bos=True)
         token_ids = torch.tensor(tokens, dtype=torch.long, device='cuda')
         prompt_len = len(token_ids)
 

@@ -191,8 +191,17 @@ class Pi05CFGPipeline(Pi05Pipeline):
         cond_padded = self._pad_prompt(cond_embeds_np, target_len)
         uncond_padded = self._pad_prompt(uncond_embeds_np, target_len)
 
-        self._lang_embeds_buf_cond = CudaBuffer.from_numpy(cond_padded)
-        self._lang_embeds_buf_uncond = CudaBuffer.from_numpy(uncond_padded)
+        if (self._lang_embeds_buf_cond is not None
+                and self._lang_embeds_buf_cond.nbytes == cond_padded.nbytes):
+            self._lang_embeds_buf_cond.upload(cond_padded)
+        else:
+            self._lang_embeds_buf_cond = CudaBuffer.from_numpy(cond_padded)
+        if (self._lang_embeds_buf_uncond is not None
+                and self._lang_embeds_buf_uncond.nbytes
+                == uncond_padded.nbytes):
+            self._lang_embeds_buf_uncond.upload(uncond_padded)
+        else:
+            self._lang_embeds_buf_uncond = CudaBuffer.from_numpy(uncond_padded)
         self._cfg_prompt_len = target_len
 
         # Reuse the parent's RoPE setup for the padded length so the
