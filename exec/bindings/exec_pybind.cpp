@@ -58,6 +58,10 @@ PYBIND11_MODULE(_flashrt_exec, m) {
         .def("capture", [](PyGraph& g, std::uint64_t key, py::function record) {
             check(frt_graph_capture(g.h, key, &py_record_trampoline, &record), "graph_capture");
         }, py::arg("key"), py::arg("record"))
+        .def("adopt", [](PyGraph& g, std::uint64_t key, std::uintptr_t graph_exec) {
+            check(frt_graph_adopt(g.h, key, reinterpret_cast<void*>(graph_exec)), "graph_adopt");
+        }, py::arg("key"), py::arg("graph_exec"),
+           "Register an external graph-exec (e.g. torch CUDAGraph.raw_cuda_graph_exec()).")
         .def("bind", [](PyGraph& g, const std::string& port, PyBuffer& b) {
             check(frt_graph_bind(g.h, port.c_str(), b.h), "graph_bind");
         })
@@ -78,6 +82,10 @@ PYBIND11_MODULE(_flashrt_exec, m) {
     py::class_<PyCtx>(m, "Ctx")
         .def(py::init<>())
         .def("stream", [](PyCtx& c, int priority) { int id = frt_ctx_stream(c.h, priority); check(id, "ctx_stream"); return id; }, py::arg("priority") = 0)
+        .def("wrap_stream", [](PyCtx& c, std::uintptr_t external_stream) {
+            int id = frt_ctx_wrap_stream(c.h, reinterpret_cast<void*>(external_stream));
+            check(id, "ctx_wrap_stream"); return id;
+        }, py::arg("external_stream"), "Wrap an external stream (e.g. torch stream cuda handle) as a stream_id.")
         .def("event", [](PyCtx& c) { PyEvent e; e.h = frt_ctx_event(c.h); if (!e.h) throw std::runtime_error("ctx_event failed"); return e; })
         .def("stream_wait", [](PyCtx& c, int stream_id, PyEvent& e) { check(frt_stream_wait(c.h, stream_id, e.h), "stream_wait"); })
         .def("buffer", [](PyCtx& c, const std::string& name, size_t nbytes) {

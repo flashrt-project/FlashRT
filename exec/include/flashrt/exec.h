@@ -73,6 +73,12 @@ void    frt_ctx_destroy(frt_ctx);
  * priority is host policy. */
 int frt_ctx_stream(frt_ctx, int priority);
 
+/* Wrap an externally-owned stream (e.g. a torch stream's cuda handle) as a
+ * stream_id usable by replay/plan. Non-owned: frt never destroys it. Lets the
+ * exec layer replay onto the SAME stream the host framework already uses, so
+ * existing stream choreography (wait_stream, etc.) is preserved. */
+int frt_ctx_wrap_stream(frt_ctx, void* external_stream);
+
 /* Events: the hardware sync primitive for IMPERATIVE cross-stream ordering,
  * used directly by the host (not only inside a Plan). This is what lets a
  * robot host express "make the action stream wait for the ASR stream's last
@@ -123,6 +129,15 @@ void      frt_graph_destroy(frt_graph);
  * replaces that variant. */
 int frt_graph_capture(frt_graph, frt_shape_key key,
                       void (*record)(void* user, void* stream), void* user);
+
+/* Adopt an externally-owned, already-instantiated graph-exec (e.g. from
+ * torch.cuda.CUDAGraph.raw_cuda_graph_exec()). frt registers it under `key`
+ * and drives replay, but does NOT own it: LRU eviction and frt_graph_destroy
+ * never free an adopted exec — the external owner does. This is the
+ * torch-friendly path: capture + allocator handling stay in the framework
+ * that owns the graph, while the exec layer owns the variant table + replay.
+ * Re-adopting/re-capturing an existing key replaces that variant. */
+int frt_graph_adopt(frt_graph, frt_shape_key key, void* external_graph_exec);
 
 /* Bind a named I/O port to a buffer. Two graphs sharing one buffer on
  * matching ports = zero-copy hand-off (this is the entire multi-subgraph /
