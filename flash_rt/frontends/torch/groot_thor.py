@@ -726,13 +726,31 @@ class GrootTorchFrontendThor:
         return h.unsqueeze(0)  # [1, 1, D_dit]
 
     def _copy_state_feature_to_dit(self, state):
-        """Encode current robot state into the captured DiT input buffer."""
+        """Encode current robot state into the captured DiT input buffer.
+
+        Uses the DiT head's own state encoder (``self._g_dit.se_w1/se_w2``) —
+        the same path the capture-time encode in ``_capture_all_graphs`` takes.
+        (``self._state_encode`` relies on ``_state_enc_w1``, which is only
+        populated by the unused single-graph ``_load_embodiment_weights`` path
+        and is absent on this g_dit pipeline.)
+        """
         if isinstance(state, np.ndarray):
             state = torch.from_numpy(state).to(torch.float32).cuda()
         elif not isinstance(state, torch.Tensor):
             state = torch.as_tensor(state, dtype=torch.float32, device='cuda')
-        state_feat = self._state_encode(state).squeeze(0)
-        self._g_dit.b_state_feat.copy_(state_feat)
+        state_fp16 = state.to(fp16).contiguous()
+        if state_fp16.dim() == 1:
+            state_fp16 = state_fp16.unsqueeze(0)
+        h = torch.empty(1, 1024, dtype=fp16, device='cuda')
+        self._g_dit.gemm.fp16_nn(state_fp16.data_ptr(), self._g_dit.se_w1.data_ptr(),
+                                 h.data_ptr(), 1, 1024, self.state_dim, 0)
+        fvk.add_bias_fp16(h.data_ptr(), self._g_dit.se_b1.data_ptr(), 1, 1024, 0)
+        fvk.relu_inplace_fp16(h.data_ptr(), 1024, 0)
+        sf = torch.empty(1, self.D_dit, dtype=fp16, device='cuda')
+        self._g_dit.gemm.fp16_nn(h.data_ptr(), self._g_dit.se_w2.data_ptr(),
+                                 sf.data_ptr(), 1, self.D_dit, 1024, 0)
+        fvk.add_bias_fp16(sf.data_ptr(), self._g_dit.se_b2.data_ptr(), 1, self.D_dit, 0)
+        self._g_dit.b_state_feat.copy_(sf)
 
     def _action_encode(self, actions, t_disc, action_horizon):
         """[1, T, action_dim] + timestep → [1, T, D_dit]."""
