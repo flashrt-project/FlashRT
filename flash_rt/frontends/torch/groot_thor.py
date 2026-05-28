@@ -1877,24 +1877,10 @@ class GrootTorchFrontendThor:
         self._g_dit.precompute_cross_kv()
         torch.cuda.synchronize()
 
-        # State encode → b_state_feat
-        state = obs.get('state', np.zeros(self.state_dim, dtype=np.float32))
-        if isinstance(state, np.ndarray):
-            state = torch.from_numpy(state).to(torch.float32).cuda()
-        state_fp16 = state.to(fp16).contiguous()
-        if state_fp16.dim() == 1:
-            state_fp16 = state_fp16.unsqueeze(0)
-        h = torch.empty(1, 1024, dtype=fp16, device='cuda')
-        self._g_dit.gemm.fp16_nn(state_fp16.data_ptr(), self._g_dit.se_w1.data_ptr(),
-                                  h.data_ptr(), 1, 1024, self.state_dim, 0)
-        fvk.add_bias_fp16(h.data_ptr(), self._g_dit.se_b1.data_ptr(), 1, 1024, 0)
-        fvk.relu_inplace_fp16(h.data_ptr(), 1024, 0)
-        sf = torch.empty(1, self.D_dit, dtype=fp16, device='cuda')
-        self._g_dit.gemm.fp16_nn(h.data_ptr(), self._g_dit.se_w2.data_ptr(),
-                                  sf.data_ptr(), 1, self.D_dit, 1024, 0)
-        fvk.add_bias_fp16(sf.data_ptr(), self._g_dit.se_b2.data_ptr(), 1, self.D_dit, 0)
+        # State encode → b_state_feat (shared helper, see _copy_state_feature_to_dit)
+        self._copy_state_feature_to_dit(
+            obs.get('state', np.zeros(self.state_dim, dtype=np.float32)))
         torch.cuda.synchronize()
-        self._g_dit.b_state_feat.copy_(sf)
 
         amax = self._collect_dit_amax()
         return np.asarray(amax, dtype=np.float32)
@@ -2167,24 +2153,10 @@ class GrootTorchFrontendThor:
         # Calibrate DiT activation scales (needs precomputed KV)
         self._calibrate_dit()
 
-        # State encode (outside graph)
-        state = obs.get('state', np.zeros(self.state_dim, dtype=np.float32))
-        if isinstance(state, np.ndarray):
-            state = torch.from_numpy(state).to(torch.float32).cuda()
-        state_fp16 = state.to(fp16).contiguous()
-        if state_fp16.dim() == 1:
-            state_fp16 = state_fp16.unsqueeze(0)
-        h = torch.empty(1, 1024, dtype=fp16, device='cuda')
-        self._g_dit.gemm.fp16_nn(state_fp16.data_ptr(), self._g_dit.se_w1.data_ptr(),
-                                  h.data_ptr(), 1, 1024, self.state_dim, 0)
-        fvk.add_bias_fp16(h.data_ptr(), self._g_dit.se_b1.data_ptr(), 1, 1024, 0)
-        fvk.relu_inplace_fp16(h.data_ptr(), 1024, 0)
-        sf = torch.empty(1, self.D_dit, dtype=fp16, device='cuda')
-        self._g_dit.gemm.fp16_nn(h.data_ptr(), self._g_dit.se_w2.data_ptr(),
-                                  sf.data_ptr(), 1, self.D_dit, 1024, 0)
-        fvk.add_bias_fp16(sf.data_ptr(), self._g_dit.se_b2.data_ptr(), 1, self.D_dit, 0)
+        # State encode (outside graph) — shared helper
+        self._copy_state_feature_to_dit(
+            obs.get('state', np.zeros(self.state_dim, dtype=np.float32)))
         torch.cuda.synchronize()
-        self._g_dit.b_state_feat.copy_(sf)
 
         # ── 5. DiT graph capture (before Qwen3 graph for optimal cuBLAS tactic) ──
         stream_d = torch.cuda.Stream()
