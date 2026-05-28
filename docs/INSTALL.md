@@ -160,9 +160,11 @@ You only need to install `flash-attn` if:
 
 - You set `FVK_RTX_FA2=0` to fall back to the legacy upstream path, or
 - You set `FVK_RTX_FA2_SITES=…` to bisect a subset of attention
-  sites against the upstream reference, or
-- You run the **GROOT N1.6 / N1.7** backend (its current attention
-  path is upstream `flash_attn_func`).
+  sites against the upstream reference.
+
+The GROOT N1.6 / N1.7 RTX backends also use FlashRT's vendored
+attention modules by default; they should not require the upstream
+`flash-attn` wheel.
 
 When you do need it, prefer a prebuilt wheel matching your
 torch / CUDA / Python combo from

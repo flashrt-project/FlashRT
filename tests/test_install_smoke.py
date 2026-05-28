@@ -18,7 +18,7 @@ prevented at build / import time, so this file is the regression net:
    torch 2.5.1 / CUDA 12.5 / Py3.12 → 30–60 min sdist compile per
    cold image). The vendored ``flash_rt_fa2.so`` is enough for the
    default path; ``flash-attn`` is only needed for legacy bisection
-   sites and the GROOT backend.
+   sites.
 
 Run:
     PYTHONPATH=. python -m pytest tests/test_install_smoke.py -v
@@ -53,7 +53,7 @@ def test_kernels_so_lives_in_flash_rt():
 def test_import_without_flash_attn(monkeypatch):
     """``import flash_rt`` must not require the upstream flash-attn
     pip package. The default RTX path uses ``flash_rt_fa2.so``; the
-    upstream wheel is only needed for legacy / GROOT paths.
+    upstream wheel is only needed for legacy bisection paths.
     """
     # Block flash_attn from importing — sys.modules[name] = None makes
     # `import flash_attn` raise ImportError without touching the real
@@ -75,6 +75,8 @@ def test_import_without_flash_attn(monkeypatch):
     # touching upstream flash_attn. Backend instantiation is GPU-bound
     # and is exercised separately in tests/test_pi05_*.py.
     importlib.import_module("flash_rt.hardware.rtx.attn_backend")
+    importlib.import_module("flash_rt.hardware.rtx.attn_backend_groot")
+    importlib.import_module("flash_rt.hardware.rtx.attn_backend_groot_n17")
 
 
 def test_legacy_path_raises_clear_error_without_flash_attn(monkeypatch):

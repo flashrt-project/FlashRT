@@ -14,8 +14,7 @@ import isolated from the rest of FlashRT:
   ``csrc/attention/flash_attn_4_src/VENDOR.md``). It is loaded by transiently
   adding the vendor dir to ``sys.path`` and importing ``flashrt_fa4.cute`` —
   the vendor path is removed from ``sys.path`` again right after import, and the
-  private name guarantees it never shadows a pip-installed ``flash_attn`` (the
-  RTX backends use ``from flash_attn import flash_attn_func``).
+  private name guarantees it never shadows upstream ``flash_attn``.
 - It is an **optional fast path**. If the FA4 runtime deps
   (``nvidia-cutlass-dsl`` + ``quack-kernels``, the ``thor-fa4`` pip extra) are
   missing, every accessor returns ``None`` and the caller falls back to the

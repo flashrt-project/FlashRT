@@ -7,17 +7,16 @@ GROOT has four distinct attention shapes:
   - DiT self    :  (1, Sa=51,  heads=32, head_dim=48)  self
   - DiT cross   :  Q (1, Sa, 32, 48)  vs  K/V (1, Se, 32, 48)  cross
 
-flash_attention covers all four head_dims (48 → kHeadDim=64, 72 → 96,
-128 direct) so we can route everything through one ``flash_attn_func``
-backend on RTX 5090.
+FlashRT's vendored FA2 covers all four head_dims (48 → kHeadDim=96,
+72 → 96, 128 direct) so we can route everything through the
+``flash_rt_fa2`` backend on RTX 5090 without requiring the upstream
+``flash-attn`` pip wheel.
 
 This is a separate backend from ``RtxFlashAttnBackend`` (the Pi0/Pi0.5
 one) because the attention sites and shapes are entirely different.
 The protocol matches: ``get_ptrs()`` returns a dict of input pointers
 for the pipeline to write into via fvk kernels, and each ``*_attn``
-method returns the raw device pointer of flash_attn's output tensor
-(no copy — torch's caching allocator pins the slot during graph
-capture, exactly the same trick as the Pi0.5 backend).
+method returns the raw device pointer of a backend-owned output tensor.
 
 Future revision will replace this with a pure-C
 ``CFlashAttnBackend`` that calls into ``libfmha_fp16.so``. The
@@ -112,7 +111,7 @@ class RtxFlashAttnBackendGroot:
         # ── DiT cross-attention ──
         # Q is the action stream (rewritten per layer by the pipeline).
         # K/V are 16 per-block precomputed projections of the Qwen3 backbone,
-        # owned by the backend so flash_attn can read them as torch tensors.
+        # owned by the backend so vendored FA2 can read them as torch tensors.
         # The pipeline writes these via fp16_nn GEMMs in precompute_cross_kv().
         self.dit_cross_Q = torch.empty(num_dit_actions, 32, 48, dtype=fp16, device=d)
         self.dit_cross_K = [
@@ -130,27 +129,89 @@ class RtxFlashAttnBackendGroot:
         self._dit_kv_seq = dit_kv_seq
         self._num_dit_cross_blocks = num_dit_cross_blocks
 
-        # Output references for caching-allocator stability
-        self._vis_out_ref = None
-        self._qwen3_out_ref = None
-        self._dit_self_out_ref = None
-        self._dit_cross_out_ref = None
-
-        # GROOT currently routes attention through the upstream
-        # ``flash-attn`` pip wheel as its primary path; defer the import
-        # to backend instantiation (not module import) so users without
-        # the wheel can still ``import flash_rt`` and run Pi0 / Pi0.5.
         try:
-            from flash_attn import flash_attn_func
+            from flash_rt import flash_rt_fa2 as fa2
         except ImportError as e:
-            raise ImportError(
-                "GROOT RTX backend requires the upstream `flash-attn` "
-                "pip package. Install a prebuilt wheel for your "
-                "torch/CUDA combo from "
-                "https://github.com/Dao-AILab/flash-attention/releases "
-                "(building the sdist takes 30+ minutes on cold images)."
+            raise RuntimeError(
+                "GROOT RTX backend requires FlashRT's vendored FA2 module "
+                "(`flash_rt.flash_rt_fa2`). Build it with CMake on RTX "
+                "targets; do not install/use the upstream `flash_attn` pip "
+                f"package for this path. Import error: {e}"
             ) from e
-        self._flash_attn_func = flash_attn_func
+        self._fa2 = fa2
+        self._fa2_fwd = fa2.fwd_fp16
+        self._num_sms = torch.cuda.get_device_properties(
+            torch.cuda.current_device()).multi_processor_count
+
+        def lse(batch: int, heads: int, seq: int):
+            return torch.empty(
+                batch, heads, self._round_up_128(seq),
+                dtype=torch.float32, device=d)
+
+        def split_scratch(batch: int, heads: int, q_seq: int,
+                          kv_seq: int, head_dim: int):
+            block_n = 256 if head_dim <= 64 else (128 if head_dim <= 128 else 64)
+            max_splits = max(1, min(128, (kv_seq + block_n - 1) // block_n))
+            lse_accum = torch.empty(
+                max_splits, batch, heads, q_seq,
+                dtype=torch.float32, device=d)
+            o_accum = torch.empty(
+                max_splits, batch, heads, q_seq,
+                self._round_head_dim(head_dim),
+                dtype=torch.float32, device=d)
+            return lse_accum, o_accum
+
+        # Preallocated outputs and LSE/splitkv scratch. Returned pointers stay
+        # stable across CUDA Graph capture and replay.
+        self.vis_O = torch.empty_like(self.vis_Q)
+        self._vis_lse = lse(num_views, 16, 256)
+        self._vis_lse_accum, self._vis_o_accum = split_scratch(
+            num_views, 16, 256, 256, 72)
+
+        self.qwen3_O = torch.empty_like(self.qwen3_Q)
+        self._qwen3_lse = lse(1, 16, encoder_seq_max)
+        self._qwen3_lse_accum, self._qwen3_o_accum = split_scratch(
+            1, 16, encoder_seq_max, encoder_seq_max, 128)
+
+        self.dit_self_O = torch.empty_like(self.dit_self_Q)
+        self._dit_self_lse = lse(1, 32, num_dit_actions)
+        self._dit_self_lse_accum, self._dit_self_o_accum = split_scratch(
+            1, 32, num_dit_actions, num_dit_actions, 48)
+
+        self.dit_cross_O = torch.empty_like(self.dit_cross_Q)
+        self._dit_cross_lse = lse(1, 32, num_dit_actions)
+        self._dit_cross_lse_accum, self._dit_cross_o_accum = split_scratch(
+            1, 32, num_dit_actions, dit_kv_seq, 48)
+
+    def _run_fa2(self, q, k, v, o, lse, *, stream: int = 0,
+                 lse_accum=None, o_accum=None) -> int:
+        B, Sq, Hq, D = q.shape
+        Sk, Hk = k.shape[1], k.shape[2]
+        self._fa2_fwd(
+            Q=q.data_ptr(), K=k.data_ptr(), V=v.data_ptr(),
+            O=o.data_ptr(), softmax_lse=lse.data_ptr(),
+            softmax_lse_accum=(lse_accum.data_ptr()
+                               if lse_accum is not None else 0),
+            o_accum=(o_accum.data_ptr() if o_accum is not None else 0),
+            batch=B, seqlen_q=Sq, seqlen_k=Sk,
+            num_heads_q=Hq, num_heads_kv=Hk, head_dim=D,
+            q_strides=(q.stride(0), q.stride(1), q.stride(2)),
+            k_strides=(k.stride(0), k.stride(1), k.stride(2)),
+            v_strides=(v.stride(0), v.stride(1), v.stride(2)),
+            o_strides=(o.stride(0), o.stride(1), o.stride(2)),
+            softmax_scale=1.0 / (D ** 0.5),
+            num_sms=self._num_sms,
+            stream=stream,
+        )
+        return o.data_ptr()
+
+    @staticmethod
+    def _round_up_128(x: int) -> int:
+        return ((int(x) + 127) // 128) * 128
+
+    @staticmethod
+    def _round_head_dim(x: int) -> int:
+        return (int(x) + 31) & ~31
 
     # ── Pointer interface (for pipeline's fvk kernel calls) ──
 
@@ -172,9 +233,7 @@ class RtxFlashAttnBackendGroot:
 
     # ── Attention calls ──
     #
-    # All four return the raw device pointer of flash_attn_func's output tensor.
-    # Torch's caching allocator reuses the same slot once warmed up; the
-    # pointer stays valid across CUDA Graph replays.
+    # All four return stable pointers to backend-owned output tensors.
 
     def vision_attn(self, stream: int = 0) -> int:
         """Per-view SigLIP2 self-attention.
@@ -183,10 +242,11 @@ class RtxFlashAttnBackendGroot:
         Downstream the pipeline reshapes/views this as (num_views * 256, 1152)
         and feeds it to the next FP8 GEMM (out projection).
         """
-        out = self._flash_attn_func(
-            self.vis_Q, self.vis_K, self.vis_V, causal=False)
-        self._vis_out_ref = out
-        return out.data_ptr()
+        return self._run_fa2(
+            self.vis_Q, self.vis_K, self.vis_V, self.vis_O,
+            self._vis_lse, stream=stream,
+            lse_accum=self._vis_lse_accum,
+            o_accum=self._vis_o_accum)
 
     def qwen3_attn(self, layer_idx: int, seq: int, stream: int = 0) -> int:
         """Qwen3 GQA self-attention for one layer (16Q/8KV, head_dim=128).
@@ -197,9 +257,11 @@ class RtxFlashAttnBackendGroot:
         q = self.qwen3_Q[:seq].unsqueeze(0)        # (1, seq, 16, 128)
         k = self.qwen3_K[:seq].unsqueeze(0)        # (1, seq, 8,  128)
         v = self.qwen3_V[:seq].unsqueeze(0)        # (1, seq, 8,  128)
-        out = self._flash_attn_func(q, k, v, causal=False)
-        self._qwen3_out_ref = out
-        return out.data_ptr()
+        o = self.qwen3_O[:seq].unsqueeze(0)
+        return self._run_fa2(
+            q, k, v, o, self._qwen3_lse, stream=stream,
+            lse_accum=self._qwen3_lse_accum,
+            o_accum=self._qwen3_o_accum)
 
     def dit_self_attn(self, layer_idx: int, sa: int, stream: int = 0) -> int:
         """DiT self-attention (32 heads × 48 head_dim) over Sa tokens.
@@ -209,9 +271,11 @@ class RtxFlashAttnBackendGroot:
         q = self.dit_self_Q[:sa].unsqueeze(0)
         k = self.dit_self_K[:sa].unsqueeze(0)
         v = self.dit_self_V[:sa].unsqueeze(0)
-        out = self._flash_attn_func(q, k, v, causal=False)
-        self._dit_self_out_ref = out
-        return out.data_ptr()
+        o = self.dit_self_O[:sa].unsqueeze(0)
+        return self._run_fa2(
+            q, k, v, o, self._dit_self_lse, stream=stream,
+            lse_accum=self._dit_self_lse_accum,
+            o_accum=self._dit_self_o_accum)
 
     def dit_cross_attn(self, cross_block_idx: int, sa: int,
                        kv_seq: int, stream: int = 0) -> int:
@@ -226,15 +290,17 @@ class RtxFlashAttnBackendGroot:
         q = self.dit_cross_Q[:sa].unsqueeze(0)
         k = self.dit_cross_K[cross_block_idx][:kv_seq].unsqueeze(0)
         v = self.dit_cross_V[cross_block_idx][:kv_seq].unsqueeze(0)
-        out = self._flash_attn_func(q, k, v, causal=False)
-        self._dit_cross_out_ref = out
-        return out.data_ptr()
+        o = self.dit_cross_O[:sa].unsqueeze(0)
+        return self._run_fa2(
+            q, k, v, o, self._dit_cross_lse, stream=stream,
+            lse_accum=self._dit_cross_lse_accum,
+            o_accum=self._dit_cross_o_accum)
 
     # ──────────────────────────────────────────────────────────────
-    # AttentionBackend protocol implementation. Wraps the same
-    # flash_attn_func calls as the legacy methods above. The legacy
-    # half will be retired once the GROOT pipeline routes entirely
-    # through the protocol methods.
+    # AttentionBackend protocol implementation. Wraps the same vendored
+    # FA2 dispatches as the legacy methods above. The legacy half will
+    # be retired once the GROOT pipeline routes entirely through the
+    # protocol methods.
     # ──────────────────────────────────────────────────────────────
 
     _PROTOCOL_SITES = ("siglip", "qwen3", "dit_self", "dit_cross")
@@ -333,10 +399,9 @@ class RtxFlashAttnBackendGroot:
     ) -> int:
         """Dispatch to the legacy attention call for the given site.
 
-        Wraps the same ``flash_attn_func`` invocations as the legacy
-        methods. Returns the freshly-allocated output tensor's data_ptr,
-        which is stable across CUDA Graph capture + replay because the
-        backend holds a reference in ``_{site}_out_ref``.
+        Wraps the same vendored FA2 invocations as the legacy methods.
+        Returns a backend-owned output tensor pointer that is stable
+        across CUDA Graph capture and replay.
         """
         if site == "siglip":
             # Pi0.5's SigLIP was 2-view × 256 tokens, GROOT's SigLIP

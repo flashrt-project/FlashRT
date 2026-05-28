@@ -114,7 +114,7 @@ The pipeline sees the same call sequence on every hardware target. Only the kern
 
 Backends are allowed to differ on **who allocates the buffers**:
 
-- **Backend-owned** (RTX): the backend allocates Q / K / V as torch tensors in `__init__`. The pipeline writes Q / K / V into the published pointers. Output is allocated by `flash_attn_func` per call; the backend holds a reference so the torch caching allocator doesn't reassign across capture / replay.
+- **Backend-owned** (RTX): the backend allocates Q / K / V as torch tensors in `__init__`. The pipeline writes Q / K / V into the published pointers. Modern vendored FA2 backends also own stable output tensors; legacy pip `flash_attn_func` fallback paths keep a torch output reference so the caching allocator doesn't reassign across capture / replay.
 - **Pipeline-owned** (Thor): the pipeline allocates its own Q (which doubles as the output buffer post-attn), plus per-layer K / V cache as part of the weights dict. The backend is a thin wrapper around `fvk.attention_qkv_fp16` and takes pointers at `run()` time.
 
 A pipeline written to the protocol does not care which storage model fires — it always reads pointers via `get_slot_ptrs` and lets `run()` return the output pointer. This is the key portability property.

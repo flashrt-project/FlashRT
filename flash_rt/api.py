@@ -44,8 +44,9 @@ class VLAModel:
         # ``infer()``; Thor / rtx GROOT lazy-calibrate inside ``infer()``.
         # Track whether we still need to bootstrap calibration so that
         # first predict() can call it exactly once.
-        self._needs_real_data_calibration = hasattr(
-            pipe, "calibrate_with_real_data"
+        self._needs_real_data_calibration = (
+            hasattr(pipe, "calibrate_with_real_data")
+            and hasattr(pipe, "calibrated")
         )
 
     @staticmethod

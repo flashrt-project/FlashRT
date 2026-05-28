@@ -21,11 +21,12 @@ The existing Thor and rtx attention backends do NOT agree on who owns
 Q/K/V/O memory:
 
 * **Backend-owned** (rtx): The backend allocates Q/K/V as torch tensors
-  in its ``__init__``. Output tensors are freshly allocated by
-  ``flash_attn_func`` per call and the backend holds a reference so the
-  torch caching allocator pins them across CUDA Graph capture + replay.
-  The pipeline writes Q/K/V into the backend's pre-allocated slots via
-  pointers returned from :meth:`AttentionBackend.get_slot_ptrs`.
+  in its ``__init__``. Modern vendored FA2 backends also own stable
+  output tensors; legacy pip ``flash_attn_func`` fallback paths keep an
+  output reference so the torch caching allocator pins the allocation
+  across CUDA Graph capture + replay. The pipeline writes Q/K/V into
+  the backend's pre-allocated slots via pointers returned from
+  :meth:`AttentionBackend.get_slot_ptrs`.
 
 * **Pipeline-owned** (Thor): The pipeline allocates its own ``attn_out``
   scratch (which stores Q *before* the attention call and the output
@@ -244,13 +245,14 @@ class AttentionBackend(Protocol):
     for the lifetime of the backend. ``get_slot_ptrs`` returns the
     current mapping.
 
-    Not every backend exposes every role. The rtx Pi0.5 backend exposes
-    ``Q``, ``K``, ``V`` per slot; output is allocated by
-    ``flash_attn_func`` and the pointer is returned by ``run()``. The
-    Thor backend exposes ``Q`` (which is also the output buffer,
-    aliased with ``O``), plus ``K`` and ``V`` per layer. Pipelines MUST
-    only read keys they know the target backend provides for a given
-    site.
+    Not every backend exposes every role. The rtx backends expose
+    ``Q``, ``K``, ``V`` per slot and return the output pointer from
+    ``run()``; vendored FA2 paths usually keep ``O`` backend-owned, while
+    legacy fallback paths may keep only a reference to the allocated
+    output tensor. The Thor backend exposes ``Q`` (which is also the
+    output buffer, aliased with ``O``), plus ``K`` and ``V`` per layer.
+    Pipelines MUST only read keys they know the target backend provides
+    for a given site.
     """
 
     def sites(self) -> tuple[str, ...]:
