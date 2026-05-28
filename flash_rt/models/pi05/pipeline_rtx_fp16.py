@@ -2076,8 +2076,15 @@ class Pi05PipelineFP16:
         assert lang_embeds_np.shape[1] == ENC_D
 
         # Store a persistent device copy of the (prompt_len, ENC_D) embeds.
+        # CUDA Graph capture bakes the source pointer used by
+        # _copy_lang_embeds_to_encoder_x(), so same-shape prompt updates must
+        # upload into the existing buffer instead of replacing it.
         arr = np.ascontiguousarray(lang_embeds_np)
-        self._lang_embeds_buf = CudaBuffer.from_numpy(arr)
+        if (hasattr(self, "_lang_embeds_buf")
+                and self._lang_embeds_buf.nbytes == arr.nbytes):
+            self._lang_embeds_buf.upload(arr)
+        else:
+            self._lang_embeds_buf = CudaBuffer.from_numpy(arr)
         self._current_prompt_len = prompt_len
 
         # Update decoder RoPE slice for this prompt length

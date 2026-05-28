@@ -97,6 +97,25 @@ strictly easier for fresh setups. The frontend accepts a tokenizer
 loaded from either source as long as you point
 `$FLASH_RT_PALIGEMMA_TOKENIZER` at it.
 
+### Pi0.5 State Prompts
+
+Pi0.5 follows openpi's discrete-state prompt format. Passing `state`
+through the stable API discretizes normalized state values into 0..255 bins
+and embeds:
+
+```python
+actions = model.predict(
+    images=[base_img, wrist_img],
+    prompt="pick up the red block",
+    state=robot_state,
+)
+```
+
+State changes update the prompt embeddings. RTX keeps a per-prompt-length
+pipeline cache and updates same-length language buffers in place, so repeated
+state-token lengths do not repeatedly rebuild CUDA Graphs or rerun autotune.
+Thor updates same-length prompt embeddings in place after graph capture.
+
 **Q: I'm getting `FileNotFoundError: paligemma_tokenizer.model not found`.**
 A: Run the download script above (or `curl` directly into one of
 the search paths). The error message is itself the fix — it spells
