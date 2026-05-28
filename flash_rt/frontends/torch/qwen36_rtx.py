@@ -4274,10 +4274,7 @@ class Qwen36TorchFrontendRtx:
             for p in range(prompt_len):
                 self._static_token_id.copy_(input_ids[:, p:p + 1])
                 g_pf = self._ensure_graph_for_pos_nvfp4(p)
-                gs_pf.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(gs_pf):
-                    g_pf.replay()
-                torch.cuda.current_stream().wait_stream(gs_pf)
+                self._replay_pos_graph(g_pf, p)
                 self._prefill_h_cache[p:p + 1].copy_(
                     self._last_hidden_buf.view(1, hidden))
             # First decoded token = argmax of last prompt step's logits.
@@ -6938,6 +6935,50 @@ class Qwen36TorchFrontendRtx:
 
         return torch.cat([input_ids] + generated, dim=1)
 
+    # ---------- opt-in: route replay through the FlashRT exec contract ----
+    # FLASHRT_QWEN36_USE_EXEC=1 drives captured-graph REPLAY through the
+    # exec-contract layer (frt_graph: ShapeKey variant table + replay) instead
+    # of torch's g.replay(). Capture stays in torch.cuda.graph; frt adopts
+    # torch's instantiated exec via raw_cuda_graph_exec(). Default path is
+    # byte-identical (additive only). See docs/exec_contract.md.
+    def _exec_lazy_init(self) -> None:
+        if getattr(self, '_exec_inited', False):
+            return
+        self._exec_inited = True
+        self._use_exec = os.environ.get(
+            'FLASHRT_QWEN36_USE_EXEC', '0') not in ('0', '', 'false', 'False')
+        if not self._use_exec:
+            return
+        from flash_rt.runtime import exec as _frt
+        self._frt = _frt
+        self._exec_ctx = _frt.Ctx()
+        # Replay on the SAME dedicated capture stream the frontend already uses,
+        # so existing wait_stream choreography is preserved exactly.
+        self._exec_gs_id = self._exec_ctx.wrap_stream(
+            self._graph_stream.cuda_stream)
+        cap = self.GRAPH_CACHE_MAX if self.GRAPH_CACHE_MAX > 0 else 0
+        self._exec_decode = self._exec_ctx.graph('qwen36_decode_s1', cap)
+
+    def _replay_pos_graph(self, g, cur_pos: int) -> None:
+        """Replay the decode-S=1 graph for cur_pos with the gs choreography.
+
+        Opt-in routes the launch through the exec contract; otherwise the
+        original torch g.replay() path runs unchanged.
+        """
+        import torch
+        self._exec_lazy_init()
+        gs = self._graph_stream
+        gs.wait_stream(torch.cuda.current_stream())
+        if getattr(self, '_use_exec', False):
+            rc = self._exec_decode.replay(cur_pos, self._exec_gs_id)
+            if rc != 0:
+                raise RuntimeError(
+                    f'frt decode replay failed rc={rc} cur_pos={cur_pos}')
+        else:
+            with torch.cuda.stream(gs):
+                g.replay()
+        torch.cuda.current_stream().wait_stream(gs)
+
     def _ensure_graph_for_pos_nvfp4(self, cur_pos: int):
         """Lazy CUDA Graph capture for forward_own_decode_nvfp4 at cur_pos.
 
@@ -6963,6 +7004,9 @@ class Qwen36TorchFrontendRtx:
 
         g = self._graph_cache_get(self._captured_graphs, cur_pos)
         if g is not None:
+            self._exec_lazy_init()
+            if getattr(self, '_use_exec', False):
+                self._exec_decode.adopt(cur_pos, g.raw_cuda_graph_exec())
             return g
 
         gs = self._graph_stream
@@ -7007,6 +7051,9 @@ class Qwen36TorchFrontendRtx:
             _restore_on_gs()
 
         self._graph_cache_put(self._captured_graphs, cur_pos, g)
+        self._exec_lazy_init()
+        if getattr(self, '_use_exec', False):
+            self._exec_decode.adopt(cur_pos, g.raw_cuda_graph_exec())
         return g
 
     # ---------- Stage 7 G1: NVFP4 verify-forward graph capture ----------
@@ -10154,10 +10201,7 @@ class Qwen36TorchFrontendRtx:
             for p in range(prompt_len):
                 self._static_token_id.copy_(input_ids[:, p:p + 1])
                 g_pf = self._ensure_graph_for_pos_nvfp4(p)
-                gs_pf.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(gs_pf):
-                    g_pf.replay()
-                torch.cuda.current_stream().wait_stream(gs_pf)
+                self._replay_pos_graph(g_pf, p)
             tok = self._logits_buf.argmax(
                 dim=-1, keepdim=True).view(1, 1)
             generated = [tok]
