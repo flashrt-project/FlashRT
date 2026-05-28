@@ -15,9 +15,22 @@ void frt_graph_s::evict_one() {
     lru.pop_front();
     auto it = variants.find(old);
     if (it != variants.end()) {
-        frt::be::graph_exec_destroy(it->second);  // frees only the exec, not buffers
+        if (it->second.owned)                         // never free an adopted exec
+            frt::be::graph_exec_destroy(it->second.exec);
         variants.erase(it);
     }
+}
+
+void frt_graph_s::put(frt_shape_key key, void* exec, bool owned) {
+    auto it = variants.find(key);
+    if (it != variants.end()) {
+        if (it->second.owned) frt::be::graph_exec_destroy(it->second.exec);
+        it->second = frt_variant{exec, owned};
+    } else {
+        variants.emplace(key, frt_variant{exec, owned});
+    }
+    touch(key);
+    if (max_variants > 0 && variants.size() > max_variants) evict_one();
 }
 
 frt_graph frt_graph_create(frt_ctx c, const char* name, size_t max_variants) {
@@ -36,7 +49,8 @@ void frt_graph_destroy(frt_graph g) {
     for (auto it = gs.begin(); it != gs.end(); ++it) {
         if (*it == g) { gs.erase(it); break; }
     }
-    for (auto& kv : g->variants) frt::be::graph_exec_destroy(kv.second);
+    for (auto& kv : g->variants)
+        if (kv.second.owned) frt::be::graph_exec_destroy(kv.second.exec);
     delete g;
 }
 
@@ -50,18 +64,13 @@ int frt_graph_capture(frt_graph g, frt_shape_key key,
     record(user, cap_stream);  // model enqueues its kernels onto cap_stream
     void* exec = frt::be::capture_end(cap_stream);
     if (!exec) return FRT_ERR_CAPTURE;
+    g->put(key, exec, /*owned=*/true);
+    return FRT_OK;
+}
 
-    // Replace an existing variant for this key.
-    auto it = g->variants.find(key);
-    if (it != g->variants.end()) {
-        frt::be::graph_exec_destroy(it->second);
-        it->second = exec;
-    } else {
-        g->variants.emplace(key, exec);
-    }
-    g->touch(key);
-    if (g->max_variants > 0 && g->variants.size() > g->max_variants)
-        g->evict_one();
+int frt_graph_adopt(frt_graph g, frt_shape_key key, void* external_graph_exec) {
+    if (!g || !external_graph_exec) return FRT_ERR_INVALID;
+    g->put(key, external_graph_exec, /*owned=*/false);  // never freed by frt
     return FRT_OK;
 }
 
@@ -78,7 +87,7 @@ int frt_graph_replay(frt_graph g, frt_shape_key key, int stream_id) {
     void* s = g->ctx->stream(stream_id);
     if (!s) return FRT_ERR_INVALID;
     g->touch(key);
-    return frt::be::graph_launch(it->second, s) ? FRT_OK : FRT_ERR_BACKEND;
+    return frt::be::graph_launch(it->second.exec, s) ? FRT_OK : FRT_ERR_BACKEND;
 }
 
 int frt_graph_has_variant(frt_graph g, frt_shape_key key) {

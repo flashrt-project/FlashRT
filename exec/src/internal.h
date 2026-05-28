@@ -24,16 +24,22 @@ struct frt_event_s {
     void*   handle = nullptr;    // backend event
 };
 
+struct frt_variant {
+    void* exec  = nullptr;   // graph-exec handle
+    bool  owned = true;      // false if adopted from an external owner (torch)
+};
+
 struct frt_graph_s {
     frt_ctx     ctx = nullptr;
     std::string name;
     size_t      max_variants = 0;                       // 0 = unbounded
-    std::unordered_map<frt_shape_key, void*> variants;  // key -> graph-exec
+    std::unordered_map<frt_shape_key, frt_variant> variants;  // key -> exec
     std::list<frt_shape_key> lru;                       // front = oldest
     std::unordered_map<std::string, frt_buffer> bindings;  // port -> buffer (refs)
 
     void touch(frt_shape_key key);   // move key to MRU
     void evict_one();                // drop the oldest variant
+    void put(frt_shape_key key, void* exec, bool owned);  // insert/replace + LRU
 };
 
 struct frt_plan_node {
@@ -50,6 +56,7 @@ struct frt_plan_s {
 
 struct frt_ctx_s {
     std::vector<void*> streams;            // stream_id -> backend stream; [0]=default
+    std::vector<char>  stream_owned;       // parallel: 1 if frt created it (destroy), 0 if wrapped
     std::vector<frt_event_s*> events;      // tracked for cleanup safety
     std::vector<frt_buffer_s*> buffers;    // ctx owns all buffers (freed at destroy)
     std::vector<frt_graph_s*> graphs;      // tracked for cleanup safety

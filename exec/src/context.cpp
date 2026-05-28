@@ -7,6 +7,7 @@ frt_ctx frt_ctx_create(void) {
     void* s0 = frt::be::stream_create(0);  // default stream = id 0
     if (!s0) { delete c; return nullptr; }
     c->streams.push_back(s0);
+    c->stream_owned.push_back(1);
     return c;
 }
 
@@ -15,7 +16,11 @@ void frt_ctx_destroy(frt_ctx c) {
     // Order: plans ref graphs; graphs ref buffers/streams; events/buffers/streams last.
     for (auto* p : c->plans) delete p;
     for (auto* g : c->graphs) {
-        if (g) { for (auto& kv : g->variants) frt::be::graph_exec_destroy(kv.second); delete g; }
+        if (g) {
+            for (auto& kv : g->variants)
+                if (kv.second.owned) frt::be::graph_exec_destroy(kv.second.exec);
+            delete g;
+        }
     }
     for (auto* b : c->buffers) {
         if (b) { if (b->owned) frt::be::free(b->dptr); delete b; }
@@ -23,7 +28,8 @@ void frt_ctx_destroy(frt_ctx c) {
     for (auto* e : c->events) {
         if (e) { frt::be::event_destroy(e->handle); delete e; }
     }
-    for (void* s : c->streams) frt::be::stream_destroy(s);
+    for (size_t i = 0; i < c->streams.size(); ++i)
+        if (c->stream_owned[i]) frt::be::stream_destroy(c->streams[i]);
     delete c;
 }
 
@@ -32,6 +38,14 @@ int frt_ctx_stream(frt_ctx c, int priority) {
     void* s = frt::be::stream_create(priority);
     if (!s) return FRT_ERR_BACKEND;
     c->streams.push_back(s);
+    c->stream_owned.push_back(1);
+    return (int)c->streams.size() - 1;
+}
+
+int frt_ctx_wrap_stream(frt_ctx c, void* external_stream) {
+    if (!c || !external_stream) return FRT_ERR_INVALID;
+    c->streams.push_back(external_stream);
+    c->stream_owned.push_back(0);  // non-owned; never destroyed by frt
     return (int)c->streams.size() - 1;
 }
 
