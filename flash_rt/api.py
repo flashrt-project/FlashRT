@@ -130,14 +130,51 @@ class VLAModel:
         if state is not None and "state" not in obs:
             obs["state"] = state
 
-        # rtx Pi0.5 expects an explicit calibration bootstrap before the
-        # first infer(); fire it lazily here so user code stays "3 lines".
-        if self._needs_real_data_calibration:
+        # RTX Pi0.5 can swap in a different cached pipeline when a changing
+        # state prompt hits a new token length. Re-check that frontend's
+        # calibration flag instead of relying only on the first-call latch.
+        needs_real_data_calibration = self._needs_real_data_calibration
+        if (hasattr(self._pipe, "_prompt_pipeline_cache")
+                and not getattr(self._pipe, "calibrated", False)):
+            needs_real_data_calibration = True
+        if (needs_real_data_calibration
+                and hasattr(self._pipe, "calibrate_with_real_data")):
             self._pipe.calibrate_with_real_data([obs])
             self._needs_real_data_calibration = False
 
         result = self._pipe.infer(obs)
         return result['actions']
+
+    def warm_state_prompt_buckets(self, images, prompt, states):
+        """Pre-build Pi0.5 state-prompt runtime buckets.
+
+        Pi0.5 encodes robot state in the text prompt. Different state
+        values can tokenize to different lengths; warming representative
+        states up front prevents the control loop from paying graph
+        capture/autotune the first time each length appears.
+        """
+        if not hasattr(self._pipe, "warm_state_prompt_buckets"):
+            raise NotImplementedError(
+                "This frontend does not expose state prompt bucket warmup.")
+
+        if isinstance(images, dict):
+            obs = dict(images)
+        elif isinstance(images, (list, tuple)):
+            if len(images) == 0:
+                raise ValueError("images list must have at least one frame")
+            obs = {"images": list(images), "image": images[0]}
+            if len(images) >= 2:
+                obs["wrist_image"] = images[1]
+            if len(images) >= 3:
+                obs["wrist_image_right"] = images[2]
+        else:
+            raise ValueError("images must be a list of numpy arrays or a dict")
+
+        lengths = self._pipe.warm_state_prompt_buckets(prompt, states, obs)
+        self._needs_real_data_calibration = False
+        self._current_prompt = None
+        self._current_prompt_state = None
+        return lengths
 
     def set_prompt(self, *args, **kwargs):
         """Delegate prompt setup to the selected frontend."""

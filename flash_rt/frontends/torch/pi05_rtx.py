@@ -1053,6 +1053,37 @@ class Pi05TorchFrontendRtx:
         logger.info("Set prompt: '%s' (%d tokens, state=%s)",
                     prompt_text, prompt_len, state is not None)
 
+    def warm_state_prompt_buckets(self, prompt_text: str, states,
+                                  sample_observation: dict) -> list[int]:
+        """Pre-build runtime buckets for Pi0.5 state-in-prompt lengths.
+
+        The prompt text is kept in the OpenPI format. This method only
+        front-loads graph capture/autotune for the token lengths reached
+        by the supplied representative states.
+        """
+        if self._rl_config is not None:
+            raise ValueError(
+                "Pi0.5 RL CFG mode does not support state prompt bucket warmup")
+        if isinstance(states, np.ndarray) and states.ndim == 1:
+            state_list = [states]
+        else:
+            state_list = list(states)
+        if not state_list:
+            raise ValueError("states must contain at least one representative state")
+
+        warmed: set[int] = set()
+        for state in state_list:
+            self.set_prompt(prompt_text, state=state)
+            prompt_len = int(self.current_prompt_len)
+            if prompt_len in warmed and getattr(self.pipeline, "_graph", None) is not None:
+                continue
+            if not self.calibrated:
+                self.calibrate_with_real_data([sample_observation])
+            warmed.add(prompt_len)
+
+        logger.info("Warmed Pi0.5 state prompt buckets: %s", sorted(warmed))
+        return sorted(warmed)
+
     def _set_prompt_rl(self, prompt_text: str) -> None:
         """RL-mode set_prompt: build conditioned + unconditioned embeddings.
 

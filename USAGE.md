@@ -184,6 +184,57 @@ model = flash_rt.load_model(
 | `vision_num_layers` | `int\|None` | `None` | Pi0.5 torch RTX/Orin. Number of SigLIP vision layers to run. |
 | `cache_frames` | `int\|None` | `None` | Pi0.5 torch RTX/Orin. Temporal encoder K/V cache period; `1` means no temporal reuse. |
 
+### Pi0.5 state prompt bucket warmup
+
+Pi0.5 follows the OpenPI contract where robot state is discretized into
+the language prefix:
+
+```text
+Task: <prompt>, State: <0..255 bins>;
+Action:
+```
+
+Because those state bins are tokenized as text, different state values can
+produce different prompt lengths. FlashRT keeps the original OpenPI text
+format for accuracy, and caches RTX Pi0.5 runtime pipelines by prompt
+length. If your control loop passes a changing `state` every step, warm the
+representative prompt-length buckets before entering the realtime loop:
+
+```python
+states = [
+    np.zeros(8, dtype=np.float32),
+    np.linspace(-1.0, 1.0, 8, dtype=np.float32),
+    rollout_state_sample,
+]
+
+model = flash_rt.load_model(
+    "/path/to/pi05_libero_pytorch",
+    framework="torch",
+    config="pi05",
+    hardware="auto",
+    num_views=2,
+)
+
+warmed_lengths = model.warm_state_prompt_buckets(
+    images=[base_img, wrist_img],
+    prompt="pick up the red block",
+    states=states,
+)
+print("warmed prompt lengths:", warmed_lengths)
+
+actions = model.predict(
+    images=[base_img, wrist_img],
+    prompt="pick up the red block",
+    state=current_state,
+)
+```
+
+This front-loads graph capture/autotune for the token lengths reached by
+the supplied states. It does not zero-pad or reformat state tokens, so the
+model still sees the same prompt distribution as OpenPI. For best results,
+use several states sampled from the deployment domain or from the first
+few rollout frames.
+
 ### Pi0.5 RTX full-FP16 opt-in path
 
 The default Pi0.5 RTX path remains FP8/BF16. For RTX 5090 / SM120 and

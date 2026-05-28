@@ -96,6 +96,7 @@ class VLAModel:
     def set_prompt(self, *args, **kwargs): ...
     def infer(self, *args, **kwargs): ...
     def predict(self, images, prompt=None, state=None) -> np.ndarray: ...
+    def warm_state_prompt_buckets(self, images, prompt, states) -> list[int]: ...
     def recalibrate(self) -> None: ...
 
     @property
@@ -139,6 +140,14 @@ class VLAModel:
   - GROOT N1.7 currently uses the lower-level
     `normalize_state(...)` + `infer(state_normalized, initial_noise=...)`
     contract rather than the image-list `predict()` contract.
+
+- `warm_state_prompt_buckets(images, prompt, states)` — Pi0.5 RTX torch
+  helper for realtime loops that pass changing state through the prompt.
+  It calls the selected frontend's bucket warmup hook, using `images` as
+  the calibration/capture observation and each item in `states` as a
+  representative robot state. The return value is the sorted list of
+  warmed prompt lengths. The method preserves the OpenPI state prompt
+  text format; it does not zero-pad or otherwise rewrite state tokens.
 
 - `recalibrate()` — clear FP8 calibration cache and force re-calibration
   on the next `predict()` call.
