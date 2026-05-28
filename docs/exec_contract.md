@@ -292,3 +292,83 @@ The Rust shell, OpenAI, and scheduler all live in examples / the upper layer, of
   C-ABI `.so` directly.
 - Therefore the common layer = replay-time execution of Buffer/Graph/Plan + a C ABI, **and not one bit
   more.**
+
+---
+
+## 8. v1 acceptance checklist
+
+Status of the first version (branch `spec/exec-contract`). Everything below is implemented and
+verified in-container on RTX 5090 (sm_120) / pi0-stablehlo-test (torch 2.9, CUDA 13, py3.12).
+
+### 8.1 Primitives (mechanism)
+- [x] `Buffer` alloc / wrap / dptr / bytes / name — owned + external pointers
+- [x] `frt_buffer_copy` device-to-device async on a stream
+- [x] `Graph` capture (own, via record callback) — stream-level RELAXED capture
+- [x] `Graph` **adopt** an external instantiated exec (torch `raw_cuda_graph_exec()` or ctypes
+      `CUDAGraph._graph_exec`); non-owned, never freed by the layer
+- [x] `Graph` `bind` named ports (zero-copy hand-off bookkeeping + lifetime)
+- [x] `Graph` ShapeKey **variant table + LRU** (exact key, `max_variants`); missing key →
+      `FRT_ERR_NO_VARIANT` (never a silent no-op)
+- [x] `Plan` dumb DAG: `add` / `after` (cross-stream event dep) / `execute` / `sync`
+- [x] Events: `frt_ctx_event` / `frt_event_record` / `frt_stream_wait` (imperative cross-stream)
+- [x] Streams: `frt_ctx_stream(priority)` + `frt_ctx_wrap_stream` (external); **default stream
+      (handle 0) is a first-class wrappable stream** (id validated by range, not handle nullness)
+- [x] Lifetime: ctx owns streams/events/buffers/graphs/plans; clean teardown, no leaks of owned memory
+
+Test: `exec/tests/test_exec.py` (5/5) + `exec/tests/test_plan_vla.py` (VLA-shaped Plan chain).
+
+### 8.2 Real-model integration (correctness — bit-identical / cosine)
+- [x] **Qwen3.6-27B NVFP4 (LLM)** decode-S=1 graph driven via exec — bit-identical to torch replay
+      (`test_adopt_qwen36.py`, max abs diff 0.0)
+- [x] **Qwen3.6** spec-decode path (MTP-chain + verify graphs) via exec — output sha identical,
+      spec stats identical (commit `0b988d8`)
+- [x] **Qwen3.6** spec rollback (lin/conv restore) via `frt_buffer_copy` — sha identical (`c3c66f4`)
+- [x] **Pi0.5 (VLA) FP16** full infer graph via exec — `cos = 1.000000`, bit-identical
+      (`test_adopt_pi05.py`)
+- [x] **Pi0.5 (VLA) FP8** full infer graph via exec — `cos = 1.000000`, bit-identical
+      (`test_adopt_pi05.py --fp8`)
+
+### 8.3 Performance (no regression — opt-in flag off vs on)
+- [x] Qwen3.6 decode tok/s: 133.7 (off) vs 133.9 (on), K=6 representative prompt — within noise
+- [x] Qwen3.6 prefill TTFT: 217.1 ms off vs on — unchanged
+- [x] Pi0.5 FP16 p50: 34.5 ms off vs on — unchanged
+- [x] Pi0.5 FP8 p50: 24.55 ms off vs on — unchanged
+- Rationale: frt replay is the same `cudaGraphLaunch` as the baseline; zero added replay overhead by
+  design.
+
+### 8.4 Opt-in integration (default path byte-identical, additive-only)
+- [x] Qwen3.6: `FLASHRT_QWEN36_USE_EXEC=1` (decode + spec + rollback)
+- [x] Pi0.5 FP16: `FLASHRT_PI05_USE_EXEC=1` (`Pi05PipelineFP16`)
+- [x] Pi0.5 FP8/default: `FLASHRT_PI05_USE_EXEC=1` (`Pi05Pipeline`)
+- [x] Flag unset → original path runs unchanged (verified: identical output + latency)
+
+### 8.5 Deliberately OUT of scope (upper layer; the spec only adapts)
+Validated against the real VLA feature surface — all are capture/setup-time and stay in the frontend;
+each resolves to "a captured graph (+ batch/CFG/decoder variants) + buffers (scales/state)", which the
+spec already expresses:
+- autotune (`autotune_gemms`), FP8 / int8-static / AWQ calibration, multi-frame (N>1) dataset
+  calibration → run before `record_infer_graph`; the layer only adopts the resulting graph
+- in-place recalibration without recapture → scales are `Buffer`s; adopted exec stays valid
+- `set_prompt_batch` / `set_batched_mode` (B=2 CFG) → a ShapeKey B-variant (another adopted graph)
+- CFG/RL pipelines, temporal-KV decoder-only graph → additional adopted graphs
+- sessions, schedulers, OpenAI/MCP, sensor/cadence orchestration, interruption policy
+
+### 8.6 Build / reproduce (in-container)
+```
+# exec layer (seconds)
+cmake -S exec -B exec/build -DCMAKE_BUILD_TYPE=Release && cmake --build exec/build -j
+# flash_rt fa2 with fp16 (needed by Pi0.5 FP16): default FA2_DTYPES already fp16;bf16
+cmake -S . -B build -DGPU_ARCH=120 && cmake --build build -j --target flash_rt_fa2
+# tests
+python exec/tests/test_exec.py
+python exec/tests/test_plan_vla.py
+python exec/tests/test_adopt_qwen36.py          # needs FLASHRT_QWEN36_{NVFP4,MTP}_CKPT_DIR
+python exec/tests/test_adopt_pi05.py  [--fp8]    # needs a pi05 ckpt
+```
+
+### 8.7 Known remaining (not blocking v1 acceptance)
+- Long-context Qwen3.6 spec paths (≥512-token FP8-KV / TQ routes) not yet routed through exec
+  (short BF16/spec path is)
+- `examples/robot_host/` interrupt demo, `examples/llm_agent/` OpenAI shell, Rust shell — upper layer
+- Full 64K–256K Qwen TTFT/decode re-alignment with the doc (512–32K done)
+- Merge `spec/exec-contract` back to main
