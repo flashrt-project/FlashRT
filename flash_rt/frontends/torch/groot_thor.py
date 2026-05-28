@@ -725,6 +725,15 @@ class GrootTorchFrontendThor:
         h = self._fp16_gemm(h, self._state_enc_w2, 1, self.D_dit, 1024) + self._state_enc_b2
         return h.unsqueeze(0)  # [1, 1, D_dit]
 
+    def _copy_state_feature_to_dit(self, state):
+        """Encode current robot state into the captured DiT input buffer."""
+        if isinstance(state, np.ndarray):
+            state = torch.from_numpy(state).to(torch.float32).cuda()
+        elif not isinstance(state, torch.Tensor):
+            state = torch.as_tensor(state, dtype=torch.float32, device='cuda')
+        state_feat = self._state_encode(state).squeeze(0)
+        self._g_dit.b_state_feat.copy_(state_feat)
+
     def _action_encode(self, actions, t_disc, action_horizon):
         """[1, T, action_dim] + timestep → [1, T, D_dit]."""
         T = action_horizon
@@ -848,6 +857,11 @@ class GrootTorchFrontendThor:
 
     def set_prompt(self, prompt):
         """Tokenize prompt and prepare text embeddings for Qwen3 backbone."""
+        if getattr(self, '_graphs_built', False):
+            raise RuntimeError(
+                "set_prompt() after the pipeline is built is not supported; "
+                "construct a new GrootTorchFrontendThor instance for a new prompt")
+
         from transformers import AutoTokenizer
 
         if not hasattr(self, '_tokenizer'):
@@ -1416,6 +1430,8 @@ class GrootTorchFrontendThor:
 
         # Precompute cross-attention K/V projections (runs once, reused across 4 steps)
         self._g_dit.precompute_cross_kv()
+        self._copy_state_feature_to_dit(
+            obs.get('state', np.zeros(self.state_dim, dtype=np.float32)))
         self._g_dit.b_actions.normal_()
 
         # ── 5. DiT graph replay ──

@@ -261,6 +261,11 @@ class GrootN17TorchFrontendThor:
           * ``self._visual_pos_masks``           — bool device (S,)
           * ``self.Se``                          — int = S
         """
+        if hasattr(self, "_backbone_features"):
+            raise RuntimeError(
+                "set_prompt() after GROOT N1.7 prompt runtime initialization "
+                "is not supported; construct a new frontend instance for a new prompt")
+
         from flash_rt.models.groot_n17 import calibration as cal
         from flash_rt.models.groot_n17.calibration import build_vit_rope_tables
 
