@@ -216,15 +216,77 @@ def test_agent_service_stream_openai_yields_live_sse_chunks():
     assert svc.sessions.hot_session_id == "agent-stream"
 
 
+def test_agent_service_stream_openai_reuses_hot_session_prefix():
+    engine = FakeAgentEngine()
+    svc = AgentService(engine)
+    list(svc.stream_openai(AgentRequest(
+        session_id="agent-stream-cache",
+        messages=[{"role": "user", "content": "abc"}],
+        max_tokens=2,
+    ), model=engine.model_name))
+
+    list(svc.stream_openai(AgentRequest(
+        session_id="agent-stream-cache",
+        messages=[
+            {"role": "user", "content": "abc"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "z"},
+        ],
+        max_tokens=1,
+    ), model=engine.model_name))
+
+    assert engine.prefills[-1][1:] == (6, 1, 6)
+
+
+def test_qwen36_agent_fastapi_non_stream_and_stream_endpoints():
+    from fastapi.testclient import TestClient
+    from serving.qwen36_agent.server import build_app
+
+    engine = FakeAgentEngine()
+    app = build_app(AgentService(engine))
+    client = TestClient(app)
+
+    model_resp = client.get("/v1/models")
+    assert model_resp.status_code == 200
+    assert model_resp.json()["data"][0]["id"] == "fake-qwen36"
+
+    resp = client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "abc"}],
+        "max_completion_tokens": 2,
+        "flashrt_session_id": "http-session",
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["choices"][0]["message"]["content"] == "hi"
+    assert body["flashrt"]["prefix_action"] == "append"
+
+    stream_resp = client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "def"}],
+        "max_tokens": 2,
+        "stream": True,
+        "flashrt_session_id": "http-stream",
+    })
+    assert stream_resp.status_code == 200
+    assert stream_resp.headers["content-type"].startswith("text/event-stream")
+    text = stream_resp.text
+    assert '"role":"assistant"' in text
+    assert '"content":"h"' in text
+    assert "data: [DONE]" in text
+
+
 def test_openai_request_and_response_include_flashrt_cache_metrics():
     engine = FakeAgentEngine()
     svc = AgentService(engine)
     req = request_from_openai({
         "messages": [{"role": "user", "content": "a"}],
-        "max_tokens": 1,
+        "max_completion_tokens": 1,
         "stream": "false",
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "tool_choice": "auto",
         "flashrt_session_id": "s",
     })
+    assert req.max_tokens == 1
     res = svc.complete(req)
     body = result_to_openai(res, model=engine.model_name)
     assert body["model"] == "fake-qwen36"

@@ -261,7 +261,10 @@ def parse_bool(value: Any, *, default: bool = False) -> bool:
 def request_from_openai(req: Dict[str, Any], *, default_k: int = 6) -> AgentRequest:
     messages = validate_messages(req.get("messages"))
     tools = validate_tools(req.get("tools"))
-    max_tokens = int(req.get("max_tokens", 256))
+    max_tokens = int(req.get(
+        "max_tokens", req.get("max_completion_tokens", 256)))
+    if max_tokens < 1:
+        raise ValueError("max_tokens must be >= 1")
     return AgentRequest(
         messages=messages,
         tools=tools,

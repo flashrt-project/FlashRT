@@ -66,6 +66,8 @@ short-context committed split:
 Long-context append-prefill is limited to the currently hot contiguous session.
 Non-hot sessions still rebuild/restore at the policy layer rather than reporting
 a fake cache hit.
+Exact same-length prompts continue from the current hot boundary; shorter
+prompts rebuild until rollback/checkpoint support lands.
 
 ## Run
 
@@ -86,3 +88,24 @@ The HTTP surface is OpenAI-compatible for `/v1/models` and
   policies.
 - `flashrt_K`: speculative decode K for this request.
 - `enable_thinking`: passed to the Qwen chat template.
+
+## Validation
+
+Fast policy and HTTP checks:
+
+```bash
+PYTHONPATH=. PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q \
+  tests/test_qwen36_agent_serving_policy.py \
+  tests/test_qwen36_server_warmup.py \
+  tests/test_qwen36_agent_gpu_split.py
+```
+
+The GPU split test is skipped unless both checkpoint variables are present.  To
+validate real Qwen3.6 short/long split and long append equivalence:
+
+```bash
+FLASHRT_QWEN36_NVFP4_CKPT_DIR=CHECKPOINT_DIR \
+FLASHRT_QWEN36_MTP_CKPT_DIR=MTP_CHECKPOINT_DIR \
+PYTHONPATH=. PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+pytest -q tests/test_qwen36_agent_gpu_split.py -s
+```
