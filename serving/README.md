@@ -13,15 +13,30 @@ exec/      (C ABI contract)    replay-time mechanism: Buffer / Graph / Plan     
 csrc/      (kernels)           the captured compute (fvk / cutlass / ...)               [hot path]
 ```
 
-Hosts (host language chosen per scenario; all link the same `libflashrt_exec`):
-- **`robot_host/`** (C++) — real-time VLA loop: vision→action Plan, concurrent
-  ASR stream, subgoal-buffer interrupt. C++ = one toolchain with exec+kernel, no
-  FFI seam, real-time/ROS2-adjacent.
-- **`llm_agent/`** (Rust) — LLM session server: per-token replay over the C ABI.
-  Rust = async/safety shell; the per-token FFI seam is crossed once per token.
+All hosts link the same `libflashrt_exec`; host language is chosen per scenario.
 
-Both are **reference skeletons**: they show the hot loop + C-ABI usage. Setup
-(capture + adopt) builds their handles once — via the Python frontend in the
+**Runnable Python hosts** (verified end-to-end with real Pi05 — the community can
+play with the mechanism directly):
+- **`robot_recap/`** — π*0.6/RECAP RL rollout: advantage-conditioned policy
+  (`set_rl_mode` CFG) + value-function critic co-hosted via ONE exec ctx, with an
+  episode state machine (per-chunk interruptible, buffer reset). Solves the real
+  "can't stop inference between episodes to reset/record" problem.
+- **`robot_pi07/`** — π0.7 hierarchy (BAGEL dropped): planner → subtask shared
+  buffer → actor, multi-rate, mid-run subtask interrupt. Two Pi05 via ONE ctx.
+
+**Native deployment host examples** (skeletons — how to write the production host):
+- **`robot_host/`** (C++) — real-time VLA host pattern: Plan, concurrent stream,
+  buffer-overwrite interrupt. C++ = one toolchain with exec+kernel, no FFI seam,
+  real-time/ROS2-adjacent.
+- **`llm_agent/`** (Rust) — LLM session server: per-token replay over the C ABI.
+  Rust = async/safety shell; the FFI seam is crossed once per token.
+
+Setup (capture + adopt) builds the handles once — via the Python frontend in the
 same process (Python out of the hot loop), or ported to native for a no-Python
 build. A captured CUDA graph is not serializable across processes, so capture
 runs in the same process that replays.
+
+The two Python hosts are mechanism demos: they drive real Pi05 graphs through the
+contract (multi-model co-host, hand-off, interrupt, reset) and verify the
+hot-path; they reuse the captured chunk and use stand-in critic/subtask wiring
+(see each README for honest scope). The C++/Rust dirs are reference skeletons.
