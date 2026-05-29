@@ -9,7 +9,6 @@ from __future__ import annotations
 import time
 from typing import Any, Dict
 
-from .openai_stream import sse_from_events
 from .service import AgentService, request_from_openai, result_to_openai
 
 SSE_HEADERS = {
@@ -49,24 +48,18 @@ def build_app(service: AgentService):
     async def chat_completions(raw: Dict[str, Any]):
         try:
             req = request_from_openai(raw)
+            if req.stream:
+                return StreamingResponse(
+                    service.stream_openai(req, model=service.engine.model_name),
+                    media_type="text/event-stream",
+                    headers=SSE_HEADERS,
+                )
             result = service.complete(req)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
         except NotImplementedError as exc:
             raise HTTPException(501, str(exc)) from exc
 
-        if req.stream:
-            return StreamingResponse(
-                sse_from_events(
-                    result.completion_id,
-                    service.engine.model_name,
-                    result.events,
-                    finish_reason=result.finish_reason,
-                    usage=result.usage,
-                ),
-                media_type="text/event-stream",
-                headers=SSE_HEADERS,
-            )
         return result_to_openai(result, model=service.engine.model_name)
 
     @app.post("/v1/sessions")
