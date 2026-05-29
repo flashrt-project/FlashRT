@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
 from .engine import AgentEngine, DecodeChunk, GenerationStats
+from .openai_stream import (
+    done_chunk,
+    event_chunk,
+    role_chunk,
+    sse_data,
+)
 from .session import PrefixPlan, SessionRegistry
 from .tool_stream import StreamEvent, ToolCallStreamParser
 
@@ -45,6 +51,24 @@ class AgentService:
         self.engine = engine
         self.sessions = sessions or SessionRegistry()
 
+    def _effective_plan(
+            self, session, plan: PrefixPlan) -> tuple[int, PrefixPlan]:
+        # v1 contiguous policy: only the currently hot session can reuse GPU
+        # state. Non-hot matches keep their token journal but rebuild until a
+        # checkpoint/offload backend lands.
+        effective_cached = plan.cached_tokens
+        if plan.cached_tokens and self.sessions.hot_session_id != session.session_id:
+            effective_cached = 0
+            plan = PrefixPlan(
+                session_id=session.session_id,
+                cached_tokens=0,
+                new_prefill_tokens=plan.incoming_tokens,
+                incoming_tokens=plan.incoming_tokens,
+                matched_tokens=plan.matched_tokens,
+                action="activate_rebuild",
+            )
+        return effective_cached, plan
+
     def complete(self, req: AgentRequest) -> AgentResult:
         if req.max_tokens < 1:
             raise ValueError("max_tokens must be >= 1")
@@ -59,20 +83,7 @@ class AgentService:
             cache_salt=req.cache_salt,
         )
 
-        # v1 contiguous policy: only the currently hot session can reuse GPU
-        # state.  Non-hot append/exact matches keep their token journal but must
-        # rebuild until a checkpoint/offload backend lands.
-        effective_cached = plan.cached_tokens
-        if plan.cached_tokens and self.sessions.hot_session_id != session.session_id:
-            effective_cached = 0
-            plan = PrefixPlan(
-                session_id=session.session_id,
-                cached_tokens=0,
-                new_prefill_tokens=len(prompt_tokens),
-                incoming_tokens=len(prompt_tokens),
-                matched_tokens=plan.matched_tokens,
-                action="activate_rebuild",
-            )
+        effective_cached, plan = self._effective_plan(session, plan)
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         t0 = time.perf_counter()
@@ -143,6 +154,61 @@ class AgentService:
             stats=stats,
             prefix_plan=plan,
         )
+
+    def stream_openai(self, req: AgentRequest, *,
+                      model: str) -> Iterable[str]:
+        """Yield OpenAI-compatible SSE chunks as decode commits tokens."""
+        if req.max_tokens < 1:
+            raise ValueError("max_tokens must be >= 1")
+        prompt_tokens = self.engine.tokenize_chat(
+            req.messages,
+            tools=req.tools,
+            enable_thinking=req.enable_thinking,
+        )
+        session, plan = self.sessions.plan_request(
+            req.session_id,
+            prompt_tokens,
+            cache_salt=req.cache_salt,
+        )
+        effective_cached, _ = self._effective_plan(session, plan)
+
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        self.engine.prefill(
+            prompt_tokens,
+            cached_tokens=effective_cached,
+            max_tokens=req.max_tokens,
+            K=req.K,
+        )
+
+        parser = ToolCallStreamParser()
+        generated_ids: List[int] = []
+        seen_tool_call = False
+        yield sse_data(role_chunk(completion_id, model))
+        for chunk in self.engine.generate_stream(max_tokens=req.max_tokens, K=req.K):
+            generated_ids.extend(int(t) for t in chunk.token_ids)
+            for ev in parser.feed(chunk.text):
+                if ev.kind == "tool_call":
+                    seen_tool_call = True
+                yield sse_data(event_chunk(completion_id, model, ev))
+        for ev in parser.finish():
+            if ev.kind == "tool_call":
+                seen_tool_call = True
+            yield sse_data(event_chunk(completion_id, model, ev))
+
+        session.commit([*prompt_tokens, *generated_ids])
+        self.sessions.mark_hot(session.session_id)
+        usage = {
+            "prompt_tokens": len(prompt_tokens),
+            "completion_tokens": len(generated_ids),
+            "total_tokens": len(prompt_tokens) + len(generated_ids),
+        }
+        yield sse_data(done_chunk(
+            completion_id,
+            model,
+            finish_reason="tool_calls" if seen_tool_call else "stop",
+            usage=usage,
+        ))
+        yield "data: [DONE]\n\n"
 
 
 def validate_messages(messages: Any) -> List[Dict[str, Any]]:

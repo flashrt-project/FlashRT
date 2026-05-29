@@ -182,6 +182,23 @@ def test_agent_service_parses_tool_calls_from_generated_stream():
     assert res.tool_calls[0]["function"]["name"] == "lookup"
 
 
+def test_agent_service_stream_openai_yields_live_sse_chunks():
+    engine = FakeAgentEngine()
+    svc = AgentService(engine)
+    chunks = list(svc.stream_openai(AgentRequest(
+        session_id="agent-stream",
+        messages=[{"role": "user", "content": "abc"}],
+        max_tokens=2,
+    ), model=engine.model_name))
+    joined = "".join(chunks)
+    assert '"role":"assistant"' in joined
+    assert '"content":"h"' in joined
+    assert '"content":"i"' in joined
+    assert '"completion_tokens":2' in joined
+    assert chunks[-1] == "data: [DONE]\n\n"
+    assert svc.sessions.hot_session_id == "agent-stream"
+
+
 def test_openai_request_and_response_include_flashrt_cache_metrics():
     engine = FakeAgentEngine()
     svc = AgentService(engine)
