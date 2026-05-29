@@ -1,5 +1,12 @@
 from serving.qwen36_agent.openai_stream import sse_from_events
 from serving.qwen36_agent.prefix import longest_common_prefix
+from serving.qwen36_agent.engine import DecodeChunk
+from serving.qwen36_agent.service import (
+    AgentRequest,
+    AgentService,
+    request_from_openai,
+    result_to_openai,
+)
 from serving.qwen36_agent.session import SessionRegistry
 from serving.qwen36_agent.tool_stream import ToolCallStreamParser
 
@@ -80,3 +87,95 @@ def test_sse_stream_contains_role_tool_call_and_done():
     assert '"tool_calls"' in joined
     assert '"finish_reason":"tool_calls"' in joined
     assert chunks[-1] == "data: [DONE]\n\n"
+
+
+class FakeAgentEngine:
+    model_name = "fake-qwen36"
+    max_seq = 262208
+
+    def __init__(self):
+        self.prefills = []
+        self.outputs = [
+            DecodeChunk((ord("h"),), "h", 1),
+            DecodeChunk((ord("i"),), "i", 1),
+        ]
+
+    def tokenize_chat(self, messages, tools=None, *, enable_thinking=False):
+        del tools, enable_thinking
+        out = []
+        for msg in messages:
+            out.extend(ord(ch) for ch in (msg.get("content") or ""))
+            if msg.get("role") != "assistant":
+                out.append(0)
+        return out
+
+    def prefill(self, token_ids, *, cached_tokens=0):
+        self.prefills.append((list(token_ids), cached_tokens))
+
+    def generate_stream(self, *, max_tokens, K):
+        del K
+        yield from self.outputs[:max_tokens]
+
+
+def test_agent_service_reuses_exact_session_prefix_when_history_is_returned():
+    engine = FakeAgentEngine()
+    svc = AgentService(engine)
+    req0 = AgentRequest(
+        session_id="agent-1",
+        messages=[{"role": "user", "content": "abc"}],
+        max_tokens=2,
+    )
+    res0 = svc.complete(req0)
+    assert res0.stats.cached_tokens == 0
+    assert res0.stats.new_prefill_tokens == 4
+    assert engine.prefills[-1][1] == 0
+    assert res0.text == "hi"
+    assert res0.finish_reason == "stop"
+
+    req1 = AgentRequest(
+        session_id="agent-1",
+        messages=[
+            {"role": "user", "content": "abc"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "tool", "content": "de"},
+        ],
+        max_tokens=1,
+    )
+    res1 = svc.complete(req1)
+    assert res1.prefix_plan.action == "append"
+    assert res1.stats.cached_tokens == 6
+    assert res1.stats.new_prefill_tokens == 3
+    assert engine.prefills[-1][1] == 6
+
+
+def test_agent_service_parses_tool_calls_from_generated_stream():
+    engine = FakeAgentEngine()
+    engine.outputs = [
+        DecodeChunk((1000,), "hello ", 1),
+        DecodeChunk((1001,), '<tool_call>{"name":"lookup","arguments":{"x":1}}</tool_call>', 1),
+    ]
+    svc = AgentService(engine)
+    res = svc.complete(AgentRequest(
+        session_id="agent-tools",
+        messages=[{"role": "user", "content": "abc"}],
+        max_tokens=2,
+    ))
+    assert res.text == "hello "
+    assert res.finish_reason == "tool_calls"
+    assert res.tool_calls[0]["function"]["name"] == "lookup"
+
+
+def test_openai_request_and_response_include_flashrt_cache_metrics():
+    engine = FakeAgentEngine()
+    svc = AgentService(engine)
+    req = request_from_openai({
+        "messages": [{"role": "user", "content": "a"}],
+        "max_tokens": 1,
+        "stream": "false",
+        "flashrt_session_id": "s",
+    })
+    res = svc.complete(req)
+    body = result_to_openai(res, model=engine.model_name)
+    assert body["model"] == "fake-qwen36"
+    assert body["flashrt"]["session_id"] == "s"
+    assert body["flashrt"]["new_prefill_tokens"] == 2

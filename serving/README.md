@@ -71,8 +71,14 @@ File: `verify_pi07.py`.
 - **`robot_host/`** (C++) — real-time VLA deployment host pattern (Plan,
   concurrent stream, buffer-overwrite interrupt). One toolchain with
   exec+kernel, no FFI seam; the target form for on-robot / ROS2 deployment.
+- **`qwen36_agent/`** (Python first) — Qwen3.6 long-session agent serving
+  policy: exact token-prefix reuse, contiguous session cache, OpenAI-compatible
+  tool calls, and true SSE streaming at spec-decode accept boundaries. This is
+  the production path for local coding-agent style workloads; the hot compute
+  still comes from the Qwen3.6 kernel/CUDA-graph frontend.
 - **`llm_agent/`** (Rust) — LLM session server (per-token replay over the C ABI;
-  async/safety shell). The FFI seam is crossed once per token.
+  async/safety shell). This remains a reference shell for future high-concurrency
+  control-plane experiments; it is not the near-term production path.
 
 These show the hot loop + C-ABI usage; they are reference skeletons, not yet
 runnable end-to-end. The C++/Rust hosts will mirror the verified Python hosts

@@ -26,6 +26,12 @@ current fastest Qwen3.6 CUDA-graph replay path. A request can reuse the hot
 frontend state when its tokenized prompt exactly extends the cached session
 prefix. Divergent prompts rebuild or restore at a future checkpoint boundary.
 
+For OpenAI-style clients that resend the full message list every turn, prefix
+reuse requires the history to include the assistant content/tool call emitted by
+the previous response. If a client sends only the new user/tool message without
+the assistant turn, the token stream has diverged and the server must rebuild or
+restore from a checkpoint.
+
 This intentionally differs from paged/block serving frameworks: those are good
 for high-concurrency batch serving, but the first FlashRT agent target is one
 interactive long session on a consumer GPU.

@@ -6,10 +6,14 @@ policy.  The lower exec layer remains Buffer/Graph/Plan/Event only.
 """
 
 from .prefix import PrefixMatch, longest_common_prefix
+from .service import AgentRequest, AgentResult, AgentService
 from .session import PrefixPlan, SessionRecord, SessionRegistry
 from .tool_stream import StreamEvent, ToolCallStreamParser
 
 __all__ = [
+    "AgentRequest",
+    "AgentResult",
+    "AgentService",
     "PrefixMatch",
     "PrefixPlan",
     "SessionRecord",
