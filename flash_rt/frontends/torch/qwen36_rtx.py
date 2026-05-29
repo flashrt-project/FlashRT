@@ -8506,6 +8506,89 @@ class Qwen36TorchFrontendRtx:
             )
         return last_h.view(1, 1, hidden), last_logits
 
+    def _ensure_agent_long_h_tail(self, rows: int) -> None:
+        from flash_rt import flash_rt_kernels as fvk
+        import torch
+
+        rows = int(rows)
+        hidden = self._cfg['hidden_size']
+        cap = int(getattr(self, '_agent_long_h_tail_cap', 0))
+        if cap >= rows:
+            return
+        new_cap = max(rows, max(16, cap * 2))
+        old = getattr(self, '_agent_long_h_tail', None)
+        self._agent_long_h_tail = torch.empty(
+            new_cap, hidden, device=self.device, dtype=torch.bfloat16)
+        if old is not None and int(getattr(self, '_agent_long_h_tail_rows', 0)):
+            old_rows = int(self._agent_long_h_tail_rows)
+            s = torch.cuda.current_stream().cuda_stream
+            fvk.gpu_copy(
+                self._agent_long_h_tail[:old_rows].data_ptr(),
+                old[:old_rows].data_ptr(),
+                old_rows * hidden * 2, s,
+            )
+        self._agent_long_h_tail_cap = new_cap
+
+    def _agent_long_h_tail_reset_from_prompt(self) -> None:
+        from flash_rt import flash_rt_kernels as fvk
+        import torch
+
+        start = int(getattr(self, '_long_mtp_h_tail_start', 0))
+        rows = int(getattr(self, '_long_mtp_h_tail_rows', 0))
+        self._ensure_agent_long_h_tail(rows)
+        if rows > 0:
+            s = torch.cuda.current_stream().cuda_stream
+            fvk.gpu_copy(
+                self._agent_long_h_tail[:rows].data_ptr(),
+                self._long_mtp_h_tail[:rows].data_ptr(),
+                rows * self._cfg['hidden_size'] * 2, s,
+            )
+        self._agent_long_h_tail_start = start
+        self._agent_long_h_tail_rows = rows
+
+    def _agent_long_h_tail_append(self, abs_pos: int, h_rows) -> None:
+        from flash_rt import flash_rt_kernels as fvk
+        import torch
+
+        rows = int(h_rows.shape[0])
+        if rows <= 0:
+            return
+        abs_pos = int(abs_pos)
+        cur_start = int(getattr(self, '_agent_long_h_tail_start', abs_pos))
+        cur_rows = int(getattr(self, '_agent_long_h_tail_rows', 0))
+        if cur_rows == 0:
+            cur_start = abs_pos
+        expected = cur_start + cur_rows
+        if abs_pos != expected:
+            raise RuntimeError(
+                f'non-contiguous long hidden tail append: '
+                f'got {abs_pos}, expected {expected}')
+        self._ensure_agent_long_h_tail(cur_rows + rows)
+        s = torch.cuda.current_stream().cuda_stream
+        fvk.gpu_copy(
+            self._agent_long_h_tail[cur_rows:cur_rows + rows].data_ptr(),
+            h_rows.contiguous().view(rows, self._cfg['hidden_size']).data_ptr(),
+            rows * self._cfg['hidden_size'] * 2, s,
+        )
+        cur_rows += rows
+
+        keep = max(
+            int(getattr(self, '_long_mtp_prefill_tail_effective', 0)) + 8,
+            int(getattr(self, '_agent_stream_K', 0)) + 8,
+            16,
+        )
+        if cur_rows > keep:
+            drop = cur_rows - keep
+            fvk.gpu_copy(
+                self._agent_long_h_tail[:keep].data_ptr(),
+                self._agent_long_h_tail[drop:drop + keep].data_ptr(),
+                keep * self._cfg['hidden_size'] * 2, s,
+            )
+            cur_start += drop
+            cur_rows = keep
+        self._agent_long_h_tail_start = cur_start
+        self._agent_long_h_tail_rows = cur_rows
+
     def prefill_long_ctx_nvfp4_agent(
             self, input_ids, *, max_new_tokens: int, K: int = 6):
         """Build a committed-stream boundary for the long FP8-KV/TQ route."""
@@ -8625,6 +8708,7 @@ class Qwen36TorchFrontendRtx:
                 last_h, pending_tok, prompt_len, mtp_cache_pos=mtp_base)
             ev_pf1.record()
 
+        self._agent_long_h_tail_reset_from_prompt()
         self._spec_attempts = 0
         self._spec_accepts = 0
         self._spec_full = 0
@@ -8891,6 +8975,11 @@ class Qwen36TorchFrontendRtx:
                 self._tq_mark_dequant_valid_end(cur_pos)
                 self._fp8_mark_dequant_valid_end(cur_pos)
 
+                commit_count = len(committed)
+                self._agent_long_h_tail_append(
+                    cur_pos - commit_count,
+                    self._K_last_hidden_buf[:, :commit_count, :].view(
+                        commit_count, hidden))
                 emitted += len(committed)
                 self._agent_stream_cur_pos = cur_pos
                 self._agent_stream_pending_tok = pending_tok

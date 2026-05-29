@@ -72,6 +72,12 @@ def _assert_split_matches_full(fe, prompt_len: int, *,
     torch.cuda.synchronize()
     actual = [tok for chunk in chunks for tok in chunk]
     assert actual == expected
+    if fe._should_use_long_ctx_route(prompt_len, max_new):
+        start = int(getattr(fe, "_agent_long_h_tail_start", -1))
+        rows = int(getattr(fe, "_agent_long_h_tail_rows", 0))
+        assert start >= 0
+        assert start + rows == prompt_len + max_new
+        assert rows >= max_new
 
 
 def test_qwen36_short_agent_split_matches_full_generate():
