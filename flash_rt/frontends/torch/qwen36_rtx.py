@@ -4471,8 +4471,21 @@ class Qwen36TorchFrontendRtx:
         Yields:
             tuple[int, ...]: committed token ids accepted at one spec boundary.
         """
+        self.prefill_own_speculative_nvfp4_agent(
+            input_ids, max_new_tokens=max_new_tokens, K=K)
+        yield from self.decode_own_speculative_nvfp4_committed_stream(
+            max_new_tokens=max_new_tokens, K=K)
+
+    def prefill_own_speculative_nvfp4_agent(
+            self, input_ids, *, max_new_tokens: int, K: int = 6):
+        """Build the committed-stream boundary for Qwen3.6 short contexts.
+
+        This keeps capture/model setup in the frontend, but exposes the
+        replay-time boundary needed by serving: after this method returns, the
+        prompt has populated KV/recurrent state and one private lookahead token
+        is stored for committed decode.
+        """
         import torch
-        from flash_rt import flash_rt_kernels as fvk
 
         prompt_len = int(input_ids.shape[1])
         if getattr(self, '_long_ctx_mode', False) and self._should_use_long_ctx_route(
@@ -4490,7 +4503,6 @@ class Qwen36TorchFrontendRtx:
                 f'K={K} out of range — need 1<=K<={max_spec_k}')
 
         hidden = self._cfg['hidden_size']
-        s = torch.cuda.current_stream().cuda_stream
 
         self.reset_state()
         self.reset_mtp_state()
@@ -4503,7 +4515,6 @@ class Qwen36TorchFrontendRtx:
             # committed by a main-model step below.
             ev_pf0 = torch.cuda.Event(enable_timing=True)
             ev_pf1 = torch.cuda.Event(enable_timing=True)
-            ev_dec1 = torch.cuda.Event(enable_timing=True)
             ev_pf0.record()
             for p in range(prompt_len):
                 self._static_token_id.copy_(input_ids[:, p:p + 1])
@@ -4527,11 +4538,47 @@ class Qwen36TorchFrontendRtx:
             self.forward_mtp_head_nvfp4(h, pending_tok, prompt_len)
             ev_pf1.record()
 
-            self._spec_attempts = 0
-            self._spec_accepts = 0
-            self._spec_full = 0
-            emitted = 0
+        self._spec_attempts = 0
+        self._spec_accepts = 0
+        self._spec_full = 0
+        self._agent_stream_active = True
+        self._agent_stream_prompt_len = prompt_len
+        self._agent_stream_cur_pos = cur_pos
+        self._agent_stream_pending_tok = pending_tok
+        self._agent_stream_h = h
+        self._agent_stream_pf0 = ev_pf0
+        self._agent_stream_pf1 = ev_pf1
 
+    def decode_own_speculative_nvfp4_committed_stream(
+            self, *, max_new_tokens: int, K: int = 6):
+        """Decode from the current committed-stream boundary.
+
+        Every yielded chunk has already been replayed through the main model.
+        The private correction/bonus token remains hidden as lookahead until a
+        later verify step commits it.
+        """
+        import torch
+        from flash_rt import flash_rt_kernels as fvk
+
+        if not getattr(self, '_agent_stream_active', False):
+            raise RuntimeError(
+                'prefill_own_speculative_nvfp4_agent must run before decode')
+
+        max_spec_k = min(self.MAX_Q_SEQ - 1, self._MAX_PUBLIC_SPEC_K)
+        if K < 1 or K > max_spec_k:
+            raise ValueError(
+                f'K={K} out of range — need 1<=K<={max_spec_k}')
+
+        s = torch.cuda.current_stream().cuda_stream
+        cur_pos = int(self._agent_stream_cur_pos)
+        pending_tok = self._agent_stream_pending_tok
+        h = self._agent_stream_h
+        ev_pf0 = self._agent_stream_pf0
+        ev_pf1 = self._agent_stream_pf1
+        ev_dec1 = torch.cuda.Event(enable_timing=True)
+        emitted = 0
+
+        with torch.no_grad():
             while emitted < int(max_new_tokens):
                 remaining = int(max_new_tokens) - emitted
                 draft_k = min(int(K), max(0, remaining - 1))
@@ -4561,6 +4608,9 @@ class Qwen36TorchFrontendRtx:
                     h = self._K_last_hidden_buf[:, 0:1, :].contiguous()
                     cur_pos += 1
                     emitted += 1
+                    self._agent_stream_cur_pos = cur_pos
+                    self._agent_stream_pending_tok = pending_tok
+                    self._agent_stream_h = h
                     yield out_ids
                     continue
 
@@ -4671,6 +4721,9 @@ class Qwen36TorchFrontendRtx:
                         'internal error: committed chunk exceeds remaining '
                         'budget')
                 emitted += len(committed)
+                self._agent_stream_cur_pos = cur_pos
+                self._agent_stream_pending_tok = pending_tok
+                self._agent_stream_h = h
                 yield tuple(committed)
 
             ev_dec1.record()
