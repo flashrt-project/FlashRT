@@ -1,3 +1,5 @@
+import pytest
+
 from serving.qwen36_agent.openai_stream import sse_from_events
 from serving.qwen36_agent.prefix import longest_common_prefix
 from serving.qwen36_agent.qwen36_engine import Qwen36FrontendAgentEngine
@@ -283,6 +285,7 @@ def test_agent_service_stream_openai_reuses_hot_session_prefix():
 
 
 def test_qwen36_agent_fastapi_non_stream_and_stream_endpoints():
+    pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
     from serving.qwen36_agent.server import build_app
 
