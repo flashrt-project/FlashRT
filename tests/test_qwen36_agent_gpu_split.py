@@ -80,6 +80,41 @@ def _assert_split_matches_full(fe, prompt_len: int, *,
         assert rows >= max_new
 
 
+def _chat_ids(fe, user_text: str):
+    import torch
+
+    prompt = fe._tokenizer.apply_chat_template(
+        [{"role": "user", "content": user_text}],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    ids = fe._tokenizer(prompt, add_special_tokens=False).input_ids
+    return torch.tensor([ids], device="cuda", dtype=torch.long)
+
+
+def _assert_long_text_split_matches_full(fe, text: str, *,
+                                         max_new: int = 32, K: int = 6):
+    import torch
+
+    ids = _chat_ids(fe, text)
+    prompt_len = int(ids.shape[1])
+    assert fe._should_use_long_ctx_route(prompt_len, max_new)
+    torch.cuda.synchronize()
+    full = fe.generate_own_speculative_KN_nvfp4(
+        ids, max_new_tokens=max_new, K=K)
+    expected = full[0, prompt_len:prompt_len + max_new].tolist()
+
+    if hasattr(fe, "clear_graphs"):
+        fe.clear_graphs()
+    fe.prefill_long_ctx_nvfp4_agent(ids, max_new_tokens=max_new, K=K)
+    chunks = list(fe.decode_long_ctx_nvfp4_committed_stream(
+        max_new_tokens=max_new, K=K))
+    torch.cuda.synchronize()
+    actual = [tok for chunk in chunks for tok in chunk]
+    assert actual == expected
+
+
 def test_qwen36_short_agent_split_matches_full_generate():
     fe = _load_frontend(max_seq=4096)
     _assert_split_matches_full(fe, 64)
@@ -131,3 +166,16 @@ def test_qwen36_long_agent_append_matches_full_generate(monkeypatch):
         max_new_tokens=next_new, K=K))
     actual = [tok for chunk in chunks for tok in chunk]
     assert actual == expected
+
+
+def test_qwen36_long_agent_text_split_matches_full_generate(monkeypatch):
+    monkeypatch.setenv("FLASHRT_QWEN36_LONG_KV_CACHE", "fp8")
+    fe = _load_frontend(max_seq=32768)
+    context = (
+        "File: qwen36_rtx.py\n"
+        "- split prefill path\n"
+        "- long context fp8 kv route\n"
+        "- session prefix append\n"
+    ) * 20
+    _assert_long_text_split_matches_full(
+        fe, context + "\nFill release notes with bullet points.")

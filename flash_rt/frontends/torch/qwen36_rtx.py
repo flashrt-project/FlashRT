@@ -4616,6 +4616,20 @@ class Qwen36TorchFrontendRtx:
         self._agent_stream_pf0 = ev_pf0
         self._agent_stream_pf1 = ev_pf1
 
+    def _agent_stable_pending_tok(self, tok):
+        """Copy the private lookahead token out of reusable argmax buffers."""
+        import torch
+        from flash_rt import flash_rt_kernels as fvk
+
+        if not hasattr(self, '_agent_pending_tok_buf'):
+            self._agent_pending_tok_buf = torch.empty(
+                (1, 1), device=self.device, dtype=torch.long)
+        s = torch.cuda.current_stream().cuda_stream
+        src = tok.view(1, 1)
+        fvk.gpu_copy(
+            self._agent_pending_tok_buf.data_ptr(), src.data_ptr(), 8, s)
+        return self._agent_pending_tok_buf
+
     def decode_own_speculative_nvfp4_committed_stream(
             self, *, max_new_tokens: int, K: int = 6):
         """Decode from the current committed-stream boundary.
@@ -4672,8 +4686,9 @@ class Qwen36TorchFrontendRtx:
                         vg.replay()
                     torch.cuda.current_stream().wait_stream(gs)
                     out_ids = (int(pending_tok.item()),)
-                    pending_tok = self._K_logits_buf[:1].argmax(
-                        dim=-1, keepdim=True).view(1, 1)
+                    pending_tok = self._agent_stable_pending_tok(
+                        self._K_logits_buf[:1].argmax(
+                            dim=-1, keepdim=True).view(1, 1))
                     h = self._K_last_hidden_buf[:, 0:1, :].contiguous()
                     cur_pos += 1
                     emitted += 1
@@ -4768,7 +4783,8 @@ class Qwen36TorchFrontendRtx:
                     committed.extend(int(x) for x in all_argmax[:N].tolist())
                 if N == draft_k:
                     self._spec_full += 1
-                    pending_tok = all_argmax[draft_k:draft_k + 1].view(1, 1)
+                    pending_tok = self._agent_stable_pending_tok(
+                        all_argmax[draft_k:draft_k + 1].view(1, 1))
                     h = self._K_last_hidden_buf[
                         :, draft_k:draft_k + 1, :].contiguous()
                     cur_pos += draft_k + 1
@@ -4783,7 +4799,8 @@ class Qwen36TorchFrontendRtx:
                         self._K_lin_conv_state_per_step[N].data_ptr(),
                         self._lin_conv_state.numel() * 2, s,
                     )
-                    pending_tok = all_argmax[N:N + 1].view(1, 1)
+                    pending_tok = self._agent_stable_pending_tok(
+                        all_argmax[N:N + 1].view(1, 1))
                     h = self._K_last_hidden_buf[
                         :, N:N + 1, :].contiguous()
                     cur_pos += N + 1
@@ -8669,10 +8686,12 @@ class Qwen36TorchFrontendRtx:
                         self._spec_accept_n_buf.data_ptr(),
                         1, self._cfg['vocab_size'], 0, s,
                     )
-                pending_tok = self._spec_argmax_buf[:1].view(1, 1)
+                pending_tok = self._agent_stable_pending_tok(
+                    self._spec_argmax_buf[:1].view(1, 1))
             else:
-                pending_tok = last_logits.argmax(
-                    dim=-1, keepdim=True).view(1, 1)
+                pending_tok = self._agent_stable_pending_tok(
+                    last_logits.argmax(
+                        dim=-1, keepdim=True).view(1, 1))
 
             mtp_tail = self._long_mtp_prefill_tail_for_prompt(prompt_len)
             mtp_base = 0
@@ -8952,7 +8971,8 @@ class Qwen36TorchFrontendRtx:
                     committed.extend(int(x) for x in all_argmax[:N].tolist())
                 if N == draft_k:
                     self._spec_full += 1
-                    pending_tok = all_argmax[draft_k:draft_k + 1].view(1, 1)
+                    pending_tok = self._agent_stable_pending_tok(
+                        all_argmax[draft_k:draft_k + 1].view(1, 1))
                     h = self._K_last_hidden_buf[
                         :, draft_k:draft_k + 1, :]
                     cur_pos += draft_k + 1
@@ -8969,7 +8989,8 @@ class Qwen36TorchFrontendRtx:
                         self._lin_conv_state.numel() * 2, s,
                     )
                     h = self._K_last_hidden_buf[:, N:N + 1, :]
-                    pending_tok = all_argmax[N:N + 1].view(1, 1)
+                    pending_tok = self._agent_stable_pending_tok(
+                        all_argmax[N:N + 1].view(1, 1))
                     cur_pos += N + 1
                     mtp_base += N + 1
                 self._tq_mark_dequant_valid_end(cur_pos)
@@ -9167,10 +9188,12 @@ class Qwen36TorchFrontendRtx:
                         self._spec_accept_n_buf.data_ptr(),
                         1, self._cfg['vocab_size'], 0, s,
                     )
-                pending_tok = self._spec_argmax_buf[:1].view(1, 1)
+                pending_tok = self._agent_stable_pending_tok(
+                    self._spec_argmax_buf[:1].view(1, 1))
             else:
-                pending_tok = last_logits.argmax(
-                    dim=-1, keepdim=True).view(1, 1)
+                pending_tok = self._agent_stable_pending_tok(
+                    last_logits.argmax(
+                        dim=-1, keepdim=True).view(1, 1))
 
             mtp_tail = self._long_mtp_prefill_tail_for_prompt(prompt_len)
             first = max(1, prompt_len - mtp_tail)
