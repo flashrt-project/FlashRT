@@ -4836,9 +4836,9 @@ class Qwen36TorchFrontendRtx:
         snapshot it, then restore-and-append on each later turn/session instead
         of re-prefilling the prefix. See docs/serving_design.md.
 
-        v1 covers the short committed-stream route (in-GPU device-to-device
-        clones); the long FP8-KV/TQ route is a separate, larger state surface
-        and is wired in a later phase.
+        Both committed-stream routes are covered (in-GPU device-to-device): the
+        short route and the long FP8-KV route. The long TQ KV mode is not yet
+        wired and raises NotImplementedError.
         """
         import torch
 
@@ -4847,9 +4847,7 @@ class Qwen36TorchFrontendRtx:
                 'snapshot_capsule requires an active committed-stream boundary '
                 '(call prefill_own_speculative_nvfp4_agent first)')
         if getattr(self, '_agent_stream_is_long', False):
-            raise NotImplementedError(
-                'long-context capsule snapshot is not wired yet; use the short '
-                'committed-stream route')
+            return self._snapshot_capsule_long()
 
         cur_pos = int(self._agent_stream_cur_pos)
         cap = {
@@ -4870,15 +4868,75 @@ class Qwen36TorchFrontendRtx:
         if hasattr(self, '_mtp_K_cache'):
             cap['mtp_K'] = self._mtp_K_cache[:cur_pos].clone()
             cap['mtp_V'] = self._mtp_V_cache[:cur_pos].clone()
-        # The capsule is a stable, stream-independent object: make sure the
-        # clones have completed before handing it back.
+        return self._finalize_capsule(cap)
+
+    def _snapshot_capsule_long(self):
+        """Freeze a long FP8-KV committed-stream boundary.
+
+        The long route stores full-attn KV in a packed FP8 cache plus a lazy
+        BF16 dequant stage. We snapshot the FP8 source of truth (the stage is
+        recomputed on restore), the linear-attn state, the MTP cache and the MTP
+        hidden tail, and the boundary metadata.
+        """
+        import torch
+
+        mode = getattr(self, '_long_kv_cache_mode', 'tq')
+        if mode != 'fp8':
+            raise NotImplementedError(
+                f'long-context capsule supports the fp8 KV mode only, got '
+                f'{mode!r}; set FLASHRT_QWEN36_LONG_KV_CACHE=fp8')
+        cur_pos = int(self._agent_stream_cur_pos)
+        mtp_base = int(self._agent_stream_mtp_base)
+        rows = int(getattr(self, '_long_mtp_h_tail_rows', 0))
+        cap = {
+            'is_long': True,
+            'kv_mode': 'fp8',
+            'cur_pos': cur_pos,
+            'prompt_len': int(self._agent_stream_prompt_len),
+            'mtp_base': mtp_base,
+            'K': int(getattr(self, '_agent_stream_K', 6)),
+            'lin_state': self._lin_state.clone(),
+            'lin_conv_state': self._lin_conv_state.clone(),
+            'fp8_K': self._fp8_K_cache[:, :cur_pos].clone(),
+            'fp8_V': self._fp8_V_cache[:, :cur_pos].clone(),
+            'pending_tok': self._agent_stream_pending_tok.clone(),
+            'h': self._agent_stream_h.clone(),
+            'long_mtp_h_tail_start': int(
+                getattr(self, '_long_mtp_h_tail_start', 0)),
+            'long_mtp_h_tail_rows': rows,
+            'spec_attempts': int(getattr(self, '_spec_attempts', 0)),
+            'spec_accepts': int(getattr(self, '_spec_accepts', 0)),
+            'spec_full': int(getattr(self, '_spec_full', 0)),
+        }
+        if hasattr(self, '_mtp_K_cache'):
+            mtp_extent = mtp_base + 1
+            cap['mtp_K'] = self._mtp_K_cache[:mtp_extent].clone()
+            cap['mtp_V'] = self._mtp_V_cache[:mtp_extent].clone()
+        if rows > 0 and hasattr(self, '_long_mtp_h_tail'):
+            cap['long_mtp_h_tail'] = self._long_mtp_h_tail[:rows].clone()
+        return self._finalize_capsule(cap)
+
+    def _finalize_capsule(self, cap):
+        """Make the capsule a stable, stream-independent object + size it."""
+        import torch
+
         torch.cuda.synchronize()
-        nbytes = 0
-        for v in cap.values():
-            if torch.is_tensor(v):
-                nbytes += v.element_size() * v.numel()
-        cap['nbytes'] = nbytes
+        cap['nbytes'] = sum(
+            v.element_size() * v.numel()
+            for v in cap.values() if torch.is_tensor(v))
         return cap
+
+    def _invalidate_long_dequant_stages(self) -> None:
+        """Mark every long-route dequant stage stale (mirrors reset_state) so
+        the next read re-dequantizes from the restored packed KV cache."""
+        if hasattr(self, '_tq_cache_packed'):
+            self._tq_cache_packed.invalidate_all()
+        for name in ('_tq_hot_stage_valid_end', '_fp8_stage_valid_end',
+                     '_fp8_hot_stage_valid_end'):
+            arr = getattr(self, name, None)
+            if arr is not None:
+                for i in range(len(arr)):
+                    arr[i] = 0
 
     def restore_capsule(self, cap) -> None:
         """Restore a committed-stream boundary from a capsule.
@@ -4892,8 +4950,8 @@ class Qwen36TorchFrontendRtx:
         import torch
 
         if cap.get('is_long', False):
-            raise NotImplementedError(
-                'long-context capsule restore is not wired yet')
+            self._restore_capsule_long(cap)
+            return
         cur_pos = int(cap['cur_pos'])
         if not hasattr(self, '_rope_cos_table'):
             self._build_rope_table()
@@ -4924,6 +4982,60 @@ class Qwen36TorchFrontendRtx:
         self._spec_full = int(cap.get('spec_full', 0))
         # Restore is the prefill-equivalent work; expose its cost through the
         # same timing fields the committed decode reports.
+        self._agent_stream_pf0 = ev0
+        self._agent_stream_pf1 = ev1
+
+    def _restore_capsule_long(self, cap) -> None:
+        """Restore a long FP8-KV committed-stream boundary."""
+        import torch
+
+        mode = getattr(self, '_long_kv_cache_mode', 'tq')
+        if mode != 'fp8' or cap.get('kv_mode') != 'fp8':
+            raise NotImplementedError(
+                'long-context capsule restore supports the fp8 KV mode only')
+        cur_pos = int(cap['cur_pos'])
+        mtp_base = int(cap['mtp_base'])
+        rows = int(cap['long_mtp_h_tail_rows'])
+        if not hasattr(self, '_rope_cos_table'):
+            self._build_rope_table()
+
+        ev0 = torch.cuda.Event(enable_timing=True)
+        ev1 = torch.cuda.Event(enable_timing=True)
+        with torch.no_grad():
+            ev0.record()
+            # Force fresh dequant from the restored FP8 cache (no stale stage).
+            self._invalidate_long_dequant_stages()
+            self._fp8_K_cache[:, :cur_pos].copy_(cap['fp8_K'])
+            self._fp8_V_cache[:, :cur_pos].copy_(cap['fp8_V'])
+            self._lin_state.copy_(cap['lin_state'])
+            self._lin_conv_state.copy_(cap['lin_conv_state'])
+            if 'mtp_K' in cap and hasattr(self, '_mtp_K_cache'):
+                m = int(cap['mtp_K'].shape[0])
+                self._mtp_K_cache[:m].copy_(cap['mtp_K'])
+                self._mtp_V_cache[:m].copy_(cap['mtp_V'])
+            if rows > 0 and 'long_mtp_h_tail' in cap and hasattr(
+                    self, '_long_mtp_h_tail'):
+                self._long_mtp_h_tail[:rows].copy_(cap['long_mtp_h_tail'])
+            ev1.record()
+
+        # Rebuild the agent-side hidden tail from the restored prompt tail, the
+        # same way a fresh long prefill does.
+        self._long_mtp_h_tail_start = int(cap['long_mtp_h_tail_start'])
+        self._long_mtp_h_tail_rows = rows
+        self._agent_long_h_tail_reset_from_prompt()
+
+        self._agent_stream_active = True
+        self._agent_stream_is_long = True
+        self._agent_stream_prompt_len = int(cap['prompt_len'])
+        self._agent_stream_cur_pos = cur_pos
+        self._agent_stream_mtp_base = mtp_base
+        self._agent_stream_K = int(cap['K'])
+        self._agent_stream_pending_tok = self._agent_stable_pending_tok(
+            cap['pending_tok'].view(1, 1))
+        self._agent_stream_h = cap['h'].clone()
+        self._spec_attempts = int(cap.get('spec_attempts', 0))
+        self._spec_accepts = int(cap.get('spec_accepts', 0))
+        self._spec_full = int(cap.get('spec_full', 0))
         self._agent_stream_pf0 = ev0
         self._agent_stream_pf1 = ev1
 
