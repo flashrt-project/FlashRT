@@ -7583,10 +7583,12 @@ class Qwen36TorchFrontendRtx:
             return int(tq_spec_k)
         prompt_len = int(prompt_len)
         caller_k = int(K)
-        if prompt_len < 192:
+        if prompt_len < 64:
+            target_k = 3
+        elif prompt_len < 192:
             target_k = 6
         elif prompt_len < 768:
-            target_k = 4
+            target_k = 3
         elif prompt_len < 1536:
             target_k = 5
         elif prompt_len < 3072:
