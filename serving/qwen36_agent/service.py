@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
-from .engine import AgentEngine, DecodeChunk, GenerationStats
+from .engine import AgentEngine, GenerationStats
 from .openai_stream import (
     done_chunk,
     event_chunk,
@@ -60,12 +60,31 @@ class AgentService:
 
     def complete(self, req: AgentRequest) -> AgentResult:
         with self._lock:
-            return self._complete(req)
+            completed = False
+            try:
+                result = self._complete(req)
+                completed = True
+                return result
+            finally:
+                # If generation raised partway, the frontend KV may have advanced
+                # while the journal did not — no session is safely hot. Rebuild.
+                if not completed:
+                    self.sessions.hot_session_id = None
 
     def stream_openai(self, req: AgentRequest, *,
                       model: str) -> Iterable[str]:
         with self._lock:
-            yield from self._stream_openai(req, model=model)
+            completed = False
+            try:
+                yield from self._stream_openai(req, model=model)
+                completed = True
+            finally:
+                # Client disconnect closes this generator (GeneratorExit) before
+                # the final commit / mark, and an exception aborts it too. Either
+                # way the frontend state advanced past the journal, so clear the
+                # hot session and force the next turn to rebuild.
+                if not completed:
+                    self.sessions.hot_session_id = None
 
     def _effective_plan(
             self, session, plan: PrefixPlan) -> tuple[int, PrefixPlan]:

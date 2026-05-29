@@ -667,3 +667,52 @@ def test_agent_service_serializes_concurrent_requests():
         t.join()
 
     assert state["max"] == 1   # serialized: never two generators at once
+
+
+def test_stream_disconnect_clears_hot_session():
+    """A client disconnect closes the stream generator before the final commit;
+    the GPU state advanced, so the hot session must be cleared (force rebuild)."""
+    svc = AgentService(FakeAgentEngine())
+    svc.sessions.hot_session_id = "stale-prev"   # a hot session from a previous turn     # a hot session from a previous turn
+
+    gen = svc.stream_openai(
+        AgentRequest(session_id="s",
+                     messages=[{"role": "user", "content": "a"}],
+                     max_tokens=2),
+        model="m")
+    next(gen)                                # start: prefill + first SSE chunk
+    gen.close()                              # simulate mid-stream disconnect
+
+    assert svc.sessions.hot_session_id is None
+
+
+def test_complete_exception_clears_hot_session():
+    """If generation raises mid-request, the hot session is cleared so the next
+    turn rebuilds instead of appending onto advanced GPU state."""
+    class BoomEngine(FakeAgentEngine):
+        def generate_stream(self, *, max_tokens, K):
+            del max_tokens, K
+            raise RuntimeError("decode blew up")
+            yield  # pragma: no cover
+
+    svc = AgentService(BoomEngine())
+    svc.sessions.hot_session_id = "stale-prev"   # a hot session from a previous turn
+
+    with pytest.raises(RuntimeError):
+        svc.complete(AgentRequest(
+            session_id="s", messages=[{"role": "user", "content": "a"}],
+            max_tokens=1))
+
+    assert svc.sessions.hot_session_id is None
+
+
+def test_stream_full_consume_keeps_hot_session():
+    """A normally completed stream still marks the session hot (no false clear)."""
+    svc = AgentService(FakeAgentEngine())
+    chunks = list(svc.stream_openai(
+        AgentRequest(session_id="s",
+                     messages=[{"role": "user", "content": "a"}],
+                     max_tokens=2),
+        model="m"))
+    assert chunks[-1] == "data: [DONE]\n\n"
+    assert svc.sessions.hot_session_id == "s"
