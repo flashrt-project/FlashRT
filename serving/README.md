@@ -66,7 +66,7 @@ File: `verify_pi07.py`.
 > **concurrent** (RECAP policy‖critic + interruptible rollout) and **sequential**
 > (π0.7 planner→actor hand-off + multi-rate).
 
-## Native deployment host examples (skeletons — **under construction**)
+## Native deployment host examples
 
 - **`robot_host/`** (C++) — real-time VLA deployment host pattern (Plan,
   concurrent stream, buffer-overwrite interrupt). One toolchain with
@@ -80,9 +80,9 @@ File: `verify_pi07.py`.
   async/safety shell). This remains a reference shell for future high-concurrency
   control-plane experiments; it is not the near-term production path.
 
-These show the hot loop + C-ABI usage; they are reference skeletons, not yet
-runnable end-to-end. The C++/Rust hosts will mirror the verified Python hosts
-above.
+`qwen36_agent/` is a runnable Python-first serving example. The C++/Rust hosts
+remain reference skeletons and will mirror the verified Python hosts above as
+their production paths mature.
 
 ## Honest scope (Python hosts)
 They drive **real Pi05 graphs** through the contract and verify the hot-path
