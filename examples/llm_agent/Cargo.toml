@@ -1,0 +1,13 @@
+[package]
+name = "flashrt-llm-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Illustrative Rust LLM session host on the FlashRT execution contract (skeleton)"
+
+[[bin]]
+name = "llm_agent"
+path = "src/main.rs"
+
+# Links libflashrt_exec via build.rs (set FLASHRT_EXEC_LIB_DIR to its directory).
+# A real server would add: axum/tonic (HTTP/gRPC+SSE), tokio (async).
+[dependencies]

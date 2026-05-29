@@ -60,6 +60,58 @@ and a real **VLA** (Pi0.5 FP16 + FP8 — cosine 1.0); every primitive validated.
 
 ---
 
+## Layering & host examples
+
+### Setup (cold, once) vs hot path (replay) — and where each language sits
+Everything model-specific and iterative is **setup** (cold, runs once): weight load, **autotune**,
+**calibration** (single / multi-frame N>1 dataset / int8-static / AWQ), graph **capture**, and `adopt`.
+It stays in the **Python frontend** — fastest to develop, inspect, debug; adding a model = a script, no
+recompile. The contract sees only the *result*: an adopted graph (+ variants) + buffers (scales/state).
+
+```
+  SETUP (cold, once, model-specific)            HOT PATH (replay, hot, model-agnostic)
+  ───────────────────────────────────          ──────────────────────────────────────
+  Python frontend:                              host loop (Python today; C++/Rust at deploy):
+    load weights                                  write inputs -> Buffer
+    calibrate (N>1 dataset) / autotune    ──▶     frt_graph_replay / frt_plan_execute  ──▶ GPU
+    capture graph (torch or ctypes)               read outputs                              kernel
+    frt_graph.adopt(exec) / buffer.wrap()         (one cudaGraphLaunch per replay = pure GPU)  graph
+```
+Why this split is optimal: the rigid, debug-heavy "engine-as-code" problem (TensorRT-LLM-style
+*one model = one compiled engine*) comes from compiling **model logic**. Here the kernel sequence is
+captured at runtime into a graph (**data**), so the C++ layer holds **zero model-specific code — one
+binary drives all models**. Flexibility lives in Python; only the stable, mechanical replay is native.
+
+### Who drives the loop — today (A) vs deployment (B)
+```
+  (A) today — Python frontend drives; exec is the C++ library it calls
+      Python frontend ──pybind──▶ C++ exec (libflashrt_exec) ──cudaGraphLaunch──▶ GPU kernel graph
+      (pybind crosses the SAME C ABI a native host would; Python is the loop driver for now)
+
+  (B) deployment — a native host drives; Python only at setup (same process) or absent
+      C++/Rust host ──C ABI──▶ C++ exec (libflashrt_exec.so) ──cudaGraphLaunch──▶ GPU kernel graph
+      (no Python in the hot loop; capture/adopt done once — in-process Python, or ported to C++)
+```
+A captured CUDA graph is **not serializable across processes** (baked pointers are process-local), so
+capture must run in the **same process** that replays — which is why "Python setup once + native hot
+loop in one process" is the pragmatic embedded path (Python out of the hot loop without porting capture).
+
+### Two reference hosts (live in `examples/` — scenario/policy, not the contract)
+Same `libflashrt_exec`; the host language is chosen per scenario.
+```
+  examples/robot_host/  (C++)  — real-time VLA            examples/llm_agent/  (Rust) — LLM server
+  ───────────────────────────────────────────            ─────────────────────────────────────────
+  C++ host loop:                                          Rust host (axum/SSE + session registry):
+    vision ─enc_x─▶ action   (Plan, 1 DAG)                  per token: write tok -> Buffer
+    ASR on a concurrent stream (overlap/interrupt)          frt_graph_replay(decode, key=cur_pos, s)
+    subgoal change = overwrite Buffer (no recapture)        read logits -> argmax -> append
+    interrupt granularity = one short replay                spec/MTP = more adopted graphs, same way
+  Why C++: real-time, ROS2-adjacent, one toolchain         Why Rust: async/safety shell; FFI seam
+  with exec+kernel, no FFI seam, easiest debug.            crossed once per token (thin).
+```
+
+---
+
 ## 0. Positioning: what this layer is / is not
 
 What FlashRT already does (see `flash_rt/core/cuda_graph.py`, `flash_rt/frontends/`):
