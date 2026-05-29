@@ -33,6 +33,32 @@ fall back to cold long-context prefill.
 This state remains owned by the Qwen frontend.  The serving layer only stores
 metadata and decides whether a request can reuse the hot frontend state.
 
+## Streaming correctness rule
+
+The old full-generate loop may verify `K+1` tokens and return only the prefix
+needed to satisfy `max_new_tokens`. That is acceptable for a stateless response,
+but it is not acceptable for an agent session cache: the GPU state would contain
+tokens that were never sent to the client.
+
+The split API therefore has a hard rule:
+
+```text
+every streamed token must be committed to the frontend state
+```
+
+If the decode loop needs lookahead, it must keep that lookahead explicitly and
+either:
+
+- commit it before yielding it; or
+- roll back/truncate to the last yielded token before returning control to the
+  session host.
+
+For Qwen3.6 this means the first token predicted by prompt prefill cannot be
+blindly yielded as a session boundary unless the main model state has also
+processed that token. A correct implementation can use a one-token commit step
+or a small lookahead buffer, but the serving layer must only see committed
+chunks.
+
 ## Long-context path
 
 For 512+ token prompts and the 128-token FP8-KV exception, the split must reuse

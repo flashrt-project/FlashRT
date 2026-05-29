@@ -13,6 +13,15 @@ from typing import Iterable, Protocol, Sequence
 
 @dataclass(frozen=True)
 class DecodeChunk:
+    """A stream chunk whose tokens are committed to the session state.
+
+    Qwen3.6 speculative decode may internally verify more tokens than the user
+    ultimately receives when a request stops.  Agent serving cannot expose that
+    old full-generate shortcut: every yielded token must already be reflected in
+    the frontend's KV/recurrent state, or must be accompanied by an explicit
+    checkpoint/rollback.  v1 requires committed chunks only.
+    """
+
     token_ids: tuple[int, ...]
     text: str
     accepted: int
@@ -42,7 +51,19 @@ class AgentEngine(Protocol):
 
     def prefill(self, token_ids: Sequence[int], *,
                 cached_tokens: int = 0) -> None:
+        """Bring the hot frontend state to ``token_ids``.
+
+        ``cached_tokens`` is an exact prefix already resident in the hot
+        contiguous session state.  Implementations must only prefill the suffix
+        and must leave the state at the end of ``token_ids``.
+        """
         ...
 
     def generate_stream(self, *, max_tokens: int, K: int) -> Iterable[DecodeChunk]:
+        """Yield committed decode chunks.
+
+        Chunks may contain more than one token because FlashRT flushes at
+        speculative accept boundaries.  They must not include uncommitted
+        lookahead tokens.
+        """
         ...

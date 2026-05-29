@@ -15,6 +15,10 @@ streaming, and request scheduling. It must not add session or KV verbs to
 - Exact token-prefix reuse for coding-agent turns: cold prefill once, then only
   prefill appended user/tool/diff/log tokens.
 - True SSE streaming at speculative-decode accept boundaries.
+- Streamed tokens are session-committed tokens only. The old stateless
+  full-generate shortcut of over-verifying and trimming output is forbidden in
+  this host because it would leave hidden KV state ahead of the client-visible
+  transcript.
 - OpenAI-compatible tool calls without leaking partial `<tool_call>` JSON.
 - Interfaces that can later grow into paged/offloaded KV, batched decode, or
   multi-GPU routing without changing the `exec` contract.
