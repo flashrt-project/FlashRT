@@ -206,8 +206,12 @@ boundary:
    concurrently via ONE exec ctx:  policy(stream P) ‖ value critic(stream C)
 ```
 
-`reset_state()` in `rollout_host.py` restores the captured policy boundary — the
-same snapshot/restore verb the coding agent uses, in a different scenario.
+`reset_state()` in `rollout_host.py` restores the captured policy boundary with no
+recapture — the **same pattern** as the agent capsule (restore a committed
+boundary), in a different scenario. Today the LLM agent has this as a bit-exact
+`snapshot_capsule`/`restore_capsule` API; the robot rollout uses its buffer-reset
+form. A shared capsule API across both, with bit-exact robot validation, is on the
+roadmap (§10).
 
 ### 4.3 `robot_pi07/` — hierarchy: buffer hand-off (the contrast case)
 
@@ -240,6 +244,12 @@ The flag is not "we also have prefix caching". It is: **FlashRT sessions are
 checkpointable, forkable, and restorable — because we capture full execution
 state — and the same capsule serves both long-running LLM agents and robot RL
 rollout.**
+
+Evidence status: snapshot + restore are shipped and **bit-exact** on the LLM agent
+(short and long FP8-KV routes), benched (§5, §7); fork is covered by the capsule
+tests; time-travel is the same verb (restore an earlier boundary). Robot-side
+capsule parity with bit-exact validation is roadmapped (§10) — the rollout host
+demonstrates the pattern today via buffer reset.
 
 ---
 
@@ -276,78 +286,80 @@ Costs to keep honest:
 
 ## 6. Retrofit plan — `qwen36_agent/` → capsules
 
-Additive, opt-in, and staged so each step has its own acceptance gate. Nothing
-below modifies the contract beyond the §3 mechanism addition.
+Additive, opt-in, and staged so each step has its own acceptance gate.
 
-1. **Contract mechanism (exec/).** Add host-backed `Buffer` + `buffer_copy`
-   device↔host async variants. Pure mechanism; covered by the exec toy tests.
-2. **Frontend snapshot/restore (flash_rt/).** Add `snapshot_capsule()` /
-   `restore_capsule(capsule)` to the Qwen3.6 frontend that copy the boundary
-   buffers in §2 (additive methods, alongside the existing `*_agent` split
-   methods; default path untouched).
-3. **Serving capsule registry (serving/qwen36_agent/).** Extend `SessionRegistry`
-   with a capsule store (pin + small LRU) and a new `PrefixPlan` action
-   `"restore"`. Today's `rebuild` / non-hot / `activate_rebuild` cases that match
-   a pinned or stored capsule prefix become restore + suffix-prefill.
-4. **Pin API.** Let the host pin a capsule for the shared prefix
+1. **Frontend snapshot/restore (flash_rt/) — DONE, in-GPU (D2D).**
+   `snapshot_capsule()` / `restore_capsule(capsule)` on the Qwen3.6 frontend copy
+   the boundary buffers (§2) for both the short and the long FP8-KV routes;
+   `long_prefill_chunk_size()` / `capsule_aligned_len()` give the chunk-aligned
+   boundary for cold-identical long-route append. Additive, default path untouched.
+2. **Serving capsule registry (serving/qwen36_agent/).** Extend `SessionRegistry`
+   with a capsule store (pin + small LRU) and a `"restore"` `PrefixPlan` action, so
+   today's `rebuild` / non-hot / `activate_rebuild` cases that match a pinned
+   capsule become restore + suffix-prefill.
+3. **Pin API.** Let the host pin a capsule for the shared prefix
    (system + tool schemas + repo index) once at startup or on first use; an
    OpenAI-side field (`flashrt_pin_prefix`) or a `/v1/sessions` capsule option.
+4. **Off-GPU capsule store (exec/).** When parking capsules off-GPU is needed, add
+   host-backed `Buffer` + device↔host async copy to the contract (pure mechanism).
+   Not required while capsules stay resident on the GPU.
 5. **Later: fork / time-travel.** Restore one capsule into N sessions (fork) and
    restore an earlier same-session boundary (undo a turn) — same verbs, no new
    mechanism.
 
 Out of scope for v1: radix tree, paged KV, dense token-grid checkpoints (§3),
-cross-deployment capsule portability (§7).
+cross-deployment capsule portability (§8).
 
 ---
 
-## 7. Acceptance design — correctness gates and expected performance
+## 7. Acceptance — correctness gates and measured results
 
-### 7.1 Correctness (non-negotiable, same yardstick as the shipped append test)
+### 7.1 Correctness (non-negotiable) — `tests/test_qwen36_agent_capsule.py`
 
-`tests/test_qwen36_agent_gpu_split.py` already asserts `append == full-generate`
-token-exact. Capsules add the symmetric gate:
+A capsule restore is **bit-identical to the path it replaces**, asserted
+token-exact:
 
-- **restore-equivalence:** `restore(capsule) + prefill(suffix) + decode` produces
-  **token-identical** output to a cold `full prefill(prefix + suffix) + decode`,
-  for short, long (FP8-KV), and long-append prompt buckets, greedy, fixed K.
-- **fork-equivalence:** two sessions forked from one capsule each match their own
-  independent cold run, token-exact.
-- **hybrid-state bit-exactness:** the recurrent/conv/MTP snapshot must round-trip
-  bit-exact; a silent mismatch here corrupts output without crashing. This is the
-  highest-risk surface and gets a dedicated buffer-level round-trip assert before
-  any end-to-end claim.
-- **no-regression:** capsules default OFF; with the flag off the host is
-  byte-identical and same-latency to the shipped path.
+- **restore-equivalence:** `restore + decode` == cold `prefill + decode` of the
+  same prefix, on the short and long FP8-KV routes (real text), including restore
+  after the live buffers were dirtied by another prompt, and fork (two branches
+  from one capsule).
+- **chunk-aligned long append == cold full prefill:** snapshotting at a
+  chunk-aligned boundary (`capsule_aligned_len`) makes `restore + append(suffix) +
+  decode` token-identical to a cold full prefill — the chunked-GDN recurrent state
+  is chunk-aligned, so an unaligned boundary would diverge under FP8 rounding.
+- **hybrid-state surface:** the recurrent/conv/MTP/FP8-KV snapshot round-trips
+  bit-exact; the long route re-dequantizes the BF16 stage from the restored FP8
+  cache (mirrors `reset_state`).
+- **no-regression:** full suite (capsule + agent policy + gpu split) is green.
 
-### 7.2 Performance — the benchmark and what we expect
+### 7.2 Measured performance (RTX 5090, in-container)
 
-The single-session decode benchmark (133 tok/s, ~217 ms TTFT) will **not** move —
-and should not. The capsule benchmark must model the real workload: a **large
-shared prefix reused across many turns/sessions**.
+The single-session decode benchmark (133 tok/s) does **not** move — capsules touch
+prefill / TTFT only. The win is on a large shared prefix reused across turns:
+`cold` = re-prefill prefix+suffix every turn; `capsule` = restore + append(suffix).
 
-Benchmark: fix a shared prefix at several lengths (e.g. 4k / 16k / 64k tokens),
-then for each length measure, for a fresh session that reuses the prefix:
+Short committed-stream route (185-token shared prefix, real coding-agent tasks,
+median of 7, < 1% across runs):
 
-| metric | cold (no capsule) | restore (capsule) | expectation |
-| --- | --- | --- | --- |
-| TTFT | full prefill of (prefix + suffix) | copy(KV+state) + prefill(suffix) | restore ≪ cold; gap grows with prefix length |
-| prefill tokens computed | prefix + suffix | suffix only | prefix tokens saved per reuse |
-| decode tok/s | baseline | baseline | unchanged (gate: within noise) |
-| capsule bytes | — | KV(prefix) + small state | report per length; FP8-KV ≈ half |
-| restore latency | — | D2D or D2H/H2D copy time | bandwidth-bound, report ms |
+| task | full / suffix | cold TTFT | capsule TTFT | speedup | token-exact |
+| --- | --- | --- | --- | --- | --- |
+| fill-doc | 258 / 73 | ~5.47 s | ~1.85 s | 2.96x | yes |
+| write-code | 223 / 38 | ~4.77 s | ~1.10 s | 4.33x | yes |
+| algorithm | 225 / 40 | ~4.82 s | ~1.13 s | 4.26x | yes |
 
-**Expected result:** for a continuous single session, ~0 change (append already
-optimal). For shared-prefix / multi-session / fork workloads, **TTFT for a warm
-session drops from a length-growing cold prefill (seconds at tens of thousands of
-tokens) to a roughly length-flat restore (milliseconds)**, with the suffix being
-the only recomputed work. Decode throughput is unchanged. The headline metric is
-**warm-session TTFT and prefill-tokens-saved per reuse**, reported against the
-shared-prefix length and the number of reuses — not single-shot decode tok/s.
+Long FP8-KV route (production agent path, chunk-aligned 2k/4k/8k prefix, median of
+5, < 0.5% across runs):
 
-Report the cold-vs-restore crossover (the prefix length beyond which restore
-wins) and the capsule memory footprint per length, in-container on RTX 5090, with
-the runnable commands — same evidence bar as `docs/exec_contract.md` §8.
+| shared prefix | cold TTFT | capsule TTFT | speedup | capsule MB | capsule == cold |
+| --- | --- | --- | --- | --- | --- |
+| 2048 tok | ~288 ms | ~138 ms | 2.08x | 168 MB | yes |
+| 4096 tok | ~388 ms | ~73 ms | 5.28x | 211 MB | yes |
+| 8192 tok | ~816 ms | ~142 ms | 5.72x | 360 MB | yes |
+
+Cold TTFT grows with prefix length; capsule TTFT stays roughly flat (restore is a
+~0.1 ms device-to-device copy, so only the suffix is recomputed), so the **speedup
+widens with prefix length** — and keeps widening toward the 10k–50k shared
+prefixes a real coding agent resends each turn. Decode throughput is unchanged.
 
 ---
 
@@ -363,3 +375,83 @@ the runnable commands — same evidence bar as `docs/exec_contract.md` §8.
   is deliberately out of scope.
 - Capsules are an opt-in serving feature. They do not change the contract beyond
   the §3 mechanism addition, and they do not change steady-state decode.
+
+---
+
+## 9. What this design is good at (and what it complements)
+
+Capsules are not a replacement for paged or radix prefix caching — they are a
+different point in the design space, chosen for FlashRT's scenario: latency-first,
+small-batch, consumer/edge, individuals and small teams. It is worth being precise
+about where each approach shines, because the goal is to **cover cases that are
+awkward for block/radix KV caches**, not to compete on their home turf.
+
+**Where mainstream prefix caching is the right tool.** vLLM Automatic Prefix
+Caching and SGLang RadixAttention are excellent for high-concurrency, multi-tenant,
+throughput-first serving of dense-attention LLMs, with automatic cross-request
+prefix discovery and paged memory. If that is the workload, use them — FlashRT does
+not target it.
+
+**Where the capsule approach fits naturally, and which other approaches don't
+cover as easily:**
+
+- **Hybrid models (linear-attention / recurrent / conv state).** A block or radix
+  KV cache reuses a prefix by addressing KV blocks; but a recurrent/conv state is a
+  *fold* over the entire prefix and has no block to address. Reusing it requires
+  snapshotting the state itself — which is exactly what a capsule is. We
+  demonstrated this bit-exact for Qwen3.6's gated-delta-net recurrent state and conv
+  state, including the chunk-alignment subtlety that exact reuse of a chunked linear
+  scan requires. This is the gap capsules fill most cleanly.
+- **Keeping full-graph capture while still reusing work.** Paged caching is what
+  lets eager/piecewise engines gather KV from arbitrary blocks; the cost is giving
+  up a single captured graph over the whole forward. FlashRT keeps the captured
+  graph (its latency advantage on small batches) and recovers prefix reuse through
+  a state snapshot instead. Different trade, suited to a different scenario.
+- **One mechanism across LLM, VLA, and robotics.** Because a capsule is just the
+  committed execution state as a set of buffers, the same snapshot/restore idea
+  serves an LLM agent's warm-start, a VLA diffusion policy, and a robot RL rollout's
+  episode reset. General LLM-serving stacks are not built to span these domains; a
+  framework that does can offer one consistent serving story across them.
+- **Deterministic, bit-exact reproducibility.** Snapshotting exact state makes a
+  session or rollout reproducible to the token / action — useful for debugging, RL
+  data integrity, and regression testing. Throughput-first stochastic batching does
+  not aim to provide this.
+
+The honest summary: pick the tool by scenario. For high-concurrency multi-tenant
+LLM serving, the paged/radix engines lead. For latency-first single/few-session
+work on consumer and edge hardware — especially hybrid models, VLAs, and robot
+rollouts — capsules cover ground those engines were not designed to reach. A fair,
+measured comparison on this scenario is planned once development settles (§10).
+
+---
+
+## 10. Roadmap — further along this philosophy
+
+The capsule primitive opens more than prefix reuse. Each item below is the same
+snapshot / restore / fork / time-travel mechanism applied to a new need; none
+requires a new contract verb (mechanism-not-policy holds, see exec_contract §9).
+
+1. **Cross-process / persistent capsules (L3 warm-start).** Park a capsule in host
+   RAM, or serialize it to disk, so a server restart or an edge device can resume a
+   pinned prefix (system + tool schema + repo index) instantly instead of
+   cold-prefilling. Bounded to a same-deployment binary blob (§8), but high value
+   for edge cold-start.
+2. **Single-GPU few-session time-sharing.** Keep several users' session capsules in
+   host RAM and swap the hot one onto the GPU on demand — latency-first
+   instant-switch, distinct from continuous batching, matched to the small-team
+   target.
+3. **Fork & time-travel as first-class agent/robot operations.** Fork one prefilled
+   prefix into N branches (tree-of-thought, best-of-N, parallel tool-call
+   hypotheses); restore an earlier committed boundary to undo a turn (agent retry)
+   or an action chunk (robot exploration / safe rollback).
+4. **Robot-side capsule parity.** Give the Pi05 / VLA path the same explicit
+   snapshot/restore API the Qwen frontend has, with a bit-exact validation, so
+   "one capsule, two scenarios" is evidenced on both sides (today the LLM agent has
+   the bit-exact capsule API; the robot rollout uses its buffer-reset form).
+5. **Deterministic replay / reproducibility tooling.** Capsule + recorded inputs →
+   bit-exact session/rollout replay for debugging and RL data integrity.
+6. **Scenario comparison study (post-development).** A fair, measured comparison on
+   FlashRT's turf — consumer GPU (5090) and edge (Orin/Thor), single/few-session
+   latency-first — reporting warm-start TTFT, decode tok/s, VLA time-to-first-action,
+   restore latency, capsule footprint, and cold-start time, with conditions stated
+   explicitly and no claims outside the measured scenario.

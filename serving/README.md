@@ -10,7 +10,12 @@ The signature serving idea — **graph-replay-native execution-state capsules**
 (snapshot / restore / fork / time-travel), and why it differs from vLLM/SGLang
 prefix caching — is documented in
 [`docs/serving_design.md`](../docs/serving_design.md). It is the unifying design
-behind the hosts below.
+behind the hosts below. That document also covers **what this design is good at
+and what it complements** (§9 — capsules fill cases awkward for block/radix KV
+caches: hybrid recurrent state, full-graph capture, LLM+VLA+robot under one
+mechanism) and the **capsule roadmap** (§10 — persistent/L3 warm-start,
+few-session time-sharing, fork & time-travel, robot-side parity, a measured
+scenario comparison).
 
 ## Layering
 
