@@ -45,20 +45,39 @@ token-exact in `tests/test_qwen36_agent_capsule.py`:
   as a cold `prefill + decode` of the same prefix (short and long routes, real
   text), including restore after the buffers were dirtied by another prompt, and
   fork (two branches from one capsule).
-- **Restore + append == non-capsule append.** The coding-agent flow
-  (`restore + append(suffix) + decode`) equals the existing
-  `prefill(prefix) + append(suffix) + decode` path token-exact: the capsule adds
-  **zero** error to the path it stands in for.
+- **Restore + append == cold full prefill** (long route, chunk-aligned boundary).
+  The coding-agent flow (`restore + append(suffix) + decode`) is token-identical
+  to a cold `prefill(prefix + suffix) + decode` when the capsule is snapshotted
+  at a chunk-aligned boundary (see below).
 
 Decode throughput is unchanged — capsules touch prefill / TTFT only, never
 steady-state decode.
 
-> Note (long route, pre-existing and orthogonal to capsules): the long-context
-> `append` path itself does **not** reproduce a cold *full* prefill token-for-token
-> at scale, because FP8-KV rounding at the append boundary perturbs the committed
-> state. This is a property of `append_long_ctx_*`, not of capsules — a capsule
-> reproduces whichever path it replaces exactly. Pure restore (no append) is
-> bit-identical to a cold prefill.
+### Long route: snapshot at a chunk-aligned boundary
+
+The long chunked-GDN prefill folds its linear-attention recurrent state **per
+chunk**, so the state at a position depends on where the chunk boundaries fall. A
+cold full prefill of length F places boundaries at multiples of the prefill chunk
+size. If a capsule/append boundary is *not* a multiple of that size, append adds
+a chunk split the cold prefill never had, and the two diverge under FP8 rounding
+(the divergence is small but compounds through greedy decode).
+
+The fix is to snapshot at a chunk-aligned boundary:
+
+```python
+aligned = fe.capsule_aligned_len(prefix_len)   # floor to fe.long_prefill_chunk_size()
+fe.prefill_long_ctx_nvfp4_agent(prefix_ids[:, :aligned], max_new_tokens=..., K=...)
+cap = fe.snapshot_capsule()
+...
+fe.restore_capsule(cap)
+fe.append_long_ctx_nvfp4_agent(full_ids, start_pos=aligned, ...)   # == cold full prefill
+```
+
+At an aligned boundary, `restore + append + decode` is token-identical to a cold
+full prefill (verified in `test_long_capsule_chunk_aligned_matches_cold_full_prefill`).
+The remainder of the prefix after the aligned boundary (< one chunk) is re-prefilled
+by the append, which is cheap. The short route has no chunking and needs no
+alignment.
 
 ## Status
 
@@ -97,23 +116,23 @@ the short route, and is exactly what the capsule removes for the shared prefix.
 
 ## Measured benefit (long FP8-KV route — production agent path)
 
-Same workload on the chunked long FP8-KV route, with the shared prefix padded to
-2k / 4k / 8k tokens (system + tool schema + repo index). `cold` =
-prefill_long(prefix+suffix) every turn; `capsule` = restore + append(suffix).
-Median of 5 repeats, stable to < 0.5% across runs:
+Same workload on the chunked long FP8-KV route, shared prefix snapshotted at a
+chunk-aligned 2k / 4k / 8k boundary. `cold` = prefill_long(prefix+suffix) every
+turn; `capsule` = restore + append(suffix). Median of 5 repeats, stable to
+< 0.5% across runs:
 
-| shared prefix | cold TTFT | capsule TTFT | TTFT speedup | capsule MB |
-| --- | --- | --- | --- | --- |
-| 2064 tok | ~289 ms | ~139 ms | **2.09x** | 168 MB |
-| 4112 tok | ~389 ms | ~73 ms | **5.31x** | 211 MB |
-| 8236 tok | ~817 ms | ~140 ms | **5.82x** | 361 MB |
+| shared prefix | cold TTFT | capsule TTFT | TTFT speedup | capsule MB | capsule==cold |
+| --- | --- | --- | --- | --- | --- |
+| 2048 tok | ~288 ms | ~138 ms | **2.08x** | 168 MB | yes |
+| 4096 tok | ~388 ms | ~73 ms | **5.28x** | 211 MB | yes |
+| 8192 tok | ~816 ms | ~142 ms | **5.72x** | 360 MB | yes |
 
-- **Cold TTFT grows with prefix length** (289 → 389 → 817 ms); **capsule TTFT
+- **Cold TTFT grows with prefix length** (288 → 388 → 816 ms); **capsule TTFT
   stays roughly flat** (restore is a ~0.1 ms device-to-device copy — bandwidth on
   the capsule bytes — so you pay essentially only for the suffix append). The
   speedup therefore **widens with prefix length**, and keeps widening past 8k
   toward the 10k–50k shared prefixes a real coding agent resends each turn.
-- Capsule output is token-exact to the non-capsule append path at every size.
+- Capsule output is **token-identical to a cold full prefill** at every size.
 - Decode throughput is unchanged by the capsule.
 
 A single continuous hot session is unaffected — the shipped contiguous-append
