@@ -180,6 +180,7 @@ def test_long_tq_effective_k_uses_measured_context_buckets(monkeypatch):
 
     assert fe._long_tq_effective_k(32, 6) == 3
     assert fe._long_tq_effective_k(32, 6, 512) == 4
+    assert fe._long_tq_effective_k(32, 6, 1024) == 3
     assert fe._long_tq_effective_k(128, 6) == 6
     assert fe._long_tq_effective_k(512, 6) == 3
     assert fe._long_tq_effective_k(1024, 6) == 3

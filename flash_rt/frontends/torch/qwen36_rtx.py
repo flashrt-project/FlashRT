@@ -7587,7 +7587,7 @@ class Qwen36TorchFrontendRtx:
         caller_k = int(K)
         max_new = 0 if max_new_tokens is None else int(max_new_tokens)
         if prompt_len < 64:
-            target_k = 4 if max_new >= 384 else 3
+            target_k = 4 if 384 <= max_new < 768 else 3
         elif prompt_len < 192:
             target_k = 6
         elif prompt_len < 768:
