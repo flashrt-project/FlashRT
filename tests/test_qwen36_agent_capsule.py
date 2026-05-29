@@ -232,6 +232,45 @@ def test_long_capsule_restore_then_append_matches_noncapsule_append(monkeypatch)
     assert warm == nocap
 
 
+def test_long_capsule_chunk_aligned_matches_cold_full_prefill(monkeypatch):
+    """A capsule snapshot at a chunk-aligned boundary + append is token-identical
+    to a cold full prefill.
+
+    The long chunked-GDN prefill folds recurrent state per chunk, so an unaligned
+    append boundary introduces a chunk split a cold full prefill does not have
+    (they then diverge under FP8 rounding). Aligning the boundary to
+    long_prefill_chunk_size removes that split and restores exact equivalence.
+    """
+    import torch
+
+    fe = _load_long_frontend(monkeypatch)
+    chunk = fe.long_prefill_chunk_size()
+    # Build a prompt that straddles a chunk boundary: prefix > chunk, then a
+    # short suffix, so the cold chunking and the aligned-append chunking match.
+    prefix_len = chunk + 80
+    suffix_len, max_new, K = 40, 16, 3
+    if not fe._should_use_long_ctx_route(prefix_len + suffix_len, max_new):
+        pytest.skip("prompt did not select the long route")
+    prefix = _token_ids(fe, prefix_len)
+    suffix = _token_ids(fe, suffix_len, word=" suffix")
+    full = torch.cat([prefix, suffix], dim=1)
+
+    fe.prefill_long_ctx_nvfp4_agent(full, max_new_tokens=max_new, K=K)
+    cold_full = _decode_long(fe, max_new=max_new, K=K)
+
+    aligned = fe.capsule_aligned_len(prefix_len)
+    assert aligned == chunk and aligned % chunk == 0
+    fe.prefill_long_ctx_nvfp4_agent(
+        full[:, :aligned], max_new_tokens=max_new, K=K)
+    cap = fe.snapshot_capsule()
+    assert cap["cur_pos"] == aligned
+    fe.restore_capsule(cap)
+    fe.append_long_ctx_nvfp4_agent(
+        full, start_pos=aligned, max_new_tokens=max_new, K=K)
+    aligned_warm = _decode_long(fe, max_new=max_new, K=K)
+    assert aligned_warm == cold_full
+
+
 def test_long_capsule_tq_mode_raises(monkeypatch):
     """The long TQ KV mode capsule is not wired yet; fail loudly, not silently."""
     monkeypatch.setenv("FLASHRT_QWEN36_LONG_KV_CACHE", "tq")

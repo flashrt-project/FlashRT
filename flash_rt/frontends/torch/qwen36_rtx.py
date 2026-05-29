@@ -5039,6 +5039,33 @@ class Qwen36TorchFrontendRtx:
         self._agent_stream_pf0 = ev0
         self._agent_stream_pf1 = ev1
 
+    def long_prefill_chunk_size(self) -> int:
+        """Long-route prefill chunk size.
+
+        The chunked GDN (linear-attention) prefill folds its recurrent state per
+        chunk, so the state at a position depends on where the chunk boundaries
+        fall. A cold full prefill of length F uses chunk boundaries at multiples
+        of this value. For a capsule restore + append to be **token-identical to
+        a cold full prefill**, the snapshot/append boundary must therefore be a
+        multiple of this size (use ``capsule_aligned_len``). An unaligned
+        boundary still restores correctly and reproduces the non-capsule append
+        path, but introduces an extra chunk split that a cold full prefill does
+        not have, so the two diverge under FP8 rounding.
+        """
+        import os
+
+        return min(
+            int(os.environ.get('FLASHRT_QWEN36_TQ_PREFILL_CHUNK',
+                               str(self.MAX_Q_SEQ))),
+            self.MAX_Q_SEQ)
+
+    def capsule_aligned_len(self, length: int) -> int:
+        """Largest chunk-aligned prefix length <= ``length`` (see
+        ``long_prefill_chunk_size``). Snapshot a long-route capsule at this
+        boundary for cold-full-prefill-identical append."""
+        chunk = self.long_prefill_chunk_size()
+        return (int(length) // chunk) * chunk
+
     # ---------- own forward (Phase 2.3b4) ----------
     #
     # Forward path implemented method-by-method on the frontend, not on
