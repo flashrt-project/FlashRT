@@ -207,11 +207,16 @@ boundary:
 ```
 
 `reset_state()` in `rollout_host.py` restores the captured policy boundary with no
-recapture — the **same pattern** as the agent capsule (restore a committed
-boundary), in a different scenario. Today the LLM agent has this as a bit-exact
-`snapshot_capsule`/`restore_capsule` API; the robot rollout uses its buffer-reset
-form. A shared capsule API across both, with bit-exact robot validation, is on the
-roadmap (§10).
+recapture — the **same capsule mechanism** as the agent, in a different scenario.
+The two sides express it at the level that fits their state: the LLM agent has a
+model-specific `snapshot_capsule`/`restore_capsule` frontend API (its boundary is a
+large hybrid state — KV + recurrent + conv + MTP), while the robot boundary is a
+small set of buffers (the diffusion seed; in production also the observation), so
+it uses the **execution contract's Buffer snapshot directly** — a capsule is a
+`frt` Buffer, snapshot/restore is `frt` device-to-device copy, no new mechanism.
+`verify_capsule.py` validates the robot side **bit-identical** (cosine 1.0, exact),
+including after the live boundary was overwritten — so episode reset *is* a capsule
+restore, evidenced on both sides.
 
 ### 4.3 `robot_pi07/` — hierarchy: buffer hand-off (the contrast case)
 
@@ -245,11 +250,11 @@ checkpointable, forkable, and restorable — because we capture full execution
 state — and the same capsule serves both long-running LLM agents and robot RL
 rollout.**
 
-Evidence status: snapshot + restore are shipped and **bit-exact** on the LLM agent
-(short and long FP8-KV routes), benched (§5, §7); fork is covered by the capsule
-tests; time-travel is the same verb (restore an earlier boundary). Robot-side
-capsule parity with bit-exact validation is roadmapped (§10) — the rollout host
-demonstrates the pattern today via buffer reset.
+Evidence status: snapshot + restore are shipped and **bit-exact on both sides** —
+the LLM agent (short and long FP8-KV routes, benched, §5/§7) via a frontend capsule
+API, and the robot rollout (`verify_capsule.py`, cosine 1.0) via the execution
+contract's Buffer snapshot. Fork is covered by the capsule tests; time-travel is
+the same verb (restore an earlier boundary).
 
 ---
 
@@ -444,10 +449,11 @@ requires a new contract verb (mechanism-not-policy holds, see exec_contract §9)
    prefix into N branches (tree-of-thought, best-of-N, parallel tool-call
    hypotheses); restore an earlier committed boundary to undo a turn (agent retry)
    or an action chunk (robot exploration / safe rollback).
-4. **Robot-side capsule parity.** Give the Pi05 / VLA path the same explicit
-   snapshot/restore API the Qwen frontend has, with a bit-exact validation, so
-   "one capsule, two scenarios" is evidenced on both sides (today the LLM agent has
-   the bit-exact capsule API; the robot rollout uses its buffer-reset form).
+4. **Robot capsule ergonomics.** The robot side is already bit-exact via the
+   contract Buffer snapshot (`verify_capsule.py`); a thin convenience wrapper that
+   snapshots the full rollout boundary (seed + observation + any cached frames) in
+   one call, and wiring it into `rollout_host.py`'s reset, would make the robot
+   capsule as ergonomic as the LLM one.
 5. **Deterministic replay / reproducibility tooling.** Capsule + recorded inputs →
    bit-exact session/rollout replay for debugging and RL data integrity.
 6. **Scenario comparison study (post-development).** A fair, measured comparison on

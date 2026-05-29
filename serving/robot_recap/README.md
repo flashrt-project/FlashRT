@@ -35,6 +35,11 @@ model" setups like AgiBot's are exactly this: a dedicated rollout-serving stack,
 separate from training.)
 
 ## Files
+- `verify_capsule.py` — the robot side of "one capsule, two scenarios": the
+  episode-boundary snapshot/restore done through the execution contract's Buffer
+  copy, verified **bit-identical** (cosine 1.0). Episode reset *is* a capsule
+  restore — the same mechanism as the LLM agent capsule
+  (`serving/qwen36_agent/capsules.md`), see `docs/serving_design.md`.
 - `verify_recap.py` — the advantage-conditioned RL/CFG inference
   (`set_rl_mode`, `Pi05CFGPipeline`) driven by the exec contract, **bit-identical
   to ctypes replay (cosine 1.0)**. Verifies the RL inference path on the contract.
