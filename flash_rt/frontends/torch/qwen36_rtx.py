@@ -7590,7 +7590,7 @@ class Qwen36TorchFrontendRtx:
         elif prompt_len < 768:
             target_k = 3
         elif prompt_len < 1536:
-            target_k = 5
+            target_k = 3
         elif prompt_len < 3072:
             target_k = 6
         elif prompt_len < 6144:
