@@ -7576,15 +7576,18 @@ class Qwen36TorchFrontendRtx:
             for i in range(len(hot_valid)):
                 hot_valid[i] = end_pos
 
-    def _long_tq_effective_k(self, prompt_len: int, K: int) -> int:
+    def _long_tq_effective_k(
+            self, prompt_len: int, K: int,
+            max_new_tokens: int | None = None) -> int:
         """Return the long-context TQ spec K used by generation."""
         tq_spec_k = os.environ.get('FLASHRT_QWEN36_TQ_SPEC_K', '')
         if tq_spec_k:
             return int(tq_spec_k)
         prompt_len = int(prompt_len)
         caller_k = int(K)
+        max_new = 0 if max_new_tokens is None else int(max_new_tokens)
         if prompt_len < 64:
-            target_k = 3
+            target_k = 4 if max_new >= 384 else 3
         elif prompt_len < 192:
             target_k = 6
         elif prompt_len < 768:
@@ -7687,7 +7690,8 @@ class Qwen36TorchFrontendRtx:
                     continue
                 if prompt_len + max_new_tokens > self._user_max_seq:
                     continue
-                eff_k = self._long_tq_effective_k(prompt_len, K)
+                eff_k = self._long_tq_effective_k(
+                    prompt_len, K, max_new_tokens)
                 verify_qseq = eff_k + 1
                 if verify_qseq < 1 or verify_qseq > self.MAX_Q_SEQ:
                     continue
@@ -8631,7 +8635,7 @@ class Qwen36TorchFrontendRtx:
         if tq_spec_k:
             K = int(tq_spec_k)
         else:
-            K = self._long_tq_effective_k(prompt_len, K)
+            K = self._long_tq_effective_k(prompt_len, K, max_new_tokens)
         max_spec_k = min(self.MAX_Q_SEQ - 1, self._MAX_PUBLIC_SPEC_K)
         if K < 1 or K > max_spec_k:
             raise ValueError(
@@ -9059,7 +9063,7 @@ class Qwen36TorchFrontendRtx:
         if tq_spec_k:
             K = int(tq_spec_k)
         else:
-            K = self._long_tq_effective_k(prompt_len, K)
+            K = self._long_tq_effective_k(prompt_len, K, max_new_tokens)
         max_spec_k = min(self.MAX_Q_SEQ - 1, self._MAX_PUBLIC_SPEC_K)
         if K < 1 or K > max_spec_k:
             raise ValueError(
@@ -9270,7 +9274,7 @@ class Qwen36TorchFrontendRtx:
         if tq_spec_k:
             K = int(tq_spec_k)
         else:
-            K = self._long_tq_effective_k(prompt_len, K)
+            K = self._long_tq_effective_k(prompt_len, K, max_new_tokens)
         adaptive_k = (
             not tq_spec_k
             and K >= 4

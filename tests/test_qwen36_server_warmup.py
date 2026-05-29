@@ -179,6 +179,7 @@ def test_long_tq_effective_k_uses_measured_context_buckets(monkeypatch):
     fe = Qwen36TorchFrontendRtx.__new__(Qwen36TorchFrontendRtx)
 
     assert fe._long_tq_effective_k(32, 6) == 3
+    assert fe._long_tq_effective_k(32, 6, 512) == 4
     assert fe._long_tq_effective_k(128, 6) == 6
     assert fe._long_tq_effective_k(512, 6) == 3
     assert fe._long_tq_effective_k(1024, 6) == 3
