@@ -49,6 +49,32 @@ separate from training.)
   timeout stop, and buffer reset between episodes. Verifies the hot-path
   mechanism (clean STOP at episode boundary, multi-model concurrency, reset).
 
+## Usage (reproducible)
+
+**Prerequisites**
+
+- A CUDA GPU; the FlashRT runtime built with the Pi0.5 path (FP8 frontend used
+  here), and the execution-contract module `_flashrt_exec` built
+  (`cmake -S exec -B exec/build -DCMAKE_BUILD_TYPE=Release && cmake --build exec/build -j`).
+- A Pi0.5 checkpoint directory.
+
+All three scripts take `--checkpoint` and run inside the CUDA container with:
+
+```bash
+PYTHONPATH=.:./exec/build PYTORCH_ALLOC_CONF=expandable_segments:True \
+python serving/robot_recap/<script>.py --checkpoint /path/to/pi05_libero_pytorch
+```
+
+| script | extra flags (default) | what it prints |
+| --- | --- | --- |
+| `verify_recap.py` | `--num-views 3` `--steps 10` `--cfg-beta 1.5` | RL/CFG inference driven by the contract, cosine vs ctypes replay; `PASS` at cos ≥ 0.999 |
+| `verify_capsule.py` | `--num-views 3` `--steps 10` | episode-boundary snapshot/restore via the contract; `PASS` when restore is bit-identical (cos 1.0) |
+| `rollout_host.py` | `--episodes 3` `--max-chunks 8` `--value-stop-threshold 0.0` `--record-dir DIR` `--num-views 3` | one line per episode (chunks run, STOP reason: keyboard / value / timeout, recorded chunks), then a `PASS` summary |
+
+`rollout_host.py --record-dir DIR` writes one `episode_*.npz` per episode (actions,
+values, stop reason). The keyboard start/end and robot reset hooks are scripted
+no-ops by default — swap in `pynput`/`termios` and your robot driver for teleop.
+
 ## Notes (honest scope)
 - Mechanism demo: it reuses the captured policy chunk with a restored noise
   buffer; production writes fresh observations each chunk. The value critic is

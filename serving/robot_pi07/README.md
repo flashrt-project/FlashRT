@@ -30,6 +30,38 @@ This is the sequential-hand-off counterpart to `serving/robot_recap/` (which is
 the concurrent policy‖critic rollout pattern) — together they cover the two
 multi-model shapes the contract is built for.
 
+## Usage (reproducible)
+
+**Prerequisites**
+
+- A CUDA GPU; the FlashRT runtime built with the Pi0.5 path (FP8 frontend used
+  here), and the execution-contract module `_flashrt_exec` built
+  (`cmake -S exec -B exec/build -DCMAKE_BUILD_TYPE=Release && cmake --build exec/build -j`).
+- A Pi0.5 checkpoint directory.
+
+**Run**
+
+```bash
+PYTHONPATH=.:./exec/build \
+PYTORCH_ALLOC_CONF=expandable_segments:True \
+python serving/robot_pi07/verify_pi07.py --checkpoint /path/to/pi05_libero_pytorch
+```
+
+**Arguments**
+
+| flag | default | meaning |
+| --- | --- | --- |
+| `--checkpoint` | (required) | Pi0.5 checkpoint directory |
+| `--num-views` | `3` | camera views per observation |
+| `--ticks` | `8` | total ACTOR ticks to run |
+| `--planner-every` | `4` | run the PLANNER once every N ACTOR ticks (multi-rate) |
+
+**Expected output**: per-tick lines showing the actor acting and the planner
+running every 4th tick, a mid-run `INTERRUPT` line where the subtask buffer is
+overwritten (planner→subtask and subtask→actor hand-offs asserted byte-equal),
+and a final `PASS — pi0.7-sim hierarchy ...` summary. Actions are checked finite;
+the hand-off and interrupt are checked byte-exact.
+
 ## Honest scope
 Two Pi05 stand in for planner + actor (in real π0.7 they differ in role/size);
 the subtask hand-off is plumbing (planner output → subtask buffer → actor

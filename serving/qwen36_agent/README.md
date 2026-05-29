@@ -8,6 +8,66 @@ owns session cache, exact token-prefix reuse, OpenAI-compatible tool calling,
 streaming, and request scheduling. It must not add session or KV verbs to
 `exec/`; the contract remains Buffer / Graph / Plan / Event / ShapeKey.
 
+The execution-state **capsule** feature (cold-prefill a shared prefix once, then
+restore instead of re-prefill on later turns) is documented in
+[`capsules.md`](capsules.md); this server exposes session prefix reuse, and the
+capsule API lives on the frontend.
+
+## Quickstart (end-to-end, reproducible)
+
+**Prerequisites**
+
+- A CUDA GPU (developed on RTX 5090, sm_120) and the FlashRT runtime built/installed
+  (`pip install -e ".[torch]"`, then the CMake build — see the repo `docs/INSTALL.md`).
+- The Qwen3.6 NVFP4 checkpoint directory (the model weights) and, for speculative
+  decode, the MTP checkpoint. Point the server at the NVFP4 directory.
+- Server-only Python deps: `pip install fastapi uvicorn`.
+
+**1. Start the server**
+
+```bash
+python -m serving.qwen36_agent.server \
+  --checkpoint /path/to/qwen36_nvfp4 \
+  --model-name qwen36-27b \
+  --host 127.0.0.1 --port 8000
+# startup runs graph warmup, then logs: Uvicorn running on http://127.0.0.1:8000
+```
+
+**2. Check it is up**
+
+```bash
+curl -s http://127.0.0.1:8000/v1/models
+curl -s http://127.0.0.1:8000/health      # model, max_seq, live sessions
+```
+
+**3. A chat completion (OpenAI-compatible)**
+
+```bash
+curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "qwen36-27b",
+  "messages": [{"role": "user", "content": "Write a Python one-liner to reverse a string."}],
+  "max_tokens": 128,
+  "flashrt_session_id": "demo"
+}'
+```
+
+The response is an OpenAI `chat.completion` with an extra `flashrt` block of serving
+telemetry (see [Response fields](#response-fields)).
+
+**4. Streaming (Server-Sent Events)**
+
+```bash
+curl -N http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "qwen36-27b", "stream": true,
+  "messages": [{"role": "user", "content": "Explain a hash map in two sentences."}],
+  "max_tokens": 128, "flashrt_session_id": "demo"
+}'
+# emits `data: {chat.completion.chunk}` lines, then `data: [DONE]`
+```
+
+Tokens are streamed only after they are committed to the session state (committed
+decode), so the visible transcript never runs ahead of the GPU state.
+
 ## Design target
 
 - 256K context on the existing Qwen3.6 long-context FP8-KV/TQ kernel path.
@@ -77,41 +137,80 @@ a fake cache hit.
 Exact same-length prompts continue from the current hot boundary; shorter
 prompts rebuild until rollback/checkpoint support lands.
 
-## Run
+## Server parameters
+
+`python -m serving.qwen36_agent.server [flags]`:
+
+| flag | default | meaning |
+| --- | --- | --- |
+| `--checkpoint` | (required) | Qwen3.6 NVFP4 checkpoint directory |
+| `--model-name` | `qwen36-27b` | id reported by `/v1/models` and echoed in responses |
+| `--device` | `cuda` | torch device |
+| `--max-seq` | `262208` | max sequence length (prompt + generation) |
+| `--route-min-seq` | `0` | min prompt length sent to the chunked long-context FP8-KV path; `0` routes even short real prompts there to avoid request-time per-position graph capture |
+| `--graph-cache-max` | `128` | per-cache CUDA-graph LRU bound on the frontend |
+| `--warmup-preset` | `agent` | startup warmup shapes: `agent` / `short` / `long` / `all` / `none` |
+| `--warmup` | `""` | extra warmup shapes, comma-separated `prompt_len:max_tokens` |
+| `--warmup-K` | `6` | speculative K used during warmup |
+| `--warmup-committed-max-prompt` | `1024` | run real committed-stream warmup up to this prompt length; larger long-context shapes use graph-only warmup |
+| `--warm-long-prefill-graphs` | off | also capture long-context prefill chunk graphs at startup |
+| `--host` / `--port` | `127.0.0.1` / `8000` | bind address |
+| `--log-level` | `info` | uvicorn log level |
+
+Startup warmup moves CUDA-graph capture out of the first request: it runs real
+committed-stream warmup for short/medium shapes and graph-only warmup for larger
+long-context shapes.
+
+## HTTP surface and request fields
+
+OpenAI-compatible: `GET /v1/models`, `GET /health`, `POST /v1/chat/completions`,
+`POST /v1/sessions`, `DELETE /v1/sessions/{id}`. Standard OpenAI request fields
+(`messages`, `max_tokens` / `max_completion_tokens`, `stream`, `tools`) plus
+FlashRT extensions:
+
+- `flashrt_session_id` (or `session_id`): stable session key for prefix reuse.
+- `flashrt_cache_salt`: optional namespace separator for different prompt policies.
+- `flashrt_K`: speculative decode K for this request (default 6).
+- `enable_thinking`: passed to the Qwen chat template (default false).
+
+## Response fields
+
+On top of the standard `chat.completion` (`choices[].message`, `usage`), each
+response carries a `flashrt` telemetry block:
+
+| field | meaning |
+| --- | --- |
+| `session_id` | the session this request used |
+| `cached_tokens` | prompt tokens reused from the hot session (the prefix-reuse win) |
+| `new_prefill_tokens` | prompt tokens actually prefilled this turn |
+| `prefill_ms` | prefill / append time |
+| `first_delta_ms` | time to first emitted delta (TTFT-like) |
+| `decode_ms`, `decode_tok_per_s` | decode time and throughput |
+| `prefix_action` | how the session was reused: `exact` / `append` / `message_append` / `truncate` / `rebuild` / `activate_rebuild` |
+
+## Session prefix reuse (walkthrough)
+
+Reuse the same `flashrt_session_id` across turns and resend the full message list
+(including the previous assistant turn). The server tokenizes the new prompt,
+finds the longest exact token-prefix match against the hot session, and prefills
+only the appended suffix:
 
 ```bash
-python -m serving.qwen36_agent.server \
-  --checkpoint CHECKPOINT_DIR \
-  --model-name qwen36-27b \
-  --max-seq 262208 \
-  --route-min-seq 0 \
-  --graph-cache-max 128 \
-  --warmup-preset agent \
-  --host 127.0.0.1 \
-  --port 8000
+# turn 1 (cold): flashrt.cached_tokens == 0, prefix_action == "rebuild"
+curl -s :8000/v1/chat/completions -d '{"model":"qwen36-27b","flashrt_session_id":"s1",
+ "messages":[{"role":"user","content":"List three sorting algorithms."}],"max_tokens":128}'
+
+# turn 2 (warm): append the prior assistant reply + a new user message;
+# flashrt.cached_tokens > 0, prefix_action == "append" / "message_append"
+curl -s :8000/v1/chat/completions -d '{"model":"qwen36-27b","flashrt_session_id":"s1",
+ "messages":[{"role":"user","content":"List three sorting algorithms."},
+             {"role":"assistant","content":"<prior reply>"},
+             {"role":"user","content":"Now give the time complexity of each."}],"max_tokens":128}'
 ```
 
-The agent host defaults to `--route-min-seq 0`, which sends short real prompts
-through the chunked long-context FP8-KV path instead of the older per-position
-short route. This avoids request-time graph capture for arbitrary short prompt
-lengths. Startup warmup runs real committed-stream warmup for short/medium
-shapes and graph-only warmup for larger long-context shapes.
-
-Warmup controls:
-
-- `--warmup-preset agent|short|long|all|none`
-- `--warmup "prompt_len:max_tokens,..."`
-- `--warmup-committed-max-prompt N`
-- `--warm-long-prefill-graphs`
-
-The HTTP surface is OpenAI-compatible for `/v1/models` and
-`/v1/chat/completions`.  FlashRT-specific request fields are:
-
-- `flashrt_session_id`: stable session key for prefix reuse.
-- `flashrt_cache_salt`: optional namespace separator for different prompt
-  policies.
-- `flashrt_K`: speculative decode K for this request.
-- `enable_thinking`: passed to the Qwen chat template.
+If a client sends only the new message without the prior assistant turn, or a
+shorter/divergent prompt, the token stream has diverged and the server rebuilds
+or restores at a checkpoint boundary (it reports `rebuild`, never a fake hit).
 
 ## Validation
 
