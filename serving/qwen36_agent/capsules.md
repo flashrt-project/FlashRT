@@ -38,22 +38,39 @@ rebuild) is serving-layer policy and stays out of the execution contract.
 
 ## Correctness contract
 
-Restore is **bit-identical** to a cold prefill of the same prefix. The gate lives
-in `tests/test_qwen36_agent_capsule.py` and asserts token-exact output for:
-restore + decode, restore after the buffers were dirtied by another prompt,
-restore + append + decode (the coding-agent flow), and fork (two branches from
-one capsule). Decode throughput is unchanged — capsules touch prefill / TTFT
-only, never steady-state decode.
+A capsule restore is **bit-identical to the path it replaces** — verified
+token-exact in `tests/test_qwen36_agent_capsule.py`:
+
+- **Pure restore == cold prefill.** `restore + decode` produces the same tokens
+  as a cold `prefill + decode` of the same prefix (short and long routes, real
+  text), including restore after the buffers were dirtied by another prompt, and
+  fork (two branches from one capsule).
+- **Restore + append == non-capsule append.** The coding-agent flow
+  (`restore + append(suffix) + decode`) equals the existing
+  `prefill(prefix) + append(suffix) + decode` path token-exact: the capsule adds
+  **zero** error to the path it stands in for.
+
+Decode throughput is unchanged — capsules touch prefill / TTFT only, never
+steady-state decode.
+
+> Note (long route, pre-existing and orthogonal to capsules): the long-context
+> `append` path itself does **not** reproduce a cold *full* prefill token-for-token
+> at scale, because FP8-KV rounding at the append boundary perturbs the committed
+> state. This is a property of `append_long_ctx_*`, not of capsules — a capsule
+> reproduces whichever path it replaces exactly. Pure restore (no append) is
+> bit-identical to a cold prefill.
 
 ## Status
 
 - **Short committed-stream route: supported** (`snapshot_capsule` /
   `restore_capsule`, in-GPU device-to-device).
-- **Long FP8-KV/TQ route: in progress** — the production agent path (`--route-min-seq 0`)
-  uses the chunked long-context route; its capsule covers a larger state surface
-  (TQ/FP8 dequant stage + long MTP tail) and is being wired next. On the long
-  route `snapshot_capsule()` raises `NotImplementedError` rather than producing a
-  partial capsule.
+- **Long FP8-KV route: supported** — the production agent path
+  (`--route-min-seq 0`, `FLASHRT_QWEN36_LONG_KV_CACHE=fp8`). The capsule covers
+  the packed FP8 KV valid range, linear recurrent/conv state, MTP cache + long
+  MTP hidden tail, and metadata; restore re-dequantizes the BF16 stage from the
+  restored FP8 cache.
+- **Long TQ KV mode: not wired** — `snapshot_capsule()` raises
+  `NotImplementedError` rather than producing a partial capsule.
 
 ## Measured benefit (short route)
 
@@ -77,9 +94,27 @@ of 7 repeats, stable to < 1% across 3 full runs:
 Honest reading: the short route prefills sequentially, one position at a time, so
 even a ~220-token cold prefill takes seconds — that absolute cost is a property of
 the short route, and is exactly what the capsule removes for the shared prefix.
-The long route (production agent path) prefills faster per token; its capsule
-advantage carries over and **grows with prefix length**, where the seconds →
-milliseconds win lands for 10k–50k-token shared prefixes.
+
+## Measured benefit (long FP8-KV route — production agent path)
+
+Same workload on the chunked long FP8-KV route, with the shared prefix padded to
+2k / 4k / 8k tokens (system + tool schema + repo index). `cold` =
+prefill_long(prefix+suffix) every turn; `capsule` = restore + append(suffix).
+Median of 5 repeats, stable to < 0.5% across runs:
+
+| shared prefix | cold TTFT | capsule TTFT | TTFT speedup | capsule MB |
+| --- | --- | --- | --- | --- |
+| 2064 tok | ~289 ms | ~139 ms | **2.09x** | 168 MB |
+| 4112 tok | ~389 ms | ~73 ms | **5.31x** | 211 MB |
+| 8236 tok | ~817 ms | ~140 ms | **5.82x** | 361 MB |
+
+- **Cold TTFT grows with prefix length** (289 → 389 → 817 ms); **capsule TTFT
+  stays roughly flat** (restore is a ~0.1 ms device-to-device copy — bandwidth on
+  the capsule bytes — so you pay essentially only for the suffix append). The
+  speedup therefore **widens with prefix length**, and keeps widening past 8k
+  toward the 10k–50k shared prefixes a real coding agent resends each turn.
+- Capsule output is token-exact to the non-capsule append path at every size.
+- Decode throughput is unchanged by the capsule.
 
 A single continuous hot session is unaffected — the shipped contiguous-append
 path already reuses its own prefix. Capsules help fresh / multi-session / fork
