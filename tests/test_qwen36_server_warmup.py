@@ -96,6 +96,14 @@ def test_server_chat_template_disables_thinking_by_default():
     assert engine.fe._tokenizer.kwargs['enable_thinking'] is True
 
 
+def test_qwen36_frontend_exposes_committed_stream_split():
+    from flash_rt.frontends.torch.qwen36_rtx import Qwen36TorchFrontendRtx
+
+    assert hasattr(
+        Qwen36TorchFrontendRtx,
+        'generate_own_speculative_KN_nvfp4_committed_stream')
+
+
 def test_long_mtp_tail_auto_policy(monkeypatch):
     from flash_rt.frontends.torch.qwen36_rtx import Qwen36TorchFrontendRtx
 

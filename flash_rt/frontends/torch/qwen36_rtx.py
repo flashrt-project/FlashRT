@@ -4457,6 +4457,228 @@ class Qwen36TorchFrontendRtx:
 
         return torch.cat([input_ids] + generated, dim=1)
 
+    def generate_own_speculative_KN_nvfp4_committed_stream(
+            self, input_ids, *, max_new_tokens: int, K: int = 6):
+        """Stream committed NVFP4 speculative-decode chunks.
+
+        This is the agent-serving split path for short BF16-KV contexts.  It
+        deliberately differs from the stateless full-generate helper above:
+        every yielded token has already been processed by the main model and is
+        reflected in KV/recurrent state.  The old helper may return a final
+        lookahead token that has not yet been committed; that shortcut is not
+        valid for session-cache serving.
+
+        Yields:
+            tuple[int, ...]: committed token ids accepted at one spec boundary.
+        """
+        import torch
+        from flash_rt import flash_rt_kernels as fvk
+
+        prompt_len = int(input_ids.shape[1])
+        if getattr(self, '_long_ctx_mode', False) and self._should_use_long_ctx_route(
+                prompt_len, max_new_tokens):
+            raise NotImplementedError(
+                'committed streaming for the long-context Qwen3.6 route '
+                'is split separately; use the short route for this method')
+
+        if self._weights.ptrs.get('mtp') is None:
+            raise RuntimeError(
+                'MTP head not loaded — speculative decode unavailable')
+        max_spec_k = min(self.MAX_Q_SEQ - 1, self._MAX_PUBLIC_SPEC_K)
+        if K < 1 or K > max_spec_k:
+            raise ValueError(
+                f'K={K} out of range — need 1<=K<={max_spec_k}')
+
+        hidden = self._cfg['hidden_size']
+        s = torch.cuda.current_stream().cuda_stream
+
+        self.reset_state()
+        self.reset_mtp_state()
+        if not hasattr(self, '_rope_cos_table'):
+            self._build_rope_table()
+
+        with torch.no_grad():
+            # 1) Prompt prefill. Same math/path as the stateless short
+            # helper, but do not expose the first predicted token until it is
+            # committed by a main-model step below.
+            ev_pf0 = torch.cuda.Event(enable_timing=True)
+            ev_pf1 = torch.cuda.Event(enable_timing=True)
+            ev_dec1 = torch.cuda.Event(enable_timing=True)
+            ev_pf0.record()
+            for p in range(prompt_len):
+                self._static_token_id.copy_(input_ids[:, p:p + 1])
+                g_pf = self._ensure_graph_for_pos_nvfp4(p)
+                self._replay_pos_graph(g_pf, p)
+                self._prefill_h_cache[p:p + 1].copy_(
+                    self._last_hidden_buf.view(1, hidden))
+
+            pending_tok = self._logits_buf.argmax(
+                dim=-1, keepdim=True).view(1, 1)
+            cur_pos = prompt_len
+
+            # 2) MTP prefill mirrors generate_own_speculative_KN_nvfp4.
+            for p in range(1, prompt_len):
+                prev_h_p = self._prefill_h_cache[
+                    p - 1:p].view(1, 1, hidden).contiguous()
+                prev_tok_p = input_ids[:, p:p + 1]
+                self.forward_mtp_head_nvfp4(prev_h_p, prev_tok_p, p)
+            h = self._prefill_h_cache[
+                prompt_len - 1:prompt_len].view(1, 1, hidden).contiguous()
+            self.forward_mtp_head_nvfp4(h, pending_tok, prompt_len)
+            ev_pf1.record()
+
+            self._spec_attempts = 0
+            self._spec_accepts = 0
+            self._spec_full = 0
+            emitted = 0
+
+            while emitted < int(max_new_tokens):
+                remaining = int(max_new_tokens) - emitted
+                draft_k = min(int(K), max(0, remaining - 1))
+                verify_q = draft_k + 1
+
+                # No room to expose a draft/correction token.  Commit only the
+                # pending token through the main model, yield it, and keep the
+                # next logits as private lookahead for a possible later call.
+                if draft_k == 0:
+                    d = self._rope_dim
+                    cos_1 = self._rope_cos_table[
+                        cur_pos:cur_pos + 1].view(1, 1, d)
+                    sin_1 = self._rope_sin_table[
+                        cur_pos:cur_pos + 1].view(1, 1, d)
+                    self._verify_static_tokens[:, 0:1].copy_(pending_tok)
+                    self._verify_static_cos[:, 0:1].copy_(cos_1)
+                    self._verify_static_sin[:, 0:1].copy_(sin_1)
+                    vg = self._ensure_verify_graph_nvfp4(cur_pos, 1)
+                    gs = self._graph_stream
+                    gs.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(gs):
+                        vg.replay()
+                    torch.cuda.current_stream().wait_stream(gs)
+                    out_ids = (int(pending_tok.item()),)
+                    pending_tok = self._K_logits_buf[:1].argmax(
+                        dim=-1, keepdim=True).view(1, 1)
+                    h = self._K_last_hidden_buf[:, 0:1, :].contiguous()
+                    cur_pos += 1
+                    emitted += 1
+                    yield out_ids
+                    continue
+
+                # Snapshot main state before verify.  MTP state is independent
+                # and restored by its graph-capture helper.
+                snap_stream = self._snap_stream
+                snap_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(snap_stream):
+                    self._snap_lin_buf.copy_(self._lin_state)
+                    self._snap_conv_buf.copy_(self._lin_conv_state)
+                    self._snap_K_buf[:, :verify_q].copy_(
+                        self._attn.K_cache[:, cur_pos:cur_pos + verify_q])
+                    self._snap_V_buf[:, :verify_q].copy_(
+                        self._attn.V_cache[:, cur_pos:cur_pos + verify_q])
+
+                # Draft only as many tokens as can be committed this cycle.
+                gs = self._graph_stream
+                cg = self._ensure_mtp_chain_graph_nvfp4(cur_pos, draft_k)
+                self._exec_lazy_init()
+                _use_exec = getattr(self, '_use_exec', False)
+                gs.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(gs):
+                    self._mtp_static_prev_h.copy_(h)
+                    self._mtp_static_prev_token.copy_(pending_tok)
+                    if not _use_exec:
+                        cg.replay()
+                if _use_exec:
+                    self._exec_mtp_chain.adopt(
+                        self._exec_key(cur_pos, draft_k),
+                        cg.raw_cuda_graph_exec())
+                    rc = self._exec_mtp_chain.replay(
+                        self._exec_key(cur_pos, draft_k), self._exec_gs_id)
+                    if rc != 0:
+                        raise RuntimeError(f'frt mtp_chain replay rc={rc}')
+                torch.cuda.current_stream().wait_stream(gs)
+                drafts_t = self._chain_drafts_buf[:draft_k]
+
+                torch.cuda.current_stream().wait_stream(snap_stream)
+
+                d = self._rope_dim
+                cos_KN = self._rope_cos_table[
+                    cur_pos:cur_pos + verify_q].view(1, verify_q, d)
+                sin_KN = self._rope_sin_table[
+                    cur_pos:cur_pos + verify_q].view(1, verify_q, d)
+                self._verify_static_tokens[:, 0:1].copy_(pending_tok)
+                self._verify_static_tokens[:, 1:verify_q].copy_(
+                    drafts_t.view(1, draft_k))
+                self._verify_static_cos[:, :verify_q].copy_(cos_KN)
+                self._verify_static_sin[:, :verify_q].copy_(sin_KN)
+                vg = self._ensure_verify_graph_nvfp4(cur_pos, verify_q)
+                gs.wait_stream(torch.cuda.current_stream())
+                if _use_exec:
+                    self._exec_verify.adopt(
+                        self._exec_key(cur_pos, verify_q),
+                        vg.raw_cuda_graph_exec())
+                    rc = self._exec_verify.replay(
+                        self._exec_key(cur_pos, verify_q), self._exec_gs_id)
+                    if rc != 0:
+                        raise RuntimeError(f'frt verify replay rc={rc}')
+                else:
+                    with torch.cuda.stream(gs):
+                        vg.replay()
+                torch.cuda.current_stream().wait_stream(gs)
+
+                logits_KN = self._K_logits_buf[:verify_q]
+                all_argmax = logits_KN.argmax(dim=-1)
+                drafts_stack = drafts_t.view(-1)
+                matches = (all_argmax[:draft_k] == drafts_stack).long()
+                matches_pad = torch.cat([
+                    matches,
+                    torch.zeros(1, device=matches.device,
+                                dtype=matches.dtype),
+                ])
+                N = int(matches_pad.argmin().item())
+                self._spec_attempts += 1
+                self._spec_accepts += N
+
+                # Commit and yield only inputs that verify actually processed:
+                # pending token + accepted drafts.  The correction/bonus token
+                # becomes private lookahead for the next cycle.
+                committed = [int(pending_tok.item())]
+                if N > 0:
+                    committed.extend(int(x) for x in all_argmax[:N].tolist())
+                if N == draft_k:
+                    self._spec_full += 1
+                    pending_tok = all_argmax[draft_k:draft_k + 1].view(1, 1)
+                    h = self._K_last_hidden_buf[
+                        :, draft_k:draft_k + 1, :].contiguous()
+                    cur_pos += draft_k + 1
+                else:
+                    fvk.gpu_copy(
+                        self._lin_state.data_ptr(),
+                        self._K_lin_state_per_step[N].data_ptr(),
+                        self._lin_state.numel() * 2, s,
+                    )
+                    fvk.gpu_copy(
+                        self._lin_conv_state.data_ptr(),
+                        self._K_lin_conv_state_per_step[N].data_ptr(),
+                        self._lin_conv_state.numel() * 2, s,
+                    )
+                    pending_tok = all_argmax[N:N + 1].view(1, 1)
+                    h = self._K_last_hidden_buf[
+                        :, N:N + 1, :].contiguous()
+                    cur_pos += N + 1
+
+                if len(committed) > remaining:
+                    raise RuntimeError(
+                        'internal error: committed chunk exceeds remaining '
+                        'budget')
+                emitted += len(committed)
+                yield tuple(committed)
+
+            ev_dec1.record()
+            torch.cuda.synchronize()
+            self._long_ctx_prefill_ms = ev_pf0.elapsed_time(ev_pf1)
+            self._long_ctx_decode_ms = ev_pf1.elapsed_time(ev_dec1)
+            self._long_ctx_route = 'short_spec_stream'
+
     # ---------- own forward (Phase 2.3b4) ----------
     #
     # Forward path implemented method-by-method on the frontend, not on
