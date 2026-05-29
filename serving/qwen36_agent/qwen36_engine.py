@@ -181,15 +181,39 @@ class Qwen36FrontendAgentEngine:
         else:
             chunks = self.fe.decode_own_speculative_nvfp4_committed_stream(
                 max_new_tokens=int(max_tokens), K=int(K))
+        stop_ids = self._visible_stop_token_ids()
         for token_chunk in chunks:
             ids = tuple(int(t) for t in token_chunk)
+            stop_at = next(
+                (i for i, tok in enumerate(ids) if tok in stop_ids), None)
+            visible_ids = ids if stop_at is None else ids[:stop_at]
             text = self.fe._tokenizer.decode(
-                list(ids), skip_special_tokens=True)
+                list(visible_ids), skip_special_tokens=True)
             if not self._last_enable_thinking:
                 text = re.sub(r"<think>.*?</think>\s*", "", text,
                               flags=re.DOTALL)
                 text = text.replace("<think>", "").replace("</think>", "")
             yield DecodeChunk(token_ids=ids, text=text, accepted=len(ids))
+            if stop_at is not None:
+                break
+
+    def _visible_stop_token_ids(self) -> set[int]:
+        tokenizer = self.fe._tokenizer
+        out = set()
+        for attr in ("eos_token_id", "pad_token_id"):
+            tok = getattr(tokenizer, attr, None)
+            if tok is not None:
+                out.add(int(tok))
+        convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+        if convert is not None:
+            for token in ("<|im_end|>", "<|endoftext|>"):
+                try:
+                    tok = convert(token)
+                except Exception:
+                    tok = None
+                if isinstance(tok, int) and tok >= 0:
+                    out.add(tok)
+        return out
 
     def dummy_token_ids(self, prompt_len: int):
         """Build exact-length token ids for startup graph warmup."""

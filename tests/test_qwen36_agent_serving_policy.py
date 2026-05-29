@@ -445,6 +445,39 @@ def test_qwen36_frontend_agent_engine_hides_think_tags_by_default():
     assert chunks[0].text == "answer"
 
 
+def test_qwen36_frontend_agent_engine_stops_visible_text_at_im_end():
+    class StopTokenizer(FakeTokenizer):
+        eos_token_id = 999
+        pad_token_id = None
+
+        def convert_tokens_to_ids(self, token):
+            return 999 if token == "<|im_end|>" else -1
+
+        def decode(self, ids, skip_special_tokens=False):
+            del skip_special_tokens
+            return "".join(chr(i) for i in ids if i != 999)
+
+    class StopFrontend(FakeFrontend):
+        def __init__(self):
+            super().__init__()
+            self._tokenizer = StopTokenizer()
+
+        def decode_own_speculative_nvfp4_committed_stream(self, *,
+                                                          max_new_tokens, K):
+            del max_new_tokens, K
+            yield (ord("o"), ord("k"), 999, ord("u"))
+            yield (ord("n"),)
+
+    engine = Qwen36FrontendAgentEngine(StopFrontend())
+    engine.tokenize_chat([{"role": "user", "content": "go"}])
+
+    chunks = list(engine.generate_stream(max_tokens=8, K=4))
+
+    assert len(chunks) == 1
+    assert chunks[0].token_ids == (ord("o"), ord("k"), 999, ord("u"))
+    assert chunks[0].text == "ok"
+
+
 def test_qwen36_frontend_agent_engine_wires_short_append_split():
     fe = FakeFrontend()
     engine = Qwen36FrontendAgentEngine(fe)
