@@ -13,18 +13,23 @@ from typing import Iterable, Protocol, Sequence
 
 @dataclass(frozen=True)
 class DecodeChunk:
-    """A stream chunk whose tokens are committed to the session state.
+    """A stream chunk of session-committed, client-visible tokens.
 
-    Qwen3.6 speculative decode may internally verify more tokens than the user
-    ultimately receives when a request stops.  Agent serving cannot expose that
-    old full-generate shortcut: every yielded token must already be reflected in
-    the frontend's KV/recurrent state, or must be accompanied by an explicit
-    checkpoint/rollback.  v1 requires committed chunks only.
+    ``token_ids`` are the visible tokens to commit to the session journal.
+
+    Qwen3.6 speculative decode verifies a whole chunk at once, so when a stop
+    token lands mid-chunk the frontend KV/recurrent state has already committed
+    the tokens *after* the stop. Those are not part of the transcript:
+    ``state_lookahead`` counts them. A nonzero ``state_lookahead`` means the GPU
+    state leads the visible journal, so the session must be rebuilt (not
+    hot-appended) until a rollback/checkpoint mechanism lands.
     """
 
     token_ids: tuple[int, ...]
     text: str
     accepted: int
+    stop: bool = False
+    state_lookahead: int = 0
 
 
 @dataclass(frozen=True)

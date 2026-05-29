@@ -193,9 +193,19 @@ class Qwen36FrontendAgentEngine:
                 text = re.sub(r"<think>.*?</think>\s*", "", text,
                               flags=re.DOTALL)
                 text = text.replace("<think>", "").replace("</think>", "")
-            yield DecodeChunk(token_ids=ids, text=text, accepted=len(ids))
-            if stop_at is not None:
-                break
+            if stop_at is None:
+                yield DecodeChunk(
+                    token_ids=ids, text=text, accepted=len(ids))
+                continue
+            # Stop token mid-chunk: the frontend committed `ids` to KV state, but
+            # only `visible_ids` belong to the transcript. Commit the visible
+            # tokens to the journal and report the post-stop tokens (the stop
+            # token itself + any verified tail) as state lookahead so the session
+            # is rebuilt rather than falsely hot-appended.
+            yield DecodeChunk(
+                token_ids=visible_ids, text=text, accepted=len(visible_ids),
+                stop=True, state_lookahead=len(ids) - len(visible_ids))
+            break
 
     def _visible_stop_token_ids(self) -> set[int]:
         tokenizer = self.fe._tokenizer
