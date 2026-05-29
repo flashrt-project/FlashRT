@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -50,6 +51,21 @@ class AgentService:
                  sessions: Optional[SessionRegistry] = None):
         self.engine = engine
         self.sessions = sessions or SessionRegistry()
+        # The backend is a single hot GPU frontend with mutable KV / linear /
+        # session state. Serialize whole requests so concurrent HTTP calls cannot
+        # interleave prefill/decode and corrupt that state. A non-streaming call
+        # holds the lock for the whole turn; a streaming call holds it for the
+        # life of the generator (released when it is exhausted or closed).
+        self._lock = threading.Lock()
+
+    def complete(self, req: AgentRequest) -> AgentResult:
+        with self._lock:
+            return self._complete(req)
+
+    def stream_openai(self, req: AgentRequest, *,
+                      model: str) -> Iterable[str]:
+        with self._lock:
+            yield from self._stream_openai(req, model=model)
 
     def _effective_plan(
             self, session, plan: PrefixPlan) -> tuple[int, PrefixPlan]:
@@ -105,7 +121,18 @@ class AgentService:
     def _copy_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return [dict(m) for m in messages]
 
-    def complete(self, req: AgentRequest) -> AgentResult:
+    def _mark_reusable(self, session, state_lookahead: bool) -> None:
+        """Mark the session hot (reusable for append) only if the GPU state ends
+        exactly at the committed transcript. If a stop token left committed
+        lookahead, the frontend KV leads the journal, so no session is safely
+        appendable until the next cold prefill resets it: clear the hot session
+        and force a rebuild."""
+        if state_lookahead:
+            self.sessions.hot_session_id = None
+        else:
+            self.sessions.mark_hot(session.session_id)
+
+    def _complete(self, req: AgentRequest) -> AgentResult:
         if req.max_tokens < 1:
             raise ValueError("max_tokens must be >= 1")
         prompt_tokens = self.engine.tokenize_chat(
@@ -144,8 +171,11 @@ class AgentService:
         generated_ids: List[int] = []
         first_delta_ms = 0.0
         decode_started = time.perf_counter()
+        state_lookahead = False
         for chunk in self.engine.generate_stream(max_tokens=req.max_tokens, K=req.K):
             generated_ids.extend(int(t) for t in chunk.token_ids)
+            if getattr(chunk, "state_lookahead", 0):
+                state_lookahead = True
             evs = parser.feed(chunk.text)
             if evs and first_delta_ms <= 0.0:
                 first_delta_ms = (time.perf_counter() - t0) * 1000.0
@@ -172,7 +202,7 @@ class AgentService:
             "content": text,
         })
         session.visible_messages = visible_messages
-        self.sessions.mark_hot(session.session_id)
+        self._mark_reusable(session, state_lookahead)
 
         completion_tokens = len(generated_ids)
         decode_ms = max(0.0, (t_done - decode_started) * 1000.0)
@@ -205,8 +235,8 @@ class AgentService:
             prefix_plan=plan,
         )
 
-    def stream_openai(self, req: AgentRequest, *,
-                      model: str) -> Iterable[str]:
+    def _stream_openai(self, req: AgentRequest, *,
+                       model: str) -> Iterable[str]:
         """Yield OpenAI-compatible SSE chunks as decode commits tokens."""
         if req.max_tokens < 1:
             raise ValueError("max_tokens must be >= 1")
@@ -241,9 +271,12 @@ class AgentService:
         generated_ids: List[int] = []
         visible_parts: List[str] = []
         seen_tool_call = False
+        state_lookahead = False
         yield sse_data(role_chunk(completion_id, model))
         for chunk in self.engine.generate_stream(max_tokens=req.max_tokens, K=req.K):
             generated_ids.extend(int(t) for t in chunk.token_ids)
+            if getattr(chunk, "state_lookahead", 0):
+                state_lookahead = True
             for ev in parser.feed(chunk.text):
                 if ev.kind == "tool_call":
                     seen_tool_call = True
@@ -264,7 +297,7 @@ class AgentService:
             "content": "".join(visible_parts),
         })
         session.visible_messages = visible_messages
-        self.sessions.mark_hot(session.session_id)
+        self._mark_reusable(session, state_lookahead)
         usage = {
             "prompt_tokens": len(prompt_tokens),
             "completion_tokens": len(generated_ids),

@@ -477,8 +477,12 @@ def test_qwen36_frontend_agent_engine_stops_visible_text_at_im_end():
     chunks = list(engine.generate_stream(max_tokens=8, K=4))
 
     assert len(chunks) == 1
-    assert chunks[0].token_ids == (ord("o"), ord("k"), 999, ord("u"))
+    # Only the visible tokens are committed to the journal; the stop token (999)
+    # and the post-stop tail ('u') are reported as state lookahead, not journaled.
+    assert chunks[0].token_ids == (ord("o"), ord("k"))
     assert chunks[0].text == "ok"
+    assert chunks[0].stop is True
+    assert chunks[0].state_lookahead == 2
 
 
 def test_qwen36_frontend_agent_engine_wires_short_append_split():
@@ -566,3 +570,100 @@ def test_qwen36_frontend_agent_engine_warmup_uses_long_graph_hooks():
     assert warmed[0]["decode_graphs"] == 1
     assert fe.prefill_warm_shapes == [(16, 4)]
     assert fe.decode_warm_shapes == ([(16, 4)], 5)
+
+
+def test_qwen36_engine_trims_visible_tokens_and_flags_state_lookahead():
+    """A stop token mid-chunk: commit only visible tokens, report the post-stop
+    tokens (eos + verified tail) as state lookahead."""
+    class StopTokenizer(FakeTokenizer):
+        eos_token_id = 7
+
+        def convert_tokens_to_ids(self, token):
+            del token
+            return -1
+
+    class StopFrontend(FakeFrontend):
+        def __init__(self):
+            super().__init__()
+            self._tokenizer = StopTokenizer()
+
+        def decode_own_speculative_nvfp4_committed_stream(self, *,
+                                                          max_new_tokens, K):
+            del max_new_tokens, K
+            yield (ord("a"), ord("b"), 7, ord("c"))   # eos at index 2, extra 'c'
+
+    engine = Qwen36FrontendAgentEngine(StopFrontend(), model_name="fake")
+    chunks = list(engine.generate_stream(max_tokens=16, K=3))
+
+    assert len(chunks) == 1
+    chunk = chunks[0]
+    assert chunk.token_ids == (ord("a"), ord("b"))   # visible only
+    assert chunk.text == "ab"
+    assert chunk.stop is True
+    assert chunk.state_lookahead == 2                # eos + 'c' committed to KV
+
+
+def test_agent_service_stop_lookahead_trims_journal_and_forces_rebuild():
+    """Post-stop committed tokens must not enter the journal, and the session
+    must not be hot-appendable (the GPU state leads the visible transcript)."""
+    class StopEngine(FakeAgentEngine):
+        def generate_stream(self, *, max_tokens, K):
+            del max_tokens, K
+            yield DecodeChunk((ord("h"),), "h", 1)
+            yield DecodeChunk((ord("i"),), "i", 1, stop=True, state_lookahead=2)
+
+    svc = AgentService(StopEngine())
+    res = svc.complete(AgentRequest(
+        session_id="s", messages=[{"role": "user", "content": "abc"}],
+        max_tokens=4))
+
+    assert res.text == "hi"
+    session = svc.sessions.get("s")
+    # journal = prompt (abc + role sep) + visible generated; no post-stop tokens
+    assert session.token_ids == [ord("a"), ord("b"), ord("c"), 0,
+                                 ord("h"), ord("i")]
+    assert svc.sessions.hot_session_id is None       # not hot -> next turn rebuilds
+
+    res2 = svc.complete(AgentRequest(
+        session_id="s",
+        messages=[{"role": "user", "content": "abc"},
+                  {"role": "assistant", "content": "hi"},
+                  {"role": "user", "content": "x"}],
+        max_tokens=1))
+    assert res2.prefix_plan.action in ("rebuild", "activate_rebuild")
+    assert res2.stats.cached_tokens == 0
+
+
+def test_agent_service_serializes_concurrent_requests():
+    """The service lock prevents two requests from interleaving on the shared
+    mutable frontend state."""
+    import threading
+    import time
+
+    state = {"active": 0, "max": 0}
+
+    class SlowEngine(FakeAgentEngine):
+        def generate_stream(self, *, max_tokens, K):
+            del max_tokens, K
+            state["active"] += 1
+            state["max"] = max(state["max"], state["active"])
+            time.sleep(0.05)
+            state["active"] -= 1
+            yield DecodeChunk((ord("h"),), "h", 1)
+
+    svc = AgentService(SlowEngine())
+    start = threading.Barrier(2)
+
+    def call():
+        start.wait()
+        svc.complete(AgentRequest(
+            session_id=None, messages=[{"role": "user", "content": "a"}],
+            max_tokens=1))
+
+    threads = [threading.Thread(target=call) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert state["max"] == 1   # serialized: never two generators at once
