@@ -4826,6 +4826,107 @@ class Qwen36TorchFrontendRtx:
             self._long_ctx_decode_ms = ev_pf1.elapsed_time(ev_dec1)
             self._long_ctx_route = 'short_spec_stream'
 
+    def snapshot_capsule(self):
+        """Freeze the current committed-stream boundary into a capsule.
+
+        A capsule is the full, restorable execution state at the boundary
+        (linear-attn recurrent/conv state, full-attn KV valid range, the hidden
+        journal, MTP cache, and the boundary metadata). It is the serving-layer
+        primitive behind prefix reuse: cold-prefill a shared prefix once,
+        snapshot it, then restore-and-append on each later turn/session instead
+        of re-prefilling the prefix. See docs/serving_design.md.
+
+        v1 covers the short committed-stream route (in-GPU device-to-device
+        clones); the long FP8-KV/TQ route is a separate, larger state surface
+        and is wired in a later phase.
+        """
+        import torch
+
+        if not getattr(self, '_agent_stream_active', False):
+            raise RuntimeError(
+                'snapshot_capsule requires an active committed-stream boundary '
+                '(call prefill_own_speculative_nvfp4_agent first)')
+        if getattr(self, '_agent_stream_is_long', False):
+            raise NotImplementedError(
+                'long-context capsule snapshot is not wired yet; use the short '
+                'committed-stream route')
+
+        cur_pos = int(self._agent_stream_cur_pos)
+        cap = {
+            'is_long': False,
+            'cur_pos': cur_pos,
+            'prompt_len': int(self._agent_stream_prompt_len),
+            'lin_state': self._lin_state.clone(),
+            'lin_conv_state': self._lin_conv_state.clone(),
+            'K_cache': self._attn.K_cache[:, :cur_pos].clone(),
+            'V_cache': self._attn.V_cache[:, :cur_pos].clone(),
+            'prefill_h': self._prefill_h_cache[:cur_pos].clone(),
+            'pending_tok': self._agent_stream_pending_tok.clone(),
+            'h': self._agent_stream_h.clone(),
+            'spec_attempts': int(getattr(self, '_spec_attempts', 0)),
+            'spec_accepts': int(getattr(self, '_spec_accepts', 0)),
+            'spec_full': int(getattr(self, '_spec_full', 0)),
+        }
+        if hasattr(self, '_mtp_K_cache'):
+            cap['mtp_K'] = self._mtp_K_cache[:cur_pos].clone()
+            cap['mtp_V'] = self._mtp_V_cache[:cur_pos].clone()
+        # The capsule is a stable, stream-independent object: make sure the
+        # clones have completed before handing it back.
+        torch.cuda.synchronize()
+        nbytes = 0
+        for v in cap.values():
+            if torch.is_tensor(v):
+                nbytes += v.element_size() * v.numel()
+        cap['nbytes'] = nbytes
+        return cap
+
+    def restore_capsule(self, cap) -> None:
+        """Restore a committed-stream boundary from a capsule.
+
+        Copies the frozen state back into the live frontend buffers and rebuilds
+        the boundary metadata, so the next decode (or append + decode) continues
+        as if the prefix had just been prefilled -- reusing the same captured
+        graphs, no recapture. Output is bit-identical to a cold prefill of the
+        same prefix (verified token-exact in tests/test_qwen36_agent_capsule.py).
+        """
+        import torch
+
+        if cap.get('is_long', False):
+            raise NotImplementedError(
+                'long-context capsule restore is not wired yet')
+        cur_pos = int(cap['cur_pos'])
+        if not hasattr(self, '_rope_cos_table'):
+            self._build_rope_table()
+
+        ev0 = torch.cuda.Event(enable_timing=True)
+        ev1 = torch.cuda.Event(enable_timing=True)
+        with torch.no_grad():
+            ev0.record()
+            self._lin_state.copy_(cap['lin_state'])
+            self._lin_conv_state.copy_(cap['lin_conv_state'])
+            self._attn.K_cache[:, :cur_pos].copy_(cap['K_cache'])
+            self._attn.V_cache[:, :cur_pos].copy_(cap['V_cache'])
+            self._prefill_h_cache[:cur_pos].copy_(cap['prefill_h'])
+            if 'mtp_K' in cap and hasattr(self, '_mtp_K_cache'):
+                self._mtp_K_cache[:cur_pos].copy_(cap['mtp_K'])
+                self._mtp_V_cache[:cur_pos].copy_(cap['mtp_V'])
+            ev1.record()
+
+        self._agent_stream_active = True
+        self._agent_stream_is_long = False
+        self._agent_stream_prompt_len = int(cap['prompt_len'])
+        self._agent_stream_cur_pos = cur_pos
+        self._agent_stream_pending_tok = self._agent_stable_pending_tok(
+            cap['pending_tok'].view(1, 1))
+        self._agent_stream_h = cap['h'].clone()
+        self._spec_attempts = int(cap.get('spec_attempts', 0))
+        self._spec_accepts = int(cap.get('spec_accepts', 0))
+        self._spec_full = int(cap.get('spec_full', 0))
+        # Restore is the prefill-equivalent work; expose its cost through the
+        # same timing fields the committed decode reports.
+        self._agent_stream_pf0 = ev0
+        self._agent_stream_pf1 = ev1
+
     # ---------- own forward (Phase 2.3b4) ----------
     #
     # Forward path implemented method-by-method on the frontend, not on
