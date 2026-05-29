@@ -60,3 +60,23 @@ short-context committed split:
 Append-prefill and the long-context FP8-KV/TQ split remain explicit frontend
 gates.  Until those are wired, the adapter raises `NotImplementedError` instead
 of silently rebuilding and reporting a fake cache hit.
+
+## Run
+
+```bash
+python -m serving.qwen36_agent.server \
+  --checkpoint CHECKPOINT_DIR \
+  --model-name qwen36-27b \
+  --max-seq 262208 \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+The HTTP surface is OpenAI-compatible for `/v1/models` and
+`/v1/chat/completions`.  FlashRT-specific request fields are:
+
+- `flashrt_session_id`: stable session key for prefix reuse.
+- `flashrt_cache_salt`: optional namespace separator for different prompt
+  policies.
+- `flashrt_K`: speculative decode K for this request.
+- `enable_thinking`: passed to the Qwen chat template.
