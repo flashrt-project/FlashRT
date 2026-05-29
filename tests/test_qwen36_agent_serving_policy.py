@@ -246,6 +246,7 @@ class FakeFrontend:
         self.prefill_args = None
         self.append_args = None
         self.long_prefill_args = None
+        self.long_append_args = None
 
     def prefill_own_speculative_nvfp4_agent(self, input_ids, *,
                                             max_new_tokens, K):
@@ -259,6 +260,11 @@ class FakeFrontend:
     def prefill_long_ctx_nvfp4_agent(self, input_ids, *,
                                      max_new_tokens, K):
         self.long_prefill_args = (input_ids.tolist(), max_new_tokens, K)
+
+    def append_long_ctx_nvfp4_agent(self, input_ids, *,
+                                    start_pos, max_new_tokens, K):
+        self.long_append_args = (
+            input_ids.tolist(), start_pos, max_new_tokens, K)
 
     def decode_own_speculative_nvfp4_committed_stream(self, *,
                                                       max_new_tokens, K):
@@ -316,17 +322,14 @@ def test_qwen36_frontend_agent_engine_wires_long_cold_split():
     assert [c.token_ids for c in chunks] == [(ord("x"),), (ord("y"),)]
 
 
-def test_qwen36_frontend_agent_engine_rejects_long_append_until_split():
+def test_qwen36_frontend_agent_engine_wires_long_append_split():
     class LongFakeFrontend(FakeFrontend):
         _long_ctx_mode = True
 
         def _should_use_long_ctx_route(self, prompt_len, max_tokens):
             return True
 
-    engine = Qwen36FrontendAgentEngine(LongFakeFrontend())
-    try:
-        engine.prefill([1, 2, 3], cached_tokens=2, max_tokens=1, K=4)
-    except NotImplementedError as exc:
-        assert "long-context append-prefill" in str(exc)
-    else:
-        raise AssertionError("long append should be explicit")
+    fe = LongFakeFrontend()
+    engine = Qwen36FrontendAgentEngine(fe)
+    engine.prefill([1, 2, 3], cached_tokens=2, max_tokens=1, K=4)
+    assert fe.long_append_args == ([[1, 2, 3]], 2, 1, 4)

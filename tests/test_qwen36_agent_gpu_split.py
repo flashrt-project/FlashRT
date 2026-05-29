@@ -91,3 +91,43 @@ def test_qwen36_long_agent_split_matches_full_generate(monkeypatch):
     assert fe._long_ctx_mode
     _assert_split_matches_full(fe, 128)
     _assert_split_matches_full(fe, 512)
+
+
+def test_qwen36_long_agent_append_matches_full_generate(monkeypatch):
+    import torch
+
+    monkeypatch.setenv("FLASHRT_QWEN36_LONG_KV_CACHE", "fp8")
+    fe = _load_frontend(max_seq=32768)
+    prompt_len = 128
+    first_new = 4
+    next_new = 8
+    K = 3
+    base = _token_ids(fe, prompt_len)
+
+    fe.prefill_long_ctx_nvfp4_agent(base, max_new_tokens=first_new, K=K)
+    first_chunks = list(fe.decode_long_ctx_nvfp4_committed_stream(
+        max_new_tokens=first_new, K=K))
+    first_tokens = [tok for chunk in first_chunks for tok in chunk]
+    start_pos = prompt_len + len(first_tokens)
+
+    suffix = _token_ids(fe, 4)
+    prompt2 = torch.cat([
+        base,
+        torch.tensor([first_tokens], device="cuda", dtype=torch.long),
+        suffix,
+    ], dim=1)
+    assert int(prompt2.shape[1]) == start_pos + 4
+
+    full = fe.generate_own_speculative_KN_nvfp4(
+        prompt2, max_new_tokens=next_new, K=K)
+    expected = full[0, prompt2.shape[1]:prompt2.shape[1] + next_new].tolist()
+
+    fe.prefill_long_ctx_nvfp4_agent(base, max_new_tokens=first_new, K=K)
+    _ = list(fe.decode_long_ctx_nvfp4_committed_stream(
+        max_new_tokens=first_new, K=K))
+    fe.append_long_ctx_nvfp4_agent(
+        prompt2, start_pos=start_pos, max_new_tokens=next_new, K=K)
+    chunks = list(fe.decode_long_ctx_nvfp4_committed_stream(
+        max_new_tokens=next_new, K=K))
+    actual = [tok for chunk in chunks for tok in chunk]
+    assert actual == expected

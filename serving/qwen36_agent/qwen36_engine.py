@@ -93,10 +93,15 @@ class Qwen36FrontendAgentEngine:
         t0 = time.perf_counter()
         if use_long:
             if cached_tokens:
-                raise NotImplementedError(
-                    "long-context append-prefill is not wired yet")
-            self.fe.prefill_long_ctx_nvfp4_agent(
-                input_ids, max_new_tokens=int(max_tokens), K=int(K))
+                self.fe.append_long_ctx_nvfp4_agent(
+                    input_ids,
+                    start_pos=int(cached_tokens),
+                    max_new_tokens=int(max_tokens),
+                    K=int(K),
+                )
+            else:
+                self.fe.prefill_long_ctx_nvfp4_agent(
+                    input_ids, max_new_tokens=int(max_tokens), K=int(K))
             self._last_route = "long"
             self._last_prompt_tokens = prompt_len
             self._last_prefill_ms = (time.perf_counter() - t0) * 1000.0
