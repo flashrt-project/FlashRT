@@ -149,6 +149,50 @@ def test_agent_service_reuses_exact_session_prefix_when_history_is_returned():
     assert engine.prefills[-1][1:] == (6, 1, 6)
 
 
+def test_agent_service_uses_message_append_when_visible_history_hides_tokens():
+    class HiddenEngine(FakeAgentEngine):
+        def __init__(self):
+            super().__init__()
+            self.outputs = [DecodeChunk((999, ord("h")), "h", 2)]
+
+        def append_suffix_tokens_for_messages(
+                self, previous, incoming, *, tools=None,
+                enable_thinking=False):
+            del tools, enable_thinking
+            assert previous == [
+                {"role": "user", "content": "abc"},
+                {"role": "assistant", "content": "h"},
+            ]
+            assert incoming[:len(previous)] == previous
+            return [42, 43]
+
+    engine = HiddenEngine()
+    svc = AgentService(engine)
+    res0 = svc.complete(AgentRequest(
+        session_id="agent-hidden",
+        messages=[{"role": "user", "content": "abc"}],
+        max_tokens=1,
+    ))
+    assert res0.text == "h"
+
+    res1 = svc.complete(AgentRequest(
+        session_id="agent-hidden",
+        messages=[
+            {"role": "user", "content": "abc"},
+            {"role": "assistant", "content": "h"},
+            {"role": "user", "content": "next"},
+        ],
+        max_tokens=1,
+    ))
+
+    assert res1.prefix_plan.action == "message_append"
+    assert res1.stats.cached_tokens == 6
+    assert res1.stats.new_prefill_tokens == 2
+    assert engine.prefills[-1][0][:6] == [ord("a"), ord("b"), ord("c"), 0, 999, ord("h")]
+    assert engine.prefills[-1][0][6:] == [42, 43]
+    assert engine.prefills[-1][1:] == (6, 1, 6)
+
+
 def test_agent_service_rebuilds_token_journal_without_hot_state():
     engine = FakeAgentEngine()
     svc = AgentService(engine)
@@ -377,6 +421,30 @@ def test_qwen36_frontend_agent_engine_wires_short_committed_split():
     assert "".join(c.text for c in chunks) == "ab"
 
 
+def test_qwen36_frontend_agent_engine_hides_think_tags_by_default():
+    class ThinkTokenizer(FakeTokenizer):
+        def decode(self, ids, skip_special_tokens=False):
+            del ids, skip_special_tokens
+            return "<think>\n\n</think>\n\nanswer"
+
+    class ThinkFrontend(FakeFrontend):
+        def __init__(self):
+            super().__init__()
+            self._tokenizer = ThinkTokenizer()
+
+        def decode_own_speculative_nvfp4_committed_stream(self, *,
+                                                          max_new_tokens, K):
+            del max_new_tokens, K
+            yield (1,)
+
+    engine = Qwen36FrontendAgentEngine(ThinkFrontend())
+    engine.tokenize_chat([{"role": "user", "content": "go"}])
+
+    chunks = list(engine.generate_stream(max_tokens=1, K=4))
+
+    assert chunks[0].text == "answer"
+
+
 def test_qwen36_frontend_agent_engine_wires_short_append_split():
     fe = FakeFrontend()
     engine = Qwen36FrontendAgentEngine(fe)
@@ -412,3 +480,53 @@ def test_qwen36_frontend_agent_engine_wires_long_append_split():
     engine = Qwen36FrontendAgentEngine(fe)
     engine.prefill([1, 2, 3], cached_tokens=2, max_tokens=1, K=4)
     assert fe.long_append_args == ([[1, 2, 3]], 2, 1, 4)
+
+
+def test_qwen36_frontend_agent_engine_warmup_runs_committed_stream():
+    fe = FakeFrontend()
+    engine = Qwen36FrontendAgentEngine(fe)
+
+    warmed = engine.warmup_committed_stream(
+        [(4, 3)], K=4, committed_max_prompt=8)
+
+    assert len(warmed) == 1
+    assert warmed[0]["route"] == "short"
+    assert fe.prefill_args[1:] == (3, 4)
+
+
+def test_qwen36_frontend_agent_engine_warmup_uses_long_graph_hooks():
+    class LongWarmFrontend(FakeFrontend):
+        _long_ctx_mode = True
+        _user_max_seq = 4096
+
+        def __init__(self):
+            super().__init__()
+            self.decode_warm_shapes = None
+            self.prefill_warm_shapes = None
+
+        def _should_use_long_ctx_route(self, prompt_len, max_tokens):
+            return prompt_len >= 16
+
+        def warmup_long_ctx_decode_graphs(self, shapes, K=6):
+            self.decode_warm_shapes = (list(shapes), K)
+            return [(16, 4, K)]
+
+        def warmup_long_ctx_prefill_graphs(self, shapes):
+            self.prefill_warm_shapes = list(shapes)
+            return [(0, 16, "last")]
+
+    fe = LongWarmFrontend()
+    engine = Qwen36FrontendAgentEngine(fe)
+
+    warmed = engine.warmup_committed_stream(
+        [(16, 4)],
+        K=5,
+        committed_max_prompt=8,
+        long_prefill_graphs=True,
+    )
+
+    assert warmed[0]["route"] == "long_graphs"
+    assert warmed[0]["prefill_graphs"] == 1
+    assert warmed[0]["decode_graphs"] == 1
+    assert fe.prefill_warm_shapes == [(16, 4)]
+    assert fe.decode_warm_shapes == ([(16, 4)], 5)

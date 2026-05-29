@@ -74,6 +74,37 @@ class AgentService:
             )
         return effective_cached, plan
 
+    def _message_append_prompt_tokens(
+            self, session, req: AgentRequest, plan: PrefixPlan
+    ) -> tuple[Optional[List[int]], Optional[PrefixPlan]]:
+        if self.sessions.hot_session_id != session.session_id:
+            return None, None
+        previous = getattr(session, "visible_messages", None)
+        if not previous or not hasattr(
+                self.engine, "append_suffix_tokens_for_messages"):
+            return None, None
+        suffix = self.engine.append_suffix_tokens_for_messages(
+            previous,
+            req.messages,
+            tools=req.tools,
+            enable_thinking=req.enable_thinking,
+        )
+        if not suffix:
+            return None, None
+        cached = len(session.token_ids)
+        return [*session.token_ids, *suffix], PrefixPlan(
+            session_id=session.session_id,
+            cached_tokens=cached,
+            new_prefill_tokens=len(suffix),
+            incoming_tokens=plan.incoming_tokens,
+            matched_tokens=plan.matched_tokens,
+            action="message_append",
+        )
+
+    @staticmethod
+    def _copy_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [dict(m) for m in messages]
+
     def complete(self, req: AgentRequest) -> AgentResult:
         if req.max_tokens < 1:
             raise ValueError("max_tokens must be >= 1")
@@ -88,12 +119,20 @@ class AgentService:
             cache_salt=req.cache_salt,
         )
 
-        effective_cached, plan = self._effective_plan(session, plan)
+        engine_prompt_tokens = prompt_tokens
+        msg_prompt, msg_plan = self._message_append_prompt_tokens(
+            session, req, plan)
+        if msg_prompt is not None and msg_plan is not None:
+            engine_prompt_tokens = msg_prompt
+            plan = msg_plan
+            effective_cached = plan.cached_tokens
+        else:
+            effective_cached, plan = self._effective_plan(session, plan)
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         t0 = time.perf_counter()
         self.engine.prefill(
-            prompt_tokens,
+            engine_prompt_tokens,
             cached_tokens=effective_cached,
             max_tokens=req.max_tokens,
             K=req.K,
@@ -126,7 +165,13 @@ class AgentService:
                 text_parts.append(str(ev.payload))
         text = "".join(text_parts)
         finish_reason = "tool_calls" if tool_calls else "stop"
-        session.commit([*prompt_tokens, *generated_ids])
+        session.commit([*engine_prompt_tokens, *generated_ids])
+        visible_messages = self._copy_messages(req.messages)
+        visible_messages.append({
+            "role": "assistant",
+            "content": text,
+        })
+        session.visible_messages = visible_messages
         self.sessions.mark_hot(session.session_id)
 
         completion_tokens = len(generated_ids)
@@ -175,11 +220,18 @@ class AgentService:
             prompt_tokens,
             cache_salt=req.cache_salt,
         )
-        effective_cached, _ = self._effective_plan(session, plan)
+        engine_prompt_tokens = prompt_tokens
+        msg_prompt, msg_plan = self._message_append_prompt_tokens(
+            session, req, plan)
+        if msg_prompt is not None and msg_plan is not None:
+            engine_prompt_tokens = msg_prompt
+            effective_cached = msg_plan.cached_tokens
+        else:
+            effective_cached, _ = self._effective_plan(session, plan)
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         self.engine.prefill(
-            prompt_tokens,
+            engine_prompt_tokens,
             cached_tokens=effective_cached,
             max_tokens=req.max_tokens,
             K=req.K,
@@ -187,6 +239,7 @@ class AgentService:
 
         parser = ToolCallStreamParser()
         generated_ids: List[int] = []
+        visible_parts: List[str] = []
         seen_tool_call = False
         yield sse_data(role_chunk(completion_id, model))
         for chunk in self.engine.generate_stream(max_tokens=req.max_tokens, K=req.K):
@@ -194,13 +247,23 @@ class AgentService:
             for ev in parser.feed(chunk.text):
                 if ev.kind == "tool_call":
                     seen_tool_call = True
+                else:
+                    visible_parts.append(str(ev.payload))
                 yield sse_data(event_chunk(completion_id, model, ev))
         for ev in parser.finish():
             if ev.kind == "tool_call":
                 seen_tool_call = True
+            else:
+                visible_parts.append(str(ev.payload))
             yield sse_data(event_chunk(completion_id, model, ev))
 
-        session.commit([*prompt_tokens, *generated_ids])
+        session.commit([*engine_prompt_tokens, *generated_ids])
+        visible_messages = self._copy_messages(req.messages)
+        visible_messages.append({
+            "role": "assistant",
+            "content": "".join(visible_parts),
+        })
+        session.visible_messages = visible_messages
         self.sessions.mark_hot(session.session_id)
         usage = {
             "prompt_tokens": len(prompt_tokens),

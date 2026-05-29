@@ -35,6 +35,24 @@ def test_parse_and_dedupe_custom_shapes():
     assert shapes == [(4096, 64), (8192, 64)]
 
 
+def test_agent_server_warmup_preset_and_parse():
+    from serving.qwen36_agent.server import (
+        _dedupe_shapes as _agent_dedupe_shapes,
+        _parse_warmup_shapes as _agent_parse_warmup_shapes,
+        _warmup_preset_shapes as _agent_warmup_preset_shapes,
+    )
+
+    shapes = _agent_warmup_preset_shapes('agent', 32768)
+    assert (16, 128) in shapes
+    assert (512, 128) in shapes
+    assert (8192, 128) in shapes
+    assert (32768, 64) not in shapes
+
+    assert _agent_dedupe_shapes(
+        _agent_parse_warmup_shapes('16:128,32:128,16:128')) == [
+            (16, 128), (32, 128)]
+
+
 def test_long_server_warmup_modes(monkeypatch):
     monkeypatch.delenv('FLASHRT_QWEN36_SERVER_LONG_WARMUP', raising=False)
     assert _long_warmup_flags() == (True, False)

@@ -8415,6 +8415,9 @@ class Qwen36TorchFrontendRtx:
                     dtype=torch.bfloat16)
             self._long_mtp_h_tail_start = hidden_save_start
             self._long_mtp_h_tail_rows = tail_rows
+        else:
+            self._long_mtp_h_tail_start = prompt_len
+            self._long_mtp_h_tail_rows = 0
         # Long-ctx BF16 working buffers are intentionally capped at the
         # retained short spec window (2048 by default). Allow larger
         # MAX_Q_SEQ experiments to allocate, but never choose a prefill

@@ -83,14 +83,89 @@ def build_app(service: AgentService):
 def create_app_from_checkpoint(*, checkpoint: str,
                                model_name: str = "qwen36-27b",
                                device: str = "cuda",
-                               max_seq: int = 262208):
+                               max_seq: int = 262208,
+                               route_min_seq: int | None = 0,
+                               graph_cache_max: int | None = 128,
+                               warmup_shapes=None,
+                               warmup_k: int = 6,
+                               warmup_committed_max_prompt: int = 1024,
+                               warm_long_prefill_graphs: bool = False):
     engine = Qwen36FrontendAgentEngine.from_checkpoint(
         checkpoint,
         device=device,
         max_seq=max_seq,
         model_name=model_name,
+        route_min_seq=route_min_seq,
+        graph_cache_max=graph_cache_max,
     )
+    if warmup_shapes:
+        engine.warmup_committed_stream(
+            warmup_shapes,
+            K=warmup_k,
+            committed_max_prompt=warmup_committed_max_prompt,
+            long_decode_graphs=True,
+            long_prefill_graphs=warm_long_prefill_graphs,
+        )
     return build_app(AgentService(engine))
+
+
+def _parse_warmup_shapes(spec_csv: str) -> list[tuple[int, int]]:
+    shapes: list[tuple[int, int]] = []
+    if not spec_csv.strip():
+        return shapes
+    for spec in spec_csv.split(","):
+        spec = spec.strip()
+        if not spec:
+            continue
+        try:
+            prompt_len, max_tokens = spec.split(":")
+            shapes.append((int(prompt_len), int(max_tokens)))
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid warmup shape {spec!r}; expected prompt:max_tokens"
+            ) from exc
+    return shapes
+
+
+def _dedupe_shapes(shapes: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    seen = set()
+    for shape in shapes:
+        if shape not in seen:
+            out.append(shape)
+            seen.add(shape)
+    return out
+
+
+def _warmup_preset_shapes(preset: str, max_seq: int) -> list[tuple[int, int]]:
+    preset = (preset or "agent").strip().lower()
+    if preset in ("none", "off", "false", "0"):
+        return []
+    if preset not in ("agent", "short", "long", "all"):
+        raise ValueError(
+            f"invalid warmup preset {preset!r}; expected agent, short, "
+            "long, all, or none")
+
+    short = [(16, 128), (32, 128), (64, 128), (128, 128), (512, 128)]
+    long = [
+        (2048, 128),
+        (8192, 128),
+        (32768, 64),
+        (131072, 64),
+        (204800, 64),
+        (262144, 16),
+    ]
+    if preset == "short":
+        candidates = short
+    elif preset == "long":
+        candidates = long
+    elif preset == "all":
+        candidates = short + [
+            (1024, 128), (4096, 128), (16384, 128), (65536, 64)
+        ] + long
+    else:
+        candidates = short + long
+    return [(p, n) for p, n in candidates if p + n <= int(max_seq)]
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -104,16 +179,52 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--model-name", default="qwen36-27b")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-seq", type=int, default=262208)
+    parser.add_argument(
+        "--route-min-seq", type=int, default=0,
+        help=(
+            "Minimum prompt length routed to the chunked long-context path. "
+            "The agent host defaults to 0 so short real prompts avoid "
+            "per-position short-route graph capture."))
+    parser.add_argument(
+        "--graph-cache-max", type=int, default=128,
+        help="Per-cache CUDA graph LRU bound for Qwen3.6 frontend graphs.")
+    parser.add_argument(
+        "--warmup-preset", default="agent",
+        help="Startup warmup preset: agent, short, long, all, or none.")
+    parser.add_argument(
+        "--warmup", default="",
+        help='Additional comma-separated "prompt_len:max_tokens" shapes.')
+    parser.add_argument(
+        "--warmup-K", type=int, default=6,
+        help="Speculative decode K used for startup warmup.")
+    parser.add_argument(
+        "--warmup-committed-max-prompt", type=int, default=1024,
+        help=(
+            "Run real committed-stream warmup up to this prompt length; "
+            "larger long-context shapes use graph-only warmup."))
+    parser.add_argument(
+        "--warm-long-prefill-graphs", action="store_true",
+        help="Also capture long-context prefill chunk graphs at startup.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--log-level", default="info")
     args = parser.parse_args(argv)
 
+    warmup_shapes = _dedupe_shapes(
+        _warmup_preset_shapes(args.warmup_preset, args.max_seq)
+        + _parse_warmup_shapes(args.warmup)
+    )
     app = create_app_from_checkpoint(
         checkpoint=args.checkpoint,
         model_name=args.model_name,
         device=args.device,
         max_seq=args.max_seq,
+        route_min_seq=args.route_min_seq,
+        graph_cache_max=args.graph_cache_max,
+        warmup_shapes=warmup_shapes,
+        warmup_k=args.warmup_K,
+        warmup_committed_max_prompt=args.warmup_committed_max_prompt,
+        warm_long_prefill_graphs=args.warm_long_prefill_graphs,
     )
     uvicorn.run(app, host=args.host, port=args.port,
                 log_level=args.log_level)

@@ -14,6 +14,8 @@ streaming, and request scheduling. It must not add session or KV verbs to
 - Latency-first, single-stream hot session by default.
 - Exact token-prefix reuse for coding-agent turns: cold prefill once, then only
   prefill appended user/tool/diff/log tokens.
+- Startup committed-stream warmup so the first real request does not pay
+  CUDA Graph capture for common agent prompt shapes.
 - True SSE streaming at speculative-decode accept boundaries.
 - Streamed tokens are session-committed tokens only. The old stateless
   full-generate shortcut of over-verifying and trimming output is forbidden in
@@ -28,9 +30,15 @@ streaming, and request scheduling. It must not add session or KV verbs to
 The first backend is contiguous and session-first because that matches the
 current fastest Qwen3.6 CUDA-graph replay path. A request can reuse the hot
 frontend state when its tokenized prompt exactly extends the cached session
-prefix. Divergent prompts rebuild or restore at a future checkpoint boundary.
-Truncation also rebuilds in v1: the frontend cannot roll the hot GPU state back
-to a shorter prefix until checkpoint/rollback support lands.
+prefix.
+
+For OpenAI-style clients that resend full visible history, the service also
+tracks the visible message journal. If the token journal contains hidden
+Qwen-only tokens that the client does not resend, the service recognizes the
+message-list append and prefills only the serialized suffix after the previous
+assistant turn. Divergent prompts rebuild or restore at a future checkpoint
+boundary. Truncation also rebuilds in v1: the frontend cannot roll the hot GPU
+state back to a shorter prefix until checkpoint/rollback support lands.
 
 For OpenAI-style clients that resend the full message list every turn, prefix
 reuse requires the history to include the assistant content/tool call emitted by
@@ -76,9 +84,25 @@ python -m serving.qwen36_agent.server \
   --checkpoint CHECKPOINT_DIR \
   --model-name qwen36-27b \
   --max-seq 262208 \
+  --route-min-seq 0 \
+  --graph-cache-max 128 \
+  --warmup-preset agent \
   --host 127.0.0.1 \
   --port 8000
 ```
+
+The agent host defaults to `--route-min-seq 0`, which sends short real prompts
+through the chunked long-context FP8-KV path instead of the older per-position
+short route. This avoids request-time graph capture for arbitrary short prompt
+lengths. Startup warmup runs real committed-stream warmup for short/medium
+shapes and graph-only warmup for larger long-context shapes.
+
+Warmup controls:
+
+- `--warmup-preset agent|short|long|all|none`
+- `--warmup "prompt_len:max_tokens,..."`
+- `--warmup-committed-max-prompt N`
+- `--warm-long-prefill-graphs`
 
 The HTTP surface is OpenAI-compatible for `/v1/models` and
 `/v1/chat/completions`.  FlashRT-specific request fields are:
