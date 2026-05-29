@@ -132,5 +132,5 @@ class Qwen36FrontendAgentEngine:
         for token_chunk in chunks:
             ids = tuple(int(t) for t in token_chunk)
             text = self.fe._tokenizer.decode(
-                list(ids), skip_special_tokens=False)
+                list(ids), skip_special_tokens=True)
             yield DecodeChunk(token_ids=ids, text=text, accepted=len(ids))
