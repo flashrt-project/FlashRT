@@ -1,5 +1,6 @@
 from serving.qwen36_agent.openai_stream import sse_from_events
 from serving.qwen36_agent.prefix import longest_common_prefix
+from serving.qwen36_agent.qwen36_engine import Qwen36FrontendAgentEngine
 from serving.qwen36_agent.engine import DecodeChunk
 from serving.qwen36_agent.service import (
     AgentRequest,
@@ -109,8 +110,8 @@ class FakeAgentEngine:
                 out.append(0)
         return out
 
-    def prefill(self, token_ids, *, cached_tokens=0):
-        self.prefills.append((list(token_ids), cached_tokens))
+    def prefill(self, token_ids, *, cached_tokens=0, max_tokens=1, K=6):
+        self.prefills.append((list(token_ids), cached_tokens, max_tokens, K))
 
     def generate_stream(self, *, max_tokens, K):
         del K
@@ -128,7 +129,7 @@ def test_agent_service_reuses_exact_session_prefix_when_history_is_returned():
     res0 = svc.complete(req0)
     assert res0.stats.cached_tokens == 0
     assert res0.stats.new_prefill_tokens == 4
-    assert engine.prefills[-1][1] == 0
+    assert engine.prefills[-1][1:] == (0, 2, 6)
     assert res0.text == "hi"
     assert res0.finish_reason == "stop"
 
@@ -145,7 +146,23 @@ def test_agent_service_reuses_exact_session_prefix_when_history_is_returned():
     assert res1.prefix_plan.action == "append"
     assert res1.stats.cached_tokens == 6
     assert res1.stats.new_prefill_tokens == 3
-    assert engine.prefills[-1][1] == 6
+    assert engine.prefills[-1][1:] == (6, 1, 6)
+
+
+def test_agent_service_rebuilds_token_journal_without_hot_state():
+    engine = FakeAgentEngine()
+    svc = AgentService(engine)
+    rec = svc.sessions.create(session_id="cold")
+    rec.commit([ord("a"), 0])
+
+    res = svc.complete(AgentRequest(
+        session_id="cold",
+        messages=[{"role": "user", "content": "a"}],
+        max_tokens=1,
+    ))
+    assert res.prefix_plan.action == "activate_rebuild"
+    assert res.stats.cached_tokens == 0
+    assert engine.prefills[-1][1:] == (0, 1, 6)
 
 
 def test_agent_service_parses_tool_calls_from_generated_stream():
@@ -179,3 +196,75 @@ def test_openai_request_and_response_include_flashrt_cache_metrics():
     assert body["model"] == "fake-qwen36"
     assert body["flashrt"]["session_id"] == "s"
     assert body["flashrt"]["new_prefill_tokens"] == 2
+
+
+class FakeTokenizer:
+    def __init__(self):
+        self.template_kwargs = None
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.template_kwargs = kwargs
+        return "|".join((m.get("content") or "") for m in messages)
+
+    def __call__(self, prompt, add_special_tokens=False):
+        del add_special_tokens
+
+        class Encoded:
+            input_ids = [ord(ch) for ch in prompt]
+
+        return Encoded()
+
+    def decode(self, ids, skip_special_tokens=False):
+        del skip_special_tokens
+        return "".join(chr(i) for i in ids)
+
+
+class FakeFrontend:
+    device = "cpu"
+    _user_max_seq = 128
+    _long_ctx_mode = False
+
+    def __init__(self):
+        self._tokenizer = FakeTokenizer()
+        self.prefill_args = None
+
+    def prefill_own_speculative_nvfp4_agent(self, input_ids, *,
+                                            max_new_tokens, K):
+        self.prefill_args = (input_ids.tolist(), max_new_tokens, K)
+
+    def decode_own_speculative_nvfp4_committed_stream(self, *,
+                                                      max_new_tokens, K):
+        del K
+        for i in range(max_new_tokens):
+            yield (ord("a") + i,)
+
+
+def test_qwen36_frontend_agent_engine_wires_short_committed_split():
+    fe = FakeFrontend()
+    engine = Qwen36FrontendAgentEngine(fe, model_name="fake")
+
+    ids = engine.tokenize_chat(
+        [{"role": "assistant", "content": None},
+         {"role": "user", "content": "go"}],
+        enable_thinking=True,
+    )
+    assert ids == [ord("|"), ord("g"), ord("o")]
+    assert fe._tokenizer.template_kwargs["enable_thinking"] is True
+
+    engine.prefill(ids, cached_tokens=0, max_tokens=2, K=4)
+    assert fe.prefill_args == ([[ord("|"), ord("g"), ord("o")]], 2, 4)
+
+    chunks = list(engine.generate_stream(max_tokens=2, K=4))
+    assert [c.token_ids for c in chunks] == [(ord("a"),), (ord("b"),)]
+    assert "".join(c.text for c in chunks) == "ab"
+
+
+def test_qwen36_frontend_agent_engine_rejects_unwired_append():
+    engine = Qwen36FrontendAgentEngine(FakeFrontend())
+
+    try:
+        engine.prefill([1, 2, 3], cached_tokens=2, max_tokens=1, K=4)
+    except NotImplementedError as exc:
+        assert "append-prefill" in str(exc)
+    else:
+        raise AssertionError("append prefill should be explicit")

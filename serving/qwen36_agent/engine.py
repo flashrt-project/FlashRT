@@ -50,7 +50,9 @@ class AgentEngine(Protocol):
         ...
 
     def prefill(self, token_ids: Sequence[int], *,
-                cached_tokens: int = 0) -> None:
+                cached_tokens: int = 0,
+                max_tokens: int = 1,
+                K: int = 6) -> None:
         """Bring the hot frontend state to ``token_ids``.
 
         ``cached_tokens`` is an exact prefix already resident in the hot
