@@ -482,3 +482,80 @@ python exec/tests/test_adopt_pi05.py  [--fp8]    # needs a pi05 ckpt
 - `serving/robot_host/` interrupt demo, `serving/llm_agent/` OpenAI shell, Rust shell — upper layer
 - Full 64K–256K Qwen TTFT/decode re-alignment with the doc (512–32K done)
 - Merge `spec/exec-contract` back to main
+
+---
+
+## 9. Mechanism-not-policy: the red line and PR review checklist
+
+This section is the maintenance contract for the execution layer and everything built on top of it
+(`serving/`). It is the rule every contract-touching or serving PR is reviewed against. Keep it short
+on purpose — if a change needs a longer justification than this, it is probably policy.
+
+### 9.1 The red line
+
+1. **The contract fixes MECHANISM, never scenario policy.** Three primitives plus one key:
+   `Buffer` / `Graph` / `Plan` / `ShapeKey`. The **only** allowed extensions are ShapeKey semantics
+   and the *number* of buffers/graphs. Anything else that wants a field is policy.
+2. **If a scenario pushes you to add a field or verb to `exec/`, that field is policy.** Push it back
+   to `serving/` or user code. There is no session, KV, cache, schedule, batch-policy, protocol, agent,
+   or robot concept in the contract, and there must never be one.
+3. **Policy lives above the contract** (in `serving/` or the user host), and includes: sessions and
+   prefix/KV reuse, eviction/scheduling, batching policy, OpenAI/MCP protocol and tool-call parsing,
+   agent/ReAct loops, robot episode/cadence/interruption orchestration, and prompt routing.
+4. **Capture-time intelligence stays in the Python frontend.** Autotune, FP8/NVFP4/AWQ calibration,
+   multi-frame calibration, CFG-batched capture, and warmup all run before graph capture; the contract
+   only **adopts** the resulting instantiated exec and owns replay-time. The contract never captures on
+   behalf of a scenario.
+5. **`exec/` is a top-level sibling of `csrc/` with zero `csrc` dependency.** It is kernel-agnostic: it
+   only sees streams/graphs/events and replays whatever was captured (kernel, torch op, or raw CUDA).
+   It must not `#include` or link csrc kernels.
+6. **Additive-only at the integration seam.** Existing kernels, bindings, loaders, and graph-capture
+   paths are not modified; new behavior is new methods / new files / new ShapeKey variants, gated by an
+   opt-in flag, with the default path byte-identical. A shared-method edit that changes behavior on a
+   path other than the new one is the one thing to flag, justify, and back with before/after numbers.
+7. **Cut graphs only at real seams** — data/cadence boundaries, host control-flow returns, or reuse
+   points — never to fill scheduling bubbles. Each cut materializes one HBM round-trip and can erase a
+   fusion win.
+
+### 9.2 PR review checklist (contract-touching or serving example)
+
+- [ ] `git diff main -- exec/` is empty, **or** the change only adds a Buffer/Graph/Plan/Event/ShapeKey
+      mechanism (no session/KV/schedule/protocol/scenario field, verb, or struct member).
+- [ ] The serving/example layer does not import or call into the scenario's behavior from inside the
+      contract; orchestration (sessions, loops, interruption, tool calls) is in `serving/` only.
+- [ ] GPU/model state stays owned by the frontend; the serving layer holds metadata only (token
+      journal, cache plan, episode bookkeeping) — never device buffers it allocated behind the contract.
+- [ ] Capture/calibration/warmup stays in the frontend; the contract only adopts. No new capture path
+      was added to `exec/`.
+- [ ] The change is additive: new methods/files/flags, default path unchanged. If a shared method was
+      edited, the PR lists the affected non-new paths and shows output is preserved (bit-identical /
+      token-exact) and reports before/after latency.
+- [ ] Correctness gate: the new path produces output identical to the pre-existing path it replaces
+      (bit-identical for deterministic LLM decode, token-exact for spec decode, cosine ≥ 0.999 for VLA
+      diffusion), with a runnable command in the PR.
+- [ ] Optional dependencies in tests use `pytest.importorskip(...)` so they skip (not fail) when a
+      serving-only dependency (e.g. `fastapi`) is absent from a kernel-only environment.
+- [ ] Public repo hygiene: English docs/code/comments, no local paths, no machine/container/env names,
+      no generated build outputs or checkpoints committed.
+
+### 9.3 Worked example — `serving/qwen36_agent` (passes the checklist)
+
+The Qwen3.6 agent-serving host is the reference application of this red line, and is what a reviewer
+should compare a new serving example against:
+
+- **`exec/` untouched** — `git diff main -- exec/` is empty; the agent adds zero contract verbs.
+- **Pure policy layer** — `server.py` is a thin FastAPI shell; `service.py`/`session.py`/`prefix.py`
+  own session cache, exact token-prefix reuse, and request planning; `tool_stream.py` parses tool
+  calls without leaking partial JSON. All of this is policy and lives only in `serving/qwen36_agent/`.
+- **State ownership respected** — `SessionRecord` explicitly tracks only the token journal and cache
+  metadata; the GPU KV / linear-attention / MTP state stays owned by the Qwen frontend.
+- **Drives the model through the frontend, not the contract** — `qwen36_engine.py` is a thin adapter to
+  the `AgentEngine` protocol; the contract is reached (optionally) inside the frontend via
+  `FLASHRT_QWEN36_USE_EXEC`, not from the serving layer.
+- **Additive frontend split** — new `*_agent` / `*_committed_stream` methods; the one shared-method edit
+  (`_long_tq_effective_k`, a speculative-K tuning heuristic) is verify-corrected, so decode output is
+  unchanged and only speed is affected.
+- **Verified** — policy + OpenAI HTTP surface: `tests/test_qwen36_agent_serving_policy.py` and
+  `tests/test_qwen36_server_warmup.py`; real-model equivalence:
+  `tests/test_qwen36_agent_gpu_split.py` asserts the split prefill + committed-stream path is
+  **token-identical** to the old full-generate path (short, long, long-append, long-text).

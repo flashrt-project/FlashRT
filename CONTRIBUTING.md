@@ -156,6 +156,34 @@ Run this for each affected hardware family, not only for the GPU in your
 workstation. Undefined symbols often show up at Python import time even when
 the CMake build itself completed.
 
+### Execution Contract And Serving Layer
+
+The `exec/` execution contract and the `serving/` examples built on it follow a
+strict mechanism-not-policy rule. The full rule and a per-PR review checklist
+live in [`docs/exec_contract.md`](docs/exec_contract.md) §9; the essentials:
+
+- The contract is `Buffer` / `Graph` / `Plan` / `Event` / `ShapeKey`, and nothing
+  more. The only allowed extensions are ShapeKey semantics and the number of
+  buffers/graphs. Do not add a session, KV, cache, scheduler, batching-policy,
+  protocol, agent, or robot field or verb to `exec/`.
+- Scenario policy — sessions and prefix/KV reuse, eviction/scheduling,
+  OpenAI/MCP protocol, tool-call parsing, agent loops, robot
+  episode/cadence/interruption orchestration — lives in `serving/` or the user
+  host, never in the contract.
+- GPU/model state stays owned by the frontend. The serving layer holds metadata
+  only (token journal, cache plan, episode bookkeeping).
+- Capture, calibration, and warmup stay in the Python frontend; the contract
+  only **adopts** the resulting instantiated graph and owns replay-time.
+- `exec/` is a top-level sibling of `csrc/` with zero `csrc` dependency. It must
+  not include or link kernel sources.
+- Integration is additive and opt-in (e.g. `FLASHRT_QWEN36_USE_EXEC`): the
+  default path stays byte-identical. A new code path must produce output
+  identical to the path it replaces — bit-identical for deterministic decode,
+  token-exact for speculative decode, cosine ≥ 0.999 for VLA diffusion.
+
+`serving/qwen36_agent` is the reference example that satisfies every item above;
+use it as the comparison point when adding a new serving host.
+
 ### Calibration And Precision
 
 FP8/NVFP4 changes must preserve the calibration cache contract described in
@@ -271,6 +299,13 @@ Before requesting review:
   feature paths unless the PR explicitly validates those devices.
 - `hasattr(fvk, "...")` is allowed only for optional fast paths with a correct
   fallback. Do not use it as hardware routing for required model behavior.
+- For `exec/` contract or `serving/` example changes, run the
+  [`docs/exec_contract.md`](docs/exec_contract.md) §9.2 checklist: confirm
+  `git diff main -- exec/` adds no scenario field, that policy stays in
+  `serving/`, that the change is additive/opt-in, and that the new path's output
+  matches the path it replaces. Tests that need a serving-only dependency such as
+  `fastapi` must `pytest.importorskip(...)` so kernel-only environments skip
+  rather than fail.
 - Include validation commands and results in the PR description.
 - Mention unsupported hardware or missing local fixtures explicitly.
 - Avoid committing generated build outputs, local checkpoints, logs, or
