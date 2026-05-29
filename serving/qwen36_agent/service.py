@@ -63,7 +63,7 @@ class AgentService:
         # state.  Non-hot append/exact matches keep their token journal but must
         # rebuild until a checkpoint/offload backend lands.
         effective_cached = plan.cached_tokens
-        if self.sessions.hot_session_id not in (None, session.session_id):
+        if plan.cached_tokens and self.sessions.hot_session_id != session.session_id:
             effective_cached = 0
             plan = PrefixPlan(
                 session_id=session.session_id,
@@ -76,7 +76,12 @@ class AgentService:
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         t0 = time.perf_counter()
-        self.engine.prefill(prompt_tokens, cached_tokens=effective_cached)
+        self.engine.prefill(
+            prompt_tokens,
+            cached_tokens=effective_cached,
+            max_tokens=req.max_tokens,
+            K=req.K,
+        )
         t_prefill = time.perf_counter()
 
         parser = ToolCallStreamParser()

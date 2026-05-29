@@ -52,6 +52,8 @@ def build_app(service: AgentService):
             result = service.complete(req)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+        except NotImplementedError as exc:
+            raise HTTPException(501, str(exc)) from exc
 
         if req.stream:
             return StreamingResponse(

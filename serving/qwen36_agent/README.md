@@ -47,3 +47,16 @@ interactive long session on a consumer GPU.
 3. Add the FastAPI host that maps OpenAI requests to session-aware generation.
 4. Add checkpoint/rollback and eviction policy.
 5. Benchmark: cold 128K/200K/256K plus incremental 2K/8K/16K turns.
+
+## Current backend gate
+
+`Qwen36FrontendAgentEngine` is wired to the real Qwen3.6 frontend for the
+short-context committed split:
+
+- cold short prefill: `prefill_own_speculative_nvfp4_agent`
+- committed streaming decode:
+  `decode_own_speculative_nvfp4_committed_stream`
+
+Append-prefill and the long-context FP8-KV/TQ split remain explicit frontend
+gates.  Until those are wired, the adapter raises `NotImplementedError` instead
+of silently rebuilding and reporting a fake cache hit.
