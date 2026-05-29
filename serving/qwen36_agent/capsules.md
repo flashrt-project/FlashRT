@@ -93,7 +93,7 @@ alignment.
 
 ## Measured benefit (short route)
 
-Real coding-agent workload on RTX 5090 (`pi0-stablehlo-test`): one shared prefix
+Real coding-agent workload on RTX 5090 (in-container): one shared prefix
 (coding-assistant system prompt + project context, **185 shared tokens**) reused
 across three tasks, served two ways — `cold` (re-prefill prefix+suffix every
 turn) vs `capsule` (restore prefix + append suffix). `max_new=64`, `K=3`, median
