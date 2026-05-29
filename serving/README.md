@@ -6,6 +6,12 @@ concrete scenario. This is the **scenario / policy** layer — sessions,
 schedulers, protocols, sensor loops, episode/rollout control, interrupt policy
 live here, deliberately *out of* the contract.
 
+The signature serving idea — **graph-replay-native execution-state capsules**
+(snapshot / restore / fork / time-travel), and why it differs from vLLM/SGLang
+prefix caching — is documented in
+[`docs/serving_design.md`](../docs/serving_design.md). It is the unifying design
+behind the hosts below.
+
 ## Layering
 
 ```
