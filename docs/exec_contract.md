@@ -33,7 +33,7 @@ ShapeKey opaque u64 encoding (B, S, ...). Batch is just a FIELD of the key, not 
 Plus mechanism helpers: prioritized + wrappable streams (incl. the default stream), cross-stream
 events, and device-to-device `buffer_copy`. Lives in a top-level `exec/` layer, **sibling to `csrc/`
 with zero dependency on it** (§5). Capture/autotune/calibration/sessions/schedulers/protocols are
-**out of scope** — the upper layer (frontend / examples) owns them; the contract only *adapts* (§8.5).
+**out of scope** — the upper layer (frontend / serving) owns them; the contract only *adapts* (§8.5).
 
 ### Simple example (C ABI; the torch/ctypes frontend keeps capturing as today)
 ```c
@@ -60,7 +60,7 @@ and a real **VLA** (Pi0.5 FP16 + FP8 — cosine 1.0); every primitive validated.
 
 ---
 
-## Layering & host examples
+## Layering & serving hosts
 
 ### Setup (cold, once) vs hot path (replay) — and where each language sits
 Everything model-specific and iterative is **setup** (cold, runs once): weight load, **autotune**,
@@ -96,10 +96,10 @@ A captured CUDA graph is **not serializable across processes** (baked pointers a
 capture must run in the **same process** that replays — which is why "Python setup once + native hot
 loop in one process" is the pragmatic embedded path (Python out of the hot loop without porting capture).
 
-### Two reference hosts (live in `examples/` — scenario/policy, not the contract)
+### Two reference hosts (live in `serving/` — scenario/policy, not the contract)
 Same `libflashrt_exec`; the host language is chosen per scenario.
 ```
-  examples/robot_host/  (C++)  — real-time VLA            examples/llm_agent/  (Rust) — LLM server
+  serving/robot_host/  (C++)  — real-time VLA            serving/llm_agent/  (Rust) — LLM server
   ───────────────────────────────────────────            ─────────────────────────────────────────
   C++ host loop:                                          Rust host (axum/SSE + session registry):
     vision ─enc_x─▶ action   (Plan, 1 DAG)                  per token: write tok -> Buffer
@@ -134,7 +134,7 @@ new abstraction.**
   scheduling, interruption, gap-fill)
 - **Imperative driving**: the host may fire any graph/Plan on demand
 
-### IS NOT (policy — lives in examples and user hosts)
+### IS NOT (policy — lives in serving / user hosts)
 - ❌ session registry, prefix/radix cache, KV append/fork/evict semantics
 - ❌ scheduler: priority decisions, deadlines, preemption policy
 - ❌ protocols: OpenAI `/v1/chat`, SSE, MCP, agent protocols
@@ -309,8 +309,8 @@ exec/                              # NEW top-level: execution-contract layer (or
   CMakeLists.txt                   #   builds libflashrt_exec (.so) as an independent target
 
 flash_rt/runtime/exec.py           # thin Python wrapper (sibling to rtc.py), dev only
-examples/robot_host/               # scenario: multi-model + interrupt (VLA + ASR), policy-layer demo
-examples/llm_agent/                # scenario: session/KV/OpenAI shell (folds in existing *_openai_server.py)
+serving/robot_host/               # scenario: multi-model + interrupt (VLA + ASR), policy-layer demo
+serving/llm_agent/                # scenario: session/KV/OpenAI shell (folds in existing *_openai_server.py)
 docs/exec_contract.md              # this document
 
 csrc/                              # unchanged: pure compute kernels (attention/gemm/conv/...), own cross-hw backends
@@ -358,7 +358,7 @@ Conclusion: **the 3-atom core holds, with no scenario field forced out**; valida
 - **"Plan vs one big graph" is the author's choice**: Pi05 can either chain vision + enc-dec via a
   `Plan`, or capture them as one graph like the CFG outer graph. The contract supports both — which
   validates the flexibility.
-- Today Pi05 is single-stream; multi-stream/multi-rate is forward-looking for `examples/robot_host/`,
+- Today Pi05 is single-stream; multi-stream/multi-rate is forward-looking for `serving/robot_host/`,
   and the mechanism is already in place.
 
 ### Verdict
@@ -379,12 +379,12 @@ Conclusion: **the 3-atom core holds, with no scenario field forced out**; valida
    route the **existing Qwen frontend's replay hot path** through it (capture stays in Python).
    Acceptance: E2E tok/s and cos **do not regress** (the floor); multi-session B≤8 runs through the
    same `select(key)`.
-3. **One multi-node + interrupt example (1-2 weeks)**: `examples/robot_host/` chains Pi05
+3. **One multi-node + interrupt example (1-2 weeks)**: `serving/robot_host/` chains Pi05
    vision→llm→action across streams via a Plan, and demonstrates concurrent ASR + subgoal-buffer
    overwrite interruption. Acceptance: Pi05 latency does not regress; **no scenario field was added to
    the common layer throughout** (if one was, go back to step 1).
 
-The Rust shell, OpenAI, and scheduler all live in examples / the upper layer, off this main line.
+The Rust shell, OpenAI, and scheduler all live in serving / the upper layer, off this main line.
 
 ---
 
@@ -479,6 +479,6 @@ python exec/tests/test_adopt_pi05.py  [--fp8]    # needs a pi05 ckpt
 ### 8.7 Known remaining (not blocking v1 acceptance)
 - Long-context Qwen3.6 spec paths (≥512-token FP8-KV / TQ routes) not yet routed through exec
   (short BF16/spec path is)
-- `examples/robot_host/` interrupt demo, `examples/llm_agent/` OpenAI shell, Rust shell — upper layer
+- `serving/robot_host/` interrupt demo, `serving/llm_agent/` OpenAI shell, Rust shell — upper layer
 - Full 64K–256K Qwen TTFT/decode re-alignment with the doc (512–32K done)
 - Merge `spec/exec-contract` back to main

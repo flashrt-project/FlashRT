@@ -1,4 +1,4 @@
-# examples/robot_host — C++ real-time VLA host (skeleton)
+# serving/robot_host — C++ real-time VLA host (skeleton)
 
 Illustrative **deployment hot-path host** for a VLA (Pi0.5-style) built directly
 on the FlashRT execution contract (`libflashrt_exec`, pure C ABI). It is the
@@ -9,7 +9,7 @@ Real-time robotics: tight loop, low jitter, interrupts, ROS2-adjacent drivers.
 The host, the exec layer, and the CUDA kernels are then **one toolchain, no FFI
 seam** — the easiest cross-layer debug, and the natural language for on-robot
 real-time code. (For a networked LLM server, prefer Rust — see
-`examples/llm_agent/`.)
+`serving/llm_agent/`.)
 
 ## What it demonstrates (`realtime_host.cpp`)
 - Drive adopted graphs from a native loop: `frt_graph_replay` / `frt_plan_execute`.

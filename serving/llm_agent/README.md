@@ -1,4 +1,4 @@
-# examples/llm_agent — Rust LLM session host (skeleton)
+# serving/llm_agent — Rust LLM session host (skeleton)
 
 Illustrative **deployment hot-path host** for an LLM (Qwen3.6-style) built on the
 FlashRT execution contract (`libflashrt_exec`, pure C ABI), driven from Rust.
@@ -9,7 +9,7 @@ A networked agent/LLM server is a **control plane**: many clients, async
 HTTP/SSE, session registry, graceful errors. Rust's async + safety shine in that
 shell, and the per-token hot path crosses the FFI seam only **once per token**
 (a single `frt_graph_replay`), so the boundary is thin. (For an on-robot
-real-time VLA loop, prefer C++ — see `examples/robot_host/`.)
+real-time VLA loop, prefer C++ — see `serving/robot_host/`.)
 
 ## What it demonstrates (`src/main.rs`)
 - A minimal FFI binding to the C-ABI subset (`frt_ctx_*`, `frt_graph_*`).

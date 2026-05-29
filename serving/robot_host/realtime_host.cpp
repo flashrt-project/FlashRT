@@ -1,4 +1,4 @@
-/* examples/robot_host/realtime_host.cpp — illustrative C++ real-time VLA host.
+/* serving/robot_host/realtime_host.cpp — illustrative C++ real-time VLA host.
  *
  * DEPLOYMENT hot path on the FlashRT execution contract: a native loop driving
  * adopted graphs across streams, with voice-interrupt + subgoal swap. This is
