@@ -50,7 +50,8 @@ def main():
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--num-views", type=int, default=3)
     ap.add_argument("--steps", type=int, default=10)
-    ap.add_argument("--iters", type=int, default=30)
+    ap.add_argument("--iters", type=int, default=100)
+    ap.add_argument("--warmup", type=int, default=30)
     ap.add_argument("--fp8", action="store_true")
     args = ap.parse_args()
 
@@ -71,10 +72,13 @@ def main():
     deterministic = np.array_equal(out_a, out_b)
     h = hashlib.sha256(out_a.tobytes()).hexdigest()[:16]
 
-    # warm + timed
-    for _ in range(10):
+    # warm + timed (wall = predict() incl. Python pre/post; internal = pure
+    # pipeline replay from model._pipe.latency_records).
+    for _ in range(args.warmup):
         model.predict(images)
     torch.cuda.synchronize()
+    if hasattr(pipe, "latency_records"):
+        pipe.latency_records.clear()
     wall = []
     for _ in range(args.iters):
         t0 = time.perf_counter()
@@ -83,10 +87,14 @@ def main():
         wall.append((time.perf_counter() - t0) * 1000.0)
     wall.sort()
     p50 = wall[len(wall) // 2]
+    internal = sorted(float(x) for x in getattr(pipe, "latency_records", []) or [0.0])
+    ip50 = internal[len(internal) // 2]
 
     print(f"RESULT USE_EXEC={USE_EXEC} actions_shape={out_a.shape} "
           f"deterministic={deterministic} action_sha={h} "
-          f"p50_ms={p50:.3f} min_ms={wall[0]:.3f} finite={np.isfinite(out_a).all()}")
+          f"wall_p50_ms={p50:.3f} wall_min_ms={wall[0]:.3f} "
+          f"internal_p50_ms={ip50:.3f} internal_min_ms={internal[0]:.3f} "
+          f"finite={np.isfinite(out_a).all()}")
 
 
 if __name__ == "__main__":

@@ -8,6 +8,58 @@
 
 ---
 
+## TL;DR — mechanism · structure · example
+
+### Mechanism
+FlashRT runs a model by capturing its kernel sequence into a **CUDA Graph once** (setup), then
+**replaying that graph forever** (hot path). This contract is a thin C ABI that takes over only the
+*replay side*. A model frontend captures its graph however it likes — torch (`torch.cuda.graph`) or
+the framework's ctypes `CUDAGraph` — and **adopts** the instantiated graph-exec into the contract;
+the contract then owns replay, shape-variant selection, zero-copy buffer hand-off, streams, events,
+and a Plan DAG. It adds **zero replay overhead** (the very same `cudaGraphLaunch`) and the default
+path is **byte-identical**. All capture-time work — autotune, calibration, warmup — stays in the
+frontend and is fully under the caller's explicit control; the contract never sees it.
+
+### Structure — 3 objects + 1 key (mechanism only)
+```
+Buffer   named device memory; the ONLY "state" (KV cache, scales, noise, subgoal embedding...).
+         Graphs are wired together by SHARING one Buffer (zero-copy hand-off).
+Graph    a ShapeKey -> graph-exec variant table (exact key + LRU). capture (own) or adopt
+         (external exec); replay(key, stream); bind named I/O ports.
+Plan     a dumb DAG of (Graph, ShapeKey) replays across streams with explicit cross-stream deps.
+         Data dependencies only — no priority/deadline/preemption (that's upper-layer policy).
+ShapeKey opaque u64 encoding (B, S, ...). Batch is just a FIELD of the key, not a new axis.
+```
+Plus mechanism helpers: prioritized + wrappable streams (incl. the default stream), cross-stream
+events, and device-to-device `buffer_copy`. Lives in a top-level `exec/` layer, **sibling to `csrc/`
+with zero dependency on it** (§5). Capture/autotune/calibration/sessions/schedulers/protocols are
+**out of scope** — the upper layer (frontend / examples) owns them; the contract only *adapts* (§8.5).
+
+### Simple example (C ABI; the torch/ctypes frontend keeps capturing as today)
+```c
+frt_ctx c = frt_ctx_create();
+
+/* (1) LLM/VLA: drive a graph the frontend already captured, bit-identical */
+frt_graph g = frt_graph_create(c, "decode", /*max_variants=*/256);  /* exact-key LRU table */
+frt_graph_adopt(g, /*key=*/cur_pos, external_exec);  /* e.g. torch raw_cuda_graph_exec() */
+int s = frt_ctx_wrap_stream(c, host_stream);          /* reuse the frontend's own stream */
+frt_graph_replay(g, /*key=*/cur_pos, s);              /* == cudaGraphLaunch, zero overhead */
+
+/* (2) Multi-subgraph (VLA): vision -> encoder -> action, zero-copy + cross-stream */
+frt_buffer x = frt_buffer_alloc(c, "enc_x", nbytes);
+frt_graph_bind(vision, "out", x);  frt_graph_bind(encoder, "in", x);  /* same buffer => no copy */
+frt_plan p = frt_plan_create(c);
+int a = frt_plan_add(p, vision,  0, s0);
+int b = frt_plan_add(p, encoder, 0, s1);
+frt_plan_after(p, b, a);              /* encoder (s1) waits vision (s0) via an event */
+frt_plan_execute(p, 0);
+```
+
+**Proven (v1):** drives a real **LLM** (Qwen3.6 decode+spec — bit-identical, 133 tok/s, no regression)
+and a real **VLA** (Pi0.5 FP16 + FP8 — cosine 1.0); every primitive validated. Acceptance: §8.
+
+---
+
 ## 0. Positioning: what this layer is / is not
 
 What FlashRT already does (see `flash_rt/core/cuda_graph.py`, `flash_rt/frontends/`):
@@ -335,6 +387,12 @@ Test: `exec/tests/test_exec.py` (5/5) + `exec/tests/test_plan_vla.py` (VLA-shape
 - [x] Pi0.5 FP8 p50: 24.55 ms off vs on — unchanged
 - Rationale: frt replay is the same `cudaGraphLaunch` as the baseline; zero added replay overhead by
   design.
+- Measurement notes: `wall ≈ internal` (the predict() Python pre/post is ~0.1 ms — negligible).
+  Absolute latency is **warmup/clock sensitive**: the RTX 5090 SM clock ramps toward its 3105 MHz peak
+  over a run, so a short warmup reads ~1–2 ms high (e.g. Pi0.5 FP16 internal_p50 34.0 ms at warmup=30
+  vs 33.1 ms / min 32.2 ms at warmup=200). Warmup, calibration, and clock pinning stay under the
+  caller's explicit control (the contract does not touch capture/warmup); the **flag on-vs-off A/B is
+  parity at any warmup level** — that is the acceptance signal, not the absolute number.
 
 ### 8.4 Opt-in integration (default path byte-identical, additive-only)
 - [x] Qwen3.6: `FLASHRT_QWEN36_USE_EXEC=1` (decode + spec + rollback)
