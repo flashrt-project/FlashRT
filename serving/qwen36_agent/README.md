@@ -54,12 +54,13 @@ interactive long session on a consumer GPU.
 short-context committed split:
 
 - cold short prefill: `prefill_own_speculative_nvfp4_agent`
+- hot contiguous short append: `append_own_speculative_nvfp4_agent`
 - committed streaming decode:
   `decode_own_speculative_nvfp4_committed_stream`
 
-Append-prefill and the long-context FP8-KV/TQ split remain explicit frontend
-gates.  Until those are wired, the adapter raises `NotImplementedError` instead
-of silently rebuilding and reporting a fake cache hit.
+The long-context FP8-KV/TQ split remains an explicit frontend gate.  Until it is
+wired, the adapter raises `NotImplementedError` instead of silently rebuilding
+and reporting a fake cache hit.
 
 ## Run
 

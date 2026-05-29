@@ -77,10 +77,6 @@ class Qwen36FrontendAgentEngine:
                 f"exceeds max_seq {self.max_seq}")
         if cached_tokens == len(token_ids):
             return
-        if cached_tokens:
-            raise NotImplementedError(
-                "append-prefill is not wired yet for the Qwen3.6 agent "
-                "adapter; rebuild or wait for the long/append split gate")
 
         input_ids = torch.tensor(
             [list(int(t) for t in token_ids)],
@@ -99,8 +95,16 @@ class Qwen36FrontendAgentEngine:
                 "currently exposes the short committed stream only")
 
         t0 = time.perf_counter()
-        self.fe.prefill_own_speculative_nvfp4_agent(
-            input_ids, max_new_tokens=int(max_tokens), K=int(K))
+        if cached_tokens:
+            self.fe.append_own_speculative_nvfp4_agent(
+                input_ids,
+                start_pos=int(cached_tokens),
+                max_new_tokens=int(max_tokens),
+                K=int(K),
+            )
+        else:
+            self.fe.prefill_own_speculative_nvfp4_agent(
+                input_ids, max_new_tokens=int(max_tokens), K=int(K))
         self._last_prompt_tokens = prompt_len
         self._last_prefill_ms = (time.perf_counter() - t0) * 1000.0
 

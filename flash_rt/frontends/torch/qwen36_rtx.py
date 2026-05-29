@@ -4549,6 +4549,71 @@ class Qwen36TorchFrontendRtx:
         self._agent_stream_pf0 = ev_pf0
         self._agent_stream_pf1 = ev_pf1
 
+    def append_own_speculative_nvfp4_agent(
+            self, input_ids, *, start_pos: int,
+            max_new_tokens: int, K: int = 6):
+        """Append short-context prompt tokens to the hot committed boundary."""
+        import torch
+
+        if not getattr(self, '_agent_stream_active', False):
+            raise RuntimeError(
+                'prefill_own_speculative_nvfp4_agent must run before append')
+        prompt_len = int(input_ids.shape[1])
+        start_pos = int(start_pos)
+        if start_pos != int(self._agent_stream_cur_pos):
+            raise NotImplementedError(
+                'short append requires a hot contiguous boundary')
+        if start_pos < 1 or prompt_len <= start_pos:
+            raise ValueError('append requires at least one suffix token')
+        if getattr(self, '_long_ctx_mode', False) and self._should_use_long_ctx_route(
+                prompt_len, max_new_tokens):
+            raise NotImplementedError(
+                'long-context append split is not wired yet')
+
+        hidden = self._cfg['hidden_size']
+        max_spec_k = min(self.MAX_Q_SEQ - 1, self._MAX_PUBLIC_SPEC_K)
+        if K < 1 or K > max_spec_k:
+            raise ValueError(
+                f'K={K} out of range — need 1<=K<={max_spec_k}')
+        if not hasattr(self, '_rope_cos_table'):
+            self._build_rope_table()
+
+        with torch.no_grad():
+            ev_pf0 = torch.cuda.Event(enable_timing=True)
+            ev_pf1 = torch.cuda.Event(enable_timing=True)
+            ev_pf0.record()
+            for p in range(start_pos, prompt_len):
+                self._static_token_id.copy_(input_ids[:, p:p + 1])
+                g_pf = self._ensure_graph_for_pos_nvfp4(p)
+                self._replay_pos_graph(g_pf, p)
+                self._prefill_h_cache[p:p + 1].copy_(
+                    self._last_hidden_buf.view(1, hidden))
+
+            pending_tok = self._logits_buf.argmax(
+                dim=-1, keepdim=True).view(1, 1)
+            h = self._prefill_h_cache[
+                prompt_len - 1:prompt_len].view(1, 1, hidden).contiguous()
+
+            # Rebuild the MTP cache from the committed hidden journal.  This is
+            # intentionally conservative for the first append gate: it avoids
+            # depending on speculative-lookahead cache residue and gives a
+            # clean equivalence target before tail-only MTP rebuild is tuned.
+            self.reset_mtp_state()
+            for p in range(1, prompt_len):
+                prev_h_p = self._prefill_h_cache[
+                    p - 1:p].view(1, 1, hidden).contiguous()
+                prev_tok_p = input_ids[:, p:p + 1]
+                self.forward_mtp_head_nvfp4(prev_h_p, prev_tok_p, p)
+            self.forward_mtp_head_nvfp4(h, pending_tok, prompt_len)
+            ev_pf1.record()
+
+        self._agent_stream_prompt_len = prompt_len
+        self._agent_stream_cur_pos = prompt_len
+        self._agent_stream_pending_tok = pending_tok
+        self._agent_stream_h = h
+        self._agent_stream_pf0 = ev_pf0
+        self._agent_stream_pf1 = ev_pf1
+
     def decode_own_speculative_nvfp4_committed_stream(
             self, *, max_new_tokens: int, K: int = 6):
         """Decode from the current committed-stream boundary.
@@ -4570,6 +4635,7 @@ class Qwen36TorchFrontendRtx:
                 f'K={K} out of range — need 1<=K<={max_spec_k}')
 
         s = torch.cuda.current_stream().cuda_stream
+        hidden = self._cfg['hidden_size']
         cur_pos = int(self._agent_stream_cur_pos)
         pending_tok = self._agent_stream_pending_tok
         h = self._agent_stream_h
@@ -4588,6 +4654,7 @@ class Qwen36TorchFrontendRtx:
                 # pending token through the main model, yield it, and keep the
                 # next logits as private lookahead for a possible later call.
                 if draft_k == 0:
+                    commit_start = cur_pos
                     d = self._rope_dim
                     cos_1 = self._rope_cos_table[
                         cur_pos:cur_pos + 1].view(1, 1, d)
@@ -4608,6 +4675,8 @@ class Qwen36TorchFrontendRtx:
                     h = self._K_last_hidden_buf[:, 0:1, :].contiguous()
                     cur_pos += 1
                     emitted += 1
+                    self._prefill_h_cache[commit_start:commit_start + 1].copy_(
+                        h.view(1, hidden))
                     self._agent_stream_cur_pos = cur_pos
                     self._agent_stream_pending_tok = pending_tok
                     self._agent_stream_h = h
@@ -4616,6 +4685,7 @@ class Qwen36TorchFrontendRtx:
 
                 # Snapshot main state before verify.  MTP state is independent
                 # and restored by its graph-capture helper.
+                commit_start = cur_pos
                 snap_stream = self._snap_stream
                 snap_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(snap_stream):
@@ -4720,6 +4790,11 @@ class Qwen36TorchFrontendRtx:
                     raise RuntimeError(
                         'internal error: committed chunk exceeds remaining '
                         'budget')
+                commit_count = len(committed)
+                self._prefill_h_cache[
+                    commit_start:commit_start + commit_count].copy_(
+                        self._K_last_hidden_buf[
+                            :, :commit_count, :].view(commit_count, hidden))
                 emitted += len(committed)
                 self._agent_stream_cur_pos = cur_pos
                 self._agent_stream_pending_tok = pending_tok

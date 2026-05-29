@@ -244,10 +244,16 @@ class FakeFrontend:
     def __init__(self):
         self._tokenizer = FakeTokenizer()
         self.prefill_args = None
+        self.append_args = None
 
     def prefill_own_speculative_nvfp4_agent(self, input_ids, *,
                                             max_new_tokens, K):
         self.prefill_args = (input_ids.tolist(), max_new_tokens, K)
+
+    def append_own_speculative_nvfp4_agent(self, input_ids, *,
+                                           start_pos, max_new_tokens, K):
+        self.append_args = (
+            input_ids.tolist(), start_pos, max_new_tokens, K)
 
     def decode_own_speculative_nvfp4_committed_stream(self, *,
                                                       max_new_tokens, K):
@@ -276,12 +282,9 @@ def test_qwen36_frontend_agent_engine_wires_short_committed_split():
     assert "".join(c.text for c in chunks) == "ab"
 
 
-def test_qwen36_frontend_agent_engine_rejects_unwired_append():
-    engine = Qwen36FrontendAgentEngine(FakeFrontend())
+def test_qwen36_frontend_agent_engine_wires_short_append_split():
+    fe = FakeFrontend()
+    engine = Qwen36FrontendAgentEngine(fe)
 
-    try:
-        engine.prefill([1, 2, 3], cached_tokens=2, max_tokens=1, K=4)
-    except NotImplementedError as exc:
-        assert "append-prefill" in str(exc)
-    else:
-        raise AssertionError("append prefill should be explicit")
+    engine.prefill([1, 2, 3], cached_tokens=2, max_tokens=1, K=4)
+    assert fe.append_args == ([[1, 2, 3]], 2, 1, 4)
