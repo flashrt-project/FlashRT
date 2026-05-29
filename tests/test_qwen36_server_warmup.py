@@ -108,6 +108,10 @@ def test_qwen36_frontend_exposes_committed_stream_split():
                    'append_own_speculative_nvfp4_agent')
     assert hasattr(Qwen36TorchFrontendRtx,
                    'decode_own_speculative_nvfp4_committed_stream')
+    assert hasattr(Qwen36TorchFrontendRtx,
+                   'prefill_long_ctx_nvfp4_agent')
+    assert hasattr(Qwen36TorchFrontendRtx,
+                   'decode_long_ctx_nvfp4_committed_stream')
 
 
 def test_long_mtp_tail_auto_policy(monkeypatch):

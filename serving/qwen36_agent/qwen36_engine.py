@@ -25,6 +25,7 @@ class Qwen36FrontendAgentEngine:
         self.max_seq = int(getattr(frontend, "_user_max_seq", 0) or 0)
         self._last_prompt_tokens = 0
         self._last_prefill_ms = 0.0
+        self._last_route = "unknown"
 
     @classmethod
     def from_checkpoint(
@@ -89,12 +90,18 @@ class Qwen36FrontendAgentEngine:
             and hasattr(self.fe, "_should_use_long_ctx_route")
             and self.fe._should_use_long_ctx_route(prompt_len, int(max_tokens))
         )
-        if use_long:
-            raise NotImplementedError(
-                "long-context committed split is not wired yet; this adapter "
-                "currently exposes the short committed stream only")
-
         t0 = time.perf_counter()
+        if use_long:
+            if cached_tokens:
+                raise NotImplementedError(
+                    "long-context append-prefill is not wired yet")
+            self.fe.prefill_long_ctx_nvfp4_agent(
+                input_ids, max_new_tokens=int(max_tokens), K=int(K))
+            self._last_route = "long"
+            self._last_prompt_tokens = prompt_len
+            self._last_prefill_ms = (time.perf_counter() - t0) * 1000.0
+            return
+
         if cached_tokens:
             self.fe.append_own_speculative_nvfp4_agent(
                 input_ids,
@@ -105,13 +112,19 @@ class Qwen36FrontendAgentEngine:
         else:
             self.fe.prefill_own_speculative_nvfp4_agent(
                 input_ids, max_new_tokens=int(max_tokens), K=int(K))
+        self._last_route = "short"
         self._last_prompt_tokens = prompt_len
         self._last_prefill_ms = (time.perf_counter() - t0) * 1000.0
 
     def generate_stream(self, *, max_tokens: int,
                         K: int) -> Iterable[DecodeChunk]:
-        for token_chunk in self.fe.decode_own_speculative_nvfp4_committed_stream(
-                max_new_tokens=int(max_tokens), K=int(K)):
+        if self._last_route == "long":
+            chunks = self.fe.decode_long_ctx_nvfp4_committed_stream(
+                max_new_tokens=int(max_tokens), K=int(K))
+        else:
+            chunks = self.fe.decode_own_speculative_nvfp4_committed_stream(
+                max_new_tokens=int(max_tokens), K=int(K))
+        for token_chunk in chunks:
             ids = tuple(int(t) for t in token_chunk)
             text = self.fe._tokenizer.decode(
                 list(ids), skip_special_tokens=False)

@@ -4542,6 +4542,7 @@ class Qwen36TorchFrontendRtx:
         self._spec_accepts = 0
         self._spec_full = 0
         self._agent_stream_active = True
+        self._agent_stream_is_long = False
         self._agent_stream_prompt_len = prompt_len
         self._agent_stream_cur_pos = cur_pos
         self._agent_stream_pending_tok = pending_tok
@@ -4608,6 +4609,7 @@ class Qwen36TorchFrontendRtx:
             ev_pf1.record()
 
         self._agent_stream_prompt_len = prompt_len
+        self._agent_stream_is_long = False
         self._agent_stream_cur_pos = prompt_len
         self._agent_stream_pending_tok = pending_tok
         self._agent_stream_h = h
@@ -8503,6 +8505,413 @@ class Qwen36TorchFrontendRtx:
                 self._cfg['vocab_size'] * 2, s,
             )
         return last_h.view(1, 1, hidden), last_logits
+
+    def prefill_long_ctx_nvfp4_agent(
+            self, input_ids, *, max_new_tokens: int, K: int = 6):
+        """Build a committed-stream boundary for the long FP8-KV/TQ route."""
+        import torch
+
+        from flash_rt import flash_rt_kernels as fvk
+
+        prompt_len = int(input_ids.shape[1])
+        if prompt_len <= 0:
+            raise ValueError('input_ids must contain at least one token')
+        if not self._should_use_long_ctx_route(prompt_len, max_new_tokens):
+            raise ValueError('prompt does not select the long-context route')
+        if os.environ.get('FLASHRT_QWEN36_TQ_STRICT_NEXT', '0') == '1':
+            raise NotImplementedError(
+                'agent committed long stream does not cover strict-next yet')
+
+        tq_spec_k = os.environ.get('FLASHRT_QWEN36_TQ_SPEC_K', '')
+        if tq_spec_k:
+            K = int(tq_spec_k)
+        else:
+            K = self._long_tq_effective_k(prompt_len, K)
+        max_spec_k = min(self.MAX_Q_SEQ - 1, self._MAX_PUBLIC_SPEC_K)
+        if K < 1 or K > max_spec_k:
+            raise ValueError(
+                f'K={K} out of range — need 1<=K<={max_spec_k}')
+        max_pos = prompt_len + int(max_new_tokens)
+        if max_pos > self._user_max_seq:
+            raise ValueError(
+                f'prompt_len ({prompt_len}) + max_new_tokens '
+                f'({max_new_tokens}) = {max_pos} exceeds the '
+                f'frontend max_seq ({self._user_max_seq})')
+
+        self._ensure_long_mtp_cache_capacity(prompt_len, max_new_tokens, K)
+        hidden = self._cfg['hidden_size']
+        self.reset_state()
+        self.reset_mtp_state()
+        if not hasattr(self, '_rope_cos_table'):
+            self._build_rope_table()
+
+        use_kernel_accept = (
+            os.environ.get('FLASHRT_QWEN36_KERNEL_ACCEPT', '1') == '1'
+        )
+        accept_parts = int(os.environ.get(
+            'FLASHRT_QWEN36_ACCEPT_PARTS', '32') or '32')
+        use_partitioned_accept = (
+            use_kernel_accept
+            and accept_parts > 1
+            and hasattr(fvk, 'qwen36_spec_accept_partitioned_bf16')
+            and hasattr(self, '_spec_argmax_partial_vals')
+        )
+
+        with torch.no_grad():
+            s = torch.cuda.current_stream().cuda_stream
+            fvk.gpu_copy(
+                self._gen_out_buf[:, :prompt_len].data_ptr(),
+                input_ids.data_ptr(), prompt_len * 8, s,
+            )
+            ev_pf0 = torch.cuda.Event(enable_timing=True)
+            ev_pf1 = torch.cuda.Event(enable_timing=True)
+            ev_pf0.record()
+            last_h, last_logits = self._prefill_long_ctx_tq_chunked(input_ids)
+            if use_kernel_accept:
+                if use_partitioned_accept:
+                    fvk.qwen36_spec_accept_partitioned_bf16(
+                        last_logits.data_ptr(),
+                        self._spec_argmax_buf.data_ptr(),
+                        self._spec_argmax_buf.data_ptr(),
+                        self._spec_accept_n_buf.data_ptr(),
+                        self._spec_argmax_partial_vals.data_ptr(),
+                        self._spec_argmax_partial_idx.data_ptr(),
+                        1, self._cfg['vocab_size'], 0, accept_parts, s,
+                    )
+                else:
+                    fvk.qwen36_spec_accept_greedy_bf16(
+                        last_logits.data_ptr(),
+                        self._spec_argmax_buf.data_ptr(),
+                        self._spec_argmax_buf.data_ptr(),
+                        self._spec_accept_n_buf.data_ptr(),
+                        1, self._cfg['vocab_size'], 0, s,
+                    )
+                pending_tok = self._spec_argmax_buf[:1].view(1, 1)
+            else:
+                pending_tok = last_logits.argmax(
+                    dim=-1, keepdim=True).view(1, 1)
+
+            mtp_tail = self._long_mtp_prefill_tail_for_prompt(prompt_len)
+            mtp_base = 0
+            if mtp_tail > 0:
+                first = max(1, prompt_len - mtp_tail)
+                tail_start = int(getattr(
+                    self, '_long_mtp_h_tail_start', first - 1))
+                tail_h = self._long_mtp_h_tail
+                used_kv_only = False
+                if os.environ.get(
+                        'FLASHRT_QWEN36_LONG_MTP_TAIL_KV_ONLY',
+                        '1') == '1':
+                    rows = prompt_len - first
+                    h_start = (first - 1) - tail_start
+                    used_kv_only = self._prefill_mtp_tail_kv_nvfp4(
+                        tail_h[h_start:h_start + rows],
+                        input_ids[:, first:prompt_len].view(-1),
+                        first, mtp_base)
+                    if used_kv_only:
+                        mtp_base += rows
+                if not used_kv_only:
+                    for p in range(first, prompt_len):
+                        h_idx = (p - 1) - tail_start
+                        prev_h_p = tail_h[
+                            h_idx:h_idx + 1].view(
+                                1, 1, hidden).contiguous()
+                        prev_tok_p = input_ids[:, p:p + 1]
+                        self.forward_mtp_head_nvfp4(
+                            prev_h_p, prev_tok_p, p,
+                            mtp_cache_pos=mtp_base)
+                        mtp_base += 1
+            self.forward_mtp_head_nvfp4(
+                last_h, pending_tok, prompt_len, mtp_cache_pos=mtp_base)
+            ev_pf1.record()
+
+        self._spec_attempts = 0
+        self._spec_accepts = 0
+        self._spec_full = 0
+        self._agent_stream_active = True
+        self._agent_stream_is_long = True
+        self._agent_stream_prompt_len = prompt_len
+        self._agent_stream_cur_pos = prompt_len
+        self._agent_stream_pending_tok = pending_tok
+        self._agent_stream_h = last_h
+        self._agent_stream_mtp_base = mtp_base
+        self._agent_stream_K = K
+        self._agent_stream_pf0 = ev_pf0
+        self._agent_stream_pf1 = ev_pf1
+
+    def decode_long_ctx_nvfp4_committed_stream(
+            self, *, max_new_tokens: int, K: int = 6):
+        """Yield committed chunks from the long FP8-KV/TQ agent boundary."""
+        import torch
+
+        from flash_rt import flash_rt_kernels as fvk
+
+        if not getattr(self, '_agent_stream_active', False):
+            raise RuntimeError(
+                'prefill_long_ctx_nvfp4_agent must run before decode')
+        if not getattr(self, '_agent_stream_is_long', False):
+            raise RuntimeError('current agent stream boundary is not long')
+        if os.environ.get('FLASHRT_QWEN36_TQ_STRICT_NEXT', '0') == '1':
+            raise NotImplementedError(
+                'agent committed long stream does not cover strict-next yet')
+
+        cur_pos = int(self._agent_stream_cur_pos)
+        prompt_len = int(self._agent_stream_prompt_len)
+        pending_tok = self._agent_stream_pending_tok
+        h = self._agent_stream_h
+        mtp_base = int(self._agent_stream_mtp_base)
+        K = int(getattr(self, '_agent_stream_K', K))
+        adaptive_k = (
+            not os.environ.get('FLASHRT_QWEN36_TQ_SPEC_K', '')
+            and K >= 4
+            and os.environ.get('FLASHRT_QWEN36_TQ_ADAPTIVE_K', '1') == '1'
+        )
+        use_kernel_accept = (
+            os.environ.get('FLASHRT_QWEN36_KERNEL_ACCEPT', '1') == '1'
+        )
+        accept_parts = int(os.environ.get(
+            'FLASHRT_QWEN36_ACCEPT_PARTS', '32') or '32')
+        use_partitioned_accept = (
+            use_kernel_accept
+            and accept_parts > 1
+            and hasattr(fvk, 'qwen36_spec_accept_partitioned_bf16')
+            and hasattr(self, '_spec_argmax_partial_vals')
+        )
+        hidden = self._cfg['hidden_size']
+        ev_pf0 = self._agent_stream_pf0
+        ev_pf1 = self._agent_stream_pf1
+        ev_dec1 = torch.cuda.Event(enable_timing=True)
+        emitted = 0
+
+        with torch.no_grad():
+            s = torch.cuda.current_stream().cuda_stream
+            while emitted < int(max_new_tokens):
+                remaining = int(max_new_tokens) - emitted
+                draft_k = min(K, max(0, remaining - 1))
+                Kv = draft_k + 1
+
+                if draft_k > 0:
+                    if os.environ.get(
+                            'FLASHRT_QWEN36_TQ_MTP_CHAIN_GRAPH',
+                            '1') == '1':
+                        gs = self._graph_stream
+                        cg = self._ensure_mtp_chain_graph_nvfp4(
+                            cur_pos, draft_k, cache_base_pos=mtp_base,
+                            allow_capture=(
+                                self._long_tq_graph_capture_allowed()))
+                        if cg is not None:
+                            gs.wait_stream(torch.cuda.current_stream())
+                            with torch.cuda.stream(gs):
+                                fvk.gpu_copy(
+                                    self._mtp_static_prev_h.data_ptr(),
+                                    h.data_ptr(), hidden * 2,
+                                    gs.cuda_stream,
+                                )
+                                fvk.gpu_copy(
+                                    self._mtp_static_prev_token.data_ptr(),
+                                    pending_tok.data_ptr(), 8,
+                                    gs.cuda_stream,
+                                )
+                                cg.replay()
+                            torch.cuda.current_stream().wait_stream(gs)
+                            drafts_t = self._chain_drafts_buf[:draft_k]
+                        else:
+                            drafts = []
+                            h_mtp = h
+                            tok_mtp = pending_tok
+                            for j in range(draft_k):
+                                h_mtp, logits_mtp = (
+                                    self.forward_mtp_head_nvfp4(
+                                        h_mtp, tok_mtp, cur_pos + j,
+                                        mtp_cache_pos=mtp_base + j))
+                                tok_mtp = logits_mtp.argmax(
+                                    dim=-1, keepdim=True).view(1, 1)
+                                drafts.append(tok_mtp)
+                            drafts_t = torch.cat(drafts, dim=0).view(
+                                draft_k, 1)
+                    else:
+                        drafts = []
+                        h_mtp = h
+                        tok_mtp = pending_tok
+                        for j in range(draft_k):
+                            h_mtp, logits_mtp = self.forward_mtp_head_nvfp4(
+                                h_mtp, tok_mtp, cur_pos + j,
+                                mtp_cache_pos=mtp_base + j)
+                            tok_mtp = logits_mtp.argmax(
+                                dim=-1, keepdim=True).view(1, 1)
+                            drafts.append(tok_mtp)
+                        drafts_t = torch.cat(drafts, dim=0).view(draft_k, 1)
+                else:
+                    drafts_t = self._chain_drafts_buf[:0]
+
+                d = self._rope_dim
+                cos_KN = self._rope_cos_table[
+                    cur_pos:cur_pos + Kv].view(1, Kv, d)
+                sin_KN = self._rope_sin_table[
+                    cur_pos:cur_pos + Kv].view(1, Kv, d)
+                fvk.gpu_copy(
+                    self._verify_static_tokens[:, 0:1].data_ptr(),
+                    pending_tok.data_ptr(), 8, s,
+                )
+                if draft_k > 0:
+                    fvk.gpu_copy(
+                        self._verify_static_tokens[:, 1:Kv].data_ptr(),
+                        drafts_t.view(1, draft_k).data_ptr(), draft_k * 8, s,
+                    )
+                fvk.gpu_copy(
+                    self._verify_static_cos[:, :Kv].data_ptr(),
+                    cos_KN.data_ptr(), Kv * d * 2, s,
+                )
+                fvk.gpu_copy(
+                    self._verify_static_sin[:, :Kv].data_ptr(),
+                    sin_KN.data_ptr(), Kv * d * 2, s,
+                )
+
+                kv_mode = getattr(self, '_long_kv_cache_mode', 'tq')
+                use_verify_graph = (
+                    os.environ.get(
+                        'FLASHRT_QWEN36_TQ_VERIFY_GRAPH', '1') == '1'
+                )
+                if kv_mode == 'tq' and use_verify_graph:
+                    self._tq_mark_dequant_valid_end(cur_pos)
+                    graph_key = (cur_pos, Kv)
+                    vg = self._graph_cache_get(
+                        self._captured_verify_graphs_tq, graph_key)
+                    if vg is None and self._long_tq_graph_capture_allowed():
+                        vg = self._ensure_verify_graph_nvfp4_tq(cur_pos, Kv)
+                    if vg is not None:
+                        gs = self._graph_stream
+                        gs.wait_stream(torch.cuda.current_stream())
+                        with torch.cuda.stream(gs):
+                            vg.replay()
+                        torch.cuda.current_stream().wait_stream(gs)
+                        self._tq_mark_dequant_valid_end(cur_pos + Kv)
+                        logits_KN = self._K_logits_buf[:Kv]
+                    else:
+                        logits_KN = self._forward_long_kv_K_nvfp4(
+                            self._verify_static_tokens[:, :Kv],
+                            self._verify_static_cos[:, :Kv],
+                            self._verify_static_sin[:, :Kv],
+                            cur_pos, Kv)
+                elif kv_mode == 'fp8' and use_verify_graph:
+                    graph_key = (cur_pos, Kv)
+                    cache = getattr(
+                        self, '_captured_verify_graphs_fp8kv', None)
+                    vg = (self._graph_cache_get(cache, graph_key)
+                          if cache is not None else None)
+                    if vg is None and self._long_tq_graph_capture_allowed():
+                        vg = self._ensure_verify_graph_nvfp4_fp8kv(
+                            cur_pos, Kv)
+                    if vg is not None:
+                        gs = self._graph_stream
+                        gs.wait_stream(torch.cuda.current_stream())
+                        with torch.cuda.stream(gs):
+                            vg.replay()
+                        torch.cuda.current_stream().wait_stream(gs)
+                        self._fp8_mark_dequant_valid_end(cur_pos + Kv)
+                        logits_KN = self._K_logits_buf[:Kv]
+                    else:
+                        logits_KN = self._forward_long_kv_K_nvfp4(
+                            self._verify_static_tokens[:, :Kv],
+                            self._verify_static_cos[:, :Kv],
+                            self._verify_static_sin[:, :Kv],
+                            cur_pos, Kv)
+                else:
+                    logits_KN = self._forward_long_kv_K_nvfp4(
+                        self._verify_static_tokens[:, :Kv],
+                        self._verify_static_cos[:, :Kv],
+                        self._verify_static_sin[:, :Kv],
+                        cur_pos, Kv)
+
+                if use_kernel_accept:
+                    if use_partitioned_accept:
+                        fvk.qwen36_spec_accept_partitioned_bf16(
+                            logits_KN.data_ptr(),
+                            drafts_t.view(-1).data_ptr(),
+                            self._spec_argmax_buf.data_ptr(),
+                            self._spec_accept_n_buf.data_ptr(),
+                            self._spec_argmax_partial_vals.data_ptr(),
+                            self._spec_argmax_partial_idx.data_ptr(),
+                            Kv, self._cfg['vocab_size'], draft_k,
+                            accept_parts, s,
+                        )
+                    else:
+                        fvk.qwen36_spec_accept_greedy_bf16(
+                            logits_KN.data_ptr(),
+                            drafts_t.view(-1).data_ptr(),
+                            self._spec_argmax_buf.data_ptr(),
+                            self._spec_accept_n_buf.data_ptr(),
+                            Kv, self._cfg['vocab_size'], draft_k, s,
+                        )
+                    all_argmax = self._spec_argmax_buf[:Kv]
+                    N = int(fvk.cuda_read_i32_sync(
+                        self._spec_accept_n_buf.data_ptr(), s))
+                else:
+                    all_argmax = logits_KN.argmax(dim=-1)
+                    if draft_k > 0:
+                        drafts_stack = drafts_t.view(-1)
+                        matches = (
+                            all_argmax[:draft_k] == drafts_stack).long()
+                        matches_pad = torch.cat([
+                            matches,
+                            torch.zeros(1, device=matches.device,
+                                        dtype=matches.dtype),
+                        ])
+                        N = int(matches_pad.argmin().item())
+                    else:
+                        N = 0
+                self._spec_attempts += 1
+                self._spec_accepts += N
+
+                committed = [int(pending_tok.item())]
+                if N > 0:
+                    committed.extend(int(x) for x in all_argmax[:N].tolist())
+                if N == draft_k:
+                    self._spec_full += 1
+                    pending_tok = all_argmax[draft_k:draft_k + 1].view(1, 1)
+                    h = self._K_last_hidden_buf[
+                        :, draft_k:draft_k + 1, :]
+                    cur_pos += draft_k + 1
+                    mtp_base += draft_k + 1
+                else:
+                    fvk.gpu_copy(
+                        self._lin_state.data_ptr(),
+                        self._K_lin_state_per_step[N].data_ptr(),
+                        self._lin_state.numel() * 2, s,
+                    )
+                    fvk.gpu_copy(
+                        self._lin_conv_state.data_ptr(),
+                        self._K_lin_conv_state_per_step[N].data_ptr(),
+                        self._lin_conv_state.numel() * 2, s,
+                    )
+                    h = self._K_last_hidden_buf[:, N:N + 1, :]
+                    pending_tok = all_argmax[N:N + 1].view(1, 1)
+                    cur_pos += N + 1
+                    mtp_base += N + 1
+                self._tq_mark_dequant_valid_end(cur_pos)
+                self._fp8_mark_dequant_valid_end(cur_pos)
+
+                emitted += len(committed)
+                self._agent_stream_cur_pos = cur_pos
+                self._agent_stream_pending_tok = pending_tok
+                self._agent_stream_h = h
+                self._agent_stream_mtp_base = mtp_base
+                yield tuple(committed)
+
+                if (adaptive_k and K > 3
+                        and self._spec_attempts >= 8
+                        and self._spec_full == 0
+                        and (self._spec_accepts / self._spec_attempts)
+                        < 1.25):
+                    K = 3
+                    self._agent_stream_K = K
+
+            ev_dec1.record()
+            torch.cuda.synchronize()
+            self._long_ctx_prefill_ms = ev_pf0.elapsed_time(ev_pf1)
+            self._long_ctx_decode_ms = ev_pf1.elapsed_time(ev_dec1)
+            self._long_ctx_route = (
+                f'{getattr(self, "_long_kv_cache_mode", "tq")}_spec_stream')
 
     def _generate_long_ctx_speculative_KN_nvfp4(
             self, input_ids, *, max_new_tokens: int, K: int = 6):
