@@ -56,13 +56,14 @@ short-context committed split:
 - cold short prefill: `prefill_own_speculative_nvfp4_agent`
 - hot contiguous short append: `append_own_speculative_nvfp4_agent`
 - cold long prefill: `prefill_long_ctx_nvfp4_agent`
+- hot contiguous long append: `append_long_ctx_nvfp4_agent`
 - committed streaming decode:
   `decode_own_speculative_nvfp4_committed_stream` or
   `decode_long_ctx_nvfp4_committed_stream`
 
-Long-context append-prefill remains an explicit frontend gate.  Until it is
-wired, the adapter raises `NotImplementedError` instead of silently rebuilding
-and reporting a fake cache hit.
+Long-context append-prefill is limited to the currently hot contiguous session.
+Non-hot sessions still rebuild/restore at the policy layer rather than reporting
+a fake cache hit.
 
 ## Run
 

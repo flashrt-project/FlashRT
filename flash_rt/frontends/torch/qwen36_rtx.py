@@ -9002,6 +9002,228 @@ class Qwen36TorchFrontendRtx:
             self._long_ctx_route = (
                 f'{getattr(self, "_long_kv_cache_mode", "tq")}_spec_stream')
 
+    def append_long_ctx_nvfp4_agent(
+            self, input_ids, *, start_pos: int,
+            max_new_tokens: int, K: int = 6):
+        """Append long-context prompt tokens to the hot committed boundary."""
+        import torch
+
+        from flash_rt import flash_rt_kernels as fvk
+
+        if not getattr(self, '_agent_stream_active', False):
+            raise RuntimeError(
+                'prefill_long_ctx_nvfp4_agent must run before append')
+        if not getattr(self, '_agent_stream_is_long', False):
+            raise RuntimeError('current agent stream boundary is not long')
+        if os.environ.get('FLASHRT_QWEN36_TQ_STRICT_NEXT', '0') == '1':
+            raise NotImplementedError(
+                'agent committed long append does not cover strict-next yet')
+
+        prompt_len = int(input_ids.shape[1])
+        start_pos = int(start_pos)
+        if start_pos != int(self._agent_stream_cur_pos):
+            raise NotImplementedError(
+                'long append requires a hot contiguous boundary')
+        if prompt_len <= start_pos:
+            raise ValueError('append requires at least one suffix token')
+        if not self._should_use_long_ctx_route(prompt_len, max_new_tokens):
+            raise ValueError('prompt does not select the long-context route')
+
+        tq_spec_k = os.environ.get('FLASHRT_QWEN36_TQ_SPEC_K', '')
+        if tq_spec_k:
+            K = int(tq_spec_k)
+        else:
+            K = self._long_tq_effective_k(prompt_len, K)
+        max_spec_k = min(self.MAX_Q_SEQ - 1, self._MAX_PUBLIC_SPEC_K)
+        if K < 1 or K > max_spec_k:
+            raise ValueError(
+                f'K={K} out of range — need 1<=K<={max_spec_k}')
+        max_pos = prompt_len + int(max_new_tokens)
+        if max_pos > self._user_max_seq:
+            raise ValueError(
+                f'prompt_len ({prompt_len}) + max_new_tokens '
+                f'({max_new_tokens}) = {max_pos} exceeds the '
+                f'frontend max_seq ({self._user_max_seq})')
+        self._ensure_long_mtp_cache_capacity(prompt_len, max_new_tokens, K)
+        if not hasattr(self, '_rope_cos_table'):
+            self._build_rope_table()
+
+        hidden = self._cfg['hidden_size']
+        chunk = int(os.environ.get(
+            'FLASHRT_QWEN36_TQ_PREFILL_CHUNK', str(self.MAX_Q_SEQ)))
+        chunk_cap = min(self.MAX_Q_SEQ, int(self._h_b.shape[0]))
+        chunk = max(1, min(chunk, chunk_cap))
+        d = self._rope_dim
+        use_prefill_graph = (
+            os.environ.get(
+                'FLASHRT_QWEN36_TQ_PREFILL_GRAPH', '0').lower()
+            in ('1', 'true', 'yes', 'on')
+            and self._long_prefill_graph_capture_allowed(prompt_len)
+        )
+
+        with torch.no_grad():
+            s = torch.cuda.current_stream().cuda_stream
+            ev_pf0 = torch.cuda.Event(enable_timing=True)
+            ev_pf1 = torch.cuda.Event(enable_timing=True)
+            ev_pf0.record()
+
+            last_h = None
+            last_logits = None
+            for start in range(start_pos, prompt_len, chunk):
+                end = min(start + chunk, prompt_len)
+                S = end - start
+                cos_S = self._rope_cos_table[start:end].view(1, S, d)
+                sin_S = self._rope_sin_table[start:end].view(1, S, d)
+                is_last = end == prompt_len
+                mode = 'hidden_last' if is_last else 'hidden'
+                kv_mode = getattr(self, '_long_kv_cache_mode', 'tq')
+                if use_prefill_graph:
+                    fvk.gpu_copy(
+                        self._verify_static_tokens[:, :S].data_ptr(),
+                        input_ids[:, start:end].data_ptr(), S * 8, s,
+                    )
+                    fvk.gpu_copy(
+                        self._verify_static_cos[:, :S].data_ptr(),
+                        cos_S.data_ptr(), S * d * 2, s,
+                    )
+                    fvk.gpu_copy(
+                        self._verify_static_sin[:, :S].data_ptr(),
+                        sin_S.data_ptr(), S * d * 2, s,
+                    )
+                    if kv_mode == 'fp8':
+                        graph, captured_live = (
+                            self._ensure_prefill_graph_nvfp4_fp8kv(
+                                start, S, mode))
+                        if not captured_live:
+                            gs = self._graph_stream
+                            gs.wait_stream(torch.cuda.current_stream())
+                            with torch.cuda.stream(gs):
+                                graph.replay()
+                            torch.cuda.current_stream().wait_stream(gs)
+                        self._fp8_mark_dequant_valid_end(end)
+                        logits = self._logits_buf if is_last else None
+                    else:
+                        self._tq_mark_dequant_valid_end(start)
+                        graph, captured_live = (
+                            self._ensure_prefill_graph_nvfp4_tq(
+                                start, S, mode))
+                        if not captured_live:
+                            gs = self._graph_stream
+                            gs.wait_stream(torch.cuda.current_stream())
+                            with torch.cuda.stream(gs):
+                                graph.replay()
+                            torch.cuda.current_stream().wait_stream(gs)
+                        self._tq_mark_dequant_valid_end(end)
+                        logits = self._logits_buf if is_last else None
+                elif kv_mode == 'fp8':
+                    logits = self.forward_own_decode_K_nvfp4_fp8kv(
+                        input_ids[:, start:end], cos_S, sin_S, start, S,
+                        logits_mode=mode)
+                else:
+                    logits = self.forward_own_decode_K_nvfp4_tq(
+                        input_ids[:, start:end], cos_S, sin_S, start, S,
+                        logits_mode=mode)
+
+                self._agent_long_h_tail_append(
+                    start, self._K_last_hidden_buf[:, :S, :].view(S, hidden))
+                if is_last:
+                    last_h = self._K_last_hidden_buf[:, S - 1:S, :]
+                    last_logits = logits
+
+            assert last_h is not None and last_logits is not None
+            if last_logits.data_ptr() != self._logits_buf.data_ptr():
+                fvk.gpu_copy(
+                    self._logits_buf.data_ptr(), last_logits.data_ptr(),
+                    self._cfg['vocab_size'] * 2, s,
+                )
+
+            use_kernel_accept = (
+                os.environ.get('FLASHRT_QWEN36_KERNEL_ACCEPT', '1') == '1'
+            )
+            accept_parts = int(os.environ.get(
+                'FLASHRT_QWEN36_ACCEPT_PARTS', '32') or '32')
+            use_partitioned_accept = (
+                use_kernel_accept
+                and accept_parts > 1
+                and hasattr(fvk, 'qwen36_spec_accept_partitioned_bf16')
+                and hasattr(self, '_spec_argmax_partial_vals')
+            )
+            if use_kernel_accept:
+                if use_partitioned_accept:
+                    fvk.qwen36_spec_accept_partitioned_bf16(
+                        last_logits.data_ptr(),
+                        self._spec_argmax_buf.data_ptr(),
+                        self._spec_argmax_buf.data_ptr(),
+                        self._spec_accept_n_buf.data_ptr(),
+                        self._spec_argmax_partial_vals.data_ptr(),
+                        self._spec_argmax_partial_idx.data_ptr(),
+                        1, self._cfg['vocab_size'], 0, accept_parts, s,
+                    )
+                else:
+                    fvk.qwen36_spec_accept_greedy_bf16(
+                        last_logits.data_ptr(),
+                        self._spec_argmax_buf.data_ptr(),
+                        self._spec_argmax_buf.data_ptr(),
+                        self._spec_accept_n_buf.data_ptr(),
+                        1, self._cfg['vocab_size'], 0, s,
+                    )
+                pending_tok = self._spec_argmax_buf[:1].view(1, 1)
+            else:
+                pending_tok = last_logits.argmax(
+                    dim=-1, keepdim=True).view(1, 1)
+
+            mtp_tail = self._long_mtp_prefill_tail_for_prompt(prompt_len)
+            first = max(1, prompt_len - mtp_tail)
+            tail_start = int(getattr(self, '_agent_long_h_tail_start', 0))
+            tail_rows = int(getattr(self, '_agent_long_h_tail_rows', 0))
+            need_start = first - 1
+            if tail_start > need_start or tail_start + tail_rows < prompt_len:
+                raise RuntimeError(
+                    'long append hidden tail does not cover MTP rebuild')
+
+            self.reset_mtp_state()
+            mtp_base = 0
+            if mtp_tail > 0:
+                rows = prompt_len - first
+                h_start = need_start - tail_start
+                used_kv_only = False
+                if os.environ.get(
+                        'FLASHRT_QWEN36_LONG_MTP_TAIL_KV_ONLY',
+                        '1') == '1':
+                    used_kv_only = self._prefill_mtp_tail_kv_nvfp4(
+                        self._agent_long_h_tail[
+                            h_start:h_start + rows],
+                        input_ids[:, first:prompt_len].view(-1),
+                        first, mtp_base)
+                    if used_kv_only:
+                        mtp_base += rows
+                if not used_kv_only:
+                    for p in range(first, prompt_len):
+                        h_idx = (p - 1) - tail_start
+                        prev_h_p = self._agent_long_h_tail[
+                            h_idx:h_idx + 1].view(
+                                1, 1, hidden).contiguous()
+                        prev_tok_p = input_ids[:, p:p + 1]
+                        self.forward_mtp_head_nvfp4(
+                            prev_h_p, prev_tok_p, p,
+                            mtp_cache_pos=mtp_base)
+                        mtp_base += 1
+            self.forward_mtp_head_nvfp4(
+                last_h, pending_tok, prompt_len, mtp_cache_pos=mtp_base)
+            ev_pf1.record()
+
+        self._spec_attempts = 0
+        self._spec_accepts = 0
+        self._spec_full = 0
+        self._agent_stream_prompt_len = prompt_len
+        self._agent_stream_cur_pos = prompt_len
+        self._agent_stream_pending_tok = pending_tok
+        self._agent_stream_h = last_h
+        self._agent_stream_mtp_base = mtp_base
+        self._agent_stream_K = K
+        self._agent_stream_pf0 = ev_pf0
+        self._agent_stream_pf1 = ev_pf1
+
     def _generate_long_ctx_speculative_KN_nvfp4(
             self, input_ids, *, max_new_tokens: int, K: int = 6):
         """Long-context MTP spec decode over the compressed KV cache.

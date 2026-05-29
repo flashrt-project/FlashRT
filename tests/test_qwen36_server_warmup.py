@@ -111,6 +111,8 @@ def test_qwen36_frontend_exposes_committed_stream_split():
     assert hasattr(Qwen36TorchFrontendRtx,
                    'prefill_long_ctx_nvfp4_agent')
     assert hasattr(Qwen36TorchFrontendRtx,
+                   'append_long_ctx_nvfp4_agent')
+    assert hasattr(Qwen36TorchFrontendRtx,
                    'decode_long_ctx_nvfp4_committed_stream')
 
 
