@@ -11,12 +11,12 @@ Gate (compared across the two runs by the caller):
     test_adopt_qwen36.py; this confirms it inside the real serving loop)
   - TTFT MUST NOT regress
 
-Run twice (inside pi0-stablehlo-test):
+Run twice (inside the CUDA container):
   for v in 0 1; do
-    PYTHONPATH=/workspace/PI/official/FlashRT-spec:/workspace/PI/official/FlashRT-spec/exec/build \
+    PYTHONPATH=.:./exec/build \
     FLASHRT_QWEN36_USE_EXEC=$v \
-    FLASHRT_QWEN36_NVFP4_CKPT_DIR=/workspace/PI/checkpoints/qwen36_nvfp4 \
-    FLASHRT_QWEN36_MTP_CKPT_DIR=/workspace/PI/checkpoints/qwen36_mtp_inferrouter \
+    FLASHRT_QWEN36_NVFP4_CKPT_DIR=checkpoints/qwen36_nvfp4 \
+    FLASHRT_QWEN36_MTP_CKPT_DIR=checkpoints/qwen36_mtp_inferrouter \
     PYTORCH_ALLOC_CONF=expandable_segments:True \
     python exec/tests/gate_exec_decode.py
   done
@@ -29,7 +29,7 @@ import torch
 from flash_rt.frontends.torch.qwen36_rtx import Qwen36TorchFrontendRtx
 
 CKPT = os.environ.get("FLASHRT_QWEN36_NVFP4_CKPT_DIR",
-                      "/workspace/PI/checkpoints/qwen36_nvfp4")
+                      "checkpoints/qwen36_nvfp4")
 USE_EXEC = os.environ.get("FLASHRT_QWEN36_USE_EXEC", "0")
 PROMPT = "Explain quantum entanglement in one short paragraph."
 K, N = 6, 128

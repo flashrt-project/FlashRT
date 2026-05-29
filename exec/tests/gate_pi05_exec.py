@@ -11,11 +11,11 @@ one flag value (run twice, off vs on, to compare):
 A within-process determinism check (same seed -> same actions twice) guards
 that the hash comparison is meaningful.
 
-Run twice (inside pi0-stablehlo-test, after building fp16 fa2):
+Run twice (inside the CUDA container, after building fp16 fa2):
   for v in 0 1; do
-    PYTHONPATH=/workspace/PI/official/FlashRT-spec \
+    PYTHONPATH=. \
     FLASHRT_PI05_USE_EXEC=$v PYTORCH_ALLOC_CONF=expandable_segments:True \
-    python exec/tests/gate_pi05_exec.py --checkpoint /workspace/PI/checkpoints/pi05_libero_pytorch
+    python exec/tests/gate_pi05_exec.py --checkpoint checkpoints/pi05_libero_pytorch
   done
 """
 

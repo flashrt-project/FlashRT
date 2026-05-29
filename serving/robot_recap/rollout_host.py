@@ -23,10 +23,10 @@ restored noise buffer; production writes fresh observations each chunk). The
 episode state machine / keyboard / reset policy live HERE in serving, never in
 the contract.
 
-Run (inside pi0-stablehlo-test):
-  PYTHONPATH=/workspace/PI/official/FlashRT-spec:/workspace/PI/official/FlashRT-spec/exec/build \
+Run (inside the CUDA container):
+  PYTHONPATH=.:./exec/build \
   PYTORCH_ALLOC_CONF=expandable_segments:True \
-  python serving/robot_recap/rollout_host.py --checkpoint /workspace/PI/checkpoints/pi05_libero_pytorch
+  python serving/robot_recap/rollout_host.py --checkpoint checkpoints/pi05_libero_pytorch
 """
 
 import argparse
@@ -48,6 +48,7 @@ def main():
     ap.add_argument("--episodes", type=int, default=3)
     ap.add_argument("--max-chunks", type=int, default=8)
     ap.add_argument("--value-stop-threshold", type=float, default=0.0)
+    ap.add_argument("--record-dir", default="", help="dir to write episode_*.npz (empty = none)")
     args = ap.parse_args()
 
     rng = np.random.RandomState(0)
@@ -108,33 +109,59 @@ def main():
         value = float(val_out.float().item())
         return actions, value
 
-    # ── episode state machine ──
+    # ── pluggable host hooks (the parts the community user asks about) ──
+    # Keyboard START/END: a swappable event source. Default is SCRIPTED so the
+    # demo runs headless; swap in a real listener (pynput/termios) with the same
+    # interface for teleop. Returns "END" to stop the current episode.
+    def keyboard_event(ep, chunk):
+        end_at = {0: 3}.get(ep)            # episode 0 ends on a "keyboard" press at chunk 3
+        return "END" if (end_at is not None and chunk + 1 >= end_at) else None
+
+    # Robot reset-to-initial: a host hook (hardware-specific). No-op here (no
+    # robot); in teleop you call your driver, e.g. robot.move_to_home().
+    def robot_reset_to_initial():
+        pass                               # robot.move_to_home(blocking=True)
+
+    import os
+    rec_dir = args.record_dir
+    if rec_dir:
+        os.makedirs(rec_dir, exist_ok=True)
+
+    # ── episode state machine: START -> RUNNING -> STOP_INFER -> reset -> RECORD ──
     print(f"frontend={type(fe).__name__} pipeline={type(pl).__name__}")
     print(f"co-hosted via ONE exec ctx: policy(stream {s_policy}) + value critic(stream {s_critic})\n")
     total_chunks = 0
     for ep in range(args.episodes):
-        reset_state()                                  # RESET (buffers, no recapture)
-        chunks, stop_reason, value = 0, None, 0.0
-        # simulate a keyboard "stop" pressed at a per-episode chunk (None = never)
-        keyboard_stop_at = {0: 3, 1: None}.get(ep, None)
-        for c in range(args.max_chunks):               # RUNNING
+        reset_state()                                  # RESET model state (buffers, no recapture)
+        traj, chunks, stop_reason, value = [], 0, None, 0.0
+        for c in range(args.max_chunks):               # RUNNING (one action chunk per replay)
             actions, value = run_chunk(c)
             chunks += 1; total_chunks += 1
             assert np.isfinite(actions.numpy()).all()
+            traj.append({"chunk": c, "action": actions.numpy(), "value": value})  # RECORD buffer
+            if keyboard_event(ep, c) == "END":
+                stop_reason = "keyboard(END)"; break     # human end -> clean STOP between chunks
             if value < args.value_stop_threshold:
-                stop_reason = "auto(value<thr)"; break  # critic-driven termination
-            if keyboard_stop_at is not None and c + 1 >= keyboard_stop_at:
-                stop_reason = "keyboard"; break          # human stop -> STOP_INFER
+                stop_reason = "auto(value<thr)"; break   # critic-driven termination
         else:
             stop_reason = "timeout(max_chunks)"
-        # STOP_INFER reached: NO further replay happens this episode (verified by `chunks`).
-        # AWAIT_RESET (human resets robot) -> RECORD -> next episode.
+        # STOP_INFER: no further replay this episode. AWAIT_RESET -> reset robot ->
+        # serialize the recorded episode -> next episode.
+        robot_reset_to_initial()                       # reset robot to initial position (hook)
+        saved = ""
+        if rec_dir:
+            path = os.path.join(rec_dir, f"episode_{ep:03d}.npz")
+            np.savez(path, actions=np.stack([t["action"] for t in traj]),
+                     values=np.array([t["value"] for t in traj], dtype=np.float32),
+                     stop_reason=stop_reason)
+            saved = f" -> {path}"
         print(f"episode {ep}: ran {chunks} chunks, STOP={stop_reason}, "
-              f"last_value={value:+.3f}, recorded.")
+              f"last_value={value:+.3f}, recorded {len(traj)} chunks{saved}")
 
     print(f"\nPASS — RL rollout host: {args.episodes} episodes, {total_chunks} chunks total, "
           "policy+critic co-hosted via ONE exec ctx, per-chunk interruptible (clean STOP at "
-          "episode boundary), buffer reset between episodes (no recapture).")
+          "episode boundary via keyboard/value/timeout), robot-reset + episode recording hooks, "
+          "model-state buffer reset between episodes (no recapture).")
 
 
 if __name__ == "__main__":

@@ -402,7 +402,7 @@ The Rust shell, OpenAI, and scheduler all live in serving / the upper layer, off
 ## 8. v1 acceptance checklist
 
 Status of the first version (branch `spec/exec-contract`). Everything below is implemented and
-verified in-container on RTX 5090 (sm_120) / pi0-stablehlo-test (torch 2.9, CUDA 13, py3.12).
+verified in-container on RTX 5090 (sm_120).
 
 ### 8.1 Primitives (mechanism)
 - [x] `Buffer` alloc / wrap / dptr / bytes / name — owned + external pointers

@@ -12,10 +12,10 @@ forward() is idempotent given fixed inputs, so the two replays must produce a
 bit-identical diffusion_noise buffer (cosine 1.0). Avoids the cross-process
 RNG nondeterminism that makes a sha gate meaningless for Pi0.5.
 
-Run (inside pi0-stablehlo-test, after building fp16 fa2):
-    PYTHONPATH=/workspace/PI/official/FlashRT-spec:/workspace/PI/official/FlashRT-spec/exec/build \
+Run (inside the CUDA container, after building fp16 fa2):
+    PYTHONPATH=.:./exec/build \
     PYTORCH_ALLOC_CONF=expandable_segments:True \
-    python exec/tests/test_adopt_pi05.py --checkpoint /workspace/PI/checkpoints/pi05_libero_pytorch
+    python exec/tests/test_adopt_pi05.py --checkpoint checkpoints/pi05_libero_pytorch
 """
 
 import argparse

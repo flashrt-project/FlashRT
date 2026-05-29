@@ -18,10 +18,10 @@ Mechanism demo (honest scope): two Pi05 stand in for planner+actor; the subtask
 hand-off is plumbing (planner output -> subtask buffer -> actor input), not a
 semantic planner->language mapping. We verify the contract orchestration.
 
-Run (inside pi0-stablehlo-test):
-  PYTHONPATH=/workspace/PI/official/FlashRT-spec:/workspace/PI/official/FlashRT-spec/exec/build \
+Run (inside the CUDA container):
+  PYTHONPATH=.:./exec/build \
   PYTORCH_ALLOC_CONF=expandable_segments:True \
-  python serving/robot_pi07/verify_pi07.py --checkpoint /workspace/PI/checkpoints/pi05_libero_pytorch
+  python serving/robot_pi07/verify_pi07.py --checkpoint checkpoints/pi05_libero_pytorch
 """
 
 import argparse

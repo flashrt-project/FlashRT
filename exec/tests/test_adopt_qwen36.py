@@ -6,10 +6,10 @@ frt adopts torch's instantiated graph-exec via raw_cuda_graph_exec(), and the
 exec layer drives replay on a wrapped torch stream. Assert the decode logits
 produced by frt-driven replay are BIT-IDENTICAL to torch's own g.replay().
 
-Run (inside pi0-stablehlo-test):
-    PYTHONPATH=/workspace/PI/official/FlashRT-spec:/workspace/PI/official/FlashRT-spec/exec/build \
-    FLASHRT_QWEN36_NVFP4_CKPT_DIR=/workspace/PI/checkpoints/qwen36_nvfp4 \
-    FLASHRT_QWEN36_MTP_CKPT_DIR=/workspace/PI/checkpoints/qwen36_mtp_inferrouter \
+Run (inside the CUDA container):
+    PYTHONPATH=.:./exec/build \
+    FLASHRT_QWEN36_NVFP4_CKPT_DIR=checkpoints/qwen36_nvfp4 \
+    FLASHRT_QWEN36_MTP_CKPT_DIR=checkpoints/qwen36_mtp_inferrouter \
     PYTORCH_ALLOC_CONF=expandable_segments:True \
     python exec/tests/test_adopt_qwen36.py
 """
@@ -21,7 +21,7 @@ import _flashrt_exec as ex
 from flash_rt.frontends.torch.qwen36_rtx import Qwen36TorchFrontendRtx
 
 CKPT = os.environ.get("FLASHRT_QWEN36_NVFP4_CKPT_DIR",
-                      "/workspace/PI/checkpoints/qwen36_nvfp4")
+                      "checkpoints/qwen36_nvfp4")
 CUR_POS = 0
 
 

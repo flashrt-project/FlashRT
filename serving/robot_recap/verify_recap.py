@@ -15,10 +15,10 @@ by the exec contract**. This script verifies it end to end:
   2. The exec layer drives that captured CFG graph BIT-IDENTICALLY to the ctypes
      replay (cosine 1.0) — restoring the in-place noise buffer before each replay.
 
-Run (inside pi0-stablehlo-test):
-  PYTHONPATH=/workspace/PI/official/FlashRT-spec:/workspace/PI/official/FlashRT-spec/exec/build \
+Run (inside the CUDA container):
+  PYTHONPATH=.:./exec/build \
   PYTORCH_ALLOC_CONF=expandable_segments:True \
-  python serving/robot_recap/verify_recap.py --checkpoint /workspace/PI/checkpoints/pi05_libero_pytorch
+  python serving/robot_recap/verify_recap.py --checkpoint checkpoints/pi05_libero_pytorch
 """
 
 import argparse
