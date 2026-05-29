@@ -178,7 +178,9 @@ def test_long_tq_effective_k_uses_measured_context_buckets(monkeypatch):
     monkeypatch.delenv('FLASHRT_QWEN36_TQ_SPEC_K', raising=False)
     fe = Qwen36TorchFrontendRtx.__new__(Qwen36TorchFrontendRtx)
 
-    assert fe._long_tq_effective_k(512, 6) == 4
+    assert fe._long_tq_effective_k(32, 6) == 3
+    assert fe._long_tq_effective_k(128, 6) == 6
+    assert fe._long_tq_effective_k(512, 6) == 3
     assert fe._long_tq_effective_k(1024, 6) == 5
     assert fe._long_tq_effective_k(2048, 6) == 6
     assert fe._long_tq_effective_k(4096, 6) == 3
