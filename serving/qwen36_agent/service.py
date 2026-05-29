@@ -53,11 +53,16 @@ class AgentService:
 
     def _effective_plan(
             self, session, plan: PrefixPlan) -> tuple[int, PrefixPlan]:
-        # v1 contiguous policy: only the currently hot session can reuse GPU
-        # state. Non-hot matches keep their token journal but rebuild until a
-        # checkpoint/offload backend lands.
+        # v1 contiguous policy: only the currently hot session can reuse append
+        # or exact GPU state. Non-hot matches and truncation keep their token
+        # journal but rebuild until a checkpoint/rollback backend lands.
         effective_cached = plan.cached_tokens
-        if plan.cached_tokens and self.sessions.hot_session_id != session.session_id:
+        needs_rebuild = (
+            plan.cached_tokens
+            and (self.sessions.hot_session_id != session.session_id
+                 or plan.action == "truncate")
+        )
+        if needs_rebuild:
             effective_cached = 0
             plan = PrefixPlan(
                 session_id=session.session_id,

@@ -165,6 +165,23 @@ def test_agent_service_rebuilds_token_journal_without_hot_state():
     assert engine.prefills[-1][1:] == (0, 1, 6)
 
 
+def test_agent_service_rebuilds_truncate_without_rollback():
+    engine = FakeAgentEngine()
+    svc = AgentService(engine)
+    rec = svc.sessions.create(session_id="hot")
+    rec.commit([ord("a"), 0, ord("h"), ord("i")])
+    svc.sessions.mark_hot("hot")
+
+    res = svc.complete(AgentRequest(
+        session_id="hot",
+        messages=[{"role": "user", "content": "a"}],
+        max_tokens=1,
+    ))
+    assert res.prefix_plan.action == "activate_rebuild"
+    assert res.stats.cached_tokens == 0
+    assert engine.prefills[-1][1:] == (0, 1, 6)
+
+
 def test_agent_service_parses_tool_calls_from_generated_stream():
     engine = FakeAgentEngine()
     engine.outputs = [

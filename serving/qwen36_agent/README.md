@@ -29,6 +29,8 @@ The first backend is contiguous and session-first because that matches the
 current fastest Qwen3.6 CUDA-graph replay path. A request can reuse the hot
 frontend state when its tokenized prompt exactly extends the cached session
 prefix. Divergent prompts rebuild or restore at a future checkpoint boundary.
+Truncation also rebuilds in v1: the frontend cannot roll the hot GPU state back
+to a shorter prefix until checkpoint/rollback support lands.
 
 For OpenAI-style clients that resend the full message list every turn, prefix
 reuse requires the history to include the assistant content/tool call emitted by
