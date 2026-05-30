@@ -24,9 +24,9 @@ The async loader expects the dataset to expose ``get_frame``,
 ``get_action_chunk``, and the camera-name → bytes-decoder
 contract that's currently fixed inside
 ``training.rl.async_loader.make_step_dataloader``. New datasets
-that need a different camera mapping should pass their own
-``camera_decoder`` to that loader (next step on the cleanup
-roadmap — out of scope for this driver).
+that need a different camera mapping should set
+``RecapTrainConfig.camera_map``; the async loader applies that map
+before handing decoded pi0.5 camera slots to ``observation_builder``.
 """
 
 from __future__ import annotations
@@ -96,6 +96,7 @@ class RecapTrainConfig:
     # overlapped with the GPU step.
     dataloader_workers: int = 0
     dataloader_prefetch_factor: int = 2
+    camera_map: dict[str, str | None] | None = None
 
     # ``torch.compile`` mode applied to ``trainer.model`` for the
     # training step. ``None`` keeps eager mode.
@@ -293,6 +294,7 @@ def train_recap_policy(
         action_dim_target=trainer.model.config.action_dim,
         num_workers=cfg.dataloader_workers,
         prefetch_factor=cfg.dataloader_prefetch_factor,
+        camera_map=cfg.camera_map,
     )
 
     losses: list[float] = []

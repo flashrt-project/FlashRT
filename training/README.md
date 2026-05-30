@@ -230,18 +230,26 @@ tokenizer = PaligemmaTokenizer(
 
 # 5. Run the generic driver. Identical to the LIBERO call below;
 # the difference is just *what dataset class* you hand in.
-cfg = RecapTrainConfig(num_steps=1000, batch_size=4, lr=2.5e-5, acp_dropout=0.30)
+cfg = RecapTrainConfig(
+    num_steps=1000,
+    batch_size=4,
+    lr=2.5e-5,
+    acp_dropout=0.30,
+    camera_map=MY_CAMERA_MAP,
+)
 result = train_recap_policy(
     trainer, MyDataset(), tokenizer, my_obs_builder,
     config=cfg, output_dir="<your-run-output-dir>",
 )
 ```
 
-Pass your `MY_CAMERA_MAP` to
-`make_step_dataloader(..., camera_map=MY_CAMERA_MAP)` (or use the
-`frames_to_observation(..., camera_map=...)` argument directly if
-you skip the async loader). The default is `LIBERO_CAMERA_MAP`,
-which is what the LIBERO example below uses implicitly.
+Put your `MY_CAMERA_MAP` on `RecapTrainConfig.camera_map`; the
+generic driver forwards it to the async step loader before images
+reach your `observation_builder`. If you bypass the driver, pass the
+same map to `make_step_dataloader(..., camera_map=MY_CAMERA_MAP)` or
+`frames_to_observation(..., camera_map=...)` directly. The default is
+`LIBERO_CAMERA_MAP`, which is what the LIBERO example below uses
+implicitly.
 
 The driver matches the openpi JAX baseline's optimiser + LR
 schedule 1-for-1: AdamW (`weight_decay=1e-10`) + warmup-cosine
@@ -331,9 +339,9 @@ Any dataset satisfying
 generic [`train_recap_policy`](rl/train_recap.py) entry point;
 LIBERO is the first concrete implementation. For a dataset with
 the same parquet layout but a different camera / state schema,
-pass a custom ``camera_map`` to
-``training/rl/observation.py:frames_to_observation`` (default is
-``LIBERO_CAMERA_MAP``).
+pass a custom ``camera_map`` through ``RecapTrainConfig``. The async
+loader applies the map before the decoded pi0.5 camera slots reach
+the observation builder. The default is ``LIBERO_CAMERA_MAP``.
 
 ### Async data prep + ``torch.compile`` (production fast path)
 
