@@ -227,9 +227,63 @@ stays roughly flat, so the gap widens with the shared-prefix length a coding
 agent resends each turn. Validated token-exact in
 `tests/test_qwen36_agent_capsule.py`.
 
+### Honest framing vs vLLM / SGLang (prefix reuse is *not* our differentiator)
+
+Shared-prefix reuse itself is table stakes — vLLM and SGLang both have it, and
+vLLM's Automatic Prefix Caching even reuses this hybrid model's GDN/mamba state
+("Mamba cache mode = align"). Measured on the same checkpoint/GPU (vLLM 0.22,
+`enable_prefix_caching=True`, base, prefix + 24-token suffix), vLLM saves a
+comparable fraction of TTFT on a cached prefix:
+
+| shared prefix | vLLM cold | vLLM APC reuse | vLLM saved |
+| ---: | ---: | ---: | ---: |
+| 2048 | 481 ms | 143 ms | 70% |
+| 4096 | 549 ms | 76 ms | 86% |
+| 8192 | 1076 ms | 120 ms | 89% |
+
+So we do **not** claim a better prefix-reuse *mechanism*. What is actually
+different here:
+
+- **Lower absolute latency** from full-graph CUDA-graph replay + hand-tuned
+  NVFP4 kernels (the cold prefill above is ~1.4-1.9x faster than vLLM's; clean
+  same-method single-stream TTFT is ~1.5-1.9x and decode with MTP ~2x — see the
+  decode-kernel docs). The *reuse ratio* is comparable; the *floor* is lower.
+- **Capsule is an explicit, host-controlled, bit-exact primitive**
+  (`snapshot` / `restore` / `fork` / restore-to-an-earlier-checkpoint), not an
+  implicit block pool — it lets the host fork one prefill into N branches and
+  roll a session back to a committed boundary deterministically.
+- **One mechanism across LLM + VLA + robot** under the same execution contract
+  (vLLM/SGLang are LLM-only); the robot side uses the identical Buffer
+  snapshot/restore (`serving/robot_recap`, cosine 1.0).
+
+In short: for high-concurrency multi-tenant LLM serving, the paged/radix engines
+lead; FlashRT's target is latency-first single/few-session work on consumer/edge
+hardware, hybrid models, and cross-domain (LLM/VLA/robot) — where the lower
+latency floor + the bit-exact cross-domain capsule are the real edge, not prefix
+reuse per se.
+
 **Decode throughput is unchanged by either feature** (they touch prefill / TTFT
-only): warm steady-state ~138 tok/s on this path, matching the frontend's
-documented decode number; the serving policy adds no measurable decode overhead.
+only): warm steady-state matches the frontend's documented decode number; the
+serving policy adds no measurable decode overhead.
+
+**3. Warm decode is stable across task types** (real `/v1/chat/completions`,
+median of 3 warm runs, `--graph-cache-max` auto):
+
+| scenario | ctx | warm decode tok/s |
+| --- | ---: | ---: |
+| code (merge sort) | 20 | 159.0 |
+| reasoning (bat & ball) | 41 | 150.3 |
+| code (two-sum) | 26 | 138.2 |
+| math (word problem) | 38 | 128.9 |
+| chat (explain) | 23 | 119.8 |
+| long generation (512 tok) | 22 | 115.9 |
+| doc-QA / RAG | 3023 | 90.6 |
+
+Run-to-run variance < 2%. Decode tok/s varies with the task's speculative
+accept-length (predictable code/reasoning highest; long-context attention pulls
+the 3K-context RAG case down) — not with the serving path. These are warm
+numbers; the first request of a brand-new prompt length still pays one-time
+graph capture (see Cold start below).
 
 **Cold start.** The first request of a not-yet-seen prompt length / accept
 trajectory pays CUDA-graph capture for the decode / verify / MTP-chain graphs it
