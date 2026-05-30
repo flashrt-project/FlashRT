@@ -1072,6 +1072,20 @@ class Qwen36TorchFrontendRtx:
         # shapes). Default off keeps the captured graph byte-identical.
         self._decode_fastgemm = bool(int(os.environ.get(
             'FLASHRT_QWEN36_DECODE_FASTGEMM', '0') or '0'))
+        # Opt-in (requires DECODE_FASTGEMM): route the long-K / small-N decode
+        # GEMVs the single-warp S3 kernel underfills (mlp_down K=17408,
+        # out/o_proj K=6144) through the warp-split-K kernel (8 cols/block,
+        # `warps` warps each streaming K/warps, partials summed in SMEM). Fills
+        # the SMs -> base decode ~+11%. NB: a base-decode lever; on the
+        # verify-bound spec path it does not help, so leave off there.
+        self._decode_splitk_down = bool(int(os.environ.get(
+            'FLASHRT_QWEN36_DECODE_SPLITK_DOWN', '0') or '0'))
+        self._decode_warpsplit_out = bool(int(os.environ.get(
+            'FLASHRT_QWEN36_DECODE_WARPSPLIT_OUT', '0') or '0'))
+        self._splitk_down_split = int(os.environ.get(
+            'FLASHRT_QWEN36_SPLITK_DOWN_SPLIT', '4') or '4')
+        self._splitk_down_stages = int(os.environ.get(
+            'FLASHRT_QWEN36_SPLITK_DOWN_STAGES', '4') or '4')
 
         self._nvfp4_scratch: dict[tuple[int, int],
                                   tuple[torch.Tensor, ...]] = {}
@@ -1461,6 +1475,21 @@ class Qwen36TorchFrontendRtx:
             fvk.fp4_w4a16_gemm_sm120_bf16out(
                 A_packed, B_packed, D, 1, N, K, SFA, SFB, alpha, s)
 
+    def _gemv_ws(self, enable, ap, packed, out_t, N, K, sf, wsf, alpha, s):
+        """Long-K / small-N decode GEMV. When ``enable`` (and FASTGEMM): the
+        warp-split-K kernel (8 cols/block, `warps` warps each streaming
+        K/warps, partials summed in SMEM intra-block -> graph-safe; fills the
+        SMs the single-warp S3 kernel underfills). Else the default
+        _gemv_nvfp4 path. Used for mlp_down (K=17408) and out/o_proj (K=6144)."""
+        if self._decode_fastgemm and enable:
+            from flash_rt import flash_rt_kernels as fvk
+            fvk.fp4_w4a4_mma_sm120_warpsplit_bf16out(
+                ap, packed, out_t.data_ptr(), N, K, sf, wsf, alpha,
+                self._splitk_down_split, self._splitk_down_stages, s)
+        else:
+            self._gemv_nvfp4(ap, packed, out_t.data_ptr(), N, K, sf, wsf,
+                             alpha, s)
+
     def _layer_forward_lin_nvfp4(self, L: int, h_in):
         """Linear-attention layer forward, NVFP4 main + BF16 in_proj.
 
@@ -1599,13 +1628,12 @@ class Qwen36TorchFrontendRtx:
             sf_6144.data_ptr(), 1, 6144, s,
         )
         out_op_buf = self._nvfp4_scratch[(5120, 6144)][2]
-        self._gemv_nvfp4(
+        self._gemv_ws(
+            self._decode_warpsplit_out,
             ap_6144.data_ptr(), int(lw['out_proj_packed']),
-            out_op_buf.data_ptr(),
-            5120, 6144,
+            out_op_buf, 5120, 6144,
             sf_6144.data_ptr(), int(lw['out_proj_sf']),
-            float(lw['out_proj_alpha']),
-            s,
+            float(lw['out_proj_alpha']), s,
         )
 
         # 11) residual.
@@ -1671,13 +1699,12 @@ class Qwen36TorchFrontendRtx:
             sf_17408.data_ptr(), 1, 17408, s,
         )
         down_out_buf = self._nvfp4_scratch[(5120, 17408)][2]
-        self._gemv_nvfp4(
+        self._gemv_ws(
+            self._decode_splitk_down,
             ap_17408.data_ptr(), int(lw['mlp_down_packed']),
-            down_out_buf.data_ptr(),
-            5120, 17408,
+            down_out_buf, 5120, 17408,
             sf_17408.data_ptr(), int(lw['mlp_down_sf']),
-            float(lw['mlp_down_alpha']),
-            s,
+            float(lw['mlp_down_alpha']), s,
         )
         mlp_out = down_out_buf[:1].view(1, 1, 5120)
 
@@ -1820,13 +1847,12 @@ class Qwen36TorchFrontendRtx:
             sf_6144.data_ptr(), 1, 6144, s,
         )
         out_op_buf = self._nvfp4_scratch[(5120, 6144)][2]
-        self._gemv_nvfp4(
+        self._gemv_ws(
+            self._decode_warpsplit_out,
             ap_6144.data_ptr(), int(lw['o_proj_packed']),
-            out_op_buf.data_ptr(),
-            5120, 6144,
+            out_op_buf, 5120, 6144,
             sf_6144.data_ptr(), int(lw['o_proj_sf']),
-            float(lw['o_proj_alpha']),
-            s,
+            float(lw['o_proj_alpha']), s,
         )
 
         # 11) Residual.
@@ -1886,13 +1912,12 @@ class Qwen36TorchFrontendRtx:
             sf_dn.data_ptr(), 1, 17408, s,
         )
         down_out_buf = self._nvfp4_scratch[(5120, 17408)][2]
-        self._gemv_nvfp4(
+        self._gemv_ws(
+            self._decode_splitk_down,
             ap_dn.data_ptr(), int(lw['mlp_down_packed']),
-            down_out_buf.data_ptr(),
-            5120, 17408,
+            down_out_buf, 5120, 17408,
             sf_dn.data_ptr(), int(lw['mlp_down_sf']),
-            float(lw['mlp_down_alpha']),
-            s,
+            float(lw['mlp_down_alpha']), s,
         )
         mlp_out = down_out_buf[:1].view(1, 1, 5120)
 
