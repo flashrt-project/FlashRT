@@ -154,6 +154,7 @@ prompts rebuild until rollback/checkpoint support lands.
 | `--warmup-K` | `6` | speculative K used during warmup |
 | `--warmup-committed-max-prompt` | `1024` | run real committed-stream warmup up to this prompt length; larger long-context shapes use graph-only warmup |
 | `--warm-long-prefill-graphs` | off | also capture long-context prefill chunk graphs at startup |
+| `--capsule-budget-mb` | `0` | GPU byte budget (MB) for pinned shared-prefix capsules; `0` disables pinning. See [Capsule pinning](#capsule-pinning-shared-prefix-reuse-that-survives-eos). |
 | `--host` / `--port` | `127.0.0.1` / `8000` | bind address |
 | `--log-level` | `info` | uvicorn log level |
 | `--access-log` | off | enable uvicorn per-request access logs; off by default to avoid benchmark jitter |
@@ -178,6 +179,10 @@ FlashRT extensions:
 - `flashrt_cache_salt`: optional namespace separator for different prompt policies.
 - `flashrt_K`: speculative decode K for this request (default 6).
 - `enable_thinking`: passed to the Qwen chat template (default false).
+- `flashrt_pin_prefix`: pin this request's shared prefix as a capsule for reuse —
+  an integer (pin that many leading prompt tokens) or `true` (pin the whole
+  prompt's chunk-aligned head). Inert unless the server was started with
+  `--capsule-budget-mb > 0`. See [Capsule pinning](#capsule-pinning-shared-prefix-reuse-that-survives-eos).
 
 ## Response fields
 
@@ -192,7 +197,7 @@ response carries a `flashrt` telemetry block:
 | `prefill_ms` | prefill / append time |
 | `first_delta_ms` | time to first emitted delta (TTFT-like) |
 | `decode_ms`, `decode_tok_per_s` | decode time and throughput |
-| `prefix_action` | how the session was reused: `exact` / `append` / `message_append` / `truncate` / `rebuild` / `activate_rebuild` |
+| `prefix_action` | how the session was reused: `exact` / `append` / `message_append` / `restore` / `pin` / `truncate` / `rebuild` / `activate_rebuild` |
 
 ## Measured (RTX 5090, in-container)
 
@@ -216,6 +221,16 @@ Each turn prefills only the ~20 new tokens and reuses the growing cached prefix
 server without prefix reuse re-prefills the full prompt every turn (589 tokens on
 turn 4). This is the `append` / `message_append` path; correctness is gated
 token-exact by `tests/test_qwen36_agent_gpu_split.py`.
+
+> **Honest scope of contiguous append.** This flat-prefill table is measured on
+> turns capped by `max_tokens` (no stop token). A turn that ends on `<|im_end|>`
+> — the realistic agent case — commits the stop token plus spec lookahead into the
+> KV but not the visible journal, so the hot session is correctly invalidated and
+> the **next turn rebuilds**. Contiguous `append` / `message_append` therefore
+> only keeps prefill flat across non-EOS turns. For the realistic EOS-terminated
+> coding-agent loop, the reuse that survives is [capsule
+> pinning](#capsule-pinning-shared-prefix-reuse-that-survives-eos): a fresh turn
+> restores a clean committed boundary and re-prefills only the suffix.
 
 **2. Capsule restore replaces a shared-prefix cold prefill with a flat copy.**
 Snapshot a shared prefix once, then restore + append the new suffix instead of
@@ -348,6 +363,60 @@ If a client sends only the new message without the prior assistant turn, or a
 shorter/divergent prompt, the token stream has diverged and the server rebuilds
 or restores at a checkpoint boundary (it reports `rebuild`, never a fake hit).
 
+## Capsule pinning (shared-prefix reuse that survives EOS)
+
+A coding agent resends a large stable prefix every turn — system prompt, tool
+schemas, repo index/summary — then a small new user/tool suffix, and each turn
+ends on a stop token. Because an EOS-terminated turn invalidates contiguous append
+(above), the way to reuse that prefix is to **pin it as an execution-state
+capsule** and *restore* a clean committed boundary on every later turn/session,
+re-prefilling only the suffix. This is FlashRT's graph-replay-native prefix reuse
+(see [`capsules.md`](capsules.md) and [`../../docs/serving_design.md`](../../docs/serving_design.md)).
+
+Enable it at startup with a GPU byte budget, then pin per request:
+
+```bash
+python -m serving.qwen36_agent.server --checkpoint /path/to/qwen36_nvfp4 \
+  --max-seq 32768 --route-min-seq 0 --capsule-budget-mb 4096
+```
+
+```bash
+# First turn: pin the stable prefix (e.g. its first 6000 tokens). The server
+# cold-prefills + snapshots a chunk-aligned capsule, then serves normally.
+curl -s :8000/v1/chat/completions -d '{"model":"qwen36-27b",
+ "messages":[{"role":"system","content":"<system + tool schemas + repo index>"},
+             {"role":"user","content":"First task"}],
+ "flashrt_pin_prefix": 6000, "max_tokens": 256}'
+# -> flashrt.prefix_action == "pin"
+
+# Later turns / fresh sessions that share that prefix: restore + suffix only.
+curl -s :8000/v1/chat/completions -d '{"model":"qwen36-27b",
+ "messages":[{"role":"system","content":"<same system + tools + repo index>"},
+             {"role":"user","content":"Second task"}],
+ "flashrt_pin_prefix": 6000, "max_tokens": 256}'
+# -> flashrt.prefix_action == "restore", cached_tokens == the chunk-aligned
+#    boundary, new_prefill_tokens == only the suffix after it
+```
+
+Semantics and bounds:
+
+- `flashrt_pin_prefix` is an int (pin that many leading prompt tokens) or `true`
+  (pin the whole prompt's aligned head). The pin boundary is floored to the long
+  prefill chunk size (2048), so a prefix shorter than one chunk is not pinned.
+- A capsule is keyed by the digest of its chunk-aligned prefix tokens, so any
+  later request — same session or not — whose prompt starts with that exact prefix
+  restores it. Restore is **token-identical to a cold full prefill** (gated by
+  `tests/test_qwen36_agent_capsule_serving.py`); tool conversations benefit too,
+  because the stable system+tools head is pinned and only the changing suffix is
+  re-prefilled.
+- `--capsule-budget-mb` bounds GPU footprint. Capsules are LRU-evicted to fit and
+  a single capsule larger than the whole budget is rejected (the request is served
+  cold — never an OOM, never a false hit). Each capsule's KV grows with the pin
+  length (≈230 MB for a 4096-token aligned prefix here), and competes with the
+  model + KV cache for VRAM, so size the budget to the headroom you have.
+- `/health` reports `capsules` (count, bytes, budget). Default budget is `0`
+  (pinning off, serving path byte-identical).
+
 ## Validation
 
 Fast policy and HTTP checks:
@@ -366,5 +435,10 @@ validate real Qwen3.6 short/long split and long append equivalence:
 FLASHRT_QWEN36_NVFP4_CKPT_DIR=CHECKPOINT_DIR \
 FLASHRT_QWEN36_MTP_CKPT_DIR=MTP_CHECKPOINT_DIR \
 PYTHONPATH=. PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-pytest -q tests/test_qwen36_agent_gpu_split.py -s
+pytest -q tests/test_qwen36_agent_gpu_split.py \
+  tests/test_qwen36_agent_capsule.py \
+  tests/test_qwen36_agent_capsule_serving.py -s
 ```
+
+`test_qwen36_agent_capsule_serving.py` gates the serving-layer pin/restore policy:
+a restored pinned prefix produces the same tokens as a cold full prefill.

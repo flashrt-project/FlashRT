@@ -28,6 +28,7 @@ class PrefixPlan:
             "exact",
             "append",
             "truncate",
+            "restore",
         }
 
 
@@ -169,3 +170,78 @@ class SessionRegistry:
             if victim_id is None:
                 break
             self._sessions.pop(victim_id, None)
+
+
+@dataclass
+class CapsuleEntry:
+    """A pinned execution-state capsule plus the metadata to match and bound it.
+
+    ``capsule`` is the opaque frontend capsule object (from
+    ``snapshot_capsule``); the store never inspects it beyond ``nbytes``.
+    ``aligned_len`` is the chunk-aligned prefix length the capsule was snapshotted
+    at, so a restore appends from there.
+    """
+
+    key: str
+    aligned_len: int
+    nbytes: int
+    capsule: object
+
+
+class CapsuleStore:
+    """Serving-layer LRU of pinned shared-prefix capsules, bounded by a byte
+    budget.
+
+    Keyed by the token digest of the chunk-aligned shared prefix, so a capsule
+    pinned by one session can be restored by any later request (or session) whose
+    prompt starts with the same prefix. The budget bounds GPU footprint: pinning
+    evicts least-recently-used capsules to fit, and a single capsule larger than
+    the whole budget is rejected (the caller then serves a plain cold prefill —
+    never an OOM). ``budget_bytes <= 0`` disables pinning entirely, keeping the
+    default serving path byte-identical.
+    """
+
+    def __init__(self, *, budget_bytes: int = 0):
+        self.budget_bytes = max(0, int(budget_bytes))
+        self._entries: "OrderedDict[str, CapsuleEntry]" = OrderedDict()
+        self._bytes = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.budget_bytes > 0
+
+    def get(self, key: str) -> Optional[CapsuleEntry]:
+        entry = self._entries.get(key)
+        if entry is not None:
+            self._entries.move_to_end(key)
+        return entry
+
+    def pin(self, entry: CapsuleEntry) -> bool:
+        """Store ``entry``, evicting LRU capsules to stay within the byte budget.
+
+        Returns False (and stores nothing) when pinning is disabled or the single
+        capsule alone exceeds the budget; the caller has already served a cold
+        prefill, so a rejected pin just means no future restore.
+        """
+        if not self.enabled or entry.nbytes <= 0 or entry.nbytes > self.budget_bytes:
+            return False
+        existing = self._entries.pop(entry.key, None)
+        if existing is not None:
+            self._bytes -= existing.nbytes
+        while self._bytes + entry.nbytes > self.budget_bytes and self._entries:
+            _, victim = self._entries.popitem(last=False)
+            self._bytes -= victim.nbytes
+        self._entries[entry.key] = entry
+        self._bytes += entry.nbytes
+        return True
+
+    def footprint(self) -> int:
+        return self._bytes
+
+    def snapshot(self) -> Dict[str, object]:
+        return {
+            "enabled": self.enabled,
+            "count": len(self._entries),
+            "bytes": self._bytes,
+            "budget_bytes": self.budget_bytes,
+        }

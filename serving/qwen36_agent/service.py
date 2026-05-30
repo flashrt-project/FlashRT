@@ -18,7 +18,8 @@ from .openai_stream import (
     role_chunk,
     sse_data,
 )
-from .session import PrefixPlan, SessionRegistry
+from .prefix import token_digest
+from .session import CapsuleEntry, CapsuleStore, PrefixPlan, SessionRegistry
 from .tool_stream import StreamEvent, ToolCallStreamParser
 
 
@@ -32,6 +33,12 @@ class AgentRequest:
     cache_salt: str = ""
     enable_thinking: bool = False
     K: int = 6
+    # Pin the shared-prefix capsule: int = number of leading prompt tokens to pin
+    # as a reusable capsule; True = pin the whole current prompt's aligned head;
+    # None/0 = no pinning. Restore on a later request whose prompt starts with the
+    # same chunk-aligned prefix. Effective only when the service has a capsule
+    # budget and the prompt takes the long route.
+    pin_prefix: Optional[int] = None
 
 
 @dataclass
@@ -51,9 +58,15 @@ class AgentService:
     """Policy layer over a Qwen3.6 split prefill/decode engine."""
 
     def __init__(self, engine: AgentEngine, *,
-                 sessions: Optional[SessionRegistry] = None):
+                 sessions: Optional[SessionRegistry] = None,
+                 capsule_budget_bytes: int = 0):
         self.engine = engine
         self.sessions = sessions or SessionRegistry()
+        # Pinned shared-prefix capsules (off-by-default: budget 0 keeps the
+        # serving path byte-identical). A pinned capsule lets a fresh turn/session
+        # restore a clean committed boundary instead of cold-prefilling the shared
+        # prefix — the reuse path that survives EOS, unlike contiguous append.
+        self.capsules = CapsuleStore(budget_bytes=capsule_budget_bytes)
         # The backend is a single hot GPU frontend with mutable KV / linear /
         # session state. Serialize whole requests so concurrent HTTP calls cannot
         # interleave prefill/decode and corrupt that state. A non-streaming call
@@ -112,6 +125,64 @@ class AgentService:
             )
         return effective_cached, plan
 
+    def _capsule_prefill(
+            self, req: AgentRequest, prompt_tokens: List[int], session
+    ) -> Optional[PrefixPlan]:
+        """Restore-or-pin a shared-prefix capsule when ``pin_prefix`` is requested
+        and viable, performing the prefill on the engine and returning its
+        PrefixPlan. Returns None (caller uses the normal hot-append / rebuild path)
+        when pinning is disabled, unsupported, or the prefix is too short to pin.
+
+        A pinned capsule is keyed by the digest of its chunk-aligned prefix tokens,
+        so a later turn or a different session whose prompt starts with the same
+        prefix restores a clean committed boundary instead of cold-prefilling it.
+        Unlike contiguous append, this survives an EOS-terminated previous turn.
+        On a budget-rejected pin the request is already served cold; only a future
+        restore is lost (never an OOM, never a false hit — the restore key is an
+        exact aligned-prefix digest match).
+        """
+        pin = req.pin_prefix
+        if not pin or not self.capsules.enabled:
+            return None
+        supports = getattr(self.engine, "supports_capsule", None)
+        if not callable(supports) or not supports():
+            return None
+        prompt_len = len(prompt_tokens)
+        pin_len = prompt_len if pin is True else min(int(pin), prompt_len)
+        if pin_len <= 0:
+            return None
+        aligned = self.engine.capsule_aligned_len(pin_len, req.max_tokens)
+        if aligned <= 0 or aligned > prompt_len:
+            return None
+        key = token_digest(prompt_tokens[:aligned], salt=req.cache_salt)
+        entry = self.capsules.get(key)
+        if entry is not None:
+            self.engine.prefill_from_capsule(
+                entry.capsule, prompt_tokens,
+                max_tokens=req.max_tokens, K=req.K)
+            return PrefixPlan(
+                session_id=session.session_id,
+                cached_tokens=aligned,
+                new_prefill_tokens=max(0, prompt_len - aligned),
+                incoming_tokens=prompt_len,
+                matched_tokens=aligned,
+                action="restore",
+            )
+        cap = self.engine.prefill_and_pin(
+            prompt_tokens, aligned_len=aligned,
+            max_tokens=req.max_tokens, K=req.K)
+        nbytes = int(cap.get("nbytes", 0)) if isinstance(cap, dict) else 0
+        pinned = self.capsules.pin(CapsuleEntry(
+            key=key, aligned_len=aligned, nbytes=nbytes, capsule=cap))
+        return PrefixPlan(
+            session_id=session.session_id,
+            cached_tokens=0,
+            new_prefill_tokens=prompt_len,
+            incoming_tokens=prompt_len,
+            matched_tokens=0,
+            action="pin" if pinned else "rebuild",
+        )
+
     def _message_append_prompt_tokens(
             self, session, req: AgentRequest, plan: PrefixPlan
     ) -> tuple[Optional[List[int]], Optional[PrefixPlan]]:
@@ -168,24 +239,27 @@ class AgentService:
             cache_salt=req.cache_salt,
         )
 
-        engine_prompt_tokens = prompt_tokens
-        msg_prompt, msg_plan = self._message_append_prompt_tokens(
-            session, req, plan)
-        if msg_prompt is not None and msg_plan is not None:
-            engine_prompt_tokens = msg_prompt
-            plan = msg_plan
-            effective_cached = plan.cached_tokens
-        else:
-            effective_cached, plan = self._effective_plan(session, plan)
-
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        engine_prompt_tokens = prompt_tokens
         t0 = time.perf_counter()
-        self.engine.prefill(
-            engine_prompt_tokens,
-            cached_tokens=effective_cached,
-            max_tokens=req.max_tokens,
-            K=req.K,
-        )
+        cap_plan = self._capsule_prefill(req, prompt_tokens, session)
+        if cap_plan is not None:
+            plan = cap_plan
+        else:
+            msg_prompt, msg_plan = self._message_append_prompt_tokens(
+                session, req, plan)
+            if msg_prompt is not None and msg_plan is not None:
+                engine_prompt_tokens = msg_prompt
+                plan = msg_plan
+                effective_cached = plan.cached_tokens
+            else:
+                effective_cached, plan = self._effective_plan(session, plan)
+            self.engine.prefill(
+                engine_prompt_tokens,
+                cached_tokens=effective_cached,
+                max_tokens=req.max_tokens,
+                K=req.K,
+            )
         t_prefill = time.perf_counter()
 
         parser = ToolCallStreamParser()
@@ -281,22 +355,26 @@ class AgentService:
             prompt_tokens,
             cache_salt=req.cache_salt,
         )
-        engine_prompt_tokens = prompt_tokens
-        msg_prompt, msg_plan = self._message_append_prompt_tokens(
-            session, req, plan)
-        if msg_prompt is not None and msg_plan is not None:
-            engine_prompt_tokens = msg_prompt
-            effective_cached = msg_plan.cached_tokens
-        else:
-            effective_cached, _ = self._effective_plan(session, plan)
-
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
-        self.engine.prefill(
-            engine_prompt_tokens,
-            cached_tokens=effective_cached,
-            max_tokens=req.max_tokens,
-            K=req.K,
-        )
+        engine_prompt_tokens = prompt_tokens
+        cap_plan = self._capsule_prefill(req, prompt_tokens, session)
+        if cap_plan is not None:
+            plan = cap_plan
+        else:
+            msg_prompt, msg_plan = self._message_append_prompt_tokens(
+                session, req, plan)
+            if msg_prompt is not None and msg_plan is not None:
+                engine_prompt_tokens = msg_prompt
+                plan = msg_plan
+                effective_cached = msg_plan.cached_tokens
+            else:
+                effective_cached, plan = self._effective_plan(session, plan)
+            self.engine.prefill(
+                engine_prompt_tokens,
+                cached_tokens=effective_cached,
+                max_tokens=req.max_tokens,
+                K=req.K,
+            )
 
         parser = ToolCallStreamParser()
         generated_ids: List[int] = []
@@ -406,6 +484,24 @@ def parse_int(value: Any, *, name: str, default: int) -> int:
         raise ValueError(f"{name} must be an integer, got {value!r}")
 
 
+def parse_pin_prefix(value: Any) -> Optional[int]:
+    """Parse ``flashrt_pin_prefix``: a positive int (pin that many leading prompt
+    tokens), ``true`` (pin the whole current prompt's aligned head), or
+    absent/false/0/null (no pinning)."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return True if value else None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"flashrt_pin_prefix must be an integer or boolean, got {value!r}")
+    return n if n > 0 else None
+
+
 def request_from_openai(req: Dict[str, Any], *, default_k: int = 6) -> AgentRequest:
     messages = validate_messages(req.get("messages"))
     tools = validate_tools(req.get("tools"))
@@ -429,6 +525,7 @@ def request_from_openai(req: Dict[str, Any], *, default_k: int = 6) -> AgentRequ
         cache_salt=str(req.get("flashrt_cache_salt", "")),
         enable_thinking=parse_bool(req.get("enable_thinking"), default=False),
         K=K,
+        pin_prefix=parse_pin_prefix(req.get("flashrt_pin_prefix")),
     )
 
 

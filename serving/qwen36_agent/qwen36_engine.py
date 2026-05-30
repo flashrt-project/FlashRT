@@ -189,6 +189,80 @@ class Qwen36FrontendAgentEngine:
         self._last_prompt_tokens = prompt_len
         self._last_prefill_ms = (time.perf_counter() - t0) * 1000.0
 
+    def _to_input_ids(self, token_ids: Sequence[int]):
+        import torch
+
+        return torch.tensor(
+            [[int(t) for t in token_ids]],
+            device=getattr(self.fe, "device", "cuda"),
+            dtype=torch.long,
+        )
+
+    def _uses_long_route(self, prompt_len: int, max_tokens: int) -> bool:
+        return bool(
+            getattr(self.fe, "_long_ctx_mode", False)
+            and hasattr(self.fe, "_should_use_long_ctx_route")
+            and self.fe._should_use_long_ctx_route(int(prompt_len), int(max_tokens))
+        )
+
+    def supports_capsule(self) -> bool:
+        """True if the frontend exposes the capsule snapshot/restore API."""
+        return (
+            hasattr(self.fe, "snapshot_capsule")
+            and hasattr(self.fe, "restore_capsule")
+            and hasattr(self.fe, "capsule_aligned_len")
+        )
+
+    def capsule_aligned_len(self, prompt_len: int, max_tokens: int) -> int:
+        """Chunk-aligned boundary to pin a shared prefix at for this prompt's
+        route, or 0 if it cannot be pinned (short route, or shorter than one
+        prefill chunk). Snapshotting at this boundary makes restore + append
+        token-identical to a cold full prefill (see the frontend capsule API)."""
+        if not self.supports_capsule():
+            return 0
+        if not self._uses_long_route(prompt_len, max_tokens):
+            return 0
+        return int(self.fe.capsule_aligned_len(int(prompt_len)))
+
+    def prefill_and_pin(self, token_ids: Sequence[int], *, aligned_len: int,
+                        max_tokens: int = 1, K: int = 6):
+        """Cold-prefill the chunk-aligned head, snapshot it into a capsule, then
+        append the remainder so the stream is ready to decode. Returns the opaque
+        capsule. Long route only (``aligned_len`` > 0 comes from
+        ``capsule_aligned_len``)."""
+        if aligned_len <= 0:
+            raise ValueError("aligned_len must be > 0 to pin a capsule")
+        ids = self._to_input_ids(token_ids)
+        prompt_len = int(ids.shape[1])
+        if aligned_len > prompt_len:
+            raise ValueError("aligned_len exceeds prompt length")
+        self.fe.prefill_long_ctx_nvfp4_agent(
+            ids[:, :aligned_len], max_new_tokens=int(max_tokens), K=int(K))
+        cap = self.fe.snapshot_capsule()
+        if prompt_len > aligned_len:
+            self.fe.append_long_ctx_nvfp4_agent(
+                ids, start_pos=int(aligned_len),
+                max_new_tokens=int(max_tokens), K=int(K))
+        self._last_route = "long"
+        self._last_prompt_tokens = prompt_len
+        return cap
+
+    def prefill_from_capsule(self, capsule, token_ids: Sequence[int], *,
+                             max_tokens: int = 1, K: int = 6) -> None:
+        """Restore a pinned capsule and append the remainder of ``token_ids`` after
+        the snapshot boundary, leaving the stream ready to decode. Token-identical
+        to a cold full prefill of ``token_ids`` (capsule correctness contract)."""
+        aligned = int(capsule["cur_pos"])
+        ids = self._to_input_ids(token_ids)
+        prompt_len = int(ids.shape[1])
+        self.fe.restore_capsule(capsule)
+        if prompt_len > aligned:
+            self.fe.append_long_ctx_nvfp4_agent(
+                ids, start_pos=aligned,
+                max_new_tokens=int(max_tokens), K=int(K))
+        self._last_route = "long"
+        self._last_prompt_tokens = prompt_len
+
     def generate_stream(self, *, max_tokens: int,
                         K: int) -> Iterable[DecodeChunk]:
         if self._last_route == "long":

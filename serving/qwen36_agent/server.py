@@ -53,6 +53,7 @@ def build_app(service: AgentService):
             "speculative": bool(getattr(engine, "spec_enabled", False)),
             "decode_fastgemm": bool(getattr(fe, "_decode_fastgemm", False)),
             "verify_warpsplit": bool(getattr(fe, "_verify_warpsplit", False)),
+            "capsules": service.capsules.snapshot(),
             "sessions": service.sessions.snapshot(),
         }
 
@@ -117,7 +118,8 @@ def create_app_from_checkpoint(*, checkpoint: str,
                                warmup_shapes=None,
                                warmup_k: int = 6,
                                warmup_committed_max_prompt: int = 1024,
-                               warm_long_prefill_graphs: bool = False):
+                               warm_long_prefill_graphs: bool = False,
+                               capsule_budget_bytes: int = 0):
     if graph_cache_max is None:
         graph_cache_max = _auto_graph_cache_max(max_seq)
     engine = Qwen36FrontendAgentEngine.from_checkpoint(
@@ -149,7 +151,11 @@ def create_app_from_checkpoint(*, checkpoint: str,
         )
         for item in warmed:
             log.info("startup warmup result: %s", item)
-    return build_app(AgentService(engine))
+    if capsule_budget_bytes > 0:
+        log.info("capsule pinning enabled, budget %.0f MB",
+                 capsule_budget_bytes / (1 << 20))
+    return build_app(AgentService(
+        engine, capsule_budget_bytes=capsule_budget_bytes))
 
 
 def _parse_warmup_shapes(spec_csv: str) -> list[tuple[int, int]]:
@@ -251,6 +257,15 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--warm-long-prefill-graphs", action="store_true",
         help="Also capture long-context prefill chunk graphs at startup.")
+    parser.add_argument(
+        "--capsule-budget-mb", type=int, default=0,
+        help="GPU byte budget (MB) for pinned shared-prefix capsules. 0 (default) "
+             "disables pinning. When >0, a request with flashrt_pin_prefix pins "
+             "its chunk-aligned shared prefix so later turns/sessions restore a "
+             "clean committed boundary instead of cold-prefilling it (survives "
+             "EOS, unlike contiguous append). Needs VRAM headroom beyond the "
+             "model + KV; capsules are LRU-evicted to fit and an over-budget pin "
+             "is rejected, not OOM.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--log-level", default="info")
@@ -280,6 +295,7 @@ def main(argv: list[str] | None = None) -> None:
         warmup_k=args.warmup_K,
         warmup_committed_max_prompt=args.warmup_committed_max_prompt,
         warm_long_prefill_graphs=args.warm_long_prefill_graphs,
+        capsule_budget_bytes=int(args.capsule_budget_mb) * (1 << 20),
     )
     uvicorn.run(app, host=args.host, port=args.port,
                 log_level=args.log_level, access_log=args.access_log)
