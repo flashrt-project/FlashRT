@@ -8730,7 +8730,20 @@ class Qwen36TorchFrontendRtx:
             return 512
         return 2048
 
-    def _prefill_long_ctx_tq_chunked(self, input_ids):
+    def _long_mtp_max_retain(self) -> int:
+        """Max hidden-tail rows any future turn of a growing session could need
+        for the MTP rebuild. ``_long_mtp_prefill_tail_for_prompt`` is a step
+        function of prompt_len (it jumps 128->512->2048 as the conversation
+        grows across turns); a chained agent append must retain enough hidden to
+        cover the largest bracket it may later land in, not just the current
+        one. Returns the env override if set, else the step function's max."""
+        raw = os.environ.get(
+            'FLASHRT_QWEN36_LONG_MTP_PREFILL_TAIL', 'auto') or 'auto'
+        if raw.lower() != 'auto':
+            return max(0, int(raw))
+        return 2048
+
+    def _prefill_long_ctx_tq_chunked(self, input_ids, *, retain_rows: int = 0):
         """Chunked prompt prefill for long-context TQ mode.
 
         Reuses the S=K TQ verify forward to process prompt tokens in
@@ -8750,8 +8763,15 @@ class Qwen36TorchFrontendRtx:
             'FLASHRT_QWEN36_TQ_PREFILL_CHUNK', str(self.MAX_Q_SEQ)))
         mtp_tail = self._long_mtp_prefill_tail_for_prompt(prompt_len)
         self._long_mtp_prefill_tail_effective = mtp_tail
-        hidden_save_start = max(0, prompt_len - mtp_tail - 1)
-        if mtp_tail > 0:
+        # ``retain`` rows of hidden are saved for the MTP rebuild. The MTP
+        # prefill WORK below still uses only ``mtp_tail`` rows; ``retain_rows``
+        # (agent path) just keeps EXTRA earlier rows so a later chained append
+        # whose prompt grew into a larger mtp_tail bracket is still covered.
+        # retain_rows defaults to 0 -> retain == mtp_tail -> byte-identical to
+        # the stateless path.
+        retain = max(mtp_tail, max(0, int(retain_rows)))
+        hidden_save_start = max(0, prompt_len - retain - 1)
+        if retain > 0:
             tail_rows = prompt_len - hidden_save_start
             if (not hasattr(self, '_long_mtp_h_tail')
                     or int(self._long_mtp_h_tail.shape[0]) < tail_rows):
@@ -8787,7 +8807,7 @@ class Qwen36TorchFrontendRtx:
             cos_S = self._rope_cos_table[start:end].view(1, S, d)
             sin_S = self._rope_sin_table[start:end].view(1, S, d)
             is_last = end == prompt_len
-            save_hidden = mtp_tail > 0 and end > hidden_save_start
+            save_hidden = retain > 0 and end > hidden_save_start
             if save_hidden:
                 mode = 'hidden_last' if is_last else 'hidden'
             else:
@@ -8939,6 +8959,7 @@ class Qwen36TorchFrontendRtx:
         cur_rows += rows
 
         keep = max(
+            int(getattr(self, '_long_mtp_h_tail_retain_rows', 0)) + 8,
             int(getattr(self, '_long_mtp_prefill_tail_effective', 0)) + 8,
             int(getattr(self, '_agent_stream_K', 0)) + 8,
             16,
@@ -8989,6 +9010,11 @@ class Qwen36TorchFrontendRtx:
 
         self._ensure_long_mtp_cache_capacity(prompt_len, max_new_tokens, K)
         hidden = self._cfg['hidden_size']
+        # Agent committed boundary: retain enough hidden tail to cover the
+        # largest MTP-rebuild bracket a later chained append may grow into
+        # (see _long_mtp_max_retain). Keeps chained multi-turn append on the
+        # fast path across the 128->512->2048 mtp_tail step thresholds.
+        self._long_mtp_h_tail_retain_rows = self._long_mtp_max_retain()
         self.reset_state()
         self.reset_mtp_state()
         if not hasattr(self, '_rope_cos_table'):
@@ -9015,7 +9041,8 @@ class Qwen36TorchFrontendRtx:
             ev_pf0 = torch.cuda.Event(enable_timing=True)
             ev_pf1 = torch.cuda.Event(enable_timing=True)
             ev_pf0.record()
-            last_h, last_logits = self._prefill_long_ctx_tq_chunked(input_ids)
+            last_h, last_logits = self._prefill_long_ctx_tq_chunked(
+                input_ids, retain_rows=self._long_mtp_h_tail_retain_rows)
             if use_kernel_accept:
                 if use_partitioned_accept:
                     fvk.qwen36_spec_accept_partitioned_bf16(
@@ -9415,6 +9442,9 @@ class Qwen36TorchFrontendRtx:
                 f'({max_new_tokens}) = {max_pos} exceeds the '
                 f'frontend max_seq ({self._user_max_seq})')
         self._ensure_long_mtp_cache_capacity(prompt_len, max_new_tokens, K)
+        # Keep the rolling hidden tail large enough for the largest MTP-rebuild
+        # bracket this growing session may land in (matches the agent prefill).
+        self._long_mtp_h_tail_retain_rows = self._long_mtp_max_retain()
         if not hasattr(self, '_rope_cos_table'):
             self._build_rope_table()
 
@@ -9550,8 +9580,14 @@ class Qwen36TorchFrontendRtx:
             tail_rows = int(getattr(self, '_agent_long_h_tail_rows', 0))
             need_start = first - 1
             if tail_start > need_start or tail_start + tail_rows < prompt_len:
-                raise RuntimeError(
-                    'long append hidden tail does not cover MTP rebuild')
+                # Safety net: the retained hidden tail cannot cover the MTP
+                # rebuild range (should not happen now that prefill/append
+                # retain _long_mtp_max_retain rows, but stays robust against
+                # any future bracket/edge case). Fall back to a cold full
+                # prefill of the whole prompt — token-identical, just without
+                # the append speedup on this turn.
+                return self.prefill_long_ctx_nvfp4_agent(
+                    input_ids, max_new_tokens=max_new_tokens, K=K)
 
             self.reset_mtp_state()
             mtp_base = 0
