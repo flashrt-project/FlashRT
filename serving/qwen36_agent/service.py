@@ -409,9 +409,14 @@ def parse_int(value: Any, *, name: str, default: int) -> int:
 def request_from_openai(req: Dict[str, Any], *, default_k: int = 6) -> AgentRequest:
     messages = validate_messages(req.get("messages"))
     tools = validate_tools(req.get("tools"))
-    max_tokens = parse_int(
-        req.get("max_tokens", req.get("max_completion_tokens")),
-        name="max_tokens", default=256)
+    # Fall back to max_completion_tokens only when max_tokens is absent *or*
+    # explicitly null: dict.get("max_tokens", fallback) returns None (not the
+    # fallback) when the key is present with a null value, which would drop a
+    # caller's max_completion_tokens.
+    raw_max_tokens = req.get("max_tokens")
+    if raw_max_tokens is None:
+        raw_max_tokens = req.get("max_completion_tokens")
+    max_tokens = parse_int(raw_max_tokens, name="max_tokens", default=256)
     if max_tokens < 1:
         raise ValueError("max_tokens must be >= 1")
     K = parse_int(req.get("flashrt_K"), name="flashrt_K", default=default_k)

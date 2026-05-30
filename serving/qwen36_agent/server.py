@@ -41,15 +41,18 @@ def build_app(service: AgentService):
 
     @app.get("/health")
     async def health():
+        # spec_enabled / fe are Qwen36-specific, not part of the AgentEngine
+        # protocol; guard them so a minimal/fake engine (tests, dev) reports
+        # health instead of 500.
+        engine = service.engine
+        fe = getattr(engine, "fe", None)
         return {
             "status": "ok",
-            "model": service.engine.model_name,
-            "max_seq": service.engine.max_seq,
-            "speculative": service.engine.spec_enabled,
-            "decode_fastgemm": bool(getattr(
-                service.engine.fe, "_decode_fastgemm", False)),
-            "verify_warpsplit": bool(getattr(
-                service.engine.fe, "_verify_warpsplit", False)),
+            "model": engine.model_name,
+            "max_seq": engine.max_seq,
+            "speculative": bool(getattr(engine, "spec_enabled", False)),
+            "decode_fastgemm": bool(getattr(fe, "_decode_fastgemm", False)),
+            "verify_warpsplit": bool(getattr(fe, "_verify_warpsplit", False)),
             "sessions": service.sessions.snapshot(),
         }
 
