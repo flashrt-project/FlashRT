@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
+
+log = logging.getLogger("qwen36_agent")
 
 from .engine import AgentEngine, GenerationStats
 from .openai_stream import (
@@ -242,6 +245,15 @@ class AgentService:
             "completion_tokens": completion_tokens,
             "total_tokens": len(prompt_tokens) + completion_tokens,
         }
+        log.info(
+            "complete sid=%s action=%s prompt=%d cached=%d new_prefill=%d "
+            "completion=%d prefill_ms=%.1f first_delta_ms=%.1f decode_ms=%.1f "
+            "decode_tok/s=%.1f",
+            session.session_id, plan.action, len(prompt_tokens),
+            stats.cached_tokens, stats.new_prefill_tokens, completion_tokens,
+            stats.prefill_ms, stats.first_delta_ms, stats.decode_ms,
+            stats.decode_tok_per_s,
+        )
         return AgentResult(
             completion_id=completion_id,
             session_id=session.session_id,
@@ -322,6 +334,11 @@ class AgentService:
             "completion_tokens": len(generated_ids),
             "total_tokens": len(prompt_tokens) + len(generated_ids),
         }
+        log.info(
+            "stream sid=%s action=%s prompt=%d completion=%d",
+            session.session_id, plan.action, len(prompt_tokens),
+            len(generated_ids),
+        )
         yield sse_data(done_chunk(
             completion_id,
             model,
@@ -373,13 +390,31 @@ def parse_bool(value: Any, *, default: bool = False) -> bool:
     raise ValueError("expected boolean")
 
 
+def parse_int(value: Any, *, name: str, default: int) -> int:
+    """Coerce an OpenAI request field to int, raising ValueError (which the HTTP
+    layer maps to 400) rather than TypeError (which would surface as a 500) on a
+    null / non-numeric value."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer, got a boolean")
+    if isinstance(value, int):
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+
+
 def request_from_openai(req: Dict[str, Any], *, default_k: int = 6) -> AgentRequest:
     messages = validate_messages(req.get("messages"))
     tools = validate_tools(req.get("tools"))
-    max_tokens = int(req.get(
-        "max_tokens", req.get("max_completion_tokens", 256)))
+    max_tokens = parse_int(
+        req.get("max_tokens", req.get("max_completion_tokens")),
+        name="max_tokens", default=256)
     if max_tokens < 1:
         raise ValueError("max_tokens must be >= 1")
+    K = parse_int(req.get("flashrt_K"), name="flashrt_K", default=default_k)
     return AgentRequest(
         messages=messages,
         tools=tools,
@@ -388,7 +423,7 @@ def request_from_openai(req: Dict[str, Any], *, default_k: int = 6) -> AgentRequ
         session_id=req.get("flashrt_session_id") or req.get("session_id"),
         cache_salt=str(req.get("flashrt_cache_salt", "")),
         enable_thinking=parse_bool(req.get("enable_thinking"), default=False),
-        K=int(req.get("flashrt_K", default_k)),
+        K=K,
     )
 
 

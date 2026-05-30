@@ -6,11 +6,14 @@ The HTTP layer is intentionally thin: all cache and streaming policy lives in
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any, Dict
 
 from .qwen36_engine import Qwen36FrontendAgentEngine
 from .service import AgentService, request_from_openai, result_to_openai
+
+log = logging.getLogger("qwen36_agent")
 
 SSE_HEADERS = {
     "Cache-Control": "no-cache, no-transform",
@@ -42,6 +45,7 @@ def build_app(service: AgentService):
             "status": "ok",
             "model": service.engine.model_name,
             "max_seq": service.engine.max_seq,
+            "speculative": service.engine.spec_enabled,
             "sessions": service.sessions.snapshot(),
         }
 
@@ -117,6 +121,15 @@ def create_app_from_checkpoint(*, checkpoint: str,
         route_min_seq=route_min_seq,
         graph_cache_max=graph_cache_max,
     )
+    if not engine.spec_enabled:
+        log.warning(
+            "MTP head not loaded — speculative decode is DISABLED; decode "
+            "runs the slower non-spec path. Set FLASHRT_QWEN36_MTP_CKPT_DIR to "
+            "a paired MTP checkpoint to enable it (/health reports "
+            "\"speculative\": false).")
+    else:
+        log.info("MTP head loaded; speculative decode enabled (default K=%d)",
+                 warmup_k)
     if warmup_shapes:
         engine.warmup_committed_stream(
             warmup_shapes,
@@ -230,7 +243,16 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--log-level", default="info")
+    parser.add_argument(
+        "--access-log", dest="access_log", action="store_true", default=False,
+        help="Enable uvicorn per-request access logging. Off by default: the "
+             "per-request access line adds wall-time jitter and the serving "
+             "layer already logs one structured metric line per completion.")
     args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     warmup_shapes = _dedupe_shapes(
         _warmup_preset_shapes(args.warmup_preset, args.max_seq)
@@ -249,7 +271,7 @@ def main(argv: list[str] | None = None) -> None:
         warm_long_prefill_graphs=args.warm_long_prefill_graphs,
     )
     uvicorn.run(app, host=args.host, port=args.port,
-                log_level=args.log_level)
+                log_level=args.log_level, access_log=args.access_log)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,15 @@ class Qwen36FrontendAgentEngine:
         self._last_route = "unknown"
         self._last_enable_thinking = False
 
+    @property
+    def spec_enabled(self) -> bool:
+        """True if the MTP head is loaded (speculative decode available). When
+        False the committed-stream path has no draft chain and decode runs the
+        slower non-spec fallback — set FLASHRT_QWEN36_MTP_CKPT_DIR to enable."""
+        weights = getattr(self.fe, "_weights", None)
+        ptrs = getattr(weights, "ptrs", None) if weights is not None else None
+        return bool(ptrs and ptrs.get("mtp") is not None)
+
     @classmethod
     def from_checkpoint(
             cls, checkpoint: str, *, device: str = "cuda",
