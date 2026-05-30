@@ -64,6 +64,21 @@ taste):
    accept boundary, and prefix reuse on hybrid state is snapshot/restore, never
    block gather.
 
+### Measured finding (2026-05-30): contiguous append does not survive EOS
+
+A turn that ends on a stop token (the realistic agent case — every answer / tool
+call ends with `<|im_end|>`) commits the stop token + any spec-verified lookahead
+into the GPU KV but **not** into the visible journal, so the KV leads the journal
+and `_mark_reusable` correctly invalidates the hot session
+(`hot_session_id = None`). Verified end-to-end: a 3-turn session of EOS-terminated
+turns reports `append(cold) → rebuild → rebuild`, full re-prefill each turn, never
+hot. Contiguous append only stays hot for turns capped by `max_tokens` (no EOS),
+which is **not** the agent workload. Consequence: **the coding-agent flat-prefill
+win comes from capsule restore (a clean committed boundary), not contiguous
+append.** This reorders the stages below (B before A) and means the
+`serving_design.md` §7 "prefix reuse keeps prefill flat" table was measured on
+`max_tokens`-capped turns; the serving README should say so to stay honest.
+
 ---
 
 ## 2. The five seams (the heart of this design)
@@ -191,13 +206,14 @@ Emitted as the existing one-line log and an aggregate on `/health` (optionally a
 
 | gap | what it is | seam(s) that make it safe | stage |
 | --- | --- | --- | --- |
-| A | tool-call turn prefix reuse: suffix tokenizer bails on `tools`; tool-call render round-trip is not token-exact-verified | Seam 3 | 1 (correctness) |
-| B | capsule not wired into the server (pin/restore policy, VRAM budget) | Seam 3 + Seam 4 | 3 |
+| **B** | capsule not wired into the server (pin/restore policy, VRAM budget). The frontend capsule API is shipped + bit-exact (`test_qwen36_agent_capsule.py`). **This is the actual coding-agent reuse lever** (survives EOS; see the measured finding). | Seam 3 + Seam 4 | **1 (first feature)** |
 | C | clean cancellation + KV-never-leads-transcript on abort | Seam 1 + Seam 2 | 1 (correctness) |
+| F | resource limits / reject-before-OOM (capsule budget needed by B) | Seam 4 | 1–2 |
+| G | observability (queued/tokenize/capture/spec) | Seam 2 + Seam 5 | 2 |
+| (thin worker) | move GPU work off the event loop; admission | Seam 1 + Seam 2 | 2 |
+| A | tool-call turn contiguous append. **Demoted to optional**: EOS invalidates the hot session before it matters, so it only helps `max_tokens`-capped turns; the frontend append is fine, the gap is serving-layer suffix extraction with a safe rebuild fallback. | Seam 3 | optional |
 | D | long-horizon resume: capsule → host RAM / disk | Seam 3 + the one exec addition (§6) | deferred, interface reserved |
 | E | branch / undo as agent ops (fork / time-travel) | Seam 3 | deferred, interface reserved |
-| F | resource limits / reject-before-OOM | Seam 4 | 2 |
-| G | observability (queued/tokenize/capture/spec) | Seam 2 + Seam 5 | 2 |
 
 ---
 
@@ -222,18 +238,26 @@ Emitted as the existing one-line log and an aggregate on `/health` (optionally a
 Correctness first; the user-visible levers next; heavy work deferred but its
 interface reserved. Each stage has its own acceptance gate.
 
-- **Stage 1 — correctness, no new surface (gaps A, C).** Fix the tool-call
-  suffix/round-trip (A); make cancel a first-class lifecycle transition reusing the
-  existing invalidation guard (C). Gate: §4 A + C token-exact; default unchanged.
+Reordered after the EOS finding: capsule (B) is the coding-agent lever and goes
+first; the tool-call contiguous-append (A) is demoted to optional.
+
+- **Stage 1 — capsule in the server + the correctness it needs (gaps B, C, and the
+  F budget B depends on).** Wire the shipped frontend capsule API into the policy
+  layer: a `CapsuleStore` (pin + small LRU + a byte budget so an over-budget pin is
+  rejected, not OOM), a `restore` `PrefixPlan` action, and the `flashrt_pin_prefix`
+  request field; snapshot at a chunk-aligned boundary (`capsule_aligned_len`) for
+  the long route. Make cancel/abort a first-class transition reusing the existing
+  invalidation guard (C). Gate: pinned-prefix `restore + append(suffix) + decode`
+  is **token-exact vs a cold full prefill** of the same prompt (the
+  `test_qwen36_agent_capsule.py` contract, now at the server level); over-budget
+  pin rejected; abort leaves no hot session; default path byte-identical.
 - **Stage 2 — thin worker + admission + metrics (Seams 1, 2, 4, 5; gaps F, G).**
   Move GPU work onto one worker thread; HTTP enqueues; bounded queue + admission
   (reject, not crash); lifecycle FSM + metrics. Gate: `/health` responsive during a
   long decode; queue-full → 429; metric record complete; single-stream latency
-  unchanged (the worker adds no measurable overhead).
-- **Stage 3 — capsule in the server (Seam 3; gap B).** `CapsuleStore` + `restore`
-  `PrefixPlan` action + pin API + VRAM/RAM budget (Seam 4). Gate: pinned-prefix
-  restore is token-exact and shows the serving_design §7 TTFT win on a fresh
-  session; over-budget pin is rejected, not OOM.
+  unchanged.
+- **Optional — A (tool-call contiguous append).** Only helps `max_tokens`-capped
+  turns; revisit if a non-EOS streaming pattern needs it.
 - **Deferred, interface reserved — D (capsule→host/disk resume), E (fork/undo as
   agent ops), multi-GPU router.** No code now; Seam 1/3 and the §6 exec addition
   leave room. Built when a workload needs them.
