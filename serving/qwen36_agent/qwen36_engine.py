@@ -48,6 +48,13 @@ class Qwen36FrontendAgentEngine:
         import torch
 
         cap = torch.cuda.get_device_capability()
+        if cap[0] >= 12:
+            # The production Qwen3.6 server should use the same SM120 fast
+            # decode/verify kernels as the documented benchmark path unless a
+            # caller explicitly opts out before startup.
+            import os
+            os.environ.setdefault("FLASHRT_QWEN36_DECODE_FASTGEMM", "1")
+            os.environ.setdefault("FLASHRT_QWEN36_VERIFY_WARPSPLIT", "1")
         if cap == (11, 0):
             from flash_rt.frontends.torch.qwen36_thor import (
                 Qwen36TorchFrontendThor as Frontend,

@@ -343,11 +343,12 @@ capture, but the warm decode rate is lower.
 - **Batch size 1 only.** Multi-batch / continuous batching not in v1.
 - **Greedy decode only.** No temperature, top-p, top-k, repetition
   penalty. The token sequence is deterministic given the prompt.
-- **No streaming.** `generate_own_speculative_KN_nvfp4` returns the
-  full output tensor at the end. The OpenAI server example wraps this
-  with chunked SSE for `stream=True` requests by waiting for the full
-  response and emitting it in one chunk; true token-by-token streaming
-  needs a frontend modification.
+- **Direct frontend generation is not streaming.**
+  `generate_own_speculative_KN_nvfp4` returns the full output tensor at
+  the end. The production agent server
+  ([`serving/qwen36_agent/`](../serving/qwen36_agent/)) uses the split
+  prefill + committed-stream decode path and supports `stream: true`
+  SSE at speculative accept boundaries.
 - **Single GPU.** Multi-GPU tensor parallel not supported.
 - **K ≤ 7** at K_save_max=8. Bumping K_save_max trades ~75 MB VRAM
   per slot for the ability to use larger K — but the K-curve plateaus

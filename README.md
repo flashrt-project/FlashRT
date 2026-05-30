@@ -152,7 +152,7 @@ First live request at a new `(prompt_len, max_tokens)` shape can pay
 CUDA Graph capture cost. The bundled OpenAI server
 ([`serving/qwen36_agent/`](serving/qwen36_agent/README.md))
 pre-captures bucketed short/long shapes at startup via
-`--warmup-preset auto` and optional explicit `--warmup` buckets.
+`--warmup-preset agent` by default and optional explicit `--warmup` buckets.
 
 #### LLM — Qwen3.6-27B NVFP4 (Jetson AGX Thor)
 

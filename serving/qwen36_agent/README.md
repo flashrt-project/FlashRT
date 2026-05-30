@@ -156,10 +156,16 @@ prompts rebuild until rollback/checkpoint support lands.
 | `--warm-long-prefill-graphs` | off | also capture long-context prefill chunk graphs at startup |
 | `--host` / `--port` | `127.0.0.1` / `8000` | bind address |
 | `--log-level` | `info` | uvicorn log level |
+| `--access-log` | off | enable uvicorn per-request access logs; off by default to avoid benchmark jitter |
 
 Startup warmup moves CUDA-graph capture out of the first request: it runs real
 committed-stream warmup for short/medium shapes and graph-only warmup for larger
 long-context shapes.
+
+On SM120, the server defaults to the same optimized decode kernels used by the
+benchmark path (`FLASHRT_QWEN36_DECODE_FASTGEMM=1` and
+`FLASHRT_QWEN36_VERIFY_WARPSPLIT=1`) unless the environment explicitly overrides
+them before startup. `/health` reports both flags.
 
 ## HTTP surface and request fields
 
@@ -284,6 +290,26 @@ accept-length (predictable code/reasoning highest; long-context attention pulls
 the 3K-context RAG case down) — not with the serving path. These are warm
 numbers; the first request of a brand-new prompt length still pays one-time
 graph capture (see Cold start below).
+
+To reproduce these rows, keep the same serving envelope and measurement
+discipline:
+
+```bash
+export FLASHRT_QWEN36_MTP_CKPT_DIR=/path/to/qwen36_mtp_ckpt
+export FLASHRT_QWEN36_LONG_KV_CACHE=fp8
+python -m serving.qwen36_agent.server \
+  --checkpoint /path/to/qwen36_nvfp4 \
+  --max-seq 32768 \
+  --route-min-seq 0 \
+  --warmup-preset agent \
+  --host 127.0.0.1 --port 8000
+```
+
+Then run the same prompt shape at least once to warm exact decode graph keys and
+report the later `flashrt.decode_tok_per_s` values. Very short answers, early
+EOS, dense RAG summaries, or a first traversal of a new prompt length will not
+match the table; those are different accept-length / cold-capture regimes rather
+than serving overhead.
 
 **Cold start.** The first request of a not-yet-seen prompt length / accept
 trajectory pays CUDA-graph capture for the decode / verify / MTP-chain graphs it

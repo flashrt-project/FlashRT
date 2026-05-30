@@ -46,6 +46,10 @@ def build_app(service: AgentService):
             "model": service.engine.model_name,
             "max_seq": service.engine.max_seq,
             "speculative": service.engine.spec_enabled,
+            "decode_fastgemm": bool(getattr(
+                service.engine.fe, "_decode_fastgemm", False)),
+            "verify_warpsplit": bool(getattr(
+                service.engine.fe, "_verify_warpsplit", False)),
             "sessions": service.sessions.snapshot(),
         }
 
@@ -131,13 +135,17 @@ def create_app_from_checkpoint(*, checkpoint: str,
         log.info("MTP head loaded; speculative decode enabled (default K=%d)",
                  warmup_k)
     if warmup_shapes:
-        engine.warmup_committed_stream(
+        log.info("startup warmup: %d shape(s), K=%d", len(warmup_shapes),
+                 warmup_k)
+        warmed = engine.warmup_committed_stream(
             warmup_shapes,
             K=warmup_k,
             committed_max_prompt=warmup_committed_max_prompt,
             long_decode_graphs=True,
             long_prefill_graphs=warm_long_prefill_graphs,
         )
+        for item in warmed:
+            log.info("startup warmup result: %s", item)
     return build_app(AgentService(engine))
 
 
