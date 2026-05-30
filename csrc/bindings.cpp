@@ -139,6 +139,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/fp4_w4a4_matvec_sm120.cuh"
 #include "kernels/fp4_w4a4_mma_sm120.cuh"
 #include "kernels/fp4_w4a4_mma_warpsplit_sm120.cuh"
+#include "kernels/fp4_w4a4_mma_warpsplit_mrows_sm120.cuh"
 #include "quantize/fp8_block128_dequant.cuh"
 #include "quantize/fp8_block128_to_nvfp4_swizzled.cuh"
 #include "quantize/bf16_weight_to_nvfp4_swizzled.cuh"
@@ -5697,6 +5698,26 @@ NVFP4 W4A4 warp-split-K M=1 GEMV (SM120) for long-K / small-N decode shapes
 8 N-cols/block, `warps` warps each streaming K/warps, partials summed in shared
 memory (intra-block) -> CUDA-graph-replay safe; fills the SMs. cos=1.000 vs
 full_n. N%8==0; K%64==0; (K/64)%warps==0; warps in {2,4,8}; stages in {3,4,6}.
+)pbdoc");
+
+    m.def("fp4_w4a4_mma_sm120_warpsplit_mrows_bf16out",
+        [](uintptr_t A, uintptr_t B, uintptr_t D, int M, int N, int K,
+           uintptr_t SFA, uintptr_t SFB, float alpha, int warps, int stages,
+           uintptr_t stream) -> int {
+            return flash_rt::gemm::fp4_w4a4_mma_sm120_warpsplit_mrows_bf16out(
+                to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, to_ptr(SFA),
+                to_ptr(SFB), alpha, warps, stages, to_stream(stream));
+        },
+        py::arg("A"), py::arg("B"), py::arg("D"), py::arg("M"), py::arg("N"),
+        py::arg("K"), py::arg("SFA"), py::arg("SFB"), py::arg("alpha") = 1.0f,
+        py::arg("warps") = 4, py::arg("stages") = 4, py::arg("stream") = 0,
+        R"pbdoc(
+NVFP4 W4A4 small-M (M<=16) warp-split-K GEMM (SM120) for the spec verify-path
+long-K shapes (mlp_down K=17408 at M=K_draft+1). The 16x8x64 MMA atom computes
+a full 16-row tile, so M<=16 rows cost the same weight HBM as M=1; combined with
+warp-split-K (K split across `warps`, partials summed in shared memory ->
+graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
+(K/64)%warps==0; warps in {2,4,8}; stages in {3,4,6}.
 )pbdoc");
 
 #endif

@@ -1086,6 +1086,18 @@ class Qwen36TorchFrontendRtx:
             'FLASHRT_QWEN36_SPLITK_DOWN_SPLIT', '4') or '4')
         self._splitk_down_stages = int(os.environ.get(
             'FLASHRT_QWEN36_SPLITK_DOWN_STAGES', '4') or '4')
+        # Opt-in (requires DECODE_FASTGEMM): route the spec VERIFY-path NVFP4
+        # GEMMs (M = K_draft+1 <= 16) through the small-M warp-split-K kernel.
+        # The 16x8x64 MMA atom computes a full 16-row tile, so M<=16 rows cost
+        # the same weight HBM as M=1; warp-split-K fills the SMs CUTLASS W4A16
+        # leaves idle on these shapes (cold 1.1-1.9x, cos=1.0). This is the
+        # shipped-metric (spec) lever. Default off keeps the graph byte-equal.
+        self._verify_warpsplit = bool(int(os.environ.get(
+            'FLASHRT_QWEN36_VERIFY_WARPSPLIT', '0') or '0'))
+        self._verify_ws_split = int(os.environ.get(
+            'FLASHRT_QWEN36_VERIFY_WS_SPLIT', '2') or '2')
+        self._verify_ws_stages = int(os.environ.get(
+            'FLASHRT_QWEN36_VERIFY_WS_STAGES', '6') or '6')
 
         self._nvfp4_scratch: dict[tuple[int, int],
                                   tuple[torch.Tensor, ...]] = {}
@@ -1489,6 +1501,26 @@ class Qwen36TorchFrontendRtx:
         else:
             self._gemv_nvfp4(ap, packed, out_t.data_ptr(), N, K, sf, wsf,
                              alpha, s)
+
+    def _vgemm_mr(self, gemm_fn, A_packed, B_packed, D, M, N, K,
+                  SFA, SFB, alpha, s):
+        """Verify-path NVFP4 GEMM (M = K_draft+1 <= 16). When VERIFY_WARPSPLIT
+        (and FASTGEMM) and the shape is supported (M<=16, N%8==0, K%64==0,
+        (K/64)%split==0): the small-M warp-split-K kernel, which fills the SMs
+        CUTLASS W4A16 leaves idle on these long-K/small-N shapes (cos=1.0).
+        Else the supplied ``gemm_fn`` (CUTLASS W4A16, possibly pingpong). The
+        choice is fixed at graph-capture time so a replayed graph holds one
+        kernel."""
+        sp = self._verify_ws_split
+        if (self._decode_fastgemm and self._verify_warpsplit
+                and 0 < M <= 16 and (N % 8) == 0 and (K % 64) == 0
+                and ((K // 64) % sp) == 0):
+            from flash_rt import flash_rt_kernels as fvk
+            fvk.fp4_w4a4_mma_sm120_warpsplit_mrows_bf16out(
+                A_packed, B_packed, D, M, N, K, SFA, SFB, alpha, sp,
+                self._verify_ws_stages, s)
+        else:
+            gemm_fn(A_packed, B_packed, D, M, N, K, SFA, SFB, alpha, s)
 
     def _layer_forward_lin_nvfp4(self, L: int, h_in):
         """Linear-attention layer forward, NVFP4 main + BF16 in_proj.
@@ -2025,7 +2057,8 @@ class Qwen36TorchFrontendRtx:
         # in_proj_qkv (G7: NVFP4 N=10240, K=5120, M=K).
         out_qkv_buf = self._nvfp4_scratch[(10240, 5120)][2]
         out_qkv_K = out_qkv_buf[:K]
-        prefill_proj_gemm(
+        self._vgemm_mr(
+            prefill_proj_gemm,
             ap_5120.data_ptr(), int(lw['in_proj_qkv_packed']),
             out_qkv_K.data_ptr(),
             K, 10240, 5120,
@@ -2036,7 +2069,8 @@ class Qwen36TorchFrontendRtx:
         # 3) in_proj_z (G7: NVFP4 N=6144, K=5120, M=K) — reuse same act.
         out_z_buf = self._nvfp4_scratch[(6144, 5120)][2]
         out_z_K = out_z_buf[:K]
-        prefill_proj_gemm(
+        self._vgemm_mr(
+            prefill_proj_gemm,
             ap_5120.data_ptr(), int(lw['in_proj_z_packed']),
             out_z_K.data_ptr(),
             K, 6144, 5120,
@@ -2980,7 +3014,8 @@ class Qwen36TorchFrontendRtx:
         )
         out_op_buf = self._nvfp4_scratch[(5120, 6144)][2]
         out_op_K = out_op_buf[:K]
-        prefill_proj_gemm(
+        self._vgemm_mr(
+            prefill_proj_gemm,
             ap_6144.data_ptr(), int(lw['out_proj_packed']),
             out_op_K.data_ptr(),
             K, 5120, 6144,
@@ -3011,7 +3046,8 @@ class Qwen36TorchFrontendRtx:
                 fvk.fp4_w4a16_gemm_sm120_bf16out_pingpong
                 if self._enable_mlp_gate_up_pingpong
                 else fvk.fp4_w4a16_gemm_sm120_bf16out)
-            mlp_gate_up_gemm(
+            self._vgemm_mr(
+                mlp_gate_up_gemm,
                 ap_5120.data_ptr(), int(lw['mlp_gate_up_packed']),
                 gate_up_buf.data_ptr(),
                 K, int(lw['mlp_gate_up_N']), 5120,
@@ -3024,7 +3060,8 @@ class Qwen36TorchFrontendRtx:
         else:
             gate_out_buf = self._nvfp4_scratch[(17408, 5120)][2]
             up_out_buf = self._mlp_up_out
-            fvk.fp4_w4a16_gemm_sm120_bf16out(
+            self._vgemm_mr(
+                fvk.fp4_w4a16_gemm_sm120_bf16out,
                 ap_5120.data_ptr(), int(lw['mlp_gate_packed']),
                 gate_out_buf.data_ptr(),
                 K, 17408, 5120,
@@ -3032,7 +3069,8 @@ class Qwen36TorchFrontendRtx:
                 float(lw['mlp_gate_alpha']),
                 s,
             )
-            fvk.fp4_w4a16_gemm_sm120_bf16out(
+            self._vgemm_mr(
+                fvk.fp4_w4a16_gemm_sm120_bf16out,
                 ap_5120.data_ptr(), int(lw['mlp_up_packed']),
                 up_out_buf.data_ptr(),
                 K, 17408, 5120,
@@ -3092,7 +3130,8 @@ class Qwen36TorchFrontendRtx:
             )
         # 8d) MLP down: NVFP4 GEMM.
         down_out_buf = self._nvfp4_scratch[(5120, 17408)][2]
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
+        self._vgemm_mr(
+            fvk.fp4_w4a16_gemm_sm120_bf16out,
             ap_17408.data_ptr(), int(lw['mlp_down_packed']),
             down_out_buf.data_ptr(),
             K, 5120, 17408,
@@ -3158,7 +3197,8 @@ class Qwen36TorchFrontendRtx:
 
         # 3) q_proj fused (Q + output_gate) — M=K, N=12288.
         q_proj_out_buf = self._nvfp4_scratch[(12288, 5120)][2]
-        prefill_proj_gemm(
+        self._vgemm_mr(
+            prefill_proj_gemm,
             ap_5120.data_ptr(), int(lw['q_proj_packed']),
             q_proj_out_buf.data_ptr(),
             K, 12288, 5120,
@@ -3174,7 +3214,8 @@ class Qwen36TorchFrontendRtx:
 
         # 4) k_proj — M=K, N=1024.
         kv_proj_out_buf = self._nvfp4_scratch[(1024, 5120)][2]
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
+        self._vgemm_mr(
+            fvk.fp4_w4a16_gemm_sm120_bf16out,
             ap_5120.data_ptr(), int(lw['k_proj_packed']),
             kv_proj_out_buf.data_ptr(),
             K, 1024, 5120,
@@ -3220,7 +3261,8 @@ class Qwen36TorchFrontendRtx:
         )
 
         # v_proj — M=K (overwrite kv_proj_out_buf, K already in cache).
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
+        self._vgemm_mr(
+            fvk.fp4_w4a16_gemm_sm120_bf16out,
             ap_5120.data_ptr(), int(lw['v_proj_packed']),
             kv_proj_out_buf.data_ptr(),
             K, 1024, 5120,
@@ -3356,7 +3398,8 @@ class Qwen36TorchFrontendRtx:
             sf_6144.data_ptr(), K, 6144, s,
         )
         out_op_buf = self._nvfp4_scratch[(5120, 6144)][2]
-        prefill_proj_gemm(
+        self._vgemm_mr(
+            prefill_proj_gemm,
             ap_6144.data_ptr(), int(lw['o_proj_packed']),
             out_op_buf.data_ptr(),
             K, 5120, 6144,
@@ -3383,7 +3426,8 @@ class Qwen36TorchFrontendRtx:
                 fvk.fp4_w4a16_gemm_sm120_bf16out_pingpong
                 if self._enable_mlp_gate_up_pingpong
                 else fvk.fp4_w4a16_gemm_sm120_bf16out)
-            mlp_gate_up_gemm(
+            self._vgemm_mr(
+                mlp_gate_up_gemm,
                 ap_mlp.data_ptr(), int(lw['mlp_gate_up_packed']),
                 gate_up_buf.data_ptr(),
                 K, int(lw['mlp_gate_up_N']), 5120,
@@ -3396,7 +3440,8 @@ class Qwen36TorchFrontendRtx:
         else:
             gate_out_buf = self._nvfp4_scratch[(17408, 5120)][2]
             up_out_buf = self._mlp_up_out
-            fvk.fp4_w4a16_gemm_sm120_bf16out(
+            self._vgemm_mr(
+                fvk.fp4_w4a16_gemm_sm120_bf16out,
                 ap_mlp.data_ptr(), int(lw['mlp_gate_packed']),
                 gate_out_buf.data_ptr(),
                 K, 17408, 5120,
@@ -3404,7 +3449,8 @@ class Qwen36TorchFrontendRtx:
                 float(lw['mlp_gate_alpha']),
                 s,
             )
-            fvk.fp4_w4a16_gemm_sm120_bf16out(
+            self._vgemm_mr(
+                fvk.fp4_w4a16_gemm_sm120_bf16out,
                 ap_mlp.data_ptr(), int(lw['mlp_up_packed']),
                 up_out_buf.data_ptr(),
                 K, 17408, 5120,
@@ -3466,7 +3512,8 @@ class Qwen36TorchFrontendRtx:
 
         # 15) MLP down: NVFP4 GEMM at M=K.
         down_out_buf = self._nvfp4_scratch[(5120, 17408)][2]
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
+        self._vgemm_mr(
+            fvk.fp4_w4a16_gemm_sm120_bf16out,
             ap_dn.data_ptr(), int(lw['mlp_down_packed']),
             down_out_buf.data_ptr(),
             K, 5120, 17408,
