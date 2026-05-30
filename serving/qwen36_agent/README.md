@@ -188,6 +188,56 @@ response carries a `flashrt` telemetry block:
 | `decode_ms`, `decode_tok_per_s` | decode time and throughput |
 | `prefix_action` | how the session was reused: `exact` / `append` / `message_append` / `truncate` / `rebuild` / `activate_rebuild` |
 
+## Measured (RTX 5090, in-container)
+
+Single RTX 5090 (sm_120), `qwen36_nvfp4` (25 GB) + MTP, `--route-min-seq 0`,
+FP8-KV. Numbers are the serving path (real `/v1/chat/completions`), measured to
+substantiate the two design claims below; this is not a throughput-serving
+benchmark (single stream, latency-first).
+
+**1. Session prefix reuse keeps prefill flat as a conversation grows.** A 4-turn
+coding-agent session (same `flashrt_session_id`, full history resent each turn):
+
+| turn | `prefix_action` | `cached_tokens` | `new_prefill_tokens` | `prefill_ms` |
+| --- | --- | ---: | ---: | ---: |
+| 1 | append (cold) | 0 | 352 | 14.5 |
+| 2 | message_append | 416 | 23 | 12.4 |
+| 3 | message_append | 503 | 22 | 12.7 |
+| 4 | message_append | 589 | 20 | 12.5 |
+
+Each turn prefills only the ~20 new tokens and reuses the growing cached prefix
+(416 → 589), so prefill stays ~12 ms instead of growing with the transcript. A
+server without prefix reuse re-prefills the full prompt every turn (589 tokens on
+turn 4). This is the `append` / `message_append` path; correctness is gated
+token-exact by `tests/test_qwen36_agent_gpu_split.py`.
+
+**2. Capsule restore replaces a shared-prefix cold prefill with a flat copy.**
+Snapshot a shared prefix once, then restore + append the new suffix instead of
+re-prefilling it (see [`capsules.md`](capsules.md) for the API and the full
+table). Long FP8-KV route, chunk-aligned prefix, cold vs capsule TTFT:
+
+| shared prefix | cold TTFT | capsule TTFT | speedup | token-exact |
+| ---: | ---: | ---: | ---: | --- |
+| 2048 | 259.6 ms | 111.0 ms | 2.3x | yes |
+| 4096 | 358.5 ms | 46.5 ms | 7.7x | yes |
+| 8192 | 775.6 ms | 111.0 ms | 7.0x | yes |
+
+Cold TTFT grows with prefix length; capsule restore is a bandwidth-bound copy and
+stays roughly flat, so the gap widens with the shared-prefix length a coding
+agent resends each turn. Validated token-exact in
+`tests/test_qwen36_agent_capsule.py`.
+
+**Decode throughput is unchanged by either feature** (they touch prefill / TTFT
+only): warm steady-state ~138 tok/s on this path, matching the frontend's
+documented decode number; the serving policy adds no measurable decode overhead.
+
+**Cold start.** The first request of a not-yet-seen prompt length / accept
+trajectory still pays CUDA-graph capture for the decode / verify / MTP-chain
+graphs it traverses (~one decode's worth, e.g. first call ~35 tok/s → warm
+~138). Startup warmup pre-captures common shapes, but because these graphs are
+keyed by exact `(cur_pos, draft_k, mtp_cache_base)` it does not fully cover every
+arbitrary prompt length; steady state is warm.
+
 ## Session prefix reuse (walkthrough)
 
 Reuse the same `flashrt_session_id` across turns and resend the full message list
