@@ -1,4 +1,4 @@
-"""Async batch preparation for the LIBERO RECAP training driver.
+"""Async batch preparation for the RECAP training driver.
 
 Why this exists: a step-level ``torch.profiler`` trace
 (B=4, lora_rank=16, RTX 5090 SM120) showed that ~47 % of the per-step
@@ -66,6 +66,7 @@ class _Pi05StepDataset(Dataset):
         *,
         action_horizon: int,
         action_dim_target: int,
+        camera_map: dict[str, str | None] | None = None,
     ):
         if per_step_starts.ndim != 2:
             raise ValueError(
@@ -76,6 +77,7 @@ class _Pi05StepDataset(Dataset):
         self._starts = per_step_starts.astype(np.int64, copy=False)
         self._horizon = int(action_horizon)
         self._adim = int(action_dim_target)
+        self._camera_map = camera_map
 
     def __len__(self) -> int:
         return self._starts.shape[0]
@@ -103,7 +105,7 @@ class _Pi05StepDataset(Dataset):
                 f"action_dim {action_chunks.shape[-1]} > target {self._adim}"
             )
 
-        decoded = decode_frame_images(frames)
+        decoded = decode_frame_images(frames, camera_map=self._camera_map)
         states_np = np.stack([f.state for f in frames], axis=0).astype(np.float32)
         states_pad = pad_states(states_np)
         tasks = [f.task_name for f in frames]
@@ -153,6 +155,7 @@ def make_step_dataloader(
     action_dim_target: int,
     num_workers: int = 0,
     prefetch_factor: int = 2,
+    camera_map: dict[str, str | None] | None = None,
 ) -> DataLoader:
     """Wrap :class:`_Pi05StepDataset` in a ``DataLoader``.
 
@@ -162,12 +165,17 @@ def make_step_dataloader(
             the main thread (the synchronous reference path).
         prefetch_factor: Number of batches each worker prefetches.
             Ignored when ``num_workers == 0``.
+        camera_map: Mapping from pi0.5 camera keys to source keys in
+            ``frame.image_bytes``. ``None`` falls back to the LIBERO
+            default (see decode_frame_images() in training.rl.observation).
+            Pass a custom map for non-LIBERO datasets.
     """
     ds = _Pi05StepDataset(
         dataset,
         per_step_starts,
         action_horizon=action_horizon,
         action_dim_target=action_dim_target,
+        camera_map=camera_map,
     )
     kwargs: dict = dict(
         dataset=ds,
