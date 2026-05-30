@@ -1065,6 +1065,13 @@ class Qwen36TorchFrontendRtx:
             'FLASHRT_QWEN36_LIN_AB96_KERNEL', '1') or '0'))
         self._enable_full_gate_sigmoid_mul = bool(int(os.environ.get(
             'FLASHRT_QWEN36_FULL_GATE_SIGMOID_MUL', '0') or '0'))
+        # Opt-in: route the M=1 decode NVFP4 GEMMs through the hand-tuned
+        # SM120 W4A4 tensor-core matvec (fp4_w4a4_mma_sm120_full_n) instead
+        # of the CUTLASS W4A16 GEMM. The Qwen3-8B decode path already ships
+        # this kernel (1.4-1.8x at M=1, cos=1.0 vs CUTLASS at the 27B
+        # shapes). Default off keeps the captured graph byte-identical.
+        self._decode_fastgemm = bool(int(os.environ.get(
+            'FLASHRT_QWEN36_DECODE_FASTGEMM', '0') or '0'))
 
         self._nvfp4_scratch: dict[tuple[int, int],
                                   tuple[torch.Tensor, ...]] = {}
@@ -1432,6 +1439,28 @@ class Qwen36TorchFrontendRtx:
 
     # ---------- NVFP4 own forward (N4 stage 2) ----------
 
+    def _gemv_nvfp4(self, A_packed, B_packed, D, N, K,
+                    SFA, SFB, alpha, s, widen=False):
+        """M=1 NVFP4 GEMV dispatch (decode hot path).
+
+        Default: CUTLASS W4A16 GEMM (the ``widen`` variant for very-large
+        N). With ``FLASHRT_QWEN36_DECODE_FASTGEMM=1``: the hand-tuned
+        SM120 W4A4 tensor-core matvec, which is M=1-only and validated
+        cos=1.0 vs the CUTLASS path at the Qwen3.6 decode shapes. Selection
+        happens at graph-capture time, so a replayed graph holds exactly
+        one kernel.
+        """
+        from flash_rt import flash_rt_kernels as fvk
+        if self._decode_fastgemm:
+            fvk.fp4_w4a4_mma_sm120_full_n_bf16out(
+                A_packed, B_packed, D, N, K, SFA, SFB, alpha, s)
+        elif widen:
+            fvk.fp4_w4a16_gemm_sm120_bf16out_widen(
+                A_packed, B_packed, D, 1, N, K, SFA, SFB, alpha, s)
+        else:
+            fvk.fp4_w4a16_gemm_sm120_bf16out(
+                A_packed, B_packed, D, 1, N, K, SFA, SFB, alpha, s)
+
     def _layer_forward_lin_nvfp4(self, L: int, h_in):
         """Linear-attention layer forward, NVFP4 main + BF16 in_proj.
 
@@ -1480,20 +1509,20 @@ class Qwen36TorchFrontendRtx:
 
         # 2) in_proj_qkv (G7: NVFP4 N=10240, K=5120).
         out_qkv_buf = self._nvfp4_scratch[(10240, 5120)][2]
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
+        self._gemv_nvfp4(
             ap_5120.data_ptr(), int(lw['in_proj_qkv_packed']),
             out_qkv_buf.data_ptr(),
-            1, 10240, 5120,
+            10240, 5120,
             sf_5120.data_ptr(), int(lw['in_proj_qkv_sf']),
             float(lw['in_proj_qkv_alpha']),
             s,
         )
         # 3) in_proj_z (G7: NVFP4 N=6144).
         out_z_buf = self._nvfp4_scratch[(6144, 5120)][2]
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
+        self._gemv_nvfp4(
             ap_5120.data_ptr(), int(lw['in_proj_z_packed']),
             out_z_buf.data_ptr(),
-            1, 6144, 5120,
+            6144, 5120,
             sf_5120.data_ptr(), int(lw['in_proj_z_sf']),
             float(lw['in_proj_z_alpha']),
             s,
@@ -1570,10 +1599,10 @@ class Qwen36TorchFrontendRtx:
             sf_6144.data_ptr(), 1, 6144, s,
         )
         out_op_buf = self._nvfp4_scratch[(5120, 6144)][2]
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
+        self._gemv_nvfp4(
             ap_6144.data_ptr(), int(lw['out_proj_packed']),
             out_op_buf.data_ptr(),
-            1, 5120, 6144,
+            5120, 6144,
             sf_6144.data_ptr(), int(lw['out_proj_sf']),
             float(lw['out_proj_alpha']),
             s,
@@ -1588,15 +1617,14 @@ class Qwen36TorchFrontendRtx:
         h_post = self._res_mid
 
         # 12) post-attn layernorm.
-        h_post_view = h_post.view(1, 5120)
-        x_mlp = self._h_b[:1].view(1, 5120)
-        # 12) post-attn layernorm.
         # NB: tried fusing rms_norm + nvfp4_swizzled_quant; at M=1 +
         # CUDA Graph it was 2% slower (graph already amortizes launch
         # overhead, and the fused kernel has higher smem pressure).
-        # The fused primitive (rms_norm_to_nvfp4_swizzled_bf16) IS
-        # bound and bit-equivalent — kept for the verify (S=K) and
-        # prefill (S=large) paths where its benefit kicks in.
+        # Re-confirmed 2026-05-30: residual_add_rms_norm /
+        # silu_mul_to_nvfp4 fused epilogues regress M=1 graph decode
+        # (slower) — graph-mode fusion benefit ~0. Kept separate here;
+        # the fused primitives stay on the verify (S=K) / prefill paths.
+        h_post_view = h_post.view(1, 5120)
         x_mlp = self._h_b[:1].view(1, 5120)
         fvk.rms_norm(
             h_post_view.data_ptr(), int(lw['post_attn_norm_eff_w']),
@@ -1610,21 +1638,21 @@ class Qwen36TorchFrontendRtx:
 
         gate_out_buf = self._nvfp4_scratch[(17408, 5120)][2]
         up_out_buf = self._mlp_up_out
-        fvk.fp4_w4a16_gemm_sm120_bf16out_widen(
+        self._gemv_nvfp4(
             ap_5120.data_ptr(), int(lw['mlp_gate_packed']),
             gate_out_buf.data_ptr(),
-            1, 17408, 5120,
+            17408, 5120,
             sf_5120.data_ptr(), int(lw['mlp_gate_sf']),
             float(lw['mlp_gate_alpha']),
-            s,
+            s, widen=True,
         )
-        fvk.fp4_w4a16_gemm_sm120_bf16out_widen(
+        self._gemv_nvfp4(
             ap_5120.data_ptr(), int(lw['mlp_up_packed']),
             up_out_buf.data_ptr(),
-            1, 17408, 5120,
+            17408, 5120,
             sf_5120.data_ptr(), int(lw['mlp_up_sf']),
             float(lw['mlp_up_alpha']),
-            s,
+            s, widen=True,
         )
 
         # 14) silu(gate) * up via fvk fused kernel.
@@ -1643,10 +1671,10 @@ class Qwen36TorchFrontendRtx:
             sf_17408.data_ptr(), 1, 17408, s,
         )
         down_out_buf = self._nvfp4_scratch[(5120, 17408)][2]
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
+        self._gemv_nvfp4(
             ap_17408.data_ptr(), int(lw['mlp_down_packed']),
             down_out_buf.data_ptr(),
-            1, 5120, 17408,
+            5120, 17408,
             sf_17408.data_ptr(), int(lw['mlp_down_sf']),
             float(lw['mlp_down_alpha']),
             s,
@@ -1697,10 +1725,10 @@ class Qwen36TorchFrontendRtx:
 
         # 3) q_proj fused (Q + output_gate) -> (1, 12288).
         q_proj_out_buf = self._nvfp4_scratch[(12288, 5120)][2]
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
+        self._gemv_nvfp4(
             ap_5120.data_ptr(), int(lw['q_proj_packed']),
             q_proj_out_buf.data_ptr(),
-            1, 12288, 5120,
+            12288, 5120,
             sf_5120.data_ptr(), int(lw['q_proj_sf']),
             float(lw['q_proj_alpha']),
             s,
@@ -1713,10 +1741,10 @@ class Qwen36TorchFrontendRtx:
 
         # 4) k_proj -> (1, 1024).
         kv_proj_out_buf = self._nvfp4_scratch[(1024, 5120)][2]
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
+        self._gemv_nvfp4(
             ap_5120.data_ptr(), int(lw['k_proj_packed']),
             kv_proj_out_buf.data_ptr(),
-            1, 1024, 5120,
+            1024, 5120,
             sf_5120.data_ptr(), int(lw['k_proj_sf']),
             float(lw['k_proj_alpha']),
             s,
@@ -1746,10 +1774,10 @@ class Qwen36TorchFrontendRtx:
         )
         # 7) Write V to KV cache.
         # v_proj — reuse kv_proj_out_buf (k already in cache).
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
+        self._gemv_nvfp4(
             ap_5120.data_ptr(), int(lw['v_proj_packed']),
             kv_proj_out_buf.data_ptr(),
-            1, 1024, 5120,
+            1024, 5120,
             sf_5120.data_ptr(), int(lw['v_proj_sf']),
             float(lw['v_proj_alpha']),
             s,
@@ -1792,10 +1820,10 @@ class Qwen36TorchFrontendRtx:
             sf_6144.data_ptr(), 1, 6144, s,
         )
         out_op_buf = self._nvfp4_scratch[(5120, 6144)][2]
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
+        self._gemv_nvfp4(
             ap_6144.data_ptr(), int(lw['o_proj_packed']),
             out_op_buf.data_ptr(),
-            1, 5120, 6144,
+            5120, 6144,
             sf_6144.data_ptr(), int(lw['o_proj_sf']),
             float(lw['o_proj_alpha']),
             s,
@@ -1825,21 +1853,21 @@ class Qwen36TorchFrontendRtx:
         )
         gate_out_buf = self._nvfp4_scratch[(17408, 5120)][2]
         up_out_buf = self._mlp_up_out
-        fvk.fp4_w4a16_gemm_sm120_bf16out_widen(
+        self._gemv_nvfp4(
             ap_mlp.data_ptr(), int(lw['mlp_gate_packed']),
             gate_out_buf.data_ptr(),
-            1, 17408, 5120,
+            17408, 5120,
             sf_mlp.data_ptr(), int(lw['mlp_gate_sf']),
             float(lw['mlp_gate_alpha']),
-            s,
+            s, widen=True,
         )
-        fvk.fp4_w4a16_gemm_sm120_bf16out_widen(
+        self._gemv_nvfp4(
             ap_mlp.data_ptr(), int(lw['mlp_up_packed']),
             up_out_buf.data_ptr(),
-            1, 17408, 5120,
+            17408, 5120,
             sf_mlp.data_ptr(), int(lw['mlp_up_sf']),
             float(lw['mlp_up_alpha']),
-            s,
+            s, widen=True,
         )
 
         # 14) silu(gate) * up via fvk.
@@ -1858,10 +1886,10 @@ class Qwen36TorchFrontendRtx:
             sf_dn.data_ptr(), 1, 17408, s,
         )
         down_out_buf = self._nvfp4_scratch[(5120, 17408)][2]
-        fvk.fp4_w4a16_gemm_sm120_bf16out(
+        self._gemv_nvfp4(
             ap_dn.data_ptr(), int(lw['mlp_down_packed']),
             down_out_buf.data_ptr(),
-            1, 5120, 17408,
+            5120, 17408,
             sf_dn.data_ptr(), int(lw['mlp_down_sf']),
             float(lw['mlp_down_alpha']),
             s,
