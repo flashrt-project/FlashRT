@@ -148,7 +148,7 @@ prompts rebuild until rollback/checkpoint support lands.
 | `--device` | `cuda` | torch device |
 | `--max-seq` | `262208` | max sequence length (prompt + generation) |
 | `--route-min-seq` | `0` | min prompt length sent to the chunked long-context FP8-KV path; `0` routes even short real prompts there to avoid request-time per-position graph capture |
-| `--graph-cache-max` | `128` | per-cache CUDA-graph LRU bound on the frontend |
+| `--graph-cache-max` | auto | per-cache CUDA-graph LRU bound; auto-scales with `--max-seq` (1024 at ≤32K, 256 at ≤128K, 128 at 256K) so small-context deployments keep warmed graphs across requests instead of evicting + re-capturing. Override to force a value. |
 | `--warmup-preset` | `agent` | startup warmup shapes: `agent` / `short` / `long` / `all` / `none` |
 | `--warmup` | `""` | extra warmup shapes, comma-separated `prompt_len:max_tokens` |
 | `--warmup-K` | `6` | speculative K used during warmup |
@@ -232,11 +232,17 @@ only): warm steady-state ~138 tok/s on this path, matching the frontend's
 documented decode number; the serving policy adds no measurable decode overhead.
 
 **Cold start.** The first request of a not-yet-seen prompt length / accept
-trajectory still pays CUDA-graph capture for the decode / verify / MTP-chain
-graphs it traverses (~one decode's worth, e.g. first call ~35 tok/s → warm
-~138). Startup warmup pre-captures common shapes, but because these graphs are
-keyed by exact `(cur_pos, draft_k, mtp_cache_base)` it does not fully cover every
-arbitrary prompt length; steady state is warm.
+trajectory pays CUDA-graph capture for the decode / verify / MTP-chain graphs it
+traverses (~one decode's worth, e.g. first call ~35 tok/s → warm ~138). Because
+these graphs are keyed by exact `(cur_pos, draft_k, mtp_cache_base)`, startup
+warmup cannot pre-cover every arbitrary prompt length, so this one-time capture
+is inherent to the exact-key fast-replay design. What `--graph-cache-max`
+(auto-scaled, above) fixes is the *repeated* cold start: at the old fixed cap of
+128 the warmed graphs were evicted between requests, so the server kept
+re-capturing; with the larger cap the warmed graphs survive and the server stays
+warm across requests and prompt lengths after the first traversal (measured: a
+short prompt re-hit after intervening medium/long requests stays at ~150 tok/s,
+no re-capture).
 
 ## Session prefix reuse (walkthrough)
 

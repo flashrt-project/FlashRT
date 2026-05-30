@@ -80,16 +80,35 @@ def build_app(service: AgentService):
     return app
 
 
+def _auto_graph_cache_max(max_seq: int) -> int:
+    """Default per-cache CUDA-graph LRU bound, scaled to the VRAM headroom that
+    ``max_seq`` leaves. Decode graphs are keyed by exact (cur_pos, K, ...), so a
+    request traverses ~one-per-position graphs; a cap below that working set
+    evicts warmed graphs and forces re-capture on the next request (a repeated
+    cold start). A bigger cap lets warmed graphs survive across requests/lengths
+    — but each graph holds pooled buffers, so it competes with the KV cache.
+    Small max_seq leaves plenty of VRAM (use a large cap, kill the eviction
+    thrash); a 256K-capable cache leaves almost none (stay conservative)."""
+    max_seq = int(max_seq)
+    if max_seq <= 32768:
+        return 1024
+    if max_seq <= 131072:
+        return 256
+    return 128
+
+
 def create_app_from_checkpoint(*, checkpoint: str,
                                model_name: str = "qwen36-27b",
                                device: str = "cuda",
                                max_seq: int = 262208,
                                route_min_seq: int | None = 0,
-                               graph_cache_max: int | None = 128,
+                               graph_cache_max: int | None = None,
                                warmup_shapes=None,
                                warmup_k: int = 6,
                                warmup_committed_max_prompt: int = 1024,
                                warm_long_prefill_graphs: bool = False):
+    if graph_cache_max is None:
+        graph_cache_max = _auto_graph_cache_max(max_seq)
     engine = Qwen36FrontendAgentEngine.from_checkpoint(
         checkpoint,
         device=device,
@@ -186,8 +205,11 @@ def main(argv: list[str] | None = None) -> None:
             "The agent host defaults to 0 so short real prompts avoid "
             "per-position short-route graph capture."))
     parser.add_argument(
-        "--graph-cache-max", type=int, default=128,
-        help="Per-cache CUDA graph LRU bound for Qwen3.6 frontend graphs.")
+        "--graph-cache-max", type=int, default=None,
+        help="Per-cache CUDA graph LRU bound for Qwen3.6 frontend graphs. "
+             "Default auto-scales with --max-seq (1024 at <=32K, 256 at "
+             "<=128K, 128 at 256K) so small-context deployments keep warmed "
+             "graphs across requests instead of evicting and re-capturing.")
     parser.add_argument(
         "--warmup-preset", default="agent",
         help="Startup warmup preset: agent, short, long, all, or none.")
