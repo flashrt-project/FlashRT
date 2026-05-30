@@ -52,7 +52,7 @@ fe = Qwen36TorchFrontendThor(
 ```
 
 The bundled OpenAI server
-([`examples/qwen36_openai_server.py`](../examples/qwen36_openai_server.py))
+([`serving/qwen36_agent/`](../serving/qwen36_agent/README.md))
 detects the compute capability at startup and dispatches automatically:
 SM110 (Jetson AGX Thor) loads `Qwen36TorchFrontendThor`; everything else
 loads `Qwen36TorchFrontendRtx`. The CLI / config surface is identical
@@ -305,13 +305,14 @@ capture either during warmup or on the first live request.
 For server deployment, run dummy generations at startup over the
 prompt_len/max_tokens buckets you expect to see. This populates graph
 cache, allocator state, kernel state, and library plans before live
-traffic. The bundled OpenAI server example does this with
-`--warmup-preset auto` by default; add explicit buckets with `--warmup`
-when your traffic includes larger contexts:
+traffic. The agent server ([`serving/qwen36_agent/`](../serving/qwen36_agent/))
+runs committed-stream warmup at startup (`--warmup-preset agent` by default);
+add explicit buckets with `--warmup` when your traffic includes larger contexts:
 
 ```bash
+export FLASHRT_QWEN36_MTP_CKPT_DIR=/path/to/qwen36_mtp_ckpt
 export FLASHRT_QWEN36_LONG_KV_CACHE=fp8
-python examples/qwen36_openai_server.py \
+python -m serving.qwen36_agent.server \
   --checkpoint /path/to/qwen36_nvfp4 \
   --max-seq 262208 \
   --warmup-preset all \
@@ -323,13 +324,14 @@ The default long-context route threshold is 512 prompt tokens, with a
 Other very short prompts stay on BF16/spec for peak decode unless the
 requested completion exceeds the retained BF16 window, while 512-token
 and larger prompts use the tuned chunked FP8-KV path.
-`--warmup-preset auto`
-warms 64-token short-chat buckets plus 2K/4K/8K/16K/32K/64K/128K/256K
-buckets that fit inside `--max-seq`. Add explicit `--warmup`
-`prompt_len:max_tokens` entries for longer completion caps.
-The 256K prompt bucket requires `--max-seq` larger than `262144` by at
-least the requested completion length. See
-[`examples/qwen36_openai_server.py`](../examples/qwen36_openai_server.py).
+`--warmup-preset all` warms the short-chat buckets plus
+2K/4K/8K/16K/32K/64K/128K/200K/256K buckets that fit inside `--max-seq`; the
+`agent` default covers a representative subset. Add explicit `--warmup`
+`prompt_len:max_tokens` entries for longer completion caps. `--graph-cache-max`
+auto-scales with `--max-seq` so warmed graphs survive across requests. The 256K
+prompt bucket requires `--max-seq` larger than `262144` by at least the
+requested completion length. See
+[`serving/qwen36_agent/README.md`](../serving/qwen36_agent/README.md).
 
 If first-request latency matters more than warm decode throughput, set
 `FLASHRT_QWEN36_TQ_VERIFY_GRAPH=0` and

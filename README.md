@@ -48,7 +48,7 @@ Pi0.5: 44 ms / 23 Hz on Jetson AGX Thor (2v, FP8) · 39.78 ms / 25 Hz (2v, NVFP4
 - [Install FlashRT](#build--install)
 - [Quick Start](#quick-start)
 - [API snippets — Pi0 / Pi0.5 / GROOT / Pi0-FAST / Qwen3.6](#api-snippets)
-- [Qwen3.6-27B NVFP4 LLM path — quickstart, K selection, measured throughput](docs/qwen36_nvfp4.md) · [parameter reference](docs/qwen36_usage.md) · [OpenAI-compatible server example](examples/qwen36_openai_server.py)
+- [Qwen3.6-27B NVFP4 LLM path — quickstart, K selection, measured throughput](docs/qwen36_nvfp4.md) · [parameter reference](docs/qwen36_usage.md) · [OpenAI-compatible server example](serving/qwen36_agent/README.md)
 - [Adding a new model](docs/adding_new_model.md)
 - [Contributing](CONTRIBUTING.md)
 - [Architecture](docs/architecture.md)
@@ -81,7 +81,7 @@ First call: ~3 s (calibration + CUDA Graph capture). Every subsequent call: 44 m
 |---|---|
 | **Run your first inference** | [Build & install](#build--install) — Docker and native Linux paths |
 | **See API examples for all 4 VLA models + the Qwen3.6 LLM** | [API snippets](#api-snippets) |
-| **Run Qwen3.6-27B NVFP4 (LLM, 256 K on RTX 5090)** | [`docs/qwen36_nvfp4.md`](docs/qwen36_nvfp4.md) — quickstart, K selection, measured throughput · [`docs/qwen36_usage.md`](docs/qwen36_usage.md) — full parameter reference · [`examples/qwen36_openai_server.py`](examples/qwen36_openai_server.py) — OpenAI-compatible HTTP server |
+| **Run Qwen3.6-27B NVFP4 (LLM, 256 K on RTX 5090)** | [`docs/qwen36_nvfp4.md`](docs/qwen36_nvfp4.md) — quickstart, K selection, measured throughput · [`docs/qwen36_usage.md`](docs/qwen36_usage.md) — full parameter reference · [`serving/qwen36_agent/`](serving/qwen36_agent/README.md) — OpenAI-compatible HTTP server |
 | **Run Qwen3-8B NVFP4 text serving** | [`docs/qwen3_8b_nvfp4.md`](docs/qwen3_8b_nvfp4.md) · [`examples/qwen3_openai_server.py`](examples/qwen3_openai_server.py) |
 | **Run Motus RTX beta, TeaCache, or RTC-lite** | [`docs/motus_usage_beta.md`](docs/motus_usage_beta.md) · [`docs/rtc_lite_design.md`](docs/rtc_lite_design.md) |
 | **Run Wan2.2 TI2V-5B official-pipeline baseline** | [`docs/wan22_usage.md`](docs/wan22_usage.md) |
@@ -150,7 +150,7 @@ for each bucket.
 
 First live request at a new `(prompt_len, max_tokens)` shape can pay
 CUDA Graph capture cost. The bundled OpenAI server
-([`examples/qwen36_openai_server.py`](examples/qwen36_openai_server.py))
+([`serving/qwen36_agent/`](serving/qwen36_agent/README.md))
 pre-captures bucketed short/long shapes at startup via
 `--warmup-preset auto` and optional explicit `--warmup` buckets.
 
@@ -495,14 +495,16 @@ print(text)
 ```
 
 For an OpenAI-API-compatible HTTP server (chat completions, drop-in
-replacement for `OpenAI(base_url=...)`), see
-[`examples/qwen36_openai_server.py`](examples/qwen36_openai_server.py):
+replacement for `OpenAI(base_url=...)`), use the production agent server
+[`serving/qwen36_agent/`](serving/qwen36_agent/) (see its
+[`README.md`](serving/qwen36_agent/README.md)):
 
 ```bash
-export FLASHRT_QWEN36_MTP_CKPT_DIR=/path/to/qwen36_fp8_ckpt
-python examples/qwen36_openai_server.py \
+pip install fastapi uvicorn
+export FLASHRT_QWEN36_MTP_CKPT_DIR=/path/to/qwen36_mtp_ckpt
+python -m serving.qwen36_agent.server \
     --checkpoint /path/to/qwen36_nvfp4 \
-    --port 8000 --K 6
+    --port 8000
 # Then: curl http://localhost:8000/v1/chat/completions ...
 ```
 

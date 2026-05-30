@@ -8,7 +8,7 @@ doc were measured on RTX 5090 (sm_120, 32 GB HBM, BW 1.79 TB/s).
 For the full per-parameter API reference (constructor, generate args,
 env vars), see [`qwen36_usage.md`](qwen36_usage.md). For an OpenAI-API
 compatible HTTP server, see
-[`examples/qwen36_openai_server.py`](../examples/qwen36_openai_server.py).
+[`serving/qwen36_agent/`](../serving/qwen36_agent/README.md).
 
 ## 0. Quickstart
 
@@ -22,7 +22,7 @@ not require Triton/FLA Python kernels:
 
 ```bash
 pip install -e ".[torch]"
-# Add the server extra too if you use examples/qwen36_openai_server.py:
+# Add the server extra too if you use serving/qwen36_agent:
 # pip install -e ".[torch,server]"
 ```
 

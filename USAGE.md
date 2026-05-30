@@ -994,31 +994,38 @@ The server uses an asyncio lock to ensure only one inference runs at a time (sin
 
 ### Qwen3.6 OpenAI-compatible server
 
-Qwen3.6-27B NVFP4 uses a separate OpenAI-shaped chat server:
-[`examples/qwen36_openai_server.py`](examples/qwen36_openai_server.py).
-Install the server extra, point `FLASHRT_QWEN36_MTP_CKPT_DIR` at a
-paired Qwen3.6 MTP checkpoint, and choose a `--max-seq` that covers the
-largest prompt plus completion you intend to serve.
+Qwen3.6-27B NVFP4 is served by the production agent server
+[`serving/qwen36_agent/`](serving/qwen36_agent/) — session prefix reuse,
+committed-stream SSE, tool calls, and execution-state capsules. See its
+[`README.md`](serving/qwen36_agent/README.md) for the full run guide, the
+parameter table, the measured serving numbers, and the differentiation vs
+vLLM/SGLang. Install the server extra, point `FLASHRT_QWEN36_MTP_CKPT_DIR` at a
+paired Qwen3.6 MTP checkpoint, and choose a `--max-seq` that covers the largest
+prompt plus completion you intend to serve.
 
 ```bash
-pip install -e ".[torch,server]"
+pip install -e ".[torch,server]"   # or: pip install fastapi uvicorn
 
-export FLASHRT_QWEN36_MTP_CKPT_DIR=/path/to/qwen36_fp8_ckpt
+export FLASHRT_QWEN36_MTP_CKPT_DIR=/path/to/qwen36_mtp_ckpt
 export FLASHRT_QWEN36_LONG_KV_CACHE=fp8
 
-python examples/qwen36_openai_server.py \
+python -m serving.qwen36_agent.server \
   --checkpoint /path/to/qwen36_nvfp4 \
   --max-seq 262208 \
-  --warmup-preset auto \
   --port 8000
+# --route-min-seq 0, --warmup-preset agent, and --graph-cache-max (auto-scaled
+# by --max-seq) are the defaults; /health reports "speculative": true/false.
 ```
 
-The Qwen server exposes `/v1/models` and `/v1/chat/completions`. Its
-logs report `prefill=... + decode=...`, so decode tok/s is directly
-comparable to TPOT-style LLM serving numbers and does not include TTFT.
-For the full parameter reference, warmup buckets, and the 128-token to
-256K context sweep, see [`docs/qwen36_usage.md`](docs/qwen36_usage.md)
-and [`docs/qwen36_nvfp4.md`](docs/qwen36_nvfp4.md).
+The server exposes `/v1/models`, `/health`, `/v1/chat/completions`, and
+`/v1/sessions`. Each completion response carries a `flashrt` telemetry block
+(`prefill_ms`, `decode_ms`, `decode_tok_per_s`, `cached_tokens`,
+`prefix_action`, …) and the server logs one metric line per request, so decode
+tok/s is directly comparable to TPOT-style LLM serving numbers and excludes
+TTFT. For the parameter reference and the 128-token to 256K context sweep, see
+[`docs/qwen36_usage.md`](docs/qwen36_usage.md) and
+[`docs/qwen36_nvfp4.md`](docs/qwen36_nvfp4.md). The earlier single-file example
+is retired to [`examples/archive/`](examples/archive/).
 
 ---
 

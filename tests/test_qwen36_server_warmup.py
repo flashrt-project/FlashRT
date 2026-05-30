@@ -1,4 +1,4 @@
-from examples.qwen36_openai_server import (
+from examples.archive.qwen36_openai_server import (
     Qwen36Engine,
     _dedupe_shapes,
     _long_warmup_flags,
