@@ -182,7 +182,7 @@ OpenAI-compatible: `GET /v1/models`, `GET /health`, `POST /v1/chat/completions`,
 FlashRT extensions:
 
 If neither `max_tokens` nor `max_completion_tokens` is supplied, the agent
-server defaults to 1024 generated tokens so coding-agent tool turns are not cut
+server defaults to 2048 generated tokens so coding-agent tool turns are not cut
 off by a chat-sized output cap.
 
 - `flashrt_session_id` (or `session_id`): stable session key for prefix reuse.
