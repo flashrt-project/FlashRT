@@ -34,7 +34,7 @@ class AgentRequest:
     session_id: Optional[str] = None
     cache_salt: str = ""
     enable_thinking: bool = False
-    K: int = 6
+    K: int = 4
     # Pin the shared-prefix capsule: int = number of leading prompt tokens to pin
     # as a reusable capsule; True = pin the whole current prompt's aligned head;
     # None/0 = no pinning. Restore on a later request whose prompt starts with the
@@ -62,7 +62,7 @@ class AgentService:
     def __init__(self, engine: AgentEngine, *,
                  sessions: Optional[SessionRegistry] = None,
                  capsule_budget_bytes: int = 0,
-                 default_k: int = 6,
+                 default_k: int = 4,
                  default_max_tokens: int = 2048,
                  max_output_tokens: int = 8192,
                  default_session_id: Optional[str] = None):
@@ -815,7 +815,7 @@ def parse_pin_prefix(value: Any) -> Optional[int]:
     return n if n > 0 else None
 
 
-def request_from_openai(req: Dict[str, Any], *, default_k: int = 6,
+def request_from_openai(req: Dict[str, Any], *, default_k: int = 4,
                         default_max_tokens: int = 2048,
                         max_output_tokens: Optional[int] = 8192
                         ) -> AgentRequest:

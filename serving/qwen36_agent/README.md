@@ -34,7 +34,7 @@ python -m serving.qwen36_agent.server \
   --model-name qwen36-27b \
   --max-seq 32768 \
   --route-min-seq 0 \
-  --default-K 6 \
+  --default-K 4 \
   --host 127.0.0.1 --port 8000
 # startup loads the model, then logs: Uvicorn running on http://127.0.0.1:8000
 ```
@@ -177,7 +177,7 @@ prompts rebuild until rollback/checkpoint support lands.
 | `--warmup-preset` | `none` | startup warmup shapes: `none` / `agent` / `short` / `long` / `all`; production agent serving does not need graph warmup by default |
 | `--warmup` | `""` | extra warmup shapes, comma-separated `prompt_len:max_tokens` |
 | `--warmup-K` | `6` | speculative K used during warmup |
-| `--default-K` | `6` | default speculative decode K for live requests; OpenAI-compatible clients inherit this unless they pass `flashrt_K` |
+| `--default-K` | `4` | default speculative decode K for live requests; OpenAI-compatible clients inherit this unless they pass `flashrt_K`; production agent sweeps currently favor K=4 |
 | `--warmup-committed-max-prompt` | `1024` | run real committed-stream warmup up to this prompt length; larger long-context shapes use graph-only warmup |
 | `--warm-long-prefill-graphs` | off | also capture long-context prefill chunk graphs at startup |
 | `--capsule-budget-mb` | `0` | GPU byte budget (MB) for pinned shared-prefix capsules; `0` disables pinning. See [Capsule pinning](#capsule-pinning-shared-prefix-reuse-for-non-hot-requests). |
@@ -204,8 +204,8 @@ If startup warmup is enabled, logs print every queued warmup shape and then a
 same metric fields for both buffered and streaming responses:
 
 ```text
-complete | sid=... | act=message_append | tok p=  9251 cache=  9237 new=   22 out= 384 | ms prefill=   13.0 ttft=  146.0 decode= 3278.4 | speed decode= 117.1 tok/s | finish=stop | tools=0 | lookahead=0 | hot=... | K=6
-stream   | sid=... | act=message_append | tok p=  3110 cache=  3089 new=   31 out= 512 | ms prefill=   12.8 ttft=   72.7 decode= 4316.9 | speed decode= 118.6 tok/s | stream= 4418.5ms/ 115.9 tok/s | finish=stop | tools=0 | lookahead=0 | hot=... | K=6
+complete | sid=... | act=message_append | tok p=  9251 cache=  9237 new=   22 out= 384 | ms prefill=   13.0 ttft=  146.0 decode= 3278.4 | speed decode= 117.1 tok/s | finish=stop | tools=0 | lookahead=0 | hot=... | K=4
+stream   | sid=... | act=message_append | tok p=  3110 cache=  3089 new=   31 out= 512 | ms prefill=   12.8 ttft=   72.7 decode= 4316.9 | speed decode= 118.6 tok/s | stream= 4418.5ms/ 115.9 tok/s | finish=stop | tools=0 | lookahead=0 | hot=... | K=4
 ```
 
 For streaming responses, `decode_tok/s` measures backend decode-active time;
@@ -224,6 +224,10 @@ for fixed-shape warmed benchmark runs. `/health` reports the kernel flags.
 `--default-K` controls live serving, while `--warmup-K` controls startup warmup.
 Use `--default-K` when a standard OpenAI-compatible client cannot pass FlashRT
 extension fields. Native clients may hot-switch per request with `flashrt_K`.
+For production agent serving on RTX 5090, the measured default is K=4: K=3/4
+are the stable plateau for short coding prompts, and K=4 wins the tool-call
+coding-agent sweep. K=6 remains available for fixed-shape benchmark/demo
+prompts where its accept length is known to be favorable.
 
 ## HTTP surface and request fields
 
@@ -404,8 +408,44 @@ python -m serving.qwen36_agent.server \
 The production agent path should be measured without those graph flags: it uses
 direct verify/MTP-chain kernel launch, so an arbitrary new prompt length no
 longer falls to cold graph-capture throughput. On RTX 5090, first-use live
-requests measured ~122 tok/s for a short text stream and ~130 tok/s for a
-tool-shaped stream with K=6.
+requests measured ~120-130 tok/s for short text/tool-shaped streams.
+
+**4. Production agent K sweep.** The live server default is K=4, based on real
+OpenAI-compatible agent workloads with direct kernel launch (no exact-position
+decode graph flags). Native clients can still override per request with
+`flashrt_K`.
+
+RTX 5090, `--route-min-seq 0`, FP8-KV long route, hot-prefix reuse enabled:
+
+| K | plain multi-turn coding warm decode tok/s | CLI-tool-call style coding-agent warm decode tok/s | short algorithm prompt decode tok/s |
+|---:|---:|---:|---:|
+| 1 | 77.0 | 96.8 | 99.6 |
+| 2 | 97.4 | 119.1 | 121.5 |
+| 3 | **104.2** | 133.8 | 128.9 |
+| 4 | 97.6 | **140.7** | 128.9 |
+| 5 | 89.6 | 132.7 | 128.9 |
+| 6 | 93.0 | 135.2 | **129.0** |
+
+The default chooses K=4 because tool-call coding-agent turns are the main
+production target and K=4 is the measured winner there. K=3 is a good
+conservative override for long plain-text coding sessions. K=6 is still useful
+for known short benchmark prompts, but it is not the best default for mixed
+agent traffic.
+
+Short algorithm prompt detail (real HTTP production path, median of 3 runs per
+prompt; values are decode-active tok/s):
+
+| scenario | K=1 | K=2 | K=3 | K=4 | K=5 | K=6 |
+| --- | ---:| ---:| ---:| ---:| ---:| ---:|
+| merge-sort | 100.0 | 130.3 | 146.9 | 146.9 | 146.8 | 146.8 |
+| dijkstra | 99.4 | 116.3 | 122.6 | 122.6 | 122.6 | 122.7 |
+| lru-cache | 101.7 | 126.6 | 135.1 | 135.2 | 135.1 | 135.2 |
+| coin-change | 98.3 | 115.0 | 122.4 | 122.7 | 122.6 | 122.7 |
+
+For these short algorithm prompts, K=3-K=6 are effectively on the same plateau
+except for the merge-sort prompt, where K>=3 reaches ~147 tok/s. This is why the
+live default can be K=4 without giving up the short-prompt speed people expect
+from the benchmark table.
 
 ## Automatic prefix reuse (walkthrough)
 
