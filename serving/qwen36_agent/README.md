@@ -157,6 +157,7 @@ prompts rebuild until rollback/checkpoint support lands.
 | `--capsule-budget-mb` | `0` | GPU byte budget (MB) for pinned shared-prefix capsules; `0` disables pinning. See [Capsule pinning](#capsule-pinning-shared-prefix-reuse-that-survives-eos). |
 | `--default-max-tokens` | `2048` | generated-token budget used when a request omits both `max_tokens` and `max_completion_tokens` |
 | `--max-output-tokens` | `8192` | hard generated-token cap; requests above this return HTTP 400 instead of being silently truncated |
+| `--default-session-id` | unset | fallback session id for requests that omit `flashrt_session_id` / `session_id`; intended only for single-client local agent demos or trusted one-user deployments |
 | `--host` / `--port` | `127.0.0.1` / `8000` | bind address |
 | `--log-level` | `info` | uvicorn log level |
 | `--access-log` | off | enable uvicorn per-request access logs; off by default to avoid benchmark jitter |
@@ -211,6 +212,11 @@ silently shortened.
   an integer (pin that many leading prompt tokens) or `true` (pin the whole
   prompt's chunk-aligned head). Inert unless the server was started with
   `--capsule-budget-mb > 0`. See [Capsule pinning](#capsule-pinning-shared-prefix-reuse-that-survives-eos).
+
+For OpenAI-compatible clients that cannot pass FlashRT extension fields, a
+single-client deployment may set `--default-session-id <id>` so omitted session
+ids still hit the local prefix/session cache. Leave it unset for multi-client
+serving.
 
 ## Response fields
 

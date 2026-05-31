@@ -396,6 +396,29 @@ def test_qwen36_agent_fastapi_rejects_output_above_service_cap():
     assert "max_tokens must be <= 8" in resp.text
 
 
+def test_agent_service_applies_default_session_id_for_openai_clients():
+    svc = AgentService(FakeAgentEngine(), default_session_id="local-agent")
+
+    req = svc.request_from_openai({
+        "messages": [{"role": "user", "content": "abc"}],
+        "max_tokens": 1,
+    })
+
+    assert req.session_id == "local-agent"
+
+
+def test_agent_service_keeps_explicit_session_over_default_session_id():
+    svc = AgentService(FakeAgentEngine(), default_session_id="local-agent")
+
+    req = svc.request_from_openai({
+        "messages": [{"role": "user", "content": "abc"}],
+        "max_tokens": 1,
+        "flashrt_session_id": "explicit",
+    })
+
+    assert req.session_id == "explicit"
+
+
 def test_openai_request_and_response_include_flashrt_cache_metrics():
     engine = FakeAgentEngine()
     svc = AgentService(engine)

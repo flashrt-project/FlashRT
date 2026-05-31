@@ -61,7 +61,8 @@ class AgentService:
                  sessions: Optional[SessionRegistry] = None,
                  capsule_budget_bytes: int = 0,
                  default_max_tokens: int = 2048,
-                 max_output_tokens: int = 8192):
+                 max_output_tokens: int = 8192,
+                 default_session_id: Optional[str] = None):
         if default_max_tokens < 1:
             raise ValueError("default_max_tokens must be >= 1")
         if max_output_tokens < 1:
@@ -73,6 +74,7 @@ class AgentService:
         self.sessions = sessions or SessionRegistry()
         self.default_max_tokens = int(default_max_tokens)
         self.max_output_tokens = int(max_output_tokens)
+        self.default_session_id = default_session_id or None
         # Pinned shared-prefix capsules (off-by-default: budget 0 keeps the
         # serving path byte-identical). A pinned capsule lets a fresh turn/session
         # restore a clean committed boundary instead of cold-prefilling the shared
@@ -86,11 +88,14 @@ class AgentService:
         self._lock = threading.Lock()
 
     def request_from_openai(self, req: Dict[str, Any]) -> AgentRequest:
-        return request_from_openai(
+        agent_req = request_from_openai(
             req,
             default_max_tokens=self.default_max_tokens,
             max_output_tokens=self.max_output_tokens,
         )
+        if not agent_req.session_id and self.default_session_id:
+            agent_req.session_id = self.default_session_id
+        return agent_req
 
     def complete(self, req: AgentRequest) -> AgentResult:
         with self._lock:

@@ -121,7 +121,8 @@ def create_app_from_checkpoint(*, checkpoint: str,
                                warm_long_prefill_graphs: bool = False,
                                capsule_budget_bytes: int = 0,
                                default_max_tokens: int = 2048,
-                               max_output_tokens: int = 8192):
+                               max_output_tokens: int = 8192,
+                               default_session_id: str | None = None):
     if graph_cache_max is None:
         graph_cache_max = _auto_graph_cache_max(max_seq)
     engine = Qwen36FrontendAgentEngine.from_checkpoint(
@@ -186,6 +187,7 @@ def create_app_from_checkpoint(*, checkpoint: str,
         capsule_budget_bytes=capsule_budget_bytes,
         default_max_tokens=default_max_tokens,
         max_output_tokens=max_output_tokens,
+        default_session_id=default_session_id,
     ))
 
 
@@ -305,6 +307,12 @@ def main(argv: list[str] | None = None) -> None:
         "--max-output-tokens", type=int, default=8192,
         help="Hard server-side generated-token cap. Requests above this cap "
              "return HTTP 400 instead of being silently truncated.")
+    parser.add_argument(
+        "--default-session-id", default=None,
+        help="Optional fallback session id for requests that omit "
+             "flashrt_session_id/session_id. Use only for single-client local "
+             "agent demos or trusted one-user deployments; multi-client "
+             "servers should leave this unset.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--log-level", default="info")
@@ -337,6 +345,7 @@ def main(argv: list[str] | None = None) -> None:
         capsule_budget_bytes=int(args.capsule_budget_mb) * (1 << 20),
         default_max_tokens=args.default_max_tokens,
         max_output_tokens=args.max_output_tokens,
+        default_session_id=args.default_session_id,
     )
     uvicorn.run(app, host=args.host, port=args.port,
                 log_level=args.log_level, access_log=args.access_log)
