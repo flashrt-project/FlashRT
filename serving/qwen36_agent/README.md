@@ -34,6 +34,7 @@ python -m serving.qwen36_agent.server \
   --model-name qwen36-27b \
   --max-seq 32768 \
   --route-min-seq 0 \
+  --default-session-id local-agent \
   --host 127.0.0.1 --port 8000
 # startup loads the model, then logs: Uvicorn running on http://127.0.0.1:8000
 ```
@@ -221,6 +222,13 @@ off by a chat-sized output cap. Production deployments should set
 `--default-max-tokens` for their client mix and keep `--max-output-tokens` as a
 hard safety bound; oversized requests fail with HTTP 400 instead of being
 silently shortened.
+
+If `prompt_tokens + max_tokens` would exceed `--max-seq`, the server clips the
+generated-token budget to the remaining context for that request. If the prompt
+itself leaves no room for at least one generated token, the request is rejected
+before streaming begins. For local clients that do not send `flashrt_session_id`,
+start with `--default-session-id` so repeated agent turns share one hot session
+instead of rebuilding under a new generated session id each request.
 
 - `flashrt_session_id` (or `session_id`): stable session key for prefix reuse.
 - `flashrt_cache_salt`: optional namespace separator for different prompt policies.

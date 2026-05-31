@@ -154,7 +154,7 @@ class AgentService:
 
     def _capsule_prefill(
             self, req: AgentRequest, prompt_tokens: List[int], session, *,
-            K: int
+            max_tokens: int, K: int
     ) -> Optional[PrefixPlan]:
         """Restore-or-pin a shared-prefix capsule when ``pin_prefix`` is requested
         and viable, performing the prefill on the engine and returning its
@@ -184,7 +184,7 @@ class AgentService:
         pin_len = prompt_len if pin is True else min(int(pin), prompt_len)
         if pin_len <= 0:
             return None
-        aligned = self.engine.capsule_aligned_len(pin_len, req.max_tokens)
+        aligned = self.engine.capsule_aligned_len(pin_len, max_tokens)
         if aligned <= 0 or aligned > prompt_len:
             raise ValueError(
                 "flashrt_pin_prefix requires the long FP8-KV route and a "
@@ -196,7 +196,7 @@ class AgentService:
         if entry is not None:
             self.engine.prefill_from_capsule(
                 entry.capsule, prompt_tokens,
-                max_tokens=req.max_tokens, K=K)
+                max_tokens=max_tokens, K=K)
             return PrefixPlan(
                 session_id=session.session_id,
                 cached_tokens=aligned,
@@ -207,7 +207,7 @@ class AgentService:
             )
         cap = self.engine.prefill_and_pin(
             prompt_tokens, aligned_len=aligned,
-            max_tokens=req.max_tokens, K=K)
+            max_tokens=max_tokens, K=K)
         nbytes = int(cap.get("nbytes", 0)) if isinstance(cap, dict) else 0
         pinned = self.capsules.pin(CapsuleEntry(
             key=key, aligned_len=aligned, nbytes=nbytes, capsule=cap))
@@ -363,6 +363,40 @@ class AgentService:
         else:
             self.sessions.mark_hot(session.session_id)
 
+    def _effective_max_tokens(self, req: AgentRequest,
+                              prompt_len: int) -> int:
+        max_tokens = int(req.max_tokens)
+        max_seq = int(getattr(self.engine, "max_seq", 0) or 0)
+        if max_seq <= 0:
+            return max_tokens
+        remaining = max_seq - int(prompt_len)
+        if remaining < 1:
+            raise ValueError(
+                f"prompt length {int(prompt_len)} leaves no room under "
+                f"max_seq {max_seq}; reduce context or start with a larger "
+                "server --max-seq")
+        if max_tokens > remaining:
+            log.warning(
+                "clipping max_tokens from %d to %d for prompt=%d max_seq=%d",
+                max_tokens, remaining, int(prompt_len), max_seq)
+            return remaining
+        return max_tokens
+
+    def validate_request_bounds(self, req: AgentRequest) -> None:
+        """Fail hard context-limit errors before a StreamingResponse starts.
+
+        Soft output-budget overflow is handled by clipping in the request path;
+        a prompt that already fills the context must be rejected before Starlette
+        begins SSE streaming, otherwise the client sees a broken stream and the
+        server logs an ASGI traceback.
+        """
+        prompt_tokens = self.engine.tokenize_chat(
+            req.messages,
+            tools=req.tools,
+            enable_thinking=req.enable_thinking,
+        )
+        self._effective_max_tokens(req, len(prompt_tokens))
+
     @staticmethod
     def _fmt_metric_line(
             kind: str, *, session_id: str, action: str,
@@ -409,6 +443,7 @@ class AgentService:
             tools=req.tools,
             enable_thinking=req.enable_thinking,
         )
+        max_tokens = self._effective_max_tokens(req, len(prompt_tokens))
         session, plan = self.sessions.plan_request(
             req.session_id,
             prompt_tokens,
@@ -420,7 +455,7 @@ class AgentService:
         decode_k = self._effective_k(req)
         t0 = time.perf_counter()
         cap_plan = self._capsule_prefill(
-            req, prompt_tokens, session, K=decode_k)
+            req, prompt_tokens, session, max_tokens=max_tokens, K=decode_k)
         if cap_plan is not None:
             plan = cap_plan
         else:
@@ -436,7 +471,7 @@ class AgentService:
             self.engine.prefill(
                 engine_prompt_tokens,
                 cached_tokens=effective_cached,
-                max_tokens=req.max_tokens,
+                max_tokens=max_tokens,
                 K=decode_k,
             )
         t_prefill = time.perf_counter()
@@ -449,7 +484,7 @@ class AgentService:
         state_lookahead = False
         saw_tool_call = False
         for chunk in self.engine.generate_stream(
-                max_tokens=req.max_tokens, K=decode_k):
+                max_tokens=max_tokens, K=decode_k):
             generated_ids.extend(int(t) for t in chunk.token_ids)
             if getattr(chunk, "state_lookahead", 0):
                 state_lookahead = True
@@ -542,6 +577,7 @@ class AgentService:
             tools=req.tools,
             enable_thinking=req.enable_thinking,
         )
+        max_tokens = self._effective_max_tokens(req, len(prompt_tokens))
         session, plan = self.sessions.plan_request(
             req.session_id,
             prompt_tokens,
@@ -552,7 +588,7 @@ class AgentService:
         decode_k = self._effective_k(req)
         t0 = time.perf_counter()
         cap_plan = self._capsule_prefill(
-            req, prompt_tokens, session, K=decode_k)
+            req, prompt_tokens, session, max_tokens=max_tokens, K=decode_k)
         if cap_plan is not None:
             plan = cap_plan
         else:
@@ -568,7 +604,7 @@ class AgentService:
             self.engine.prefill(
                 engine_prompt_tokens,
                 cached_tokens=effective_cached,
-                max_tokens=req.max_tokens,
+                max_tokens=max_tokens,
                 K=decode_k,
             )
         t_prefill = time.perf_counter()
@@ -585,7 +621,7 @@ class AgentService:
         stream_started = time.perf_counter()
         backend_decode_ms = 0.0
         saw_tool_call = False
-        chunks = iter(self.engine.generate_stream(max_tokens=req.max_tokens,
+        chunks = iter(self.engine.generate_stream(max_tokens=max_tokens,
                                                   K=decode_k))
         while True:
             next_t0 = time.perf_counter()

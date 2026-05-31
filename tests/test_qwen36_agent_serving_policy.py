@@ -177,6 +177,24 @@ def test_agent_service_reuses_exact_session_prefix_when_history_is_returned():
     assert engine.prefills[-1][1:] == (6, 1, 6)
 
 
+def test_agent_service_clips_output_budget_to_remaining_context():
+    class SmallContextEngine(FakeAgentEngine):
+        max_seq = 6
+
+    engine = SmallContextEngine()
+    svc = AgentService(engine)
+
+    res = svc.complete(AgentRequest(
+        session_id="small-context",
+        messages=[{"role": "user", "content": "abc"}],  # 4 prompt tokens
+        max_tokens=8,
+    ))
+
+    assert res.usage["completion_tokens"] == 2
+    assert engine.prefills[-1][2] == 2
+    assert engine.generate_calls[-1] == (2, 6)
+
+
 def test_agent_service_uses_message_append_when_visible_history_hides_tokens():
     class HiddenEngine(FakeAgentEngine):
         def __init__(self):
@@ -513,6 +531,27 @@ def test_qwen36_agent_fastapi_rejects_output_above_service_cap():
 
     assert resp.status_code == 400
     assert "max_tokens must be <= 8" in resp.text
+
+
+def test_qwen36_agent_fastapi_rejects_full_prompt_before_streaming():
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    from serving.qwen36_agent.server import build_app
+
+    class TinyContextEngine(FakeAgentEngine):
+        max_seq = 3
+
+    app = build_app(AgentService(TinyContextEngine()))
+    client = TestClient(app)
+
+    resp = client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "abc"}],  # 4 prompt tokens
+        "max_tokens": 2,
+        "stream": True,
+    })
+
+    assert resp.status_code == 400
+    assert "leaves no room under max_seq" in resp.text
 
 
 def test_agent_service_applies_default_session_id_for_openai_clients():

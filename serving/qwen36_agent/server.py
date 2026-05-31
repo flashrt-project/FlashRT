@@ -63,6 +63,7 @@ def build_app(service: AgentService):
         try:
             req = service.request_from_openai(raw)
             if req.stream:
+                service.validate_request_bounds(req)
                 return StreamingResponse(
                     service.stream_openai(req, model=service.engine.model_name),
                     media_type="text/event-stream",
