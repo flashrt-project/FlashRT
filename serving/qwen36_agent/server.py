@@ -151,15 +151,33 @@ def create_app_from_checkpoint(*, checkpoint: str,
     if warmup_shapes:
         log.info("startup warmup: %d shape(s), K=%d", len(warmup_shapes),
                  warmup_k)
+        for idx, (prompt_len, max_tokens) in enumerate(warmup_shapes, start=1):
+            route_hint = (
+                "graph-only"
+                if int(prompt_len) > int(warmup_committed_max_prompt)
+                else "committed-stream"
+            )
+            log.info(
+                "startup warmup queued %d/%d: prompt_len=%d max_tokens=%d "
+                "mode=%s",
+                idx, len(warmup_shapes), int(prompt_len), int(max_tokens),
+                route_hint,
+            )
+
+        def _log_warmup_result(index: int, total: int, item: Dict[str, Any]):
+            log.info("startup warmup done %d/%d: %s", index, total, item)
+
         warmed = engine.warmup_committed_stream(
             warmup_shapes,
             K=warmup_k,
             committed_max_prompt=warmup_committed_max_prompt,
             long_decode_graphs=True,
             long_prefill_graphs=warm_long_prefill_graphs,
+            on_result=_log_warmup_result,
         )
-        for item in warmed:
-            log.info("startup warmup result: %s", item)
+        total_ms = sum(float(item.get("wall_ms", 0.0)) for item in warmed)
+        log.info("startup warmup complete: %d shape(s), total_wall_ms=%.1f",
+                 len(warmed), total_ms)
     if capsule_budget_bytes > 0:
         log.info("capsule pinning enabled, budget %.0f MB",
                  capsule_budget_bytes / (1 << 20))

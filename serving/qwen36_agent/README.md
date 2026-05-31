@@ -171,6 +171,15 @@ Startup warmup moves CUDA-graph capture out of the first request: it runs real
 committed-stream warmup for short/medium shapes and graph-only warmup for larger
 long-context shapes.
 
+Startup logs print every queued warmup shape and then a `startup warmup done
+i/N` line as each shape finishes. Per-request logs use the same metric fields for
+both buffered and streaming responses:
+
+```text
+complete sid=... prompt=... completion=... prefill_ms=... first_delta_ms=... decode_ms=... decode_tok/s=...
+stream   sid=... prompt=... completion=... prefill_ms=... first_delta_ms=... decode_ms=... decode_tok/s=...
+```
+
 On SM120, the server defaults to the same optimized decode kernels used by the
 benchmark path (`FLASHRT_QWEN36_DECODE_FASTGEMM=1` and
 `FLASHRT_QWEN36_VERIFY_WARPSPLIT=1`) unless the environment explicitly overrides

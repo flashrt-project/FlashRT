@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Sequence
 
 from .engine import DecodeChunk
 
@@ -377,6 +377,7 @@ class Qwen36FrontendAgentEngine:
             committed_max_prompt: int = 1024,
             long_decode_graphs: bool = True,
             long_prefill_graphs: bool = False,
+            on_result: Callable[[int, int, Dict[str, Any]], None] | None = None,
     ) -> List[Dict[str, Any]]:
         """Move committed-stream graph capture out of the first request.
 
@@ -388,17 +389,21 @@ class Qwen36FrontendAgentEngine:
 
         out: List[Dict[str, Any]] = []
         for prompt_len, max_tokens in shapes:
+            index = len(out) + 1
             prompt_len = int(prompt_len)
             max_tokens = int(max_tokens)
             if prompt_len <= 0 or max_tokens <= 0:
                 continue
             if self.max_seq and prompt_len + max_tokens > self.max_seq:
-                out.append({
+                item = {
                     "prompt_len": prompt_len,
                     "max_tokens": max_tokens,
                     "route": "skip",
                     "reason": "exceeds max_seq",
-                })
+                }
+                out.append(item)
+                if on_result is not None:
+                    on_result(index, len(shapes), item)
                 continue
 
             use_long = (
@@ -422,14 +427,17 @@ class Qwen36FrontendAgentEngine:
                         [(prompt_len, max_tokens)], K=K)
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
-                out.append({
+                item = {
                     "prompt_len": prompt_len,
                     "max_tokens": max_tokens,
                     "route": "long_graphs",
                     "prefill_graphs": len(prefill_warmed),
                     "decode_graphs": len(decode_warmed),
                     "wall_ms": (time.perf_counter() - t0) * 1000.0,
-                })
+                }
+                out.append(item)
+                if on_result is not None:
+                    on_result(index, len(shapes), item)
                 continue
 
             ids = self.dummy_token_ids(prompt_len)
@@ -437,11 +445,14 @@ class Qwen36FrontendAgentEngine:
             _ = list(self.generate_stream(max_tokens=max_tokens, K=K))
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
-            out.append({
+            item = {
                 "prompt_len": prompt_len,
                 "max_tokens": max_tokens,
                 "route": self._last_route,
                 "prefill_ms": self._last_prefill_ms,
                 "wall_ms": (time.perf_counter() - t0) * 1000.0,
-            })
+            }
+            out.append(item)
+            if on_result is not None:
+                on_result(index, len(shapes), item)
         return out
