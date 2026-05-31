@@ -143,28 +143,36 @@ class Qwen36FrontendAgentEngine:
     def append_suffix_tokens_for_messages(
             self, previous_messages, incoming_messages, *,
             tools=None, enable_thinking: bool = False) -> List[int] | None:
-        """Tokenize only the message suffix after a completed assistant turn."""
-        if tools:
-            return None
+        """Tokenize only the message suffix after a completed assistant turn.
+
+        Agent clients replay tool-call history through their own OpenAI/SDK
+        adapters.  The replayed full prompt may not be byte-identical to the
+        exact tool-call text the model generated, but the continuation after
+        the completed assistant message is still appendable from the hot GPU
+        state.  Prefer a message-boundary suffix over full-prompt token prefix
+        matching whenever the previous visible messages are a strict prefix of
+        the incoming messages.
+        """
         if not previous_messages or len(incoming_messages) <= len(previous_messages):
             return None
         if incoming_messages[:len(previous_messages)] != previous_messages:
             return None
-        last = previous_messages[-1]
-        if last.get("role") != "assistant":
-            return None
-        content = last.get("content") or ""
-        rendered_content = content.rstrip()
+
+        previous_rendered = self.render_chat(
+            previous_messages,
+            tools=tools or None,
+            add_generation_prompt=False,
+            enable_thinking=enable_thinking,
+        )
         rendered = self.render_chat(
             incoming_messages,
-            tools=None,
+            tools=tools or None,
             add_generation_prompt=True,
             enable_thinking=enable_thinking,
         )
-        idx = rendered.rfind(rendered_content)
-        if idx < 0:
+        if not rendered.startswith(previous_rendered):
             return None
-        suffix = rendered[idx + len(rendered_content):]
+        suffix = rendered[len(previous_rendered):]
         if not suffix:
             return None
         return self.tokenize_text(suffix)
@@ -302,13 +310,15 @@ class Qwen36FrontendAgentEngine:
 
     def generate_stream(self, *, max_tokens: int,
                         K: int) -> Iterable[DecodeChunk]:
-        if self._last_route == "long":
-            chunks = self.fe.decode_long_ctx_nvfp4_committed_stream(
-                max_new_tokens=int(max_tokens), K=int(K))
-        else:
-            chunks = self.fe.decode_own_speculative_nvfp4_committed_stream(
-                max_new_tokens=int(max_tokens), K=int(K))
         stop_ids = self._visible_stop_token_ids()
+        if self._last_route == "long":
+            chunks = self._committed_stream(
+                self.fe.decode_long_ctx_nvfp4_committed_stream,
+                max_tokens=max_tokens, K=K, stop_ids=stop_ids)
+        else:
+            chunks = self._committed_stream(
+                self.fe.decode_own_speculative_nvfp4_committed_stream,
+                max_tokens=max_tokens, K=K, stop_ids=stop_ids)
         for token_chunk in chunks:
             ids = tuple(int(t) for t in token_chunk)
             stop_at = next(
@@ -334,6 +344,16 @@ class Qwen36FrontendAgentEngine:
                 token_ids=committed_ids, text=text, accepted=len(visible_ids),
                 stop=True, state_lookahead=len(ids) - len(committed_ids))
             break
+
+    @staticmethod
+    def _committed_stream(fn, *, max_tokens: int, K: int, stop_ids: set[int]):
+        try:
+            return fn(max_new_tokens=int(max_tokens), K=int(K),
+                      stop_token_ids=tuple(int(t) for t in stop_ids))
+        except TypeError as exc:
+            if "stop_token_ids" not in str(exc):
+                raise
+            return fn(max_new_tokens=int(max_tokens), K=int(K))
 
     def _visible_stop_token_ids(self) -> set[int]:
         tokenizer = self.fe._tokenizer

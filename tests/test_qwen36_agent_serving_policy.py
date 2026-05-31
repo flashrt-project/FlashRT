@@ -121,6 +121,7 @@ class FakeAgentEngine:
 
     def __init__(self):
         self.prefills = []
+        self.generate_calls = []
         self.outputs = [
             DecodeChunk((ord("h"),), "h", 1),
             DecodeChunk((ord("i"),), "i", 1),
@@ -139,7 +140,7 @@ class FakeAgentEngine:
         self.prefills.append((list(token_ids), cached_tokens, max_tokens, K))
 
     def generate_stream(self, *, max_tokens, K):
-        del K
+        self.generate_calls.append((max_tokens, K))
         yield from self.outputs[:max_tokens]
 
 
@@ -376,6 +377,53 @@ def test_agent_service_stream_openai_reuses_hot_session_prefix():
     assert engine.prefills[-1][1:] == (6, 1, 6)
 
 
+def test_agent_service_message_append_ignores_tool_call_wire_ids():
+    class SuffixEngine(FakeAgentEngine):
+        def append_suffix_tokens_for_messages(
+                self, previous_messages, incoming_messages, *,
+                tools=None, enable_thinking=False):
+            del tools, enable_thinking
+            if previous_messages != incoming_messages[:len(previous_messages)]:
+                return None
+            return [7, 8]
+
+    engine = SuffixEngine()
+    svc = AgentService(engine)
+    session = svc.sessions.get_or_create("s")
+    session.commit([1, 2, 3])
+    svc.sessions.mark_hot("s")
+    session.visible_messages = [
+        {"role": "user", "content": "make"},
+        {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "call_server",
+            "index": 0,
+            "type": "function",
+            "function": {"name": "write", "arguments": "{\"x\":1}"},
+        }]},
+    ]
+    req = AgentRequest(
+        session_id="s",
+        messages=[
+            {"role": "user", "content": "make"},
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "call_client",
+                "type": "function",
+                "function": {"name": "write", "arguments": {"x": 1}},
+            }]},
+            {"role": "tool", "content": "ok"},
+        ],
+        tools=[{"type": "function"}],
+        max_tokens=1,
+    )
+    plan = session.plan([9, 9, 9, 9])
+
+    prompt, msg_plan = svc._message_append_prompt_tokens(session, req, plan)
+
+    assert prompt == [1, 2, 3, 7, 8]
+    assert msg_plan.action == "message_append"
+    assert msg_plan.cached_tokens == 3
+
+
 def test_agent_service_pin_prefix_fails_without_capsule_budget():
     engine = FakeAgentEngine()
     svc = AgentService(engine)
@@ -610,6 +658,44 @@ def test_qwen36_frontend_agent_engine_wires_short_committed_split():
     chunks = list(engine.generate_stream(max_tokens=2, K=4))
     assert [c.token_ids for c in chunks] == [(ord("a"),), (ord("b"),)]
     assert "".join(c.text for c in chunks) == "ab"
+
+
+def test_qwen36_frontend_agent_engine_appends_tool_suffix_from_message_boundary():
+    class BoundaryTokenizer(FakeTokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            rendered = ""
+            for msg in messages:
+                rendered += f"<{msg.get('role')}>"
+                rendered += msg.get("content") or ""
+                if msg.get("tool_calls"):
+                    rendered += "<tool_call/>"
+                rendered += "</m>"
+            if kwargs.get("add_generation_prompt"):
+                rendered += "<assistant>"
+            return rendered
+
+    class BoundaryFrontend(FakeFrontend):
+        def __init__(self):
+            super().__init__()
+            self._tokenizer = BoundaryTokenizer()
+
+    engine = Qwen36FrontendAgentEngine(BoundaryFrontend(), model_name="fake")
+    previous = [
+        {"role": "user", "content": "make file"},
+        {"role": "assistant", "content": "ok", "tool_calls": [{
+            "type": "function",
+            "function": {"name": "write", "arguments": "{}"},
+        }]},
+    ]
+    incoming = [
+        *previous,
+        {"role": "tool", "content": "done"},
+    ]
+
+    suffix = engine.append_suffix_tokens_for_messages(
+        previous, incoming, tools=[{"type": "function"}])
+
+    assert suffix == [ord(ch) for ch in "<tool>done</m><assistant>"]
 
 
 def test_qwen36_frontend_agent_engine_hides_think_tags_by_default():

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -152,7 +153,8 @@ class AgentService:
         return effective_cached, plan
 
     def _capsule_prefill(
-            self, req: AgentRequest, prompt_tokens: List[int], session
+            self, req: AgentRequest, prompt_tokens: List[int], session, *,
+            K: int
     ) -> Optional[PrefixPlan]:
         """Restore-or-pin a shared-prefix capsule when ``pin_prefix`` is requested
         and viable, performing the prefill on the engine and returning its
@@ -194,7 +196,7 @@ class AgentService:
         if entry is not None:
             self.engine.prefill_from_capsule(
                 entry.capsule, prompt_tokens,
-                max_tokens=req.max_tokens, K=req.K)
+                max_tokens=req.max_tokens, K=K)
             return PrefixPlan(
                 session_id=session.session_id,
                 cached_tokens=aligned,
@@ -205,7 +207,7 @@ class AgentService:
             )
         cap = self.engine.prefill_and_pin(
             prompt_tokens, aligned_len=aligned,
-            max_tokens=req.max_tokens, K=req.K)
+            max_tokens=req.max_tokens, K=K)
         nbytes = int(cap.get("nbytes", 0)) if isinstance(cap, dict) else 0
         pinned = self.capsules.pin(CapsuleEntry(
             key=key, aligned_len=aligned, nbytes=nbytes, capsule=cap))
@@ -227,8 +229,14 @@ class AgentService:
         if not previous or not hasattr(
                 self.engine, "append_suffix_tokens_for_messages"):
             return None, None
+        previous_for_suffix = previous
+        incoming_prefix = req.messages[:len(previous)]
+        if incoming_prefix != previous:
+            if not self._messages_equivalent_prefix(previous, incoming_prefix):
+                return None, None
+            previous_for_suffix = incoming_prefix
         suffix = self.engine.append_suffix_tokens_for_messages(
-            previous,
+            previous_for_suffix,
             req.messages,
             tools=req.tools,
             enable_thinking=req.enable_thinking,
@@ -243,6 +251,90 @@ class AgentService:
             incoming_tokens=plan.incoming_tokens,
             matched_tokens=plan.matched_tokens,
             action="message_append",
+        )
+
+    @classmethod
+    def _messages_equivalent_prefix(
+            cls, previous: List[Dict[str, Any]],
+            incoming: List[Dict[str, Any]]) -> bool:
+        if len(incoming) != len(previous):
+            return False
+        return all(cls._messages_equivalent(a, b)
+                   for a, b in zip(previous, incoming))
+
+    @classmethod
+    def _messages_equivalent(cls, a: Dict[str, Any],
+                             b: Dict[str, Any]) -> bool:
+        if a.get("role") != b.get("role"):
+            return False
+        if (a.get("content") or "") != (b.get("content") or ""):
+            return False
+        return cls._tool_calls_equivalent(
+            a.get("tool_calls"), b.get("tool_calls"))
+
+    @staticmethod
+    def _tool_calls_equivalent(a: Any, b: Any) -> bool:
+        if not a and not b:
+            return True
+        if not isinstance(a, list) or not isinstance(b, list):
+            return False
+        if len(a) != len(b):
+            return False
+
+        def norm_call(tc: Any) -> Any:
+            if not isinstance(tc, dict):
+                return tc
+            fn = tc.get("function")
+            if not isinstance(fn, dict):
+                return fn
+            args = fn.get("arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args) if args.strip() else {}
+                except Exception:
+                    pass
+            return {
+                "type": tc.get("type", "function"),
+                "name": fn.get("name"),
+                "arguments": args,
+            }
+
+        return [norm_call(x) for x in a] == [norm_call(x) for x in b]
+
+    @staticmethod
+    def _effective_k(req: AgentRequest) -> int:
+        return int(req.K)
+
+    def _log_reuse_miss(self, session, plan: PrefixPlan,
+                        incoming_messages: List[Dict[str, Any]]) -> None:
+        if plan.action in ("append", "exact", "restore", "message_append"):
+            return
+        previous = getattr(session, "visible_messages", None) or []
+
+        def msg_shape(msg: Dict[str, Any]) -> str:
+            role = str(msg.get("role", "?"))
+            has_tools = bool(msg.get("tool_calls"))
+            content = msg.get("content")
+            if content is None:
+                ckind = "none"
+            elif isinstance(content, str):
+                ckind = f"str:{len(content)}"
+            elif isinstance(content, list):
+                ckind = f"list:{len(content)}"
+            else:
+                ckind = type(content).__name__
+            return f"{role}/{ckind}/tools={int(has_tools)}"
+
+        log.info(
+            "reuse_miss sid=%s action=%s matched=%d cached_len=%d "
+            "prev_tokens=%d incoming_tokens=%d hot=%s prev_msgs=%d "
+            "incoming_msgs=%d prev_tail=%s incoming_tail=%s",
+            session.session_id, plan.action, plan.matched_tokens,
+            session.cached_len, len(session.token_ids),
+            plan.incoming_tokens, self.sessions.hot_session_id,
+            len(previous), len(incoming_messages),
+            [msg_shape(m) for m in previous[-4:]],
+            [msg_shape(m) for m in incoming_messages[-4:]],
         )
 
     @staticmethod
@@ -287,8 +379,10 @@ class AgentService:
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         engine_prompt_tokens = prompt_tokens
+        decode_k = self._effective_k(req)
         t0 = time.perf_counter()
-        cap_plan = self._capsule_prefill(req, prompt_tokens, session)
+        cap_plan = self._capsule_prefill(
+            req, prompt_tokens, session, K=decode_k)
         if cap_plan is not None:
             plan = cap_plan
         else:
@@ -300,11 +394,12 @@ class AgentService:
                 effective_cached = plan.cached_tokens
             else:
                 effective_cached, plan = self._effective_plan(session, plan)
+                self._log_reuse_miss(session, plan, req.messages)
             self.engine.prefill(
                 engine_prompt_tokens,
                 cached_tokens=effective_cached,
                 max_tokens=req.max_tokens,
-                K=req.K,
+                K=decode_k,
             )
         t_prefill = time.perf_counter()
 
@@ -315,7 +410,8 @@ class AgentService:
         decode_started = time.perf_counter()
         state_lookahead = False
         saw_tool_call = False
-        for chunk in self.engine.generate_stream(max_tokens=req.max_tokens, K=req.K):
+        for chunk in self.engine.generate_stream(
+                max_tokens=req.max_tokens, K=decode_k):
             generated_ids.extend(int(t) for t in chunk.token_ids)
             if getattr(chunk, "state_lookahead", 0):
                 state_lookahead = True
@@ -371,11 +467,13 @@ class AgentService:
         log.info(
             "complete sid=%s action=%s prompt=%d cached=%d new_prefill=%d "
             "completion=%d prefill_ms=%.1f first_delta_ms=%.1f decode_ms=%.1f "
-            "decode_tok/s=%.1f",
+            "decode_tok/s=%.1f finish=%s tool_calls=%d state_lookahead=%d "
+            "hot_after=%s K=%d",
             session.session_id, plan.action, len(prompt_tokens),
             stats.cached_tokens, stats.new_prefill_tokens, completion_tokens,
             stats.prefill_ms, stats.first_delta_ms, stats.decode_ms,
-            stats.decode_tok_per_s,
+            stats.decode_tok_per_s, finish_reason, len(tool_calls),
+            int(state_lookahead), self.sessions.hot_session_id, decode_k,
         )
         return AgentResult(
             completion_id=completion_id,
@@ -406,8 +504,10 @@ class AgentService:
         )
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         engine_prompt_tokens = prompt_tokens
+        decode_k = self._effective_k(req)
         t0 = time.perf_counter()
-        cap_plan = self._capsule_prefill(req, prompt_tokens, session)
+        cap_plan = self._capsule_prefill(
+            req, prompt_tokens, session, K=decode_k)
         if cap_plan is not None:
             plan = cap_plan
         else:
@@ -419,11 +519,12 @@ class AgentService:
                 effective_cached = msg_plan.cached_tokens
             else:
                 effective_cached, plan = self._effective_plan(session, plan)
+                self._log_reuse_miss(session, plan, req.messages)
             self.engine.prefill(
                 engine_prompt_tokens,
                 cached_tokens=effective_cached,
                 max_tokens=req.max_tokens,
-                K=req.K,
+                K=decode_k,
             )
         t_prefill = time.perf_counter()
 
@@ -438,9 +539,9 @@ class AgentService:
         first_delta_ms = 0.0
         stream_started = time.perf_counter()
         backend_decode_ms = 0.0
-        chunks = iter(self.engine.generate_stream(max_tokens=req.max_tokens,
-                                                  K=req.K))
         saw_tool_call = False
+        chunks = iter(self.engine.generate_stream(max_tokens=req.max_tokens,
+                                                  K=decode_k))
         while True:
             next_t0 = time.perf_counter()
             try:
@@ -504,11 +605,14 @@ class AgentService:
         log.info(
             "stream sid=%s action=%s prompt=%d cached=%d new_prefill=%d "
             "completion=%d prefill_ms=%.1f first_delta_ms=%.1f decode_ms=%.1f "
-            "decode_tok/s=%.1f stream_wall_ms=%.1f stream_wall_tok/s=%.1f",
+            "decode_tok/s=%.1f stream_wall_ms=%.1f stream_wall_tok/s=%.1f "
+            "finish=%s tool_calls=%d state_lookahead=%d hot_after=%s K=%d",
             session.session_id, plan.action, len(prompt_tokens),
             plan.cached_tokens, plan.new_prefill_tokens, completion_tokens,
             (t_prefill - t0) * 1000.0, first_delta_ms, decode_ms,
             decode_tok_per_s, stream_wall_ms, stream_wall_tok_per_s,
+            "tool_calls" if seen_tool_call else "stop", len(tool_calls),
+            int(state_lookahead), self.sessions.hot_session_id, decode_k,
         )
         for ev in deferred_tool_events:
             yield sse_data(event_chunk(completion_id, model, ev))

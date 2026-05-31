@@ -4731,7 +4731,8 @@ class Qwen36TorchFrontendRtx:
         return self._agent_pending_tok_buf
 
     def decode_own_speculative_nvfp4_committed_stream(
-            self, *, max_new_tokens: int, K: int = 6):
+            self, *, max_new_tokens: int, K: int = 6,
+            stop_token_ids=None):
         """Decode from the current committed-stream boundary.
 
         Every yielded chunk has already been replayed through the main model.
@@ -4754,6 +4755,7 @@ class Qwen36TorchFrontendRtx:
         hidden = self._cfg['hidden_size']
         cur_pos = int(self._agent_stream_cur_pos)
         pending_tok = self._agent_stream_pending_tok
+        stop_ids = {int(t) for t in (stop_token_ids or ())}
         h = self._agent_stream_h
         ev_pf0 = self._agent_stream_pf0
         ev_pf1 = self._agent_stream_pf1
@@ -4878,6 +4880,7 @@ class Qwen36TorchFrontendRtx:
                 # Commit and yield only inputs that verify actually processed:
                 # pending token + accepted drafts.  The correction/bonus token
                 # becomes private lookahead for the next cycle.
+                step_start = cur_pos
                 committed = [int(pending_tok.item())]
                 if N > 0:
                     committed.extend(int(x) for x in all_argmax[:N].tolist())
@@ -4909,7 +4912,33 @@ class Qwen36TorchFrontendRtx:
                     raise RuntimeError(
                         'internal error: committed chunk exceeds remaining '
                         'budget')
-                commit_count = len(committed)
+                stop_i = next(
+                    (i for i, tok in enumerate(committed)
+                     if tok in stop_ids),
+                    None,
+                )
+                stop_after_yield = stop_i is not None
+                if stop_i is not None:
+                    committed = committed[:stop_i + 1]
+                    commit_count = len(committed)
+                    if stop_i != (cur_pos - step_start - 1):
+                        fvk.gpu_copy(
+                            self._lin_state.data_ptr(),
+                            self._K_lin_state_per_step[stop_i].data_ptr(),
+                            self._lin_state.numel() * 2, s,
+                        )
+                        fvk.gpu_copy(
+                            self._lin_conv_state.data_ptr(),
+                            self._K_lin_conv_state_per_step[stop_i].data_ptr(),
+                            self._lin_conv_state.numel() * 2, s,
+                        )
+                    pending_tok = self._agent_stable_pending_tok(
+                        all_argmax[stop_i:stop_i + 1].view(1, 1))
+                    h = self._K_last_hidden_buf[
+                        :, stop_i:stop_i + 1, :].contiguous()
+                    cur_pos = step_start + commit_count
+                else:
+                    commit_count = len(committed)
                 self._prefill_h_cache[
                     commit_start:commit_start + commit_count].copy_(
                         self._K_last_hidden_buf[
@@ -4919,6 +4948,8 @@ class Qwen36TorchFrontendRtx:
                 self._agent_stream_pending_tok = pending_tok
                 self._agent_stream_h = h
                 yield tuple(committed)
+                if stop_after_yield:
+                    break
 
             ev_dec1.record()
             torch.cuda.synchronize()
@@ -9119,7 +9150,8 @@ class Qwen36TorchFrontendRtx:
         self._agent_stream_pf1 = ev_pf1
 
     def decode_long_ctx_nvfp4_committed_stream(
-            self, *, max_new_tokens: int, K: int = 6):
+            self, *, max_new_tokens: int, K: int = 6,
+            stop_token_ids=None):
         """Yield committed chunks from the long FP8-KV/TQ agent boundary."""
         import torch
 
@@ -9137,6 +9169,7 @@ class Qwen36TorchFrontendRtx:
         cur_pos = int(self._agent_stream_cur_pos)
         prompt_len = int(self._agent_stream_prompt_len)
         pending_tok = self._agent_stream_pending_tok
+        stop_ids = {int(t) for t in (stop_token_ids or ())}
         h = self._agent_stream_h
         mtp_base = int(self._agent_stream_mtp_base)
         K = int(getattr(self, '_agent_stream_K', K))
@@ -9342,6 +9375,8 @@ class Qwen36TorchFrontendRtx:
                 self._spec_attempts += 1
                 self._spec_accepts += N
 
+                step_start = cur_pos
+                mtp_start = mtp_base
                 committed = [int(pending_tok.item())]
                 if N > 0:
                     committed.extend(int(x) for x in all_argmax[:N].tolist())
@@ -9369,12 +9404,38 @@ class Qwen36TorchFrontendRtx:
                         all_argmax[N:N + 1].view(1, 1))
                     cur_pos += N + 1
                     mtp_base += N + 1
+                stop_i = next(
+                    (i for i, tok in enumerate(committed)
+                     if tok in stop_ids),
+                    None,
+                )
+                stop_after_yield = stop_i is not None
+                if stop_i is not None:
+                    committed = committed[:stop_i + 1]
+                    commit_count = len(committed)
+                    if stop_i != (cur_pos - step_start - 1):
+                        fvk.gpu_copy(
+                            self._lin_state.data_ptr(),
+                            self._K_lin_state_per_step[stop_i].data_ptr(),
+                            self._lin_state.numel() * 2, s,
+                        )
+                        fvk.gpu_copy(
+                            self._lin_conv_state.data_ptr(),
+                            self._K_lin_conv_state_per_step[stop_i].data_ptr(),
+                            self._lin_conv_state.numel() * 2, s,
+                        )
+                    h = self._K_last_hidden_buf[:, stop_i:stop_i + 1, :]
+                    pending_tok = self._agent_stable_pending_tok(
+                        all_argmax[stop_i:stop_i + 1].view(1, 1))
+                    cur_pos = step_start + commit_count
+                    mtp_base = mtp_start + commit_count
+                else:
+                    commit_count = len(committed)
                 self._tq_mark_dequant_valid_end(cur_pos)
                 self._fp8_mark_dequant_valid_end(cur_pos)
 
-                commit_count = len(committed)
                 self._agent_long_h_tail_append(
-                    cur_pos - commit_count,
+                    step_start,
                     self._K_last_hidden_buf[:, :commit_count, :].view(
                         commit_count, hidden))
                 emitted += len(committed)
@@ -9383,6 +9444,8 @@ class Qwen36TorchFrontendRtx:
                 self._agent_stream_h = h
                 self._agent_stream_mtp_base = mtp_base
                 yield tuple(committed)
+                if stop_after_yield:
+                    break
 
                 if (adaptive_k and K > 3
                         and self._spec_attempts >= 8
