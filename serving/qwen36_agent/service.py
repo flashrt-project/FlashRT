@@ -27,7 +27,7 @@ from .tool_stream import StreamEvent, ToolCallStreamParser
 class AgentRequest:
     messages: List[Dict[str, Any]]
     tools: Optional[List[Dict[str, Any]]] = None
-    max_tokens: int = 256
+    max_tokens: int = 1024
     stream: bool = False
     session_id: Optional[str] = None
     cache_salt: str = ""
@@ -511,7 +511,8 @@ def parse_pin_prefix(value: Any) -> Optional[int]:
     return n if n > 0 else None
 
 
-def request_from_openai(req: Dict[str, Any], *, default_k: int = 6) -> AgentRequest:
+def request_from_openai(req: Dict[str, Any], *, default_k: int = 6,
+                        default_max_tokens: int = 1024) -> AgentRequest:
     messages = validate_messages(req.get("messages"))
     tools = validate_tools(req.get("tools"))
     # Fall back to max_completion_tokens only when max_tokens is absent *or*
@@ -521,7 +522,8 @@ def request_from_openai(req: Dict[str, Any], *, default_k: int = 6) -> AgentRequ
     raw_max_tokens = req.get("max_tokens")
     if raw_max_tokens is None:
         raw_max_tokens = req.get("max_completion_tokens")
-    max_tokens = parse_int(raw_max_tokens, name="max_tokens", default=256)
+    max_tokens = parse_int(
+        raw_max_tokens, name="max_tokens", default=default_max_tokens)
     if max_tokens < 1:
         raise ValueError("max_tokens must be >= 1")
     K = parse_int(req.get("flashrt_K"), name="flashrt_K", default=default_k)
