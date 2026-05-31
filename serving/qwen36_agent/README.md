@@ -191,8 +191,8 @@ If startup warmup is enabled, logs print every queued warmup shape and then a
 same metric fields for both buffered and streaming responses:
 
 ```text
-complete sid=... prompt=... completion=... prefill_ms=... first_delta_ms=... decode_ms=... decode_tok/s=...
-stream   sid=... prompt=... completion=... prefill_ms=... first_delta_ms=... decode_ms=... decode_tok/s=... stream_wall_tok/s=...
+complete | sid=... | act=message_append | tok p=  9251 cache=  9237 new=   22 out= 384 | ms prefill=   13.0 ttft=  146.0 decode= 3278.4 | speed decode= 117.1 tok/s | finish=stop | tools=0 | lookahead=0 | hot=... | K=6
+stream   | sid=... | act=message_append | tok p=  3110 cache=  3089 new=   31 out= 512 | ms prefill=   12.8 ttft=   72.7 decode= 4316.9 | speed decode= 118.6 tok/s | stream= 4418.5ms/ 115.9 tok/s | finish=stop | tools=0 | lookahead=0 | hot=... | K=6
 ```
 
 For streaming responses, `decode_tok/s` measures backend decode-active time;

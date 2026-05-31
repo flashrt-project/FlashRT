@@ -363,6 +363,44 @@ class AgentService:
         else:
             self.sessions.mark_hot(session.session_id)
 
+    @staticmethod
+    def _fmt_metric_line(
+            kind: str, *, session_id: str, action: str,
+            prompt_tokens: int, cached_tokens: int, new_prefill_tokens: int,
+            completion_tokens: int, prefill_ms: float,
+            first_delta_ms: float, decode_ms: float,
+            decode_tok_per_s: float, finish: str, tool_calls: int,
+            state_lookahead: bool, hot_after: Optional[str], K: int,
+            stream_wall_ms: Optional[float] = None,
+            stream_wall_tok_per_s: Optional[float] = None) -> str:
+        """Stable one-line serving metrics optimized for terminal scanning."""
+        parts = [
+            f"{kind:<8}",
+            f"sid={session_id}",
+            f"act={action:<14}",
+            (
+                f"tok p={prompt_tokens:>6} cache={cached_tokens:>6} "
+                f"new={new_prefill_tokens:>5} out={completion_tokens:>4}"
+            ),
+            (
+                f"ms prefill={prefill_ms:>7.1f} "
+                f"ttft={first_delta_ms:>7.1f} decode={decode_ms:>7.1f}"
+            ),
+            f"speed decode={decode_tok_per_s:>6.1f} tok/s",
+        ]
+        if stream_wall_ms is not None and stream_wall_tok_per_s is not None:
+            parts.append(
+                f"stream={stream_wall_ms:>7.1f}ms/"
+                f"{stream_wall_tok_per_s:>6.1f} tok/s")
+        parts.extend([
+            f"finish={finish}",
+            f"tools={tool_calls}",
+            f"lookahead={int(state_lookahead)}",
+            f"hot={hot_after}",
+            f"K={K}",
+        ])
+        return " | ".join(parts)
+
     def _complete(self, req: AgentRequest) -> AgentResult:
         if req.max_tokens < 1:
             raise ValueError("max_tokens must be >= 1")
@@ -464,17 +502,24 @@ class AgentService:
             "completion_tokens": completion_tokens,
             "total_tokens": len(prompt_tokens) + completion_tokens,
         }
-        log.info(
-            "complete sid=%s action=%s prompt=%d cached=%d new_prefill=%d "
-            "completion=%d prefill_ms=%.1f first_delta_ms=%.1f decode_ms=%.1f "
-            "decode_tok/s=%.1f finish=%s tool_calls=%d state_lookahead=%d "
-            "hot_after=%s K=%d",
-            session.session_id, plan.action, len(prompt_tokens),
-            stats.cached_tokens, stats.new_prefill_tokens, completion_tokens,
-            stats.prefill_ms, stats.first_delta_ms, stats.decode_ms,
-            stats.decode_tok_per_s, finish_reason, len(tool_calls),
-            int(state_lookahead), self.sessions.hot_session_id, decode_k,
-        )
+        log.info(self._fmt_metric_line(
+            "complete",
+            session_id=session.session_id,
+            action=plan.action,
+            prompt_tokens=len(prompt_tokens),
+            cached_tokens=stats.cached_tokens,
+            new_prefill_tokens=stats.new_prefill_tokens,
+            completion_tokens=completion_tokens,
+            prefill_ms=stats.prefill_ms,
+            first_delta_ms=stats.first_delta_ms,
+            decode_ms=stats.decode_ms,
+            decode_tok_per_s=stats.decode_tok_per_s,
+            finish=finish_reason,
+            tool_calls=len(tool_calls),
+            state_lookahead=state_lookahead,
+            hot_after=self.sessions.hot_session_id,
+            K=decode_k,
+        ))
         return AgentResult(
             completion_id=completion_id,
             session_id=session.session_id,
@@ -602,18 +647,26 @@ class AgentService:
             completion_tokens * 1000.0 / stream_wall_ms
             if stream_wall_ms > 0 else 0.0
         )
-        log.info(
-            "stream sid=%s action=%s prompt=%d cached=%d new_prefill=%d "
-            "completion=%d prefill_ms=%.1f first_delta_ms=%.1f decode_ms=%.1f "
-            "decode_tok/s=%.1f stream_wall_ms=%.1f stream_wall_tok/s=%.1f "
-            "finish=%s tool_calls=%d state_lookahead=%d hot_after=%s K=%d",
-            session.session_id, plan.action, len(prompt_tokens),
-            plan.cached_tokens, plan.new_prefill_tokens, completion_tokens,
-            (t_prefill - t0) * 1000.0, first_delta_ms, decode_ms,
-            decode_tok_per_s, stream_wall_ms, stream_wall_tok_per_s,
-            "tool_calls" if seen_tool_call else "stop", len(tool_calls),
-            int(state_lookahead), self.sessions.hot_session_id, decode_k,
-        )
+        log.info(self._fmt_metric_line(
+            "stream",
+            session_id=session.session_id,
+            action=plan.action,
+            prompt_tokens=len(prompt_tokens),
+            cached_tokens=plan.cached_tokens,
+            new_prefill_tokens=plan.new_prefill_tokens,
+            completion_tokens=completion_tokens,
+            prefill_ms=(t_prefill - t0) * 1000.0,
+            first_delta_ms=first_delta_ms,
+            decode_ms=decode_ms,
+            decode_tok_per_s=decode_tok_per_s,
+            stream_wall_ms=stream_wall_ms,
+            stream_wall_tok_per_s=stream_wall_tok_per_s,
+            finish="tool_calls" if seen_tool_call else "stop",
+            tool_calls=len(tool_calls),
+            state_lookahead=state_lookahead,
+            hot_after=self.sessions.hot_session_id,
+            K=decode_k,
+        ))
         for ev in deferred_tool_events:
             yield sse_data(event_chunk(completion_id, model, ev))
         yield sse_data(done_chunk(
