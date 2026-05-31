@@ -130,8 +130,9 @@ class AgentService:
     ) -> Optional[PrefixPlan]:
         """Restore-or-pin a shared-prefix capsule when ``pin_prefix`` is requested
         and viable, performing the prefill on the engine and returning its
-        PrefixPlan. Returns None (caller uses the normal hot-append / rebuild path)
-        when pinning is disabled, unsupported, or the prefix is too short to pin.
+        PrefixPlan. Returns None only when the request did not ask for capsule
+        pinning. If the request does ask for pinning, fail fast on unsupported
+        configs instead of silently falling back to a different prefill route.
 
         A pinned capsule is keyed by the digest of its chunk-aligned prefix tokens,
         so a later turn or a different session whose prompt starts with the same
@@ -142,18 +143,26 @@ class AgentService:
         exact aligned-prefix digest match).
         """
         pin = req.pin_prefix
-        if not pin or not self.capsules.enabled:
+        if not pin:
             return None
+        if not self.capsules.enabled:
+            raise ValueError(
+                "flashrt_pin_prefix requires --capsule-budget-mb > 0")
         supports = getattr(self.engine, "supports_capsule", None)
         if not callable(supports) or not supports():
-            return None
+            raise ValueError(
+                "flashrt_pin_prefix requires a capsule-capable Qwen3.6 engine")
         prompt_len = len(prompt_tokens)
         pin_len = prompt_len if pin is True else min(int(pin), prompt_len)
         if pin_len <= 0:
             return None
         aligned = self.engine.capsule_aligned_len(pin_len, req.max_tokens)
         if aligned <= 0 or aligned > prompt_len:
-            return None
+            raise ValueError(
+                "flashrt_pin_prefix requires the long FP8-KV route and a "
+                "chunk-aligned prefix; start the server with a long-context "
+                "max_seq, --route-min-seq 0, and "
+                "FLASHRT_QWEN36_LONG_KV_CACHE=fp8")
         key = token_digest(prompt_tokens[:aligned], salt=req.cache_salt)
         entry = self.capsules.get(key)
         if entry is not None:

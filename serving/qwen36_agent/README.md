@@ -159,6 +159,12 @@ prompts rebuild until rollback/checkpoint support lands.
 | `--log-level` | `info` | uvicorn log level |
 | `--access-log` | off | enable uvicorn per-request access logs; off by default to avoid benchmark jitter |
 
+Capsule pin/restore in this server is a production long-route feature. If a
+request supplies `flashrt_pin_prefix`, the server requires a positive capsule
+budget plus the long FP8-KV route (`--route-min-seq 0` and a long-context
+`--max-seq`). It fails fast instead of silently falling back to the legacy short
+prefill path.
+
 Startup warmup moves CUDA-graph capture out of the first request: it runs real
 committed-stream warmup for short/medium shapes and graph-only warmup for larger
 long-context shapes.

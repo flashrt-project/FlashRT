@@ -100,8 +100,9 @@ def test_serving_capsule_restore_matches_cold_full_prefill(monkeypatch):
             == r_cold.usage["completion_tokens"])
 
 
-def test_serving_capsule_disabled_by_default(monkeypatch):
-    """With no budget, flashrt_pin_prefix is inert and the path is unchanged."""
+def test_serving_capsule_requires_budget(monkeypatch):
+    """With no budget, an explicit flashrt_pin_prefix fails fast instead of
+    silently falling back to the normal prefill path."""
     fe, _, _ = _service(monkeypatch)
     from serving.qwen36_agent.qwen36_engine import Qwen36FrontendAgentEngine
     from serving.qwen36_agent.service import AgentService, AgentRequest
@@ -110,8 +111,7 @@ def test_serving_capsule_disabled_by_default(monkeypatch):
     eng = Qwen36FrontendAgentEngine(fe)
     svc = AgentService(eng, sessions=SessionRegistry())  # budget 0
     assert not svc.capsules.enabled
-    res = svc.complete(AgentRequest(
-        messages=[{"role": "user", "content": "Hello."}],
-        max_tokens=8, session_id="t", K=6, pin_prefix=4096))
-    assert res.prefix_plan.action != "restore"
-    assert res.prefix_plan.action != "pin"
+    with pytest.raises(ValueError, match="capsule-budget"):
+        svc.complete(AgentRequest(
+            messages=[{"role": "user", "content": "Hello."}],
+            max_tokens=8, session_id="t", K=6, pin_prefix=4096))

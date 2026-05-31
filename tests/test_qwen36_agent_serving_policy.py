@@ -284,6 +284,40 @@ def test_agent_service_stream_openai_reuses_hot_session_prefix():
     assert engine.prefills[-1][1:] == (6, 1, 6)
 
 
+def test_agent_service_pin_prefix_fails_without_capsule_budget():
+    engine = FakeAgentEngine()
+    svc = AgentService(engine)
+
+    with pytest.raises(ValueError, match="capsule-budget"):
+        svc.complete(AgentRequest(
+            session_id="pin-no-budget",
+            messages=[{"role": "user", "content": "abc"}],
+            max_tokens=1,
+            pin_prefix=1,
+        ))
+
+
+def test_agent_service_pin_prefix_fails_when_long_route_unavailable():
+    class CapsuleButNoLongRouteEngine(FakeAgentEngine):
+        def supports_capsule(self):
+            return True
+
+        def capsule_aligned_len(self, prompt_len, max_tokens):
+            del prompt_len, max_tokens
+            return 0
+
+    engine = CapsuleButNoLongRouteEngine()
+    svc = AgentService(engine, capsule_budget_bytes=1024)
+
+    with pytest.raises(ValueError, match="long FP8-KV route"):
+        svc.complete(AgentRequest(
+            session_id="pin-no-long-route",
+            messages=[{"role": "user", "content": "abc"}],
+            max_tokens=1,
+            pin_prefix=1,
+        ))
+
+
 def test_qwen36_agent_fastapi_non_stream_and_stream_endpoints():
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient

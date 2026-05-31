@@ -139,6 +139,13 @@ def create_app_from_checkpoint(*, checkpoint: str,
     else:
         log.info("MTP head loaded; speculative decode enabled (default K=%d)",
                  warmup_k)
+    if capsule_budget_bytes > 0:
+        fe = getattr(engine, "fe", None)
+        if not bool(getattr(fe, "_long_ctx_mode", False)):
+            raise ValueError(
+                "--capsule-budget-mb requires the long FP8-KV route; use a "
+                "long-context --max-seq, --route-min-seq 0, and "
+                "FLASHRT_QWEN36_LONG_KV_CACHE=fp8")
     if warmup_shapes:
         log.info("startup warmup: %d shape(s), K=%d", len(warmup_shapes),
                  warmup_k)
