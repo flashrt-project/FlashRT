@@ -1,10 +1,11 @@
-"""serving/robot_pi07 — hierarchical two-VLA host (pi0.7-style, simplified).
+"""serving/robot_handoff — hierarchical planner->actor buffer hand-off.
 
-pi0.7 runtime is a multi-model hierarchy: a High-Level Policy emits a subtask, a
-World Model (BAGEL) emits subgoal images, and the action VLA consumes them.
-Simplified (BAGEL/world-model dropped) it is a two-stage hierarchy:
+The hierarchy shape is inspired by pi0.7's runtime (High-Level Policy -> World
+Model -> action VLA); this host does NOT run pi0.7. The two-stage form is:
 
     PLANNER (low rate) --subtask (shared Buffer)--> ACTOR (high rate) --> actions
+
+(an optional world-model stage can use Wan2.2 in place of pi0.7's BAGEL.)
 
 This host co-hosts TWO Pi05 instances through ONE exec ctx and verifies the
 multi-model hot-path mechanism:
@@ -21,7 +22,7 @@ semantic planner->language mapping. We verify the contract orchestration.
 Run (inside the CUDA container):
   PYTHONPATH=.:./exec/build \
   PYTORCH_ALLOC_CONF=expandable_segments:True \
-  python serving/robot_pi07/verify_pi07.py --checkpoint checkpoints/pi05_libero_pytorch
+  python serving/robot_handoff/verify_handoff.py --checkpoint checkpoints/pi05_libero_pytorch
 """
 
 import argparse
@@ -104,7 +105,7 @@ def main():
         assert np.isfinite(actions.numpy()).all()
         print(f"  tick {t}: actor acted (planner_run={ran_planner})")
 
-    print(f"\nPASS — pi0.7-sim hierarchy: {args.ticks} actor ticks, {planner_runs} planner runs "
+    print(f"\nPASS — planner->actor hand-off: {args.ticks} actor ticks, {planner_runs} planner runs "
           f"(1:{args.planner_every} multi-rate), planner->subtask->actor hand-off via shared "
           "buffer (verified), mid-run subtask interrupt (no recapture), two VLAs co-hosted via "
           "ONE exec ctx.")

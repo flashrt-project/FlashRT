@@ -218,9 +218,10 @@ it uses the **execution contract's Buffer snapshot directly** — a capsule is a
 including after the live boundary was overwritten — so episode reset *is* a capsule
 restore, evidenced on both sides.
 
-### 4.3 `robot_pi07/` — hierarchy: buffer hand-off (the contrast case)
+### 4.3 `robot_handoff/` — hierarchy: buffer hand-off (the contrast case)
 
-Not every multi-model pattern needs a capsule. The π0.7 hierarchy is a
+Not every multi-model pattern needs a capsule. A planner→actor hierarchy (shape
+inspired by π0.7; the host co-hosts models we have, it does not run π0.7) is a
 **zero-copy buffer hand-off**, not a state snapshot:
 
 ```

@@ -62,20 +62,22 @@ contract):
 Files: `verify_recap.py` (RL/CFG inference driven by the contract, cosine 1.0) ·
 `rollout_host.py` (the full host above).
 
-### `robot_pi07/` — hierarchical two-VLA host (π0.7-style)
-The π0.7 multi-model hierarchy (BAGEL world model dropped):
+### `robot_handoff/` — hierarchical planner→actor buffer hand-off
+A multi-model hierarchy (shape inspired by π0.7; does not run π0.7 — co-hosts
+models we have):
 ```
   PLANNER (low rate) ──subtask (shared Buffer)──▶ ACTOR (high rate) ──▶ actions
                               ▲
         interrupt / verbal coaching: overwrite the subtask buffer (no recapture)
 ```
 Two Pi05 co-hosted via ONE exec ctx; planner→actor hand-off through a shared
-buffer (verified byte-equal); multi-rate (1:N); mid-run subtask interrupt.
-File: `verify_pi07.py`.
+buffer (verified byte-equal); multi-rate (1:N); mid-run subtask interrupt. An
+optional world-model stage can use Wan2.2 in place of π0.7's BAGEL.
+File: `verify_handoff.py`.
 
 > Together these cover the two multi-model shapes the contract is built for:
 > **concurrent** (RECAP policy‖critic + interruptible rollout) and **sequential**
-> (π0.7 planner→actor hand-off + multi-rate).
+> (planner→actor hand-off + multi-rate).
 
 ## Native deployment host examples
 
