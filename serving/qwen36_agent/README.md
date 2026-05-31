@@ -30,7 +30,7 @@ python -m serving.qwen36_agent.server \
   --checkpoint /path/to/qwen36_nvfp4 \
   --model-name qwen36-27b \
   --host 127.0.0.1 --port 8000
-# startup runs graph warmup, then logs: Uvicorn running on http://127.0.0.1:8000
+# startup loads the model, then logs: Uvicorn running on http://127.0.0.1:8000
 ```
 
 **2. Check it is up**
@@ -74,8 +74,10 @@ decode), so the visible transcript never runs ahead of the GPU state.
 - Latency-first, single-stream hot session by default.
 - Exact token-prefix reuse for coding-agent turns: cold prefill once, then only
   prefill appended user/tool/diff/log tokens.
-- Startup committed-stream warmup so the first real request does not pay
-  CUDA Graph capture for common agent prompt shapes.
+- Direct long-decode kernel launch by default for live agent sessions, so a
+  growing conversation does not pay exact-position CUDA Graph capture in the
+  first real request. Fixed-shape graph replay remains opt-in for demos and
+  benchmarks.
 - True SSE streaming at speculative-decode accept boundaries.
 - Streamed tokens are session-committed tokens only. The old stateless
   full-generate shortcut of over-verifying and trimming output is forbidden in
@@ -88,7 +90,7 @@ decode), so the visible transcript never runs ahead of the GPU state.
 ## v1 cache policy
 
 The first backend is contiguous and session-first because that matches the
-current fastest Qwen3.6 CUDA-graph replay path. A request can reuse the hot
+current fastest Qwen3.6 single-stream kernel path. A request can reuse the hot
 frontend state when its tokenized prompt exactly extends the cached session
 prefix.
 
@@ -148,8 +150,8 @@ prompts rebuild until rollback/checkpoint support lands.
 | `--device` | `cuda` | torch device |
 | `--max-seq` | `262208` | max sequence length (prompt + generation) |
 | `--route-min-seq` | `0` | min prompt length sent to the chunked long-context FP8-KV path; `0` routes even short real prompts there to avoid request-time per-position graph capture |
-| `--graph-cache-max` | auto | per-cache CUDA-graph LRU bound; auto-scales with `--max-seq` (1024 at ≤32K, 256 at ≤128K, 128 at 256K) so small-context deployments keep warmed graphs across requests instead of evicting + re-capturing. Override to force a value. |
-| `--warmup-preset` | `agent` | startup warmup shapes: `agent` / `short` / `long` / `all` / `none` |
+| `--graph-cache-max` | auto | per-cache CUDA-graph LRU bound for opt-in exact graph replay; the production agent default uses direct long-decode kernels instead of exact-position decode graphs |
+| `--warmup-preset` | `none` | startup warmup shapes: `none` / `agent` / `short` / `long` / `all`; production agent serving does not need graph warmup by default |
 | `--warmup` | `""` | extra warmup shapes, comma-separated `prompt_len:max_tokens` |
 | `--warmup-K` | `6` | speculative K used during warmup |
 | `--warmup-committed-max-prompt` | `1024` | run real committed-stream warmup up to this prompt length; larger long-context shapes use graph-only warmup |
@@ -168,9 +170,10 @@ budget plus the long FP8-KV route (`--route-min-seq 0` and a long-context
 `--max-seq`). It fails fast instead of silently falling back to the legacy short
 prefill path.
 
-Startup warmup moves CUDA-graph capture out of the first request: it runs real
-committed-stream warmup for short/medium shapes and graph-only warmup for larger
-long-context shapes.
+Startup warmup is optional. The production agent default avoids exact-position
+decode graphs on the live path, so arbitrary coding-agent sessions do not need
+minutes of synthetic warmup. Use `--warmup-preset agent/all` only when you are
+intentionally preparing fixed-shape graph-replay demos or benchmarks.
 
 Startup logs print every queued warmup shape and then a `startup warmup done
 i/N` line as each shape finishes. Per-request logs use the same metric fields for
@@ -185,10 +188,14 @@ For streaming responses, `decode_tok/s` measures backend decode-active time;
 `stream_wall_tok/s` includes SSE/client backpressure and is the user-visible
 streaming wall-time rate.
 
-On SM120, the server defaults to the same optimized decode kernels used by the
+On SM120, the server defaults to the optimized decode kernels used by the
 benchmark path (`FLASHRT_QWEN36_DECODE_FASTGEMM=1` and
-`FLASHRT_QWEN36_VERIFY_WARPSPLIT=1`) unless the environment explicitly overrides
-them before startup. `/health` reports both flags.
+`FLASHRT_QWEN36_VERIFY_WARPSPLIT=1`). It also defaults
+`FLASHRT_QWEN36_TQ_VERIFY_GRAPH=0` and
+`FLASHRT_QWEN36_TQ_MTP_CHAIN_GRAPH=0` for agent serving, because exact-position
+decode graphs are keyed by the live `cur_pos` and hurt first-use latency in a
+continually growing session. Set those graph flags to `1` before startup only
+for fixed-shape warmed benchmark runs. `/health` reports the kernel flags.
 
 ## HTTP surface and request fields
 
@@ -256,15 +263,11 @@ server without prefix reuse re-prefills the full prompt every turn (589 tokens o
 turn 4). This is the `append` / `message_append` path; correctness is gated
 token-exact by `tests/test_qwen36_agent_gpu_split.py`.
 
-> **Honest scope of contiguous append.** This flat-prefill table is measured on
-> turns capped by `max_tokens` (no stop token). A turn that ends on `<|im_end|>`
-> — the realistic agent case — commits the stop token plus spec lookahead into the
-> KV but not the visible journal, so the hot session is correctly invalidated and
-> the **next turn rebuilds**. Contiguous `append` / `message_append` therefore
-> only keeps prefill flat across non-EOS turns. For the realistic EOS-terminated
-> coding-agent loop, the reuse that survives is [capsule
-> pinning](#capsule-pinning-shared-prefix-reuse-that-survives-eos): a fresh turn
-> restores a clean committed boundary and re-prefills only the suffix.
+> **Honest scope of contiguous append.** The committed stream stops at the
+> visible stop-token boundary, so the hot session remains reusable when the next
+> OpenAI request resends the prior assistant/tool turn. If a client rewrites or
+> omits prior visible history, the token stream is no longer append-only and the
+> server rebuilds or restores from a capsule instead of reporting a fake hit.
 
 **2. Capsule restore replaces a shared-prefix cold prefill with a flat copy.**
 Snapshot a shared prefix once, then restore + append the new suffix instead of
@@ -321,10 +324,10 @@ reuse per se.
 only): warm steady-state matches the frontend's documented decode number; the
 serving policy adds no measurable decode overhead.
 
-**3. Warm decode is stable across task types** (real `/v1/chat/completions`,
-median of 3 warm runs, `--graph-cache-max` auto):
+**3. Decode is stable across task types** (real `/v1/chat/completions`,
+median of 3 runs in the fixed-shape warmed benchmark mode):
 
-| scenario | ctx | warm decode tok/s |
+| scenario | ctx | fixed-shape decode tok/s |
 | --- | ---: | ---: |
 | code (merge sort) | 20 | 159.0 |
 | reasoning (bat & ball) | 41 | 150.3 |
@@ -336,9 +339,9 @@ median of 3 warm runs, `--graph-cache-max` auto):
 
 Run-to-run variance < 2%. Decode tok/s varies with the task's speculative
 accept-length (predictable code/reasoning highest; long-context attention pulls
-the 3K-context RAG case down) — not with the serving path. These are warm
-numbers; the first request of a brand-new prompt length still pays one-time
-graph capture (see Cold start below).
+the 3K-context RAG case down) — not with the serving path. These rows are the
+fixed-shape warmed graph-replay benchmark mode, not the production agent
+default.
 
 To reproduce these rows, keep the same serving envelope and measurement
 discipline:
@@ -346,6 +349,8 @@ discipline:
 ```bash
 export FLASHRT_QWEN36_MTP_CKPT_DIR=/path/to/qwen36_mtp_ckpt
 export FLASHRT_QWEN36_LONG_KV_CACHE=fp8
+export FLASHRT_QWEN36_TQ_VERIFY_GRAPH=1
+export FLASHRT_QWEN36_TQ_MTP_CHAIN_GRAPH=1
 python -m serving.qwen36_agent.server \
   --checkpoint /path/to/qwen36_nvfp4 \
   --max-seq 32768 \
@@ -354,24 +359,11 @@ python -m serving.qwen36_agent.server \
   --host 127.0.0.1 --port 8000
 ```
 
-Then run the same prompt shape at least once to warm exact decode graph keys and
-report the later `flashrt.decode_tok_per_s` values. Very short answers, early
-EOS, dense RAG summaries, or a first traversal of a new prompt length will not
-match the table; those are different accept-length / cold-capture regimes rather
-than serving overhead.
-
-**Cold start.** The first request of a not-yet-seen prompt length / accept
-trajectory pays CUDA-graph capture for the decode / verify / MTP-chain graphs it
-traverses (~one decode's worth, e.g. first call ~35 tok/s → warm ~138). Because
-these graphs are keyed by exact `(cur_pos, draft_k, mtp_cache_base)`, startup
-warmup cannot pre-cover every arbitrary prompt length, so this one-time capture
-is inherent to the exact-key fast-replay design. What `--graph-cache-max`
-(auto-scaled, above) fixes is the *repeated* cold start: at the old fixed cap of
-128 the warmed graphs were evicted between requests, so the server kept
-re-capturing; with the larger cap the warmed graphs survive and the server stays
-warm across requests and prompt lengths after the first traversal (measured: a
-short prompt re-hit after intervening medium/long requests stays at ~150 tok/s,
-no re-capture).
+The production agent path should be measured without those graph flags: it uses
+direct verify/MTP-chain kernel launch, so an arbitrary new prompt length no
+longer falls to cold graph-capture throughput. On RTX 5090, first-use live
+requests measured ~122 tok/s for a short text stream and ~130 tok/s for a
+tool-shaped stream with K=6.
 
 ## Session prefix reuse (walkthrough)
 

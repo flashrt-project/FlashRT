@@ -49,13 +49,7 @@ class Qwen36FrontendAgentEngine:
         import torch
 
         cap = torch.cuda.get_device_capability()
-        if cap[0] >= 12:
-            # The production Qwen3.6 server should use the same SM120 fast
-            # decode/verify kernels as the documented benchmark path unless a
-            # caller explicitly opts out before startup.
-            import os
-            os.environ.setdefault("FLASHRT_QWEN36_DECODE_FASTGEMM", "1")
-            os.environ.setdefault("FLASHRT_QWEN36_VERIFY_WARPSPLIT", "1")
+        cls._set_agent_runtime_env_defaults(cap[0])
         if cap == (11, 0):
             from flash_rt.frontends.torch.qwen36_thor import (
                 Qwen36TorchFrontendThor as Frontend,
@@ -72,6 +66,26 @@ class Qwen36FrontendAgentEngine:
         if graph_cache_max is not None:
             fe.GRAPH_CACHE_MAX = int(graph_cache_max)
         return cls(fe, model_name=model_name)
+
+    @staticmethod
+    def _set_agent_runtime_env_defaults(cap_major: int) -> None:
+        """Set agent-serving runtime defaults before frontend construction.
+
+        The fixed-shape benchmark path benefits from exact-position CUDA Graph
+        replay. A long-lived agent session does not: every new generated
+        position can be a never-seen graph key, so the first real coding-agent
+        turn pays capture on the hot path and drops to cold-capture throughput.
+        Keep the fast SM120 kernels on, but default the agent host to direct
+        long-decode kernel launch for verify/MTP-chain unless the caller opts
+        back into exact graph replay before startup.
+        """
+        import os
+
+        if int(cap_major) >= 12:
+            os.environ.setdefault("FLASHRT_QWEN36_DECODE_FASTGEMM", "1")
+            os.environ.setdefault("FLASHRT_QWEN36_VERIFY_WARPSPLIT", "1")
+            os.environ.setdefault("FLASHRT_QWEN36_TQ_VERIFY_GRAPH", "0")
+            os.environ.setdefault("FLASHRT_QWEN36_TQ_MTP_CHAIN_GRAPH", "0")
 
     def render_chat(self, messages, tools=None, *,
                     add_generation_prompt: bool = True,

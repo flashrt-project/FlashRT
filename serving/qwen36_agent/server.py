@@ -7,6 +7,7 @@ The HTTP layer is intentionally thin: all cache and streaming policy lives in
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any, Dict
 
@@ -93,14 +94,13 @@ def build_app(service: AgentService):
 
 
 def _auto_graph_cache_max(max_seq: int) -> int:
-    """Default per-cache CUDA-graph LRU bound, scaled to the VRAM headroom that
-    ``max_seq`` leaves. Decode graphs are keyed by exact (cur_pos, K, ...), so a
-    request traverses ~one-per-position graphs; a cap below that working set
-    evicts warmed graphs and forces re-capture on the next request (a repeated
-    cold start). A bigger cap lets warmed graphs survive across requests/lengths
-    — but each graph holds pooled buffers, so it competes with the KV cache.
-    Small max_seq leaves plenty of VRAM (use a large cap, kill the eviction
-    thrash); a 256K-capable cache leaves almost none (stay conservative)."""
+    """Default per-cache CUDA-graph LRU bound for opt-in graph replay.
+
+    The agent host defaults long decode to direct kernels so arbitrary growing
+    sessions do not pay exact-position graph capture in the request path. This
+    cap still matters when a caller explicitly opts back into CUDA Graph replay
+    for fixed-shape demos or benchmarks.
+    """
     max_seq = int(max_seq)
     if max_seq <= 32768:
         return 1024
@@ -142,6 +142,11 @@ def create_app_from_checkpoint(*, checkpoint: str,
     else:
         log.info("MTP head loaded; speculative decode enabled (default K=%d)",
                  warmup_k)
+    log.info(
+        "agent decode graph mode: verify_graph=%s mtp_chain_graph=%s",
+        os.environ.get("FLASHRT_QWEN36_TQ_VERIFY_GRAPH", "<unset>"),
+        os.environ.get("FLASHRT_QWEN36_TQ_MTP_CHAIN_GRAPH", "<unset>"),
+    )
     if capsule_budget_bytes > 0:
         fe = getattr(engine, "fe", None)
         if not bool(getattr(fe, "_long_ctx_mode", False)):
@@ -220,7 +225,7 @@ def _dedupe_shapes(shapes: list[tuple[int, int]]) -> list[tuple[int, int]]:
 
 
 def _warmup_preset_shapes(preset: str, max_seq: int) -> list[tuple[int, int]]:
-    preset = (preset or "agent").strip().lower()
+    preset = (preset or "none").strip().lower()
     if preset in ("none", "off", "false", "0"):
         return []
     if preset not in ("agent", "short", "long", "all"):
@@ -269,13 +274,14 @@ def main(argv: list[str] | None = None) -> None:
             "per-position short-route graph capture."))
     parser.add_argument(
         "--graph-cache-max", type=int, default=None,
-        help="Per-cache CUDA graph LRU bound for Qwen3.6 frontend graphs. "
-             "Default auto-scales with --max-seq (1024 at <=32K, 256 at "
-             "<=128K, 128 at 256K) so small-context deployments keep warmed "
-             "graphs across requests instead of evicting and re-capturing.")
+        help="Per-cache CUDA graph LRU bound for opt-in Qwen3.6 frontend "
+             "graphs. The agent host defaults long decode to direct kernels; "
+             "this only matters when exact graph replay is explicitly enabled.")
     parser.add_argument(
-        "--warmup-preset", default="agent",
-        help="Startup warmup preset: agent, short, long, all, or none.")
+        "--warmup-preset", default="none",
+        help="Startup warmup preset: none, agent, short, long, or all. The "
+             "production agent default is none because long decode uses direct "
+             "kernels by default; use agent/all for fixed-shape graph demos.")
     parser.add_argument(
         "--warmup", default="",
         help='Additional comma-separated "prompt_len:max_tokens" shapes.')

@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from serving.qwen36_agent.openai_stream import sse_from_events
@@ -818,6 +820,34 @@ def test_qwen36_frontend_agent_engine_wires_long_append_split():
     engine = Qwen36FrontendAgentEngine(fe)
     engine.prefill([1, 2, 3], cached_tokens=2, max_tokens=1, K=4)
     assert fe.long_append_args == ([[1, 2, 3]], 2, 1, 4)
+
+
+def test_qwen36_agent_sm120_defaults_disable_exact_position_decode_graphs(monkeypatch):
+    keys = (
+        "FLASHRT_QWEN36_DECODE_FASTGEMM",
+        "FLASHRT_QWEN36_VERIFY_WARPSPLIT",
+        "FLASHRT_QWEN36_TQ_VERIFY_GRAPH",
+        "FLASHRT_QWEN36_TQ_MTP_CHAIN_GRAPH",
+    )
+    for key in keys:
+        monkeypatch.delenv(key, raising=False)
+
+    Qwen36FrontendAgentEngine._set_agent_runtime_env_defaults(12)
+
+    assert os.environ["FLASHRT_QWEN36_DECODE_FASTGEMM"] == "1"
+    assert os.environ["FLASHRT_QWEN36_VERIFY_WARPSPLIT"] == "1"
+    assert os.environ["FLASHRT_QWEN36_TQ_VERIFY_GRAPH"] == "0"
+    assert os.environ["FLASHRT_QWEN36_TQ_MTP_CHAIN_GRAPH"] == "0"
+
+
+def test_qwen36_agent_runtime_defaults_respect_overrides(monkeypatch):
+    monkeypatch.setenv("FLASHRT_QWEN36_TQ_VERIFY_GRAPH", "1")
+    monkeypatch.setenv("FLASHRT_QWEN36_TQ_MTP_CHAIN_GRAPH", "1")
+
+    Qwen36FrontendAgentEngine._set_agent_runtime_env_defaults(12)
+
+    assert os.environ["FLASHRT_QWEN36_TQ_VERIFY_GRAPH"] == "1"
+    assert os.environ["FLASHRT_QWEN36_TQ_MTP_CHAIN_GRAPH"] == "1"
 
 
 def test_qwen36_frontend_agent_engine_warmup_runs_committed_stream():
