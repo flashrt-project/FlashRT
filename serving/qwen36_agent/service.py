@@ -246,6 +246,17 @@ class AgentService:
     def _copy_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return [dict(m) for m in messages]
 
+    @staticmethod
+    def _assistant_message(text: str,
+                           tool_calls: List[Dict[str, Any]]) -> Dict[str, Any]:
+        msg: Dict[str, Any] = {
+            "role": "assistant",
+            "content": text if text or not tool_calls else None,
+        }
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+        return msg
+
     def _mark_reusable(self, session, state_lookahead: bool) -> None:
         """Mark the session hot (reusable for append) only if the GPU state ends
         exactly at the committed transcript. If a stop token left committed
@@ -300,6 +311,7 @@ class AgentService:
         first_delta_ms = 0.0
         decode_started = time.perf_counter()
         state_lookahead = False
+        saw_tool_call = False
         for chunk in self.engine.generate_stream(max_tokens=req.max_tokens, K=req.K):
             generated_ids.extend(int(t) for t in chunk.token_ids)
             if getattr(chunk, "state_lookahead", 0):
@@ -308,10 +320,15 @@ class AgentService:
             if evs and first_delta_ms <= 0.0:
                 first_delta_ms = (time.perf_counter() - t0) * 1000.0
             events.extend(evs)
+            if any(ev.kind == "tool_call" for ev in evs):
+                saw_tool_call = True
+                break
         tail = parser.finish()
         if tail and first_delta_ms <= 0.0:
             first_delta_ms = (time.perf_counter() - t0) * 1000.0
         events.extend(tail)
+        if any(ev.kind == "tool_call" for ev in tail):
+            saw_tool_call = True
         t_done = time.perf_counter()
 
         text_parts: List[str] = []
@@ -325,10 +342,7 @@ class AgentService:
         finish_reason = "tool_calls" if tool_calls else "stop"
         session.commit([*engine_prompt_tokens, *generated_ids])
         visible_messages = self._copy_messages(req.messages)
-        visible_messages.append({
-            "role": "assistant",
-            "content": text,
-        })
+        visible_messages.append(self._assistant_message(text, tool_calls))
         session.visible_messages = visible_messages
         self._mark_reusable(session, state_lookahead)
 
@@ -413,6 +427,7 @@ class AgentService:
         parser = ToolCallStreamParser()
         generated_ids: List[int] = []
         visible_parts: List[str] = []
+        tool_calls: List[Dict[str, Any]] = []
         seen_tool_call = False
         state_lookahead = False
         yield sse_data(role_chunk(completion_id, model))
@@ -421,6 +436,7 @@ class AgentService:
         backend_decode_ms = 0.0
         chunks = iter(self.engine.generate_stream(max_tokens=req.max_tokens,
                                                   K=req.K))
+        saw_tool_call = False
         while True:
             next_t0 = time.perf_counter()
             try:
@@ -438,14 +454,20 @@ class AgentService:
                     first_delta_ms = (time.perf_counter() - t0) * 1000.0
                 if ev.kind == "tool_call":
                     seen_tool_call = True
+                    saw_tool_call = True
+                    tool_calls.append(ev.payload)
                 else:
                     visible_parts.append(str(ev.payload))
                 yield sse_data(event_chunk(completion_id, model, ev))
+            if saw_tool_call:
+                break
         for ev in parser.finish():
             if first_delta_ms <= 0.0:
                 first_delta_ms = (time.perf_counter() - t0) * 1000.0
             if ev.kind == "tool_call":
                 seen_tool_call = True
+                saw_tool_call = True
+                tool_calls.append(ev.payload)
             else:
                 visible_parts.append(str(ev.payload))
             yield sse_data(event_chunk(completion_id, model, ev))
@@ -453,10 +475,8 @@ class AgentService:
 
         session.commit([*engine_prompt_tokens, *generated_ids])
         visible_messages = self._copy_messages(req.messages)
-        visible_messages.append({
-            "role": "assistant",
-            "content": "".join(visible_parts),
-        })
+        visible_messages.append(self._assistant_message(
+            "".join(visible_parts), tool_calls))
         session.visible_messages = visible_messages
         self._mark_reusable(session, state_lookahead)
         usage = {

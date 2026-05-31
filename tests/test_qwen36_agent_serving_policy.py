@@ -268,6 +268,52 @@ def test_agent_service_parses_tool_calls_from_generated_stream():
     assert res.tool_calls[0]["function"]["name"] == "lookup"
 
 
+def test_agent_service_stops_decode_after_tool_call_to_keep_session_hot():
+    engine = FakeAgentEngine()
+    engine.outputs = [
+        DecodeChunk((1001,),
+                    '<tool_call>{"name":"lookup","arguments":{"x":1}}</tool_call>',
+                    1),
+        DecodeChunk((999, ord("x")), "", 0, stop=True, state_lookahead=2),
+    ]
+    svc = AgentService(engine)
+
+    res = svc.complete(AgentRequest(
+        session_id="agent-tools-hot",
+        messages=[{"role": "user", "content": "abc"}],
+        max_tokens=8,
+    ))
+
+    assert res.finish_reason == "tool_calls"
+    assert res.usage["completion_tokens"] == 1
+    assert svc.sessions.hot_session_id == "agent-tools-hot"
+    msg = svc.sessions.get("agent-tools-hot").visible_messages[-1]
+    assert msg["content"] is None
+    assert msg["tool_calls"][0]["function"]["name"] == "lookup"
+
+
+def test_agent_service_stream_stops_decode_after_tool_call_to_keep_session_hot():
+    engine = FakeAgentEngine()
+    engine.outputs = [
+        DecodeChunk((1001,),
+                    '<tool_call>{"name":"lookup","arguments":{"x":1}}</tool_call>',
+                    1),
+        DecodeChunk((999, ord("x")), "", 0, stop=True, state_lookahead=2),
+    ]
+    svc = AgentService(engine)
+
+    chunks = list(svc.stream_openai(AgentRequest(
+        session_id="agent-tools-stream-hot",
+        messages=[{"role": "user", "content": "abc"}],
+        max_tokens=8,
+    ), model=engine.model_name))
+
+    joined = "".join(chunks)
+    assert '"tool_calls"' in joined
+    assert '"completion_tokens":1' in joined
+    assert svc.sessions.hot_session_id == "agent-tools-stream-hot"
+
+
 def test_agent_service_stream_openai_yields_live_sse_chunks():
     engine = FakeAgentEngine()
     svc = AgentService(engine)
