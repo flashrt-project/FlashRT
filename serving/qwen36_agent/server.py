@@ -121,7 +121,7 @@ def create_app_from_checkpoint(*, checkpoint: str,
                                warmup_committed_max_prompt: int = 1024,
                                warm_long_prefill_graphs: bool = False,
                                capsule_budget_bytes: int = 0,
-                               default_k: int = 6,
+                               default_k: int = 4,
                                default_max_tokens: int = 2048,
                                max_output_tokens: int = 8192,
                                default_session_id: str | None = None):
@@ -292,7 +292,7 @@ def main(argv: list[str] | None = None) -> None:
         "--warmup-K", type=int, default=6,
         help="Speculative decode K used for startup warmup.")
     parser.add_argument(
-        "--default-K", dest="default_K", type=int, default=6,
+        "--default-K", dest="default_K", type=int, default=4,
         help="Default speculative decode K for live requests. Requests may "
              "override it with the FlashRT extension field flashrt_K.")
     parser.add_argument(

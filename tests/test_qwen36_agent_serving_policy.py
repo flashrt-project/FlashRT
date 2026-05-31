@@ -157,7 +157,7 @@ def test_agent_service_reuses_exact_session_prefix_when_history_is_returned():
     res0 = svc.complete(req0)
     assert res0.stats.cached_tokens == 0
     assert res0.stats.new_prefill_tokens == 4
-    assert engine.prefills[-1][1:] == (0, 2, 6)
+    assert engine.prefills[-1][1:] == (0, 2, 4)
     assert res0.text == "hi"
     assert res0.finish_reason == "stop"
 
@@ -174,7 +174,7 @@ def test_agent_service_reuses_exact_session_prefix_when_history_is_returned():
     assert res1.prefix_plan.action == "append"
     assert res1.stats.cached_tokens == 6
     assert res1.stats.new_prefill_tokens == 3
-    assert engine.prefills[-1][1:] == (6, 1, 6)
+    assert engine.prefills[-1][1:] == (6, 1, 4)
 
 
 def test_agent_service_clips_output_budget_to_remaining_context():
@@ -192,7 +192,7 @@ def test_agent_service_clips_output_budget_to_remaining_context():
 
     assert res.usage["completion_tokens"] == 2
     assert engine.prefills[-1][2] == 2
-    assert engine.generate_calls[-1] == (2, 6)
+    assert engine.generate_calls[-1] == (2, 4)
 
 
 def test_agent_service_uses_message_append_when_visible_history_hides_tokens():
@@ -236,7 +236,7 @@ def test_agent_service_uses_message_append_when_visible_history_hides_tokens():
     assert res1.stats.new_prefill_tokens == 2
     assert engine.prefills[-1][0][:6] == [ord("a"), ord("b"), ord("c"), 0, 999, ord("h")]
     assert engine.prefills[-1][0][6:] == [42, 43]
-    assert engine.prefills[-1][1:] == (6, 1, 6)
+    assert engine.prefills[-1][1:] == (6, 1, 4)
 
 
 def test_agent_service_rebuilds_token_journal_without_hot_state():
@@ -252,7 +252,7 @@ def test_agent_service_rebuilds_token_journal_without_hot_state():
     ))
     assert res.prefix_plan.action == "activate_rebuild"
     assert res.stats.cached_tokens == 0
-    assert engine.prefills[-1][1:] == (0, 1, 6)
+    assert engine.prefills[-1][1:] == (0, 1, 4)
 
 
 def test_agent_service_rebuilds_truncate_without_rollback():
@@ -269,7 +269,7 @@ def test_agent_service_rebuilds_truncate_without_rollback():
     ))
     assert res.prefix_plan.action == "activate_rebuild"
     assert res.stats.cached_tokens == 0
-    assert engine.prefills[-1][1:] == (0, 1, 6)
+    assert engine.prefills[-1][1:] == (0, 1, 4)
 
 
 def test_agent_service_parses_tool_calls_from_generated_stream():
@@ -394,7 +394,7 @@ def test_agent_service_stream_openai_reuses_hot_session_prefix():
         max_tokens=1,
     ), model=engine.model_name))
 
-    assert engine.prefills[-1][1:] == (6, 1, 6)
+    assert engine.prefills[-1][1:] == (6, 1, 4)
 
 
 def test_agent_service_auto_reuses_hot_prefix_without_session_id():
@@ -420,7 +420,7 @@ def test_agent_service_auto_reuses_hot_prefix_without_session_id():
     assert res1.prefix_plan.action == "append"
     assert res1.stats.cached_tokens == 6
     assert res1.stats.new_prefill_tokens == 2
-    assert engine.prefills[-1][1:] == (6, 1, 6)
+    assert engine.prefills[-1][1:] == (6, 1, 4)
 
 
 def test_agent_service_auto_message_append_without_session_id():
@@ -457,7 +457,7 @@ def test_agent_service_auto_message_append_without_session_id():
     assert res1.prefix_plan.action == "message_append"
     assert res1.stats.cached_tokens == 6
     assert res1.stats.new_prefill_tokens == 2
-    assert engine.prefills[-1][1:] == (6, 1, 6)
+    assert engine.prefills[-1][1:] == (6, 1, 4)
 
 
 def test_agent_service_auto_prefix_respects_cache_namespace():
@@ -481,7 +481,7 @@ def test_agent_service_auto_prefix_respects_cache_namespace():
 
     assert res.prefix_plan.action == "append"
     assert res.stats.cached_tokens == 0
-    assert engine.prefills[-1][1:] == (0, 1, 6)
+    assert engine.prefills[-1][1:] == (0, 1, 4)
 
 
 def test_agent_service_message_append_ignores_tool_call_wire_ids():
