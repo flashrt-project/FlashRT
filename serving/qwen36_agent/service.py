@@ -412,8 +412,19 @@ class AgentService:
         state_lookahead = False
         yield sse_data(role_chunk(completion_id, model))
         first_delta_ms = 0.0
-        decode_started = time.perf_counter()
-        for chunk in self.engine.generate_stream(max_tokens=req.max_tokens, K=req.K):
+        stream_started = time.perf_counter()
+        backend_decode_ms = 0.0
+        chunks = iter(self.engine.generate_stream(max_tokens=req.max_tokens,
+                                                  K=req.K))
+        while True:
+            next_t0 = time.perf_counter()
+            try:
+                chunk = next(chunks)
+            except StopIteration:
+                backend_decode_ms += (
+                    time.perf_counter() - next_t0) * 1000.0
+                break
+            backend_decode_ms += (time.perf_counter() - next_t0) * 1000.0
             generated_ids.extend(int(t) for t in chunk.token_ids)
             if getattr(chunk, "state_lookahead", 0):
                 state_lookahead = True
@@ -449,18 +460,23 @@ class AgentService:
             "total_tokens": len(prompt_tokens) + len(generated_ids),
         }
         completion_tokens = len(generated_ids)
-        decode_ms = max(0.0, (t_done - decode_started) * 1000.0)
+        decode_ms = max(0.0, backend_decode_ms)
         decode_tok_per_s = (
             completion_tokens * 1000.0 / decode_ms if decode_ms > 0 else 0.0
+        )
+        stream_wall_ms = max(0.0, (t_done - stream_started) * 1000.0)
+        stream_wall_tok_per_s = (
+            completion_tokens * 1000.0 / stream_wall_ms
+            if stream_wall_ms > 0 else 0.0
         )
         log.info(
             "stream sid=%s action=%s prompt=%d cached=%d new_prefill=%d "
             "completion=%d prefill_ms=%.1f first_delta_ms=%.1f decode_ms=%.1f "
-            "decode_tok/s=%.1f",
+            "decode_tok/s=%.1f stream_wall_ms=%.1f stream_wall_tok/s=%.1f",
             session.session_id, plan.action, len(prompt_tokens),
             plan.cached_tokens, plan.new_prefill_tokens, completion_tokens,
             (t_prefill - t0) * 1000.0, first_delta_ms, decode_ms,
-            decode_tok_per_s,
+            decode_tok_per_s, stream_wall_ms, stream_wall_tok_per_s,
         )
         yield sse_data(done_chunk(
             completion_id,

@@ -177,8 +177,12 @@ both buffered and streaming responses:
 
 ```text
 complete sid=... prompt=... completion=... prefill_ms=... first_delta_ms=... decode_ms=... decode_tok/s=...
-stream   sid=... prompt=... completion=... prefill_ms=... first_delta_ms=... decode_ms=... decode_tok/s=...
+stream   sid=... prompt=... completion=... prefill_ms=... first_delta_ms=... decode_ms=... decode_tok/s=... stream_wall_tok/s=...
 ```
+
+For streaming responses, `decode_tok/s` measures backend decode-active time;
+`stream_wall_tok/s` includes SSE/client backpressure and is the user-visible
+streaming wall-time rate.
 
 On SM120, the server defaults to the same optimized decode kernels used by the
 benchmark path (`FLASHRT_QWEN36_DECODE_FASTGEMM=1` and
