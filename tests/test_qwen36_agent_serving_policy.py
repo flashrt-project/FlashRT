@@ -195,6 +195,37 @@ def test_agent_service_clips_output_budget_to_remaining_context():
     assert engine.generate_calls[-1] == (2, 4)
 
 
+def test_agent_service_validation_uses_stateless_tokenizer_path():
+    class ValidationEngine(FakeAgentEngine):
+        def __init__(self):
+            super().__init__()
+            self.mutating_tokenize_calls = 0
+            self.validation_tokenize_calls = 0
+
+        def tokenize_chat(self, messages, tools=None, *,
+                          enable_thinking=False):
+            del messages, tools, enable_thinking
+            self.mutating_tokenize_calls += 1
+            raise AssertionError("stateful tokenizer should not validate")
+
+        def tokenize_chat_for_validation(self, messages, tools=None, *,
+                                         enable_thinking=False):
+            del tools, enable_thinking
+            self.validation_tokenize_calls += 1
+            return [1] * sum(len(m.get("content") or "") for m in messages)
+
+    engine = ValidationEngine()
+    svc = AgentService(engine)
+
+    svc.validate_request_bounds(AgentRequest(
+        messages=[{"role": "user", "content": "abc"}],
+        max_tokens=1,
+    ))
+
+    assert engine.validation_tokenize_calls == 1
+    assert engine.mutating_tokenize_calls == 0
+
+
 def test_agent_service_uses_message_append_when_visible_history_hides_tokens():
     class HiddenEngine(FakeAgentEngine):
         def __init__(self):
@@ -687,6 +718,27 @@ def test_agent_service_applies_default_k_and_request_override():
     }))
     assert engine.generate_calls[-1] == (1, 5)
     assert engine.prefills[-1][3] == 5
+
+
+def test_openai_request_rejects_invalid_flashrt_k():
+    for value in (0, -1):
+        with pytest.raises(ValueError, match="flashrt_K must be >= 1"):
+            request_from_openai({
+                "messages": [{"role": "user", "content": "abc"}],
+                "max_tokens": 1,
+                "flashrt_K": value,
+            })
+
+
+def test_agent_service_rejects_direct_invalid_k():
+    svc = AgentService(FakeAgentEngine())
+
+    with pytest.raises(ValueError, match="flashrt_K must be >= 1"):
+        svc.complete(AgentRequest(
+            messages=[{"role": "user", "content": "abc"}],
+            max_tokens=1,
+            K=0,
+        ))
 
 
 def test_openai_request_and_response_include_flashrt_cache_metrics():

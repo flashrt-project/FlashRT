@@ -310,7 +310,10 @@ class AgentService:
 
     @staticmethod
     def _effective_k(req: AgentRequest) -> int:
-        return int(req.K)
+        k = int(req.K)
+        if k < 1:
+            raise ValueError("flashrt_K must be >= 1")
+        return k
 
     def _log_reuse_miss(self, session, plan: PrefixPlan,
                         incoming_messages: List[Dict[str, Any]]) -> None:
@@ -417,7 +420,11 @@ class AgentService:
         begins SSE streaming, otherwise the client sees a broken stream and the
         server logs an ASGI traceback.
         """
-        prompt_tokens = self.engine.tokenize_chat(
+        tokenizer = getattr(
+            self.engine, "tokenize_chat_for_validation", None)
+        if not callable(tokenizer):
+            tokenizer = self.engine.tokenize_chat
+        prompt_tokens = tokenizer(
             req.messages,
             tools=req.tools,
             enable_thinking=req.enable_thinking,
@@ -844,6 +851,8 @@ def request_from_openai(req: Dict[str, Any], *, default_k: int = 4,
         raise ValueError(
             f"max_tokens must be <= {int(max_output_tokens)}")
     K = parse_int(req.get("flashrt_K"), name="flashrt_K", default=default_k)
+    if K < 1:
+        raise ValueError("flashrt_K must be >= 1")
     return AgentRequest(
         messages=messages,
         tools=tools,

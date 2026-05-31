@@ -91,6 +91,16 @@ class Qwen36FrontendAgentEngine:
                     add_generation_prompt: bool = True,
                     enable_thinking: bool = False) -> str:
         self._last_enable_thinking = bool(enable_thinking)
+        return self._render_chat(
+            messages,
+            tools=tools,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+        )
+
+    def _render_chat(self, messages, tools=None, *,
+                     add_generation_prompt: bool = True,
+                     enable_thinking: bool = False) -> str:
         normalized: List[Dict[str, Any]] = []
         for msg in messages:
             if msg.get("content") is None:
@@ -147,6 +157,20 @@ class Qwen36FrontendAgentEngine:
     def tokenize_chat(self, messages, tools=None, *,
                       enable_thinking: bool = False) -> List[int]:
         prompt = self.render_chat(
+            messages,
+            tools=tools,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+        )
+        return self.tokenize_text(prompt)
+
+    def tokenize_chat_for_validation(self, messages, tools=None, *,
+                                     enable_thinking: bool = False) -> List[int]:
+        """Tokenize a request for HTTP pre-validation without mutating hot
+        decode state. The normal ``tokenize_chat`` records ``enable_thinking``
+        for committed-stream filtering; this method is safe to call before a
+        StreamingResponse is returned while another stream owns the engine."""
+        prompt = self._render_chat(
             messages,
             tools=tools,
             add_generation_prompt=True,
