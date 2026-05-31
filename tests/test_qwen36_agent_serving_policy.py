@@ -689,12 +689,12 @@ def test_qwen36_frontend_agent_engine_stops_visible_text_at_im_end():
     chunks = list(engine.generate_stream(max_tokens=8, K=4))
 
     assert len(chunks) == 1
-    # Only the visible tokens are committed to the journal; the stop token (999)
-    # and the post-stop tail ('u') are reported as state lookahead, not journaled.
-    assert chunks[0].token_ids == (ord("o"), ord("k"))
+    # The stop token is a chat-template boundary: it is cached but not rendered.
+    # Only the verified post-stop tail ('u') is reported as lookahead.
+    assert chunks[0].token_ids == (ord("o"), ord("k"), 999)
     assert chunks[0].text == "ok"
     assert chunks[0].stop is True
-    assert chunks[0].state_lookahead == 2
+    assert chunks[0].state_lookahead == 1
 
 
 def test_qwen36_frontend_agent_engine_wires_short_append_split():
@@ -785,8 +785,8 @@ def test_qwen36_frontend_agent_engine_warmup_uses_long_graph_hooks():
 
 
 def test_qwen36_engine_trims_visible_tokens_and_flags_state_lookahead():
-    """A stop token mid-chunk: commit only visible tokens, report the post-stop
-    tokens (eos + verified tail) as state lookahead."""
+    """A stop token mid-chunk: cache the stop boundary but report any verified
+    post-stop tail as lookahead."""
     class StopTokenizer(FakeTokenizer):
         eos_token_id = 7
 
@@ -809,10 +809,10 @@ def test_qwen36_engine_trims_visible_tokens_and_flags_state_lookahead():
 
     assert len(chunks) == 1
     chunk = chunks[0]
-    assert chunk.token_ids == (ord("a"), ord("b"))   # visible only
+    assert chunk.token_ids == (ord("a"), ord("b"), 7)
     assert chunk.text == "ab"
     assert chunk.stop is True
-    assert chunk.state_lookahead == 2                # eos + 'c' committed to KV
+    assert chunk.state_lookahead == 1                # only 'c' leads transcript
 
 
 def test_agent_service_stop_lookahead_trims_journal_and_forces_rebuild():

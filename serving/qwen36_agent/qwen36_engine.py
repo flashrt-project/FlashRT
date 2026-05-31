@@ -324,14 +324,15 @@ class Qwen36FrontendAgentEngine:
                 yield DecodeChunk(
                     token_ids=ids, text=text, accepted=len(ids))
                 continue
-            # Stop token mid-chunk: the frontend committed `ids` to KV state, but
-            # only `visible_ids` belong to the transcript. Commit the visible
-            # tokens to the journal and report the post-stop tokens (the stop
-            # token itself + any verified tail) as state lookahead so the session
-            # is rebuilt rather than falsely hot-appended.
+            # Stop token mid-chunk: the token itself is the chat-template
+            # boundary that a later full-history prompt will contain, so keep it
+            # in the cache journal while hiding it from client-visible text. Any
+            # tokens verified after the stop are not part of the transcript and
+            # still force a rebuild.
+            committed_ids = ids[:stop_at + 1]
             yield DecodeChunk(
-                token_ids=visible_ids, text=text, accepted=len(visible_ids),
-                stop=True, state_lookahead=len(ids) - len(visible_ids))
+                token_ids=committed_ids, text=text, accepted=len(visible_ids),
+                stop=True, state_lookahead=len(ids) - len(committed_ids))
             break
 
     def _visible_stop_token_ids(self) -> set[int]:
