@@ -378,6 +378,24 @@ def test_qwen36_agent_fastapi_non_stream_and_stream_endpoints():
     assert "data: [DONE]" in text
 
 
+def test_qwen36_agent_fastapi_rejects_output_above_service_cap():
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    from serving.qwen36_agent.server import build_app
+
+    app = build_app(AgentService(
+        FakeAgentEngine(), default_max_tokens=4, max_output_tokens=8))
+    client = TestClient(app)
+
+    resp = client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "abc"}],
+        "max_tokens": 9,
+    })
+
+    assert resp.status_code == 400
+    assert "max_tokens must be <= 8" in resp.text
+
+
 def test_openai_request_and_response_include_flashrt_cache_metrics():
     engine = FakeAgentEngine()
     svc = AgentService(engine)
@@ -396,6 +414,25 @@ def test_openai_request_and_response_include_flashrt_cache_metrics():
     assert body["model"] == "fake-qwen36"
     assert body["flashrt"]["session_id"] == "s"
     assert body["flashrt"]["new_prefill_tokens"] == 2
+
+
+def test_openai_request_uses_configured_default_and_output_cap():
+    req = request_from_openai({
+        "messages": [{"role": "user", "content": "a"}],
+    }, default_max_tokens=123, max_output_tokens=256)
+    assert req.max_tokens == 123
+
+    req = request_from_openai({
+        "messages": [{"role": "user", "content": "a"}],
+        "max_completion_tokens": 77,
+    }, default_max_tokens=123, max_output_tokens=256)
+    assert req.max_tokens == 77
+
+    with pytest.raises(ValueError, match="max_tokens must be <= 256"):
+        request_from_openai({
+            "messages": [{"role": "user", "content": "a"}],
+            "max_tokens": 257,
+        }, default_max_tokens=123, max_output_tokens=256)
 
 
 class FakeTokenizer:

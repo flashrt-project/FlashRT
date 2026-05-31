@@ -155,6 +155,8 @@ prompts rebuild until rollback/checkpoint support lands.
 | `--warmup-committed-max-prompt` | `1024` | run real committed-stream warmup up to this prompt length; larger long-context shapes use graph-only warmup |
 | `--warm-long-prefill-graphs` | off | also capture long-context prefill chunk graphs at startup |
 | `--capsule-budget-mb` | `0` | GPU byte budget (MB) for pinned shared-prefix capsules; `0` disables pinning. See [Capsule pinning](#capsule-pinning-shared-prefix-reuse-that-survives-eos). |
+| `--default-max-tokens` | `2048` | generated-token budget used when a request omits both `max_tokens` and `max_completion_tokens` |
+| `--max-output-tokens` | `8192` | hard generated-token cap; requests above this return HTTP 400 instead of being silently truncated |
 | `--host` / `--port` | `127.0.0.1` / `8000` | bind address |
 | `--log-level` | `info` | uvicorn log level |
 | `--access-log` | off | enable uvicorn per-request access logs; off by default to avoid benchmark jitter |
@@ -183,7 +185,10 @@ FlashRT extensions:
 
 If neither `max_tokens` nor `max_completion_tokens` is supplied, the agent
 server defaults to 2048 generated tokens so coding-agent tool turns are not cut
-off by a chat-sized output cap.
+off by a chat-sized output cap. Production deployments should set
+`--default-max-tokens` for their client mix and keep `--max-output-tokens` as a
+hard safety bound; oversized requests fail with HTTP 400 instead of being
+silently shortened.
 
 - `flashrt_session_id` (or `session_id`): stable session key for prefix reuse.
 - `flashrt_cache_salt`: optional namespace separator for different prompt policies.
