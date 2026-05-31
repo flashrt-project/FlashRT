@@ -64,20 +64,23 @@ taste):
    accept boundary, and prefix reuse on hybrid state is snapshot/restore, never
    block gather.
 
-### Measured finding (2026-05-30): contiguous append does not survive EOS
+### Measured finding (2026-05-31): EOS turns can stay hot if the boundary is committed
 
-A turn that ends on a stop token (the realistic agent case — every answer / tool
-call ends with `<|im_end|>`) commits the stop token + any spec-verified lookahead
-into the GPU KV but **not** into the visible journal, so the KV leads the journal
-and `_mark_reusable` correctly invalidates the hot session
-(`hot_session_id = None`). Verified end-to-end: a 3-turn session of EOS-terminated
-turns reports `append(cold) → rebuild → rebuild`, full re-prefill each turn, never
-hot. Contiguous append only stays hot for turns capped by `max_tokens` (no EOS),
-which is **not** the agent workload. Consequence: **the coding-agent flat-prefill
-win comes from capsule restore (a clean committed boundary), not contiguous
-append.** This reorders the stages below (B before A) and means the
-`serving_design.md` §7 "prefix reuse keeps prefill flat" table was measured on
-`max_tokens`-capped turns; the serving README should say so to stay honest.
+The production stream now stops at the visible stop-token boundary and does not
+leave speculative lookahead ahead of the client-visible transcript. A second
+issue was Qwen3.6's hidden non-thinking generation prompt
+(`<think>\n\n</think>\n\n`): OpenAI clients replay only visible assistant text,
+so the full rendered prompt can differ from the internal hot KV journal by a few
+tokens even when the message prefix is semantically identical. The serving layer
+now appends the newly added message suffix after a known-equivalent visible
+message prefix, instead of forcing a full render byte-prefix match.
+
+Verified end-to-end on realistic EOS-terminated long-sequence turns:
+`append(cold) → message_append → message_append`, with `new_prefill_tokens`
+dropping from thousands to tens and TTFT staying ~70-150 ms. Capsule restore is
+still the right primitive for shared-prefix reuse across fresh sessions,
+branches, restarts, or non-hot workers; it is no longer required for the normal
+single hot coding-agent loop.
 
 ---
 
@@ -206,12 +209,12 @@ Emitted as the existing one-line log and an aggregate on `/health` (optionally a
 
 | gap | what it is | seam(s) that make it safe | stage |
 | --- | --- | --- | --- |
-| **B** | capsule not wired into the server (pin/restore policy, VRAM budget). The frontend capsule API is shipped + bit-exact (`test_qwen36_agent_capsule.py`). **This is the actual coding-agent reuse lever** (survives EOS; see the measured finding). | Seam 3 + Seam 4 | **1 (first feature)** |
+| **B** | capsule not wired into the server (pin/restore policy, VRAM budget). The frontend capsule API is shipped + bit-exact (`test_qwen36_agent_capsule.py`). This is the shared-prefix reuse lever for fresh sessions, branches, restarts, and non-hot workers; the single hot EOS loop now uses `message_append`. | Seam 3 + Seam 4 | **1 (first feature)** |
 | C | clean cancellation + KV-never-leads-transcript on abort | Seam 1 + Seam 2 | 1 (correctness) |
 | F | resource limits / reject-before-OOM (capsule budget needed by B) | Seam 4 | 1–2 |
 | G | observability (queued/tokenize/capture/spec) | Seam 2 + Seam 5 | 2 |
 | (thin worker) | move GPU work off the event loop; admission | Seam 1 + Seam 2 | 2 |
-| A | tool-call turn contiguous append. **Demoted to optional**: EOS invalidates the hot session before it matters, so it only helps `max_tokens`-capped turns; the frontend append is fine, the gap is serving-layer suffix extraction with a safe rebuild fallback. | Seam 3 | optional |
+| A | tool-call / text turn contiguous append. The hot EOS loop is now viable: stop-aware committed stream + message-boundary suffix append keeps visible OpenAI history connected to the internal KV journal, with safe rebuild fallback on divergence. | Seam 3 | shipped, keep hardening |
 | D | long-horizon resume: capsule → host RAM / disk | Seam 3 + the one exec addition (§6) | deferred, interface reserved |
 | E | branch / undo as agent ops (fork / time-travel) | Seam 3 | deferred, interface reserved |
 

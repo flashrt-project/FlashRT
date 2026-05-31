@@ -26,12 +26,23 @@ capsule API lives on the frontend.
 **1. Start the server**
 
 ```bash
+export FLASHRT_QWEN36_MTP_CKPT_DIR=/path/to/qwen36_mtp_ckpt
+export FLASHRT_QWEN36_LONG_KV_CACHE=fp8
+
 python -m serving.qwen36_agent.server \
   --checkpoint /path/to/qwen36_nvfp4 \
   --model-name qwen36-27b \
+  --max-seq 32768 \
+  --route-min-seq 0 \
   --host 127.0.0.1 --port 8000
 # startup loads the model, then logs: Uvicorn running on http://127.0.0.1:8000
 ```
+
+Do not set `FLASHRT_QWEN36_TQ_VERIFY_GRAPH=1` or
+`FLASHRT_QWEN36_TQ_MTP_CHAIN_GRAPH=1` for normal agent serving. The server
+defaults those graph flags to `0` on SM120 so arbitrary growing sessions avoid
+request-time exact-position graph capture. Enable them only for fixed-shape
+graph-replay benchmarks.
 
 **2. Check it is up**
 
@@ -175,9 +186,9 @@ decode graphs on the live path, so arbitrary coding-agent sessions do not need
 minutes of synthetic warmup. Use `--warmup-preset agent/all` only when you are
 intentionally preparing fixed-shape graph-replay demos or benchmarks.
 
-Startup logs print every queued warmup shape and then a `startup warmup done
-i/N` line as each shape finishes. Per-request logs use the same metric fields for
-both buffered and streaming responses:
+If startup warmup is enabled, logs print every queued warmup shape and then a
+`startup warmup done i/N` line as each shape finishes. Per-request logs use the
+same metric fields for both buffered and streaming responses:
 
 ```text
 complete sid=... prompt=... completion=... prefill_ms=... first_delta_ms=... decode_ms=... decode_tok/s=...
