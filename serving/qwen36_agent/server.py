@@ -121,6 +121,7 @@ def create_app_from_checkpoint(*, checkpoint: str,
                                warmup_committed_max_prompt: int = 1024,
                                warm_long_prefill_graphs: bool = False,
                                capsule_budget_bytes: int = 0,
+                               default_k: int = 6,
                                default_max_tokens: int = 2048,
                                max_output_tokens: int = 8192,
                                default_session_id: str | None = None):
@@ -142,7 +143,7 @@ def create_app_from_checkpoint(*, checkpoint: str,
             "\"speculative\": false).")
     else:
         log.info("MTP head loaded; speculative decode enabled (default K=%d)",
-                 warmup_k)
+                 default_k)
     log.info(
         "agent decode graph mode: verify_graph=%s mtp_chain_graph=%s",
         os.environ.get("FLASHRT_QWEN36_TQ_VERIFY_GRAPH", "<unset>"),
@@ -191,6 +192,7 @@ def create_app_from_checkpoint(*, checkpoint: str,
     return build_app(AgentService(
         engine,
         capsule_budget_bytes=capsule_budget_bytes,
+        default_k=default_k,
         default_max_tokens=default_max_tokens,
         max_output_tokens=max_output_tokens,
         default_session_id=default_session_id,
@@ -290,6 +292,10 @@ def main(argv: list[str] | None = None) -> None:
         "--warmup-K", type=int, default=6,
         help="Speculative decode K used for startup warmup.")
     parser.add_argument(
+        "--default-K", dest="default_K", type=int, default=6,
+        help="Default speculative decode K for live requests. Requests may "
+             "override it with the FlashRT extension field flashrt_K.")
+    parser.add_argument(
         "--warmup-committed-max-prompt", type=int, default=1024,
         help=(
             "Run real committed-stream warmup up to this prompt length; "
@@ -350,6 +356,7 @@ def main(argv: list[str] | None = None) -> None:
         warmup_committed_max_prompt=args.warmup_committed_max_prompt,
         warm_long_prefill_graphs=args.warm_long_prefill_graphs,
         capsule_budget_bytes=int(args.capsule_budget_mb) * (1 << 20),
+        default_k=args.default_K,
         default_max_tokens=args.default_max_tokens,
         max_output_tokens=args.max_output_tokens,
         default_session_id=args.default_session_id,

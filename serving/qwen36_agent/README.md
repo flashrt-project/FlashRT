@@ -34,6 +34,7 @@ python -m serving.qwen36_agent.server \
   --model-name qwen36-27b \
   --max-seq 32768 \
   --route-min-seq 0 \
+  --default-K 6 \
   --host 127.0.0.1 --port 8000
 # startup loads the model, then logs: Uvicorn running on http://127.0.0.1:8000
 ```
@@ -176,6 +177,7 @@ prompts rebuild until rollback/checkpoint support lands.
 | `--warmup-preset` | `none` | startup warmup shapes: `none` / `agent` / `short` / `long` / `all`; production agent serving does not need graph warmup by default |
 | `--warmup` | `""` | extra warmup shapes, comma-separated `prompt_len:max_tokens` |
 | `--warmup-K` | `6` | speculative K used during warmup |
+| `--default-K` | `6` | default speculative decode K for live requests; OpenAI-compatible clients inherit this unless they pass `flashrt_K` |
 | `--warmup-committed-max-prompt` | `1024` | run real committed-stream warmup up to this prompt length; larger long-context shapes use graph-only warmup |
 | `--warm-long-prefill-graphs` | off | also capture long-context prefill chunk graphs at startup |
 | `--capsule-budget-mb` | `0` | GPU byte budget (MB) for pinned shared-prefix capsules; `0` disables pinning. See [Capsule pinning](#capsule-pinning-shared-prefix-reuse-for-non-hot-requests). |
@@ -219,6 +221,10 @@ decode graphs are keyed by the live `cur_pos` and hurt first-use latency in a
 continually growing session. Set those graph flags to `1` before startup only
 for fixed-shape warmed benchmark runs. `/health` reports the kernel flags.
 
+`--default-K` controls live serving, while `--warmup-K` controls startup warmup.
+Use `--default-K` when a standard OpenAI-compatible client cannot pass FlashRT
+extension fields. Native clients may hot-switch per request with `flashrt_K`.
+
 ## HTTP surface and request fields
 
 OpenAI-compatible: `GET /v1/models`, `GET /health`, `POST /v1/chat/completions`,
@@ -243,7 +249,8 @@ before streaming begins.
   `prompt_cache_key`.
 - `flashrt_session_id` (or `session_id`): optional native session-affinity hint.
 - `flashrt_cache_salt`: legacy FlashRT namespace separator.
-- `flashrt_K`: speculative decode K for this request (default 6).
+- `flashrt_K`: speculative decode K for this request; overrides server
+  `--default-K`.
 - `enable_thinking`: passed to the Qwen chat template (default false).
 - `flashrt_pin_prefix`: pin this request's shared prefix as a capsule for reuse —
   an integer (pin that many leading prompt tokens) or `true` (pin the whole
