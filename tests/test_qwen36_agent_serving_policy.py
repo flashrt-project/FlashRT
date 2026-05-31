@@ -314,6 +314,29 @@ def test_agent_service_stream_stops_decode_after_tool_call_to_keep_session_hot()
     assert svc.sessions.hot_session_id == "agent-tools-stream-hot"
 
 
+def test_agent_service_stream_tool_call_close_after_delta_keeps_hot_session():
+    engine = FakeAgentEngine()
+    engine.outputs = [
+        DecodeChunk((1001,),
+                    '<tool_call>{"name":"lookup","arguments":{"x":1}}</tool_call>',
+                    1),
+        DecodeChunk((999, ord("x")), "", 0, stop=True, state_lookahead=2),
+    ]
+    svc = AgentService(engine)
+
+    gen = svc.stream_openai(AgentRequest(
+        session_id="agent-tools-close-hot",
+        messages=[{"role": "user", "content": "abc"}],
+        max_tokens=8,
+    ), model=engine.model_name)
+    next(gen)                 # role chunk
+    tool_delta = next(gen)    # tool_call delta, emitted after commit/mark hot
+    assert '"tool_calls"' in tool_delta
+    assert svc.sessions.hot_session_id == "agent-tools-close-hot"
+    gen.close()
+    assert svc.sessions.hot_session_id == "agent-tools-close-hot"
+
+
 def test_agent_service_stream_openai_yields_live_sse_chunks():
     engine = FakeAgentEngine()
     svc = AgentService(engine)

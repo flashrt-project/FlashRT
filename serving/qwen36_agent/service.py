@@ -86,6 +86,7 @@ class AgentService:
         # holds the lock for the whole turn; a streaming call holds it for the
         # life of the generator (released when it is exhausted or closed).
         self._lock = threading.Lock()
+        self._active_stream_committed = False
 
     def request_from_openai(self, req: Dict[str, Any]) -> AgentRequest:
         agent_req = request_from_openai(
@@ -114,6 +115,7 @@ class AgentService:
                       model: str) -> Iterable[str]:
         with self._lock:
             completed = False
+            self._active_stream_committed = False
             try:
                 yield from self._stream_openai(req, model=model)
                 completed = True
@@ -122,8 +124,9 @@ class AgentService:
                 # the final commit / mark, and an exception aborts it too. Either
                 # way the frontend state advanced past the journal, so clear the
                 # hot session and force the next turn to rebuild.
-                if not completed:
+                if not completed and not self._active_stream_committed:
                     self.sessions.hot_session_id = None
+                self._active_stream_committed = False
 
     def _effective_plan(
             self, session, plan: PrefixPlan) -> tuple[int, PrefixPlan]:
@@ -428,6 +431,7 @@ class AgentService:
         generated_ids: List[int] = []
         visible_parts: List[str] = []
         tool_calls: List[Dict[str, Any]] = []
+        deferred_tool_events: List[StreamEvent] = []
         seen_tool_call = False
         state_lookahead = False
         yield sse_data(role_chunk(completion_id, model))
@@ -456,9 +460,10 @@ class AgentService:
                     seen_tool_call = True
                     saw_tool_call = True
                     tool_calls.append(ev.payload)
+                    deferred_tool_events.append(ev)
                 else:
                     visible_parts.append(str(ev.payload))
-                yield sse_data(event_chunk(completion_id, model, ev))
+                    yield sse_data(event_chunk(completion_id, model, ev))
             if saw_tool_call:
                 break
         for ev in parser.finish():
@@ -468,9 +473,10 @@ class AgentService:
                 seen_tool_call = True
                 saw_tool_call = True
                 tool_calls.append(ev.payload)
+                deferred_tool_events.append(ev)
             else:
                 visible_parts.append(str(ev.payload))
-            yield sse_data(event_chunk(completion_id, model, ev))
+                yield sse_data(event_chunk(completion_id, model, ev))
         t_done = time.perf_counter()
 
         session.commit([*engine_prompt_tokens, *generated_ids])
@@ -479,6 +485,7 @@ class AgentService:
             "".join(visible_parts), tool_calls))
         session.visible_messages = visible_messages
         self._mark_reusable(session, state_lookahead)
+        self._active_stream_committed = True
         usage = {
             "prompt_tokens": len(prompt_tokens),
             "completion_tokens": len(generated_ids),
@@ -503,6 +510,8 @@ class AgentService:
             (t_prefill - t0) * 1000.0, first_delta_ms, decode_ms,
             decode_tok_per_s, stream_wall_ms, stream_wall_tok_per_s,
         )
+        for ev in deferred_tool_events:
+            yield sse_data(event_chunk(completion_id, model, ev))
         yield sse_data(done_chunk(
             completion_id,
             model,
