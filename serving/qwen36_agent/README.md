@@ -172,8 +172,11 @@ committed-stream warmup for short/medium shapes and graph-only warmup for larger
 long-context shapes.
 
 Startup logs print every queued warmup shape and then a `startup warmup done
-i/N` line as each shape finishes. Per-request logs use the same metric fields for
-both buffered and streaming responses:
+i/N` line as each shape finishes. Committed-stream warmup results include
+`completion_tokens`, `decode_ms`, and `decode_tok/s`; graph-only warmup results
+report graph counts instead because they do not execute a real decode stream.
+Per-request logs use the same metric fields for both buffered and streaming
+responses:
 
 ```text
 complete sid=... prompt=... completion=... prefill_ms=... first_delta_ms=... decode_ms=... decode_tok/s=...
