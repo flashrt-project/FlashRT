@@ -59,9 +59,20 @@ class AgentService:
 
     def __init__(self, engine: AgentEngine, *,
                  sessions: Optional[SessionRegistry] = None,
-                 capsule_budget_bytes: int = 0):
+                 capsule_budget_bytes: int = 0,
+                 default_max_tokens: int = 2048,
+                 max_output_tokens: int = 8192):
+        if default_max_tokens < 1:
+            raise ValueError("default_max_tokens must be >= 1")
+        if max_output_tokens < 1:
+            raise ValueError("max_output_tokens must be >= 1")
+        if default_max_tokens > max_output_tokens:
+            raise ValueError(
+                "default_max_tokens must be <= max_output_tokens")
         self.engine = engine
         self.sessions = sessions or SessionRegistry()
+        self.default_max_tokens = int(default_max_tokens)
+        self.max_output_tokens = int(max_output_tokens)
         # Pinned shared-prefix capsules (off-by-default: budget 0 keeps the
         # serving path byte-identical). A pinned capsule lets a fresh turn/session
         # restore a clean committed boundary instead of cold-prefilling the shared
@@ -73,6 +84,13 @@ class AgentService:
         # holds the lock for the whole turn; a streaming call holds it for the
         # life of the generator (released when it is exhausted or closed).
         self._lock = threading.Lock()
+
+    def request_from_openai(self, req: Dict[str, Any]) -> AgentRequest:
+        return request_from_openai(
+            req,
+            default_max_tokens=self.default_max_tokens,
+            max_output_tokens=self.max_output_tokens,
+        )
 
     def complete(self, req: AgentRequest) -> AgentResult:
         with self._lock:
@@ -512,7 +530,17 @@ def parse_pin_prefix(value: Any) -> Optional[int]:
 
 
 def request_from_openai(req: Dict[str, Any], *, default_k: int = 6,
-                        default_max_tokens: int = 2048) -> AgentRequest:
+                        default_max_tokens: int = 2048,
+                        max_output_tokens: Optional[int] = 8192
+                        ) -> AgentRequest:
+    if default_max_tokens < 1:
+        raise ValueError("default_max_tokens must be >= 1")
+    if max_output_tokens is not None:
+        if max_output_tokens < 1:
+            raise ValueError("max_output_tokens must be >= 1")
+        if default_max_tokens > max_output_tokens:
+            raise ValueError(
+                "default_max_tokens must be <= max_output_tokens")
     messages = validate_messages(req.get("messages"))
     tools = validate_tools(req.get("tools"))
     # Fall back to max_completion_tokens only when max_tokens is absent *or*
@@ -526,6 +554,9 @@ def request_from_openai(req: Dict[str, Any], *, default_k: int = 6,
         raw_max_tokens, name="max_tokens", default=default_max_tokens)
     if max_tokens < 1:
         raise ValueError("max_tokens must be >= 1")
+    if max_output_tokens is not None and max_tokens > int(max_output_tokens):
+        raise ValueError(
+            f"max_tokens must be <= {int(max_output_tokens)}")
     K = parse_int(req.get("flashrt_K"), name="flashrt_K", default=default_k)
     return AgentRequest(
         messages=messages,

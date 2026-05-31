@@ -11,7 +11,7 @@ import time
 from typing import Any, Dict
 
 from .qwen36_engine import Qwen36FrontendAgentEngine
-from .service import AgentService, request_from_openai, result_to_openai
+from .service import AgentService, result_to_openai
 
 log = logging.getLogger("qwen36_agent")
 
@@ -60,7 +60,7 @@ def build_app(service: AgentService):
     @app.post("/v1/chat/completions")
     async def chat_completions(raw: Dict[str, Any]):
         try:
-            req = request_from_openai(raw)
+            req = service.request_from_openai(raw)
             if req.stream:
                 return StreamingResponse(
                     service.stream_openai(req, model=service.engine.model_name),
@@ -119,7 +119,9 @@ def create_app_from_checkpoint(*, checkpoint: str,
                                warmup_k: int = 6,
                                warmup_committed_max_prompt: int = 1024,
                                warm_long_prefill_graphs: bool = False,
-                               capsule_budget_bytes: int = 0):
+                               capsule_budget_bytes: int = 0,
+                               default_max_tokens: int = 2048,
+                               max_output_tokens: int = 8192):
     if graph_cache_max is None:
         graph_cache_max = _auto_graph_cache_max(max_seq)
     engine = Qwen36FrontendAgentEngine.from_checkpoint(
@@ -162,7 +164,11 @@ def create_app_from_checkpoint(*, checkpoint: str,
         log.info("capsule pinning enabled, budget %.0f MB",
                  capsule_budget_bytes / (1 << 20))
     return build_app(AgentService(
-        engine, capsule_budget_bytes=capsule_budget_bytes))
+        engine,
+        capsule_budget_bytes=capsule_budget_bytes,
+        default_max_tokens=default_max_tokens,
+        max_output_tokens=max_output_tokens,
+    ))
 
 
 def _parse_warmup_shapes(spec_csv: str) -> list[tuple[int, int]]:
@@ -273,6 +279,14 @@ def main(argv: list[str] | None = None) -> None:
              "EOS, unlike contiguous append). Needs VRAM headroom beyond the "
              "model + KV; capsules are LRU-evicted to fit and an over-budget pin "
              "is rejected, not OOM.")
+    parser.add_argument(
+        "--default-max-tokens", type=int, default=2048,
+        help="Generated-token budget used when an OpenAI request omits both "
+             "max_tokens and max_completion_tokens.")
+    parser.add_argument(
+        "--max-output-tokens", type=int, default=8192,
+        help="Hard server-side generated-token cap. Requests above this cap "
+             "return HTTP 400 instead of being silently truncated.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--log-level", default="info")
@@ -303,6 +317,8 @@ def main(argv: list[str] | None = None) -> None:
         warmup_committed_max_prompt=args.warmup_committed_max_prompt,
         warm_long_prefill_graphs=args.warm_long_prefill_graphs,
         capsule_budget_bytes=int(args.capsule_budget_mb) * (1 << 20),
+        default_max_tokens=args.default_max_tokens,
+        max_output_tokens=args.max_output_tokens,
     )
     uvicorn.run(app, host=args.host, port=args.port,
                 log_level=args.log_level, access_log=args.access_log)
