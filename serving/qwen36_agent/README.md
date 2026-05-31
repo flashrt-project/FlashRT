@@ -4,14 +4,14 @@ Production-oriented Qwen3.6-27B NVFP4 serving example for long-running agent
 sessions.
 
 This directory is the **policy layer** above the FlashRT execution contract. It
-owns session cache, exact token-prefix reuse, OpenAI-compatible tool calling,
-streaming, and request scheduling. It must not add session or KV verbs to
+owns automatic exact-prefix reuse, OpenAI-compatible tool calling, streaming,
+and request scheduling. It must not add session or KV verbs to
 `exec/`; the contract remains Buffer / Graph / Plan / Event / ShapeKey.
 
 The execution-state **capsule** feature (cold-prefill a shared prefix once, then
 restore instead of re-prefill on later turns) is documented in
-[`capsules.md`](capsules.md); this server exposes session prefix reuse, and the
-capsule API lives on the frontend.
+[`capsules.md`](capsules.md); this server exposes hot-state prefix reuse, and
+the capsule API lives on the frontend.
 
 ## Quickstart (end-to-end, reproducible)
 
@@ -34,7 +34,6 @@ python -m serving.qwen36_agent.server \
   --model-name qwen36-27b \
   --max-seq 32768 \
   --route-min-seq 0 \
-  --default-session-id local-agent \
   --host 127.0.0.1 --port 8000
 # startup loads the model, then logs: Uvicorn running on http://127.0.0.1:8000
 ```
@@ -58,8 +57,7 @@ curl -s http://127.0.0.1:8000/health      # model, max_seq, live sessions
 curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "model": "qwen36-27b",
   "messages": [{"role": "user", "content": "Write a Python one-liner to reverse a string."}],
-  "max_tokens": 128,
-  "flashrt_session_id": "demo"
+  "max_tokens": 128
 }'
 ```
 
@@ -72,7 +70,7 @@ telemetry (see [Response fields](#response-fields)).
 curl -N http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "model": "qwen36-27b", "stream": true,
   "messages": [{"role": "user", "content": "Explain a hash map in two sentences."}],
-  "max_tokens": 128, "flashrt_session_id": "demo"
+  "max_tokens": 128
 }'
 # emits `data: {chat.completion.chunk}` lines, then `data: [DONE]`
 ```
@@ -84,8 +82,9 @@ decode), so the visible transcript never runs ahead of the GPU state.
 
 - 256K context on the existing Qwen3.6 long-context FP8-KV/TQ kernel path.
 - Latency-first, single-stream hot session by default.
-- Exact token-prefix reuse for coding-agent turns: cold prefill once, then only
-  prefill appended user/tool/diff/log tokens.
+- Automatic exact token-prefix reuse for OpenAI-compatible coding-agent turns:
+  cold prefill once, then only prefill appended user/tool/diff/log tokens. A
+  FlashRT session id is an optional native hint, not a protocol requirement.
 - Direct long-decode kernel launch by default for live agent sessions, so a
   growing conversation does not pay exact-position CUDA Graph capture in the
   first real request. Fixed-shape graph replay remains opt-in for demos and
@@ -101,10 +100,12 @@ decode), so the visible transcript never runs ahead of the GPU state.
 
 ## v1 cache policy
 
-The first backend is contiguous and session-first because that matches the
+The first backend is contiguous and hot-state-first because that matches the
 current fastest Qwen3.6 single-stream kernel path. A request can reuse the hot
-frontend state when its tokenized prompt exactly extends the cached session
-prefix.
+frontend state when its tokenized prompt exactly extends the cached prefix. This
+does not require a client-provided session id: OpenAI-compatible clients that
+resend full history are matched by token/content prefix. `flashrt_session_id`
+remains a native hint for explicit affinity, not the primary compatibility path.
 
 For OpenAI-style clients that resend full visible history, the service also
 tracks the visible message journal. If the token journal contains hidden
@@ -226,12 +227,13 @@ silently shortened.
 If `prompt_tokens + max_tokens` would exceed `--max-seq`, the server clips the
 generated-token budget to the remaining context for that request. If the prompt
 itself leaves no room for at least one generated token, the request is rejected
-before streaming begins. For local clients that do not send `flashrt_session_id`,
-start with `--default-session-id` so repeated agent turns share one hot session
-instead of rebuilding under a new generated session id each request.
+before streaming begins.
 
-- `flashrt_session_id` (or `session_id`): stable session key for prefix reuse.
-- `flashrt_cache_salt`: optional namespace separator for different prompt policies.
+- `prompt_cache_key`: OpenAI-style namespace hint for routing/reuse policy.
+- `cache_salt`: vLLM-style namespace separator; lower priority than
+  `prompt_cache_key`.
+- `flashrt_session_id` (or `session_id`): optional native session-affinity hint.
+- `flashrt_cache_salt`: legacy FlashRT namespace separator.
 - `flashrt_K`: speculative decode K for this request (default 6).
 - `enable_thinking`: passed to the Qwen chat template (default false).
 - `flashrt_pin_prefix`: pin this request's shared prefix as a capsule for reuse —
@@ -239,10 +241,11 @@ instead of rebuilding under a new generated session id each request.
   prompt's chunk-aligned head). Inert unless the server was started with
   `--capsule-budget-mb > 0`. See [Capsule pinning](#capsule-pinning-shared-prefix-reuse-that-survives-eos).
 
-For OpenAI-compatible clients that cannot pass FlashRT extension fields, a
-single-client deployment may set `--default-session-id <id>` so omitted session
-ids still hit the local prefix/session cache. Leave it unset for multi-client
-serving.
+OpenAI-compatible clients do not need to pass FlashRT extension fields for the
+normal single hot conversation path. The server tokenizes the full resent
+history and automatically attaches it to the hot prefix when it is an exact
+extension. `--default-session-id` is kept only as a single-client compatibility
+fallback for older local demos.
 
 ## Response fields
 
@@ -259,6 +262,10 @@ response carries a `flashrt` telemetry block:
 | `decode_ms`, `decode_tok_per_s` | decode time and throughput |
 | `prefix_action` | how the session was reused: `exact` / `append` / `message_append` / `restore` / `pin` / `truncate` / `rebuild` / `activate_rebuild` |
 
+The standard `usage.prompt_tokens_details.cached_tokens` mirrors the FlashRT
+cached-token count so OpenAI-compatible tools can observe prefix-cache hits
+without reading the `flashrt` extension block.
+
 ## Measured (RTX 5090, in-container)
 
 Single RTX 5090 (sm_120), `qwen36_nvfp4` (25 GB) + MTP, `--route-min-seq 0`,
@@ -266,8 +273,8 @@ FP8-KV. Numbers are the serving path (real `/v1/chat/completions`), measured to
 substantiate the two design claims below; this is not a throughput-serving
 benchmark (single stream, latency-first).
 
-**1. Session prefix reuse keeps prefill flat as a conversation grows.** A 4-turn
-coding-agent session (same `flashrt_session_id`, full history resent each turn):
+**1. Automatic hot-prefix reuse keeps prefill flat as a conversation grows.** A
+4-turn coding-agent session (full history resent each turn; session id optional):
 
 | turn | `prefix_action` | `cached_tokens` | `new_prefill_tokens` | `prefill_ms` |
 | --- | --- | ---: | ---: | ---: |
@@ -384,21 +391,21 @@ longer falls to cold graph-capture throughput. On RTX 5090, first-use live
 requests measured ~122 tok/s for a short text stream and ~130 tok/s for a
 tool-shaped stream with K=6.
 
-## Session prefix reuse (walkthrough)
+## Automatic prefix reuse (walkthrough)
 
-Reuse the same `flashrt_session_id` across turns and resend the full message list
-(including the previous assistant turn). The server tokenizes the new prompt,
-finds the longest exact token-prefix match against the hot session, and prefills
-only the appended suffix:
+Resend the full message list across turns, including the previous assistant
+turn. This is the normal OpenAI-compatible client pattern. The server tokenizes
+the new prompt, finds the longest exact token-prefix match against the hot
+state, and prefills only the appended suffix:
 
 ```bash
-# turn 1 (cold): flashrt.cached_tokens == 0, prefix_action == "rebuild"
-curl -s :8000/v1/chat/completions -d '{"model":"qwen36-27b","flashrt_session_id":"s1",
+# turn 1 (cold): flashrt.cached_tokens == 0
+curl -s :8000/v1/chat/completions -d '{"model":"qwen36-27b",
  "messages":[{"role":"user","content":"List three sorting algorithms."}],"max_tokens":128}'
 
 # turn 2 (warm): append the prior assistant reply + a new user message;
 # flashrt.cached_tokens > 0, prefix_action == "append" / "message_append"
-curl -s :8000/v1/chat/completions -d '{"model":"qwen36-27b","flashrt_session_id":"s1",
+curl -s :8000/v1/chat/completions -d '{"model":"qwen36-27b",
  "messages":[{"role":"user","content":"List three sorting algorithms."},
              {"role":"assistant","content":"<prior reply>"},
              {"role":"user","content":"Now give the time complexity of each."}],"max_tokens":128}'

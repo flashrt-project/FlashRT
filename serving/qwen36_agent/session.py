@@ -116,6 +116,11 @@ class SessionRegistry:
             self._sessions.move_to_end(session_id)
         return rec
 
+    def hot_record(self) -> Optional[SessionRecord]:
+        if not self.hot_session_id:
+            return None
+        return self.get(self.hot_session_id)
+
     def get_or_create(self, session_id: Optional[str],
                       *, cache_salt: str = "") -> SessionRecord:
         if session_id:

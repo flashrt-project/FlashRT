@@ -82,6 +82,21 @@ still the right primitive for shared-prefix reuse across fresh sessions,
 branches, restarts, or non-hot workers; it is no longer required for the normal
 single hot coding-agent loop.
 
+### Measured finding (2026-05-31): session id is not an ecosystem contract
+
+OpenAI-compatible clients generally resend the full message/tool history and do
+not carry a backend-specific session id. A FlashRT session id is therefore only a
+native affinity hint. The production path must be automatic and content-addressed:
+tokenize the incoming OpenAI request, try to attach it to the current hot
+token/message prefix, then fall back to capsule restore or cold prefill. This
+matches the ecosystem expectation set by OpenAI prompt caching, vLLM Automatic
+Prefix Caching, and SGLang prefix caching: clients may provide namespace hints
+(`prompt_cache_key`, `cache_salt`), but they should not need FlashRT-specific
+fields for normal prefix reuse.
+
+The implemented v1 remains capsule/hot-state granular, not block-radix. It does
+not add a KV-block table or scheduler to the execution contract.
+
 ---
 
 ## 2. The five seams (the heart of this design)

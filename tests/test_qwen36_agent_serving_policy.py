@@ -397,6 +397,93 @@ def test_agent_service_stream_openai_reuses_hot_session_prefix():
     assert engine.prefills[-1][1:] == (6, 1, 6)
 
 
+def test_agent_service_auto_reuses_hot_prefix_without_session_id():
+    engine = FakeAgentEngine()
+    svc = AgentService(engine)
+
+    res0 = svc.complete(AgentRequest(
+        messages=[{"role": "user", "content": "abc"}],
+        max_tokens=2,
+    ))
+    assert res0.session_id.startswith("frt-")
+
+    res1 = svc.complete(AgentRequest(
+        messages=[
+            {"role": "user", "content": "abc"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "z"},
+        ],
+        max_tokens=1,
+    ))
+
+    assert res1.session_id == res0.session_id
+    assert res1.prefix_plan.action == "append"
+    assert res1.stats.cached_tokens == 6
+    assert res1.stats.new_prefill_tokens == 2
+    assert engine.prefills[-1][1:] == (6, 1, 6)
+
+
+def test_agent_service_auto_message_append_without_session_id():
+    class HiddenEngine(FakeAgentEngine):
+        def __init__(self):
+            super().__init__()
+            self.outputs = [DecodeChunk((999, ord("h")), "h", 2)]
+
+        def append_suffix_tokens_for_messages(
+                self, previous, incoming, *, tools=None,
+                enable_thinking=False):
+            del tools, enable_thinking
+            if previous != incoming[:len(previous)]:
+                return None
+            return [42, 43]
+
+    engine = HiddenEngine()
+    svc = AgentService(engine)
+    res0 = svc.complete(AgentRequest(
+        messages=[{"role": "user", "content": "abc"}],
+        max_tokens=1,
+    ))
+
+    res1 = svc.complete(AgentRequest(
+        messages=[
+            {"role": "user", "content": "abc"},
+            {"role": "assistant", "content": "h"},
+            {"role": "user", "content": "next"},
+        ],
+        max_tokens=1,
+    ))
+
+    assert res1.session_id == res0.session_id
+    assert res1.prefix_plan.action == "message_append"
+    assert res1.stats.cached_tokens == 6
+    assert res1.stats.new_prefill_tokens == 2
+    assert engine.prefills[-1][1:] == (6, 1, 6)
+
+
+def test_agent_service_auto_prefix_respects_cache_namespace():
+    engine = FakeAgentEngine()
+    svc = AgentService(engine)
+    svc.complete(AgentRequest(
+        messages=[{"role": "user", "content": "abc"}],
+        cache_salt="tenant-a",
+        max_tokens=2,
+    ))
+
+    res = svc.complete(AgentRequest(
+        messages=[
+            {"role": "user", "content": "abc"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "z"},
+        ],
+        cache_salt="tenant-b",
+        max_tokens=1,
+    ))
+
+    assert res.prefix_plan.action == "append"
+    assert res.stats.cached_tokens == 0
+    assert engine.prefills[-1][1:] == (0, 1, 6)
+
+
 def test_agent_service_message_append_ignores_tool_call_wire_ids():
     class SuffixEngine(FakeAgentEngine):
         def append_suffix_tokens_for_messages(
@@ -595,6 +682,24 @@ def test_openai_request_and_response_include_flashrt_cache_metrics():
     assert body["model"] == "fake-qwen36"
     assert body["flashrt"]["session_id"] == "s"
     assert body["flashrt"]["new_prefill_tokens"] == 2
+    assert body["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
+
+
+def test_openai_request_accepts_standard_prompt_cache_namespace():
+    req = request_from_openai({
+        "messages": [{"role": "user", "content": "a"}],
+        "prompt_cache_key": "repo-a",
+        "cache_salt": "tenant-b",
+        "flashrt_cache_salt": "legacy",
+    })
+    assert req.cache_salt == "repo-a"
+
+    req = request_from_openai({
+        "messages": [{"role": "user", "content": "a"}],
+        "cache_salt": "tenant-b",
+        "flashrt_cache_salt": "legacy",
+    })
+    assert req.cache_salt == "tenant-b"
 
 
 def test_openai_request_uses_configured_default_and_output_cap():

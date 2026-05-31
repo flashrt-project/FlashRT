@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 log = logging.getLogger("qwen36_agent")
 
+from .auto_prefix import AutoPrefixCacheManager
 from .engine import AgentEngine, GenerationStats
 from .openai_stream import (
     done_chunk,
@@ -50,7 +51,7 @@ class AgentResult:
     tool_calls: List[Dict[str, Any]]
     finish_reason: str
     events: List[StreamEvent]
-    usage: Dict[str, int]
+    usage: Dict[str, Any]
     stats: GenerationStats
     prefix_plan: PrefixPlan
 
@@ -73,6 +74,7 @@ class AgentService:
                 "default_max_tokens must be <= max_output_tokens")
         self.engine = engine
         self.sessions = sessions or SessionRegistry()
+        self.auto_prefix = AutoPrefixCacheManager(self.sessions)
         self.default_max_tokens = int(default_max_tokens)
         self.max_output_tokens = int(max_output_tokens)
         self.default_session_id = default_session_id or None
@@ -363,6 +365,26 @@ class AgentService:
         else:
             self.sessions.mark_hot(session.session_id)
 
+    def _select_prefix_session(
+            self, req: AgentRequest, prompt_tokens: List[int]):
+        def can_message_append(session) -> bool:
+            previous = getattr(session, "visible_messages", None)
+            if not previous:
+                return False
+            incoming_prefix = req.messages[:len(previous)]
+            return (
+                incoming_prefix == previous
+                or self._messages_equivalent_prefix(previous, incoming_prefix)
+            )
+
+        selected = self.auto_prefix.select(
+            req.session_id,
+            prompt_tokens,
+            cache_salt=req.cache_salt,
+            can_message_append=can_message_append,
+        )
+        return selected.session, selected.plan
+
     def _effective_max_tokens(self, req: AgentRequest,
                               prompt_len: int) -> int:
         max_tokens = int(req.max_tokens)
@@ -444,11 +466,7 @@ class AgentService:
             enable_thinking=req.enable_thinking,
         )
         max_tokens = self._effective_max_tokens(req, len(prompt_tokens))
-        session, plan = self.sessions.plan_request(
-            req.session_id,
-            prompt_tokens,
-            cache_salt=req.cache_salt,
-        )
+        session, plan = self._select_prefix_session(req, prompt_tokens)
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         engine_prompt_tokens = prompt_tokens
@@ -536,6 +554,9 @@ class AgentService:
             "prompt_tokens": len(prompt_tokens),
             "completion_tokens": completion_tokens,
             "total_tokens": len(prompt_tokens) + completion_tokens,
+            "prompt_tokens_details": {
+                "cached_tokens": int(plan.cached_tokens),
+            },
         }
         log.info(self._fmt_metric_line(
             "complete",
@@ -578,11 +599,7 @@ class AgentService:
             enable_thinking=req.enable_thinking,
         )
         max_tokens = self._effective_max_tokens(req, len(prompt_tokens))
-        session, plan = self.sessions.plan_request(
-            req.session_id,
-            prompt_tokens,
-            cache_salt=req.cache_salt,
-        )
+        session, plan = self._select_prefix_session(req, prompt_tokens)
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         engine_prompt_tokens = prompt_tokens
         decode_k = self._effective_k(req)
@@ -672,6 +689,9 @@ class AgentService:
             "prompt_tokens": len(prompt_tokens),
             "completion_tokens": len(generated_ids),
             "total_tokens": len(prompt_tokens) + len(generated_ids),
+            "prompt_tokens_details": {
+                "cached_tokens": int(plan.cached_tokens),
+            },
         }
         completion_tokens = len(generated_ids)
         decode_ms = max(0.0, backend_decode_ms)
@@ -825,7 +845,11 @@ def request_from_openai(req: Dict[str, Any], *, default_k: int = 6,
         max_tokens=max_tokens,
         stream=parse_bool(req.get("stream"), default=False),
         session_id=req.get("flashrt_session_id") or req.get("session_id"),
-        cache_salt=str(req.get("flashrt_cache_salt", "")),
+        cache_salt=str(
+            req.get("prompt_cache_key")
+            or req.get("cache_salt")
+            or req.get("flashrt_cache_salt", "")
+        ),
         enable_thinking=parse_bool(req.get("enable_thinking"), default=False),
         K=K,
         pin_prefix=parse_pin_prefix(req.get("flashrt_pin_prefix")),
