@@ -75,12 +75,23 @@ tokens even when the message prefix is semantically identical. The serving layer
 now appends the newly added message suffix after a known-equivalent visible
 message prefix, instead of forcing a full render byte-prefix match.
 
+This is the R1 continuation contract: the hot journal may retain internal
+non-thinking control tokens, and continuation happens from that committed
+boundary. A naive cold canonical render that strips those internal tokens is not
+the reference for hot reuse.
+
 Verified end-to-end on realistic EOS-terminated long-sequence turns:
 `append(cold) → message_append → message_append`, with `new_prefill_tokens`
 dropping from thousands to tens and TTFT staying ~70-150 ms. Capsule restore is
 still the right primitive for shared-prefix reuse across fresh sessions,
 branches, restarts, or non-hot workers; it is no longer required for the normal
 single hot coding-agent loop.
+
+The frontend-level correctness gate is token-exact: decode with a stop token
+inside a speculative chunk, rollback to the stop boundary, append a suffix, and
+decode again must match prefill to the exact stopped boundary plus the same
+suffix. This is covered for short and long routes in
+`tests/test_qwen36_agent_gpu_split.py`.
 
 ### Measured finding (2026-05-31): session id is not an ecosystem contract
 

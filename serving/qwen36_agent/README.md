@@ -115,6 +115,14 @@ assistant turn. Divergent prompts rebuild or restore at a future checkpoint
 boundary. Truncation also rebuilds in v1: the frontend cannot roll the hot GPU
 state back to a shorter prefix until checkpoint/rollback support lands.
 
+The hot journal is the source of truth for continuation. For Qwen3.6
+non-thinking mode it may include internal empty `<think></think>` control tokens
+that are not visible in the OpenAI assistant message. That R1 continuation
+contract is intentional: later turns append after the committed hot journal, not
+after a freshly rendered visible-only prompt. Tests compare against exact hot
+boundary continuation, not a naive canonical render with those internal tokens
+stripped.
+
 For OpenAI-style clients that resend the full message list every turn, prefix
 reuse requires the history to include the assistant content/tool call emitted by
 the previous response. If a client sends only the new user/tool message without
@@ -483,7 +491,8 @@ PYTHONPATH=. PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q \
 ```
 
 The GPU split test is skipped unless both checkpoint variables are present.  To
-validate real Qwen3.6 short/long split and long append equivalence:
+validate real Qwen3.6 short/long split, long append equivalence, and stop-token
+rollback at a speculative chunk boundary:
 
 ```bash
 FLASHRT_QWEN36_NVFP4_CKPT_DIR=CHECKPOINT_DIR \

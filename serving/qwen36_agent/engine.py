@@ -17,12 +17,12 @@ class DecodeChunk:
 
     ``token_ids`` are the visible tokens to commit to the session journal.
 
-    Qwen3.6 speculative decode verifies a whole chunk at once, so when a stop
-    token lands mid-chunk the frontend KV/recurrent state has already committed
-    the tokens *after* the stop. Those are not part of the transcript:
-    ``state_lookahead`` counts them. A nonzero ``state_lookahead`` means the GPU
-    state leads the visible journal, so the session must be rebuilt (not
-    hot-appended) until a rollback/checkpoint mechanism lands.
+    Qwen3.6 speculative decode verifies a whole chunk at once. A committed
+    frontend should roll KV/recurrent state back when a stop token lands
+    mid-chunk, so ``state_lookahead`` is normally zero. If a backend cannot
+    rollback and reports tokens after the visible stop boundary,
+    ``state_lookahead`` counts them; a nonzero value means the GPU state leads
+    the visible journal, so the session must be rebuilt rather than hot-appended.
     """
 
     token_ids: tuple[int, ...]
