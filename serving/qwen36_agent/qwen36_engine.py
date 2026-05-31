@@ -442,24 +442,14 @@ class Qwen36FrontendAgentEngine:
 
             ids = self.dummy_token_ids(prompt_len)
             self.prefill(ids.view(-1).tolist(), max_tokens=max_tokens, K=K)
-            decode_t0 = time.perf_counter()
-            chunks = list(self.generate_stream(max_tokens=max_tokens, K=K))
+            _ = list(self.generate_stream(max_tokens=max_tokens, K=K))
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
-            decode_ms = max(0.0, (time.perf_counter() - decode_t0) * 1000.0)
-            completion_tokens = sum(len(chunk.token_ids) for chunk in chunks)
-            decode_tok_per_s = (
-                completion_tokens * 1000.0 / decode_ms
-                if decode_ms > 0 else 0.0
-            )
             item = {
                 "prompt_len": prompt_len,
                 "max_tokens": max_tokens,
                 "route": self._last_route,
                 "prefill_ms": self._last_prefill_ms,
-                "completion_tokens": completion_tokens,
-                "decode_ms": decode_ms,
-                "decode_tok/s": decode_tok_per_s,
                 "wall_ms": (time.perf_counter() - t0) * 1000.0,
             }
             out.append(item)
