@@ -664,6 +664,31 @@ def test_agent_service_keeps_explicit_session_over_default_session_id():
     assert req.session_id == "explicit"
 
 
+def test_agent_service_applies_default_k_and_request_override():
+    engine = FakeAgentEngine()
+    svc = AgentService(engine, default_k=4)
+
+    res = svc.complete(svc.request_from_openai({
+        "messages": [{"role": "user", "content": "abc"}],
+        "max_tokens": 1,
+    }))
+    assert res.prefix_plan.action == "append"
+    assert engine.generate_calls[-1] == (1, 4)
+    assert engine.prefills[-1][3] == 4
+
+    res = svc.complete(svc.request_from_openai({
+        "messages": [
+            {"role": "user", "content": "abc"},
+            {"role": "assistant", "content": res.text},
+            {"role": "user", "content": "next"},
+        ],
+        "max_tokens": 1,
+        "flashrt_K": 5,
+    }))
+    assert engine.generate_calls[-1] == (1, 5)
+    assert engine.prefills[-1][3] == 5
+
+
 def test_openai_request_and_response_include_flashrt_cache_metrics():
     engine = FakeAgentEngine()
     svc = AgentService(engine)

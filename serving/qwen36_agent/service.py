@@ -62,9 +62,12 @@ class AgentService:
     def __init__(self, engine: AgentEngine, *,
                  sessions: Optional[SessionRegistry] = None,
                  capsule_budget_bytes: int = 0,
+                 default_k: int = 6,
                  default_max_tokens: int = 2048,
                  max_output_tokens: int = 8192,
                  default_session_id: Optional[str] = None):
+        if default_k < 1:
+            raise ValueError("default_k must be >= 1")
         if default_max_tokens < 1:
             raise ValueError("default_max_tokens must be >= 1")
         if max_output_tokens < 1:
@@ -75,6 +78,7 @@ class AgentService:
         self.engine = engine
         self.sessions = sessions or SessionRegistry()
         self.auto_prefix = AutoPrefixCacheManager(self.sessions)
+        self.default_k = int(default_k)
         self.default_max_tokens = int(default_max_tokens)
         self.max_output_tokens = int(max_output_tokens)
         self.default_session_id = default_session_id or None
@@ -94,6 +98,7 @@ class AgentService:
     def request_from_openai(self, req: Dict[str, Any]) -> AgentRequest:
         agent_req = request_from_openai(
             req,
+            default_k=self.default_k,
             default_max_tokens=self.default_max_tokens,
             max_output_tokens=self.max_output_tokens,
         )
