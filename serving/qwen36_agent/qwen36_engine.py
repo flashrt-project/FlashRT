@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from typing import Any, Dict, Iterable, List, Sequence
@@ -80,6 +81,11 @@ class Qwen36FrontendAgentEngine:
         for msg in messages:
             if msg.get("content") is None:
                 msg = {**msg, "content": ""}
+            else:
+                msg = dict(msg)
+            if msg.get("tool_calls"):
+                msg["tool_calls"] = self._normalize_tool_calls(
+                    msg.get("tool_calls"))
             normalized.append(msg)
         return self.fe._tokenizer.apply_chat_template(
             normalized,
@@ -88,6 +94,37 @@ class Qwen36FrontendAgentEngine:
             add_generation_prompt=add_generation_prompt,
             enable_thinking=enable_thinking,
         )
+
+    @staticmethod
+    def _normalize_tool_calls(tool_calls: Any) -> Any:
+        """Qwen's chat template expects assistant tool-call arguments as a
+        mapping so it can emit one <parameter=...> block per key. OpenAI wire
+        format carries ``function.arguments`` as a JSON string; normalize it
+        before handing history back to the tokenizer."""
+        if not isinstance(tool_calls, list):
+            return tool_calls
+        out = []
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                out.append(tc)
+                continue
+            tc = dict(tc)
+            fn = tc.get("function")
+            if isinstance(fn, dict):
+                fn = dict(fn)
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        parsed = json.loads(args) if args.strip() else {}
+                    except Exception:
+                        parsed = {"arguments": args}
+                    if isinstance(parsed, dict):
+                        fn["arguments"] = parsed
+                    else:
+                        fn["arguments"] = {"arguments": parsed}
+                tc["function"] = fn
+            out.append(tc)
+        return out
 
     def tokenize_text(self, text: str) -> List[int]:
         return list(self.fe._tokenizer(

@@ -96,12 +96,12 @@ class ToolCallStreamParser:
             if s.endswith("```"):
                 s = s[:-3]
             s = s.strip()
-        try:
-            obj = json.loads(s)
-        except Exception:
+        parsed = self._parse_json_tool_call(s)
+        if parsed is None:
+            parsed = self._parse_qwen_xml_tool_call(s)
+        if parsed is None:
             return None
-        name = obj.get("name")
-        args = obj.get("arguments", obj.get("parameters", {}))
+        name, args = parsed
         if not isinstance(args, str):
             args = json.dumps(args, ensure_ascii=False, separators=(",", ":"))
         idx = self._tool_idx
@@ -115,3 +115,48 @@ class ToolCallStreamParser:
                 "arguments": args,
             },
         }
+
+    @staticmethod
+    def _parse_json_tool_call(s: str) -> Optional[tuple[str, Any]]:
+        try:
+            obj = json.loads(s)
+        except Exception:
+            return None
+        name = obj.get("name")
+        if not isinstance(name, str) or not name:
+            return None
+        args = obj.get("arguments", obj.get("parameters", {}))
+        return name, args
+
+    @staticmethod
+    def _parse_qwen_xml_tool_call(s: str) -> Optional[tuple[str, Dict[str, str]]]:
+        """Parse Qwen's native tool-call format from its chat template:
+
+        <function=name>
+        <parameter=arg>
+        value
+        </parameter>
+        </function>
+        """
+        m = re.fullmatch(
+            r"\s*<function=([^>\n]+)>\s*(.*?)\s*</function>\s*",
+            s,
+            flags=re.DOTALL,
+        )
+        if m is None:
+            return None
+        name = m.group(1).strip()
+        body = m.group(2)
+        if not name:
+            return None
+        args: Dict[str, str] = {}
+        for pm in re.finditer(
+                r"<parameter=([^>\n]+)>\s*(.*?)\s*</parameter>",
+                body,
+                flags=re.DOTALL):
+            key = pm.group(1).strip()
+            if key:
+                args[key] = pm.group(2).strip()
+        if not args and body.strip():
+            return None
+        return name, args

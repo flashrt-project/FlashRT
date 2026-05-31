@@ -78,6 +78,29 @@ def test_tool_stream_parser_holds_partial_tags_and_json():
     assert tail == []
 
 
+def test_tool_stream_parser_accepts_qwen_xml_function_calls():
+    p = ToolCallStreamParser()
+
+    out = p.feed(
+        "<tool_call>\n"
+        "<function=write>\n"
+        "<parameter=path>\n"
+        "merge_sort.py\n"
+        "</parameter>\n"
+        "<parameter=content>\n"
+        "print('ok')\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>")
+
+    assert len(out) == 1
+    assert out[0].kind == "tool_call"
+    tc = out[0].payload
+    assert tc["function"]["name"] == "write"
+    assert tc["function"]["arguments"] == (
+        "{\"path\":\"merge_sort.py\",\"content\":\"print('ok')\"}")
+
+
 def test_sse_stream_contains_role_tool_call_and_done():
     p = ToolCallStreamParser()
     events = []
@@ -378,9 +401,11 @@ def test_openai_request_and_response_include_flashrt_cache_metrics():
 class FakeTokenizer:
     def __init__(self):
         self.template_kwargs = None
+        self.messages = None
 
     def apply_chat_template(self, messages, **kwargs):
         self.template_kwargs = kwargs
+        self.messages = messages
         return "|".join((m.get("content") or "") for m in messages)
 
     def __call__(self, prompt, add_special_tokens=False):
@@ -480,6 +505,30 @@ def test_qwen36_frontend_agent_engine_hides_think_tags_by_default():
     chunks = list(engine.generate_stream(max_tokens=1, K=4))
 
     assert chunks[0].text == "answer"
+
+
+def test_qwen36_frontend_agent_engine_normalizes_openai_tool_call_history():
+    fe = FakeFrontend()
+    engine = Qwen36FrontendAgentEngine(fe)
+
+    engine.render_chat([{
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "write",
+                "arguments": "{\"path\":\"x.txt\",\"content\":\"ok\"}",
+            },
+        }],
+    }])
+
+    tool_call = fe._tokenizer.messages[0]["tool_calls"][0]
+    assert tool_call["function"]["arguments"] == {
+        "path": "x.txt",
+        "content": "ok",
+    }
 
 
 def test_qwen36_frontend_agent_engine_stops_visible_text_at_im_end():
