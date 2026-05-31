@@ -185,8 +185,28 @@ class Qwen36FrontendAgentEngine:
             enable_thinking=enable_thinking,
         )
         if not rendered.startswith(previous_rendered):
-            return None
-        suffix = rendered[len(previous_rendered):]
+            # Qwen3.6's non-thinking generation prompt still injects an
+            # internal ``<think>\n\n</think>\n\n`` control block before decode.
+            # That block is part of the hot KV state but is intentionally not
+            # replayed by OpenAI clients as visible assistant content. When the
+            # visible message prefix is already known-equivalent, append only
+            # the newly added messages after the committed stop-token boundary
+            # instead of requiring the full visible render to be a byte prefix
+            # of the internal prompt journal.
+            suffix_messages = incoming_messages[len(previous_messages):]
+            if not suffix_messages:
+                return None
+            suffix = self.fe._tokenizer.apply_chat_template(
+                suffix_messages,
+                tools=tools or None,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+            if suffix:
+                suffix = "\n" + suffix
+        else:
+            suffix = rendered[len(previous_rendered):]
         if not suffix:
             return None
         return self.tokenize_text(suffix)

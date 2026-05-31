@@ -700,6 +700,42 @@ def test_qwen36_frontend_agent_engine_appends_tool_suffix_from_message_boundary(
     assert suffix == [ord(ch) for ch in "<tool>done</m><assistant>"]
 
 
+def test_qwen36_frontend_agent_engine_appends_suffix_when_internal_think_breaks_render_prefix():
+    class ThinkBoundaryTokenizer(FakeTokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            rendered = ""
+            for msg in messages:
+                rendered += f"<{msg.get('role')}>"
+                if len(messages) > 2 and msg.get("role") == "assistant":
+                    rendered += "<hidden>"
+                rendered += msg.get("content") or ""
+                rendered += "</m>\n"
+            if kwargs.get("add_generation_prompt"):
+                rendered += "<assistant>\n<think>\n\n</think>\n\n"
+            return rendered
+
+    class ThinkBoundaryFrontend(FakeFrontend):
+        def __init__(self):
+            super().__init__()
+            self._tokenizer = ThinkBoundaryTokenizer()
+
+    engine = Qwen36FrontendAgentEngine(
+        ThinkBoundaryFrontend(), model_name="fake")
+    previous = [
+        {"role": "user", "content": "write code"},
+        {"role": "assistant", "content": "done"},
+    ]
+    incoming = [
+        *previous,
+        {"role": "user", "content": "add tests"},
+    ]
+
+    suffix = engine.append_suffix_tokens_for_messages(previous, incoming)
+
+    expected = "\n<user>add tests</m>\n<assistant>\n<think>\n\n</think>\n\n"
+    assert suffix == [ord(ch) for ch in expected]
+
+
 def test_qwen36_frontend_agent_engine_hides_think_tags_by_default():
     class ThinkTokenizer(FakeTokenizer):
         def decode(self, ids, skip_special_tokens=False):
