@@ -316,10 +316,10 @@ def main(argv: list[str] | None = None) -> None:
              "return HTTP 400 instead of being silently truncated.")
     parser.add_argument(
         "--default-session-id", default=None,
-        help="Optional fallback session id for requests that omit "
-             "flashrt_session_id/session_id. Use only for single-client local "
-             "agent demos or trusted one-user deployments; multi-client "
-             "servers should leave this unset.")
+        help="Legacy fallback session id for older single-client local demos. "
+             "Normal OpenAI-compatible clients should rely on automatic "
+             "hot-prefix reuse instead; multi-client servers should leave this "
+             "unset.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--log-level", default="info")

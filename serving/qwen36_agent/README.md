@@ -146,9 +146,10 @@ short-context committed split:
   `decode_own_speculative_nvfp4_committed_stream` or
   `decode_long_ctx_nvfp4_committed_stream`
 
-Long-context append-prefill is limited to the currently hot contiguous session.
-Non-hot sessions still rebuild/restore at the policy layer rather than reporting
-a fake cache hit.
+Long-context append-prefill is limited to the currently hot contiguous frontend
+state. Requests without `flashrt_session_id` can still attach to that hot state
+when their tokenized OpenAI history is an exact extension. Non-hot prompts still
+rebuild/restore at the policy layer rather than reporting a fake cache hit.
 Exact same-length prompts continue from the current hot boundary; shorter
 prompts rebuild until rollback/checkpoint support lands.
 
@@ -169,10 +170,10 @@ prompts rebuild until rollback/checkpoint support lands.
 | `--warmup-K` | `6` | speculative K used during warmup |
 | `--warmup-committed-max-prompt` | `1024` | run real committed-stream warmup up to this prompt length; larger long-context shapes use graph-only warmup |
 | `--warm-long-prefill-graphs` | off | also capture long-context prefill chunk graphs at startup |
-| `--capsule-budget-mb` | `0` | GPU byte budget (MB) for pinned shared-prefix capsules; `0` disables pinning. See [Capsule pinning](#capsule-pinning-shared-prefix-reuse-that-survives-eos). |
+| `--capsule-budget-mb` | `0` | GPU byte budget (MB) for pinned shared-prefix capsules; `0` disables pinning. See [Capsule pinning](#capsule-pinning-shared-prefix-reuse-for-non-hot-requests). |
 | `--default-max-tokens` | `2048` | generated-token budget used when a request omits both `max_tokens` and `max_completion_tokens` |
 | `--max-output-tokens` | `8192` | hard generated-token cap; requests above this return HTTP 400 instead of being silently truncated |
-| `--default-session-id` | unset | fallback session id for requests that omit `flashrt_session_id` / `session_id`; intended only for single-client local agent demos or trusted one-user deployments |
+| `--default-session-id` | unset | legacy fallback session id for older single-client demos; normal OpenAI-compatible clients should rely on automatic hot-prefix reuse instead |
 | `--host` / `--port` | `127.0.0.1` / `8000` | bind address |
 | `--log-level` | `info` | uvicorn log level |
 | `--access-log` | off | enable uvicorn per-request access logs; off by default to avoid benchmark jitter |
@@ -239,7 +240,7 @@ before streaming begins.
 - `flashrt_pin_prefix`: pin this request's shared prefix as a capsule for reuse —
   an integer (pin that many leading prompt tokens) or `true` (pin the whole
   prompt's chunk-aligned head). Inert unless the server was started with
-  `--capsule-budget-mb > 0`. See [Capsule pinning](#capsule-pinning-shared-prefix-reuse-that-survives-eos).
+  `--capsule-budget-mb > 0`. See [Capsule pinning](#capsule-pinning-shared-prefix-reuse-for-non-hot-requests).
 
 OpenAI-compatible clients do not need to pass FlashRT extension fields for the
 normal single hot conversation path. The server tokenizes the full resent
@@ -415,14 +416,15 @@ If a client sends only the new message without the prior assistant turn, or a
 shorter/divergent prompt, the token stream has diverged and the server rebuilds
 or restores at a checkpoint boundary (it reports `rebuild`, never a fake hit).
 
-## Capsule pinning (shared-prefix reuse that survives EOS)
+## Capsule pinning (shared-prefix reuse for non-hot requests)
 
-A coding agent resends a large stable prefix every turn — system prompt, tool
-schemas, repo index/summary — then a small new user/tool suffix, and each turn
-ends on a stop token. Because an EOS-terminated turn invalidates contiguous append
-(above), the way to reuse that prefix is to **pin it as an execution-state
-capsule** and *restore* a clean committed boundary on every later turn/session,
-re-prefilling only the suffix. This is FlashRT's graph-replay-native prefix reuse
+A coding agent often resends a large stable prefix — system prompt, tool
+schemas, repo index/summary — plus a small user/tool/diff suffix. The normal
+single hot conversation uses automatic `append` / `message_append`. Capsules are
+for the cases that hot-state append cannot cover: fresh sessions, branch/fork,
+restart/resume, non-hot workers, or a deliberately pinned shared prefix reused by
+multiple later requests. A capsule restores a clean committed boundary and
+re-prefills only the suffix. This is FlashRT's graph-replay-native prefix reuse
 (see [`capsules.md`](capsules.md) and [`../../docs/serving_design.md`](../../docs/serving_design.md)).
 
 Enable it at startup with a GPU byte budget, then pin per request:

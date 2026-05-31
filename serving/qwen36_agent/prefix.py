@@ -1,9 +1,10 @@
-"""Token-prefix helpers for contiguous FlashRT session cache.
+"""Token-prefix helpers for contiguous FlashRT hot-state cache.
 
-The first Qwen3.6 agent-serving backend is session-first and contiguous: it
+The first Qwen3.6 agent-serving backend is hot-state-first and contiguous: it
 keeps one hot GPU KV/state region and reuses it when the next request extends
-the same exact token prefix.  More elaborate block/radix caches can implement
-the same policy interface later without changing the exec contract.
+the same exact token prefix.  A client-provided session id is only a native
+affinity hint.  More elaborate cache policies can implement the same policy
+interface later without changing the exec contract.
 """
 
 from __future__ import annotations

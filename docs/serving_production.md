@@ -161,11 +161,14 @@ Every request carries a small state record with a timestamp per transition. This
 Transitions stamp: `enqueued_at, started_at, first_token_at, finished_at`, plus
 `terminal_state`. CANCELLED and ERROR both trip invariant 2.
 
-### Seam 3 — session / capsule policy interface
+### Seam 3 — automatic prefix / capsule policy interface
 
-Extend the existing `SessionRegistry` + `PrefixPlan` (do not replace). Add the
-`restore` and `fork` actions and a capsule store; this is serving_design §6
-steps 2–3 made into a locked interface.
+Extend the existing `SessionRegistry` + `PrefixPlan` (do not replace), but do
+not make a client session id the compatibility contract. The worker first asks
+an automatic prefix policy to match the incoming tokenized OpenAI request against
+the current hot state; explicit session ids are affinity hints. Add the `restore`
+and `fork` actions and a capsule store; this is serving_design §6 steps 2–3 made
+into a locked interface.
 
 ```python
 # PrefixPlan.action ∈ {exact, append, message_append, restore, rebuild, fork, truncate}
@@ -178,12 +181,13 @@ class CapsuleStore:
     def evict_lru(self) -> None: ...
     def footprint(self) -> int: ...        # for the budget (Seam 4)
 
-class SessionPolicy:                       # what the worker asks before each request
-    def plan(self, session, incoming_tokens, *, tools, salt) -> PrefixPlan: ...
+class AutoPrefixPolicy:                    # what the worker asks before each request
+    def plan(self, incoming_tokens, *, session_hint, tools, salt) -> PrefixPlan: ...
     def on_commit(self, session, tokens, *, lookahead: int) -> None: ...   # invariant 2
 ```
 
-Pin source: an OpenAI-side field (`flashrt_pin_prefix`) or a `/v1/sessions`
+Namespace source is `prompt_cache_key > cache_salt > native salt/default`.
+Pin source is an OpenAI-side field (`flashrt_pin_prefix`) or a `/v1/sessions`
 capsule option. Restore-vs-rebuild and which boundary to pin stay here (policy),
 never in the contract.
 
