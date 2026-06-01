@@ -33,6 +33,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import math
+import os
 import pathlib
 import time
 from typing import Optional, Union
@@ -640,8 +641,19 @@ class GrootTorchFrontendRtxFP16:
         these IDs are valid.
 
         We don't need a fancy "Eagle tokenizer" — we just load the base
-        Qwen3-1.7B tokenizer (downloaded once to a local cache) and bypass
-        it for the three special tokens which we splice in by ID.
+        Qwen3-1.7B tokenizer from a local directory and bypass it for the
+        three special tokens which we splice in by ID.
+
+        Resolution order is local-only and deterministic (no implicit
+        network download, so offline / air-gapped deployments stay
+        reproducible):
+
+          1. the checkpoint directory itself, then ``<checkpoint>/tokenizer``
+          2. the ``FLASH_RT_QWEN3_TOKENIZER`` environment variable, if set
+          3. ``~/.cache/flash_rt/qwen3_tok``
+
+        If none resolve, a clear error explains how to provide the
+        tokenizer; FlashRT never reaches out to the network on its own.
         """
         from transformers import AutoTokenizer
 
@@ -649,23 +661,28 @@ class GrootTorchFrontendRtxFP16:
             tokenizer_candidates = [
                 str(self._checkpoint_dir),                    # if user dropped one in
                 str(self._checkpoint_dir / "tokenizer"),
-                "/tmp/qwen3_tok",                              # local cache
-                "/root/.cache/qwen3_tok",
-                "Qwen/Qwen3-1.7B",                             # HF download (~7 MB)
             ]
+            env_tok = os.environ.get("FLASH_RT_QWEN3_TOKENIZER")
+            if env_tok:
+                tokenizer_candidates.append(env_tok)
+            tokenizer_candidates.append(
+                str(pathlib.Path.home() / ".cache" / "flash_rt" / "qwen3_tok"))
             for tok_path in tokenizer_candidates:
                 try:
                     self._tokenizer = AutoTokenizer.from_pretrained(
-                        tok_path, trust_remote_code=True)
+                        tok_path, trust_remote_code=True, local_files_only=True)
                     logger.info("Loaded Qwen3 tokenizer from %s", tok_path)
                     break
                 except Exception:
                     continue
             if not hasattr(self, "_tokenizer"):
                 raise RuntimeError(
-                    "Cannot load Qwen3 tokenizer. Pre-download it via "
-                    "`hf download Qwen/Qwen3-1.7B --include 'tokenizer*' "
-                    "'vocab*' 'merges*' --local-dir /tmp/qwen3_tok`")
+                    "Cannot load the Qwen3-1.7B tokenizer locally. Provide it via "
+                    "one of: a 'tokenizer' subdirectory in the checkpoint, the "
+                    "FLASH_RT_QWEN3_TOKENIZER environment variable, or "
+                    "~/.cache/flash_rt/qwen3_tok. Pre-download once with "
+                    "`hf download Qwen/Qwen3-1.7B --include 'tokenizer*' 'vocab*' "
+                    "'merges*' --local-dir ~/.cache/flash_rt/qwen3_tok`.")
             self._img_token_id = 151669
             self._img_start_id = 151670
             self._img_end_id = 151671

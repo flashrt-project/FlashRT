@@ -264,13 +264,21 @@ warmed_lengths = model.warm_state_prompt_buckets(
 print("prewarmed state prompt token lengths:", warmed_lengths)
 ```
 
-### RTX full-FP16 opt-in path (Pi0.5 / GROOT)
+### RTX full-FP16 path (Pi0.5 / GROOT)
 
-The default RTX paths run FP8 (Pi0.5, GROOT N1.6) or bf16 (GROOT N1.7 action
-head). For RTX 5090 / SM120 and RTX 4090/L40-class SM89 experiments that need
-a **non-quantized full-FP16 baseline** (e.g. to A/B against the quantized
-path), explicitly disable FP8 and enable FP16. The FP16 routes are additive
-and leave the default FP8/bf16 paths untouched.
+FP16 has two different roles on RTX depending on the model:
+
+* **Pi0.5 and GROOT N1.6** default to FP8; full-FP16 is an **opt-in**
+  non-quantized baseline (e.g. to A/B against the quantized path). Enable it
+  by explicitly disabling FP8 and enabling FP16.
+* **GROOT N1.7** defaults to **full-FP16 on RTX** — it is the only
+  framework-conforming RTX path today (the entire ViT/LLM/VL-self-attn
+  backbone runs through FlashRT kernels with no torch matmul on the serving
+  feature path). The FP8 backbone GEMMs use a fused cuBLAS epilogue that is
+  unsupported on sm_120, so the quantized backbone stays on the Thor path.
+
+The FP16 routes are additive and leave the Pi0.5 / N1.6 default FP8 paths
+untouched.
 
 #### Pi0.5
 
@@ -346,10 +354,14 @@ production latency.
 
 #### GROOT N1.7
 
-GROOT N1.7's RTX action head (state/action encoders, the 32-layer DiT,
-output proj, decoder) defaults to bf16; the full-FP16 variant runs it in
-FP16. The backbone (ViT/LLM/VL self-attn) is produced once at `set_prompt`
-by the shared fp32 reference and is unchanged.
+GROOT N1.7 **defaults to full-FP16 on RTX** — `load_model(config="groot_n17",
+hardware="rtx_sm120"|"rtx_sm89", framework="torch")` returns the full-FP16
+frontend whether or not `use_fp16=True` is passed. The whole backbone
+(ViT / LLM / VL self-attn) and the action head (state/action encoders, the
+32-layer DiT, output proj, decoder) run through FlashRT kernels in FP16; no
+PyTorch matmul touches the serving feature path. The torch reference shadow
+is used only for one-time activation/scale work, never as the inference
+backbone.
 
 N1.7 uses the aux-driven `set_prompt(aux=...)` / `infer(state, initial_noise=...)`
 contract (not the `predict(images=...)` quickstart flow), so construct the
@@ -369,8 +381,9 @@ fe.set_prompt(aux=aux)                       # aux from the N1.7 preprocessing p
 actions = fe.infer(state_normalized, initial_noise=noise)
 ```
 
-`load_model(config="groot_n17", use_fp16=True, use_fp8=False)` also returns
-this frontend. Reference on RTX 5090: FP16-vs-bf16 action cosine ≈ 0.99999,
+`load_model(config="groot_n17", hardware="rtx_sm120")` returns this frontend
+by default (no flags needed); `use_fp16=True, use_fp8=False` is equivalent.
+Reference on RTX 5090: FP16-vs-bf16 action cosine ≈ 0.99999,
 combined E2E-vs-reference cosine ≈ 0.9999; infer latency ≈ 10.7 ms (≈ the
 bf16 path — the DiT GEMMs are small, so FP16 and bf16 throughput match).
 
@@ -401,15 +414,16 @@ actions_normalized = model.infer(
 )
 ```
 
-`aux` is the precomputed Qwen3-VL setup bundle consumed by the N1.7
-calibration path: LLM input embeddings, visual masks, M-RoPE tables,
-pixel features, and `grid_thw`. `infer()` expects normalized state and
-returns normalized actions; denormalization remains the caller's
-responsibility for this N1.7 path.
+`aux` is the precomputed Qwen3-VL setup bundle for N1.7: LLM input
+embeddings, visual masks, M-RoPE tables, pixel features, and `grid_thw`.
+`infer()` expects normalized state and returns normalized actions;
+denormalization remains the caller's responsibility for this N1.7 path.
 
-The RTX backend scope is DiT-only in this release: DiT self/cross
-attention uses FlashRT's vendored FA2 slots, while ViT, LLM, and VL
-self-attention stay on the shared N1.7 frontend/calibration path.
+On RTX the entire forward runs through FlashRT kernels: ViT, LLM, and VL
+self-attention execute in `set_prompt` (the backbone attention uses the
+vendored FA2 / FMHA kernels), and DiT self/cross attention uses FlashRT's
+vendored FA2 slots during `infer`. No PyTorch matmul runs on the serving
+feature path.
 
 Supported hardware is `rtx_sm120` (RTX 5090-class Blackwell). SM89 is
 not registered until it has target-specific benchmark and cosine
