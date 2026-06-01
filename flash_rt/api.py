@@ -426,6 +426,17 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         )
         pipe_cls = GrootN17TorchFrontendRtxFP16
 
+    # GROOT N1.7 on Thor (SM110) runs the FP8 backbone (+ bf16 DiT) by
+    # default. There is no BF16-only fallback; the non-quantized reference is
+    # the explicit full-FP16 path (use_fp16=True with use_fp8=False), so a
+    # bare use_fp8=False is rejected rather than silently ignored.
+    if config == "groot_n17" and framework == "torch" and arch == "thor" \
+            and not use_fp16 and not use_fp8:
+        raise ValueError(
+            "GROOT N1.7 on Thor defaults to FP8; there is no BF16-only "
+            "fallback. For the non-quantized full-FP16 reference pass "
+            "use_fp16=True together with use_fp8=False.")
+
     if use_fp16:
         if use_fp8:
             raise ValueError("use_fp16=True requires use_fp8=False")
