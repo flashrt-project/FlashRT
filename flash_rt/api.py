@@ -415,6 +415,17 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
 
     pipe_cls = resolve_pipeline_class(config, framework, arch)
 
+    # GROOT N1.7 on RTX: the only framework-conforming path (no torch matmul on
+    # the serving feature path) is full FP16 — the FP8 backbone GEMMs use a
+    # fused cuBLAS epilogue unsupported on sm_120. Default config="groot_n17"
+    # on RTX to the full-FP16 frontend (FP8/bf16 path remains for Thor).
+    if config == "groot_n17" and framework == "torch" \
+            and arch in ("rtx_sm120", "rtx_sm89"):
+        from flash_rt.frontends.torch.groot_n17_rtx_fp16 import (
+            GrootN17TorchFrontendRtxFP16,
+        )
+        pipe_cls = GrootN17TorchFrontendRtxFP16
+
     if use_fp16:
         if use_fp8:
             raise ValueError("use_fp16=True requires use_fp8=False")
