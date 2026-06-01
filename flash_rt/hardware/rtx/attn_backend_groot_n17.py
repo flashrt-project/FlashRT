@@ -24,12 +24,16 @@ class RtxFlashAttnBackendGrootN17:
         s_kv_image: int,
         num_dit_cross_blocks: int = 16,
         device: str = "cuda",
+        slot_dtype=None,
     ):
         import torch
 
         self._torch = torch
         self._device = device
-        bf16 = torch.bfloat16
+        # Q/K/V/O slot dtype. Default bf16 (FP8 production path). The full-FP16
+        # baseline frontend passes torch.float16; run() dispatches fwd_fp16
+        # automatically on q.dtype, so no other change is needed.
+        bf16 = slot_dtype if slot_dtype is not None else torch.bfloat16
 
         self._num_vit_groups = int(num_vit_groups)
         self._llm_seq_max = int(llm_seq_max)
