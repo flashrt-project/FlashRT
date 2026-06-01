@@ -344,8 +344,11 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         use_fp8: Enable FP8 execution where the selected frontend supports
             an FP8/BF16 switch. Defaults to True to preserve existing
             performance-oriented behavior.
-        use_fp16: Experimental Pi0.5 torch RTX full-FP16 baseline. This is
-            only valid with ``use_fp8=False`` on RTX SM120/SM89.
+        use_fp16: Opt-in non-quantized full-FP16 path for Pi0.5, GROOT N1.6,
+            and GROOT N1.7 (torch, RTX SM120/SM89). Only valid with
+            ``use_fp8=False``; an A/B reference against the quantized default.
+            On GROOT N1.7 the default is FP8 (FP8 backbone + bf16 DiT), so
+            ``use_fp8=False`` without ``use_fp16=True`` raises.
         num_steps: Pi0/Pi0.5 torch only when supported. Number of
             flow-matching ODE steps. ``None`` uses the frontend default.
         vision_pool_factor: Pi0.5 torch RTX/Orin only. Spatial pooling factor
@@ -423,6 +426,11 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     # opts into the full-FP16 frontend below (no FP8, non-quantized reference).
     if config == "groot_n17" and framework == "torch" \
             and arch in ("rtx_sm120", "rtx_sm89") and not use_fp16:
+        if not use_fp8:
+            raise ValueError(
+                "GROOT N1.7 on RTX defaults to FP8; there is no separate "
+                "non-FP16 BF16 fallback. For the non-quantized full-FP16 "
+                "reference pass use_fp16=True, use_fp8=False.")
         from flash_rt.frontends.torch.groot_n17_rtx_fp8 import (
             GrootN17TorchFrontendRtxFP8,
         )
