@@ -77,6 +77,11 @@ def main():
                              "FFN layers + AWQ + P1 split-GU "
                              "(LIBERO Spatial 491/500 = 98.2%%, matches FP8 "
                              "baseline). Requires Thor SM110 / SM100+.")
+    parser.add_argument('--use_fp16', action='store_true',
+                        help="Pi0.5 / GROOT torch RTX only. Run a full-FP16 "
+                             "baseline (no FP8 quantization, no calibration) "
+                             "as an A/B precision reference. Requires "
+                             "hardware in {rtx_sm120, rtx_sm89}.")
     args = parser.parse_args()
 
     # ══════════════════════════════════════════
@@ -96,6 +101,8 @@ def main():
         embodiment_tag=args.embodiment_tag,
         action_horizon=args.action_horizon,
         use_fp4=args.use_fp4,
+        use_fp16=args.use_fp16,
+        use_fp8=not args.use_fp16,
     )
 
     img = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)

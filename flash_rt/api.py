@@ -419,15 +419,22 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         if use_fp8:
             raise ValueError("use_fp16=True requires use_fp8=False")
         fp16_arches = ("rtx_sm120", "rtx_sm89")
-        if config != "pi05" or framework != "torch" or arch not in fp16_arches:
+        if config not in ("pi05", "groot") or framework != "torch" \
+                or arch not in fp16_arches:
             raise ValueError(
                 "use_fp16=True is currently experimental and only supports "
-                "config='pi05', framework='torch', "
+                "config in {'pi05', 'groot'}, framework='torch', "
                 "hardware in {'rtx_sm120', 'rtx_sm89'}")
-        from flash_rt.frontends.torch.pi05_rtx_fp16 import (
-            Pi05TorchFrontendRtxFP16,
-        )
-        pipe_cls = Pi05TorchFrontendRtxFP16
+        if config == "pi05":
+            from flash_rt.frontends.torch.pi05_rtx_fp16 import (
+                Pi05TorchFrontendRtxFP16,
+            )
+            pipe_cls = Pi05TorchFrontendRtxFP16
+        else:  # config == "groot"
+            from flash_rt.frontends.torch.groot_rtx_fp16 import (
+                GrootTorchFrontendRtxFP16,
+            )
+            pipe_cls = GrootTorchFrontendRtxFP16
 
     # ── FP4 routing (Pi0.5 torch + Pi0.5 JAX on Thor) ──
     if use_fp4:
