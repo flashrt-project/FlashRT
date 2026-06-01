@@ -325,7 +325,7 @@ def deepstack_merge_forward(gemm, fvk, bufs, weights, dims,
 
 def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
                         scales_dev, *, attn, stream: int = 0,
-                        layers_subset=None) -> None:
+                        layers_subset=None, fp16_layers=()) -> None:
     """16 truncated Qwen3-VL LLM decoder layers.
 
     Per layer (input ``h``, in-place residual update):
@@ -426,11 +426,19 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
 
     inject_ptrs = weights.get("deepstack_inject", [0] * 16)
     layer_iter = range(16) if layers_subset is None else list(layers_subset)
+    # Per-layer precision protection: layers in ``fp16_layers`` run their
+    # QKV / O / gate / up GEMMs in fp16 (no input fp8 quant) to protect the
+    # large visual-token activation spikes that wreck per-tensor FP8 on the
+    # first decoder layers. The down GEMM stays FP8 (its gate*up input is
+    # already smoothed by SiLU). Requires fp16 weight ptrs in
+    # ``weights["{q,k,v,o,gate,up}_w_fp16"]``.
+    fp16_set = set(fp16_layers or ())
 
     for li in layer_iter:
         slots = attn.get_slot_ptrs("llm", li)
         # Backend's "llm" site uses single Q/K/V/O slots; we override K/V
         # with GQA-expanded versions before the MHA kernel.
+        hi_prec = li in fp16_set
 
         # ── Pre-attn RMSNorm ───────────────────────────────────────────
         fvk.rms_norm_fp16(
@@ -438,29 +446,37 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
             S, D, 1e-6, int(stream),
         )
 
-        # ── Quantize xn for Q/K/V (single shared act scale) ────────────
-        fvk.quantize_fp8_static_fp16(
-            xn_ptr, xn_fp8_ptr, int(scales_dev["act_qkv"][li]),
-            S * D, int(stream),
-        )
-
-        # ── 3 split FP8 GEMMs (per-tensor act+weight scales) ───────────
-        d_act_qkv = int(scales_dev["act_qkv"][li])
-        gemm.fp8_nn_dev(
-            xn_fp8_ptr, int(weights["q_w"][li]), Q_ptr,
-            S, NHQ * HD, D,
-            d_act_qkv, int(weights["d_w_q"][li]), int(stream),
-        )
-        gemm.fp8_nn_dev(
-            xn_fp8_ptr, int(weights["k_w"][li]), K_ptr,
-            S, NHKV * HD, D,
-            d_act_qkv, int(weights["d_w_k"][li]), int(stream),
-        )
-        gemm.fp8_nn_dev(
-            xn_fp8_ptr, int(weights["v_w"][li]), V_ptr,
-            S, NHKV * HD, D,
-            d_act_qkv, int(weights["d_w_v"][li]), int(stream),
-        )
+        if hi_prec:
+            # fp16-protected QKV: GEMM straight off the fp16 RMSNorm output.
+            gemm.fp16_nn(xn_ptr, int(weights["q_w_fp16"][li]), Q_ptr,
+                         S, NHQ * HD, D, int(stream))
+            gemm.fp16_nn(xn_ptr, int(weights["k_w_fp16"][li]), K_ptr,
+                         S, NHKV * HD, D, int(stream))
+            gemm.fp16_nn(xn_ptr, int(weights["v_w_fp16"][li]), V_ptr,
+                         S, NHKV * HD, D, int(stream))
+        else:
+            # ── Quantize xn for Q/K/V (single shared act scale) ────────
+            fvk.quantize_fp8_static_fp16(
+                xn_ptr, xn_fp8_ptr, int(scales_dev["act_qkv"][li]),
+                S * D, int(stream),
+            )
+            # ── 3 split FP8 GEMMs (per-tensor act+weight scales) ───────
+            d_act_qkv = int(scales_dev["act_qkv"][li])
+            gemm.fp8_nn_dev(
+                xn_fp8_ptr, int(weights["q_w"][li]), Q_ptr,
+                S, NHQ * HD, D,
+                d_act_qkv, int(weights["d_w_q"][li]), int(stream),
+            )
+            gemm.fp8_nn_dev(
+                xn_fp8_ptr, int(weights["k_w"][li]), K_ptr,
+                S, NHKV * HD, D,
+                d_act_qkv, int(weights["d_w_k"][li]), int(stream),
+            )
+            gemm.fp8_nn_dev(
+                xn_fp8_ptr, int(weights["v_w"][li]), V_ptr,
+                S, NHKV * HD, D,
+                d_act_qkv, int(weights["d_w_v"][li]), int(stream),
+            )
 
         # ── Per-head q_norm / k_norm (BEFORE M-RoPE — Qwen3 standard) ──
         fvk.rms_norm_fp16(
@@ -486,16 +502,21 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
         # call is unchanged.
         attn.run("llm", li, q_seq=S, kv_seq=S, stream=int(stream))
 
-        # ── Quantize O for o_proj ──────────────────────────────────────
-        fvk.quantize_fp8_static_fp16(
-            int(slots["O"]), xn_fp8_ptr, int(scales_dev["act_o"][li]),
-            S * NHQ * HD, int(stream),
-        )
-        gemm.fp8_nn_dev(
-            xn_fp8_ptr, int(weights["o_w"][li]), o_out_ptr,
-            S, D, NHQ * HD,
-            int(scales_dev["act_o"][li]), int(weights["d_w_o"][li]), int(stream),
-        )
+        if hi_prec:
+            gemm.fp16_nn(int(slots["O"]), int(weights["o_w_fp16"][li]),
+                         o_out_ptr, S, D, NHQ * HD, int(stream))
+        else:
+            # ── Quantize O for o_proj ──────────────────────────────────
+            fvk.quantize_fp8_static_fp16(
+                int(slots["O"]), xn_fp8_ptr, int(scales_dev["act_o"][li]),
+                S * NHQ * HD, int(stream),
+            )
+            gemm.fp8_nn_dev(
+                xn_fp8_ptr, int(weights["o_w"][li]), o_out_ptr,
+                S, D, NHQ * HD,
+                int(scales_dev["act_o"][li]), int(weights["d_w_o"][li]),
+                int(stream),
+            )
 
         # ── Residual 1 ────────────────────────────────────────────────
         fvk.residual_add_fp16(h_ptr, o_out_ptr, S * D, int(stream))
@@ -506,35 +527,48 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
             S, D, 1e-6, int(stream),
         )
 
-        # ── Quantize xn for gate+up (shared act scale) ────────────────
-        fvk.quantize_fp8_static_fp16(
-            xn_ptr, xn_fp8_ptr, int(scales_dev["act_gateup"][li]),
-            S * D, int(stream),
-        )
-        d_act_gu = int(scales_dev["act_gateup"][li])
-        # ── gate / up FP8 GEMMs → fp16 outputs ────────────────────────
-        gemm.fp8_nn_dev(
-            xn_fp8_ptr, int(weights["gate_w"][li]), gate_ptr,
-            S, FF, D,
-            d_act_gu, int(weights["d_w_gate"][li]), int(stream),
-        )
-        gemm.fp8_nn_dev(
-            xn_fp8_ptr, int(weights["up_w"][li]), up_ptr,
-            S, FF, D,
-            d_act_gu, int(weights["d_w_up"][li]), int(stream),
-        )
-        # ── SiLU(gate) * up → directly FP8 (fused) ────────────────────
-        fvk.silu_mul_split_fp8_fp16(
-            gate_ptr, up_ptr, gu_fp8_ptr, S * FF,
-            int(scales_dev["act_down"][li]), int(stream),
-        )
-        # ── down GEMM → fp16 ──────────────────────────────────────────
-        gemm.fp8_nn_dev(
-            gu_fp8_ptr, int(weights["down_w"][li]), o_out_ptr,
-            S, D, FF,
-            int(scales_dev["act_down"][li]), int(weights["d_w_down"][li]),
-            int(stream),
-        )
+        if hi_prec:
+            gemm.fp16_nn(xn_ptr, int(weights["gate_w_fp16"][li]), gate_ptr,
+                         S, FF, D, int(stream))
+            gemm.fp16_nn(xn_ptr, int(weights["up_w_fp16"][li]), up_ptr,
+                         S, FF, D, int(stream))
+        else:
+            # ── Quantize xn for gate+up (shared act scale) ────────────
+            fvk.quantize_fp8_static_fp16(
+                xn_ptr, xn_fp8_ptr, int(scales_dev["act_gateup"][li]),
+                S * D, int(stream),
+            )
+            d_act_gu = int(scales_dev["act_gateup"][li])
+            # ── gate / up FP8 GEMMs → fp16 outputs ────────────────────
+            gemm.fp8_nn_dev(
+                xn_fp8_ptr, int(weights["gate_w"][li]), gate_ptr,
+                S, FF, D,
+                d_act_gu, int(weights["d_w_gate"][li]), int(stream),
+            )
+            gemm.fp8_nn_dev(
+                xn_fp8_ptr, int(weights["up_w"][li]), up_ptr,
+                S, FF, D,
+                d_act_gu, int(weights["d_w_up"][li]), int(stream),
+            )
+        if hi_prec:
+            # fp16-protected FFN out: SiLU(gate)*up in fp16, fp16 down GEMM.
+            fvk.silu_inplace_fp16(gate_ptr, S * FF, int(stream))
+            fvk.mul_fp16(gate_ptr, up_ptr, gate_ptr, S * FF, int(stream))
+            gemm.fp16_nn(gate_ptr, int(weights["down_w_fp16"][li]), o_out_ptr,
+                         S, D, FF, int(stream))
+        else:
+            # ── SiLU(gate) * up → directly FP8 (fused) ────────────────
+            fvk.silu_mul_split_fp8_fp16(
+                gate_ptr, up_ptr, gu_fp8_ptr, S * FF,
+                int(scales_dev["act_down"][li]), int(stream),
+            )
+            # ── down GEMM → fp16 ──────────────────────────────────────
+            gemm.fp8_nn_dev(
+                gu_fp8_ptr, int(weights["down_w"][li]), o_out_ptr,
+                S, D, FF,
+                int(scales_dev["act_down"][li]), int(weights["d_w_down"][li]),
+                int(stream),
+            )
 
         # ── Residual 2 ────────────────────────────────────────────────
         fvk.residual_add_fp16(h_ptr, o_out_ptr, S * D, int(stream))
