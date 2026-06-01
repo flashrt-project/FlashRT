@@ -109,6 +109,9 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
         ("flash_rt.frontends.torch.groot_rtx", "GrootTorchFrontendRtx"),
 
     # ── GROOT N1.7 ──
+    ("groot_n17", "torch", "thor"):
+        ("flash_rt.frontends.torch.groot_n17_thor",
+         "GrootN17TorchFrontendThor"),
     ("groot_n17", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.groot_n17_rtx",
          "GrootN17TorchFrontendRtx"),
