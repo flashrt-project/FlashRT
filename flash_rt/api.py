@@ -415,16 +415,18 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
 
     pipe_cls = resolve_pipeline_class(config, framework, arch)
 
-    # GROOT N1.7 on RTX: the only framework-conforming path (no torch matmul on
-    # the serving feature path) is full FP16 — the FP8 backbone GEMMs use a
-    # fused cuBLAS epilogue unsupported on sm_120. Default config="groot_n17"
-    # on RTX to the full-FP16 frontend (FP8/bf16 path remains for Thor).
+    # GROOT N1.7 on RTX: default to the framework-conforming FP8 frontend. The
+    # whole ViT/LLM/VL-self-attn backbone runs FP8 kernels via the SM120-safe
+    # descale pattern (no torch matmul on the serving feature path; activation
+    # scales come from the on-disk calibration cache, the torch shadow runs only
+    # on a cold cache miss). The DiT stays bf16 for Thor parity. ``use_fp16=True``
+    # opts into the full-FP16 frontend below (no FP8, non-quantized reference).
     if config == "groot_n17" and framework == "torch" \
-            and arch in ("rtx_sm120", "rtx_sm89"):
-        from flash_rt.frontends.torch.groot_n17_rtx_fp16 import (
-            GrootN17TorchFrontendRtxFP16,
+            and arch in ("rtx_sm120", "rtx_sm89") and not use_fp16:
+        from flash_rt.frontends.torch.groot_n17_rtx_fp8 import (
+            GrootN17TorchFrontendRtxFP8,
         )
-        pipe_cls = GrootN17TorchFrontendRtxFP16
+        pipe_cls = GrootN17TorchFrontendRtxFP8
 
     if use_fp16:
         if use_fp8:

@@ -266,19 +266,11 @@ print("prewarmed state prompt token lengths:", warmed_lengths)
 
 ### RTX full-FP16 path (Pi0.5 / GROOT)
 
-FP16 has two different roles on RTX depending on the model:
-
-* **Pi0.5 and GROOT N1.6** default to FP8; full-FP16 is an **opt-in**
-  non-quantized baseline (e.g. to A/B against the quantized path). Enable it
-  by explicitly disabling FP8 and enabling FP16.
-* **GROOT N1.7** defaults to **full-FP16 on RTX** — it is the only
-  framework-conforming RTX path today (the entire ViT/LLM/VL-self-attn
-  backbone runs through FlashRT kernels with no torch matmul on the serving
-  feature path). The FP8 backbone GEMMs use a fused cuBLAS epilogue that is
-  unsupported on sm_120, so the quantized backbone stays on the Thor path.
-
-The FP16 routes are additive and leave the Pi0.5 / N1.6 default FP8 paths
-untouched.
+**Pi0.5, GROOT N1.6, and GROOT N1.7 all default to a quantized path on RTX**
+(FP8 backbone; bf16 DiT for GROOT N1.7). Full-FP16 is an **opt-in**
+non-quantized baseline — useful to A/B against the quantized path. Enable it by
+explicitly disabling FP8 and enabling FP16. The FP16 routes are additive and
+leave the default quantized paths untouched.
 
 #### Pi0.5
 
@@ -354,14 +346,11 @@ production latency.
 
 #### GROOT N1.7
 
-GROOT N1.7 **defaults to full-FP16 on RTX** — `load_model(config="groot_n17",
-hardware="rtx_sm120"|"rtx_sm89", framework="torch")` returns the full-FP16
-frontend whether or not `use_fp16=True` is passed. The whole backbone
-(ViT / LLM / VL self-attn) and the action head (state/action encoders, the
-32-layer DiT, output proj, decoder) run through FlashRT kernels in FP16; no
-PyTorch matmul touches the serving feature path. The torch reference shadow
-is used only for one-time activation/scale work, never as the inference
-backbone.
+GROOT N1.7 defaults to the **FP8** path on RTX (see [GROOT N1.7 RTX](#groot-n17-rtx)).
+The full-FP16 variant is the opt-in non-quantized A/B reference: it runs the
+whole backbone (ViT / LLM / VL self-attn) and the action head (state/action
+encoders, the 32-layer DiT, output proj, decoder) through FlashRT kernels in
+FP16, with no PyTorch matmul on the serving feature path.
 
 N1.7 uses the aux-driven `set_prompt(aux=...)` / `infer(state, initial_noise=...)`
 contract (not the `predict(images=...)` quickstart flow), so construct the
@@ -381,11 +370,11 @@ fe.set_prompt(aux=aux)                       # aux from the N1.7 preprocessing p
 actions = fe.infer(state_normalized, initial_noise=noise)
 ```
 
-`load_model(config="groot_n17", hardware="rtx_sm120")` returns this frontend
-by default (no flags needed); `use_fp16=True, use_fp8=False` is equivalent.
-Reference on RTX 5090: FP16-vs-bf16 action cosine ≈ 0.99999,
-combined E2E-vs-reference cosine ≈ 0.9999; infer latency ≈ 10.7 ms (≈ the
-bf16 path — the DiT GEMMs are small, so FP16 and bf16 throughput match).
+`load_model(config="groot_n17", hardware="rtx_sm120", use_fp16=True,
+use_fp8=False)` returns this frontend. Reference on RTX 5090: FP16-vs-bf16
+action cosine ≈ 0.99999, combined E2E-vs-reference cosine ≈ 0.9999; infer
+latency ≈ 10.7 ms (≈ the bf16 path — the DiT GEMMs are small, so FP16 and bf16
+throughput match).
 
 The underlying FP16 kernels are SM80-family friendly; FlashRT exposes the
 FP16 route for Pi0.5, GROOT N1.6, and GROOT N1.7 on the RTX frontends.
@@ -419,15 +408,25 @@ embeddings, visual masks, M-RoPE tables, pixel features, and `grid_thw`.
 `infer()` expects normalized state and returns normalized actions;
 denormalization remains the caller's responsibility for this N1.7 path.
 
-On RTX the entire forward runs through FlashRT kernels: ViT, LLM, and VL
-self-attention execute in `set_prompt` (the backbone attention uses the
-vendored FA2 / FMHA kernels), and DiT self/cross attention uses FlashRT's
-vendored FA2 slots during `infer`. No PyTorch matmul runs on the serving
-feature path.
+On RTX the default path is **FP8**: the backbone GEMMs (ViT / LLM / VL
+self-attn) run FP8 via the SM120-safe descale pattern (`fp8_descale_fp16` plus
+separate bias/GELU — the fused cuBLAS FP8 epilogue is unsupported on sm_120),
+and the bf16 DiT runs in `infer`. The entire forward runs through FlashRT
+kernels: backbone attention uses the vendored FA2 / FMHA kernels in
+`set_prompt`, and DiT self/cross attention uses FlashRT's vendored FA2 slots
+during `infer`. No PyTorch matmul runs on the serving feature path.
+
+Activation scales follow the FlashRT calibration convention
+([Calibration](#calibration)): weight scales are baked at load, activation
+scales are calibrated once and cached to
+`~/.flash_rt/calibration/<ckpt_hash>_n17_Se<N>.json`. A warm `set_prompt` loads
+the cache and runs FP8 kernels only; the torch reference shadow runs solely on
+a cold cache miss (or `recalibrate=True`) to extract activation amax — never as
+the inference backbone. `calibrate(aux_list)` refines scales across N samples.
 
 Supported hardware is `rtx_sm120` (RTX 5090-class Blackwell). SM89 is
-not registered until it has target-specific benchmark and cosine
-validation.
+registered through the same path; validate benchmark/accuracy on the target
+card.
 
 Build FA2 with at least the N1.7 head dimensions and dtypes:
 
@@ -438,17 +437,19 @@ cmake -S . -B build \
 cmake --build build --target flash_rt_fa2 -j
 ```
 
-RTX 5090 validation against the N1.7 reference fixture:
+RTX 5090 validation against the N1.7 reference fixture (denormalized
+action cosine vs HuggingFace):
 
-| Metric | Result |
-|---|---:|
-| DiT step-0 input cosine | 0.999995 |
-| Denormalized action cosine, combined | 0.999952 |
-| Denormalized action cosine, EEF 9D | 0.999901 |
-| Denormalized action cosine, gripper | 0.941401 |
-| Denormalized action cosine, joints | 0.999969 |
-| DiT graph latency p50 | 10.55 ms |
-| DiT eager latency p50 | 17.60 ms |
+| Metric | FP8 (default) | full-FP16 (opt-in) |
+|---|---:|---:|
+| Combined | 0.999849 | 0.999852 |
+| EEF 9D | 0.999901 | 0.999895 |
+| Gripper | 0.928382 | 0.913727 |
+| Joints | 0.999832 | 0.999838 |
+
+The gripper DOF is a near-constant scalar whose cosine is intrinsically noisy
+(the bf16 reference itself scores ≈ 0.94); the combined action cosine clears
+the ≥ 0.999 bar on both paths. DiT graph latency p50 ≈ 10.5 ms.
 
 This path does not change CMake targets, C++ bindings, or existing
 Pi0/Pi0.5/GROOT N1.6 runtime dispatch.
