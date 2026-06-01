@@ -335,6 +335,230 @@ class GrootN17TorchFrontendRtxFP16(GrootN17TorchFrontendRtx):
             torch.cuda.synchronize()
             self._dit_graphs.append(graph)
 
+    # ── set_prompt: produce backbone_features via FP16 kernels (no torch) ──
+    def set_prompt(self, *, aux: dict, prompt: str | None = None) -> None:
+        import warnings
+        from flash_rt.models.groot_n17.calibration import build_vit_rope_tables
+
+        if hasattr(self, "_backbone_features"):
+            raise RuntimeError(
+                "set_prompt() after prompt init is not supported; construct a "
+                "new frontend instance for a new prompt")
+
+        device = self.device
+        self._prompt = prompt
+        self.Se = int(aux["llm_input_embeds"].shape[1])
+        self._mrope_cos = aux["rope_cos"][0].to(device).half().contiguous()
+        self._mrope_sin = aux["rope_sin"][0].to(device).half().contiguous()
+        grid_thw = [tuple(int(x) for x in row) for row in aux["grid_thw"].tolist()]
+        vit_cos, vit_sin = build_vit_rope_tables(
+            grid_thw, head_dim=64, theta=10000.0, spatial_merge_size=2,
+            device=device)
+        self._vit_cos = vit_cos
+        self._vit_sin = vit_sin
+        self._num_vit_views = len(grid_thw)
+        self._S_vit = sum(int(t * h * w) for t, h, w in grid_thw)
+        self._visual_pos_masks = aux["visual_pos_masks"][0].to(device)
+
+        # ── Full-FP16 KERNEL backbone (replaces the torch calibration shadow) ──
+        self._backbone_features = self._run_kernel_backbone(aux).half()
+
+        try:
+            self._warmup_infer()
+        except Exception as e:  # noqa: BLE001
+            warnings.warn(f"set_prompt warmup failed (non-fatal): {e!r}")
+
+    def _run_kernel_backbone(self, aux: dict) -> "torch.Tensor":
+        """Run ViT → DeepStack → LLM → vlln → VL-self-attn through FP16 kernels.
+
+        Returns backbone_features (1, Se, 2048). No PyTorch matmul on the
+        feature path — the entire VLM backbone runs through FlashRT kernels.
+        """
+        import flash_rt.flash_rt_kernels as fvk
+        from flash_rt.models.groot_n17 import pipeline_rtx_fp16 as P
+        from flash_rt.hardware.rtx.attn_backend_groot_n17_backbone import (
+            RtxGrootN17BackboneAttn,
+        )
+
+        if not hasattr(self, "_gemm"):
+            self._fvk = fvk
+            self._gemm = fvk.GemmRunner()
+        gemm, fvkm = self._gemm, self._fvk
+        dev = self.device
+        Sv, nv, Se = self._S_vit, self._num_vit_views, self.Se
+        sh = self._fp16_shadow_weights
+
+        keep: list = []
+
+        def K(t):
+            keep.append(t)
+            return t
+
+        attn = RtxGrootN17BackboneAttn(
+            num_vit_views=nv, vit_seq=Sv, llm_seq=Se, vl_self_attn_seq=Se,
+            device=dev)
+        self._kbb_keep = keep
+        self._kbb_attn = attn
+
+        def buf(*shape):
+            return K(torch.empty(*shape, dtype=_FP16, device=dev))
+
+        # ═══ ViT (24L) ═══
+        vit_h = buf(Sv, 1024)
+        vit_h.copy_(aux["pixel_features"].to(dev).half().reshape(Sv, 1024))
+        vit_bufs = {"h": vit_h.data_ptr(), "xn": buf(Sv, 1024).data_ptr(),
+                    "o_proj_out": buf(Sv, 1024).data_ptr(),
+                    "fc1_out": buf(Sv, 4096).data_ptr()}
+        vw = {k: [] for k in (
+            "norm1_w", "norm1_b", "norm2_w", "norm2_b", "q_w", "q_b",
+            "k_w", "k_b", "v_w", "v_b", "o_w", "o_b", "fc1_w", "fc1_b",
+            "fc2_w", "fc2_b")}
+        vw["cos"] = self._vit_cos.data_ptr()
+        vw["sin"] = self._vit_sin.data_ptr()
+        for li in range(24):
+            qkv = sh[("vit", li, "qkv")]            # (1024, 3072) fp16
+            b = self._vit_qkv_b[li]                 # (3072,)
+            q = K(qkv[:, :1024].contiguous()); kk = K(qkv[:, 1024:2048].contiguous())
+            v = K(qkv[:, 2048:].contiguous())
+            qb = K(b[:1024].contiguous()); kb = K(b[1024:2048].contiguous())
+            vb = K(b[2048:].contiguous())
+            vw["norm1_w"].append(self._vit_ln1_w[li].data_ptr())
+            vw["norm1_b"].append(self._vit_ln1_b[li].data_ptr())
+            vw["norm2_w"].append(self._vit_ln2_w[li].data_ptr())
+            vw["norm2_b"].append(self._vit_ln2_b[li].data_ptr())
+            vw["q_w"].append(q.data_ptr()); vw["q_b"].append(qb.data_ptr())
+            vw["k_w"].append(kk.data_ptr()); vw["k_b"].append(kb.data_ptr())
+            vw["v_w"].append(v.data_ptr()); vw["v_b"].append(vb.data_ptr())
+            vw["o_w"].append(sh[("vit", li, "o")].data_ptr())
+            vw["o_b"].append(self._vit_o_b[li].data_ptr())
+            vw["fc1_w"].append(sh[("vit", li, "fc1")].data_ptr())
+            vw["fc1_b"].append(self._vit_fc1_b[li].data_ptr())
+            vw["fc2_w"].append(sh[("vit", li, "fc2")].data_ptr())
+            vw["fc2_b"].append(self._vit_fc2_b[li].data_ptr())
+
+        tap_layers = (5, 11, 17)
+        tap_bufs = {l: buf(Sv, 1024) for l in tap_layers}
+
+        def mk_cb(l):
+            def cb(h_ptr):
+                fvkm.gpu_copy(tap_bufs[l].data_ptr(), int(h_ptr), Sv * 1024 * 2, 0)
+            return cb
+        dcap = [mk_cb(l) for l in tap_layers]
+
+        P.qwen3vl_vit_forward(
+            gemm=gemm, fvk=fvkm, bufs=vit_bufs, weights=vw,
+            dims={"S": Sv, "D": 1024, "NH": 16, "HD": 64,
+                  "ff_inner": 4096, "Sper_view": Sv // nv},
+            attn=attn, deepstack_taps=tap_layers, deepstack_capture=dcap)
+
+        # ═══ DeepStack (3 mergers) ═══
+        Nout = Sv // 4
+        ds_out = [buf(Nout, 2048) for _ in range(3)]
+        dsw = {k: [] for k in ("norm_w", "norm_b", "fc1_w", "fc1_b",
+                                "fc2_w", "fc2_b")}
+        for j in range(3):
+            dsw["norm_w"].append(getattr(self, f"_dsm{j}_norm_w").data_ptr())
+            dsw["norm_b"].append(getattr(self, f"_dsm{j}_norm_b").data_ptr())
+            dsw["fc1_w"].append(sh[("dsm", j, "fc1")].data_ptr())
+            dsw["fc1_b"].append(getattr(self, f"_dsm{j}_fc1_b").data_ptr())
+            dsw["fc2_w"].append(sh[("dsm", j, "fc2")].data_ptr())
+            dsw["fc2_b"].append(getattr(self, f"_dsm{j}_fc2_b").data_ptr())
+        P.deepstack_merge_forward(
+            gemm=gemm, fvk=fvkm,
+            bufs={"in": [tap_bufs[l].data_ptr() for l in tap_layers],
+                  "ln_out": buf(Nout, 4096).data_ptr(),
+                  "fc1_out": buf(Nout, 4096).data_ptr(),
+                  "out": [t.data_ptr() for t in ds_out]},
+            weights=dsw,
+            dims={"Nin": Sv, "Din": 1024, "Nout": Nout, "Dmid": 4096, "Dout": 2048})
+
+        # DeepStack inject buffers (S, D) — zero except visual positions.
+        mask = self._visual_pos_masks
+        inject = [0] * 16
+        for j in range(3):
+            ib = K(torch.zeros(Se, 2048, dtype=_FP16, device=dev))
+            ib[mask] = ds_out[j]
+            inject[j] = ib.data_ptr()
+
+        # ═══ LLM (16L, causal, GQA) ═══
+        llm_h = buf(Se, 2048)
+        llm_h.copy_(aux["llm_input_embeds"].to(dev).half().reshape(Se, 2048))
+        # bufs["Q"]/["K_exp"]/["V_exp"] must alias the attn llm slots so run() reads them.
+        lw = {k: [] for k in (
+            "in_ln_w", "post_ln_w", "q_norm_w", "k_norm_w", "q_w", "k_w",
+            "v_w", "o_w", "gate_w", "up_w", "down_w")}
+        lw["cos"] = self._mrope_cos.data_ptr()
+        lw["sin"] = self._mrope_sin.data_ptr()
+        lw["deepstack_inject"] = inject
+        for li in range(16):
+            qkv = sh[("llm", li, "qkv")]            # (2048, 4096) fp16
+            q = K(qkv[:, :2048].contiguous())
+            kk = K(qkv[:, 2048:3072].contiguous())
+            v = K(qkv[:, 3072:4096].contiguous())
+            lw["in_ln_w"].append(self._llm_input_ln_w[li].data_ptr())
+            lw["post_ln_w"].append(self._llm_post_ln_w[li].data_ptr())
+            lw["q_norm_w"].append(self._llm_q_norm_w[li].data_ptr())
+            lw["k_norm_w"].append(self._llm_k_norm_w[li].data_ptr())
+            lw["q_w"].append(q.data_ptr()); lw["k_w"].append(kk.data_ptr())
+            lw["v_w"].append(v.data_ptr())
+            lw["o_w"].append(sh[("llm", li, "o")].data_ptr())
+            lw["gate_w"].append(sh[("llm", li, "gate")].data_ptr())
+            lw["up_w"].append(sh[("llm", li, "up")].data_ptr())
+            lw["down_w"].append(sh[("llm", li, "down")].data_ptr())
+        slots = attn.get_slot_ptrs("llm")
+        llm_bufs = {
+            "h": llm_h.data_ptr(), "xn": buf(Se, 2048).data_ptr(),
+            "Q": slots["Q"], "K": buf(Se, 1024).data_ptr(),
+            "V": buf(Se, 1024).data_ptr(),
+            "K_exp": slots["K"], "V_exp": slots["V"],
+            "o_proj_out": buf(Se, 2048).data_ptr(),
+            "gate_out": buf(Se, 6144).data_ptr(),
+            "up_out": buf(Se, 6144).data_ptr()}
+        P.qwen3vl_llm_forward(
+            gemm=gemm, fvk=fvkm, bufs=llm_bufs, weights=lw,
+            dims={"S": Se, "D": 2048, "NHQ": 16, "NHKV": 8, "HD": 128, "FF": 6144},
+            attn=attn)
+
+        # ═══ vlln + VL self-attn (4L) ═══
+        vlsa_h = buf(Se, 2048)
+        P.vlln_forward(
+            gemm=gemm, fvk=fvkm,
+            bufs={"x": llm_h.data_ptr(), "out": vlsa_h.data_ptr()},
+            weights={"vlln_w": self._vlln_w.data_ptr(),
+                     "vlln_b": self._vlln_b.data_ptr()},
+            dims={"S": Se, "D": 2048})
+        vsw = {k: [] for k in (
+            "norm1_w", "norm1_b", "norm3_w", "norm3_b", "q_w", "q_b",
+            "k_w", "k_b", "v_w", "v_b", "o_w", "o_b", "fc1_w", "fc1_b",
+            "fc2_w", "fc2_b")}
+        for li in range(4):
+            vsw["norm1_w"].append(self._vlsa_norm1_w[li].data_ptr())
+            vsw["norm1_b"].append(self._vlsa_norm1_b[li].data_ptr())
+            vsw["norm3_w"].append(self._vlsa_norm3_w[li].data_ptr())
+            vsw["norm3_b"].append(self._vlsa_norm3_b[li].data_ptr())
+            vsw["q_w"].append(sh[("vlsa", li, "q")].data_ptr())
+            vsw["q_b"].append(self._vlsa_q_b[li].data_ptr())
+            vsw["k_w"].append(sh[("vlsa", li, "k")].data_ptr())
+            vsw["k_b"].append(self._vlsa_k_b[li].data_ptr())
+            vsw["v_w"].append(sh[("vlsa", li, "v")].data_ptr())
+            vsw["v_b"].append(self._vlsa_v_b[li].data_ptr())
+            vsw["o_w"].append(sh[("vlsa", li, "o")].data_ptr())
+            vsw["o_b"].append(self._vlsa_o_b[li].data_ptr())
+            vsw["fc1_w"].append(sh[("vlsa", li, "fc1")].data_ptr())
+            vsw["fc1_b"].append(self._vlsa_fc1_b[li].data_ptr())
+            vsw["fc2_w"].append(sh[("vlsa", li, "fc2")].data_ptr())
+            vsw["fc2_b"].append(self._vlsa_fc2_b[li].data_ptr())
+        P.vl_self_attn_forward(
+            gemm=gemm, fvk=fvkm,
+            bufs={"h": vlsa_h.data_ptr(), "xn": buf(Se, 2048).data_ptr(),
+                  "o_proj_out": buf(Se, 2048).data_ptr(),
+                  "fc1_out": buf(Se, 8192).data_ptr()},
+            weights=vsw,
+            dims={"T": Se, "D": 2048, "NH": 32, "HD": 64, "ff_inner": 8192},
+            attn=attn)
+        torch.cuda.synchronize()
+        return vlsa_h.unsqueeze(0)
+
     # ── infer: same as base but action-head tensors in FP16 ──
     def infer(
         self,
