@@ -178,7 +178,7 @@ model = flash_rt.load_model(
 | `awq_alpha` | `float` | `0.5` | AWQ scaling exponent `s[k] = (a[k]/a.mean())^alpha`. |
 | `use_p1_split_gu` | `bool` \| `None` | `None` | P1 split-GU 2-GEMM path (parity on Pi0.5, kernel reusable for Pi0.6). `None` → resolved by the `use_fp4` preset. |
 | `use_fp8` | `bool` | `True` | Enable the selected frontend's FP8 path when available. Set `False` for BF16 fallback or for the opt-in Pi0.5 RTX FP16 path. |
-| `use_fp16` | `bool` | `False` | **Pi0.5 torch RTX SM120/SM89 only.** Opt-in full-FP16 CUDA Graph path. Requires `use_fp8=False`; other hardware/configs raise a clear error. |
+| `use_fp16` | `bool` | `False` | **Pi0.5 / GROOT N1.6 / GROOT N1.7 torch RTX SM120/SM89.** Opt-in non-quantized full-FP16 path (A/B reference against the FP8/bf16 default). Requires `use_fp8=False`; other hardware/configs raise a clear error. See [RTX full-FP16 opt-in path](#rtx-full-fp16-opt-in-path-pi05--groot). |
 | `num_steps` | `int\|None` | `None` | Pi0/Pi0.5 torch frontends. Flow-matching denoise steps; `None` uses the frontend default. |
 | `vision_pool_factor` | `int\|None` | `None` | Pi0.5 torch RTX/Orin. Spatial pooling factor for vision tokens. The FP16 RTX path currently supports only `1`. |
 | `vision_num_layers` | `int\|None` | `None` | Pi0.5 torch RTX/Orin. Number of SigLIP vision layers to run. |
@@ -264,11 +264,17 @@ warmed_lengths = model.warm_state_prompt_buckets(
 print("prewarmed state prompt token lengths:", warmed_lengths)
 ```
 
-### Pi0.5 RTX full-FP16 opt-in path
+### RTX full-FP16 opt-in path (Pi0.5 / GROOT)
 
-The default Pi0.5 RTX path remains FP8/BF16. For RTX 5090 / SM120 and
-RTX 4090/L40-class SM89 experiments that need a full-FP16 baseline,
-explicitly disable FP8 and enable FP16:
+The default RTX paths run FP8 (Pi0.5, GROOT N1.6) or bf16 (GROOT N1.7 action
+head). For RTX 5090 / SM120 and RTX 4090/L40-class SM89 experiments that need
+a **non-quantized full-FP16 baseline** (e.g. to A/B against the quantized
+path), explicitly disable FP8 and enable FP16. The FP16 routes are additive
+and leave the default FP8/bf16 paths untouched.
+
+#### Pi0.5
+
+The default Pi0.5 RTX path remains FP8/BF16. To run full-FP16:
 
 ```python
 import flash_rt
@@ -313,9 +319,63 @@ Officially enabled FP16 RTX routes are:
 | `rtx_sm120` | RTX 5090 | validated reference path |
 | `rtx_sm89` | RTX 4090, L40 | enabled through the same RTX FP16 path; validate benchmark/accuracy on the target card |
 
-The underlying FP16 kernels are SM80-family friendly, but FlashRT only
-exposes this Pi0.5 FP16 route for architectures already mapped to the
-RTX Pi0.5 frontend.
+#### GROOT N1.6
+
+GROOT N1.6 defaults to FP8 on RTX. The full-FP16 baseline runs every GEMM
+in FP16 with no activation calibration; it is reachable from `load_model`
+(or `examples/quickstart.py --use_fp16`) and exposes the same
+`set_prompt` / `predict` contract as the FP8 path:
+
+```python
+model = flash_rt.load_model(
+    "/path/to/GR00T-N1.6-3B",
+    framework="torch",
+    config="groot",
+    hardware="rtx_sm120",     # or rtx_sm89
+    num_views=2,
+    embodiment_tag="gr1",
+    use_fp8=False,
+    use_fp16=True,
+)
+```
+
+`calibrate()` is a no-op on this path and `precision_spec` is `None` (no FP8
+scales). Reference: FP16-vs-FP8 cosine ≈ 0.999 on RTX 5090; FP16 is slower
+than FP8 (precision↔speed trade-off), so use it as an A/B reference, not for
+production latency.
+
+#### GROOT N1.7
+
+GROOT N1.7's RTX action head (state/action encoders, the 32-layer DiT,
+output proj, decoder) defaults to bf16; the full-FP16 variant runs it in
+FP16. The backbone (ViT/LLM/VL self-attn) is produced once at `set_prompt`
+by the shared fp32 reference and is unchanged.
+
+N1.7 uses the aux-driven `set_prompt(aux=...)` / `infer(state, initial_noise=...)`
+contract (not the `predict(images=...)` quickstart flow), so construct the
+frontend directly:
+
+```python
+from flash_rt.frontends.torch.groot_n17_rtx_fp16 import (
+    GrootN17TorchFrontendRtxFP16,
+)
+
+fe = GrootN17TorchFrontendRtxFP16(
+    "/path/to/GR00T-N1.7-3B",
+    num_views=2,
+    embodiment_tag="oxe_droid_relative_eef_relative_joint",
+)
+fe.set_prompt(aux=aux)                       # aux from the N1.7 preprocessing path
+actions = fe.infer(state_normalized, initial_noise=noise)
+```
+
+`load_model(config="groot_n17", use_fp16=True, use_fp8=False)` also returns
+this frontend. Reference on RTX 5090: FP16-vs-bf16 action cosine ≈ 0.99999,
+combined E2E-vs-reference cosine ≈ 0.9999; infer latency ≈ 10.7 ms (≈ the
+bf16 path — the DiT GEMMs are small, so FP16 and bf16 throughput match).
+
+The underlying FP16 kernels are SM80-family friendly; FlashRT exposes the
+FP16 route for Pi0.5, GROOT N1.6, and GROOT N1.7 on the RTX frontends.
 
 ### GROOT N1.7 RTX
 
