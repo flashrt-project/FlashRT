@@ -26,6 +26,7 @@ from flash_rt.frontends.torch.groot_n17_thor import GrootN17TorchFrontendThor
 
 _FP16 = torch.float16
 _FP8 = torch.float8_e4m3fn
+_BF16 = torch.bfloat16
 
 
 class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
@@ -491,7 +492,23 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
 
         # ═══ LLM (16L, causal, GQA) ═══
         llm_h = buf(Se, 2048)
-        llm_h.copy_(aux["llm_input_embeds"].to(dev).half().reshape(Se, 2048))
+        # Text-token embeddings: in-kernel embed lookup over the prompt's token
+        # ids (per-prompt constant; image positions hold placeholder embeds that
+        # the ViT final merger overwrites). Falls back to the externally
+        # supplied llm_input_embeds when no token ids are given.
+        use_embed = use_pe and "input_ids" in aux
+        if use_embed:
+            if not hasattr(self, "_embed_tokens_bf16"):
+                self._embed_tokens_bf16 = self._embed_tokens_w.to(_BF16).contiguous()
+            ids = K(aux["input_ids"].reshape(-1).to(torch.int64).to(dev).contiguous())
+            emb_bf16 = K(torch.empty(Se, 2048, dtype=_BF16, device=dev))
+            fvk.qwen36_embedding_lookup_bf16(ids.data_ptr(),
+                                             self._embed_tokens_bf16.data_ptr(),
+                                             emb_bf16.data_ptr(), Se, 2048, 0)
+            self._kbb_llm_base = emb_bf16.to(_FP16).contiguous()
+            llm_h.copy_(self._kbb_llm_base)
+        else:
+            llm_h.copy_(aux["llm_input_embeds"].to(dev).half().reshape(Se, 2048))
         if not hasattr(self, "_llm_protect_fp16"):
             self._load_llm_protect_fp16()
         lw = {k: [] for k in (
@@ -702,7 +719,10 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
         else:
             self._kbb_vit_h.copy_(
                 aux["pixel_features"].to(dev).half().reshape(self._S_vit, 1024))
-        self._kbb_llm_h.copy_(
-            aux["llm_input_embeds"].to(dev).half().reshape(self.Se, 2048))
+        if hasattr(self, "_kbb_llm_base"):
+            self._kbb_llm_h.copy_(self._kbb_llm_base)   # in-kernel text embeds
+        else:
+            self._kbb_llm_h.copy_(
+                aux["llm_input_embeds"].to(dev).half().reshape(self.Se, 2048))
         self._kbb_graph.replay()
         return self._kbb_vlsa_h.unsqueeze(0)
