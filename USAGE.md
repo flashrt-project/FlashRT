@@ -390,14 +390,15 @@ bf16 path — the DiT GEMMs are small, so FP16 and bf16 throughput match).
 The underlying FP16 kernels are SM80-family friendly; FlashRT exposes the
 FP16 route for Pi0.5, GROOT N1.6, and GROOT N1.7 on the RTX frontends.
 
-### Thor full-FP16 path (GROOT N1.6 / N1.7)
+### Thor non-FP8 reference paths (GROOT N1.6 / N1.7)
 
-Thor (SM110) defaults to FP8 for both GROOT N1.6 and N1.7. The full-FP16
-route is the **opt-in non-quantized A/B reference** for those FP8 paths: it
-runs the identical fully-kernelized pipeline with every GEMM in FP16 (the
-graph-safe `fp16_nn` path) instead of per-tensor FP8, with no activation
-calibration. No PyTorch matmul touches the feature path. Enable it with
-`use_fp8=False, use_fp16=True`.
+Thor (SM110) defaults to FP8 for both GROOT N1.6 and N1.7. The non-FP8
+route is the **opt-in, fully non-quantized A/B reference** for those FP8
+paths: it runs the identical fully-kernelized pipeline with **no FP8
+anywhere** — the backbone GEMMs go through the graph-safe `fp16_nn` path
+instead of per-tensor FP8, and the DiT action head stays bf16 (its native
+ckpt precision) — with no activation calibration. No PyTorch matmul touches
+the feature path. Enable it with `use_fp8=False, use_fp16=True`.
 
 #### GROOT N1.6 (Thor)
 
