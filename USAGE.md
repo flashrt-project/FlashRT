@@ -439,11 +439,11 @@ Reference (Jetson AGX Thor, wall-clock per-frame image→action e2e):
 Action cosine vs the FP16-backbone reference ≈ 0.9999; replays are
 bit-identical.
 
-**FP16 backbone reference (opt-in A/B).** `use_fp8=False, use_fp16=True`
-returns a reference frontend whose backbone runs every GEMM in fp16 (the
-tighter backbone-vs-HF cosine); the DiT action head still runs the
-production FP8 graph. Use it to validate the FP8 backbone, not for
-production latency.
+**Full-FP16 reference (opt-in A/B).** `use_fp8=False, use_fp16=True`
+returns a fully non-quantized reference: the backbone runs every GEMM in
+fp16 and the DiT action head stays bf16 (no FP8 anywhere). It is the
+accuracy baseline for the whole model (e2e ≈ 74 ms on Thor; action cosine
+vs the FP8 default ≈ 0.9999), not a production-latency path.
 
 ```python
 fe = flash_rt.load_model(
