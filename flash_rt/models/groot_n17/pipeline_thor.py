@@ -831,14 +831,27 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
         # layer index). Map here.
         j_attn = (li - 1) // 2 if is_self else li // 2
 
-        # ── AdaLN modulated norm1 (bf16) ──────────────────────────────
-        fvk.ada_layer_norm_bf16(
-            h_ptr,
-            int(weights["scale_msa"][li]), int(weights["shift_msa"][li]),
-            xn_ptr, Sa, D, 1e-5, int(stream),
-        )
+        # ── AdaLN modulated norm1 ─────────────────────────────────────
+        # For self-attn FP8 QKV, fuse the AdaLN and the FP8 quantize into one
+        # kernel — the AdaLN output feeds only the QKV projection, so it can
+        # be emitted directly as fp8 (one kernel instead of AdaLN + quantize).
+        # Cross-attn and the bf16 fallback keep the bf16 AdaLN.
+        is_self_fp8 = is_self and "qkv_w_fp8" in weights
+        j_self = (li - 1) // 2
+        if is_self_fp8:
+            fvk.ada_layer_norm_fp8(
+                h_ptr, int(weights["scale_msa"][li]), int(weights["shift_msa"][li]),
+                int(bufs["qkv_xn_fp8"]), int(weights["act_qkv_scale"][j_self]),
+                Sa, D, 1e-5, int(stream),
+            )
+        else:
+            fvk.ada_layer_norm_bf16(
+                h_ptr,
+                int(weights["scale_msa"][li]), int(weights["shift_msa"][li]),
+                xn_ptr, Sa, D, 1e-5, int(stream),
+            )
 
-        # ── Q always projects from D → D ──────────────────────────────
+        # ── attention projections ─────────────────────────────────────
         if is_self:
             slots = attn.get_slot_ptrs("dit_self", j_attn)
         else:
@@ -849,16 +862,11 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
         # CUBLAS_STATUS_NOT_SUPPORTED at M=Sa=41 (M not 16-aligned). Match
         # N1.6's calibrate path: bf16_nn (no epilogue) + explicit
         # add_bias_bf16. Slightly more launches but works on every shape.
-        if is_self and "qkv_w_fp8" in weights:
-            # Fused FP8 QKV (self-attn): q/k/v share the post-AdaLN input xn,
+        if is_self_fp8:
+            # Fused FP8 QKV (self-attn): q/k/v share the post-AdaLN input,
             # so one [D, 3D] GEMM (compute-bound, unlike 3 launch-bound D→D
-            # GEMMs) + a strided split into the Q/K/V slots. j_attn indexes
-            # the 16 self-attn layers. Cross-attn keeps a single Q GEMM (K/V
-            # come from the backbone-projected cross-KV).
-            j_self = (li - 1) // 2
-            fvk.quantize_fp8_static(
-                xn_ptr, int(bufs["qkv_xn_fp8"]),
-                int(weights["act_qkv_scale"][j_self]), Sa * D, int(stream))
+            # GEMMs) + a strided split into the Q/K/V slots. Cross-attn keeps
+            # a single Q GEMM (K/V come from the backbone-projected cross-KV).
             gemm.fp8_nn_bias_bf16(
                 int(bufs["qkv_xn_fp8"]), int(weights["qkv_w_fp8"][j_self]),
                 int(bufs["qkv_buf"]), int(weights["qkv_b"][j_self]),
