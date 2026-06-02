@@ -200,6 +200,49 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
         except Exception as e:  # noqa: BLE001
             warnings.warn(f"set_prompt warmup failed (non-fatal): {e!r}")
 
+    # ── Patch embed (image → ViT input), kernelized ───────────────────────
+    def _fast_pos_embed_interpolate(self, grid_thw) -> "torch.Tensor":
+        """Bilinear interpolation of the ViT position-embedding table to the
+        per-image grid — a pure-torch port of Qwen3-VL
+        ``fast_pos_embed_interpolate`` (one-time, per prompt). Returns
+        ``(S_vit, 1024)``."""
+        dev = self.device
+        pos_w = self._vit_pos_embed.float()           # (2304, 1024)
+        side = int(round(pos_w.shape[0] ** 0.5))      # 48
+        merge = 2
+        idx_list = [[] for _ in range(4)]
+        wgt_list = [[] for _ in range(4)]
+        for t, h, w in [tuple(int(x) for x in row) for row in grid_thw]:
+            h_i = torch.linspace(0, side - 1, h)
+            w_i = torch.linspace(0, side - 1, w)
+            hf, wf = h_i.int(), w_i.int()
+            hc = (hf + 1).clip(max=side - 1)
+            wc = (wf + 1).clip(max=side - 1)
+            dh, dw = h_i - hf, w_i - wf
+            bh, bhc = hf * side, hc * side
+            inds = [(bh[None].T + wf[None]).flatten(), (bh[None].T + wc[None]).flatten(),
+                    (bhc[None].T + wf[None]).flatten(), (bhc[None].T + wc[None]).flatten()]
+            wgts = [((1 - dh)[None].T * (1 - dw)[None]).flatten(), ((1 - dh)[None].T * dw[None]).flatten(),
+                    (dh[None].T * (1 - dw)[None]).flatten(), (dh[None].T * dw[None]).flatten()]
+            for i in range(4):
+                idx_list[i].extend(inds[i].tolist())
+                wgt_list[i].extend(wgts[i].tolist())
+        idx = torch.tensor(idx_list, dtype=torch.long, device=dev)
+        wgt = torch.tensor(wgt_list, dtype=torch.float32, device=dev)
+        pe = pos_w[idx] * wgt[:, :, None]
+        patch = pe[0] + pe[1] + pe[2] + pe[3]
+        grids = [(int(h), int(w)) for _, h, w in
+                 [tuple(int(x) for x in row) for row in grid_thw]]
+        ts = [int(t) for t, _, _ in [tuple(int(x) for x in row) for row in grid_thw]]
+        patch = patch.split([h * w for h, w in grids])
+        out = []
+        for pe_g, t, (h, w) in zip(patch, ts, grids):
+            pe_g = pe_g.repeat(t, 1)
+            pe_g = (pe_g.view(t, h // merge, merge, w // merge, merge, -1)
+                    .permute(0, 1, 3, 2, 4, 5).flatten(0, 4))
+            out.append(pe_g)
+        return torch.cat(out)
+
     # ── FP8 kernel backbone: ViT → DeepStack → LLM → vlln → VL self-attn ──
     def _run_kernel_backbone(self, aux: dict) -> "torch.Tensor":
         import flash_rt.flash_rt_kernels as fvk
@@ -283,7 +326,21 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
 
         # ═══ ViT (24L) ═══
         vit_h = buf(Sv, 1024)
-        vit_h.copy_(aux["pixel_features"].to(dev).half().reshape(Sv, 1024))
+        # When the caller supplies raw ``pixel_values`` the patch embed runs
+        # in-kernel as the graph's first op (fp16_nn + bias + interpolated pos
+        # embed → vit_h); otherwise the pre-embedded ``pixel_features`` are
+        # copied straight in (legacy path).
+        use_pe = "pixel_values" in aux
+        if use_pe:
+            pv_buf = buf(Sv, 1536)
+            pv_buf.copy_(aux["pixel_values"].to(dev).half().reshape(Sv, 1536))
+            pe_W = K(self._patch_embed_w.reshape(1024, 1536).t().contiguous().to(_FP16))
+            pe_b = K(self._patch_embed_b.to(_FP16).contiguous())
+            pe_pos = K(self._fast_pos_embed_interpolate(aux["grid_thw"].tolist())
+                       .to(_FP16).contiguous())
+            self._kbb_pv = pv_buf
+        else:
+            vit_h.copy_(aux["pixel_features"].to(dev).half().reshape(Sv, 1024))
         vit_bufs = {"h": vit_h.data_ptr(), "xn": buf(Sv, 1024).data_ptr(),
                     "xn_fp8": buf8(Sv, 1024).data_ptr(),
                     "o_proj_out": buf(Sv, 1024).data_ptr(),
@@ -544,6 +601,11 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
 
         def _kbb_forward(s=0):
             scell[0] = s
+            if use_pe:
+                gemm.fp16_nn(pv_buf.data_ptr(), pe_W.data_ptr(), vit_h.data_ptr(),
+                             Sv, 1024, 1536, s)
+                fvkm.add_bias_fp16(vit_h.data_ptr(), pe_b.data_ptr(), Sv, 1024, s)
+                fvkm.residual_add_fp16(vit_h.data_ptr(), pe_pos.data_ptr(), Sv * 1024, s)
             P.qwen3vl_vit_forward(gemm=gemm, fvk=fvkm, bufs=vit_bufs, weights=vw,
                                   scales_dev=vit_scales, dims=vit_dims, attn=attn,
                                   deepstack_taps=tap_layers, deepstack_capture=dcap,
@@ -592,8 +654,12 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
         """Per-observation hot path: write fresh inputs into the persistent
         buffers and replay the captured backbone graph."""
         dev = self.device
-        self._kbb_vit_h.copy_(
-            aux["pixel_features"].to(dev).half().reshape(self._S_vit, 1024))
+        if hasattr(self, "_kbb_pv") and "pixel_values" in aux:
+            self._kbb_pv.copy_(
+                aux["pixel_values"].to(dev).half().reshape(self._S_vit, 1536))
+        else:
+            self._kbb_vit_h.copy_(
+                aux["pixel_features"].to(dev).half().reshape(self._S_vit, 1024))
         self._kbb_llm_h.copy_(
             aux["llm_input_embeds"].to(dev).half().reshape(self.Se, 2048))
         self._kbb_graph.replay()
