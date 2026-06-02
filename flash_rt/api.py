@@ -448,6 +448,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 GrootTorchFrontendThorFP16,
             )
             pipe_cls = GrootTorchFrontendThorFP16
+        elif config == "groot_n17" and framework == "torch" and arch == "thor":
+            # N1.7 Thor full-FP16 reference: ViT / DeepStack / LLM /
+            # VL-self-attn all run fp16_nn on the shadow weights (bf16 DiT).
+            from flash_rt.frontends.torch.groot_n17_thor_fp16 import (
+                GrootN17TorchFrontendThorFP16,
+            )
+            pipe_cls = GrootN17TorchFrontendThorFP16
         else:
             fp16_arches = ("rtx_sm120", "rtx_sm89")
             if config not in ("pi05", "groot", "groot_n17") or framework != "torch" \
@@ -455,7 +462,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 raise ValueError(
                     "use_fp16=True is currently experimental and only supports "
                     "config in {'pi05', 'groot', 'groot_n17'}, framework='torch', "
-                    "hardware in {'thor' (groot only), 'rtx_sm120', 'rtx_sm89'}")
+                    "hardware in {'thor' (groot/groot_n17 only), 'rtx_sm120', "
+                    "'rtx_sm89'}")
             if config == "pi05":
                 from flash_rt.frontends.torch.pi05_rtx_fp16 import (
                     Pi05TorchFrontendRtxFP16,
