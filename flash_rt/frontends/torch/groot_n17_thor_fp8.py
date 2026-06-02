@@ -32,16 +32,23 @@ _BF16 = torch.bfloat16
 class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
     """N1.7 Thor frontend with an FP8-kernel serving backbone + cached scales."""
 
-    # LLM decoder layers that run their GEMMs in fp16 instead of per-tensor
-    # FP8. The Qwen3-VL text decoder carries large visual-token activation
-    # spikes whose per-tensor FP8 error — though only ~0.99 per isolated
-    # layer — accumulates across the 16-layer stack into a per-position
-    # backbone that the action head cannot use (post-vlln cosine collapses
-    # to ~0.1; end-to-end action cosine 0.99 → 1.00 once protected). Running
-    # the whole decoder in fp16 (still kernel-based, no torch on the feature
-    # path) restores it; ViT / DeepStack / VL-self-attn stay FP8. This mirrors
-    # the N1.6 precedent of fp16 for the precision-sensitive sub-modules.
-    PROTECT_LLM_FP16 = tuple(range(16))
+    # LLM decoder layers forced to fp16 instead of FP8. Empty = the whole
+    # decoder runs FP8.
+    #
+    # The earlier "FP8 LLM collapses to cosine ~0.1" was NOT a precision limit
+    # of per-tensor FP8 — it was a broken GEMM. The LLM projections used
+    # ``fp8_nn_dev`` (cublasLt per-operand A/B scale pointers), which is
+    # mis-scaled on this build: a single FP8 layer dropped the backbone to
+    # cos ~0.52 (one GEMM ~0.85 vs 0.999 for the host-alpha epilogue), and the
+    # 16-layer stack to ~0.02. Switching the LLM GEMMs to the host-alpha
+    # ``fp8_nn_bias`` epilogue (the same path the ViT / DeepStack / VL-self-attn
+    # and the DiT already use) restores full-FP8 backbone cos to 0.987 and —
+    # because the action head is robust to backbone fidelity — end-to-end
+    # action cosine to 0.99999. So the whole decoder runs FP8 by default.
+    # (Protecting the first few layers is available as extra margin for
+    # inputs with larger visual-token activation spikes than the calibration
+    # set, but is not needed at the verified action cosine.)
+    PROTECT_LLM_FP16 = ()
 
     # ViT / DeepStack / VL-self-attn GEMM precision. The FP8 production
     # frontend keeps these stages in FP8; the full-FP16 reference subclass
@@ -515,6 +522,8 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
             "in_ln_w", "post_ln_w", "q_norm_w", "k_norm_w", "q_w", "k_w",
             "v_w", "o_w", "gate_w", "up_w", "down_w",
             "d_w_q", "d_w_k", "d_w_v", "d_w_o", "d_w_gate", "d_w_up", "d_w_down",
+            "alpha_q", "alpha_k", "alpha_v", "alpha_o",
+            "alpha_gate", "alpha_up", "alpha_down",
             "q_w_fp16", "k_w_fp16", "v_w_fp16", "o_w_fp16",
             "gate_w_fp16", "up_w_fp16", "down_w_fp16")}
         lw["cos"] = self._mrope_cos.data_ptr()
@@ -542,6 +551,20 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
             lw["d_w_gate"].append(wsc(self._llm_alpha[li * 5 + 2]))
             lw["d_w_up"].append(wsc(self._llm_alpha[li * 5 + 3]))
             lw["d_w_down"].append(wsc(self._llm_alpha[li * 5 + 4]))
+            # Host alphas (act_scale × weight_scale) for the fp8_nn_bias
+            # epilogue — the correct path (device A/B-scale fp8_nn_dev is
+            # mis-scaled on this build). act scales are static (calibrated).
+            a_qkv = float(self._llm_act_qkv_dev[li].item())
+            a_o = float(self._llm_act_o_dev[li].item())
+            a_gu = float(self._llm_act_gateup_dev[li].item())
+            a_dn = float(self._llm_act_down_dev[li].item())
+            wq = self._llm_alpha[li * 5 + 0]
+            lw["alpha_q"].append(a_qkv * wq); lw["alpha_k"].append(a_qkv * wq)
+            lw["alpha_v"].append(a_qkv * wq)
+            lw["alpha_o"].append(a_o * self._llm_alpha[li * 5 + 1])
+            lw["alpha_gate"].append(a_gu * self._llm_alpha[li * 5 + 2])
+            lw["alpha_up"].append(a_gu * self._llm_alpha[li * 5 + 3])
+            lw["alpha_down"].append(a_dn * self._llm_alpha[li * 5 + 4])
             # fp16-protect weight ptrs (only valid for protected layers; 0
             # elsewhere — qwen3vl_llm_forward only reads them for fp16_layers).
             if (li, "q") in prot:
@@ -560,9 +583,12 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
             "act_qkv": adv(self._llm_act_qkv_dev), "act_o": adv(self._llm_act_o_dev),
             "act_gateup": adv(self._llm_act_gateup_dev),
             "act_down": adv(self._llm_act_down_dev)}
+        if not hasattr(self, "_llm_zero_bias"):
+            self._llm_zero_bias = torch.zeros(6144, dtype=_FP16, device=dev)
         llm_bufs = {
             "h": llm_h.data_ptr(), "xn": buf(Se, 2048).data_ptr(),
             "xn_fp8": buf8(Se, 2048).data_ptr(),
+            "zero_bias": self._llm_zero_bias.data_ptr(),
             "Q": llmQ.data_ptr(), "K": buf(Se, 1024).data_ptr(),
             "V": buf(Se, 1024).data_ptr(),
             "K_exp": llmKx.data_ptr(), "V_exp": llmVx.data_ptr(),

@@ -541,8 +541,9 @@ def llm_artifacts(fixture):
     gate_out = torch.empty((S, FF), dtype=torch.float16, device="cuda")
     up_out = torch.empty((S, FF), dtype=torch.float16, device="cuda")
     gu_fp8 = torch.empty((S, FF), dtype=torch.float8_e4m3fn, device="cuda")
+    _llm_zero_bias = torch.zeros(FF, dtype=torch.float16, device="cuda")
     keep += [h_buf, xn_buf, xn_fp8, Q_buf, K_buf, V_buf, K_exp_buf, V_exp_buf,
-             O_buf, logits_buf, o_proj_out, gate_out, up_out, gu_fp8]
+             O_buf, logits_buf, o_proj_out, gate_out, up_out, gu_fp8, _llm_zero_bias]
 
     # ── M-RoPE cos/sin from captured aux (HF rotary_emb output) ──
     cos_t = aux["rope_cos"][0].to("cuda").half().contiguous()  # (S, HD)
@@ -595,6 +596,8 @@ def llm_artifacts(fixture):
         "gate_w", "up_w", "down_w",
         "d_w_q", "d_w_k", "d_w_v", "d_w_o",
         "d_w_gate", "d_w_up", "d_w_down",
+        "alpha_q", "alpha_k", "alpha_v", "alpha_o",
+        "alpha_gate", "alpha_up", "alpha_down",
     ]}
     weights["cos"] = cos_t.data_ptr()
     weights["sin"] = sin_t.data_ptr()
@@ -728,6 +731,13 @@ def llm_artifacts(fixture):
         scales_dev["act_o"].append(d_o.data_ptr())
         scales_dev["act_gateup"].append(d_gu.data_ptr())
         scales_dev["act_down"].append(d_dn.data_ptr())
+        # Host alphas (act_scale × weight_scale) for the fp8_nn_bias epilogue.
+        s_qkv = amax_qkv / 448.0; s_o = amax_o / 448.0
+        s_gu = amax_gu / 448.0; s_dn = amax_down / 448.0
+        weights["alpha_q"].append(s_qkv * q_ws); weights["alpha_k"].append(s_qkv * k_ws)
+        weights["alpha_v"].append(s_qkv * v_ws); weights["alpha_o"].append(s_o * o_ws)
+        weights["alpha_gate"].append(s_gu * gate_ws); weights["alpha_up"].append(s_gu * up_ws)
+        weights["alpha_down"].append(s_dn * down_ws)
 
     return {
         "fvk": fvk_mod, "gemm": g, "attn": backend, "keep": keep,
@@ -740,6 +750,7 @@ def llm_artifacts(fixture):
             "o_proj_out": o_proj_out.data_ptr(),
             "gate_out": gate_out.data_ptr(), "up_out": up_out.data_ptr(),
             "gu_fp8": gu_fp8.data_ptr(),
+            "zero_bias": _llm_zero_bias.data_ptr(),
         },
         "weights": weights, "scales_dev": scales_dev,
         "dims": {"S": S, "D": D, "NHQ": NHQ, "NHKV": NHKV, "HD": HD, "FF": FF},

@@ -478,22 +478,23 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
                 xn_ptr, xn_fp8_ptr, int(scales_dev["act_qkv"][li]),
                 S * D, int(stream),
             )
-            # ── 3 split FP8 GEMMs (per-tensor act+weight scales) ───────
-            d_act_qkv = int(scales_dev["act_qkv"][li])
-            gemm.fp8_nn_dev(
-                xn_fp8_ptr, int(weights["q_w"][li]), Q_ptr,
-                S, NHQ * HD, D,
-                d_act_qkv, int(weights["d_w_q"][li]), int(stream),
+            # ── 3 split FP8 GEMMs ─────────────────────────────────────
+            # Use the host-alpha epilogue (alpha = act_scale × weight_scale);
+            # the device A/B-scale path (fp8_nn_dev) mis-applies the cublasLt
+            # FP8 operand scales on this build (per-GEMM cos ~0.85, collapsing
+            # the 16-layer stack) — host alpha is the correct, verified path.
+            zb = int(bufs["zero_bias"])
+            gemm.fp8_nn_bias(
+                xn_fp8_ptr, int(weights["q_w"][li]), Q_ptr, zb,
+                S, NHQ * HD, D, float(weights["alpha_q"][li]), int(stream),
             )
-            gemm.fp8_nn_dev(
-                xn_fp8_ptr, int(weights["k_w"][li]), K_ptr,
-                S, NHKV * HD, D,
-                d_act_qkv, int(weights["d_w_k"][li]), int(stream),
+            gemm.fp8_nn_bias(
+                xn_fp8_ptr, int(weights["k_w"][li]), K_ptr, zb,
+                S, NHKV * HD, D, float(weights["alpha_k"][li]), int(stream),
             )
-            gemm.fp8_nn_dev(
-                xn_fp8_ptr, int(weights["v_w"][li]), V_ptr,
-                S, NHKV * HD, D,
-                d_act_qkv, int(weights["d_w_v"][li]), int(stream),
+            gemm.fp8_nn_bias(
+                xn_fp8_ptr, int(weights["v_w"][li]), V_ptr, zb,
+                S, NHKV * HD, D, float(weights["alpha_v"][li]), int(stream),
             )
 
         # ── Per-head q_norm / k_norm (BEFORE M-RoPE — Qwen3 standard) ──
@@ -529,11 +530,10 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
                 int(slots["O"]), xn_fp8_ptr, int(scales_dev["act_o"][li]),
                 S * NHQ * HD, int(stream),
             )
-            gemm.fp8_nn_dev(
+            gemm.fp8_nn_bias(
                 xn_fp8_ptr, int(weights["o_w"][li]), o_out_ptr,
-                S, D, NHQ * HD,
-                int(scales_dev["act_o"][li]), int(weights["d_w_o"][li]),
-                int(stream),
+                int(bufs["zero_bias"]), S, D, NHQ * HD,
+                float(weights["alpha_o"][li]), int(stream),
             )
 
         # ── Residual 1 ────────────────────────────────────────────────
@@ -556,17 +556,15 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
                 xn_ptr, xn_fp8_ptr, int(scales_dev["act_gateup"][li]),
                 S * D, int(stream),
             )
-            d_act_gu = int(scales_dev["act_gateup"][li])
-            # ── gate / up FP8 GEMMs → fp16 outputs ────────────────────
-            gemm.fp8_nn_dev(
-                xn_fp8_ptr, int(weights["gate_w"][li]), gate_ptr,
-                S, FF, D,
-                d_act_gu, int(weights["d_w_gate"][li]), int(stream),
+            # ── gate / up FP8 GEMMs → fp16 outputs (host-alpha epilogue) ─
+            zb = int(bufs["zero_bias"])
+            gemm.fp8_nn_bias(
+                xn_fp8_ptr, int(weights["gate_w"][li]), gate_ptr, zb,
+                S, FF, D, float(weights["alpha_gate"][li]), int(stream),
             )
-            gemm.fp8_nn_dev(
-                xn_fp8_ptr, int(weights["up_w"][li]), up_ptr,
-                S, FF, D,
-                d_act_gu, int(weights["d_w_up"][li]), int(stream),
+            gemm.fp8_nn_bias(
+                xn_fp8_ptr, int(weights["up_w"][li]), up_ptr, zb,
+                S, FF, D, float(weights["alpha_up"][li]), int(stream),
             )
         if hi_prec:
             # fp16-protected FFN out: SiLU(gate)*up in fp16, fp16 down GEMM.
@@ -580,12 +578,11 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
                 gate_ptr, up_ptr, gu_fp8_ptr, S * FF,
                 int(scales_dev["act_down"][li]), int(stream),
             )
-            # ── down GEMM → fp16 ──────────────────────────────────────
-            gemm.fp8_nn_dev(
+            # ── down GEMM → fp16 (host-alpha epilogue) ────────────────
+            gemm.fp8_nn_bias(
                 gu_fp8_ptr, int(weights["down_w"][li]), o_out_ptr,
-                S, D, FF,
-                int(scales_dev["act_down"][li]), int(weights["d_w_down"][li]),
-                int(stream),
+                int(bufs["zero_bias"]), S, D, FF,
+                float(weights["alpha_down"][li]), int(stream),
             )
 
         # ── Residual 2 ────────────────────────────────────────────────
