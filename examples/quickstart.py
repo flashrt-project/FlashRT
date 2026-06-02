@@ -78,10 +78,12 @@ def main():
                              "(LIBERO Spatial 491/500 = 98.2%%, matches FP8 "
                              "baseline). Requires Thor SM110 / SM100+.")
     parser.add_argument('--use_fp16', action='store_true',
-                        help="Pi0.5 / GROOT torch RTX only. Run a full-FP16 "
-                             "baseline (no FP8 quantization, no calibration) "
-                             "as an A/B precision reference. Requires "
-                             "hardware in {rtx_sm120, rtx_sm89}.")
+                        help="Run a full-FP16 baseline (no FP8 quantization, "
+                             "no calibration) as an A/B precision reference. "
+                             "Pi0.5/GROOT torch on RTX {rtx_sm120, rtx_sm89}, "
+                             "or GROOT N1.6 torch on Thor. (GROOT N1.7 is "
+                             "aux-driven; call load_model directly, not this "
+                             "predict() quickstart.)")
     args = parser.parse_args()
 
     # ══════════════════════════════════════════

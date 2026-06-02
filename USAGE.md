@@ -178,7 +178,7 @@ model = flash_rt.load_model(
 | `awq_alpha` | `float` | `0.5` | AWQ scaling exponent `s[k] = (a[k]/a.mean())^alpha`. |
 | `use_p1_split_gu` | `bool` \| `None` | `None` | P1 split-GU 2-GEMM path (parity on Pi0.5, kernel reusable for Pi0.6). `None` → resolved by the `use_fp4` preset. |
 | `use_fp8` | `bool` | `True` | Enable the selected frontend's FP8 path when available. Set `False` for BF16 fallback or for the opt-in Pi0.5 RTX FP16 path. |
-| `use_fp16` | `bool` | `False` | **Pi0.5 / GROOT N1.6 / GROOT N1.7 torch RTX SM120/SM89.** Opt-in non-quantized full-FP16 path (A/B reference against the FP8/bf16 default). Requires `use_fp8=False`; other hardware/configs raise a clear error. See [RTX full-FP16 opt-in path](#rtx-full-fp16-opt-in-path-pi05--groot). |
+| `use_fp16` | `bool` | `False` | Opt-in non-quantized full-FP16 path (A/B reference against the FP8/bf16 default). Supported: **Pi0.5 / GROOT N1.6 / GROOT N1.7 torch on RTX SM120/SM89**, and **GROOT N1.6 / GROOT N1.7 torch on Thor (SM110)**. Requires `use_fp8=False`; other hardware/configs raise a clear error. See the RTX and Thor full-FP16 sections below. |
 | `num_steps` | `int\|None` | `None` | Pi0/Pi0.5 torch frontends. Flow-matching denoise steps; `None` uses the frontend default. |
 | `vision_pool_factor` | `int\|None` | `None` | Pi0.5 torch RTX/Orin. Spatial pooling factor for vision tokens. The FP16 RTX path currently supports only `1`. |
 | `vision_num_layers` | `int\|None` | `None` | Pi0.5 torch RTX/Orin. Number of SigLIP vision layers to run. |
@@ -389,6 +389,65 @@ bf16 path — the DiT GEMMs are small, so FP16 and bf16 throughput match).
 
 The underlying FP16 kernels are SM80-family friendly; FlashRT exposes the
 FP16 route for Pi0.5, GROOT N1.6, and GROOT N1.7 on the RTX frontends.
+
+### Thor full-FP16 path (GROOT N1.6 / N1.7)
+
+Thor (SM110) defaults to FP8 for both GROOT N1.6 and N1.7. The full-FP16
+route is the **opt-in non-quantized A/B reference** for those FP8 paths: it
+runs the identical fully-kernelized pipeline with every GEMM in FP16 (the
+graph-safe `fp16_nn` path) instead of per-tensor FP8, with no activation
+calibration. No PyTorch matmul touches the feature path. Enable it with
+`use_fp8=False, use_fp16=True`.
+
+#### GROOT N1.6 (Thor)
+
+Same `set_prompt` / `predict` contract as the FP8 path:
+
+```python
+model = flash_rt.load_model(
+    "/path/to/GR00T-N1.6-3B",
+    framework="torch",
+    config="groot",
+    hardware="thor",
+    num_views=2,
+    embodiment_tag="gr1",
+    use_fp8=False,
+    use_fp16=True,
+)
+actions = model.predict(images=[base_img, wrist_img], prompt="pick up the block")
+```
+
+Reference (Jetson AGX Thor, CUDA-event E2E P50): FP8 default ≈ 44 ms, FP16
+≈ 65 ms; FP16-vs-FP8 action cosine ≈ 0.99996 (fixed denoise noise). FP16 is
+slower (precision↔speed trade-off) — use it as an accuracy reference, not
+for production latency.
+
+#### GROOT N1.7 (Thor)
+
+N1.7 uses the aux-driven `set_prompt(aux=...)` / `infer(state, initial_noise=...)`
+contract (not `predict(images=...)`). `load_model(config="groot_n17",
+hardware="thor", use_fp8=False, use_fp16=True)` returns the full-FP16
+frontend; the FP8 default is `use_fp8=True`. Both share the same bf16 DiT,
+so only the one-time `set_prompt` backbone differs in precision.
+
+```python
+from flash_rt.frontends.torch.groot_n17_thor_fp16 import (
+    GrootN17TorchFrontendThorFP16,
+)
+
+fe = GrootN17TorchFrontendThorFP16(
+    "/path/to/GR00T-N1.7-3B",
+    num_views=2,
+    embodiment_tag="oxe_droid_relative_eef_relative_joint",
+)
+fe.set_prompt(aux=aux)                       # aux from the N1.7 preprocessing path
+actions = fe.infer(state_normalized, initial_noise=noise)
+```
+
+Reference (Jetson AGX Thor): backbone cosine vs the HF reference ≈ 0.9996
+(FP16) vs ≈ 0.9946 (FP8) — the FP16 backbone is the tighter accuracy
+baseline. Per-frame DiT `infer` P50 ≈ 41 ms (identical for both, the DiT is
+bf16); the backbone runs once per prompt in `set_prompt` and is cached.
 
 ### GROOT N1.7 RTX
 
