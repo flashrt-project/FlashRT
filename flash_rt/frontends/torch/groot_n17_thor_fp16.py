@@ -1,12 +1,12 @@
-"""FlashRT -- GROOT N1.7 Thor full-FP16 reference frontend.
+"""FlashRT -- GROOT N1.7 Thor FP16 *backbone* reference frontend.
 
-A non-quantized FP16 A/B reference for the FP8 Thor serving frontend
-(:class:`GrootN17TorchFrontendThorFP8`). It runs the identical fully-kernelized
-ViT -> DeepStack -> LLM -> vlln -> VL-self-attn backbone, with every stage's
-GEMMs executed through the cuBLASLt ``fp16_nn`` path on the shadow weights
-instead of per-tensor FP8. There is no PyTorch matmul/attention on the feature
-path and no activation calibration; the only difference from the FP8 frontend
-is GEMM precision. The DiT action head is already bf16 in both frontends.
+This is NOT a full-model FP16 path. It is an A/B reference for the FP8 Thor
+serving frontend (:class:`GrootN17TorchFrontendThorFP8`) that runs only the
+vision/language *backbone* (ViT -> DeepStack -> LLM -> vlln -> VL-self-attn)
+in FP16: every backbone-stage GEMM goes through the cuBLASLt ``fp16_nn`` path
+on the shadow weights instead of per-tensor FP8, with no activation
+calibration. The DiT action head is unchanged — it runs the same production
+FP8 CUDA graph as the default frontend.
 
 Useful for validating the FP8 backbone cosine against a kernel FP16 baseline.
 """
@@ -19,7 +19,10 @@ from flash_rt.frontends.torch.groot_n17_thor_fp8 import (
 
 
 class GrootN17TorchFrontendThorFP16(GrootN17TorchFrontendThorFP8):
-    """N1.7 Thor full-FP16 reference backbone (ViT/DeepStack/LLM/VL-self-attn).
+    """N1.7 Thor FP16 *backbone* reference (ViT/DeepStack/LLM/VL-self-attn).
+
+    Backbone GEMMs only run in FP16; the DiT action head stays on the
+    production FP8 graph. This is not a full-model FP16 path.
 
     Flips the shared ``_run_kernel_backbone`` to feed every stage its fp16
     shadow weights through ``fp16_nn`` (``_KBB_USE_FP8 = False``). The LLM
