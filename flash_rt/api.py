@@ -449,8 +449,9 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             )
             pipe_cls = GrootTorchFrontendThorFP16
         elif config == "groot_n17" and framework == "torch" and arch == "thor":
-            # N1.7 Thor full-FP16 reference: ViT / DeepStack / LLM /
-            # VL-self-attn all run fp16_nn on the shadow weights (bf16 DiT).
+            # N1.7 Thor FP16 backbone reference: ViT / DeepStack / LLM /
+            # VL-self-attn all run fp16_nn on the shadow weights. The DiT
+            # action head runs the production FP8 graph (shared base class).
             from flash_rt.frontends.torch.groot_n17_thor_fp16 import (
                 GrootN17TorchFrontendThorFP16,
             )

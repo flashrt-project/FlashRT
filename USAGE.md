@@ -425,29 +425,46 @@ for production latency.
 #### GROOT N1.7 (Thor)
 
 N1.7 uses the aux-driven `set_prompt(aux=...)` / `infer(state, initial_noise=...)`
-contract (not `predict(images=...)`). `load_model(config="groot_n17",
-hardware="thor", use_fp8=False, use_fp16=True)` returns the full-FP16
-frontend; the FP8 default is `use_fp8=True`. Both share the same bf16 DiT,
-so only the one-time `set_prompt` backbone differs in precision.
+contract (not `predict(images=...)`). **The default on Thor is FP8**
+(`use_fp8=True`): the vision backbone (ViT / DeepStack / LLM / VL-self-attn)
+and the DiT action head both run per-tensor FP8 through the host-alpha GEMM
+epilogues. The whole per-frame path is two static CUDA graphs — a vision
+backbone graph and an action graph (cross-KV refresh + state encode + all
+diffusion steps) — with no Python/torch compute on the hot path.
 
 ```python
-from flash_rt.frontends.torch.groot_n17_thor_fp16 import (
-    GrootN17TorchFrontendThorFP16,
-)
+import flash_rt
 
-fe = GrootN17TorchFrontendThorFP16(
+# FP8 default (no flags needed)
+fe = flash_rt.load_model(
     "/path/to/GR00T-N1.7-3B",
-    num_views=2,
-    embodiment_tag="oxe_droid_relative_eef_relative_joint",
+    framework="torch", config="groot_n17", hardware="thor",
+    num_views=2, embodiment_tag="oxe_droid_relative_eef_relative_joint",
 )
-fe.set_prompt(aux=aux)                       # aux from the N1.7 preprocessing path
+fe.set_prompt(aux=aux)                          # aux from the N1.7 preprocessing path
 actions = fe.infer(state_normalized, initial_noise=noise)
 ```
 
-Reference (Jetson AGX Thor): backbone cosine vs the HF reference ≈ 0.9996
-(FP16) vs ≈ 0.9946 (FP8) — the FP16 backbone is the tighter accuracy
-baseline. Per-frame DiT `infer` P50 ≈ 41 ms (identical for both, the DiT is
-bf16); the backbone runs once per prompt in `set_prompt` and is cached.
+Reference (Jetson AGX Thor, wall-clock per-frame image→action e2e):
+**≈ 49 ms** — vision backbone graph ≈ 24 ms + action graph ≈ 26 ms.
+Action cosine vs the FP16-backbone reference ≈ 0.9999; replays are
+bit-identical.
+
+**FP16 backbone reference (opt-in A/B).** `use_fp8=False, use_fp16=True`
+returns a reference frontend whose backbone runs every GEMM in fp16 (the
+tighter backbone-vs-HF cosine); the DiT action head still runs the
+production FP8 graph. Use it to validate the FP8 backbone, not for
+production latency.
+
+```python
+fe = flash_rt.load_model(
+    "/path/to/GR00T-N1.7-3B",
+    framework="torch", config="groot_n17", hardware="thor",
+    use_fp8=False, use_fp16=True,
+    num_views=2, embodiment_tag="oxe_droid_relative_eef_relative_joint",
+)
+# equivalently: GrootN17TorchFrontendThorFP16(checkpoint, num_views=2, embodiment_tag=...)
+```
 
 ### GROOT N1.7 RTX
 
