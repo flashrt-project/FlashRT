@@ -459,12 +459,14 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
         hi_prec = li in fp16_set
 
         # ── Pre-attn RMSNorm ───────────────────────────────────────────
-        fvk.rms_norm_fp16(
-            h_ptr, int(weights["in_ln_w"][li]), xn_ptr,
-            S, D, 1e-6, int(stream),
-        )
-
+        # FP8 path fuses RMSNorm + quantize into one kernel (the norm output
+        # feeds only the FP8 QKV GEMMs). fp16-protected layers keep the bf16
+        # RMSNorm so the fp16 GEMMs can read it.
         if hi_prec:
+            fvk.rms_norm_fp16(
+                h_ptr, int(weights["in_ln_w"][li]), xn_ptr,
+                S, D, 1e-6, int(stream),
+            )
             # fp16-protected QKV: GEMM straight off the fp16 RMSNorm output.
             gemm.fp16_nn(xn_ptr, int(weights["q_w_fp16"][li]), Q_ptr,
                          S, NHQ * HD, D, int(stream))
@@ -473,10 +475,9 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
             gemm.fp16_nn(xn_ptr, int(weights["v_w_fp16"][li]), V_ptr,
                          S, NHKV * HD, D, int(stream))
         else:
-            # ── Quantize xn for Q/K/V (single shared act scale) ────────
-            fvk.quantize_fp8_static_fp16(
-                xn_ptr, xn_fp8_ptr, int(scales_dev["act_qkv"][li]),
-                S * D, int(stream),
+            fvk.rms_norm_fp8_fp16(
+                h_ptr, int(weights["in_ln_w"][li]), xn_fp8_ptr,
+                S, D, 1e-6, int(scales_dev["act_qkv"][li]), int(stream),
             )
             # ── 3 split FP8 GEMMs ─────────────────────────────────────
             # Use the host-alpha epilogue (alpha = act_scale × weight_scale);
@@ -536,25 +537,22 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
                 float(weights["alpha_o"][li]), int(stream),
             )
 
-        # ── Residual 1 ────────────────────────────────────────────────
-        fvk.residual_add_fp16(h_ptr, o_out_ptr, S * D, int(stream))
-
-        # ── Pre-FFN RMSNorm ───────────────────────────────────────────
-        fvk.rms_norm_fp16(
-            h_ptr, int(weights["post_ln_w"][li]), xn_ptr,
-            S, D, 1e-6, int(stream),
-        )
-
+        # ── Residual 1 + Pre-FFN RMSNorm ──────────────────────────────
+        # FP8 path fuses residual-add + RMSNorm + quantize into one kernel.
         if hi_prec:
+            fvk.residual_add_fp16(h_ptr, o_out_ptr, S * D, int(stream))
+            fvk.rms_norm_fp16(
+                h_ptr, int(weights["post_ln_w"][li]), xn_ptr,
+                S, D, 1e-6, int(stream),
+            )
             gemm.fp16_nn(xn_ptr, int(weights["gate_w_fp16"][li]), gate_ptr,
                          S, FF, D, int(stream))
             gemm.fp16_nn(xn_ptr, int(weights["up_w_fp16"][li]), up_ptr,
                          S, FF, D, int(stream))
         else:
-            # ── Quantize xn for gate+up (shared act scale) ────────────
-            fvk.quantize_fp8_static_fp16(
-                xn_ptr, xn_fp8_ptr, int(scales_dev["act_gateup"][li]),
-                S * D, int(stream),
+            fvk.residual_add_rms_norm_fp8_fp16(
+                h_ptr, o_out_ptr, int(weights["post_ln_w"][li]), xn_fp8_ptr,
+                S, D, 1e-6, int(scales_dev["act_gateup"][li]), int(stream),
             )
             # ── gate / up FP8 GEMMs → fp16 outputs (host-alpha epilogue) ─
             zb = int(bufs["zero_bias"])
