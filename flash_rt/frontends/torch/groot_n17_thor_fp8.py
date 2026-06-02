@@ -186,8 +186,14 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
         # Activation scales: warm cache load (no torch) or one-time shadow.
         self._ensure_act_scales(aux)
 
-        # FP8 KERNEL backbone — no torch matmul on the serving feature path.
-        self._backbone_features = self._run_kernel_backbone(aux).half()
+        # FP8 KERNEL backbone — built once, then captured as a single CUDA
+        # graph so the per-observation hot path is one graph replay with zero
+        # Python launch overhead. The graph is the producer of the backbone
+        # features (and is reusable for a new observation via
+        # ``run_backbone_graph``); no torch matmul touches the feature path.
+        self._run_kernel_backbone(aux)
+        self._capture_backbone_graph()
+        self._backbone_features = self.run_backbone_graph(aux).clone().half()
 
         try:
             self._warmup_infer()
@@ -334,9 +340,14 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
         tap_layers = (5, 11, 17)
         tap_bufs = {l: buf(Sv, 1024) for l in tap_layers}
 
+        # Mutable stream cell so the DeepStack tap copies land on the same
+        # stream as the rest of the backbone (required under graph capture).
+        scell = [0]
+        self._kbb_scell = scell
+
         def mk_cb(l):
             def cb(h_ptr):
-                fvkm.gpu_copy(tap_bufs[l].data_ptr(), int(h_ptr), Sv * 1024 * 2, 0)
+                fvkm.gpu_copy(tap_bufs[l].data_ptr(), int(h_ptr), Sv * 1024 * 2, scell[0])
             return cb
         dcap = [mk_cb(l) for l in tap_layers]
 
@@ -368,25 +379,30 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
         ds_scales = None if fp16_ref else {
             "act_fc1": adv(self._dsm_act_fc1_dev),
             "act_fc2": adv(self._dsm_act_fc2_dev)}
+        ds_bufs = {"in": [tap_bufs[l].data_ptr() for l in tap_layers],
+                   "ln_out": buf(Nout, 4096).data_ptr(),
+                   "fp8_scratch": buf8(Nout, 4096).data_ptr(),
+                   "fc1_out": buf(Nout, 4096).data_ptr(),
+                   "out": [t.data_ptr() for t in ds_out]}
         P.deepstack_merge_forward(
-            gemm=gemm, fvk=fvkm,
-            bufs={"in": [tap_bufs[l].data_ptr() for l in tap_layers],
-                  "ln_out": buf(Nout, 4096).data_ptr(),
-                  "fp8_scratch": buf8(Nout, 4096).data_ptr(),
-                  "fc1_out": buf(Nout, 4096).data_ptr(),
-                  "out": [t.data_ptr() for t in ds_out]},
+            gemm=gemm, fvk=fvkm, bufs=ds_bufs,
             weights=dsw, scales_dev=ds_scales,
             dims={"Nin": Sv, "Din": 1024, "Nout": Nout, "Dmid": 4096, "Dout": 2048},
             use_fp8=self._KBB_USE_FP8)
 
         # DeepStack inject buffers (Se, 2048) — zero except visual positions.
+        # Scatter via a fixed index_copy (capturable; bit-identical between the
+        # eager and the graph paths).
         mask = self._visual_pos_masks
+        vis_idx = K(mask.reshape(-1).nonzero(as_tuple=True)[0].to(torch.long))
         inject = [0] * 16
+        injb = []
         for j in range(3):
             ib = buf(Se, 2048)
             ib.zero_()
-            ib[mask] = ds_out[j]
+            ib.index_copy_(0, vis_idx, ds_out[j])
             inject[j] = ib.data_ptr()
+            injb.append(ib)
 
         # ═══ LLM (16L, causal, GQA) ═══
         llm_h = buf(Se, 2048)
@@ -500,15 +516,85 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
         vsa_scales = None if fp16_ref else {
             "act_qkv": adv(self._vlsa_act_qkv_dev), "act_o": adv(self._vlsa_act_o_dev),
             "act_fc1": adv(self._vlsa_act_fc1_dev), "act_fc2": adv(self._vlsa_act_fc2_dev)}
+        vsa_bufs = {"h": vlsa_h.data_ptr(), "xn": buf(Se, 2048).data_ptr(),
+                    "xn_fp8": buf8(Se, 2048).data_ptr(),
+                    "o_proj_out": buf(Se, 2048).data_ptr(),
+                    "fc1_out": buf(Se, 8192).data_ptr(),
+                    "fc1_fp8": buf8(Se, 8192).data_ptr()}
         P.vl_self_attn_forward(
-            gemm=gemm, fvk=fvkm,
-            bufs={"h": vlsa_h.data_ptr(), "xn": buf(Se, 2048).data_ptr(),
-                  "xn_fp8": buf8(Se, 2048).data_ptr(),
-                  "o_proj_out": buf(Se, 2048).data_ptr(),
-                  "fc1_out": buf(Se, 8192).data_ptr(),
-                  "fc1_fp8": buf8(Se, 8192).data_ptr()},
+            gemm=gemm, fvk=fvkm, bufs=vsa_bufs,
             weights=vsw, scales_dev=vsa_scales,
             dims={"T": Se, "D": 2048, "NH": 32, "HD": 64, "ff_inner": 8192},
             attn=attn, use_fp8=self._KBB_USE_FP8)
         torch.cuda.synchronize()
+
+        # ── Stash a graph-capturable pure-kernel forward over the persistent
+        # buffers above (no Python dict rebuild, no torch input prep). Inputs
+        # (pixel_features / llm_input_embeds) are written into vit_h / llm_h by
+        # the caller before replay; the DeepStack inject scatter uses a fixed
+        # index_copy (capturable) instead of boolean-mask assignment. ──
+        vit_dims = {"S": Sv, "D": 1024, "NH": 16, "HD": 64,
+                    "ff_inner": 4096, "Sper_view": Sv // nv}
+        ds_dims = {"Nin": Sv, "Din": 1024, "Nout": Nout, "Dmid": 4096, "Dout": 2048}
+        llm_dims = {"S": Se, "D": 2048, "NHQ": 16, "NHKV": 8, "HD": 128, "FF": 6144}
+        vlln_bufs = {"x": llm_h.data_ptr(), "out": vlsa_h.data_ptr()}
+        vlln_w = {"vlln_w": self._vlln_w.data_ptr(), "vlln_b": self._vlln_b.data_ptr()}
+        vsa_dims = {"T": Se, "D": 2048, "NH": 32, "HD": 64, "ff_inner": 8192}
+        use_fp8 = self._KBB_USE_FP8
+
+        def _kbb_forward(s=0):
+            scell[0] = s
+            P.qwen3vl_vit_forward(gemm=gemm, fvk=fvkm, bufs=vit_bufs, weights=vw,
+                                  scales_dev=vit_scales, dims=vit_dims, attn=attn,
+                                  deepstack_taps=tap_layers, deepstack_capture=dcap,
+                                  use_fp8=use_fp8, stream=s)
+            P.deepstack_merge_forward(gemm=gemm, fvk=fvkm, bufs=ds_bufs, weights=dsw,
+                                      scales_dev=ds_scales, dims=ds_dims,
+                                      use_fp8=use_fp8, stream=s)
+            for j in range(3):
+                injb[j].zero_()
+                injb[j].index_copy_(0, vis_idx, ds_out[j])
+            P.qwen3vl_llm_forward(gemm=gemm, fvk=fvkm, bufs=llm_bufs, weights=lw,
+                                  scales_dev=llm_scales, dims=llm_dims, attn=attn,
+                                  fp16_layers=self.PROTECT_LLM_FP16, stream=s)
+            P.vlln_forward(gemm=None, fvk=fvkm, bufs=vlln_bufs, weights=vlln_w,
+                           dims={"S": Se, "D": 2048}, stream=s)
+            P.vl_self_attn_forward(gemm=gemm, fvk=fvkm, bufs=vsa_bufs, weights=vsw,
+                                   scales_dev=vsa_scales, dims=vsa_dims, attn=attn,
+                                   use_fp8=use_fp8, stream=s)
+            return vlsa_h
+        self._kbb_forward = _kbb_forward
+        self._kbb_vit_h = vit_h
+        self._kbb_llm_h = llm_h
+        self._kbb_vlsa_h = vlsa_h
         return vlsa_h.unsqueeze(0)
+
+    # ── Backbone CUDA graph: capture the full ViT→DeepStack→LLM→VLSA kernel
+    # chain once so the per-observation hot path is a single graph replay with
+    # zero Python launch overhead (the inputs are copied into the persistent
+    # vit_h / llm_h buffers before replay). Requires _run_kernel_backbone to
+    # have run once (it stashes the pure-kernel forward closure). ──
+    def _capture_backbone_graph(self) -> None:
+        s = torch.cuda.Stream()
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                self._kbb_forward(s.cuda_stream)
+        torch.cuda.synchronize()
+        self._kbb_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(s):
+            self._kbb_graph.capture_begin()
+            self._kbb_forward(s.cuda_stream)
+            self._kbb_graph.capture_end()
+        torch.cuda.synchronize()
+        self._kbb_scell[0] = 0  # replay runs on the default stream
+
+    def run_backbone_graph(self, aux: dict) -> "torch.Tensor":
+        """Per-observation hot path: write fresh inputs into the persistent
+        buffers and replay the captured backbone graph."""
+        dev = self.device
+        self._kbb_vit_h.copy_(
+            aux["pixel_features"].to(dev).half().reshape(self._S_vit, 1024))
+        self._kbb_llm_h.copy_(
+            aux["llm_input_embeds"].to(dev).half().reshape(self.Se, 2048))
+        self._kbb_graph.replay()
+        return self._kbb_vlsa_h.unsqueeze(0)
