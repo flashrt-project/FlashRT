@@ -554,17 +554,20 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
             # Host alphas (act_scale × weight_scale) for the fp8_nn_bias
             # epilogue — the correct path (device A/B-scale fp8_nn_dev is
             # mis-scaled on this build). act scales are static (calibrated).
-            a_qkv = float(self._llm_act_qkv_dev[li].item())
-            a_o = float(self._llm_act_o_dev[li].item())
-            a_gu = float(self._llm_act_gateup_dev[li].item())
-            a_dn = float(self._llm_act_down_dev[li].item())
-            wq = self._llm_alpha[li * 5 + 0]
-            lw["alpha_q"].append(a_qkv * wq); lw["alpha_k"].append(a_qkv * wq)
-            lw["alpha_v"].append(a_qkv * wq)
-            lw["alpha_o"].append(a_o * self._llm_alpha[li * 5 + 1])
-            lw["alpha_gate"].append(a_gu * self._llm_alpha[li * 5 + 2])
-            lw["alpha_up"].append(a_gu * self._llm_alpha[li * 5 + 3])
-            lw["alpha_down"].append(a_dn * self._llm_alpha[li * 5 + 4])
+            # Only the FP8 path needs them; the FP16 reference (fp16_ref) runs
+            # every LLM layer fp16 and has no FP8 act scales.
+            if not fp16_ref:
+                a_qkv = float(self._llm_act_qkv_dev[li].item())
+                a_o = float(self._llm_act_o_dev[li].item())
+                a_gu = float(self._llm_act_gateup_dev[li].item())
+                a_dn = float(self._llm_act_down_dev[li].item())
+                wq = self._llm_alpha[li * 5 + 0]
+                lw["alpha_q"].append(a_qkv * wq); lw["alpha_k"].append(a_qkv * wq)
+                lw["alpha_v"].append(a_qkv * wq)
+                lw["alpha_o"].append(a_o * self._llm_alpha[li * 5 + 1])
+                lw["alpha_gate"].append(a_gu * self._llm_alpha[li * 5 + 2])
+                lw["alpha_up"].append(a_gu * self._llm_alpha[li * 5 + 3])
+                lw["alpha_down"].append(a_dn * self._llm_alpha[li * 5 + 4])
             # fp16-protect weight ptrs (only valid for protected layers; 0
             # elsewhere — qwen3vl_llm_forward only reads them for fp16_layers).
             if (li, "q") in prot:

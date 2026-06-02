@@ -23,10 +23,13 @@ class GrootN17TorchFrontendThorFP16(GrootN17TorchFrontendThorFP8):
 
     Flips the shared ``_run_kernel_backbone`` to feed every stage its fp16
     shadow weights through ``fp16_nn`` (``_KBB_USE_FP8 = False``). The LLM
-    already runs fully fp16 via ``PROTECT_LLM_FP16``.
+    runs fully fp16 — ``PROTECT_LLM_FP16`` is forced to all 16 layers here
+    (the FP8 frontend defaults it to empty), since this reference computes
+    no FP8 activation scales.
     """
 
     _KBB_USE_FP8 = False
+    PROTECT_LLM_FP16 = tuple(range(16))
 
     def _ensure_act_scales(self, aux: dict) -> None:
         """No activation calibration in the FP16 reference.
