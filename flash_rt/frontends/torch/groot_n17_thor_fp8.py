@@ -42,6 +42,12 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
     # the N1.6 precedent of fp16 for the precision-sensitive sub-modules.
     PROTECT_LLM_FP16 = tuple(range(16))
 
+    # ViT / DeepStack / VL-self-attn GEMM precision. The FP8 production
+    # frontend keeps these stages in FP8; the full-FP16 reference subclass
+    # (:class:`GrootN17TorchFrontendThorFP16`) flips this to run them through
+    # the fp16_nn path on the shadow weights, with no activation calibration.
+    _KBB_USE_FP8 = True
+
     def _load_llm_protect_fp16(self) -> None:
         """Load fp16 q/k/v/o/gate/up weights for the protected LLM layers.
 
@@ -203,6 +209,13 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
         dev = self.device
         Sv, nv, Se = self._S_vit, self._num_vit_views, self.Se
 
+        # Full-FP16 reference: run ViT / DeepStack / VL-self-attn through
+        # fp16_nn on the shadow weights instead of FP8. The shadow holds [K, N]
+        # fp16 GEMM weights for every stage; biases/norms are shared with the
+        # FP8 path. No activation scales are needed in this mode.
+        fp16_ref = not self._KBB_USE_FP8
+        sh = self._fp16_shadow_weights if fp16_ref else None
+
         keep: list = []
         self._kbb_keep = keep
 
@@ -297,6 +310,16 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
             vw["fc1_b"].append(self._vit_fc1_b[li].data_ptr())
             vw["fc2_w"].append(self._vit_fc2_w[li].data_ptr())
             vw["fc2_b"].append(self._vit_fc2_b[li].data_ptr())
+            if fp16_ref:
+                # Split the fused [K, 3N] shadow qkv into per-projection [K, N].
+                qkv16 = sh[("vit", li, "qkv")]
+                vw.setdefault("q_w_fp16", []).append(K(qkv16[:, :1024].contiguous()).data_ptr())
+                vw.setdefault("k_w_fp16", []).append(K(qkv16[:, 1024:2048].contiguous()).data_ptr())
+                vw.setdefault("v_w_fp16", []).append(K(qkv16[:, 2048:].contiguous()).data_ptr())
+                vw.setdefault("o_w_fp16", []).append(sh[("vit", li, "o")].data_ptr())
+                vw.setdefault("fc1_w_fp16", []).append(sh[("vit", li, "fc1")].data_ptr())
+                vw.setdefault("fc2_w_fp16", []).append(sh[("vit", li, "fc2")].data_ptr())
+                continue
             # qkv is fused → single weight scale shared across q/k/v.
             vw["alpha_q"].append(self._vit_alpha_q[li])
             vw["alpha_k"].append(self._vit_alpha_q[li])
@@ -304,7 +327,7 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
             vw["alpha_o"].append(self._vit_alpha_o[li])
             vw["alpha_fc1"].append(self._vit_alpha_fc1[li])
             vw["alpha_fc2"].append(self._vit_alpha_fc2[li])
-        vit_scales = {
+        vit_scales = None if fp16_ref else {
             "act_qkv": adv(self._vit_act_qkv_dev), "act_o": adv(self._vit_act_o_dev),
             "act_fc1": adv(self._vit_act_fc1_dev), "act_fc2": adv(self._vit_act_fc2_dev)}
 
@@ -321,7 +344,8 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
             gemm=gemm, fvk=fvkm, bufs=vit_bufs, weights=vw, scales_dev=vit_scales,
             dims={"S": Sv, "D": 1024, "NH": 16, "HD": 64,
                   "ff_inner": 4096, "Sper_view": Sv // nv},
-            attn=attn, deepstack_taps=tap_layers, deepstack_capture=dcap)
+            attn=attn, deepstack_taps=tap_layers, deepstack_capture=dcap,
+            use_fp8=self._KBB_USE_FP8)
 
         # ═══ DeepStack (3 mergers) ═══
         Nout = Sv // 4
@@ -335,10 +359,15 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
             dsw["fc1_b"].append(getattr(self, f"_dsm{j}_fc1_b").data_ptr())
             dsw["fc2_w"].append(getattr(self, f"_dsm{j}_fc2_w").data_ptr())
             dsw["fc2_b"].append(getattr(self, f"_dsm{j}_fc2_b").data_ptr())
+            if fp16_ref:
+                dsw.setdefault("fc1_w_fp16", []).append(sh[("dsm", j, "fc1")].data_ptr())
+                dsw.setdefault("fc2_w_fp16", []).append(sh[("dsm", j, "fc2")].data_ptr())
+                continue
             dsw["alpha_fc1"].append(self._dsm_alpha_fc1[j])
             dsw["alpha_fc2"].append(self._dsm_alpha_fc2[j])
-        ds_scales = {"act_fc1": adv(self._dsm_act_fc1_dev),
-                     "act_fc2": adv(self._dsm_act_fc2_dev)}
+        ds_scales = None if fp16_ref else {
+            "act_fc1": adv(self._dsm_act_fc1_dev),
+            "act_fc2": adv(self._dsm_act_fc2_dev)}
         P.deepstack_merge_forward(
             gemm=gemm, fvk=fvkm,
             bufs={"in": [tap_bufs[l].data_ptr() for l in tap_layers],
@@ -347,7 +376,8 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
                   "fc1_out": buf(Nout, 4096).data_ptr(),
                   "out": [t.data_ptr() for t in ds_out]},
             weights=dsw, scales_dev=ds_scales,
-            dims={"Nin": Sv, "Din": 1024, "Nout": Nout, "Dmid": 4096, "Dout": 2048})
+            dims={"Nin": Sv, "Din": 1024, "Nout": Nout, "Dmid": 4096, "Dout": 2048},
+            use_fp8=self._KBB_USE_FP8)
 
         # DeepStack inject buffers (Se, 2048) — zero except visual positions.
         mask = self._visual_pos_masks
@@ -408,7 +438,7 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
                 for kk2 in ("q_w_fp16", "k_w_fp16", "v_w_fp16", "o_w_fp16",
                             "gate_w_fp16", "up_w_fp16", "down_w_fp16"):
                     lw[kk2].append(0)
-        llm_scales = {
+        llm_scales = None if fp16_ref else {
             "act_qkv": adv(self._llm_act_qkv_dev), "act_o": adv(self._llm_act_o_dev),
             "act_gateup": adv(self._llm_act_gateup_dev),
             "act_down": adv(self._llm_act_down_dev)}
@@ -457,13 +487,17 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
             vsw["fc1_b"].append(self._vlsa_fc1_b[li].data_ptr())
             vsw["fc2_w"].append(self._vlsa_fc2_w[li].data_ptr())
             vsw["fc2_b"].append(self._vlsa_fc2_b[li].data_ptr())
+            if fp16_ref:
+                for nm in ("q", "k", "v", "o", "fc1", "fc2"):
+                    vsw.setdefault(f"{nm}_w_fp16", []).append(sh[("vlsa", li, nm)].data_ptr())
+                continue
             vsw["alpha_q"].append(self._vlsa_alpha_q[li])
             vsw["alpha_k"].append(self._vlsa_alpha_k[li])
             vsw["alpha_v"].append(self._vlsa_alpha_v[li])
             vsw["alpha_o"].append(self._vlsa_alpha_o[li])
             vsw["alpha_fc1"].append(self._vlsa_alpha_fc1[li])
             vsw["alpha_fc2"].append(self._vlsa_alpha_fc2[li])
-        vsa_scales = {
+        vsa_scales = None if fp16_ref else {
             "act_qkv": adv(self._vlsa_act_qkv_dev), "act_o": adv(self._vlsa_act_o_dev),
             "act_fc1": adv(self._vlsa_act_fc1_dev), "act_fc2": adv(self._vlsa_act_fc2_dev)}
         P.vl_self_attn_forward(
@@ -475,6 +509,6 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
                   "fc1_fp8": buf8(Se, 8192).data_ptr()},
             weights=vsw, scales_dev=vsa_scales,
             dims={"T": Se, "D": 2048, "NH": 32, "HD": 64, "ff_inner": 8192},
-            attn=attn)
+            attn=attn, use_fp8=self._KBB_USE_FP8)
         torch.cuda.synchronize()
         return vlsa_h.unsqueeze(0)
