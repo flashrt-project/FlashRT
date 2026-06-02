@@ -471,6 +471,229 @@ class GrootN17TorchFrontendThor:
             torch.cuda.synchronize()
             self._dit_graphs.append(graph)
 
+    # ────────────────────────────────────────────────────────────────
+    # Fully-kernelized DiT inner loop — the entire per-step chain
+    # (action_encode + cat + DiT + output_proj + decode + Euler) plus
+    # the once-per-frame state_encode run as CUDA graphs over persistent
+    # kernel buffers. No PyTorch compute on the per-frame hot path; the
+    # only host work between frames is two device copies (state, noise)
+    # and the graph replays.
+    #
+    # All MLP weights are materialized once as bf16 [K, N]; the DiT main
+    # path is bf16 throughout, matching the ckpt's native dtype. The
+    # action-encoder's SiLU is evaluated in fp16 (cast in/out) since the
+    # kernel library exposes SiLU only for fp16 — fp16 carries more
+    # mantissa than bf16 so this is at least as accurate as a bf16 SiLU.
+    # ────────────────────────────────────────────────────────────────
+
+    def _prepare_kernel_dit(self, num_inference_timesteps: int = 4) -> None:
+        """Materialize bf16 MLP weights + per-step constants (timestep
+        concat halves and output-projection AdaLN shift/scale) used by the
+        kernelized DiT graphs. Image-independent → computed once."""
+        if hasattr(self, "_kw"):
+            return
+        import math
+        dev = self.device
+        def b16(t):
+            return t.to(torch.bfloat16).contiguous()
+        alpha = self._dit_misc_alpha
+        self._kw = {
+            "st_l1": b16(self._st_enc_l1_W), "st_l1b": b16(self._st_enc_l1_b),
+            "st_l2": b16(self._st_enc_l2_W), "st_l2b": b16(self._st_enc_l2_b),
+            "ae_W1": b16(self._ac_enc_W1_W), "ae_b1": b16(self._ac_enc_W1_b),
+            "ae_W2": b16(self._ac_enc_W2_W), "ae_b2": b16(self._ac_enc_W2_b),
+            "ae_W3": b16(self._ac_enc_W3_W), "ae_b3": b16(self._ac_enc_W3_b),
+            # proj_out_2 is stored FP8; dequant via misc alpha[3] → bf16.
+            "po2": b16(self._proj_out_2_w.float() * alpha[3]),
+            "po2b": b16(self._proj_out_2_b),
+            "dec_l1": b16(self._ac_dec_l1_W), "dec_l1b": b16(self._ac_dec_l1_b),
+            "dec_l2": b16(self._ac_dec_l2_W), "dec_l2b": b16(self._ac_dec_l2_b),
+        }
+        self._k_pos = b16(self._ah_pos_embed_w[:40])
+
+        if not hasattr(self, "_step_temb"):
+            self._precompute_diffusion_modulators(
+                num_inference_timesteps=num_inference_timesteps)
+
+        # action-encoder timestep embedding (SinusoidalPositionalEncoding,
+        # broadcast over the action sequence) — the right half of the
+        # encoder's concat input. Matches ``_run_action_encode``.
+        half = 768
+        ex = (-torch.arange(half, dtype=torch.float32, device=dev)
+              * (math.log(10000.0) / half)).exp()
+        po1w = self._proj_out_1_w.float() * alpha[2]
+        po1b = self._proj_out_1_b.float()
+        self._k_tau, self._k_oproj_shift, self._k_oproj_scale = [], [], []
+        for s in range(num_inference_timesteps):
+            t_disc = int(s / num_inference_timesteps * 1000)
+            ts = torch.full((40,), float(t_disc), dtype=torch.float32, device=dev)
+            fr = ts.unsqueeze(-1) * ex
+            self._k_tau.append(
+                torch.cat([torch.sin(fr), torch.cos(fr)], dim=-1)
+                .to(torch.bfloat16).contiguous())
+            # output_proj AdaLN modulators: silu(temb) @ proj_out_1 → (shift, scale)
+            x = torch.nn.functional.silu(self._step_temb[s].float())
+            mod = x @ po1w + po1b
+            shift, scale = mod.chunk(2, dim=-1)
+            self._k_oproj_shift.append(b16(shift.squeeze(0)))
+            self._k_oproj_scale.append(b16(scale.squeeze(0)))
+
+    def _allocate_kernel_dit_buffers(self, action_horizon: int = 40) -> None:
+        """Persistent bf16 scratch for the kernelized DiT graphs (allocated
+        once so the data_ptr()s baked into the captured graphs stay valid)."""
+        if hasattr(self, "_k_actions"):
+            return
+        dev = self.device
+        bf = torch.bfloat16
+        def e(*shape, dtype=bf):
+            return torch.empty(*shape, dtype=dtype, device=dev)
+        self._k_state_in = torch.zeros(1, 132, dtype=bf, device=dev)
+        self._k_st_h1 = e(1, 1024)
+        self._k_state_feat = e(1, 1536)
+        self._k_actions = torch.zeros(action_horizon, 132, dtype=bf, device=dev)
+        self._k_ae_aemb = e(action_horizon, 1536)
+        self._k_ae_concat = e(action_horizon, 3072)
+        self._k_ae_i2 = e(action_horizon, 1536)
+        self._k_ae_i2f = e(action_horizon, 1536, dtype=torch.float16)
+        self._k_ae_out = e(action_horizon, 1536)
+        self._k_hmod = e(action_horizon + 1, 1536)
+        self._k_hout = e(action_horizon + 1, 1024)
+        self._k_dec_h = e(action_horizon, 1024)
+        self._k_vel = e(action_horizon, 132)
+        if not hasattr(self, "_mlp_gemm"):
+            self._mlp_gemm = self._fvk.GemmRunner()
+
+    def _capture_kernel_dit_graphs(self, num_inference_timesteps: int = 4,
+                                    action_horizon: int = 40) -> None:
+        """Capture the once-per-frame state encode and the full per-step DiT
+        chain as CUDA graphs. Replaying them (after copying the normalized
+        state and the initial noise into the persistent input buffers) yields
+        the denoised actions with zero PyTorch compute in between."""
+        from flash_rt.models.groot_n17 import pipeline_thor
+
+        Sa = action_horizon + 1
+        if not hasattr(self, "_dit_cross_K"):
+            self._precompute_dit_cross_kv()
+        if not hasattr(self, "_infer_bufs"):
+            self._allocate_infer_buffers(action_horizon)
+        if not hasattr(self, "_dit_attn"):
+            self._build_dit_attn(Sa)
+        if not hasattr(self, "_gemm"):
+            import flash_rt.flash_rt_kernels as _fvk
+            self._fvk = _fvk
+            self._gemm = _fvk.GemmRunner()
+        self._prepare_kernel_dit(num_inference_timesteps)
+        self._allocate_kernel_dit_buffers(action_horizon)
+
+        K = self._fvk
+        mg = self._mlp_gemm
+        w = self._kw
+        bufs = self._infer_bufs
+        dit_h = bufs["dit_h"].data_ptr()
+        Skv_text = int(self._dit_cross_K[0].shape[0])
+        Skv_image = int(self._dit_cross_K[1].shape[0])
+        dims = {"Sa": Sa, "D": 1536, "FF": 6144,
+                "Skv_text": Skv_text, "Skv_image": Skv_image}
+        bp = {"h": dit_h, "xn": bufs["dit_xn"].data_ptr(),
+              "o_proj_out": bufs["dit_o_proj_out"].data_ptr(),
+              "ff_proj_out": bufs["dit_ff_proj_out"].data_ptr()}
+        dt = 1.0 / num_inference_timesteps
+        # decode reads the action rows (1..Sa) of the (Sa, 1024) output_proj
+        hout_dec = self._k_hout.data_ptr() + 1024 * 2  # skip state row
+
+        def _dit_weights(step):
+            d = {"scale_msa": [t.data_ptr() for t in self._step_scales[step]],
+                 "shift_msa": [t.data_ptr() for t in self._step_shifts[step]]}
+            for key, attr in (("q_w", "_dit_q_w"), ("q_b", "_dit_q_b"),
+                              ("k_w", "_dit_k_w"), ("k_b", "_dit_k_b"),
+                              ("v_w", "_dit_v_w"), ("v_b", "_dit_v_b"),
+                              ("o_w", "_dit_o_w"), ("o_b", "_dit_o_b"),
+                              ("ff_proj_w", "_dit_ff_proj_w"),
+                              ("ff_proj_b", "_dit_ff_proj_b"),
+                              ("ff_down_w", "_dit_ff_down_w"),
+                              ("ff_down_b", "_dit_ff_down_b")):
+                d[key] = [t.data_ptr() for t in getattr(self, attr)]
+            return d
+        step_weights = [_dit_weights(s) for s in range(num_inference_timesteps)]
+
+        def _state_fwd(s):
+            mg.bf16_nn(self._k_state_in.data_ptr(), w["st_l1"].data_ptr(),
+                       self._k_st_h1.data_ptr(), 1, 1024, 132, s)
+            K.add_bias_bf16(self._k_st_h1.data_ptr(), w["st_l1b"].data_ptr(), 1, 1024, s)
+            K.relu_inplace_fp16(self._k_st_h1.data_ptr(), 1024, s)
+            mg.bf16_nn(self._k_st_h1.data_ptr(), w["st_l2"].data_ptr(),
+                       self._k_state_feat.data_ptr(), 1, 1536, 1024, s)
+            K.add_bias_bf16(self._k_state_feat.data_ptr(), w["st_l2b"].data_ptr(), 1, 1536, s)
+
+        def _step_fwd(step, s):
+            T = action_horizon
+            # action_encode: W1 (no act) → cat[a_emb, tau] → W2 → SiLU → W3
+            mg.bf16_nn(self._k_actions.data_ptr(), w["ae_W1"].data_ptr(),
+                       self._k_ae_aemb.data_ptr(), T, 1536, 132, s)
+            K.add_bias_bf16(self._k_ae_aemb.data_ptr(), w["ae_b1"].data_ptr(), T, 1536, s)
+            K.concat2_bf16(self._k_ae_aemb.data_ptr(), self._k_tau[step].data_ptr(),
+                           self._k_ae_concat.data_ptr(), T, 1536, 1536, s)
+            mg.bf16_nn(self._k_ae_concat.data_ptr(), w["ae_W2"].data_ptr(),
+                       self._k_ae_i2.data_ptr(), T, 1536, 3072, s)
+            K.add_bias_bf16(self._k_ae_i2.data_ptr(), w["ae_b2"].data_ptr(), T, 1536, s)
+            K.cast_bf16_to_fp16(self._k_ae_i2.data_ptr(), self._k_ae_i2f.data_ptr(), T * 1536, s)
+            K.silu_inplace_fp16(self._k_ae_i2f.data_ptr(), T * 1536, s)
+            K.cast_fp16_to_bf16(self._k_ae_i2f.data_ptr(), self._k_ae_i2.data_ptr(), T * 1536, s)
+            mg.bf16_nn(self._k_ae_i2.data_ptr(), w["ae_W3"].data_ptr(),
+                       self._k_ae_out.data_ptr(), T, 1536, 1536, s)
+            K.add_bias_bf16(self._k_ae_out.data_ptr(), w["ae_b3"].data_ptr(), T, 1536, s)
+            K.residual_add(self._k_ae_out.data_ptr(), self._k_pos.data_ptr(), T * 1536, s)
+            # DiT input: dit_h[0] = state, dit_h[1:] = action features
+            K.gpu_copy(dit_h, self._k_state_feat.data_ptr(), 1536 * 2, s)
+            K.gpu_copy(dit_h + 1536 * 2, self._k_ae_out.data_ptr(), T * 1536 * 2, s)
+            pipeline_thor.dit_forward(
+                gemm=self._gemm, fvk=K, bufs=bp, weights=step_weights[step],
+                dims=dims, attn=self._dit_attn, stream=s)
+            # output projection: AdaLN(dit_h) → proj_out_2
+            K.ada_layer_norm_bf16(dit_h, self._k_oproj_scale[step].data_ptr(),
+                                  self._k_oproj_shift[step].data_ptr(),
+                                  self._k_hmod.data_ptr(), Sa, 1536, 1e-5, s)
+            mg.bf16_nn(self._k_hmod.data_ptr(), w["po2"].data_ptr(),
+                       self._k_hout.data_ptr(), Sa, 1024, 1536, s)
+            K.add_bias_bf16(self._k_hout.data_ptr(), w["po2b"].data_ptr(), Sa, 1024, s)
+            # action_decode on the action rows → velocity
+            mg.bf16_nn(hout_dec, w["dec_l1"].data_ptr(),
+                       self._k_dec_h.data_ptr(), T, 1024, 1024, s)
+            K.add_bias_bf16(self._k_dec_h.data_ptr(), w["dec_l1b"].data_ptr(), T, 1024, s)
+            K.relu_inplace_fp16(self._k_dec_h.data_ptr(), T * 1024, s)
+            mg.bf16_nn(self._k_dec_h.data_ptr(), w["dec_l2"].data_ptr(),
+                       self._k_vel.data_ptr(), T, 132, 1024, s)
+            K.add_bias_bf16(self._k_vel.data_ptr(), w["dec_l2b"].data_ptr(), T, 132, s)
+            # Euler flow update (in place)
+            K.euler_step_bf16_out(self._k_actions.data_ptr(), self._k_vel.data_ptr(),
+                                  self._k_actions.data_ptr(), dt, T * 132, s)
+
+        self._kdit_fwd = (_state_fwd, _step_fwd)
+
+        # Warmup on the default stream to prime both GemmRunner algo caches.
+        for _ in range(3):
+            _state_fwd(0)
+            for step in range(num_inference_timesteps):
+                _step_fwd(step, 0)
+        torch.cuda.synchronize()
+
+        def _capture(fn):
+            graph = torch.cuda.CUDAGraph()
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                graph.capture_begin()
+                fn(stream.cuda_stream)
+                graph.capture_end()
+            torch.cuda.current_stream().wait_stream(stream)
+            torch.cuda.synchronize()
+            return graph
+
+        self._k_state_graph = _capture(_state_fwd)
+        self._kdit_graphs = [
+            _capture(lambda s, step=step: _step_fwd(step, s))
+            for step in range(num_inference_timesteps)]
+
     def _bake_calibration(self, out_vit, out_ds, out_llm, out_vlsa) -> None:
         """Convert per-stage amax dicts to per-layer device d_act_scale tensors
         and host alphas. After this, the production forwards have everything
@@ -810,6 +1033,31 @@ class GrootN17TorchFrontendThor:
         D = 1536
         action_dim = 132
         Sa = action_horizon + 1   # 1 state + 40 action tokens
+
+        # ── Fully-kernelized graph fast-path ──────────────────────────────
+        # Replay the once-per-frame state encode + the per-step DiT chain
+        # (action_encode + DiT + output_proj + decode + Euler), all captured
+        # as CUDA graphs over persistent kernel buffers. Zero PyTorch compute
+        # on the hot path. Captured lazily on first use behind set_prompt's
+        # warmup. Falls back to the eager path on a timestep-count mismatch.
+        if use_dit_graph:
+            if not hasattr(self, "_kdit_graphs"):
+                self._capture_kernel_dit_graphs(
+                    num_inference_timesteps=num_inference_timesteps,
+                    action_horizon=action_horizon)
+            if len(self._kdit_graphs) == num_inference_timesteps:
+                self._k_state_in.copy_(
+                    state_normalized.reshape(1, action_dim).to(device).bfloat16())
+                self._k_state_graph.replay()
+                if initial_noise is not None:
+                    self._k_actions.copy_(
+                        initial_noise.reshape(action_horizon, action_dim).to(device).bfloat16())
+                else:
+                    self._k_actions.copy_(torch.randn(
+                        action_horizon, action_dim, dtype=torch.bfloat16, device=device))
+                for step in range(num_inference_timesteps):
+                    self._kdit_graphs[step].replay()
+                return self._k_actions.float().view(1, action_horizon, action_dim)
 
         # ── state encode (one-shot; doesn't change across steps) ──────────
         state_features = self._run_state_encode(state_normalized.to(device).bfloat16())  # (1, 1, 1536) bf16
