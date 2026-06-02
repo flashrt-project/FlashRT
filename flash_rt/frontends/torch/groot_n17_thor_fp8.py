@@ -243,6 +243,26 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
             out.append(pe_g)
         return torch.cat(out)
 
+    def _load_merger_fp16(self) -> None:
+        """Load the ViT final-merger fc1/fc2 as FP16 [K, N] (norm weights come
+        from the spec). Used to compute the image-token embeddings in-kernel."""
+        import glob as _glob
+        import os as _os
+        from safetensors import safe_open
+        idx = {}
+        for p in sorted(_glob.glob(_os.path.join(self.checkpoint_path,
+                                                  "model-*.safetensors"))):
+            h = safe_open(p, framework="pt", device=self.device)
+            for k in h.keys():
+                idx[k] = h
+        pre = "backbone.model.model.visual.merger"
+        def g(name):
+            return idx[f"{pre}.{name}"].get_tensor(f"{pre}.{name}")
+        self._mg_fc1_w = g("linear_fc1.weight").t().contiguous().to(_FP16)  # [4096,4096]
+        self._mg_fc1_b = g("linear_fc1.bias").to(_FP16).contiguous()
+        self._mg_fc2_w = g("linear_fc2.weight").t().contiguous().to(_FP16)  # [4096,2048]
+        self._mg_fc2_b = g("linear_fc2.bias").to(_FP16).contiguous()
+
     # ── FP8 kernel backbone: ViT → DeepStack → LLM → vlln → VL self-attn ──
     def _run_kernel_backbone(self, aux: dict) -> "torch.Tensor":
         import flash_rt.flash_rt_kernels as fvk
@@ -339,6 +359,14 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
             pe_pos = K(self._fast_pos_embed_interpolate(aux["grid_thw"].tolist())
                        .to(_FP16).contiguous())
             self._kbb_pv = pv_buf
+            # ViT final-merger image-token embeds (computed in-kernel from the
+            # ViT output and scattered into the LLM input at visual positions).
+            if not hasattr(self, "_mg_fc1_w"):
+                self._load_merger_fp16()
+            Nimg = Sv // 4
+            mg_norm = buf(Sv, 1024)
+            mg_fc1 = buf(Nimg, 4096)
+            mg_img = buf(Nimg, 2048)
         else:
             vit_h.copy_(aux["pixel_features"].to(dev).half().reshape(Sv, 1024))
         vit_bufs = {"h": vit_h.data_ptr(), "xn": buf(Sv, 1024).data_ptr(),
@@ -616,6 +644,20 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
             for j in range(3):
                 injb[j].zero_()
                 injb[j].index_copy_(0, vis_idx, ds_out[j])
+            if use_pe:
+                # ViT final merger: LayerNorm(1024) -> [Nimg,4096] -> fc1+GELU
+                # -> fc2 -> scatter the image-token embeds into the LLM input.
+                fvkm.layer_norm_fp16(vit_h.data_ptr(), self._merger_norm_w.data_ptr(),
+                                     self._merger_norm_b.data_ptr(), mg_norm.data_ptr(),
+                                     Sv, 1024, 1e-6, s)
+                gemm.fp16_nn(mg_norm.data_ptr(), self._mg_fc1_w.data_ptr(),
+                             mg_fc1.data_ptr(), Nimg, 4096, 4096, s)
+                fvkm.add_bias_fp16(mg_fc1.data_ptr(), self._mg_fc1_b.data_ptr(), Nimg, 4096, s)
+                fvkm.gelu_inplace_fp16(mg_fc1.data_ptr(), Nimg * 4096, s)
+                gemm.fp16_nn(mg_fc1.data_ptr(), self._mg_fc2_w.data_ptr(),
+                             mg_img.data_ptr(), Nimg, 2048, 4096, s)
+                fvkm.add_bias_fp16(mg_img.data_ptr(), self._mg_fc2_b.data_ptr(), Nimg, 2048, s)
+                llm_h.index_copy_(0, vis_idx, mg_img)
             P.qwen3vl_llm_forward(gemm=gemm, fvk=fvkm, bufs=llm_bufs, weights=lw,
                                   scales_dev=llm_scales, dims=llm_dims, attn=attn,
                                   fp16_layers=self.PROTECT_LLM_FP16, stream=s)
