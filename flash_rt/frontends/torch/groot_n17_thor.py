@@ -587,9 +587,22 @@ class GrootN17TorchFrontendThor:
 
         act_fc1 = [0.0] * 32
         act_fc2 = [0.0] * 32
+        act_qkv = [0.0] * 16   # self-attn layers only (j = (li-1)//2)
+        h_ptr = bufs["dit_h"].data_ptr()
         for step in range(num_inference_timesteps):
             ae_fwd(step, 0)
+            sc = step_weights[step]["scale_msa"]
+            sh = step_weights[step]["shift_msa"]
             for li in range(32):
+                if li % 2 == 1:
+                    # self-attn QKV input = AdaLN(h); capture amax before the
+                    # layer mutates h.
+                    self._fvk.ada_layer_norm_bf16(
+                        h_ptr, int(sc[li]), int(sh[li]),
+                        self._k_hmod.data_ptr(), Sa, 1536, 1e-5, 0)
+                    torch.cuda.synchronize()
+                    j = (li - 1) // 2
+                    act_qkv[j] = max(act_qkv[j], float(self._k_hmod[:Sa].abs().max().item()))
                 pipeline_thor.dit_forward(
                     gemm=self._gemm, fvk=self._fvk, bufs=bp,
                     weights=step_weights[step], dims=dims,
@@ -627,15 +640,34 @@ class GrootN17TorchFrontendThor:
             s_fc1.append(sf1.data_ptr()); s_fc2.append(sf2.data_ptr())
             a_fc1.append((act_fc1[li] / FP8_MAX) * ws_p)
             a_fc2.append((act_fc2[li] / FP8_MAX) * ws_d)
+        # Fused FP8 QKV for the 16 self-attn layers: concat q/k/v ([D,D] each)
+        # → [D, 3D], quantize per-tensor. j indexes self-attn layers (li=2j+1).
+        self._k_qkv_buf = torch.empty(Sa, 3 * 1536, dtype=torch.bfloat16, device=dev)
+        self._k_qkv_xn_fp8 = torch.empty(Sa, 1536, dtype=f8, device=dev)
+        qkv_fp8, qkv_b, a_qkv, s_qkv = [], [], [], []
+        for j in range(16):
+            li = 2 * j + 1
+            qw = torch.cat([self._dit_q_w[li], self._dit_k_w[li], self._dit_v_w[li]], dim=1).float()
+            qb = torch.cat([self._dit_q_b[li], self._dit_k_b[li], self._dit_v_b[li]]).to(torch.bfloat16).contiguous()
+            ws_q = qw.abs().max().item() / FP8_MAX
+            qf = (qw / ws_q).to(f8).contiguous()
+            sq = torch.tensor([act_qkv[j] / FP8_MAX], dtype=torch.float32, device=dev)
+            self._dit_ff_fp8_keep += [qf, qb, sq]
+            qkv_fp8.append(qf.data_ptr()); qkv_b.append(qb.data_ptr()); s_qkv.append(sq.data_ptr())
+            a_qkv.append((act_qkv[j] / FP8_MAX) * ws_q)
         for step in range(num_inference_timesteps):
             step_weights[step].update(
                 ff_proj_w_fp8=proj_fp8, ff_down_w_fp8=down_fp8,
                 ff_proj_b=projb16,  # fp16 bias for the GELU epilogue
                 alpha_fc1=a_fc1, alpha_fc2=a_fc2,
-                act_fc1_scale=s_fc1, act_fc2_scale=s_fc2)
+                act_fc1_scale=s_fc1, act_fc2_scale=s_fc2,
+                qkv_w_fp8=qkv_fp8, qkv_b=qkv_b,
+                alpha_qkv=a_qkv, act_qkv_scale=s_qkv)
         bp.update(xn_fp8=self._k_xn_fp8.data_ptr(),
                   ff_fp16=self._k_ff_fp16.data_ptr(),
-                  ff_fp8=self._k_ff_fp8.data_ptr())
+                  ff_fp8=self._k_ff_fp8.data_ptr(),
+                  qkv_buf=self._k_qkv_buf.data_ptr(),
+                  qkv_xn_fp8=self._k_qkv_xn_fp8.data_ptr())
 
     def _capture_kernel_dit_graphs(self, num_inference_timesteps: int = 4,
                                     action_horizon: int = 40) -> None:

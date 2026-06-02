@@ -852,26 +852,44 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
         # CUBLAS_STATUS_NOT_SUPPORTED at M=Sa=41 (M not 16-aligned). Match
         # N1.6's calibrate path: bf16_nn (no epilogue) + explicit
         # add_bias_bf16. Slightly more launches but works on every shape.
-        gemm.bf16_nn(xn_ptr, int(weights["q_w"][li]),
-                      Q_ptr, Sa, D, D, int(stream))
-        fvk.add_bias_bf16(Q_ptr, int(weights["q_b"][li]),
-                           Sa, D, int(stream))
-
-        if is_self:
-            gemm.bf16_nn(xn_ptr, int(weights["k_w"][li]),
-                          K_ptr, Sa, D, D, int(stream))
-            fvk.add_bias_bf16(K_ptr, int(weights["k_b"][li]),
-                               Sa, D, int(stream))
-            gemm.bf16_nn(xn_ptr, int(weights["v_w"][li]),
-                          V_ptr, Sa, D, D, int(stream))
-            fvk.add_bias_bf16(V_ptr, int(weights["v_b"][li]),
-                               Sa, D, int(stream))
+        if is_self and "qkv_w_fp8" in weights:
+            # Fused FP8 QKV (self-attn): q/k/v share the post-AdaLN input xn,
+            # so one [D, 3D] GEMM (compute-bound, unlike 3 launch-bound D→D
+            # GEMMs) + a strided split into the Q/K/V slots. j_attn indexes
+            # the 16 self-attn layers. Cross-attn keeps a single Q GEMM (K/V
+            # come from the backbone-projected cross-KV).
+            j_self = (li - 1) // 2
+            fvk.quantize_fp8_static(
+                xn_ptr, int(bufs["qkv_xn_fp8"]),
+                int(weights["act_qkv_scale"][j_self]), Sa * D, int(stream))
+            gemm.fp8_nn_bias_bf16(
+                int(bufs["qkv_xn_fp8"]), int(weights["qkv_w_fp8"][j_self]),
+                int(bufs["qkv_buf"]), int(weights["qkv_b"][j_self]),
+                Sa, 3 * D, D, float(weights["alpha_qkv"][j_self]), int(stream))
+            fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), Q_ptr, Sa, D, 3 * D, 0, int(stream))
+            fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), K_ptr, Sa, D, 3 * D, D, int(stream))
+            fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), V_ptr, Sa, D, 3 * D, 2 * D, int(stream))
             attn.run("dit_self", j_attn, q_seq=Sa, kv_seq=Sa, stream=int(stream))
         else:
-            target_text = (li % 4 == 0)
-            kv_seq = Skv_text if target_text else Skv_image
-            attn.run("dit_cross", j_attn, q_seq=Sa, kv_seq=kv_seq,
-                     stream=int(stream))
+            gemm.bf16_nn(xn_ptr, int(weights["q_w"][li]),
+                          Q_ptr, Sa, D, D, int(stream))
+            fvk.add_bias_bf16(Q_ptr, int(weights["q_b"][li]),
+                               Sa, D, int(stream))
+            if is_self:
+                gemm.bf16_nn(xn_ptr, int(weights["k_w"][li]),
+                              K_ptr, Sa, D, D, int(stream))
+                fvk.add_bias_bf16(K_ptr, int(weights["k_b"][li]),
+                                   Sa, D, int(stream))
+                gemm.bf16_nn(xn_ptr, int(weights["v_w"][li]),
+                              V_ptr, Sa, D, D, int(stream))
+                fvk.add_bias_bf16(V_ptr, int(weights["v_b"][li]),
+                                   Sa, D, int(stream))
+                attn.run("dit_self", j_attn, q_seq=Sa, kv_seq=Sa, stream=int(stream))
+            else:
+                target_text = (li % 4 == 0)
+                kv_seq = Skv_text if target_text else Skv_image
+                attn.run("dit_cross", j_attn, q_seq=Sa, kv_seq=kv_seq,
+                         stream=int(stream))
 
         gemm.bf16_nn(O_ptr, int(weights["o_w"][li]),
                       o_out_ptr, Sa, D, D, int(stream))
