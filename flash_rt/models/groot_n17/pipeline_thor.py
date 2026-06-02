@@ -909,6 +909,10 @@ def embodiment_state_encode(gemm, fvk, bufs, weights, dims, *,
       h1 = ReLU(h1)
       out = h1 @ l2_w + l2_b                # (1, 1536)
 
+    GEMMs use ``bf16_nn`` + ``add_bias_bf16`` rather than the fused
+    ``bf16_nn_bias`` epilogue, which returns ``CUBLAS_NOT_SUPPORTED`` on Thor
+    SM110 (same split every live Thor GEMM uses).
+
     Args:
         bufs: state_in (1, 132), h1 (1, 1024), out (1, 1536) — bf16
         weights: l1_w (132, 1024), l1_b (1024,), l2_w (1024, 1536), l2_b (1536,)
@@ -918,17 +922,17 @@ def embodiment_state_encode(gemm, fvk, bufs, weights, dims, *,
     in_dim = int(dims["state_dim"])    # 132
     h_dim = int(dims["h_dim"])         # 1024
     out_dim = int(dims["out_dim"])     # 1536
-    gemm.bf16_nn_bias(
-        int(bufs["state_in"]), int(weights["l1_w"]),
-        int(bufs["h1"]), int(weights["l1_b"]),
+    gemm.bf16_nn(
+        int(bufs["state_in"]), int(weights["l1_w"]), int(bufs["h1"]),
         M, h_dim, in_dim, int(stream),
     )
+    fvk.add_bias_bf16(int(bufs["h1"]), int(weights["l1_b"]), M, h_dim, int(stream))
     fvk.relu_inplace_fp16(int(bufs["h1"]), M * h_dim, int(stream))
-    gemm.bf16_nn_bias(
-        int(bufs["h1"]), int(weights["l2_w"]),
-        int(bufs["out"]), int(weights["l2_b"]),
+    gemm.bf16_nn(
+        int(bufs["h1"]), int(weights["l2_w"]), int(bufs["out"]),
         M, out_dim, h_dim, int(stream),
     )
+    fvk.add_bias_bf16(int(bufs["out"]), int(weights["l2_b"]), M, out_dim, int(stream))
 
 
 def embodiment_action_encode(gemm, fvk, bufs, weights, dims, *,
@@ -938,24 +942,29 @@ def embodiment_action_encode(gemm, fvk, bufs, weights, dims, *,
 
     Per ``MultiEmbodimentActionEncoder`` (gr00t_n1d7.py:391). 3-layer MLP with
     timestep concat after the first hidden layer. Pre-sliced per-embodiment.
+    NOTE the activation pattern — unlike the ReLU ``CategorySpecificMLP``
+    used by state-encode/action-decode, this encoder is NO-act → SiLU → NO-act:
 
-      i1 = ReLU(noisy @ W1 + b1)            # (40, 1536)
-      i1_cat = cat([i1, timestep_emb_broadcast_T], dim=-1)   # (40, 3072)
-      i2 = ReLU(i1_cat @ W2 + b2)           # (40, 1536)
-      out = i2 @ W3 + b3                    # (40, 1536)
+      a   = noisy @ W1 + b1                  # (40, 1536)  NO activation
+      cat = concat([a, tau_emb], dim=-1)     # (40, 3072)  tau = timestep emb
+      i2  = SiLU(cat @ W2 + b2)              # (40, 1536)  swish, NOT relu
+      out = i2 @ W3 + b3                      # (40, 1536)  NO activation
 
-    The ``timestep_emb`` is broadcast across the action sequence: caller
-    must pre-fill ``bufs["concat_buf"]`` so its second-half (cols 1536..3072)
-    holds ``timestep_emb`` replicated along T. Concretely the frontend does
-    a one-shot ``gpu_strided_copy``-equivalent at set_prompt time per step,
-    or interleaves it with a copy kernel.
+    ``tau_emb`` is the timestep embedding broadcast across the T action rows
+    (identical per row). GEMMs use ``bf16_nn`` + ``add_bias_bf16`` (the fused
+    ``bf16_nn_bias`` epilogue is ``CUBLAS_NOT_SUPPORTED`` on Thor SM110); the
+    concat uses ``concat2_bf16`` (a true two-input concat — ``gpu_strided_copy``
+    is a narrowing *gather*, not a scatter); SiLU runs through an fp16 round
+    trip since the kernel library exposes it only for fp16.
 
     Args:
         bufs:
             noisy        — bf16 (T=40, 132)
-            i1           — bf16 (T, 1536) — also written into concat_buf left half
-            concat_buf   — bf16 (T, 3072) — left half = i1, right half = timestep_emb
+            i1           — bf16 (T, 1536)  W1 output (a)
+            tau_emb      — bf16 (T, 1536)  timestep emb broadcast over T
+            concat_buf   — bf16 (T, 3072)  concat([i1, tau_emb])
             i2           — bf16 (T, 1536)
+            i2_fp16      — fp16 (T, 1536)  SiLU scratch
             out          — bf16 (T, 1536)
         weights: W1 (132, 1536), b1 (1536), W2 (3072, 1536), b2, W3 (1536, 1536), b3
         dims: T (= 40), action_dim (= 132), h_dim (= 1536), cat_dim (= 3072)
@@ -965,35 +974,35 @@ def embodiment_action_encode(gemm, fvk, bufs, weights, dims, *,
     H = int(dims["h_dim"])
     Cat = int(dims["cat_dim"])
 
-    # Layer 1: (T, A) → (T, H), then ReLU
-    gemm.bf16_nn_bias(
-        int(bufs["noisy"]), int(weights["W1"]),
-        int(bufs["i1"]), int(weights["b1"]),
+    # Layer 1: (T, A) → (T, H), NO activation
+    gemm.bf16_nn(
+        int(bufs["noisy"]), int(weights["W1"]), int(bufs["i1"]),
         T, H, A, int(stream),
     )
-    fvk.relu_inplace_fp16(int(bufs["i1"]), T * H, int(stream))
+    fvk.add_bias_bf16(int(bufs["i1"]), int(weights["b1"]), T, H, int(stream))
 
-    # Caller has pre-arranged concat_buf so the second half holds
-    # broadcast timestep_emb. Copy i1 into the first half.
-    fvk.gpu_strided_copy_fp16(
-        int(bufs["i1"]), int(bufs["concat_buf"]),
-        T, Cat, H, 0, int(stream),
-    )
-
-    # Layer 2: (T, Cat) → (T, H), then ReLU
-    gemm.bf16_nn_bias(
-        int(bufs["concat_buf"]), int(weights["W2"]),
-        int(bufs["i2"]), int(weights["b2"]),
-        T, H, Cat, int(stream),
-    )
-    fvk.relu_inplace_fp16(int(bufs["i2"]), T * H, int(stream))
-
-    # Layer 3: (T, H) → (T, H)
-    gemm.bf16_nn_bias(
-        int(bufs["i2"]), int(weights["W3"]),
-        int(bufs["out"]), int(weights["b3"]),
+    # concat([i1, tau_emb]) → (T, 2H)
+    fvk.concat2_bf16(
+        int(bufs["i1"]), int(bufs["tau_emb"]), int(bufs["concat_buf"]),
         T, H, H, int(stream),
     )
+
+    # Layer 2: (T, Cat) → (T, H), then SiLU (fp16 round trip)
+    gemm.bf16_nn(
+        int(bufs["concat_buf"]), int(weights["W2"]), int(bufs["i2"]),
+        T, H, Cat, int(stream),
+    )
+    fvk.add_bias_bf16(int(bufs["i2"]), int(weights["b2"]), T, H, int(stream))
+    fvk.cast_bf16_to_fp16(int(bufs["i2"]), int(bufs["i2_fp16"]), T * H, int(stream))
+    fvk.silu_inplace_fp16(int(bufs["i2_fp16"]), T * H, int(stream))
+    fvk.cast_fp16_to_bf16(int(bufs["i2_fp16"]), int(bufs["i2"]), T * H, int(stream))
+
+    # Layer 3: (T, H) → (T, H), NO activation
+    gemm.bf16_nn(
+        int(bufs["i2"]), int(weights["W3"]), int(bufs["out"]),
+        T, H, H, int(stream),
+    )
+    fvk.add_bias_bf16(int(bufs["out"]), int(weights["b3"]), T, H, int(stream))
 
 
 def embodiment_action_decode(gemm, fvk, bufs, weights, dims, *,
@@ -1001,7 +1010,8 @@ def embodiment_action_decode(gemm, fvk, bufs, weights, dims, *,
     """DiT proj_out_2 result ``(40, 1024)`` → velocity ``(40, 132)``.
 
     Per ``CategorySpecificMLP`` (gr00t_n1d7.py:416). 2-layer MLP with ReLU.
-    Pre-sliced per-embodiment.
+    Pre-sliced per-embodiment. GEMMs use ``bf16_nn`` + ``add_bias_bf16`` (the
+    fused ``bf16_nn_bias`` epilogue is ``CUBLAS_NOT_SUPPORTED`` on Thor SM110).
 
       h = ReLU(in @ l1_w + l1_b)            # (40, 1024)
       out = h @ l2_w + l2_b                 # (40, 132)
@@ -1011,14 +1021,14 @@ def embodiment_action_decode(gemm, fvk, bufs, weights, dims, *,
     h_dim = int(dims["h_dim"])         # 1024
     out_dim = int(dims["out_dim"])     # 132
 
-    gemm.bf16_nn_bias(
-        int(bufs["dit_out"]), int(weights["l1_w"]),
-        int(bufs["h"]), int(weights["l1_b"]),
+    gemm.bf16_nn(
+        int(bufs["dit_out"]), int(weights["l1_w"]), int(bufs["h"]),
         T, h_dim, in_dim, int(stream),
     )
+    fvk.add_bias_bf16(int(bufs["h"]), int(weights["l1_b"]), T, h_dim, int(stream))
     fvk.relu_inplace_fp16(int(bufs["h"]), T * h_dim, int(stream))
-    gemm.bf16_nn_bias(
-        int(bufs["h"]), int(weights["l2_w"]),
-        int(bufs["velocity"]), int(weights["l2_b"]),
+    gemm.bf16_nn(
+        int(bufs["h"]), int(weights["l2_w"]), int(bufs["velocity"]),
         T, out_dim, h_dim, int(stream),
     )
+    fvk.add_bias_bf16(int(bufs["velocity"]), int(weights["l2_b"]), T, out_dim, int(stream))
