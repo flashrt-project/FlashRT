@@ -970,7 +970,7 @@ def embodiment_state_encode(gemm, fvk, bufs, weights, dims, *,
         M, h_dim, in_dim, int(stream),
     )
     fvk.add_bias_bf16(int(bufs["h1"]), int(weights["l1_b"]), M, h_dim, int(stream))
-    fvk.relu_inplace_fp16(int(bufs["h1"]), M * h_dim, int(stream))
+    fvk.relu_inplace_bf16(int(bufs["h1"]), M * h_dim, int(stream))
     gemm.bf16_nn(
         int(bufs["h1"]), int(weights["l2_w"]), int(bufs["out"]),
         M, out_dim, h_dim, int(stream),
@@ -1069,7 +1069,7 @@ def embodiment_action_decode(gemm, fvk, bufs, weights, dims, *,
         T, h_dim, in_dim, int(stream),
     )
     fvk.add_bias_bf16(int(bufs["h"]), int(weights["l1_b"]), T, h_dim, int(stream))
-    fvk.relu_inplace_fp16(int(bufs["h"]), T * h_dim, int(stream))
+    fvk.relu_inplace_bf16(int(bufs["h"]), T * h_dim, int(stream))
     gemm.bf16_nn(
         int(bufs["h"]), int(weights["l2_w"]), int(bufs["velocity"]),
         T, out_dim, h_dim, int(stream),

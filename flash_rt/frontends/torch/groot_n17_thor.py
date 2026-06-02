@@ -728,7 +728,7 @@ class GrootN17TorchFrontendThor:
             mg.bf16_nn(self._k_state_in.data_ptr(), w["st_l1"].data_ptr(),
                        self._k_st_h1.data_ptr(), 1, 1024, 132, s)
             K.add_bias_bf16(self._k_st_h1.data_ptr(), w["st_l1b"].data_ptr(), 1, 1024, s)
-            K.relu_inplace_fp16(self._k_st_h1.data_ptr(), 1024, s)
+            K.relu_inplace_bf16(self._k_st_h1.data_ptr(), 1024, s)
             mg.bf16_nn(self._k_st_h1.data_ptr(), w["st_l2"].data_ptr(),
                        self._k_state_feat.data_ptr(), 1, 1536, 1024, s)
             K.add_bias_bf16(self._k_state_feat.data_ptr(), w["st_l2b"].data_ptr(), 1, 1536, s)
@@ -767,7 +767,7 @@ class GrootN17TorchFrontendThor:
             mg.bf16_nn(hout_dec, w["dec_l1"].data_ptr(),
                        self._k_dec_h.data_ptr(), T, 1024, 1024, s)
             K.add_bias_bf16(self._k_dec_h.data_ptr(), w["dec_l1b"].data_ptr(), T, 1024, s)
-            K.relu_inplace_fp16(self._k_dec_h.data_ptr(), T * 1024, s)
+            K.relu_inplace_bf16(self._k_dec_h.data_ptr(), T * 1024, s)
             mg.bf16_nn(self._k_dec_h.data_ptr(), w["dec_l2"].data_ptr(),
                        self._k_vel.data_ptr(), T, 132, 1024, s)
             K.add_bias_bf16(self._k_vel.data_ptr(), w["dec_l2b"].data_ptr(), T, 132, s)

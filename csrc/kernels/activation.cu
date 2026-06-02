@@ -390,3 +390,10 @@ void relu_inplace_fp16(__half* x, int n, cudaStream_t stream) {
     int n2 = n >> 1;
     relu_inplace_kernel<__half><<<(n2 + 255) / 256, 256, 0, stream>>>(x, n);
 }
+
+template __global__ void relu_inplace_kernel<__nv_bfloat16>(__nv_bfloat16*, int);
+
+void relu_inplace_bf16(__nv_bfloat16* x, int n, cudaStream_t stream) {
+    int n2 = n >> 1;
+    relu_inplace_kernel<__nv_bfloat16><<<(n2 + 255) / 256, 256, 0, stream>>>(x, n);
+}

@@ -1993,6 +1993,11 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         relu_inplace_fp16(reinterpret_cast<__half*>(x), n, to_stream(stream));
     }, py::arg("x"), py::arg("n"), py::arg("stream") = 0);
 
+    m.def("relu_inplace_bf16", [](uintptr_t x, int n, uintptr_t stream) {
+        extern void relu_inplace_bf16(__nv_bfloat16*, int, cudaStream_t);
+        relu_inplace_bf16(reinterpret_cast<__nv_bfloat16*>(x), n, to_stream(stream));
+    }, py::arg("x"), py::arg("n"), py::arg("stream") = 0);
+
     // GQA KV repeat interleave (for Qwen3 8→16 heads)
     m.def("gpu_repeat_interleave_heads", [](uintptr_t src, uintptr_t dst,
                                              int S, int NH_src, int HD, int repeat, uintptr_t stream) {
