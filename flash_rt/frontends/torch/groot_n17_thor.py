@@ -563,6 +563,80 @@ class GrootN17TorchFrontendThor:
         if not hasattr(self, "_mlp_gemm"):
             self._mlp_gemm = self._fvk.GemmRunner()
 
+    def _calibrate_quantize_dit_ffn(self, num_inference_timesteps, action_horizon,
+                                     state_fwd, ae_fwd, post_fwd,
+                                     step_weights, bp, dims) -> None:
+        """Calibrate the DiT FFN activation scales over a representative bf16
+        denoising run, quantize the FFN weights to FP8, and splice the FP8
+        entries into ``step_weights`` / ``bp`` so the captured graph uses the
+        FP8 FFN path. Attention GEMMs stay bf16 (launch-bound at M=41)."""
+        from flash_rt.models.groot_n17 import pipeline_thor
+        dev = self.device
+        Sa = action_horizon + 1
+        bufs = self._infer_bufs
+        xn_t = bufs["dit_xn"]
+        ff_t = bufs["dit_ff_proj_out"]
+
+        # Representative inputs: warmup state (zeros) + seeded noise.
+        self._cross_kv_fwd(0)
+        self._k_state_in.zero_()
+        state_fwd(0)
+        torch.manual_seed(0)
+        self._k_actions.copy_(torch.randn(
+            action_horizon, 132, dtype=torch.bfloat16, device=dev))
+
+        act_fc1 = [0.0] * 32
+        act_fc2 = [0.0] * 32
+        for step in range(num_inference_timesteps):
+            ae_fwd(step, 0)
+            for li in range(32):
+                pipeline_thor.dit_forward(
+                    gemm=self._gemm, fvk=self._fvk, bufs=bp,
+                    weights=step_weights[step], dims=dims,
+                    attn=self._dit_attn, layers_subset=[li])
+                torch.cuda.synchronize()
+                # post-layer: xn holds pre-FF-LN input (act_fc1), ff_proj_out
+                # holds the post-GELU activation (act_fc2 input).
+                act_fc1[li] = max(act_fc1[li], float(xn_t[:Sa].abs().max().item()))
+                act_fc2[li] = max(act_fc2[li], float(ff_t[:Sa].abs().max().item()))
+            post_fwd(step, 0)
+
+        # Quantize FFN weights to FP8 (per-tensor) + compose alphas/act-scales.
+        FP8_MAX = 448.0
+        f8 = torch.float8_e4m3fn
+        self._k_xn_fp8 = torch.empty(Sa, 1536, dtype=f8, device=dev)
+        self._k_ff_fp16 = torch.empty(Sa, 6144, dtype=torch.float16, device=dev)
+        self._k_ff_fp8 = torch.empty(Sa, 6144, dtype=f8, device=dev)
+        self._dit_ff_fp8_keep = []
+        proj_fp8, down_fp8, projb16 = [], [], []
+        a_fc1, a_fc2, s_fc1, s_fc2 = [], [], [], []
+        for li in range(32):
+            pw = self._dit_ff_proj_w[li].float()
+            dw = self._dit_ff_down_w[li].float()
+            ws_p = pw.abs().max().item() / FP8_MAX
+            ws_d = dw.abs().max().item() / FP8_MAX
+            pf = (pw / ws_p).to(f8).contiguous()
+            df = (dw / ws_d).to(f8).contiguous()
+            # fp8_nn_gelu_bias outputs fp16 → its bias must be fp16.
+            pb = self._dit_ff_proj_b[li].half().contiguous()
+            sf1 = torch.tensor([act_fc1[li] / FP8_MAX], dtype=torch.float32, device=dev)
+            sf2 = torch.tensor([act_fc2[li] / FP8_MAX], dtype=torch.float32, device=dev)
+            self._dit_ff_fp8_keep += [pf, df, pb, sf1, sf2]
+            proj_fp8.append(pf.data_ptr()); down_fp8.append(df.data_ptr())
+            projb16.append(pb.data_ptr())
+            s_fc1.append(sf1.data_ptr()); s_fc2.append(sf2.data_ptr())
+            a_fc1.append((act_fc1[li] / FP8_MAX) * ws_p)
+            a_fc2.append((act_fc2[li] / FP8_MAX) * ws_d)
+        for step in range(num_inference_timesteps):
+            step_weights[step].update(
+                ff_proj_w_fp8=proj_fp8, ff_down_w_fp8=down_fp8,
+                ff_proj_b=projb16,  # fp16 bias for the GELU epilogue
+                alpha_fc1=a_fc1, alpha_fc2=a_fc2,
+                act_fc1_scale=s_fc1, act_fc2_scale=s_fc2)
+        bp.update(xn_fp8=self._k_xn_fp8.data_ptr(),
+                  ff_fp16=self._k_ff_fp16.data_ptr(),
+                  ff_fp8=self._k_ff_fp8.data_ptr())
+
     def _capture_kernel_dit_graphs(self, num_inference_timesteps: int = 4,
                                     action_horizon: int = 40) -> None:
         """Capture the once-per-frame state encode and the full per-step DiT
@@ -627,9 +701,10 @@ class GrootN17TorchFrontendThor:
                        self._k_state_feat.data_ptr(), 1, 1536, 1024, s)
             K.add_bias_bf16(self._k_state_feat.data_ptr(), w["st_l2b"].data_ptr(), 1, 1536, s)
 
-        def _step_fwd(step, s):
+        def _ae_fwd(step, s):
+            # action_encode: W1 (no act) → cat[a_emb, tau] → W2 → SiLU → W3,
+            # add pos, then fill dit_h ([0]=state, [1:]=action features).
             T = action_horizon
-            # action_encode: W1 (no act) → cat[a_emb, tau] → W2 → SiLU → W3
             mg.bf16_nn(self._k_actions.data_ptr(), w["ae_W1"].data_ptr(),
                        self._k_ae_aemb.data_ptr(), T, 1536, 132, s)
             K.add_bias_bf16(self._k_ae_aemb.data_ptr(), w["ae_b1"].data_ptr(), T, 1536, s)
@@ -645,20 +720,18 @@ class GrootN17TorchFrontendThor:
                        self._k_ae_out.data_ptr(), T, 1536, 1536, s)
             K.add_bias_bf16(self._k_ae_out.data_ptr(), w["ae_b3"].data_ptr(), T, 1536, s)
             K.residual_add(self._k_ae_out.data_ptr(), self._k_pos.data_ptr(), T * 1536, s)
-            # DiT input: dit_h[0] = state, dit_h[1:] = action features
             K.gpu_copy(dit_h, self._k_state_feat.data_ptr(), 1536 * 2, s)
             K.gpu_copy(dit_h + 1536 * 2, self._k_ae_out.data_ptr(), T * 1536 * 2, s)
-            pipeline_thor.dit_forward(
-                gemm=self._gemm, fvk=K, bufs=bp, weights=step_weights[step],
-                dims=dims, attn=self._dit_attn, stream=s)
-            # output projection: AdaLN(dit_h) → proj_out_2
+
+        def _post_fwd(step, s):
+            # output projection (AdaLN → proj_out_2) + action_decode + Euler.
+            T = action_horizon
             K.ada_layer_norm_bf16(dit_h, self._k_oproj_scale[step].data_ptr(),
                                   self._k_oproj_shift[step].data_ptr(),
                                   self._k_hmod.data_ptr(), Sa, 1536, 1e-5, s)
             mg.bf16_nn(self._k_hmod.data_ptr(), w["po2"].data_ptr(),
                        self._k_hout.data_ptr(), Sa, 1024, 1536, s)
             K.add_bias_bf16(self._k_hout.data_ptr(), w["po2b"].data_ptr(), Sa, 1024, s)
-            # action_decode on the action rows → velocity
             mg.bf16_nn(hout_dec, w["dec_l1"].data_ptr(),
                        self._k_dec_h.data_ptr(), T, 1024, 1024, s)
             K.add_bias_bf16(self._k_dec_h.data_ptr(), w["dec_l1b"].data_ptr(), T, 1024, s)
@@ -666,9 +739,24 @@ class GrootN17TorchFrontendThor:
             mg.bf16_nn(self._k_dec_h.data_ptr(), w["dec_l2"].data_ptr(),
                        self._k_vel.data_ptr(), T, 132, 1024, s)
             K.add_bias_bf16(self._k_vel.data_ptr(), w["dec_l2b"].data_ptr(), T, 132, s)
-            # Euler flow update (in place)
             K.euler_step_bf16_out(self._k_actions.data_ptr(), self._k_vel.data_ptr(),
                                   self._k_actions.data_ptr(), dt, T * 132, s)
+
+        # ── Calibrate + quantize the DiT FFN to FP8 ───────────────────────
+        # The FFN GEMMs are the compute-bound part of the (M=41) DiT; FP8 here
+        # is ~1.8x on the up-projection and fuses bias+GELU into the epilogue.
+        # Calibrate per-layer activation amax over a representative bf16
+        # denoising run (warmup state/noise), then quantize the FFN weights.
+        self._calibrate_quantize_dit_ffn(
+            num_inference_timesteps, action_horizon, _state_fwd, _ae_fwd,
+            _post_fwd, step_weights, bp, dims)
+
+        def _step_fwd(step, s):
+            _ae_fwd(step, s)
+            pipeline_thor.dit_forward(
+                gemm=self._gemm, fvk=K, bufs=bp, weights=step_weights[step],
+                dims=dims, attn=self._dit_attn, stream=s)
+            _post_fwd(step, s)
 
         self._kdit_fwd = (_state_fwd, _step_fwd)
 

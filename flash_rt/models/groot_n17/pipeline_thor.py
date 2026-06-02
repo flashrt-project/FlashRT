@@ -885,15 +885,37 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
         )
 
         # ── FFN: GELU(tanh-approx) ────────────────────────────────────
-        gemm.bf16_nn(xn_ptr, int(weights["ff_proj_w"][li]),
-                      ff_out_ptr, Sa, FF, D, int(stream))
-        fvk.add_bias_bf16(ff_out_ptr, int(weights["ff_proj_b"][li]),
-                           Sa, FF, int(stream))
-        fvk.gelu_inplace(ff_out_ptr, Sa * FF, int(stream))
-        gemm.bf16_nn(ff_out_ptr, int(weights["ff_down_w"][li]),
-                      o_out_ptr, Sa, D, FF, int(stream))
-        fvk.add_bias_bf16(o_out_ptr, int(weights["ff_down_b"][li]),
-                           Sa, D, int(stream))
+        # The FFN GEMMs are the compute-bound part of the (M=41) DiT, so an
+        # FP8 path here is a real win (≈1.8× on the up-projection) and fuses
+        # the bias+GELU into the GEMM epilogue. Activated when calibrated FP8
+        # FFN weights/scales are supplied; otherwise the bf16 path runs. The
+        # attention GEMMs stay bf16 — at M=41 they are launch-bound, so FP8
+        # gives no speedup there.
+        if "ff_proj_w_fp8" in weights:
+            fvk.quantize_fp8_static(
+                xn_ptr, int(bufs["xn_fp8"]),
+                int(weights["act_fc1_scale"][li]), Sa * D, int(stream))
+            gemm.fp8_nn_gelu_bias(
+                int(bufs["xn_fp8"]), int(weights["ff_proj_w_fp8"][li]),
+                int(bufs["ff_fp16"]), int(weights["ff_proj_b"][li]),
+                Sa, FF, D, float(weights["alpha_fc1"][li]), int(stream))
+            fvk.quantize_fp8_static_fp16(
+                int(bufs["ff_fp16"]), int(bufs["ff_fp8"]),
+                int(weights["act_fc2_scale"][li]), Sa * FF, int(stream))
+            gemm.fp8_nn_bias_bf16(
+                int(bufs["ff_fp8"]), int(weights["ff_down_w_fp8"][li]),
+                o_out_ptr, int(weights["ff_down_b"][li]),
+                Sa, D, FF, float(weights["alpha_fc2"][li]), int(stream))
+        else:
+            gemm.bf16_nn(xn_ptr, int(weights["ff_proj_w"][li]),
+                          ff_out_ptr, Sa, FF, D, int(stream))
+            fvk.add_bias_bf16(ff_out_ptr, int(weights["ff_proj_b"][li]),
+                               Sa, FF, int(stream))
+            fvk.gelu_inplace(ff_out_ptr, Sa * FF, int(stream))
+            gemm.bf16_nn(ff_out_ptr, int(weights["ff_down_w"][li]),
+                          o_out_ptr, Sa, D, FF, int(stream))
+            fvk.add_bias_bf16(o_out_ptr, int(weights["ff_down_b"][li]),
+                               Sa, D, int(stream))
         fvk.residual_add(h_ptr, o_out_ptr, Sa * D, int(stream))
 
 
