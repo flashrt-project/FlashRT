@@ -39,6 +39,12 @@ class GrootN17TorchFrontendThor:
       d. CUDA Graph capture for vit / llm / vl_self_attn / dit-per-step.
     """
 
+    # Run the DiT action head's compute-bound GEMMs (FFN + self-attn QKV) in
+    # FP8. Default for the production frontend. The full-FP16 reference
+    # subclass sets this False so the DiT stays bf16 (a fully non-quantized
+    # accuracy baseline).
+    _DIT_USE_FP8 = True
+
     def __init__(
         self,
         checkpoint_path: str,
@@ -774,14 +780,18 @@ class GrootN17TorchFrontendThor:
             K.euler_step_bf16_out(self._k_actions.data_ptr(), self._k_vel.data_ptr(),
                                   self._k_actions.data_ptr(), dt, T * 132, s)
 
-        # ── Calibrate + quantize the DiT FFN to FP8 ───────────────────────
-        # The FFN GEMMs are the compute-bound part of the (M=41) DiT; FP8 here
-        # is ~1.8x on the up-projection and fuses bias+GELU into the epilogue.
-        # Calibrate per-layer activation amax over a representative bf16
-        # denoising run (warmup state/noise), then quantize the FFN weights.
-        self._calibrate_quantize_dit_ffn(
-            num_inference_timesteps, action_horizon, _state_fwd, _ae_fwd,
-            _post_fwd, step_weights, bp, dims)
+        # ── Calibrate + quantize the DiT FFN / self-attn QKV to FP8 ───────
+        # The FFN and fused-QKV GEMMs are the compute-bound part of the (M=41)
+        # DiT; FP8 here is ~1.8x on the FFN up-projection and ~3x on the fused
+        # QKV, and fuses bias+GELU into the epilogue. Calibrate per-layer
+        # activation amax over a representative bf16 denoising run, then
+        # quantize. Skipped for the full-FP16 reference (``_DIT_USE_FP8`` off),
+        # which keeps the DiT bf16 — dit_forward / _step_fwd fall back to the
+        # bf16 path when the FP8 weights are absent from ``step_weights`` / ``bp``.
+        if self._DIT_USE_FP8:
+            self._calibrate_quantize_dit_ffn(
+                num_inference_timesteps, action_horizon, _state_fwd, _ae_fwd,
+                _post_fwd, step_weights, bp, dims)
 
         def _step_fwd(step, s):
             _ae_fwd(step, s)

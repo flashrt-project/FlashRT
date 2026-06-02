@@ -1,14 +1,15 @@
-"""FlashRT -- GROOT N1.7 Thor FP16 *backbone* reference frontend.
+"""FlashRT -- GROOT N1.7 Thor full-FP16 reference frontend.
 
-This is NOT a full-model FP16 path. It is an A/B reference for the FP8 Thor
-serving frontend (:class:`GrootN17TorchFrontendThorFP8`) that runs only the
-vision/language *backbone* (ViT -> DeepStack -> LLM -> vlln -> VL-self-attn)
-in FP16: every backbone-stage GEMM goes through the cuBLASLt ``fp16_nn`` path
-on the shadow weights instead of per-tensor FP8, with no activation
-calibration. The DiT action head is unchanged — it runs the same production
-FP8 CUDA graph as the default frontend.
-
-Useful for validating the FP8 backbone cosine against a kernel FP16 baseline.
+A fully non-quantized A/B reference for the FP8 Thor serving frontend
+(:class:`GrootN17TorchFrontendThorFP8`). It runs the identical fully-kernelized
+pipeline with **no FP8 anywhere**:
+  * the backbone (ViT -> DeepStack -> LLM -> vlln -> VL-self-attn) GEMMs go
+    through the cuBLASLt ``fp16_nn`` path on the shadow weights
+    (``_KBB_USE_FP8 = False``);
+  * the DiT action head stays bf16 — the FP8 FFN / fused-QKV path is disabled
+    (``_DIT_USE_FP8 = False``), so the captured DiT graph uses bf16 GEMMs.
+There is no activation calibration and no PyTorch matmul/attention on the
+feature path. Useful as a non-quantized accuracy baseline for the whole model.
 """
 
 from __future__ import annotations
@@ -19,19 +20,21 @@ from flash_rt.frontends.torch.groot_n17_thor_fp8 import (
 
 
 class GrootN17TorchFrontendThorFP16(GrootN17TorchFrontendThorFP8):
-    """N1.7 Thor FP16 *backbone* reference (ViT/DeepStack/LLM/VL-self-attn).
+    """N1.7 Thor full-FP16 reference (no FP8 anywhere).
 
-    Backbone GEMMs only run in FP16; the DiT action head stays on the
-    production FP8 graph. This is not a full-model FP16 path.
+    Backbone GEMMs run in FP16 (``_KBB_USE_FP8 = False``) and the DiT action
+    head stays bf16 (``_DIT_USE_FP8 = False``) — a fully non-quantized A/B
+    baseline for the whole model.
 
-    Flips the shared ``_run_kernel_backbone`` to feed every stage its fp16
-    shadow weights through ``fp16_nn`` (``_KBB_USE_FP8 = False``). The LLM
-    runs fully fp16 — ``PROTECT_LLM_FP16`` is forced to all 16 layers here
-    (the FP8 frontend defaults it to empty), since this reference computes
-    no FP8 activation scales.
+    Flips the shared ``_run_kernel_backbone`` to feed every backbone stage its
+    fp16 shadow weights through ``fp16_nn``. The LLM runs fully fp16 —
+    ``PROTECT_LLM_FP16`` is forced to all 16 layers here (the FP8 frontend
+    defaults it to empty), since this reference computes no FP8 activation
+    scales.
     """
 
     _KBB_USE_FP8 = False
+    _DIT_USE_FP8 = False
     PROTECT_LLM_FP16 = tuple(range(16))
 
     def _ensure_act_scales(self, aux: dict) -> None:
