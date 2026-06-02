@@ -572,16 +572,18 @@ class GrootN17TorchFrontendThor:
         from flash_rt.models.groot_n17 import pipeline_thor
 
         Sa = action_horizon + 1
-        if not hasattr(self, "_dit_cross_K"):
-            self._precompute_dit_cross_kv()
-        if not hasattr(self, "_infer_bufs"):
-            self._allocate_infer_buffers(action_horizon)
-        if not hasattr(self, "_dit_attn"):
-            self._build_dit_attn(Sa)
         if not hasattr(self, "_gemm"):
             import flash_rt.flash_rt_kernels as _fvk
             self._fvk = _fvk
             self._gemm = _fvk.GemmRunner()
+        # Kernelized cross-KV: allocates the persistent K/V buffers (fixed
+        # data_ptrs) that the attention backend and the cross-KV graph share.
+        # Must run before _build_dit_attn so the backend wires those ptrs.
+        self._setup_cross_kv_kernel()
+        if not hasattr(self, "_infer_bufs"):
+            self._allocate_infer_buffers(action_horizon)
+        if not hasattr(self, "_dit_attn"):
+            self._build_dit_attn(Sa)
         self._prepare_kernel_dit(num_inference_timesteps)
         self._allocate_kernel_dit_buffers(action_horizon)
 
@@ -670,8 +672,11 @@ class GrootN17TorchFrontendThor:
 
         self._kdit_fwd = (_state_fwd, _step_fwd)
 
-        # Warmup on the default stream to prime both GemmRunner algo caches.
+        # Warmup on the default stream to prime both GemmRunner algo caches
+        # (cross-KV, state and per-step shapes all selected here so the
+        # captured graphs bake stable, working cuBLASLt algos).
         for _ in range(3):
+            self._cross_kv_fwd(0)
             _state_fwd(0)
             for step in range(num_inference_timesteps):
                 _step_fwd(step, 0)
@@ -689,10 +694,20 @@ class GrootN17TorchFrontendThor:
             torch.cuda.synchronize()
             return graph
 
-        self._k_state_graph = _capture(_state_fwd)
-        self._kdit_graphs = [
-            _capture(lambda s, step=step: _step_fwd(step, s))
-            for step in range(num_inference_timesteps)]
+        # Single combined graph for the entire action-head side: cross-KV
+        # refresh + state encode + all diffusion steps. The three per-frame
+        # inputs (_ck_bb_src, _k_state_in, _k_actions) are written before the
+        # one replay. Matches the Pi0.5 two-graph e2e structure (vision graph
+        # + action graph). _nsteps records the captured step count.
+        self._k_nsteps = num_inference_timesteps
+
+        def _dit_all(s):
+            self._cross_kv_fwd(s)
+            _state_fwd(s)
+            for step in range(num_inference_timesteps):
+                _step_fwd(step, s)
+
+        self._k_dit_graph = _capture(_dit_all)
 
     def _bake_calibration(self, out_vit, out_ds, out_llm, out_vlsa) -> None:
         """Convert per-stage amax dicts to per-layer device d_act_scale tensors
@@ -1024,40 +1039,43 @@ class GrootN17TorchFrontendThor:
         if not hasattr(self, "_backbone_features"):
             raise RuntimeError("call set_prompt before infer")
 
-        # Lazy first-call: pre-compute DiT cross-KV from backbone (constant
-        # across diffusion steps; only depends on prompt → backbone).
-        if not hasattr(self, "_dit_cross_K"):
-            self._precompute_dit_cross_kv()
-
         device = self.device
         D = 1536
         action_dim = 132
         Sa = action_horizon + 1   # 1 state + 40 action tokens
 
         # ── Fully-kernelized graph fast-path ──────────────────────────────
-        # Replay the once-per-frame state encode + the per-step DiT chain
+        # Per frame, end to end in kernels: refresh cross-KV from the current
+        # backbone, then replay the state encode + the per-step DiT chain
         # (action_encode + DiT + output_proj + decode + Euler), all captured
         # as CUDA graphs over persistent kernel buffers. Zero PyTorch compute
         # on the hot path. Captured lazily on first use behind set_prompt's
         # warmup. Falls back to the eager path on a timestep-count mismatch.
         if use_dit_graph:
-            if not hasattr(self, "_kdit_graphs"):
+            if not hasattr(self, "_k_dit_graph"):
                 self._capture_kernel_dit_graphs(
                     num_inference_timesteps=num_inference_timesteps,
                     action_horizon=action_horizon)
-            if len(self._kdit_graphs) == num_inference_timesteps:
+            if self._k_nsteps == num_inference_timesteps:
+                # Write the three per-frame inputs, then one graph replay does
+                # cross-KV refresh + state encode + all diffusion steps.
+                self._ck_bb_src.copy_(
+                    self._backbone_features.reshape(self.Se, 2048).half())
                 self._k_state_in.copy_(
                     state_normalized.reshape(1, action_dim).to(device).bfloat16())
-                self._k_state_graph.replay()
                 if initial_noise is not None:
                     self._k_actions.copy_(
                         initial_noise.reshape(action_horizon, action_dim).to(device).bfloat16())
                 else:
                     self._k_actions.copy_(torch.randn(
                         action_horizon, action_dim, dtype=torch.bfloat16, device=device))
-                for step in range(num_inference_timesteps):
-                    self._kdit_graphs[step].replay()
+                self._k_dit_graph.replay()
                 return self._k_actions.float().view(1, action_horizon, action_dim)
+
+        # Eager fallback: torch cross-KV from backbone (graph path refreshes
+        # it via the kernel cross-KV graph instead).
+        if not hasattr(self, "_dit_cross_K"):
+            self._precompute_dit_cross_kv()
 
         # ── state encode (one-shot; doesn't change across steps) ──────────
         state_features = self._run_state_encode(state_normalized.to(device).bfloat16())  # (1, 1, 1536) bf16
@@ -1198,6 +1216,79 @@ class GrootN17TorchFrontendThor:
             V_list.append(V)
         self._dit_cross_K = K_list
         self._dit_cross_V = V_list
+
+    def _setup_cross_kv_kernel(self) -> None:
+        """Kernelized DiT cross-KV: gather the backbone's text/image rows and
+        project them to per-layer K/V entirely on-device, writing into the
+        SAME persistent buffers the DiT attention backend reads. The backbone
+        changes every frame (new image), so this must run per-frame — running
+        it as a kernel graph removes the only remaining PyTorch on the hot
+        path (the previous torch implementation cost ~5.4 ms/frame).
+
+        Replaces the torch ``_precompute_dit_cross_kv`` buffers with persistent
+        ones (fixed data_ptrs) so both ``_build_dit_attn`` and the captured
+        cross-KV graph reference them.
+        """
+        if hasattr(self, "_ck_text_idx"):
+            return
+        dev = self.device
+        S = self.Se
+        mask = self._visual_pos_masks
+        self._ck_text_idx = torch.where(~mask)[0].to(torch.int64).contiguous()
+        self._ck_image_idx = torch.where(mask)[0].to(torch.int64).contiguous()
+        nt = int(self._ck_text_idx.numel())
+        ni = int(self._ck_image_idx.numel())
+        self._ck_nt, self._ck_ni = nt, ni
+        bf = torch.bfloat16
+        # per-frame backbone input (fp16, copied in before replay) + bf16 cast
+        self._ck_bb_src = torch.empty(S, 2048, dtype=torch.float16, device=dev)
+        self._ck_bb = torch.empty(S, 2048, dtype=bf, device=dev)
+        self._ck_text_src = torch.empty(nt, 2048, dtype=bf, device=dev)
+        self._ck_image_src = torch.empty(ni, 2048, dtype=bf, device=dev)
+        # persistent per-layer K/V buffers (overwrite torch list)
+        self._dit_cross_K = [
+            torch.empty((nt if (2 * j) % 4 == 0 else ni), 1536, dtype=bf, device=dev)
+            for j in range(16)]
+        self._dit_cross_V = [
+            torch.empty((nt if (2 * j) % 4 == 0 else ni), 1536, dtype=bf, device=dev)
+            for j in range(16)]
+        if not hasattr(self, "_fvk"):
+            import flash_rt.flash_rt_kernels as _fvk
+            self._fvk = _fvk
+        if not hasattr(self, "_mlp_gemm"):
+            self._mlp_gemm = self._fvk.GemmRunner()
+        # seed the buffers from the current backbone (eager) so a non-graph
+        # consumer sees valid K/V immediately.
+        self._ck_bb_src.copy_(self._backbone_features.reshape(S, 2048).half())
+        self._cross_kv_fwd(0)
+
+    def _cross_kv_fwd(self, s: int) -> None:
+        """Pure-kernel cross-KV forward over the persistent buffers (graph-safe).
+        Reads ``_ck_bb_src`` (current backbone), writes ``_dit_cross_K/V``."""
+        K = self._fvk
+        mg = self._mlp_gemm
+        S = self.Se
+        nt, ni = self._ck_nt, self._ck_ni
+        K.cast_fp16_to_bf16(self._ck_bb_src.data_ptr(), self._ck_bb.data_ptr(), S * 2048, s)
+        K.qwen36_embedding_lookup_bf16(
+            self._ck_text_idx.data_ptr(), self._ck_bb.data_ptr(),
+            self._ck_text_src.data_ptr(), nt, 2048, s)
+        K.qwen36_embedding_lookup_bf16(
+            self._ck_image_idx.data_ptr(), self._ck_bb.data_ptr(),
+            self._ck_image_src.data_ptr(), ni, 2048, s)
+        for j in range(16):
+            li = 2 * j
+            text = (li % 4 == 0)
+            src = self._ck_text_src if text else self._ck_image_src
+            N = nt if text else ni
+            mg.bf16_nn(src.data_ptr(), self._dit_k_w[li].data_ptr(),
+                       self._dit_cross_K[j].data_ptr(), N, 1536, 2048, s)
+            K.add_bias_bf16(self._dit_cross_K[j].data_ptr(),
+                            self._dit_k_b[li].data_ptr(), N, 1536, s)
+            mg.bf16_nn(src.data_ptr(), self._dit_v_w[li].data_ptr(),
+                       self._dit_cross_V[j].data_ptr(), N, 1536, 2048, s)
+            K.add_bias_bf16(self._dit_cross_V[j].data_ptr(),
+                            self._dit_v_b[li].data_ptr(), N, 1536, s)
 
     def _compute_timestep_emb(self, t_disc: int) -> torch.Tensor:
         """diffusers Timesteps + TimestepEmbedding → (1, 1536) fp16."""
