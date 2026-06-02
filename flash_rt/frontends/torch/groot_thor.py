@@ -260,6 +260,27 @@ class GrootTorchFrontendThor:
             'unit_scale': self._unit_scale.data_ptr(),
         }
 
+        # ── FP16 reference path: raw (non-quantized) SigLIP GEMM weights ──
+        # ``siglip_forward(use_fp8=False)`` consumes the same dict but expects
+        # FP16 [K, N] qkv/o/up/down weights. Override those pointers in place.
+        if not self.use_fp8:
+            _vp = f"{VIS_PREFIX}.encoder.layers.{{i}}"
+            self._sig_qkv_w_fp16, self._sig_o_w_fp16 = [], []
+            self._sig_up_w_fp16, self._sig_down_w_fp16 = [], []
+            for i in range(L):
+                p = _vp.format(i=i)
+                q = sd[f"{p}.self_attn.q_proj.weight"]
+                k = sd[f"{p}.self_attn.k_proj.weight"]
+                v = sd[f"{p}.self_attn.v_proj.weight"]
+                self._sig_qkv_w_fp16.append(torch.cat([q, k, v], dim=0).T.contiguous().to(fp16))
+                self._sig_o_w_fp16.append(sd[f"{p}.self_attn.out_proj.weight"].T.contiguous().to(fp16))
+                self._sig_up_w_fp16.append(sd[f"{p}.mlp.fc1.weight"].T.contiguous().to(fp16))
+                self._sig_down_w_fp16.append(sd[f"{p}.mlp.fc2.weight"].T.contiguous().to(fp16))
+            self._sig_weights['qkv_w'] = [w.data_ptr() for w in self._sig_qkv_w_fp16]
+            self._sig_weights['o_w'] = [w.data_ptr() for w in self._sig_o_w_fp16]
+            self._sig_weights['up_w'] = [w.data_ptr() for w in self._sig_up_w_fp16]
+            self._sig_weights['down_w'] = [w.data_ptr() for w in self._sig_down_w_fp16]
+
         logger.info("SigLIP2 weights loaded: %d layers, patch_embed [%s], pos_embed [%s], mlp1 ready",
                      L, list(self._sig_patch_w.shape), list(self._sig_pos_embed.shape))
 
@@ -648,6 +669,10 @@ class GrootTorchFrontendThor:
         self._sig_attn   = torch.empty(S_sig, D_sig, dtype=fp16, device='cuda')
         self._sig_hidden = torch.empty(S_sig, H_sig, dtype=fp16, device='cuda')
         self._sig_hid_fp8 = torch.zeros(S_sig * H_sig, dtype=torch.uint8, device='cuda')
+        # FP16-path scratch (x_norm / fg) required by ``_siglip_forward_fp16``;
+        # harmless extra buffers when running the FP8 path.
+        self._sig_x_norm = torch.empty(S_sig, D_sig, dtype=fp16, device='cuda')
+        self._sig_fg = torch.empty(S_sig, D_sig, dtype=fp16, device='cuda')
 
         self._sig_bufs = {
             'x':       self._sig_x.data_ptr(),
@@ -656,6 +681,8 @@ class GrootTorchFrontendThor:
             'attn_out': self._sig_attn.data_ptr(),
             'hidden':  self._sig_hidden.data_ptr(),
             'hid_fp8': self._sig_hid_fp8.data_ptr(),
+            'x_norm':  self._sig_x_norm.data_ptr(),
+            'fg':      self._sig_fg.data_ptr(),
         }
 
         # ── mlp1 buffer (after pixel unshuffle) ──
@@ -2016,7 +2043,7 @@ class GrootTorchFrontendThor:
 
         # ── 1. Build CKernel objects FIRST (from sd dict, before SigLIP FP8 init) ──
         # This ensures cuBLASLt workspace is not polluted by SigLIP FP8 quantization
-        self._g_qwen3 = CKernelQwen3(self._full_sd, Se)
+        self._g_qwen3 = CKernelQwen3(self._full_sd, Se, use_fp8=self.use_fp8)
         vlln_w = self._vlln_w.to(fp16)
         vlln_b = self._vlln_b.to(fp16)
 
@@ -2025,7 +2052,7 @@ class GrootTorchFrontendThor:
 
         T = self.action_horizon
         self._g_dit = CKernelDiTHead(self._full_sd, self._embodiment_id, T,
-                                      (1, Se, self.D_llm))
+                                      (1, Se, self.D_llm), use_fp8=self.use_fp8)
 
         # ── 2. SigLIP init (after CKernel objects, so FP8 quant doesn't pollute cuBLAS state) ──
         self._load_siglip2_weights(self._full_sd)
@@ -2101,7 +2128,7 @@ class GrootTorchFrontendThor:
         s = stream.cuda_stream
         def _run_sig(si):
             siglip_forward(self._gemm, fvk, self._sig_bufs, self._sig_weights, sig_dims,
-                           stream=si, attn=self._attn)
+                           stream=si, attn=self._attn, use_fp8=self.use_fp8)
             fvk.layer_norm_fp16(self._sig_x.data_ptr(), self._sig_post_ln_w.data_ptr(),
                                 self._sig_post_ln_b.data_ptr(), self._g_sig_postln.data_ptr(),
                                 S_sig, self.D_sig, 1e-6, si)
@@ -2196,8 +2223,13 @@ class GrootTorchFrontendThor:
         torch.cuda.synchronize()
         logger.info("  Qwen3 graph captured (Se=%d)", Se)
 
-        # Pre-allocate input_embeds buffer
-        self._g_ie_buf = torch.empty(Se, self.D_llm, dtype=fp16, device='cuda')
+        # Reuse the exact buffer the Qwen3 graph baked into its captured
+        # ``gpu_copy(b_x, ie_fp16)`` so per-frame ``_g_ie_buf`` writes land at
+        # the pointer the graph reads on replay. (A fresh allocation here only
+        # worked because the caching allocator happened to reuse ``ie_fp16``'s
+        # freed block; the FP16 path's extra weight allocations perturb that,
+        # so make the aliasing explicit.)
+        self._g_ie_buf = ie_fp16
 
         self._graphs_built = True
         logger.info("All CUDA Graphs ready")

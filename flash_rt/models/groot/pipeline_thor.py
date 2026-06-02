@@ -471,8 +471,9 @@ class CKernelQwen3:
     attention_mha (cuBLAS), residual_add. Internal FP32 precision.
     """
 
-    def __init__(self, sd_or_path, Se):
+    def __init__(self, sd_or_path, Se, use_fp8=True):
         self.gemm = fvk.GemmRunner()
+        self.use_fp8 = bool(use_fp8)
         self.D = 2048; self.NHQ = 16; self.NHKV = 8; self.HD = 128
         self.H = 6144; self.L = 16; self.Se = Se
         self.QKV = self.NHQ * self.HD + 2 * self.NHKV * self.HD
@@ -516,6 +517,10 @@ class CKernelQwen3:
                                 for p in ('q', 'k', 'v')], dim=0).T.contiguous()
             w['qkv_fp8'], s = _quant_fp8(qkv_T)
             w['qkv_s'] = torch.tensor([s], dtype=torch.float32, device='cuda')
+            if not self.use_fp8:
+                # FP16 reference uses the same [K, N] weight layout and the same
+                # cuBLASLt fp16_nn GEMM as the o_proj below.
+                w['qkv_fp16'] = qkv_T.to(fp16)
             w['q_norm_w'] = sd[f"{lp}.self_attn.q_norm.weight"].to(fp16)
             w['k_norm_w'] = sd[f"{lp}.self_attn.k_norm.weight"].to(fp16)
             w['o_w'] = sd[f"{lp}.self_attn.o_proj.weight"].T.contiguous().to(fp16)
@@ -527,6 +532,9 @@ class CKernelQwen3:
             down_T = sd[f"{lp}.mlp.down_proj.weight"].T.contiguous()
             w['down_fp8'], s2 = _quant_fp8(down_T)
             w['down_s'] = torch.tensor([s2], dtype=torch.float32, device='cuda')
+            if not self.use_fp8:
+                w['gu_fp16'] = gate_up.to(fp16)
+                w['down_fp16'] = down_T.to(fp16)
             self.layers.append(w)
         self.final_norm_w = sd["backbone.model.language_model.model.norm.weight"].to(fp16)
 
@@ -571,11 +579,15 @@ class CKernelQwen3:
             as_dn  = self.act_scales.data_ptr() + (i * 3 + 2) * 4
             fvk.rms_norm_fp16(self.b_x.data_ptr(), w['ln_w'].data_ptr(),
                               self.b_xn.data_ptr(), Se, D, 1e-6, s)
-            fvk.quantize_fp8_static_fp16(self.b_xn.data_ptr(), self.b_fp8_qkv.data_ptr(),
-                                          as_qkv, Se * D, s)
-            self.gemm.fp8_descale_fp16(self.b_fp8_qkv.data_ptr(), w['qkv_fp8'].data_ptr(),
-                                        self.b_qkv.data_ptr(), Se, self.QKV, D,
-                                        as_qkv, w['qkv_s'].data_ptr(), s)
+            if self.use_fp8:
+                fvk.quantize_fp8_static_fp16(self.b_xn.data_ptr(), self.b_fp8_qkv.data_ptr(),
+                                              as_qkv, Se * D, s)
+                self.gemm.fp8_descale_fp16(self.b_fp8_qkv.data_ptr(), w['qkv_fp8'].data_ptr(),
+                                            self.b_qkv.data_ptr(), Se, self.QKV, D,
+                                            as_qkv, w['qkv_s'].data_ptr(), s)
+            else:
+                self.gemm.fp16_nn(self.b_xn.data_ptr(), w['qkv_fp16'].data_ptr(),
+                                  self.b_qkv.data_ptr(), Se, self.QKV, D, s)
             fvk.gpu_strided_copy_fp16(self.b_qkv.data_ptr(), self.b_q.data_ptr(), Se, NHQ*HD, self.QKV, 0, s)
             fvk.gpu_strided_copy_fp16(self.b_qkv.data_ptr(), self.b_k.data_ptr(), Se, NHKV*HD, self.QKV, NHQ*HD, s)
             fvk.rms_norm_fp16(self.b_q.data_ptr(), w['q_norm_w'].data_ptr(), self.b_q.data_ptr(), Se*NHQ, HD, 1e-6, s)
@@ -594,15 +606,27 @@ class CKernelQwen3:
             self.gemm.fp16_nn(self.b_o.data_ptr(), w['o_w'].data_ptr(), self.b_xn.data_ptr(), Se, D, D, s)
             fvk.residual_add_fp16(self.b_x.data_ptr(), self.b_xn.data_ptr(), Se * D, s)
             fvk.rms_norm_fp16(self.b_x.data_ptr(), w['ln2_w'].data_ptr(), self.b_xn.data_ptr(), Se, D, 1e-6, s)
-            fvk.quantize_fp8_static_fp16(self.b_xn.data_ptr(), self.b_fp8_ffn.data_ptr(), as_gu, Se*D, s)
-            self.gemm.fp8_descale_fp16(self.b_fp8_ffn.data_ptr(), w['gu_fp8'].data_ptr(), self.b_gu.data_ptr(),
-                                        Se, 2*H, D, as_gu, w['gu_s'].data_ptr(), s)
+            if self.use_fp8:
+                fvk.quantize_fp8_static_fp16(self.b_xn.data_ptr(), self.b_fp8_ffn.data_ptr(), as_gu, Se*D, s)
+                self.gemm.fp8_descale_fp16(self.b_fp8_ffn.data_ptr(), w['gu_fp8'].data_ptr(), self.b_gu.data_ptr(),
+                                            Se, 2*H, D, as_gu, w['gu_s'].data_ptr(), s)
+            else:
+                self.gemm.fp16_nn(self.b_xn.data_ptr(), w['gu_fp16'].data_ptr(),
+                                  self.b_gu.data_ptr(), Se, 2*H, D, s)
             fvk.gpu_strided_copy_fp16(self.b_gu.data_ptr(), self.b_gate.data_ptr(), Se, H, 2*H, 0, s)
             fvk.gpu_strided_copy_fp16(self.b_gu.data_ptr(), self.b_up.data_ptr(), Se, H, 2*H, H, s)
-            fvk.silu_mul_split_fp8_fp16(self.b_gate.data_ptr(), self.b_up.data_ptr(),
-                                         self.b_fp8_ffn.data_ptr(), Se*H, as_dn, s)
-            self.gemm.fp8_descale_fp16(self.b_fp8_ffn.data_ptr(), w['down_fp8'].data_ptr(), self.b_down.data_ptr(),
-                                        Se, D, H, as_dn, w['down_s'].data_ptr(), s)
+            if self.use_fp8:
+                fvk.silu_mul_split_fp8_fp16(self.b_gate.data_ptr(), self.b_up.data_ptr(),
+                                             self.b_fp8_ffn.data_ptr(), Se*H, as_dn, s)
+                self.gemm.fp8_descale_fp16(self.b_fp8_ffn.data_ptr(), w['down_fp8'].data_ptr(), self.b_down.data_ptr(),
+                                            Se, D, H, as_dn, w['down_s'].data_ptr(), s)
+            else:
+                fvk.silu_inplace_fp16(self.b_gate.data_ptr(), Se*H, s)
+                # SiLU(gate) * up -> b_gu (free after the gate/up split), so the
+                # down GEMM input does not alias either operand.
+                fvk.mul_fp16(self.b_gate.data_ptr(), self.b_up.data_ptr(), self.b_gu.data_ptr(), Se*H, s)
+                self.gemm.fp16_nn(self.b_gu.data_ptr(), w['down_fp16'].data_ptr(),
+                                  self.b_down.data_ptr(), Se, D, H, s)
             fvk.residual_add_fp16(self.b_x.data_ptr(), self.b_down.data_ptr(), Se * D, s)
         fvk.rms_norm_fp16(self.b_x.data_ptr(), self.final_norm_w.data_ptr(), self.b_xn.data_ptr(), Se, D, 1e-6, s)
         return self.b_xn
@@ -615,9 +639,11 @@ class CKernelDiTHead:
     precomputed timestep/AdaLN conditioning, FP8 hybrid GEMMs.
     """
 
-    def __init__(self, sd_or_path, embodiment_id, action_horizon, backbone_shape):
+    def __init__(self, sd_or_path, embodiment_id, action_horizon, backbone_shape,
+                 use_fp8=True):
         self.gemm = fvk.GemmRunner()
         self.ctx = fvk.FvkContext()
+        self.use_fp8 = bool(use_fp8)
         self.D = 1536; self.H = 6144; self.NH = 32; self.HD = 48
         self.L = 32; self.action_dim = 128; self.num_steps = 4
         self.T = action_horizon; self.Sa = 1 + action_horizon
@@ -672,12 +698,17 @@ class CKernelDiTHead:
                 w['qkv_fp8'], s = _quant_fp8(qkv_m)
                 w['qkv_s'] = torch.tensor([s], dtype=torch.float32, device='cuda')
                 w['qkv_b'] = torch.cat([w['q_b'], w['k_b'], w['v_b']], dim=0)
+                if not self.use_fp8:
+                    w['qkv_fp16'] = qkv_m.to(fp16)
             up_T = sd[f"{prefix}.ff.net.0.proj.weight"].T.contiguous()
             dn_T = sd[f"{prefix}.ff.net.2.weight"].T.contiguous()
             w['ff_up_fp8'], s = _quant_fp8(up_T); w['ff_up_s'] = torch.tensor([s], dtype=torch.float32, device='cuda'); w['ff_up_alpha'] = float(s)
             w['ff_up_b'] = to(sd[f"{prefix}.ff.net.0.proj.bias"])
             w['ff_dn_fp8'], s = _quant_fp8(dn_T); w['ff_dn_s'] = torch.tensor([s], dtype=torch.float32, device='cuda'); w['ff_dn_alpha'] = float(s)
             w['ff_dn_b'] = to(sd[f"{prefix}.ff.net.2.bias"])
+            if not self.use_fp8:
+                w['ff_up_fp16'] = up_T.to(fp16)
+                w['ff_dn_fp16'] = dn_T.to(fp16)
             self.dit.append(w)
 
     def _precompute(self, sd):
@@ -859,7 +890,10 @@ class CKernelDiTHead:
             as_dn_ptr  = self._dit_act_scales_dev.data_ptr() + (l * 3 + 2) * 4
             qkv_alpha, up_alpha, dn_alpha = self._dit_alpha_cache[l]
             if is_self:
-                self._fp8_gemm(self.b_h_norm.data_ptr(), w['qkv_fp8'].data_ptr(), w['qkv_s'].data_ptr(), Sa, 3*D, D, self.b_qkv.data_ptr(), as_qkv_ptr, s)
+                if self.use_fp8:
+                    self._fp8_gemm(self.b_h_norm.data_ptr(), w['qkv_fp8'].data_ptr(), w['qkv_s'].data_ptr(), Sa, 3*D, D, self.b_qkv.data_ptr(), as_qkv_ptr, s)
+                else:
+                    self._fp16_gemm(self.b_h_norm.data_ptr(), w['qkv_fp16'].data_ptr(), self.b_qkv.data_ptr(), Sa, 3*D, D, s)
                 fvk.add_bias_fp16(self.b_qkv.data_ptr(), w['qkv_b'].data_ptr(), Sa, 3*D, s)
                 fvk.gpu_strided_copy_fp16(self.b_qkv.data_ptr(), self.b_q_self.data_ptr(), Sa, D, 3*D, 0, s)
                 fvk.gpu_strided_copy_fp16(self.b_qkv.data_ptr(), self.b_k_self.data_ptr(), Sa, D, 3*D, D, s)
@@ -892,14 +926,21 @@ class CKernelDiTHead:
             fvk.add_bias_fp16(self.b_o.data_ptr(), w['o_b'].data_ptr(), Sa, D, s)
             fvk.residual_add_fp16(self.b_hidden.data_ptr(), self.b_o.data_ptr(), Sa*D, s)
             fvk.layer_norm_no_affine_fp16(self.b_hidden.data_ptr(), self.b_h_norm.data_ptr(), Sa, D, 1e-5, s)
-            # FFN-up + bias + GELU fused (3 kernels → 1)
-            self._fp8_gemm_gelu_bias(self.b_h_norm.data_ptr(), w['ff_up_fp8'].data_ptr(),
-                                      up_alpha, Sa, H, D, self.b_ff_h.data_ptr(),
-                                      w['ff_up_b'].data_ptr(), as_up_ptr, s)
-            # FFN-down + bias fused (2 kernels → 1)
-            self._fp8_gemm_bias(self.b_ff_h.data_ptr(), w['ff_dn_fp8'].data_ptr(),
-                                 dn_alpha, Sa, D, H, self.b_ff_out.data_ptr(),
-                                 w['ff_dn_b'].data_ptr(), as_dn_ptr, s)
+            if self.use_fp8:
+                # FFN-up + bias + GELU fused (3 kernels → 1)
+                self._fp8_gemm_gelu_bias(self.b_h_norm.data_ptr(), w['ff_up_fp8'].data_ptr(),
+                                          up_alpha, Sa, H, D, self.b_ff_h.data_ptr(),
+                                          w['ff_up_b'].data_ptr(), as_up_ptr, s)
+                # FFN-down + bias fused (2 kernels → 1)
+                self._fp8_gemm_bias(self.b_ff_h.data_ptr(), w['ff_dn_fp8'].data_ptr(),
+                                     dn_alpha, Sa, D, H, self.b_ff_out.data_ptr(),
+                                     w['ff_dn_b'].data_ptr(), as_dn_ptr, s)
+            else:
+                self._fp16_gemm(self.b_h_norm.data_ptr(), w['ff_up_fp16'].data_ptr(), self.b_ff_h.data_ptr(), Sa, H, D, s)
+                fvk.add_bias_fp16(self.b_ff_h.data_ptr(), w['ff_up_b'].data_ptr(), Sa, H, s)
+                fvk.gelu_inplace_fp16(self.b_ff_h.data_ptr(), Sa*H, s)
+                self._fp16_gemm(self.b_ff_h.data_ptr(), w['ff_dn_fp16'].data_ptr(), self.b_ff_out.data_ptr(), Sa, D, H, s)
+                fvk.add_bias_fp16(self.b_ff_out.data_ptr(), w['ff_dn_b'].data_ptr(), Sa, D, s)
             fvk.residual_add_fp16(self.b_hidden.data_ptr(), self.b_ff_out.data_ptr(), Sa*D, s)
         fvk.ada_layer_norm_fp16(self.b_hidden.data_ptr(), self.out_scales[step].data_ptr(),
                                  self.out_shifts[step].data_ptr(), self.b_h_norm.data_ptr(), Sa, D, 1e-6, s)
