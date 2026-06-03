@@ -242,6 +242,7 @@ class Pi05Pipeline:
         # FP8 activation scratch buffers + per-layer static scales
         self.fp8_act_scales = {}  # name -> CudaBuffer(1, fp32)
         self.fp8_calibrated = False
+        self._fp8_current_decoder_step = -1
         self._allocate_fp8_scratch()
         self.int8_act_scales = {}  # name -> CudaBuffer(rows, fp32), runtime-dynamic
         self._allocate_int8_scratch()
@@ -587,6 +588,19 @@ class Pi05Pipeline:
             self.fp8_act_scales[name] = buf
         return buf
 
+    def _fp8_decoder_step_scale_name(self, weight_name: str) -> str:
+        step = getattr(self, "_fp8_current_decoder_step", -1)
+        if step >= 0 and weight_name.startswith("decoder_"):
+            return f"{weight_name}__step_{step}"
+        return weight_name
+
+    def _fp8_static_scale_ptr(self, weight_name: str) -> int:
+        step_name = self._fp8_decoder_step_scale_name(weight_name)
+        buf = self.fp8_act_scales.get(step_name)
+        if buf is None:
+            buf = self.fp8_act_scales[weight_name]
+        return buf.ptr.value
+
     def _pick_fp8_scratch(self, weight_name: str, act_n: int) -> tuple[int, int]:
         """Return (act_fp8_ptr, act_scale_ptr) scratch for the right domain.
 
@@ -720,26 +734,33 @@ class Pi05Pipeline:
         """
         fvk = self.fvk
         w_fp8_ptr, w_scale_ptr = self._weight_fp8(weight_name)
-        act_fp8_ptr, _scratch_scale_ptr = self._pick_fp8_scratch(weight_name, act_n)
+        act_fp8_ptr, scratch_scale_ptr = self._pick_fp8_scratch(weight_name, act_n)
 
         if self.fp8_calibrated and weight_name in self.fp8_act_scales:
-            static_scale_ptr = self.fp8_act_scales[weight_name].ptr.value
+            static_scale_ptr = self._fp8_static_scale_ptr(weight_name)
             fvk.quantize_fp8_static(
                 act_bf16_ptr, act_fp8_ptr, static_scale_ptr, act_n, stream=stream)
             self._fp8_matmul(
                 act_fp8_ptr, w_fp8_ptr, out_bf16_ptr,
                 M, N, K, static_scale_ptr, w_scale_ptr, stream)
         else:
-            # Dynamic quantization path (calibration run): write the
-            # activation scale directly into the layer's *persistent* scale
-            # buffer so that when we flip fp8_calibrated=True, the scale is
-            # already there.
+            # Dynamic calibration path: use the per-call scratch scale for
+            # this GEMM, while accumulating a max into the persistent static
+            # scale. Decoder weights are visited once per denoise step; direct
+            # writes would leave only the final step's scale.
             layer_scale = self._fp8_scale_buf(weight_name)
+            step_scale = self._fp8_scale_buf(
+                self._fp8_decoder_step_scale_name(weight_name))
             fvk.quantize_fp8_device(
-                act_bf16_ptr, act_fp8_ptr, layer_scale.ptr.value, act_n, stream=stream)
+                act_bf16_ptr, act_fp8_ptr, scratch_scale_ptr, act_n, stream=stream)
+            fvk.fp8_accumulate_scale_max(
+                scratch_scale_ptr, layer_scale.ptr.value, stream=stream)
+            if step_scale is not layer_scale:
+                fvk.fp8_accumulate_scale_max(
+                    scratch_scale_ptr, step_scale.ptr.value, stream=stream)
             self._fp8_matmul(
                 act_fp8_ptr, w_fp8_ptr, out_bf16_ptr,
-                M, N, K, layer_scale.ptr.value, w_scale_ptr, stream)
+                M, N, K, scratch_scale_ptr, w_scale_ptr, stream)
 
     def _fp8_gemm_fused(self, act_fp8_ptr: int, weight_name: str,
                         out_bf16_ptr: int, M: int, N: int, K: int,
@@ -1364,42 +1385,47 @@ class Pi05Pipeline:
         ds = self.chunk_size
         fused = self.use_fp8_decoder and self.fp8_calibrated
 
-        for step in range(self.num_steps):
-            # C0: Action input projection: noise (ds, 32) → decoder_x (ds, 1024)
-            gemm.bf16_nn(
-                B["diffusion_noise"].ptr.value,
-                W["decoder_action_in_proj_w"],
-                B["decoder_x"].ptr.value,
-                ds, DEC_D, ACTION_DIM, stream=stream)
-            self._bias_add_bf16(
-                B["decoder_x"].ptr.value, W["decoder_action_in_proj_b"],
-                ds, DEC_D, stream)
+        prev_decoder_step = getattr(self, "_fp8_current_decoder_step", -1)
+        try:
+            for step in range(self.num_steps):
+                self._fp8_current_decoder_step = step
+                # C0: Action input projection: noise (ds, 32) → decoder_x (ds, 1024)
+                gemm.bf16_nn(
+                    B["diffusion_noise"].ptr.value,
+                    W["decoder_action_in_proj_w"],
+                    B["decoder_x"].ptr.value,
+                    ds, DEC_D, ACTION_DIM, stream=stream)
+                self._bias_add_bf16(
+                    B["decoder_x"].ptr.value, W["decoder_action_in_proj_b"],
+                    ds, DEC_D, stream)
 
-            # 18 decoder layers
-            for i in range(DEC_L):
-                skip_c1 = (fused or self.use_int8_decoder) and i > 0
-                self._decoder_layer(i, step, enc_seq, ds, skip_c1, stream)
+                # 18 decoder layers
+                for i in range(DEC_L):
+                    skip_c1 = (fused or self.use_int8_decoder) and i > 0
+                    self._decoder_layer(i, step, enc_seq, ds, skip_c1, stream)
 
-            # C8: Final AdaRMSNorm + output projection
-            fvk.ada_rms_norm_style(
-                B["decoder_x"].ptr.value, self._rms_ones_dec.ptr.value,
-                self._style_slice_ptr("decoder_style_final", step),
-                B["x_normed_buf"].ptr.value, B["gate_buf"].ptr.value,
-                ds, DEC_D, 1e-6, stream=stream)
-            gemm.bf16_nn(
-                B["x_normed_buf"].ptr.value,
-                W["decoder_action_out_proj_w"],
-                B["decoder_action_buf"].ptr.value,
-                ds, ACTION_DIM, DEC_D, stream=stream)
-            self._bias_add_bf16(
-                B["decoder_action_buf"].ptr.value,
-                W["decoder_action_out_proj_b"],
-                ds, ACTION_DIM, stream)
-            # noise += action_buf (weights pre-scaled by -1/num_steps by frontend)
-            fvk.residual_add(
-                B["diffusion_noise"].ptr.value,
-                B["decoder_action_buf"].ptr.value,
-                ds * ACTION_DIM, stream=stream)
+                # C8: Final AdaRMSNorm + output projection
+                fvk.ada_rms_norm_style(
+                    B["decoder_x"].ptr.value, self._rms_ones_dec.ptr.value,
+                    self._style_slice_ptr("decoder_style_final", step),
+                    B["x_normed_buf"].ptr.value, B["gate_buf"].ptr.value,
+                    ds, DEC_D, 1e-6, stream=stream)
+                gemm.bf16_nn(
+                    B["x_normed_buf"].ptr.value,
+                    W["decoder_action_out_proj_w"],
+                    B["decoder_action_buf"].ptr.value,
+                    ds, ACTION_DIM, DEC_D, stream=stream)
+                self._bias_add_bf16(
+                    B["decoder_action_buf"].ptr.value,
+                    W["decoder_action_out_proj_b"],
+                    ds, ACTION_DIM, stream)
+                # noise += action_buf (weights pre-scaled by -1/num_steps by frontend)
+                fvk.residual_add(
+                    B["diffusion_noise"].ptr.value,
+                    B["decoder_action_buf"].ptr.value,
+                    ds * ACTION_DIM, stream=stream)
+        finally:
+            self._fp8_current_decoder_step = prev_decoder_step
 
     def _decoder_layer(self, i: int, step: int, enc_seq: int, ds: int,
                        skip_c1: bool, stream: int) -> None:
@@ -1414,7 +1440,7 @@ class Pi05Pipeline:
         # C1: AdaRMSNorm with style modulation → FP8 (fused) or BF16
         qkv_name = f"decoder_attn_qkv_w_{i}"
         if fused:
-            act_scale_qkv = self.fp8_act_scales[qkv_name].ptr.value
+            act_scale_qkv = self._fp8_static_scale_ptr(qkv_name)
             if not skip_c1:
                 fvk.ada_rms_norm_style_fp8(
                     B["decoder_x"].ptr.value, self._rms_ones_dec.ptr.value,
@@ -1502,7 +1528,7 @@ class Pi05Pipeline:
         gate_name = f"decoder_ffn_gate_w_{i}"       # INT8 separate gate
         up_name   = f"decoder_ffn_up_w_{i}"         # INT8 separate up
         if fused:
-            act_scale_gu = self.fp8_act_scales[gu_name].ptr.value
+            act_scale_gu = self._fp8_static_scale_ptr(gu_name)
             fvk.gate_residual_ada_norm_fp8(
                 B["decoder_x"].ptr.value, B["x_normed_buf"].ptr.value,
                 B["gate_buf"].ptr.value,
@@ -1569,7 +1595,7 @@ class Pi05Pipeline:
         # C6: SiLU(gate) * up → FFN down
         down_name = f"decoder_ffn_down_w_{i}"
         if fused:
-            act_scale_down = self.fp8_act_scales[down_name].ptr.value
+            act_scale_down = self._fp8_static_scale_ptr(down_name)
             fvk.gate_geglu_merged_fp8(
                 B["decoder_gate_merged"].ptr.value,
                 B["dec_act_fp8_large"].ptr.value,
@@ -1610,7 +1636,7 @@ class Pi05Pipeline:
         # C7→C1_next: gate*residual + next layer's AdaRMSNorm → FP8 (fused)
         if fused and i < DEC_L - 1:
             next_qkv = f"decoder_attn_qkv_w_{i + 1}"
-            act_scale_next = self.fp8_act_scales[next_qkv].ptr.value
+            act_scale_next = self._fp8_static_scale_ptr(next_qkv)
             fvk.gate_residual_ada_norm_fp8(
                 B["decoder_x"].ptr.value, B["x_normed_buf"].ptr.value,
                 B["gate_buf"].ptr.value,

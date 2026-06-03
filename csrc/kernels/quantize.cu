@@ -133,6 +133,17 @@ __global__ void compute_scale_kernel(const float* d_absmax, float* d_scale) {
     *d_scale = scale;
 }
 
+__global__ void fp8_accumulate_scale_max_kernel(const float* src_scale,
+                                                float* dst_scale) {
+    float scale = *src_scale;
+    atomicMax(reinterpret_cast<int*>(dst_scale), __float_as_int(scale));
+}
+
+void fp8_accumulate_scale_max(const float* src_scale, float* dst_scale,
+                              cudaStream_t stream) {
+    fp8_accumulate_scale_max_kernel<<<1, 1, 0, stream>>>(src_scale, dst_scale);
+}
+
 // Static FP8 quantize: uses pre-computed scale on device (no absmax, no reduction)
 void quantize_fp8_static(const __nv_bfloat16* input, __nv_fp8_e4m3* output,
                           const float* d_scale, int n, cudaStream_t stream) {

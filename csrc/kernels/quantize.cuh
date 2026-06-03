@@ -46,6 +46,9 @@ void dequantize_fp8_static_bf16_6(
 void quantize_fp8_device(const __nv_bfloat16* input, __nv_fp8_e4m3* output,
                          float* d_scale, int n, cudaStream_t stream = 0);
 
+void fp8_accumulate_scale_max(const float* src_scale, float* dst_scale,
+                              cudaStream_t stream = 0);
+
 // ── FP16 variants ──
 
 float quantize_fp8_fp16(const __half* input, __nv_fp8_e4m3* output,

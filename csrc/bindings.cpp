@@ -856,6 +856,14 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                             reinterpret_cast<float*>(d_scale), n, to_stream(stream));
     }, py::arg("input"), py::arg("output"), py::arg("d_scale"), py::arg("n"), py::arg("stream") = 0);
 
+    m.def("fp8_accumulate_scale_max", [](uintptr_t src_scale,
+                                         uintptr_t dst_scale,
+                                         uintptr_t stream) {
+        fp8_accumulate_scale_max(reinterpret_cast<const float*>(src_scale),
+                                 reinterpret_cast<float*>(dst_scale),
+                                 to_stream(stream));
+    }, py::arg("src_scale"), py::arg("dst_scale"), py::arg("stream") = 0);
+
     // FP16 device-only FP8 quantize (GPU absmax + scale + quantize, CUDA Graph compatible)
     m.def("quantize_fp8_device_fp16", [](uintptr_t input, uintptr_t output,
                                           uintptr_t d_scale, int n, uintptr_t stream) {
