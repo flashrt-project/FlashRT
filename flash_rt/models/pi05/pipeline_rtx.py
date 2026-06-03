@@ -437,17 +437,19 @@ class Pi05Pipeline:
             np.ascontiguousarray(enc_rope_slice))
 
         # Decoder RoPE: placeholder, will be overwritten per-prompt.
-        # Positions start after the pooled vision tokens + prompt — use
-        # vision_seq_enc (not vision_seq) so the rope table isn't overrun
+        # Decoder suffix positions start after the valid prefix tokens.
+        # This mirrors openpi's ``prefix_offsets + cumsum(suffix_mask) - 1``:
+        # the first action token is at position ``vision_seq_enc + prompt_len``.
+        # Use vision_seq_enc (not vision_seq) so the rope table isn't overrun
         # when vision_pool_factor > 1.
         dec_rope_slice = interleaved[
-            self.vision_seq_enc - 1 : self.vision_seq_enc - 1 + self.chunk_size]
+            self.vision_seq_enc : self.vision_seq_enc + self.chunk_size]
         self.bufs["decoder_rope_weights"] = CudaBuffer.from_numpy(
             np.ascontiguousarray(dec_rope_slice))
 
     def _set_decoder_rope_for_prompt(self, prompt_len: int) -> None:
         """Update ``decoder_rope_weights`` for a new prompt length."""
-        start = self.vision_seq_enc + prompt_len - 1
+        start = self.vision_seq_enc + prompt_len
         end = start + self.chunk_size
         self.bufs["decoder_rope_weights"].upload(
             np.ascontiguousarray(self._rope_table_np[start:end]))
