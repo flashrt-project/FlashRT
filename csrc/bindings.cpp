@@ -15,6 +15,7 @@
 #include "gemm/fp8_smallM_handtuned_sm120.cuh"
 #include "gemm/fp8_smallM_handtuned_splitk_sm120.cuh"
 #include "gemm/fp8_smallM_handtuned_ldmatrix_sm120.cuh"
+#include "gemm/fp8_gemv_m1_sm120.cuh"
 #endif
 #ifdef ENABLE_CUTLASS_SM120_NVFP4_W4A16
 #include "gemm/fp4/cutlass_nvfp4_w4a16_gemm_sm120.cuh"
@@ -5241,6 +5242,25 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     BIND_SPLITK(splitk_fp8_gemm_32x64x128_w4);
 
 #undef BIND_SPLITK
+
+    // Dedicated M=1 FP8 GEMV (warp-per-output-row, no MMA padding tax).
+#define BIND_GEMV_M1(NAME)                                                   \
+    m.def("ht_" #NAME,                                                       \
+        [](uintptr_t A, uintptr_t B, uintptr_t D,                            \
+           int M, int N, int K, float alpha, uintptr_t stream) {             \
+            return flash_rt::gemm::gemv_m1::NAME(                            \
+                to_ptr(A), to_ptr(B), to_ptr(D),                             \
+                M, N, K, alpha, to_stream(stream));                          \
+        },                                                                   \
+        py::arg("A"), py::arg("B"), py::arg("D"),                            \
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("alpha"),          \
+        py::arg("stream") = 0)
+
+    BIND_GEMV_M1(gemv_fp8_m1_w4);
+    BIND_GEMV_M1(gemv_fp8_m1_w8);
+    BIND_GEMV_M1(gemv_fp8_m1_w16);
+
+#undef BIND_GEMV_M1
 #endif
 
 #ifdef ENABLE_FP8_CONV3D_V17
