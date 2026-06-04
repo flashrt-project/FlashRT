@@ -333,8 +333,14 @@ class Pi05TorchFrontendThor:
         _enc_w_scales = getattr(self, '_enc_w_scales', []) or [0.0] * (Le * 4)
         self._enc_w_dev = torch.tensor(_enc_w_scales, dtype=torch.float32, device='cuda')
 
-        # RoPE table
+        # RoPE table.  The reference model stores ``inv_freq`` in bfloat16
+        # (checkpoint dtype), so the cos/sin phase must be derived from a
+        # bf16-quantized ``inv_freq`` to match it.  Computing it in fp32 keeps
+        # a ~1e-3 per-frequency offset that is scaled by the absolute position
+        # and grows into a large RoPE angle error at high prefix positions,
+        # diverging the prefix K/V and the action decision on borderline frames.
         inv_freq = 1.0 / (10000 ** (torch.arange(0, 256, 2, dtype=torch.float32, device='cuda') / 256))
+        inv_freq = inv_freq.to(torch.bfloat16).to(torch.float32)
         kp = inv_freq[None, :] * torch.arange(1200, device='cuda')[:, None].float()
         self._kc_t = torch.cos(kp).to(fp16)
         self._ks_t = torch.sin(kp).to(fp16)
