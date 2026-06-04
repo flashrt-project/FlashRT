@@ -760,7 +760,7 @@ class Pi05JaxFrontendThorFP4(Pi05JaxFrontendThor):
             encoder_forward_calibrate(self._gemm, self._fvk,
                                        enc_bufs, enc_weights, enc_dims,
                                        enc_scales_buf.ptr.value,
-                                       stream=stream_int)
+                                       stream=stream_int, attn=self._attn)
             self._cudart.cudaStreamSynchronize(stream)
             per_sample_enc.append(
                 enc_scales_buf.download_new((Le * 4,), np.float32))
@@ -776,7 +776,7 @@ class Pi05JaxFrontendThorFP4(Pi05JaxFrontendThor):
             decoder_forward_calibrate(self._ctx, self._fvk,
                                        ae_bufs, ae_weights, ae_dims,
                                        ae_scales_buf.ptr.value,
-                                       stream=stream_int)
+                                       stream=stream_int, attn=self._attn)
             self._cudart.cudaStreamSynchronize(stream)
             per_sample_ae.append(
                 ae_scales_buf.download_new((ae_scale_count,), np.float32))
