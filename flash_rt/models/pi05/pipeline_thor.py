@@ -24,6 +24,7 @@ Classes:
 """
 
 import math
+import torch
 
 from flash_rt.hardware.thor.shared_primitives import (
     _measure_scale_gpu,
@@ -217,6 +218,11 @@ def _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None)
     noise = bufs['noise']; x = bufs['x']; xn = bufs['xn']
     gate = bufs['gate']; qkv = bufs['qkv']; logits = bufs['logits']
     attn_out = bufs['attn_out']; fg = bufs['fg']; hid = bufs['hid']
+    noise_t = bufs.get('noise_t')
+    xn_t = bufs.get('xn_t')
+    delta_t = bufs.get('delta_t')
+    xn_f32_t = bufs.get('xn_f32_t')
+    delta_f32_t = bufs.get('delta_f32_t')
 
     ain_w = weights['ain_w']; ain_b = weights['ain_b']
     sa = weights['sa']; qw = weights['qw']
@@ -224,6 +230,11 @@ def _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None)
     ow = weights['ow']; sf = weights['sf']
     gw = weights['gw']; dw = weights['dw']
     aow = weights['aow']; aob = weights['aob']
+    aow_t = weights.get('aow_t')
+    aob_t = weights.get('aob_t')
+    aow_f32_t = weights.get('aow_f32_t')
+    aob_f32_t = weights.get('aob_f32_t')
+    dt_t = weights.get('dt_t')
     fs = weights['fs']; rope = weights['rope']
 
     for s in range(steps):
@@ -263,7 +274,8 @@ def _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None)
             fvk.gmm_fp16(ctx, attn_out, ow_ptr, fg, S, D, NH * HD, 0.0, stream)
 
             # C4→C5: gated residual + post-attn AdaRMSNorm
-            fvk.gate_res_fp16(fg, gate, x, S * D, stream)
+            fvk.mul_fp16(fg, gate, fg, S * D, stream)
+            fvk.residual_add_fp16(x, fg, S * D, stream)
             fvk.adarms_fp16(x, sf_ptr, xn, gate, S, D, stream)
 
             # C5: Gate+Up merged GEMM (weight is [K, 2H])
@@ -278,14 +290,30 @@ def _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None)
             fvk.gmm_fp16(ctx, hid, dw_ptr, fg, S, D, H, 0.0, stream)
 
             # C7: residual into x (next layer's C1 will do AdaRMS)
-            fvk.gate_res_fp16(fg, gate, x, S * D, stream)
+            fvk.mul_fp16(fg, gate, fg, S * D, stream)
+            fvk.residual_add_fp16(x, fg, S * D, stream)
 
         # Final: AdaRMSNorm + action output
         fi = s * S * D3
         fs_ptr = fs + fi * 2
         fvk.adarms_fp16(x, fs_ptr, xn, gate, S, D, stream)
-        fvk.gmm_fp16(ctx, xn, aow, noise, S, 32, D, 1.0, stream)
-        fvk.add_bias_fp16(noise, aob, S, 32, stream)
+        if (noise_t is not None and xn_t is not None and delta_t is not None
+                and xn_f32_t is not None and delta_f32_t is not None
+                and aow_f32_t is not None and aob_f32_t is not None
+                and dt_t is not None):
+            xn_f32_t.copy_(xn_t)
+            torch.addmm(aob_f32_t, xn_f32_t, aow_f32_t, out=delta_f32_t)
+            delta_t.copy_(delta_f32_t)
+            delta_t.mul_(dt_t)
+            noise_t.add_(delta_t)
+        elif (noise_t is not None and xn_t is not None and delta_t is not None
+                and aow_t is not None and aob_t is not None and dt_t is not None):
+            torch.addmm(aob_t, xn_t, aow_t, out=delta_t)
+            delta_t.mul_(dt_t)
+            noise_t.add_(delta_t)
+        else:
+            fvk.gmm_fp16(ctx, xn, aow, noise, S, 32, D, 1.0, stream)
+            fvk.add_bias_fp16(noise, aob, S, 32, stream)
 
 
 # ══════════════════════════════════════════════════════════════════

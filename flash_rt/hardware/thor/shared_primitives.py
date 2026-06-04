@@ -232,7 +232,7 @@ def _siglip_forward_fp16(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None)
     for l in range(L):
         # ── Attention LayerNorm → x_norm ──
         fvk.layer_norm_fp16(x, weights['ln_attn_w'][l], weights['ln_attn_b'][l],
-                            x_norm, S, D, 1e-6, stream)
+                            x_norm, S, D, 1e-5, stream)
 
         # ── QKV GEMM (FP16 NN) + bias ──
         gemm.fp16_nn(x_norm, weights['qkv_w'][l], qkv, S, 3 * D, D, stream)
@@ -253,11 +253,11 @@ def _siglip_forward_fp16(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None)
 
         # ── O projection + residual + bias ──
         gemm.fp16_nn(attn_out, weights['o_w'][l], fg, S, D, D, stream)
-        fvk.bias_residual_fp16(x, fg, weights['o_b'][l], S, D, stream)
+        fvk.bias_residual_strict_fp16(x, fg, weights['o_b'][l], S, D, stream)
 
         # ── FFN LayerNorm → x_norm ──
         fvk.layer_norm_fp16(x, weights['ln_ffn_w'][l], weights['ln_ffn_b'][l],
-                            x_norm, S, D, 1e-6, stream)
+                            x_norm, S, D, 1e-5, stream)
 
         # ── Up GEMM + bias + GELU ──
         gemm.fp16_nn(x_norm, weights['up_w'][l], hidden, S, H, D, stream)
@@ -266,7 +266,7 @@ def _siglip_forward_fp16(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None)
 
         # ── Down GEMM + residual + bias ──
         gemm.fp16_nn(hidden, weights['down_w'][l], fg, S, D, H, stream)
-        fvk.bias_residual_fp16(x, fg, weights['down_b'][l], S, D, stream)
+        fvk.bias_residual_strict_fp16(x, fg, weights['down_b'][l], S, D, stream)
 
 
 def _encoder_forward_fp16(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None):

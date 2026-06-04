@@ -387,9 +387,13 @@ class Pi05TorchFrontendThor:
         # Action in/out projections (singletons)
         self._ain_w = g('action_in_proj.weight').t().contiguous()
         self._ain_b = g('action_in_proj.bias')
-        # Note: action_out_proj has -1/steps scaling baked in
-        self._aow = g('action_out_proj.weight').t().contiguous() * (-1.0 / steps)
-        self._aob = g('action_out_proj.bias') * (-1.0 / steps)
+        self._aow = g('action_out_proj.weight').t().contiguous()
+        self._aob = g('action_out_proj.bias')
+        self._ae_dt = torch.tensor(-1.0 / steps, dtype=fp16, device='cuda')
+        self._aow_dt = self._aow * self._ae_dt
+        self._aob_dt = self._aob * self._ae_dt
+        self._aow_f32 = self._aow.float()
+        self._aob_f32 = self._aob.float()
 
         _ae_w_scales = getattr(self, '_ae_w_scales', []) or [0.0] * (La * 4)
         self._ae_w_dev = torch.tensor(_ae_w_scales, dtype=torch.float32, device='cuda')
@@ -415,6 +419,9 @@ class Pi05TorchFrontendThor:
         self._ae_attn = torch.empty(Sa * 8, 256, dtype=fp16, device='cuda')
         self._ae_hid  = torch.empty(Sa, 2 * Ha, dtype=fp16, device='cuda')
         self._ae_fg   = torch.empty(Sa, 2 * Ha, dtype=fp16, device='cuda')  # must fit Gate+Up GEMM output [Sa, 2H]
+        self._ae_delta = torch.empty(Sa, 32, dtype=fp16, device='cuda')
+        self._ae_xn_f32 = torch.empty(Sa, Da, dtype=torch.float32, device='cuda')
+        self._ae_delta_f32 = torch.empty(Sa, 32, dtype=torch.float32, device='cuda')
         self._ae_xn_fp8  = torch.zeros(Sa * Da, dtype=torch.uint8, device='cuda')
         self._ae_hid_fp8 = torch.zeros(Sa * Ha, dtype=torch.uint8, device='cuda')
         self._ae_ctx_fp8 = torch.zeros(Sa * 8 * 256, dtype=torch.uint8, device='cuda')
@@ -1185,6 +1192,11 @@ class Pi05TorchFrontendThor:
             'attn_out': self._ae_attn.data_ptr(),
             'hid':     self._ae_hid.data_ptr(),
             'fg':      self._ae_fg.data_ptr(),
+            'noise_t': self._g_noise,
+            'xn_t':    self._ae_xn,
+            'delta_t': self._ae_delta,
+            'xn_f32_t': self._ae_xn_f32,
+            'delta_f32_t': self._ae_delta_f32,
             'xn_fp8':  self._ae_xn_fp8.data_ptr(),
             'hid_fp8': self._ae_hid_fp8.data_ptr(),
             'ctx_fp8': self._ae_ctx_fp8.data_ptr(),
@@ -1200,8 +1212,13 @@ class Pi05TorchFrontendThor:
             'sf':        self._sf_all.data_ptr(),
             'gw':        self._dec_gu_flat.data_ptr(),
             'dw':        self._dec_d_flat.data_ptr(),
-            'aow':       self._aow.data_ptr(),
-            'aob':       self._aob.data_ptr(),
+            'aow':       self._aow_dt.data_ptr(),
+            'aob':       self._aob_dt.data_ptr(),
+            'aow_t':     self._aow,
+            'aob_t':     self._aob,
+            'aow_f32_t': self._aow_f32,
+            'aob_f32_t': self._aob_f32,
+            'dt_t':      self._ae_dt,
             'fs':        self._fs_all.data_ptr(),
             'rope':      self._dec_rope.data_ptr(),
             'w_scales':  self._ae_w_dev.data_ptr(),
@@ -1374,6 +1391,11 @@ class Pi05TorchFrontendThor:
             'attn_out': self._ae_attn.data_ptr(),
             'hid':     self._ae_hid.data_ptr(),
             'fg':      self._ae_fg.data_ptr(),
+            'noise_t': self._g_noise,
+            'xn_t':    self._ae_xn,
+            'delta_t': self._ae_delta,
+            'xn_f32_t': self._ae_xn_f32,
+            'delta_f32_t': self._ae_delta_f32,
             'xn_fp8':  self._ae_xn_fp8.data_ptr(),
             'hid_fp8': self._ae_hid_fp8.data_ptr(),
             'ctx_fp8': self._ae_ctx_fp8.data_ptr(),
@@ -1389,8 +1411,13 @@ class Pi05TorchFrontendThor:
             'sf':         self._sf_all.data_ptr(),
             'gw':         self._dec_gu_flat.data_ptr(),
             'dw':         self._dec_d_flat.data_ptr(),
-            'aow':        self._aow.data_ptr(),
-            'aob':        self._aob.data_ptr(),
+            'aow':        self._aow_dt.data_ptr(),
+            'aob':        self._aob_dt.data_ptr(),
+            'aow_t':      self._aow,
+            'aob_t':      self._aob,
+            'aow_f32_t':  self._aow_f32,
+            'aob_f32_t':  self._aob_f32,
+            'dt_t':       self._ae_dt,
             'fs':         self._fs_all.data_ptr(),
             'rope':       self._dec_rope.data_ptr(),
             'w_scales':   self._ae_w_dev.data_ptr(),
@@ -1522,8 +1549,8 @@ class Pi05TorchFrontendThor:
             'sf':         self._sf_all_b2.data_ptr(),
             'gw':         self._dec_gu_flat.data_ptr(),
             'dw':         self._dec_d_flat.data_ptr(),
-            'aow':        self._aow.data_ptr(),
-            'aob':        self._aob.data_ptr(),
+            'aow':        self._aow_dt.data_ptr(),
+            'aob':        self._aob_dt.data_ptr(),
             'fs':         self._fs_all_b2.data_ptr(),
             'rope':       self._dec_rope.data_ptr(),
             'w_scales':   self._ae_w_dev.data_ptr(),
@@ -1667,8 +1694,8 @@ class Pi05TorchFrontendThor:
             'sf':         self._sf_all_b2.data_ptr(),
             'gw':         self._dec_gu_flat.data_ptr(),
             'dw':         self._dec_d_flat.data_ptr(),
-            'aow':        self._aow.data_ptr(),
-            'aob':        self._aob.data_ptr(),
+            'aow':        self._aow_dt.data_ptr(),
+            'aob':        self._aob_dt.data_ptr(),
             'fs':         self._fs_all_b2.data_ptr(),
             'rope':       self._dec_rope.data_ptr(),
             'w_scales':   self._ae_w_dev.data_ptr(),
@@ -2219,8 +2246,8 @@ class Pi05TorchFrontendThor:
             'sf':         self._sf_all.data_ptr(),
             'gw':         self._dec_gu_flat.data_ptr(),
             'dw':         self._dec_d_flat.data_ptr(),
-            'aow':        self._aow.data_ptr(),
-            'aob':        self._aob.data_ptr(),
+            'aow':        self._aow_dt.data_ptr(),
+            'aob':        self._aob_dt.data_ptr(),
             'fs':         self._fs_all.data_ptr(),
             'rope':       self._dec_rope.data_ptr(),
             'w_scales':   self._ae_w_dev.data_ptr(),
@@ -2332,8 +2359,8 @@ class Pi05TorchFrontendThor:
             'sf':         self._sf_all.data_ptr(),
             'gw':         self._dec_gu_flat.data_ptr(),
             'dw':         self._dec_d_flat.data_ptr(),
-            'aow':        self._aow.data_ptr(),
-            'aob':        self._aob.data_ptr(),
+            'aow':        self._aow_dt.data_ptr(),
+            'aob':        self._aob_dt.data_ptr(),
             'fs':         self._fs_all.data_ptr(),
             'rope':       self._dec_rope.data_ptr(),
             'w_scales':   self._ae_w_dev.data_ptr(),
