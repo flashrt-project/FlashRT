@@ -163,9 +163,9 @@ void layer_norm_fp16(const __half* x, const __half* weight,
 }
 
 // ── LayerNorm → FP8 (fused, matches pi05 fused_layernorm_fp8) ──
-// FP16 specialization: verbatim production fused_layernorm_fp8
+// FP16 specialization.
 __global__ void layer_norm_fp8_kernel_fp16(const __half* in, __nv_fp8_e4m3* out, const __half* gamma,
-                                    const __half* beta, int R, int C) {
+                                    const __half* beta, int R, int C, float eps) {
     int r=blockIdx.x; if(r>=R)return;
     const __half*row=in+r*C; __nv_fp8_e4m3*orow=out+r*C;
     float sum=0;
@@ -182,7 +182,7 @@ __global__ void layer_norm_fp8_kernel_fp16(const __half* in, __nv_fp8_e4m3* out,
     if(!l)sh[w]=var;__syncthreads();
     if(!w){var=(l<(blockDim.x+31)/32)?sh[l]:0;for(int o=16;o>0;o>>=1)var+=__shfl_xor_sync(0xffffffff,var,o);}
     __syncthreads();if(!threadIdx.x)sh[0]=var;__syncthreads();
-    float rstd=rsqrtf(sh[0]/C+1e-6f);
+    float rstd=rsqrtf(sh[0]/C+eps);
     for(int i=threadIdx.x;i<C;i+=blockDim.x){
         float v=(__half2float(row[i])-mean)*rstd;
         float normed = v*__half2float(gamma[i])+__half2float(beta[i]);
@@ -225,8 +225,8 @@ template __global__ void layer_norm_fp8_kernel<__nv_bfloat16>(const __nv_bfloat1
 void layer_norm_fp8(const __half* x, __nv_fp8_e4m3* out,
                      const __half* gamma, const __half* beta,
                      int seq_len, int dim, float eps, cudaStream_t stream) {
-    // Use production-verbatim FP16 kernel (no __restrict__, fixed shared[32])
-    layer_norm_fp8_kernel_fp16<<<seq_len, 256, 0, stream>>>(x, out, gamma, beta, seq_len, dim);
+    layer_norm_fp8_kernel_fp16<<<seq_len, 256, 0, stream>>>(
+        x, out, gamma, beta, seq_len, dim, eps);
 }
 void layer_norm_fp8_bf16(const __nv_bfloat16* x, __nv_fp8_e4m3* out,
                           const __nv_bfloat16* gamma, const __nv_bfloat16* beta,

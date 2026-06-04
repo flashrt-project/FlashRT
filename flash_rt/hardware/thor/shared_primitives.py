@@ -104,7 +104,7 @@ def siglip_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None,
 
         # ── Attention LayerNorm → FP8 ──
         fvk.layer_norm_fp8(x, x_fp8, weights['ln_attn_w'][l], weights['ln_attn_b'][l],
-                           S, D, 1e-6, stream)
+                           S, D, 1e-5, stream)
 
         # ── QKV GEMM (FP8 → FP16, with bias) ──
         # x_fp8[S,D] @ qkv_w[D,3D] + qkv_b[3D] → qkv[S,3D]
@@ -139,7 +139,7 @@ def siglip_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None,
 
         # ── FFN LayerNorm → FP8 ──
         fvk.layer_norm_fp8(x, x_fp8, weights['ln_ffn_w'][l], weights['ln_ffn_b'][l],
-                           S, D, 1e-6, stream)
+                           S, D, 1e-5, stream)
 
         # ── Up GEMM with fused GELU + bias ──
         # hidden[S,H] = GELU(alpha * x_fp8[S,D] @ up_w[D,H] + up_b[H])
@@ -529,10 +529,9 @@ def encoder_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None,
             fvk.cutlass_fp8_wide(hid_fp8, weights['down_w'][l], fg,
                                   Se, D, H, alpha_host[l * 4 + 3], 0.0, stream)
 
-            # ── 11. Residual + RMSNorm → FP8 for next layer (noweight) ──
-            as_next = act_scales + ((l + 1) * 4 + 0) * 4
-            fvk.residual_add_rms_norm_fp8_noweight_fp16(x, fg, x_fp8,
-                                                          Se, D, as_next, stream)
+            # ── 11. Residual writeback. The next layer recomputes C1
+            # RMSNorm→FP8, so no FP8 output is consumed here.
+            fvk.residual_add_fp16(x, fg, Se * D, stream)
 
     # x[Se, D] now contains final encoder output
 
@@ -606,7 +605,7 @@ def _measure_scale_gpu(fvk_mod, fp16_ptr, n_elements, d_scale_ptr, d_fp8_scratch
 
 
 def encoder_forward_calibrate(gemm, fvk_mod, bufs, weights, dims,
-                              calib_scales_ptr, stream=0):
+                              calib_scales_ptr, stream=0, *, attn=None):
     """Calibrate encoder FP8 scales. Framework-agnostic (pure pointers).
 
     Two-pass per quantization point:
@@ -666,11 +665,14 @@ def encoder_forward_calibrate(gemm, fvk_mod, bufs, weights, dims,
 
         if not last:
             # 5. Attention
-            K_ptr = weights['Kc'] + kv_off * 2
-            V_ptr = weights['Vc'] + kv_off * 2
-            fvk_mod.attention_qkv_fp16(bufs['ctx'], attn_out, K_ptr, V_ptr,
-                                        logits, attn_out,
-                                        Se, Se, NH, HD, attn_scale, stream)
+            if attn is not None:
+                attn.run("encoder", l, q_seq=Se, stream=stream)
+            else:
+                K_ptr = weights['Kc'] + kv_off * 2
+                V_ptr = weights['Vc'] + kv_off * 2
+                fvk_mod.attention_qkv_fp16(bufs['ctx'], attn_out, K_ptr, V_ptr,
+                                            logits, attn_out,
+                                            Se, Se, NH, HD, attn_scale, stream)
 
             # 6. O proj: measure attn amax → quantize → GEMM
             _measure_scale_gpu(fvk_mod, attn_out, Se * Q_dim, d_scale, fp8_scratch, stream)
@@ -714,7 +716,8 @@ def encoder_forward_calibrate(gemm, fvk_mod, bufs, weights, dims,
             fvk_mod.cutlass_fp8_wide(hid_fp8, weights['down_w'][l], fg,
                                       Se, D, H, alpha_down, 0.0, stream)
 
-            # 11. Residual + prep next layer
+            # 11. Match inference residual writeback. The next layer
+            # calibration step measures and quantizes its own C1 input.
             fvk_mod.residual_add_fp16(x, fg, Se * D, stream)
 
     # Copy calib scales to output

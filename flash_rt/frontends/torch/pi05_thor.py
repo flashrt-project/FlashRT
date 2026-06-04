@@ -375,6 +375,7 @@ class Pi05TorchFrontendThor:
         # ===============================================================
         dp = 'paligemma_with_expert.gemma_expert'
         steps = 10
+        self.steps = steps
         D3a = 3 * Da
 
         # Decoder/AE per-layer weights loaded declaratively above as flat cats:
@@ -429,7 +430,7 @@ class Pi05TorchFrontendThor:
 
         # Calibration scale buffers
         self._enc_calib_scales = torch.zeros(Le * 4, dtype=torch.float32, device='cuda')
-        self._ae_calib_scales  = torch.zeros(La * 4, dtype=torch.float32, device='cuda')
+        self._ae_calib_scales  = torch.zeros(steps * La * 4, dtype=torch.float32, device='cuda')
 
         # ── B=N batched mode state (Stage 2 of Thor batched-CFG port) ──
         # Inactive by default — buffers + B=N graph capture are
@@ -1083,7 +1084,7 @@ class Pi05TorchFrontendThor:
             # (the FP16 branches never read them).
             self._enc_calib_scales = torch.zeros(self.Le * 4, dtype=torch.float32, device='cuda')
             self._enc_alpha_host = [1.0] * (self.Le * 4)
-            self._ae_calib_scales = torch.zeros(self.La * 4, dtype=torch.float32, device='cuda')
+            self._ae_calib_scales = torch.zeros(self.steps * self.La * 4, dtype=torch.float32, device='cuda')
             logger.info("use_fp8=False — skipping FP8 calibration (FP16 baseline)")
 
         # ---- Capture encoder+decoder graph ----
@@ -1103,11 +1104,14 @@ class Pi05TorchFrontendThor:
     def _calibrate(self, Se):
         """Calibrate encoder + decoder FP8 activation scales."""
         Le = self.Le; La = self.La
+        ae_scale_count = self.steps * La * 4
         total_keys = self.total_keys
 
         # Try cache first
         cached = load_calibration(self._checkpoint_path, Se)
-        if cached is not None:
+        if (cached is not None
+                and len(cached.get("enc_scales", [])) == Le * 4
+                and len(cached.get("ae_scales", [])) == ae_scale_count):
             self._enc_calib_scales = torch.tensor(
                 cached["enc_scales"], dtype=torch.float32, device='cuda')
             enc_ws = self._enc_w_dev.cpu().tolist()
@@ -1118,8 +1122,11 @@ class Pi05TorchFrontendThor:
             self._ae_calib_scales = torch.tensor(
                 cached["ae_scales"], dtype=torch.float32, device='cuda')
             logger.info("Calibration loaded from cache (enc=%d, ae=%d scales)",
-                        Le * 4, La * 4)
+                        Le * 4, ae_scale_count)
             return
+        if cached is not None:
+            logger.info("Ignoring stale calibration cache (expected enc=%d, ae=%d scales)",
+                        Le * 4, ae_scale_count)
 
         HDe = self.HDe; NHe = self.NHe; De = self.De; He = self.He
 
@@ -1170,7 +1177,7 @@ class Pi05TorchFrontendThor:
         enc_max = torch.zeros(Le * 4, dtype=torch.float32, device='cuda')
         encoder_forward_calibrate(
             self._gemm, fvk, enc_bufs, enc_weights, enc_dims,
-            enc_max.data_ptr(), stream=0)
+            enc_max.data_ptr(), stream=0, attn=self._attn)
 
         self._enc_calib_scales = enc_max
         enc_ws = self._enc_w_dev.cpu().tolist()
@@ -1231,7 +1238,7 @@ class Pi05TorchFrontendThor:
 
         # Decoder scratch buffers
         Sa, Da, Ha = self.Sa, self.Da, self.Ha
-        _ae_calib_buf = torch.zeros(self.La * 4, dtype=torch.float32, device='cuda')
+        _ae_calib_buf = torch.zeros(ae_scale_count, dtype=torch.float32, device='cuda')
         _ae_d_scale = torch.zeros(1, dtype=torch.float32, device='cuda')
         _ae_hidden_scratch = torch.empty(Sa * Ha, dtype=fp16, device='cuda')
         _ae_fp8_scratch = torch.zeros(Sa * max(Da, Ha), dtype=torch.uint8, device='cuda')
@@ -1241,13 +1248,13 @@ class Pi05TorchFrontendThor:
         ae_bufs['fp8_scratch'] = _ae_fp8_scratch.data_ptr()
 
         self._g_noise.normal_()
-        ae_max = torch.zeros(self.La * 4, dtype=torch.float32, device='cuda')
+        ae_max = torch.zeros(ae_scale_count, dtype=torch.float32, device='cuda')
         decoder_forward_calibrate(
             self._ctx, fvk, ae_bufs, ae_weights, ae_dims,
-            ae_max.data_ptr(), stream=0)
+            ae_max.data_ptr(), stream=0, attn=self._attn)
 
         self._ae_calib_scales = ae_max
-        logger.info("Decoder calibrated: %d scales", La * 4)
+        logger.info("Decoder calibrated: %d scales", ae_scale_count)
 
         # Save to cache
         try:
@@ -2162,6 +2169,7 @@ class Pi05TorchFrontendThor:
     def _recalibrate_with_real_data(self):
         """Recalibrate using real SigLIP output, then recapture enc+ae graph."""
         Se = self.Se; Le = self.Le; La = self.La
+        ae_scale_count = self.steps * La * 4
         total_keys = self.total_keys
         De = self.De; He = self.He; NHe = self.NHe; HDe = self.HDe
 
@@ -2211,7 +2219,7 @@ class Pi05TorchFrontendThor:
         self._Kc.zero_(); self._Vc.zero_()
         encoder_forward_calibrate(
             self._gemm, fvk, enc_bufs, enc_weights, enc_dims,
-            self._enc_calib_scales.data_ptr(), stream=0)
+            self._enc_calib_scales.data_ptr(), stream=0, attn=self._attn)
         torch.cuda.synchronize()
 
         enc_ws = self._enc_w_dev.cpu().tolist()
@@ -2231,6 +2239,11 @@ class Pi05TorchFrontendThor:
             'attn_out': self._ae_attn.data_ptr(),
             'hid':     self._ae_hid.data_ptr(),
             'fg':      self._ae_fg.data_ptr(),
+            'noise_t': self._g_noise,
+            'xn_t':    self._ae_xn,
+            'delta_t': self._ae_delta,
+            'xn_f32_t': self._ae_xn_f32,
+            'delta_f32_t': self._ae_delta_f32,
             'xn_fp8':  self._ae_xn_fp8.data_ptr(),
             'hid_fp8': self._ae_hid_fp8.data_ptr(),
             'ctx_fp8': self._ae_ctx_fp8.data_ptr(),
@@ -2248,6 +2261,11 @@ class Pi05TorchFrontendThor:
             'dw':         self._dec_d_flat.data_ptr(),
             'aow':        self._aow_dt.data_ptr(),
             'aob':        self._aob_dt.data_ptr(),
+            'aow_t':      self._aow,
+            'aob_t':      self._aob,
+            'aow_f32_t':  self._aow_f32,
+            'aob_f32_t':  self._aob_f32,
+            'dt_t':       self._ae_dt,
             'fs':         self._fs_all.data_ptr(),
             'rope':       self._dec_rope.data_ptr(),
             'w_scales':   self._ae_w_dev.data_ptr(),
@@ -2258,7 +2276,7 @@ class Pi05TorchFrontendThor:
             'total_keys': total_keys,
         }
 
-        _ae_calib_buf = torch.zeros(self.La * 4, dtype=torch.float32, device='cuda')
+        _ae_calib_buf = torch.zeros(ae_scale_count, dtype=torch.float32, device='cuda')
         _ae_d_scale = torch.zeros(1, dtype=torch.float32, device='cuda')
         _ae_hidden_scratch = torch.empty(Sa * Ha, dtype=fp16, device='cuda')
         _ae_fp8_scratch = torch.zeros(Sa * max(Da, Ha), dtype=torch.uint8, device='cuda')
@@ -2271,7 +2289,7 @@ class Pi05TorchFrontendThor:
         self._g_noise.normal_()
         decoder_forward_calibrate(
             self._ctx, fvk, ae_bufs, ae_weights, ae_dims,
-            self._ae_calib_scales.data_ptr(), stream=0)
+            self._ae_calib_scales.data_ptr(), stream=0, attn=self._attn)
         torch.cuda.synchronize()
 
         # Recapture graph with updated scales
@@ -2290,7 +2308,7 @@ class Pi05TorchFrontendThor:
         Reuses the existing ``encoder_forward_calibrate`` /
         ``decoder_forward_calibrate`` kernels (no new CUDA code). Each
         sample writes amax into ``_enc_calib_scales[Le*4]`` and
-        ``_ae_calib_scales[La*4]``; we snapshot both to CPU per sample,
+        ``_ae_calib_scales[steps*La*4]``; we snapshot both to CPU per sample,
         then ``accumulate_amax(percentile)`` column-wise, upload the
         reduced scales once, recompute ``_enc_alpha_host`` (the cuBLASLt
         alpha-fold list), and recapture the encoder+decoder CUDA graph.
@@ -2313,6 +2331,7 @@ class Pi05TorchFrontendThor:
             "(percentile=%.2f)...", n, percentile)
 
         Se = self.Se; Le = self.Le; La = self.La
+        ae_scale_count = self.steps * La * 4
         total_keys = self.total_keys
         De = self.De; He = self.He; NHe = self.NHe; HDe = self.HDe
         Sa, Da, Ha = self.Sa, self.Da, self.Ha
@@ -2328,7 +2347,7 @@ class Pi05TorchFrontendThor:
             Se * max(De, He), dtype=torch.uint8, device='cuda')
         _ones = torch.ones(De, dtype=fp16, device='cuda')
 
-        _ae_calib_buf = torch.zeros(La * 4, dtype=torch.float32, device='cuda')
+        _ae_calib_buf = torch.zeros(ae_scale_count, dtype=torch.float32, device='cuda')
         _ae_d_scale = torch.zeros(1, dtype=torch.float32, device='cuda')
         _ae_hidden_scratch = torch.empty(Sa * Ha, dtype=fp16, device='cuda')
         _ae_fp8_scratch = torch.zeros(
@@ -2361,6 +2380,11 @@ class Pi05TorchFrontendThor:
             'dw':         self._dec_d_flat.data_ptr(),
             'aow':        self._aow_dt.data_ptr(),
             'aob':        self._aob_dt.data_ptr(),
+            'aow_t':      self._aow,
+            'aob_t':      self._aob,
+            'aow_f32_t':  self._aow_f32,
+            'aob_f32_t':  self._aob_f32,
+            'dt_t':       self._ae_dt,
             'fs':         self._fs_all.data_ptr(),
             'rope':       self._dec_rope.data_ptr(),
             'w_scales':   self._ae_w_dev.data_ptr(),
@@ -2430,7 +2454,7 @@ class Pi05TorchFrontendThor:
             self._Kc.zero_(); self._Vc.zero_()
             encoder_forward_calibrate(
                 self._gemm, fvk, enc_bufs, enc_weights, enc_dims,
-                self._enc_calib_scales.data_ptr(), stream=0)
+                self._enc_calib_scales.data_ptr(), stream=0, attn=self._attn)
             torch.cuda.synchronize()
             per_sample_enc.append(self._enc_calib_scales.cpu().numpy().copy())
 
@@ -2445,6 +2469,11 @@ class Pi05TorchFrontendThor:
                 'attn_out': self._ae_attn.data_ptr(),
                 'hid':     self._ae_hid.data_ptr(),
                 'fg':      self._ae_fg.data_ptr(),
+                'noise_t': self._g_noise,
+                'xn_t':    self._ae_xn,
+                'delta_t': self._ae_delta,
+                'xn_f32_t': self._ae_xn_f32,
+                'delta_f32_t': self._ae_delta_f32,
                 'xn_fp8':  self._ae_xn_fp8.data_ptr(),
                 'hid_fp8': self._ae_hid_fp8.data_ptr(),
                 'ctx_fp8': self._ae_ctx_fp8.data_ptr(),
@@ -2454,12 +2483,12 @@ class Pi05TorchFrontendThor:
                 'fp8_scratch':    _ae_fp8_scratch.data_ptr(),
             }
             self._ae_calib_scales.zero_()
-            # Reset noise-gen per sample for deterministic per-sample input.
+            # Deterministic but varied per-sample decoder input.
             noise = torch.empty_like(self._g_noise).normal_(generator=noise_gen)
             self._g_noise.copy_(noise)
             decoder_forward_calibrate(
                 self._ctx, fvk, ae_bufs, ae_weights, ae_dims,
-                self._ae_calib_scales.data_ptr(), stream=0)
+                self._ae_calib_scales.data_ptr(), stream=0, attn=self._attn)
             torch.cuda.synchronize()
             per_sample_ae.append(self._ae_calib_scales.cpu().numpy().copy())
 

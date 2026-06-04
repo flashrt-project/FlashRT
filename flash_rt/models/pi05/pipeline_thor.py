@@ -88,6 +88,11 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
     attn_out = bufs['attn_out']
     hid = bufs['hid']
     fg = bufs['fg']
+    noise_t = bufs.get('noise_t')
+    xn_t = bufs.get('xn_t')
+    delta_t = bufs.get('delta_t')
+    xn_f32_t = bufs.get('xn_f32_t')
+    delta_f32_t = bufs.get('delta_f32_t')
     xn_fp8 = bufs['xn_fp8']
     hid_fp8 = bufs['hid_fp8']
     ctx_fp8 = bufs['ctx_fp8']
@@ -105,12 +110,18 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
     dw = weights['dw']
     aow = weights['aow']
     aob = weights['aob']
+    aow_t = weights.get('aow_t')
+    aob_t = weights.get('aob_t')
+    aow_f32_t = weights.get('aow_f32_t')
+    aob_f32_t = weights.get('aob_f32_t')
+    dt_t = weights.get('dt_t')
     fs = weights['fs']
     rope = weights['rope']
     w_scales = weights['w_scales']
     act_scales = weights['act_scales']
 
     for s in range(steps):
+        step_scale_base = s * layers * 4
         # ── Action input: noise → x ──
         fvk.gmm_fp16(ctx, noise, ain_w, x, S, D, 32, 0.0, stream)
         fvk.add_bias_fp16(x, ain_b, S, D, stream)
@@ -121,8 +132,10 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
             sf_ptr = sf + si * 2
 
             # ── C1: Fused AdaRMSNorm → FP8 with static scale ──
-            act_scale_qkv = act_scales + (l * 4 + 0) * 4
-            fvk.fused_adarms_fp8_static_fp16(x, sa_ptr, xn_fp8, gate, S, D, act_scale_qkv, stream)
+            act_scale_qkv = act_scales + (step_scale_base + l * 4 + 0) * 4
+            if l == 0:
+                fvk.fused_adarms_fp8_static_fp16(
+                    x, sa_ptr, xn_fp8, gate, S, D, act_scale_qkv, stream)
 
             # ── C2: QKV GEMM with descale ──
             w_scale_qkv = w_scales + (l * 4 + 0) * 4
@@ -147,7 +160,7 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
                                         S, total_keys, NH, HD, attn_scale, stream)
 
             # ── C4: O proj ──
-            act_scale_o = act_scales + (l * 4 + 1) * 4
+            act_scale_o = act_scales + (step_scale_base + l * 4 + 1) * 4
             w_scale_o = w_scales + (l * 4 + 1) * 4
             fvk.quantize_fp8_static_fp16(attn_out, ctx_fp8, act_scale_o, S * NH * HD, stream)
             ow_ptr = ow + l * NH * HD * D
@@ -155,7 +168,7 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
                                        act_scale_o, w_scale_o, stream)
 
             # ── C4→C5: gate×residual + AdaRMSNorm → FP8 ──
-            act_scale_gu = act_scales + (l * 4 + 2) * 4
+            act_scale_gu = act_scales + (step_scale_base + l * 4 + 2) * 4
             fvk.gate_res_adarms_fp8_static_fp16(fg, gate, x, sf_ptr,
                                                   xn_fp8, gate, S, D, act_scale_gu, stream)
 
@@ -166,7 +179,7 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
                                        act_scale_gu, w_scale_gu, stream)
 
             # ── C6: SiLU(gate) × up → FP8 ──
-            act_scale_down = act_scales + (l * 4 + 3) * 4
+            act_scale_down = act_scales + (step_scale_base + l * 4 + 3) * 4
             fvk.gate_geglu_merged_fp8_fp16(fg, hid_fp8, S, H, act_scale_down, stream)
 
             # ── C6: Down GEMM ──
@@ -179,7 +192,7 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
             if l < layers - 1:
                 si_next = (s * layers + l + 1) * S * D3
                 sa_next_ptr = sa + si_next * 2
-                act_scale_next = act_scales + ((l + 1) * 4 + 0) * 4
+                act_scale_next = act_scales + (step_scale_base + (l + 1) * 4 + 0) * 4
                 fvk.gate_res_adarms_fp8_static_fp16(fg, gate, x, sa_next_ptr,
                                                       xn_fp8, gate, S, D, act_scale_next, stream)
             else:
@@ -190,8 +203,23 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
         fs_ptr = fs + fi * 2
         fvk.adarms_fp16(x, fs_ptr, xn, gate, S, D, stream)
 
-        fvk.gmm_fp16(ctx, xn, aow, noise, S, 32, D, 1.0, stream)
-        fvk.add_bias_fp16(noise, aob, S, 32, stream)
+        if (noise_t is not None and xn_t is not None and delta_t is not None
+                and xn_f32_t is not None and delta_f32_t is not None
+                and aow_f32_t is not None and aob_f32_t is not None
+                and dt_t is not None):
+            xn_f32_t.copy_(xn_t)
+            torch.addmm(aob_f32_t, xn_f32_t, aow_f32_t, out=delta_f32_t)
+            delta_t.copy_(delta_f32_t)
+            delta_t.mul_(dt_t)
+            noise_t.add_(delta_t)
+        elif (noise_t is not None and xn_t is not None and delta_t is not None
+                and aow_t is not None and aob_t is not None and dt_t is not None):
+            torch.addmm(aob_t, xn_t, aow_t, out=delta_t)
+            delta_t.mul_(dt_t)
+            noise_t.add_(delta_t)
+        else:
+            fvk.gmm_fp16(ctx, xn, aow, noise, S, 32, D, 1.0, stream)
+            fvk.add_bias_fp16(noise, aob, S, 32, stream)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -321,7 +349,7 @@ def _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None)
 # ══════════════════════════════════════════════════════════════════
 
 def decoder_forward_calibrate(ctx, fvk_mod, bufs, weights, dims,
-                               calib_scales_ptr, stream=0):
+                               calib_scales_ptr, stream=0, *, attn=None):
     """Calibrate decoder FP8 scales. Framework-agnostic (pure pointers).
 
     For each quantization point:
@@ -339,6 +367,11 @@ def decoder_forward_calibrate(ctx, fvk_mod, bufs, weights, dims,
     noise = bufs['noise']; x = bufs['x']; xn = bufs['xn']
     gate_buf = bufs['gate']; qkv = bufs['qkv']; logits = bufs['logits']
     attn_out = bufs['attn_out']; hid = bufs['hid']; fg = bufs['fg']
+    noise_t = bufs.get('noise_t')
+    xn_t = bufs.get('xn_t')
+    delta_t = bufs.get('delta_t')
+    xn_f32_t = bufs.get('xn_f32_t')
+    delta_f32_t = bufs.get('delta_f32_t')
     xn_fp8 = bufs['xn_fp8']; hid_fp8 = bufs['hid_fp8']; ctx_fp8 = bufs['ctx_fp8']
 
     ain_w = weights['ain_w']; ain_b = weights['ain_b']
@@ -347,6 +380,11 @@ def decoder_forward_calibrate(ctx, fvk_mod, bufs, weights, dims,
     ow = weights['ow']; sf = weights['sf']
     gw = weights['gw']; dw = weights['dw']
     aow = weights['aow']; aob = weights['aob']
+    aow_t = weights.get('aow_t')
+    aob_t = weights.get('aob_t')
+    aow_f32_t = weights.get('aow_f32_t')
+    aob_f32_t = weights.get('aob_f32_t')
+    dt_t = weights.get('dt_t')
     fs = weights['fs']; rope = weights['rope']
     w_scales = weights['w_scales']
 
@@ -355,9 +393,10 @@ def decoder_forward_calibrate(ctx, fvk_mod, bufs, weights, dims,
     d_scale = bufs['d_scale']              # 1 float32
     hidden_scratch = bufs['hidden_scratch']  # S*H fp16
     fp8_scratch = bufs['fp8_scratch']      # S*max(D,H) fp8
-    _gpu_zero(calib_buf, layers * 4 * 4, stream)
+    _gpu_zero(calib_buf, steps * layers * 4 * 4, stream)
 
     for s in range(steps):
+        step_scale_base = s * layers * 4
         fvk_mod.gmm_fp16(ctx, noise, ain_w, x, S, D, 32, 0.0, stream)
         fvk_mod.add_bias_fp16(x, ain_b, S, D, stream)
 
@@ -367,13 +406,14 @@ def decoder_forward_calibrate(ctx, fvk_mod, bufs, weights, dims,
             sf_ptr = sf + si * 2
 
             # C1: AdaRMSNorm FP16 → measure amax → FP8
-            fvk_mod.adarms_fp16(x, sa_ptr, xn, gate_buf, S, D, stream)
-            _measure_scale_gpu(fvk_mod, xn, S * D, d_scale, fp8_scratch, stream)
-            _gpu_sync(stream)
-            cs_qkv = calib_buf + (l * 4 + 0) * 4
-            _gpu_copy(cs_qkv, d_scale, 4, stream)
-            fvk_mod.fused_adarms_fp8_static_fp16(x, sa_ptr, xn_fp8, gate_buf,
-                                                   S, D, cs_qkv, stream)
+            cs_qkv = calib_buf + (step_scale_base + l * 4 + 0) * 4
+            if l == 0:
+                fvk_mod.adarms_fp16(x, sa_ptr, xn, gate_buf, S, D, stream)
+                _measure_scale_gpu(fvk_mod, xn, S * D, d_scale, fp8_scratch, stream)
+                _gpu_sync(stream)
+                _gpu_copy(cs_qkv, d_scale, 4, stream)
+                fvk_mod.fused_adarms_fp8_static_fp16(
+                    x, sa_ptr, xn_fp8, gate_buf, S, D, cs_qkv, stream)
 
             # C2: QKV GEMM
             ws_qkv = w_scales + (l * 4 + 0) * 4
@@ -388,16 +428,19 @@ def decoder_forward_calibrate(ctx, fvk_mod, bufs, weights, dims,
                                                   kv_offset, HD, stream)
 
             # C3: Attention
-            K_ptr = Kc + l * total_keys * HD * 2
-            V_ptr = Vc + l * total_keys * HD * 2
-            fvk_mod.attention_qkv_fp16(ctx, attn_out, K_ptr, V_ptr,
-                                        logits, attn_out,
-                                        S, total_keys, NH, HD, attn_scale, stream)
+            if attn is not None:
+                attn.run("decoder", l, q_seq=S, kv_seq=total_keys, stream=stream)
+            else:
+                K_ptr = Kc + l * total_keys * HD * 2
+                V_ptr = Vc + l * total_keys * HD * 2
+                fvk_mod.attention_qkv_fp16(ctx, attn_out, K_ptr, V_ptr,
+                                            logits, attn_out,
+                                            S, total_keys, NH, HD, attn_scale, stream)
 
             # C4: O proj — measure attn amax → FP8 → GEMM
             _measure_scale_gpu(fvk_mod, attn_out, S * NH * HD, d_scale, fp8_scratch, stream)
             _gpu_sync(stream)
-            cs_o = calib_buf + (l * 4 + 1) * 4
+            cs_o = calib_buf + (step_scale_base + l * 4 + 1) * 4
             _gpu_copy(cs_o, d_scale, 4, stream)
             ws_o = w_scales + (l * 4 + 1) * 4
             fvk_mod.quantize_fp8_static_fp16(attn_out, ctx_fp8, cs_o, S * NH * HD, stream)
@@ -410,7 +453,7 @@ def decoder_forward_calibrate(ctx, fvk_mod, bufs, weights, dims,
             fvk_mod.adarms_fp16(x, sf_ptr, xn, gate_buf, S, D, stream)
             _measure_scale_gpu(fvk_mod, xn, S * D, d_scale, fp8_scratch, stream)
             _gpu_sync(stream)
-            cs_gu = calib_buf + (l * 4 + 2) * 4
+            cs_gu = calib_buf + (step_scale_base + l * 4 + 2) * 4
             _gpu_copy(cs_gu, d_scale, 4, stream)
             fvk_mod.quantize_fp8_static_fp16(xn, xn_fp8, cs_gu, S * D, stream)
 
@@ -424,7 +467,7 @@ def decoder_forward_calibrate(ctx, fvk_mod, bufs, weights, dims,
             fvk_mod.gate_geglu_merged_fp16(fg, hidden_scratch, S, H, stream)
             _measure_scale_gpu(fvk_mod, hidden_scratch, S * H, d_scale, fp8_scratch, stream)
             _gpu_sync(stream)
-            cs_down = calib_buf + (l * 4 + 3) * 4
+            cs_down = calib_buf + (step_scale_base + l * 4 + 3) * 4
             _gpu_copy(cs_down, d_scale, 4, stream)
             fvk_mod.gate_geglu_merged_fp8_fp16(fg, hid_fp8, S, H, cs_down, stream)
 
@@ -442,7 +485,7 @@ def decoder_forward_calibrate(ctx, fvk_mod, bufs, weights, dims,
                 fvk_mod.adarms_fp16(x, sa_next_ptr, xn, gate_buf, S, D, stream)
                 _measure_scale_gpu(fvk_mod, xn, S * D, d_scale, fp8_scratch, stream)
                 _gpu_sync(stream)
-                cs_next = calib_buf + ((l + 1) * 4 + 0) * 4
+                cs_next = calib_buf + (step_scale_base + (l + 1) * 4 + 0) * 4
                 _gpu_copy(cs_next, d_scale, 4, stream)
                 fvk_mod.quantize_fp8_static_fp16(xn, xn_fp8, cs_next, S * D, stream)
             else:
@@ -451,10 +494,25 @@ def decoder_forward_calibrate(ctx, fvk_mod, bufs, weights, dims,
         fi = s * S * D3
         fs_ptr = fs + fi * 2
         fvk_mod.adarms_fp16(x, fs_ptr, xn, gate_buf, S, D, stream)
-        fvk_mod.gmm_fp16(ctx, xn, aow, noise, S, 32, D, 1.0, stream)
-        fvk_mod.add_bias_fp16(noise, aob, S, 32, stream)
+        if (noise_t is not None and xn_t is not None and delta_t is not None
+                and xn_f32_t is not None and delta_f32_t is not None
+                and aow_f32_t is not None and aob_f32_t is not None
+                and dt_t is not None):
+            xn_f32_t.copy_(xn_t)
+            torch.addmm(aob_f32_t, xn_f32_t, aow_f32_t, out=delta_f32_t)
+            delta_t.copy_(delta_f32_t)
+            delta_t.mul_(dt_t)
+            noise_t.add_(delta_t)
+        elif (noise_t is not None and xn_t is not None and delta_t is not None
+                and aow_t is not None and aob_t is not None and dt_t is not None):
+            torch.addmm(aob_t, xn_t, aow_t, out=delta_t)
+            delta_t.mul_(dt_t)
+            noise_t.add_(delta_t)
+        else:
+            fvk_mod.gmm_fp16(ctx, xn, aow, noise, S, 32, D, 1.0, stream)
+            fvk_mod.add_bias_fp16(noise, aob, S, 32, stream)
 
-    _gpu_copy(calib_scales_ptr, calib_buf, layers * 4 * 4, stream)
+    _gpu_copy(calib_scales_ptr, calib_buf, steps * layers * 4 * 4, stream)
     _gpu_sync(stream)
 
 

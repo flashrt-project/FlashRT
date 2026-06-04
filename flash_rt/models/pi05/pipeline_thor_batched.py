@@ -155,6 +155,7 @@ def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
     attn_q_stride_bytes = S * Q_dim * 2
 
     for s in range(steps):
+        step_scale_base = s * layers * 4
         # ── Action input: noise → x (M = B*S) ──
         fvk.gmm_fp16(ctx, noise, ain_w, x, BS, D, 32, 0.0, stream)
         fvk.add_bias_fp16(x, ain_b, BS, D, stream)
@@ -167,9 +168,10 @@ def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
             sf_ptr = sf + si * 2
 
             # ── C1: Fused AdaRMSNorm + style → FP8 (M = B*S) ──
-            act_scale_qkv = act_scales + (l * 4 + 0) * 4
-            fvk.fused_adarms_fp8_static_fp16(
-                x, sa_ptr, xn_fp8, gate, BS, D, act_scale_qkv, stream)
+            act_scale_qkv = act_scales + (step_scale_base + l * 4 + 0) * 4
+            if l == 0:
+                fvk.fused_adarms_fp8_static_fp16(
+                    x, sa_ptr, xn_fp8, gate, BS, D, act_scale_qkv, stream)
 
             # ── C2: QKV GEMM (M = B*S) ──
             w_scale_qkv = w_scales + (l * 4 + 0) * 4
@@ -202,7 +204,7 @@ def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
                     S, total_keys, NH, HD, attn_scale, stream)
 
             # ── C4: Quantize attn → FP8 + O proj GEMM (flat, M = B*S) ──
-            act_scale_o = act_scales + (l * 4 + 1) * 4
+            act_scale_o = act_scales + (step_scale_base + l * 4 + 1) * 4
             w_scale_o = w_scales + (l * 4 + 1) * 4
             fvk.quantize_fp8_static_fp16(
                 attn_out, ctx_fp8, act_scale_o, BS * NH * HD, stream)
@@ -212,7 +214,7 @@ def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
                 act_scale_o, w_scale_o, stream)
 
             # ── C4→C5: gate × residual + AdaRMSNorm → FP8 (M = B*S) ──
-            act_scale_gu = act_scales + (l * 4 + 2) * 4
+            act_scale_gu = act_scales + (step_scale_base + l * 4 + 2) * 4
             fvk.gate_res_adarms_fp8_static_fp16(
                 fg, gate, x, sf_ptr,
                 xn_fp8, gate, BS, D, act_scale_gu, stream)
@@ -225,7 +227,7 @@ def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
                 act_scale_gu, w_scale_gu, stream)
 
             # ── C6: SiLU(gate) × up → FP8 (flat, M = B*S*H) ──
-            act_scale_down = act_scales + (l * 4 + 3) * 4
+            act_scale_down = act_scales + (step_scale_base + l * 4 + 3) * 4
             fvk.gate_geglu_merged_fp8_fp16(
                 fg, hid_fp8, BS, H, act_scale_down, stream)
 
@@ -240,7 +242,7 @@ def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
             if l < layers - 1:
                 si_next = (s * layers + l + 1) * BS * D3
                 sa_next_ptr = sa + si_next * 2
-                act_scale_next = act_scales + ((l + 1) * 4 + 0) * 4
+                act_scale_next = act_scales + (step_scale_base + (l + 1) * 4 + 0) * 4
                 fvk.gate_res_adarms_fp8_static_fp16(
                     fg, gate, x, sa_next_ptr,
                     xn_fp8, gate, BS, D, act_scale_next, stream)
