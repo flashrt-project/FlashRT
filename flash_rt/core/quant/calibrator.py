@@ -70,7 +70,8 @@ def _cache_path(ckpt_hash: str, Se: int) -> Path:
 
 def save_calibration(checkpoint_path: str, Se: int,
                      enc_scales: list, enc_alpha: list,
-                     ae_scales: list, enc_w_scales: list):
+                     ae_scales: list, enc_w_scales: list,
+                     metadata: dict | None = None):
     """Save calibration scales to local cache.
 
     Args:
@@ -97,6 +98,8 @@ def save_calibration(checkpoint_path: str, Se: int,
         "ae_scales": ae_scales,
         "enc_w_scales": enc_w_scales,
     }
+    if metadata is not None:
+        data["metadata"] = metadata
 
     with open(cache_file, "w") as f:
         json.dump(data, f, indent=2)

@@ -140,6 +140,7 @@ def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
     dw = weights['dw']
     aow = weights['aow']
     aob = weights['aob']
+    aob_dt = weights.get('aob_dt')
     dt = weights.get('dt')
     fs = weights['fs']                 # B-tiled: (steps, B*S, D3)
     rope = weights['rope']
@@ -261,7 +262,7 @@ def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
             # accumulates its own velocity into ``noise``.
             #   noise[i, :] = noise[i, :] + xn[i, :] @ aow + aob
             _action_update_fp16(ctx, fvk, xn, aow, aob, noise, BS, 32, D,
-                                stream, dt, action_f32)
+                                stream, dt, action_f32, aob_dt)
         else:
             # Per-step CFG (paper-correct, arXiv:2511.14759 App. E;
             # mirrors RTX
@@ -280,9 +281,11 @@ def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
                 fvk.action_update_from_fp32(v_b2_f32, aob, v_b2, BS, 32,
                                             float(dt), False, stream)
             else:
+                if aob_dt is None:
+                    raise ValueError("aob_dt is required for dt fallback path")
                 fvk.gmm_fp16_alpha(ctx, xn, aow, v_b2, BS, 32, D,
                                    float(dt), 0.0, stream)
-                fvk.add_bias_fp16(v_b2, aob, BS, 32, stream)
+                fvk.add_bias_fp16(v_b2, aob_dt, BS, 32, stream)
             # noise[slot 0] += v_uncond + cfg_beta * (v_cond - v_uncond)
             #   v_cond   = v_b2[0:S, :]   (slot 0)
             #   v_uncond = v_b2[S:2S, :]  (slot 1)

@@ -34,7 +34,7 @@ from flash_rt.hardware.thor.shared_primitives import (
 
 
 def _action_update_fp16(ctx, fvk, xn, aow, aob, noise, rows, cols, dim,
-                        stream, dt=None, scratch_f32=None):
+                        stream, dt=None, scratch_f32=None, aob_dt=None):
     if dt is None:
         fvk.gmm_fp16(ctx, xn, aow, noise, rows, cols, dim, 1.0, stream)
         fvk.add_bias_fp16(noise, aob, rows, cols, stream)
@@ -44,9 +44,11 @@ def _action_update_fp16(ctx, fvk, xn, aow, aob, noise, rows, cols, dim,
         fvk.action_update_from_fp32(scratch_f32, aob, noise, rows, cols,
                                     float(dt), True, stream)
     else:
+        if aob_dt is None:
+            raise ValueError("aob_dt is required for dt fallback path")
         fvk.gmm_fp16_alpha(ctx, xn, aow, noise, rows, cols, dim,
                            float(dt), 1.0, stream)
-        fvk.add_bias_fp16(noise, aob, rows, cols, stream)
+        fvk.add_bias_fp16(noise, aob_dt, rows, cols, stream)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -121,6 +123,7 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
     dw = weights['dw']
     aow = weights['aow']
     aob = weights['aob']
+    aob_dt = weights.get('aob_dt')
     dt = weights.get('dt')
     fs = weights['fs']
     rope = weights['rope']
@@ -211,7 +214,7 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
         fvk.adarms_fp16(x, fs_ptr, xn, gate, S, D, stream)
 
         _action_update_fp16(ctx, fvk, xn, aow, aob, noise, S, 32, D,
-                            stream, dt, action_f32)
+                            stream, dt, action_f32, aob_dt)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -246,6 +249,7 @@ def _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None)
     ow = weights['ow']; sf = weights['sf']
     gw = weights['gw']; dw = weights['dw']
     aow = weights['aow']; aob = weights['aob']
+    aob_dt = weights.get('aob_dt')
     dt = weights.get('dt')
     fs = weights['fs']; rope = weights['rope']
 
@@ -310,7 +314,7 @@ def _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None)
         fs_ptr = fs + fi * 2
         fvk.adarms_fp16(x, fs_ptr, xn, gate, S, D, stream)
         _action_update_fp16(ctx, fvk, xn, aow, aob, noise, S, 32, D,
-                            stream, dt, action_f32)
+                            stream, dt, action_f32, aob_dt)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -345,6 +349,7 @@ def decoder_forward_calibrate(ctx, fvk_mod, bufs, weights, dims,
     ow = weights['ow']; sf = weights['sf']
     gw = weights['gw']; dw = weights['dw']
     aow = weights['aow']; aob = weights['aob']
+    aob_dt = weights.get('aob_dt')
     dt = weights.get('dt')
     fs = weights['fs']; rope = weights['rope']
     w_scales = weights['w_scales']
@@ -456,7 +461,7 @@ def decoder_forward_calibrate(ctx, fvk_mod, bufs, weights, dims,
         fs_ptr = fs + fi * 2
         fvk_mod.adarms_fp16(x, fs_ptr, xn, gate_buf, S, D, stream)
         _action_update_fp16(ctx, fvk_mod, xn, aow, aob, noise, S, 32, D,
-                            stream, dt, action_f32)
+                            stream, dt, action_f32, aob_dt)
 
     _gpu_copy(calib_scales_ptr, calib_buf, steps * layers * 4 * 4, stream)
     _gpu_sync(stream)

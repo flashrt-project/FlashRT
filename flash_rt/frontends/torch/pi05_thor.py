@@ -47,6 +47,10 @@ logger = logging.getLogger(__name__)
 fp16 = torch.float16
 fp8 = torch.float8_e4m3fn
 
+_CALIBRATION_CACHE_METADATA = {
+    "pi05_thor_action_update": "fp32_bias_unscaled_v1",
+}
+
 _cudart = ctypes.CDLL("libcudart.so")
 
 
@@ -1107,6 +1111,7 @@ class Pi05TorchFrontendThor:
         # Try cache first
         cached = load_calibration(self._checkpoint_path, Se)
         if (cached is not None
+                and cached.get("metadata") == _CALIBRATION_CACHE_METADATA
                 and len(cached.get("enc_scales", [])) == Le * 4
                 and len(cached.get("ae_scales", [])) == ae_scale_count):
             self._enc_calib_scales = torch.tensor(
@@ -1213,7 +1218,8 @@ class Pi05TorchFrontendThor:
             'gw':        self._dec_gu_flat.data_ptr(),
             'dw':        self._dec_d_flat.data_ptr(),
             'aow':       self._aow.data_ptr(),
-            'aob':       self._aob_dt.data_ptr(),
+            'aob':       self._aob.data_ptr(),
+            'aob_dt':    self._aob_dt.data_ptr(),
             'dt':        self._ae_dt,
             'fs':        self._fs_all.data_ptr(),
             'rope':      self._dec_rope.data_ptr(),
@@ -1254,6 +1260,7 @@ class Pi05TorchFrontendThor:
                 enc_alpha=self._enc_alpha_host,
                 ae_scales=self._ae_calib_scales.cpu().tolist(),
                 enc_w_scales=enc_ws,
+                metadata=_CALIBRATION_CACHE_METADATA,
             )
         except Exception as e:
             logger.warning("Failed to save calibration cache: %s", e)
@@ -1404,7 +1411,8 @@ class Pi05TorchFrontendThor:
             'gw':         self._dec_gu_flat.data_ptr(),
             'dw':         self._dec_d_flat.data_ptr(),
             'aow':        self._aow.data_ptr(),
-            'aob':        self._aob_dt.data_ptr(),
+            'aob':        self._aob.data_ptr(),
+            'aob_dt':     self._aob_dt.data_ptr(),
             'dt':         self._ae_dt,
             'fs':         self._fs_all.data_ptr(),
             'rope':       self._dec_rope.data_ptr(),
@@ -1540,7 +1548,8 @@ class Pi05TorchFrontendThor:
             'gw':         self._dec_gu_flat.data_ptr(),
             'dw':         self._dec_d_flat.data_ptr(),
             'aow':        self._aow.data_ptr(),
-            'aob':        self._aob_dt.data_ptr(),
+            'aob':        self._aob.data_ptr(),
+            'aob_dt':     self._aob_dt.data_ptr(),
             'dt':         self._ae_dt,
             'fs':         self._fs_all_b2.data_ptr(),
             'rope':       self._dec_rope.data_ptr(),
@@ -1688,7 +1697,8 @@ class Pi05TorchFrontendThor:
             'gw':         self._dec_gu_flat.data_ptr(),
             'dw':         self._dec_d_flat.data_ptr(),
             'aow':        self._aow.data_ptr(),
-            'aob':        self._aob_dt.data_ptr(),
+            'aob':        self._aob.data_ptr(),
+            'aob_dt':     self._aob_dt.data_ptr(),
             'dt':         self._ae_dt,
             'fs':         self._fs_all_b2.data_ptr(),
             'rope':       self._dec_rope.data_ptr(),
@@ -2243,7 +2253,8 @@ class Pi05TorchFrontendThor:
             'gw':         self._dec_gu_flat.data_ptr(),
             'dw':         self._dec_d_flat.data_ptr(),
             'aow':        self._aow.data_ptr(),
-            'aob':        self._aob_dt.data_ptr(),
+            'aob':        self._aob.data_ptr(),
+            'aob_dt':     self._aob_dt.data_ptr(),
             'dt':         self._ae_dt,
             'fs':         self._fs_all.data_ptr(),
             'rope':       self._dec_rope.data_ptr(),
@@ -2358,7 +2369,8 @@ class Pi05TorchFrontendThor:
             'gw':         self._dec_gu_flat.data_ptr(),
             'dw':         self._dec_d_flat.data_ptr(),
             'aow':        self._aow.data_ptr(),
-            'aob':        self._aob_dt.data_ptr(),
+            'aob':        self._aob.data_ptr(),
+            'aob_dt':     self._aob_dt.data_ptr(),
             'dt':         self._ae_dt,
             'fs':         self._fs_all.data_ptr(),
             'rope':       self._dec_rope.data_ptr(),
