@@ -1460,6 +1460,39 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("ctx"), py::arg("A"), py::arg("B"), py::arg("C"),
        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("beta") = 0.0f, py::arg("stream") = 0);
 
+    m.def("gmm_fp16_alpha", [](FvkContext& ctx, uintptr_t A, uintptr_t B, uintptr_t C,
+                               int M, int N, int K, float alpha, float beta,
+                               uintptr_t stream) {
+        gmm_fp16_alpha(ctx.cublas_handle,
+                       reinterpret_cast<const __half*>(A),
+                       reinterpret_cast<const __half*>(B),
+                       reinterpret_cast<__half*>(C),
+                       M, N, K, alpha, beta, to_stream(stream));
+    }, py::arg("ctx"), py::arg("A"), py::arg("B"), py::arg("C"),
+       py::arg("M"), py::arg("N"), py::arg("K"), py::arg("alpha"),
+       py::arg("beta") = 0.0f, py::arg("stream") = 0);
+
+    m.def("gmm_fp16_out_fp32", [](FvkContext& ctx, uintptr_t A, uintptr_t B, uintptr_t C,
+                                  int M, int N, int K, uintptr_t stream) {
+        gmm_fp16_out_fp32(ctx.cublas_handle,
+                          reinterpret_cast<const __half*>(A),
+                          reinterpret_cast<const __half*>(B),
+                          reinterpret_cast<float*>(C),
+                          M, N, K, to_stream(stream));
+    }, py::arg("ctx"), py::arg("A"), py::arg("B"), py::arg("C"),
+       py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+
+    m.def("action_update_from_fp32", [](uintptr_t delta, uintptr_t bias, uintptr_t noise,
+                                        int S, int D, float dt, bool residual,
+                                        uintptr_t stream) {
+        action_update_from_fp32(reinterpret_cast<const float*>(delta),
+                                reinterpret_cast<const __half*>(bias),
+                                reinterpret_cast<__half*>(noise),
+                                S, D, dt, residual, to_stream(stream));
+    }, py::arg("delta"), py::arg("bias"), py::arg("noise"),
+       py::arg("S"), py::arg("D"), py::arg("dt"),
+       py::arg("residual") = true, py::arg("stream") = 0);
+
     // FP8 GEMM with device descale → FP16 output (pi05 gmm_fp8_kn_descale)
     m.def("fp8_gemm_descale_fp16", [](uintptr_t A, uintptr_t B, uintptr_t C,
             int M, int N, int K, uintptr_t act_descale, uintptr_t w_descale, uintptr_t stream) {

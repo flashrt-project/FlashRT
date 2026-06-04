@@ -24,7 +24,6 @@ Classes:
 """
 
 import math
-import torch
 
 from flash_rt.hardware.thor.shared_primitives import (
     _measure_scale_gpu,
@@ -32,6 +31,22 @@ from flash_rt.hardware.thor.shared_primitives import (
     _gpu_sync,
     _gpu_zero,
 )
+
+
+def _action_update_fp16(ctx, fvk, xn, aow, aob, noise, rows, cols, dim,
+                        stream, dt=None, scratch_f32=None):
+    if dt is None:
+        fvk.gmm_fp16(ctx, xn, aow, noise, rows, cols, dim, 1.0, stream)
+        fvk.add_bias_fp16(noise, aob, rows, cols, stream)
+    elif scratch_f32 is not None:
+        fvk.gmm_fp16_out_fp32(ctx, xn, aow, scratch_f32, rows, cols, dim,
+                              stream)
+        fvk.action_update_from_fp32(scratch_f32, aob, noise, rows, cols,
+                                    float(dt), True, stream)
+    else:
+        fvk.gmm_fp16_alpha(ctx, xn, aow, noise, rows, cols, dim,
+                           float(dt), 1.0, stream)
+        fvk.add_bias_fp16(noise, aob, rows, cols, stream)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -88,11 +103,7 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
     attn_out = bufs['attn_out']
     hid = bufs['hid']
     fg = bufs['fg']
-    noise_t = bufs.get('noise_t')
-    xn_t = bufs.get('xn_t')
-    delta_t = bufs.get('delta_t')
-    xn_f32_t = bufs.get('xn_f32_t')
-    delta_f32_t = bufs.get('delta_f32_t')
+    action_f32 = bufs.get('action_f32')
     xn_fp8 = bufs['xn_fp8']
     hid_fp8 = bufs['hid_fp8']
     ctx_fp8 = bufs['ctx_fp8']
@@ -110,11 +121,7 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
     dw = weights['dw']
     aow = weights['aow']
     aob = weights['aob']
-    aow_t = weights.get('aow_t')
-    aob_t = weights.get('aob_t')
-    aow_f32_t = weights.get('aow_f32_t')
-    aob_f32_t = weights.get('aob_f32_t')
-    dt_t = weights.get('dt_t')
+    dt = weights.get('dt')
     fs = weights['fs']
     rope = weights['rope']
     w_scales = weights['w_scales']
@@ -203,23 +210,8 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
         fs_ptr = fs + fi * 2
         fvk.adarms_fp16(x, fs_ptr, xn, gate, S, D, stream)
 
-        if (noise_t is not None and xn_t is not None and delta_t is not None
-                and xn_f32_t is not None and delta_f32_t is not None
-                and aow_f32_t is not None and aob_f32_t is not None
-                and dt_t is not None):
-            xn_f32_t.copy_(xn_t)
-            torch.addmm(aob_f32_t, xn_f32_t, aow_f32_t, out=delta_f32_t)
-            delta_t.copy_(delta_f32_t)
-            delta_t.mul_(dt_t)
-            noise_t.add_(delta_t)
-        elif (noise_t is not None and xn_t is not None and delta_t is not None
-                and aow_t is not None and aob_t is not None and dt_t is not None):
-            torch.addmm(aob_t, xn_t, aow_t, out=delta_t)
-            delta_t.mul_(dt_t)
-            noise_t.add_(delta_t)
-        else:
-            fvk.gmm_fp16(ctx, xn, aow, noise, S, 32, D, 1.0, stream)
-            fvk.add_bias_fp16(noise, aob, S, 32, stream)
+        _action_update_fp16(ctx, fvk, xn, aow, aob, noise, S, 32, D,
+                            stream, dt, action_f32)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -246,11 +238,7 @@ def _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None)
     noise = bufs['noise']; x = bufs['x']; xn = bufs['xn']
     gate = bufs['gate']; qkv = bufs['qkv']; logits = bufs['logits']
     attn_out = bufs['attn_out']; fg = bufs['fg']; hid = bufs['hid']
-    noise_t = bufs.get('noise_t')
-    xn_t = bufs.get('xn_t')
-    delta_t = bufs.get('delta_t')
-    xn_f32_t = bufs.get('xn_f32_t')
-    delta_f32_t = bufs.get('delta_f32_t')
+    action_f32 = bufs.get('action_f32')
 
     ain_w = weights['ain_w']; ain_b = weights['ain_b']
     sa = weights['sa']; qw = weights['qw']
@@ -258,11 +246,7 @@ def _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None)
     ow = weights['ow']; sf = weights['sf']
     gw = weights['gw']; dw = weights['dw']
     aow = weights['aow']; aob = weights['aob']
-    aow_t = weights.get('aow_t')
-    aob_t = weights.get('aob_t')
-    aow_f32_t = weights.get('aow_f32_t')
-    aob_f32_t = weights.get('aob_f32_t')
-    dt_t = weights.get('dt_t')
+    dt = weights.get('dt')
     fs = weights['fs']; rope = weights['rope']
 
     for s in range(steps):
@@ -325,23 +309,8 @@ def _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None)
         fi = s * S * D3
         fs_ptr = fs + fi * 2
         fvk.adarms_fp16(x, fs_ptr, xn, gate, S, D, stream)
-        if (noise_t is not None and xn_t is not None and delta_t is not None
-                and xn_f32_t is not None and delta_f32_t is not None
-                and aow_f32_t is not None and aob_f32_t is not None
-                and dt_t is not None):
-            xn_f32_t.copy_(xn_t)
-            torch.addmm(aob_f32_t, xn_f32_t, aow_f32_t, out=delta_f32_t)
-            delta_t.copy_(delta_f32_t)
-            delta_t.mul_(dt_t)
-            noise_t.add_(delta_t)
-        elif (noise_t is not None and xn_t is not None and delta_t is not None
-                and aow_t is not None and aob_t is not None and dt_t is not None):
-            torch.addmm(aob_t, xn_t, aow_t, out=delta_t)
-            delta_t.mul_(dt_t)
-            noise_t.add_(delta_t)
-        else:
-            fvk.gmm_fp16(ctx, xn, aow, noise, S, 32, D, 1.0, stream)
-            fvk.add_bias_fp16(noise, aob, S, 32, stream)
+        _action_update_fp16(ctx, fvk, xn, aow, aob, noise, S, 32, D,
+                            stream, dt, action_f32)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -367,11 +336,7 @@ def decoder_forward_calibrate(ctx, fvk_mod, bufs, weights, dims,
     noise = bufs['noise']; x = bufs['x']; xn = bufs['xn']
     gate_buf = bufs['gate']; qkv = bufs['qkv']; logits = bufs['logits']
     attn_out = bufs['attn_out']; hid = bufs['hid']; fg = bufs['fg']
-    noise_t = bufs.get('noise_t')
-    xn_t = bufs.get('xn_t')
-    delta_t = bufs.get('delta_t')
-    xn_f32_t = bufs.get('xn_f32_t')
-    delta_f32_t = bufs.get('delta_f32_t')
+    action_f32 = bufs.get('action_f32')
     xn_fp8 = bufs['xn_fp8']; hid_fp8 = bufs['hid_fp8']; ctx_fp8 = bufs['ctx_fp8']
 
     ain_w = weights['ain_w']; ain_b = weights['ain_b']
@@ -380,11 +345,7 @@ def decoder_forward_calibrate(ctx, fvk_mod, bufs, weights, dims,
     ow = weights['ow']; sf = weights['sf']
     gw = weights['gw']; dw = weights['dw']
     aow = weights['aow']; aob = weights['aob']
-    aow_t = weights.get('aow_t')
-    aob_t = weights.get('aob_t')
-    aow_f32_t = weights.get('aow_f32_t')
-    aob_f32_t = weights.get('aob_f32_t')
-    dt_t = weights.get('dt_t')
+    dt = weights.get('dt')
     fs = weights['fs']; rope = weights['rope']
     w_scales = weights['w_scales']
 
@@ -494,23 +455,8 @@ def decoder_forward_calibrate(ctx, fvk_mod, bufs, weights, dims,
         fi = s * S * D3
         fs_ptr = fs + fi * 2
         fvk_mod.adarms_fp16(x, fs_ptr, xn, gate_buf, S, D, stream)
-        if (noise_t is not None and xn_t is not None and delta_t is not None
-                and xn_f32_t is not None and delta_f32_t is not None
-                and aow_f32_t is not None and aob_f32_t is not None
-                and dt_t is not None):
-            xn_f32_t.copy_(xn_t)
-            torch.addmm(aob_f32_t, xn_f32_t, aow_f32_t, out=delta_f32_t)
-            delta_t.copy_(delta_f32_t)
-            delta_t.mul_(dt_t)
-            noise_t.add_(delta_t)
-        elif (noise_t is not None and xn_t is not None and delta_t is not None
-                and aow_t is not None and aob_t is not None and dt_t is not None):
-            torch.addmm(aob_t, xn_t, aow_t, out=delta_t)
-            delta_t.mul_(dt_t)
-            noise_t.add_(delta_t)
-        else:
-            fvk_mod.gmm_fp16(ctx, xn, aow, noise, S, 32, D, 1.0, stream)
-            fvk_mod.add_bias_fp16(noise, aob, S, 32, stream)
+        _action_update_fp16(ctx, fvk_mod, xn, aow, aob, noise, S, 32, D,
+                            stream, dt, action_f32)
 
     _gpu_copy(calib_scales_ptr, calib_buf, steps * layers * 4 * 4, stream)
     _gpu_sync(stream)
@@ -537,12 +483,10 @@ class Pi05ThorPipeline:
         * **No graph capture**: capture is the frontend's
           responsibility (it is intertwined with calibration). The
           pipeline only orchestrates ``replay``.
-        * **Backend-agnostic**: the torch frontend uses
-          ``torch.cuda.CUDAGraph`` and the JAX frontend uses
-          ``flash_rt.core.cuda_graph.CUDAGraph``; both are wrapped
-          by the ``replay_siglip`` / ``replay_enc_ae`` callbacks the
-          frontend hands in. Each callback is responsible for any
-          stream-sync the backend needs after replay.
+        * **Backend-agnostic**: backend-specific graph objects stay
+          in the frontend and are wrapped by the ``replay_siglip`` /
+          ``replay_enc_ae`` callbacks handed in here. Each callback is
+          responsible for any stream-sync the backend needs after replay.
     """
 
     def __init__(self, *, batch_size: int = 1):

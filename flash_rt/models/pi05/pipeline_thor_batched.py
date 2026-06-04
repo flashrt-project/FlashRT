@@ -36,7 +36,7 @@ Functions:
 
 import math
 
-from .pipeline_thor import Pi05ThorPipeline
+from .pipeline_thor import Pi05ThorPipeline, _action_update_fp16
 
 
 def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
@@ -125,6 +125,7 @@ def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
     logits = bufs['logits']
     attn_out = bufs['attn_out']
     fg = bufs['fg']
+    action_f32 = bufs.get('action_f32')
     xn_fp8 = bufs['xn_fp8']
     hid_fp8 = bufs['hid_fp8']
     ctx_fp8 = bufs['ctx_fp8']
@@ -139,6 +140,7 @@ def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
     dw = weights['dw']
     aow = weights['aow']
     aob = weights['aob']
+    dt = weights.get('dt')
     fs = weights['fs']                 # B-tiled: (steps, B*S, D3)
     rope = weights['rope']
     w_scales = weights['w_scales']
@@ -258,8 +260,8 @@ def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
             # Standard batched flow-matching integration: each slot
             # accumulates its own velocity into ``noise``.
             #   noise[i, :] = noise[i, :] + xn[i, :] @ aow + aob
-            fvk.gmm_fp16(ctx, xn, aow, noise, BS, 32, D, 1.0, stream)
-            fvk.add_bias_fp16(noise, aob, BS, 32, stream)
+            _action_update_fp16(ctx, fvk, xn, aow, aob, noise, BS, 32, D,
+                                stream, dt, action_f32)
         else:
             # Per-step CFG (paper-correct, arXiv:2511.14759 App. E;
             # mirrors RTX
@@ -268,8 +270,19 @@ def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
             # GEMM = overwrite) so we can blend the two slots before
             # integrating into noise:
             v_b2 = bufs['v_b2']
-            fvk.gmm_fp16(ctx, xn, aow, v_b2, BS, 32, D, 0.0, stream)
-            fvk.add_bias_fp16(v_b2, aob, BS, 32, stream)
+            if dt is None:
+                fvk.gmm_fp16(ctx, xn, aow, v_b2, BS, 32, D, 0.0, stream)
+                fvk.add_bias_fp16(v_b2, aob, BS, 32, stream)
+            elif bufs.get('v_b2_f32') is not None:
+                v_b2_f32 = bufs['v_b2_f32']
+                fvk.gmm_fp16_out_fp32(ctx, xn, aow, v_b2_f32, BS, 32, D,
+                                      stream)
+                fvk.action_update_from_fp32(v_b2_f32, aob, v_b2, BS, 32,
+                                            float(dt), False, stream)
+            else:
+                fvk.gmm_fp16_alpha(ctx, xn, aow, v_b2, BS, 32, D,
+                                   float(dt), 0.0, stream)
+                fvk.add_bias_fp16(v_b2, aob, BS, 32, stream)
             # noise[slot 0] += v_uncond + cfg_beta * (v_cond - v_uncond)
             #   v_cond   = v_b2[0:S, :]   (slot 0)
             #   v_uncond = v_b2[S:2S, :]  (slot 1)

@@ -46,6 +46,18 @@ void gmm_fp16(cublasHandle_t handle,
                const __half* A, const __half* B, __half* C,
                int M, int N, int K, float beta,
                cudaStream_t stream = 0);
+void gmm_fp16_alpha(cublasHandle_t handle,
+                    const __half* A, const __half* B, __half* C,
+                    int M, int N, int K, float alpha, float beta,
+                    cudaStream_t stream = 0);
+void gmm_fp16_out_fp32(cublasHandle_t handle,
+                       const __half* A, const __half* B, float* C,
+                       int M, int N, int K,
+                       cudaStream_t stream = 0);
+void action_update_from_fp32(const float* delta, const __half* bias,
+                             __half* noise, int S, int D, float dt,
+                             bool residual = true,
+                             cudaStream_t stream = 0);
 
 // FP8 GEMM with device descale → FP16 output (pi05 gmm_fp8_kn_descale)
 // Exact match: col-major layout, A_SCALE=w_descale, B_SCALE=act_descale

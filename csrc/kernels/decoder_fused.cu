@@ -193,6 +193,48 @@ void gmm_fp16(cublasHandle_t handle, const __half* A, const __half* B, __half* C
         &beta, C, CUDA_R_16F, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 }
 
+void gmm_fp16_alpha(cublasHandle_t handle, const __half* A, const __half* B, __half* C,
+                    int M, int N, int K, float alpha, float beta, cudaStream_t stream) {
+    cublasSetStream(handle, stream);
+    cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+        N, M, K, &alpha, B, CUDA_R_16F, N, A, CUDA_R_16F, K,
+        &beta, C, CUDA_R_16F, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+
+void gmm_fp16_out_fp32(cublasHandle_t handle, const __half* A, const __half* B, float* C,
+                       int M, int N, int K, cudaStream_t stream) {
+    cublasSetStream(handle, stream);
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+        N, M, K, &alpha, B, CUDA_R_16F, N, A, CUDA_R_16F, K,
+        &beta, C, CUDA_R_32F, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+
+__global__ void action_update_from_fp32_kernel(const float* delta,
+                                               const __half* bias,
+                                               __half* noise,
+                                               int S, int D, float dt,
+                                               bool residual) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= S * D) return;
+    __half dt_h = __float2half(dt);
+    __half v = __float2half(delta[i] + __half2float(bias[i % D]));
+    __half step = __float2half(__half2float(v) * __half2float(dt_h));
+    if (residual) {
+        noise[i] = __float2half(__half2float(noise[i]) + __half2float(step));
+    } else {
+        noise[i] = step;
+    }
+}
+
+void action_update_from_fp32(const float* delta, const __half* bias,
+                             __half* noise, int S, int D, float dt,
+                             bool residual, cudaStream_t stream) {
+    action_update_from_fp32_kernel<<<(S * D + 255) / 256, 256, 0, stream>>>(
+        delta, bias, noise, S, D, dt, residual);
+}
+
 // ── FP8 GEMM with device descale pointers → FP16 output ──
 // Exact port of pi05 gmm_fp8_kn_descale: cached descriptor + algo per (M,N,K).
 // Scale pointers updated per-call. Layout: col-major matching pi05.
