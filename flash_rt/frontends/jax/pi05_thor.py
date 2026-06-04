@@ -323,6 +323,8 @@ class Pi05JaxFrontendThor:
         self._ks_t = np.sin(kp).astype(fp16)
 
         Sa, Da, Ha, La = 10, 1024, 4096, 18
+        steps = 10
+        self.steps = steps
         self.Sa = Sa; self.Da = Da; self.Ha = Ha; self.La = La
         total_keys_max = Se_max + Sa
         self.Kc = CB.device_zeros(Le * total_keys_max * HDe, fp16)
@@ -506,7 +508,8 @@ class Pi05JaxFrontendThor:
         dims = {"sig_dims": list(self.sig_dims), "Se_max": self.Se_max,
                 "De": self.De, "He": self.He, "Le": self.Le,
                 "NHe": self.NHe, "HDe": self.HDe,
-                "Sa": self.Sa, "Da": self.Da, "Ha": self.Ha, "La": self.La}
+                "Sa": self.Sa, "Da": self.Da, "Ha": self.Ha, "La": self.La,
+                "steps": getattr(self, "steps", 10)}
         dims_json = json.dumps(dims).encode("utf-8")
         entries.append({"name": "_dims", "dtype": "json", "shape": [len(dims_json)]})
         blobs.append(dims_json)
@@ -567,6 +570,7 @@ class Pi05JaxFrontendThor:
         self.sig_dims = tuple(dims["sig_dims"])
         for k in ["Se_max", "De", "He", "Le", "NHe", "HDe", "Sa", "Da", "Ha", "La"]:
             setattr(self, k, dims[k])
+        self.steps = int(dims.get("steps", 10))
 
         # Numpy arrays
         for attr in self._CACHE_NUMPY:
@@ -749,7 +753,7 @@ class Pi05JaxFrontendThor:
         final_mod_b = jnp.array(self._final_mod_b)
 
         sa_list, sf_list, fs_list = [], [], []
-        for step in range(10):
+        for step in range(self.steps):
             te = jnp.array(self._time_emb_np[step][None, :], dtype=jnp.float16)
             tmp = (te @ t_mlp_in_w.T + t_mlp_in_b[None, :]).astype(jnp.float32)
             tmp = (tmp * jax.nn.sigmoid(tmp)).astype(jnp.float16)
@@ -849,7 +853,7 @@ class Pi05JaxFrontendThor:
              'w_scales': self.ae_w_dev.ptr.value,
              'act_scales': self.ae_calib_scales.ptr.value},
             {'S': self.Sa, 'D': self.Da, 'H': self.Ha, 'NH': 8, 'HD': 256,
-             'steps': 10, 'layers': self.La, 'enc_seq': self.Se,
+             'steps': self.steps, 'layers': self.La, 'enc_seq': self.Se,
              'total_keys': self.total_keys}
         )
 
@@ -864,12 +868,15 @@ class Pi05JaxFrontendThor:
         CB = self._CudaBuffer
         Se = self.Se; total_keys = self.total_keys
         Le = self.Le; La = self.La
+        ae_scale_count = self.steps * La * 4
         _cudart = self._cudart; stream = self._stream
         stream_int = stream.value or 0
 
         # Try cache first
         cached = load_calibration(self._checkpoint_path, Se)
-        if cached is not None:
+        if (cached is not None
+                and len(cached.get("enc_scales", [])) == Le * 4
+                and len(cached.get("ae_scales", [])) == ae_scale_count):
             enc_scales_np = np.array(cached["enc_scales"], dtype=np.float32)
             ae_scales_np = np.array(cached["ae_scales"], dtype=np.float32)
             self.enc_calib_scales = CB.from_numpy_managed(enc_scales_np)
@@ -879,9 +886,12 @@ class Pi05JaxFrontendThor:
                 float(np.float32(enc_scales_np[i]) * np.float32(enc_ws_np[i]))
                 for i in range(Le * 4)]
             logger.info("Calibration loaded from cache (enc=%d, ae=%d scales)",
-                        Le * 4, La * 4)
+                        Le * 4, ae_scale_count)
             self.calibrated = True
             return
+        if cached is not None:
+            logger.info("Ignoring stale calibration cache (expected enc=%d, ae=%d scales)",
+                        Le * 4, ae_scale_count)
 
         # ── Cache miss: run dynamic calibration ──
 
@@ -927,7 +937,7 @@ class Pi05JaxFrontendThor:
                     'L': Le, 'total_keys': total_keys}
         encoder_forward_calibrate(
             self._gemm, self._fvk, enc_bufs, enc_weights, enc_dims,
-            enc_scales_buf.ptr.value, stream=stream_int)
+            enc_scales_buf.ptr.value, stream=stream_int, attn=self._attn)
         _cudart.cudaStreamSynchronize(stream)
 
         self.enc_calib_scales = enc_scales_buf
@@ -940,9 +950,9 @@ class Pi05JaxFrontendThor:
 
         # Decoder calibration
         Sa = self.Sa; Da = self.Da; Ha = self.Ha
-        ae_scales_buf = CB.zeros(La * 4, np.float32)
+        ae_scales_buf = CB.zeros(ae_scale_count, np.float32)
         self.ae_calib_scales = ae_scales_buf
-        _ae_calib_buf = CB.zeros(La * 4, np.float32)
+        _ae_calib_buf = CB.zeros(ae_scale_count, np.float32)
         _ae_d_scale = CB.zeros(1, np.float32)
         _ae_hidden_scratch = CB.device_empty(Sa * Ha, np.float16)
         _ae_fp8_scratch = CB.device_zeros(Sa * max(Da, Ha), np.uint8)
@@ -957,11 +967,11 @@ class Pi05JaxFrontendThor:
         ae_bufs['fp8_scratch'] = _ae_fp8_scratch.ptr.value
         decoder_forward_calibrate(
             self._ctx, self._fvk, ae_bufs, ae_weights, ae_dims,
-            ae_scales_buf.ptr.value, stream=stream_int)
+            ae_scales_buf.ptr.value, stream=stream_int, attn=self._attn)
         _cudart.cudaStreamSynchronize(stream)
 
         self.ae_calib_scales = ae_scales_buf
-        logger.info(f"Decoder calibrated: {La*4} scales")
+        logger.info("Decoder calibrated: %d scales", ae_scale_count)
         self.calibrated = True
 
         # Save to cache
@@ -971,7 +981,7 @@ class Pi05JaxFrontendThor:
                 Se=Se,
                 enc_scales=enc_scales_np.tolist(),
                 enc_alpha=self.enc_alpha_host,
-                ae_scales=ae_scales_buf.download_new((La * 4,), np.float32).tolist(),
+                ae_scales=ae_scales_buf.download_new((ae_scale_count,), np.float32).tolist(),
                 enc_w_scales=enc_ws_np.tolist(),
             )
         except Exception as e:
@@ -1371,7 +1381,7 @@ class Pi05JaxFrontendThor:
         }
         ae_dims_b2 = {
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
-            'steps': 10, 'layers': La, 'enc_seq': Se,
+            'steps': self.steps, 'layers': La, 'enc_seq': Se,
             'total_keys': total_keys,
         }
 
@@ -1527,7 +1537,7 @@ class Pi05JaxFrontendThor:
         }
         ae_dims_b2 = {
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
-            'steps': 10, 'layers': La, 'enc_seq': Se,
+            'steps': self.steps, 'layers': La, 'enc_seq': Se,
             'total_keys': total_keys,
         }
 
@@ -2234,6 +2244,7 @@ class Pi05JaxFrontendThor:
         Se = int(self.Se); De = int(self.De); He = int(self.He)
         NHe = int(self.NHe); HDe = int(self.HDe)
         Le = int(self.Le); La = int(self.La)
+        ae_scale_count = self.steps * La * 4
         Sa = int(self.Sa); Da = int(self.Da); Ha = int(self.Ha)
         total_keys = int(self.total_keys)
         nv = self.num_views
@@ -2245,7 +2256,7 @@ class Pi05JaxFrontendThor:
         _d_scale = CB.zeros(1, np.float32)
         _fp8_scratch = CB.device_zeros(Se * max(De, He), np.uint8)
         _ones_buf = CB.from_numpy(np.ones(De, dtype=np.float16))
-        _ae_calib_buf = CB.zeros(La * 4, np.float32)
+        _ae_calib_buf = CB.zeros(ae_scale_count, np.float32)
         _ae_d_scale = CB.zeros(1, np.float32)
         _ae_hidden_scratch = CB.device_empty(Sa * Ha, np.float16)
         _ae_fp8_scratch = CB.device_zeros(Sa * max(Da, Ha), np.uint8)
@@ -2313,13 +2324,13 @@ class Pi05JaxFrontendThor:
             self.Kc.zero_(stream); self.Vc.zero_(stream)
             encoder_forward_calibrate(
                 self._gemm, self._fvk, enc_bufs, enc_weights, enc_dims,
-                enc_scales_buf.ptr.value, stream=stream_int)
+                enc_scales_buf.ptr.value, stream=stream_int, attn=self._attn)
             self._cudart.cudaStreamSynchronize(stream)
             per_sample_enc.append(
                 enc_scales_buf.download_new((Le * 4,), np.float32))
 
             # ── Decoder shadow forward (fixed seed per sample, rule C10) ──
-            ae_scales_buf = CB.zeros(La * 4, np.float32)
+            ae_scales_buf = CB.zeros(ae_scale_count, np.float32)
             noise_np = np.random.default_rng(i).standard_normal(
                 (Sa, 32)).astype(np.float16)
             self.g_noise.upload(noise_np)
@@ -2330,10 +2341,10 @@ class Pi05JaxFrontendThor:
             ae_bufs['fp8_scratch'] = _ae_fp8_scratch.ptr.value
             decoder_forward_calibrate(
                 self._ctx, self._fvk, ae_bufs, ae_weights, ae_dims,
-                ae_scales_buf.ptr.value, stream=stream_int)
+                ae_scales_buf.ptr.value, stream=stream_int, attn=self._attn)
             self._cudart.cudaStreamSynchronize(stream)
             per_sample_ae.append(
-                ae_scales_buf.download_new((La * 4,), np.float32))
+                ae_scales_buf.download_new((ae_scale_count,), np.float32))
 
             if verbose and (i + 1) % max(1, n // 10) == 0:
                 logger.info("  sample %d/%d", i + 1, n)
@@ -2375,6 +2386,7 @@ class Pi05JaxFrontendThor:
         """
         CB = self._CudaBuffer
         Se = self.Se; Le = self.Le; La = self.La
+        ae_scale_count = self.steps * La * 4
         total_keys = self.total_keys
         _cudart = self._cudart; stream = self._stream
         stream_int = stream.value or 0
@@ -2419,7 +2431,7 @@ class Pi05JaxFrontendThor:
         self.Kc.zero_(stream); self.Vc.zero_(stream)
         encoder_forward_calibrate(
             self._gemm, self._fvk, enc_bufs, enc_weights, enc_dims,
-            enc_scales_buf.ptr.value, stream=stream_int)
+            enc_scales_buf.ptr.value, stream=stream_int, attn=self._attn)
         _cudart.cudaStreamSynchronize(stream)
 
         self.enc_calib_scales = enc_scales_buf
@@ -2431,8 +2443,8 @@ class Pi05JaxFrontendThor:
 
         # Decoder recalibration
         Sa = self.Sa; Da = self.Da; Ha = self.Ha
-        ae_scales_buf = CB.zeros(La * 4, np.float32)
-        _ae_calib_buf = CB.zeros(La * 4, np.float32)
+        ae_scales_buf = CB.zeros(ae_scale_count, np.float32)
+        _ae_calib_buf = CB.zeros(ae_scale_count, np.float32)
         _ae_d_scale = CB.zeros(1, np.float32)
         _ae_hidden_scratch = CB.device_empty(Sa * Ha, np.float16)
         _ae_fp8_scratch = CB.device_zeros(Sa * max(Da, Ha), np.uint8)
@@ -2447,7 +2459,7 @@ class Pi05JaxFrontendThor:
         ae_bufs['fp8_scratch'] = _ae_fp8_scratch.ptr.value
         decoder_forward_calibrate(
             self._ctx, self._fvk, ae_bufs, ae_weights, ae_dims,
-            ae_scales_buf.ptr.value, stream=stream_int)
+            ae_scales_buf.ptr.value, stream=stream_int, attn=self._attn)
         _cudart.cudaStreamSynchronize(stream)
 
         self.ae_calib_scales = ae_scales_buf
