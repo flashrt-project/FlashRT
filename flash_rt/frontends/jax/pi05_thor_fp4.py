@@ -686,6 +686,7 @@ class Pi05JaxFrontendThorFP4(Pi05JaxFrontendThor):
         Se = int(self.Se); De = int(self.De); He = int(self.He)
         NHe = int(self.NHe); HDe = int(self.HDe); Le = int(self.Le); La = int(self.La)
         Sa = int(self.Sa); Da = int(self.Da); Ha = int(self.Ha)
+        ae_scale_count = int(self.steps) * La * 4
         total_keys = int(self.total_keys)
         nv = self.num_views
 
@@ -696,7 +697,7 @@ class Pi05JaxFrontendThorFP4(Pi05JaxFrontendThor):
         _d_scale = CB.zeros(1, np.float32)
         _fp8_scratch = CB.device_zeros(Se * max(De, He), np.uint8)
         _ones_buf = CB.from_numpy(np.ones(De, dtype=np.float16))
-        _ae_calib_buf = CB.zeros(La * 4, np.float32)
+        _ae_calib_buf = CB.zeros(ae_scale_count, np.float32)
         _ae_d_scale = CB.zeros(1, np.float32)
         _ae_hidden_scratch = CB.device_empty(Sa * Ha, np.float16)
         _ae_fp8_scratch = CB.device_zeros(Sa * max(Da, Ha), np.uint8)
@@ -764,7 +765,7 @@ class Pi05JaxFrontendThorFP4(Pi05JaxFrontendThor):
             per_sample_enc.append(
                 enc_scales_buf.download_new((Le * 4,), np.float32))
 
-            ae_scales_buf = CB.zeros(La * 4, np.float32)
+            ae_scales_buf = CB.zeros(ae_scale_count, np.float32)
             noise_np = _orig_randn(Sa, 32).astype(np.float16)
             self.g_noise.upload(noise_np)
             ae_bufs, ae_weights, ae_dims = self._build_ae_dicts(stream_int)
@@ -778,7 +779,7 @@ class Pi05JaxFrontendThorFP4(Pi05JaxFrontendThor):
                                        stream=stream_int)
             self._cudart.cudaStreamSynchronize(stream)
             per_sample_ae.append(
-                ae_scales_buf.download_new((La * 4,), np.float32))
+                ae_scales_buf.download_new((ae_scale_count,), np.float32))
 
             if verbose and (i + 1) % max(1, n // 10) == 0:
                 logger.info("  FP8-scale sample %d/%d", i + 1, n)

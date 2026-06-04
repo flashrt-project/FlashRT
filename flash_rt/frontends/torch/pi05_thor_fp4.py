@@ -394,6 +394,11 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                 self._awq_inv_s_dn[l].copy_(inv_s_dn)
                 quant_weight_nvfp4_inplace(gu_scaled, self._fp4_weights[l]['gate_up'])
                 quant_weight_nvfp4_inplace(d_scaled,  self._fp4_weights[l]['down'])
+                if self.use_p1_split_gu and 'gate' in self._fp4_weights[l]:
+                    quant_weight_nvfp4_inplace(
+                        gu_scaled[:He, :].contiguous(), self._fp4_weights[l]['gate'])
+                    quant_weight_nvfp4_inplace(
+                        gu_scaled[He:, :].contiguous(), self._fp4_weights[l]['up'])
 
     def _collect_awq_activation_amax(self):
         """Run calibration forward with hook that snapshots fp16 activations
@@ -703,7 +708,8 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                 self._gemm, fvk, fvk_fp4, enc_bufs, enc_weights, enc_dims,
                 stream=s_int, attn=self._attn,
                 fp4_layers=fp4_layers, fp4_weights=fp4_weights,
-                fp4_scratch=fp4_scratch)
+                fp4_scratch=fp4_scratch,
+                use_p1_split_gu=self.use_p1_split_gu)
             decoder_forward(self._ctx, fvk, ae_bufs, ae_weights,
                             ae_dims, stream=s_int, attn=self._attn)
             self._enc_ae_graph.capture_end()
