@@ -38,5 +38,31 @@ void fp8_per_token_block128_quant_bf16(
     int M, int K,
     cudaStream_t stream);
 
+// Generic row-wise block-128 FP8 e4m3 quantization with ceil-div scale
+// layout. Unlike fp8_per_token_block128_quant_bf16, K does not need to
+// be a multiple of 128.
+//
+//   input  : (rows, cols) bf16 row-major
+//   output : (rows, cols) e4m3 row-major
+//   scale  : (rows, ceil(cols / 128)) fp32 row-major
+void fp8_row_block128_quant_bf16(
+    const void* input,
+    void*       output_fp8,
+    float*      output_scale,
+    int rows, int cols,
+    cudaStream_t stream);
+
+// Row-wise FP8 e4m3 quantization.
+//
+//   input  : (rows, cols) bf16 row-major
+//   output : (rows, cols) e4m3 row-major
+//   scale  : (rows) fp32, one scale per row
+void fp8_row_quant_bf16(
+    const void* input,
+    void*       output_fp8,
+    float*      output_scale,
+    int rows, int cols,
+    cudaStream_t stream);
+
 }  // namespace quantize
 }  // namespace flash_rt

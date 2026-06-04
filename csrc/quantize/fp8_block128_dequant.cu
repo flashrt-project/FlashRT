@@ -80,6 +80,37 @@ __global__ void per_token_dequant_kernel(
     out_bf16[i * K + j] = __float2bfloat16(v);
 }
 
+__global__ void row_block128_dequant_kernel(
+    const __nv_fp8_e4m3* __restrict__ in_fp8,
+    const float* __restrict__ block_scale,
+    __nv_bfloat16* __restrict__ out_bf16,
+    int rows, int cols, int col_blocks)
+{
+    const int j = blockIdx.x * kBkX + threadIdx.x;
+    const int i = blockIdx.y * kBkY + threadIdx.y;
+    if (i >= rows || j >= cols) return;
+
+    const int sb = i * col_blocks + (j / kBlock);
+    const float s = block_scale[sb];
+    const float v = static_cast<float>(in_fp8[i * cols + j]) * s;
+    out_bf16[i * cols + j] = __float2bfloat16(v);
+}
+
+__global__ void row_dequant_kernel(
+    const __nv_fp8_e4m3* __restrict__ in_fp8,
+    const float* __restrict__ row_scale,
+    __nv_bfloat16* __restrict__ out_bf16,
+    int rows, int cols)
+{
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    if (row >= rows || col >= cols) return;
+
+    const float s = row_scale[row];
+    const float v = static_cast<float>(in_fp8[row * cols + col]) * s;
+    out_bf16[row * cols + col] = __float2bfloat16(v);
+}
+
 }  // namespace
 
 void fp8_block128_dequantize_to_bf16(
@@ -112,6 +143,39 @@ void fp8_per_token_block128_dequantize_to_bf16(
         act_block_scale,
         reinterpret_cast<__nv_bfloat16*>(out_bf16),
         M, K);
+}
+
+void fp8_row_block128_dequantize_to_bf16(
+    const void* in_fp8,
+    const float* block_scale,
+    void* out_bf16,
+    int rows, int cols,
+    cudaStream_t stream)
+{
+    const int col_blocks = (cols + kBlock - 1) / kBlock;
+    dim3 grid((cols + kBkX - 1) / kBkX, (rows + kBkY - 1) / kBkY);
+    dim3 block(kBkX, kBkY);
+    row_block128_dequant_kernel<<<grid, block, 0, stream>>>(
+        reinterpret_cast<const __nv_fp8_e4m3*>(in_fp8),
+        block_scale,
+        reinterpret_cast<__nv_bfloat16*>(out_bf16),
+        rows, cols, col_blocks);
+}
+
+void fp8_row_dequantize_to_bf16(
+    const void* in_fp8,
+    const float* row_scale,
+    void* out_bf16,
+    int rows, int cols,
+    cudaStream_t stream)
+{
+    constexpr int threads = 256;
+    dim3 grid((cols + threads - 1) / threads, rows);
+    row_dequant_kernel<<<grid, threads, 0, stream>>>(
+        reinterpret_cast<const __nv_fp8_e4m3*>(in_fp8),
+        row_scale,
+        reinterpret_cast<__nv_bfloat16*>(out_bf16),
+        rows, cols);
 }
 
 }  // namespace quantize

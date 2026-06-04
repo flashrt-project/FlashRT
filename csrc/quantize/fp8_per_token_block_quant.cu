@@ -127,6 +127,142 @@ __global__ void fp8_per_token_block_quant_linear_kernel(
   }
 }
 
+__global__ void fp8_row_block128_quant_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    __nv_fp8_e4m3* __restrict__ output,
+    float* __restrict__ scale,
+    int rows, int cols, int col_blocks)
+{
+  const int row = blockIdx.y;
+  const int kb = blockIdx.x;
+  if (row >= rows || kb >= col_blocks) return;
+
+  const int t = threadIdx.x;
+  const int col = kb * kBlock + t;
+  const float v = (col < cols)
+      ? static_cast<float>(input[row * cols + col])
+      : 0.0f;
+  float amax = fabsf(v);
+
+  for (int off = 16; off > 0; off >>= 1) {
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
+  }
+  __shared__ float warp_amax[4];
+  const int lane = t & 31;
+  const int warp = t >> 5;
+  if (lane == 0) warp_amax[warp] = amax;
+  __syncthreads();
+
+  if (warp == 0) {
+    amax = (lane < 4) ? warp_amax[lane] : 0.0f;
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2));
+    if (lane == 0) {
+      const float s = fmaxf(amax / kFp8Max, 1.0e-12f);
+      warp_amax[0] = s;
+      scale[row * col_blocks + kb] = s;
+    }
+  }
+  __syncthreads();
+
+  if (col < cols) {
+    float q = v / warp_amax[0];
+    q = fminf(fmaxf(q, -kFp8Max), kFp8Max);
+    output[row * cols + col] = __nv_fp8_e4m3(q);
+  }
+}
+
+__global__ void fp8_row_block128_quant_linear_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    __nv_fp8_e4m3* __restrict__ output,
+    float* __restrict__ scale,
+    int rows, int cols, int col_blocks)
+{
+  const int tile = blockIdx.x;
+  const int row = tile / col_blocks;
+  const int kb = tile - row * col_blocks;
+  if (row >= rows || kb >= col_blocks) return;
+
+  const int t = threadIdx.x;
+  const int col = kb * kBlock + t;
+  const float v = (col < cols)
+      ? static_cast<float>(input[row * cols + col])
+      : 0.0f;
+  float amax = fabsf(v);
+
+  for (int off = 16; off > 0; off >>= 1) {
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
+  }
+  __shared__ float warp_amax[4];
+  const int lane = t & 31;
+  const int warp = t >> 5;
+  if (lane == 0) warp_amax[warp] = amax;
+  __syncthreads();
+
+  if (warp == 0) {
+    amax = (lane < 4) ? warp_amax[lane] : 0.0f;
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2));
+    if (lane == 0) {
+      const float s = fmaxf(amax / kFp8Max, 1.0e-12f);
+      warp_amax[0] = s;
+      scale[row * col_blocks + kb] = s;
+    }
+  }
+  __syncthreads();
+
+  if (col < cols) {
+    float q = v / warp_amax[0];
+    q = fminf(fmaxf(q, -kFp8Max), kFp8Max);
+    output[row * cols + col] = __nv_fp8_e4m3(q);
+  }
+}
+
+__global__ void fp8_row_quant_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    __nv_fp8_e4m3* __restrict__ output,
+    float* __restrict__ scale,
+    int rows, int cols)
+{
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+
+  float amax = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    amax = fmaxf(amax, fabsf(static_cast<float>(input[row * cols + col])));
+  }
+
+  for (int off = 16; off > 0; off >>= 1) {
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
+  }
+
+  __shared__ float warp_amax[8];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  if (lane == 0) warp_amax[warp] = amax;
+  __syncthreads();
+
+  if (warp == 0) {
+    amax = (lane < (blockDim.x >> 5)) ? warp_amax[lane] : 0.0f;
+    for (int off = 4; off > 0; off >>= 1) {
+      amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
+    }
+    if (lane == 0) {
+      const float s = fmaxf(amax / kFp8Max, 1.0e-12f);
+      warp_amax[0] = s;
+      scale[row] = s;
+    }
+  }
+  __syncthreads();
+
+  const float inv_s = 1.0f / warp_amax[0];
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    float q = static_cast<float>(input[row * cols + col]) * inv_s;
+    q = fminf(fmaxf(q, -kFp8Max), kFp8Max);
+    output[row * cols + col] = __nv_fp8_e4m3(q);
+  }
+}
+
 }  // namespace
 
 void fp8_per_token_block128_quant_bf16(
@@ -152,6 +288,47 @@ void fp8_per_token_block128_quant_bf16(
         output_scale,
         M, K);
   }
+}
+
+void fp8_row_block128_quant_bf16(
+    const void* input,
+    void* output_fp8,
+    float* output_scale,
+    int rows, int cols,
+    cudaStream_t stream)
+{
+  const int col_blocks = (cols + kBlock - 1) / kBlock;
+  dim3 block(kBlock);
+  if (rows <= 65535) {
+    dim3 grid(col_blocks, rows);
+    fp8_row_block128_quant_kernel<<<grid, block, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(input),
+        reinterpret_cast<__nv_fp8_e4m3*>(output_fp8),
+        output_scale,
+        rows, cols, col_blocks);
+  } else {
+    dim3 grid(col_blocks * rows);
+    fp8_row_block128_quant_linear_kernel<<<grid, block, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(input),
+        reinterpret_cast<__nv_fp8_e4m3*>(output_fp8),
+        output_scale,
+        rows, cols, col_blocks);
+  }
+}
+
+void fp8_row_quant_bf16(
+    const void* input,
+    void* output_fp8,
+    float* output_scale,
+    int rows, int cols,
+    cudaStream_t stream)
+{
+  constexpr int threads = 256;
+  fp8_row_quant_kernel<<<rows, threads, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(input),
+      reinterpret_cast<__nv_fp8_e4m3*>(output_fp8),
+      output_scale,
+      rows, cols);
 }
 
 }  // namespace quantize

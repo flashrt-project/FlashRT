@@ -51,5 +51,31 @@ void fp8_per_token_block128_dequantize_to_bf16(
     int K,
     cudaStream_t stream);
 
+// Generic row-wise block-128 dequantization with ceil-div scale layout.
+//
+//   input : (rows, cols) e4m3 row-major
+//   scale : (rows, ceil(cols / 128)) fp32 row-major
+//   output: (rows, cols) bf16 row-major
+void fp8_row_block128_dequantize_to_bf16(
+    const void*  in_fp8,
+    const float* block_scale,
+    void*        out_bf16,
+    int rows,
+    int cols,
+    cudaStream_t stream);
+
+// Row-wise FP8 dequantization.
+//
+//   input : (rows, cols) e4m3 row-major
+//   scale : (rows) fp32
+//   output: (rows, cols) bf16 row-major
+void fp8_row_dequantize_to_bf16(
+    const void*  in_fp8,
+    const float* row_scale,
+    void*        out_bf16,
+    int rows,
+    int cols,
+    cudaStream_t stream);
+
 }  // namespace quantize
 }  // namespace flash_rt

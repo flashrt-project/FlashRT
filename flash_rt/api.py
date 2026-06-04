@@ -239,6 +239,13 @@ class VLAModel:
         time, or None if the frontend does not surface it yet."""
         return getattr(self._pipe, "precision_spec", None)
 
+    def export_quant_manifest(self, path):
+        """Export the active frontend quantization manifest when supported."""
+        if not hasattr(self._pipe, "export_quant_manifest"):
+            raise ValueError(
+                f"quant manifest export is not supported by {type(self._pipe).__name__}")
+        return self._pipe.export_quant_manifest(path)
+
     def recalibrate(self):
         """Force recalibration on next set_prompt().
 
@@ -281,7 +288,9 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                vision_num_layers=None,
                cache_frames=None,
                use_fp16=False,
-               use_fp8=True):
+               use_fp8=True,
+               quant_manifest=None,
+               quant_policy="compatible"):
     """Load a FlashRT model.
 
     Args:
@@ -358,6 +367,14 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             1 runs the full vision+encoder+decoder path on every frame; 2
             alternates full and decoder-only frames. ``None`` keeps the
             frontend default.
+        quant_manifest: Optional external quantization manifest. Currently
+            supported by Pi0.5 torch RTX/Orin FP8 frontends for per-tensor
+            FP8 weight and activation scales.
+        quant_policy: Policy for missing manifest entries:
+            ``"strict"`` errors, ``"compatible"`` uses FlashRT local
+            calibration for missing activation scales and local amax for
+            missing weight scales, ``"fallback_bf16"`` is reserved for
+            future mixed-precision manifests.
 
     Returns:
         VLAModel instance with .predict() method.
@@ -534,6 +551,12 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             kwargs["vision_num_layers"] = vision_num_layers
         if cache_frames is not None and "cache_frames" in sig.parameters:
             kwargs["cache_frames"] = cache_frames
+        if quant_manifest is not None and "quant_manifest" in sig.parameters:
+            kwargs["quant_manifest"] = quant_manifest
+            kwargs["quant_policy"] = quant_policy
+        elif quant_manifest is not None:
+            raise ValueError(
+                f"quant_manifest is not supported by {pipe_cls.__name__}")
         # FP4 frontend accepts these extra kwargs (only set when the class
         # actually accepts them — base class ignores, FP4 subclass uses).
         if use_fp4 and "use_fp4_encoder_ffn" in sig.parameters:

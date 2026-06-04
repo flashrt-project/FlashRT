@@ -349,6 +349,16 @@ def _quantize_fp8_e4m3(w_bf16: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
     return w_fp8, scale_tensor
 
 
+def _quantize_fp8_e4m3_with_scale(
+    w_bf16: torch.Tensor, scale_value: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-tensor symmetric FP8 E4M3 quantization with an external scale."""
+    scale = max(float(scale_value), 1e-12)
+    w_fp8 = (w_bf16.float() / scale).clamp(-448.0, 448.0).to(fp8_e4m3)
+    scale_tensor = torch.tensor([scale], dtype=torch.float32, device="cuda")
+    return w_fp8, scale_tensor
+
+
 def _select_fp8_layout(hardware: Optional[str], fp8_layout: Optional[str]) -> str:
     """Choose the Pi0.5 FP8 weight layout.
 
@@ -480,7 +490,9 @@ class Pi05TorchFrontendRtx:
                  cache_frames: int = 1,
                  use_fp8: bool = True,
                  hardware: Optional[str] = None,
-                 fp8_layout: Optional[str] = None):
+                 fp8_layout: Optional[str] = None,
+                 quant_manifest: Optional[Union[str, pathlib.Path]] = None,
+                 quant_policy: str = "compatible"):
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         self.num_views = int(num_views)
         self.chunk_size = int(chunk_size)
@@ -510,6 +522,18 @@ class Pi05TorchFrontendRtx:
         # _use_int8_vision_static is set after _force_int8_decoder below
         self.use_fp8 = bool(use_fp8)
         self.fp8_layout = _select_fp8_layout(hardware, fp8_layout)
+        from flash_rt.core.quant.manifest import (
+            load_quant_manifest,
+            validate_quant_policy,
+        )
+        self.quant_policy = validate_quant_policy(quant_policy)
+        self.quant_manifest = load_quant_manifest(quant_manifest)
+        if self.quant_manifest is not None:
+            self.quant_manifest.require_model("pi05")
+            if self.quant_policy == "fallback_bf16":
+                raise NotImplementedError(
+                    "Pi0.5 external quant manifests currently support "
+                    "strict and compatible FP8 policies only")
 
         self.latency_records: list[float] = []
         self.calibrated = False
@@ -548,6 +572,13 @@ class Pi05TorchFrontendRtx:
             (env_force_bf16 or not supports_fp8()) and
             not self._force_int8_decoder
         )
+        if self.quant_manifest is not None:
+            if not self.use_fp8:
+                raise ValueError("quant_manifest requires use_fp8=True")
+            if self._force_bf16 or self._force_int8_decoder or self._int8_encoder_only:
+                raise ValueError(
+                    "quant_manifest requires the active Pi0.5 FP8 path; "
+                    "BF16 and INT8 override modes do not consume FP8 manifests")
 
         # ── Load norm_stats ──
         self._load_norm_stats(checkpoint_dir)
@@ -582,6 +613,7 @@ class Pi05TorchFrontendRtx:
         # ── Low-precision weight stores ──
         self._fp8_weights: dict = {}
         self._fp8_store: list = []  # holds tensors alive
+        self._fp8_weight_scales: dict[str, torch.Tensor] = {}
         self._int8_weights: dict = {}
         self._int8_store: list = []
         self._int8_weight_scales: dict[str, torch.Tensor] = {}
@@ -712,10 +744,32 @@ class Pi05TorchFrontendRtx:
                 w = w.t().contiguous()
             else:
                 w = w.contiguous()
-            w_fp8, scale = _quantize_fp8_e4m3(w)
+            site = self.quant_manifest.site(name) if self.quant_manifest else None
+            if site is not None and site.precision != "fp8":
+                raise NotImplementedError(
+                    f"{name}: manifest precision={site.precision!r} is not "
+                    "supported by the current Pi0.5 FP8 GEMM path")
+            weight_spec = site.weight if site is not None else None
+            external_scale = weight_spec.scalar_scale() if weight_spec is not None else None
+            if external_scale is not None:
+                if weight_spec.granularity != "per_tensor":
+                    raise ValueError(
+                        f"{name}: only per_tensor weight scales are supported by "
+                        "the current Pi0.5 FP8 GEMM path, got "
+                        f"{weight_spec.granularity!r}")
+                w_fp8, scale = _quantize_fp8_e4m3_with_scale(w, external_scale)
+            else:
+                if (
+                    self.quant_manifest is not None and
+                    self.quant_policy == "strict" and
+                    name in self._manifest_required_weight_sites
+                ):
+                    raise ValueError(f"{name}: missing weight scale in quant manifest")
+                w_fp8, scale = _quantize_fp8_e4m3(w)
             store.append(w_fp8)
             store.append(scale)
             fp8[name] = (w_fp8.data_ptr(), scale.data_ptr())
+            self._fp8_weight_scales[name] = scale
 
         # Vision (27 layers × 4) + projector
         for i in range(VIS_L):
@@ -746,6 +800,15 @@ class Pi05TorchFrontendRtx:
             quant(f"decoder_ffn_down_w_{i}", W["decoder_ffn_down_w"][i])
 
         logger.info("FP8 quantized %d GEMM weights (layout=%s)", len(fp8), self.fp8_layout)
+
+    @property
+    def _manifest_required_weight_sites(self) -> set[str]:
+        from flash_rt.core.quant.pi05_sites import iter_pi05_fp8_sites
+        return {
+            spec.name
+            for spec in iter_pi05_fp8_sites(vision_layers=self._vision_num_layers)
+            if spec.runtime_active
+        }
 
     def _quantize_decoder_int8(self) -> None:
         """Pre-quantize the decoder hot-path GEMM weights to INT8."""
@@ -1306,6 +1369,7 @@ class Pi05TorchFrontendRtx:
                     "from one calibration sample. Expect cosine drop "
                     "(~0.96 vs dynamic 0.991 on test sequence). Set "
                     "FVK_PI05_RTX_INT8_ENCODER_STATIC=0 to disable.")
+            self._apply_manifest_activation_scales()
             self.pipeline.autotune_gemms()
             self.pipeline.record_infer_graph(external_stream_int=stream_int)
 
@@ -1370,6 +1434,7 @@ class Pi05TorchFrontendRtx:
                 self.pipeline.fp8_act_scales[name].upload(
                     np.array([final_amax[idx]], dtype=np.float32))
 
+            self._apply_manifest_activation_scales()
             self.pipeline.fp8_calibrated = True
             self.pipeline.autotune_gemms()
             self.pipeline.record_infer_graph(external_stream_int=stream_int)
@@ -1389,6 +1454,43 @@ class Pi05TorchFrontendRtx:
         for buf in getattr(self.pipeline, "int8_act_scales", {}).values():
             buf.zero_()
 
+    def _apply_manifest_activation_scales(self) -> None:
+        """Overlay external Q/DQ activation scales before graph capture."""
+        if self.quant_manifest is None or self.pipeline is None:
+            return
+        overridden = 0
+        missing = []
+        for name, buf in self.pipeline.fp8_act_scales.items():
+            site = self.quant_manifest.site(name)
+            if site is None or site.activation is None:
+                base_name = name.split("__step_", 1)[0]
+                site = self.quant_manifest.site(base_name)
+            if site is not None and site.precision != "fp8":
+                raise NotImplementedError(
+                    f"{name}: manifest precision={site.precision!r} is not "
+                    "supported by the current Pi0.5 static FP8 path")
+            act_spec = site.activation if site is not None else None
+            external_scale = act_spec.scalar_scale() if act_spec is not None else None
+            if external_scale is None:
+                missing.append(name)
+                continue
+            if act_spec.granularity != "per_tensor":
+                raise ValueError(
+                    f"{name}: only per_tensor activation scales are supported "
+                    "by the current Pi0.5 static FP8 path, got "
+                    f"{act_spec.granularity!r}")
+            buf.upload(np.array([external_scale], dtype=np.float32))
+            overridden += 1
+        if missing and self.quant_policy == "strict":
+            raise ValueError(
+                "quant manifest is missing activation scale(s): "
+                + ", ".join(missing[:20])
+                + (" ..." if len(missing) > 20 else ""))
+        if overridden:
+            logger.info(
+                "Applied %d activation scale(s) from quant manifest "
+                "(policy=%s)", overridden, self.quant_policy)
+
     def _warn_if_scale_ceiling_exceeded(self, label: str = "pi05_rtx") -> None:
         """Diagnostic warning if any FP8 scale exceeds the sanity ceiling."""
         from flash_rt.core.calibration import check_scale_ceiling
@@ -1397,6 +1499,52 @@ class Pi05TorchFrontendRtx:
             for name, buf in self.pipeline.fp8_act_scales.items()
         }
         check_scale_ceiling(scales, label=label)
+
+    def export_quant_manifest(self, path: Union[str, pathlib.Path]) -> pathlib.Path:
+        """Export current Pi0.5 FP8 scales as a FlashRT quant manifest."""
+        if not self._fp8_weight_scales:
+            raise ValueError("no FP8 weight scales are available to export")
+        path = pathlib.Path(path)
+        sites = {}
+        required_sites = self._manifest_required_weight_sites
+        for name in sorted(required_sites):
+            weight_scale = self._fp8_weight_scales.get(name)
+            if weight_scale is None:
+                continue
+            rec = {
+                "precision": "fp8",
+                "weight": {
+                    "dtype": "fp8_e4m3fn",
+                    "granularity": "per_tensor",
+                    "scale": float(weight_scale.detach().cpu().float().item()),
+                },
+            }
+            if self.pipeline is not None and name in self.pipeline.fp8_act_scales:
+                rec["activation"] = {
+                    "dtype": "fp8_e4m3fn",
+                    "granularity": "per_tensor",
+                    "scale": float(
+                        self.pipeline.fp8_act_scales[name].download_new(
+                            (1,), np.float32)[0]),
+                }
+            sites[name] = rec
+        manifest = {
+            "format": "flashrt_quant_manifest_v1",
+            "model": "pi05",
+            "source": "flashrt",
+            "metadata": {
+                "producer": "Pi05TorchFrontendRtx.export_quant_manifest",
+                "fp8_layout": self.fp8_layout,
+                "num_steps": self._num_steps,
+                "vision_num_layers": self._vision_num_layers,
+            },
+            "sites": sites,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2, sort_keys=True)
+            f.write("\n")
+        return path
 
     def _snapshot_precision_spec(self, *, method: str, n: int,
                                   percentile: Optional[float]):

@@ -441,6 +441,12 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
             self.bf16_nn(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, to_stream(stream));
         }, py::arg("A"), py::arg("B"), py::arg("D"),
            py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0)
+        .def("bf16_run", [](GemmRunner& self,
+                             uintptr_t A, uintptr_t B, uintptr_t D,
+                             int M, int N, int K, uintptr_t stream) {
+            self.bf16_run(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, to_stream(stream));
+        }, py::arg("A"), py::arg("B"), py::arg("D"),
+           py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0)
         .def("bf16_nn_res", [](GemmRunner& self,
                                 uintptr_t A, uintptr_t B, uintptr_t D,
                                 int M, int N, int K, uintptr_t stream) {
@@ -2175,6 +2181,30 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("in_fp8"), py::arg("scale"), py::arg("out_bf16"),
         py::arg("N"), py::arg("K"), py::arg("stream") = 0);
 
+    m.def("fp8_row_block128_dequantize_to_bf16",
+        [](uintptr_t in_fp8, uintptr_t scale, uintptr_t out_bf16,
+           int rows, int cols, uintptr_t stream) {
+            flash_rt::quantize::fp8_row_block128_dequantize_to_bf16(
+                to_ptr(in_fp8),
+                reinterpret_cast<const float*>(scale),
+                to_ptr(out_bf16),
+                rows, cols, to_stream(stream));
+        },
+        py::arg("in_fp8"), py::arg("scale"), py::arg("out_bf16"),
+        py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
+
+    m.def("fp8_row_dequantize_to_bf16",
+        [](uintptr_t in_fp8, uintptr_t scale, uintptr_t out_bf16,
+           int rows, int cols, uintptr_t stream) {
+            flash_rt::quantize::fp8_row_dequantize_to_bf16(
+                to_ptr(in_fp8),
+                reinterpret_cast<const float*>(scale),
+                to_ptr(out_bf16),
+                rows, cols, to_stream(stream));
+        },
+        py::arg("in_fp8"), py::arg("scale"), py::arg("out_bf16"),
+        py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
+
     // Single-shot FP8 block-128 -> NVFP4 (swizzled SF + per-tensor global).
     // Replaces the lossy two-step (dequantize_to_bf16 + bf16_to_nvfp4_swizzled)
     // for weight tensors — see csrc/quantize/fp8_block128_to_nvfp4_swizzled.cuh
@@ -2646,6 +2676,30 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("input"), py::arg("output_fp8"),
         py::arg("output_scale"),
         py::arg("M"), py::arg("K"), py::arg("stream") = 0);
+
+    m.def("fp8_row_block128_quant_bf16",
+        [](uintptr_t input, uintptr_t output_fp8, uintptr_t output_scale,
+           int rows, int cols, uintptr_t stream) {
+            flash_rt::quantize::fp8_row_block128_quant_bf16(
+                to_ptr(input), to_ptr(output_fp8),
+                reinterpret_cast<float*>(output_scale),
+                rows, cols, to_stream(stream));
+        },
+        py::arg("input"), py::arg("output_fp8"),
+        py::arg("output_scale"),
+        py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
+
+    m.def("fp8_row_quant_bf16",
+        [](uintptr_t input, uintptr_t output_fp8, uintptr_t output_scale,
+           int rows, int cols, uintptr_t stream) {
+            flash_rt::quantize::fp8_row_quant_bf16(
+                to_ptr(input), to_ptr(output_fp8),
+                reinterpret_cast<float*>(output_scale),
+                rows, cols, to_stream(stream));
+        },
+        py::arg("input"), py::arg("output_fp8"),
+        py::arg("output_scale"),
+        py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
 
     // G7.7 — Fused IM2COL + FP8 e4m3 quantize for 3x3x3 stride-1
     // already-padded Conv3d. Caller pads x with F.pad to (T_pad, H_pad, W_pad)
