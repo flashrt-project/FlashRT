@@ -231,3 +231,123 @@ class HiggsAudioV3Fp8Decoder:
 
     def set_input(self, embed_row: torch.Tensor) -> None:
         self.h.copy_(embed_row)
+
+    # ── position-agnostic single decode graph ──
+    # One captured graph serves every decode position: the RoPE row is pre-copied
+    # into a fixed buffer, the KV write targets K_cache[*cur_pos] via the devpos
+    # kernel, and attention reads the device KV length via FA2 seqused_k. The host
+    # updates three small buffers (rope row, cur_pos, seqused) before each replay.
+
+    def _alloc_graph(self) -> None:
+        d, HALF = self.dev, self.HD // 2
+        self.rope_cos_buf = torch.empty(HALF, device=d, dtype=BF16)
+        self.rope_sin_buf = torch.empty(HALF, device=d, dtype=BF16)
+        self.cur_pos_dev = torch.zeros(1, device=d, dtype=torch.int32)
+        self.seqused_dev = torch.zeros(1, device=d, dtype=torch.int32)
+        self._graph = None
+        self._gs = torch.cuda.Stream(device=d)
+
+    @torch.no_grad()
+    def _step_graphable(self):
+        from flash_rt import flash_rt_kernels as fvk
+        from flash_rt import flash_rt_fa2 as fa2
+        fe, be = self.fe, self.fe._attn
+        H, NQ, NKV, HD, INTER = self.H, self.NQ, self.NKV, self.HD, self.INTER
+        NQK, KV, EPS = self.NQK, self.KV, self.EPS
+        MAXS = be._max_seq
+        gv = {k: getattr(fvk, v) for k, v in _GEMV.items()}
+        s = torch.cuda.current_stream().cuda_stream
+        rc, rs = self.rope_cos_buf, self.rope_sin_buf
+        cp, su = self.cur_pos_dev, self.seqused_dev
+        h, fp8a, fp8o, fp8d = self.h, self.fp8a, self.fp8o, self.fp8d
+        qb, ob = be.Q_buf[:, :1], be.O_buf[:, :1]
+        qst = (qb.stride(0), qb.stride(1), qb.stride(2))
+        ost = (ob.stride(0), ob.stride(1), ob.stride(2))
+        for L in range(self.NL):
+            w = self.WL[L]
+            fvk.rms_norm_fp8(h.data_ptr(), w["in_norm"].data_ptr(), fp8a.data_ptr(),
+                             1, H, EPS, self.DS[L][0].data_ptr(), s)
+            gv["qkv"](fp8a.data_ptr(), w["qkvq"].data_ptr(), self.Dq.data_ptr(),
+                      1, NQK + 2 * KV, H, self.ALP[L][0] * w["qkvs"], s)
+            q = self.Dq[:, :NQK].view(NQ, HD).contiguous()
+            k = self.Dq[:, NQK:NQK + KV].view(NKV, HD).contiguous()
+            v = self.Dq[:, NQK + KV:].view(NKV, HD).contiguous()
+            fvk.qwen3_q_norm_rope_qstage_bf16(
+                q_pre=q.data_ptr(), q_norm_w=w["qn"].data_ptr(),
+                cos=rc.data_ptr(), sin=rs.data_ptr(),
+                q_buf_dst=qb.data_ptr(), n_q_heads=NQ, eps=EPS, stream=s)
+            fvk.qwen3_k_norm_rope_kvwrite_devpos_bf16(
+                k.data_ptr(), v.data_ptr(), w["kn"].data_ptr(),
+                rc.data_ptr(), rs.data_ptr(),
+                be.K_cache[L, 0].data_ptr(), be.V_cache[L, 0].data_ptr(),
+                cp.data_ptr(), NKV * HD, NKV, EPS, s)
+            kf, vf = be.K_cache[L:L + 1, :MAXS], be.V_cache[L:L + 1, :MAXS]
+            fa2.fwd_bf16_seqused(
+                Q=qb.data_ptr(), K=kf.data_ptr(), V=vf.data_ptr(), O=ob.data_ptr(),
+                softmax_lse=be.lse_buf.data_ptr(), seqused_k=su.data_ptr(),
+                batch=1, seqlen_q=1, seqlen_k=MAXS, num_heads_q=NQ,
+                num_heads_kv=NKV, head_dim=HD, q_strides=qst,
+                k_strides=(kf.stride(0), kf.stride(1), kf.stride(2)),
+                v_strides=(vf.stride(0), vf.stride(1), vf.stride(2)),
+                o_strides=ost, softmax_scale=HD ** -0.5, num_sms=0, stream=s)
+            ao = be.O_buf[:, :1].reshape(1, NQK).contiguous()
+            fvk.quantize_fp8_static(ao.data_ptr(), fp8o.data_ptr(), self.DS[L][1].data_ptr(), NQK, s)
+            gv["o"](fp8o.data_ptr(), w["oq"].data_ptr(), h.data_ptr(),
+                    1, H, NQK, self.ALP[L][1] * w["os"], s)
+            fvk.rms_norm_fp8(h.data_ptr(), w["post_norm"].data_ptr(), fp8a.data_ptr(),
+                             1, H, EPS, self.DS[L][2].data_ptr(), s)
+            gv["gu"](fp8a.data_ptr(), w["guq"].data_ptr(), self.Dg.data_ptr(),
+                     1, 2 * INTER, H, self.ALP[L][2] * w["gus"], s)
+            fvk.silu_mul_qwen36_bf16(self.Dg[:, :INTER].contiguous().data_ptr(),
+                                     self.Dg[:, INTER:].contiguous().data_ptr(),
+                                     self.act.data_ptr(), INTER, s)
+            fvk.quantize_fp8_static(self.act.data_ptr(), fp8d.data_ptr(), self.DS[L][3].data_ptr(), INTER, s)
+            gv["dn"](fp8d.data_ptr(), w["dnq"].data_ptr(), h.data_ptr(),
+                     1, H, INTER, self.ALP[L][3] * w["dns"], s)
+        fvk.rms_norm(h.data_ptr(), fe._weights["final_norm"].data_ptr(),
+                     self.hn.data_ptr(), 1, H, EPS, s)
+        fvk.quantize_fp8_static(self.hn.data_ptr(), fp8a.data_ptr(), self.DSF.data_ptr(), H, s)
+        gv["head"](fp8a.data_ptr(), self.CBq.data_ptr(), self.Dh.data_ptr(),
+                   1, self.NC * self.CV, H, self.asc_f * self.CBs, s)
+        return self.Dh.view(1, self.NC, self.CV)
+
+    @torch.no_grad()
+    def _set_pos(self, t: int) -> None:
+        self.rope_cos_buf.copy_(self.fe._rope_cos[t])
+        self.rope_sin_buf.copy_(self.fe._rope_sin[t])
+        self.cur_pos_dev.fill_(t)
+        self.seqused_dev.fill_(t + 1)
+
+    @torch.no_grad()
+    def capture_graph(self, embed_row: torch.Tensor, warm_pos: int) -> None:
+        """Capture the single decode graph once (any warm position works)."""
+        if getattr(self, "_graph", None) is not None:
+            return
+        if not hasattr(self, "rope_cos_buf"):
+            self._alloc_graph()
+        gs = self._gs
+        gs.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(gs):
+            for _ in range(3):
+                self.h.copy_(embed_row)
+                self._set_pos(warm_pos)
+                self._step_graphable()
+            self.h.copy_(embed_row)
+            self._set_pos(warm_pos)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, stream=gs):
+                self._step_graphable()
+        torch.cuda.current_stream().wait_stream(gs)
+        self._graph = g
+
+    @torch.no_grad()
+    def decode_graph(self, embed_row: torch.Tensor, t: int) -> torch.Tensor:
+        """Replay the decode graph at position t with input embed_row."""
+        gs = self._gs
+        gs.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(gs):
+            self.h.copy_(embed_row)
+            self._set_pos(t)
+            self._graph.replay()
+        torch.cuda.current_stream().wait_stream(gs)
+        return self.Dh.view(1, self.NC, self.CV)

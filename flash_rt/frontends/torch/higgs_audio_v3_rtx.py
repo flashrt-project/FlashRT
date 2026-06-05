@@ -56,6 +56,11 @@ class HiggsAudioV3TorchFrontendRtx:
         self.max_seq = int(max_seq)
         self.max_new_frames = int(max_new_frames)
         self.fp8 = bool(fp8)
+        # Single position-agnostic decode CUDA graph (devpos KV-write + FA2
+        # seqused_k). On by default for FP8; set FLASHRT_HIGGS_GRAPH=0 to force
+        # the eager decode path.
+        self._use_graph = self.fp8 and os.environ.get(
+            "FLASHRT_HIGGS_GRAPH", "1") != "0"
 
         self._tokenizer: Any = None
         self._special_ids: dict[str, int] = {}
@@ -303,6 +308,15 @@ class HiggsAudioV3TorchFrontendRtx:
             return self._fp8_decoder.step(t)[0]
         return self._logits(self._step(fvk, embed_row, t))
 
+    def _decode_logits(self, fvk, embed_row, t):
+        """Decode-position logits; uses the position-agnostic graph when on."""
+        if self._use_graph:
+            dec = self._fp8_decoder
+            if getattr(dec, "_graph", None) is None:
+                dec.capture_graph(embed_row, t)   # one-time, any position
+            return dec.decode_graph(embed_row, t)[0]
+        return self._frame_logits(fvk, embed_row, t)
+
     # ── split surface (committed streaming seam for the serving layer) ──
     # prefill once -> decode_stream yields un-delayed [nc] frames as they
     # complete. The delay pattern means an un-delayed frame t is only complete
@@ -355,7 +369,7 @@ class HiggsAudioV3TorchFrontendRtx:
                 base = len(window) - nc
                 yield torch.stack(
                     [window[base + i][i] for i in range(nc)]).cpu()
-            logits = self._frame_logits(fvk, self._embed_codes(codes), P + j)
+            logits = self._decode_logits(fvk, self._embed_codes(codes), P + j)
 
     @torch.no_grad()
     def predict(self, text: str | None = None) -> torch.Tensor:
