@@ -16,18 +16,25 @@ non-commercial license — check the model card.
 
 ## Performance
 
-Measured on a single **RTX 5090** (SM120), single stream, FP8 W8A8, warm
-(numbers vary with text and clocks):
+Measured on a single **RTX 5090** (SM120), single stream, warm (numbers vary
+with text and clocks). Two precisions: **FP8 W8A8** (default) and **BF16
+W16A16** — the fallback for hosts without FP8 (`fp8=False`, see below):
 
-| Metric | Value |
-|---|---|
-| Real-time factor (RTF) | **0.095 – 0.11** (≈ 9–10× faster than real time) |
-| Time to first audio (TTFA) | **≈ 94 ms** |
-| Prompt prefill | **≈ 1.0 ms/token** (batched single-pass; ~0.8 on longer prompts) |
-| Autoregressive decode | **≈ 3.2 ms/frame** steady (≈ 3.7–4.3 ms/frame full-pipeline incl. prefill amortisation + codec) |
-| Peak VRAM | **6.6 GB** (FP8 backbone ≈ 3.6 GB + bf16 embed/head + fp32 codec) |
-| Fidelity | teacher-forced logits **cos 1.0** vs the reference backbone; codec **cos 0.99993** vs canonical; streamed == one-shot **cos 1.0** |
-| Prefix reuse | a shared `system` preamble cuts prefill by **~64 %**, output bit-identical |
+| Metric | **FP8** (default) | **BF16** (`fp8=False`) |
+|---|---|---|
+| Real-time factor (RTF) | **0.095 – 0.11** (≈ 9–10× real time) | **0.15** (≈ 6.5× real time) |
+| Time to first audio (TTFA) | **≈ 94 ms** | **≈ 138 ms** |
+| Autoregressive decode | **≈ 3.2 ms/frame** | **≈ 6.1 ms/frame** (at the BF16 bandwidth wall) |
+| Prompt prefill | **≈ 1.0 ms/token** | **≈ 0.9 ms/token** (cuBLAS, weight-once) |
+| Peak VRAM | **6.6 GB** | **9.6 GB** |
+| Fidelity | teacher-forced logits **cos 1.0**; codec **cos 0.99993**; streamed == one-shot **cos 1.0** | same (bit-exact vs eager) |
+| Prefix reuse | shared `system` preamble cuts prefill **~64 %**, output bit-identical | same |
+
+Both precisions run the **same** fully-kernelised, zero-torch decode path
+(position-agnostic CUDA graph, batched prefill, prefix reuse). BF16 reads 2× the
+weight bytes of FP8, so its per-frame is ~1.7× — the bandwidth floor, not
+overhead. **No FP8 (pre-Blackwell, or FP8 disabled)? construct with `fp8=False`
+or pass `--bf16` to the quickstart/server** — everything else is identical.
 
 **Speedup over the unoptimised PyTorch reference** (same model + GPU, transformers
 eager backbone):
@@ -38,19 +45,13 @@ eager backbone):
 | Prompt prefill | 3.7 ms/token | **1.0 ms/token** | **3.7× faster** |
 | Backbone weight VRAM | 7.3 GB (bf16) | **3.6 GB (FP8)** | **2× smaller** |
 
-The decode math path is fully kernelised (RMSNorm→FP8 quant, dedicated M=1 FP8
-GEMV with fused residual epilogue, fused q/k-norm+RoPE+KV-write, FlashAttention-2)
-and replayed from a single position-agnostic CUDA graph. The prompt is prefilled
-in one batched M=P pass; a shared `system` preamble's KV is reused across
-requests (only the new text is prefilled — see [§4](#4-python-api)).
-
-**BF16 fallback (`fp8=False`)** — for hosts without FP8 — runs the same
-fully-kernelised decode path (dedicated M=1 BF16 GEMV at **86 % HBM BW**,
-residual folded into the following RMSNorm, position-agnostic graph, prefix
-reuse): **≈ 6.1 ms/frame, RTF ≈ 0.15, TTFA ≈ 138 ms, ~9.6 GB**, bit-exact vs
-the eager reference. BF16 reads 2× the weight bytes of FP8, so per-frame is at
-its bandwidth wall (~1.7× FP8); the one-time prompt prefill uses cuBLAS
-(weight-once, 66–82 % HBM) since it is eager setup, not the decode graph.
+The decode math path is fully kernelised (RMSNorm + quant, dedicated M=1 GEMV
+with fused residual, fused q/k-norm+RoPE+KV-write, FlashAttention-2) and replayed
+from a single position-agnostic CUDA graph. The prompt is prefilled in one
+batched M=P pass; a shared `system` preamble's KV is reused across requests (only
+the new text is prefilled — see [§4](#4-python-api)). The dedicated M=1 GEMV runs
+at **86 % HBM bandwidth** in both precisions; per-frame is bandwidth-bound, so
+the only lever below the BF16 floor is the FP8 quantisation (half the bytes).
 
 ---
 
