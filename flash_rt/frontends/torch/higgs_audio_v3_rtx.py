@@ -36,6 +36,7 @@ class HiggsAudioV3TorchFrontendRtx:
                  device: str = "cuda:0",
                  max_seq: int = 2048,
                  max_new_frames: int = 1024,
+                 fp8: bool = True,
                  alloc_own_forward_buffers: bool = True) -> None:
         """Load the BF16 backbone + fused codebook table and build scratch.
 
@@ -44,6 +45,9 @@ class HiggsAudioV3TorchFrontendRtx:
           device: CUDA device string.
           max_seq: KV-cache length (prompt + generated frames).
           max_new_frames: cap on generated acoustic frames per call.
+          fp8: run the decode backbone in FP8 W8A8 (the dedicated M=1 GEMV
+            path); falls back to the BF16 backbone when False. FP8 weights are
+            quantised and activation scales calibrated lazily on first use.
           alloc_own_forward_buffers: pre-allocate the attention backend and
             RoPE table at construction.
         """
@@ -51,6 +55,7 @@ class HiggsAudioV3TorchFrontendRtx:
         self.device = device
         self.max_seq = int(max_seq)
         self.max_new_frames = int(max_new_frames)
+        self.fp8 = bool(fp8)
 
         self._tokenizer: Any = None
         self._special_ids: dict[str, int] = {}
@@ -60,6 +65,8 @@ class HiggsAudioV3TorchFrontendRtx:
         self._rope_cos = None
         self._rope_sin = None
         self._prompt_ids: list[int] | None = None
+        self._fp8_decoder: Any = None
+        self._codec: Any = None
         self.latency_records: list[float] = []
 
         self._load_weights()
@@ -270,12 +277,38 @@ class HiggsAudioV3TorchFrontendRtx:
         self._prompt_ids = self.build_prompt(text)
         self._attn.reset_cache()
 
+    # ── FP8 / codec lazy init ──
+
+    def _ensure_fp8(self) -> None:
+        if self._fp8_decoder is not None:
+            return
+        from flash_rt.frontends.torch._higgs_audio_v3_fp8 import (
+            HiggsAudioV3Fp8Decoder,
+        )
+        dec = HiggsAudioV3Fp8Decoder(self)
+        dec.calibrate(self._prompt_ids)   # static activation scales (one-time)
+        self._fp8_decoder = dec
+
+    def _ensure_codec(self) -> None:
+        if self._codec is not None:
+            return
+        from flash_rt.models.higgs_audio_v3.codec import HiggsAudioV3Codec
+        self._codec = HiggsAudioV3Codec.from_checkpoint(
+            self.checkpoint_path, device=self.device)
+
+    def _frame_logits(self, fvk, embed_row, t):
+        """[num_codebooks, codebook_vocab] logits for one frame at position t."""
+        if self.fp8:
+            self._fp8_decoder.set_input(embed_row)
+            return self._fp8_decoder.step(t)[0]
+        return self._logits(self._step(fvk, embed_row, t))
+
     @torch.no_grad()
     def predict(self, text: str | None = None) -> torch.Tensor:
         """Generate acoustic codes for ``text`` (greedy, delay/EOC).
 
         Returns raw codes of shape ``[T, num_codebooks]`` (int64, CPU);
-        feed them to the Higgs codec to synthesise a 24 kHz waveform.
+        feed them to :meth:`synthesize` (or the Higgs codec) for a 24 kHz wave.
         """
         import time
 
@@ -285,6 +318,8 @@ class HiggsAudioV3TorchFrontendRtx:
             self.set_prompt(text)
         if self._prompt_ids is None:
             raise RuntimeError("no prompt set; call set_prompt() or pass text")
+        if self.fp8:
+            self._ensure_fp8()
 
         c = self._cfg
         nc = c["num_codebooks"]
@@ -296,15 +331,14 @@ class HiggsAudioV3TorchFrontendRtx:
         self._attn.reset_cache()
         ids = self._prompt_ids
         for t, tok in enumerate(ids):
-            row = F.embedding(
-                torch.tensor([tok], device=self.device), te)
-            hn = self._step(fvk, row, t)
+            row = F.embedding(torch.tensor([tok], device=self.device), te)
+            logits = self._frame_logits(fvk, row, t)
         P = len(ids)
 
         delay, eoc_countdown, done = 0, None, False
         delayed = []
         for j in range(self.max_new_frames):
-            codes = self._logits(hn).argmax(-1).clone()
+            codes = logits.argmax(-1).clone()
             if delay < nc:
                 if delay + 1 < nc:
                     codes[delay + 1:] = boc
@@ -318,7 +352,7 @@ class HiggsAudioV3TorchFrontendRtx:
             if done:
                 break
             delayed.append(codes.clone())
-            hn = self._step(fvk, self._embed_codes(codes), P + j)
+            logits = self._frame_logits(fvk, self._embed_codes(codes), P + j)
 
         torch.cuda.synchronize()
         self.latency_records.append((time.perf_counter() - t0) * 1000.0)
@@ -329,3 +363,16 @@ class HiggsAudioV3TorchFrontendRtx:
         if T <= 0:
             return torch.empty(0, nc, dtype=torch.long)
         return torch.stack([grid[i:i + T, i] for i in range(nc)], dim=1).cpu()
+
+    @torch.no_grad()
+    def synthesize(self, codes: torch.Tensor) -> torch.Tensor:
+        """``[T, num_codebooks]`` codes -> mono 24 kHz waveform ``[L]`` (cpu)."""
+        self._ensure_codec()
+        if codes.numel() == 0:
+            return torch.zeros(0)
+        return self._codec.decode(codes)
+
+    @torch.no_grad()
+    def generate(self, text: str) -> torch.Tensor:
+        """Full pipeline: text -> acoustic codes -> 24 kHz waveform ``[L]``."""
+        return self.synthesize(self.predict(text))
