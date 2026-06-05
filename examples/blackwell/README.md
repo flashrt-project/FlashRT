@@ -56,15 +56,62 @@ python examples/blackwell/eval_libero.py \
   --task_suite libero_spatial
 ```
 
-## Performance
+## VLA latency (RTX 5090)
+
+All RTX 5090 numbers here are pure CUDA Graph replay p50
+(`cuda.Event` around `graph.replay()`), not the end-to-end
+`quickstart.py` wall clock. Replay excludes graph-external work such
+as image normalization, H2D upload, D2H action download, post-process
+un-normalization, and Python wrapper overhead.
+
+### Pi0.5
 
 | Views | Latency | Frequency |
 |-------|---------|-----------|
-| 1 view | 14.79 ms | 67.6 Hz |
-| 2 views | 17.88 ms | 55.9 Hz |
-| 3 views | 20.56 ms | 48.6 Hz |
+| 1 view | **14.48 ms** | 69 Hz |
+| 2 views | **17.58 ms** | 57 Hz |
+| 3 views | **20.00 ms** | 50 Hz |
 
-Cosine vs PyTorch: 0.999638
+Wall p50 reference: 15.92 ms / 19.58 ms / 23.24 ms for 1/2/3 views.
+Cosine vs FP16 PyTorch reference: **0.998**.
+
+### GROOT N1.6
+
+Use a trained embodiment such as `gr1`; the base checkpoint's default
+placeholder embodiment emits untrained actions.
+
+T=50, padded production horizon:
+
+| Views | Replay p50 | Frequency |
+|-------|------------|-----------|
+| 1 view | **11.90 ms** | 84 Hz |
+| 2 views | **13.08 ms** | 76 Hz |
+| 3 views | **13.92 ms** | 72 Hz |
+
+T=16, LIBERO-style short horizon:
+
+| Views | Replay p50 | Frequency |
+|-------|------------|-----------|
+| 1 view | **11.31 ms** | 88 Hz |
+| 2 views | **12.53 ms** | 80 Hz |
+| 3 views | **13.36 ms** | 75 Hz |
+
+GROOT N1.6 E2E precision is cosine **0.9992** vs the Isaac-GR00T
+`Gr00tN1d6` reference on `gr1`, with matched noise and matched
+post-vlln backbone features.
+
+### Pi0-FAST
+
+50-token end-to-end, Orbax/JAX frontend:
+
+| Mode | Quickstart P50 | Throughput |
+|------|---------------:|-----------:|
+| **Default** (`decode_cuda_graph=False`) | **147.4 ms** | **~340 tok/s** |
+| **Max-perf** (`decode_cuda_graph=True`) | **122.9 ms** | **~410 tok/s** |
+
+Detailed Pi0-FAST per-token breakdown: default is about 12 ms prefill
++ 2.87 ms per decode token; max-perf is about 11 ms prefill + 2.39 ms
+per decode token.
 
 ## Troubleshooting
 

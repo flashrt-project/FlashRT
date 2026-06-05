@@ -12,6 +12,10 @@ SwiGLU, RoPE θ=1e6) + a fused multi-codebook acoustic head (8 codebooks × 1026
 + a DAC-style convolutional codec (25 Hz / 24 kHz, delay pattern). Research /
 non-commercial license — check the model card.
 
+Jump to: [Usage](#3-quickstart) · [Python API](#4-python-api) ·
+[Performance](#performance) ·
+[HTTP serving](../serving/higgs_audio_agent/README.md)
+
 ---
 
 ## Performance
@@ -249,6 +253,8 @@ Headline numbers are in [Performance](#performance) above. Methodology:
   (e.g. Orin/Thor) does not compile these kernels, and the frontend raises a
   clear error at construction.
 - Synthesis here is **non-streaming** (the codec decodes the whole clip at the
-  end). Streaming / chunked synthesis is not yet wired.
+  end) when using `generate(...)`. Use `generate_stream(...)` or
+  [`serving/higgs_audio_agent`](../serving/higgs_audio_agent/README.md) for
+  chunked streaming responses.
 - Codec source: the `bosonai/higgs-audio` v2 tokenizer (decode path only),
   vendored under `flash_rt/models/higgs_audio_v3/_codec/`.

@@ -51,8 +51,75 @@ python examples/thor/eval_libero.py \
     --use_fp4
 ```
 
-See the README §NVFP4 section for the full latency/accuracy table
-across 1/2/3 views.
+See [Thor VLA performance](#thor-vla-performance) below for the
+latency/accuracy table across 1/2/3 views.
+
+## Thor VLA performance
+
+### Precision (Pi0.5, 2-view LIBERO)
+
+Cosine similarity measured with matched noise injection.
+
+| Comparison | Cosine |
+|-----------|--------|
+| FlashRT Torch vs Production | **0.9996** |
+| FlashRT JAX vs Production | **0.9999** |
+| FlashRT Torch vs JAX | **0.9998** |
+
+Module-level byte-exact verification on the same input:
+
+- SigLIP (27 layers): byte-exact
+- Encoder (18 layers): byte-exact
+- Decoder (18 layers x 10 steps): byte-exact
+
+### Latency (Thor)
+
+Pi0.5:
+
+| Frontend | 1-view | 2-view | 3-view |
+|----------|--------|--------|--------|
+| **FlashRT Torch** | **36.5 ms** (27 Hz) | **44.0 ms** (23 Hz) | **54.8 ms** (18 Hz) |
+| **FlashRT JAX** (autotune=5) | **37.3 ms** (27 Hz) | **44.9 ms** (22 Hz) | **54.4 ms** (18 Hz) |
+| NVIDIA TensorRT baseline | - | 91-95 ms | - |
+
+Pi0:
+
+| Frontend | 1-view | 2-view | 3-view |
+|----------|--------|--------|--------|
+| **FlashRT Torch** (autotune=5) | **37.6 ms** (27 Hz) | **45.8 ms** (22 Hz) | **56.7 ms** (18 Hz) |
+| **FlashRT JAX** (autotune=5) | **37.8 ms** (26 Hz) | **45.8 ms** (22 Hz) | **55.9 ms** (18 Hz) |
+
+Each additional camera view adds about 6 ms from 256 extra SigLIP
+tokens and the corresponding encoder traffic. Pi0 E2E precision is
+cosine **0.998** vs the FP16 PyTorch reference for both Torch and JAX
+frontends.
+
+GROOT N1.6:
+
+| Stage | T=16 (LIBERO) | T=50 (padded max) | Method |
+|-------|---------------|-------------------|--------|
+| SigLIP (2 views, CUDA Graph) | 6.0 ms | 6.0 ms | Batched 2-view + Graph |
+| Qwen3 16L (CUDA Graph) | 8.8 ms | 8.8 ms | FP8 GEMM + C kernel attention |
+| DiT 32L x 4 steps (CUDA Graph) | 26 ms | 30 ms | FP8 + cuBLASLt epilogue fusion + cross-KV precompute |
+| **Full E2E (image to action)** | **41 ms** (24 Hz) | **45 ms** (22 Hz) | All CUDA Graph |
+
+T is the action horizon. T=50 is the padded production max across
+embodiments; T=16 is LIBERO-specific. GROOT N1.6 E2E precision is
+cosine **0.999** vs the FP32 PyTorch reference.
+
+Pi0-FAST:
+
+| Mode | Per-token | 50-token E2E | Method |
+|------|-----------|-------------|--------|
+| **Default** (`decode_cuda_graph=False`) | **8.7 ms** | **~464 ms** | CUTLASS FP8 wide GEMM, vocab pruning, prefill CUDA Graph |
+| **Max-perf** (`decode_cuda_graph=True`) | **8.1 ms** | **~431 ms** | Decode loop captured as CUDA Graph |
+
+### LIBERO benchmark (Thor, Pi0.5)
+
+| Suite | Torch | JAX |
+|-------|-------|-----|
+| **LIBERO Spatial** (10 tasks x 50 ep) | **492/500 = 98.4%** | **490/500 = 98.0%** |
+| **LIBERO 10** (10 tasks x 50 ep) | **465/500 = 93.0%** | **463/500 = 92.6%** |
 
 ## Troubleshooting
 

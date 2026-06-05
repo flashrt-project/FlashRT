@@ -2,11 +2,36 @@
 
 > **Target audience**: anyone trying to understand what FlashRT *is* as a system — not how to add a model (see [`adding_new_model.md`](adding_new_model.md)) or how a specific kernel works (see [`kernel_catalog.md`](kernel_catalog.md)). This doc names the eight infrastructure components that make up FlashRT, says where each one lives in the repo, and explains how they compose into a working inference engine.
 >
-> **TL;DR**: FlashRT is **not** a compiler, a graph rewriter, or a serving runtime. It is a **kernel library plus six infrastructure components** wired together by a thin per-model pipeline. Every component has a single responsibility, a stable API, and a clear file in the tree. Adding a new model touches at most one file per component.
+> **TL;DR**: FlashRT core is **not** a compiler or graph rewriter. It is a **kernel library plus eight infrastructure components** wired together by a thin per-model pipeline. The repository also ships a `serving/` scenario-host layer on top of the execution contract for OpenAI-compatible LLM/audio endpoints and robot rollout hosts. Core mechanisms stay in `flash_rt/`, `exec/`, and `csrc/`; scenario policy stays in `serving/`.
 
 ---
 
-## 1. The eight components
+## 1. Runtime layers
+
+```
+serving/   scenario hosts: sessions, schedulers, protocols, robot loops,
+           OpenAI-compatible HTTP/SSE, streaming audio, rollout policy
+             │
+             ▼
+flash_rt/   Python frontends: weights, calibration, CUDA Graph capture,
+           model APIs and per-model pipeline composition
+             │
+             ▼
+exec/       C ABI execution contract: Buffer / Graph / Plan, replay-time
+           mechanism for native hosts
+             │
+             ▼
+csrc/       CUDA/C++ kernels and vendored attention/GEMM building blocks
+```
+
+The serving layer is deliberately above the model runtime. It decides
+session policy, streaming protocol, episode lifecycle, interrupt/reset
+behavior, and host language. The core runtime owns the graph and kernel
+mechanism. See [`../serving/README.md`](../serving/README.md),
+[`serving_design.md`](serving_design.md), and
+[`serving_production.md`](serving_production.md).
+
+## 2. The eight core components
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -67,9 +92,9 @@ The frontend is the only file you write per model. Everything below it is shared
 
 ---
 
-## 2. Component-by-component
+## 3. Component-by-component
 
-### 2.1 Public API (`flash_rt/api.py`)
+### 3.1 Public API (`flash_rt/api.py`)
 
 The single entry point. Two functions:
 
@@ -87,7 +112,7 @@ The API is stable and deliberately small. It does *not* expose attention backend
 
 See [`stable_api.md`](stable_api.md) for the full surface.
 
-### 2.2 Hardware Dispatch Map (`flash_rt/hardware/__init__.py`)
+### 3.2 Hardware Dispatch Map (`flash_rt/hardware/__init__.py`)
 
 A single dict — the **only** place in the codebase that knows which frontend handles which hardware:
 
@@ -105,7 +130,7 @@ External plugins extend the map at import time without forking the repo. See [`p
 
 This is the simplest possible dispatcher. There is no plugin manifest, no entry-points scanning, no manifest YAML. The map is python and explicit.
 
-### 2.3 Frontend (`flash_rt/frontends/{torch,jax}/<model>_<arch>.py`)
+### 3.3 Frontend (`flash_rt/frontends/{torch,jax}/<model>_<arch>.py`)
 
 The frontend is the per-model file. It is the *only* piece a new model adds.
 
@@ -123,7 +148,7 @@ A frontend is typically 800–1500 LOC, all linear. There is no inheritance hier
 
 The four shipped models each have between two and four frontends (one per `(framework, arch)` combination). They do not share code in the forward path; they share code through components 4–8.
 
-### 2.4 Weight Loading (`flash_rt/executors/weight_loader.py`)
+### 3.4 Weight Loading (`flash_rt/executors/weight_loader.py`)
 
 A declarative description of how every weight tensor in a checkpoint maps to module attributes, including transforms (transpose, fuse-norm, FP8 quant) and quantization scales.
 
@@ -147,7 +172,7 @@ The runner is framework-agnostic. Concrete `WeightSource` implementations exist 
 
 Full doc: [`extension/weight_spec.md`](extension/weight_spec.md).
 
-### 2.5 Attention Backend (`flash_rt/hardware/backend.py`)
+### 3.5 Attention Backend (`flash_rt/hardware/backend.py`)
 
 A protocol with two key methods:
 
@@ -161,7 +186,7 @@ A *site* is a distinct attention shape (e.g. SigLIP vision, PaliGemma encoder, P
 
 Full doc: [`extension/attention_backend.md`](extension/attention_backend.md).
 
-### 2.6 Calibration Framework (`flash_rt/core/quant/calibrator.py`)
+### 3.6 Calibration Framework (`flash_rt/core/quant/calibrator.py`)
 
 FP8 calibration is a *framework*, not a per-model script. It owns:
 
@@ -174,7 +199,7 @@ A frontend writes `_calibrate(self, sample_obs)` that follows the protocol; ever
 
 Full doc: [`extension/calibration.md`](extension/calibration.md). Mechanics doc: [`calibration.md`](calibration.md).
 
-### 2.7 CUDA Graph Capture (`flash_rt/core/cuda_graph.py`)
+### 3.7 CUDA Graph Capture (`flash_rt/core/cuda_graph.py`)
 
 A small helper that wraps `torch.cuda.CUDAGraph` (and a JAX equivalent) with two FlashRT-specific extensions:
 
@@ -183,7 +208,7 @@ A small helper that wraps `torch.cuda.CUDAGraph` (and a JAX equivalent) with two
 
 The captured graph is stored as `self._enc_ae_graph` on the frontend. Replay is `graph.replay()` plus a sync. No `.engine` file. No serialization. The graph lives in memory for the process lifetime; restart = re-capture (~50–500 ms on warm cache).
 
-### 2.8 Kernel Library (`flash_rt/*.so`, source under `csrc/`)
+### 3.8 Kernel Library (`flash_rt/*.so`, source under `csrc/`)
 
 The bottom of the stack. Hand-written CUDA kernels for the memory-bound ops (norm, activation, residual + norm + quant fusions, qkv split + RoPE, patch embed, etc.) plus thin wrappers around cuBLASLt FP8 GEMM, CUTLASS SM100 FP8 GEMM, vendored FlashAttention-2, and Thor's CUTLASS FMHA.
 
@@ -201,7 +226,7 @@ The kernel library is **stable** — every shipped kernel preserves its signatur
 
 ---
 
-## 3. The composition story
+## 4. The composition story
 
 What happens when you call `model.predict(images, prompt)`:
 
@@ -229,7 +254,7 @@ The first call is slow (calibration + capture). Every subsequent call is `graph.
 
 ---
 
-## 4. Today's runtime characteristics
+## 5. Today's runtime characteristics
 
 The current architecture is shaped by the small-batch realtime workload:
 
@@ -239,7 +264,7 @@ The current architecture is shaped by the small-batch realtime workload:
 
 ---
 
-## 5. File map (one-line locator)
+## 6. File map (one-line locator)
 
 | Component | Source | Line count (approx) |
 |---|---|---|
@@ -259,7 +284,7 @@ The whole infrastructure side (excluding kernels and frontends) is **~3000 lines
 
 ---
 
-## 6. Where to read next
+## 7. Where to read next
 
 - **You want to add a model** → [`adding_new_model.md`](adding_new_model.md)
 - **You want to understand a single component deeply** →
@@ -267,4 +292,8 @@ The whole infrastructure side (excluding kernels and frontends) is **~3000 lines
   [`extension/attention_backend.md`](extension/attention_backend.md) ·
   [`extension/calibration.md`](extension/calibration.md)
 - **You want the kernel inventory** → [`kernel_catalog.md`](kernel_catalog.md)
+- **You want serving hosts / capsules / HTTP endpoints** →
+  [`../serving/README.md`](../serving/README.md) ·
+  [`serving_design.md`](serving_design.md) ·
+  [`serving_production.md`](serving_production.md)
 - **You want to know how this differs from TensorRT / vLLM / SGLang** → [`inference_engine_differences.md`](inference_engine_differences.md)
