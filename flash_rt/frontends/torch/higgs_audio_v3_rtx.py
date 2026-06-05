@@ -303,40 +303,39 @@ class HiggsAudioV3TorchFrontendRtx:
             return self._fp8_decoder.step(t)[0]
         return self._logits(self._step(fvk, embed_row, t))
 
+    # ── split surface (committed streaming seam for the serving layer) ──
+    # prefill once -> decode_stream yields un-delayed [nc] frames as they
+    # complete. The delay pattern means an un-delayed frame t is only complete
+    # after nc-1 further frames decode, so the stream carries a fixed nc-1
+    # holdback; every yielded frame is already committed to the KV state.
+
     @torch.no_grad()
-    def predict(self, text: str | None = None) -> torch.Tensor:
-        """Generate acoustic codes for ``text`` (greedy, delay/EOC).
-
-        Returns raw codes of shape ``[T, num_codebooks]`` (int64, CPU);
-        feed them to :meth:`synthesize` (or the Higgs codec) for a 24 kHz wave.
-        """
-        import time
-
+    def prefill(self, prompt_ids: list[int] | None = None) -> int:
+        """Run the prompt prefill; returns cur_pos (= prompt length)."""
         from flash_rt import flash_rt_kernels as fvk
-
-        if text is not None:
-            self.set_prompt(text)
+        if prompt_ids is not None:
+            self._prompt_ids = list(prompt_ids)
         if self._prompt_ids is None:
-            raise RuntimeError("no prompt set; call set_prompt() or pass text")
+            raise RuntimeError("no prompt set; call set_prompt()/pass prompt_ids")
         if self.fp8:
             self._ensure_fp8()
-
-        c = self._cfg
-        nc = c["num_codebooks"]
-        boc, eoc = self.DIMS.boc_id, self.DIMS.eoc_id
-        te = self._weights["text_embed"]
-
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
         self._attn.reset_cache()
-        ids = self._prompt_ids
-        for t, tok in enumerate(ids):
+        te = self._weights["text_embed"]
+        for t, tok in enumerate(self._prompt_ids):
             row = F.embedding(torch.tensor([tok], device=self.device), te)
-            logits = self._frame_logits(fvk, row, t)
-        P = len(ids)
+            self._gen_logits = self._frame_logits(fvk, row, t)
+        self._gen_pos = len(self._prompt_ids)
+        return self._gen_pos
 
+    @torch.no_grad()
+    def decode_stream(self):
+        """Yield committed un-delayed ``[nc]`` int code frames (cpu) as ready."""
+        from flash_rt import flash_rt_kernels as fvk
+        nc = self._cfg["num_codebooks"]
+        boc, eoc = self.DIMS.boc_id, self.DIMS.eoc_id
+        P, logits = self._gen_pos, self._gen_logits
         delay, eoc_countdown, done = 0, None, False
-        delayed = []
+        window: list[torch.Tensor] = []
         for j in range(self.max_new_frames):
             codes = logits.argmax(-1).clone()
             if delay < nc:
@@ -351,18 +350,35 @@ class HiggsAudioV3TorchFrontendRtx:
                 eoc_countdown = nc - 2
             if done:
                 break
-            delayed.append(codes.clone())
+            window.append(codes.clone())
+            if len(window) >= nc:                       # frame (len-nc) complete
+                base = len(window) - nc
+                yield torch.stack(
+                    [window[base + i][i] for i in range(nc)]).cpu()
             logits = self._frame_logits(fvk, self._embed_codes(codes), P + j)
 
+    @torch.no_grad()
+    def predict(self, text: str | None = None) -> torch.Tensor:
+        """Generate acoustic codes for ``text`` (greedy, delay/EOC).
+
+        Returns raw codes of shape ``[T, num_codebooks]`` (int64, CPU);
+        feed them to :meth:`synthesize` (or the Higgs codec) for a 24 kHz wave.
+        """
+        import time
+
+        if text is not None:
+            self.set_prompt(text)
+        nc = self._cfg["num_codebooks"]
+
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        self.prefill()
+        frames = list(self.decode_stream())
         torch.cuda.synchronize()
         self.latency_records.append((time.perf_counter() - t0) * 1000.0)
-        if not delayed:
+        if not frames:
             return torch.empty(0, nc, dtype=torch.long)
-        grid = torch.stack(delayed)            # [L, nc] delayed
-        T = grid.shape[0] - (nc - 1)
-        if T <= 0:
-            return torch.empty(0, nc, dtype=torch.long)
-        return torch.stack([grid[i:i + T, i] for i in range(nc)], dim=1).cpu()
+        return torch.stack(frames)             # [T, nc] un-delayed
 
     @torch.no_grad()
     def synthesize(self, codes: torch.Tensor) -> torch.Tensor:
