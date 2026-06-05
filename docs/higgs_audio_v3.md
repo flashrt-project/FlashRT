@@ -69,8 +69,8 @@ the only lever below the BF16 floor is the FP8 quantisation (half the bytes).
 
 | | |
 |---|---|
-| **GPU** | RTX 5090 (SM120). Other SM120 Blackwell parts should work; the FP8 GEMV/GEMM kernels are `sm_120a`. |
-| **FlashRT** | Built with `GPU_ARCH=120` — see [Build & install](../README.md#build--install) (`cmake .. && make -j` produces `flash_rt/flash_rt_kernels*.so` and `flash_rt/flash_rt_fa2.so`). |
+| **GPU** | **FP8** path: SM120 (RTX 5090 / Blackwell consumer) — the FP8 prefill GEMM is `sm_120a`. **BF16** path: SM89 (RTX 4090 / Ada) **or** SM120 — its GEMV compiles for both (sm89 BF16 is build/configure-validated but not yet hardware accuracy/perf-validated). The frontend auto-selects the precision for the GPU. |
+| **FlashRT** | Built with `GPU_ARCH=120` (FP8 + BF16) or `GPU_ARCH=89` (BF16 only) — auto-detected from the GPU if unset. See [Build & install](../README.md#build--install) (`cmake .. && make -j` produces `flash_rt/flash_rt_kernels*.so` and `flash_rt/flash_rt_fa2.so`). |
 | **Python** | 3.12, CUDA 13, torch ≥ 2.9. |
 | **Packages** | `transformers` (≥ 4.53; tokenizer + codec config classes), `safetensors`, `numpy`. `torchaudio` is **optional** (only the codec *encode* path uses it; decode does not — it is auto-stubbed if absent). |
 

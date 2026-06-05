@@ -490,18 +490,18 @@ endif()
 # symbol when MOTUS is OFF. (FP8 still needs the SM120 prefill GEMM in MOTUS, so
 # the FP8 path is SM120-only; the BF16 path runs wherever this object is built.)
 if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "89")
-  add_library(sm120_gemv_m1_obj OBJECT
+  add_library(decode_gemv_m1_obj OBJECT
     csrc/gemm/fp8_gemv_m1_sm120.cu
     csrc/gemm/bf16_gemv_m1_sm120.cu)
-  set_target_properties(sm120_gemv_m1_obj PROPERTIES
+  set_target_properties(decode_gemv_m1_obj PROPERTIES
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
   )
-  target_include_directories(sm120_gemv_m1_obj PRIVATE
+  target_include_directories(decode_gemv_m1_obj PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
   )
-  target_compile_options(sm120_gemv_m1_obj PRIVATE
+  target_compile_options(decode_gemv_m1_obj PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
       --expt-relaxed-constexpr -O3 --use_fast_math
       ${GPU_GENCODE}
@@ -984,7 +984,7 @@ endif()
 # resolve, independent of FLASHRT_ENABLE_MOTUS.
 if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "89")
   target_sources(flash_rt_kernels PRIVATE
-    $<TARGET_OBJECTS:sm120_gemv_m1_obj>)
+    $<TARGET_OBJECTS:decode_gemv_m1_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE
     ENABLE_DECODE_GEMV_M1=1)
 endif()

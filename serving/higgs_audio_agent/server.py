@@ -121,7 +121,7 @@ def main():
             pass
     app = build_app(fe, args.model_name)
     print(f"FlashRT Higgs TTS ready: http://{args.host}:{args.port}  "
-          f"backbone={'BF16' if args.bf16 else 'FP8'}")
+          f"backbone={'FP8' if fe.fp8 else 'BF16'}")   # actual selection
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 
