@@ -152,7 +152,17 @@ class HiggsAudioV3Fp8Decoder:
         self.DSF = torch.tensor([max(self.asc_f, 1e-9)], device=self.dev, dtype=torch.float32)
         self.ALP = [[self.asc[L, i].item() for i in range(4)] for L in range(self.NL)]
         self._alloc()
+        self._free_bf16_backbone()
         self._calibrated = True
+
+    def _free_bf16_backbone(self) -> None:
+        """Release the bf16 projection weights — quantised into WL and no longer
+        needed (norm weights are tiny and kept; this drops ~half the VRAM). The
+        bf16 fallback backbone is unavailable once FP8 is calibrated."""
+        for L in self.fe._weights["layers"]:
+            for k in ("q", "k", "v", "o", "gate", "up", "down"):
+                L.pop(k, None)
+        torch.cuda.empty_cache()
 
     # ── FP8 decode step (eager, fully kernelised) ──
 
