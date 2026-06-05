@@ -392,3 +392,50 @@ class HiggsAudioV3TorchFrontendRtx:
     def generate(self, text: str) -> torch.Tensor:
         """Full pipeline: text -> acoustic codes -> 24 kHz waveform ``[L]``."""
         return self.synthesize(self.predict(text))
+
+    SAMPLES_PER_FRAME = 960   # 24000 Hz / 25 Hz acoustic frame rate
+
+    @torch.no_grad()
+    def generate_stream(self, text: str, *, first_chunk: int = 8,
+                        chunk: int = 25, ctx: int = 8, holdback: int = 8):
+        """Stream 24 kHz audio chunks as frames decode (low TTFA).
+
+        Yields mono waveform chunks (cpu f32). ``first_chunk`` frames are emitted
+        as soon as they are committed (minimises time-to-first-audio), then
+        ``chunk`` frames at a time. The codec conv has a receptive field, so each
+        emitted frame is decoded inside a window with ``ctx`` frames of already-
+        emitted left context and ``holdback`` frames of not-yet-emitted right
+        context; only the centre frames' samples are released, so the streamed
+        waveform matches the one-shot ``synthesize`` (no boundary seams).
+        """
+        self._ensure_codec()
+        self.set_prompt(text)
+        self.prefill()
+        spf = self.SAMPLES_PER_FRAME
+        frames: list[torch.Tensor] = []
+        emitted = 0
+
+        def flush(ready: int):
+            nonlocal emitted
+            if ready <= emitted:
+                return None
+            left = min(ctx, emitted)
+            right = min(holdback, len(frames) - ready)
+            wav = self._codec.decode(torch.stack(frames[emitted - left:ready + right]))
+            n = ready - emitted
+            out = wav[left * spf:(left + n) * spf].clone()
+            emitted = ready
+            return out
+
+        target = first_chunk
+        for frame in self.decode_stream():
+            frames.append(frame)
+            ready = len(frames) - holdback           # frames with full right ctx
+            if ready - emitted >= target:
+                out = flush(ready)
+                if out is not None:
+                    yield out
+                    target = chunk
+        out = flush(len(frames))                     # tail (no right context)
+        if out is not None:
+            yield out
