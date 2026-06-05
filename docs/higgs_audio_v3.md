@@ -44,6 +44,13 @@ and replayed from a single position-agnostic CUDA graph. The prompt is prefilled
 in one batched M=P pass; a shared `system` preamble's KV is reused across
 requests (only the new text is prefilled — see [§4](#4-python-api)).
 
+**BF16 fallback (`fp8=False`)** — for hosts without FP8 — runs the same
+fully-kernelised, zero-torch path (dedicated M=1 BF16 GEMV at **86 % HBM BW**,
+residual folded into the following RMSNorm, position-agnostic graph, batched
+prefill, prefix reuse): **≈ 6.4 ms/frame, RTF ≈ 0.16, ~7.3 GB**, bit-exact vs
+the eager reference. BF16 reads 2× the weight bytes of FP8, so it is ~1.7×
+slower; everything else is identical.
+
 ---
 
 ## 1. Requirements
