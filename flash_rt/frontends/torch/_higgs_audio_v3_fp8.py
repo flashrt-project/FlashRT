@@ -232,25 +232,34 @@ class HiggsAudioV3Fp8Decoder:
     def set_input(self, embed_row: torch.Tensor) -> None:
         self.h.copy_(embed_row)
 
-    # ── batched prompt prefill (single M=P forward) ──
-    # Prefill the whole prompt in one M=P pass instead of P separate M=1 decode
-    # steps. At small M the FP8 GEMM is weight-bandwidth-bound, so an M=P pass
-    # costs ~one M=1 pass — all P tokens for roughly one step. Reuses the tiled
-    # ht_fp8_gemm kernels (M=P), a per-position loop of the same fused
+    # ── batched prompt prefill (single M=S forward, optional cached prefix) ──
+    # Prefill the prompt in one M=S pass instead of S separate M=1 decode steps.
+    # At small M the FP8 GEMM is weight-bandwidth-bound, so an M=S pass costs
+    # ~one M=1 pass — all S tokens for roughly one step. Reuses the tiled
+    # ht_fp8_gemm kernels (M=S), a per-position loop of the same fused
     # q/k-norm+RoPE+KV-write kernels the decode step uses (identical convention,
-    # writing Q_buf[:, j] / K_cache[L, j]), and one causal FA2 over the prompt.
-    # The head runs on the last position only — that is the first-frame logits.
+    # writing Q_buf[:, j] / K_cache[L, start_pos+j]), and one causal FA2.
+    #
+    # ``start_pos`` enables prefix-KV reuse (serving prefix caching): when the
+    # leading ``start_pos`` tokens of ``ids`` already have valid KV resident in
+    # K_cache[:, :start_pos] (from a prior prefill of the same prefix), only the
+    # suffix ids[start_pos:] is prefilled (S = P-start_pos). Causal attention
+    # over the full [0:P] reuses the prefix KV; FA2's q_seq<kv_seq causal aligns
+    # the S queries to the trailing positions. Prefix KV is independent of the
+    # suffix (causal), so the result is bit-identical to a full prefill. The
+    # head runs on the last position only — that is the first-frame logits.
 
     # 16x64/128 tiles race at large N (non-deterministic KV); 16x192x128_w8 is
     # bit-deterministic across all prefill shapes (M up to 512) and fastest.
     _PREFILL_GEMM = "ht_fp8_gemm_16x192x128_w8"
 
     @torch.no_grad()
-    def prefill_batched(self, ids: list[int]) -> torch.Tensor:
+    def prefill_batched(self, ids: list[int], start_pos: int = 0) -> torch.Tensor:
         from flash_rt import flash_rt_kernels as fvk
         fe, be = self.fe, self.fe._attn
         dev = self.dev
         P = len(ids)
+        S = P - start_pos
         H, NQ, NKV, HD, INTER = self.H, self.NQ, self.NKV, self.HD, self.INTER
         NQK, KV, EPS = self.NQK, self.KV, self.EPS
         s = torch.cuda.current_stream().cuda_stream
@@ -258,68 +267,70 @@ class HiggsAudioV3Fp8Decoder:
         head = getattr(fvk, _GEMV["head"])
         rc, rs = fe._rope_cos, fe._rope_sin
 
-        ids_t = torch.tensor(ids, device=dev)
-        h = F.embedding(ids_t, fe._weights["text_embed"]).contiguous()  # [P,H]
-        fp8a = torch.empty(P, H, device=dev, dtype=F8)
-        Dq = torch.empty(P, NQK + 2 * KV, device=dev, dtype=BF16)
-        Dg = torch.empty(P, 2 * INTER, device=dev, dtype=BF16)
-        fp8o = torch.empty(P, NQK, device=dev, dtype=F8)
-        fp8d = torch.empty(P, INTER, device=dev, dtype=F8)
-        tmp = torch.empty(P, H, device=dev, dtype=BF16)
-        act = torch.empty(P, INTER, device=dev, dtype=BF16)
+        ids_t = torch.tensor(ids[start_pos:], device=dev)
+        h = F.embedding(ids_t, fe._weights["text_embed"]).contiguous()  # [S,H]
+        fp8a = torch.empty(S, H, device=dev, dtype=F8)
+        Dq = torch.empty(S, NQK + 2 * KV, device=dev, dtype=BF16)
+        Dg = torch.empty(S, 2 * INTER, device=dev, dtype=BF16)
+        fp8o = torch.empty(S, NQK, device=dev, dtype=F8)
+        fp8d = torch.empty(S, INTER, device=dev, dtype=F8)
+        tmp = torch.empty(S, H, device=dev, dtype=BF16)
+        act = torch.empty(S, INTER, device=dev, dtype=BF16)
 
         for L in range(self.NL):
             w = self.WL[L]
             fvk.rms_norm_fp8(h.data_ptr(), w["in_norm"].data_ptr(),
-                             fp8a.data_ptr(), P, H, EPS,
+                             fp8a.data_ptr(), S, H, EPS,
                              self.DS[L][0].data_ptr(), s)
             gemm(fp8a.data_ptr(), w["qkvq"].data_ptr(), Dq.data_ptr(),
-                 P, NQK + 2 * KV, H, self.ALP[L][0] * w["qkvs"], s)
-            for j in range(P):
+                 S, NQK + 2 * KV, H, self.ALP[L][0] * w["qkvs"], s)
+            for j in range(S):
+                pos = start_pos + j
                 qj = Dq[j, :NQK].contiguous()
                 kj = Dq[j, NQK:NQK + KV].contiguous()
                 vj = Dq[j, NQK + KV:].contiguous()
                 fvk.qwen3_q_norm_rope_qstage_bf16(
                     q_pre=qj.data_ptr(), q_norm_w=w["qn"].data_ptr(),
-                    cos=rc[j].data_ptr(), sin=rs[j].data_ptr(),
+                    cos=rc[pos].data_ptr(), sin=rs[pos].data_ptr(),
                     q_buf_dst=be.Q_buf[:, j].data_ptr(), n_q_heads=NQ,
                     eps=EPS, stream=s)
                 fvk.qwen3_k_norm_rope_kvwrite_bf16(
                     k_pre=kj.data_ptr(), v_pre=vj.data_ptr(),
                     k_norm_w=w["kn"].data_ptr(),
-                    cos=rc[j].data_ptr(), sin=rs[j].data_ptr(),
-                    k_cache_dst=be.K_cache[L, j].data_ptr(),
-                    v_cache_dst=be.V_cache[L, j].data_ptr(),
+                    cos=rc[pos].data_ptr(), sin=rs[pos].data_ptr(),
+                    k_cache_dst=be.K_cache[L, pos].data_ptr(),
+                    v_cache_dst=be.V_cache[L, pos].data_ptr(),
                     n_kv_heads=NKV, eps=EPS, stream=s)
             # Pre-zero the query slots: the causal FA2 path can leave a partial
             # query-tile slot unwritten, and reading stale O_buf makes the
             # prefill non-deterministic run-to-run (frame-0 near-tie argmax
             # flips). Zeroing fixes determinism with cos vs eager preserved.
-            be.O_buf[:, :P].zero_()
-            be.run("full", L, P, kv_seq=P, causal=True, stream=s,
+            be.O_buf[:, :S].zero_()
+            # queries are the trailing S positions of kv_seq=P (causal align).
+            be.run("full", L, S, kv_seq=P, causal=True, stream=s,
                    softmax_scale=HD ** -0.5)
-            ao = be.O_buf[:, :P].reshape(P, NQK).contiguous()
+            ao = be.O_buf[:, :S].reshape(S, NQK).contiguous()
             fvk.quantize_fp8_static(ao.data_ptr(), fp8o.data_ptr(),
-                                    self.DS[L][1].data_ptr(), P * NQK, s)
+                                    self.DS[L][1].data_ptr(), S * NQK, s)
             gemm(fp8o.data_ptr(), w["oq"].data_ptr(), tmp.data_ptr(),
-                 P, H, NQK, self.ALP[L][1] * w["os"], s)
+                 S, H, NQK, self.ALP[L][1] * w["os"], s)
             h = (h.float() + tmp.float()).to(BF16)
             fvk.rms_norm_fp8(h.data_ptr(), w["post_norm"].data_ptr(),
-                             fp8a.data_ptr(), P, H, EPS,
+                             fp8a.data_ptr(), S, H, EPS,
                              self.DS[L][2].data_ptr(), s)
             gemm(fp8a.data_ptr(), w["guq"].data_ptr(), Dg.data_ptr(),
-                 P, 2 * INTER, H, self.ALP[L][2] * w["gus"], s)
+                 S, 2 * INTER, H, self.ALP[L][2] * w["gus"], s)
             g = Dg[:, :INTER].contiguous()
             u = Dg[:, INTER:].contiguous()
             fvk.silu_mul_qwen36_bf16(g.data_ptr(), u.data_ptr(),
-                                     act.data_ptr(), P * INTER, s)
+                                     act.data_ptr(), S * INTER, s)
             fvk.quantize_fp8_static(act.data_ptr(), fp8d.data_ptr(),
-                                    self.DS[L][3].data_ptr(), P * INTER, s)
+                                    self.DS[L][3].data_ptr(), S * INTER, s)
             gemm(fp8d.data_ptr(), w["dnq"].data_ptr(), tmp.data_ptr(),
-                 P, H, INTER, self.ALP[L][3] * w["dns"], s)
+                 S, H, INTER, self.ALP[L][3] * w["dns"], s)
             h = (h.float() + tmp.float()).to(BF16)
 
-        hlast = h[P - 1:P].contiguous()
+        hlast = h[S - 1:S].contiguous()
         fvk.rms_norm(hlast.data_ptr(), fe._weights["final_norm"].data_ptr(),
                      self.hn.data_ptr(), 1, H, EPS, s)
         fvk.quantize_fp8_static(self.hn.data_ptr(), self.fp8a.data_ptr(),

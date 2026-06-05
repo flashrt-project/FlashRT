@@ -51,6 +51,7 @@ def build_app(frontend, model_name: str):
         model: str | None = None
         input: str
         voice: str | None = None
+        instructions: str | None = None       # shared voice/style preamble
         response_format: str = "pcm"          # pcm | wav
         stream: bool = True
 
@@ -78,7 +79,12 @@ def build_app(frontend, model_name: str):
                     # Unknown total length up front; stream with a max-size
                     # header (clients that read incrementally accept this).
                     yield _wav_header(0xFFFFFFFF - 44)
-                for chunk in frontend.generate_stream(req.input):
+                # ``instructions`` is a shared voice/style preamble: when many
+                # requests carry the same one, the frontend reuses its prefix KV
+                # (only the new input is prefilled). Policy lives here; the
+                # frontend owns the reuse mechanism.
+                for chunk in frontend.generate_stream(
+                        req.input, system=req.instructions):
                     yield _pcm16(chunk)
 
         media = "audio/wav" if fmt == "wav" else "audio/pcm"

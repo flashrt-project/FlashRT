@@ -79,6 +79,7 @@ class HiggsAudioV3TorchFrontendRtx:
         self._rope_cos = None
         self._rope_sin = None
         self._prompt_ids: list[int] | None = None
+        self._resident_ids: list[int] | None = None   # KV currently on GPU
         self._fp8_decoder: Any = None
         self._codec: Any = None
         self.latency_records: list[float] = []
@@ -283,9 +284,17 @@ class HiggsAudioV3TorchFrontendRtx:
 
     # ── Public API ──
 
-    def build_prompt(self, text: str) -> list[int]:
-        """Zero-shot TTS prompt: <|tts|> <|text|> tok(text) <|audio|>."""
+    def build_prompt(self, text: str, system: str | None = None) -> list[int]:
+        """Zero-shot TTS prompt: <|tts|> <|text|> [enc(system)] tok(text) <|audio|>.
+
+        An optional ``system`` preamble (voice/style instruction) is prepended
+        as a clean reusable token prefix: requests that share the same ``system``
+        share that leading run, so its KV can be reused across requests (serving
+        prefix caching) — only the varying ``text`` suffix is re-prefilled.
+        """
         ids = [self._special_ids["<|tts|>"], self._special_ids["<|text|>"]]
+        if system:
+            ids += self._tokenizer.encode(system, add_special_tokens=False)
         ids += self._tokenizer.encode(text, add_special_tokens=False)
         ids.append(self._special_ids["<|audio|>"])
         return ids
@@ -293,6 +302,7 @@ class HiggsAudioV3TorchFrontendRtx:
     def set_prompt(self, text: str) -> None:
         self._prompt_ids = self.build_prompt(text)
         self._attn.reset_cache()
+        self._resident_ids = None      # KV zeroed; nothing reusable resident
 
     # ── FP8 / codec lazy init ──
 
@@ -335,9 +345,33 @@ class HiggsAudioV3TorchFrontendRtx:
     # after nc-1 further frames decode, so the stream carries a fixed nc-1
     # holdback; every yielded frame is already committed to the KV state.
 
+    def resident_prefix_len(self, prompt_ids: list[int]) -> int:
+        """Longest prefix of ``prompt_ids`` whose KV is already resident on GPU
+        (from the previous prefill). The serving layer passes this back as
+        ``cached_tokens`` to skip re-prefilling a shared prefix (system/voice
+        preamble) — prefix-KV reuse. Mechanism only; the cache/eviction policy
+        lives in the serving layer. Always keeps >=1 token to prefill fresh."""
+        resident = self._resident_ids
+        if not resident:
+            return 0
+        n = 0
+        for a, b in zip(prompt_ids, resident):
+            if a != b:
+                break
+            n += 1
+        return max(0, min(n, len(prompt_ids) - 1))
+
     @torch.no_grad()
-    def prefill(self, prompt_ids: list[int] | None = None) -> int:
-        """Run the prompt prefill; returns cur_pos (= prompt length)."""
+    def prefill(self, prompt_ids: list[int] | None = None,
+                cached_tokens: int = 0) -> int:
+        """Run the prompt prefill; returns cur_pos (= prompt length).
+
+        ``cached_tokens`` > 0 reuses the KV of the leading ``cached_tokens``
+        tokens (already resident from a prior prefill of the same prefix) and
+        prefills only the suffix — serving prefix caching. The claim is verified
+        against the resident tokens; on mismatch it safely falls back to a full
+        prefill. Reuse requires the batched FP8 prefill path.
+        """
         from flash_rt import flash_rt_kernels as fvk
         if prompt_ids is not None:
             self._prompt_ids = list(prompt_ids)
@@ -345,19 +379,28 @@ class HiggsAudioV3TorchFrontendRtx:
             raise RuntimeError("no prompt set; call set_prompt()/pass prompt_ids")
         if self.fp8:
             self._ensure_fp8()
-        self._attn.reset_cache()
         P = len(self._prompt_ids)
-        if (self._batched_prefill
-                and P <= self._attn._max_q_seq):
-            # one M=P forward over the whole prompt
+        batched = self._batched_prefill and P <= self._attn._max_q_seq
+        # Validate the cached-prefix claim against the resident KV (safety: never
+        # reuse stale/mismatched KV); reuse only on the batched path.
+        reuse = (batched and 0 < cached_tokens < P
+                 and self._resident_ids is not None
+                 and len(self._resident_ids) >= cached_tokens
+                 and self._prompt_ids[:cached_tokens]
+                 == self._resident_ids[:cached_tokens])
+        if not reuse:
+            self._attn.reset_cache()      # cold prefill writes KV from pos 0
+            cached_tokens = 0
+        if batched:
             self._gen_logits = self._fp8_decoder.prefill_batched(
-                self._prompt_ids)[0]
+                self._prompt_ids, start_pos=cached_tokens)[0]
         else:
             te = self._weights["text_embed"]
             for t, tok in enumerate(self._prompt_ids):
                 row = F.embedding(torch.tensor([tok], device=self.device), te)
                 self._gen_logits = self._frame_logits(fvk, row, t)
         self._gen_pos = P
+        self._resident_ids = list(self._prompt_ids)
         return self._gen_pos
 
     @torch.no_grad()
@@ -429,8 +472,9 @@ class HiggsAudioV3TorchFrontendRtx:
     SAMPLES_PER_FRAME = 960   # 24000 Hz / 25 Hz acoustic frame rate
 
     @torch.no_grad()
-    def generate_stream(self, text: str, *, first_chunk: int = 8,
-                        chunk: int = 25, ctx: int = 8, holdback: int = 8):
+    def generate_stream(self, text: str, *, system: str | None = None,
+                        first_chunk: int = 8, chunk: int = 25, ctx: int = 8,
+                        holdback: int = 8):
         """Stream 24 kHz audio chunks as frames decode (low TTFA).
 
         Yields mono waveform chunks (cpu f32). ``first_chunk`` frames are emitted
@@ -440,10 +484,20 @@ class HiggsAudioV3TorchFrontendRtx:
         emitted left context and ``holdback`` frames of not-yet-emitted right
         context; only the centre frames' samples are released, so the streamed
         waveform matches the one-shot ``synthesize`` (no boundary seams).
+
+        ``system`` is an optional shared preamble (voice/style instruction). When
+        successive requests carry the same ``system``, its KV is reused across
+        requests (only the new ``text`` suffix is prefilled) — serving prefix
+        caching, bit-identical to a cold prefill.
         """
         self._ensure_codec()
-        self.set_prompt(text)
-        self.prefill()
+        if system is None:
+            self.set_prompt(text)
+            self.prefill()
+        else:
+            ids = self.build_prompt(text, system=system)
+            # reuse the resident shared-preamble KV; only prefill the new suffix
+            self.prefill(ids, cached_tokens=self.resident_prefix_len(ids))
         spf = self.SAMPLES_PER_FRAME
         frames: list[torch.Tensor] = []
         emitted = 0
