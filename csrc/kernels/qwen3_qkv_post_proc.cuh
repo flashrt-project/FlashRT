@@ -76,5 +76,22 @@ int qwen3_k_norm_rope_kvwrite_bf16(
     float       eps,
     cudaStream_t stream);
 
+// Device-position variant: cache slot = K_cache_base + (*cur_pos) * row_elems,
+// so one captured graph serves every decode position (host bumps *cur_pos
+// before each replay). row_elems = n_kv * 128. Returns 0 on success.
+int qwen3_k_norm_rope_kvwrite_devpos_bf16(
+    const void* k_pre,
+    const void* v_pre,
+    const void* k_norm_w,
+    const void* cos,
+    const void* sin,
+    void*       k_cache_base,
+    void*       v_cache_base,
+    const void* cur_pos,
+    int         row_elems,
+    int         n_kv_heads,
+    float       eps,
+    cudaStream_t stream);
+
 }  // namespace kernels
 }  // namespace flash_rt

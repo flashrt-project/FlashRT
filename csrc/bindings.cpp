@@ -6049,6 +6049,26 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
         py::arg("n_kv_heads"), py::arg("eps") = 1e-6f,
         py::arg("stream") = 0);
 
+    m.def("qwen3_k_norm_rope_kvwrite_devpos_bf16",
+        [](uintptr_t k_pre, uintptr_t v_pre, uintptr_t k_norm_w,
+           uintptr_t cos, uintptr_t sin,
+           uintptr_t k_cache_base, uintptr_t v_cache_base,
+           uintptr_t cur_pos, int row_elems,
+           int n_kv_heads, float eps, uintptr_t stream) -> int {
+            return flash_rt::kernels::qwen3_k_norm_rope_kvwrite_devpos_bf16(
+                to_ptr(k_pre), to_ptr(v_pre), to_ptr(k_norm_w),
+                to_ptr(cos), to_ptr(sin),
+                to_ptr(k_cache_base), to_ptr(v_cache_base),
+                to_ptr(cur_pos), row_elems,
+                n_kv_heads, eps, to_stream(stream));
+        },
+        py::arg("k_pre"), py::arg("v_pre"), py::arg("k_norm_w"),
+        py::arg("cos"), py::arg("sin"),
+        py::arg("k_cache_base"), py::arg("v_cache_base"),
+        py::arg("cur_pos"), py::arg("row_elems"),
+        py::arg("n_kv_heads"), py::arg("eps") = 1e-6f,
+        py::arg("stream") = 0);
+
     m.def("ada_rms_norm_style_int8", [](uintptr_t x, uintptr_t weight, uintptr_t style,
                                          uintptr_t out, uintptr_t gate_out,
                                          int seq_len, int dim, float eps,
