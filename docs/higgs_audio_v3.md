@@ -17,8 +17,9 @@ non-commercial license — check the model card.
 ## Performance
 
 Measured on a single **RTX 5090** (SM120), single stream, warm (numbers vary
-with text and clocks). Two precisions: **FP8 W8A8** (default) and **BF16
-W16A16** — the fallback for hosts without FP8 (`fp8=False`, see below):
+with text and clocks). Two precisions, **both SM120-only** (the GEMV kernels are
+`sm_120a`): **FP8 W8A8** (default) and **BF16 W16A16** (`fp8=False`) — the
+unquantised precision path for the same hardware (see below):
 
 | Metric | **FP8** (default) | **BF16** (`fp8=False`) |
 |---|---|---|
@@ -33,8 +34,12 @@ W16A16** — the fallback for hosts without FP8 (`fp8=False`, see below):
 Both precisions run the **same** fully-kernelised, zero-torch decode path
 (position-agnostic CUDA graph, batched prefill, prefix reuse). BF16 reads 2× the
 weight bytes of FP8, so its per-frame is ~1.7× — the bandwidth floor, not
-overhead. **No FP8 (pre-Blackwell, or FP8 disabled)? construct with `fp8=False`
-or pass `--bf16` to the quickstart/server** — everything else is identical.
+overhead. **Want unquantised BF16 numerics (e.g. FP8 disabled in your build, or
+to skip quantisation)? construct with `fp8=False` or pass `--bf16`** —
+everything else is identical. Both paths still require **SM120** (the BF16 path
+also uses an `sm_120a` GEMV); it is *not* a pre-Blackwell (e.g. 4090 / Thor /
+Orin) fallback — those would need separate kernels, which this frontend does
+not provide.
 
 **Speedup over the unoptimised PyTorch reference** (same model + GPU, transformers
 eager backbone):

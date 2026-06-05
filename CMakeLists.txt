@@ -481,6 +481,31 @@ if(GPU_ARCH STREQUAL "110")
   message(STATUS "SM100 CUTLASS NVFP4 W4A16 GEMM (Thor): ENABLED")
 endif()
 
+# ── Dedicated M=1 GEMV (FP8 + BF16) for sm_120a decode ──
+# Independent of FLASHRT_ENABLE_MOTUS: the bindings are gated by
+# ENABLE_SM120_GEMV_M1 (set for every GPU_ARCH=120 build below), so the object
+# must link whenever GPU_ARCH=120 — otherwise the binding would reference an
+# unlinked symbol when MOTUS is OFF.
+if(GPU_ARCH STREQUAL "120")
+  add_library(sm120_gemv_m1_obj OBJECT
+    csrc/gemm/fp8_gemv_m1_sm120.cu
+    csrc/gemm/bf16_gemv_m1_sm120.cu)
+  set_target_properties(sm120_gemv_m1_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(sm120_gemv_m1_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
+  )
+  target_compile_options(sm120_gemv_m1_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+endif()
+
 # ── Motus beta SM120 kernels ──
 # These are model-specific RTX kernels and must remain additive. They are
 # compiled into flash_rt_kernels so Motus does not depend on separate
@@ -518,9 +543,7 @@ if(FLASHRT_ENABLE_MOTUS AND GPU_ARCH STREQUAL "120")
   add_library(motus_fp8_smallm_sm120_obj OBJECT
     csrc/gemm/fp8_smallM_handtuned_sm120.cu
     csrc/gemm/fp8_smallM_handtuned_splitk_sm120.cu
-    csrc/gemm/fp8_smallM_handtuned_ldmatrix_sm120.cu
-    csrc/gemm/fp8_gemv_m1_sm120.cu
-    csrc/gemm/bf16_gemv_m1_sm120.cu)
+    csrc/gemm/fp8_smallM_handtuned_ldmatrix_sm120.cu)
   set_target_properties(motus_fp8_smallm_sm120_obj PROPERTIES
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
@@ -951,6 +974,15 @@ if(GPU_ARCH STREQUAL "120")
     $<TARGET_OBJECTS:cutlass_sm120_block_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE
     ENABLE_CUTLASS_SM120_BLOCK_FP8=1)
+endif()
+
+# Dedicated M=1 GEMV (FP8 + BF16); linked for every GPU_ARCH=120 build so the
+# ENABLE_SM120_GEMV_M1 bindings always resolve, independent of FLASHRT_ENABLE_MOTUS.
+if(GPU_ARCH STREQUAL "120")
+  target_sources(flash_rt_kernels PRIVATE
+    $<TARGET_OBJECTS:sm120_gemv_m1_obj>)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    ENABLE_SM120_GEMV_M1=1)
 endif()
 
 # SM120a CUTLASS NVFP4 W4A16 GEMM (Qwen3.6 NVFP4 ckpt path).
