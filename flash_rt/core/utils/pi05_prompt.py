@@ -22,7 +22,7 @@ def discretize_pi05_state(state) -> np.ndarray:
     arr = np.asarray(state, dtype=np.float32).reshape(-1)
     bins = np.linspace(-1, 1, 256 + 1, dtype=np.float32)[:-1]
     tokens = np.digitize(arr, bins=bins) - 1
-    return np.clip(tokens, 0, 255).astype(np.int64)
+    return tokens.astype(np.int64)
 
 
 def format_pi05_prompt(prompt: str, state=None) -> str:

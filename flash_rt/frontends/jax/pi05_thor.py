@@ -814,6 +814,8 @@ class Pi05JaxFrontendThor:
         else:
             self._capture_enc_ae_graph()
 
+        if self.use_fp8:
+            self._real_data_calibrated = False
         self.current_prompt = prompt_text
         logger.info(f"Set prompt: '{prompt_text}' (Se={Se})")
 

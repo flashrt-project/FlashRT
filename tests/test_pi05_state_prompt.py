@@ -9,9 +9,9 @@ def test_pi05_state_prompt_matches_openpi_format():
 
     state = np.array([-1.0, 0.0, 1.0, 2.0, -2.0], dtype=np.float32)
 
-    assert discretize_pi05_state(state).tolist() == [0, 128, 255, 255, 0]
+    assert discretize_pi05_state(state).tolist() == [0, 128, 255, 255, -1]
     assert format_pi05_prompt("pick_up\nred", state) == (
-        "Task: pick up red, State: 0 128 255 255 0;\nAction: "
+        "Task: pick up red, State: 0 128 255 255 -1;\nAction: "
     )
 
 
@@ -26,12 +26,15 @@ def test_jax_prompt_embedding_formats_state(monkeypatch):
 
     seen = {}
 
-    def fake_tokenize(text):
-        seen["text"] = text
-        return [0, 1, 2]
+    class FakeSentencePiece:
+        def Encode(self, text, add_bos=False):
+            seen["text"] = text
+            seen["add_bos"] = add_bos
+            return [0, 1, 2]
 
     monkeypatch.setattr(
-        thor_frontend_utils, "_tokenize_sentencepiece", fake_tokenize)
+        "flash_rt.utils.paligemma_tokenizer.load_paligemma_sentencepiece",
+        lambda: FakeSentencePiece())
     embedding = np.ones((3, 4), dtype=np.float16)
 
     embeds, prompt_len = thor_frontend_utils.embed_prompt_numpy(
@@ -42,3 +45,4 @@ def test_jax_prompt_embedding_formats_state(monkeypatch):
     assert seen["text"] == (
         "Task: pick up red, State: 0 128 255;\nAction: "
     )
+    assert seen["add_bos"] is True

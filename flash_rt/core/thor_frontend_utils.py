@@ -131,8 +131,14 @@ def embed_prompt_numpy(prompt_text, embedding_weight_np, max_len: int = 48,
     No torch dependency. Returns (embeds_fp16_np, prompt_len).
     """
     if state is not None:
-        prompt_text = format_pi05_prompt(prompt_text, state)
-    tokens = _tokenize_sentencepiece(prompt_text)
+        from flash_rt.utils.paligemma_tokenizer import (
+            load_paligemma_sentencepiece,
+        )
+        sp = load_paligemma_sentencepiece()
+        tokens = sp.Encode(format_pi05_prompt(prompt_text, state),
+                           add_bos=True)
+    else:
+        tokens = _tokenize_sentencepiece(prompt_text)
     token_ids = np.array(tokens, dtype=np.int32)
     prompt_len = len(token_ids)
     embeds = embedding_weight_np[token_ids]
