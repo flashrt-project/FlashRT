@@ -14,6 +14,38 @@ non-commercial license — check the model card.
 
 ---
 
+## Performance
+
+Measured on a single **RTX 5090** (SM120), single stream, FP8 W8A8, warm
+(numbers vary with text and clocks):
+
+| Metric | Value |
+|---|---|
+| Real-time factor (RTF) | **0.095 – 0.11** (≈ 9–10× faster than real time) |
+| Time to first audio (TTFA) | **≈ 94 ms** |
+| Prompt prefill | **≈ 1.0 ms/token** (batched single-pass; ~0.8 on longer prompts) |
+| Autoregressive decode | **≈ 3.2 ms/frame** steady (≈ 3.7–4.3 ms/frame full-pipeline incl. prefill amortisation + codec) |
+| Peak VRAM | **6.6 GB** (FP8 backbone ≈ 3.6 GB + bf16 embed/head + fp32 codec) |
+| Fidelity | teacher-forced logits **cos 1.0** vs the reference backbone; codec **cos 0.99993** vs canonical; streamed == one-shot **cos 1.0** |
+| Prefix reuse | a shared `system` preamble cuts prefill by **~64 %**, output bit-identical |
+
+**Speedup over the unoptimised PyTorch reference** (same model + GPU, transformers
+eager backbone):
+
+| Stage | PyTorch eager | FlashRT FP8 | |
+|---|---|---|---|
+| Autoregressive decode (no codec) | 10.8 ms/frame | **3.2 ms/frame** | **3.3× faster** |
+| Prompt prefill | 3.7 ms/token | **1.0 ms/token** | **3.7× faster** |
+| Backbone weight VRAM | 7.3 GB (bf16) | **3.6 GB (FP8)** | **2× smaller** |
+
+The decode math path is fully kernelised (RMSNorm→FP8 quant, dedicated M=1 FP8
+GEMV with fused residual epilogue, fused q/k-norm+RoPE+KV-write, FlashAttention-2)
+and replayed from a single position-agnostic CUDA graph. The prompt is prefilled
+in one batched M=P pass; a shared `system` preamble's KV is reused across
+requests (only the new text is prefilled — see [§4](#4-python-api)).
+
+---
+
 ## 1. Requirements
 
 | | |
@@ -59,9 +91,9 @@ Expected output on a 5090 (numbers vary with text length and clocks):
 
 ```
 [FP8 W8A8] 'The quick brown fox jumps over the lazy dog.'
-  -> fox.wav  (2.76s audio, ~4.5s wall incl 1st-call setup)
-  bench 1: AR decode ~334 ms (~4.8 ms/frame)
-  bench 2: AR decode ~333 ms (~4.8 ms/frame)
+  -> fox.wav  (~3.0s audio, ~4.5s wall incl 1st-call setup)
+  bench 1: AR decode ~290 ms (~3.8 ms/frame)
+  bench 2: AR decode ~290 ms (~3.8 ms/frame)
   ...
 ```
 
@@ -83,9 +115,29 @@ wav = fe.generate("Hello from FlashRT.")     # text -> 24 kHz mono waveform [L] 
 # or split the stages:
 codes = fe.predict("Hello from FlashRT.")    # [T, 8] acoustic codes (int64, cpu)
 wav   = fe.synthesize(codes)                 # codes -> waveform
+
+# streaming (low TTFA): yields 24 kHz chunks as frames decode
+for chunk in fe.generate_stream("A longer sentence to speak aloud."):
+    ...                                      # chunk: waveform [n] (cpu f32)
 ```
 
 Save with any WAV writer (the quickstart uses the stdlib `wave` module at 24 kHz).
+
+**Shared preamble + prefix reuse.** Pass a `system` preamble (a fixed
+voice/style instruction) to reuse its KV across requests — when successive calls
+share the same preamble, only the new text is prefilled, cutting prefill cost
+while producing bit-identical audio:
+
+```python
+SYSTEM = "Narrate in a calm, warm storyteller voice with clear diction."
+for line in lines:                           # same voice, many utterances
+    for chunk in fe.generate_stream(line, system=SYSTEM):
+        ...                                  # preamble KV reused after the 1st call
+```
+
+The reuse is a frontend mechanism (the KV cache is owned by the frontend); the
+caching/eviction policy belongs in the serving layer
+(`serving/higgs_audio_agent` forwards the request `instructions` as `system`).
 
 ---
 
@@ -132,31 +184,27 @@ teacher-forced cosine above, and the codec is bit-faithful on identical codes.
 
 ---
 
-## 7. Measured comparison (RTX 5090, single stream, greedy)
+## 7. Measurement notes
 
-Full text→waveform pipeline. FlashRT numbers are the standardized frontend
-(`generate`), warm, FP8 backbone:
+Headline numbers are in [Performance](#performance) above. Methodology:
 
-| | per-frame | RTF | first-token / TTFA | VRAM | precision |
-|---|---|---|---|---|---|
-| PyTorch eager (transformers Qwen3, AR backbone only) | 10.8 ms | 0.27 | — | 9.0 GB | bf16 |
-| sglang-omni (full pipeline) | ~6.4 ms | 0.16–0.19 | 0.36–0.63 s | 28.3 GB¹ | bf16 |
-| **FlashRT (this frontend, FP8 + codec)** | **4.6–5.1 ms** | **0.12** | **~40 ms²** | **6.3 GB** | FP8 W8A8 |
-
-¹ sglang reserves ~85 % of the GPU for its KV pool (`mem_fraction_static`); its
-  actual working set is ≈ 10 GB. FlashRT does not over-reserve.
-² FlashRT prefill latency (time to first frame logits) for a short prompt; the
-  codec adds 3–49 ms once for the whole clip (3–40 s of audio).
-
-Notes:
-- **RTF 0.12 across short/medium/long** (≈ 8× real time), ~1.4× faster than
-  sglang's full pipeline; **VRAM ~4.5× smaller** than sglang's reservation.
-- The kernel-level decode floor is **3.2 ms/frame** (clean CUDA-graph replay at
-  a single position, short KV). The frontend's eager per-frame is higher because
-  it includes Python dispatch and the attention cost growing with KV length over
-  a full generation; a per-position CUDA-graph capture closes most of that gap.
-- The codec runs in fp32 (ConvTranspose is unstable in low precision) and costs
-  a small one-shot pass at the end (≤ 50 ms for 40 s of audio).
+- **Full pipeline, warm.** RTF / TTFA are end-to-end text→waveform through the
+  standardized `generate` / `generate_stream` frontend, FP8 backbone, after a
+  warm-up call (lazy FP8 calibration + codec load + CUDA-graph capture happen
+  once on the first call and are excluded).
+- **Decode floor 3.2 ms/frame** is the clean single-position CUDA-graph replay;
+  the per-token GEMMs read 3.6 GB of distinct FP8 weights, so this is genuinely
+  HBM-bound (micro-benchmarks that reuse weights report L2-cached fiction). The
+  full-pipeline per-frame is slightly higher because attention cost grows with KV
+  length over a long generation.
+- **Prefill** is one batched M=P forward (≈ 1 ms/token); a shared `system`
+  preamble reuses its resident KV across requests (only the new text suffix is
+  prefilled — bit-identical to a cold prefill).
+- **Codec** runs in fp32 (ConvTranspose is unstable in low precision) as one
+  small pass at the end (≤ 50 ms for 40 s of audio); in streaming it is decoded
+  in overlapping windows so the streamed waveform matches the one-shot output.
+- **VRAM** is the peak process working set, not a reservation: FP8 backbone
+  weights ≈ 3.6 GB (bf16 would be 7.3 GB) + bf16 embed/head + fp32 codec.
 
 ---
 
