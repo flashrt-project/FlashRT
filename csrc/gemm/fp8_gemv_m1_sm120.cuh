@@ -21,6 +21,8 @@ namespace gemv_m1 {
 DECL(gemv_fp8_m1_w4);
 DECL(gemv_fp8_m1_w8);
 DECL(gemv_fp8_m1_w16);
+DECL(gemv_fp8_m1_resadd_w4);  // D[n] += acc*alpha (fused residual)
+DECL(gemv_fp8_m1_resadd_w8);
 
 #undef DECL
 

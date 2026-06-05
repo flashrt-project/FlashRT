@@ -5259,6 +5259,8 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     BIND_GEMV_M1(gemv_fp8_m1_w4);
     BIND_GEMV_M1(gemv_fp8_m1_w8);
     BIND_GEMV_M1(gemv_fp8_m1_w16);
+    BIND_GEMV_M1(gemv_fp8_m1_resadd_w4);
+    BIND_GEMV_M1(gemv_fp8_m1_resadd_w8);
 
 #undef BIND_GEMV_M1
 #endif
