@@ -37,7 +37,7 @@ class HiggsAudioV3TorchFrontendRtx:
                  max_seq: int = 2048,
                  max_new_frames: int = 1024,
                  max_prefill_tokens: int = 512,
-                 fp8: bool = True,
+                 fp8: bool | None = None,
                  alloc_own_forward_buffers: bool = True) -> None:
         """Load the BF16 backbone + fused codebook table and build scratch.
 
@@ -47,11 +47,14 @@ class HiggsAudioV3TorchFrontendRtx:
           max_seq: KV-cache length (prompt + generated frames).
           max_new_frames: cap on generated acoustic frames per call.
           max_prefill_tokens: max prompt length served by the batched single-
-            pass FP8 prefill; longer prompts fall back to the eager per-token
+            pass prefill; longer prompts fall back to the eager per-token
             prefill. Sizes the attention Q/O buffers.
-          fp8: run the decode backbone in FP8 W8A8 (the dedicated M=1 GEMV
-            path); falls back to the BF16 backbone when False. FP8 weights are
-            quantised and activation scales calibrated lazily on first use.
+          fp8: decode precision. ``None`` (default) auto-selects by hardware —
+            FP8 W8A8 when the FP8 decode kernels are compiled in (SM120 build),
+            else BF16 W16A16. ``True`` forces FP8 (falls back to BF16 with a
+            warning if its kernels are absent); ``False`` forces BF16. Both run
+            the same kernelised graph; selection follows the FlashRT
+            hardware-detection convention (compiled-symbol probe + SM version).
           alloc_own_forward_buffers: pre-allocate the attention backend and
             RoPE table at construction.
         """
@@ -60,7 +63,7 @@ class HiggsAudioV3TorchFrontendRtx:
         self.max_seq = int(max_seq)
         self.max_new_frames = int(max_new_frames)
         self.max_prefill_tokens = int(max_prefill_tokens)
-        self.fp8 = bool(fp8)
+        self.fp8 = self._resolve_precision(fp8)
         # Batched single-pass prompt prefill (M=P) instead of P eager M=1 steps
         # (both FP8 and BF16 paths). Set FLASHRT_HIGGS_BATCHED_PREFILL=0 for eager.
         self._batched_prefill = os.environ.get(
@@ -87,6 +90,53 @@ class HiggsAudioV3TorchFrontendRtx:
         if alloc_own_forward_buffers:
             self._alloc_buffers()
             self._build_rope_table()
+
+    @staticmethod
+    def _resolve_precision(fp8: bool | None) -> bool:
+        """Pick the decode precision from the hardware, FlashRT-style: probe the
+        compiled kernel module (the FP8 path needs both its M=1 GEMV and the
+        SM120 FP8 prefill GEMM; BF16 needs its M=1 GEMV) and read the SM version
+        for the log. ``None`` auto-selects FP8 if available else BF16; ``True``
+        forces FP8 but falls back to BF16 (with a warning) when its kernels were
+        not compiled into this build; ``False`` forces BF16."""
+        import logging
+
+        from flash_rt import flash_rt_kernels as fvk
+        from flash_rt.core.utils.hardware import (
+            get_gpu_name,
+            get_gpu_sm_version,
+        )
+        log = logging.getLogger(__name__)
+        fp8_ok = (hasattr(fvk, "ht_gemv_fp8_m1_w8")
+                  and hasattr(fvk, "ht_fp8_gemm_16x192x128_w8"))
+        bf16_ok = hasattr(fvk, "ht_gemv_bf16_m1_w4")
+        sm, name = get_gpu_sm_version(), get_gpu_name()
+
+        if fp8 is None:
+            use_fp8 = fp8_ok
+        elif fp8:
+            use_fp8 = True
+            if not fp8_ok:
+                if not bf16_ok:
+                    raise RuntimeError(
+                        f"Higgs Audio v3: no decode kernels in this build "
+                        f"(SM{sm} {name}); rebuild FlashRT with GPU_ARCH "
+                        f"matching the GPU.")
+                log.warning(
+                    "Higgs Audio v3: FP8 requested but the FP8 decode kernels "
+                    "are not in this build (SM%s %s); using BF16.", sm, name)
+                use_fp8 = False
+        else:
+            use_fp8 = False
+
+        if not use_fp8 and not bf16_ok:
+            raise RuntimeError(
+                f"Higgs Audio v3: the BF16 decode GEMV is not in this build "
+                f"(SM{sm} {name}); rebuild FlashRT with GPU_ARCH matching the "
+                f"GPU.")
+        log.info("Higgs Audio v3 on SM%s (%s): %s decode", sm, name,
+                 "FP8 W8A8" if use_fp8 else "BF16 W16A16")
+        return use_fp8
 
     # ── Load ──
 

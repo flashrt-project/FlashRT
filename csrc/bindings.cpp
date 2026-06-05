@@ -16,7 +16,7 @@
 #include "gemm/fp8_smallM_handtuned_splitk_sm120.cuh"
 #include "gemm/fp8_smallM_handtuned_ldmatrix_sm120.cuh"
 #endif
-#ifdef ENABLE_SM120_GEMV_M1
+#ifdef ENABLE_DECODE_GEMV_M1
 #include "gemm/fp8_gemv_m1_sm120.cuh"
 #include "gemm/bf16_gemv_m1_sm120.cuh"
 #endif
@@ -5280,7 +5280,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
 #undef BIND_SPLITK
 #endif  // ENABLE_CUTLASS_SM120_BLOCK_FP8
 
-#ifdef ENABLE_SM120_GEMV_M1
+#ifdef ENABLE_DECODE_GEMV_M1
     // Dedicated M=1 GEMV (FP8 + BF16), warp-per-output-row, no MMA padding tax.
     // Internal decode kernels: callers must pass M=1 and K aligned (FP8 K%16,
     // BF16 K%8). These hold for the fixed Higgs/Qwen decode shapes; the kernels
@@ -5309,7 +5309,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     BIND_GEMV_M1(gemv_bf16_m1_w16);
 
 #undef BIND_GEMV_M1
-#endif  // ENABLE_SM120_GEMV_M1
+#endif  // ENABLE_DECODE_GEMV_M1
 
 #ifdef ENABLE_FP8_CONV3D_V17
     m.def("fp8_conv3d_v17_ndhwc_bf16out",
