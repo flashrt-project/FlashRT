@@ -279,6 +279,41 @@ DEFINE_FA2_STUB(fvk_attention_fa2_fwd_fp16,  "fp16")
 
 #ifdef FA2_HAS_BF16
 DEFINE_FA2_ENTRY(fvk_attention_fa2_fwd_bf16, cutlass::bfloat16_t, true)
+
+// seqused_k variant: K/V length is read per-batch from device memory
+// (seqused_k[b]); the kernel clamps n_block_max to that length and early-exits.
+// Forces num_splits=1 (no reduction scratch, CUDA-graph-safe). Lets one captured
+// decode graph serve every position — the host writes the current length into
+// the seqused_k buffer before each replay (paired with the devpos KV-write).
+extern "C" void fvk_attention_fa2_fwd_bf16_seqused(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr, const void* seqused_k_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int /*num_sms*/, cudaStream_t stream)
+{
+    FLASH_NAMESPACE::Flash_fwd_params params;
+    fill_params(params, true, q_ptr, k_ptr, v_ptr, o_ptr, softmax_lse_ptr,
+                batch, seqlen_q, seqlen_k, num_heads_q, num_heads_kv, head_dim,
+                q_batch_stride, q_row_stride, q_head_stride,
+                k_batch_stride, k_row_stride, k_head_stride,
+                v_batch_stride, v_row_stride, v_head_stride,
+                o_batch_stride, o_row_stride, o_head_stride, softmax_scale);
+    params.seqused_k = reinterpret_cast<int*>(const_cast<void*>(seqused_k_ptr));
+    params.num_splits = 1;
+    params.softmax_lseaccum_ptr = nullptr;
+    params.oaccum_ptr = nullptr;
+    dispatch_hdim<cutlass::bfloat16_t>(head_dim, 1, params, stream);
+}
 #else
 DEFINE_FA2_STUB(fvk_attention_fa2_fwd_bf16,  "bf16")
+extern "C" void fvk_attention_fa2_fwd_bf16_seqused(
+    const void*, const void*, const void*, void*, void*, const void*,
+    int, int, int, int, int, int, int, int, int, int, int, int,
+    int, int, int, int, int, int, float, int, cudaStream_t)
+{ std::abort(); }
 #endif
