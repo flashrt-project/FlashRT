@@ -130,8 +130,11 @@ class VLAModel:
   its own reference contract:
   - Pi0 uses a continuous state token in the action-expert suffix.
   - Pi0.5 encodes state as openpi-compatible discretized prompt tokens:
-    `Task: <prompt>, State: <0..255 bins>;\nAction: `. RTX/Thor torch
-    frontends accept `state` in `set_prompt()` and through `predict()`.
+    `Task: <prompt>, State: <openpi state bins>;\nAction: `. The bins use
+    OpenPI's `np.digitize(state, np.linspace(-1, 1, 257)[:-1]) - 1`
+    convention: normalized in-range values usually become 0..255, while
+    values below -1 become -1. RTX/Thor torch frontends and the JAX Thor
+    Pi0.5 frontend accept `state` in `set_prompt()` and through `predict()`.
     Same-length state prompt updates reuse the captured graph; recurring
     RTX prompt lengths reuse the cached pipeline instead of rebuilding.
   - Pi0-FAST encodes state in the FAST token prefix.

@@ -100,8 +100,10 @@ loaded from either source as long as you point
 ### Pi0.5 State Prompts
 
 Pi0.5 follows openpi's discrete-state prompt format. Passing `state`
-through the stable API discretizes normalized state values into 0..255 bins
-and embeds:
+through the stable API discretizes normalized state values with OpenPI's
+`np.digitize(state, np.linspace(-1, 1, 257)[:-1]) - 1` bins and embeds:
+values in the normalized range usually become 0..255, while values below
+-1 become -1.
 
 ```python
 actions = model.predict(
@@ -187,10 +189,11 @@ model = flash_rt.load_model(
 ### Pi0.5 state prompt bucket warmup
 
 Pi0.5 follows the OpenPI contract where robot state is discretized into
-the language prefix:
+the language prefix with `np.digitize(state, np.linspace(-1, 1, 257)[:-1]) - 1`.
+Normalized in-range values usually become 0..255; values below -1 become -1.
 
 ```text
-Task: <prompt>, State: <0..255 bins>;
+Task: <prompt>, State: <openpi state bins>;
 Action:
 ```
 
