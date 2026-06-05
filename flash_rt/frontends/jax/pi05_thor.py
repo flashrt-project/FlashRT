@@ -55,6 +55,7 @@ import jax.numpy as jnp
 
 
 from flash_rt.core.thor_frontend_utils import embed_prompt_numpy as _embed_prompt  # noqa: E402
+from flash_rt.core.utils.pi05_prompt import PI05_STATE_PROMPT_MAX_LEN  # noqa: E402
 
 
 class Pi05JaxFrontendThor:
@@ -647,7 +648,7 @@ class Pi05JaxFrontendThor:
 
         logger.info("Weights restored from cache")
 
-    def set_prompt(self, prompt_text):
+    def set_prompt(self, prompt_text, state=None):
         """Set prompt: tokenize, time conditioning (numpy), RoPE, calibrate, capture graph.
 
         When :meth:`set_rl_mode` has activated CFG inference and a text
@@ -660,6 +661,9 @@ class Pi05JaxFrontendThor:
         if (self._rl_config is not None
                 and not getattr(self, "_in_rl_set_prompt", False)
                 and isinstance(prompt_text, str)):
+            if state is not None:
+                raise ValueError(
+                    "Pi0.5 RL CFG mode does not support state-in-prompt yet")
             self._in_rl_set_prompt = True
             try:
                 self._set_prompt_rl(prompt_text)
@@ -678,7 +682,9 @@ class Pi05JaxFrontendThor:
             embeds_np = self._embedding_np[token_ids]
             embeds_np = (embeds_np * float(embeds_np.shape[-1] ** 0.5)).astype(np.float16)
         else:
-            embeds_np, prompt_len = _embed_prompt(prompt_text, self._embedding_np, max_len=48)
+            max_len = PI05_STATE_PROMPT_MAX_LEN if state is not None else 48
+            embeds_np, prompt_len = _embed_prompt(
+                prompt_text, self._embedding_np, max_len=max_len, state=state)
         Se = S + prompt_len
         if Se % 2 != 0:
             Se += 1

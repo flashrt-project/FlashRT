@@ -19,3 +19,26 @@ def test_pi05_state_prompt_without_state_keeps_text_only_format():
     from flash_rt.core.utils.pi05_prompt import format_pi05_prompt
 
     assert format_pi05_prompt(" pick_up\nred ") == "pick up red"
+
+
+def test_jax_prompt_embedding_formats_state(monkeypatch):
+    from flash_rt.core import thor_frontend_utils
+
+    seen = {}
+
+    def fake_tokenize(text):
+        seen["text"] = text
+        return [0, 1, 2]
+
+    monkeypatch.setattr(
+        thor_frontend_utils, "_tokenize_sentencepiece", fake_tokenize)
+    embedding = np.ones((3, 4), dtype=np.float16)
+
+    embeds, prompt_len = thor_frontend_utils.embed_prompt_numpy(
+        "pick_up\nred", embedding, state=np.array([-1.0, 0.0, 1.0]))
+
+    assert prompt_len == 3
+    assert embeds.shape == (3, 4)
+    assert seen["text"] == (
+        "Task: pick up red, State: 0 128 255;\nAction: "
+    )
