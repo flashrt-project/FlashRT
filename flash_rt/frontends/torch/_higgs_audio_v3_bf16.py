@@ -177,7 +177,12 @@ class HiggsAudioV3Bf16Decoder:
         H, NQ, NKV, HD, INTER = self.H, self.NQ, self.NKV, self.HD, self.INTER
         NQK, KV, EPS = self.NQK, self.KV, self.EPS
         s = torch.cuda.current_stream().cuda_stream
-        mm = fvk.bf16_matmul_qwen36_bf16
+        # One-time eager prefill GEMM: cuBLAS (torch.matmul) reads each weight
+        # ONCE across the P prompt rows (5-14x the warp-per-row bf16_matmul,
+        # which re-reads W per row -> 11%/5% effective BW at P=13/33). This is
+        # the one-time setup path, not the per-frame decode graph (which stays
+        # the hand-written bf16 GEMV); the norms/qk-norm+RoPE/silu/attention all
+        # stay kernelised. mv is the M=1 head GEMV.
         mv = fvk.bf16_matvec_qwen36_bf16
         rc, rs = fe._rope_cos, fe._rope_sin
 
@@ -194,8 +199,7 @@ class HiggsAudioV3Bf16Decoder:
                      xn.data_ptr(), S, H, EPS, s)
         for L in range(self.NL):
             w = self.WL[L]
-            mm(xn.data_ptr(), w["qkv"].data_ptr(), Dq.data_ptr(),
-               S, NQK + 2 * KV, H, s)
+            torch.matmul(xn, w["qkv"].t(), out=Dq)
             for j in range(S):
                 pos = start_pos + j
                 qj = Dq[j, :NQK].contiguous()
@@ -217,18 +221,16 @@ class HiggsAudioV3Bf16Decoder:
             be.run("full", L, S, kv_seq=P, causal=True, stream=s,
                    softmax_scale=HD ** -0.5)
             ao = be.O_buf[:, :S].reshape(S, NQK).contiguous()
-            mm(ao.data_ptr(), w["o"].data_ptr(), tmp.data_ptr(), S, H, NQK, s)
+            torch.matmul(ao, w["o"].t(), out=tmp)
             fvk.residual_add_rms_norm(h.data_ptr(), tmp.data_ptr(),
                                       w["post_norm"].data_ptr(), xn2.data_ptr(),
                                       S, H, EPS, s)
-            mm(xn2.data_ptr(), w["gu"].data_ptr(), Dg.data_ptr(),
-               S, 2 * INTER, H, s)
+            torch.matmul(xn2, w["gu"].t(), out=Dg)
             g = Dg[:, :INTER].contiguous()
             u = Dg[:, INTER:].contiguous()
             fvk.silu_mul_qwen36_bf16(g.data_ptr(), u.data_ptr(), act.data_ptr(),
                                      S * INTER, s)
-            mm(act.data_ptr(), w["down"].data_ptr(), tmp.data_ptr(),
-               S, H, INTER, s)
+            torch.matmul(act, w["down"].t(), out=tmp)
             if L < self.NL - 1:
                 fvk.residual_add_rms_norm(
                     h.data_ptr(), tmp.data_ptr(),
