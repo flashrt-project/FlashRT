@@ -481,12 +481,15 @@ if(GPU_ARCH STREQUAL "110")
   message(STATUS "SM100 CUTLASS NVFP4 W4A16 GEMM (Thor): ENABLED")
 endif()
 
-# ── Dedicated M=1 GEMV (FP8 + BF16) for sm_120a decode ──
-# Independent of FLASHRT_ENABLE_MOTUS: the bindings are gated by
-# ENABLE_SM120_GEMV_M1 (set for every GPU_ARCH=120 build below), so the object
-# must link whenever GPU_ARCH=120 — otherwise the binding would reference an
-# unlinked symbol when MOTUS is OFF.
-if(GPU_ARCH STREQUAL "120")
+# ── Dedicated M=1 decode GEMV (FP8 + BF16) ──
+# Origin sm_120a, but neither kernel uses an SM120-specific instruction, so both
+# compile for Ada (sm89) too — built for the FP8-capable consumer RTX arches
+# (sm89 / sm120). Independent of FLASHRT_ENABLE_MOTUS: the bindings are gated by
+# ENABLE_DECODE_GEMV_M1 (set alongside this object below), so the object must
+# link whenever it is built — otherwise the binding would reference an unlinked
+# symbol when MOTUS is OFF. (FP8 still needs the SM120 prefill GEMM in MOTUS, so
+# the FP8 path is SM120-only; the BF16 path runs wherever this object is built.)
+if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "89")
   add_library(sm120_gemv_m1_obj OBJECT
     csrc/gemm/fp8_gemv_m1_sm120.cu
     csrc/gemm/bf16_gemv_m1_sm120.cu)
@@ -976,13 +979,14 @@ if(GPU_ARCH STREQUAL "120")
     ENABLE_CUTLASS_SM120_BLOCK_FP8=1)
 endif()
 
-# Dedicated M=1 GEMV (FP8 + BF16); linked for every GPU_ARCH=120 build so the
-# ENABLE_SM120_GEMV_M1 bindings always resolve, independent of FLASHRT_ENABLE_MOTUS.
-if(GPU_ARCH STREQUAL "120")
+# Dedicated M=1 decode GEMV (FP8 + BF16); linked + macro defined wherever the
+# object is built (sm89 / sm120) so the ENABLE_DECODE_GEMV_M1 bindings always
+# resolve, independent of FLASHRT_ENABLE_MOTUS.
+if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "89")
   target_sources(flash_rt_kernels PRIVATE
     $<TARGET_OBJECTS:sm120_gemv_m1_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE
-    ENABLE_SM120_GEMV_M1=1)
+    ENABLE_DECODE_GEMV_M1=1)
 endif()
 
 # SM120a CUTLASS NVFP4 W4A16 GEMM (Qwen3.6 NVFP4 ckpt path).

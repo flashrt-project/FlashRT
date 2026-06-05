@@ -17,9 +17,9 @@ non-commercial license — check the model card.
 ## Performance
 
 Measured on a single **RTX 5090** (SM120), single stream, warm (numbers vary
-with text and clocks). Two precisions, **both SM120-only** (the GEMV kernels are
-`sm_120a`): **FP8 W8A8** (default) and **BF16 W16A16** (`fp8=False`) — the
-unquantised precision path for the same hardware (see below):
+with text and clocks). Two precisions, auto-selected by GPU (see *Hardware-
+adaptive* below): **FP8 W8A8** (SM120) and **BF16 W16A16** (the unquantised path,
+also the auto-selection on non-FP8 builds):
 
 | Metric | **FP8** (default) | **BF16** (`fp8=False`) |
 |---|---|---|
@@ -34,15 +34,17 @@ unquantised precision path for the same hardware (see below):
 Both precisions run the **same** fully-kernelised, zero-torch decode path
 (position-agnostic CUDA graph, batched prefill, prefix reuse). BF16 reads 2× the
 weight bytes of FP8, so its per-frame is ~1.7× — the bandwidth floor, not
-overhead. **Want unquantised BF16 numerics (e.g. to skip quantisation)?
-construct with `fp8=False` or pass `--bf16`** — everything else is identical.
+overhead.
 
-**Architecture**: as shipped both paths are built for **SM120** (`-gencode
-sm_120a`), so a default build runs on SM120 only. The BF16 decode kernels use no
-SM120-specific instruction (the M=1 GEMV is plain CUDA, the rest is shared
-kernels) and compile for Ada (sm89) — a 4090 BF16 build is a CMake-gating change
-away, but is not built or validated here. The FP8 path additionally needs the
-SM120 FP8 GEMM, so it stays SM120-only. See [§8](#8-notes--limitations).
+**Hardware-adaptive**: the precision is auto-selected from the GPU
+(`fp8=None`, the default) — FP8 where its kernels are compiled in, else BF16;
+pass `fp8=True` / `fp8=False` (or `--bf16`) to force, and forced FP8 falls back
+to BF16 with a warning if its kernels are absent. The decode GEMV (FP8 + BF16)
+is built for **sm89 and sm120** (the build auto-detects the GPU arch), so a 4090
+build compiles the BF16 path and the frontend runs it automatically. The FP8
+path additionally needs the SM120 FP8 prefill GEMM, so **FP8 is SM120-only**.
+Validated on SM120 (5090); the sm89/4090 BF16 path compiles and configures but
+is not hardware-validated here. See [§8](#8-notes--limitations).
 
 **Speedup over the unoptimised PyTorch reference** (same model + GPU, transformers
 eager backbone):
@@ -125,7 +127,8 @@ run the BF16 backbone instead of FP8.
 ```python
 from flash_rt.frontends.torch.higgs_audio_v3_rtx import HiggsAudioV3TorchFrontendRtx
 
-fe = HiggsAudioV3TorchFrontendRtx(CHECKPOINT_DIR, fp8=True)   # fp8=False -> BF16 backbone
+fe = HiggsAudioV3TorchFrontendRtx(CHECKPOINT_DIR)   # fp8=None (default): auto FP8/BF16 by GPU
+# fe = HiggsAudioV3TorchFrontendRtx(CHECKPOINT_DIR, fp8=False)   # force BF16
 
 wav = fe.generate("Hello from FlashRT.")     # text -> 24 kHz mono waveform [L] (cpu f32)
 
@@ -232,15 +235,19 @@ Headline numbers are in [Performance](#performance) above. Methodology:
   ranges are stable across prompts; re-instantiate the frontend to recalibrate.
 - The BF16 projection weights are freed after calibration (the FP8 backbone is
   the active path); pass `fp8=False` for the BF16 backbone, which keeps them.
-- **GPU support.** A default build targets **SM120** (`GPU_ARCH=120`,
-  `-gencode sm_120a`), so the frontend's decode kernels are only compiled there;
-  a non-SM120 build (e.g. `GPU_ARCH=89` for a 4090) builds the rest of FlashRT
-  but **not** these kernels, so the frontend raises at runtime (the `ht_gemv_*`
-  symbols are absent). The BF16 GEMV itself is plain CUDA (no SM120 intrinsics)
-  and *compiles* for Ada (sm89) — and all the support kernels (RMSNorm, SwiGLU,
-  q/k-norm+RoPE, FlashAttention-2) are arch-generic — so a 4090 **BF16** build is
-  a build-gating change away, but it is not enabled or hardware-validated here.
-  The FP8 path additionally needs the SM120 FP8 GEMM and stays SM120-only.
+- **GPU support / precision auto-selection.** The build auto-detects the GPU
+  arch (CMake reads `nvidia-smi`), and the decode GEMV (FP8 + BF16) is compiled
+  for **sm89 and sm120**. At construction the frontend follows FlashRT's
+  hardware-detection convention — it probes the compiled kernels + the SM version
+  and auto-selects (`fp8=None`): **FP8 W8A8** when its kernels are present
+  (SM120, where the FP8 prefill GEMM is built) else **BF16 W16A16**. So a 5090
+  runs FP8 by default and a 4090 runs BF16 automatically; `fp8=True`/`False`
+  force, and forced FP8 falls back to BF16 (with a warning) when its kernels are
+  absent. FP8 stays SM120-only (its prefill GEMM is SM120). The BF16 path is
+  validated on SM120 here; it compiles and configures for sm89 (4090) but is not
+  hardware-validated on that part. A build for an arch outside {sm89, sm120}
+  (e.g. Orin/Thor) does not compile these kernels, and the frontend raises a
+  clear error at construction.
 - Synthesis here is **non-streaming** (the codec decodes the whole clip at the
   end). Streaming / chunked synthesis is not yet wired.
 - Codec source: the `bosonai/higgs-audio` v2 tokenizer (decode path only),

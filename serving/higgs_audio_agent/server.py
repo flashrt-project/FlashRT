@@ -115,7 +115,7 @@ def main():
     )
     fe = HiggsAudioV3TorchFrontendRtx(
         args.checkpoint, device=args.device, max_seq=args.max_seq,
-        fp8=not args.bf16)
+        fp8=False if args.bf16 else None)   # None: auto-select by GPU
     if args.warmup:                            # capture graph + load codec once
         for _ in fe.generate_stream(args.warmup):
             pass

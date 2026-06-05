@@ -70,8 +70,8 @@ def main() -> None:
 
     fe = HiggsAudioV3TorchFrontendRtx(
         args.checkpoint, device=args.device, max_seq=args.max_seq,
-        fp8=not args.bf16)
-    backbone = "BF16" if args.bf16 else "FP8 W8A8"
+        fp8=False if args.bf16 else None)   # None: auto-select by GPU
+    backbone = "BF16" if not fe.fp8 else "FP8 W8A8"
 
     t0 = time.perf_counter()
     wav = fe.generate(args.text)                  # 1st call: lazy calibrate + codec
