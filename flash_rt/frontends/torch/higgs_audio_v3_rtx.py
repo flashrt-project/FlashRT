@@ -36,6 +36,7 @@ class HiggsAudioV3TorchFrontendRtx:
                  device: str = "cuda:0",
                  max_seq: int = 2048,
                  max_new_frames: int = 1024,
+                 max_prefill_tokens: int = 512,
                  fp8: bool = True,
                  alloc_own_forward_buffers: bool = True) -> None:
         """Load the BF16 backbone + fused codebook table and build scratch.
@@ -45,6 +46,9 @@ class HiggsAudioV3TorchFrontendRtx:
           device: CUDA device string.
           max_seq: KV-cache length (prompt + generated frames).
           max_new_frames: cap on generated acoustic frames per call.
+          max_prefill_tokens: max prompt length served by the batched single-
+            pass FP8 prefill; longer prompts fall back to the eager per-token
+            prefill. Sizes the attention Q/O buffers.
           fp8: run the decode backbone in FP8 W8A8 (the dedicated M=1 GEMV
             path); falls back to the BF16 backbone when False. FP8 weights are
             quantised and activation scales calibrated lazily on first use.
@@ -55,7 +59,12 @@ class HiggsAudioV3TorchFrontendRtx:
         self.device = device
         self.max_seq = int(max_seq)
         self.max_new_frames = int(max_new_frames)
+        self.max_prefill_tokens = int(max_prefill_tokens)
         self.fp8 = bool(fp8)
+        # Batched single-pass prompt prefill (M=P) instead of P eager M=1 steps.
+        # On by default for FP8; set FLASHRT_HIGGS_BATCHED_PREFILL=0 for eager.
+        self._batched_prefill = self.fp8 and os.environ.get(
+            "FLASHRT_HIGGS_BATCHED_PREFILL", "1") != "0"
         # Single position-agnostic decode CUDA graph (devpos KV-write + FA2
         # seqused_k). On by default for FP8; set FLASHRT_HIGGS_GRAPH=0 to force
         # the eager decode path.
@@ -175,8 +184,11 @@ class HiggsAudioV3TorchFrontendRtx:
             RtxFlashAttnBackendQwen3,
         )
 
+        # max_q_seq sizes the Q/O/lse buffers; batched prefill needs room for
+        # the whole prompt (q_seq=P), decode only ever uses q_seq=1.
+        mqs = max(1, self.max_prefill_tokens) if self._batched_prefill else 1
         self._attn = RtxFlashAttnBackendQwen3(
-            max_seq=self.max_seq, max_q_seq=1, dtype=torch.bfloat16)
+            max_seq=self.max_seq, max_q_seq=mqs, dtype=torch.bfloat16)
         nc = self._cfg["num_codebooks"]
         self._cb_offsets = (
             torch.arange(nc, device=self.device) * self._cfg["codebook_vocab"])
@@ -334,11 +346,18 @@ class HiggsAudioV3TorchFrontendRtx:
         if self.fp8:
             self._ensure_fp8()
         self._attn.reset_cache()
-        te = self._weights["text_embed"]
-        for t, tok in enumerate(self._prompt_ids):
-            row = F.embedding(torch.tensor([tok], device=self.device), te)
-            self._gen_logits = self._frame_logits(fvk, row, t)
-        self._gen_pos = len(self._prompt_ids)
+        P = len(self._prompt_ids)
+        if (self._batched_prefill
+                and P <= self._attn._max_q_seq):
+            # one M=P forward over the whole prompt
+            self._gen_logits = self._fp8_decoder.prefill_batched(
+                self._prompt_ids)[0]
+        else:
+            te = self._weights["text_embed"]
+            for t, tok in enumerate(self._prompt_ids):
+                row = F.embedding(torch.tensor([tok], device=self.device), te)
+                self._gen_logits = self._frame_logits(fvk, row, t)
+        self._gen_pos = P
         return self._gen_pos
 
     @torch.no_grad()
