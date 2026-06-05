@@ -519,7 +519,8 @@ if(FLASHRT_ENABLE_MOTUS AND GPU_ARCH STREQUAL "120")
     csrc/gemm/fp8_smallM_handtuned_sm120.cu
     csrc/gemm/fp8_smallM_handtuned_splitk_sm120.cu
     csrc/gemm/fp8_smallM_handtuned_ldmatrix_sm120.cu
-    csrc/gemm/fp8_gemv_m1_sm120.cu)
+    csrc/gemm/fp8_gemv_m1_sm120.cu
+    csrc/gemm/bf16_gemv_m1_sm120.cu)
   set_target_properties(motus_fp8_smallm_sm120_obj PROPERTIES
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON

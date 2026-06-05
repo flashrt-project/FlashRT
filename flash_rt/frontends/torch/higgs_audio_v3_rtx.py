@@ -61,15 +61,13 @@ class HiggsAudioV3TorchFrontendRtx:
         self.max_new_frames = int(max_new_frames)
         self.max_prefill_tokens = int(max_prefill_tokens)
         self.fp8 = bool(fp8)
-        # Batched single-pass prompt prefill (M=P) instead of P eager M=1 steps.
-        # On by default for FP8; set FLASHRT_HIGGS_BATCHED_PREFILL=0 for eager.
-        self._batched_prefill = self.fp8 and os.environ.get(
+        # Batched single-pass prompt prefill (M=P) instead of P eager M=1 steps
+        # (both FP8 and BF16 paths). Set FLASHRT_HIGGS_BATCHED_PREFILL=0 for eager.
+        self._batched_prefill = os.environ.get(
             "FLASHRT_HIGGS_BATCHED_PREFILL", "1") != "0"
         # Single position-agnostic decode CUDA graph (devpos KV-write + FA2
-        # seqused_k). On by default for FP8; set FLASHRT_HIGGS_GRAPH=0 to force
-        # the eager decode path.
-        self._use_graph = self.fp8 and os.environ.get(
-            "FLASHRT_HIGGS_GRAPH", "1") != "0"
+        # seqused_k), both paths. Set FLASHRT_HIGGS_GRAPH=0 to force eager decode.
+        self._use_graph = os.environ.get("FLASHRT_HIGGS_GRAPH", "1") != "0"
 
         self._tokenizer: Any = None
         self._special_ids: dict[str, int] = {}
@@ -80,7 +78,8 @@ class HiggsAudioV3TorchFrontendRtx:
         self._rope_sin = None
         self._prompt_ids: list[int] | None = None
         self._resident_ids: list[int] | None = None   # KV currently on GPU
-        self._fp8_decoder: Any = None
+        self._dec: Any = None                          # active decode engine
+        self._fp8_decoder: Any = None                  # back-compat alias
         self._codec: Any = None
         self.latency_records: list[float] = []
 
@@ -204,79 +203,6 @@ class HiggsAudioV3TorchFrontendRtx:
         self._rope_cos = f.cos().to(torch.bfloat16).contiguous()
         self._rope_sin = f.sin().to(torch.bfloat16).contiguous()
 
-    # ── Forward ──
-
-    def _layer(self, fvk, L, h, t):
-        c = self._cfg
-        H, NQ, NKV, HD = (c["hidden"], c["num_q_heads"],
-                          c["num_kv_heads"], c["head_dim"])
-        INTER, eps = c["intermediate"], c["rms_norm_eps"]
-        w = self._weights["layers"][L]
-        s = torch.cuda.current_stream().cuda_stream
-        bf16 = torch.bfloat16
-
-        def rms(x, weight, M, K):
-            out = torch.empty(M, K, device=self.device, dtype=bf16)
-            fvk.rms_norm(x.contiguous().data_ptr(), weight.data_ptr(),
-                         out.data_ptr(), M, K, eps, s)
-            return out
-
-        def mm(x, weight, M, N, K):
-            out = torch.empty(M, N, device=self.device, dtype=bf16)
-            fvk.bf16_matmul_qwen36_bf16(x.contiguous().data_ptr(),
-                                        weight.data_ptr(), out.data_ptr(),
-                                        M, N, K, s)
-            return out
-
-        xn = rms(h, w["in_norm"], 1, H)
-        q = mm(xn, w["q"], 1, NQ * HD, H).view(NQ, HD).contiguous()
-        k = mm(xn, w["k"], 1, NKV * HD, H).view(NKV, HD).contiguous()
-        v = mm(xn, w["v"], 1, NKV * HD, H).view(NKV, HD).contiguous()
-        cos_t = self._rope_cos[t]
-        sin_t = self._rope_sin[t]
-        fvk.qwen3_q_norm_rope_qstage_bf16(
-            q_pre=q.data_ptr(), q_norm_w=w["qn"].data_ptr(),
-            cos=cos_t.data_ptr(), sin=sin_t.data_ptr(),
-            q_buf_dst=self._attn.Q_buf[:, :1].data_ptr(),
-            n_q_heads=NQ, eps=eps, stream=s)
-        fvk.qwen3_k_norm_rope_kvwrite_bf16(
-            k_pre=k.data_ptr(), v_pre=v.data_ptr(), k_norm_w=w["kn"].data_ptr(),
-            cos=cos_t.data_ptr(), sin=sin_t.data_ptr(),
-            k_cache_dst=self._attn.K_cache[L, t:t + 1].data_ptr(),
-            v_cache_dst=self._attn.V_cache[L, t:t + 1].data_ptr(),
-            n_kv_heads=NKV, eps=eps, stream=s)
-        self._attn.run("full", L, 1, kv_seq=t + 1, causal=True,
-                       softmax_scale=HD ** -0.5)
-        ao = self._attn.O_buf[:, :1].reshape(1, NQ * HD).to(bf16)
-        h = (h.float() + mm(ao, w["o"], 1, H, NQ * HD).float()).to(bf16)
-        xn2 = rms(h, w["post_norm"], 1, H)
-        gate = mm(xn2, w["gate"], 1, INTER, H)
-        up = mm(xn2, w["up"], 1, INTER, H)
-        act = torch.empty(1, INTER, device=self.device, dtype=bf16)
-        fvk.silu_mul_qwen36_bf16(gate.contiguous().data_ptr(),
-                                 up.contiguous().data_ptr(),
-                                 act.data_ptr(), INTER, s)
-        h = (h.float() + mm(act, w["down"], 1, H, INTER).float()).to(bf16)
-        return h
-
-    def _step(self, fvk, embed_row, t):
-        c = self._cfg
-        H = c["hidden"]
-        h = embed_row
-        for L in range(c["num_layers"]):
-            h = self._layer(fvk, L, h, t)
-        s = torch.cuda.current_stream().cuda_stream
-        hn = torch.empty(1, H, device=self.device, dtype=torch.bfloat16)
-        fvk.rms_norm(h.contiguous().data_ptr(),
-                     self._weights["final_norm"].data_ptr(),
-                     hn.data_ptr(), 1, H, c["rms_norm_eps"], s)
-        return hn
-
-    def _logits(self, hn):
-        cb = self._weights["codebook"]
-        nc, cv = self._cfg["num_codebooks"], self._cfg["codebook_vocab"]
-        return (hn.float() @ cb.float().t()).view(nc, cv)
-
     def _embed_codes(self, codes):
         cb = self._weights["codebook"]
         ids = codes.to(self.device).long() + self._cb_offsets
@@ -304,17 +230,31 @@ class HiggsAudioV3TorchFrontendRtx:
         self._attn.reset_cache()
         self._resident_ids = None      # KV zeroed; nothing reusable resident
 
-    # ── FP8 / codec lazy init ──
+    # ── decoder / codec lazy init ──
 
-    def _ensure_fp8(self) -> None:
-        if self._fp8_decoder is not None:
+    def _ensure_decoder(self) -> None:
+        """Build the active decode engine: FP8 (W8A8, static-calibrated) when
+        ``fp8`` else BF16 (W16A16). Both expose the same surface — step /
+        prefill_batched(start_pos) / capture_graph / decode_graph — so the
+        frontend drives them identically (kernelised step + position-agnostic
+        graph + batched prefill + prefix reuse)."""
+        if self._dec is not None:
             return
-        from flash_rt.frontends.torch._higgs_audio_v3_fp8 import (
-            HiggsAudioV3Fp8Decoder,
-        )
-        dec = HiggsAudioV3Fp8Decoder(self)
-        dec.calibrate(self._prompt_ids)   # static activation scales (one-time)
-        self._fp8_decoder = dec
+        if self.fp8:
+            from flash_rt.frontends.torch._higgs_audio_v3_fp8 import (
+                HiggsAudioV3Fp8Decoder,
+            )
+            dec = HiggsAudioV3Fp8Decoder(self)
+            dec.calibrate(self._prompt_ids)   # static activation scales (once)
+        else:
+            from flash_rt.frontends.torch._higgs_audio_v3_bf16 import (
+                HiggsAudioV3Bf16Decoder,
+            )
+            dec = HiggsAudioV3Bf16Decoder(self)
+        self._dec = dec
+        self._fp8_decoder = dec if self.fp8 else None   # back-compat alias
+
+    _ensure_fp8 = _ensure_decoder        # back-compat alias
 
     def _ensure_codec(self) -> None:
         if self._codec is not None:
@@ -325,15 +265,13 @@ class HiggsAudioV3TorchFrontendRtx:
 
     def _frame_logits(self, fvk, embed_row, t):
         """[num_codebooks, codebook_vocab] logits for one frame at position t."""
-        if self.fp8:
-            self._fp8_decoder.set_input(embed_row)
-            return self._fp8_decoder.step(t)[0]
-        return self._logits(self._step(fvk, embed_row, t))
+        self._dec.set_input(embed_row)
+        return self._dec.step(t)[0]
 
     def _decode_logits(self, fvk, embed_row, t):
         """Decode-position logits; uses the position-agnostic graph when on."""
         if self._use_graph:
-            dec = self._fp8_decoder
+            dec = self._dec
             if getattr(dec, "_graph", None) is None:
                 dec.capture_graph(embed_row, t)   # one-time, any position
             return dec.decode_graph(embed_row, t)[0]
@@ -377,8 +315,7 @@ class HiggsAudioV3TorchFrontendRtx:
             self._prompt_ids = list(prompt_ids)
         if self._prompt_ids is None:
             raise RuntimeError("no prompt set; call set_prompt()/pass prompt_ids")
-        if self.fp8:
-            self._ensure_fp8()
+        self._ensure_decoder()
         P = len(self._prompt_ids)
         batched = self._batched_prefill and P <= self._attn._max_q_seq
         # Validate the cached-prefix claim against the resident KV (safety: never
@@ -392,7 +329,7 @@ class HiggsAudioV3TorchFrontendRtx:
             self._attn.reset_cache()      # cold prefill writes KV from pos 0
             cached_tokens = 0
         if batched:
-            self._gen_logits = self._fp8_decoder.prefill_batched(
+            self._gen_logits = self._dec.prefill_batched(
                 self._prompt_ids, start_pos=cached_tokens)[0]
         else:
             te = self._weights["text_embed"]

@@ -16,6 +16,7 @@
 #include "gemm/fp8_smallM_handtuned_splitk_sm120.cuh"
 #include "gemm/fp8_smallM_handtuned_ldmatrix_sm120.cuh"
 #include "gemm/fp8_gemv_m1_sm120.cuh"
+#include "gemm/bf16_gemv_m1_sm120.cuh"
 #endif
 #ifdef ENABLE_CUTLASS_SM120_NVFP4_W4A16
 #include "gemm/fp4/cutlass_nvfp4_w4a16_gemm_sm120.cuh"
@@ -5261,6 +5262,11 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     BIND_GEMV_M1(gemv_fp8_m1_w16);
     BIND_GEMV_M1(gemv_fp8_m1_resadd_w4);
     BIND_GEMV_M1(gemv_fp8_m1_resadd_w8);
+
+    // Dedicated M=1 BF16 GEMV (all-BF16 decode; no smem A-stage -> full occ).
+    BIND_GEMV_M1(gemv_bf16_m1_w4);
+    BIND_GEMV_M1(gemv_bf16_m1_w8);
+    BIND_GEMV_M1(gemv_bf16_m1_w16);
 
 #undef BIND_GEMV_M1
 #endif
