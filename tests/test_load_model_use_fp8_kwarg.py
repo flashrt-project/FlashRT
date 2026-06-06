@@ -63,6 +63,54 @@ def test_predict_refreshes_prompt_when_prompt_state_changes():
     assert TokenStateFrontend.prompt_states == [state0, state1]
 
 
+def test_predict_refreshes_prompt_when_prompt_state_is_removed():
+    from flash_rt.api import VLAModel
+
+    image = object()
+    state0 = [0.0, 1.0]
+
+    class TokenStateFrontend:
+        prompt_states = []
+
+        def set_prompt(self, prompt, state=None):
+            type(self).prompt_states.append(
+                None if state is None else list(state))
+
+        def infer(self, obs):
+            return {"actions": None}
+
+    TokenStateFrontend.prompt_states = []
+    model = VLAModel(TokenStateFrontend(), framework="torch")
+    model.predict(images=[image], prompt="pick", state=state0)
+    model.predict(images=[image], state=None)
+
+    assert TokenStateFrontend.prompt_states == [state0, None]
+
+
+def test_manual_set_prompt_tracks_prompt_state():
+    from flash_rt.api import VLAModel
+
+    image = object()
+    state0 = [0.0, 1.0]
+
+    class TokenStateFrontend:
+        prompt_states = []
+
+        def set_prompt(self, prompt, state=None):
+            type(self).prompt_states.append(
+                None if state is None else list(state))
+
+        def infer(self, obs):
+            return {"actions": None}
+
+    TokenStateFrontend.prompt_states = []
+    model = VLAModel(TokenStateFrontend(), framework="torch")
+    model.set_prompt("pick", state=state0)
+    model.predict(images=[image], state=None)
+
+    assert TokenStateFrontend.prompt_states == [state0, None]
+
+
 def test_predict_preserves_state_from_observation_dict():
     from flash_rt.api import VLAModel
 
