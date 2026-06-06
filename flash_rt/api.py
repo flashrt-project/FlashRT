@@ -94,7 +94,7 @@ class VLAModel:
             import inspect
             sig = inspect.signature(self._pipe.set_prompt)
             prompt_accepts_state = 'state' in sig.parameters
-            if prompt_accepts_state and state is not None:
+            if prompt_accepts_state:
                 prompt_state_changed = not self._prompt_state_equal(
                     self._current_prompt_state, state)
         else:
@@ -187,6 +187,21 @@ class VLAModel:
             self._current_prompt = kwargs["prompt"]
         elif args and isinstance(args[0], str):
             self._current_prompt = args[0]
+        try:
+            import inspect
+            sig = inspect.signature(self._pipe.set_prompt)
+            params = list(sig.parameters)
+            if "state" in sig.parameters:
+                state_pos = params.index("state")
+                if "state" in kwargs:
+                    state = kwargs["state"]
+                elif len(args) > state_pos:
+                    state = args[state_pos]
+                else:
+                    state = None
+                self._current_prompt_state = self._snapshot_prompt_state(state)
+        except (TypeError, ValueError):
+            pass
         return result
 
     def infer(self, *args, **kwargs):
