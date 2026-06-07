@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import types
+import ctypes
 import logging
 import os
 import pathlib
@@ -18,6 +19,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from safetensors.torch import load_file
 
 logger = logging.getLogger(__name__)
@@ -639,6 +641,7 @@ class Pi05TorchFrontendRocm:
         self,
         checkpoint: str,
         num_views: int = 2,
+        chunk_size: Optional[int] = None,
         autotune: int = 3,
         hardware: Optional[str] = None,
         num_steps: Optional[int] = None,
@@ -655,6 +658,7 @@ class Pi05TorchFrontendRocm:
 
         self.checkpoint = str(checkpoint)
         self.num_views = int(num_views)
+        self.chunk_size = int(chunk_size or 10)
         self.autotune = autotune
         self.hardware = hardware or "rocm"
         self._num_steps = int(num_steps or 10)
@@ -675,90 +679,133 @@ class Pi05TorchFrontendRocm:
         t0 = time.perf_counter()
         self._model, self._model_cfg, self._weight_path = _load_openpi_model(checkpoint)
         from openpi.models.tokenizer import PaligemmaTokenizer
+        from flash_rt.core.hip_buffer import _hip, _check
+        from flash_rt.frontends.torch.pi05_rocm_weights import (
+            build_rocm_vision_weights_from_openpi_model,
+        )
+        from flash_rt.models.pi05.pipeline_rocm import (
+            ACTION_DIM,
+            ENC_D,
+            Pi05PipelineRocm,
+        )
 
         self._tokenizer = PaligemmaTokenizer(max_len=self._model_cfg.max_token_len)
-        self._rocm_rms_norm_modules = _install_rocm_rms_norm(self._model, self.fvk)
-        self._rocm_fp8_linear_modules, self._rocm_fp8_sites = _install_rocm_fp8_linear(
-            self._model, self.fvk
+        self._hip = _hip
+        self._hip_check = _check
+        self._action_dim = ACTION_DIM
+        self._enc_dim = ENC_D
+        self._pipeline_cls = Pi05PipelineRocm
+        self._embedding_weight = (
+            self._model.paligemma_with_expert
+            .paligemma
+            .model
+            .language_model
+            .embed_tokens
+            .weight
+            .detach()
+            .to(device="cuda", dtype=torch.bfloat16)
+            .contiguous()
         )
-        self._rocm_fp8_calibrated = not self._rocm_fp8_sites
-        self._rocm_fp8_mlp_fused_modules = _install_rocm_fp8_gemma_mlp_fusion(
-            self._model, self.fvk
+        self._weights = build_rocm_vision_weights_from_openpi_model(
+            self._model,
+            chunk_size=self.chunk_size,
+            num_steps=self._num_steps,
+            include_fp8=self.use_fp8,
         )
-        self._rocm_bf16_mlp_fused_modules = (
-            0
-            if self._rocm_fp8_linear_modules
-            else _install_rocm_bf16_gemma_mlp_fusion(self._model, self.fvk)
+        self._pipeline = None
+        self._current_prompt_len = 0
+        self._graph_recorded = False
+        self._graph_torch_stream = torch.cuda.Stream()
+        self._img_buf = torch.empty(
+            self.num_views, 224, 224, 3, dtype=torch.bfloat16, device="cuda"
         )
-        self._rocm_linear_modules = (
-            0
-            if self._rocm_fp8_linear_modules or self._rocm_bf16_mlp_fused_modules
-            else _install_rocm_linear(self._model, self.fvk)
+        self._noise_buf = torch.zeros(
+            self.chunk_size, ACTION_DIM, dtype=torch.bfloat16, device="cuda"
         )
-        self._rocm_mlp_activation_modules = _install_rocm_gemma_mlp_activation(
-            self._model, self.fvk
+        self._noise_out = torch.empty(
+            self.chunk_size, ACTION_DIM, dtype=torch.bfloat16, device="cuda"
         )
-        self._rocm_siglip_mlp_activation_modules = _install_rocm_siglip_mlp_activation(
-            self._model, self.fvk
-        )
+        self._rocm_rms_norm_modules = 0
+        self._rocm_linear_modules = 0
+        self._rocm_fp8_linear_modules = 0
+        self._rocm_fp8_mlp_fused_modules = 0
+        self._rocm_bf16_mlp_fused_modules = 0
+        self._rocm_mlp_activation_modules = 0
+        self._rocm_siglip_mlp_activation_modules = 0
+        self._rocm_fp8_sites = []
+        self._rocm_fp8_calibrated = not self.use_fp8
         self.fvk.hip_sync()
         logger.info(
-            "Pi05TorchFrontendRocm loaded %s in %.3fs "
-            "(rocm_rms_norm_modules=%d, rocm_linear_modules=%d, "
-            "rocm_fp8_linear_modules=%d, rocm_mlp_activation_modules=%d, "
-            "rocm_siglip_mlp_activation_modules=%d, "
-            "rocm_fp8_mlp_fused_modules=%d, "
-            "rocm_bf16_mlp_fused_modules=%d)",
+            "Pi05TorchFrontendRocm loaded %s in %.3fs (pipeline bf16 graph path)",
             self._weight_path,
             time.perf_counter() - t0,
-            self._rocm_rms_norm_modules,
-            self._rocm_linear_modules,
-            self._rocm_fp8_linear_modules,
-            self._rocm_mlp_activation_modules,
-            self._rocm_siglip_mlp_activation_modules,
-            self._rocm_fp8_mlp_fused_modules,
-            self._rocm_bf16_mlp_fused_modules,
         )
 
-    def set_prompt(self, prompt_text: str) -> None:
+    def _embed_prompt(self, prompt_text: str, state=None):
+        tokens_np, mask_np = self._tokenizer.tokenize(prompt_text, state=state)
+        prompt_len = int(mask_np.sum())
+        token_ids = torch.as_tensor(
+            tokens_np[:prompt_len],
+            dtype=torch.long,
+            device="cuda",
+        )
+        embeds = F.embedding(token_ids, self._embedding_weight)
+        embeds = embeds * float(embeds.shape[-1] ** 0.5)
+        return embeds.contiguous(), prompt_len
+
+    def _ensure_pipeline(self, prompt_len: int):
+        if self._pipeline is not None and prompt_len == self._current_prompt_len:
+            return
+        self._pipeline = self._pipeline_cls.with_sdpa_attention(
+            num_views=self.num_views,
+            max_prompt_len=int(prompt_len),
+            chunk_size=self.chunk_size,
+            num_steps=self._num_steps,
+        )
+        self._pipeline.configure_runtime(
+            self.fvk,
+            self._weights,
+            use_fp8=self.use_fp8,
+        )
+        self._current_prompt_len = int(prompt_len)
+        self._graph_recorded = False
+
+    def _set_prompt_embeds(self, prompt_text: str, state=None) -> None:
+        embeds, prompt_len = self._embed_prompt(prompt_text, state=state)
+        self._ensure_pipeline(prompt_len)
+        embeds_np = embeds.view(torch.uint16).cpu().numpy()
+        self._pipeline.set_language_embeds(embeds_np)
+
+    def set_prompt(self, prompt_text: str, state=None) -> None:
         self._prompt_text = prompt_text
+        self._set_prompt_embeds(prompt_text, state=state)
 
     def calibrate_with_real_data(self, sample_observations) -> None:
-        if not self._rocm_fp8_sites:
-            return None
-
         observations = list(sample_observations or [])
         if not observations:
-            raise ValueError("ROCm FP8 calibration requires at least one observation")
-
-        for site in self._rocm_fp8_sites:
-            site.act_scale.zero_()
-            site.calibrating = True
-            site.ready = False
-
-        try:
-            with torch.inference_mode():
-                for observation in observations:
-                    obs = self._make_observation(observation)
-                    noise = torch.zeros(
-                        (
-                            1,
-                            self._model_cfg.action_horizon,
-                            self._model_cfg.action_dim,
-                        ),
-                        dtype=torch.float32,
-                        device="cuda",
-                    )
-                    self._model.sample_actions(
-                        "cuda", obs, noise=noise, num_steps=self._num_steps
-                    )
-                torch.cuda.synchronize()
-        finally:
-            for site in self._rocm_fp8_sites:
-                site.calibrating = False
-                site.ready = True
-            self._rocm_fp8_calibrated = True
-            self.fvk.hip_sync()
+            raise ValueError("ROCm graph preparation requires at least one observation")
+        observation = observations[0]
+        state = observation.get("state")
+        prompt_text = "" if self._prompt_text is None else self._prompt_text
+        self._set_prompt_embeds(prompt_text, state=state)
+        with torch.cuda.stream(self._graph_torch_stream):
+            stream_int = int(self._graph_torch_stream.cuda_stream)
+            self._fill_img_buf(observation)
+            self._noise_buf.zero_()
+            self._copy_tensor_to_pipeline_buf_stream(
+                self._img_buf, self._pipeline.input_images_buf, stream_int
+            )
+            self._copy_tensor_to_pipeline_buf_stream(
+                self._noise_buf, self._pipeline.input_noise_buf, stream_int
+            )
+            if self.use_fp8:
+                self._pipeline.calibrate_fp8(self.fvk, self._weights, stream=stream_int)
+                self._pipeline.capture_fp8_graph(self.fvk, self._weights)
+                self._rocm_fp8_calibrated = True
+            else:
+                self._pipeline.capture_bf16_graph(self.fvk, self._weights)
+        torch.cuda.synchronize()
+        self._graph_recorded = True
         return None
 
     calibrate = calibrate_with_real_data
@@ -780,6 +827,31 @@ class Pi05TorchFrontendRocm:
         else:
             images = images[:3]
         return [np.asarray(img) for img in images]
+
+    def _fill_img_buf(self, observation: dict) -> None:
+        images = self._images_from_observation(observation)
+        for v, img in enumerate(images[: self.num_views]):
+            if img.shape != (224, 224, 3):
+                raise ValueError(
+                    f"ROCm Pi0.5 frontend expects 224x224x3 uint8 images, got {img.shape}"
+                )
+            norm = torch.from_numpy(img.astype(np.float32) / 127.5 - 1.0)
+            self._img_buf[v].copy_(norm.to(device="cuda", dtype=torch.bfloat16))
+
+    def _copy_tensor_to_pipeline_buf_stream(self, src: torch.Tensor, dst_buf, stream_int: int):
+        nbytes = src.numel() * src.element_size()
+        if nbytes != dst_buf.nbytes:
+            raise ValueError(f"size mismatch: src {nbytes} vs dst {dst_buf.nbytes}")
+        self._hip_check(
+            self._hip.hipMemcpyAsync(
+                dst_buf.ptr,
+                ctypes.c_void_p(int(src.data_ptr())),
+                nbytes,
+                3,
+                ctypes.c_void_p(int(stream_int)),
+            ),
+            "hipMemcpyAsync tensor to Pi0.5 ROCm buffer",
+        )
 
     def _make_observation(self, observation: dict):
         from openpi.models import model as openpi_model
@@ -848,34 +920,57 @@ class Pi05TorchFrontendRocm:
         )
 
     def infer(self, observation: dict, debug: bool = False) -> dict:
-        if self._rocm_fp8_sites and not self._rocm_fp8_calibrated:
-            raise RuntimeError(
-                "ROCm FP8 Linear path requires static calibration before infer(). "
-                "Call calibrate_with_real_data([observation]) first."
-            )
-        obs = self._make_observation(observation)
-        noise = torch.zeros(
-            (1, self._model_cfg.action_horizon, self._model_cfg.action_dim),
-            dtype=torch.float32,
-            device="cuda",
-        )
+        state = observation.get("state")
+        prompt_text = "" if self._prompt_text is None else self._prompt_text
+        self._set_prompt_embeds(prompt_text, state=state)
 
-        with torch.inference_mode():
-            t0 = time.perf_counter()
-            out = self._model.sample_actions(
-                "cuda", obs, noise=noise, num_steps=self._num_steps
+        with torch.inference_mode(), torch.cuda.stream(self._graph_torch_stream):
+            stream_int = int(self._graph_torch_stream.cuda_stream)
+            self._fill_img_buf(observation)
+            self._noise_buf.zero_()
+            self._copy_tensor_to_pipeline_buf_stream(
+                self._img_buf, self._pipeline.input_images_buf, stream_int
             )
-            torch.cuda.synchronize()
+            self._copy_tensor_to_pipeline_buf_stream(
+                self._noise_buf, self._pipeline.input_noise_buf, stream_int
+            )
+            if not self._graph_recorded:
+                if self.use_fp8:
+                    self._pipeline.calibrate_fp8(self.fvk, self._weights, stream=stream_int)
+                    self._pipeline.capture_fp8_graph(self.fvk, self._weights)
+                    self._rocm_fp8_calibrated = True
+                else:
+                    self._pipeline.capture_bf16_graph(self.fvk, self._weights)
+                self._graph_recorded = True
+
+            t0 = time.perf_counter()
+            out_ptr = self._pipeline.forward()
+            self._hip_check(
+                self._hip.hipMemcpyAsync(
+                    ctypes.c_void_p(int(self._noise_out.data_ptr())),
+                    ctypes.c_void_p(int(out_ptr)),
+                    self._noise_out.numel() * self._noise_out.element_size(),
+                    3,
+                    ctypes.c_void_p(stream_int),
+                ),
+                "hipMemcpyAsync Pi0.5 ROCm output",
+            )
+            self._hip_check(
+                self._hip.hipStreamSynchronize(ctypes.c_void_p(stream_int)),
+                "hipStreamSynchronize Pi0.5 ROCm infer",
+            )
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
         self._latency_records.append(elapsed_ms)
-        actions = out[0].detach().float().cpu().numpy()
+        actions = self._noise_out.float().cpu().numpy()
         result = {"actions": actions}
         if debug:
             result["debug"] = {
                 "backend": "rocm",
                 "infer_ms": elapsed_ms,
-                "prompt_tokens": int(obs.tokenized_prompt_mask.sum().item()),
+                "prompt_tokens": int(self._current_prompt_len),
+                "pipeline_graph_recorded": bool(self._graph_recorded),
+                "pipeline_path": "fp8_graph" if self.use_fp8 else "bf16_graph",
                 "rocm_rms_norm_modules": self._rocm_rms_norm_modules,
                 "rocm_linear_modules": self._rocm_linear_modules,
                 "rocm_fp8_linear_modules": self._rocm_fp8_linear_modules,

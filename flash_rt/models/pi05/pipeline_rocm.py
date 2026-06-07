@@ -229,6 +229,12 @@ class Pi05PipelineRocm:
         self.fp8_calibrated = False
         self._aiter_scale_tensors = {}
         self._build_rope_table()
+        self._rocm_kernels = None
+        self._weights = None
+        self._runtime_use_fp8 = False
+        self._runtime_vision_num_layers = VIS_L
+        self._runtime_encoder_num_layers = ENC_L
+        self._runtime_decoder_num_layers = DEC_L
 
     @classmethod
     def with_sdpa_attention(cls, **kwargs):
@@ -370,6 +376,86 @@ class Pi05PipelineRocm:
     @property
     def input_encoder_x_buf(self) -> HipBuffer:
         return self.bufs["encoder_x"]
+
+    def configure_runtime(
+        self,
+        rocm_kernels,
+        weights,
+        *,
+        use_fp8: bool = False,
+        vision_num_layers: int = VIS_L,
+        encoder_num_layers: int = ENC_L,
+        decoder_num_layers: int = DEC_L,
+    ) -> None:
+        """Bind kernels, weights, and layer counts for ``forward``.
+
+        Frontends own framework-specific weight loading. The pipeline owns the
+        steady-state execution contract, so the hot path can replay the same
+        graph without passing Python-side execution arguments.
+        """
+        self._rocm_kernels = rocm_kernels
+        self._weights = weights
+        self._runtime_use_fp8 = bool(use_fp8)
+        self._runtime_vision_num_layers = _check_layer_count(
+            "vision_num_layers", vision_num_layers, VIS_L
+        )
+        self._runtime_encoder_num_layers = _check_layer_count(
+            "encoder_num_layers", encoder_num_layers, ENC_L
+        )
+        self._runtime_decoder_num_layers = _check_layer_count(
+            "decoder_num_layers", decoder_num_layers, DEC_L
+        )
+
+    def set_language_embeds(self, lang_embeds_np) -> None:
+        """Store prompt embeddings and copy them into ``encoder_x``.
+
+        The encoder residual stream overwrites the language slice in-place.
+        Keeping a persistent device copy lets every graph replay restore the
+        exact prompt embedding bytes before running the encoder.
+        """
+        arr = np.ascontiguousarray(lang_embeds_np)
+        if arr.ndim != 2 or arr.shape[1] != ENC_D:
+            raise ValueError(
+                f"language embeds must have shape (prompt_len, {ENC_D}), got {arr.shape}"
+            )
+        if arr.shape[0] > self.max_prompt_len:
+            raise ValueError(
+                f"prompt_len {arr.shape[0]} exceeds max_prompt_len {self.max_prompt_len}"
+            )
+        if hasattr(self, "_lang_embeds_buf") and self._lang_embeds_buf.nbytes == arr.nbytes:
+            self._lang_embeds_buf.upload(arr)
+        else:
+            self._lang_embeds_buf = HipBuffer.from_numpy(arr)
+        self._current_prompt_len = int(arr.shape[0])
+        self._copy_lang_embeds_to_encoder_x()
+
+    def _copy_lang_embeds_to_encoder_x(self, stream: int = 0) -> None:
+        if not hasattr(self, "_lang_embeds_buf"):
+            return
+        start_byte = self.vision_seq_enc * ENC_D * 2
+        dst_ptr = ctypes.c_void_p(self.bufs["encoder_x"].ptr.value + start_byte)
+        src_ptr = self._lang_embeds_buf.ptr
+        if stream:
+            _check(
+                _hip.hipMemcpyAsync(
+                    dst_ptr,
+                    src_ptr,
+                    self._lang_embeds_buf.nbytes,
+                    3,
+                    ctypes.c_void_p(int(stream)),
+                ),
+                "hipMemcpyAsync language embeds",
+            )
+        else:
+            _check(
+                _hip.hipMemcpy(
+                    dst_ptr,
+                    src_ptr,
+                    self._lang_embeds_buf.nbytes,
+                    3,
+                ),
+                "hipMemcpy language embeds",
+            )
 
     def copy_device_to_buffer(self, dst_name: str, src_ptr: int, nbytes: int) -> None:
         dst = self.bufs[dst_name]
@@ -2690,6 +2776,7 @@ class Pi05PipelineRocm:
         by the frontend before this call; the vision projector overwrites only
         the visual prefix.
         """
+        self._copy_lang_embeds_to_encoder_x(stream)
         self.vision_encoder_to_encoder_x_bf16(
             rocm_kernels,
             weights,
@@ -2729,6 +2816,7 @@ class Pi05PipelineRocm:
             raise RuntimeError(
                 "run_fp8_pipeline requires weights built with include_fp8=True"
             )
+        self._copy_lang_embeds_to_encoder_x(stream)
         self.vision_encoder_to_encoder_x_fp8(
             rocm_kernels,
             weights,
@@ -3187,9 +3275,38 @@ class Pi05PipelineRocm:
         )
 
     def run_pipeline(self, stream: int = 0) -> None:
-        raise NotImplementedError("Pi05PipelineRocm BF16 execution is not ported yet")
+        if self._rocm_kernels is None or self._weights is None:
+            raise RuntimeError("Pi05PipelineRocm runtime is not configured")
+        if self._runtime_use_fp8:
+            self.run_fp8_pipeline(
+                self._rocm_kernels,
+                self._weights,
+                vision_num_layers=self._runtime_vision_num_layers,
+                encoder_num_layers=self._runtime_encoder_num_layers,
+                decoder_num_layers=self._runtime_decoder_num_layers,
+                stream=stream,
+            )
+        else:
+            self.run_bf16_pipeline(
+                self._rocm_kernels,
+                self._weights,
+                vision_num_layers=self._runtime_vision_num_layers,
+                encoder_num_layers=self._runtime_encoder_num_layers,
+                decoder_num_layers=self._runtime_decoder_num_layers,
+                stream=stream,
+            )
 
     def forward(self) -> int:
+        if self._runtime_use_fp8:
+            graph = getattr(self, "_fp8_graph", None)
+            if graph is not None:
+                self.replay_fp8_graph()
+                return self.bufs["diffusion_noise"].ptr.value
+        else:
+            graph = getattr(self, "_bf16_graph", None)
+            if graph is not None:
+                self.replay_bf16_graph()
+                return self.bufs["diffusion_noise"].ptr.value
         self.run_pipeline(stream=0)
         _check(_hip.hipDeviceSynchronize(), "hipDeviceSynchronize")
         return self.bufs["diffusion_noise"].ptr.value
