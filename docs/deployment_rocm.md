@@ -36,6 +36,27 @@ GPU_ARCH=gfx942 bash scripts/build_rocm_kernels.sh
 Set `GPU_ARCH` to the target offload architecture for the deployment card.
 The default is `gfx942`.
 
+## Hardware Tiers
+
+ROCm support is capability-gated by the GPU architecture and the installed
+ROCm libraries.
+
+Compatibility tier:
+
+- Typical architecture: `gfx1100` / Navi 31 / Radeon PRO W7900-class devices.
+- Expected use: build validation, BF16 kernels, HIP buffers, ROCm attention,
+  Pi0.5 BF16 pipeline, and public frontend routing.
+- FP8 status: PyTorch may expose FP8 dtypes, but hipBLASLt may not return a
+  usable FP8 GEMM/Linear algorithm. FP8 tests and benchmarks report this as a
+  runtime capability boundary.
+
+Performance tier:
+
+- Typical architecture: `gfx942` / Instinct MI300-class devices.
+- Expected use: BF16 plus FP8 GEMM/Linear performance validation.
+- FP8 status: this is the target tier for enabling and tuning the static FP8
+  Pi0.5 pipeline.
+
 ## Validation
 
 Run the ROCm unit tests from the repository root:
