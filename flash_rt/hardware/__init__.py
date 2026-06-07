@@ -6,7 +6,7 @@ Detects the current GPU's compute capability and maps
 
 ``flash_rt.api.load_model`` calls ``resolve_pipeline_class`` so user
 code doesn't need to know whether it's running on Jetson Thor (SM110),
-an RTX 5090 (SM120), or an RTX 4090 (SM89).
+an RTX 5090 (SM120), an RTX 4090 (SM89), or an AMD ROCm runtime.
 
 Adding a new model
 -------------------
@@ -30,15 +30,16 @@ from __future__ import annotations
 
 
 def detect_arch() -> str:
-    """Return a short string identifier for the current CUDA device.
+    """Return a short string identifier for the current accelerator.
 
     Supported:
         ``"thor"``      — Jetson AGX Thor, SM110 (cc 11.0)
         ``"rtx_sm120"`` — RTX 5090 / Blackwell consumer, SM120 (cc 12.0)
         ``"rtx_sm89"``  — RTX 4090 / Ada, SM89 (cc 8.9)
         ``"rtx_sm87"``  — Jetson Orin via RTX consumer backend, SM87 (cc 8.7)
+        ``"rocm"``      — AMD ROCm/HIP torch backend
 
-    Raises RuntimeError if CUDA is unavailable or the card has an
+    Raises RuntimeError if CUDA/HIP is unavailable or the card has an
     unsupported SM level. Deliberately strict: silently falling back to
     the wrong backend would hide latency/correctness regressions.
     """
@@ -49,8 +50,10 @@ def detect_arch() -> str:
             "FlashRT requires PyTorch for GPU detection") from e
     if not torch.cuda.is_available():
         raise RuntimeError(
-            "FlashRT requires a CUDA-capable GPU "
+            "FlashRT requires a CUDA/HIP-capable GPU "
             "(torch.cuda.is_available()==False)")
+    if getattr(torch.version, "hip", None):
+        return "rocm"
     major, minor = torch.cuda.get_device_capability()
     if (major, minor) == (11, 0):
         return "thor"
@@ -63,7 +66,7 @@ def detect_arch() -> str:
     raise RuntimeError(
         f"FlashRT: unsupported GPU SM {major}.{minor}. "
         f"Supported architectures: SM110 (Thor), SM120 (RTX 5090), "
-        f"SM89 (RTX 4090), SM87 (Jetson Orin experimental)."
+        f"SM89 (RTX 4090), SM87 (Jetson Orin)."
     )
 
 
@@ -81,6 +84,8 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
         ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
     ("pi05", "torch", "rtx_sm89"):
         ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
+    ("pi05", "torch", "rocm"):
+        ("flash_rt.frontends.torch.pi05_rocm", "Pi05TorchFrontendRocm"),
     ("pi05", "jax", "thor"):
         ("flash_rt.frontends.jax.pi05_thor", "Pi05JaxFrontendThor"),
     ("pi05", "jax", "rtx_sm120"):
@@ -122,7 +127,7 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("motus", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.motus_rtx", "MotusTorchFrontendRtx"),
 
-    # ── Wan2.2 TI2V-5B official pipeline baseline ──
+    # ── Wan2.2 TI2V-5B official pipeline ──
     ("wan22_ti2v_5b", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.wan22_rtx", "Wan22TorchFrontendRtx"),
 
