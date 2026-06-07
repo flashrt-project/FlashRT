@@ -237,8 +237,14 @@ class Pi05PipelineRocm:
         self._runtime_decoder_num_layers = DEC_L
 
     @classmethod
-    def with_sdpa_attention(cls, **kwargs):
-        """Construct the BF16 pipeline plus the ROCm SDPA attention bridge."""
+    def with_rocm_attention(
+        cls,
+        *,
+        preferred_backend: str = "flash",
+        decoder_preferred_backend: str | None = "flash",
+        **kwargs,
+    ):
+        """Construct the pipeline with the ROCm FlashAttention backend."""
         from flash_rt.hardware.rocm.attn_backend import RocmSdpaAttnBackend
 
         pipe = cls(**kwargs)
@@ -247,9 +253,16 @@ class Pi05PipelineRocm:
             pipe.encoder_seq_len,
             pipe.chunk_size,
             num_encoder_layers=ENC_L,
+            preferred_backend=preferred_backend,
+            decoder_preferred_backend=decoder_preferred_backend,
         )
         pipe._attn_ptrs = pipe.attn.get_ptrs()
         return pipe
+
+    @classmethod
+    def with_sdpa_attention(cls, **kwargs):
+        """Backward-compatible alias for ``with_rocm_attention``."""
+        return cls.with_rocm_attention(**kwargs)
 
     def _allocate_buffers(self) -> dict[str, HipBuffer]:
         nv = self.num_views

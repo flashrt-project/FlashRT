@@ -141,6 +141,8 @@ class Pi05TorchFrontendRocm:
         hardware: Optional[str] = None,
         num_steps: Optional[int] = None,
         use_fp8: bool = False,
+        attn_backend: str = "flash",
+        decoder_attn_backend: Optional[str] = "flash",
         **_unused,
     ):
         if not torch.cuda.is_available() or not getattr(torch.version, "hip", None):
@@ -157,6 +159,8 @@ class Pi05TorchFrontendRocm:
         self.autotune = autotune
         self.hardware = hardware or "rocm"
         self._num_steps = int(num_steps or 10)
+        self._attn_backend = str(attn_backend)
+        self._decoder_attn_backend = decoder_attn_backend
         self._prompt_text: str | None = None
         self._latency_records: list[float] = []
         self.fvk = rocm_kernels
@@ -251,11 +255,13 @@ class Pi05TorchFrontendRocm:
     def _ensure_pipeline(self, prompt_len: int):
         if self._pipeline is not None and prompt_len == self._current_prompt_len:
             return
-        self._pipeline = self._pipeline_cls.with_sdpa_attention(
+        self._pipeline = self._pipeline_cls.with_rocm_attention(
             num_views=self.num_views,
             max_prompt_len=int(prompt_len),
             chunk_size=self.chunk_size,
             num_steps=self._num_steps,
+            preferred_backend=self._attn_backend,
+            decoder_preferred_backend=self._decoder_attn_backend,
         )
         self._pipeline.configure_runtime(
             self.fvk,
@@ -466,6 +472,8 @@ class Pi05TorchFrontendRocm:
                 "prompt_tokens": int(self._current_prompt_len),
                 "pipeline_graph_recorded": bool(self._graph_recorded),
                 "pipeline_path": "fp8_graph" if self.use_fp8 else "bf16_graph",
+                "attn_backend": self._pipeline.attn.active_backend_name,
+                "decoder_attn_backend": self._pipeline.attn.decoder_backend_name,
                 "rocm_rms_norm_modules": self._rocm_rms_norm_modules,
                 "rocm_linear_modules": self._rocm_linear_modules,
                 "rocm_fp8_linear_modules": self._rocm_fp8_linear_modules,

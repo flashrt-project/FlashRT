@@ -1,11 +1,15 @@
-"""ROCm attention backend for FlashRT-owned Pi0.5 buffers.
+"""ROCm FlashAttention backend for FlashRT-owned Pi0.5 buffers.
 
 This mirrors the RTX attention backend contract: the backend owns Q/K/V/O
-scratch tensors and exposes raw device pointers. The first AMD implementation
-uses PyTorch ROCm SDPA as a correctness bridge while the rest of the BF16
-pipeline is being kernelized. The call boundary is intentionally stable so the
-implementation can later be swapped to AOTriton, CK, or a custom HIP kernel
-without changing the Pi0.5 pipeline.
+scratch tensors and exposes raw device pointers. By default it routes through
+PyTorch ROCm's ``SDPBackend.FLASH_ATTENTION`` implementation, which is the
+ROCm-native FlashAttention path in the active torch build. If an external
+ROCm ``flash_attn`` package is installed, callers can request
+``preferred_backend='flash_attn'`` to use ``flash_attn_func`` directly.
+
+The call boundary is intentionally stable so the implementation can later be
+swapped to CK, AOTriton, or a custom HIP kernel without changing the Pi0.5
+pipeline/frontend contract.
 """
 
 from __future__ import annotations
@@ -67,7 +71,7 @@ def make_pi05_attention_spec(
 
 
 class RocmSdpaAttnBackend(AttentionBackendBase):
-    """Pi0.5 ROCm attention backend using preallocated BF16 scratch."""
+    """Pi0.5 ROCm FlashAttention backend using preallocated BF16 scratch."""
 
     def __init__(
         self,
