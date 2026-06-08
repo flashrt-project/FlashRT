@@ -117,6 +117,22 @@ the action chunk `[1,50,75]` vs the upstream LingBot BF16 PyTorch reference
 | FlashRT (FA4)           | 50 | 0.995455 | 155.8 ms |
 | FlashRT (fmha fallback) | 50 | 0.994928 | 193.8 ms |
 
+LingBot model cleanup baseline:
+
+| ns | Baseline latency |
+|---:|---:|
+| 5 | 1501 ms |
+| 10 | 1741 ms |
+| 50 | 2481 ms |
+
+TRT-aligned FP4 loop comparison, using the same quantization scheme:
+
+| steps | TRT aligned FP4 loop | FlashRT full E2E | Speedup |
+|------:|---------------------:|-----------------:|--------:|
+| 10 | ~122 ms | **64.1 ms** | **~1.9x** |
+| 25 | ~304 ms | **97.5 ms** | **~3.1x** |
+| 50 | ~608 ms | **155.8 ms** | **~3.9x** |
+
 - Reference: upstream LingBot BF16, fixed-noise action chunk, 10 denoise steps
   (`baseline_artifacts_10/outputs/actions.pt`). The 25/50-step rows are compared
   against the same 10-step reference, hence the slightly lower cosine — they are
