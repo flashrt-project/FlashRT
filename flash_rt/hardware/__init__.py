@@ -132,6 +132,18 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
         ("flash_rt.frontends.torch.wan22_rtx", "Wan22TorchFrontendRtx"),
 
     # ── Pi0-FAST ── (SM120 runtime fork inside pipeline, no AttentionBackend protocol.)
+    # Qwen dense text models.
+    ("qwen3", "torch", "rocm"):
+        ("flash_rt.frontends.torch.qwen3_rocm", "Qwen3TorchFrontendRocm"),
+    ("qwen3_rocm_owned", "torch", "rocm"):
+        ("flash_rt.frontends.torch.qwen3_rocm_owned",
+         "Qwen3RocmOwnedBF16Frontend"),
+    ("qwen36", "torch", "rocm"):
+        ("flash_rt.frontends.torch.qwen36_rocm", "Qwen36TorchFrontendRocm"),
+    ("qwen36_rocm_owned", "torch", "rocm"):
+        ("flash_rt.frontends.torch.qwen36_rocm_owned",
+         "Qwen36RocmOwnedFP8Frontend"),
+
     ("pi0fast", "torch", "thor"):
         ("flash_rt.frontends.torch.pi0fast", "Pi0FastTorchFrontend"),
     ("pi0fast", "torch", "rtx_sm120"):

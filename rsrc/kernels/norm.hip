@@ -99,6 +99,42 @@ __global__ void rms_norm_bf16_f32w_kernel(const hip_bfloat16* x,
   }
 }
 
+__global__ void rms_norm_bf16_plain_kernel(const hip_bfloat16* x,
+                                           const hip_bfloat16* weight,
+                                           hip_bfloat16* out,
+                                           int rows, int hidden, float eps) {
+  const int row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+
+  extern __shared__ float smem[];
+  float sum = 0.0f;
+  const int base = row * hidden;
+  for (int col = threadIdx.x; col < hidden; col += blockDim.x) {
+    const float v = static_cast<float>(x[base + col]);
+    sum += v * v;
+  }
+
+  smem[threadIdx.x] = sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      smem[threadIdx.x] += smem[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  const float inv = rsqrtf(smem[0] / static_cast<float>(hidden) + eps);
+  for (int col = threadIdx.x; col < hidden; col += blockDim.x) {
+    const int idx = base + col;
+    const float v = static_cast<float>(x[idx]);
+    const float w = static_cast<float>(weight[col]);
+    out[idx] = hip_bfloat16(v * inv * w);
+  }
+}
+
 __global__ void rms_norm_fp8_kernel(const hip_bfloat16* x,
                                     const hip_bfloat16* weight,
                                     __hip_fp8_e4m3_fnuz* out,
@@ -133,6 +169,44 @@ __global__ void rms_norm_fp8_kernel(const hip_bfloat16* x,
     const float v = static_cast<float>(x[idx]);
     const float w = static_cast<float>(weight[col]);
     out[idx] = __hip_fp8_e4m3_fnuz((v * inv * (1.0f + w)) / s);
+  }
+}
+
+__global__ void rms_norm_fp8_plain_kernel(const hip_bfloat16* x,
+                                          const hip_bfloat16* weight,
+                                          __hip_fp8_e4m3_fnuz* out,
+                                          int rows, int hidden, float eps,
+                                          const float* scale) {
+  const int row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+
+  extern __shared__ float smem[];
+  float sum = 0.0f;
+  const int base = row * hidden;
+  for (int col = threadIdx.x; col < hidden; col += blockDim.x) {
+    const float v = static_cast<float>(x[base + col]);
+    sum += v * v;
+  }
+  smem[threadIdx.x] = sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      smem[threadIdx.x] += smem[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  const float inv = rsqrtf(smem[0] / static_cast<float>(hidden) + eps);
+  const float s = scale[0];
+  for (int col = threadIdx.x; col < hidden; col += blockDim.x) {
+    const int idx = base + col;
+    const float v = static_cast<float>(x[idx]);
+    const float w = static_cast<float>(weight[col]);
+    const hip_bfloat16 rounded = hip_bfloat16(v * inv * w);
+    out[idx] = __hip_fp8_e4m3_fnuz(static_cast<float>(rounded) / s);
   }
 }
 
@@ -337,6 +411,50 @@ __global__ void residual_add_rms_norm_bf16_kernel(
   }
 }
 
+__global__ void residual_add_rms_norm_bf16_plain_kernel(
+    hip_bfloat16* residual,
+    const hip_bfloat16* x,
+    const hip_bfloat16* weight,
+    hip_bfloat16* out,
+    int rows,
+    int hidden,
+    float eps) {
+  const int row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+
+  extern __shared__ float smem[];
+  float sum = 0.0f;
+  const int base = row * hidden;
+  for (int col = threadIdx.x; col < hidden; col += blockDim.x) {
+    const int idx = base + col;
+    const hip_bfloat16 updated = hip_bfloat16(
+        static_cast<float>(residual[idx]) + static_cast<float>(x[idx]));
+    residual[idx] = updated;
+    const float v = static_cast<float>(updated);
+    sum += v * v;
+  }
+
+  smem[threadIdx.x] = sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      smem[threadIdx.x] += smem[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  const float inv = rsqrtf(smem[0] / static_cast<float>(hidden) + eps);
+  for (int col = threadIdx.x; col < hidden; col += blockDim.x) {
+    const int idx = base + col;
+    const float v = static_cast<float>(residual[idx]);
+    const float w = static_cast<float>(weight[col]);
+    out[idx] = hip_bfloat16(v * inv * w);
+  }
+}
+
 __global__ void residual_add_rms_norm_fp8_kernel(
     hip_bfloat16* residual,
     const hip_bfloat16* x,
@@ -379,6 +497,53 @@ __global__ void residual_add_rms_norm_fp8_kernel(
     const float v = static_cast<float>(residual[idx]);
     const float w = static_cast<float>(weight[col]);
     const hip_bfloat16 rounded = hip_bfloat16(v * inv * (1.0f + w));
+    out[idx] = __hip_fp8_e4m3_fnuz(static_cast<float>(rounded) / s);
+  }
+}
+
+__global__ void residual_add_rms_norm_fp8_plain_kernel(
+    hip_bfloat16* residual,
+    const hip_bfloat16* x,
+    const hip_bfloat16* weight,
+    __hip_fp8_e4m3_fnuz* out,
+    int rows,
+    int hidden,
+    float eps,
+    const float* scale) {
+  const int row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+
+  extern __shared__ float smem[];
+  float sum = 0.0f;
+  const int base = row * hidden;
+  for (int col = threadIdx.x; col < hidden; col += blockDim.x) {
+    const int idx = base + col;
+    const hip_bfloat16 updated = hip_bfloat16(
+        static_cast<float>(residual[idx]) + static_cast<float>(x[idx]));
+    residual[idx] = updated;
+    const float v = static_cast<float>(updated);
+    sum += v * v;
+  }
+
+  smem[threadIdx.x] = sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      smem[threadIdx.x] += smem[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  const float inv = rsqrtf(smem[0] / static_cast<float>(hidden) + eps);
+  const float s = scale[0];
+  for (int col = threadIdx.x; col < hidden; col += blockDim.x) {
+    const int idx = base + col;
+    const float v = static_cast<float>(residual[idx]);
+    const float w = static_cast<float>(weight[col]);
+    const hip_bfloat16 rounded = hip_bfloat16(v * inv * w);
     out[idx] = __hip_fp8_e4m3_fnuz(static_cast<float>(rounded) / s);
   }
 }
@@ -749,6 +914,19 @@ void launch_rms_norm_bf16_f32w(const void* x, const float* weight, void* out,
                      rows, hidden, eps);
 }
 
+void launch_rms_norm_bf16_plain(const void* x, const void* weight, void* out,
+                                int rows, int hidden, float eps, hipStream_t stream) {
+  if (rows <= 0 || hidden <= 0) {
+    return;
+  }
+  hipLaunchKernelGGL(rms_norm_bf16_plain_kernel,
+                     dim3(rows), dim3(kBlock), kBlock * sizeof(float), stream,
+                     static_cast<const hip_bfloat16*>(x),
+                     static_cast<const hip_bfloat16*>(weight),
+                     static_cast<hip_bfloat16*>(out),
+                     rows, hidden, eps);
+}
+
 void launch_rms_norm_fp8_e4m3fnuz(
     const void* x, const void* weight, void* out,
     int rows, int hidden, float eps, const float* scale,
@@ -757,6 +935,21 @@ void launch_rms_norm_fp8_e4m3fnuz(
     return;
   }
   hipLaunchKernelGGL(rms_norm_fp8_kernel,
+                     dim3(rows), dim3(kBlock), kBlock * sizeof(float), stream,
+                     static_cast<const hip_bfloat16*>(x),
+                     static_cast<const hip_bfloat16*>(weight),
+                     static_cast<__hip_fp8_e4m3_fnuz*>(out),
+                     rows, hidden, eps, scale);
+}
+
+void launch_rms_norm_fp8_e4m3fnuz_plain(
+    const void* x, const void* weight, void* out,
+    int rows, int hidden, float eps, const float* scale,
+    hipStream_t stream) {
+  if (rows <= 0 || hidden <= 0) {
+    return;
+  }
+  hipLaunchKernelGGL(rms_norm_fp8_plain_kernel,
                      dim3(rows), dim3(kBlock), kBlock * sizeof(float), stream,
                      static_cast<const hip_bfloat16*>(x),
                      static_cast<const hip_bfloat16*>(weight),
@@ -875,6 +1068,27 @@ void launch_residual_add_rms_norm_bf16(
                      rows, hidden, eps);
 }
 
+void launch_residual_add_rms_norm_bf16_plain(
+    void* residual,
+    const void* x,
+    const void* weight,
+    void* out,
+    int rows,
+    int hidden,
+    float eps,
+    hipStream_t stream) {
+  if (rows <= 0 || hidden <= 0) {
+    return;
+  }
+  hipLaunchKernelGGL(residual_add_rms_norm_bf16_plain_kernel,
+                     dim3(rows), dim3(kBlock), kBlock * sizeof(float), stream,
+                     static_cast<hip_bfloat16*>(residual),
+                     static_cast<const hip_bfloat16*>(x),
+                     static_cast<const hip_bfloat16*>(weight),
+                     static_cast<hip_bfloat16*>(out),
+                     rows, hidden, eps);
+}
+
 void launch_residual_add_rms_norm_fp8_e4m3fnuz(
     void* residual,
     const void* x,
@@ -889,6 +1103,28 @@ void launch_residual_add_rms_norm_fp8_e4m3fnuz(
     return;
   }
   hipLaunchKernelGGL(residual_add_rms_norm_fp8_kernel,
+                     dim3(rows), dim3(kBlock), kBlock * sizeof(float), stream,
+                     static_cast<hip_bfloat16*>(residual),
+                     static_cast<const hip_bfloat16*>(x),
+                     static_cast<const hip_bfloat16*>(weight),
+                     static_cast<__hip_fp8_e4m3_fnuz*>(out),
+                     rows, hidden, eps, scale);
+}
+
+void launch_residual_add_rms_norm_fp8_e4m3fnuz_plain(
+    void* residual,
+    const void* x,
+    const void* weight,
+    void* out,
+    int rows,
+    int hidden,
+    float eps,
+    const float* scale,
+    hipStream_t stream) {
+  if (rows <= 0 || hidden <= 0) {
+    return;
+  }
+  hipLaunchKernelGGL(residual_add_rms_norm_fp8_plain_kernel,
                      dim3(rows), dim3(kBlock), kBlock * sizeof(float), stream,
                      static_cast<hip_bfloat16*>(residual),
                      static_cast<const hip_bfloat16*>(x),

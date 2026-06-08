@@ -24,9 +24,12 @@ hipcc -O3 -std=c++17 -fPIC -shared \
   "${ROOT}/rsrc/gemm/hipblaslt_matmul.cpp" \
   "${ROOT}/rsrc/gemm/hipblaslt_probe.cpp" \
   "${ROOT}/rsrc/kernels/activation.hip" \
+  "${ROOT}/rsrc/kernels/attention_decode.hip" \
+  "${ROOT}/rsrc/kernels/embedding.hip" \
   "${ROOT}/rsrc/kernels/norm.hip" \
   "${ROOT}/rsrc/kernels/patch_embed.hip" \
   "${ROOT}/rsrc/kernels/qkv_split.hip" \
+  "${ROOT}/rsrc/kernels/qwen36_linear.hip" \
   "${ROOT}/rsrc/kernels/quantize.hip" \
   "${ROOT}/rsrc/kernels/vector_add.hip" \
   -L/opt/rocm/lib \

@@ -7,5 +7,6 @@ Public re-exports keep the model-namespace surface in line with the
 from __future__ import annotations
 
 from .pipeline_rtx import Qwen3Dims, Qwen3Pipeline
+from .pipeline_rocm import Qwen3PipelineRocm, Qwen3RocmDims
 
-__all__ = ['Qwen3Dims', 'Qwen3Pipeline']
+__all__ = ['Qwen3Dims', 'Qwen3Pipeline', 'Qwen3PipelineRocm', 'Qwen3RocmDims']

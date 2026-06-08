@@ -1,7 +1,8 @@
 """FlashRT -- Qwen3.6-27B model pipelines.
 
 Per the unified pipeline_<hw>.py contract:
-    pipeline_rtx.py  - RTX SM120 Qwen36Pipeline (Blackwell consumer)
+    pipeline_rtx.py   - RTX SM120 Qwen36Pipeline (Blackwell consumer)
+    pipeline_rocm.py  - ROCm Qwen36 metadata / owned-buffer staging
 
 Phase plan (see docs/qwen36_integration.md when written; for now the
 adaptation plan lives in project memory):
@@ -20,8 +21,10 @@ adaptation plan lives in project memory):
     Phase 6: MTP speculative decode (optional).
 """
 
+from flash_rt.models.qwen36.pipeline_rocm import Qwen36RocmDims
 from flash_rt.models.qwen36.pipeline_rtx import Qwen36Pipeline
 
 __all__ = [
     'Qwen36Pipeline',
+    'Qwen36RocmDims',
 ]
