@@ -217,6 +217,7 @@ def build_rocm_vision_weights_from_openpi_model(
     weights["encoder_post_attn_norm_w"] = []
     weights["encoder_ffn_gate_w"] = []
     weights["encoder_ffn_up_w"] = []
+    weights["encoder_ffn_gate_up_w"] = []
     weights["encoder_ffn_down_w"] = []
     weights["decoder_action_in_proj_w"] = _linear_weight(model.action_in_proj)
     weights["decoder_action_in_proj_b"] = _linear_bias(model.action_in_proj)
@@ -231,6 +232,7 @@ def build_rocm_vision_weights_from_openpi_model(
     weights["decoder_attn_o_w"] = []
     weights["decoder_ffn_gate_w"] = []
     weights["decoder_ffn_up_w"] = []
+    weights["decoder_ffn_gate_up_w"] = []
     weights["decoder_ffn_down_w"] = []
 
     for layer in vision.encoder.layers:
@@ -285,8 +287,13 @@ def build_rocm_vision_weights_from_openpi_model(
         weights["encoder_post_attn_norm_w"].append(
             _bf16_tensor(layer.post_attention_layernorm.weight)
         )
-        weights["encoder_ffn_gate_w"].append(_linear_weight(layer.mlp.gate_proj))
-        weights["encoder_ffn_up_w"].append(_linear_weight(layer.mlp.up_proj))
+        gate_w = _linear_weight(layer.mlp.gate_proj)
+        up_w = _linear_weight(layer.mlp.up_proj)
+        weights["encoder_ffn_gate_w"].append(gate_w)
+        weights["encoder_ffn_up_w"].append(up_w)
+        weights["encoder_ffn_gate_up_w"].append(
+            torch.cat((gate_w, up_w), dim=0).contiguous()
+        )
         weights["encoder_ffn_down_w"].append(_linear_weight(layer.mlp.down_proj))
 
     expert_layers = model.paligemma_with_expert.gemma_expert.model.layers
@@ -303,8 +310,13 @@ def build_rocm_vision_weights_from_openpi_model(
             ).contiguous()
         )
         weights["decoder_attn_o_w"].append(_linear_weight(attn.o_proj))
-        weights["decoder_ffn_gate_w"].append(_linear_weight(layer.mlp.gate_proj))
-        weights["decoder_ffn_up_w"].append(_linear_weight(layer.mlp.up_proj))
+        gate_w = _linear_weight(layer.mlp.gate_proj)
+        up_w = _linear_weight(layer.mlp.up_proj)
+        weights["decoder_ffn_gate_w"].append(gate_w)
+        weights["decoder_ffn_up_w"].append(up_w)
+        weights["decoder_ffn_gate_up_w"].append(
+            torch.cat((gate_w, up_w), dim=0).contiguous()
+        )
         weights["decoder_ffn_down_w"].append(_linear_weight(layer.mlp.down_proj))
 
     weights["precomputed"] = _precompute_decoder_styles_from_openpi_model(
@@ -336,11 +348,9 @@ def build_rocm_vision_weights_from_openpi_model(
                 "encoder_ffn_down_w",
             ):
                 _add_fp8_weight(weights, name, i)
-            gate_up = torch.cat(
-                (weights["encoder_ffn_gate_w"][i], weights["encoder_ffn_up_w"][i]),
-                dim=0,
-            ).contiguous()
-            _add_fp8_weight_tensor(weights, "encoder_ffn_gate_up_w", gate_up, i)
+            _add_fp8_weight_tensor(
+                weights, "encoder_ffn_gate_up_w", weights["encoder_ffn_gate_up_w"][i], i
+            )
         for i in range(len(weights["decoder_attn_qkv_w"])):
             for name in (
                 "decoder_attn_qkv_w",
@@ -348,11 +358,9 @@ def build_rocm_vision_weights_from_openpi_model(
                 "decoder_ffn_down_w",
             ):
                 _add_fp8_weight(weights, name, i)
-            gate_up = torch.cat(
-                (weights["decoder_ffn_gate_w"][i], weights["decoder_ffn_up_w"][i]),
-                dim=0,
-            ).contiguous()
-            _add_fp8_weight_tensor(weights, "decoder_ffn_gate_up_w", gate_up, i)
+            _add_fp8_weight_tensor(
+                weights, "decoder_ffn_gate_up_w", weights["decoder_ffn_gate_up_w"][i], i
+            )
 
     return weights
 

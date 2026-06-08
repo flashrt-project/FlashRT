@@ -1652,18 +1652,25 @@ class Pi05PipelineRocm:
         self.vision_project_to_encoder_fp8(rocm_kernels, weights, stream=stream)
 
     def encoder_qkv_bf16(
-        self, rocm_kernels, weights, layer: int, stream: int = 0
+        self,
+        rocm_kernels,
+        weights,
+        layer: int,
+        *,
+        skip_norm: bool = False,
+        stream: int = 0,
     ) -> None:
         """Run encoder RMSNorm and QKV projection for one Gemma layer."""
-        rocm_kernels.rms_norm_bf16_ptr(
-            self.bufs["encoder_x"].ptr.value,
-            _weight_ptr(weights, "encoder_input_norm_w", layer),
-            self.bufs["encoder_x_norm"].ptr.value,
-            self.encoder_seq_len,
-            ENC_D,
-            1e-6,
-            stream,
-        )
+        if not skip_norm:
+            rocm_kernels.rms_norm_bf16_ptr(
+                self.bufs["encoder_x"].ptr.value,
+                _weight_ptr(weights, "encoder_input_norm_w", layer),
+                self.bufs["encoder_x_norm"].ptr.value,
+                self.encoder_seq_len,
+                ENC_D,
+                1e-6,
+                stream,
+            )
         rocm_kernels.hipblaslt_linear_bf16_ptr(
             self.bufs["encoder_x_norm"].ptr.value,
             _weight_ptr(weights, "encoder_attn_qkv_w", layer),
@@ -1759,10 +1766,18 @@ class Pi05PipelineRocm:
         )
 
     def encoder_qkv_rope_bf16(
-        self, rocm_kernels, weights, layer: int, stream: int = 0
+        self,
+        rocm_kernels,
+        weights,
+        layer: int,
+        *,
+        skip_norm: bool = False,
+        stream: int = 0,
     ) -> None:
         """Run the B1 encoder path through attention Q/K/V cache writes."""
-        self.encoder_qkv_bf16(rocm_kernels, weights, layer, stream=stream)
+        self.encoder_qkv_bf16(
+            rocm_kernels, weights, layer, skip_norm=skip_norm, stream=stream
+        )
         self.encoder_qkv_split_rope_to_attn(rocm_kernels, layer, stream=stream)
 
     def encoder_qkv_rope_fp8(
@@ -1854,34 +1869,30 @@ class Pi05PipelineRocm:
         )
 
     def encoder_mlp_bf16(
-        self, rocm_kernels, weights, layer: int, stream: int = 0
+        self,
+        rocm_kernels,
+        weights,
+        layer: int,
+        *,
+        next_input_norm_layer: int | None = None,
+        stream: int = 0,
     ) -> None:
-        """Run Gemma gated MLP and add its down-projected output to encoder_x."""
+        """Run Gemma gated MLP and update encoder residual state."""
         rocm_kernels.hipblaslt_linear_bf16_ptr(
             self.bufs["encoder_x_norm"].ptr.value,
-            _weight_ptr(weights, "encoder_ffn_gate_w", layer),
+            _weight_ptr(weights, "encoder_ffn_gate_up_w", layer),
             0,
-            self.bufs["encoder_gate_buf"].ptr.value,
+            self.bufs["encoder_gate_merged"].ptr.value,
             self.encoder_seq_len,
-            ENC_H,
+            2 * ENC_H,
             ENC_D,
             stream,
         )
-        rocm_kernels.hipblaslt_linear_bf16_ptr(
-            self.bufs["encoder_x_norm"].ptr.value,
-            _weight_ptr(weights, "encoder_ffn_up_w", layer),
-            0,
+        rocm_kernels.gelu_tanh_merged_bf16_ptr(
+            self.bufs["encoder_gate_merged"].ptr.value,
             self.bufs["encoder_hidden"].ptr.value,
             self.encoder_seq_len,
             ENC_H,
-            ENC_D,
-            stream,
-        )
-        rocm_kernels.gelu_tanh_mul_bf16_ptr(
-            self.bufs["encoder_gate_buf"].ptr.value,
-            self.bufs["encoder_hidden"].ptr.value,
-            self.bufs["encoder_hidden"].ptr.value,
-            self.encoder_seq_len * ENC_H,
             stream,
         )
         rocm_kernels.hipblaslt_linear_bf16_ptr(
@@ -1894,12 +1905,24 @@ class Pi05PipelineRocm:
             ENC_H,
             stream,
         )
-        rocm_kernels.residual_add_bf16_ptr(
-            self.bufs["encoder_x"].ptr.value,
-            self.bufs["encoder_x_norm"].ptr.value,
-            self.encoder_seq_len * ENC_D,
-            stream,
-        )
+        if next_input_norm_layer is None:
+            rocm_kernels.residual_add_bf16_ptr(
+                self.bufs["encoder_x"].ptr.value,
+                self.bufs["encoder_x_norm"].ptr.value,
+                self.encoder_seq_len * ENC_D,
+                stream,
+            )
+        else:
+            rocm_kernels.residual_add_rms_norm_bf16_ptr(
+                self.bufs["encoder_x"].ptr.value,
+                self.bufs["encoder_x_norm"].ptr.value,
+                _weight_ptr(weights, "encoder_input_norm_w", next_input_norm_layer),
+                self.bufs["encoder_x_norm"].ptr.value,
+                self.encoder_seq_len,
+                ENC_D,
+                1e-6,
+                stream,
+            )
 
     def encoder_mlp_fp8_static(
         self, rocm_kernels, weights, layer: int, stream: int = 0
@@ -2115,7 +2138,9 @@ class Pi05PipelineRocm:
         weights,
         layer: int,
         *,
+        skip_b1: bool = False,
         is_last: bool = False,
+        precompute_next_b1: bool = False,
         stream: int = 0,
     ) -> None:
         """Run one Gemma encoder layer through the BF16 kernel pipeline.
@@ -2123,7 +2148,9 @@ class Pi05PipelineRocm:
         The final layer stops after QKV/RoPE cache population, matching the RTX
         pipeline contract where the decoder consumes the final encoder KV cache.
         """
-        self.encoder_qkv_rope_bf16(rocm_kernels, weights, layer, stream=stream)
+        self.encoder_qkv_rope_bf16(
+            rocm_kernels, weights, layer, skip_norm=skip_b1, stream=stream
+        )
         if is_last:
             return
         attn_out_ptr = self.encoder_attention(layer, stream=stream)
@@ -2134,7 +2161,13 @@ class Pi05PipelineRocm:
             attn_out_ptr,
             stream=stream,
         )
-        self.encoder_mlp_bf16(rocm_kernels, weights, layer, stream=stream)
+        self.encoder_mlp_bf16(
+            rocm_kernels,
+            weights,
+            layer,
+            next_input_norm_layer=layer + 1 if precompute_next_b1 else None,
+            stream=stream,
+        )
 
     def encoder_bf16(
         self,
@@ -2155,7 +2188,9 @@ class Pi05PipelineRocm:
                 rocm_kernels,
                 weights,
                 i,
+                skip_b1=i > 0,
                 is_last=i == n_layers - 1,
+                precompute_next_b1=i < n_layers - 1,
                 stream=stream,
             )
 
@@ -2359,29 +2394,19 @@ class Pi05PipelineRocm:
         """Run decoder gated MLP down projection into x_normed_buf."""
         rocm_kernels.hipblaslt_linear_bf16_ptr(
             self.bufs["x_normed_buf"].ptr.value,
-            _weight_ptr(weights, "decoder_ffn_gate_w", layer),
+            _weight_ptr(weights, "decoder_ffn_gate_up_w", layer),
             0,
-            self.bufs["decoder_gate_buf"].ptr.value,
+            self.bufs["decoder_gate_merged"].ptr.value,
             self.chunk_size,
-            DEC_H,
+            2 * DEC_H,
             DEC_D,
             stream,
         )
-        rocm_kernels.hipblaslt_linear_bf16_ptr(
-            self.bufs["x_normed_buf"].ptr.value,
-            _weight_ptr(weights, "decoder_ffn_up_w", layer),
-            0,
+        rocm_kernels.gelu_tanh_merged_bf16_ptr(
+            self.bufs["decoder_gate_merged"].ptr.value,
             self.bufs["decoder_hidden"].ptr.value,
             self.chunk_size,
             DEC_H,
-            DEC_D,
-            stream,
-        )
-        rocm_kernels.gelu_tanh_mul_bf16_ptr(
-            self.bufs["decoder_gate_buf"].ptr.value,
-            self.bufs["decoder_hidden"].ptr.value,
-            self.bufs["decoder_hidden"].ptr.value,
-            self.chunk_size * DEC_H,
             stream,
         )
         rocm_kernels.hipblaslt_linear_bf16_ptr(
@@ -2519,14 +2544,17 @@ class Pi05PipelineRocm:
         layer: int,
         step: int,
         *,
+        skip_c1: bool = False,
+        is_last: bool = False,
         stream: int = 0,
     ) -> None:
         """Run one Gemma expert decoder layer in the BF16 kernel pipeline."""
-        self.decoder_ada_rms_norm_style(
-            rocm_kernels,
-            self._style_slice_ptr("decoder_style_attn", step, layer),
-            stream=stream,
-        )
+        if not skip_c1:
+            self.decoder_ada_rms_norm_style(
+                rocm_kernels,
+                self._style_slice_ptr("decoder_style_attn", step, layer),
+                stream=stream,
+            )
         self.decoder_qkv_bf16(rocm_kernels, weights, layer, stream=stream)
         self.decoder_qkv_split_rope_to_attn(rocm_kernels, layer, stream=stream)
         attn_out_ptr = self.decoder_attention(layer, stream=stream)
@@ -2543,13 +2571,28 @@ class Pi05PipelineRocm:
             stream=stream,
         )
         self.decoder_mlp_bf16(rocm_kernels, weights, layer, stream=stream)
-        rocm_kernels.gate_mul_residual_bf16_ptr(
-            self.bufs["decoder_x"].ptr.value,
-            self.bufs["x_normed_buf"].ptr.value,
-            self.bufs["gate_buf"].ptr.value,
-            self.chunk_size * DEC_D,
-            stream,
-        )
+        if is_last:
+            rocm_kernels.gate_mul_residual_bf16_ptr(
+                self.bufs["decoder_x"].ptr.value,
+                self.bufs["x_normed_buf"].ptr.value,
+                self.bufs["gate_buf"].ptr.value,
+                self.chunk_size * DEC_D,
+                stream,
+            )
+        else:
+            rocm_kernels.gate_residual_ada_norm_bf16_ptr(
+                self.bufs["decoder_x"].ptr.value,
+                self.bufs["x_normed_buf"].ptr.value,
+                self.bufs["gate_buf"].ptr.value,
+                self.bufs["decoder_rms_ones"].ptr.value,
+                self._style_slice_ptr("decoder_style_attn", step, layer + 1),
+                self.bufs["x_normed_buf"].ptr.value,
+                self.bufs["gate_buf"].ptr.value,
+                self.chunk_size,
+                DEC_D,
+                1e-6,
+                stream,
+            )
 
     def decoder_layer_fp8(
         self,
@@ -2699,8 +2742,17 @@ class Pi05PipelineRocm:
                 f"decoder_num_layers must be in [1, {DEC_L}], got {decoder_num_layers}"
             )
         self.decoder_action_in_bf16(rocm_kernels, weights, stream=stream)
-        for i in range(int(decoder_num_layers)):
-            self.decoder_layer_bf16(rocm_kernels, weights, i, step, stream=stream)
+        n_layers = int(decoder_num_layers)
+        for i in range(n_layers):
+            self.decoder_layer_bf16(
+                rocm_kernels,
+                weights,
+                i,
+                step,
+                skip_c1=i > 0,
+                is_last=i == n_layers - 1,
+                stream=stream,
+            )
         self.decoder_final_bf16(rocm_kernels, weights, step, stream=stream)
 
     def decoder_step_fp8(
@@ -3139,7 +3191,7 @@ class Pi05PipelineRocm:
                 False,
             ),
             ("encoder_attn_o", self.encoder_seq_len, ENC_D, ENC_D, False),
-            ("encoder_ffn_gate_up", self.encoder_seq_len, ENC_H, ENC_D, False),
+            ("encoder_ffn_gate_up", self.encoder_seq_len, 2 * ENC_H, ENC_D, False),
             ("encoder_ffn_down", self.encoder_seq_len, ENC_D, ENC_H, False),
             ("decoder_action_in", self.chunk_size, DEC_D, ACTION_DIM, True),
             (
@@ -3150,7 +3202,7 @@ class Pi05PipelineRocm:
                 False,
             ),
             ("decoder_attn_o", self.chunk_size, DEC_D, DEC_NH * DEC_HD, False),
-            ("decoder_ffn_gate_up", self.chunk_size, DEC_H, DEC_D, False),
+            ("decoder_ffn_gate_up", self.chunk_size, 2 * DEC_H, DEC_D, False),
             ("decoder_ffn_down", self.chunk_size, DEC_D, DEC_H, False),
             ("decoder_action_out", self.chunk_size, ACTION_DIM, DEC_D, True),
         ]
