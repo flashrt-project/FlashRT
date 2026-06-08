@@ -79,14 +79,12 @@ class RocmSdpaAttnBackend(AttentionBackendBase):
         total_kv = encoder_seq_max + chunk_size
         self.enc_Q = torch.empty(encoder_seq_max, 8, 256, dtype=bf16, device=device)
         self.enc_K = torch.empty(
-            num_encoder_layers, total_kv, 1, 256, dtype=bf16, device=device
+            num_encoder_layers, total_kv, 8, 256, dtype=bf16, device=device
         )
         self.enc_V = torch.empty(
-            num_encoder_layers, total_kv, 1, 256, dtype=bf16, device=device
+            num_encoder_layers, total_kv, 8, 256, dtype=bf16, device=device
         )
         self.enc_O = torch.empty(encoder_seq_max, 8, 256, dtype=bf16, device=device)
-        self.gqa_K_full = torch.empty(total_kv, 8, 256, dtype=bf16, device=device)
-        self.gqa_V_full = torch.empty(total_kv, 8, 256, dtype=bf16, device=device)
 
         self.dec_Q = torch.empty(chunk_size, 8, 256, dtype=bf16, device=device)
         self.dec_O = torch.empty(chunk_size, 8, 256, dtype=bf16, device=device)
@@ -98,7 +96,10 @@ class RocmSdpaAttnBackend(AttentionBackendBase):
         del preferred_backend, decoder_preferred_backend
         self._kernels = rocm_kernels
         self._enc_kv_layer_stride_bytes = (
-            total_kv * 1 * 256 * self.enc_K.element_size()
+            total_kv * 8 * 256 * self.enc_K.element_size()
+        )
+        self._enc_kv_token_stride_bytes = (
+            8 * 256 * self.enc_K.element_size()
         )
 
         self.warmup()
@@ -122,6 +123,8 @@ class RocmSdpaAttnBackend(AttentionBackendBase):
             "dec_Q": self.dec_Q.data_ptr(),
             "enc_k_layer_stride_bytes": self._enc_kv_layer_stride_bytes,
             "enc_v_layer_stride_bytes": self._enc_kv_layer_stride_bytes,
+            "enc_k_token_stride_bytes": self._enc_kv_token_stride_bytes,
+            "enc_v_token_stride_bytes": self._enc_kv_token_stride_bytes,
         }
 
     def _check_layer_idx(self, site: str, layer_idx: int) -> None:
@@ -191,28 +194,10 @@ class RocmSdpaAttnBackend(AttentionBackendBase):
         return self.vis_O.data_ptr()
 
     def encoder_attn(self, layer_idx: int, seq: int, stream: int = 0) -> int:
-        self._kernels.qwen36_full_v_broadcast_bf16_out(
-            self.enc_K[layer_idx, :seq],
-            self.gqa_K_full[:seq],
-            seq,
-            1,
-            8,
-            256,
-            stream,
-        )
-        self._kernels.qwen36_full_v_broadcast_bf16_out(
-            self.enc_V[layer_idx, :seq],
-            self.gqa_V_full[:seq],
-            seq,
-            1,
-            8,
-            256,
-            stream,
-        )
         self._kernels.pi05_gqa8_attention_bf16_ptr(
             self.enc_Q.data_ptr(),
-            self.gqa_K_full.data_ptr(),
-            self.gqa_V_full.data_ptr(),
+            self.enc_K[layer_idx].data_ptr(),
+            self.enc_V[layer_idx].data_ptr(),
             self.enc_O.data_ptr(),
             1,
             seq,
@@ -229,28 +214,10 @@ class RocmSdpaAttnBackend(AttentionBackendBase):
         stream: int = 0,
     ) -> int:
         total_kv = enc_seq + dec_seq
-        self._kernels.qwen36_full_v_broadcast_bf16_out(
-            self.enc_K[layer_idx, :total_kv],
-            self.gqa_K_full[:total_kv],
-            total_kv,
-            1,
-            8,
-            256,
-            stream,
-        )
-        self._kernels.qwen36_full_v_broadcast_bf16_out(
-            self.enc_V[layer_idx, :total_kv],
-            self.gqa_V_full[:total_kv],
-            total_kv,
-            1,
-            8,
-            256,
-            stream,
-        )
         self._kernels.pi05_gqa8_attention_bf16_ptr(
             self.dec_Q.data_ptr(),
-            self.gqa_K_full.data_ptr(),
-            self.gqa_V_full.data_ptr(),
+            self.enc_K[layer_idx].data_ptr(),
+            self.enc_V[layer_idx].data_ptr(),
             self.dec_O.data_ptr(),
             1,
             dec_seq,

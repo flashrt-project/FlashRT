@@ -240,8 +240,8 @@ class Pi05PipelineRocm:
     def with_rocm_attention(
         cls,
         *,
-        preferred_backend: str = "flash",
-        decoder_preferred_backend: str | None = "flash",
+        preferred_backend: str = "ck_wmma",
+        decoder_preferred_backend: str | None = "ck_wmma",
         **kwargs,
     ):
         """Construct the pipeline with the ROCm FlashAttention backend."""
@@ -751,14 +751,19 @@ class Pi05PipelineRocm:
         attn_ptrs = getattr(self, "_attn_ptrs", None)
         if attn_ptrs is None:
             raise RuntimeError("no attention backend is attached")
-        token_offset_bytes = offset_tokens * ENC_NKV * ENC_HD * 2
+        k_token_stride = int(
+            attn_ptrs.get("enc_k_token_stride_bytes", ENC_NKV * ENC_HD * 2)
+        )
+        v_token_stride = int(
+            attn_ptrs.get("enc_v_token_stride_bytes", ENC_NKV * ENC_HD * 2)
+        )
         return (
             int(attn_ptrs["enc_K"])
             + layer * int(attn_ptrs["enc_k_layer_stride_bytes"])
-            + token_offset_bytes,
+            + offset_tokens * k_token_stride,
             int(attn_ptrs["enc_V"])
             + layer * int(attn_ptrs["enc_v_layer_stride_bytes"])
-            + token_offset_bytes,
+            + offset_tokens * v_token_stride,
         )
 
     def vision_patch_im2col(self, rocm_kernels, stream: int = 0) -> None:
@@ -1751,16 +1756,15 @@ class Pi05PipelineRocm:
         if attn_ptrs is None:
             raise RuntimeError("no attention backend is attached")
         k_ptr, v_ptr = self._enc_kv_layer_ptrs(layer, offset_tokens=0)
-        rocm_kernels.qkv_split_rope_bf16_ptr(
+        rocm_kernels.qkv_split_rope_broadcast_bf16_ptr(
             self.bufs["encoder_QKV"].ptr.value,
             self.bufs["encoder_rope_weights"].ptr.value,
             int(attn_ptrs["enc_Q"]),
             k_ptr,
             v_ptr,
             self.encoder_seq_len,
-            ENC_NH * ENC_HD,
-            ENC_NKV * ENC_HD,
-            ENC_NKV * ENC_HD,
+            ENC_NH,
+            ENC_NKV,
             ENC_HD,
             stream,
         )
@@ -2294,16 +2298,15 @@ class Pi05PipelineRocm:
         if attn_ptrs is None:
             raise RuntimeError("no attention backend is attached")
         k_ptr, v_ptr = self._enc_kv_layer_ptrs(layer, offset_tokens=self.encoder_seq_len)
-        rocm_kernels.qkv_split_rope_bf16_ptr(
+        rocm_kernels.qkv_split_rope_broadcast_bf16_ptr(
             self.bufs["decoder_QKV"].ptr.value,
             self.bufs["decoder_rope_weights"].ptr.value,
             int(attn_ptrs["dec_Q"]),
             k_ptr,
             v_ptr,
             self.chunk_size,
-            DEC_NH * DEC_HD,
-            DEC_NKV * DEC_HD,
-            DEC_NKV * DEC_HD,
+            DEC_NH,
+            DEC_NKV,
             DEC_HD,
             stream,
         )

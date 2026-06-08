@@ -877,6 +877,9 @@ def test_pi05_rocm_pipeline_encoder_layer_bf16_zero_weight_smoke():
         "encoder_ffn_up_w": [
             torch.zeros((16384, 2048), device="cuda", dtype=torch.bfloat16),
         ],
+        "encoder_ffn_gate_up_w": [
+            torch.zeros((32768, 2048), device="cuda", dtype=torch.bfloat16),
+        ],
         "encoder_ffn_down_w": [
             torch.zeros((2048, 16384), device="cuda", dtype=torch.bfloat16),
         ],
@@ -930,6 +933,9 @@ def test_pi05_rocm_pipeline_decoder_step_bf16_zero_weight_smoke():
         ],
         "decoder_ffn_up_w": [
             torch.zeros((4096, 1024), device="cuda", dtype=torch.bfloat16)
+        ],
+        "decoder_ffn_gate_up_w": [
+            torch.zeros((8192, 1024), device="cuda", dtype=torch.bfloat16)
         ],
         "decoder_ffn_down_w": [
             torch.zeros((1024, 4096), device="cuda", dtype=torch.bfloat16)

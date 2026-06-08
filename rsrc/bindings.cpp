@@ -146,6 +146,9 @@ void launch_qkv_split_rope_bf16(const void* qkv, const void* rope,
                                 void* q, void* k, void* v,
                                 int seq, int q_dim, int k_dim, int v_dim,
                                 int head_dim, hipStream_t stream);
+void launch_qkv_split_rope_broadcast_bf16(
+    const void* qkv, const void* rope, void* q, void* k, void* v,
+    int seq, int q_heads, int kv_heads, int head_dim, hipStream_t stream);
 void launch_qwen3_qkv_norm_rope_bf16(
     const void* qkv, const float* cos, const float* sin,
     const void* q_norm_w, const void* k_norm_w,
@@ -862,6 +865,25 @@ void qkv_split_rope_bf16_ptr(std::uintptr_t qkv, std::uintptr_t rope,
       reinterpret_cast<void*>(v),
       seq, q_dim, k_dim, v_dim, head_dim, stream_from_uint(stream));
   hip_check(hipGetLastError(), "qkv_split_rope_bf16_ptr launch");
+}
+
+void qkv_split_rope_broadcast_bf16_ptr(
+    std::uintptr_t qkv, std::uintptr_t rope,
+    std::uintptr_t q, std::uintptr_t k, std::uintptr_t v,
+    int seq, int q_heads, int kv_heads, int head_dim,
+    std::uintptr_t stream = 0) {
+  if (seq <= 0 || q_heads <= 0 || kv_heads <= 0 || head_dim <= 0) {
+    throw std::invalid_argument(
+        "seq, q_heads, kv_heads, and head_dim must be positive");
+  }
+  launch_qkv_split_rope_broadcast_bf16(
+      reinterpret_cast<const void*>(qkv),
+      reinterpret_cast<const void*>(rope),
+      reinterpret_cast<void*>(q),
+      reinterpret_cast<void*>(k),
+      reinterpret_cast<void*>(v),
+      seq, q_heads, kv_heads, head_dim, stream_from_uint(stream));
+  hip_check(hipGetLastError(), "qkv_split_rope_broadcast_bf16_ptr launch");
 }
 
 void qwen3_qkv_norm_rope_bf16_ptr(
@@ -2584,6 +2606,12 @@ PYBIND11_MODULE(flash_rt_rocm_kernels, m) {
         py::arg("v"), py::arg("seq"), py::arg("q_dim"), py::arg("k_dim"),
         py::arg("v_dim"), py::arg("head_dim"), py::arg("stream") = 0,
         "Split packed BF16 QKV rows, apply RoPE to Q/K, and write raw buffers.");
+  m.def("qkv_split_rope_broadcast_bf16_ptr",
+        &qkv_split_rope_broadcast_bf16_ptr,
+        py::arg("qkv"), py::arg("rope"), py::arg("q"), py::arg("k"),
+        py::arg("v"), py::arg("seq"), py::arg("q_heads"),
+        py::arg("kv_heads"), py::arg("head_dim"), py::arg("stream") = 0,
+        "Split packed BF16 QKV rows, apply RoPE, and broadcast GQA K/V heads.");
   m.def("qwen3_qkv_norm_rope_bf16_ptr", &qwen3_qkv_norm_rope_bf16_ptr,
         py::arg("qkv"), py::arg("cos"), py::arg("sin"),
         py::arg("q_norm_w"), py::arg("k_norm_w"),

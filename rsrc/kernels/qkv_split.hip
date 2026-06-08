@@ -84,6 +84,60 @@ __global__ void qkv_split_rope_bf16_kernel(const hip_bfloat16* qkv,
   }
 }
 
+__global__ void qkv_split_rope_broadcast_bf16_kernel(
+    const hip_bfloat16* qkv,
+    const hip_bfloat16* rope,
+    hip_bfloat16* q,
+    hip_bfloat16* k,
+    hip_bfloat16* v,
+    int seq,
+    int q_heads,
+    int kv_heads,
+    int head_dim) {
+  const int q_dim = q_heads * head_dim;
+  const int kv_dim = kv_heads * head_dim;
+  const int qkv_dim = q_dim + 2 * kv_dim;
+  const int total = seq * 3 * q_dim;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+
+  const int row = idx / (3 * q_dim);
+  const int col = idx % (3 * q_dim);
+  const int section = col / q_dim;
+  const int out_col = col % q_dim;
+  const int head = out_col / head_dim;
+  const int d = out_col % head_dim;
+  const int kv_head = head / (q_heads / kv_heads);
+
+  if (section == 0) {
+    const int pair = d / 2;
+    const int pair_base = row * qkv_dim + head * head_dim + pair * 2;
+    const float x0 = static_cast<float>(qkv[pair_base]);
+    const float x1 = static_cast<float>(qkv[pair_base + 1]);
+    const int rope_base = row * head_dim + pair * 2;
+    const float c = static_cast<float>(rope[rope_base]);
+    const float s = static_cast<float>(rope[rope_base + 1]);
+    q[row * q_dim + out_col] = hip_bfloat16(
+        (d & 1) == 0 ? x0 * c - x1 * s : x1 * c + x0 * s);
+  } else if (section == 1) {
+    const int pair = d / 2;
+    const int pair_base =
+        row * qkv_dim + q_dim + kv_head * head_dim + pair * 2;
+    const float x0 = static_cast<float>(qkv[pair_base]);
+    const float x1 = static_cast<float>(qkv[pair_base + 1]);
+    const int rope_base = row * head_dim + pair * 2;
+    const float c = static_cast<float>(rope[rope_base]);
+    const float s = static_cast<float>(rope[rope_base + 1]);
+    k[row * q_dim + out_col] = hip_bfloat16(
+        (d & 1) == 0 ? x0 * c - x1 * s : x1 * c + x0 * s);
+  } else {
+    const int src = row * qkv_dim + q_dim + kv_dim + kv_head * head_dim + d;
+    v[row * q_dim + out_col] = qkv[src];
+  }
+}
+
 __global__ void qwen3_qk_norm_rope_bf16_kernel(
     const hip_bfloat16* qkv,
     const float* cos,
@@ -297,6 +351,26 @@ void launch_qkv_split_rope_bf16(const void* qkv, const void* rope,
                      static_cast<hip_bfloat16*>(k),
                      static_cast<hip_bfloat16*>(v),
                      seq, q_dim, k_dim, v_dim, head_dim);
+}
+
+void launch_qkv_split_rope_broadcast_bf16(
+    const void* qkv, const void* rope, void* q, void* k, void* v,
+    int seq, int q_heads, int kv_heads, int head_dim, hipStream_t stream) {
+  if (seq <= 0 || q_heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
+      q_heads % kv_heads != 0) {
+    return;
+  }
+  const int q_dim = q_heads * head_dim;
+  const int total = seq * 3 * q_dim;
+  const int blocks = (total + kBlock - 1) / kBlock;
+  hipLaunchKernelGGL(qkv_split_rope_broadcast_bf16_kernel,
+                     dim3(blocks), dim3(kBlock), 0, stream,
+                     static_cast<const hip_bfloat16*>(qkv),
+                     static_cast<const hip_bfloat16*>(rope),
+                     static_cast<hip_bfloat16*>(q),
+                     static_cast<hip_bfloat16*>(k),
+                     static_cast<hip_bfloat16*>(v),
+                     seq, q_heads, kv_heads, head_dim);
 }
 
 void launch_qwen3_qkv_norm_rope_bf16(

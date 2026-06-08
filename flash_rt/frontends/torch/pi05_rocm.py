@@ -141,8 +141,8 @@ class Pi05TorchFrontendRocm:
         hardware: Optional[str] = None,
         num_steps: Optional[int] = None,
         use_fp8: bool = False,
-        attn_backend: str = "flash",
-        decoder_attn_backend: Optional[str] = "flash",
+        attn_backend: str = "ck_wmma",
+        decoder_attn_backend: Optional[str] = "ck_wmma",
         **_unused,
     ):
         if not torch.cuda.is_available() or not getattr(torch.version, "hip", None):
