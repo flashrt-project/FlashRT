@@ -52,8 +52,6 @@ See [Supported Models](#supported-models), [Hardware Support](#hardware-support)
 
 Baseline comparisons and source methodology live in [Benchmark Comparison](docs/benchmark_comparison.md).
 
-### FlashRT Headline Matrix
-
 #### Pi0.5
 
 | Hardware | Mode | Latency | Throughput | Source |
