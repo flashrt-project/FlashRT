@@ -80,7 +80,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-cosine", type=float, default=0.999)
     parser.add_argument("--max-mean-abs", type=float, default=None)
     parser.add_argument("--expect-path", default=None)
-    parser.add_argument("--expect-attn-backend", default="FLASH_ATTENTION")
+    parser.add_argument("--expect-attn-backend", default="ck_wmma")
     return parser.parse_args()
 
 

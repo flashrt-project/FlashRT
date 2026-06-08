@@ -1,36 +1,11 @@
-"""ROCm FlashAttention backend for FlashRT-owned Pi0.5 buffers.
-
-This mirrors the RTX attention backend contract: the backend owns Q/K/V/O
-scratch tensors and exposes raw device pointers. By default it routes through
-PyTorch ROCm's ``SDPBackend.FLASH_ATTENTION`` implementation, which is the
-ROCm-native FlashAttention path in the active torch build. If an external
-ROCm ``flash_attn`` package is installed, callers can request
-``preferred_backend='flash_attn'`` to use ``flash_attn_func`` directly.
-
-The call boundary is intentionally stable so the implementation can later be
-swapped to CK, AOTriton, or a custom HIP kernel without changing the Pi0.5
-pipeline/frontend contract.
-"""
+"""ROCm CK attention backend for FlashRT-owned Pi0.5 buffers."""
 
 from __future__ import annotations
 
-from contextlib import nullcontext
-
 import torch
-import torch.nn.functional as F
 
 from flash_rt.hardware.backend import AttentionBackendBase, AttentionSpec
-
-try:
-    from flash_attn import flash_attn_func
-except Exception:  # pragma: no cover - depends on optional ROCm FA package
-    flash_attn_func = None
-
-try:
-    from torch.nn.attention import SDPBackend, sdpa_kernel
-except Exception:  # pragma: no cover - depends on PyTorch build
-    SDPBackend = None
-    sdpa_kernel = None
+from flash_rt import flash_rt_rocm_kernels as rocm_kernels
 
 
 def make_pi05_attention_spec(
@@ -71,7 +46,7 @@ def make_pi05_attention_spec(
 
 
 class RocmSdpaAttnBackend(AttentionBackendBase):
-    """Pi0.5 ROCm FlashAttention backend using preallocated BF16 scratch."""
+    """Pi0.5 ROCm attention backend using preallocated BF16 CK/HIP kernels."""
 
     def __init__(
         self,
@@ -80,8 +55,8 @@ class RocmSdpaAttnBackend(AttentionBackendBase):
         chunk_size: int,
         num_encoder_layers: int = 18,
         dtype=None,
-        preferred_backend: str = "flash",
-        decoder_preferred_backend: str | None = "flash",
+        preferred_backend: str = "ck_wmma",
+        decoder_preferred_backend: str | None = "ck_wmma",
     ):
         if not torch.cuda.is_available() or not getattr(torch.version, "hip", None):
             raise RuntimeError("RocmSdpaAttnBackend requires ROCm PyTorch")
@@ -110,6 +85,8 @@ class RocmSdpaAttnBackend(AttentionBackendBase):
             num_encoder_layers, total_kv, 1, 256, dtype=bf16, device=device
         )
         self.enc_O = torch.empty(encoder_seq_max, 8, 256, dtype=bf16, device=device)
+        self.gqa_K_full = torch.empty(total_kv, 8, 256, dtype=bf16, device=device)
+        self.gqa_V_full = torch.empty(total_kv, 8, 256, dtype=bf16, device=device)
 
         self.dec_Q = torch.empty(chunk_size, 8, 256, dtype=bf16, device=device)
         self.dec_O = torch.empty(chunk_size, 8, 256, dtype=bf16, device=device)
@@ -118,88 +95,21 @@ class RocmSdpaAttnBackend(AttentionBackendBase):
         self._encoder_seq_max = int(encoder_seq_max)
         self._chunk_size = int(chunk_size)
         self._num_encoder_layers = int(num_encoder_layers)
-        self._preferred_backend = str(preferred_backend).lower()
-        self._use_flash_attn_func = self._preferred_backend in {
-            "flash_attn",
-            "flash-attn",
-            "fa2",
-            "fa_rocm",
-        }
-        if self._use_flash_attn_func and flash_attn_func is None:
-            raise RuntimeError("preferred_backend='flash_attn' requires flash_attn")
-        self._active_backend = (
-            None if self._use_flash_attn_func else self._resolve_backend(preferred_backend)
-        )
-        decoder_backend_name = (
-            preferred_backend
-            if decoder_preferred_backend is None
-            else decoder_preferred_backend
-        )
-        self._decoder_preferred_backend = str(decoder_backend_name).lower()
-        self._use_decoder_flash_attn_func = self._decoder_preferred_backend in {
-            "flash_attn",
-            "flash-attn",
-            "fa2",
-            "fa_rocm",
-        }
-        if self._use_decoder_flash_attn_func and flash_attn_func is None:
-            raise RuntimeError(
-                "decoder_preferred_backend='flash_attn' requires flash_attn"
-            )
-        self._decoder_active_backend = (
-            None
-            if self._use_decoder_flash_attn_func
-            else self._resolve_backend(decoder_backend_name)
-        )
+        del preferred_backend, decoder_preferred_backend
+        self._kernels = rocm_kernels
         self._enc_kv_layer_stride_bytes = (
             total_kv * 1 * 256 * self.enc_K.element_size()
         )
 
-        try:
-            self.warmup()
-        except Exception:
-            can_fallback = (
-                self._active_backend is not None
-                or self._decoder_active_backend is not None
-            )
-            if not can_fallback:
-                raise
-            self._active_backend = None
-            self._decoder_active_backend = None
-            self.warmup()
-
-    @staticmethod
-    def _resolve_backend(name: str):
-        if SDPBackend is None:
-            return None
-        normalized = str(name).lower()
-        if normalized in {"auto", "default", "sdpa"}:
-            return None
-        if normalized in {"flash", "flash_attention", "fa"}:
-            return SDPBackend.FLASH_ATTENTION
-        if normalized in {"efficient", "mem_efficient", "memory_efficient"}:
-            return SDPBackend.EFFICIENT_ATTENTION
-        if normalized == "math":
-            return SDPBackend.MATH
-        raise ValueError(f"unknown ROCm SDPA backend: {name!r}")
+        self.warmup()
 
     @property
     def active_backend_name(self) -> str:
-        return self._backend_name(self._use_flash_attn_func, self._active_backend)
-
-    @staticmethod
-    def _backend_name(use_flash_attn_func: bool, backend) -> str:
-        if use_flash_attn_func:
-            return "flash_attn_func"
-        if backend is None:
-            return "auto"
-        return getattr(backend, "name", str(backend))
+        return "ck_wmma"
 
     @property
     def decoder_backend_name(self) -> str:
-        return self._backend_name(
-            self._use_decoder_flash_attn_func, self._decoder_active_backend
-        )
+        return "ck_wmma"
 
     def get_ptrs(self) -> dict[str, int]:
         return {
@@ -248,38 +158,8 @@ class RocmSdpaAttnBackend(AttentionBackendBase):
             }
         raise ValueError(f"unknown attention site: {site!r}")
 
-    def _sdpa(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        *,
-        use_flash_attn_func: bool,
-        active_backend,
-    ) -> torch.Tensor:
-        if use_flash_attn_func:
-            return flash_attn_func(
-                q.transpose(1, 2),
-                k.transpose(1, 2),
-                v.transpose(1, 2),
-                dropout_p=0.0,
-                softmax_scale=q.shape[-1] ** -0.5,
-                causal=False,
-            ).transpose(1, 2)
-        if active_backend is None or sdpa_kernel is None:
-            ctx = nullcontext()
-        else:
-            ctx = sdpa_kernel([active_backend])
-        if k.shape[1] != q.shape[1]:
-            k = k.expand(q.shape[0], q.shape[1], k.shape[2], k.shape[3])
-            v = v.expand(q.shape[0], q.shape[1], v.shape[2], v.shape[3])
-        with ctx:
-            return F.scaled_dot_product_attention(
-                q, k, v, dropout_p=0.0, is_causal=False
-            )
-
     def warmup(self) -> None:
-        """Compile/warm selected ROCm SDPA kernels for the fixed Pi0.5 shapes."""
+        """Warm selected ROCm kernels for the fixed Pi0.5 shapes."""
         self.vis_Q.zero_()
         self.vis_K.zero_()
         self.vis_V.zero_()
@@ -299,33 +179,46 @@ class RocmSdpaAttnBackend(AttentionBackendBase):
         torch.cuda.synchronize()
 
     def vision_attn(self, stream: int = 0) -> int:
-        del stream
-        q = self.vis_Q.transpose(1, 2)
-        k = self.vis_K.transpose(1, 2)
-        v = self.vis_V.transpose(1, 2)
-        out = self._sdpa(
-            q,
-            k,
-            v,
-            use_flash_attn_func=self._use_flash_attn_func,
-            active_backend=self._active_backend,
-        ).transpose(1, 2)
-        self.vis_O.copy_(out)
+        self._kernels.pi05_siglip_attention_bf16_ptr(
+            self.vis_Q.data_ptr(),
+            self.vis_K.data_ptr(),
+            self.vis_V.data_ptr(),
+            self.vis_O.data_ptr(),
+            self._num_views,
+            256,
+            stream,
+        )
         return self.vis_O.data_ptr()
 
     def encoder_attn(self, layer_idx: int, seq: int, stream: int = 0) -> int:
-        del stream
-        q = self.enc_Q[:seq].transpose(0, 1).unsqueeze(0)
-        k = self.enc_K[layer_idx, :seq].transpose(0, 1).unsqueeze(0)
-        v = self.enc_V[layer_idx, :seq].transpose(0, 1).unsqueeze(0)
-        out = self._sdpa(
-            q,
-            k,
-            v,
-            use_flash_attn_func=self._use_flash_attn_func,
-            active_backend=self._active_backend,
-        ).squeeze(0).transpose(0, 1)
-        self.enc_O[:seq].copy_(out)
+        self._kernels.qwen36_full_v_broadcast_bf16_out(
+            self.enc_K[layer_idx, :seq],
+            self.gqa_K_full[:seq],
+            seq,
+            1,
+            8,
+            256,
+            stream,
+        )
+        self._kernels.qwen36_full_v_broadcast_bf16_out(
+            self.enc_V[layer_idx, :seq],
+            self.gqa_V_full[:seq],
+            seq,
+            1,
+            8,
+            256,
+            stream,
+        )
+        self._kernels.pi05_gqa8_attention_bf16_ptr(
+            self.enc_Q.data_ptr(),
+            self.gqa_K_full.data_ptr(),
+            self.gqa_V_full.data_ptr(),
+            self.enc_O.data_ptr(),
+            1,
+            seq,
+            seq,
+            stream,
+        )
         return self.enc_O.data_ptr()
 
     def decoder_attn(
@@ -336,17 +229,34 @@ class RocmSdpaAttnBackend(AttentionBackendBase):
         stream: int = 0,
     ) -> int:
         total_kv = enc_seq + dec_seq
-        q = self.dec_Q[:dec_seq].transpose(0, 1).unsqueeze(0)
-        k = self.enc_K[layer_idx, :total_kv].transpose(0, 1).unsqueeze(0)
-        v = self.enc_V[layer_idx, :total_kv].transpose(0, 1).unsqueeze(0)
-        out = self._sdpa(
-            q,
-            k,
-            v,
-            use_flash_attn_func=self._use_decoder_flash_attn_func,
-            active_backend=self._decoder_active_backend,
-        ).squeeze(0).transpose(0, 1)
-        self.dec_O[:dec_seq].copy_(out)
+        self._kernels.qwen36_full_v_broadcast_bf16_out(
+            self.enc_K[layer_idx, :total_kv],
+            self.gqa_K_full[:total_kv],
+            total_kv,
+            1,
+            8,
+            256,
+            stream,
+        )
+        self._kernels.qwen36_full_v_broadcast_bf16_out(
+            self.enc_V[layer_idx, :total_kv],
+            self.gqa_V_full[:total_kv],
+            total_kv,
+            1,
+            8,
+            256,
+            stream,
+        )
+        self._kernels.pi05_gqa8_attention_bf16_ptr(
+            self.dec_Q.data_ptr(),
+            self.gqa_K_full.data_ptr(),
+            self.gqa_V_full.data_ptr(),
+            self.dec_O.data_ptr(),
+            1,
+            dec_seq,
+            total_kv,
+            stream,
+        )
         return self.dec_O.data_ptr()
 
     def run(

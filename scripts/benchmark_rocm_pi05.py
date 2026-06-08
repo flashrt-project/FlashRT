@@ -156,8 +156,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--linear-k", type=int, default=2048)
     parser.add_argument(
         "--attn-backend",
-        choices=("flash", "efficient", "math", "auto"),
-        default="flash",
+        choices=("ck_wmma",),
+        default="ck_wmma",
     )
     parser.add_argument("--fp8", action="store_true", help="probe FP8 GEMM support")
     parser.add_argument(

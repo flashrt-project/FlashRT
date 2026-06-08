@@ -106,6 +106,14 @@ void launch_qwen3_decode_attention_bf16(
     const void* q, const void* k_cache, const void* v_cache, void* out,
     int layer_idx, int max_seq, int kv_seq, int q_heads, int kv_heads,
     int head_dim, hipStream_t stream);
+void launch_pi05_siglip_attention_bf16(const void* q, const void* k,
+                                       const void* v, void* out,
+                                       int batch, int q_seq,
+                                       hipStream_t stream);
+void launch_pi05_gqa8_attention_bf16(const void* q, const void* k,
+                                     const void* v, void* out,
+                                     int batch, int q_seq, int kv_seq,
+                                     hipStream_t stream);
 void launch_qwen3_decode_attention_gate_quant_fp8_fnuz(
     const void* q, const void* k_cache, const void* v_cache,
     const void* gate, void* out, float* scale,
@@ -1396,6 +1404,26 @@ void silu_mul_merged_quantize_fp8_e4m3fnuz_ptr(
             "silu_mul_merged_quantize_fp8_e4m3fnuz_ptr launch");
 }
 
+void pi05_siglip_attention_bf16_ptr(
+    std::uintptr_t q, std::uintptr_t k, std::uintptr_t v, std::uintptr_t out,
+    int batch, int q_seq, std::uintptr_t stream = 0) {
+  launch_pi05_siglip_attention_bf16(
+      reinterpret_cast<const void*>(q), reinterpret_cast<const void*>(k),
+      reinterpret_cast<const void*>(v), reinterpret_cast<void*>(out),
+      batch, q_seq, stream_from_uint(stream));
+  hip_check(hipGetLastError(), "pi05_siglip_attention_bf16_ptr launch");
+}
+
+void pi05_gqa8_attention_bf16_ptr(
+    std::uintptr_t q, std::uintptr_t k, std::uintptr_t v, std::uintptr_t out,
+    int batch, int q_seq, int kv_seq, std::uintptr_t stream = 0) {
+  launch_pi05_gqa8_attention_bf16(
+      reinterpret_cast<const void*>(q), reinterpret_cast<const void*>(k),
+      reinterpret_cast<const void*>(v), reinterpret_cast<void*>(out),
+      batch, q_seq, kv_seq, stream_from_uint(stream));
+  hip_check(hipGetLastError(), "pi05_gqa8_attention_bf16_ptr launch");
+}
+
 void qwen3_decode_attention_bf16_ptr(
     std::uintptr_t q, std::uintptr_t k_cache, std::uintptr_t v_cache,
     std::uintptr_t out, int layer_idx, int max_seq, int kv_seq,
@@ -2512,6 +2540,17 @@ PYBIND11_MODULE(flash_rt_rocm_kernels, m) {
         py::arg("q_heads"), py::arg("kv_heads"), py::arg("head_dim"),
         py::arg("stream") = 0,
         "Run q_seq=1 Qwen3 GQA decode attention from owned BF16 Q/K/V cache.");
+  m.def("pi05_siglip_attention_bf16_ptr",
+        &pi05_siglip_attention_bf16_ptr,
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("out"),
+        py::arg("batch"), py::arg("q_seq"), py::arg("stream") = 0,
+        "Pi0.5 SigLIP BF16 CK attention over preallocated raw buffers.");
+  m.def("pi05_gqa8_attention_bf16_ptr",
+        &pi05_gqa8_attention_bf16_ptr,
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("out"),
+        py::arg("batch"), py::arg("q_seq"), py::arg("kv_seq"),
+        py::arg("stream") = 0,
+        "Pi0.5 BF16 GQA8 CK attention over preallocated raw buffers.");
   m.def("qwen3_decode_attention_gate_quant_fp8_fnuz_out",
         &qwen3_decode_attention_gate_quant_fp8_fnuz_out,
         py::arg("q"), py::arg("k_cache"), py::arg("v_cache"),

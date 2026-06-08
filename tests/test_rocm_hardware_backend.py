@@ -58,7 +58,7 @@ def test_rocm_raw_pointer_kernel_uses_hip_buffer_addresses():
     np.testing.assert_array_equal(out, a + b)
 
 
-def test_rocm_sdpa_attention_backend_protocol_slots():
+def test_rocm_ck_attention_backend_protocol_slots():
     from flash_rt.hardware.rocm.attn_backend import RocmSdpaAttnBackend
 
     backend = RocmSdpaAttnBackend(num_views=1, encoder_seq_max=64, chunk_size=5)
@@ -83,11 +83,11 @@ def test_rocm_sdpa_attention_backend_protocol_slots():
     assert decoder["K"] == encoder0["K"]
 
 
-def test_rocm_sdpa_attention_backend_matches_torch_reference():
+def test_rocm_ck_attention_backend_matches_torch_reference():
     from flash_rt.hardware.rocm.attn_backend import RocmSdpaAttnBackend
 
     backend = RocmSdpaAttnBackend(num_views=2, encoder_seq_max=64, chunk_size=5)
-    assert backend.active_backend_name in {"FLASH_ATTENTION", "auto"}
+    assert backend.active_backend_name == "ck_wmma"
     backend.vis_Q.copy_(torch.randn_like(backend.vis_Q.float()).to(torch.bfloat16))
     backend.vis_K.copy_(torch.randn_like(backend.vis_K.float()).to(torch.bfloat16))
     backend.vis_V.copy_(torch.randn_like(backend.vis_V.float()).to(torch.bfloat16))
@@ -106,7 +106,7 @@ def test_rocm_sdpa_attention_backend_matches_torch_reference():
     torch.testing.assert_close(backend.vis_O.float(), ref.float(), rtol=2e-2, atol=3e-2)
 
 
-def test_rocm_sdpa_attention_backend_encoder_and_decoder_shapes():
+def test_rocm_ck_attention_backend_encoder_and_decoder_shapes():
     from flash_rt.hardware.rocm.attn_backend import RocmSdpaAttnBackend
 
     backend = RocmSdpaAttnBackend(num_views=1, encoder_seq_max=64, chunk_size=5)
@@ -137,4 +137,4 @@ def test_rocm_sdpa_attention_backend_encoder_and_decoder_shapes():
     torch.cuda.synchronize()
     assert dec_ptr == backend.dec_O.data_ptr()
     assert backend.dec_O[:5].shape == (5, 8, 256)
-    assert backend.decoder_backend_name in {"FLASH_ATTENTION", "auto"}
+    assert backend.decoder_backend_name == "ck_wmma"
