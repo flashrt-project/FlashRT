@@ -533,6 +533,10 @@ class Pi05TorchFrontendRtx:
         self.current_prompt_len = 0
         self.pipeline: Optional[Pi05Pipeline] = None
         self._prompt_pipeline_cache: dict[int, Pi05Pipeline] = {}
+        # Fixed-shape (state_prompt_mode="fixed") pipeline, cached separately so
+        # switching to a no-state prompt and back reuses the already-calibrated,
+        # already-captured graph instead of rebuilding it.
+        self._fixed_pipeline: Optional[Pi05Pipeline] = None
         # RL inference configuration. ``None`` = default behaviour (single
         # forward, no advantage-conditioned prompt injection). When set
         # by :meth:`set_rl_mode`, the next :meth:`set_prompt` call builds
@@ -655,6 +659,7 @@ class Pi05TorchFrontendRtx:
             chunk_size=self.chunk_size,
             num_encoder_layers=ENC_L)
         self._prompt_pipeline_cache.clear()
+        self._fixed_pipeline = None
         self.pipeline = None
         self.current_prompt_len = 0
         self.graph_recorded = False
@@ -1048,16 +1053,21 @@ class Pi05TorchFrontendRtx:
 
     def _set_prompt_fixed(self, prompt_len: int) -> None:
         """Fixed-shape mode: build ONE max-length pipeline + one graph; later
-        prompt lengths only update embeds + seqused/devpos (no re-capture)."""
+        prompt lengths only update embeds + seqused/devpos (no re-capture).
+
+        The fixed pipeline is cached in ``self._fixed_pipeline`` so that
+        switching to a no-state prompt (which activates a per-length pipeline)
+        and back REUSES the already-calibrated, already-captured graph instead
+        of rebuilding it — a rebuild would re-run FP8 calibration/autotune on a
+        backend the per-length pipeline has since touched (observed CUDA illegal
+        access) and would also perturb numerics via autotune variance.
+        """
         self._ensure_prompt_capacity(PI05_STATE_PROMPT_MAX_LEN)
-        if (self.pipeline is None
-                or not getattr(self.pipeline, "_fixed_shape", False)):
+        if self._fixed_pipeline is None:
             logger.info("Building fixed-shape Pi05Pipeline (max_prompt_len=%d)...",
                         PI05_STATE_PROMPT_MAX_LEN)
-            self.graph_recorded = False
-            self.calibrated = False
             pipeline_weights = self._build_pipeline_weights()
-            self.pipeline = Pi05Pipeline(
+            self._fixed_pipeline = Pi05Pipeline(
                 gemm=self.gemm, fvk=self.fvk, attn_backend=self.attn_backend,
                 weights=pipeline_weights,
                 num_views=self.num_views,
@@ -1068,9 +1078,19 @@ class Pi05TorchFrontendRtx:
                 vision_num_layers=self._vision_num_layers,
                 fixed_shape=True,
                 **self._pipeline_precision_kwargs())
-            if self.pipeline.use_int8_vision_static:
-                self.pipeline.vis_int8_static_calibrated = False
-                self.pipeline.vis_int8_static_scales = {}
+            if self._fixed_pipeline.use_int8_vision_static:
+                self._fixed_pipeline.vis_int8_static_calibrated = False
+                self._fixed_pipeline.vis_int8_static_scales = {}
+        # (Re)activate the cached fixed pipeline, restoring calibration/capture
+        # state from the instance (mirrors the per-length cache reuse path) so
+        # predict() does not re-calibrate or re-capture on switch-back.
+        if self.pipeline is not self._fixed_pipeline:
+            self.pipeline = self._fixed_pipeline
+            self.graph_recorded = (
+                getattr(self._fixed_pipeline, "_graph", None) is not None)
+            self.calibrated = (
+                self.graph_recorded
+                or bool(getattr(self._fixed_pipeline, "fp8_calibrated", False)))
         self.current_prompt_len = prompt_len
 
     def _set_prompt_per_length(self, state, prompt_len: int) -> None:

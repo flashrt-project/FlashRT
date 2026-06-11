@@ -187,6 +187,37 @@ except RuntimeError:
 """
 
 
+# Switching a fixed-mode frontend to a no-state prompt and back must reuse the
+# cached fixed pipeline rather than rebuild it. A rebuild re-runs FP8
+# calibration/autotune on a backend the per-length pipeline has touched (CUDA
+# illegal access) and perturbs numerics. Run the full predict() in FP8 (the
+# default) through the switch and require it to complete with a stable output.
+_CHILD_SWITCH_PREDICT = r"""
+import sys, numpy as np, torch, flash_rt
+m = flash_rt.load_model(sys.argv[1], framework="torch", config="pi05",
+                        num_views=2, state_prompt_mode="fixed")  # FP8 default
+rng = np.random.RandomState(0)
+imgs = [rng.randint(0, 255, (224, 224, 3), dtype=np.uint8),
+        rng.randint(0, 255, (224, 224, 3), dtype=np.uint8)]
+st = np.zeros(8, dtype=np.float32)
+prompt = "pick up the cup"
+for kw in (dict(state=st), dict(), dict(state=st)):  # warm both pipelines
+    m.predict(imgs, prompt=prompt, **kw)
+
+def pr(**kw):
+    torch.manual_seed(11)
+    return np.asarray(m.predict(imgs, prompt=prompt, **kw), dtype=np.float32)
+
+a1 = pr(state=st)   # fixed
+_ = pr()            # no-state -> per-length pipeline
+a2 = pr(state=st)   # back to fixed (must reuse cached graph, same state)
+x, y = a1.reshape(-1).astype(np.float64), a2.reshape(-1).astype(np.float64)
+cos = float(x @ y / (np.linalg.norm(x) * np.linalg.norm(y)))
+finite = bool(np.isfinite(a1).all() and np.isfinite(a2).all())
+print("SWITCHPRED", finite, round(cos, 6))
+"""
+
+
 def _run_child_text(child_src):
     proc = subprocess.run([sys.executable, "-c", child_src, CKPT_PI05],
                           capture_output=True, text=True, env=dict(os.environ))
@@ -216,3 +247,18 @@ def test_fixed_shape_refuses_without_fa2_seqused():
     assert line.strip() == "RESULT RAISED", (
         f"fixed-shape must refuse when the FA2 seqused path is unavailable, "
         f"got: {line}")
+
+
+@pytest.mark.skipif(not _GPU_AVAILABLE, reason="CUDA GPU required")
+@pytest.mark.skipif(not _CKPT_AVAILABLE,
+                    reason=f"Pi0.5 checkpoint not found at {CKPT_PI05}")
+def test_fixed_shape_mode_switch_predict_fp8_no_rebuild():
+    out = _run_child_text(_CHILD_SWITCH_PREDICT)
+    line = [ln for ln in out.splitlines() if ln.startswith("SWITCHPRED")][-1]
+    _, finite, cos = line.split()
+    assert finite == "True", f"non-finite action through mode switch: {line}"
+    # Same state before and after the no-state detour: the cached fixed
+    # pipeline is reused (not rebuilt), so the outputs must match closely.
+    assert float(cos) >= 0.999, (
+        f"fixed pipeline not reused across mode switch (cos={cos}); a rebuild "
+        "would re-calibrate/re-capture and perturb the output")
