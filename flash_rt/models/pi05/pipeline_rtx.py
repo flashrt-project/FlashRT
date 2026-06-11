@@ -161,11 +161,20 @@ class Pi05Pipeline:
                  use_int8_vision_static: bool = False,
                  vision_pool_factor: int = 1,
                  vision_num_layers: int = VIS_L,
-                 num_steps: int = NUM_STEPS_DEFAULT):
+                 num_steps: int = NUM_STEPS_DEFAULT,
+                 fixed_shape: bool = False):
         self.gemm = gemm
         self.fvk = fvk
         self.attn = attn_backend
         self.weights = weights
+
+        # Fixed-shape state-prompt mode: one captured graph at the MAX prompt
+        # length serves every length via seqused masking + devpos K/V append.
+        # The attention backend masks padded keys; this pipeline appends the
+        # decoder K/V right after the valid prefix. Toggled by the frontend.
+        self._fixed_shape = bool(fixed_shape)
+        if self._fixed_shape:
+            self.attn._fixed_shape = True
 
         self.num_views = int(num_views)
         self.max_prompt_len = int(max_prompt_len)
@@ -1486,15 +1495,28 @@ class Pi05Pipeline:
                     B["decoder_QKV"].ptr.value,
                     ds, (DEC_NH + 2 * DEC_NKV) * DEC_HD, DEC_D, stream=stream)
 
-        # C2: QKV split + RoPE. Decoder K/V write into enc cache at offset enc_seq.
-        k_ptr, v_ptr = self._enc_kv_layer_ptrs(i, offset_tokens=enc_seq)
-        fvk.qkv_split_rope(
-            B["decoder_QKV"].ptr.value,
-            B["decoder_rope_weights"].ptr.value,
-            attn_ptrs["dec_Q"],
-            k_ptr, v_ptr,
-            ds, DEC_NH * DEC_HD, DEC_NKV * DEC_HD, DEC_NKV * DEC_HD,
-            DEC_HD, stream=stream)
+        # C2: QKV split + RoPE. Decoder K/V write into enc cache after prefix.
+        if self._fixed_shape:
+            # Fixed graph: append the action K/V right after the VALID prefix
+            # (runtime row offset = devpos), so cross-attn over [0:valid+chunk]
+            # is one contiguous (seqused) call. K/V pointers are cache base.
+            k_base, v_base = self._enc_kv_layer_ptrs(i, offset_tokens=0)
+            fvk.qkv_split_rope_devpos(
+                B["decoder_QKV"].ptr.value,
+                B["decoder_rope_weights"].ptr.value,
+                attn_ptrs["dec_Q"],
+                k_base, v_base, self.attn.dec_devpos.data_ptr(),
+                ds, DEC_NH * DEC_HD, DEC_NKV * DEC_HD, DEC_NKV * DEC_HD,
+                DEC_HD, stream=stream)
+        else:
+            k_ptr, v_ptr = self._enc_kv_layer_ptrs(i, offset_tokens=enc_seq)
+            fvk.qkv_split_rope(
+                B["decoder_QKV"].ptr.value,
+                B["decoder_rope_weights"].ptr.value,
+                attn_ptrs["dec_Q"],
+                k_ptr, v_ptr,
+                ds, DEC_NH * DEC_HD, DEC_NKV * DEC_HD, DEC_NKV * DEC_HD,
+                DEC_HD, stream=stream)
 
         # C3: Cross-attention (decoder Q over enc+dec K/V cache) — returns ptr.
         dec_o_ptr = self.attn.run(
@@ -1991,6 +2013,15 @@ class Pi05Pipeline:
             f"prompt_len {prompt_len} exceeds max_prompt_len {self.max_prompt_len}"
         assert lang_embeds_np.shape[1] == ENC_D
 
+        if self._fixed_shape and prompt_len < self.max_prompt_len:
+            # Pad to max with zeros so the in-graph embeds copy is a fixed
+            # MAX-row copy; the padded prompt rows are masked (seqused) in
+            # attention, so they never affect the valid output.
+            padded = np.zeros((self.max_prompt_len, ENC_D),
+                              dtype=lang_embeds_np.dtype)
+            padded[:prompt_len] = lang_embeds_np
+            lang_embeds_np = padded
+
         # Store a persistent device copy of the (prompt_len, ENC_D) embeds.
         # CUDA Graph capture bakes the source pointer used by
         # _copy_lang_embeds_to_encoder_x(), so same-shape prompt updates must
@@ -2005,6 +2036,11 @@ class Pi05Pipeline:
 
         # Update decoder RoPE slice for this prompt length
         self._set_decoder_rope_for_prompt(prompt_len)
+
+        # Fixed-shape: update the valid prefix length read by FA2 (seqused) +
+        # the devpos K/V append offset. Runtime device buffers; no recapture.
+        if self._fixed_shape:
+            self.attn.set_fixed_valid_len(self.vision_seq_enc + prompt_len)
 
         # Initial copy into encoder_x (so the FIRST calibration pass sees
         # the correct lang embeds without needing a prior forward() call).

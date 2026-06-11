@@ -757,6 +757,24 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("seq"), py::arg("q_dim"), py::arg("k_dim"), py::arg("v_dim"),
        py::arg("head_dim"), py::arg("stream") = 0);
 
+    // QKV split + RoPE with a runtime device K/V-cache row offset (devpos).
+    // K/V are cache BASE pointers; row written = devpos[0] + token index.
+    m.def("qkv_split_rope_devpos", [](uintptr_t qkv, uintptr_t rope_weights,
+                                       uintptr_t Q, uintptr_t K, uintptr_t V,
+                                       uintptr_t devpos,
+                                       int seq, int q_dim, int k_dim, int v_dim,
+                                       int head_dim, uintptr_t stream) {
+        qkv_split_rope_devpos(typed_ptr<__nv_bfloat16>(qkv),
+                              typed_ptr<__nv_bfloat16>(rope_weights),
+                              typed_ptr<__nv_bfloat16>(Q), typed_ptr<__nv_bfloat16>(K),
+                              typed_ptr<__nv_bfloat16>(V),
+                              typed_ptr<int>(devpos),
+                              seq, q_dim, k_dim, v_dim, head_dim, to_stream(stream));
+    }, py::arg("qkv"), py::arg("rope_weights"),
+       py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("devpos"),
+       py::arg("seq"), py::arg("q_dim"), py::arg("k_dim"), py::arg("v_dim"),
+       py::arg("head_dim"), py::arg("stream") = 0);
+
     // Elementwise
     m.def("gate_mul_residual", [](uintptr_t residual, uintptr_t x, uintptr_t gate, int n, uintptr_t stream) {
         gate_mul_residual(typed_ptr<__nv_bfloat16>(residual),

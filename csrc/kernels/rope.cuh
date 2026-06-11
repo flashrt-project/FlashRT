@@ -33,6 +33,16 @@ void qkv_split_rope(const __nv_bfloat16* qkv,
                      int seq, int q_dim, int k_dim, int v_dim, int head_dim,
                      cudaStream_t stream = 0);
 
+// Same as qkv_split_rope, but the K/V cache write row is shifted by a RUNTIME
+// device offset ``devpos[0]`` (K/V are cache base pointers, row 0). Lets one
+// fixed-shape graph append decoder K/V after a variable-length valid prefix.
+void qkv_split_rope_devpos(const __nv_bfloat16* qkv,
+                           const __nv_bfloat16* rope_weights,
+                           __nv_bfloat16* Q, __nv_bfloat16* K, __nv_bfloat16* V,
+                           const int* devpos,
+                           int seq, int q_dim, int k_dim, int v_dim,
+                           int head_dim, cudaStream_t stream = 0);
+
 // Fused QKV split + RoPE + KV cache write (FP16)
 // Matches pi05 qkv_split_rope_kvcache_k exactly.
 // Q → contiguous (S, Q_dim), K → Kc[kc_offset + s*kc_stride], V → Vc[kc_offset + s*kc_stride]

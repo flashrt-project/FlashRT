@@ -296,7 +296,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                vision_num_layers=None,
                cache_frames=None,
                use_fp16=False,
-               use_fp8=True):
+               use_fp8=True,
+               state_prompt_mode="exact"):
     """Load a FlashRT model.
 
     Args:
@@ -588,6 +589,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             kwargs["vision_num_layers"] = vision_num_layers
         if cache_frames is not None and "cache_frames" in sig.parameters:
             kwargs["cache_frames"] = cache_frames
+        # Pi0.5 state-in-prompt graph strategy: "fixed" (default, one graph) /
+        # "exact" (legacy per-length capture). Forwarded only if accepted.
+        if "state_prompt_mode" in sig.parameters:
+            kwargs["state_prompt_mode"] = state_prompt_mode
         # FP4 frontend accepts these extra kwargs (only set when the class
         # actually accepts them — base class ignores, FP4 subclass uses).
         if use_fp4 and "use_fp4_encoder_ffn" in sig.parameters:

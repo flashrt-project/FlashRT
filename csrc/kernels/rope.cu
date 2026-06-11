@@ -205,6 +205,77 @@ void qkv_split_rope(const __nv_bfloat16* qkv,
         qkv, rope_weights, Q, K, V, seq, q_dim, k_dim, v_dim, head_dim);
 }
 
+// ── Fused QKV Split + RoPE with a RUNTIME (device) K/V-cache row offset ──
+// Identical math to qkv_split_rope, but the K/V destination row is shifted by
+// ``devpos[0]`` read at launch time. Q is still written contiguous (rows 0..seq).
+// This lets a single fixed-shape CUDA graph append the decoder's K/V right
+// after a variable-length valid prefix (devpos = valid prefix length), so the
+// cross-attention can be one contiguous (seqused) call instead of recapturing
+// per prompt length. K/V are the cache BASE pointers (row 0), not pre-offset.
+__global__ void qkv_split_rope_devpos_kernel(
+    const __nv_bfloat16* __restrict__ qkv,
+    const __nv_bfloat16* __restrict__ rope_weights,
+    __nv_bfloat16* __restrict__ Q,
+    __nv_bfloat16* __restrict__ K,
+    __nv_bfloat16* __restrict__ V,
+    const int* __restrict__ devpos,
+    int seq, int q_dim, int k_dim, int v_dim, int head_dim) {
+    int qkv_dim = q_dim + k_dim + v_dim;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seq * qkv_dim;
+    if (idx >= total) return;
+
+    int row = idx / qkv_dim;
+    int col = idx % qkv_dim;
+    int pos = devpos[0];  // runtime K/V-cache row offset (valid prefix length)
+
+    if (col < q_dim) {
+        int q_col = col;
+        int head = q_col / head_dim;
+        int d_in_head = q_col % head_dim;
+        int pair = d_in_head / 2;
+        int is_odd = d_in_head & 1;
+        int pair_base_qkv = row * qkv_dim + head * head_dim + pair * 2;
+        float x0 = bf16_to_f32(qkv[pair_base_qkv]);
+        float x1 = bf16_to_f32(qkv[pair_base_qkv + 1]);
+        int rope_base = row * head_dim + pair * 2;
+        float c = bf16_to_f32(rope_weights[rope_base]);
+        float s = bf16_to_f32(rope_weights[rope_base + 1]);
+        int out_idx = row * q_dim + q_col;
+        if (is_odd == 0) Q[out_idx] = f32_to_bf16(x0 * c - x1 * s);
+        else             Q[out_idx] = f32_to_bf16(x1 * c + x0 * s);
+    } else if (col < q_dim + k_dim) {
+        int k_col = col - q_dim;
+        int pair = k_col / 2;
+        int is_odd = k_col & 1;
+        int pair_base_qkv = row * qkv_dim + q_dim + pair * 2;
+        float x0 = bf16_to_f32(qkv[pair_base_qkv]);
+        float x1 = bf16_to_f32(qkv[pair_base_qkv + 1]);
+        int rope_base = row * head_dim + pair * 2;
+        float c = bf16_to_f32(rope_weights[rope_base]);
+        float s = bf16_to_f32(rope_weights[rope_base + 1]);
+        int out_idx = (pos + row) * k_dim + k_col;
+        if (is_odd == 0) K[out_idx] = f32_to_bf16(x0 * c - x1 * s);
+        else             K[out_idx] = f32_to_bf16(x1 * c + x0 * s);
+    } else {
+        int v_col = col - q_dim - k_dim;
+        V[(pos + row) * v_dim + v_col] = qkv[idx];
+    }
+}
+
+void qkv_split_rope_devpos(const __nv_bfloat16* qkv,
+                           const __nv_bfloat16* rope_weights,
+                           __nv_bfloat16* Q, __nv_bfloat16* K, __nv_bfloat16* V,
+                           const int* devpos,
+                           int seq, int q_dim, int k_dim, int v_dim,
+                           int head_dim, cudaStream_t stream) {
+    int total = seq * (q_dim + k_dim + v_dim);
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    qkv_split_rope_devpos_kernel<<<blocks, threads, 0, stream>>>(
+        qkv, rope_weights, Q, K, V, devpos, seq, q_dim, k_dim, v_dim, head_dim);
+}
+
 // ── Fused QKV Split + RoPE + KV Cache Write (FP16) ──
 // Direct port of pi05 qkv_split_rope_kvcache_k for FP16 data.
 // Q → contiguous (S, Q_dim)
