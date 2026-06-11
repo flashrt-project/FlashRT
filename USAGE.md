@@ -139,12 +139,13 @@ ONE pipeline and ONE captured CUDA Graph at the max prompt length serve every
 length: the padded prefix keys are masked (FlashAttention-2 `seqused_k`) and the
 decoder's action K/V are appended right after the *valid* prefix
 (`qkv_split_rope_devpos`), so a changing state-token length **never re-captures
-a graph or reruns autotune** — no warmup needed. The trade-off is that every
-inference runs at the padded max length, so steady-state latency is somewhat
-higher than `"exact"` at a given length (it buys you no recapture stalls when
-the length drifts). Lower `PI05_STATE_PROMPT_MAX_LEN` toward your real maximum
-to shrink the padding. Enable it when you don't want to enumerate state lengths
-up front:
+a graph or reruns autotune** — no warmup needed. The trade-off is latency:
+every inference runs at the padded max length, so `"fixed"` is ~+4.6 ms (2
+views) / +6.7 ms (3 views) slower than `"exact"` at a typical prompt length —
+for peak performance prefer `"exact"` and warm a fuller length sweep yourself
+with `warm_state_prompt_buckets()`. (Lowering `PI05_STATE_PROMPT_MAX_LEN`
+toward your real maximum shrinks the padding and the gap.) Enable `"fixed"`
+when you don't want to enumerate state lengths up front:
 
 ```python
 model = flash_rt.load_model(
