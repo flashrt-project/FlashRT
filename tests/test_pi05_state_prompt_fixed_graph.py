@@ -1,11 +1,11 @@
 """End-to-end gate for the Pi0.5 fixed-shape state-prompt graph.
 
 Pi0.5 renders the discretized robot state into the language prompt, so the
-prompt token length drifts with the state values. The default
+prompt token length drifts with the state values. The opt-in
 ``state_prompt_mode="fixed"`` keeps ONE pipeline and ONE captured graph at the
 max prompt length: every length is served by masking the padded prefix keys
 (FlashAttention-2 ``seqused_k``) and appending the decoder's action K/V right
-after the valid prefix (``qkv_split_rope_devpos``). The legacy ``"exact"`` mode
+after the valid prefix (``qkv_split_rope_devpos``). The default ``"exact"`` mode
 captures a separate graph per length.
 
 Gates (each mode runs in its own child process; sharing a CUDA context between
@@ -143,3 +143,76 @@ def test_fixed_graph_mechanism_exact_and_one_graph():
         assert c >= 0.9999, (
             f"BF16 step {i} (len={fixed['lens'][i]}): fixed vs exact "
             f"cos={c:.7f} — seqused/devpos mechanism is not bit-exact")
+
+
+# The shared attention backend must track the active pipeline's mode: a
+# fixed-mode frontend that serves a state prompt and then a no-state prompt
+# (which falls back to a per-length pipeline) must NOT leave the backend in
+# fixed mode with stale seqused/devpos.
+_CHILD_SWITCH = r"""
+import sys, numpy as np, flash_rt
+m = flash_rt.load_model(sys.argv[1], framework="torch", config="pi05",
+                        num_views=2, state_prompt_mode="fixed")
+fe = m._pipe
+st = np.zeros(8, dtype=np.float32)
+flags = []
+def active_flag():
+    # The frontend may swap attn_backend when growing prompt capacity, so read
+    # it fresh; it must be the SAME object the active pipeline runs on.
+    assert fe.attn_backend is fe.pipeline.attn, "backend/pipeline mismatch"
+    return bool(fe.attn_backend._fixed_shape)
+fe.set_prompt("pick up the cup", state=st)        # fixed pipeline
+flags.append(active_flag())
+fe.set_prompt("pick up the cup")                  # no-state -> per-length
+flags.append(active_flag())
+fe.set_prompt("pick up the cup", state=st + 1.0)  # fixed again
+flags.append(active_flag())
+print("FLAGS", flags[0], flags[1], flags[2])
+"""
+
+# Fixed shape relies on the vendored bf16 FA2 seqused path; if a site is
+# unavailable it must REFUSE (raise) rather than silently run the unmasked
+# legacy path on padded keys.
+_CHILD_FA2_GUARD = r"""
+import sys, flash_rt
+m = flash_rt.load_model(sys.argv[1], framework="torch", config="pi05",
+                        num_views=2, state_prompt_mode="exact")
+be = m._pipe.attn_backend
+be._fa2_sites["encoder"] = False   # simulate FA2 excluded for a site
+try:
+    be.set_fixed_shape(True)
+    print("RESULT NO_RAISE")
+except RuntimeError:
+    print("RESULT RAISED")
+"""
+
+
+def _run_child_text(child_src):
+    proc = subprocess.run([sys.executable, "-c", child_src, CKPT_PI05],
+                          capture_output=True, text=True, env=dict(os.environ))
+    if proc.returncode != 0:
+        raise RuntimeError(f"child failed:\n{proc.stdout}\n{proc.stderr}")
+    return proc.stdout
+
+
+@pytest.mark.skipif(not _GPU_AVAILABLE, reason="CUDA GPU required")
+@pytest.mark.skipif(not _CKPT_AVAILABLE,
+                    reason=f"Pi0.5 checkpoint not found at {CKPT_PI05}")
+def test_fixed_shape_backend_synced_on_mode_switch():
+    out = _run_child_text(_CHILD_SWITCH)
+    line = [ln for ln in out.splitlines() if ln.startswith("FLAGS")][-1]
+    _, a, b, c = line.split()
+    assert (a, b, c) == ("True", "False", "True"), (
+        f"backend _fixed_shape not synced to active pipeline: {line} "
+        "(state->True, no-state->False, state->True expected)")
+
+
+@pytest.mark.skipif(not _GPU_AVAILABLE, reason="CUDA GPU required")
+@pytest.mark.skipif(not _CKPT_AVAILABLE,
+                    reason=f"Pi0.5 checkpoint not found at {CKPT_PI05}")
+def test_fixed_shape_refuses_without_fa2_seqused():
+    out = _run_child_text(_CHILD_FA2_GUARD)
+    line = [ln for ln in out.splitlines() if ln.startswith("RESULT")][-1]
+    assert line.strip() == "RESULT RAISED", (
+        f"fixed-shape must refuse when the FA2 seqused path is unavailable, "
+        f"got: {line}")

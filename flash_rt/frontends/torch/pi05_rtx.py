@@ -1013,6 +1013,10 @@ class Pi05TorchFrontendRtx:
                 raise ValueError(
                     "Pi0.5 RL CFG mode does not support state-in-prompt yet")
             self._set_prompt_rl(prompt_text)
+            # RL has no state-in-prompt; ensure the shared backend is not stuck
+            # in fixed-shape mode from a prior state prompt.
+            self.attn_backend.set_fixed_shape(
+                bool(getattr(self.pipeline, "_fixed_shape", False)))
             return
 
         max_len = (PI05_STATE_PROMPT_MAX_LEN if state is not None
@@ -1024,6 +1028,14 @@ class Pi05TorchFrontendRtx:
             self._set_prompt_fixed(prompt_len)
         else:
             self._set_prompt_per_length(state, prompt_len)
+
+        # The attention backend is shared across pipelines, so sync its
+        # fixed-shape mode to the now-active pipeline BEFORE running it. Without
+        # this, a frontend that ran a fixed state prompt and then a no-state
+        # prompt (which falls back to a per-length pipeline) would keep the
+        # backend in fixed mode and reuse stale seqused/devpos buffers.
+        self.attn_backend.set_fixed_shape(
+            bool(getattr(self.pipeline, "_fixed_shape", False)))
 
         # Upload language embeds into pipeline's encoder_x slot. In fixed mode
         # set_language_embeds pads to max + updates the seqused/devpos buffers.

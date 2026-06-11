@@ -171,10 +171,13 @@ class Pi05Pipeline:
         # Fixed-shape state-prompt mode: one captured graph at the MAX prompt
         # length serves every length via seqused masking + devpos K/V append.
         # The attention backend masks padded keys; this pipeline appends the
-        # decoder K/V right after the valid prefix. Toggled by the frontend.
+        # decoder K/V right after the valid prefix. set_fixed_shape validates
+        # the FA2 seqused path is available (fail-fast for fixed pipelines).
+        # NOTE: the backend is SHARED across pipelines, so the frontend re-syncs
+        # backend.set_fixed_shape(active_pipeline._fixed_shape) on every prompt
+        # — this build-time call must not be relied on for run-time mode.
         self._fixed_shape = bool(fixed_shape)
-        if self._fixed_shape:
-            self.attn._fixed_shape = True
+        self.attn.set_fixed_shape(self._fixed_shape)
 
         self.num_views = int(num_views)
         self.max_prompt_len = int(max_prompt_len)

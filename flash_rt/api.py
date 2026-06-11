@@ -377,6 +377,17 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             1 runs the full vision+encoder+decoder path on every frame; 2
             alternates full and decoder-only frames. ``None`` keeps the
             frontend default.
+        state_prompt_mode: Pi0.5 torch RTX only. How the variable-length
+            state-in-prompt is mapped to CUDA graphs:
+              ``"exact"`` (default) — one captured graph per exact prompt
+                length, cached; pair with ``warm_state_prompt_buckets()`` to
+                front-load the lengths you expect. Unchanged legacy behavior.
+              ``"fixed"`` — ONE graph at the max prompt length serves every
+                length (padded prefix masked via FA2 ``seqused_k`` + decoder
+                K/V appended at the valid offset); a changing length never
+                re-captures and no warmup is needed. Requires the vendored
+                bf16 FA2 path (``FVK_RTX_FA2=1``, encoder+decoder sites on).
+            Env override: ``FLASHRT_PI05_STATE_PROMPT_MODE``.
 
     Returns:
         VLAModel instance with .predict() method.
@@ -589,8 +600,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             kwargs["vision_num_layers"] = vision_num_layers
         if cache_frames is not None and "cache_frames" in sig.parameters:
             kwargs["cache_frames"] = cache_frames
-        # Pi0.5 state-in-prompt graph strategy: "fixed" (default, one graph) /
-        # "exact" (legacy per-length capture). Forwarded only if accepted.
+        # Pi0.5 state-in-prompt graph strategy: "exact" (default, per-length
+        # capture) / "fixed" (opt-in, one graph). Forwarded only if accepted.
         if "state_prompt_mode" in sig.parameters:
             kwargs["state_prompt_mode"] = state_prompt_mode
         # FP4 frontend accepts these extra kwargs (only set when the class

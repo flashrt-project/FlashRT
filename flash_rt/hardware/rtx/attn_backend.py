@@ -478,6 +478,40 @@ class RtxFlashAttnBackend:
             stream=stream,
         )
 
+    def set_fixed_shape(self, enabled: bool) -> None:
+        """Enable/disable fixed-shape (seqused/devpos) state-prompt execution.
+
+        Fixed shape masks the padded prompt prefix with FlashAttention-2
+        ``seqused_k`` (``fwd_bf16_seqused``) on the encoder + decoder sites, so
+        it is ONLY correct on the vendored bf16 FA2 path with those sites
+        enabled. The legacy pip-flash-attn fallback (``FVK_RTX_FA2=0`` or a
+        site excluded via ``FVK_RTX_FA2_SITES``) does NOT mask the padded keys
+        and would silently produce wrong output — so refuse to enable there
+        instead of falling back. Call with ``False`` to return to per-length
+        execution (the shared backend is reused across pipelines, so the active
+        pipeline must sync this each time it changes).
+        """
+        if enabled:
+            reasons = []
+            if self._is_fp16:
+                reasons.append("backend is fp16 (seqused path is bf16-only)")
+            if not self._use_fvk_fa2:
+                reasons.append("FVK_RTX_FA2=0 (vendored FA2 disabled)")
+            if not self._fa2_sites.get("encoder", False):
+                reasons.append("encoder excluded from FVK_RTX_FA2_SITES")
+            if not self._fa2_sites.get("decoder", False):
+                reasons.append("decoder excluded from FVK_RTX_FA2_SITES")
+            if not hasattr(getattr(self, "_fa2", None), "fwd_bf16_seqused"):
+                reasons.append("flash_rt_fa2.fwd_bf16_seqused unavailable")
+            if reasons:
+                raise RuntimeError(
+                    "Pi0.5 fixed-shape state-prompt mode needs the vendored "
+                    "bf16 FlashAttention-2 seqused path on the encoder+decoder "
+                    "sites; refusing because: " + "; ".join(reasons) + ". Use "
+                    "state_prompt_mode='exact' (per-length capture), or enable "
+                    "FA2 (unset FVK_RTX_FA2 / FVK_RTX_FA2_SITES).")
+        self._fixed_shape = bool(enabled)
+
     def set_fixed_valid_len(self, valid_prefix_len: int) -> None:
         """Update the fixed-shape valid prefix length (host->device).
 
