@@ -1699,6 +1699,11 @@ class Pi05TorchFrontendRtx:
                 encoder_seq_max=enc_seq_max,
                 chunk_size=self.chunk_size,
                 num_encoder_layers=ENC_L)
+            # Replacing the backend orphans any single-sample pipelines that were
+            # bound to the old one; drop the caches so they are rebuilt on the
+            # new backend (mirrors _ensure_prompt_capacity()).
+            self._prompt_pipeline_cache.clear()
+            self._fixed_pipeline = None
         self._batched_active = True
         # Force pipeline rebuild so set_prompt_batch picks the batched class.
         if not isinstance(self.pipeline, Pi05BatchedPipeline):
