@@ -224,6 +224,7 @@ model = flash_rt.load_model(
 | `vision_pool_factor` | `int\|None` | `None` | Pi0.5 torch RTX/Orin. Spatial pooling factor for vision tokens. The FP16 RTX path currently supports only `1`. |
 | `vision_num_layers` | `int\|None` | `None` | Pi0.5 torch RTX/Orin. Number of SigLIP vision layers to run. |
 | `cache_frames` | `int\|None` | `None` | Pi0.5 torch RTX/Orin. Temporal encoder K/V cache period; `1` means no temporal reuse. |
+| `state_prompt_mode` | `str` | `"exact"` | Pi0.5 torch RTX. State-in-prompt graph strategy: `"exact"` (per-length capture + `warm_state_prompt_buckets()`) or `"fixed"` (one graph at the max length, no recapture; ~+4.6 ms/2v, +6.7 ms/3v). Env override `FLASHRT_PI05_STATE_PROMPT_MODE`. See [Pi0.5 State Prompts](#pi05-state-prompts). |
 
 ### Pi0.5 state prompt bucket warmup
 

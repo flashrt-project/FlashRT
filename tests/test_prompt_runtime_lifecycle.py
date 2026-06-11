@@ -3,6 +3,18 @@ from pathlib import Path
 import numpy as np
 
 
+class _FakeAttnBackend:
+    """Minimal stand-in for RtxFlashAttnBackend in the lightweight lifecycle
+    tests: set_prompt() syncs the shared backend's fixed-shape flag to the
+    active pipeline, so the mock must accept set_fixed_shape()."""
+
+    def __init__(self):
+        self._fixed_shape = False
+
+    def set_fixed_shape(self, enabled):
+        self._fixed_shape = bool(enabled)
+
+
 def test_pi05_rtx_caches_recurring_state_prompt_lengths(monkeypatch):
     import torch
     from flash_rt.frontends.torch import pi05_rtx
@@ -38,11 +50,13 @@ def test_pi05_rtx_caches_recurring_state_prompt_lengths(monkeypatch):
     pipe.pipeline = None
     pipe.current_prompt_len = 0
     pipe._prompt_pipeline_cache = {}
+    pipe._fixed_pipeline = None
+    pipe._state_prompt_mode = "exact"
     pipe.graph_recorded = False
     pipe.calibrated = False
     pipe.gemm = None
     pipe.fvk = None
-    pipe.attn_backend = None
+    pipe.attn_backend = _FakeAttnBackend()
     pipe._build_pipeline_weights = lambda: {}
     pipe._pipeline_precision_kwargs = lambda: {}
 
@@ -98,11 +112,13 @@ def test_vla_model_warms_pi05_state_prompt_buckets(monkeypatch):
     pipe.pipeline = None
     pipe.current_prompt_len = 0
     pipe._prompt_pipeline_cache = {}
+    pipe._fixed_pipeline = None
+    pipe._state_prompt_mode = "exact"
     pipe.graph_recorded = False
     pipe.calibrated = False
     pipe.gemm = None
     pipe.fvk = None
-    pipe.attn_backend = None
+    pipe.attn_backend = _FakeAttnBackend()
     pipe._build_pipeline_weights = lambda: {}
     pipe._pipeline_precision_kwargs = lambda: {}
 
