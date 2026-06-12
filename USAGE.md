@@ -140,12 +140,15 @@ length: the padded prefix keys are masked (FlashAttention-2 `seqused_k`) and the
 decoder's action K/V are appended right after the *valid* prefix
 (`qkv_split_rope_devpos`), so a changing state-token length **never re-captures
 a graph or reruns autotune** — no warmup needed. The trade-off is latency:
-every inference runs at the padded max length, so `"fixed"` is ~+4.6 ms (2
-views) / +6.7 ms (3 views) slower than `"exact"` at a typical prompt length —
-for peak performance prefer `"exact"` and warm a fuller length sweep yourself
-with `warm_state_prompt_buckets()`. (Lowering `PI05_STATE_PROMPT_MAX_LEN`
-toward your real maximum shrinks the padding and the gap.) Enable `"fixed"`
-when you don't want to enumerate state lengths up front:
+every inference runs at the padded max length, so `"fixed"` is ~+1.0 ms (2
+views) / +1.2 ms (3 views) slower than `"exact"` at a typical prompt length
+(measured fp8, RTX 5090; the decoder joint-attention uses a graph-safe
+split-KV kernel that keeps the padding overhead small). That ~1 ms makes
+`"fixed"` the low-friction choice when the state-token length drifts: zero
+recapture, no length enumeration. Prefer `"exact"` + `warm_state_prompt_buckets()`
+only when you need absolute peak latency at a known, stable set of lengths.
+(Lowering `PI05_STATE_PROMPT_MAX_LEN` toward your real maximum shrinks the
+padding and the gap further.) Enable `"fixed"` like so:
 
 ```python
 model = flash_rt.load_model(
