@@ -651,7 +651,7 @@ System requirements:
 
 | Component | Minimum | Notes |
 |---|---|---|
-| GPU | SM80+ (A100, 30xx+, Thor, 4090, 5090) | |
+| GPU | SM80+ (A100, 30xx+, Thor, 4090, 5090, DGX Spark) | |
 | NVIDIA driver | 545+ for CUDA 13, 525+ for CUDA 12.4 | 5090 needs 550+ |
 | CUDA Toolkit | 12.4+ (Thor/Hopper) or 12.8+ (Blackwell) | CUDA 13 recommended on 5090 |
 | Python | 3.10 / 3.11 / 3.12 | 3.12 on the default NGC image |
@@ -724,13 +724,14 @@ arch. Override for cross-compilation or when auto-detect fails:
 
 ```bash
 cmake -B build -S . -DGPU_ARCH=110   # Jetson AGX Thor   (FA2 skipped, CUTLASS SM100 path ON)
-cmake -B build -S . -DGPU_ARCH=120   # RTX 5090           (FA2 sm_80+sm_120 AOT, NVFP4 ON)
+cmake -B build -S . -DGPU_ARCH=121   # DGX Spark / GB10   (FA2 sm_121 AOT, NVFP4 ON)
+cmake -B build -S . -DGPU_ARCH=120   # RTX 5090           (FA2 sm_120 AOT, NVFP4 ON)
 cmake -B build -S . -DGPU_ARCH=89    # RTX 4090           (FA2 sm_80 AOT natively runs on Ada)
 cmake -B build -S . -DGPU_ARCH=86    # RTX 3090 / A10     (FA2 sm_80 AOT)
 cmake -B build -S . -DGPU_ARCH=80    # A100               (FA2 sm_80 AOT)
 ```
 
-FA2 is enabled by CMake when `GPU_ARCH ∈ {80, 86, 89, 120}`. Other
+FA2 is enabled by CMake when `GPU_ARCH ∈ {80, 86, 89, 120, 121}`. Other
 arches (notably Thor SM110 and SM90 Hopper) route attention through
 the cuBLAS-decomposed `fvk.attention_qkv_fp16` path instead of FA2 —
 `flash_rt_fa2.so` simply isn't built, and no runtime error results.
@@ -742,7 +743,7 @@ On a 5090 with CUDA 13 in a warm container, `make -j$(nproc)`:
 | Target | Time |
 |---|---|
 | `flash_rt_kernels` (main kernels) | ~2 min |
-| `flash_rt_fa2` (FA2 vendor, default — 12 kernel .cu files × 3 arches) | **~4.5 min** (267 s) |
+| `flash_rt_fa2` (FA2 vendor, default — 12 kernel .cu files × sm_80 + sm_120/sm_121 + Blackwell PTX fallback) | **~4.5 min** (267 s) |
 | Full `make -j$(nproc)` | ~6.5 min |
 
 Subsequent rebuilds of only the hand-written kernels take ~2 min —
@@ -759,7 +760,7 @@ opt-in CMake flags trade binary coverage for iteration speed:
 
 | Flag | Default | What it does | `fa2` cold build on 5090 |
 |---|---|---|---|
-| — | (none) | 12 .cu × sm_80 + sm_120 + PTX fallback | **267 s (4.5 min)** |
+| — | (none) | 12 .cu × sm_80 + sm_120/sm_121 + Blackwell PTX fallback | **267 s (4.5 min)** |
 | `-DFA2_ARCH_NATIVE_ONLY=ON` | OFF | Only emit SASS for the detected GPU; skip sm_80 + PTX passes | **110 s** (−59%) |
 | `-DFA2_HDIMS="96;256"` | `"96;128;256"` | Drop `head_dim=128` (shipped models don't use it; reserved for future DiT variants) | **210 s** (−21%) |
 | `-DFA2_DTYPES="fp16"` | `"fp16;bf16"` | Drop bf16 (Pi0 is fp16-only; Pi0.5 / GROOT need bf16) | **179 s** (−33%) |

@@ -28,7 +28,7 @@ flash_rt.__version__` returns the installed version, and
 
 | Component | Minimum | Notes |
 |---|---|---|
-| GPU | SM80+ | A100 / RTX 30-series / 40-series / Thor / 5090. Pre-SM80 (V100, 20-series) is unsupported — FA2 vendored code requires Ampere. |
+| GPU | SM80+ | A100 / RTX 30-series / 40-series / Thor / 5090 / DGX Spark. Pre-SM80 (V100, 20-series) is unsupported — FA2 vendored code requires Ampere. |
 | NVIDIA driver | 525+ (CUDA 12.4) / 545+ (CUDA 13) | 5090 needs 550+ |
 | CUDA Toolkit | 12.4+ on Thor/Ada/Hopper, 12.8+ on Blackwell | CUDA 13 is the NGC-image default |
 | Python | 3.10 / 3.11 / 3.12 | One venv; the interpreter that runs `cmake` MUST match the interpreter that later imports `flash_rt` |
@@ -83,7 +83,7 @@ built, and `import flash_rt` later would fail with a missing
 
 ```bash
 cmake -B build -S .                  # auto-detects GPU arch via nvidia-smi
-# Or override: cmake -B build -S . -DGPU_ARCH=110   (110=Thor, 120=5090, 89=4090, 80=A100)
+# Or override: cmake -B build -S . -DGPU_ARCH=121   (121=Spark, 120=5090, 110=Thor, 89=4090, 80=A100)
 cmake --build build -j$(nproc)       # equivalent to: ninja -C build, or make -C build
 ```
 
@@ -100,17 +100,19 @@ Per-arch produced shared libraries:
 |---------|:----------------------:|:------------------:|:------------------:|:-------------------------:|
 | Thor (SM110) | ✅ | ✅ | — | ✅ (SigLIP fast path) |
 | Hopper (SM100) | ✅ | ✅ | — | ✅ |
+| DGX Spark / GB10 (SM121) | ✅ | ✅ | ✅ (in-SO FA2) | — |
 | RTX 5090 (SM120) | ✅ | ✅ | ✅ (in-SO FA2) | — |
 | RTX 4090 (SM89) | ✅ | — | ✅ (in-SO FA2) | — |
 
 ### 6.1 Building on CUDA < 12.8
 
-The default vendor build of Flash-Attention 2 emits a ``compute_120``
-PTX fallback alongside the per-arch SASS so a single ``.so`` covers
-all listed gencodes — including Blackwell (SM120) targets that need
+The default vendor build of Flash-Attention 2 emits Blackwell PTX
+fallbacks alongside the per-arch SASS so a single ``.so`` covers all
+listed gencodes — including Blackwell SM120/SM121 targets that need
 CUDA 12.8+. On older toolchains (e.g. an L40S running a CUDA-12.4
-image) ``nvcc`` rejects the ``compute_120`` PTX target with a
-``Value 'compute_120' is not defined`` error and the build aborts.
+image) ``nvcc`` rejects the Blackwell PTX target with a
+``Value 'compute_120' is not defined`` or
+``Value 'compute_121' is not defined`` error and the build aborts.
 
 If you only need a binary for the GPU detected on the build host
 (typical for cloud / self-hosted users that aren't shipping the
