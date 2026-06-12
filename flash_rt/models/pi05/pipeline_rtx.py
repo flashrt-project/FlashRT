@@ -254,6 +254,9 @@ class Pi05Pipeline:
         # FP8 activation scratch buffers + per-layer static scales
         self.fp8_act_scales = {}  # name -> CudaBuffer(1, fp32)
         self.fp8_calibrated = False
+        # Set once autotune_gemms() has benchmarked this pipeline's (fixed) GEMM
+        # shapes, so repeat calls (frontend + record_infer_graph) are no-ops.
+        self._gemms_autotuned = False
         self._fp8_current_decoder_step = -1
         self._allocate_fp8_scratch()
         self.int8_act_scales = {}  # name -> CudaBuffer(rows, fp32), runtime-dynamic
@@ -1732,7 +1735,12 @@ class Pi05Pipeline:
         """Benchmark cuBLASLt algorithms for each GEMM shape and cache the best.
 
         Call after ``calibrate_fp8()`` and before ``record_infer_graph()``.
+        Idempotent: a pipeline's GEMM shapes are fixed, so once tuned, repeat
+        calls return immediately (the frontend tunes before capture and
+        record_infer_graph tunes again — without this guard that ran twice).
         """
+        if self._gemms_autotuned:
+            return
         B = self.bufs
         W = self.weights
         gemm = self.gemm
@@ -1885,6 +1893,7 @@ class Pi05Pipeline:
                 "Skipping cuBLASLt INT8 autotune: decoder INT8 uses CUTLASS fused path")
 
         self._cudart.cudaDeviceSynchronize()
+        self._gemms_autotuned = True
         logger.info("Autotune complete")
 
     # ── opt-in: route graph REPLAY through the FlashRT exec contract ──
