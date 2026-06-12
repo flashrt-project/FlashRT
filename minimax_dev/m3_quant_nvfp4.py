@@ -36,7 +36,9 @@ import time
 
 import torch
 import torch.nn.functional as F
-from safetensors import safe_open
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from raw_st_reader import RawShardReader  # noqa: E402
 
 HIDDEN = 6144
 LAYERS = 60
@@ -105,20 +107,7 @@ def selfcheck_gemm(fvk, qz, w_bf16, packed, sf, alpha, device):
     return float(cos)
 
 
-class Reader:
-    def __init__(self, model_dir):
-        self.model_dir = model_dir
-        idx = json.load(open(os.path.join(model_dir,
-                                          "model.safetensors.index.json")))
-        self.wm = idx["weight_map"]
-        self._h = {}
-
-    def get(self, name, device):
-        sh = self.wm[name]
-        if sh not in self._h:
-            self._h[sh] = safe_open(os.path.join(self.model_dir, sh),
-                                    framework="pt", device="cpu")
-        return self._h[sh].get_tensor(name).to(device)
+Reader = RawShardReader  # pread-based; safetensors mmap is ~0.3 GB/s on GB10
 
 
 def do_layer(i, rd, qz, fvk, out_dir, device, selfcheck):
@@ -183,14 +172,17 @@ def do_layer(i, rd, qz, fvk, out_dir, device, selfcheck):
                          ("sh_down", "block_sparse_moe.shared_experts.down_proj.weight")]:
             q_to(pref, nm)
 
-        # routed experts -> packed bin
+        # routed experts -> packed bin (parallel pread whole layer to CPU)
         alphas = torch.zeros(N_EXPERTS, 3, dtype=torch.float32)
+        names = [f"{b}experts.{e}.{wn}.weight"
+                 for e in range(N_EXPERTS) for wn in ("w1", "w3", "w2")]
+        cpu = rd.get_many(names, device="cpu")
         tmp_path = bin_path + ".tmp"
         with open(tmp_path, "wb") as f:
             for e in range(N_EXPERTS):
                 blk = bytearray()
                 for j, wn in enumerate(["w1", "w3", "w2"]):
-                    w = rd.get(f"{b}experts.{e}.{wn}.weight", device)
+                    w = cpu[3 * e + j].to(device)
                     w = w.to(torch.bfloat16).contiguous()
                     packed, sf, alpha = qz.quant(w)
                     alphas[e, j] = alpha
@@ -221,6 +213,7 @@ def do_layer(i, rd, qz, fvk, out_dir, device, selfcheck):
 
     torch.save(res, res_path + ".tmp")
     os.replace(res_path + ".tmp", res_path)
+    rd.drop_all()  # keep streamed bytes out of the cgroup page cache
     checks = {k: v for k, v in res.items() if k.endswith("_cos")}
     print(f"layer {i}: done in {time.time() - t0:.1f}s {checks}", flush=True)
     del res

@@ -35,7 +35,11 @@ from collections import defaultdict
 
 import torch
 import torch.nn.functional as F
-from safetensors import safe_open
+
+sys_dir = os.path.dirname(os.path.abspath(__file__))
+import sys  # noqa: E402
+sys.path.insert(0, sys_dir)
+from raw_st_reader import RawShardReader  # noqa: E402
 
 torch.manual_seed(0)
 
@@ -67,28 +71,7 @@ DENSE_LAYERS = {0, 1, 2}  # dense MLP + full attention; 3..59 are MoE + sparse a
 PFX = "language_model.model."
 
 
-class ShardReader:
-    """weight_map-driven tensor loader over the original safetensors shards."""
-
-    def __init__(self, model_dir: str, device: str):
-        self.model_dir = model_dir
-        self.device = device
-        idx = json.load(open(os.path.join(model_dir, "model.safetensors.index.json")))
-        self.weight_map = idx["weight_map"]
-        self._handles = {}
-        self.bytes_read = 0
-
-    def _handle(self, shard: str):
-        if shard not in self._handles:
-            self._handles[shard] = safe_open(
-                os.path.join(self.model_dir, shard), framework="pt", device="cpu"
-            )
-        return self._handles[shard]
-
-    def get(self, name: str) -> torch.Tensor:
-        t = self._handle(self.weight_map[name]).get_tensor(name)
-        self.bytes_read += t.numel() * t.element_size()
-        return t.to(self.device, non_blocking=False)
+ShardReader = RawShardReader  # pread-based; safetensors mmap is ~0.3 GB/s on GB10
 
 
 def rms_norm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -157,14 +140,19 @@ class LayerWeights:
             self.sh_up = g(b + "shared_experts.up_proj.weight")
             self.sh_down = g(b + "shared_experts.down_proj.weight")
             # grouped expert tensors: w1=gate [I,H], w3=up [I,H], w2=down [H,I]
-            # preallocate + copy_ per expert: avoids the 2x transient of stack()
+            # parallel pread to CPU (8 threads ~8GB/s), then copy_ into
+            # preallocated GPU stacks (avoids the 2x transient of stack())
             self.w1 = torch.empty(N_EXPERTS, INTER, HIDDEN, dtype=torch.bfloat16, device=rd.device)
             self.w3 = torch.empty(N_EXPERTS, INTER, HIDDEN, dtype=torch.bfloat16, device=rd.device)
+            names = [f"{b}experts.{e}.{wn}.weight"
+                     for e in range(N_EXPERTS) for wn in ("w1", "w3", "w2")]
             self.w2 = torch.empty(N_EXPERTS, HIDDEN, INTER, dtype=torch.bfloat16, device=rd.device)
+            cpu = rd.get_many(names, device="cpu")
             for e in range(N_EXPERTS):
-                self.w1[e].copy_(g(f"{b}experts.{e}.w1.weight"))
-                self.w3[e].copy_(g(f"{b}experts.{e}.w3.weight"))
-                self.w2[e].copy_(g(f"{b}experts.{e}.w2.weight"))
+                self.w1[e].copy_(cpu[3 * e])
+                self.w3[e].copy_(cpu[3 * e + 1])
+                self.w2[e].copy_(cpu[3 * e + 2])
+            del cpu
         else:
             self.mlp_gate = g(p + "mlp.gate_proj.weight")
             self.mlp_up = g(p + "mlp.up_proj.weight")
@@ -319,6 +307,7 @@ def full_forward(rd, kv, ids, position_ids, embed_w, norm_w, head_w, trace, tag)
         if trace is not None:
             trace["hidden_last"][i].append(x[0, -1].float().cpu())
         w.free()
+        rd.drop_all()  # keep streamed bytes out of the cgroup page cache
         torch.cuda.synchronize()
         layer_times.append((t_load, time.time() - t0 - t_load))
         if i % 8 == 0:

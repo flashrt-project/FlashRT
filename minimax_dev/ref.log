@@ -1,0 +1,8 @@
+prompt tokens: 253
+    [prefill] layer 0: load 0.3s compute 0.5s
+    [prefill] layer 8: load 3.0s compute 0.4s
+    [prefill] layer 16: load 3.7s compute 0.6s
+    [prefill] layer 24: load 3.6s compute 0.4s
+    [prefill] layer 32: load 3.6s compute 0.5s
+    [prefill] layer 40: load 3.5s compute 0.6s
+    [prefill] layer 48: load 3.7s compute 0.7s
