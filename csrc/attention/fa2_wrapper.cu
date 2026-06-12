@@ -309,10 +309,45 @@ extern "C" void fvk_attention_fa2_fwd_bf16_seqused(
     params.oaccum_ptr = nullptr;
     dispatch_hdim<cutlass::bfloat16_t>(head_dim, 1, params, stream);
 }
+
+// seqused_k + split-KV variant (experimental). Caller MUST pre-init
+// softmax_lse_accum to -inf each launch (empty splits past seqused_k keep that
+// so the combine ignores them) — see standalone graph-replay test.
+extern "C" void fvk_attention_fa2_fwd_bf16_seqused_splitkv(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr, const void* seqused_k_ptr,
+    void* softmax_lse_accum_ptr, void* o_accum_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream)
+{
+    FLASH_NAMESPACE::Flash_fwd_params params;
+    fill_params(params, true, q_ptr, k_ptr, v_ptr, o_ptr, softmax_lse_ptr,
+                batch, seqlen_q, seqlen_k, num_heads_q, num_heads_kv, head_dim,
+                q_batch_stride, q_row_stride, q_head_stride,
+                k_batch_stride, k_row_stride, k_head_stride,
+                v_batch_stride, v_row_stride, v_head_stride,
+                o_batch_stride, o_row_stride, o_head_stride, softmax_scale);
+    params.seqused_k = reinterpret_cast<int*>(const_cast<void*>(seqused_k_ptr));
+    int num_splits = setup_splitkv(params, softmax_lse_accum_ptr, o_accum_ptr,
+                                    num_sms, seqlen_q, seqlen_k,
+                                    head_dim, batch, num_heads_q);
+    dispatch_hdim<cutlass::bfloat16_t>(head_dim, num_splits, params, stream);
+}
 #else
 DEFINE_FA2_STUB(fvk_attention_fa2_fwd_bf16,  "bf16")
 extern "C" void fvk_attention_fa2_fwd_bf16_seqused(
     const void*, const void*, const void*, void*, void*, const void*,
+    int, int, int, int, int, int, int, int, int, int, int, int,
+    int, int, int, int, int, int, float, int, cudaStream_t)
+{ std::abort(); }
+extern "C" void fvk_attention_fa2_fwd_bf16_seqused_splitkv(
+    const void*, const void*, const void*, void*, void*, const void*,
+    void*, void*,
     int, int, int, int, int, int, int, int, int, int, int, int,
     int, int, int, int, int, int, float, int, cudaStream_t)
 { std::abort(); }

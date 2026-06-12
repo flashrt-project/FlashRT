@@ -503,6 +503,10 @@ class RtxFlashAttnBackend:
                 reasons.append("decoder excluded from FVK_RTX_FA2_SITES")
             if not hasattr(getattr(self, "_fa2", None), "fwd_bf16_seqused"):
                 reasons.append("flash_rt_fa2.fwd_bf16_seqused unavailable")
+            if not hasattr(getattr(self, "_fa2", None),
+                           "fwd_bf16_seqused_splitkv"):
+                reasons.append("flash_rt_fa2.fwd_bf16_seqused_splitkv "
+                               "unavailable (rebuild flash_rt_fa2)")
             if reasons:
                 raise RuntimeError(
                     "Pi0.5 fixed-shape state-prompt mode needs the vendored "
@@ -545,6 +549,40 @@ class RtxFlashAttnBackend:
             Q=q.data_ptr(), K=k.data_ptr(), V=v.data_ptr(),
             O=o.data_ptr(), softmax_lse=lse.data_ptr(),
             seqused_k=seqused.data_ptr(),
+            batch=B, seqlen_q=Sq, seqlen_k=Sk,
+            num_heads_q=Hq, num_heads_kv=Hk, head_dim=D,
+            q_strides=(q.stride(0), q.stride(1), q.stride(2)),
+            k_strides=(k.stride(0), k.stride(1), k.stride(2)),
+            v_strides=(v.stride(0), v.stride(1), v.stride(2)),
+            o_strides=(o.stride(0), o.stride(1), o.stride(2)),
+            softmax_scale=softmax_scale, num_sms=self._num_sms, stream=stream)
+
+    def _call_fvk_fa2_seqused_splitkv(self, q, k, v, o, lse, seqused, *,
+                                      lse_accum, o_accum,
+                                      stream: int = 0, softmax_scale=None):
+        """``fwd_bf16_seqused`` + split-KV (better SM occupancy on tiny-Q,
+        long-K shapes like the Pi0.5 decoder joint-attention: Sq=chunk,
+        Sk=valid_prefix+chunk, 1 KV head).
+
+        ``num_splits`` is computed host-side from ``seqlen_k`` (the K-tensor's
+        max length, fixed at capture) so it is constant across graph replays.
+        At replay with a smaller ``seqused``, splits whose K-range lies entirely
+        past ``seqused`` are empty and the kernel does NOT write ``-inf`` into
+        their ``lse_accum`` slot — so we MUST pre-fill ``lse_accum`` with
+        ``-inf`` each call (captured in the graph). Empty splits then keep
+        ``-inf`` → combine weight ``exp(-inf)=0`` → correct. ``o_accum`` needs
+        no init (it is multiplied by the zero weight). bf16-only."""
+        B, Sq, Hq, D = q.shape
+        Sk, Hk = k.shape[1], k.shape[2]
+        if softmax_scale is None:
+            softmax_scale = 1.0 / (D ** 0.5)
+        lse_accum.fill_(float("-inf"))
+        self._fa2.fwd_bf16_seqused_splitkv(
+            Q=q.data_ptr(), K=k.data_ptr(), V=v.data_ptr(),
+            O=o.data_ptr(), softmax_lse=lse.data_ptr(),
+            seqused_k=seqused.data_ptr(),
+            softmax_lse_accum=lse_accum.data_ptr(),
+            o_accum=o_accum.data_ptr(),
             batch=B, seqlen_q=Sq, seqlen_k=Sk,
             num_heads_q=Hq, num_heads_kv=Hk, head_dim=D,
             q_strides=(q.stride(0), q.stride(1), q.stride(2)),
@@ -604,8 +642,14 @@ class RtxFlashAttnBackend:
                 # The decoder's action K/V were appended right after the valid
                 # prefix (qkv_split_rope_devpos), so [0 : valid+chunk] is one
                 # contiguous valid range — single seqused call masks padding.
-                self._call_fvk_fa2_seqused(
-                    q, k, v, o, self._dec_lse, self.dec_seqused, stream=stream)
+                # Split-KV: this shape (Sq=chunk, Sk≈valid+chunk, 1 KV head) is
+                # occupancy-bound; no-split leaves most SMs idle. Split-KV is 3×
+                # faster here. (Encoder stays no-split: its Sq is already large
+                # enough to fill the GPU, and split-KV slightly hurts it.)
+                self._call_fvk_fa2_seqused_splitkv(
+                    q, k, v, o, self._dec_lse, self.dec_seqused,
+                    lse_accum=self._dec_lse_accum, o_accum=self._dec_o_accum,
+                    stream=stream)
             else:
                 self._call_fvk_fa2(q, k, v, o, self._dec_lse, stream=stream,
                                    lse_accum=self._dec_lse_accum,
