@@ -66,6 +66,19 @@ extern "C" void fvk_attention_fa2_fwd_bf16_seqused(
     int o_batch_stride, int o_row_stride, int o_head_stride,
     float softmax_scale, int num_sms, cudaStream_t stream);
 
+// seqused_k + split-KV variant (experimental; caller pre-inits lse_accum=-inf).
+extern "C" void fvk_attention_fa2_fwd_bf16_seqused_splitkv(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr, const void* seqused_k_ptr,
+    void* softmax_lse_accum_ptr, void* o_accum_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream);
+
 // Causal variant — definition in csrc/attention/fa2_wrapper_causal.cu.
 // Currently only (bf16, head_dim=128) is built. Used by Qwen3-8B
 // prefill (S=N causal self-attention).
@@ -159,6 +172,35 @@ static auto make_fwd_seqused(
 }
 
 
+static auto make_fwd_seqused_splitkv(
+    void (*fn)(const void*, const void*, const void*, void*, void*, const void*,
+               void*, void*,
+               int, int, int, int, int, int, int, int, int, int, int, int,
+               int, int, int, int, int, int, float, int, cudaStream_t)) {
+    return [fn](uintptr_t Q, uintptr_t K, uintptr_t V, uintptr_t O,
+                uintptr_t softmax_lse, uintptr_t seqused_k,
+                uintptr_t softmax_lse_accum, uintptr_t o_accum,
+                int batch, int seqlen_q, int seqlen_k,
+                int num_heads_q, int num_heads_kv, int head_dim,
+                py::tuple q_strides, py::tuple k_strides,
+                py::tuple v_strides, py::tuple o_strides,
+                float softmax_scale, int num_sms, uintptr_t stream) {
+        fn(reinterpret_cast<const void*>(Q), reinterpret_cast<const void*>(K),
+           reinterpret_cast<const void*>(V), reinterpret_cast<void*>(O),
+           reinterpret_cast<void*>(softmax_lse),
+           reinterpret_cast<const void*>(seqused_k),
+           reinterpret_cast<void*>(softmax_lse_accum),
+           reinterpret_cast<void*>(o_accum),
+           batch, seqlen_q, seqlen_k, num_heads_q, num_heads_kv, head_dim,
+           py::cast<int>(q_strides[0]), py::cast<int>(q_strides[1]), py::cast<int>(q_strides[2]),
+           py::cast<int>(k_strides[0]), py::cast<int>(k_strides[1]), py::cast<int>(k_strides[2]),
+           py::cast<int>(v_strides[0]), py::cast<int>(v_strides[1]), py::cast<int>(v_strides[2]),
+           py::cast<int>(o_strides[0]), py::cast<int>(o_strides[1]), py::cast<int>(o_strides[2]),
+           softmax_scale, num_sms, to_stream(stream));
+    };
+}
+
+
 PYBIND11_MODULE(flash_rt_fa2, m) {
     m.doc() = "FlashRT — vendored Flash-Attention 2 forward (fp16 + bf16).";
 
@@ -171,6 +213,15 @@ PYBIND11_MODULE(flash_rt_fa2, m) {
         py::arg("v_strides"), py::arg("o_strides"),
         py::arg("softmax_scale") = 1.0f, py::arg("num_sms") = 0,
         py::arg("stream") = 0);
+
+    m.def("fwd_bf16_seqused_splitkv",
+        make_fwd_seqused_splitkv(&fvk_attention_fa2_fwd_bf16_seqused_splitkv),
+        py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),
+        py::arg("seqused_k"), py::arg("softmax_lse_accum")=0, py::arg("o_accum")=0,
+        py::arg("batch"), py::arg("seqlen_q"), py::arg("seqlen_k"),
+        py::arg("num_heads_q"), py::arg("num_heads_kv"), py::arg("head_dim"),
+        py::arg("q_strides"), py::arg("k_strides"), py::arg("v_strides"), py::arg("o_strides"),
+        py::arg("softmax_scale")=1.0f, py::arg("num_sms")=0, py::arg("stream")=0);
 
     m.def("fwd_fp16", make_fwd(&fvk_attention_fa2_fwd_fp16),
         py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),
