@@ -387,6 +387,12 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 K/V appended at the valid offset); a changing length never
                 re-captures and no warmup is needed. Requires the vendored
                 bf16 FA2 path (``FVK_RTX_FA2=1``, encoder+decoder sites on).
+                Cost: every inference runs at the padded max length, so it is
+                ~1 ms slower than a warmed ``"exact"`` graph (split-KV decoder
+                joint-attention keeps the padding overhead small). Prefer
+                ``"fixed"`` when the state-token length drifts and you'd rather
+                not enumerate/warm lengths; prefer ``"exact"`` + warmup for
+                absolute peak latency at known lengths.
             Env override: ``FLASHRT_PI05_STATE_PROMPT_MODE``.
 
     Returns:
