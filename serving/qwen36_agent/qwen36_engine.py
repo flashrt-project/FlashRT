@@ -49,10 +49,14 @@ class Qwen36FrontendAgentEngine:
         import torch
 
         cap = torch.cuda.get_device_capability()
-        cls._set_agent_runtime_env_defaults(cap[0])
+        cls._set_agent_runtime_env_defaults(cap)
         if cap == (11, 0):
             from flash_rt.frontends.torch.qwen36_thor import (
                 Qwen36TorchFrontendThor as Frontend,
+            )
+        elif cap == (12, 1):
+            from flash_rt.frontends.torch.qwen36_spark import (
+                Qwen36TorchFrontendSpark as Frontend,
             )
         else:
             from flash_rt.frontends.torch.qwen36_rtx import (
@@ -68,22 +72,31 @@ class Qwen36FrontendAgentEngine:
         return cls(fe, model_name=model_name)
 
     @staticmethod
-    def _set_agent_runtime_env_defaults(cap_major: int) -> None:
+    def _set_agent_runtime_env_defaults(capability) -> None:
         """Set agent-serving runtime defaults before frontend construction.
 
         The fixed-shape benchmark path benefits from exact-position CUDA Graph
         replay. A long-lived agent session does not: every new generated
         position can be a never-seen graph key, so the first real coding-agent
         turn pays capture on the hot path and drops to cold-capture throughput.
-        Keep the fast SM120 kernels on, but default the agent host to direct
+        Keep the fast SM120 kernels on for RTX 5090, but do not enable them by
+        default on GB10/SM121: Spark profiling shows those SM120 hand-tuned
+        small-M kernels are slower there. Default the agent host to direct
         long-decode kernel launch for verify/MTP-chain unless the caller opts
         back into exact graph replay before startup.
         """
         import os
 
-        if int(cap_major) >= 12:
-            os.environ.setdefault("FLASHRT_QWEN36_DECODE_FASTGEMM", "1")
-            os.environ.setdefault("FLASHRT_QWEN36_VERIFY_WARPSPLIT", "1")
+        if isinstance(capability, tuple):
+            cap_major = int(capability[0])
+            cap_minor = int(capability[1]) if len(capability) > 1 else 0
+        else:
+            cap_major = int(capability)
+            cap_minor = 0
+        if cap_major >= 12:
+            if (cap_major, cap_minor) == (12, 0):
+                os.environ.setdefault("FLASHRT_QWEN36_DECODE_FASTGEMM", "1")
+                os.environ.setdefault("FLASHRT_QWEN36_VERIFY_WARPSPLIT", "1")
             os.environ.setdefault("FLASHRT_QWEN36_TQ_VERIFY_GRAPH", "0")
             os.environ.setdefault("FLASHRT_QWEN36_TQ_MTP_CHAIN_GRAPH", "0")
 

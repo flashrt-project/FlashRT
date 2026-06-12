@@ -34,7 +34,7 @@ def detect_arch() -> str:
 
     Supported:
         ``"thor"``      — Jetson AGX Thor, SM110 (cc 11.0)
-        ``"rtx_sm120"`` — RTX 5090 / Blackwell consumer, SM120 (cc 12.0)
+        ``"rtx_sm120"`` — RTX 5090 / DGX Spark GB10 Blackwell, SM120/SM121
         ``"rtx_sm89"``  — RTX 4090 / Ada, SM89 (cc 8.9)
         ``"rtx_sm87"``  — Jetson Orin via RTX consumer backend, SM87 (cc 8.7)
 
@@ -54,7 +54,7 @@ def detect_arch() -> str:
     major, minor = torch.cuda.get_device_capability()
     if (major, minor) == (11, 0):
         return "thor"
-    if (major, minor) == (12, 0):
+    if (major, minor) in ((12, 0), (12, 1)):
         return "rtx_sm120"
     if (major, minor) == (8, 7):
         return "rtx_sm87"
@@ -62,7 +62,7 @@ def detect_arch() -> str:
         return "rtx_sm89"
     raise RuntimeError(
         f"FlashRT: unsupported GPU SM {major}.{minor}. "
-        f"Supported architectures: SM110 (Thor), SM120 (RTX 5090), "
+        f"Supported architectures: SM110 (Thor), SM120/SM121 (Blackwell), "
         f"SM89 (RTX 4090), SM87 (Jetson Orin experimental)."
     )
 

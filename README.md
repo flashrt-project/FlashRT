@@ -119,6 +119,13 @@ Jetson AGX Thor:
 | NVFP4, 128 | **268 ms** | **42.8 tok/s** | [Qwen3.6 Thor](docs/qwen36_nvfp4.md#jetson-agx-thor-numbers) |
 | NVFP4, 16 K | **19.23 s** | **52.9 tok/s** | [Qwen3.6 Thor](docs/qwen36_nvfp4.md#jetson-agx-thor-numbers) |
 
+DGX Spark / GB10:
+
+| Mode | Prefill | Decode | Source |
+|---|---:|---:|---|
+| NVFP4, 128 | **170.1 ms** | **40.42 tok/s** | [Qwen3.6 Spark](docs/qwen36_spark.md#performance) |
+| NVFP4, 16 K | **8.545 s** | **54.94 tok/s** | [Qwen3.6 Spark](docs/qwen36_spark.md#performance) |
+
 #### Qwen3-8B
 
 | Hardware | Mode | Prefill | Decode | Source |
@@ -154,7 +161,7 @@ Jetson AGX Thor:
 - [API snippets — Pi0 / Pi0.5 / GROOT / Pi0-FAST / Qwen3.6](#api-snippets)
 - [Supported Models](#supported-models) · [Hardware Support](#hardware-support) · [Benchmark](#benchmark)
 - [Serving](serving/README.md) · [Architecture](docs/architecture.md)
-- [Qwen3.6-27B NVFP4 LLM path — quickstart, K selection, measured throughput](docs/qwen36_nvfp4.md) · [parameter reference](docs/qwen36_usage.md) · [OpenAI-compatible server example](serving/qwen36_agent/README.md)
+- [Qwen3.6-27B NVFP4 LLM path — quickstart, K selection, measured throughput](docs/qwen36_nvfp4.md) · [Spark usage](docs/qwen36_spark.md) · [parameter reference](docs/qwen36_usage.md) · [OpenAI-compatible server example](serving/qwen36_agent/README.md)
 - [Adding a new model](docs/adding_new_model.md)
 - [Contributing](CONTRIBUTING.md)
 - [Architecture](docs/architecture.md)
@@ -189,7 +196,7 @@ First call: ~3 s (calibration + CUDA Graph capture). Every subsequent call: 44 m
 |---|---|
 | **Run your first inference** | [Build & install](#build--install) — Docker and native Linux paths |
 | **See API examples for all 4 VLA models + the Qwen3.6 LLM** | [API snippets](#api-snippets) |
-| **Run Qwen3.6-27B NVFP4 (LLM, 256 K on RTX 5090)** | [`docs/qwen36_nvfp4.md`](docs/qwen36_nvfp4.md) — quickstart, K selection, measured throughput · [`docs/qwen36_usage.md`](docs/qwen36_usage.md) — full parameter reference · [`serving/qwen36_agent/`](serving/qwen36_agent/README.md) — OpenAI-compatible HTTP server |
+| **Run Qwen3.6-27B NVFP4 (LLM, 256 K on RTX 5090; Spark/GB10 supported)** | [`docs/qwen36_nvfp4.md`](docs/qwen36_nvfp4.md) — quickstart, K selection, measured throughput · [`docs/qwen36_spark.md`](docs/qwen36_spark.md) — DGX Spark usage and performance · [`docs/qwen36_usage.md`](docs/qwen36_usage.md) — full parameter reference · [`serving/qwen36_agent/`](serving/qwen36_agent/README.md) — OpenAI-compatible HTTP server |
 | **Run Qwen3-8B NVFP4 text serving** | [`docs/qwen3_8b_nvfp4.md`](docs/qwen3_8b_nvfp4.md) · [`examples/qwen3_openai_server.py`](examples/qwen3_openai_server.py) |
 | **Run Higgs Audio v3 TTS** | [`docs/higgs_audio_v3.md`](docs/higgs_audio_v3.md) — usage + performance · [`serving/higgs_audio_agent/`](serving/higgs_audio_agent/README.md) — HTTP serving |
 | **Run Motus RTX beta, TeaCache, or RTC-lite** | [`docs/motus_usage_beta.md`](docs/motus_usage_beta.md) · [`docs/rtc_lite_design.md`](docs/rtc_lite_design.md) |

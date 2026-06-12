@@ -1097,6 +1097,24 @@ def test_qwen36_agent_sm120_defaults_disable_exact_position_decode_graphs(monkey
     assert os.environ["FLASHRT_QWEN36_TQ_MTP_CHAIN_GRAPH"] == "0"
 
 
+def test_qwen36_agent_sm121_defaults_do_not_enable_sm120_fastgemm(monkeypatch):
+    keys = (
+        "FLASHRT_QWEN36_DECODE_FASTGEMM",
+        "FLASHRT_QWEN36_VERIFY_WARPSPLIT",
+        "FLASHRT_QWEN36_TQ_VERIFY_GRAPH",
+        "FLASHRT_QWEN36_TQ_MTP_CHAIN_GRAPH",
+    )
+    for key in keys:
+        monkeypatch.delenv(key, raising=False)
+
+    Qwen36FrontendAgentEngine._set_agent_runtime_env_defaults((12, 1))
+
+    assert "FLASHRT_QWEN36_DECODE_FASTGEMM" not in os.environ
+    assert "FLASHRT_QWEN36_VERIFY_WARPSPLIT" not in os.environ
+    assert os.environ["FLASHRT_QWEN36_TQ_VERIFY_GRAPH"] == "0"
+    assert os.environ["FLASHRT_QWEN36_TQ_MTP_CHAIN_GRAPH"] == "0"
+
+
 def test_qwen36_agent_runtime_defaults_respect_overrides(monkeypatch):
     monkeypatch.setenv("FLASHRT_QWEN36_TQ_VERIFY_GRAPH", "1")
     monkeypatch.setenv("FLASHRT_QWEN36_TQ_MTP_CHAIN_GRAPH", "1")

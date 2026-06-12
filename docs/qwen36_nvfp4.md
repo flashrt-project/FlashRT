@@ -9,6 +9,8 @@ For the full per-parameter API reference (constructor, generate args,
 env vars), see [`qwen36_usage.md`](qwen36_usage.md). For an OpenAI-API
 compatible HTTP server, see
 [`serving/qwen36_agent/`](../serving/qwen36_agent/README.md).
+For DGX Spark / GB10 (SM121), see
+[`qwen36_spark.md`](qwen36_spark.md).
 
 ## 0. Quickstart
 

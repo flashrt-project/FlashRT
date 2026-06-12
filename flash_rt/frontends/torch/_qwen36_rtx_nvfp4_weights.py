@@ -407,13 +407,11 @@ def extract_weights_nvfp4(
 
             if t == 'linear_attention':
                 la = base + 'linear_attn.'
-                # G7: ckpt leaves the three large lin projections as
-                # BF16. We quantize them to NVFP4 at load time (with
-                # per-tensor global_scale) so the verify-path GEMMs
-                # read FP4 weights instead of BF16 — cuts BW by 2× on
-                # 48 lin layers (the dominant FP8/NVFP4 verify-forward
-                # delta). in_proj_a / in_proj_b are tiny (N=48) so we
-                # keep them BF16; the matvec/matmul cost is negligible.
+                # G7: some ckpts leave the three large lin projections
+                # as BF16, while others pre-pack out_proj as NVFP4.
+                # Normalize both forms to the same NVFP4 handle fields.
+                # in_proj_a / in_proj_b are tiny (N=48), so keep them
+                # BF16; the matvec/matmul cost is negligible.
                 _quant_bf16_lin_proj(
                     handles, ld, 'in_proj_qkv',
                     f.get_tensor(la + 'in_proj_qkv.weight'),
@@ -435,10 +433,15 @@ def extract_weights_nvfp4(
                 ab_w = torch.cat([a_w, b_w], dim=0).contiguous()
                 ld['in_proj_ab_w'] = _ensure_anchored(handles, ab_w)
                 ld['in_proj_ab_w_t'] = ab_w
-                _quant_bf16_lin_proj(
-                    handles, ld, 'out_proj',
-                    f.get_tensor(la + 'out_proj.weight'),
-                    fvk, device)
+                if la + 'out_proj.weight_packed' in f.keys():
+                    _load_quantized_proj(
+                        handles, ld, 'out_proj',
+                        f, la + 'out_proj', fvk, device)
+                else:
+                    _quant_bf16_lin_proj(
+                        handles, ld, 'out_proj',
+                        f.get_tensor(la + 'out_proj.weight'),
+                        fvk, device)
                 conv = f.get_tensor(la + 'conv1d.weight').to(
                     torch.bfloat16).squeeze(1).contiguous().to(device)
                 ld['conv1d_w'] = _ensure_anchored(handles, conv)

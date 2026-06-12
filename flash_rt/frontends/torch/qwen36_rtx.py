@@ -19,6 +19,7 @@ in Phase 2) that quantizes weights into fvk-compatible layouts.
 from __future__ import annotations
 
 import collections
+import json
 import os
 from typing import Any
 
@@ -48,6 +49,48 @@ def _qwen36_tq_prefill_gdn_backend() -> str:
             'FLASHRT_QWEN36_TQ_PREFILL_GDN_BACKEND no longer supports '
             f'{backend!r}; use wy_lt or native for FlashRT CUDA kernels')
     return backend
+
+
+def _load_qwen36_tokenizer(checkpoint_path: str):
+    """Load Qwen3.6 tokenizer with a local fast-tokenizer fallback."""
+    from transformers import AutoTokenizer, PreTrainedTokenizerFast
+
+    try:
+        return AutoTokenizer.from_pretrained(checkpoint_path)
+    except (KeyError, ValueError):
+        tokenizer_file = os.path.join(checkpoint_path, 'tokenizer.json')
+        if not os.path.isfile(tokenizer_file):
+            raise
+
+        cfg_path = os.path.join(checkpoint_path, 'tokenizer_config.json')
+        cfg = {}
+        if os.path.isfile(cfg_path):
+            with open(cfg_path, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+        kwargs = {
+            key: cfg[key]
+            for key in (
+                'bos_token',
+                'eos_token',
+                'unk_token',
+                'pad_token',
+                'additional_special_tokens',
+            )
+            if key in cfg
+        }
+        tok = PreTrainedTokenizerFast(
+            tokenizer_file=tokenizer_file,
+            **kwargs,
+        )
+        chat_template = cfg.get('chat_template')
+        if chat_template is None:
+            template_path = os.path.join(checkpoint_path, 'chat_template.jinja')
+            if os.path.isfile(template_path):
+                with open(template_path, 'r', encoding='utf-8') as f:
+                    chat_template = f.read()
+        if chat_template is not None:
+            tok.chat_template = chat_template
+        return tok
 
 
 class Qwen36TorchFrontendRtx:
@@ -195,7 +238,7 @@ class Qwen36TorchFrontendRtx:
         Phase 1 only. Phase 2 will replace with a WEIGHT_SPEC-driven
         loader.
         """
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoModelForCausalLM
 
         # attn_implementation='flash_attention_2' routes the attention
         # path through the vendored FA2 (flash_rt_fa2.so) instead of
@@ -208,7 +251,7 @@ class Qwen36TorchFrontendRtx:
             low_cpu_mem_usage=True,
             attn_implementation='flash_attention_2',
         ).eval()
-        self._tokenizer = AutoTokenizer.from_pretrained(self.checkpoint_path)
+        self._tokenizer = _load_qwen36_tokenizer(self.checkpoint_path)
         self._pipeline = Qwen36Pipeline(mdl)
 
     # ---------- Phase 6 MTP head loader ----------
@@ -898,8 +941,7 @@ class Qwen36TorchFrontendRtx:
 
         # Tokenizer — NVFP4 ckpts ship tokenizer.json + chat_template
         # at the ckpt path (verified prithivMLmods/Qwen3.6-27B-NVFP4).
-        from transformers import AutoTokenizer
-        self._tokenizer = AutoTokenizer.from_pretrained(self.checkpoint_path)
+        self._tokenizer = _load_qwen36_tokenizer(self.checkpoint_path)
 
         # Raw NVFP4 weights → handles (compatible schema with FP8 path
         # but with *_packed/_sf/_alpha keys for quantized linears).
@@ -1030,6 +1072,17 @@ class Qwen36TorchFrontendRtx:
             return n_row_super * n_col_super * 512
 
         layers = self._weights.ptrs['layers']
+        try:
+            cap = tuple(int(x) for x in torch.cuda.get_device_capability(
+                device))
+        except Exception:
+            cap = ()
+        is_sm121 = cap == (12, 1)
+        pingpong_default = '0' if is_sm121 else '1'
+        def _flag_enabled(name: str, default: str) -> bool:
+            return os.environ.get(name, default).strip().lower() not in (
+                '0', 'false', 'off')
+
         gate_up_default = '1' if self._long_ctx_mode else '0'
         self._enable_mlp_gate_up_fusion = (
             bool(int(os.environ.get(
@@ -1040,15 +1093,15 @@ class Qwen36TorchFrontendRtx:
         self._enable_mlp_gate_up_pingpong = (
             self._enable_mlp_gate_up_fusion
             and hasattr(fvk, 'fp4_w4a16_gemm_sm120_bf16out_pingpong')
-            and os.environ.get(
+            and _flag_enabled(
                 'FLASHRT_QWEN36_MLP_GATE_UP_PINGPONG',
-                '1').strip().lower() not in ('0', 'false', 'off')
+                pingpong_default)
         )
         self._enable_prefill_proj_pingpong = (
             hasattr(fvk, 'fp4_w4a16_gemm_sm120_bf16out_pingpong')
-            and os.environ.get(
+            and _flag_enabled(
                 'FLASHRT_QWEN36_PREFILL_PROJ_PINGPONG',
-                '1').strip().lower() not in ('0', 'false', 'off')
+                pingpong_default)
         )
         self._enable_silu_mul_quant_fusion = bool(int(os.environ.get(
             'FLASHRT_QWEN36_FUSE_SILU_MUL_QUANT', '0') or '0'))
@@ -1098,7 +1151,6 @@ class Qwen36TorchFrontendRtx:
             'FLASHRT_QWEN36_VERIFY_WS_SPLIT', '2') or '2')
         self._verify_ws_stages = int(os.environ.get(
             'FLASHRT_QWEN36_VERIFY_WS_STAGES', '6') or '6')
-
         self._nvfp4_scratch: dict[tuple[int, int],
                                   tuple[torch.Tensor, ...]] = {}
         for N, K in self._NVFP4_SHAPES:
@@ -12037,10 +12089,16 @@ class Qwen36TorchFrontendRtx:
         _add('logits', self._logits_buf)
         _add('lin_state', self._lin_state)
         _add('lin_conv_state', self._lin_conv_state)
-        for (N, K), (qinp, sc, out) in self._fp8_scratch.items():
+        for (N, K), (qinp, sc, out) in getattr(
+                self, '_fp8_scratch', {}).items():
             _add(f'fp8_{N}x{K}_qinp', qinp)
             _add(f'fp8_{N}x{K}_scale', sc)
             _add(f'fp8_{N}x{K}_out', out)
+        for (N, K), (qinp, sc, out) in getattr(
+                self, '_nvfp4_scratch', {}).items():
+            _add(f'nvfp4_{N}x{K}_qinp', qinp)
+            _add(f'nvfp4_{N}x{K}_scale', sc)
+            _add(f'nvfp4_{N}x{K}_out', out)
         # attn backend buffers
         _add('attn_K_cache', self._attn.K_cache)
         _add('attn_V_cache', self._attn.V_cache)

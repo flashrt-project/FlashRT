@@ -55,12 +55,13 @@ option(FLASHRT_BUILD_SM100_ENCODER_MLP
        "Build the WIP Path C encoder MLP megakernel scaffold" OFF)
 
 # SM120+ (Blackwell): NVFP4/W4A8 block-scaled GEMM
-if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "120a")
+if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "120a" OR
+   GPU_ARCH STREQUAL "121" OR GPU_ARCH STREQUAL "121a")
   set(ENABLE_NVFP4 ON)
-  message(STATUS "NVFP4/W4A8 support: ENABLED (sm_120a)")
+  message(STATUS "NVFP4/W4A8 support: ENABLED (sm_${GPU_ARCH}a)")
 else()
   set(ENABLE_NVFP4 OFF)
-  message(STATUS "NVFP4/W4A8 support: DISABLED (requires sm_120a, current: sm_${GPU_ARCH})")
+  message(STATUS "NVFP4/W4A8 support: DISABLED (requires Blackwell sm_120a/sm_121a, current: sm_${GPU_ARCH})")
 endif()
 
 # Only sm_90/100/110/120 ship an 'a' (architecture-accelerated) variant.
@@ -68,7 +69,8 @@ endif()
 # arch=compute_89a,code=sm_89a breaks nvcc on 4090. Pick the right
 # gencode flag once here and reuse it for every target below.
 if(GPU_ARCH STREQUAL "90"  OR GPU_ARCH STREQUAL "100" OR
-   GPU_ARCH STREQUAL "110" OR GPU_ARCH STREQUAL "120")
+   GPU_ARCH STREQUAL "110" OR GPU_ARCH STREQUAL "120" OR
+   GPU_ARCH STREQUAL "121")
   set(GPU_GENCODE "-gencode=arch=compute_${GPU_ARCH}a,code=sm_${GPU_ARCH}a")
 else()
   set(GPU_GENCODE "-gencode=arch=compute_${GPU_ARCH},code=sm_${GPU_ARCH}")
@@ -85,7 +87,8 @@ message(STATUS "Using gencode flag: ${GPU_GENCODE}")
 # FA2 there would add ~10 MB to the .so and unused compile time.
 if(GPU_ARCH STREQUAL "80"  OR GPU_ARCH STREQUAL "86" OR
    GPU_ARCH STREQUAL "87"  OR
-   GPU_ARCH STREQUAL "89"  OR GPU_ARCH STREQUAL "120")
+   GPU_ARCH STREQUAL "89"  OR GPU_ARCH STREQUAL "120" OR
+   GPU_ARCH STREQUAL "121")
   set(ENABLE_FA2 ON)
   message(STATUS "FA2 in-SO attention: ENABLED (sm_${GPU_ARCH})")
 else()
@@ -431,7 +434,7 @@ endif()
 # Block-scaled FP4 e2m1 weights × FP4 e2m1 act (post quant) × FP8 ue4m3
 # group scales × BF16 output. Ported from NVIDIA unit test
 # sm120_bs_gemm_nvf4_nvf4_f32_bf16.cu — sm_120a / sm_121a.
-if(GPU_ARCH STREQUAL "120")
+if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
   add_library(cutlass_nvfp4_w4a16_sm120_obj OBJECT
     csrc/gemm/fp4/cutlass_nvfp4_w4a16_gemm_sm120.cu)
   set_target_properties(cutlass_nvfp4_w4a16_sm120_obj PROPERTIES
@@ -489,7 +492,8 @@ endif()
 # link whenever it is built — otherwise the binding would reference an unlinked
 # symbol when MOTUS is OFF. (FP8 still needs the SM120 prefill GEMM in MOTUS, so
 # the FP8 path is SM120-only; the BF16 path runs wherever this object is built.)
-if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "89")
+if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
+   GPU_ARCH STREQUAL "89")
   add_library(decode_gemv_m1_obj OBJECT
     csrc/gemm/fp8_gemv_m1_sm120.cu
     csrc/gemm/bf16_gemv_m1_sm120.cu)
@@ -648,7 +652,7 @@ if(ENABLE_NVFP4)
   target_compile_options(gemm_kernels_obj PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
       --expt-relaxed-constexpr -O3
-      -gencode arch=compute_120a,code=sm_120a
+      ${GPU_GENCODE}
     >
   )
 endif()
@@ -764,14 +768,16 @@ if(ENABLE_FA2)
   # ──────────────────────────────────────────────────────────────
   # gencode selection — default ships multi-arch AOT so one build
   # covers every RTX card (sm_80 SASS runs SM80/86/89 natively; sm_120
-  # SASS for 5090; compute_120 PTX fallback for future consumer archs).
+  # / sm_121 SASS for Blackwell; compute_121 PTX fallback for future
+  # consumer archs).
   # FA2_ARCH_NATIVE_ONLY=ON skips the non-native AOT passes, saving
   # ~66% compile time on single-card developer boxes.
   # ──────────────────────────────────────────────────────────────
   if(FA2_ARCH_NATIVE_ONLY)
     # Just emit native SASS for the detected GPU. Use the real arch
     # (compute_80 for SM80/86/89 since they share Ampere ISA; direct
-    # compute_120 for SM120). Matches upstream FA2 setup.py behaviour.
+    # Blackwell arch for SM120/121). Matches upstream FA2 setup.py
+    # behaviour where applicable.
     if(GPU_ARCH STREQUAL "80" OR GPU_ARCH STREQUAL "86" OR
        GPU_ARCH STREQUAL "87" OR GPU_ARCH STREQUAL "89")
       target_compile_options(fa2_vendor_obj PRIVATE
@@ -787,6 +793,13 @@ if(ENABLE_FA2)
         >
       )
       message(STATUS "FA2 vendor arch: sm_120 AOT only (FA2_ARCH_NATIVE_ONLY=ON)")
+    elseif(GPU_ARCH STREQUAL "121")
+      target_compile_options(fa2_vendor_obj PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:
+          "SHELL:-gencode arch=compute_121,code=sm_121"
+        >
+      )
+      message(STATUS "FA2 vendor arch: sm_121 AOT only (FA2_ARCH_NATIVE_ONLY=ON)")
     endif()
   else()
     # Default multi-arch AOT (original behaviour; distributable across
@@ -799,9 +812,11 @@ if(ENABLE_FA2)
         "SHELL:-gencode arch=compute_80,code=sm_80"
         "SHELL:-gencode arch=compute_120,code=sm_120"
         "SHELL:-gencode arch=compute_120,code=compute_120"
+        "SHELL:-gencode arch=compute_121,code=sm_121"
+        "SHELL:-gencode arch=compute_121,code=compute_121"
       >
     )
-    message(STATUS "FA2 vendor arch: sm_80 + sm_120 AOT + compute_120 PTX fallback (default)")
+    message(STATUS "FA2 vendor arch: sm_80 + sm_120/sm_121 AOT + Blackwell PTX fallback (default)")
   endif()
 
   # Macros the wrapper reads to #ifdef-guard optional hdim/dtype
@@ -839,12 +854,12 @@ if(ENABLE_FA2)
   message(STATUS "FA2 pybind module: flash_rt_fa2 (separate .so)")
 endif()
 
-# ── Qwen3.6 FlashInfer XQA FP8-KV (SM120 + SM110/Thor) ──
-# Vendored FlashInfer XQA mha.cu has explicit `__CUDA_ARCH__ == 1100`
-# branches alongside the SM120 ones, so the same translation unit
-# compiles for both GPU_ARCH values; the differentiation is purely the
-# -gencode flag forwarded via GPU_GENCODE.
-if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "110")
+# ── Qwen3.6 FlashInfer XQA FP8-KV (SM120/SM121 + SM110/Thor) ──
+# Vendored FlashInfer XQA mha.cu handles Blackwell SM120/SM121 and
+# Thor SM110 in the same translation unit; the differentiation is
+# purely the -gencode flag forwarded via GPU_GENCODE.
+if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
+   GPU_ARCH STREQUAL "110")
   add_library(qwen36_flashinfer_xqa_obj OBJECT
     csrc/attention/flashinfer_xqa_src/mha.cu
     csrc/kernels/qwen36_flashinfer_xqa.cu)
@@ -982,7 +997,8 @@ endif()
 # Dedicated M=1 decode GEMV (FP8 + BF16); linked + macro defined wherever the
 # object is built (sm89 / sm120) so the ENABLE_DECODE_GEMV_M1 bindings always
 # resolve, independent of FLASHRT_ENABLE_MOTUS.
-if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "89")
+if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
+   GPU_ARCH STREQUAL "89")
   target_sources(flash_rt_kernels PRIVATE
     $<TARGET_OBJECTS:decode_gemv_m1_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE
@@ -990,9 +1006,12 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "89")
 endif()
 
 # SM120a CUTLASS NVFP4 W4A16 GEMM (Qwen3.6 NVFP4 ckpt path).
-if(GPU_ARCH STREQUAL "120")
+if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
   target_sources(flash_rt_kernels PRIVATE
     $<TARGET_OBJECTS:cutlass_nvfp4_w4a16_sm120_obj>
+    csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_bf16out_sm120.cu
+    csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_fp4out_sm120.cu
+    csrc/gemm/fp4/cutlass_nvfp4_gemm_dn_streamk_bias_sm120.cu
     csrc/quantize/nvfp4_sf_reshape_sm120.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE
     ENABLE_CUTLASS_SM120_NVFP4_W4A16=1)
@@ -1010,7 +1029,8 @@ if(GPU_ARCH STREQUAL "110")
     ENABLE_CUTLASS_SM100_NVFP4_W4A16=1)
 endif()
 
-if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "110")
+if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
+   GPU_ARCH STREQUAL "110")
   target_sources(flash_rt_kernels PRIVATE
     $<TARGET_OBJECTS:qwen36_flashinfer_xqa_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE

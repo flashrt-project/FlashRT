@@ -214,7 +214,11 @@ streaming wall-time rate.
 
 On SM120, the server defaults to the optimized decode kernels used by the
 benchmark path (`FLASHRT_QWEN36_DECODE_FASTGEMM=1` and
-`FLASHRT_QWEN36_VERIFY_WARPSPLIT=1`). It also defaults
+`FLASHRT_QWEN36_VERIFY_WARPSPLIT=1`). On GB10/SM121 Spark these SM120
+hand-tuned small-M kernels are left opt-in because profiling shows the default
+CUTLASS NVFP4 path is faster; the frontend also defaults the SM120 ping-pong
+CUTLASS NVFP4 variants off on SM121 unless explicitly re-enabled. The server
+also defaults
 `FLASHRT_QWEN36_TQ_VERIFY_GRAPH=0` and
 `FLASHRT_QWEN36_TQ_MTP_CHAIN_GRAPH=0` for agent serving, because exact-position
 decode graphs are keyed by the live `cur_pos` and hurt first-use latency in a

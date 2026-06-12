@@ -51,12 +51,29 @@ fe = Qwen36TorchFrontendThor(
 )
 ```
 
+On DGX Spark / GB10 (SM121), use the Spark subclass. It keeps the RTX
+compute path but applies Spark-measured long-context K / MTP-tail /
+FP8-XQA policy and supports NVFP4 MTP tail K/V prefill for paired FP8
+MTP checkpoints:
+
+```python
+from flash_rt.frontends.torch.qwen36_spark import Qwen36TorchFrontendSpark
+
+fe = Qwen36TorchFrontendSpark(
+    checkpoint_path,
+    device='cuda:0',
+    max_seq=32768,
+    quant='nvfp4',
+)
+```
+
 The bundled OpenAI server
 ([`serving/qwen36_agent/`](../serving/qwen36_agent/README.md))
 detects the compute capability at startup and dispatches automatically:
-SM110 (Jetson AGX Thor) loads `Qwen36TorchFrontendThor`; everything else
-loads `Qwen36TorchFrontendRtx`. The CLI / config surface is identical
-across both.
+SM110 (Jetson AGX Thor) loads `Qwen36TorchFrontendThor`, SM121
+(DGX Spark / GB10) loads `Qwen36TorchFrontendSpark`, and other
+supported Blackwell/Ada GPUs load `Qwen36TorchFrontendRtx`. The CLI /
+config surface is identical across these frontends.
 
 | Argument | Type | Default | Meaning |
 |---|---|---|---|

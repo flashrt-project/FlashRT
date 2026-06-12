@@ -155,6 +155,24 @@ def test_long_mtp_tail_auto_policy(monkeypatch):
     assert fe._long_mtp_prefill_tail_for_prompt(204800) == 512
 
 
+def test_spark_long_k_and_xqa_buckets(monkeypatch):
+    from flash_rt.frontends.torch.qwen36_spark import Qwen36TorchFrontendSpark
+
+    monkeypatch.delenv('FLASHRT_QWEN36_TQ_SPEC_K', raising=False)
+    fe = Qwen36TorchFrontendSpark.__new__(Qwen36TorchFrontendSpark)
+
+    assert fe._long_tq_effective_k(2048, 6, 64) == 6
+    assert fe._long_tq_effective_k(8192, 6, 64) == 7
+    assert fe._long_tq_effective_k(16384, 6, 64) == 6
+    assert fe._long_tq_effective_k(24576, 6, 64) == 7
+    assert fe._long_tq_effective_k(32768, 6, 64) == 7
+
+    assert fe._fp8_xqa_auto_bucket_enabled(7, 2048)
+    assert not fe._fp8_xqa_auto_bucket_enabled(8, 8192)
+    assert fe._fp8_xqa_auto_bucket_enabled(7, 16384)
+    assert fe._fp8_xqa_auto_bucket_enabled(7, 32768)
+
+
 def test_long_mtp_tail_auto_disables_without_bf16_kv(monkeypatch):
     from flash_rt.frontends.torch.qwen36_rtx import Qwen36TorchFrontendRtx
 
@@ -170,6 +188,25 @@ def test_long_mtp_tail_auto_disables_without_bf16_kv(monkeypatch):
 
     monkeypatch.setenv('FLASHRT_QWEN36_LONG_MTP_PREFILL_TAIL', '512')
     assert fe._long_mtp_prefill_tail_for_prompt(204800) == 512
+
+
+def test_spark_long_mtp_tail_auto_supports_nvfp4_mtp(monkeypatch):
+    from flash_rt.frontends.torch.qwen36_spark import Qwen36TorchFrontendSpark
+
+    monkeypatch.delenv('FLASHRT_QWEN36_LONG_MTP_PREFILL_TAIL',
+                       raising=False)
+    fe = Qwen36TorchFrontendSpark.__new__(Qwen36TorchFrontendSpark)
+    fe._weights = type('Weights', (), {
+        'ptrs': {'mtp': {'k_proj_packed': 1}},
+    })()
+
+    assert fe._long_mtp_prefill_tail_for_prompt(128) == 128
+    assert fe._long_mtp_prefill_tail_for_prompt(512) == 512
+    assert fe._long_mtp_prefill_tail_for_prompt(1024) == 2048
+    assert fe._long_mtp_prefill_tail_for_prompt(4096) == 512
+    assert fe._long_mtp_prefill_tail_for_prompt(8192) == 4096
+    assert fe._long_mtp_prefill_tail_for_prompt(16384) == 4096
+    assert fe._long_mtp_prefill_tail_for_prompt(204800) == 2048
 
 
 def test_long_tq_effective_k_uses_measured_context_buckets(monkeypatch):
