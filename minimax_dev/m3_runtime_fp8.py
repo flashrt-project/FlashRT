@@ -45,18 +45,32 @@ PFX = "language_model.model."
 
 
 class ExpertCacheFP8:
-    """Layer-quota LRU cache of FP8 expert blocks (56.6 MB each)."""
+    """Two-tier FP8 expert cache (56.6 MB blocks):
+      - PINNED tier: per-layer warm set (top experts from the prompt trace),
+        loaded once, NEVER evicted. Decode hot experts live here -> hits.
+      - STREAM tier: a small shared LRU for everything else (prefill touches
+        all 128 experts/layer; cold decode misses). Prefill no longer evicts
+        the warm set, so decode hit rate = warm coverage instead of ~prefill
+        churn (the 41% -> ~warm% fix).
+    Per-expert get() + immediate consume keeps it evict-safe."""
 
     def __init__(self, qdir, device, budget_gb, workers=8):
         self.device = device
-        self.n_slots = int(budget_gb * 1e9 // BLOCK_BYTES)
-        self.quota = max(4, self.n_slots // (LAYERS - len(DENSE_LAYERS)))
+        self.qdir = qdir
+        n_total = int(budget_gb * 1e9 // BLOCK_BYTES)
+        n_sparse = LAYERS - len(DENSE_LAYERS)
+        # reserve most slots for the pinned warm set, keep a stream ring
+        self.n_stream = max(32, n_total // 16)
+        self.quota = max(4, (n_total - self.n_stream) // n_sparse)
+        self.n_pinned = self.quota * n_sparse
+        self.n_slots = self.n_pinned + self.n_stream
         self.slots = torch.empty(self.n_slots, BLOCK_BYTES,
                                  dtype=torch.uint8, device=device)
-        self.free = list(range(self.n_slots))
-        self.lru = {i: OrderedDict() for i in range(LAYERS)}
+        self.pinned = {i: {} for i in range(LAYERS)}   # layer -> {e: slot}
+        self.stream_lru = OrderedDict()                 # (layer,e) -> slot
+        self.stream_slots = list(range(self.n_pinned, self.n_slots))
+        self._pin_next = 0
         self.fds = {}
-        self.qdir = qdir
         self.stage = [torch.empty(BLOCK_BYTES, dtype=torch.uint8).pin_memory()
                       for _ in range(workers)]
         self.pool = ThreadPoolExecutor(max_workers=workers)
@@ -84,63 +98,53 @@ class ExpertCacheFP8:
         self.slots[slot].copy_(st)
         self.bytes_streamed += BLOCK_BYTES
 
-    def _evict(self, layer):
-        lru = self.lru[layer]
-        if lru and len(lru) >= self.quota:
-            return lru.popitem(last=False)[1]
-        if self.free:
-            return self.free.pop()
-        fat = max(self.lru, key=lambda i: len(self.lru[i]))
-        return self.lru[fat].popitem(last=False)[1]
-
     def get(self, layer, e):
-        """Fetch ONE expert; caller must consume (dequant) it before the next
-        get(), since a later eviction may reuse this slot. Evict-safe for the
-        prefill case where a layer touches more unique experts than the quota
-        (get_many would corrupt earlier-returned pointers via self-eviction)."""
-        lru = self.lru[layer]
-        if e in lru:
-            lru.move_to_end(e)
+        """One expert; consume before the next get() (stream slot may be
+        reused). Pinned warm-set hits never stream."""
+        p = self.pinned[layer]
+        slot = p.get(e)
+        if slot is not None:
             self.hits += 1
-            return int(self.slots[lru[e]].data_ptr())
+            return int(self.slots[slot].data_ptr())
         self.misses += 1
-        slot = self._evict(layer)
+        key = (layer, e)
+        slot = self.stream_lru.get(key)
+        if slot is not None:
+            self.stream_lru.move_to_end(key)
+            return int(self.slots[slot].data_ptr())
+        if len(self.stream_lru) >= self.n_stream:
+            slot = self.stream_lru.popitem(last=False)[1]
+        else:
+            slot = self.stream_slots[len(self.stream_lru)]
         self._read(layer, e, slot)
-        lru[e] = slot
+        self.stream_lru[key] = slot
         return int(self.slots[slot].data_ptr())
 
-    def get_many(self, layer, experts):
-        lru = self.lru[layer]
-        out, missing = {}, []
-        for e in experts:
-            if e in lru:
-                lru.move_to_end(e)
-                self.hits += 1
-                out[e] = int(self.slots[lru[e]].data_ptr())
-            else:
-                missing.append(e)
-        if missing:
-            self.misses += len(missing)
-            slots = [self._evict(layer) for _ in missing]
-            futs = [self.pool.submit(self._read, layer, e, s, k % len(self.stage))
-                    for k, (e, s) in enumerate(zip(missing, slots))]
-            for f in futs:
-                f.result()
-            for e, s in zip(missing, slots):
-                lru[e] = s
-                out[e] = int(self.slots[s].data_ptr())
-        return out
-
     def warm(self, trace_path):
+        """Pin the top-`quota` experts per layer from the prompt trace."""
         tr = torch.load(trace_path, map_location="cpu", weights_only=False)
         t0 = time.time()
         for i, sel in tr["experts"].items():
+            i = int(i)
             counts = torch.bincount(sel.flatten(), minlength=N_EXPERTS)
             top = counts.argsort(descending=True)[: self.quota]
-            self.get_many(int(i), [int(e) for e in top])
-        print(f"cache warmed {time.time() - t0:.1f}s; {self.stats()}", flush=True)
-        self.hits = self.misses = 0
+            futs = []
+            for e in top:
+                slot = self._pin_next
+                self._pin_next += 1
+                self.pinned[i][int(e)] = slot
+                futs.append(self.pool.submit(self._read, i, int(e), slot,
+                                             len(futs) % len(self.stage)))
+                if len(futs) == len(self.stage):
+                    for f in futs:
+                        f.result()
+                    futs = []
+            for f in futs:
+                f.result()
         self.bytes_streamed = 0
+        print(f"cache warmed {time.time() - t0:.1f}s; pinned "
+              f"{self._pin_next} experts, {self.n_stream} stream slots",
+              flush=True)
 
     def stats(self):
         tot = self.hits + self.misses
