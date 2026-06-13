@@ -38,6 +38,28 @@ from m3_quant_nvfp4 import (  # noqa: E402
     INTER, _sf_bytes,
 )
 
+_E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+
+
+def nvfp4_fake_quant(w: torch.Tensor) -> torch.Tensor:
+    """Emulate NVFP4 weight quantization numerically (per-16 e4m3 SF +
+    e2m1 nearest rounding + per-tensor global scale, compressed-tensors
+    convention), returning a dequantized BF16 weight. Running F.linear
+    on the result = W4A16 numerics — isolates weight-quant noise from
+    activation-quant (A4) noise."""
+    N, K = w.shape
+    wf = w.float().view(N, K // 16, 16)
+    gs = (448.0 * 6.0) / wf.abs().max().clamp(min=1e-12)
+    sf = (wf.abs().amax(-1, keepdim=True) * gs / 6.0)
+    sf = sf.to(torch.float8_e4m3fn).float().clamp(min=2.0 ** -9)
+    q = wf * gs / sf
+    code = torch.tensor(_E2M1, device=w.device)
+    mids = (code[1:] + code[:-1]) / 2
+    idx = torch.bucketize(q.abs(), mids)
+    deq = q.sign() * code[idx] * sf / gs
+    return deq.view(N, K).to(torch.bfloat16)
+
+
 OFF_W1P = 0
 OFF_W1S = OFF_W1P + W1_PACKED
 OFF_W3P = OFF_W1S + W1_SF
@@ -93,29 +115,33 @@ class QuantLayer:
     """One decoder layer materialized on GPU from the NVFP4 artifacts."""
 
     def __init__(self, i: int, qdir: str, device: str,
-                 bf16_parts=frozenset(), rd=None):
+                 bf16_parts=frozenset(), rd=None, fq_parts=frozenset()):
         self.i = i
         self.sparse = i not in DENSE_LAYERS
-        self.bf16_parts = bf16_parts
+        self.bf16_parts = bf16_parts = bf16_parts | fq_parts
+        self.fq_parts = fq_parts
         self._keep = []
         pre = f"{PFX}layers.{i}."
         res = torch.load(os.path.join(qdir, f"resident_layer_{i:02d}.pt"),
                          map_location="cpu", weights_only=False)
         g = lambda p: _gpu_lin(res, p, self._keep, device)  # noqa: E731
 
-        def orig(name):
+        def orig(name, part=None):
             t = rd.get(pre + name, device).to(torch.bfloat16)
+            if part in fq_parts:
+                t = nvfp4_fake_quant(t)
             self._keep.append(t)
             return t
 
         if "attn" in bf16_parts:
             self.q_proj = orig("self_attn.q_proj.weight")
-            self.k_proj = orig("self_attn.k_proj.weight")
-            self.v_proj = orig("self_attn.v_proj.weight")
+            self.k_proj = orig("self_attn.k_proj.weight", "attn")
+            self.v_proj = orig("self_attn.v_proj.weight", "attn")
         else:
             self.q_proj, self.k_proj = g("q_proj"), g("k_proj")
             self.v_proj = g("v_proj")
-        self.o_proj = (orig("self_attn.o_proj.weight")
+        opart = "o" if "o" in bf16_parts else "attn"
+        self.o_proj = (orig("self_attn.o_proj.weight", opart)
                        if {"attn", "o"} & bf16_parts else g("o_proj"))
         self.q_norm = res["q_norm"].to(device)
         self.k_norm = res["k_norm"].to(device)
@@ -123,9 +149,9 @@ class QuantLayer:
         self.post_ln = res["post_ln"].to(device)
         if not self.sparse:
             if "dense" in bf16_parts:
-                self.mlp_gate = orig("mlp.gate_proj.weight")
-                self.mlp_up = orig("mlp.up_proj.weight")
-                self.mlp_down = orig("mlp.down_proj.weight")
+                self.mlp_gate = orig("mlp.gate_proj.weight", "dense")
+                self.mlp_up = orig("mlp.up_proj.weight", "dense")
+                self.mlp_down = orig("mlp.down_proj.weight", "dense")
             else:
                 self.mlp_gate, self.mlp_up = g("mlp_gate"), g("mlp_up")
                 self.mlp_down = g("mlp_down")
@@ -134,22 +160,25 @@ class QuantLayer:
             self.gate_bias = res["gate_bias"].to(device)
             if "shared" in bf16_parts:
                 b = "block_sparse_moe.shared_experts."
-                self.sh_gate = orig(b + "gate_proj.weight")
-                self.sh_up = orig(b + "up_proj.weight")
-                self.sh_down = orig(b + "down_proj.weight")
+                self.sh_gate = orig(b + "gate_proj.weight", "shared")
+                self.sh_up = orig(b + "up_proj.weight", "shared")
+                self.sh_down = orig(b + "down_proj.weight", "shared")
             else:
                 self.sh_gate, self.sh_up = g("sh_gate"), g("sh_up")
                 self.sh_down = g("sh_down")
             if {"w13", "w2"} & bf16_parts:
                 b = f"{pre}block_sparse_moe.experts."
-                names, self._orig_experts = [], {}
+                self._orig_experts = {}
                 wanted = ([("w1", "w13"), ("w3", "w13"), ("w2", "w2")])
                 for wn, part in wanted:
                     if part in bf16_parts:
                         ts = rd.get_many(
                             [f"{b}{e}.{wn}.weight" for e in range(N_EXPERTS)],
                             device="cpu")
-                        st = torch.stack(ts).to(device)
+                        st = torch.stack(ts).to(device).to(torch.bfloat16)
+                        if part in fq_parts:
+                            for e in range(N_EXPERTS):
+                                st[e] = nvfp4_fake_quant(st[e])
                         self._keep.append(st)
                         self._orig_experts[wn] = st
             else:
@@ -246,14 +275,15 @@ def layer_forward_q(ctx: Fp4Ctx, w: QuantLayer, x, cos, sin, position_ids,
 
 
 def full_forward_q(ctx, qdir, kv, ids, position_ids, embed_w, norm_w,
-                   lm_head, hidden_ref, tag, bf16_parts=frozenset(), rd=None):
+                   lm_head, hidden_ref, tag, bf16_parts=frozenset(), rd=None,
+                   fq_parts=frozenset()):
     device = ids.device
     x = F.embedding(ids, embed_w)[None]
     cos, sin = rope_cos_sin(position_ids, device, x.dtype)
     coss = []
     for i in range(LAYERS):
         t0 = time.time()
-        w = QuantLayer(i, qdir, device, bf16_parts, rd)
+        w = QuantLayer(i, qdir, device, bf16_parts, rd, fq_parts)
         x = layer_forward_q(ctx, w, x, cos, sin, position_ids, kv)
         w.free()
         if hidden_ref is not None:
@@ -279,6 +309,9 @@ def main():
     ap.add_argument("--bf16-parts", default="",
                     help="comma list of components to run as original BF16 "
                          "(ablation): attn,o,dense,shared,w13,w2,lm_head")
+    ap.add_argument("--fq-parts", default="",
+                    help="components to run as W4A16 (NVFP4 fake-quant "
+                         "weights + BF16 activations) — isolates A4 noise")
     args = ap.parse_args()
 
     sys.path.insert(0, "/workspace/FlashRT/flash_rt")
@@ -288,8 +321,10 @@ def main():
     device = args.device
     ctx = Fp4Ctx(fvk, device)
     bf16_parts = frozenset(p for p in args.bf16_parts.split(",") if p)
+    fq_parts = frozenset(p for p in args.fq_parts.split(",") if p)
     rd = RawShardReader(args.model, device)
-    print(f"bf16 ablation parts: {sorted(bf16_parts) or 'none'}", flush=True)
+    print(f"bf16 ablation parts: {sorted(bf16_parts) or 'none'}; "
+          f"fq(W4A16) parts: {sorted(fq_parts) or 'none'}", flush=True)
 
     trace = torch.load(os.path.join(args.ref, "trace.pt"),
                        map_location="cpu", weights_only=False)
@@ -317,7 +352,7 @@ def main():
     t0 = time.time()
     logits, coss = full_forward_q(ctx, args.qdir, kv, ids, pos, embed_w,
                                   norm_w, lm_head, hidden_ref, "prefill",
-                                  bf16_parts, rd)
+                                  bf16_parts, rd, fq_parts)
     print(f"prefill {time.time() - t0:.1f}s", flush=True)
 
     print("\nper-layer last-token hidden cos vs BF16 ref:")
@@ -335,7 +370,7 @@ def main():
         p = torch.tensor([ids.shape[0] + step], device=device)
         logits, _ = full_forward_q(ctx, args.qdir, kv, cur, p, embed_w,
                                    norm_w, lm_head, None, f"step{step}",
-                                   bf16_parts, rd)
+                                   bf16_parts, rd, fq_parts)
         gen.append(int(logits[-1].argmax()))
         ok = "MATCH" if gen[-1] == ref_gen[step + 1] else "MISMATCH"
         print(f"step {step}: {gen[-1]} vs ref {ref_gen[step + 1]} {ok}",
