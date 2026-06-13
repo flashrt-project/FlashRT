@@ -1,7 +1,34 @@
 # MiniMax-M3 on DGX Spark (GB10) — FlashRT 适配 Handoff
 
-更新: 2026-06-12 深夜。分支 `minimax-spark` @ 91004e6。Session 入口 memory:
+更新: 2026-06-13。分支 `minimax-spark` @ ab9c6a9。Session 入口 memory:
 `project_minimax_m3_spark_adaptation.md`。
+
+## 当前状态 (2026-06-13 收尾)
+
+DONE: M3 427B 单 Spark E2E 跑通。质量 Route B = FP8 experts + BF16 resident
+**prefill cos 0.981** (达成 0.96+ 目标; W4A4 0.797 / W4A16 0.871)。
+单 Spark 单流 FP8 decode **0.77 tok/s** (两层 cache 后), 纯流式带宽受限。
+
+产物: /models/MiniMax-M3-NVFP4 (232GB W4A4) + /models/MiniMax-M3-FP8E
+(385GB FP8 experts, BF16 resident from original)。
+runtime: minimax_dev/m3_runtime_fp8.py (Route B 主) / m3_runtime.py (W4A16)。
+kernels 新增: nvfp4_dequant_swizzled_to_bf16 (additive); FP8 用现成
+fp8_block128_dequantize_to_bf16。MSA Triton: minimax_dev/msa_triton/
+(decode-sparse sm_121 全验证, 未接 runtime)。
+
+🔴 MTP 未发布: checkpoint 无 mtp/nextn 张量, spec decode 不可行。
+单 Spark 单流提速杠杆只剩: batching (吞吐) / 2-Spark / prompt-lookup spec /
+降 W4A16 (0.914, ~2×速度)。待用户 steer。
+
+未做: 真 8K/32K/128K benchmark (decode 已确认流式受限~ctx无关; 128K 需 FP8 KV
+cache, 当前 BF16 KV 放不下); P4-2 Triton decode-sparse 接 runtime (长 ctx
+attention 加速, 但 decode 被 expert 流式主导, 收益次要)。
+
+合成 prompt bug: m3_runtime_fp8.py main 的 `base*8` 只 ~177 token, 长 ctx
+benchmark 要改 repeat 次数 (base*400 给 8K)。
+
+---
+## 历史 (2026-06-12)
 
 ## 任务与现实约束
 
