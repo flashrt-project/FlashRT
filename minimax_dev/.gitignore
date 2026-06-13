@@ -2,3 +2,7 @@ ref_out/
 ref_out_smoke/
 *.log
 __pycache__/
+minimax_dev/msa_triton/_src_sglang/
+minimax_dev/msa_triton/_src_vllm/
+minimax_dev/msa_triton/**/__pycache__/
+minimax_dev/msa_triton/.pytest_cache/
