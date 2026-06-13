@@ -142,6 +142,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/bf16_matmul_qwen36_thor.cuh"
 #include "kernels/fp4_w4a4_matvec_sm120.cuh"
 #include "kernels/nvfp4_dequant_swizzled_to_bf16.cuh"
+#include "kernels/msa_decode_attn_mma.cuh"
 #include "kernels/fp4_w4a4_mma_sm120.cuh"
 #include "kernels/fp4_w4a4_mma_warpsplit_sm120.cuh"
 #include "kernels/fp4_w4a4_mma_warpsplit_mrows_sm120.cuh"
@@ -2312,6 +2313,56 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("b_packed"), py::arg("sfb"), py::arg("d_bf16"),
         py::arg("N"), py::arg("K"), py::arg("alpha"),
         py::arg("stream") = 0);
+    // Tensor-core (mma m16n8k16) fragment-resident block-sparse GQA decode
+    // attention for the M3 MSA shape (head_dim 128, GQA group 16). Contiguous
+    // KV cache [max_slots, 2, max_len, Hkv, D] (k at index 0, v at index 1).
+    m.def("msa_decode_sparse_attn_mma",
+        [](uintptr_t q, uintptr_t kv_cache, uintptr_t seq_lens,
+           uintptr_t slot_ids, uintptr_t topk_idx, uintptr_t out,
+           int B, int Hq, int Hkv, int D, int max_slots, int max_len,
+           int block_size, int topk, float sm_scale, uintptr_t stream) {
+            flashrt_minimax_msa::msa_decode_sparse_attn_mma_cuda(
+                reinterpret_cast<const void*>(q),
+                reinterpret_cast<const void*>(kv_cache),
+                reinterpret_cast<const int*>(seq_lens),
+                reinterpret_cast<const int64_t*>(slot_ids),
+                reinterpret_cast<const int*>(topk_idx),
+                reinterpret_cast<void*>(out),
+                B, Hq, Hkv, D, max_slots, max_len, block_size, topk, sm_scale,
+                to_stream(stream));
+        },
+        py::arg("q"), py::arg("kv_cache"), py::arg("seq_lens"),
+        py::arg("slot_ids"), py::arg("topk_idx"), py::arg("out"),
+        py::arg("B"), py::arg("Hq"), py::arg("Hkv"), py::arg("D"),
+        py::arg("max_slots"), py::arg("max_len"), py::arg("block_size"),
+        py::arg("topk"), py::arg("sm_scale"), py::arg("stream") = 0);
+
+    // Paged variant: separate k_cache / v_cache [max_slots, Hkv, D] with a
+    // req_to_token [max_reqs, max_kv_len] indirection (logical token -> slot).
+    m.def("msa_decode_sparse_attn_mma_paged",
+        [](uintptr_t q, uintptr_t k_cache, uintptr_t v_cache,
+           uintptr_t req_to_token, uintptr_t seq_lens, uintptr_t slot_ids,
+           uintptr_t topk_idx, uintptr_t out, int B, int Hq, int Hkv, int D,
+           int max_slots, int max_kv_len, int block_size, int topk,
+           float sm_scale, uintptr_t stream) {
+            flashrt_minimax_msa::msa_decode_sparse_attn_mma_paged_cuda(
+                reinterpret_cast<const void*>(q),
+                reinterpret_cast<const void*>(k_cache),
+                reinterpret_cast<const void*>(v_cache),
+                reinterpret_cast<const int*>(req_to_token),
+                reinterpret_cast<const int*>(seq_lens),
+                reinterpret_cast<const int64_t*>(slot_ids),
+                reinterpret_cast<const int*>(topk_idx),
+                reinterpret_cast<void*>(out),
+                B, Hq, Hkv, D, max_slots, max_kv_len, block_size, topk,
+                sm_scale, to_stream(stream));
+        },
+        py::arg("q"), py::arg("k_cache"), py::arg("v_cache"),
+        py::arg("req_to_token"), py::arg("seq_lens"), py::arg("slot_ids"),
+        py::arg("topk_idx"), py::arg("out"), py::arg("B"), py::arg("Hq"),
+        py::arg("Hkv"), py::arg("D"), py::arg("max_slots"),
+        py::arg("max_kv_len"), py::arg("block_size"), py::arg("topk"),
+        py::arg("sm_scale"), py::arg("stream") = 0);
 
     // ── TurboQuant unpack (Phase 3A B9 step S3) ───────────────────────
     // Packed B8 (4-bit K idx + 1-bit qjl + 4-bit V idx) → 3 BF16 outputs:

@@ -943,6 +943,7 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/qwen3_qkv_post_proc.cu
   csrc/kernels/fp4_w4a4_matvec_sm120.cu
   csrc/kernels/nvfp4_dequant_swizzled_to_bf16.cu
+  csrc/kernels/msa_decode_attn_mma.cu
   csrc/kernels/fp4_w4a4_mma_sm120.cu
   csrc/kernels/fp4_w4a4_mma_warpsplit_sm120.cu
   csrc/kernels/fp4_w4a4_mma_warpsplit_mrows_sm120.cu
