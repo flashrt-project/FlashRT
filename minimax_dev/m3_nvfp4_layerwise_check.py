@@ -77,19 +77,35 @@ class Fp4Linear:
 
 
 class Fp4Ctx:
-    def __init__(self, fvk, device):
+    def __init__(self, fvk, device, w4a16=False):
         self.fvk = fvk
         self.device = device
+        # W4A16: dequant the FP4 weight to BF16 in-kernel and matmul with the
+        # BF16 activation (no activation quant) — quality path, ~0.89 vs ref.
+        self.w4a16 = w4a16
+        self._deq = None  # reusable dequant scratch (grows to max N*K)
+
+    def _dequant(self, lin) -> torch.Tensor:
+        need = lin.N * lin.K
+        if self._deq is None or self._deq.numel() < need:
+            self._deq = torch.empty(need, dtype=torch.bfloat16,
+                                    device=self.device)
+        w = self._deq[:need].view(lin.N, lin.K)
+        self.fvk.nvfp4_dequant_swizzled_to_bf16(
+            lin.b_ptr, lin.sfb_ptr, int(w.data_ptr()),
+            lin.N, lin.K, lin.alpha, 0)
+        return w
 
     def linear(self, x: torch.Tensor, lin) -> torch.Tensor:
-        """x [M, K] bf16 -> [M, N] bf16. `lin` is either an Fp4Linear
-        (dynamic-act-quant FP4 GEMM) or a BF16 weight tensor (ablation:
-        that component bypasses quantization entirely)."""
+        """x [M, K] bf16 -> [M, N] bf16. `lin` is either an Fp4Linear or a
+        BF16 weight tensor (ablation: bypasses quantization)."""
         if isinstance(lin, torch.Tensor):
             return F.linear(x, lin)
         M, K = x.shape
         assert K == lin.K, (K, lin.K)
         x = x.contiguous()
+        if self.w4a16:
+            return F.linear(x, self._dequant(lin))
         a_packed = torch.empty(M, K // 2, dtype=torch.uint8, device=self.device)
         a_sf = torch.zeros(_sf_bytes(M, K), dtype=torch.uint8, device=self.device)
         self.fvk.quantize_bf16_to_nvfp4_swizzled(
@@ -306,6 +322,8 @@ def main():
     ap.add_argument("--model", default="/models/MiniMax-M3")
     ap.add_argument("--max-new", type=int, default=2)
     ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--w4a16", action="store_true",
+                    help="dequant weights to BF16 + BF16-activation matmul")
     ap.add_argument("--bf16-parts", default="",
                     help="comma list of components to run as original BF16 "
                          "(ablation): attn,o,dense,shared,w13,w2,lm_head")
@@ -319,7 +337,7 @@ def main():
     from raw_st_reader import RawShardReader
 
     device = args.device
-    ctx = Fp4Ctx(fvk, device)
+    ctx = Fp4Ctx(fvk, device, w4a16=args.w4a16)
     bf16_parts = frozenset(p for p in args.bf16_parts.split(",") if p)
     fq_parts = frozenset(p for p in args.fq_parts.split(",") if p)
     rd = RawShardReader(args.model, device)

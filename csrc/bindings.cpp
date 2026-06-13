@@ -141,6 +141,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/bf16_matmul_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36_thor.cuh"
 #include "kernels/fp4_w4a4_matvec_sm120.cuh"
+#include "kernels/nvfp4_dequant_swizzled_to_bf16.cuh"
 #include "kernels/fp4_w4a4_mma_sm120.cuh"
 #include "kernels/fp4_w4a4_mma_warpsplit_sm120.cuh"
 #include "kernels/fp4_w4a4_mma_warpsplit_mrows_sm120.cuh"
@@ -2295,6 +2296,22 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("nvfp4_packed"), py::arg("nvfp4_sf_swizzled"),
         py::arg("scratch_global_amax"), py::arg("out_global_scale"),
         py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+
+    // NVFP4 swizzled weight -> dense BF16 (W4A16 quality path). Inverse of
+    // bf16_weight_to_nvfp4_swizzled's packing; a BF16-activation matmul over
+    // the result is true W4A16 (no activation quant).
+    m.def("nvfp4_dequant_swizzled_to_bf16",
+        [](uintptr_t b_packed, uintptr_t sfb, uintptr_t d_bf16,
+           int N, int K, float alpha, uintptr_t stream) {
+            flash_rt::quantize::nvfp4_dequant_swizzled_to_bf16(
+                reinterpret_cast<const uint8_t*>(b_packed),
+                reinterpret_cast<const uint8_t*>(sfb),
+                reinterpret_cast<void*>(d_bf16),
+                N, K, alpha, to_stream(stream));
+        },
+        py::arg("b_packed"), py::arg("sfb"), py::arg("d_bf16"),
+        py::arg("N"), py::arg("K"), py::arg("alpha"),
+        py::arg("stream") = 0);
 
     // ── TurboQuant unpack (Phase 3A B9 step S3) ───────────────────────
     // Packed B8 (4-bit K idx + 1-bit qjl + 4-bit V idx) → 3 BF16 outputs:

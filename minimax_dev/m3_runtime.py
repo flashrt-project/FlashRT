@@ -153,9 +153,10 @@ def expert_lin(base: int, alphas, e_row, which: str) -> Fp4Linear:
 
 
 class M3Runtime:
-    def __init__(self, qdir, device, fvk, cache_gb=75.0, max_seq=16384):
+    def __init__(self, qdir, device, fvk, cache_gb=75.0, max_seq=16384,
+                 w4a16=False):
         self.device = device
-        self.ctx = Fp4Ctx(fvk, device)
+        self.ctx = Fp4Ctx(fvk, device, w4a16=w4a16)
         self.qdir = qdir
         self.max_seq = max_seq
         t0 = time.time()
@@ -354,12 +355,15 @@ def main():
     ap.add_argument("--check-ref", default="",
                     help="ref_out dir: replay its prompt and compare")
     ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--w4a16", action="store_true",
+                    help="W4A16 quality path (dequant weights, BF16 act)")
     args = ap.parse_args()
 
     sys.path.insert(0, "/workspace/FlashRT/flash_rt")
     import flash_rt_kernels as fvk
 
-    rt = M3Runtime(args.qdir, args.device, fvk, cache_gb=args.cache_gb)
+    rt = M3Runtime(args.qdir, args.device, fvk, cache_gb=args.cache_gb,
+                   w4a16=args.w4a16)
     if args.warm_trace and os.path.exists(args.warm_trace):
         rt.warm_from_trace(args.warm_trace)
 
