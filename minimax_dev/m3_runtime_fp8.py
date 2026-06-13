@@ -234,6 +234,13 @@ class M3RuntimeFP8:
         self.k_cache = torch.zeros(LAYERS, KV_HEADS, max_seq, HEAD_DIM,
                                    dtype=torch.bfloat16, device=device)
         self.v_cache = torch.zeros_like(self.k_cache)
+        # Native tensor-core block-sparse decode: used automatically when the
+        # kernel is built into flash_rt_kernels, otherwise SDPA is used. The
+        # identity req_to_token (head-major cache -> slot-major paged) is cached.
+        self._has_native_decode = hasattr(
+            self.fvk, "msa_decode_sparse_attn_mma_paged")
+        self._r2t_identity = torch.arange(
+            self.k_cache.shape[2], dtype=torch.int32, device=device).view(1, -1)
         self.idx_k_cache = torch.zeros(LAYERS, max_seq, IDX_DIM,
                                        dtype=torch.bfloat16, device=device)
         self.seq_len = 0
@@ -284,13 +291,7 @@ class M3RuntimeFP8:
         sparse = (d["sparse"] and S == 1 and k_len > IDX_TOPK * IDX_BLOCK)
         if sparse:
             bid = self._indexer(d, li, h, cos, sin, pos)
-            cols = (bid[:, None] * IDX_BLOCK
-                    + torch.arange(IDX_BLOCK, device=q.device)[None]).flatten()
-            cols = cols[cols < k_len]
-            kk = self.k_cache[li, :, cols][None]
-            vv = self.v_cache[li, :, cols][None]
-            attn = F.scaled_dot_product_attention(
-                q, kk, vv, enable_gqa=True, scale=HEAD_DIM**-0.5)
+            attn = self._sparse_decode(li, q, bid, k_len)
         else:
             if d["sparse"] and S > 1:
                 idx_k = F.linear(h, d["idx_k_proj"]).view(S, 1, IDX_DIM)
@@ -305,6 +306,40 @@ class M3RuntimeFP8:
                 scale=HEAD_DIM**-0.5)
         attn = attn.transpose(1, 2).reshape(S, Q_HEADS * HEAD_DIM)
         return F.linear(attn, d["o_proj"])
+
+    def _sparse_decode(self, li, q, bid, k_len):
+        # Native tensor-core path (cos ~1.0 vs SDPA) when the kernel is built;
+        # the head-major [Hkv, seq, D] cache is transposed to the kernel's
+        # slot-major paged layout with an identity req_to_token. SDPA fallback.
+        if self._has_native_decode:
+            Hq, Hkv, D = Q_HEADS, KV_HEADS, HEAD_DIM
+            dev = q.device
+            qn = q[0, :, 0, :].unsqueeze(0).contiguous()
+            kc = self.k_cache[li, :, :k_len].transpose(0, 1).contiguous()
+            vc = self.v_cache[li, :, :k_len].transpose(0, 1).contiguous()
+            ms = kc.shape[0]
+            r2t = self._r2t_identity
+            sl = torch.tensor([k_len], dtype=torch.int32, device=dev)
+            sid = torch.zeros(1, dtype=torch.int64, device=dev)
+            ti = torch.full((Hkv, 1, IDX_TOPK), -1, dtype=torch.int32, device=dev)
+            bb = bid.to(torch.int32)
+            n = min(IDX_TOPK, bb.numel())
+            for kh in range(Hkv):
+                ti[kh, 0, :n] = bb[:n]
+            out = torch.empty(1, Hq, D, dtype=torch.bfloat16, device=dev)
+            self.fvk.msa_decode_sparse_attn_mma_paged(
+                qn.data_ptr(), kc.data_ptr(), vc.data_ptr(), r2t.data_ptr(),
+                sl.data_ptr(), sid.data_ptr(), ti.data_ptr(), out.data_ptr(),
+                1, Hq, Hkv, D, ms, r2t.shape[1], IDX_BLOCK, IDX_TOPK,
+                float(HEAD_DIM ** -0.5), 0)
+            return out.view(1, Hq, 1, D)
+        cols = (bid[:, None] * IDX_BLOCK
+                + torch.arange(IDX_BLOCK, device=q.device)[None]).flatten()
+        cols = cols[cols < k_len]
+        kk = self.k_cache[li, :, cols][None]
+        vv = self.v_cache[li, :, cols][None]
+        return F.scaled_dot_product_attention(
+            q, kk, vv, enable_gqa=True, scale=HEAD_DIM ** -0.5)
 
     def _moe(self, d, li, flat):
         shared = F.linear(swigluoai(F.linear(flat, d["sh_gate"]),
