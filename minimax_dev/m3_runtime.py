@@ -308,16 +308,19 @@ class M3Runtime:
         weights = scores.gather(1, sel)
         weights = weights / weights.sum(dim=-1, keepdim=True)
         uniq = [int(e) for e in sel.unique()]
-        ptrs = self.cache.get_many(li, uniq)
         routed = torch.zeros_like(flat)
         al = d["alphas"]
+        # Per-expert fetch + immediate consume: a layer can route to more
+        # unique experts than the cache quota (prefill), so batch-fetching
+        # pointers would let later self-evictions corrupt earlier slots.
         for e in uniq:
+            base = self.cache.get(li, e)
             tok, p = torch.where(sel == e)
             xe = flat[tok]
             cur = swigluoai(
-                ctx.linear(xe, expert_lin(ptrs[e], al, al[e], "w1")),
-                ctx.linear(xe, expert_lin(ptrs[e], al, al[e], "w3")))
-            cur = ctx.linear(cur, expert_lin(ptrs[e], al, al[e], "w2"))
+                ctx.linear(xe, expert_lin(base, al, al[e], "w1")),
+                ctx.linear(xe, expert_lin(base, al, al[e], "w3")))
+            cur = ctx.linear(cur, expert_lin(base, al, al[e], "w2"))
             routed.index_add_(0, tok, cur * weights[tok, p, None].to(cur.dtype))
         return routed * 2.0 + shared
 

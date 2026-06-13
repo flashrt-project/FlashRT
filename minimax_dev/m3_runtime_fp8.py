@@ -93,6 +93,22 @@ class ExpertCacheFP8:
         fat = max(self.lru, key=lambda i: len(self.lru[i]))
         return self.lru[fat].popitem(last=False)[1]
 
+    def get(self, layer, e):
+        """Fetch ONE expert; caller must consume (dequant) it before the next
+        get(), since a later eviction may reuse this slot. Evict-safe for the
+        prefill case where a layer touches more unique experts than the quota
+        (get_many would corrupt earlier-returned pointers via self-eviction)."""
+        lru = self.lru[layer]
+        if e in lru:
+            lru.move_to_end(e)
+            self.hits += 1
+            return int(self.slots[lru[e]].data_ptr())
+        self.misses += 1
+        slot = self._evict(layer)
+        self._read(layer, e, slot)
+        lru[e] = slot
+        return int(self.slots[slot].data_ptr())
+
     def get_many(self, layer, experts):
         lru = self.lru[layer]
         out, missing = {}, []
@@ -295,14 +311,18 @@ class M3RuntimeFP8:
         weights = scores.gather(1, sel)
         weights = weights / weights.sum(dim=-1, keepdim=True)
         uniq = [int(e) for e in sel.unique()]
-        ptrs = self.cache.get_many(li, uniq)
         routed = torch.zeros_like(flat)
+        # Per-expert fetch: dequant each expert into scratch and consume it
+        # before fetching the next. A layer can route to more unique experts
+        # than the cache quota (prefill: up to 128 > quota), so batch-fetching
+        # pointers would let later evictions corrupt earlier slots.
         for e in uniq:
+            base = self.cache.get(li, e)
             tok, pos = torch.where(sel == e)
             xe = flat[tok]
-            cur = swigluoai(self._expert(ptrs[e], "w1", xe),
-                            self._expert(ptrs[e], "w3", xe))
-            cur = self._expert(ptrs[e], "w2", cur)
+            cur = swigluoai(self._expert(base, "w1", xe),
+                            self._expert(base, "w3", xe))
+            cur = self._expert(base, "w2", cur)
             routed.index_add_(0, tok, cur * weights[tok, pos, None].to(cur.dtype))
         return routed * 2.0 + shared
 
