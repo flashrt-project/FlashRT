@@ -126,6 +126,10 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("wan22_ti2v_5b", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.wan22_rtx", "Wan22TorchFrontendRtx"),
 
+    # ── Cosmos3-Nano AV FP4 (inverse-dynamics denoise; RTX SM120 only) ──
+    ("cosmos3_av", "torch", "rtx_sm120"):
+        ("flash_rt.frontends.torch.cosmos3_av_rtx", "Cosmos3AvTorchFrontendRtx"),
+
     # ── Pi0-FAST ── (SM120 runtime fork inside pipeline, no AttentionBackend protocol.)
     ("pi0fast", "torch", "thor"):
         ("flash_rt.frontends.torch.pi0fast", "Pi0FastTorchFrontend"),

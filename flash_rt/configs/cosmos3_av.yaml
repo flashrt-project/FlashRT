@@ -1,0 +1,24 @@
+# Cosmos3-Nano AV FP4 inverse-dynamics denoise (RTX SM120).
+# Metadata only — runtime dims are inferred from the reference dump in the model.
+name: cosmos3_av
+description: Cosmos3-Nano AV inverse-dynamics FP4 denoise (two-tower MoT, 10-step UniPC)
+arch: two_tower_mot_denoise
+hidden_dim: 4096
+ffn_hidden_dim: 12288
+num_layers: 36
+num_heads: 32
+num_kv_heads: 8
+head_dim: 128
+# denoise / action
+num_steps: 10
+guidance: 1.0
+shift: 5.0
+action_chunk_size: 60
+active_dims: 9
+# quantization
+weight_quant: nvfp4_mse
+ffn: cutlass_fp4_direct          # fp4_silu_aux (model-local kernel)
+attention: fa2_early_sage_int8_late
+sage_lo: 11                      # int8-sage on gen layers [11:36]; FA2 on [0:11]
+fp4_norm_constant: 16
+# reference baseline (RTX 5090): E2E 10-step ~1784 ms, action rel_l2 2.458%, cos 0.99971
