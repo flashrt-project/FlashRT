@@ -1,0 +1,24 @@
+# Cosmos3-Nano text2video FP8 denoise (RTX SM120).
+# Metadata only — runtime dims are inferred from the reference dump in the model.
+name: cosmos3_video
+description: Cosmos3-Nano text2video FP8 denoise (two-tower MoT, UniPC, TeaCache)
+arch: two_tower_mot_denoise
+hidden_dim: 4096
+ffn_hidden_dim: 12288
+num_layers: 36
+num_heads: 32
+num_kv_heads: 8
+head_dim: 128
+patch_latent_dim: 192
+latent_channels: 48
+# denoise
+num_steps: 10
+guidance: 1.0
+shift: 10.0
+scheduler: unipc
+# quantization
+weight_quant: fp8_e4m3           # near-lossless for the video latent; fp4 is lossy here
+attention: fa2_bf16              # int8-sage degrades the video latent
+teacache_skip: ""               # step caching, e.g. "3,5,7" (safe) or "2,4,6,8" (faster)
+vae_decode: wan2.2_fp4           # near-lossless Wan VAE conv acceleration (downstream)
+# reference baseline (RTX 5090, 480p/49f/10-step): denoise ~2.6 s, e2e latent cos ~0.986

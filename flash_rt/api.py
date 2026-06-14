@@ -399,11 +399,11 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         VLAModel instance with .predict() method.
     """
     if config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
-                      "motus", "wan22_ti2v_5b", "cosmos3_av"):
+                      "motus", "wan22_ti2v_5b", "cosmos3_av", "cosmos3_video"):
         raise ValueError(
             f"Unknown config: {config}. "
             f"Supported: pi05, groot, groot_n17, pi0, pi0fast, motus, "
-            f"wan22_ti2v_5b, cosmos3_av")
+            f"wan22_ti2v_5b, cosmos3_av, cosmos3_video")
     if framework not in ("torch", "jax"):
         raise ValueError(
             f"Unknown framework: {framework}. Supported: torch, jax")
