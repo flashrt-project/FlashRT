@@ -29,7 +29,7 @@ def load_model(
     autotune: int = 3,              # 0=off, 3=default, 5+=thorough
     recalibrate: bool = False,
     weight_cache: bool = True,      # JAX only
-    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "groot_n17" | "pi0fast" | "motus" | "wan22_ti2v_5b"
+    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "groot_n17" | "pi0fast" | "motus" | "wan22_ti2v_5b" | "cosmos3_video"
     device=None,                    # reserved
     # Pi0-FAST-specific:
     decode_cuda_graph: bool = False,
@@ -85,6 +85,12 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   teacache_threshold=..., teacache_start_step=...,
   teacache_end_step=..., teacache_cache_device=...)`; `predict()` is not
   part of this video-generation API. See `docs/wan22_usage.md`.
+- `config="cosmos3_video"` is an RTX SM120 Cosmos3-Nano text2video FP8
+  denoise model (non-VLA). It exposes `set_prompt(ref=<reference dump>)`
+  for conditioning and `infer(teacache_skip=..., shift=...,
+  compare_ref=..., return_metadata=...)`, returning the denoised vision
+  latent; `predict()` is not part of this API. Precision is selected with
+  `load_model(..., use_fp8=True|False)`. See `docs/cosmos3_video_usage.md`.
 - `config="groot_n17"` is registered for `framework="torch"` and
   `hardware="rtx_sm120"`. This route validates the N1.7 DiT
   self/cross-attention path on the vendored FA2 backend.

@@ -213,7 +213,7 @@ model = flash_rt.load_model(
 | `autotune` | `int\|bool` | `3` | CUDA Graph autotune intensity. See [Autotune](#autotune). |
 | `recalibrate` | `bool` | `False` | Force fresh FP8 calibration (and weight cache for JAX), ignoring cache. See [Calibration](#calibration). |
 | `weight_cache` | `bool` | `True` | Cache FP8-quantized weights to disk. **JAX only** — reduces cold start from ~42s to ~6s. Torch loads in ~3s and ignores this. See [Weight Cache](#weight-cache-jax-only). |
-| `config` | `str` | `"pi05"` | Model architecture config: `"pi05"`, `"pi0"`, `"groot"`, `"groot_n17"`, `"pi0fast"`, `"motus"`, `"wan22_ti2v_5b"`. |
+| `config` | `str` | `"pi05"` | Model architecture config: `"pi05"`, `"pi0"`, `"groot"`, `"groot_n17"`, `"pi0fast"`, `"motus"`, `"wan22_ti2v_5b"`, `"cosmos3_video"`. `"cosmos3_video"` is a non-VLA text2video denoise model — drive it with `set_prompt(ref=...)` + `infer(...)`, not `predict()`. |
 | `decode_cuda_graph` | `bool` | `False` | **Pi0-FAST only.** Capture action-phase decode as CUDA Graph. Trades startup time for per-token speed. See [Pi0-FAST](#pi0-fast). |
 | `decode_graph_steps` | `int` | `80` | **Pi0-FAST only.** Number of action tokens to capture in the decode graph. Should cover your longest expected action sequence. |
 | `use_fp4` | `bool` | `False` | **Pi0.5 torch + jax on Thor.** Enable NVFP4 quantization on the encoder FFN stack. When `True`, resolves to the production preset (`fp4_layers=tuple(range(18))` + `use_awq=True` + `use_p1_split_gu=True`). Requires SM100+ GPU. Other configs emit a warning and fall back to FP8. See [NVFP4](#nvfp4-pi05-only). |
@@ -621,6 +621,37 @@ This route uses the official Wan Python pipeline and original ModelScope
 checkpoint layout. It is separate from ComfyUI; ComfyUI integration should
 be provided by an external custom-node package. See
 [`docs/wan22_usage.md`](docs/wan22_usage.md).
+
+### Cosmos3-Nano text2video
+
+Cosmos3-Nano text2video is a self-contained, kernelized FP8 denoise model
+(non-VLA) on RTX SM120. Conditioning enters via `set_prompt(ref=...)` and the
+denoise runs through `infer(...)`; `predict()` is not part of this API.
+
+```python
+import flash_rt
+
+model = flash_rt.load_model(
+    "/path/to/cosmos3_video_weights.safetensors",
+    framework="torch",
+    config="cosmos3_video",
+    hardware="rtx_sm120",
+    use_fp8=True,                       # default; use_fp8=False -> bf16 reference
+)
+
+model.set_prompt(ref="/path/to/tensors.safetensors")   # official reference dump
+out = model.infer(
+    teacache_skip="3,5,7",             # training-free step caching ("" = off)
+    shift=10.0,
+    compare_ref=True,
+    return_metadata=True,
+)
+# out["latent"] -> [1,48,T,H,W] denoised vision latent (VAE decode is downstream)
+```
+
+The model-local kernel is built once on the target GPU (`cd
+flash_rt/models/cosmos3_video/kernels && python3 setup.py build_ext --inplace`).
+See [`docs/cosmos3_video_usage.md`](docs/cosmos3_video_usage.md).
 
 ### `model.predict()`
 

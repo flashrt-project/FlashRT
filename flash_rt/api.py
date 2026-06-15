@@ -316,7 +316,9 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         weight_cache: if True (default), cache FP8-quantized weights to disk
             after first load. Only affects JAX.
         config: model config name: "pi05", "pi0", "groot", "groot_n17",
-            "pi0fast", "motus", "wan22_ti2v_5b"
+            "pi0fast", "motus", "wan22_ti2v_5b", "cosmos3_video".
+            "cosmos3_video" is a non-VLA text2video denoise model: drive it with
+            set_prompt(ref=<reference dump>) + infer(...), not predict().
         device: ignored (auto-detects GPU). Reserved for future multi-GPU.
         decode_cuda_graph: Pi0-FAST only. Capture action-phase decode as CUDA
             Graph for max throughput (trades startup time for per-token speed).
@@ -399,11 +401,11 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         VLAModel instance with .predict() method.
     """
     if config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
-                      "motus", "wan22_ti2v_5b"):
+                      "motus", "wan22_ti2v_5b", "cosmos3_video"):
         raise ValueError(
             f"Unknown config: {config}. "
             f"Supported: pi05, groot, groot_n17, pi0, pi0fast, motus, "
-            f"wan22_ti2v_5b")
+            f"wan22_ti2v_5b, cosmos3_video")
     if framework not in ("torch", "jax"):
         raise ValueError(
             f"Unknown framework: {framework}. Supported: torch, jax")
