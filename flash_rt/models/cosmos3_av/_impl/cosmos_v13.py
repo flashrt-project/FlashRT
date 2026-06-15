@@ -5,7 +5,7 @@ down to layer 11 (sage on gen layers [11:36] instead of [16:36]).
 WHY (measured, not assumed): at the TRUE gen-attn shape (Q[6300,32,128] x KV[6410,8,
 128], the 480p/5-frame vision tokens dominate) bf16 FA2 runs at 3.20ms/call = 1.01x
 the bf16 roofline — it is already optimal, so a "faster bf16 attention kernel" has zero
-headroom (the old LEVER3_TODO premise was computed against a stale 633-token shape).
+headroom (an earlier premise was computed against a stale 633-token shape).
 The only attention lever is reduced precision. int8 sage is 1.60x faster than FA2.
 Per-layer error compounds through 36 layers (single-layer cos 0.9998 is misleading), so
 sage can only be pushed so far before the action rel_l2 gate (3%) breaks:

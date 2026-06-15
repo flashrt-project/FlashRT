@@ -7,7 +7,7 @@
 //   - sage_gqa_d128       GQA-native int8-QK / f16-PV SageAttention (late layers)
 //   - sage_gqa_f8_d128    GQA-native int8-QK / f8-PV  SageAttention (probe; unused by default)
 //   - qk_norm_rope        fused RMS qk-norm + qwen36 partial rope (one launch)
-// Sources are the byte-for-byte validated kernels from the cosmos bring-up.
+// Byte-for-byte validated Cosmos3 model-local kernels.
 #include <pybind11/pybind11.h>
 #include <cstdint>
 

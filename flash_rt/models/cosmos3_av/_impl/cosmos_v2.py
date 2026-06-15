@@ -5,8 +5,6 @@ Kernels: NVFP4 GEMM (both towers), rms_norm (qk-norm batched), qwen36 batched
 rope (q+k one launch), residual_add_rms_norm (fused residual+next-norm),
 silu_mul_qwen36, FA2. Timestep embeds precomputed outside the graph (static table).
 No cat / scatter / torch-rope / torch-residual.
-
-  sudo docker exec cosmos-dev python3 /work/cosmos_v2.py
 """
 import os, sys, math, time, torch, torch.nn.functional as F
 from safetensors import safe_open

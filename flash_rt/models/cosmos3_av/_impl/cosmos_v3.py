@@ -4,8 +4,6 @@ shared activation ONCE (qkv reads one nvfp4 input, not 3). Per-tower quant count
 drops 7 -> ~2/layer. Uses residual_add_rms_norm_to_nvfp4_swizzled_bf16 (residual
 + norm + nvfp4-quant in ONE launch) + rms_norm_to_nvfp4 for layer-0 input.
 o_proj/down read non-norm inputs (attn/silu) so keep quant-then-gemm (or bf16).
-
-  sudo docker exec cosmos-dev python3 /work/cosmos_v3.py
 """
 import sys, time, torch, torch.nn.functional as F
 from safetensors import safe_open

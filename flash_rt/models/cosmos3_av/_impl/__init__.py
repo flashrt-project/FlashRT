@@ -1,3 +1,3 @@
-"""Proven Cosmos3-AV denoise model (ported verbatim from bring-up; pointer-based,
-graph-safe). Kernel imports rewired to the model-local extension. V13 is the
-deliverable (sage boundary 16->11)."""
+"""Cosmos3 denoise models (pointer-based, CUDA-graph-safe). Kernel imports use the
+model-local extension. cosmos_v13 = AV inverse-dynamics deliverable (sage boundary
+16->11); cosmos_video = text2video FP8 path."""
