@@ -1236,6 +1236,27 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("S"), py::arg("Q_dim"), py::arg("K_dim"), py::arg("HD"), py::arg("qkv_stride"),
        py::arg("kc_offset"), py::arg("kc_stride"), py::arg("stream") = 0);
 
+    // QKV Split + RoPE + KV Cache (FP16) with runtime device K/V row offset.
+    // Same shape contract as qkv_split_rope_kvcache_fp16; K/V row =
+    // devpos[0] + token row inside the layer slab.
+    m.def("qkv_split_rope_kvcache_fp16_devpos", [](uintptr_t qkv, uintptr_t rope,
+                                              uintptr_t Q, uintptr_t Kc, uintptr_t Vc,
+                                              uintptr_t devpos,
+                                              int S, int Q_dim, int K_dim, int HD, int qkv_stride,
+                                              int kc_offset, int kc_stride, uintptr_t stream) {
+        qkv_split_rope_kvcache_fp16_devpos(reinterpret_cast<const __half*>(qkv),
+                                     reinterpret_cast<const __half*>(rope),
+                                     reinterpret_cast<__half*>(Q),
+                                     reinterpret_cast<__half*>(Kc),
+                                     reinterpret_cast<__half*>(Vc),
+                                     reinterpret_cast<const int*>(devpos),
+                                     S, Q_dim, K_dim, HD, qkv_stride,
+                                     kc_offset, kc_stride, to_stream(stream));
+    }, py::arg("qkv"), py::arg("rope"), py::arg("Q"), py::arg("Kc"), py::arg("Vc"),
+       py::arg("devpos"),
+       py::arg("S"), py::arg("Q_dim"), py::arg("K_dim"), py::arg("HD"), py::arg("qkv_stride"),
+       py::arg("kc_offset"), py::arg("kc_stride"), py::arg("stream") = 0);
+
     // Elementwise FP16
     m.def("bias_residual_fp16", [](uintptr_t residual, uintptr_t x, uintptr_t bias,
                                     int seq_len, int dim, uintptr_t stream) {
@@ -1562,6 +1583,26 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("logits"), py::arg("out"),
        py::arg("S"), py::arg("S_kv"), py::arg("NH"), py::arg("HD"),
        py::arg("attn_scale") = 1.0f, py::arg("stream") = 0);
+
+    // Fixed-shape cuBLAS decomposed attention. S_kv_max is graph-captured;
+    // seqused_k is a device int32[1] containing the valid K/V rows.
+    m.def("attention_qkv_fp16_seqused", [](FvkContext& ctx, uintptr_t Q, uintptr_t K, uintptr_t V,
+                                    uintptr_t logits, uintptr_t out,
+                                    int S, int S_kv_max, int NH, int HD,
+                                    uintptr_t seqused_k, float attn_scale, uintptr_t stream) {
+        attention_qkv_fp16_seqused(ctx.cublas_handle,
+                            reinterpret_cast<const __half*>(Q),
+                            reinterpret_cast<const __half*>(K),
+                            reinterpret_cast<const __half*>(V),
+                            reinterpret_cast<__half*>(logits),
+                            reinterpret_cast<__half*>(out),
+                            S, S_kv_max, NH, HD,
+                            reinterpret_cast<const int*>(seqused_k),
+                            attn_scale, to_stream(stream));
+    }, py::arg("ctx"), py::arg("Q"), py::arg("K"), py::arg("V"),
+       py::arg("logits"), py::arg("out"),
+       py::arg("S"), py::arg("S_kv_max"), py::arg("NH"), py::arg("HD"),
+       py::arg("seqused_k"), py::arg("attn_scale") = 1.0f, py::arg("stream") = 0);
 
     // Padded attention: supports odd S_kv (pads logits lda to even).
     // logits buffer must have room for S*NH * (S_kv + S_kv%2) elements.

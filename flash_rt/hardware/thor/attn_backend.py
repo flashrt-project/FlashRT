@@ -47,7 +47,8 @@ class ThorFlashAttnBackend(AttentionBackendBase):
     # ────────────────────────────────────────────────────────────────
     def __init__(self, spec: AttentionSpec, ctx, *,
                  siglip_slots: dict, encoder_slots: dict,
-                 decoder_slots: dict) -> None:
+                 decoder_slots: dict,
+                 fixed_control: Optional[dict] = None) -> None:
         """
         Args:
             spec: AttentionSpec with exactly the sites
@@ -69,6 +70,11 @@ class ThorFlashAttnBackend(AttentionBackendBase):
                 logits       (int) — scratch for P = QK^T
                 layer_stride (int) — bytes between successive layers in Kc/Vc
                 scale        (float) — 1/sqrt(head_dim)
+            fixed_control: optional dict for fixed-shape state-prompt mode.
+                When omitted and torch CUDA is available, the backend
+                allocates the three int32 device scalars itself. JAX callers
+                pass CudaBuffer-backed pointers plus a setter callback to keep
+                this module independent of PyTorch.
 
         Invariants enforced:
             * spec has the three expected sites with correct layer counts.
@@ -130,6 +136,44 @@ class ThorFlashAttnBackend(AttentionBackendBase):
         # construct the backend without a fully-initialised fvk env.
         self._fvk = None
 
+        self._fixed_shape = False
+        self._fixed_set_valid_len = None
+        self.enc_seqused = None
+        self.dec_seqused = None
+        self.dec_devpos = None
+        if fixed_control is not None:
+            self.enc_seqused = fixed_control.get("enc_seqused")
+            self.dec_seqused = fixed_control.get("dec_seqused")
+            self.dec_devpos = fixed_control.get("dec_devpos")
+            self._fixed_set_valid_len = fixed_control.get("set_valid_len")
+        else:
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    self.enc_seqused = torch.zeros(
+                        1, dtype=torch.int32, device="cuda")
+                    self.dec_seqused = torch.zeros(
+                        1, dtype=torch.int32, device="cuda")
+                    self.dec_devpos = torch.zeros(
+                        1, dtype=torch.int32, device="cuda")
+            except Exception:
+                pass
+        self._enc_seqused_ptr = self._device_ptr(self.enc_seqused)
+        self._dec_seqused_ptr = self._device_ptr(self.dec_seqused)
+        self._dec_devpos_ptr = self._device_ptr(self.dec_devpos)
+
+    @staticmethod
+    def _device_ptr(obj) -> int:
+        if obj is None:
+            return 0
+        if isinstance(obj, int):
+            return int(obj)
+        if hasattr(obj, "data_ptr"):
+            return int(obj.data_ptr())
+        if hasattr(obj, "ptr"):
+            return int(obj.ptr.value)
+        return int(obj)
+
     def _require_keys(self, site: str, keys: tuple[str, ...]) -> None:
         slot = self._slots[site]
         for k in keys:
@@ -147,6 +191,52 @@ class ThorFlashAttnBackend(AttentionBackendBase):
             import flash_rt.flash_rt_kernels as fvk
             self._fvk = fvk
         return self._fvk
+
+    def set_fixed_shape(self, enabled: bool) -> None:
+        """Enable/disable fixed-shape state-prompt masking.
+
+        When enabled, encoder and decoder standard attention use
+        ``attention_qkv_fp16_seqused``. The captured K/V max shape stays fixed;
+        :meth:`set_fixed_valid_len` updates the device-side valid lengths.
+        """
+        if enabled and not (
+            self._enc_seqused_ptr and self._dec_seqused_ptr
+            and self._dec_devpos_ptr
+        ):
+            raise RuntimeError(
+                "Thor fixed-shape attention requires enc_seqused, "
+                "dec_seqused, and dec_devpos device scalars")
+        self._fixed_shape = bool(enabled)
+
+    def set_fixed_valid_len(self, valid_prefix_len: int) -> None:
+        """Update device-side valid prefix length for fixed-shape replay."""
+        v = int(valid_prefix_len)
+        enc_max = self._spec.site("encoder").max_kv_seq
+        dec_max = self._spec.site("decoder").max_kv_seq
+        chunk = self._spec.site("decoder").max_q_seq
+        if not (0 < v <= enc_max):
+            raise ValueError(
+                f"valid_prefix_len={v} out of range for encoder max {enc_max}")
+        if v + chunk > dec_max:
+            raise ValueError(
+                f"decoder valid length {v + chunk} exceeds max {dec_max}")
+        if self._fixed_set_valid_len is not None:
+            self._fixed_set_valid_len(v, v + chunk, v)
+            return
+        if not (hasattr(self.enc_seqused, "fill_")
+                and hasattr(self.dec_seqused, "fill_")
+                and hasattr(self.dec_devpos, "fill_")):
+            raise RuntimeError(
+                "Thor fixed-shape scalars are pointer-only; caller must "
+                "provide fixed_control['set_valid_len']")
+        self.enc_seqused.fill_(v)
+        self.dec_seqused.fill_(v + chunk)
+        self.dec_devpos.fill_(v)
+        try:
+            import torch
+            torch.cuda.synchronize()
+        except Exception:
+            pass
 
     # ────────────────────────────────────────────────────────────────
     # Protocol: get_slot_ptrs
@@ -258,14 +348,27 @@ class ThorFlashAttnBackend(AttentionBackendBase):
                 float(s["scale"]), stream,
             )
         elif kernel == "standard":
-            fvk.attention_qkv_fp16(
-                self._ctx_cpp,
-                int(s["Q_O"]), K_ptr, V_ptr,
-                int(s["logits"]), int(s["Q_O"]),
-                q_seq, kv_seq,
-                site_spec.num_q_heads, site_spec.head_dim,
-                float(s["scale"]), stream,
-            )
+            if self._fixed_shape and site in ("encoder", "decoder"):
+                seqused = (self._enc_seqused_ptr if site == "encoder"
+                           else self._dec_seqused_ptr)
+                fvk.attention_qkv_fp16_seqused(
+                    self._ctx_cpp,
+                    int(s["Q_O"]), K_ptr, V_ptr,
+                    int(s["logits"]), int(s["Q_O"]),
+                    q_seq, kv_seq,
+                    site_spec.num_q_heads, site_spec.head_dim,
+                    seqused,
+                    float(s["scale"]), stream,
+                )
+            else:
+                fvk.attention_qkv_fp16(
+                    self._ctx_cpp,
+                    int(s["Q_O"]), K_ptr, V_ptr,
+                    int(s["logits"]), int(s["Q_O"]),
+                    q_seq, kv_seq,
+                    site_spec.num_q_heads, site_spec.head_dim,
+                    float(s["scale"]), stream,
+                )
         else:
             raise ValueError(
                 f"unknown kernel {kernel!r} for site {site!r} "

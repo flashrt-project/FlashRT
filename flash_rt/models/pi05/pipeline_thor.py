@@ -90,6 +90,9 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
     layers = dims['layers']
     enc_seq = dims['enc_seq']
     total_keys = dims['total_keys']
+    fixed_shape = bool(dims.get('fixed_shape', False))
+    if fixed_shape and attn is None:
+        raise ValueError("Pi0.5 Thor fixed_shape decoder requires attn backend")
     D3 = 3 * D
     Q_dim = NH * HD
     K_dim = HD
@@ -154,10 +157,17 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
                                        act_scale_qkv, w_scale_qkv, stream)
 
             # ── C2b: Fused RoPE + QKV split + KV cache ──
-            kv_offset = l * total_keys * HD + enc_seq * HD
-            fvk.qkv_split_rope_kvcache_fp16(qkv, rope, attn_out, Kc, Vc,
-                                             S, Q_dim, K_dim, HD, 2560,
-                                             kv_offset, HD, stream)
+            if fixed_shape:
+                kv_offset = l * total_keys * HD
+                fvk.qkv_split_rope_kvcache_fp16_devpos(
+                    qkv, rope, attn_out, Kc, Vc, weights['dec_devpos'],
+                    S, Q_dim, K_dim, HD, 2560,
+                    kv_offset, HD, stream)
+            else:
+                kv_offset = l * total_keys * HD + enc_seq * HD
+                fvk.qkv_split_rope_kvcache_fp16(qkv, rope, attn_out, Kc, Vc,
+                                                 S, Q_dim, K_dim, HD, 2560,
+                                                 kv_offset, HD, stream)
 
             # ── C3: Cross-attention ──
             if attn is not None:
@@ -233,6 +243,9 @@ def _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None)
     NH = dims['NH']; HD = dims['HD']
     steps = dims['steps']; layers = dims['layers']
     enc_seq = dims['enc_seq']; total_keys = dims['total_keys']
+    fixed_shape = bool(dims.get('fixed_shape', False))
+    if fixed_shape and attn is None:
+        raise ValueError("Pi0.5 Thor fixed_shape decoder requires attn backend")
     D3 = 3 * D
     Q_dim = NH * HD
     K_dim = HD
@@ -270,10 +283,17 @@ def _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None)
             fvk.gmm_fp16(ctx, xn, qw_ptr, qkv, S, 2560, D, 0.0, stream)
 
             # C2b: Split + RoPE + KV cache write
-            kv_offset = l * total_keys * HD + enc_seq * HD
-            fvk.qkv_split_rope_kvcache_fp16(qkv, rope, attn_out, Kc, Vc,
-                                             S, Q_dim, K_dim, HD, 2560,
-                                             kv_offset, HD, stream)
+            if fixed_shape:
+                kv_offset = l * total_keys * HD
+                fvk.qkv_split_rope_kvcache_fp16_devpos(
+                    qkv, rope, attn_out, Kc, Vc, weights['dec_devpos'],
+                    S, Q_dim, K_dim, HD, 2560,
+                    kv_offset, HD, stream)
+            else:
+                kv_offset = l * total_keys * HD + enc_seq * HD
+                fvk.qkv_split_rope_kvcache_fp16(qkv, rope, attn_out, Kc, Vc,
+                                                 S, Q_dim, K_dim, HD, 2560,
+                                                 kv_offset, HD, stream)
 
             # C3: Attention
             if attn is not None:
@@ -333,6 +353,9 @@ def decoder_forward_calibrate(ctx, fvk_mod, bufs, weights, dims,
     NH = dims['NH']; HD = dims['HD']
     steps = dims['steps']; layers = dims['layers']
     enc_seq = dims['enc_seq']; total_keys = dims['total_keys']
+    fixed_shape = bool(dims.get('fixed_shape', False))
+    if fixed_shape and attn is None:
+        raise ValueError("Pi0.5 Thor fixed_shape decoder requires attn backend")
     Q_dim = NH * HD
     attn_scale = 1.0 / math.sqrt(float(HD))
     D3 = 3 * D
@@ -388,10 +411,17 @@ def decoder_forward_calibrate(ctx, fvk_mod, bufs, weights, dims,
                                            cs_qkv, ws_qkv, stream)
 
             # C2b: Split+RoPE
-            kv_offset = l * total_keys * HD + enc_seq * HD
-            fvk_mod.qkv_split_rope_kvcache_fp16(qkv, rope, attn_out, Kc, Vc,
-                                                  S, Q_dim, HD, HD, 2560,
-                                                  kv_offset, HD, stream)
+            if fixed_shape:
+                kv_offset = l * total_keys * HD
+                fvk_mod.qkv_split_rope_kvcache_fp16_devpos(
+                    qkv, rope, attn_out, Kc, Vc, weights['dec_devpos'],
+                    S, Q_dim, HD, HD, 2560,
+                    kv_offset, HD, stream)
+            else:
+                kv_offset = l * total_keys * HD + enc_seq * HD
+                fvk_mod.qkv_split_rope_kvcache_fp16(qkv, rope, attn_out, Kc, Vc,
+                                                      S, Q_dim, HD, HD, 2560,
+                                                      kv_offset, HD, stream)
 
             # C3: Attention
             if attn is not None:

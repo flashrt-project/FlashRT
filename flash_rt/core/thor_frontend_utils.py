@@ -14,6 +14,7 @@ Stage 5 rollout adds functions incrementally:
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 
 import numpy as np
 
@@ -76,11 +77,22 @@ def _tokenize_sentencepiece(prompt_text: str):
     command if the file is missing — see
     USAGE.md → 'PaliGemma tokenizer setup' for details.
     """
+    sp = _paligemma_sentencepiece()
+    return [sp.bos_id()] + sp.Encode(prompt_text) + [108]
+
+
+@lru_cache(maxsize=1)
+def _paligemma_sentencepiece():
     from flash_rt.utils.paligemma_tokenizer import (
         load_paligemma_sentencepiece,
     )
-    sp = load_paligemma_sentencepiece()
-    return [sp.bos_id()] + sp.Encode(prompt_text) + [108]
+    return load_paligemma_sentencepiece()
+
+
+@lru_cache(maxsize=4)
+def _openpi_paligemma_tokenizer(max_len: int):
+    from openpi.models.tokenizer import PaligemmaTokenizer
+    return PaligemmaTokenizer(max_len=max_len)
 
 
 def embed_prompt_torch(prompt_text, embedding_weight, max_len: int = 48,
@@ -98,8 +110,7 @@ def embed_prompt_torch(prompt_text, embedding_weight, max_len: int = 48,
     import torch.nn.functional as F
 
     try:
-        from openpi.models.tokenizer import PaligemmaTokenizer
-        tokenizer = PaligemmaTokenizer(max_len=max_len)
+        tokenizer = _openpi_paligemma_tokenizer(int(max_len))
         tokens_np, mask_np = tokenizer.tokenize(prompt_text, state=state)
         prompt_len = int(mask_np.sum())
         token_ids = torch.tensor(
@@ -108,10 +119,7 @@ def embed_prompt_torch(prompt_text, embedding_weight, max_len: int = 48,
         if state is None:
             tokens = _tokenize_sentencepiece(prompt_text)
         else:
-            from flash_rt.utils.paligemma_tokenizer import (
-                load_paligemma_sentencepiece,
-            )
-            sp = load_paligemma_sentencepiece()
+            sp = _paligemma_sentencepiece()
             tokens = sp.Encode(format_pi05_prompt(prompt_text, state),
                                add_bos=True)
         token_ids = torch.tensor(tokens, dtype=torch.long, device='cuda')
@@ -125,16 +133,13 @@ def embed_prompt_torch(prompt_text, embedding_weight, max_len: int = 48,
 
 
 def embed_prompt_numpy(prompt_text, embedding_weight_np, max_len: int = 48,
-                       state=None):
+                       state=None, already_scaled: bool = False):
     """Numpy-side tokenize + embed (used by JAX frontends).
 
     No torch dependency. Returns (embeds_fp16_np, prompt_len).
     """
     if state is not None:
-        from flash_rt.utils.paligemma_tokenizer import (
-            load_paligemma_sentencepiece,
-        )
-        sp = load_paligemma_sentencepiece()
+        sp = _paligemma_sentencepiece()
         tokens = sp.Encode(format_pi05_prompt(prompt_text, state),
                            add_bos=True)
     else:
@@ -142,5 +147,6 @@ def embed_prompt_numpy(prompt_text, embedding_weight_np, max_len: int = 48,
     token_ids = np.array(tokens, dtype=np.int32)
     prompt_len = len(token_ids)
     embeds = embedding_weight_np[token_ids]
-    embeds = embeds * float(embeds.shape[-1] ** 0.5)
+    if not already_scaled:
+        embeds = embeds * float(embeds.shape[-1] ** 0.5)
     return embeds.astype(np.float16), prompt_len

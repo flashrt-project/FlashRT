@@ -53,11 +53,13 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  awq_alpha: float = 0.5,
                  awq_calib_iters: int = 8,
                  use_p1_split_gu: bool = False,
-                 use_fp8: bool = True):
+                 use_fp8: bool = True,
+                 state_prompt_mode: str = "exact"):
         # Base init (loads weights, allocates all FP8 buffers, etc.)
         super().__init__(checkpoint_dir, num_views=num_views,
                          use_cuda_graph=use_cuda_graph, autotune=autotune,
-                         use_fp8=use_fp8)
+                         use_fp8=use_fp8,
+                         state_prompt_mode=state_prompt_mode)
 
         self.use_fp4_encoder_ffn = bool(use_fp4_encoder_ffn)
         self._fp4_layers = frozenset(fp4_layers) if self.use_fp4_encoder_ffn else frozenset()
@@ -661,6 +663,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
             'qw':         self._dec_qkv_flat.data_ptr(),
             'Kc':         self._Kc.reshape(-1).data_ptr(),
             'Vc':         self._Vc.reshape(-1).data_ptr(),
+            'dec_devpos': self._attn.dec_devpos.data_ptr(),
             'ow':         self._dec_o_flat.data_ptr(),
             'sf':         self._sf_all.data_ptr(),
             'gw':         self._dec_gu_flat.data_ptr(),
@@ -678,6 +681,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
             'steps': 10, 'layers': La, 'enc_seq': Se,
             'total_keys': total_keys,
+            'fixed_shape': self._fixed_shape_active,
         }
 
         fp4_layers = self._fp4_layers

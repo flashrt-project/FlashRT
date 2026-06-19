@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 
 class _FakeAttnBackend:
@@ -146,6 +147,39 @@ def test_vla_model_warms_pi05_state_prompt_buckets(monkeypatch):
     assert [p.max_prompt_len for p in FakePipeline.instances] == [17, 23]
     assert model._needs_real_data_calibration is False
     assert model.prompt is None
+
+
+@pytest.mark.parametrize("framework", ["torch", "jax"])
+def test_load_model_forwards_state_prompt_mode_to_pi05_thor(
+        monkeypatch, framework):
+    import flash_rt
+    import flash_rt.hardware as hw
+
+    seen = {}
+
+    class FakeThorFrontend:
+        def __init__(self, checkpoint, num_views=2, autotune=3,
+                     state_prompt_mode="exact"):
+            seen["checkpoint"] = checkpoint
+            seen["num_views"] = num_views
+            seen["autotune"] = autotune
+            seen["state_prompt_mode"] = state_prompt_mode
+
+    monkeypatch.setattr(
+        hw, "resolve_pipeline_class",
+        lambda config, framework, arch: FakeThorFrontend)
+
+    model = flash_rt.load_model(
+        "/tmp/pi05", framework=framework, config="pi05", hardware="thor",
+        num_views=3, autotune=0, state_prompt_mode="fixed")
+
+    assert isinstance(model._pipe, FakeThorFrontend)
+    assert seen == {
+        "checkpoint": "/tmp/pi05",
+        "num_views": 3,
+        "autotune": 0,
+        "state_prompt_mode": "fixed",
+    }
 
 
 def test_predict_recalibrates_when_prompt_bucket_changes():

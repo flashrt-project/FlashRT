@@ -52,3 +52,13 @@ void qkv_split_rope_kvcache_fp16(
     int S, int Q_dim, int K_dim, int HD, int qkv_stride,
     int kc_offset, int kc_stride,
     cudaStream_t stream = 0);
+
+// Same FP16 math and argument contract as qkv_split_rope_kvcache_fp16, but
+// K/V write rows are shifted by device-side devpos[0] within the layer slab.
+void qkv_split_rope_kvcache_fp16_devpos(
+    const __half* qkv, const __half* rope,
+    __half* Q, __half* Kc, __half* Vc,
+    const int* devpos,
+    int S, int Q_dim, int K_dim, int HD, int qkv_stride,
+    int kc_offset, int kc_stride,
+    cudaStream_t stream = 0);

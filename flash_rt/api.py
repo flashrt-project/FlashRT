@@ -379,22 +379,26 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             1 runs the full vision+encoder+decoder path on every frame; 2
             alternates full and decoder-only frames. ``None`` keeps the
             frontend default.
-        state_prompt_mode: Pi0.5 torch RTX only. How the variable-length
+        state_prompt_mode: Pi0.5 RTX/Thor only. How the variable-length
             state-in-prompt is mapped to CUDA graphs:
-              ``"exact"`` (default) — one captured graph per exact prompt
-                length, cached; pair with ``warm_state_prompt_buckets()`` to
-                front-load the lengths you expect. Unchanged legacy behavior.
+              ``"exact"`` (default) — graph shape tracks the exact prompt
+                length. RTX caches recurring lengths and can front-load them
+                with ``warm_state_prompt_buckets()``; Thor reuses same-length
+                updates and recaptures when the exact length changes.
               ``"fixed"`` — ONE graph at the max prompt length serves every
-                length (padded prefix masked via FA2 ``seqused_k`` + decoder
-                K/V appended at the valid offset); a changing length never
-                re-captures and no warmup is needed. Requires the vendored
-                bf16 FA2 path (``FVK_RTX_FA2=1``, encoder+decoder sites on).
+                length (padded prefix masked by a device-side valid length +
+                decoder K/V appended at the valid offset); a changing length
+                never re-captures and no warmup is needed. RTX uses the
+                vendored bf16 FA2 path; Thor uses its cuBLAS-decomposed
+                attention path.
                 Cost: every inference runs at the padded max length, so it is
                 ~1 ms slower than a warmed ``"exact"`` graph (split-KV decoder
-                joint-attention keeps the padding overhead small). Prefer
-                ``"fixed"`` when the state-token length drifts and you'd rather
-                not enumerate/warm lengths; prefer ``"exact"`` + warmup for
-                absolute peak latency at known lengths.
+                joint-attention keeps the padding overhead small on RTX; Thor
+                uses its cuBLAS-decomposed attention path with device-side
+                valid-length masking). Prefer ``"fixed"`` when the state-token
+                length drifts and you'd rather not enumerate/warm lengths;
+                prefer ``"exact"`` + warmup for absolute peak latency at known
+                lengths.
             Env override: ``FLASHRT_PI05_STATE_PROMPT_MODE``.
 
     Returns:

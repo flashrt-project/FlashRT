@@ -39,7 +39,7 @@ def load_model(
     # GROOT-specific:
     embodiment_tag: str | None = None,
     action_horizon: int | None = None,
-    # Pi0.5 torch-specific:
+    # Pi0.5-specific:
     use_fp4: bool = False,
     fp4_layers: tuple[int, ...] | None = None,
     use_awq: bool | None = None,
@@ -49,6 +49,7 @@ def load_model(
     vision_pool_factor: int | None = None,
     vision_num_layers: int | None = None,
     cache_frames: int | None = None,
+    state_prompt_mode: str = "exact",
     # Frontends with an FP8/BF16 switch:
     use_fp8: bool = True,
     # Pi0.5 torch RTX SM120/SM89 opt-in:
@@ -69,6 +70,11 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   parameters today. The Pi0.5 torch RTX/Orin frontend validates
   `vision_pool_factor in {1, 2, 4}`, `vision_num_layers in [1, 27]`, and
   `cache_frames >= 1`.
+- `state_prompt_mode` applies to Pi0.5 RTX/Thor state-in-prompt
+  execution. `"exact"` tracks the exact token length (RTX caches recurring
+  lengths; Thor reuses same-length updates). `"fixed"` captures one max-length
+  graph and masks padded state-prompt tokens with a device-side valid length;
+  use it when live robot state changes make token lengths drift.
 - `use_fp8=False` disables FP8 where the selected frontend exposes a
   BF16 fallback; unsupported frontends ignore it.
 - `use_fp16=True` selects the opt-in Pi0.5 torch RTX SM120/SM89 full-FP16
@@ -141,8 +147,9 @@ class VLAModel:
     convention: normalized in-range values usually become 0..255, while
     values below -1 become -1. RTX/Thor torch frontends and the JAX Thor
     Pi0.5 frontend accept `state` in `set_prompt()` and through `predict()`.
-    Same-length state prompt updates reuse the captured graph; recurring
-    RTX prompt lengths reuse the cached pipeline instead of rebuilding.
+    Same-length state prompt updates reuse the captured graph. RTX exact mode
+    reuses cached recurring prompt lengths; RTX/Thor fixed mode uses one
+    max-length graph for drifting state-token lengths.
   - Pi0-FAST encodes state in the FAST token prefix.
   - GROOT N1.6 consumes proprioceptive state from `obs["state"]`; if omitted,
     the backend uses zeros.

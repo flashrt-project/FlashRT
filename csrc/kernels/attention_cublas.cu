@@ -68,6 +68,73 @@ void attention_qkv_fp16(
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 }
 
+// Mask rows [seqused_k[0], S_kv_max) in every logits column.
+// logits is col-major [S_kv_max, S*NH].
+__global__ void mask_seqused_logits_kernel(
+    __half* logits, int S_kv_max, int S_NH, const int* __restrict__ seqused_k)
+{
+    int valid = seqused_k[0];
+    if (valid < 0) valid = 0;
+    if (valid > S_kv_max) valid = S_kv_max;
+    int mask_rows = S_kv_max - valid;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = S_NH * mask_rows;
+    if (idx >= total) return;
+    int col = idx / mask_rows;
+    int row = valid + (idx % mask_rows);
+    logits[col * S_kv_max + row] = __float2half(-65504.0f);
+}
+
+void mask_seqused_logits_fp16(__half* logits, int S_kv_max, int S_NH,
+                              const int* seqused_k, cudaStream_t stream) {
+    // Launch even when valid == S_kv_max; the kernel exits with total=0.
+    int total = S_NH * S_kv_max;
+    if (total > 0) {
+        mask_seqused_logits_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
+            logits, S_kv_max, S_NH, seqused_k);
+    }
+}
+
+void attention_qkv_fp16_seqused(
+    cublasHandle_t handle,
+    const __half* Q,
+    const __half* K,
+    const __half* V,
+    __half* logits,
+    __half* out,
+    int S, int S_kv_max, int NH, int HD,
+    const int* seqused_k,
+    float attn_scale,
+    cudaStream_t stream)
+{
+    cublasSetStream(handle, stream);
+
+    float zero = 0.0f;
+    cublasGemmEx(handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        S_kv_max, S * NH, HD,
+        &attn_scale,
+        K, CUDA_R_16F, HD,
+        Q, CUDA_R_16F, HD,
+        &zero,
+        logits, CUDA_R_16F, S_kv_max,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+
+    mask_seqused_logits_fp16(logits, S_kv_max, S * NH, seqused_k, stream);
+    softmax_fp16(logits, S * NH, S_kv_max, stream);
+
+    float one = 1.0f;
+    cublasGemmEx(handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        HD, S * NH, S_kv_max,
+        &one,
+        V, CUDA_R_16F, HD,
+        logits, CUDA_R_16F, S_kv_max,
+        &zero,
+        out, CUDA_R_16F, HD,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+}
+
 
 // Combined mask kernel: pad column + state mask in one launch.
 // logits is col-major [S_kv_pad, S_NH].

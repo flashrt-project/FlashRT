@@ -63,7 +63,8 @@ class Pi05JaxFrontendThor:
 
     def __init__(self, checkpoint_dir, engine_path=None, fmha_path=None,
                  use_cuda_graph=True, num_views=2, autotune=3,
-                 weight_cache=True, use_fp8=True, **kwargs):
+                 weight_cache=True, use_fp8=True,
+                 state_prompt_mode: str = "exact", **kwargs):
         """
         Args:
             autotune: CUDA Graph autotune trials per set_prompt().
@@ -80,6 +81,13 @@ class Pi05JaxFrontendThor:
 
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         self.use_fp8 = bool(use_fp8)
+        mode = os.environ.get("FLASHRT_PI05_STATE_PROMPT_MODE",
+                              state_prompt_mode)
+        if mode not in ("exact", "fixed"):
+            raise ValueError(
+                "state_prompt_mode must be 'exact' or 'fixed', "
+                f"got {mode!r}")
+        self._state_prompt_mode = mode
 
         # ── Load norm stats (openpi or lerobot HF release) ──
         from flash_rt.core.utils.norm_stats import (
@@ -147,6 +155,8 @@ class Pi05JaxFrontendThor:
         # ── State ──
         self._checkpoint_path = str(checkpoint_dir)
         self.current_prompt = None
+        self.current_prompt_len = 0
+        self._fixed_shape_active = False
         self.calibrated = False
         self._real_data_calibrated = False
 
@@ -202,8 +212,18 @@ class Pi05JaxFrontendThor:
         self.autotune = int(autotune) if autotune is not True else 3
         if autotune is False:
             self.autotune = 0
+        self.enc_seqused = CudaBuffer.device_empty(1, np.int32)
+        self.dec_seqused = CudaBuffer.device_empty(1, np.int32)
+        self.dec_devpos = CudaBuffer.device_empty(1, np.int32)
         self._rng_key = jax.random.PRNGKey(0)
         logger.info("JAX backend initialized (cache_hit=%s)", cache_hit)
+
+    def _set_fixed_control_values(self, enc_seqused: int, dec_seqused: int,
+                                  dec_devpos: int) -> None:
+        self.enc_seqused.upload(np.array([enc_seqused], dtype=np.int32))
+        self.dec_seqused.upload(np.array([dec_seqused], dtype=np.int32))
+        self.dec_devpos.upload(np.array([dec_devpos], dtype=np.int32))
+        self._sync()
 
     def _prefetch_weights(self):
         """Weights are already managed (cudaMallocManaged). No conversion needed.
@@ -356,6 +376,9 @@ class Pi05JaxFrontendThor:
 
         # Embedding: keep as numpy for _embed_prompt
         self._embedding_np = engine_w["encoder.embedding"].astype(fp16)
+        self._embedding_scaled_np = (
+            self._embedding_np * float(self._embedding_np.shape[-1] ** 0.5)
+        ).astype(fp16)
 
         _ainw = engine_w["action.in_proj.weight"].astype(fp16)
         _ainb = engine_w["action.in_proj.bias"].astype(fp16)
@@ -576,6 +599,9 @@ class Pi05JaxFrontendThor:
         # Numpy arrays
         for attr in self._CACHE_NUMPY:
             setattr(self, attr, _get_numpy(attr))
+        self._embedding_scaled_np = (
+            self._embedding_np * float(self._embedding_np.shape[-1] ** 0.5)
+        ).astype(fp16)
 
         # Per-layer numpy lists
         for attr in self._CACHE_NUMPY_LISTS:
@@ -679,17 +705,74 @@ class Pi05JaxFrontendThor:
             # Raw token IDs
             token_ids = np.asarray(prompt_text, dtype=np.int64)
             prompt_len = len(token_ids)
-            embeds_np = self._embedding_np[token_ids]
-            embeds_np = (embeds_np * float(embeds_np.shape[-1] ** 0.5)).astype(np.float16)
+            embeds_np = self._embedding_scaled_np[token_ids]
         else:
             max_len = PI05_STATE_PROMPT_MAX_LEN if state is not None else 48
             embeds_np, prompt_len = _embed_prompt(
-                prompt_text, self._embedding_np, max_len=max_len, state=state)
-        Se = S + prompt_len
-        if Se % 2 != 0:
-            Se += 1
+                prompt_text, self._embedding_scaled_np, max_len=max_len,
+                state=state, already_scaled=True)
+        fixed_shape = (
+            self._state_prompt_mode == "fixed"
+            and state is not None
+            and self._rl_config is None
+        )
+
+        if fixed_shape:
+            Se = S + PI05_STATE_PROMPT_MAX_LEN
+            if Se % 2 != 0:
+                Se += 1
+            actual_lang = Se - S
+            valid_lang = prompt_len
+            if (S + valid_lang) % 2 != 0:
+                valid_lang += 1
+            if valid_lang > actual_lang:
+                raise ValueError(
+                    f"prompt_len {prompt_len} exceeds fixed state prompt "
+                    f"capacity {actual_lang}")
+            padded = np.zeros(
+                (actual_lang, embeds_np.shape[1]), dtype=np.float16)
+            padded[:prompt_len] = embeds_np[:prompt_len]
+            if valid_lang > prompt_len:
+                padded[prompt_len:valid_lang] = embeds_np[-1:]
+            embeds_np = padded
+            valid_prefix = S + valid_lang
+        else:
+            Se = S + prompt_len
+            if Se % 2 != 0:
+                Se += 1
+            actual_lang = Se - S
+            if actual_lang > prompt_len:
+                embeds_np = np.concatenate([embeds_np, embeds_np[-1:]], axis=0)
+            valid_prefix = Se
+
+        if (hasattr(self, "siglip_graph") and hasattr(self, "enc_ae_graph")
+                and hasattr(self, "lang_emb") and self.S_lang == actual_lang
+                and self.Se == Se):
+            self.lang_emb.upload(embeds_np[:actual_lang].astype(fp16))
+            dec_start = valid_prefix if fixed_shape else Se
+            dec_rope_np = np.concatenate(
+                [self._kc_t[dec_start:dec_start+self.Sa, :, None],
+                 self._ks_t[dec_start:dec_start+self.Sa, :, None]], 2
+            ).reshape(self.Sa, 256)
+            self.dec_rope.upload(dec_rope_np.astype(fp16))
+            self._fixed_shape_active = fixed_shape
+            self.current_prompt_len = int(prompt_len)
+            if self._attn is not None:
+                self._attn.set_fixed_shape(fixed_shape)
+                if fixed_shape:
+                    self._attn.set_fixed_valid_len(valid_prefix)
+            self.current_prompt = prompt_text
+            logger.info(
+                "Updated Pi0.5 JAX Thor prompt in place: '%s' "
+                "(%d tokens, Se=%d, state=%s, mode=%s)",
+                prompt_text, prompt_len, Se, state is not None,
+                "fixed" if fixed_shape else "exact")
+            return
+
         self.Se = Se
         self.total_keys = Se + self.Sa
+        self._fixed_shape_active = fixed_shape
+        self.current_prompt_len = int(prompt_len)
 
         # Stage 1.5 — build AttentionBackend. total_keys must be set first
         # (see sibling comment in frontends/torch/pi05_thor.py). Rebuilt
@@ -725,11 +808,16 @@ class Pi05JaxFrontendThor:
                 "layer_stride": layer_stride,
                 "scale":        attn_scale,
             },
+            fixed_control={
+                "enc_seqused": self.enc_seqused.ptr.value,
+                "dec_seqused": self.dec_seqused.ptr.value,
+                "dec_devpos": self.dec_devpos.ptr.value,
+                "set_valid_len": self._set_fixed_control_values,
+            },
         )
-
-        actual_lang = Se - S
-        if actual_lang > prompt_len:
-            embeds_np = np.concatenate([embeds_np, embeds_np[-1:]], axis=0)
+        self._attn.set_fixed_shape(fixed_shape)
+        if fixed_shape:
+            self._attn.set_fixed_valid_len(valid_prefix)
         self.lang_emb = CB.from_numpy(embeds_np[:actual_lang].astype(fp16))
         self.S_lang = actual_lang
 
@@ -737,7 +825,7 @@ class Pi05JaxFrontendThor:
         enc_rope_np = np.concatenate(
             [self._kc_t[:Se, :, None], self._ks_t[:Se, :, None]], 2).reshape(Se, 256)
         self.enc_rope = CB.from_numpy(enc_rope_np.astype(fp16))
-        dec_start = Se
+        dec_start = valid_prefix if fixed_shape else Se
         dec_rope_np = np.concatenate(
             [self._kc_t[dec_start:dec_start+self.Sa, :, None],
              self._ks_t[dec_start:dec_start+self.Sa, :, None]], 2).reshape(self.Sa, 256)
@@ -859,10 +947,12 @@ class Pi05JaxFrontendThor:
              'aow': self.aow.ptr.value, 'aob': self.aob.ptr.value,
              'fs': self.ae_w_static[13].ptr.value, 'rope': self.dec_rope.ptr.value,
              'w_scales': self.ae_w_dev.ptr.value,
+             'dec_devpos': self.dec_devpos.ptr.value,
              'act_scales': self.ae_calib_scales.ptr.value},
             {'S': self.Sa, 'D': self.Da, 'H': self.Ha, 'NH': 8, 'HD': 256,
              'steps': self.steps, 'layers': self.La, 'enc_seq': self.Se,
-             'total_keys': self.total_keys}
+             'total_keys': self.total_keys,
+             'fixed_shape': self._fixed_shape_active}
         )
 
     def _calibrate(self):
