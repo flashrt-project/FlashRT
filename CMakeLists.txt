@@ -430,6 +430,30 @@ if(GPU_ARCH STREQUAL "120")
   message(STATUS "SM120a CUTLASS block-128 FP8: ENABLED")
 endif()
 
+# ── Hand-tuned SM120 small-M FP8 GEMMs ──
+# These bindings are exposed together with ENABLE_CUTLASS_SM120_BLOCK_FP8, so
+# the objects must be linked for every SM120 build, independent of Motus.
+if(GPU_ARCH STREQUAL "120")
+  add_library(sm120_fp8_smallm_obj OBJECT
+    csrc/gemm/fp8_smallM_handtuned_sm120.cu
+    csrc/gemm/fp8_smallM_handtuned_splitk_sm120.cu
+    csrc/gemm/fp8_smallM_handtuned_ldmatrix_sm120.cu)
+  set_target_properties(sm120_fp8_smallm_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(sm120_fp8_smallm_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
+  )
+  target_compile_options(sm120_fp8_smallm_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+endif()
+
 # ── CUTLASS SM120a NVFP4 W4A16 GEMM (Qwen3.6 NVFP4 ckpt) ──
 # Block-scaled FP4 e2m1 weights × FP4 e2m1 act (post quant) × FP8 ue4m3
 # group scales × BF16 output. Ported from NVIDIA unit test
@@ -454,6 +478,32 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
     >
   )
   message(STATUS "SM120a CUTLASS NVFP4 W4A16 GEMM: ENABLED")
+endif()
+
+# ── SM120a NVFP4 FFN epilogue GEMMs ──
+# Shared by Qwen3.6 and Motus. Keep these sources in one object target so a
+# Motus-enabled SM120 build does not link the same global symbols twice.
+if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
+  add_library(sm120_nvfp4_ffn_obj OBJECT
+    csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_bf16out_sm120.cu
+    csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_fp4out_sm120.cu
+    csrc/gemm/fp4/cutlass_nvfp4_gemm_dn_streamk_bias_sm120.cu)
+  set_target_properties(sm120_nvfp4_ffn_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(sm120_nvfp4_ffn_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/fp4
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(sm120_nvfp4_ffn_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
 endif()
 
 # ── CUTLASS SM100 NVFP4 W4A16 GEMM (Qwen3.6 NVFP4 ckpt, Thor SM110) ──
@@ -541,46 +591,6 @@ if(FLASHRT_ENABLE_MOTUS AND GPU_ARCH STREQUAL "120")
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/quantize
   )
   target_compile_options(motus_aux_sm120_obj PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:
-      --expt-relaxed-constexpr -O3 --use_fast_math
-      ${GPU_GENCODE}
-    >
-  )
-
-  add_library(motus_fp8_smallm_sm120_obj OBJECT
-    csrc/gemm/fp8_smallM_handtuned_sm120.cu
-    csrc/gemm/fp8_smallM_handtuned_splitk_sm120.cu
-    csrc/gemm/fp8_smallM_handtuned_ldmatrix_sm120.cu)
-  set_target_properties(motus_fp8_smallm_sm120_obj PROPERTIES
-    CUDA_STANDARD 17
-    POSITION_INDEPENDENT_CODE ON
-  )
-  target_include_directories(motus_fp8_smallm_sm120_obj PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
-    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
-  )
-  target_compile_options(motus_fp8_smallm_sm120_obj PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:
-      --expt-relaxed-constexpr -O3 --use_fast_math
-      ${GPU_GENCODE}
-    >
-  )
-
-  add_library(motus_nvfp4_ffn_sm120_obj OBJECT
-    csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_bf16out_sm120.cu
-    csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_fp4out_sm120.cu
-    csrc/gemm/fp4/cutlass_nvfp4_gemm_dn_streamk_bias_sm120.cu)
-  set_target_properties(motus_nvfp4_ffn_sm120_obj PROPERTIES
-    CUDA_STANDARD 17
-    POSITION_INDEPENDENT_CODE ON
-  )
-  target_include_directories(motus_nvfp4_ffn_sm120_obj PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
-    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/fp4
-    ${CUTLASS_INCLUDE}
-    ${CUTLASS_DIR}/tools/util/include
-  )
-  target_compile_options(motus_nvfp4_ffn_sm120_obj PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
       --expt-relaxed-constexpr -O3 --use_fast_math
       ${GPU_GENCODE}
@@ -989,7 +999,8 @@ endif()
 # SM120a CUTLASS block-128 FP8 GEMM (Path B for Qwen3.6).
 if(GPU_ARCH STREQUAL "120")
   target_sources(flash_rt_kernels PRIVATE
-    $<TARGET_OBJECTS:cutlass_sm120_block_obj>)
+    $<TARGET_OBJECTS:cutlass_sm120_block_obj>
+    $<TARGET_OBJECTS:sm120_fp8_smallm_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE
     ENABLE_CUTLASS_SM120_BLOCK_FP8=1)
 endif()
@@ -1009,9 +1020,7 @@ endif()
 if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
   target_sources(flash_rt_kernels PRIVATE
     $<TARGET_OBJECTS:cutlass_nvfp4_w4a16_sm120_obj>
-    csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_bf16out_sm120.cu
-    csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_fp4out_sm120.cu
-    csrc/gemm/fp4/cutlass_nvfp4_gemm_dn_streamk_bias_sm120.cu
+    $<TARGET_OBJECTS:sm120_nvfp4_ffn_obj>
     csrc/quantize/nvfp4_sf_reshape_sm120.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE
     ENABLE_CUTLASS_SM120_NVFP4_W4A16=1)
@@ -1040,8 +1049,6 @@ endif()
 if(FLASHRT_ENABLE_MOTUS AND GPU_ARCH STREQUAL "120")
   target_sources(flash_rt_kernels PRIVATE
     $<TARGET_OBJECTS:motus_aux_sm120_obj>
-    $<TARGET_OBJECTS:motus_fp8_smallm_sm120_obj>
-    $<TARGET_OBJECTS:motus_nvfp4_ffn_sm120_obj>
     $<TARGET_OBJECTS:motus_action_ffn_v6t_sm120_obj>
     $<TARGET_OBJECTS:motus_und_ffn_sm120_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE
