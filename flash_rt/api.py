@@ -297,7 +297,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                cache_frames=None,
                use_fp16=False,
                use_fp8=True,
-               state_prompt_mode="exact"):
+               state_prompt_mode="exact",
+               state_prompt_fixed_max_len=None):
     """Load a FlashRT model.
 
     Args:
@@ -400,6 +401,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 prefer ``"exact"`` + warmup for absolute peak latency at known
                 lengths.
             Env override: ``FLASHRT_PI05_STATE_PROMPT_MODE``.
+        state_prompt_fixed_max_len: Pi0.5 Thor fixed mode only. Padded
+            state-prompt token capacity used when ``state_prompt_mode="fixed"``.
+            ``None`` keeps the frontend default (200 tokens). Lower this when
+            the serving stack can bound the live state prompt length; for
+            example, a cap near the actual length (120 vs. 117 tokens) measured
+            about a 1 ms normal overhead on Thor versus warmed exact mode.
+            Env override: ``FLASHRT_PI05_STATE_PROMPT_FIXED_MAX_LEN``.
 
     Returns:
         VLAModel instance with .predict() method.
@@ -616,6 +624,9 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         # capture) / "fixed" (opt-in, one graph). Forwarded only if accepted.
         if "state_prompt_mode" in sig.parameters:
             kwargs["state_prompt_mode"] = state_prompt_mode
+        if (state_prompt_fixed_max_len is not None and
+                "state_prompt_fixed_max_len" in sig.parameters):
+            kwargs["state_prompt_fixed_max_len"] = state_prompt_fixed_max_len
         # FP4 frontend accepts these extra kwargs (only set when the class
         # actually accepts them — base class ignores, FP4 subclass uses).
         if use_fp4 and "use_fp4_encoder_ffn" in sig.parameters:

@@ -159,11 +159,13 @@ def test_load_model_forwards_state_prompt_mode_to_pi05_thor(
 
     class FakeThorFrontend:
         def __init__(self, checkpoint, num_views=2, autotune=3,
-                     state_prompt_mode="exact"):
+                     state_prompt_mode="exact",
+                     state_prompt_fixed_max_len=None):
             seen["checkpoint"] = checkpoint
             seen["num_views"] = num_views
             seen["autotune"] = autotune
             seen["state_prompt_mode"] = state_prompt_mode
+            seen["state_prompt_fixed_max_len"] = state_prompt_fixed_max_len
 
     monkeypatch.setattr(
         hw, "resolve_pipeline_class",
@@ -171,7 +173,8 @@ def test_load_model_forwards_state_prompt_mode_to_pi05_thor(
 
     model = flash_rt.load_model(
         "/tmp/pi05", framework=framework, config="pi05", hardware="thor",
-        num_views=3, autotune=0, state_prompt_mode="fixed")
+        num_views=3, autotune=0, state_prompt_mode="fixed",
+        state_prompt_fixed_max_len=120)
 
     assert isinstance(model._pipe, FakeThorFrontend)
     assert seen == {
@@ -179,6 +182,7 @@ def test_load_model_forwards_state_prompt_mode_to_pi05_thor(
         "num_views": 3,
         "autotune": 0,
         "state_prompt_mode": "fixed",
+        "state_prompt_fixed_max_len": 120,
     }
 
 

@@ -64,7 +64,8 @@ class Pi05JaxFrontendThor:
     def __init__(self, checkpoint_dir, engine_path=None, fmha_path=None,
                  use_cuda_graph=True, num_views=2, autotune=3,
                  weight_cache=True, use_fp8=True,
-                 state_prompt_mode: str = "exact", **kwargs):
+                 state_prompt_mode: str = "exact",
+                 state_prompt_fixed_max_len=None, **kwargs):
         """
         Args:
             autotune: CUDA Graph autotune trials per set_prompt().
@@ -88,6 +89,19 @@ class Pi05JaxFrontendThor:
                 "state_prompt_mode must be 'exact' or 'fixed', "
                 f"got {mode!r}")
         self._state_prompt_mode = mode
+        fixed_cap = PI05_STATE_PROMPT_MAX_LEN
+        if mode == "fixed":
+            fixed_cap = os.environ.get(
+                "FLASHRT_PI05_STATE_PROMPT_FIXED_MAX_LEN",
+                state_prompt_fixed_max_len)
+            if fixed_cap is None:
+                fixed_cap = PI05_STATE_PROMPT_MAX_LEN
+            fixed_cap = int(fixed_cap)
+            if fixed_cap <= 0:
+                raise ValueError(
+                    "state_prompt_fixed_max_len must be a positive integer, "
+                    f"got {fixed_cap}")
+        self._state_prompt_fixed_max_len = fixed_cap
 
         # ── Load norm stats (openpi or lerobot HF release) ──
         from flash_rt.core.utils.norm_stats import (
@@ -701,24 +715,26 @@ class Pi05JaxFrontendThor:
         fp16 = np.float16
 
         S = self.sig_dims[0]  # num_views * 256
+        fixed_shape = (
+            self._state_prompt_mode == "fixed"
+            and state is not None
+            and self._rl_config is None
+        )
         if isinstance(prompt_text, (np.ndarray, list)):
             # Raw token IDs
             token_ids = np.asarray(prompt_text, dtype=np.int64)
             prompt_len = len(token_ids)
             embeds_np = self._embedding_scaled_np[token_ids]
         else:
-            max_len = PI05_STATE_PROMPT_MAX_LEN if state is not None else 48
+            max_len = (self._state_prompt_fixed_max_len
+                       if fixed_shape else PI05_STATE_PROMPT_MAX_LEN)
+            max_len = max_len if state is not None else 48
             embeds_np, prompt_len = _embed_prompt(
                 prompt_text, self._embedding_scaled_np, max_len=max_len,
                 state=state, already_scaled=True)
-        fixed_shape = (
-            self._state_prompt_mode == "fixed"
-            and state is not None
-            and self._rl_config is None
-        )
 
         if fixed_shape:
-            Se = S + PI05_STATE_PROMPT_MAX_LEN
+            Se = S + self._state_prompt_fixed_max_len
             if Se % 2 != 0:
                 Se += 1
             actual_lang = Se - S

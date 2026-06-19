@@ -54,12 +54,14 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  awq_calib_iters: int = 8,
                  use_p1_split_gu: bool = False,
                  use_fp8: bool = True,
-                 state_prompt_mode: str = "exact"):
+                 state_prompt_mode: str = "exact",
+                 state_prompt_fixed_max_len=None):
         # Base init (loads weights, allocates all FP8 buffers, etc.)
         super().__init__(checkpoint_dir, num_views=num_views,
                          use_cuda_graph=use_cuda_graph, autotune=autotune,
                          use_fp8=use_fp8,
-                         state_prompt_mode=state_prompt_mode)
+                         state_prompt_mode=state_prompt_mode,
+                         state_prompt_fixed_max_len=state_prompt_fixed_max_len)
 
         self.use_fp4_encoder_ffn = bool(use_fp4_encoder_ffn)
         self._fp4_layers = frozenset(fp4_layers) if self.use_fp4_encoder_ffn else frozenset()

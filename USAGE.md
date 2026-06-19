@@ -115,7 +115,7 @@ actions = model.predict(
 
 State changes update the prompt embeddings. Because the discretized state is
 rendered into the prompt, its token length drifts with the state values. The
-RTX Pi0.5 frontend offers two strategies via `state_prompt_mode`:
+Pi0.5 RTX/Thor frontends offer two strategies via `state_prompt_mode`:
 
 **`"exact"` (default) — per-length capture + manual warmup.**
 A separate pipeline is captured per exact prompt length and cached, so a
@@ -136,25 +136,25 @@ warmed = model.warm_state_prompt_buckets(
 
 **`"fixed"` (opt-in) — one graph, no warmup.**
 ONE pipeline and ONE captured CUDA Graph at the max prompt length serve every
-length: the padded prefix keys are masked (FlashAttention-2 `seqused_k`) and the
-decoder's action K/V are appended right after the *valid* prefix
-(`qkv_split_rope_devpos`), so a changing state-token length **never re-captures
-a graph or reruns autotune** — no warmup needed. The trade-off is latency:
-every inference runs at the padded max length, so `"fixed"` is ~+1.0 ms (2
-views) / +1.2 ms (3 views) slower than `"exact"` at a typical prompt length
-(measured fp8, RTX 5090; the decoder joint-attention uses a graph-safe
-split-KV kernel that keeps the padding overhead small). That ~1 ms makes
+length: padded prefix keys are masked with a device-side valid length and the
+decoder's action K/V are appended right after the *valid* prefix, so a changing
+state-token length **never re-captures a graph or reruns autotune** — no warmup
+needed. The trade-off is latency: every inference runs at the padded max length.
+On Thor, keeping `state_prompt_fixed_max_len` close to the actual maximum
+(for example 120 for a 117-token prompt) normally costs about 1 ms versus a
+warmed exact graph; larger caps pay for the extra padded tokens. That makes
 `"fixed"` the low-friction choice when the state-token length drifts: zero
 recapture, no length enumeration. Prefer `"exact"` + `warm_state_prompt_buckets()`
 only when you need absolute peak latency at a known, stable set of lengths.
-(Lowering `PI05_STATE_PROMPT_MAX_LEN` toward your real maximum shrinks the
-padding and the gap further.) Enable `"fixed"` like so:
+Enable `"fixed"` like so:
 
 ```python
 model = flash_rt.load_model(
     checkpoint="/path/to/pi05", framework="torch", config="pi05",
-    state_prompt_mode="fixed")
+    state_prompt_mode="fixed",
+    state_prompt_fixed_max_len=120)  # choose a cap >= your observed max
 # or, without code changes: FLASHRT_PI05_STATE_PROMPT_MODE=fixed
+# set FLASHRT_PI05_STATE_PROMPT_FIXED_MAX_LEN=120 to tune the cap in serving
 # predict() handles any state length with a single captured graph
 ```
 
@@ -227,7 +227,8 @@ model = flash_rt.load_model(
 | `vision_pool_factor` | `int\|None` | `None` | Pi0.5 torch RTX/Orin. Spatial pooling factor for vision tokens. The FP16 RTX path currently supports only `1`. |
 | `vision_num_layers` | `int\|None` | `None` | Pi0.5 torch RTX/Orin. Number of SigLIP vision layers to run. |
 | `cache_frames` | `int\|None` | `None` | Pi0.5 torch RTX/Orin. Temporal encoder K/V cache period; `1` means no temporal reuse. |
-| `state_prompt_mode` | `str` | `"exact"` | Pi0.5 torch RTX. State-in-prompt graph strategy: `"exact"` (per-length capture + `warm_state_prompt_buckets()`) or `"fixed"` (one graph at the max length, no recapture; ~+4.6 ms/2v, +6.7 ms/3v). Env override `FLASHRT_PI05_STATE_PROMPT_MODE`. See [Pi0.5 State Prompts](#pi05-state-prompts). |
+| `state_prompt_mode` | `str` | `"exact"` | Pi0.5 RTX/Thor. State-in-prompt graph strategy: `"exact"` (exact prompt length; RTX can pre-warm recurring buckets) or `"fixed"` (one graph at a configured max length, no recapture). Env override `FLASHRT_PI05_STATE_PROMPT_MODE`. See [Pi0.5 State Prompts](#pi05-state-prompts). |
+| `state_prompt_fixed_max_len` | `int\|None` | `None` | Pi0.5 Thor fixed mode. `None` keeps the default 200-token cap; set a lower cap when serving can bound the state-prompt length. The cap must be >= the actual token length. Env override `FLASHRT_PI05_STATE_PROMPT_FIXED_MAX_LEN`. |
 
 ### Pi0.5 state prompt bucket warmup
 

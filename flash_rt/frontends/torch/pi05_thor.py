@@ -84,7 +84,8 @@ class Pi05TorchFrontendThor:
 
     def __init__(self, checkpoint_dir: str, num_views: int = 2,
                  use_cuda_graph: bool = True, autotune: int = 3,
-                 use_fp8: bool = True, state_prompt_mode: str = "exact"):
+                 use_fp8: bool = True, state_prompt_mode: str = "exact",
+                 state_prompt_fixed_max_len: Optional[int] = None):
         """
         Args:
             autotune: CUDA Graph autotune trials per set_prompt().
@@ -97,6 +98,19 @@ class Pi05TorchFrontendThor:
             raise ValueError(
                 f"state_prompt_mode must be 'fixed' or 'exact', got {_spm!r}")
         self._state_prompt_mode = _spm
+        _fixed_cap = PI05_STATE_PROMPT_MAX_LEN
+        if _spm == "fixed":
+            _fixed_cap = os.environ.get(
+                "FLASHRT_PI05_STATE_PROMPT_FIXED_MAX_LEN",
+                state_prompt_fixed_max_len)
+            if _fixed_cap is None:
+                _fixed_cap = PI05_STATE_PROMPT_MAX_LEN
+            _fixed_cap = int(_fixed_cap)
+            if _fixed_cap <= 0:
+                raise ValueError(
+                    "state_prompt_fixed_max_len must be a positive integer, "
+                    f"got {_fixed_cap}")
+        self._state_prompt_fixed_max_len = _fixed_cap
         self.num_views = num_views
         self.use_cuda_graph = use_cuda_graph
         self.use_fp8 = bool(use_fp8)
@@ -940,6 +954,12 @@ class Pi05TorchFrontendThor:
         S_sig = self.sig_S
         nv = self.num_views
 
+        fixed_shape = (
+            self._state_prompt_mode == "fixed"
+            and state is not None
+            and self._rl_config is None
+        )
+
         # ---- Tokenize ----
         if isinstance(prompt_text, (np.ndarray, list)):
             token_ids = np.asarray(prompt_text, dtype=np.int64)
@@ -948,22 +968,18 @@ class Pi05TorchFrontendThor:
                 torch.from_numpy(token_ids).long().cuda(), self.embedding_weight)
             embeds = embeds * float(embeds.shape[-1] ** 0.5)
         else:
-            max_len = PI05_STATE_PROMPT_MAX_LEN if state is not None else 48
+            max_len = (self._state_prompt_fixed_max_len
+                       if fixed_shape else PI05_STATE_PROMPT_MAX_LEN)
+            max_len = max_len if state is not None else 48
             embeds, prompt_len = embed_prompt(
                 prompt_text, self.embedding_weight, max_len=max_len,
                 state=state)
-
-        fixed_shape = (
-            self._state_prompt_mode == "fixed"
-            and state is not None
-            and self._rl_config is None
-        )
 
         # Se must be EVEN for cuBLASLt FP8. In fixed state-prompt mode the
         # graph captures the max state-prompt shape and masks padded K/V rows
         # through the Thor attention backend's device-side seqused buffers.
         if fixed_shape:
-            Se = S_sig + PI05_STATE_PROMPT_MAX_LEN
+            Se = S_sig + self._state_prompt_fixed_max_len
             if Se % 2 != 0:
                 Se += 1
             actual_lang = Se - S_sig
