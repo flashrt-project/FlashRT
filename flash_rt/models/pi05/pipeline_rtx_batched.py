@@ -1044,6 +1044,8 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         """
         # First, the parent's B=1 tune (covers calibration-time GEMMs).
         super().autotune_gemms()
+        if getattr(self, "_gemms_autotuned_b2", False):
+            return
 
         # Then run an additional autotune at the B=2 ``M = B*seq`` shapes.
         # When this code first landed we hit
@@ -1089,10 +1091,10 @@ class Pi05BatchedPipeline(Pi05Pipeline):
             ]:
                 w_fp8_ptr, w_scale_ptr = self._weight_fp8(name_prefix)
                 act_scale_ptr = self.fp8_act_scales[name_prefix].ptr.value
-                act_buf = (Bb["vis_act_fp8_large_b2"] if K_val == VIS_H
-                           else Bb["vis_act_fp8_b2"])
+                act_buf_ptr, _ = self._pick_fp8_scratch_b2(
+                    name_prefix, M_val * K_val)
                 self._autotune_fp8_matmul(
-                    act_buf.ptr.value, w_fp8_ptr, Bb[out_key].ptr.value,
+                    act_buf_ptr, w_fp8_ptr, Bb[out_key].ptr.value,
                     M_val, N_val, K_val, act_scale_ptr, w_scale_ptr)
 
         # Encoder FP8 at B*seq
@@ -1105,10 +1107,10 @@ class Pi05BatchedPipeline(Pi05Pipeline):
             ]:
                 w_fp8_ptr, w_scale_ptr = self._weight_fp8(name_prefix)
                 act_scale_ptr = self.fp8_act_scales[name_prefix].ptr.value
-                act_buf = (Bb["enc_act_fp8_large_b2"] if K_val == ENC_H
-                           else Bb["enc_act_fp8_b2"])
+                act_buf_ptr, _ = self._pick_fp8_scratch_b2(
+                    name_prefix, M_val * K_val)
                 self._autotune_fp8_matmul(
-                    act_buf.ptr.value, w_fp8_ptr, Bb[out_key].ptr.value,
+                    act_buf_ptr, w_fp8_ptr, Bb[out_key].ptr.value,
                     M_val, N_val, K_val, act_scale_ptr, w_scale_ptr)
 
         # Decoder FP8 at B*ds
@@ -1121,13 +1123,14 @@ class Pi05BatchedPipeline(Pi05Pipeline):
             ]:
                 w_fp8_ptr, w_scale_ptr = self._weight_fp8(name_prefix)
                 act_scale_ptr = self.fp8_act_scales[name_prefix].ptr.value
-                act_buf = (Bb["dec_act_fp8_large_b2"] if K_val == DEC_H
-                           else Bb["dec_act_fp8_b2"])
+                act_buf_ptr, _ = self._pick_fp8_scratch_b2(
+                    name_prefix, M_val * K_val)
                 self._autotune_fp8_matmul(
-                    act_buf.ptr.value, w_fp8_ptr, Bb[out_key].ptr.value,
+                    act_buf_ptr, w_fp8_ptr, Bb[out_key].ptr.value,
                     M_val, N_val, K_val, act_scale_ptr, w_scale_ptr)
 
         self._cudart.cudaDeviceSynchronize()
+        self._gemms_autotuned_b2 = True
         logger.info("B=%d autotune complete", self.B)
 
     def calibrate_fp8(self) -> None:

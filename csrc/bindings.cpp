@@ -494,6 +494,17 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         }, py::arg("A"), py::arg("B"), py::arg("D"),
            py::arg("M"), py::arg("N"), py::arg("K"),
            py::arg("d_scale_a"), py::arg("d_scale_b"), py::arg("stream") = 0)
+        .def("fp8_nt_dev", [](GemmRunner& self,
+                               uintptr_t A, uintptr_t B, uintptr_t D,
+                               int M, int N, int K,
+                               uintptr_t d_scale_a, uintptr_t d_scale_b,
+                               uintptr_t stream) {
+            self.fp8_nt_dev(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K,
+                             reinterpret_cast<float*>(d_scale_a),
+                             reinterpret_cast<float*>(d_scale_b), to_stream(stream));
+        }, py::arg("A"), py::arg("B"), py::arg("D"),
+           py::arg("M"), py::arg("N"), py::arg("K"),
+           py::arg("d_scale_a"), py::arg("d_scale_b"), py::arg("stream") = 0)
         // FP8 with device descale → FP16 (GemmRunner handle, matching pi05)
         .def("fp8_descale_fp16", [](GemmRunner& self,
                                      uintptr_t A, uintptr_t B, uintptr_t D,
@@ -553,6 +564,17 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                                         uintptr_t d_scale_a, uintptr_t d_scale_b,
                                         int num_algos) {
             self.autotune_fp8_nn_dev(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K,
+                                      reinterpret_cast<float*>(d_scale_a),
+                                      reinterpret_cast<float*>(d_scale_b), num_algos);
+        }, py::arg("A"), py::arg("B"), py::arg("D"),
+           py::arg("M"), py::arg("N"), py::arg("K"),
+           py::arg("d_scale_a"), py::arg("d_scale_b"), py::arg("num_algos") = 16)
+        .def("autotune_fp8_nt_dev", [](GemmRunner& self,
+                                        uintptr_t A, uintptr_t B, uintptr_t D,
+                                        int M, int N, int K,
+                                        uintptr_t d_scale_a, uintptr_t d_scale_b,
+                                        int num_algos) {
+            self.autotune_fp8_nt_dev(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K,
                                       reinterpret_cast<float*>(d_scale_a),
                                       reinterpret_cast<float*>(d_scale_b), num_algos);
         }, py::arg("A"), py::arg("B"), py::arg("D"),

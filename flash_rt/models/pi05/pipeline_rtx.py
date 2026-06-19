@@ -1792,12 +1792,9 @@ class Pi05Pipeline:
             ]:
                 w_fp8_ptr, w_scale_ptr = self._weight_fp8(name_prefix)
                 act_scale_ptr = self.fp8_act_scales[name_prefix].ptr.value
-                if K_val == VIS_H:
-                    act_buf = B["vis_act_fp8_large"]
-                else:
-                    act_buf = B["vis_act_fp8"]
+                act_buf_ptr, _ = self._pick_fp8_scratch(name_prefix, M_val * K_val)
                 self._autotune_fp8_matmul(
-                    act_buf.ptr.value, w_fp8_ptr, B[out_key].ptr.value,
+                    act_buf_ptr, w_fp8_ptr, B[out_key].ptr.value,
                     M_val, N_val, K_val, act_scale_ptr, w_scale_ptr)
 
         # Encoder FP8 shapes
@@ -1810,9 +1807,9 @@ class Pi05Pipeline:
             ]:
                 w_fp8_ptr, w_scale_ptr = self._weight_fp8(name_prefix)
                 act_scale_ptr = self.fp8_act_scales[name_prefix].ptr.value
-                act_buf = B["enc_act_fp8_large"] if K_val == ENC_H else B["enc_act_fp8"]
+                act_buf_ptr, _ = self._pick_fp8_scratch(name_prefix, M_val * K_val)
                 self._autotune_fp8_matmul(
-                    act_buf.ptr.value, w_fp8_ptr, B[out_key].ptr.value,
+                    act_buf_ptr, w_fp8_ptr, B[out_key].ptr.value,
                     M_val, N_val, K_val, act_scale_ptr, w_scale_ptr)
         # Plain encoder GEMMs fall back to BF16 when neither FP8 nor
         # INT8 owns the encoder matmuls.
@@ -1849,9 +1846,9 @@ class Pi05Pipeline:
             ]:
                 w_fp8_ptr, w_scale_ptr = self._weight_fp8(name_prefix)
                 act_scale_ptr = self.fp8_act_scales[name_prefix].ptr.value
-                act_buf = B["dec_act_fp8_large"] if K_val == DEC_H else B["dec_act_fp8"]
+                act_buf_ptr, _ = self._pick_fp8_scratch(name_prefix, M_val * K_val)
                 self._autotune_fp8_matmul(
-                    act_buf.ptr.value, w_fp8_ptr, B[out_key].ptr.value,
+                    act_buf_ptr, w_fp8_ptr, B[out_key].ptr.value,
                     M_val, N_val, K_val, act_scale_ptr, w_scale_ptr)
         # Plain decoder GEMMs fall back to BF16 when neither FP8 nor
         # INT8 owns the decoder matmuls.
