@@ -6,6 +6,10 @@
 
 **FlashRT is a high-performance realtime inference engine for small-batch, latency-sensitive AI workloads.**
 
+<p align="center">
+  | <a href="https://arxiv.org/abs/2606.20537"><b>Paper</b></a> |
+</p>
+
 A general kernel library composed into static graphs — no ONNX export, no engine compilation, no per-driver rebuild. Hand-written kernels (norm / activation / fusion / RoPE / FP8 / NVFP4 GEMM / attention) cover standard transformer, DiT, and SigLIP primitives. The composition pattern itself is hardware-agnostic; today the codebase ships with NVIDIA implementations spanning edge to server (Jetson AGX Thor through A100 / RTX 4090 / 5090).
 
 The flagship integration today is **VLA control** — production frontends for Pi0, Pi0.5, GROOT N1.6, GROOT N1.7, and Pi0-FAST, validated on LIBERO where applicable. The same kernel set also powers BAGEL world-model research paths, Higgs Audio v3 TTS, Wan2.2 / Motus video-policy paths, and **single-stream LLM inference** with Qwen3.6-27B NVFP4 long-context serving. The pattern is workload-shaped (small-batch realtime), not model-class-shaped.
@@ -1021,6 +1025,25 @@ Task-level submission:
 If you contribute a hardware benchmark, include the exact command, warmup count,
 driver/CUDA/PyTorch versions, and `nvidia-smi` output. For new cards, start with
 `python examples/quickstart.py --checkpoint <...> --benchmark 20`.
+
+---
+
+## Citation
+
+If you use FlashRT for your research, please cite our paper:
+
+```bibtex
+@misc{su2026executionstatecapsules,
+  title={Execution-State Capsules: Graph-Bound Execution-State Checkpoint and Restore for Low-Latency, Small-Batch, On-Device Physical-AI Serving},
+  author={Liang Su},
+  year={2026},
+  eprint={2606.20537},
+  archivePrefix={arXiv},
+  primaryClass={cs.LG},
+  doi={10.48550/arXiv.2606.20537},
+  url={https://arxiv.org/abs/2606.20537},
+}
+```
 
 ---
 
