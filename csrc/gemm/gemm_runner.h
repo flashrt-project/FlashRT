@@ -121,6 +121,14 @@ public:
                     float* d_scale_a, float* d_scale_b,
                     cudaStream_t stream = 0);
 
+    // FP8 transpose-B path for SM89-compatible cuBLASLt layouts:
+    // D_bf16 = A_fp8(M,K) @ B_fp8(N,K)^T with device scale pointers.
+    // B is stored as (N,K) row-major.
+    void fp8_nt_dev(void* A, void* B, void* D,
+                    int M, int N, int K,
+                    float* d_scale_a, float* d_scale_b,
+                    cudaStream_t stream = 0);
+
     // FP8 with host alpha + BIAS epilogue: D = alpha * A_fp8 @ B_fp8 + bias
     // Matches pi05 gmm_fp8_kn_bias: host scalar alpha, per-GEMM bias vector
     void fp8_nn_bias(void* A, void* B, void* D, void* bias,
@@ -173,6 +181,10 @@ public:
                              int M, int N, int K,
                              float* d_scale_a, float* d_scale_b,
                              int num_algos = 16);
+    void autotune_fp8_nt_dev(void* A, void* B, void* D,
+                             int M, int N, int K,
+                             float* d_scale_a, float* d_scale_b,
+                             int num_algos = 16);
 #ifdef ENABLE_NVFP4
     void autotune_fp4_nn_dev(void* A_fp4, void* SFA, void* B_fp4, void* SFB,
                               void* D, int M, int N, int K,
@@ -188,7 +200,8 @@ private:
     float* d_scale_b_;
 
     // ── GEMM descriptor + algorithm cache ──
-    enum GemmType { BF16_NN = 0, BF16_NN_RES = 1, FP8_NN_DEV = 2, FP16_NN = 4
+    enum GemmType { BF16_NN = 0, BF16_NN_RES = 1, FP8_NN_DEV = 2,
+                    FP8_NT_DEV = 5, FP16_NN = 4
 #ifdef ENABLE_NVFP4
         , FP4_NN_DEV = 3
 #endif
