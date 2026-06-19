@@ -3,19 +3,6 @@ from unittest.mock import Mock
 
 import pytest
 
-from flash_rt.models.pi05.pipeline_rtx_batched import Pi05BatchedPipeline
-from flash_rt.models.pi05.pipeline_rtx import (
-    DEC_D,
-    DEC_H,
-    DEC_HD,
-    DEC_NH,
-    ENC_D,
-    ENC_H,
-    Pi05Pipeline,
-    VIS_D,
-    VIS_H,
-)
-
 
 class _Buf:
     def __init__(self, ptr, nbytes):
@@ -31,6 +18,36 @@ class _Gemm:
 class _CudaRt:
     def __init__(self):
         self.cudaDeviceSynchronize = Mock(return_value=0)
+
+
+def _load_pi05_rtx_symbols():
+    try:
+        from flash_rt.models.pi05.pipeline_rtx_batched import Pi05BatchedPipeline
+        from flash_rt.models.pi05.pipeline_rtx import (
+            DEC_D,
+            DEC_H,
+            DEC_HD,
+            DEC_NH,
+            ENC_D,
+            ENC_H,
+            Pi05Pipeline,
+            VIS_D,
+            VIS_H,
+        )
+    except (ImportError, OSError) as exc:
+        pytest.skip(f"Pi05 RTX imports unavailable: {exc}")
+    return SimpleNamespace(
+        DEC_D=DEC_D,
+        DEC_H=DEC_H,
+        DEC_HD=DEC_HD,
+        DEC_NH=DEC_NH,
+        ENC_D=ENC_D,
+        ENC_H=ENC_H,
+        Pi05BatchedPipeline=Pi05BatchedPipeline,
+        Pi05Pipeline=Pi05Pipeline,
+        VIS_D=VIS_D,
+        VIS_H=VIS_H,
+    )
 
 
 def _setup_pi05_pipe(pipe_cls):
@@ -92,7 +109,7 @@ def _setup_pi05_pipe(pipe_cls):
     return pipe
 
 
-def _set_base_test_bufs(pipe):
+def _set_base_test_bufs(pipe, symbols):
     pipe.bufs = {
         "vision_patches": _Buf(101, 1),
         "vision_x": _Buf(102, 1),
@@ -106,19 +123,19 @@ def _set_base_test_bufs(pipe):
         "decoder_QKV": _Buf(110, 1),
         "decoder_gate_merged": _Buf(111, 1),
         "x_normed_buf": _Buf(112, 1),
-        "vis_act_fp8": _Buf(201, pipe.vision_seq * VIS_D),
-        "vis_act_fp8_large": _Buf(202, pipe.vision_seq * VIS_H),
+        "vis_act_fp8": _Buf(201, pipe.vision_seq * symbols.VIS_D),
+        "vis_act_fp8_large": _Buf(202, pipe.vision_seq * symbols.VIS_H),
         "vis_act_scale": _Buf(203, 4),
-        "enc_act_fp8": _Buf(301, pipe.encoder_seq_len * ENC_D),
-        "enc_act_fp8_large": _Buf(302, pipe.encoder_seq_len * 2 * ENC_H),
+        "enc_act_fp8": _Buf(301, pipe.encoder_seq_len * symbols.ENC_D),
+        "enc_act_fp8_large": _Buf(302, pipe.encoder_seq_len * 2 * symbols.ENC_H),
         "enc_act_scale": _Buf(303, 4),
-        "dec_act_fp8": _Buf(401, pipe.chunk_size * DEC_D),
-        "dec_act_fp8_large": _Buf(402, pipe.chunk_size * 2 * DEC_H),
+        "dec_act_fp8": _Buf(401, pipe.chunk_size * symbols.DEC_D),
+        "dec_act_fp8_large": _Buf(402, pipe.chunk_size * 2 * symbols.DEC_H),
         "dec_act_scale": _Buf(403, 4),
     }
 
 
-def _set_batched_test_bufs(pipe):
+def _set_batched_test_bufs(pipe, symbols):
     pipe.B = 2
     batched_slack = pipe.B + 1
     pipe.bufs = {
@@ -146,35 +163,42 @@ def _set_batched_test_bufs(pipe):
         "decoder_QKV_b2": _Buf(110, 1),
         "decoder_gate_merged_b2": _Buf(111, 1),
         "x_normed_buf_b2": _Buf(112, 1),
-        "vis_act_fp8": _Buf(201, pipe.vision_seq * VIS_D),
-        "vis_act_fp8_large": _Buf(202, pipe.vision_seq * VIS_H),
-        "vis_act_fp8_b2": _Buf(211, batched_slack * pipe.vision_seq * VIS_D),
-        "vis_act_fp8_large_b2": _Buf(212, batched_slack * pipe.vision_seq * VIS_H),
+        "vis_act_fp8": _Buf(201, pipe.vision_seq * symbols.VIS_D),
+        "vis_act_fp8_large": _Buf(202, pipe.vision_seq * symbols.VIS_H),
+        "vis_act_fp8_b2": _Buf(
+            211, batched_slack * pipe.vision_seq * symbols.VIS_D),
+        "vis_act_fp8_large_b2": _Buf(
+            212, batched_slack * pipe.vision_seq * symbols.VIS_H),
         "vis_act_scale": _Buf(203, 4),
-        "enc_act_fp8": _Buf(301, pipe.encoder_seq_len * ENC_D),
-        "enc_act_fp8_large": _Buf(302, pipe.encoder_seq_len * 2 * ENC_H),
-        "enc_act_fp8_b2": _Buf(311, batched_slack * pipe.encoder_seq_len * ENC_D),
+        "enc_act_fp8": _Buf(301, pipe.encoder_seq_len * symbols.ENC_D),
+        "enc_act_fp8_large": _Buf(302, pipe.encoder_seq_len * 2 * symbols.ENC_H),
+        "enc_act_fp8_b2": _Buf(
+            311, batched_slack * pipe.encoder_seq_len * symbols.ENC_D),
         "enc_act_fp8_large_b2": _Buf(
-            312, batched_slack * pipe.encoder_seq_len * 2 * ENC_H),
+            312, batched_slack * pipe.encoder_seq_len * 2 * symbols.ENC_H),
         "enc_act_scale": _Buf(303, 4),
-        "dec_act_fp8": _Buf(401, pipe.chunk_size * DEC_D),
-        "dec_act_fp8_large": _Buf(402, pipe.chunk_size * 2 * DEC_H),
-        "dec_act_fp8_b2": _Buf(411, batched_slack * pipe.chunk_size * DEC_D),
-        "dec_act_fp8_large_b2": _Buf(412, batched_slack * pipe.chunk_size * 2 * DEC_H),
+        "dec_act_fp8": _Buf(401, pipe.chunk_size * symbols.DEC_D),
+        "dec_act_fp8_large": _Buf(402, pipe.chunk_size * 2 * symbols.DEC_H),
+        "dec_act_fp8_b2": _Buf(
+            411, batched_slack * pipe.chunk_size * symbols.DEC_D),
+        "dec_act_fp8_large_b2": _Buf(
+            412, batched_slack * pipe.chunk_size * 2 * symbols.DEC_H),
         "dec_act_scale": _Buf(403, 4),
     }
 
 
 def test_autotune_uses_large_decoder_fp8_scratch_for_attn_o():
-    pipe = _setup_pi05_pipe(Pi05Pipeline)
-    _set_base_test_bufs(pipe)
+    symbols = _load_pi05_rtx_symbols()
+    pipe = _setup_pi05_pipe(symbols.Pi05Pipeline)
+    _set_base_test_bufs(pipe, symbols)
     pipe._autotune_fp8_matmul = Mock()
 
-    Pi05Pipeline.autotune_gemms(pipe)
+    symbols.Pi05Pipeline.autotune_gemms(pipe)
 
     decoder_attn_o = [
         call.args for call in pipe._autotune_fp8_matmul.call_args_list
-        if call.args[3:6] == (pipe.chunk_size, DEC_D, DEC_NH * DEC_HD)
+        if call.args[3:6] == (
+            pipe.chunk_size, symbols.DEC_D, symbols.DEC_NH * symbols.DEC_HD)
     ]
     assert decoder_attn_o, "decoder attn_o FP8 autotune shape was not visited"
     assert decoder_attn_o[0][0] == pipe.bufs["dec_act_fp8_large"].ptr.value
@@ -182,16 +206,22 @@ def test_autotune_uses_large_decoder_fp8_scratch_for_attn_o():
 
 def test_batched_autotune_uses_size_based_decoder_fp8_scratch_for_attn_o(
         monkeypatch):
-    pipe = _setup_pi05_pipe(Pi05BatchedPipeline)
-    _set_batched_test_bufs(pipe)
+    symbols = _load_pi05_rtx_symbols()
+    pipe = _setup_pi05_pipe(symbols.Pi05BatchedPipeline)
+    _set_batched_test_bufs(pipe, symbols)
     pipe._autotune_fp8_matmul = Mock()
 
-    monkeypatch.setattr(Pi05Pipeline, "autotune_gemms", lambda self: None)
-    Pi05BatchedPipeline.autotune_gemms(pipe)
+    monkeypatch.setattr(
+        symbols.Pi05Pipeline, "autotune_gemms", lambda self: None)
+    symbols.Pi05BatchedPipeline.autotune_gemms(pipe)
 
     decoder_attn_o = [
         call.args for call in pipe._autotune_fp8_matmul.call_args_list
-        if call.args[3:6] == (pipe.B * pipe.chunk_size, DEC_D, DEC_NH * DEC_HD)
+        if call.args[3:6] == (
+            pipe.B * pipe.chunk_size,
+            symbols.DEC_D,
+            symbols.DEC_NH * symbols.DEC_HD,
+        )
     ]
     assert decoder_attn_o, (
         "batched decoder attn_o FP8 autotune shape was not visited")
@@ -199,15 +229,17 @@ def test_batched_autotune_uses_size_based_decoder_fp8_scratch_for_attn_o(
 
 
 def test_batched_autotune_runs_b2_shapes_only_once(monkeypatch):
-    pipe = _setup_pi05_pipe(Pi05BatchedPipeline)
-    _set_batched_test_bufs(pipe)
+    symbols = _load_pi05_rtx_symbols()
+    pipe = _setup_pi05_pipe(symbols.Pi05BatchedPipeline)
+    _set_batched_test_bufs(pipe, symbols)
     pipe._autotune_fp8_matmul = Mock()
 
-    monkeypatch.setattr(Pi05Pipeline, "autotune_gemms", lambda self: None)
+    monkeypatch.setattr(
+        symbols.Pi05Pipeline, "autotune_gemms", lambda self: None)
 
-    Pi05BatchedPipeline.autotune_gemms(pipe)
+    symbols.Pi05BatchedPipeline.autotune_gemms(pipe)
     first_count = pipe._autotune_fp8_matmul.call_count
-    Pi05BatchedPipeline.autotune_gemms(pipe)
+    symbols.Pi05BatchedPipeline.autotune_gemms(pipe)
 
     assert first_count > 0
     assert pipe._autotune_fp8_matmul.call_count == first_count
@@ -216,7 +248,8 @@ def test_batched_autotune_runs_b2_shapes_only_once(monkeypatch):
 
 
 def test_fp8_nk_layout_dispatches_to_nt_entrypoints():
-    pipe = Pi05Pipeline.__new__(Pi05Pipeline)
+    symbols = _load_pi05_rtx_symbols()
+    pipe = symbols.Pi05Pipeline.__new__(symbols.Pi05Pipeline)
     pipe.fp8_layout = "nk"
     pipe.gemm = SimpleNamespace(
         fp8_nt_dev=Mock(),
