@@ -1,0 +1,79 @@
+# FlashRT — Nex-N2-mini (architecture name: qwen3_5_moe)
+#
+# Hybrid Gated-DeltaNet + softmax-attention transformer with a fine-grained
+# Mixture-of-Experts FFN. The checkpoint registers
+# architectures=Qwen3_5MoeForConditionalGeneration / model_type=qwen3_5_moe,
+# the MoE sibling of the dense qwen36 family. FlashRT names it after the
+# public model brand (nexn2) so it matches the checkpoint folder.
+#
+# This YAML is metadata only (logging / introspection). Runtime dimensions
+# come from the constants in the frontend / pipeline.
+name: nexn2
+
+# ── Backbone family ──
+backbone_type: nexn2_hybrid      # 30 linear-attn + 10 full-attn, every-4 pattern
+backbone_hidden: 2048
+
+# ── Language model (decoder-only) ──
+llm:
+  type: nexn2
+  hidden_dim: 2048
+  num_layers: 40                 # 40 = 30 linear_attention + 10 full_attention
+  full_attn_period: 4            # full attn at indices 3, 7, 11, ..., 39
+  vocab_size: 248320
+
+  # Full-attn layers (10 of them)
+  full_attn:
+    num_q_heads: 16
+    num_kv_heads: 2              # GQA 8:1
+    head_dim: 256
+    has_output_gate: true
+    partial_rotary_factor: 0.25  # rotate first 64 of 256 head dims
+    mrope_section: [11, 11, 10]  # interleaved mRoPE (multimodal position axes)
+    rope_theta: null             # set from config.text_config at load time
+
+  # Linear-attn layers (30 of them) — Gated DeltaNet
+  linear_attn:
+    num_k_heads: 16
+    num_v_heads: 32              # differs from qwen36 (48)
+    head_dim: 128
+    conv_kernel_size: 4
+    ssm_dtype: float32
+
+  # FFN — fine-grained MoE on every layer (mlp_only_layers is empty)
+  moe:
+    num_experts: 256
+    experts_per_token: 8
+    moe_intermediate_dim: 512
+    shared_expert_intermediate_dim: 512   # always-on shared expert
+    activation: silu             # SwiGLU (silu_mul)
+
+  # Multi-token prediction head (1 native layer, shares main embeddings)
+  mtp:
+    num_layers: 1
+    use_dedicated_embeddings: false
+
+# ── Vision tower (only used in multimodal path; deferred) ──
+vision:
+  type: nexn2_vit
+  hidden_dim: 1152               # SigLIP-so400m encoder width
+  num_blocks: 27
+  num_heads: 16
+  patch_size: 16
+  spatial_merge_size: 2
+  temporal_patch_size: 2
+  out_hidden_size: 2048          # projected to LLM hidden
+
+# ── Quantization ──
+quant:
+  weights: nvfp4                 # full-attn + MoE GEMM weights
+  weight_block: [16, 16]         # NVFP4 per-16 block scale
+  activations: nvfp4_dynamic     # on-the-fly per-token swizzled quant
+  # Modules kept in BF16 (not quantized): embeddings, lm_head, all layernorms,
+  # linear_attn.{A_log, conv1d, dt_bias, in_proj_a, in_proj_b}, router gate,
+  # all visual blocks. The GDN in_proj path must stay BF16.
+
+# ── KV cache budget ──
+kv_cache:
+  max_seq_len: 8192              # only the 10 full-attn layers grow KV
+  full_attn_layer_count: 10
