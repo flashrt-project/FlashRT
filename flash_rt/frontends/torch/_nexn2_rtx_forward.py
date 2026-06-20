@@ -71,11 +71,11 @@ def _proj(x2d, ld, base, n, fvk, device):
     return (x2d.float() @ w.float().T).to(torch.bfloat16)
 
 
-def _nvfp4_gemm(x2d, wp_ptr, wsf_ptr, alpha, n, fvk, device, stream=0):
-    """y = x @ w.T via NVFP4. x2d is (M,K) bf16; weight given by ptrs+alpha.
+def _quant_act(x2d, fvk, device, stream=0):
+    """Quantise one (M,K) bf16 activation to NVFP4 swizzled; return (xp, xsf).
 
-    Activation quantised per call (swizzled). All ptr args are bound to
-    named tensors that outlive the launch.
+    Split out so a shared activation (e.g. the M=1 decode token routed to
+    several experts) is quantised once and reused across GEMMs.
     """
     m, kk = x2d.shape
     xc = x2d.contiguous()
@@ -83,11 +83,29 @@ def _nvfp4_gemm(x2d, wp_ptr, wsf_ptr, alpha, n, fvk, device, stream=0):
     xsf = torch.zeros(_sf_swz_bytes(m, kk), dtype=torch.uint8, device=device)
     fvk.quantize_bf16_to_nvfp4_swizzled(
         xc.data_ptr(), xp.data_ptr(), xsf.data_ptr(), m, kk, stream)
+    return xp, xsf
+
+
+def _nvfp4_gemm_preq(xp, xsf, wp_ptr, wsf_ptr, alpha, m, n, k, fvk, device,
+                     stream=0):
+    """y = x @ w.T from a pre-quantised activation (xp, xsf)."""
     y = torch.empty(m, n, dtype=torch.bfloat16, device=device)
     fvk.fp4_w4a16_gemm_sm120_bf16out(
-        xp.data_ptr(), wp_ptr, y.data_ptr(), m, n, kk,
+        xp.data_ptr(), wp_ptr, y.data_ptr(), m, n, k,
         xsf.data_ptr(), wsf_ptr, alpha, stream)
     return y
+
+
+def _nvfp4_gemm(x2d, wp_ptr, wsf_ptr, alpha, n, fvk, device, stream=0):
+    """y = x @ w.T via NVFP4. x2d is (M,K) bf16; weight given by ptrs+alpha.
+
+    Activation quantised per call (swizzled). All ptr args are bound to
+    named tensors that outlive the launch.
+    """
+    m, kk = x2d.shape
+    xp, xsf = _quant_act(x2d, fvk, device, stream)
+    return _nvfp4_gemm_preq(xp, xsf, wp_ptr, wsf_ptr, alpha, m, n, kk,
+                            fvk, device, stream)
 
 
 def _gdn_layer(h, ld, fvk, device, eps):
