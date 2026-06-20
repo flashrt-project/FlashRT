@@ -834,7 +834,8 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
         # kernel — the AdaLN output feeds only the QKV projection, so it can
         # be emitted directly as fp8 (one kernel instead of AdaLN + quantize).
         # Cross-attn and the bf16 fallback keep the bf16 AdaLN.
-        is_self_fp8 = is_self and "qkv_w_fp8" in weights
+        is_self_fp8_sm120 = is_self and "qkv_w_fp8_nt" in weights
+        is_self_fp8 = is_self and ("qkv_w_fp8" in weights or is_self_fp8_sm120)
         j_self = (li - 1) // 2
         if is_self_fp8:
             fvk.ada_layer_norm_fp8(
@@ -860,7 +861,20 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
         # CUBLAS_STATUS_NOT_SUPPORTED at M=Sa=41 (M not 16-aligned). Match
         # N1.6's calibrate path: bf16_nn (no epilogue) + explicit
         # add_bias_bf16. Slightly more launches but works on every shape.
-        if is_self_fp8:
+        if is_self_fp8_sm120:
+            gemm.fp8_nt_dev(
+                int(bufs["qkv_xn_fp8"]), int(weights["qkv_w_fp8_nt"][j_self]),
+                int(bufs["qkv_buf"]), Sa, 3 * D, D,
+                int(weights["act_qkv_scale"][j_self]),
+                int(weights["qkv_weight_scale"][j_self]), int(stream))
+            fvk.add_bias_bf16(
+                int(bufs["qkv_buf"]), int(weights["qkv_b"][j_self]),
+                Sa, 3 * D, int(stream))
+            fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), Q_ptr, Sa, D, 3 * D, 0, int(stream))
+            fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), K_ptr, Sa, D, 3 * D, D, int(stream))
+            fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), V_ptr, Sa, D, 3 * D, 2 * D, int(stream))
+            attn.run("dit_self", j_attn, q_seq=Sa, kv_seq=Sa, stream=int(stream))
+        elif is_self_fp8:
             # Fused FP8 QKV (self-attn): q/k/v share the post-AdaLN input,
             # so one [D, 3D] GEMM (compute-bound, unlike 3 launch-bound D→D
             # GEMMs) + a strided split into the Q/K/V slots. Cross-attn keeps
@@ -912,7 +926,30 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
         # FFN weights/scales are supplied; otherwise the bf16 path runs. The
         # attention GEMMs stay bf16 — at M=41 they are launch-bound, so FP8
         # gives no speedup there.
-        if "ff_proj_w_fp8" in weights:
+        if "ff_proj_w_fp8_sm120" in weights:
+            fvk.quantize_fp8_static(
+                xn_ptr, int(bufs["xn_fp8"]),
+                int(weights["act_fc1_scale"][li]), Sa * D, int(stream))
+            gemm.fp8_descale_fp16(
+                int(bufs["xn_fp8"]), int(weights["ff_proj_w_fp8_sm120"][li]),
+                int(bufs["ff_fp16"]), Sa, FF, D,
+                int(weights["act_fc1_scale"][li]),
+                int(weights["ff_proj_weight_scale"][li]), int(stream))
+            fvk.add_bias_fp16(
+                int(bufs["ff_fp16"]), int(weights["ff_proj_b"][li]),
+                Sa, FF, int(stream))
+            fvk.gelu_inplace_fp16(int(bufs["ff_fp16"]), Sa * FF, int(stream))
+            fvk.quantize_fp8_static_fp16(
+                int(bufs["ff_fp16"]), int(bufs["ff_fp8"]),
+                int(weights["act_fc2_scale"][li]), Sa * FF, int(stream))
+            gemm.fp8_nt_dev(
+                int(bufs["ff_fp8"]), int(weights["ff_down_w_fp8_nt"][li]),
+                o_out_ptr, Sa, D, FF,
+                int(weights["act_fc2_scale"][li]),
+                int(weights["ff_down_weight_scale"][li]), int(stream))
+            fvk.add_bias_bf16(o_out_ptr, int(weights["ff_down_b"][li]),
+                              Sa, D, int(stream))
+        elif "ff_proj_w_fp8" in weights:
             fvk.quantize_fp8_static(
                 xn_ptr, int(bufs["xn_fp8"]),
                 int(weights["act_fc1_scale"][li]), Sa * D, int(stream))

@@ -44,6 +44,7 @@ class GrootN17TorchFrontendThor:
     # subclass sets this False so the DiT stays bf16 (a fully non-quantized
     # accuracy baseline).
     _DIT_USE_FP8 = True
+    _DIT_FP8_IMPL = "thor_epilogue"
 
     def __init__(
         self,
@@ -627,7 +628,10 @@ class GrootN17TorchFrontendThor:
         self._k_ff_fp16 = torch.empty(Sa, 6144, dtype=torch.float16, device=dev)
         self._k_ff_fp8 = torch.empty(Sa, 6144, dtype=f8, device=dev)
         self._dit_ff_fp8_keep = []
+        dit_fp8_impl = getattr(self, "_DIT_FP8_IMPL", "thor_epilogue")
+        use_sm120_safe = dit_fp8_impl == "sm120_safe"
         proj_fp8, down_fp8, projb16 = [], [], []
+        proj_ws, down_fp8_nt, down_ws = [], [], []
         a_fc1, a_fc2, s_fc1, s_fc2 = [], [], [], []
         for li in range(32):
             pw = self._dit_ff_proj_w[li].float()
@@ -644,13 +648,21 @@ class GrootN17TorchFrontendThor:
             proj_fp8.append(pf.data_ptr()); down_fp8.append(df.data_ptr())
             projb16.append(pb.data_ptr())
             s_fc1.append(sf1.data_ptr()); s_fc2.append(sf2.data_ptr())
+            if use_sm120_safe:
+                df_nt = df.t().contiguous()
+                sw_p = torch.tensor([ws_p], dtype=torch.float32, device=dev)
+                sw_d = torch.tensor([ws_d], dtype=torch.float32, device=dev)
+                self._dit_ff_fp8_keep += [df_nt, sw_p, sw_d]
+                proj_ws.append(sw_p.data_ptr())
+                down_fp8_nt.append(df_nt.data_ptr())
+                down_ws.append(sw_d.data_ptr())
             a_fc1.append((act_fc1[li] / FP8_MAX) * ws_p)
             a_fc2.append((act_fc2[li] / FP8_MAX) * ws_d)
         # Fused FP8 QKV for the 16 self-attn layers: concat q/k/v ([D,D] each)
         # → [D, 3D], quantize per-tensor. j indexes self-attn layers (li=2j+1).
         self._k_qkv_buf = torch.empty(Sa, 3 * 1536, dtype=torch.bfloat16, device=dev)
         self._k_qkv_xn_fp8 = torch.empty(Sa, 1536, dtype=f8, device=dev)
-        qkv_fp8, qkv_b, a_qkv, s_qkv = [], [], [], []
+        qkv_fp8, qkv_fp8_nt, qkv_b, a_qkv, s_qkv, qkv_ws = [], [], [], [], [], []
         for j in range(16):
             li = 2 * j + 1
             qw = torch.cat([self._dit_q_w[li], self._dit_k_w[li], self._dit_v_w[li]], dim=1).float()
@@ -660,15 +672,35 @@ class GrootN17TorchFrontendThor:
             sq = torch.tensor([act_qkv[j] / FP8_MAX], dtype=torch.float32, device=dev)
             self._dit_ff_fp8_keep += [qf, qb, sq]
             qkv_fp8.append(qf.data_ptr()); qkv_b.append(qb.data_ptr()); s_qkv.append(sq.data_ptr())
+            if use_sm120_safe:
+                qf_nt = qf.t().contiguous()
+                sw_q = torch.tensor([ws_q], dtype=torch.float32, device=dev)
+                self._dit_ff_fp8_keep += [qf_nt, sw_q]
+                qkv_fp8_nt.append(qf_nt.data_ptr())
+                qkv_ws.append(sw_q.data_ptr())
             a_qkv.append((act_qkv[j] / FP8_MAX) * ws_q)
         for step in range(num_inference_timesteps):
-            step_weights[step].update(
-                ff_proj_w_fp8=proj_fp8, ff_down_w_fp8=down_fp8,
-                ff_proj_b=projb16,  # fp16 bias for the GELU epilogue
-                alpha_fc1=a_fc1, alpha_fc2=a_fc2,
-                act_fc1_scale=s_fc1, act_fc2_scale=s_fc2,
-                qkv_w_fp8=qkv_fp8, qkv_b=qkv_b,
-                alpha_qkv=a_qkv, act_qkv_scale=s_qkv)
+            if use_sm120_safe:
+                step_weights[step].update(
+                    ff_proj_w_fp8_sm120=proj_fp8,
+                    ff_proj_weight_scale=proj_ws,
+                    ff_down_w_fp8_nt=down_fp8_nt,
+                    ff_down_weight_scale=down_ws,
+                    ff_proj_b=projb16,  # fp16 bias for the explicit GELU path
+                    act_fc1_scale=s_fc1,
+                    act_fc2_scale=s_fc2,
+                    qkv_w_fp8_nt=qkv_fp8_nt,
+                    qkv_weight_scale=qkv_ws,
+                    qkv_b=qkv_b,
+                    act_qkv_scale=s_qkv)
+            else:
+                step_weights[step].update(
+                    ff_proj_w_fp8=proj_fp8, ff_down_w_fp8=down_fp8,
+                    ff_proj_b=projb16,  # fp16 bias for the GELU epilogue
+                    alpha_fc1=a_fc1, alpha_fc2=a_fc2,
+                    act_fc1_scale=s_fc1, act_fc2_scale=s_fc2,
+                    qkv_w_fp8=qkv_fp8, qkv_b=qkv_b,
+                    alpha_qkv=a_qkv, act_qkv_scale=s_qkv)
         bp.update(xn_fp8=self._k_xn_fp8.data_ptr(),
                   ff_fp16=self._k_ff_fp16.data_ptr(),
                   ff_fp8=self._k_ff_fp8.data_ptr(),

@@ -399,6 +399,8 @@ class _GrootN17FP8BackboneMixin:
 class GrootN17TorchFrontendRtxFP8(_GrootN17FP8BackboneMixin, GrootN17TorchFrontendRtx):
     """N1.7 RTX FP8 frontend with a bf16 action head (Thor-parity dtype)."""
 
+    _DIT_FP8_IMPL = "sm120_safe"
+
 
 class GrootN17TorchFrontendRtxFP8FP16DiT(
         _GrootN17FP8BackboneMixin, GrootN17TorchFrontendRtxFP16):

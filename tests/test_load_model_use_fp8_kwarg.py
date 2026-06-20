@@ -266,6 +266,22 @@ def test_groot_n17_rtx_sm89_is_registered():
     assert cls.__name__ == "GrootN17TorchFrontendRtxSm89"
 
 
+def test_groot_n17_sm120_uses_sm120_safe_dit_fp8_only_on_sm120_frontend():
+    from flash_rt.frontends.torch.groot_n17_rtx_fp8 import (
+        GrootN17TorchFrontendRtxFP8,
+    )
+    from flash_rt.frontends.torch.groot_n17_rtx_sm89 import (
+        GrootN17TorchFrontendRtxSm89,
+    )
+    from flash_rt.frontends.torch.groot_n17_thor_fp8 import (
+        GrootN17TorchFrontendThorFP8,
+    )
+
+    assert GrootN17TorchFrontendRtxFP8._DIT_FP8_IMPL == "sm120_safe"
+    assert GrootN17TorchFrontendRtxSm89._DIT_FP8_IMPL == "thor_epilogue"
+    assert GrootN17TorchFrontendThorFP8._DIT_FP8_IMPL == "thor_epilogue"
+
+
 def test_wan22_ti2v_5b_rtx_sm120_is_registered():
     from flash_rt.hardware import resolve_pipeline_class
 
