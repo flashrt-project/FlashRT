@@ -443,9 +443,14 @@ actions_normalized = model.infer(
 )
 ```
 
-GROOT N1.7 is registered as `config="groot_n17"` for the RTX SM120
-torch path. It uses the N1.7 `set_prompt(aux=...)` / normalized-state
-`infer(...)` contract; see [USAGE.md](USAGE.md#groot-n17-rtx).
+GROOT N1.7 is registered as `config="groot_n17"` for the RTX torch
+path (`rtx_sm120` and `rtx_sm89`). `rtx_sm120` keeps the shared RTX
+registration and `load_model()` refines that default to the FP8
+production frontend when `use_fp16=False`; `rtx_sm89` is registered
+directly to its dedicated FP8 frontend. `use_fp16=True, use_fp8=False`
+selects the explicit RTX reference frontend for the selected hardware. It
+uses the N1.7 `set_prompt(aux=...)` / normalized-state `infer(...)`
+contract; see [USAGE.md](USAGE.md#groot-n17-rtx).
 
 ### Autotune
 

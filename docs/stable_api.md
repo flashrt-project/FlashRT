@@ -86,11 +86,15 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   pay for the extra padded tokens. It can also be set with
   `FLASHRT_PI05_STATE_PROMPT_FIXED_MAX_LEN`.
 - `use_fp8=False` disables FP8 where the selected frontend exposes a
-  BF16 fallback; unsupported frontends ignore it.
-- `use_fp16=True` selects the opt-in Pi0.5 torch RTX SM120/SM89 full-FP16
-  CUDA Graph path. It requires `use_fp8=False` and is currently valid
-  only for `config="pi05"`, `framework="torch"`, and
-  `hardware in {"rtx_sm120", "rtx_sm89"}`.
+  BF16 fallback; unsupported frontends ignore it. GROOT N1.7 on RTX/Thor
+  is stricter: the default route is FP8, and `use_fp8=False` alone
+  raises because there is no separate BF16-only path.
+- `use_fp16=True` selects the opt-in reference path. It requires
+  `use_fp8=False` and is currently valid for:
+  - `config="pi05"`, `framework="torch"`, `hardware in {"rtx_sm120", "rtx_sm89"}`
+  - `config="groot"`, `framework="torch"`, `hardware in {"thor", "rtx_sm120"}`
+  - `config="groot_n17"`, `framework="torch"`,
+    `hardware in {"thor", "rtx_sm120", "rtx_sm89"}`
 - `config="motus"` is a beta RTX SM120 frontend. It expects a Motus
   checkpoint plus Wan and VLM checkpoint paths supplied to the Motus
   quickstart/frontend; see `docs/motus_usage_beta.md`.
@@ -107,9 +111,13 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   compare_ref=..., return_metadata=...)`, returning the denoised vision
   latent; `predict()` is not part of this API. Precision is selected with
   `load_model(..., use_fp8=True|False)`. See `docs/cosmos3_video_usage.md`.
-- `config="groot_n17"` is registered for `framework="torch"` and
-  `hardware="rtx_sm120"`. This route validates the N1.7 DiT
-  self/cross-attention path on the vendored FA2 backend.
+- `config="groot_n17"` is registered for `framework="torch"` on
+  `hardware in {"thor", "rtx_sm120", "rtx_sm89"}`. On RTX,
+  `rtx_sm120` resolves through the historical shared RTX registration and
+  `load_model()` refines that default route to the FP8 production
+  frontend; `rtx_sm89` resolves directly to its dedicated SM89 frontend.
+  `use_fp16=True, use_fp8=False` requests the explicit RTX reference
+  frontend for the selected hardware.
 
 ### `flash_rt.VLAModel`
 
@@ -205,8 +213,12 @@ Lazily imports and returns the concrete frontend class for the given
 `(config, framework, arch)` triple. Used internally by `load_model`.
 Motus beta is registered for `(config="motus", framework="torch",
 arch="rtx_sm120")`.
-GROOT N1.7 RTX is registered for `(config="groot_n17",
-framework="torch", arch="rtx_sm120")`.
+GROOT N1.7 is registered for `(config="groot_n17", framework="torch",
+arch in {"thor", "rtx_sm120", "rtx_sm89"})`. On RTX, `rtx_sm120`
+keeps the shared-base registration and `load_model()` refines that
+resolved class to the FP8 default or the explicit RTX reference frontend
+based on `use_fp8` / `use_fp16`; `rtx_sm89` resolves directly to the
+dedicated SM89 frontend class.
 Wan2.2 TI2V-5B is registered for `(config="wan22_ti2v_5b",
 framework="torch", arch="rtx_sm120")`.
 

@@ -363,11 +363,12 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         use_fp8: Enable FP8 execution where the selected frontend supports
             an FP8/BF16 switch. Defaults to True to preserve existing
             performance-oriented behavior.
-        use_fp16: Opt-in non-quantized full-FP16 path for Pi0.5, GROOT N1.6,
-            and GROOT N1.7 (torch, RTX SM120/SM89). Only valid with
-            ``use_fp8=False``; an A/B reference against the quantized default.
-            On GROOT N1.7 the default is FP8 (FP8 backbone + bf16 DiT), so
-            ``use_fp8=False`` without ``use_fp16=True`` raises.
+        use_fp16: Opt-in non-quantized full-FP16 path for Pi0.5 on RTX
+            SM120/SM89, GROOT N1.6 on Thor/RTX SM120, and GROOT N1.7 on
+            Thor/RTX SM120/SM89. Only valid with ``use_fp8=False``; an A/B
+            reference against the quantized default. On GROOT N1.7 the
+            default is FP8 (FP8 backbone + bf16 DiT), so ``use_fp8=False``
+            without ``use_fp16=True`` raises.
         num_steps: Pi0/Pi0.5 torch only when supported. Number of
             flow-matching ODE steps. ``None`` uses the frontend default.
         vision_pool_factor: Pi0.5 torch RTX/Orin only. Spatial pooling factor
@@ -463,14 +464,30 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "--xla_gpu_enable_triton_gemm=false --xla_gpu_autotune_level=0")
         os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
+    if use_fp16:
+        if use_fp8:
+            raise ValueError("use_fp16=True requires use_fp8=False")
+        if (config, framework, arch) not in {
+            ("pi05", "torch", "rtx_sm120"),
+            ("pi05", "torch", "rtx_sm89"),
+            ("groot", "torch", "thor"),
+            ("groot", "torch", "rtx_sm120"),
+            ("groot_n17", "torch", "thor"),
+            ("groot_n17", "torch", "rtx_sm120"),
+            ("groot_n17", "torch", "rtx_sm89"),
+        }:
+            raise ValueError(
+                "use_fp16=True is currently experimental and only supports "
+                "('pi05', 'torch', 'rtx_sm120'/'rtx_sm89'), "
+                "('groot', 'torch', 'thor'/'rtx_sm120'), and "
+                "('groot_n17', 'torch', 'thor'/'rtx_sm120'/'rtx_sm89')")
+
     pipe_cls = resolve_pipeline_class(config, framework, arch)
 
-    # GROOT N1.7 on RTX: default to the framework-conforming FP8 frontend. The
-    # whole ViT/LLM/VL-self-attn backbone runs FP8 kernels via the SM120-safe
-    # descale pattern (no torch matmul on the serving feature path; activation
-    # scales come from the on-disk calibration cache, the torch shadow runs only
-    # on a cold cache miss). The DiT stays bf16 for Thor parity. ``use_fp16=True``
-    # opts into the full-FP16 frontend below (no FP8, non-quantized reference).
+    # GROOT N1.7 on RTX defaults to the framework-conforming FP8 frontend.
+    # rtx_sm120 keeps the historical shared-base registration and is refined
+    # here to the explicit FP8 production frontend. rtx_sm89 is already
+    # registered directly to its dedicated FP8 frontend in _PIPELINE_MAP.
     if config == "groot_n17" and framework == "torch" \
             and arch in ("rtx_sm120", "rtx_sm89") and not use_fp16:
         if not use_fp8:
@@ -478,10 +495,11 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 "GROOT N1.7 on RTX defaults to FP8; there is no separate "
                 "non-FP16 BF16 fallback. For the non-quantized full-FP16 "
                 "reference pass use_fp16=True, use_fp8=False.")
-        from flash_rt.frontends.torch.groot_n17_rtx_fp8 import (
-            GrootN17TorchFrontendRtxFP8,
-        )
-        pipe_cls = GrootN17TorchFrontendRtxFP8
+        if arch == "rtx_sm120":
+            from flash_rt.frontends.torch.groot_n17_rtx_fp8 import (
+                GrootN17TorchFrontendRtxFP8,
+            )
+            pipe_cls = GrootN17TorchFrontendRtxFP8
 
     # GROOT N1.7 on Thor (SM110) runs the FP8 backbone (+ bf16 DiT) by
     # default. There is no BF16-only fallback; the non-quantized reference is
@@ -495,8 +513,6 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "use_fp16=True together with use_fp8=False.")
 
     if use_fp16:
-        if use_fp8:
-            raise ValueError("use_fp16=True requires use_fp8=False")
         # GROOT N1.6 Thor full-FP16 reference: the same fully-kernelized,
         # CUDA-graph pipeline as the FP8 production frontend, with the GEMMs run
         # in FP16 instead of per-tensor FP8 (an A/B accuracy baseline).
@@ -514,14 +530,6 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             )
             pipe_cls = GrootN17TorchFrontendThorFP16
         else:
-            fp16_arches = ("rtx_sm120", "rtx_sm89")
-            if config not in ("pi05", "groot", "groot_n17") or framework != "torch" \
-                    or arch not in fp16_arches:
-                raise ValueError(
-                    "use_fp16=True is currently experimental and only supports "
-                    "config in {'pi05', 'groot', 'groot_n17'}, framework='torch', "
-                    "hardware in {'thor' (groot/groot_n17 only), 'rtx_sm120', "
-                    "'rtx_sm89'}")
             if config == "pi05":
                 from flash_rt.frontends.torch.pi05_rtx_fp16 import (
                     Pi05TorchFrontendRtxFP16,
@@ -533,10 +541,16 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 )
                 pipe_cls = GrootTorchFrontendRtxFP16
             else:  # config == "groot_n17"
-                from flash_rt.frontends.torch.groot_n17_rtx_fp16 import (
-                    GrootN17TorchFrontendRtxFP16,
-                )
-                pipe_cls = GrootN17TorchFrontendRtxFP16
+                if arch == "rtx_sm89":
+                    from flash_rt.frontends.torch.groot_n17_rtx_sm89_fp16 import (
+                        GrootN17TorchFrontendRtxSm89FP16,
+                    )
+                    pipe_cls = GrootN17TorchFrontendRtxSm89FP16
+                else:
+                    from flash_rt.frontends.torch.groot_n17_rtx_fp16 import (
+                        GrootN17TorchFrontendRtxFP16,
+                    )
+                    pipe_cls = GrootN17TorchFrontendRtxFP16
 
     # ── FP4 routing (Pi0.5 torch + Pi0.5 JAX on Thor) ──
     if use_fp4:

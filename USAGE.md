@@ -221,8 +221,8 @@ model = flash_rt.load_model(
 | `use_awq` | `bool` \| `None` | `None` | Activation-aware weight quant. Required for 18-layer FP4 scope (without it, cos collapses to ~0.33). `None` → resolved by the `use_fp4` preset. |
 | `awq_alpha` | `float` | `0.5` | AWQ scaling exponent `s[k] = (a[k]/a.mean())^alpha`. |
 | `use_p1_split_gu` | `bool` \| `None` | `None` | P1 split-GU 2-GEMM path (parity on Pi0.5, kernel reusable for Pi0.6). `None` → resolved by the `use_fp4` preset. |
-| `use_fp8` | `bool` | `True` | Enable the selected frontend's FP8 path when available. Set `False` for BF16 fallback or for the opt-in Pi0.5 RTX FP16 path. |
-| `use_fp16` | `bool` | `False` | Opt-in non-quantized full-FP16 path (A/B reference against the FP8/bf16 default). Supported: **Pi0.5 / GROOT N1.6 / GROOT N1.7 torch on RTX SM120/SM89**, and **GROOT N1.6 / GROOT N1.7 torch on Thor (SM110)**. Requires `use_fp8=False`; other hardware/configs raise a clear error. See the RTX and Thor full-FP16 sections below. |
+| `use_fp8` | `bool` | `True` | Enable the selected frontend's FP8 path when available. Set `False` for frontends with a documented BF16 fallback or for explicit full-FP16 reference paths. `groot_n17` on RTX/Thor is stricter: `use_fp8=False` alone raises, and the non-quantized reference path is `use_fp16=True, use_fp8=False`. |
+| `use_fp16` | `bool` | `False` | Opt-in non-quantized full-FP16 path (A/B reference against the FP8/bf16 default). Supported: **Pi0.5 torch on RTX SM120/SM89**, **GROOT N1.6 torch on Thor / RTX SM120**, and **GROOT N1.7 torch on Thor / RTX SM120/SM89**. Requires `use_fp8=False`; other hardware/configs raise a clear error. See the RTX and Thor full-FP16 sections below. |
 | `num_steps` | `int\|None` | `None` | Pi0/Pi0.5 torch frontends. Flow-matching denoise steps; `None` uses the frontend default. |
 | `vision_pool_factor` | `int\|None` | `None` | Pi0.5 torch RTX/Orin. Spatial pooling factor for vision tokens. The FP16 RTX path currently supports only `1`. |
 | `vision_num_layers` | `int\|None` | `None` | Pi0.5 torch RTX/Orin. Number of SigLIP vision layers to run. |
@@ -378,7 +378,7 @@ model = flash_rt.load_model(
     "/path/to/GR00T-N1.6-3B",
     framework="torch",
     config="groot",
-    hardware="rtx_sm120",     # or rtx_sm89
+    hardware="rtx_sm120",
     num_views=2,
     embodiment_tag="gr1",
     use_fp8=False,
@@ -394,14 +394,18 @@ production latency.
 #### GROOT N1.7
 
 GROOT N1.7 defaults to the **FP8** path on RTX (see [GROOT N1.7 RTX](#groot-n17-rtx)).
-The full-FP16 variant is the opt-in non-quantized A/B reference: it runs the
-whole backbone (ViT / LLM / VL self-attn) and the action head (state/action
-encoders, the 32-layer DiT, output proj, decoder) through FlashRT kernels in
-FP16, with no PyTorch matmul on the serving feature path.
+The RTX reference variant is the opt-in non-default A/B path:
+
+- on `rtx_sm120`, it is the existing `GrootN17TorchFrontendRtxFP16`
+- on `rtx_sm89`, it is the dedicated
+  `GrootN17TorchFrontendRtxSm89FP16`
+
+Both paths replace the default FP8 route selected by `load_model()`, but the
+exact kernel/dtype mix remains hardware-specific.
 
 N1.7 uses the aux-driven `set_prompt(aux=...)` / `infer(state, initial_noise=...)`
 contract (not the `predict(images=...)` quickstart flow), so construct the
-frontend directly:
+frontend directly when you want the explicit class. Example for `rtx_sm120`:
 
 ```python
 from flash_rt.frontends.torch.groot_n17_rtx_fp16 import (
@@ -417,14 +421,22 @@ fe.set_prompt(aux=aux)                       # aux from the N1.7 preprocessing p
 actions = fe.infer(state_normalized, initial_noise=noise)
 ```
 
+On `rtx_sm89`, import and construct
+`flash_rt.frontends.torch.groot_n17_rtx_sm89_fp16.GrootN17TorchFrontendRtxSm89FP16`
+instead.
+
 `load_model(config="groot_n17", hardware="rtx_sm120", use_fp16=True,
-use_fp8=False)` returns this frontend. Reference on RTX 5090: FP16-vs-bf16
+use_fp8=False)` returns this frontend; on `hardware="rtx_sm89"` the same API
+returns the dedicated `GrootN17TorchFrontendRtxSm89FP16` reference frontend.
+Reference on RTX 5090: FP16-vs-bf16
 action cosine ≈ 0.99999, combined E2E-vs-reference cosine ≈ 0.9999; infer
 latency ≈ 10.7 ms (≈ the bf16 path — the DiT GEMMs are small, so FP16 and bf16
 throughput match).
 
-The underlying FP16 kernels are SM80-family friendly; FlashRT exposes the
-FP16 route for Pi0.5, GROOT N1.6, and GROOT N1.7 on the RTX frontends.
+The underlying FP16 kernels are SM80-family friendly, but the public support
+matrix is narrower: FlashRT exposes the FP16 RTX route for Pi0.5 on
+`rtx_sm120` / `rtx_sm89`, for GROOT N1.6 on `rtx_sm120`, and for GROOT N1.7
+on `rtx_sm120` / `rtx_sm89`.
 
 ### Thor non-FP8 reference paths (GROOT N1.6 / N1.7)
 
@@ -532,13 +544,22 @@ embeddings, visual masks, M-RoPE tables, pixel features, and `grid_thw`.
 `infer()` expects normalized state and returns normalized actions;
 denormalization remains the caller's responsibility for this N1.7 path.
 
-On RTX the default path is **FP8**: the backbone GEMMs (ViT / LLM / VL
-self-attn) run FP8 via the SM120-safe descale pattern (`fp8_descale_fp16` plus
-separate bias/GELU — the fused cuBLAS FP8 epilogue is unsupported on sm_120),
-and the bf16 DiT runs in `infer`. The entire forward runs through FlashRT
-kernels: backbone attention uses the vendored FA2 / FMHA kernels in
-`set_prompt`, and DiT self/cross attention uses FlashRT's vendored FA2 slots
-during `infer`. No PyTorch matmul runs on the serving feature path.
+On RTX the default path is **FP8**, but the hardware split is explicit:
+
+- `rtx_sm120` uses the shared RTX frontend / pipeline with the established
+  `fp8_descale_fp16` backbone path
+- `rtx_sm89` uses a dedicated RTX SM89 frontend / pipeline with runtime
+  weights stored as `[N, K]` and GEMMs dispatched through `fp8_nt_dev`
+
+In both cases the VLM backbone feature path runs through FlashRT kernels:
+backbone attention uses the vendored FA2 / FMHA kernels in `set_prompt`, and
+DiT self/cross attention uses FlashRT's vendored FA2 slots during `infer`.
+The action-head mix is not identical across the two RTX families:
+
+- `rtx_sm120` keeps the established RTX semantics documented by its frontend
+- `rtx_sm89` keeps FlashRT kernel execution for the SM89 FP8 backbone and
+  quantized DiT hot-path GEMMs, while some action-head-adjacent helpers stay
+  in the inherited bf16/fp16 route
 
 Activation scales follow the FlashRT calibration convention
 ([Calibration](#calibration)): weight scales are baked at load, activation
@@ -548,9 +569,11 @@ the cache and runs FP8 kernels only; the torch reference shadow runs solely on
 a cold cache miss (or `recalibrate=True`) to extract activation amax — never as
 the inference backbone. `calibrate(aux_list)` refines scales across N samples.
 
-Supported hardware is `rtx_sm120` (RTX 5090-class Blackwell). SM89 is
-registered through the same path; validate benchmark/accuracy on the target
-card.
+Supported hardware is `rtx_sm120` and `rtx_sm89`. `rtx_sm120` remains the
+validated Blackwell reference path in the public docs; `rtx_sm89` is validated
+locally on RTX 4090 using the same aux/reference-fixture methodology and
+should still be benchmarked on the target card before making hardware-specific
+claims.
 
 Build FA2 with at least the N1.7 head dimensions and dtypes:
 

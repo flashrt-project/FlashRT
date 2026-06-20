@@ -259,11 +259,11 @@ def test_groot_n17_rtx_sm120_is_registered():
     assert cls.__name__ == "GrootN17TorchFrontendRtx"
 
 
-def test_groot_n17_sm89_is_not_registered_without_validation():
+def test_groot_n17_rtx_sm89_is_registered():
     from flash_rt.hardware import resolve_pipeline_class
 
-    with pytest.raises(RuntimeError, match="rtx_sm120"):
-        resolve_pipeline_class("groot_n17", "torch", "rtx_sm89")
+    cls = resolve_pipeline_class("groot_n17", "torch", "rtx_sm89")
+    assert cls.__name__ == "GrootN17TorchFrontendRtxSm89"
 
 
 def test_wan22_ti2v_5b_rtx_sm120_is_registered():
@@ -336,7 +336,73 @@ def test_wan22_infer_exposes_teacache_parameters():
 def test_load_model_accepts_groot_n17_config():
     from flash_rt.api import load_model
 
-    class GrootN17Frontend:
+    class GrootN17RtxFp8Frontend:
+        seen = []
+
+        def __init__(self, checkpoint, num_views=2, embodiment_tag=None):
+            type(self).seen.append({
+                "checkpoint": checkpoint,
+                "num_views": num_views,
+                "embodiment_tag": embodiment_tag,
+            })
+
+        def set_prompt(self, *args, **kwargs):
+            return None
+
+        def infer(self, *args, **kwargs):
+            return None
+
+    GrootN17RtxFp8Frontend.seen = []
+    with patch("flash_rt.hardware.resolve_pipeline_class",
+               return_value=GrootN17RtxFp8Frontend) as resolve:
+        model_default = load_model(
+            "unused-checkpoint-default",
+            config="groot_n17",
+            framework="torch",
+            hardware="rtx_sm89",
+            num_views=2,
+            embodiment_tag="oxe_droid_relative_eef_relative_joint",
+        )
+        model_use_fp8 = load_model(
+            "unused-checkpoint-explicit-fp8",
+            config="groot_n17",
+            framework="torch",
+            hardware="rtx_sm89",
+            num_views=2,
+            embodiment_tag="oxe_droid_relative_eef_relative_joint",
+            use_fp8=True,
+        )
+
+    assert isinstance(model_default._pipe, GrootN17RtxFp8Frontend)
+    assert isinstance(model_use_fp8._pipe, GrootN17RtxFp8Frontend)
+    assert [call.args for call in resolve.call_args_list] == [
+        ("groot_n17", "torch", "rtx_sm89"),
+        ("groot_n17", "torch", "rtx_sm89"),
+    ]
+    assert GrootN17RtxFp8Frontend.seen == [
+        {
+            "checkpoint": "unused-checkpoint-default",
+            "num_views": 2,
+            "embodiment_tag": "oxe_droid_relative_eef_relative_joint",
+        },
+        {
+            "checkpoint": "unused-checkpoint-explicit-fp8",
+            "num_views": 2,
+            "embodiment_tag": "oxe_droid_relative_eef_relative_joint",
+        },
+    ]
+
+
+def test_load_model_routes_groot_n17_rtx_sm120_default_to_fp8_frontend():
+    from flash_rt.api import load_model
+
+    class ResolvedFrontend:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError(
+                "load_model() should rewrite default groot_n17 RTX SM120 "
+                "requests to the FP8 production frontend")
+
+    class GrootN17RtxFp8Frontend:
         seen = None
 
         def __init__(self, checkpoint, num_views=2, embodiment_tag=None):
@@ -353,9 +419,12 @@ def test_load_model_accepts_groot_n17_config():
             return None
 
     with patch("flash_rt.hardware.resolve_pipeline_class",
-              return_value=GrootN17Frontend):
+              return_value=ResolvedFrontend), \
+            patch("flash_rt.frontends.torch.groot_n17_rtx_fp8."
+                  "GrootN17TorchFrontendRtxFP8",
+                  GrootN17RtxFp8Frontend):
         model = load_model(
-            "unused-checkpoint",
+            "unused-checkpoint-sm120-fp8",
             config="groot_n17",
             framework="torch",
             hardware="rtx_sm120",
@@ -363,12 +432,207 @@ def test_load_model_accepts_groot_n17_config():
             embodiment_tag="oxe_droid_relative_eef_relative_joint",
         )
 
-    assert isinstance(model._pipe, GrootN17Frontend)
-    assert GrootN17Frontend.seen == {
-        "checkpoint": "unused-checkpoint",
+    assert isinstance(model._pipe, GrootN17RtxFp8Frontend)
+    assert GrootN17RtxFp8Frontend.seen == {
+        "checkpoint": "unused-checkpoint-sm120-fp8",
         "num_views": 2,
         "embodiment_tag": "oxe_droid_relative_eef_relative_joint",
     }
+
+
+def test_load_model_routes_groot_n17_rtx_fp16_reference_path():
+    from flash_rt.api import load_model
+
+    class ResolvedFrontend:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError(
+                "load_model() should rewrite groot_n17 RTX SM89 FP16 "
+                "requests to the FP16 reference frontend")
+
+    class GrootN17RtxFp16Frontend:
+        seen = None
+
+        def __init__(self, checkpoint, num_views=2, embodiment_tag=None):
+            type(self).seen = {
+                "checkpoint": checkpoint,
+                "num_views": num_views,
+                "embodiment_tag": embodiment_tag,
+            }
+
+        def set_prompt(self, *args, **kwargs):
+            return None
+
+        def infer(self, *args, **kwargs):
+            return None
+
+    with patch("flash_rt.hardware.resolve_pipeline_class",
+              return_value=ResolvedFrontend), \
+            patch("flash_rt.frontends.torch.groot_n17_rtx_sm89_fp16."
+                  "GrootN17TorchFrontendRtxSm89FP16",
+                  GrootN17RtxFp16Frontend):
+        model = load_model(
+            "unused-checkpoint-fp16",
+            config="groot_n17",
+            framework="torch",
+            hardware="rtx_sm89",
+            num_views=2,
+            embodiment_tag="oxe_droid_relative_eef_relative_joint",
+            use_fp16=True,
+            use_fp8=False,
+        )
+
+    assert isinstance(model._pipe, GrootN17RtxFp16Frontend)
+    assert GrootN17RtxFp16Frontend.seen == {
+        "checkpoint": "unused-checkpoint-fp16",
+        "num_views": 2,
+        "embodiment_tag": "oxe_droid_relative_eef_relative_joint",
+    }
+
+
+def test_groot_n17_rtx_fp8_layout_selection():
+    from flash_rt.frontends.torch.groot_n17_rtx_sm89 import (
+        GrootN17TorchFrontendRtxSm89,
+    )
+
+    assert GrootN17TorchFrontendRtxSm89.fp8_layout == "nk"
+
+
+def test_groot_n17_rtx_sm89_runtime_weights_are_materialized_in_nk_layout():
+    from flash_rt.frontends.torch.groot_n17_rtx_sm89 import (
+        _GrootN17FP8BackboneMixin,
+    )
+
+    class FakeMatrix:
+        def __init__(self, rows, cols, label):
+            self.shape = (rows, cols)
+            self.label = label
+
+        def __getitem__(self, key):
+            row_sel, col_sel = key
+            if row_sel != slice(None):
+                raise AssertionError("test fake only supports full-row slices")
+            start = 0 if col_sel.start is None else col_sel.start
+            stop = self.shape[1] if col_sel.stop is None else col_sel.stop
+            return FakeMatrix(self.shape[0], stop - start,
+                              f"{self.label}[{start}:{stop}]")
+
+        def t(self):
+            return FakeMatrix(self.shape[1], self.shape[0],
+                              f"{self.label}.t")
+
+        def contiguous(self):
+            return FakeMatrix(self.shape[0], self.shape[1],
+                              f"{self.label}.contiguous")
+
+    frontend = object.__new__(_GrootN17FP8BackboneMixin)
+    frontend._vit_qkv_w = [FakeMatrix(1024, 3072, f"vit_qkv_{i}")
+                           for i in range(24)]
+    frontend._vit_o_w = [FakeMatrix(1024, 1024, f"vit_o_{i}")
+                         for i in range(24)]
+    frontend._vit_fc1_w = [FakeMatrix(1024, 4096, f"vit_fc1_{i}")
+                           for i in range(24)]
+    frontend._vit_fc2_w = [FakeMatrix(4096, 1024, f"vit_fc2_{i}")
+                           for i in range(24)]
+
+    for j in range(3):
+        setattr(frontend, f"_dsm{j}_fc1_w", FakeMatrix(4096, 4096, f"dsm{j}_fc1"))
+        setattr(frontend, f"_dsm{j}_fc2_w", FakeMatrix(4096, 2048, f"dsm{j}_fc2"))
+
+    frontend._llm_qkv_w = [FakeMatrix(2048, 4096, f"llm_qkv_{i}")
+                           for i in range(16)]
+    frontend._llm_o_w = [FakeMatrix(2048, 2048, f"llm_o_{i}")
+                         for i in range(16)]
+    frontend._llm_gate_w = [FakeMatrix(2048, 6144, f"llm_gate_{i}")
+                            for i in range(16)]
+    frontend._llm_up_w = [FakeMatrix(2048, 6144, f"llm_up_{i}")
+                          for i in range(16)]
+    frontend._llm_down_w = [FakeMatrix(6144, 2048, f"llm_down_{i}")
+                            for i in range(16)]
+
+    frontend._vlsa_q_w = [FakeMatrix(2048, 2048, f"vlsa_q_{i}")
+                          for i in range(4)]
+    frontend._vlsa_k_w = [FakeMatrix(2048, 2048, f"vlsa_k_{i}")
+                          for i in range(4)]
+    frontend._vlsa_v_w = [FakeMatrix(2048, 2048, f"vlsa_v_{i}")
+                          for i in range(4)]
+    frontend._vlsa_o_w = [FakeMatrix(2048, 2048, f"vlsa_o_{i}")
+                          for i in range(4)]
+    frontend._vlsa_fc1_w = [FakeMatrix(2048, 8192, f"vlsa_fc1_{i}")
+                            for i in range(4)]
+    frontend._vlsa_fc2_w = [FakeMatrix(8192, 2048, f"vlsa_fc2_{i}")
+                            for i in range(4)]
+
+    frontend._prepare_fp8_runtime_weights()
+
+    runtime = frontend._rtx_fp8_runtime
+    assert runtime["vit_q"][0].shape == (1024, 1024)
+    assert runtime["vit_fc1"][0].shape == (4096, 1024)
+    assert runtime["dsm_fc2"][0].shape == (2048, 4096)
+    assert runtime["llm_q"][0].shape == (2048, 2048)
+    assert runtime["llm_gate"][0].shape == (6144, 2048)
+    assert runtime["vlsa_fc2"][0].shape == (2048, 8192)
+    assert runtime["vit_q"][0].label == "vit_qkv_0[0:1024].t.contiguous"
+    assert runtime["llm_down"][0].label == "llm_down_0.t.contiguous"
+
+
+def test_groot_n17_rtx_sm89_fp8_helper_dispatches_nt_then_cast():
+    from flash_rt.models.groot_n17 import pipeline_rtx_sm89
+
+    calls = []
+
+    class Gemm:
+        def fp8_nt_dev(self, *args):
+            calls.append(("fp8_nt_dev", args))
+
+    class Fvk:
+        def cast_bf16_to_fp16(self, *args):
+            calls.append(("cast_bf16_to_fp16", args))
+
+    pipeline_rtx_sm89._fp8_matmul_fp16(
+        Gemm(),
+        Fvk(),
+        act_fp8_ptr=11,
+        weight_ptr=12,
+        out_fp16_ptr=13,
+        bf16_tmp_ptr=14,
+        M=15,
+        N=16,
+        K=17,
+        act_scale_ptr=18,
+        weight_scale_ptr=19,
+        stream=20,
+    )
+
+    assert calls == [
+        ("fp8_nt_dev", (11, 12, 14, 15, 16, 17, 18, 19, 20)),
+        ("cast_bf16_to_fp16", (14, 13, 15 * 16, 20)),
+    ]
+
+
+def test_groot_n17_rtx_sm89_rejects_use_fp8_false_without_fp16():
+    from flash_rt.api import load_model
+
+    with pytest.raises(ValueError, match="defaults to FP8"):
+        load_model(
+            "unused-checkpoint",
+            config="groot_n17",
+            framework="torch",
+            hardware="rtx_sm89",
+            use_fp8=False,
+        )
+
+
+def test_groot_n17_rtx_sm120_rejects_use_fp8_false_without_fp16():
+    from flash_rt.api import load_model
+
+    with pytest.raises(ValueError, match="defaults to FP8"):
+        load_model(
+            "unused-checkpoint",
+            config="groot_n17",
+            framework="torch",
+            hardware="rtx_sm120",
+            use_fp8=False,
+        )
 
 
 def test_pi05_rtx_fp8_layout_selection():
