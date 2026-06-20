@@ -53,12 +53,26 @@ def _mma(x2d, wp_ptr, wsf_ptr, alpha, n, fvk, device):
     return _mma_preq(xp, xsf, wp_ptr, wsf_ptr, alpha, n, k, fvk, device)
 
 
+def _bf16_mv(x1k, w, fvk, device):
+    """M=1 BF16 GEMV x(1,K) @ w(N,K).T -> (1,N) via the hand-tuned kernel.
+
+    cos 0.999999 vs torch fp32 matmul; reads the bf16 weight directly (no
+    fp32 up-cast / temporary), so it is both faster and lighter on HBM.
+    """
+    n, k = w.shape
+    xc = x1k.contiguous()
+    y = torch.empty(1, n, dtype=torch.bfloat16, device=device)
+    fvk.bf16_matvec_qwen36_bf16(xc.data_ptr(), w.data_ptr(), y.data_ptr(),
+                                n, k, 0)
+    return y
+
+
 def _proj_mma(x2d, ld, base, n, fvk, device):
-    """Decode projection dispatch: NVFP4 -> mma GEMV, else BF16 cuBLAS."""
+    """Decode projection dispatch: NVFP4 -> mma GEMV, else BF16 mv kernel."""
     if ld.get(base + '_packed') is not None:
         return _mma(x2d, ld[base + '_packed'], ld[base + '_sf'],
                     ld[base + '_alpha'], n, fvk, device)
-    return (x2d.float() @ ld[base + '_w_t'].float().T).to(torch.bfloat16)
+    return _bf16_mv(x2d, ld[base + '_w_t'], fvk, device)
 
 
 class Nexn2DecodeState:
@@ -123,10 +137,10 @@ def _decode_gdn(h, ld, state, lin_rank, fvk, device):
     nw = ld['gdn_norm_w_t']
 
     h2 = h.reshape(1, HID)
-    mixed = (h2.float() @ Wqkv.float().T).to(torch.bfloat16).contiguous()
-    z = (h2.float() @ Wz.float().T).to(torch.bfloat16).reshape(NV, HV).contiguous()
-    a = (h2.float() @ Wa.float().T).to(torch.bfloat16).contiguous()
-    b = (h2.float() @ Wb.float().T).to(torch.bfloat16).contiguous()
+    mixed = _bf16_mv(h2, Wqkv, fvk, device).contiguous()
+    z = _bf16_mv(h2, Wz, fvk, device).reshape(NV, HV).contiguous()
+    a = _bf16_mv(h2, Wa, fvk, device).contiguous()
+    b = _bf16_mv(h2, Wb, fvk, device).contiguous()
 
     # causal conv1d state-update (no bias) + silu.
     conv_out = torch.empty(1, CONV, dtype=torch.bfloat16, device=device)
@@ -212,7 +226,7 @@ def _moe_layer_decode(h, ld, fvk, device):
     """M=1 MoE: the single token's top-8 experts share the gate_up activation,
     so quantise it once and reuse (vs the prefill path's per-expert quant)."""
     x = h.reshape(1, HID)
-    logit = F.softmax(x.float() @ ld['router_w_t'].float().T, -1)
+    logit = F.softmax(_bf16_mv(x, ld['router_w_t'], fvk, device).float(), -1)
     tw, ti = torch.topk(logit, TOPK, -1)
     tw = (tw / tw.sum(-1, keepdim=True))[0].tolist()    # one host sync
     ti = ti[0].tolist()
