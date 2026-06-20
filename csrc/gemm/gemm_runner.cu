@@ -84,6 +84,27 @@ GemmRunner::CachedGemm& GemmRunner::get_or_create_cached(GemmType type, int M, i
         CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(entry.B_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
         CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.D_desc, CUDA_R_16BF, M, N, N));
         CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(entry.D_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
+    } else if (type == FP8_NT_BIAS_BF16 || type == FP8_NT_BIAS_FP16 ||
+               type == FP8_NT_GELU_BIAS_FP16) {
+        CUBLAS_CHECK(cublasLtMatmulDescCreate(&entry.matmul_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_T, sizeof(op_T)));
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_N, sizeof(op_N)));
+        cublasLtEpilogue_t epi =
+            (type == FP8_NT_GELU_BIAS_FP16) ? CUBLASLT_EPILOGUE_GELU_BIAS
+                                             : CUBLASLT_EPILOGUE_BIAS;
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+            entry.matmul_desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epi, sizeof(epi)));
+        cudaDataType_t bias_type =
+            (type == FP8_NT_BIAS_BF16) ? CUDA_R_16BF : CUDA_R_16F;
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+            entry.matmul_desc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
+            &bias_type, sizeof(bias_type)));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.A_desc, CUDA_R_8F_E4M3, K, N, K));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.B_desc, CUDA_R_8F_E4M3, K, M, K));
+        cudaDataType_t out_type =
+            (type == FP8_NT_BIAS_FP16 || type == FP8_NT_GELU_BIAS_FP16) ? CUDA_R_16F
+                                                                        : CUDA_R_16BF;
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.D_desc, out_type, N, M, N));
     } else if (type == FP16_NN) {
         // FP16 no-transpose: D(M,N) = A(M,K) @ B(K,N)
         CUBLAS_CHECK(cublasLtMatmulDescCreate(&entry.matmul_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
@@ -1077,6 +1098,63 @@ void GemmRunner::fp8_nt_dev(void* A, void* B, void* D,
     float alpha = 1.0f, beta = 0.0f;
     CUBLAS_CHECK(cublasLtMatmul(handle_, entry.matmul_desc,
         &alpha, A, entry.A_desc, B, entry.B_desc,
+        &beta, D, entry.D_desc, D, entry.D_desc,
+        &entry.algo, workspace_, workspace_size_, stream));
+}
+
+void GemmRunner::fp8_nt_bias_bf16(void* A, void* B, void* D, void* bias,
+                                   int M, int N, int K,
+                                   float* d_scale_a, float* d_scale_b,
+                                   cudaStream_t stream) {
+    auto& entry = get_or_create_cached(FP8_NT_BIAS_BF16, M, N, K);
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc,
+        CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &d_scale_b, sizeof(d_scale_b)));
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc,
+        CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &d_scale_a, sizeof(d_scale_a)));
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc,
+        CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+
+    float alpha = 1.0f, beta = 0.0f;
+    CUBLAS_CHECK(cublasLtMatmul(handle_, entry.matmul_desc,
+        &alpha, B, entry.A_desc, A, entry.B_desc,
+        &beta, D, entry.D_desc, D, entry.D_desc,
+        &entry.algo, workspace_, workspace_size_, stream));
+}
+
+void GemmRunner::fp8_nt_bias_fp16(void* A, void* B, void* D, void* bias,
+                                   int M, int N, int K,
+                                   float* d_scale_a, float* d_scale_b,
+                                   cudaStream_t stream) {
+    auto& entry = get_or_create_cached(FP8_NT_BIAS_FP16, M, N, K);
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc,
+        CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &d_scale_b, sizeof(d_scale_b)));
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc,
+        CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &d_scale_a, sizeof(d_scale_a)));
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc,
+        CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+
+    float alpha = 1.0f, beta = 0.0f;
+    CUBLAS_CHECK(cublasLtMatmul(handle_, entry.matmul_desc,
+        &alpha, B, entry.A_desc, A, entry.B_desc,
+        &beta, D, entry.D_desc, D, entry.D_desc,
+        &entry.algo, workspace_, workspace_size_, stream));
+}
+
+void GemmRunner::fp8_nt_gelu_bias_fp16(void* A, void* B, void* D, void* bias,
+                                        int M, int N, int K,
+                                        float* d_scale_a, float* d_scale_b,
+                                        cudaStream_t stream) {
+    auto& entry = get_or_create_cached(FP8_NT_GELU_BIAS_FP16, M, N, K);
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc,
+        CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &d_scale_b, sizeof(d_scale_b)));
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc,
+        CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &d_scale_a, sizeof(d_scale_a)));
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc,
+        CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+
+    float alpha = 1.0f, beta = 0.0f;
+    CUBLAS_CHECK(cublasLtMatmul(handle_, entry.matmul_desc,
+        &alpha, B, entry.A_desc, A, entry.B_desc,
         &beta, D, entry.D_desc, D, entry.D_desc,
         &entry.algo, workspace_, workspace_size_, stream));
 }

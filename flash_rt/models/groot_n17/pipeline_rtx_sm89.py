@@ -13,6 +13,9 @@ Stages mirror ``pipeline_thor.py``: ``qwen3vl_vit_forward`` →
 from __future__ import annotations
 
 
+_FP8_NT_EPILOGUE_DISABLED: set[tuple[str, int, int, int]] = set()
+
+
 def _fp8_matmul_fp16(
     gemm,
     fvk,
@@ -26,8 +29,48 @@ def _fp8_matmul_fp16(
     K: int,
     act_scale_ptr: int,
     weight_scale_ptr: int,
+    bias_ptr: int = 0,
+    gelu: bool = False,
     stream: int,
 ) -> None:
+    if bias_ptr:
+        op = "gelu_bias" if gelu else "bias"
+        key = (op, int(M), int(N), int(K))
+        if key not in _FP8_NT_EPILOGUE_DISABLED:
+            try:
+                if gelu:
+                    gemm.fp8_nt_gelu_bias_fp16(
+                        int(act_fp8_ptr),
+                        int(weight_ptr),
+                        int(out_fp16_ptr),
+                        int(bias_ptr),
+                        int(M),
+                        int(N),
+                        int(K),
+                        int(act_scale_ptr),
+                        int(weight_scale_ptr),
+                        int(stream),
+                    )
+                else:
+                    gemm.fp8_nt_bias_fp16(
+                        int(act_fp8_ptr),
+                        int(weight_ptr),
+                        int(out_fp16_ptr),
+                        int(bias_ptr),
+                        int(M),
+                        int(N),
+                        int(K),
+                        int(act_scale_ptr),
+                        int(weight_scale_ptr),
+                        int(stream),
+                    )
+                return
+            except (AttributeError, RuntimeError) as exc:
+                if isinstance(exc, AttributeError) or "code=15" in str(exc):
+                    _FP8_NT_EPILOGUE_DISABLED.add(key)
+                else:
+                    raise
+
     gemm.fp8_nt_dev(
         int(act_fp8_ptr),
         int(weight_ptr),
@@ -45,6 +88,10 @@ def _fp8_matmul_fp16(
         int(M) * int(N),
         int(stream),
     )
+    if bias_ptr:
+        fvk.add_bias_fp16(int(out_fp16_ptr), int(bias_ptr), int(M), int(N), int(stream))
+        if gelu:
+            fvk.gelu_inplace_fp16(int(out_fp16_ptr), int(M) * int(N), int(stream))
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -134,25 +181,25 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
             act_fp8_ptr=xn_fp8_ptr, weight_ptr=int(weights["q_w"][li]), out_fp16_ptr=Q_ptr,
             bf16_tmp_ptr=bf16_tmp_ptr, M=S, N=D, K=D,
             act_scale_ptr=a_qkv, weight_scale_ptr=int(weights["q_ws"][li]),
+            bias_ptr=int(weights["q_b"][li]),
             stream=int(stream),
         )
-        fvk.add_bias_fp16(Q_ptr, int(weights["q_b"][li]), S, D, int(stream))
         _fp8_matmul_fp16(
             gemm, fvk,
             act_fp8_ptr=xn_fp8_ptr, weight_ptr=int(weights["k_w"][li]), out_fp16_ptr=K_ptr,
             bf16_tmp_ptr=bf16_tmp_ptr, M=S, N=D, K=D,
             act_scale_ptr=a_qkv, weight_scale_ptr=int(weights["k_ws"][li]),
+            bias_ptr=int(weights["k_b"][li]),
             stream=int(stream),
         )
-        fvk.add_bias_fp16(K_ptr, int(weights["k_b"][li]), S, D, int(stream))
         _fp8_matmul_fp16(
             gemm, fvk,
             act_fp8_ptr=xn_fp8_ptr, weight_ptr=int(weights["v_w"][li]), out_fp16_ptr=V_ptr,
             bf16_tmp_ptr=bf16_tmp_ptr, M=S, N=D, K=D,
             act_scale_ptr=a_qkv, weight_scale_ptr=int(weights["v_ws"][li]),
+            bias_ptr=int(weights["v_b"][li]),
             stream=int(stream),
         )
-        fvk.add_bias_fp16(V_ptr, int(weights["v_b"][li]), S, D, int(stream))
 
         # ── Split-half RoPE on Q and K ──
         fvk.rope_rotate_half_fp16(Q_ptr, cos_ptr, sin_ptr, S, NH, HD, int(stream))
@@ -168,9 +215,9 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
             act_fp8_ptr=xn_fp8_ptr, weight_ptr=int(weights["o_w"][li]), out_fp16_ptr=o_proj_out,
             bf16_tmp_ptr=bf16_tmp_ptr, M=S, N=D, K=D,
             act_scale_ptr=a_o, weight_scale_ptr=int(weights["o_ws"][li]),
+            bias_ptr=int(weights["o_b"][li]),
             stream=int(stream),
         )
-        fvk.add_bias_fp16(o_proj_out, int(weights["o_b"][li]), S, D, int(stream))
         fvk.residual_add_fp16(h_ptr, o_proj_out, S * D, int(stream))
 
         # ── Pre-FF LayerNorm ──
@@ -185,19 +232,18 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
             act_fp8_ptr=xn_fp8_ptr, weight_ptr=int(weights["fc1_w"][li]), out_fp16_ptr=fc1_out_ptr,
             bf16_tmp_ptr=bf16_ff_ptr, M=S, N=FF, K=D,
             act_scale_ptr=a_fc1, weight_scale_ptr=int(weights["fc1_ws"][li]),
+            bias_ptr=int(weights["fc1_b"][li]), gelu=True,
             stream=int(stream),
         )
-        fvk.add_bias_fp16(fc1_out_ptr, int(weights["fc1_b"][li]), S, FF, int(stream))
-        fvk.gelu_inplace_fp16(fc1_out_ptr, S * FF, int(stream))
         fvk.quantize_fp8_static_fp16(fc1_out_ptr, fc1_fp8_ptr, a_fc2, S * FF, int(stream))
         _fp8_matmul_fp16(
             gemm, fvk,
             act_fp8_ptr=fc1_fp8_ptr, weight_ptr=int(weights["fc2_w"][li]), out_fp16_ptr=o_proj_out,
             bf16_tmp_ptr=bf16_tmp_ptr, M=S, N=D, K=FF,
             act_scale_ptr=a_fc2, weight_scale_ptr=int(weights["fc2_ws"][li]),
+            bias_ptr=int(weights["fc2_b"][li]),
             stream=int(stream),
         )
-        fvk.add_bias_fp16(o_proj_out, int(weights["fc2_b"][li]), S, D, int(stream))
         fvk.residual_add_fp16(h_ptr, o_proj_out, S * D, int(stream))
 
         # ── DeepStack tap callback ──
@@ -248,10 +294,9 @@ def deepstack_merge_forward(gemm, fvk, bufs, weights, dims,
             act_fp8_ptr=fp8_scratch, weight_ptr=int(weights["fc1_w"][j]), out_fp16_ptr=fc1_out,
             bf16_tmp_ptr=bf16_ff_ptr, M=Nout, N=Dmid, K=Dmid,
             act_scale_ptr=a_fc1, weight_scale_ptr=int(weights["fc1_ws"][j]),
+            bias_ptr=int(weights["fc1_b"][j]), gelu=True,
             stream=int(stream),
         )
-        fvk.add_bias_fp16(fc1_out, int(weights["fc1_b"][j]), Nout, Dmid, int(stream))
-        fvk.gelu_inplace_fp16(fc1_out, Nout * Dmid, int(stream))
 
         fvk.quantize_fp8_static_fp16(fc1_out, fp8_scratch, a_fc2, Nout * Dmid, int(stream))
         _fp8_matmul_fp16(
@@ -259,9 +304,9 @@ def deepstack_merge_forward(gemm, fvk, bufs, weights, dims,
             act_fp8_ptr=fp8_scratch, weight_ptr=int(weights["fc2_w"][j]), out_fp16_ptr=out_ptr,
             bf16_tmp_ptr=bf16_tmp_ptr, M=Nout, N=Dout, K=Dmid,
             act_scale_ptr=a_fc2, weight_scale_ptr=int(weights["fc2_ws"][j]),
+            bias_ptr=int(weights["fc2_b"][j]),
             stream=int(stream),
         )
-        fvk.add_bias_fp16(out_ptr, int(weights["fc2_b"][j]), Nout, Dout, int(stream))
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -480,25 +525,25 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
             act_fp8_ptr=xn_fp8_ptr, weight_ptr=int(weights["q_w"][li]), out_fp16_ptr=Q_ptr,
             bf16_tmp_ptr=bf16_tmp_ptr, M=T, N=D, K=D,
             act_scale_ptr=a_qkv, weight_scale_ptr=int(weights["q_ws"][li]),
+            bias_ptr=int(weights["q_b"][li]),
             stream=int(stream),
         )
-        fvk.add_bias_fp16(Q_ptr, int(weights["q_b"][li]), T, D, int(stream))
         _fp8_matmul_fp16(
             gemm, fvk,
             act_fp8_ptr=xn_fp8_ptr, weight_ptr=int(weights["k_w"][li]), out_fp16_ptr=K_ptr,
             bf16_tmp_ptr=bf16_tmp_ptr, M=T, N=D, K=D,
             act_scale_ptr=a_qkv, weight_scale_ptr=int(weights["k_ws"][li]),
+            bias_ptr=int(weights["k_b"][li]),
             stream=int(stream),
         )
-        fvk.add_bias_fp16(K_ptr, int(weights["k_b"][li]), T, D, int(stream))
         _fp8_matmul_fp16(
             gemm, fvk,
             act_fp8_ptr=xn_fp8_ptr, weight_ptr=int(weights["v_w"][li]), out_fp16_ptr=V_ptr,
             bf16_tmp_ptr=bf16_tmp_ptr, M=T, N=D, K=D,
             act_scale_ptr=a_qkv, weight_scale_ptr=int(weights["v_ws"][li]),
+            bias_ptr=int(weights["v_b"][li]),
             stream=int(stream),
         )
-        fvk.add_bias_fp16(V_ptr, int(weights["v_b"][li]), T, D, int(stream))
 
         # ── MHA ──
         attn.run("vl_self_attn", li, q_seq=T, kv_seq=T, stream=int(stream))
@@ -510,9 +555,9 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
             act_fp8_ptr=xn_fp8_ptr, weight_ptr=int(weights["o_w"][li]), out_fp16_ptr=o_proj_out,
             bf16_tmp_ptr=bf16_tmp_ptr, M=T, N=D, K=D,
             act_scale_ptr=a_o, weight_scale_ptr=int(weights["o_ws"][li]),
+            bias_ptr=int(weights["o_b"][li]),
             stream=int(stream),
         )
-        fvk.add_bias_fp16(o_proj_out, int(weights["o_b"][li]), T, D, int(stream))
         fvk.residual_add_fp16(h_ptr, o_proj_out, T * D, int(stream))
 
         # ── Pre-FF LayerNorm + FF (GELU) ──
@@ -525,17 +570,16 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
             act_fp8_ptr=xn_fp8_ptr, weight_ptr=int(weights["fc1_w"][li]), out_fp16_ptr=fc1_out_ptr,
             bf16_tmp_ptr=bf16_ff_ptr, M=T, N=FF, K=D,
             act_scale_ptr=a_fc1, weight_scale_ptr=int(weights["fc1_ws"][li]),
+            bias_ptr=int(weights["fc1_b"][li]), gelu=True,
             stream=int(stream),
         )
-        fvk.add_bias_fp16(fc1_out_ptr, int(weights["fc1_b"][li]), T, FF, int(stream))
-        fvk.gelu_inplace_fp16(fc1_out_ptr, T * FF, int(stream))
         fvk.quantize_fp8_static_fp16(fc1_out_ptr, fc1_fp8_ptr, a_fc2, T * FF, int(stream))
         _fp8_matmul_fp16(
             gemm, fvk,
             act_fp8_ptr=fc1_fp8_ptr, weight_ptr=int(weights["fc2_w"][li]), out_fp16_ptr=o_proj_out,
             bf16_tmp_ptr=bf16_tmp_ptr, M=T, N=D, K=FF,
             act_scale_ptr=a_fc2, weight_scale_ptr=int(weights["fc2_ws"][li]),
+            bias_ptr=int(weights["fc2_b"][li]),
             stream=int(stream),
         )
-        fvk.add_bias_fp16(o_proj_out, int(weights["fc2_b"][li]), T, D, int(stream))
         fvk.residual_add_fp16(h_ptr, o_proj_out, T * D, int(stream))

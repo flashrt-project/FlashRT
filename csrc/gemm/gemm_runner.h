@@ -129,6 +129,23 @@ public:
                     float* d_scale_a, float* d_scale_b,
                     cudaStream_t stream = 0);
 
+    // SM89 candidate: FP8 transpose-B path with cuBLASLt epilogues.
+    // B is stored as (N,K) row-major, matching fp8_nt_dev.
+    void fp8_nt_bias_bf16(void* A, void* B, void* D, void* bias,
+                          int M, int N, int K,
+                          float* d_scale_a, float* d_scale_b,
+                          cudaStream_t stream = 0);
+
+    void fp8_nt_bias_fp16(void* A, void* B, void* D, void* bias,
+                          int M, int N, int K,
+                          float* d_scale_a, float* d_scale_b,
+                          cudaStream_t stream = 0);
+
+    void fp8_nt_gelu_bias_fp16(void* A, void* B, void* D, void* bias,
+                               int M, int N, int K,
+                               float* d_scale_a, float* d_scale_b,
+                               cudaStream_t stream = 0);
+
     // FP8 with host alpha + BIAS epilogue: D = alpha * A_fp8 @ B_fp8 + bias
     // Matches pi05 gmm_fp8_kn_bias: host scalar alpha, per-GEMM bias vector
     void fp8_nn_bias(void* A, void* B, void* D, void* bias,
@@ -201,7 +218,9 @@ private:
 
     // ── GEMM descriptor + algorithm cache ──
     enum GemmType { BF16_NN = 0, BF16_NN_RES = 1, FP8_NN_DEV = 2,
-                    FP8_NT_DEV = 5, FP16_NN = 4
+                    FP8_NT_DEV = 5, FP16_NN = 4,
+                    FP8_NT_BIAS_BF16 = 6, FP8_NT_BIAS_FP16 = 7,
+                    FP8_NT_GELU_BIAS_FP16 = 8
 #ifdef ENABLE_NVFP4
         , FP4_NN_DEV = 3
 #endif
