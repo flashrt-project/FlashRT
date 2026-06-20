@@ -865,10 +865,24 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
             # so one [D, 3D] GEMM (compute-bound, unlike 3 launch-bound D→D
             # GEMMs) + a strided split into the Q/K/V slots. Cross-attn keeps
             # a single Q GEMM (K/V come from the backbone-projected cross-KV).
-            gemm.fp8_nn_bias_bf16(
-                int(bufs["qkv_xn_fp8"]), int(weights["qkv_w_fp8"][j_self]),
-                int(bufs["qkv_buf"]), int(weights["qkv_b"][j_self]),
-                Sa, 3 * D, D, float(weights["alpha_qkv"][j_self]), int(stream))
+            if "qkv_w_fp8_nt" in weights:
+                gemm.fp8_nt_bias_bf16(
+                    int(bufs["qkv_xn_fp8"]),
+                    int(weights["qkv_w_fp8_nt"][j_self]),
+                    int(bufs["qkv_buf"]),
+                    int(weights["qkv_b"][j_self]),
+                    Sa,
+                    3 * D,
+                    D,
+                    int(weights["act_qkv_scale"][j_self]),
+                    int(weights["qkv_weight_scale"][j_self]),
+                    int(stream),
+                )
+            else:
+                gemm.fp8_nn_bias_bf16(
+                    int(bufs["qkv_xn_fp8"]), int(weights["qkv_w_fp8"][j_self]),
+                    int(bufs["qkv_buf"]), int(weights["qkv_b"][j_self]),
+                    Sa, 3 * D, D, float(weights["alpha_qkv"][j_self]), int(stream))
             fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), Q_ptr, Sa, D, 3 * D, 0, int(stream))
             fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), K_ptr, Sa, D, 3 * D, D, int(stream))
             fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), V_ptr, Sa, D, 3 * D, 2 * D, int(stream))
@@ -916,17 +930,45 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
             fvk.quantize_fp8_static(
                 xn_ptr, int(bufs["xn_fp8"]),
                 int(weights["act_fc1_scale"][li]), Sa * D, int(stream))
-            gemm.fp8_nn_gelu_bias(
-                int(bufs["xn_fp8"]), int(weights["ff_proj_w_fp8"][li]),
-                int(bufs["ff_fp16"]), int(weights["ff_proj_b"][li]),
-                Sa, FF, D, float(weights["alpha_fc1"][li]), int(stream))
+            if "ff_proj_w_fp8_nt" in weights:
+                gemm.fp8_nt_gelu_bias_fp16(
+                    int(bufs["xn_fp8"]),
+                    int(weights["ff_proj_w_fp8_nt"][li]),
+                    int(bufs["ff_fp16"]),
+                    int(weights["ff_proj_b"][li]),
+                    Sa,
+                    FF,
+                    D,
+                    int(weights["act_fc1_scale"][li]),
+                    int(weights["ff_proj_weight_scale"][li]),
+                    int(stream),
+                )
+            else:
+                gemm.fp8_nn_gelu_bias(
+                    int(bufs["xn_fp8"]), int(weights["ff_proj_w_fp8"][li]),
+                    int(bufs["ff_fp16"]), int(weights["ff_proj_b"][li]),
+                    Sa, FF, D, float(weights["alpha_fc1"][li]), int(stream))
             fvk.quantize_fp8_static_fp16(
                 int(bufs["ff_fp16"]), int(bufs["ff_fp8"]),
                 int(weights["act_fc2_scale"][li]), Sa * FF, int(stream))
-            gemm.fp8_nn_bias_bf16(
-                int(bufs["ff_fp8"]), int(weights["ff_down_w_fp8"][li]),
-                o_out_ptr, int(weights["ff_down_b"][li]),
-                Sa, D, FF, float(weights["alpha_fc2"][li]), int(stream))
+            if "ff_down_w_fp8_nt" in weights:
+                gemm.fp8_nt_bias_bf16(
+                    int(bufs["ff_fp8"]),
+                    int(weights["ff_down_w_fp8_nt"][li]),
+                    o_out_ptr,
+                    int(weights["ff_down_b"][li]),
+                    Sa,
+                    D,
+                    FF,
+                    int(weights["act_fc2_scale"][li]),
+                    int(weights["ff_down_weight_scale"][li]),
+                    int(stream),
+                )
+            else:
+                gemm.fp8_nn_bias_bf16(
+                    int(bufs["ff_fp8"]), int(weights["ff_down_w_fp8"][li]),
+                    o_out_ptr, int(weights["ff_down_b"][li]),
+                    Sa, D, FF, float(weights["alpha_fc2"][li]), int(stream))
         else:
             gemm.bf16_nn(xn_ptr, int(weights["ff_proj_w"][li]),
                           ff_out_ptr, Sa, FF, D, int(stream))

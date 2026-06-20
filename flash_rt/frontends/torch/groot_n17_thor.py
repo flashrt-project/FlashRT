@@ -623,11 +623,14 @@ class GrootN17TorchFrontendThor:
         # Quantize FFN weights to FP8 (per-tensor) + compose alphas/act-scales.
         FP8_MAX = 448.0
         f8 = torch.float8_e4m3fn
+        use_nt = bool(getattr(self, "_use_dit_fp8_nt_epilogues", False))
         self._k_xn_fp8 = torch.empty(Sa, 1536, dtype=f8, device=dev)
         self._k_ff_fp16 = torch.empty(Sa, 6144, dtype=torch.float16, device=dev)
         self._k_ff_fp8 = torch.empty(Sa, 6144, dtype=f8, device=dev)
         self._dit_ff_fp8_keep = []
         proj_fp8, down_fp8, projb16 = [], [], []
+        proj_fp8_nt, down_fp8_nt = [], []
+        ws_fc1, ws_fc2 = [], []
         a_fc1, a_fc2, s_fc1, s_fc2 = [], [], [], []
         for li in range(32):
             pw = self._dit_ff_proj_w[li].float()
@@ -644,13 +647,21 @@ class GrootN17TorchFrontendThor:
             proj_fp8.append(pf.data_ptr()); down_fp8.append(df.data_ptr())
             projb16.append(pb.data_ptr())
             s_fc1.append(sf1.data_ptr()); s_fc2.append(sf2.data_ptr())
+            if use_nt:
+                pf_nt = pf.t().contiguous()
+                df_nt = df.t().contiguous()
+                sw1 = torch.tensor([ws_p], dtype=torch.float32, device=dev)
+                sw2 = torch.tensor([ws_d], dtype=torch.float32, device=dev)
+                self._dit_ff_fp8_keep += [pf_nt, df_nt, sw1, sw2]
+                proj_fp8_nt.append(pf_nt.data_ptr()); down_fp8_nt.append(df_nt.data_ptr())
+                ws_fc1.append(sw1.data_ptr()); ws_fc2.append(sw2.data_ptr())
             a_fc1.append((act_fc1[li] / FP8_MAX) * ws_p)
             a_fc2.append((act_fc2[li] / FP8_MAX) * ws_d)
         # Fused FP8 QKV for the 16 self-attn layers: concat q/k/v ([D,D] each)
         # → [D, 3D], quantize per-tensor. j indexes self-attn layers (li=2j+1).
         self._k_qkv_buf = torch.empty(Sa, 3 * 1536, dtype=torch.bfloat16, device=dev)
         self._k_qkv_xn_fp8 = torch.empty(Sa, 1536, dtype=f8, device=dev)
-        qkv_fp8, qkv_b, a_qkv, s_qkv = [], [], [], []
+        qkv_fp8, qkv_fp8_nt, qkv_b, a_qkv, s_qkv, ws_qkv = [], [], [], [], [], []
         for j in range(16):
             li = 2 * j + 1
             qw = torch.cat([self._dit_q_w[li], self._dit_k_w[li], self._dit_v_w[li]], dim=1).float()
@@ -659,7 +670,14 @@ class GrootN17TorchFrontendThor:
             qf = (qw / ws_q).to(f8).contiguous()
             sq = torch.tensor([act_qkv[j] / FP8_MAX], dtype=torch.float32, device=dev)
             self._dit_ff_fp8_keep += [qf, qb, sq]
-            qkv_fp8.append(qf.data_ptr()); qkv_b.append(qb.data_ptr()); s_qkv.append(sq.data_ptr())
+            qkv_fp8.append(qf.data_ptr())
+            qkv_b.append(qb.data_ptr()); s_qkv.append(sq.data_ptr())
+            if use_nt:
+                qf_nt = qf.t().contiguous()
+                swq = torch.tensor([ws_q], dtype=torch.float32, device=dev)
+                self._dit_ff_fp8_keep += [qf_nt, swq]
+                qkv_fp8_nt.append(qf_nt.data_ptr())
+                ws_qkv.append(swq.data_ptr())
             a_qkv.append((act_qkv[j] / FP8_MAX) * ws_q)
         for step in range(num_inference_timesteps):
             step_weights[step].update(
@@ -669,6 +687,15 @@ class GrootN17TorchFrontendThor:
                 act_fc1_scale=s_fc1, act_fc2_scale=s_fc2,
                 qkv_w_fp8=qkv_fp8, qkv_b=qkv_b,
                 alpha_qkv=a_qkv, act_qkv_scale=s_qkv)
+            if use_nt:
+                step_weights[step].update(
+                    ff_proj_w_fp8_nt=proj_fp8_nt,
+                    ff_down_w_fp8_nt=down_fp8_nt,
+                    ff_proj_weight_scale=ws_fc1,
+                    ff_down_weight_scale=ws_fc2,
+                    qkv_w_fp8_nt=qkv_fp8_nt,
+                    qkv_weight_scale=ws_qkv,
+                )
         bp.update(xn_fp8=self._k_xn_fp8.data_ptr(),
                   ff_fp16=self._k_ff_fp16.data_ptr(),
                   ff_fp8=self._k_ff_fp8.data_ptr(),

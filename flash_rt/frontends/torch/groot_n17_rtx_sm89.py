@@ -33,6 +33,7 @@ class _GrootN17FP8BackboneMixin:
     """set_prompt + FP8 kernel backbone + disk-cached activation scales."""
 
     fp8_layout = "nk"
+    _use_dit_fp8_nt_epilogues = True
 
     def __init__(
         self,
