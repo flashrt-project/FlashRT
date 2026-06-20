@@ -32,6 +32,13 @@ from flash_rt.frontends.torch._nexn2_rtx_nvfp4_weights import _sf_swz_bytes
 from flash_rt.hardware.rtx.attn_backend_nexn2 import RtxFlashAttnBackendNexn2
 
 
+def _cs():
+    """Current CUDA stream handle. Inside torch.cuda.graph capture this is
+    the capture stream; eager, the default stream. fvk calls MUST use it --
+    a hard-coded stream=0 silently no-ops on graph replay (-> NaN)."""
+    return torch.cuda.current_stream().cuda_stream
+
+
 def _mma_preq(xp, xsf, wp_ptr, wsf_ptr, alpha, n, k, fvk, device):
     """M=1 NVFP4 GEMV via the hand-tuned SM120 mma kernel (full-N).
 
@@ -43,14 +50,14 @@ def _mma_preq(xp, xsf, wp_ptr, wsf_ptr, alpha, n, k, fvk, device):
     y = torch.empty(1, n, dtype=torch.bfloat16, device=device)
     fvk.fp4_w4a4_mma_sm120_full_n_bf16out(
         xp.data_ptr(), wp_ptr, y.data_ptr(), n, k,
-        xsf.data_ptr(), wsf_ptr, alpha, 0)
+        xsf.data_ptr(), wsf_ptr, alpha, _cs())
     return y
 
 
 def _mma(x2d, wp_ptr, wsf_ptr, alpha, n, fvk, device):
     """Quantise the M=1 activation then GEMV via the mma kernel."""
     _, k = x2d.shape
-    xp, xsf = _quant_act(x2d, fvk, device)
+    xp, xsf = _quant_act(x2d, fvk, device, _cs())
     return _mma_preq(xp, xsf, wp_ptr, wsf_ptr, alpha, n, k, fvk, device)
 
 
@@ -64,7 +71,7 @@ def _bf16_mv(x1k, w, fvk, device):
     xc = x1k.contiguous()
     y = torch.empty(1, n, dtype=torch.bfloat16, device=device)
     fvk.bf16_matvec_qwen36_bf16(xc.data_ptr(), w.data_ptr(), y.data_ptr(),
-                                n, k, 0)
+                                n, k, _cs())
     return y
 
 
@@ -119,6 +126,16 @@ class Nexn2DecodeState:
         self.rope_cos, self.rope_sin = build_rope_tables(
             self.max_seq, theta, rope_dim, device)
 
+        # ── CUDA graph decode ──
+        # One graph per position (KV slot / attn length / RoPE slice baked);
+        # the only varying input is the device token id, re-read each replay.
+        self._static_token = torch.zeros(1, 1, dtype=torch.long, device=device)
+        self._graph_stream = torch.cuda.Stream()
+        self._graph_pool = torch.cuda.graph_pool_handle()
+        self._graphs = {}                       # pos -> (CUDAGraph, out tensor)
+        self._snap_lin = [torch.empty_like(t) for t in self.lin_state]
+        self._snap_conv = [torch.empty_like(t) for t in self.lin_conv_state]
+
     def reset(self):
         for s in self.lin_state:
             s.zero_()
@@ -137,6 +154,7 @@ def _decode_gdn(h, ld, state, lin_rank, fvk, device):
     A_log, dtb = ld['A_log_t'].float(), ld['dt_bias_t'].float()
     nw = ld['gdn_norm_w_t']
 
+    s = _cs()
     h2 = h.reshape(1, HID)
     mixed = _bf16_mv(h2, Wqkv, fvk, device).contiguous()
     z = _bf16_mv(h2, Wz, fvk, device).reshape(NV, HV).contiguous()
@@ -149,7 +167,7 @@ def _decode_gdn(h, ld, state, lin_rank, fvk, device):
     fvk.causal_conv1d_qwen36_update_bf16(
         mixed.data_ptr(), convw.data_ptr(), 0,
         conv_out.data_ptr(), conv_state.data_ptr(),
-        1, CONV, KS, True, 0)
+        1, CONV, KS, True, s)
 
     # split + broadcast 16 -> 32 heads.
     qb = torch.empty(1, NV, HK, dtype=torch.bfloat16, device=device)
@@ -157,7 +175,7 @@ def _decode_gdn(h, ld, state, lin_rank, fvk, device):
     vb = torch.empty(1, NV, HV, dtype=torch.bfloat16, device=device)
     fvk.nexn2_lin_split_qkv_broadcast_bf16(
         conv_out.data_ptr(), qb.data_ptr(), kb.data_ptr(), vb.data_ptr(),
-        1, 0)
+        1, s)
 
     neg = (-A_log.exp()).float().contiguous()
     dtb_c = dtb.contiguous()
@@ -165,7 +183,7 @@ def _decode_gdn(h, ld, state, lin_rank, fvk, device):
     bo = torch.empty(1, NV, dtype=torch.bfloat16, device=device)
     fvk.qwen36_gdn_gating_bf16(
         a.data_ptr(), b.data_ptr(), neg.data_ptr(), dtb_c.data_ptr(),
-        g_out.data_ptr(), bo.data_ptr(), 1, NV, 0)
+        g_out.data_ptr(), bo.data_ptr(), 1, NV, s)
 
     qt = qb.reshape(NV, HK).contiguous()
     kt = kb.reshape(NV, HK).contiguous()
@@ -176,12 +194,12 @@ def _decode_gdn(h, ld, state, lin_rank, fvk, device):
     fvk.gated_deltanet_recurrent_qwen36_bf16(
         qt.data_ptr(), kt.data_ptr(), vt.data_ptr(), gt.data_ptr(),
         bt.data_ptr(), state.lin_state[lin_rank].data_ptr(),
-        core.data_ptr(), 1, NV, HK, HV, True, 0)
+        core.data_ptr(), 1, NV, HK, HV, True, s)
 
     nf = torch.empty(NV, HV, dtype=torch.bfloat16, device=device)
     fvk.rms_norm_gated_silu_qwen36_bf16(
         core.data_ptr(), z.data_ptr(), nw.data_ptr(), nf.data_ptr(),
-        NV, HV, eps, 0)
+        NV, HV, eps, s)
     out = _proj_mma(nf.reshape(1, VD), ld, 'out_proj', HID, fvk, device)
     return out.reshape(1, 1, HID)
 
@@ -189,6 +207,7 @@ def _decode_gdn(h, ld, state, lin_rank, fvk, device):
 def _decode_full(h, ld, state, full_rank, pos, fvk, device):
     """Full-attn layer at one token; writes KV at pos, attends [0..pos]."""
     eps = state.eps
+    s = _cs()
     qnw, knw = ld['q_norm_w_t'], ld['k_norm_w_t']
     x2 = h.reshape(1, HID)
 
@@ -196,7 +215,7 @@ def _decode_full(h, ld, state, full_rank, pos, fvk, device):
     q_pre = torch.empty(1, NQ, HD, dtype=torch.bfloat16, device=device)
     gate = torch.empty(1, NQ * HD, dtype=torch.bfloat16, device=device)
     fvk.nexn2_split_q_gate_bf16(
-        qg.data_ptr(), q_pre.data_ptr(), gate.data_ptr(), 1, 0)
+        qg.data_ptr(), q_pre.data_ptr(), gate.data_ptr(), 1, s)
     q = _rms(q_pre.reshape(NQ, HD), qnw, eps).reshape(1, NQ, HD)
     k = _proj_mma(x2, ld, 'k_proj', NKV * HD, fvk, device).reshape(NKV, HD)
     k = _rms(k, knw, eps).reshape(1, NKV, HD)
@@ -210,14 +229,14 @@ def _decode_full(h, ld, state, full_rank, pos, fvk, device):
     ko = torch.empty(1, NKV, HD, dtype=torch.bfloat16, device=device)
     fvk.qwen36_partial_rope_qk_bf16(
         qin.data_ptr(), kin.data_ptr(), ct.data_ptr(), st.data_ptr(),
-        qo.data_ptr(), ko.data_ptr(), 1, NQ, NKV, HD, ROPE, 0)
+        qo.data_ptr(), ko.data_ptr(), 1, NQ, NKV, HD, ROPE, s)
 
     attn = state.attn
     attn.Q_buf[:, :1].copy_(qo.reshape(1, 1, NQ, HD))
     attn.K_cache[full_rank, pos:pos + 1].copy_(ko.reshape(1, NKV, HD))
     attn.V_cache[full_rank, pos:pos + 1].copy_(v.reshape(1, NKV, HD))
     attn.run('full', layer_idx=full_rank, q_seq=1, kv_seq=pos + 1,
-             softmax_scale=float(HD) ** -0.5)
+             stream=s, softmax_scale=float(HD) ** -0.5)
     at = attn.O_buf[:, :1].reshape(1, NQ * HD)
     at = (at.float() * torch.sigmoid(gate.float())).to(torch.bfloat16)
     return _proj_mma(at, ld, 'o_proj', HID, fvk, device).reshape(1, 1, HID)
@@ -227,6 +246,7 @@ def _moe_layer_decode(h, ld, fvk, device):
     """M=1 fine-grained MoE via the grouped GEMV kernel: the 8 routed experts
     run in one launch each for gate_up (shared act) and down (per-slot act),
     indexed by a device top-k id buffer (the same buffer drives a graph)."""
+    s = _cs()
     x = h.reshape(1, HID)
     logit = F.softmax(_bf16_mv(x, ld['router_w_t'], fvk, device).float(), -1)
     tw, ti = torch.topk(logit, TOPK, -1)
@@ -244,13 +264,13 @@ def _moe_layer_decode(h, ld, fvk, device):
     n_gu, n_dn = gu_p.shape[1], dn_p.shape[1]               # 1024 / HID
 
     # gate_up: one shared activation, grouped over the 8 experts.
-    xp, xsf = _quant_act(x, fvk, device)
+    xp, xsf = _quant_act(x, fvk, device, s)
     d_gu = torch.empty(TOPK, n_gu, dtype=torch.bfloat16, device=device)
     fvk.nexn2_moe_grouped_gemv_bf16(
         xp.data_ptr(), gu_p.data_ptr(), d_gu.data_ptr(),
         xsf.data_ptr(), gu_s.data_ptr(), gu_a.data_ptr(), idx.data_ptr(),
         TOPK, n_gu, HID, 0, 0, n_gu * (HID // 2),
-        _sf_swz_bytes(n_gu, HID), 0)
+        _sf_swz_bytes(n_gu, HID), s)
 
     g, u = d_gu[:, :INTER], d_gu[:, INTER:]
     inter = (F.silu(g.float()) * u.float()).to(torch.bfloat16)   # (TOPK, INTER)
@@ -259,17 +279,17 @@ def _moe_layer_decode(h, ld, fvk, device):
     a_stack = torch.empty(TOPK, INTER // 2, dtype=torch.uint8, device=device)
     sfa_stack = torch.zeros(TOPK, _sf_swz_bytes(1, INTER),
                             dtype=torch.uint8, device=device)
-    for s in range(TOPK):
-        xc = inter[s:s + 1].contiguous()
+    for j in range(TOPK):
+        xc = inter[j:j + 1].contiguous()
         fvk.quantize_bf16_to_nvfp4_swizzled(
-            xc.data_ptr(), a_stack[s].data_ptr(), sfa_stack[s].data_ptr(),
-            1, INTER, 0)
+            xc.data_ptr(), a_stack[j].data_ptr(), sfa_stack[j].data_ptr(),
+            1, INTER, s)
     d_dn = torch.empty(TOPK, n_dn, dtype=torch.bfloat16, device=device)
     fvk.nexn2_moe_grouped_gemv_bf16(
         a_stack.data_ptr(), dn_p.data_ptr(), d_dn.data_ptr(),
         sfa_stack.data_ptr(), dn_s.data_ptr(), dn_a.data_ptr(), idx.data_ptr(),
         TOPK, n_dn, INTER, INTER // 2, _sf_swz_bytes(1, INTER),
-        n_dn * (INTER // 2), _sf_swz_bytes(n_dn, INTER), 0)
+        n_dn * (INTER // 2), _sf_swz_bytes(n_dn, INTER), s)
     out = (d_dn.float() * tw_row.unsqueeze(-1)).sum(0, keepdim=True)
 
     sg = _proj_mma(x, ld, 'shared_gate_proj', INTER, fvk, device)
@@ -331,5 +351,71 @@ def generate_greedy(state, input_ids, max_new_tokens, fvk, device):
         nxt = int(logits[0].argmax().item())
         out.append(nxt)
         logits = decode_step(state, nxt, pos, fvk, device)
+        pos += 1
+    return out
+
+
+def _ensure_decode_graph(state, pos, fvk, device):
+    """Lazily capture a CUDA graph of one decode step at ``pos``.
+
+    The KV-write slot, attention length and RoPE slice are baked per pos, so
+    each pos owns a graph; the only varying input is ``state._static_token``,
+    re-read each replay. The lin/conv/KV state mutated by the 2 warmup runs +
+    the capture run is snapshotted and restored, so a later replay advances
+    from the true pre-step state. Returns (graph, logits_buffer).
+    """
+    cached = state._graphs.get(pos)
+    if cached is not None:
+        return cached
+
+    gs = state._graph_stream
+    for i, t in enumerate(state.lin_state):
+        state._snap_lin[i].copy_(t)
+    for i, t in enumerate(state.lin_conv_state):
+        state._snap_conv[i].copy_(t)
+    snap_k = state.attn.K_cache[:, pos:pos + 1].clone()
+    snap_v = state.attn.V_cache[:, pos:pos + 1].clone()
+
+    def _restore():
+        for i, t in enumerate(state.lin_state):
+            t.copy_(state._snap_lin[i])
+        for i, t in enumerate(state.lin_conv_state):
+            t.copy_(state._snap_conv[i])
+        state.attn.K_cache[:, pos:pos + 1].copy_(snap_k)
+        state.attn.V_cache[:, pos:pos + 1].copy_(snap_v)
+
+    with torch.no_grad():               # settle allocator + kernel order
+        for _ in range(2):
+            decode_step(state, state._static_token, pos, fvk, device)
+        _restore()
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=gs, pool=state._graph_pool), \
+            torch.no_grad():
+        out = decode_step(state, state._static_token, pos, fvk, device)
+    with torch.no_grad():
+        _restore()
+
+    state._graphs[pos] = (g, out)
+    return state._graphs[pos]
+
+
+def generate_greedy_graph(state, input_ids, max_new_tokens, fvk, device):
+    """Greedy decode replaying a per-position CUDA graph.
+
+    First visit to each pos captures (and runs) its graph; subsequent visits
+    (warm cache / later generations) are pure replays. The graph reads the
+    next token from ``state._static_token``.
+    """
+    pos = input_ids.view(-1).shape[0]
+    logits = seed_prefill(state, input_ids, fvk, device)
+    out = []
+    for _ in range(max_new_tokens):
+        nxt = int(logits[0].argmax().item())
+        out.append(nxt)
+        state._static_token.fill_(nxt)
+        g, out_buf = _ensure_decode_graph(state, pos, fvk, device)
+        g.replay()
+        logits = out_buf
         pos += 1
     return out
