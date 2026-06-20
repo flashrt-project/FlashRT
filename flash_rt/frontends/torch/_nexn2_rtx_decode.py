@@ -26,10 +26,39 @@ import torch.nn.functional as F
 
 from flash_rt.frontends.torch._nexn2_rtx_forward import (
     CONV, HD, HID, HK, HV, INTER, KS, NKV, NQ, NV, ROPE, TOPK, VD,
-    _nvfp4_gemm, _nvfp4_gemm_preq, _proj, _quant_act, _rms,
-    build_rope_tables,
+    _quant_act, _rms, build_rope_tables,
 )
 from flash_rt.hardware.rtx.attn_backend_nexn2 import RtxFlashAttnBackendNexn2
+
+
+def _mma_preq(xp, xsf, wp_ptr, wsf_ptr, alpha, n, k, fvk, device):
+    """M=1 NVFP4 GEMV via the hand-tuned SM120 mma kernel (full-N).
+
+    cos=1.0 vs the CUTLASS fp4_w4a16 GEMM at every Nex-N2 decode shape, and
+    far higher HBM-BW utilisation at M=1 (CUTLASS tiles for M>=16). Same
+    swizzled SF layout, so it consumes the loader weights + _quant_act
+    activation directly.
+    """
+    y = torch.empty(1, n, dtype=torch.bfloat16, device=device)
+    fvk.fp4_w4a4_mma_sm120_full_n_bf16out(
+        xp.data_ptr(), wp_ptr, y.data_ptr(), n, k,
+        xsf.data_ptr(), wsf_ptr, alpha, 0)
+    return y
+
+
+def _mma(x2d, wp_ptr, wsf_ptr, alpha, n, fvk, device):
+    """Quantise the M=1 activation then GEMV via the mma kernel."""
+    _, k = x2d.shape
+    xp, xsf = _quant_act(x2d, fvk, device)
+    return _mma_preq(xp, xsf, wp_ptr, wsf_ptr, alpha, n, k, fvk, device)
+
+
+def _proj_mma(x2d, ld, base, n, fvk, device):
+    """Decode projection dispatch: NVFP4 -> mma GEMV, else BF16 cuBLAS."""
+    if ld.get(base + '_packed') is not None:
+        return _mma(x2d, ld[base + '_packed'], ld[base + '_sf'],
+                    ld[base + '_alpha'], n, fvk, device)
+    return (x2d.float() @ ld[base + '_w_t'].float().T).to(torch.bfloat16)
 
 
 class Nexn2DecodeState:
@@ -138,7 +167,7 @@ def _decode_gdn(h, ld, state, lin_rank, fvk, device):
     fvk.rms_norm_gated_silu_qwen36_bf16(
         core.data_ptr(), z.data_ptr(), nw.data_ptr(), nf.data_ptr(),
         NV, HV, eps, 0)
-    out = _proj(nf.reshape(1, VD), ld, 'out_proj', HID, fvk, device)
+    out = _proj_mma(nf.reshape(1, VD), ld, 'out_proj', HID, fvk, device)
     return out.reshape(1, 1, HID)
 
 
@@ -148,15 +177,15 @@ def _decode_full(h, ld, state, full_rank, pos, fvk, device):
     qnw, knw = ld['q_norm_w_t'], ld['k_norm_w_t']
     x2 = h.reshape(1, HID)
 
-    qg = _proj(x2, ld, 'q_proj', NQ * 2 * HD, fvk, device).contiguous()
+    qg = _proj_mma(x2, ld, 'q_proj', NQ * 2 * HD, fvk, device).contiguous()
     q_pre = torch.empty(1, NQ, HD, dtype=torch.bfloat16, device=device)
     gate = torch.empty(1, NQ * HD, dtype=torch.bfloat16, device=device)
     fvk.nexn2_split_q_gate_bf16(
         qg.data_ptr(), q_pre.data_ptr(), gate.data_ptr(), 1, 0)
     q = _rms(q_pre.reshape(NQ, HD), qnw, eps).reshape(1, NQ, HD)
-    k = _proj(x2, ld, 'k_proj', NKV * HD, fvk, device).reshape(NKV, HD)
+    k = _proj_mma(x2, ld, 'k_proj', NKV * HD, fvk, device).reshape(NKV, HD)
     k = _rms(k, knw, eps).reshape(1, NKV, HD)
-    v = _proj(x2, ld, 'v_proj', NKV * HD, fvk, device).reshape(1, NKV, HD)
+    v = _proj_mma(x2, ld, 'v_proj', NKV * HD, fvk, device).reshape(1, NKV, HD)
 
     ct = state.rope_cos[pos:pos + 1].contiguous()
     st = state.rope_sin[pos:pos + 1].contiguous()
@@ -176,7 +205,7 @@ def _decode_full(h, ld, state, full_rank, pos, fvk, device):
              softmax_scale=float(HD) ** -0.5)
     at = attn.O_buf[:, :1].reshape(1, NQ * HD)
     at = (at.float() * torch.sigmoid(gate.float())).to(torch.bfloat16)
-    return _proj(at, ld, 'o_proj', HID, fvk, device).reshape(1, 1, HID)
+    return _proj_mma(at, ld, 'o_proj', HID, fvk, device).reshape(1, 1, HID)
 
 
 def _moe_layer_decode(h, ld, fvk, device):
@@ -199,19 +228,19 @@ def _moe_layer_decode(h, ld, fvk, device):
     for i in range(TOPK):
         e = ti[i]
         gu_e_p, gu_e_s = gu_p[e], gu_s[e]
-        gu = _nvfp4_gemm_preq(xp, xsf, gu_e_p.data_ptr(), gu_e_s.data_ptr(),
-                              float(gu_a[e].item()), 1, n_gu, HID, fvk, device)
+        gu = _mma_preq(xp, xsf, gu_e_p.data_ptr(), gu_e_s.data_ptr(),
+                       float(gu_a[e].item()), n_gu, HID, fvk, device)
         g, u = gu.chunk(2, -1)
         inter = (F.silu(g.float()) * u.float()).to(torch.bfloat16)
         dn_e_p, dn_e_s = dn_p[e], dn_s[e]
-        dpj = _nvfp4_gemm(inter, dn_e_p.data_ptr(), dn_e_s.data_ptr(),
-                          float(dn_a[e].item()), n_dn, fvk, device)
+        dpj = _mma(inter, dn_e_p.data_ptr(), dn_e_s.data_ptr(),
+                   float(dn_a[e].item()), n_dn, fvk, device)
         out += dpj.float() * tw[i]
 
-    sg = _proj(x, ld, 'shared_gate_proj', INTER, fvk, device)
-    su = _proj(x, ld, 'shared_up_proj', INTER, fvk, device)
+    sg = _proj_mma(x, ld, 'shared_gate_proj', INTER, fvk, device)
+    su = _proj_mma(x, ld, 'shared_up_proj', INTER, fvk, device)
     si = (F.silu(sg.float()) * su.float()).to(torch.bfloat16)
-    shared = _proj(si, ld, 'shared_down_proj', HID, fvk, device)
+    shared = _proj_mma(si, ld, 'shared_down_proj', HID, fvk, device)
     sgate = torch.sigmoid(x.float() @ ld['shared_gate_w_t'].float().T)
     return (out + shared.float() * sgate).reshape(1, 1, HID).to(torch.bfloat16)
 
