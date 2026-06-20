@@ -220,3 +220,41 @@ See [USAGE.md](../USAGE.md) §Loading a model for the per-frontend
 | `PJRT plugin ... not found` at JAX import | JAX / jax-cuda12-plugin version mismatch (Step 8) |
 | `cuBLAS error code=13` when loading second model | Ran two model loads in one process; subprocess-isolate per model |
 | cos regression right after calibrate | `act_scale * weight_scale` alpha computed in f64 somewhere; see `docs/calibration.md` §2.3 |
+
+## 12. Known runtime issue: cuBLASLt FP8 heuristic `code=15`
+
+Some FP8 cuBLASLt descriptors are sensitive to the cuBLASLt runtime
+patch version. `CUDA 13`, `CUDA 12.4`, or `libcublasLt.so.13` alone is
+not specific enough to identify the runtime behavior.
+
+If an FP8 GEMM fails with:
+
+```text
+cublasLtMatmulAlgoGetHeuristic(...), CUBLAS_STATUS_NOT_SUPPORTED / code=15
+```
+
+first print the exact cuBLASLt runtime version from the same Python
+environment that imports `flash_rt`:
+
+```python
+import ctypes
+import ctypes.util
+
+lib = ctypes.CDLL(ctypes.util.find_library("cublasLt"))
+lib.cublasLtGetVersion.restype = ctypes.c_size_t
+print(lib.cublasLtGetVersion())
+```
+
+Known local result on the same RTX 5090 and the same FP8 descriptor:
+
+| cuBLASLt runtime | Result |
+|---|---|
+| `13.0.2` (`cublasLtGetVersion() == 130002`) | one SM120 FP8 NN descriptor returned `code=15` |
+| `13.1.0` (`cublasLtGetVersion() == 130100`) | the same descriptor succeeded |
+
+On SM89, FP8 fused epilogue descriptors can show the same class of
+failure on older CUDA/cuBLASLt stacks. Treat this as a runtime-library
+capability issue until the exact cuBLASLt version, GPU, descriptor
+shape/layout, and epilogue have been checked. Prefer the validated
+Docker/NGC stack when debugging FP8 cuBLASLt heuristic failures, and
+include `cublasLtGetVersion()` in bug reports.
