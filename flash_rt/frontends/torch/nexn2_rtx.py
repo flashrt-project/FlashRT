@@ -66,6 +66,7 @@ class Nexn2TorchFrontendRtx:
         self._pipeline: Nexn2Pipeline | None = None
         self._weights = None
         self._fvk = None
+        self._decode_state = None
         self.latency_records: list[float] = []
 
         if self._kernelized:
@@ -144,9 +145,23 @@ class Nexn2TorchFrontendRtx:
         return logits
 
     def generate(self, max_new_tokens: int, *, do_sample: bool = False):
-        """Autoregressive generate over the current prompt. Phase-1 -> HF."""
+        """Autoregressive generate over the current prompt.
+
+        Kernelized path: greedy M=1 decode over the fvk kernels (KV cache +
+        GDN recurrent/conv state). Reference path: HF .generate().
+        """
         if self._prompt_ids is None:
             raise ValueError('call set_prompt(...) before generate()')
+        if self._kernelized:
+            from flash_rt.frontends.torch._nexn2_rtx_decode import (
+                Nexn2DecodeState, generate_greedy,
+            )
+            if self._decode_state is None:
+                self._decode_state = Nexn2DecodeState(
+                    self._weights, self._user_max_seq, self.device)
+            return generate_greedy(
+                self._decode_state, self._prompt_ids, max_new_tokens,
+                self._fvk, self.device)
         return self._pipeline.generate(
             self._prompt_ids,
             max_new_tokens=max_new_tokens,
