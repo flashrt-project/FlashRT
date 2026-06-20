@@ -126,11 +126,18 @@ def _quant_from_ckpt(handles, out_dict, prefix, key, handles_d, wmap,
 
 
 def _bf16_from_ckpt(handles, out_dict, name, key, handles_d, wmap, device,
-                    *, optional=False) -> None:
+                    *, optional=False, fold_one=False) -> None:
     if optional and not _has(wmap, key):
         out_dict[name] = 0
         return
-    t = _bf16_to_dev(_get(handles_d, wmap, key), device)
+    w = _get(handles_d, wmap, key)
+    if fold_one:
+        # Qwen3_5MoeRMSNorm: out = norm(x) * (1 + weight). Precompute the
+        # (1 + w) effective weight in fp32 so the kernel does a plain
+        # weight*norm. (The GDN RMSNormGated uses plain weight -- no fold.)
+        t = (w.float() + 1.0).to(torch.bfloat16).to(device).contiguous()
+    else:
+        t = _bf16_to_dev(w, device)
     out_dict[name] = _anchor(handles, t)
     out_dict[name + '_shape'] = tuple(t.shape)
 
@@ -229,7 +236,7 @@ def extract_weights_nexn2_nvfp4(
                     handles_d, wmap, device)
     _bf16_from_ckpt(handles, handles.ptrs, 'final_norm_w',
                     'model.language_model.norm.weight',
-                    handles_d, wmap, device)
+                    handles_d, wmap, device, fold_one=True)
     _bf16_from_ckpt(handles, handles.ptrs, 'lm_head_w', 'lm_head.weight',
                     handles_d, wmap, device)
 
@@ -241,10 +248,10 @@ def extract_weights_nexn2_nvfp4(
         ld: dict = {'type': ltype, 'quant_format': 'nvfp4'}
 
         _bf16_from_ckpt(handles, ld, 'input_norm_w', lp + 'input_layernorm.weight',
-                        handles_d, wmap, device)
+                        handles_d, wmap, device, fold_one=True)
         _bf16_from_ckpt(handles, ld, 'post_norm_w',
                         lp + 'post_attention_layernorm.weight',
-                        handles_d, wmap, device)
+                        handles_d, wmap, device, fold_one=True)
 
         if ltype == 'full_attention':
             ap = lp + 'self_attn.'
@@ -257,9 +264,9 @@ def extract_weights_nexn2_nvfp4(
             _quant_from_ckpt(handles, ld, 'o_proj', ap + 'o_proj.weight',
                              handles_d, wmap, fvk, device)
             _bf16_from_ckpt(handles, ld, 'q_norm_w', ap + 'q_norm.weight',
-                            handles_d, wmap, device)
+                            handles_d, wmap, device, fold_one=True)
             _bf16_from_ckpt(handles, ld, 'k_norm_w', ap + 'k_norm.weight',
-                            handles_d, wmap, device)
+                            handles_d, wmap, device, fold_one=True)
         elif ltype == 'linear_attention':
             gp = lp + 'linear_attn.'
             # GDN in_proj path stays BF16.
