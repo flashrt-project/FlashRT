@@ -56,6 +56,21 @@ def _rms(x, w, eps):
     return ((x.float() * torch.rsqrt(v + eps)) * w.float()).to(torch.bfloat16)
 
 
+def _proj(x2d, ld, base, n, fvk, device):
+    """y = x @ w.T for one projection, dispatching on the loader's scope.
+
+    NVFP4 site (``<base>_packed`` present) -> fp4 W4A16 GEMM. Otherwise the
+    weight was kept BF16 (``<base>_w_t``, quant_scope='experts') -> cuBLAS
+    matmul with fp32 accumulate. ``n`` is ignored on the BF16 path (taken
+    from the weight).
+    """
+    if ld.get(base + '_packed') is not None:
+        return _nvfp4_gemm(x2d, ld[base + '_packed'], ld[base + '_sf'],
+                           ld[base + '_alpha'], n, fvk, device)
+    w = ld[base + '_w_t']
+    return (x2d.float() @ w.float().T).to(torch.bfloat16)
+
+
 def _nvfp4_gemm(x2d, wp_ptr, wsf_ptr, alpha, n, fvk, device, stream=0):
     """y = x @ w.T via NVFP4. x2d is (M,K) bf16; weight given by ptrs+alpha.
 
@@ -132,8 +147,7 @@ def _gdn_layer(h, ld, fvk, device, eps):
     fvk.rms_norm_gated_silu_qwen36_bf16(
         cf.data_ptr(), zf.data_ptr(), nw.data_ptr(), nf.data_ptr(),
         cf.shape[0], HV, eps, 0)
-    out = _nvfp4_gemm(nf.reshape(B * S, VD), ld['out_proj_packed'],
-                      ld['out_proj_sf'], ld['out_proj_alpha'], HID, fvk, device)
+    out = _proj(nf.reshape(B * S, VD), ld, 'out_proj', HID, fvk, device)
     return out.reshape(B, S, HID)
 
 
@@ -143,16 +157,13 @@ def _full_attn_layer(h, ld, ct, st, fvk, device, eps):
     qnw, knw = ld['q_norm_w_t'], ld['k_norm_w_t']      # already (1+w)-folded
     x2 = h.reshape(B * S, HID)
 
-    qg = _nvfp4_gemm(x2, ld['q_proj_packed'], ld['q_proj_sf'],
-                     ld['q_proj_alpha'], NQ * 2 * HD, fvk, device)
+    qg = _proj(x2, ld, 'q_proj', NQ * 2 * HD, fvk, device)
     qg = qg.view(B, S, NQ, 2 * HD)
     q, gate = qg[..., :HD], qg[..., HD:].reshape(B, S, NQ * HD)
     q = _rms(q.to(torch.bfloat16), qnw, eps)
-    k = _nvfp4_gemm(x2, ld['k_proj_packed'], ld['k_proj_sf'],
-                    ld['k_proj_alpha'], NKV * HD, fvk, device).view(B, S, NKV, HD)
+    k = _proj(x2, ld, 'k_proj', NKV * HD, fvk, device).view(B, S, NKV, HD)
     k = _rms(k, knw, eps)
-    v = _nvfp4_gemm(x2, ld['v_proj_packed'], ld['v_proj_sf'],
-                    ld['v_proj_alpha'], NKV * HD, fvk, device).view(B, S, NKV, HD)
+    v = _proj(x2, ld, 'v_proj', NKV * HD, fvk, device).view(B, S, NKV, HD)
 
     qo = torch.empty(S, NQ, HD, dtype=torch.bfloat16, device=device)
     ko = torch.empty(S, NKV, HD, dtype=torch.bfloat16, device=device)
@@ -170,9 +181,8 @@ def _full_attn_layer(h, ld, ct, st, fvk, device, eps):
         qa.float(), ka.float(), va.float(), is_causal=True)
     at = at.transpose(1, 2).reshape(B, S, NQ * HD)
     at = (at * torch.sigmoid(gate.float())).to(torch.bfloat16)
-    return _nvfp4_gemm(at.reshape(B * S, NQ * HD), ld['o_proj_packed'],
-                       ld['o_proj_sf'], ld['o_proj_alpha'], HID,
-                       fvk, device).reshape(B, S, HID)
+    return _proj(at.reshape(B * S, NQ * HD), ld, 'o_proj', HID,
+                 fvk, device).reshape(B, S, HID)
 
 
 def _moe_layer(h, ld, fvk, device):
@@ -206,14 +216,10 @@ def _moe_layer(h, ld, fvk, device):
                           float(dn_a[e].item()), n_dn, fvk, device)
         out[tok] += dpj.float() * w.unsqueeze(-1)
 
-    sg = _nvfp4_gemm(x, ld['shared_gate_proj_packed'], ld['shared_gate_proj_sf'],
-                     ld['shared_gate_proj_alpha'], INTER, fvk, device)
-    su = _nvfp4_gemm(x, ld['shared_up_proj_packed'], ld['shared_up_proj_sf'],
-                     ld['shared_up_proj_alpha'], INTER, fvk, device)
+    sg = _proj(x, ld, 'shared_gate_proj', INTER, fvk, device)
+    su = _proj(x, ld, 'shared_up_proj', INTER, fvk, device)
     si = (F.silu(sg.float()) * su.float()).to(torch.bfloat16)
-    shared = _nvfp4_gemm(si, ld['shared_down_proj_packed'],
-                         ld['shared_down_proj_sf'], ld['shared_down_proj_alpha'],
-                         HID, fvk, device)
+    shared = _proj(si, ld, 'shared_down_proj', HID, fvk, device)
     sgate = torch.sigmoid(x.float() @ ld['shared_gate_w_t'].float().T)
     return (out + shared.float() * sgate).reshape(B, S, HID).to(torch.bfloat16)
 

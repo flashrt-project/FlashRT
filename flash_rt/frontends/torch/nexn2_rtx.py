@@ -30,7 +30,8 @@ class Nexn2TorchFrontendRtx:
                  device: str = 'cuda:0',
                  max_seq: int = 2048,
                  quant: str = 'nvfp4',
-                 kernelized: bool = False) -> None:
+                 kernelized: bool = False,
+                 quant_scope: str = 'full') -> None:
         """Construct the frontend.
 
         Args:
@@ -46,6 +47,10 @@ class Nexn2TorchFrontendRtx:
             NVFP4-quantized weights directly via the fvk loader and run the
             kernelized forward -- the production seam (fits the RTX 5090;
             the BF16 reference does not).
+          quant_scope: kernelized-only. ``'full'`` (default) = NVFP4 for
+            full-attn / out_proj / shared / routed experts (cos ~0.94).
+            ``'experts'`` = only routed experts NVFP4, rest BF16 (cos
+            ~0.99, the precision baseline until the W4A16 mixed kernel).
         """
         if quant not in ('fp8', 'nvfp4'):
             raise ValueError(f"quant must be 'fp8' or 'nvfp4', got {quant!r}")
@@ -55,6 +60,7 @@ class Nexn2TorchFrontendRtx:
         self._user_max_seq = int(max_seq)
         self._quant_format = quant
         self._kernelized = bool(kernelized)
+        self._quant_scope = quant_scope
         self._tokenizer = None
         self._prompt_ids = None
         self._pipeline: Nexn2Pipeline | None = None
@@ -103,7 +109,8 @@ class Nexn2TorchFrontendRtx:
         self._tokenizer = AutoTokenizer.from_pretrained(self.checkpoint_path)
         self._fvk = fvk
         self._weights = extract_weights_nexn2_nvfp4(
-            self.checkpoint_path, fvk, device=self.device)
+            self.checkpoint_path, fvk, device=self.device,
+            quant_scope=self._quant_scope)
 
     def set_prompt(self, text: str) -> None:
         """Tokenize ``text`` for the next ``infer()`` / ``generate()`` call."""

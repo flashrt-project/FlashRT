@@ -125,6 +125,24 @@ def _quant_from_ckpt(handles, out_dict, prefix, key, handles_d, wmap,
     del w
 
 
+def _proj_load(handles, out_dict, base, key, handles_d, wmap, fvk, device,
+               *, quantize: bool) -> None:
+    """Load a projection weight as NVFP4 or BF16 by ``quant_scope``.
+
+    quantize=True  -> ``<base>_packed`` / ``_sf`` / ``_alpha`` (NVFP4 GEMM).
+    quantize=False -> ``<base>_w`` ptr + ``<base>_w_t`` tensor (BF16 matmul).
+    The forward dispatches on which key set is present, so the same site
+    can run NVFP4 (quant_scope='full') or BF16 (quant_scope='experts',
+    which keeps everything but the storage-dominant routed experts BF16).
+    """
+    if quantize:
+        _quant_from_ckpt(handles, out_dict, base, key, handles_d, wmap,
+                         fvk, device)
+    else:
+        _bf16_from_ckpt(handles, out_dict, base + '_w', key, handles_d,
+                        wmap, device)
+
+
 def _bf16_from_ckpt(handles, out_dict, name, key, handles_d, wmap, device,
                     *, optional=False, fold_one=False) -> None:
     if optional and not _has(wmap, key):
@@ -149,7 +167,7 @@ def _bf16_from_ckpt(handles, out_dict, name, key, handles_d, wmap, device,
 
 
 def _load_moe(handles, ld, lp, handles_d, wmap, fvk, device,
-              n_experts: int) -> None:
+              n_experts: int, *, quantize_shared: bool = True) -> None:
     """Load one layer's MoE block: router (BF16) + experts + shared expert."""
     # Router gate (BF16) and shared-expert sigmoid gate (BF16).
     _bf16_from_ckpt(handles, ld, 'router_w', lp + 'mlp.gate.weight',
@@ -158,14 +176,14 @@ def _load_moe(handles, ld, lp, handles_d, wmap, fvk, device,
                     lp + 'mlp.shared_expert_gate.weight',
                     handles_d, wmap, device)
 
-    # Shared expert (NVFP4).
+    # Shared expert (NVFP4 in 'full' scope, BF16 in 'experts' scope).
     sp = lp + 'mlp.shared_expert.'
-    _quant_from_ckpt(handles, ld, 'shared_gate_proj', sp + 'gate_proj.weight',
-                     handles_d, wmap, fvk, device)
-    _quant_from_ckpt(handles, ld, 'shared_up_proj', sp + 'up_proj.weight',
-                     handles_d, wmap, fvk, device)
-    _quant_from_ckpt(handles, ld, 'shared_down_proj', sp + 'down_proj.weight',
-                     handles_d, wmap, fvk, device)
+    _proj_load(handles, ld, 'shared_gate_proj', sp + 'gate_proj.weight',
+               handles_d, wmap, fvk, device, quantize=quantize_shared)
+    _proj_load(handles, ld, 'shared_up_proj', sp + 'up_proj.weight',
+               handles_d, wmap, fvk, device, quantize=quantize_shared)
+    _proj_load(handles, ld, 'shared_down_proj', sp + 'down_proj.weight',
+               handles_d, wmap, fvk, device, quantize=quantize_shared)
 
     # Routed experts: packed 3D tensors (E, out, in). Quantize each expert
     # into a contiguous slice of a per-layer stacked NVFP4 buffer so the
@@ -224,8 +242,21 @@ def extract_weights_nexn2_nvfp4(
     ckpt_dir: str,
     fvk,
     device: str = 'cuda:0',
+    quant_scope: str = 'full',
 ) -> WeightHandles:
-    """Build :class:`WeightHandles` from a Nex-N2-mini BF16 ckpt directory."""
+    """Build :class:`WeightHandles` from a Nex-N2-mini BF16 ckpt directory.
+
+    quant_scope:
+      * ``'full'`` (default): NVFP4 for full-attn q/k/v/o, GDN out_proj,
+        MoE routed + shared experts. Fits ~22 GB; E2E cos ~0.94 (W4A4).
+      * ``'experts'``: only the storage-dominant routed experts go NVFP4;
+        full-attn / out_proj / shared stay BF16. ~21 GB; E2E cos ~0.99 --
+        the precision-per-VRAM baseline until the Step-3 W4A16 mixed kernel.
+    """
+    if quant_scope not in ('full', 'experts'):
+        raise ValueError(
+            f"quant_scope must be 'full' or 'experts', got {quant_scope!r}")
+    quant_main = quant_scope == 'full'
     cfg = json.load(open(os.path.join(ckpt_dir, 'config.json')))
     tc = cfg.get('text_config', cfg)
     num_layers = int(tc['num_hidden_layers'])
@@ -270,14 +301,14 @@ def extract_weights_nexn2_nvfp4(
 
         if ltype == 'full_attention':
             ap = lp + 'self_attn.'
-            _quant_from_ckpt(handles, ld, 'q_proj', ap + 'q_proj.weight',
-                             handles_d, wmap, fvk, device)
-            _quant_from_ckpt(handles, ld, 'k_proj', ap + 'k_proj.weight',
-                             handles_d, wmap, fvk, device)
-            _quant_from_ckpt(handles, ld, 'v_proj', ap + 'v_proj.weight',
-                             handles_d, wmap, fvk, device)
-            _quant_from_ckpt(handles, ld, 'o_proj', ap + 'o_proj.weight',
-                             handles_d, wmap, fvk, device)
+            _proj_load(handles, ld, 'q_proj', ap + 'q_proj.weight',
+                       handles_d, wmap, fvk, device, quantize=quant_main)
+            _proj_load(handles, ld, 'k_proj', ap + 'k_proj.weight',
+                       handles_d, wmap, fvk, device, quantize=quant_main)
+            _proj_load(handles, ld, 'v_proj', ap + 'v_proj.weight',
+                       handles_d, wmap, fvk, device, quantize=quant_main)
+            _proj_load(handles, ld, 'o_proj', ap + 'o_proj.weight',
+                       handles_d, wmap, fvk, device, quantize=quant_main)
             _bf16_from_ckpt(handles, ld, 'q_norm_w', ap + 'q_norm.weight',
                             handles_d, wmap, device, fold_one=True)
             _bf16_from_ckpt(handles, ld, 'k_norm_w', ap + 'k_norm.weight',
@@ -295,14 +326,15 @@ def extract_weights_nexn2_nvfp4(
                             ('gdn_norm_w', 'norm.weight')):
                 _bf16_from_ckpt(handles, ld, nm, gp + key,
                                 handles_d, wmap, device, optional=True)
-            # out_proj → NVFP4.
-            _quant_from_ckpt(handles, ld, 'out_proj', gp + 'out_proj.weight',
-                             handles_d, wmap, fvk, device)
+            # out_proj → NVFP4 ('full') or BF16 ('experts').
+            _proj_load(handles, ld, 'out_proj', gp + 'out_proj.weight',
+                       handles_d, wmap, fvk, device, quantize=quant_main)
         else:
             raise ValueError(f'layer {i}: unknown layer_type {ltype!r}')
 
         # Every layer has a MoE FFN (mlp_only_layers is empty).
-        _load_moe(handles, ld, lp, handles_d, wmap, fvk, device, n_experts)
+        _load_moe(handles, ld, lp, handles_d, wmap, fvk, device, n_experts,
+                  quantize_shared=quant_main)
         per_layer[i] = ld
 
     handles.ptrs['layers'] = per_layer
@@ -319,6 +351,7 @@ def extract_weights_nexn2_nvfp4(
     handles.ptrs['rope_theta'] = rope_theta
     handles.ptrs['partial_rotary_factor'] = partial_rotary
     handles.ptrs['quant_format'] = 'nvfp4'
+    handles.ptrs['quant_scope'] = quant_scope
     handles.ptrs['ckpt_dir'] = ckpt_dir
     handles.ptrs['mtp'] = None       # MTP weights not in the base ckpt
     handles.ptrs['dflash'] = None
