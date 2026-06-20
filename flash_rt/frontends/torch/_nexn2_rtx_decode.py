@@ -28,6 +28,7 @@ from flash_rt.frontends.torch._nexn2_rtx_forward import (
     CONV, HD, HID, HK, HV, INTER, KS, NKV, NQ, NV, ROPE, TOPK, VD,
     _quant_act, _rms, build_rope_tables,
 )
+from flash_rt.frontends.torch._nexn2_rtx_nvfp4_weights import _sf_swz_bytes
 from flash_rt.hardware.rtx.attn_backend_nexn2 import RtxFlashAttnBackendNexn2
 
 
@@ -223,33 +224,53 @@ def _decode_full(h, ld, state, full_rank, pos, fvk, device):
 
 
 def _moe_layer_decode(h, ld, fvk, device):
-    """M=1 MoE: the single token's top-8 experts share the gate_up activation,
-    so quantise it once and reuse (vs the prefill path's per-expert quant)."""
+    """M=1 fine-grained MoE via the grouped GEMV kernel: the 8 routed experts
+    run in one launch each for gate_up (shared act) and down (per-slot act),
+    indexed by a device top-k id buffer (the same buffer drives a graph)."""
     x = h.reshape(1, HID)
     logit = F.softmax(_bf16_mv(x, ld['router_w_t'], fvk, device).float(), -1)
     tw, ti = torch.topk(logit, TOPK, -1)
-    tw = (tw / tw.sum(-1, keepdim=True))[0].tolist()    # one host sync
-    ti = ti[0].tolist()
+    tw_row = (tw / tw.sum(-1, keepdim=True))[0]              # (TOPK,) device
+    idx = ti[0].to(torch.int32).contiguous()                # (TOPK,) device
 
-    gu_p, gu_s, gu_a = (ld['experts_gate_up_packed_t'],
-                        ld['experts_gate_up_sf_t'], ld['experts_gate_up_alpha_t'])
-    dn_p, dn_s, dn_a = (ld['experts_down_packed_t'],
-                        ld['experts_down_sf_t'], ld['experts_down_alpha_t'])
-    n_gu, n_dn = gu_p.shape[1], dn_p.shape[1]
+    if 'experts_gate_up_alpha_dev' not in ld:               # cache once/layer
+        ld['experts_gate_up_alpha_dev'] = \
+            ld['experts_gate_up_alpha_t'].to(device).contiguous()
+        ld['experts_down_alpha_dev'] = \
+            ld['experts_down_alpha_t'].to(device).contiguous()
+    gu_p, gu_s = ld['experts_gate_up_packed_t'], ld['experts_gate_up_sf_t']
+    dn_p, dn_s = ld['experts_down_packed_t'], ld['experts_down_sf_t']
+    gu_a, dn_a = ld['experts_gate_up_alpha_dev'], ld['experts_down_alpha_dev']
+    n_gu, n_dn = gu_p.shape[1], dn_p.shape[1]               # 1024 / HID
 
-    xp, xsf = _quant_act(x, fvk, device)                # gate_up act, once
-    out = torch.zeros(1, HID, device=device)
-    for i in range(TOPK):
-        e = ti[i]
-        gu_e_p, gu_e_s = gu_p[e], gu_s[e]
-        gu = _mma_preq(xp, xsf, gu_e_p.data_ptr(), gu_e_s.data_ptr(),
-                       float(gu_a[e].item()), n_gu, HID, fvk, device)
-        g, u = gu.chunk(2, -1)
-        inter = (F.silu(g.float()) * u.float()).to(torch.bfloat16)
-        dn_e_p, dn_e_s = dn_p[e], dn_s[e]
-        dpj = _mma(inter, dn_e_p.data_ptr(), dn_e_s.data_ptr(),
-                   float(dn_a[e].item()), n_dn, fvk, device)
-        out += dpj.float() * tw[i]
+    # gate_up: one shared activation, grouped over the 8 experts.
+    xp, xsf = _quant_act(x, fvk, device)
+    d_gu = torch.empty(TOPK, n_gu, dtype=torch.bfloat16, device=device)
+    fvk.nexn2_moe_grouped_gemv_bf16(
+        xp.data_ptr(), gu_p.data_ptr(), d_gu.data_ptr(),
+        xsf.data_ptr(), gu_s.data_ptr(), gu_a.data_ptr(), idx.data_ptr(),
+        TOPK, n_gu, HID, 0, 0, n_gu * (HID // 2),
+        _sf_swz_bytes(n_gu, HID), 0)
+
+    g, u = d_gu[:, :INTER], d_gu[:, INTER:]
+    inter = (F.silu(g.float()) * u.float()).to(torch.bfloat16)   # (TOPK, INTER)
+
+    # down: per-slot activation (quantise each M=1 into the stack).
+    a_stack = torch.empty(TOPK, INTER // 2, dtype=torch.uint8, device=device)
+    sfa_stack = torch.zeros(TOPK, _sf_swz_bytes(1, INTER),
+                            dtype=torch.uint8, device=device)
+    for s in range(TOPK):
+        xc = inter[s:s + 1].contiguous()
+        fvk.quantize_bf16_to_nvfp4_swizzled(
+            xc.data_ptr(), a_stack[s].data_ptr(), sfa_stack[s].data_ptr(),
+            1, INTER, 0)
+    d_dn = torch.empty(TOPK, n_dn, dtype=torch.bfloat16, device=device)
+    fvk.nexn2_moe_grouped_gemv_bf16(
+        a_stack.data_ptr(), dn_p.data_ptr(), d_dn.data_ptr(),
+        sfa_stack.data_ptr(), dn_s.data_ptr(), dn_a.data_ptr(), idx.data_ptr(),
+        TOPK, n_dn, INTER, INTER // 2, _sf_swz_bytes(1, INTER),
+        n_dn * (INTER // 2), _sf_swz_bytes(n_dn, INTER), 0)
+    out = (d_dn.float() * tw_row.unsqueeze(-1)).sum(0, keepdim=True)
 
     sg = _proj_mma(x, ld, 'shared_gate_proj', INTER, fvk, device)
     su = _proj_mma(x, ld, 'shared_up_proj', INTER, fvk, device)

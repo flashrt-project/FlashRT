@@ -138,6 +138,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/silu_mul_qwen36.cuh"
 #include "kernels/qwen36_misc.cuh"
 #include "kernels/nexn2_misc.cuh"
+#include "kernels/nexn2_moe_grouped.cuh"
 #include "kernels/bf16_matvec_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36_thor.cuh"
@@ -4486,6 +4487,28 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         },
         py::arg("q_proj"), py::arg("q_pre"), py::arg("gate"),
         py::arg("S"), py::arg("stream") = 0);
+
+    m.def("nexn2_moe_grouped_gemv_bf16",
+        [](uintptr_t A_stack, uintptr_t B_stack, uintptr_t D,
+           uintptr_t SFA_stack, uintptr_t SFB_stack,
+           uintptr_t alpha_stack, uintptr_t expert_idx,
+           int E, int N, int K,
+           long a_stride, long sfa_stride, long w_stride, long sfb_stride,
+           uintptr_t stream) -> int {
+            return flash_rt::gemm::nexn2_moe_grouped_gemv_bf16(
+                to_ptr(A_stack), to_ptr(B_stack), to_ptr(D),
+                to_ptr(SFA_stack), to_ptr(SFB_stack),
+                to_ptr(alpha_stack), to_ptr(expert_idx),
+                E, N, K, a_stride, sfa_stride, w_stride, sfb_stride,
+                to_stream(stream));
+        },
+        py::arg("A_stack"), py::arg("B_stack"), py::arg("D"),
+        py::arg("SFA_stack"), py::arg("SFB_stack"),
+        py::arg("alpha_stack"), py::arg("expert_idx"),
+        py::arg("E"), py::arg("N"), py::arg("K"),
+        py::arg("a_stride"), py::arg("sfa_stride"),
+        py::arg("w_stride"), py::arg("sfb_stride"),
+        py::arg("stream") = 0);
 
     m.def("qwen36_gdn_gating_bf16",
         [](uintptr_t a, uintptr_t b,
