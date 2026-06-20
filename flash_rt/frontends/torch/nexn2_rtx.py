@@ -29,7 +29,8 @@ class Nexn2TorchFrontendRtx:
     def __init__(self, checkpoint_path: str, *,
                  device: str = 'cuda:0',
                  max_seq: int = 2048,
-                 quant: str = 'nvfp4') -> None:
+                 quant: str = 'nvfp4',
+                 kernelized: bool = False) -> None:
         """Construct the frontend.
 
         Args:
@@ -40,8 +41,11 @@ class Nexn2TorchFrontendRtx:
             * ``'nvfp4'`` (default): NVFP4 W4A16 for full-attn + MoE GEMM;
               GDN in_proj kept BF16.
             * ``'fp8'``: FP8 E4M3 block-128 weights.
-            In Phase 1 this only records intent; the shim loads the BF16
-            HF reference regardless.
+          kernelized: when False (default) load the BF16 HF reference and
+            delegate forward to it (Phase-1 fixture). When True load the
+            NVFP4-quantized weights directly via the fvk loader and run the
+            kernelized forward -- the production seam (fits the RTX 5090;
+            the BF16 reference does not).
         """
         if quant not in ('fp8', 'nvfp4'):
             raise ValueError(f"quant must be 'fp8' or 'nvfp4', got {quant!r}")
@@ -50,12 +54,18 @@ class Nexn2TorchFrontendRtx:
         self.device = device
         self._user_max_seq = int(max_seq)
         self._quant_format = quant
+        self._kernelized = bool(kernelized)
         self._tokenizer = None
         self._prompt_ids = None
         self._pipeline: Nexn2Pipeline | None = None
+        self._weights = None
+        self._fvk = None
         self.latency_records: list[float] = []
 
-        self._build_phase1_reference()
+        if self._kernelized:
+            self._build_kernelized_nvfp4()
+        else:
+            self._build_phase1_reference()
 
     def _build_phase1_reference(self) -> None:
         """Load tokenizer + HF reference model and wrap it in the Pipeline.
@@ -75,6 +85,26 @@ class Nexn2TorchFrontendRtx:
         hf_model.eval()
         self._pipeline = Nexn2Pipeline(hf_model)
 
+    def _build_kernelized_nvfp4(self) -> None:
+        """Load NVFP4 weights via the fvk loader and arm the kernel forward.
+
+        No HF model: the 35B-A3B checkpoint does not fit a 32 GB RTX 5090
+        in BF16. The loader streams each shard, quantizes the large GEMMs
+        to NVFP4 (GDN in_proj / norms / router kept BF16) and frees the
+        BF16 source as it goes, fitting in ~22 GB.
+        """
+        from transformers import AutoTokenizer
+
+        from flash_rt import flash_rt_kernels as fvk
+        from flash_rt.frontends.torch._nexn2_rtx_nvfp4_weights import (
+            extract_weights_nexn2_nvfp4,
+        )
+
+        self._tokenizer = AutoTokenizer.from_pretrained(self.checkpoint_path)
+        self._fvk = fvk
+        self._weights = extract_weights_nexn2_nvfp4(
+            self.checkpoint_path, fvk, device=self.device)
+
     def set_prompt(self, text: str) -> None:
         """Tokenize ``text`` for the next ``infer()`` / ``generate()`` call."""
         enc = self._tokenizer(text, return_tensors='pt')
@@ -88,6 +118,19 @@ class Nexn2TorchFrontendRtx:
         """
         if self._prompt_ids is None:
             raise ValueError('call set_prompt(...) before infer()')
+        if self._kernelized:
+            import torch
+
+            from flash_rt.frontends.torch._nexn2_rtx_forward import (
+                nexn2_forward_nvfp4,
+            )
+            t0 = time.perf_counter()
+            with torch.no_grad():
+                logits = nexn2_forward_nvfp4(
+                    self._weights, self._prompt_ids, self._fvk, self.device)
+            torch.cuda.synchronize()
+            self.latency_records.append(time.perf_counter() - t0)
+            return logits.unsqueeze(0)        # (1, S, vocab)
         t0 = time.perf_counter()
         logits = self._pipeline.forward(self._prompt_ids)
         self.latency_records.append(time.perf_counter() - t0)

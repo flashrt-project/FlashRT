@@ -129,6 +129,7 @@ def _bf16_from_ckpt(handles, out_dict, name, key, handles_d, wmap, device,
                     *, optional=False, fold_one=False) -> None:
     if optional and not _has(wmap, key):
         out_dict[name] = 0
+        out_dict[name + '_t'] = None
         return
     w = _get(handles_d, wmap, key)
     if fold_one:
@@ -140,6 +141,11 @@ def _bf16_from_ckpt(handles, out_dict, name, key, handles_d, wmap, device,
         t = _bf16_to_dev(w, device)
     out_dict[name] = _anchor(handles, t)
     out_dict[name + '_shape'] = tuple(t.shape)
+    # Named tensor handle: BF16-kept weights (norms, GDN in_proj, conv1d,
+    # A_log/dt_bias, router, shared gate, embed, lm_head) are consumed by
+    # the prefill forward as batched cuBLAS matmuls / elementwise inputs.
+    # The pointer in out_dict[name] stays for the M=1 matvec decode path.
+    out_dict[name + '_t'] = t
 
 
 def _load_moe(handles, ld, lp, handles_d, wmap, fvk, device,
@@ -201,6 +207,15 @@ def _load_moe(handles, ld, lp, handles_d, wmap, fvk, device,
     ld['experts_down_packed'] = _anchor(handles, dn_packed)
     ld['experts_down_sf'] = _anchor(handles, dn_sf)
     ld['experts_down_alpha'] = _anchor(handles, dn_alpha)
+    # Named tensor handles for per-expert slicing in the routed-expert
+    # grouped loop (stacked (E, N, K/2) packed / (E, sf_bytes) SF / (E,)
+    # alpha). gu_alpha / dn_alpha stay on host for cheap .item() per call.
+    ld['experts_gate_up_packed_t'] = gu_packed
+    ld['experts_gate_up_sf_t'] = gu_sf
+    ld['experts_gate_up_alpha_t'] = gu_alpha
+    ld['experts_down_packed_t'] = dn_packed
+    ld['experts_down_sf_t'] = dn_sf
+    ld['experts_down_alpha_t'] = dn_alpha
     ld['moe_intermediate'] = k_dn          # inter
     ld['n_experts'] = n_experts
 
