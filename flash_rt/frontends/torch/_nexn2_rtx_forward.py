@@ -109,9 +109,14 @@ def _gdn_layer(h, ld, fvk, device, eps):
     # causal depthwise conv1d + silu (torch glue; nexn2 dim=8192).
     xc = F.silu(F.conv1d(mixed.transpose(1, 2).float(), convw.float(),
                          groups=CONV, padding=KS - 1)[:, :, :S]).transpose(1, 2)
-    q, k, v = torch.split(xc, [KD, KD, VD], -1)
-    q, k = q.reshape(B, S, NK, HK), k.reshape(B, S, NK, HK)
-    v = v.reshape(B, S, NV, HV)
+    # split conv output + broadcast q/k 16 -> 32 heads in one fvk kernel.
+    xc_bf = xc.to(torch.bfloat16).reshape(B * S, CONV).contiguous()
+    qb = torch.empty(B, S, NV, HK, dtype=torch.bfloat16, device=device)
+    kb = torch.empty(B, S, NV, HK, dtype=torch.bfloat16, device=device)
+    vb = torch.empty(B, S, NV, HV, dtype=torch.bfloat16, device=device)
+    fvk.nexn2_lin_split_qkv_broadcast_bf16(
+        xc_bf.data_ptr(), qb.data_ptr(), kb.data_ptr(), vb.data_ptr(),
+        B * S, 0)
 
     neg = (-A_log.exp()).float().contiguous()
     dtb_c = dtb.contiguous()
@@ -123,10 +128,6 @@ def _gdn_layer(h, ld, fvk, device, eps):
         a_bf.data_ptr(), b_bf.data_ptr(), neg.data_ptr(), dtb_c.data_ptr(),
         g_out.data_ptr(), bo.data_ptr(), B * S, NV, 0)
 
-    # broadcast q/k 16 -> 32 heads (torch glue; needs new 16->32 .cu for graph).
-    qb = q.repeat_interleave(NV // NK, 2).contiguous()
-    kb = k.repeat_interleave(NV // NK, 2).contiguous()
-    vb = v.contiguous()
     state = torch.zeros(NV, HK, HV, dtype=torch.bfloat16, device=device)
     core = torch.empty(B, S, NV, HV, dtype=torch.bfloat16, device=device)
     for t in range(S):
@@ -157,9 +158,14 @@ def _full_attn_layer(h, ld, ct, st, fvk, device, eps):
     qnw, knw = ld['q_norm_w_t'], ld['k_norm_w_t']      # already (1+w)-folded
     x2 = h.reshape(B * S, HID)
 
-    qg = _proj(x2, ld, 'q_proj', NQ * 2 * HD, fvk, device)
-    qg = qg.view(B, S, NQ, 2 * HD)
-    q, gate = qg[..., :HD], qg[..., HD:].reshape(B, S, NQ * HD)
+    qg = _proj(x2, ld, 'q_proj', NQ * 2 * HD, fvk, device).contiguous()
+    # split interleaved [q_pre(256), gate(256)] per head via fvk kernel.
+    q_pre = torch.empty(B * S, NQ, HD, dtype=torch.bfloat16, device=device)
+    gate = torch.empty(B * S, NQ * HD, dtype=torch.bfloat16, device=device)
+    fvk.nexn2_split_q_gate_bf16(
+        qg.data_ptr(), q_pre.data_ptr(), gate.data_ptr(), B * S, 0)
+    q = q_pre.view(B, S, NQ, HD)
+    gate = gate.view(B, S, NQ * HD)
     q = _rms(q.to(torch.bfloat16), qnw, eps)
     k = _proj(x2, ld, 'k_proj', NKV * HD, fvk, device).view(B, S, NKV, HD)
     k = _rms(k, knw, eps)

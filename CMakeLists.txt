@@ -950,6 +950,7 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/silu_mul_qwen36.cu
   csrc/kernels/silu_mul_to_nvfp4_swizzled.cu
   csrc/kernels/qwen36_misc.cu
+  csrc/kernels/nexn2_misc.cu
   csrc/kernels/qwen3_qkv_post_proc.cu
   csrc/kernels/fp4_w4a4_matvec_sm120.cu
   csrc/kernels/fp4_w4a4_mma_sm120.cu

@@ -137,6 +137,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/rms_norm_gated_silu_qwen36.cuh"
 #include "kernels/silu_mul_qwen36.cuh"
 #include "kernels/qwen36_misc.cuh"
+#include "kernels/nexn2_misc.cuh"
 #include "kernels/bf16_matvec_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36_thor.cuh"
@@ -4457,6 +4458,29 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         [](uintptr_t q_proj, uintptr_t q_pre,
            uintptr_t gate, int S, uintptr_t stream) {
             flash_rt::kernels::qwen36_split_q_gate_bf16(
+                to_ptr(q_proj), to_ptr(q_pre), to_ptr(gate),
+                S, to_stream(stream));
+        },
+        py::arg("q_proj"), py::arg("q_pre"), py::arg("gate"),
+        py::arg("S"), py::arg("stream") = 0);
+
+    m.def("nexn2_lin_split_qkv_broadcast_bf16",
+        [](uintptr_t conv_out, uintptr_t q32,
+           uintptr_t k32, uintptr_t v32,
+           int S, uintptr_t stream) {
+            flash_rt::kernels::nexn2_lin_split_qkv_broadcast_bf16(
+                to_ptr(conv_out), to_ptr(q32),
+                to_ptr(k32), to_ptr(v32),
+                S, to_stream(stream));
+        },
+        py::arg("conv_out"), py::arg("q32"),
+        py::arg("k32"), py::arg("v32"),
+        py::arg("S"), py::arg("stream") = 0);
+
+    m.def("nexn2_split_q_gate_bf16",
+        [](uintptr_t q_proj, uintptr_t q_pre,
+           uintptr_t gate, int S, uintptr_t stream) {
+            flash_rt::kernels::nexn2_split_q_gate_bf16(
                 to_ptr(q_proj), to_ptr(q_pre), to_ptr(gate),
                 S, to_stream(stream));
         },
