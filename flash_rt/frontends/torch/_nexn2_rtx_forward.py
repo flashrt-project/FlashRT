@@ -690,7 +690,8 @@ def _moe_layer(h, ld, fvk, device):
     return (out + shared.float() * sgate).reshape(B, S, HID).to(torch.bfloat16)
 
 
-def nexn2_forward_nvfp4(handles, input_ids, fvk, device, cap=None):
+def nexn2_forward_nvfp4(handles, input_ids, fvk, device, cap=None,
+                        return_hidden=False):
     """Full kernelized NVFP4 prefill forward: token ids -> logits.
 
     Args:
@@ -732,6 +733,9 @@ def nexn2_forward_nvfp4(handles, input_ids, fvk, device, cap=None):
         n = _rms(h, ld['post_norm_w_t'], eps)
         h = res + _moe_layer(n, ld, fvk, device)
 
+    hidden = h[0]                       # (S, HID) residual stream, pre-final-norm
     h = _rms(h, p['final_norm_w_t'], eps)
     logits = h[0].float() @ p['lm_head_w_t'].float().T
+    if return_hidden:
+        return logits, hidden
     return logits
