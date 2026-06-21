@@ -26,7 +26,7 @@ import torch.nn.functional as F
 
 from flash_rt.frontends.torch._nexn2_rtx_forward import (
     CONV, HD, HID, HK, HV, INTER, KD, KS, NKV, NQ, NV, ROPE, TOPK, VD,
-    _quant_act, _rms, build_rope_tables,
+    _quant_act, build_rope_tables,
 )
 from flash_rt.frontends.torch._nexn2_rtx_nvfp4_weights import _sf_swz_bytes
 from flash_rt.hardware.rtx.attn_backend_nexn2 import RtxFlashAttnBackendNexn2
@@ -73,6 +73,19 @@ def _bf16_mv(x1k, w, fvk, device):
     fvk.bf16_matvec_qwen36_bf16(xc.data_ptr(), w.data_ptr(), y.data_ptr(),
                                 n, k, _cs())
     return y
+
+
+def _rms_fvk(x, w, fvk, device, eps):
+    """RMSNorm via the fused fvk kernel (fp32 internal) -- one launch vs the
+    ~6 torch elementwise ops of the reference _rms. w is the (1+w)-folded
+    weight; the kernel multiplies by it directly."""
+    shp = x.shape
+    k = shp[-1]
+    x2 = x.reshape(-1, k).contiguous()
+    out = torch.empty(x2.shape[0], k, dtype=torch.bfloat16, device=device)
+    fvk.rms_norm(x2.data_ptr(), w.data_ptr(), out.data_ptr(),
+                 x2.shape[0], k, eps, _cs())
+    return out.reshape(shp)
 
 
 def _proj_mma(x2d, ld, base, n, fvk, device):
@@ -237,8 +250,9 @@ def _decode_full(h, ld, state, full_rank, pos, fvk, device):
     gate = torch.empty(1, NQ * HD, dtype=torch.bfloat16, device=device)
     fvk.nexn2_split_q_gate_bf16(
         qg.data_ptr(), q_pre.data_ptr(), gate.data_ptr(), 1, s)
-    q = _rms(q_pre.reshape(NQ, HD), qnw, eps).reshape(1, NQ, HD)
-    k = _rms(k, knw, eps).reshape(1, NKV, HD)
+    q = _rms_fvk(q_pre.reshape(NQ, HD), qnw, fvk, device, eps).reshape(
+        1, NQ, HD)
+    k = _rms_fvk(k, knw, fvk, device, eps).reshape(1, NKV, HD)
 
     ct = state.rope_cos[pos:pos + 1].contiguous()
     st = state.rope_sin[pos:pos + 1].contiguous()
@@ -339,7 +353,7 @@ def decode_step(state, token_id, pos, fvk, device):
     for L in range(state.num_layers):
         ld = layers[L]
         res = h
-        n = _rms(h, ld['input_norm_w_t'], state.eps)
+        n = _rms_fvk(h, ld['input_norm_w_t'], fvk, device, state.eps)
         if state.types[L] == 'linear_attention':
             attn = _decode_gdn(n, ld, state, state._lin_rank[L], fvk, device)
         else:
@@ -347,10 +361,10 @@ def decode_step(state, token_id, pos, fvk, device):
                                 fvk, device)
         h = res + attn
         res = h
-        n = _rms(h, ld['post_norm_w_t'], state.eps)
+        n = _rms_fvk(h, ld['post_norm_w_t'], fvk, device, state.eps)
         h = res + _moe_layer_decode(n, ld, fvk, device)
 
-    h = _rms(h, p['final_norm_w_t'], state.eps)
+    h = _rms_fvk(h, p['final_norm_w_t'], fvk, device, state.eps)
     logits = h[0].float() @ p['lm_head_w_t'].float().T
     return logits
 
