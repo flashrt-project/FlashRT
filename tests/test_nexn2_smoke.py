@@ -45,11 +45,26 @@ def test_frontend_imports():
     assert hasattr(m, "Nexn2TorchFrontendRtx")
 
 
-def test_constructor_rejects_bad_quant():
-    """quant is validated before any weight load (no checkpoint touched)."""
+def test_constructor_rejects_unimplemented_quant():
+    """Only nvfp4 is wired; fp8 / others raise before any weight load."""
     from flash_rt.frontends.torch.nexn2_rtx import Nexn2TorchFrontendRtx
-    with pytest.raises(ValueError):
-        Nexn2TorchFrontendRtx("/nonexistent", quant="int4")
+    for q in ("fp8", "int4"):
+        with pytest.raises(NotImplementedError):
+            Nexn2TorchFrontendRtx("/nonexistent", quant=q)
+
+
+def test_require_kernels_fails_fast_on_missing_symbols():
+    """The kernelized path checks the gated symbols up front, so a build
+    without -DFLASHRT_ENABLE_QWEN35MOE=ON raises a clear RuntimeError instead
+    of crashing mid-forward after loading the 35B checkpoint."""
+    from flash_rt.frontends.torch.nexn2_rtx import _require_kernels
+
+    class _Empty:                      # stand-in for a non-gated fvk module
+        pass
+
+    with pytest.raises(RuntimeError) as ei:
+        _require_kernels(_Empty())
+    assert "FLASHRT_ENABLE_QWEN35MOE" in str(ei.value)
 
 
 def test_static_dims_consistent():

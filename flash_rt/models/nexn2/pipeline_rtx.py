@@ -1,22 +1,12 @@
-"""FlashRT -- RTX SM120 Nex-N2-mini inference pipeline.
+"""FlashRT -- Nex-N2-mini static dims + BF16 reference pipeline.
 
-Phase 1 implementation: PyTorch-eager wrapper around the HF reference
-model. The class shape, file layout, and frontend contract are real;
-the compute path is a thin shim over HF until Phase 2 starts replacing
-it kernel-by-kernel with fvk calls.
-
-Why ship a Phase-1 shim that doesn't use fvk yet:
-  * Locks the file layout and class names so the frontend contract
-    resolves before any kernel work lands.
-  * Lets us write the cosine regression test (vs the Phase-0 HF
-    reference) against the same Pipeline + Frontend objects we keep
-    through Phase 2/3/4 -- only the internals get swapped, never the
-    seams.
-
-What this file does NOT do yet (intentionally, by Phase plan):
-  * No fvk kernel calls -- those land in Phase 2.
-  * No CUDA Graph capture, no FP8/NVFP4 calibration -- Phase 3.
-  * No KV / GDN-state cache management beyond what HF provides -- Phase 3.
+This module holds the static dimension constants (``Nexn2Dims``) and the
+``Nexn2Pipeline`` BF16-eager wrapper around the HF reference model. The
+reference pipeline is used **only** when the frontend is constructed with
+``kernelized=False`` (the correctness baseline for the golden cosine fixture);
+the production path -- NVFP4 kernels, CUDA-graph decode, chunked long-context
+prefill -- lives in the frontend forward/decode modules
+(``flash_rt.frontends.torch._nexn2_rtx_{forward,decode}``), not here.
 
 Architecture summary (Nex-N2-mini = model_type qwen3_5_moe)::
 
@@ -39,8 +29,8 @@ Architecture summary (Nex-N2-mini = model_type qwen3_5_moe)::
         v
     [logits: (B, S, 248320)]
 
-    Plus a native MTP (multi-token-prediction) head with 1 full-attn
-    layer (shares the main embeddings), used for speculative decoding.
+The config declares one MTP (multi-token-prediction) layer, but the released
+Nex-N2-mini checkpoint ships no MTP tensors, so speculative decode is not wired.
 """
 
 from __future__ import annotations

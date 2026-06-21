@@ -21,7 +21,7 @@ frontend directly.
 | Hardware | RTX 5090 / Blackwell **SM120** only |
 | GPU memory | ≥ 32 GB (NVFP4 weights ~22 GB resident) |
 | Framework | PyTorch (`torch`) |
-| Weight quant | `nvfp4` (default) or `fp8` |
+| Weight quant | `nvfp4` |
 | Build flag | `-DFLASHRT_ENABLE_QWEN35MOE=ON` (required) |
 | Prefill | up to ~16.4k tok/s (see table) |
 | Decode | ~250 tok/s, token-exact CUDA-graph |
@@ -80,7 +80,7 @@ Nexn2TorchFrontendRtx(
     *,
     device: str = "cuda:0",
     max_seq: int = 2048,        # KV cache + scratch sized to this
-    quant: str = "nvfp4",       # "nvfp4" or "fp8"
+    quant: str = "nvfp4",       # only "nvfp4" is implemented
     kernelized: bool = False,   # see below
     quant_scope: str = "full",  # see below
 )
@@ -91,7 +91,7 @@ Nexn2TorchFrontendRtx(
 | `checkpoint_path` | path | HF checkpoint directory (config + safetensors + tokenizer). |
 | `device` | `"cuda"`, `"cuda:N"` | Target GPU. SM120 required for `kernelized=True`. |
 | `max_seq` | int | Max prompt+generation length; KV cache and decode scratch are sized to it. |
-| `quant` | `"nvfp4"`, `"fp8"` | Weight quantization for the kernel path. |
+| `quant` | `"nvfp4"` | Weight quantization; only `nvfp4` is implemented. |
 | `kernelized` | `False` (default) | BF16 HF reference model (needs the full BF16 weights, >32 GB). For correctness/golden only. |
 | | `True` | NVFP4 kernel forward/decode — the production path, fits 32 GB. |
 | `quant_scope` | `"experts"` (recommended) | Only routed experts are NVFP4; dense projections run the deterministic BF16-weight w16a16 GEMM → prefill cos ~0.99, bit-reproducible. |
