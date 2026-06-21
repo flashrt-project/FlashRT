@@ -25,7 +25,7 @@ import torch
 import torch.nn.functional as F
 
 from flash_rt.frontends.torch._nexn2_rtx_forward import (
-    CONV, HD, HID, HK, HV, INTER, KS, NKV, NQ, NV, ROPE, TOPK, VD,
+    CONV, HD, HID, HK, HV, INTER, KD, KS, NKV, NQ, NV, ROPE, TOPK, VD,
     _quant_act, _rms, build_rope_tables,
 )
 from flash_rt.frontends.torch._nexn2_rtx_nvfp4_weights import _sf_swz_bytes
@@ -156,10 +156,17 @@ def _decode_gdn(h, ld, state, lin_rank, fvk, device):
 
     s = _cs()
     h2 = h.reshape(1, HID)
-    mixed = _bf16_mv(h2, Wqkv, fvk, device).contiguous()
-    z = _bf16_mv(h2, Wz, fvk, device).reshape(NV, HV).contiguous()
-    a = _bf16_mv(h2, Wa, fvk, device).contiguous()
-    b = _bf16_mv(h2, Wb, fvk, device).contiguous()
+    # Fuse the 4 K=2048 in_proj GEMVs into one matvec: under CUDA graph the
+    # kernels run serially and each pays a fixed K-loop latency regardless of
+    # N, so one (12352, 2048) matvec replaces four (saves 3 K-loops/layer).
+    if 'in_proj_fused_w' not in ld:
+        ld['in_proj_fused_w'] = torch.cat(
+            [Wqkv, Wz, Wa, Wb], 0).contiguous()
+    fused = _bf16_mv(h2, ld['in_proj_fused_w'], fvk, device)
+    mixed = fused[:, :KD * 2 + VD].contiguous()
+    z = fused[:, KD * 2 + VD:KD * 2 + VD + NV * HV].reshape(NV, HV).contiguous()
+    a = fused[:, -2 * NV:-NV].contiguous()
+    b = fused[:, -NV:].contiguous()
 
     # causal conv1d state-update (no bias) + silu.
     conv_out = torch.empty(1, CONV, dtype=torch.bfloat16, device=device)
@@ -211,15 +218,27 @@ def _decode_full(h, ld, state, full_rank, pos, fvk, device):
     qnw, knw = ld['q_norm_w_t'], ld['k_norm_w_t']
     x2 = h.reshape(1, HID)
 
-    qg = _proj_mma(x2, ld, 'q_proj', NQ * 2 * HD, fvk, device).contiguous()
+    nqg = NQ * 2 * HD
+    if ld.get('q_proj_packed') is None:     # experts-scope: fuse BF16 q/k/v
+        if 'qkv_fused_w' not in ld:
+            ld['qkv_fused_w'] = torch.cat(
+                [ld['q_proj_w_t'], ld['k_proj_w_t'], ld['v_proj_w_t']],
+                0).contiguous()
+        fused = _bf16_mv(x2, ld['qkv_fused_w'], fvk, device)
+        qg = fused[:, :nqg].contiguous()
+        k = fused[:, nqg:nqg + NKV * HD].reshape(NKV, HD)
+        v = fused[:, nqg + NKV * HD:].reshape(1, NKV, HD)
+    else:
+        qg = _proj_mma(x2, ld, 'q_proj', nqg, fvk, device).contiguous()
+        k = _proj_mma(x2, ld, 'k_proj', NKV * HD, fvk, device).reshape(NKV, HD)
+        v = _proj_mma(x2, ld, 'v_proj', NKV * HD, fvk, device).reshape(
+            1, NKV, HD)
     q_pre = torch.empty(1, NQ, HD, dtype=torch.bfloat16, device=device)
     gate = torch.empty(1, NQ * HD, dtype=torch.bfloat16, device=device)
     fvk.nexn2_split_q_gate_bf16(
         qg.data_ptr(), q_pre.data_ptr(), gate.data_ptr(), 1, s)
     q = _rms(q_pre.reshape(NQ, HD), qnw, eps).reshape(1, NQ, HD)
-    k = _proj_mma(x2, ld, 'k_proj', NKV * HD, fvk, device).reshape(NKV, HD)
     k = _rms(k, knw, eps).reshape(1, NKV, HD)
-    v = _proj_mma(x2, ld, 'v_proj', NKV * HD, fvk, device).reshape(1, NKV, HD)
 
     ct = state.rope_cos[pos:pos + 1].contiguous()
     st = state.rope_sin[pos:pos + 1].contiguous()
@@ -292,8 +311,16 @@ def _moe_layer_decode(h, ld, fvk, device):
         n_dn * (INTER // 2), _sf_swz_bytes(n_dn, INTER), s)
     out = (d_dn.float() * tw_row.unsqueeze(-1)).sum(0, keepdim=True)
 
-    sg = _proj_mma(x, ld, 'shared_gate_proj', INTER, fvk, device)
-    su = _proj_mma(x, ld, 'shared_up_proj', INTER, fvk, device)
+    if ld.get('shared_gate_proj_packed') is None:    # experts-scope: fuse g/u
+        if 'shared_gu_fused_w' not in ld:
+            ld['shared_gu_fused_w'] = torch.cat(
+                [ld['shared_gate_proj_w_t'], ld['shared_up_proj_w_t']],
+                0).contiguous()
+        gu = _bf16_mv(x, ld['shared_gu_fused_w'], fvk, device)
+        sg, su = gu[:, :INTER], gu[:, INTER:]
+    else:
+        sg = _proj_mma(x, ld, 'shared_gate_proj', INTER, fvk, device)
+        su = _proj_mma(x, ld, 'shared_up_proj', INTER, fvk, device)
     si = (F.silu(sg.float()) * su.float()).to(torch.bfloat16)
     shared = _proj_mma(si, ld, 'shared_down_proj', HID, fvk, device)
     sgate = torch.sigmoid(x.float() @ ld['shared_gate_w_t'].float().T)
