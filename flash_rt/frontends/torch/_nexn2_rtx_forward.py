@@ -108,8 +108,13 @@ def _nvfp4_gemm(x2d, wp_ptr, wsf_ptr, alpha, n, fvk, device, stream=0):
                             fvk, device, stream)
 
 
-def _gdn_layer(h, ld, fvk, device, eps):
-    """Gated DeltaNet (linear_attention) layer. h (1,S,HID) -> (1,S,HID)."""
+def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None):
+    """Gated DeltaNet (linear_attention) layer. h (1,S,HID) -> (1,S,HID).
+
+    When ``cap`` is given (a Nexn2DecodeState), the final recurrent state and
+    the last KS-1 conv inputs are written into its decode buffers so a batched
+    prefill leaves exactly the state the per-token decode path would.
+    """
     B, S, _ = h.shape
     Wqkv = ld['in_proj_qkv_w_t']
     Wz = ld['in_proj_z_w_t']
@@ -160,6 +165,14 @@ def _gdn_layer(h, ld, fvk, device, eps):
             btt.data_ptr(), state.data_ptr(), ot.data_ptr(),
             1, NV, HK, HV, True, 0)
 
+    if cap is not None:
+        # GDN recurrent final state = `state` after the S-step scan; conv state
+        # = the last KS-1 `mixed` inputs (channel-major, newest at index -1),
+        # matching the causal_conv1d_update rolling buffer (1, CONV, KS-1).
+        cap.lin_state[rank].copy_(state)
+        cs = mixed[0, S - (KS - 1):S, :].transpose(0, 1).contiguous()
+        cap.lin_conv_state[rank].copy_(cs.unsqueeze(0))
+
     cf = core.reshape(-1, HV).contiguous()
     zf = z.reshape(-1, HV).to(torch.bfloat16).contiguous()
     nf = torch.empty_like(cf)
@@ -170,8 +183,13 @@ def _gdn_layer(h, ld, fvk, device, eps):
     return out.reshape(B, S, HID)
 
 
-def _full_attn_layer(h, ld, ct, st, fvk, device, eps):
-    """Full GQA attention layer with output gate + partial RoPE."""
+def _full_attn_layer(h, ld, ct, st, fvk, device, eps, cap=None, rank=None):
+    """Full GQA attention layer with output gate + partial RoPE.
+
+    When ``cap`` is given, the RoPE'd K and V for all S positions are written
+    into the decode KV cache so a batched prefill seeds the same cache the
+    per-token decode would.
+    """
     B, S, _ = h.shape
     qnw, knw = ld['q_norm_w_t'], ld['k_norm_w_t']      # already (1+w)-folded
     x2 = h.reshape(B * S, HID)
@@ -197,6 +215,12 @@ def _full_attn_layer(h, ld, ct, st, fvk, device, eps):
     fvk.qwen36_partial_rope_qk_bf16(
         qin.data_ptr(), kin.data_ptr(), ctc.data_ptr(), stc.data_ptr(),
         qo.data_ptr(), ko.data_ptr(), S, NQ, NKV, HD, ROPE, 0)
+
+    if cap is not None:
+        # Seed the decode KV cache: RoPE'd K + raw V for all S positions,
+        # exactly what the per-token decode writes at each pos.
+        cap.attn.K_cache[rank, :S].copy_(ko.reshape(S, NKV, HD))
+        cap.attn.V_cache[rank, :S].copy_(v.reshape(S, NKV, HD))
 
     qa = qo.reshape(B, S, NQ, HD).transpose(1, 2)
     ka = ko.reshape(B, S, NKV, HD).transpose(1, 2).repeat_interleave(NQ // NKV, 1)
@@ -252,7 +276,7 @@ def _moe_layer(h, ld, fvk, device):
     return (out + shared.float() * sgate).reshape(B, S, HID).to(torch.bfloat16)
 
 
-def nexn2_forward_nvfp4(handles, input_ids, fvk, device):
+def nexn2_forward_nvfp4(handles, input_ids, fvk, device, cap=None):
     """Full kernelized NVFP4 prefill forward: token ids -> logits.
 
     Args:
@@ -260,6 +284,9 @@ def nexn2_forward_nvfp4(handles, input_ids, fvk, device):
         input_ids: (1, S) long on device.
         fvk: flash_rt_kernels module.
         device: cuda device string.
+        cap: optional Nexn2DecodeState; when given, the GDN recurrent/conv
+            state and the full-attn KV cache are seeded so a subsequent decode
+            continues from position S (batched prefill).
 
     Returns:
         logits: (S, vocab) fp32 on device.
@@ -274,14 +301,18 @@ def nexn2_forward_nvfp4(handles, input_ids, fvk, device):
     h = F.embedding(input_ids, p['embed_w_t'])
     S = h.shape[1]
     ct, st = build_rope_tables(S, theta, rope_dim, device)
+    lin_rank = full_rank = 0
     for L in range(p['num_layers']):
         ld = layers[L]
         res = h
         n = _rms(h, ld['input_norm_w_t'], eps)
         if types[L] == 'linear_attention':
-            attn = _gdn_layer(n, ld, fvk, device, eps)
+            attn = _gdn_layer(n, ld, fvk, device, eps, cap, lin_rank)
+            lin_rank += 1
         else:
-            attn = _full_attn_layer(n, ld, ct, st, fvk, device, eps)
+            attn = _full_attn_layer(n, ld, ct, st, fvk, device, eps,
+                                    cap, full_rank)
+            full_rank += 1
         h = res + attn
         res = h
         n = _rms(h, ld['post_norm_w_t'], eps)

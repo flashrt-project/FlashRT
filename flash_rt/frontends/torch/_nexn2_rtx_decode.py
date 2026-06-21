@@ -26,7 +26,7 @@ import torch.nn.functional as F
 
 from flash_rt.frontends.torch._nexn2_rtx_forward import (
     CONV, HD, HID, HK, HV, INTER, KD, KS, NKV, NQ, NV, ROPE, TOPK, VD,
-    _quant_act, build_rope_tables,
+    _quant_act, build_rope_tables, nexn2_forward_nvfp4,
 )
 from flash_rt.frontends.torch._nexn2_rtx_nvfp4_weights import _sf_swz_bytes
 from flash_rt.hardware.rtx.attn_backend_nexn2 import RtxFlashAttnBackendNexn2
@@ -469,6 +469,21 @@ def seed_prefill(state, input_ids, fvk, device):
     for pos in range(ids.shape[0]):
         last = decode_step(state, ids[pos:pos + 1], pos, fvk, device)
     return last
+
+
+def seed_prefill_batched(state, input_ids, fvk, device):
+    """Batched prefill: one forward pass over the whole prompt seeds the decode
+    state (GDN recurrent/conv + KV cache), instead of looping the per-token
+    decode S times. Returns the last-token logits (1, vocab).
+
+    Produces the same decode state as ``seed_prefill`` (the per-token path) but
+    runs the prompt through batched (M=S) projections / attention, which is far
+    faster for long prompts. The state capture is done inside the forward layers
+    when ``cap`` is passed (see _gdn_layer / _full_attn_layer)."""
+    state.reset()
+    logits = nexn2_forward_nvfp4(
+        state.handles, input_ids.view(1, -1), fvk, device, cap=state)
+    return logits[-1:].contiguous()
 
 
 def generate_greedy(state, input_ids, max_new_tokens, fvk, device):
