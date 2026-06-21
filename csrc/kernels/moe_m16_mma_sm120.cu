@@ -76,6 +76,9 @@ __global__ void moe_m16_mma_kernel(
     int N, int K, long sfa_stride, long w_stride, long sfb_stride) {
   const int tile = blockIdx.y;
   const int e = tile_expert[tile];
+  // Sentinel for padded/empty tiles (sync-free fixed-grid caller marks unused
+  // tiles e=-1); early-exit. Backward-compatible with e>=0-only callers.
+  if (e < 0) return;
   const uint8_t* A_packed = A_tiled + (long)tile * 16 * (K / 2);
   // SFA is the single batched-quant swizzle of all (num_tiles*16) rows; each
   // row reads its global-row swizzle offset (sfa_stride unused).

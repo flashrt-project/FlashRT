@@ -83,6 +83,11 @@ __global__ __launch_bounds__(BT_THREADS) void moe_bt_mma_kernel(
     int N, int K, long sfa_stride, long w_stride, long sfb_stride) {
   const int tile = blockIdx.y;
   const int e = tile_expert[tile];
+  // Sentinel for padded/empty tiles: the caller may launch a fixed worst-case
+  // grid (sync-free tile count) and mark unused tiles e=-1; they early-exit
+  // here (cheap: one load + return). Backward-compatible -- callers that pass
+  // only valid e>=0 are unaffected.
+  if (e < 0) return;
   const uint8_t* A_packed = A_tiled + (long)tile * BT_BM * (K / 2);
   const uint8_t* SFA = SFA_tiled;
   const uint8_t* B_packed = B_stack + (long)e * w_stride;

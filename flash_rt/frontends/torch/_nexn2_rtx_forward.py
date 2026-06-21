@@ -1,25 +1,26 @@
 """FlashRT -- Nex-N2-mini (qwen3_5_moe) kernelized NVFP4 forward.
 
-Production forward that drives the fvk kernels off the pre-quantized
-:class:`WeightHandles` produced by ``extract_weights_nexn2_nvfp4`` -- the
-load-once seam that replaces the Phase-1 HF shim. It reproduces the
-component-validated assembly (GDN recurrent, full GQA attn, fine-grained
-MoE) used to lock the golden cosine fixture, sourcing every weight from
-the loader instead of re-reading safetensors.
+Production prefill forward (S>1) that drives the fvk SM120 kernels off the
+pre-quantized :class:`WeightHandles` produced by ``extract_weights_nexn2_nvfp4``.
+Every heavy op runs on a FlashRT kernel -- no ``torch`` matmul, no
+``F.scaled_dot_product_attention``, no host-side sync in the hot path -- so the
+prefill is fully on-device and bit-reproducible (it seeds the decode state).
 
-Compute split (this milestone -- prefill, S>1):
-  * NVFP4 W4A16 GEMMs (full-attn q/k/v/o, GDN out_proj, MoE routed +
-    shared experts): ``quantize_bf16_to_nvfp4_swizzled`` +
-    ``fp4_w4a16_gemm_sm120_bf16out`` off the loader's packed / SF / alpha.
-  * GDN gating / recurrent / gated-norm, partial RoPE: shared fvk kernels
-    (parameterised, validated at the Nex-N2 head counts).
-  * BF16-kept projections (GDN in_proj -- red line, router, shared gate,
-    embed, lm_head): batched cuBLAS matmul (fp32 accumulate).
-  * Full-attn: the vendored FA2 causal kernel (flash_rt_fa2.fwd_bf16_causal),
-    native GQA (no KV repeat_interleave). Winner of the prefill attention
-    meta-test (cos 1.0; beats flash_attn pip / Sage[HD=256 unsupported] / the
-    fp32 cublas-decomposed MHA) -- see nexn2_dev/tests/phase_attn_metatest.py.
-  * Glue still on torch (kernelised incrementally): MoE routing, residual adds.
+Compute path:
+  * Dense projections (full-attn q/k/v/o, GDN in/out_proj, router, shared
+    gate/up/down, lm_head): the deterministic ``w16a16_gemm_sm120`` (BF16
+    weight x BF16 act, FP32 register accumulate, single pass over K). Matches
+    the fp32 argmax, bit-identical run-to-run -- so it can seed decode. The
+    non-red-line projections may instead take NVFP4 W4A16 under
+    ``quant_scope='full'`` (``fp4_w4a16_gemm_sm120``).
+  * Full-attn: vendored FA2 causal (``flash_rt_fa2.fwd_bf16_causal``), native
+    GQA (KV stays at 2 heads, no repeat_interleave). Winner of the prefill
+    attention meta-test (cos 1.0; beats flash_attn pip ~4%, Sage rejects
+    HD=256) -- see nexn2_dev/tests/phase_attn_metatest.py.
+  * GDN linear attn: WY chunked delta-rule (``linear_attn_gdn_wy_*``) +
+    fused gating / gated-norm / causal-conv1d / partial-RoPE kernels.
+  * MoE: NVFP4 block-tile mma (``moe_blocktile_mma_sm120``) over sync-free
+    tiles + deterministic unpermute; router softmax/topk on torch CUDA ops.
 
 All fvk pointer args bind to named tensors first -- an inline
 ``x.to(bf16).contiguous().data_ptr()`` temporary is GC'd before the
@@ -150,14 +151,12 @@ def _gemm_w4a16(x2d, w, ld, key, fvk, device):
     return y
 
 
-# The experts-scope dense projections run as `.float() @ .float().T` -- a full
-# fp32 (TF32) tensor-op which on sm120 is ~10x slower than the fp4 block-scaled
-# GEMM. Routing the non-red-line projections (full-attn q/k/v/o, GDN out_proj,
-# shared expert) through the fp4 W4A4 GEMM (weight quantised once) crosses the
-# llama.cpp 9.5k prefill target (9686 tok/s) but the fp4 *activation* drops cos
-# to 0.987 (within the 0.984 red line, tight). Off by default; the true W4A16
-# kernel (w4a16_gemm_sm120, bf16 activation, correct but needs occupancy tuning
-# to beat the fp32 path) is the precision-preserving replacement in progress.
+# A/B option (off by default): route the non-red-line dense projections
+# (full-attn q/k/v/o, GDN out_proj, shared expert) through the fp4 W4A4 GEMM
+# (weight quantised once). It crosses the llama.cpp prefill target but the fp4
+# *activation* drops cos to 0.987 (tight against the 0.984 red line), so the
+# shipped default is the BF16-weight w16a16 GEMM below (_DENSE_W16A16) -- same
+# argmax as fp32, deterministic, ~1.75x. _DENSE_FP4 is kept only for bisection.
 _DENSE_FP4 = False
 
 
@@ -624,38 +623,67 @@ def _moe_experts_bt(x, ti, tw, ld, fvk, device):
 
     exp_flat = ti.reshape(-1).to(torch.int32)
     tok_flat = torch.arange(S, device=device).repeat_interleave(TOPK)
-    order = exp_flat.argsort()
+    # Stable sort: equal-expert ties keep token order, so the tokens packed into
+    # each fp4-quant tile (and thus the per-block scale factors / rounding) are
+    # deterministic run-to-run. Prefill seeds the decode state, so this keeps the
+    # token-exact red line (an unstable sort jitters the MoE output ~1e-3 cos).
+    order = exp_flat.argsort(stable=True)
     se = exp_flat[order].long()
     stok = tok_flat[order]
     sw = tw.reshape(-1)[order]
     counts = torch.bincount(se, minlength=E)
     tile_counts = (counts + 63) // 64
-    tile_off = torch.cumsum(tile_counts, 0) - tile_counts
-    total_tiles = int(tile_counts.sum().item())
-    tile_expert = torch.repeat_interleave(
-        torch.arange(E, device=device), tile_counts).to(torch.int32)
+    tcum = torch.cumsum(tile_counts, 0)               # inclusive prefix (E,)
+    tile_off = tcum - tile_counts                     # each expert's start tile
+    total_tiles = tcum[-1]                            # device scalar (no .item())
+    # The exact tile count is data-dependent, so the old code read it to the
+    # host (.sum().item()) and built tile_expert via repeat_interleave (whose
+    # output size also forces a sync) -- two host stalls every MoE layer. The
+    # worst case is host-known from S (each expert rounds up by <1 tile, so
+    # total_tiles <= S*TOPK//64 + E), so size the grid + buffers to that fixed
+    # bound and mark the unused tail tiles e=-1 (they early-exit in the kernel:
+    # one load + return, no over-compute). Fully sync-free.
+    MAX_TILES = (S * TOPK) // 64 + E
+    tidx = torch.arange(MAX_TILES, device=device)
+    # tile t belongs to the smallest expert e with tcum[e] > t (searchsorted
+    # right); tiles past total_tiles get the sentinel -1.
+    tile_expert = torch.searchsorted(tcum, tidx, right=True).to(torch.int32)
+    tile_expert = torch.where(tidx < total_tiles, tile_expert,
+                              torch.full_like(tile_expert, -1))
     cumcount = torch.cumsum(counts, 0) - counts
     pos = torch.arange(S * TOPK, device=device) - cumcount[se]
     tiled_row = (tile_off[se] + pos // 64) * 64 + (pos % 64)
 
-    A_t = torch.zeros(total_tiles * 64, HID, dtype=torch.bfloat16, device=device)
+    A_t = torch.zeros(MAX_TILES * 64, HID, dtype=torch.bfloat16, device=device)
     A_t[tiled_row] = x[stok]
     ap, asf = _quant_act(A_t, fvk, device)
-    d_gu = torch.empty(total_tiles * 64, n_gu, dtype=torch.bfloat16, device=device)
+    # d_gu/d_dn rows for the e=-1 tail tiles are never written (kernel exits)
+    # and never gathered (tiled_row only indexes real slots), so their
+    # uninitialised contents can't reach the output -- empty is safe.
+    d_gu = torch.empty(MAX_TILES * 64, n_gu, dtype=torch.bfloat16, device=device)
     fvk.moe_blocktile_mma_sm120_bf16(
         ap.data_ptr(), gu_p.data_ptr(), asf.data_ptr(), gu_s.data_ptr(),
         d_gu.data_ptr(), gu_a.data_ptr(), tile_expert.data_ptr(),
-        total_tiles, n_gu, HID, 0, gu_p[0].numel(), gu_s[0].numel(), 0)
+        MAX_TILES, n_gu, HID, 0, gu_p[0].numel(), gu_s[0].numel(), 0)
     inter = _silu_mul(d_gu[:, :INTER], d_gu[:, INTER:], fvk, device).contiguous()
     ip, isf = _quant_act(inter, fvk, device)
-    d_dn = torch.empty(total_tiles * 64, n_dn, dtype=torch.bfloat16, device=device)
+    d_dn = torch.empty(MAX_TILES * 64, n_dn, dtype=torch.bfloat16, device=device)
     fvk.moe_blocktile_mma_sm120_bf16(
         ip.data_ptr(), dn_p.data_ptr(), isf.data_ptr(), dn_s.data_ptr(),
         d_dn.data_ptr(), dn_a.data_ptr(), tile_expert.data_ptr(),
-        total_tiles, n_dn, INTER, 0, dn_p[0].numel(), dn_s[0].numel(), 0)
-    out = torch.zeros(S, HID, device=device)
-    out.index_add_(0, stok, d_dn[tiled_row].float() * sw.unsqueeze(-1))
-    return out
+        MAX_TILES, n_dn, INTER, 0, dn_p[0].numel(), dn_s[0].numel(), 0)
+    # Deterministic unpermute, no atomics and no full-width scatter: invert the
+    # routing permutation (inv: orig slot -> sorted position, a 131 KB int
+    # scatter), gather each token's TOPK expert-output rows into (S, TOPK, HID)
+    # in original order, and sum over TOPK with the (already token-ordered)
+    # router weights. The sum order is fixed -> bit-reproducible (index_add_'s
+    # atomicAdd over the 8 slots/token jittered the cos ~1e-3 and broke the
+    # token-exact decode seed; an explicit (slots, HID) scatter+sum was
+    # deterministic but moved an extra 134 MB/layer).
+    inv = torch.empty(S * TOPK, dtype=torch.long, device=device)
+    inv[order] = torch.arange(S * TOPK, device=device)
+    rows = tiled_row[inv].view(S, TOPK)        # d_dn row for each (token, k)
+    return (d_dn[rows].float() * tw.unsqueeze(-1)).sum(1)
 
 
 def _moe_experts_grouped(x, ti, tw, ld, fvk, device):
