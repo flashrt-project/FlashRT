@@ -68,9 +68,33 @@ def _proj(x2d, ld, base, n, fvk, device):
         return _nvfp4_gemm(x2d, ld[base + '_packed'], ld[base + '_sf'],
                            ld[base + '_alpha'], n, fvk, device)
     w = ld[base + '_w_t']
+    if (_DENSE_W4A16 and x2d.shape[0] >= 64 and (w.shape[0] % 64) == 0
+            and (x2d.shape[1] % 64) == 0):
+        return _gemm_w4a16(x2d, w, ld, base + '_w_t', fvk, device)
     if _DENSE_FP4:
         return _gemm_fp4(x2d, w, ld, base + '_w_t', fvk, device)
     return (x2d.float() @ w.float().T).to(torch.bfloat16)
+
+
+# True W4A16 (bf16 activation x fp4 weight) GEMM for the large prefill dense
+# projections: 2.18x the fp32 path. BUT the cos cost of the dense proj is the
+# fp4 *weight* (not the activation), so W4A16 lands at the same ~0.987 as W4A4
+# while being slower than the CUTLASS W4A4 -- dominated. Default OFF; the 0.994
+# path needs a bf16-*weight* GEMM (repurpose this kernel's 2.18x structure).
+_DENSE_W4A16 = False
+
+
+def _gemm_w4a16(x2d, w, ld, key, fvk, device):
+    """y = x @ w.T via the bf16-act x fp4-weight tensor-core GEMM. Weight
+    quantised to NVFP4 once (cached); activation stays BF16 (precise)."""
+    m, k = x2d.shape
+    p, s, a = _wquant(w, ld, key, fvk, device)
+    n = p.shape[0]
+    xc = x2d.contiguous()
+    y = torch.empty(m, n, dtype=torch.bfloat16, device=device)
+    fvk.nexn2_w4a16_gemm_bf16(xc.data_ptr(), p.data_ptr(), s.data_ptr(),
+                              y.data_ptr(), m, n, k, a, 0)
+    return y
 
 
 # The experts-scope dense projections run as `.float() @ .float().T` -- a full

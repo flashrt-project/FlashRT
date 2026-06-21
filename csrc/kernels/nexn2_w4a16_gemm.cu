@@ -35,6 +35,7 @@ constexpr int GM_BN = 64;          // CTA N tile
 constexpr int GM_BK = 16;          // mma K
 constexpr int GM_KT = 64;          // K-tile per cp.async stage (4 mma chunks)
 constexpr int GM_KSUB = GM_KT / GM_BK;
+constexpr int GM_AS = GM_KT + 8;   // padded sA row stride (kills A bank conflicts)
 constexpr int GM_WARPS = 4;
 constexpr int GM_THREADS = GM_WARPS * 32;
 constexpr int GM_WN = 2;           // warp grid along N
@@ -52,6 +53,11 @@ __device__ __forceinline__ void cpcommit() {
 __device__ __forceinline__ void cpwait(int n) {
   if (n == 0) asm volatile("cp.async.wait_group 0;\n" ::);
   else asm volatile("cp.async.wait_group 1;\n" ::);
+}
+
+__device__ __forceinline__ uint32_t pack_bf16x2(float a, float b) {
+  __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
+  return *reinterpret_cast<uint32_t*>(&v);
 }
 
 __device__ __forceinline__ void mma_m16n8k16(
@@ -75,10 +81,9 @@ __global__ __launch_bounds__(GM_THREADS) void w4a16_gemm_kernel(
   const int bm = blockIdx.y * GM_BM;
   const int bn = blockIdx.x * GM_BN;
 
-  __shared__ __nv_bfloat16 sA[2][GM_BM * GM_KT];   // activation (bf16, 2-stage)
+  __shared__ __nv_bfloat16 sA[2][GM_BM * GM_AS];   // activation (bf16, 2-stage)
   __shared__ uint8_t sWq[2][GM_BN * (GM_KT / 2)];  // weight (NVFP4, 2-stage)
   __shared__ uint8_t sSFB[2][GM_BN * GM_KSUB];     // weight SF (2-stage)
-  __shared__ __nv_bfloat16 sW[GM_BN * GM_KT];      // dequanted weight
 
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
@@ -108,7 +113,7 @@ __global__ __launch_bounds__(GM_THREADS) void w4a16_gemm_kernel(
       int row = idx / GM_KT;
       int koff = idx % GM_KT;
       int gm = bm + row; if (gm >= M) gm = M - 1;
-      cp16(&sA[buf][idx], &X[(size_t)gm * K + k0 + koff]);
+      cp16(&sA[buf][row * GM_AS + koff], &X[(size_t)gm * K + k0 + koff]);
     }
     // sWq: BN x KT_half bytes via cp.async 16B. 64*32=2048 B = 128 cp16.
 #pragma unroll
@@ -147,50 +152,42 @@ __global__ __launch_bounds__(GM_THREADS) void w4a16_gemm_kernel(
     cpwait(kt + 1 < n_tiles ? 1 : 0);
     __syncthreads();
 
-    // Dequant sWq[cur] + sSFB[cur] -> sW (BN x KT bf16). One 16-K sub / item;
-    // BN*KSUB items, 128 threads -> (BN*KSUB)/128 each.
-    const float gn_valid_sf = alpha;
-#pragma unroll
-    for (int it = 0; it < (GM_BN * GM_KSUB) / GM_THREADS; ++it) {
-      int i = tid + it * GM_THREADS;
-      int col = i / GM_KSUB;
-      int sub = i % GM_KSUB;
-      float sf = c_w4a16_ue4m3[sSFB[cur][col * GM_KSUB + sub]] * gn_valid_sf;
-      const uint8_t* wq = &sWq[cur][col * KT_half + sub * 8];
-#pragma unroll
-      for (int b = 0; b < 8; ++b) {   // 8 bytes = 16 nibbles = the 16-K sub-block
-        __half2_raw hr = __nv_cvt_fp4x2_to_halfraw2(
-            static_cast<__nv_fp4x2_storage_t>(wq[b]), __NV_E2M1);
-        float2 f = __half22float2(*reinterpret_cast<const __half2*>(&hr));
-        int o = col * GM_KT + sub * 16 + b * 2;
-        sW[o] = __float2bfloat16(f.x * sf);
-        sW[o + 1] = __float2bfloat16(f.y * sf);
-      }
-    }
-    __syncthreads();
-
-    // 4 mma sub-chunks (BK=16) reusing the loaded K-tile.
+    // 4 mma sub-chunks (BK=16) over the loaded K-tile. The B fragment is
+    // dequantised inline per-thread straight from sWq (no sW staging buffer):
+    // each thread's b0/b1 are the 4 weight values it owns -- byte (ksub*8 +
+    // lane%4) holds {w[K],w[K+1]} (cvt -> half2), byte +4 holds {w[K+8],w[K+9]}.
 #pragma unroll
     for (int ksub = 0; ksub < GM_KSUB; ++ksub) {
       const int kb = ksub * GM_BK;
+      const int byte0 = ksub * 8 + (kk >> 1);   // kk = (lane&3)*2 -> kk>>1 = lane&3
+      uint32_t bb0[GM_WCB], bb1[GM_WCB];
+#pragma unroll
+      for (int jb = 0; jb < GM_WCB; ++jb) {
+        const int ncol = warp_n * 32 + jb * 8 + r;
+        const uint8_t* wq = &sWq[cur][ncol * KT_half];
+        float sf = c_w4a16_ue4m3[sSFB[cur][ncol * GM_KSUB + ksub]] * alpha;
+        __half2_raw h0 = __nv_cvt_fp4x2_to_halfraw2(
+            static_cast<__nv_fp4x2_storage_t>(wq[byte0]), __NV_E2M1);
+        __half2_raw h1 = __nv_cvt_fp4x2_to_halfraw2(
+            static_cast<__nv_fp4x2_storage_t>(wq[byte0 + 4]), __NV_E2M1);
+        float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&h0));
+        float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&h1));
+        bb0[jb] = pack_bf16x2(f0.x * sf, f0.y * sf);
+        bb1[jb] = pack_bf16x2(f1.x * sf, f1.y * sf);
+      }
 #pragma unroll
       for (int ib = 0; ib < GM_WRB; ++ib) {
         const int mrow = warp_m * 32 + ib * 16;
-        const __nv_bfloat16* aR0 = &sA[cur][(mrow + r) * GM_KT + kb + kk];
-        const __nv_bfloat16* aR1 = &sA[cur][(mrow + r + 8) * GM_KT + kb + kk];
+        const __nv_bfloat16* aR0 = &sA[cur][(mrow + r) * GM_AS + kb + kk];
+        const __nv_bfloat16* aR1 = &sA[cur][(mrow + r + 8) * GM_AS + kb + kk];
         uint32_t a0 = *reinterpret_cast<const uint32_t*>(aR0);
         uint32_t a1 = *reinterpret_cast<const uint32_t*>(aR1);
         uint32_t a2 = *reinterpret_cast<const uint32_t*>(aR0 + 8);
         uint32_t a3 = *reinterpret_cast<const uint32_t*>(aR1 + 8);
 #pragma unroll
-        for (int jb = 0; jb < GM_WCB; ++jb) {
-          const int ncol = warp_n * 32 + jb * 8 + r;
-          const __nv_bfloat16* bC = &sW[ncol * GM_KT + kb + kk];
-          uint32_t b0 = *reinterpret_cast<const uint32_t*>(bC);
-          uint32_t b1 = *reinterpret_cast<const uint32_t*>(bC + 8);
+        for (int jb = 0; jb < GM_WCB; ++jb)
           mma_m16n8k16(c[ib][jb][0], c[ib][jb][1], c[ib][jb][2], c[ib][jb][3],
-                       a0, a1, a2, a3, b0, b1);
-        }
+                       a0, a1, a2, a3, bb0[jb], bb1[jb]);
       }
     }
     __syncthreads();
