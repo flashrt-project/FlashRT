@@ -120,14 +120,12 @@ tok/s is the warm CUDA-graph steady-state rate (KV grows with context).
 | 32768  | 2317.2  | 14,141 | 169.6  |
 | 65536  | 5520.0  | 11,872 | 125.0  |
 | 131072 | 14567.8 | 8,997  | 83.6   |
-| 262144 | 42800.0 | 6,121  | 50.4 † |
+| 262144 | 42800.0 | 6,121  | ~50   |
 
-† 256k fits on 32 GB (peak ~29.5 GiB, ~1.8 GiB headroom) and generates, but at
-that headroom the CUDA-graph decode (which captures a pool per position) is too
-tight, so 256k runs on the eager decode path (the 50.4 tok/s above); ≤128k
-keeps the graph path. FP8 KV (5.4 → 2.7 GB at 256k) would restore the
-graph-decode headroom — the one remaining lever specifically for 256k, not for
-context in general (the chunked prefill already removed the activation wall).
+256k seeds and runs the full CUDA-graph decode path on a single 32 GB card
+(peak 29.6 GiB / 31.35 GiB). Decode is HBM-bound at that length (~50 tok/s), so
+the bf16 KV read dominates; FP8 KV would roughly halve it (a future
+decode-throughput lever for very long context, not required to reach 256k).
 
 Prompts above `prefill_chunk` (8192 by default) run a **chunked prefill** —
 processed in token-blocks through all layers, carrying the GDN recurrent/conv
