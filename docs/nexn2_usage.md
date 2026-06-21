@@ -25,7 +25,7 @@ frontend directly.
 | Build flag | `-DFLASHRT_ENABLE_QWEN35MOE=ON` (required) |
 | Prefill | up to ~16.4k tok/s (see table) |
 | Decode | ~250 tok/s, token-exact CUDA-graph |
-| Context | chunked prefill, KV-bound; 128k on 32 GB |
+| Context | chunked prefill, KV-bound; 256k on 32 GB |
 | Precision | cos vs BF16 reference 0.9914, deterministic |
 
 ## 1. Build
@@ -117,15 +117,23 @@ tok/s is the warm CUDA-graph steady-state rate (KV grows with context).
 | 4096  | 254.4  | 16,103 | 242.2 |
 | 8192  | 498.9  | 16,419 | 228.5 |
 | 16384 | 1031.6 | 15,883 | 202.2 |
-| 32768  | 2317.2  | 14,141 | 169.6 |
-| 65536  | 5520.0  | 11,872 | 125.0 |
-| 131072 | 14567.8 | 8,997  | 83.6  |
+| 32768  | 2317.2  | 14,141 | 169.6  |
+| 65536  | 5520.0  | 11,872 | 125.0  |
+| 131072 | 14567.8 | 8,997  | 83.6   |
+| 262144 | 42800.0 | 6,121  | 50.4 † |
+
+† 256k fits on 32 GB (peak ~29.5 GiB, ~1.8 GiB headroom) and generates, but at
+that headroom the CUDA-graph decode (which captures a pool per position) is too
+tight, so 256k runs on the eager decode path (the 50.4 tok/s above); ≤128k
+keeps the graph path. FP8 KV (5.4 → 2.7 GB at 256k) would restore the
+graph-decode headroom — the one remaining lever specifically for 256k, not for
+context in general (the chunked prefill already removed the activation wall).
 
 Prompts above `prefill_chunk` (8192 by default) run a **chunked prefill** —
 processed in token-blocks through all layers, carrying the GDN recurrent/conv
 state and KV cache across blocks — so the per-layer activation memory stays
-bounded and context scales well past the single-pass ceiling (32k–128k above;
-higher is KV-bound, ~5.4 GB at 256k). It is bit-exact to the single-pass path
+bounded and context scales well past the single-pass ceiling (32k–256k above;
+256k uses ~5.4 GB KV, peak ~30 GB). It is bit-exact to the single-pass path
 (last-token logits, GDN state, KV all cos 1.0). Prefill throughput and decode
 rate taper at long context as the O(S²) attention and the bf16 KV cache grow.
 
