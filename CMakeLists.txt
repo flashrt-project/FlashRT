@@ -145,6 +145,13 @@ option(FLASHRT_ENABLE_LINGBOT
        "Build LingBot-VLA Thor (sm_110) model kernels and bindings" ON)
 option(FLASHRT_ENABLE_MOTUS
        "Build Motus-specific RTX SM120 kernels and bindings" ON)
+# qwen3_5_moe family (Nex-N2-mini / Qwen3.5-3.6-35B-A3B) RTX SM120 kernels.
+# OFF by default: these are NVFP4/sm_120a-only block-scaled kernels and must
+# not enter the default flash_rt_kernels build on SM89/87/110 or for models
+# that don't use them. Enable explicitly (-DFLASHRT_ENABLE_QWEN35MOE=ON) on a
+# Blackwell build to get the Nex-N2 / Qwen3.6-35B-A3B path.
+option(FLASHRT_ENABLE_QWEN35MOE
+       "Build qwen3_5_moe (Nex-N2 / Qwen3.6-35B-A3B) RTX SM120 kernels" OFF)
 if(FLASHRT_ENABLE_MOTUS)
   message(STATUS "Motus beta kernels: ENABLED")
 else()
@@ -950,19 +957,10 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/silu_mul_qwen36.cu
   csrc/kernels/silu_mul_to_nvfp4_swizzled.cu
   csrc/kernels/qwen36_misc.cu
-  csrc/kernels/qwen35moe_layout.cu
-  csrc/kernels/moe_grouped_gemv_sm120.cu
-  csrc/kernels/bf16_matvec_sm120.cu
-  csrc/kernels/w4a16_matvec_sm120.cu
-  csrc/kernels/moe_grouped_w4a16_sm120.cu
-  csrc/kernels/gdn_recurrent_seq_sm120.cu
-  csrc/kernels/act_fuse_sm120.cu
-  csrc/kernels/moe_router_topk_sm120.cu
-  csrc/kernels/moe_m16_mma_sm120.cu
-  csrc/kernels/moe_m64_mma_sm120.cu
-  csrc/kernels/moe_blocktile_mma_sm120.cu
-  csrc/kernels/w4a16_gemm_sm120.cu
-  csrc/kernels/w16a16_gemm_sm120.cu
+  # qwen3_5_moe-family RTX SM120 kernels are NOT listed here -- they are
+  # gated into the module below (FLASHRT_ENABLE_QWEN35MOE), so SM89/87/110
+  # and non-Nex-N2 builds never compile them. See the gated block after the
+  # target definition.
   csrc/kernels/qwen3_qkv_post_proc.cu
   csrc/kernels/fp4_w4a4_matvec_sm120.cu
   csrc/kernels/fp4_w4a4_mma_sm120.cu
@@ -977,6 +975,31 @@ pybind11_add_module(flash_rt_kernels
 set_target_properties(flash_rt_kernels PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+
+# ── qwen3_5_moe family (Nex-N2 / Qwen3.6-35B-A3B) SM120 kernels ──
+# Gated: only compiled when explicitly enabled AND on a Blackwell (NVFP4)
+# build. The bindings are #ifdef FLASHRT_HAVE_QWEN35MOE in bindings.cpp, so
+# the symbols are absent (and the .cu never compiled) on every other target.
+if(FLASHRT_ENABLE_QWEN35MOE AND ENABLE_NVFP4)
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/qwen35moe_layout.cu
+    csrc/kernels/moe_grouped_gemv_sm120.cu
+    csrc/kernels/bf16_matvec_sm120.cu
+    csrc/kernels/w4a16_matvec_sm120.cu
+    csrc/kernels/moe_grouped_w4a16_sm120.cu
+    csrc/kernels/gdn_recurrent_seq_sm120.cu
+    csrc/kernels/act_fuse_sm120.cu
+    csrc/kernels/moe_router_topk_sm120.cu
+    csrc/kernels/moe_m16_mma_sm120.cu
+    csrc/kernels/moe_m64_mma_sm120.cu
+    csrc/kernels/moe_blocktile_mma_sm120.cu
+    csrc/kernels/w4a16_gemm_sm120.cu
+    csrc/kernels/w16a16_gemm_sm120.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_QWEN35MOE=1)
+  message(STATUS "qwen3_5_moe (Nex-N2 / Qwen3.6-35B-A3B) SM120 kernels: ENABLED")
+elseif(FLASHRT_ENABLE_QWEN35MOE)
+  message(STATUS "qwen3_5_moe SM120 kernels: SKIPPED (requires Blackwell NVFP4)")
+endif()
 
 if(ENABLE_SM100_CUTLASS)
   target_sources(flash_rt_kernels PRIVATE

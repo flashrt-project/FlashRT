@@ -137,6 +137,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/rms_norm_gated_silu_qwen36.cuh"
 #include "kernels/silu_mul_qwen36.cuh"
 #include "kernels/qwen36_misc.cuh"
+#ifdef FLASHRT_HAVE_QWEN35MOE
 #include "kernels/qwen35moe_layout.cuh"
 #include "kernels/moe_grouped_gemv_sm120.cuh"
 #include "kernels/bf16_matvec_sm120.cuh"
@@ -150,6 +151,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/moe_blocktile_mma_sm120.cuh"
 #include "kernels/w4a16_gemm_sm120.cuh"
 #include "kernels/w16a16_gemm_sm120.cuh"
+#endif  // FLASHRT_HAVE_QWEN35MOE
 #include "kernels/bf16_matvec_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36_thor.cuh"
@@ -4476,6 +4478,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("q_proj"), py::arg("q_pre"), py::arg("gate"),
         py::arg("S"), py::arg("stream") = 0);
 
+#ifdef FLASHRT_HAVE_QWEN35MOE
     m.def("qwen35moe_lin_split_qkv_broadcast_bf16",
         [](uintptr_t conv_out, uintptr_t q32,
            uintptr_t k32, uintptr_t v32,
@@ -4663,6 +4666,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("a_stride"), py::arg("sfa_stride"),
         py::arg("w_stride"), py::arg("sfb_stride"),
         py::arg("stream") = 0);
+#endif  // FLASHRT_HAVE_QWEN35MOE
 
     m.def("qwen36_gdn_gating_bf16",
         [](uintptr_t a, uintptr_t b,
