@@ -364,11 +364,15 @@ def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None):
         b = (h.float() @ Wb.float().T).to(torch.bfloat16)
         a = (h.float() @ Wa.float().T).to(torch.bfloat16)
 
-    # causal depthwise conv1d + silu (torch glue; nexn2 dim=8192).
-    xc = F.silu(F.conv1d(mixed.transpose(1, 2).float(), convw.float(),
-                         groups=CONV, padding=KS - 1)[:, :, :S]).transpose(1, 2)
+    # causal depthwise conv1d + silu via the fused kernel (was F.conv1d glue).
+    # Same (B, S, conv_dim) layout the decode update kernel uses; no bias.
+    convw_k = convw.reshape(CONV, KS).contiguous()
+    xc = torch.empty(B, S, CONV, dtype=torch.bfloat16, device=device)
+    fvk.causal_conv1d_qwen36_bf16(
+        mixed.contiguous().data_ptr(), convw_k.data_ptr(), 0,
+        xc.data_ptr(), B, S, CONV, KS, True, 0)
     # split conv output + broadcast q/k 16 -> 32 heads in one fvk kernel.
-    xc_bf = xc.to(torch.bfloat16).reshape(B * S, CONV).contiguous()
+    xc_bf = xc.reshape(B * S, CONV).contiguous()
     qb = torch.empty(B, S, NV, HK, dtype=torch.bfloat16, device=device)
     kb = torch.empty(B, S, NV, HK, dtype=torch.bfloat16, device=device)
     vb = torch.empty(B, S, NV, HV, dtype=torch.bfloat16, device=device)
