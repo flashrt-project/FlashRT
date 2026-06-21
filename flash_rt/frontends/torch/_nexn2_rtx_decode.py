@@ -305,23 +305,21 @@ def _moe_layer_decode(h, ld, fvk, device):
         TOPK, n_gu, HID, 0, 0, n_gu * (HID // 2),
         _sf_swz_bytes(n_gu, HID), s)
 
-    g, u = d_gu[:, :INTER], d_gu[:, INTER:]
-    inter = (F.silu(g.float()) * u.float()).to(torch.bfloat16)   # (TOPK, INTER)
-
-    # down: per-slot activation (quantise each M=1 into the stack).
+    # down activation: fuse silu(gate)*up + per-row NVFP4 quant in one launch
+    # (replaces the torch silu_mul + the 8-iteration quant loop). The grouped
+    # SF is the unified (TOPK, INTER) swizzle -> the down GEMV reads row `slot`
+    # at SF + slot*16 (sfa_stride=16), packed at slot*(INTER/2).
     a_stack = torch.empty(TOPK, INTER // 2, dtype=torch.uint8, device=device)
-    sfa_stack = torch.zeros(TOPK, _sf_swz_bytes(1, INTER),
+    sfa_stack = torch.zeros(_sf_swz_bytes(TOPK, INTER),
                             dtype=torch.uint8, device=device)
-    for j in range(TOPK):
-        xc = inter[j:j + 1].contiguous()
-        fvk.quantize_bf16_to_nvfp4_swizzled(
-            xc.data_ptr(), a_stack[j].data_ptr(), sfa_stack[j].data_ptr(),
-            1, INTER, s)
+    fvk.silu_mul_merged_to_nvfp4_swizzled_grouped_bf16(
+        d_gu.contiguous().data_ptr(), a_stack.data_ptr(),
+        sfa_stack.data_ptr(), TOPK, INTER, s)
     d_dn = torch.empty(TOPK, n_dn, dtype=torch.bfloat16, device=device)
     fvk.nexn2_moe_grouped_gemv_bf16(
         a_stack.data_ptr(), dn_p.data_ptr(), d_dn.data_ptr(),
         sfa_stack.data_ptr(), dn_s.data_ptr(), dn_a.data_ptr(), idx.data_ptr(),
-        TOPK, n_dn, INTER, INTER // 2, _sf_swz_bytes(1, INTER),
+        TOPK, n_dn, INTER, INTER // 2, 16,
         n_dn * (INTER // 2), _sf_swz_bytes(n_dn, INTER), s)
     out = (d_dn.float() * tw_row.unsqueeze(-1)).sum(0, keepdim=True)
 
