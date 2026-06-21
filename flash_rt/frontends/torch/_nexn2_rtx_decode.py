@@ -365,7 +365,13 @@ def decode_step(state, token_id, pos, fvk, device):
         h = res + _moe_layer_decode(n, ld, fvk, device)
 
     h = _rms_fvk(h, p['final_norm_w_t'], fvk, device, state.eps)
-    logits = h[0].float() @ p['lm_head_w_t'].float().T
+    # lm_head via the bf16 GEMV: avoids casting the (vocab, HID) weight to
+    # fp32 (a multi-GB write) -- reads it once in bf16.
+    vocab = p['vocab_size']
+    logits = torch.empty(1, vocab, dtype=torch.bfloat16, device=device)
+    fvk.nexn2_bf16_matvec_bf16(
+        h.reshape(1, HID).contiguous().data_ptr(),
+        p['lm_head_w_t'].data_ptr(), logits.data_ptr(), vocab, HID, _cs())
     return logits
 
 
