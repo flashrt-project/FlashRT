@@ -406,6 +406,12 @@ def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None):
     return out.reshape(B, S, HID)
 
 
+# bf16 SDPA for the prefill full-attn (vs the fp32/TF32 cutlass fmha). The
+# softmax accumulates in fp32 inside the kernel, so cos is preserved while the
+# QK^T / PV matmuls run on bf16 tensor cores (~2x). Default ON.
+_ATTN_BF16 = True
+
+
 def _full_attn_layer(h, ld, ct, st, fvk, device, eps, cap=None, rank=None):
     """Full GQA attention layer with output gate + partial RoPE.
 
@@ -448,10 +454,15 @@ def _full_attn_layer(h, ld, ct, st, fvk, device, eps, cap=None, rank=None):
     qa = qo.reshape(B, S, NQ, HD).transpose(1, 2)
     ka = ko.reshape(B, S, NKV, HD).transpose(1, 2).repeat_interleave(NQ // NKV, 1)
     va = v.transpose(1, 2).repeat_interleave(NQ // NKV, 1)
-    at = F.scaled_dot_product_attention(
-        qa.float(), ka.float(), va.float(), is_causal=True)
+    if _ATTN_BF16:
+        # bf16 SDPA (mem-efficient/flash) instead of the fp32/TF32 fmha: ~2x
+        # that bucket, cos preserved (softmax accumulates in fp32 internally).
+        at = F.scaled_dot_product_attention(qa, ka, va, is_causal=True)
+    else:
+        at = F.scaled_dot_product_attention(
+            qa.float(), ka.float(), va.float(), is_causal=True)
     at = at.transpose(1, 2).reshape(B, S, NQ * HD)
-    at = (at * torch.sigmoid(gate.float())).to(torch.bfloat16)
+    at = (at.float() * torch.sigmoid(gate.float())).to(torch.bfloat16)
     return _proj(at.reshape(B * S, NQ * HD), ld, 'o_proj', HID,
                  fvk, device).reshape(B, S, HID)
 
