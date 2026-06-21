@@ -26,7 +26,7 @@ frontend directly.
 | Prefill | up to ~16.4k tok/s (see table) |
 | Decode | ~250 tok/s, token-exact CUDA-graph |
 | Context | chunked prefill, KV-bound; 128k on 32 GB |
-| Precision | cos vs BF16 reference 0.9924, deterministic |
+| Precision | cos vs BF16 reference 0.9914, deterministic |
 
 ## 1. Build
 
@@ -168,7 +168,7 @@ print(f"decode {GEN/(time.perf_counter()-t0-ttft):.0f} tok/s")
 (deterministic w16a16 GEMM + deterministic MoE unpermute), so the last-token
 logits that seed decode are stable:
 
-* prefill cos vs the BF16 reference **0.9924**, argmax match 438/441,
+* prefill cos vs the BF16 reference **0.9914**, argmax match 440/441,
 * decode token-exact: the CUDA-graph replay matches eager decode exactly.
 
 ## 7. Limitations
