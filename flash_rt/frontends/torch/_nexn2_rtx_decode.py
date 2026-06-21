@@ -77,6 +77,41 @@ def _bf16_mv(x1k, w, fvk, device):
     return y
 
 
+def _w4a16_mv(x1k, w_bf16, ld, key, fvk, device):
+    """M=1 W4A16 GEMV: NVFP4 weight x BF16 activation. The bf16 weight is
+    quantised to swizzled NVFP4 once (cached in `ld`, done on the first eager
+    call before graph capture -> the .item()/sync is graph-safe), then the
+    matvec reads 4-bit weight. ~2.2x the bf16 GEMV on the big projections,
+    cos 0.994 (BF16 activation -> no activation-quant error)."""
+    n, k = w_bf16.shape
+    pk = key + '_w4a16_p'
+    if pk not in ld:
+        packed = torch.empty(n, k // 2, dtype=torch.uint8, device=device)
+        sf = torch.zeros(_sf_swz_bytes(n, k), dtype=torch.uint8, device=device)
+        scr = torch.zeros(1, dtype=torch.float32, device=device)
+        og = torch.zeros(1, dtype=torch.float32, device=device)
+        fvk.bf16_weight_to_nvfp4_swizzled(
+            w_bf16.contiguous().data_ptr(), packed.data_ptr(), sf.data_ptr(),
+            scr.data_ptr(), og.data_ptr(), n, k, _cs())
+        torch.cuda.synchronize()
+        ld[pk] = packed
+        ld[key + '_w4a16_sf'] = sf
+        ld[key + '_w4a16_a'] = float(og.item())
+    xc = x1k.contiguous()
+    y = torch.empty(1, n, dtype=torch.bfloat16, device=device)
+    fvk.nexn2_w4a16_matvec_bf16(
+        xc.data_ptr(), ld[pk].data_ptr(), ld[key + '_w4a16_sf'].data_ptr(),
+        y.data_ptr(), n, k, ld[key + '_w4a16_a'], _cs())
+    return y
+
+
+def _dense_mv(x1k, w_bf16, ld, key, state, fvk, device):
+    """Dense projection GEMV: W4A16 when enabled, else the BF16 kernel."""
+    if state.dense_w4a16:
+        return _w4a16_mv(x1k, w_bf16, ld, key, fvk, device)
+    return _bf16_mv(x1k, w_bf16, fvk, device)
+
+
 def _rms_fvk(x, w, fvk, device, eps):
     """RMSNorm via the fused fvk kernel (fp32 internal) -- one launch vs the
     ~6 torch elementwise ops of the reference _rms. w is the (1+w)-folded
@@ -90,12 +125,16 @@ def _rms_fvk(x, w, fvk, device, eps):
     return out.reshape(shp)
 
 
-def _proj_mma(x2d, ld, base, n, fvk, device):
-    """Decode projection dispatch: NVFP4 -> mma GEMV, else BF16 mv kernel."""
+def _proj_mma(x2d, ld, base, n, fvk, device, state=None):
+    """Decode projection dispatch: NVFP4(W4A4) -> mma GEMV; else BF16 weight
+    via W4A16 (when state.dense_w4a16) or the plain BF16 GEMV."""
     if ld.get(base + '_packed') is not None:
         return _mma(x2d, ld[base + '_packed'], ld[base + '_sf'],
                     ld[base + '_alpha'], n, fvk, device)
-    return _bf16_mv(x2d, ld[base + '_w_t'], fvk, device)
+    w = ld[base + '_w_t']
+    if state is not None and state.dense_w4a16:
+        return _w4a16_mv(x2d, w, ld, base + '_w_t', fvk, device)
+    return _bf16_mv(x2d, w, fvk, device)
 
 
 class Nexn2DecodeState:
@@ -153,6 +192,14 @@ class Nexn2DecodeState:
         # NVFP4 lm_head: 1GB -> 0.25GB read, +7% tok/s, decode cos 0.973 ->
         # 0.965. On by default (SOTA speed); set False for the bf16 lm_head.
         self.lm_head_nvfp4 = True
+        # W4A16 dense projections (NVFP4 weight x BF16 activation): the dense
+        # BF16 projections are the largest decode HBM bucket; reading 4-bit
+        # weight instead of 16-bit is ~2.2x on the big shapes. BF16 activation
+        # keeps cos high (no activation quant). `gdn_in_proj` is the GDN
+        # in_proj_qkv (the W4A4 red line); W4A16 keeps BF16 activation so it is
+        # gated separately and validated by E2E cos before enabling.
+        self.dense_w4a16 = True
+        self.gdn_in_proj_w4a16 = True
 
     def reset(self):
         for s in self.lin_state:
@@ -180,7 +227,11 @@ def _decode_gdn(h, ld, state, lin_rank, fvk, device):
     if 'in_proj_fused_w' not in ld:
         ld['in_proj_fused_w'] = torch.cat(
             [Wqkv, Wz, Wa, Wb], 0).contiguous()
-    fused = _bf16_mv(h2, ld['in_proj_fused_w'], fvk, device)
+    if state.dense_w4a16 and state.gdn_in_proj_w4a16:
+        fused = _w4a16_mv(h2, ld['in_proj_fused_w'], ld, 'in_proj_fused',
+                          fvk, device)
+    else:
+        fused = _bf16_mv(h2, ld['in_proj_fused_w'], fvk, device)
     mixed = fused[:, :KD * 2 + VD].contiguous()
     z = fused[:, KD * 2 + VD:KD * 2 + VD + NV * HV].reshape(NV, HV).contiguous()
     a = fused[:, -2 * NV:-NV].contiguous()
@@ -225,7 +276,7 @@ def _decode_gdn(h, ld, state, lin_rank, fvk, device):
     fvk.rms_norm_gated_silu_qwen36_bf16(
         core.data_ptr(), z.data_ptr(), nw.data_ptr(), nf.data_ptr(),
         NV, HV, eps, s)
-    out = _proj_mma(nf.reshape(1, VD), ld, 'out_proj', HID, fvk, device)
+    out = _proj_mma(nf.reshape(1, VD), ld, 'out_proj', HID, fvk, device, state)
     return out.reshape(1, 1, HID)
 
 
@@ -242,14 +293,16 @@ def _decode_full(h, ld, state, full_rank, pos, fvk, device):
             ld['qkv_fused_w'] = torch.cat(
                 [ld['q_proj_w_t'], ld['k_proj_w_t'], ld['v_proj_w_t']],
                 0).contiguous()
-        fused = _bf16_mv(x2, ld['qkv_fused_w'], fvk, device)
+        fused = _dense_mv(x2, ld['qkv_fused_w'], ld, 'qkv_fused', state,
+                          fvk, device)
         qg = fused[:, :nqg].contiguous()
         k = fused[:, nqg:nqg + NKV * HD].reshape(NKV, HD)
         v = fused[:, nqg + NKV * HD:].reshape(1, NKV, HD)
     else:
-        qg = _proj_mma(x2, ld, 'q_proj', nqg, fvk, device).contiguous()
-        k = _proj_mma(x2, ld, 'k_proj', NKV * HD, fvk, device).reshape(NKV, HD)
-        v = _proj_mma(x2, ld, 'v_proj', NKV * HD, fvk, device).reshape(
+        qg = _proj_mma(x2, ld, 'q_proj', nqg, fvk, device, state).contiguous()
+        k = _proj_mma(x2, ld, 'k_proj', NKV * HD, fvk, device, state).reshape(
+            NKV, HD)
+        v = _proj_mma(x2, ld, 'v_proj', NKV * HD, fvk, device, state).reshape(
             1, NKV, HD)
     q_pre = torch.empty(1, NQ, HD, dtype=torch.bfloat16, device=device)
     gate = torch.empty(1, NQ * HD, dtype=torch.bfloat16, device=device)
@@ -277,16 +330,19 @@ def _decode_full(h, ld, state, full_rank, pos, fvk, device):
              stream=s, softmax_scale=float(HD) ** -0.5)
     at = attn.O_buf[:, :1].reshape(1, NQ * HD)
     at = (at.float() * torch.sigmoid(gate.float())).to(torch.bfloat16)
-    return _proj_mma(at, ld, 'o_proj', HID, fvk, device).reshape(1, 1, HID)
+    return _proj_mma(at, ld, 'o_proj', HID, fvk, device, state).reshape(
+        1, 1, HID)
 
 
-def _moe_layer_decode(h, ld, fvk, device):
+def _moe_layer_decode(h, ld, state, fvk, device):
     """M=1 fine-grained MoE via the grouped GEMV kernel: the 8 routed experts
     run in one launch each for gate_up (shared act) and down (per-slot act),
     indexed by a device top-k id buffer (the same buffer drives a graph)."""
     s = _cs()
     x = h.reshape(1, HID)
-    logit = F.softmax(_bf16_mv(x, ld['router_w_t'], fvk, device).float(), -1)
+    logit = F.softmax(
+        _dense_mv(x, ld['router_w_t'], ld, 'router', state, fvk, device)
+        .float(), -1)
     tw, ti = torch.topk(logit, TOPK, -1)
     tw_row = (tw / tw.sum(-1, keepdim=True))[0]              # (TOPK,) device
     idx = ti[0].to(torch.int32).contiguous()                # (TOPK,) device
@@ -333,13 +389,14 @@ def _moe_layer_decode(h, ld, fvk, device):
             ld['shared_gu_fused_w'] = torch.cat(
                 [ld['shared_gate_proj_w_t'], ld['shared_up_proj_w_t']],
                 0).contiguous()
-        gu = _bf16_mv(x, ld['shared_gu_fused_w'], fvk, device)
+        gu = _dense_mv(x, ld['shared_gu_fused_w'], ld, 'shared_gu_fused',
+                       state, fvk, device)
         sg, su = gu[:, :INTER], gu[:, INTER:]
     else:
-        sg = _proj_mma(x, ld, 'shared_gate_proj', INTER, fvk, device)
-        su = _proj_mma(x, ld, 'shared_up_proj', INTER, fvk, device)
+        sg = _proj_mma(x, ld, 'shared_gate_proj', INTER, fvk, device, state)
+        su = _proj_mma(x, ld, 'shared_up_proj', INTER, fvk, device, state)
     si = (F.silu(sg.float()) * su.float()).to(torch.bfloat16)
-    shared = _proj_mma(si, ld, 'shared_down_proj', HID, fvk, device)
+    shared = _proj_mma(si, ld, 'shared_down_proj', HID, fvk, device, state)
     sgate = torch.sigmoid(x.float() @ ld['shared_gate_w_t'].float().T)
     return (out + shared.float() * sgate).reshape(1, 1, HID).to(torch.bfloat16)
 
@@ -365,7 +422,7 @@ def decode_step(state, token_id, pos, fvk, device):
         h = res + attn
         res = h
         n = _rms_fvk(h, ld['post_norm_w_t'], fvk, device, state.eps)
-        h = res + _moe_layer_decode(n, ld, fvk, device)
+        h = res + _moe_layer_decode(n, ld, state, fvk, device)
 
     h = _rms_fvk(h, p['final_norm_w_t'], fvk, device, state.eps)
     # lm_head as NVFP4 W4A16: 4x less weight read (1GB -> 0.25GB) via the
