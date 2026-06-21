@@ -144,6 +144,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/nexn2_moe_grouped_w4a16.cuh"
 #include "kernels/nexn2_gdn_seq.cuh"
 #include "kernels/nexn2_act_fuse.cuh"
+#include "kernels/nexn2_router_topk.cuh"
 #include "kernels/bf16_matvec_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36_thor.cuh"
@@ -4511,6 +4512,16 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         },
         py::arg("x"), py::arg("W"), py::arg("sfb"), py::arg("out"),
         py::arg("N"), py::arg("K"), py::arg("alpha"), py::arg("stream") = 0);
+
+    m.def("nexn2_router_topk_bf16",
+        [](uintptr_t logits, uintptr_t out_idx, uintptr_t out_val,
+           int n_experts, int k, uintptr_t stream) -> int {
+            return flash_rt::kernels::nexn2_router_topk_bf16(
+                to_ptr(logits), to_ptr(out_idx), to_ptr(out_val),
+                n_experts, k, to_stream(stream));
+        },
+        py::arg("logits"), py::arg("out_idx"), py::arg("out_val"),
+        py::arg("n_experts"), py::arg("k"), py::arg("stream") = 0);
 
     m.def("nexn2_silu_mul_bf16",
         [](uintptr_t g, uintptr_t u, uintptr_t out, int n,

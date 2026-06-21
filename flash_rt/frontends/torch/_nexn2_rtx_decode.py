@@ -372,12 +372,16 @@ def _moe_layer_decode(h, ld, state, fvk, device):
     indexed by a device top-k id buffer (the same buffer drives a graph)."""
     s = _cs()
     x = h.reshape(1, HID)
-    logit = F.softmax(
-        _dense_mv(x, ld['router_w_t'], ld, 'router', state, fvk, device)
-        .float(), -1)
-    tw, ti = torch.topk(logit, TOPK, -1)
-    tw_row = (tw / tw.sum(-1, keepdim=True))[0]              # (TOPK,) device
-    idx = ti[0].to(torch.int32).contiguous()                # (TOPK,) device
+    # Router: top-8 of the raw logits via one kernel (was softmax(256) +
+    # torch.topk bitonic sort). Re-normalising top-8 of softmax(256) equals
+    # softmax(top-8 logits), so softmax the 8 returned logits.
+    logit_raw = _dense_mv(x, ld['router_w_t'], ld, 'router', state, fvk, device)
+    lr = logit_raw.reshape(-1).contiguous()
+    idx = torch.empty(TOPK, dtype=torch.int32, device=device)
+    topv = torch.empty(TOPK, dtype=torch.float32, device=device)
+    fvk.nexn2_router_topk_bf16(lr.data_ptr(), idx.data_ptr(), topv.data_ptr(),
+                               lr.numel(), TOPK, s)
+    tw_row = F.softmax(topv, -1)                             # (TOPK,) device
 
     if 'experts_gate_up_alpha_dev' not in ld:               # cache once/layer
         ld['experts_gate_up_alpha_dev'] = \
