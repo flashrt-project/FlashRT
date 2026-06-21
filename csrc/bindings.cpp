@@ -141,6 +141,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/nexn2_moe_grouped.cuh"
 #include "kernels/nexn2_bf16_gemv.cuh"
 #include "kernels/nexn2_w4a16_gemv.cuh"
+#include "kernels/nexn2_moe_grouped_w4a16.cuh"
 #include "kernels/bf16_matvec_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36_thor.cuh"
@@ -4508,6 +4509,21 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         },
         py::arg("x"), py::arg("W"), py::arg("sfb"), py::arg("out"),
         py::arg("N"), py::arg("K"), py::arg("alpha"), py::arg("stream") = 0);
+
+    m.def("nexn2_moe_grouped_w4a16_bf16",
+        [](uintptr_t A, uintptr_t W, uintptr_t sfb, uintptr_t alpha,
+           uintptr_t eidx, uintptr_t D, int slots, int N, int K,
+           long a_stride, long w_stride, long sfb_stride,
+           uintptr_t stream) -> int {
+            return flash_rt::kernels::nexn2_moe_grouped_w4a16_bf16(
+                to_ptr(A), to_ptr(W), to_ptr(sfb), to_ptr(alpha), to_ptr(eidx),
+                to_ptr(D), slots, N, K, a_stride, w_stride, sfb_stride,
+                to_stream(stream));
+        },
+        py::arg("A"), py::arg("W"), py::arg("sfb"), py::arg("alpha"),
+        py::arg("eidx"), py::arg("D"), py::arg("slots"), py::arg("N"),
+        py::arg("K"), py::arg("a_stride"), py::arg("w_stride"),
+        py::arg("sfb_stride"), py::arg("stream") = 0);
 
     m.def("nexn2_moe_grouped_gemv_bf16",
         [](uintptr_t A_stack, uintptr_t B_stack, uintptr_t D,

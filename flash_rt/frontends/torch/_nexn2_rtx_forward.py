@@ -233,6 +233,53 @@ def _full_attn_layer(h, ld, ct, st, fvk, device, eps, cap=None, rank=None):
                  fvk, device).reshape(B, S, HID)
 
 
+# Grouped MoE for prefill (on by default); set False to use the per-expert loop.
+_USE_GROUPED_MOE = True
+
+
+def _moe_experts_grouped(x, ti, tw, ld, fvk, device):
+    """Routed experts via the grouped W4A16 GEMV. Flatten the S*TOPK
+    (token, expert) assignments, sort by expert so consecutive slots share a
+    weight (L2-amortised -> each expert weight read ~once), and run one grouped
+    GEMV per gate_up / down (BF16 activation, no per-expert launch/quant). The
+    Python expert loop's ~5000 tiny-M GEMMs collapse to 2 kernel launches."""
+    S = x.shape[0]
+    gu_p, gu_s = ld['experts_gate_up_packed_t'], ld['experts_gate_up_sf_t']
+    dn_p, dn_s = ld['experts_down_packed_t'], ld['experts_down_sf_t']
+    n_gu, n_dn = gu_p.shape[1], dn_p.shape[1]
+    if 'experts_gate_up_alpha_dev' not in ld:
+        ld['experts_gate_up_alpha_dev'] = \
+            ld['experts_gate_up_alpha_t'].to(device).contiguous()
+        ld['experts_down_alpha_dev'] = \
+            ld['experts_down_alpha_t'].to(device).contiguous()
+    gu_a, dn_a = ld['experts_gate_up_alpha_dev'], ld['experts_down_alpha_dev']
+
+    slots = S * TOPK
+    exp_flat = ti.reshape(-1).to(torch.int32)
+    tok_flat = torch.arange(S, device=device).repeat_interleave(TOPK)
+    order = exp_flat.argsort()
+    se = exp_flat[order].contiguous()
+    stok = tok_flat[order]
+    sw = tw.reshape(-1)[order]
+
+    A = x[stok].contiguous()                          # (slots, HID) bf16
+    d_gu = torch.empty(slots, n_gu, dtype=torch.bfloat16, device=device)
+    fvk.nexn2_moe_grouped_w4a16_bf16(
+        A.data_ptr(), gu_p.data_ptr(), gu_s.data_ptr(), gu_a.data_ptr(),
+        se.data_ptr(), d_gu.data_ptr(), slots, n_gu, HID,
+        HID, gu_p[0].numel(), gu_s[0].numel(), 0)
+    g, u = d_gu[:, :INTER], d_gu[:, INTER:]
+    inter = (F.silu(g.float()) * u.float()).to(torch.bfloat16).contiguous()
+    d_dn = torch.empty(slots, n_dn, dtype=torch.bfloat16, device=device)
+    fvk.nexn2_moe_grouped_w4a16_bf16(
+        inter.data_ptr(), dn_p.data_ptr(), dn_s.data_ptr(), dn_a.data_ptr(),
+        se.data_ptr(), d_dn.data_ptr(), slots, n_dn, INTER,
+        INTER, dn_p[0].numel(), dn_s[0].numel(), 0)
+    out = torch.zeros(S, HID, device=device)
+    out.index_add_(0, stok, d_dn.float() * sw.unsqueeze(-1))
+    return out
+
+
 def _moe_layer(h, ld, fvk, device):
     """Fine-grained MoE FFN: 256 experts top-8 routed + 1 shared expert."""
     B, S, _ = h.shape
@@ -248,25 +295,27 @@ def _moe_layer(h, ld, fvk, device):
     logit = F.softmax(x.float() @ rw.float().T, -1)
     tw, ti = torch.topk(logit, TOPK, -1)
     tw = tw / tw.sum(-1, keepdim=True)
-    out = torch.zeros(x.shape[0], HID, device=device)
-    # Hoist the per-expert alpha .item()/unique() host syncs out of the loop:
-    # one .tolist() each instead of ~2 device->host stalls per routed expert.
-    gu_a_l = gu_a.tolist()
-    dn_a_l = dn_a.tolist()
-    for e in torch.unique(ti).tolist():
-        m = (ti == e)
-        tok = m.any(-1).nonzero(as_tuple=True)[0]
-        w = (tw * m)[tok].sum(-1)
-        gu_e_p, gu_e_s = gu_p[e], gu_s[e]
-        gu = _nvfp4_gemm(x[tok].contiguous(), gu_e_p.data_ptr(),
-                         gu_e_s.data_ptr(), gu_a_l[e], n_gu,
-                         fvk, device)
-        g, u = gu.chunk(2, -1)
-        inter = (F.silu(g.float()) * u.float()).to(torch.bfloat16)
-        dn_e_p, dn_e_s = dn_p[e], dn_s[e]
-        dpj = _nvfp4_gemm(inter, dn_e_p.data_ptr(), dn_e_s.data_ptr(),
-                          dn_a_l[e], n_dn, fvk, device)
-        out[tok] += dpj.float() * w.unsqueeze(-1)
+
+    if _USE_GROUPED_MOE:
+        out = _moe_experts_grouped(x, ti, tw, ld, fvk, device)
+    else:
+        out = torch.zeros(x.shape[0], HID, device=device)
+        gu_a_l = gu_a.tolist()
+        dn_a_l = dn_a.tolist()
+        for e in torch.unique(ti).tolist():
+            m = (ti == e)
+            tok = m.any(-1).nonzero(as_tuple=True)[0]
+            w = (tw * m)[tok].sum(-1)
+            gu_e_p, gu_e_s = gu_p[e], gu_s[e]
+            gu = _nvfp4_gemm(x[tok].contiguous(), gu_e_p.data_ptr(),
+                             gu_e_s.data_ptr(), gu_a_l[e], n_gu,
+                             fvk, device)
+            g, u = gu.chunk(2, -1)
+            inter = (F.silu(g.float()) * u.float()).to(torch.bfloat16)
+            dn_e_p, dn_e_s = dn_p[e], dn_s[e]
+            dpj = _nvfp4_gemm(inter, dn_e_p.data_ptr(), dn_e_s.data_ptr(),
+                              dn_a_l[e], n_dn, fvk, device)
+            out[tok] += dpj.float() * w.unsqueeze(-1)
 
     sg = _proj(x, ld, 'shared_gate_proj', INTER, fvk, device)
     su = _proj(x, ld, 'shared_up_proj', INTER, fvk, device)
