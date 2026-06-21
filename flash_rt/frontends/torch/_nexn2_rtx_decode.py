@@ -393,31 +393,24 @@ def _moe_layer_decode(h, ld, state, fvk, device):
     gu_a, dn_a = ld['experts_gate_up_alpha_dev'], ld['experts_down_alpha_dev']
     n_gu, n_dn = gu_p.shape[1], dn_p.shape[1]               # 1024 / HID
 
-    # gate_up: one shared activation, grouped over the 8 experts.
-    xp, xsf = _quant_act(x, fvk, device, s)
+    # gate_up: shared BF16 activation, grouped W4A16 over the 8 experts. BF16
+    # activation -> no activation quant, higher cos than the W4A4 mma, and
+    # faster at this scale (6.2 vs 8.2 us standalone).
+    xc = x.contiguous()
     d_gu = torch.empty(TOPK, n_gu, dtype=torch.bfloat16, device=device)
-    fvk.nexn2_moe_grouped_gemv_bf16(
-        xp.data_ptr(), gu_p.data_ptr(), d_gu.data_ptr(),
-        xsf.data_ptr(), gu_s.data_ptr(), gu_a.data_ptr(), idx.data_ptr(),
-        TOPK, n_gu, HID, 0, 0, n_gu * (HID // 2),
-        _sf_swz_bytes(n_gu, HID), s)
+    fvk.nexn2_moe_grouped_w4a16_bf16(
+        xc.data_ptr(), gu_p.data_ptr(), gu_s.data_ptr(), gu_a.data_ptr(),
+        idx.data_ptr(), d_gu.data_ptr(), TOPK, n_gu, HID,
+        0, gu_p[0].numel(), gu_s[0].numel(), s)
 
-    # down activation: fuse silu(gate)*up + per-row NVFP4 quant in one launch
-    # (replaces the torch silu_mul + the 8-iteration quant loop). The grouped
-    # SF is the unified (TOPK, INTER) swizzle -> the down GEMV reads row `slot`
-    # at SF + slot*16 (sfa_stride=16), packed at slot*(INTER/2).
-    a_stack = torch.empty(TOPK, INTER // 2, dtype=torch.uint8, device=device)
-    sfa_stack = torch.zeros(_sf_swz_bytes(TOPK, INTER),
-                            dtype=torch.uint8, device=device)
-    fvk.silu_mul_merged_to_nvfp4_swizzled_grouped_bf16(
-        d_gu.contiguous().data_ptr(), a_stack.data_ptr(),
-        sfa_stack.data_ptr(), TOPK, INTER, s)
+    # down: silu(gate)*up (BF16, fused) then grouped W4A16 (per-slot activation).
+    g_, u_ = d_gu[:, :INTER], d_gu[:, INTER:]
+    inter = _silu_mul(g_, u_, fvk, device).contiguous()
     d_dn = torch.empty(TOPK, n_dn, dtype=torch.bfloat16, device=device)
-    fvk.nexn2_moe_grouped_gemv_bf16(
-        a_stack.data_ptr(), dn_p.data_ptr(), d_dn.data_ptr(),
-        sfa_stack.data_ptr(), dn_s.data_ptr(), dn_a.data_ptr(), idx.data_ptr(),
-        TOPK, n_dn, INTER, INTER // 2, 16,
-        n_dn * (INTER // 2), _sf_swz_bytes(n_dn, INTER), s)
+    fvk.nexn2_moe_grouped_w4a16_bf16(
+        inter.data_ptr(), dn_p.data_ptr(), dn_s.data_ptr(), dn_a.data_ptr(),
+        idx.data_ptr(), d_dn.data_ptr(), TOPK, n_dn, INTER,
+        INTER, dn_p[0].numel(), dn_s[0].numel(), s)
     out = (tw_row.float() @ d_dn.float()).unsqueeze(0)   # (1, n_dn) weighted sum
 
     if ld.get('shared_gate_proj_packed') is None:    # experts-scope: fuse g/u
