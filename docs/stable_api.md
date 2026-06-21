@@ -128,6 +128,14 @@ class VLAModel:
     def set_prompt(self, *args, **kwargs): ...
     def infer(self, *args, **kwargs): ...
     def predict(self, images, prompt=None, state=None) -> np.ndarray: ...
+    def calibrate(
+        self,
+        observations,
+        *,
+        percentile: float = 99.9,
+        max_samples: int | None = None,
+        verbose: bool = False,
+    ) -> None: ...
     def warm_state_prompt_buckets(self, images, prompt, states) -> list[int]: ...
     def recalibrate(self) -> None: ...
 
@@ -176,6 +184,16 @@ class VLAModel:
   - GROOT N1.7 currently uses the lower-level
     `normalize_state(...)` + `infer(state_normalized, initial_noise=...)`
     contract rather than the image-list `predict()` contract.
+
+- `calibrate(observations, *, percentile=99.9, max_samples=None,
+  verbose=False)` — run the selected frontend's public calibration path.
+  `observations` may be a single observation dict or an iterable of samples in
+  the frontend's calibration format. `max_samples` caps the consumed sample
+  list before the frontend chooses its N=1 or N>=2 path. Frontends that
+  document N>=2 support run dataset calibration with percentile-clipped amax
+  reduction; unsupported frontends raise a clear `NotImplementedError`.
+  GROOT N1.7 uses captured aux dict samples rather than raw image observation
+  dicts.
 
 - `warm_state_prompt_buckets(images, prompt, states)` — Pi0.5 RTX torch
   helper for realtime loops that pass changing state through the prompt.

@@ -216,16 +216,17 @@ class VLAModel:
         observations,
         *,
         percentile: float = 99.9,
-        max_samples=None,
+        max_samples: int | None = None,
         verbose: bool = False,
     ) -> None:
         """Unified calibration entry point.
 
         Args:
             observations: single dict or iterable of dicts. N=1 triggers
-                the single-frame calibration path (back-compatible); N>=2
-                engages dataset calibration with percentile-clipped amax
-                reduction (RTX frontends only today).
+                the single-frame calibration path (back-compatible). Frontends
+                that document N>=2 support run dataset calibration with
+                percentile-clipped amax reduction; unsupported frontends raise
+                a clear NotImplementedError from their calibrate() method.
             percentile: percentile for multi-sample amax reduction. 99.9
                 by default; 100.0 == traditional max.
             max_samples: optional cap.
