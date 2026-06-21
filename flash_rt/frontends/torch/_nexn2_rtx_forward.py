@@ -334,9 +334,18 @@ def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None):
     A_log, dtb = ld['A_log_t'].float(), ld['dt_bias_t'].float()
     nw = ld['gdn_norm_w_t']
 
-    # in_proj stays BF16 (red line: quantizing it collapses GDN).
-    mixed = (h.float() @ Wqkv.float().T).to(torch.bfloat16)
-    z = (h.float() @ Wz.float().T).reshape(B, S, NV, HV)
+    # in_proj must NOT be quantized (red line: fp4 weight/act collapses GDN).
+    # The big mixed (N=CONV) and z (N=NV*HV) projections route through the
+    # deterministic bf16-weight w16a16 GEMM -- bf16 weight + bf16 act + fp32
+    # accumulate is the same precision as the fp32 path (no quantization), just
+    # on bf16 tensor cores. The tiny b/a (N=NV=32) stay on the fp32 matmul.
+    h2 = h.reshape(B * S, HID)
+    if _DENSE_W16A16 and (B * S) >= _DENSE_BF16_MIN_M:
+        mixed = _gemm_w16a16(h2, Wqkv, fvk, device).reshape(B, S, -1)
+        z = _gemm_w16a16(h2, Wz, fvk, device).reshape(B, S, NV, HV)
+    else:
+        mixed = (h.float() @ Wqkv.float().T).to(torch.bfloat16)
+        z = (h.float() @ Wz.float().T).reshape(B, S, NV, HV)
     b = h.float() @ Wb.float().T
     a = h.float() @ Wa.float().T
 
