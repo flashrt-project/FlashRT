@@ -355,6 +355,10 @@ _USE_GROUPED_MOE = True
 _USE_M16_MOE = True
 _M16_MIN_S = 64
 _N_EXPERTS = 256
+# M=64 x N=16 tile: 2.07x the M16 tile (weight + activation re-read both
+# amortised over a bigger output tile). Default on for S >= _M16_MIN_S; set
+# False to fall back to the M16 tile.
+_USE_M64_MOE = True
 
 
 def _moe_experts_m16(x, ti, tw, ld, fvk, device):
@@ -402,6 +406,60 @@ def _moe_experts_m16(x, ti, tw, ld, fvk, device):
     ip, isf = _quant_act(inter, fvk, device)
     d_dn = torch.empty(total_tiles * 16, n_dn, dtype=torch.bfloat16, device=device)
     fvk.nexn2_moe_m16_mma_bf16(
+        ip.data_ptr(), dn_p.data_ptr(), isf.data_ptr(), dn_s.data_ptr(),
+        d_dn.data_ptr(), dn_a.data_ptr(), tile_expert.data_ptr(),
+        total_tiles, n_dn, INTER, 0, dn_p[0].numel(), dn_s[0].numel(), 0)
+    out = torch.zeros(S, HID, device=device)
+    out.index_add_(0, stok, d_dn[tiled_row].float() * sw.unsqueeze(-1))
+    return out
+
+
+def _moe_experts_m64(x, ti, tw, ld, fvk, device):
+    """Routed experts via the M=64 x N=16 block-scaled mma. Same tiling as the
+    M=16 path but 64-row tiles: each expert weight K-chunk and each activation
+    row are reused across a 4x larger M tile and a 2x larger N tile, so the HBM
+    traffic ~ (1/64 + 1/16) vs the M16 (1/16 + 1/8) -- 2.07x the throughput at
+    1024 rows, cos identical (same FP4 mma)."""
+    S = x.shape[0]
+    E = _N_EXPERTS
+    gu_p, gu_s = ld['experts_gate_up_packed_t'], ld['experts_gate_up_sf_t']
+    dn_p, dn_s = ld['experts_down_packed_t'], ld['experts_down_sf_t']
+    n_gu, n_dn = gu_p.shape[1], dn_p.shape[1]
+    if 'experts_gate_up_alpha_dev' not in ld:
+        ld['experts_gate_up_alpha_dev'] = \
+            ld['experts_gate_up_alpha_t'].to(device).contiguous()
+        ld['experts_down_alpha_dev'] = \
+            ld['experts_down_alpha_t'].to(device).contiguous()
+    gu_a, dn_a = ld['experts_gate_up_alpha_dev'], ld['experts_down_alpha_dev']
+
+    exp_flat = ti.reshape(-1).to(torch.int32)
+    tok_flat = torch.arange(S, device=device).repeat_interleave(TOPK)
+    order = exp_flat.argsort()
+    se = exp_flat[order].long()
+    stok = tok_flat[order]
+    sw = tw.reshape(-1)[order]
+    counts = torch.bincount(se, minlength=E)
+    tile_counts = (counts + 63) // 64
+    tile_off = torch.cumsum(tile_counts, 0) - tile_counts
+    total_tiles = int(tile_counts.sum().item())
+    tile_expert = torch.repeat_interleave(
+        torch.arange(E, device=device), tile_counts).to(torch.int32)
+    cumcount = torch.cumsum(counts, 0) - counts
+    pos = torch.arange(S * TOPK, device=device) - cumcount[se]
+    tiled_row = (tile_off[se] + pos // 64) * 64 + (pos % 64)
+
+    A_t = torch.zeros(total_tiles * 64, HID, dtype=torch.bfloat16, device=device)
+    A_t[tiled_row] = x[stok]
+    ap, asf = _quant_act(A_t, fvk, device)
+    d_gu = torch.empty(total_tiles * 64, n_gu, dtype=torch.bfloat16, device=device)
+    fvk.nexn2_moe_m64_mma_bf16(
+        ap.data_ptr(), gu_p.data_ptr(), asf.data_ptr(), gu_s.data_ptr(),
+        d_gu.data_ptr(), gu_a.data_ptr(), tile_expert.data_ptr(),
+        total_tiles, n_gu, HID, 0, gu_p[0].numel(), gu_s[0].numel(), 0)
+    inter = _silu_mul(d_gu[:, :INTER], d_gu[:, INTER:], fvk, device).contiguous()
+    ip, isf = _quant_act(inter, fvk, device)
+    d_dn = torch.empty(total_tiles * 64, n_dn, dtype=torch.bfloat16, device=device)
+    fvk.nexn2_moe_m64_mma_bf16(
         ip.data_ptr(), dn_p.data_ptr(), isf.data_ptr(), dn_s.data_ptr(),
         d_dn.data_ptr(), dn_a.data_ptr(), tile_expert.data_ptr(),
         total_tiles, n_dn, INTER, 0, dn_p[0].numel(), dn_s[0].numel(), 0)
@@ -469,7 +527,9 @@ def _moe_layer(h, ld, fvk, device):
     tw, ti = torch.topk(logit, TOPK, -1)
     tw = tw / tw.sum(-1, keepdim=True)
 
-    if _USE_M16_MOE and x.shape[0] >= _M16_MIN_S:
+    if _USE_M64_MOE and x.shape[0] >= _M16_MIN_S:
+        out = _moe_experts_m64(x, ti, tw, ld, fvk, device)
+    elif _USE_M16_MOE and x.shape[0] >= _M16_MIN_S:
         out = _moe_experts_m16(x, ti, tw, ld, fvk, device)
     elif _USE_GROUPED_MOE:
         out = _moe_experts_grouped(x, ti, tw, ld, fvk, device)
