@@ -969,6 +969,7 @@ class GrootN17TorchFrontendThor:
         aux_list,
         *,
         percentile: float = 99.9,
+        max_samples: Optional[int] = None,
         verbose: bool = False,
     ) -> None:
         """Refine FP8 act-scale alphas across N calibration samples.
@@ -1005,6 +1006,8 @@ class GrootN17TorchFrontendThor:
             aux_list: list of aux dicts (or single dict / iterable).
             percentile: percentile along the sample axis. ``100.0`` ==
                 traditional max. ``99.9`` (default) clips outliers.
+            max_samples: optional cap, matching the unified public
+                ``VLAModel.calibrate`` API.
             verbose: log per-stage amax dispersion summaries after
                 reduction.
         """
@@ -1022,6 +1025,8 @@ class GrootN17TorchFrontendThor:
             aux_list = [aux_list]
         else:
             aux_list = list(aux_list)
+        if max_samples is not None:
+            aux_list = aux_list[:max_samples]
         n = len(aux_list)
         if n == 0:
             raise ValueError("aux_list must contain at least 1 sample")
