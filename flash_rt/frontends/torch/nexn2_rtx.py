@@ -1,19 +1,20 @@
 """FlashRT -- Nex-N2-mini inference frontend (PyTorch + RTX SM120).
 
-Phase-1 surface area (frozen to keep tests stable across phases):
-    - ``__init__(checkpoint_path)`` -- loads tokenizer + builds Pipeline
-    - ``set_prompt(text)``          -- tokenizes for the next infer()
+LLM frontend for the qwen3_5_moe 35B-A3B model. Surface:
+    - ``__init__(checkpoint_path, *, kernelized=, quant_scope=, ...)``
+    - ``set_prompt(text)``          -- tokenizes for the next call
     - ``infer()``                   -- single forward, returns logits
-    - ``generate(max_new_tokens)``  -- delegates to HF .generate()
+    - ``generate(max_new_tokens)``  -- greedy decode
+    - ``latency_records``           -- list[float] populated by infer()
 
-Future surface (added in later phases, signatures kept stable):
-    - ``calibrate_with_real_data(prompts)`` -- Phase 3 NVFP4/FP8 calibration
-    - ``latency_records``                   -- list[float] populated by infer()
-
-Phase 1 loads the HF reference model (BF16) to lock the cosine fixture.
-The reference is large (35B total params), so it loads with HF device
-mapping and may offload to host RAM; the production path (Phase 3) loads
-NVFP4-quantized weights directly and fits the RTX 5090.
+Two backends share this surface:
+  * ``kernelized=True`` (production): NVFP4 weights loaded directly via the
+    fvk loader and run through the SM120 kernel forward / decode -- fits the
+    32 GB RTX 5090 (the BF16 model does not). Requires the gated kernel build
+    (-DFLASHRT_ENABLE_QWEN35MOE=ON). See docs/nexn2_usage.md.
+  * ``kernelized=False`` (reference): the BF16 HF model, used to lock the
+    golden cosine fixture. Large (35B total params) -- loads with HF device
+    mapping and may offload to host RAM.
 """
 
 from __future__ import annotations
@@ -47,10 +48,12 @@ class Nexn2TorchFrontendRtx:
             NVFP4-quantized weights directly via the fvk loader and run the
             kernelized forward -- the production seam (fits the RTX 5090;
             the BF16 reference does not).
-          quant_scope: kernelized-only. ``'full'`` (default) = NVFP4 for
-            full-attn / out_proj / shared / routed experts (cos ~0.94).
-            ``'experts'`` = only routed experts NVFP4, rest BF16 (cos
-            ~0.99, the precision baseline until the W4A16 mixed kernel).
+          quant_scope: kernelized-only. ``'experts'`` (recommended) = only
+            the routed experts are NVFP4; the dense projections run on the
+            deterministic BF16-weight w16a16 GEMM, so prefill cos vs the BF16
+            golden is ~0.99 and bit-reproducible. ``'full'`` additionally
+            NVFP4-quantises the non-red-line dense projections (q/k/v/o /
+            out_proj / shared) for a smaller footprint at lower cos.
         """
         if quant not in ('fp8', 'nvfp4'):
             raise ValueError(f"quant must be 'fp8' or 'nvfp4', got {quant!r}")

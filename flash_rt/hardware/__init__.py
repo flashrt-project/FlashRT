@@ -133,6 +133,17 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("cosmos3_video", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.cosmos3_video_rtx", "Cosmos3VideoTorchFrontendRtx"),
 
+    # ── Nex-N2-mini / Qwen3.6-35B-A3B (qwen3_5_moe) ──
+    # Text LLM, not a VLA: GDN linear-attn + full-attn-every-4th + 256-expert
+    # NVFP4 MoE. RTX 5090 (SM120) only, and requires the gated kernel build
+    # (-DFLASHRT_ENABLE_QWEN35MOE=ON). Registered here for discoverability /
+    # resolve_pipeline_class, but the frontend exposes an LLM surface
+    # (infer()->logits, generate_greedy) rather than the VLA predict(images)
+    # API, so it is used via direct instantiation of Nexn2TorchFrontendRtx
+    # (see docs/nexn2_usage.md) rather than load_model's VLAModel wrapper.
+    ("nexn2", "torch", "rtx_sm120"):
+        ("flash_rt.frontends.torch.nexn2_rtx", "Nexn2TorchFrontendRtx"),
+
     # ── Pi0-FAST ── (SM120 runtime fork inside pipeline, no AttentionBackend protocol.)
     ("pi0fast", "torch", "thor"):
         ("flash_rt.frontends.torch.pi0fast", "Pi0FastTorchFrontend"),
