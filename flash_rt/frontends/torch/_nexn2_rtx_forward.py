@@ -283,9 +283,14 @@ def _wy_gcumsum(g, ch=64):
         -1, g.shape[1])[:s].to(torch.bfloat16)
 
 
-def _gdn_wy_chunk(q16, k16, v, g, beta, fvk, device):
+def _gdn_wy_chunk(q16, k16, v, g, beta, fvk, device, init_state=None):
     """WY chunked scan. q16/k16 (S,16,128) raw post-conv, v (S,32,128),
     g/beta (S,32). Returns core (S,32,128) + final state (32,128,128).
+
+    ``init_state`` (NV,HK,HV) is the recurrent state to continue from -- the
+    chunk_h kernel reads it as h0[0] and writes the post-block state back, so a
+    chunked prefill carries it across blocks (probe-verified bit-exact: whole
+    vs two state-carried halves match at cos 1.0). Defaults to zeros.
 
     Pipeline (FLA chunked delta rule, all add-only existing kernels):
     l2norm + per-chunk g-cumsum (torch glue) -> kkt -> solve_tril(+pack) ->
@@ -318,7 +323,8 @@ def _gdn_wy_chunk(q16, k16, v, g, beta, fvk, device):
         Ai_pack.data_ptr(), w_pack.data_ptr(), u_pack.data_ptr(),
         S, NK, NV, HK, QKG, 0)
 
-    state = torch.zeros(NV, HK, HV, dtype=torch.bfloat16, device=device)
+    state = (init_state.clone() if init_state is not None
+             else torch.zeros(NV, HK, HV, dtype=torch.bfloat16, device=device))
     h0 = torch.empty(chunks, NV, HK, HV, dtype=torch.bfloat16, device=device)
     v_new = torch.empty(S, NV, HV, dtype=torch.bfloat16, device=device)
     fvk.linear_attn_gdn_wy_chunk_h_b64_bf16_mma_fla(
@@ -337,12 +343,18 @@ def _gdn_wy_chunk(q16, k16, v, g, beta, fvk, device):
     return core, state
 
 
-def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None):
+def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None,
+              init_state=None, conv_hist=None):
     """Gated DeltaNet (linear_attention) layer. h (1,S,HID) -> (1,S,HID).
 
     When ``cap`` is given (a Nexn2DecodeState), the final recurrent state and
     the last KS-1 conv inputs are written into its decode buffers so a batched
     prefill leaves exactly the state the per-token decode path would.
+
+    ``init_state`` (NV,HK,HV) continues the recurrent scan from a previous block
+    and ``conv_hist`` (1,CONV,KS-1) supplies the conv's causal history -- both
+    for chunked prefill. With both None (batched / first block) the behaviour is
+    identical to the single-pass prefill.
     """
     B, S, _ = h.shape
     Wqkv = ld['in_proj_qkv_w_t']
@@ -370,12 +382,25 @@ def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None):
         a = (h.float() @ Wa.float().T).to(torch.bfloat16)
 
     # causal depthwise conv1d + silu via the fused kernel (was F.conv1d glue).
-    # Same (B, S, conv_dim) layout the decode update kernel uses; no bias.
+    # Same (B, S, conv_dim) layout the decode update kernel uses; no bias. For a
+    # chunked block, prepend the previous block's last KS-1 inputs (conv_hist)
+    # so the block's first outputs see the right history, then drop them.
     convw_k = convw.reshape(CONV, KS).contiguous()
-    xc = torch.empty(B, S, CONV, dtype=torch.bfloat16, device=device)
-    fvk.causal_conv1d_qwen36_bf16(
-        mixed.contiguous().data_ptr(), convw_k.data_ptr(), 0,
-        xc.data_ptr(), B, S, CONV, KS, True, 0)
+    if conv_hist is not None:
+        hist = conv_hist[0].transpose(0, 1).reshape(1, KS - 1, CONV)
+        mixed_ext = torch.cat(
+            [hist.to(mixed.dtype), mixed], dim=1).contiguous()
+        Se = mixed_ext.shape[1]
+        xc_ext = torch.empty(B, Se, CONV, dtype=torch.bfloat16, device=device)
+        fvk.causal_conv1d_qwen36_bf16(
+            mixed_ext.data_ptr(), convw_k.data_ptr(), 0,
+            xc_ext.data_ptr(), B, Se, CONV, KS, True, 0)
+        xc = xc_ext[:, KS - 1:, :].contiguous()
+    else:
+        xc = torch.empty(B, S, CONV, dtype=torch.bfloat16, device=device)
+        fvk.causal_conv1d_qwen36_bf16(
+            mixed.contiguous().data_ptr(), convw_k.data_ptr(), 0,
+            xc.data_ptr(), B, S, CONV, KS, True, 0)
     # split conv output + broadcast q/k 16 -> 32 heads in one fvk kernel.
     xc_bf = xc.reshape(B * S, CONV).contiguous()
     qb = torch.empty(B, S, NV, HK, dtype=torch.bfloat16, device=device)
@@ -403,14 +428,16 @@ def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None):
         k16 = kb.reshape(S, NV, HK)[:, 0::2, :]
         core, state = _gdn_wy_chunk(
             q16, k16, vb.reshape(S, NV, HV), g_out.reshape(S, NV),
-            bo.reshape(S, NV), fvk, device)
+            bo.reshape(S, NV), fvk, device, init_state=init_state)
         core = core.reshape(B, S, NV, HV)
     else:
         # Sequential scan over the whole prompt in ONE launch (state stays in
         # registers across all S timesteps -> no per-token state HBM round-trip
         # / S kernel launches). Bit-equivalent to the per-token recurrent loop
         # (out cos 0.99999); the short-prompt fallback below _WY_MIN_S.
-        state = torch.zeros(NV, HK, HV, dtype=torch.bfloat16, device=device)
+        state = (init_state.clone() if init_state is not None
+                 else torch.zeros(NV, HK, HV, dtype=torch.bfloat16,
+                                  device=device))
         core = torch.empty(S, NV, HV, dtype=torch.bfloat16, device=device)
         fvk.gdn_recurrent_seq_sm120_bf16(
             qb.reshape(S, NV, HK).contiguous().data_ptr(),
@@ -468,29 +495,36 @@ def _num_sms():
 
 
 def _fa2_causal_attn(qf, kf, vf, device):
-    """Causal GQA self-attention via the vendored FA2 kernel (bf16, native
-    GQA -- no KV repeat). qf (1,S,NQ,HD), kf/vf (1,S,NKV,HD). Returns
-    (1,S,NQ,HD). Prefill-optimal config: splitkv off (large-q parallelism)."""
+    """Causal GQA attention via the vendored FA2 kernel (bf16, native GQA -- no
+    KV repeat). qf (1,Sq,NQ,HD), kf/vf (1,Sk,NKV,HD). Returns (1,Sq,NQ,HD).
+    Sk may exceed Sq (chunked prefill: a block of Sq queries against the Sk
+    accumulated KV); FA2 causal uses bottom-right alignment, so query i attends
+    to keys [0, Sk-Sq+i] -- exactly the block's absolute causal window. splitkv
+    off (large-q parallelism)."""
     Sq = qf.shape[1]
+    Sk = kf.shape[1]
     qc, kc, vc = qf.contiguous(), kf.contiguous(), vf.contiguous()
     o = torch.empty(1, Sq, NQ, HD, dtype=torch.bfloat16, device=device)
     lse = torch.empty(1, NQ, Sq, dtype=torch.float32, device=device)
     _get_fa2().fwd_bf16_causal(
         Q=qc.data_ptr(), K=kc.data_ptr(), V=vc.data_ptr(), O=o.data_ptr(),
         softmax_lse=lse.data_ptr(), softmax_lse_accum=0, o_accum=0,
-        batch=1, seqlen_q=Sq, seqlen_k=Sq, num_heads_q=NQ, num_heads_kv=NKV,
+        batch=1, seqlen_q=Sq, seqlen_k=Sk, num_heads_q=NQ, num_heads_kv=NKV,
         head_dim=HD, q_strides=qc.stride()[:3], k_strides=kc.stride()[:3],
         v_strides=vc.stride()[:3], o_strides=o.stride()[:3],
         softmax_scale=float(HD) ** -0.5, num_sms=_num_sms(), stream=0)
     return o
 
 
-def _full_attn_layer(h, ld, ct, st, fvk, device, eps, cap=None, rank=None):
+def _full_attn_layer(h, ld, ct, st, fvk, device, eps, cap=None, rank=None,
+                     pos_offset=0):
     """Full GQA attention layer with output gate + partial RoPE.
 
-    When ``cap`` is given, the RoPE'd K and V for all S positions are written
-    into the decode KV cache so a batched prefill seeds the same cache the
-    per-token decode would.
+    When ``cap`` is given, the RoPE'd K and V for the S block positions are
+    written into the decode KV cache at [pos_offset, pos_offset+S). With
+    pos_offset>0 (chunked prefill) the block's queries attend to the whole
+    accumulated cache [0, pos_offset+S); with pos_offset=0 (batched) it is the
+    block's own K/V, identical to the previous single-pass prefill.
     """
     B, S, _ = h.shape
     qnw, knw = ld['q_norm_w_t'], ld['k_norm_w_t']      # already (1+w)-folded
@@ -518,17 +552,25 @@ def _full_attn_layer(h, ld, ct, st, fvk, device, eps, cap=None, rank=None):
         qin.data_ptr(), kin.data_ptr(), ctc.data_ptr(), stc.data_ptr(),
         qo.data_ptr(), ko.data_ptr(), S, NQ, NKV, HD, ROPE, 0)
 
+    # Causal GQA attention via the vendored FA2 kernel (native GQA: KV stays at
+    # NKV=2, no repeat_interleave; layout is FA2's (B,S,H,HD), no transpose).
     if cap is not None:
-        # Seed the decode KV cache: RoPE'd K + raw V for all S positions,
-        # exactly what the per-token decode writes at each pos.
-        cap.attn.K_cache[rank, :S].copy_(ko.reshape(S, NKV, HD))
-        cap.attn.V_cache[rank, :S].copy_(v.reshape(S, NKV, HD))
-
-    # Causal GQA attention via the vendored FA2 kernel (native GQA: KV stays
-    # at NKV=2, no repeat_interleave; layout is FA2's (B,S,H,HD), no transpose).
+        # Write the block's RoPE'd K + raw V into the decode KV cache at its
+        # absolute slots; a chunked block then attends to all KV seen so far.
+        end = pos_offset + S
+        cap.attn.K_cache[rank, pos_offset:end].copy_(ko.reshape(S, NKV, HD))
+        cap.attn.V_cache[rank, pos_offset:end].copy_(v.reshape(S, NKV, HD))
+        if pos_offset > 0:
+            kf = cap.attn.K_cache[rank, :end].reshape(1, end, NKV, HD)
+            vf = cap.attn.V_cache[rank, :end].reshape(1, end, NKV, HD)
+        else:
+            kf = ko.reshape(1, S, NKV, HD)
+            vf = v.reshape(1, S, NKV, HD)
+    else:
+        kf = ko.reshape(1, S, NKV, HD)
+        vf = v.reshape(1, S, NKV, HD)
     at = _fa2_causal_attn(
-        qo.reshape(1, S, NQ, HD), ko.reshape(1, S, NKV, HD),
-        v.reshape(1, S, NKV, HD), device).reshape(B, S, NQ * HD)
+        qo.reshape(1, S, NQ, HD), kf, vf, device).reshape(B, S, NQ * HD)
     # output gate: at * sigmoid(gate) via the fused kernel (was torch glue).
     atc = at.reshape(-1).to(torch.bfloat16).contiguous()
     gc = gate.reshape(-1).contiguous()
@@ -634,7 +676,6 @@ def _moe_experts_bt(x, ti, tw, ld, fvk, device):
     order = exp_flat.argsort(stable=True)
     se = exp_flat[order].long()
     stok = tok_flat[order]
-    sw = tw.reshape(-1)[order]
     counts = torch.bincount(se, minlength=E)
     tile_counts = (counts + 63) // 64
     tcum = torch.cumsum(tile_counts, 0)               # inclusive prefix (E,)
@@ -791,7 +832,8 @@ def _moe_layer(h, ld, fvk, device):
 
 
 def nexn2_forward_nvfp4(handles, input_ids, fvk, device, cap=None,
-                        return_hidden=False, last_logits_only=False):
+                        return_hidden=False, last_logits_only=False,
+                        pos_offset=0, compute_logits=True):
     """Full kernelized NVFP4 prefill forward: token ids -> logits.
 
     Args:
@@ -801,15 +843,22 @@ def nexn2_forward_nvfp4(handles, input_ids, fvk, device, cap=None,
         device: cuda device string.
         cap: optional Nexn2DecodeState; when given, the GDN recurrent/conv
             state and the full-attn KV cache are seeded so a subsequent decode
-            continues from position S (batched prefill).
+            continues from position pos_offset+S.
         last_logits_only: when True compute the lm_head for only the final
             position, returning logits (1, vocab). The all-position logits are
             (S, vocab) -- 4 GB at S=8192 -- and only the last row seeds decode,
             so this is what the decode-seeding path uses to keep long-context
             prefill within memory (KV stays bf16 and small).
+        pos_offset: absolute position of input_ids[0] (chunked prefill). >0
+            continues every GDN layer from cap's carried recurrent/conv state
+            and attends each full-attn block to cap's accumulated KV; bounds the
+            per-layer activation memory to the block size. 0 == single-pass.
+        compute_logits: False skips the final norm + lm_head (intermediate
+            chunks of a chunked prefill, which only need to advance the state).
 
     Returns:
-        logits: (S, vocab) bf16, or (1, vocab) when last_logits_only.
+        logits: (S, vocab) bf16, or (1, vocab) when last_logits_only, or None
+        when compute_logits is False.
     """
     p = handles.ptrs
     eps = float(p['rms_norm_eps'])
@@ -820,18 +869,24 @@ def nexn2_forward_nvfp4(handles, input_ids, fvk, device, cap=None,
 
     h = F.embedding(input_ids, p['embed_w_t'])
     S = h.shape[1]
-    ct, st = build_rope_tables(S, theta, rope_dim, device)
+    # RoPE tables for this block's absolute positions [pos_offset, pos_offset+S).
+    ct_full, st_full = build_rope_tables(pos_offset + S, theta, rope_dim, device)
+    ct, st = ct_full[pos_offset:], st_full[pos_offset:]
+    chunked = pos_offset > 0
     lin_rank = full_rank = 0
     for L in range(p['num_layers']):
         ld = layers[L]
         res = h
         n = _rms_k(h, ld['input_norm_w_t'], fvk, device, eps)
         if types[L] == 'linear_attention':
-            attn = _gdn_layer(n, ld, fvk, device, eps, cap, lin_rank)
+            init_s = cap.lin_state[lin_rank] if chunked else None
+            conv_h = cap.lin_conv_state[lin_rank] if chunked else None
+            attn = _gdn_layer(n, ld, fvk, device, eps, cap, lin_rank,
+                              init_state=init_s, conv_hist=conv_h)
             lin_rank += 1
         else:
             attn = _full_attn_layer(n, ld, ct, st, fvk, device, eps,
-                                    cap, full_rank)
+                                    cap, full_rank, pos_offset=pos_offset)
             full_rank += 1
         h = res + attn
         res = h
@@ -839,6 +894,8 @@ def nexn2_forward_nvfp4(handles, input_ids, fvk, device, cap=None,
         h = res + _moe_layer(n, ld, fvk, device)
 
     hidden = h[0]                       # (S, HID) residual stream, pre-final-norm
+    if not compute_logits:
+        return (None, hidden) if return_hidden else None
     h = _rms_k(h, p['final_norm_w_t'], fvk, device, eps)
     # lm_head via w16a16 (bf16 weight, fp32 accumulate): reads the ~1GB weight
     # as bf16 (no fp32 widen), same argmax. logits returned bf16. Slice to the

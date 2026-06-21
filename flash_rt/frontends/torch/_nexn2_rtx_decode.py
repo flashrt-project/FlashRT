@@ -258,6 +258,14 @@ class Nexn2DecodeState:
         # for prompts >= _BATCHED_PREFILL_MIN_S (below that the per-token path's
         # lower fixed overhead wins). Set False to force the per-token path.
         self.batched_prefill = True
+        # Above this prompt length the batched prefill is run in token-blocks
+        # of this size (chunked prefill), carrying the GDN recurrent/conv state
+        # and KV cache across blocks so the per-layer activation memory stays
+        # bounded by the block (not S) -- this is what lets context scale past
+        # the ~16k single-pass ceiling on a 32 GB card. A multiple of the WY
+        # chunk (64). 0 disables (always single-pass).
+        self.prefill_chunk = int(
+            os.environ.get('FLASHRT_NEXN2_PREFILL_CHUNK', '8192'))
 
     def reset(self):
         for s in self.lin_state:
@@ -561,12 +569,37 @@ def seed_prefill_batched(state, input_ids, fvk, device):
     Produces the same decode state as ``seed_prefill`` (the per-token path) but
     runs the prompt through batched (M=S) projections / attention, which is far
     faster for long prompts. The state capture is done inside the forward layers
-    when ``cap`` is passed (see _gdn_layer / _full_attn_layer)."""
+    when ``cap`` is passed (see _gdn_layer / _full_attn_layer). Above
+    ``prefill_chunk`` tokens the pass is chunked to bound activation memory."""
+    S = input_ids.view(-1).shape[0]
+    if state.prefill_chunk and S > state.prefill_chunk:
+        return seed_prefill_chunked(state, input_ids, fvk, device,
+                                    state.prefill_chunk)
     state.reset()
     logits = nexn2_forward_nvfp4(
         state.handles, input_ids.view(1, -1), fvk, device, cap=state,
         last_logits_only=True)
     return logits           # already (1, vocab): only the seeding logit
+
+
+def seed_prefill_chunked(state, input_ids, fvk, device, block):
+    """Chunked batched prefill: process the prompt in token-blocks through all
+    layers, carrying the GDN recurrent/conv state + the full-attn KV cache
+    across blocks. Each block's per-layer activations are bounded by ``block``
+    instead of the full prompt, so context scales past the single-pass memory
+    ceiling. Produces the same decode state as ``seed_prefill_batched`` (each
+    GDN layer continues from cap's carried state; each full-attn block attends
+    to cap's accumulated KV). Returns the last-token logits (1, vocab)."""
+    state.reset()
+    ids = input_ids.view(1, -1)
+    S = ids.shape[1]
+    logits = None
+    for b0 in range(0, S, block):
+        b1 = min(b0 + block, S)
+        logits = nexn2_forward_nvfp4(
+            state.handles, ids[:, b0:b1], fvk, device, cap=state,
+            pos_offset=b0, last_logits_only=True, compute_logits=(b1 == S))
+    return logits
 
 
 def generate_greedy(state, input_ids, max_new_tokens, fvk, device):

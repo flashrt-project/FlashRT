@@ -25,7 +25,7 @@ frontend directly.
 | Build flag | `-DFLASHRT_ENABLE_QWEN35MOE=ON` (required) |
 | Prefill | up to ~16.4k tok/s (see table) |
 | Decode | ~250 tok/s, token-exact CUDA-graph |
-| Context | bf16 KV (small); ~16k generates on 32 GB |
+| Context | chunked prefill, KV-bound; 64k+ on 32 GB |
 | Precision | cos vs BF16 reference 0.9924, deterministic |
 
 ## 1. Build
@@ -99,6 +99,8 @@ Nexn2TorchFrontendRtx(
 
 Methods: `set_prompt(text)`, `infer() -> (1, S, vocab)`, `generate(max_new_tokens) -> list[int]`, `tokenizer`, `latency_records` (list[float], per `infer()`).
 
+Env knobs: `FLASHRT_NEXN2_PREFILL_CHUNK` (chunked-prefill block size, default 8192; 0 disables), `FLASHRT_NEXN2_GRAPH_CACHE_MAX` (decode CUDA-graph LRU cap, default 256).
+
 ## 5. Performance
 
 RTX 5090, `kernelized=True`, `quant_scope="experts"`, greedy decode. TTFT is the
@@ -115,11 +117,20 @@ tok/s is the warm CUDA-graph steady-state rate (KV grows with context).
 | 4096  | 254.4  | 16,103 | 242.2 |
 | 8192  | 498.9  | 16,419 | 228.5 |
 | 16384 | 1031.6 | 15,883 | 202.2 |
+| 32768 | 2317.2 | 14,141 | 169.6 |
+| 65536 | 5520.0 | 11,872 | 125.0 |
+
+Prompts above `prefill_chunk` (8192 by default) run a **chunked prefill** —
+processed in token-blocks through all layers, carrying the GDN recurrent/conv
+state and KV cache across blocks — so the per-layer activation memory stays
+bounded and context scales well past the single-pass ceiling (32k/64k above;
+higher is KV-bound, ~5.4 GB at 256k). It is bit-exact to the single-pass path
+(last-token logits, GDN state, KV all cos 1.0). Prefill throughput and decode
+rate taper at long context as the O(S²) attention and the bf16 KV cache grow.
 
 Reference llama.cpp NVFP4 GGUF on the same class of card: prefill 9.5–10.1k,
 decode 193–259 tok/s. FlashRT crosses the prefill target from ~1k context and
-holds decode at the top of that band; decode tapers with context as the bf16 KV
-cache grows.
+holds decode at the top of that band at short context.
 
 Reproduce (needs the checkpoint):
 
@@ -163,14 +174,12 @@ logits that seed decode are stable:
 
 * SM120 (RTX 5090 / Blackwell) only for `kernelized=True`.
 * Requires the `-DFLASHRT_ENABLE_QWEN35MOE=ON` build.
-* The KV cache is bf16 and small (0.17 GB at 8k, ~5.4 GB at 256k context over
-  the 10 full-attn layers), so it does not bound context on a 32 GB card. The
-  decode-seeding prefill computes the lm_head for the last position only, and
-  the MoE unpermute is a fused gather-sum (no `(S, TOPK, HID)` intermediate), so
-  neither bounds context. On 32 GB ~16k context generates comfortably; beyond
-  that the per-layer activations (the full-sequence GDN projections, ~4 GB per
-  layer at 256k) are the wall — lifting it needs chunked prefill (process the
-  prompt in token-blocks carrying GDN/KV state). (`infer()`, which returns
-  all-position logits for validation, is separately capped at ~4k by the
-  `(S, 248320)` tensor.)
+* Long context is handled by the chunked prefill (above), so the per-layer
+  activations no longer bound it; the residual limit on a 32 GB card is the
+  bf16 KV cache (~5.4 GB at 256k over the 10 full-attn layers) alongside the
+  ~22 GB of weights. `generate()` auto-chunks; tune the block via
+  `FLASHRT_NEXN2_PREFILL_CHUNK` (default 8192; lower trades a little throughput
+  for headroom). The raw `infer()` path returns all-position logits and is a
+  separate single-pass validation tool, capped at ~4k by the `(S, 248320)`
+  logit tensor — use `generate()` for long context.
 * Text LLM only — not wired into the `load_model` / VLA `predict()` API.
