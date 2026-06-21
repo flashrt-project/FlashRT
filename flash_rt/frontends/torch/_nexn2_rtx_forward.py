@@ -355,10 +355,10 @@ _USE_GROUPED_MOE = True
 _USE_M16_MOE = True
 _M16_MIN_S = 64
 _N_EXPERTS = 256
-# M=64 x N=16 tile: 2.07x the M16 tile (weight + activation re-read both
-# amortised over a bigger output tile). Default on for S >= _M16_MIN_S; set
-# False to fall back to the M16 tile.
-_USE_M64_MOE = True
+# Multi-warp block-tile (BM=BN=64, 4 warps) W4A4 GEMM: 4.0x the M16 tile (the
+# activation + weight loaded once into smem and shared across warps). Default on
+# for S >= _M16_MIN_S; set False to fall back to the M16 tile.
+_USE_BT_MOE = True
 
 
 def _moe_experts_m16(x, ti, tw, ld, fvk, device):
@@ -414,12 +414,12 @@ def _moe_experts_m16(x, ti, tw, ld, fvk, device):
     return out
 
 
-def _moe_experts_m64(x, ti, tw, ld, fvk, device):
-    """Routed experts via the M=64 x N=16 block-scaled mma. Same tiling as the
-    M=16 path but 64-row tiles: each expert weight K-chunk and each activation
-    row are reused across a 4x larger M tile and a 2x larger N tile, so the HBM
-    traffic ~ (1/64 + 1/16) vs the M16 (1/16 + 1/8) -- 2.07x the throughput at
-    1024 rows, cos identical (same FP4 mma)."""
+def _moe_experts_bt(x, ti, tw, ld, fvk, device):
+    """Routed experts via the multi-warp block-tile (BM=BN=64, 4 warps) W4A4
+    block-scaled GEMM. 64-row expert tiles; the activation rows and weight cols
+    are loaded once into smem and shared across the 4 warps, so traffic ~ (1/64
+    + 1/64) -- 4.0x the M16 tile / 1.96x the M64 tile at 1024 rows, cos identical
+    (same FP4 mma). The sm120 hand-tuned equivalent of a DeepGEMM/SGLang tile."""
     S = x.shape[0]
     E = _N_EXPERTS
     gu_p, gu_s = ld['experts_gate_up_packed_t'], ld['experts_gate_up_sf_t']
@@ -452,14 +452,14 @@ def _moe_experts_m64(x, ti, tw, ld, fvk, device):
     A_t[tiled_row] = x[stok]
     ap, asf = _quant_act(A_t, fvk, device)
     d_gu = torch.empty(total_tiles * 64, n_gu, dtype=torch.bfloat16, device=device)
-    fvk.nexn2_moe_m64_mma_bf16(
+    fvk.nexn2_moe_bt_mma_bf16(
         ap.data_ptr(), gu_p.data_ptr(), asf.data_ptr(), gu_s.data_ptr(),
         d_gu.data_ptr(), gu_a.data_ptr(), tile_expert.data_ptr(),
         total_tiles, n_gu, HID, 0, gu_p[0].numel(), gu_s[0].numel(), 0)
     inter = _silu_mul(d_gu[:, :INTER], d_gu[:, INTER:], fvk, device).contiguous()
     ip, isf = _quant_act(inter, fvk, device)
     d_dn = torch.empty(total_tiles * 64, n_dn, dtype=torch.bfloat16, device=device)
-    fvk.nexn2_moe_m64_mma_bf16(
+    fvk.nexn2_moe_bt_mma_bf16(
         ip.data_ptr(), dn_p.data_ptr(), isf.data_ptr(), dn_s.data_ptr(),
         d_dn.data_ptr(), dn_a.data_ptr(), tile_expert.data_ptr(),
         total_tiles, n_dn, INTER, 0, dn_p[0].numel(), dn_s[0].numel(), 0)
@@ -527,8 +527,8 @@ def _moe_layer(h, ld, fvk, device):
     tw, ti = torch.topk(logit, TOPK, -1)
     tw = tw / tw.sum(-1, keepdim=True)
 
-    if _USE_M64_MOE and x.shape[0] >= _M16_MIN_S:
-        out = _moe_experts_m64(x, ti, tw, ld, fvk, device)
+    if _USE_BT_MOE and x.shape[0] >= _M16_MIN_S:
+        out = _moe_experts_bt(x, ti, tw, ld, fvk, device)
     elif _USE_M16_MOE and x.shape[0] >= _M16_MIN_S:
         out = _moe_experts_m16(x, ti, tw, ld, fvk, device)
     elif _USE_GROUPED_MOE:

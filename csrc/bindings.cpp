@@ -147,6 +147,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/nexn2_router_topk.cuh"
 #include "kernels/nexn2_moe_m16_mma.cuh"
 #include "kernels/nexn2_moe_m64_mma.cuh"
+#include "kernels/nexn2_moe_bt_mma.cuh"
 #include "kernels/bf16_matvec_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36_thor.cuh"
@@ -4536,6 +4537,21 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
            long sfa_stride, long w_stride, long sfb_stride,
            uintptr_t stream) -> int {
             return flash_rt::gemm::nexn2_moe_m64_mma_bf16(
+                to_ptr(A), to_ptr(B), to_ptr(sfa), to_ptr(sfb), to_ptr(D),
+                to_ptr(alpha), to_ptr(te), num_tiles, N, K,
+                sfa_stride, w_stride, sfb_stride, to_stream(stream));
+        },
+        py::arg("A"), py::arg("B"), py::arg("sfa"), py::arg("sfb"),
+        py::arg("D"), py::arg("alpha"), py::arg("te"), py::arg("num_tiles"),
+        py::arg("N"), py::arg("K"), py::arg("sfa_stride"), py::arg("w_stride"),
+        py::arg("sfb_stride"), py::arg("stream") = 0);
+
+    m.def("nexn2_moe_bt_mma_bf16",
+        [](uintptr_t A, uintptr_t B, uintptr_t sfa, uintptr_t sfb, uintptr_t D,
+           uintptr_t alpha, uintptr_t te, int num_tiles, int N, int K,
+           long sfa_stride, long w_stride, long sfb_stride,
+           uintptr_t stream) -> int {
+            return flash_rt::gemm::nexn2_moe_bt_mma_bf16(
                 to_ptr(A), to_ptr(B), to_ptr(sfa), to_ptr(sfb), to_ptr(D),
                 to_ptr(alpha), to_ptr(te), num_tiles, N, K,
                 sfa_stride, w_stride, sfb_stride, to_stream(stream));
