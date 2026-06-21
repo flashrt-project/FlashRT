@@ -474,7 +474,10 @@ def _moe_layer_decode(h, ld, state, fvk, device):
         su = _proj_mma(x, ld, 'shared_up_proj', INTER, fvk, device, state)
     si = _silu_mul(sg, su, fvk, device)
     shared = _proj_mma(si, ld, 'shared_down_proj', HID, fvk, device, state)
-    sgate = torch.sigmoid(x.float() @ ld['shared_gate_w_t'].float().T)
+    # shared-expert scalar gate: N=1 GEMV via the bf16 matvec kernel (was a
+    # torch matmul -- the last fp32 matmul in the captured decode step).
+    sgate = torch.sigmoid(
+        _bf16_mv(x, ld['shared_gate_w_t'], fvk, device).float())
     return (out + shared.float() * sgate).reshape(1, 1, HID).to(torch.bfloat16)
 
 

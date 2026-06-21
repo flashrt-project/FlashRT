@@ -125,9 +125,13 @@ _DENSE_W4A16 = False
 # experts-scope q/k/v/o/out/shared/router projections dominate the prefill
 # profile as fp32 GEMMs; bf16 inputs with fp32 accumulate roughly halve that
 # bucket at near-identical cos (no fp4 weight rounding -> stays ~0.994).
-# Gated to M >= _DENSE_BF16_MIN_M (decode M=1 is weight-bound -> fp4 wins).
+# w16a16 masks partial M tiles (every prompt's last tile already exercises
+# this), so the prefill forward kernelizes every M; the fp32 fallback below is
+# only reachable for non-sm120 / K-not-multiple-of-64. (Decode M=1 has its own
+# weight-bound GEMV path in _nexn2_rtx_decode.) _DENSE_BF16 (cuBLAS bf16) is an
+# A/B knob only -- nondeterministic split-K, so off by default.
 _DENSE_BF16 = False
-_DENSE_BF16_MIN_M = 64
+_DENSE_BF16_MIN_M = 1
 
 # Deterministic hand-tuned bf16-act x bf16-weight tensor-core GEMM (fp32 reg
 # accumulate, single pass over K). Matches the fp32 path's argmax (cos 1.0),
