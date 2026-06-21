@@ -420,11 +420,11 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         VLAModel instance with .predict() method.
     """
     if config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
-                      "motus", "wan22_ti2v_5b", "cosmos3_video"):
+                      "motus", "wan22_ti2v_5b", "cosmos3_video", "nexn2"):
         raise ValueError(
             f"Unknown config: {config}. "
             f"Supported: pi05, groot, groot_n17, pi0, pi0fast, motus, "
-            f"wan22_ti2v_5b, cosmos3_video")
+            f"wan22_ti2v_5b, cosmos3_video, nexn2")
     if framework not in ("torch", "jax"):
         raise ValueError(
             f"Unknown framework: {framework}. Supported: torch, jax")
@@ -446,6 +446,19 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             use_awq = False
         if use_p1_split_gu is None:
             use_p1_split_gu = False
+
+    # Nex-N2-mini (qwen3_5_moe) is a text LLM, not a VLA: its frontend exposes
+    # infer()->logits / generate() rather than the predict(images, ...) surface
+    # that load_model's VLAModel wraps. It is registered in _PIPELINE_MAP for
+    # discoverability but constructed directly (checked before GPU detection so
+    # the redirect fires on any machine).
+    if config == "nexn2":
+        raise NotImplementedError(
+            "config='nexn2' is a text LLM and is not served through "
+            "load_model's VLA wrapper. Construct it directly:\n"
+            "    from flash_rt.frontends.torch.nexn2_rtx import "
+            "Nexn2TorchFrontendRtx\n"
+            "See docs/nexn2_usage.md.")
 
     from flash_rt.hardware import detect_arch, resolve_pipeline_class
     arch = detect_arch() if hardware == "auto" else hardware

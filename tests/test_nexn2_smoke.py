@@ -30,6 +30,15 @@ def test_registry_resolves_nexn2():
     assert cls.__module__ == "flash_rt.frontends.torch.nexn2_rtx"
 
 
+def test_load_model_redirects_to_direct_construction():
+    """load_model marks nexn2 as not-in-the-VLA-path with a clear redirect
+    (it is a text LLM), instead of a cryptic kwargs TypeError."""
+    import flash_rt
+    with pytest.raises(NotImplementedError) as ei:
+        flash_rt.load_model("/nonexistent", config="nexn2")
+    assert "Nexn2TorchFrontendRtx" in str(ei.value)
+
+
 def test_frontend_imports():
     """The frontend module + class import without a GPU or checkpoint."""
     m = importlib.import_module("flash_rt.frontends.torch.nexn2_rtx")

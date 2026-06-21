@@ -116,6 +116,11 @@ class Nexn2TorchFrontendRtx:
             self.checkpoint_path, fvk, device=self.device,
             quant_scope=self._quant_scope)
 
+    @property
+    def tokenizer(self):
+        """The HF tokenizer loaded from the checkpoint."""
+        return self._tokenizer
+
     def set_prompt(self, text: str) -> None:
         """Tokenize ``text`` for the next ``infer()`` / ``generate()`` call."""
         enc = self._tokenizer(text, return_tensors='pt')
