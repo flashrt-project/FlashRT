@@ -8,8 +8,8 @@ CPU-only, no torch / jax / fvk dependencies. Validates:
   * Dataclasses (``Item``, ``LayerBlock``, ``ModelWeightSpec``,
     ``BufferSpec``, ``LoaderContext``) construct and roundtrip cleanly.
   * ``WeightLoader`` rejects a non-conforming source with a typed error.
-  * ``WeightLoader.run`` raises ``NotImplementedError`` with a readable
-    message (no silent partial load).
+  * ``WeightLoader.run`` returns a ``LoaderContext`` for an empty spec without
+    publishing scales or scratch state.
 
 Run: python3 tests/test_weight_loader.py
 """
@@ -17,8 +17,12 @@ Run: python3 tests/test_weight_loader.py
 from __future__ import annotations
 
 import sys
+import types
 import traceback
 
+import numpy as np
+
+from flash_rt.core.weights.loader import _load_orbax
 from flash_rt.executors.weight_loader import (
     BufferSpec,
     Item,
@@ -137,17 +141,200 @@ def test_weight_loader_rejects_bad_spec():
     raise AssertionError("expected TypeError for non-ModelWeightSpec spec")
 
 
-def test_weight_loader_run_stub():
+def _load_orbax_with_fake_modules(metadata, restored):
+    seen = {}
+
+    class _PyTreeCheckpointer:
+        def __enter__(self): return self
+        def __exit__(self, exc_type, exc, tb): pass
+        def metadata(self, path):
+            seen["metadata_path"] = path
+            return metadata
+        def restore(self, path, restore_args):
+            seen["restore_path"] = path
+            seen["restore_item"] = restore_args.item
+            return restored
+
+    class _PyTreeRestore:
+        def __init__(self, *, item, restore_args):
+            self.item = item
+            self.restore_args = restore_args
+
+    class _ArrayRestoreArgs:
+        def __init__(self, *, sharding, restore_type):
+            self.sharding = sharding
+            self.restore_type = restore_type
+
+    ocp = types.ModuleType("orbax.checkpoint")
+    ocp.PyTreeCheckpointer = _PyTreeCheckpointer
+    ocp.ArrayRestoreArgs = _ArrayRestoreArgs
+    ocp.args = types.SimpleNamespace(
+        PyTreeRestore=_PyTreeRestore,
+    )
+
+    orbax = types.ModuleType("orbax")
+    orbax.checkpoint = ocp
+
+    jax = types.ModuleType("jax")
+    jax.devices = lambda: ["fake_device"]
+    jax.sharding = types.SimpleNamespace(
+        Mesh=lambda devices, names: ("mesh", tuple(devices), tuple(names)),
+        NamedSharding=lambda mesh, spec: ("named", mesh, spec),
+        PartitionSpec=lambda: ("partition",),
+    )
+    jax.tree = types.SimpleNamespace(map=lambda fn, tree: fn(tree))
+
+    traverse_util = types.ModuleType("flax.traverse_util")
+    def _flatten_dict(d, sep="."):
+        out = {}
+        stack = [("", d)]
+        while stack:
+            prefix, value = stack.pop()
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    stack.append((f"{prefix}{sep}{key}" if prefix else key,
+                                  child))
+            else:
+                out[prefix] = value
+        return out
+    traverse_util.flatten_dict = _flatten_dict
+    flax = types.ModuleType("flax")
+    flax.traverse_util = traverse_util
+
+    saved_modules = {
+        name: sys.modules.get(name)
+        for name in ("orbax", "orbax.checkpoint", "jax", "flax",
+                     "flax.traverse_util")
+    }
+    sys.modules.update({
+        "orbax": orbax,
+        "orbax.checkpoint": ocp,
+        "jax": jax,
+        "flax": flax,
+        "flax.traverse_util": traverse_util,
+    })
+    try:
+        weights = _load_orbax("/tmp/fake_orbax")
+    finally:
+        for name, module in saved_modules.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+    return seen, weights
+
+
+def test_orbax_step_metadata_loader_path():
+    params_tree = {
+        "foo": {
+            "bar": {
+                "value": object(),
+            },
+        },
+    }
+    restored = {
+        "params": {
+            "foo": {
+                "bar": {
+                    "value": np.array([1.0, 2.0], dtype=np.float16),
+                },
+            },
+        },
+    }
+
+    class _ItemMetadata:
+        tree = {"params": params_tree}
+
+    class _StepMetadata:
+        item_metadata = _ItemMetadata()
+
+    seen, weights = _load_orbax_with_fake_modules(_StepMetadata(), restored)
+
+    _expect(seen["metadata_path"] == "/tmp/fake_orbax",
+            "metadata path should point to the params dir")
+    _expect(seen["restore_path"] == "/tmp/fake_orbax",
+            "restore path should point to the params dir")
+    _expect(seen["restore_item"] == {"params": params_tree},
+            "StepMetadata item_metadata.tree params should seed restore item")
+    _expect(list(weights) == ["foo.bar"],
+            "NNX .value suffix should be stripped from flattened keys")
+    _expect(weights["foo.bar"].dtype == np.float32,
+            "loaded arrays should be converted to float32")
+    _expect(weights["foo.bar"].tolist() == [1.0, 2.0],
+            "loaded values should be preserved")
+
+
+def test_orbax_dict_metadata_loader_path():
+    params_tree = {
+        "foo": {
+            "baz": object(),
+        },
+    }
+    restored = {
+        "params": {
+            "foo": {
+                "baz": np.array([3.0, 4.0], dtype=np.float32),
+            },
+        },
+    }
+    seen, weights = _load_orbax_with_fake_modules(
+        {"params": params_tree}, restored)
+
+    _expect(seen["metadata_path"] == "/tmp/fake_orbax",
+            "metadata path should point to the params dir")
+    _expect(seen["restore_path"] == "/tmp/fake_orbax",
+            "restore path should point to the params dir")
+    _expect(seen["restore_item"] == {"params": params_tree},
+            "dict metadata params should seed restore item")
+    _expect(list(weights) == ["foo.baz"],
+            "dict metadata path should preserve flattened keys")
+    _expect(weights["foo.baz"].dtype == np.float32,
+            "float32 loaded arrays should keep float32 dtype")
+    _expect(weights["foo.baz"].tolist() == [3.0, 4.0],
+            "loaded values should be preserved")
+
+
+def test_orbax_mapping_metadata_loader_path():
+    params_tree = {
+        "foo": {
+            "qux": object(),
+        },
+    }
+    restored = {
+        "params": {
+            "foo": {
+                "qux": np.array([5.0, 6.0], dtype=np.float32),
+            },
+        },
+    }
+
+    class _MappingMetadata:
+        def __getitem__(self, key):
+            if key != "params":
+                raise KeyError(key)
+            return params_tree
+
+    seen, weights = _load_orbax_with_fake_modules(
+        _MappingMetadata(), restored)
+
+    _expect(seen["restore_item"] == {"params": params_tree},
+            "mapping metadata params should seed restore item")
+    _expect(list(weights) == ["foo.qux"],
+            "mapping metadata path should preserve flattened keys")
+    _expect(weights["foo.qux"].tolist() == [5.0, 6.0],
+            "loaded values should be preserved")
+
+
+def test_weight_loader_run_empty_spec_returns_context():
     src = _DictSource({})
     spec = ModelWeightSpec(framework="torch")
     loader = WeightLoader(source=src, target=None, spec=spec)
-    try:
-        loader.run()
-    except NotImplementedError as e:
-        _expect("7.1" in str(e) and "7.2" in str(e),
-                "stub message must reference stage 7.1/7.2")
-        return
-    raise AssertionError("stage-7.1 run() must raise NotImplementedError")
+    ctx = loader.run()
+    _expect(ctx.source is src, "run() should return a context with the source")
+    _expect(ctx.target is None, "run() should preserve the target")
+    _expect(ctx.scales == {}, "empty spec should not publish scales")
+    _expect(ctx.scratch == {}, "empty spec should not leave scratch state")
 
 
 TESTS = [
@@ -158,6 +345,10 @@ TESTS = [
     test_loader_context_defaults,
     test_weight_loader_rejects_bad_source,
     test_weight_loader_rejects_bad_spec,
+    test_orbax_step_metadata_loader_path,
+    test_orbax_dict_metadata_loader_path,
+    test_orbax_mapping_metadata_loader_path,
+    test_weight_loader_run_empty_spec_returns_context,
 ]
 
 

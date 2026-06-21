@@ -13,7 +13,6 @@ transformations (QKV merge, interleave, FP8 quantize).
 """
 
 import logging
-import os
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -97,65 +96,40 @@ def _load_orbax(path: str) -> Dict[str, np.ndarray]:
     Handles multi-device checkpoints (saved on 8 GPUs) by restoring
     as numpy arrays with no sharding.
     """
-    import sys
-
     p = Path(path)
     params_path = p / "params" if (p / "params").is_dir() else p
 
-    # Use openpi's restore_params if available (handles sharding correctly).
-    # If openpi is not importable we fall through to the direct orbax
-    # fallback below — verified byte-identical on tested checkpoints, so
-    # both paths produce the same engine-weights dict.
-    try:
-        # Try importing openpi's loader
-        import importlib.util
-        openpi_paths = [
-            "/workspace/src",
-        ]
-        for op in openpi_paths:
-            if os.path.exists(op) and op not in sys.path:
-                sys.path.insert(0, op)
+    import orbax.checkpoint as ocp
+    import jax
 
-        from openpi.models.model import restore_params
-        import flax.traverse_util as tu
+    mesh = jax.sharding.Mesh(jax.devices(), ("x",))
+    sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
-        raw = restore_params(str(params_path), restore_type=np.ndarray)
-        flat = tu.flatten_dict(raw, sep=".")
-        weights = {k: np.array(v, dtype=np.float32) if v.dtype != np.float32 else v
-                   for k, v in flat.items()}
-        logger.info(f"Loaded {len(weights)} tensors from Orbax (via openpi)")
-        return weights
-
-    except ImportError:
-        # Fallback: direct orbax loading
-        import orbax.checkpoint as ocp
-        import jax
-
-        mesh = jax.sharding.Mesh(jax.devices(), ("x",))
-        sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
-
-        with ocp.PyTreeCheckpointer() as ckptr:
-            metadata = ckptr.metadata(str(params_path))
+    with ocp.PyTreeCheckpointer() as ckptr:
+        metadata = ckptr.metadata(str(params_path))
+        if hasattr(metadata, "item_metadata"):
+            item = {"params": metadata.item_metadata.tree["params"]}
+        else:
             item = {"params": metadata["params"]}
-            params = ckptr.restore(
-                str(params_path),
-                ocp.args.PyTreeRestore(
-                    item=item,
-                    restore_args=jax.tree.map(
-                        lambda _: ocp.ArrayRestoreArgs(
-                            sharding=sharding, restore_type=np.ndarray
-                        ), item
-                    ),
+        params = ckptr.restore(
+            str(params_path),
+            ocp.args.PyTreeRestore(
+                item=item,
+                restore_args=jax.tree.map(
+                    lambda _: ocp.ArrayRestoreArgs(
+                        sharding=sharding, restore_type=np.ndarray
+                    ), item
                 ),
-            )["params"]
+            ),
+        )["params"]
 
-        import flax.traverse_util as tu
-        flat = tu.flatten_dict(params, sep=".")
-        # Remove 'value' suffix if present (NNX convention)
-        if all(k.endswith(".value") for k in flat):
-            flat = {k[:-6]: v for k, v in flat.items()}
+    import flax.traverse_util as tu
+    flat = tu.flatten_dict(params, sep=".")
+    # Remove 'value' suffix if present (NNX convention)
+    if all(k.endswith(".value") for k in flat):
+        flat = {k[:-6]: v for k, v in flat.items()}
 
-        weights = {k: np.array(v, dtype=np.float32) if v.dtype != np.float32 else v
-                   for k, v in flat.items()}
-        logger.info(f"Loaded {len(weights)} tensors from Orbax (direct)")
-        return weights
+    weights = {k: np.array(v, dtype=np.float32) if v.dtype != np.float32 else v
+               for k, v in flat.items()}
+    logger.info(f"Loaded {len(weights)} tensors from Orbax")
+    return weights
