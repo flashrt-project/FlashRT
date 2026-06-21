@@ -68,7 +68,55 @@ def _proj(x2d, ld, base, n, fvk, device):
         return _nvfp4_gemm(x2d, ld[base + '_packed'], ld[base + '_sf'],
                            ld[base + '_alpha'], n, fvk, device)
     w = ld[base + '_w_t']
+    if _DENSE_FP4:
+        return _gemm_fp4(x2d, w, ld, base + '_w_t', fvk, device)
     return (x2d.float() @ w.float().T).to(torch.bfloat16)
+
+
+# The experts-scope dense projections run as `.float() @ .float().T` -- a full
+# fp32 (TF32) tensor-op which on sm120 is ~10x slower than the fp4 block-scaled
+# GEMM. Routing the non-red-line projections (full-attn q/k/v/o, GDN out_proj,
+# shared expert) through the fp4 W4A4 GEMM (weight quantised once) crosses the
+# llama.cpp 9.5k prefill target (9686 tok/s) but the fp4 *activation* drops cos
+# to 0.987 (within the 0.984 red line, tight). Off by default; the true W4A16
+# kernel (nexn2_w4a16_gemm, bf16 activation, correct but needs occupancy tuning
+# to beat the fp32 path) is the precision-preserving replacement in progress.
+_DENSE_FP4 = False
+
+
+def _wquant(w, ld, key, fvk, device):
+    """Quantise a bf16 weight to swizzled NVFP4 once, cached on ld[key+'_w4*']."""
+    pk = key + '_w4p'
+    if pk not in ld:
+        nn, kk = w.shape
+        p = torch.empty(nn, kk // 2, dtype=torch.uint8, device=device)
+        s = torch.zeros(_sf_swz_bytes(nn, kk), dtype=torch.uint8, device=device)
+        scr = torch.zeros(1, dtype=torch.float32, device=device)
+        og = torch.zeros(1, dtype=torch.float32, device=device)
+        fvk.bf16_weight_to_nvfp4_swizzled(
+            w.contiguous().data_ptr(), p.data_ptr(), s.data_ptr(),
+            scr.data_ptr(), og.data_ptr(), nn, kk, 0)
+        torch.cuda.synchronize()
+        ld[pk] = p
+        ld[key + '_w4s'] = s
+        ld[key + '_w4a'] = float(og.item())
+    return ld[pk], ld[key + '_w4s'], ld[key + '_w4a']
+
+
+def _gemm_fp4(x2d, w, ld, key, fvk, device, xp=None, xsf=None):
+    """y = x @ w.T via the fp4 block-scaled GEMM (W4A4, bf16 out). 6-10x the
+    fp32 path at large M. Weight quantised once (cached); activation quantised
+    per call unless (xp, xsf) are supplied (shared across same-input projs)."""
+    m, k = x2d.shape
+    p, s, a = _wquant(w, ld, key, fvk, device)
+    n = ld[key + '_w4p'].shape[0]
+    if xp is None:
+        xp, xsf = _quant_act(x2d, fvk, device)
+    y = torch.empty(m, n, dtype=torch.bfloat16, device=device)
+    fvk.fp4_w4a16_gemm_sm120_bf16out(
+        xp.data_ptr(), p.data_ptr(), y.data_ptr(), m, n, k,
+        xsf.data_ptr(), s.data_ptr(), a, 0)
+    return y
 
 
 def _quant_act(x2d, fvk, device, stream=0):

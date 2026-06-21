@@ -148,6 +148,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/nexn2_moe_m16_mma.cuh"
 #include "kernels/nexn2_moe_m64_mma.cuh"
 #include "kernels/nexn2_moe_bt_mma.cuh"
+#include "kernels/nexn2_w4a16_gemm.cuh"
 #include "kernels/bf16_matvec_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36_thor.cuh"
@@ -4560,6 +4561,17 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("D"), py::arg("alpha"), py::arg("te"), py::arg("num_tiles"),
         py::arg("N"), py::arg("K"), py::arg("sfa_stride"), py::arg("w_stride"),
         py::arg("sfb_stride"), py::arg("stream") = 0);
+
+    m.def("nexn2_w4a16_gemm_bf16",
+        [](uintptr_t X, uintptr_t W, uintptr_t SFB, uintptr_t Y,
+           int M, int N, int K, float alpha, uintptr_t stream) -> int {
+            return flash_rt::gemm::nexn2_w4a16_gemm_bf16(
+                to_ptr(X), to_ptr(W), to_ptr(SFB), to_ptr(Y),
+                M, N, K, alpha, to_stream(stream));
+        },
+        py::arg("X"), py::arg("W"), py::arg("SFB"), py::arg("Y"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("alpha") = 1.0f, py::arg("stream") = 0);
 
     m.def("nexn2_router_topk_bf16",
         [](uintptr_t logits, uintptr_t out_idx, uintptr_t out_val,
