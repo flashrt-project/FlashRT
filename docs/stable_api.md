@@ -65,7 +65,9 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   Pi0-FAST.
 - `embodiment_tag` and `action_horizon` apply to GROOT.
 - `use_fp4`, `fp4_layers`, `use_awq`, `awq_alpha`, and
-  `use_p1_split_gu` apply to the Pi0.5 torch NVFP4 encoder path.
+  `use_p1_split_gu` apply to the Pi0.5 torch and JAX NVFP4 encoder path on
+  Thor. The JAX path loads Orbax checkpoints; the torch path loads
+  safetensors checkpoints.
 - `num_steps`, `vision_pool_factor`, `vision_num_layers`, and
   `cache_frames` apply only to frontends that expose those constructor
   parameters today. The Pi0.5 torch RTX/Orin frontend validates

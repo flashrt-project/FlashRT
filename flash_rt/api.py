@@ -351,15 +351,20 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         action_horizon: GROOT only. Number of action steps to generate per
             inference (default = ``ACTION_HORIZON_MAX`` = 50). Set to a
             smaller value (e.g. 16 for LIBERO) to reduce DiT compute.
-        use_fp4: Pi0.5 torch only. If True, enable NVFP4 quantization on the
-            selected encoder FFN layers (Gate+Up + Down GEMMs). Requires
-            SM100+ GPU (Thor SM110) and the flash_rt_fp4 extension. Falls
-            back to FP8 with a warning if the extension is unavailable.
-            Default False (production FP8 baseline).
-            Validated on LIBERO Spatial: 491/500 = 98.2% (matches baseline).
+        use_fp4: Pi0.5 torch and JAX on Thor. If True, enable NVFP4
+            quantization on the selected encoder FFN layers (Gate+Up + Down
+            GEMMs). Requires SM100+ GPU (Thor SM110) and the flash_rt_fp4
+            extension. Uses the FP8 route with a warning if the extension is
+            unavailable. Default False (production FP8 baseline).
+            Torch uses safetensors checkpoints; JAX uses Orbax checkpoints.
+            Validated on LIBERO Spatial for the torch path: 491/500 = 98.2%
+            (matches baseline). JAX FP4 has Thor precision / replay-latency
+            validation against a same-origin PyTorch reference.
         fp4_layers: Tuple of encoder layer indices to FP4-quantize (only
-            applies when use_fp4=True). Default (7, 8, 9) = middle FFN
-            subset, LIBERO-validated. Other subsets untested at task level.
+            applies when use_fp4=True). ``None`` resolves to the production
+            preset, full 18 encoder FFN layers with AWQ + P1 split-GU.
+            Explicit tuples override the preset; `(7, 8, 9)` is the
+            conservative middle-FFN subset.
         use_fp8: Enable FP8 execution where the selected frontend supports
             an FP8/BF16 switch. Defaults to True to preserve existing
             performance-oriented behavior.

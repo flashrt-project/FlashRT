@@ -511,9 +511,9 @@ data regardless of cache.
 ### NVFP4 encoder FFN (Pi0.5 only)
 
 Optional NVFP4 (Blackwell block-scaled FP4) quantization on the Pi0.5 encoder
-FFN stack. Currently implemented for **Pi0.5 torch only** — passing
+FFN stack. Implemented for **Pi0.5 torch and JAX on Thor** — passing
 `use_fp4=True` with any other config (pi0 / groot / pi0fast) emits a warning
-and falls back to FP8.
+and uses the FP8 route.
 
 ```python
 model = flash_rt.load_model(
@@ -549,8 +549,8 @@ L7-9 subset).
   `enable_llm_nvfp4` style — `output_quantizer` disabled).
 
 **Requirements**:
-- SM100+ GPU (validated on Thor SM110). Non-SM100 hardware silently falls
-  back to FP8.
+- SM100+ GPU (validated on Thor SM110). Non-SM100 hardware logs a warning
+  and uses the FP8 route.
 - `flash_rt_fp4.so` extension (built alongside `flash_rt_kernels.so`).
 
 **Measured on Thor SM110, Pi0.5 / LIBERO Spatial 10 × 50 = 500 episodes**:
@@ -572,12 +572,12 @@ stratified calibration, 50 graph replays, Thor SM110)**:
 | **NVFP4 encoder (torch)** | **31.91 ms** | **39.78 ms** | **51.51 ms** | **0.998932** |
 | **NVFP4 encoder (jax, Orbax)** | **34.39 ms** | **43.65 ms** | **56.90 ms** | **0.999030** |
 
-Encoder FP4 preserves cosine **≥ 0.9989** vs the PyTorch FP32 reference
-across view counts, with no latency regression relative to the FP8
-torch baseline. The JAX FP4 path derives NVFP4 weights directly from the
-Orbax checkpoint (no torch dependency at runtime) and uses the same
-two-phase multi-sample calibration flow as the torch FP4 path, producing
-a slightly higher cos (0.99903 vs 0.99893 at 3v, same AWQ refit tuning).
+Encoder FP4 preserves cosine **≥ 0.9989** vs the same-origin PyTorch
+reference in these Thor replay-latency checks. The JAX FP4 path derives
+NVFP4 weights directly from the Orbax checkpoint (no torch dependency at
+runtime) and uses the same two-phase multi-sample calibration flow as the
+torch FP4 path. Treat the table as Thor correctness / availability evidence,
+not a broad performance claim across every view count or host.
 Reproduce with
 [`tests/bench_pi05_thor_views.py`](tests/bench_pi05_thor_views.py)
 (defaults now include `jax_fp4`).
