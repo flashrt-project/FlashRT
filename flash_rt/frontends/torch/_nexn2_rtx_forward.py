@@ -71,9 +71,31 @@ def _proj(x2d, ld, base, n, fvk, device):
     if (_DENSE_W4A16 and x2d.shape[0] >= 64 and (w.shape[0] % 64) == 0
             and (x2d.shape[1] % 64) == 0):
         return _gemm_w4a16(x2d, w, ld, base + '_w_t', fvk, device)
+    if (_DENSE_W16A16 and x2d.shape[0] >= _DENSE_BF16_MIN_M
+            and (x2d.shape[1] % 64) == 0):
+        return _gemm_w16a16(x2d, w, fvk, device)
     if _DENSE_FP4:
         return _gemm_fp4(x2d, w, ld, base + '_w_t', fvk, device)
+    if _DENSE_BF16 and x2d.shape[0] >= _DENSE_BF16_MIN_M:
+        # BF16 cuBLAS matmul. Faster than the hand-tuned kernel but its split-K
+        # accumulation is non-deterministic (flips near-tie argmaxes run-to-run,
+        # breaking the token-exact red line) -- kept only for A/B, not default.
+        return (x2d.to(torch.bfloat16) @ w.t()).to(torch.bfloat16)
     return (x2d.float() @ w.float().T).to(torch.bfloat16)
+
+
+def _gemm_w16a16(x2d, w, fvk, device):
+    """y = x @ w.T via the deterministic bf16-act x bf16-weight tensor-core
+    GEMM (fp32 register accumulate). Matches the fp32 path's argmax (cos 1.0)
+    and is bit-identical run-to-run, at ~1.75x the fp32/TF32 op."""
+    m, k = x2d.shape
+    n = w.shape[0]
+    xc = x2d.contiguous()
+    wc = w.contiguous()
+    y = torch.empty(m, n, dtype=torch.bfloat16, device=device)
+    fvk.nexn2_w16a16_gemm_bf16(xc.data_ptr(), wc.data_ptr(), y.data_ptr(),
+                               m, n, k, 1.0, 0)
+    return y
 
 
 # True W4A16 (bf16 activation x fp4 weight) GEMM for the large prefill dense
@@ -82,6 +104,22 @@ def _proj(x2d, ld, base, n, fvk, device):
 # while being slower than the CUTLASS W4A4 -- dominated. Default OFF; the 0.994
 # path needs a bf16-*weight* GEMM (repurpose this kernel's 2.18x structure).
 _DENSE_W4A16 = False
+
+# BF16 tensor-core dense projections (vs the default fp32/TF32 matmul). The
+# experts-scope q/k/v/o/out/shared/router projections dominate the prefill
+# profile as fp32 GEMMs; bf16 inputs with fp32 accumulate roughly halve that
+# bucket at near-identical cos (no fp4 weight rounding -> stays ~0.994).
+# Gated to M >= _DENSE_BF16_MIN_M (decode M=1 is weight-bound -> fp4 wins).
+_DENSE_BF16 = False
+_DENSE_BF16_MIN_M = 64
+
+# Deterministic hand-tuned bf16-act x bf16-weight tensor-core GEMM (fp32 reg
+# accumulate, single pass over K). Matches the fp32 path's argmax (cos 1.0),
+# bit-identical run-to-run, ~1.75x the fp32/TF32 op -- so it replaces the fp32
+# dense projections at prefill M with no precision or determinism cost. Default
+# ON; decode (M=1) stays on its own GEMV (weight-bound -> fp4). Set False to
+# fall back to the fp32 path. (K must be a multiple of 64.)
+_DENSE_W16A16 = True
 
 
 def _gemm_w4a16(x2d, w, ld, key, fvk, device):
