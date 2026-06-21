@@ -16,11 +16,11 @@ namespace flash_rt {
 namespace kernels {
 
 // out = silu(g) * u   (silu(x) = x / (1 + exp(-x))), bf16 io, fp32 internal.
-int nexn2_silu_mul_bf16(const void* g, const void* u, void* out, int n,
+int silu_mul_sm120_bf16(const void* g, const void* u, void* out, int n,
                         cudaStream_t stream);
 
 // out = x * sigmoid(gate), bf16 io, fp32 internal.
-int nexn2_sigmoid_mul_bf16(const void* x, const void* gate, void* out, int n,
+int sigmoid_mul_sm120_bf16(const void* x, const void* gate, void* out, int n,
                            cudaStream_t stream);
 
 }  // namespace kernels

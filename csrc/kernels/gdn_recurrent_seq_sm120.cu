@@ -4,7 +4,7 @@
 // Math mirrors gated_deltanet_recurrent_kernel; the state column lives in
 // registers across the whole S-step scan instead of HBM per token.
 
-#include "kernels/nexn2_gdn_seq.cuh"
+#include "kernels/gdn_recurrent_seq_sm120.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -112,7 +112,7 @@ __global__ void gdn_recurrent_seq_kernel(
 
 }  // namespace
 
-int nexn2_gdn_recurrent_seq_bf16(
+int gdn_recurrent_seq_sm120_bf16(
     const void*  q,
     const void*  k,
     const void*  v,

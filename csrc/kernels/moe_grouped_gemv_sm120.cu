@@ -9,7 +9,7 @@
 // added on top; correctness is pinned by a cos=1.0 check vs the per-expert
 // fp4_w4a4_mma_sm120_full_n_bf16out loop.
 
-#include "kernels/nexn2_moe_grouped.cuh"
+#include "kernels/moe_grouped_gemv_sm120.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -230,7 +230,7 @@ __global__ void grouped_n_kernel(
 
 }  // namespace
 
-int nexn2_moe_grouped_gemv_bf16(
+int moe_grouped_gemv_sm120_bf16(
     const void*  A_stack,
     const void*  B_stack,
     void*        D,

@@ -15,7 +15,7 @@ namespace kernels {
 
 // logits (n_experts,) bf16 -> out_idx (k,) int32 + out_val (k,) fp32 (the
 // top-k logits, descending). k must be <= 32. Returns 0 on success.
-int nexn2_router_topk_bf16(const void* logits, void* out_idx, void* out_val,
+int moe_router_topk_sm120_bf16(const void* logits, void* out_idx, void* out_val,
                            int n_experts, int k, cudaStream_t stream);
 
 }  // namespace kernels

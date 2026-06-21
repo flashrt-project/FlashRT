@@ -36,7 +36,7 @@ namespace gemm {
 //                sfb_stride = swizzled SF bytes for (N,K)).
 //
 // Returns 0 on success, nonzero on caller-side argument error.
-int nexn2_moe_grouped_gemv_bf16(
+int moe_grouped_gemv_sm120_bf16(
     const void*  A_stack,
     const void*  B_stack,
     void*        D,

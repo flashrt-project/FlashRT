@@ -18,7 +18,7 @@ namespace kernels {
 
 // y(1,N) = x(1,K) . W(N,K)^T, bf16, fp32 accumulate. K must be a multiple
 // of 8 (int4 vectorization). Returns 0 on success, nonzero on arg error.
-int nexn2_bf16_matvec_bf16(
+int bf16_matvec_sm120_bf16(
     const void*  x,
     const void*  W,
     void*        out,

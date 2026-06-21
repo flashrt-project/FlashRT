@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Nex-N2-mini MoE grouped W4A16 GEMV (NVFP4 weight x BF16 act). See header.
-// Body mirrors nexn2_w4a16_gemv.cu with per-slot/per-expert base pointers.
+// Body mirrors w4a16_matvec_sm120.cu with per-slot/per-expert base pointers.
 
-#include "kernels/nexn2_moe_grouped_w4a16.cuh"
+#include "kernels/moe_grouped_w4a16_sm120.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -127,7 +127,7 @@ void init_ue4m3_g() {
 
 }  // namespace
 
-int nexn2_moe_grouped_w4a16_bf16(
+int moe_grouped_w4a16_sm120_bf16(
     const void*  A_stack,
     const void*  W_stack,
     const void*  SFB_stack,

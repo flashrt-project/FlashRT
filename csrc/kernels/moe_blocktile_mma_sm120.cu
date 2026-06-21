@@ -17,7 +17,7 @@
 // tiling + cooperative smem staging are new. Tokens pre-sorted into BM-row
 // expert tiles (pad with zeros). All add-only.
 
-#include "kernels/nexn2_moe_bt_mma.cuh"
+#include "kernels/moe_blocktile_mma_sm120.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -227,7 +227,7 @@ __global__ __launch_bounds__(BT_THREADS) void moe_bt_mma_kernel(
 
 }  // namespace
 
-int nexn2_moe_bt_mma_bf16(
+int moe_blocktile_mma_sm120_bf16(
     const void* A_tiled, const void* B_stack, const void* SFA_tiled,
     const void* SFB_stack, void* D, const void* alpha_stack,
     const void* tile_expert, int num_tiles, int N, int K,

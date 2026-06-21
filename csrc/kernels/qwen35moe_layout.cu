@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Nex-N2-mini (qwen3_5_moe) layout-glue kernels. See nexn2_misc.cuh for the
+// Nex-N2-mini (qwen3_5_moe) layout-glue kernels. See qwen35moe_layout.cuh for the
 // head-count differences vs the qwen36 variants.
 
-#include "kernels/nexn2_misc.cuh"
+#include "kernels/qwen35moe_layout.cuh"
 
 #include <cuda_bf16.h>
 
@@ -21,7 +21,7 @@ constexpr int kSplitThreads = 256;
 
 // 16 K-heads -> 32 V-heads broadcast (ratio 2). Mirror of the qwen36 16->48
 // kernel with floor(h/2) and an 8192-wide conv row.
-__global__ void nexn2_lin_split_qkv_broadcast_kernel(
+__global__ void qwen35moe_lin_split_qkv_broadcast_kernel(
     const __nv_bfloat16* __restrict__ conv_out,
     __nv_bfloat16* __restrict__ q32,
     __nv_bfloat16* __restrict__ k32,
@@ -43,7 +43,7 @@ __global__ void nexn2_lin_split_qkv_broadcast_kernel(
 }
 
 // Split q_proj (S, 16, 512) -> q_pre (S, 16, 256) + gate (S, 16, 256).
-__global__ void nexn2_split_q_gate_kernel(
+__global__ void qwen35moe_split_q_gate_kernel(
     const __nv_bfloat16* __restrict__ q_proj,
     __nv_bfloat16* __restrict__ q_pre,
     __nv_bfloat16* __restrict__ gate,
@@ -63,7 +63,7 @@ __global__ void nexn2_split_q_gate_kernel(
 
 }  // namespace
 
-void nexn2_lin_split_qkv_broadcast_bf16(
+void qwen35moe_lin_split_qkv_broadcast_bf16(
     const void* conv_out,
     void*       q32,
     void*       k32,
@@ -75,7 +75,7 @@ void nexn2_lin_split_qkv_broadcast_bf16(
   const int total = S * kVHeads * kHD;
   dim3 grid((total + kSplitThreads - 1) / kSplitThreads);
   dim3 block(kSplitThreads);
-  nexn2_lin_split_qkv_broadcast_kernel<<<grid, block, 0, stream>>>(
+  qwen35moe_lin_split_qkv_broadcast_kernel<<<grid, block, 0, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(conv_out),
       reinterpret_cast<__nv_bfloat16*>(q32),
       reinterpret_cast<__nv_bfloat16*>(k32),
@@ -83,7 +83,7 @@ void nexn2_lin_split_qkv_broadcast_bf16(
       S);
 }
 
-void nexn2_split_q_gate_bf16(
+void qwen35moe_split_q_gate_bf16(
     const void* q_proj,
     void*       q_pre,
     void*       gate,
@@ -94,7 +94,7 @@ void nexn2_split_q_gate_bf16(
   const int total = S * kQHeads * kFullHD;
   dim3 grid((total + kSplitThreads - 1) / kSplitThreads);
   dim3 block(kSplitThreads);
-  nexn2_split_q_gate_kernel<<<grid, block, 0, stream>>>(
+  qwen35moe_split_q_gate_kernel<<<grid, block, 0, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(q_proj),
       reinterpret_cast<__nv_bfloat16*>(q_pre),
       reinterpret_cast<__nv_bfloat16*>(gate),

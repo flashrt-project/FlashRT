@@ -137,19 +137,19 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/rms_norm_gated_silu_qwen36.cuh"
 #include "kernels/silu_mul_qwen36.cuh"
 #include "kernels/qwen36_misc.cuh"
-#include "kernels/nexn2_misc.cuh"
-#include "kernels/nexn2_moe_grouped.cuh"
-#include "kernels/nexn2_bf16_gemv.cuh"
-#include "kernels/nexn2_w4a16_gemv.cuh"
-#include "kernels/nexn2_moe_grouped_w4a16.cuh"
-#include "kernels/nexn2_gdn_seq.cuh"
-#include "kernels/nexn2_act_fuse.cuh"
-#include "kernels/nexn2_router_topk.cuh"
-#include "kernels/nexn2_moe_m16_mma.cuh"
-#include "kernels/nexn2_moe_m64_mma.cuh"
-#include "kernels/nexn2_moe_bt_mma.cuh"
-#include "kernels/nexn2_w4a16_gemm.cuh"
-#include "kernels/nexn2_w16a16_gemm.cuh"
+#include "kernels/qwen35moe_layout.cuh"
+#include "kernels/moe_grouped_gemv_sm120.cuh"
+#include "kernels/bf16_matvec_sm120.cuh"
+#include "kernels/w4a16_matvec_sm120.cuh"
+#include "kernels/moe_grouped_w4a16_sm120.cuh"
+#include "kernels/gdn_recurrent_seq_sm120.cuh"
+#include "kernels/act_fuse_sm120.cuh"
+#include "kernels/moe_router_topk_sm120.cuh"
+#include "kernels/moe_m16_mma_sm120.cuh"
+#include "kernels/moe_m64_mma_sm120.cuh"
+#include "kernels/moe_blocktile_mma_sm120.cuh"
+#include "kernels/w4a16_gemm_sm120.cuh"
+#include "kernels/w16a16_gemm_sm120.cuh"
 #include "kernels/bf16_matvec_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36_thor.cuh"
@@ -4476,11 +4476,11 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("q_proj"), py::arg("q_pre"), py::arg("gate"),
         py::arg("S"), py::arg("stream") = 0);
 
-    m.def("nexn2_lin_split_qkv_broadcast_bf16",
+    m.def("qwen35moe_lin_split_qkv_broadcast_bf16",
         [](uintptr_t conv_out, uintptr_t q32,
            uintptr_t k32, uintptr_t v32,
            int S, uintptr_t stream) {
-            flash_rt::kernels::nexn2_lin_split_qkv_broadcast_bf16(
+            flash_rt::kernels::qwen35moe_lin_split_qkv_broadcast_bf16(
                 to_ptr(conv_out), to_ptr(q32),
                 to_ptr(k32), to_ptr(v32),
                 S, to_stream(stream));
@@ -4489,41 +4489,41 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("k32"), py::arg("v32"),
         py::arg("S"), py::arg("stream") = 0);
 
-    m.def("nexn2_split_q_gate_bf16",
+    m.def("qwen35moe_split_q_gate_bf16",
         [](uintptr_t q_proj, uintptr_t q_pre,
            uintptr_t gate, int S, uintptr_t stream) {
-            flash_rt::kernels::nexn2_split_q_gate_bf16(
+            flash_rt::kernels::qwen35moe_split_q_gate_bf16(
                 to_ptr(q_proj), to_ptr(q_pre), to_ptr(gate),
                 S, to_stream(stream));
         },
         py::arg("q_proj"), py::arg("q_pre"), py::arg("gate"),
         py::arg("S"), py::arg("stream") = 0);
 
-    m.def("nexn2_bf16_matvec_bf16",
+    m.def("bf16_matvec_sm120_bf16",
         [](uintptr_t x, uintptr_t W, uintptr_t out,
            int N, int K, uintptr_t stream) -> int {
-            return flash_rt::kernels::nexn2_bf16_matvec_bf16(
+            return flash_rt::kernels::bf16_matvec_sm120_bf16(
                 to_ptr(x), to_ptr(W), to_ptr(out), N, K, to_stream(stream));
         },
         py::arg("x"), py::arg("W"), py::arg("out"),
         py::arg("N"), py::arg("K"), py::arg("stream") = 0);
 
-    m.def("nexn2_w4a16_matvec_bf16",
+    m.def("w4a16_matvec_sm120_bf16",
         [](uintptr_t x, uintptr_t W, uintptr_t sfb, uintptr_t out,
            int N, int K, float alpha, uintptr_t stream) -> int {
-            return flash_rt::kernels::nexn2_w4a16_matvec_bf16(
+            return flash_rt::kernels::w4a16_matvec_sm120_bf16(
                 to_ptr(x), to_ptr(W), to_ptr(sfb), to_ptr(out),
                 N, K, alpha, to_stream(stream));
         },
         py::arg("x"), py::arg("W"), py::arg("sfb"), py::arg("out"),
         py::arg("N"), py::arg("K"), py::arg("alpha"), py::arg("stream") = 0);
 
-    m.def("nexn2_moe_m16_mma_bf16",
+    m.def("moe_m16_mma_sm120_bf16",
         [](uintptr_t A, uintptr_t B, uintptr_t sfa, uintptr_t sfb, uintptr_t D,
            uintptr_t alpha, uintptr_t te, int num_tiles, int N, int K,
            long sfa_stride, long w_stride, long sfb_stride,
            uintptr_t stream) -> int {
-            return flash_rt::gemm::nexn2_moe_m16_mma_bf16(
+            return flash_rt::gemm::moe_m16_mma_sm120_bf16(
                 to_ptr(A), to_ptr(B), to_ptr(sfa), to_ptr(sfb), to_ptr(D),
                 to_ptr(alpha), to_ptr(te), num_tiles, N, K,
                 sfa_stride, w_stride, sfb_stride, to_stream(stream));
@@ -4533,12 +4533,12 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("N"), py::arg("K"), py::arg("sfa_stride"), py::arg("w_stride"),
         py::arg("sfb_stride"), py::arg("stream") = 0);
 
-    m.def("nexn2_moe_m64_mma_bf16",
+    m.def("moe_m64_mma_sm120_bf16",
         [](uintptr_t A, uintptr_t B, uintptr_t sfa, uintptr_t sfb, uintptr_t D,
            uintptr_t alpha, uintptr_t te, int num_tiles, int N, int K,
            long sfa_stride, long w_stride, long sfb_stride,
            uintptr_t stream) -> int {
-            return flash_rt::gemm::nexn2_moe_m64_mma_bf16(
+            return flash_rt::gemm::moe_m64_mma_sm120_bf16(
                 to_ptr(A), to_ptr(B), to_ptr(sfa), to_ptr(sfb), to_ptr(D),
                 to_ptr(alpha), to_ptr(te), num_tiles, N, K,
                 sfa_stride, w_stride, sfb_stride, to_stream(stream));
@@ -4548,12 +4548,12 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("N"), py::arg("K"), py::arg("sfa_stride"), py::arg("w_stride"),
         py::arg("sfb_stride"), py::arg("stream") = 0);
 
-    m.def("nexn2_moe_bt_mma_bf16",
+    m.def("moe_blocktile_mma_sm120_bf16",
         [](uintptr_t A, uintptr_t B, uintptr_t sfa, uintptr_t sfb, uintptr_t D,
            uintptr_t alpha, uintptr_t te, int num_tiles, int N, int K,
            long sfa_stride, long w_stride, long sfb_stride,
            uintptr_t stream) -> int {
-            return flash_rt::gemm::nexn2_moe_bt_mma_bf16(
+            return flash_rt::gemm::moe_blocktile_mma_sm120_bf16(
                 to_ptr(A), to_ptr(B), to_ptr(sfa), to_ptr(sfb), to_ptr(D),
                 to_ptr(alpha), to_ptr(te), num_tiles, N, K,
                 sfa_stride, w_stride, sfb_stride, to_stream(stream));
@@ -4563,10 +4563,10 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("N"), py::arg("K"), py::arg("sfa_stride"), py::arg("w_stride"),
         py::arg("sfb_stride"), py::arg("stream") = 0);
 
-    m.def("nexn2_w4a16_gemm_bf16",
+    m.def("w4a16_gemm_sm120_bf16",
         [](uintptr_t X, uintptr_t W, uintptr_t SFB, uintptr_t Y,
            int M, int N, int K, float alpha, uintptr_t stream) -> int {
-            return flash_rt::gemm::nexn2_w4a16_gemm_bf16(
+            return flash_rt::gemm::w4a16_gemm_sm120_bf16(
                 to_ptr(X), to_ptr(W), to_ptr(SFB), to_ptr(Y),
                 M, N, K, alpha, to_stream(stream));
         },
@@ -4574,10 +4574,10 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("M"), py::arg("N"), py::arg("K"),
         py::arg("alpha") = 1.0f, py::arg("stream") = 0);
 
-    m.def("nexn2_w16a16_gemm_bf16",
+    m.def("w16a16_gemm_sm120_bf16",
         [](uintptr_t X, uintptr_t W, uintptr_t Y,
            int M, int N, int K, float alpha, uintptr_t stream) -> int {
-            return flash_rt::gemm::nexn2_w16a16_gemm_bf16(
+            return flash_rt::gemm::w16a16_gemm_sm120_bf16(
                 to_ptr(X), to_ptr(W), to_ptr(Y),
                 M, N, K, alpha, to_stream(stream));
         },
@@ -4585,39 +4585,39 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("M"), py::arg("N"), py::arg("K"),
         py::arg("alpha") = 1.0f, py::arg("stream") = 0);
 
-    m.def("nexn2_router_topk_bf16",
+    m.def("moe_router_topk_sm120_bf16",
         [](uintptr_t logits, uintptr_t out_idx, uintptr_t out_val,
            int n_experts, int k, uintptr_t stream) -> int {
-            return flash_rt::kernels::nexn2_router_topk_bf16(
+            return flash_rt::kernels::moe_router_topk_sm120_bf16(
                 to_ptr(logits), to_ptr(out_idx), to_ptr(out_val),
                 n_experts, k, to_stream(stream));
         },
         py::arg("logits"), py::arg("out_idx"), py::arg("out_val"),
         py::arg("n_experts"), py::arg("k"), py::arg("stream") = 0);
 
-    m.def("nexn2_silu_mul_bf16",
+    m.def("silu_mul_sm120_bf16",
         [](uintptr_t g, uintptr_t u, uintptr_t out, int n,
            uintptr_t stream) -> int {
-            return flash_rt::kernels::nexn2_silu_mul_bf16(
+            return flash_rt::kernels::silu_mul_sm120_bf16(
                 to_ptr(g), to_ptr(u), to_ptr(out), n, to_stream(stream));
         },
         py::arg("g"), py::arg("u"), py::arg("out"), py::arg("n"),
         py::arg("stream") = 0);
 
-    m.def("nexn2_sigmoid_mul_bf16",
+    m.def("sigmoid_mul_sm120_bf16",
         [](uintptr_t x, uintptr_t gate, uintptr_t out, int n,
            uintptr_t stream) -> int {
-            return flash_rt::kernels::nexn2_sigmoid_mul_bf16(
+            return flash_rt::kernels::sigmoid_mul_sm120_bf16(
                 to_ptr(x), to_ptr(gate), to_ptr(out), n, to_stream(stream));
         },
         py::arg("x"), py::arg("gate"), py::arg("out"), py::arg("n"),
         py::arg("stream") = 0);
 
-    m.def("nexn2_gdn_recurrent_seq_bf16",
+    m.def("gdn_recurrent_seq_sm120_bf16",
         [](uintptr_t q, uintptr_t k, uintptr_t v, uintptr_t g, uintptr_t beta,
            uintptr_t state, uintptr_t out, int S, int num_v_heads,
            int head_dim, bool use_qk_l2norm, uintptr_t stream) -> int {
-            return flash_rt::kernels::nexn2_gdn_recurrent_seq_bf16(
+            return flash_rt::kernels::gdn_recurrent_seq_sm120_bf16(
                 to_ptr(q), to_ptr(k), to_ptr(v), to_ptr(g), to_ptr(beta),
                 to_ptr(state), to_ptr(out), S, num_v_heads, head_dim,
                 use_qk_l2norm, to_stream(stream));
@@ -4627,12 +4627,12 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("head_dim"), py::arg("use_qk_l2norm") = true,
         py::arg("stream") = 0);
 
-    m.def("nexn2_moe_grouped_w4a16_bf16",
+    m.def("moe_grouped_w4a16_sm120_bf16",
         [](uintptr_t A, uintptr_t W, uintptr_t sfb, uintptr_t alpha,
            uintptr_t eidx, uintptr_t D, int slots, int N, int K,
            long a_stride, long w_stride, long sfb_stride,
            uintptr_t stream) -> int {
-            return flash_rt::kernels::nexn2_moe_grouped_w4a16_bf16(
+            return flash_rt::kernels::moe_grouped_w4a16_sm120_bf16(
                 to_ptr(A), to_ptr(W), to_ptr(sfb), to_ptr(alpha), to_ptr(eidx),
                 to_ptr(D), slots, N, K, a_stride, w_stride, sfb_stride,
                 to_stream(stream));
@@ -4642,14 +4642,14 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("K"), py::arg("a_stride"), py::arg("w_stride"),
         py::arg("sfb_stride"), py::arg("stream") = 0);
 
-    m.def("nexn2_moe_grouped_gemv_bf16",
+    m.def("moe_grouped_gemv_sm120_bf16",
         [](uintptr_t A_stack, uintptr_t B_stack, uintptr_t D,
            uintptr_t SFA_stack, uintptr_t SFB_stack,
            uintptr_t alpha_stack, uintptr_t expert_idx,
            int E, int N, int K,
            long a_stride, long sfa_stride, long w_stride, long sfb_stride,
            uintptr_t stream) -> int {
-            return flash_rt::gemm::nexn2_moe_grouped_gemv_bf16(
+            return flash_rt::gemm::moe_grouped_gemv_sm120_bf16(
                 to_ptr(A_stack), to_ptr(B_stack), to_ptr(D),
                 to_ptr(SFA_stack), to_ptr(SFB_stack),
                 to_ptr(alpha_stack), to_ptr(expert_idx),

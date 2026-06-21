@@ -13,7 +13,7 @@
 namespace flash_rt {
 namespace gemm {
 
-int nexn2_w16a16_gemm_bf16(
+int w16a16_gemm_sm120_bf16(
     const void*  X,
     const void*  W,
     void*        Y,

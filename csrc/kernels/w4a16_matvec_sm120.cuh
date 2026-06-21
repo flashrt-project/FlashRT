@@ -4,7 +4,7 @@
 //
 // The dense decode projections (GDN/full-attn/out/shared) are the largest
 // single bucket of decode-step HBM traffic. The BF16 MLP GEMV
-// (nexn2_bf16_matvec_bf16) already hits ~87% of peak BW, so the only way to
+// (bf16_matvec_sm120_bf16) already hits ~87% of peak BW, so the only way to
 // shrink that bucket is to read 4-bit weights instead of 16-bit ones.
 //
 // Unlike the W4A4 matvec (fp4_w4a4_matvec_sm120), the activation here stays
@@ -14,7 +14,7 @@
 //   W[n,k] = global_scale * ue4m3(SFB[n, k/16]) * fp4_e2m1(nibble[n,k])
 // so out[n] = global_scale * sum_kb ue4m3(SFB) * sum_j fp4(nibble) * x_bf16.
 //
-// Layout mirrors nexn2_bf16_gemv: 1 warp / output row, x staged once in smem
+// Layout mirrors bf16_matvec_sm120: 1 warp / output row, x staged once in smem
 // and shared across the 8 warps of the block, UNROLL packed-weight loads in
 // flight per warp so the K loop stays bandwidth-bound. All add-only.
 
@@ -32,7 +32,7 @@ namespace kernels {
 //   out       : (N,)            bf16
 //   alpha     : weight per-tensor global_scale (out_global_scale)
 // K must be a multiple of 16. Returns 0 on success, nonzero on arg error.
-int nexn2_w4a16_matvec_bf16(
+int w4a16_matvec_sm120_bf16(
     const void*  x_bf16,
     const void*  W_packed,
     const void*  SFB,

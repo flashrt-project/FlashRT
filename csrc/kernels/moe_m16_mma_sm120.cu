@@ -2,12 +2,12 @@
 //
 // Nex-N2-mini MoE grouped W4A4 block-scaled mma, M=16 tiled (prefill).
 //
-// The grouped W4A16 GEMV (nexn2_moe_grouped_w4a16) is SIMT and runs one M=1
+// The grouped W4A16 GEMV (moe_grouped_w4a16_sm120) is SIMT and runs one M=1
 // GEMV per (token, expert) slot -> at large S the per-token compute is the
 // wall (51% of the S=2048 prefill). This kernel feeds the SM120 block-scaled
 // mma 16 REAL tokens of one expert per tile, so the tensor cores are fully
 // utilised and each expert weight is read once. It is the M=16 sibling of the
-// decode nexn2_moe_grouped (which pads M=1 to 16 and writes only row 0); the
+// decode moe_grouped_gemv_sm120 (which pads M=1 to 16 and writes only row 0); the
 // mma body / swizzle decode are copied verbatim from that validated kernel
 // (file-local anon namespace, cannot be shared) with the activation load,
 // SFA load and epilogue widened to all 16 rows. W4A4 (FP4 activation).
@@ -16,7 +16,7 @@
 // rows): A_tiled (num_tiles*16, K) FP4 + SFA_tiled (per-tile super, sfa_stride),
 // tile_expert (num_tiles,). All add-only.
 
-#include "kernels/nexn2_moe_m16_mma.cuh"
+#include "kernels/moe_m16_mma_sm120.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -184,7 +184,7 @@ __global__ void moe_m16_mma_kernel(
 
 }  // namespace
 
-int nexn2_moe_m16_mma_bf16(
+int moe_m16_mma_sm120_bf16(
     const void* A_tiled, const void* B_stack, const void* SFA_tiled,
     const void* SFB_stack, void* D, const void* alpha_stack,
     const void* tile_expert, int num_tiles, int N, int K,

@@ -2,7 +2,7 @@
 //
 // Nex-N2-mini M=1 W4A16 GEMV (NVFP4 weight x BF16 activation). See header.
 
-#include "kernels/nexn2_w4a16_gemv.cuh"
+#include "kernels/w4a16_matvec_sm120.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -129,7 +129,7 @@ void init_ue4m3_lut() {
 
 }  // namespace
 
-int nexn2_w4a16_matvec_bf16(
+int w4a16_matvec_sm120_bf16(
     const void*  x_bf16,
     const void*  W_packed,
     const void*  SFB,

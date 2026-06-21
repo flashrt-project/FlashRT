@@ -950,19 +950,19 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/silu_mul_qwen36.cu
   csrc/kernels/silu_mul_to_nvfp4_swizzled.cu
   csrc/kernels/qwen36_misc.cu
-  csrc/kernels/nexn2_misc.cu
-  csrc/kernels/nexn2_moe_grouped.cu
-  csrc/kernels/nexn2_bf16_gemv.cu
-  csrc/kernels/nexn2_w4a16_gemv.cu
-  csrc/kernels/nexn2_moe_grouped_w4a16.cu
-  csrc/kernels/nexn2_gdn_seq.cu
-  csrc/kernels/nexn2_act_fuse.cu
-  csrc/kernels/nexn2_router_topk.cu
-  csrc/kernels/nexn2_moe_m16_mma.cu
-  csrc/kernels/nexn2_moe_m64_mma.cu
-  csrc/kernels/nexn2_moe_bt_mma.cu
-  csrc/kernels/nexn2_w4a16_gemm.cu
-  csrc/kernels/nexn2_w16a16_gemm.cu
+  csrc/kernels/qwen35moe_layout.cu
+  csrc/kernels/moe_grouped_gemv_sm120.cu
+  csrc/kernels/bf16_matvec_sm120.cu
+  csrc/kernels/w4a16_matvec_sm120.cu
+  csrc/kernels/moe_grouped_w4a16_sm120.cu
+  csrc/kernels/gdn_recurrent_seq_sm120.cu
+  csrc/kernels/act_fuse_sm120.cu
+  csrc/kernels/moe_router_topk_sm120.cu
+  csrc/kernels/moe_m16_mma_sm120.cu
+  csrc/kernels/moe_m64_mma_sm120.cu
+  csrc/kernels/moe_blocktile_mma_sm120.cu
+  csrc/kernels/w4a16_gemm_sm120.cu
+  csrc/kernels/w16a16_gemm_sm120.cu
   csrc/kernels/qwen3_qkv_post_proc.cu
   csrc/kernels/fp4_w4a4_matvec_sm120.cu
   csrc/kernels/fp4_w4a4_mma_sm120.cu

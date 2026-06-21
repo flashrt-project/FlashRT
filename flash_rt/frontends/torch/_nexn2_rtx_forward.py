@@ -93,7 +93,7 @@ def _gemm_w16a16(x2d, w, fvk, device):
     xc = x2d.contiguous()
     wc = w.contiguous()
     y = torch.empty(m, n, dtype=torch.bfloat16, device=device)
-    fvk.nexn2_w16a16_gemm_bf16(xc.data_ptr(), wc.data_ptr(), y.data_ptr(),
+    fvk.w16a16_gemm_sm120_bf16(xc.data_ptr(), wc.data_ptr(), y.data_ptr(),
                                m, n, k, 1.0, 0)
     return y
 
@@ -130,7 +130,7 @@ def _gemm_w4a16(x2d, w, ld, key, fvk, device):
     n = p.shape[0]
     xc = x2d.contiguous()
     y = torch.empty(m, n, dtype=torch.bfloat16, device=device)
-    fvk.nexn2_w4a16_gemm_bf16(xc.data_ptr(), p.data_ptr(), s.data_ptr(),
+    fvk.w4a16_gemm_sm120_bf16(xc.data_ptr(), p.data_ptr(), s.data_ptr(),
                               y.data_ptr(), m, n, k, a, 0)
     return y
 
@@ -141,7 +141,7 @@ def _gemm_w4a16(x2d, w, ld, key, fvk, device):
 # shared expert) through the fp4 W4A4 GEMM (weight quantised once) crosses the
 # llama.cpp 9.5k prefill target (9686 tok/s) but the fp4 *activation* drops cos
 # to 0.987 (within the 0.984 red line, tight). Off by default; the true W4A16
-# kernel (nexn2_w4a16_gemm, bf16 activation, correct but needs occupancy tuning
+# kernel (w4a16_gemm_sm120, bf16 activation, correct but needs occupancy tuning
 # to beat the fp32 path) is the precision-preserving replacement in progress.
 _DENSE_FP4 = False
 
@@ -224,7 +224,7 @@ def _silu_mul(g, u, fvk, device):
     gc = g.reshape(-1).contiguous()
     uc = u.reshape(-1).contiguous()
     out = torch.empty(n, dtype=torch.bfloat16, device=device)
-    fvk.nexn2_silu_mul_bf16(gc.data_ptr(), uc.data_ptr(), out.data_ptr(), n, 0)
+    fvk.silu_mul_sm120_bf16(gc.data_ptr(), uc.data_ptr(), out.data_ptr(), n, 0)
     return out.reshape(g.shape)
 
 
@@ -357,7 +357,7 @@ def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None):
     qb = torch.empty(B, S, NV, HK, dtype=torch.bfloat16, device=device)
     kb = torch.empty(B, S, NV, HK, dtype=torch.bfloat16, device=device)
     vb = torch.empty(B, S, NV, HV, dtype=torch.bfloat16, device=device)
-    fvk.nexn2_lin_split_qkv_broadcast_bf16(
+    fvk.qwen35moe_lin_split_qkv_broadcast_bf16(
         xc_bf.data_ptr(), qb.data_ptr(), kb.data_ptr(), vb.data_ptr(),
         B * S, 0)
 
@@ -388,7 +388,7 @@ def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None):
         # (out cos 0.99999); the short-prompt fallback below _WY_MIN_S.
         state = torch.zeros(NV, HK, HV, dtype=torch.bfloat16, device=device)
         core = torch.empty(S, NV, HV, dtype=torch.bfloat16, device=device)
-        fvk.nexn2_gdn_recurrent_seq_bf16(
+        fvk.gdn_recurrent_seq_sm120_bf16(
             qb.reshape(S, NV, HK).contiguous().data_ptr(),
             kb.reshape(S, NV, HK).contiguous().data_ptr(),
             vb.reshape(S, NV, HV).contiguous().data_ptr(),
@@ -436,7 +436,7 @@ def _full_attn_layer(h, ld, ct, st, fvk, device, eps, cap=None, rank=None):
     # split interleaved [q_pre(256), gate(256)] per head via fvk kernel.
     q_pre = torch.empty(B * S, NQ, HD, dtype=torch.bfloat16, device=device)
     gate = torch.empty(B * S, NQ * HD, dtype=torch.bfloat16, device=device)
-    fvk.nexn2_split_q_gate_bf16(
+    fvk.qwen35moe_split_q_gate_bf16(
         qg.data_ptr(), q_pre.data_ptr(), gate.data_ptr(), B * S, 0)
     q = q_pre.view(B, S, NQ, HD)
     gate = gate.view(B, S, NQ * HD)
@@ -528,14 +528,14 @@ def _moe_experts_m16(x, ti, tw, ld, fvk, device):
     A_t[tiled_row] = x[stok]
     ap, asf = _quant_act(A_t, fvk, device)
     d_gu = torch.empty(total_tiles * 16, n_gu, dtype=torch.bfloat16, device=device)
-    fvk.nexn2_moe_m16_mma_bf16(
+    fvk.moe_m16_mma_sm120_bf16(
         ap.data_ptr(), gu_p.data_ptr(), asf.data_ptr(), gu_s.data_ptr(),
         d_gu.data_ptr(), gu_a.data_ptr(), tile_expert.data_ptr(),
         total_tiles, n_gu, HID, 0, gu_p[0].numel(), gu_s[0].numel(), 0)
     inter = _silu_mul(d_gu[:, :INTER], d_gu[:, INTER:], fvk, device).contiguous()
     ip, isf = _quant_act(inter, fvk, device)
     d_dn = torch.empty(total_tiles * 16, n_dn, dtype=torch.bfloat16, device=device)
-    fvk.nexn2_moe_m16_mma_bf16(
+    fvk.moe_m16_mma_sm120_bf16(
         ip.data_ptr(), dn_p.data_ptr(), isf.data_ptr(), dn_s.data_ptr(),
         d_dn.data_ptr(), dn_a.data_ptr(), tile_expert.data_ptr(),
         total_tiles, n_dn, INTER, 0, dn_p[0].numel(), dn_s[0].numel(), 0)
@@ -582,14 +582,14 @@ def _moe_experts_bt(x, ti, tw, ld, fvk, device):
     A_t[tiled_row] = x[stok]
     ap, asf = _quant_act(A_t, fvk, device)
     d_gu = torch.empty(total_tiles * 64, n_gu, dtype=torch.bfloat16, device=device)
-    fvk.nexn2_moe_bt_mma_bf16(
+    fvk.moe_blocktile_mma_sm120_bf16(
         ap.data_ptr(), gu_p.data_ptr(), asf.data_ptr(), gu_s.data_ptr(),
         d_gu.data_ptr(), gu_a.data_ptr(), tile_expert.data_ptr(),
         total_tiles, n_gu, HID, 0, gu_p[0].numel(), gu_s[0].numel(), 0)
     inter = _silu_mul(d_gu[:, :INTER], d_gu[:, INTER:], fvk, device).contiguous()
     ip, isf = _quant_act(inter, fvk, device)
     d_dn = torch.empty(total_tiles * 64, n_dn, dtype=torch.bfloat16, device=device)
-    fvk.nexn2_moe_bt_mma_bf16(
+    fvk.moe_blocktile_mma_sm120_bf16(
         ip.data_ptr(), dn_p.data_ptr(), isf.data_ptr(), dn_s.data_ptr(),
         d_dn.data_ptr(), dn_a.data_ptr(), tile_expert.data_ptr(),
         total_tiles, n_dn, INTER, 0, dn_p[0].numel(), dn_s[0].numel(), 0)
@@ -625,14 +625,14 @@ def _moe_experts_grouped(x, ti, tw, ld, fvk, device):
 
     A = x[stok].contiguous()                          # (slots, HID) bf16
     d_gu = torch.empty(slots, n_gu, dtype=torch.bfloat16, device=device)
-    fvk.nexn2_moe_grouped_w4a16_bf16(
+    fvk.moe_grouped_w4a16_sm120_bf16(
         A.data_ptr(), gu_p.data_ptr(), gu_s.data_ptr(), gu_a.data_ptr(),
         se.data_ptr(), d_gu.data_ptr(), slots, n_gu, HID,
         HID, gu_p[0].numel(), gu_s[0].numel(), 0)
     g, u = d_gu[:, :INTER], d_gu[:, INTER:]
     inter = _silu_mul(g, u, fvk, device).contiguous()
     d_dn = torch.empty(slots, n_dn, dtype=torch.bfloat16, device=device)
-    fvk.nexn2_moe_grouped_w4a16_bf16(
+    fvk.moe_grouped_w4a16_sm120_bf16(
         inter.data_ptr(), dn_p.data_ptr(), dn_s.data_ptr(), dn_a.data_ptr(),
         se.data_ptr(), d_dn.data_ptr(), slots, n_dn, INTER,
         INTER, dn_p[0].numel(), dn_s[0].numel(), 0)

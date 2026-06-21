@@ -2,7 +2,7 @@
 //
 // Nex-N2-mini M=1 BF16 GEMV (memory-level-parallel). See header.
 
-#include "kernels/nexn2_bf16_gemv.cuh"
+#include "kernels/bf16_matvec_sm120.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -71,7 +71,7 @@ __global__ void bf16_matvec_mlp_kernel(
 
 }  // namespace
 
-int nexn2_bf16_matvec_bf16(
+int bf16_matvec_sm120_bf16(
     const void*  x,
     const void*  W,
     void*        out,

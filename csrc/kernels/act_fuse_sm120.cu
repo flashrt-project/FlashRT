@@ -2,7 +2,7 @@
 //
 // Nex-N2-mini fused activation-gate kernels. See header.
 
-#include "kernels/nexn2_act_fuse.cuh"
+#include "kernels/act_fuse_sm120.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -44,7 +44,7 @@ __global__ void sigmoid_mul_kernel(const __nv_bfloat162* __restrict__ x,
 
 }  // namespace
 
-int nexn2_silu_mul_bf16(const void* g, const void* u, void* out, int n,
+int silu_mul_sm120_bf16(const void* g, const void* u, void* out, int n,
                         cudaStream_t stream) {
   if (!g || !u || !out) return 1;
   if (n <= 0 || (n & 1)) return 2;
@@ -56,7 +56,7 @@ int nexn2_silu_mul_bf16(const void* g, const void* u, void* out, int n,
   return 0;
 }
 
-int nexn2_sigmoid_mul_bf16(const void* x, const void* gate, void* out, int n,
+int sigmoid_mul_sm120_bf16(const void* x, const void* gate, void* out, int n,
                            cudaStream_t stream) {
   if (!x || !gate || !out) return 1;
   if (n <= 0 || (n & 1)) return 2;

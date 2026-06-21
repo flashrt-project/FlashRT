@@ -2,7 +2,7 @@
 //
 // Nex-N2-mini MoE grouped W4A4 block-scaled mma, M=64 x N=16 tiled (prefill).
 //
-// The M=16/N=8 sibling (nexn2_moe_m16_mma) re-reads the activation rows once
+// The M=16/N=8 sibling (moe_m16_mma_sm120) re-reads the activation rows once
 // per N-block (grid.x = N/8) and re-reads each expert weight once per 16-row
 // tile, so its total HBM traffic ~ (1/M_tile + 1/N_tile) = 1/16 + 1/8 dominates
 // and it sits ~8x off the roofline. This kernel widens BOTH the M tile to 64
@@ -13,7 +13,7 @@
 // chunk) is new. Tokens pre-sorted into 64-row expert tiles (pad with zeros).
 // All add-only.
 
-#include "kernels/nexn2_moe_m64_mma.cuh"
+#include "kernels/moe_m64_mma_sm120.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -220,7 +220,7 @@ __global__ void moe_m64_mma_kernel(
 
 }  // namespace
 
-int nexn2_moe_m64_mma_bf16(
+int moe_m64_mma_sm120_bf16(
     const void* A_tiled, const void* B_stack, const void* SFA_tiled,
     const void* SFB_stack, void* D, const void* alpha_stack,
     const void* tile_expert, int num_tiles, int N, int K,

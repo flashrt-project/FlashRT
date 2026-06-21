@@ -21,7 +21,7 @@
 namespace flash_rt {
 namespace kernels {
 
-int nexn2_gdn_recurrent_seq_bf16(
+int gdn_recurrent_seq_sm120_bf16(
     const void*  q,
     const void*  k,
     const void*  v,

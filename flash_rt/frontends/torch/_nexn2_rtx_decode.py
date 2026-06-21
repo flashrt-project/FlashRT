@@ -80,7 +80,7 @@ def _bf16_mv(x1k, w, fvk, device):
     y = torch.empty(1, n, dtype=torch.bfloat16, device=device)
     # MLP variant: 8 int4 loads in flight per warp -> bandwidth-bound at M=1
     # (1.5-3.4x the qwen36 matvec on the Nex-N2 shapes, cos=1.0).
-    fvk.nexn2_bf16_matvec_bf16(xc.data_ptr(), w.data_ptr(), y.data_ptr(),
+    fvk.bf16_matvec_sm120_bf16(xc.data_ptr(), w.data_ptr(), y.data_ptr(),
                                n, k, _cs())
     return y
 
@@ -107,7 +107,7 @@ def _w4a16_mv(x1k, w_bf16, ld, key, fvk, device):
         ld[key + '_w4a16_a'] = float(og.item())
     xc = x1k.contiguous()
     y = torch.empty(1, n, dtype=torch.bfloat16, device=device)
-    fvk.nexn2_w4a16_matvec_bf16(
+    fvk.w4a16_matvec_sm120_bf16(
         xc.data_ptr(), ld[pk].data_ptr(), ld[key + '_w4a16_sf'].data_ptr(),
         y.data_ptr(), n, k, ld[key + '_w4a16_a'], _cs())
     return y
@@ -126,7 +126,7 @@ def _silu_mul(g, u, fvk, device):
     gc = g.reshape(-1).contiguous()
     uc = u.reshape(-1).contiguous()
     out = torch.empty(n, dtype=torch.bfloat16, device=device)
-    fvk.nexn2_silu_mul_bf16(gc.data_ptr(), uc.data_ptr(), out.data_ptr(),
+    fvk.silu_mul_sm120_bf16(gc.data_ptr(), uc.data_ptr(), out.data_ptr(),
                             n, _cs())
     return out.reshape(g.shape)
 
@@ -137,7 +137,7 @@ def _sigmoid_mul(x, gate, fvk, device):
     xc = x.reshape(-1).contiguous()
     gc = gate.reshape(-1).contiguous()
     out = torch.empty(n, dtype=torch.bfloat16, device=device)
-    fvk.nexn2_sigmoid_mul_bf16(xc.data_ptr(), gc.data_ptr(), out.data_ptr(),
+    fvk.sigmoid_mul_sm120_bf16(xc.data_ptr(), gc.data_ptr(), out.data_ptr(),
                                n, _cs())
     return out.reshape(x.shape)
 
@@ -307,7 +307,7 @@ def _decode_gdn(h, ld, state, lin_rank, fvk, device):
     qb = torch.empty(1, NV, HK, dtype=torch.bfloat16, device=device)
     kb = torch.empty(1, NV, HK, dtype=torch.bfloat16, device=device)
     vb = torch.empty(1, NV, HV, dtype=torch.bfloat16, device=device)
-    fvk.nexn2_lin_split_qkv_broadcast_bf16(
+    fvk.qwen35moe_lin_split_qkv_broadcast_bf16(
         conv_out.data_ptr(), qb.data_ptr(), kb.data_ptr(), vb.data_ptr(),
         1, s)
 
@@ -364,7 +364,7 @@ def _decode_full(h, ld, state, full_rank, pos, fvk, device):
             1, NKV, HD)
     q_pre = torch.empty(1, NQ, HD, dtype=torch.bfloat16, device=device)
     gate = torch.empty(1, NQ * HD, dtype=torch.bfloat16, device=device)
-    fvk.nexn2_split_q_gate_bf16(
+    fvk.qwen35moe_split_q_gate_bf16(
         qg.data_ptr(), q_pre.data_ptr(), gate.data_ptr(), 1, s)
     q = _rms_fvk(q_pre.reshape(NQ, HD), qnw, fvk, device, eps).reshape(
         1, NQ, HD)
@@ -425,7 +425,7 @@ def _moe_layer_decode(h, ld, state, fvk, device):
     lr = logit_raw.reshape(-1).contiguous()
     idx = torch.empty(TOPK, dtype=torch.int32, device=device)
     topv = torch.empty(TOPK, dtype=torch.float32, device=device)
-    fvk.nexn2_router_topk_bf16(lr.data_ptr(), idx.data_ptr(), topv.data_ptr(),
+    fvk.moe_router_topk_sm120_bf16(lr.data_ptr(), idx.data_ptr(), topv.data_ptr(),
                                lr.numel(), TOPK, s)
     tw_row = F.softmax(topv, -1)                             # (TOPK,) device
 
@@ -444,7 +444,7 @@ def _moe_layer_decode(h, ld, state, fvk, device):
     # faster at this scale (6.2 vs 8.2 us standalone).
     xc = x.contiguous()
     d_gu = torch.empty(TOPK, n_gu, dtype=torch.bfloat16, device=device)
-    fvk.nexn2_moe_grouped_w4a16_bf16(
+    fvk.moe_grouped_w4a16_sm120_bf16(
         xc.data_ptr(), gu_p.data_ptr(), gu_s.data_ptr(), gu_a.data_ptr(),
         idx.data_ptr(), d_gu.data_ptr(), TOPK, n_gu, HID,
         0, gu_p[0].numel(), gu_s[0].numel(), s)
@@ -453,7 +453,7 @@ def _moe_layer_decode(h, ld, state, fvk, device):
     g_, u_ = d_gu[:, :INTER], d_gu[:, INTER:]
     inter = _silu_mul(g_, u_, fvk, device).contiguous()
     d_dn = torch.empty(TOPK, n_dn, dtype=torch.bfloat16, device=device)
-    fvk.nexn2_moe_grouped_w4a16_bf16(
+    fvk.moe_grouped_w4a16_sm120_bf16(
         inter.data_ptr(), dn_p.data_ptr(), dn_s.data_ptr(), dn_a.data_ptr(),
         idx.data_ptr(), d_dn.data_ptr(), TOPK, n_dn, INTER,
         INTER, dn_p[0].numel(), dn_s[0].numel(), s)
@@ -509,7 +509,7 @@ def decode_step(state, token_id, pos, fvk, device):
     vocab = p['vocab_size']
     logits = torch.empty(1, vocab, dtype=torch.bfloat16, device=device)
     if not state.lm_head_nvfp4:
-        fvk.nexn2_bf16_matvec_bf16(
+        fvk.bf16_matvec_sm120_bf16(
             h.reshape(1, HID).contiguous().data_ptr(),
             p['lm_head_w_t'].data_ptr(), logits.data_ptr(), vocab, HID, _cs())
         return logits

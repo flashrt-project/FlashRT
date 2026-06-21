@@ -4,7 +4,7 @@
 //
 // One GEMV per (token, expert) assignment ("slot"): D[slot] = A[slot] (bf16)
 // @ W[expert_idx[slot]] (NVFP4). It is the grouped sibling of
-// nexn2_w4a16_matvec_bf16 -- same hardware-fp4-decode bf16-activation body,
+// w4a16_matvec_sm120_bf16 -- same hardware-fp4-decode bf16-activation body,
 // with per-slot activation + per-expert weight/SF/alpha base pointers added on
 // top (the only change over the single-GEMV kernel). The BF16 activation means
 // there is no activation scale-factor swizzle to thread through, unlike the
@@ -31,7 +31,7 @@ namespace kernels {
 //   a_stride   : element stride between slots in A_stack (= K)
 //   w_stride/sfb_stride: byte stride between experts
 // K multiple of 16. Returns 0 on success.
-int nexn2_moe_grouped_w4a16_bf16(
+int moe_grouped_w4a16_sm120_bf16(
     const void*  A_stack,
     const void*  W_stack,
     const void*  SFB_stack,

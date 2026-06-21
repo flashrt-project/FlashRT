@@ -2,7 +2,7 @@
 //
 // Nex-N2-mini MoE router top-k (M=1). See header.
 
-#include "kernels/nexn2_router_topk.cuh"
+#include "kernels/moe_router_topk_sm120.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -71,7 +71,7 @@ __global__ void router_topk_kernel(const __nv_bfloat16* __restrict__ logits,
 
 }  // namespace
 
-int nexn2_router_topk_bf16(const void* logits, void* out_idx, void* out_val,
+int moe_router_topk_sm120_bf16(const void* logits, void* out_idx, void* out_val,
                            int n_experts, int k, cudaStream_t stream) {
   if (!logits || !out_idx || !out_val) return 1;
   if (n_experts <= 0 || k <= 0 || k > 32) return 2;

@@ -23,7 +23,7 @@ namespace kernels {
 // Split + broadcast linear-attention conv output, 16 K-heads -> 32 V-heads.
 // conv_out: (S, 8192) = Q(16*128), K(16*128), V(32*128).
 // q32/k32/v32: contiguous (S, 32, 128); Q/K head h sourced from floor(h/2).
-void nexn2_lin_split_qkv_broadcast_bf16(
+void qwen35moe_lin_split_qkv_broadcast_bf16(
     const void* conv_out,
     void*       q32,
     void*       k32,
@@ -35,7 +35,7 @@ void nexn2_lin_split_qkv_broadcast_bf16(
 // q_proj: (S, 16, 512) = [q_pre(256), gate(256)] per head.
 // q_pre:  (S, 16, 256), contiguous.
 // gate:   (S, 16*256), contiguous.
-void nexn2_split_q_gate_bf16(
+void qwen35moe_split_q_gate_bf16(
     const void* q_proj,
     void*       q_pre,
     void*       gate,
