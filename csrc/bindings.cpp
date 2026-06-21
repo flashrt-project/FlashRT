@@ -142,6 +142,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/nexn2_bf16_gemv.cuh"
 #include "kernels/nexn2_w4a16_gemv.cuh"
 #include "kernels/nexn2_moe_grouped_w4a16.cuh"
+#include "kernels/nexn2_gdn_seq.cuh"
 #include "kernels/bf16_matvec_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36_thor.cuh"
@@ -4509,6 +4510,20 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         },
         py::arg("x"), py::arg("W"), py::arg("sfb"), py::arg("out"),
         py::arg("N"), py::arg("K"), py::arg("alpha"), py::arg("stream") = 0);
+
+    m.def("nexn2_gdn_recurrent_seq_bf16",
+        [](uintptr_t q, uintptr_t k, uintptr_t v, uintptr_t g, uintptr_t beta,
+           uintptr_t state, uintptr_t out, int S, int num_v_heads,
+           int head_dim, bool use_qk_l2norm, uintptr_t stream) -> int {
+            return flash_rt::kernels::nexn2_gdn_recurrent_seq_bf16(
+                to_ptr(q), to_ptr(k), to_ptr(v), to_ptr(g), to_ptr(beta),
+                to_ptr(state), to_ptr(out), S, num_v_heads, head_dim,
+                use_qk_l2norm, to_stream(stream));
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"), py::arg("beta"),
+        py::arg("state"), py::arg("out"), py::arg("S"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("use_qk_l2norm") = true,
+        py::arg("stream") = 0);
 
     m.def("nexn2_moe_grouped_w4a16_bf16",
         [](uintptr_t A, uintptr_t W, uintptr_t sfb, uintptr_t alpha,
