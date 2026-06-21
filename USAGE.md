@@ -1365,10 +1365,9 @@ Max-perf mode is ~1.5s (decode graph capture dominates after cache hit).
 ## NVFP4 (Pi0.5 only)
 
 Optional NVFP4 (Blackwell block-scaled FP4) quantization on the Pi0.5
-encoder FFN stack, enabled via a single flag `use_fp4=True`. **Currently
-only supported on Pi0.5 torch.** The gate applies in two directions:
-- Other configs (`pi0` / `groot` / `pi0fast`) log a warning and fall back to FP8.
-- `framework="jax"` with `use_fp4=True` also logs a warning and falls back to FP8, even with `config="pi05"` — JAX FP4 is not yet wired up (planned, see handoff prompt Task A).
+encoder FFN stack, enabled via a single flag `use_fp4=True`. It is supported
+for **Pi0.5 torch and JAX on Thor**. Other configs (`pi0` / `groot` /
+`pi0fast`) log a warning and use the FP8 route.
 
 ```python
 # Production-recommended — single flag, best-known config:
@@ -1430,14 +1429,16 @@ When `use_fp4=True` and a sub-flag (`fp4_layers`, `use_awq`,
 ### Weight loading
 
 When `use_fp4=True`, the FP4 layer weights are loaded directly as fp16 from
-safetensors and NVFP4-quantized offline (no FP8 intermediate). This matches
-the NVIDIA modelopt design and avoids a double-lossy FP8 → fp16 → FP4
-round-trip. A fp8-dequant fallback path exists if direct fp16 load fails.
+the selected framework checkpoint and NVFP4-quantized offline (no FP8
+intermediate). Torch uses safetensors checkpoints. JAX uses Orbax checkpoints
+and depends on the Orbax loader accepting current `StepMetadata` checkpoint
+metadata. This matches the NVIDIA modelopt design and avoids a double-lossy
+FP8 → fp16 → FP4 round-trip.
 
 ### Requirements
 
 - SM100+ GPU with Blackwell Tensor Cores (validated on Thor SM110).
-  Hardware without NVFP4 support silently falls back to FP8.
+  Hardware without NVFP4 support logs a warning and uses the FP8 route.
 - `flash_rt_fp4.so` extension built alongside `flash_rt_kernels.so`
   (automatic in standard install).
 
@@ -1466,6 +1467,20 @@ Multi-model precision regression (`tests/test_all_models_precision.py`):
 | Pi0 | (unchanged) | vs_pytorch_ref=0.9972 | 46.7 ms |
 | Pi0 JAX | (unchanged) | vs_pytorch_ref=0.9983 | 45.1 ms |
 | GROOT N1.6 | (unchanged) | vs_pytorch_ref=0.9986 | 46.2 ms |
+
+Thor replay-latency / precision check for the JAX Orbax path:
+
+| Frontend | Views | P50 | P95 | cos vs same-origin PyTorch ref | max diff |
+|---|---:|---:|---:|---:|---:|
+| `jax_fp8` | 3 | 55.03 ms | 55.23 ms | 0.999358 | 0.0638 |
+| `jax_fp4` | 3 | 50.30 ms | 56.58 ms | 0.998351 | 0.0994 |
+
+The JAX reference was generated from the same `pi05_libero_jax` Orbax
+checkpoint via the upstream OpenPI conversion script and
+`PI0Pytorch.sample_actions`; do not compare this validation against a separate
+HF / LeRobot safetensors checkpoint. These numbers are correctness /
+availability evidence for the Thor JAX FP4 path, not a broad performance
+claim.
 
 ### Layer selection
 
