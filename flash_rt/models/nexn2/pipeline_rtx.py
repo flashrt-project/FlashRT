@@ -78,31 +78,18 @@ class Nexn2Dims:
 
 
 class Nexn2Pipeline:
-    """Framework-agnostic Nex-N2-mini inference pipeline (RTX SM120).
+    """BF16 HF reference pipeline for Nex-N2-mini.
 
-    Phase-1 implementation: hosts an HF reference model and delegates
-    ``forward(input_ids)``. The class signature is the Phase-2+ target --
-    only the internals will change.
-
-    Future shape (Phase 2+):
-        gemm:  fvk.GemmRunner
-        fvk:   flash_rt_kernels module
-        attn:  AttentionBackend (RtxFlashAttnBackendNexn2)
-        bufs:  pre-allocated CudaBuffer dict
-        weights: nvfp4-quantized + bf16 device pointers
+    Hosts an HF reference model and delegates ``forward`` / ``generate``. Used
+    only by the frontend's ``kernelized=False`` path (the correctness baseline);
+    the production NVFP4 kernel forward/decode lives in
+    ``flash_rt.frontends.torch._nexn2_rtx_{forward,decode}``.
     """
 
     DIMS = Nexn2Dims()
 
     def __init__(self, hf_model: Any) -> None:
-        """Wrap an HF model object.
-
-        Args:
-            hf_model: Output of the HF auto-loader for the qwen3_5_moe
-                checkpoint. In Phase 1 we own the reference; in Phase 2+
-                we ingest only the safetensors path and own weight
-                loading ourselves.
-        """
+        """Wrap an HF model object (the qwen3_5_moe auto-loader output)."""
         self.hf = hf_model
         self.config = hf_model.config
         text_cfg = getattr(self.config, 'text_config', self.config)
@@ -119,7 +106,7 @@ class Nexn2Pipeline:
         )
 
     def forward(self, input_ids):
-        """Single forward pass: token IDs -> logits. Phase-1 thin shim.
+        """Single forward pass: token IDs -> logits (BF16 HF reference).
 
         Args:
             input_ids: (B, S) torch.long on cuda.
@@ -135,10 +122,10 @@ class Nexn2Pipeline:
         return out.logits
 
     def generate(self, input_ids, *, max_new_tokens: int, do_sample: bool = False):
-        """Greedy/sampled autoregressive generate. Phase-1 delegates to HF.
+        """Greedy/sampled autoregressive generate (BF16 HF reference path).
 
-        Phase-3 replaces this with a C++-driven decode loop that captures
-        CUDA Graphs and bypasses HF .generate() entirely.
+        The production decode (CUDA-graph, on-device argmax) is in the
+        frontend's kernelized path, not here.
         """
         import torch
         with torch.no_grad():

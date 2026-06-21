@@ -52,10 +52,13 @@ def _require_kernels(fvk) -> None:
             "Nex-N2 full attention needs the vendored FA2 module "
             "(flash_rt_fa2), which failed to import. Build with FA2 enabled "
             "(ENABLE_FA2, auto-on for SM120).") from e
-    if not hasattr(_fa2, 'fwd_bf16_causal'):                # pragma: no cover
+    fa2_missing = [s for s in ('fwd_bf16', 'fwd_bf16_causal')
+                   if not hasattr(_fa2, s)]
+    if fa2_missing:                                         # pragma: no cover
         raise RuntimeError(
-            "flash_rt_fa2 is present but lacks fwd_bf16_causal; rebuild the "
-            "FA2 module.")
+            "flash_rt_fa2 is present but lacks "
+            f"{', '.join(fa2_missing)} (decode uses fwd_bf16, prefill uses "
+            "fwd_bf16_causal); rebuild the FA2 module.")
 
 
 class Nexn2TorchFrontendRtx:
@@ -66,7 +69,7 @@ class Nexn2TorchFrontendRtx:
                  max_seq: int = 2048,
                  quant: str = 'nvfp4',
                  kernelized: bool = False,
-                 quant_scope: str = 'full') -> None:
+                 quant_scope: str = 'experts') -> None:
         """Construct the frontend.
 
         Args:
@@ -80,8 +83,8 @@ class Nexn2TorchFrontendRtx:
             (correctness baseline; the 35B-A3B weights do not fit the 32 GB
             card). When True load the NVFP4-quantized weights directly via the
             fvk loader and run the kernel forward/decode -- the production path.
-          quant_scope: kernelized-only. ``'experts'`` (recommended) = only
-            the routed experts are NVFP4; the dense projections run on the
+          quant_scope: kernelized-only. ``'experts'`` (default) = only the
+            routed experts are NVFP4; the dense projections run on the
             deterministic BF16-weight w16a16 GEMM, so prefill cos vs the BF16
             golden is ~0.99 and bit-reproducible. ``'full'`` additionally
             NVFP4-quantises the non-red-line dense projections (q/k/v/o /

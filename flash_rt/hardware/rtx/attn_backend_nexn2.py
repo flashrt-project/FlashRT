@@ -47,7 +47,6 @@ class RtxFlashAttnBackendNexn2:
     HEAD_DIM = 256
 
     def __init__(self, max_seq: int, max_q_seq: int = 1, dtype=None):
-        import os
         import torch
 
         self._torch = torch
@@ -102,14 +101,6 @@ class RtxFlashAttnBackendNexn2:
         self._num_sms = torch.cuda.get_device_properties(
             torch.cuda.current_device()
         ).multi_processor_count
-
-        # Optional bisect knob: env FVK_NEXN2_FA2=0 routes through pip
-        # flash_attn_func instead (single-call fallback for debugging cos
-        # drifts). Not used in production.
-        self._use_fvk_fa2 = os.environ.get("FVK_NEXN2_FA2", "1") == "1"
-        if not self._use_fvk_fa2:
-            from flash_attn import flash_attn_func
-            self._flash_attn_func = flash_attn_func
 
     # ── Layer cache pointer math ──
 
@@ -184,29 +175,23 @@ class RtxFlashAttnBackendNexn2:
         if softmax_scale is None:
             softmax_scale = 1.0 / (self.HEAD_DIM ** 0.5)
 
-        if self._use_fvk_fa2:
-            self._fa2_fwd(
-                Q=q.data_ptr(), K=k.data_ptr(), V=v.data_ptr(),
-                O=o.data_ptr(), softmax_lse=self.lse_buf.data_ptr(),
-                softmax_lse_accum=self.lse_accum.data_ptr(),
-                o_accum=self.o_accum.data_ptr(),
-                batch=1, seqlen_q=q_seq, seqlen_k=kv_seq,
-                num_heads_q=self.NUM_Q_HEADS,
-                num_heads_kv=self.NUM_KV_HEADS,
-                head_dim=self.HEAD_DIM,
-                q_strides=(q.stride(0), q.stride(1), q.stride(2)),
-                k_strides=(k.stride(0), k.stride(1), k.stride(2)),
-                v_strides=(v.stride(0), v.stride(1), v.stride(2)),
-                o_strides=(o.stride(0), o.stride(1), o.stride(2)),
-                softmax_scale=softmax_scale,
-                num_sms=self._num_sms,
-                stream=stream,
-            )
-            return o.data_ptr()
-
-        out = self._flash_attn_func(q, k, v, causal=False,
-                                    softmax_scale=softmax_scale)
-        o.copy_(out)
+        self._fa2_fwd(
+            Q=q.data_ptr(), K=k.data_ptr(), V=v.data_ptr(),
+            O=o.data_ptr(), softmax_lse=self.lse_buf.data_ptr(),
+            softmax_lse_accum=self.lse_accum.data_ptr(),
+            o_accum=self.o_accum.data_ptr(),
+            batch=1, seqlen_q=q_seq, seqlen_k=kv_seq,
+            num_heads_q=self.NUM_Q_HEADS,
+            num_heads_kv=self.NUM_KV_HEADS,
+            head_dim=self.HEAD_DIM,
+            q_strides=(q.stride(0), q.stride(1), q.stride(2)),
+            k_strides=(k.stride(0), k.stride(1), k.stride(2)),
+            v_strides=(v.stride(0), v.stride(1), v.stride(2)),
+            o_strides=(o.stride(0), o.stride(1), o.stride(2)),
+            softmax_scale=softmax_scale,
+            num_sms=self._num_sms,
+            stream=stream,
+        )
         return o.data_ptr()
 
 

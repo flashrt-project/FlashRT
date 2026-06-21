@@ -242,7 +242,7 @@ def extract_weights_nexn2_nvfp4(
     ckpt_dir: str,
     fvk,
     device: str = 'cuda:0',
-    quant_scope: str = 'full',
+    quant_scope: str = 'experts',
 ) -> WeightHandles:
     """Build :class:`WeightHandles` from a Nex-N2-mini BF16 ckpt directory.
 

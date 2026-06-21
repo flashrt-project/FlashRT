@@ -5,8 +5,8 @@ reviewer needs to trust the model is wired in -- registry routing, static
 dims, constructor validation, and (when the gated kernels are built) the
 availability of the SM120 kernel symbols the kernelized path calls.
 
-The full cos-vs-golden / token-exact E2E lives in nexn2_dev/tests/ (needs
-the checkpoint + refs/nexn2_golden_long2.pt); see docs/nexn2_usage.md.
+The full cos-vs-golden / token-exact E2E test requires the checkpoint and is
+documented in docs/nexn2_usage.md (Reproduce / Precision sections).
 
 Run:
     PYTHONPATH=. python -m pytest tests/test_nexn2_smoke.py -v

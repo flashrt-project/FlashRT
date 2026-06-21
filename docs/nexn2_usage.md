@@ -82,7 +82,7 @@ Nexn2TorchFrontendRtx(
     max_seq: int = 2048,        # KV cache + scratch sized to this
     quant: str = "nvfp4",       # only "nvfp4" is implemented
     kernelized: bool = False,   # see below
-    quant_scope: str = "full",  # see below
+    quant_scope: str = "experts", # see below
 )
 ```
 
@@ -94,7 +94,7 @@ Nexn2TorchFrontendRtx(
 | `quant` | `"nvfp4"` | Weight quantization; only `nvfp4` is implemented. |
 | `kernelized` | `False` (default) | BF16 HF reference model (needs the full BF16 weights, >32 GB). For correctness/golden only. |
 | | `True` | NVFP4 kernel forward/decode — the production path, fits 32 GB. |
-| `quant_scope` | `"experts"` (recommended) | Only routed experts are NVFP4; dense projections run the deterministic BF16-weight w16a16 GEMM → prefill cos ~0.99, bit-reproducible. |
+| `quant_scope` | `"experts"` (default) | Only routed experts are NVFP4; dense projections run the deterministic BF16-weight w16a16 GEMM → prefill cos ~0.99, bit-reproducible. |
 | | `"full"` | Additionally NVFP4-quantises the non-red-line dense projections (q/k/v/o / out_proj / shared) for a smaller footprint at lower cos. |
 
 Methods: `set_prompt(text)`, `infer() -> (1, S, vocab)`, `generate(max_new_tokens) -> list[int]`, `tokenizer`, `latency_records` (list[float], per `infer()`).
