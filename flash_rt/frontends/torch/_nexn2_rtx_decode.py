@@ -21,6 +21,9 @@ All fvk pointer args bind to named tensors (ctypes GC rule).
 """
 from __future__ import annotations
 
+import collections
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -213,9 +216,32 @@ class Nexn2DecodeState:
         self._static_token = torch.zeros(1, 1, dtype=torch.long, device=device)
         self._graph_stream = torch.cuda.Stream()
         self._graph_pool = torch.cuda.graph_pool_handle()
-        self._graphs = {}                       # pos -> (CUDAGraph, out tensor)
+        # pos -> (CUDAGraph, out tensor). LRU-bounded: each captured graph owns
+        # its memory pool, so an unbounded cache leaks VRAM across a long
+        # generation (one graph per absolute position). Evict the least-recently
+        # used pos once over the cap; 0/negative disables the bound (legacy).
+        self._graphs = collections.OrderedDict()
+        self.graph_cache_max = int(
+            os.environ.get('FLASHRT_NEXN2_GRAPH_CACHE_MAX', '256'))
         self._snap_lin = [torch.empty_like(t) for t in self.lin_state]
         self._snap_conv = [torch.empty_like(t) for t in self.lin_conv_state]
+        # Pre-allocated KV snapshot rows (one [.,1,.] slice each) reused every
+        # capture instead of a fresh clone() per pos -- zero alloc in the hot
+        # capture path.
+        self._snap_k = torch.empty_like(self.attn.K_cache[:, 0:1])
+        self._snap_v = torch.empty_like(self.attn.V_cache[:, 0:1])
+        # On-device greedy sampling. The captured decode graph runs argmax on
+        # its own logits and writes the next token id straight back into
+        # _static_token (the buffer the next replay re-reads), so a warm replay
+        # is a single launch -- no per-step logits.argmax().item() D2H sync, no
+        # separate argmax launch. Emitted ids accumulate in _out_tokens and are
+        # read to the host once at the end. _snap_token preserves the input
+        # token across the warmup/capture runs (which overwrite it via argmax).
+        # NB decode is GPU (HBM)-bound, so this is ~parity for plain greedy
+        # decode; its purpose is to keep the loop fully on-device as the
+        # foundation for the spec-decode verify chain.
+        self._out_tokens = torch.zeros(1, dtype=torch.long, device=device)
+        self._snap_token = torch.zeros_like(self._static_token)
         # NVFP4 lm_head: 1GB -> 0.25GB read, +7% tok/s, decode cos 0.973 ->
         # 0.965. On by default (SOTA speed); set False for the bf16 lm_head.
         self.lm_head_nvfp4 = True
@@ -558,29 +584,41 @@ def _ensure_decode_graph(state, pos, fvk, device):
 
     The KV-write slot, attention length and RoPE slice are baked per pos, so
     each pos owns a graph; the only varying input is ``state._static_token``,
-    re-read each replay. The lin/conv/KV state mutated by the 2 warmup runs +
-    the capture run is snapshotted and restored, so a later replay advances
-    from the true pre-step state. Returns (graph, logits_buffer).
+    re-read each replay. When ``qwen36_argmax_bf16`` is available the greedy
+    argmax of the step's logits is captured *inside* the graph and written back
+    into ``_static_token``, so a warm replay both decodes and produces the next
+    input token in one launch (the token buffer is also snapshotted/restored,
+    since the warmup+capture argmax overwrites it). The lin/conv/KV state
+    mutated by the 2 warmup runs + the capture run is snapshotted and restored,
+    so a later replay advances from the true pre-step state.
+    Returns (graph, logits_buffer).
     """
     cached = state._graphs.get(pos)
     if cached is not None:
+        state._graphs.move_to_end(pos)          # mark MRU
         return cached
 
+    bake_argmax = hasattr(fvk, 'qwen36_argmax_bf16')
+    vocab = state.handles.ptrs['vocab_size']
     gs = state._graph_stream
     for i, t in enumerate(state.lin_state):
         state._snap_lin[i].copy_(t)
     for i, t in enumerate(state.lin_conv_state):
         state._snap_conv[i].copy_(t)
-    snap_k = state.attn.K_cache[:, pos:pos + 1].clone()
-    snap_v = state.attn.V_cache[:, pos:pos + 1].clone()
+    # Reuse the pre-allocated [.,1,.] KV rows instead of cloning a fresh tensor
+    # every capture (zero alloc in the hot capture path).
+    state._snap_k.copy_(state.attn.K_cache[:, pos:pos + 1])
+    state._snap_v.copy_(state.attn.V_cache[:, pos:pos + 1])
+    state._snap_token.copy_(state._static_token)
 
     def _restore():
         for i, t in enumerate(state.lin_state):
             t.copy_(state._snap_lin[i])
         for i, t in enumerate(state.lin_conv_state):
             t.copy_(state._snap_conv[i])
-        state.attn.K_cache[:, pos:pos + 1].copy_(snap_k)
-        state.attn.V_cache[:, pos:pos + 1].copy_(snap_v)
+        state.attn.K_cache[:, pos:pos + 1].copy_(state._snap_k)
+        state.attn.V_cache[:, pos:pos + 1].copy_(state._snap_v)
+        state._static_token.copy_(state._snap_token)
 
     with torch.no_grad():               # settle allocator + kernel order
         for _ in range(2):
@@ -591,10 +629,17 @@ def _ensure_decode_graph(state, pos, fvk, device):
     with torch.cuda.graph(g, stream=gs, pool=state._graph_pool), \
             torch.no_grad():
         out = decode_step(state, state._static_token, pos, fvk, device)
+        if bake_argmax:
+            fvk.qwen36_argmax_bf16(
+                out.data_ptr(), state._static_token.data_ptr(),
+                1, vocab, _cs())
     with torch.no_grad():
         _restore()
 
     state._graphs[pos] = (g, out)
+    cap = state.graph_cache_max
+    if cap > 0 and len(state._graphs) > cap:
+        state._graphs.popitem(last=False)       # evict LRU
     return state._graphs[pos]
 
 
@@ -604,16 +649,42 @@ def generate_greedy_graph(state, input_ids, max_new_tokens, fvk, device):
     First visit to each pos captures (and runs) its graph; subsequent visits
     (warm cache / later generations) are pure replays. The graph reads the
     next token from ``state._static_token``.
+
+    Greedy sampling runs on-device: ``qwen36_argmax_bf16`` writes the argmax
+    token id straight into ``_static_token`` (which the next replay re-reads)
+    and the emitted ids accumulate in ``_out_tokens``, read back to the host
+    once at the end. This removes the per-step ``logits.argmax().item()`` D2H
+    sync that otherwise serialises the decode loop (CPU blocks on the GPU every
+    token). Falls back to the host argmax when the kernel is unavailable.
     """
     pos = input_ids.view(-1).shape[0]
     logits = seed_prefill(state, input_ids, fvk, device)
-    out = []
-    for _ in range(max_new_tokens):
-        nxt = int(logits[0].argmax().item())
-        out.append(nxt)
-        state._static_token.fill_(nxt)
-        g, out_buf = _ensure_decode_graph(state, pos, fvk, device)
-        g.replay()
-        logits = out_buf
+    vocab = state.handles.ptrs['vocab_size']
+
+    if not hasattr(fvk, 'qwen36_argmax_bf16'):
+        out = []
+        for _ in range(max_new_tokens):
+            nxt = int(logits[0].argmax().item())
+            out.append(nxt)
+            state._static_token.fill_(nxt)
+            g, out_buf = _ensure_decode_graph(state, pos, fvk, device)
+            g.replay()
+            logits = out_buf
+            pos += 1
+        return out
+
+    if state._out_tokens.numel() < max_new_tokens:
+        state._out_tokens = torch.zeros(
+            max_new_tokens, dtype=torch.long, device=device)
+    out_tokens = state._out_tokens
+    # Seed token: argmax of the last prompt-step logits -> _static_token.
+    # Every subsequent next-token argmax is baked into the replayed graph,
+    # so the loop body is a single launch + a device-side token copy.
+    fvk.qwen36_argmax_bf16(
+        logits.data_ptr(), state._static_token.data_ptr(), 1, vocab, _cs())
+    for i in range(max_new_tokens):
+        out_tokens[i].copy_(state._static_token.view(-1)[0])
+        g, _ = _ensure_decode_graph(state, pos, fvk, device)
+        g.replay()                # decode + argmax -> _static_token (next tok)
         pos += 1
-    return out
+    return out_tokens[:max_new_tokens].tolist()       # single D2H sync
