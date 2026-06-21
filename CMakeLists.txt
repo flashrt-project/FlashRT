@@ -958,6 +958,7 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/nexn2_gdn_seq.cu
   csrc/kernels/nexn2_act_fuse.cu
   csrc/kernels/nexn2_router_topk.cu
+  csrc/kernels/nexn2_moe_m16_mma.cu
   csrc/kernels/qwen3_qkv_post_proc.cu
   csrc/kernels/fp4_w4a4_matvec_sm120.cu
   csrc/kernels/fp4_w4a4_mma_sm120.cu
