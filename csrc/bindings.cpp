@@ -140,6 +140,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/nexn2_misc.cuh"
 #include "kernels/nexn2_moe_grouped.cuh"
 #include "kernels/nexn2_bf16_gemv.cuh"
+#include "kernels/nexn2_w4a16_gemv.cuh"
 #include "kernels/bf16_matvec_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36_thor.cuh"
@@ -4497,6 +4498,16 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         },
         py::arg("x"), py::arg("W"), py::arg("out"),
         py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+
+    m.def("nexn2_w4a16_matvec_bf16",
+        [](uintptr_t x, uintptr_t W, uintptr_t sfb, uintptr_t out,
+           int N, int K, float alpha, uintptr_t stream) -> int {
+            return flash_rt::kernels::nexn2_w4a16_matvec_bf16(
+                to_ptr(x), to_ptr(W), to_ptr(sfb), to_ptr(out),
+                N, K, alpha, to_stream(stream));
+        },
+        py::arg("x"), py::arg("W"), py::arg("sfb"), py::arg("out"),
+        py::arg("N"), py::arg("K"), py::arg("alpha"), py::arg("stream") = 0);
 
     m.def("nexn2_moe_grouped_gemv_bf16",
         [](uintptr_t A_stack, uintptr_t B_stack, uintptr_t D,
