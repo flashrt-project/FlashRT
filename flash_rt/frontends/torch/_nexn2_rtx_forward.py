@@ -225,19 +225,23 @@ def _moe_layer(h, ld, fvk, device):
     tw, ti = torch.topk(logit, TOPK, -1)
     tw = tw / tw.sum(-1, keepdim=True)
     out = torch.zeros(x.shape[0], HID, device=device)
+    # Hoist the per-expert alpha .item()/unique() host syncs out of the loop:
+    # one .tolist() each instead of ~2 device->host stalls per routed expert.
+    gu_a_l = gu_a.tolist()
+    dn_a_l = dn_a.tolist()
     for e in torch.unique(ti).tolist():
         m = (ti == e)
         tok = m.any(-1).nonzero(as_tuple=True)[0]
         w = (tw * m)[tok].sum(-1)
         gu_e_p, gu_e_s = gu_p[e], gu_s[e]
         gu = _nvfp4_gemm(x[tok].contiguous(), gu_e_p.data_ptr(),
-                         gu_e_s.data_ptr(), float(gu_a[e].item()), n_gu,
+                         gu_e_s.data_ptr(), gu_a_l[e], n_gu,
                          fvk, device)
         g, u = gu.chunk(2, -1)
         inter = (F.silu(g.float()) * u.float()).to(torch.bfloat16)
         dn_e_p, dn_e_s = dn_p[e], dn_s[e]
         dpj = _nvfp4_gemm(inter, dn_e_p.data_ptr(), dn_e_s.data_ptr(),
-                          float(dn_a[e].item()), n_dn, fvk, device)
+                          dn_a_l[e], n_dn, fvk, device)
         out[tok] += dpj.float() * w.unsqueeze(-1)
 
     sg = _proj(x, ld, 'shared_gate_proj', INTER, fvk, device)
