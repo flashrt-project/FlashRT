@@ -14,21 +14,31 @@ namespace kernels {
 namespace {
 
 constexpr int kThreads = 256;
+constexpr int kWarps = kThreads / 32;
 
-// One block. Each thread owns several logits (grid-stride within the block);
-// k rounds of block-wide argmax, masking the winner each round.
+// argmax (value, carrying index) across a warp via shuffles, no __syncthreads.
+__device__ __forceinline__ void warp_argmax(float& v, int& iv) {
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) {
+    const float ov = __shfl_xor_sync(0xffffffff, v, o);
+    const int oi = __shfl_xor_sync(0xffffffff, iv, o);
+    if (ov > v || (ov == v && oi < iv)) { v = ov; iv = oi; }
+  }
+}
+
+// One block. Each thread owns its strided logits; k rounds of block-argmax via
+// warp shuffles (lower-index wins ties, deterministic), masking the winner.
 __global__ void router_topk_kernel(const __nv_bfloat16* __restrict__ logits,
                                    int* __restrict__ out_idx,
                                    float* __restrict__ out_val,
                                    int n, int k) {
   const int t = threadIdx.x;
-  // Per-thread running best over its strided slice.
-  __shared__ float s_val[kThreads];
-  __shared__ int s_idx[kThreads];
+  const int lane = t & 31;
+  const int wid = t >> 5;
+  __shared__ float sw_val[kWarps];
+  __shared__ int sw_idx[kWarps];
+  __shared__ int s_win;
 
-  // Load this thread's slice into registers (small n: usually 1 each).
-  // We re-scan the (masked) logits each round from a local copy in smem so
-  // masking is cheap. Stage the logits in smem floats.
   extern __shared__ float s_log[];
   for (int i = t; i < n; i += kThreads) s_log[i] = static_cast<float>(logits[i]);
   __syncthreads();
@@ -38,27 +48,23 @@ __global__ void router_topk_kernel(const __nv_bfloat16* __restrict__ logits,
     int bidx = -1;
     for (int i = t; i < n; i += kThreads) {
       const float v = s_log[i];
-      if (v > best) { best = v; bidx = i; }
+      if (v > best || (v == best && i < bidx)) { best = v; bidx = i; }
     }
-    s_val[t] = best;
-    s_idx[t] = bidx;
+    warp_argmax(best, bidx);                    // lane 0 of each warp has it
+    if (lane == 0) { sw_val[wid] = best; sw_idx[wid] = bidx; }
     __syncthreads();
-    // Block reduce (max with index) over the kThreads partials.
-    for (int stride = kThreads >> 1; stride > 0; stride >>= 1) {
-      if (t < stride) {
-        if (s_val[t + stride] > s_val[t]) {
-          s_val[t] = s_val[t + stride];
-          s_idx[t] = s_idx[t + stride];
-        }
+    if (wid == 0) {
+      best = (lane < kWarps) ? sw_val[lane] : -FLT_MAX;
+      bidx = (lane < kWarps) ? sw_idx[lane] : -1;
+      warp_argmax(best, bidx);
+      if (lane == 0) {
+        out_idx[r] = bidx;
+        out_val[r] = best;
+        s_win = bidx;
       }
-      __syncthreads();
     }
-    const int win = s_idx[0];
-    if (t == 0) {
-      out_idx[r] = win;
-      out_val[r] = s_val[0];
-    }
-    if (t == 0 && win >= 0) s_log[win] = -FLT_MAX;   // mask the winner
+    __syncthreads();
+    if (t == 0 && s_win >= 0) s_log[s_win] = -FLT_MAX;
     __syncthreads();
   }
 }
