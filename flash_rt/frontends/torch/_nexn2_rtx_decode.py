@@ -150,6 +150,9 @@ class Nexn2DecodeState:
         self._graphs = {}                       # pos -> (CUDAGraph, out tensor)
         self._snap_lin = [torch.empty_like(t) for t in self.lin_state]
         self._snap_conv = [torch.empty_like(t) for t in self.lin_conv_state]
+        # NVFP4 lm_head: 1GB -> 0.25GB read, +7% tok/s, decode cos 0.973 ->
+        # 0.965. On by default (SOTA speed); set False for the bf16 lm_head.
+        self.lm_head_nvfp4 = True
 
     def reset(self):
         for s in self.lin_state:
@@ -365,13 +368,36 @@ def decode_step(state, token_id, pos, fvk, device):
         h = res + _moe_layer_decode(n, ld, fvk, device)
 
     h = _rms_fvk(h, p['final_norm_w_t'], fvk, device, state.eps)
-    # lm_head via the bf16 GEMV: avoids casting the (vocab, HID) weight to
-    # fp32 (a multi-GB write) -- reads it once in bf16.
+    # lm_head as NVFP4 W4A16: 4x less weight read (1GB -> 0.25GB) via the
+    # hand-tuned mma (3.1x the bf16 GEMV; the CUTLASS widen is M=1-broken).
+    # The weight is quantised once during the eager seed (cached on p), so
+    # the captured graph only runs the activation quant + fp4 GEMM.
     vocab = p['vocab_size']
     logits = torch.empty(1, vocab, dtype=torch.bfloat16, device=device)
-    fvk.nexn2_bf16_matvec_bf16(
-        h.reshape(1, HID).contiguous().data_ptr(),
-        p['lm_head_w_t'].data_ptr(), logits.data_ptr(), vocab, HID, _cs())
+    if not state.lm_head_nvfp4:
+        fvk.nexn2_bf16_matvec_bf16(
+            h.reshape(1, HID).contiguous().data_ptr(),
+            p['lm_head_w_t'].data_ptr(), logits.data_ptr(), vocab, HID, _cs())
+        return logits
+    if 'lm_head_packed_t' not in p:
+        w = p['lm_head_w_t'].contiguous()
+        nn, kk = w.shape
+        packed = torch.empty(nn, kk // 2, dtype=torch.uint8, device=device)
+        sf = torch.zeros(_sf_swz_bytes(nn, kk), dtype=torch.uint8, device=device)
+        scr = torch.zeros(1, dtype=torch.float32, device=device)
+        og = torch.zeros(1, dtype=torch.float32, device=device)
+        fvk.bf16_weight_to_nvfp4_swizzled(
+            w.data_ptr(), packed.data_ptr(), sf.data_ptr(),
+            scr.data_ptr(), og.data_ptr(), nn, kk, 0)
+        torch.cuda.synchronize()
+        p['lm_head_packed_t'] = packed
+        p['lm_head_sf_t'] = sf
+        p['lm_head_alpha'] = float(og.item())
+    xp, xsf = _quant_act(h.reshape(1, HID), fvk, device, _cs())
+    fvk.fp4_w4a4_mma_sm120_full_n_bf16out(
+        xp.data_ptr(), p['lm_head_packed_t'].data_ptr(), logits.data_ptr(),
+        vocab, HID, xsf.data_ptr(), p['lm_head_sf_t'].data_ptr(),
+        p['lm_head_alpha'], _cs())
     return logits
 
 
