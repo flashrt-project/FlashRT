@@ -713,7 +713,10 @@ def _moe_layer(h, ld, fvk, device):
     n_gu = gu_p.shape[1]          # 2 * inter
     n_dn = dn_p.shape[1]          # hidden
 
-    logit = F.softmax(x.float() @ rw.float().T, -1)
+    # Router GEMM via the deterministic w16a16 kernel (bf16 weight, fp32
+    # accumulate) instead of the fp32 upcast matmul. bf16 logits match the
+    # bf16 reference router; softmax/topk stay (already CUDA ops).
+    logit = F.softmax(_gemm_w16a16(x, rw, fvk, device).float(), -1)
     tw, ti = torch.topk(logit, TOPK, -1)
     tw = tw / tw.sum(-1, keepdim=True)
 
@@ -746,7 +749,9 @@ def _moe_layer(h, ld, fvk, device):
     su = _proj(x, ld, 'shared_up_proj', INTER, fvk, device)
     si = _silu_mul(sg, su, fvk, device)
     shared = _proj(si, ld, 'shared_down_proj', HID, fvk, device)
-    sgate = torch.sigmoid(x.float() @ ld['shared_gate_w_t'].float().T)
+    # shared-expert scalar gate: GEMM (N=1) via w16a16, then sigmoid.
+    sgate = torch.sigmoid(
+        _gemm_w16a16(x, ld['shared_gate_w_t'], fvk, device).float())
     return (out + shared.float() * sgate).reshape(B, S, HID).to(torch.bfloat16)
 
 
@@ -795,7 +800,9 @@ def nexn2_forward_nvfp4(handles, input_ids, fvk, device, cap=None,
 
     hidden = h[0]                       # (S, HID) residual stream, pre-final-norm
     h = _rms_k(h, p['final_norm_w_t'], fvk, device, eps)
-    logits = h[0].float() @ p['lm_head_w_t'].float().T
+    # lm_head via w16a16 (bf16 weight, fp32 accumulate): reads the ~1GB weight
+    # as bf16 (no fp32 widen), same argmax. logits returned bf16.
+    logits = _gemm_w16a16(h[0], p['lm_head_w_t'], fvk, device)
     if return_hidden:
         return logits, hidden
     return logits
