@@ -95,6 +95,7 @@ def test_qwen35moe_kernel_symbols_present():
     required = [
         "w16a16_gemm_sm120_bf16",          # dense GEMMs (router/lm_head/...)
         "moe_blocktile_mma_sm120_bf16",    # MoE routed experts
+        "moe_weighted_sum_sm120_bf16",     # fused MoE unpermute
         "moe_router_topk_sm120_bf16",      # decode router top-k
         "qwen36_partial_rope_qk_bf16",     # partial RoPE
         "causal_conv1d_qwen36_bf16",       # GDN conv1d (prefill)

@@ -993,6 +993,7 @@ if(FLASHRT_ENABLE_QWEN35MOE AND ENABLE_NVFP4)
     csrc/kernels/moe_m16_mma_sm120.cu
     csrc/kernels/moe_m64_mma_sm120.cu
     csrc/kernels/moe_blocktile_mma_sm120.cu
+    csrc/kernels/moe_weighted_sum_sm120.cu
     csrc/kernels/w4a16_gemm_sm120.cu
     csrc/kernels/w16a16_gemm_sm120.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_QWEN35MOE=1)

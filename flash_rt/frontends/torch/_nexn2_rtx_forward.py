@@ -676,18 +676,21 @@ def _moe_experts_bt(x, ti, tw, ld, fvk, device):
         ip.data_ptr(), dn_p.data_ptr(), isf.data_ptr(), dn_s.data_ptr(),
         d_dn.data_ptr(), dn_a.data_ptr(), tile_expert.data_ptr(),
         MAX_TILES, n_dn, INTER, 0, dn_p[0].numel(), dn_s[0].numel(), 0)
-    # Deterministic unpermute, no atomics and no full-width scatter: invert the
-    # routing permutation (inv: orig slot -> sorted position, a 131 KB int
-    # scatter), gather each token's TOPK expert-output rows into (S, TOPK, HID)
-    # in original order, and sum over TOPK with the (already token-ordered)
-    # router weights. The sum order is fixed -> bit-reproducible (index_add_'s
-    # atomicAdd over the 8 slots/token jittered the cos ~1e-3 and broke the
-    # token-exact decode seed; an explicit (slots, HID) scatter+sum was
-    # deterministic but moved an extra 134 MB/layer).
+    # Deterministic unpermute via the fused gather-weighted-sum kernel: invert
+    # the routing permutation (inv: orig slot -> sorted position, a 131 KB int
+    # scatter) to get each token's TOPK d_dn rows, then one kernel computes
+    # out[t] = sum_k tw[t,k] * d_dn[rows[t,k]] in fixed k-order. No
+    # (S, TOPK, HID) intermediate (it was 4 GB at S=32k -> the long-context
+    # wall) and no atomics -> bit-reproducible.
     inv = torch.empty(S * TOPK, dtype=torch.long, device=device)
     inv[order] = torch.arange(S * TOPK, device=device)
-    rows = tiled_row[inv].view(S, TOPK)        # d_dn row for each (token, k)
-    return (d_dn[rows].float() * tw.unsqueeze(-1)).sum(1)
+    rows = tiled_row[inv].to(torch.int32).contiguous()
+    twc = tw.reshape(S, TOPK).contiguous()
+    out = torch.empty(S, HID, dtype=torch.float32, device=device)
+    fvk.moe_weighted_sum_sm120_bf16(
+        d_dn.data_ptr(), rows.data_ptr(), twc.data_ptr(), out.data_ptr(),
+        S, TOPK, n_dn, n_dn, 0)
+    return out
 
 
 def _moe_experts_grouped(x, ti, tw, ld, fvk, device):

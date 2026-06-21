@@ -149,6 +149,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/moe_m16_mma_sm120.cuh"
 #include "kernels/moe_m64_mma_sm120.cuh"
 #include "kernels/moe_blocktile_mma_sm120.cuh"
+#include "kernels/moe_weighted_sum_sm120.cuh"
 #include "kernels/w4a16_gemm_sm120.cuh"
 #include "kernels/w16a16_gemm_sm120.cuh"
 #endif  // FLASHRT_HAVE_QWEN35MOE
@@ -4565,6 +4566,17 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("D"), py::arg("alpha"), py::arg("te"), py::arg("num_tiles"),
         py::arg("N"), py::arg("K"), py::arg("sfa_stride"), py::arg("w_stride"),
         py::arg("sfb_stride"), py::arg("stream") = 0);
+
+    m.def("moe_weighted_sum_sm120_bf16",
+        [](uintptr_t d_dn, uintptr_t rows, uintptr_t tw, uintptr_t out,
+           int S, int TOPK, int HID, int dn_stride, uintptr_t stream) -> int {
+            return flash_rt::kernels::moe_weighted_sum_sm120_bf16(
+                to_ptr(d_dn), to_ptr(rows), to_ptr(tw), to_ptr(out),
+                S, TOPK, HID, dn_stride, to_stream(stream));
+        },
+        py::arg("d_dn"), py::arg("rows"), py::arg("tw"), py::arg("out"),
+        py::arg("S"), py::arg("TOPK"), py::arg("HID"), py::arg("dn_stride"),
+        py::arg("stream") = 0);
 
     m.def("w4a16_gemm_sm120_bf16",
         [](uintptr_t X, uintptr_t W, uintptr_t SFB, uintptr_t Y,
