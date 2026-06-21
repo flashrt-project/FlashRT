@@ -117,6 +117,28 @@ def _dense_mv(x1k, w_bf16, ld, key, state, fvk, device):
     return _bf16_mv(x1k, w_bf16, fvk, device)
 
 
+def _silu_mul(g, u, fvk, device):
+    """out = silu(g) * u via one fused kernel (was 4 torch ops). g, u bf16."""
+    n = g.numel()
+    gc = g.reshape(-1).contiguous()
+    uc = u.reshape(-1).contiguous()
+    out = torch.empty(n, dtype=torch.bfloat16, device=device)
+    fvk.nexn2_silu_mul_bf16(gc.data_ptr(), uc.data_ptr(), out.data_ptr(),
+                            n, _cs())
+    return out.reshape(g.shape)
+
+
+def _sigmoid_mul(x, gate, fvk, device):
+    """out = x * sigmoid(gate) via one fused kernel. x, gate bf16."""
+    n = x.numel()
+    xc = x.reshape(-1).contiguous()
+    gc = gate.reshape(-1).contiguous()
+    out = torch.empty(n, dtype=torch.bfloat16, device=device)
+    fvk.nexn2_sigmoid_mul_bf16(xc.data_ptr(), gc.data_ptr(), out.data_ptr(),
+                               n, _cs())
+    return out.reshape(x.shape)
+
+
 def _rms_fvk(x, w, fvk, device, eps):
     """RMSNorm via the fused fvk kernel (fp32 internal) -- one launch vs the
     ~6 torch elementwise ops of the reference _rms. w is the (1+w)-folded
@@ -339,7 +361,7 @@ def _decode_full(h, ld, state, full_rank, pos, fvk, device):
     attn.run('full', layer_idx=full_rank, q_seq=1, kv_seq=pos + 1,
              stream=s, softmax_scale=float(HD) ** -0.5)
     at = attn.O_buf[:, :1].reshape(1, NQ * HD)
-    at = (at.float() * torch.sigmoid(gate.float())).to(torch.bfloat16)
+    at = _sigmoid_mul(at, gate, fvk, device)
     return _proj_mma(at, ld, 'o_proj', HID, fvk, device, state).reshape(
         1, 1, HID)
 
@@ -405,7 +427,7 @@ def _moe_layer_decode(h, ld, state, fvk, device):
     else:
         sg = _proj_mma(x, ld, 'shared_gate_proj', INTER, fvk, device, state)
         su = _proj_mma(x, ld, 'shared_up_proj', INTER, fvk, device, state)
-    si = (F.silu(sg.float()) * su.float()).to(torch.bfloat16)
+    si = _silu_mul(sg, su, fvk, device)
     shared = _proj_mma(si, ld, 'shared_down_proj', HID, fvk, device, state)
     sgate = torch.sigmoid(x.float() @ ld['shared_gate_w_t'].float().T)
     return (out + shared.float() * sgate).reshape(1, 1, HID).to(torch.bfloat16)

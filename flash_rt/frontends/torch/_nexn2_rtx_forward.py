@@ -108,6 +108,16 @@ def _nvfp4_gemm(x2d, wp_ptr, wsf_ptr, alpha, n, fvk, device, stream=0):
                             fvk, device, stream)
 
 
+def _silu_mul(g, u, fvk, device):
+    """out = silu(g) * u via one fused kernel (was 4 torch ops). g, u bf16."""
+    n = g.numel()
+    gc = g.reshape(-1).contiguous()
+    uc = u.reshape(-1).contiguous()
+    out = torch.empty(n, dtype=torch.bfloat16, device=device)
+    fvk.nexn2_silu_mul_bf16(gc.data_ptr(), uc.data_ptr(), out.data_ptr(), n, 0)
+    return out.reshape(g.shape)
+
+
 def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None):
     """Gated DeltaNet (linear_attention) layer. h (1,S,HID) -> (1,S,HID).
 
@@ -270,7 +280,7 @@ def _moe_experts_grouped(x, ti, tw, ld, fvk, device):
         se.data_ptr(), d_gu.data_ptr(), slots, n_gu, HID,
         HID, gu_p[0].numel(), gu_s[0].numel(), 0)
     g, u = d_gu[:, :INTER], d_gu[:, INTER:]
-    inter = (F.silu(g.float()) * u.float()).to(torch.bfloat16).contiguous()
+    inter = _silu_mul(g, u, fvk, device).contiguous()
     d_dn = torch.empty(slots, n_dn, dtype=torch.bfloat16, device=device)
     fvk.nexn2_moe_grouped_w4a16_bf16(
         inter.data_ptr(), dn_p.data_ptr(), dn_s.data_ptr(), dn_a.data_ptr(),
@@ -320,7 +330,7 @@ def _moe_layer(h, ld, fvk, device):
 
     sg = _proj(x, ld, 'shared_gate_proj', INTER, fvk, device)
     su = _proj(x, ld, 'shared_up_proj', INTER, fvk, device)
-    si = (F.silu(sg.float()) * su.float()).to(torch.bfloat16)
+    si = _silu_mul(sg, su, fvk, device)
     shared = _proj(si, ld, 'shared_down_proj', HID, fvk, device)
     sgate = torch.sigmoid(x.float() @ ld['shared_gate_w_t'].float().T)
     return (out + shared.float() * sgate).reshape(B, S, HID).to(torch.bfloat16)
