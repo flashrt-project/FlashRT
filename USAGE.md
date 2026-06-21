@@ -1009,19 +1009,14 @@ scales for free.
 | `pi05_thor_fp4` (jax, FP4 encoder active) | ✅ | ✅ (two-phase: FP8 + AWQ refit) |
 | `pi0_rtx`, `pi05_rtx` (torch + jax) | ✅ | ✅ |
 | `groot_rtx` (torch) | ✅ | ✅ |
-| `groot_thor` (torch) | ✅ | ❌ (see note) |
-| `pi05_thor` / `pi0_thor` / `pi0fast` (jax, non-FP4) | ✅ | ❌ (see note) |
+| `groot_n17_thor` (torch, aux samples) | ✅ | ✅ |
+| `groot_thor` (torch) | ✅ | Implemented; validate with N1.6 fixtures before deployment |
+| `pi05_thor` / `pi0_thor` / `pi0fast` (jax, non-FP4) | ✅ | Implemented; validate with target fixtures before deployment |
 
-Frontends marked ❌ raise `NotImplementedError` on N >= 2 — pass N = 1
-there today. Reasons:
-
-- **`groot_thor`**: the Thor port of the multi-sample path is staged
-  for the next rollout; the N=1 calibrate path remains the default
-  there. RTX (`groot_rtx`) ships the full N>=2 path today.
-- Non-FP4 JAX Thor frontends (`pi05_thor`, `pi0_thor`, `pi0fast`): the
-  FP8-only JAX path still uses the N=1 implicit-recalibrate shim; the
-  JAX Pi0.5 FP4 frontend (`pi05_thor_fp4` with `framework="jax"`) does
-  support N>=2, using the same two-phase flow as torch.
+GROOT N1.7 Thor is aux-driven rather than `predict()`-driven: its
+calibration samples use the same aux schema consumed by
+`set_prompt(aux=...)`. The obs-list examples above apply to
+`predict()`-style frontends.
 
 `pi05_thor_fp4` uses a two-phase multi-sample flow: Phase 1 reduces
 FP8 activation scales across N samples (same loop the base class

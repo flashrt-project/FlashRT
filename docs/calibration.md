@@ -582,7 +582,7 @@ replay path.
 
 Per-frame cost asymptotes to ~128 ms (~2.3× a single 55 ms replay).
 Measured with the same LIBERO dataset and `percentile=99.9` as the RTX
-row, on Pi0.5 LIBERO-FT safetensors in the the PyTorch deploy container container.
+row, on Pi0.5 LIBERO-FT safetensors in the PyTorch deploy container.
 See [`tests/bench_thor_calibration_vs_ref.py`](../tests/bench_thor_calibration_vs_ref.py).
 
 Calibration runs once per deployment session on both platforms. A Thor
@@ -592,13 +592,26 @@ taking for production deployments, but skippable for a 50-shot demo on
 a fixed scene where `N = 1` is already above the accuracy-sufficient
 threshold.
 
+#### GROOT N1.7 Thor aux-list validation
+
+GROOT N1.7 Thor uses aux samples rather than LIBERO obs dicts for
+multi-sample calibration. After `set_prompt(aux=...)` selects the
+deployment prompt, `GrootN17TorchFrontendThor.calibrate(aux_list,
+percentile=99.9)` percentile-reduces FP8 backbone activation scales
+across pre-captured aux samples. The focused Thor regression is
+[`tests/test_thor_groot_n17_calibrate.py`](../tests/test_thor_groot_n17_calibrate.py)
+with `--ns 1,8`.
+
 #### Which Thor frontends implement multi-sample calibration
 
 Thor `Pi05TorchFrontendThor.calibrate(obs_list, percentile=99.9)`
 supports N ≥ 2 today (same shape as the RTX API — see
 [`flash_rt/frontends/torch/pi05_thor.py`](../flash_rt/frontends/torch/pi05_thor.py)
-`_calibrate_multi_frame`). On RTX the same multi-sample API is also
-available for `groot_rtx` (see
+`_calibrate_multi_frame`). The torch Pi0 and Pi0-FAST Thor frontends,
+plus the non-FP4 JAX Thor frontends, follow the same obs-list contract.
+GROOT N1.7 Thor supports N ≥ 2 through its aux-list API described
+above. On RTX the same multi-sample API is also available for
+`groot_rtx` (see
 [`flash_rt/frontends/torch/groot_rtx.py`](../flash_rt/frontends/torch/groot_rtx.py)
 `_calibrate_multi_frame`), which percentile-reduces both the Qwen3 and
 the DiT activation scales after running per-sample shadow forwards
@@ -606,11 +619,9 @@ through both stages. Motus RTX also supports
 `MotusTorchFrontendRtx.calibrate(obs_list, percentile=99.9)` for
 Stage3 bundles; it percentile-reduces Motus FP8 GEMM scales, AWQ-FP8
 action/und scales, G7.24 action/und QKV scales, and VAE FP8 resample
-scales before CUDA Graph capture. The remaining Thor frontends (`pi0_thor`,
-`pi0fast`, `groot_thor`, and their JAX counterparts) still route N ≥ 2
-through the `implicit_calibrate` shim and raise `NotImplementedError`
-— each needs a per-model audit of its calibrate-pass scale buffer
-layout before the same loop generalizes.
+scales before CUDA Graph capture. For the older GROOT N1.6 Thor path
+(`groot_thor`), run `tests/test_thor_groot_calibrate.py --ns 1,8`
+with N1.6 assets before using it as deployment evidence.
 
 ### What remains unchanged
 
