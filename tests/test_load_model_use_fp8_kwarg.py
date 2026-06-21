@@ -310,6 +310,72 @@ def test_load_model_routes_pi05_jax_thor_fp4_and_preset_kwargs(monkeypatch):
     }
 
 
+@pytest.mark.parametrize(
+    "framework, hardware, module_name, class_name",
+    [
+        (
+            "jax",
+            "rtx_sm89",
+            "flash_rt.frontends.jax.pi05_thor_fp4",
+            "Pi05JaxFrontendThorFP4",
+        ),
+        (
+            "torch",
+            "rtx_sm120",
+            "flash_rt.frontends.torch.pi05_thor_fp4",
+            "Pi05TorchFrontendThorFP4",
+        ),
+    ],
+)
+def test_load_model_does_not_route_pi05_non_thor_fp4_to_thor_frontend(
+        monkeypatch, framework, hardware, module_name, class_name):
+    from flash_rt.api import load_model
+
+    class ResolvedFrontend:
+        seen = None
+
+        def __init__(self, checkpoint, *, num_views=2, use_fp8=True):
+            type(self).seen = {
+                "checkpoint": checkpoint,
+                "num_views": num_views,
+                "use_fp8": use_fp8,
+            }
+
+        def infer(self, obs):
+            return {"actions": None}
+
+    class UnexpectedThorFP4Frontend:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError(
+                "non-Thor Pi0.5 use_fp4=True must keep the resolved "
+                "hardware frontend instead of rewriting to a Thor FP4 class")
+
+    fp4_ext = types.ModuleType("flash_rt.flash_rt_fp4")
+    fp4_ext.has_nvfp4 = lambda: True
+    thor_fp4_mod = types.ModuleType(module_name)
+    setattr(thor_fp4_mod, class_name, UnexpectedThorFP4Frontend)
+    monkeypatch.setitem(sys.modules, "flash_rt.flash_rt_fp4", fp4_ext)
+    monkeypatch.setitem(sys.modules, module_name, thor_fp4_mod)
+
+    with patch("flash_rt.hardware.resolve_pipeline_class",
+               return_value=ResolvedFrontend):
+        model = load_model(
+            "unused-checkpoint",
+            config="pi05",
+            framework=framework,
+            hardware=hardware,
+            num_views=3,
+            use_fp4=True,
+        )
+
+    assert isinstance(model._pipe, ResolvedFrontend)
+    assert ResolvedFrontend.seen == {
+        "checkpoint": "unused-checkpoint",
+        "num_views": 3,
+        "use_fp8": True,
+    }
+
+
 def test_sm87_rejects_unvalidated_pi0_and_jax_backends():
     from flash_rt.hardware import resolve_pipeline_class
 

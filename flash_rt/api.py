@@ -559,11 +559,12 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
 
     # ── FP4 routing (Pi0.5 torch + Pi0.5 JAX on Thor) ──
     if use_fp4:
-        if config != "pi05" or framework not in ("torch", "jax"):
+        if config != "pi05" or framework not in ("torch", "jax") or arch != "thor":
             logger.warning(
                 "use_fp4=True is only supported for config='pi05' with "
-                "framework in ('torch', 'jax'); got config='%s' framework='%s'. "
-                "Falling back to FP8.", config, framework)
+                "framework in ('torch', 'jax') on Thor; got config='%s' "
+                "framework='%s' hardware='%s'. Falling back to FP8.",
+                config, framework, arch)
             use_fp4 = False
         else:
             try:
