@@ -788,7 +788,7 @@ def _moe_layer(h, ld, fvk, device):
 
 
 def nexn2_forward_nvfp4(handles, input_ids, fvk, device, cap=None,
-                        return_hidden=False):
+                        return_hidden=False, last_logits_only=False):
     """Full kernelized NVFP4 prefill forward: token ids -> logits.
 
     Args:
@@ -799,9 +799,14 @@ def nexn2_forward_nvfp4(handles, input_ids, fvk, device, cap=None,
         cap: optional Nexn2DecodeState; when given, the GDN recurrent/conv
             state and the full-attn KV cache are seeded so a subsequent decode
             continues from position S (batched prefill).
+        last_logits_only: when True compute the lm_head for only the final
+            position, returning logits (1, vocab). The all-position logits are
+            (S, vocab) -- 4 GB at S=8192 -- and only the last row seeds decode,
+            so this is what the decode-seeding path uses to keep long-context
+            prefill within memory (KV stays bf16 and small).
 
     Returns:
-        logits: (S, vocab) fp32 on device.
+        logits: (S, vocab) bf16, or (1, vocab) when last_logits_only.
     """
     p = handles.ptrs
     eps = float(p['rms_norm_eps'])
@@ -833,8 +838,11 @@ def nexn2_forward_nvfp4(handles, input_ids, fvk, device, cap=None,
     hidden = h[0]                       # (S, HID) residual stream, pre-final-norm
     h = _rms_k(h, p['final_norm_w_t'], fvk, device, eps)
     # lm_head via w16a16 (bf16 weight, fp32 accumulate): reads the ~1GB weight
-    # as bf16 (no fp32 widen), same argmax. logits returned bf16.
-    logits = _gemm_w16a16(h[0], p['lm_head_w_t'], fvk, device)
+    # as bf16 (no fp32 widen), same argmax. logits returned bf16. Slice to the
+    # last position first when only the seeding logit is needed (avoids the
+    # (S, vocab) materialisation that dominates long-context prefill memory).
+    h_lm = h[0][-1:].contiguous() if last_logits_only else h[0]
+    logits = _gemm_w16a16(h_lm, p['lm_head_w_t'], fvk, device)
     if return_hidden:
         return logits, hidden
     return logits

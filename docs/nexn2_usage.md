@@ -23,8 +23,9 @@ frontend directly.
 | Framework | PyTorch (`torch`) |
 | Weight quant | `nvfp4` (default) or `fp8` |
 | Build flag | `-DFLASHRT_ENABLE_QWEN35MOE=ON` (required) |
-| Prefill | ~12.5k tok/s @ 4k ctx (see table) |
+| Prefill | up to ~14.4k tok/s (see table) |
 | Decode | ~250 tok/s, token-exact CUDA-graph |
+| Context | bf16 KV (small); ~16k generates on 32 GB |
 | Precision | cos vs BF16 reference 0.9924, deterministic |
 
 ## 1. Build
@@ -106,16 +107,19 @@ tok/s is the warm CUDA-graph steady-state rate (KV grows with context).
 
 | Context S | TTFT (ms) | Prefill (tok/s) | Decode (tok/s) |
 |---:|---:|---:|---:|
-| 128  | 44.2  | 2,897  | 258.5 |
-| 256  | 51.3  | 4,993  | 258.5 |
-| 512  | 67.7  | 7,563  | 258.5 |
-| 1024 | 102.3 | 10,014 | 254.5 |
-| 2048 | 176.1 | 11,631 | 249.6 |
-| 4096 | 327.8 | 12,494 | 240.8 |
+| 128   | 44.6   | 2,868  | 259.2 |
+| 256   | 51.2   | 5,005  | 259.4 |
+| 512   | 64.5   | 7,938  | 258.4 |
+| 1024  | 94.3   | 10,864 | 254.3 |
+| 2048  | 158.3  | 12,942 | 250.5 |
+| 4096  | 289.5  | 14,147 | 242.3 |
+| 8192  | 566.9  | 14,450 | 227.5 |
+| 16384 | 1172.8 | 13,970 | 203.3 |
 
 Reference llama.cpp NVFP4 GGUF on the same class of card: prefill 9.5–10.1k,
 decode 193–259 tok/s. FlashRT crosses the prefill target from ~1k context and
-holds decode at the top of that band.
+holds decode at the top of that band; decode tapers with context as the bf16 KV
+cache grows.
 
 Reproduce (needs the checkpoint):
 
@@ -159,7 +163,11 @@ logits that seed decode are stable:
 
 * SM120 (RTX 5090 / Blackwell) only for `kernelized=True`.
 * Requires the `-DFLASHRT_ENABLE_QWEN35MOE=ON` build.
-* `infer()` materialises all-position logits `(S, 248320)`; on a 32 GB card the
-  full-logits prefill ceiling is ~4096 tokens (8192 OOMs on the logits alone).
-  Decode is unaffected (single-token logits).
+* The KV cache is bf16 and small (0.17 GB at 8k, ~5.4 GB at 256k context over
+  the 10 full-attn layers), so it does not bound context on a 32 GB card. The
+  decode-seeding prefill computes the lm_head for the last position only, so the
+  `(S, 248320)` logit tensor does not bound it either. On 32 GB the practical
+  ceiling is the MoE activation memory: ~16k context generates comfortably; 32k
+  OOMs in the fp32 MoE unpermute. (`infer()`, which returns all-position logits
+  for validation, is separately capped at ~4k by the `(S, 248320)` tensor.)
 * Text LLM only — not wired into the `load_model` / VLA `predict()` API.

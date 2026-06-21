@@ -564,8 +564,9 @@ def seed_prefill_batched(state, input_ids, fvk, device):
     when ``cap`` is passed (see _gdn_layer / _full_attn_layer)."""
     state.reset()
     logits = nexn2_forward_nvfp4(
-        state.handles, input_ids.view(1, -1), fvk, device, cap=state)
-    return logits[-1:].contiguous()
+        state.handles, input_ids.view(1, -1), fvk, device, cap=state,
+        last_logits_only=True)
+    return logits           # already (1, vocab): only the seeding logit
 
 
 def generate_greedy(state, input_ids, max_new_tokens, fvk, device):
