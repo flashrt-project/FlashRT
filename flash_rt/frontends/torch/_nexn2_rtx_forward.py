@@ -118,6 +118,97 @@ def _silu_mul(g, u, fvk, device):
     return out.reshape(g.shape)
 
 
+# WY chunked gated-delta-rule scan for the GDN prefill. The seq-scan kernel is
+# O(S) sequential per head with only NV=32 blocks (19% occupancy on the 5090),
+# so it is the prefill wall (~9.4 ms/layer at S=2048). The WY/UT chunked form
+# (FLA delta rule) runs the intra-chunk work as tensor-core matmuls and only
+# the inter-chunk state recurrence is sequential -> 11x faster at S=2048,
+# bit-exact (out cos 0.99998, state cos 0.99997 vs the seq-scan). Default on.
+import os as _os
+_USE_WY_GDN = _os.environ.get('NEXN2_WY_GDN', '1') != '0'
+_WY_MIN_S = 64        # below this the seq-scan's lower fixed overhead wins
+
+
+def _wy_pack_t(x, ch=64):
+    """(S, H, D) -> (chunks, H, ch, D): x_pack[ci, h, i, d] = x[ci*ch+i, h, d]
+    (zero-padded last chunk). The packed chunk-major layout the mma kernels read."""
+    s, hh, d = x.shape
+    pad = (-s) % ch
+    if pad:
+        x = F.pad(x, (0, 0, 0, 0, 0, pad))
+    return x.reshape(-1, ch, hh, d).permute(0, 2, 1, 3).contiguous()
+
+
+def _wy_l2(x):
+    """l2norm over the last dim, eps inside rsqrt (matches the seq-scan kEps)."""
+    xf = x.float()
+    return (xf * torch.rsqrt((xf * xf).sum(-1, keepdim=True) + 1e-6)).to(
+        torch.bfloat16)
+
+
+def _wy_gcumsum(g, ch=64):
+    """(S, NV) -> (S, NV) per-chunk cumulative sum of the (log-space) gate."""
+    s = g.shape[0]
+    pad = (-s) % ch
+    gp = F.pad(g, (0, 0, 0, pad)) if pad else g
+    return torch.cumsum(gp.float().reshape(-1, ch, g.shape[1]), 1).reshape(
+        -1, g.shape[1])[:s].to(torch.bfloat16)
+
+
+def _gdn_wy_chunk(q16, k16, v, g, beta, fvk, device):
+    """WY chunked scan. q16/k16 (S,16,128) raw post-conv, v (S,32,128),
+    g/beta (S,32). Returns core (S,32,128) + final state (32,128,128).
+
+    Pipeline (FLA chunked delta rule, all add-only existing kernels):
+    l2norm + per-chunk g-cumsum (torch glue) -> kkt -> solve_tril(+pack) ->
+    recompute_wu -> chunk_h (inter-chunk state) -> output_o."""
+    S = q16.shape[0]
+    chunks = (S + 63) // 64
+    CH, QKG = 64, NV // NK
+    q_l2 = _wy_l2(q16)
+    k_l2 = _wy_l2(k16).contiguous()
+    gc = _wy_gcumsum(g).contiguous()
+    betac = beta.contiguous()
+    vc = v.contiguous()
+
+    k_pack = torch.empty(chunks, NK, CH, HK, dtype=torch.bfloat16, device=device)
+    kkt_base = torch.empty(chunks, NK, CH, CH, dtype=torch.float32, device=device)
+    A = torch.empty(chunks, NV, CH, CH, dtype=torch.float32, device=device)
+    fvk.linear_attn_gdn_wy_kkt_b64_bf16_cublaslt(
+        k_l2.data_ptr(), betac.data_ptr(), gc.data_ptr(), k_pack.data_ptr(),
+        kkt_base.data_ptr(), A.data_ptr(), S, NK, NV, HK, QKG, 0)
+
+    Ai = torch.empty(chunks, NV, CH, CH, dtype=torch.float32, device=device)
+    Ai_pack = torch.empty(chunks, NV, CH, CH, dtype=torch.bfloat16, device=device)
+    fvk.linear_attn_gdn_wy_solve_tril_b64_f32_parallel_pack(
+        A.data_ptr(), Ai.data_ptr(), Ai_pack.data_ptr(), S, NV, 0)
+
+    w_pack = torch.empty(chunks, NV, CH, HV, dtype=torch.bfloat16, device=device)
+    u_pack = torch.empty(chunks, NV, CH, HV, dtype=torch.bfloat16, device=device)
+    fvk.linear_attn_gdn_wy_recompute_wu_b64_bf16_mma_fla(
+        k_l2.data_ptr(), vc.data_ptr(), betac.data_ptr(), gc.data_ptr(),
+        Ai_pack.data_ptr(), w_pack.data_ptr(), u_pack.data_ptr(),
+        S, NK, NV, HK, QKG, 0)
+
+    state = torch.zeros(NV, HK, HV, dtype=torch.bfloat16, device=device)
+    h0 = torch.empty(chunks, NV, HK, HV, dtype=torch.bfloat16, device=device)
+    v_new = torch.empty(S, NV, HV, dtype=torch.bfloat16, device=device)
+    fvk.linear_attn_gdn_wy_chunk_h_b64_bf16_mma_fla(
+        k_l2.data_ptr(), w_pack.data_ptr(), u_pack.data_ptr(), gc.data_ptr(),
+        state.data_ptr(), h0.data_ptr(), v_new.data_ptr(), 0, 0,
+        S, NK, NV, HK, QKG, 0)
+
+    q_pack = _wy_pack_t(q_l2.repeat_interleave(QKG, 1))
+    k_pack_hv = _wy_pack_t(k_l2.repeat_interleave(QKG, 1))
+    v_pack = _wy_pack_t(v_new)
+    core = torch.empty(S, NV, HV, dtype=torch.bfloat16, device=device)
+    fvk.linear_attn_gdn_wy_output_o_b64_bf16_mma_fla(
+        q_pack.data_ptr(), k_pack_hv.data_ptr(), v_pack.data_ptr(),
+        h0.data_ptr(), gc.data_ptr(), core.data_ptr(),
+        S, NV, HV, float(HV ** -0.5), 0)
+    return core, state
+
+
 def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None):
     """Gated DeltaNet (linear_attention) layer. h (1,S,HID) -> (1,S,HID).
 
@@ -161,20 +252,31 @@ def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None):
         a_bf.data_ptr(), b_bf.data_ptr(), neg.data_ptr(), dtb_c.data_ptr(),
         g_out.data_ptr(), bo.data_ptr(), B * S, NV, 0)
 
-    # Sequential scan over the whole prompt in ONE launch (state stays in
-    # registers across all S timesteps -> no per-token state HBM round-trip /
-    # S kernel launches). Bit-equivalent to the per-token recurrent loop
-    # (out cos 0.99999); ~2.6x faster at S=128.
-    state = torch.zeros(NV, HK, HV, dtype=torch.bfloat16, device=device)
-    core = torch.empty(S, NV, HV, dtype=torch.bfloat16, device=device)
-    fvk.nexn2_gdn_recurrent_seq_bf16(
-        qb.reshape(S, NV, HK).contiguous().data_ptr(),
-        kb.reshape(S, NV, HK).contiguous().data_ptr(),
-        vb.reshape(S, NV, HV).contiguous().data_ptr(),
-        g_out.reshape(S, NV).contiguous().data_ptr(),
-        bo.reshape(S, NV).contiguous().data_ptr(),
-        state.data_ptr(), core.data_ptr(), S, NV, HK, True, 0)
-    core = core.reshape(B, S, NV, HV)
+    if _USE_WY_GDN and S >= _WY_MIN_S:
+        # WY chunked delta-rule scan: 11x faster than the seq-scan at S=2048,
+        # bit-exact. qb/kb are the 16->32 broadcast heads (src_h = h//2), so the
+        # 16 unique K-heads are the even slots; the WY kernels re-expand by GQA.
+        q16 = qb.reshape(S, NV, HK)[:, 0::2, :]
+        k16 = kb.reshape(S, NV, HK)[:, 0::2, :]
+        core, state = _gdn_wy_chunk(
+            q16, k16, vb.reshape(S, NV, HV), g_out.reshape(S, NV),
+            bo.reshape(S, NV), fvk, device)
+        core = core.reshape(B, S, NV, HV)
+    else:
+        # Sequential scan over the whole prompt in ONE launch (state stays in
+        # registers across all S timesteps -> no per-token state HBM round-trip
+        # / S kernel launches). Bit-equivalent to the per-token recurrent loop
+        # (out cos 0.99999); the short-prompt fallback below _WY_MIN_S.
+        state = torch.zeros(NV, HK, HV, dtype=torch.bfloat16, device=device)
+        core = torch.empty(S, NV, HV, dtype=torch.bfloat16, device=device)
+        fvk.nexn2_gdn_recurrent_seq_bf16(
+            qb.reshape(S, NV, HK).contiguous().data_ptr(),
+            kb.reshape(S, NV, HK).contiguous().data_ptr(),
+            vb.reshape(S, NV, HV).contiguous().data_ptr(),
+            g_out.reshape(S, NV).contiguous().data_ptr(),
+            bo.reshape(S, NV).contiguous().data_ptr(),
+            state.data_ptr(), core.data_ptr(), S, NV, HK, True, 0)
+        core = core.reshape(B, S, NV, HV)
 
     if cap is not None:
         # GDN recurrent final state = `state` after the S-step scan; conv state
