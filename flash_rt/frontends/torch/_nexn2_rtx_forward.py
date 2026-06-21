@@ -51,9 +51,22 @@ def build_rope_tables(seq_len, theta, rope_dim, device):
 
 
 def _rms(x, w, eps):
-    """Plain (already (1+w)-folded) RMSNorm in fp32, bf16 out."""
+    """Plain (already (1+w)-folded) RMSNorm in fp32, bf16 out (torch ref)."""
     v = x.float().pow(2).mean(-1, keepdim=True)
     return ((x.float() * torch.rsqrt(v + eps)) * w.float()).to(torch.bfloat16)
+
+
+def _rms_k(x, w, fvk, device, eps):
+    """RMSNorm via the fused fvk kernel (fp32 internal, bf16 out) -- the
+    kernelized prefill replacement for _rms. w is the (1+w)-folded weight; the
+    kernel normalises each row over the last dim. Bit-equivalent to _rms."""
+    shp = x.shape
+    dim = shp[-1]
+    x2 = x.reshape(-1, dim).contiguous()
+    out = torch.empty(x2.shape[0], dim, dtype=torch.bfloat16, device=device)
+    fvk.rms_norm(x2.data_ptr(), w.data_ptr(), out.data_ptr(),
+                 x2.shape[0], dim, eps, 0)
+    return out.reshape(shp)
 
 
 def _proj(x2d, ld, base, n, fvk, device):
@@ -343,11 +356,13 @@ def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None):
     if _DENSE_W16A16 and (B * S) >= _DENSE_BF16_MIN_M:
         mixed = _gemm_w16a16(h2, Wqkv, fvk, device).reshape(B, S, -1)
         z = _gemm_w16a16(h2, Wz, fvk, device).reshape(B, S, NV, HV)
+        b = _gemm_w16a16(h2, Wb, fvk, device).reshape(B, S, NV)
+        a = _gemm_w16a16(h2, Wa, fvk, device).reshape(B, S, NV)
     else:
         mixed = (h.float() @ Wqkv.float().T).to(torch.bfloat16)
         z = (h.float() @ Wz.float().T).reshape(B, S, NV, HV)
-    b = h.float() @ Wb.float().T
-    a = h.float() @ Wa.float().T
+        b = (h.float() @ Wb.float().T).to(torch.bfloat16)
+        a = (h.float() @ Wa.float().T).to(torch.bfloat16)
 
     # causal depthwise conv1d + silu (torch glue; nexn2 dim=8192).
     xc = F.silu(F.conv1d(mixed.transpose(1, 2).float(), convw.float(),
@@ -440,9 +455,9 @@ def _full_attn_layer(h, ld, ct, st, fvk, device, eps, cap=None, rank=None):
         qg.data_ptr(), q_pre.data_ptr(), gate.data_ptr(), B * S, 0)
     q = q_pre.view(B, S, NQ, HD)
     gate = gate.view(B, S, NQ * HD)
-    q = _rms(q.to(torch.bfloat16), qnw, eps)
+    q = _rms_k(q.to(torch.bfloat16), qnw, fvk, device, eps)
     k = _proj(x2, ld, 'k_proj', NKV * HD, fvk, device).view(B, S, NKV, HD)
-    k = _rms(k, knw, eps)
+    k = _rms_k(k, knw, fvk, device, eps)
     v = _proj(x2, ld, 'v_proj', NKV * HD, fvk, device).view(B, S, NKV, HD)
 
     qo = torch.empty(S, NQ, HD, dtype=torch.bfloat16, device=device)
@@ -471,9 +486,14 @@ def _full_attn_layer(h, ld, ct, st, fvk, device, eps, cap=None, rank=None):
         at = F.scaled_dot_product_attention(
             qa.float(), ka.float(), va.float(), is_causal=True)
     at = at.transpose(1, 2).reshape(B, S, NQ * HD)
-    at = (at.float() * torch.sigmoid(gate.float())).to(torch.bfloat16)
-    return _proj(at.reshape(B * S, NQ * HD), ld, 'o_proj', HID,
-                 fvk, device).reshape(B, S, HID)
+    # output gate: at * sigmoid(gate) via the fused kernel (was torch glue).
+    atc = at.reshape(-1).to(torch.bfloat16).contiguous()
+    gc = gate.reshape(-1).contiguous()
+    ato = torch.empty_like(atc)
+    fvk.sigmoid_mul_sm120_bf16(atc.data_ptr(), gc.data_ptr(),
+                               ato.data_ptr(), atc.numel(), 0)
+    at = ato.reshape(B * S, NQ * HD)
+    return _proj(at, ld, 'o_proj', HID, fvk, device).reshape(B, S, HID)
 
 
 # Grouped MoE for prefill (on by default); set False to use the per-expert loop.
@@ -720,7 +740,7 @@ def nexn2_forward_nvfp4(handles, input_ids, fvk, device, cap=None,
     for L in range(p['num_layers']):
         ld = layers[L]
         res = h
-        n = _rms(h, ld['input_norm_w_t'], eps)
+        n = _rms_k(h, ld['input_norm_w_t'], fvk, device, eps)
         if types[L] == 'linear_attention':
             attn = _gdn_layer(n, ld, fvk, device, eps, cap, lin_rank)
             lin_rank += 1
@@ -730,11 +750,11 @@ def nexn2_forward_nvfp4(handles, input_ids, fvk, device, cap=None,
             full_rank += 1
         h = res + attn
         res = h
-        n = _rms(h, ld['post_norm_w_t'], eps)
+        n = _rms_k(h, ld['post_norm_w_t'], fvk, device, eps)
         h = res + _moe_layer(n, ld, fvk, device)
 
     hidden = h[0]                       # (S, HID) residual stream, pre-final-norm
-    h = _rms(h, p['final_norm_w_t'], eps)
+    h = _rms_k(h, p['final_norm_w_t'], fvk, device, eps)
     logits = h[0].float() @ p['lm_head_w_t'].float().T
     if return_hidden:
         return logits, hidden
