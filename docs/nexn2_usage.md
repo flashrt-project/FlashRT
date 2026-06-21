@@ -23,7 +23,7 @@ frontend directly.
 | Framework | PyTorch (`torch`) |
 | Weight quant | `nvfp4` (default) or `fp8` |
 | Build flag | `-DFLASHRT_ENABLE_QWEN35MOE=ON` (required) |
-| Prefill | up to ~14.4k tok/s (see table) |
+| Prefill | up to ~16.4k tok/s (see table) |
 | Decode | ~250 tok/s, token-exact CUDA-graph |
 | Context | bf16 KV (small); ~16k generates on 32 GB |
 | Precision | cos vs BF16 reference 0.9924, deterministic |
@@ -107,14 +107,14 @@ tok/s is the warm CUDA-graph steady-state rate (KV grows with context).
 
 | Context S | TTFT (ms) | Prefill (tok/s) | Decode (tok/s) |
 |---:|---:|---:|---:|
-| 128   | 44.6   | 2,868  | 259.2 |
-| 256   | 51.2   | 5,005  | 259.4 |
-| 512   | 64.5   | 7,938  | 258.4 |
-| 1024  | 94.3   | 10,864 | 254.3 |
-| 2048  | 158.3  | 12,942 | 250.5 |
-| 4096  | 289.5  | 14,147 | 242.3 |
-| 8192  | 566.9  | 14,450 | 227.5 |
-| 16384 | 1172.8 | 13,970 | 203.3 |
+| 128   | 44.3   | 2,889  | 259.1 |
+| 256   | 50.6   | 5,060  | 259.6 |
+| 512   | 62.7   | 8,165  | 258.5 |
+| 1024  | 88.7   | 11,541 | 254.3 |
+| 2048  | 140.7  | 14,554 | 249.7 |
+| 4096  | 254.4  | 16,103 | 242.2 |
+| 8192  | 498.9  | 16,419 | 228.5 |
+| 16384 | 1031.6 | 15,883 | 202.2 |
 
 Reference llama.cpp NVFP4 GGUF on the same class of card: prefill 9.5–10.1k,
 decode 193–259 tok/s. FlashRT crosses the prefill target from ~1k context and
@@ -165,9 +165,12 @@ logits that seed decode are stable:
 * Requires the `-DFLASHRT_ENABLE_QWEN35MOE=ON` build.
 * The KV cache is bf16 and small (0.17 GB at 8k, ~5.4 GB at 256k context over
   the 10 full-attn layers), so it does not bound context on a 32 GB card. The
-  decode-seeding prefill computes the lm_head for the last position only, so the
-  `(S, 248320)` logit tensor does not bound it either. On 32 GB the practical
-  ceiling is the MoE activation memory: ~16k context generates comfortably; 32k
-  OOMs in the fp32 MoE unpermute. (`infer()`, which returns all-position logits
-  for validation, is separately capped at ~4k by the `(S, 248320)` tensor.)
+  decode-seeding prefill computes the lm_head for the last position only, and
+  the MoE unpermute is a fused gather-sum (no `(S, TOPK, HID)` intermediate), so
+  neither bounds context. On 32 GB ~16k context generates comfortably; beyond
+  that the per-layer activations (the full-sequence GDN projections, ~4 GB per
+  layer at 256k) are the wall — lifting it needs chunked prefill (process the
+  prompt in token-blocks carrying GDN/KV state). (`infer()`, which returns
+  all-position logits for validation, is separately capped at ~4k by the
+  `(S, 248320)` tensor.)
 * Text LLM only — not wired into the `load_model` / VLA `predict()` API.
