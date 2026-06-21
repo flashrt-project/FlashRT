@@ -15,9 +15,11 @@ Compute split (this milestone -- prefill, S>1):
     (parameterised, validated at the Nex-N2 head counts).
   * BF16-kept projections (GDN in_proj -- red line, router, shared gate,
     embed, lm_head): batched cuBLAS matmul (fp32 accumulate).
-  * Glue still on torch (kernelised in the decode/graph milestone, where
-    the nexn2-specific dims need new .cu): conv1d, 16->32 q/k broadcast,
-    q/gate split, causal SDPA, MoE routing, residual adds.
+  * Full-attn: the vendored FA2 causal kernel (flash_rt_fa2.fwd_bf16_causal),
+    native GQA (no KV repeat_interleave). Winner of the prefill attention
+    meta-test (cos 1.0; beats flash_attn pip / Sage[HD=256 unsupported] / the
+    fp32 cublas-decomposed MHA) -- see nexn2_dev/tests/phase_attn_metatest.py.
+  * Glue still on torch (kernelised incrementally): MoE routing, residual adds.
 
 All fvk pointer args bind to named tensors first -- an inline
 ``x.to(bf16).contiguous().data_ptr()`` temporary is GC'd before the
@@ -434,10 +436,50 @@ def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None):
     return out.reshape(B, S, HID)
 
 
-# bf16 SDPA for the prefill full-attn (vs the fp32/TF32 cutlass fmha). The
-# softmax accumulates in fp32 inside the kernel, so cos is preserved while the
-# QK^T / PV matmuls run on bf16 tensor cores (~2x). Default ON.
-_ATTN_BF16 = True
+# Vendored FA2 causal kernel for the prefill full-attn. The attention meta-test
+# (nexn2_dev/tests/phase_attn_metatest.py) over the Nex-N2 full-attn shape
+# (S, 16Q/2KV, HD=256, causal, bf16) ranks fwd_bf16_causal first at every S
+# (cos 1.0; beats flash_attn pip by ~4%, Sage rejects HD=256, the cublas mha
+# materialises O(S^2) scores). It also takes native GQA, so the KV no longer
+# needs repeat_interleave to 16 heads (was the SDPA path). The kernel lives in
+# the pre-existing flash_rt_fa2.so (already a hard dep of the decode backend),
+# so this adds no new csrc.
+_FA2_MOD = None
+_NUM_SMS = None
+
+
+def _get_fa2():
+    global _FA2_MOD
+    if _FA2_MOD is None:
+        from flash_rt import flash_rt_fa2 as _m
+        _FA2_MOD = _m
+    return _FA2_MOD
+
+
+def _num_sms():
+    global _NUM_SMS
+    if _NUM_SMS is None:
+        _NUM_SMS = torch.cuda.get_device_properties(
+            torch.cuda.current_device()).multi_processor_count
+    return _NUM_SMS
+
+
+def _fa2_causal_attn(qf, kf, vf, device):
+    """Causal GQA self-attention via the vendored FA2 kernel (bf16, native
+    GQA -- no KV repeat). qf (1,S,NQ,HD), kf/vf (1,S,NKV,HD). Returns
+    (1,S,NQ,HD). Prefill-optimal config: splitkv off (large-q parallelism)."""
+    Sq = qf.shape[1]
+    qc, kc, vc = qf.contiguous(), kf.contiguous(), vf.contiguous()
+    o = torch.empty(1, Sq, NQ, HD, dtype=torch.bfloat16, device=device)
+    lse = torch.empty(1, NQ, Sq, dtype=torch.float32, device=device)
+    _get_fa2().fwd_bf16_causal(
+        Q=qc.data_ptr(), K=kc.data_ptr(), V=vc.data_ptr(), O=o.data_ptr(),
+        softmax_lse=lse.data_ptr(), softmax_lse_accum=0, o_accum=0,
+        batch=1, seqlen_q=Sq, seqlen_k=Sq, num_heads_q=NQ, num_heads_kv=NKV,
+        head_dim=HD, q_strides=qc.stride()[:3], k_strides=kc.stride()[:3],
+        v_strides=vc.stride()[:3], o_strides=o.stride()[:3],
+        softmax_scale=float(HD) ** -0.5, num_sms=_num_sms(), stream=0)
+    return o
 
 
 def _full_attn_layer(h, ld, ct, st, fvk, device, eps, cap=None, rank=None):
@@ -479,17 +521,11 @@ def _full_attn_layer(h, ld, ct, st, fvk, device, eps, cap=None, rank=None):
         cap.attn.K_cache[rank, :S].copy_(ko.reshape(S, NKV, HD))
         cap.attn.V_cache[rank, :S].copy_(v.reshape(S, NKV, HD))
 
-    qa = qo.reshape(B, S, NQ, HD).transpose(1, 2)
-    ka = ko.reshape(B, S, NKV, HD).transpose(1, 2).repeat_interleave(NQ // NKV, 1)
-    va = v.transpose(1, 2).repeat_interleave(NQ // NKV, 1)
-    if _ATTN_BF16:
-        # bf16 SDPA (mem-efficient/flash) instead of the fp32/TF32 fmha: ~2x
-        # that bucket, cos preserved (softmax accumulates in fp32 internally).
-        at = F.scaled_dot_product_attention(qa, ka, va, is_causal=True)
-    else:
-        at = F.scaled_dot_product_attention(
-            qa.float(), ka.float(), va.float(), is_causal=True)
-    at = at.transpose(1, 2).reshape(B, S, NQ * HD)
+    # Causal GQA attention via the vendored FA2 kernel (native GQA: KV stays
+    # at NKV=2, no repeat_interleave; layout is FA2's (B,S,H,HD), no transpose).
+    at = _fa2_causal_attn(
+        qo.reshape(1, S, NQ, HD), ko.reshape(1, S, NKV, HD),
+        v.reshape(1, S, NKV, HD), device).reshape(B, S, NQ * HD)
     # output gate: at * sigmoid(gate) via the fused kernel (was torch glue).
     atc = at.reshape(-1).to(torch.bfloat16).contiguous()
     gc = gate.reshape(-1).contiguous()
