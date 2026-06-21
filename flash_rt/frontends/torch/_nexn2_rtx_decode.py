@@ -321,7 +321,7 @@ def _moe_layer_decode(h, ld, fvk, device):
         sfa_stack.data_ptr(), dn_s.data_ptr(), dn_a.data_ptr(), idx.data_ptr(),
         TOPK, n_dn, INTER, INTER // 2, 16,
         n_dn * (INTER // 2), _sf_swz_bytes(n_dn, INTER), s)
-    out = (d_dn.float() * tw_row.unsqueeze(-1)).sum(0, keepdim=True)
+    out = (tw_row.float() @ d_dn.float()).unsqueeze(0)   # (1, n_dn) weighted sum
 
     if ld.get('shared_gate_proj_packed') is None:    # experts-scope: fuse g/u
         if 'shared_gu_fused_w' not in ld:
