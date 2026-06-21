@@ -31,6 +31,11 @@ from flash_rt.frontends.torch._nexn2_rtx_forward import (
 from flash_rt.frontends.torch._nexn2_rtx_nvfp4_weights import _sf_swz_bytes
 from flash_rt.hardware.rtx.attn_backend_nexn2 import RtxFlashAttnBackendNexn2
 
+# Prompt length at/above which the batched prefill wins over the per-token loop
+# (batched has a fixed forward overhead; below this the loop's lower latency
+# wins). See Nexn2DecodeState.batched_prefill.
+_BATCHED_PREFILL_MIN_S = 8
+
 
 def _cs():
     """Current CUDA stream handle. Inside torch.cuda.graph capture this is
@@ -200,6 +205,11 @@ class Nexn2DecodeState:
         # gated separately and validated by E2E cos before enabling.
         self.dense_w4a16 = True
         self.gdn_in_proj_w4a16 = True
+        # Batched prefill (one M=S forward seeding the decode state) instead of
+        # the O(S) per-token loop: ~15x at S=128 and higher cos vs golden. Used
+        # for prompts >= _BATCHED_PREFILL_MIN_S (below that the per-token path's
+        # lower fixed overhead wins). Set False to force the per-token path.
+        self.batched_prefill = True
 
     def reset(self):
         for s in self.lin_state:
@@ -463,8 +473,10 @@ def seed_prefill(state, input_ids, fvk, device):
 
     Returns the last-token logits (1, vocab).
     """
-    state.reset()
     ids = input_ids.view(-1)
+    if state.batched_prefill and ids.shape[0] >= _BATCHED_PREFILL_MIN_S:
+        return seed_prefill_batched(state, input_ids, fvk, device)
+    state.reset()
     last = None
     for pos in range(ids.shape[0]):
         last = decode_step(state, ids[pos:pos + 1], pos, fvk, device)
