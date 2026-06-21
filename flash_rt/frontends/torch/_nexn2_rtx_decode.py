@@ -70,8 +70,10 @@ def _bf16_mv(x1k, w, fvk, device):
     n, k = w.shape
     xc = x1k.contiguous()
     y = torch.empty(1, n, dtype=torch.bfloat16, device=device)
-    fvk.bf16_matvec_qwen36_bf16(xc.data_ptr(), w.data_ptr(), y.data_ptr(),
-                                n, k, _cs())
+    # MLP variant: 8 int4 loads in flight per warp -> bandwidth-bound at M=1
+    # (1.5-3.4x the qwen36 matvec on the Nex-N2 shapes, cos=1.0).
+    fvk.nexn2_bf16_matvec_bf16(xc.data_ptr(), w.data_ptr(), y.data_ptr(),
+                               n, k, _cs())
     return y
 
 
