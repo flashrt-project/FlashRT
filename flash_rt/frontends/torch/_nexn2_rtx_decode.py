@@ -372,10 +372,30 @@ def _moe_layer_decode(h, ld, state, fvk, device):
     indexed by a device top-k id buffer (the same buffer drives a graph)."""
     s = _cs()
     x = h.reshape(1, HID)
-    # Router: top-8 of the raw logits via one kernel (was softmax(256) +
+    # Router + shared gate/up all read the same post-norm activation at K=HID,
+    # so when they take the W4A16 path they fuse into one GEMV (concat weights,
+    # split outputs). Under graph replay each tiny GEMV pays a ~2 us latency
+    # floor, so collapsing three latency-bound launches into one big-N read is a
+    # real saving (the elementwise glue is not -- no launch cost to remove).
+    ne = ld['router_w_t'].shape[0]                          # n_experts (256)
+    fused_rs = (state.dense_w4a16 and ld.get('router_packed') is None
+                and ld.get('shared_gate_proj_packed') is None)
+    if fused_rs:
+        if 'router_shared_fused_w' not in ld:
+            ld['router_shared_fused_w'] = torch.cat(
+                [ld['router_w_t'], ld['shared_gate_proj_w_t'],
+                 ld['shared_up_proj_w_t']], 0).contiguous()
+        rs = _w4a16_mv(x, ld['router_shared_fused_w'], ld,
+                       'router_shared_fused', fvk, device)
+        logit_raw = rs[:, :ne]
+        sg_f = rs[:, ne:ne + INTER]
+        su_f = rs[:, ne + INTER:]
+    else:
+        logit_raw = _dense_mv(x, ld['router_w_t'], ld, 'router', state,
+                              fvk, device)
+    # Router top-8 of the raw logits via one kernel (was softmax(256) +
     # torch.topk bitonic sort). Re-normalising top-8 of softmax(256) equals
     # softmax(top-8 logits), so softmax the 8 returned logits.
-    logit_raw = _dense_mv(x, ld['router_w_t'], ld, 'router', state, fvk, device)
     lr = logit_raw.reshape(-1).contiguous()
     idx = torch.empty(TOPK, dtype=torch.int32, device=device)
     topv = torch.empty(TOPK, dtype=torch.float32, device=device)
@@ -413,7 +433,9 @@ def _moe_layer_decode(h, ld, state, fvk, device):
         INTER, dn_p[0].numel(), dn_s[0].numel(), s)
     out = (tw_row.float() @ d_dn.float()).unsqueeze(0)   # (1, n_dn) weighted sum
 
-    if ld.get('shared_gate_proj_packed') is None:    # experts-scope: fuse g/u
+    if fused_rs:                                      # already projected above
+        sg, su = sg_f, su_f
+    elif ld.get('shared_gate_proj_packed') is None:  # experts-scope: fuse g/u
         if 'shared_gu_fused_w' not in ld:
             ld['shared_gu_fused_w'] = torch.cat(
                 [ld['shared_gate_proj_w_t'], ld['shared_up_proj_w_t']],
