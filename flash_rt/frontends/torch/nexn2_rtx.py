@@ -23,6 +23,40 @@ import time
 
 from flash_rt.models.nexn2.pipeline_rtx import Nexn2Pipeline
 
+# Kernels the kernelized path calls; checked up front so a build without
+# -DFLASHRT_ENABLE_QWEN35MOE=ON fails clearly instead of after loading the 35B
+# checkpoint and crashing mid-forward on a missing symbol.
+_REQUIRED_FVK = (
+    'w16a16_gemm_sm120_bf16', 'moe_blocktile_mma_sm120_bf16',
+    'moe_weighted_sum_sm120_bf16', 'moe_router_topk_sm120_bf16',
+    'qwen36_partial_rope_qk_bf16', 'causal_conv1d_qwen36_bf16',
+    'gdn_recurrent_seq_sm120_bf16',
+)
+
+
+def _require_kernels(fvk) -> None:
+    """Raise a clear RuntimeError if the gated qwen3_5_moe kernels or the FA2
+    module are missing (build was not configured with
+    -DFLASHRT_ENABLE_QWEN35MOE=ON, or flash_rt_fa2 is absent)."""
+    missing = [s for s in _REQUIRED_FVK if not hasattr(fvk, s)]
+    if missing:
+        raise RuntimeError(
+            "Nex-N2 kernelized path needs the qwen3_5_moe SM120 kernels, which "
+            "are absent from flash_rt_kernels (missing: "
+            f"{', '.join(missing)}). Rebuild on an SM120 toolchain with "
+            "-DFLASHRT_ENABLE_QWEN35MOE=ON. See docs/nexn2_usage.md.")
+    try:
+        from flash_rt import flash_rt_fa2 as _fa2
+    except Exception as e:                                  # pragma: no cover
+        raise RuntimeError(
+            "Nex-N2 full attention needs the vendored FA2 module "
+            "(flash_rt_fa2), which failed to import. Build with FA2 enabled "
+            "(ENABLE_FA2, auto-on for SM120).") from e
+    if not hasattr(_fa2, 'fwd_bf16_causal'):                # pragma: no cover
+        raise RuntimeError(
+            "flash_rt_fa2 is present but lacks fwd_bf16_causal; rebuild the "
+            "FA2 module.")
+
 
 class Nexn2TorchFrontendRtx:
     """Nex-N2-mini inference frontend (PyTorch + RTX SM120)."""
@@ -39,15 +73,13 @@ class Nexn2TorchFrontendRtx:
           checkpoint_path: HF-style checkpoint directory.
           device: cuda device string for the kernelized path.
           max_seq: maximum sequence length (KV + scratch sized to this).
-          quant: weight quantization format for the kernelized path.
-            * ``'nvfp4'`` (default): NVFP4 W4A16 for full-attn + MoE GEMM;
-              GDN in_proj kept BF16.
-            * ``'fp8'``: FP8 E4M3 block-128 weights.
-          kernelized: when False (default) load the BF16 HF reference and
-            delegate forward to it (Phase-1 fixture). When True load the
-            NVFP4-quantized weights directly via the fvk loader and run the
-            kernelized forward -- the production seam (fits the RTX 5090;
-            the BF16 reference does not).
+          quant: weight quantization format for the kernelized path. Only
+            ``'nvfp4'`` is implemented (NVFP4 W4A16 for full-attn + MoE GEMM;
+            GDN in_proj kept BF16); any other value raises NotImplementedError.
+          kernelized: when False (default) load the BF16 HF reference model
+            (correctness baseline; the 35B-A3B weights do not fit the 32 GB
+            card). When True load the NVFP4-quantized weights directly via the
+            fvk loader and run the kernel forward/decode -- the production path.
           quant_scope: kernelized-only. ``'experts'`` (recommended) = only
             the routed experts are NVFP4; the dense projections run on the
             deterministic BF16-weight w16a16 GEMM, so prefill cos vs the BF16
@@ -55,8 +87,11 @@ class Nexn2TorchFrontendRtx:
             NVFP4-quantises the non-red-line dense projections (q/k/v/o /
             out_proj / shared) for a smaller footprint at lower cos.
         """
-        if quant not in ('fp8', 'nvfp4'):
-            raise ValueError(f"quant must be 'fp8' or 'nvfp4', got {quant!r}")
+        if quant != 'nvfp4':
+            raise NotImplementedError(
+                f"quant={quant!r} is not implemented; only 'nvfp4' is "
+                "supported (the kernelized path quantizes via "
+                "extract_weights_nexn2_nvfp4).")
 
         self.checkpoint_path = checkpoint_path
         self.device = device
@@ -78,10 +113,10 @@ class Nexn2TorchFrontendRtx:
             self._build_phase1_reference()
 
     def _build_phase1_reference(self) -> None:
-        """Load tokenizer + HF reference model and wrap it in the Pipeline.
+        """Load tokenizer + the BF16 HF reference model (kernelized=False).
 
-        Replaced kernel-by-kernel in Phase 2+; the seams (Pipeline object,
-        tokenizer, prompt ids) stay identical.
+        This is the correctness baseline only; the production path is the
+        kernelized forward/decode (kernelized=True).
         """
         import torch
         from transformers import AutoModelForImageTextToText, AutoTokenizer
@@ -109,6 +144,8 @@ class Nexn2TorchFrontendRtx:
         from flash_rt.frontends.torch._nexn2_rtx_nvfp4_weights import (
             extract_weights_nexn2_nvfp4,
         )
+
+        _require_kernels(fvk)            # fail fast before loading the 35B ckpt
 
         self._tokenizer = AutoTokenizer.from_pretrained(self.checkpoint_path)
         self._fvk = fvk
