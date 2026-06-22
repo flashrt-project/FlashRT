@@ -36,6 +36,26 @@ TTFT history on this path (5090): 621 ms (initial eager) → 121 ms (ViT
 FFN on the fast GEMM + bf16) → 102 ms (FP8 block-128 ViT GEMMs) → **99 ms**
 (FP8 activation quant fused into the producing LayerNorm / GELU).
 
+### TTFT vs resolution (the dominant knob)
+
+The 99 ms above is the **full-resolution** benchmark: the 2172×724 image
+patchifies to 6256 patches → 1564 of the 1581 LLM tokens are vision. The
+patch count (≈ pixels / 16²) sets both the ViT cost and the LLM prefill
+length, so capping resolution cuts both at once. Pass ``max_pixels`` (the
+processor's smart_resize rounds to the patch grid); the description is
+unchanged across this range:
+
+| `max_pixels` | patches | LLM tokens | TTFT |
+|---|---:|---:|---:|
+| none (full) | 6256 | 1581 | 99 ms |
+| 1.0 M | 3888 | 989 | 57 ms |
+| 0.5 M | 1824 | 473 | **30 ms** |
+| 0.25 M | 972 | 260 | 22 ms |
+
+```python
+fe = Qwen3VlTorchFrontendRtx(ckpt, max_pixels=1_000_000)  # or pass --max-pixels
+```
+
 Reproduce:
 
 ```bash

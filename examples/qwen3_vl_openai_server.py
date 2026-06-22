@@ -72,6 +72,9 @@ def main() -> None:
     p.add_argument('--device', default='cuda:0')
     p.add_argument('--max-seq', type=int, default=4096)
     p.add_argument('--max-new-tokens', type=int, default=256)
+    p.add_argument('--max-pixels', type=int, default=None,
+                   help='cap image/video resolution (pixels) to bound TTFT; '
+                        'default keeps full resolution')
     p.add_argument('--model-name', default='qwen3-vl')
     args = p.parse_args()
 
@@ -83,7 +86,8 @@ def main() -> None:
     from flash_rt.frontends.torch.qwen3_vl_rtx import Qwen3VlTorchFrontendRtx
 
     fe = Qwen3VlTorchFrontendRtx(
-        args.checkpoint, device=args.device, max_seq=args.max_seq)
+        args.checkpoint, device=args.device, max_seq=args.max_seq,
+        max_pixels=args.max_pixels)
     lock = asyncio.Lock()
     app = FastAPI(title='FlashRT Qwen3-VL OpenAI-compatible server')
 

@@ -48,6 +48,10 @@ def main() -> None:
     p.add_argument('--max-new-tokens', type=int, default=256)
     p.add_argument('--device', default='cuda:0')
     p.add_argument('--max-seq', type=int, default=4096)
+    p.add_argument('--max-pixels', type=int, default=None,
+                   help='cap image resolution (pixels); the patch count '
+                        'drives TTFT, so e.g. 1000000 roughly halves it. '
+                        'Default: checkpoint full resolution.')
     p.add_argument('--benchmark', type=int, default=0,
                    help='if >0, run that many timed iterations')
     args = p.parse_args()
@@ -57,7 +61,8 @@ def main() -> None:
     from flash_rt.frontends.torch.qwen3_vl_rtx import Qwen3VlTorchFrontendRtx
 
     fe = Qwen3VlTorchFrontendRtx(
-        args.checkpoint, device=args.device, max_seq=args.max_seq)
+        args.checkpoint, device=args.device, max_seq=args.max_seq,
+        max_pixels=args.max_pixels)
     messages = _build_messages(args.image, args.prompt)
 
     text = fe.generate(messages, max_new_tokens=args.max_new_tokens)

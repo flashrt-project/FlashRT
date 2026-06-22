@@ -35,7 +35,7 @@ class Qwen3VlTorchFrontendRtx:
     """
 
     def __init__(self, checkpoint_path: str, *, device: str = 'cuda:0',
-                 max_seq: int = 4096) -> None:
+                 max_seq: int = 4096, max_pixels: int | None = None) -> None:
         from transformers import AutoProcessor
 
         from flash_rt.frontends.torch._qwen3_vl_vision_rtx import (
@@ -72,6 +72,18 @@ class Qwen3VlTorchFrontendRtx:
             max_q_seq=max_seq)
         self.vision = Qwen3VlVisionRtx(checkpoint_path, device=device)
         self.processor = AutoProcessor.from_pretrained(checkpoint_path)
+        # Optional resolution cap. The patch count (≈ pixels / patch_size^2)
+        # sets both the ViT cost and the number of vision tokens the LLM
+        # prefills, so it is the dominant TTFT knob; capping it triggers the
+        # processor's smart_resize (rounds to the patch grid). None keeps the
+        # checkpoint default (full resolution).
+        self.max_pixels = max_pixels
+        if max_pixels is not None:
+            for proc in (getattr(self.processor, 'image_processor', None),
+                         getattr(self.processor, 'video_processor', None)):
+                size = getattr(proc, 'size', None)
+                if isinstance(size, dict) and 'longest_edge' in size:
+                    size['longest_edge'] = int(max_pixels)
 
         self._prompt: dict[str, Any] | None = None
         # cache-slot -> captured decode CUDA Graph (rope baked at the
