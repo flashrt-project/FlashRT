@@ -1,10 +1,11 @@
-# Qwen3-VL-8B on RTX 5090 (NVFP4 language stack + BF16 ViT)
+# Qwen3-VL-8B on RTX 5090 (NVFP4 language stack + FP8 ViT)
 
 FlashRT multimodal inference path for
 [Qwen3-VL-8B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct)
 on a single RTX 5090 (sm_120, 32 GB): the dense-Qwen3 language stack runs
 NVFP4 W4A4 (reusing the [Qwen3-8B path](qwen3_8b_nvfp4.md) unchanged) and
-the SigLIP-style ViT tower runs hand-controlled BF16 kernels.
+the SigLIP-style ViT tower runs hand-controlled kernels (FP8 block-128
+W8A8 GEMMs, BF16 attention).
 
 For the framework intro see [`../README.md`](../README.md); for the
 text-only Qwen3-8B path see [`qwen3_8b_nvfp4.md`](qwen3_8b_nvfp4.md).
@@ -20,14 +21,19 @@ image + text prompt, 1581 LLM tokens (1564 vision + 17 text), FlashRT.png
 
 | Metric | HF SDPA (bf16) | FlashRT |
 |---|---:|---:|
-| TTFT (prefill, image+text) | 206 ms | **121 ms** |
+| TTFT (prefill, image+text) | 206 ms | **102 ms** |
 | Decode (warm CUDA Graph)   | ~48 tok/s | **143 tok/s** |
 
-The TTFT is dominated by the ViT tower (~81 ms, FA2-bound at the
-6256-patch full-attention) plus the NVFP4 language prefill (~39 ms).
-Decode reuses the Qwen3-8B NVFP4 W4A4 + CUDA-Graph path and lands at the
-same ~143 tok/s ceiling; the MRoPE position continues past the image
-while the KV-cache slot advances from the image-compressed prompt length.
+TTFT is dominated by the ViT tower (~63 ms) plus the NVFP4 language
+prefill (~39 ms). After the FP8 GEMMs, the two remaining ViT costs are
+the full-attention over 6256 patches (~31 ms, ~75% of bf16 roofline at
+head_dim 72) and the FP8 GEMMs (~20 ms); both are compute-bound. Decode
+reuses the Qwen3-8B NVFP4 W4A4 + CUDA-Graph path and lands at the same
+~143 tok/s ceiling; the MRoPE position continues past the image while the
+KV-cache slot advances from the image-compressed prompt length.
+
+TTFT history on this path (5090): 621 ms (initial eager) → 121 ms (ViT
+FFN on the fast GEMM + bf16) → **102 ms** (FP8 block-128 ViT GEMMs).
 
 Reproduce:
 
@@ -114,13 +120,15 @@ Validated against the stock HF bf16 reference on an image+text prompt:
 |---|---|
 | ViT block (cumulative, layer 8) cosine | 0.9998 |
 | DeepStack features cosine | 0.9999 / 0.9986 / 0.9967 |
-| image_embeds (merger) cosine | 0.984 |
+| image_embeds (merger) cosine | 0.984 bf16 / 0.971 FP8 |
 | Next-token argmax vs HF | match |
 | End-to-end image description | correct |
 
-The image_embeds 0.984 is a single massive-activation channel in the last
-ViT block (a known bf16 sensitivity); it does not change the generated
-token sequence.
+A single massive-activation channel in the last ViT blocks makes
+image_embeds sensitive (a known bf16 effect, amplified by FP8): patch
+embed, the mergers and the first 3 blocks stay bf16 to hold the cosine at
+0.971. It does not change the generated token sequence (argmax matches HF,
+the description is unchanged).
 
 ---
 
@@ -128,6 +136,9 @@ token sequence.
 
 - **lm_head stays BF16** (same as the Qwen3-8B path).
 - **Image inputs.** Video and multi-image are not wired in this path.
-- **Vision is BF16.** The ViT GEMMs (~52% of TTFT) are the next lever; an
-  FP8 vision tower would roughly halve the GEMM time.
+- **Next TTFT levers** (both need new kernels): an FP8 ViT attention
+  (Sage/FA on sm_120 only ships head_dim 128/256, so head_dim 72 would
+  need padding), and an FP8 language prefill (the stack is NVFP4, whose
+  large-M GEMM dequantizes to bf16 compute). Fusing the FP8 activation
+  quant into the preceding LayerNorm would also remove ~4 ms.
 - **No KV-cache offload**; prompt + generation must fit in `max_seq`.
