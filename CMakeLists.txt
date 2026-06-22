@@ -152,6 +152,11 @@ option(FLASHRT_ENABLE_MOTUS
 # Blackwell build to get the Nex-N2 / Qwen3.6-35B-A3B path.
 option(FLASHRT_ENABLE_QWEN35MOE
        "Build qwen3_5_moe (Nex-N2 / Qwen3.6-35B-A3B) RTX SM120 kernels" OFF)
+# Qwen3-VL adds a handful of kernels (rotate_half RoPE, ...) that the shared
+# binary does not yet need. Built into a SEPARATE flash_rt_qwen3_vl_kernels
+# module so flash_rt_kernels.so stays stable; OFF by default.
+option(FLASHRT_BUILD_QWEN3_VL
+       "Build Qwen3-VL kernels into a separate flash_rt_qwen3_vl_kernels module" OFF)
 if(FLASHRT_ENABLE_MOTUS)
   message(STATUS "Motus beta kernels: ENABLED")
 else()
@@ -869,6 +874,35 @@ if(ENABLE_FA2)
   target_link_libraries(flash_rt_fa2 PRIVATE CUDA::cudart)
   install(TARGETS flash_rt_fa2 DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
   message(STATUS "FA2 pybind module: flash_rt_fa2 (separate .so)")
+endif()
+
+# ── Qwen3-VL kernels (separate module, additive) ──
+# Independent pybind module so the shared flash_rt_kernels.so is not rebuilt
+# for this model. Caller side:
+#     from flash_rt import flash_rt_qwen3_vl_kernels as vlk
+#     vlk.rope_neox_qk_bf16(...)
+if(FLASHRT_BUILD_QWEN3_VL)
+  pybind11_add_module(flash_rt_qwen3_vl_kernels
+    csrc/qwen3_vl_bindings.cpp
+    csrc/kernels/rope_neox_qk_bf16.cu)
+  set_target_properties(flash_rt_qwen3_vl_kernels PROPERTIES
+    CUDA_STANDARD 17
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+  target_include_directories(flash_rt_qwen3_vl_kernels PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels)
+  target_compile_options(flash_rt_qwen3_vl_kernels PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3
+      -U__CUDA_NO_BFLOAT16_OPERATORS__
+      -U__CUDA_NO_BFLOAT162_OPERATORS__
+      ${GPU_GENCODE}
+    >)
+  target_link_libraries(flash_rt_qwen3_vl_kernels PRIVATE CUDA::cudart)
+  install(TARGETS flash_rt_qwen3_vl_kernels
+    DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+  message(STATUS "Qwen3-VL pybind module: flash_rt_qwen3_vl_kernels (separate .so)")
 endif()
 
 # ── Qwen3.6 FlashInfer XQA FP8-KV (SM120/SM121 + SM110/Thor) ──
