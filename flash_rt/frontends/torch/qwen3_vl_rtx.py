@@ -59,6 +59,11 @@ class Qwen3VlTorchFrontendRtx:
         self._rope_theta = float(cfg['rope_theta'])
         self._head_dim = int(cfg['head_dim'])
         self._mrope_section = tuple(cfg['rope_scaling']['mrope_section'])
+        eos = cfg.get('eos_token_id')
+        if eos is None:
+            self._eos_token_ids: set = set()
+        else:
+            self._eos_token_ids = set(eos if isinstance(eos, list) else [eos])
 
         # Language core (reused unchanged) + ViT tower.
         self.llm = Qwen3TorchFrontendRtx(
@@ -116,6 +121,7 @@ class Qwen3VlTorchFrontendRtx:
             'img_start': img_start, 'img_end': img_end,
             'mcos': mcos, 'msin': msin, 'vcos': vcos, 'vsin': vsin,
             'pos_embeds': pos_embeds, 'S': S,
+            'mrope_max': int(pos_ids.max()),
         }
 
     # ── Forward ──
@@ -135,6 +141,7 @@ class Qwen3VlTorchFrontendRtx:
             raise RuntimeError('call set_prompt() before prefill()')
         p = self._prompt
         llm = self.llm
+        llm.reset_state()
         stream = torch.cuda.current_stream().cuda_stream
         hidden = llm._cfg['hidden_size']
         vocab = llm._cfg['vocab_size']
@@ -178,3 +185,35 @@ class Qwen3VlTorchFrontendRtx:
             logits.data_ptr(), 1, vocab, hidden, stream)
         torch.cuda.synchronize()
         return logits
+
+    def generate(self, messages: list, *, max_new_tokens: int = 256) -> str:
+        """Greedy multimodal generation. Returns the decoded text.
+
+        Runs the multimodal prefill (which fills the KV cache), then the
+        reused Qwen3 NVFP4 decode loop. After the image the MRoPE position
+        is scalar, so the decode RoPE position simply continues from the
+        prompt's max position while the KV-cache slot advances from the
+        (image-compressed) prompt length.
+        """
+        self.set_prompt(messages)
+        logits = self.prefill()
+        p = self._prompt
+        llm = self.llm
+        cache_pos = p['S']
+        rope_pos = p['mrope_max'] + 1
+
+        tok = int(logits[0].float().argmax())
+        out_ids = [tok]
+        for i in range(max_new_tokens - 1):
+            if tok in self._eos_token_ids:
+                break
+            cos, sin = llm._rope_cos_sin(rope_pos + i)
+            logits = llm.forward_own_decode_nvfp4(tok, cos, sin, cache_pos + i)
+            tok = int(logits[0].float().argmax())
+            out_ids.append(tok)
+
+        eos = [t for t in out_ids if t in self._eos_token_ids]
+        if eos:
+            out_ids = out_ids[:out_ids.index(eos[0])]
+        return self.processor.tokenizer.decode(
+            out_ids, skip_special_tokens=True)
