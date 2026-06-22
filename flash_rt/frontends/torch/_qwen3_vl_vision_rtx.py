@@ -197,6 +197,45 @@ class Qwen3VlVisionRtx:
             M, D, self.ln_eps, stream)
         return y
 
+    def _gemm_fp8(self, x_fp8, x_scale, lin, M, N, K, stream):
+        """FP8 block-128 GEMM from an already-quantized activation.
+
+        ``x_fp8`` / ``x_scale`` are the FP8 e4m3 values and their per-token,
+        per-128-K-block descale, as produced by the fused norm/gelu kernels.
+        Same epilogue (bf16 out, optional bias) as the FP8 branch of
+        ``_gemm``; it just skips the internal quantization step.
+        """
+        import torch
+        w8, ws, bias = lin
+        y = torch.empty(M, N, dtype=torch.bfloat16, device=self.device)
+        self._fvk.fp8_block128_gemm_cutlass_sm120_bf16out(
+            x_fp8.data_ptr(), w8.data_ptr(), y.data_ptr(), M, N, K,
+            x_scale.data_ptr(), ws.data_ptr(), stream)
+        if bias is not None:
+            self._fvk.add_bias_bf16(y.data_ptr(), bias.data_ptr(), M, N, stream)
+        return y
+
+    def _layer_norm_to_fp8(self, x, w, b, M, D, stream):
+        """LayerNorm fused with the FP8 block-128 activation quant (one
+        kernel, no bf16 round-trip). Returns (fp8 values, per-block scale)
+        ready for ``_gemm_fp8``."""
+        import torch
+        xf = torch.empty(M, D, dtype=torch.float8_e4m3fn, device=self.device)
+        xs = torch.empty(M, D // 128, dtype=torch.float32, device=self.device)
+        self._vlk.layer_norm_to_fp8_block128_bf16(
+            x.data_ptr(), w.data_ptr(), b.data_ptr(), xf.data_ptr(),
+            xs.data_ptr(), M, D, self.ln_eps, stream)
+        return xf, xs
+
+    def _gelu_to_fp8(self, x, M, D, stream):
+        """GELU-tanh fused with the FP8 block-128 activation quant."""
+        import torch
+        xf = torch.empty(M, D, dtype=torch.float8_e4m3fn, device=self.device)
+        xs = torch.empty(M, D // 128, dtype=torch.float32, device=self.device)
+        self._vlk.gelu_tanh_to_fp8_block128_bf16(
+            x.data_ptr(), xf.data_ptr(), xs.data_ptr(), M, D, stream)
+        return xf, xs
+
     def _merger_forward(self, h, mg, stream):
         merge = self.spatial_merge_size * self.spatial_merge_size
         S = h.shape[0]
@@ -256,9 +295,19 @@ class Qwen3VlVisionRtx:
 
         deepstack: list = [None] * len(self.deepstack_indexes)
         for i, blk in enumerate(self.blocks):
-            xn = self._layer_norm(
-                h, blk['norm1_w'], blk['norm1_b'], S, H, stream)
-            qkv = self._gemm(xn, blk['qkv'], S, 3 * H, H, stream)
+            # FP8 blocks fuse the activation quant into the producing
+            # LayerNorm / GELU (one kernel, no bf16 round-trip); bf16 blocks
+            # (the first few, protecting the massive-activation channel) keep
+            # the plain norm + w16a16 path.
+            fp8 = blk['qkv'][0] is not None
+            if fp8:
+                xf, xs = self._layer_norm_to_fp8(
+                    h, blk['norm1_w'], blk['norm1_b'], S, H, stream)
+                qkv = self._gemm_fp8(xf, xs, blk['qkv'], S, 3 * H, H, stream)
+            else:
+                xn = self._layer_norm(
+                    h, blk['norm1_w'], blk['norm1_b'], S, H, stream)
+                qkv = self._gemm(xn, blk['qkv'], S, 3 * H, H, stream)
             fvk.qkv_split(qkv.data_ptr(), q.data_ptr(), k.data_ptr(),
                           v.data_ptr(), S, H, H, H, stream)
             vlk.rope_neox_qk_bf16(
@@ -279,15 +328,24 @@ class Qwen3VlVisionRtx:
                 v_strides=(vv.stride(0), vv.stride(1), vv.stride(2)),
                 o_strides=(o.stride(0), o.stride(1), o.stride(2)),
                 softmax_scale=scale, num_sms=self._num_sms, stream=stream)
+            # proj input is the attention output (not a norm/gelu), so its
+            # quant cannot be fused upstream; keep the internal quant in _gemm.
             attn = self._gemm(o.view(S, H), blk['proj'], S, H, H, stream)
             fvk.residual_add(h.data_ptr(), attn.data_ptr(), S * H, stream)
 
-            xn2 = self._layer_norm(
-                h, blk['norm2_w'], blk['norm2_b'], S, H, stream)
             inter = self.intermediate
-            f1 = self._gemm(xn2, blk['fc1'], S, inter, H, stream)
-            fvk.gelu_inplace(f1.data_ptr(), S * inter, stream)
-            f2 = self._gemm(f1, blk['fc2'], S, H, inter, stream)
+            if fp8:
+                xf2, xs2 = self._layer_norm_to_fp8(
+                    h, blk['norm2_w'], blk['norm2_b'], S, H, stream)
+                f1 = self._gemm_fp8(xf2, xs2, blk['fc1'], S, inter, H, stream)
+                gf, gs = self._gelu_to_fp8(f1, S, inter, stream)
+                f2 = self._gemm_fp8(gf, gs, blk['fc2'], S, H, inter, stream)
+            else:
+                xn2 = self._layer_norm(
+                    h, blk['norm2_w'], blk['norm2_b'], S, H, stream)
+                f1 = self._gemm(xn2, blk['fc1'], S, inter, H, stream)
+                fvk.gelu_inplace(f1.data_ptr(), S * inter, stream)
+                f2 = self._gemm(f1, blk['fc2'], S, H, inter, stream)
             fvk.residual_add(h.data_ptr(), f2.data_ptr(), S * H, stream)
 
             if i in self.deepstack_indexes:

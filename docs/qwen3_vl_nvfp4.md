@@ -21,10 +21,10 @@ image + text prompt, 1581 LLM tokens (1564 vision + 17 text), FlashRT.png
 
 | Metric | HF SDPA (bf16) | FlashRT |
 |---|---:|---:|
-| TTFT (prefill, image+text) | 206 ms | **102 ms** |
+| TTFT (prefill, image+text) | 206 ms | **99 ms** |
 | Decode (warm CUDA Graph)   | ~48 tok/s | **143 tok/s** |
 
-TTFT is dominated by the ViT tower (~63 ms) plus the NVFP4 language
+TTFT is dominated by the ViT tower (~60 ms) plus the NVFP4 language
 prefill (~39 ms). After the FP8 GEMMs, the two remaining ViT costs are
 the full-attention over 6256 patches (~31 ms, ~75% of bf16 roofline at
 head_dim 72) and the FP8 GEMMs (~20 ms); both are compute-bound. Decode
@@ -33,7 +33,8 @@ reuses the Qwen3-8B NVFP4 W4A4 + CUDA-Graph path and lands at the same
 KV-cache slot advances from the image-compressed prompt length.
 
 TTFT history on this path (5090): 621 ms (initial eager) → 121 ms (ViT
-FFN on the fast GEMM + bf16) → **102 ms** (FP8 block-128 ViT GEMMs).
+FFN on the fast GEMM + bf16) → 102 ms (FP8 block-128 ViT GEMMs) → **99 ms**
+(FP8 activation quant fused into the producing LayerNorm / GELU).
 
 Reproduce:
 
@@ -106,9 +107,13 @@ intermediate (4304) is zero-padded to 4352 at load so every FFN GEMM uses
 the fast `w16a16` kernel (the unpadded fc2 fell back to an M=1-tuned
 matmul that dominated the tower at ~19 ms/call).
 
-New kernel (general, in the separate `flash_rt_qwen3_vl_kernels` module):
+New kernels (general, in the separate `flash_rt_qwen3_vl_kernels` module):
 `rope_neox_qk_bf16`, a rotate_half RoPE for Q/K not covered by the
-interleaved `rope_apply` or the norm-fused Qwen3 RoPE kernels.
+interleaved `rope_apply` or the norm-fused Qwen3 RoPE kernels; and
+`layer_norm_to_fp8_block128_bf16` / `gelu_tanh_to_fp8_block128_bf16`,
+which fuse the per-token / per-128-K-block FP8 activation quant into the
+producing LayerNorm / GELU so the bf16 activation never round-trips to
+HBM before the FP8 GEMM (≈2× over the unfused norm/gelu + quant chain).
 
 ---
 
@@ -139,6 +144,5 @@ the description is unchanged).
 - **Next TTFT levers** (both need new kernels): an FP8 ViT attention
   (Sage/FA on sm_120 only ships head_dim 128/256, so head_dim 72 would
   need padding), and an FP8 language prefill (the stack is NVFP4, whose
-  large-M GEMM dequantizes to bf16 compute). Fusing the FP8 activation
-  quant into the preceding LayerNorm would also remove ~4 ms.
+  large-M GEMM dequantizes to bf16 compute).
 - **No KV-cache offload**; prompt + generation must fit in `max_seq`.

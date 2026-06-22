@@ -22,6 +22,7 @@
 #include <cstdint>
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 namespace py = pybind11;
@@ -33,6 +34,15 @@ void rope_neox_qk_bf16(
     const __nv_bfloat16* cos_tab, const __nv_bfloat16* sin_tab,
     __nv_bfloat16* q_out, __nv_bfloat16* k_out,
     int rows, int q_heads, int k_heads, int head_dim, cudaStream_t stream);
+
+void layer_norm_to_fp8_block128_bf16(
+    const __nv_bfloat16* x, const __nv_bfloat16* gamma,
+    const __nv_bfloat16* beta, __nv_fp8_e4m3* out, float* scale,
+    int rows, int dim, float eps, cudaStream_t stream);
+
+void gelu_tanh_to_fp8_block128_bf16(
+    const __nv_bfloat16* x, __nv_fp8_e4m3* out, float* scale,
+    int rows, int dim, cudaStream_t stream);
 }  // namespace kernels
 }  // namespace flash_rt
 
@@ -65,4 +75,30 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
         py::arg("q_out"), py::arg("k_out"), py::arg("rows"),
         py::arg("q_heads"), py::arg("k_heads"), py::arg("head_dim"),
         py::arg("stream") = 0);
+
+    m.def(
+        "layer_norm_to_fp8_block128_bf16",
+        [](uintptr_t x, uintptr_t gamma, uintptr_t beta, uintptr_t out,
+           uintptr_t scale, int rows, int dim, float eps, uintptr_t stream) {
+            flash_rt::kernels::layer_norm_to_fp8_block128_bf16(
+                as_ptr<const __nv_bfloat16>(x),
+                as_ptr<const __nv_bfloat16>(gamma),
+                as_ptr<const __nv_bfloat16>(beta),
+                as_ptr<__nv_fp8_e4m3>(out), as_ptr<float>(scale),
+                rows, dim, eps, to_stream(stream));
+        },
+        py::arg("x"), py::arg("gamma"), py::arg("beta"), py::arg("out"),
+        py::arg("scale"), py::arg("rows"), py::arg("dim"), py::arg("eps"),
+        py::arg("stream") = 0);
+
+    m.def(
+        "gelu_tanh_to_fp8_block128_bf16",
+        [](uintptr_t x, uintptr_t out, uintptr_t scale, int rows, int dim,
+           uintptr_t stream) {
+            flash_rt::kernels::gelu_tanh_to_fp8_block128_bf16(
+                as_ptr<const __nv_bfloat16>(x), as_ptr<__nv_fp8_e4m3>(out),
+                as_ptr<float>(scale), rows, dim, to_stream(stream));
+        },
+        py::arg("x"), py::arg("out"), py::arg("scale"), py::arg("rows"),
+        py::arg("dim"), py::arg("stream") = 0);
 }

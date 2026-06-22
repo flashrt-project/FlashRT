@@ -884,7 +884,8 @@ endif()
 if(FLASHRT_BUILD_QWEN3_VL)
   pybind11_add_module(flash_rt_qwen3_vl_kernels
     csrc/qwen3_vl_bindings.cpp
-    csrc/kernels/rope_neox_qk_bf16.cu)
+    csrc/kernels/rope_neox_qk_bf16.cu
+    csrc/kernels/norm_act_to_fp8_block128.cu)
   set_target_properties(flash_rt_qwen3_vl_kernels PROPERTIES
     CUDA_STANDARD 17
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
