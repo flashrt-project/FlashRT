@@ -39,6 +39,9 @@ class Qwen3VlVisionRtx:
         self._fvk = None
         self._fa2 = None
         self._vlk = None
+        # patch-count -> (graph, static_inputs, captured_outputs)
+        self._graphs: dict = {}
+        self._graph_stream = None
 
         cfg = config if config is not None else _read_vision_config(
             checkpoint_path)
@@ -48,6 +51,7 @@ class Qwen3VlVisionRtx:
         self.head_dim = self.hidden // self.num_heads
         self.spatial_merge_size = int(cfg['spatial_merge_size'])
         self.out_hidden = int(cfg['out_hidden_size'])
+        self.intermediate = int(cfg['intermediate_size'])
         self.deepstack_indexes = tuple(cfg['deepstack_visual_indexes'])
         self.ln_eps = float(cfg.get('layer_norm_eps', 1e-6))
 
@@ -74,6 +78,15 @@ class Qwen3VlVisionRtx:
         self.patch_proj_b = _w(p + 'patch_embed.proj.bias')
         self.pos_embed = _w(p + 'pos_embed.weight')
 
+        # The FFN GEMMs use w16a16 (K % 128 == 0); the ViT intermediate
+        # (4304) is not 128-aligned, so the intermediate is zero-padded to
+        # the next multiple of 128 at load time. Padded fc1 rows / bias and
+        # fc2 columns are zero, so GELU(0)=0 keeps the pad inert and the
+        # result is unchanged — but fc2 now runs on the fast w16a16 kernel
+        # instead of the M=1-tuned arbitrary-K matmul (~56x faster at S>>1).
+        self.intermediate_padded = (
+            (self.intermediate + 127) // 128) * 128
+
         self.blocks: list[dict] = []
         for i in range(self.depth):
             bp = f'{p}blocks.{i}.'
@@ -86,9 +99,12 @@ class Qwen3VlVisionRtx:
                 'qkv_b': _w(bp + 'attn.qkv.bias'),
                 'proj_w': _w(bp + 'attn.proj.weight'),
                 'proj_b': _w(bp + 'attn.proj.bias'),
-                'fc1_w': _w(bp + 'mlp.linear_fc1.weight'),
-                'fc1_b': _w(bp + 'mlp.linear_fc1.bias'),
-                'fc2_w': _w(bp + 'mlp.linear_fc2.weight'),
+                'fc1_w': _pad_rows(_w(bp + 'mlp.linear_fc1.weight'),
+                                   self.intermediate_padded),
+                'fc1_b': _pad_rows(_w(bp + 'mlp.linear_fc1.bias'),
+                                   self.intermediate_padded),
+                'fc2_w': _pad_cols(_w(bp + 'mlp.linear_fc2.weight'),
+                                   self.intermediate_padded),
                 'fc2_b': _w(bp + 'mlp.linear_fc2.bias'),
             })
         self.merger = _load_merger(_w, p + 'merger.')
@@ -243,6 +259,70 @@ class Qwen3VlVisionRtx:
 
         image_embeds = self._merger_forward(h, self.merger, stream)
         return image_embeds, deepstack
+
+    def forward_graph(self, pixel_values, pos_embeds, rope_cos, rope_sin):
+        """CUDA-Graph-accelerated ``forward``.
+
+        The tower is launch-bound (hundreds of small kernels), so a
+        captured graph removes nearly all launch overhead. One graph per
+        distinct patch count; inputs are staged into fixed buffers and
+        the graph is replayed. Returns the captured output tensors (valid
+        until the next replay at the same patch count) — clone if the
+        caller needs to keep them across calls.
+        """
+        import torch
+
+        self._kernels()
+        if self._graph_stream is None:
+            self._graph_stream = torch.cuda.Stream(device=self.device)
+        S = pixel_values.shape[0]
+        g = self._graphs.get(S)
+        if g is None:
+            si = {
+                'pixel': pixel_values.clone(),
+                'pos': pos_embeds.clone(),
+                'cos': rope_cos.clone(),
+                'sin': rope_sin.clone(),
+            }
+            gs = self._graph_stream
+            gs.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(gs), torch.no_grad():
+                for _ in range(2):
+                    self.forward(si['pixel'], si['pos'], si['cos'], si['sin'])
+            gs.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=gs), torch.no_grad():
+                out = self.forward(
+                    si['pixel'], si['pos'], si['cos'], si['sin'])
+            gs.synchronize()
+            torch.cuda.current_stream().wait_stream(gs)
+            g = (graph, si, out)
+            self._graphs[S] = g
+        graph, si, out = g
+        si['pixel'].copy_(pixel_values)
+        si['pos'].copy_(pos_embeds)
+        si['cos'].copy_(rope_cos)
+        si['sin'].copy_(rope_sin)
+        graph.replay()
+        return out
+
+
+def _pad_rows(t, n_rows: int):
+    import torch
+    if t.shape[0] >= n_rows:
+        return t
+    pad = torch.zeros(n_rows - t.shape[0], *t.shape[1:],
+                      dtype=t.dtype, device=t.device)
+    return torch.cat([t, pad], dim=0).contiguous()
+
+
+def _pad_cols(t, n_cols: int):
+    import torch
+    if t.shape[-1] >= n_cols:
+        return t
+    pad = torch.zeros(*t.shape[:-1], n_cols - t.shape[-1],
+                      dtype=t.dtype, device=t.device)
+    return torch.cat([t, pad], dim=-1).contiguous()
 
 
 def _load_merger(load_fn, prefix: str) -> dict:
