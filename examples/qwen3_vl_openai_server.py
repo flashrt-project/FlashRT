@@ -110,9 +110,12 @@ def main() -> None:
             fe_messages = _to_frontend_messages(messages)
         except Exception as e:  # noqa: BLE001 - surface a clean 400
             raise HTTPException(400, f'bad message content: {e}')
-        async with lock:
-            text = await asyncio.to_thread(
-                fe.generate, fe_messages, max_new_tokens=max_new)
+        try:
+            async with lock:
+                text = await asyncio.to_thread(
+                    fe.generate, fe_messages, max_new_tokens=max_new)
+        except ValueError as e:  # e.g. text-only prompt to the VL frontend
+            raise HTTPException(400, str(e))
         return {
             'id': f'chatcmpl-{int(time.time()*1000)}',
             'object': 'chat.completion',

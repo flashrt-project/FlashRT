@@ -24,6 +24,69 @@ from __future__ import annotations
 import torch
 
 
+def vision_segments(input_ids, image_grid_thw=None, video_grid_thw=None, *,
+                    image_token_id, video_token_id, spatial_merge_size):
+    """Walk the image/video token runs of a sequence in order.
+
+    Videos are split into per-frame rows (t -> 1) so each frame is one
+    segment. Returns a list of dicts, one per vision segment, in sequence
+    order:
+
+      {'span': (start, end),     # token indices of the run
+       'grid': (t, h, w),        # per-frame grid (t == 1 for video frames)
+       'kind': 'image'|'video',
+       'kind_index': k,          # index within that modality's pixel tensor
+       'patches': t*h*w}         # patches the ViT consumes for this segment
+
+    Raises ValueError if there is no vision segment (text-only prompt) or a
+    run length does not match its grid (t*(h/m)*(w/m)).
+    """
+    if video_grid_thw is not None and len(video_grid_thw):
+        vg = torch.as_tensor(video_grid_thw).clone()
+        vg = torch.repeat_interleave(vg, vg[:, 0], dim=0)
+        vg[:, 0] = 1
+    else:
+        vg = None
+
+    ids = input_ids.tolist() if hasattr(input_ids, 'tolist') else list(
+        input_ids)
+    n = len(ids)
+    m = spatial_merge_size
+    segs: list = []
+    im = vi = 0
+    i = 0
+    while i < n:
+        tok = ids[i]
+        if tok not in (image_token_id, video_token_id):
+            i += 1
+            continue
+        j = i
+        while j < n and ids[j] == tok:
+            j += 1
+        if tok == image_token_id:
+            t, h, w = (int(x) for x in image_grid_thw[im])
+            kind, kind_index = 'image', im
+            im += 1
+        else:
+            t, h, w = (int(x) for x in vg[vi])
+            kind, kind_index = 'video', vi
+            vi += 1
+        if j - i != t * (h // m) * (w // m):
+            raise ValueError(
+                f'vision-token span [{i},{j}) does not match its grid '
+                f'{(t, h, w)} (expected {t * (h // m) * (w // m)} tokens)')
+        segs.append({'span': (i, j), 'grid': (t, h, w), 'kind': kind,
+                     'kind_index': kind_index, 'patches': t * h * w})
+        i = j
+
+    if not segs:
+        raise ValueError(
+            'Qwen3-VL frontend requires at least one image or video '
+            'segment; for text-only prompts use the Qwen3 text path '
+            '(Qwen3TorchFrontendRtx).')
+    return segs
+
+
 def mrope_position_ids(input_ids, image_grid_thw=None, video_grid_thw=None, *,
                        image_token_id, video_token_id, vision_start_token_id,
                        spatial_merge_size):
@@ -101,7 +164,6 @@ def mrope_cos_sin(position_ids, *, head_dim, rope_theta, mrope_section,
     Returns:
       (cos, sin) each (S, head_dim/2) on ``device`` in ``dtype``.
     """
-    half = head_dim // 2
     inv_freq = 1.0 / (rope_theta ** (
         torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
     pos = position_ids.to(torch.float32)
