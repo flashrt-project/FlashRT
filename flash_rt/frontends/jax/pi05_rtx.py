@@ -48,6 +48,7 @@ from flash_rt.frontends.torch.pi05_rtx import (
     MAX_PROMPT_LEN_DEFAULT,
     Pi05TorchFrontendRtx,
     _interleave_qk,
+    _resolve_effective_hardware,
     _select_fp8_layout,
 )
 from flash_rt.core.utils.hardware import supports_fp8
@@ -477,6 +478,7 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
                 f"vision_num_layers must be in [1, {VIS_L}], "
                 f"got {self._vision_num_layers}")
         self.use_fp8 = bool(use_fp8)
+        self.hardware = _resolve_effective_hardware(hardware)
         self.fp8_layout = _select_fp8_layout(hardware, fp8_layout)
 
         self.latency_records: list[float] = []

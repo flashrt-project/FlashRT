@@ -40,6 +40,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import math
+import os
 
 import numpy as np
 import ml_dtypes
@@ -48,6 +49,28 @@ from flash_rt.core.cuda_buffer import CudaBuffer
 from flash_rt.core.cuda_graph import CUDAGraph
 
 logger = logging.getLogger(__name__)
+
+
+def _fp8_nt_autotune_enabled(hardware: str | None, fp8_layout: str) -> bool:
+    """Whether to run cuBLASLt top-N autotune for FP8 NT GEMMs.
+
+    ``auto`` keeps FP8 inference enabled but avoids benchmarking non-top-1
+    FP8 NT candidates on Ada / SM89, where a bad cuBLASLt candidate can poison
+    the CUDA context with an illegal memory access. The default heuristic
+    algorithm selected when the GEMM descriptor is created remains active.
+    """
+    policy = os.environ.get("FLASHRT_FP8_NT_AUTOTUNE", "auto").strip().lower()
+    if policy in ("1", "true", "on", "force"):
+        return True
+    if policy in ("0", "false", "off", "safe", "skip"):
+        return False
+    if policy != "auto":
+        logger.warning(
+            "Unknown FLASHRT_FP8_NT_AUTOTUNE=%r; using auto policy", policy)
+
+    if fp8_layout == "nk" and hardware in ("rtx_sm89", "sm89", "ada"):
+        return False
+    return True
 
 
 # Fixed Pi0.5 model dimensions
@@ -221,6 +244,15 @@ class Pi05Pipeline:
         self.fp8_layout = weights.get("fp8_layout", "kn")
         if self.fp8_layout not in ("kn", "nk"):
             raise ValueError(f"unsupported FP8 layout: {self.fp8_layout!r}")
+        self.hardware = weights.get("hardware")
+        self._autotune_fp8_nt = _fp8_nt_autotune_enabled(
+            self.hardware, self.fp8_layout)
+        if self.fp8_layout == "nk" and not self._autotune_fp8_nt:
+            logger.info(
+                "Skipping FP8 NT top-N autotune for hardware=%s; keeping "
+                "cuBLASLt heuristic top-1 algorithm. Set "
+                "FLASHRT_FP8_NT_AUTOTUNE=force to override.",
+                self.hardware or "unknown")
 
         # Derived sizes
         # vision_seq: full SigLIP token count (pre-pooling) — used for SigLIP buffers
@@ -525,6 +557,8 @@ class Pi05Pipeline:
                              act_scale_ptr: int, weight_scale_ptr: int) -> None:
         """Autotune the FP8 GEMM for the selected weight layout."""
         if self.fp8_layout == "nk":
+            if not getattr(self, "_autotune_fp8_nt", True):
+                return
             self.gemm.autotune_fp8_nt_dev(
                 act_fp8_ptr, weight_fp8_ptr, out_bf16_ptr,
                 M, N, K, act_scale_ptr, weight_scale_ptr)

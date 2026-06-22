@@ -33,6 +33,7 @@ def _load_pi05_rtx_symbols():
             Pi05Pipeline,
             VIS_D,
             VIS_H,
+            _fp8_nt_autotune_enabled,
         )
     except (ImportError, OSError) as exc:
         pytest.skip(f"Pi05 RTX imports unavailable: {exc}")
@@ -47,6 +48,7 @@ def _load_pi05_rtx_symbols():
         Pi05Pipeline=Pi05Pipeline,
         VIS_D=VIS_D,
         VIS_H=VIS_H,
+        _fp8_nt_autotune_enabled=_fp8_nt_autotune_enabled,
     )
 
 
@@ -266,6 +268,41 @@ def test_fp8_nk_layout_dispatches_to_nt_entrypoints():
     pipe.gemm.autotune_fp8_nt_dev.assert_called_once_with(
         21, 22, 23, 24, 25, 26, 27, 28)
     pipe.gemm.fp8_nn_dev.assert_not_called()
+    pipe.gemm.autotune_fp8_nn_dev.assert_not_called()
+
+
+def test_fp8_nt_autotune_auto_skips_sm89(monkeypatch):
+    symbols = _load_pi05_rtx_symbols()
+    monkeypatch.delenv("FLASHRT_FP8_NT_AUTOTUNE", raising=False)
+    assert not symbols._fp8_nt_autotune_enabled("rtx_sm89", "nk")
+    assert symbols._fp8_nt_autotune_enabled("rtx_sm120", "nk")
+    assert symbols._fp8_nt_autotune_enabled("rtx_sm89", "kn")
+
+
+def test_fp8_nt_autotune_env_override(monkeypatch):
+    symbols = _load_pi05_rtx_symbols()
+    monkeypatch.setenv("FLASHRT_FP8_NT_AUTOTUNE", "force")
+    assert symbols._fp8_nt_autotune_enabled("rtx_sm89", "nk")
+    monkeypatch.setenv("FLASHRT_FP8_NT_AUTOTUNE", "safe")
+    assert not symbols._fp8_nt_autotune_enabled("rtx_sm120", "nk")
+
+
+def test_fp8_nk_layout_skips_nt_autotune_when_policy_disabled(monkeypatch):
+    symbols = _load_pi05_rtx_symbols()
+    monkeypatch.setenv("FLASHRT_FP8_NT_AUTOTUNE", "safe")
+    pipe = symbols.Pi05Pipeline.__new__(symbols.Pi05Pipeline)
+    pipe.fp8_layout = "nk"
+    pipe._autotune_fp8_nt = symbols._fp8_nt_autotune_enabled("rtx_sm89", "nk")
+    pipe.gemm = SimpleNamespace(
+        fp8_nt_dev=Mock(),
+        autotune_fp8_nt_dev=Mock(),
+        fp8_nn_dev=Mock(),
+        autotune_fp8_nn_dev=Mock(),
+    )
+
+    pipe._autotune_fp8_matmul(21, 22, 23, 24, 25, 26, 27, 28)
+
+    pipe.gemm.autotune_fp8_nt_dev.assert_not_called()
     pipe.gemm.autotune_fp8_nn_dev.assert_not_called()
 
 

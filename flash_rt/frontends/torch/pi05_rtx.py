@@ -374,6 +374,22 @@ def _select_fp8_layout(hardware: Optional[str], fp8_layout: Optional[str]) -> st
     return "kn"
 
 
+def _resolve_effective_hardware(hardware: Optional[str]) -> Optional[str]:
+    """Resolve the RTX hardware tag used by lower-level policy decisions."""
+    if hardware is not None:
+        return hardware
+    try:
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability()
+            if major == 8 and minor == 9:
+                return "rtx_sm89"
+            if major == 12:
+                return "rtx_sm120"
+    except Exception:
+        pass
+    return hardware
+
+
 def _precompute_decoder_styles(ckpt: dict, chunk_size: int,
                                num_steps: int = NUM_STEPS_DEFAULT) -> dict:
     """Pre-compute the time-MLP + per-layer style modulations in torch.
@@ -525,6 +541,7 @@ class Pi05TorchFrontendRtx:
                 f"got {self._vision_num_layers}")
         # _use_int8_vision_static is set after _force_int8_decoder below
         self.use_fp8 = bool(use_fp8)
+        self.hardware = _resolve_effective_hardware(hardware)
         self.fp8_layout = _select_fp8_layout(hardware, fp8_layout)
 
         self.latency_records: list[float] = []
@@ -936,6 +953,7 @@ class Pi05TorchFrontendRtx:
             "fp8": self._fp8_weights,
             "int8": self._int8_weights,
             "fp8_layout": self.fp8_layout,
+            "hardware": self.hardware,
 
             # Precomputed decoder styles (numpy bf16 as uint16 view)
             "precomputed": self._precomputed_styles,

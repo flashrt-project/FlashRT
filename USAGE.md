@@ -837,6 +837,26 @@ CUDA Graph instantiation on Thor is non-deterministic — the same kernels can p
 
 Autotune is part of `set_prompt()`. If you call `predict()` with the same prompt, the cached graph is replayed — no autotune overhead.
 
+### RTX 4090 / SM89 FP8 NT safety policy
+
+Pi0.5 on RTX 4090 / Ada uses FP8 weights in `nk` layout and dispatches
+cuBLASLt FP8 NT GEMMs. On some SM89 driver / cuBLASLt runtime combinations,
+the default heuristic top-1 algorithm is stable but the top-N autotune
+benchmark can expose a non-default candidate that raises CUDA illegal memory
+access. Because that failure poisons the CUDA context, FlashRT avoids the risky
+benchmark path before it runs.
+
+By default (`FLASHRT_FP8_NT_AUTOTUNE=auto`), Pi0.5 skips FP8 NT top-N autotune
+on SM89 and keeps the cuBLASLt heuristic top-1 algorithm. FP8 inference remains
+enabled; only the FP8 NT autotune benchmark is skipped.
+
+Override for debugging / local benchmarking:
+
+```bash
+FLASHRT_FP8_NT_AUTOTUNE=force  # force FP8 NT top-N autotune
+FLASHRT_FP8_NT_AUTOTUNE=safe   # always skip FP8 NT top-N autotune
+```
+
 ---
 
 ## Calibration
