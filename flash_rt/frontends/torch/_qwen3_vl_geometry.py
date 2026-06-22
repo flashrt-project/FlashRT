@@ -14,37 +14,68 @@ HuggingFace model object:
   * ``vision_pos_embeds``   — bilinear-interpolated learned position
     embedding for the patch grid, in 2×2-merge token order.
 
-Image inputs only (the multimodal scope of this path); the MRoPE builder
-mirrors HF's text/image span walk.
+Image and video inputs; the MRoPE builder mirrors HF's text/image/video
+span walk (videos use timestamp alignment: the grid is split per frame so
+each frame's temporal index is 0 and the inter-frame timestamp text tokens
+carry the temporal information).
 """
 from __future__ import annotations
 
 import torch
 
 
-def mrope_position_ids(input_ids, image_grid_thw, *, image_token_id,
-                       vision_start_token_id, spatial_merge_size):
+def mrope_position_ids(input_ids, image_grid_thw=None, video_grid_thw=None, *,
+                       image_token_id, video_token_id, vision_start_token_id,
+                       spatial_merge_size):
     """3D MRoPE position ids for a single (unpadded) sequence.
+
+    Mirrors HF ``Qwen3VLModel.get_rope_index``: walks the interleaved text /
+    image / video spans in token order. A video grid (t, h, w) is split into
+    ``t`` per-frame rows (t -> 1) so each frame is encoded like an image and
+    the temporal position is carried by the timestamp text tokens between
+    frames.
 
     Args:
       input_ids: (S,) long.
-      image_grid_thw: (num_images, 3) long — (t, h, w) per image.
+      image_grid_thw: (num_images, 3) long — (t, h, w) per image, or None.
+      video_grid_thw: (num_videos, 3) long — (t, h, w) per video, or None.
     Returns:
       (3, S) long position ids (t, h, w rows).
     """
+    if video_grid_thw is not None and len(video_grid_thw):
+        vg = video_grid_thw.clone()
+        vg = torch.repeat_interleave(vg, vg[:, 0], dim=0)
+        vg[:, 0] = 1
+    else:
+        vg = None
+
     ids = input_ids.tolist()
     n = len(ids)
+    m = spatial_merge_size
     starts = [i for i, tok in enumerate(ids) if tok == vision_start_token_id]
     image_nums = sum(1 for i in starts if ids[i + 1] == image_token_id)
+    video_nums = sum(1 for i in starts if ids[i + 1] == video_token_id)
 
     parts: list = []
     st = 0
-    img = 0
-    for _ in range(image_nums):
-        ed = ids.index(image_token_id, st)
-        t, h, w = (int(x) for x in image_grid_thw[img])
-        img += 1
-        gt, gh, gw = t, h // spatial_merge_size, w // spatial_merge_size
+    im = vi = 0
+    rem_i, rem_v = image_nums, video_nums
+    for _ in range(image_nums + video_nums):
+        ed_i = ids.index(image_token_id, st) if (
+            image_token_id in ids and rem_i > 0) else n + 1
+        ed_v = ids.index(video_token_id, st) if (
+            video_token_id in ids and rem_v > 0) else n + 1
+        if ed_i < ed_v:
+            t, h, w = (int(x) for x in image_grid_thw[im])
+            im += 1
+            rem_i -= 1
+            ed = ed_i
+        else:
+            t, h, w = (int(x) for x in vg[vi])
+            vi += 1
+            rem_v -= 1
+            ed = ed_v
+        gt, gh, gw = t, h // m, w // m
         text_len = ed - st
         base = int(parts[-1].max()) + 1 if parts else 0
         parts.append(

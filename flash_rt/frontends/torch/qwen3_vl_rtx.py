@@ -50,6 +50,7 @@ class Qwen3VlTorchFrontendRtx:
         cfg = json.load(
             open(os.path.join(checkpoint_path, 'config.json')))
         self._image_token_id = int(cfg['image_token_id'])
+        self._video_token_id = int(cfg['video_token_id'])
         self._vision_start_token_id = int(cfg['vision_start_token_id'])
         vc = cfg['vision_config']
         self._merge = int(vc['spatial_merge_size'])
@@ -90,51 +91,88 @@ class Qwen3VlTorchFrontendRtx:
             messages, add_generation_prompt=True, tokenize=True,
             return_dict=True, return_tensors='pt').to(self.device)
         input_ids = inputs['input_ids'][0]
-        grid = inputs['image_grid_thw']
-        pixel_values = inputs['pixel_values'].to(torch.bfloat16)
         S = int(input_ids.shape[0])
         if S > self.max_seq:
             raise ValueError(
                 f'prompt length {S} exceeds max_seq {self.max_seq}')
 
-        # Image-token spans, one contiguous run per image (multi-image:
-        # the runs appear in image order, matching the grid rows and the
-        # concatenated pixel_values / vision tables).
-        mask = (input_ids == self._image_token_id).cpu().tolist()
+        m = self._merge
+        image_grid = inputs.get('image_grid_thw')
+        video_grid = inputs.get('video_grid_thw')
+        pix_img = inputs.get('pixel_values')
+        pix_vid = inputs.get('pixel_values_videos')
+        if pix_img is not None:
+            pix_img = pix_img.to(torch.bfloat16)
+        if pix_vid is not None:
+            pix_vid = pix_vid.to(torch.bfloat16)
+        # Videos are split into per-frame rows (t -> 1) so each frame is a
+        # vision segment encoded like an image; the inter-frame timestamp
+        # text tokens carry the temporal position (HF get_rope_index).
+        if video_grid is not None and len(video_grid):
+            vg = torch.repeat_interleave(
+                video_grid, video_grid[:, 0], dim=0).clone()
+            vg[:, 0] = 1
+        else:
+            vg = None
+
+        # Walk the vision token runs in sequence order; each run is one
+        # segment (image, or one video frame), consuming the matching grid
+        # row and patch slice. Images and videos may interleave.
+        ids = input_ids.tolist()
+        seg_pix: list = []
+        seg_grids: list = []
         spans: list[tuple[int, int]] = []
+        seg_patches: list[int] = []
+        im = vi = off_img = off_vid = 0
         i = 0
         while i < S:
-            if mask[i]:
-                j = i
-                while j < S and mask[j]:
-                    j += 1
-                spans.append((i, j))
-                i = j
-            else:
+            tok = ids[i]
+            if tok not in (self._image_token_id, self._video_token_id):
                 i += 1
-        # Patches fed to the ViT per image (t*h*w) and the merged-token span
-        # length (t*(h/m)*(w/m)) it produces; they must line up with spans.
-        m = self._merge
-        seg_patches = [int(t * h * w) for t, h, w in grid.tolist()]
-        for (a, b), (t, h, w) in zip(spans, grid.tolist()):
-            assert b - a == int(t) * (int(h) // m) * (int(w) // m), (
-                'image-token span does not match its grid')
+                continue
+            j = i
+            while j < S and ids[j] == tok:
+                j += 1
+            if tok == self._image_token_id:
+                t, h, w = (int(x) for x in image_grid[im])
+                im += 1
+                npp = t * h * w
+                seg_pix.append(pix_img[off_img:off_img + npp])
+                off_img += npp
+            else:
+                t, h, w = (int(x) for x in vg[vi])
+                vi += 1
+                npp = t * h * w
+                seg_pix.append(pix_vid[off_vid:off_vid + npp])
+                off_vid += npp
+            assert j - i == t * (h // m) * (w // m), (
+                'vision-token span does not match its grid')
+            seg_grids.append((t, h, w))
+            spans.append((i, j))
+            seg_patches.append(npp)
+            i = j
+
+        seg_grid = torch.tensor(seg_grids, dtype=torch.long)
+        pixel_values = torch.cat(seg_pix, dim=0).contiguous()
 
         pos_ids = geo.mrope_position_ids(
-            input_ids.cpu(), grid.cpu(),
+            input_ids.cpu(),
+            image_grid.cpu() if image_grid is not None else None,
+            video_grid.cpu() if video_grid is not None else None,
             image_token_id=self._image_token_id,
+            video_token_id=self._video_token_id,
             vision_start_token_id=self._vision_start_token_id,
-            spatial_merge_size=self._merge)
+            spatial_merge_size=m)
         mcos, msin = geo.mrope_cos_sin(
             pos_ids, head_dim=self._head_dim, rope_theta=self._rope_theta,
             mrope_section=self._mrope_section, device=self.device)
         vcos, vsin = geo.vision_rope_cos_sin(
-            grid.cpu(), head_dim=self._vis_head_dim,
-            spatial_merge_size=self._merge, device=self.device)
+            seg_grid, head_dim=self._vis_head_dim,
+            spatial_merge_size=m, device=self.device)
         pos_embeds = geo.vision_pos_embeds(
-            grid.cpu(), self.vision.pos_embed,
+            seg_grid, self.vision.pos_embed,
             num_grid_per_side=self._num_grid_per_side,
-            spatial_merge_size=self._merge, device=self.device)
+            spatial_merge_size=m, device=self.device)
 
         self._prompt = {
             'input_ids': input_ids, 'pixel_values': pixel_values,

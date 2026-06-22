@@ -140,10 +140,14 @@ the description is unchanged).
 ## 5. Notes & limitations
 
 - **lm_head stays BF16** (same as the Qwen3-8B path).
-- **Multi-image** is supported: the ViT runs once per image (each image is
-  an independent attention window, reproducing HF's block-diagonal
-  cu_seqlens attention), and the features scatter into each image's token
-  span with per-image DeepStack injection. **Video is not yet wired.**
+- **Multi-image and video** are supported. The ViT runs once per vision
+  segment — each image, or each video frame-group, is an independent
+  attention window, reproducing HF's per-window cu_seqlens attention — and
+  the features scatter into each segment's token span with per-segment
+  DeepStack injection. Video uses Qwen3-VL's timestamp-aligned MRoPE (the
+  grid is split per frame so each frame's temporal index is 0 and the
+  inter-frame timestamp text tokens carry the temporal position). Frame
+  sampling follows the processor defaults.
 - **Next TTFT levers** (both need new kernels): an FP8 ViT attention
   (Sage/FA on sm_120 only ships head_dim 128/256, so head_dim 72 would
   need padding), and an FP8 language prefill (the stack is NVFP4, whose
