@@ -98,6 +98,46 @@ The build needs the `flash_rt_qwen3_vl_kernels` module
 (`cmake -B build -S . -DGPU_ARCH=120 -DFLASHRT_BUILD_QWEN3_VL=ON` then
 build that target); the shared `flash_rt_kernels.so` is unchanged.
 
+### Inputs (image / multi-image / video)
+
+`messages` follows the processor's chat format. Mix any number of images
+and/or one video; the frontend builds the per-segment geometry and scatter
+automatically.
+
+```python
+# Multiple images
+content = [
+    {'type': 'image', 'image': img_a},
+    {'type': 'image', 'image': img_b},
+    {'type': 'text', 'text': 'Compare the two images.'},
+]
+
+# Video (numpy (T,H,W,C) array or a list of PIL frames; frame sampling
+# follows the processor defaults)
+content = [
+    {'type': 'video', 'video': frames},
+    {'type': 'text', 'text': 'What happens in this video?'},
+]
+```
+
+### Resolution (`max_pixels`) — explicit, opt-in
+
+`max_pixels` is **not** set by default (`None` = the checkpoint's full
+resolution, so behaviour is unchanged and the output is bit-identical).
+Because the patch count drives both the ViT and the LLM prefill length
+(see §1), set it explicitly to trade visual detail for latency — it is the
+single biggest TTFT lever:
+
+```python
+fe = Qwen3VlTorchFrontendRtx(ckpt, max_pixels=1_000_000)   # ~57 ms
+fe = Qwen3VlTorchFrontendRtx(ckpt, max_pixels=500_000)     # ~30 ms
+```
+
+The same knob is exposed as `--max-pixels` on
+`examples/qwen3_vl_quickstart.py` and `examples/qwen3_vl_openai_server.py`.
+It applies the processor's smart_resize (rounds to the patch grid) to both
+images and videos.
+
 ---
 
 ## 3. Inference architecture

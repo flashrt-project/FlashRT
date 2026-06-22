@@ -212,7 +212,8 @@ class Qwen3VlVisionRtx:
             x_fp8.data_ptr(), w8.data_ptr(), y.data_ptr(), M, N, K,
             x_scale.data_ptr(), ws.data_ptr(), stream)
         if bias is not None:
-            self._fvk.add_bias_bf16(y.data_ptr(), bias.data_ptr(), M, N, stream)
+            self._fvk.add_bias_bf16(
+                y.data_ptr(), bias.data_ptr(), M, N, stream)
         return y
 
     def _layer_norm_to_fp8(self, x, w, b, M, D, stream):
