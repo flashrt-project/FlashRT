@@ -73,6 +73,9 @@ class Qwen3VlTorchFrontendRtx:
         self.processor = AutoProcessor.from_pretrained(checkpoint_path)
 
         self._prompt: dict[str, Any] | None = None
+        # cache-slot -> captured decode CUDA Graph (rope baked at the
+        # MRoPE-continuation position, which differs from the slot).
+        self._decode_graphs: dict[int, Any] = {}
 
     # ── Prompt ──
 
@@ -186,29 +189,75 @@ class Qwen3VlTorchFrontendRtx:
         torch.cuda.synchronize()
         return logits
 
-    def generate(self, messages: list, *, max_new_tokens: int = 256) -> str:
+    def _ensure_decode_graph(self, cache_pos: int, rope_pos: int):
+        """Lazy-capture a decode CUDA Graph for one cache slot.
+
+        Mirrors ``qwen3_rtx._ensure_decode_graph`` but bakes the RoPE
+        slice at ``rope_pos`` (the MRoPE continuation position) rather
+        than the cache slot. Reuses the language core's static token
+        buffer, capture stream and decode kernels.
+        """
+        import torch
+
+        llm = self.llm
+        g = self._decode_graphs.get(cache_pos)
+        if g is not None:
+            return g
+        cos, sin = llm._rope_cos_sin(rope_pos)
+        gs = llm._graph_stream
+        gs.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(gs), torch.no_grad():
+            for _ in range(2):
+                llm.forward_own_decode_nvfp4(
+                    llm._static_token_id, cos, sin, cache_pos)
+        gs.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=gs), torch.no_grad():
+            llm.forward_own_decode_nvfp4(
+                llm._static_token_id, cos, sin, cache_pos)
+        gs.synchronize()
+        torch.cuda.current_stream().wait_stream(gs)
+        self._decode_graphs[cache_pos] = g
+        return g
+
+    def warmup_decode_graphs(self, n_tokens: int) -> None:
+        """Pre-capture decode graphs for the current prompt's next
+        ``n_tokens`` steps so generation replays warm graphs."""
+        if self._prompt is None:
+            raise RuntimeError('call set_prompt() before warmup')
+        p = self._prompt
+        for i in range(n_tokens):
+            self._ensure_decode_graph(p['S'] + i, p['mrope_max'] + 1 + i)
+
+    def generate(self, messages: list, *, max_new_tokens: int = 256,
+                 use_graph: bool = True) -> str:
         """Greedy multimodal generation. Returns the decoded text.
 
         Runs the multimodal prefill (which fills the KV cache), then the
         reused Qwen3 NVFP4 decode loop. After the image the MRoPE position
-        is scalar, so the decode RoPE position simply continues from the
-        prompt's max position while the KV-cache slot advances from the
-        (image-compressed) prompt length.
+        is scalar, so the decode RoPE position continues from the prompt's
+        max position while the KV-cache slot advances from the
+        image-compressed prompt length. ``use_graph`` replays a per-slot
+        captured CUDA Graph for each decode step.
         """
         self.set_prompt(messages)
         logits = self.prefill()
-        p = self._prompt
         llm = self.llm
-        cache_pos = p['S']
-        rope_pos = p['mrope_max'] + 1
+        p = self._prompt
+        base_slot, base_rope = p['S'], p['mrope_max'] + 1
 
         tok = int(logits[0].float().argmax())
         out_ids = [tok]
         for i in range(max_new_tokens - 1):
             if tok in self._eos_token_ids:
                 break
-            cos, sin = llm._rope_cos_sin(rope_pos + i)
-            logits = llm.forward_own_decode_nvfp4(tok, cos, sin, cache_pos + i)
+            if use_graph:
+                logits = self._decode_step_graph(
+                    tok, base_slot + i, base_rope + i)
+            else:
+                cos, sin = llm._rope_cos_sin(base_rope + i)
+                logits = llm.forward_own_decode_nvfp4(
+                    tok, cos, sin, base_slot + i)
             tok = int(logits[0].float().argmax())
             out_ids.append(tok)
 
@@ -217,3 +266,9 @@ class Qwen3VlTorchFrontendRtx:
             out_ids = out_ids[:out_ids.index(eos[0])]
         return self.processor.tokenizer.decode(
             out_ids, skip_special_tokens=True)
+
+    def _decode_step_graph(self, token: int, cache_pos: int, rope_pos: int):
+        llm = self.llm
+        llm._static_token_id.fill_(int(token))
+        self._ensure_decode_graph(cache_pos, rope_pos).replay()
+        return llm._logits_buf[:1]
