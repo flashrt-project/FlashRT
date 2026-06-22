@@ -183,14 +183,16 @@ below are what we test against — don't upgrade one without the others:
 pip install jax==0.5.3 jax-cuda12-pjrt==0.5.3 jax-cuda12-plugin==0.5.3 ml_dtypes==0.5.3 orbax-checkpoint flax
 ```
 
-Upgrade path (tracked, not yet done):
+Version drift notes:
 
 - jax 0.6+ needs the `jax-cuda12-plugin` name to stay aligned (no
   rename expected but verify); check the PJRT plugin registers
   cleanly with `python -c "import jax; jax.devices()"`.
-- Orbax 0.6+ changed the default metadata layout for `StandardRestore`;
-  our `load_from_cache` path in `flash_rt/frontends/jax/` expects
-  the 0.5.x layout.
+- Orbax 0.6+ changed the default metadata layout for `StandardRestore`.
+  The shared Orbax loader now handles both the older mapping-style metadata
+  and the newer `StepMetadata.item_metadata.tree["params"]` layout; keep
+  `tests/test_weight_loader.py::test_orbax_step_metadata_loader_path`
+  passing when changing the Orbax pin.
 
 ## 9. `transformers` version constraint
 
