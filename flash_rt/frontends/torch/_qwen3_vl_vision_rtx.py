@@ -1,4 +1,4 @@
-"""FlashRT — Qwen3-VL ViT tower forward (RTX SM120, BF16).
+"""FlashRT — Qwen3-VL ViT tower forward (RTX SM120).
 
 Kernelized SigLIP-style vision tower for ``Qwen3-VL``: patch embed →
 learned position embedding → ``depth`` transformer blocks (rotate_half
@@ -7,9 +7,12 @@ merger, with DeepStack feature taps at the configured layers.
 
 All heavy compute runs through ``flash_rt_kernels`` / ``flash_rt_fa2`` /
 ``flash_rt_qwen3_vl_kernels``; tensor reshapes are metadata-only views.
+The linear layers run FP8 block-128 W8A8 (2× tensor-core vs bf16); the
+activation is dynamically quantized per GEMM and the residual stream
+(which carries the late-layer massive-activation outlier) stays bf16.
 The tower is prefill-once per image and the sequence length is
 image-resolution dependent, so scratch is sized per forward (CUDA-Graph
-bucketing by patch count is layered on top separately).
+bucketing by patch count is layered on top via ``forward_graph``).
 
 Sibling of the language path in ``qwen3_rtx`` / ``qwen3_vl_rtx``.
 """
@@ -20,12 +23,13 @@ from typing import Any
 
 
 class Qwen3VlVisionRtx:
-    """Qwen3-VL ViT tower. Loads BF16 vision weights from a checkpoint
-    directory and runs the forward against the FlashRT kernel modules.
+    """Qwen3-VL ViT tower. Loads the vision weights from a checkpoint
+    directory (norms BF16, linears FP8 block-128) and runs the forward
+    against the FlashRT kernel modules.
 
     Public surface:
       __init__(checkpoint_path, *, device='cuda:0')
-      forward(pixel_values, rope_cos, rope_sin)
+      forward(pixel_values, pos_embeds, rope_cos, rope_sin)
         -> (image_embeds, deepstack_features)
     """
 
@@ -71,47 +75,71 @@ class Qwen3VlVisionRtx:
             return shards[shard].get_tensor(key).to(
                 torch.bfloat16).to(device).contiguous()
 
-        p = 'model.visual.'
-        # patch_embed.proj.weight is (hidden, in_ch, T, ph, pw) → (hidden, K)
-        self.patch_proj_w = _w(p + 'patch_embed.proj.weight').reshape(
-            self.hidden, -1).contiguous()
-        self.patch_proj_b = _w(p + 'patch_embed.proj.bias')
-        self.pos_embed = _w(p + 'pos_embed.weight')
+        def _lin(w, bias, fp8: bool = True):
+            """Pack a linear. fp8=True → (fp8 weight, block scale, bias);
+            fp8=False → (None, bf16 weight, bias) for the bf16 path. The
+            residual-writing GEMMs (attn proj, FFN fc2) stay bf16: their
+            output feeds the late-layer massive-activation channel, where
+            accumulated FP8 noise would be amplified."""
+            if not fp8:
+                return (None, w, bias)
+            w8, ws = _quant_fp8_block128(w)
+            return (w8, ws, bias)
 
-        # The FFN GEMMs use w16a16 (K % 128 == 0); the ViT intermediate
-        # (4304) is not 128-aligned, so the intermediate is zero-padded to
-        # the next multiple of 128 at load time. Padded fc1 rows / bias and
-        # fc2 columns are zero, so GELU(0)=0 keeps the pad inert and the
-        # result is unchanged — but fc2 now runs on the fast w16a16 kernel
-        # instead of the M=1-tuned arbitrary-K matmul (~56x faster at S>>1).
+        # FP8 block-128 GEMMs need K % 128 == 0; the ViT intermediate
+        # (4304) is not aligned, so fc1 (rows) / fc2 (cols) are zero-padded
+        # to the next multiple of 128. Padded fc1 rows/bias and fc2 columns
+        # are zero, so GELU(0)=0 keeps the pad inert and the result is
+        # unchanged.
         self.intermediate_padded = (
             (self.intermediate + 127) // 128) * 128
+
+        p = 'model.visual.'
+        # patch_embed (runs once, at layer 0) and the mergers (the output
+        # projection, on the massive-activation hidden) stay bf16: they are
+        # cheap and FP8 noise there is amplified through the whole tower.
+        # The per-block GEMMs (the compute bulk, 27x) run FP8.
+        self.patch_embed = _lin(
+            _w(p + 'patch_embed.proj.weight').reshape(self.hidden, -1),
+            _w(p + 'patch_embed.proj.bias'), fp8=False)
+        self.pos_embed = _w(p + 'pos_embed.weight')
+
+        # FP8 the bulk of the tower, but keep the first few blocks in bf16.
+        # The late layers grow a massive-activation channel that amplifies
+        # perturbations from the earliest blocks the most; protecting the
+        # first 3 blocks recovers image_embeds cosine from 0.86 (all-FP8)
+        # to 0.97 for ~+2 ms, vs 0.984 / +21 ms for the all-bf16 tower.
+        self.bf16_first_blocks = max(0, int(cfg.get('_bf16_first_blocks', 3)))
 
         self.blocks: list[dict] = []
         for i in range(self.depth):
             bp = f'{p}blocks.{i}.'
+            f8 = i >= self.bf16_first_blocks
             self.blocks.append({
                 'norm1_w': _w(bp + 'norm1.weight'),
                 'norm1_b': _w(bp + 'norm1.bias'),
                 'norm2_w': _w(bp + 'norm2.weight'),
                 'norm2_b': _w(bp + 'norm2.bias'),
-                'qkv_w': _w(bp + 'attn.qkv.weight'),
-                'qkv_b': _w(bp + 'attn.qkv.bias'),
-                'proj_w': _w(bp + 'attn.proj.weight'),
-                'proj_b': _w(bp + 'attn.proj.bias'),
-                'fc1_w': _pad_rows(_w(bp + 'mlp.linear_fc1.weight'),
-                                   self.intermediate_padded),
-                'fc1_b': _pad_rows(_w(bp + 'mlp.linear_fc1.bias'),
-                                   self.intermediate_padded),
-                'fc2_w': _pad_cols(_w(bp + 'mlp.linear_fc2.weight'),
-                                   self.intermediate_padded),
-                'fc2_b': _w(bp + 'mlp.linear_fc2.bias'),
+                'qkv': _lin(_w(bp + 'attn.qkv.weight'),
+                            _w(bp + 'attn.qkv.bias'), fp8=f8),
+                'proj': _lin(_w(bp + 'attn.proj.weight'),
+                             _w(bp + 'attn.proj.bias'), fp8=f8),
+                'fc1': _lin(
+                    _pad_rows(_w(bp + 'mlp.linear_fc1.weight'),
+                              self.intermediate_padded),
+                    _pad_rows(_w(bp + 'mlp.linear_fc1.bias'),
+                              self.intermediate_padded), fp8=f8),
+                'fc2': _lin(
+                    _pad_cols(_w(bp + 'mlp.linear_fc2.weight'),
+                              self.intermediate_padded),
+                    _w(bp + 'mlp.linear_fc2.bias'), fp8=f8),
             })
-        self.merger = _load_merger(_w, p + 'merger.')
+        self.merger = _load_merger(_w, _lin, p + 'merger.')
         self.deepstack_mergers = [
-            _load_merger(_w, f'{p}deepstack_merger_list.{k}.')
+            _load_merger(_w, _lin, f'{p}deepstack_merger_list.{k}.')
             for k in range(len(self.deepstack_indexes))
         ]
+        self.intermediate = self.intermediate_padded
 
     # ── kernel handles (lazy) ──
 
@@ -128,19 +156,35 @@ class Qwen3VlVisionRtx:
 
     # ── primitives ──
 
-    def _gemm(self, x, w, bias, M, N, K, stream):
+    def _gemm(self, x, lin, M, N, K, stream):
+        """y = x @ W.T + bias via FP8 block-128 (2× tensor-core vs bf16).
+
+        ``lin`` is a (weight_fp8, weight_block_scale, bias) tuple. The
+        bf16 activation is dynamically quantized to FP8 with per-token,
+        per-128-K-block scales; the GEMM accumulates in FP32 and emits
+        bf16. The massive-activation outlier lives in the bf16 residual
+        stream (added after the GEMM), so it is unaffected.
+        """
         import torch
+
         fvk = self._fvk
+        w8, ws, bias = lin
         y = torch.empty(M, N, dtype=torch.bfloat16, device=self.device)
-        if K % 128 == 0:
+        if w8 is None:                                  # bf16 path (w16a16)
             fvk.w16a16_gemm_sm120_bf16(
-                x.data_ptr(), w.data_ptr(), y.data_ptr(), M, N, K, 1.0, stream)
-        else:
-            # w16a16 requires K % 128 == 0; the arbitrary-K bf16 matmul
-            # also preserves accumulation precision on the ViT FFN
-            # (K=intermediate) massive-activation channels.
-            fvk.bf16_matmul_qwen36_bf16(
-                x.data_ptr(), w.data_ptr(), y.data_ptr(), M, N, K, stream)
+                x.data_ptr(), ws.data_ptr(), y.data_ptr(), M, N, K, 1.0,
+                stream)
+        else:                                           # FP8 block-128 W8A8
+            x_fp8 = torch.empty(
+                M, K, dtype=torch.float8_e4m3fn, device=self.device)
+            x_scale = torch.empty(
+                M, K // 128, dtype=torch.float32, device=self.device)
+            fvk.fp8_per_token_block128_quant_bf16(
+                x.data_ptr(), x_fp8.data_ptr(), x_scale.data_ptr(),
+                M, K, stream)
+            fvk.fp8_block128_gemm_cutlass_sm120_bf16out(
+                x_fp8.data_ptr(), w8.data_ptr(), y.data_ptr(), M, N, K,
+                x_scale.data_ptr(), ws.data_ptr(), stream)
         if bias is not None:
             fvk.add_bias_bf16(y.data_ptr(), bias.data_ptr(), M, N, stream)
         return y
@@ -167,10 +211,9 @@ class Qwen3VlVisionRtx:
                 xs, mg['norm_w'], mg['norm_b'], xs.shape[0], norm_dim, stream)
         M = xn.shape[0]
         din = self.hidden * merge
-        f1 = self._gemm(xn, mg['fc1_w'], mg['fc1_b'], M, din, din, stream)
+        f1 = self._gemm(xn, mg['fc1'], M, din, din, stream)
         self._fvk.gelu_inplace(f1.data_ptr(), M * din, stream)
-        return self._gemm(
-            f1, mg['fc2_w'], mg['fc2_b'], M, self.out_hidden, din, stream)
+        return self._gemm(f1, mg['fc2'], M, self.out_hidden, din, stream)
 
     # ── forward ──
 
@@ -202,8 +245,7 @@ class Qwen3VlVisionRtx:
         dev = self.device
 
         # patch embed + grid-interpolated learned pos embed.
-        h = self._gemm(pixel_values, self.patch_proj_w, self.patch_proj_b,
-                       S, H, K, stream)
+        h = self._gemm(pixel_values, self.patch_embed, S, H, K, stream)
         fvk.residual_add(h.data_ptr(), pos_embeds.data_ptr(), S * H, stream)
 
         q = torch.empty(S, H, dtype=bf16, device=dev)
@@ -216,8 +258,7 @@ class Qwen3VlVisionRtx:
         for i, blk in enumerate(self.blocks):
             xn = self._layer_norm(
                 h, blk['norm1_w'], blk['norm1_b'], S, H, stream)
-            qkv = self._gemm(
-                xn, blk['qkv_w'], blk['qkv_b'], S, 3 * H, H, stream)
+            qkv = self._gemm(xn, blk['qkv'], S, 3 * H, H, stream)
             fvk.qkv_split(qkv.data_ptr(), q.data_ptr(), k.data_ptr(),
                           v.data_ptr(), S, H, H, H, stream)
             vlk.rope_neox_qk_bf16(
@@ -238,18 +279,15 @@ class Qwen3VlVisionRtx:
                 v_strides=(vv.stride(0), vv.stride(1), vv.stride(2)),
                 o_strides=(o.stride(0), o.stride(1), o.stride(2)),
                 softmax_scale=scale, num_sms=self._num_sms, stream=stream)
-            attn = self._gemm(o.view(S, H), blk['proj_w'], blk['proj_b'],
-                              S, H, H, stream)
+            attn = self._gemm(o.view(S, H), blk['proj'], S, H, H, stream)
             fvk.residual_add(h.data_ptr(), attn.data_ptr(), S * H, stream)
 
             xn2 = self._layer_norm(
                 h, blk['norm2_w'], blk['norm2_b'], S, H, stream)
-            inter = blk['fc1_w'].shape[0]
-            f1 = self._gemm(
-                xn2, blk['fc1_w'], blk['fc1_b'], S, inter, H, stream)
+            inter = self.intermediate
+            f1 = self._gemm(xn2, blk['fc1'], S, inter, H, stream)
             fvk.gelu_inplace(f1.data_ptr(), S * inter, stream)
-            f2 = self._gemm(
-                f1, blk['fc2_w'], blk['fc2_b'], S, H, inter, stream)
+            f2 = self._gemm(f1, blk['fc2'], S, H, inter, stream)
             fvk.residual_add(h.data_ptr(), f2.data_ptr(), S * H, stream)
 
             if i in self.deepstack_indexes:
@@ -261,14 +299,10 @@ class Qwen3VlVisionRtx:
         return image_embeds, deepstack
 
     def forward_graph(self, pixel_values, pos_embeds, rope_cos, rope_sin):
-        """CUDA-Graph-accelerated ``forward``.
+        """CUDA-Graph replay of ``forward`` (one graph per patch count).
 
-        The tower is launch-bound (hundreds of small kernels), so a
-        captured graph removes nearly all launch overhead. One graph per
-        distinct patch count; inputs are staged into fixed buffers and
-        the graph is replayed. Returns the captured output tensors (valid
-        until the next replay at the same patch count) — clone if the
-        caller needs to keep them across calls.
+        Inputs are staged into fixed buffers; returns the captured output
+        tensors (valid until the next replay at the same patch count).
         """
         import torch
 
@@ -307,6 +341,21 @@ class Qwen3VlVisionRtx:
         return out
 
 
+def _quant_fp8_block128(w):
+    """Quantize a (N, K) bf16 weight to FP8 e4m3 with per-128x128-block
+    descales. N and K must be multiples of 128. Returns (w_fp8 (N, K),
+    block_scale (N/128, K/128) fp32), matching the convention of
+    ``fp8_block128_gemm_cutlass_sm120_bf16out``."""
+    import torch
+    N, K = w.shape
+    wv = w.float().view(N // 128, 128, K // 128, 128)
+    amax = wv.abs().amax(dim=(1, 3))
+    scale = (amax / 448.0).clamp_min(1e-12)
+    wq = (wv / scale[:, None, :, None]).clamp(-448.0, 448.0)
+    wq = wq.to(torch.float8_e4m3fn).view(N, K).contiguous()
+    return wq, scale.float().contiguous()
+
+
 def _pad_rows(t, n_rows: int):
     import torch
     if t.shape[0] >= n_rows:
@@ -325,14 +374,14 @@ def _pad_cols(t, n_cols: int):
     return torch.cat([t, pad], dim=-1).contiguous()
 
 
-def _load_merger(load_fn, prefix: str) -> dict:
+def _load_merger(load_fn, lin_fn, prefix: str) -> dict:
     return {
         'norm_w': load_fn(prefix + 'norm.weight'),
         'norm_b': load_fn(prefix + 'norm.bias'),
-        'fc1_w': load_fn(prefix + 'linear_fc1.weight'),
-        'fc1_b': load_fn(prefix + 'linear_fc1.bias'),
-        'fc2_w': load_fn(prefix + 'linear_fc2.weight'),
-        'fc2_b': load_fn(prefix + 'linear_fc2.bias'),
+        'fc1': lin_fn(load_fn(prefix + 'linear_fc1.weight'),
+                      load_fn(prefix + 'linear_fc1.bias'), fp8=False),
+        'fc2': lin_fn(load_fn(prefix + 'linear_fc2.weight'),
+                      load_fn(prefix + 'linear_fc2.bias'), fp8=False),
     }
 
 
