@@ -24,6 +24,37 @@ import json
 import os
 from typing import Any
 
+# Functions the Qwen3-VL ViT tower needs from the separate, opt-in
+# ``flash_rt_qwen3_vl_kernels`` module (CMake ``-DFLASHRT_BUILD_QWEN3_VL=ON``).
+_QWEN3_VL_KERNEL_FNS = (
+    'rope_neox_qk_bf16',
+    'layer_norm_to_fp8_block128_bf16',
+    'gelu_tanh_to_fp8_block128_bf16',
+)
+
+
+def _check_qwen3_vl_kernels(module) -> None:
+    """Raise a clear error if the Qwen3-VL kernel module is incomplete."""
+    missing = [fn for fn in _QWEN3_VL_KERNEL_FNS if not hasattr(module, fn)]
+    if missing:
+        raise RuntimeError(
+            'flash_rt_qwen3_vl_kernels is missing ' + ', '.join(missing)
+            + '. Rebuild it with -DFLASHRT_BUILD_QWEN3_VL=ON (GPU_ARCH=120).')
+
+
+def _require_qwen3_vl_kernels():
+    """Import + validate the Qwen3-VL kernel module up front (fail-fast),
+    before any weights are loaded. Returns the module."""
+    try:
+        from flash_rt import flash_rt_qwen3_vl_kernels as vlk
+    except ImportError as e:
+        raise RuntimeError(
+            'flash_rt_qwen3_vl_kernels is not built. Configure with '
+            '-DFLASHRT_BUILD_QWEN3_VL=ON (GPU_ARCH=120) and build the '
+            'flash_rt_qwen3_vl_kernels target.') from e
+    _check_qwen3_vl_kernels(vlk)
+    return vlk
+
 
 class Qwen3VlTorchFrontendRtx:
     """Qwen3-VL-8B-class multimodal inference frontend (RTX SM120, NVFP4).
@@ -46,6 +77,10 @@ class Qwen3VlTorchFrontendRtx:
         self.checkpoint_path = str(checkpoint_path)
         self.device = device
         self.max_seq = int(max_seq)
+
+        # Fail fast if the opt-in kernel module is missing, before loading
+        # the (large) language and vision weights.
+        _require_qwen3_vl_kernels()
 
         cfg = json.load(
             open(os.path.join(checkpoint_path, 'config.json')))
@@ -120,49 +155,28 @@ class Qwen3VlTorchFrontendRtx:
         # Videos are split into per-frame rows (t -> 1) so each frame is a
         # vision segment encoded like an image; the inter-frame timestamp
         # text tokens carry the temporal position (HF get_rope_index).
-        if video_grid is not None and len(video_grid):
-            vg = torch.repeat_interleave(
-                video_grid, video_grid[:, 0], dim=0).clone()
-            vg[:, 0] = 1
-        else:
-            vg = None
-
-        # Walk the vision token runs in sequence order; each run is one
-        # segment (image, or one video frame), consuming the matching grid
-        # row and patch slice. Images and videos may interleave.
-        ids = input_ids.tolist()
+        # Walk the image/video token runs (sequence order; videos split per
+        # frame). Raises ValueError for a text-only prompt or a grid mismatch.
+        segs = geo.vision_segments(
+            input_ids.cpu(), image_grid, video_grid,
+            image_token_id=self._image_token_id,
+            video_token_id=self._video_token_id, spatial_merge_size=m)
         seg_pix: list = []
         seg_grids: list = []
         spans: list[tuple[int, int]] = []
         seg_patches: list[int] = []
-        im = vi = off_img = off_vid = 0
-        i = 0
-        while i < S:
-            tok = ids[i]
-            if tok not in (self._image_token_id, self._video_token_id):
-                i += 1
-                continue
-            j = i
-            while j < S and ids[j] == tok:
-                j += 1
-            if tok == self._image_token_id:
-                t, h, w = (int(x) for x in image_grid[im])
-                im += 1
-                npp = t * h * w
+        off_img = off_vid = 0
+        for sg in segs:
+            npp = sg['patches']
+            if sg['kind'] == 'image':
                 seg_pix.append(pix_img[off_img:off_img + npp])
                 off_img += npp
             else:
-                t, h, w = (int(x) for x in vg[vi])
-                vi += 1
-                npp = t * h * w
                 seg_pix.append(pix_vid[off_vid:off_vid + npp])
                 off_vid += npp
-            assert j - i == t * (h // m) * (w // m), (
-                'vision-token span does not match its grid')
-            seg_grids.append((t, h, w))
-            spans.append((i, j))
+            seg_grids.append(sg['grid'])
+            spans.append(sg['span'])
             seg_patches.append(npp)
-            i = j
 
         seg_grid = torch.tensor(seg_grids, dtype=torch.long)
         pixel_values = torch.cat(seg_pix, dim=0).contiguous()

@@ -882,6 +882,13 @@ endif()
 #     from flash_rt import flash_rt_qwen3_vl_kernels as vlk
 #     vlk.rope_neox_qk_bf16(...)
 if(FLASHRT_BUILD_QWEN3_VL)
+  # The Qwen3-VL path depends on the SM120 Qwen3 NVFP4 / FP8 block-128
+  # kernels, so this module only builds for RTX 5090 (sm_120).
+  if(NOT GPU_ARCH STREQUAL "120")
+    message(FATAL_ERROR
+      "FLASHRT_BUILD_QWEN3_VL requires GPU_ARCH=120 (RTX 5090 / sm_120); "
+      "got '${GPU_ARCH}'.")
+  endif()
   pybind11_add_module(flash_rt_qwen3_vl_kernels
     csrc/qwen3_vl_bindings.cpp
     csrc/kernels/rope_neox_qk_bf16.cu
