@@ -76,19 +76,22 @@ def main() -> None:
             ttft.append((time.perf_counter() - t0) * 1e3)
         ttft.sort()
 
-        # Decode throughput.
+        # Decode throughput with warm CUDA Graphs.
+        s = fe._prompt['S']
+        n_dec = args.max_new_tokens
+        fe.warmup_decode_graphs(n_dec)
+        torch.cuda.synchronize()
         t0 = time.perf_counter()
-        out = fe.generate(messages, max_new_tokens=args.max_new_tokens)
+        for j in range(n_dec):
+            fe._decode_step_graph(0, s + j, fe._prompt['mrope_max'] + 1 + j)
         torch.cuda.synchronize()
         dt = time.perf_counter() - t0
-        n_tok = len(fe.processor.tokenizer(out).input_ids)
 
-        s = fe._prompt['S']
         print('--- benchmark ---')
         print(f'prompt tokens (incl. vision) : {s}')
         print(f'TTFT prefill P50             : {ttft[len(ttft)//2]:.1f} ms')
-        print(f'decode throughput            : {n_tok / dt:.1f} tok/s '
-              f'({n_tok} tok in {dt*1e3:.0f} ms)')
+        print(f'decode throughput (warm graph): {n_dec / dt:.1f} tok/s '
+              f'({n_dec} tok in {dt*1e3:.0f} ms)')
 
 
 if __name__ == '__main__':
