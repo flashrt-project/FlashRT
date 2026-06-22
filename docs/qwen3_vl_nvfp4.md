@@ -140,7 +140,10 @@ the description is unchanged).
 ## 5. Notes & limitations
 
 - **lm_head stays BF16** (same as the Qwen3-8B path).
-- **Image inputs.** Video and multi-image are not wired in this path.
+- **Multi-image** is supported: the ViT runs once per image (each image is
+  an independent attention window, reproducing HF's block-diagonal
+  cu_seqlens attention), and the features scatter into each image's token
+  span with per-image DeepStack injection. **Video is not yet wired.**
 - **Next TTFT levers** (both need new kernels): an FP8 ViT attention
   (Sage/FA on sm_120 only ships head_dim 128/256, so head_dim 72 would
   need padding), and an FP8 language prefill (the stack is NVFP4, whose

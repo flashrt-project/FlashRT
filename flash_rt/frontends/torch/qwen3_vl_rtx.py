@@ -97,11 +97,28 @@ class Qwen3VlTorchFrontendRtx:
             raise ValueError(
                 f'prompt length {S} exceeds max_seq {self.max_seq}')
 
-        # Contiguous image-token span (single image).
-        mask = (input_ids == self._image_token_id)
-        idx = torch.nonzero(mask, as_tuple=False).flatten()
-        img_start = int(idx[0])
-        img_end = int(idx[-1]) + 1
+        # Image-token spans, one contiguous run per image (multi-image:
+        # the runs appear in image order, matching the grid rows and the
+        # concatenated pixel_values / vision tables).
+        mask = (input_ids == self._image_token_id).cpu().tolist()
+        spans: list[tuple[int, int]] = []
+        i = 0
+        while i < S:
+            if mask[i]:
+                j = i
+                while j < S and mask[j]:
+                    j += 1
+                spans.append((i, j))
+                i = j
+            else:
+                i += 1
+        # Patches fed to the ViT per image (t*h*w) and the merged-token span
+        # length (t*(h/m)*(w/m)) it produces; they must line up with spans.
+        m = self._merge
+        seg_patches = [int(t * h * w) for t, h, w in grid.tolist()]
+        for (a, b), (t, h, w) in zip(spans, grid.tolist()):
+            assert b - a == int(t) * (int(h) // m) * (int(w) // m), (
+                'image-token span does not match its grid')
 
         pos_ids = geo.mrope_position_ids(
             input_ids.cpu(), grid.cpu(),
@@ -121,7 +138,8 @@ class Qwen3VlTorchFrontendRtx:
 
         self._prompt = {
             'input_ids': input_ids, 'pixel_values': pixel_values,
-            'img_start': img_start, 'img_end': img_end,
+            'spans': spans, 'seg_patches': seg_patches,
+            'img_start': spans[0][0], 'img_end': spans[0][1],
             'mcos': mcos, 'msin': msin, 'vcos': vcos, 'vsin': vsin,
             'pos_embeds': pos_embeds, 'S': S,
             'mrope_max': int(pos_ids.max()),
@@ -151,29 +169,38 @@ class Qwen3VlTorchFrontendRtx:
         eps = float(llm._cfg['rms_norm_eps'])
         n_layers = llm._cfg['num_hidden_layers']
         S = p['S']
-        a, b = p['img_start'], p['img_end']
+        spans = p['spans']
 
-        # Vision tower → image features + DeepStack.
-        image_embeds, deepstack = self.vision.forward(
-            p['pixel_values'], p['pos_embeds'], p['vcos'], p['vsin'])
-
-        # Embedding lookup + scatter the (contiguous) image span.
+        # Vision tower, once per image (each image is an independent
+        # attention window — running the tower per segment reproduces HF's
+        # block-diagonal cu_seqlens attention without a varlen kernel).
         embed = llm._weights.anchors[0]
         h = embed[p['input_ids']].to(torch.bfloat16).view(1, S, hidden)
         h = h.contiguous()
-        h[0, a:b] = image_embeds.to(torch.bfloat16)
+        seg_deepstacks: list = []
+        off = 0
+        for (a, b), n_patch in zip(spans, p['seg_patches']):
+            sl = slice(off, off + n_patch)
+            off += n_patch
+            emb, ds = self.vision.forward(
+                p['pixel_values'][sl], p['pos_embeds'][sl],
+                p['vcos'][sl], p['vsin'][sl])
+            h[0, a:b] = emb.to(torch.bfloat16)
+            seg_deepstacks.append(ds)
 
-        # Decoder layers with MRoPE; DeepStack added at the first layers.
+        # Decoder layers with MRoPE; DeepStack added at the first layers,
+        # each image's features into its own span.
         cur = h
         for layer in range(n_layers):
             cur = llm._layer_forward_full_nvfp4_prefill(
                 layer, cur, p['mcos'], p['msin'], 0, S)
             if layer < self._deepstack_layers:
                 cur = cur.clone()
-                fvk.residual_add(
-                    cur[0, a:b].data_ptr(),
-                    deepstack[layer].to(torch.bfloat16).data_ptr(),
-                    (b - a) * hidden, stream)
+                for (a, b), ds in zip(spans, seg_deepstacks):
+                    fvk.residual_add(
+                        cur[0, a:b].data_ptr(),
+                        ds[layer].to(torch.bfloat16).data_ptr(),
+                        (b - a) * hidden, stream)
                 cur = cur.contiguous()
 
         # Final RMSNorm + BF16 lm_head on the last row.
