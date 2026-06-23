@@ -134,9 +134,13 @@ class Qwen3VlTorchFrontendRtx:
 
         from flash_rt.frontends.torch import _qwen3_vl_geometry as geo
 
+        # device=self.device runs the fast image processor's resize /
+        # normalize / patchify on the GPU (~10x over the CPU path), so the
+        # whole preprocess is off the CPU.
         inputs = self.processor.apply_chat_template(
             messages, add_generation_prompt=True, tokenize=True,
-            return_dict=True, return_tensors='pt').to(self.device)
+            return_dict=True, return_tensors='pt',
+            device=self.device).to(self.device)
         input_ids = inputs['input_ids'][0]
         S = int(input_ids.shape[0])
         if S > self.max_seq:
