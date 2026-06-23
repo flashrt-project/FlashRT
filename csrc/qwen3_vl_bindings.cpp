@@ -43,6 +43,19 @@ void layer_norm_to_fp8_block128_bf16(
 void gelu_tanh_to_fp8_block128_bf16(
     const __nv_bfloat16* x, __nv_fp8_e4m3* out, float* scale,
     int rows, int dim, cudaStream_t stream);
+
+void gelu_tanh_bias_to_fp8_block128_bf16(
+    const __nv_bfloat16* x, const __nv_bfloat16* bias, __nv_fp8_e4m3* out,
+    float* scale, int rows, int dim, cudaStream_t stream);
+
+void residual_add_bias_bf16(
+    __nv_bfloat16* residual, const __nv_bfloat16* x,
+    const __nv_bfloat16* bias, int rows, int dim, cudaStream_t stream);
+
+void qkv_split_bias_bf16(
+    const __nv_bfloat16* qkv, const __nv_bfloat16* bias, __nv_bfloat16* q,
+    __nv_bfloat16* k, __nv_bfloat16* v, int rows, int hq, int hk, int hv,
+    cudaStream_t stream);
 }  // namespace kernels
 }  // namespace flash_rt
 
@@ -101,4 +114,43 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
         },
         py::arg("x"), py::arg("out"), py::arg("scale"), py::arg("rows"),
         py::arg("dim"), py::arg("stream") = 0);
+
+    m.def(
+        "gelu_tanh_bias_to_fp8_block128_bf16",
+        [](uintptr_t x, uintptr_t bias, uintptr_t out, uintptr_t scale,
+           int rows, int dim, uintptr_t stream) {
+            flash_rt::kernels::gelu_tanh_bias_to_fp8_block128_bf16(
+                as_ptr<const __nv_bfloat16>(x),
+                as_ptr<const __nv_bfloat16>(bias), as_ptr<__nv_fp8_e4m3>(out),
+                as_ptr<float>(scale), rows, dim, to_stream(stream));
+        },
+        py::arg("x"), py::arg("bias"), py::arg("out"), py::arg("scale"),
+        py::arg("rows"), py::arg("dim"), py::arg("stream") = 0);
+
+    m.def(
+        "residual_add_bias_bf16",
+        [](uintptr_t residual, uintptr_t x, uintptr_t bias, int rows, int dim,
+           uintptr_t stream) {
+            flash_rt::kernels::residual_add_bias_bf16(
+                as_ptr<__nv_bfloat16>(residual),
+                as_ptr<const __nv_bfloat16>(x),
+                as_ptr<const __nv_bfloat16>(bias), rows, dim,
+                to_stream(stream));
+        },
+        py::arg("residual"), py::arg("x"), py::arg("bias"), py::arg("rows"),
+        py::arg("dim"), py::arg("stream") = 0);
+
+    m.def(
+        "qkv_split_bias_bf16",
+        [](uintptr_t qkv, uintptr_t bias, uintptr_t q, uintptr_t k,
+           uintptr_t v, int rows, int hq, int hk, int hv, uintptr_t stream) {
+            flash_rt::kernels::qkv_split_bias_bf16(
+                as_ptr<const __nv_bfloat16>(qkv),
+                as_ptr<const __nv_bfloat16>(bias), as_ptr<__nv_bfloat16>(q),
+                as_ptr<__nv_bfloat16>(k), as_ptr<__nv_bfloat16>(v),
+                rows, hq, hk, hv, to_stream(stream));
+        },
+        py::arg("qkv"), py::arg("bias"), py::arg("q"), py::arg("k"),
+        py::arg("v"), py::arg("rows"), py::arg("hq"), py::arg("hk"),
+        py::arg("hv"), py::arg("stream") = 0);
 }

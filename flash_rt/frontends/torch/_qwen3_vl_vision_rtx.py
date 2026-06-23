@@ -156,7 +156,7 @@ class Qwen3VlVisionRtx:
 
     # ── primitives ──
 
-    def _gemm(self, x, lin, M, N, K, stream):
+    def _gemm(self, x, lin, M, N, K, stream, add_bias=True):
         """y = x @ W.T + bias via FP8 block-128 (2× tensor-core vs bf16).
 
         ``lin`` is a (weight_fp8, weight_block_scale, bias) tuple. The
@@ -185,7 +185,7 @@ class Qwen3VlVisionRtx:
             fvk.fp8_block128_gemm_cutlass_sm120_bf16out(
                 x_fp8.data_ptr(), w8.data_ptr(), y.data_ptr(), M, N, K,
                 x_scale.data_ptr(), ws.data_ptr(), stream)
-        if bias is not None:
+        if bias is not None and add_bias:
             fvk.add_bias_bf16(y.data_ptr(), bias.data_ptr(), M, N, stream)
         return y
 
@@ -197,13 +197,14 @@ class Qwen3VlVisionRtx:
             M, D, self.ln_eps, stream)
         return y
 
-    def _gemm_fp8(self, x_fp8, x_scale, lin, M, N, K, stream):
+    def _gemm_fp8(self, x_fp8, x_scale, lin, M, N, K, stream, add_bias=True):
         """FP8 block-128 GEMM from an already-quantized activation.
 
         ``x_fp8`` / ``x_scale`` are the FP8 e4m3 values and their per-token,
         per-128-K-block descale, as produced by the fused norm/gelu kernels.
         Same epilogue (bf16 out, optional bias) as the FP8 branch of
-        ``_gemm``; it just skips the internal quantization step.
+        ``_gemm``; it just skips the internal quantization step. ``add_bias``
+        False leaves the bias for a downstream fused kernel.
         """
         import torch
         w8, ws, bias = lin
@@ -211,7 +212,7 @@ class Qwen3VlVisionRtx:
         self._fvk.fp8_block128_gemm_cutlass_sm120_bf16out(
             x_fp8.data_ptr(), w8.data_ptr(), y.data_ptr(), M, N, K,
             x_scale.data_ptr(), ws.data_ptr(), stream)
-        if bias is not None:
+        if bias is not None and add_bias:
             self._fvk.add_bias_bf16(
                 y.data_ptr(), bias.data_ptr(), M, N, stream)
         return y
@@ -237,6 +238,17 @@ class Qwen3VlVisionRtx:
             x.data_ptr(), xf.data_ptr(), xs.data_ptr(), M, D, stream)
         return xf, xs
 
+    def _gelu_bias_to_fp8(self, x, bias, M, D, stream):
+        """fc1 bias + GELU-tanh + FP8 block-128 quant in one kernel (the
+        bias rides this op instead of a standalone add_bias)."""
+        import torch
+        xf = torch.empty(M, D, dtype=torch.float8_e4m3fn, device=self.device)
+        xs = torch.empty(M, D // 128, dtype=torch.float32, device=self.device)
+        self._vlk.gelu_tanh_bias_to_fp8_block128_bf16(
+            x.data_ptr(), bias.data_ptr(), xf.data_ptr(), xs.data_ptr(),
+            M, D, stream)
+        return xf, xs
+
     def _merger_forward(self, h, mg, stream):
         merge = self.spatial_merge_size * self.spatial_merge_size
         S = h.shape[0]
@@ -251,8 +263,14 @@ class Qwen3VlVisionRtx:
                 xs, mg['norm_w'], mg['norm_b'], xs.shape[0], norm_dim, stream)
         M = xn.shape[0]
         din = self.hidden * merge
-        f1 = self._gemm(xn, mg['fc1'], M, din, din, stream)
-        self._fvk.gelu_inplace(f1.data_ptr(), M * din, stream)
+        # fc1 bias rides the bias+GELU kernel (no standalone add_bias).
+        f1 = self._gemm(xn, mg['fc1'], M, din, din, stream, add_bias=False)
+        b1 = mg['fc1'][2]
+        if b1 is not None:
+            self._fvk.bias_gelu_inplace_bf16(
+                f1.data_ptr(), b1.data_ptr(), M, din, stream)
+        else:
+            self._fvk.gelu_inplace(f1.data_ptr(), M * din, stream)
         return self._gemm(f1, mg['fc2'], M, self.out_hidden, din, stream)
 
     # ── forward ──
@@ -304,13 +322,17 @@ class Qwen3VlVisionRtx:
             if fp8:
                 xf, xs = self._layer_norm_to_fp8(
                     h, blk['norm1_w'], blk['norm1_b'], S, H, stream)
-                qkv = self._gemm_fp8(xf, xs, blk['qkv'], S, 3 * H, H, stream)
+                qkv = self._gemm_fp8(xf, xs, blk['qkv'], S, 3 * H, H, stream,
+                                     add_bias=False)
             else:
                 xn = self._layer_norm(
                     h, blk['norm1_w'], blk['norm1_b'], S, H, stream)
-                qkv = self._gemm(xn, blk['qkv'], S, 3 * H, H, stream)
-            fvk.qkv_split(qkv.data_ptr(), q.data_ptr(), k.data_ptr(),
-                          v.data_ptr(), S, H, H, H, stream)
+                qkv = self._gemm(xn, blk['qkv'], S, 3 * H, H, stream,
+                                 add_bias=False)
+            # qkv bias rides the split (no standalone add_bias).
+            vlk.qkv_split_bias_bf16(
+                qkv.data_ptr(), blk['qkv'][2].data_ptr(), q.data_ptr(),
+                k.data_ptr(), v.data_ptr(), S, H, H, H, stream)
             vlk.rope_neox_qk_bf16(
                 q.data_ptr(), k.data_ptr(), rope_cos.data_ptr(),
                 rope_sin.data_ptr(), q.data_ptr(), k.data_ptr(),
@@ -330,24 +352,36 @@ class Qwen3VlVisionRtx:
                 o_strides=(o.stride(0), o.stride(1), o.stride(2)),
                 softmax_scale=scale, num_sms=self._num_sms, stream=stream)
             # proj input is the attention output (not a norm/gelu), so its
-            # quant cannot be fused upstream; keep the internal quant in _gemm.
-            attn = self._gemm(o.view(S, H), blk['proj'], S, H, H, stream)
-            fvk.residual_add(h.data_ptr(), attn.data_ptr(), S * H, stream)
+            # quant cannot be fused upstream; the proj bias rides the residual.
+            attn = self._gemm(o.view(S, H), blk['proj'], S, H, H, stream,
+                              add_bias=False)
+            vlk.residual_add_bias_bf16(
+                h.data_ptr(), attn.data_ptr(), blk['proj'][2].data_ptr(),
+                S, H, stream)
 
             inter = self.intermediate
             if fp8:
                 xf2, xs2 = self._layer_norm_to_fp8(
                     h, blk['norm2_w'], blk['norm2_b'], S, H, stream)
-                f1 = self._gemm_fp8(xf2, xs2, blk['fc1'], S, inter, H, stream)
-                gf, gs = self._gelu_to_fp8(f1, S, inter, stream)
-                f2 = self._gemm_fp8(gf, gs, blk['fc2'], S, H, inter, stream)
+                f1 = self._gemm_fp8(xf2, xs2, blk['fc1'], S, inter, H, stream,
+                                    add_bias=False)
+                gf, gs = self._gelu_bias_to_fp8(
+                    f1, blk['fc1'][2], S, inter, stream)
+                f2 = self._gemm_fp8(gf, gs, blk['fc2'], S, H, inter, stream,
+                                    add_bias=False)
             else:
                 xn2 = self._layer_norm(
                     h, blk['norm2_w'], blk['norm2_b'], S, H, stream)
-                f1 = self._gemm(xn2, blk['fc1'], S, inter, H, stream)
-                fvk.gelu_inplace(f1.data_ptr(), S * inter, stream)
-                f2 = self._gemm(f1, blk['fc2'], S, H, inter, stream)
-            fvk.residual_add(h.data_ptr(), f2.data_ptr(), S * H, stream)
+                f1 = self._gemm(xn2, blk['fc1'], S, inter, H, stream,
+                                add_bias=False)
+                fvk.bias_gelu_inplace_bf16(
+                    f1.data_ptr(), blk['fc1'][2].data_ptr(), S, inter, stream)
+                f2 = self._gemm(f1, blk['fc2'], S, H, inter, stream,
+                                add_bias=False)
+            # fc2 bias rides the residual.
+            vlk.residual_add_bias_bf16(
+                h.data_ptr(), f2.data_ptr(), blk['fc2'][2].data_ptr(),
+                S, H, stream)
 
             if i in self.deepstack_indexes:
                 j = self.deepstack_indexes.index(i)
