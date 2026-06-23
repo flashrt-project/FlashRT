@@ -19,22 +19,30 @@ RTX 5090 / sm_120 / 32 GB · NVFP4 W4A4 language stack · BF16 ViT tower
 image + text prompt, 1581 LLM tokens (1564 vision + 17 text), FlashRT.png
 ```
 
-| Metric | HF SDPA (bf16) | FlashRT |
-|---|---:|---:|
-| TTFT (prefill, image+text) | 206 ms | **99 ms** |
-| Decode (warm CUDA Graph)   | ~48 tok/s | **143 tok/s** |
+| Metric | HF SDPA (bf16) | vLLM 0.22 (bf16) | FlashRT |
+|---|---:|---:|---:|
+| TTFT (full request, image+text) | 206 ms | 126 ms | **~103 ms** |
+| Decode (warm CUDA Graph)   | ~48 tok/s | ~96 tok/s | **~150 tok/s** |
 
-TTFT is dominated by the ViT tower (~60 ms) plus the NVFP4 language
-prefill (~39 ms). After the FP8 GEMMs, the two remaining ViT costs are
-the full-attention over 6256 patches (~31 ms, ~75% of bf16 roofline at
-head_dim 72) and the FP8 GEMMs (~20 ms); both are compute-bound. Decode
-reuses the Qwen3-8B NVFP4 W4A4 + CUDA-Graph path and lands at the same
-~143 tok/s ceiling; the MRoPE position continues past the image while the
-KV-cache slot advances from the image-compressed prompt length.
+vLLM measured in-process on the same 5090 / same image, prefix-caching off
+(fresh prefill), full resolution (both at 1581 prompt tokens). FlashRT TTFT
+is GPU image preprocessing (~8 ms) + the **CUDA-graph prefill** (~95 ms);
+decode is the NVFP4 W4A4 + graph path. Both prefill and decode replay as
+pure-kernel CUDA graphs — no per-request Python/torch dispatch — which is
+where the stable lead over vLLM's eager V1 engine comes from.
 
-TTFT history on this path (5090): 621 ms (initial eager) → 121 ms (ViT
-FFN on the fast GEMM + bf16) → 102 ms (FP8 block-128 ViT GEMMs) → **99 ms**
-(FP8 activation quant fused into the producing LayerNorm / GELU).
+The prefill graph captures the whole single-image path (embed → ViT tower →
+image-feature scatter → NVFP4 layers + DeepStack → final norm) into one
+graph; lm_head runs eager on the last row. Multi-image / video fall back to
+the eager prefill. Inside the graph the costs are the ViT full-attention
+over 6256 patches (~31 ms, ~75 % bf16 roofline at head_dim 72), the FP8 +
+NVFP4 GEMMs, and the attention; all compute-bound.
+
+Prefill history on this path (5090, prefill-only ms): 621 → 121 (ViT FFN on
+the fast GEMM) → 102 (FP8 block-128 ViT GEMMs) → 99 (FP8 quant fused into
+LayerNorm/GELU) → **95** (merger FP8 + whole-prefill CUDA graph). Image
+preprocessing moved CPU → GPU (24 → 8 ms), so the full request TTFT is
+~103 ms.
 
 ### TTFT vs resolution (the dominant knob)
 
