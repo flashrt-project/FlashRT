@@ -434,13 +434,22 @@ def _pad_cols(t, n_cols: int):
 
 
 def _load_merger(load_fn, lin_fn, prefix: str) -> dict:
+    # The merger linears run FP8 block-128 when 128-aligned (the Qwen3-VL
+    # dims are): preflight showed image_embeds cosine 0.9703 -> 0.9698
+    # (argmax-safe) for ~-2.6 ms across the four mergers. The norm output is
+    # bounded post-LayerNorm, so FP8 here does not touch the massive-
+    # activation residual stream.
+    def _merger_lin(name):
+        w = load_fn(prefix + name + '.weight')
+        bias = load_fn(prefix + name + '.bias')
+        aligned = w.shape[0] % 128 == 0 and w.shape[1] % 128 == 0
+        return lin_fn(w, bias, fp8=aligned)
+
     return {
         'norm_w': load_fn(prefix + 'norm.weight'),
         'norm_b': load_fn(prefix + 'norm.bias'),
-        'fc1': lin_fn(load_fn(prefix + 'linear_fc1.weight'),
-                      load_fn(prefix + 'linear_fc1.bias'), fp8=False),
-        'fc2': lin_fn(load_fn(prefix + 'linear_fc2.weight'),
-                      load_fn(prefix + 'linear_fc2.bias'), fp8=False),
+        'fc1': _merger_lin('linear_fc1'),
+        'fc2': _merger_lin('linear_fc2'),
     }
 
 
