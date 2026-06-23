@@ -124,6 +124,18 @@ class Qwen3VlTorchFrontendRtx:
         # cache-slot -> captured decode CUDA Graph (rope baked at the
         # MRoPE-continuation position, which differs from the slot).
         self._decode_graphs: dict[int, Any] = {}
+        # Captured single-image prefill: (P,S,a,b) -> graph, plus the static
+        # input buffers set_prompt stages into and the persistent output
+        # buffers the replay + eager lm_head write.
+        self._prefill_graphs: dict = {}
+        self._pg_buffers: dict = {}
+        import torch as _torch
+        hidden = self.llm._cfg['hidden_size']
+        vocab = self.llm._cfg['vocab_size']
+        self._pg_last_hidden = _torch.empty(
+            self.max_seq, hidden, dtype=_torch.bfloat16, device=device)
+        self._pg_logits = _torch.empty(
+            1, vocab, dtype=_torch.bfloat16, device=device)
 
     # ── Prompt ──
 
@@ -212,6 +224,30 @@ class Qwen3VlTorchFrontendRtx:
             'pos_embeds': pos_embeds, 'S': S,
             'mrope_max': int(pos_ids.max()),
         }
+        # Single image: stage the captured-prefill static inputs here (this is
+        # one-time set-up glue), so prefill_graph's hot path is just replay +
+        # lm_head with no per-request torch copy.
+        if len(spans) == 1:
+            self._prompt['pg_key'] = self._stage_prefill_inputs(
+                seg_patches[0], S, spans[0])
+
+    _PG_KEYS = ('input_ids', 'pixel_values', 'pos_embeds',
+                'vcos', 'vsin', 'mcos', 'msin')
+
+    def _stage_prefill_inputs(self, P: int, S: int, span):
+        """Copy the per-prompt tensors into persistent static buffers keyed by
+        (P, S, a, b). The captured prefill graph reads only from these, so the
+        replay path needs no torch copy. Returns the key."""
+        p = self._prompt
+        key = (P, S, span[0], span[1])
+        bufs = self._pg_buffers.get(key)
+        if bufs is None:
+            bufs = {k: p[k].clone() for k in self._PG_KEYS}
+            self._pg_buffers[key] = bufs
+        else:
+            for k in self._PG_KEYS:
+                bufs[k].copy_(p[k])
+        return key
 
     # ── Forward ──
 
@@ -308,8 +344,9 @@ class Qwen3VlTorchFrontendRtx:
         n_layers = llm._cfg['num_hidden_layers']
 
         emb, ds = self.vision.forward(
-            st['pixel'], st['pos'], st['vcos'], st['vsin'])
-        h = llm._weights.anchors[0][st['ids']].to(bf16).view(1, S, hidden)
+            st['pixel_values'], st['pos_embeds'], st['vcos'], st['vsin'])
+        h = llm._weights.anchors[0][st['input_ids']].to(bf16).view(
+            1, S, hidden)
         h = h.contiguous()
         h[0, a:b] = emb.to(bf16)
 
@@ -365,55 +402,35 @@ class Qwen3VlTorchFrontendRtx:
         if self._prompt is None:
             raise RuntimeError('call set_prompt() before prefill_graph()')
         p = self._prompt
-        if len(p['spans']) != 1:
+        if p.get('pg_key') is None:           # multi-image / video: eager
             return self.prefill()
 
         llm = self.llm
         hidden = llm._cfg['hidden_size']
         vocab = llm._cfg['vocab_size']
         S = p['S']
-        P = p['seg_patches'][0]
-        a, b = p['spans'][0]
-        key = (P, S, a, b)
-        llm.reset_state()
+        key = p['pg_key']
+        P, _, a, b = key
+        st = self._pg_buffers[key]            # already staged by set_prompt
+        # No reset_state: the captured layers write K/V[0:S] (which is all the
+        # causal prefill reads), and the subsequent decode overwrites
+        # K/V[>=S] before reading it (same as qwen3_rtx.prefill_with_graph).
 
-        if not hasattr(self, '_pg_last_hidden'):
-            self._pg_last_hidden = torch.empty(
-                self.max_seq, hidden, dtype=torch.bfloat16, device=self.device)
-            self._prefill_graphs: dict = {}
-
-        entry = self._prefill_graphs.get(key)
-        if entry is None:
-            st = {
-                'ids': p['input_ids'].clone(),
-                'pixel': p['pixel_values'].clone(),
-                'pos': p['pos_embeds'].clone(),
-                'vcos': p['vcos'].clone(), 'vsin': p['vsin'].clone(),
-                'mcos': p['mcos'].clone(), 'msin': p['msin'].clone(),
-            }
+        graph = self._prefill_graphs.get(key)
+        if graph is None:
             graph = self._capture_prefill_graph(st, P, S, a, b)
-            entry = (graph, st)
-            self._prefill_graphs[key] = entry
-        graph, st = entry
+            self._prefill_graphs[key] = graph
 
-        st['ids'].copy_(p['input_ids'])
-        st['pixel'].copy_(p['pixel_values'])
-        st['pos'].copy_(p['pos_embeds'])
-        st['vcos'].copy_(p['vcos'])
-        st['vsin'].copy_(p['vsin'])
-        st['mcos'].copy_(p['mcos'])
-        st['msin'].copy_(p['msin'])
+        # Hot path: pure-kernel graph replay + eager lm_head (one buffer, no
+        # per-request torch alloc/copy).
         graph.replay()
-
         stream = torch.cuda.current_stream().cuda_stream
         last = self._pg_last_hidden[S - 1:S].contiguous()
-        logits = torch.empty(
-            1, vocab, dtype=torch.bfloat16, device=self.device)
         fvk.bf16_matmul_qwen36_bf16(
             last.data_ptr(), int(llm._weights.ptrs['lm_head_w']),
-            logits.data_ptr(), 1, vocab, hidden, stream)
+            self._pg_logits.data_ptr(), 1, vocab, hidden, stream)
         torch.cuda.synchronize()
-        return logits
+        return self._pg_logits
 
     def _ensure_decode_graph(self, cache_pos: int, rope_pos: int):
         """Lazy-capture a decode CUDA Graph for one cache slot.
