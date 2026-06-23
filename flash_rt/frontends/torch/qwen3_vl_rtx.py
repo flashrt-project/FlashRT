@@ -280,6 +280,137 @@ class Qwen3VlTorchFrontendRtx:
         torch.cuda.synchronize()
         return logits
 
+    # ── Prefill via a captured CUDA Graph (single image) ──
+
+    def _prefill_graph_body(self, st, P, S, a, b):
+        """Capture body: embed gather -> ViT tower -> scatter image features
+        -> NVFP4 decoder layers with DeepStack inject -> final RMSNorm into
+        ``self._pg_last_hidden[:S]``. No lm_head (run eager post-replay so one
+        graph serves all real_S <= bucket). All torch glue (gather/scatter/
+        clone/copy) traces into the graph, so replay is pure-kernel.
+
+        ``st`` is the dict of static input buffers; the graph reads only from
+        them. Mirrors the eager ``prefill`` single-image path exactly so
+        captured and eager hidden state match bit-for-bit.
+        """
+        import torch
+        from flash_rt import flash_rt_kernels as fvk
+
+        llm = self.llm
+        bf16 = torch.bfloat16
+        stream = torch.cuda.current_stream().cuda_stream
+        hidden = llm._cfg['hidden_size']
+        eps = float(llm._cfg['rms_norm_eps'])
+        n_layers = llm._cfg['num_hidden_layers']
+
+        emb, ds = self.vision.forward(
+            st['pixel'], st['pos'], st['vcos'], st['vsin'])
+        h = llm._weights.anchors[0][st['ids']].to(bf16).view(1, S, hidden)
+        h = h.contiguous()
+        h[0, a:b] = emb.to(bf16)
+
+        cur = h
+        for layer in range(n_layers):
+            cur = llm._layer_forward_full_nvfp4_prefill(
+                layer, cur, st['mcos'], st['msin'], 0, S)
+            if layer < self._deepstack_layers:
+                cur = cur.clone()
+                fvk.residual_add(
+                    cur[0, a:b].data_ptr(),
+                    ds[layer].to(bf16).data_ptr(), (b - a) * hidden, stream)
+                cur = cur.contiguous()
+
+        h2 = cur.view(S, hidden).contiguous()
+        fvk.rms_norm(
+            h2.data_ptr(), int(llm._weights.ptrs['final_norm_w']),
+            self._pg_last_hidden[:S].data_ptr(), S, hidden, eps, stream)
+
+    def _capture_prefill_graph(self, st, P, S, a, b):
+        """2-iter warmup then capture the prefill body for one (P,S,a) bucket.
+        Mirrors qwen3_rtx._ensure_prefill_graph (inference_mode + capture
+        stream)."""
+        import torch
+
+        llm = self.llm
+        gs = llm._graph_stream
+        gs.wait_stream(torch.cuda.current_stream())
+        # no_grad (not inference_mode) to match the ViT forward_graph and the
+        # decode-graph capture this composes with; inference_mode flags the
+        # ViT's per-call scratch as inference tensors and trips capture_begin.
+        with torch.cuda.stream(gs), torch.no_grad():
+            for _ in range(2):
+                self._prefill_graph_body(st, P, S, a, b)
+        gs.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=gs), torch.no_grad():
+            self._prefill_graph_body(st, P, S, a, b)
+        gs.synchronize()
+        torch.cuda.current_stream().wait_stream(gs)
+        return graph
+
+    def prefill_graph(self):
+        """Pure-kernel prefill via a captured CUDA Graph (single image).
+
+        Falls back to the eager ``prefill`` for multi-image / video (variable
+        segment structure is not graph-capturable). Returns ``(1, vocab)``
+        bf16 next-token logits.
+        """
+        import torch
+        from flash_rt import flash_rt_kernels as fvk
+
+        if self._prompt is None:
+            raise RuntimeError('call set_prompt() before prefill_graph()')
+        p = self._prompt
+        if len(p['spans']) != 1:
+            return self.prefill()
+
+        llm = self.llm
+        hidden = llm._cfg['hidden_size']
+        vocab = llm._cfg['vocab_size']
+        S = p['S']
+        P = p['seg_patches'][0]
+        a, b = p['spans'][0]
+        key = (P, S, a, b)
+        llm.reset_state()
+
+        if not hasattr(self, '_pg_last_hidden'):
+            self._pg_last_hidden = torch.empty(
+                self.max_seq, hidden, dtype=torch.bfloat16, device=self.device)
+            self._prefill_graphs: dict = {}
+
+        entry = self._prefill_graphs.get(key)
+        if entry is None:
+            st = {
+                'ids': p['input_ids'].clone(),
+                'pixel': p['pixel_values'].clone(),
+                'pos': p['pos_embeds'].clone(),
+                'vcos': p['vcos'].clone(), 'vsin': p['vsin'].clone(),
+                'mcos': p['mcos'].clone(), 'msin': p['msin'].clone(),
+            }
+            graph = self._capture_prefill_graph(st, P, S, a, b)
+            entry = (graph, st)
+            self._prefill_graphs[key] = entry
+        graph, st = entry
+
+        st['ids'].copy_(p['input_ids'])
+        st['pixel'].copy_(p['pixel_values'])
+        st['pos'].copy_(p['pos_embeds'])
+        st['vcos'].copy_(p['vcos'])
+        st['vsin'].copy_(p['vsin'])
+        st['mcos'].copy_(p['mcos'])
+        st['msin'].copy_(p['msin'])
+        graph.replay()
+
+        stream = torch.cuda.current_stream().cuda_stream
+        last = self._pg_last_hidden[S - 1:S].contiguous()
+        logits = torch.empty(
+            1, vocab, dtype=torch.bfloat16, device=self.device)
+        fvk.bf16_matmul_qwen36_bf16(
+            last.data_ptr(), int(llm._weights.ptrs['lm_head_w']),
+            logits.data_ptr(), 1, vocab, hidden, stream)
+        torch.cuda.synchronize()
+        return logits
+
     def _ensure_decode_graph(self, cache_pos: int, rope_pos: int):
         """Lazy-capture a decode CUDA Graph for one cache slot.
 
@@ -332,7 +463,7 @@ class Qwen3VlTorchFrontendRtx:
         captured CUDA Graph for each decode step.
         """
         self.set_prompt(messages)
-        logits = self.prefill()
+        logits = self.prefill_graph()
         llm = self.llm
         p = self._prompt
         base_slot, base_rope = p['S'], p['mrope_max'] + 1
