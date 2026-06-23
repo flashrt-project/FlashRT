@@ -21,39 +21,47 @@ image + text prompt, 1581 LLM tokens (1564 vision + 17 text), FlashRT.png
 
 | Metric | HF SDPA (bf16) | FlashRT |
 |---|---:|---:|
-| TTFT (prefill, image+text) | 206 ms | **99 ms** |
-| Decode (warm CUDA Graph)   | ~48 tok/s | **143 tok/s** |
+| TTFT (full request, image+text) | 206 ms | **~100 ms** |
+| Decode (warm CUDA Graph)   | ~48 tok/s | **~150 tok/s** |
 
-TTFT is dominated by the ViT tower (~60 ms) plus the NVFP4 language
-prefill (~39 ms). After the FP8 GEMMs, the two remaining ViT costs are
-the full-attention over 6256 patches (~31 ms, ~75% of bf16 roofline at
-head_dim 72) and the FP8 GEMMs (~20 ms); both are compute-bound. Decode
-reuses the Qwen3-8B NVFP4 W4A4 + CUDA-Graph path and lands at the same
-~143 tok/s ceiling; the MRoPE position continues past the image while the
-KV-cache slot advances from the image-compressed prompt length.
+Same 5090, FlashRT.png, full resolution (1581 prompt tokens). FlashRT TTFT
+is GPU image preprocessing (~8 ms) + the **CUDA-graph prefill** (~93 ms);
+decode is the NVFP4 W4A4 + graph path. Both prefill and decode replay as
+pure-kernel CUDA graphs (no per-request Python/torch dispatch), so latency
+is low and stable.
 
-TTFT history on this path (5090): 621 ms (initial eager) → 121 ms (ViT
-FFN on the fast GEMM + bf16) → 102 ms (FP8 block-128 ViT GEMMs) → **99 ms**
-(FP8 activation quant fused into the producing LayerNorm / GELU).
+The prefill graph captures the whole single-image path (embed → ViT tower →
+image-feature scatter → NVFP4 layers + DeepStack → final norm) into one
+graph; lm_head runs eager on the last row. Multi-image / video fall back to
+the eager prefill. Inside the graph the costs are the ViT full-attention
+over 6256 patches (~31 ms, ~75 % bf16 roofline at head_dim 72), the FP8 +
+NVFP4 GEMMs, and the attention; all compute-bound.
+
+Prefill history on this path (5090, prefill-only ms): 621 → 121 (ViT FFN on
+the fast GEMM) → 102 (FP8 block-128 ViT GEMMs) → 99 (FP8 quant fused into
+LayerNorm/GELU) → 95 (merger FP8 + whole-prefill CUDA graph) → **93** (ViT
+bias adds fused into adjacent kernels). Image preprocessing moved CPU → GPU
+(24 → 8 ms), so the full request TTFT is ~100 ms.
 
 ### TTFT vs resolution (the dominant knob)
 
-The 99 ms above is the **full-resolution** benchmark: the 2172×724 image
+The ~100 ms above is the **full-resolution** benchmark: the 2172×724 image
 patchifies to 6256 patches → 1564 of the 1581 LLM tokens are vision. The
 patch count (≈ pixels / 16²) sets both the ViT cost and the LLM prefill
 length, so capping resolution cuts both at once. Pass ``max_pixels`` (the
 processor's smart_resize rounds to the patch grid); the description is
-unchanged across this range:
+unchanged across this range (full-request TTFT = GPU preprocessing + graph
+prefill):
 
 | `max_pixels` | patches | LLM tokens | TTFT |
 |---|---:|---:|---:|
-| none (full) | 6256 | 1581 | 99 ms |
-| 1.0 M | 3888 | 989 | 57 ms |
-| 0.5 M | 1824 | 473 | **30 ms** |
-| 0.25 M | 972 | 260 | 22 ms |
+| none (full) | 6256 | 1581 | 100 ms |
+| 1.0 M | 3888 | 989 | 59 ms |
+| 0.5 M | 1824 | 473 | **32 ms** |
+| 0.25 M | 972 | 260 | 25 ms |
 
 ```python
-fe = Qwen3VlTorchFrontendRtx(ckpt, max_pixels=1_000_000)  # or pass --max-pixels
+fe = Qwen3VlTorchFrontendRtx(ckpt, max_pixels=1_000_000)  # or --max-pixels
 ```
 
 Reproduce:
@@ -162,7 +170,11 @@ images and videos.
 
 Per-prompt geometry (3D MRoPE position ids, MRoPE / vision-RoPE tables,
 the interpolated vision position embedding) is precomputed once in
-`set_prompt`; the forward runs only kernels. The vision tower's
+`set_prompt` (with the image processor running on the GPU), which also
+stages the captured-prefill static input buffers. The single-image prefill
+then replays as one CUDA graph — pure kernel, no torch dispatch — and the
+eager paths (`prefill`, multi-image / video) run only kernels. The vision
+tower's
 intermediate (4304) is zero-padded to 4352 at load so every FFN GEMM uses
 the fast `w16a16` kernel (the unpadded fc2 fell back to an M=1-tuned
 matmul that dominated the tower at ~19 ms/call).
@@ -208,8 +220,11 @@ the description is unchanged).
   grid is split per frame so each frame's temporal index is 0 and the
   inter-frame timestamp text tokens carry the temporal position). Frame
   sampling follows the processor defaults.
-- **Next TTFT levers** (both need new kernels): an FP8 ViT attention
-  (Sage/FA on sm_120 only ships head_dim 128/256, so head_dim 72 would
-  need padding), and an FP8 language prefill (the stack is NVFP4, whose
-  large-M GEMM dequantizes to bf16 compute).
+- **Compute core is at the kernel floor for this shape** (measured): the
+  ViT attention (bf16 FA2, head_dim 72) ties the best community kernels
+  (sm_120 has no FP8/INT8 attention that holds the accuracy — INT8-QK
+  collapses image_embeds cosine), and the NVFP4 language prefill GEMM is
+  already faster than an FP8 block-128 path at these shapes. Further TTFT
+  comes from capping `max_pixels` (above) or an algorithm change (fewer
+  patches / windowed attention) that would alter outputs.
 - **No KV-cache offload**; prompt + generation must fit in `max_seq`.
