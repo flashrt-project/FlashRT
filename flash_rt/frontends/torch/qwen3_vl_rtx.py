@@ -30,6 +30,9 @@ _QWEN3_VL_KERNEL_FNS = (
     'rope_neox_qk_bf16',
     'layer_norm_to_fp8_block128_bf16',
     'gelu_tanh_to_fp8_block128_bf16',
+    'gelu_tanh_bias_to_fp8_block128_bf16',
+    'residual_add_bias_bf16',
+    'qkv_split_bias_bf16',
 )
 
 

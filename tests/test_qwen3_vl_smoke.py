@@ -47,6 +47,24 @@ def test_require_kernels_fails_fast_on_missing_symbols():
     assert 'FLASHRT_BUILD_QWEN3_VL' in str(ei.value)
 
 
+def test_fail_fast_on_each_missing_symbol():
+    """Dropping ANY single required symbol (e.g. a stale .so without the
+    fused-bias kernels) must raise at the check, naming the missing one —
+    not crash mid-ViT with an AttributeError."""
+    from flash_rt.frontends.torch.qwen3_vl_rtx import (
+        _QWEN3_VL_KERNEL_FNS,
+        _check_qwen3_vl_kernels,
+    )
+
+    for missing in _QWEN3_VL_KERNEL_FNS:
+        stub = type('Stub', (), {fn: (lambda *a, **k: None)
+                                 for fn in _QWEN3_VL_KERNEL_FNS
+                                 if fn != missing})()
+        with pytest.raises(RuntimeError) as ei:
+            _check_qwen3_vl_kernels(stub)
+        assert missing in str(ei.value)
+
+
 def test_kernel_module_complete_when_built():
     """If the gated module is built, it must expose every symbol the tower
     calls (otherwise skip -- this build did not enable it)."""
