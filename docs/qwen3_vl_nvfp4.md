@@ -19,17 +19,16 @@ RTX 5090 / sm_120 / 32 GB · NVFP4 W4A4 language stack · BF16 ViT tower
 image + text prompt, 1581 LLM tokens (1564 vision + 17 text), FlashRT.png
 ```
 
-| Metric | HF SDPA (bf16) | vLLM 0.22 (bf16) | FlashRT |
-|---|---:|---:|---:|
-| TTFT (full request, image+text) | 206 ms | 126 ms | **~103 ms** |
-| Decode (warm CUDA Graph)   | ~48 tok/s | ~96 tok/s | **~150 tok/s** |
+| Metric | HF SDPA (bf16) | FlashRT |
+|---|---:|---:|
+| TTFT (full request, image+text) | 206 ms | **~103 ms** |
+| Decode (warm CUDA Graph)   | ~48 tok/s | **~150 tok/s** |
 
-vLLM measured in-process on the same 5090 / same image, prefix-caching off
-(fresh prefill), full resolution (both at 1581 prompt tokens). FlashRT TTFT
+Same 5090, FlashRT.png, full resolution (1581 prompt tokens). FlashRT TTFT
 is GPU image preprocessing (~8 ms) + the **CUDA-graph prefill** (~95 ms);
 decode is the NVFP4 W4A4 + graph path. Both prefill and decode replay as
-pure-kernel CUDA graphs — no per-request Python/torch dispatch — which is
-where the stable lead over vLLM's eager V1 engine comes from.
+pure-kernel CUDA graphs (no per-request Python/torch dispatch), so latency
+is low and stable.
 
 The prefill graph captures the whole single-image path (embed → ViT tower →
 image-feature scatter → NVFP4 layers + DeepStack → final norm) into one
@@ -46,19 +45,20 @@ preprocessing moved CPU → GPU (24 → 8 ms), so the full request TTFT is
 
 ### TTFT vs resolution (the dominant knob)
 
-The 99 ms above is the **full-resolution** benchmark: the 2172×724 image
+The ~103 ms above is the **full-resolution** benchmark: the 2172×724 image
 patchifies to 6256 patches → 1564 of the 1581 LLM tokens are vision. The
 patch count (≈ pixels / 16²) sets both the ViT cost and the LLM prefill
 length, so capping resolution cuts both at once. Pass ``max_pixels`` (the
 processor's smart_resize rounds to the patch grid); the description is
-unchanged across this range:
+unchanged across this range (full-request TTFT = GPU preprocessing + graph
+prefill):
 
 | `max_pixels` | patches | LLM tokens | TTFT |
 |---|---:|---:|---:|
-| none (full) | 6256 | 1581 | 99 ms |
-| 1.0 M | 3888 | 989 | 57 ms |
-| 0.5 M | 1824 | 473 | **30 ms** |
-| 0.25 M | 972 | 260 | 22 ms |
+| none (full) | 6256 | 1581 | 103 ms |
+| 1.0 M | 3888 | 989 | 60 ms |
+| 0.5 M | 1824 | 473 | **33 ms** |
+| 0.25 M | 972 | 260 | 25 ms |
 
 ```python
 fe = Qwen3VlTorchFrontendRtx(ckpt, max_pixels=1_000_000)  # or pass --max-pixels
@@ -170,7 +170,11 @@ images and videos.
 
 Per-prompt geometry (3D MRoPE position ids, MRoPE / vision-RoPE tables,
 the interpolated vision position embedding) is precomputed once in
-`set_prompt`; the forward runs only kernels. The vision tower's
+`set_prompt` (with the image processor running on the GPU), which also
+stages the captured-prefill static input buffers. The single-image prefill
+then replays as one CUDA graph — pure kernel, no torch dispatch — and the
+eager paths (`prefill`, multi-image / video) run only kernels. The vision
+tower's
 intermediate (4304) is zero-padded to 4352 at load so every FFN GEMM uses
 the fast `w16a16` kernel (the unpadded fc2 fell back to an M=1-tuned
 matmul that dominated the tower at ~19 ms/call).
@@ -216,8 +220,11 @@ the description is unchanged).
   grid is split per frame so each frame's temporal index is 0 and the
   inter-frame timestamp text tokens carry the temporal position). Frame
   sampling follows the processor defaults.
-- **Next TTFT levers** (both need new kernels): an FP8 ViT attention
-  (Sage/FA on sm_120 only ships head_dim 128/256, so head_dim 72 would
-  need padding), and an FP8 language prefill (the stack is NVFP4, whose
-  large-M GEMM dequantizes to bf16 compute).
+- **Compute core is at the kernel floor for this shape** (measured): the
+  ViT attention (bf16 FA2, head_dim 72) ties the best community kernels
+  (sm_120 has no FP8/INT8 attention that holds the accuracy — INT8-QK
+  collapses image_embeds cosine), and the NVFP4 language prefill GEMM is
+  already faster than an FP8 block-128 path at these shapes. Further TTFT
+  comes from capping `max_pixels` (above) or an algorithm change (fewer
+  patches / windowed attention) that would alter outputs.
 - **No KV-cache offload**; prompt + generation must fit in `max_seq`.
