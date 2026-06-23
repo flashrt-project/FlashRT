@@ -137,6 +137,35 @@ __global__ void gelu_tanh_to_fp8_block128_kernel(
   }
 }
 
+// Like ``gelu_tanh_to_fp8_block128_kernel`` but adds a per-column bias
+// before the GELU (``bias`` is broadcast over rows). Fuses the preceding
+// GEMM's bias add into this op so it never round-trips through HBM.
+__global__ void gelu_tanh_bias_to_fp8_block128_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ bias,
+    __nv_fp8_e4m3* __restrict__ out,
+    float* __restrict__ scale,
+    int dim) {
+  __shared__ float sh[4];
+  const int m = blockIdx.x;
+  const int t = threadIdx.x;
+  const __nv_bfloat16* xr = x + static_cast<long>(m) * dim;
+  __nv_fp8_e4m3* orow = out + static_cast<long>(m) * dim;
+
+  const int n_kb = dim / kBlock;
+  for (int kb = 0; kb < n_kb; ++kb) {
+    const int i = kb * kBlock + t;
+    const float g = gelu_tanh(
+        __bfloat162float(xr[i]) + __bfloat162float(bias[i]));
+    const float amax = block_reduce128(fabsf(g), sh, true);
+    const float sc = fmaxf(amax / kFp8Max, 1.0e-12f);
+    if (t == 0) scale[m * n_kb + kb] = sc;
+    float q = g / sc;
+    q = fminf(fmaxf(q, -kFp8Max), kFp8Max);
+    orow[i] = __nv_fp8_e4m3(q);
+  }
+}
+
 }  // namespace
 
 void layer_norm_to_fp8_block128_bf16(
@@ -152,6 +181,14 @@ void gelu_tanh_to_fp8_block128_bf16(
     int rows, int dim, cudaStream_t stream) {
   gelu_tanh_to_fp8_block128_kernel<<<rows, kBlock, 0, stream>>>(
       x, out, scale, dim);
+}
+
+void gelu_tanh_bias_to_fp8_block128_bf16(
+    const __nv_bfloat16* x, const __nv_bfloat16* bias,
+    __nv_fp8_e4m3* out, float* scale, int rows, int dim,
+    cudaStream_t stream) {
+  gelu_tanh_bias_to_fp8_block128_kernel<<<rows, kBlock, 0, stream>>>(
+      x, bias, out, scale, dim);
 }
 
 }  // namespace kernels
