@@ -21,11 +21,11 @@ image + text prompt, 1581 LLM tokens (1564 vision + 17 text), FlashRT.png
 
 | Metric | HF SDPA (bf16) | FlashRT |
 |---|---:|---:|
-| TTFT (full request, image+text) | 206 ms | **~103 ms** |
+| TTFT (full request, image+text) | 206 ms | **~100 ms** |
 | Decode (warm CUDA Graph)   | ~48 tok/s | **~150 tok/s** |
 
 Same 5090, FlashRT.png, full resolution (1581 prompt tokens). FlashRT TTFT
-is GPU image preprocessing (~8 ms) + the **CUDA-graph prefill** (~95 ms);
+is GPU image preprocessing (~8 ms) + the **CUDA-graph prefill** (~93 ms);
 decode is the NVFP4 W4A4 + graph path. Both prefill and decode replay as
 pure-kernel CUDA graphs (no per-request Python/torch dispatch), so latency
 is low and stable.
@@ -39,13 +39,13 @@ NVFP4 GEMMs, and the attention; all compute-bound.
 
 Prefill history on this path (5090, prefill-only ms): 621 → 121 (ViT FFN on
 the fast GEMM) → 102 (FP8 block-128 ViT GEMMs) → 99 (FP8 quant fused into
-LayerNorm/GELU) → **95** (merger FP8 + whole-prefill CUDA graph). Image
-preprocessing moved CPU → GPU (24 → 8 ms), so the full request TTFT is
-~103 ms.
+LayerNorm/GELU) → 95 (merger FP8 + whole-prefill CUDA graph) → **93** (ViT
+bias adds fused into adjacent kernels). Image preprocessing moved CPU → GPU
+(24 → 8 ms), so the full request TTFT is ~100 ms.
 
 ### TTFT vs resolution (the dominant knob)
 
-The ~103 ms above is the **full-resolution** benchmark: the 2172×724 image
+The ~100 ms above is the **full-resolution** benchmark: the 2172×724 image
 patchifies to 6256 patches → 1564 of the 1581 LLM tokens are vision. The
 patch count (≈ pixels / 16²) sets both the ViT cost and the LLM prefill
 length, so capping resolution cuts both at once. Pass ``max_pixels`` (the
@@ -55,13 +55,13 @@ prefill):
 
 | `max_pixels` | patches | LLM tokens | TTFT |
 |---|---:|---:|---:|
-| none (full) | 6256 | 1581 | 103 ms |
-| 1.0 M | 3888 | 989 | 60 ms |
-| 0.5 M | 1824 | 473 | **33 ms** |
+| none (full) | 6256 | 1581 | 100 ms |
+| 1.0 M | 3888 | 989 | 59 ms |
+| 0.5 M | 1824 | 473 | **32 ms** |
 | 0.25 M | 972 | 260 | 25 ms |
 
 ```python
-fe = Qwen3VlTorchFrontendRtx(ckpt, max_pixels=1_000_000)  # or pass --max-pixels
+fe = Qwen3VlTorchFrontendRtx(ckpt, max_pixels=1_000_000)  # or --max-pixels
 ```
 
 Reproduce:
