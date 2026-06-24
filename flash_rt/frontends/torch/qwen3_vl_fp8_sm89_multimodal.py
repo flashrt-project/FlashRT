@@ -99,7 +99,7 @@ class Qwen3VlFp8Sm89Frontend:
                 if isinstance(size, dict) and 'longest_edge' in size:
                     size['longest_edge'] = int(max_pixels)
         self._prompt: dict[str, Any] | None = None
-        self._decode_graphs: dict[int, Any] = {}
+        self._decode_graphs: dict[tuple[int, int], Any] = {}
         self._prefill_graphs: dict = {}
         self._pg_buffers: dict = {}
 
@@ -123,6 +123,7 @@ class Qwen3VlFp8Sm89Frontend:
 
         from flash_rt.frontends.torch import _qwen3_vl_geometry as geo
 
+        self._decode_graphs.clear()
         inputs = self.processor.apply_chat_template(
             messages, add_generation_prompt=True, tokenize=True,
             return_dict=True, return_tensors='pt',
@@ -305,7 +306,8 @@ class Qwen3VlFp8Sm89Frontend:
     def _ensure_decode_graph(self, cache_pos: int, rope_pos: int):
         import torch
 
-        graph = self._decode_graphs.get(cache_pos)
+        key = (int(cache_pos), int(rope_pos))
+        graph = self._decode_graphs.get(key)
         if graph is not None:
             return graph
         llm = self.llm
@@ -323,7 +325,7 @@ class Qwen3VlFp8Sm89Frontend:
                 llm._static_token_id, cos, sin, cache_pos)
         gs.synchronize()
         torch.cuda.current_stream().wait_stream(gs)
-        self._decode_graphs[cache_pos] = graph
+        self._decode_graphs[key] = graph
         return graph
 
     def decode_step_with_graph(self, token_id, cache_pos: int):

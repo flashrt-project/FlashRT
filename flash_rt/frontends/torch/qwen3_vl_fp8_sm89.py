@@ -45,6 +45,45 @@ class Qwen3VlFp8Sm89TextFrontend:
         self._cur_pos = 0
         self._decode_graphs: dict[int, Any] = {}
 
+        import torch
+        from flash_rt import flash_rt_kernels as fvk
+
+        device_obj = torch.device(self.device)
+        if device_obj.type != 'cuda' or not torch.cuda.is_available():
+            raise RuntimeError(
+                'Qwen3VlFp8Sm89TextFrontend requires an SM89 CUDA device')
+        cap = torch.cuda.get_device_capability(device_obj)
+        if cap != (8, 9):
+            raise RuntimeError(
+                'Qwen3VlFp8Sm89TextFrontend requires GPU_ARCH=89 / sm_89; '
+                f'got sm_{cap[0]}{cap[1]} on {self.device}')
+        required = (
+            'fp8_block128_gemm_blockscaled_sm89_bf16out',
+            'ht_gemv_fp8_block128_m1_w8',
+            'ht_gemv_fp8_block128_m1_w16',
+            'fp8_per_token_block128_quant_bf16',
+            'rms_norm_to_fp8_block128_bf16',
+            'residual_add_rms_norm_to_fp8_block128_bf16',
+            'silu_mul_to_fp8_block128_bf16',
+            'qwen3_qk_norm_rope_kvwrite_bf16',
+            'qwen3_qk_norm_rope_kvwrite_batched_bf16',
+            'qwen3_q_norm_rope_qstage_bf16',
+            'qwen3_k_norm_rope_kvwrite_bf16',
+            'qwen36_embedding_lookup_bf16',
+            'bf16_matmul_qwen36_bf16',
+            'rms_norm',
+            'residual_add',
+        )
+        missing = [name for name in required if not hasattr(fvk, name)]
+        if missing:
+            raise RuntimeError(
+                'flash_rt_kernels is missing SM89 Qwen3-VL FP8 symbols: '
+                + ', '.join(missing)
+                + '. Rebuild with -DGPU_ARCH=89 -DFLASHRT_BUILD_QWEN3_VL=ON '
+                'and build flash_rt_kernels flash_rt_fa2 '
+                'flash_rt_qwen3_vl_kernels.')
+        self._fvk = fvk
+
         self._load_fp8_path()
         self._alloc_buffers()
         self._build_rope_table()
@@ -52,7 +91,6 @@ class Qwen3VlFp8Sm89TextFrontend:
     def _load_fp8_path(self) -> None:
         from transformers import AutoTokenizer
 
-        from flash_rt import flash_rt_kernels as fvk
         from flash_rt.frontends.torch._qwen3_vl_fp8_weights import (
             assert_extraction_invariants_qwen3_vl_fp8,
             extract_weights_qwen3_vl_fp8,
@@ -78,7 +116,6 @@ class Qwen3VlFp8Sm89TextFrontend:
             'rope_theta': float(p['rope_theta']),
             'rotary_dim': int(p['head_dim']),
         }
-        self._fvk = fvk
 
     def _alloc_buffers(self) -> None:
         import torch

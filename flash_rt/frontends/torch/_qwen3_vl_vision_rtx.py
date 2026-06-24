@@ -7,9 +7,9 @@ merger, with DeepStack feature taps at the configured layers.
 
 All heavy compute runs through ``flash_rt_kernels`` / ``flash_rt_fa2`` /
 ``flash_rt_qwen3_vl_kernels``; tensor reshapes are metadata-only views.
-On SM120 the linear layers run FP8 block-128 W8A8 (2× tensor-core vs bf16);
-on SM89 the same tower uses the BF16 GEMM path because the SM120 FP8 GEMM
-binding is not available on Ada. In both cases the residual stream (which
+On SM120 the linears use the CUTLASS block-128 FP8 path; on SM89 eligible
+linears use the native Ada block-128 FP8 GEMM. BF16-protected linears use the
+architecture-specific BF16 path. In all cases the residual stream (which
 carries the late-layer massive-activation outlier) stays bf16.
 The tower is prefill-once per image and the sequence length is
 image-resolution dependent, so scratch is sized per forward (CUDA-Graph
