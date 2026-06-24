@@ -177,6 +177,35 @@ def mrope_cos_sin(position_ids, *, head_dim, rope_theta, mrope_section,
     return cos, sin
 
 
+def build_mrope_cache(*, max_pos, head_dim, rope_theta,
+                      device='cuda:0', dtype=torch.bfloat16):
+    """Precompute per-axis MRoPE cos/sin lookup tables.
+
+    Returns (cos_cache, sin_cache), each (max_pos, head_dim/2). The caller
+    applies Qwen3-VL's interleaving policy for t/h/w axes.
+    """
+    inv_freq = 1.0 / (rope_theta ** (
+        torch.arange(0, head_dim, 2, device=device,
+                     dtype=torch.float32) / head_dim))
+    positions = torch.arange(max_pos, device=device, dtype=torch.float32)
+    freqs = torch.outer(positions, inv_freq)
+    return (freqs.cos().to(dtype).contiguous(),
+            freqs.sin().to(dtype).contiguous())
+
+
+def mrope_cos_sin_cached(position_ids, cos_cache, sin_cache, *,
+                         mrope_section):
+    """Gather interleaved-MRoPE cos/sin from precomputed lookup tables."""
+    pos = position_ids.to(device=cos_cache.device, dtype=torch.long)
+    cos = cos_cache[pos[0]].clone()
+    sin = sin_cache[pos[0]].clone()
+    for axis, offset in ((1, 1), (2, 2)):
+        idx = slice(offset, mrope_section[axis] * 3, 3)
+        cos[:, idx] = cos_cache[pos[axis]][:, idx]
+        sin[:, idx] = sin_cache[pos[axis]][:, idx]
+    return cos.contiguous(), sin.contiguous()
+
+
 def vision_rope_cos_sin(grid_thw, *, head_dim, spatial_merge_size,
                         rope_theta=10000.0, device='cuda:0',
                         dtype=torch.bfloat16):
@@ -212,6 +241,45 @@ def vision_rope_cos_sin(grid_thw, *, head_dim, spatial_merge_size,
     cos = freqs.cos().to(device).to(dtype).contiguous()
     sin = freqs.sin().to(device).to(dtype).contiguous()
     return cos, sin
+
+
+def build_vision_rope_cache(*, max_hw, head_dim, rope_theta=10000.0,
+                            device='cuda:0', dtype=torch.bfloat16):
+    """Precompute rotate-half 2D-RoPE cos/sin lookup tables per coordinate."""
+    dim = head_dim // 2
+    inv_freq = 1.0 / (rope_theta ** (
+        torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    coords = torch.arange(max_hw, dtype=torch.float32)
+    freqs = torch.outer(coords, inv_freq)
+    return (freqs.cos().to(device).to(dtype).contiguous(),
+            freqs.sin().to(device).to(dtype).contiguous())
+
+
+def vision_rope_cos_sin_cached(grid_thw, cos_cache, sin_cache, *,
+                               spatial_merge_size):
+    """Gather rotate-half 2D-RoPE cos/sin from precomputed coordinate tables."""
+    coords = []
+    device = cos_cache.device
+    for t, h, w in grid_thw:
+        t, h, w = int(t), int(h), int(w)
+        mh, mw = h // spatial_merge_size, w // spatial_merge_size
+        m = spatial_merge_size
+        rows = (torch.arange(mh, device=device)[:, None, None, None] * m
+                + torch.arange(m, device=device)[None, None, :, None])
+        cols = (torch.arange(mw, device=device)[None, :, None, None] * m
+                + torch.arange(m, device=device)[None, None, None, :])
+        rows = rows.expand(mh, mw, m, m).reshape(-1)
+        cols = cols.expand(mh, mw, m, m).reshape(-1)
+        c = torch.stack((rows, cols), dim=-1)
+        if t > 1:
+            c = c.repeat(t, 1)
+        coords.append(c)
+    pos_ids = torch.cat(coords, dim=0)
+    cos = torch.cat((cos_cache[pos_ids[:, 0]], cos_cache[pos_ids[:, 1]]),
+                    dim=1)
+    sin = torch.cat((sin_cache[pos_ids[:, 0]], sin_cache[pos_ids[:, 1]]),
+                    dim=1)
+    return cos.contiguous(), sin.contiguous()
 
 
 def vision_pos_embeds(grid_thw, pos_embed_table, *, num_grid_per_side,

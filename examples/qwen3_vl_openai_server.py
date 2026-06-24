@@ -2,9 +2,11 @@
 """Minimal OpenAI-compatible vision chat server for Qwen3-VL on FlashRT.
 
 Exposes ``POST /v1/chat/completions`` (non-streaming) for image+text
-chat, backed by the FlashRT Qwen3-VL NVFP4 path. Multimodal messages use
-the OpenAI ``image_url`` content format (``http(s)://`` or ``data:`` base64
-URLs). Single-GPU, batch 1; concurrent requests are serialised.
+chat, backed by the FlashRT Qwen3-VL RTX path. ``--arch sm120`` expects the
+FlashRT NVFP4 checkpoint; ``--arch sm89`` expects the official FP8
+checkpoint. Multimodal messages use the OpenAI ``image_url`` content format
+(``http(s)://`` or ``data:`` base64 URLs). Single-GPU, batch 1; concurrent
+requests are serialised.
 
     pip install fastapi uvicorn
     python examples/qwen3_vl_openai_server.py \\
@@ -67,6 +69,8 @@ def _to_frontend_messages(messages: list) -> list:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--checkpoint', required=True)
+    p.add_argument('--arch', default='sm120', choices=('sm120', 'sm89'),
+                   help='RTX route: sm120 NVFP4 or sm89 official FP8')
     p.add_argument('--host', default='0.0.0.0')
     p.add_argument('--port', type=int, default=8000)
     p.add_argument('--device', default='cuda:0')
@@ -75,6 +79,19 @@ def main() -> None:
     p.add_argument('--max-pixels', type=int, default=None,
                    help='cap image/video resolution (pixels) to bound TTFT; '
                         'default keeps full resolution')
+    p.add_argument('--max-prefill-seq', type=int, default=None,
+                   help='SM89 official-FP8 prefill buffer length; default '
+                        'uses min(max_seq, 128). Only valid with --arch sm89.')
+    p.add_argument('--fuse-gate-up', action='store_true',
+                   help='use SM89 official-FP8 fused gate/up weight when '
+                        'available. Only valid with --arch sm89.')
+    p.add_argument('--fp8-lm-head', action='store_true',
+                   help='use the SM89 official-FP8 explicit experimental '
+                        'FP8 lm_head mode. Only valid with --arch sm89.')
+    p.add_argument('--vision-bf16-first-blocks', type=int, default=3,
+                   help='SM89 vision path: keep the first N ViT blocks in '
+                        'BF16 before switching linears to FP8. '
+                        'Only valid with --arch sm89.')
     p.add_argument('--model-name', default='qwen3-vl')
     args = p.parse_args()
 
@@ -83,11 +100,33 @@ def main() -> None:
     import uvicorn
     from fastapi import FastAPI, HTTPException
 
-    from flash_rt.frontends.torch.qwen3_vl_rtx import Qwen3VlTorchFrontendRtx
+    if args.arch == 'sm89':
+        from flash_rt.frontends.torch.qwen3_vl_fp8_sm89_multimodal import (
+            Qwen3VlFp8Sm89Frontend,
+        )
 
-    fe = Qwen3VlTorchFrontendRtx(
-        args.checkpoint, device=args.device, max_seq=args.max_seq,
-        max_pixels=args.max_pixels)
+        fe = Qwen3VlFp8Sm89Frontend(
+            args.checkpoint, device=args.device, max_seq=args.max_seq,
+            max_pixels=args.max_pixels, max_prefill_seq=args.max_prefill_seq,
+            fuse_gate_up=args.fuse_gate_up,
+            use_fp8_lm_head=args.fp8_lm_head,
+            vision_bf16_first_blocks=args.vision_bf16_first_blocks)
+    else:
+        if args.max_prefill_seq is not None:
+            p.error('--max-prefill-seq is only valid with --arch sm89')
+        if args.fuse_gate_up:
+            p.error('--fuse-gate-up is only valid with --arch sm89')
+        if args.fp8_lm_head:
+            p.error('--fp8-lm-head is only valid with --arch sm89')
+        if args.vision_bf16_first_blocks != 3:
+            p.error('--vision-bf16-first-blocks is only valid with --arch sm89')
+        from flash_rt.frontends.torch.qwen3_vl_rtx import (
+            Qwen3VlTorchFrontendRtx,
+        )
+
+        fe = Qwen3VlTorchFrontendRtx(
+            args.checkpoint, device=args.device, max_seq=args.max_seq,
+            max_pixels=args.max_pixels)
     lock = asyncio.Lock()
     app = FastAPI(title='FlashRT Qwen3-VL OpenAI-compatible server')
 

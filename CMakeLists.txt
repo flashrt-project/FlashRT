@@ -882,11 +882,12 @@ endif()
 #     from flash_rt import flash_rt_qwen3_vl_kernels as vlk
 #     vlk.rope_neox_qk_bf16(...)
 if(FLASHRT_BUILD_QWEN3_VL)
-  # The Qwen3-VL path depends on the SM120 Qwen3 NVFP4 / FP8 block-128
-  # kernels, so this module only builds for RTX 5090 (sm_120).
-  if(NOT GPU_ARCH STREQUAL "120")
+  # These Qwen3-VL helper kernels are model-agnostic BF16 / FP8 activation
+  # kernels. The SM120 frontend also depends on NVFP4 language kernels, but
+  # the helper module itself can be built for SM89 bring-up as well.
+  if(NOT (GPU_ARCH STREQUAL "89" OR GPU_ARCH STREQUAL "120"))
     message(FATAL_ERROR
-      "FLASHRT_BUILD_QWEN3_VL requires GPU_ARCH=120 (RTX 5090 / sm_120); "
+      "FLASHRT_BUILD_QWEN3_VL requires GPU_ARCH=89 or 120; "
       "got '${GPU_ARCH}'.")
   endif()
   pybind11_add_module(flash_rt_qwen3_vl_kernels
@@ -1083,6 +1084,14 @@ if(GPU_ARCH STREQUAL "120")
     $<TARGET_OBJECTS:sm120_fp8_smallm_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE
     ENABLE_CUTLASS_SM120_BLOCK_FP8=1)
+endif()
+
+# Native Ada block-scaled FP8 GEMM for official Qwen3-VL FP8 prefill.
+if(GPU_ARCH STREQUAL "89")
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/gemm/fp8_block128_gemm_mma_sm89.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    ENABLE_SM89_BLOCK_FP8_GEMM=1)
 endif()
 
 # Dedicated M=1 decode GEMV (FP8 + BF16); linked + macro defined wherever the

@@ -38,11 +38,45 @@ struct Ab96LtPlan {
     cublasLtMatmulAlgo_t algo{};
 };
 
+struct Bf16LtPlan {
+    cublasLtMatmulDesc_t desc = nullptr;
+    cublasLtMatrixLayout_t a_desc = nullptr;
+    cublasLtMatrixLayout_t b_desc = nullptr;
+    cublasLtMatrixLayout_t c_desc = nullptr;
+    cublasLtMatmulAlgo_t algo{};
+};
+
+struct Bf16LtKey {
+    int M;
+    int N;
+    int K;
+
+    bool operator==(const Bf16LtKey& other) const {
+        return M == other.M && N == other.N && K == other.K;
+    }
+};
+
+struct Bf16LtKeyHash {
+    size_t operator()(const Bf16LtKey& key) const {
+        size_t h = static_cast<size_t>(key.M);
+        h = h * 1315423911u + static_cast<size_t>(key.N);
+        h = h * 1315423911u + static_cast<size_t>(key.K);
+        return h;
+    }
+};
+
 static cublasLtHandle_t g_ab96_lt = nullptr;
 static void* g_ab96_workspace = nullptr;
 static size_t g_ab96_workspace_size = 16 * 1024 * 1024;
 static std::mutex g_ab96_mu;
 static std::unordered_map<int, Ab96LtPlan> g_ab96_plans;
+
+static cublasLtHandle_t g_bf16_lt = nullptr;
+static void* g_bf16_workspace = nullptr;
+static size_t g_bf16_workspace_size = 32 * 1024 * 1024;
+static std::mutex g_bf16_mu;
+static std::unordered_map<Bf16LtKey, Bf16LtPlan, Bf16LtKeyHash>
+    g_bf16_plans;
 
 static void ensure_ab96_lt() {
     if (g_ab96_lt) return;
@@ -51,6 +85,17 @@ static void ensure_ab96_lt() {
     if (err != cudaSuccess) {
         throw std::runtime_error(
             std::string("cudaMalloc failed for AB96 cuBLASLt workspace: ") +
+            cudaGetErrorString(err));
+    }
+}
+
+static void ensure_bf16_lt() {
+    if (g_bf16_lt) return;
+    FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtCreate(&g_bf16_lt));
+    cudaError_t err = cudaMalloc(&g_bf16_workspace, g_bf16_workspace_size);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("cudaMalloc failed for BF16 cuBLASLt workspace: ") +
             cudaGetErrorString(err));
     }
 }
@@ -108,6 +153,63 @@ static Ab96LtPlan& get_ab96_lt_plan(int M) {
     plan.algo = heuristic.algo;
 
     auto [inserted, _] = g_ab96_plans.emplace(M, plan);
+    return inserted->second;
+}
+
+static Bf16LtPlan& get_bf16_lt_plan(int M, int N, int K) {
+    std::lock_guard<std::mutex> lock(g_bf16_mu);
+    ensure_bf16_lt();
+    Bf16LtKey key{M, N, K};
+    auto it = g_bf16_plans.find(key);
+    if (it != g_bf16_plans.end()) return it->second;
+
+    Bf16LtPlan plan;
+    cublasOperation_t op_n = CUBLAS_OP_N;
+    cublasOperation_t op_t = CUBLAS_OP_T;
+    cublasLtOrder_t row_order = CUBLASLT_ORDER_ROW;
+
+    FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(
+        cublasLtMatmulDescCreate(&plan.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(
+        plan.desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_n, sizeof(op_n)));
+    FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(
+        plan.desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_t, sizeof(op_t)));
+
+    FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(
+        &plan.a_desc, CUDA_R_16BF, M, K, K));
+    FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+        plan.a_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order,
+        sizeof(row_order)));
+
+    FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(
+        &plan.b_desc, CUDA_R_16BF, N, K, K));
+    FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+        plan.b_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order,
+        sizeof(row_order)));
+
+    FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(
+        &plan.c_desc, CUDA_R_16BF, M, N, N));
+    FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
+        plan.c_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order,
+        sizeof(row_order)));
+
+    cublasLtMatmulPreference_t pref;
+    FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatmulPreferenceCreate(&pref));
+    FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatmulPreferenceSetAttribute(
+        pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        &g_bf16_workspace_size, sizeof(g_bf16_workspace_size)));
+    cublasLtMatmulHeuristicResult_t heuristic;
+    int returned = 0;
+    FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatmulAlgoGetHeuristic(
+        g_bf16_lt, plan.desc, plan.a_desc, plan.b_desc,
+        plan.c_desc, plan.c_desc, pref, 1, &heuristic, &returned));
+    cublasLtMatmulPreferenceDestroy(pref);
+    if (returned == 0) {
+        throw std::runtime_error("cuBLASLt: no generic BF16 GEMM algorithm");
+    }
+    plan.algo = heuristic.algo;
+
+    auto [inserted, _] = g_bf16_plans.emplace(key, plan);
     return inserted->second;
 }
 
@@ -480,6 +582,26 @@ void bf16_matmul_qwen36_bf16(
         bf16_matmul_warp_kernel_generic
             <<<grid, kThreads, smem_bytes, stream>>>(x, W, out, M, N, K);
     }
+}
+
+void bf16_matmul_cublaslt_bf16(
+    const __nv_bfloat16* x,
+    const __nv_bfloat16* W,
+    __nv_bfloat16* out,
+    int M, int N, int K,
+    cudaStream_t stream) {
+    if (M <= 0 || N <= 0 || K <= 0) return;
+    Bf16LtPlan& plan = get_bf16_lt_plan(M, N, K);
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatmul(
+        g_bf16_lt, plan.desc, &alpha,
+        x, plan.a_desc,
+        W, plan.b_desc,
+        &beta,
+        out, plan.c_desc,
+        out, plan.c_desc,
+        &plan.algo, g_bf16_workspace, g_bf16_workspace_size, stream));
 }
 
 void bf16_matmul_qwen36_ab96_bf16(

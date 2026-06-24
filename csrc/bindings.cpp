@@ -10,6 +10,9 @@
 #include "context.h"
 #include "gemm/gemm_runner.h"
 #include "gemm/fp8_block128_gemm.cuh"
+#ifdef ENABLE_SM89_BLOCK_FP8_GEMM
+#include "gemm/fp8_block128_gemm_mma_sm89.cuh"
+#endif
 #ifdef ENABLE_CUTLASS_SM120_BLOCK_FP8
 #include "gemm/cutlass_sm120_block128_fp8_gemm.cuh"
 #include "gemm/fp8_smallM_handtuned_sm120.cuh"
@@ -2794,6 +2797,46 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("output_scale"),
         py::arg("M"), py::arg("K"), py::arg("stream") = 0);
 
+    m.def("rms_norm_to_fp8_block128_bf16",
+        [](uintptr_t input, uintptr_t weight, uintptr_t output_fp8,
+           uintptr_t output_scale, int M, int K, float eps,
+           uintptr_t stream) {
+            flash_rt::quantize::rms_norm_to_fp8_block128_bf16(
+                to_ptr(input), to_ptr(weight), to_ptr(output_fp8),
+                reinterpret_cast<float*>(output_scale),
+                M, K, eps, to_stream(stream));
+        },
+        py::arg("input"), py::arg("weight"), py::arg("output_fp8"),
+        py::arg("output_scale"), py::arg("M"), py::arg("K"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+
+    m.def("residual_add_rms_norm_to_fp8_block128_bf16",
+        [](uintptr_t residual, uintptr_t x, uintptr_t residual_out,
+           uintptr_t weight, uintptr_t output_fp8, uintptr_t output_scale,
+           int M, int K, float eps, uintptr_t stream) {
+            flash_rt::quantize::residual_add_rms_norm_to_fp8_block128_bf16(
+                to_ptr(residual), to_ptr(x), to_ptr(residual_out),
+                to_ptr(weight), to_ptr(output_fp8),
+                reinterpret_cast<float*>(output_scale),
+                M, K, eps, to_stream(stream));
+        },
+        py::arg("residual"), py::arg("x"), py::arg("residual_out"),
+        py::arg("weight"), py::arg("output_fp8"), py::arg("output_scale"),
+        py::arg("M"), py::arg("K"), py::arg("eps") = 1e-6f,
+        py::arg("stream") = 0);
+
+    m.def("silu_mul_to_fp8_block128_bf16",
+        [](uintptr_t gate, uintptr_t up, uintptr_t output_fp8,
+           uintptr_t output_scale, int M, int K, uintptr_t stream) {
+            flash_rt::quantize::silu_mul_to_fp8_block128_bf16(
+                to_ptr(gate), to_ptr(up), to_ptr(output_fp8),
+                reinterpret_cast<float*>(output_scale),
+                M, K, to_stream(stream));
+        },
+        py::arg("gate"), py::arg("up"), py::arg("output_fp8"),
+        py::arg("output_scale"), py::arg("M"), py::arg("K"),
+        py::arg("stream") = 0);
+
     // G7.7 — Fused IM2COL + FP8 e4m3 quantize for 3x3x3 stride-1
     // already-padded Conv3d. Caller pads x with F.pad to (T_pad, H_pad, W_pad)
     // first; this kernel emits col_fp8 (M=B*To*Ho*Wo, K=27*Ci) ready for
@@ -4013,6 +4056,85 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("scratch_A_bf16"), py::arg("scratch_B_bf16"),
         py::arg("stream") = 0);
 
+#ifdef ENABLE_SM89_BLOCK_FP8_GEMM
+    // Native Ada (sm_89) block-scaled FP8 GEMM. Reads the FP8 weight
+    // directly (no dequant scratch), applies DeepSeek block-128 scaling in
+    // the mainloop. Drop-in replacement for the descale path on sm_89
+    // prefill — ~3-4x faster on the Qwen3-VL-8B linear shapes (weight
+    // traffic 5x lower). No scratch buffers needed.
+    m.def("fp8_block128_gemm_blockscaled_sm89_bf16out",
+        [](uintptr_t A, uintptr_t B, uintptr_t D,
+           int M, int N, int K,
+           uintptr_t act_scale, uintptr_t w_scale,
+           uintptr_t stream) {
+            int rc = flash_rt::gemm::block128_sm89::
+                fp8_block128_gemm_blockscaled_sm89_bf16out(
+                    to_ptr(A), to_ptr(B), to_ptr(D),
+                    M, N, K,
+                    reinterpret_cast<const float*>(act_scale),
+                    reinterpret_cast<const float*>(w_scale),
+                    to_stream(stream));
+            if (rc != 0)
+                throw std::runtime_error(
+                    "fp8_block128_gemm_blockscaled_sm89_bf16out launch failed");
+        },
+        py::arg("A"), py::arg("B"), py::arg("D"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("act_block_scale"), py::arg("w_block_scale"),
+        py::arg("stream") = 0);
+
+    auto bind_sm89_bs = [&](const char* name, auto fn) {
+        m.def(name,
+            [fn, name](uintptr_t A, uintptr_t B, uintptr_t D,
+                       int M, int N, int K,
+                       uintptr_t act_scale, uintptr_t w_scale,
+                       uintptr_t stream) {
+                int rc = fn(
+                    to_ptr(A), to_ptr(B), to_ptr(D), M, N, K,
+                    reinterpret_cast<const float*>(act_scale),
+                    reinterpret_cast<const float*>(w_scale),
+                    to_stream(stream));
+                if (rc != 0)
+                    throw std::runtime_error(
+                        std::string(name) + " launch failed");
+            },
+            py::arg("A"), py::arg("B"), py::arg("D"),
+            py::arg("M"), py::arg("N"), py::arg("K"),
+            py::arg("act_block_scale"), py::arg("w_block_scale"),
+            py::arg("stream") = 0);
+    };
+    bind_sm89_bs("fp8_block128_gemm_bs_sm89_16x64x128_w4",
+                 flash_rt::gemm::block128_sm89::
+                     fp8_block128_gemm_bs_sm89_16x64x128_w4);
+    bind_sm89_bs("fp8_block128_gemm_bs_sm89_16x128x128_w4",
+                 flash_rt::gemm::block128_sm89::
+                     fp8_block128_gemm_bs_sm89_16x128x128_w4);
+    bind_sm89_bs("fp8_block128_gemm_bs_sm89_32x64x128_w4",
+                 flash_rt::gemm::block128_sm89::
+                     fp8_block128_gemm_bs_sm89_32x64x128_w4);
+    bind_sm89_bs("fp8_block128_gemm_bs_sm89_32x128x128_w4",
+                 flash_rt::gemm::block128_sm89::
+                     fp8_block128_gemm_bs_sm89_32x128x128_w4);
+    bind_sm89_bs("fp8_block128_gemm_bs_sm89_64x64x128_w4",
+                 flash_rt::gemm::block128_sm89::
+                     fp8_block128_gemm_bs_sm89_64x64x128_w4);
+    bind_sm89_bs("fp8_block128_gemm_bs_sm89_64x128x128_w4",
+                 flash_rt::gemm::block128_sm89::
+                     fp8_block128_gemm_bs_sm89_64x128x128_w4);
+    bind_sm89_bs("fp8_block128_gemm_bs_sm89_64x128x128_w8",
+                 flash_rt::gemm::block128_sm89::
+                     fp8_block128_gemm_bs_sm89_64x128x128_w8);
+    bind_sm89_bs("fp8_block128_gemm_bs_sm89_128x64x128_w4",
+                 flash_rt::gemm::block128_sm89::
+                     fp8_block128_gemm_bs_sm89_128x64x128_w4);
+    bind_sm89_bs("fp8_block128_gemm_bs_sm89_128x128x128_w4",
+                 flash_rt::gemm::block128_sm89::
+                     fp8_block128_gemm_bs_sm89_128x128x128_w4);
+    bind_sm89_bs("fp8_block128_gemm_bs_sm89_128x128x128_w8",
+                 flash_rt::gemm::block128_sm89::
+                     fp8_block128_gemm_bs_sm89_128x128x128_w8);
+#endif  // ENABLE_SM89_BLOCK_FP8_GEMM
+
     // Phase 3.2 — causal_conv1d for Qwen3.6 linear-attention. SiLU
     // fused into the epilogue. Two variants for prefill / decode.
     m.def("causal_conv1d_qwen36_bf16",
@@ -4136,6 +4258,18 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         [](uintptr_t x, uintptr_t W, uintptr_t out,
            int M, int N, int K, uintptr_t stream) {
             flash_rt::kernels::bf16_matmul_qwen36_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(x),
+                reinterpret_cast<const __nv_bfloat16*>(W),
+                reinterpret_cast<__nv_bfloat16*>(out),
+                M, N, K, to_stream(stream));
+        },
+        py::arg("x"), py::arg("W"), py::arg("out"),
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+
+    m.def("bf16_matmul_cublaslt_bf16",
+        [](uintptr_t x, uintptr_t W, uintptr_t out,
+           int M, int N, int K, uintptr_t stream) {
+            flash_rt::kernels::bf16_matmul_cublaslt_bf16(
                 reinterpret_cast<const __nv_bfloat16*>(x),
                 reinterpret_cast<const __nv_bfloat16*>(W),
                 reinterpret_cast<__nv_bfloat16*>(out),
@@ -5607,6 +5741,28 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     BIND_GEMV_M1(gemv_bf16_m1_w16);
 
 #undef BIND_GEMV_M1
+
+#define BIND_BLOCK128_GEMV_M1(NAME)                                           \
+    m.def("ht_" #NAME,                                                       \
+        [](uintptr_t A, uintptr_t B, uintptr_t D,                            \
+           int M, int N, int K, uintptr_t act_scale, uintptr_t w_scale,       \
+           float alpha, uintptr_t stream) {                                  \
+            return flash_rt::gemm::gemv_m1::NAME(                            \
+                to_ptr(A), to_ptr(B), to_ptr(D),                             \
+                M, N, K, reinterpret_cast<const float*>(act_scale),          \
+                reinterpret_cast<const float*>(w_scale), alpha,              \
+                to_stream(stream));                                          \
+        },                                                                   \
+        py::arg("A"), py::arg("B"), py::arg("D"),                          \
+        py::arg("M"), py::arg("N"), py::arg("K"),                          \
+        py::arg("act_scale"), py::arg("w_scale"), py::arg("alpha"),        \
+        py::arg("stream") = 0)
+
+    BIND_BLOCK128_GEMV_M1(gemv_fp8_block128_m1_w4);
+    BIND_BLOCK128_GEMV_M1(gemv_fp8_block128_m1_w8);
+    BIND_BLOCK128_GEMV_M1(gemv_fp8_block128_m1_w16);
+
+#undef BIND_BLOCK128_GEMV_M1
 #endif  // ENABLE_DECODE_GEMV_M1
 
 #ifdef ENABLE_FP8_CONV3D_V17
@@ -6375,6 +6531,64 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
         py::arg("merged_gate_up"),
         py::arg("packed"), py::arg("sf_swz"),
         py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
+
+    m.def("qwen3_qk_norm_rope_kvwrite_bf16",
+        [](uintptr_t q_pre, uintptr_t k_pre, uintptr_t v_pre,
+           uintptr_t q_norm_w, uintptr_t k_norm_w,
+           uintptr_t cos, uintptr_t sin,
+           uintptr_t q_buf_dst,
+           uintptr_t k_cache_dst, uintptr_t v_cache_dst,
+           int n_q_heads, int n_kv_heads, float eps,
+           uintptr_t stream) -> int {
+            return flash_rt::kernels::qwen3_qk_norm_rope_kvwrite_bf16(
+                to_ptr(q_pre), to_ptr(k_pre), to_ptr(v_pre),
+                to_ptr(q_norm_w), to_ptr(k_norm_w),
+                to_ptr(cos), to_ptr(sin),
+                to_ptr(q_buf_dst),
+                to_ptr(k_cache_dst), to_ptr(v_cache_dst),
+                n_q_heads, n_kv_heads, eps, to_stream(stream));
+        },
+        py::arg("q_pre"), py::arg("k_pre"), py::arg("v_pre"),
+        py::arg("q_norm_w"), py::arg("k_norm_w"),
+        py::arg("cos"), py::arg("sin"),
+        py::arg("q_buf_dst"),
+        py::arg("k_cache_dst"), py::arg("v_cache_dst"),
+        py::arg("n_q_heads"), py::arg("n_kv_heads"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+
+    m.def("qwen3_qk_norm_rope_kvwrite_batched_bf16",
+        [](uintptr_t q_pre, uintptr_t k_pre, uintptr_t v_pre,
+           uintptr_t q_norm_w, uintptr_t k_norm_w,
+           uintptr_t cos, uintptr_t sin,
+           uintptr_t q_buf_dst,
+           uintptr_t k_cache_dst, uintptr_t v_cache_dst,
+           int seq_len,
+           int q_pre_row_elems, int k_pre_row_elems, int v_pre_row_elems,
+           int q_dst_row_elems, int kv_dst_row_elems,
+           int n_q_heads, int n_kv_heads, float eps,
+           uintptr_t stream) -> int {
+            return flash_rt::kernels::qwen3_qk_norm_rope_kvwrite_batched_bf16(
+                to_ptr(q_pre), to_ptr(k_pre), to_ptr(v_pre),
+                to_ptr(q_norm_w), to_ptr(k_norm_w),
+                to_ptr(cos), to_ptr(sin),
+                to_ptr(q_buf_dst),
+                to_ptr(k_cache_dst), to_ptr(v_cache_dst),
+                seq_len,
+                q_pre_row_elems, k_pre_row_elems, v_pre_row_elems,
+                q_dst_row_elems, kv_dst_row_elems,
+                n_q_heads, n_kv_heads, eps, to_stream(stream));
+        },
+        py::arg("q_pre"), py::arg("k_pre"), py::arg("v_pre"),
+        py::arg("q_norm_w"), py::arg("k_norm_w"),
+        py::arg("cos"), py::arg("sin"),
+        py::arg("q_buf_dst"),
+        py::arg("k_cache_dst"), py::arg("v_cache_dst"),
+        py::arg("seq_len"),
+        py::arg("q_pre_row_elems"), py::arg("k_pre_row_elems"),
+        py::arg("v_pre_row_elems"),
+        py::arg("q_dst_row_elems"), py::arg("kv_dst_row_elems"),
+        py::arg("n_q_heads"), py::arg("n_kv_heads"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0);
 
     m.def("qwen3_k_norm_rope_kvwrite_bf16",
         [](uintptr_t k_pre, uintptr_t v_pre, uintptr_t k_norm_w,
