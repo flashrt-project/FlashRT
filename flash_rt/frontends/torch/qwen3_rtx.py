@@ -942,7 +942,8 @@ class Qwen3TorchFrontendRtx:
     def _layer_forward_full_nvfp4_prefill(self, L: int, h_in_S, cos_S,
                                             sin_S, start_pos: int, S: int,
                                             prequant_ap=None, prequant_sf=None,
-                                            next_input_norm_w: int = 0):
+                                            next_input_norm_w: int = 0,
+                                            final_norm_w: int = 0):
         """Single Qwen3 layer at S=N prefill.
 
         Same kernel sequence as ``_layer_forward_full_nvfp4`` but with
@@ -1204,7 +1205,17 @@ class Qwen3TorchFrontendRtx:
         )
         mlp_out = down_out_buf[:S].view(1, S, hidden)
 
-        # 15) Residual 2 (+ optional boundary fusion) → ping-pong.
+        # 15) Residual 2 (+ optional boundary / final-norm fusion).
+        if final_norm_w:
+            # Last layer: fuse residual_2 + the final RMSNorm (bf16)
+            # straight into the persistent last-hidden buffer — kills the
+            # trailing torch.add AND the standalone final rms_norm.
+            x_norm = self._last_hidden_buf[:, :S].view(S, hidden)
+            fvk.residual_add_rms_norm(
+                h_post.data_ptr(), mlp_out.contiguous().data_ptr(),
+                int(final_norm_w), x_norm.data_ptr(), S, hidden, eps, s,
+            )
+            return None
         h_out = self._layer_out_a if (L % 2 == 0) else self._layer_out_b
         h_out_v = h_out[:, :S]
         if next_input_norm_w:
@@ -1343,28 +1354,37 @@ class Qwen3TorchFrontendRtx:
                 h0_v.data_ptr(), int(layers_ptrs[0]['input_norm_w']),
                 ap0.data_ptr(), sf0.data_ptr(), S, hidden, eps, s,
             )
+            final_w = int(self._weights.ptrs['final_norm_w'])
             for L in range(n_layers):
-                next_w = (int(layers_ptrs[L + 1]['input_norm_w'])
-                          if L + 1 < n_layers else 0)
+                last = L + 1 == n_layers
+                next_w = 0 if last else int(layers_ptrs[L + 1]['input_norm_w'])
+                # Last layer fuses residual_2 + final RMSNorm into
+                # _last_hidden_buf; earlier layers fuse into the next
+                # layer's pre-quant.
                 h = self._layer_forward_full_nvfp4_prefill(
                     L, h, cos_S, sin_S, start_pos, S,
                     prequant_ap=ap0, prequant_sf=sf0,
                     next_input_norm_w=next_w,
+                    final_norm_w=(final_w if last else 0),
                 )
+            final_done = True
         else:
             for L in range(n_layers):
                 h = self._layer_forward_full_nvfp4_prefill(
                     L, h, cos_S, sin_S, start_pos, S,
                 )
+            final_done = False
 
         # 3) Final RMSNorm at M=S, written straight into the persistent
-        # last-hidden buffer (no separate stage-copy).
-        h2 = h.view(S, hidden).contiguous()
+        # last-hidden buffer (no separate stage-copy). With boundary
+        # fusion the last layer already fused residual_2 + final norm.
         x_norm = self._last_hidden_buf[:, :S].view(S, hidden)
-        fvk.rms_norm(
-            h2.data_ptr(), int(self._weights.ptrs['final_norm_w']),
-            x_norm.data_ptr(), S, hidden, eps, s,
-        )
+        if not final_done:
+            h2 = h.view(S, hidden).contiguous()
+            fvk.rms_norm(
+                h2.data_ptr(), int(self._weights.ptrs['final_norm_w']),
+                x_norm.data_ptr(), S, hidden, eps, s,
+            )
 
         # 4) lm_head BF16. M=1 (last row, default) or M=S (full_logits).
         if full_logits:
@@ -1515,27 +1535,33 @@ class Qwen3TorchFrontendRtx:
                 h0_v.data_ptr(), int(layers_ptrs[0]['input_norm_w']),
                 ap0.data_ptr(), sf0.data_ptr(), S, hidden, eps, s,
             )
+            final_w = int(self._weights.ptrs['final_norm_w'])
             for L in range(n_layers):
-                next_w = (int(layers_ptrs[L + 1]['input_norm_w'])
-                          if L + 1 < n_layers else 0)
+                last = L + 1 == n_layers
+                next_w = 0 if last else int(layers_ptrs[L + 1]['input_norm_w'])
                 h = self._layer_forward_full_nvfp4_prefill(
                     L, h, cos_S, sin_S, 0, S,
                     prequant_ap=ap0, prequant_sf=sf0,
                     next_input_norm_w=next_w,
+                    final_norm_w=(final_w if last else 0),
                 )
+            final_done = True
         else:
             for L in range(n_layers):
                 h = self._layer_forward_full_nvfp4_prefill(
                     L, h, cos_S, sin_S, 0, S,
                 )
+            final_done = False
 
-        h2 = h.view(S, hidden).contiguous()
-        x_norm = self._h_b[:S].view(S, hidden)
-        fvk.rms_norm(
-            h2.data_ptr(), int(self._weights.ptrs['final_norm_w']),
-            x_norm.data_ptr(), S, hidden, eps, s,
-        )
-        self._last_hidden_buf[:, :S].copy_(x_norm.view(1, S, hidden))
+        # Final RMSNorm straight into _last_hidden_buf (boundary fusion
+        # already fused it into the last layer).
+        if not final_done:
+            h2 = h.view(S, hidden).contiguous()
+            x_norm = self._last_hidden_buf[:, :S].view(S, hidden)
+            fvk.rms_norm(
+                h2.data_ptr(), int(self._weights.ptrs['final_norm_w']),
+                x_norm.data_ptr(), S, hidden, eps, s,
+            )
 
     def _ensure_prefill_graph(self, S_bucket: int):
         """Lazy-capture a CUDA Graph for fresh-KV prefill at S=S_bucket.
