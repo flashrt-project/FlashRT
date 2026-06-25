@@ -11,16 +11,19 @@ from __future__ import annotations
 from typing import Any
 
 
-class Qwen3VlFp8Sm89TextFrontend:
-    """Batch-1 Qwen3-VL text-only decode on SM89 official FP8 weights."""
+def _resolve_max_prefill_seq(max_seq: int,
+                             max_prefill_seq: int | None) -> int:
+    return int(max_seq) if max_prefill_seq is None else int(max_prefill_seq)
 
-    _FP8_SHAPES: tuple[tuple[int, int], ...] = (
-        (6144, 4096),     # fused q/k/v
-        (4096, 4096),     # o_proj
-        (12288, 4096),    # gate / up
-        (24576, 4096),    # fused gate/up
-        (4096, 12288),    # down
-    )
+
+class Qwen3VlFp8Sm89TextFrontend:
+    """Batch-1 Qwen3-VL text-only decode on SM89 official FP8 weights.
+
+    Supports any Qwen3-VL language stack meeting the block-128 FP8 kernel
+    constraints (head_dim == 128, all GEMM dims a multiple of 128). Validated
+    on the official Qwen3-VL-8B-Instruct-FP8 checkpoint and on a block-128
+    quantized Qwen3-VL-2B checkpoint.
+    """
 
     def __init__(self, checkpoint_path: str, *,
                  device: str = 'cuda:0', max_seq: int = 2048,
@@ -34,10 +37,8 @@ class Qwen3VlFp8Sm89TextFrontend:
         self.checkpoint_path = str(checkpoint_path)
         self.device = device
         self.max_seq = int(max_seq)
-        self.max_prefill_seq = (
-            min(self.max_seq, 128) if max_prefill_seq is None
-            else int(max_prefill_seq)
-        )
+        self.max_prefill_seq = _resolve_max_prefill_seq(
+            self.max_seq, max_prefill_seq)
         self.fuse_gate_up = bool(fuse_gate_up)
         self.fuse_qk_postproc = bool(fuse_qk_postproc)
         self.use_fp8_lm_head = bool(use_fp8_lm_head)
@@ -90,34 +91,35 @@ class Qwen3VlFp8Sm89TextFrontend:
         cfg_path = os.path.join(self.checkpoint_path, 'config.json')
         cfg = json.load(open(cfg_path))
         text_cfg = cfg['text_config']
-        expected = {
-            'num_hidden_layers': 36,
-            'num_attention_heads': 32,
-            'num_key_value_heads': 8,
-            'head_dim': 128,
-            'hidden_size': 4096,
-            'intermediate_size': 12288,
-        }
-        actual = {
-            'num_hidden_layers': int(text_cfg['num_hidden_layers']),
-            'num_attention_heads': int(text_cfg['num_attention_heads']),
-            'num_key_value_heads': int(text_cfg['num_key_value_heads']),
-            'head_dim': int(text_cfg.get('head_dim')
-                            or text_cfg['hidden_size']
-                            // int(text_cfg['num_attention_heads'])),
-            'hidden_size': int(text_cfg['hidden_size']),
-            'intermediate_size': int(text_cfg['intermediate_size']),
-        }
-        mismatched = [
-            f"{key}={actual[key]} (expected {value})"
-            for key, value in expected.items()
-            if actual[key] != value
-        ]
-        if mismatched:
+        # This path supports any Qwen3-VL language stack whose dimensions
+        # satisfy the SM89 block-128 FP8 kernel constraints (validated on the
+        # official 8B-FP8 and the quantized 2B checkpoints). The hard
+        # requirements are: head_dim == 128 (the fused qk-norm/RoPE/KV-write
+        # kernels hardcode it) and every GEMM N/K dimension a multiple of 128
+        # (block-128 act/weight scaling). num_q_heads must be a multiple of
+        # num_kv_heads (GQA). Anything else is fine and read from config.
+        n_q = int(text_cfg['num_attention_heads'])
+        n_kv = int(text_cfg['num_key_value_heads'])
+        head_dim = int(text_cfg.get('head_dim')
+                       or text_cfg['hidden_size'] // n_q)
+        hidden = int(text_cfg['hidden_size'])
+        inter = int(text_cfg['intermediate_size'])
+        vocab = int(text_cfg['vocab_size'])
+        qkv_N = (n_q + 2 * n_kv) * head_dim
+        problems = []
+        if head_dim != 128:
+            problems.append(f'head_dim={head_dim} (kernels require 128)')
+        if n_kv == 0 or (n_q % n_kv) != 0:
+            problems.append(
+                f'num_q_heads={n_q} not a multiple of num_kv_heads={n_kv}')
+        for name, dim in (('hidden_size', hidden), ('intermediate_size', inter),
+                          ('vocab_size', vocab), ('qkv_proj_N', qkv_N)):
+            if (dim % 128) != 0:
+                problems.append(f'{name}={dim} not a multiple of 128')
+        if problems:
             raise RuntimeError(
-                'Qwen3VlFp8Sm89TextFrontend only supports the official '
-                'Qwen3-VL-8B FP8 text stack; got ' + ', '.join(mismatched)
-                + f' from {cfg_path}')
+                'Qwen3VlFp8Sm89TextFrontend cannot serve this config: '
+                + '; '.join(problems) + f' (from {cfg_path})')
 
         self._load_fp8_path()
         self._alloc_buffers()
@@ -172,9 +174,23 @@ class Qwen3VlFp8Sm89TextFrontend:
         hd = cfg['head_dim']
         inter = cfg['intermediate']
         Sq_max = max(1, self.max_prefill_seq)
+        qkv_N = n_q * hd + 2 * n_kv * hd
+        self._qkv_N = qkv_N
+        # Block-128 FP8 GEMM/GEMV scratch shapes (N, K), derived from config
+        # so the 8B (qkv 6144) and 2B (qkv 4096) stacks share one code path.
+        self._fp8_shapes = (
+            (qkv_N, hidden),        # fused q/k/v
+            (hidden, hidden),       # o_proj
+            (inter, hidden),        # gate / up
+            (2 * inter, hidden),    # fused gate/up
+            (hidden, inter),        # down
+        )
 
         self._attn = RtxFlashAttnBackendQwen3(
-            max_seq=self.max_seq, max_q_seq=Sq_max, dtype=bf16)
+            max_seq=self.max_seq, max_q_seq=Sq_max, dtype=bf16,
+            num_layers=cfg['num_hidden_layers'],
+            num_q_heads=n_q, num_kv_heads=n_kv, head_dim=hd,
+            device=self.device)
         self._h_a = torch.empty(Sq_max, hidden, device=device, dtype=bf16)
         self._h_b = torch.empty(Sq_max, hidden, device=device, dtype=bf16)
         self._res_mid = torch.empty(1, Sq_max, hidden, device=device, dtype=bf16)
@@ -222,7 +238,7 @@ class Qwen3VlFp8Sm89TextFrontend:
         self._graph_stream = torch.cuda.Stream(device=device)
 
         self._fp8_scratch: dict[tuple[int, int], tuple[torch.Tensor, ...]] = {}
-        for N, K in self._FP8_SHAPES + ((vocab, hidden),):
+        for N, K in self._fp8_shapes + ((vocab, hidden),):
             act = torch.empty(1, K, device=device, dtype=f8)
             scale = torch.empty(1, K // 128, device=device, dtype=fp32)
             out = torch.empty(1, N, device=device, dtype=bf16)
@@ -358,7 +374,7 @@ class Qwen3VlFp8Sm89TextFrontend:
         h2 = h_in.view(1, hidden).contiguous()
 
         if prequant is None:
-            ap, sc, _ = self._fp8_scratch[(6144, hidden)]
+            ap, sc, _ = self._fp8_scratch[(self._qkv_N, hidden)]
             fvk.rms_norm_to_fp8_block128_bf16(
                 h2.data_ptr(), int(lw['input_norm_w']),
                 ap.data_ptr(), sc.data_ptr(), 1, hidden, eps, s)
@@ -434,7 +450,7 @@ class Qwen3VlFp8Sm89TextFrontend:
                  else self._layer_out_b)[:, :1]
         mlp_out = down_out.view(1, 1, hidden)
         if next_input_norm_w:
-            next_ap, next_sc, _ = self._fp8_scratch[(6144, hidden)]
+            next_ap, next_sc, _ = self._fp8_scratch[(self._qkv_N, hidden)]
             fvk.residual_add_rms_norm_to_fp8_block128_bf16(
                 h_post.data_ptr(), mlp_out.data_ptr(), h_out.data_ptr(),
                 int(next_input_norm_w),

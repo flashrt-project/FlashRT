@@ -29,15 +29,26 @@ def _open_shards(ckpt_dir: str):
     from safetensors import safe_open
 
     idx_path = os.path.join(ckpt_dir, 'model.safetensors.index.json')
-    if not os.path.isfile(idx_path):
-        raise RuntimeError(f'Qwen3-VL FP8 ckpt missing index: {idx_path}')
-    wmap = json.load(open(idx_path))['weight_map']
-    handles_d = {
-        shard: safe_open(os.path.join(ckpt_dir, shard), framework='pt',
-                         device='cpu')
-        for shard in set(wmap.values())
-    }
-    return handles_d, wmap
+    if os.path.isfile(idx_path):
+        wmap = json.load(open(idx_path))['weight_map']
+        handles_d = {
+            shard: safe_open(os.path.join(ckpt_dir, shard), framework='pt',
+                             device='cpu')
+            for shard in set(wmap.values())
+        }
+        return handles_d, wmap
+    # Single-file FP8 checkpoints (for example a quantized 2B ckpt written as
+    # one shard) have no index.json. Build a synthetic weight_map from the lone
+    # model.safetensors so the rest of the loader is identical to the sharded
+    # path. Raw BF16 2B checkpoints still need the offline block-128 quantizer.
+    single = os.path.join(ckpt_dir, 'model.safetensors')
+    if not os.path.isfile(single):
+        raise RuntimeError(
+            f'Qwen3-VL FP8 ckpt missing both index and model.safetensors: '
+            f'{ckpt_dir}')
+    h = safe_open(single, framework='pt', device='cpu')
+    wmap = {key: 'model.safetensors' for key in h.keys()}
+    return {'model.safetensors': h}, wmap
 
 
 def _get_tensor(handles_d, wmap, key: str) -> torch.Tensor:
@@ -100,7 +111,20 @@ def extract_weights_qwen3_vl_fp8(ckpt_dir: str, device: str = 'cuda:0',
         _get_tensor(handles_d, wmap, 'model.language_model.norm.weight'),
         device)
     handles.ptrs['final_norm_w'] = _anchor(handles, final_norm)
-    lm_head_cpu = _get_tensor(handles_d, wmap, 'lm_head.weight')
+    # tie_word_embeddings: the 2B release ties lm_head to embed_tokens and
+    # ships no lm_head.weight. Fall back to the embedding matrix in that case
+    # (identical math: logits = h @ embed_tokens^T).
+    tied = bool(cfg.get('tie_word_embeddings',
+                        text_cfg.get('tie_word_embeddings', False)))
+    if 'lm_head.weight' in wmap:
+        lm_head_cpu = _get_tensor(handles_d, wmap, 'lm_head.weight')
+    elif tied:
+        lm_head_cpu = _get_tensor(
+            handles_d, wmap, 'model.language_model.embed_tokens.weight')
+    else:
+        raise RuntimeError(
+            'Qwen3-VL FP8 ckpt has neither lm_head.weight nor '
+            'tie_word_embeddings=true')
     N_lm, K_lm = lm_head_cpu.shape
     handles.ptrs['lm_head_quantized'] = bool(quantize_lm_head)
     if quantize_lm_head:

@@ -33,6 +33,16 @@ def test_frontend_imports():
         assert hasattr(cls, name)
 
 
+def test_default_prefill_limit_matches_max_seq_without_cuda():
+    """SM89 VL should behave like SM120: default prefill capacity is max_seq."""
+    from flash_rt.frontends.torch.qwen3_vl_fp8_sm89 import (
+        _resolve_max_prefill_seq,
+    )
+
+    assert _resolve_max_prefill_seq(1234, None) == 1234
+    assert _resolve_max_prefill_seq(1234, 256) == 256
+
+
 def test_weight_loader_invariants_reject_missing_layer_fields():
     from flash_rt.frontends.torch._qwen3_vl_fp8_weights import (
         WeightHandles,

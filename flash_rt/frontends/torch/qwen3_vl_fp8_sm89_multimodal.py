@@ -34,6 +34,7 @@ class Qwen3VlFp8Sm89Frontend:
         )
         from flash_rt.frontends.torch.qwen3_vl_fp8_sm89 import (
             Qwen3VlFp8Sm89TextFrontend,
+            _resolve_max_prefill_seq,
         )
         from flash_rt.frontends.torch.qwen3_vl_rtx import (
             _require_qwen3_vl_kernels,
@@ -43,10 +44,8 @@ class Qwen3VlFp8Sm89Frontend:
         self.device = device
         self.max_seq = int(max_seq)
         _require_qwen3_vl_kernels()
-        self.max_prefill_seq = (
-            min(self.max_seq, 128) if max_prefill_seq is None
-            else int(max_prefill_seq)
-        )
+        self.max_prefill_seq = _resolve_max_prefill_seq(
+            self.max_seq, max_prefill_seq)
         self.llm = Qwen3VlFp8Sm89TextFrontend(
             checkpoint_path, device=device, max_seq=max_seq,
             max_prefill_seq=self.max_prefill_seq,

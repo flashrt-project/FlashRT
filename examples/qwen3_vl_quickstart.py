@@ -56,7 +56,8 @@ def main() -> None:
                         'Default: checkpoint full resolution.')
     p.add_argument('--max-prefill-seq', type=int, default=None,
                    help='SM89 official-FP8 prefill buffer length; default '
-                        'uses min(max_seq, 128). Only valid with --arch sm89.')
+                        'uses max_seq to match the SM120 VL path. Only valid '
+                        'with --arch sm89.')
     p.add_argument('--fuse-gate-up', action='store_true',
                    help='use SM89 official-FP8 fused gate/up weight when '
                         'available. Only valid with --arch sm89.')

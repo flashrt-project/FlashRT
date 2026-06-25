@@ -46,14 +46,35 @@ class RtxFlashAttnBackendQwen3:
     NUM_KV_HEADS = 8                # GQA 4:1
     HEAD_DIM = 128
 
-    def __init__(self, max_seq: int, max_q_seq: int = 1, dtype=None):
+    def __init__(self, max_seq: int, max_q_seq: int = 1, dtype=None,
+                 *, num_layers: int | None = None,
+                 num_q_heads: int | None = None,
+                 num_kv_heads: int | None = None,
+                 head_dim: int | None = None,
+                 device: str = "cuda"):
         import os
 
         import torch
 
         self._torch = torch
         bf16 = dtype if dtype is not None else torch.bfloat16
-        d = "cuda"
+        d = torch.device(device)
+
+        # Per-instance attention geometry. Defaults match Qwen3-VL-8B
+        # (36/32/8/128); the 2B variant passes 28/16/8/128. Class constants
+        # are kept for the static spec helper / backward compat.
+        self.NUM_FULL_LAYERS = (
+            int(num_layers) if num_layers is not None
+            else type(self).NUM_FULL_LAYERS)
+        self.NUM_Q_HEADS = (
+            int(num_q_heads) if num_q_heads is not None
+            else type(self).NUM_Q_HEADS)
+        self.NUM_KV_HEADS = (
+            int(num_kv_heads) if num_kv_heads is not None
+            else type(self).NUM_KV_HEADS)
+        self.HEAD_DIM = (
+            int(head_dim) if head_dim is not None
+            else type(self).HEAD_DIM)
 
         self._max_seq = int(max_seq)
         self._max_q_seq = int(max_q_seq)
@@ -106,7 +127,7 @@ class RtxFlashAttnBackendQwen3:
         # (bf16, head_dim=128); other shapes fall back to the SDPA path.
         self._fa2_fwd_causal = getattr(_fa2, 'fwd_bf16_causal', None)
         self._num_sms = torch.cuda.get_device_properties(
-            torch.cuda.current_device()
+            d
         ).multi_processor_count
 
         # Optional debug bisect knob (mirror qwen36 sibling).
