@@ -39,6 +39,9 @@ DECL(fp8_block128_gemm_bs_sm89_64x64x128_w4);
 DECL(fp8_block128_gemm_bs_sm89_128x64x128_w4);
 DECL(fp8_block128_gemm_bs_sm89_16x128x128_w4);
 DECL(fp8_block128_gemm_bs_sm89_16x64x128_w4);
+DECL(fp8_block128_gemm_bs_sm89_32x128x128_w4_s1);
+DECL(fp8_block128_gemm_bs_sm89_64x64x128_w4_s1);
+DECL(fp8_block128_gemm_bs_sm89_128x128x128_w8_s1);
 
 #undef DECL
 

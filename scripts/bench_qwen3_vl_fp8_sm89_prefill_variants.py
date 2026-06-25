@@ -75,6 +75,9 @@ def main() -> None:
         ("128x64_w4", fvk.fp8_block128_gemm_bs_sm89_128x64x128_w4),
         ("128x128_w4", fvk.fp8_block128_gemm_bs_sm89_128x128x128_w4),
         ("128x128_w8", fvk.fp8_block128_gemm_bs_sm89_128x128x128_w8),
+        ("32x128_w4_s1", fvk.fp8_block128_gemm_bs_sm89_32x128x128_w4_s1),
+        ("64x64_w4_s1", fvk.fp8_block128_gemm_bs_sm89_64x64x128_w4_s1),
+        ("128x128_w8_s1", fvk.fp8_block128_gemm_bs_sm89_128x128x128_w8_s1),
         ("auto", fvk.fp8_block128_gemm_blockscaled_sm89_bf16out),
     ]
     shapes = [

@@ -228,6 +228,9 @@ void fp8_bs_gemm_kernel(
                 acc[mi][ni][3] += tacc[mi][ni][3] * (as1 * ws_cta);
             }
         }
+        // Do not let the next cp.async overwrite this shared-memory stage
+        // before all warps finish reading it.
+        __syncthreads();
         compute_stage = (compute_stage + 1) % STAGES;
     }
     asm volatile("cp.async.wait_all;\n" ::);
@@ -297,6 +300,9 @@ DEFINE(fp8_block128_gemm_bs_sm89_64x64x128_w4,    64,  64, 4, 2, 4)
 DEFINE(fp8_block128_gemm_bs_sm89_128x64x128_w4,  128,  64, 4, 2, 2)
 DEFINE(fp8_block128_gemm_bs_sm89_16x128x128_w4,   16, 128, 4, 2, 4)
 DEFINE(fp8_block128_gemm_bs_sm89_16x64x128_w4,    16,  64, 4, 2, 4)
+DEFINE(fp8_block128_gemm_bs_sm89_32x128x128_w4_s1, 32, 128, 4, 1, 4)
+DEFINE(fp8_block128_gemm_bs_sm89_64x64x128_w4_s1,  64,  64, 4, 1, 4)
+DEFINE(fp8_block128_gemm_bs_sm89_128x128x128_w8_s1, 128, 128, 8, 1, 2)
 
 #undef DEFINE
 
@@ -334,18 +340,20 @@ int fp8_block128_gemm_blockscaled_sm89_bf16out(
         return fp8_block128_gemm_bs_sm89_16x64x128_w4(
             A, B, D, M, N, K, act_scale, w_scale, stream);
     }
-    if (M >= 1024) {
-        if (N >= 8192 && K == 4096)
-            return fp8_block128_gemm_bs_sm89_128x128x128_w8(
-                A, B, D, M, N, K, act_scale, w_scale, stream);
-        if (N == 4096 && K >= 8192)
-            return fp8_block128_gemm_bs_sm89_64x64x128_w4(
-                A, B, D, M, N, K, act_scale, w_scale, stream);
-    }
     if (M < 128)
         return fp8_block128_gemm_bs_sm89_32x64x128_w4(
             A, B, D, M, N, K, act_scale, w_scale, stream);
-    return fp8_block128_gemm_bs_sm89_32x128x128_w4(
+    // Language prefill (M>=128, N>=2048) is limited by low eligible warps on
+    // Ada. A single cp.async stage reduces shared-memory pressure and wins on
+    // Qwen3-VL 2B/8B prefill shapes. Keep a short-prefill exception for the
+    // wide 8B MLP, where the 8-warp tile remains slightly faster.
+    if (N >= 8192 && K == 4096 && M < 1024)
+        return fp8_block128_gemm_bs_sm89_128x128x128_w8_s1(
+            A, B, D, M, N, K, act_scale, w_scale, stream);
+    if (N == 2048 && M < 1024)
+        return fp8_block128_gemm_bs_sm89_64x64x128_w4(
+            A, B, D, M, N, K, act_scale, w_scale, stream);
+    return fp8_block128_gemm_bs_sm89_64x64x128_w4_s1(
         A, B, D, M, N, K, act_scale, w_scale, stream);
 }
 

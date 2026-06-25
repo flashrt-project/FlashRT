@@ -4145,6 +4145,15 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     bind_sm89_bs("fp8_block128_gemm_bs_sm89_128x128x128_w8",
                  flash_rt::gemm::block128_sm89::
                      fp8_block128_gemm_bs_sm89_128x128x128_w8);
+    bind_sm89_bs("fp8_block128_gemm_bs_sm89_32x128x128_w4_s1",
+                 flash_rt::gemm::block128_sm89::
+                     fp8_block128_gemm_bs_sm89_32x128x128_w4_s1);
+    bind_sm89_bs("fp8_block128_gemm_bs_sm89_64x64x128_w4_s1",
+                 flash_rt::gemm::block128_sm89::
+                     fp8_block128_gemm_bs_sm89_64x64x128_w4_s1);
+    bind_sm89_bs("fp8_block128_gemm_bs_sm89_128x128x128_w8_s1",
+                 flash_rt::gemm::block128_sm89::
+                     fp8_block128_gemm_bs_sm89_128x128x128_w8_s1);
 #endif  // ENABLE_SM89_BLOCK_FP8_GEMM
 
     // Phase 3.2 — causal_conv1d for Qwen3.6 linear-attention. SiLU
