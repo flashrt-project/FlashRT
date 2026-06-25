@@ -43,6 +43,25 @@ def test_default_prefill_limit_matches_max_seq_without_cuda():
     assert _resolve_max_prefill_seq(1234, 256) == 256
 
 
+def test_multimodal_prefill_graph_falls_back_to_eager_without_pg_key():
+    """Match SM120: graph prefill falls back for multi-image/video prompts."""
+    from flash_rt.frontends.torch.qwen3_vl_fp8_sm89_multimodal import (
+        Qwen3VlFp8Sm89Frontend,
+    )
+
+    fe = Qwen3VlFp8Sm89Frontend.__new__(Qwen3VlFp8Sm89Frontend)
+    fe._prompt = {'S': 7}
+    called = []
+
+    def fake_prefill():
+        called.append(True)
+        return 'eager-logits'
+
+    fe.prefill = fake_prefill
+    assert fe.prefill_graph() == 'eager-logits'
+    assert called == [True]
+
+
 def test_weight_loader_invariants_reject_missing_layer_fields():
     from flash_rt.frontends.torch._qwen3_vl_fp8_weights import (
         WeightHandles,

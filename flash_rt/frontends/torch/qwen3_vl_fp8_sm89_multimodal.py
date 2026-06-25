@@ -277,9 +277,7 @@ class Qwen3VlFp8Sm89Frontend:
         p = self._prompt
         key = p.get('pg_key')
         if key is None:
-            raise ValueError(
-                'prefill_graph currently supports single-image prompts only; '
-                'call prefill() explicitly for multi-image or video prompts')
+            return self.prefill()
 
         P, S, a, b = key
         st = self._pg_buffers[key]

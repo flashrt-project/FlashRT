@@ -241,7 +241,7 @@ def main() -> None:
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--max-seq", type=int, default=2048)
-    p.add_argument("--max-prefill-seq", type=int, default=2048)
+    p.add_argument("--max-prefill-seq", type=int, default=None)
     p.add_argument("--warmup", type=int, default=1)
     p.add_argument("--iters", type=int, default=5)
     p.add_argument("--text-only", action="store_true")
