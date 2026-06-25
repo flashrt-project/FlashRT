@@ -261,6 +261,10 @@ class Qwen3TorchFrontendRtx:
         self._last_hidden_buf = torch.empty(
             1, Sq_max, hidden, device=device, dtype=bf16,
         )
+        # Prefill embedding-lookup output (kernel gather, no torch index).
+        self._embed_h_buf = torch.empty(
+            Sq_max, hidden, device=device, dtype=bf16,
+        )
 
         # Static decode-step scratch: a (1, 1) long tensor holding the
         # next token id, copy_'d in place every step so CUDA graph
@@ -315,7 +319,8 @@ class Qwen3TorchFrontendRtx:
         # the M=1 (full_logits=False) path; full_logits stays bf16.
         # Default ON when the fp8 weight is present.
         self._enable_lmhead_fp8_prefill: bool = True
-        self._lmhead_fp8_act = None     # holds the per-call fp8 activation
+        self._lmhead_fp8_act = None     # [hidden] fp8 activation buffer
+        self._lmhead_act_scale = None   # [1] f32 device amax scale
 
         # silu_mul + nvfp4 quant fusion: collapse `silu(gate) * up`
         # and the subsequent nvfp4 swizzled quantization into one
@@ -1227,12 +1232,23 @@ class Qwen3TorchFrontendRtx:
         from flash_rt import flash_rt_kernels as fvk
         lm_fp8 = self._weights.ptrs.get('lm_head_fp8')
         if self._enable_lmhead_fp8_prefill and lm_fp8 is not None:
-            sx = 448.0 / last_row.abs().max().float()
-            # Keep a ref on self so the fp8 buffer outlives the async kernel.
-            self._lmhead_fp8_act = (last_row.float() * sx).clamp_(
-                -448.0, 448.0).to(torch.float8_e4m3fn)
-            alpha = 1.0 / (
-                self._weights.ptrs['lm_head_fp8_wscale'] * float(sx))
+            # Pure-kernel activation quant: quantize_fp8_device does the
+            # amax + e4m3 quant in one launch (replacing the torch abs/max/
+            # mul/clamp/cast chain). d_scale = amax/448; dequant = fp8 *
+            # d_scale, so the GEMV alpha = act_dscale * weight_dscale =
+            # act_dscale / lm_head_fp8_wscale.
+            if self._lmhead_fp8_act is None:
+                dev = self._logits_buf.device
+                self._lmhead_fp8_act = torch.empty(
+                    hidden, device=dev, dtype=torch.float8_e4m3fn)
+                self._lmhead_act_scale = torch.empty(
+                    1, device=dev, dtype=torch.float32)
+            lr = last_row.reshape(hidden).contiguous()
+            fvk.quantize_fp8_device(
+                lr.data_ptr(), self._lmhead_fp8_act.data_ptr(),
+                self._lmhead_act_scale.data_ptr(), hidden, s)
+            alpha = (float(self._lmhead_act_scale.item())
+                     / self._weights.ptrs['lm_head_fp8_wscale'])
             fvk.ht_gemv_fp8_m1_w16(
                 self._lmhead_fp8_act.data_ptr(), int(lm_fp8),
                 self._logits_buf[:1].data_ptr(), 1, vocab, hidden, alpha, s,
@@ -1297,11 +1313,14 @@ class Qwen3TorchFrontendRtx:
                 f'prefill end {start_pos + S} > max_seq {self.max_seq}'
             )
 
-        # 0) Embed S tokens.
+        # 0) Embed S tokens via the kernel gather (no torch indexing).
         embed_t = self._weights.anchors[0]
-        h = embed_t[prompt_ids.view(-1)].view(1, S, hidden).contiguous()
-        if h.dtype != bf16:
-            h = h.to(bf16)
+        h = self._embed_h_buf[:S]
+        fvk.qwen36_embedding_lookup_bf16(
+            prompt_ids.view(-1).data_ptr(), embed_t.data_ptr(),
+            h.data_ptr(), S, hidden, s,
+        )
+        h = h.view(1, S, hidden)
 
         # 1) cos/sin for absolute positions [start_pos, start_pos+S).
         cos_S = self._rope_cos_table[start_pos:start_pos + S]
@@ -1338,14 +1357,14 @@ class Qwen3TorchFrontendRtx:
                     L, h, cos_S, sin_S, start_pos, S,
                 )
 
-        # 3) Final RMSNorm at M=S.
+        # 3) Final RMSNorm at M=S, written straight into the persistent
+        # last-hidden buffer (no separate stage-copy).
         h2 = h.view(S, hidden).contiguous()
-        x_norm = self._h_b[:S].view(S, hidden)
+        x_norm = self._last_hidden_buf[:, :S].view(S, hidden)
         fvk.rms_norm(
             h2.data_ptr(), int(self._weights.ptrs['final_norm_w']),
             x_norm.data_ptr(), S, hidden, eps, s,
         )
-        self._last_hidden_buf[:, :S].copy_(x_norm.view(1, S, hidden))
 
         # 4) lm_head BF16. M=1 (last row, default) or M=S (full_logits).
         if full_logits:
@@ -1475,9 +1494,12 @@ class Qwen3TorchFrontendRtx:
         eps = float(cfg['rms_norm_eps'])
 
         embed_t = self._weights.anchors[0]
-        h = embed_t[prompt_ids.view(-1)].view(1, S, hidden).contiguous()
-        if h.dtype != bf16:
-            h = h.to(bf16)
+        h = self._embed_h_buf[:S]
+        fvk.qwen36_embedding_lookup_bf16(
+            prompt_ids.view(-1).data_ptr(), embed_t.data_ptr(),
+            h.data_ptr(), S, hidden, s,
+        )
+        h = h.view(1, S, hidden)
 
         cos_S = self._rope_cos_table[0:S]
         sin_S = self._rope_sin_table[0:S]
