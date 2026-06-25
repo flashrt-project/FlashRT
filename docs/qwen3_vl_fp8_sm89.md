@@ -69,9 +69,12 @@ python examples/qwen3_vl_quickstart.py \
   --checkpoint /path/to/Qwen3-VL-8B-Instruct-FP8 \
   --image FlashRT.png \
   --prompt "Describe this image in one sentence." \
-  --max-seq 2048 \
-  --max-prefill-seq 2048
+  --max-seq 2048
 ```
+
+By default, the SM89 prefill buffer is sized to `max_seq`, matching the SM120
+Qwen3-VL frontend. Pass `--max-prefill-seq` only to deliberately lower that
+capacity.
 
 For the development smoke benchmark:
 
