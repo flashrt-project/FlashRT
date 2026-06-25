@@ -2837,6 +2837,18 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("output_scale"), py::arg("M"), py::arg("K"),
         py::arg("stream") = 0);
 
+    m.def("silu_mul_merged_to_fp8_block128_bf16",
+        [](uintptr_t gate_up, uintptr_t output_fp8,
+           uintptr_t output_scale, int M, int K, uintptr_t stream) {
+            flash_rt::quantize::silu_mul_merged_to_fp8_block128_bf16(
+                to_ptr(gate_up), to_ptr(output_fp8),
+                reinterpret_cast<float*>(output_scale),
+                M, K, to_stream(stream));
+        },
+        py::arg("gate_up"), py::arg("output_fp8"),
+        py::arg("output_scale"), py::arg("M"), py::arg("K"),
+        py::arg("stream") = 0);
+
     // G7.7 — Fused IM2COL + FP8 e4m3 quantize for 3x3x3 stride-1
     // already-padded Conv3d. Caller pads x with F.pad to (T_pad, H_pad, W_pad)
     // first; this kernel emits col_fp8 (M=B*To*Ho*Wo, K=27*Ci) ready for

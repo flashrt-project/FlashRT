@@ -64,5 +64,12 @@ void silu_mul_to_fp8_block128_bf16(
     int M, int K,
     cudaStream_t stream);
 
+void silu_mul_merged_to_fp8_block128_bf16(
+    const void* gate_up,
+    void*       output_fp8,
+    float*      output_scale,
+    int M, int K,
+    cudaStream_t stream);
+
 }  // namespace quantize
 }  // namespace flash_rt

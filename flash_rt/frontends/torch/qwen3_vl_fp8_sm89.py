@@ -69,6 +69,7 @@ class Qwen3VlFp8Sm89TextFrontend:
             'rms_norm_to_fp8_block128_bf16',
             'residual_add_rms_norm_to_fp8_block128_bf16',
             'silu_mul_to_fp8_block128_bf16',
+            'silu_mul_merged_to_fp8_block128_bf16',
             'qwen3_qk_norm_rope_kvwrite_bf16',
             'qwen3_qk_norm_rope_kvwrite_batched_bf16',
             'qwen3_q_norm_rope_qstage_bf16',
@@ -250,6 +251,7 @@ class Qwen3VlFp8Sm89TextFrontend:
             (n_q * hd + 2 * n_kv * hd, hidden),
             (hidden, hidden),
             (inter, hidden),
+            (2 * inter, hidden),
             (hidden, inter),
         ):
             act = torch.empty(Sq_max, K, device=device, dtype=f8)
@@ -530,16 +532,25 @@ class Qwen3VlFp8Sm89TextFrontend:
             h_post.data_ptr(), int(lw['post_attn_norm_w']),
             ap_mlp.data_ptr(), sc_mlp.data_ptr(), S, hidden, eps, s)
         up_out = self._prefill_up_out[:S]
-        self._prefill_gemm(
-            ap_mlp, sc_mlp, int(lw['mlp_gate_w']), int(lw['mlp_gate_s']),
-            gate_out, inter, hidden, S)
-        self._prefill_gemm(
-            ap_mlp, sc_mlp, int(lw['mlp_up_w']), int(lw['mlp_up_s']),
-            up_out, inter, hidden, S)
         ap_dn, sc_dn, down_out = self._prefill_fp8_scratch[(hidden, inter)]
-        fvk.silu_mul_to_fp8_block128_bf16(
-            gate_out[:S].data_ptr(), up_out.data_ptr(),
-            ap_dn.data_ptr(), sc_dn.data_ptr(), S, inter, s)
+        if self.fuse_gate_up:
+            _, _, gate_up_out = self._prefill_fp8_scratch[(2 * inter, hidden)]
+            self._prefill_gemm(
+                ap_mlp, sc_mlp, int(lw['gate_up_w']), int(lw['gate_up_s']),
+                gate_up_out, int(lw['gate_up_N']), hidden, S)
+            fvk.silu_mul_merged_to_fp8_block128_bf16(
+                gate_up_out[:S].data_ptr(),
+                ap_dn.data_ptr(), sc_dn.data_ptr(), S, inter, s)
+        else:
+            self._prefill_gemm(
+                ap_mlp, sc_mlp, int(lw['mlp_gate_w']), int(lw['mlp_gate_s']),
+                gate_out, inter, hidden, S)
+            self._prefill_gemm(
+                ap_mlp, sc_mlp, int(lw['mlp_up_w']), int(lw['mlp_up_s']),
+                up_out, inter, hidden, S)
+            fvk.silu_mul_to_fp8_block128_bf16(
+                gate_out[:S].data_ptr(), up_out.data_ptr(),
+                ap_dn.data_ptr(), sc_dn.data_ptr(), S, inter, s)
         self._prefill_gemm(
             ap_dn, sc_dn, int(lw['mlp_down_w']), int(lw['mlp_down_s']),
             down_out, hidden, inter, S)

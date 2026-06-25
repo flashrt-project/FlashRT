@@ -290,6 +290,34 @@ __global__ void silu_mul_to_fp8_block128_kernel(
   output[idx] = __nv_fp8_e4m3(q);
 }
 
+__global__ void silu_mul_merged_to_fp8_block128_kernel(
+    const __nv_bfloat16* __restrict__ gate_up,
+    __nv_fp8_e4m3* __restrict__ output,
+    float* __restrict__ scale,
+    int K)
+{
+  const int m = blockIdx.y;
+  const int kb = blockIdx.x;
+  const int t = threadIdx.x;
+  const int k = kb * kBlock + t;
+  const size_t out_idx = (size_t)m * K + k;
+  const size_t gate_idx = (size_t)m * (2 * K) + k;
+  const size_t up_idx = gate_idx + K;
+  __shared__ float red[4];
+
+  const float g = __bfloat162float(gate_up[gate_idx]);
+  const float u = __bfloat162float(gate_up[up_idx]);
+  const float silu_g = silu_f32(g);
+  const float silu_bf = __bfloat162float(__float2bfloat16(silu_g));
+  const float v = __bfloat162float(__float2bfloat16(silu_bf * u));
+  const float amax = block_reduce_max_128(fabsf(v), red);
+  const float sc = fmaxf(amax / kFp8Max, 1.0e-12f);
+  if (t == 0) scale[m * (K / kBlock) + kb] = sc;
+  float q = v / sc;
+  q = fminf(fmaxf(q, -kFp8Max), kFp8Max);
+  output[out_idx] = __nv_fp8_e4m3(q);
+}
+
 }  // namespace
 
 void fp8_per_token_block128_quant_bf16(
@@ -378,6 +406,24 @@ void silu_mul_to_fp8_block128_bf16(
   silu_mul_to_fp8_block128_kernel<<<grid, block, 0, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(gate),
       reinterpret_cast<const __nv_bfloat16*>(up),
+      reinterpret_cast<__nv_fp8_e4m3*>(output_fp8),
+      output_scale, K);
+}
+
+void silu_mul_merged_to_fp8_block128_bf16(
+    const void* gate_up,
+    void* output_fp8,
+    float* output_scale,
+    int M, int K,
+    cudaStream_t stream)
+{
+  if ((K % kBlock) != 0)
+    throw std::runtime_error(
+        "silu_mul_merged_to_fp8_block128_bf16 requires K multiple of 128");
+  dim3 block(kBlock);
+  dim3 grid(K / kBlock, M);
+  silu_mul_merged_to_fp8_block128_kernel<<<grid, block, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(gate_up),
       reinterpret_cast<__nv_fp8_e4m3*>(output_fp8),
       output_scale, K);
 }
