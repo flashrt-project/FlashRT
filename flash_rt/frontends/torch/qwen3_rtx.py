@@ -301,6 +301,12 @@ class Qwen3TorchFrontendRtx:
         # fused QKV path (homogeneous alpha). Default ON.
         self._enable_qkv_post_fusion_prefill: bool = True
 
+        # Prefill boundary fusion: fold residual_2 + next-layer input_norm
+        # + nvfp4 quant into one `residual_add_rms_norm_to_nvfp4` per layer
+        # boundary (mirrors the decode `_enable_boundary_fusion`), removing
+        # the standalone torch.add + a separate input norm+quant. Default ON.
+        self._enable_boundary_fusion_prefill: bool = True
+
         # silu_mul + nvfp4 quant fusion: collapse `silu(gate) * up`
         # and the subsequent nvfp4 swizzled quantization into one
         # launch (`silu_mul_to_nvfp4_swizzled_bf16`); also avoids a
@@ -919,7 +925,9 @@ class Qwen3TorchFrontendRtx:
     # ── D4: S=N prefill ──
 
     def _layer_forward_full_nvfp4_prefill(self, L: int, h_in_S, cos_S,
-                                            sin_S, start_pos: int, S: int):
+                                            sin_S, start_pos: int, S: int,
+                                            prequant_ap=None, prequant_sf=None,
+                                            next_input_norm_w: int = 0):
         """Single Qwen3 layer at S=N prefill.
 
         Same kernel sequence as ``_layer_forward_full_nvfp4`` but with
@@ -952,12 +960,18 @@ class Qwen3TorchFrontendRtx:
 
         h2 = h_in_S.view(S, hidden).contiguous()
 
-        # 1+2) input layernorm + NVFP4 quantize at M=S.
+        # 1+2) input layernorm + NVFP4 quantize at M=S. With boundary
+        # fusion the previous layer's tail already produced this layer's
+        # pre-quantized activation (residual_2 + this input_norm + quant
+        # in one launch), so skip the standalone norm+quant here.
         ap_h, sf_h, _ = self._nvfp4_scratch[(n_q * hd, hidden)]
-        fvk.rms_norm_to_nvfp4_swizzled_bf16(
-            h2.data_ptr(), int(lw['input_norm_w']),
-            ap_h.data_ptr(), sf_h.data_ptr(), S, hidden, eps, s,
-        )
+        if prequant_ap is not None and prequant_sf is not None:
+            ap_h, sf_h = prequant_ap, prequant_sf
+        else:
+            fvk.rms_norm_to_nvfp4_swizzled_bf16(
+                h2.data_ptr(), int(lw['input_norm_w']),
+                ap_h.data_ptr(), sf_h.data_ptr(), S, hidden, eps, s,
+            )
 
         # 3) q/k/v_proj NVFP4 GEMMs at M=S. When the checkpoint has a
         # homogeneous qkv alpha (q/k/v share activation + alpha) a single
@@ -1175,10 +1189,21 @@ class Qwen3TorchFrontendRtx:
         )
         mlp_out = down_out_buf[:S].view(1, S, hidden)
 
-        # 15) Residual 2 → ping-pong.
+        # 15) Residual 2 (+ optional boundary fusion) → ping-pong.
         h_out = self._layer_out_a if (L % 2 == 0) else self._layer_out_b
         h_out_v = h_out[:, :S]
-        torch.add(h_post, mlp_out, out=h_out_v)
+        if next_input_norm_w:
+            # Fused: h_out = h_post + mlp_out AND next ap/sf =
+            # nvfp4_quant(rms_norm(h_out, next_norm_w)). Reuse the
+            # (n_q*hd, hidden) NVFP4 scratch — consumer-done by step 3.
+            next_ap, next_sf, _ = self._nvfp4_scratch[(n_q * hd, hidden)]
+            fvk.residual_add_rms_norm_to_nvfp4_swizzled_bf16(
+                h_post.data_ptr(), mlp_out.contiguous().data_ptr(),
+                h_out_v.data_ptr(), int(next_input_norm_w),
+                next_ap.data_ptr(), next_sf.data_ptr(), S, hidden, eps, s,
+            )
+        else:
+            torch.add(h_post, mlp_out, out=h_out_v)
         return h_out_v
 
     def forward_prefill_nvfp4(self, prompt_ids, start_pos: int = 0,
@@ -1247,10 +1272,33 @@ class Qwen3TorchFrontendRtx:
 
         # 2) 36 layers.
         n_layers = cfg['num_hidden_layers']
-        for L in range(n_layers):
-            h = self._layer_forward_full_nvfp4_prefill(
-                L, h, cos_S, sin_S, start_pos, S,
+        layers_ptrs = self._weights.ptrs['layers']
+        if self._enable_boundary_fusion_prefill:
+            # Pre-quant the layer-0 input, then have each layer's tail
+            # produce the next layer's pre-quant via the fused
+            # residual+norm+quant op. Removes the standalone torch.add
+            # (residual_2) + a separate input norm+quant per boundary.
+            n_q = cfg['num_q_heads']
+            hd = cfg['head_dim']
+            ap0, sf0, _ = self._nvfp4_scratch[(n_q * hd, hidden)]
+            h0_v = h.view(S, hidden).contiguous()
+            fvk.rms_norm_to_nvfp4_swizzled_bf16(
+                h0_v.data_ptr(), int(layers_ptrs[0]['input_norm_w']),
+                ap0.data_ptr(), sf0.data_ptr(), S, hidden, eps, s,
             )
+            for L in range(n_layers):
+                next_w = (int(layers_ptrs[L + 1]['input_norm_w'])
+                          if L + 1 < n_layers else 0)
+                h = self._layer_forward_full_nvfp4_prefill(
+                    L, h, cos_S, sin_S, start_pos, S,
+                    prequant_ap=ap0, prequant_sf=sf0,
+                    next_input_norm_w=next_w,
+                )
+        else:
+            for L in range(n_layers):
+                h = self._layer_forward_full_nvfp4_prefill(
+                    L, h, cos_S, sin_S, start_pos, S,
+                )
 
         # 3) Final RMSNorm at M=S.
         h2 = h.view(S, hidden).contiguous()
@@ -1402,10 +1450,29 @@ class Qwen3TorchFrontendRtx:
         sin_S = self._rope_sin_table[0:S]
 
         n_layers = cfg['num_hidden_layers']
-        for L in range(n_layers):
-            h = self._layer_forward_full_nvfp4_prefill(
-                L, h, cos_S, sin_S, 0, S,
+        layers_ptrs = self._weights.ptrs['layers']
+        if self._enable_boundary_fusion_prefill:
+            n_q = cfg['num_q_heads']
+            hd = cfg['head_dim']
+            ap0, sf0, _ = self._nvfp4_scratch[(n_q * hd, hidden)]
+            h0_v = h.view(S, hidden).contiguous()
+            fvk.rms_norm_to_nvfp4_swizzled_bf16(
+                h0_v.data_ptr(), int(layers_ptrs[0]['input_norm_w']),
+                ap0.data_ptr(), sf0.data_ptr(), S, hidden, eps, s,
             )
+            for L in range(n_layers):
+                next_w = (int(layers_ptrs[L + 1]['input_norm_w'])
+                          if L + 1 < n_layers else 0)
+                h = self._layer_forward_full_nvfp4_prefill(
+                    L, h, cos_S, sin_S, 0, S,
+                    prequant_ap=ap0, prequant_sf=sf0,
+                    next_input_norm_w=next_w,
+                )
+        else:
+            for L in range(n_layers):
+                h = self._layer_forward_full_nvfp4_prefill(
+                    L, h, cos_S, sin_S, 0, S,
+                )
 
         h2 = h.view(S, hidden).contiguous()
         x_norm = self._h_b[:S].view(S, hidden)
