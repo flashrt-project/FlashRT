@@ -91,13 +91,13 @@ class Qwen3VlFp8Sm89TextFrontend:
         cfg_path = os.path.join(self.checkpoint_path, 'config.json')
         cfg = json.load(open(cfg_path))
         text_cfg = cfg['text_config']
-        # This path supports any Qwen3-VL language stack whose dimensions
-        # satisfy the SM89 block-128 FP8 kernel constraints (validated on the
-        # official 8B-FP8 and the quantized 2B checkpoints). The hard
+        # This path supports Qwen3-VL language stacks whose dimensions satisfy
+        # the SM89 block-128 FP8 kernel constraints and whose checkpoint uses
+        # the official/block-128 FP8 tensor layout loaded below. The config
         # requirements are: head_dim == 128 (the fused qk-norm/RoPE/KV-write
-        # kernels hardcode it) and every GEMM N/K dimension a multiple of 128
-        # (block-128 act/weight scaling). num_q_heads must be a multiple of
-        # num_kv_heads (GQA). Anything else is fine and read from config.
+        # kernels hardcode it), every GEMM N/K dimension a multiple of 128
+        # (block-128 act/weight scaling), and num_q_heads a multiple of
+        # num_kv_heads (GQA). Other language geometry is read from config.
         n_q = int(text_cfg['num_attention_heads'])
         n_kv = int(text_cfg['num_key_value_heads'])
         head_dim = int(text_cfg.get('head_dim')
@@ -118,7 +118,8 @@ class Qwen3VlFp8Sm89TextFrontend:
                 problems.append(f'{name}={dim} not a multiple of 128')
         if problems:
             raise RuntimeError(
-                'Qwen3VlFp8Sm89TextFrontend cannot serve this config: '
+                'Qwen3VlFp8Sm89TextFrontend requires Qwen3-VL config '
+                'dimensions compatible with the SM89 block-128 FP8 kernels: '
                 + '; '.join(problems) + f' (from {cfg_path})')
 
         self._load_fp8_path()

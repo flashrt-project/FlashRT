@@ -21,8 +21,8 @@ tool does not materialise a separate (0.6 GB) lm_head.
 Usage::
 
     python scripts/quantize_qwen3_vl_to_fp8_block128.py \
-        --src ~/code/AICAS/Qwen3-VL-2B-Instruct \
-        --dst ~/models/vlm/Qwen3-VL-2B-Instruct-FP8
+        --src /path/to/Qwen3-VL-2B-Instruct \
+        --dst /path/to/Qwen3-VL-2B-Instruct-FP8
 """
 from __future__ import annotations
 

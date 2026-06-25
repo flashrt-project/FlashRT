@@ -47,20 +47,14 @@ cmake -S . -B build -DGPU_ARCH=89 -DFLASHRT_BUILD_QWEN3_VL=ON
 cmake --build build -j --target flash_rt_kernels flash_rt_fa2 flash_rt_qwen3_vl_kernels
 ```
 
-## lm_head: pass `use_fp8_lm_head=True` for 2B
+## lm_head: optional FP8 mode for 2B
 
-The frontend default is BF16 `lm_head` (shared with the 8B path). For 2B,
-pass `use_fp8_lm_head=True` — the 152k-vocab projection is the single largest
-decode weight read; in FP8 it halves that traffic and is what carries decode
-past the 350 tps target:
-
-| `lm_head` | decode (S=63) | tps | logit cos |
-|---|---|---|---|
-| FP8 | 2.653 ms | **377** | 0.999426 |
-| BF16 | 3.479 ms | 287 | 0.999487 |
-
-Both produce the same top token at every step measured and generate coherent
-multi-token text, so FP8 `lm_head` is recommended for 2B.
+The frontend default is BF16 `lm_head` (shared with the 8B path). For
+throughput-sensitive local validation, pass `use_fp8_lm_head=True` or
+`--fp8-lm-head`. The 152k-vocab projection is a large decode-time weight read,
+so FP8 `lm_head` can reduce bandwidth pressure on 2B. Treat it as a performance
+mode: validate logits and generation quality against the default BF16 head on
+the target checkpoint before using it in production.
 
 ## Quickstart
 
@@ -98,11 +92,9 @@ generate_tokens=32 text='A black background features the "FlashRT" logo, with
   and orange.'
 ```
 
-Versus the 8B path on the same 4090 (text S=79): decode 10.128 ms → 2B is
-**~3.8x faster** at decode and faster at prefill (8.5 ms vs 14.3 ms), as
-expected from the ~4x smaller language weights. Short-context text decode runs
-at 377 tps; decode at the full 1581-token multimodal context is 2.966 ms
-(337 tps) because attention reads the longer KV cache.
+These numbers are local validation points, not CI guarantees. Re-benchmark on
+the target GPU, driver, and build flags before treating them as deployment
+latency targets.
 
 ## Limits
 
