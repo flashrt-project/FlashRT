@@ -307,6 +307,16 @@ class Qwen3TorchFrontendRtx:
         # the standalone torch.add + a separate input norm+quant. Default ON.
         self._enable_boundary_fusion_prefill: bool = True
 
+        # FP8 (e4m3) lm_head for the prefill eager M=1 path. The bf16
+        # lm_head is bandwidth-bound on the 1.24 GB weight (~0.76 ms);
+        # W8A8 fp8 halves that read. Per-call activation scale keeps the
+        # next-token argmax matching the original HF bf16 ref as well as
+        # the bf16 lm_head (24-prompt check: 3 vs HF, == bf16's 4). Only
+        # the M=1 (full_logits=False) path; full_logits stays bf16.
+        # Default ON when the fp8 weight is present.
+        self._enable_lmhead_fp8_prefill: bool = True
+        self._lmhead_fp8_act = None     # holds the per-call fp8 activation
+
         # silu_mul + nvfp4 quant fusion: collapse `silu(gate) * up`
         # and the subsequent nvfp4 swizzled quantization into one
         # launch (`silu_mul_to_nvfp4_swizzled_bf16`); also avoids a
@@ -1206,6 +1216,34 @@ class Qwen3TorchFrontendRtx:
             torch.add(h_post, mlp_out, out=h_out_v)
         return h_out_v
 
+    def _lm_head_m1(self, last_row, vocab: int, hidden: int, s) -> None:
+        """Eager M=1 lm_head into self._logits_buf[:1]. Uses the W8A8 fp8
+        GEMV (half the bf16 weight BW) with a per-call activation scale when
+        the fp8 weight is present and enabled; else the bf16 mat-vec. The
+        fp8 path matches the original HF bf16 next-token argmax as well as
+        the bf16 lm_head (validated 24 prompts). Eager only (prefill tail);
+        decode keeps the captured bf16 lm_head."""
+        import torch
+        from flash_rt import flash_rt_kernels as fvk
+        lm_fp8 = self._weights.ptrs.get('lm_head_fp8')
+        if self._enable_lmhead_fp8_prefill and lm_fp8 is not None:
+            sx = 448.0 / last_row.abs().max().float()
+            # Keep a ref on self so the fp8 buffer outlives the async kernel.
+            self._lmhead_fp8_act = (last_row.float() * sx).clamp_(
+                -448.0, 448.0).to(torch.float8_e4m3fn)
+            alpha = 1.0 / (
+                self._weights.ptrs['lm_head_fp8_wscale'] * float(sx))
+            fvk.ht_gemv_fp8_m1_w16(
+                self._lmhead_fp8_act.data_ptr(), int(lm_fp8),
+                self._logits_buf[:1].data_ptr(), 1, vocab, hidden, alpha, s,
+            )
+        else:
+            fvk.bf16_matmul_qwen36_bf16(
+                last_row.contiguous().data_ptr(),
+                int(self._weights.ptrs['lm_head_w']),
+                self._logits_buf[:1].data_ptr(), 1, vocab, hidden, s,
+            )
+
     def forward_prefill_nvfp4(self, prompt_ids, start_pos: int = 0,
                                 *, full_logits: bool = False):
         """S=N prefill: process the whole prompt in one batched forward.
@@ -1320,12 +1358,7 @@ class Qwen3TorchFrontendRtx:
             ret = self._logits_buf[:S]
         else:
             last_row = x_norm[S - 1:S].contiguous()
-            fvk.bf16_matmul_qwen36_bf16(
-                last_row.data_ptr(),
-                int(self._weights.ptrs['lm_head_w']),
-                self._logits_buf[:1].data_ptr(),
-                1, vocab, hidden, s,
-            )
+            self._lm_head_m1(last_row, vocab, hidden, s)
             ret = self._logits_buf[:1]
 
         # Advance the logical decode cursor to right after the prompt.
@@ -1600,12 +1633,7 @@ class Qwen3TorchFrontendRtx:
         vocab = cfg['vocab_size']
         s = torch.cuda.current_stream().cuda_stream
         last_row = self._last_hidden_buf[0, real_S - 1:real_S].contiguous()
-        fvk.bf16_matmul_qwen36_bf16(
-            last_row.data_ptr(),
-            int(self._weights.ptrs['lm_head_w']),
-            self._logits_buf[:1].data_ptr(),
-            1, vocab, hidden, s,
-        )
+        self._lm_head_m1(last_row, vocab, hidden, s)
         _ = bucket  # silence unused warning in IDE diff view
 
         # Decode resumes at the real prompt's end, NOT the bucket end.

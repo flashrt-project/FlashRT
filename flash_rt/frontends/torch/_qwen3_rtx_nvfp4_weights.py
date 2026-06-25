@@ -319,6 +319,19 @@ def extract_weights_qwen3_nvfp4(
     handles.ptrs['lm_head_sf'] = _anchor(handles, sf_swz_lm)
     handles.ptrs['lm_head_alpha'] = lm_alpha
 
+    # FP8 (e4m3) lm_head for the prefill eager M=1 path. Unlike the NVFP4
+    # variant above, per-call W8A8 fp8 matches the original HF bf16 argmax
+    # as well as the bf16 lm_head does (24-prompt check: 3 vs HF, same as
+    # bf16's 4) at half the weight BW — e4m3's dynamic range covers the
+    # per-row magnitude spread NVFP4's e2m1 could not. Per-tensor weight
+    # scale; the activation is quantized per-call (eager tail), combined
+    # alpha = 1/(w_scale * act_scale).
+    lm_w_scale = 448.0 / lm_head.abs().max().float()
+    lm_head_fp8 = (lm_head.float() * lm_w_scale).clamp_(-448.0, 448.0).to(
+        torch.float8_e4m3fn).contiguous()
+    handles.ptrs['lm_head_fp8'] = _anchor(handles, lm_head_fp8)
+    handles.ptrs['lm_head_fp8_wscale'] = float(lm_w_scale.item())
+
     handles.ptrs['vocab_size'] = vocab
     handles.ptrs['hidden'] = hidden
     handles.ptrs['head_dim'] = head_dim
