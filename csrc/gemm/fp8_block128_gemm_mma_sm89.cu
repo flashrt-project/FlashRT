@@ -22,6 +22,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <stdexcept>
 
 namespace flash_rt {
 namespace gemm {
@@ -303,6 +304,12 @@ int fp8_block128_gemm_blockscaled_sm89_bf16out(
     const void* A, const void* B, void* D, int M, int N, int K,
     const float* act_scale, const float* w_scale, cudaStream_t stream)
 {
+    if ((N % 128) != 0)
+        throw std::runtime_error(
+            "fp8_block128_gemm_blockscaled_sm89_bf16out requires N multiple of 128");
+    if ((K % 128) != 0)
+        throw std::runtime_error(
+            "fp8_block128_gemm_blockscaled_sm89_bf16out requires K multiple of 128");
     // Tuned on 4090 over Qwen3-VL-8B-FP8 layer shapes (qkv 6144, o 4096,
     // gate/up 12288, down 4096x12288) at S=79..256. BLOCK_M=32 keeps grid
     // occupancy high at small M; BLOCK_N=64 wins until M crosses ~128, then

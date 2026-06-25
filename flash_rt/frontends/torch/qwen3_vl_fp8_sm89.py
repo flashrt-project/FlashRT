@@ -28,6 +28,9 @@ class Qwen3VlFp8Sm89TextFrontend:
                  fuse_gate_up: bool = False,
                  fuse_qk_postproc: bool = True,
                  use_fp8_lm_head: bool = False) -> None:
+        import json
+        import os
+
         self.checkpoint_path = str(checkpoint_path)
         self.device = device
         self.max_seq = int(max_seq)
@@ -83,6 +86,38 @@ class Qwen3VlFp8Sm89TextFrontend:
                 'and build flash_rt_kernels flash_rt_fa2 '
                 'flash_rt_qwen3_vl_kernels.')
         self._fvk = fvk
+
+        cfg_path = os.path.join(self.checkpoint_path, 'config.json')
+        cfg = json.load(open(cfg_path))
+        text_cfg = cfg['text_config']
+        expected = {
+            'num_hidden_layers': 36,
+            'num_attention_heads': 32,
+            'num_key_value_heads': 8,
+            'head_dim': 128,
+            'hidden_size': 4096,
+            'intermediate_size': 12288,
+        }
+        actual = {
+            'num_hidden_layers': int(text_cfg['num_hidden_layers']),
+            'num_attention_heads': int(text_cfg['num_attention_heads']),
+            'num_key_value_heads': int(text_cfg['num_key_value_heads']),
+            'head_dim': int(text_cfg.get('head_dim')
+                            or text_cfg['hidden_size']
+                            // int(text_cfg['num_attention_heads'])),
+            'hidden_size': int(text_cfg['hidden_size']),
+            'intermediate_size': int(text_cfg['intermediate_size']),
+        }
+        mismatched = [
+            f"{key}={actual[key]} (expected {value})"
+            for key, value in expected.items()
+            if actual[key] != value
+        ]
+        if mismatched:
+            raise RuntimeError(
+                'Qwen3VlFp8Sm89TextFrontend only supports the official '
+                'Qwen3-VL-8B FP8 text stack; got ' + ', '.join(mismatched)
+                + f' from {cfg_path}')
 
         self._load_fp8_path()
         self._alloc_buffers()

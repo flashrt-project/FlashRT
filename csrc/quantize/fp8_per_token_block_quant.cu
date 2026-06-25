@@ -7,6 +7,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <stdexcept>
 
 namespace flash_rt {
 namespace quantize {
@@ -298,6 +299,9 @@ void fp8_per_token_block128_quant_bf16(
     int M, int K,
     cudaStream_t stream)
 {
+  if ((K % kBlock) != 0)
+    throw std::runtime_error(
+        "fp8_per_token_block128_quant_bf16 requires K multiple of 128");
   dim3 block(kBlock);
   if (M <= 65535) {
     dim3 grid(K / kBlock, M);
@@ -324,6 +328,9 @@ void rms_norm_to_fp8_block128_bf16(
     int M, int K, float eps,
     cudaStream_t stream)
 {
+  if ((K % kBlock) != 0)
+    throw std::runtime_error(
+        "rms_norm_to_fp8_block128_bf16 requires K multiple of 128");
   size_t smem = 4 * sizeof(float) + (size_t)K * sizeof(__nv_bfloat16);
   rms_norm_to_fp8_block128_kernel<<<M, kBlock, smem, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(input),
@@ -342,6 +349,9 @@ void residual_add_rms_norm_to_fp8_block128_bf16(
     int M, int K, float eps,
     cudaStream_t stream)
 {
+  if ((K % kBlock) != 0)
+    throw std::runtime_error(
+        "residual_add_rms_norm_to_fp8_block128_bf16 requires K multiple of 128");
   size_t smem = 4 * sizeof(float) + (size_t)K * sizeof(__nv_bfloat16);
   residual_add_rms_norm_to_fp8_block128_kernel<<<M, kBlock, smem, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(residual),
@@ -360,6 +370,9 @@ void silu_mul_to_fp8_block128_bf16(
     int M, int K,
     cudaStream_t stream)
 {
+  if ((K % kBlock) != 0)
+    throw std::runtime_error(
+        "silu_mul_to_fp8_block128_bf16 requires K multiple of 128");
   dim3 block(kBlock);
   dim3 grid(K / kBlock, M);
   silu_mul_to_fp8_block128_kernel<<<grid, block, 0, stream>>>(
