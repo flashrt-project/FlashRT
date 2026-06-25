@@ -204,7 +204,138 @@ __global__ void k_norm_rope_kvwrite_devpos_kernel(
   v_cache_dst[head * HEAD_DIM + tid] = v_pre[head * HEAD_DIM + tid];
 }
 
+// ── Prefill (S>1) batched variants ──
+// One block per (row, head); grid = (n_heads, S). Read strided q/k/v from
+// the fused QKV output (in_row_stride = qkv_N), per-row cos/sin (stride
+// HALF), write to contiguous Q_buf / K_cache / V_cache (out/cache row
+// stride passed in). Same norm+RoPE math as the decode kernels; folds the
+// per-layer rms_norm + multi-op RoPE + Q/K/V copies into 2 launches.
+__global__ void q_norm_rope_qstage_prefill_kernel(
+    const __nv_bfloat16* __restrict__ q_pre,      // (S, *) strided
+    const __nv_bfloat16* __restrict__ q_norm_w,   // (128,)
+    const __nv_bfloat16* __restrict__ cos_v,      // (S, 64)
+    const __nv_bfloat16* __restrict__ sin_v,      // (S, 64)
+    __nv_bfloat16* __restrict__ q_buf,            // (S, n_q*128)
+    int n_q, int S,
+    int in_row_stride, int out_row_stride,
+    float eps) {
+  int head = blockIdx.x;
+  int row = blockIdx.y;
+  if (head >= n_q || row >= S) return;
+  int tid = threadIdx.x;
+
+  __shared__ float s_normed[HEAD_DIM];
+  __shared__ float s_smem4[N_WARPS];
+
+  const __nv_bfloat16* q_row = q_pre + (size_t)row * in_row_stride + head * HEAD_DIM;
+  const __nv_bfloat16* cos_r = cos_v + (size_t)row * HALF;
+  const __nv_bfloat16* sin_r = sin_v + (size_t)row * HALF;
+  float v = __bfloat162float(q_row[tid]);
+  float w = __bfloat162float(q_norm_w[tid]);
+  float rstd = rsqrtf(block_sum_4warp(v * v, s_smem4) / float(HEAD_DIM) + eps);
+  float normed = v * rstd * w;
+  s_normed[tid] = normed;
+  __syncthreads();
+
+  __nv_bfloat16* dst = q_buf + (size_t)row * out_row_stride + head * HEAD_DIM;
+  if (tid < HALF) {
+    float partner = s_normed[tid + HALF];
+    float c = __bfloat162float(cos_r[tid]);
+    float sn = __bfloat162float(sin_r[tid]);
+    dst[tid] = __float2bfloat16(normed * c - partner * sn);
+  } else {
+    float partner = s_normed[tid - HALF];
+    int hi = tid - HALF;
+    float c = __bfloat162float(cos_r[hi]);
+    float sn = __bfloat162float(sin_r[hi]);
+    dst[tid] = __float2bfloat16(normed * c + partner * sn);
+  }
+}
+
+__global__ void k_norm_rope_kvwrite_prefill_kernel(
+    const __nv_bfloat16* __restrict__ k_pre,      // (S, *) strided
+    const __nv_bfloat16* __restrict__ v_pre,      // (S, *) strided
+    const __nv_bfloat16* __restrict__ k_norm_w,   // (128,)
+    const __nv_bfloat16* __restrict__ cos_v,      // (S, 64)
+    const __nv_bfloat16* __restrict__ sin_v,      // (S, 64)
+    __nv_bfloat16* __restrict__ k_cache,          // (S, n_kv*128)
+    __nv_bfloat16* __restrict__ v_cache,          // (S, n_kv*128)
+    int n_kv, int S,
+    int in_row_stride, int cache_row_stride,
+    float eps) {
+  int head = blockIdx.x;
+  int row = blockIdx.y;
+  if (head >= n_kv || row >= S) return;
+  int tid = threadIdx.x;
+
+  __shared__ float s_normed[HEAD_DIM];
+  __shared__ float s_smem4[N_WARPS];
+
+  const __nv_bfloat16* k_row = k_pre + (size_t)row * in_row_stride + head * HEAD_DIM;
+  const __nv_bfloat16* v_row = v_pre + (size_t)row * in_row_stride + head * HEAD_DIM;
+  const __nv_bfloat16* cos_r = cos_v + (size_t)row * HALF;
+  const __nv_bfloat16* sin_r = sin_v + (size_t)row * HALF;
+  float v = __bfloat162float(k_row[tid]);
+  float w = __bfloat162float(k_norm_w[tid]);
+  float rstd = rsqrtf(block_sum_4warp(v * v, s_smem4) / float(HEAD_DIM) + eps);
+  float normed = v * rstd * w;
+  s_normed[tid] = normed;
+  __syncthreads();
+
+  __nv_bfloat16* kdst = k_cache + (size_t)row * cache_row_stride + head * HEAD_DIM;
+  if (tid < HALF) {
+    float partner = s_normed[tid + HALF];
+    float c = __bfloat162float(cos_r[tid]);
+    float sn = __bfloat162float(sin_r[tid]);
+    kdst[tid] = __float2bfloat16(normed * c - partner * sn);
+  } else {
+    float partner = s_normed[tid - HALF];
+    int hi = tid - HALF;
+    float c = __bfloat162float(cos_r[hi]);
+    float sn = __bfloat162float(sin_r[hi]);
+    kdst[tid] = __float2bfloat16(normed * c + partner * sn);
+  }
+  // V is copied (no norm, no RoPE).
+  v_cache[(size_t)row * cache_row_stride + head * HEAD_DIM + tid] = v_row[tid];
+}
+
 }  // namespace
+
+int qwen3_q_norm_rope_qstage_prefill_bf16(
+    const void* q_pre, const void* q_norm_w, const void* cos, const void* sin,
+    void* q_buf_dst, int n_q_heads, int S, int in_row_stride,
+    int out_row_stride, float eps, cudaStream_t stream) {
+  if (!q_pre || !q_norm_w || !cos || !sin || !q_buf_dst) return 1;
+  if (n_q_heads <= 0 || S <= 0) return 2;
+  q_norm_rope_qstage_prefill_kernel<<<dim3(n_q_heads, S), dim3(THREADS), 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(q_pre),
+      reinterpret_cast<const __nv_bfloat16*>(q_norm_w),
+      reinterpret_cast<const __nv_bfloat16*>(cos),
+      reinterpret_cast<const __nv_bfloat16*>(sin),
+      reinterpret_cast<__nv_bfloat16*>(q_buf_dst),
+      n_q_heads, S, in_row_stride, out_row_stride, eps);
+  return 0;
+}
+
+int qwen3_k_norm_rope_kvwrite_prefill_bf16(
+    const void* k_pre, const void* v_pre, const void* k_norm_w,
+    const void* cos, const void* sin, void* k_cache_dst, void* v_cache_dst,
+    int n_kv_heads, int S, int in_row_stride, int cache_row_stride,
+    float eps, cudaStream_t stream) {
+  if (!k_pre || !v_pre || !k_norm_w || !cos || !sin
+      || !k_cache_dst || !v_cache_dst) return 1;
+  if (n_kv_heads <= 0 || S <= 0) return 2;
+  k_norm_rope_kvwrite_prefill_kernel<<<dim3(n_kv_heads, S), dim3(THREADS), 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(k_pre),
+      reinterpret_cast<const __nv_bfloat16*>(v_pre),
+      reinterpret_cast<const __nv_bfloat16*>(k_norm_w),
+      reinterpret_cast<const __nv_bfloat16*>(cos),
+      reinterpret_cast<const __nv_bfloat16*>(sin),
+      reinterpret_cast<__nv_bfloat16*>(k_cache_dst),
+      reinterpret_cast<__nv_bfloat16*>(v_cache_dst),
+      n_kv_heads, S, in_row_stride, cache_row_stride, eps);
+  return 0;
+}
 
 int qwen3_k_norm_rope_kvwrite_devpos_bf16(
     const void* k_pre, const void* v_pre, const void* k_norm_w,

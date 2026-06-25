@@ -76,6 +76,41 @@ int qwen3_k_norm_rope_kvwrite_bf16(
     float       eps,
     cudaStream_t stream);
 
+// Prefill (S>1) batched variants. grid = (n_heads, S); one block per
+// (row, head). q/k/v read with `in_row_stride` (= qkv_N for the fused QKV
+// output) so the strided q/k/v slices are consumed in place — no
+// contiguous copy. cos/sin are (S, 64); outputs are written with the
+// destination row stride (q_buf: n_q*128; K/V cache: cache_row_stride).
+// Folds the per-layer rms_norm + multi-op RoPE + Q/K/V copies into 2
+// launches. head_dim hardcoded 128. Returns 0 on success.
+int qwen3_q_norm_rope_qstage_prefill_bf16(
+    const void* q_pre,
+    const void* q_norm_w,
+    const void* cos,
+    const void* sin,
+    void*       q_buf_dst,
+    int         n_q_heads,
+    int         S,
+    int         in_row_stride,
+    int         out_row_stride,
+    float       eps,
+    cudaStream_t stream);
+
+int qwen3_k_norm_rope_kvwrite_prefill_bf16(
+    const void* k_pre,
+    const void* v_pre,
+    const void* k_norm_w,
+    const void* cos,
+    const void* sin,
+    void*       k_cache_dst,
+    void*       v_cache_dst,
+    int         n_kv_heads,
+    int         S,
+    int         in_row_stride,
+    int         cache_row_stride,
+    float       eps,
+    cudaStream_t stream);
+
 // Device-position variant: cache slot = K_cache_base + (*cur_pos) * row_elems,
 // so one captured graph serves every decode position (host bumps *cur_pos
 // before each replay). row_elems = n_kv * 128. Returns 0 on success.

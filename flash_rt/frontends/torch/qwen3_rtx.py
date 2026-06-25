@@ -293,6 +293,14 @@ class Qwen3TorchFrontendRtx:
         # ON.
         self._enable_qkv_post_fusion: bool = True
 
+        # Prefill (M=S) batched q/k/v post-proc fusion: collapse the
+        # per-layer (q_norm + k_norm + 2× RoPE + Q/K/V copies) chain into
+        # two batched launches via `qwen3_q_norm_rope_qstage_prefill_bf16`
+        # / `qwen3_k_norm_rope_kvwrite_prefill_bf16`, reading the strided
+        # q/k/v slices of the fused QKV output in place. Requires the
+        # fused QKV path (homogeneous alpha). Default ON.
+        self._enable_qkv_post_fusion_prefill: bool = True
+
         # silu_mul + nvfp4 quant fusion: collapse `silu(gate) * up`
         # and the subsequent nvfp4 swizzled quantization into one
         # launch (`silu_mul_to_nvfp4_swizzled_bf16`); also avoids a
@@ -958,6 +966,11 @@ class Qwen3TorchFrontendRtx:
         # FP4 peak at M=512. Folding them into the wide-N GEMM lifts the
         # whole projection toward the q_proj/down efficiency band.
         prefill_gemm = self._prefill_gemm
+        # When the fused QKV path is active, the batched post-proc kernel
+        # consumes the strided q/k/v slices of qkv_out in place (no
+        # contiguous copy) and writes Q_buf/K_cache/V_cache directly.
+        use_fused_post = (self._qkv_prefill_out is not None
+                          and self._enable_qkv_post_fusion_prefill)
         if self._qkv_prefill_out is not None:
             qkv_N = int(lw['qkv_proj_N'])
             Nq = n_q * hd          # 4096
@@ -971,9 +984,10 @@ class Qwen3TorchFrontendRtx:
                 float(lw['qkv_proj_alpha']),
                 s,
             )
-            q_pre = qkv_out[:, :Nq].view(1, S, n_q, hd)
-            k_pre = qkv_out[:, Nq:Nq + Nk].view(1, S, n_kv, hd).contiguous()
-            v_fused = qkv_out[:, Nq + Nk:].view(S, n_kv, hd)
+            if not use_fused_post:
+                q_pre = qkv_out[:, :Nq].view(1, S, n_q, hd)
+                k_pre = qkv_out[:, Nq:Nq + Nk].view(1, S, n_kv, hd).contiguous()
+                v_fused = qkv_out[:, Nq + Nk:].view(S, n_kv, hd)
         else:
             q_proj_out_buf = self._nvfp4_scratch[(n_q * hd, hidden)][2]
             prefill_gemm(
@@ -997,54 +1011,78 @@ class Qwen3TorchFrontendRtx:
             k_pre = kv_proj_out_buf[:S].view(1, S, n_kv, hd).contiguous()
             v_fused = None
 
-        # 4) q/k_norm at (S*n_q, hd) and (S*n_kv, hd) flat views.
-        q_pre_flat = q_pre.contiguous().view(S * n_q, hd)
-        k_pre_flat = k_pre.view(S * n_kv, hd)
-        fvk.rms_norm(
-            q_pre_flat.data_ptr(), int(lw['q_norm_w']),
-            self._q_norm_out[:S * n_q].data_ptr(), S * n_q, hd, eps, s,
-        )
-        fvk.rms_norm(
-            k_pre_flat.data_ptr(), int(lw['k_norm_w']),
-            self._k_norm_out[:S * n_kv].data_ptr(), S * n_kv, hd, eps, s,
-        )
-
-        # 5) Inline full-RoPE (rotary_dim = head_dim).
-        q_for_rope = self._q_norm_out[:S * n_q].view(1, S, n_q, hd)
-        k_for_rope = self._k_norm_out[:S * n_kv].view(1, S, n_kv, hd)
-        # cos_S/sin_S are (S, hd/2). Broadcast to (1, S, 1, hd/2).
-        cos4 = cos_S.view(1, S, 1, hd // 2)
-        sin4 = sin_S.view(1, S, 1, hd // 2)
-        q_rot = self._q_rot[:, :S]
-        k_rot = self._k_rot[:, :S]
-        self._rope_apply_inline(
-            q_for_rope, q_rot, self._rope_tmp_q[:, :S], cos4, sin4,
-        )
-        self._rope_apply_inline(
-            k_for_rope, k_rot, self._rope_tmp_k[:, :S], cos4, sin4,
-        )
-
-        # 6) Stage Q + write K to KV cache at [start_pos:start_pos+S].
-        self._attn.Q_buf[:, :S].copy_(q_rot)
-        self._attn.K_cache[L, start_pos:start_pos + S].copy_(
-            k_rot.view(S, n_kv, hd),
-        )
-
-        # 7) v_proj — the fused path already produced v inside the qkv
-        # slice; the split path runs the v GEMM now (reusing kv buffer).
-        if v_fused is not None:
-            v_new = v_fused
-        else:
-            prefill_gemm(
-                ap_h.data_ptr(), int(lw['v_proj_packed']),
-                kv_proj_out_buf.data_ptr(),
-                S, n_kv * hd, hidden,
-                sf_h.data_ptr(), int(lw['v_proj_sf']),
-                float(lw['v_proj_alpha']),
-                s,
+        if use_fused_post:
+            # 4+5+6+7) Fused batched q/k/v post-proc: two launches replace
+            # rms_norm ×2 + multi-op RoPE ×2 + Q/K/V copies. Reads the
+            # strided q/k/v slices of qkv_out in place (in_row_stride =
+            # qkv_N) and writes Q_buf / K_cache / V_cache for all S rows.
+            kv_row_elems = n_kv * hd
+            kv_off = (L * self._attn.kv_layer_stride_bytes
+                      + start_pos * self._attn.kv_row_stride_bytes)
+            k_cache_dst = self._attn.K_cache.data_ptr() + kv_off
+            v_cache_dst = self._attn.V_cache.data_ptr() + kv_off
+            fvk.qwen3_q_norm_rope_qstage_prefill_bf16(
+                qkv_out[:, :Nq].data_ptr(), int(lw['q_norm_w']),
+                cos_S.data_ptr(), sin_S.data_ptr(),
+                self._attn.Q_buf[:, :S].data_ptr(),
+                n_q, S, qkv_N, n_q * hd, eps, s,
             )
-            v_new = kv_proj_out_buf[:S].view(S, n_kv, hd)
-        self._attn.V_cache[L, start_pos:start_pos + S].copy_(v_new)
+            fvk.qwen3_k_norm_rope_kvwrite_prefill_bf16(
+                qkv_out[:, Nq:Nq + Nk].data_ptr(),
+                qkv_out[:, Nq + Nk:].data_ptr(), int(lw['k_norm_w']),
+                cos_S.data_ptr(), sin_S.data_ptr(),
+                k_cache_dst, v_cache_dst,
+                n_kv, S, qkv_N, kv_row_elems, eps, s,
+            )
+        else:
+            # 4) q/k_norm at (S*n_q, hd) and (S*n_kv, hd) flat views.
+            q_pre_flat = q_pre.contiguous().view(S * n_q, hd)
+            k_pre_flat = k_pre.view(S * n_kv, hd)
+            fvk.rms_norm(
+                q_pre_flat.data_ptr(), int(lw['q_norm_w']),
+                self._q_norm_out[:S * n_q].data_ptr(), S * n_q, hd, eps, s,
+            )
+            fvk.rms_norm(
+                k_pre_flat.data_ptr(), int(lw['k_norm_w']),
+                self._k_norm_out[:S * n_kv].data_ptr(), S * n_kv, hd, eps, s,
+            )
+
+            # 5) Inline full-RoPE (rotary_dim = head_dim).
+            q_for_rope = self._q_norm_out[:S * n_q].view(1, S, n_q, hd)
+            k_for_rope = self._k_norm_out[:S * n_kv].view(1, S, n_kv, hd)
+            # cos_S/sin_S are (S, hd/2). Broadcast to (1, S, 1, hd/2).
+            cos4 = cos_S.view(1, S, 1, hd // 2)
+            sin4 = sin_S.view(1, S, 1, hd // 2)
+            q_rot = self._q_rot[:, :S]
+            k_rot = self._k_rot[:, :S]
+            self._rope_apply_inline(
+                q_for_rope, q_rot, self._rope_tmp_q[:, :S], cos4, sin4,
+            )
+            self._rope_apply_inline(
+                k_for_rope, k_rot, self._rope_tmp_k[:, :S], cos4, sin4,
+            )
+
+            # 6) Stage Q + write K to KV cache at [start_pos:start_pos+S].
+            self._attn.Q_buf[:, :S].copy_(q_rot)
+            self._attn.K_cache[L, start_pos:start_pos + S].copy_(
+                k_rot.view(S, n_kv, hd),
+            )
+
+            # 7) v_proj — the fused QKV path produced v inside the qkv
+            # slice; the split path runs the v GEMM now (reusing kv buf).
+            if v_fused is not None:
+                v_new = v_fused
+            else:
+                prefill_gemm(
+                    ap_h.data_ptr(), int(lw['v_proj_packed']),
+                    kv_proj_out_buf.data_ptr(),
+                    S, n_kv * hd, hidden,
+                    sf_h.data_ptr(), int(lw['v_proj_sf']),
+                    float(lw['v_proj_alpha']),
+                    s,
+                )
+                v_new = kv_proj_out_buf[:S].view(S, n_kv, hd)
+            self._attn.V_cache[L, start_pos:start_pos + S].copy_(v_new)
 
         # 8) Run FA2 causal: q_seq=S, kv_seq=start_pos+S.
         kv_seq = start_pos + S
