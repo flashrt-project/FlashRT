@@ -309,8 +309,15 @@ class Qwen3TorchFrontendRtx:
             self._qkv_fused_out = torch.empty(
                 1, qkv_N, device=device, dtype=bf16,
             )
+            # Prefill (M=S) fused-QKV output; folds the two N=1024 k/v
+            # GEMMs (~21% of FP4 peak each at M=512) into one wide-N
+            # GEMM with q. Sized to the largest prefill bucket.
+            self._qkv_prefill_out = torch.empty(
+                Sq_max, qkv_N, device=device, dtype=bf16,
+            )
         else:
             self._qkv_fused_out = None
+            self._qkv_prefill_out = None
         if layers0.get('gate_up_homogeneous_alpha'):
             gu_N = int(layers0['gate_up_N'])
             self._gate_up_fused_out = torch.empty(
@@ -944,28 +951,51 @@ class Qwen3TorchFrontendRtx:
             ap_h.data_ptr(), sf_h.data_ptr(), S, hidden, eps, s,
         )
 
-        # 3) q/k/v_proj NVFP4 GEMMs at M=S.
+        # 3) q/k/v_proj NVFP4 GEMMs at M=S. When the checkpoint has a
+        # homogeneous qkv alpha (q/k/v share activation + alpha) a single
+        # fused N=6144 GEMM via `qkv_proj_packed` replaces q (N=4096) plus
+        # the two N=1024 k/v GEMMs — each of which runs at only ~21% of
+        # FP4 peak at M=512. Folding them into the wide-N GEMM lifts the
+        # whole projection toward the q_proj/down efficiency band.
         prefill_gemm = self._prefill_gemm
-        q_proj_out_buf = self._nvfp4_scratch[(n_q * hd, hidden)][2]
-        prefill_gemm(
-            ap_h.data_ptr(), int(lw['q_proj_packed']),
-            q_proj_out_buf.data_ptr(),
-            S, n_q * hd, hidden,
-            sf_h.data_ptr(), int(lw['q_proj_sf']),
-            float(lw['q_proj_alpha']),
-            s,
-        )
-        kv_proj_out_buf = self._nvfp4_scratch[(n_kv * hd, hidden)][2]
-        prefill_gemm(
-            ap_h.data_ptr(), int(lw['k_proj_packed']),
-            kv_proj_out_buf.data_ptr(),
-            S, n_kv * hd, hidden,
-            sf_h.data_ptr(), int(lw['k_proj_sf']),
-            float(lw['k_proj_alpha']),
-            s,
-        )
-        q_pre = q_proj_out_buf[:S].view(1, S, n_q, hd)
-        k_pre = kv_proj_out_buf[:S].view(1, S, n_kv, hd).contiguous()
+        if self._qkv_prefill_out is not None:
+            qkv_N = int(lw['qkv_proj_N'])
+            Nq = n_q * hd          # 4096
+            Nk = n_kv * hd         # 1024
+            qkv_out = self._qkv_prefill_out[:S]
+            prefill_gemm(
+                ap_h.data_ptr(), int(lw['qkv_proj_packed']),
+                qkv_out.data_ptr(),
+                S, qkv_N, hidden,
+                sf_h.data_ptr(), int(lw['qkv_proj_sf']),
+                float(lw['qkv_proj_alpha']),
+                s,
+            )
+            q_pre = qkv_out[:, :Nq].view(1, S, n_q, hd)
+            k_pre = qkv_out[:, Nq:Nq + Nk].view(1, S, n_kv, hd).contiguous()
+            v_fused = qkv_out[:, Nq + Nk:].view(S, n_kv, hd)
+        else:
+            q_proj_out_buf = self._nvfp4_scratch[(n_q * hd, hidden)][2]
+            prefill_gemm(
+                ap_h.data_ptr(), int(lw['q_proj_packed']),
+                q_proj_out_buf.data_ptr(),
+                S, n_q * hd, hidden,
+                sf_h.data_ptr(), int(lw['q_proj_sf']),
+                float(lw['q_proj_alpha']),
+                s,
+            )
+            kv_proj_out_buf = self._nvfp4_scratch[(n_kv * hd, hidden)][2]
+            prefill_gemm(
+                ap_h.data_ptr(), int(lw['k_proj_packed']),
+                kv_proj_out_buf.data_ptr(),
+                S, n_kv * hd, hidden,
+                sf_h.data_ptr(), int(lw['k_proj_sf']),
+                float(lw['k_proj_alpha']),
+                s,
+            )
+            q_pre = q_proj_out_buf[:S].view(1, S, n_q, hd)
+            k_pre = kv_proj_out_buf[:S].view(1, S, n_kv, hd).contiguous()
+            v_fused = None
 
         # 4) q/k_norm at (S*n_q, hd) and (S*n_kv, hd) flat views.
         q_pre_flat = q_pre.contiguous().view(S * n_q, hd)
@@ -1000,16 +1030,20 @@ class Qwen3TorchFrontendRtx:
             k_rot.view(S, n_kv, hd),
         )
 
-        # 7) v_proj — reuse kv_proj_out_buf, write into V_cache.
-        prefill_gemm(
-            ap_h.data_ptr(), int(lw['v_proj_packed']),
-            kv_proj_out_buf.data_ptr(),
-            S, n_kv * hd, hidden,
-            sf_h.data_ptr(), int(lw['v_proj_sf']),
-            float(lw['v_proj_alpha']),
-            s,
-        )
-        v_new = kv_proj_out_buf[:S].view(S, n_kv, hd)
+        # 7) v_proj — the fused path already produced v inside the qkv
+        # slice; the split path runs the v GEMM now (reusing kv buffer).
+        if v_fused is not None:
+            v_new = v_fused
+        else:
+            prefill_gemm(
+                ap_h.data_ptr(), int(lw['v_proj_packed']),
+                kv_proj_out_buf.data_ptr(),
+                S, n_kv * hd, hidden,
+                sf_h.data_ptr(), int(lw['v_proj_sf']),
+                float(lw['v_proj_alpha']),
+                s,
+            )
+            v_new = kv_proj_out_buf[:S].view(S, n_kv, hd)
         self._attn.V_cache[L, start_pos:start_pos + S].copy_(v_new)
 
         # 8) Run FA2 causal: q_seq=S, kv_seq=start_pos+S.
