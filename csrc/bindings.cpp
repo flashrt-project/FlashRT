@@ -129,7 +129,9 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #endif
 #include "kernels/kernels.h"
 #include "kernels/fusion.cuh"
+#ifdef FLASHRT_HAVE_MELBAND_ROFORMER
 #include "kernels/mbr_kernels.cuh"
+#endif
 #include "kernels/causal_conv1d_qwen36.cuh"
 #include "kernels/linear_attention/gated_delta_wy_bf16.cuh"
 #include "kernels/gated_deltanet_qwen36.cuh"
@@ -734,7 +736,8 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         gelu_inplace(typed_ptr<__nv_bfloat16>(x), n, to_stream(stream));
     }, py::arg("x"), py::arg("n"), py::arg("stream") = 0);
 
-    // ── MelBandRoformer custom fused kernels (compiled into this module) ──
+    // ── MelBandRoformer custom fused kernels (gated) ──
+#ifdef FLASHRT_HAVE_MELBAND_ROFORMER
     m.def("mbr_qkv_split_rope", [](uintptr_t qkv, uintptr_t cosT, uintptr_t sinT,
             uintptr_t Q, uintptr_t K, uintptr_t V,
             int B, int T, int H, int D, uintptr_t stream) {
@@ -769,6 +772,55 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("a"), py::arg("b"), py::arg("gamma"),
        py::arg("sum_out"), py::arg("norm_fp8"),
        py::arg("M"), py::arg("dim"), py::arg("scale"), py::arg("stream") = 0);
+
+    m.def("mbr_fused_add_rmsnorm_bf16", [](uintptr_t a, uintptr_t b, uintptr_t gamma,
+            uintptr_t out, int M, int dim, uintptr_t stream) {
+        flash_rt::mbr::fused_add_rmsnorm_bf16(typed_ptr<__nv_bfloat16>(a),
+            typed_ptr<__nv_bfloat16>(b), typed_ptr<__nv_bfloat16>(gamma),
+            typed_ptr<__nv_bfloat16>(out), M, dim, to_stream(stream));
+    }, py::arg("a"), py::arg("b"), py::arg("gamma"), py::arg("out"),
+       py::arg("M"), py::arg("dim"), py::arg("stream") = 0);
+
+    m.def("mbr_fp8_dequant_tiny_linear_bf16", [](uintptr_t inp_fp8, float inp_scale,
+            uintptr_t weight, uintptr_t bias, uintptr_t out,
+            int M, int D_in, int D_out, uintptr_t stream) {
+        flash_rt::mbr::fp8_dequant_tiny_linear_bf16(typed_ptr<__nv_fp8_e4m3>(inp_fp8),
+            inp_scale, typed_ptr<__nv_bfloat16>(weight), typed_ptr<__nv_bfloat16>(bias),
+            typed_ptr<__nv_bfloat16>(out), M, D_in, D_out, to_stream(stream));
+    }, py::arg("inp_fp8"), py::arg("inp_scale"), py::arg("weight"), py::arg("bias"),
+       py::arg("out"), py::arg("M"), py::arg("D_in"), py::arg("D_out"), py::arg("stream") = 0);
+
+    m.def("mbr_fp8_gemm_bias_residual_norm_bf16", [](
+            uintptr_t inp_fp8, uintptr_t weight_fp8,
+            float scale_inp, float scale_weight,
+            uintptr_t bias, uintptr_t residual, uintptr_t gamma, uintptr_t out,
+            int M, int K, int N, uintptr_t stream) {
+        flash_rt::mbr::fp8_gemm_bias_residual_norm_bf16(
+            typed_ptr<__nv_fp8_e4m3>(inp_fp8), typed_ptr<__nv_fp8_e4m3>(weight_fp8),
+            scale_inp, scale_weight,
+            typed_ptr<__nv_bfloat16>(bias), typed_ptr<__nv_bfloat16>(residual),
+            typed_ptr<__nv_bfloat16>(gamma), typed_ptr<__nv_bfloat16>(out),
+            M, K, N, to_stream(stream));
+    }, py::arg("inp_fp8"), py::arg("weight_fp8"),
+       py::arg("scale_inp"), py::arg("scale_weight"),
+       py::arg("bias"), py::arg("residual"), py::arg("gamma"), py::arg("out"),
+       py::arg("M"), py::arg("K"), py::arg("N"), py::arg("stream") = 0);
+
+    m.def("mbr_gemm_output_bias_residual_norm_bf16", [](
+            uintptr_t gemm_out, uintptr_t bias, uintptr_t residual,
+            uintptr_t gamma, uintptr_t out,
+            int M, int N, uintptr_t stream) {
+        flash_rt::mbr::gemm_output_bias_residual_norm_bf16(
+            typed_ptr<__nv_bfloat16>(gemm_out),
+            bias ? typed_ptr<__nv_bfloat16>(bias) : nullptr,
+            typed_ptr<__nv_bfloat16>(residual),
+            typed_ptr<__nv_bfloat16>(gamma),
+            typed_ptr<__nv_bfloat16>(out),
+            M, N, to_stream(stream));
+    }, py::arg("gemm_out"), py::arg("bias"), py::arg("residual"),
+       py::arg("gamma"), py::arg("out"),
+       py::arg("M"), py::arg("N"), py::arg("stream") = 0);
+#endif // FLASHRT_HAVE_MELBAND_ROFORMER
 
     // G7.11 — fused (bias + GELU(tanh)) in-place on bf16 (M, N) tensor.
     m.def("bias_gelu_inplace_bf16", [](uintptr_t x, uintptr_t bias,
