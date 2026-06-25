@@ -5601,6 +5601,20 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     BIND_GEMV_M1(gemv_fp8_m1_resadd_w4);
     BIND_GEMV_M1(gemv_fp8_m1_resadd_w8);
 
+    // Device-scale variant: alpha = act_scale[0] * w_descale computed
+    // in-kernel, so the per-call activation scale stays on-device (no host
+    // sync to form alpha). Used by the fp8 lm_head tail.
+    m.def("ht_gemv_fp8_m1_w16_dscale",
+        [](uintptr_t A, uintptr_t B, uintptr_t D, int M, int N, int K,
+           uintptr_t act_scale, float w_descale, uintptr_t stream) {
+            return flash_rt::gemm::gemv_m1::gemv_fp8_m1_w16_dscale(
+                to_ptr(A), to_ptr(B), to_ptr(D), M, N, K,
+                to_ptr(act_scale), w_descale, to_stream(stream));
+        },
+        py::arg("A"), py::arg("B"), py::arg("D"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("act_scale"), py::arg("w_descale"), py::arg("stream") = 0);
+
     // Dedicated M=1 BF16 GEMV (all-BF16 decode; no smem A-stage -> full occ).
     BIND_GEMV_M1(gemv_bf16_m1_w4);
     BIND_GEMV_M1(gemv_bf16_m1_w8);

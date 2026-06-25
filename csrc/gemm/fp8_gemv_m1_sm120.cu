@@ -104,6 +104,56 @@ void gemv_fp8_m1_resadd_kernel(
     if (lane == 0) D[n] = __float2bfloat16(__bfloat162float(D[n]) + acc * alpha);
 }
 
+// Device-scale variant: alpha read on-device as act_scale[0]*w_descale, so the
+// per-call activation scale never needs a host round-trip. Identical dot product
+// to gemv_fp8_m1_kernel; only the epilogue scale source differs.
+template <int WARPS_PER_BLOCK>
+__global__ __launch_bounds__(WARPS_PER_BLOCK * 32, 8)
+void gemv_fp8_m1_dscale_kernel(
+    const __nv_fp8_e4m3* __restrict__ A,
+    const __nv_fp8_e4m3* __restrict__ B,
+    __nv_bfloat16* __restrict__ D,
+    int N, int K, const float* __restrict__ act_scale, float w_descale)
+{
+    extern __shared__ __nv_fp8_e4m3 sA[];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int threads = WARPS_PER_BLOCK * 32, K16 = K >> 4;
+    uint4* sA16 = reinterpret_cast<uint4*>(sA);
+    const uint4* A16 = reinterpret_cast<const uint4*>(A);
+    for (int i = tid; i < K16; i += threads) sA16[i] = A16[i];
+    __syncthreads();
+    const int n = blockIdx.x * WARPS_PER_BLOCK + warp;
+    if (n >= N) return;
+    const uint4* Brow = reinterpret_cast<const uint4*>(B) + (size_t)n * K16;
+    float acc = 0.0f;
+    for (int i = lane; i < K16; i += 32) {
+        uint4 bpack = Brow[i];
+        const __nv_fp8_e4m3* bp = reinterpret_cast<const __nv_fp8_e4m3*>(&bpack);
+        const __nv_fp8_e4m3* ap = sA + (i << 4);
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) acc += float(ap[j]) * float(bp[j]);
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) {
+        float alpha = act_scale[0] * w_descale;   // read scale on-device
+        D[n] = __float2bfloat16(acc * alpha);
+    }
+}
+
+template <int W>
+int launch_dscale_(const void* A, const void* B, void* D, int N, int K,
+                   const void* act_scale, float w_descale, cudaStream_t stream) {
+    dim3 grid((N + W - 1) / W);
+    size_t smem = (size_t)K * sizeof(__nv_fp8_e4m3);
+    gemv_fp8_m1_dscale_kernel<W><<<grid, W * 32, smem, stream>>>(
+        reinterpret_cast<const __nv_fp8_e4m3*>(A),
+        reinterpret_cast<const __nv_fp8_e4m3*>(B),
+        reinterpret_cast<__nv_bfloat16*>(D), N, K,
+        reinterpret_cast<const float*>(act_scale), w_descale);
+    return 0;
+}
+
 template <int W>
 int launch_resadd_(const void* A, const void* B, void* D,
                    int N, int K, float alpha, cudaStream_t stream) {
@@ -141,6 +191,12 @@ int launch_(const void* A, const void* B, void* D,
 DEFINE(gemv_fp8_m1_w4,  4)
 DEFINE(gemv_fp8_m1_w8,  8)
 DEFINE(gemv_fp8_m1_w16, 16)
+
+int gemv_fp8_m1_w16_dscale(
+    const void* A, const void* B, void* D, int /*M*/, int N, int K,
+    const void* act_scale, float w_descale, cudaStream_t stream) {
+  return launch_dscale_<16>(A, B, D, N, K, act_scale, w_descale, stream);
+}
 
 #define DEFINE_RA(NAME, W)                                                      \
   int NAME(const void* A, const void* B, void* D, int M, int N, int K,          \

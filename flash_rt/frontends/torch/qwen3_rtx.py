@@ -1258,11 +1258,14 @@ class Qwen3TorchFrontendRtx:
             fvk.quantize_fp8_device(
                 lr.data_ptr(), self._lmhead_fp8_act.data_ptr(),
                 self._lmhead_act_scale.data_ptr(), hidden, s)
-            alpha = (float(self._lmhead_act_scale.item())
-                     / self._weights.ptrs['lm_head_fp8_wscale'])
-            fvk.ht_gemv_fp8_m1_w16(
+            # Device-scale GEMV: alpha = act_scale[0] * w_descale is read
+            # on-device, so the per-call activation scale never round-trips
+            # to the host (no sync — the hot path stays kernel-only).
+            w_descale = 1.0 / self._weights.ptrs['lm_head_fp8_wscale']
+            fvk.ht_gemv_fp8_m1_w16_dscale(
                 self._lmhead_fp8_act.data_ptr(), int(lm_fp8),
-                self._logits_buf[:1].data_ptr(), 1, vocab, hidden, alpha, s,
+                self._logits_buf[:1].data_ptr(), 1, vocab, hidden,
+                self._lmhead_act_scale.data_ptr(), w_descale, s,
             )
         else:
             fvk.bf16_matmul_qwen36_bf16(

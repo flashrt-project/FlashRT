@@ -26,6 +26,14 @@ DECL(gemv_fp8_m1_resadd_w8);
 
 #undef DECL
 
+// Device-scale variant: alpha is computed in-kernel as
+// act_scale[0] * w_descale, so the per-call activation scale (e.g. from
+// quantize_fp8_device) is read on-device — no host sync to form alpha.
+// w_descale is the per-tensor weight de-scale (host constant). M=1 assumed.
+int gemv_fp8_m1_w16_dscale(
+    const void* A, const void* B, void* D, int M, int N, int K,
+    const void* act_scale, float w_descale, cudaStream_t stream);
+
 }  // namespace gemv_m1
 }  // namespace gemm
 }  // namespace flash_rt
