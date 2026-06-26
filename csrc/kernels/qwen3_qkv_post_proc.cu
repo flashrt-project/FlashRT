@@ -152,6 +152,136 @@ __global__ void k_norm_rope_kvwrite_kernel(
   v_cache_dst[head * HEAD_DIM + tid] = v_pre[head * HEAD_DIM + tid];
 }
 
+__global__ void qk_norm_rope_kvwrite_kernel(
+    const __nv_bfloat16* __restrict__ q_pre,
+    const __nv_bfloat16* __restrict__ k_pre,
+    const __nv_bfloat16* __restrict__ v_pre,
+    const __nv_bfloat16* __restrict__ q_norm_w,
+    const __nv_bfloat16* __restrict__ k_norm_w,
+    const __nv_bfloat16* __restrict__ cos_v,
+    const __nv_bfloat16* __restrict__ sin_v,
+    __nv_bfloat16* __restrict__ q_buf,
+    __nv_bfloat16* __restrict__ k_cache_dst,
+    __nv_bfloat16* __restrict__ v_cache_dst,
+    int n_q,
+    int n_kv,
+    float eps) {
+  const int block = blockIdx.x;
+  const int tid = threadIdx.x;
+  const bool is_q = block < n_q;
+  const int head = is_q ? block : (block - n_q);
+  if ((!is_q) && head >= n_kv) return;
+
+  __shared__ float s_normed[HEAD_DIM];
+  __shared__ float s_smem4[N_WARPS];
+
+  const __nv_bfloat16* x_row =
+      is_q ? (q_pre + head * HEAD_DIM) : (k_pre + head * HEAD_DIM);
+  const __nv_bfloat16* norm_w = is_q ? q_norm_w : k_norm_w;
+  float v = __bfloat162float(x_row[tid]);
+  float w = __bfloat162float(norm_w[tid]);
+
+  float sum_sq = block_sum_4warp(v * v, s_smem4);
+  float rstd = rsqrtf(sum_sq / float(HEAD_DIM) + eps);
+  float normed = v * rstd * w;
+  s_normed[tid] = normed;
+  __syncthreads();
+
+  float partner, c, sn, out;
+  if (tid < HALF) {
+    partner = s_normed[tid + HALF];
+    c = __bfloat162float(cos_v[tid]);
+    sn = __bfloat162float(sin_v[tid]);
+    out = normed * c - partner * sn;
+  } else {
+    partner = s_normed[tid - HALF];
+    int half_idx = tid - HALF;
+    c = __bfloat162float(cos_v[half_idx]);
+    sn = __bfloat162float(sin_v[half_idx]);
+    out = normed * c + partner * sn;
+  }
+
+  if (is_q) {
+    q_buf[head * HEAD_DIM + tid] = __float2bfloat16(out);
+  } else {
+    k_cache_dst[head * HEAD_DIM + tid] = __float2bfloat16(out);
+    v_cache_dst[head * HEAD_DIM + tid] = v_pre[head * HEAD_DIM + tid];
+  }
+}
+
+__global__ void qk_norm_rope_kvwrite_batched_kernel(
+    const __nv_bfloat16* __restrict__ q_pre,
+    const __nv_bfloat16* __restrict__ k_pre,
+    const __nv_bfloat16* __restrict__ v_pre,
+    const __nv_bfloat16* __restrict__ q_norm_w,
+    const __nv_bfloat16* __restrict__ k_norm_w,
+    const __nv_bfloat16* __restrict__ cos,
+    const __nv_bfloat16* __restrict__ sin,
+    __nv_bfloat16* __restrict__ q_buf,
+    __nv_bfloat16* __restrict__ k_cache_dst,
+    __nv_bfloat16* __restrict__ v_cache_dst,
+    int seq_len,
+    int q_pre_row_elems,
+    int k_pre_row_elems,
+    int v_pre_row_elems,
+    int q_dst_row_elems,
+    int kv_dst_row_elems,
+    int n_q,
+    int n_kv,
+    float eps) {
+  const int block = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int heads_total = n_q + n_kv;
+  const int token = block / heads_total;
+  if (token >= seq_len) return;
+  const int inner = block - token * heads_total;
+  const bool is_q = inner < n_q;
+  const int head = is_q ? inner : (inner - n_q);
+  if ((!is_q) && head >= n_kv) return;
+
+  __shared__ float s_normed[HEAD_DIM];
+  __shared__ float s_smem4[N_WARPS];
+
+  const __nv_bfloat16* x_row =
+      is_q ? (q_pre + token * q_pre_row_elems + head * HEAD_DIM)
+           : (k_pre + token * k_pre_row_elems + head * HEAD_DIM);
+  const __nv_bfloat16* norm_w = is_q ? q_norm_w : k_norm_w;
+  const __nv_bfloat16* cos_row = cos + token * HALF;
+  const __nv_bfloat16* sin_row = sin + token * HALF;
+  float v = __bfloat162float(x_row[tid]);
+  float w = __bfloat162float(norm_w[tid]);
+
+  float sum_sq = block_sum_4warp(v * v, s_smem4);
+  float rstd = rsqrtf(sum_sq / float(HEAD_DIM) + eps);
+  float normed = v * rstd * w;
+  s_normed[tid] = normed;
+  __syncthreads();
+
+  float partner, c, sn, out;
+  if (tid < HALF) {
+    partner = s_normed[tid + HALF];
+    c = __bfloat162float(cos_row[tid]);
+    sn = __bfloat162float(sin_row[tid]);
+    out = normed * c - partner * sn;
+  } else {
+    partner = s_normed[tid - HALF];
+    int half_idx = tid - HALF;
+    c = __bfloat162float(cos_row[half_idx]);
+    sn = __bfloat162float(sin_row[half_idx]);
+    out = normed * c + partner * sn;
+  }
+
+  if (is_q) {
+    q_buf[token * q_dst_row_elems + head * HEAD_DIM + tid] =
+        __float2bfloat16(out);
+  } else {
+    k_cache_dst[token * kv_dst_row_elems + head * HEAD_DIM + tid] =
+        __float2bfloat16(out);
+    v_cache_dst[token * kv_dst_row_elems + head * HEAD_DIM + tid] =
+        v_pre[token * v_pre_row_elems + head * HEAD_DIM + tid];
+  }
+}
+
 // Device-position variant: writes K/V into K_cache[*cur_pos] / V_cache[*cur_pos]
 // where cur_pos is read from device memory, so a single captured graph serves
 // every decode position (the host bumps *cur_pos before each replay). row_elems
@@ -378,6 +508,85 @@ int qwen3_q_norm_rope_qstage_bf16(
       reinterpret_cast<const __nv_bfloat16*>(sin),
       reinterpret_cast<__nv_bfloat16*>(q_buf_dst),
       n_q_heads, eps);
+  return 0;
+}
+
+int qwen3_qk_norm_rope_kvwrite_bf16(
+    const void* q_pre,
+    const void* k_pre,
+    const void* v_pre,
+    const void* q_norm_w,
+    const void* k_norm_w,
+    const void* cos,
+    const void* sin,
+    void*       q_buf_dst,
+    void*       k_cache_dst,
+    void*       v_cache_dst,
+    int         n_q_heads,
+    int         n_kv_heads,
+    float       eps,
+    cudaStream_t stream) {
+  if (!q_pre || !k_pre || !v_pre || !q_norm_w || !k_norm_w || !cos || !sin
+      || !q_buf_dst || !k_cache_dst || !v_cache_dst) return 1;
+  if (n_q_heads <= 0 || n_kv_heads <= 0) return 2;
+  dim3 grid(n_q_heads + n_kv_heads);
+  dim3 block(THREADS);
+  qk_norm_rope_kvwrite_kernel<<<grid, block, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(q_pre),
+      reinterpret_cast<const __nv_bfloat16*>(k_pre),
+      reinterpret_cast<const __nv_bfloat16*>(v_pre),
+      reinterpret_cast<const __nv_bfloat16*>(q_norm_w),
+      reinterpret_cast<const __nv_bfloat16*>(k_norm_w),
+      reinterpret_cast<const __nv_bfloat16*>(cos),
+      reinterpret_cast<const __nv_bfloat16*>(sin),
+      reinterpret_cast<__nv_bfloat16*>(q_buf_dst),
+      reinterpret_cast<__nv_bfloat16*>(k_cache_dst),
+      reinterpret_cast<__nv_bfloat16*>(v_cache_dst),
+      n_q_heads, n_kv_heads, eps);
+  return 0;
+}
+
+int qwen3_qk_norm_rope_kvwrite_batched_bf16(
+    const void* q_pre,
+    const void* k_pre,
+    const void* v_pre,
+    const void* q_norm_w,
+    const void* k_norm_w,
+    const void* cos,
+    const void* sin,
+    void*       q_buf_dst,
+    void*       k_cache_dst,
+    void*       v_cache_dst,
+    int         seq_len,
+    int         q_pre_row_elems,
+    int         k_pre_row_elems,
+    int         v_pre_row_elems,
+    int         q_dst_row_elems,
+    int         kv_dst_row_elems,
+    int         n_q_heads,
+    int         n_kv_heads,
+    float       eps,
+    cudaStream_t stream) {
+  if (!q_pre || !k_pre || !v_pre || !q_norm_w || !k_norm_w || !cos || !sin
+      || !q_buf_dst || !k_cache_dst || !v_cache_dst) return 1;
+  if (seq_len <= 0 || n_q_heads <= 0 || n_kv_heads <= 0) return 2;
+  dim3 grid(seq_len * (n_q_heads + n_kv_heads));
+  dim3 block(THREADS);
+  qk_norm_rope_kvwrite_batched_kernel<<<grid, block, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(q_pre),
+      reinterpret_cast<const __nv_bfloat16*>(k_pre),
+      reinterpret_cast<const __nv_bfloat16*>(v_pre),
+      reinterpret_cast<const __nv_bfloat16*>(q_norm_w),
+      reinterpret_cast<const __nv_bfloat16*>(k_norm_w),
+      reinterpret_cast<const __nv_bfloat16*>(cos),
+      reinterpret_cast<const __nv_bfloat16*>(sin),
+      reinterpret_cast<__nv_bfloat16*>(q_buf_dst),
+      reinterpret_cast<__nv_bfloat16*>(k_cache_dst),
+      reinterpret_cast<__nv_bfloat16*>(v_cache_dst),
+      seq_len,
+      q_pre_row_elems, k_pre_row_elems, v_pre_row_elems,
+      q_dst_row_elems, kv_dst_row_elems,
+      n_q_heads, n_kv_heads, eps);
   return 0;
 }
 

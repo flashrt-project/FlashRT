@@ -54,6 +54,51 @@ int qwen3_q_norm_rope_qstage_bf16(
     float       eps,
     cudaStream_t stream);
 
+// Fused q_norm + RoPE + Q_buf write and k_norm + RoPE + KV_cache write in
+// one launch. Decode-only S=1 path, head_dim hardcoded at 128.
+int qwen3_qk_norm_rope_kvwrite_bf16(
+    const void* q_pre,
+    const void* k_pre,
+    const void* v_pre,
+    const void* q_norm_w,
+    const void* k_norm_w,
+    const void* cos,
+    const void* sin,
+    void*       q_buf_dst,
+    void*       k_cache_dst,
+    void*       v_cache_dst,
+    int         n_q_heads,
+    int         n_kv_heads,
+    float       eps,
+    cudaStream_t stream);
+
+// Batched fused q_norm + RoPE + Q_buf write and k_norm + RoPE + KV_cache
+// write for prefill (S>=1). q_pre / k_pre / v_pre may be row-strided views
+// into a larger qkv tensor; row strides are in elements, not bytes. cos/sin
+// are (S, 64) bf16 and outputs are contiguous per-position rows in Q_buf /
+// K_cache / V_cache.
+int qwen3_qk_norm_rope_kvwrite_batched_bf16(
+    const void* q_pre,
+    const void* k_pre,
+    const void* v_pre,
+    const void* q_norm_w,
+    const void* k_norm_w,
+    const void* cos,
+    const void* sin,
+    void*       q_buf_dst,
+    void*       k_cache_dst,
+    void*       v_cache_dst,
+    int         seq_len,
+    int         q_pre_row_elems,
+    int         k_pre_row_elems,
+    int         v_pre_row_elems,
+    int         q_dst_row_elems,
+    int         kv_dst_row_elems,
+    int         n_q_heads,
+    int         n_kv_heads,
+    float       eps,
+    cudaStream_t stream);
+
 // Fused k_norm + RoPE + K_cache write + V_cache write (S=1 decode).
 //
 //   k_pre        : (n_kv_heads, 128) bf16

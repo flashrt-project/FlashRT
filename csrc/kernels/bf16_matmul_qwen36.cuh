@@ -39,6 +39,15 @@ void bf16_matmul_qwen36_bf16(
     int K,
     cudaStream_t stream);
 
+void bf16_matmul_cublaslt_bf16(
+    const __nv_bfloat16* x,
+    const __nv_bfloat16* W,
+    __nv_bfloat16* out,
+    int M,
+    int N,
+    int K,
+    cudaStream_t stream);
+
 void bf16_matmul_qwen36_ab96_bf16(
     const __nv_bfloat16* x,
     const __nv_bfloat16* W_ab,

@@ -38,5 +38,38 @@ void fp8_per_token_block128_quant_bf16(
     int M, int K,
     cudaStream_t stream);
 
+void rms_norm_to_fp8_block128_bf16(
+    const void* input,
+    const void* weight,
+    void*       output_fp8,
+    float*      output_scale,
+    int M, int K, float eps,
+    cudaStream_t stream);
+
+void residual_add_rms_norm_to_fp8_block128_bf16(
+    const void* residual,
+    const void* x,
+    void*       residual_out,
+    const void* weight,
+    void*       output_fp8,
+    float*      output_scale,
+    int M, int K, float eps,
+    cudaStream_t stream);
+
+void silu_mul_to_fp8_block128_bf16(
+    const void* gate,
+    const void* up,
+    void*       output_fp8,
+    float*      output_scale,
+    int M, int K,
+    cudaStream_t stream);
+
+void silu_mul_merged_to_fp8_block128_bf16(
+    const void* gate_up,
+    void*       output_fp8,
+    float*      output_scale,
+    int M, int K,
+    cudaStream_t stream);
+
 }  // namespace quantize
 }  // namespace flash_rt
