@@ -26,18 +26,6 @@ QKVD = NQK + 2 * KVD; GUD = 2 * FFN; MAX_S = 2048
 from omnivoice.models.omnivoice import _get_time_steps, _gumbel_sample, _filter_top_k
 
 # ── FlashRT kernel detection (supports flashcli deployment + local dev) ──
-_fvk_swapped = False
-def _ensure_v4qk():
-    global _fvk_swapped
-    if not _fvk_swapped:
-        try:
-            from flash_rt import flash_rt_kernels as _f
-        except ImportError:
-            import flash_rt_kernels as _f
-        if hasattr(_f, 'fused_qk_norm_rope_v4_bf16'):
-            _f.fused_qk_norm_rope_v3_bf16 = _f.fused_qk_norm_rope_v4_bf16
-            _fvk_swapped = True
-
 try:
     from flash_rt import flash_rt_kernels as _fvk
 except ImportError:
@@ -493,7 +481,6 @@ def inject(m, cfg_ratio=0.05, bookend=False):
     global _injected, _frt_bf16, _frt_fp4, _orig, _orig_gen
     if _injected: return
     _check_kernels()
-    _ensure_v4qk()
 
     _frt_bf16 = FlashRTLlmBF16(m.llm, str(m.device))
     _orig = m.llm.forward
