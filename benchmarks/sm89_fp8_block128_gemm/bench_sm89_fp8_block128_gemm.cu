@@ -376,12 +376,20 @@ void launch_64x64_s1(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* B,
                    + (BM * SCALE_KTILE + SCALE_KTILE) * (int)sizeof(float);
     if (CANDIDATE) {
 #ifdef EXPERIMENT
-        if (smem_bytes > 48 * 1024) {
-            cudaFuncSetAttribute((const void*)&fp8_bs_gemm_kernel_cand<BM, BN, W, S, MB>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+        // Experiment: multi-stage cp.async pipeline (SM120a-style). CAND_STAGES
+        // overrides the production S=1; the kernel body is staging-generic.
+#ifndef CAND_STAGES
+#define CAND_STAGES 1
+#endif
+        constexpr int CS = CAND_STAGES;
+        int cand_smem = CS * (BM + BN) * BK
+                      + (BM * SCALE_KTILE + SCALE_KTILE) * (int)sizeof(float);
+        if (cand_smem > 48 * 1024) {
+            cudaFuncSetAttribute((const void*)&fp8_bs_gemm_kernel_cand<BM, BN, W, CS, MB>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, cand_smem);
         }
-        fp8_bs_gemm_kernel_cand<BM, BN, W, S, MB>
-            <<<grid, block, smem_bytes, stream>>>(A, B, act_scale, w_scale, D, M, N, K);
+        fp8_bs_gemm_kernel_cand<BM, BN, W, CS, MB>
+            <<<grid, block, cand_smem, stream>>>(A, B, act_scale, w_scale, D, M, N, K);
         return;
 #else
         // No experiment compiled in: candidate == production baseline.

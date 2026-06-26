@@ -19,10 +19,13 @@ OUT="${BUILD_DIR}/bench_sm89_fp8_block128_gemm"
 #   ./build.sh --experiment
 # Without it the candidate aliases the production baseline, so `--mode both`
 # reports ~0% delta -- a built-in check that the harness is faithful.
+#   ./build.sh --experiment --stages 2   # candidate cp.async pipeline depth
 EXTRA=""
 for arg in "$@"; do
   case "$arg" in
-    --experiment) EXTRA="-DEXPERIMENT" ;;
+    --experiment) EXTRA="${EXTRA} -DEXPERIMENT" ;;
+    --stages=*)   EXTRA="${EXTRA} -DCAND_STAGES=${arg#*=}" ;;
+    [0-9]*)       EXTRA="${EXTRA} -DCAND_STAGES=${arg}" ;;
     *) echo "unknown build arg: $arg" >&2; exit 2 ;;
   esac
 done

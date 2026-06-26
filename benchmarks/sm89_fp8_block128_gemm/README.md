@@ -107,6 +107,24 @@ FA2 vision attn is 29%, untouched on 8B).
 
 ### Rejected
 
+- **C6 multi-stage cp.async pipeline (STAGES=2/3, SM120a-style)**: the SM120a
+  reference GEMM (`fp8_smallM_handtuned_ldmatrix_sm120`) defaults to a 2-stage
+  (and tunes up to 5-stage) cp.async pipeline to hide load latency, and this
+  kernel is latency-bound, so S>=2 looked like the natural next step. It
+  **regresses**: 64x64 gate +12.4%, down +10.1%, qkv +12.0% at S=2; S=3 is
+  +60-73%. NCU (gate, S=2) shows the mechanism clearly and why it differs from
+  SM120a: the second smem stage grows dynamic smem 18.5 -> 34.9 KB, which drops
+  the shared-mem block limit 5 -> 2 and so halves occupancy (33.3% -> 16.7%,
+  4 -> 2 CTA/SM). Per-warp latency hiding *does* improve (Warp-Cycles/Inst
+  11.74 -> 6.17), but eligible warps/sched still *fall* (0.46 -> 0.37) because
+  losing half the resident CTAs removes more warps than double-buffering gains.
+  This kernel is **register-limited to 4 CTA/SM at 128 regs** with no smem
+  headroom on the 4090 (4 x 34.9 KB = 139 KB > 100 KB/SM). SM120a affords S>=2
+  because its motus kernel uses per-tensor `alpha` (no block-128 scale staging)
+  -> fewer regs + less smem -> occupancy headroom the block-128 Qwen3-VL kernel
+  does not have. **S=1 is correct for this kernel; the SM120a multi-stage design
+  does not port because the block-128 scaling changes the occupancy budget.**
+  (Bench harness keeps `./build.sh --experiment --stages N` for future re-tests.)
 - **C5 smem-staged epilogue** (fully-coalesce global stores 16B->32B/sector):
   NCU on the C4 baseline ranks the global-store pattern as the #1 actionable
   rule (24.5% estimated). C5 stages the output tile in the (now-free) A/B smem
