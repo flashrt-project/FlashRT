@@ -35,17 +35,32 @@ class _FakeFrontend:
 
 
 def test_construction_without_kernels_raises():
-    """Without mbr kernels, __init__ must raise RuntimeError mentioning the build flag."""
+    """Without mbr kernels, _load_kernels raises a clear RuntimeError."""
     from flash_rt.models.melband_roformer.pipeline import _load_kernels
 
     try:
         _load_kernels()
-    except RuntimeError:
-        pass  # kernels not available — expected in default build
+    except RuntimeError as exc:
+        msg = str(exc)
+        assert "flash_rt_kernels" in msg
+        assert ("FLASHRT_ENABLE_MELBAND_ROFORMER=ON" in msg or
+                "compiled .so" in msg)
     except Exception:
         pass  # flash_rt_kernels not importable at all
     else:
         pytest.skip("mbr kernels are available (gated build) — skip this test")
+
+
+def test_pipeline_constructor_validates_kernels(monkeypatch):
+    """Pipeline construction must fail before touching model internals."""
+    from flash_rt.models.melband_roformer import pipeline
+
+    def _raise_missing():
+        raise RuntimeError("missing -DFLASHRT_ENABLE_MELBAND_ROFORMER=ON")
+
+    monkeypatch.setattr(pipeline, "_load_kernels", _raise_missing)
+    with pytest.raises(RuntimeError, match="FLASHRT_ENABLE_MELBAND_ROFORMER=ON"):
+        pipeline.MelBandRoformerPipeline(_FakeFrontend())
 
 
 # ── 3. Gated build: all required mbr_* symbols present ──

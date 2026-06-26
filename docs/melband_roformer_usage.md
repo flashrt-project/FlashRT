@@ -20,7 +20,7 @@ unaffected. Bindings are gated by `#ifdef FLASHRT_HAVE_MELBAND_ROFORMER`.
 
 ## Custom fused kernels
 
-Seven fused CUDA kernels in `csrc/kernels/mbr_kernels.{cu,cuh}`, compiled into
+Five fused CUDA kernels in `csrc/kernels/mbr_kernels.{cu,cuh}`, compiled into
 `flash_rt_kernels.so`:
 
 | Kernel | Fused operation |
@@ -30,11 +30,11 @@ Seven fused CUDA kernels in `csrc/kernels/mbr_kernels.{cu,cuh}`, compiled into
 | `mbr_fp8_dequant_bf16` | FP8 E4M3 → BF16 dequantize |
 | `mbr_resadd_rmsnorm_fp8_keepres` | residual add + RMSNorm → FP8 (keeps residual) |
 | `mbr_fused_add_rmsnorm_bf16` | residual add + RMSNorm (BF16 in/out) |
-| `mbr_fp8_dequant_tiny_linear_bf16` | FP8 dequant + tiny linear (for gates) |
-| `mbr_fp8_gemm_bias_residual_norm_bf16` | FP8 GEMM + bias + residual + RMSNorm |
 
-All kernels follow FlashRT conventions: `template<typename T>`, `common.cuh`
-reuse (`to_f32`, `from_f32`, `packed2`, `block_reduce_sum`), typed launchers.
+The pipeline also reuses existing FlashRT kernels such as `rms_norm_fp8` and
+`bias_gelu_quantize_fp8_static_bf16`. All MelBandRoformer kernels follow
+FlashRT conventions: `template<typename T>`, `common.cuh` reuse (`to_f32`,
+`from_f32`, `packed2`, `block_reduce_sum`), typed launchers.
 
 ## Pipeline
 
