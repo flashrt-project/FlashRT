@@ -1,8 +1,8 @@
 # SM89 FP8 Block-128 GEMM Kernel Bench
 
-This is a standalone kernel-iteration harness for the Qwen3-VL SM89 FP8
-block-128 prefill GEMM. It is intentionally separate from the FlashRT Python
-runtime so a low-context agent can iterate on the CUDA kernel quickly.
+Standalone kernel-iteration harness for the Qwen3-VL SM89 FP8 block-128
+prefill GEMM. Kept separate from the FlashRT Python runtime so a low-context
+agent can iterate on the CUDA kernel quickly.
 
 ## Target Boundary
 
@@ -11,175 +11,121 @@ A_fp8[M,K] + B_fp8[N,K] + act_scale[M,K/128] + w_scale[N/128,K/128]
     -> D_bf16[M,N]
 ```
 
-The main production hotspot is equivalent to:
+The production hotspot is `fp8_bs_gemm_kernel<64,64,4,1,4>`
+(`fp8_block128_gemm_bs_sm89_64x64x128_w4_s1`).
 
-```text
-fp8_bs_gemm_kernel<64,64,4,1,4>
-```
+## Zero-drift baseline (read this first)
 
-The harness includes:
+The `baseline` kernel is **not a copy** — `--mode baseline` runs the *exact*
+production kernel by `#include`-ing `csrc/gemm/fp8_bs_gemm_device.cuh`, the same
+header the production `.cu` compiles. So the bench baseline cannot lag behind
+production, which is the bug that previously made the C1-C4 deltas look ~10x
+bigger than they were: the old frozen baseline was the pre-C1 kernel, ~19%
+slower than what production actually shipped, so every reported delta was
+"cumulative vs a stale kernel" instead of "marginal vs current production".
 
-- `baseline`: current FlashRT SM89 kernel structure.
-- `candidate`: a separate template instantiation for structural experiments.
-- deterministic device-side input initialization.
-- sampled FP32 reference checks.
-- cold-L2 timing with an explicit flush buffer.
-- NCU profile wrapper and CSV parser.
+The `candidate`:
+- **Default build** (`./build.sh`): candidate aliases the production kernel, so
+  `--mode both` reports **~0%**. This is a built-in honesty check — if a fresh
+  bench shows a nonzero delta, the harness itself is wrong.
+- **Experiment build** (`./build.sh --experiment`): compiles the editable
+  `fp8_bs_gemm_kernel_cand` (seeded identical to production). Edit *that* kernel
+  for a structural experiment; baseline stays pinned to production.
+
+After an experiment is accepted, fold it into
+`csrc/gemm/fp8_bs_gemm_device.cuh`. Production and the bench baseline both pick
+it up automatically — no second copy to keep in sync.
+
+**Always read candidate deltas as marginal-over-current-production**, never as
+cumulative-over-some-old-baseline.
 
 ## Quick Start
 
 ```bash
-cd /data/home/tianjianyang/code/FlashRT/benchmarks/sm89_fp8_block128_gemm
+cd benchmarks/sm89_fp8_block128_gemm
+
+# Faithful baseline (candidate == production): expect ~0% delta.
 ./build.sh
+./build/bench_sm89_fp8_block128_gemm --shape gate --mode both
+
+# Iterate on a structural change:
+./build.sh --experiment            # then edit fp8_bs_gemm_kernel_cand
 ./build/bench_sm89_fp8_block128_gemm --shape gate --mode both
 ```
 
-Representative shapes:
+Representative shapes (M=1581 ~ the real language-prefill M; vision uses
+M=6256, pass it explicitly with `--M`):
 
 ```bash
-./build/bench_sm89_fp8_block128_gemm --shape gate  # M=1581,N=12288,K=4096
-./build/bench_sm89_fp8_block128_gemm --shape up    # same as gate
-./build/bench_sm89_fp8_block128_gemm --shape down  # M=1581,N=4096,K=12288
-./build/bench_sm89_fp8_block128_gemm --shape qkv   # M=1581,N=6144,K=4096
+--shape gate  # M=1581,N=12288,K=4096   (gate/up)
+--shape down  # M=1581,N=4096,K=12288
+--shape qkv   # M=1581,N=6144,K=4096
+--M 6256 --N 3456 --K 1536   # representative vision linear
 ```
 
-Run NCU on one candidate launch:
+NCU on one candidate launch:
 
 ```bash
 ./profile_ncu.sh candidate gate
 python parse_ncu.py profiles/candidate_gate_details.csv
 ```
 
-## Iteration Rules
+## Methodology notes
 
-- Make one structural change at a time in the candidate path.
-- Do not start with broad tile or dispatch sweeps.
-- Keep the baseline path unchanged unless intentionally updating the imported
-  FlashRT baseline after validating a runtime change.
-- A candidate is not accepted from timing alone. It must pass sampled
-  correctness, improve cold-L2 timing beyond noise, and move NCU metrics in the
-  expected direction.
-- If NCU contradicts the hypothesis, reject or redesign the candidate even if
-  raw timing is slightly faster.
+- **Cold-L2 is the right default** (`--flush-l2-mb 256`). In real multimodal
+  prefill each layer's FP8 weights (tens of MB) are cold per-GEMM — they don't
+  fit alongside the next layer's in the 4090's 72 MB L2. The cold-bench gate
+  time (~0.61 ms) matches the production end-to-end gate kernel time, so the
+  flush models reality. Warm timing (`--flush-l2-mb 0`) understates weight
+  traffic and is only useful for isolating compute-bound effects.
+- A candidate is **not** accepted on timing alone. It must pass sampled
+  correctness, beat baseline beyond noise on cold-L2, and move the relevant NCU
+  metric in the predicted direction. If NCU contradicts the hypothesis, reject.
+- One structural change at a time. No broad tile/dispatch sweeps.
 
-## Current Baseline Profile Summary
+## Iteration history (deltas are vs the ORIGINAL pre-C1 kernel)
 
-Standalone bench baseline for `--shape gate` (`M=1581,N=12288,K=4096`) shows:
+These shipped and are now folded into the shared header, i.e. they ARE the
+current baseline. A new candidate must beat this baseline, not re-bank these.
 
-- target kernel: `64x64x128_w4_s1`
-- cold-L2 event timing: about 0.716 ms median
-- NCU duration: about 810 us
-- registers/thread: 120
-- spill load/store: 0 bytes in ptxas output
-- dynamic shared memory/block: 18.43 KB
-- theoretical occupancy: 33.33%, register-limited
-- achieved occupancy: about 32.27%
-- eligible warps/scheduler: about 0.45
-- no eligible: about 71.7%
-- issue slots busy: about 28.3%
-- executed instructions: about 254.0 M
+| step | change | gate cold | vs pre-C1 |
+|------|--------|-----------|-----------|
+| pre-C1 | original scalar scale-load + scalar store + padded smem | 0.720 ms | — |
+| C1 | scale-load coalescing (stage SCALE_KTILE scales in smem) | 0.650 ms | -9.7% |
+| C2 | store-pattern coalescing (bfloat162 pair store) | 0.619 ms | -14.1% |
+| C4 | ldmatrix.x4 + 128B-swizzle smem (no pad) | 0.612 ms | -15.7% |
 
-The first rejected structural experiment moved the temporary accumulator to an
-M-atom scope. It reduced instruction count but increased registers from 120 to
-128, did not improve occupancy, and worsened eligible warps. Do not repeat that
-candidate without a new reason.
+Each step's INCREMENTAL value (not cumulative):
+- C1: -9.7%   (the big one — global scale-load was the top NCU bottleneck)
+- C2: ~-4.5%  (store sectors 8B -> 16B)
+- C4: ~-1.3%  (LSU 67.7% -> 29.8%, but LSU was no longer binding after C1)
 
-Use the NCU wrapper for comparable profiles:
+End-to-end (8B full-res prefill, nsys): GEMM total 125.3 ms (clean PR111) ->
+107.7 ms (C4) = **-14%**, faithful to the cold-bench per-shape -15.6%. Total
+prefill 208.6 -> 190.9 ms = **-8.5%** (Amdahl: GEMM is only 56% of prefill;
+FA2 vision attn is 29%, untouched on 8B).
 
-```bash
-./profile_ncu.sh baseline gate
-./parse_ncu.py profiles/baseline_gate_details.csv
-```
+### Rejected
 
-## Candidate C1: scale-load coalescing
-
-NCU's top bottleneck on the baseline (~51% estimated speedup) is the global
-load access pattern: each 32-byte sector delivers only 4 used bytes, caused by
-the row-strided scalar `act_scale[row*K128+kb]` reads in the scale fold.
-
-C1 stages the scales in shared memory with a coalesced load. To keep the smem
-footprint independent of K (so occupancy does not regress on large-K shapes
-like `down`, K128=96), it stages only `SCALE_KTILE=8` scale-block columns at a
-time (`BLOCK_M*8 + 8` floats = ~2 KB), re-staged each time the k-loop crosses a
-tile boundary.
-
-A first attempt that staged the *entire* `[BLOCK_M, K128]` slice at once won on
-`gate`/`qkv` (K128=32) but regressed `down` +17% (24 KB scale smem dropped
-occupancy 33%→25%). The tiled version below is the fix.
-
-Cold-L2 timing (`--flush-l2-mb 256`, both mode):
-
-```text
-gate M=1581,N=12288,K=4096:  baseline 0.7199 ms  candidate 0.6502 ms  (-9.7%)
-down M=1581,N=4096,K=12288:  baseline 0.6636 ms  candidate 0.6154 ms  (-7.3%)
-qkv  M=1581,N=6144,K=4096:   baseline 0.3359 ms  candidate 0.3052 ms  (-9.1%)
-```
-
-NCU (gate): duration 813→731 us, executed instructions 254.0M→200.4M (-21%),
-theoretical occupancy held at 33.3% (smem footprint kept small), registers
-120→124. Sampled correctness unchanged (max_rel ~6e-4).
-
-## Candidate C2: store-pattern coalescing
-
-After C1, NCU's top remaining bottleneck (~47%) is the global store pattern:
-the scalar 16-bit BF16 epilogue stores deliver only 8 of 32 bytes per sector.
-The m16n8 accumulator layout has each lane holding two adjacent output columns
-per row (`acc[0,1]` = row0 cols {2l,2l+1}, `acc[2,3]` = row1), so C2 emits one
-32-bit `bfloat162` store per row instead of two scalar stores (tail columns
-keep scalar stores).
-
-Cold-L2 timing (C1+C2 vs baseline):
-
-```text
-gate: baseline 0.7199 ms  candidate 0.6185 ms  (-14.1%)
-down: baseline 0.6615 ms  candidate 0.6062 ms  (-8.4%)
-qkv:  baseline 0.3400 ms  candidate 0.2929 ms  (-13.8%)
-```
-
-NCU (gate): duration 731→696 us, store sector utilization 8→16 bytes, store
-bottleneck ~47%→~33%. Correctness unchanged. (Reaching 32/32 would need a
-wider vector store across the discontiguous row halves — diminishing return,
-left for later.)
-
-## Rejected: C3 raise occupancy (register/CTA tuning)
-
-After C1+C2, NCU still lists occupancy (~19% est.) as a bottleneck: 124
-registers limit the kernel to 4 CTAs/SM (33.3% theoretical occupancy). Forcing
-`MIN_BLOCKS_PER_SM=5` makes ptxas drop to 96 registers — but it spills (4 B
-spill stores) and runs **slower**: gate candidate 0.6185 → 0.6482 ms (+4.8%).
-
-This confirms the kernel is **latency-bound, not occupancy-bound**: Warp Cycles
-Per Issued Instruction is ~14.7 and DRAM throughput is only ~10%, so the low
-eligible-warp count comes from instruction/dependency latency, not from too few
-resident warps. Cutting registers to add a CTA removes the latency-hiding
-headroom each warp needs. NCU's occupancy estimate is theoretical and does not
-realize here. Do not pursue register/occupancy tuning for this kernel without a
-fundamentally different accumulator design.
-
-## Candidate C4: ldmatrix.x4 + 128B-swizzle smem (structural)
-
-Raw-page NCU on C1+C2 reveals the real top pipe: **LSU at 67.7%** (the highest),
-with **54.7M shared-load instructions** (27% of all instructions) — the scalar
-32-bit `LDS` reads of A/B fragments in the MMA inner loop. Tensor pipe is only
-20.5%, so the kernel is bound by the load/store unit, not compute.
-
-C4 ports the sm120 ldmatrix structure (`fp8_smallM_handtuned_ldmatrix_sm120`):
-a 128B-swizzle smem layout (no `SMEM_K_PAD`) written by swizzled cp.async and
-read by `ldmatrix.sync.aligned.x4.m8n8.shared.b16`, which loads four 8x8 b16
-fragments per lane in one instruction. The MMA uses the sm89 e4m3 variant (the
-sm120 `kind::f8f6f4` is sm120a-only); C1 scale staging and C2 pair-store are
-kept (orthogonal). Build with `-DUSE_LDMATRIX`.
-
-Cold-L2 timing (C4 vs baseline):
-
-```text
-gate: baseline 0.7199 ms  candidate 0.6072 ms  (-15.7%)
-down: baseline 0.6636 ms  candidate 0.5827 ms  (-12.2%)
-qkv:  baseline 0.3400 ms  candidate 0.2866 ms  (-15.7%)
-```
-
-NCU (gate): **LSU pipe 67.7%->29.8%**, **shared-load instructions 54.7M->5.5M
-(-10x)**, Tensor pipe unchanged (~21%). Correctness unchanged (max_rel matches
-baseline exactly — swizzle + ldmatrix addressing is bit-correct). All
-production tiles have an even N_ATOMS_PW, so the ldmatrix pairing constraint
-holds for the whole dispatch table.
+- **C5 smem-staged epilogue** (fully-coalesce global stores 16B->32B/sector):
+  NCU on the C4 baseline ranks the global-store pattern as the #1 actionable
+  rule (24.5% estimated). C5 stages the output tile in the (now-free) A/B smem
+  and streams it out as 128-bit uint4 stores. **Hypothesis mechanically
+  confirmed** — NCU shows the store-pattern rule eliminated (stores now 32/32).
+  But duration only moved 686.3 -> 682.5 us (**-0.6%**, bit-exact), because the
+  kernel is latency-bound and stores were never on the critical path; the smem
+  round-trip even adds +5.3% instructions (249.7M -> 262.9M). Same lesson as C3:
+  NCU per-rule estimates are theoretical and don't realize on this latency-bound
+  kernel. Not worth a `__syncthreads` + 8 KB epilogue + only-tested-at-M=1581
+  risk on small-M tiles for ~0.5%. **Conclusion: the obvious memory-pattern
+  levers (load coalescing C1, store coalescing C2/C5, ldmatrix C4) are
+  exhausted; the kernel sits at its latency wall.** Further GEMM gains need a
+  fundamentally different accumulator/pipeline design, not another coalescing
+  pass. End-to-end, the bigger lever is now vision attention (29% of 8B prefill).
+- **C3 raise occupancy** (force `MIN_BLOCKS_PER_SM=5`): ptxas drops to 96 regs
+  but spills and runs +4.8% slower. The kernel is **latency-bound, not
+  occupancy-bound** (Warp Cycles/Issued-Inst ~14.7, DRAM ~10%). Do not pursue
+  register/occupancy tuning without a fundamentally different accumulator
+  design.
+- **Temp accumulator at M-atom scope**: fewer instructions but 120->128 regs,
+  worse eligible warps, no occupancy gain.

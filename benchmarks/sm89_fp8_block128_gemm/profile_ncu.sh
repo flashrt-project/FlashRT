@@ -4,9 +4,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODE="${1:-candidate}"
 SHAPE="${2:-gate}"
-NCU="${NCU:-/usr/local/cuda-12.4/bin/ncu}"
+NCU="${NCU:-ncu}"
 
-"${SCRIPT_DIR}/build.sh" >/dev/null
+# Candidate mode needs the editable experiment kernel compiled in; baseline
+# mode profiles the production kernel from the shared header. Without this the
+# candidate would alias the baseline and the two profiles would be identical.
+if [ "${MODE}" = "candidate" ]; then
+  "${SCRIPT_DIR}/build.sh" --experiment >/dev/null
+else
+  "${SCRIPT_DIR}/build.sh" >/dev/null
+fi
 mkdir -p "${SCRIPT_DIR}/profiles"
 
 REP="${SCRIPT_DIR}/profiles/${MODE}_${SHAPE}"

@@ -8,6 +8,11 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+// Production kernel body, shared verbatim. `--mode baseline` runs THIS exact
+// kernel, so the bench baseline cannot drift behind production. The candidate
+// (EXPERIMENT slot, see below) is seeded from the same source.
+#include "fp8_bs_gemm_device.cuh"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -29,11 +34,21 @@
 
 namespace {
 
+// ---------------------------------------------------------------------------
+// EXPERIMENT slot. By default the candidate IS the production kernel (included
+// from the shared header below), so a freshly-synced bench reports ~0% delta
+// between baseline and candidate -- a built-in honesty check that the harness
+// is faithful. To iterate on a structural change, build with -DEXPERIMENT and
+// edit `fp8_bs_gemm_kernel_cand` below; once an experiment is accepted, fold
+// it into csrc/gemm/fp8_bs_gemm_device.cuh and the baseline tracks it again.
+// ---------------------------------------------------------------------------
+#ifdef EXPERIMENT
 __device__ __forceinline__ void mma_m16n8k32_e4m3(
     float &d0, float &d1, float &d2, float &d3,
     uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
     uint32_t b0, uint32_t b1)
 {
+    // Ada (sm_89) FP8 tensor-core op — NO .kind::f8f6f4 qualifier.
     asm volatile(
         "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
         "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
@@ -51,7 +66,7 @@ __device__ __forceinline__ uint32_t to_smem(const void* p) {
     return static_cast<uint32_t>(__cvta_generic_to_shared(p));
 }
 
-// True when the adjacent column pair {c, c+1} is fully in bounds, so a
+// True when the adjacent output column pair {c, c+1} is fully in bounds, so a
 // 32-bit bfloat162 store is valid. n_pair_base is even (=...+2*l) and N is a
 // multiple of 128, so &D[row*N + c] is 4-byte aligned for the vector store.
 __device__ __forceinline__ bool col_pair_ok(int c, int N) {
@@ -59,8 +74,8 @@ __device__ __forceinline__ bool col_pair_ok(int c, int N) {
 }
 
 // ldmatrix.x4: load four 8x8 b16 fragments from smem into 4 registers/lane in
-// one instruction. The C4 candidate uses it to replace 4 scalar 32-bit LDS,
-// offloading the saturated LSU pipe (NCU: LSU 67.7%, 54.7M shared loads).
+// one instruction, replacing 4 scalar 32-bit LDS to offload the LSU pipe
+// (NCU on the scalar path: LSU 67.7%, 54.7M shared loads = 27% of all insts).
 __device__ __forceinline__ void ldmatrix_x4_b16(
     uint32_t &d0, uint32_t &d1, uint32_t &d2, uint32_t &d3, uint32_t smem_addr)
 {
@@ -70,14 +85,19 @@ __device__ __forceinline__ void ldmatrix_x4_b16(
         : "r"(smem_addr));
 }
 
+// BLOCK_K is pinned to 128 (one DeepSeek scale block per K-iteration).
+//  - A: [M, K] row-major FP8 e4m3, act_scale [M, K/128] fp32
+//  - B: [N, K] row-major FP8 e4m3, w_scale [N/128, K/128] fp32
+//  - D: [M, N] row-major BF16
+//  - BLOCK_N must keep each warp's 8-wide N-atoms inside one 128 scale block.
 template <int BLOCK_M, int BLOCK_N, int NUM_WARPS, int STAGES,
-          int MIN_BLOCKS_PER_SM, bool CANDIDATE>
+          int MIN_BLOCKS_PER_SM>
 __global__ __launch_bounds__(NUM_WARPS * 32, MIN_BLOCKS_PER_SM)
-void fp8_bs_gemm_kernel(
+void fp8_bs_gemm_kernel_cand(
     const __nv_fp8_e4m3* __restrict__ A,
     const __nv_fp8_e4m3* __restrict__ B,
-    const float* __restrict__ act_scale,
-    const float* __restrict__ w_scale,
+    const float* __restrict__ act_scale,   // [M, K/128]
+    const float* __restrict__ w_scale,     // [N/128, K/128]
     __nv_bfloat16* __restrict__ D,
     int M, int N, int K)
 {
@@ -86,26 +106,36 @@ void fp8_bs_gemm_kernel(
     constexpr int M_ATOMS    = BLOCK_M / 16;
     constexpr int N_ATOMS    = BLOCK_N / 8;
     constexpr int N_ATOMS_PW = N_ATOMS / NUM_WARPS;
-    constexpr int K_ATOMS    = BLOCK_K / 32;
-    constexpr int SMEM_K_PAD = BLOCK_K + 16;
+    constexpr int N_PAIRS_PW = N_ATOMS_PW / 2;      // ldmatrix pairs 2 N-atoms
+    constexpr int K_ATOMS    = BLOCK_K / 32;        // = 4
+    constexpr int NUM_CHUNKS_PER_ROW = BLOCK_K / 16;  // 8 chunks of 16 bytes
+    // 128B swizzle: chunk_sw = chunk ^ (row & SWIZZLE_MASK). Removes the old
+    // SMEM_K_PAD and the bank conflicts; applied identically on cp.async store
+    // and ldmatrix load so the round-trip is bit-exact.
+    constexpr int SWIZZLE_MASK = NUM_CHUNKS_PER_ROW - 1;  // = 7
 
     static_assert(BLOCK_M % 16 == 0, "BLOCK_M multiple of 16");
     static_assert(BLOCK_N % 8 == 0,  "BLOCK_N multiple of 8");
     static_assert(BLOCK_N <= 128, "one CTA must fit one N scale block");
     static_assert((BLOCK_N / 8) % NUM_WARPS == 0, "N-atoms split across warps");
+    static_assert(N_ATOMS_PW >= 2 && N_ATOMS_PW % 2 == 0,
+                  "ldmatrix pairs 2 N-atoms: N_ATOMS_PW must be even >= 2");
+
+    // Stage the per-CTA activation/weight scales in shared memory with a
+    // coalesced load, so the per-k_iter scale fold reads smem instead of
+    // row-strided scalar global loads (NCU's top global-load bottleneck).
+    // Only SCALE_KTILE scale-block columns are staged at a time, re-staged on
+    // each k-tile boundary, so the smem footprint is K-independent (~2 KB) and
+    // occupancy does not regress on large-K shapes (e.g. down, K128=96).
+    constexpr int SCALE_KTILE = 8;
+    constexpr int A_TILE = BLOCK_M * BLOCK_K;       // swizzled, no pad
+    constexpr int B_TILE = BLOCK_N * BLOCK_K;
 
     extern __shared__ uint8_t smem_raw[];
     uint8_t* A_smem = smem_raw;
-    uint8_t* B_smem = A_smem + STAGES * BLOCK_M * SMEM_K_PAD;
-    // Candidate C1: stage activation/weight scales in shared memory with a
-    // coalesced load, so the per-k_iter scale fold reads smem instead of
-    // row-strided scalar global loads. To keep the smem footprint independent
-    // of K (occupancy-neutral), stage only SCALE_KTILE scale-block columns at
-    // a time (act_scale[m_base:m_base+BLOCK_M, kb0:kb0+SCALE_KTILE]).
-    constexpr int SCALE_KTILE = 8;
-    float* as_smem = reinterpret_cast<float*>(
-        B_smem + STAGES * BLOCK_N * SMEM_K_PAD);
-    float* ws_smem = as_smem + (CANDIDATE ? BLOCK_M * SCALE_KTILE : 0);
+    uint8_t* B_smem = A_smem + STAGES * A_TILE;
+    float* as_smem = reinterpret_cast<float*>(B_smem + STAGES * B_TILE);
+    float* ws_smem = as_smem + BLOCK_M * SCALE_KTILE;
 
     const int cta_m = blockIdx.x;
     const int cta_n = blockIdx.y;
@@ -117,73 +147,75 @@ void fp8_bs_gemm_kernel(
     const int lane = t % 32;
     const int l = lane % 4;
     const int h = lane / 4;
+    // ldmatrix.x4 lane -> fragment partition.
+    const int frag_group = lane / 8;       // 0..3 (TL,TR,BL,BR)
+    const int row_in_frag = lane % 8;      // row within an 8x8 fragment
+    const int row_block = frag_group / 2;  // top(0)/bottom(1) 8 rows
+    const int col_block = frag_group % 2;  // left(0)/right(1) 16-byte chunk
 
-    const int K128 = K >> 7;
+    const int K128 = K >> 7;                        // # scale blocks along K
 
     // Coalesced staging of one SCALE_KTILE-wide scale block into smem.
-    // Layout: as_smem[local_row * SCALE_KTILE + (kb - kb0)] for the rows this
-    // CTA owns; ws_smem[kb - kb0] for the CTA's single N scale block.
     auto stage_scales = [&](int kb0) {
-        if constexpr (CANDIDATE) {
-            const int as_total = BLOCK_M * SCALE_KTILE;
-            for (int idx = t; idx < as_total; idx += THREADS) {
-                int r = idx / SCALE_KTILE;
-                int kc = idx - r * SCALE_KTILE;
-                int row = m_base + r;
-                int kb = kb0 + kc;
-                as_smem[idx] = (row < M && kb < K128)
-                    ? act_scale[(size_t)row * K128 + kb] : 0.0f;
-            }
-            for (int kc = t; kc < SCALE_KTILE; kc += THREADS) {
-                int kb = kb0 + kc;
-                ws_smem[kc] = (kb < K128)
-                    ? w_scale[(size_t)(n_base >> 7) * K128 + kb] : 0.0f;
-            }
-            __syncthreads();
+        const int as_total = BLOCK_M * SCALE_KTILE;
+        for (int idx = t; idx < as_total; idx += THREADS) {
+            int r = idx / SCALE_KTILE;
+            int kc = idx - r * SCALE_KTILE;
+            int row = m_base + r;
+            int kb = kb0 + kc;
+            as_smem[idx] = (row < M && kb < K128)
+                ? act_scale[(size_t)row * K128 + kb] : 0.0f;
         }
+        for (int kc = t; kc < SCALE_KTILE; kc += THREADS) {
+            int kb = kb0 + kc;
+            ws_smem[kc] = (kb < K128)
+                ? w_scale[(size_t)(n_base >> 7) * K128 + kb] : 0.0f;
+        }
+        __syncthreads();
     };
 
     auto issue_load = [&](int stage, int k_base) {
-        constexpr int A_TOTAL_16B = BLOCK_M * BLOCK_K / 16;
-        constexpr int A_ITERS = (A_TOTAL_16B + THREADS - 1) / THREADS;
+        constexpr int A_CHUNKS = BLOCK_M * NUM_CHUNKS_PER_ROW;
+        constexpr int A_ITERS = (A_CHUNKS + THREADS - 1) / THREADS;
         #pragma unroll
         for (int it = 0; it < A_ITERS; ++it) {
             int idx = it * THREADS + t;
-            if (idx >= A_TOTAL_16B) break;
-            int row_a = idx / (BLOCK_K / 16);
-            int koff_a = (idx % (BLOCK_K / 16)) * 16;
+            if (idx >= A_CHUNKS) break;
+            int row_a = idx / NUM_CHUNKS_PER_ROW;
+            int chunk_a = idx % NUM_CHUNKS_PER_ROW;
             int m_glob = m_base + row_a;
-            int k_glob = k_base + koff_a;
+            int k_glob = k_base + chunk_a * 16;
             const uint8_t* a_src = nullptr;
             if (m_glob < M && k_glob < K) {
-                a_src = reinterpret_cast<const uint8_t*>(&A[m_glob * K + k_glob]);
+                a_src = reinterpret_cast<const uint8_t*>(&A[(size_t)m_glob * K + k_glob]);
             }
+            int csw = chunk_a ^ (row_a & SWIZZLE_MASK);
             cp_async_16(
-                to_smem(&A_smem[stage * BLOCK_M * SMEM_K_PAD
-                                + row_a * SMEM_K_PAD + koff_a]),
+                to_smem(&A_smem[stage * A_TILE + row_a * BLOCK_K + csw * 16]),
                 a_src);
         }
-        constexpr int B_TOTAL_16B = BLOCK_N * BLOCK_K / 16;
-        constexpr int B_ITERS = (B_TOTAL_16B + THREADS - 1) / THREADS;
+        constexpr int B_CHUNKS = BLOCK_N * NUM_CHUNKS_PER_ROW;
+        constexpr int B_ITERS = (B_CHUNKS + THREADS - 1) / THREADS;
         #pragma unroll
         for (int it = 0; it < B_ITERS; ++it) {
             int idx = it * THREADS + t;
-            if (idx >= B_TOTAL_16B) break;
-            int row_b = idx / (BLOCK_K / 16);
-            int koff_b = (idx % (BLOCK_K / 16)) * 16;
+            if (idx >= B_CHUNKS) break;
+            int row_b = idx / NUM_CHUNKS_PER_ROW;
+            int chunk_b = idx % NUM_CHUNKS_PER_ROW;
             int n_glob = n_base + row_b;
-            int k_glob = k_base + koff_b;
+            int k_glob = k_base + chunk_b * 16;
             const uint8_t* b_src = nullptr;
             if (n_glob < N && k_glob < K) {
-                b_src = reinterpret_cast<const uint8_t*>(&B[n_glob * K + k_glob]);
+                b_src = reinterpret_cast<const uint8_t*>(&B[(size_t)n_glob * K + k_glob]);
             }
+            int csw = chunk_b ^ (row_b & SWIZZLE_MASK);
             cp_async_16(
-                to_smem(&B_smem[stage * BLOCK_N * SMEM_K_PAD
-                                + row_b * SMEM_K_PAD + koff_b]),
+                to_smem(&B_smem[stage * B_TILE + row_b * BLOCK_K + csw * 16]),
                 b_src);
         }
     };
 
+    // Running (scaled) accumulators across all K-blocks.
     float acc[M_ATOMS][N_ATOMS_PW][4];
     #pragma unroll
     for (int mi = 0; mi < M_ATOMS; ++mi)
@@ -209,10 +241,12 @@ void fp8_bs_gemm_kernel(
         asm volatile("cp.async.wait_group %0;\n" :: "n"(STAGES - 1));
         __syncthreads();
 
+        // This k_iter is exactly one scale block (kb = k_iter).
         const int kb = k_iter;
-        // Re-stage the next SCALE_KTILE-wide scale block when crossing a tile
-        // boundary (candidate only; no-op for baseline).
+        // Re-stage the next SCALE_KTILE-wide scale block on each tile boundary.
         if ((kb % SCALE_KTILE) == 0) stage_scales(kb);
+        // w_scale is constant across this CTA's BLOCK_N if it fits one
+        // 128 block; index per warp's N base to stay correct for BLOCK_N>128.
         float tacc[M_ATOMS][N_ATOMS_PW][4];
         #pragma unroll
         for (int mi = 0; mi < M_ATOMS; ++mi)
@@ -220,243 +254,27 @@ void fp8_bs_gemm_kernel(
             for (int ni = 0; ni < N_ATOMS_PW; ++ni)
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) tacc[mi][ni][j] = 0.0f;
-
-        #pragma unroll
-        for (int ka = 0; ka < K_ATOMS; ++ka) {
-            int kA0 = ka * 32 + 4 * l;
-            int kA2 = ka * 32 + 4 * l + 16;
-            #pragma unroll
-            for (int mi = 0; mi < M_ATOMS; ++mi) {
-                int rA0 = mi * 16 + h;
-                int rA1 = mi * 16 + h + 8;
-                uint32_t A0 = *reinterpret_cast<const uint32_t*>(
-                    &A_smem[compute_stage * BLOCK_M * SMEM_K_PAD + rA0 * SMEM_K_PAD + kA0]);
-                uint32_t A1 = *reinterpret_cast<const uint32_t*>(
-                    &A_smem[compute_stage * BLOCK_M * SMEM_K_PAD + rA1 * SMEM_K_PAD + kA0]);
-                uint32_t A2 = *reinterpret_cast<const uint32_t*>(
-                    &A_smem[compute_stage * BLOCK_M * SMEM_K_PAD + rA0 * SMEM_K_PAD + kA2]);
-                uint32_t A3 = *reinterpret_cast<const uint32_t*>(
-                    &A_smem[compute_stage * BLOCK_M * SMEM_K_PAD + rA1 * SMEM_K_PAD + kA2]);
-                #pragma unroll
-                for (int ni = 0; ni < N_ATOMS_PW; ++ni) {
-                    int co_n = warp_id * N_ATOMS_PW * 8 + ni * 8 + h;
-                    uint32_t B0 = *reinterpret_cast<const uint32_t*>(
-                        &B_smem[compute_stage * BLOCK_N * SMEM_K_PAD + co_n * SMEM_K_PAD + kA0]);
-                    uint32_t B1 = *reinterpret_cast<const uint32_t*>(
-                        &B_smem[compute_stage * BLOCK_N * SMEM_K_PAD + co_n * SMEM_K_PAD + kA2]);
-                    mma_m16n8k32_e4m3(
-                        tacc[mi][ni][0], tacc[mi][ni][1],
-                        tacc[mi][ni][2], tacc[mi][ni][3],
-                        A0, A1, A2, A3, B0, B1);
-                }
-            }
-        }
-
-        int kbt = kb % SCALE_KTILE;   // column within the staged scale tile
-        float ws_cta = CANDIDATE ? ws_smem[kbt]
-                                  : w_scale[(size_t)(n_base >> 7) * K128 + kb];
-        #pragma unroll
-        for (int mi = 0; mi < M_ATOMS; ++mi) {
-            int row0 = m_base + mi * 16 + h;
-            int row1 = row0 + 8;
-            float as0, as1;
-            if constexpr (CANDIDATE) {
-                // Staged in smem with bounds applied during load.
-                as0 = as_smem[(mi * 16 + h) * SCALE_KTILE + kbt];
-                as1 = as_smem[(mi * 16 + h + 8) * SCALE_KTILE + kbt];
-            } else {
-                as0 = (row0 < M) ? act_scale[row0 * K128 + kb] : 0.0f;
-                as1 = (row1 < M) ? act_scale[row1 * K128 + kb] : 0.0f;
-            }
-            #pragma unroll
-            for (int ni = 0; ni < N_ATOMS_PW; ++ni) {
-                acc[mi][ni][0] += tacc[mi][ni][0] * (as0 * ws_cta);
-                acc[mi][ni][1] += tacc[mi][ni][1] * (as0 * ws_cta);
-                acc[mi][ni][2] += tacc[mi][ni][2] * (as1 * ws_cta);
-                acc[mi][ni][3] += tacc[mi][ni][3] * (as1 * ws_cta);
-            }
-        }
-
-        __syncthreads();
-        compute_stage = (compute_stage + 1) % STAGES;
-    }
-    asm volatile("cp.async.wait_all;\n" ::);
-
-    #pragma unroll
-    for (int mi = 0; mi < M_ATOMS; ++mi) {
-        int row0 = m_base + mi * 16 + h;
-        int row1 = row0 + 8;
-        #pragma unroll
-        for (int ni = 0; ni < N_ATOMS_PW; ++ni) {
-            int n_pair_base = n_base + warp_id * N_ATOMS_PW * 8 + ni * 8 + 2 * l;
-            // m16n8 layout: acc[0,1] are row0 cols {2l,2l+1}; acc[2,3] are
-            // row1 cols {2l,2l+1}. The two columns are adjacent, so candidate
-            // emits one 32-bit bfloat162 store per row instead of two scalar
-            // 16-bit stores (NCU's top store-pattern bottleneck). Tail (odd
-            // last column) keeps scalar stores.
-            if constexpr (CANDIDATE) {
-                if (row0 < M && col_pair_ok(n_pair_base, N)) {
-                    *reinterpret_cast<__nv_bfloat162*>(&D[(size_t)row0 * N + n_pair_base]) =
-                        __floats2bfloat162_rn(acc[mi][ni][0], acc[mi][ni][1]);
-                } else if (row0 < M) {
-                    if (n_pair_base < N)     D[(size_t)row0 * N + n_pair_base]   = __float2bfloat16(acc[mi][ni][0]);
-                    if (n_pair_base + 1 < N) D[(size_t)row0 * N + n_pair_base+1] = __float2bfloat16(acc[mi][ni][1]);
-                }
-                if (row1 < M && col_pair_ok(n_pair_base, N)) {
-                    *reinterpret_cast<__nv_bfloat162*>(&D[(size_t)row1 * N + n_pair_base]) =
-                        __floats2bfloat162_rn(acc[mi][ni][2], acc[mi][ni][3]);
-                } else if (row1 < M) {
-                    if (n_pair_base < N)     D[(size_t)row1 * N + n_pair_base]   = __float2bfloat16(acc[mi][ni][2]);
-                    if (n_pair_base + 1 < N) D[(size_t)row1 * N + n_pair_base+1] = __float2bfloat16(acc[mi][ni][3]);
-                }
-            } else {
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    int row = (j < 2) ? row0 : row1;
-                    int col = n_pair_base + (j & 1);
-                    if (row < M && col < N) {
-                        D[row * N + col] = __float2bfloat16(acc[mi][ni][j]);
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// C4 candidate: ldmatrix.x4 + 128B-swizzle smem, block-scaled (C1 staging) +
-// pair-store (C2). Structure ported from the sm120 ldmatrix kernel; MMA uses
-// the sm89 e4m3 variant (no kind::f8f6f4). Swizzle removes the SMEM_K_PAD and
-// bank conflicts; ldmatrix collapses 4 scalar LDS into one to offload the LSU.
-//   Restrictions: BLOCK_K=128, N_ATOMS_PW even (>=2), BLOCK_M%16==0.
-template <int BLOCK_M, int BLOCK_N, int NUM_WARPS, int STAGES, int MIN_BLOCKS_PER_SM>
-__global__ __launch_bounds__(NUM_WARPS * 32, MIN_BLOCKS_PER_SM)
-void fp8_bs_gemm_ld_kernel(
-    const __nv_fp8_e4m3* __restrict__ A, const __nv_fp8_e4m3* __restrict__ B,
-    const float* __restrict__ act_scale, const float* __restrict__ w_scale,
-    __nv_bfloat16* __restrict__ D, int M, int N, int K)
-{
-    constexpr int BLOCK_K   = 128;
-    constexpr int THREADS   = NUM_WARPS * 32;
-    constexpr int M_ATOMS   = BLOCK_M / 16;
-    constexpr int N_ATOMS   = BLOCK_N / 8;
-    constexpr int N_ATOMS_PW= N_ATOMS / NUM_WARPS;
-    constexpr int N_PAIRS_PW= N_ATOMS_PW / 2;
-    constexpr int K_ATOMS   = BLOCK_K / 32;            // = 4
-    constexpr int NUM_CHUNKS_PER_ROW = BLOCK_K / 16;   // = 8 chunks of 16B
-    // 128B swizzle: chunk_sw = chunk ^ (row & SWIZZLE_MASK). For 8 chunks/row
-    // the period is 8, mask 7 (>8 chunks would need mask 7 too on 4090).
-    constexpr int SWIZZLE_MASK = (NUM_CHUNKS_PER_ROW <= 8) ? (NUM_CHUNKS_PER_ROW - 1) : 7;
-    constexpr int SCALE_KTILE = 8;
-    constexpr int A_TILE = BLOCK_M * BLOCK_K;          // no pad (swizzle)
-    constexpr int B_TILE = BLOCK_N * BLOCK_K;
-
-    static_assert(N_ATOMS_PW >= 2 && N_ATOMS_PW % 2 == 0, "N_ATOMS_PW even>=2");
-
-    extern __shared__ uint8_t smem_raw[];
-    uint8_t* A_smem = smem_raw;
-    uint8_t* B_smem = A_smem + STAGES * A_TILE;
-    float* as_smem = reinterpret_cast<float*>(B_smem + STAGES * B_TILE);
-    float* ws_smem = as_smem + BLOCK_M * SCALE_KTILE;
-
-    const int m_base = blockIdx.x * BLOCK_M;
-    const int n_base = blockIdx.y * BLOCK_N;
-    const int t = threadIdx.x, warp_id = t / 32, lane = t % 32;
-    const int frag_group = lane / 8, row_in_frag = lane % 8;
-    const int row_block = frag_group / 2, col_block = frag_group % 2;
-    const int h = lane / 4, l = lane % 4;
-    const int K128 = K >> 7;
-
-    auto stage_scales = [&](int kb0) {
-        for (int idx = t; idx < BLOCK_M * SCALE_KTILE; idx += THREADS) {
-            int r = idx / SCALE_KTILE, kc = idx - r * SCALE_KTILE;
-            int row = m_base + r, kb = kb0 + kc;
-            as_smem[idx] = (row < M && kb < K128) ? act_scale[(size_t)row * K128 + kb] : 0.0f;
-        }
-        for (int kc = t; kc < SCALE_KTILE; kc += THREADS) {
-            int kb = kb0 + kc;
-            ws_smem[kc] = (kb < K128) ? w_scale[(size_t)(n_base >> 7) * K128 + kb] : 0.0f;
-        }
-        __syncthreads();
-    };
-
-    auto issue_load = [&](int stage, int k_base) {
-        constexpr int A_CHUNKS = BLOCK_M * NUM_CHUNKS_PER_ROW;
-        #pragma unroll
-        for (int it = 0; it * THREADS < A_CHUNKS; ++it) {
-            int idx = it * THREADS + t; if (idx >= A_CHUNKS) break;
-            int row = idx / NUM_CHUNKS_PER_ROW, chunk = idx % NUM_CHUNKS_PER_ROW;
-            int m_g = m_base + row, k_g = k_base + chunk * 16;
-            const uint8_t* src = (m_g < M && k_g < K)
-                ? reinterpret_cast<const uint8_t*>(&A[(size_t)m_g * K + k_g]) : nullptr;
-            int csw = chunk ^ (row & SWIZZLE_MASK);
-            cp_async_16(to_smem(&A_smem[stage * A_TILE + row * BLOCK_K + csw * 16]), src);
-        }
-        constexpr int B_CHUNKS = BLOCK_N * NUM_CHUNKS_PER_ROW;
-        #pragma unroll
-        for (int it = 0; it * THREADS < B_CHUNKS; ++it) {
-            int idx = it * THREADS + t; if (idx >= B_CHUNKS) break;
-            int row = idx / NUM_CHUNKS_PER_ROW, chunk = idx % NUM_CHUNKS_PER_ROW;
-            int n_g = n_base + row, k_g = k_base + chunk * 16;
-            const uint8_t* src = (n_g < N && k_g < K)
-                ? reinterpret_cast<const uint8_t*>(&B[(size_t)n_g * K + k_g]) : nullptr;
-            int csw = chunk ^ (row & SWIZZLE_MASK);
-            cp_async_16(to_smem(&B_smem[stage * B_TILE + row * BLOCK_K + csw * 16]), src);
-        }
-    };
-
-    float acc[M_ATOMS][N_ATOMS_PW][4];
-    #pragma unroll
-    for (int mi = 0; mi < M_ATOMS; ++mi)
-        #pragma unroll
-        for (int ni = 0; ni < N_ATOMS_PW; ++ni)
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) acc[mi][ni][j] = 0.0f;
-
-    const int K_ITERS = (K + BLOCK_K - 1) / BLOCK_K;
-    #pragma unroll
-    for (int s = 0; s < STAGES - 1; ++s) {
-        if (s * BLOCK_K < K) issue_load(s, s * BLOCK_K);
-        asm volatile("cp.async.commit_group;\n" ::);
-    }
-
-    int compute_stage = 0;
-    for (int k_iter = 0; k_iter < K_ITERS; ++k_iter) {
-        int issue_iter = k_iter + (STAGES - 1), issue_stage = issue_iter % STAGES;
-        if (issue_iter < K_ITERS) issue_load(issue_stage, issue_iter * BLOCK_K);
-        asm volatile("cp.async.commit_group;\n" ::);
-        asm volatile("cp.async.wait_group %0;\n" :: "n"(STAGES - 1));
-        __syncthreads();
-
-        const int kb = k_iter;
-        if ((kb % SCALE_KTILE) == 0) stage_scales(kb);
 
         uint8_t* A_stage = A_smem + compute_stage * A_TILE;
         uint8_t* B_stage = B_smem + compute_stage * B_TILE;
-        float tacc[M_ATOMS][N_ATOMS_PW][4];
         #pragma unroll
-        for (int mi = 0; mi < M_ATOMS; ++mi)
-            #pragma unroll
-            for (int ni = 0; ni < N_ATOMS_PW; ++ni)
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) tacc[mi][ni][j] = 0.0f;
-
-        #pragma unroll
-        for (int k_a = 0; k_a < K_ATOMS; ++k_a) {
+        for (int ka = 0; ka < K_ATOMS; ++ka) {
+            // ldmatrix.x4 loads the m16xk32 A fragment (4 regs/lane) per m-atom.
             uint32_t A_regs[M_ATOMS][4];
             #pragma unroll
             for (int mi = 0; mi < M_ATOMS; ++mi) {
                 int row = mi * 16 + row_block * 8 + row_in_frag;
-                int chunk = 2 * k_a + col_block;
+                int chunk = 2 * ka + col_block;
                 int csw = chunk ^ (row & SWIZZLE_MASK);
                 ldmatrix_x4_b16(A_regs[mi][0], A_regs[mi][1], A_regs[mi][2], A_regs[mi][3],
                                 to_smem(&A_stage[row * BLOCK_K + csw * 16]));
             }
+            // ldmatrix.x4 loads two N-atoms (n16xk32) per pair.
             uint32_t B_regs[N_PAIRS_PW][4];
             #pragma unroll
             for (int np = 0; np < N_PAIRS_PW; ++np) {
                 int nrow = warp_id * N_ATOMS_PW * 8 + np * 16 + row_block * 8 + row_in_frag;
-                int chunk = 2 * k_a + col_block;
+                int chunk = 2 * ka + col_block;
                 int csw = chunk ^ (nrow & SWIZZLE_MASK);
                 ldmatrix_x4_b16(B_regs[np][0], B_regs[np][1], B_regs[np][2], B_regs[np][3],
                                 to_smem(&B_stage[nrow * BLOCK_K + csw * 16]));
@@ -479,10 +297,16 @@ void fp8_bs_gemm_ld_kernel(
             }
         }
 
+        // Fold block scales: D += act_scale[row,kb] * w_scale[ncol/128,kb] * tacc
+        // Scales come from the smem stage (coalesced load above), indexed by
+        // the column within the current SCALE_KTILE tile. BLOCK_N <= 128 keeps
+        // the CTA inside one 128-column weight-scale block.
         int kbt = kb % SCALE_KTILE;
         float ws_cta = ws_smem[kbt];
         #pragma unroll
         for (int mi = 0; mi < M_ATOMS; ++mi) {
+            int row0 = m_base + mi * 16 + h;
+            int row1 = row0 + 8;
             float as0 = as_smem[(mi * 16 + h) * SCALE_KTILE + kbt];
             float as1 = as_smem[(mi * 16 + h + 8) * SCALE_KTILE + kbt];
             #pragma unroll
@@ -493,71 +317,81 @@ void fp8_bs_gemm_ld_kernel(
                 acc[mi][ni][3] += tacc[mi][ni][3] * (as1 * ws_cta);
             }
         }
+        // Do not let the next cp.async overwrite this shared-memory stage
+        // before all warps finish reading it.
         __syncthreads();
         compute_stage = (compute_stage + 1) % STAGES;
     }
     asm volatile("cp.async.wait_all;\n" ::);
 
+    // Epilogue: write BF16. m16n8 layout: thread (h,l) -> rows {h,h+8},
+    // cols {2*l, 2*l+1}.
     #pragma unroll
     for (int mi = 0; mi < M_ATOMS; ++mi) {
-        int row0 = m_base + mi * 16 + h, row1 = row0 + 8;
+        int row0 = m_base + mi * 16 + h;
+        int row1 = row0 + 8;
         #pragma unroll
         for (int ni = 0; ni < N_ATOMS_PW; ++ni) {
-            int c = n_base + warp_id * N_ATOMS_PW * 8 + ni * 8 + 2 * l;
-            if (row0 < M && col_pair_ok(c, N))
-                *reinterpret_cast<__nv_bfloat162*>(&D[(size_t)row0 * N + c]) =
+            int n_pair_base = n_base + warp_id * N_ATOMS_PW * 8 + ni * 8 + 2 * l;
+            // acc[0,1] = row0 cols {2l,2l+1}; acc[2,3] = row1 cols {2l,2l+1}.
+            // Emit one 32-bit bfloat162 store per row instead of two scalar
+            // 16-bit stores (NCU's top store-pattern bottleneck after C1).
+            // Tail (odd last column) falls back to scalar stores.
+            if (row0 < M && col_pair_ok(n_pair_base, N)) {
+                *reinterpret_cast<__nv_bfloat162*>(&D[(size_t)row0 * N + n_pair_base]) =
                     __floats2bfloat162_rn(acc[mi][ni][0], acc[mi][ni][1]);
-            else if (row0 < M) {
-                if (c < N)     D[(size_t)row0 * N + c]   = __float2bfloat16(acc[mi][ni][0]);
-                if (c + 1 < N) D[(size_t)row0 * N + c+1] = __float2bfloat16(acc[mi][ni][1]);
+            } else if (row0 < M) {
+                if (n_pair_base < N)     D[(size_t)row0 * N + n_pair_base]   = __float2bfloat16(acc[mi][ni][0]);
+                if (n_pair_base + 1 < N) D[(size_t)row0 * N + n_pair_base+1] = __float2bfloat16(acc[mi][ni][1]);
             }
-            if (row1 < M && col_pair_ok(c, N))
-                *reinterpret_cast<__nv_bfloat162*>(&D[(size_t)row1 * N + c]) =
+            if (row1 < M && col_pair_ok(n_pair_base, N)) {
+                *reinterpret_cast<__nv_bfloat162*>(&D[(size_t)row1 * N + n_pair_base]) =
                     __floats2bfloat162_rn(acc[mi][ni][2], acc[mi][ni][3]);
-            else if (row1 < M) {
-                if (c < N)     D[(size_t)row1 * N + c]   = __float2bfloat16(acc[mi][ni][2]);
-                if (c + 1 < N) D[(size_t)row1 * N + c+1] = __float2bfloat16(acc[mi][ni][3]);
+            } else if (row1 < M) {
+                if (n_pair_base < N)     D[(size_t)row1 * N + n_pair_base]   = __float2bfloat16(acc[mi][ni][2]);
+                if (n_pair_base + 1 < N) D[(size_t)row1 * N + n_pair_base+1] = __float2bfloat16(acc[mi][ni][3]);
             }
         }
     }
 }
+#endif  // EXPERIMENT
 
 template <bool CANDIDATE>
 void launch_64x64_s1(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* B,
                      const float* act_scale, const float* w_scale,
                      __nv_bfloat16* D, int M, int N, int K,
                      cudaStream_t stream) {
+    namespace prod = flash_rt::gemm::block128_sm89;
     constexpr int BM = 64;
     constexpr int BN = 64;
     constexpr int BK = 128;
     constexpr int W = 4;
     constexpr int S = 1;
     constexpr int MB = 4;
+    constexpr int SCALE_KTILE = 8;
     dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN, 1);
     dim3 block(W * 32, 1, 1);
-    constexpr int SCALE_KTILE = 8;
+    // Swizzled smem (no pad) + staged scale tile -- same layout production uses.
+    int smem_bytes = S * (BM + BN) * BK
+                   + (BM * SCALE_KTILE + SCALE_KTILE) * (int)sizeof(float);
     if (CANDIDATE) {
-#ifdef USE_LDMATRIX
-        // C4: swizzled smem (no pad) + ldmatrix + C1 scales + C2 store.
-        int smem_bytes = S * (BM + BN) * BK
-                       + (BM * SCALE_KTILE + SCALE_KTILE) * (int)sizeof(float);
+#ifdef EXPERIMENT
         if (smem_bytes > 48 * 1024) {
-            cudaFuncSetAttribute((const void*)&fp8_bs_gemm_ld_kernel<BM, BN, W, S, MB>,
+            cudaFuncSetAttribute((const void*)&fp8_bs_gemm_kernel_cand<BM, BN, W, S, MB>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
         }
-        fp8_bs_gemm_ld_kernel<BM, BN, W, S, MB>
+        fp8_bs_gemm_kernel_cand<BM, BN, W, S, MB>
             <<<grid, block, smem_bytes, stream>>>(A, B, act_scale, w_scale, D, M, N, K);
         return;
 #else
-        int smem_bytes = S * (BM + BN) * (BK + 16)
-                       + (BM * SCALE_KTILE + SCALE_KTILE) * (int)sizeof(float);
-        fp8_bs_gemm_kernel<BM, BN, W, S, MB, true>
-            <<<grid, block, smem_bytes, stream>>>(A, B, act_scale, w_scale, D, M, N, K);
-        return;
+        // No experiment compiled in: candidate == production baseline.
 #endif
     }
-    int smem_bytes = S * (BM + BN) * (BK + 16);
-    fp8_bs_gemm_kernel<BM, BN, W, S, MB, false>
+    if (smem_bytes > 48 * 1024) {
+        cudaFuncSetAttribute((const void*)&prod::fp8_bs_gemm_kernel<BM, BN, W, S, MB>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    }
+    prod::fp8_bs_gemm_kernel<BM, BN, W, S, MB>
         <<<grid, block, smem_bytes, stream>>>(A, B, act_scale, w_scale, D, M, N, K);
 }
 
