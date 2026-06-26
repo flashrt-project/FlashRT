@@ -1099,6 +1099,17 @@ if(GPU_ARCH STREQUAL "120")
     ENABLE_CUTLASS_SM120_BLOCK_FP8=1)
 endif()
 
+# Native Ada (sm_89) block-scaled FP8 GEMM for official Qwen3-VL FP8 prefill.
+# Ada has no TMA / no warp-specialized CUTLASS collective, so this is a
+# hand-written cp.async + ldmatrix + block-128 scaling MMA kernel (see
+# docs/qwen3_vl_fp8_sm89.md for why the SM120a CUTLASS path does not port).
+if(GPU_ARCH STREQUAL "89")
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/gemm/fp8_block128_gemm_mma_sm89.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    ENABLE_SM89_BLOCK_FP8_GEMM=1)
+endif()
+
 # Dedicated M=1 decode GEMV (FP8 + BF16); linked + macro defined wherever the
 # object is built (sm89 / sm120) so the ENABLE_DECODE_GEMV_M1 bindings always
 # resolve, independent of FLASHRT_ENABLE_MOTUS.
