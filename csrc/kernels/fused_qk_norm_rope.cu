@@ -161,8 +161,6 @@ void fused_qk_norm_rope_v4_bf16(
     const __nv_bfloat16* k_weight,
     const __nv_bfloat16* cos,
     const __nv_bfloat16* sin,
-    __nv_bfloat16* q_out,
-    __nv_bfloat16* k_out,
     __nv_bfloat16* q_temp,
     __nv_bfloat16* k_temp,
     int BS, int NH, int NKV, int HD, int QKVD, float eps,

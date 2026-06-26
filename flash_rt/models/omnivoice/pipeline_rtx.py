@@ -190,7 +190,7 @@ class FlashRTLlm:
                 b['Dq'].data_ptr(), BS, QKVD, D, fa['inp_sf'].data_ptr(), w['qkv_sf'].data_ptr(),
                 al['qkv'], _pick_gemm_variant(QKVD, D), st)
             fvk.fused_qk_norm_rope_v4_bf16(b['Dq'].data_ptr(), w['qn'].data_ptr(), w['kn'].data_ptr(),
-                cos_bs.data_ptr(), sin_bs.data_ptr(), b['q_flat'].data_ptr(), b['k_flat'].data_ptr(),
+                cos_bs.data_ptr(), sin_bs.data_ptr(),
                 b['q_temp'].data_ptr(), b['k_temp'].data_ptr(), BS, NH, NKV, HD, QKVD, EPS, st)
             b['q_flat'], b['q_temp'] = b['q_temp'], b['q_flat']
             b['k_flat'], b['k_temp'] = b['k_temp'], b['k_flat']
@@ -287,7 +287,7 @@ class FlashRTLlmBF16(FlashRTLlm):
             fvk.rms_norm(b['h'].data_ptr(), wb['in_norm'].data_ptr(), b['xn'].data_ptr(), BS, D, EPS, st)
             torch.matmul(b['xn'], wb['qkv'].t(), out=b['Dq'])
             fvk.fused_qk_norm_rope_v4_bf16(b['Dq'].data_ptr(), wb['qn'].data_ptr(), wb['kn'].data_ptr(),
-                cos_bs.data_ptr(), sin_bs.data_ptr(), b['q_flat'].data_ptr(), b['k_flat'].data_ptr(),
+                cos_bs.data_ptr(), sin_bs.data_ptr(),
                 b['q_temp'].data_ptr(), b['k_temp'].data_ptr(), BS, NH, NKV, HD, QKVD, EPS, st)
             b['q_flat'], b['q_temp'] = b['q_temp'], b['q_flat']
             b['k_flat'], b['k_temp'] = b['k_temp'], b['k_flat']

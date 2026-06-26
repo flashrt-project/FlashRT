@@ -10,8 +10,6 @@
 //   2. Apply per-head RMSNorm (Q and K separately)
 //   3. Apply RoPE — warp-shuffle RMS reduction, register-based
 //   4. Write RoPE results to q_temp/k_temp output buffers
-//
-// Signature: q_out/k_out are unused (retained for API compatibility).
 
 #pragma once
 
@@ -27,8 +25,6 @@ void fused_qk_norm_rope_v4_bf16(
     const __nv_bfloat16* k_weight,   // [HD]  K norm weight
     const __nv_bfloat16* cos,        // [BS, rope_dim]  RoPE cos
     const __nv_bfloat16* sin,        // [BS, rope_dim]  RoPE sin
-    __nv_bfloat16* q_out,            // UNUSED (API compat)
-    __nv_bfloat16* k_out,            // UNUSED (API compat)
     __nv_bfloat16* q_temp,           // RoPE output
     __nv_bfloat16* k_temp,           // RoPE output
     int BS, int NH, int NKV, int HD, int QKVD, float eps,
