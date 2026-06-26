@@ -42,7 +42,8 @@ def _check_qwen3_vl_kernels(module) -> None:
     if missing:
         raise RuntimeError(
             'flash_rt_qwen3_vl_kernels is missing ' + ', '.join(missing)
-            + '. Rebuild it with -DFLASHRT_BUILD_QWEN3_VL=ON (GPU_ARCH=120).')
+            + '. Rebuild it with -DFLASHRT_BUILD_QWEN3_VL=ON '
+            '(GPU_ARCH=89 or 120).')
 
 
 def _require_qwen3_vl_kernels():
@@ -53,7 +54,7 @@ def _require_qwen3_vl_kernels():
     except ImportError as e:
         raise RuntimeError(
             'flash_rt_qwen3_vl_kernels is not built. Configure with '
-            '-DFLASHRT_BUILD_QWEN3_VL=ON (GPU_ARCH=120) and build the '
+            '-DFLASHRT_BUILD_QWEN3_VL=ON (GPU_ARCH=89 or 120) and build the '
             'flash_rt_qwen3_vl_kernels target.') from e
     _check_qwen3_vl_kernels(vlk)
     return vlk
@@ -98,6 +99,15 @@ class Qwen3VlTorchFrontendRtx:
         self._rope_theta = float(cfg['rope_theta'])
         self._head_dim = int(cfg['head_dim'])
         self._mrope_section = tuple(cfg['rope_scaling']['mrope_section'])
+        from flash_rt.frontends.torch import _qwen3_vl_geometry as geo
+        self._mrope_cos_cache, self._mrope_sin_cache = geo.build_mrope_cache(
+            max_pos=self.max_seq + self._num_grid_per_side,
+            head_dim=self._head_dim, rope_theta=self._rope_theta,
+            device=self.device)
+        self._vision_rope_cos_cache, self._vision_rope_sin_cache = (
+            geo.build_vision_rope_cache(
+                max_hw=self.max_seq * self._merge,
+                head_dim=self._vis_head_dim, device=self.device))
         eos = cfg.get('eos_token_id')
         if eos is None:
             self._eos_token_ids: set = set()
@@ -208,12 +218,12 @@ class Qwen3VlTorchFrontendRtx:
             video_token_id=self._video_token_id,
             vision_start_token_id=self._vision_start_token_id,
             spatial_merge_size=m)
-        mcos, msin = geo.mrope_cos_sin(
-            pos_ids, head_dim=self._head_dim, rope_theta=self._rope_theta,
-            mrope_section=self._mrope_section, device=self.device)
-        vcos, vsin = geo.vision_rope_cos_sin(
-            seg_grid, head_dim=self._vis_head_dim,
-            spatial_merge_size=m, device=self.device)
+        mcos, msin = geo.mrope_cos_sin_cached(
+            pos_ids, self._mrope_cos_cache, self._mrope_sin_cache,
+            mrope_section=self._mrope_section)
+        vcos, vsin = geo.vision_rope_cos_sin_cached(
+            seg_grid, self._vision_rope_cos_cache, self._vision_rope_sin_cache,
+            spatial_merge_size=m)
         pos_embeds = geo.vision_pos_embeds(
             seg_grid, self.vision.pos_embed,
             num_grid_per_side=self._num_grid_per_side,

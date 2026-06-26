@@ -1,4 +1,4 @@
-"""FlashRT — Qwen3-VL ViT tower forward (RTX SM120).
+"""FlashRT — Qwen3-VL ViT tower forward on RTX.
 
 Kernelized SigLIP-style vision tower for ``Qwen3-VL``: patch embed →
 learned position embedding → ``depth`` transformer blocks (rotate_half
@@ -7,9 +7,10 @@ merger, with DeepStack feature taps at the configured layers.
 
 All heavy compute runs through ``flash_rt_kernels`` / ``flash_rt_fa2`` /
 ``flash_rt_qwen3_vl_kernels``; tensor reshapes are metadata-only views.
-The linear layers run FP8 block-128 W8A8 (2× tensor-core vs bf16); the
-activation is dynamically quantized per GEMM and the residual stream
-(which carries the late-layer massive-activation outlier) stays bf16.
+On SM120 the linears use the CUTLASS block-128 FP8 path; on SM89 eligible
+linears use the native Ada block-128 FP8 GEMM. BF16-protected linears use the
+architecture-specific BF16 path. In all cases the residual stream (which
+carries the late-layer massive-activation outlier) stays bf16.
 The tower is prefill-once per image and the sequence length is
 image-resolution dependent, so scratch is sized per forward (CUDA-Graph
 bucketing by patch count is layered on top via ``forward_graph``).
@@ -24,8 +25,9 @@ from typing import Any
 
 class Qwen3VlVisionRtx:
     """Qwen3-VL ViT tower. Loads the vision weights from a checkpoint
-    directory (norms BF16, linears FP8 block-128) and runs the forward
-    against the FlashRT kernel modules.
+    directory and runs the forward against the FlashRT kernel modules.
+    Eligible linears pack as FP8 block-128 on SM89/SM120; sensitive
+    early-layer paths can stay BF16 via explicit config overrides.
 
     Public surface:
       __init__(checkpoint_path, *, device='cuda:0')
@@ -46,6 +48,7 @@ class Qwen3VlVisionRtx:
         # patch-count -> (graph, static_inputs, captured_outputs)
         self._graphs: dict = {}
         self._graph_stream = None
+        self._use_fp8_gemm = False
 
         cfg = config if config is not None else _read_vision_config(
             checkpoint_path)
@@ -58,6 +61,10 @@ class Qwen3VlVisionRtx:
         self.intermediate = int(cfg['intermediate_size'])
         self.deepstack_indexes = tuple(cfg['deepstack_visual_indexes'])
         self.ln_eps = float(cfg.get('layer_norm_eps', 1e-6))
+        self._device_sm = torch.cuda.get_device_capability(
+            torch.device(device))[0] * 10 + torch.cuda.get_device_capability(
+                torch.device(device))[1]
+        self._use_fp8_gemm = self._device_sm >= 89
 
         import json
         import os
@@ -81,7 +88,7 @@ class Qwen3VlVisionRtx:
             residual-writing GEMMs (attn proj, FFN fc2) stay bf16: their
             output feeds the late-layer massive-activation channel, where
             accumulated FP8 noise would be amplified."""
-            if not fp8:
+            if not fp8 or not self._use_fp8_gemm:
                 return (None, w, bias)
             w8, ws = _quant_fp8_block128(w)
             return (w8, ws, bias)
@@ -110,29 +117,46 @@ class Qwen3VlVisionRtx:
         # first 3 blocks recovers image_embeds cosine from 0.86 (all-FP8)
         # to 0.97 for ~+2 ms, vs 0.984 / +21 ms for the all-bf16 tower.
         self.bf16_first_blocks = max(0, int(cfg.get('_bf16_first_blocks', 3)))
+        raw_bf16_linears = cfg.get('_bf16_block_linears', {})
+        self._bf16_block_linears: dict[int, frozenset[str]] = {}
+        allowed_bf16_linears = frozenset(('qkv', 'proj', 'fc1', 'fc2'))
+        for raw_idx, raw_names in raw_bf16_linears.items():
+            idx = int(raw_idx)
+            names = frozenset(str(name) for name in raw_names)
+            bad = names - allowed_bf16_linears
+            if bad:
+                raise ValueError(
+                    f'unsupported vision bf16 override(s) for block {idx}: '
+                    + ', '.join(sorted(bad)))
+            self._bf16_block_linears[idx] = names
 
         self.blocks: list[dict] = []
         for i in range(self.depth):
             bp = f'{p}blocks.{i}.'
-            f8 = i >= self.bf16_first_blocks
+            f8 = self._use_fp8_gemm and i >= self.bf16_first_blocks
+            bf16_linears = self._bf16_block_linears.get(i, frozenset())
             self.blocks.append({
                 'norm1_w': _w(bp + 'norm1.weight'),
                 'norm1_b': _w(bp + 'norm1.bias'),
                 'norm2_w': _w(bp + 'norm2.weight'),
                 'norm2_b': _w(bp + 'norm2.bias'),
                 'qkv': _lin(_w(bp + 'attn.qkv.weight'),
-                            _w(bp + 'attn.qkv.bias'), fp8=f8),
+                            _w(bp + 'attn.qkv.bias'),
+                            fp8=f8 and 'qkv' not in bf16_linears),
                 'proj': _lin(_w(bp + 'attn.proj.weight'),
-                             _w(bp + 'attn.proj.bias'), fp8=f8),
+                             _w(bp + 'attn.proj.bias'),
+                             fp8=f8 and 'proj' not in bf16_linears),
                 'fc1': _lin(
                     _pad_rows(_w(bp + 'mlp.linear_fc1.weight'),
                               self.intermediate_padded),
                     _pad_rows(_w(bp + 'mlp.linear_fc1.bias'),
-                              self.intermediate_padded), fp8=f8),
+                              self.intermediate_padded),
+                    fp8=f8 and 'fc1' not in bf16_linears),
                 'fc2': _lin(
                     _pad_cols(_w(bp + 'mlp.linear_fc2.weight'),
                               self.intermediate_padded),
-                    _w(bp + 'mlp.linear_fc2.bias'), fp8=f8),
+                    _w(bp + 'mlp.linear_fc2.bias'),
+                    fp8=f8 and 'fc2' not in bf16_linears),
             })
         self.merger = _load_merger(_w, _lin, p + 'merger.')
         self.deepstack_mergers = [
@@ -171,9 +195,14 @@ class Qwen3VlVisionRtx:
         w8, ws, bias = lin
         y = torch.empty(M, N, dtype=torch.bfloat16, device=self.device)
         if w8 is None:                                  # bf16 path (w16a16)
-            fvk.w16a16_gemm_sm120_bf16(
-                x.data_ptr(), ws.data_ptr(), y.data_ptr(), M, N, K, 1.0,
-                stream)
+            if self._device_sm >= 120:
+                fvk.w16a16_gemm_sm120_bf16(
+                    x.data_ptr(), ws.data_ptr(), y.data_ptr(), M, N, K, 1.0,
+                    stream)
+            else:
+                self._vlk.bf16_matmul_cublaslt_bf16(
+                    x.data_ptr(), ws.data_ptr(), y.data_ptr(), M, N, K,
+                    stream)
         else:                                           # FP8 block-128 W8A8
             x_fp8 = torch.empty(
                 M, K, dtype=torch.float8_e4m3fn, device=self.device)
@@ -182,9 +211,14 @@ class Qwen3VlVisionRtx:
             fvk.fp8_per_token_block128_quant_bf16(
                 x.data_ptr(), x_fp8.data_ptr(), x_scale.data_ptr(),
                 M, K, stream)
-            fvk.fp8_block128_gemm_cutlass_sm120_bf16out(
-                x_fp8.data_ptr(), w8.data_ptr(), y.data_ptr(), M, N, K,
-                x_scale.data_ptr(), ws.data_ptr(), stream)
+            if self._device_sm >= 120:
+                fvk.fp8_block128_gemm_cutlass_sm120_bf16out(
+                    x_fp8.data_ptr(), w8.data_ptr(), y.data_ptr(), M, N, K,
+                    x_scale.data_ptr(), ws.data_ptr(), stream)
+            else:
+                self._vlk.fp8_block128_gemm_blockscaled_sm89_bf16out(
+                    x_fp8.data_ptr(), w8.data_ptr(), y.data_ptr(), M, N, K,
+                    x_scale.data_ptr(), ws.data_ptr(), stream)
         if bias is not None and add_bias:
             fvk.add_bias_bf16(y.data_ptr(), bias.data_ptr(), M, N, stream)
         return y
@@ -209,9 +243,14 @@ class Qwen3VlVisionRtx:
         import torch
         w8, ws, bias = lin
         y = torch.empty(M, N, dtype=torch.bfloat16, device=self.device)
-        self._fvk.fp8_block128_gemm_cutlass_sm120_bf16out(
-            x_fp8.data_ptr(), w8.data_ptr(), y.data_ptr(), M, N, K,
-            x_scale.data_ptr(), ws.data_ptr(), stream)
+        if self._device_sm >= 120:
+            self._fvk.fp8_block128_gemm_cutlass_sm120_bf16out(
+                x_fp8.data_ptr(), w8.data_ptr(), y.data_ptr(), M, N, K,
+                x_scale.data_ptr(), ws.data_ptr(), stream)
+        else:
+            self._vlk.fp8_block128_gemm_blockscaled_sm89_bf16out(
+                x_fp8.data_ptr(), w8.data_ptr(), y.data_ptr(), M, N, K,
+                x_scale.data_ptr(), ws.data_ptr(), stream)
         if bias is not None and add_bias:
             self._fvk.add_bias_bf16(
                 y.data_ptr(), bias.data_ptr(), M, N, stream)
@@ -314,12 +353,12 @@ class Qwen3VlVisionRtx:
 
         deepstack: list = [None] * len(self.deepstack_indexes)
         for i, blk in enumerate(self.blocks):
-            # FP8 blocks fuse the activation quant into the producing
-            # LayerNorm / GELU (one kernel, no bf16 round-trip); bf16 blocks
-            # (the first few, protecting the massive-activation channel) keep
-            # the plain norm + w16a16 path.
-            fp8 = blk['qkv'][0] is not None
-            if fp8:
+            # Activation-side fusion follows the linear that consumes it:
+            # qkv/fc1 use fused norm->FP8 only when that GEMM is FP8; fc2
+            # uses fused GELU->FP8 only when fc2 itself is FP8. This keeps
+            # mixed early blocks legal for bring-up experiments.
+            qkv_fp8 = blk['qkv'][0] is not None
+            if qkv_fp8:
                 xf, xs = self._layer_norm_to_fp8(
                     h, blk['norm1_w'], blk['norm1_b'], S, H, stream)
                 qkv = self._gemm_fp8(xf, xs, blk['qkv'], S, 3 * H, H, stream,
@@ -353,27 +392,45 @@ class Qwen3VlVisionRtx:
                 softmax_scale=scale, num_sms=self._num_sms, stream=stream)
             # proj input is the attention output (not a norm/gelu), so its
             # quant cannot be fused upstream; the proj bias rides the residual.
-            attn = self._gemm(o.view(S, H), blk['proj'], S, H, H, stream,
-                              add_bias=False)
+            if blk['proj'][0] is not None:
+                ao = o.view(S, H).contiguous()
+                ao_fp8 = torch.empty(
+                    S, H, dtype=torch.float8_e4m3fn, device=dev)
+                ao_scale = torch.empty(
+                    S, H // 128, dtype=torch.float32, device=dev)
+                fvk.fp8_per_token_block128_quant_bf16(
+                    ao.data_ptr(), ao_fp8.data_ptr(), ao_scale.data_ptr(),
+                    S, H, stream)
+                attn = self._gemm_fp8(
+                    ao_fp8, ao_scale, blk['proj'], S, H, H, stream,
+                    add_bias=False)
+            else:
+                attn = self._gemm(
+                    o.view(S, H), blk['proj'], S, H, H, stream,
+                    add_bias=False)
             vlk.residual_add_bias_bf16(
                 h.data_ptr(), attn.data_ptr(), blk['proj'][2].data_ptr(),
                 S, H, stream)
 
             inter = self.intermediate
-            if fp8:
+            fc1_fp8 = blk['fc1'][0] is not None
+            fc2_fp8 = blk['fc2'][0] is not None
+            if fc1_fp8:
                 xf2, xs2 = self._layer_norm_to_fp8(
                     h, blk['norm2_w'], blk['norm2_b'], S, H, stream)
                 f1 = self._gemm_fp8(xf2, xs2, blk['fc1'], S, inter, H, stream,
-                                    add_bias=False)
-                gf, gs = self._gelu_bias_to_fp8(
-                    f1, blk['fc1'][2], S, inter, stream)
-                f2 = self._gemm_fp8(gf, gs, blk['fc2'], S, H, inter, stream,
                                     add_bias=False)
             else:
                 xn2 = self._layer_norm(
                     h, blk['norm2_w'], blk['norm2_b'], S, H, stream)
                 f1 = self._gemm(xn2, blk['fc1'], S, inter, H, stream,
                                 add_bias=False)
+            if fc2_fp8:
+                gf, gs = self._gelu_bias_to_fp8(
+                    f1, blk['fc1'][2], S, inter, stream)
+                f2 = self._gemm_fp8(gf, gs, blk['fc2'], S, H, inter, stream,
+                                    add_bias=False)
+            else:
                 fvk.bias_gelu_inplace_bf16(
                     f1.data_ptr(), blk['fc1'][2].data_ptr(), S, inter, stream)
                 f2 = self._gemm(f1, blk['fc2'], S, H, inter, stream,
