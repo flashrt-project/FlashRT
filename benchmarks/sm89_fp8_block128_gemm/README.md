@@ -118,3 +118,25 @@ qkv  M=1581,N=6144,K=4096:   baseline 0.3359 ms  candidate 0.3052 ms  (-9.1%)
 NCU (gate): duration 813→731 us, executed instructions 254.0M→200.4M (-21%),
 theoretical occupancy held at 33.3% (smem footprint kept small), registers
 120→124. Sampled correctness unchanged (max_rel ~6e-4).
+
+## Candidate C2: store-pattern coalescing
+
+After C1, NCU's top remaining bottleneck (~47%) is the global store pattern:
+the scalar 16-bit BF16 epilogue stores deliver only 8 of 32 bytes per sector.
+The m16n8 accumulator layout has each lane holding two adjacent output columns
+per row (`acc[0,1]` = row0 cols {2l,2l+1}, `acc[2,3]` = row1), so C2 emits one
+32-bit `bfloat162` store per row instead of two scalar stores (tail columns
+keep scalar stores).
+
+Cold-L2 timing (C1+C2 vs baseline):
+
+```text
+gate: baseline 0.7199 ms  candidate 0.6185 ms  (-14.1%)
+down: baseline 0.6615 ms  candidate 0.6062 ms  (-8.4%)
+qkv:  baseline 0.3400 ms  candidate 0.2929 ms  (-13.8%)
+```
+
+NCU (gate): duration 731→696 us, store sector utilization 8→16 bytes, store
+bottleneck ~47%→~33%. Correctness unchanged. (Reaching 32/32 would need a
+wider vector store across the discontiguous row halves — diminishing return,
+left for later.)

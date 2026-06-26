@@ -53,6 +53,13 @@ __device__ __forceinline__ uint32_t to_smem(const void* p) {
     return static_cast<uint32_t>(__cvta_generic_to_shared(p));
 }
 
+// True when the adjacent output column pair {c, c+1} is fully in bounds, so a
+// 32-bit bfloat162 store is valid. n_pair_base is even (=...+2*l) and N is a
+// multiple of 128, so &D[row*N + c] is 4-byte aligned for the vector store.
+__device__ __forceinline__ bool col_pair_ok(int c, int N) {
+    return c + 1 < N;
+}
+
 // BLOCK_K is pinned to 128 (one DeepSeek scale block per K-iteration).
 //  - A: [M, K] row-major FP8 e4m3, act_scale [M, K/128] fp32
 //  - B: [N, K] row-major FP8 e4m3, w_scale [N/128, K/128] fp32
@@ -276,13 +283,23 @@ void fp8_bs_gemm_kernel(
         #pragma unroll
         for (int ni = 0; ni < N_ATOMS_PW; ++ni) {
             int n_pair_base = n_base + warp_id * N_ATOMS_PW * 8 + ni * 8 + 2 * l;
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                int row = (j < 2) ? row0 : row1;
-                int col = n_pair_base + (j & 1);
-                if (row < M && col < N) {
-                    D[row * N + col] = __float2bfloat16(acc[mi][ni][j]);
-                }
+            // acc[0,1] = row0 cols {2l,2l+1}; acc[2,3] = row1 cols {2l,2l+1}.
+            // Emit one 32-bit bfloat162 store per row instead of two scalar
+            // 16-bit stores (NCU's top store-pattern bottleneck after C1).
+            // Tail (odd last column) falls back to scalar stores.
+            if (row0 < M && col_pair_ok(n_pair_base, N)) {
+                *reinterpret_cast<__nv_bfloat162*>(&D[(size_t)row0 * N + n_pair_base]) =
+                    __floats2bfloat162_rn(acc[mi][ni][0], acc[mi][ni][1]);
+            } else if (row0 < M) {
+                if (n_pair_base < N)     D[(size_t)row0 * N + n_pair_base]   = __float2bfloat16(acc[mi][ni][0]);
+                if (n_pair_base + 1 < N) D[(size_t)row0 * N + n_pair_base+1] = __float2bfloat16(acc[mi][ni][1]);
+            }
+            if (row1 < M && col_pair_ok(n_pair_base, N)) {
+                *reinterpret_cast<__nv_bfloat162*>(&D[(size_t)row1 * N + n_pair_base]) =
+                    __floats2bfloat162_rn(acc[mi][ni][2], acc[mi][ni][3]);
+            } else if (row1 < M) {
+                if (n_pair_base < N)     D[(size_t)row1 * N + n_pair_base]   = __float2bfloat16(acc[mi][ni][2]);
+                if (n_pair_base + 1 < N) D[(size_t)row1 * N + n_pair_base+1] = __float2bfloat16(acc[mi][ni][3]);
             }
         }
     }
