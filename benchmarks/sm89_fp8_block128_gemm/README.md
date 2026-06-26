@@ -124,7 +124,25 @@ FA2 vision attn is 29%, untouched on 8B).
   -> fewer regs + less smem -> occupancy headroom the block-128 Qwen3-VL kernel
   does not have. **S=1 is correct for this kernel; the SM120a multi-stage design
   does not port because the block-128 scaling changes the occupancy budget.**
-  (Bench harness keeps `./build.sh --experiment --stages N` for future re-tests.)
+  (Bench harness keeps `./build.sh --experiment --stages N --bm M --bn N --warps W`
+  for future re-tests.)
+  - **Small-tile S=2 (hold occupancy)**: to keep >=3 CTA/SM at S=2 the tile must
+    shrink (`BM+BN<=91`). Tested 32x64 and 32x128: 32x64 S=1 is already +36% vs
+    64x64 S=1 (arithmetic intensity drops), and S=2 over S=1 at 32x64 is a wash
+    (+0.7%) -- the overlap buys nothing once the tile is small. 32x128 S=2 is
+    +23.6%. **Two-sided squeeze: big tile -> S=2 halves occupancy; small tile ->
+    arithmetic-intensity loss dwarfs any S=2 gain. No tile wins.** This is the
+    no-TMA penalty: on Ada a deeper cp.async pipeline always costs either
+    occupancy or intensity.
+  - **CUTLASS won't help on SM89**: the SM120 Qwen3-VL GEMM
+    (`fp8_block128_gemm_cutlass_sm120_bf16out`) wins via `KernelTmaWarpSpecialized
+    BlockwisePingpongSm120` -- TMA + warp specialization + auto multi-stage.
+    Ada (sm89) has **no TMA and no warp-specialized/TMA collective in CUTLASS**
+    (only Sm90+/Sm120). CUTLASS's Ada blockwise (example 94) is the same cp.async
+    `device::GemmBlockwise` class we hand-wrote, and was already benched at
+    ~64 TFLOPS (slower than this kernel) with an activation-scale precision
+    downgrade. The only way to get TMA-style pipelining benefit on sm89 is a
+    hand-written **warp-specialized producer/consumer** kernel (deferred).
 - **C5 smem-staged epilogue** (fully-coalesce global stores 16B->32B/sector):
   NCU on the C4 baseline ranks the global-store pattern as the #1 actionable
   rule (24.5% estimated). C5 stages the output tile in the (now-free) A/B smem

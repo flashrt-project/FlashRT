@@ -377,19 +377,32 @@ void launch_64x64_s1(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* B,
     if (CANDIDATE) {
 #ifdef EXPERIMENT
         // Experiment: multi-stage cp.async pipeline (SM120a-style). CAND_STAGES
-        // overrides the production S=1; the kernel body is staging-generic.
+        // overrides the production S=1; CAND_BM/BN/W let a smaller tile hold
+        // occupancy at S>=2 (S=2 at 64x64 falls to 2 CTA/SM; a 32x64 tile keeps
+        // ~3 CTA/SM). The kernel body is tile/staging-generic.
 #ifndef CAND_STAGES
 #define CAND_STAGES 1
 #endif
-        constexpr int CS = CAND_STAGES;
-        int cand_smem = CS * (BM + BN) * BK
-                      + (BM * SCALE_KTILE + SCALE_KTILE) * (int)sizeof(float);
+#ifndef CAND_BM
+#define CAND_BM 64
+#endif
+#ifndef CAND_BN
+#define CAND_BN 64
+#endif
+#ifndef CAND_W
+#define CAND_W 4
+#endif
+        constexpr int CS = CAND_STAGES, CBM = CAND_BM, CBN = CAND_BN, CW = CAND_W;
+        dim3 cgrid((M + CBM - 1) / CBM, (N + CBN - 1) / CBN, 1);
+        dim3 cblock(CW * 32, 1, 1);
+        int cand_smem = CS * (CBM + CBN) * BK
+                      + (CBM * SCALE_KTILE + SCALE_KTILE) * (int)sizeof(float);
         if (cand_smem > 48 * 1024) {
-            cudaFuncSetAttribute((const void*)&fp8_bs_gemm_kernel_cand<BM, BN, W, CS, MB>,
+            cudaFuncSetAttribute((const void*)&fp8_bs_gemm_kernel_cand<CBM, CBN, CW, CS, MB>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, cand_smem);
         }
-        fp8_bs_gemm_kernel_cand<BM, BN, W, CS, MB>
-            <<<grid, block, cand_smem, stream>>>(A, B, act_scale, w_scale, D, M, N, K);
+        fp8_bs_gemm_kernel_cand<CBM, CBN, CW, CS, MB>
+            <<<cgrid, cblock, cand_smem, stream>>>(A, B, act_scale, w_scale, D, M, N, K);
         return;
 #else
         // No experiment compiled in: candidate == production baseline.

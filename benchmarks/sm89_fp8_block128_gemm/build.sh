@@ -25,6 +25,9 @@ for arg in "$@"; do
   case "$arg" in
     --experiment) EXTRA="${EXTRA} -DEXPERIMENT" ;;
     --stages=*)   EXTRA="${EXTRA} -DCAND_STAGES=${arg#*=}" ;;
+    --bm=*)       EXTRA="${EXTRA} -DCAND_BM=${arg#*=}" ;;
+    --bn=*)       EXTRA="${EXTRA} -DCAND_BN=${arg#*=}" ;;
+    --warps=*)    EXTRA="${EXTRA} -DCAND_W=${arg#*=}" ;;
     [0-9]*)       EXTRA="${EXTRA} -DCAND_STAGES=${arg}" ;;
     *) echo "unknown build arg: $arg" >&2; exit 2 ;;
   esac
