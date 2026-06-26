@@ -887,18 +887,36 @@ endif()
 #     from flash_rt import flash_rt_qwen3_vl_kernels as vlk
 #     vlk.rope_neox_qk_bf16(...)
 if(FLASHRT_BUILD_QWEN3_VL)
-  # The Qwen3-VL path depends on the SM120 Qwen3 NVFP4 / FP8 block-128
-  # kernels, so this module only builds for RTX 5090 (sm_120).
-  if(NOT GPU_ARCH STREQUAL "120")
+  # SM120 (RTX 5090): NVFP4/FP8 ViT helpers. SM89 (Ada): native FP8 block-128
+  # GEMM/GEMV + fused act/norm-quant + QK norm-rope kernels for the official
+  # FP8 Qwen3-VL path. Both build into the same separate module so neither
+  # bloats the central flash_rt_kernels.so.
+  if(NOT (GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "89"))
     message(FATAL_ERROR
-      "FLASHRT_BUILD_QWEN3_VL requires GPU_ARCH=120 (RTX 5090 / sm_120); "
-      "got '${GPU_ARCH}'.")
+      "FLASHRT_BUILD_QWEN3_VL requires GPU_ARCH=120 (RTX 5090 / sm_120) or "
+      "GPU_ARCH=89 (Ada / sm_89); got '${GPU_ARCH}'.")
   endif()
-  pybind11_add_module(flash_rt_qwen3_vl_kernels
+  set(QWEN3_VL_SOURCES
     csrc/qwen3_vl_bindings.cpp
     csrc/kernels/rope_neox_qk_bf16.cu
     csrc/kernels/norm_act_to_fp8_block128.cu
     csrc/kernels/bias_epilogue_bf16.cu)
+  if(GPU_ARCH STREQUAL "89")
+    # Ada has no TMA / no warp-specialized CUTLASS collective, so these are
+    # hand-written cp.async + ldmatrix + block-128 scaling kernels (see
+    # docs/qwen3_vl_fp8_sm89.md for why the SM120a CUTLASS path does not port).
+    list(APPEND QWEN3_VL_SOURCES
+      csrc/gemm/fp8_block128_gemm_mma_sm89.cu
+      csrc/gemm/fp8_gemv_m1_sm89.cu
+      csrc/quantize/fp8_per_token_block_quant.cu
+      csrc/kernels/qwen3_qkv_post_proc.cu
+      csrc/kernels/bf16_matmul_qwen36.cu)
+  endif()
+  pybind11_add_module(flash_rt_qwen3_vl_kernels ${QWEN3_VL_SOURCES})
+  if(GPU_ARCH STREQUAL "89")
+    target_compile_definitions(flash_rt_qwen3_vl_kernels PRIVATE
+      ENABLE_SM89_BLOCK_FP8_GEMM=1)
+  endif()
   set_target_properties(flash_rt_qwen3_vl_kernels PROPERTIES
     CUDA_STANDARD 17
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
@@ -914,6 +932,10 @@ if(FLASHRT_BUILD_QWEN3_VL)
       ${GPU_GENCODE}
     >)
   target_link_libraries(flash_rt_qwen3_vl_kernels PRIVATE CUDA::cudart)
+  if(GPU_ARCH STREQUAL "89")
+    # bf16_matmul_qwen36 (ViT bf16 linears on SM89) uses cuBLASLt.
+    target_link_libraries(flash_rt_qwen3_vl_kernels PRIVATE CUDA::cublasLt)
+  endif()
   install(TARGETS flash_rt_qwen3_vl_kernels
     DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
   message(STATUS "Qwen3-VL pybind module: flash_rt_qwen3_vl_kernels (separate .so)")
@@ -1097,17 +1119,6 @@ if(GPU_ARCH STREQUAL "120")
     $<TARGET_OBJECTS:sm120_fp8_smallm_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE
     ENABLE_CUTLASS_SM120_BLOCK_FP8=1)
-endif()
-
-# Native Ada (sm_89) block-scaled FP8 GEMM for official Qwen3-VL FP8 prefill.
-# Ada has no TMA / no warp-specialized CUTLASS collective, so this is a
-# hand-written cp.async + ldmatrix + block-128 scaling MMA kernel (see
-# docs/qwen3_vl_fp8_sm89.md for why the SM120a CUTLASS path does not port).
-if(GPU_ARCH STREQUAL "89")
-  target_sources(flash_rt_kernels PRIVATE
-    csrc/gemm/fp8_block128_gemm_mma_sm89.cu)
-  target_compile_definitions(flash_rt_kernels PRIVATE
-    ENABLE_SM89_BLOCK_FP8_GEMM=1)
 endif()
 
 # Dedicated M=1 decode GEMV (FP8 + BF16); linked + macro defined wherever the
