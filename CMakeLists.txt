@@ -157,6 +157,11 @@ option(FLASHRT_ENABLE_QWEN35MOE
 # module so flash_rt_kernels.so stays stable; OFF by default.
 option(FLASHRT_BUILD_QWEN3_VL
        "Build Qwen3-VL kernels into a separate flash_rt_qwen3_vl_kernels module" OFF)
+# MelBandRoformer audio source separation kernels (FP8 fused kernels for
+# BF16-in / FP8-out norm, QKV+RoPE, gated attention quant, residual+norm).
+# OFF by default; enable with -DFLASHRT_ENABLE_MELBAND_ROFORMER=ON.
+option(FLASHRT_ENABLE_MELBAND_ROFORMER
+       "Build MelBandRoformer custom fused kernels (BF16/FP8, SM120)" OFF)
 if(FLASHRT_ENABLE_MOTUS)
   message(STATUS "Motus beta kernels: ENABLED")
 else()
@@ -1043,6 +1048,15 @@ if(FLASHRT_ENABLE_QWEN35MOE AND ENABLE_NVFP4)
   message(STATUS "qwen3_5_moe (Nex-N2 / Qwen3.6-35B-A3B) SM120 kernels: ENABLED")
 elseif(FLASHRT_ENABLE_QWEN35MOE)
   message(STATUS "qwen3_5_moe SM120 kernels: SKIPPED (requires Blackwell NVFP4)")
+endif()
+
+# ── MelBandRoformer custom fused kernels (BF16/FP8, gated) ──
+if(FLASHRT_ENABLE_MELBAND_ROFORMER)
+  target_sources(flash_rt_kernels PRIVATE csrc/kernels/mbr_kernels.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_MELBAND_ROFORMER=1)
+  message(STATUS "MelBandRoformer kernels: ENABLED")
+else()
+  message(STATUS "MelBandRoformer kernels: DISABLED")
 endif()
 
 if(ENABLE_SM100_CUTLASS)

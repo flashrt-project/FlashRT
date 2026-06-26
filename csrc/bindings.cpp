@@ -129,6 +129,9 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #endif
 #include "kernels/kernels.h"
 #include "kernels/fusion.cuh"
+#ifdef FLASHRT_HAVE_MELBAND_ROFORMER
+#include "kernels/mbr_kernels.cuh"
+#endif
 #include "kernels/causal_conv1d_qwen36.cuh"
 #include "kernels/linear_attention/gated_delta_wy_bf16.cuh"
 #include "kernels/gated_deltanet_qwen36.cuh"
@@ -732,6 +735,52 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     m.def("gelu_inplace", [](uintptr_t x, int n, uintptr_t stream) {
         gelu_inplace(typed_ptr<__nv_bfloat16>(x), n, to_stream(stream));
     }, py::arg("x"), py::arg("n"), py::arg("stream") = 0);
+
+    // ── MelBandRoformer custom fused kernels (gated) ──
+#ifdef FLASHRT_HAVE_MELBAND_ROFORMER
+    m.def("mbr_qkv_split_rope", [](uintptr_t qkv, uintptr_t cosT, uintptr_t sinT,
+            uintptr_t Q, uintptr_t K, uintptr_t V,
+            int B, int T, int H, int D, uintptr_t stream) {
+        flash_rt::mbr::qkv_split_rope(typed_ptr<__nv_bfloat16>(qkv),
+            typed_ptr<float>(cosT), typed_ptr<float>(sinT),
+            typed_ptr<__nv_bfloat16>(Q), typed_ptr<__nv_bfloat16>(K),
+            typed_ptr<__nv_bfloat16>(V), B, T, H, D, to_stream(stream));
+    }, py::arg("qkv"), py::arg("cosT"), py::arg("sinT"),
+       py::arg("Q"), py::arg("K"), py::arg("V"),
+       py::arg("B"), py::arg("T"), py::arg("H"), py::arg("D"), py::arg("stream") = 0);
+
+    m.def("mbr_gated_attn_quant", [](uintptr_t o, uintptr_t gates, uintptr_t out_fp8,
+            int B, int H, int T, int D, float scale, uintptr_t stream) {
+        flash_rt::mbr::gated_attn_quant(typed_ptr<__nv_bfloat16>(o),
+            typed_ptr<__nv_bfloat16>(gates), typed_ptr<__nv_fp8_e4m3>(out_fp8),
+            B, H, T, D, scale, to_stream(stream));
+    }, py::arg("o"), py::arg("gates"), py::arg("out_fp8"),
+       py::arg("B"), py::arg("H"), py::arg("T"), py::arg("D"),
+       py::arg("scale"), py::arg("stream") = 0);
+
+    m.def("mbr_fp8_dequant_bf16", [](uintptr_t inp, float scale, uintptr_t out, int n, uintptr_t stream) {
+        flash_rt::mbr::fp8_dequant_bf16(typed_ptr<__nv_fp8_e4m3>(inp), scale,
+            typed_ptr<__nv_bfloat16>(out), n, to_stream(stream));
+    }, py::arg("inp"), py::arg("scale"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+
+    m.def("mbr_resadd_rmsnorm_fp8_keepres", [](uintptr_t a, uintptr_t b, uintptr_t gamma,
+            uintptr_t sum_out, uintptr_t norm_fp8, int M, int dim, float scale, uintptr_t stream) {
+        flash_rt::mbr::resadd_rmsnorm_fp8_keepres(typed_ptr<__nv_bfloat16>(a),
+            typed_ptr<__nv_bfloat16>(b), typed_ptr<__nv_bfloat16>(gamma),
+            typed_ptr<__nv_bfloat16>(sum_out), typed_ptr<__nv_fp8_e4m3>(norm_fp8),
+            M, dim, scale, to_stream(stream));
+    }, py::arg("a"), py::arg("b"), py::arg("gamma"),
+       py::arg("sum_out"), py::arg("norm_fp8"),
+       py::arg("M"), py::arg("dim"), py::arg("scale"), py::arg("stream") = 0);
+
+    m.def("mbr_fused_add_rmsnorm_bf16", [](uintptr_t a, uintptr_t b, uintptr_t gamma,
+            uintptr_t out, int M, int dim, uintptr_t stream) {
+        flash_rt::mbr::fused_add_rmsnorm_bf16(typed_ptr<__nv_bfloat16>(a),
+            typed_ptr<__nv_bfloat16>(b), typed_ptr<__nv_bfloat16>(gamma),
+            typed_ptr<__nv_bfloat16>(out), M, dim, to_stream(stream));
+    }, py::arg("a"), py::arg("b"), py::arg("gamma"), py::arg("out"),
+       py::arg("M"), py::arg("dim"), py::arg("stream") = 0);
+#endif // FLASHRT_HAVE_MELBAND_ROFORMER
 
     // G7.11 — fused (bias + GELU(tanh)) in-place on bf16 (M, N) tensor.
     m.def("bias_gelu_inplace_bf16", [](uintptr_t x, uintptr_t bias,
