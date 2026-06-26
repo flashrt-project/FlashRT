@@ -82,9 +82,20 @@ void fp8_bs_gemm_kernel(
     static_assert(BLOCK_N <= 128, "one CTA must fit one N scale block");
     static_assert((BLOCK_N / 8) % NUM_WARPS == 0, "N-atoms split across warps");
 
+    // Stage the per-CTA activation/weight scales in shared memory with a
+    // coalesced load, so the per-k_iter scale fold reads smem instead of
+    // row-strided scalar global loads (NCU's top global-load bottleneck).
+    // Only SCALE_KTILE scale-block columns are staged at a time, re-staged on
+    // each k-tile boundary, so the smem footprint is K-independent (~2 KB) and
+    // occupancy does not regress on large-K shapes (e.g. down, K128=96).
+    constexpr int SCALE_KTILE = 8;
+
     extern __shared__ uint8_t smem_raw[];
     uint8_t* A_smem = smem_raw;
     uint8_t* B_smem = A_smem + STAGES * BLOCK_M * SMEM_K_PAD;
+    float* as_smem = reinterpret_cast<float*>(
+        B_smem + STAGES * BLOCK_N * SMEM_K_PAD);
+    float* ws_smem = as_smem + BLOCK_M * SCALE_KTILE;
 
     const int cta_m = blockIdx.x;
     const int cta_n = blockIdx.y;
@@ -98,6 +109,25 @@ void fp8_bs_gemm_kernel(
     const int h = lane / 4;
 
     const int K128 = K >> 7;                        // # scale blocks along K
+
+    // Coalesced staging of one SCALE_KTILE-wide scale block into smem.
+    auto stage_scales = [&](int kb0) {
+        const int as_total = BLOCK_M * SCALE_KTILE;
+        for (int idx = t; idx < as_total; idx += THREADS) {
+            int r = idx / SCALE_KTILE;
+            int kc = idx - r * SCALE_KTILE;
+            int row = m_base + r;
+            int kb = kb0 + kc;
+            as_smem[idx] = (row < M && kb < K128)
+                ? act_scale[(size_t)row * K128 + kb] : 0.0f;
+        }
+        for (int kc = t; kc < SCALE_KTILE; kc += THREADS) {
+            int kb = kb0 + kc;
+            ws_smem[kc] = (kb < K128)
+                ? w_scale[(size_t)(n_base >> 7) * K128 + kb] : 0.0f;
+        }
+        __syncthreads();
+    };
 
     auto issue_load = [&](int stage, int k_base) {
         constexpr int A_TOTAL_16B = BLOCK_M * BLOCK_K / 16;
@@ -168,6 +198,8 @@ void fp8_bs_gemm_kernel(
 
         // This k_iter is exactly one scale block (kb = k_iter).
         const int kb = k_iter;
+        // Re-stage the next SCALE_KTILE-wide scale block on each tile boundary.
+        if ((kb % SCALE_KTILE) == 0) stage_scales(kb);
         // w_scale is constant across this CTA's BLOCK_N if it fits one
         // 128 block; index per warp's N base to stay correct for BLOCK_N>128.
         float tacc[M_ATOMS][N_ATOMS_PW][4];
@@ -209,17 +241,17 @@ void fp8_bs_gemm_kernel(
         }
 
         // Fold block scales: D += act_scale[row,kb] * w_scale[ncol/128,kb] * tacc
-        // All current SM89 prefill tiles use BLOCK_N <= 128, so a CTA stays
-        // inside one 128-column weight-scale block even for 64-column half
-        // tiles. Load that scale once per K block instead of once per
-        // M/N atom.
-        float ws_cta = w_scale[(size_t)(n_base >> 7) * K128 + kb];
+        // Scales come from the smem stage (coalesced load above), indexed by
+        // the column within the current SCALE_KTILE tile. BLOCK_N <= 128 keeps
+        // the CTA inside one 128-column weight-scale block.
+        int kbt = kb % SCALE_KTILE;
+        float ws_cta = ws_smem[kbt];
         #pragma unroll
         for (int mi = 0; mi < M_ATOMS; ++mi) {
             int row0 = m_base + mi * 16 + h;
             int row1 = row0 + 8;
-            float as0 = (row0 < M) ? act_scale[row0 * K128 + kb] : 0.0f;
-            float as1 = (row1 < M) ? act_scale[row1 * K128 + kb] : 0.0f;
+            float as0 = as_smem[(mi * 16 + h) * SCALE_KTILE + kbt];
+            float as1 = as_smem[(mi * 16 + h + 8) * SCALE_KTILE + kbt];
             #pragma unroll
             for (int ni = 0; ni < N_ATOMS_PW; ++ni) {
                 acc[mi][ni][0] += tacc[mi][ni][0] * (as0 * ws_cta);
@@ -262,11 +294,14 @@ int launch_(const void* A, const void* B, void* D,
             const float* w_scale, cudaStream_t s)
 {
     constexpr int BK = 128;
+    constexpr int SCALE_KTILE = 8;
     int grid_m = (M + BM - 1) / BM;
     int grid_n = (N + BN - 1) / BN;
     dim3 grid(grid_m, grid_n, 1);
     dim3 block(W * 32, 1, 1);
-    int smem_bytes = STAGES * (BM + BN) * (BK + 16);
+    // A/B cp.async stages + staged scale tile (as_smem[BM*8] + ws_smem[8]).
+    int smem_bytes = STAGES * (BM + BN) * (BK + 16)
+                   + (BM * SCALE_KTILE + SCALE_KTILE) * (int)sizeof(float);
     if (smem_bytes > 48 * 1024) {
         cudaFuncSetAttribute(
             (const void*)&fp8_bs_gemm_kernel<BM, BN, W, STAGES, MIN_BLK>,
