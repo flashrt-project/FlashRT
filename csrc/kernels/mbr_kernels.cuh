@@ -6,7 +6,7 @@
 //   2. gated_attn_quant      — sigmoid gate * attn + reshape + FP8 quant
 //   3. fp8_dequant           — FP8 → BF16 dequantize
 //   4. resadd_rmsnorm_fp8    — residual add + RMSNorm → FP8 (keeps residual)
-//   5. fused_add_rmsnorm_bf16 — V70: residual add + RMSNorm (BF16 in/out)
+//   5. fused_add_rmsnorm_bf16 — residual add + RMSNorm (BF16 in/out)
 //
 // Kernels are templated on input dtype T (__nv_bfloat16 / __half).
 // Currently instantiated for __nv_bfloat16 (BF16).
@@ -36,45 +36,8 @@ void resadd_rmsnorm_fp8_keepres(const __nv_bfloat16* a, const __nv_bfloat16* b,
                                 __nv_bfloat16* sum_out, __nv_fp8_e4m3* norm_fp8,
                                 int M, int dim, float scale, cudaStream_t st);
 
-// V70 NEW: Fused residual_add + RMSNorm (BF16 in/out, for final_norm)
 void fused_add_rmsnorm_bf16(const __nv_bfloat16* a, const __nv_bfloat16* b,
                             const __nv_bfloat16* gamma, __nv_bfloat16* out,
                             int M, int dim, cudaStream_t st);
 
-
-
-// V72 NEW: Fused fp8_dequant + tiny Linear (for gates)
-void fp8_dequant_tiny_linear_bf16(
-    const __nv_fp8_e4m3* inp_fp8,
-    float inp_scale,
-    const __nv_bfloat16* weight,
-    const __nv_bfloat16* bias,
-    __nv_bfloat16* out,
-    int M, int D_in, int D_out,
-    cudaStream_t st);
-
-
-
-// V73 ULTIMATE: FP8 GEMM + bias + residual + RMSNorm (all-in-one)
-void fp8_gemm_bias_residual_norm_bf16(
-    const __nv_fp8_e4m3* inp_fp8,
-    const __nv_fp8_e4m3* weight_fp8,
-    float scale_inp,
-    float scale_weight,
-    const __nv_bfloat16* bias,
-    const __nv_bfloat16* residual,
-    const __nv_bfloat16* gamma,
-    __nv_bfloat16* out,
-    int M, int K, int N,
-    cudaStream_t st);
-
-void gemm_output_bias_residual_norm_bf16(
-    const __nv_bfloat16* gemm_out,
-    const __nv_bfloat16* bias,
-    const __nv_bfloat16* residual,
-    const __nv_bfloat16* gamma,
-    __nv_bfloat16* out,
-    int M, int N,
-    cudaStream_t st);
 }}  // namespace flash_rt::mbr
-

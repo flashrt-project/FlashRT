@@ -6,8 +6,6 @@
 //   - QKV layout: (B, S, 3*H*D) = [Q(H*D) | K(H*D) | V(H*D)], each H*D = h0(D)...
 //   - melband RMSNorm = x/||x|| * sqrt(dim) * gamma == x * rms * gamma where
 //     rms = rsqrt(mean(x^2)+eps) (sqrt(dim) folded into rms).
-//
-// V70: Added fused_add_rmsnorm_bf16 to eliminate final_norm overhead
 // ================================================================
 
 #include "mbr_kernels.cuh"
@@ -16,6 +14,7 @@
 namespace flash_rt { namespace mbr {
 
 // ── 1) fused QKV split + interleaved RoPE -> (B,H,S,D) for SDPA ──
+//    One thread per RoPE-pair; packed2<T> for 2-element vectorised I/O.
 template<typename T>
 __global__ void qkv_split_rope_kernel(const T* __restrict__ qkv,
     const float* __restrict__ cosT, const float* __restrict__ sinT,
@@ -82,6 +81,7 @@ __global__ void fp8_dequant_kernel(const __nv_fp8_e4m3* __restrict__ inp,
 }
 
 // ── 4) fused residual_add + RMSNorm -> FP8 (keeps summed residual) ──
+//    Reduction loop uses packed2<T> for 2-element vectorised I/O.
 template<typename T>
 __global__ void resadd_rmsnorm_fp8_keepres_kernel(const T* __restrict__ a,
     const T* __restrict__ b, const T* __restrict__ gamma,
@@ -115,7 +115,7 @@ __global__ void resadd_rmsnorm_fp8_keepres_kernel(const T* __restrict__ a,
     }
 }
 
-// ── 5) V70 NEW: Fused residual_add + RMSNorm (BF16 in/out, for final_norm) ──
+// ── 5) fused residual_add + RMSNorm (BF16 in/out, for final norm) ──
 template<typename T>
 __global__ void fused_add_rmsnorm_bf16_kernel(
     const T* __restrict__ a,        // ff_out
@@ -203,256 +203,12 @@ void resadd_rmsnorm_fp8_keepres(const __nv_bfloat16* a, const __nv_bfloat16* b,
             a, b, gamma, sum_out, norm_fp8, dim, 1e-6f, 1.0f / scale);
 }
 
-// ── V70 NEW Launcher ──
 void fused_add_rmsnorm_bf16(const __nv_bfloat16* a, const __nv_bfloat16* b,
                             const __nv_bfloat16* gamma, __nv_bfloat16* out,
                             int M, int dim, cudaStream_t st) {
     int smem = 256 * sizeof(float) + dim * sizeof(__nv_bfloat16);
     fused_add_rmsnorm_bf16_kernel<__nv_bfloat16><<<M, 256, smem, st>>>(
         a, b, gamma, out, dim, 1e-6f);
-}
-
-// ══════════════════════════════════════════════════════════════════
-// V72 NEW: Fused FP8 dequant + tiny Linear (for gates)  
-// ══════════════════════════════════════════════════════════════════
-
-// Kernel template (inside namespace)
-template<typename T>
-__global__ void fp8_dequant_tiny_linear_kernel(
-    const __nv_fp8_e4m3* __restrict__ inp_fp8,
-    float inp_scale,
-    const T* __restrict__ weight,
-    const T* __restrict__ bias,
-    T* __restrict__ out,
-    int M, int D_in, int D_out) {
-
-    int m = blockIdx.x;
-    if (m >= M) return;
-
-    int tid = threadIdx.x;
-    const __nv_fp8_e4m3* inp_row = inp_fp8 + m * D_in;
-    T* out_row = out + m * D_out;
-
-    for (int d = tid; d < D_out; d += blockDim.x) {
-        float sum = 0.0f;
-        const T* w_row = weight + d * D_in;
-
-        #pragma unroll 8
-        for (int i = 0; i < D_in; i++) {
-            __half h = static_cast<__half>(inp_row[i]);
-            float inp_val = __half2float(h) * inp_scale;
-            float w_val = to_f32<T>(w_row[i]);
-            sum += inp_val * w_val;
-        }
-
-        if (bias) {
-            sum += to_f32<T>(bias[d]);
-        }
-
-        out_row[d] = from_f32<T>(sum);
-    }
-}
-
-// Launcher
-void fp8_dequant_tiny_linear_bf16(
-    const __nv_fp8_e4m3* inp_fp8,
-    float inp_scale,
-    const __nv_bfloat16* weight,
-    const __nv_bfloat16* bias,
-    __nv_bfloat16* out,
-    int M, int D_in, int D_out,
-    cudaStream_t st) {
-
-    fp8_dequant_tiny_linear_kernel<__nv_bfloat16>
-        <<<M, 128, 0, st>>>(
-            inp_fp8, inp_scale, weight, bias, out, M, D_in, D_out);
-}
-
-// ══════════════════════════════════════════════════════════════════
-// V73 ULTIMATE FUSION: FP8 GEMM + bias + residual + RMSNorm
-//
-// 这是终极融合kernel！一次完成5个操作：
-//   1. FP8 GEMM (hfp8 × w2)
-//   2. + bias (w2.bias)
-//   3. + residual (x_new)
-//   4. RMSNorm
-//   5. 输出 BF16
-//
-// 预期节省: 10-15ms (消除所有中间步骤和内存往返)
-// ══════════════════════════════════════════════════════════════════
-
-template<typename T>
-__global__ void fp8_gemm_bias_residual_norm_kernel(
-    const __nv_fp8_e4m3* __restrict__ inp_fp8,      // (M, K) - hfp8
-    const __nv_fp8_e4m3* __restrict__ weight_fp8,   // (N, K) transposed - w2
-    float scale_inp,
-    float scale_weight,
-    const T* __restrict__ bias,                      // (N) - w2.bias
-    const T* __restrict__ residual,                  // (M, N) - x_new
-    const T* __restrict__ gamma,                     // (N) - norm weight
-    T* __restrict__ out,                             // (M, N) - output
-    int M, int K, int N,
-    float eps) {
-
-    // 每个block处理一行
-    int m = blockIdx.x;
-    if (m >= M) return;
-
-    int tid = threadIdx.x;
-    extern __shared__ float shared[];
-
-    const __nv_fp8_e4m3* inp_row = inp_fp8 + m * K;
-    T* out_row = out + m * N;
-    const T* res_row = residual + m * N;
-
-    // Phase 1: GEMM + bias + residual (compute到shared memory)
-    for (int n = tid; n < N; n += blockDim.x) {
-        float sum = 0.0f;
-
-        // Dot product for this output element
-        const __nv_fp8_e4m3* w_col = weight_fp8 + n * K;
-        #pragma unroll 8
-        for (int k = 0; k < K; k++) {
-            __half h_inp = static_cast<__half>(inp_row[k]);
-            __half h_w = static_cast<__half>(w_col[k]);
-            float inp_val = __half2float(h_inp) * scale_inp;
-            float w_val = __half2float(h_w) * scale_weight;
-            sum += inp_val * w_val;
-        }
-
-        // Add bias
-        if (bias) {
-            sum += to_f32<T>(bias[n]);
-        }
-
-        // Add residual
-        sum += to_f32<T>(res_row[n]);
-
-        // Store in shared memory for RMSNorm
-        shared[n] = sum;
-    }
-    __syncthreads();
-
-    // Phase 2: Compute RMS
-    float local_sq = 0.0f;
-    for (int n = tid; n < N; n += blockDim.x) {
-        float val = shared[n];
-        local_sq += val * val;
-    }
-
-    // Reduce across block
-    float rms_sq = block_reduce_sum(local_sq, shared + N) / N + eps;
-    float rms_inv = rsqrtf(rms_sq);
-    __syncthreads();
-
-    // Phase 3: Normalize and write output
-    for (int n = tid; n < N; n += blockDim.x) {
-        float val = shared[n];
-        float normed = val * rms_inv * to_f32<T>(gamma[n]);
-        out_row[n] = from_f32<T>(normed);
-    }
-}
-
-// Launcher
-void fp8_gemm_bias_residual_norm_bf16(
-    const __nv_fp8_e4m3* inp_fp8,
-    const __nv_fp8_e4m3* weight_fp8,
-    float scale_inp,
-    float scale_weight,
-    const __nv_bfloat16* bias,
-    const __nv_bfloat16* residual,
-    const __nv_bfloat16* gamma,
-    __nv_bfloat16* out,
-    int M, int K, int N,
-    cudaStream_t st) {
-
-    // Shared memory: N floats for intermediate + 256 floats for reduction
-    int smem = (N + 256) * sizeof(float);
-
-    fp8_gemm_bias_residual_norm_kernel<__nv_bfloat16>
-        <<<M, 256, smem, st>>>(
-            inp_fp8, weight_fp8, scale_inp, scale_weight,
-            bias, residual, gamma, out, M, K, N, 1e-6f);
-}
-
-
-// ══════════════════════════════════════════════════════════════════
-// V74: 正确的融合策略 - 处理 GEMM 输出，而不是替换 GEMM
-//
-// 输入：PyTorch FP8 GEMM 的输出（BF16）
-// 融合：bias + residual + RMSNorm
-// 这个 kernel 简单且高效，因为不涉及 GEMM 计算！
-// ══════════════════════════════════════════════════════════════════
-
-template<typename T>
-__global__ void gemm_output_bias_residual_norm_kernel(
-    const T* __restrict__ gemm_out,     // (M, N) - GEMM 输出
-    const T* __restrict__ bias,          // (N) - 可选
-    const T* __restrict__ residual,      // (M, N)
-    const T* __restrict__ gamma,         // (N) - norm weight
-    T* __restrict__ out,                 // (M, N)
-    int M, int N,
-    float eps) {
-
-    // 每个 block 处理一行
-    int m = blockIdx.x;
-    if (m >= M) return;
-
-    int tid = threadIdx.x;
-    extern __shared__ float shared[];
-
-    const T* gemm_row = gemm_out + m * N;
-    const T* res_row = residual + m * N;
-    T* out_row = out + m * N;
-
-    // Phase 1: bias + residual，并计算 sum of squares
-    float local_sq = 0.0f;
-    for (int n = tid; n < N; n += blockDim.x) {
-        float val = to_f32<T>(gemm_row[n]);
-
-        // Add bias if present
-        if (bias) {
-            val += to_f32<T>(bias[n]);
-        }
-
-        // Add residual
-        val += to_f32<T>(res_row[n]);
-
-        // Store in shared memory
-        shared[n] = val;
-        local_sq += val * val;
-    }
-    __syncthreads();
-
-    // Phase 2: Compute RMS
-    float rms_sq = block_reduce_sum(local_sq, shared + N) / N + eps;
-    float rms_inv = rsqrtf(rms_sq);
-    __syncthreads();
-
-    // Phase 3: Normalize and write output
-    for (int n = tid; n < N; n += blockDim.x) {
-        float val = shared[n];
-        float normed = val * rms_inv * to_f32<T>(gamma[n]);
-        out_row[n] = from_f32<T>(normed);
-    }
-}
-
-// Launcher
-void gemm_output_bias_residual_norm_bf16(
-    const __nv_bfloat16* gemm_out,
-    const __nv_bfloat16* bias,
-    const __nv_bfloat16* residual,
-    const __nv_bfloat16* gamma,
-    __nv_bfloat16* out,
-    int M, int N,
-    cudaStream_t st) {
-
-    // Shared memory: N floats for intermediate + 256 floats for reduction
-    int smem = (N + 256) * sizeof(float);
-
-    gemm_output_bias_residual_norm_kernel<__nv_bfloat16>
-        <<<M, 256, smem, st>>>(
-            gemm_out, bias, residual, gamma, out, M, N, 1e-6f);
 }
 
 }}  // namespace flash_rt::mbr

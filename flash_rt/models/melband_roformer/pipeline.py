@@ -18,6 +18,10 @@ Kernel surface used (all from ``flash_rt_kernels``):
 * ``mbr_resadd_rmsnorm_fp8_keepres``       -- residual-add + RMSNorm -> FP8
 * ``bias_gelu_quantize_fp8_static_bf16``   -- GeLU(bias) + FP8 quantize
 * ``mbr_fused_add_rmsnorm_bf16``           -- fused residual-add + final RMSNorm
+
+The ``mbr_*`` kernels require ``-DFLASHRT_ENABLE_MELBAND_ROFORMER=ON`` at
+build time. Importing this module does **not** require them; validation is
+deferred to ``MelBandRoformerPipeline.__init__``.
 """
 
 import gc
@@ -30,27 +34,53 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Load the compiled kernel extension the standard FlashRT way, with a
-# fallback to a top-level import when running outside the package.
-try:
-    from flash_rt import flash_rt_kernels as fvk
-except ImportError:
-    import flash_rt_kernels as fvk  # type: ignore
-
 logger = logging.getLogger(__name__)
 
 FP8_MAX = 448.0
-_stream = lambda: int(torch.cuda.current_stream().cuda_stream)
 
-# Kernel alias grouping the MelBandRoformer-specific mbr_* entry points so
-# the patched forward reads as short method calls.
-mk = type("M", (), {
-    "qkv_split_rope": fvk.mbr_qkv_split_rope,
-    "gated_attn_quant": fvk.mbr_gated_attn_quant,
-    "fp8_dequant_bf16": fvk.mbr_fp8_dequant_bf16,
-    "resadd_rmsnorm_fp8_keepres": fvk.mbr_resadd_rmsnorm_fp8_keepres,
-    "fused_add_rmsnorm_bf16": fvk.mbr_fused_add_rmsnorm_bf16,
-})()
+_REQUIRED_MBR_SYMBOLS = (
+    "mbr_qkv_split_rope",
+    "mbr_gated_attn_quant",
+    "mbr_fp8_dequant_bf16",
+    "mbr_resadd_rmsnorm_fp8_keepres",
+    "mbr_fused_add_rmsnorm_bf16",
+)
+
+
+def _load_kernels():
+    """Import ``flash_rt_kernels`` and validate that all ``mbr_*`` symbols exist.
+
+    Returns ``(fvk, mk)`` where ``fvk`` is the raw module and ``mk`` is a
+    lightweight namespace grouping the ``mbr_*`` entry points.
+
+    Raises ``RuntimeError`` if any required symbol is missing (i.e. the
+    build did not include ``-DFLASHRT_ENABLE_MELBAND_ROFORMER=ON``).
+    """
+    try:
+        from flash_rt import flash_rt_kernels as fvk
+    except ImportError:
+        try:
+            import flash_rt_kernels as fvk  # type: ignore
+        except ImportError:
+            raise RuntimeError(
+                "flash_rt_kernels is not available. Build FlashRT with "
+                "'pip install -e .' and ensure the compiled .so is on the path.")
+
+    missing = [s for s in _REQUIRED_MBR_SYMBOLS if not hasattr(fvk, s)]
+    if missing:
+        raise RuntimeError(
+            "MelBandRoformer kernels are not compiled into flash_rt_kernels. "
+            "Rebuild with:  cmake .. -DFLASHRT_ENABLE_MELBAND_ROFORMER=ON && make -j\n"
+            f"Missing symbols: {', '.join(missing)}")
+
+    mk = types.SimpleNamespace(
+        qkv_split_rope=fvk.mbr_qkv_split_rope,
+        gated_attn_quant=fvk.mbr_gated_attn_quant,
+        fp8_dequant_bf16=fvk.mbr_fp8_dequant_bf16,
+        resadd_rmsnorm_fp8_keepres=fvk.mbr_resadd_rmsnorm_fp8_keepres,
+        fused_add_rmsnorm_bf16=fvk.mbr_fused_add_rmsnorm_bf16,
+    )
+    return fvk, mk
 
 
 def _fp8_gemm(a, w_cm, sa, sb):
@@ -84,6 +114,7 @@ class _W:
         self.w = (w.float() / s).clamp(-FP8_MAX, FP8_MAX - 1).to(torch.float8_e4m3fn).t().to(device)
         self.s = torch.tensor([s], dtype=torch.float32, device=device)
         self.out_scale = float(out_scale)
+        self.out_scale_dev = torch.tensor([float(out_scale)], dtype=torch.float32, device=device)
         self.bias = (linear.bias.data.to(torch.bfloat16).contiguous().to(device)
                      if linear.bias is not None else None)
 
@@ -121,12 +152,11 @@ class MelBandRoformerPipeline:
     """
 
     def __init__(self, frontend, max_seq_len=1024, calibration_path=None, model_dir=None):
+        self.fvk, self.mk = _load_kernels()
         self.frontend = frontend
         self.config = frontend.config
         self.device = frontend.device
         self.model = frontend.model
-        # FP8 static per-tensor calibration. An explicit path wins; otherwise
-        # fall back to fp8_calibration.json alongside the checkpoint.
         if calibration_path is None and model_dir is not None:
             calibration_path = os.path.join(model_dir, "fp8_calibration.json")
         self.calib = _load_calib(calibration_path)
@@ -148,19 +178,15 @@ class MelBandRoformerPipeline:
         self.final_norm_gamma = {}
         for nm, mod in list(m.named_modules()):
             if type(mod).__name__ == "Attention" and hasattr(mod, "attend"):
-                base = nm.rsplit(".layers.0.0", 1)[0]
                 self.attn_norm[nm] = _Norm(mod.norm.gamma.detach(), self._s(nm + ".to_qkv"), dev)
                 self.ropes[nm] = _RoPE(mod.rotary_embed, max_seq_len)
             if type(mod).__name__ == "FeedForward":
                 self.ff_norm[nm] = _Norm(mod.net[0].gamma.detach(), self._s(nm + ".net.1"), dev)
             if type(mod).__name__ == "Transformer":
-                # Store final_norm gamma for the fused residual + norm kernel.
                 self.final_norm_gamma[nm] = mod.norm.gamma.detach().to(torch.bfloat16).contiguous().to(dev)
         logger.info("%d FP8 weights, %d attn norms, %d ff norms (before weight deletion)",
                     len(self.W), len(self.attn_norm), len(self.ff_norm))
 
-        # Delete the original weights of the Linear layers we've already
-        # quantized to FP8. Only weights present in self.W are touched.
         deleted_count = 0
         for nm in self.W.keys():
             module = m
@@ -176,6 +202,7 @@ class MelBandRoformerPipeline:
         logger.info("Deleted %d quantized Linear weights, saved ~400 MB", deleted_count)
 
     def _patch(self, max_seq_len):
+        fvk, mk = self.fvk, self.mk
         m, dev = self.model, self.device
         ca = 0
         for nm, mod in list(m.named_modules()):
@@ -197,11 +224,11 @@ class MelBandRoformerPipeline:
             w2 = self.W[fnm + ".net.4"]
             final_gamma = self.final_norm_gamma[nm]
 
-            def make_fwd(anorm, fnorm, wq, wo, gates, heads, rope, D, w1, w2, final_gamma):
+            def make_fwd(fvk, mk, anorm, fnorm, wq, wo, gates, heads, rope, D, w1, w2, final_gamma):
                 def fwd(self, x):
                     Bp, T, dim = x.shape
                     M = Bp * T
-                    st = _stream()
+                    st = int(torch.cuda.current_stream().cuda_stream)
                     # ---- Attention ----
                     nfp8 = torch.empty(M, dim, dtype=torch.float8_e4m3fn, device=x.device)
                     fvk.rms_norm_fp8(int(x.reshape(-1, dim).data_ptr()), int(anorm.gamma.data_ptr()),
@@ -219,7 +246,7 @@ class MelBandRoformerPipeline:
                     HD = heads * D
                     ofp8 = torch.empty(M, HD, dtype=torch.float8_e4m3fn, device=x.device)
                     mk.gated_attn_quant(o.data_ptr(), g.data_ptr(), ofp8.data_ptr(), Bp, heads, T, D, wo.out_scale, st)
-                    attn_out = _fp8_gemm(ofp8, wo.w, torch.tensor([wo.out_scale], dtype=torch.float32, device=x.device), wo.s)
+                    attn_out = _fp8_gemm(ofp8, wo.w, wo.out_scale_dev, wo.s)
                     attn_out = attn_out.view(Bp, T, dim)
                     # ---- FFN ----
                     x_new = torch.empty(M, dim, dtype=torch.bfloat16, device=x.device)
@@ -233,9 +260,9 @@ class MelBandRoformerPipeline:
                     fvk.bias_gelu_quantize_fp8_static_bf16(int(h.data_ptr()),
                                                            int(w1.bias.data_ptr()) if w1.bias is not None else 0,
                                                            int(hfp8.data_ptr()),
-                                                           int(torch.tensor([w2.out_scale], dtype=torch.float32, device=x.device).data_ptr()),
+                                                           int(w2.out_scale_dev.data_ptr()),
                                                            M, Ni, st)
-                    ff_out = _fp8_gemm(hfp8, w2.w, torch.tensor([w2.out_scale], dtype=torch.float32, device=x.device), w2.s)
+                    ff_out = _fp8_gemm(hfp8, w2.w, w2.out_scale_dev, w2.s)
                     if w2.bias is not None:
                         ff_out = ff_out + w2.bias
                     ff_out = ff_out.view(Bp, T, dim)
@@ -249,7 +276,8 @@ class MelBandRoformerPipeline:
                         M, dim, st)
                     return output
                 return fwd
-            mod.forward = types.MethodType(make_fwd(anorm, fnorm, wq, wo, gates, heads, rope, D, w1, w2, final_gamma), mod)
+            mod.forward = types.MethodType(
+                make_fwd(fvk, mk, anorm, fnorm, wq, wo, gates, heads, rope, D, w1, w2, final_gamma), mod)
             ca += 1
         logger.info("patched %d Transformer blocks (memory optimized)", ca)
 
