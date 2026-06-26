@@ -161,6 +161,29 @@ def test_mrope_cos_sin_shape():
     assert cos.shape == (ids.numel(), 64) == sin.shape
 
 
+def test_mrope_cos_sin_cached_matches_direct():
+    grids = [(1, 4, 6)]
+    ids = _image_seq(grids)
+    pos = geo.mrope_position_ids(
+        ids, torch.tensor(grids), None, image_token_id=IMG,
+        video_token_id=VID, vision_start_token_id=VSTART,
+        spatial_merge_size=MERGE)
+    kwargs = {
+        'head_dim': 128,
+        'rope_theta': 5e6,
+        'mrope_section': (24, 20, 20),
+        'device': 'cpu',
+    }
+    cos, sin = geo.mrope_cos_sin(pos, **kwargs)
+    cache = geo.build_mrope_cache(
+        max_pos=int(pos.max()) + 1, head_dim=kwargs['head_dim'],
+        rope_theta=kwargs['rope_theta'], device='cpu')
+    cos_cached, sin_cached = geo.mrope_cos_sin_cached(
+        pos, cache[0], cache[1], mrope_section=kwargs['mrope_section'])
+    assert torch.equal(cos, cos_cached)
+    assert torch.equal(sin, sin_cached)
+
+
 def test_vision_rope_and_pos_embeds_shapes():
     grids = torch.tensor([(1, 4, 6)])
     n_patch = 1 * 4 * 6
@@ -172,3 +195,15 @@ def test_vision_rope_and_pos_embeds_shapes():
         grids, table, num_grid_per_side=48, spatial_merge_size=MERGE,
         device='cpu')
     assert pe.shape == (n_patch, 8)
+
+
+def test_vision_rope_cached_matches_direct():
+    grids = torch.tensor([(1, 4, 6), (1, 6, 4)])
+    cos, sin = geo.vision_rope_cos_sin(
+        grids, head_dim=72, spatial_merge_size=MERGE, device='cpu')
+    cache = geo.build_vision_rope_cache(
+        max_hw=int(grids[:, 1:].max()), head_dim=72, device='cpu')
+    cos_cached, sin_cached = geo.vision_rope_cos_sin_cached(
+        grids, cache[0], cache[1], spatial_merge_size=MERGE)
+    assert torch.equal(cos, cos_cached)
+    assert torch.equal(sin, sin_cached)
