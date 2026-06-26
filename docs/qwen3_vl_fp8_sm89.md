@@ -29,11 +29,14 @@ cmake --build build -j --target flash_rt_kernels flash_rt_fa2 flash_rt_qwen3_vl_
 
 The SM89 Qwen3-VL path uses:
 
-- `flash_rt_kernels` for FP8 block-128 GEMV/GEMM, fused norm/activation
-  quantization, BF16 cuBLASLt matmul wrappers, and Qwen3 postprocessing.
+- `flash_rt_kernels` for generic helpers shared with other RTX paths, such as
+  embedding lookup, RMSNorm, residual add, and the base attention/runtime
+  support.
 - `flash_rt_fa2` for BF16 FlashAttention.
-- `flash_rt_qwen3_vl_kernels` for vision RoPE, layernorm/GELU to FP8, and
-  BF16 bias epilogues.
+- `flash_rt_qwen3_vl_kernels` for Qwen3-VL-specific kernels: SM89 FP8
+  block-128 GEMV/GEMM, fused norm/activation quantization, QK norm/RoPE/KV
+  write, BF16 cuBLASLt ViT matmul wrappers, Qwen3 postprocessing, and the
+  existing SM120 vision RoPE / layernorm-GELU-to-FP8 / BF16 bias epilogues.
 
 ## Runtime Architecture
 
