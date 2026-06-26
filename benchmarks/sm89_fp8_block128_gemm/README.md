@@ -140,3 +140,46 @@ NCU (gate): duration 731→696 us, store sector utilization 8→16 bytes, store
 bottleneck ~47%→~33%. Correctness unchanged. (Reaching 32/32 would need a
 wider vector store across the discontiguous row halves — diminishing return,
 left for later.)
+
+## Rejected: C3 raise occupancy (register/CTA tuning)
+
+After C1+C2, NCU still lists occupancy (~19% est.) as a bottleneck: 124
+registers limit the kernel to 4 CTAs/SM (33.3% theoretical occupancy). Forcing
+`MIN_BLOCKS_PER_SM=5` makes ptxas drop to 96 registers — but it spills (4 B
+spill stores) and runs **slower**: gate candidate 0.6185 → 0.6482 ms (+4.8%).
+
+This confirms the kernel is **latency-bound, not occupancy-bound**: Warp Cycles
+Per Issued Instruction is ~14.7 and DRAM throughput is only ~10%, so the low
+eligible-warp count comes from instruction/dependency latency, not from too few
+resident warps. Cutting registers to add a CTA removes the latency-hiding
+headroom each warp needs. NCU's occupancy estimate is theoretical and does not
+realize here. Do not pursue register/occupancy tuning for this kernel without a
+fundamentally different accumulator design.
+
+## Candidate C4: ldmatrix.x4 + 128B-swizzle smem (structural)
+
+Raw-page NCU on C1+C2 reveals the real top pipe: **LSU at 67.7%** (the highest),
+with **54.7M shared-load instructions** (27% of all instructions) — the scalar
+32-bit `LDS` reads of A/B fragments in the MMA inner loop. Tensor pipe is only
+20.5%, so the kernel is bound by the load/store unit, not compute.
+
+C4 ports the sm120 ldmatrix structure (`fp8_smallM_handtuned_ldmatrix_sm120`):
+a 128B-swizzle smem layout (no `SMEM_K_PAD`) written by swizzled cp.async and
+read by `ldmatrix.sync.aligned.x4.m8n8.shared.b16`, which loads four 8x8 b16
+fragments per lane in one instruction. The MMA uses the sm89 e4m3 variant (the
+sm120 `kind::f8f6f4` is sm120a-only); C1 scale staging and C2 pair-store are
+kept (orthogonal). Build with `-DUSE_LDMATRIX`.
+
+Cold-L2 timing (C4 vs baseline):
+
+```text
+gate: baseline 0.7199 ms  candidate 0.6072 ms  (-15.7%)
+down: baseline 0.6636 ms  candidate 0.5827 ms  (-12.2%)
+qkv:  baseline 0.3400 ms  candidate 0.2866 ms  (-15.7%)
+```
+
+NCU (gate): **LSU pipe 67.7%->29.8%**, **shared-load instructions 54.7M->5.5M
+(-10x)**, Tensor pipe unchanged (~21%). Correctness unchanged (max_rel matches
+baseline exactly — swizzle + ldmatrix addressing is bit-correct). All
+production tiles have an even N_ATOMS_PW, so the ldmatrix pairing constraint
+holds for the whole dispatch table.
