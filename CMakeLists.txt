@@ -126,15 +126,16 @@ endif()
 #
 #   FA2_HDIMS="96;256"         Restrict head_dim instantiations. The
 #                              shipped models (Pi0 / Pi0.5 / GROOT) only
-#                              need {96, 256}; 128 is reserved for future
-#                              DiT-style models. Default "96;128;256".
+#                              need {96, 256}; 128 is for Qwen3 prefill;
+#                              64 is Qwen3-VL 2B vision full attention.
+#                              Default "64;96;128;256".
 #
 #   FA2_DTYPES="fp16"          Drop bf16 if you only run fp16 models (Pi0).
 #                              pi0.5 / groot need bf16. Default "fp16;bf16".
 set(FA2_ARCH_NATIVE_ONLY OFF CACHE BOOL
     "Only build FA2 for the detected arch (no sm_80/PTX fallback). ~66% faster build.")
-set(FA2_HDIMS "96;128;256" CACHE STRING
-    "Semicolon-separated FA2 head_dim instantiations to build. Shipped models use 96 and 256.")
+set(FA2_HDIMS "64;96;128;256" CACHE STRING
+    "Semicolon-separated FA2 head_dim instantiations to build. Qwen3-VL 2B vision uses 64; older paths use 96/256.")
 set(FA2_DTYPES "fp16;bf16" CACHE STRING
     "Semicolon-separated FA2 dtype instantiations to build. Pi0 uses fp16; pi0.5/groot use bf16.")
 
@@ -699,8 +700,8 @@ if(ENABLE_FA2)
   set(FA2_BUILT_HDIMS "")
   set(FA2_BUILT_DTYPES "")
   foreach(_hd IN LISTS FA2_HDIMS)
-    if(NOT _hd MATCHES "^(96|128|256)$")
-      message(FATAL_ERROR "FA2_HDIMS entry '${_hd}' not supported. Valid: 96, 128, 256.")
+    if(NOT _hd MATCHES "^(64|96|128|256)$")
+      message(FATAL_ERROR "FA2_HDIMS entry '${_hd}' not supported. Valid: 64, 96, 128, 256.")
     endif()
     list(APPEND FA2_BUILT_HDIMS ${_hd})
     foreach(_dt IN LISTS FA2_DTYPES)
@@ -709,8 +710,15 @@ if(ENABLE_FA2)
       endif()
       list(APPEND FA2_SRCS
         ${FA2_SRC_ROOT}/flash_fwd_hdim${_hd}_${_dt}_sm80.cu
-        ${FA2_SRC_ROOT}/flash_fwd_split_hdim${_hd}_${_dt}_sm80.cu
       )
+      # hdim64 (Qwen3-VL 2B vision full attention) always takes the no-split
+      # path, so skip its split-KV specialization — that variant is unused
+      # and one of the most expensive objects for ptxas.
+      if(NOT _hd STREQUAL "64")
+        list(APPEND FA2_SRCS
+          ${FA2_SRC_ROOT}/flash_fwd_split_hdim${_hd}_${_dt}_sm80.cu
+        )
+      endif()
     endforeach()
   endforeach()
   foreach(_dt IN LISTS FA2_DTYPES)

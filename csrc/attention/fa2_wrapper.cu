@@ -192,7 +192,15 @@ static void dispatch_hdim(int head_dim, int num_splits,
         }
     };
     (void)do_dispatch;  // silence unused warning when all hdims are gated out
-    if (head_dim > 0 && head_dim <= 96) {
+    if (head_dim > 0 && head_dim <= 64 && num_splits <= 1) {
+        // hd64 (Qwen3-VL 2B vision) builds only the no-split path; any
+        // split-KV request falls through to the hd96 bucket below.
+#ifdef FA2_HAS_HDIM_64
+        do_dispatch(std::integral_constant<int, 64>{});
+#else
+        fa2_not_built("head_dim<=64", head_dim);
+#endif
+    } else if (head_dim > 0 && head_dim <= 96) {
 #ifdef FA2_HAS_HDIM_96
         do_dispatch(std::integral_constant<int, 96>{});
 #else
@@ -213,7 +221,7 @@ static void dispatch_hdim(int head_dim, int num_splits,
     } else {
         fprintf(stderr,
             "fvk_attention_fa2_fwd: unsupported head_dim=%d "
-            "(supported buckets: <=96, <=128, <=256).\n", head_dim);
+            "(supported buckets: <=64, <=96, <=128, <=256).\n", head_dim);
         std::abort();
     }
 }
