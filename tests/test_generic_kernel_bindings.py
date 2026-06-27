@@ -57,6 +57,11 @@ def test_legacy_embedding_binding_exists():
 
 def test_legacy_cublaslt_binding_exists_on_vl_module():
     m = _import_vl_kernels()
+    if not hasattr(m, "fp8_block128_gemm_blockscaled_sm89_bf16out"):
+        pytest.skip(
+            "bf16_matmul_cublaslt_bf16 is part of the SM89 Qwen3-VL module; "
+            "SM120 builds use the SM120 path instead"
+        )
     assert hasattr(m, "bf16_matmul_cublaslt_bf16")
 
 
