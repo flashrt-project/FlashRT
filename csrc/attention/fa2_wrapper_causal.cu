@@ -180,13 +180,20 @@ extern "C" void fvk_attention_fa2_fwd_bf16_causal(
     int o_batch_stride, int o_row_stride, int o_head_stride,
     float softmax_scale, int num_sms, cudaStream_t stream)
 {
-    if (head_dim != 128 && head_dim != 256) {
+    if ((head_dim != 128)
+#ifdef FA2_HAS_HDIM_256
+        && head_dim != 256
+#endif
+        ) {
+#ifdef FA2_HAS_HDIM_256
         fprintf(stderr,
             "fvk_attention_fa2_fwd_bf16_causal: head_dim=%d not built. "
-            "Only head_dim=128 and 256 are currently instantiated for the causal "
-            "path. Add a new file under csrc/attention/fa2_causal_inst/ "
-            "and extend the dispatch in fa2_wrapper_causal.cu to support "
-            "additional shapes.\n", head_dim);
+            "Only head_dim=128 and 256 are currently instantiated.\n", head_dim);
+#else
+        fprintf(stderr,
+            "fvk_attention_fa2_fwd_bf16_causal: head_dim=%d not built. "
+            "Only head_dim=128 is currently instantiated.\n", head_dim);
+#endif
         std::abort();
     }
 
@@ -208,9 +215,19 @@ extern "C" void fvk_attention_fa2_fwd_bf16_causal(
         FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, true>(params, stream);
     } else if (head_dim == 128) {
         FLASH_NAMESPACE::run_mha_fwd_<cutlass::bfloat16_t, 128, true>(params, stream);
-    } else if (num_splits > 1) {
+    }
+#ifdef FA2_HAS_HDIM_256
+    else if (num_splits > 1) {
         FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, true>(params, stream);
     } else {
         FLASH_NAMESPACE::run_mha_fwd_<cutlass::bfloat16_t, 256, true>(params, stream);
     }
+#else
+    else {
+        fprintf(stderr,
+            "fvk_attention_fa2_fwd_bf16_causal: head_dim=%d not built "
+            "(hdim=256 disabled at compile time).\n", head_dim);
+        std::abort();
+    }
+#endif
 }
