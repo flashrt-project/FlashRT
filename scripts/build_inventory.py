@@ -133,6 +133,10 @@ def object_libraries(build_dir: Path) -> dict[str, list[str]]:
     ``$<TARGET_OBJECTS:...>``; their TUs never appear in a consuming module's
     DependInfo.cmake. We read each ``<name>_obj.dir/DependInfo.cmake`` directly,
     so this is generator-agnostic like ``target_sources``.
+
+    Discovery relies on the repo convention that every CMake object library is
+    named ``<something>_obj`` (verified against CMakeLists.txt). An object
+    library that breaks this convention would be missed here.
     """
     cmf = build_dir / "CMakeFiles"
     libs: dict[str, list[str]] = {}
@@ -155,6 +159,8 @@ def linked_object_libs(build_dir: Path, target: str) -> set[str] | None:
     ``build.ninja``. Both name the ``<obj>.dir/...`` object files on the link
     line. Returns None when no manifest is found (attribution unavailable), so
     callers can still report object-lib TUs globally without false attribution.
+    An empty set means the manifest was found but the target links no object
+    library (distinct from None = no manifest).
     """
     link_txt = build_dir / "CMakeFiles" / f"{target}.dir" / "link.txt"
     if link_txt.is_file():
@@ -162,13 +168,19 @@ def linked_object_libs(build_dir: Path, target: str) -> set[str] | None:
     ninja = build_dir / "build.ninja"
     if ninja.is_file():
         # Find the build statement that produces this target's .so and read the
-        # object files listed as its inputs.
+        # object files listed as its inputs. Match the module filename
+        # (``<target>.cpython-...so``) rather than a bare substring so a longer
+        # target name that contains this one cannot be mis-attributed.
         text = ninja.read_text(errors="replace")
         found: set[str] = set()
+        seen_build_edge = False
         for line in text.splitlines():
-            if line.startswith("build ") and target in line and ".so" in line:
+            if line.startswith("build ") and f"{target}.cpython" in line and ".so" in line:
+                seen_build_edge = True
                 found |= set(_OBJ_DIR_RE.findall(line))
-        return found or None
+        # Empty set when the build edge was found but lists no object libs;
+        # None only when no build edge for this target exists at all.
+        return found if seen_build_edge else None
     return None
 
 
