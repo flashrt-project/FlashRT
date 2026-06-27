@@ -1088,17 +1088,9 @@ pybind11_add_module(flash_rt_kernels
   csrc/quantize/qkv_split_norm_rope_bf16.cu
   csrc/quantize/rope_apply_bf16.cu
   csrc/gemm/fp8_block128_gemm.cu
-  csrc/kernels/causal_conv1d_qwen36.cu
-  csrc/kernels/linear_attention/gated_delta_wy_bf16.cu
-  csrc/kernels/linear_attention/gated_delta_wy_bf16_mma_fla.cu
-  csrc/kernels/linear_attention/gated_delta_wy_output_o_mma_fla.cu
-  csrc/kernels/linear_attention/gated_delta_wy_recompute_wu_mma_fla.cu
-  csrc/kernels/gated_deltanet_qwen36.cu
-  csrc/kernels/rms_norm_gated_silu_qwen36.cu
   csrc/kernels/silu_mul_qwen36.cu
   csrc/kernels/silu_mul_to_nvfp4_swizzled.cu
   csrc/kernels/embedding_lookup_bf16.cu
-  csrc/kernels/qwen36_misc.cu
   # qwen3_5_moe-family RTX SM120 kernels are NOT listed here -- they are
   # gated into the module below (FLASHRT_ENABLE_QWEN35MOE), so SM89/87/110
   # and non-Nex-N2 builds never compile them. See the gated block after the
@@ -1110,8 +1102,6 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/fp4_w4a4_mma_warpsplit_mrows_sm120.cu
   csrc/kernels/bf16_matvec_qwen36.cu
   csrc/kernels/bf16_matmul_bf16.cu
-  csrc/kernels/bf16_matmul_qwen36.cu
-  csrc/kernels/bf16_matmul_qwen36_thor.cu
   csrc/attention/fmha_dispatch.cu
   csrc/bindings.cpp
 )
@@ -1144,6 +1134,42 @@ if(NOT FLASHRT_SLIM_BUILD)
   message(STATUS "Motus VAE FP8 quantize kernels: ENABLED")
 else()
   message(STATUS "Motus VAE FP8 quantize kernels: SKIPPED (slim build)")
+endif()
+
+# ── Qwen3.6 / linear-attention kernels (slim-gated) ──
+# These 10 TUs are used only by the Qwen3.6 family: Qwen3.6 dense/thor/spark
+# and Nex-N2 (the Qwen3.6-35B-A3B MoE). They cover causal-conv1d, the gated
+# DeltaNet / linear-attention WY stack, the Qwen3.6 fused RMSNorm-gated-SiLU,
+# Qwen3.6 misc helpers (partial-rope / argmax / tq-prepare / spec-accept /
+# legacy embedding wrapper), and the Qwen3.6 bf16 matmul (AB96 + legacy
+# wrapper + Thor MTP). A slim VLA build (Qwen3-VL etc.) needs none of them.
+# Their bindings in csrc/bindings.cpp are guarded by FLASHRT_HAVE_QWEN36_KERNELS
+# so they drop in lockstep (a gated source whose binding stayed compiled would
+# fail to link).
+#
+# NOTE: silu_mul_qwen36.cu and bf16_matvec_qwen36.cu are intentionally NOT in
+# this group — silu_mul_qwen36_bf16 is shared (Qwen3-dense / Higgs / Cosmos3)
+# and bf16_matvec_qwen36_bf16 is used by Higgs, so they stay always compiled.
+# The neutral helpers bf16_matmul_bf16.cu / embedding_lookup_bf16.cu also stay
+# (#112); only the legacy wrappers bf16_matmul_qwen36_bf16 /
+# qwen36_embedding_lookup_bf16 live inside the gated TUs. Do not fold the two
+# shared files in without splitting their shared symbols out.
+if(NOT FLASHRT_SLIM_BUILD)
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/causal_conv1d_qwen36.cu
+    csrc/kernels/linear_attention/gated_delta_wy_bf16.cu
+    csrc/kernels/linear_attention/gated_delta_wy_bf16_mma_fla.cu
+    csrc/kernels/linear_attention/gated_delta_wy_output_o_mma_fla.cu
+    csrc/kernels/linear_attention/gated_delta_wy_recompute_wu_mma_fla.cu
+    csrc/kernels/gated_deltanet_qwen36.cu
+    csrc/kernels/rms_norm_gated_silu_qwen36.cu
+    csrc/kernels/qwen36_misc.cu
+    csrc/kernels/bf16_matmul_qwen36.cu
+    csrc/kernels/bf16_matmul_qwen36_thor.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_QWEN36_KERNELS=1)
+  message(STATUS "Qwen3.6 / linear-attention kernels: ENABLED")
+else()
+  message(STATUS "Qwen3.6 / linear-attention kernels: SKIPPED (slim build)")
 endif()
 
 # ── qwen3_5_moe family (Nex-N2 / Qwen3.6-35B-A3B) SM120 kernels ──

@@ -132,15 +132,21 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #ifdef FLASHRT_HAVE_MELBAND_ROFORMER
 #include "kernels/mbr_kernels.cuh"
 #endif
+#ifdef FLASHRT_HAVE_QWEN36_KERNELS
 #include "kernels/causal_conv1d_qwen36.cuh"
 #include "kernels/linear_attention/gated_delta_wy_bf16.cuh"
 #include "kernels/gated_deltanet_qwen36.cuh"
+#endif
 #include "kernels/qwen3_qkv_post_proc.cuh"
 #include "kernels/silu_mul_to_nvfp4_swizzled.cuh"
+#ifdef FLASHRT_HAVE_QWEN36_KERNELS
 #include "kernels/rms_norm_gated_silu_qwen36.cuh"
+#endif
 #include "kernels/silu_mul_qwen36.cuh"
 #include "kernels/embedding_lookup_bf16.cuh"
+#ifdef FLASHRT_HAVE_QWEN36_KERNELS
 #include "kernels/qwen36_misc.cuh"
+#endif
 #ifdef FLASHRT_HAVE_QWEN35MOE
 #include "kernels/qwen35moe_layout.cuh"
 #include "kernels/moe_grouped_gemv_sm120.cuh"
@@ -159,8 +165,10 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #endif  // FLASHRT_HAVE_QWEN35MOE
 #include "kernels/bf16_matvec_qwen36.cuh"
 #include "kernels/bf16_matmul_bf16.cuh"
+#ifdef FLASHRT_HAVE_QWEN36_KERNELS
 #include "kernels/bf16_matmul_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36_thor.cuh"
+#endif
 #include "kernels/fp4_w4a4_matvec_sm120.cuh"
 #include "kernels/fp4_w4a4_mma_sm120.cuh"
 #include "kernels/fp4_w4a4_mma_warpsplit_sm120.cuh"
@@ -4076,6 +4084,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("scratch_A_bf16"), py::arg("scratch_B_bf16"),
         py::arg("stream") = 0);
 
+#ifdef FLASHRT_HAVE_QWEN36_KERNELS
     // Phase 3.2 — causal_conv1d for Qwen3.6 linear-attention. SiLU
     // fused into the epilogue. Two variants for prefill / decode.
     m.def("causal_conv1d_qwen36_bf16",
@@ -4173,6 +4182,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("q16"), py::arg("k16"), py::arg("v48"), py::arg("state"),
         py::arg("B"), py::arg("S"), py::arg("conv_dim"), py::arg("k"),
         py::arg("apply_silu") = true, py::arg("stream") = 0);
+#endif  // FLASHRT_HAVE_QWEN36_KERNELS (causal_conv1d_qwen36)
 
     // Phase 4.4 — stream-invariant bf16 matvec for Qwen3.6 (replaces F.linear
     // / cuBLASLt for the small in_proj_a/b and the lm_head bf16 GEMM whose
@@ -4211,6 +4221,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("x"), py::arg("W"), py::arg("out"),
         py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
 
+#ifdef FLASHRT_HAVE_QWEN36_KERNELS
     m.def("bf16_matmul_qwen36_bf16",
         [](uintptr_t x, uintptr_t W, uintptr_t out,
            int M, int N, int K, uintptr_t stream) {
@@ -4286,6 +4297,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         },
         py::arg("x"), py::arg("W_ab"), py::arg("out_ab"),
         py::arg("M"), py::arg("stream") = 0);
+#endif  // FLASHRT_HAVE_QWEN36_KERNELS (bf16_matmul_qwen36 legacy + thor + ab96)
 
     // Neutral name for the model-neutral bf16 embedding lookup (#112). The
     // legacy qwen36_embedding_lookup_bf16 below is a thin wrapper over this
@@ -4303,6 +4315,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("token_ids"), py::arg("embed"), py::arg("out"),
         py::arg("rows"), py::arg("hidden"), py::arg("stream") = 0);
 
+#ifdef FLASHRT_HAVE_QWEN36_KERNELS
     m.def("qwen36_embedding_lookup_bf16",
         [](uintptr_t token_ids, uintptr_t embed, uintptr_t out,
            int rows, int hidden, uintptr_t stream) {
@@ -4395,6 +4408,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("accept_n"), py::arg("partial_vals"),
         py::arg("partial_idx"), py::arg("rows"), py::arg("vocab"),
         py::arg("spec_k"), py::arg("parts"), py::arg("stream") = 0);
+#endif  // FLASHRT_HAVE_QWEN36_KERNELS (qwen36_misc)
 
     // Phase 4.3 — SiLU-gate elementwise multiply for Qwen3.6 SwiGLU MLP.
     // out[i] = silu(gate[i]) * up[i], bf16 in/out, fp32 internal.
@@ -4424,6 +4438,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("n"), py::arg("stream") = 0);
 
     // Fused RMSNorm + weight + silu(gate) for Qwen3.6 linear-attn output.
+#ifdef FLASHRT_HAVE_QWEN36_KERNELS
     m.def("rms_norm_gated_silu_qwen36_bf16",
         [](uintptr_t x, uintptr_t gate, uintptr_t weight, uintptr_t out,
            int M, int dim, float eps, uintptr_t stream) {
@@ -4573,6 +4588,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         },
         py::arg("q_proj"), py::arg("q_pre"), py::arg("gate"),
         py::arg("S"), py::arg("stream") = 0);
+#endif  // FLASHRT_HAVE_QWEN36_KERNELS (gated_deltanet_qwen36 part 1)
 
 #ifdef FLASHRT_HAVE_QWEN35MOE
     m.def("qwen35moe_lin_split_qkv_broadcast_bf16",
@@ -4775,6 +4791,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("stream") = 0);
 #endif  // FLASHRT_HAVE_QWEN35MOE
 
+#ifdef FLASHRT_HAVE_QWEN36_KERNELS
     m.def("qwen36_gdn_gating_bf16",
         [](uintptr_t a, uintptr_t b,
            uintptr_t neg_exp_A_log, uintptr_t dt_bias,
@@ -5513,6 +5530,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("q16_l2"), py::arg("k16_l2"), py::arg("v_new"),
         py::arg("h0"), py::arg("g_cumsum"), py::arg("out"),
         py::arg("S"), py::arg("stream") = 0);
+#endif  // FLASHRT_HAVE_QWEN36_KERNELS (gated_deltanet + linear_attention WY)
 
 #ifdef ENABLE_CUTLASS_SM120_BLOCK_FP8
     // Path B: native CUTLASS block-128 FP8 GEMM on SM120a — no
