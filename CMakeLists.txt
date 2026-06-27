@@ -940,7 +940,7 @@ if(FLASHRT_BUILD_QWEN3_VL)
     >)
   target_link_libraries(flash_rt_qwen3_vl_kernels PRIVATE CUDA::cudart)
   if(GPU_ARCH STREQUAL "89")
-    # bf16_matmul_qwen36 (ViT bf16 linears on SM89) uses cuBLASLt.
+    # bf16_matmul_bf16 (ViT bf16 linears on SM89) uses cuBLASLt.
     target_link_libraries(flash_rt_qwen3_vl_kernels PRIVATE CUDA::cublasLt)
   endif()
   install(TARGETS flash_rt_qwen3_vl_kernels
