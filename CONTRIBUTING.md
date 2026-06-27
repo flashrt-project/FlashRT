@@ -281,6 +281,9 @@ Open the pull request from:
 
 Before requesting review:
 
+- Read the full public review standard in
+  [`docs/pr_review_checklist.md`](docs/pr_review_checklist.md) for the
+  long-term maintenance rules reviewers will apply.
 - Rebase or fast-forward onto the latest `main`.
 - Keep the change scoped to one behavior or model path.
 - Update docs when the user-facing API, build flow, supported hardware, or
