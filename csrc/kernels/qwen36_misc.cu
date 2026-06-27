@@ -1,5 +1,7 @@
 #include "qwen36_misc.cuh"
 
+#include "embedding_lookup_bf16.cuh"
+
 #include <limits>
 
 namespace flash_rt::kernels {
@@ -7,21 +9,6 @@ namespace flash_rt::kernels {
 namespace {
 
 constexpr int kThreads = 256;
-
-__global__ void embedding_lookup_bf16_kernel(
-    const int64_t* __restrict__ token_ids,
-    const __nv_bfloat16* __restrict__ embed,
-    __nv_bfloat16* __restrict__ out,
-    int rows,
-    int hidden)
-{
-  const int row = blockIdx.y;
-  if (row >= rows) return;
-  const int col = blockIdx.x * blockDim.x + threadIdx.x;
-  if (col >= hidden) return;
-  const int64_t tok = token_ids[row];
-  out[row * hidden + col] = embed[tok * hidden + col];
-}
 
 __device__ __forceinline__ __nv_bfloat16 partial_rope_value(
     const __nv_bfloat16* __restrict__ x,
@@ -256,6 +243,10 @@ __global__ void spec_accept_kernel(
 
 }  // namespace
 
+// Thin legacy wrapper: qwen36_embedding_lookup_bf16 is the historical name for
+// the model-neutral embedding lookup, kept so Qwen3.6 call sites and the
+// existing binding stay unchanged. The implementation lives in
+// embedding_lookup_bf16.cu.
 void qwen36_embedding_lookup_bf16(
     const int64_t* token_ids,
     const __nv_bfloat16* embed,
@@ -264,11 +255,7 @@ void qwen36_embedding_lookup_bf16(
     int hidden,
     cudaStream_t stream)
 {
-  if (rows <= 0 || hidden <= 0) return;
-  const dim3 block(kThreads);
-  const dim3 grid((hidden + kThreads - 1) / kThreads, rows);
-  embedding_lookup_bf16_kernel<<<grid, block, 0, stream>>>(
-      token_ids, embed, out, rows, hidden);
+  embedding_lookup_bf16(token_ids, embed, out, rows, hidden, stream);
 }
 
 void qwen36_partial_rope_qk_bf16(

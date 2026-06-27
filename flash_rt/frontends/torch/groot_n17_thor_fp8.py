@@ -509,7 +509,7 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
                 self._embed_tokens_bf16 = self._embed_tokens_w.to(_BF16).contiguous()
             ids = K(aux["input_ids"].reshape(-1).to(torch.int64).to(dev).contiguous())
             emb_bf16 = K(torch.empty(Se, 2048, dtype=_BF16, device=dev))
-            fvk.qwen36_embedding_lookup_bf16(ids.data_ptr(),
+            fvk.embedding_lookup_bf16(ids.data_ptr(),
                                              self._embed_tokens_bf16.data_ptr(),
                                              emb_bf16.data_ptr(), Se, 2048, 0)
             self._kbb_llm_base = emb_bf16.to(_FP16).contiguous()

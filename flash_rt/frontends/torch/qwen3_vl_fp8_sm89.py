@@ -102,7 +102,7 @@ class Qwen3VlFp8Sm89TextFrontend:
             'qwen3_qk_norm_rope_kvwrite_batched_bf16',
             'qwen3_q_norm_rope_qstage_bf16',
             'qwen3_k_norm_rope_kvwrite_bf16',
-            'qwen36_embedding_lookup_bf16',
+            'embedding_lookup_bf16',
             'bf16_matmul_bf16',
             'rms_norm',
             'residual_add',
@@ -677,7 +677,7 @@ class Qwen3VlFp8Sm89TextFrontend:
         if token_id.ndim == 1:
             token_id = token_id.view(1, 1)
         h = self._h_a[:1]
-        self._fvk.qwen36_embedding_lookup_bf16(
+        self._fvk.embedding_lookup_bf16(
             token_id.view(-1).data_ptr(),
             int(self._weights.ptrs['embed_w']),
             h.data_ptr(),

@@ -1071,6 +1071,7 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/rms_norm_gated_silu_qwen36.cu
   csrc/kernels/silu_mul_qwen36.cu
   csrc/kernels/silu_mul_to_nvfp4_swizzled.cu
+  csrc/kernels/embedding_lookup_bf16.cu
   csrc/kernels/qwen36_misc.cu
   # qwen3_5_moe-family RTX SM120 kernels are NOT listed here -- they are
   # gated into the module below (FLASHRT_ENABLE_QWEN35MOE), so SM89/87/110

@@ -1437,10 +1437,10 @@ class GrootN17TorchFrontendThor:
         S = self.Se
         nt, ni = self._ck_nt, self._ck_ni
         K.cast_fp16_to_bf16(self._ck_bb_src.data_ptr(), self._ck_bb.data_ptr(), S * 2048, s)
-        K.qwen36_embedding_lookup_bf16(
+        K.embedding_lookup_bf16(
             self._ck_text_idx.data_ptr(), self._ck_bb.data_ptr(),
             self._ck_text_src.data_ptr(), nt, 2048, s)
-        K.qwen36_embedding_lookup_bf16(
+        K.embedding_lookup_bf16(
             self._ck_image_idx.data_ptr(), self._ck_bb.data_ptr(),
             self._ck_image_src.data_ptr(), ni, 2048, s)
         for j in range(16):
