@@ -138,7 +138,9 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/gated_deltanet_qwen36.cuh"
 #endif
 #include "kernels/qwen3_qkv_post_proc.cuh"
+#ifdef FLASHRT_HAVE_NVFP4_SWIZZLE
 #include "kernels/silu_mul_to_nvfp4_swizzled.cuh"
+#endif
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS
 #include "kernels/rms_norm_gated_silu_qwen36.cuh"
 #endif
@@ -174,8 +176,10 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/fp4_w4a4_mma_warpsplit_sm120.cuh"
 #include "kernels/fp4_w4a4_mma_warpsplit_mrows_sm120.cuh"
 #include "quantize/fp8_block128_dequant.cuh"
+#ifdef FLASHRT_HAVE_NVFP4_SWIZZLE
 #include "quantize/fp8_block128_to_nvfp4_swizzled.cuh"
 #include "quantize/bf16_weight_to_nvfp4_swizzled.cuh"
+#endif
 #include "quantize/fp8_per_token_block_quant.cuh"
 #include "quantize/bias_gelu_quantize_fp8.cuh"
 #ifdef FLASHRT_HAVE_MOTUS_VAE_FP8
@@ -2396,6 +2400,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     // out_global_scale (1 fp32). out_global_scale is to be passed as the GEMM
     // alpha (= act_global * w_global; for per-token activation quant
     // act_global = 1 so alpha = w_global = out_global_scale).
+#ifdef FLASHRT_HAVE_NVFP4_SWIZZLE
     m.def("fp8_block128_to_nvfp4_swizzled_bf16",
         [](uintptr_t w_fp8, uintptr_t w_block_scale_fp32,
            uintptr_t nvfp4_packed, uintptr_t nvfp4_sf_swizzled,
@@ -2437,6 +2442,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("nvfp4_packed"), py::arg("nvfp4_sf_swizzled"),
         py::arg("scratch_global_amax"), py::arg("out_global_scale"),
         py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+#endif  // FLASHRT_HAVE_NVFP4_SWIZZLE (fp8/bf16 weight -> nvfp4 swizzled)
 
     // ── TurboQuant unpack (Phase 3A B9 step S3) ───────────────────────
     // Packed B8 (4-bit K idx + 1-bit qjl + 4-bit V idx) → 3 BF16 outputs:
@@ -6451,6 +6457,7 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
         py::arg("n_q_heads"), py::arg("eps") = 1e-6f,
         py::arg("stream") = 0);
 
+#ifdef FLASHRT_HAVE_NVFP4_SWIZZLE
     m.def("silu_mul_to_nvfp4_swizzled_bf16",
         [](uintptr_t gate, uintptr_t up,
            uintptr_t packed, uintptr_t sf_swz,
@@ -6502,6 +6509,7 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
         py::arg("merged_gate_up"),
         py::arg("packed"), py::arg("sf_swz"),
         py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
+#endif  // FLASHRT_HAVE_NVFP4_SWIZZLE (silu_mul_to_nvfp4_swizzled)
 
     m.def("qwen3_k_norm_rope_kvwrite_bf16",
         [](uintptr_t k_pre, uintptr_t v_pre, uintptr_t k_norm_w,

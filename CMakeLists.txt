@@ -1077,8 +1077,6 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/dit_bf16.cu
   csrc/kernels/attention_dit_bf16.cu
   csrc/quantize/fp8_block128_dequant.cu
-  csrc/quantize/fp8_block128_to_nvfp4_swizzled.cu
-  csrc/quantize/bf16_weight_to_nvfp4_swizzled.cu
   csrc/quantize/fp8_per_token_block_quant.cu
   csrc/quantize/tq_dequant_kv.cu
   csrc/quantize/wmma_probe.cu
@@ -1089,17 +1087,12 @@ pybind11_add_module(flash_rt_kernels
   csrc/quantize/rope_apply_bf16.cu
   csrc/gemm/fp8_block128_gemm.cu
   csrc/kernels/silu_mul_qwen36.cu
-  csrc/kernels/silu_mul_to_nvfp4_swizzled.cu
   csrc/kernels/embedding_lookup_bf16.cu
   # qwen3_5_moe-family RTX SM120 kernels are NOT listed here -- they are
   # gated into the module below (FLASHRT_ENABLE_QWEN35MOE), so SM89/87/110
   # and non-Nex-N2 builds never compile them. See the gated block after the
   # target definition.
   csrc/kernels/qwen3_qkv_post_proc.cu
-  csrc/kernels/fp4_w4a4_matvec_sm120.cu
-  csrc/kernels/fp4_w4a4_mma_sm120.cu
-  csrc/kernels/fp4_w4a4_mma_warpsplit_sm120.cu
-  csrc/kernels/fp4_w4a4_mma_warpsplit_mrows_sm120.cu
   csrc/kernels/bf16_matvec_qwen36.cu
   csrc/kernels/bf16_matmul_bf16.cu
   csrc/attention/fmha_dispatch.cu
@@ -1170,6 +1163,47 @@ if(NOT FLASHRT_SLIM_BUILD)
   message(STATUS "Qwen3.6 / linear-attention kernels: ENABLED")
 else()
   message(STATUS "Qwen3.6 / linear-attention kernels: SKIPPED (slim build)")
+endif()
+
+# ── SM120 / NVFP4-named kernels (slim-gated, arch-macro keyed) ──
+# These TUs are named/built for SM120 NVFP4 but today compile unconditionally,
+# wasting build time on SM89 where they are unreachable. Each group compiles
+# when "NOT slim build OR <its existing arch macro is ON>": this keeps the
+# default SM89 surface broad (compatibility), drops the kernels only in a slim
+# SM89 build, and GUARANTEES they stay compiled on any SM120/NVFP4 build (slim
+# or not) where the arch macro is ON.
+#
+# Group A — fp4_w4a4_* SM120 NVFP4 W4A16 GEMM/GEMV. Their bindings are already
+# inside #ifdef ENABLE_CUTLASS_SM120_NVFP4_W4A16 in bindings.cpp, so on SM89 the
+# Python symbols never exist; only the source was compiling. No bindings change.
+# Keyed on the SAME condition that defines that macro (GPU_ARCH 120/121, see the
+# ENABLE_CUTLASS_SM120_NVFP4_W4A16 block below) — the macro is a compile-def, not
+# a CMake variable, so it must not be tested as one here.
+if(NOT FLASHRT_SLIM_BUILD OR GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/fp4_w4a4_matvec_sm120.cu
+    csrc/kernels/fp4_w4a4_mma_sm120.cu
+    csrc/kernels/fp4_w4a4_mma_warpsplit_sm120.cu
+    csrc/kernels/fp4_w4a4_mma_warpsplit_mrows_sm120.cu)
+  message(STATUS "SM120 NVFP4 W4A16 fp4_w4a4 kernels: ENABLED")
+else()
+  message(STATUS "SM120 NVFP4 W4A16 fp4_w4a4 kernels: SKIPPED (slim build)")
+endif()
+
+# Group B — NVFP4 swizzle/quantize helpers. Their bindings are unguarded today
+# (exposed on SM89 but runtime-unreachable: every Python loader self-gates on
+# has_nvfp4()). Gating the sources requires guarding their bindings + includes
+# in lockstep; FLASHRT_HAVE_NVFP4_SWIZZLE drives that guard and is defined on
+# the same "NOT slim OR ENABLE_NVFP4" condition.
+if(NOT FLASHRT_SLIM_BUILD OR ENABLE_NVFP4)
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/quantize/fp8_block128_to_nvfp4_swizzled.cu
+    csrc/quantize/bf16_weight_to_nvfp4_swizzled.cu
+    csrc/kernels/silu_mul_to_nvfp4_swizzled.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_NVFP4_SWIZZLE=1)
+  message(STATUS "NVFP4 swizzle/quantize kernels: ENABLED")
+else()
+  message(STATUS "NVFP4 swizzle/quantize kernels: SKIPPED (slim build)")
 endif()
 
 # ── qwen3_5_moe family (Nex-N2 / Qwen3.6-35B-A3B) SM120 kernels ──
