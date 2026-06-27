@@ -917,6 +917,7 @@ if(FLASHRT_BUILD_QWEN3_VL)
       csrc/gemm/fp8_gemv_m1_sm89.cu
       csrc/quantize/fp8_per_token_block_quant.cu
       csrc/kernels/qwen3_qkv_post_proc.cu
+      csrc/kernels/bf16_matmul_bf16.cu
       csrc/kernels/bf16_matmul_qwen36.cu)
   endif()
   pybind11_add_module(flash_rt_qwen3_vl_kernels ${QWEN3_VL_SOURCES})
@@ -1044,6 +1045,7 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/fp4_w4a4_mma_warpsplit_sm120.cu
   csrc/kernels/fp4_w4a4_mma_warpsplit_mrows_sm120.cu
   csrc/kernels/bf16_matvec_qwen36.cu
+  csrc/kernels/bf16_matmul_bf16.cu
   csrc/kernels/bf16_matmul_qwen36.cu
   csrc/kernels/bf16_matmul_qwen36_thor.cu
   csrc/attention/fmha_dispatch.cu

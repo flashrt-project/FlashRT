@@ -327,7 +327,7 @@ class Qwen3VlTorchFrontendRtx:
                      xn.data_ptr(), 1, hidden, eps, stream)
         logits = torch.empty(
             1, vocab, dtype=torch.bfloat16, device=self.device)
-        fvk.bf16_matmul_qwen36_bf16(
+        fvk.bf16_matmul_bf16(
             xn.data_ptr(), int(llm._weights.ptrs['lm_head_w']),
             logits.data_ptr(), 1, vocab, hidden, stream)
         torch.cuda.synchronize()
@@ -439,7 +439,7 @@ class Qwen3VlTorchFrontendRtx:
         graph.replay()
         stream = torch.cuda.current_stream().cuda_stream
         last = self._pg_last_hidden[S - 1:S].contiguous()
-        fvk.bf16_matmul_qwen36_bf16(
+        fvk.bf16_matmul_bf16(
             last.data_ptr(), int(llm._weights.ptrs['lm_head_w']),
             self._pg_logits.data_ptr(), 1, vocab, hidden, stream)
         torch.cuda.synchronize()

@@ -27,7 +27,7 @@ import pytest
 # Cleanup progress switches. Each is flipped to True in the same commit that
 # introduces the corresponding neutral binding, which is also where the
 # matching neutral-name assertion starts being enforced.
-NEUTRAL_MATMUL_AVAILABLE = False  # Unit 1: bf16_matmul_bf16
+NEUTRAL_MATMUL_AVAILABLE = True  # Unit 1: bf16_matmul_bf16
 NEUTRAL_EMBEDDING_AVAILABLE = False  # Unit 2: embedding_lookup_bf16
 
 

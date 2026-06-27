@@ -34,7 +34,10 @@
 #include "gemm/fp8_gemv_m1_sm89.cuh"
 #include "quantize/fp8_per_token_block_quant.cuh"
 #include "kernels/qwen3_qkv_post_proc.cuh"
-#include "kernels/bf16_matmul_qwen36.cuh"
+// Only bf16_matmul_cublaslt_bf16 is needed here; it lives in the neutral
+// matmul translation unit (#112), so the Qwen3-VL module no longer has to
+// pull in the Qwen3.6 AB96 matmul file.
+#include "kernels/bf16_matmul_bf16.cuh"
 #endif
 
 namespace py = pybind11;
