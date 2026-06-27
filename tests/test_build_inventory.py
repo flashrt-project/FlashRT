@@ -26,9 +26,12 @@ BUILD_DIR = Path(os.environ.get("FLASHRT_BUILD_DIR", REPO_ROOT / "build"))
 
 # Baseline captured on the local SM89 configure (GPU_ARCH=89,
 # FLASHRT_BUILD_QWEN3_VL=ON, FLASHRT_ENABLE_MOTUS=ON, QWEN35MOE/MELBAND OFF)
-# before any slim-build gating. Units 1-3 reduce flash_rt_kernels; when a unit
-# lands behind FLASHRT_SLIM_BUILD=OFF (compat default), the default-configure
-# count here is unchanged and the slim count is asserted separately.
+# before any slim-build gating. Units 1-3 gate model/arch-specific TUs behind
+# FLASHRT_SLIM_BUILD; with the compat default (OFF) the default-configure count
+# here is unchanged at 55. A slim SM89 build (FLASHRT_SLIM_BUILD=ON) drops 22 TUs
+# to 33: -5 Motus VAE FP8 (Unit 1), -10 Qwen3.6/linear-attn (Unit 2), -7
+# SM120/NVFP4-named (Unit 3). The slim count is build-dir specific and not
+# asserted here (CI configures the default build only).
 BASELINE_KERNELS_TU = 55
 
 # Category breakdown of flash_rt_kernels (mirrors AGENTS.md "Current Build
