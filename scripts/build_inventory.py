@@ -13,6 +13,16 @@ the target compiles directly. This is generator-agnostic (Makefiles or Ninja)
 and reflects the *configured* options (e.g. GPU_ARCH, FLASHRT_* gates), which
 is exactly the surface we want to shrink.
 
+A pybind module's *direct* sources are not its whole compile surface: object
+libraries (``add_library(... OBJECT ...)``) are compiled separately and linked
+in via ``$<TARGET_OBJECTS:...>``. Those TUs have their own DependInfo.cmake but
+are invisible in the consuming module's. This tool therefore reports both the
+direct-source count (``count``, where the slim-build source gates live) and the
+object-library TUs (``object_tu_count``), and attributes each object library to
+the module that links it when the linker manifest (``link.txt`` for Makefiles,
+``build.ninja`` for Ninja) is available. ``total_tu_count = count +
+object_tu_count`` is the honest full compile surface for the target.
+
 Usage:
     python scripts/build_inventory.py                 # default build dir: ./build
     python scripts/build_inventory.py --build out      # custom build dir
@@ -113,6 +123,55 @@ def target_sources(build_dir: Path, target: str) -> list[str] | None:
     return sorted(set(_SRC_RE.findall(text)))
 
 
+_OBJ_DIR_RE = re.compile(r"([A-Za-z0-9_]+_obj)\.dir")
+
+
+def object_libraries(build_dir: Path) -> dict[str, list[str]]:
+    """Map every configured object library (``*_obj``) to its csrc TUs.
+
+    Object libraries are compiled separately and linked into pybind modules via
+    ``$<TARGET_OBJECTS:...>``; their TUs never appear in a consuming module's
+    DependInfo.cmake. We read each ``<name>_obj.dir/DependInfo.cmake`` directly,
+    so this is generator-agnostic like ``target_sources``.
+    """
+    cmf = build_dir / "CMakeFiles"
+    libs: dict[str, list[str]] = {}
+    if not cmf.is_dir():
+        return libs
+    for d in sorted(cmf.glob("*_obj.dir")):
+        dep = d / "DependInfo.cmake"
+        if not dep.is_file():
+            continue
+        name = d.name[: -len(".dir")]
+        text = dep.read_text(encoding="utf-8", errors="replace")
+        libs[name] = sorted(set(_SRC_RE.findall(text)))
+    return libs
+
+
+def linked_object_libs(build_dir: Path, target: str) -> set[str] | None:
+    """Object libraries linked into ``target``, read from the linker manifest.
+
+    Makefiles write ``CMakeFiles/<target>.dir/link.txt``; Ninja writes one
+    ``build.ninja``. Both name the ``<obj>.dir/...`` object files on the link
+    line. Returns None when no manifest is found (attribution unavailable), so
+    callers can still report object-lib TUs globally without false attribution.
+    """
+    link_txt = build_dir / "CMakeFiles" / f"{target}.dir" / "link.txt"
+    if link_txt.is_file():
+        return set(_OBJ_DIR_RE.findall(link_txt.read_text(errors="replace")))
+    ninja = build_dir / "build.ninja"
+    if ninja.is_file():
+        # Find the build statement that produces this target's .so and read the
+        # object files listed as its inputs.
+        text = ninja.read_text(errors="replace")
+        found: set[str] = set()
+        for line in text.splitlines():
+            if line.startswith("build ") and target in line and ".so" in line:
+                found |= set(_OBJ_DIR_RE.findall(line))
+        return found or None
+    return None
+
+
 def categorize(sources: list[str]) -> dict[str, list[str]]:
     """Bucket a target's sources by the AGENTS.md layout groups."""
     known = {src: cat for cat, srcs in CATEGORIES.items() for src in srcs}
@@ -125,6 +184,8 @@ def categorize(sources: list[str]) -> dict[str, list[str]]:
 
 def collect(build_dir: Path) -> dict[str, object]:
     report: dict[str, object] = {"build_dir": str(build_dir), "targets": {}}
+    obj_libs = object_libraries(build_dir)
+    report["object_libraries"] = {n: len(v) for n, v in obj_libs.items()}
     for target in TARGETS:
         srcs = target_sources(build_dir, target)
         if srcs is None:
@@ -136,6 +197,14 @@ def collect(build_dir: Path) -> dict[str, object]:
             entry["categories"] = {c: len(v) for c, v in cats.items()}
             entry["category_sources"] = cats
         entry["sources"] = srcs
+        # Attribute object-library TUs to this target via the linker manifest.
+        linked = linked_object_libs(build_dir, target)
+        if linked is not None:
+            attributed = {n: len(obj_libs[n]) for n in sorted(linked) if n in obj_libs}
+            entry["object_libraries"] = attributed
+            obj_tu = sum(attributed.values())
+            entry["object_tu_count"] = obj_tu
+            entry["total_tu_count"] = len(srcs) + obj_tu
         report["targets"][target] = entry
     return report
 
@@ -154,6 +223,17 @@ def print_report(report: dict[str, object]) -> None:
         if cats:
             for cat, n in cats.items():
                 print(f"    {cat:<28} {n}")
+        objs = entry.get("object_libraries")
+        if objs:
+            print(f"    + object libraries ({entry['object_tu_count']} TUs):")
+            for name, n in objs.items():
+                print(f"        {name:<32} {n}")
+            print(f"    = {entry['total_tu_count']} total TUs (direct + object)")
+    obj_all = report.get("object_libraries")
+    if obj_all:
+        print(f"\nconfigured object libraries ({sum(obj_all.values())} TUs total):")
+        for name, n in obj_all.items():
+            print(f"    {name:<36} {n}")
 
 
 def main(argv: list[str] | None = None) -> int:
