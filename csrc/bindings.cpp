@@ -170,13 +170,17 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "quantize/bf16_weight_to_nvfp4_swizzled.cuh"
 #include "quantize/fp8_per_token_block_quant.cuh"
 #include "quantize/bias_gelu_quantize_fp8.cuh"
+#ifdef FLASHRT_HAVE_MOTUS_VAE_FP8
 #include "quantize/awq_quant_fp8_static_bf16.cuh"
+#endif
 #include "quantize/rope_apply_bf16.cuh"
 #include "quantize/ada_layer_norm_fp8.cuh"
+#ifdef FLASHRT_HAVE_MOTUS_VAE_FP8
 #include "quantize/bf16_rms_silu_quant_fp8_ncdhw_to_ndhwc_v4.cuh"
 #include "quantize/bf16_rms_silu_ncdhw.cuh"
 #include "quantize/bf16_ndhwc_to_ncdhw_transpose.cuh"
 #include "quantize/bf16_quant_fp8_ncdhw_to_ndhwc.cuh"
+#endif
 #include "quantize/qkv_split_norm_rope_bf16.cuh"
 #include "attention/fmha_dispatch.h"
 #ifdef ENABLE_MOTUS_SAGE2_RAW
@@ -2944,6 +2948,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
 
     // G7.23 v19 — bare BF16 -> FP8 quant with NCDHW -> NDHWC permute.
     // Used by the (1,1,1) shortcut conv FP8 path (no RMS / SiLU / gamma).
+#ifdef FLASHRT_HAVE_MOTUS_VAE_FP8
     m.def("bf16_quant_fp8_ncdhw_to_ndhwc",
         [](uintptr_t x_bf16, uintptr_t y_fp8,
            int B, int C, int T, int H, int W,
@@ -2992,6 +2997,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("x_bf16"), py::arg("gamma_bf16"), py::arg("y_fp8"),
         py::arg("B"), py::arg("C"), py::arg("T"), py::arg("H"), py::arg("W"),
         py::arg("act_scale"), py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+#endif  // FLASHRT_HAVE_MOTUS_VAE_FP8
 
     // G7.23 v3 — v2 + uint32 vec smem read (eliminates 4-8 way bank conflict).
 
@@ -3023,6 +3029,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
 
     // G7.14 — Fused (per-K AWQ inv_s mul + per-tensor static FP8
     // quantize) for AWQ FP8 sites in action_expert + und_expert.
+#ifdef FLASHRT_HAVE_MOTUS_VAE_FP8
     m.def("awq_quant_fp8_static_bf16",
         [](uintptr_t in_bf16, uintptr_t inv_s_bf16, uintptr_t out_fp8,
            uintptr_t act_scale, long long M, int K, uintptr_t stream) {
@@ -3037,6 +3044,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("out_fp8"), py::arg("act_scale"),
         py::arg("M"), py::arg("K"),
         py::arg("stream") = 0);
+#endif  // FLASHRT_HAVE_MOTUS_VAE_FP8
 
     // Motus 205ms path bindings. These are the production fused kernels
     // used by the cleaned Motus frontend; probe/test kernels stay archived.
@@ -3196,6 +3204,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("seq_len"), py::arg("dim"),
         py::arg("eps") = 1e-6f, py::arg("stream") = 0);
 
+#ifdef FLASHRT_HAVE_MOTUS_VAE_FP8
     m.def("awq_quant2_fp8_static_bf16",
         [](uintptr_t in0_bf16, uintptr_t inv_s0_bf16, uintptr_t out0_fp8,
            uintptr_t act_scale0, long long M0, int K0,
@@ -3214,6 +3223,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("in1_bf16"), py::arg("inv_s1_bf16"),
         py::arg("out1_fp8"), py::arg("act_scale1"),
         py::arg("M1"), py::arg("K1"), py::arg("stream") = 0);
+#endif  // FLASHRT_HAVE_MOTUS_VAE_FP8
 
     m.def("layer_norm_no_affine_fp8_static_bf16",
         [](uintptr_t x, uintptr_t out, uintptr_t d_scale,
@@ -3449,6 +3459,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("gate"), py::arg("gate_scale"), py::arg("out"),
         py::arg("seq_len"), py::arg("dim"), py::arg("stream") = 0);
 
+#ifdef FLASHRT_HAVE_MOTUS_VAE_FP8
     m.def("bf16_rms_silu_ncdhw",
         [](uintptr_t x_bf16, uintptr_t gamma_bf16, uintptr_t y_bf16,
            uintptr_t prev_cache_bf16, uintptr_t next_cache_bf16,
@@ -3514,6 +3525,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("x_bf16"), py::arg("y_fp8"),
         py::arg("N"), py::arg("C"), py::arg("H"), py::arg("W"),
         py::arg("act_scale"), py::arg("stream") = 0);
+#endif  // FLASHRT_HAVE_MOTUS_VAE_FP8
 
     m.def("qkv_split_bias_norm_rope_v_bf16",
         [](uintptr_t packed_qkv, uintptr_t qkv_bias,

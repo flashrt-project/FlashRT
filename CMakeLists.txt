@@ -168,6 +168,24 @@ option(FLASHRT_ENABLE_MELBAND_ROFORMER
 # Enable explicitly on a Blackwell (sm_120) build.
 option(FLASHRT_ENABLE_OMNIVOICE
        "Build OmniVoice TTS RTX SM120 fused kernels in flash_rt_omnivoice" OFF)
+# ── Slim build for VLA deployments ──
+# OFF by default: the standard build keeps the broad, compatibility-oriented
+# kernel set it has today. Turn ON (-DFLASHRT_SLIM_BUILD=ON) to drop
+# model/architecture-specific translation units that a given hardware/model
+# path does not need, reducing flash_rt_kernels compile time on weaker
+# deployment machines. This is COMPILE-TIME surface reduction only; it never
+# changes kernel math, dispatch, graph capture, or runtime fallback. Each gated
+# group is guarded by its own internal FLASHRT_HAVE_* compile-def so the
+# corresponding bindings in csrc/bindings.cpp drop in lockstep with the sources
+# (a gated source whose binding stayed compiled would fail to link). See
+# scripts/build_inventory.py for the measured surface.
+option(FLASHRT_SLIM_BUILD
+       "Drop model/arch-specific kernels not needed by the target path" OFF)
+if(FLASHRT_SLIM_BUILD)
+  message(STATUS "Slim VLA build: ENABLED (model/arch-specific kernels gated out)")
+else()
+  message(STATUS "Slim VLA build: DISABLED (broad compatibility kernel set)")
+endif()
 if(FLASHRT_ENABLE_MOTUS)
   message(STATUS "Motus beta kernels: ENABLED")
 else()
@@ -1066,11 +1084,6 @@ pybind11_add_module(flash_rt_kernels
   csrc/quantize/wmma_probe.cu
   csrc/quantize/tq_dequant_cutlass.cu
   csrc/quantize/ada_layer_norm_fp8.cu
-  csrc/quantize/awq_quant_fp8_static_bf16.cu
-  csrc/quantize/bf16_ndhwc_to_ncdhw_transpose.cu
-  csrc/quantize/bf16_quant_fp8_ncdhw_to_ndhwc.cu
-  csrc/quantize/bf16_rms_silu_ncdhw.cu
-  csrc/quantize/bf16_rms_silu_quant_fp8_ncdhw_to_ndhwc_v4.cu
   csrc/quantize/bias_gelu_quantize_fp8.cu
   csrc/quantize/qkv_split_norm_rope_bf16.cu
   csrc/quantize/rope_apply_bf16.cu
@@ -1105,6 +1118,33 @@ pybind11_add_module(flash_rt_kernels
 set_target_properties(flash_rt_kernels PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+
+# ── Motus VAE FP8 quantize kernels (slim-gated) ──
+# These 5 TUs are used only by the Motus VAE FP8 path (the *_ncdhw* /
+# upsample / per-tensor AWQ-FP8 quant helpers; see flash_rt/models/motus/*).
+# They compile unconditionally today even on SM89 where no Motus model runs,
+# so a slim VLA build drops them. The matching bindings in csrc/bindings.cpp
+# are guarded by FLASHRT_HAVE_MOTUS_VAE_FP8 so they drop in lockstep (a gated
+# source whose binding stayed compiled would fail to link). The Motus Python
+# frontend already probes these with hasattr(), so a missing binding degrades
+# clearly instead of crashing on import.
+#
+# NOTE: ada_layer_norm_fp8.cu and bias_gelu_quantize_fp8.cu are intentionally
+# NOT in this group — they are shared (ada_layer_norm_fp8 is used by GROOT N1.7,
+# bias_gelu_quantize_fp8_static_bf16 by Melband-RoFormer), so they stay always
+# compiled. Do not fold them in without splitting their shared symbols out.
+if(NOT FLASHRT_SLIM_BUILD)
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/quantize/awq_quant_fp8_static_bf16.cu
+    csrc/quantize/bf16_ndhwc_to_ncdhw_transpose.cu
+    csrc/quantize/bf16_quant_fp8_ncdhw_to_ndhwc.cu
+    csrc/quantize/bf16_rms_silu_ncdhw.cu
+    csrc/quantize/bf16_rms_silu_quant_fp8_ncdhw_to_ndhwc_v4.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_MOTUS_VAE_FP8=1)
+  message(STATUS "Motus VAE FP8 quantize kernels: ENABLED")
+else()
+  message(STATUS "Motus VAE FP8 quantize kernels: SKIPPED (slim build)")
+endif()
 
 # ── qwen3_5_moe family (Nex-N2 / Qwen3.6-35B-A3B) SM120 kernels ──
 # Gated: only compiled when explicitly enabled AND on a Blackwell (NVFP4)
