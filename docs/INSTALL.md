@@ -126,6 +126,46 @@ cmake -B build -S . -DFA2_ARCH_NATIVE_ONLY=ON
 cmake --build build -j$(nproc)
 ```
 
+### 6.2 Slim VLA build (optional)
+
+The default build keeps FlashRT's broad compatibility surface. It compiles
+shared kernels plus several model- or architecture-specific translation units
+so existing model paths keep their historical bindings.
+
+For deployment builds that only need the current VLA-oriented surface, you can
+opt into a smaller compile surface:
+
+```bash
+cmake -B build -S . -DGPU_ARCH=<arch> -DFLASHRT_SLIM_BUILD=ON
+cmake --build build -j$(nproc) --target flash_rt_kernels
+```
+
+`FLASHRT_SLIM_BUILD` is OFF by default and only changes what is compiled into
+`flash_rt_kernels`. It does not change kernel math, launch parameters, dtype
+selection, graph capture, runtime routing, or fallback policy.
+
+In slim mode, the build drops kernel groups that the current VLA deployment
+surface does not need:
+
+- Motus VAE FP8 quantize kernels.
+- Qwen3.6 / linear-attention kernels and their legacy Qwen3.6 binding names.
+- SM120/NVFP4-named helper translation units on non-NVFP4 builds.
+
+Neutral shared helpers stay compiled in both modes, including
+`bf16_matmul_bf16` and `embedding_lookup_bf16`. Architecture-required kernels
+also stay compiled when their architecture macro is enabled; for example,
+SM120/NVFP4 builds retain NVFP4-required sources even with slim mode enabled.
+
+Do not use `FLASHRT_SLIM_BUILD=ON` for compatibility builds or for model paths
+that require the gated bindings, such as Qwen3.6 / Nex-N2, Motus FP8/VAE, or
+non-VLA NVFP4 conversion flows. Those paths should use the default build until
+they have their own documented build profile.
+
+This option is a first step toward explicit build profiles. It is not yet a
+general `vla` / `llm` / `vlm` / `tts` / `video` profile system; it is a
+conservative opt-in compile-time reduction with tests covering the exported
+binding surface.
+
 ## 7. Verify
 
 ```bash
