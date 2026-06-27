@@ -929,7 +929,7 @@ class Qwen3TorchFrontendRtx:
         # BW saving justifies. Reverted to BF16. A future NVFP4
         # lm_head with FP8 per-row calibration could potentially
         # recover the gap.
-        fvk.bf16_matmul_qwen36_bf16(
+        fvk.bf16_matmul_bf16(
             x_norm.data_ptr(),
             int(self._weights.ptrs['lm_head_w']),
             self._logits_buf[:1].data_ptr(),

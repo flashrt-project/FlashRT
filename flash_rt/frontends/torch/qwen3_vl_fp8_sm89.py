@@ -103,7 +103,7 @@ class Qwen3VlFp8Sm89TextFrontend:
             'qwen3_q_norm_rope_qstage_bf16',
             'qwen3_k_norm_rope_kvwrite_bf16',
             'qwen36_embedding_lookup_bf16',
-            'bf16_matmul_qwen36_bf16',
+            'bf16_matmul_bf16',
             'rms_norm',
             'residual_add',
         )
@@ -381,7 +381,7 @@ class Qwen3VlFp8Sm89TextFrontend:
                        int(self._weights.ptrs['lm_head_fp8_s']),
                        self._logits_buf, vocab, hidden)
         else:
-            self._fvk.bf16_matmul_qwen36_bf16(
+            self._fvk.bf16_matmul_bf16(
                 last_row.data_ptr(), int(self._weights.ptrs['lm_head_w']),
                 self._logits_buf.data_ptr(), 1, vocab, hidden, s)
         return self._logits_buf
