@@ -34,9 +34,9 @@ BUILD_DIR = Path(os.environ.get("FLASHRT_BUILD_DIR", REPO_ROOT / "build"))
 #   slim SM89   (FLASHRT_SLIM_BUILD=ON):     33 direct TUs (-22):
 #       -5 Motus VAE FP8 (Unit 1), -10 Qwen3.6/linear-attn (Unit 2),
 #       -7 SM120/NVFP4-named (Unit 3).
-# The slim breakdown is SM89-specific; a slim build on an arch whose macros keep
-# Group A/B (e.g. GPU_ARCH=120) would differ, so the slim asserts are limited to
-# the SM89 case below.
+# The direct-source breakdowns below are SM89-specific; other arches add/remove
+# arch-owned sources (for example SM120 adds nvfp4_sf_reshape_sm120.cu), so the
+# direct-count/category asserts are limited to SM89.
 COMPAT_KERNELS_TU = 55
 SLIM_SM89_KERNELS_TU = 33
 
@@ -139,8 +139,8 @@ def test_kernels_baseline_tu_count():
     a unit added/removed a TU from that mode's build; if intended, update the
     matching constant in the same commit.
     """
-    if _is_slim() and not _is_sm89():
-        pytest.skip("slim TU baseline is recorded for SM89 only")
+    if not _is_sm89():
+        pytest.skip("direct TU baseline is recorded for SM89 only")
     entry = _kernels_entry()
     expected = _expected_tu()
     assert entry["count"] == expected, (
@@ -152,8 +152,8 @@ def test_kernels_baseline_tu_count():
 
 def test_kernels_category_breakdown():
     """Per-group counts match AGENTS.md's Current Build Layout (mode-aware)."""
-    if _is_slim() and not _is_sm89():
-        pytest.skip("slim category baseline is recorded for SM89 only")
+    if not _is_sm89():
+        pytest.skip("category baseline is recorded for SM89 only")
     entry = _kernels_entry()
     assert entry["categories"] == _expected_categories()
 

@@ -28,12 +28,17 @@ a CUDA device or any model checkpoint, only that the extension built.
 from __future__ import annotations
 
 import importlib
+import os
+from pathlib import Path
 
 import pytest
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+BUILD_DIR = Path(os.environ.get("FLASHRT_BUILD_DIR", REPO_ROOT / "build"))
+
 # A binding gated under FLASHRT_HAVE_QWEN36_KERNELS alongside the legacy helper
-# names. Present in the compat build, absent in slim. Used to detect build mode
-# from the compiled module without needing the source build dir.
+# names. Present in the compat build, absent in slim. Used only as a consistency
+# check after the build mode is read from CMakeCache.txt.
 QWEN36_SENTINEL = "causal_conv1d_qwen36_bf16"
 
 
@@ -56,28 +61,68 @@ def _qwen36_kernels_built(m) -> bool:
     return hasattr(m, QWEN36_SENTINEL)
 
 
+def _cache_bool(name: str) -> bool:
+    """Read a BOOL from the configured build dir's CMakeCache.txt.
+
+    Do not infer the mode from exported symbols: that can hide compat-build
+    regressions where an entire binding group disappears.
+    """
+    cache = BUILD_DIR / "CMakeCache.txt"
+    if not cache.is_file():
+        pytest.skip(f"no CMakeCache.txt at {cache}; cannot determine build mode")
+    for line in cache.read_text(errors="replace").splitlines():
+        if line.startswith(f"{name}:"):
+            return line.rsplit("=", 1)[-1].strip().upper() in (
+                "ON",
+                "TRUE",
+                "1",
+                "YES",
+            )
+    pytest.skip(f"{name} not found in {cache}; cannot determine build mode")
+
+
+def _is_slim_build() -> bool:
+    return _cache_bool("FLASHRT_SLIM_BUILD")
+
+
 def test_legacy_matmul_bindings_exist():
     """Compat build: legacy name present. Slim build: gated out by design."""
     m = _import_kernels()
-    if _qwen36_kernels_built(m):
-        assert hasattr(m, "bf16_matmul_qwen36_bf16")
-    else:
+    if _is_slim_build():
+        assert not _qwen36_kernels_built(m), (
+            "slim build still exposes Qwen3.6 sentinel binding; the "
+            "FLASHRT_HAVE_QWEN36_KERNELS gate did not drop it"
+        )
         assert not hasattr(m, "bf16_matmul_qwen36_bf16"), (
             "slim build still exposes legacy bf16_matmul_qwen36_bf16; the "
             "Qwen3.6 TU gate did not drop it"
         )
+    else:
+        assert _qwen36_kernels_built(m), (
+            "compat build is missing Qwen3.6 sentinel binding; the "
+            "FLASHRT_HAVE_QWEN36_KERNELS gate may not have been enabled"
+        )
+        assert hasattr(m, "bf16_matmul_qwen36_bf16")
 
 
 def test_legacy_embedding_binding_exists():
     """Compat build: legacy name present. Slim build: gated out by design."""
     m = _import_kernels()
-    if _qwen36_kernels_built(m):
-        assert hasattr(m, "qwen36_embedding_lookup_bf16")
-    else:
+    if _is_slim_build():
+        assert not _qwen36_kernels_built(m), (
+            "slim build still exposes Qwen3.6 sentinel binding; the "
+            "FLASHRT_HAVE_QWEN36_KERNELS gate did not drop it"
+        )
         assert not hasattr(m, "qwen36_embedding_lookup_bf16"), (
             "slim build still exposes legacy qwen36_embedding_lookup_bf16; the "
             "Qwen3.6 TU gate did not drop it"
         )
+    else:
+        assert _qwen36_kernels_built(m), (
+            "compat build is missing Qwen3.6 sentinel binding; the "
+            "FLASHRT_HAVE_QWEN36_KERNELS gate may not have been enabled"
+        )
+        assert hasattr(m, "qwen36_embedding_lookup_bf16")
 
 
 def test_legacy_cublaslt_binding_exists_on_vl_module():
