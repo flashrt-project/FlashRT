@@ -1028,6 +1028,19 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
 endif()
 
 # ── Main module ──
+# flash_rt_kernels is the shared core pybind module. It currently compiles a
+# broad superset of kernels, including several model/architecture-specific
+# translation units that not every deployment needs (Qwen3.6/linear-attention,
+# SM120/NVFP4-named, Motus/video FP8-history). For VLA deployments on weaker
+# machines this is avoidable build latency.
+#
+# An incremental cleanup gates those model/arch-specific TUs behind explicit
+# CMake options so a slim build compiles only what a given hardware/model path
+# needs. This is COMPILE-TIME surface reduction only: it does not change kernel
+# math, launch params, dtype/dispatch policy, graph capture, or runtime
+# fallback. Default builds stay compatibility-oriented (broad set) until the
+# slim path is validated across SM89/SM120/Thor. See scripts/build_inventory.py
+# and tests/test_build_inventory.py for the measured per-target surface.
 pybind11_add_module(flash_rt_kernels
   csrc/gemm/gemm_runner.cu
   csrc/kernels/norm.cu
