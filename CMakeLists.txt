@@ -900,9 +900,8 @@ if(FLASHRT_ENABLE_OMNIVOICE)
   endif()
   pybind11_add_module(flash_rt_omnivoice
     csrc/omnivoice_extra_bindings.cpp
-    csrc/kernels/cfg_combine.cu
-    csrc/kernels/maskgit_sample.cu
-    csrc/kernels/maskgit_select.cu)
+    csrc/kernels/omnivoice/omnivoice_cfg_combine.cu
+    csrc/kernels/omnivoice/omnivoice_qk_norm_rope.cu)
   set_target_properties(flash_rt_omnivoice PROPERTIES
     CUDA_STANDARD 17
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
@@ -1009,7 +1008,6 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/fusion.cu
   csrc/kernels/patch_embed.cu
   csrc/kernels/softmax.cu
-  csrc/kernels/fused_qk_norm_rope.cu
   csrc/kernels/attention_cublas.cu
   csrc/kernels/attention_mha.cu
   csrc/kernels/attention_mha_causal.cu

@@ -23,8 +23,6 @@ D = 1024; L = 28; NH = 16; NKV = 8; HD = 128; FFN = 3072; EPS = 1e-6
 THETA = 1_000_000.0; NQK = NH * HD; KVD = NKV * HD
 QKVD = NQK + 2 * KVD; GUD = 2 * FFN; MAX_S = 2048
 
-from omnivoice.models.omnivoice import _get_time_steps, _gumbel_sample, _filter_top_k
-
 # ── FlashRT kernel detection (supports flashcli deployment + local dev) ──
 try:
     from flash_rt import flash_rt_kernels as _fvk
@@ -42,7 +40,7 @@ except ImportError:
     except ImportError:
         _fvo = None
 
-_has_cfg_kernel = _fvo is not None and hasattr(_fvo, 'cfg_combine_log_softmax_bf16')
+_has_cfg_kernel = _fvo is not None and hasattr(_fvo, 'omnivoice_cfg_logsoftmax_bf16')
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -77,8 +75,9 @@ class FlashRTLlm:
         self.device = dev
         layers = qm.layers
         from flash_rt import flash_rt_kernels as fvk
+        from flash_rt import flash_rt_omnivoice as fvo
         from flash_rt import flash_rt_fa2 as fa2
-        self.fvk = fvk; self.fa2 = fa2
+        self.fvk = fvk; self.fvo = fvo; self.fa2 = fa2
 
         self.WL_bf16 = []
         for i in range(L):
@@ -189,7 +188,7 @@ class FlashRTLlm:
             _call_fp4_gemm(fvk, fa['inp_packed'].data_ptr(), w['qkv_packed'].data_ptr(),
                 b['Dq'].data_ptr(), BS, QKVD, D, fa['inp_sf'].data_ptr(), w['qkv_sf'].data_ptr(),
                 al['qkv'], _pick_gemm_variant(QKVD, D), st)
-            fvk.fused_qk_norm_rope_v4_bf16(b['Dq'].data_ptr(), w['qn'].data_ptr(), w['kn'].data_ptr(),
+            self.fvo.omnivoice_qk_norm_rope_bf16(b['Dq'].data_ptr(), w['qn'].data_ptr(), w['kn'].data_ptr(),
                 cos_bs.data_ptr(), sin_bs.data_ptr(),
                 b['q_temp'].data_ptr(), b['k_temp'].data_ptr(), BS, NH, NKV, HD, QKVD, EPS, st)
             b['q_flat'], b['q_temp'] = b['q_temp'], b['q_flat']
@@ -286,7 +285,7 @@ class FlashRTLlmBF16(FlashRTLlm):
             wb = self.WL_bf16[li]
             fvk.rms_norm(b['h'].data_ptr(), wb['in_norm'].data_ptr(), b['xn'].data_ptr(), BS, D, EPS, st)
             torch.matmul(b['xn'], wb['qkv'].t(), out=b['Dq'])
-            fvk.fused_qk_norm_rope_v4_bf16(b['Dq'].data_ptr(), wb['qn'].data_ptr(), wb['kn'].data_ptr(),
+            self.fvo.omnivoice_qk_norm_rope_bf16(b['Dq'].data_ptr(), wb['qn'].data_ptr(), wb['kn'].data_ptr(),
                 cos_bs.data_ptr(), sin_bs.data_ptr(),
                 b['q_temp'].data_ptr(), b['k_temp'].data_ptr(), BS, NH, NKV, HD, QKVD, EPS, st)
             b['q_flat'], b['q_temp'] = b['q_temp'], b['q_flat']
@@ -318,7 +317,7 @@ def _make_cfg(gs, mask_id):
             B,C,S,V = c.shape; r=B*C*S
             cf=c.reshape(r,V).contiguous(); uf=u.reshape(r,V).contiguous()
             out=torch.empty_like(cf)
-            _fvo.cfg_combine_log_softmax_bf16(cf.data_ptr(),uf.data_ptr(),out.data_ptr(),r,V,mask_id,gs,_sfn())
+            _fvo.omnivoice_cfg_logsoftmax_bf16(cf.data_ptr(),uf.data_ptr(),out.data_ptr(),r,V,mask_id,gs,_sfn())
             return out.view(B,C,S,V)
         return _cfg
     def _cfg(c, u):
@@ -330,6 +329,8 @@ def _make_cfg(gs, mask_id):
 
 
 def _optimize_maskgit(model, frt_fp4, cfg_ratio=0.05, bookend=False):
+    from omnivoice.models.omnivoice import _get_time_steps, _gumbel_sample, _filter_top_k
+
     num_cb = model.config.num_audio_codebook
     mask_id = model.config.audio_mask_id
     _dev = model.device
@@ -452,17 +453,19 @@ def _check_kernels():
             "rms_norm",
             "residual_add_rms_norm_to_nvfp4_swizzled_bf16",
             "silu_mul_merged_to_nvfp4_swizzled_bf16",
-            "fused_qk_norm_rope_v4_bf16",
             "quantize_bf16_to_nvfp4_swizzled_mse",
         ):
             if not hasattr(_fvk, sym):
                 missing.append("flash_rt_kernels." + sym)
 
-    if _fvo is None or not hasattr(_fvo, "cfg_combine_log_softmax_bf16"):
+    if _fvo is None:
         missing.append(
-            "flash_rt_omnivoice — cfg_combine_log_softmax_bf16 not found; "
-            "rebuild FlashRT with: cmake -DFLASHRT_ENABLE_OMNIVOICE=ON -DGPU_ARCH=120"
-        )
+            "flash_rt_omnivoice not found; "
+            "rebuild FlashRT with: cmake -DFLASHRT_ENABLE_OMNIVOICE=ON -DGPU_ARCH=120")
+    else:
+        for sym in ("omnivoice_cfg_logsoftmax_bf16", "omnivoice_qk_norm_rope_bf16"):
+            if not hasattr(_fvo, sym):
+                missing.append("flash_rt_omnivoice." + sym)
 
     if missing:
         raise RuntimeError(

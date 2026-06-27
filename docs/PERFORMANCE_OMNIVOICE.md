@@ -14,8 +14,8 @@ make -j$(nproc) flash_rt_kernels flash_rt_fa2 flash_rt_omnivoice
 
 | Module | Contents | Gate |
 |--------|----------|------|
-| `flash_rt_kernels` | FP4 GEMM, RMS norm, RoPE, fused QK norm+rope, quantize, SiLU | Always built |
-| `flash_rt_omnivoice` | cfg_combine_log_softmax, maskgit_sample, maskgit_select | `FLASHRT_ENABLE_OMNIVOICE=ON` |
+| `flash_rt_kernels` | FP4 GEMM, RMS norm, quantize, SiLU | Always built |
+| `flash_rt_omnivoice` | `omnivoice_cfg_logsoftmax_bf16`, `omnivoice_qk_norm_rope_bf16` | `FLASHRT_ENABLE_OMNIVOICE=ON` |
 | `flash_rt_fa2` | FlashAttention2 BF16 forward | Always built |
 
 ## End-to-End Inference (ns=32, gs=2.0, 32 codebooks)
@@ -29,8 +29,8 @@ make -j$(nproc) flash_rt_kernels flash_rt_fa2 flash_rt_omnivoice
 
 ## Audio Quality (versus PyTorch BF16 reference)
 
-| Metric | BF16 FlashRT | FP4 W4A4 FlashRT | V69 Hybrid (5% BF16) |
-|--------|-------------|-------------------|----------------------|
+| Metric | BF16 FlashRT | FP4 W4A4 FlashRT | Hybrid (5% BF16) |
+|--------|-------------|-------------------|-------------------|
 | **Mel-cosine** | 0.9971 | 0.9315 | 0.9961 |
 | **Max abs error** | 0.0012 | 0.0473 | 0.0009 |
 | **Token match rate** | 100% | 3.3% | 99.7% |
@@ -42,7 +42,7 @@ make -j$(nproc) flash_rt_kernels flash_rt_fa2 flash_rt_omnivoice
   0.999 is unattainable due to stochastic sampling. BF16 FlashRT sits at this floor.
 - **FP4 W4A4 alone**: 98% of audio tokens diverge from BF16, altering rhythm and
   timbre. Not suitable for quality-sensitive TTS.
-- **Hybrid (V69) strategy**: Step 1 uses BF16 CFG to establish token structure
+- **Hybrid strategy**: Step 1 uses BF16 CFG to establish token structure
   (17 tokens / 2.9% mutated). Steps 2-32 use FP4 without CFG to fill remaining
   tokens at 5x speed. Perceptually identical to full BF16.
 
@@ -65,7 +65,7 @@ Memory optimizations:
 ## Engine Injection
 
 ```python
-from flash_rt import inject, free_encoder
+from flash_rt.models.omnivoice import inject, free_encoder
 
 model = OmniVoice.from_pretrained(...)
 inject(model, cfg_ratio=0.05, bookend=False)
@@ -81,9 +81,5 @@ symbols are missing, with instructions to rebuild with
 ## Regression Tests
 
 ```sh
-# Default build (FLASHRT_ENABLE_OMNIVOICE=OFF)
-pytest -q tests/test_omnivoice_smoke.py -k "Default"
-
-# OmniVoice build (FLASHRT_ENABLE_OMNIVOICE=ON, GPU required)
-pytest -q tests/test_omnivoice_smoke.py -m gpu
+pytest -q tests/test_omnivoice_smoke.py
 ```

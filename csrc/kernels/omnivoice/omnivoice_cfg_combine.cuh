@@ -1,5 +1,5 @@
 // ================================================================
-// FlashRT — Fused CFG (classifier-free guidance) combine kernel (BF16)
+// FlashRT — OmniVoice fused kernels.
 //
 // Replaces 3× torch log_softmax in the MaskGIT CFG path:
 //   c_lp = log_softmax(c_logits)        with mask_col → -inf
@@ -19,7 +19,7 @@ namespace flash_rt { namespace kernels {
 // (kept in namespace for organization; .cu defines at global scope via using)
 }}
 
-void cfg_combine_log_softmax_bf16(
+void omnivoice_cfg_logsoftmax_bf16(
     const __nv_bfloat16* c_logits,   // [rows, cols]
     const __nv_bfloat16* u_logits,   // [rows, cols]
     __nv_bfloat16* out,              // [rows, cols]

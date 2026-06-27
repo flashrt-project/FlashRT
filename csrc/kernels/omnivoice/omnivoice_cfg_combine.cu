@@ -1,13 +1,13 @@
 // ================================================================
-// FlashRT — Fused CFG combine kernel (BF16). See cfg_combine.cuh.
+// FlashRT — Fused CFG combine kernel (BF16). See omnivoice_cfg_combine.cuh.
 // ================================================================
 
-#include "cfg_combine.cuh"
+#include "omnivoice_cfg_combine.cuh"
 
 #define CC_WARP 32
 #define CC_ITERS 48   // 48*32 = 1536 cols max (OmniVoice vocab = 1025)
 
-__global__ void cfg_combine_log_softmax_bf16_kernel(
+__global__ void omnivoice_cfg_logsoftmax_bf16_kernel(
     const __nv_bfloat16* __restrict__ c_logits,
     const __nv_bfloat16* __restrict__ u_logits,
     __nv_bfloat16* __restrict__ out,
@@ -88,7 +88,7 @@ __global__ void cfg_combine_log_softmax_bf16_kernel(
     }
 }
 
-void cfg_combine_log_softmax_bf16(
+void omnivoice_cfg_logsoftmax_bf16(
     const __nv_bfloat16* c_logits,
     const __nv_bfloat16* u_logits,
     __nv_bfloat16* out,
@@ -97,6 +97,6 @@ void cfg_combine_log_softmax_bf16(
 {
     if (rows <= 0 || cols <= 0) return;
     dim3 grid(rows), block(CC_WARP);
-    cfg_combine_log_softmax_bf16_kernel<<<grid, block, 0, stream>>>(
+    omnivoice_cfg_logsoftmax_bf16_kernel<<<grid, block, 0, stream>>>(
         c_logits, u_logits, out, cols, mask_col, guidance_scale);
 }

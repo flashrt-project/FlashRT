@@ -13,13 +13,13 @@
 //   3. Normalize with per-head Q/K weight, apply RoPE from registers
 //   4. Write RoPE result to flat output buffer
 
-#include "fused_qk_norm_rope.cuh"
+#include "omnivoice_qk_norm_rope.cuh"
 #include "common.cuh"
 
 namespace flash_rt {
 namespace kernels {
 
-__global__ void fused_qk_norm_rope_v4_kernel(
+__global__ void omnivoice_qk_norm_rope_kernel(
     const __nv_bfloat16* __restrict__ dq,
     const __nv_bfloat16* __restrict__ q_weight,
     const __nv_bfloat16* __restrict__ k_weight,
@@ -155,7 +155,7 @@ __global__ void fused_qk_norm_rope_v4_kernel(
     }
 }
 
-void fused_qk_norm_rope_v4_bf16(
+void omnivoice_qk_norm_rope_bf16(
     const __nv_bfloat16* dq,
     const __nv_bfloat16* q_weight,
     const __nv_bfloat16* k_weight,
@@ -172,7 +172,7 @@ void fused_qk_norm_rope_v4_bf16(
     dim3 block(kThreads);
     dim3 grid(BS);
 
-    fused_qk_norm_rope_v4_kernel<<<grid, block, 0, stream>>>(
+    omnivoice_qk_norm_rope_kernel<<<grid, block, 0, stream>>>(
         dq, q_weight, k_weight, cos, sin,
         q_temp, k_temp,
         NH, NKV, HD, QKVD, eps);

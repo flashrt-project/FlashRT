@@ -160,7 +160,6 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/bf16_matmul_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36_thor.cuh"
 #include "kernels/fp4_w4a4_matvec_sm120.cuh"
-#include "kernels/fused_qk_norm_rope.cuh"    // v4: Q/K RMSNorm+RoPE for OmniVoice
 #include "kernels/fp4_w4a4_mma_sm120.cuh"
 #include "kernels/fp4_w4a4_mma_warpsplit_sm120.cuh"
 #include "kernels/fp4_w4a4_mma_warpsplit_mrows_sm120.cuh"
@@ -806,32 +805,6 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                                   reinterpret_cast<const float*>(d_scale), to_stream(stream));
     }, py::arg("merged"), py::arg("out"), py::arg("seq"), py::arg("half_dim"),
        py::arg("d_scale") = 0, py::arg("stream") = 0);
-
-    // ── Fused Q/K RMSNorm + RoPE (v4: warp-per-head, register-based RMS) ──
-    m.def("fused_qk_norm_rope_v4_bf16",
-        [](uintptr_t dq, uintptr_t q_weight, uintptr_t k_weight,
-           uintptr_t cos, uintptr_t sin,
-           uintptr_t q_temp, uintptr_t k_temp,
-           int BS, int NH, int NKV, int HD, int QKVD, float eps,
-           uintptr_t stream) {
-            flash_rt::kernels::fused_qk_norm_rope_v4_bf16(
-                reinterpret_cast<const __nv_bfloat16*>(dq),
-                reinterpret_cast<const __nv_bfloat16*>(q_weight),
-                reinterpret_cast<const __nv_bfloat16*>(k_weight),
-                reinterpret_cast<const __nv_bfloat16*>(cos),
-                reinterpret_cast<const __nv_bfloat16*>(sin),
-                reinterpret_cast<__nv_bfloat16*>(q_temp),
-                reinterpret_cast<__nv_bfloat16*>(k_temp),
-                BS, NH, NKV, HD, QKVD, eps,
-                reinterpret_cast<cudaStream_t>(stream));
-        },
-        py::arg("dq"), py::arg("q_weight"), py::arg("k_weight"),
-        py::arg("cos"), py::arg("sin"),
-        py::arg("q_temp"), py::arg("k_temp"),
-        py::arg("BS"), py::arg("NH"), py::arg("NKV"), py::arg("HD"),
-        py::arg("QKVD"), py::arg("eps") = 1e-6f, py::arg("stream") = 0,
-        "Fused Q/K RMSNorm + RoPE in a single kernel (v4). "
-        "Warp-per-head parallelism replaces qkv_split + norm + rope (3 launches → 1).");
 
     // RoPE
     m.def("rope_apply", [](uintptr_t rope_weights, uintptr_t Q, uintptr_t K,
