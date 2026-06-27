@@ -1330,7 +1330,7 @@ class Qwen3TorchFrontendRtx:
         # 0) Embed S tokens via the kernel gather (no torch indexing).
         embed_t = self._weights.anchors[0]
         h = self._embed_h_buf[:S]
-        fvk.qwen36_embedding_lookup_bf16(
+        fvk.embedding_lookup_bf16(
             prompt_ids.view(-1).data_ptr(), embed_t.data_ptr(),
             h.data_ptr(), S, hidden, s,
         )
@@ -1518,7 +1518,7 @@ class Qwen3TorchFrontendRtx:
 
         embed_t = self._weights.anchors[0]
         h = self._embed_h_buf[:S]
-        fvk.qwen36_embedding_lookup_bf16(
+        fvk.embedding_lookup_bf16(
             prompt_ids.view(-1).data_ptr(), embed_t.data_ptr(),
             h.data_ptr(), S, hidden, s,
         )
