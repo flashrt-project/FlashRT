@@ -76,8 +76,9 @@ See `docs/PERFORMANCE_OMNIVOICE.md` for full performance specifications.
 ## Notes
 
 - `FLASHRT_ENABLE_OMNIVOICE=ON` must be set at cmake build time to compile
-  the `flash_rt_omnivoice` module (cfg_combine + maskgit kernels). Without
-  it, the engine falls back to torch operations with a warning.
+  the `flash_rt_omnivoice` module (`omnivoice_cfg_logsoftmax_bf16` and
+  `omnivoice_qk_norm_rope_bf16`). Without it, OmniVoice initialization fails
+  fast with a clear `RuntimeError`.
 - The output is 24 kHz mono PCM16, returned as `data:audio/wav;base64`.
 - `pip install fastapi uvicorn` is a server-only dependency; the engine and
   kernels do not require it.

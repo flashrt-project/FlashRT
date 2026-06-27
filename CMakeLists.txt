@@ -162,11 +162,12 @@ option(FLASHRT_BUILD_QWEN3_VL
 # OFF by default; enable with -DFLASHRT_ENABLE_MELBAND_ROFORMER=ON.
 option(FLASHRT_ENABLE_MELBAND_ROFORMER
        "Build MelBandRoformer custom fused kernels (BF16/FP8, SM120)" OFF)
-# OmniVoice TTS — builds flash_rt_omnivoice.so (cfg_combine + maskgit_sample/select)
-# and gates csrc/kernels/cfg_combine.cu + maskgit_sample.cu out of flash_rt_kernels.
+# OmniVoice TTS — builds flash_rt_omnivoice.so with OmniVoice-specific
+# cfg-logsoftmax and QK-norm/RoPE kernels. The module is opt-in and remains
+# separate from the default flash_rt_kernels target.
 # Enable explicitly on a Blackwell (sm_120) build.
 option(FLASHRT_ENABLE_OMNIVOICE
-       "Build OmniVoice TTS RTX SM120 fused kernels (cfg_combine, maskgit)" OFF)
+       "Build OmniVoice TTS RTX SM120 fused kernels in flash_rt_omnivoice" OFF)
 if(FLASHRT_ENABLE_MOTUS)
   message(STATUS "Motus beta kernels: ENABLED")
 else()
@@ -923,7 +924,7 @@ if(FLASHRT_ENABLE_OMNIVOICE)
       -U__CUDA_NO_BFLOAT162_OPERATORS__
       ${GPU_GENCODE}
     >)
-  target_link_libraries(flash_rt_omnivoice PRIVATE CUDA::cudart CUDA::curand)
+  target_link_libraries(flash_rt_omnivoice PRIVATE CUDA::cudart)
   install(TARGETS flash_rt_omnivoice LIBRARY DESTINATION flash_rt)
   message(STATUS "OmniVoice TTS SM120 kernels: ENABLED")
 else()
