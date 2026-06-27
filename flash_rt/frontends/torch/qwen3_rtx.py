@@ -1268,7 +1268,7 @@ class Qwen3TorchFrontendRtx:
                 self._lmhead_act_scale.data_ptr(), w_descale, s,
             )
         else:
-            fvk.bf16_matmul_qwen36_bf16(
+            fvk.bf16_matmul_bf16(
                 last_row.contiguous().data_ptr(),
                 int(self._weights.ptrs['lm_head_w']),
                 self._logits_buf[:1].data_ptr(), 1, vocab, hidden, s,
@@ -1391,7 +1391,7 @@ class Qwen3TorchFrontendRtx:
 
         # 4) lm_head BF16. M=1 (last row, default) or M=S (full_logits).
         if full_logits:
-            fvk.bf16_matmul_qwen36_bf16(
+            fvk.bf16_matmul_bf16(
                 x_norm.contiguous().data_ptr(),
                 int(self._weights.ptrs['lm_head_w']),
                 self._logits_buf[:S].data_ptr(),

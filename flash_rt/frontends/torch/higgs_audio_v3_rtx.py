@@ -6,7 +6,7 @@ acoustic frame under a delay pattern, decoded autoregressively with greedy
 sampling. ``predict`` returns raw ``[T, num_codebooks]`` codes; waveform
 synthesis is the codec's responsibility.
 
-Kernels used: ``rms_norm``, ``bf16_matmul_qwen36_bf16``, ``silu_mul_qwen36_bf16``,
+Kernels used: ``rms_norm``, ``bf16_matmul_bf16``, ``silu_mul_qwen36_bf16``,
 ``qwen3_q_norm_rope_qstage_bf16`` / ``qwen3_k_norm_rope_kvwrite_bf16`` (fused
 q/k-norm + full RoPE), and vendored FlashAttention-2 via
 ``RtxFlashAttnBackendQwen3`` (head config 36 / 32q / 8kv / 128 is shared with

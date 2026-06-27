@@ -12,7 +12,7 @@ residual-norms + fused q/k-norm+RoPE+KV-write + FA2 + silu_mul; nothing else.
 
 GEMV kernel is the dedicated M=1 ``bf16_matvec_qwen36_bf16`` (warp-per-output-row,
 no MMA BLOCK_M padding tax), selected over the tiled ``bf16_matmul`` by measured
-full-decode latency. Prefill uses the tiled ``bf16_matmul_qwen36_bf16`` at M=P.
+full-decode latency. Prefill uses the tiled ``bf16_matmul_bf16`` at M=P.
 
 Used by :class:`HiggsAudioV3TorchFrontendRtx` when ``fp8=False``.
 """
