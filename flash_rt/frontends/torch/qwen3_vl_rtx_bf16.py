@@ -15,6 +15,7 @@ checkpoint path for correctness bring-up and unsupported quantized targets.
 """
 from __future__ import annotations
 
+import collections
 import json
 import os
 from typing import Any
@@ -77,7 +78,9 @@ class Qwen3VlTorchFrontendRtxBF16:
     """
 
     def __init__(self, checkpoint_path: str, *, device: str = 'cuda:0',
-                 max_seq: int = 2048, max_pixels: int | None = None) -> None:
+                 max_seq: int = 2048, max_pixels: int | None = None,
+                 max_prefill_graphs: int | None = None,
+                 max_decode_graphs: int | None = None) -> None:
         import torch
         from transformers import AutoProcessor
 
@@ -97,9 +100,21 @@ class Qwen3VlTorchFrontendRtxBF16:
         self.max_seq = int(max_seq)
         self.max_pixels = max_pixels
         self._prompt: dict[str, Any] | None = None
-        self._decode_graphs: dict[tuple[int, int], Any] = {}
-        self._prefill_graphs: dict[tuple[int, int, int, int], Any] = {}
-        self._pg_buffers: dict[tuple[int, int, int, int], dict[str, Any]] = {}
+        if max_prefill_graphs is None:
+            max_prefill_graphs = int(os.environ.get(
+                'FLASHRT_QWEN3_VL_PREFILL_GRAPH_CACHE_MAX', '256'))
+        if max_decode_graphs is None:
+            max_decode_graphs = int(os.environ.get(
+                'FLASHRT_QWEN3_VL_DECODE_GRAPH_CACHE_MAX', '256'))
+        self.max_prefill_graphs = int(max_prefill_graphs)
+        self.max_decode_graphs = int(max_decode_graphs)
+        self._decode_graphs: collections.OrderedDict[tuple[int, int], Any] = (
+            collections.OrderedDict())
+        self._prefill_graphs: collections.OrderedDict[
+            tuple[int, int, int, int], Any] = collections.OrderedDict()
+        self._pg_buffers: collections.OrderedDict[
+            tuple[int, int, int, int], dict[str, Any]] = (
+                collections.OrderedDict())
 
         device_obj = torch.device(device)
         if device_obj.type != 'cuda' or not torch.cuda.is_available():
@@ -180,6 +195,21 @@ class Qwen3VlTorchFrontendRtxBF16:
     _PG_KEYS = ('input_ids', 'pixel_values', 'pos_embeds',
                 'vcos', 'vsin', 'mcos', 'msin')
 
+    def _graph_cache_get(self, cache, key):
+        graph = cache.get(key)
+        if graph is not None and isinstance(cache, collections.OrderedDict):
+            cache.move_to_end(key)
+        return graph
+
+    def _trim_lru_graph_cache(self, cache, max_entries: int,
+                              on_evict=None) -> None:
+        if max_entries <= 0 or not isinstance(cache, collections.OrderedDict):
+            return
+        while len(cache) > max_entries:
+            old_key, _ = cache.popitem(last=False)
+            if on_evict is not None:
+                on_evict(old_key)
+
     def _alloc_buffers(self) -> None:
         import torch
 
@@ -226,14 +256,48 @@ class Qwen3VlTorchFrontendRtxBF16:
         p = self._prompt
         assert p is not None
         key = (int(P), int(S), int(span[0]), int(span[1]))
+        if not isinstance(self._pg_buffers, collections.OrderedDict):
+            self._pg_buffers = collections.OrderedDict(self._pg_buffers)
+        if not isinstance(self._prefill_graphs, collections.OrderedDict):
+            self._prefill_graphs = collections.OrderedDict(
+                self._prefill_graphs)
         bufs = self._pg_buffers.get(key)
         if bufs is None:
+            cap = self.max_prefill_graphs
+            while cap > 0 and len(self._pg_buffers) >= cap:
+                old_key, _ = self._pg_buffers.popitem(last=False)
+                self._prefill_graphs.pop(old_key, None)
             bufs = {k: p[k].clone() for k in self._PG_KEYS}
             self._pg_buffers[key] = bufs
         else:
+            self._pg_buffers.move_to_end(key)
             for k in self._PG_KEYS:
                 bufs[k].copy_(p[k])
         return key
+
+    def clear_graphs(self) -> None:
+        """Drop captured Qwen3-VL BF16 prefill/decode CUDA Graphs."""
+        for attr in ('_prefill_graphs', '_decode_graphs', '_pg_buffers'):
+            cache = getattr(self, attr, None)
+            if cache:
+                cache.clear()
+
+    def graph_cache_stats(self) -> dict[str, Any]:
+        """Return lightweight BF16 CUDA Graph cache diagnostics."""
+        return {
+            'prefill': {
+                'max_graphs': self.max_prefill_graphs,
+                'graph_count': len(self._prefill_graphs),
+                'buffer_count': len(self._pg_buffers),
+                'graph_keys': list(self._prefill_graphs.keys()),
+                'buffer_keys': list(self._pg_buffers.keys()),
+            },
+            'decode': {
+                'max_graphs': self.max_decode_graphs,
+                'graph_count': len(self._decode_graphs),
+                'graph_keys': list(self._decode_graphs.keys()),
+            },
+        }
 
     def set_prompt(self, messages: list) -> None:
         """Preprocess a single-image Qwen3-VL chat prompt."""
@@ -537,10 +601,30 @@ class Qwen3VlTorchFrontendRtxBF16:
         key = self._prompt.get('pg_key')
         if key is None:
             return self.prefill()
-        graph = self._prefill_graphs.get(key)
+        if not isinstance(self._pg_buffers, collections.OrderedDict):
+            self._pg_buffers = collections.OrderedDict(self._pg_buffers)
+        if not isinstance(self._prefill_graphs, collections.OrderedDict):
+            self._prefill_graphs = collections.OrderedDict(
+                self._prefill_graphs)
+        st = self._pg_buffers.get(key)
+        if st is None:
+            self._prefill_graphs.pop(key, None)
+            P, S, a, b = key
+            self._stage_prefill_inputs(P, S, (a, b))
+            st = self._pg_buffers[key]
+        graph = self._graph_cache_get(self._prefill_graphs, key)
         if graph is None:
-            graph = self._capture_prefill_graph(self._pg_buffers[key], key)
+            graph = self._capture_prefill_graph(st, key)
             self._prefill_graphs[key] = graph
+            if isinstance(self._prefill_graphs, collections.OrderedDict):
+                self._prefill_graphs.move_to_end(key)
+            if isinstance(self._pg_buffers, collections.OrderedDict):
+                self._pg_buffers.move_to_end(key)
+            self._trim_lru_graph_cache(
+                self._prefill_graphs, self.max_prefill_graphs,
+                lambda old_key: self._pg_buffers.pop(old_key, None))
+        elif isinstance(self._pg_buffers, collections.OrderedDict):
+            self._pg_buffers.move_to_end(key)
         graph.replay()
         self._cur_pos = int(key[1])
         return self._logits
@@ -582,7 +666,10 @@ class Qwen3VlTorchFrontendRtxBF16:
         import torch
 
         key = (int(cache_pos), int(rope_pos))
-        graph = self._decode_graphs.get(key)
+        if not isinstance(self._decode_graphs, collections.OrderedDict):
+            self._decode_graphs = collections.OrderedDict(
+                self._decode_graphs)
+        graph = self._graph_cache_get(self._decode_graphs, key)
         if graph is not None:
             return graph
         gs = self._graph_stream
@@ -600,6 +687,10 @@ class Qwen3VlTorchFrontendRtxBF16:
         gs.synchronize()
         torch.cuda.current_stream().wait_stream(gs)
         self._decode_graphs[key] = graph
+        if isinstance(self._decode_graphs, collections.OrderedDict):
+            self._decode_graphs.move_to_end(key)
+        self._trim_lru_graph_cache(
+            self._decode_graphs, self.max_decode_graphs)
         return graph
 
     def decode_step_with_graph(self, token_id: int, *, cache_pos: int,
