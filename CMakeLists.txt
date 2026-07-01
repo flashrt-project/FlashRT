@@ -952,30 +952,55 @@ endif()
 if(FLASHRT_BUILD_QWEN3_VL)
   # SM120 (RTX 5090): NVFP4/FP8 ViT helpers. SM89 (Ada): native FP8 block-128
   # GEMM/GEMV + fused act/norm-quant + QK norm-rope kernels for the official
-  # FP8 Qwen3-VL path. Both build into the same separate module so neither
-  # bloats the central flash_rt_kernels.so.
-  if(NOT (GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "89"))
+  # FP8 Qwen3-VL path. SM87 (Jetson Orin): BF16 ViT helper module only; the
+  # language path reuses the generic flash_rt_kernels BF16 Qwen3 helpers.
+  # All build into a separate module so neither bloats flash_rt_kernels.so.
+  if(NOT (GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "89" OR
+          GPU_ARCH STREQUAL "87"))
     message(FATAL_ERROR
       "FLASHRT_BUILD_QWEN3_VL requires GPU_ARCH=120 (RTX 5090 / sm_120) or "
-      "GPU_ARCH=89 (Ada / sm_89); got '${GPU_ARCH}'.")
+      "GPU_ARCH=89 (Ada / sm_89) or GPU_ARCH=87 (Jetson Orin / sm_87); "
+      "got '${GPU_ARCH}'.")
   endif()
+
   set(QWEN3_VL_SOURCES
     csrc/qwen3_vl_bindings.cpp
     csrc/kernels/rope_neox_qk_bf16.cu
-    csrc/kernels/norm_act_to_fp8_block128.cu
     csrc/kernels/bias_epilogue_bf16.cu)
-  if(GPU_ARCH STREQUAL "89")
+
+  if(GPU_ARCH STREQUAL "120")
+    list(APPEND QWEN3_VL_SOURCES
+      csrc/kernels/norm_act_to_fp8_block128.cu)
+  elseif(GPU_ARCH STREQUAL "89")
     # Ada has no TMA / no warp-specialized CUTLASS collective, so these are
     # hand-written cp.async + ldmatrix + block-128 scaling kernels (see
     # docs/qwen3_vl_fp8_sm89.md for why the SM120a CUTLASS path does not port).
     list(APPEND QWEN3_VL_SOURCES
+      csrc/kernels/norm_act_to_fp8_block128.cu
       csrc/gemm/fp8_block128_gemm_mma_sm89.cu
       csrc/gemm/fp8_gemv_m1_sm89.cu
       csrc/quantize/fp8_per_token_block_quant.cu
       csrc/kernels/qwen3_qkv_post_proc.cu
       csrc/kernels/bf16_matmul_bf16.cu)
+  elseif(GPU_ARCH STREQUAL "87")
+    list(APPEND QWEN3_VL_SOURCES
+      csrc/kernels/bf16_matmul_bf16.cu
+      csrc/kernels/qwen3_vl_bf16_gemv_m1.cu)
   endif()
+
   pybind11_add_module(flash_rt_qwen3_vl_kernels ${QWEN3_VL_SOURCES})
+  if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "89")
+    target_compile_definitions(flash_rt_qwen3_vl_kernels PRIVATE
+      ENABLE_QWEN3_VL_FP8_ACT=1)
+  endif()
+  if(GPU_ARCH STREQUAL "87" OR GPU_ARCH STREQUAL "89")
+    target_compile_definitions(flash_rt_qwen3_vl_kernels PRIVATE
+      ENABLE_QWEN3_VL_BF16_CUBLASLT=1)
+  endif()
+  if(GPU_ARCH STREQUAL "87")
+    target_compile_definitions(flash_rt_qwen3_vl_kernels PRIVATE
+      ENABLE_QWEN3_VL_BF16_GEMV_M1=1)
+  endif()
   if(GPU_ARCH STREQUAL "89")
     target_compile_definitions(flash_rt_qwen3_vl_kernels PRIVATE
       ENABLE_SM89_BLOCK_FP8_GEMM=1)
@@ -995,8 +1020,8 @@ if(FLASHRT_BUILD_QWEN3_VL)
       ${GPU_GENCODE}
     >)
   target_link_libraries(flash_rt_qwen3_vl_kernels PRIVATE CUDA::cudart)
-  if(GPU_ARCH STREQUAL "89")
-    # bf16_matmul_bf16 (ViT bf16 linears on SM89) uses cuBLASLt.
+  if(GPU_ARCH STREQUAL "87" OR GPU_ARCH STREQUAL "89")
+    # bf16_matmul_bf16 (ViT/language bf16 linears) uses cuBLASLt.
     target_link_libraries(flash_rt_qwen3_vl_kernels PRIVATE CUDA::cublasLt)
   endif()
   install(TARGETS flash_rt_qwen3_vl_kernels

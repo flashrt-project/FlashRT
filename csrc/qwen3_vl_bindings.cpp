@@ -22,22 +22,28 @@
 #include <cstdint>
 
 #include <cuda_bf16.h>
+#ifdef ENABLE_QWEN3_VL_FP8_ACT
 #include <cuda_fp8.h>
+#endif
 #include <cuda_runtime.h>
 
 // SM89 Qwen3-VL FP8 kernels (block-128 GEMM/GEMV + fused act/norm quant +
 // fused QK norm-rope-kvwrite). Bound here so the SM89 path imports them from
 // this dedicated module, just like the SM120 ViT helpers below, instead of
 // bloating the central flash_rt_kernels bindings.
+#if defined(ENABLE_SM89_BLOCK_FP8_GEMM) || defined(ENABLE_QWEN3_VL_BF16_CUBLASLT)
+#include "kernels/bf16_matmul_bf16.cuh"
+#endif
+
+#ifdef ENABLE_QWEN3_VL_BF16_GEMV_M1
+#include "kernels/qwen3_vl_bf16_gemv_m1.cuh"
+#endif
+
 #ifdef ENABLE_SM89_BLOCK_FP8_GEMM
 #include "gemm/fp8_block128_gemm_mma_sm89.cuh"
 #include "gemm/fp8_gemv_m1_sm89.cuh"
 #include "quantize/fp8_per_token_block_quant.cuh"
 #include "kernels/qwen3_qkv_post_proc.cuh"
-// Only bf16_matmul_cublaslt_bf16 is needed here; it lives in the neutral
-// matmul translation unit (#112), so the Qwen3-VL module no longer has to
-// pull in the Qwen3.6 AB96 matmul file.
-#include "kernels/bf16_matmul_bf16.cuh"
 #endif
 
 namespace py = pybind11;
@@ -50,6 +56,13 @@ void rope_neox_qk_bf16(
     __nv_bfloat16* q_out, __nv_bfloat16* k_out,
     int rows, int q_heads, int k_heads, int head_dim, cudaStream_t stream);
 
+#ifdef ENABLE_QWEN3_VL_BF16_GEMV_M1
+void qwen3_vl_bf16_gemv_m1(
+    const __nv_bfloat16* x, const __nv_bfloat16* W, __nv_bfloat16* out,
+    int N, int K, cudaStream_t stream);
+#endif
+
+#ifdef ENABLE_QWEN3_VL_FP8_ACT
 void layer_norm_to_fp8_block128_bf16(
     const __nv_bfloat16* x, const __nv_bfloat16* gamma,
     const __nv_bfloat16* beta, __nv_fp8_e4m3* out, float* scale,
@@ -62,6 +75,7 @@ void gelu_tanh_to_fp8_block128_bf16(
 void gelu_tanh_bias_to_fp8_block128_bf16(
     const __nv_bfloat16* x, const __nv_bfloat16* bias, __nv_fp8_e4m3* out,
     float* scale, int rows, int dim, cudaStream_t stream);
+#endif
 
 void residual_add_bias_bf16(
     __nv_bfloat16* residual, const __nv_bfloat16* x,
@@ -108,6 +122,7 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
         py::arg("q_heads"), py::arg("k_heads"), py::arg("head_dim"),
         py::arg("stream") = 0);
 
+#ifdef ENABLE_QWEN3_VL_FP8_ACT
     m.def(
         "layer_norm_to_fp8_block128_bf16",
         [](uintptr_t x, uintptr_t gamma, uintptr_t beta, uintptr_t out,
@@ -145,6 +160,7 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
         },
         py::arg("x"), py::arg("bias"), py::arg("out"), py::arg("scale"),
         py::arg("rows"), py::arg("dim"), py::arg("stream") = 0);
+#endif
 
     m.def(
         "residual_add_bias_bf16",
@@ -326,9 +342,11 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
     BIND_BLOCK128_GEMV_M1(gemv_fp8_block128_m1_w4);
     BIND_BLOCK128_GEMV_M1(gemv_fp8_block128_m1_w8);
     BIND_BLOCK128_GEMV_M1(gemv_fp8_block128_m1_w16);
+#endif  // ENABLE_SM89_BLOCK_FP8_GEMM
 
-    // BF16 cuBLASLt matmul for the ViT bf16 linears on SM89 (the SM120 path
-    // uses w16a16_gemm_sm120_bf16 from flash_rt_kernels instead).
+#ifdef ENABLE_QWEN3_VL_BF16_CUBLASLT
+    // BF16 cuBLASLt matmul for Qwen3-VL BF16 linears on SM87/SM89. SM120
+    // uses w16a16_gemm_sm120_bf16 from flash_rt_kernels instead.
     m.def("bf16_matmul_cublaslt_bf16",
         [](uintptr_t x, uintptr_t W, uintptr_t out,
            int M, int N, int K, uintptr_t stream) {
@@ -340,5 +358,19 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
         },
         py::arg("x"), py::arg("W"), py::arg("out"),
         py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
-#endif  // ENABLE_SM89_BLOCK_FP8_GEMM
+
+#ifdef ENABLE_QWEN3_VL_BF16_GEMV_M1
+    m.def("qwen3_vl_bf16_gemv_m1",
+        [](uintptr_t x, uintptr_t W, uintptr_t out,
+           int N, int K, uintptr_t stream) {
+            flash_rt::kernels::qwen3_vl_bf16_gemv_m1(
+                reinterpret_cast<const __nv_bfloat16*>(x),
+                reinterpret_cast<const __nv_bfloat16*>(W),
+                reinterpret_cast<__nv_bfloat16*>(out),
+                N, K, to_stream(stream));
+        },
+        py::arg("x"), py::arg("W"), py::arg("out"),
+        py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+#endif
+#endif
 }
