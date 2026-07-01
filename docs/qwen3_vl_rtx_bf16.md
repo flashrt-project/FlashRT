@@ -157,9 +157,16 @@ prefill graph P50: 953.8 ms
 decode throughput (warm graph): 36.7 tok/s
 ```
 
-The decode throughput improvement over the earlier generic M=1 BF16 GEMM
-bring-up comes from the Qwen3-VL `K=2048/6144` M=1 BF16 GEMV path. The
-cuBLASLt autotune mainly affects M>1 prefill replay.
+The two optimization effects were measured separately:
+
+| Change | Before | After |
+|---|---:|---:|
+| M=1 BF16 GEMV decode helper | ~16.2 tok/s | 36.8 tok/s |
+| cuBLASLt autotune for M>1 prefill GEMMs | 953.8 ms prefill P50 | 927.5 ms prefill P50 |
+
+The fixed-K M=1 GEMV helper provides the larger decode win. The cuBLASLt
+autotune mainly affects M>1 prefill replay; it has little effect on decode
+throughput once the M=1 GEMV helper is enabled.
 
 ### Resolution knob
 
