@@ -8,6 +8,8 @@ route. The hot linears use block-scaled M=1 FP8 GEMV against the checkpoint's
 """
 from __future__ import annotations
 
+import collections
+import os
 from typing import Any
 
 
@@ -58,9 +60,9 @@ class Qwen3VlFp8Sm89TextFrontend:
                  max_prefill_seq: int | None = None,
                  fuse_gate_up: bool = False,
                  fuse_qk_postproc: bool = True,
-                 use_fp8_lm_head: bool = False) -> None:
+                 use_fp8_lm_head: bool = False,
+                 max_decode_graphs: int | None = None) -> None:
         import json
-        import os
 
         self.checkpoint_path = str(checkpoint_path)
         self.device = device
@@ -75,7 +77,12 @@ class Qwen3VlFp8Sm89TextFrontend:
         self._cfg: dict | None = None
         self._attn = None
         self._cur_pos = 0
-        self._decode_graphs: dict[int, Any] = {}
+        if max_decode_graphs is None:
+            max_decode_graphs = int(os.environ.get(
+                'FLASHRT_QWEN3_VL_DECODE_GRAPH_CACHE_MAX', '256'))
+        self.max_decode_graphs = int(max_decode_graphs)
+        self._decode_graphs: collections.OrderedDict[int, Any] = (
+            collections.OrderedDict())
 
         import torch
         fvk = _import_fvk()
@@ -155,6 +162,31 @@ class Qwen3VlFp8Sm89TextFrontend:
         self._load_fp8_path()
         self._alloc_buffers()
         self._build_rope_table()
+
+    def _graph_cache_get(self, cache, key):
+        graph = cache.get(key)
+        if graph is not None and isinstance(cache, collections.OrderedDict):
+            cache.move_to_end(key)
+        return graph
+
+    def _trim_lru_graph_cache(self, cache, max_entries: int) -> None:
+        if max_entries <= 0 or not isinstance(cache, collections.OrderedDict):
+            return
+        while len(cache) > max_entries:
+            cache.popitem(last=False)
+
+    def clear_graphs(self) -> None:
+        if self._decode_graphs:
+            self._decode_graphs.clear()
+
+    def graph_cache_stats(self) -> dict[str, Any]:
+        return {
+            'decode': {
+                'max_graphs': self.max_decode_graphs,
+                'graph_count': len(self._decode_graphs),
+                'graph_keys': list(self._decode_graphs.keys()),
+            },
+        }
 
     def _load_fp8_path(self) -> None:
         from transformers import AutoTokenizer
@@ -691,7 +723,10 @@ class Qwen3VlFp8Sm89TextFrontend:
     def _ensure_decode_graph(self, cur_pos: int):
         import torch
 
-        graph = self._decode_graphs.get(cur_pos)
+        if not isinstance(self._decode_graphs, collections.OrderedDict):
+            self._decode_graphs = collections.OrderedDict(
+                self._decode_graphs)
+        graph = self._graph_cache_get(self._decode_graphs, cur_pos)
         if graph is not None:
             return graph
         cos, sin = self._rope_cos_sin(cur_pos)
@@ -709,6 +744,10 @@ class Qwen3VlFp8Sm89TextFrontend:
         gs.synchronize()
         torch.cuda.current_stream().wait_stream(gs)
         self._decode_graphs[cur_pos] = graph
+        if isinstance(self._decode_graphs, collections.OrderedDict):
+            self._decode_graphs.move_to_end(cur_pos)
+        self._trim_lru_graph_cache(
+            self._decode_graphs, self.max_decode_graphs)
         return graph
 
     def decode_step_with_graph(self, token_id, cur_pos: int):
