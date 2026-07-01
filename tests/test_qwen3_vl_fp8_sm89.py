@@ -15,6 +15,7 @@ def test_frontend_imports():
     text_cls = m.Qwen3VlFp8Sm89TextFrontend
     assert hasattr(m, 'Qwen3VlFp8Sm89TextFrontend')
     assert 'max_prefill_seq' in inspect.signature(text_cls).parameters
+    assert 'max_decode_graphs' in inspect.signature(text_cls).parameters
     assert 'run_lm_head' in inspect.signature(
         text_cls.forward_hidden_prefill_fp8_blockscaled).parameters
     mm = importlib.import_module(
@@ -24,11 +25,13 @@ def test_frontend_imports():
     assert 'max_prefill_seq' in inspect.signature(
         cls).parameters
     for name in ('fuse_gate_up', 'fuse_qk_postproc', 'use_fp8_lm_head',
-                 'vision_bf16_first_blocks'):
+                 'vision_bf16_first_blocks', 'max_prefill_graphs',
+                 'max_decode_graphs'):
         assert name in inspect.signature(cls).parameters
     for name in (
         'prefill_graph', 'decode_step_with_graph',
-        'warmup_decode_graphs', 'generate',
+        'warmup_decode_graphs', 'clear_graphs', 'graph_cache_stats',
+        'generate',
     ):
         assert hasattr(cls, name)
 
