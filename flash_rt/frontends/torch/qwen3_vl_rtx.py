@@ -149,9 +149,9 @@ class Qwen3VlTorchFrontendRtx:
         self.max_prefill_graphs = int(max_prefill_graphs)
         self.max_decode_graphs = int(max_decode_graphs)
 
-        # cache-slot -> captured decode CUDA Graph (rope baked at the
-        # MRoPE-continuation position, which differs from the slot).
-        self._decode_graphs: collections.OrderedDict[int, Any] = (
+        # (cache-slot, rope-pos) -> captured decode CUDA Graph. The RoPE slice
+        # is baked into capture and can differ across prompts for one slot.
+        self._decode_graphs: collections.OrderedDict[tuple[int, int], Any] = (
             collections.OrderedDict())
         # Captured single-image prefill: (P,S,a,b) -> graph, plus the static
         # input buffers set_prompt stages into and the persistent output
@@ -535,10 +535,11 @@ class Qwen3VlTorchFrontendRtx:
         import torch
 
         llm = self.llm
+        key = (int(cache_pos), int(rope_pos))
         if not isinstance(self._decode_graphs, collections.OrderedDict):
             self._decode_graphs = collections.OrderedDict(
                 self._decode_graphs)
-        g = self._graph_cache_get(self._decode_graphs, cache_pos)
+        g = self._graph_cache_get(self._decode_graphs, key)
         if g is not None:
             return g
         cos, sin = llm._rope_cos_sin(rope_pos)
@@ -555,9 +556,9 @@ class Qwen3VlTorchFrontendRtx:
                 llm._static_token_id, cos, sin, cache_pos)
         gs.synchronize()
         torch.cuda.current_stream().wait_stream(gs)
-        self._decode_graphs[cache_pos] = g
+        self._decode_graphs[key] = g
         if isinstance(self._decode_graphs, collections.OrderedDict):
-            self._decode_graphs.move_to_end(cache_pos)
+            self._decode_graphs.move_to_end(key)
         self._trim_lru_graph_cache(
             self._decode_graphs, self.max_decode_graphs)
         return g

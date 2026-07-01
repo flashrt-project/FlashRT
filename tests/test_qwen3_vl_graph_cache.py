@@ -76,7 +76,7 @@ def test_qwen3_vl_decode_graph_cache_is_lru_bounded(monkeypatch):
         fe._ensure_decode_graph(cache_pos, rope_pos=100 + cache_pos)
 
     assert len(fe._decode_graphs) == fe.max_decode_graphs
-    assert list(fe._decode_graphs) == [3, 4]
+    assert list(fe._decode_graphs) == [(3, 103), (4, 104)]
 
 
 def test_qwen3_vl_prefill_graph_cache_eviction_drops_static_buffers():
@@ -177,7 +177,8 @@ def test_qwen3_vl_graph_cache_stats_and_clear_graphs():
     fe.max_decode_graphs = 5
     fe._prefill_graphs = collections.OrderedDict([(("p0",), object())])
     fe._pg_buffers = collections.OrderedDict([(("p0",), object())])
-    fe._decode_graphs = collections.OrderedDict([(3, object()), (4, object())])
+    fe._decode_graphs = collections.OrderedDict([
+        ((3, 103), object()), ((4, 104), object())])
 
     stats = fe.graph_cache_stats()
     assert stats["prefill"]["max_graphs"] == 7
@@ -186,7 +187,7 @@ def test_qwen3_vl_graph_cache_stats_and_clear_graphs():
     assert stats["prefill"]["graph_keys"] == [("p0",)]
     assert stats["decode"]["max_graphs"] == 5
     assert stats["decode"]["graph_count"] == 2
-    assert stats["decode"]["graph_keys"] == [3, 4]
+    assert stats["decode"]["graph_keys"] == [(3, 103), (4, 104)]
 
     fe.clear_graphs()
 
