@@ -70,8 +70,19 @@ class Qwen3VlVisionRtx:
         import os
         index_path = os.path.join(
             checkpoint_path, 'model.safetensors.index.json')
-        wmap = json.load(open(index_path))['weight_map']
         shards: dict[str, Any] = {}
+        if os.path.isfile(index_path):
+            with open(index_path) as f:
+                wmap = json.load(f)['weight_map']
+        else:
+            single = os.path.join(checkpoint_path, 'model.safetensors')
+            if not os.path.isfile(single):
+                raise RuntimeError(
+                    f'Qwen3-VL ckpt missing both index and model.safetensors: '
+                    f'{checkpoint_path}')
+            h = safe_open(single, framework='pt', device='cpu')
+            shards['model.safetensors'] = h
+            wmap = {key: 'model.safetensors' for key in h.keys()}
 
         def _w(key: str):
             shard = wmap[key]
@@ -199,8 +210,12 @@ class Qwen3VlVisionRtx:
                 fvk.w16a16_gemm_sm120_bf16(
                     x.data_ptr(), ws.data_ptr(), y.data_ptr(), M, N, K, 1.0,
                     stream)
-            else:
+            elif hasattr(self._vlk, 'bf16_matmul_cublaslt_bf16'):
                 self._vlk.bf16_matmul_cublaslt_bf16(
+                    x.data_ptr(), ws.data_ptr(), y.data_ptr(), M, N, K,
+                    stream)
+            else:
+                fvk.bf16_matmul_bf16(
                     x.data_ptr(), ws.data_ptr(), y.data_ptr(), M, N, K,
                     stream)
         else:                                           # FP8 block-128 W8A8
@@ -547,5 +562,6 @@ def _load_merger(load_fn, lin_fn, prefix: str) -> dict:
 def _read_vision_config(checkpoint_path: str) -> dict:
     import json
     import os
-    cfg = json.load(open(os.path.join(checkpoint_path, 'config.json')))
+    with open(os.path.join(checkpoint_path, 'config.json')) as f:
+        cfg = json.load(f)
     return cfg['vision_config']

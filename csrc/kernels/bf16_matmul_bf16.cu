@@ -10,10 +10,14 @@
 #include "bf16_matmul_bf16.cuh"
 
 #include <cublasLt.h>
+#include <algorithm>
+#include <cstdlib>
+#include <iostream>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace flash_rt::kernels {
 
@@ -39,6 +43,7 @@ struct Bf16LtPlan {
     cublasLtMatrixLayout_t b_desc = nullptr;
     cublasLtMatrixLayout_t c_desc = nullptr;
     cublasLtMatmulAlgo_t algo{};
+    bool autotuned = false;
 };
 
 struct Bf16LtKey {
@@ -66,6 +71,17 @@ static size_t g_bf16_workspace_size = 32 * 1024 * 1024;
 static std::mutex g_bf16_mu;
 static std::unordered_map<Bf16LtKey, Bf16LtPlan, Bf16LtKeyHash>
     g_bf16_plans;
+
+static int get_bf16_autotune_algos() {
+    const char* env = std::getenv("FLASHRT_BF16_CUBLASLT_AUTOTUNE_ALGOS");
+    if (!env || !*env) return 8;
+    return std::clamp(std::atoi(env), 1, 32);
+}
+
+static bool get_bf16_autotune_verbose() {
+    const char* env = std::getenv("FLASHRT_BF16_CUBLASLT_AUTOTUNE_VERBOSE");
+    return env && std::atoi(env) != 0;
+}
 
 static void ensure_bf16_lt() {
     if (g_bf16_lt) return;
@@ -133,6 +149,150 @@ static Bf16LtPlan& get_bf16_lt_plan(int M, int N, int K) {
 
     auto [inserted, _] = g_bf16_plans.emplace(key, plan);
     return inserted->second;
+}
+
+static void autotune_bf16_lt_plan(
+    Bf16LtPlan& plan,
+    const __nv_bfloat16* x,
+    const __nv_bfloat16* W,
+    __nv_bfloat16* out,
+    int M,
+    int N,
+    int K,
+    cudaStream_t stream) {
+    if (plan.autotuned) return;
+    const int num_algos = get_bf16_autotune_algos();
+    if (num_algos <= 1) {
+        plan.autotuned = true;
+        return;
+    }
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    cudaError_t capture_err = cudaStreamIsCapturing(stream, &capture_status);
+    if (capture_err == cudaSuccess && capture_status != cudaStreamCaptureStatusNone) {
+        return;
+    }
+
+    cublasLtMatmulPreference_t pref;
+    FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatmulPreferenceCreate(&pref));
+    FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatmulPreferenceSetAttribute(
+        pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        &g_bf16_workspace_size, sizeof(g_bf16_workspace_size)));
+
+    std::vector<cublasLtMatmulHeuristicResult_t> heuristics(num_algos);
+    int returned = 0;
+    FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatmulAlgoGetHeuristic(
+        g_bf16_lt, plan.desc, plan.a_desc, plan.b_desc,
+        plan.c_desc, plan.c_desc, pref, num_algos, heuristics.data(),
+        &returned));
+    cublasLtMatmulPreferenceDestroy(pref);
+    if (returned <= 1) {
+        plan.autotuned = true;
+        return;
+    }
+
+    cudaEvent_t start, stop;
+    cudaError_t err = cudaEventCreate(&start);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaEventCreate failed: ") +
+                                 cudaGetErrorString(err));
+    }
+    err = cudaEventCreate(&stop);
+    if (err != cudaSuccess) {
+        cudaEventDestroy(start);
+        throw std::runtime_error(std::string("cudaEventCreate failed: ") +
+                                 cudaGetErrorString(err));
+    }
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    constexpr int kWarmup = 1;
+    constexpr int kBench = 3;
+    float best_ms = 1.0e30f;
+    int best_idx = -1;
+
+    for (int i = 0; i < returned; ++i) {
+        bool ok = true;
+        for (int w = 0; w < kWarmup; ++w) {
+            cublasStatus_t st = cublasLtMatmul(
+                g_bf16_lt, plan.desc, &alpha,
+                x, plan.a_desc,
+                W, plan.b_desc,
+                &beta,
+                out, plan.c_desc,
+                out, plan.c_desc,
+                &heuristics[i].algo, g_bf16_workspace,
+                g_bf16_workspace_size, stream);
+            if (st != CUBLAS_STATUS_SUCCESS) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) continue;
+
+        err = cudaEventRecord(start, stream);
+        if (err != cudaSuccess) {
+            cudaEventDestroy(start);
+            cudaEventDestroy(stop);
+            throw std::runtime_error(std::string("cudaEventRecord failed: ") +
+                                     cudaGetErrorString(err));
+        }
+        for (int b = 0; b < kBench; ++b) {
+            cublasStatus_t st = cublasLtMatmul(
+                g_bf16_lt, plan.desc, &alpha,
+                x, plan.a_desc,
+                W, plan.b_desc,
+                &beta,
+                out, plan.c_desc,
+                out, plan.c_desc,
+                &heuristics[i].algo, g_bf16_workspace,
+                g_bf16_workspace_size, stream);
+            if (st != CUBLAS_STATUS_SUCCESS) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) continue;
+        err = cudaEventRecord(stop, stream);
+        if (err != cudaSuccess) {
+            cudaEventDestroy(start);
+            cudaEventDestroy(stop);
+            throw std::runtime_error(std::string("cudaEventRecord failed: ") +
+                                     cudaGetErrorString(err));
+        }
+        err = cudaEventSynchronize(stop);
+        if (err != cudaSuccess) {
+            cudaEventDestroy(start);
+            cudaEventDestroy(stop);
+            throw std::runtime_error(std::string("cudaEventSynchronize failed: ") +
+                                     cudaGetErrorString(err));
+        }
+        float ms = 0.0f;
+        err = cudaEventElapsedTime(&ms, start, stop);
+        if (err != cudaSuccess) {
+            cudaEventDestroy(start);
+            cudaEventDestroy(stop);
+            throw std::runtime_error(std::string("cudaEventElapsedTime failed: ") +
+                                     cudaGetErrorString(err));
+        }
+        ms /= static_cast<float>(kBench);
+        if (ms < best_ms) {
+            best_ms = ms;
+            best_idx = i;
+        }
+    }
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    if (best_idx >= 0) {
+        plan.algo = heuristics[best_idx].algo;
+    }
+    plan.autotuned = true;
+    if (best_idx >= 0 && get_bf16_autotune_verbose()) {
+        std::cout << "  bf16_matmul_cublaslt autotune: shape=("
+                  << M << "," << N << "," << K << ") tested=" << returned
+                  << " best=" << best_idx << " (" << best_ms * 1000.0f
+                  << " us)" << std::endl;
+    }
 }
 
 // Vectorized: each thread reads 8 bf16 = 16 bytes per iter via int4.
@@ -253,7 +413,7 @@ void bf16_matmul_bf16(
     dim3 grid((N + kWarpsPerBlock - 1) / kWarpsPerBlock, M);
     // Specialization set must match the bf16_matvec sibling so the
     // M=1 reference and the M=K test produce bit-identical reductions
-    // (different chunking → different fma order → bf16 drift). matvec
+    // (different chunking -> different fma order -> bf16 drift). matvec
     // specializes K=5120 and K=4096; everything else (incl. K=6144 for
     // lin_K out_proj) falls to the generic chunked path.
     if (K == 5120) {
@@ -277,6 +437,10 @@ void bf16_matmul_cublaslt_bf16(
     cudaStream_t stream) {
     if (M <= 0 || N <= 0 || K <= 0) return;
     Bf16LtPlan& plan = get_bf16_lt_plan(M, N, K);
+    if (!plan.autotuned) {
+        std::lock_guard<std::mutex> lock(g_bf16_mu);
+        autotune_bf16_lt_plan(plan, x, W, out, M, N, K, stream);
+    }
     const float alpha = 1.0f;
     const float beta = 0.0f;
     FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatmul(
