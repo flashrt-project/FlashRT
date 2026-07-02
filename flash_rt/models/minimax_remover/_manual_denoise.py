@@ -43,7 +43,7 @@ from ._kernels import (ada_layernorm_fp16_io, gate_mul_residual_bcast,
                        rms_norm_fp32stat, rope_apply_bshd, freqs_to_cos_sin,
                        euler_step_inplace, mask_mul,
                        latent_normalize, latent_denormalize)
-from ._attention import _sage_attn, _attention_mode
+from ._attention import attention_forward, _attention_mode
 
 _USE_FUSED_BLOCK = os.environ.get("FLASHRT_FUSED_BLOCK", "1") == "1"
 
@@ -116,7 +116,7 @@ def block_forward_fused(block, hidden_states, mod, rotary_emb, eps, kern,
     k = k.contiguous()
     v = v.contiguous()
     scale = 1.0 / math.sqrt(float(Dd))
-    out = _sage_attn(q, k, v, scale, _attention_mode())
+    out = attention_forward(q, k, v, scale, _attention_mode())
     attn_out = attn.to_out[0](out.view(1, S, D)).view(S, D)
     gate_mul_residual_bcast(hs, attn_out, mod[2])
 

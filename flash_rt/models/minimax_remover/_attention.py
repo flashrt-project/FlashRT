@@ -76,6 +76,37 @@ def _sage_attn(q, k, v, scale, mode):
     return sa.sageattn(q, k, v, **kw)
 
 
+def _fa2_attn(q, k, v, scale, lse_cache=None):
+    """Run FlashRT's vendored FA2 backend on [B, S, H, D] fp16 tensors."""
+    B, S, H, Dd = q.shape
+    out = torch.empty_like(q)
+    if lse_cache is None:
+        lse = torch.empty(B, H, S, device=q.device, dtype=torch.float32)
+    else:
+        lse = lse_cache.get((B, S, H))
+        if lse is None:
+            lse = torch.empty(B, H, S, device=q.device, dtype=torch.float32)
+            lse_cache[(B, S, H)] = lse
+    from flash_rt import flash_rt_fa2 as fa2
+    qs, ks, vs, os_ = (q.stride(), k.stride(), v.stride(), out.stride())
+    fa2.fwd_fp16(
+        q.data_ptr(), k.data_ptr(), v.data_ptr(), out.data_ptr(),
+        lse.data_ptr(), 0, 0,
+        B, S, S, H, H, Dd,
+        (qs[0], qs[1], qs[2]), (ks[0], ks[1], ks[2]), (vs[0], vs[1], vs[2]),
+        (os_[0], os_[1], os_[2]),
+        scale, _NUM_SMS, torch.cuda.current_stream().cuda_stream)
+    return out
+
+
+def attention_forward(q, k, v, scale, mode=None, *, lse_cache=None):
+    """Dispatch MiniMax-Remover attention without importing unused backends."""
+    mode = _attention_mode() if mode is None else str(mode).lower()
+    if mode.startswith("sage"):
+        return _sage_attn(q, k, v, scale, mode)
+    return _fa2_attn(q, k, v, scale, lse_cache)
+
+
 class FlashRTFA2Processor:
     """Kernel attention processor for the native [B, S, H, D] layout.
 
@@ -125,23 +156,8 @@ class FlashRTFA2Processor:
         if not v.is_contiguous():
             v = v.contiguous()
 
-        if mode.startswith("sage"):
-            out = _sage_attn(q, k, v, scale, mode)
-        else:
-            out = torch.empty_like(q)
-            lse = self._lse_bufs.get((B, S, H))
-            if lse is None:
-                lse = torch.empty(B, H, S, device=q.device, dtype=torch.float32)
-                self._lse_bufs[(B, S, H)] = lse
-            from flash_rt import flash_rt_fa2 as fa2
-            qs, ks, vs, os_ = (q.stride(), k.stride(), v.stride(), out.stride())
-            fa2.fwd_fp16(
-                q.data_ptr(), k.data_ptr(), v.data_ptr(), out.data_ptr(),
-                lse.data_ptr(), 0, 0,
-                B, S, S, H, H, Dd,
-                (qs[0], qs[1], qs[2]), (ks[0], ks[1], ks[2]), (vs[0], vs[1], vs[2]),
-                (os_[0], os_[1], os_[2]),
-                scale, _NUM_SMS, torch.cuda.current_stream().cuda_stream)
+        out = attention_forward(q, k, v, scale, mode,
+                                lse_cache=self._lse_bufs)
 
         hidden_states = out.view(B, S, H * Dd)
         hidden_states = attn.to_out[0](hidden_states)
