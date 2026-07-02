@@ -45,7 +45,15 @@ _SAGE = None
 def _get_sage():
     global _SAGE
     if _SAGE is None:
-        import sageattention as _m
+        try:
+            import sageattention as _m
+        except ImportError as e:
+            raise RuntimeError(
+                "FLASHRT_ATTN_MODE=sage_* requires the 'sageattention' package "
+                "(the default attention backend). Install the model extra:\n"
+                "    pip install -e \".[minimax-remover]\"\n"
+                "or switch to the dependency-light FlashRT FA2 backend:\n"
+                "    FLASHRT_ATTN_MODE=fa2") from e
         _SAGE = _m
     return _SAGE
 

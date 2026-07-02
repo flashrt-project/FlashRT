@@ -6,25 +6,35 @@ MiniMax-Remover video inpainting (subtitle / object removal) with NVFP4
 ## Build
 
 The pipeline reuses the **generic** FlashRT SM120 NVFP4 kernels — it
-ships **no model-specific CUDA operators**. It requires those generic
-kernels to be compiled in. Build FlashRT on a Blackwell host with the
-NVFP4 build option enabled so the NVFP4 quantise / W4A4 GEMM /
-fused-bias-gelu kernels are present in `flash_rt_kernels.so`:
+ships **no model-specific CUDA operators**. Building for Blackwell
+auto-enables the NVFP4 kernels (the NVFP4 quantise / W4A4 GEMM /
+fused-bias-gelu entry points land in `flash_rt_kernels.so`):
 
 ```bash
 cd FlashRT
-mkdir build && cd build
-cmake .. -DENABLE_CUTLASS_SM120_NVFP4_W4A16=ON
-make -j$(nproc)
-pip install -e ..
+cmake -S . -B build -DGPU_ARCH=120 -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j --target flash_rt_kernels
+pip install -e ".[torch,minimax-remover]"
 ```
 
-Importing `flash_rt.models.minimax_remover` always succeeds; the kernel
-surface is validated lazily in `MiniMaxRemoverPipeline.__init__` via
-`_load_kernels()`. If any required symbol is missing the constructor
-raises a clear `RuntimeError` listing the missing names, so a non-NVFP4
-build fails fast instead of crashing mid-quantisation. The required
-generic symbols are:
+`GPU_ARCH=120` (RTX 5090) or `121` selects the Blackwell target; the
+NVFP4 surface is compiled in automatically (internally gated by
+`ENABLE_CUTLASS_SM120_NVFP4_W4A16`, which is set from `GPU_ARCH`, not a
+flag users pass). Then install the runtime extras:
+
+```bash
+pip install -e ".[minimax-remover]"   # diffusers + einops + sageattention
+```
+
+Importing `flash_rt.models.minimax_remover` always succeeds — it needs
+**none** of `diffusers` / `einops` / `triton` / `sageattention`. The
+kernel surface is validated lazily in
+`MiniMaxRemoverPipeline.__init__` via `_load_kernels()`, and the runtime
+deps are resolved at construction via `_import_runtime()`. If a required
+symbol or dep is missing the constructor raises a clear `RuntimeError`
+with the rebuild/install hint, so a non-NVFP4 build or a bare
+environment fails fast instead of crashing mid-run. The required generic
+symbols are:
 
 | Symbol | Role |
 |--------|------|
@@ -36,8 +46,8 @@ generic symbols are:
 | `fp4_w4a16_gemm_bias_gelu_fp4out_sm120` | fused FFN-up GEMM + bias + GELU -> FP4 |
 
 The attention backend (`FLASHRT_ATTN_MODE`) optionally pulls in
-`sageattention` (Sage) or `triton_flash_attn` (Triton FA); `fa2` uses
-the vendored `flash_rt_fa2.so`. The fused norm / RoPE / Euler-step
+`sageattention` (Sage); `fa2` uses the vendored `flash_rt_fa2.so` and is
+the dependency-light fallback. The fused norm / RoPE / Euler-step
 elementwise kernels are self-contained Triton JIT kernels shipped in the
 package (`_kernels.py`) and need no build step.
 

@@ -19,6 +19,12 @@ torch = ["torch", "safetensors", "sentencepiece"]
 jax = ["jax", "jaxlib", "ml_dtypes", "orbax-checkpoint", "flax"]
 server = ["fastapi", "uvicorn"]
 eval = ["opencv-python", "tqdm"]
+# MiniMax-Remover NVFP4 video-inpainting pipeline. Optional: only needed to
+# construct/run flash_rt.models.minimax_remover (importing the package needs
+# none of these). diffusers + einops are the runtime model deps; sageattention
+# is the default attention backend (FLASHRT_ATTN_MODE=sage_fp8) -- switch to
+# FLASHRT_ATTN_MODE=fa2 to drop it. triton ships with torch on CUDA.
+minimax-remover = ["diffusers", "einops", "sageattention"]
 # Optional. Required only for the legacy upstream attention path
 # (FVK_RTX_FA2=0 / FVK_RTX_FA2_SITES=...) and the GROOT N1.6/N1.7
 # backend. Default RTX Pi0 / Pi0.5 inference uses the vendored
@@ -35,7 +41,7 @@ flash-attn = ["flash-attn"]
 # (flash_rt/hardware/thor/fa4_backend.py) sets CUTE_DSL_ARCH=sm_101a.
 # Requires an editable / source-tree install (pip install -e). pip install ".[thor-fa4]".
 thor-fa4 = ["nvidia-cutlass-dsl==4.5.1", "quack-kernels==0.4.1"]
-all = ["flash-rt[torch,jax,server,eval]"]
+all = ["flash-rt[torch,jax,server,eval,minimax-remover]"]
 
 [tool.setuptools.packages.find]
 include = ["flash_rt*"]
