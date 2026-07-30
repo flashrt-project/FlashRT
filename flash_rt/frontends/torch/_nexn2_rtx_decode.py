@@ -29,7 +29,8 @@ import torch.nn.functional as F
 
 from flash_rt.frontends.torch._nexn2_rtx_forward import (
     CONV, HD, HID, HK, HV, INTER, KD, KS, NKV, NQ, NV, ROPE, TOPK, VD,
-    _quant_act, build_rope_tables, nexn2_forward_nvfp4,
+    _quant_act, build_rope_tables, moe_grouped_w4a16, nexn2_forward_nvfp4,
+    w4a16_matvec,
 )
 from flash_rt.frontends.torch._nexn2_rtx_nvfp4_weights import _sf_swz_bytes
 from flash_rt.hardware.rtx.attn_backend_nexn2 import RtxFlashAttnBackendNexn2
@@ -114,7 +115,7 @@ def _w4a16_mv(x1k, w_bf16, ld, key, fvk, device):
         ld[key + '_w4a16_a'] = float(og.item())
     xc = x1k.contiguous()
     y = torch.empty(1, n, dtype=torch.bfloat16, device=device)
-    fvk.w4a16_matvec_sm120_bf16(
+    w4a16_matvec(fvk)(
         xc.data_ptr(), ld[pk].data_ptr(), ld[key + '_w4a16_sf'].data_ptr(),
         y.data_ptr(), n, k, ld[key + '_w4a16_a'], _cs())
     return y
@@ -586,7 +587,7 @@ def _moe_layer_decode(h, ld, state, fvk, device):
         # and faster at this scale (6.2 vs 8.2 us standalone).
         xc = x.contiguous()
         d_gu = torch.empty(TOPK, n_gu, dtype=torch.bfloat16, device=device)
-        fvk.moe_grouped_w4a16_sm120_bf16(
+        moe_grouped_w4a16(fvk)(
             xc.data_ptr(), gu_p.data_ptr(), gu_s.data_ptr(), gu_a.data_ptr(),
             idx.data_ptr(), d_gu.data_ptr(), TOPK, n_gu, HID,
             0, gu_p[0].numel(), gu_s[0].numel(), s)
@@ -595,7 +596,7 @@ def _moe_layer_decode(h, ld, state, fvk, device):
         g_, u_ = d_gu[:, :INTER], d_gu[:, INTER:]
         inter = _silu_mul(g_, u_, fvk, device).contiguous()
         d_dn = torch.empty(TOPK, n_dn, dtype=torch.bfloat16, device=device)
-        fvk.moe_grouped_w4a16_sm120_bf16(
+        moe_grouped_w4a16(fvk)(
             inter.data_ptr(), dn_p.data_ptr(), dn_s.data_ptr(), dn_a.data_ptr(),
             idx.data_ptr(), d_dn.data_ptr(), TOPK, n_dn, INTER,
             INTER, dn_p[0].numel(), dn_s[0].numel(), s)
@@ -696,7 +697,7 @@ def decode_step(state, token_id, pos, fvk, device):
     # swizzled weight and the same scale factors, leaves the activation in
     # bf16 -- so it also skips the activation quantisation and its error -- and
     # lives in a tier that builds wherever the core does.
-    fvk.w4a16_matvec_sm120_bf16(
+    w4a16_matvec(fvk)(
         h.reshape(1, HID).contiguous().data_ptr(),
         p['lm_head_packed_t'].data_ptr(), p['lm_head_sf_t'].data_ptr(),
         logits.data_ptr(), vocab, HID, p['lm_head_alpha'], _cs())

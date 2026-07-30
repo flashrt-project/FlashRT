@@ -1522,6 +1522,7 @@ if(FLASHRT_ENABLE_QWEN35MOE_W4A16)
   target_sources(flash_rt_kernels PRIVATE
     csrc/kernels/w4a16_matvec_sm120.cu
     csrc/kernels/moe_grouped_w4a16_sm120.cu
+    csrc/kernels/w4a16_edge_sm120.cu
     csrc/kernels/w4a16_gemm_sm120.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE
     FLASHRT_HAVE_QWEN35MOE_W4A16=1)

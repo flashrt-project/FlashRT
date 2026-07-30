@@ -660,6 +660,34 @@ def _full_attn_layer(h, ld, ct, st, fvk, device, eps, cap=None, rank=None,
     return _proj(at, ld, 'o_proj', HID, fvk, device).reshape(B, S, HID)
 
 
+# The two weight-only 4-bit GEMVs each have an "edge" variant that is bitwise
+# identical -- it differs only in a shared-memory layout and in decoding the
+# UE4M3 scale byte arithmetically rather than through a constant-memory lookup
+# whose index differs per lane. Because the outputs are identical to the bit,
+# choosing between them is purely a performance decision and cannot move a
+# token, so preferring the variant needs no accuracy argument. Set
+# FLASHRT_QWEN35MOE_W4A16_EDGE=0 to force the original.
+_EDGE_W4A16 = _os.environ.get("FLASHRT_QWEN35MOE_W4A16_EDGE", "1") != "0"
+
+
+def w4a16_matvec(fvk):
+    """The dense 4-bit GEMV entry point this build should call."""
+    if _EDGE_W4A16:
+        fn = getattr(fvk, 'w4a16_matvec_edge_sm120_bf16', None)
+        if fn is not None:
+            return fn
+    return fvk.w4a16_matvec_sm120_bf16
+
+
+def moe_grouped_w4a16(fvk):
+    """The grouped per-slot 4-bit GEMV entry point this build should call."""
+    if _EDGE_W4A16:
+        fn = getattr(fvk, 'moe_grouped_w4a16_edge_sm120_bf16', None)
+        if fn is not None:
+            return fn
+    return fvk.moe_grouped_w4a16_sm120_bf16
+
+
 # Grouped MoE for prefill (on by default); set False to use the per-expert loop.
 _USE_GROUPED_MOE = True
 # M=16 tensor-core mma MoE: tokens are sorted into 16-row expert tiles and the
@@ -840,14 +868,14 @@ def _moe_experts_grouped(x, ti, tw, ld, fvk, device):
 
     A = x[stok].contiguous()                          # (slots, HID) bf16
     d_gu = torch.empty(slots, n_gu, dtype=torch.bfloat16, device=device)
-    fvk.moe_grouped_w4a16_sm120_bf16(
+    moe_grouped_w4a16(fvk)(
         A.data_ptr(), gu_p.data_ptr(), gu_s.data_ptr(), gu_a.data_ptr(),
         se.data_ptr(), d_gu.data_ptr(), slots, n_gu, HID,
         HID, gu_p[0].numel(), gu_s[0].numel(), 0)
     g, u = d_gu[:, :INTER], d_gu[:, INTER:]
     inter = _silu_mul(g, u, fvk, device).contiguous()
     d_dn = torch.empty(slots, n_dn, dtype=torch.bfloat16, device=device)
-    fvk.moe_grouped_w4a16_sm120_bf16(
+    moe_grouped_w4a16(fvk)(
         inter.data_ptr(), dn_p.data_ptr(), dn_s.data_ptr(), dn_a.data_ptr(),
         se.data_ptr(), d_dn.data_ptr(), slots, n_dn, INTER,
         INTER, dn_p[0].numel(), dn_s[0].numel(), 0)

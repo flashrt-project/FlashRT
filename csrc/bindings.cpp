@@ -191,6 +191,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #ifdef FLASHRT_HAVE_QWEN35MOE_W4A16
 #include "kernels/w4a16_matvec_sm120.cuh"
 #include "kernels/moe_grouped_w4a16_sm120.cuh"
+#include "kernels/w4a16_edge_sm120.cuh"
 #include "kernels/w4a16_gemm_sm120.cuh"
 #endif  // FLASHRT_HAVE_QWEN35MOE_W4A16
 #ifdef FLASHRT_HAVE_QWEN35MOE_W4A4
@@ -5527,6 +5528,33 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
            long a_stride, long w_stride, long sfb_stride,
            uintptr_t stream) -> int {
             return flash_rt::kernels::moe_grouped_w4a16_sm120_bf16(
+                to_ptr(A), to_ptr(W), to_ptr(sfb), to_ptr(alpha), to_ptr(eidx),
+                to_ptr(D), slots, N, K, a_stride, w_stride, sfb_stride,
+                to_stream(stream));
+        },
+        py::arg("A"), py::arg("W"), py::arg("sfb"), py::arg("alpha"),
+        py::arg("eidx"), py::arg("D"), py::arg("slots"), py::arg("N"),
+        py::arg("K"), py::arg("a_stride"), py::arg("w_stride"),
+        py::arg("sfb_stride"), py::arg("stream") = 0);
+
+    // Bitwise-identical variants tuned for a part where these two are compute
+    // bound rather than bandwidth bound. See w4a16_edge_sm120.cuh.
+    m.def("w4a16_matvec_edge_sm120_bf16",
+        [](uintptr_t x, uintptr_t W, uintptr_t sfb, uintptr_t out,
+           int N, int K, float alpha, uintptr_t stream) -> int {
+            return flash_rt::kernels::w4a16_matvec_edge_sm120_bf16(
+                to_ptr(x), to_ptr(W), to_ptr(sfb), to_ptr(out),
+                N, K, alpha, to_stream(stream));
+        },
+        py::arg("x"), py::arg("W"), py::arg("sfb"), py::arg("out"),
+        py::arg("N"), py::arg("K"), py::arg("alpha"), py::arg("stream") = 0);
+
+    m.def("moe_grouped_w4a16_edge_sm120_bf16",
+        [](uintptr_t A, uintptr_t W, uintptr_t sfb, uintptr_t alpha,
+           uintptr_t eidx, uintptr_t D, int slots, int N, int K,
+           long a_stride, long w_stride, long sfb_stride,
+           uintptr_t stream) -> int {
+            return flash_rt::kernels::moe_grouped_w4a16_edge_sm120_bf16(
                 to_ptr(A), to_ptr(W), to_ptr(sfb), to_ptr(alpha), to_ptr(eidx),
                 to_ptr(D), slots, N, K, a_stride, w_stride, sfb_stride,
                 to_stream(stream));

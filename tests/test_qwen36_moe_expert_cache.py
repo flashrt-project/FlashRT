@@ -187,7 +187,10 @@ def test_lm_head_has_a_path_without_the_sm120_only_kernel():
     source = inspect.getsource(_nexn2_rtx_decode.decode_step)
 
     assert "hasattr(fvk, 'fp4_w4a4_mma_sm120_full_n_bf16out')" in source
-    assert "w4a16_matvec_sm120_bf16" in source
+    # The fallback goes through the resolver, which returns whichever
+    # weight-only GEMV this build has; both members of that pair are in the
+    # W4A16 tier, so either satisfies what this test is about.
+    assert "w4a16_matvec(fvk)" in source
 
 
 def test_staging_buffers_are_owned_for_the_duration_of_a_read():
