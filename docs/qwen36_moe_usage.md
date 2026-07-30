@@ -70,6 +70,32 @@ for this model.
 Selecting tiers by reading the source's own grouping is therefore not enough to
 know what a target needs; the call sites are what decide.
 
+### Attention differs by target, by design
+
+The ten full-attention layers do not use the same kernel everywhere, and the
+arch lists reflect that rather than overlooking it:
+
+| target | attention | why |
+|---|---|---|
+| SM120 / SM89 / SM87 | vendored FA2 | the SM80-family source, which `__CUDA_ARCH__ >= 800` admits |
+| Thor SM110 | FA4 | its SM100-class CuTe-DSL kernel needs Blackwell tensor memory; ships as the `thor-fa4` pip extra, not compiled into `flash_rt_kernels` |
+
+So FA2 is deliberately absent from the Thor build, and FA4 cannot serve
+Ampere-class SM87. Treat a missing FA2 as a signal to fall back, not as a
+build error.
+
+The attention backend probes its kernel at construction: it runs one case
+through the same launch the hot path uses and compares against
+`scaled_dot_product_attention`, falling back if they disagree. That is not
+belt-and-braces. Three times in this work a kernel compiled, linked and loaded
+while being unable to run — the block-scaled 4-bit tier substitutes an invalid
+control path off its own architecture, the lm_head kernel is simply absent
+outside GPU_ARCH 120/121, and the vendored FA2 on an SM110 part printed a
+complaint and returned without writing its output. That last one still produced
+15 of 16 reference tokens, because ten of forty layers contributing nothing is
+survivable for a residual stream — which is precisely why a symbol check is not
+a capability check.
+
 `_W4A4` refuses to configure on a target without block-scaled MMA. CUTLASS
 still compiles those translation units elsewhere, but substitutes
 `CUTE_INVALID_CONTROL_PATH` for the MMA, so the build would succeed and then
