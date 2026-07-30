@@ -137,6 +137,10 @@ def _gemm_w16a16(x2d, w, fvk, device):
 # fp4 *weight* (not the activation), so W4A16 lands at the same ~0.987 as W4A4
 # while being slower than the CUTLASS W4A4 -- dominated. Default OFF; the 0.994
 # path needs a bf16-*weight* GEMM (repurpose this kernel's 2.18x structure).
+#
+# Retested on a part with no W4A4 at all, where it might have been expected to
+# win on traffic: at S=1024 it moves TTFT 1335.0 -> 1346.6 ms, i.e. nothing.
+# The 178 ms those GEMMs cost is not what bounds this prefill.
 _DENSE_W4A16 = False
 
 # Set only around a speculative verify block; see _proj and the lm_head below.
@@ -739,6 +743,17 @@ def moe_grouped_w4a16(fvk):
 
 # Grouped MoE for prefill (on by default); set False to use the per-expert loop.
 _USE_GROUPED_MOE = True
+# One GEMM per expert, for a build without the block-scaled MMA tiles. Reads
+# each expert's weight once instead of once per token that routed to it.
+#
+# It only pays once the tokens per expert are worth a launch. Each expert costs
+# about five launches (quantise, two GEMMs, the gate), so with 256 of them a
+# layer that is thousands of launches whichever way; below the threshold the
+# grouped GEMV's two launches win even though it re-reads the weight. Measured
+# at S=256 -- eight tokens an expert -- the per-expert path takes TTFT from 585
+# to 923 ms, while at S=1024 it takes it from 2237 to 1354.
+_USE_PER_EXPERT_GEMM = True
+_PER_EXPERT_MIN_M = 16              # mean tokens per expert, = S * TOPK / 256
 # M=16 tensor-core mma MoE: tokens are sorted into 16-row expert tiles and the
 # SM120 block-scaled mma runs each expert once at full M-utilisation -- ~5.6x
 # the SIMT grouped W4A16 at large S (the compute wall). W4A4 (FP4 activation),
@@ -932,6 +947,66 @@ def _moe_experts_bt(x, ti, tw, ld, fvk, device):
     return out
 
 
+def _moe_experts_per_expert_gemm(x, ti, tw, ld, fvk, device):
+    """Routed experts as one GEMM per expert over the tokens that chose it.
+
+    The grouped GEMV below issues one GEMV per (token, expert) slot, so an
+    expert's weight is re-read once per token that routed to it -- 8192 reads
+    of a 1.18 MB weight per layer at S=1024, which is 9.7 GB of traffic a layer
+    even before the down projection. Sorting by expert makes those reads hit L2
+    rather than DRAM, which is why it works at all, but it is still bounded by
+    L2 bandwidth and it dominates prefill: measured 74.6% of a 1024-token
+    prefill, 1762 ms of 2361.
+
+    Grouping the tokens instead turns each expert into a single M-row GEMM that
+    reads its weight once. The block-scaled 4-bit MMA tile does the same thing
+    and better, but it is a build tier that is not present everywhere; this path
+    needs only the NVFP4 W4A16 GEMM, which is.
+
+    The count per expert is data-dependent, so this reads it to the host -- one
+    sync per layer, which prefill can afford and a captured decode could not.
+    """
+    S = x.shape[0]
+    gu_p, gu_s = ld['experts_gate_up_packed_t'], ld['experts_gate_up_sf_t']
+    dn_p, dn_s = ld['experts_down_packed_t'], ld['experts_down_sf_t']
+    n_gu, n_dn = gu_p.shape[1], dn_p.shape[1]
+    if 'experts_gate_up_alpha_list' not in ld:
+        ld['experts_gate_up_alpha_list'] = ld['experts_gate_up_alpha_t'].tolist()
+        ld['experts_down_alpha_list'] = ld['experts_down_alpha_t'].tolist()
+    gu_a = ld['experts_gate_up_alpha_list']
+    dn_a = ld['experts_down_alpha_list']
+
+    exp_flat = ti.reshape(-1).to(torch.int32)
+    tok_flat = torch.arange(S, device=device).repeat_interleave(TOPK)
+    # Stable, so equal-expert ties keep token order and the rows packed into
+    # each quantisation tile are the same run to run.
+    order = exp_flat.argsort(stable=True)
+    se = exp_flat[order]
+    stok = tok_flat[order]
+    sw = tw.reshape(-1)[order]
+
+    counts = torch.bincount(se, minlength=_N_EXPERTS).tolist()
+    A = x[stok].contiguous()                          # (slots, HID) bf16
+    d_dn = torch.empty(S * TOPK, n_dn, dtype=torch.bfloat16, device=device)
+
+    off = 0
+    for e, cnt in enumerate(counts):
+        if cnt == 0:
+            continue
+        rows = A[off:off + cnt]
+        gu = _nvfp4_gemm(rows, gu_p[e].data_ptr(), gu_s[e].data_ptr(),
+                         gu_a[e], n_gu, fvk, device, _cs())
+        inter = _silu_mul(gu[:, :INTER], gu[:, INTER:], fvk, device)
+        d_dn[off:off + cnt] = _nvfp4_gemm(
+            inter.contiguous(), dn_p[e].data_ptr(), dn_s[e].data_ptr(),
+            dn_a[e], n_dn, fvk, device, _cs())
+        off += cnt
+
+    out = torch.zeros(S, HID, device=device)
+    out.index_add_(0, stok, d_dn.float() * sw.unsqueeze(-1))
+    return out
+
+
 def _moe_experts_grouped(x, ti, tw, ld, fvk, device):
     """Routed experts via the grouped W4A16 GEMV. Flatten the S*TOPK
     (token, expert) assignments, sort by expert so consecutive slots share a
@@ -1003,6 +1078,10 @@ def _moe_layer(h, ld, fvk, device):
         out = _moe_experts_bt(x, ti, tw, ld, fvk, device)
     elif _USE_M16_MOE and big and hasattr(fvk, 'moe_m16_mma_sm120_bf16'):
         out = _moe_experts_m16(x, ti, tw, ld, fvk, device)
+    elif (big and _USE_PER_EXPERT_GEMM
+            and x.shape[0] * TOPK >= _PER_EXPERT_MIN_M * _N_EXPERTS
+            and hasattr(fvk, 'fp4_w4a16_gemm_sm120_bf16out')):
+        out = _moe_experts_per_expert_gemm(x, ti, tw, ld, fvk, device)
     elif _USE_GROUPED_MOE:
         out = _moe_experts_grouped(x, ti, tw, ld, fvk, device)
     else:
