@@ -39,6 +39,12 @@ class Qwen36MoeStreamingFrontend(Qwen36MoeTextFrontendRtx):
         if not name.startswith(('moe_blocktile_mma', 'moe_m16_mma'))
     ) + ('qwen35moe_e0m3_dequant_bf16', 'bf16_matvec_sm120_bf16')
 
+    # The attention backend probes its kernel and falls back, so this runs on a
+    # target that builds no FA2. Thor is one: it uses FA4, whose SM100-class
+    # kernel needs Blackwell tensor memory that Orin's SM87 does not have --
+    # so the two targets take different attention paths by design.
+    _REQUIRE_FA2 = False
+
     def __init__(self, checkpoint_path: str, bundle: str | Path, *,
                  slots_per_layer: int,
                  device: str = "cuda:0",

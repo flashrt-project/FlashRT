@@ -95,13 +95,22 @@ class RtxFlashAttnBackendNexn2:
             dtype=torch.float32, device=d,
         )
 
-        from flash_rt import flash_rt_fa2 as _fa2
-        self._fa2 = _fa2
-        self._fa2_fwd = _fa2.fwd_bf16
+        # A target may not build FA2 at all -- Thor uses FA4 instead, so the
+        # arch list deliberately omits it there. Absence is a fallback, not an
+        # error, because the reference path below computes the same thing.
+        try:
+            from flash_rt import flash_rt_fa2 as _fa2
+        except ImportError:
+            self._fa2 = None
+            self._fa2_fwd = None
+        else:
+            self._fa2 = _fa2
+            self._fa2_fwd = _fa2.fwd_bf16
         self._num_sms = torch.cuda.get_device_properties(
             torch.cuda.current_device()
         ).multi_processor_count
-        self._fa2_usable = self._probe_fa2()
+        self._fa2_usable = (
+            self._fa2_fwd is not None and self._probe_fa2())
 
     def _probe_fa2(self) -> bool:
         """Does the vendored kernel actually compute on this device?

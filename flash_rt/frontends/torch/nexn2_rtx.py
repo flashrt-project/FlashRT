@@ -37,7 +37,7 @@ _REQUIRED_FVK = (
 def _require_kernels(
         fvk, *, model_label: str = "Nex-N2",
         usage_doc: str = "docs/nexn2_usage.md",
-        required=None) -> None:
+        required=None, require_fa2: bool = True) -> None:
     """Raise a clear RuntimeError if the gated qwen3_5_moe kernels or the FA2
     module are missing (build was not configured with
     -DFLASHRT_ENABLE_QWEN35MOE=ON, or flash_rt_fa2 is absent).
@@ -55,6 +55,11 @@ def _require_kernels(
             "are absent from flash_rt_kernels (missing: "
             f"{', '.join(missing)}). Rebuild on an SM120 toolchain with "
             f"-DFLASHRT_ENABLE_QWEN35MOE=ON. See {usage_doc}.")
+    if not require_fa2:
+        # The attention backend probes its kernel and falls back to a
+        # reference implementation, so a target that builds no FA2 -- Thor
+        # uses FA4 instead -- still runs.
+        return
     try:
         from flash_rt import flash_rt_fa2 as _fa2
     except Exception as e:                                  # pragma: no cover
@@ -77,6 +82,10 @@ class Nexn2TorchFrontendRtx:
     # Kernels this configuration calls; a subclass whose path calls fewer
     # narrows it. See _require_kernels.
     _REQUIRED_KERNELS = _REQUIRED_FVK
+
+    # Whether the vendored FA2 module must be present. A subclass whose
+    # attention backend can fall back sets this False.
+    _REQUIRE_FA2 = True
 
     _MODEL_LABEL = "Nex-N2"
     _USAGE_DOC = "docs/nexn2_usage.md"
@@ -172,6 +181,7 @@ class Nexn2TorchFrontendRtx:
             model_label=self._MODEL_LABEL,
             usage_doc=self._USAGE_DOC,
             required=self._REQUIRED_KERNELS,
+            require_fa2=self._REQUIRE_FA2,
         )
 
         self._fvk = fvk
