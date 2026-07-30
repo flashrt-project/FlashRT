@@ -18,6 +18,14 @@ NUM_EXPERTS = 256
 HIDDEN = 2048
 INTERMEDIATE = 512
 
+# Expert blocks are padded so that every block's offset and length are a
+# multiple of the logical block size. A device whose memory holds only a
+# fraction of the experts cannot afford to stream them through the page
+# cache -- the cache competes with the resident weights for the same
+# physical memory -- so the reader has to use O_DIRECT, which requires
+# aligned offsets and lengths.
+BLOCK_ALIGNMENT = 4096
+
 
 class CheckpointReader:
     def __init__(self, checkpoint: Path):
@@ -120,6 +128,7 @@ def quantize_expert(
         _tensor_bytes(gu_scale),
         _tensor_bytes(dn_weight),
         _tensor_bytes(dn_scale),
+        bytes(_layout(quant_format, group_size)["padding"]),
     ))
 
 
@@ -142,12 +151,17 @@ def _layout(quant_format: str, group_size: int) -> dict[str, int]:
         gu_scale = 2 * INTERMEDIATE * (HIDDEN // group_size)
         dn_weight = HIDDEN * INTERMEDIATE // 2
         dn_scale = HIDDEN * (INTERMEDIATE // group_size)
-    return {
+    layout = {
         "gate_up_weight": gu_weight,
         "gate_up_scale": gu_scale,
         "down_weight": dn_weight,
         "down_scale": dn_scale,
     }
+    # Trailing pad keeps every expert's offset and length aligned. The INT4
+    # group-16 payload happens to be a multiple already; the INT8 payload is
+    # 3,151,872 B, which is 769.5 blocks.
+    layout["padding"] = -sum(layout.values()) % BLOCK_ALIGNMENT
+    return layout
 
 
 def main() -> None:
@@ -180,6 +194,7 @@ def main() -> None:
         "block_layout": list(layout),
         "block_sizes": layout,
         "block_bytes": block_bytes,
+        "block_alignment": BLOCK_ALIGNMENT,
     }
     with (args.output / "manifest.json").open("w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)

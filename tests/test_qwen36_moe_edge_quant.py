@@ -11,6 +11,7 @@ from qwen36_moe_edge.route_trace import (
     simulate_two_tier,
 )
 from qwen36_moe_edge.quantize_experts import (
+    BLOCK_ALIGNMENT,
     HIDDEN,
     INTERMEDIATE,
     _hadamard16,
@@ -85,6 +86,29 @@ def test_expert_block_size_matches_manifest_layout():
         )
         assert len(block) == sum(
             _layout(quant_format, group_size).values())
+
+
+def test_expert_blocks_are_aligned_for_direct_io():
+    # An 8 GiB unified-memory device cannot stream the experts through the
+    # page cache, so the reader needs O_DIRECT and every block offset and
+    # length has to be aligned.
+    for quant_format, group_size in (
+        ("int8", 32),
+        ("int4", 16),
+        ("int4", 32),
+        ("int4-rht", 16),
+    ):
+        layout = _layout(quant_format, group_size)
+        block_bytes = sum(layout.values())
+        assert block_bytes % BLOCK_ALIGNMENT == 0, (
+            quant_format, group_size, block_bytes)
+        assert layout["padding"] < BLOCK_ALIGNMENT
+        assert list(layout)[-1] == "padding"
+
+    # INT4 group-16 is aligned on its own; INT8 needs 2048 bytes of pad.
+    assert _layout("int4-rht", 16)["padding"] == 0
+    assert _layout("int8", 32)["padding"] == 2048
+    assert sum(_layout("int8", 32).values()) == 3153920
 
 
 def test_route_trace_lru_separates_prompt_and_decode():

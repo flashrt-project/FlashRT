@@ -45,9 +45,18 @@ INT8 uses symmetric per-output-channel FP16 scales. INT4 follows the Thor
 Pi0.5 numerical contract: sign-magnitude values, one UE4M3 scale per 16 K
 values, and two values per byte with the low nibble first. `int4-rht` applies
 the same orthonormal H16/4 transform to every K block that the runtime applies
-to activations. Scale bytes in these edge block files are linear; a Thor
-loader must convert them to the SM1xx SFB tile-interleaved layout before
-calling the native block-scaled MMA kernels.
+to activations. Scale bytes in these edge block files are linear; a loader
+must convert them to the SM1xx SFB tile-interleaved layout before calling the
+native block-scaled MMA kernels.
+
+Each block carries a trailing pad so its offset and length are multiples of
+`BLOCK_ALIGNMENT`. On a device whose memory holds only a fraction of the
+experts, the expert stream cannot go through the page cache — it would compete
+with the resident weights for the same physical memory — so the reader has to
+use `O_DIRECT`, which requires aligned offsets and lengths. The INT4 group-16
+payload is already a multiple of 4096; the INT8 payload is 3,151,872 bytes and
+takes 2048 bytes of pad. `manifest.json` records `block_bytes`,
+`block_alignment`, and the padding entry in `block_sizes`.
 
 An SM120 machine can collect real router selections for cache sizing:
 
