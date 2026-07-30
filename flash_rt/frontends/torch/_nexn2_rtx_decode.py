@@ -302,6 +302,13 @@ class Nexn2DecodeState:
         # and RoPE slice are baked per position exactly as the decode graph's
         # are. Same LRU bound, since each graph owns a memory pool.
         self._spec_graphs = collections.OrderedDict()
+        # Its own memory pool, not the decode graphs'. The two are replayed
+        # interleaved -- a window, then whatever the caller does next -- and
+        # sharing a pool between graphs used that way is the case the runtime
+        # does not promise to handle. Measured: with the pool shared, a 64-token
+        # speculative run ran at half the rate of a 32-token one on identical
+        # code, the cost growing with the number of live graphs.
+        self._spec_pool = torch.cuda.graph_pool_handle()
         self._spec_tokens = None
         self._spec_argmax = None
         # Which half of the draft head's fc input carries the hidden state.
@@ -921,7 +928,7 @@ def _ensure_spec_graph(state, pos, k, fvk, device):
 
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g, stream=state._graph_stream,
-                          pool=state._graph_pool), torch.no_grad():
+                          pool=state._spec_pool), torch.no_grad():
         hid = _spec_block(state, pos, k, fvk, device)
     with torch.no_grad():
         _restore()

@@ -490,15 +490,20 @@ def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None,
         core = core.reshape(B, S, NV, HV)
 
     if cap is not None:
+        # The per-step snapshots go FIRST. `init_state` and `conv_hist` are the
+        # very tensors the two copies below overwrite -- the caller passes
+        # cap.lin_state[rank] / cap.lin_conv_state[rank] in directly -- so
+        # replaying the scan after the copies would start it from the state the
+        # block ended at, and every rewind would restore a fabricated one.
+        if getattr(cap, 'spec_capture', False):
+            _capture_per_token_state(cap, rank, S, init_state, conv_hist,
+                                     mixed, qb, kb, vb, g_out, bo, fvk, device)
         # GDN recurrent final state = `state` after the S-step scan; conv state
         # = the last KS-1 `mixed` inputs (channel-major, newest at index -1),
         # matching the causal_conv1d_update rolling buffer (1, CONV, KS-1).
         cap.lin_state[rank].copy_(state)
         cs = mixed[0, S - (KS - 1):S, :].transpose(0, 1).contiguous()
         cap.lin_conv_state[rank].copy_(cs.unsqueeze(0))
-        if getattr(cap, 'spec_capture', False):
-            _capture_per_token_state(cap, rank, S, init_state, conv_hist,
-                                     mixed, qb, kb, vb, g_out, bo, fvk, device)
 
     cf = core.reshape(-1, HV).contiguous()
     zf = z.reshape(-1, HV).to(torch.bfloat16).contiguous()
