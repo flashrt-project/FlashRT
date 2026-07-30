@@ -45,6 +45,31 @@ below. Targets that cannot run a tier can select the remainder explicitly.
 The upper tiers depend on the core tier, so enabling either turns it on. The
 SM120 text runtime documented here needs all three.
 
+**These three tiers are not the whole dependency set.** Walking every `fvk`
+call the pipeline makes and resolving each to the preprocessor guard active
+where it is defined gives 32 kernels across seven gates:
+
+| gate | kernels |
+|---|---:|
+| `FLASHRT_HAVE_QWEN36_KERNELS` | 12 |
+| `FLASHRT_HAVE_QWEN35MOE_CORE` | 10 |
+| `FLASHRT_HAVE_QWEN35MOE_W4A16` | 3 |
+| `ENABLE_CUTLASS_SM120_NVFP4_W4A16` | 2 |
+| `FLASHRT_HAVE_QWEN35MOE_W4A4` | 2 |
+| `FLASHRT_HAVE_NVFP4_SWIZZLE` | 1 |
+| ungated | 1 |
+
+The twelve under `FLASHRT_HAVE_QWEN36_KERNELS` are the linear-attention path:
+causal convolution and its update, the gated-DeltaNet recurrence, the WY chunk
+stack, the fused RMSNorm-gated-SiLU, partial RoPE and argmax. They are shared
+with the rest of the Qwen3.6 family and are gated on `NOT FLASHRT_SLIM_BUILD`,
+not on architecture — so `-DFLASHRT_SLIM_BUILD=ON` removes them and the
+frontend then refuses to start, naming what is missing. Do not use a slim build
+for this model.
+
+Selecting tiers by reading the source's own grouping is therefore not enough to
+know what a target needs; the call sites are what decide.
+
 `_W4A4` refuses to configure on a target without block-scaled MMA. CUTLASS
 still compiles those translation units elsewhere, but substitutes
 `CUTE_INVALID_CONTROL_PATH` for the MMA, so the build would succeed and then

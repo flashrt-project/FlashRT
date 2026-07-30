@@ -150,8 +150,6 @@ class Nexn2TorchFrontendRtx:
         to NVFP4 (GDN in_proj / norms / router kept BF16) and frees the
         BF16 source as it goes, fitting in ~22 GB.
         """
-        from transformers import AutoTokenizer
-
         from flash_rt import flash_rt_kernels as fvk
         from flash_rt.frontends.torch._nexn2_rtx_nvfp4_weights import (
             extract_weights_nexn2_nvfp4,
@@ -164,7 +162,6 @@ class Nexn2TorchFrontendRtx:
             usage_doc=self._USAGE_DOC,
         )
 
-        self._tokenizer = AutoTokenizer.from_pretrained(self.checkpoint_path)
         self._fvk = fvk
         self._weights = extract_weights_nexn2_nvfp4(
             self.checkpoint_path, fvk, device=self.device,
@@ -172,12 +169,37 @@ class Nexn2TorchFrontendRtx:
 
     @property
     def tokenizer(self):
-        """The HF tokenizer loaded from the checkpoint."""
+        """The checkpoint's tokenizer, loaded when something asks for it.
+
+        Loading it eagerly would make ``transformers`` a hard requirement of
+        the runtime, which it is not: a caller that supplies token ids through
+        :meth:`set_prompt_ids` never needs one. That matters for a deployment
+        target where the dependency may be absent or unwelcome, and it keeps
+        the kernel and weight paths testable without it.
+        """
+        if self._tokenizer is None:
+            from transformers import AutoTokenizer
+
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self.checkpoint_path)
         return self._tokenizer
+
+    def set_prompt_ids(self, token_ids) -> None:
+        """Set the prompt from token ids, requiring no tokenizer."""
+        import torch
+
+        ids = torch.as_tensor(
+            token_ids, dtype=torch.long, device=self.device).reshape(1, -1)
+        if ids.shape[1] == 0:
+            raise ValueError('token_ids is empty')
+        # Matches set_prompt: the decode state is not discarded, because
+        # seed_prefill resets the recurrent and KV caches itself and
+        # reallocating them per prompt would be waste.
+        self._prompt_ids = ids
 
     def set_prompt(self, text: str) -> None:
         """Tokenize ``text`` for the next ``infer()`` / ``generate()`` call."""
-        enc = self._tokenizer(text, return_tensors='pt')
+        enc = self.tokenizer(text, return_tensors='pt')
         self._prompt_ids = enc['input_ids'].to(self.device)
 
     def infer(self):
