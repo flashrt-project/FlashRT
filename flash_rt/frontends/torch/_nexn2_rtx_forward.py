@@ -32,6 +32,19 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+
+def _cs():
+    """Current CUDA stream handle.
+
+    Inside a graph capture this is the capture stream; eager, the default one.
+    A hard-coded 0 is not the same thing: during capture it names a stream that
+    is not being captured, which is an illegal access at capture_end. This
+    forward was written for prefill, which is never captured -- a speculative
+    verify block is.
+    """
+    return torch.cuda.current_stream().cuda_stream
+
+
 from flash_rt.frontends.torch._nexn2_rtx_nvfp4_weights import _sf_swz_bytes
 
 # Static Nex-N2-mini dims (config.json:text_config). Kept module-local so
@@ -68,7 +81,7 @@ def _rms_k(x, w, fvk, device, eps):
     x2 = x.reshape(-1, dim).contiguous()
     out = torch.empty(x2.shape[0], dim, dtype=torch.bfloat16, device=device)
     fvk.rms_norm(x2.data_ptr(), w.data_ptr(), out.data_ptr(),
-                 x2.shape[0], dim, eps, 0)
+                 x2.shape[0], dim, eps, _cs())
     return out.reshape(shp)
 
 
@@ -115,7 +128,7 @@ def _gemm_w16a16(x2d, w, fvk, device):
     wc = w.contiguous()
     y = torch.empty(m, n, dtype=torch.bfloat16, device=device)
     fvk.w16a16_gemm_sm120_bf16(xc.data_ptr(), wc.data_ptr(), y.data_ptr(),
-                               m, n, k, 1.0, 0)
+                               m, n, k, 1.0, _cs())
     return y
 
 
@@ -128,15 +141,19 @@ _DENSE_W4A16 = False
 
 # Set only around a speculative verify block; see _proj and the lm_head below.
 #
-# Default off, because it was measured and it loses: routing the verify block's
-# dense projections and lm_head through the 4-bit weights takes K=2 from 36.15
-# to 33.38 tok/s, despite reading a quarter of the bytes. That is the useful
-# part of the result -- it says the verify pass is not bandwidth bound, so the
-# thing to fix is not what it reads. It runs eager, against a baseline whose
-# every step is a captured graph, and a window also pays for K drafts that each
-# project the full 248320-wide vocabulary. Capture the verify block and prune
-# the draft head's vocabulary first; revisit this after, when the pass is
-# actually reading-bound and the switch can be judged on its merits.
+# Off, on evidence, twice over. Routing the verify block through _gemm_w4a16
+# loses whether or not the window is captured -- 36.15 to 33.38 eager, and
+# 39.77 to 20.84 captured -- and it also reintroduces the divergence from plain
+# greedy that a BF16 verify does not have.
+#
+# Both readings say the same thing: this is the wrong path, not the wrong idea.
+# _gemm_w4a16 quantises the weight through its own helper into its own cache,
+# so it is neither the tensor the decode GEMV reads nor a kernel shaped for
+# three rows. What the verify wants is a small-M GEMM over the *same* packed
+# weights the decode path already caches -- then it reads a quarter of the
+# bytes and differs from decode only by reduction order. Until that exists,
+# BF16 is both faster and the one that agrees with plain greedy token for
+# token.
 _SPEC_VERIFY_W4A16 = False
 _SPEC_VERIFY = False
 
@@ -175,7 +192,7 @@ def _gemm_w4a16(x2d, w, ld, key, fvk, device):
     xc = x2d.contiguous()
     y = torch.empty(m, n, dtype=torch.bfloat16, device=device)
     fvk.w4a16_gemm_sm120_bf16(xc.data_ptr(), p.data_ptr(), s.data_ptr(),
-                              y.data_ptr(), m, n, k, a, 0)
+                              y.data_ptr(), m, n, k, a, _cs())
     return y
 
 
@@ -199,7 +216,7 @@ def _wquant(w, ld, key, fvk, device):
         og = torch.zeros(1, dtype=torch.float32, device=device)
         fvk.bf16_weight_to_nvfp4_swizzled(
             w.contiguous().data_ptr(), p.data_ptr(), s.data_ptr(),
-            scr.data_ptr(), og.data_ptr(), nn, kk, 0)
+            scr.data_ptr(), og.data_ptr(), nn, kk, _cs())
         torch.cuda.synchronize()
         ld[pk] = p
         ld[key + '_w4s'] = s
@@ -219,7 +236,7 @@ def _gemm_fp4(x2d, w, ld, key, fvk, device, xp=None, xsf=None):
     y = torch.empty(m, n, dtype=torch.bfloat16, device=device)
     fvk.fp4_w4a16_gemm_sm120_bf16out(
         xp.data_ptr(), p.data_ptr(), y.data_ptr(), m, n, k,
-        xsf.data_ptr(), s.data_ptr(), a, 0)
+        xsf.data_ptr(), s.data_ptr(), a, _cs())
     return y
 
 
@@ -266,7 +283,7 @@ def _silu_mul(g, u, fvk, device):
     gc = g.reshape(-1).contiguous()
     uc = u.reshape(-1).contiguous()
     out = torch.empty(n, dtype=torch.bfloat16, device=device)
-    fvk.silu_mul_sm120_bf16(gc.data_ptr(), uc.data_ptr(), out.data_ptr(), n, 0)
+    fvk.silu_mul_sm120_bf16(gc.data_ptr(), uc.data_ptr(), out.data_ptr(), n, _cs())
     return out.reshape(g.shape)
 
 
@@ -333,19 +350,19 @@ def _gdn_wy_chunk(q16, k16, v, g, beta, fvk, device, init_state=None):
     A = torch.empty(chunks, NV, CH, CH, dtype=torch.float32, device=device)
     fvk.linear_attn_gdn_wy_kkt_b64_bf16_cublaslt(
         k_l2.data_ptr(), betac.data_ptr(), gc.data_ptr(), k_pack.data_ptr(),
-        kkt_base.data_ptr(), A.data_ptr(), S, NK, NV, HK, QKG, 0)
+        kkt_base.data_ptr(), A.data_ptr(), S, NK, NV, HK, QKG, _cs())
 
     Ai = torch.empty(chunks, NV, CH, CH, dtype=torch.float32, device=device)
     Ai_pack = torch.empty(chunks, NV, CH, CH, dtype=torch.bfloat16, device=device)
     fvk.linear_attn_gdn_wy_solve_tril_b64_f32_parallel_pack(
-        A.data_ptr(), Ai.data_ptr(), Ai_pack.data_ptr(), S, NV, 0)
+        A.data_ptr(), Ai.data_ptr(), Ai_pack.data_ptr(), S, NV, _cs())
 
     w_pack = torch.empty(chunks, NV, CH, HV, dtype=torch.bfloat16, device=device)
     u_pack = torch.empty(chunks, NV, CH, HV, dtype=torch.bfloat16, device=device)
     fvk.linear_attn_gdn_wy_recompute_wu_b64_bf16_mma_fla(
         k_l2.data_ptr(), vc.data_ptr(), betac.data_ptr(), gc.data_ptr(),
         Ai_pack.data_ptr(), w_pack.data_ptr(), u_pack.data_ptr(),
-        S, NK, NV, HK, QKG, 0)
+        S, NK, NV, HK, QKG, _cs())
 
     state = (init_state.clone() if init_state is not None
              else torch.zeros(NV, HK, HV, dtype=torch.bfloat16, device=device))
@@ -354,7 +371,7 @@ def _gdn_wy_chunk(q16, k16, v, g, beta, fvk, device, init_state=None):
     fvk.linear_attn_gdn_wy_chunk_h_b64_bf16_mma_fla(
         k_l2.data_ptr(), w_pack.data_ptr(), u_pack.data_ptr(), gc.data_ptr(),
         state.data_ptr(), h0.data_ptr(), v_new.data_ptr(), 0, 0,
-        S, NK, NV, HK, QKG, 0)
+        S, NK, NV, HK, QKG, _cs())
 
     q_pack = _wy_pack_t(q_l2.repeat_interleave(QKG, 1))
     k_pack_hv = _wy_pack_t(k_l2.repeat_interleave(QKG, 1))
@@ -363,7 +380,7 @@ def _gdn_wy_chunk(q16, k16, v, g, beta, fvk, device, init_state=None):
     fvk.linear_attn_gdn_wy_output_o_b64_bf16_mma_fla(
         q_pack.data_ptr(), k_pack_hv.data_ptr(), v_pack.data_ptr(),
         h0.data_ptr(), gc.data_ptr(), core.data_ptr(),
-        S, NV, HV, float(HV ** -0.5), 0)
+        S, NV, HV, float(HV ** -0.5), _cs())
     return core, state
 
 
@@ -418,13 +435,13 @@ def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None,
         xc_ext = torch.empty(B, Se, CONV, dtype=torch.bfloat16, device=device)
         fvk.causal_conv1d_qwen36_bf16(
             mixed_ext.data_ptr(), convw_k.data_ptr(), 0,
-            xc_ext.data_ptr(), B, Se, CONV, KS, True, 0)
+            xc_ext.data_ptr(), B, Se, CONV, KS, True, _cs())
         xc = xc_ext[:, KS - 1:, :].contiguous()
     else:
         xc = torch.empty(B, S, CONV, dtype=torch.bfloat16, device=device)
         fvk.causal_conv1d_qwen36_bf16(
             mixed.contiguous().data_ptr(), convw_k.data_ptr(), 0,
-            xc.data_ptr(), B, S, CONV, KS, True, 0)
+            xc.data_ptr(), B, S, CONV, KS, True, _cs())
     # split conv output + broadcast q/k 16 -> 32 heads in one fvk kernel.
     xc_bf = xc.reshape(B * S, CONV).contiguous()
     qb = torch.empty(B, S, NV, HK, dtype=torch.bfloat16, device=device)
@@ -432,7 +449,7 @@ def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None,
     vb = torch.empty(B, S, NV, HV, dtype=torch.bfloat16, device=device)
     fvk.qwen35moe_lin_split_qkv_broadcast_bf16(
         xc_bf.data_ptr(), qb.data_ptr(), kb.data_ptr(), vb.data_ptr(),
-        B * S, 0)
+        B * S, _cs())
 
     neg = (-A_log.exp()).float().contiguous()
     dtb_c = dtb.contiguous()
@@ -442,7 +459,7 @@ def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None,
     bo = torch.empty(B, S, NV, dtype=torch.bfloat16, device=device)
     fvk.qwen36_gdn_gating_bf16(
         a_bf.data_ptr(), b_bf.data_ptr(), neg.data_ptr(), dtb_c.data_ptr(),
-        g_out.data_ptr(), bo.data_ptr(), B * S, NV, 0)
+        g_out.data_ptr(), bo.data_ptr(), B * S, NV, _cs())
 
     if _USE_WY_GDN and S >= _WY_MIN_S:
         # WY chunked delta-rule scan: 11x faster than the seq-scan at S=2048,
@@ -469,7 +486,7 @@ def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None,
             vb.reshape(S, NV, HV).contiguous().data_ptr(),
             g_out.reshape(S, NV).contiguous().data_ptr(),
             bo.reshape(S, NV).contiguous().data_ptr(),
-            state.data_ptr(), core.data_ptr(), S, NV, HK, True, 0)
+            state.data_ptr(), core.data_ptr(), S, NV, HK, True, _cs())
         core = core.reshape(B, S, NV, HV)
 
     if cap is not None:
@@ -488,7 +505,7 @@ def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None,
     nf = torch.empty_like(cf)
     fvk.rms_norm_gated_silu_qwen36_bf16(
         cf.data_ptr(), zf.data_ptr(), nw.data_ptr(), nf.data_ptr(),
-        cf.shape[0], HV, eps, 0)
+        cf.shape[0], HV, eps, _cs())
     out = _proj(nf.reshape(B * S, VD), ld, 'out_proj', HID, fvk, device)
     return out.reshape(B, S, HID)
 
@@ -641,7 +658,7 @@ def _full_attn_layer(h, ld, ct, st, fvk, device, eps, cap=None, rank=None,
     q_pre = torch.empty(B * S, NQ, HD, dtype=torch.bfloat16, device=device)
     gate = torch.empty(B * S, NQ * HD, dtype=torch.bfloat16, device=device)
     fvk.qwen35moe_split_q_gate_bf16(
-        qg.data_ptr(), q_pre.data_ptr(), gate.data_ptr(), B * S, 0)
+        qg.data_ptr(), q_pre.data_ptr(), gate.data_ptr(), B * S, _cs())
     q = q_pre.view(B, S, NQ, HD)
     gate = gate.view(B, S, NQ * HD)
     q = _rms_k(q.to(torch.bfloat16), qnw, fvk, device, eps)
@@ -656,7 +673,7 @@ def _full_attn_layer(h, ld, ct, st, fvk, device, eps, cap=None, rank=None,
     ctc, stc = ct.contiguous(), st.contiguous()
     fvk.qwen36_partial_rope_qk_bf16(
         qin.data_ptr(), kin.data_ptr(), ctc.data_ptr(), stc.data_ptr(),
-        qo.data_ptr(), ko.data_ptr(), S, NQ, NKV, HD, ROPE, 0)
+        qo.data_ptr(), ko.data_ptr(), S, NQ, NKV, HD, ROPE, _cs())
 
     # Causal GQA attention via the vendored FA2 kernel (native GQA: KV stays at
     # NKV=2, no repeat_interleave; layout is FA2's (B,S,H,HD), no transpose).
@@ -682,7 +699,7 @@ def _full_attn_layer(h, ld, ct, st, fvk, device, eps, cap=None, rank=None,
     gc = gate.reshape(-1).contiguous()
     ato = torch.empty_like(atc)
     fvk.sigmoid_mul_sm120_bf16(atc.data_ptr(), gc.data_ptr(),
-                               ato.data_ptr(), atc.numel(), 0)
+                               ato.data_ptr(), atc.numel(), _cs())
     at = ato.reshape(B * S, NQ * HD)
     return _proj(at, ld, 'o_proj', HID, fvk, device).reshape(B, S, HID)
 
@@ -759,7 +776,7 @@ def _capture_per_token_state(cap, rank, S, init_state, conv_hist, mixed,
             q3[t:t + 1].data_ptr(), k3[t:t + 1].data_ptr(),
             v3[t:t + 1].data_ptr(), g2[t:t + 1].data_ptr(),
             b2[t:t + 1].data_ptr(), state.data_ptr(), core1.data_ptr(),
-            1, NV, HK, True, 0)
+            1, NV, HK, True, _cs())
         cap.spec_states[rank][t].copy_(state)
 
     # Conv state after t+1 tokens: the last KS-1 entries of the block's inputs
@@ -812,14 +829,14 @@ def _moe_experts_m16(x, ti, tw, ld, fvk, device):
     fvk.moe_m16_mma_sm120_bf16(
         ap.data_ptr(), gu_p.data_ptr(), asf.data_ptr(), gu_s.data_ptr(),
         d_gu.data_ptr(), gu_a.data_ptr(), tile_expert.data_ptr(),
-        total_tiles, n_gu, HID, 0, gu_p[0].numel(), gu_s[0].numel(), 0)
+        total_tiles, n_gu, HID, 0, gu_p[0].numel(), gu_s[0].numel(), _cs())
     inter = _silu_mul(d_gu[:, :INTER], d_gu[:, INTER:], fvk, device).contiguous()
     ip, isf = _quant_act(inter, fvk, device)
     d_dn = torch.empty(total_tiles * 16, n_dn, dtype=torch.bfloat16, device=device)
     fvk.moe_m16_mma_sm120_bf16(
         ip.data_ptr(), dn_p.data_ptr(), isf.data_ptr(), dn_s.data_ptr(),
         d_dn.data_ptr(), dn_a.data_ptr(), tile_expert.data_ptr(),
-        total_tiles, n_dn, INTER, 0, dn_p[0].numel(), dn_s[0].numel(), 0)
+        total_tiles, n_dn, INTER, 0, dn_p[0].numel(), dn_s[0].numel(), _cs())
     out = torch.zeros(S, HID, device=device)
     out.index_add_(0, stok, d_dn[tiled_row].float() * sw.unsqueeze(-1))
     return out
@@ -885,14 +902,14 @@ def _moe_experts_bt(x, ti, tw, ld, fvk, device):
     fvk.moe_blocktile_mma_sm120_bf16(
         ap.data_ptr(), gu_p.data_ptr(), asf.data_ptr(), gu_s.data_ptr(),
         d_gu.data_ptr(), gu_a.data_ptr(), tile_expert.data_ptr(),
-        MAX_TILES, n_gu, HID, 0, gu_p[0].numel(), gu_s[0].numel(), 0)
+        MAX_TILES, n_gu, HID, 0, gu_p[0].numel(), gu_s[0].numel(), _cs())
     inter = _silu_mul(d_gu[:, :INTER], d_gu[:, INTER:], fvk, device).contiguous()
     ip, isf = _quant_act(inter, fvk, device)
     d_dn = torch.empty(MAX_TILES * 64, n_dn, dtype=torch.bfloat16, device=device)
     fvk.moe_blocktile_mma_sm120_bf16(
         ip.data_ptr(), dn_p.data_ptr(), isf.data_ptr(), dn_s.data_ptr(),
         d_dn.data_ptr(), dn_a.data_ptr(), tile_expert.data_ptr(),
-        MAX_TILES, n_dn, INTER, 0, dn_p[0].numel(), dn_s[0].numel(), 0)
+        MAX_TILES, n_dn, INTER, 0, dn_p[0].numel(), dn_s[0].numel(), _cs())
     # Deterministic unpermute via the fused gather-weighted-sum kernel: invert
     # the routing permutation (inv: orig slot -> sorted position, a 131 KB int
     # scatter) to get each token's TOPK d_dn rows, then one kernel computes
@@ -906,7 +923,7 @@ def _moe_experts_bt(x, ti, tw, ld, fvk, device):
     out = torch.empty(S, HID, dtype=torch.float32, device=device)
     fvk.moe_weighted_sum_sm120_bf16(
         d_dn.data_ptr(), rows.data_ptr(), twc.data_ptr(), out.data_ptr(),
-        S, TOPK, n_dn, n_dn, 0)
+        S, TOPK, n_dn, n_dn, _cs())
     return out
 
 
@@ -940,14 +957,14 @@ def _moe_experts_grouped(x, ti, tw, ld, fvk, device):
     moe_grouped_w4a16(fvk)(
         A.data_ptr(), gu_p.data_ptr(), gu_s.data_ptr(), gu_a.data_ptr(),
         se.data_ptr(), d_gu.data_ptr(), slots, n_gu, HID,
-        HID, gu_p[0].numel(), gu_s[0].numel(), 0)
+        HID, gu_p[0].numel(), gu_s[0].numel(), _cs())
     g, u = d_gu[:, :INTER], d_gu[:, INTER:]
     inter = _silu_mul(g, u, fvk, device).contiguous()
     d_dn = torch.empty(slots, n_dn, dtype=torch.bfloat16, device=device)
     moe_grouped_w4a16(fvk)(
         inter.data_ptr(), dn_p.data_ptr(), dn_s.data_ptr(), dn_a.data_ptr(),
         se.data_ptr(), d_dn.data_ptr(), slots, n_dn, INTER,
-        INTER, dn_p[0].numel(), dn_s[0].numel(), 0)
+        INTER, dn_p[0].numel(), dn_s[0].numel(), _cs())
     out = torch.zeros(S, HID, device=device)
     out.index_add_(0, stok, d_dn.float() * sw.unsqueeze(-1))
     return out

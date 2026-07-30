@@ -298,6 +298,12 @@ class Nexn2DecodeState:
         # Set only around a verify block. Prefill runs the same layer code and
         # would otherwise pay for -- and overrun -- snapshots it never uses.
         self.spec_capture = False
+        # One captured graph per (pos, window): the KV slots, attention length
+        # and RoPE slice are baked per position exactly as the decode graph's
+        # are. Same LRU bound, since each graph owns a memory pool.
+        self._spec_graphs = collections.OrderedDict()
+        self._spec_tokens = None
+        self._spec_argmax = None
         # Which half of the draft head's fc input carries the hidden state.
         # The checkpoint does not say and fc is square in the concatenated
         # width, so this is settled by measuring acceptance both ways.
@@ -763,6 +769,21 @@ def mtp_draft(state, token_id, pos, fvk, device, *, hidden=None):
     ld = mtp['layer']
     h_prev = state.last_hidden if hidden is None else hidden
 
+    # The draft head runs on its BF16 weights, not on the runtime W4A16 the
+    # model's own projections take. A draft is one layer -- its weights are a
+    # rounding error against the window's traffic -- while its accuracy is the
+    # whole point, since a rejected draft costs a verified position. The
+    # sibling frontends keep the head BF16 for the same reason; this path had
+    # been quantising it along with everything else.
+    was_w4a16, state.dense_w4a16 = state.dense_w4a16, False
+    try:
+        return _mtp_draft_bf16(state, mtp, ld, p, token_id, h_prev, pos,
+                               fvk, device)
+    finally:
+        state.dense_w4a16 = was_w4a16
+
+
+def _mtp_draft_bf16(state, mtp, ld, p, token_id, h_prev, pos, fvk, device):
     e = F.embedding(token_id.view(1, 1), p['embed_w_t']).reshape(1, HID)
     hn = _rms_fvk(h_prev.reshape(1, HID), mtp['pre_h_w_t'], fvk, device,
                   state.eps)
@@ -794,7 +815,12 @@ def mtp_draft(state, token_id, pos, fvk, device, *, hidden=None):
 
 
 def _ensure_spec_buffers(state, window, device):
-    """Allocate the per-token state snapshots a window of `window` needs."""
+    """Allocate what a window of `window` tokens needs."""
+    if state._spec_tokens is None or state._spec_tokens.numel() < window:
+        state._spec_tokens = torch.zeros(window, dtype=torch.long,
+                                         device=device)
+        state._spec_argmax = torch.zeros(window, dtype=torch.long,
+                                         device=device)
     have = (state.spec_states is not None
             and len(state.spec_states[0]) >= window)
     if have:
@@ -822,64 +848,127 @@ def _rewind_to(state, kept):
         state.lin_conv_state[rank].copy_(state.spec_conv[rank][kept - 1])
 
 
-def spec_decode_step(state, token_id, pos, k, fvk, device):
-    """One speculative step: draft k tokens, verify k+1 positions, keep a prefix.
+def _spec_block(state, pos, k, fvk, device):
+    """The whole window as one dependency chain: k drafts, then the verify.
 
-    Returns (tokens, logits, next_pos) where `tokens` are the ids actually
-    emitted -- between 1 and k+1 of them -- and `logits` are the ones that
-    produced the last of them, so the caller can continue from it.
-
-    The window is [token_id, draft_1 .. draft_k]. Verifying it is one batched
-    forward over k+1 positions, which reads the dense weights once instead of
-    k+1 times; that, and nothing about the drafts being good, is where the time
-    comes from. A draft is kept only when the model's own argmax at that
-    position agrees with it, so the emitted sequence is exactly what plain
-    greedy decoding would have produced.
+    Written to be capturable end to end. Each draft's token is chosen on the
+    device -- ``qwen36_argmax_bf16`` writes it straight into the token buffer
+    the next draft reads -- so the chain never leaves the GPU, and the only
+    host decision left is how much of the window to keep.
     """
+    vocab = state.handles.ptrs['vocab_size']
+    toks = state._spec_tokens
     window = k + 1
-    _ensure_spec_buffers(state, window, device)
 
-    # Draft k tokens off the state as it stands. Each chained draft feeds the
-    # head its own hidden state, the same kind of input the model gives it.
-    drafts = []
-    tok = token_id.view(1)
     hidden = state.last_hidden
     for j in range(k):
-        d_logits, hidden = mtp_draft(state, tok, pos + j, fvk, device,
-                                     hidden=hidden)
-        tok = d_logits[0].argmax().view(1)
-        drafts.append(tok)
+        d_logits, hidden = mtp_draft(state, toks[j:j + 1], pos + j, fvk,
+                                     device, hidden=hidden)
+        fvk.qwen36_argmax_bf16(d_logits.data_ptr(),
+                               toks[j + 1:j + 2].data_ptr(), 1, vocab, _cs())
 
-    ids = torch.cat([token_id.view(1)] + drafts).view(1, window)
     state.spec_capture = True
     set_spec_verify(True)
     try:
-        logits, hidden = nexn2_forward_nvfp4(
-            state.handles, ids, fvk, device, cap=state, pos_offset=pos,
-            last_logits_only=False, return_hidden=True)
+        logits, hid = nexn2_forward_nvfp4(
+            state.handles, toks[:window].view(1, window), fvk, device,
+            cap=state, pos_offset=pos, last_logits_only=False,
+            return_hidden=True)
     finally:
         state.spec_capture = False
         set_spec_verify(False)
     logits = logits.reshape(window, -1)
-    argmax = logits.argmax(-1)
+    fvk.qwen36_argmax_bf16(logits.data_ptr(), state._spec_argmax.data_ptr(),
+                           window, vocab, _cs())
+    return hid
 
-    # Keep the longest prefix the model agrees with. Row j predicts position
-    # pos+j+1, so it is compared against draft j+1.
+
+def _ensure_spec_graph(state, pos, k, fvk, device):
+    """Capture the draft-and-verify window at ``pos``, or return the cached one.
+
+    Everything the block mutates is snapshotted and restored around the warmup
+    and capture runs -- the recurrent and conv states, the KV rows the window
+    writes across every rank including the draft head's, and the drafted token
+    slots -- so a later replay advances from the true pre-window state rather
+    than from whatever the capture left behind.
+    """
+    key = (pos, k)
+    cached = state._spec_graphs.get(key)
+    if cached is not None:
+        state._spec_graphs.move_to_end(key)
+        return cached
+
+    window = k + 1
+    snap_lin = [t.clone() for t in state.lin_state]
+    snap_conv = [t.clone() for t in state.lin_conv_state]
+    snap_k = state.attn.K_cache[:, pos:pos + window].clone()
+    snap_v = state.attn.V_cache[:, pos:pos + window].clone()
+    snap_tok = state._spec_tokens.clone()
+
+    def _restore():
+        for i, t in enumerate(state.lin_state):
+            t.copy_(snap_lin[i])
+        for i, t in enumerate(state.lin_conv_state):
+            t.copy_(snap_conv[i])
+        state.attn.K_cache[:, pos:pos + window].copy_(snap_k)
+        state.attn.V_cache[:, pos:pos + window].copy_(snap_v)
+        state._spec_tokens.copy_(snap_tok)
+
+    with torch.no_grad():           # settle allocator, kernel order, and the
+        for _ in range(2):          # weight quantisation the draft does lazily
+            _spec_block(state, pos, k, fvk, device)
+        _restore()
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=state._graph_stream,
+                          pool=state._graph_pool), torch.no_grad():
+        hid = _spec_block(state, pos, k, fvk, device)
+    with torch.no_grad():
+        _restore()
+
+    state._spec_graphs[key] = (g, hid)
+    cap = state.graph_cache_max
+    if cap > 0 and len(state._spec_graphs) > cap:
+        state._spec_graphs.popitem(last=False)
+    return state._spec_graphs[key]
+
+
+def spec_decode_step(state, token_id, pos, k, fvk, device):
+    """One speculative step: draft k tokens, verify k+1 positions, keep a prefix.
+
+    Returns (tokens, next_pos) where `tokens` are the ids actually emitted --
+    between 1 and k+1 of them.
+
+    Verifying the window is one batched forward over k+1 positions, which reads
+    the dense weights once instead of k+1 times; that, and nothing about the
+    drafts being good, is where the time comes from. A draft is kept only where
+    the model's own argmax agrees with it, so the emitted sequence is what that
+    verifier's greedy decode would have produced.
+    """
+    window = k + 1
+    _ensure_spec_buffers(state, window, device)
+    state._spec_tokens[0].copy_(token_id.view(1)[0])
+
+    g, hid = _ensure_spec_graph(state, pos, k, fvk, device)
+    g.replay()
+
+    # One D2H for the whole decision: the drafted ids and what the model said
+    # at each position. Everything before this stayed on the device.
+    drafted = state._spec_tokens[:window].tolist()
+    argmax = state._spec_argmax[:window].tolist()
     kept = 1
-    accepted = argmax[:k] == ids.view(window)[1:]
     for j in range(k):
-        if not bool(accepted[j]):
+        if argmax[j] != drafted[j + 1]:
             break
         kept += 1
 
     if kept < window:
         _rewind_to(state, kept)
     # The draft head reads the pre-final-norm hidden state of the last emitted
-    # position. The batched forward has it for every position in the window;
-    # without this the next window would draft off a state from before it.
-    state.last_hidden.copy_(hidden[kept - 1])
-    tokens = ids.view(window)[1:kept].tolist() + [int(argmax[kept - 1])]
-    return tokens, logits[kept - 1:kept], pos + kept
+    # position. Without this the next window would draft off a stale one.
+    state.last_hidden.copy_(hid[kept - 1])
+    tokens = drafted[1:kept] + [argmax[kept - 1]]
+    return tokens, pos + kept
 
 
 def generate_greedy_spec(state, input_ids, max_new_tokens, k, fvk, device):
@@ -890,19 +979,17 @@ def generate_greedy_spec(state, input_ids, max_new_tokens, k, fvk, device):
     """
     logits = seed_prefill(state, input_ids, fvk, device)
     pos = input_ids.view(-1).shape[0]
+    nxt = logits[0].argmax().view(1)
     out = []
     state.spec_windows = 0
     state.spec_kept = 0
     while len(out) < max_new_tokens:
-        nxt = logits[0].argmax().view(1)
-        tokens, logits, pos = spec_decode_step(
-            state, nxt, pos, k, fvk, device)
+        tokens, pos = spec_decode_step(state, nxt, pos, k, fvk, device)
         emitted = [int(nxt)] + tokens[:-1]
         state.spec_windows += 1
         state.spec_kept += len(emitted)
         out.extend(emitted)
-        # The step returns the logits that produced its last token, which the
-        # next window drafts from.
+        nxt = torch.tensor([tokens[-1]], dtype=torch.long, device=device)
     return out[:max_new_tokens]
 
 
