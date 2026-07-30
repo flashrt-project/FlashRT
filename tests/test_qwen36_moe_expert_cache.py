@@ -138,3 +138,25 @@ def test_close_is_documented_to_release_the_slots():
 
     assert "self.slots = None" in source
     assert "self._staging = []" in source
+
+
+def test_components_follows_the_manifest_and_omits_the_pad():
+    # A consumer must not reproduce the offset arithmetic; it reads the order
+    # from the manifest, so it cannot drift from whatever wrote the bundle.
+    import inspect
+
+    source = inspect.getsource(ExpertCache.components)
+
+    assert 'self.manifest["block_layout"]' in source
+    assert 'name != "padding"' in source
+
+
+def test_global_scales_validates_the_sidecar_size():
+    # The scales live beside the blocks so a block stays exactly block_bytes
+    # and aligned. A truncated sidecar has to be caught, not silently reshaped.
+    import inspect
+
+    source = inspect.getsource(ExpertCache.global_scales)
+
+    assert "num_experts * 2 * 4" in source
+    assert "raise ValueError" in source

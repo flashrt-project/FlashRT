@@ -137,6 +137,7 @@ class ExpertCache:
             for layer in range(self.num_layers)
         ]
         self._fds: dict[int, int] = {}
+        self._global_scales: dict[int, torch.Tensor] = {}
         self.hits = 0
         self.misses = 0
         self.bytes_read = 0
@@ -258,6 +259,51 @@ class ExpertCache:
 
     def get(self, layer: int, expert: int) -> int:
         return self.get_many(layer, (expert,))[0]
+
+    def components(self, layer: int, expert: int) -> dict[str, torch.Tensor]:
+        """The block's four parts as views over its slot, plus its scales.
+
+        Views, not copies: the caller reads them where the block already lies.
+        The manifest's ``block_layout`` gives the order, so a consumer never
+        reproduces the offset arithmetic and cannot drift from the writer.
+        """
+        self.get(layer, expert)
+        raw = self.slots[self._lru[layer][expert]]
+        sizes = self.manifest["block_sizes"]
+        offset = 0
+        parts = {}
+        for name in self.manifest["block_layout"]:
+            length = int(sizes[name])
+            if name != "padding":
+                parts[name] = raw[offset:offset + length]
+            offset += length
+        parts["global_scales"] = self.global_scales(layer)[expert]
+        return parts
+
+    def global_scales(self, layer: int) -> torch.Tensor:
+        """This layer's per-expert (gate_up, down) scales, read once.
+
+        They live beside the blocks rather than inside them so a block stays
+        exactly ``block_bytes`` and aligned; the kernel takes them as its GEMM
+        alpha.
+        """
+        cached = self._global_scales.get(layer)
+        if cached is None:
+            name = self.manifest.get(
+                "global_scales", "global_scales_layer_NN.bin")
+            path = self.config.bundle / name.replace(
+                "NN", f"{layer:02d}")
+            expected = self.num_experts * 2 * 4
+            size = path.stat().st_size
+            if size != expected:
+                raise ValueError(
+                    f"{path} is {size} bytes; expected {expected} "
+                    f"({self.num_experts} experts x 2 x float32)")
+            cached = torch.frombuffer(
+                bytearray(path.read_bytes()), dtype=torch.float32
+            ).view(self.num_experts, 2)
+            self._global_scales[layer] = cached
+        return cached
 
     # ── startup ──
 
