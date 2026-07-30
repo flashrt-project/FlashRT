@@ -249,3 +249,26 @@ def test_streamed_experts_rotate_the_activation_when_the_bundle_is_rotated():
     # Both GEMMs: the hidden state entering gate_up, and the gated result
     # entering down.
     assert source.count("_rotate16(") == 2
+
+
+def test_attention_backend_probes_the_vendored_kernel():
+    # Importing the module and finding its symbols proves neither that the
+    # kernel runs nor that it computes. On an SM110 part it imported, exposed
+    # every symbol, and then refused at run time while writing nothing --
+    # which reads downstream as plausible-but-wrong attention, not a failure.
+    import inspect
+
+    from flash_rt.hardware.rtx import attn_backend_nexn2 as backend
+
+    cls = backend.RtxFlashAttnBackendNexn2
+    probe = inspect.getsource(cls._probe_fa2)
+    run = inspect.getsource(cls.run)
+
+    # The probe compares against a reference rather than checking a return code.
+    assert "scaled_dot_product_attention" in probe
+    assert "isfinite" in probe
+    # And it goes through the same launch the hot path uses, so it cannot pass
+    # while the real call fails.
+    assert "_launch_fa2" in probe
+    assert "_launch_fa2" in run
+    assert "self._fa2_usable" in run

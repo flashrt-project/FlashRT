@@ -101,6 +101,73 @@ class RtxFlashAttnBackendNexn2:
         self._num_sms = torch.cuda.get_device_properties(
             torch.cuda.current_device()
         ).multi_processor_count
+        self._fa2_usable = self._probe_fa2()
+
+    def _probe_fa2(self) -> bool:
+        """Does the vendored kernel actually compute on this device?
+
+        Importing it and finding its symbols proves neither. Its own arch
+        handling can leave a build that links, loads, prints a complaint to
+        stdout and returns without writing the output -- which downstream looks
+        like plausible-but-wrong attention rather than a failure. Measured on
+        an SM110 part: the module imported, every symbol was present, and the
+        kernel refused at run time.
+
+        So run one small case against a reference and compare. The cost is one
+        launch at construction.
+        """
+        import torch.nn.functional as F
+
+        q_seq, kv_seq = 1, 8
+        generator = torch.Generator(device=self.Q_buf.device).manual_seed(1)
+        q = torch.randn(
+            1, q_seq, self.NUM_Q_HEADS, self.HEAD_DIM, generator=generator,
+            device=self.Q_buf.device, dtype=torch.bfloat16)
+        k = torch.randn(
+            1, kv_seq, self.NUM_KV_HEADS, self.HEAD_DIM, generator=generator,
+            device=self.Q_buf.device, dtype=torch.bfloat16)
+        v = torch.randn_like(k)
+        self.Q_buf[:, :q_seq].copy_(q)
+        self.K_cache[0:1, :kv_seq].copy_(k)
+        self.V_cache[0:1, :kv_seq].copy_(v)
+        self.O_buf[:, :q_seq].zero_()
+        try:
+            self._launch_fa2(0, q_seq, kv_seq, 0,
+                             1.0 / (self.HEAD_DIM ** 0.5))
+            torch.cuda.synchronize()
+        except Exception:                                    # noqa: BLE001
+            return False
+        produced = self.O_buf[:, :q_seq].float().clone()
+
+        groups = self.NUM_Q_HEADS // self.NUM_KV_HEADS
+        kr = k.repeat_interleave(groups, dim=2)
+        vr = v.repeat_interleave(groups, dim=2)
+        expected = F.scaled_dot_product_attention(
+            q.transpose(1, 2).float(), kr.transpose(1, 2).float(),
+            vr.transpose(1, 2).float()).transpose(1, 2)
+        if not torch.isfinite(produced).all():
+            return False
+        reference = expected.norm().clamp_min(1e-6)
+        return bool(
+            ((produced - expected).norm() / reference).item() < 0.05)
+
+    def _sdpa(self, layer_idx: int, q_seq: int, kv_seq: int,
+              softmax_scale: float) -> None:
+        """Reference attention, for a device the vendored kernel refuses."""
+        import torch.nn.functional as F
+
+        q = self.Q_buf[:, :q_seq]
+        k = self.K_cache[layer_idx:layer_idx + 1, :kv_seq]
+        v = self.V_cache[layer_idx:layer_idx + 1, :kv_seq]
+        groups = self.NUM_Q_HEADS // self.NUM_KV_HEADS
+        out = F.scaled_dot_product_attention(
+            q.transpose(1, 2).float(),
+            k.repeat_interleave(groups, dim=2).transpose(1, 2).float(),
+            v.repeat_interleave(groups, dim=2).transpose(1, 2).float(),
+            is_causal=q_seq > 1,
+            scale=softmax_scale,
+        ).transpose(1, 2)
+        self.O_buf[:, :q_seq].copy_(out.to(self.O_buf.dtype))
 
     # ── Layer cache pointer math ──
 
@@ -175,6 +242,21 @@ class RtxFlashAttnBackendNexn2:
         if softmax_scale is None:
             softmax_scale = 1.0 / (self.HEAD_DIM ** 0.5)
 
+        if not self._fa2_usable:
+            self._sdpa(layer_idx, q_seq, kv_seq, softmax_scale)
+            return o.data_ptr()
+
+        self._launch_fa2(layer_idx, q_seq, kv_seq, stream, softmax_scale)
+        return o.data_ptr()
+
+    def _launch_fa2(self, layer_idx: int, q_seq: int, kv_seq: int,
+                    stream: int, softmax_scale: float) -> None:
+        """One vendored-FA2 launch. Shared with the construction-time probe so
+        the probe exercises the same call the hot path makes."""
+        q = self.Q_buf[:, :q_seq]
+        k = self.K_cache[layer_idx:layer_idx + 1, :kv_seq]
+        v = self.V_cache[layer_idx:layer_idx + 1, :kv_seq]
+        o = self.O_buf[:, :q_seq]
         self._fa2_fwd(
             Q=q.data_ptr(), K=k.data_ptr(), V=v.data_ptr(),
             O=o.data_ptr(), softmax_lse=self.lse_buf.data_ptr(),
@@ -192,7 +274,6 @@ class RtxFlashAttnBackendNexn2:
             num_sms=self._num_sms,
             stream=stream,
         )
-        return o.data_ptr()
 
 
 def make_nexn2_attention_spec(*, max_seq: int, max_q_seq: int = 1) -> dict:
