@@ -79,43 +79,91 @@ __device__ __forceinline__ void stage_padded(
     sh_i4[(j >> 1) * kBlockInt4 + (j & 1)] = x_i4[j];
 }
 
-// The K loop, shared by both entry points: 1 warp per output row, kUnroll
-// packed-weight loads in flight.
-__device__ __forceinline__ float row_dot(
-    const uint64_t* __restrict__ w_blk, const uint8_t* __restrict__ SFB,
-    const __nv_bfloat16* x_sh, int K_BLOCKS, int rb_ncs, int row_inner,
-    int lane) {
-  float acc = 0.0f;
+// The K loop, shared by both entry points: R output rows per warp, kUnroll
+// packed-weight loads per row in flight.
+//
+// R exists because a warp with one row does not have enough memory-level
+// parallelism on this part. In situ the dominant stall is the global-load
+// dependency (long scoreboard, 5.8-13 cycles per issued instruction) while the
+// ALU pipe sits at 27-50%: the loop is waiting on memory it has not asked for
+// yet. Each lane keeps R*kUnroll eight-byte loads outstanding instead of
+// kUnroll, and the K=512 shapes -- where K_BLOCKS is exactly 32, so the
+// unrolled body never runs and the tail leaves ONE load in flight -- get the
+// whole factor from R.
+//
+// The rows a warp takes are consecutive and 32-aligned by construction, so
+// their scale offsets differ by a constant and cost no extra registers. The
+// per-row arithmetic is untouched: same lane-to-block mapping, same order, same
+// reduction, so the result is bit-identical to R = 1.
+template <int R>
+__device__ __forceinline__ void row_dot(
+    const uint64_t* __restrict__ w_row0, size_t row_stride_u64,
+    const uint8_t* __restrict__ SFB, const __nv_bfloat16* x_sh,
+    int K_BLOCKS, int rb_ncs, int row_inner, int lane, float (&acc)[R]) {
+#pragma unroll
+  for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+
   int kb = lane;
   const int step = 32 * kUnroll;
   for (; kb + 32 * (kUnroll - 1) < K_BLOCKS; kb += step) {
-    uint64_t wv[kUnroll];
-    float sf[kUnroll];
+    uint64_t wv[R][kUnroll];
+    float sf[R][kUnroll];
 #pragma unroll
-    for (int u = 0; u < kUnroll; ++u) wv[u] = w_blk[kb + 32 * u];
+    for (int r = 0; r < R; ++r)
 #pragma unroll
-    for (int u = 0; u < kUnroll; ++u)
-      sf[u] = ue4m3_to_float(
-          __ldg(SFB + sf_off(rb_ncs, row_inner, kb + 32 * u)));
+      for (int u = 0; u < kUnroll; ++u)
+        wv[r][u] = w_row0[r * row_stride_u64 + kb + 32 * u];
 #pragma unroll
-    for (int u = 0; u < kUnroll; ++u)
-      acc += blockdot(
-          wv[u], reinterpret_cast<const __nv_bfloat162*>(
-                     x_sh + (size_t)(kb + 32 * u) * kBlockSlots)) * sf[u];
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u)
+        sf[r][u] = ue4m3_to_float(__ldg(
+            SFB + sf_off(rb_ncs, row_inner + 16 * r, kb + 32 * u)));
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u)
+        acc[r] += blockdot(
+            wv[r][u], reinterpret_cast<const __nv_bfloat162*>(
+                          x_sh + (size_t)(kb + 32 * u) * kBlockSlots))
+            * sf[r][u];
   }
   for (; kb < K_BLOCKS; kb += 32) {
-    const float s = ue4m3_to_float(
-        __ldg(SFB + sf_off(rb_ncs, row_inner, kb)));
-    acc += blockdot(
-        w_blk[kb], reinterpret_cast<const __nv_bfloat162*>(
-                       x_sh + (size_t)kb * kBlockSlots)) * s;
+    uint64_t wv[R];
+    float sf[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) wv[r] = w_row0[r * row_stride_u64 + kb];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+      sf[r] = ue4m3_to_float(
+          __ldg(SFB + sf_off(rb_ncs, row_inner + 16 * r, kb)));
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+      acc[r] += blockdot(
+          wv[r], reinterpret_cast<const __nv_bfloat162*>(
+                     x_sh + (size_t)kb * kBlockSlots)) * sf[r];
   }
 #pragma unroll
-  for (int off = 16; off > 0; off >>= 1)
-    acc += __shfl_xor_sync(0xffffffff, acc, off);
-  return acc;
+  for (int r = 0; r < R; ++r)
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+      acc[r] += __shfl_xor_sync(0xffffffff, acc[r], off);
 }
 
+// Rows per warp. Enough outstanding loads to cover the memory latency without
+// spending so many registers that occupancy pays for it: R * (loads per row)
+// lands at 8 either way, since the unrolled body runs only when K_BLOCKS
+// reaches 32 * kUnroll.
+constexpr int kRowsBig = 2;      // K >= 2048: kUnroll fires, 2 * 4 = 8
+constexpr int kRowsSmall = 8;    // K <  2048: tail only, 8 * 1 = 8
+
+// The row block a warp owns must not straddle a 32-row scale group, or
+// row_inner + 16 * r stops describing the swizzle. Warps take R consecutive
+// rows starting at a multiple of R, so this holds for any R dividing 32.
+static_assert(32 % kRowsBig == 0 && 32 % kRowsSmall == 0,
+              "rows per warp must divide the 32-row scale group");
+
+template <int R>
 __global__ void w4a16_matvec_edge_kernel(
     const __nv_bfloat16* __restrict__ x,
     const uint8_t* __restrict__ W,
@@ -127,19 +175,25 @@ __global__ void w4a16_matvec_edge_kernel(
   __syncthreads();
 
   const int lane = threadIdx.x & 31;
-  const int row = blockIdx.x * kWarps + (threadIdx.x >> 5);
-  if (row >= N) return;
+  const int row0 = (blockIdx.x * kWarps + (threadIdx.x >> 5)) * R;
+  if (row0 >= N) return;
 
-  const int rb = row >> 7;
-  const int ri = row & 127;
-  const float acc = row_dot(
-      reinterpret_cast<const uint64_t*>(W + (size_t)row * (K >> 1)), SFB,
-      x_sh, K >> 4, rb * n_col_super,
-      (ri & 31) * 16 + ((ri >> 5) & 3) * 4, lane);
-  if (lane == 0) out[row] = __float2bfloat16(acc * alpha);
+  const int rb = row0 >> 7;
+  const int ri = row0 & 127;
+  float acc[R];
+  row_dot<R>(
+      reinterpret_cast<const uint64_t*>(W + (size_t)row0 * (K >> 1)),
+      (size_t)(K >> 1) / 8, SFB, x_sh, K >> 4, rb * n_col_super,
+      (ri & 31) * 16 + ((ri >> 5) & 3) * 4, lane, acc);
+  if (lane == 0) {
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+      if (row0 + r < N) out[row0 + r] = __float2bfloat16(acc[r] * alpha);
+  }
 }
 
-// grid = (ceil(N/8), slots). Block computes 8 output rows of one slot.
+// grid = (ceil(N/(8*R)), slots). Block computes 8*R output rows of one slot.
+template <int R>
 __global__ void moe_grouped_w4a16_edge_kernel(
     const __nv_bfloat16* __restrict__ A_stack,
     const uint8_t* __restrict__ W_stack,
@@ -157,23 +211,37 @@ __global__ void moe_grouped_w4a16_edge_kernel(
   __syncthreads();
 
   const int lane = threadIdx.x & 31;
-  const int row = blockIdx.x * kWarps + (threadIdx.x >> 5);
-  if (row >= N) return;
+  const int row0 = (blockIdx.x * kWarps + (threadIdx.x >> 5)) * R;
+  if (row0 >= N) return;
 
-  const int rb = row >> 7;
-  const int ri = row & 127;
-  const float acc = row_dot(
+  const int rb = row0 >> 7;
+  const int ri = row0 & 127;
+  float acc[R];
+  row_dot<R>(
       reinterpret_cast<const uint64_t*>(
-          W_stack + (long)e * w_stride + (size_t)row * (K >> 1)),
-      SFB_stack + (long)e * sfb_stride, x_sh, K >> 4, rb * n_col_super,
-      (ri & 31) * 16 + ((ri >> 5) & 3) * 4, lane);
-  if (lane == 0)
-    D[(long)slot * N + row] = __float2bfloat16(acc * alpha_stack[e]);
+          W_stack + (long)e * w_stride + (size_t)row0 * (K >> 1)),
+      (size_t)(K >> 1) / 8, SFB_stack + (long)e * sfb_stride, x_sh, K >> 4,
+      rb * n_col_super, (ri & 31) * 16 + ((ri >> 5) & 3) * 4, lane, acc);
+  if (lane == 0) {
+    const float a = alpha_stack[e];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+      if (row0 + r < N)
+        D[(long)slot * N + row0 + r] = __float2bfloat16(acc[r] * a);
+  }
 }
 
 // Shared memory for the padded stage: kBlockSlots bf16 per 16 elements.
 inline size_t smem_bytes(int K) {
   return (size_t)(K >> 4) * kBlockSlots * sizeof(__nv_bfloat16);
+}
+
+// Rows per warp for this K, dropping to 1 when N cannot fill even one warp's
+// worth. Above 32 rows a warp would straddle a scale group; the constants
+// enforce that, this only picks between them.
+inline int rows_per_warp(int N, int K) {
+  const int r = (K >= 2048) ? kRowsBig : kRowsSmall;
+  return (N >= kWarps * r) ? r : 1;
 }
 
 }  // namespace
@@ -190,13 +258,21 @@ int w4a16_matvec_edge_sm120_bf16(
   if (!x_bf16 || !W_packed || !SFB || !out) return 1;
   if (N <= 0 || K <= 0 || (K & 15) != 0) return 2;
   const int n_col_super = ((K >> 4) + 3) / 4;
-  w4a16_matvec_edge_kernel<<<dim3((N + kWarps - 1) / kWarps),
-                             dim3(kThreads), smem_bytes(K), stream>>>(
-      reinterpret_cast<const __nv_bfloat16*>(x_bf16),
-      reinterpret_cast<const uint8_t*>(W_packed),
-      reinterpret_cast<const uint8_t*>(SFB),
-      reinterpret_cast<__nv_bfloat16*>(out),
-      alpha, N, K, n_col_super);
+  const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x_bf16);
+  const auto* wp = reinterpret_cast<const uint8_t*>(W_packed);
+  const auto* sp = reinterpret_cast<const uint8_t*>(SFB);
+  auto* op = reinterpret_cast<__nv_bfloat16*>(out);
+  const size_t smem = smem_bytes(K);
+#define FLASHRT_LAUNCH_MATVEC(R)                                              \
+  w4a16_matvec_edge_kernel<R><<<dim3((N + kWarps * (R) - 1) / (kWarps * (R))),\
+                                dim3(kThreads), smem, stream>>>(              \
+      xp, wp, sp, op, alpha, N, K, n_col_super)
+  switch (rows_per_warp(N, K)) {
+    case kRowsBig:   FLASHRT_LAUNCH_MATVEC(kRowsBig);   break;
+    case kRowsSmall: FLASHRT_LAUNCH_MATVEC(kRowsSmall); break;
+    default:         FLASHRT_LAUNCH_MATVEC(1);          break;
+  }
+#undef FLASHRT_LAUNCH_MATVEC
   return 0;
 }
 
@@ -218,15 +294,25 @@ int moe_grouped_w4a16_edge_sm120_bf16(
     return 1;
   if (slots <= 0 || N <= 0 || K <= 0 || (K & 15) != 0) return 2;
   const int n_col_super = ((K >> 4) + 3) / 4;
-  moe_grouped_w4a16_edge_kernel<<<dim3((N + kWarps - 1) / kWarps, slots),
-                                  dim3(kThreads), smem_bytes(K), stream>>>(
-      reinterpret_cast<const __nv_bfloat16*>(A_stack),
-      reinterpret_cast<const uint8_t*>(W_stack),
-      reinterpret_cast<const uint8_t*>(SFB_stack),
-      reinterpret_cast<const float*>(alpha_stack),
-      reinterpret_cast<const int*>(eidx),
-      reinterpret_cast<__nv_bfloat16*>(D),
-      N, K, n_col_super, a_stride, w_stride, sfb_stride);
+  const auto* ap = reinterpret_cast<const __nv_bfloat16*>(A_stack);
+  const auto* wp = reinterpret_cast<const uint8_t*>(W_stack);
+  const auto* sp = reinterpret_cast<const uint8_t*>(SFB_stack);
+  const auto* alp = reinterpret_cast<const float*>(alpha_stack);
+  const auto* ep = reinterpret_cast<const int*>(eidx);
+  auto* dp = reinterpret_cast<__nv_bfloat16*>(D);
+  const size_t smem = smem_bytes(K);
+#define FLASHRT_LAUNCH_GROUPED(R)                                             \
+  moe_grouped_w4a16_edge_kernel<R>                                            \
+      <<<dim3((N + kWarps * (R) - 1) / (kWarps * (R)), slots),                \
+         dim3(kThreads), smem, stream>>>(                                     \
+          ap, wp, sp, alp, ep, dp, N, K, n_col_super,                         \
+          a_stride, w_stride, sfb_stride)
+  switch (rows_per_warp(N, K)) {
+    case kRowsBig:   FLASHRT_LAUNCH_GROUPED(kRowsBig);   break;
+    case kRowsSmall: FLASHRT_LAUNCH_GROUPED(kRowsSmall); break;
+    default:         FLASHRT_LAUNCH_GROUPED(1);          break;
+  }
+#undef FLASHRT_LAUNCH_GROUPED
   return 0;
 }
 
