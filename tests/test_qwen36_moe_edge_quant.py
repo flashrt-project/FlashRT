@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 
+from qwen36_moe_edge.kernel_parity import CASES, _binding_of
 from qwen36_moe_edge.expert_quality import (
     SCHEMES,
     expert_forward,
@@ -224,6 +225,26 @@ def test_cold_prefill_counts_the_union_prefill_touches():
 
     assert without == 3 + 2          # {0,1,2} and {3,4}
     assert with_resident == 1 + 1    # {2} and {4}
+
+
+def test_parity_cases_name_bindings_that_exist_in_the_tiers():
+    # The parity harness resolves a case name to a binding name. If a kernel is
+    # renamed and this mapping is not updated, the case silently reports
+    # "binding absent" and a real regression passes unnoticed.
+    expected = {
+        "bf16_matvec": "bf16_matvec_sm120_bf16",
+        "moe_router_topk": "moe_router_topk_sm120_bf16",
+        "silu_mul": "silu_mul_sm120_bf16",
+        "sigmoid_mul": "sigmoid_mul_sm120_bf16",
+        "moe_weighted_sum": "moe_weighted_sum_sm120_bf16",
+        "w16a16_gemm": "w16a16_gemm_sm120_bf16",
+        "lin_split_qkv": "qwen35moe_lin_split_qkv_broadcast_bf16",
+        "split_q_gate": "qwen35moe_split_q_gate_bf16",
+    }
+
+    assert set(CASES) == set(expected)
+    for case, binding in expected.items():
+        assert _binding_of(case) == binding
 
 
 def test_expert_forward_is_a_swiglu_over_the_gate_up_split():

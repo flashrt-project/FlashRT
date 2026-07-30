@@ -24,6 +24,33 @@ PYTHONPATH=. python qwen36_moe_edge/probe.py \
   --group-size 16
 ```
 
+Check that the gated kernels compute the same thing on another architecture.
+Compiling for a target says nothing about what it computes there, so record a
+reference where the kernels are known good and replay it elsewhere:
+
+```bash
+# On a known-good target:
+PYTHONPATH=. python qwen36_moe_edge/kernel_parity.py \
+  --output parity_sm120.json
+
+# On the target under test, with the reference alongside it:
+PYTHONPATH=. python qwen36_moe_edge/kernel_parity.py \
+  --output parity_sm110.json \
+  --reference parity_sm120.json
+```
+
+No checkpoint is involved: shapes come from the Qwen3.6 geometry and inputs
+from a fixed generator. Inputs are stored in the reference and replayed rather
+than regenerated, because CUDA RNG is not bit-reproducible across
+architectures — the Philox thread mapping follows occupancy, so regenerating on
+the target compares kernels on different data and reads as a kernel failure.
+Divergence appears only past the first launch block, which is why small tensors
+appear to agree and large ones do not.
+
+Each case also checks its kernel against a Torch expression on the local
+device, so a genuine kernel fault is distinguishable from a harness or input
+problem: a broken kernel fails its local check first.
+
 Score the quantization schemes against the activations the router actually
 sends each expert, and optionally save the references a device can check
 itself against:
