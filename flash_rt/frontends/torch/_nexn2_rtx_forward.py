@@ -455,6 +455,9 @@ def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None,
         cap.lin_state[rank].copy_(state)
         cs = mixed[0, S - (KS - 1):S, :].transpose(0, 1).contiguous()
         cap.lin_conv_state[rank].copy_(cs.unsqueeze(0))
+        if getattr(cap, 'spec_capture', False):
+            _capture_per_token_state(cap, rank, S, init_state, conv_hist,
+                                     mixed, qb, kb, vb, g_out, bo, fvk, device)
 
     cf = core.reshape(-1, HV).contiguous()
     zf = z.reshape(-1, HV).to(torch.bfloat16).contiguous()
@@ -701,6 +704,48 @@ _N_EXPERTS = 256
 # activation + weight loaded once into smem and shared across warps). Default on
 # for S >= _M16_MIN_S; set False to fall back to the M16 tile.
 _USE_BT_MOE = True
+
+
+def _capture_per_token_state(cap, rank, S, init_state, conv_hist, mixed,
+                             qb, kb, vb, g_out, bo, fvk, device):
+    """Record what the recurrent state would be after each token of a block.
+
+    A verified speculative window is accepted up to some prefix, and the layer
+    that has to be rewound is this one: the KV cache is a cursor, but the
+    recurrent and conv states are not -- they have already absorbed every token
+    of the block, including the rejected tail.
+
+    Rather than re-deriving them afterwards, run the scan a token at a time and
+    keep each intermediate. The block is a handful of tokens, so this is a few
+    extra launches and a few MB of state copies; recovering the state any other
+    way means either re-running the block's projections or reconstructing the
+    recurrence from saved inputs, both of which cost more than they save at
+    this length.
+    """
+    state = (init_state.clone() if init_state is not None
+             else torch.zeros(NV, HK, HV, dtype=torch.bfloat16, device=device))
+    q3 = qb.reshape(S, NV, HK).contiguous()
+    k3 = kb.reshape(S, NV, HK).contiguous()
+    v3 = vb.reshape(S, NV, HV).contiguous()
+    g2 = g_out.reshape(S, NV).contiguous()
+    b2 = bo.reshape(S, NV).contiguous()
+    core1 = torch.empty(1, NV, HV, dtype=torch.bfloat16, device=device)
+    for t in range(S):
+        fvk.gdn_recurrent_seq_sm120_bf16(
+            q3[t:t + 1].data_ptr(), k3[t:t + 1].data_ptr(),
+            v3[t:t + 1].data_ptr(), g2[t:t + 1].data_ptr(),
+            b2[t:t + 1].data_ptr(), state.data_ptr(), core1.data_ptr(),
+            1, NV, HK, True, 0)
+        cap.spec_states[rank][t].copy_(state)
+
+    # Conv state after t+1 tokens: the last KS-1 entries of the block's inputs
+    # preceded by whatever history the block started from.
+    prev = (conv_hist[0] if conv_hist is not None
+            else torch.zeros(mixed.shape[-1], KS - 1,
+                             dtype=mixed.dtype, device=device))
+    hist = torch.cat([prev, mixed[0].transpose(0, 1)], dim=1)
+    for t in range(S):
+        cap.spec_conv[rank][t].copy_(hist[:, t + 1:t + KS].unsqueeze(0))
 
 
 def _moe_experts_m16(x, ti, tw, ld, fvk, device):

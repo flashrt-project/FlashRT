@@ -322,6 +322,32 @@ class Qwen36MoeTextFrontendRtx(Nexn2TorchFrontendRtx):
         )
         self._checkpoint_contract = contract
 
+    def generate_spec(self, max_new_tokens: int, *, k: int = 2):
+        """Greedy decode through draft-and-verify with the MTP head.
+
+        Emits exactly what ``generate`` emits: a draft is kept only where the
+        model's own argmax agrees with it, so this is a speed change and
+        nothing else. Requires the frontend to have loaded the head.
+        """
+        if self._prompt_ids is None:
+            raise ValueError("call set_prompt(...) before generate_spec()")
+        if not self._load_mtp:
+            raise RuntimeError(
+                "speculative decoding needs the MTP draft head; construct "
+                "the frontend with _load_mtp so the loader reads it")
+
+        from flash_rt.frontends.torch._nexn2_rtx_decode import (
+            Nexn2DecodeState,
+            generate_greedy_spec,
+        )
+
+        if self._decode_state is None:
+            self._decode_state = Nexn2DecodeState(
+                self._weights, self._user_max_seq, self.device)
+        return generate_greedy_spec(
+            self._decode_state, self._prompt_ids, max_new_tokens, k,
+            self._fvk, self.device)
+
     def generate(self, max_new_tokens: int, *, do_sample: bool = False):
         """Generate tokens with the shared qwen3_5_moe CUDA Graph path."""
         if self._prompt_ids is None:
