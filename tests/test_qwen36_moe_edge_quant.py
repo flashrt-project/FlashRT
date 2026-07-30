@@ -255,6 +255,7 @@ def test_parity_cases_name_bindings_that_exist_in_the_tiers():
         "w16a16_gemm": "w16a16_gemm_sm120_bf16",
         "lin_split_qkv": "qwen35moe_lin_split_qkv_broadcast_bf16",
         "split_q_gate": "qwen35moe_split_q_gate_bf16",
+        "e0m3_dequant": "qwen35moe_e0m3_dequant_bf16",
     }
 
     assert set(CASES) == set(expected)

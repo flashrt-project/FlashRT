@@ -151,6 +151,25 @@ def case_lin_split_qkv(fvk, device):
     return {"q32": q32, "k32": k32, "v32": v32}
 
 
+def case_e0m3_dequant(fvk, device):
+    """The streamed-block decode: sign-magnitude 4-bit plus a two-level scale."""
+    from qwen36_moe_edge.quantize_experts import _int4_weight, dequantize_int4
+
+    rows, cols, group = 2 * INTERMEDIATE, HIDDEN, 16
+    weight = _bf16("weight", (rows, cols), "cpu", 0.02).float()
+    packed, scale, global_scale = _int4_weight(weight, group)
+    packed = _record("packed", packed, device).contiguous()
+    scale = _record("scale", scale, device).contiguous()
+    out = torch.zeros(rows, cols, dtype=torch.bfloat16, device=device)
+    rc = fvk.qwen35moe_e0m3_dequant_bf16(
+        packed.data_ptr(), scale.data_ptr(), out.data_ptr(),
+        rows, cols, group, float(global_scale), 0)
+    torch.cuda.synchronize()
+    reference = dequantize_int4(
+        packed.cpu(), scale.cpu(), cols, group, global_scale)
+    return {"rc": rc, "out": out, "torch": reference.to(device)}
+
+
 def case_split_q_gate(fvk, device):
     S = 4
     q_proj = _bf16("q_proj", (S, 8192), device).contiguous()
@@ -171,6 +190,7 @@ CASES = {
     "w16a16_gemm": case_w16a16_gemm,
     "lin_split_qkv": case_lin_split_qkv,
     "split_q_gate": case_split_q_gate,
+    "e0m3_dequant": case_e0m3_dequant,
 }
 
 
@@ -258,6 +278,7 @@ def _binding_of(name: str) -> str:
     return {
         "lin_split_qkv": "qwen35moe_lin_split_qkv_broadcast_bf16",
         "split_q_gate": "qwen35moe_split_q_gate_bf16",
+        "e0m3_dequant": "qwen35moe_e0m3_dequant_bf16",
     }.get(name, f"{name}_sm120_bf16")
 
 

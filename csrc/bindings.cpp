@@ -186,6 +186,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/moe_router_topk_sm120.cuh"
 #include "kernels/moe_weighted_sum_sm120.cuh"
 #include "kernels/w16a16_gemm_sm120.cuh"
+#include "kernels/qwen35moe_e0m3_dequant.cuh"
 #endif  // FLASHRT_HAVE_QWEN35MOE_CORE
 #ifdef FLASHRT_HAVE_QWEN35MOE_W4A16
 #include "kernels/w4a16_matvec_sm120.cuh"
@@ -5470,6 +5471,18 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         },
         py::arg("x"), py::arg("gate"), py::arg("out"), py::arg("n"),
         py::arg("stream") = 0);
+
+    m.def("qwen35moe_e0m3_dequant_bf16",
+        [](uintptr_t packed, uintptr_t scale, uintptr_t out,
+           int rows, int cols, int group_size, float global_scale,
+           uintptr_t stream) -> int {
+            return flash_rt::kernels::qwen35moe_e0m3_dequant_bf16(
+                to_ptr(packed), to_ptr(scale), to_ptr(out),
+                rows, cols, group_size, global_scale, to_stream(stream));
+        },
+        py::arg("packed"), py::arg("scale"), py::arg("out"),
+        py::arg("rows"), py::arg("cols"), py::arg("group_size"),
+        py::arg("global_scale"), py::arg("stream") = 0);
 
     m.def("gdn_recurrent_seq_sm120_bf16",
         [](uintptr_t q, uintptr_t k, uintptr_t v, uintptr_t g, uintptr_t beta,
