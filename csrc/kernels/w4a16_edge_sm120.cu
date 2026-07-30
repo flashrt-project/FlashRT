@@ -16,7 +16,7 @@ namespace kernels {
 
 namespace {
 
-constexpr int kWarps = 8;                  // 8 output rows / block
+constexpr int kWarps = 2;                  // output-row groups per block
 constexpr int kThreads = kWarps * 32;      // 256
 constexpr int kUnroll = 4;                 // packed-weight loads in flight
 
