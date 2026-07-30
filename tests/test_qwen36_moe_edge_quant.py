@@ -44,8 +44,8 @@ def test_int4_grouped_round_trip_matches_packed_layout():
     generator = torch.Generator().manual_seed(5)
     weight = torch.randn(64, 256, generator=generator)
 
-    packed, scale = _int4_weight(weight, 32)
-    restored = dequantize_int4(packed, scale, 256, 32)
+    packed, scale, global_scale = _int4_weight(weight, 32)
+    restored = dequantize_int4(packed, scale, 256, 32, global_scale)
 
     assert packed.shape == (64, 128)
     assert scale.shape == (64, 8)
@@ -82,7 +82,7 @@ def test_expert_block_size_matches_manifest_layout():
         ("int4", 32),
         ("int4-rht", 16),
     ):
-        block = quantize_expert(
+        block, alphas = quantize_expert(
             gate_up,
             down,
             quant_format=quant_format,
@@ -91,6 +91,7 @@ def test_expert_block_size_matches_manifest_layout():
         )
         assert len(block) == sum(
             _layout(quant_format, group_size).values())
+        assert len(alphas) == 2
 
 
 def test_expert_blocks_are_aligned_for_direct_io():
@@ -218,10 +219,39 @@ def test_rht16_reduces_int4_error_on_outlier_heavy_weights():
     rotated = score_expert(
         activation, gate_up, down, scheme="w4a16_rht16", group_size=16)
 
-    # The transform is only worth its cost when groups have outliers; a 10 %
-    # margin keeps this from asserting on noise.
-    assert rotated["relative_l2"] < 0.9 * plain["relative_l2"]
+    # The transform only pays off when groups have outliers, and once the
+    # two-level scale is correct the win is modest -- about 9 % here. An
+    # earlier single-level scale showed 38 %, but most of that was the
+    # transform compensating for scale error rather than doing its own job.
+    assert rotated["relative_l2"] < 0.97 * plain["relative_l2"]
     assert rotated["cosine"] > plain["cosine"]
+
+
+def test_two_level_scale_keeps_group_scales_out_of_e4m3_subnormals():
+    # Real expert weights have per-group amax around 0.02. With a single level
+    # the scale is amax/7 ~ 0.003, below e4m3's smallest normal 2**-6, where
+    # the format keeps about three bits; the scale error then swamps the 4-bit
+    # value grid. Factoring out a global scale moves the stored bytes into
+    # e4m3's normal range.
+    generator = torch.Generator().manual_seed(23)
+    weight = torch.randn(64, 512, generator=generator) * 0.02
+
+    _, scale_bytes, global_scale = _int4_weight(weight, 16)
+    stored = scale_bytes.view(torch.float8_e4m3fn).float()
+
+    # Every stored byte is now in e4m3's normal range: that is the fix.
+    assert (stored[stored > 0] >= 2.0 ** -6).all()
+    assert global_scale > 0.0
+
+    packed, scale_bytes, global_scale = _int4_weight(weight, 16)
+    restored = dequantize_int4(packed, scale_bytes, 512, 16, global_scale)
+    error = ((restored - weight).norm() / weight.norm()).item()
+
+    # A signed 4-bit grid over a per-group amax has step amax/7, so uniform
+    # quantization noise is step/sqrt(12). For Gaussian groups of 16, amax is
+    # about 2 sigma, giving ~8.6 % -- and that is what this measures, meaning
+    # the scale contributes nothing on top of the value grid.
+    assert error < 0.10, error
 
 
 def test_weight_only_schemes_order_by_bit_width():

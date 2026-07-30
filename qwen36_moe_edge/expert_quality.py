@@ -30,6 +30,7 @@ import torch
 import torch.nn.functional as F
 
 from qwen36_moe_edge.quantize_experts import (
+    E4M3_MAX,
     HIDDEN,
     INTERMEDIATE,
     NUM_LAYERS,
@@ -41,7 +42,14 @@ from qwen36_moe_edge.quantize_experts import (
 )
 
 
-SCHEMES = ("w8a16", "w4a16", "w4a16_rht16")
+# nvfp4_e2m1 is the control: the shipped SM120 runtime uses that format for
+# these same experts and reproduces greedy tokens exactly, so it is the bar an
+# alternative 4-bit format has to match. Scoring a format without it invites
+# reading a metric artefact as a defect.
+SCHEMES = ("w8a16", "w4a16", "w4a16_rht16", "nvfp4_e2m1")
+
+# The sixteen E2M1 magnitudes, for nearest-value rounding.
+_E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 
 def expert_forward(
@@ -57,6 +65,26 @@ def expert_forward(
     return hidden @ down.T
 
 
+def _reconstruct_e2m1(
+        weight: torch.Tensor, group_size: int) -> torch.Tensor:
+    """Two-level E2M1, matching what the shipped NVFP4 expert path stores."""
+    rows, columns = weight.shape
+    grouped = weight.float().reshape(rows, columns // group_size, group_size)
+    amax = grouped.abs().amax(dim=2).clamp_min(1e-12)
+    peak = max(_E2M1_MAGNITUDES)
+    global_scale = max(float(amax.max()) / (E4M3_MAX * peak), 1e-12)
+    scale = (amax / peak / global_scale).to(torch.float8_e4m3fn)
+    effective = (scale.float() * global_scale).unsqueeze(-1)
+    normalized = grouped / effective.clamp_min(1e-30)
+    codebook = torch.tensor(
+        _E2M1_MAGNITUDES, dtype=torch.float32, device=weight.device)
+    nearest = codebook[
+        (normalized.abs().unsqueeze(-1) - codebook).abs().argmin(-1)]
+    return (
+        torch.sign(normalized) * nearest * effective
+    ).reshape(rows, columns)
+
+
 def _reconstruct(
         weight: torch.Tensor,
         *,
@@ -67,9 +95,12 @@ def _reconstruct(
     if scheme == "w8a16":
         quantized, scale = _int8_weight(weight)
         return quantized.float() * scale.float()[:, None]
+    if scheme == "nvfp4_e2m1":
+        return _reconstruct_e2m1(weight, group_size)
     source = _rht16(weight) if scheme == "w4a16_rht16" else weight
-    packed, scale = _int4_weight(source, group_size)
-    return dequantize_int4(packed, scale, columns, group_size)
+    packed, scale, global_scale = _int4_weight(source, group_size)
+    return dequantize_int4(
+        packed, scale, columns, group_size, global_scale)
 
 
 def score_expert(
@@ -105,6 +136,14 @@ def score_expert(
         "relative_l2": (
             difference.norm() / reference.flatten().norm().clamp_min(1e-12)
         ).item(),
+        # Absolute error and reference magnitude, so results can be pooled
+        # across experts. Per-expert relative L2 alone is misleading here:
+        # output norms span three orders of magnitude across experts, and the
+        # router weights the small ones down before summing, so an expert with
+        # a near-zero output shows a huge relative error that contributes
+        # almost nothing to the layer.
+        "absolute_l2": difference.norm().item(),
+        "reference_l2": reference.flatten().norm().item(),
     }
 
 
@@ -205,9 +244,10 @@ def main() -> None:
     print(f"scoring {len(pairs)} routed (layer, expert) pairs", flush=True)
 
     reader = CheckpointReader(args.checkpoint)
+    metrics = ("cosine", "relative_l2", "absolute_l2", "reference_l2")
     scores: dict[str, list[float]] = {
         f"{scheme}.{metric}": []
-        for scheme in SCHEMES for metric in ("cosine", "relative_l2")
+        for scheme in SCHEMES for metric in metrics
     }
     records = []
     golden: dict[str, torch.Tensor] = {}
@@ -244,6 +284,16 @@ def main() -> None:
         }
         for name, values in scores.items()
     }
+    # Pooled relative L2: total error energy over total reference energy. This
+    # weights each expert by how much signal it carries, which is what the
+    # router does downstream, so it is the figure to judge a format on.
+    for scheme in SCHEMES:
+        error = sum(
+            value ** 2 for value in scores[f"{scheme}.absolute_l2"])
+        signal = sum(
+            value ** 2 for value in scores[f"{scheme}.reference_l2"])
+        summary[f"{scheme}.pooled_relative_l2"] = (
+            error ** 0.5 / max(signal ** 0.5, 1e-12))
     result = {
         "prompt_tokens": args.prompt_tokens,
         "new_tokens": args.new_tokens,
@@ -270,13 +320,14 @@ def main() -> None:
         })
         print(f"wrote {len(golden) // 2} reference pairs to {args.golden}")
 
-    print(f"\n{'scheme':<14} {'cos min':>10} {'cos mean':>10} "
-          f"{'relL2 max':>10} {'relL2 mean':>11}")
+    print(f"\n{'scheme':<14} {'pooled relL2':>13} {'cos mean':>10} "
+          f"{'cos min':>10} {'per-expert relL2 mean':>22}")
     for scheme in SCHEMES:
         cosine = summary[f"{scheme}.cosine"]
         l2 = summary[f"{scheme}.relative_l2"]
-        print(f"{scheme:<14} {cosine['min']:>10.6f} {cosine['mean']:>10.6f} "
-              f"{l2['max']:>10.5f} {l2['mean']:>11.5f}")
+        pooled = summary[f"{scheme}.pooled_relative_l2"]
+        print(f"{scheme:<14} {pooled:>13.5f} {cosine['mean']:>10.6f} "
+              f"{cosine['min']:>10.6f} {l2['mean']:>22.5f}")
 
 
 if __name__ == "__main__":

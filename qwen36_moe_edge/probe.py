@@ -234,14 +234,15 @@ def quality_probe(
                 current = (
                     activation.reshape(-1, 16) @ transform
                 ).reshape_as(activation)
-            gu4, gu4_scale = _int4_weight(
+            gu4, gu4_scale, gu4_alpha = _int4_weight(
                 gu_source, current_group)
             gu4 = dequantize_int4(
-                gu4, gu4_scale, HIDDEN, current_group)
-            current4, current4_scale = _int4_weight(
+                gu4, gu4_scale, HIDDEN, current_group, gu4_alpha)
+            current4, current4_scale, current4_alpha = _int4_weight(
                 current, current_group)
             current = dequantize_int4(
-                current4, current4_scale, HIDDEN, current_group)
+                current4, current4_scale, HIDDEN, current_group,
+                current4_alpha)
             projected = current @ gu4.T
             current = (
                 F.silu(projected[:, :INTERMEDIATE])
@@ -255,14 +256,15 @@ def quality_probe(
                 current = (
                     current.reshape(-1, 16) @ transform
                 ).reshape_as(current)
-            dn4, dn4_scale = _int4_weight(
+            dn4, dn4_scale, dn4_alpha = _int4_weight(
                 dn_source, current_group)
             dn4 = dequantize_int4(
-                dn4, dn4_scale, INTERMEDIATE, current_group)
-            current4, current4_scale = _int4_weight(
+                dn4, dn4_scale, INTERMEDIATE, current_group, dn4_alpha)
+            current4, current4_scale, current4_alpha = _int4_weight(
                 current, current_group)
             current = dequantize_int4(
-                current4, current4_scale, INTERMEDIATE, current_group)
+                current4, current4_scale, INTERMEDIATE, current_group,
+                current4_alpha)
             output = current @ dn4.T
             scores[mode].append(F.cosine_similarity(
                 reference.flatten(), output.flatten(), dim=0).item())

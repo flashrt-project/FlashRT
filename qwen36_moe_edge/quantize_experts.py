@@ -26,6 +26,13 @@ INTERMEDIATE = 512
 # aligned offsets and lengths.
 BLOCK_ALIGNMENT = 4096
 
+# Largest magnitude an e4m3 scale byte can hold. The per-group scale is
+# expressed as a fraction of a per-tensor global scale so that it lands in
+# e4m3's normal range: with one level, every scale in this checkpoint falls
+# into e4m3's subnormal range, where the format keeps about three bits and
+# carries ~18 % relative error, which swamps the 4-bit value grid entirely.
+E4M3_MAX = 448.0
+
 
 class CheckpointReader:
     def __init__(self, checkpoint: Path):
@@ -77,23 +84,30 @@ def _rht16(weight: torch.Tensor) -> torch.Tensor:
 
 def _int4_weight(
         weight: torch.Tensor, group_size: int
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, float]:
+    """Pack to 4-bit with a two-level scale.
+
+    Returns the packed values, the per-group e4m3 scale bytes, and the global
+    scale the kernel applies as its GEMM alpha. The effective scale of a group
+    is ``global_scale * e4m3(scale_byte)``.
+    """
     rows, columns = weight.shape
     if columns % group_size:
         raise ValueError(
             f"K={columns} is not divisible by group_size={group_size}")
     grouped = weight.float().reshape(rows, columns // group_size, group_size)
-    scale = (
-        grouped.abs().amax(dim=2).clamp_min(1e-8) / 7.0
-    ).to(torch.float8_e4m3fn)
-    scale_float = scale.float().clamp_min(2.0**-9)
+    amax = grouped.abs().amax(dim=2).clamp_min(1e-12)
+    global_scale = max(float(amax.max()) / (E4M3_MAX * 7.0), 1e-12)
+    scale = (amax / 7.0 / global_scale).to(torch.float8_e4m3fn)
+    effective = scale.float() * global_scale
     values = (
-        grouped / scale_float.unsqueeze(-1)
+        grouped / effective.unsqueeze(-1).clamp_min(1e-30)
     ).round().clamp(-7, 7).to(torch.int8).reshape(rows, columns)
     magnitude = values.abs().to(torch.uint8)
     code = magnitude | ((values < 0).to(torch.uint8) << 3)
     packed = code[:, 0::2] | (code[:, 1::2] << 4)
-    return packed.contiguous(), scale.view(torch.uint8).contiguous()
+    return (packed.contiguous(), scale.view(torch.uint8).contiguous(),
+            global_scale)
 
 
 def dequantize_int4(
@@ -101,6 +115,7 @@ def dequantize_int4(
         scale: torch.Tensor,
         columns: int,
         group_size: int,
+        global_scale: float = 1.0,
 ) -> torch.Tensor:
     """Inverse of :func:`_int4_weight`, for scoring and reference paths."""
     low = packed & 0x0F
@@ -111,7 +126,7 @@ def dequantize_int4(
         (high & 0x08) != 0, -1, 1).to(torch.int8)
     values = torch.stack((low, high), dim=-1).flatten(1)
     rows = values.shape[0]
-    scale_float = scale.view(torch.float8_e4m3fn).float()
+    scale_float = scale.view(torch.float8_e4m3fn).float() * global_scale
     return (
         values.float().reshape(rows, columns // group_size, group_size)
         * scale_float.unsqueeze(-1)
@@ -129,7 +144,12 @@ def quantize_expert(
         quant_format: str,
         group_size: int,
         device: str,
-) -> bytes:
+) -> tuple[bytes, tuple[float, float]]:
+    """Return the fixed-size block and its (gate_up, down) global scales.
+
+    INT8 uses per-output-channel scales that need no second level, so its
+    global scales are both 1.0.
+    """
     if quant_format not in ("int8", "int4", "int4-rht"):
         raise ValueError(f"unsupported quantization format: {quant_format}")
     if quant_format == "int4-rht" and group_size != 16:
@@ -139,19 +159,21 @@ def quantize_expert(
     if quant_format == "int8":
         gu_weight, gu_scale = _int8_weight(gate_up)
         dn_weight, dn_scale = _int8_weight(down)
+        alphas = (1.0, 1.0)
     else:
         if quant_format == "int4-rht":
             gate_up = _rht16(gate_up)
             down = _rht16(down)
-        gu_weight, gu_scale = _int4_weight(gate_up, group_size)
-        dn_weight, dn_scale = _int4_weight(down, group_size)
+        gu_weight, gu_scale, gu_alpha = _int4_weight(gate_up, group_size)
+        dn_weight, dn_scale, dn_alpha = _int4_weight(down, group_size)
+        alphas = (gu_alpha, dn_alpha)
     return b"".join((
         _tensor_bytes(gu_weight),
         _tensor_bytes(gu_scale),
         _tensor_bytes(dn_weight),
         _tensor_bytes(dn_scale),
         bytes(_layout(quant_format, group_size)["padding"]),
-    ))
+    )), alphas
 
 
 def _parse_layers(value: str) -> range:
@@ -206,7 +228,7 @@ def main() -> None:
     layout = _layout(args.format, args.group_size)
     block_bytes = sum(layout.values())
     manifest = {
-        "format": f"flashrt-qwen36-moe-{args.format}-experts-v1",
+        "format": f"flashrt-qwen36-moe-{args.format}-experts-v2",
         "group_size": args.group_size if args.format != "int8" else None,
         "rht": args.format == "int4-rht",
         "num_layers": NUM_LAYERS,
@@ -217,6 +239,13 @@ def main() -> None:
         "block_sizes": layout,
         "block_bytes": block_bytes,
         "block_alignment": BLOCK_ALIGNMENT,
+        # Per-expert global scales, one pair per expert. Kept out of the
+        # blocks so a block stays exactly block_bytes and 4096-aligned;
+        # they are a few bytes each and belong with the resident weights,
+        # where the kernel reads them as its GEMM alpha.
+        "global_scales": "global_scales_layer_NN.bin",
+        "global_scales_dtype": "float32",
+        "global_scales_layout": ["gate_up", "down"],
     }
     with (args.output / "manifest.json").open("w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
@@ -225,18 +254,23 @@ def main() -> None:
     reader = CheckpointReader(args.checkpoint)
     for layer in args.layers:
         output_path = args.output / f"experts_layer_{layer:02d}.bin"
+        scale_check = args.output / f"global_scales_layer_{layer:02d}.bin"
         expected_bytes = NUM_EXPERTS * block_bytes
-        if output_path.is_file() and output_path.stat().st_size == expected_bytes:
+        if (output_path.is_file()
+                and output_path.stat().st_size == expected_bytes
+                and scale_check.is_file()
+                and scale_check.stat().st_size == NUM_EXPERTS * 2 * 4):
             print(f"layer {layer}: already complete")
             continue
         temporary_path = output_path.with_suffix(".bin.tmp")
         started = time.perf_counter()
+        alphas = []
         with temporary_path.open("wb") as f:
             for expert in range(NUM_EXPERTS):
                 gate_up = reader.expert(
                     layer, "gate_up_proj", expert)
                 down = reader.expert(layer, "down_proj", expert)
-                block = quantize_expert(
+                block, expert_alphas = quantize_expert(
                     gate_up,
                     down,
                     quant_format=args.format,
@@ -248,7 +282,14 @@ def main() -> None:
                         f"expert block is {len(block)} bytes; "
                         f"expected {block_bytes}")
                 f.write(block)
+                alphas.extend(expert_alphas)
         os.replace(temporary_path, output_path)
+        scale_path = args.output / f"global_scales_layer_{layer:02d}.bin"
+        temporary_scale_path = scale_path.with_suffix(".bin.tmp")
+        with temporary_scale_path.open("wb") as f:
+            f.write(_tensor_bytes(
+                torch.tensor(alphas, dtype=torch.float32)))
+        os.replace(temporary_scale_path, scale_path)
         elapsed = time.perf_counter() - started
         gib = expected_bytes / 2**30
         print(
