@@ -177,7 +177,8 @@ class Nexn2TorchFrontendRtx:
         self._fvk = fvk
         self._weights = extract_weights_nexn2_nvfp4(
             self.checkpoint_path, fvk, device=self.device,
-            quant_scope=self._quant_scope)
+            quant_scope=self._quant_scope,
+            stream_experts=self._stream_experts)
 
     @property
     def tokenizer(self):

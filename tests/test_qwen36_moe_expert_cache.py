@@ -160,3 +160,31 @@ def test_global_scales_validates_the_sidecar_size():
 
     assert "num_experts * 2 * 4" in source
     assert "raise ValueError" in source
+
+
+def test_streaming_frontend_actually_asks_the_loader_to_skip():
+    # A silently-unapplied edit left the argument off this call once, and the
+    # run that followed reported a resident footprint identical to the ordinary
+    # frontend's -- plausible enough to miss without comparing against the
+    # documented baseline. Pin the wiring so it cannot regress quietly.
+    import inspect
+
+    from flash_rt.frontends.torch import nexn2_rtx
+
+    source = inspect.getsource(nexn2_rtx.Nexn2TorchFrontendRtx)
+
+    assert "stream_experts=self._stream_experts" in source
+
+
+def test_lm_head_has_a_path_without_the_sm120_only_kernel():
+    # fp4_w4a4_mma_sm120_full_n_bf16out is built only for GPU_ARCH 120/121, so
+    # before this branch the lm_head decode had no implementation on any other
+    # target, the Orin one included.
+    import inspect
+
+    from flash_rt.frontends.torch import _nexn2_rtx_decode
+
+    source = inspect.getsource(_nexn2_rtx_decode.decode_step)
+
+    assert "hasattr(fvk, 'fp4_w4a4_mma_sm120_full_n_bf16out')" in source
+    assert "w4a16_matvec_sm120_bf16" in source

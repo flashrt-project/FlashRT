@@ -658,11 +658,22 @@ def decode_step(state, token_id, pos, fvk, device):
         p['lm_head_packed_t'] = packed
         p['lm_head_sf_t'] = sf
         p['lm_head_alpha'] = float(og.item())
-    xp, xsf = _quant_act(h.reshape(1, HID), fvk, device, _cs())
-    fvk.fp4_w4a4_mma_sm120_full_n_bf16out(
-        xp.data_ptr(), p['lm_head_packed_t'].data_ptr(), logits.data_ptr(),
-        vocab, HID, xsf.data_ptr(), p['lm_head_sf_t'].data_ptr(),
-        p['lm_head_alpha'], _cs())
+    if hasattr(fvk, 'fp4_w4a4_mma_sm120_full_n_bf16out'):
+        xp, xsf = _quant_act(h.reshape(1, HID), fvk, device, _cs())
+        fvk.fp4_w4a4_mma_sm120_full_n_bf16out(
+            xp.data_ptr(), p['lm_head_packed_t'].data_ptr(),
+            logits.data_ptr(), vocab, HID, xsf.data_ptr(),
+            p['lm_head_sf_t'].data_ptr(), p['lm_head_alpha'], _cs())
+        return logits
+    # That kernel is built only for GPU_ARCH 120/121, so on every other target
+    # this path had no implementation at all. The W4A16 matvec reads the same
+    # swizzled weight and the same scale factors, leaves the activation in
+    # bf16 -- so it also skips the activation quantisation and its error -- and
+    # lives in a tier that builds wherever the core does.
+    fvk.w4a16_matvec_sm120_bf16(
+        h.reshape(1, HID).contiguous().data_ptr(),
+        p['lm_head_packed_t'].data_ptr(), p['lm_head_sf_t'].data_ptr(),
+        logits.data_ptr(), vocab, HID, p['lm_head_alpha'], _cs())
     return logits
 
 
