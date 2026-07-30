@@ -283,6 +283,7 @@ class Nexn2DecodeState:
         # meaningful when the loader skipped them; see _moe_experts_streamed.
         self.expert_cache = None
         self._scratch = None
+        self._hadamard = None
 
     def _streamed_scratch(self, device):
         """The two decode buffers a streamed expert is unpacked into.
@@ -432,33 +433,52 @@ def _decode_full(h, ld, state, full_rank, pos, fvk, device):
         1, 1, HID)
 
 
-def _moe_experts_streamed(x, idx, tw_row, ld, state, fvk, device, s):
-    """The routed experts, read from storage instead of held in memory.
+def _hadamard16(device):
+    """The block-16 transform, built once. Symmetric and its own inverse."""
+    m = torch.ones(1, 1, dtype=torch.float32, device=device)
+    for _ in range(4):
+        m = torch.cat((torch.cat((m, m), 1), torch.cat((m, -m), 1)), 0)
+    return m / 4.0
 
-    Only reachable when the loader was told to stream them, in which case the
-    per-layer stacked NVFP4 tensors were never allocated -- that is the whole
-    point, and adding a cache without skipping them would cost memory rather
-    than save it.
 
-    Each block is decoded to bf16 and multiplied with the shared bf16 GEMM. The
-    block-scaled 4-bit GEMMs cannot read these blocks: different codebook,
-    different scale layout. Decoding costs bandwidth on a block that is already
-    resident, which is the cheap end of this system -- the misses are what cost
-    time.
+def _rotate16(x, h):
+    """Apply the transform along the last dimension, in blocks of 16."""
+    shape = x.shape
+    return (x.reshape(-1, 16).float() @ h).reshape(shape).to(x.dtype)
 
-    The whole top-k is fetched in one call so the reads overlap, and the
-    per-layer quota is at least the top-k, so none of the returned pointers can
-    be invalidated by the others.
+
+def _moe_experts_streamed(x, idx, state, fvk, device, s):
+    """The routed experts' outputs, read from storage instead of memory.
+
+    Returns only ``d_dn`` -- the per-slot expert outputs. The weighted sum, the
+    shared expert and its gate are identical to the resident path and stay
+    there; replacing the whole layer here is how an earlier version silently
+    dropped the shared expert from every layer.
+
+    Reachable only when the loader was told to stream, in which case the
+    per-layer stacked tensors were never allocated. Each block is decoded to
+    bf16 and multiplied with the shared bf16 GEMV, because the block-scaled
+    4-bit GEMMs read neither this codebook nor this scale layout.
+
+    When the bundle was written with the transform applied, the stored weight is
+    H*W, so the activation entering each GEMM has to be rotated the same way or
+    the products are wrong -- while staying finite and plausible, which is
+    exactly how it goes unnoticed.
     """
     cache = state.expert_cache
     layer = state._active_layer
     experts = [int(value) for value in idx.cpu().tolist()]
     cache.get_many(layer, experts)
 
+    rotated = bool(cache.manifest.get('rht'))
+    if rotated and state._hadamard is None:
+        state._hadamard = _hadamard16(device)
+    h16 = state._hadamard
+
     scratch = state._streamed_scratch(device)
     d_gu = torch.empty(TOPK, 2 * INTER, dtype=torch.bfloat16, device=device)
     d_dn = torch.empty(TOPK, HID, dtype=torch.bfloat16, device=device)
-    xc = x.contiguous()
+    xc = (_rotate16(x, h16) if rotated else x).contiguous()
 
     for slot, expert in enumerate(experts):
         parts = cache.components(layer, expert)
@@ -476,7 +496,10 @@ def _moe_experts_streamed(x, idx, tw_row, ld, state, fvk, device, s):
 
         gated = _silu_mul(
             d_gu[slot:slot + 1, :INTER], d_gu[slot:slot + 1, INTER:],
-            fvk, device).contiguous()
+            fvk, device)
+        if rotated:
+            gated = _rotate16(gated, h16)
+        gated = gated.contiguous()
         rc = fvk.qwen35moe_e0m3_dequant_bf16(
             parts['down_weight'].data_ptr(),
             parts['down_scale'].data_ptr(),
@@ -487,15 +510,7 @@ def _moe_experts_streamed(x, idx, tw_row, ld, state, fvk, device, s):
         fvk.bf16_matvec_sm120_bf16(
             gated.data_ptr(), scratch['down'].data_ptr(),
             d_dn[slot].data_ptr(), HID, INTER, s)
-
-    if 'decode_topk_rows' not in ld:
-        ld['decode_topk_rows'] = torch.arange(
-            TOPK, dtype=torch.int32, device=device)
-    out = torch.empty(HID, dtype=torch.float32, device=device)
-    fvk.moe_weighted_sum_sm120_bf16(
-        d_dn.data_ptr(), ld['decode_topk_rows'].data_ptr(),
-        tw_row.data_ptr(), out.data_ptr(), 1, TOPK, HID, HID, s)
-    return out.unsqueeze(0)
+    return d_dn
 
 
 def _moe_layer_decode(h, ld, state, fvk, device):
@@ -531,8 +546,14 @@ def _moe_layer_decode(h, ld, state, fvk, device):
     lr = logit_raw.reshape(-1).contiguous()
     idx = torch.empty(TOPK, dtype=torch.int32, device=device)
     topv = torch.empty(TOPK, dtype=torch.float32, device=device)
-    fvk.moe_router_topk_sm120_bf16(lr.data_ptr(), idx.data_ptr(), topv.data_ptr(),
-                               lr.numel(), TOPK, s)
+    # idx and topv come from torch.empty, so an unchecked failure here leaves
+    # uninitialised memory to be used as expert indices -- which reaches a file
+    # offset before anything notices.
+    rc = fvk.moe_router_topk_sm120_bf16(
+        lr.data_ptr(), idx.data_ptr(), topv.data_ptr(), lr.numel(), TOPK, s)
+    if rc:
+        raise RuntimeError(
+            f'router top-k failed with {rc} for {lr.numel()} experts, k={TOPK}')
     tw_row = F.softmax(topv, -1)                             # (TOPK,) device
     if state.router_trace is not None:
         state.router_trace[state._active_layer].append(
@@ -541,38 +562,43 @@ def _moe_layer_decode(h, ld, state, fvk, device):
         state.moe_input_trace[state._active_layer].append(
             x.detach().to("cpu", copy=True))
 
+    # Streaming replaces only the routed experts' own GEMVs. Everything after
+    # this -- the weighted sum, the shared expert, its gate -- is identical, and
+    # returning early from here is how an earlier version silently dropped the
+    # shared expert from every layer.
     if ld.get('experts_streamed'):
-        return _moe_experts_streamed(
-            x, idx, tw_row, ld, state, fvk, device, s)
+        d_dn = _moe_experts_streamed(x, idx, state, fvk, device, s)
+        n_dn = HID
+    else:
+        if 'experts_gate_up_alpha_dev' not in ld:           # cache once/layer
+            ld['experts_gate_up_alpha_dev'] = \
+                ld['experts_gate_up_alpha_t'].to(device).contiguous()
+            ld['experts_down_alpha_dev'] = \
+                ld['experts_down_alpha_t'].to(device).contiguous()
+        gu_p, gu_s = ld['experts_gate_up_packed_t'], ld['experts_gate_up_sf_t']
+        dn_p, dn_s = ld['experts_down_packed_t'], ld['experts_down_sf_t']
+        gu_a = ld['experts_gate_up_alpha_dev']
+        dn_a = ld['experts_down_alpha_dev']
+        n_gu, n_dn = gu_p.shape[1], dn_p.shape[1]           # 1024 / HID
 
-    if 'experts_gate_up_alpha_dev' not in ld:               # cache once/layer
-        ld['experts_gate_up_alpha_dev'] = \
-            ld['experts_gate_up_alpha_t'].to(device).contiguous()
-        ld['experts_down_alpha_dev'] = \
-            ld['experts_down_alpha_t'].to(device).contiguous()
-    gu_p, gu_s = ld['experts_gate_up_packed_t'], ld['experts_gate_up_sf_t']
-    dn_p, dn_s = ld['experts_down_packed_t'], ld['experts_down_sf_t']
-    gu_a, dn_a = ld['experts_gate_up_alpha_dev'], ld['experts_down_alpha_dev']
-    n_gu, n_dn = gu_p.shape[1], dn_p.shape[1]               # 1024 / HID
+        # gate_up: shared BF16 activation, grouped W4A16 over the 8 experts.
+        # BF16 activation -> no activation quant, higher cos than the W4A4 mma,
+        # and faster at this scale (6.2 vs 8.2 us standalone).
+        xc = x.contiguous()
+        d_gu = torch.empty(TOPK, n_gu, dtype=torch.bfloat16, device=device)
+        fvk.moe_grouped_w4a16_sm120_bf16(
+            xc.data_ptr(), gu_p.data_ptr(), gu_s.data_ptr(), gu_a.data_ptr(),
+            idx.data_ptr(), d_gu.data_ptr(), TOPK, n_gu, HID,
+            0, gu_p[0].numel(), gu_s[0].numel(), s)
 
-    # gate_up: shared BF16 activation, grouped W4A16 over the 8 experts. BF16
-    # activation -> no activation quant, higher cos than the W4A4 mma, and
-    # faster at this scale (6.2 vs 8.2 us standalone).
-    xc = x.contiguous()
-    d_gu = torch.empty(TOPK, n_gu, dtype=torch.bfloat16, device=device)
-    fvk.moe_grouped_w4a16_sm120_bf16(
-        xc.data_ptr(), gu_p.data_ptr(), gu_s.data_ptr(), gu_a.data_ptr(),
-        idx.data_ptr(), d_gu.data_ptr(), TOPK, n_gu, HID,
-        0, gu_p[0].numel(), gu_s[0].numel(), s)
-
-    # down: silu(gate)*up (BF16, fused) then grouped W4A16 (per-slot activation).
-    g_, u_ = d_gu[:, :INTER], d_gu[:, INTER:]
-    inter = _silu_mul(g_, u_, fvk, device).contiguous()
-    d_dn = torch.empty(TOPK, n_dn, dtype=torch.bfloat16, device=device)
-    fvk.moe_grouped_w4a16_sm120_bf16(
-        inter.data_ptr(), dn_p.data_ptr(), dn_s.data_ptr(), dn_a.data_ptr(),
-        idx.data_ptr(), d_dn.data_ptr(), TOPK, n_dn, INTER,
-        INTER, dn_p[0].numel(), dn_s[0].numel(), s)
+        # down: silu(gate)*up (BF16, fused) then grouped W4A16 (per-slot act).
+        g_, u_ = d_gu[:, :INTER], d_gu[:, INTER:]
+        inter = _silu_mul(g_, u_, fvk, device).contiguous()
+        d_dn = torch.empty(TOPK, n_dn, dtype=torch.bfloat16, device=device)
+        fvk.moe_grouped_w4a16_sm120_bf16(
+            inter.data_ptr(), dn_p.data_ptr(), dn_s.data_ptr(), dn_a.data_ptr(),
+            idx.data_ptr(), d_dn.data_ptr(), TOPK, n_dn, INTER,
+            INTER, dn_p[0].numel(), dn_s[0].numel(), s)
     # Fixed-order weighted sum. The generic torch matmul may choose a
     # reduction whose accumulation order changes between launches, which can
     # flip a later greedy decision when two logits are nearly tied.

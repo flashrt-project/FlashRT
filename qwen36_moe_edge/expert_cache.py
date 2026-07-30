@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -130,6 +131,13 @@ class ExpertCache:
                     f"{self.alignment}-byte aligned, which direct reads "
                     "require")
         self._pool = ThreadPoolExecutor(max_workers=config.staging_buffers)
+        # Buffers are taken from here and returned, so a task owns one for as
+        # long as it runs. Indexing by task number would let task N and task
+        # N + len(staging) share a buffer: the pool bounds how many run at once,
+        # not the order they finish in.
+        self._available: queue.Queue = queue.Queue()
+        for index in range(len(self._staging)):
+            self._available.put(index)
 
         # Per-layer LRU of expert -> slot index, and that layer's free slots.
         self._lru: list[OrderedDict[int, int]] = [
@@ -198,22 +206,43 @@ class ExpertCache:
             self._fds[layer] = os.open(path, flags)
         return self._fds[layer]
 
-    def _fetch(self, layer: int, expert: int, slot: int, buffer: int) -> None:
-        staging = self._staging[buffer]
-        view = memoryview(staging.numpy())
-        fd = self._fd(layer)
-        base = expert * self.block_bytes
-        offset = 0
-        while offset < self.block_bytes:
-            length = min(self.config.read_chunk, self.block_bytes - offset)
-            read = os.preadv(fd, [view[offset:offset + length]], base + offset)
-            if read <= 0:
-                raise IOError(
-                    f"short read of layer {layer} expert {expert} at "
-                    f"{offset}/{self.block_bytes}")
-            offset += read
-        self.slots[slot].copy_(staging)
-        self.bytes_read += self.block_bytes
+    def _fetch(self, layer: int, expert: int, slot: int) -> None:
+        if not 0 <= expert < self.num_experts:
+            raise ValueError(
+                f"expert {expert} is outside 0..{self.num_experts - 1}; a "
+                "negative or oversized index becomes an invalid file offset")
+        buffer = self._available.get()
+        try:
+            staging = self._staging[buffer]
+            view = memoryview(staging.numpy())
+            fd = self._fd(layer)
+            base = expert * self.block_bytes
+            offset = 0
+            while offset < self.block_bytes:
+                length = min(self.config.read_chunk, self.block_bytes - offset)
+                try:
+                    read = os.preadv(
+                        fd, [view[offset:offset + length]], base + offset)
+                except OSError as error:
+                    # A direct read rejects a misaligned offset, length or
+                    # buffer with the same EINVAL, which says nothing about
+                    # which of the three it was.
+                    raise OSError(
+                        f"{error.strerror} reading layer {layer} expert "
+                        f"{expert}: offset {base + offset} aligned="
+                        f"{(base + offset) % self.alignment == 0}, length "
+                        f"{length} aligned={length % self.alignment == 0}, "
+                        f"buffer {staging.data_ptr():#x} aligned="
+                        f"{staging.data_ptr() % self.alignment == 0}") from error
+                if read <= 0:
+                    raise IOError(
+                        f"short read of layer {layer} expert {expert} at "
+                        f"{offset}/{self.block_bytes}")
+                offset += read
+            self.slots[slot].copy_(staging)
+            self.bytes_read += self.block_bytes
+        finally:
+            self._available.put(buffer)
 
     def _claim(self, layer: int, expert: int) -> int:
         """A slot for an expert not currently held, evicting if necessary."""
@@ -232,6 +261,14 @@ class ExpertCache:
         pointers can be invalidated by the others.
         """
         wanted = list(dict.fromkeys(int(expert) for expert in experts))
+        out_of_range = [
+            expert for expert in wanted
+            if not 0 <= expert < self.num_experts
+        ]
+        if out_of_range:
+            raise ValueError(
+                f"layer {layer} was asked for experts {out_of_range} outside "
+                f"0..{self.num_experts - 1}; the full request was {wanted}")
         if len(wanted) > self.config.slots_per_layer:
             raise ValueError(
                 f"asked for {len(wanted)} experts of layer {layer} but the "
@@ -247,10 +284,8 @@ class ExpertCache:
             pending.append((expert, self._claim(layer, expert)))
         if pending:
             futures = [
-                self._pool.submit(
-                    self._fetch, layer, expert, slot,
-                    index % len(self._staging))
-                for index, (expert, slot) in enumerate(pending)
+                self._pool.submit(self._fetch, layer, expert, slot)
+                for expert, slot in pending
             ]
             for future in futures:
                 future.result()

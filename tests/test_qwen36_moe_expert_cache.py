@@ -188,3 +188,64 @@ def test_lm_head_has_a_path_without_the_sm120_only_kernel():
 
     assert "hasattr(fvk, 'fp4_w4a4_mma_sm120_full_n_bf16out')" in source
     assert "w4a16_matvec_sm120_bf16" in source
+
+
+def test_staging_buffers_are_owned_for_the_duration_of_a_read():
+    # Indexing a buffer by task number is unsafe: the pool bounds how many
+    # tasks run at once, not the order they finish in, so task N and task
+    # N + len(staging) can hold the same buffer simultaneously and read into
+    # each other's memory. A task must acquire one and give it back.
+    import inspect
+
+    source = inspect.getsource(ExpertCache._fetch)
+
+    assert "self._available.get()" in source
+    assert "self._available.put(buffer)" in source
+    assert "finally:" in source
+    # And the submission must not hand a buffer index in at all.
+    submit = inspect.getsource(ExpertCache.get_many)
+    assert "len(self._staging)" not in submit
+
+
+def test_fetch_rejects_an_out_of_range_expert():
+    # A negative or oversized index turns into an invalid file offset, which a
+    # direct read reports as a bare EINVAL that names nothing.
+    import inspect
+
+    source = inspect.getsource(ExpertCache._fetch)
+
+    assert "0 <= expert < self.num_experts" in source
+    assert "invalid file offset" in source
+
+
+def test_streaming_replaces_only_the_routed_expert_gemvs():
+    # An earlier version returned from the middle of the MoE layer, which
+    # dropped the shared expert and its gate from every layer -- and returned
+    # the wrong shape and dtype while doing it. The branch must set d_dn and
+    # fall through to the shared tail.
+    import inspect
+
+    from flash_rt.frontends.torch import _nexn2_rtx_decode
+
+    source = inspect.getsource(_nexn2_rtx_decode._moe_layer_decode)
+
+    assert "d_dn = _moe_experts_streamed(" in source
+    assert "return _moe_experts_streamed(" not in source
+    # The shared expert and its gate are still reached on both paths.
+    assert "shared_down_proj" in source
+    assert "shared_gate_w_t" in source
+
+
+def test_streamed_experts_rotate_the_activation_when_the_bundle_is_rotated():
+    # The bundle stores H*W, so an unrotated activation gives a wrong product
+    # that is still finite and plausible -- the failure mode that hides.
+    import inspect
+
+    from flash_rt.frontends.torch import _nexn2_rtx_decode
+
+    source = inspect.getsource(_nexn2_rtx_decode._moe_experts_streamed)
+
+    assert "cache.manifest.get('rht')" in source
+    # Both GEMMs: the hidden state entering gate_up, and the gated result
+    # entering down.
+    assert source.count("_rotate16(") == 2
