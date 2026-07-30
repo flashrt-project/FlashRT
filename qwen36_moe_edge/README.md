@@ -57,8 +57,26 @@ PYTHONPATH=. python qwen36_moe_edge/route_trace.py \
   --prompt "Explain edge mixture-of-experts inference. " \
   --prompt-tokens 32 \
   --new-tokens 64 \
+  --quotas 16,27,32,43,64 \
   --output qwen36_moe_route_trace.json
 ```
 
 Tracing deliberately uses eager per-token prefill. It must not be enabled
 during CUDA Graph capture.
+
+Each quota is scored under three policies:
+
+- `single_lru` — one per-layer LRU behind both prefill and decode. Prefill
+  touches every expert in a layer, so this measures what survives prompt
+  churn.
+- `two_tier` — a per-layer warm set pinned from prompt-phase selection counts
+  plus an evictable ring sized by `--stream-fraction`. Prefill cannot displace
+  the warm set.
+- `two_tier_oracle_warm` — the same split with the warm set chosen from the
+  decode phase. Not implementable; it bounds what a better warm-set heuristic
+  could add.
+
+`--block-bytes` (default: the INT4 group-16 block) and `--bandwidths` turn
+misses per token into a read volume and the token rate each storage bandwidth
+would allow, which is the number that decides whether a memory budget is
+viable.

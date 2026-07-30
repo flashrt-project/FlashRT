@@ -5,7 +5,11 @@ from __future__ import annotations
 import torch
 
 from qwen36_moe_edge.probe import _dequant_int4
-from qwen36_moe_edge.route_trace import simulate_lru
+from qwen36_moe_edge.route_trace import (
+    read_volume,
+    simulate_lru,
+    simulate_two_tier,
+)
 from qwen36_moe_edge.quantize_experts import (
     HIDDEN,
     INTERMEDIATE,
@@ -96,3 +100,53 @@ def test_route_trace_lru_separates_prompt_and_decode():
         "decode_hit_rate": 0.25,
         "decode_misses_per_token": 3.0,
     }
+
+
+def test_two_tier_warm_set_survives_prefill():
+    # The prompt only ever selects expert 0, so it is the warm set. Decode
+    # reuses it once and touches an unseen expert once.
+    trace = [[[0], [0], [1], [0]]]
+
+    result = simulate_two_tier(
+        trace, prompt_tokens=2, pinned=1, stream=0)
+
+    assert result == {
+        "decode_hit_rate": 0.5,
+        "warm_hit_rate": 0.5,
+        "decode_misses_per_token": 0.5,
+    }
+
+
+def test_two_tier_stream_ring_serves_repeats():
+    # No warm set at all: every decode hit has to come from the ring.
+    trace = [[[0], [1], [1]]]
+
+    result = simulate_two_tier(
+        trace, prompt_tokens=1, pinned=0, stream=1)
+
+    assert result["warm_hit_rate"] == 0.0
+    assert result["decode_hit_rate"] == 0.5
+    assert result["decode_misses_per_token"] == 0.5
+
+
+def test_two_tier_oracle_warm_bounds_the_prompt_heuristic():
+    # Decode routes somewhere the prompt never went, so a prompt-derived warm
+    # set misses everything while a decode-derived one hits everything.
+    trace = [[[0], [0], [0], [1], [1], [1]]]
+
+    prompt_warm = simulate_two_tier(
+        trace, prompt_tokens=3, pinned=1, stream=0)
+    oracle_warm = simulate_two_tier(
+        trace, prompt_tokens=3, pinned=1, stream=0, warm_from="decode")
+
+    assert prompt_warm["decode_hit_rate"] == 0.0
+    assert oracle_warm["decode_hit_rate"] == 1.0
+
+
+def test_read_volume_converts_misses_to_bandwidth_limits():
+    result = read_volume(
+        2.0, block_bytes=1_000_000, bandwidths=(1.0, 2.0))
+
+    assert result["mb_per_token"] == 2.0
+    assert result["tok_s_at_1gbps"] == 500.0
+    assert result["tok_s_at_2gbps"] == 1000.0
