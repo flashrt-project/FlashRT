@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from flash_rt.frontends.torch._nexn2_rtx_forward import (
     CONV, HD, HID, HK, HV, INTER, KD, KS, NKV, NQ, NV, ROPE, TOPK, VD,
     _quant_act, build_rope_tables, moe_grouped_w4a16, nexn2_forward_nvfp4,
-    w4a16_matvec,
+    set_spec_verify, w4a16_matvec,
 )
 from flash_rt.frontends.torch._nexn2_rtx_nvfp4_weights import _sf_swz_bytes
 from flash_rt.hardware.rtx.attn_backend_nexn2 import RtxFlashAttnBackendNexn2
@@ -852,12 +852,14 @@ def spec_decode_step(state, token_id, pos, k, fvk, device):
 
     ids = torch.cat([token_id.view(1)] + drafts).view(1, window)
     state.spec_capture = True
+    set_spec_verify(True)
     try:
         logits, hidden = nexn2_forward_nvfp4(
             state.handles, ids, fvk, device, cap=state, pos_offset=pos,
             last_logits_only=False, return_hidden=True)
     finally:
         state.spec_capture = False
+        set_spec_verify(False)
     logits = logits.reshape(window, -1)
     argmax = logits.argmax(-1)
 

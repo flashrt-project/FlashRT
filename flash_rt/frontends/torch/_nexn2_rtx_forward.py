@@ -84,8 +84,13 @@ def _proj(x2d, ld, base, n, fvk, device):
         return _nvfp4_gemm(x2d, ld[base + '_packed'], ld[base + '_sf'],
                            ld[base + '_alpha'], n, fvk, device)
     w = ld[base + '_w_t']
-    if (_DENSE_W4A16 and x2d.shape[0] >= 64 and (w.shape[0] % 64) == 0
-            and (x2d.shape[1] % 64) == 0):
+    # A speculative verify block is a handful of rows, so the M>=64 heuristic
+    # below would send it to the BF16 GEMM -- four times the weight bytes, on
+    # the pass whose whole purpose is to read the weights once. It wants the
+    # 4-bit weight for the same reason decode does: at this M the cost is
+    # traffic, not throughput.
+    if ((_SPEC_VERIFY or (_DENSE_W4A16 and x2d.shape[0] >= 64))
+            and (w.shape[0] % 64) == 0 and (x2d.shape[1] % 64) == 0):
         return _gemm_w4a16(x2d, w, ld, base + '_w_t', fvk, device)
     if (_DENSE_W16A16 and x2d.shape[0] >= _DENSE_BF16_MIN_M
             and (x2d.shape[1] % 64) == 0):
@@ -120,6 +125,25 @@ def _gemm_w16a16(x2d, w, fvk, device):
 # while being slower than the CUTLASS W4A4 -- dominated. Default OFF; the 0.994
 # path needs a bf16-*weight* GEMM (repurpose this kernel's 2.18x structure).
 _DENSE_W4A16 = False
+
+# Set only around a speculative verify block; see _proj and the lm_head below.
+#
+# Default off, because it was measured and it loses: routing the verify block's
+# dense projections and lm_head through the 4-bit weights takes K=2 from 36.15
+# to 33.38 tok/s, despite reading a quarter of the bytes. That is the useful
+# part of the result -- it says the verify pass is not bandwidth bound, so the
+# thing to fix is not what it reads. It runs eager, against a baseline whose
+# every step is a captured graph, and a window also pays for K drafts that each
+# project the full 248320-wide vocabulary. Capture the verify block and prune
+# the draft head's vocabulary first; revisit this after, when the pass is
+# actually reading-bound and the switch can be judged on its merits.
+_SPEC_VERIFY_W4A16 = False
+_SPEC_VERIFY = False
+
+
+def set_spec_verify(on: bool) -> None:
+    global _SPEC_VERIFY
+    _SPEC_VERIFY = bool(on) and _SPEC_VERIFY_W4A16
 
 # BF16 tensor-core dense projections (vs the default fp32/TF32 matmul). The
 # experts-scope q/k/v/o/out/shared/router projections dominate the prefill
@@ -1059,7 +1083,13 @@ def nexn2_forward_nvfp4(handles, input_ids, fvk, device, cap=None,
     # last position first when only the seeding logit is needed (avoids the
     # (S, vocab) materialisation that dominates long-context prefill memory).
     h_lm = h[0][-1:].contiguous() if last_logits_only else h[0]
-    logits = _gemm_w16a16(h_lm, p['lm_head_w_t'], fvk, device)
+    if _SPEC_VERIFY:
+        # The lm_head is the single largest weight; at BF16 it is a gigabyte a
+        # verify, which on its own outweighs what the window saves.
+        logits = _gemm_w4a16(h_lm, p['lm_head_w_t'], p, 'lm_head_w_t',
+                             fvk, device)
+    else:
+        logits = _gemm_w16a16(h_lm, p['lm_head_w_t'], fvk, device)
     if return_hidden:
         return logits, hidden
     return logits
