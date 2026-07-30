@@ -22,6 +22,7 @@ from qwen36_moe_edge.quantize_experts import (
     _int4_weight,
     _int8_weight,
     _layout,
+    dequantize_int4,
 )
 
 
@@ -155,27 +156,6 @@ def memory_probe(
         )
 
 
-def _dequant_int4(
-        packed: torch.Tensor,
-        scale: torch.Tensor,
-        columns: int,
-        group_size: int,
-) -> torch.Tensor:
-    low = packed & 0x0F
-    high = (packed >> 4) & 0x0F
-    low = (low & 0x07).to(torch.int8) * torch.where(
-        (low & 0x08) != 0, -1, 1).to(torch.int8)
-    high = (high & 0x07).to(torch.int8) * torch.where(
-        (high & 0x08) != 0, -1, 1).to(torch.int8)
-    values = torch.stack((low, high), dim=-1).flatten(1)
-    rows = values.shape[0]
-    scale_float = scale.view(torch.float8_e4m3fn).float()
-    return (
-        values.float().reshape(rows, columns // group_size, group_size)
-        * scale_float.unsqueeze(-1)
-    ).reshape(rows, columns)
-
-
 def quality_probe(
         checkpoint: Path,
         *,
@@ -256,11 +236,11 @@ def quality_probe(
                 ).reshape_as(activation)
             gu4, gu4_scale = _int4_weight(
                 gu_source, current_group)
-            gu4 = _dequant_int4(
+            gu4 = dequantize_int4(
                 gu4, gu4_scale, HIDDEN, current_group)
             current4, current4_scale = _int4_weight(
                 current, current_group)
-            current = _dequant_int4(
+            current = dequantize_int4(
                 current4, current4_scale, HIDDEN, current_group)
             projected = current @ gu4.T
             current = (
@@ -277,11 +257,11 @@ def quality_probe(
                 ).reshape_as(current)
             dn4, dn4_scale = _int4_weight(
                 dn_source, current_group)
-            dn4 = _dequant_int4(
+            dn4 = dequantize_int4(
                 dn4, dn4_scale, INTERMEDIATE, current_group)
             current4, current4_scale = _int4_weight(
                 current, current_group)
-            current = _dequant_int4(
+            current = dequantize_int4(
                 current4, current4_scale, INTERMEDIATE, current_group)
             output = current @ dn4.T
             scores[mode].append(F.cosine_similarity(

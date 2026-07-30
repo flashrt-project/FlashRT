@@ -96,6 +96,28 @@ def _int4_weight(
     return packed.contiguous(), scale.view(torch.uint8).contiguous()
 
 
+def dequantize_int4(
+        packed: torch.Tensor,
+        scale: torch.Tensor,
+        columns: int,
+        group_size: int,
+) -> torch.Tensor:
+    """Inverse of :func:`_int4_weight`, for scoring and reference paths."""
+    low = packed & 0x0F
+    high = (packed >> 4) & 0x0F
+    low = (low & 0x07).to(torch.int8) * torch.where(
+        (low & 0x08) != 0, -1, 1).to(torch.int8)
+    high = (high & 0x07).to(torch.int8) * torch.where(
+        (high & 0x08) != 0, -1, 1).to(torch.int8)
+    values = torch.stack((low, high), dim=-1).flatten(1)
+    rows = values.shape[0]
+    scale_float = scale.view(torch.float8_e4m3fn).float()
+    return (
+        values.float().reshape(rows, columns // group_size, group_size)
+        * scale_float.unsqueeze(-1)
+    ).reshape(rows, columns)
+
+
 def _tensor_bytes(tensor: torch.Tensor) -> bytes:
     return tensor.contiguous().cpu().numpy().tobytes()
 

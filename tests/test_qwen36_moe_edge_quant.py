@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import torch
 
-from qwen36_moe_edge.probe import _dequant_int4
+from qwen36_moe_edge.expert_quality import (
+    SCHEMES,
+    expert_forward,
+    score_expert,
+)
 from qwen36_moe_edge.route_trace import (
     read_volume,
     simulate_lru,
@@ -19,6 +23,7 @@ from qwen36_moe_edge.quantize_experts import (
     _int8_weight,
     _layout,
     _rht16,
+    dequantize_int4,
     quantize_expert,
 )
 
@@ -40,7 +45,7 @@ def test_int4_grouped_round_trip_matches_packed_layout():
     weight = torch.randn(64, 256, generator=generator)
 
     packed, scale = _int4_weight(weight, 32)
-    restored = _dequant_int4(packed, scale, 256, 32)
+    restored = dequantize_int4(packed, scale, 256, 32)
 
     assert packed.shape == (64, 128)
     assert scale.shape == (64, 8)
@@ -174,3 +179,63 @@ def test_read_volume_converts_misses_to_bandwidth_limits():
     assert result["mb_per_token"] == 2.0
     assert result["tok_s_at_1gbps"] == 500.0
     assert result["tok_s_at_2gbps"] == 1000.0
+
+
+def test_expert_forward_is_a_swiglu_over_the_gate_up_split():
+    generator = torch.Generator().manual_seed(13)
+    activation = torch.randn(2, HIDDEN, generator=generator)
+    gate_up = torch.randn(
+        2 * INTERMEDIATE, HIDDEN, generator=generator) * 0.02
+    down = torch.randn(HIDDEN, INTERMEDIATE, generator=generator) * 0.02
+
+    projected = activation @ gate_up.T
+    expected = (
+        torch.nn.functional.silu(projected[:, :INTERMEDIATE])
+        * projected[:, INTERMEDIATE:]
+    ) @ down.T
+
+    torch.testing.assert_close(
+        expert_forward(activation, gate_up, down), expected)
+
+
+def _outlier_weight(rows, columns, generator):
+    """One large value in every group of 16 -- what the transform targets."""
+    weight = torch.randn(rows, columns, generator=generator) * 0.02
+    weight = weight.reshape(rows, columns // 16, 16)
+    weight[:, :, 0] += torch.randn(
+        rows, columns // 16, generator=generator).abs()
+    return weight.reshape(rows, columns)
+
+
+def test_rht16_reduces_int4_error_on_outlier_heavy_weights():
+    generator = torch.Generator().manual_seed(11)
+    activation = torch.randn(4, HIDDEN, generator=generator)
+    gate_up = _outlier_weight(2 * INTERMEDIATE, HIDDEN, generator)
+    down = _outlier_weight(HIDDEN, INTERMEDIATE, generator)
+
+    plain = score_expert(
+        activation, gate_up, down, scheme="w4a16", group_size=16)
+    rotated = score_expert(
+        activation, gate_up, down, scheme="w4a16_rht16", group_size=16)
+
+    # The transform is only worth its cost when groups have outliers; a 10 %
+    # margin keeps this from asserting on noise.
+    assert rotated["relative_l2"] < 0.9 * plain["relative_l2"]
+    assert rotated["cosine"] > plain["cosine"]
+
+
+def test_weight_only_schemes_order_by_bit_width():
+    generator = torch.Generator().manual_seed(17)
+    activation = torch.randn(4, HIDDEN, generator=generator)
+    gate_up = _outlier_weight(2 * INTERMEDIATE, HIDDEN, generator)
+    down = _outlier_weight(HIDDEN, INTERMEDIATE, generator)
+
+    scores = {
+        scheme: score_expert(
+            activation, gate_up, down, scheme=scheme, group_size=16)
+        for scheme in SCHEMES
+    }
+
+    assert scores["w8a16"]["relative_l2"] < scores["w4a16"]["relative_l2"]
+    for values in scores.values():
+        assert 0.0 < values["cosine"] <= 1.0

@@ -273,9 +273,11 @@ class Nexn2DecodeState:
         # chunk (64). 0 disables (always single-pass).
         self.prefill_chunk = int(
             _qwen35moe_env("PREFILL_CHUNK", "8192"))
-        # Optional eager-only routing trace used to size edge expert caches.
-        # Keep this disabled during CUDA Graph capture.
+        # Optional eager-only traces used to size edge expert caches and to
+        # score expert quantization against real activations. Keep these
+        # disabled during CUDA Graph capture.
         self.router_trace = None
+        self.moe_input_trace = None
         self._active_layer = -1
 
     def reset(self):
@@ -450,6 +452,9 @@ def _moe_layer_decode(h, ld, state, fvk, device):
     if state.router_trace is not None:
         state.router_trace[state._active_layer].append(
             tuple(int(v) for v in idx.cpu().tolist()))
+    if state.moe_input_trace is not None:
+        state.moe_input_trace[state._active_layer].append(
+            x.detach().to("cpu", copy=True))
 
     if 'experts_gate_up_alpha_dev' not in ld:               # cache once/layer
         ld['experts_gate_up_alpha_dev'] = \

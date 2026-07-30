@@ -24,6 +24,27 @@ PYTHONPATH=. python qwen36_moe_edge/probe.py \
   --group-size 16
 ```
 
+Score the quantization schemes against the activations the router actually
+sends each expert, and optionally save the references a device can check
+itself against:
+
+```bash
+PYTHONPATH=. python qwen36_moe_edge/expert_quality.py \
+  --checkpoint /models/Qwen3.6-35B-A3B \
+  --prompt "Explain edge mixture-of-experts inference. " \
+  --prompt-tokens 32 \
+  --new-tokens 32 \
+  --output qwen36_expert_quality.json \
+  --golden qwen36_expert_golden.safetensors
+```
+
+Prefer this over `probe.py --mode quality` when deciding what to generate.
+The probe uses `torch.randn` activations and quantizes the activations too;
+neither matches the runtime, where the activation is 4 KiB against a 1.7 MiB
+weight block and so is left in BF16. Random activations also hide errors that
+real inputs expose, because a scale calibrated against noise is not the scale
+real inputs need.
+
 Generate fixed-size routed-expert blocks for a layer range:
 
 ```bash
