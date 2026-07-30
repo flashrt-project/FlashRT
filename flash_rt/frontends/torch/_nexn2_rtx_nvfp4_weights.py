@@ -260,6 +260,7 @@ def extract_weights_nexn2_nvfp4(
     device: str = 'cuda:0',
     quant_scope: str = 'experts',
     stream_experts: bool = False,
+    load_mtp: bool = False,
 ) -> WeightHandles:
     """Build :class:`WeightHandles` from a Nex-N2-mini BF16 ckpt directory.
 
@@ -310,10 +311,13 @@ def extract_weights_nexn2_nvfp4(
                     handles_d, wmap, device)
 
     # ── Per-layer ──
-    per_layer: list = [None] * num_layers
-    for i in range(num_layers):
-        lp = f'model.language_model.layers.{i}.'
-        ltype = layer_types[i]
+    def _load_layer(lp: str, ltype: str, *, streamed: bool = None) -> dict:
+        """Build one layer's weight dict from its checkpoint prefix.
+
+        Taken out of the loop so the MTP head can use it: its layer lives under
+        a different prefix but has exactly a full-attention layer's keys, and
+        loading it a second way would be a second thing to keep correct.
+        """
         ld: dict = {'type': ltype, 'quant_format': 'nvfp4'}
 
         _bf16_from_ckpt(handles, ld, 'input_norm_w', lp + 'input_layernorm.weight',
@@ -353,13 +357,19 @@ def extract_weights_nexn2_nvfp4(
             _proj_load(handles, ld, 'out_proj', gp + 'out_proj.weight',
                        handles_d, wmap, fvk, device, quantize=quant_main)
         else:
-            raise ValueError(f'layer {i}: unknown layer_type {ltype!r}')
+            raise ValueError(f'{lp}: unknown layer_type {ltype!r}')
 
         # Every layer has a MoE FFN (mlp_only_layers is empty).
         _load_moe(handles, ld, lp, handles_d, wmap, fvk, device, n_experts,
                   quantize_shared=quant_main,
-                  stream_experts=stream_experts)
-        per_layer[i] = ld
+                  stream_experts=(stream_experts if streamed is None
+                                  else streamed))
+        return ld
+
+    per_layer: list = [None] * num_layers
+    for i in range(num_layers):
+        per_layer[i] = _load_layer(
+            f'model.language_model.layers.{i}.', layer_types[i])
 
     handles.ptrs['layers'] = per_layer
     handles.ptrs['vocab_size'] = vocab
@@ -377,6 +387,30 @@ def extract_weights_nexn2_nvfp4(
     handles.ptrs['quant_format'] = 'nvfp4'
     handles.ptrs['quant_scope'] = quant_scope
     handles.ptrs['ckpt_dir'] = ckpt_dir
-    handles.ptrs['mtp'] = None       # MTP weights not in the base ckpt
+    # ── Multi-token-prediction head ──
+    #
+    # One full-attention layer plus its own 256-expert MoE, under `mtp.`, with
+    # four head-level tensors around it. It drafts the token after next from
+    # the main model's last hidden state and the token just emitted, which is
+    # only useful with a verifier, so it is opt-in: it costs another layer's
+    # worth of weights and a KV slot.
+    handles.ptrs['mtp'] = None
+    if load_mtp:
+        if not _has(wmap, 'mtp.fc.weight'):
+            raise RuntimeError(
+                f'{ckpt_dir} has no MTP head (mtp.fc.weight is absent), so '
+                'speculative drafting cannot be built from it.')
+        # A bundle holds the model's own layers, so the head's experts have
+        # nowhere to stream from and stay resident whatever the model does.
+        mtp: dict = {'layer': _load_layer('mtp.layers.0.', 'full_attention',
+                                          streamed=False)}
+        _bf16_from_ckpt(handles, mtp, 'fc_w', 'mtp.fc.weight',
+                        handles_d, wmap, device)
+        for name, key in (('norm_w', 'mtp.norm.weight'),
+                          ('pre_h_w', 'mtp.pre_fc_norm_hidden.weight'),
+                          ('pre_e_w', 'mtp.pre_fc_norm_embedding.weight')):
+            _bf16_from_ckpt(handles, mtp, name, key,
+                            handles_d, wmap, device, fold_one=True)
+        handles.ptrs['mtp'] = mtp
     handles.ptrs['dflash'] = None
     return handles

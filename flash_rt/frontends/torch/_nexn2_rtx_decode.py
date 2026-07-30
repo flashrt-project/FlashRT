@@ -209,8 +209,18 @@ class Nexn2DecodeState:
             torch.zeros(1, CONV, KS - 1, dtype=bf16, device=device)
             for _ in range(nlin)]
 
-        # Full-attn KV cache.
-        self.attn = RtxFlashAttnBackendNexn2(max_seq=self.max_seq, max_q_seq=1)
+        # Full-attn KV cache. A loaded draft head is one more full-attention
+        # layer and takes the slot after the model's own.
+        self.mtp = p.get('mtp')
+        self.mtp_rank = nfull if self.mtp is not None else None
+        self.attn = RtxFlashAttnBackendNexn2(
+            max_seq=self.max_seq, max_q_seq=1,
+            num_full_layers=nfull + (1 if self.mtp is not None else 0))
+        # The pre-final-norm hidden state of the last step, which is what the
+        # draft head reads. Written every step whether or not one is loaded:
+        # a 4 KB device copy, and making it conditional would put a Python
+        # branch inside the captured region.
+        self.last_hidden = torch.zeros(HID, dtype=bf16, device=device)
 
         # RoPE tables for the whole window.
         theta = float(p['rope_theta'])
@@ -280,6 +290,11 @@ class Nexn2DecodeState:
         self.router_trace = None
         self.moe_input_trace = None
         self._active_layer = -1
+        # Which half of the draft head's fc input carries the hidden state.
+        # The checkpoint does not say and fc is square in the concatenated
+        # width, so this is settled by measuring acceptance both ways.
+        self.mtp_hidden_first = (
+            _qwen35moe_env("MTP_HIDDEN_FIRST", "1") != "0")
         # Set to an ExpertCache to read the routed experts from storage. Only
         # meaningful when the loader skipped them; see _moe_experts_streamed.
         self.expert_cache = None
@@ -659,11 +674,25 @@ def decode_step(state, token_id, pos, fvk, device):
         state._active_layer = L
         h = res + _moe_layer_decode(n, ld, state, fvk, device)
 
+    # The pre-final-norm hidden state is what a DeepSeek-V3-style draft head
+    # consumes. Keeping it in a fixed buffer costs one 4 KB device copy and
+    # survives graph capture, unlike reading it out per step.
+    state.last_hidden.copy_(h.reshape(HID))
     h = _rms_fvk(h, p['final_norm_w_t'], fvk, device, state.eps)
     # lm_head as NVFP4 W4A16: 4x less weight read (1GB -> 0.25GB) via the
     # hand-tuned mma (3.1x the bf16 GEMV; the CUTLASS widen is M=1-broken).
     # The weight is quantised once during the eager seed (cached on p), so
     # the captured graph only runs the activation quant + fp4 GEMM.
+    return _lm_head(state, h, fvk, device)
+
+
+def _lm_head(state, h, fvk, device):
+    """Project a hidden state to logits over the full vocabulary.
+
+    Taken out of decode_step so the speculative draft head, which ends the
+    same way, does not carry a second copy of the quantise-once bookkeeping.
+    """
+    p = state.handles.ptrs
     vocab = p['vocab_size']
     logits = torch.empty(1, vocab, dtype=torch.bfloat16, device=device)
     if not state.lm_head_nvfp4:
@@ -702,6 +731,58 @@ def decode_step(state, token_id, pos, fvk, device):
         p['lm_head_packed_t'].data_ptr(), p['lm_head_sf_t'].data_ptr(),
         logits.data_ptr(), vocab, HID, p['lm_head_alpha'], _cs())
     return logits
+
+
+def mtp_draft(state, token_id, pos, fvk, device, *, hidden=None):
+    """Draft the token after next with the MTP head.
+
+    A DeepSeek-V3 single-module head: it sees the main model's last hidden
+    state for position p-1 and the token emitted at p, and predicts p+1. The
+    layer under it is an ordinary full-attention layer with its own MoE, so it
+    runs through the same per-layer code as the model -- which is the point of
+    loading it through the same loader.
+
+    ``hidden`` defaults to the buffer the last decode step wrote. The head
+    carries its own KV at the same absolute positions as the model, so calling
+    this advances that cache and nothing else.
+    """
+    p = state.handles.ptrs
+    mtp = state.mtp
+    if mtp is None:
+        raise RuntimeError(
+            'no MTP head is loaded; build the frontend with speculation '
+            'enabled so the loader reads it')
+    ld = mtp['layer']
+    h_prev = state.last_hidden if hidden is None else hidden
+
+    e = F.embedding(token_id.view(1, 1), p['embed_w_t']).reshape(1, HID)
+    hn = _rms_fvk(h_prev.reshape(1, HID), mtp['pre_h_w_t'], fvk, device,
+                  state.eps)
+    en = _rms_fvk(e, mtp['pre_e_w_t'], fvk, device, state.eps)
+    # Which half goes first is a checkpoint convention, not something the
+    # shapes pin down -- fc is square in the concatenated width. It is
+    # measured, not assumed: the wrong order drafts noise.
+    cat = (torch.cat([hn, en], -1) if state.mtp_hidden_first
+           else torch.cat([en, hn], -1))
+    h = _dense_mv(cat, mtp['fc_w_t'], mtp, 'fc_w_t', state, fvk, device)
+
+    res = h
+    n = _rms_fvk(h, ld['input_norm_w_t'], fvk, device, state.eps)
+    h = res + _decode_full(n, ld, state, state.mtp_rank, pos, fvk, device)
+    res = h
+    n = _rms_fvk(h, ld['post_norm_w_t'], fvk, device, state.eps)
+    prev_layer, state._active_layer = state._active_layer, None
+    try:
+        h = res + _moe_layer_decode(n, ld, state, fvk, device)
+    finally:
+        state._active_layer = prev_layer
+    # Return the state before the head's own final norm as well: chaining a
+    # second draft means feeding the head what the model would have fed it,
+    # and that is a pre-final-norm hidden state. Handing it the model's stale
+    # one instead costs real acceptance -- measured 0.208 against 0.539 on the
+    # second draft.
+    return _lm_head(state, _rms_fvk(h, mtp['norm_w_t'], fvk, device,
+                                    state.eps), fvk, device), h.reshape(HID)
 
 
 def seed_prefill(state, input_ids, fvk, device):

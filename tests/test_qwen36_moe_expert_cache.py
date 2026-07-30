@@ -184,7 +184,9 @@ def test_lm_head_has_a_path_without_the_sm120_only_kernel():
 
     from flash_rt.frontends.torch import _nexn2_rtx_decode
 
-    source = inspect.getsource(_nexn2_rtx_decode.decode_step)
+    # The projection moved into its own function when the draft head, which
+    # ends the same way, needed it too.
+    source = inspect.getsource(_nexn2_rtx_decode._lm_head)
 
     assert "hasattr(fvk, 'fp4_w4a4_mma_sm120_full_n_bf16out')" in source
     # The fallback goes through the resolver, which returns whichever

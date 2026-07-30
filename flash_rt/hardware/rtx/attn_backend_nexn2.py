@@ -46,12 +46,19 @@ class RtxFlashAttnBackendNexn2:
     NUM_KV_HEADS = 2
     HEAD_DIM = 256
 
-    def __init__(self, max_seq: int, max_q_seq: int = 1, dtype=None):
+    def __init__(self, max_seq: int, max_q_seq: int = 1, dtype=None,
+                 num_full_layers: int | None = None):
         import torch
 
         self._torch = torch
         bf16 = dtype if dtype is not None else torch.bfloat16
         d = "cuda"
+        # The model's ten full-attention layers by default. A speculative
+        # draft head is one more full-attention layer carrying its own KV, so
+        # it asks for an extra slot rather than owning a second cache.
+        self.NUM_FULL_LAYERS = (
+            int(num_full_layers) if num_full_layers is not None
+            else type(self).NUM_FULL_LAYERS)
 
         self._max_seq = int(max_seq)
         self._max_q_seq = int(max_q_seq)

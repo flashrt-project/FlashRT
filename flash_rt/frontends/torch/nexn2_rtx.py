@@ -131,6 +131,10 @@ class Nexn2TorchFrontendRtx:
         # Set by a subclass that streams the routed experts from a bundle
         # instead of holding them; see _nexn2_rtx_decode._moe_experts_streamed.
         self._stream_experts = getattr(self, '_stream_experts', False)
+        # Read by the loader before any weight is touched, like the above:
+        # the draft head is another layer's worth of weights and is only
+        # useful with a verifier, so nothing loads it unless asked.
+        self._load_mtp = getattr(self, '_load_mtp', False)
         self._tokenizer = None
         self._prompt_ids = None
         self._pipeline: Nexn2Pipeline | None = None
@@ -188,7 +192,8 @@ class Nexn2TorchFrontendRtx:
         self._weights = extract_weights_nexn2_nvfp4(
             self.checkpoint_path, fvk, device=self.device,
             quant_scope=self._quant_scope,
-            stream_experts=self._stream_experts)
+            stream_experts=self._stream_experts,
+            load_mtp=self._load_mtp)
 
     @property
     def tokenizer(self):
