@@ -136,6 +136,90 @@ def simulate_two_tier(
     }
 
 
+def global_frequency(
+        trace: list[list[list[int]]]) -> list[Counter[int]]:
+    """Per-layer selection counts over a whole trace.
+
+    Intended to be built from traces other than the one being evaluated: a set
+    derived from the trace it is scored on is an oracle, not a predictor.
+    """
+    return [
+        Counter(expert for step in layer_trace for expert in step)
+        for layer_trace in trace
+    ]
+
+
+def simulate_warm_lru(
+        trace: list[list[list[int]]],
+        *,
+        prompt_tokens: int,
+        quota: int,
+        preload: list[Counter[int]] | None = None,
+        window: int = 1) -> dict[str, float]:
+    """Per-layer LRU, optionally warm-started, over ``window`` tokens at a time.
+
+    ``preload`` fills each layer's cache with its most frequent experts before
+    decode, which is what a runtime can do at startup from offline statistics.
+    Entries are evictable: an earlier experiment showed that pinning a
+    prompt-derived set costs more adaptivity than it gains.
+
+    ``window`` groups that many decode steps into one request, as a
+    multi-token verification step would. Note that this does not reduce reads:
+    an LRU already captures the reuse that a window's union would.
+    """
+    if window < 1:
+        raise ValueError(f"window must be at least 1, got {window}")
+    misses = accesses = tokens = 0
+    for index, layer_trace in enumerate(trace):
+        cache: OrderedDict[int, None] = OrderedDict()
+        if preload is not None:
+            for expert, _ in preload[index].most_common(quota):
+                cache[expert] = None
+        steps = layer_trace[prompt_tokens:]
+        for start in range(0, len(steps) - window + 1, window):
+            requested = {
+                expert
+                for step in steps[start:start + window]
+                for expert in step
+            }
+            if index == 0:
+                tokens += window
+            for expert in requested:
+                accesses += 1
+                if expert in cache:
+                    cache.move_to_end(expert)
+                    continue
+                misses += 1
+                if len(cache) >= quota:
+                    cache.popitem(last=False)
+                cache[expert] = None
+    return {
+        "distinct_hit_rate": 1.0 - misses / max(accesses, 1),
+        "decode_misses_per_token": misses / max(tokens, 1),
+    }
+
+
+def cold_prefill_blocks(
+        trace: list[list[list[int]]],
+        *,
+        prompt_tokens: int,
+        resident: list[set[int]]) -> int:
+    """Blocks prefill must read before the first token can be emitted.
+
+    Prefill routes every prompt token independently, so a layer's cost is the
+    union of its tokens' selections. Whatever is already resident is free; the
+    rest sets the floor on time to first token.
+    """
+    return sum(
+        len({
+            expert
+            for step in layer_trace[:prompt_tokens]
+            for expert in step
+        } - resident[index])
+        for index, layer_trace in enumerate(trace)
+    )
+
+
 def read_volume(
         misses_per_token: float,
         *,

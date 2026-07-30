@@ -10,9 +10,12 @@ from qwen36_moe_edge.expert_quality import (
     score_expert,
 )
 from qwen36_moe_edge.route_trace import (
+    cold_prefill_blocks,
+    global_frequency,
     read_volume,
     simulate_lru,
     simulate_two_tier,
+    simulate_warm_lru,
 )
 from qwen36_moe_edge.quantize_experts import (
     BLOCK_ALIGNMENT,
@@ -180,6 +183,47 @@ def test_read_volume_converts_misses_to_bandwidth_limits():
     assert result["mb_per_token"] == 2.0
     assert result["tok_s_at_1gbps"] == 500.0
     assert result["tok_s_at_2gbps"] == 1000.0
+
+
+def test_warm_start_removes_the_first_touch_of_a_frequent_expert():
+    # A trace whose decode phase only ever wants expert 5. Cold, the first
+    # touch misses; warm-started from statistics that name expert 5, it does
+    # not.
+    trace = [[[5], [5], [5], [5]]]
+    frequency = global_frequency([[[5], [5]]])
+
+    cold = simulate_warm_lru(trace, prompt_tokens=2, quota=4)
+    warm = simulate_warm_lru(
+        trace, prompt_tokens=2, quota=4, preload=frequency)
+
+    assert cold["decode_misses_per_token"] == 0.5
+    assert warm["decode_misses_per_token"] == 0.0
+
+
+def test_windowing_does_not_reduce_reads_an_lru_already_serves():
+    # Verifying several tokens at once requests the union of their selections.
+    # An LRU already holds a repeated expert, so grouping changes nothing.
+    trace = [[[0], [0, 1], [1], [0, 1]]]
+
+    single = simulate_warm_lru(trace, prompt_tokens=0, quota=8, window=1)
+    grouped = simulate_warm_lru(trace, prompt_tokens=0, quota=8, window=2)
+
+    assert single["decode_misses_per_token"] == grouped[
+        "decode_misses_per_token"]
+
+
+def test_cold_prefill_counts_the_union_prefill_touches():
+    # Prefill routes each token independently, so a layer costs the union of
+    # its tokens' selections, less whatever is already resident.
+    trace = [[[0, 1], [1, 2], [9]], [[3], [4], [9]]]
+
+    without = cold_prefill_blocks(
+        trace, prompt_tokens=2, resident=[set(), set()])
+    with_resident = cold_prefill_blocks(
+        trace, prompt_tokens=2, resident=[{0, 1}, {3}])
+
+    assert without == 3 + 2          # {0,1,2} and {3,4}
+    assert with_resident == 1 + 1    # {2} and {4}
 
 
 def test_expert_forward_is_a_swiglu_over_the_gate_up_split():
