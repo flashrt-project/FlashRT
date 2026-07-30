@@ -51,6 +51,9 @@ class CacheConfig:
     device: str = "cuda:0"
     experts_per_token: int = 8
     read_chunk: int = 1 << 28
+    # Bypass the page cache. Off only to demonstrate what happens when it is
+    # not bypassed, or on a filesystem without O_DIRECT.
+    direct: bool = True
     metadata: dict = field(default_factory=dict)
 
 
@@ -185,8 +188,10 @@ class ExpertCache:
                 raise ValueError(
                     f"{path} is {size} bytes; expected {expected} "
                     f"({self.num_experts} x {self.block_bytes})")
-            self._fds[layer] = os.open(
-                path, os.O_RDONLY | getattr(os, "O_DIRECT", 0))
+            flags = os.O_RDONLY
+            if self.config.direct:
+                flags |= getattr(os, "O_DIRECT", 0)
+            self._fds[layer] = os.open(path, flags)
         return self._fds[layer]
 
     def _fetch(self, layer: int, expert: int, slot: int, buffer: int) -> None:
