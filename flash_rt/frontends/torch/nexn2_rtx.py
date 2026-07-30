@@ -108,6 +108,9 @@ class Nexn2TorchFrontendRtx:
         self._quant_format = quant
         self._kernelized = bool(kernelized)
         self._quant_scope = quant_scope
+        # Set by a subclass that streams the routed experts from a bundle
+        # instead of holding them; see _nexn2_rtx_decode._moe_experts_streamed.
+        self._stream_experts = getattr(self, '_stream_experts', False)
         self._tokenizer = None
         self._prompt_ids = None
         self._pipeline: Nexn2Pipeline | None = None

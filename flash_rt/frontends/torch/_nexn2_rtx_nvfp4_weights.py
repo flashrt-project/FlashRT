@@ -168,7 +168,8 @@ def _bf16_from_ckpt(handles, out_dict, name, key, handles_d, wmap, device,
 
 
 def _load_moe(handles, ld, lp, handles_d, wmap, fvk, device,
-              n_experts: int, *, quantize_shared: bool = True) -> None:
+              n_experts: int, *, quantize_shared: bool = True,
+              stream_experts: bool = False) -> None:
     """Load one layer's MoE block: router (BF16) + experts + shared expert."""
     # Router gate (BF16) and shared-expert sigmoid gate (BF16).
     _bf16_from_ckpt(handles, ld, 'router_w', lp + 'mlp.gate.weight',
@@ -189,6 +190,20 @@ def _load_moe(handles, ld, lp, handles_d, wmap, fvk, device,
     # Routed experts: packed 3D tensors (E, out, in). Quantize each expert
     # into a contiguous slice of a per-layer stacked NVFP4 buffer so the
     # downstream grouped GEMM sees one contiguous weight per projection.
+    if stream_experts:
+        # The routed experts are read from storage at decode time, so the
+        # stacked per-layer tensors are never built. Skipping them is the
+        # point: they are 16.9 GiB of the resident footprint, and a cache
+        # added on top of them would cost memory rather than save it. The
+        # shapes are still checked, because a bundle is generated against them.
+        for name in ('mlp.experts.gate_up_proj', 'mlp.experts.down_proj'):
+            if not _has(wmap, lp + name):
+                raise ValueError(
+                    f'{lp}{name} is absent, so a streamed expert bundle '
+                    'cannot correspond to this checkpoint')
+        ld['experts_streamed'] = True
+        return
+
     gate_up = _get(handles_d, wmap, lp + 'mlp.experts.gate_up_proj')
     down = _get(handles_d, wmap, lp + 'mlp.experts.down_proj')
     e_gu, n_gu, k_gu = gate_up.shape   # (E, 2*inter, hidden)
@@ -244,6 +259,7 @@ def extract_weights_nexn2_nvfp4(
     fvk,
     device: str = 'cuda:0',
     quant_scope: str = 'experts',
+    stream_experts: bool = False,
 ) -> WeightHandles:
     """Build :class:`WeightHandles` from a Nex-N2-mini BF16 ckpt directory.
 
@@ -253,6 +269,12 @@ def extract_weights_nexn2_nvfp4(
       * ``'experts'``: only the storage-dominant routed experts go NVFP4;
         full-attn / out_proj / shared stay BF16. ~21 GB; E2E cos ~0.99 --
         the precision-per-VRAM baseline until the Step-3 W4A16 mixed kernel.
+
+    stream_experts: skip the routed experts entirely, leaving the decode path
+      to read them from a prepared bundle. They are 16.9 GiB of the resident
+      footprint, so this is the difference between a model that fits a small
+      device and one that does not; a cache added without skipping them would
+      only add to the total. The decode path must then be given an ExpertCache.
     """
     if quant_scope not in ('full', 'experts'):
         raise ValueError(
@@ -335,7 +357,8 @@ def extract_weights_nexn2_nvfp4(
 
         # Every layer has a MoE FFN (mlp_only_layers is empty).
         _load_moe(handles, ld, lp, handles_d, wmap, fvk, device, n_experts,
-                  quantize_shared=quant_main)
+                  quantize_shared=quant_main,
+                  stream_experts=stream_experts)
         per_layer[i] = ld
 
     handles.ptrs['layers'] = per_layer

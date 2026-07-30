@@ -279,6 +279,25 @@ class Nexn2DecodeState:
         self.router_trace = None
         self.moe_input_trace = None
         self._active_layer = -1
+        # Set to an ExpertCache to read the routed experts from storage. Only
+        # meaningful when the loader skipped them; see _moe_experts_streamed.
+        self.expert_cache = None
+        self._scratch = None
+
+    def _streamed_scratch(self, device):
+        """The two decode buffers a streamed expert is unpacked into.
+
+        Allocated once and reused: 4 MiB for gate_up and 2 MiB for down, which
+        would otherwise be allocated 8 times per layer per token.
+        """
+        if self._scratch is None:
+            self._scratch = {
+                'gate_up': torch.empty(
+                    2 * INTER, HID, dtype=torch.bfloat16, device=device),
+                'down': torch.empty(
+                    HID, INTER, dtype=torch.bfloat16, device=device),
+            }
+        return self._scratch
 
     def reset(self):
         for s in self.lin_state:
@@ -413,6 +432,72 @@ def _decode_full(h, ld, state, full_rank, pos, fvk, device):
         1, 1, HID)
 
 
+def _moe_experts_streamed(x, idx, tw_row, ld, state, fvk, device, s):
+    """The routed experts, read from storage instead of held in memory.
+
+    Only reachable when the loader was told to stream them, in which case the
+    per-layer stacked NVFP4 tensors were never allocated -- that is the whole
+    point, and adding a cache without skipping them would cost memory rather
+    than save it.
+
+    Each block is decoded to bf16 and multiplied with the shared bf16 GEMM. The
+    block-scaled 4-bit GEMMs cannot read these blocks: different codebook,
+    different scale layout. Decoding costs bandwidth on a block that is already
+    resident, which is the cheap end of this system -- the misses are what cost
+    time.
+
+    The whole top-k is fetched in one call so the reads overlap, and the
+    per-layer quota is at least the top-k, so none of the returned pointers can
+    be invalidated by the others.
+    """
+    cache = state.expert_cache
+    layer = state._active_layer
+    experts = [int(value) for value in idx.cpu().tolist()]
+    cache.get_many(layer, experts)
+
+    scratch = state._streamed_scratch(device)
+    d_gu = torch.empty(TOPK, 2 * INTER, dtype=torch.bfloat16, device=device)
+    d_dn = torch.empty(TOPK, HID, dtype=torch.bfloat16, device=device)
+    xc = x.contiguous()
+
+    for slot, expert in enumerate(experts):
+        parts = cache.components(layer, expert)
+        gu_alpha, dn_alpha = parts['global_scales'].tolist()
+        rc = fvk.qwen35moe_e0m3_dequant_bf16(
+            parts['gate_up_weight'].data_ptr(),
+            parts['gate_up_scale'].data_ptr(),
+            scratch['gate_up'].data_ptr(),
+            2 * INTER, HID, cache.group_size, gu_alpha, s)
+        if rc:
+            raise RuntimeError(f'gate_up decode failed with {rc}')
+        fvk.bf16_matvec_sm120_bf16(
+            xc.data_ptr(), scratch['gate_up'].data_ptr(),
+            d_gu[slot].data_ptr(), 2 * INTER, HID, s)
+
+        gated = _silu_mul(
+            d_gu[slot:slot + 1, :INTER], d_gu[slot:slot + 1, INTER:],
+            fvk, device).contiguous()
+        rc = fvk.qwen35moe_e0m3_dequant_bf16(
+            parts['down_weight'].data_ptr(),
+            parts['down_scale'].data_ptr(),
+            scratch['down'].data_ptr(),
+            HID, INTER, cache.group_size, dn_alpha, s)
+        if rc:
+            raise RuntimeError(f'down decode failed with {rc}')
+        fvk.bf16_matvec_sm120_bf16(
+            gated.data_ptr(), scratch['down'].data_ptr(),
+            d_dn[slot].data_ptr(), HID, INTER, s)
+
+    if 'decode_topk_rows' not in ld:
+        ld['decode_topk_rows'] = torch.arange(
+            TOPK, dtype=torch.int32, device=device)
+    out = torch.empty(HID, dtype=torch.float32, device=device)
+    fvk.moe_weighted_sum_sm120_bf16(
+        d_dn.data_ptr(), ld['decode_topk_rows'].data_ptr(),
+        tw_row.data_ptr(), out.data_ptr(), 1, TOPK, HID, HID, s)
+    return out.unsqueeze(0)
+
+
 def _moe_layer_decode(h, ld, state, fvk, device):
     """M=1 fine-grained MoE via the grouped GEMV kernel: the 8 routed experts
     run in one launch each for gate_up (shared act) and down (per-slot act),
@@ -455,6 +540,10 @@ def _moe_layer_decode(h, ld, state, fvk, device):
     if state.moe_input_trace is not None:
         state.moe_input_trace[state._active_layer].append(
             x.detach().to("cpu", copy=True))
+
+    if ld.get('experts_streamed'):
+        return _moe_experts_streamed(
+            x, idx, tw_row, ld, state, fvk, device, s)
 
     if 'experts_gate_up_alpha_dev' not in ld:               # cache once/layer
         ld['experts_gate_up_alpha_dev'] = \

@@ -90,6 +90,9 @@ class ExpertCache:
         self.alignment = int(self.manifest["block_alignment"])
         self.num_layers = int(self.manifest["num_layers"])
         self.num_experts = int(self.manifest["num_experts"])
+        # None in the manifest means INT8, whose scales are per output channel
+        # and need no group.
+        self.group_size = int(self.manifest.get("group_size") or 0)
 
         if config.slots_per_layer < config.experts_per_token:
             raise ValueError(
