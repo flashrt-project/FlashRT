@@ -165,17 +165,27 @@ class RtxFlashAttnBackendNexn2:
         """Reference attention, for a device the vendored kernel refuses."""
         import torch.nn.functional as F
 
-        q = self.Q_buf[:, :q_seq]
+        q = self.Q_buf[:, :q_seq].transpose(1, 2).float()
         k = self.K_cache[layer_idx:layer_idx + 1, :kv_seq]
         v = self.V_cache[layer_idx:layer_idx + 1, :kv_seq]
+        # Broadcasting the KV to the query head count materialises it: at
+        # decode that is 8x2xkv_seqx256 floats twice per layer, ~48 MB a step
+        # across the ten full-attention layers, purely to be read once. Native
+        # GQA does the same thing without the copy. fp32 either way, so the
+        # numerics are untouched -- this path seeds a token-exact decode.
         groups = self.NUM_Q_HEADS // self.NUM_KV_HEADS
-        out = F.scaled_dot_product_attention(
-            q.transpose(1, 2).float(),
-            k.repeat_interleave(groups, dim=2).transpose(1, 2).float(),
-            v.repeat_interleave(groups, dim=2).transpose(1, 2).float(),
-            is_causal=q_seq > 1,
-            scale=softmax_scale,
-        ).transpose(1, 2)
+        try:
+            out = F.scaled_dot_product_attention(
+                q, k.transpose(1, 2).float(), v.transpose(1, 2).float(),
+                is_causal=q_seq > 1, scale=softmax_scale, enable_gqa=True,
+            ).transpose(1, 2)
+        except TypeError:                       # torch without native GQA
+            out = F.scaled_dot_product_attention(
+                q,
+                k.repeat_interleave(groups, dim=2).transpose(1, 2).float(),
+                v.repeat_interleave(groups, dim=2).transpose(1, 2).float(),
+                is_causal=q_seq > 1, scale=softmax_scale,
+            ).transpose(1, 2)
         self.O_buf[:, :q_seq].copy_(out.to(self.O_buf.dtype))
 
     # ── Layer cache pointer math ──

@@ -150,17 +150,24 @@ __device__ __forceinline__ void row_dot(
       acc[r] += __shfl_xor_sync(0xffffffff, acc[r], off);
 }
 
-// Rows per warp. Enough outstanding loads to cover the memory latency without
-// spending so many registers that occupancy pays for it: R * (loads per row)
-// lands at 8 either way, since the unrolled body runs only when K_BLOCKS
-// reaches 32 * kUnroll.
-constexpr int kRowsBig = 2;      // K >= 2048: kUnroll fires, 2 * 4 = 8
+// Rows per warp. More rows means more outstanding loads and more registers, so
+// the useful value is where the added parallelism stops paying for the
+// occupancy it costs -- and that turned out to differ between the two entry
+// points, which is why they do not share a constant. Measured at the shapes
+// the decode issues, cold: the dense GEMV peaks at 2 (q_proj 47.9 us against
+// 53.9 at 4, lm_head 1205 against 1366) while the grouped one peaks at 4
+// (gate_up 42.9 against 47.8 at 2). The grouped launch carries a slot per grid
+// row, so it has fewer blocks per row tile and leans harder on what each
+// thread keeps in flight.
+constexpr int kRowsDense = 2;    // K >= 2048: kUnroll fires, 2 * 4 = 8
+constexpr int kRowsGrouped = 4;  // K >= 2048: 4 * 4 = 16
 constexpr int kRowsSmall = 8;    // K <  2048: tail only, 8 * 1 = 8
 
 // The row block a warp owns must not straddle a 32-row scale group, or
 // row_inner + 16 * r stops describing the swizzle. Warps take R consecutive
 // rows starting at a multiple of R, so this holds for any R dividing 32.
-static_assert(32 % kRowsBig == 0 && 32 % kRowsSmall == 0,
+static_assert(32 % kRowsDense == 0 && 32 % kRowsGrouped == 0
+                  && 32 % kRowsSmall == 0,
               "rows per warp must divide the 32-row scale group");
 
 template <int R>
@@ -239,8 +246,8 @@ inline size_t smem_bytes(int K) {
 // Rows per warp for this K, dropping to 1 when N cannot fill even one warp's
 // worth. Above 32 rows a warp would straddle a scale group; the constants
 // enforce that, this only picks between them.
-inline int rows_per_warp(int N, int K) {
-  const int r = (K >= 2048) ? kRowsBig : kRowsSmall;
+inline int rows_per_warp(int N, int K, int rows_big) {
+  const int r = (K >= 2048) ? rows_big : kRowsSmall;
   return (N >= kWarps * r) ? r : 1;
 }
 
@@ -267,8 +274,8 @@ int w4a16_matvec_edge_sm120_bf16(
   w4a16_matvec_edge_kernel<R><<<dim3((N + kWarps * (R) - 1) / (kWarps * (R))),\
                                 dim3(kThreads), smem, stream>>>(              \
       xp, wp, sp, op, alpha, N, K, n_col_super)
-  switch (rows_per_warp(N, K)) {
-    case kRowsBig:   FLASHRT_LAUNCH_MATVEC(kRowsBig);   break;
+  switch (rows_per_warp(N, K, kRowsDense)) {
+    case kRowsDense: FLASHRT_LAUNCH_MATVEC(kRowsDense); break;
     case kRowsSmall: FLASHRT_LAUNCH_MATVEC(kRowsSmall); break;
     default:         FLASHRT_LAUNCH_MATVEC(1);          break;
   }
@@ -307,10 +314,10 @@ int moe_grouped_w4a16_edge_sm120_bf16(
          dim3(kThreads), smem, stream>>>(                                     \
           ap, wp, sp, alp, ep, dp, N, K, n_col_super,                         \
           a_stride, w_stride, sfb_stride)
-  switch (rows_per_warp(N, K)) {
-    case kRowsBig:   FLASHRT_LAUNCH_GROUPED(kRowsBig);   break;
-    case kRowsSmall: FLASHRT_LAUNCH_GROUPED(kRowsSmall); break;
-    default:         FLASHRT_LAUNCH_GROUPED(1);          break;
+  switch (rows_per_warp(N, K, kRowsGrouped)) {
+    case kRowsGrouped: FLASHRT_LAUNCH_GROUPED(kRowsGrouped); break;
+    case kRowsSmall:   FLASHRT_LAUNCH_GROUPED(kRowsSmall);   break;
+    default:           FLASHRT_LAUNCH_GROUPED(1);            break;
   }
 #undef FLASHRT_LAUNCH_GROUPED
   return 0;
