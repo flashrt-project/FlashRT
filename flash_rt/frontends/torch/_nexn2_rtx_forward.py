@@ -475,15 +475,89 @@ def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None,
 # the pre-existing flash_rt_fa2.so (already a hard dep of the decode backend),
 # so this adds no new csrc.
 _FA2_MOD = None
+_FA2_USABLE = None
 _NUM_SMS = None
 
 
 def _get_fa2():
+    """The vendored FA2 module, or None where the target does not build it.
+
+    Thor is such a target: its arch list omits FA2 because it uses FA4. Absence
+    is a fallback, not an error -- ``_sdpa_causal_attn`` computes the same
+    thing -- so this returns None rather than raising, the way the decode
+    attention backend already treats it.
+    """
     global _FA2_MOD
     if _FA2_MOD is None:
-        from flash_rt import flash_rt_fa2 as _m
-        _FA2_MOD = _m
-    return _FA2_MOD
+        try:
+            from flash_rt import flash_rt_fa2 as _m
+        except ImportError:
+            _FA2_MOD = False
+        else:
+            _FA2_MOD = _m
+    return _FA2_MOD or None
+
+
+def _fa2_usable(device):
+    """Does the vendored kernel actually compute here?
+
+    Importing it and finding its symbols proves neither: its arch handling can
+    leave a build that links, loads, prints a complaint and returns without
+    writing the output, which downstream looks like wrong attention rather than
+    a failure. The decode backend probes for the same reason. One launch, once.
+    """
+    global _FA2_USABLE
+    if _FA2_USABLE is not None:
+        return _FA2_USABLE
+    if _get_fa2() is None:
+        _FA2_USABLE = False
+        return False
+    g = torch.Generator(device=device).manual_seed(1)
+    q = torch.randn(1, 8, NQ, HD, generator=g, device=device,
+                    dtype=torch.bfloat16)
+    k = torch.randn(1, 8, NKV, HD, generator=g, device=device,
+                    dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    try:
+        produced = _fa2_causal_attn(q, k, v, device, _probe=True).float()
+        torch.cuda.synchronize(device)
+    except Exception:                                        # noqa: BLE001
+        _FA2_USABLE = False
+        return False
+    expected = _sdpa_causal_attn(q, k, v, device).float()
+    _FA2_USABLE = bool(
+        torch.isfinite(produced).all()
+        and ((produced - expected).norm()
+             / expected.norm().clamp_min(1e-6)).item() < 0.05)
+    return _FA2_USABLE
+
+
+def _sdpa_causal_attn(qf, kf, vf, device):
+    """Reference causal GQA attention, for a build without the FA2 kernel.
+
+    FA2 causal aligns bottom-right -- query i attends to keys [0, Sk-Sq+i] --
+    which is exactly a chunked block's absolute causal window. torch's
+    ``is_causal=True`` aligns top-left, and the two only agree when Sq == Sk,
+    so the mask is built explicitly rather than left to a flag whose convention
+    differs where it matters.
+    """
+    import torch.nn.functional as F
+
+    Sq, Sk = qf.shape[1], kf.shape[1]
+    q = qf.transpose(1, 2)                               # (1, NQ, Sq, HD)
+    k, v = kf.transpose(1, 2), vf.transpose(1, 2)        # (1, NKV, Sk, HD)
+    qi = torch.arange(Sk - Sq, Sk, device=device).unsqueeze(1)
+    mask = torch.arange(Sk, device=device).unsqueeze(0) <= qi
+    try:
+        o = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, scale=float(HD) ** -0.5, enable_gqa=True)
+    except TypeError:                       # torch without native GQA
+        groups = NQ // NKV
+        o = F.scaled_dot_product_attention(
+            q, k.repeat_interleave(groups, dim=1),
+            v.repeat_interleave(groups, dim=1),
+            attn_mask=mask, scale=float(HD) ** -0.5)
+    return o.transpose(1, 2).contiguous()
 
 
 def _num_sms():
@@ -494,13 +568,18 @@ def _num_sms():
     return _NUM_SMS
 
 
-def _fa2_causal_attn(qf, kf, vf, device):
+def _fa2_causal_attn(qf, kf, vf, device, *, _probe=False):
     """Causal GQA attention via the vendored FA2 kernel (bf16, native GQA -- no
     KV repeat). qf (1,Sq,NQ,HD), kf/vf (1,Sk,NKV,HD). Returns (1,Sq,NQ,HD).
     Sk may exceed Sq (chunked prefill: a block of Sq queries against the Sk
     accumulated KV); FA2 causal uses bottom-right alignment, so query i attends
     to keys [0, Sk-Sq+i] -- exactly the block's absolute causal window. splitkv
-    off (large-q parallelism)."""
+    off (large-q parallelism).
+
+    Falls back to the reference where the kernel is absent or refuses. ``_probe``
+    forces the kernel, since the probe is what decides that question."""
+    if not _probe and not _fa2_usable(device):
+        return _sdpa_causal_attn(qf, kf, vf, device)
     Sq = qf.shape[1]
     Sk = kf.shape[1]
     qc, kc, vc = qf.contiguous(), kf.contiguous(), vf.contiguous()
@@ -796,9 +875,14 @@ def _moe_layer(h, ld, fvk, device):
     tw, ti = torch.topk(logit, TOPK, -1)
     tw = tw / tw.sum(-1, keepdim=True)
 
-    if _USE_BT_MOE and x.shape[0] >= _M16_MIN_S:
+    # The block-scaled 4-bit MMA tiles are a build tier, not a given: a target
+    # whose toolchain has no block-scaled mma builds the weight-only tier
+    # instead. Ask the module what it has rather than assuming, so the tile
+    # choice degrades to the grouped GEMV instead of raising mid-prefill.
+    big = x.shape[0] >= _M16_MIN_S
+    if _USE_BT_MOE and big and hasattr(fvk, 'moe_blocktile_mma_sm120_bf16'):
         out = _moe_experts_bt(x, ti, tw, ld, fvk, device)
-    elif _USE_M16_MOE and x.shape[0] >= _M16_MIN_S:
+    elif _USE_M16_MOE and big and hasattr(fvk, 'moe_m16_mma_sm120_bf16'):
         out = _moe_experts_m16(x, ti, tw, ld, fvk, device)
     elif _USE_GROUPED_MOE:
         out = _moe_experts_grouped(x, ti, tw, ld, fvk, device)

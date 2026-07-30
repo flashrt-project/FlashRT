@@ -282,6 +282,21 @@ class Qwen36MoeTextFrontendRtx(Nexn2TorchFrontendRtx):
     _MODEL_LABEL = "Qwen3.6-35B-A3B text"
     _USAGE_DOC = "docs/qwen36_moe_usage.md"
 
+    # The block-scaled 4-bit MMA tier is a build tier, and the prefill now picks
+    # its MoE tile from what the module actually has: without the tier it uses
+    # the weight-only grouped GEMV, which is slower on a long prompt and
+    # otherwise identical. So the tier is a performance requirement, not a
+    # correctness one, and demanding it here would refuse a build -- a Jetson
+    # one, whose toolchain has no block-scaled mma -- that runs this correctly.
+    _REQUIRED_KERNELS = tuple(
+        name for name in Nexn2TorchFrontendRtx._REQUIRED_KERNELS
+        if not name.startswith(('moe_blocktile_mma', 'moe_m16_mma'))
+    ) + ('moe_grouped_w4a16_sm120_bf16',)
+
+    # Same for FA2: prefill and decode both probe the vendored kernel and fall
+    # back to a reference, so a target that builds FA4 instead still runs.
+    _REQUIRE_FA2 = False
+
     def __init__(self, checkpoint_path: str, *,
                  device: str = "cuda:0",
                  max_seq: int = 2048,
