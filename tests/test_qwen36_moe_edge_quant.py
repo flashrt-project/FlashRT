@@ -213,6 +213,21 @@ def test_windowing_does_not_reduce_reads_an_lru_already_serves():
         "decode_misses_per_token"]
 
 
+def test_requests_keep_the_router_order_so_eviction_matches_the_cache():
+    # Within one request the insertion order decides which entry is oldest, so
+    # it changes what the next eviction picks. The cache dedupes preserving the
+    # router's order; a simulator that iterated a set instead would model a
+    # different cache. Quota 2 with three distinct experts makes the choice
+    # observable: after [7, 3] the oldest is 7, so requesting 9 must evict 7 and
+    # leave 3 -- and the following request for 3 must then hit.
+    trace = [[[7, 3], [9], [3]]]
+
+    result = simulate_warm_lru(trace, prompt_tokens=0, quota=2)
+
+    assert result["decode_misses_per_token"] == 1.0    # 7, 3, 9 miss; 3 hits
+    assert result["distinct_hit_rate"] == 0.25
+
+
 def test_cold_prefill_counts_the_union_prefill_touches():
     # Prefill routes each token independently, so a layer costs the union of
     # its tokens' selections, less whatever is already resident.

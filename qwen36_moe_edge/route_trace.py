@@ -177,11 +177,15 @@ def simulate_warm_lru(
                 cache[expert] = None
         steps = layer_trace[prompt_tokens:]
         for start in range(0, len(steps) - window + 1, window):
-            requested = {
+            # Order-preserving dedupe, matching what the cache does. Within one
+            # request the insertion order decides which entry becomes the
+            # oldest, so it changes what a later eviction picks: iterating a set
+            # instead put this 0.25 % away from the measured cache.
+            requested = dict.fromkeys(
                 expert
                 for step in steps[start:start + window]
                 for expert in step
-            }
+            )
             if index == 0:
                 tokens += window
             for expert in requested:
