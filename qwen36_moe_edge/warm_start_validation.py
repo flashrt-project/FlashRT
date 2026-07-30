@@ -143,6 +143,10 @@ def main() -> None:
     parser.add_argument("--max-seq", type=int, default=128)
     parser.add_argument("--quotas", default="43,57,64")
     parser.add_argument("--block-bytes", type=int, default=DEFAULT_BLOCK_BYTES)
+    parser.add_argument(
+        "--save-traces", type=Path,
+        help="write the per-prompt traces, so a warm set built from some of "
+             "them can be replayed against another on real hardware")
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
 
@@ -161,6 +165,14 @@ def main() -> None:
         max_seq=args.max_seq,
         device=args.device,
     )
+
+    if args.save_traces is not None:
+        args.save_traces.parent.mkdir(parents=True, exist_ok=True)
+        with args.save_traces.open("w", encoding="utf-8") as f:
+            json.dump({"prompt_tokens": args.prompt_tokens,
+                       "traces": traces}, f)
+            f.write("\n")
+        print(f"wrote {len(traces)} traces to {args.save_traces}")
 
     quotas = tuple(int(value) for value in args.quotas.split(","))
     report = {"prompt_count": len(prompts), "quotas": list(quotas),
