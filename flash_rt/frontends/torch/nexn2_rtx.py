@@ -36,11 +36,18 @@ _REQUIRED_FVK = (
 
 def _require_kernels(
         fvk, *, model_label: str = "Nex-N2",
-        usage_doc: str = "docs/nexn2_usage.md") -> None:
+        usage_doc: str = "docs/nexn2_usage.md",
+        required=None) -> None:
     """Raise a clear RuntimeError if the gated qwen3_5_moe kernels or the FA2
     module are missing (build was not configured with
-    -DFLASHRT_ENABLE_QWEN35MOE=ON, or flash_rt_fa2 is absent)."""
-    missing = [s for s in _REQUIRED_FVK if not hasattr(fvk, s)]
+    -DFLASHRT_ENABLE_QWEN35MOE=ON, or flash_rt_fa2 is absent).
+
+    ``required`` lets a configuration that calls fewer kernels say so. A list
+    demanding more than a path uses turns a working build into a refusal; one
+    demanding less lets a missing symbol surface mid-forward. Both are wrong,
+    so the list belongs with whatever decides which kernels get called.
+    """
+    missing = [s for s in (required or _REQUIRED_FVK) if not hasattr(fvk, s)]
     if missing:
         raise RuntimeError(
             f"{model_label} kernelized path needs the qwen3_5_moe SM120 "
@@ -66,6 +73,10 @@ def _require_kernels(
 
 class Nexn2TorchFrontendRtx:
     """Nex-N2-mini inference frontend (PyTorch + RTX SM120)."""
+
+    # Kernels this configuration calls; a subclass whose path calls fewer
+    # narrows it. See _require_kernels.
+    _REQUIRED_KERNELS = _REQUIRED_FVK
 
     _MODEL_LABEL = "Nex-N2"
     _USAGE_DOC = "docs/nexn2_usage.md"
@@ -160,6 +171,7 @@ class Nexn2TorchFrontendRtx:
             fvk,
             model_label=self._MODEL_LABEL,
             usage_doc=self._USAGE_DOC,
+            required=self._REQUIRED_KERNELS,
         )
 
         self._fvk = fvk

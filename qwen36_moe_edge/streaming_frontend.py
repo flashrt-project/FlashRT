@@ -28,6 +28,17 @@ class Qwen36MoeStreamingFrontend(Qwen36MoeTextFrontendRtx):
 
     _MODEL_LABEL = "Qwen3.6-35B-A3B text, streamed experts"
 
+    # The block-scaled 4-bit MMA kernels are absent from this list because this
+    # path never calls them: they serve the batched prefill, and streaming runs
+    # prefill through the per-token loop instead, since a miss issues host reads.
+    # Demanding them would refuse a build that can run this perfectly well --
+    # which is what happened on the first attempt, on a target where the tier is
+    # correctly not built at all.
+    _REQUIRED_KERNELS = tuple(
+        name for name in Qwen36MoeTextFrontendRtx._REQUIRED_KERNELS
+        if not name.startswith(('moe_blocktile_mma', 'moe_m16_mma'))
+    ) + ('qwen35moe_e0m3_dequant_bf16', 'bf16_matvec_sm120_bf16')
+
     def __init__(self, checkpoint_path: str, bundle: str | Path, *,
                  slots_per_layer: int,
                  device: str = "cuda:0",
