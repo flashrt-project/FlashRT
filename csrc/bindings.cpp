@@ -178,22 +178,26 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS
 #include "kernels/qwen36_misc.cuh"
 #endif
-#ifdef FLASHRT_HAVE_QWEN35MOE
+#ifdef FLASHRT_HAVE_QWEN35MOE_CORE
 #include "kernels/qwen35moe_layout.cuh"
-#include "kernels/moe_grouped_gemv_sm120.cuh"
 #include "kernels/bf16_matvec_sm120.cuh"
-#include "kernels/w4a16_matvec_sm120.cuh"
-#include "kernels/moe_grouped_w4a16_sm120.cuh"
 #include "kernels/gdn_recurrent_seq_sm120.cuh"
 #include "kernels/act_fuse_sm120.cuh"
 #include "kernels/moe_router_topk_sm120.cuh"
+#include "kernels/moe_weighted_sum_sm120.cuh"
+#include "kernels/w16a16_gemm_sm120.cuh"
+#endif  // FLASHRT_HAVE_QWEN35MOE_CORE
+#ifdef FLASHRT_HAVE_QWEN35MOE_W4A16
+#include "kernels/w4a16_matvec_sm120.cuh"
+#include "kernels/moe_grouped_w4a16_sm120.cuh"
+#include "kernels/w4a16_gemm_sm120.cuh"
+#endif  // FLASHRT_HAVE_QWEN35MOE_W4A16
+#ifdef FLASHRT_HAVE_QWEN35MOE_W4A4
+#include "kernels/moe_grouped_gemv_sm120.cuh"
 #include "kernels/moe_m16_mma_sm120.cuh"
 #include "kernels/moe_m64_mma_sm120.cuh"
 #include "kernels/moe_blocktile_mma_sm120.cuh"
-#include "kernels/moe_weighted_sum_sm120.cuh"
-#include "kernels/w4a16_gemm_sm120.cuh"
-#include "kernels/w16a16_gemm_sm120.cuh"
-#endif  // FLASHRT_HAVE_QWEN35MOE
+#endif  // FLASHRT_HAVE_QWEN35MOE_W4A4
 #include "kernels/bf16_matvec_qwen36.cuh"
 #include "kernels/bf16_matmul_bf16.cuh"
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS
@@ -5384,7 +5388,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("S"), py::arg("stream") = 0);
 #endif  // FLASHRT_HAVE_QWEN36_KERNELS (gated_deltanet_qwen36 part 1)
 
-#ifdef FLASHRT_HAVE_QWEN35MOE
+#ifdef FLASHRT_HAVE_QWEN35MOE_CORE
     m.def("qwen35moe_lin_split_qkv_broadcast_bf16",
         [](uintptr_t conv_out, uintptr_t q32,
            uintptr_t k32, uintptr_t v32,
@@ -5417,61 +5421,6 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("x"), py::arg("W"), py::arg("out"),
         py::arg("N"), py::arg("K"), py::arg("stream") = 0);
 
-    m.def("w4a16_matvec_sm120_bf16",
-        [](uintptr_t x, uintptr_t W, uintptr_t sfb, uintptr_t out,
-           int N, int K, float alpha, uintptr_t stream) -> int {
-            return flash_rt::kernels::w4a16_matvec_sm120_bf16(
-                to_ptr(x), to_ptr(W), to_ptr(sfb), to_ptr(out),
-                N, K, alpha, to_stream(stream));
-        },
-        py::arg("x"), py::arg("W"), py::arg("sfb"), py::arg("out"),
-        py::arg("N"), py::arg("K"), py::arg("alpha"), py::arg("stream") = 0);
-
-    m.def("moe_m16_mma_sm120_bf16",
-        [](uintptr_t A, uintptr_t B, uintptr_t sfa, uintptr_t sfb, uintptr_t D,
-           uintptr_t alpha, uintptr_t te, int num_tiles, int N, int K,
-           long sfa_stride, long w_stride, long sfb_stride,
-           uintptr_t stream) -> int {
-            return flash_rt::gemm::moe_m16_mma_sm120_bf16(
-                to_ptr(A), to_ptr(B), to_ptr(sfa), to_ptr(sfb), to_ptr(D),
-                to_ptr(alpha), to_ptr(te), num_tiles, N, K,
-                sfa_stride, w_stride, sfb_stride, to_stream(stream));
-        },
-        py::arg("A"), py::arg("B"), py::arg("sfa"), py::arg("sfb"),
-        py::arg("D"), py::arg("alpha"), py::arg("te"), py::arg("num_tiles"),
-        py::arg("N"), py::arg("K"), py::arg("sfa_stride"), py::arg("w_stride"),
-        py::arg("sfb_stride"), py::arg("stream") = 0);
-
-    m.def("moe_m64_mma_sm120_bf16",
-        [](uintptr_t A, uintptr_t B, uintptr_t sfa, uintptr_t sfb, uintptr_t D,
-           uintptr_t alpha, uintptr_t te, int num_tiles, int N, int K,
-           long sfa_stride, long w_stride, long sfb_stride,
-           uintptr_t stream) -> int {
-            return flash_rt::gemm::moe_m64_mma_sm120_bf16(
-                to_ptr(A), to_ptr(B), to_ptr(sfa), to_ptr(sfb), to_ptr(D),
-                to_ptr(alpha), to_ptr(te), num_tiles, N, K,
-                sfa_stride, w_stride, sfb_stride, to_stream(stream));
-        },
-        py::arg("A"), py::arg("B"), py::arg("sfa"), py::arg("sfb"),
-        py::arg("D"), py::arg("alpha"), py::arg("te"), py::arg("num_tiles"),
-        py::arg("N"), py::arg("K"), py::arg("sfa_stride"), py::arg("w_stride"),
-        py::arg("sfb_stride"), py::arg("stream") = 0);
-
-    m.def("moe_blocktile_mma_sm120_bf16",
-        [](uintptr_t A, uintptr_t B, uintptr_t sfa, uintptr_t sfb, uintptr_t D,
-           uintptr_t alpha, uintptr_t te, int num_tiles, int N, int K,
-           long sfa_stride, long w_stride, long sfb_stride,
-           uintptr_t stream) -> int {
-            return flash_rt::gemm::moe_blocktile_mma_sm120_bf16(
-                to_ptr(A), to_ptr(B), to_ptr(sfa), to_ptr(sfb), to_ptr(D),
-                to_ptr(alpha), to_ptr(te), num_tiles, N, K,
-                sfa_stride, w_stride, sfb_stride, to_stream(stream));
-        },
-        py::arg("A"), py::arg("B"), py::arg("sfa"), py::arg("sfb"),
-        py::arg("D"), py::arg("alpha"), py::arg("te"), py::arg("num_tiles"),
-        py::arg("N"), py::arg("K"), py::arg("sfa_stride"), py::arg("w_stride"),
-        py::arg("sfb_stride"), py::arg("stream") = 0);
-
     m.def("moe_weighted_sum_sm120_bf16",
         [](uintptr_t d_dn, uintptr_t rows, uintptr_t tw, uintptr_t out,
            int S, int TOPK, int HID, int dn_stride, uintptr_t stream) -> int {
@@ -5482,17 +5431,6 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("d_dn"), py::arg("rows"), py::arg("tw"), py::arg("out"),
         py::arg("S"), py::arg("TOPK"), py::arg("HID"), py::arg("dn_stride"),
         py::arg("stream") = 0);
-
-    m.def("w4a16_gemm_sm120_bf16",
-        [](uintptr_t X, uintptr_t W, uintptr_t SFB, uintptr_t Y,
-           int M, int N, int K, float alpha, uintptr_t stream) -> int {
-            return flash_rt::gemm::w4a16_gemm_sm120_bf16(
-                to_ptr(X), to_ptr(W), to_ptr(SFB), to_ptr(Y),
-                M, N, K, alpha, to_stream(stream));
-        },
-        py::arg("X"), py::arg("W"), py::arg("SFB"), py::arg("Y"),
-        py::arg("M"), py::arg("N"), py::arg("K"),
-        py::arg("alpha") = 1.0f, py::arg("stream") = 0);
 
     m.def("w16a16_gemm_sm120_bf16",
         [](uintptr_t X, uintptr_t W, uintptr_t Y,
@@ -5546,6 +5484,29 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("state"), py::arg("out"), py::arg("S"), py::arg("num_v_heads"),
         py::arg("head_dim"), py::arg("use_qk_l2norm") = true,
         py::arg("stream") = 0);
+#endif  // FLASHRT_HAVE_QWEN35MOE_CORE
+
+#ifdef FLASHRT_HAVE_QWEN35MOE_W4A16
+    m.def("w4a16_matvec_sm120_bf16",
+        [](uintptr_t x, uintptr_t W, uintptr_t sfb, uintptr_t out,
+           int N, int K, float alpha, uintptr_t stream) -> int {
+            return flash_rt::kernels::w4a16_matvec_sm120_bf16(
+                to_ptr(x), to_ptr(W), to_ptr(sfb), to_ptr(out),
+                N, K, alpha, to_stream(stream));
+        },
+        py::arg("x"), py::arg("W"), py::arg("sfb"), py::arg("out"),
+        py::arg("N"), py::arg("K"), py::arg("alpha"), py::arg("stream") = 0);
+
+    m.def("w4a16_gemm_sm120_bf16",
+        [](uintptr_t X, uintptr_t W, uintptr_t SFB, uintptr_t Y,
+           int M, int N, int K, float alpha, uintptr_t stream) -> int {
+            return flash_rt::gemm::w4a16_gemm_sm120_bf16(
+                to_ptr(X), to_ptr(W), to_ptr(SFB), to_ptr(Y),
+                M, N, K, alpha, to_stream(stream));
+        },
+        py::arg("X"), py::arg("W"), py::arg("SFB"), py::arg("Y"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("alpha") = 1.0f, py::arg("stream") = 0);
 
     m.def("moe_grouped_w4a16_sm120_bf16",
         [](uintptr_t A, uintptr_t W, uintptr_t sfb, uintptr_t alpha,
@@ -5560,6 +5521,53 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("A"), py::arg("W"), py::arg("sfb"), py::arg("alpha"),
         py::arg("eidx"), py::arg("D"), py::arg("slots"), py::arg("N"),
         py::arg("K"), py::arg("a_stride"), py::arg("w_stride"),
+        py::arg("sfb_stride"), py::arg("stream") = 0);
+#endif  // FLASHRT_HAVE_QWEN35MOE_W4A16
+
+#ifdef FLASHRT_HAVE_QWEN35MOE_W4A4
+    m.def("moe_m16_mma_sm120_bf16",
+        [](uintptr_t A, uintptr_t B, uintptr_t sfa, uintptr_t sfb, uintptr_t D,
+           uintptr_t alpha, uintptr_t te, int num_tiles, int N, int K,
+           long sfa_stride, long w_stride, long sfb_stride,
+           uintptr_t stream) -> int {
+            return flash_rt::gemm::moe_m16_mma_sm120_bf16(
+                to_ptr(A), to_ptr(B), to_ptr(sfa), to_ptr(sfb), to_ptr(D),
+                to_ptr(alpha), to_ptr(te), num_tiles, N, K,
+                sfa_stride, w_stride, sfb_stride, to_stream(stream));
+        },
+        py::arg("A"), py::arg("B"), py::arg("sfa"), py::arg("sfb"),
+        py::arg("D"), py::arg("alpha"), py::arg("te"), py::arg("num_tiles"),
+        py::arg("N"), py::arg("K"), py::arg("sfa_stride"), py::arg("w_stride"),
+        py::arg("sfb_stride"), py::arg("stream") = 0);
+
+    m.def("moe_m64_mma_sm120_bf16",
+        [](uintptr_t A, uintptr_t B, uintptr_t sfa, uintptr_t sfb, uintptr_t D,
+           uintptr_t alpha, uintptr_t te, int num_tiles, int N, int K,
+           long sfa_stride, long w_stride, long sfb_stride,
+           uintptr_t stream) -> int {
+            return flash_rt::gemm::moe_m64_mma_sm120_bf16(
+                to_ptr(A), to_ptr(B), to_ptr(sfa), to_ptr(sfb), to_ptr(D),
+                to_ptr(alpha), to_ptr(te), num_tiles, N, K,
+                sfa_stride, w_stride, sfb_stride, to_stream(stream));
+        },
+        py::arg("A"), py::arg("B"), py::arg("sfa"), py::arg("sfb"),
+        py::arg("D"), py::arg("alpha"), py::arg("te"), py::arg("num_tiles"),
+        py::arg("N"), py::arg("K"), py::arg("sfa_stride"), py::arg("w_stride"),
+        py::arg("sfb_stride"), py::arg("stream") = 0);
+
+    m.def("moe_blocktile_mma_sm120_bf16",
+        [](uintptr_t A, uintptr_t B, uintptr_t sfa, uintptr_t sfb, uintptr_t D,
+           uintptr_t alpha, uintptr_t te, int num_tiles, int N, int K,
+           long sfa_stride, long w_stride, long sfb_stride,
+           uintptr_t stream) -> int {
+            return flash_rt::gemm::moe_blocktile_mma_sm120_bf16(
+                to_ptr(A), to_ptr(B), to_ptr(sfa), to_ptr(sfb), to_ptr(D),
+                to_ptr(alpha), to_ptr(te), num_tiles, N, K,
+                sfa_stride, w_stride, sfb_stride, to_stream(stream));
+        },
+        py::arg("A"), py::arg("B"), py::arg("sfa"), py::arg("sfb"),
+        py::arg("D"), py::arg("alpha"), py::arg("te"), py::arg("num_tiles"),
+        py::arg("N"), py::arg("K"), py::arg("sfa_stride"), py::arg("w_stride"),
         py::arg("sfb_stride"), py::arg("stream") = 0);
 
     m.def("moe_grouped_gemv_sm120_bf16",
@@ -5583,7 +5591,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("a_stride"), py::arg("sfa_stride"),
         py::arg("w_stride"), py::arg("sfb_stride"),
         py::arg("stream") = 0);
-#endif  // FLASHRT_HAVE_QWEN35MOE
+#endif  // FLASHRT_HAVE_QWEN35MOE_W4A4
 
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS
     m.def("qwen36_gdn_gating_bf16",

@@ -31,6 +31,25 @@ cmake --build build -j
 pip install -e ".[torch]"
 ```
 
+### Kernel tiers
+
+`FLASHRT_ENABLE_QWEN35MOE=ON` is a convenience switch for all three tiers
+below. Targets that cannot run a tier can select the remainder explicitly.
+
+| Flag | Kernels | Requires |
+|---|---|---|
+| `FLASHRT_ENABLE_QWEN35MOE_CORE` | QKV layout/split, bf16 matvec, router top-k, SiLU/sigmoid fusion, GDN recurrence, weighted-sum reducer, bf16 GEMM | SM80 and newer |
+| `FLASHRT_ENABLE_QWEN35MOE_W4A16` | weight-only 4-bit matvec, grouped matvec, GEMM | SM80 and newer; hardware operand conversion from SM89 |
+| `FLASHRT_ENABLE_QWEN35MOE_W4A4` | block-scaled 4-bit MMA: grouped GEMV, M16/M64/block-tile MMA | sm_120a / sm_121a |
+
+The upper tiers depend on the core tier, so enabling either turns it on. The
+SM120 text runtime documented here needs all three.
+
+`_W4A4` refuses to configure on a target without block-scaled MMA. CUTLASS
+still compiles those translation units elsewhere, but substitutes
+`CUTE_INVALID_CONTROL_PATH` for the MMA, so the build would succeed and then
+fail at run time. The explicit gate turns that into a configure-time error.
+
 ## Usage
 
 ```python
