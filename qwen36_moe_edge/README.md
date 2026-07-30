@@ -85,6 +85,20 @@ Each quota is scored under three policies:
   decode phase. Not implementable; it bounds what a better warm-set heuristic
   could add.
 
+On Qwen3.6-35B-A3B the plain LRU wins from 16 slots per layer up, and its
+margin grows with prompt length — at 43 slots per layer, 0.745 against 0.731
+for a 32-token prompt and 0.711 against 0.664 for a 128-token prompt. Once a
+per-layer quota exists, recency predicts this router's next selections better
+than prompt-phase frequency, and a longer prompt makes the frequency estimate
+more diffuse rather than more reliable. The oracle variant stays ahead of both
+(0.776 at 43 slots for the 128-token prompt), so pinning is sound and the
+prompt-derived choice of what to pin is what falls short. Treat the policy as
+something to measure per checkpoint, not to assume.
+
+Capacity dominates policy either way: going from 43 to 64 slots per layer cuts
+read volume by a third, while any policy change at a fixed quota moves it by a
+few percent.
+
 `--block-bytes` (default: the INT4 group-16 block) and `--bandwidths` turn
 misses per token into a read volume and the token rate each storage bandwidth
 would allow, which is the number that decides whether a memory budget is

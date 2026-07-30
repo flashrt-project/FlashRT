@@ -9,10 +9,22 @@ Two cache policies are simulated from the same trace:
     whatever the end of the prompt happened to use.
 
 ``simulate_two_tier``
-    A per-layer warm set chosen from the prompt and never evicted, plus a
-    small LRU ring for everything else. Prefill can no longer displace the
-    warm set, so the decode hit rate follows warm-set coverage instead of
-    prompt churn.
+    A per-layer warm set chosen from prompt-phase selection counts and never
+    evicted, plus a small LRU ring for everything else. Prefill cannot
+    displace the warm set, so the decode hit rate follows warm-set coverage
+    rather than what the end of the prompt happened to leave behind.
+
+Which is better is a property of the checkpoint, not a foregone conclusion.
+On Qwen3.6-35B-A3B, with a per-layer quota already in place, the plain LRU
+wins at every quota from 16 slots up, and its margin *grows* with prompt
+length: at 43 slots per layer it reaches 0.745 against 0.731 for a 32-token
+prompt and 0.711 against 0.664 for a 128-token prompt. Recency predicts this
+router's next selections better than prompt-phase frequency does, and a longer
+prompt makes the frequency estimate more diffuse rather than more reliable.
+
+The oracle variant is consistently best, so pinning itself is not the problem
+— the prompt-derived choice of what to pin is. Measure before committing a
+runtime to either policy.
 
 The reported miss count per token, multiplied by the expert block size, is the
 per-token read volume a streaming runtime has to sustain.
