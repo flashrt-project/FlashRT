@@ -468,7 +468,19 @@ def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None,
     _conv = getattr(fvk, 'causal_conv1d_qwen36_rows_bf16',
                     fvk.causal_conv1d_qwen36_bf16)
     convw_k = convw.reshape(CONV, KS).contiguous()
-    if conv_hist is not None:
+    xc = torch.empty(B, S, CONV, dtype=torch.bfloat16, device=device)
+    _hist_conv = getattr(fvk, 'causal_conv1d_qwen36_rows_hist_bf16', None)
+    if conv_hist is not None and _hist_conv is not None:
+        # The conv reads the previous block's trailing inputs where it needs
+        # them. Prepending them to the activations instead meant concatenating
+        # and then slicing the whole block back off -- two copies of it per
+        # layer, 691 ms of a 32768-token prefill, to supply three tokens.
+        # conv_hist is already (1, CONV, KS-1), newest last, which is the
+        # layout the kernel reads, so the transpose goes with the copy.
+        _hist_conv(mixed.contiguous().data_ptr(), convw_k.data_ptr(), 0,
+                   conv_hist.contiguous().data_ptr(), xc.data_ptr(),
+                   B, S, CONV, KS, True, _cs())
+    elif conv_hist is not None:
         hist = conv_hist[0].transpose(0, 1).reshape(1, KS - 1, CONV)
         mixed_ext = torch.cat(
             [hist.to(mixed.dtype), mixed], dim=1).contiguous()
@@ -478,7 +490,6 @@ def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None,
               xc_ext.data_ptr(), B, Se, CONV, KS, True, _cs())
         xc = xc_ext[:, KS - 1:, :].contiguous()
     else:
-        xc = torch.empty(B, S, CONV, dtype=torch.bfloat16, device=device)
         _conv(mixed.contiguous().data_ptr(), convw_k.data_ptr(), 0,
               xc.data_ptr(), B, S, CONV, KS, True, _cs())
     # split conv output + broadcast q/k 16 -> 32 heads in one fvk kernel.

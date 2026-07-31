@@ -24,6 +24,7 @@ __global__ void causal_conv1d_rows_kernel(
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ w,
     const __nv_bfloat16* __restrict__ bias,
+    const __nv_bfloat16* __restrict__ hist,
     __nv_bfloat16* __restrict__ out,
     int B, int S, int conv_dim, int k,
     bool apply_silu)
@@ -43,16 +44,24 @@ __global__ void causal_conv1d_rows_kernel(
 
   const size_t base = static_cast<size_t>(b) * S * conv_dim + c;
 
-  // win[j] holds x[s0 - (k-1) + j], the window the first output needs. Reads
-  // before the start of the sequence are zero, which is what the causal
-  // convolution means there.
+  // win[j] holds x[s0 - (k-1) + j], the window the first output needs. Before
+  // the start of this block that is the previous block's trailing inputs when
+  // there are any, and zero when the sequence itself starts here.
   float win[kMaxK];
   #pragma unroll
   for (int j = 0; j < kMaxK; ++j) {
     const int t = s0 - (k - 1) + j;
-    win[j] = (j < k && t >= 0 && t < S)
-        ? static_cast<float>(x[base + static_cast<size_t>(t) * conv_dim])
-        : 0.0f;
+    if (j >= k) { win[j] = 0.0f; continue; }
+    if (t >= 0 && t < S) {
+      win[j] = static_cast<float>(x[base + static_cast<size_t>(t) * conv_dim]);
+    } else if (t < 0 && hist != nullptr) {
+      // hist is (B, conv_dim, k-1), newest last: t == -1 is the final column.
+      const int hj = t + (k - 1);
+      win[j] = static_cast<float>(
+          hist[(static_cast<size_t>(b) * conv_dim + c) * (k - 1) + hj]);
+    } else {
+      win[j] = 0.0f;
+    }
   }
 
   #pragma unroll
@@ -92,6 +101,25 @@ void causal_conv1d_qwen36_rows_bf16(
 {
   if (B <= 0 || S <= 0 || conv_dim <= 0 || k <= 0 || k > kMaxK) return;
 
+  causal_conv1d_qwen36_rows_hist_bf16(x, w, bias, nullptr, out, B, S,
+                                      conv_dim, k, apply_silu, stream);
+}
+
+void causal_conv1d_qwen36_rows_hist_bf16(
+    const void* x,
+    const void* w,
+    const void* bias,
+    const void* hist,
+    void*       out,
+    int B,
+    int S,
+    int conv_dim,
+    int k,
+    bool apply_silu,
+    cudaStream_t stream)
+{
+  if (B <= 0 || S <= 0 || conv_dim <= 0 || k <= 0 || k > kMaxK) return;
+
   constexpr int kRows = 8;
   const dim3 block(kThreadsX);
   const dim3 grid((conv_dim + kThreadsX - 1) / kThreadsX,
@@ -101,6 +129,7 @@ void causal_conv1d_qwen36_rows_bf16(
       reinterpret_cast<const __nv_bfloat16*>(x),
       reinterpret_cast<const __nv_bfloat16*>(w),
       reinterpret_cast<const __nv_bfloat16*>(bias),
+      reinterpret_cast<const __nv_bfloat16*>(hist),
       reinterpret_cast<__nv_bfloat16*>(out),
       B, S, conv_dim, k, apply_silu);
 }
