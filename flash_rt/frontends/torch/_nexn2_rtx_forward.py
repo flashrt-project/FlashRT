@@ -1071,8 +1071,20 @@ def _moe_experts_grouped_gemm(x, ti, tw, ld, fvk, device):
     d_dn = torch.empty(slots, n_dn, dtype=torch.bfloat16, device=device)
     project(inter, INTER, n_dn, dn_p, dn_s, dn_a, d_dn)
 
-    out = torch.zeros(S, HID, device=device)
-    out.index_add_(0, stok, d_dn.float() * sw.unsqueeze(-1))
+    # Deterministic unpermute, the same one the block-tile path uses: invert the
+    # routing permutation and let one kernel sum each token's TOPK rows in fixed
+    # order. index_add_ was 37.8 ms of a 1024-token prefill and reduces through
+    # atomics, so its order varies -- which prefill cannot afford, since it
+    # seeds a decode that has to be reproducible.
+    inv = torch.empty(slots, dtype=torch.long, device=device)
+    inv[order] = torch.arange(slots, device=device)
+    rows = (torch.arange(slots, dtype=torch.int32, device=device)[inv]
+            ).contiguous()
+    out = torch.empty(S, HID, dtype=torch.float32, device=device)
+    fvk.moe_weighted_sum_sm120_bf16(
+        d_dn.data_ptr(), rows.data_ptr(),
+        tw.reshape(S, TOPK).contiguous().data_ptr(), out.data_ptr(),
+        S, TOPK, n_dn, n_dn, _cs())
     return out
 
 
