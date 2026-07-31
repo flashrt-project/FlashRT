@@ -623,6 +623,15 @@ def _sdpa_causal_attn(qf, kf, vf, device):
     Sq, Sk = qf.shape[1], kf.shape[1]
     q = qf.transpose(1, 2)                               # (1, NQ, Sq, HD)
     k, v = kf.transpose(1, 2), vf.transpose(1, 2)        # (1, NKV, Sk, HD)
+    # An explicit mask forces the math backend, which materialises the scores
+    # and runs them through SIMT fp32 GEMMs -- 131.7 ms of a 2048-token prefill
+    # in twenty launches, growing as S^2. When the block is square the two
+    # causal conventions coincide, so say is_causal and let the fused backend
+    # take it; the mask is only needed when Sq < Sk, which is chunked prefill.
+    if Sq == Sk:
+        return F.scaled_dot_product_attention(
+            q, k, v, is_causal=True, scale=float(HD) ** -0.5, enable_gqa=True
+        ).transpose(1, 2).contiguous()
     qi = torch.arange(Sk - Sq, Sk, device=device).unsqueeze(1)
     mask = torch.arange(Sk, device=device).unsqueeze(0) <= qi
     try:
