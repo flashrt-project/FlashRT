@@ -2822,6 +2822,7 @@ __global__ void moe_grouped_quant_nvfp4_kernel(
     const int* __restrict__ expert_of_row,
     const int* __restrict__ group_off,
     const int* __restrict__ sfa_off,
+    const long* __restrict__ src_row,
     uint8_t* __restrict__ fp4_data,
     uint8_t* __restrict__ scale_factors,
     int cols, int num_blocks, int n_col_blocks)
@@ -2829,7 +2830,13 @@ __global__ void moe_grouped_quant_nvfp4_kernel(
     const int row = blockIdx.x;
     const int e = expert_of_row[row];
     const int local = row - group_off[e];          // row index inside its group
-    const __nv_bfloat16* row_in = input + (size_t)row * cols;
+    // Gather while quantising when a permutation is given. Materialising the
+    // sorted activation first is a full read and a full write of an (S, HID)
+    // matrix per layer -- 14.5 ms of a 2048-token prefill -- for rows this
+    // kernel is about to read once anyway.
+    const size_t in_row = (src_row == nullptr) ? (size_t)row
+                                               : (size_t)src_row[row];
+    const __nv_bfloat16* row_in = input + in_row * cols;
     uint8_t* row_fp4 = fp4_data + (size_t)row * cols / 2;
     uint8_t* sf_base = scale_factors + sfa_off[e];
 
@@ -2887,7 +2894,7 @@ __global__ void moe_grouped_quant_nvfp4_kernel(
 
 int moe_grouped_quant_nvfp4_bf16(
     const void* A, const void* expert_of_row, const void* group_off,
-    const void* sfa_off, void* out_packed, void* out_sf,
+    const void* sfa_off, const void* src_row, void* out_packed, void* out_sf,
     int slots, int K, cudaStream_t stream)
 {
     if (!A || !expert_of_row || !group_off || !sfa_off || !out_packed
@@ -2902,6 +2909,7 @@ int moe_grouped_quant_nvfp4_bf16(
         reinterpret_cast<const int*>(expert_of_row),
         reinterpret_cast<const int*>(group_off),
         reinterpret_cast<const int*>(sfa_off),
+        reinterpret_cast<const long*>(src_row),
         reinterpret_cast<uint8_t*>(out_packed),
         reinterpret_cast<uint8_t*>(out_sf),
         K, num_blocks, n_col_blocks);

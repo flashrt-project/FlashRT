@@ -341,7 +341,7 @@ void dequant_int32_to_bf16(const int32_t* input, __nv_bfloat16* output,
 // K must be a multiple of 16. Returns 0 on success, nonzero on arg error.
 int moe_grouped_quant_nvfp4_bf16(
     const void* A, const void* expert_of_row, const void* group_off,
-    const void* sfa_off, void* out_packed, void* out_sf,
+    const void* sfa_off, const void* src_row, void* out_packed, void* out_sf,
     int slots, int K, cudaStream_t stream);
 
 // Gate and quantise in one pass: reads the grouped GEMM's merged (slots,

@@ -1029,6 +1029,26 @@ def _moe_experts_bt(x, ti, tw, ld, fvk, device):
 
 
 _GROUPED_SCRATCH = {}
+_ROUTE_CONST = {}
+
+
+def _route_constants(S, device):
+    """The parts of the routing permutation that depend only on the shape.
+
+    Each layer routes differently, but the token index per slot and the slot
+    index itself do not change -- they are a function of S alone, and every
+    layer was rebuilding both. Forty layers of arange + repeat_interleave is
+    launches and traffic spent to recompute a constant.
+    """
+    key = (S, str(device))
+    got = _ROUTE_CONST.get(key)
+    if got is None:
+        tok_flat = torch.arange(
+            S, device=device).repeat_interleave(TOPK).contiguous()
+        slot_ix = torch.arange(S * TOPK, device=device)
+        got = (tok_flat, slot_ix)
+        _ROUTE_CONST[key] = got
+    return got
 
 
 def _grouped_scratch(fvk, device):
@@ -1091,18 +1111,17 @@ def _moe_experts_grouped_gemm(x, ti, tw, ld, fvk, device):
     gu_a, dn_a = ld['experts_gate_up_alpha_dev'], ld['experts_down_alpha_dev']
     scratch, scratch_bytes = _grouped_scratch(fvk, device)
 
+    tok_flat, slot_ix = _route_constants(S, device)
     exp_flat = ti.reshape(-1).to(torch.int32)
-    tok_flat = torch.arange(S, device=device).repeat_interleave(TOPK)
     order = exp_flat.argsort(stable=True)
     se = exp_flat[order].contiguous()
     stok = tok_flat[order]
-    sw = tw.reshape(-1)[order]
 
     counts = torch.bincount(se, minlength=_N_EXPERTS)
     group_off = torch.zeros(_N_EXPERTS + 1, dtype=torch.int32, device=device)
     group_off[1:] = counts.cumsum(0).to(torch.int32)
 
-    def project(A, k, n, w_p, w_s, alpha, out, gate=False):
+    def project(A, k, n, w_p, w_s, alpha, out, gate=False, perm=None):
         sfa_off, n_col = _sf_layout(counts, k, device)
         bound = (_N_EXPERTS + slots // 128 + 1) * n_col * 512
         packed = torch.empty(slots, k // 2, dtype=torch.uint8, device=device)
@@ -1118,8 +1137,8 @@ def _moe_experts_grouped_gemm(x, ti, tw, ld, fvk, device):
         else:
             rc = fvk.moe_grouped_quant_nvfp4_bf16(
                 A.data_ptr(), se.data_ptr(), group_off.data_ptr(),
-                sfa_off.data_ptr(), packed.data_ptr(), sfa.data_ptr(),
-                slots, k, _cs())
+                sfa_off.data_ptr(), 0 if perm is None else perm.data_ptr(),
+                packed.data_ptr(), sfa.data_ptr(), slots, k, _cs())
         if rc:
             raise RuntimeError(f'grouped activation quant failed with {rc}')
         rc = fvk.moe_grouped_gemm_nvfp4_sm100_bf16out(
@@ -1132,7 +1151,7 @@ def _moe_experts_grouped_gemm(x, ti, tw, ld, fvk, device):
             raise RuntimeError(f'grouped MoE GEMM failed with {rc}')
 
     d_gu = torch.empty(slots, n_gu, dtype=torch.bfloat16, device=device)
-    project(x[stok].contiguous(), HID, n_gu, gu_p, gu_s, gu_a, d_gu)
+    project(x, HID, n_gu, gu_p, gu_s, gu_a, d_gu, perm=stok)
     d_dn = torch.empty(slots, n_dn, dtype=torch.bfloat16, device=device)
     project(d_gu, INTER, n_dn, dn_p, dn_s, dn_a, d_dn, gate=True)
 
@@ -1141,15 +1160,15 @@ def _moe_experts_grouped_gemm(x, ti, tw, ld, fvk, device):
     # order. index_add_ was 37.8 ms of a 1024-token prefill and reduces through
     # atomics, so its order varies -- which prefill cannot afford, since it
     # seeds a decode that has to be reproducible.
-    inv = torch.empty(slots, dtype=torch.long, device=device)
-    inv[order] = torch.arange(slots, device=device)
-    rows = (torch.arange(slots, dtype=torch.int32, device=device)[inv]
-            ).contiguous()
+    # rows[i] is which sorted row holds slot i, which is exactly the inverse
+    # permutation -- gathering arange through it, as the tiled path has to,
+    # would just reproduce it.
+    inv = torch.empty(slots, dtype=torch.int32, device=device)
+    inv[order] = slot_ix.to(torch.int32)
     out = torch.empty(S, HID, dtype=torch.float32, device=device)
     fvk.moe_weighted_sum_sm120_bf16(
-        d_dn.data_ptr(), rows.data_ptr(),
-        tw.reshape(S, TOPK).contiguous().data_ptr(), out.data_ptr(),
-        S, TOPK, n_dn, n_dn, _cs())
+        d_dn.data_ptr(), inv.data_ptr(), tw.contiguous().data_ptr(),
+        out.data_ptr(), S, TOPK, n_dn, n_dn, _cs())
     return out
 
 
