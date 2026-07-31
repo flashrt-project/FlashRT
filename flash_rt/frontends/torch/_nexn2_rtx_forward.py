@@ -609,6 +609,45 @@ def _fa2_usable(device):
     return _FA2_USABLE
 
 
+_FLEX_CACHE = {}
+
+
+def _flex_causal(sq, sk, device):
+    """A bottom-right-causal flex_attention closure for this block shape.
+
+    Block masks are built per (Sq, Sk) and cached, because a chunked prefill
+    revisits the same shapes as it walks the prompt. Returns None where flex is
+    unavailable, leaving the explicit-mask path to handle it.
+    """
+    key = (sq, sk, str(device))
+    got = _FLEX_CACHE.get(key)
+    if got is not None:
+        return got
+    if key in _FLEX_CACHE:
+        return None
+    try:
+        from torch.nn.attention.flex_attention import (
+            create_block_mask, flex_attention,
+        )
+
+        off = sk - sq
+
+        def mask_mod(b, h, q_idx, kv_idx):
+            return kv_idx <= q_idx + off
+
+        block_mask = create_block_mask(mask_mod, 1, NQ, sq, sk, device=device)
+
+        def run(q, k, v):
+            return flex_attention(q, k, v, block_mask=block_mask,
+                                  scale=float(HD) ** -0.5, enable_gqa=True)
+
+        _FLEX_CACHE[key] = run
+        return run
+    except Exception:                                        # noqa: BLE001
+        _FLEX_CACHE[key] = None
+        return None
+
+
 def _sdpa_causal_attn(qf, kf, vf, device):
     """Reference causal GQA attention, for a build without the FA2 kernel.
 
@@ -632,6 +671,15 @@ def _sdpa_causal_attn(qf, kf, vf, device):
         return F.scaled_dot_product_attention(
             q, k, v, is_causal=True, scale=float(HD) ** -0.5, enable_gqa=True
         ).transpose(1, 2).contiguous()
+    # A chunked block's window is bottom-right causal, which is_causal does not
+    # mean (measured: cos 0.24 against this mask, i.e. it silently truncates the
+    # history) and which a boolean mask only expresses by materialising the
+    # scores. flex_attention states it as a predicate and skips fully-masked
+    # blocks -- numerically right, cos 0.999997 -- but it compiles per shape,
+    # and a chunked prefill hands it a new (Sq, Sk) for every chunk: measured
+    # 10240 tokens 4071 -> 4330 ms, 16384 tokens 13858. Left out on that
+    # evidence; it becomes the right answer once the chunk shapes are fixed and
+    # warmed, which is where the long-context work goes next.
     qi = torch.arange(Sk - Sq, Sk, device=device).unsqueeze(1)
     mask = torch.arange(Sk, device=device).unsqueeze(0) <= qi
     try:
