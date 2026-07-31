@@ -125,6 +125,12 @@ __global__ void slot_hist_kernel(
 
 // One block per expert: exclusive scan of that expert's per-block counts, so a
 // scatter block knows where its own slots for that expert begin.
+//
+// Scanned across the block in tiles rather than by one thread in a loop. The
+// number of slot-blocks grows with the sequence, so a serial walk here is
+// O(S) on a single thread -- invisible at two thousand tokens, and the reason
+// the prefill rate fell away past four thousand.
+template <int kThreads>
 __global__ void expert_block_scan_kernel(
     const int* __restrict__ blk_hist,
     int* __restrict__ blk_off,
@@ -133,14 +139,34 @@ __global__ void expert_block_scan_kernel(
     int n_experts)
 {
   const int e = blockIdx.x;
-  if (threadIdx.x != 0) return;
-  int acc = 0;
-  for (int b = 0; b < n_blocks; ++b) {
+  const int t = threadIdx.x;
+  __shared__ int s[kThreads];
+  __shared__ int s_carry;
+  if (t == 0) s_carry = 0;
+  __syncthreads();
+
+  for (int base = 0; base < n_blocks; base += kThreads) {
+    const int b = base + t;
     const size_t off = static_cast<size_t>(b) * n_experts + e;
-    blk_off[off] = acc;
-    acc += blk_hist[off];
+    const int own = (b < n_blocks) ? blk_hist[off] : 0;
+    s[t] = own;
+    __syncthreads();
+
+    // Hillis-Steele inclusive scan; subtracting own value gives the exclusive
+    // one without a second pass.
+    for (int d = 1; d < kThreads; d <<= 1) {
+      const int add = (t >= d) ? s[t - d] : 0;
+      __syncthreads();
+      s[t] += add;
+      __syncthreads();
+    }
+    const int tile_total = s[kThreads - 1];
+    if (b < n_blocks) blk_off[off] = s_carry + s[t] - own;
+    __syncthreads();
+    if (t == 0) s_carry += tile_total;
+    __syncthreads();
   }
-  counts[e] = acc;
+  if (t == 0) counts[e] = s_carry;
 }
 
 __global__ void group_off_kernel(
@@ -290,7 +316,7 @@ int moe_route_prefill_bf16(
   slot_hist_kernel<<<nblk, kSlotsPerBlock, n_experts * sizeof(int), stream>>>(
       ti_i, blk_hist, slots, n_experts);
 
-  expert_block_scan_kernel<<<n_experts, 32, 0, stream>>>(
+  expert_block_scan_kernel<256><<<n_experts, 256, 0, stream>>>(
       blk_hist, blk_off, counts, nblk, n_experts);
 
   group_off_kernel<<<1, 32, 0, stream>>>(
