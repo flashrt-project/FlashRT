@@ -2907,3 +2907,90 @@ int moe_grouped_quant_nvfp4_bf16(
         K, num_blocks, n_col_blocks);
     return 0;
 }
+
+// ── Gate and quantise in one pass, for the grouped MoE's down projection ──
+//
+// The grouped GEMM produces gate and up interleaved in one (slots, 2*inter)
+// buffer, and the gate op wants them as two matrices. Slicing columns out of it
+// is not free: the halves are strided, so `.contiguous()` copies both -- 67 MB
+// a layer at 2048 tokens, to feed an op that then writes another 17 and has it
+// read straight back by the quantiser.
+//
+// Reading the merged buffer directly costs none of that. The silu is computed
+// and rounded to bf16 exactly as silu_mul_sm120_bf16 does, so the value that
+// reaches the quantiser is the same one it saw before.
+__global__ void moe_grouped_silu_quant_nvfp4_kernel(
+    const __nv_bfloat16* __restrict__ merged,     // (slots, 2 * inter)
+    const int* __restrict__ expert_of_row,
+    const int* __restrict__ group_off,
+    const int* __restrict__ sfa_off,
+    uint8_t* __restrict__ fp4_data,
+    uint8_t* __restrict__ scale_factors,
+    int inter, int num_blocks, int n_col_blocks)
+{
+    const int row = blockIdx.x;
+    const int e = expert_of_row[row];
+    const int local = row - group_off[e];
+    const __nv_bfloat16* g_in = merged + (size_t)row * 2 * inter;
+    const __nv_bfloat16* u_in = g_in + inter;
+    uint8_t* row_fp4 = fp4_data + (size_t)row * inter / 2;
+    uint8_t* sf_base = scale_factors + sfa_off[e];
+
+    extern __shared__ float smem[];               // inter gated values, then scales
+    float* gated = smem;
+    float* scales = smem + inter;
+
+    const int tid = threadIdx.x;
+    for (int i = tid; i < inter; i += blockDim.x) {
+        const float gv = __bfloat162float(g_in[i]);
+        const float uv = __bfloat162float(u_in[i]);
+        // Rounded to bf16 here, as the separate gate kernel does, so the
+        // quantiser downstream sees the identical value.
+        gated[i] = __bfloat162float(
+            __float2bfloat16_rn(gv / (1.0f + __expf(-gv)) * uv));
+    }
+    __syncthreads();
+
+    for (int b = tid; b < num_blocks; b += blockDim.x) {
+        float a = 0.0f;
+        #pragma unroll 4
+        for (int j = 0; j < 16; ++j) a = fmaxf(a, fabsf(gated[b * 16 + j]));
+        const uint8_t ue = float_to_ue4m3_ceil(a * (1.0f / 6.0f));
+        const int rb = local / 128, ri = local % 128;
+        sf_base[(rb * n_col_blocks + (b >> 2)) * 512 + (ri % 32) * 16
+                + (ri / 32) * 4 + (b & 3)] = ue;
+        scales[b] = ue4m3_to_float(ue);
+    }
+    __syncthreads();
+
+    const int half = inter >> 1;
+    for (int p = tid; p < half; p += blockDim.x) {
+        const int i = p * 2;
+        const float s = scales[i >> 4];
+        const float inv = (s > 0.0f) ? (1.0f / s) : 0.0f;
+        row_fp4[p] = (uint8_t)((float_to_fp4_e2m1(gated[i + 1] * inv) << 4)
+                               | (float_to_fp4_e2m1(gated[i] * inv) & 0x0F));
+    }
+}
+
+int moe_grouped_silu_quant_nvfp4_bf16(
+    const void* merged, const void* expert_of_row, const void* group_off,
+    const void* sfa_off, void* out_packed, void* out_sf,
+    int slots, int inter, cudaStream_t stream)
+{
+    if (!merged || !expert_of_row || !group_off || !sfa_off || !out_packed
+        || !out_sf) return 1;
+    if (slots <= 0 || inter <= 0 || (inter & 15) != 0) return 2;
+    const int num_blocks = inter / 16;
+    const int n_col_blocks = (num_blocks + 3) / 4;
+    const size_t smem = ((size_t)inter + num_blocks) * sizeof(float);
+    moe_grouped_silu_quant_nvfp4_kernel<<<slots, 256, smem, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(merged),
+        reinterpret_cast<const int*>(expert_of_row),
+        reinterpret_cast<const int*>(group_off),
+        reinterpret_cast<const int*>(sfa_off),
+        reinterpret_cast<uint8_t*>(out_packed),
+        reinterpret_cast<uint8_t*>(out_sf),
+        inter, num_blocks, n_col_blocks);
+    return 0;
+}

@@ -343,3 +343,12 @@ int moe_grouped_quant_nvfp4_bf16(
     const void* A, const void* expert_of_row, const void* group_off,
     const void* sfa_off, void* out_packed, void* out_sf,
     int slots, int K, cudaStream_t stream);
+
+// Gate and quantise in one pass: reads the grouped GEMM's merged (slots,
+// 2*inter) gate/up output directly, so the strided column halves are never
+// copied out. The silu is rounded to bf16 exactly as silu_mul_sm120_bf16 does,
+// so the quantiser sees the same value it did when the two were separate.
+int moe_grouped_silu_quant_nvfp4_bf16(
+    const void* merged, const void* expert_of_row, const void* group_off,
+    const void* sfa_off, void* out_packed, void* out_sf,
+    int slots, int inter, cudaStream_t stream);

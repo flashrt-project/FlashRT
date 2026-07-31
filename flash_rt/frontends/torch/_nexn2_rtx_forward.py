@@ -1054,15 +1054,24 @@ def _moe_experts_grouped_gemm(x, ti, tw, ld, fvk, device):
     group_off = torch.zeros(_N_EXPERTS + 1, dtype=torch.int32, device=device)
     group_off[1:] = counts.cumsum(0).to(torch.int32)
 
-    def project(A, k, n, w_p, w_s, alpha, out):
+    def project(A, k, n, w_p, w_s, alpha, out, gate=False):
         sfa_off, n_col = _sf_layout(counts, k, device)
         bound = (_N_EXPERTS + slots // 128 + 1) * n_col * 512
         packed = torch.empty(slots, k // 2, dtype=torch.uint8, device=device)
         sfa = torch.empty(bound, dtype=torch.uint8, device=device)
-        rc = fvk.moe_grouped_quant_nvfp4_bf16(
-            A.data_ptr(), se.data_ptr(), group_off.data_ptr(),
-            sfa_off.data_ptr(), packed.data_ptr(), sfa.data_ptr(),
-            slots, k, _cs())
+        if gate:
+            # A is the merged (slots, 2k) gate/up output: gate it and quantise
+            # in one pass rather than slicing two strided halves out of it,
+            # copying both, gating into a third buffer and reading that back.
+            rc = fvk.moe_grouped_silu_quant_nvfp4_bf16(
+                A.data_ptr(), se.data_ptr(), group_off.data_ptr(),
+                sfa_off.data_ptr(), packed.data_ptr(), sfa.data_ptr(),
+                slots, k, _cs())
+        else:
+            rc = fvk.moe_grouped_quant_nvfp4_bf16(
+                A.data_ptr(), se.data_ptr(), group_off.data_ptr(),
+                sfa_off.data_ptr(), packed.data_ptr(), sfa.data_ptr(),
+                slots, k, _cs())
         if rc:
             raise RuntimeError(f'grouped activation quant failed with {rc}')
         rc = fvk.moe_grouped_gemm_nvfp4_sm100_bf16out(
@@ -1076,9 +1085,8 @@ def _moe_experts_grouped_gemm(x, ti, tw, ld, fvk, device):
 
     d_gu = torch.empty(slots, n_gu, dtype=torch.bfloat16, device=device)
     project(x[stok].contiguous(), HID, n_gu, gu_p, gu_s, gu_a, d_gu)
-    inter = _silu_mul(d_gu[:, :INTER], d_gu[:, INTER:], fvk, device)
     d_dn = torch.empty(slots, n_dn, dtype=torch.bfloat16, device=device)
-    project(inter, INTER, n_dn, dn_p, dn_s, dn_a, d_dn)
+    project(d_gu, INTER, n_dn, dn_p, dn_s, dn_a, d_dn, gate=True)
 
     # Deterministic unpermute, the same one the block-tile path uses: invert the
     # routing permutation and let one kernel sum each token's TOPK rows in fixed
