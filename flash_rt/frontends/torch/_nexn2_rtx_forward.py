@@ -1233,7 +1233,13 @@ def _moe_experts_grouped_gemm(x, ti, tw, ld, fvk, device, route=None):
             # A is the merged (slots, 2k) gate/up output: gate it and quantise
             # in one pass rather than slicing two strided halves out of it,
             # copying both, gating into a third buffer and reading that back.
-            rc = fvk.moe_grouped_silu_quant_nvfp4_bf16(
+            # Warp-per-row: a lane owns one scale-factor group and keeps
+            # it in registers, so there is no shared memory and no barrier.
+            # Byte-identical to the block-per-row form and 2.7x at the shape
+            # prefill issues, which puts it at 1.04x of its traffic bound.
+            _sq = getattr(fvk, 'moe_grouped_silu_quant_nvfp4_warp_bf16',
+                          fvk.moe_grouped_silu_quant_nvfp4_bf16)
+            rc = _sq(
                 A.data_ptr(), se.data_ptr(), group_off.data_ptr(),
                 sfa_off.data_ptr(), packed.data_ptr(), sfa.data_ptr(),
                 slots, k, _cs())

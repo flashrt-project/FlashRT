@@ -352,3 +352,11 @@ int moe_grouped_silu_quant_nvfp4_bf16(
     const void* merged, const void* expert_of_row, const void* group_off,
     const void* sfa_off, void* out_packed, void* out_sf,
     int slots, int inter, cudaStream_t stream);
+
+// Warp-per-row form of the above: a lane owns one 16-element scale-factor
+// group and keeps it in registers, so there is no shared memory and no
+// barrier. Same arithmetic in the same order, so the output is identical.
+int moe_grouped_silu_quant_nvfp4_warp_bf16(
+    const void* merged, const void* expert_of_row, const void* group_off,
+    const void* sfa_off, void* out_packed, void* out_sf,
+    int slots, int inter, cudaStream_t stream);

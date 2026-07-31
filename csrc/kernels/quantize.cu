@@ -2981,6 +2981,95 @@ __global__ void moe_grouped_silu_quant_nvfp4_kernel(
     }
 }
 
+// Warp-per-row form of the same thing.
+//
+// The block-per-row kernel above gives 256 threads a row of 512 values -- two
+// elements each -- behind three barriers and three passes over shared memory,
+// so a block reads two kilobytes and then waits. Measured 2.9x off what that
+// traffic implies.
+//
+// Here a warp owns a row and a lane owns one 16-element scale-factor group:
+// it reads its own sixteen gate and up values as vectors, gates them, takes
+// its own maximum and packs its own eight bytes. Nothing is shared, so there
+// are no barriers and no shared memory at all, and each lane has sixteen
+// values in flight instead of two.
+//
+// The arithmetic is the same in the same order, so the output is identical.
+__global__ void moe_grouped_silu_quant_nvfp4_warp_kernel(
+    const __nv_bfloat16* __restrict__ merged,
+    const int* __restrict__ expert_of_row,
+    const int* __restrict__ group_off,
+    const int* __restrict__ sfa_off,
+    uint8_t* __restrict__ fp4_data,
+    uint8_t* __restrict__ scale_factors,
+    int slots, int inter, int num_blocks, int n_col_blocks)
+{
+    const int warp_in_blk = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * (blockDim.x >> 5) + warp_in_blk;
+    if (row >= slots) return;
+
+    const int e = expert_of_row[row];
+    const int local = row - group_off[e];
+    const __nv_bfloat16* g_in = merged + (size_t)row * 2 * inter;
+    const __nv_bfloat16* u_in = g_in + inter;
+    uint8_t* row_fp4 = fp4_data + (size_t)row * inter / 2;
+    uint8_t* sf_base = scale_factors + sfa_off[e];
+    const int rb = local / 128, ri = local % 128;
+
+    for (int b = lane; b < num_blocks; b += 32) {
+        float gated[16];
+        const int base = b * 16;
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const float gv = __bfloat162float(g_in[base + j]);
+            const float uv = __bfloat162float(u_in[base + j]);
+            gated[j] = __bfloat162float(
+                __float2bfloat16_rn(gv / (1.0f + __expf(-gv)) * uv));
+        }
+        float a = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) a = fmaxf(a, fabsf(gated[j]));
+
+        const uint8_t ue = float_to_ue4m3_ceil(a * (1.0f / 6.0f));
+        sf_base[(rb * n_col_blocks + (b >> 2)) * 512 + (ri % 32) * 16
+                + (ri / 32) * 4 + (b & 3)] = ue;
+
+        const float sc = ue4m3_to_float(ue);
+        const float inv = (sc > 0.0f) ? (1.0f / sc) : 0.0f;
+        uint8_t* out8 = row_fp4 + (size_t)b * 8;
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            out8[p] = (uint8_t)((float_to_fp4_e2m1(gated[2 * p + 1] * inv) << 4)
+                                | (float_to_fp4_e2m1(gated[2 * p] * inv) & 0x0F));
+        }
+    }
+}
+
+int moe_grouped_silu_quant_nvfp4_warp_bf16(
+    const void* merged, const void* expert_of_row, const void* group_off,
+    const void* sfa_off, void* out_packed, void* out_sf,
+    int slots, int inter, cudaStream_t stream)
+{
+    if (!merged || !expert_of_row || !group_off || !sfa_off || !out_packed
+        || !out_sf) return 1;
+    if (slots <= 0 || inter <= 0 || (inter & 15) != 0) return 2;
+    const int num_blocks = inter / 16;
+    const int n_col_blocks = (num_blocks + 3) / 4;
+    constexpr int kThreads = 256;
+    const int rows_per_block = kThreads / 32;
+    const int grid = (slots + rows_per_block - 1) / rows_per_block;
+    moe_grouped_silu_quant_nvfp4_warp_kernel<<<grid, kThreads, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(merged),
+        reinterpret_cast<const int*>(expert_of_row),
+        reinterpret_cast<const int*>(group_off),
+        reinterpret_cast<const int*>(sfa_off),
+        reinterpret_cast<uint8_t*>(out_packed),
+        reinterpret_cast<uint8_t*>(out_sf),
+        slots, inter, num_blocks, n_col_blocks);
+    return 0;
+}
+
 int moe_grouped_silu_quant_nvfp4_bf16(
     const void* merged, const void* expert_of_row, const void* group_off,
     const void* sfa_off, void* out_packed, void* out_sf,

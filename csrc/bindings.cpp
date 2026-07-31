@@ -1106,6 +1106,19 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("sfa_off"), py::arg("out_packed"), py::arg("out_sf"),
         py::arg("slots"), py::arg("inter"), py::arg("stream") = 0);
 
+    m.def("moe_grouped_silu_quant_nvfp4_warp_bf16",
+        [](uintptr_t merged, uintptr_t expert_of_row, uintptr_t group_off,
+           uintptr_t sfa_off, uintptr_t out_packed, uintptr_t out_sf,
+           int slots, int inter, uintptr_t stream) -> int {
+            return moe_grouped_silu_quant_nvfp4_warp_bf16(
+                to_ptr(merged), to_ptr(expert_of_row), to_ptr(group_off),
+                to_ptr(sfa_off), to_ptr(out_packed), to_ptr(out_sf),
+                slots, inter, to_stream(stream));
+        },
+        py::arg("merged"), py::arg("expert_of_row"), py::arg("group_off"),
+        py::arg("sfa_off"), py::arg("out_packed"), py::arg("out_sf"),
+        py::arg("slots"), py::arg("inter"), py::arg("stream") = 0);
+
     m.def("moe_grouped_quant_nvfp4_bf16",
         [](uintptr_t A, uintptr_t expert_of_row, uintptr_t group_off,
            uintptr_t sfa_off, uintptr_t src_row,
