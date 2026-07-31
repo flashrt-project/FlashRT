@@ -183,6 +183,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/qwen35moe_layout.cuh"
 #include "kernels/bf16_matvec_sm120.cuh"
 #include "kernels/gdn_recurrent_seq_sm120.cuh"
+#include "kernels/gdn_wy_prefill_edge.cuh"
 #include "kernels/act_fuse_sm120.cuh"
 #include "kernels/moe_router_topk_sm120.cuh"
 #include "kernels/moe_weighted_sum_sm120.cuh"
@@ -5527,6 +5528,31 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"), py::arg("beta"),
         py::arg("state"), py::arg("out"), py::arg("S"), py::arg("num_v_heads"),
         py::arg("head_dim"), py::arg("use_qk_l2norm") = true,
+        py::arg("stream") = 0);
+
+    m.def("gdn_wy_norm_pack_q_cumsum_edge_bf16",
+        [](uintptr_t q, uintptr_t k, uintptr_t g, uintptr_t k_l2,
+           uintptr_t q_pack, uintptr_t g_cumsum, int S, int num_k_heads,
+           int num_v_heads, int head_dim, int qk_group, uintptr_t stream) {
+            flash_rt::kernels::gdn_wy_norm_pack_q_cumsum_edge_bf16(
+                to_ptr(q), to_ptr(k), to_ptr(g), to_ptr(k_l2),
+                to_ptr(q_pack), to_ptr(g_cumsum), S, num_k_heads,
+                num_v_heads, head_dim, qk_group, to_stream(stream));
+        },
+        py::arg("q"), py::arg("k"), py::arg("g"), py::arg("k_l2"),
+        py::arg("q_pack"), py::arg("g_cumsum"), py::arg("S"),
+        py::arg("num_k_heads"), py::arg("num_v_heads"), py::arg("head_dim"),
+        py::arg("qk_group"), py::arg("stream") = 0);
+
+    m.def("gdn_wy_pack_v_edge_bf16",
+        [](uintptr_t v, uintptr_t v_pack, int S, int num_v_heads,
+           int head_dim, uintptr_t stream) {
+            flash_rt::kernels::gdn_wy_pack_v_edge_bf16(
+                to_ptr(v), to_ptr(v_pack), S, num_v_heads, head_dim,
+                to_stream(stream));
+        },
+        py::arg("v"), py::arg("v_pack"), py::arg("S"),
+        py::arg("num_v_heads"), py::arg("head_dim"),
         py::arg("stream") = 0);
 #endif  // FLASHRT_HAVE_QWEN35MOE_CORE
 

@@ -326,58 +326,41 @@ _USE_WY_GDN = _os.environ.get('NEXN2_WY_GDN', '1') != '0'
 _WY_MIN_S = 64        # below this the seq-scan's lower fixed overhead wins
 
 
-def _wy_pack_t(x, ch=64):
-    """(S, H, D) -> (chunks, H, ch, D): x_pack[ci, h, i, d] = x[ci*ch+i, h, d]
-    (zero-padded last chunk). The packed chunk-major layout the mma kernels read."""
-    s, hh, d = x.shape
-    pad = (-s) % ch
-    if pad:
-        x = F.pad(x, (0, 0, 0, 0, 0, pad))
-    return x.reshape(-1, ch, hh, d).permute(0, 2, 1, 3).contiguous()
-
-
-def _wy_l2(x):
-    """l2norm over the last dim, eps inside rsqrt (matches the seq-scan kEps)."""
-    xf = x.float()
-    return (xf * torch.rsqrt((xf * xf).sum(-1, keepdim=True) + 1e-6)).to(
-        torch.bfloat16)
-
-
-def _wy_gcumsum(g, ch=64):
-    """(S, NV) -> (S, NV) per-chunk cumulative sum of the (log-space) gate."""
-    s = g.shape[0]
-    pad = (-s) % ch
-    gp = F.pad(g, (0, 0, 0, pad)) if pad else g
-    return torch.cumsum(gp.float().reshape(-1, ch, g.shape[1]), 1).reshape(
-        -1, g.shape[1])[:s].to(torch.bfloat16)
-
-
-def _gdn_wy_chunk(q16, k16, v, g, beta, fvk, device, init_state=None):
-    """WY chunked scan. q16/k16 (S,16,128) raw post-conv, v (S,32,128),
-    g/beta (S,32). Returns core (S,32,128) + final state (32,128,128).
+def _gdn_wy_chunk(qb, kb, v, g, beta, fvk, device, init_state=None):
+    """WY chunked scan. qb/kb (S,32,128) raw post-conv with q/k already
+    GQA-broadcast across the 32 v-head slots, v (S,32,128), g/beta (S,32).
+    Returns core (S,32,128) + final state (32,128,128).
 
     ``init_state`` (NV,HK,HV) is the recurrent state to continue from -- the
     chunk_h kernel reads it as h0[0] and writes the post-block state back, so a
     chunked prefill carries it across blocks (probe-verified bit-exact: whole
     vs two state-carried halves match at cos 1.0). Defaults to zeros.
 
-    Pipeline (FLA chunked delta rule, all add-only existing kernels):
-    l2norm + per-chunk g-cumsum (torch glue) -> kkt -> solve_tril(+pack) ->
-    recompute_wu -> chunk_h (inter-chunk state) -> output_o."""
-    S = q16.shape[0]
+    Pipeline (FLA chunked delta rule, kernels throughout): norm+pack_q+cumsum
+    -> kkt -> solve_tril(+pack) -> recompute_wu -> chunk_h (inter-chunk state)
+    -> pack_v -> output_o.
+    """
+    S = qb.shape[0]
     chunks = (S + 63) // 64
     CH, QKG = 64, NV // NK
-    q_l2 = _wy_l2(q16)
-    k_l2 = _wy_l2(k16).contiguous()
-    gc = _wy_gcumsum(g).contiguous()
-    betac = beta.contiguous()
-    vc = v.contiguous()
+
+    # l2norm of q and k, the GQA broadcast of q into the 32 v-head slots, the
+    # chunk-major packing of q, and the per-chunk gate cumulative sum, in one
+    # kernel. The broadcast never materialises and q is normalised straight
+    # into its packed slots, so the only q traffic is the packed write.
+    k_l2 = torch.empty(S, NK, HK, dtype=torch.bfloat16, device=device)
+    q_pack = torch.empty(chunks, NV, CH, HK, dtype=torch.bfloat16,
+                         device=device)
+    gc = torch.empty(S, NV, dtype=torch.bfloat16, device=device)
+    fvk.gdn_wy_norm_pack_q_cumsum_edge_bf16(
+        qb.data_ptr(), kb.data_ptr(), g.data_ptr(), k_l2.data_ptr(),
+        q_pack.data_ptr(), gc.data_ptr(), S, NK, NV, HK, QKG, _cs())
 
     k_pack = torch.empty(chunks, NK, CH, HK, dtype=torch.bfloat16, device=device)
     kkt_base = torch.empty(chunks, NK, CH, CH, dtype=torch.float32, device=device)
     A = torch.empty(chunks, NV, CH, CH, dtype=torch.float32, device=device)
     fvk.linear_attn_gdn_wy_kkt_b64_bf16_cublaslt(
-        k_l2.data_ptr(), betac.data_ptr(), gc.data_ptr(), k_pack.data_ptr(),
+        k_l2.data_ptr(), beta.data_ptr(), gc.data_ptr(), k_pack.data_ptr(),
         kkt_base.data_ptr(), A.data_ptr(), S, NK, NV, HK, QKG, _cs())
 
     Ai = torch.empty(chunks, NV, CH, CH, dtype=torch.float32, device=device)
@@ -388,7 +371,7 @@ def _gdn_wy_chunk(q16, k16, v, g, beta, fvk, device, init_state=None):
     w_pack = torch.empty(chunks, NV, CH, HV, dtype=torch.bfloat16, device=device)
     u_pack = torch.empty(chunks, NV, CH, HV, dtype=torch.bfloat16, device=device)
     fvk.linear_attn_gdn_wy_recompute_wu_b64_bf16_mma_fla(
-        k_l2.data_ptr(), vc.data_ptr(), betac.data_ptr(), gc.data_ptr(),
+        k_l2.data_ptr(), v.data_ptr(), beta.data_ptr(), gc.data_ptr(),
         Ai_pack.data_ptr(), w_pack.data_ptr(), u_pack.data_ptr(),
         S, NK, NV, HK, QKG, _cs())
 
@@ -401,14 +384,17 @@ def _gdn_wy_chunk(q16, k16, v, g, beta, fvk, device, init_state=None):
         state.data_ptr(), h0.data_ptr(), v_new.data_ptr(), 0, 0,
         S, NK, NV, HK, QKG, _cs())
 
-    q_pack = _wy_pack_t(q_l2.repeat_interleave(QKG, 1))
-    k_pack_hv = _wy_pack_t(k_l2.repeat_interleave(QKG, 1))
-    v_pack = _wy_pack_t(v_new)
+    # v is the only side still needing a packed copy; the raw-K output_o does
+    # the GQA expansion of k in-kernel, so k never gets a 32-head buffer.
+    v_pack = torch.empty(chunks, NV, CH, HV, dtype=torch.bfloat16,
+                         device=device)
+    fvk.gdn_wy_pack_v_edge_bf16(
+        v_new.data_ptr(), v_pack.data_ptr(), S, NV, HV, _cs())
     core = torch.empty(S, NV, HV, dtype=torch.bfloat16, device=device)
-    fvk.linear_attn_gdn_wy_output_o_b64_bf16_mma_fla(
-        q_pack.data_ptr(), k_pack_hv.data_ptr(), v_pack.data_ptr(),
+    fvk.linear_attn_gdn_wy_output_o_b64_bf16_mma_fla_rawk(
+        q_pack.data_ptr(), k_l2.data_ptr(), v_pack.data_ptr(),
         h0.data_ptr(), gc.data_ptr(), core.data_ptr(),
-        S, NV, HV, float(HV ** -0.5), _cs())
+        S, NK, NV, HV, QKG, float(HV ** -0.5), _cs())
     return core, state
 
 
@@ -491,12 +477,12 @@ def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None,
 
     if _USE_WY_GDN and S >= _WY_MIN_S:
         # WY chunked delta-rule scan: 11x faster than the seq-scan at S=2048,
-        # bit-exact. qb/kb are the 16->32 broadcast heads (src_h = h//2), so the
-        # 16 unique K-heads are the even slots; the WY kernels re-expand by GQA.
-        q16 = qb.reshape(S, NV, HK)[:, 0::2, :]
-        k16 = kb.reshape(S, NV, HK)[:, 0::2, :]
+        # bit-exact. qb/kb carry the 16->32 broadcast heads (src_h = h//2); the
+        # front kernel reads the group leaders and re-expands where it packs,
+        # so no strided slice is taken here.
         core, state = _gdn_wy_chunk(
-            q16, k16, vb.reshape(S, NV, HV), g_out.reshape(S, NV),
+            qb.reshape(S, NV, HK), kb.reshape(S, NV, HK),
+            vb.reshape(S, NV, HV), g_out.reshape(S, NV),
             bo.reshape(S, NV), fvk, device, init_state=init_state)
         core = core.reshape(B, S, NV, HV)
     else:
@@ -725,7 +711,7 @@ def _fa2_causal_attn(qf, kf, vf, device, *, _probe=False):
         batch=1, seqlen_q=Sq, seqlen_k=Sk, num_heads_q=NQ, num_heads_kv=NKV,
         head_dim=HD, q_strides=qc.stride()[:3], k_strides=kc.stride()[:3],
         v_strides=vc.stride()[:3], o_strides=o.stride()[:3],
-        softmax_scale=float(HD) ** -0.5, num_sms=_num_sms(), stream=0)
+        softmax_scale=float(HD) ** -0.5, num_sms=_num_sms(), stream=_cs())
     return o
 
 
