@@ -187,6 +187,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/act_fuse_sm120.cuh"
 #include "kernels/moe_router_topk_sm120.cuh"
 #include "kernels/moe_route_prefill_edge.cuh"
+#include "kernels/moe_shared_combine_edge.cuh"
 #include "kernels/moe_weighted_sum_sm120.cuh"
 #include "kernels/w16a16_gemm_sm120.cuh"
 #include "kernels/qwen35moe_e0m3_dequant.cuh"
@@ -5529,6 +5530,17 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"), py::arg("beta"),
         py::arg("state"), py::arg("out"), py::arg("S"), py::arg("num_v_heads"),
         py::arg("head_dim"), py::arg("use_qk_l2norm") = true,
+        py::arg("stream") = 0);
+
+    m.def("moe_shared_gate_combine_edge_bf16",
+        [](uintptr_t routed, uintptr_t shared, uintptr_t gate, uintptr_t out,
+           int S, int dim, uintptr_t stream) {
+            flash_rt::kernels::moe_shared_gate_combine_edge_bf16(
+                to_ptr(routed), to_ptr(shared), to_ptr(gate), to_ptr(out),
+                S, dim, to_stream(stream));
+        },
+        py::arg("routed"), py::arg("shared"), py::arg("gate"),
+        py::arg("out"), py::arg("S"), py::arg("dim"),
         py::arg("stream") = 0);
 
     m.def("moe_route_prefill_bf16",

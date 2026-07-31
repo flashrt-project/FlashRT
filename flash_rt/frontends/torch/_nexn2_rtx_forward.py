@@ -85,6 +85,25 @@ def _rms_k(x, w, fvk, device, eps):
     return out.reshape(shp)
 
 
+def _add_rms_k(h, x, w, fvk, device, eps):
+    """h += x in place, and return rmsnorm(h, w).
+
+    The residual add and the norm that always follows it were a tensor add and
+    a separate kernel: two passes over (S, HID) and two launches per half
+    layer, 160 of each per forward. Same weight and eps convention as the
+    plain norm, so this is the two of them and not a third behaviour.
+
+    Both must be bf16 and contiguous -- the kernel writes through `h`.
+    """
+    dim = h.shape[-1]
+    h2 = h.reshape(-1, dim)
+    out = torch.empty(h2.shape[0], dim, dtype=torch.bfloat16, device=device)
+    fvk.residual_add_rms_norm(
+        h2.data_ptr(), x.reshape(-1, dim).data_ptr(), w.data_ptr(),
+        out.data_ptr(), h2.shape[0], dim, eps, _cs())
+    return out.reshape(h.shape)
+
+
 def _proj(x2d, ld, base, n, fvk, device):
     """y = x @ w.T for one projection, dispatching on the loader's scope.
 
@@ -1435,9 +1454,18 @@ def _moe_layer(h, ld, fvk, device):
     su = _proj(x, ld, 'shared_up_proj', INTER, fvk, device)
     si = _silu_mul(sg, su, fvk, device)
     shared = _proj(si, ld, 'shared_down_proj', HID, fvk, device)
-    # shared-expert scalar gate: GEMM (N=1) via w16a16, then sigmoid.
-    sgate = torch.sigmoid(
-        _gemm_w16a16(x, ld['shared_gate_w_t'], fvk, device).float())
+    # shared-expert scalar gate: GEMM (N=1) via w16a16. The sigmoid, the
+    # broadcast multiply, the add onto the routed sum and the cast are one
+    # kernel; the routed sum stays fp32 until the single rounding at its store.
+    glog = _gemm_w16a16(x, ld['shared_gate_w_t'], fvk, device)
+    if hasattr(fvk, 'moe_shared_gate_combine_edge_bf16'):
+        comb = torch.empty(x.shape[0], HID, dtype=torch.bfloat16,
+                           device=device)
+        fvk.moe_shared_gate_combine_edge_bf16(
+            out.data_ptr(), shared.data_ptr(), glog.data_ptr(),
+            comb.data_ptr(), x.shape[0], HID, _cs())
+        return comb.reshape(B, S, HID)
+    sgate = torch.sigmoid(glog.float())
     return (out + shared.float() * sgate).reshape(B, S, HID).to(torch.bfloat16)
 
 
@@ -1484,10 +1512,14 @@ def nexn2_forward_nvfp4(handles, input_ids, fvk, device, cap=None,
     ct, st = ct_full[pos_offset:], st_full[pos_offset:]
     chunked = pos_offset > 0
     lin_rank = full_rank = 0
+    # Every residual add is immediately followed by the norm of what it
+    # produced, so the two run as one kernel that updates the residual stream
+    # in place -- which means the loop carries the *normed* tensor across each
+    # boundary and takes the first norm before entering it.
+    h = h.contiguous()
+    n = _rms_k(h, layers[0]['input_norm_w_t'], fvk, device, eps)
     for L in range(p['num_layers']):
         ld = layers[L]
-        res = h
-        n = _rms_k(h, ld['input_norm_w_t'], fvk, device, eps)
         if types[L] == 'linear_attention':
             init_s = cap.lin_state[lin_rank] if chunked else None
             conv_h = cap.lin_conv_state[lin_rank] if chunked else None
@@ -1498,15 +1530,19 @@ def nexn2_forward_nvfp4(handles, input_ids, fvk, device, cap=None,
             attn = _full_attn_layer(n, ld, ct, st, fvk, device, eps,
                                     cap, full_rank, pos_offset=pos_offset)
             full_rank += 1
-        h = res + attn
-        res = h
-        n = _rms_k(h, ld['post_norm_w_t'], fvk, device, eps)
-        h = res + _moe_layer(n, ld, fvk, device)
+        n = _add_rms_k(h, attn, ld['post_norm_w_t'], fvk, device, eps)
+        moe = _moe_layer(n, ld, fvk, device)
+        # The norm after the last layer's residual is the final norm, and
+        # between layers it is the next layer's input norm -- one call either
+        # way, so the boundary is a choice of weight rather than a branch.
+        nxt = (layers[L + 1]['input_norm_w_t'] if L + 1 < p['num_layers']
+               else p['final_norm_w_t'])
+        n = _add_rms_k(h, moe, nxt, fvk, device, eps)
 
     hidden = h[0]                       # (S, HID) residual stream, pre-final-norm
     if not compute_logits:
         return (None, hidden) if return_hidden else None
-    h = _rms_k(h, p['final_norm_w_t'], fvk, device, eps)
+    h = n                               # already the final norm, see above
     # lm_head via w16a16 (bf16 weight, fp32 accumulate): reads the ~1GB weight
     # as bf16 (no fp32 widen), same argmax. logits returned bf16. Slice to the
     # last position first when only the seeding logit is needed (avoids the
