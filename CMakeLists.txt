@@ -82,18 +82,25 @@ message(STATUS "Using gencode flag: ${GPU_GENCODE}")
 # SM86/87/89 share the same source instantiations; we emit arch-specific
 # codegen per target so Jetson Orin (SM87) is not forced through an
 # incompatible cubin. SM120 (5090) uses PTX JIT from
-# compute_80. Thor SM110 has its own attention path (fvk.attention_qkv_fp16
-# cuBLAS decomposed), hand-tuned for unified LPDDR memory — building
-# FA2 there would add ~10 MB to the .so and unused compile time.
+# compute_80.
+#
+# Thor SM110 was excluded on the grounds that it has its own attention path
+# (fvk.attention_qkv_fp16, cuBLAS decomposed) and that FA2 would cost ~10 MB
+# of .so for nothing. That trade does not survive a long prefill: the
+# decomposed path materialises an (S * heads, S_kv) score buffer, which is
+# 3.4 GB per layer at ten thousand tokens, and the model that needs it here
+# is bf16 at head_dim 256 -- one instantiation, not the twelve the size
+# estimate assumed. FA2_HDIMS/FA2_DTYPES are narrowed for this target below.
 if(GPU_ARCH STREQUAL "80"  OR GPU_ARCH STREQUAL "86" OR
    GPU_ARCH STREQUAL "87"  OR
-   GPU_ARCH STREQUAL "89"  OR GPU_ARCH STREQUAL "120" OR
+   GPU_ARCH STREQUAL "89"  OR GPU_ARCH STREQUAL "110" OR
+   GPU_ARCH STREQUAL "120" OR
    GPU_ARCH STREQUAL "121")
   set(ENABLE_FA2 ON)
   message(STATUS "FA2 in-SO attention: ENABLED (sm_${GPU_ARCH})")
 else()
   set(ENABLE_FA2 OFF)
-  message(STATUS "FA2 in-SO attention: DISABLED (Thor SM110 uses fvk.attention_qkv_fp16 cuBLAS path)")
+  message(STATUS "FA2 in-SO attention: DISABLED (sm_${GPU_ARCH})")
 endif()
 
 # SM80-family CUTLASS INT8 kernels used by the Jetson Orin SM87 Pi0.5 fast
@@ -137,6 +144,21 @@ set(FA2_HDIMS "64;96;128;256" CACHE STRING
     "Semicolon-separated FA2 head_dim instantiations to build. Qwen3-VL 2B vision uses 64; other shipped models use 96 and 256.")
 set(FA2_DTYPES "fp16;bf16" CACHE STRING
     "Semicolon-separated FA2 dtype instantiations to build. Pi0 uses fp16; pi0.5/groot use bf16.")
+
+# Thor runs one model family through FA2 -- Qwen3.6 full attention, bf16 at
+# head_dim 256 -- so the default there is that one instantiation rather than
+# the twelve-file matrix the RTX targets distribute. This is why enabling FA2
+# on this arch does not cost what the original exclusion assumed. Both remain
+# cache variables: an explicit -DFA2_HDIMS on the command line still wins.
+if(GPU_ARCH STREQUAL "110")
+  if(NOT DEFINED CACHE{FA2_HDIMS} OR FA2_HDIMS STREQUAL "64;96;128;256")
+    set(FA2_HDIMS "256" CACHE STRING "" FORCE)
+  endif()
+  if(NOT DEFINED CACHE{FA2_DTYPES} OR FA2_DTYPES STREQUAL "fp16;bf16")
+    set(FA2_DTYPES "bf16" CACHE STRING "" FORCE)
+  endif()
+endif()
+
 option(FLASHRT_ENABLE_NATIVE_CPP
        "Build Python-free operation libraries for native C++ consumers" OFF)
 option(FLASHRT_BUILD_FA2_PYTHON_ADAPTER
@@ -990,6 +1012,15 @@ if(ENABLE_FA2 AND
         >
       )
       message(STATUS "FA2 vendor arch: sm_${GPU_ARCH} AOT only (FA2_ARCH_NATIVE_ONLY=ON)")
+    elseif(GPU_ARCH STREQUAL "110")
+      # Native SASS via the same gencode the rest of this build uses, not
+      # compute_80 PTX. The 5090 learned that lesson: routing it through
+      # compute_80 PTX produced SASS that drifted from the native build by
+      # about an fp16 ULP a layer.
+      target_compile_options(fa2_vendor_obj PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:${GPU_GENCODE}>
+      )
+      message(STATUS "FA2 vendor arch: sm_110a AOT only (FA2_ARCH_NATIVE_ONLY=ON)")
     elseif(GPU_ARCH STREQUAL "120")
       target_compile_options(fa2_vendor_obj PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:
@@ -1011,16 +1042,26 @@ if(ENABLE_FA2 AND
     # build). See commit history for the reason each gencode matters —
     # routing 5090 through compute_80 PTX produced a subtle sm_120 SASS
     # drift that accumulated to cos 0.98 under Pi0 FP8.
-    target_compile_options(fa2_vendor_obj PRIVATE
-      $<$<COMPILE_LANGUAGE:CUDA>:
-        "SHELL:-gencode arch=compute_80,code=sm_80"
-        "SHELL:-gencode arch=compute_120,code=sm_120"
-        "SHELL:-gencode arch=compute_120,code=compute_120"
-        "SHELL:-gencode arch=compute_121,code=sm_121"
-        "SHELL:-gencode arch=compute_121,code=compute_121"
-      >
-    )
-    message(STATUS "FA2 vendor arch: sm_80 + sm_120/sm_121 AOT + Blackwell PTX fallback (default)")
+    # sm_110 is not in the consumer family this multi-arch list distributes
+    # for, and compute_80 SASS does not run on it, so it takes its own
+    # gencode here as well rather than silently getting no cubin.
+    if(GPU_ARCH STREQUAL "110")
+      target_compile_options(fa2_vendor_obj PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:${GPU_GENCODE}>
+      )
+      message(STATUS "FA2 vendor arch: sm_110a AOT (Thor)")
+    else()
+      target_compile_options(fa2_vendor_obj PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:
+          "SHELL:-gencode arch=compute_80,code=sm_80"
+          "SHELL:-gencode arch=compute_120,code=sm_120"
+          "SHELL:-gencode arch=compute_120,code=compute_120"
+          "SHELL:-gencode arch=compute_121,code=sm_121"
+          "SHELL:-gencode arch=compute_121,code=compute_121"
+        >
+      )
+      message(STATUS "FA2 vendor arch: sm_80 + sm_120/sm_121 AOT + Blackwell PTX fallback (default)")
+    endif()
   endif()
 
   # Macros the wrapper reads to #ifdef-guard optional hdim/dtype

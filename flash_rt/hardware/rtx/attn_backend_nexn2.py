@@ -102,17 +102,36 @@ class RtxFlashAttnBackendNexn2:
             dtype=torch.float32, device=d,
         )
 
-        # A target may not build FA2 at all -- Thor uses FA4 instead, so the
-        # arch list deliberately omits it there. Absence is a fallback, not an
+        # A target may not build FA2 at all. Absence is a fallback, not an
         # error, because the reference path below computes the same thing.
+        #
+        # Prefill and decode want different answers about FA2. Prefill gains
+        # 20x on a chunked block's non-square window. At the decode shape the
+        # two are the same answer to bf16 precision -- measured against an
+        # fp32 reference, 2.0e-3 relative for both at kv=64, 2.2e-3 against
+        # 2.1e-3 at kv=2048 -- so taking it there buys about 1% of a step and
+        # moves two of the sixteen golden tokens, because a bf16-level
+        # difference in one step flips a later one. That is the fixture losing
+        # its meaning in exchange for 1%, which is the wrong trade.
+        #
+        # So the default follows what each target already validated: on the
+        # arch that has always had FA2 in decode, keep it; on sm_110, where
+        # FA2 has only just started building and the fixture was recorded
+        # through the reference path, decline it. FLASHRT_NEXN2_DECODE_FA2
+        # overrides either way.
+        import os as _os
+        _cap = torch.cuda.get_device_capability()
+        _default = "0" if _cap == (11, 0) else "1"
+        want_fa2 = _os.environ.get(
+            "FLASHRT_NEXN2_DECODE_FA2", _default) != "0"
         try:
             from flash_rt import flash_rt_fa2 as _fa2
         except ImportError:
             self._fa2 = None
             self._fa2_fwd = None
         else:
-            self._fa2 = _fa2
-            self._fa2_fwd = _fa2.fwd_bf16
+            self._fa2 = _fa2 if want_fa2 else None
+            self._fa2_fwd = _fa2.fwd_bf16 if want_fa2 else None
         self._num_sms = torch.cuda.get_device_properties(
             torch.cuda.current_device()
         ).multi_processor_count
@@ -132,6 +151,11 @@ class RtxFlashAttnBackendNexn2:
         So run one small case against a reference and compare. The cost is one
         launch at construction.
         """
+        # Imported here, not at module scope, for the same reason as F: this
+        # module is written to import without torch present. The body had
+        # never run on a target that builds FA2, so the missing name sat
+        # unnoticed until this arch started building one.
+        import torch
         import torch.nn.functional as F
 
         q_seq, kv_seq = 1, 8
