@@ -186,6 +186,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/gdn_wy_prefill_edge.cuh"
 #include "kernels/act_fuse_sm120.cuh"
 #include "kernels/moe_router_topk_sm120.cuh"
+#include "kernels/moe_route_prefill_edge.cuh"
 #include "kernels/moe_weighted_sum_sm120.cuh"
 #include "kernels/w16a16_gemm_sm120.cuh"
 #include "kernels/qwen35moe_e0m3_dequant.cuh"
@@ -5529,6 +5530,38 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("state"), py::arg("out"), py::arg("S"), py::arg("num_v_heads"),
         py::arg("head_dim"), py::arg("use_qk_l2norm") = true,
         py::arg("stream") = 0);
+
+    m.def("moe_route_prefill_bf16",
+        [](uintptr_t logits, uintptr_t ti, uintptr_t tw, uintptr_t se,
+           uintptr_t stok, uintptr_t inv, uintptr_t group_off, uintptr_t ws,
+           int ws_bytes, int S, int n_experts, int topk,
+           uintptr_t stream) -> int {
+            return flash_rt::kernels::moe_route_prefill_bf16(
+                to_ptr(logits), to_ptr(ti), to_ptr(tw), to_ptr(se),
+                to_ptr(stok), to_ptr(inv), to_ptr(group_off), to_ptr(ws),
+                ws_bytes, S, n_experts, topk, to_stream(stream));
+        },
+        py::arg("logits"), py::arg("ti"), py::arg("tw"), py::arg("se"),
+        py::arg("stok"), py::arg("inv"), py::arg("group_off"), py::arg("ws"),
+        py::arg("ws_bytes"), py::arg("S"), py::arg("n_experts"),
+        py::arg("topk"), py::arg("stream") = 0);
+
+    m.def("moe_route_prefill_workspace_bytes",
+        [](int S, int topk, int n_experts) -> int {
+            return flash_rt::kernels::moe_route_prefill_workspace_bytes(
+                S, topk, n_experts);
+        },
+        py::arg("S"), py::arg("topk"), py::arg("n_experts"));
+
+    m.def("moe_route_sfa_offsets",
+        [](uintptr_t group_off, uintptr_t sfa_off, int n_experts, int n_col,
+           uintptr_t stream) {
+            flash_rt::kernels::moe_route_sfa_offsets(
+                to_ptr(group_off), to_ptr(sfa_off), n_experts, n_col,
+                to_stream(stream));
+        },
+        py::arg("group_off"), py::arg("sfa_off"), py::arg("n_experts"),
+        py::arg("n_col"), py::arg("stream") = 0);
 
     m.def("gdn_wy_norm_pack_q_cumsum_edge_bf16",
         [](uintptr_t q, uintptr_t k, uintptr_t g, uintptr_t k_l2,

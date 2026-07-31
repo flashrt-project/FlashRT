@@ -1016,6 +1016,10 @@ def _moe_experts_bt(x, ti, tw, ld, fvk, device):
 
 _GROUPED_SCRATCH = {}
 _ROUTE_CONST = {}
+_ROUTE_BUF = {}
+# Off puts the routing back on the tensor chain, which is how the kernel's
+# output is A/B'd against it end to end rather than only in a probe.
+_USE_ROUTE_KERNEL = _os.environ.get('NEXN2_ROUTE_KERNEL', '1') != '0'
 
 
 def _route_constants(S, device):
@@ -1035,6 +1039,75 @@ def _route_constants(S, device):
         got = (tok_flat, slot_ix)
         _ROUTE_CONST[key] = got
     return got
+
+
+def _route_buffers(S, fvk, device):
+    """The routing kernel's outputs, allocated once per prompt length.
+
+    Their sizes depend only on S, so the forty layers of a prefill write
+    through the same buffers at the same addresses -- which is what lets the
+    call sit inside a captured region, and incidentally saves forty rounds of
+    allocation per forward.
+    """
+    key = (S, str(device))
+    got = _ROUTE_BUF.get(key)
+    if got is None:
+        slots = S * TOPK
+        ws_bytes = int(fvk.moe_route_prefill_workspace_bytes(
+            S, TOPK, _N_EXPERTS))
+        got = {
+            'ti': torch.empty(S, TOPK, dtype=torch.int32, device=device),
+            'tw': torch.empty(S, TOPK, dtype=torch.float32, device=device),
+            'se': torch.empty(slots, dtype=torch.int32, device=device),
+            # int64: the activation quantiser reads this gather index
+            # as a long, and int32 there is an illegal access.
+            'stok': torch.empty(slots, dtype=torch.int64, device=device),
+            'inv': torch.empty(slots, dtype=torch.int32, device=device),
+            'group_off': torch.empty(_N_EXPERTS + 1, dtype=torch.int32,
+                                     device=device),
+            'ws': torch.empty(ws_bytes, dtype=torch.uint8, device=device),
+            'ws_bytes': ws_bytes,
+            'sfa_off': {},
+        }
+        _ROUTE_BUF[key] = got
+    return got
+
+
+def _route_prefill(logits, fvk, device):
+    """Softmax, top-k, and the permutation the grouped GEMM reads, in kernels.
+
+    Replaces softmax + top-k + a renormalising divide + a stable argsort + two
+    gathers + a bincount + a cumulative sum + a scatter: ten tensor ops a
+    layer, of which the top-k alone was 25 ms of a 2048-token prefill.
+
+    Returns None where the kernel is absent, so the tensor chain stays the
+    fallback rather than this being a hard dependency.
+    """
+    if not _USE_ROUTE_KERNEL or not hasattr(fvk, 'moe_route_prefill_bf16'):
+        return None
+    S = logits.shape[0]
+    b = _route_buffers(S, fvk, device)
+    rc = fvk.moe_route_prefill_bf16(
+        logits.data_ptr(), b['ti'].data_ptr(), b['tw'].data_ptr(),
+        b['se'].data_ptr(), b['stok'].data_ptr(), b['inv'].data_ptr(),
+        b['group_off'].data_ptr(), b['ws'].data_ptr(), b['ws_bytes'],
+        S, _N_EXPERTS, TOPK, _cs())
+    if rc:
+        raise RuntimeError(f'prefill routing failed with {rc}')
+    return b
+
+
+def _route_sfa_off(route, k, fvk, device):
+    """Per-expert scale-factor byte offsets for one projection's K."""
+    n_col = ((k // 16) + 3) // 4
+    off = route['sfa_off'].get(k)
+    if off is None:
+        off = torch.empty(_N_EXPERTS, dtype=torch.int32, device=device)
+        route['sfa_off'][k] = off
+    fvk.moe_route_sfa_offsets(
+        route['group_off'].data_ptr(), off.data_ptr(), _N_EXPERTS, n_col,
+        _cs())
+    return off, n_col
 
 
 def _grouped_scratch(fvk, device):
@@ -1070,7 +1143,7 @@ def _sf_layout(counts, k, device):
     return off, n_col
 
 
-def _moe_experts_grouped_gemm(x, ti, tw, ld, fvk, device):
+def _moe_experts_grouped_gemm(x, ti, tw, ld, fvk, device, route=None):
     """Every routed expert of the layer in two GEMM launches.
 
     The per-expert loop below reads each weight once, which is the right amount,
@@ -1097,18 +1170,26 @@ def _moe_experts_grouped_gemm(x, ti, tw, ld, fvk, device):
     gu_a, dn_a = ld['experts_gate_up_alpha_dev'], ld['experts_down_alpha_dev']
     scratch, scratch_bytes = _grouped_scratch(fvk, device)
 
-    tok_flat, slot_ix = _route_constants(S, device)
-    exp_flat = ti.reshape(-1).to(torch.int32)
-    order = exp_flat.argsort(stable=True)
-    se = exp_flat[order].contiguous()
-    stok = tok_flat[order]
+    if route is not None:
+        se, stok, group_off, order, counts = (
+            route['se'], route['stok'], route['group_off'], None, None)
+    else:
+        tok_flat, slot_ix = _route_constants(S, device)
+        exp_flat = ti.reshape(-1).to(torch.int32)
+        order = exp_flat.argsort(stable=True)
+        se = exp_flat[order].contiguous()
+        stok = tok_flat[order]
 
-    counts = torch.bincount(se, minlength=_N_EXPERTS)
-    group_off = torch.zeros(_N_EXPERTS + 1, dtype=torch.int32, device=device)
-    group_off[1:] = counts.cumsum(0).to(torch.int32)
+        counts = torch.bincount(se, minlength=_N_EXPERTS)
+        group_off = torch.zeros(_N_EXPERTS + 1, dtype=torch.int32,
+                                device=device)
+        group_off[1:] = counts.cumsum(0).to(torch.int32)
 
     def project(A, k, n, w_p, w_s, alpha, out, gate=False, perm=None):
-        sfa_off, n_col = _sf_layout(counts, k, device)
+        if route is not None:
+            sfa_off, n_col = _route_sfa_off(route, k, fvk, device)
+        else:
+            sfa_off, n_col = _sf_layout(counts, k, device)
         bound = (_N_EXPERTS + slots // 128 + 1) * n_col * 512
         packed = torch.empty(slots, k // 2, dtype=torch.uint8, device=device)
         sfa = torch.empty(bound, dtype=torch.uint8, device=device)
@@ -1149,11 +1230,15 @@ def _moe_experts_grouped_gemm(x, ti, tw, ld, fvk, device):
     # rows[i] is which sorted row holds slot i, which is exactly the inverse
     # permutation -- gathering arange through it, as the tiled path has to,
     # would just reproduce it.
-    inv = torch.empty(slots, dtype=torch.int32, device=device)
-    inv[order] = slot_ix.to(torch.int32)
+    if route is not None:
+        inv, twc = route['inv'], route['tw']
+    else:
+        inv = torch.empty(slots, dtype=torch.int32, device=device)
+        inv[order] = slot_ix.to(torch.int32)
+        twc = tw.contiguous()
     out = torch.empty(S, HID, dtype=torch.float32, device=device)
     fvk.moe_weighted_sum_sm120_bf16(
-        d_dn.data_ptr(), inv.data_ptr(), tw.contiguous().data_ptr(),
+        d_dn.data_ptr(), inv.data_ptr(), twc.data_ptr(),
         out.data_ptr(), S, TOPK, n_dn, n_dn, _cs())
     return out
 
@@ -1288,24 +1373,39 @@ def _moe_layer(h, ld, fvk, device):
 
     # Router GEMM via the deterministic w16a16 kernel (bf16 weight, fp32
     # accumulate) instead of the fp32 upcast matmul. bf16 logits match the
-    # bf16 reference router; softmax/topk stay (already CUDA ops).
-    logit = F.softmax(_gemm_w16a16(x, rw, fvk, device).float(), -1)
-    tw, ti = torch.topk(logit, TOPK, -1)
-    tw = tw / tw.sum(-1, keepdim=True)
+    # bf16 reference router.
+    lg = _gemm_w16a16(x, rw, fvk, device)
 
     # The block-scaled 4-bit MMA tiles are a build tier, not a given: a target
     # whose toolchain has no block-scaled mma builds the weight-only tier
     # instead. Ask the module what it has rather than assuming, so the tile
     # choice degrades to the grouped GEMV instead of raising mid-prefill.
     big = x.shape[0] >= _M16_MIN_S
-    if _USE_BT_MOE and big and hasattr(fvk, 'moe_blocktile_mma_sm120_bf16'):
+    use_bt = (_USE_BT_MOE and big
+              and hasattr(fvk, 'moe_blocktile_mma_sm120_bf16'))
+    use_m16 = (not use_bt and _USE_M16_MOE and big
+               and hasattr(fvk, 'moe_m16_mma_sm120_bf16'))
+    grouped = (not use_bt and not use_m16 and big
+               and hasattr(fvk, 'moe_grouped_gemm_nvfp4_sm100_bf16out'))
+    # Only the grouped path reads the kernel's permutation, and the tiled
+    # paths index with the tensor top-k's own indices, so the routing is not
+    # computed twice for a path that will not use it.
+    route = _route_prefill(lg, fvk, device) if grouped else None
+    if route is not None:
+        ti, tw = route['ti'], route['tw']
+    else:
+        logit = F.softmax(lg.float(), -1)
+        tw, ti = torch.topk(logit, TOPK, -1)
+        tw = tw / tw.sum(-1, keepdim=True)
+
+    if use_bt:
         out = _moe_experts_bt(x, ti, tw, ld, fvk, device)
-    elif _USE_M16_MOE and big and hasattr(fvk, 'moe_m16_mma_sm120_bf16'):
+    elif use_m16:
         out = _moe_experts_m16(x, ti, tw, ld, fvk, device)
-    elif big and hasattr(fvk, 'moe_grouped_gemm_nvfp4_sm100_bf16out'):
+    elif grouped:
         # No threshold: the grouped path wins at every prefill length measured,
         # because it does not pay per expert for anything.
-        out = _moe_experts_grouped_gemm(x, ti, tw, ld, fvk, device)
+        out = _moe_experts_grouped_gemm(x, ti, tw, ld, fvk, device, route)
     elif (big and _USE_PER_EXPERT_GEMM
             and x.shape[0] * TOPK >= _PER_EXPERT_MIN_M * _N_EXPERTS
             and hasattr(fvk, 'fp4_w4a16_gemm_sm120_bf16out')):

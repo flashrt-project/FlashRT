@@ -1513,6 +1513,7 @@ if(FLASHRT_ENABLE_QWEN35MOE_CORE)
     csrc/kernels/gdn_wy_prefill_edge.cu
     csrc/kernels/act_fuse_sm120.cu
     csrc/kernels/moe_router_topk_sm120.cu
+    csrc/kernels/moe_route_prefill_edge.cu
     csrc/kernels/moe_weighted_sum_sm120.cu
     csrc/kernels/w16a16_gemm_sm120.cu
     csrc/kernels/qwen35moe_e0m3_dequant.cu)
