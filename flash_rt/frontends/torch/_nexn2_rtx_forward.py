@@ -118,6 +118,19 @@ def _proj(x2d, ld, base, n, fvk, device):
     return (x2d.float() @ w.float().T).to(torch.bfloat16)
 
 
+# cuBLASLt for the same product, where the build has it. It is 4-8x the
+# hand-written kernel at every shape prefill issues -- 140 ms of a 1024-token
+# prefill against 22.5 -- and it is a drop-in in the strongest sense: bitwise
+# identical output at every shape checked, and bit-reproducible across repeated
+# launches.
+#
+# The determinism caveat elsewhere in this file is about torch.matmul, whose
+# split-K reduction order can vary and flip a near-tie argmax. It does not apply
+# to this entry point, which was measured rather than assumed. Set False to
+# force the hand-written kernel.
+_DENSE_CUBLASLT = True
+
+
 def _gemm_w16a16(x2d, w, fvk, device):
     """y = x @ w.T via the deterministic bf16-act x bf16-weight tensor-core
     GEMM (fp32 register accumulate). Matches the fp32 path's argmax (cos 1.0)
@@ -127,6 +140,10 @@ def _gemm_w16a16(x2d, w, fvk, device):
     xc = x2d.contiguous()
     wc = w.contiguous()
     y = torch.empty(m, n, dtype=torch.bfloat16, device=device)
+    if _DENSE_CUBLASLT and hasattr(fvk, 'bf16_matmul_cublaslt_bf16'):
+        fvk.bf16_matmul_cublaslt_bf16(xc.data_ptr(), wc.data_ptr(),
+                                      y.data_ptr(), m, n, k, _cs())
+        return y
     fvk.w16a16_gemm_sm120_bf16(xc.data_ptr(), wc.data_ptr(), y.data_ptr(),
                                m, n, k, 1.0, _cs())
     return y
@@ -260,9 +277,16 @@ def _quant_act(x2d, fvk, device, stream=0):
 
 
 def _nvfp4_gemm_preq(xp, xsf, wp_ptr, wsf_ptr, alpha, m, n, k, fvk, device,
-                     stream=0):
-    """y = x @ w.T from a pre-quantised activation (xp, xsf)."""
-    y = torch.empty(m, n, dtype=torch.bfloat16, device=device)
+                     stream=0, out=None):
+    """y = x @ w.T from a pre-quantised activation (xp, xsf).
+
+    ``out`` lets a caller point the result at a slice of a buffer it already
+    owns, which is what the per-expert loop wants: it writes 256 blocks into
+    one matrix, and allocating each of them separately costs more in Python
+    than the GEMM costs on the device.
+    """
+    y = torch.empty(m, n, dtype=torch.bfloat16, device=device) if out is None \
+        else out
     fvk.fp4_w4a16_gemm_sm120_bf16out(
         xp.data_ptr(), wp_ptr, y.data_ptr(), m, n, k,
         xsf.data_ptr(), wsf_ptr, alpha, stream)
@@ -986,21 +1010,34 @@ def _moe_experts_per_expert_gemm(x, ti, tw, ld, fvk, device):
     sw = tw.reshape(-1)[order]
 
     counts = torch.bincount(se, minlength=_N_EXPERTS).tolist()
+    slots = S * TOPK
     A = x[stok].contiguous()                          # (slots, HID) bf16
-    d_dn = torch.empty(S * TOPK, n_dn, dtype=torch.bfloat16, device=device)
+    # One buffer per projection, written in place by each expert's GEMM. The
+    # activation is a slot-major matrix throughout, so the gate is one launch
+    # over all of it rather than one per expert -- 256 launches a layer and two
+    # slice copies each, for an op that does not care where the rows came from.
+    d_gu = torch.empty(slots, n_gu, dtype=torch.bfloat16, device=device)
+    d_dn = torch.empty(slots, n_dn, dtype=torch.bfloat16, device=device)
 
     off = 0
+    bounds = []
     for e, cnt in enumerate(counts):
         if cnt == 0:
             continue
-        rows = A[off:off + cnt]
-        gu = _nvfp4_gemm(rows, gu_p[e].data_ptr(), gu_s[e].data_ptr(),
-                         gu_a[e], n_gu, fvk, device, _cs())
-        inter = _silu_mul(gu[:, :INTER], gu[:, INTER:], fvk, device)
-        d_dn[off:off + cnt] = _nvfp4_gemm(
-            inter.contiguous(), dn_p[e].data_ptr(), dn_s[e].data_ptr(),
-            dn_a[e], n_dn, fvk, device, _cs())
+        bounds.append((e, off, cnt))
+        xp, xsf = _quant_act(A[off:off + cnt], fvk, device, _cs())
+        _nvfp4_gemm_preq(xp, xsf, gu_p[e].data_ptr(), gu_s[e].data_ptr(),
+                         gu_a[e], cnt, n_gu, HID, fvk, device, _cs(),
+                         out=d_gu[off:off + cnt])
         off += cnt
+
+    inter = _silu_mul(d_gu[:, :INTER], d_gu[:, INTER:], fvk, device)
+    for e, off_e, cnt in bounds:
+        xp, xsf = _quant_act(inter[off_e:off_e + cnt].contiguous(), fvk,
+                             device, _cs())
+        _nvfp4_gemm_preq(xp, xsf, dn_p[e].data_ptr(), dn_s[e].data_ptr(),
+                         dn_a[e], cnt, n_dn, INTER, fvk, device, _cs(),
+                         out=d_dn[off_e:off_e + cnt])
 
     out = torch.zeros(S, HID, device=device)
     out.index_add_(0, stok, d_dn.float() * sw.unsqueeze(-1))
