@@ -2804,3 +2804,97 @@ void dequant_int32_to_bf16(const int32_t* input, __nv_bfloat16* output,
     dequant_int32_to_bf16_kernel<<<blocks, threads, 0, stream>>>(
         input, output, d_act_scale, d_weight_scale, n);
 }
+
+// ── Grouped activation quantiser for the MoE grouped GEMM ──
+//
+// Same math as quantize_bf16_to_nvfp4_swizzled_kernel, block for block; what
+// differs is where the scale factors land. The block-scaled GEMM wants each
+// group's scales in the Sm1xx atom layout for that group's own row count, and
+// that layout blocks rows by 128, so a group beginning at an arbitrary row of a
+// jointly-quantised matrix has no contiguous sub-block to point at. Quantising
+// per group is correct but costs a launch and a host iteration per expert.
+//
+// Here a row reads the expert it was sorted by, subtracts its group's first
+// row, and indexes its group's own block. Nothing reaches the host, which is
+// what lets the surrounding prefill chunk be captured.
+__global__ void moe_grouped_quant_nvfp4_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    const int* __restrict__ expert_of_row,
+    const int* __restrict__ group_off,
+    const int* __restrict__ sfa_off,
+    uint8_t* __restrict__ fp4_data,
+    uint8_t* __restrict__ scale_factors,
+    int cols, int num_blocks, int n_col_blocks)
+{
+    const int row = blockIdx.x;
+    const int e = expert_of_row[row];
+    const int local = row - group_off[e];          // row index inside its group
+    const __nv_bfloat16* row_in = input + (size_t)row * cols;
+    uint8_t* row_fp4 = fp4_data + (size_t)row * cols / 2;
+    uint8_t* sf_base = scale_factors + sfa_off[e];
+
+    extern __shared__ float smem[];
+
+    for (int b = threadIdx.x; b < num_blocks; b += blockDim.x) smem[b] = 0.0f;
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float val = fabsf(__bfloat162float(row_in[i]));
+        atomicMax((int*)&smem[i >> 4], __float_as_int(val));
+    }
+    __syncthreads();
+
+    const int rb = local / 128;
+    const int ri = local % 128;
+    for (int b = threadIdx.x; b < num_blocks; b += blockDim.x) {
+        float amax = __int_as_float(*(int*)&smem[b]);
+        uint8_t ue_scale = float_to_ue4m3_ceil(amax / 6.0f);
+        const int cb = b / 4;
+        const int ci = b % 4;
+        sf_base[(rb * n_col_blocks + cb) * 512 + (ri % 32) * 16
+                + (ri / 32) * 4 + ci] = ue_scale;
+        smem[b] = ue4m3_to_float(ue_scale);
+    }
+    __syncthreads();
+
+    const int half_cols = cols >> 1;
+    for (int p = threadIdx.x; p < half_cols; p += blockDim.x) {
+        const int i = p * 2;
+        const int blk = i >> 4;
+        float scale = smem[blk];
+        float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+        float v0 = __bfloat162float(row_in[i]) * inv_scale;
+        float v1 = __bfloat162float(row_in[i + 1]) * inv_scale;
+        const int blk1 = (i + 1) >> 4;
+        if (blk1 != blk) {
+            float s1 = smem[blk1];
+            float inv1 = (s1 > 0.0f) ? (1.0f / s1) : 0.0f;
+            v1 = __bfloat162float(row_in[i + 1]) * inv1;
+        }
+        row_fp4[p] = (uint8_t)((float_to_fp4_e2m1(v1) << 4)
+                               | (float_to_fp4_e2m1(v0) & 0x0F));
+    }
+}
+
+int moe_grouped_quant_nvfp4_bf16(
+    const void* A, const void* expert_of_row, const void* group_off,
+    const void* sfa_off, void* out_packed, void* out_sf,
+    int slots, int K, cudaStream_t stream)
+{
+    if (!A || !expert_of_row || !group_off || !sfa_off || !out_packed
+        || !out_sf) return 1;
+    if (slots <= 0 || K <= 0 || (K & 15) != 0) return 2;
+    const int num_blocks = K / 16;
+    const int n_col_blocks = (num_blocks + 3) / 4;
+    const int threads = 256;
+    const size_t smem = (size_t)num_blocks * sizeof(float);
+    moe_grouped_quant_nvfp4_kernel<<<slots, threads, smem, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(A),
+        reinterpret_cast<const int*>(expert_of_row),
+        reinterpret_cast<const int*>(group_off),
+        reinterpret_cast<const int*>(sfa_off),
+        reinterpret_cast<uint8_t*>(out_packed),
+        reinterpret_cast<uint8_t*>(out_sf),
+        K, num_blocks, n_col_blocks);
+    return 0;
+}

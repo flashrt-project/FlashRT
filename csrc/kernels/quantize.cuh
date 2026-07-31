@@ -325,3 +325,21 @@ void quantize_int8_rowwise_static(const __nv_bfloat16* input, int8_t* output,
 void dequant_int32_to_bf16(const int32_t* input, __nv_bfloat16* output,
                            const float* d_act_scale, const float* d_weight_scale,
                            int n, cudaStream_t stream = 0);
+
+// Grouped activation quantiser for the MoE grouped GEMM: every expert's block
+// in one launch. Same math as quantize_bf16_to_nvfp4_swizzled; what differs is
+// that each group's scale factors go into the Sm1xx atom layout for that
+// group's own row count, which is what the block-scaled grouped GEMM reads.
+// Quantising per group instead is correct but costs a launch and a host
+// iteration per expert -- and a host iteration is what a graph capture cannot
+// have.
+//
+//   A              (slots, K) bf16, rows already sorted by expert
+//   expert_of_row  (slots,)  i32
+//   group_off      (E + 1,)  i32  prefix sums of the per-expert row counts
+//   sfa_off        (E,)      i32  byte offset of each group's SF block
+// K must be a multiple of 16. Returns 0 on success, nonzero on arg error.
+int moe_grouped_quant_nvfp4_bf16(
+    const void* A, const void* expert_of_row, const void* group_off,
+    const void* sfa_off, void* out_packed, void* out_sf,
+    int slots, int K, cudaStream_t stream);

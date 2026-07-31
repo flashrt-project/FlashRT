@@ -971,6 +971,111 @@ def _moe_experts_bt(x, ti, tw, ld, fvk, device):
     return out
 
 
+_GROUPED_SCRATCH = {}
+
+
+def _grouped_scratch(fvk, device):
+    """One scratch buffer per device for the grouped GEMM's descriptor arrays.
+
+    Its size depends only on the expert count, not on how the routing falls, so
+    it is allocated once and never resized -- which is also what lets the call
+    sit inside a captured region.
+    """
+    key = str(device)
+    got = _GROUPED_SCRATCH.get(key)
+    if got is None:
+        nbytes = int(fvk.moe_grouped_gemm_nvfp4_sm100_scratch_bytes(_N_EXPERTS))
+        got = (torch.empty(nbytes, dtype=torch.uint8, device=device), nbytes)
+        _GROUPED_SCRATCH[key] = got
+    return got
+
+
+def _sf_layout(counts, k, device):
+    """Per-group scale-factor byte offsets, and a host-known bound on the total.
+
+    The block-scaled layout blocks rows by 128, so a group of c rows needs
+    ceil(c/128) super-blocks. Summing that needs the counts, which live on the
+    device -- but the sum is bounded by (experts + slots/128) super-blocks
+    whatever the routing does, and that bound follows from the shapes alone.
+    Sizing the buffer from the bound rather than the sum is what keeps this free
+    of a host read.
+    """
+    n_col = ((k // 16) + 3) // 4
+    per_group = ((counts + 127) // 128) * (n_col * 512)
+    off = torch.zeros(_N_EXPERTS, dtype=torch.int32, device=device)
+    off[1:] = per_group.cumsum(0)[:-1].to(torch.int32)
+    return off, n_col
+
+
+def _moe_experts_grouped_gemm(x, ti, tw, ld, fvk, device):
+    """Every routed expert of the layer in two GEMM launches.
+
+    The per-expert loop below reads each weight once, which is the right amount,
+    but pays a launch and a host iteration per expert -- and the host iteration
+    is fatal twice over: it dominated the time at S=1024, and it makes the layer
+    impossible to capture. A grouped GEMM takes the per-group shapes from device
+    memory, so the launch geometry depends only on the expert count and the
+    routing never reaches the host.
+
+    Measured against the loop it replaces, at the shapes prefill issues: 6.0x on
+    gate_up and 14.5x on down at S=1024, 512 launches down to 2, output bitwise
+    identical.
+    """
+    S = x.shape[0]
+    slots = S * TOPK
+    gu_p, gu_s = ld['experts_gate_up_packed_t'], ld['experts_gate_up_sf_t']
+    dn_p, dn_s = ld['experts_down_packed_t'], ld['experts_down_sf_t']
+    n_gu, n_dn = gu_p.shape[1], dn_p.shape[1]
+    if 'experts_gate_up_alpha_dev' not in ld:
+        ld['experts_gate_up_alpha_dev'] = \
+            ld['experts_gate_up_alpha_t'].to(device).contiguous()
+        ld['experts_down_alpha_dev'] = \
+            ld['experts_down_alpha_t'].to(device).contiguous()
+    gu_a, dn_a = ld['experts_gate_up_alpha_dev'], ld['experts_down_alpha_dev']
+    scratch, scratch_bytes = _grouped_scratch(fvk, device)
+
+    exp_flat = ti.reshape(-1).to(torch.int32)
+    tok_flat = torch.arange(S, device=device).repeat_interleave(TOPK)
+    order = exp_flat.argsort(stable=True)
+    se = exp_flat[order].contiguous()
+    stok = tok_flat[order]
+    sw = tw.reshape(-1)[order]
+
+    counts = torch.bincount(se, minlength=_N_EXPERTS)
+    group_off = torch.zeros(_N_EXPERTS + 1, dtype=torch.int32, device=device)
+    group_off[1:] = counts.cumsum(0).to(torch.int32)
+
+    def project(A, k, n, w_p, w_s, alpha, out):
+        sfa_off, n_col = _sf_layout(counts, k, device)
+        bound = (_N_EXPERTS + slots // 128 + 1) * n_col * 512
+        packed = torch.empty(slots, k // 2, dtype=torch.uint8, device=device)
+        sfa = torch.empty(bound, dtype=torch.uint8, device=device)
+        rc = fvk.moe_grouped_quant_nvfp4_bf16(
+            A.data_ptr(), se.data_ptr(), group_off.data_ptr(),
+            sfa_off.data_ptr(), packed.data_ptr(), sfa.data_ptr(),
+            slots, k, _cs())
+        if rc:
+            raise RuntimeError(f'grouped activation quant failed with {rc}')
+        rc = fvk.moe_grouped_gemm_nvfp4_sm100_bf16out(
+            packed.data_ptr(), sfa.data_ptr(), w_p.data_ptr(),
+            w_s.data_ptr(), alpha.data_ptr(), out.data_ptr(),
+            group_off.data_ptr(), sfa_off.data_ptr(),
+            _N_EXPERTS, n, k, w_p[0].numel(), w_s[0].numel(),
+            scratch.data_ptr(), scratch_bytes, _cs())
+        if rc:
+            raise RuntimeError(f'grouped MoE GEMM failed with {rc}')
+
+    d_gu = torch.empty(slots, n_gu, dtype=torch.bfloat16, device=device)
+    project(x[stok].contiguous(), HID, n_gu, gu_p, gu_s, gu_a, d_gu)
+    inter = _silu_mul(d_gu[:, :INTER], d_gu[:, INTER:], fvk, device)
+    d_dn = torch.empty(slots, n_dn, dtype=torch.bfloat16, device=device)
+    project(inter, INTER, n_dn, dn_p, dn_s, dn_a, d_dn)
+
+    out = torch.zeros(S, HID, device=device)
+    out.index_add_(0, stok, d_dn.float() * sw.unsqueeze(-1))
+    return out
+
+
 def _moe_experts_per_expert_gemm(x, ti, tw, ld, fvk, device):
     """Routed experts as one GEMM per expert over the tokens that chose it.
 
@@ -1115,6 +1220,10 @@ def _moe_layer(h, ld, fvk, device):
         out = _moe_experts_bt(x, ti, tw, ld, fvk, device)
     elif _USE_M16_MOE and big and hasattr(fvk, 'moe_m16_mma_sm120_bf16'):
         out = _moe_experts_m16(x, ti, tw, ld, fvk, device)
+    elif big and hasattr(fvk, 'moe_grouped_gemm_nvfp4_sm100_bf16out'):
+        # No threshold: the grouped path wins at every prefill length measured,
+        # because it does not pay per expert for anything.
+        out = _moe_experts_grouped_gemm(x, ti, tw, ld, fvk, device)
     elif (big and _USE_PER_EXPERT_GEMM
             and x.shape[0] * TOPK >= _PER_EXPERT_MIN_M * _N_EXPERTS
             and hasattr(fvk, 'fp4_w4a16_gemm_sm120_bf16out')):

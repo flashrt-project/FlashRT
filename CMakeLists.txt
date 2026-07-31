@@ -656,12 +656,14 @@ endif()
 # -gencode arch=compute_110a,code=sm_110a via GPU_GENCODE.
 if(GPU_ARCH STREQUAL "110")
   add_library(cutlass_nvfp4_w4a16_sm100_obj OBJECT
-    csrc/gemm/fp4/cutlass_nvfp4_w4a16_gemm_sm100.cu)
+    csrc/gemm/fp4/cutlass_nvfp4_w4a16_gemm_sm100.cu
+    csrc/gemm/fp4/cutlass_nvfp4_moe_grouped_sm100.cu)
   set_target_properties(cutlass_nvfp4_w4a16_sm100_obj PROPERTIES
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
   )
   target_include_directories(cutlass_nvfp4_w4a16_sm100_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/fp4
     ${CUTLASS_INCLUDE}

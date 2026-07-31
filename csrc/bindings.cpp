@@ -38,6 +38,7 @@
 #endif
 #ifdef ENABLE_CUTLASS_SM100_NVFP4_W4A16
 #include "gemm/fp4/cutlass_nvfp4_w4a16_gemm_sm100.cuh"
+#include "gemm/fp4/cutlass_nvfp4_moe_grouped_sm100.cuh"
 #endif
 #ifdef ENABLE_ACTION_FFN_MEGAKERNEL_V6T
 #include "kernels/megakernel/action_ffn_megakernel_v6t_sm120.cuh"
@@ -1087,6 +1088,19 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                                 rows, cols, to_stream(stream));
     }, py::arg("input"), py::arg("fp4_data"), py::arg("scale_factors"),
        py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
+
+    m.def("moe_grouped_quant_nvfp4_bf16",
+        [](uintptr_t A, uintptr_t expert_of_row, uintptr_t group_off,
+           uintptr_t sfa_off, uintptr_t out_packed, uintptr_t out_sf,
+           int slots, int K, uintptr_t stream) -> int {
+            return moe_grouped_quant_nvfp4_bf16(
+                to_ptr(A), to_ptr(expert_of_row), to_ptr(group_off),
+                to_ptr(sfa_off), to_ptr(out_packed), to_ptr(out_sf),
+                slots, K, to_stream(stream));
+        },
+        py::arg("A"), py::arg("expert_of_row"), py::arg("group_off"),
+        py::arg("sfa_off"), py::arg("out_packed"), py::arg("out_sf"),
+        py::arg("slots"), py::arg("K"), py::arg("stream") = 0);
 
     m.def("quantize_bf16_to_nvfp4_swizzled", [](uintptr_t input, uintptr_t fp4_data,
                                                   uintptr_t scale_factors, int rows, int cols,
@@ -7269,6 +7283,36 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
 // out of the Thor surface.
 // ─────────────────────────────────────────────────────────────────────
 #ifdef ENABLE_CUTLASS_SM100_NVFP4_W4A16
+    // Every routed expert of a layer in one launch, with the per-group shapes
+    // taken from device memory so the routing never reaches the host.
+    m.def("moe_grouped_gemm_nvfp4_sm100_bf16out",
+        [](uintptr_t A_packed, uintptr_t SFA, uintptr_t W_stack,
+           uintptr_t SFB_stack, uintptr_t alpha_dev, uintptr_t D,
+           uintptr_t group_off, uintptr_t sfa_off,
+           int groups, int N, int K, long w_stride, long sfb_stride,
+           uintptr_t scratch, size_t scratch_bytes,
+           uintptr_t stream) -> int {
+            return flash_rt::gemm::moe_grouped_gemm_nvfp4_sm100_bf16out(
+                to_ptr(A_packed), to_ptr(SFA), to_ptr(W_stack),
+                to_ptr(SFB_stack), to_ptr(alpha_dev), to_ptr(D),
+                to_ptr(group_off), to_ptr(sfa_off),
+                groups, N, K, w_stride, sfb_stride,
+                to_ptr(scratch), scratch_bytes, to_stream(stream));
+        },
+        py::arg("A_packed"), py::arg("SFA"), py::arg("W_stack"),
+        py::arg("SFB_stack"), py::arg("alpha_dev"), py::arg("D"),
+        py::arg("group_off"), py::arg("sfa_off"), py::arg("groups"),
+        py::arg("N"), py::arg("K"), py::arg("w_stride"),
+        py::arg("sfb_stride"), py::arg("scratch"),
+        py::arg("scratch_bytes"), py::arg("stream") = 0);
+
+    m.def("moe_grouped_gemm_nvfp4_sm100_scratch_bytes",
+        [](int groups) -> size_t {
+            return flash_rt::gemm::moe_grouped_gemm_nvfp4_sm100_scratch_bytes(
+                groups);
+        },
+        py::arg("groups"));
+
     m.def("fp4_w4a16_gemm_sm120_bf16out",
         [](uintptr_t A_packed, uintptr_t B_packed, uintptr_t D,
            int M, int N, int K,
