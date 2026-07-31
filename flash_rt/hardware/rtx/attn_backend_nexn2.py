@@ -172,7 +172,11 @@ class RtxFlashAttnBackendNexn2:
         """Reference attention, for a device the vendored kernel refuses."""
         import torch.nn.functional as F
 
-        q = self.Q_buf[:, :q_seq].transpose(1, 2).float()
+        # BF16 throughout. The cache is bf16, so upcasting it materialises the
+        # whole history in fp32 every step -- hundreds of MB of temporaries per
+        # token at a long context, which is what made decode fall from 26 to 11
+        # tok/s between 4k and 10k. SDPA accumulates in fp32 regardless.
+        q = self.Q_buf[:, :q_seq].transpose(1, 2)
         k = self.K_cache[layer_idx:layer_idx + 1, :kv_seq]
         v = self.V_cache[layer_idx:layer_idx + 1, :kv_seq]
         # Broadcasting the KV to the query head count materialises it: at
@@ -183,14 +187,14 @@ class RtxFlashAttnBackendNexn2:
         groups = self.NUM_Q_HEADS // self.NUM_KV_HEADS
         try:
             out = F.scaled_dot_product_attention(
-                q, k.transpose(1, 2).float(), v.transpose(1, 2).float(),
+                q, k.transpose(1, 2), v.transpose(1, 2),
                 is_causal=q_seq > 1, scale=softmax_scale, enable_gqa=True,
             ).transpose(1, 2)
         except TypeError:                       # torch without native GQA
             out = F.scaled_dot_product_attention(
                 q,
-                k.repeat_interleave(groups, dim=2).transpose(1, 2).float(),
-                v.repeat_interleave(groups, dim=2).transpose(1, 2).float(),
+                k.repeat_interleave(groups, dim=2).transpose(1, 2),
+                v.repeat_interleave(groups, dim=2).transpose(1, 2),
                 is_causal=q_seq > 1, scale=softmax_scale,
             ).transpose(1, 2)
         self.O_buf[:, :q_seq].copy_(out.to(self.O_buf.dtype))
