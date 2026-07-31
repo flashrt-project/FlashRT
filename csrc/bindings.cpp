@@ -184,6 +184,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/bf16_matvec_sm120.cuh"
 #include "kernels/gdn_recurrent_seq_sm120.cuh"
 #include "kernels/gdn_wy_prefill_edge.cuh"
+#include "kernels/causal_conv1d_rows_edge.cuh"
 #include "kernels/act_fuse_sm120.cuh"
 #include "kernels/moe_router_topk_sm120.cuh"
 #include "kernels/moe_route_prefill_edge.cuh"
@@ -5574,6 +5575,18 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         },
         py::arg("group_off"), py::arg("sfa_off"), py::arg("n_experts"),
         py::arg("n_col"), py::arg("stream") = 0);
+
+    m.def("causal_conv1d_qwen36_rows_bf16",
+        [](uintptr_t x, uintptr_t w, uintptr_t bias, uintptr_t out,
+           int B, int S, int conv_dim, int k, bool apply_silu,
+           uintptr_t stream) {
+            flash_rt::kernels::causal_conv1d_qwen36_rows_bf16(
+                to_ptr(x), to_ptr(w), to_ptr(bias), to_ptr(out),
+                B, S, conv_dim, k, apply_silu, to_stream(stream));
+        },
+        py::arg("x"), py::arg("w"), py::arg("bias"), py::arg("out"),
+        py::arg("B"), py::arg("S"), py::arg("conv_dim"), py::arg("k"),
+        py::arg("apply_silu") = true, py::arg("stream") = 0);
 
     m.def("gdn_wy_norm_pack_q_cumsum_edge_bf16",
         [](uintptr_t q, uintptr_t k, uintptr_t g, uintptr_t k_l2,

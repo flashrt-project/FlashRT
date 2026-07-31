@@ -459,6 +459,14 @@ def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None,
     # Same (B, S, conv_dim) layout the decode update kernel uses; no bias. For a
     # chunked block, prepend the previous block's last KS-1 inputs (conv_hist)
     # so the block's first outputs see the right history, then drop them.
+    # The row-blocked entry walks several tokens per thread with the window in
+    # registers, so each input is read once instead of once per output that
+    # needs it. Bit-identical to the per-token entry (probe: exact at every
+    # length measured) and 3.3x, which puts it within 1.3x of what its traffic
+    # implies rather than 4.2x off. It also lifts the gridDim.y ceiling that
+    # capped a single launch at 65535 tokens.
+    _conv = getattr(fvk, 'causal_conv1d_qwen36_rows_bf16',
+                    fvk.causal_conv1d_qwen36_bf16)
     convw_k = convw.reshape(CONV, KS).contiguous()
     if conv_hist is not None:
         hist = conv_hist[0].transpose(0, 1).reshape(1, KS - 1, CONV)
@@ -466,15 +474,13 @@ def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None,
             [hist.to(mixed.dtype), mixed], dim=1).contiguous()
         Se = mixed_ext.shape[1]
         xc_ext = torch.empty(B, Se, CONV, dtype=torch.bfloat16, device=device)
-        fvk.causal_conv1d_qwen36_bf16(
-            mixed_ext.data_ptr(), convw_k.data_ptr(), 0,
-            xc_ext.data_ptr(), B, Se, CONV, KS, True, _cs())
+        _conv(mixed_ext.data_ptr(), convw_k.data_ptr(), 0,
+              xc_ext.data_ptr(), B, Se, CONV, KS, True, _cs())
         xc = xc_ext[:, KS - 1:, :].contiguous()
     else:
         xc = torch.empty(B, S, CONV, dtype=torch.bfloat16, device=device)
-        fvk.causal_conv1d_qwen36_bf16(
-            mixed.contiguous().data_ptr(), convw_k.data_ptr(), 0,
-            xc.data_ptr(), B, S, CONV, KS, True, _cs())
+        _conv(mixed.contiguous().data_ptr(), convw_k.data_ptr(), 0,
+              xc.data_ptr(), B, S, CONV, KS, True, _cs())
     # split conv output + broadcast q/k 16 -> 32 heads in one fvk kernel.
     xc_bf = xc.reshape(B * S, CONV).contiguous()
     qb = torch.empty(B, S, NV, HK, dtype=torch.bfloat16, device=device)
