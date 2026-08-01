@@ -14,7 +14,13 @@ namespace {
 // blocks off each other's banks.
 constexpr int kWarps = 2;
 constexpr int kThreads = kWarps * 32;
-constexpr int kUnroll = 4;
+// Two, matching the M=1 entry: this kernel inherited 4 when it was written and
+// kept it after the sweep moved the single-row path, which left the verify
+// paying registers for depth while decode had already traded them for warps.
+// Same argument, same invariance -- the main loop advances by 32*kUnroll and
+// the tail takes the remainder, so a lane visits the same k-blocks in the same
+// order and every output row stays bit-identical to the per-row GEMV.
+constexpr int kUnroll = 2;
 constexpr int kBlockSlots = 24;
 constexpr int kBlockInt4 = kBlockSlots / 8;
 constexpr int kRowsDense = 2;
