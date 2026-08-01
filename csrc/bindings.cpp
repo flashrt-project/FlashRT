@@ -197,6 +197,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/w4a16_matvec_sm120.cuh"
 #include "kernels/moe_grouped_w4a16_sm120.cuh"
 #include "kernels/w4a16_edge_sm120.cuh"
+#include "kernels/w4a16_mrows_edge_sm120.cuh"
 #include "kernels/w4a16_gemm_sm120.cuh"
 #endif  // FLASHRT_HAVE_QWEN35MOE_W4A16
 #ifdef FLASHRT_HAVE_QWEN35MOE_W4A4
@@ -5612,6 +5613,17 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("x"), py::arg("w"), py::arg("bias"), py::arg("out"),
         py::arg("B"), py::arg("S"), py::arg("conv_dim"), py::arg("k"),
         py::arg("apply_silu") = true, py::arg("stream") = 0);
+
+    m.def("w4a16_mrows_edge_sm120_bf16",
+        [](uintptr_t x, uintptr_t W, uintptr_t SFB, uintptr_t out,
+           int M, int N, int K, double alpha, uintptr_t stream) -> int {
+            return flash_rt::kernels::w4a16_mrows_edge_sm120_bf16(
+                to_ptr(x), to_ptr(W), to_ptr(SFB), to_ptr(out),
+                M, N, K, static_cast<float>(alpha), to_stream(stream));
+        },
+        py::arg("x"), py::arg("W"), py::arg("SFB"), py::arg("out"),
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("alpha"),
+        py::arg("stream") = 0);
 
     m.def("gdn_wy_norm_pack_q_cumsum_edge_bf16",
         [](uintptr_t q, uintptr_t k, uintptr_t g, uintptr_t k_l2,

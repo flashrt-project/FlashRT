@@ -121,7 +121,10 @@ def _proj(x2d, ld, base, n, fvk, device):
     # the pass whose whole purpose is to read the weights once. It wants the
     # 4-bit weight for the same reason decode does: at this M the cost is
     # traffic, not throughput.
-    if ((_SPEC_VERIFY or (_DENSE_W4A16 and x2d.shape[0] >= 64))
+    if (_SPEC_VERIFY and x2d.shape[0] <= 8
+            and (w.shape[1] % 16) == 0):
+        return _w4a16_mrows(x2d, w, ld, base + '_w_t', fvk, device)
+    if (_DENSE_W4A16 and x2d.shape[0] >= 64
             and (w.shape[0] % 64) == 0 and (x2d.shape[1] % 64) == 0):
         return _gemm_w4a16(x2d, w, ld, base + '_w_t', fvk, device)
     if (_DENSE_W16A16 and x2d.shape[0] >= _DENSE_BF16_MIN_M
@@ -216,7 +219,13 @@ _DENSE_W4A16 = False
 # bytes and differs from decode only by reduction order. Until that exists,
 # BF16 is both faster and the one that agrees with plain greedy token for
 # token.
-_SPEC_VERIFY_W4A16 = False
+# On: the verify runs the dense projections through the M-row form of the
+# decode GEMV, over the tensor the decode path caches. Off, it reads the same
+# weights at BF16 -- four times the bytes, and a different answer from the step
+# it is verifying (measured logit cosine 0.988 against decode, which is what
+# made the emitted text diverge from plain greedy).
+_SPEC_VERIFY_W4A16 = _os_early.environ.get(
+    'NEXN2_SPEC_VERIFY_W4A16', '1') != '0'
 _SPEC_VERIFY = False
 
 
@@ -243,6 +252,42 @@ _DENSE_BF16_MIN_M = 1
 # ON; decode (M=1) stays on its own GEMV (weight-bound -> fp4). Set False to
 # fall back to the fp32 path. (K must be a multiple of 64.)
 _DENSE_W16A16 = True
+
+
+def _w4a16_mrows(x2d, w, ld, key, fvk, device):
+    """A few rows against the 4-bit weight the *decode* path caches.
+
+    This is what makes a speculative verify the same function as the step it
+    verifies. It reads the identical packed tensor under the identical cache
+    keys the decode GEMV uses -- not a second copy quantised by a different
+    helper -- and runs the M-row form of that GEMV, whose per-row accumulation
+    order is the GEMV's. So a verified row equals the decode row it stands in
+    for, bit for bit, and the window reads the weight once rather than once per
+    token and at a quarter of the bytes the BF16 path reads.
+    """
+    n, k = w.shape
+    pk = key + '_w4a16_p'
+    if pk not in ld:
+        packed = torch.empty(n, k // 2, dtype=torch.uint8, device=device)
+        sf = torch.zeros(_sf_swz_bytes(n, k), dtype=torch.uint8, device=device)
+        scr = torch.zeros(1, dtype=torch.float32, device=device)
+        og = torch.zeros(1, dtype=torch.float32, device=device)
+        fvk.bf16_weight_to_nvfp4_swizzled(
+            w.contiguous().data_ptr(), packed.data_ptr(), sf.data_ptr(),
+            scr.data_ptr(), og.data_ptr(), n, k, _cs())
+        torch.cuda.synchronize()
+        ld[pk] = packed
+        ld[key + '_w4a16_sf'] = sf
+        ld[key + '_w4a16_a'] = float(og.item())
+    m = x2d.shape[0]
+    xc = x2d.contiguous()
+    y = torch.empty(m, n, dtype=torch.bfloat16, device=device)
+    rc = fvk.w4a16_mrows_edge_sm120_bf16(
+        xc.data_ptr(), ld[pk].data_ptr(), ld[key + '_w4a16_sf'].data_ptr(),
+        y.data_ptr(), m, n, k, ld[key + '_w4a16_a'], _cs())
+    if rc:
+        raise RuntimeError(f'M-row W4A16 failed with {rc} at M={m}')
+    return y
 
 
 def _gemm_w4a16(x2d, w, ld, key, fvk, device):
