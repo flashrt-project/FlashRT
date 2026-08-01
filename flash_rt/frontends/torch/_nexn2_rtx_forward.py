@@ -147,7 +147,29 @@ def _proj(x2d, ld, base, n, fvk, device):
 # split-K reduction order can vary and flip a near-tie argmax. It does not apply
 # to this entry point, which was measured rather than assumed. Set False to
 # force the hand-written kernel.
-_DENSE_CUBLASLT = True
+import os as _os_early
+
+# The cuBLASLt wrapper picks its algorithm by *timing* eight candidates at
+# first use. Timing is noisy, so different processes pick different algorithms,
+# and different algorithms reduce in different orders -- which makes the model
+# itself non-deterministic across processes. Measured on one binary: the golden
+# prefix came out 16/16 three times and 14/16 three times, flipping between
+# exactly two token streams. Asking for one candidate takes the heuristic's own
+# choice instead, and five of five processes then agree.
+#
+# It is not a speed trade worth making either way round: at 1024 tokens the
+# timed pick is worth 1.6% warm (213.6 against 217.1 ms) and costs 25% of the
+# cold time (about 1020 against 770 ms), because the timing loop runs inside
+# the first call. Determinism and a faster first token for 1.6% of the warm
+# path.
+#
+# Set here rather than in the kernel, whose default is shared with other
+# frontends. FLASHRT_BF16_CUBLASLT_AUTOTUNE_ALGOS overrides.
+_os_early.environ.setdefault('FLASHRT_BF16_CUBLASLT_AUTOTUNE_ALGOS', '1')
+
+# NEXN2_DENSE_CUBLASLT=0 drops to the in-house bf16 GEMM entirely, which is
+# also deterministic but 66% slower at 2048 (693 against 418 ms).
+_DENSE_CUBLASLT = _os_early.environ.get('NEXN2_DENSE_CUBLASLT', '1') != '0'
 
 
 def _gemm_w16a16(x2d, w, fvk, device):
