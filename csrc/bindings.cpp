@@ -5513,6 +5513,16 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("M"), py::arg("N"), py::arg("K"),
         py::arg("alpha") = 1.0f, py::arg("stream") = 0);
 
+    m.def("moe_router_topk_warp_sm120_bf16",
+        [](uintptr_t logits, uintptr_t out_idx, uintptr_t out_val,
+           int n_experts, int k, uintptr_t stream) {
+            return flash_rt::kernels::moe_router_topk_warp_sm120_bf16(
+                to_ptr(logits), to_ptr(out_idx), to_ptr(out_val),
+                n_experts, k, to_stream(stream));
+        },
+        py::arg("logits"), py::arg("out_idx"), py::arg("out_val"),
+        py::arg("n_experts"), py::arg("k"), py::arg("stream") = 0);
+
     m.def("moe_router_topk_sm120_bf16",
         [](uintptr_t logits, uintptr_t out_idx, uintptr_t out_val,
            int n_experts, int k, uintptr_t stream) -> int {

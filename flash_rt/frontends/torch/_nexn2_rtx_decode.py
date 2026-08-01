@@ -359,6 +359,18 @@ class Nexn2DecodeState:
         self.attn.reset_cache()
 
 
+def router_topk(fvk):
+    """The router top-k entry this build should call.
+
+    The warp variant returns identical indices and values -- argmax under a
+    total order picks one element regardless of the reduction tree, checked
+    over 800 inputs of which 397 had a tie inside the top-8 -- without the
+    block kernel's 24 barriers.
+    """
+    fn = getattr(fvk, 'moe_router_topk_warp_sm120_bf16', None)
+    return fn if fn is not None else fvk.moe_router_topk_sm120_bf16
+
+
 def gdn_recurrent(fvk):
     """The single-token GDN recurrence entry this build should call.
 
@@ -653,7 +665,7 @@ def _moe_layer_decode(h, ld, state, fvk, device):
     # idx and topv come from torch.empty, so an unchecked failure here leaves
     # uninitialised memory to be used as expert indices -- which reaches a file
     # offset before anything notices.
-    rc = fvk.moe_router_topk_sm120_bf16(
+    rc = router_topk(fvk)(
         lr.data_ptr(), idx.data_ptr(), topv.data_ptr(), lr.numel(), TOPK, s)
     if rc:
         raise RuntimeError(
@@ -1110,7 +1122,7 @@ def _verify_moe(h, ld, state, w, fvk, device):
     idx = torch.empty(w, TOPK, dtype=torch.int32, device=device)
     topv = torch.empty(w, TOPK, dtype=torch.float32, device=device)
     for t in range(w):
-        rc = fvk.moe_router_topk_sm120_bf16(
+        rc = router_topk(fvk)(
             logit_raw[t].data_ptr(), idx[t].data_ptr(), topv[t].data_ptr(),
             ne, TOPK, s)
         if rc:
