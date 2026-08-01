@@ -1177,10 +1177,21 @@ def _verify_block_usable(state) -> bool:
     reads, which is only true where decode takes the W4A16 dense path over
     BF16-scope weights. Anywhere else the prefill forward is still the answer.
     """
+    # gdn_in_proj_w4a16 is gated separately from the rest of the dense path, so
+    # with it off decode reads the GDN in_proj at BF16 while the window reads
+    # it at four bits -- a different function in thirty of the forty layers,
+    # which is exactly the thing this block exists to rule out.
     if not _VERIFY_K_ROWS or not state.dense_w4a16:
         return False
+    if not state.gdn_in_proj_w4a16:
+        return False
+    # The window fuses the router with the shared gate/up and reads every
+    # projection at four bits, which is what decode does only when the loader
+    # kept these BF16. One NVFP4 site among them and decode takes the W4A4 mma
+    # instead, so ask about each of the three the window assumes.
     ld = state.handles.ptrs['layers'][0]
     return (ld.get('router_packed') is None
+            and ld.get('shared_gate_proj_packed') is None
             and ld.get('out_proj_packed') is None
             and not ld.get('experts_streamed'))
 
