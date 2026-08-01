@@ -29,8 +29,8 @@ import torch.nn.functional as F
 
 from flash_rt.frontends.torch._nexn2_rtx_forward import (
     CONV, HD, HID, HK, HV, INTER, KD, KS, NKV, NQ, NV, ROPE, TOPK, VD,
-    _quant_act, build_rope_tables, moe_grouped_w4a16, nexn2_forward_nvfp4,
-    set_spec_verify, w4a16_matvec,
+    _quant_act, _w4a16_mrows, build_rope_tables, moe_grouped_w4a16,
+    nexn2_forward_nvfp4, set_spec_verify, w4a16_matvec,
 )
 from flash_rt.frontends.torch._nexn2_rtx_nvfp4_weights import _sf_swz_bytes
 from flash_rt.hardware.rtx.attn_backend_nexn2 import RtxFlashAttnBackendNexn2
@@ -46,6 +46,11 @@ def _qwen35moe_env(name: str, default: str) -> str:
 # (batched has a fixed forward overhead; below this the loop's lower latency
 # wins). See Nexn2DecodeState.batched_prefill.
 _BATCHED_PREFILL_MIN_S = 8
+
+# Run a speculative window through the decode kernels at w rows rather than
+# through the prefill forward. Read once, at import, because a captured graph
+# replays whatever branch was taken when it was recorded.
+_VERIFY_K_ROWS = _qwen35moe_env("VERIFY_K_ROWS", "1") != "0"
 
 
 def _cs():
@@ -716,6 +721,32 @@ def decode_step(state, token_id, pos, fvk, device):
     return _lm_head(state, h, fvk, device)
 
 
+def _ensure_lm_head_nvfp4(state, fvk, device):
+    """Quantise the lm_head to swizzled NVFP4 once, on the handles.
+
+    Both the single-row decode head and the M-row verify read this one copy,
+    so the verify cannot drift from decode by having been handed a second
+    quantisation of the same weight. The .item() lands here, on the first
+    eager call, and never inside a captured region.
+    """
+    p = state.handles.ptrs
+    if 'lm_head_packed_t' in p:
+        return
+    w = p['lm_head_w_t'].contiguous()
+    nn, kk = w.shape
+    packed = torch.empty(nn, kk // 2, dtype=torch.uint8, device=device)
+    sf = torch.zeros(_sf_swz_bytes(nn, kk), dtype=torch.uint8, device=device)
+    scr = torch.zeros(1, dtype=torch.float32, device=device)
+    og = torch.zeros(1, dtype=torch.float32, device=device)
+    fvk.bf16_weight_to_nvfp4_swizzled(
+        w.data_ptr(), packed.data_ptr(), sf.data_ptr(),
+        scr.data_ptr(), og.data_ptr(), nn, kk, 0)
+    torch.cuda.synchronize()
+    p['lm_head_packed_t'] = packed
+    p['lm_head_sf_t'] = sf
+    p['lm_head_alpha'] = float(og.item())
+
+
 def _lm_head(state, h, fvk, device):
     """Project a hidden state to logits over the full vocabulary.
 
@@ -730,20 +761,7 @@ def _lm_head(state, h, fvk, device):
             h.reshape(1, HID).contiguous().data_ptr(),
             p['lm_head_w_t'].data_ptr(), logits.data_ptr(), vocab, HID, _cs())
         return logits
-    if 'lm_head_packed_t' not in p:
-        w = p['lm_head_w_t'].contiguous()
-        nn, kk = w.shape
-        packed = torch.empty(nn, kk // 2, dtype=torch.uint8, device=device)
-        sf = torch.zeros(_sf_swz_bytes(nn, kk), dtype=torch.uint8, device=device)
-        scr = torch.zeros(1, dtype=torch.float32, device=device)
-        og = torch.zeros(1, dtype=torch.float32, device=device)
-        fvk.bf16_weight_to_nvfp4_swizzled(
-            w.data_ptr(), packed.data_ptr(), sf.data_ptr(),
-            scr.data_ptr(), og.data_ptr(), nn, kk, 0)
-        torch.cuda.synchronize()
-        p['lm_head_packed_t'] = packed
-        p['lm_head_sf_t'] = sf
-        p['lm_head_alpha'] = float(og.item())
+    _ensure_lm_head_nvfp4(state, fvk, device)
     if hasattr(fvk, 'fp4_w4a4_mma_sm120_full_n_bf16out'):
         xp, xsf = _quant_act(h.reshape(1, HID), fvk, device, _cs())
         fvk.fp4_w4a4_mma_sm120_full_n_bf16out(
@@ -864,6 +882,309 @@ def _rewind_to(state, kept):
         state.lin_conv_state[rank].copy_(state.spec_conv[rank][kept - 1])
 
 
+def _verify_dense(x2d, w_bf16, ld, key, fvk, device):
+    """A window's rows against the 4-bit weight the decode GEMV reads.
+
+    Same tensor under the same cache key, and the M-row form of that GEMV,
+    whose per-row accumulation order is the GEMV's -- so row t of the result
+    equals what the decode step at that position would have computed, bit for
+    bit, while the weight crosses the bus once for the whole window.
+    """
+    return _w4a16_mrows(x2d, w_bf16, ld, key, fvk, device)
+
+
+def _verify_gdn(h, ld, state, lin_rank, w, fvk, device):
+    """The GDN layer over a window of w tokens, snapshotting per token.
+
+    The projections and the elementwise stages run at w rows; the two stages
+    that carry state -- the causal conv and the recurrence -- run a token at a
+    time through the very kernels the decode step calls, because a window is
+    accepted up to a prefix and the state at that prefix has to be the state
+    decode would have been in. The sequential-scan variant would do both in one
+    launch, but it is cos 0.99999 against the per-token kernel rather than
+    equal to it, and this layer is ~6% of a step: not worth paying for in
+    tokens that diverge.
+    """
+    eps = state.eps
+    convw = ld['conv1d_w_t'].reshape(CONV, KS).contiguous()
+    A_log, dtb = ld['A_log_t'].float(), ld['dt_bias_t'].float()
+    nw = ld['gdn_norm_w_t']
+    s = _cs()
+    x = h.reshape(w, HID)
+
+    if 'in_proj_fused_w' not in ld:
+        ld['in_proj_fused_w'] = torch.cat(
+            [ld['in_proj_qkv_w_t'], ld['in_proj_z_w_t'],
+             ld['in_proj_a_w_t'], ld['in_proj_b_w_t']], 0).contiguous()
+    fused = _verify_dense(x, ld['in_proj_fused_w'], ld, 'in_proj_fused',
+                          fvk, device)
+    mixed = fused[:, :KD * 2 + VD].contiguous()
+    z = fused[:, KD * 2 + VD:KD * 2 + VD + NV * HV].reshape(
+        w * NV, HV).contiguous()
+    a = fused[:, -2 * NV:-NV].contiguous()
+    b = fused[:, -NV:].contiguous()
+
+    conv_out = torch.empty(w, CONV, dtype=torch.bfloat16, device=device)
+    st_in = state.lin_conv_state[lin_rank]
+    for t in range(w):
+        st_out = state.spec_conv[lin_rank][t]
+        fvk.causal_conv1d_qwen36_update_inout_bf16(
+            mixed[t].data_ptr(), convw.data_ptr(), 0,
+            conv_out[t].data_ptr(), st_in.data_ptr(), st_out.data_ptr(),
+            1, CONV, KS, True, s)
+        st_in = st_out
+    state.lin_conv_state[lin_rank].copy_(st_in)
+
+    qb = torch.empty(w, NV, HK, dtype=torch.bfloat16, device=device)
+    kb = torch.empty(w, NV, HK, dtype=torch.bfloat16, device=device)
+    vb = torch.empty(w, NV, HV, dtype=torch.bfloat16, device=device)
+    fvk.qwen35moe_lin_split_qkv_broadcast_bf16(
+        conv_out.data_ptr(), qb.data_ptr(), kb.data_ptr(), vb.data_ptr(),
+        w, s)
+
+    neg = (-A_log.exp()).float().contiguous()
+    dtb_c = dtb.contiguous()
+    g_out = torch.empty(w, NV, dtype=torch.bfloat16, device=device)
+    bo = torch.empty(w, NV, dtype=torch.bfloat16, device=device)
+    fvk.qwen36_gdn_gating_bf16(
+        a.data_ptr(), b.data_ptr(), neg.data_ptr(), dtb_c.data_ptr(),
+        g_out.data_ptr(), bo.data_ptr(), w, NV, s)
+
+    core = torch.empty(w, NV, HV, dtype=torch.bfloat16, device=device)
+    lin_state = state.lin_state[lin_rank]
+    for t in range(w):
+        qt, kt, vt = qb[t], kb[t], vb[t]
+        gt, bt = g_out[t], bo[t]
+        fvk.gated_deltanet_recurrent_qwen36_bf16(
+            qt.data_ptr(), kt.data_ptr(), vt.data_ptr(), gt.data_ptr(),
+            bt.data_ptr(), lin_state.data_ptr(), core[t].data_ptr(),
+            1, NV, HK, HV, True, s)
+        state.spec_states[lin_rank][t].copy_(lin_state)
+
+    nf = torch.empty(w * NV, HV, dtype=torch.bfloat16, device=device)
+    fvk.rms_norm_gated_silu_qwen36_bf16(
+        core.reshape(w * NV, HV).data_ptr(), z.data_ptr(), nw.data_ptr(),
+        nf.data_ptr(), w * NV, HV, eps, s)
+    out = _verify_dense(nf.reshape(w, VD), ld['out_proj_w_t'], ld,
+                        'out_proj_w_t', fvk, device)
+    return out.reshape(1, w, HID)
+
+
+def _verify_full(h, ld, state, full_rank, pos, w, fvk, device):
+    """The full-attention layer over a window of w tokens.
+
+    Projections, norms and rope run at w rows. The attention itself runs a
+    token at a time at q_seq=1 against [0..pos+t], which is the call the decode
+    step makes: a batched q_seq=w call would have to carry a bottom-right
+    causal mask and would reduce over a different tiling, and this is the one
+    place where the two would stop being the same function. The KV it reads is
+    small next to the weights the window is here to amortise.
+    """
+    eps = state.eps
+    s = _cs()
+    qnw, knw = ld['q_norm_w_t'], ld['k_norm_w_t']
+    x2 = h.reshape(w, HID)
+
+    nqg = NQ * 2 * HD
+    if 'qkv_fused_w' not in ld:
+        ld['qkv_fused_w'] = torch.cat(
+            [ld['q_proj_w_t'], ld['k_proj_w_t'], ld['v_proj_w_t']],
+            0).contiguous()
+    fused = _verify_dense(x2, ld['qkv_fused_w'], ld, 'qkv_fused', fvk, device)
+    qg = fused[:, :nqg].contiguous()
+    kk = fused[:, nqg:nqg + NKV * HD].reshape(w * NKV, HD).contiguous()
+    v = fused[:, nqg + NKV * HD:].reshape(w, NKV, HD).contiguous()
+
+    q_pre = torch.empty(w, NQ, HD, dtype=torch.bfloat16, device=device)
+    gate = torch.empty(w, NQ * HD, dtype=torch.bfloat16, device=device)
+    fvk.qwen35moe_split_q_gate_bf16(
+        qg.data_ptr(), q_pre.data_ptr(), gate.data_ptr(), w, s)
+    q = _rms_fvk(q_pre.reshape(w * NQ, HD), qnw, fvk, device, eps)
+    kn = _rms_fvk(kk, knw, fvk, device, eps)
+
+    ct = state.rope_cos[pos:pos + w].contiguous()
+    st = state.rope_sin[pos:pos + w].contiguous()
+    qin = q.reshape(w, NQ, HD).contiguous()
+    kin = kn.reshape(w, NKV, HD).contiguous()
+    qo = torch.empty(w, NQ, HD, dtype=torch.bfloat16, device=device)
+    ko = torch.empty(w, NKV, HD, dtype=torch.bfloat16, device=device)
+    fvk.qwen36_partial_rope_qk_bf16(
+        qin.data_ptr(), kin.data_ptr(), ct.data_ptr(), st.data_ptr(),
+        qo.data_ptr(), ko.data_ptr(), w, NQ, NKV, HD, ROPE, s)
+
+    attn = state.attn
+    at = torch.empty(w, NQ * HD, dtype=torch.bfloat16, device=device)
+    for t in range(w):
+        attn.Q_buf[:, :1].copy_(qo[t].reshape(1, 1, NQ, HD))
+        attn.K_cache[full_rank, pos + t:pos + t + 1].copy_(
+            ko[t].reshape(1, NKV, HD))
+        attn.V_cache[full_rank, pos + t:pos + t + 1].copy_(
+            v[t].reshape(1, NKV, HD))
+        attn.run('full', layer_idx=full_rank, q_seq=1, kv_seq=pos + t + 1,
+                 stream=s, softmax_scale=float(HD) ** -0.5)
+        at[t].copy_(attn.O_buf[:, :1].reshape(NQ * HD))
+    at = _sigmoid_mul(at, gate, fvk, device)
+    out = _verify_dense(at, ld['o_proj_w_t'], ld, 'o_proj_w_t', fvk, device)
+    return out.reshape(1, w, HID)
+
+
+def _verify_moe(h, ld, state, w, fvk, device):
+    """The MoE layer over a window of w tokens.
+
+    The routed experts are the one part of a window that does not amortise:
+    w tokens pick up to w*TOPK distinct experts out of 256, so the weight
+    traffic here scales with the window where everything else is read once.
+    They still go through one grouped launch rather than w of them -- the
+    kernel already takes the slot count, and a slot is an independent GEMV, so
+    w*TOPK slots compute exactly what w separate TOPK-slot launches would.
+    """
+    s = _cs()
+    x = h.reshape(w, HID)
+    ne = ld['router_w_t'].shape[0]
+
+    if 'router_shared_fused_w' not in ld:
+        ld['router_shared_fused_w'] = torch.cat(
+            [ld['router_w_t'], ld['shared_gate_proj_w_t'],
+             ld['shared_up_proj_w_t']], 0).contiguous()
+    rs = _verify_dense(x, ld['router_shared_fused_w'], ld,
+                       'router_shared_fused', fvk, device)
+    logit_raw = rs[:, :ne].contiguous()
+    sg, su = rs[:, ne:ne + INTER], rs[:, ne + INTER:]
+
+    # Top-8 a row at a time through the decode router. It is a single-block
+    # kernel, so w launches is w small launches -- and the selected set has to
+    # be the set decode selects, ties included, or the window keeps a token
+    # from a different mixture.
+    idx = torch.empty(w, TOPK, dtype=torch.int32, device=device)
+    topv = torch.empty(w, TOPK, dtype=torch.float32, device=device)
+    for t in range(w):
+        rc = fvk.moe_router_topk_sm120_bf16(
+            logit_raw[t].data_ptr(), idx[t].data_ptr(), topv[t].data_ptr(),
+            ne, TOPK, s)
+        if rc:
+            raise RuntimeError(
+                f'router top-k failed with {rc} for {ne} experts, k={TOPK}')
+    tw = F.softmax(topv, -1)
+
+    if 'experts_gate_up_alpha_dev' not in ld:
+        ld['experts_gate_up_alpha_dev'] = \
+            ld['experts_gate_up_alpha_t'].to(device).contiguous()
+        ld['experts_down_alpha_dev'] = \
+            ld['experts_down_alpha_t'].to(device).contiguous()
+    gu_p, gu_s = ld['experts_gate_up_packed_t'], ld['experts_gate_up_sf_t']
+    dn_p, dn_s = ld['experts_down_packed_t'], ld['experts_down_sf_t']
+    gu_a, dn_a = ld['experts_gate_up_alpha_dev'], ld['experts_down_alpha_dev']
+    n_gu, n_dn = gu_p.shape[1], dn_p.shape[1]
+
+    slots = w * TOPK
+    eidx = idx.reshape(-1).contiguous()
+    # One activation row per slot: the grouped kernel indexes A by slot, and
+    # the decode call gets the same effect from a zero stride over its single
+    # row. The copy is w*TOPK*HID bf16 -- tens of KB.
+    xrep = x.repeat_interleave(TOPK, 0).contiguous()
+    d_gu = torch.empty(slots, n_gu, dtype=torch.bfloat16, device=device)
+    moe_grouped_w4a16(fvk)(
+        xrep.data_ptr(), gu_p.data_ptr(), gu_s.data_ptr(), gu_a.data_ptr(),
+        eidx.data_ptr(), d_gu.data_ptr(), slots, n_gu, HID,
+        HID, gu_p[0].numel(), gu_s[0].numel(), s)
+
+    g_, u_ = d_gu[:, :INTER], d_gu[:, INTER:]
+    inter = _silu_mul(g_, u_, fvk, device).contiguous()
+    d_dn = torch.empty(slots, n_dn, dtype=torch.bfloat16, device=device)
+    moe_grouped_w4a16(fvk)(
+        inter.data_ptr(), dn_p.data_ptr(), dn_s.data_ptr(), dn_a.data_ptr(),
+        eidx.data_ptr(), d_dn.data_ptr(), slots, n_dn, INTER,
+        INTER, dn_p[0].numel(), dn_s[0].numel(), s)
+
+    rk = f'verify_topk_rows_{w}'
+    if rk not in ld:
+        ld[rk] = torch.arange(slots, dtype=torch.int32, device=device)
+    twf = tw.reshape(-1).contiguous()
+    out = torch.empty(w, n_dn, dtype=torch.float32, device=device)
+    fvk.moe_weighted_sum_sm120_bf16(
+        d_dn.data_ptr(), ld[rk].data_ptr(), twf.data_ptr(),
+        out.data_ptr(), w, TOPK, n_dn, n_dn, s)
+
+    si = _silu_mul(sg.contiguous(), su.contiguous(), fvk, device)
+    shared = _verify_dense(si, ld['shared_down_proj_w_t'], ld,
+                           'shared_down_proj_w_t', fvk, device)
+    # The scalar gate is an N=1 GEMV over a 4 KB weight, so a row at a time
+    # costs nothing and is the decode kernel's own arithmetic.
+    xc = x.contiguous()
+    gsc = torch.empty(w, 1, dtype=torch.bfloat16, device=device)
+    for t in range(w):
+        xr = xc[t]
+        fvk.bf16_matvec_sm120_bf16(
+            xr.data_ptr(), ld['shared_gate_w_t'].data_ptr(),
+            gsc[t].data_ptr(), 1, HID, s)
+    sgate = torch.sigmoid(gsc.float())
+    return (out + shared.float() * sgate).reshape(
+        1, w, HID).to(torch.bfloat16)
+
+
+def _verify_block_K(state, toks, pos, w, fvk, device):
+    """Run a window of w tokens through the decode kernels, at w rows.
+
+    This is what makes the verify the same function as the steps it verifies.
+    Every stage is the kernel decode calls, at w rows instead of one, over the
+    weights decode caches; the two state-carrying stages and the attention run
+    per token for the reasons given above. So the window's row t is the decode
+    step at pos+t, and the largest weights cross the bus once instead of w
+    times.
+
+    Returns (logits (w, vocab), hidden (w, HID) pre-final-norm).
+    """
+    p = state.handles.ptrs
+    layers = p['layers']
+    h = F.embedding(toks.view(1, w), p['embed_w_t'])
+
+    for L in range(state.num_layers):
+        ld = layers[L]
+        res = h
+        n = _rms_fvk(h, ld['input_norm_w_t'], fvk, device, state.eps)
+        if state.types[L] == 'linear_attention':
+            attn = _verify_gdn(n, ld, state, state._lin_rank[L], w,
+                               fvk, device)
+        else:
+            attn = _verify_full(n, ld, state, state._full_rank[L], pos, w,
+                                fvk, device)
+        h = res + attn
+        res = h
+        n = _rms_fvk(h, ld['post_norm_w_t'], fvk, device, state.eps)
+        state._active_layer = L
+        h = res + _verify_moe(n, ld, state, w, fvk, device)
+
+    hidden = h.reshape(w, HID)
+    hn = _rms_fvk(h, p['final_norm_w_t'], fvk, device, state.eps)
+    vocab = p['vocab_size']
+    _ensure_lm_head_nvfp4(state, fvk, device)
+    logits = torch.empty(w, vocab, dtype=torch.bfloat16, device=device)
+    hc = hn.reshape(w, HID).contiguous()
+    rc = fvk.w4a16_mrows_edge_sm120_bf16(
+        hc.data_ptr(), p['lm_head_packed_t'].data_ptr(),
+        p['lm_head_sf_t'].data_ptr(), logits.data_ptr(),
+        w, vocab, HID, p['lm_head_alpha'], _cs())
+    if rc:
+        raise RuntimeError(f'M-row lm_head failed with {rc} at M={w}')
+    return logits, hidden
+
+
+def _verify_block_usable(state) -> bool:
+    """Can the window run on the decode kernels?
+
+    The M-row GEMV stages a window's activations in shared memory, so it has a
+    width limit; and the whole point is that the window reads what decode
+    reads, which is only true where decode takes the W4A16 dense path over
+    BF16-scope weights. Anywhere else the prefill forward is still the answer.
+    """
+    if not _VERIFY_K_ROWS or not state.dense_w4a16:
+        return False
+    ld = state.handles.ptrs['layers'][0]
+    return (ld.get('router_packed') is None
+            and ld.get('out_proj_packed') is None
+            and not ld.get('experts_streamed'))
+
+
 def _spec_block(state, pos, k, fvk, device):
     """The whole window as one dependency chain: k drafts, then the verify.
 
@@ -883,16 +1204,20 @@ def _spec_block(state, pos, k, fvk, device):
         fvk.qwen36_argmax_bf16(d_logits.data_ptr(),
                                toks[j + 1:j + 2].data_ptr(), 1, vocab, _cs())
 
-    state.spec_capture = True
-    set_spec_verify(True)
-    try:
-        logits, hid = nexn2_forward_nvfp4(
-            state.handles, toks[:window].view(1, window), fvk, device,
-            cap=state, pos_offset=pos, last_logits_only=False,
-            return_hidden=True)
-    finally:
-        state.spec_capture = False
-        set_spec_verify(False)
+    if _verify_block_usable(state):
+        logits, hid = _verify_block_K(state, toks[:window], pos, window,
+                                      fvk, device)
+    else:
+        state.spec_capture = True
+        set_spec_verify(True)
+        try:
+            logits, hid = nexn2_forward_nvfp4(
+                state.handles, toks[:window].view(1, window), fvk, device,
+                cap=state, pos_offset=pos, last_logits_only=False,
+                return_hidden=True)
+        finally:
+            state.spec_capture = False
+            set_spec_verify(False)
     logits = logits.reshape(window, -1)
     fvk.qwen36_argmax_bf16(logits.data_ptr(), state._spec_argmax.data_ptr(),
                            window, vocab, _cs())
