@@ -3,6 +3,8 @@
 // Grouped NVFP4 block-scaled GEMM for sm_100-class Blackwell. See header.
 
 #include "gemm/fp4/cutlass_nvfp4_moe_grouped_sm100.cuh"
+#include <cstdlib>
+#include <cstdio>
 
 #include <cstdio>
 
@@ -47,7 +49,13 @@ using ProblemShape  = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
 using ArchTag       = cutlass::arch::Sm100;
 using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
 using ClusterShape  = Shape<int32_t, int32_t, _1>;
-using MmaTileShape  = Shape<_128, _256, _256>;
+// N of 128 rather than 256, measured. A prefill routes about sixty-four rows
+// to the average expert across 256 groups of unequal size, and the narrower
+// tile gives the scheduler twice as many blocks to balance them across twenty
+// SMs. Paired against N=256 on the same machine state: 377.9/378.2/377.9 ms
+// against 429.6/386.3/387.6 -- the worst run of this tile beats the best run
+// of the other, and the spread goes from 43 ms to 0.3.
+using MmaTileShape  = Shape<_128, _128, _256>;
 
 using CollectiveEpilogue =
     typename cutlass::epilogue::collective::CollectiveBuilder<
@@ -241,7 +249,21 @@ int moe_grouped_gemm_nvfp4_sm100_bf16out(
   hw_info.device_id = 0;
   hw_info.sm_count =
       cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
-  hw_info.cluster_shape = dim3(1, 1, 1);
+  // The cluster is a runtime shape, so it was swept without recompiling:
+  // (1,1) (2,1) (1,2) (2,2) (4,1) (1,4) at the prefill shape, then the best
+  // two alternated three times each. The within-pair differences (+1.4%,
+  // -0.4%, +0.8%) came out smaller than the drift between runs (427 to 385 ms
+  // for the same setting), so the cluster shape does not move this. Left as a
+  // knob with the result written down rather than as a knob to try again.
+  static const dim3 kCluster = [] {
+    const char* v = std::getenv("FLASHRT_MOE_GROUPED_CLUSTER");
+    int x = 1, y = 1;
+    if (v && std::sscanf(v, "%d,%d", &x, &y) == 2 && x >= 1 && y >= 1) {
+      return dim3(x, y, 1);
+    }
+    return dim3(1, 1, 1);
+  }();
+  hw_info.cluster_shape = kCluster;
   hw_info.cluster_shape_fallback = dim3(1, 1, 1);
 
   typename Gemm::Arguments args_proto{};
