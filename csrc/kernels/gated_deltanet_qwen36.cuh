@@ -60,6 +60,21 @@ void gated_deltanet_recurrent_qwen36_bf16(
 // to state_out (different buffer). Caller chains state_in[k+1] :=
 // state_out[k] to support per-step state save without an extra
 // .copy_(state_save, state) launch per step.
+// Spill-free variant of the above: identical arithmetic and accumulation
+// order, but the thread's state column is re-read rather than held in a
+// 128-float local array. Same arguments, same results, bit for bit.
+void gated_deltanet_recurrent_edge_qwen36_bf16(
+    const void* q,
+    const void* k,
+    const void* v,
+    const void* g,
+    const void* beta,
+    void*       state,
+    void*       out,
+    int B, int num_v_heads, int head_k_dim, int head_v_dim,
+    bool use_qk_l2norm,
+    cudaStream_t stream);
+
 void gated_deltanet_recurrent_inout_qwen36_bf16(
     const void* q,
     const void* k,

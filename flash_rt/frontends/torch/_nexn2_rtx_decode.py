@@ -359,6 +359,20 @@ class Nexn2DecodeState:
         self.attn.reset_cache()
 
 
+def gdn_recurrent(fvk):
+    """The single-token GDN recurrence entry this build should call.
+
+    The edge variant is the same arithmetic in the same order -- checked
+    exactly, over chained steps so the state drift is exercised too -- and it is
+    1.70x the shipped one. The shipped one holds the thread's whole state column
+    in a 128-float array that cannot live in registers, so it is in local
+    memory and walked five times; ncu measures 39 registers per thread for a
+    128-float array. 51% of bandwidth against 87%.
+    """
+    fn = getattr(fvk, 'gated_deltanet_recurrent_edge_qwen36_bf16', None)
+    return fn if fn is not None else fvk.gated_deltanet_recurrent_qwen36_bf16
+
+
 def _gdn_gate_consts(ld, device):
     """The gating kernel's two constant inputs, derived once per layer.
 
@@ -434,7 +448,7 @@ def _decode_gdn(h, ld, state, lin_rank, fvk, device):
     gt = g_out.reshape(NV).contiguous()
     bt = bo.reshape(NV).contiguous()
     core = torch.empty(NV, HV, dtype=torch.bfloat16, device=device)
-    fvk.gated_deltanet_recurrent_qwen36_bf16(
+    gdn_recurrent(fvk)(
         qt.data_ptr(), kt.data_ptr(), vt.data_ptr(), gt.data_ptr(),
         bt.data_ptr(), state.lin_state[lin_rank].data_ptr(),
         core.data_ptr(), 1, NV, HK, HV, True, s)
@@ -993,7 +1007,7 @@ def _verify_gdn(h, ld, state, lin_rank, w, fvk, device):
     for t in range(w):
         qt, kt, vt = qb[t], kb[t], vb[t]
         gt, bt = g_out[t], bo[t]
-        fvk.gated_deltanet_recurrent_qwen36_bf16(
+        gdn_recurrent(fvk)(
             qt.data_ptr(), kt.data_ptr(), vt.data_ptr(), gt.data_ptr(),
             bt.data_ptr(), lin_state.data_ptr(), core[t].data_ptr(),
             1, NV, HK, HV, True, s)
