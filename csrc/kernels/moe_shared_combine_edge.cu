@@ -22,8 +22,16 @@ __global__ void moe_shared_gate_combine_kernel(
   const float g = 1.0f / (1.0f + expf(-static_cast<float>(gate[row])));
   const size_t base = static_cast<size_t>(row) * dim;
   for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-    out[base + i] = __float2bfloat16(
-        routed[base + i] + static_cast<float>(shared[base + i]) * g);
+    // Multiply and add as two rounded operations, not one contracted fma.
+    // Written as `routed + shared * g` the compiler contracts it, which is one
+    // rounding instead of two and therefore a different number -- measured, one
+    // element in 16384 by one ulp, where the routed sum is small against the
+    // gated shared term. That is a fine trade in isolation and the wrong one
+    // here: the decode step computes this as separate tensor ops, and this
+    // kernel is only allowed to stand in for it if it lands on the same bits.
+    out[base + i] = __float2bfloat16(__fadd_rn(
+        routed[base + i],
+        __fmul_rn(static_cast<float>(shared[base + i]), g)));
   }
 }
 

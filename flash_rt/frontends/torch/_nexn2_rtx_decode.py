@@ -581,6 +581,28 @@ def _moe_experts_streamed(x, idx, state, fvk, device, s):
     return d_dn
 
 
+def _shared_combine(routed, shared, glog, rows, fvk, device):
+    """out = routed(fp32) + shared(bf16) * sigmoid(gate), in one kernel.
+
+    The tensor-op form is a cast, a sigmoid, a broadcast multiply, an add and a
+    cast: five launches a layer, forty layers, in a step that is 99% kernel
+    time and where a launch costs its dispatch quantum whether or not it
+    computes much. The kernel does the same arithmetic in the same order and
+    rounds once at the store, so it stands in for the chain rather than
+    approximating it -- checked bit for bit at the shapes and scales decode and
+    the window issue, because the fixture and the speculative verify both rest
+    on it.
+    """
+    if hasattr(fvk, 'moe_shared_gate_combine_edge_bf16'):
+        out = torch.empty(rows, HID, dtype=torch.bfloat16, device=device)
+        fvk.moe_shared_gate_combine_edge_bf16(
+            routed.data_ptr(), shared.data_ptr(), glog.data_ptr(),
+            out.data_ptr(), rows, HID, _cs())
+        return out
+    sgate = torch.sigmoid(glog.float()).reshape(rows, 1)
+    return (routed + shared.float() * sgate).to(torch.bfloat16)
+
+
 def _moe_layer_decode(h, ld, state, fvk, device):
     """M=1 fine-grained MoE via the grouped GEMV kernel: the 8 routed experts
     run in one launch each for gate_up (shared act) and down (per-slot act),
@@ -696,10 +718,11 @@ def _moe_layer_decode(h, ld, state, fvk, device):
     si = _silu_mul(sg, su, fvk, device)
     shared = _proj_mma(si, ld, 'shared_down_proj', HID, fvk, device, state)
     # shared-expert scalar gate: N=1 GEMV via the bf16 matvec kernel (was a
-    # torch matmul -- the last fp32 matmul in the captured decode step).
-    sgate = torch.sigmoid(
-        _bf16_mv(x, ld['shared_gate_w_t'], fvk, device).float())
-    return (out + shared.float() * sgate).reshape(1, 1, HID).to(torch.bfloat16)
+    # torch matmul -- the last fp32 matmul in the captured decode step). The
+    # sigmoid, the broadcast multiply, the add and the cast are one kernel.
+    glog = _bf16_mv(x, ld['shared_gate_w_t'], fvk, device)
+    return _shared_combine(out, shared, glog, 1, fvk, device).reshape(
+        1, 1, HID)
 
 
 def decode_step(state, token_id, pos, fvk, device):
@@ -1132,9 +1155,8 @@ def _verify_moe(h, ld, state, w, fvk, device):
         fvk.bf16_matvec_sm120_bf16(
             xr.data_ptr(), ld['shared_gate_w_t'].data_ptr(),
             gsc[t].data_ptr(), 1, HID, s)
-    sgate = torch.sigmoid(gsc.float())
-    return (out + shared.float() * sgate).reshape(
-        1, w, HID).to(torch.bfloat16)
+    return _shared_combine(out, shared, gsc, w, fvk, device).reshape(
+        1, w, HID)
 
 
 def _verify_block_K(state, toks, pos, w, fvk, device):
