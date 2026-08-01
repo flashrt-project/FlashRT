@@ -313,9 +313,18 @@ class Nexn2DecodeState:
         self._spec_argmax = None
         # Which half of the draft head's fc input carries the hidden state.
         # The checkpoint does not say and fc is square in the concatenated
-        # width, so this is settled by measuring acceptance both ways.
+        # width, so it was settled by measuring acceptance both ways -- and the
+        # answer is the embedding first. Over 48 decoded tokens:
+        #
+        #   cat[embed, hidden]   first draft 0.896, chained 0.646, 0.417
+        #   cat[hidden, embed]   0.000, 0.000, 0.000
+        #
+        # The wrong half drafts noise, so nothing is ever accepted and every
+        # window pays for a verify that keeps one token. It agrees with the
+        # reference implementation of this head, which concatenates the
+        # embedding first as well.
         self.mtp_hidden_first = (
-            _qwen35moe_env("MTP_HIDDEN_FIRST", "1") != "0")
+            _qwen35moe_env("MTP_HIDDEN_FIRST", "0") != "0")
         # Set to an ExpertCache to read the routed experts from storage. Only
         # meaningful when the loader skipped them; see _moe_experts_streamed.
         self.expert_cache = None
