@@ -998,10 +998,11 @@ def _moe_experts_m16(x, ti, tw, ld, fvk, device):
 
     exp_flat = ti.reshape(-1).to(torch.int32)
     tok_flat = torch.arange(S, device=device).repeat_interleave(TOPK)
-    order = exp_flat.argsort()
+    # Stable, so equal-expert ties keep token order and the rows packed into
+    # each quantisation tile are the same run to run.
+    order = exp_flat.argsort(stable=True)
     se = exp_flat[order].long()
     stok = tok_flat[order]
-    sw = tw.reshape(-1)[order]
     counts = torch.bincount(se, minlength=E)
     tile_counts = (counts + 15) // 16
     tile_off = torch.cumsum(tile_counts, 0) - tile_counts
@@ -1027,8 +1028,18 @@ def _moe_experts_m16(x, ti, tw, ld, fvk, device):
         ip.data_ptr(), dn_p.data_ptr(), isf.data_ptr(), dn_s.data_ptr(),
         d_dn.data_ptr(), dn_a.data_ptr(), tile_expert.data_ptr(),
         total_tiles, n_dn, INTER, 0, dn_p[0].numel(), dn_s[0].numel(), _cs())
-    out = torch.zeros(S, HID, device=device)
-    out.index_add_(0, stok, d_dn[tiled_row].float() * sw.unsqueeze(-1))
+    # Deterministic unpermute, as the grouped-GEMM path does: one kernel sums
+    # each token's TOPK rows in a fixed order. Slot i of the token-major
+    # routing sits at sorted position inv[i], whose output row is tiled_row of
+    # that position.
+    inv = torch.empty(S * TOPK, dtype=torch.long, device=device)
+    inv[order] = torch.arange(S * TOPK, device=device)
+    rows = tiled_row[inv].to(torch.int32).contiguous()
+    twc = tw.contiguous()
+    out = torch.empty(S, HID, dtype=torch.float32, device=device)
+    fvk.moe_weighted_sum_sm120_bf16(
+        d_dn.data_ptr(), rows.data_ptr(), twc.data_ptr(),
+        out.data_ptr(), S, TOPK, n_dn, n_dn, _cs())
     return out
 
 
@@ -1388,7 +1399,6 @@ def _moe_experts_per_expert_gemm(x, ti, tw, ld, fvk, device):
     order = exp_flat.argsort(stable=True)
     se = exp_flat[order]
     stok = tok_flat[order]
-    sw = tw.reshape(-1)[order]
 
     counts = torch.bincount(se, minlength=_N_EXPERTS).tolist()
     slots = S * TOPK
@@ -1420,8 +1430,15 @@ def _moe_experts_per_expert_gemm(x, ti, tw, ld, fvk, device):
                          dn_a[e], cnt, n_dn, INTER, fvk, device, _cs(),
                          out=d_dn[off_e:off_e + cnt])
 
-    out = torch.zeros(S, HID, device=device)
-    out.index_add_(0, stok, d_dn.float() * sw.unsqueeze(-1))
+    # Deterministic unpermute, as the grouped-GEMM path does; index_add_
+    # reduces through atomics, so its order varies run to run.
+    inv = torch.empty(S * TOPK, dtype=torch.int32, device=device)
+    inv[order] = torch.arange(S * TOPK, dtype=torch.int32, device=device)
+    twc = tw.contiguous()
+    out = torch.empty(S, HID, dtype=torch.float32, device=device)
+    fvk.moe_weighted_sum_sm120_bf16(
+        d_dn.data_ptr(), inv.data_ptr(), twc.data_ptr(),
+        out.data_ptr(), S, TOPK, n_dn, n_dn, _cs())
     return out
 
 
@@ -1445,10 +1462,10 @@ def _moe_experts_grouped(x, ti, tw, ld, fvk, device):
     slots = S * TOPK
     exp_flat = ti.reshape(-1).to(torch.int32)
     tok_flat = torch.arange(S, device=device).repeat_interleave(TOPK)
-    order = exp_flat.argsort()
+    # Stable, so equal-expert ties keep token order run to run.
+    order = exp_flat.argsort(stable=True)
     se = exp_flat[order].contiguous()
     stok = tok_flat[order]
-    sw = tw.reshape(-1)[order]
 
     A = x[stok].contiguous()                          # (slots, HID) bf16
     d_gu = torch.empty(slots, n_gu, dtype=torch.bfloat16, device=device)
@@ -1463,8 +1480,18 @@ def _moe_experts_grouped(x, ti, tw, ld, fvk, device):
         inter.data_ptr(), dn_p.data_ptr(), dn_s.data_ptr(), dn_a.data_ptr(),
         se.data_ptr(), d_dn.data_ptr(), slots, n_dn, INTER,
         INTER, dn_p[0].numel(), dn_s[0].numel(), _cs())
-    out = torch.zeros(S, HID, device=device)
-    out.index_add_(0, stok, d_dn.float() * sw.unsqueeze(-1))
+    # Deterministic unpermute, as the grouped-GEMM path does: invert the
+    # routing permutation and let one kernel sum each token's TOPK rows in a
+    # fixed order. index_add_ reduces through atomics, so eight fp32 addends
+    # land in whatever order the blocks retire -- and a prefill cannot afford
+    # that, because it seeds a decode that has to be reproducible.
+    inv = torch.empty(slots, dtype=torch.int32, device=device)
+    inv[order] = torch.arange(slots, dtype=torch.int32, device=device)
+    twc = tw.contiguous()
+    out = torch.empty(S, HID, dtype=torch.float32, device=device)
+    fvk.moe_weighted_sum_sm120_bf16(
+        d_dn.data_ptr(), inv.data_ptr(), twc.data_ptr(),
+        out.data_ptr(), S, TOPK, n_dn, n_dn, _cs())
     return out
 
 
