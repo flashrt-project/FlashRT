@@ -1039,9 +1039,15 @@ def seed_prefill_batched(state, input_ids, fvk, device):
         return seed_prefill_chunked(state, input_ids, fvk, device,
                                     state.prefill_chunk)
     state.reset()
-    logits = nexn2_forward_nvfp4(
+    logits, hidden = nexn2_forward_nvfp4(
         state.handles, input_ids.view(1, -1), fvk, device, cap=state,
-        last_logits_only=True)
+        last_logits_only=True, return_hidden=True)
+    # The last prompt position's pre-final-norm hidden state, which is what a
+    # draft head reads. The per-token path writes it every step; this one has
+    # to do it explicitly, and without it the first window drafts off whatever
+    # the previous generation left behind -- so how much of that window is kept
+    # depends on what ran before it, and the run stops being reproducible.
+    state.last_hidden.copy_(hidden[-1])
     return logits           # already (1, vocab): only the seeding logit
 
 
@@ -1059,9 +1065,11 @@ def seed_prefill_chunked(state, input_ids, fvk, device, block):
     logits = None
     for b0 in range(0, S, block):
         b1 = min(b0 + block, S)
-        logits = nexn2_forward_nvfp4(
+        logits, hidden = nexn2_forward_nvfp4(
             state.handles, ids[:, b0:b1], fvk, device, cap=state,
-            pos_offset=b0, last_logits_only=True, compute_logits=(b1 == S))
+            pos_offset=b0, last_logits_only=True, compute_logits=(b1 == S),
+            return_hidden=True)
+    state.last_hidden.copy_(hidden[-1])          # see seed_prefill_batched
     return logits
 
 
