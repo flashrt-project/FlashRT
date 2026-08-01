@@ -18,7 +18,26 @@ namespace {
 
 constexpr int kWarps = 2;                  // output-row groups per block
 constexpr int kThreads = kWarps * 32;      // 256
-constexpr int kUnroll = 4;                 // packed-weight loads in flight
+// Packed-weight loads in flight per row. Two, not four, and the reason is
+// occupancy rather than parallelism: ncu puts this kernel at 121 registers a
+// thread, which caps it at 8 blocks per SM when shared memory, warps and the
+// SM limit all allow 24 -- Block Limit Registers is the only binding one, and
+// achieved occupancy is 31%. wv[R][kUnroll] alone is R * kUnroll eight-byte
+// values, 64 registers at R=8.
+//
+// Halving it halves that array and buys back the warps. The loads in flight
+// per lane go from R * 4 to R * 2, but there are twice as many lanes issuing
+// them, and the second is worth more here. Swept in the captured decode step,
+// one build each:
+//
+//     kUnroll   4        3        2
+//     step      10.384   10.360   9.743 ms
+//     tok/s     96.3     96.5     102.6
+//
+// The accumulation order does not move: the main loop advances by 32*kUnroll
+// and the tail picks up the remainder, so a lane visits the same k-blocks in
+// the same sequence for any kUnroll, and the result is bit-identical.
+constexpr int kUnroll = 2;
 
 // A 16-element NVFP4 block is 16 bf16 of activation, 32 bytes. Held at that
 // stride, the eight lanes of a 128-bit shared-load phase land on banks
