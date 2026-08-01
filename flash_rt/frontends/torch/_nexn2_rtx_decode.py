@@ -359,6 +359,25 @@ class Nexn2DecodeState:
         self.attn.reset_cache()
 
 
+def _gdn_gate_consts(ld, device):
+    """The gating kernel's two constant inputs, derived once per layer.
+
+    ``A_log`` and ``dt_bias`` are weights, so -exp(A_log) and the fp32 bias are
+    the same on every step -- but deriving them per call put four elementwise
+    launches per GDN layer inside the captured region, thirty layers of them,
+    recomputing values identical to the previous replay's. Each is a couple of
+    microseconds of dispatch quantum for no arithmetic anyone reads.
+
+    Same expressions in the same order, so the bytes handed to the kernel are
+    the bytes it was getting before.
+    """
+    if 'gdn_neg_exp_a' not in ld:
+        ld['gdn_neg_exp_a'] = (
+            -ld['A_log_t'].float().exp()).float().contiguous()
+        ld['gdn_dt_bias_f'] = ld['dt_bias_t'].float().contiguous()
+    return ld['gdn_neg_exp_a'], ld['gdn_dt_bias_f']
+
+
 def _decode_gdn(h, ld, state, lin_rank, fvk, device):
     """GDN layer at one token, updating recurrent + conv state in place."""
     eps = state.eps
@@ -366,7 +385,7 @@ def _decode_gdn(h, ld, state, lin_rank, fvk, device):
     Wz = ld['in_proj_z_w_t']
     Wb, Wa = ld['in_proj_b_w_t'], ld['in_proj_a_w_t']
     convw = ld['conv1d_w_t'].reshape(CONV, KS).contiguous()
-    A_log, dtb = ld['A_log_t'].float(), ld['dt_bias_t'].float()
+    neg, dtb_c = _gdn_gate_consts(ld, device)
     nw = ld['gdn_norm_w_t']
 
     s = _cs()
@@ -403,8 +422,6 @@ def _decode_gdn(h, ld, state, lin_rank, fvk, device):
         conv_out.data_ptr(), qb.data_ptr(), kb.data_ptr(), vb.data_ptr(),
         1, s)
 
-    neg = (-A_log.exp()).float().contiguous()
-    dtb_c = dtb.contiguous()
     g_out = torch.empty(1, NV, dtype=torch.bfloat16, device=device)
     bo = torch.empty(1, NV, dtype=torch.bfloat16, device=device)
     fvk.qwen36_gdn_gating_bf16(
@@ -907,7 +924,7 @@ def _verify_gdn(h, ld, state, lin_rank, w, fvk, device):
     """
     eps = state.eps
     convw = ld['conv1d_w_t'].reshape(CONV, KS).contiguous()
-    A_log, dtb = ld['A_log_t'].float(), ld['dt_bias_t'].float()
+    neg, dtb_c = _gdn_gate_consts(ld, device)
     nw = ld['gdn_norm_w_t']
     s = _cs()
     x = h.reshape(w, HID)
@@ -942,8 +959,6 @@ def _verify_gdn(h, ld, state, lin_rank, w, fvk, device):
         conv_out.data_ptr(), qb.data_ptr(), kb.data_ptr(), vb.data_ptr(),
         w, s)
 
-    neg = (-A_log.exp()).float().contiguous()
-    dtb_c = dtb.contiguous()
     g_out = torch.empty(w, NV, dtype=torch.bfloat16, device=device)
     bo = torch.empty(w, NV, dtype=torch.bfloat16, device=device)
     fvk.qwen36_gdn_gating_bf16(
