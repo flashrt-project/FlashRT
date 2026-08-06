@@ -183,8 +183,9 @@ Jetson AGX Thor, against vLLM 0.26.0 on the same part and protocol:
 | NVFP4, 32 K | **7207.5 ms** (vLLM 7231.8) | | [Qwen3.6-MoE Thor](docs/qwen36_moe_usage.md#jetson-agx-thor-numbers) |
 
 TTFT leads at every length from 20 to 32768 tokens; 128 K context reaches the
-board at 2470 tok/s of prefill. The decode column predates a later round that
-moved the steady step from 89.0 to 102.6 tok/s, so it is a lower bound.
+board at 2470 tok/s of prefill. The decode column was taken before a later
+round that moved the steady step from 89.0 to 102.6 tok/s, and vLLM's side is
+unaffected by it, so the ratios shown are lower bounds.
 
 Speculative decode with the MTP head reaches **106.74 tok/s** against 100.35
 plain in the same process, emitting the same tokens as greedy decoding. See

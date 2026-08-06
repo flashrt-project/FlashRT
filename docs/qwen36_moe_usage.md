@@ -409,16 +409,23 @@ linear-attention scan -- the kernels win, and win by more the shorter the
 prompt. Where it is dominated by attention's O(S^2) the lead narrows, because
 attention is the one component still reached through torch.
 
-Decode, from the same sweep:
+Decode. Each row carries the tree it was taken on, because the decode round
+below moved the step 15.3% and the vLLM sweep predates it:
 
-| prompt | decode | vLLM decode | |
-|---:|---:|---:|---|
-| 1024 | **87.1 tok/s** | 31.6 tok/s | 2.8x |
-| 2048 | **86.3 tok/s** | 31.5 tok/s | 2.7x |
-| 4096 | **85.1 tok/s** | 31.2 tok/s | 2.7x |
+| measurement | tree | decode | vLLM decode | |
+|---|---|---:|---:|---|
+| @1024, from the sweep above | before the decode round | 87.1 tok/s | 31.6 tok/s | 2.8x |
+| @2048 | before the decode round | 86.3 tok/s | 31.5 tok/s | 2.7x |
+| @4096 | before the decode round | 85.1 tok/s | 31.2 tok/s | 2.7x |
+| captured steady step @20 | before the decode round | 89.0 tok/s | | |
+| captured steady step @20 | **current** | **102.6 tok/s** | | |
 
-That sweep predates the decode round below, which moved the steady step 15.3%
-and does not touch vLLM's side, so it is a lower bound on the current ratio.
+The two protocols agree on the same tree -- the sweep reads 87.1 at 1024, the
+captured step 89.0 at 20, a 2% spread -- so the distance from 87 to 102.6 is
+the decode round, not the way it was timed. vLLM's side is a different binary
+and nothing here changes it, which makes 2.7-2.8x a lower bound on the current
+ratio; the current tree has not been swept at 1024-4096, so no figure is quoted
+for it.
 
 Context reaches 128 K on this board, at 2470 tok/s of prefill. It could not
 before FA2 was available here: the default configuration chunks past 8192
@@ -428,9 +435,7 @@ backend, so the scores were materialised.
 ### The decode round
 
 Five changes, each bit-identical to what it replaced, measured in the captured
-steady step at a 20-token prompt. This is a different protocol from the sweep
-above, which times a whole generate, so the two numbers are not
-interchangeable.
+steady step at a 20-token prompt.
 
 | | step | tok/s |
 |---|---:|---:|
