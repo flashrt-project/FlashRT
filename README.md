@@ -1072,6 +1072,7 @@ examples/
 - **Cosmos3-Nano text-to-video** (`config="cosmos3_video"`) — RTX 5090 BF16/FP8 denoise and complete benchmark workflow; [usage and performance](docs/cosmos3_video_usage.md)
 - **Cosmos3-Edge AV inverse dynamics and Reasoner** (`config="cosmos3_edge"`) — Jetson AGX Thor official baseline, 6.60x no-cache AV denoise, and NVFP4 multimodal chat decode; [complete usage and performance](docs/cosmos3_edge_thor.md)
 - **Qwen3-VL-8B** — RTX 5090 NVFP4/FP8 multimodal path, RTX 4090 official-FP8 path, and Jetson BF16 paths for Thor and Orin; [RTX 5090 usage](docs/qwen3_vl_nvfp4.md), [RTX 4090 usage](docs/qwen3_vl_fp8_sm89.md), [Jetson Thor usage](docs/qwen3_vl_thor.md), [Jetson Orin usage](docs/qwen3_vl_rtx_bf16.md)
+- **Chameleon-7B** — Jetson Thor dynamic-FP8 prefill (~120 ms E2E, ~30 tok/s decode) and Jetson Orin INT8/QuaRot-INT4 path; [usage](docs/chameleon_usage.md), [Thor notes](docs/chameleon_thor_sm110.md), [Orin SM87 notes](docs/chameleon7b_rtx_sm87.md)
 - **MiniMax-Remover** — FP8 transformer + NVFP4 VAE video inpainting; [usage and performance](docs/minimax_remover_usage.md)
 - **MelBandRoformer** — kernelized FP8 audio source separation; [usage and performance](docs/melband_roformer_usage.md)
 - **OmniVoice TTS** — BF16/FP4 acceleration and HTTP serving; [serving quickstart](serving/omnivoice_agent/README.md)
