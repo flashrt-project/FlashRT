@@ -47,7 +47,8 @@ class RtxFlashAttnBackendNexn2:
     HEAD_DIM = 256
 
     def __init__(self, max_seq: int, max_q_seq: int = 1, dtype=None,
-                 num_full_layers: int | None = None):
+                 num_full_layers: int | None = None,
+                 use_fa2: bool | None = None):
         import torch
 
         self._torch = torch
@@ -114,16 +115,19 @@ class RtxFlashAttnBackendNexn2:
         # difference in one step flips a later one. That is the fixture losing
         # its meaning in exchange for 1%, which is the wrong trade.
         #
-        # So the default follows what each target already validated: on the
-        # arch that has always had FA2 in decode, keep it; on sm_110, where
-        # FA2 has only just started building and the fixture was recorded
-        # through the reference path, decline it. FLASHRT_NEXN2_DECODE_FA2
-        # overrides either way.
+        # So the caller says. ``use_fa2=None`` keeps what each target already
+        # validated: on the arch that has always had FA2 in decode, keep it;
+        # on sm_110, where FA2 has only just started building and the fixture
+        # was recorded through the reference path, decline it.
+        # FLASHRT_NEXN2_DECODE_FA2 overrides either way.
         import os as _os
-        _cap = torch.cuda.get_device_capability()
-        _default = "0" if _cap == (11, 0) else "1"
-        want_fa2 = _os.environ.get(
-            "FLASHRT_NEXN2_DECODE_FA2", _default) != "0"
+        if use_fa2 is None:
+            _cap = torch.cuda.get_device_capability()
+            _default = "0" if _cap == (11, 0) else "1"
+            want_fa2 = _os.environ.get(
+                "FLASHRT_NEXN2_DECODE_FA2", _default) != "0"
+        else:
+            want_fa2 = bool(use_fa2)
         try:
             from flash_rt import flash_rt_fa2 as _fa2
         except ImportError:

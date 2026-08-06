@@ -4694,17 +4694,21 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("x"), py::arg("W"), py::arg("out"),
         py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
 
+    // max_algos=0 (the default) keeps the environment-driven autotune this
+    // entry has always had; a caller passes 1 to take the heuristic's own pick
+    // and get a run-to-run reproducible reduction order. See the header.
     m.def("bf16_matmul_cublaslt_bf16",
         [](uintptr_t x, uintptr_t W, uintptr_t out,
-           int M, int N, int K, uintptr_t stream) {
+           int M, int N, int K, uintptr_t stream, int max_algos) {
             flash_rt::kernels::bf16_matmul_cublaslt_bf16(
                 reinterpret_cast<const __nv_bfloat16*>(x),
                 reinterpret_cast<const __nv_bfloat16*>(W),
                 reinterpret_cast<__nv_bfloat16*>(out),
-                M, N, K, to_stream(stream));
+                M, N, K, to_stream(stream), max_algos);
         },
         py::arg("x"), py::arg("W"), py::arg("out"),
-        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0,
+        py::arg("max_algos") = 0);
 
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS
     m.def("bf16_matmul_qwen36_bf16",

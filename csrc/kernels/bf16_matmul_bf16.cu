@@ -50,9 +50,14 @@ struct Bf16LtKey {
     int M;
     int N;
     int K;
+    // Part of the key, not just of the search: a caller that asked for a
+    // deterministic pick and one that let the timing loop run must not share
+    // whichever plan happened to be built first.
+    int max_algos;
 
     bool operator==(const Bf16LtKey& other) const {
-        return M == other.M && N == other.N && K == other.K;
+        return M == other.M && N == other.N && K == other.K
+            && max_algos == other.max_algos;
     }
 };
 
@@ -61,6 +66,7 @@ struct Bf16LtKeyHash {
         size_t h = static_cast<size_t>(key.M);
         h = h * 1315423911u + static_cast<size_t>(key.N);
         h = h * 1315423911u + static_cast<size_t>(key.K);
+        h = h * 1315423911u + static_cast<size_t>(key.max_algos);
         return h;
     }
 };
@@ -72,7 +78,10 @@ static std::mutex g_bf16_mu;
 static std::unordered_map<Bf16LtKey, Bf16LtPlan, Bf16LtKeyHash>
     g_bf16_plans;
 
-static int get_bf16_autotune_algos() {
+// requested > 0 is the caller's own bound; 0 falls back to the environment,
+// then to the historical default of 8.
+static int get_bf16_autotune_algos(int requested) {
+    if (requested > 0) return std::clamp(requested, 1, 32);
     const char* env = std::getenv("FLASHRT_BF16_CUBLASLT_AUTOTUNE_ALGOS");
     if (!env || !*env) return 8;
     return std::clamp(std::atoi(env), 1, 32);
@@ -94,10 +103,11 @@ static void ensure_bf16_lt() {
     }
 }
 
-static Bf16LtPlan& get_bf16_lt_plan(int M, int N, int K) {
+static Bf16LtPlan& get_bf16_lt_plan(int M, int N, int K,
+                                    int max_algos) {
     std::lock_guard<std::mutex> lock(g_bf16_mu);
     ensure_bf16_lt();
-    Bf16LtKey key{M, N, K};
+    Bf16LtKey key{M, N, K, max_algos};
     auto it = g_bf16_plans.find(key);
     if (it != g_bf16_plans.end()) return it->second;
 
@@ -159,9 +169,10 @@ static void autotune_bf16_lt_plan(
     int M,
     int N,
     int K,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    int max_algos) {
     if (plan.autotuned) return;
-    const int num_algos = get_bf16_autotune_algos();
+    const int num_algos = get_bf16_autotune_algos(max_algos);
     if (num_algos <= 1) {
         plan.autotuned = true;
         return;
@@ -434,12 +445,13 @@ void bf16_matmul_cublaslt_bf16(
     const __nv_bfloat16* W,
     __nv_bfloat16* out,
     int M, int N, int K,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    int max_algos) {
     if (M <= 0 || N <= 0 || K <= 0) return;
-    Bf16LtPlan& plan = get_bf16_lt_plan(M, N, K);
+    Bf16LtPlan& plan = get_bf16_lt_plan(M, N, K, max_algos);
     if (!plan.autotuned) {
         std::lock_guard<std::mutex> lock(g_bf16_mu);
-        autotune_bf16_lt_plan(plan, x, W, out, M, N, K, stream);
+        autotune_bf16_lt_plan(plan, x, W, out, M, N, K, stream, max_algos);
     }
     const float alpha = 1.0f;
     const float beta = 0.0f;

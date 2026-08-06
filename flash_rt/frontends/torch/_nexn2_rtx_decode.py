@@ -29,8 +29,8 @@ import torch.nn.functional as F
 
 from flash_rt.frontends.torch._nexn2_rtx_forward import (
     CONV, HD, HID, HK, HV, INTER, KD, KS, NKV, NQ, NV, ROPE, TOPK, VD,
-    _quant_act, _w4a16_mrows, build_rope_tables, moe_grouped_w4a16,
-    nexn2_forward_nvfp4, set_spec_verify, w4a16_matvec,
+    _quant_act, _w4a16_mrows, build_rope_tables, kernel_policy,
+    moe_grouped_w4a16, nexn2_forward_nvfp4, set_spec_verify, w4a16_matvec,
 )
 from flash_rt.frontends.torch._nexn2_rtx_nvfp4_weights import _sf_swz_bytes
 from flash_rt.hardware.rtx.attn_backend_nexn2 import RtxFlashAttnBackendNexn2
@@ -46,11 +46,6 @@ def _qwen35moe_env(name: str, default: str) -> str:
 # (batched has a fixed forward overhead; below this the loop's lower latency
 # wins). See Nexn2DecodeState.batched_prefill.
 _BATCHED_PREFILL_MIN_S = 8
-
-# Run a speculative window through the decode kernels at w rows rather than
-# through the prefill forward. Read once, at import, because a captured graph
-# replays whatever branch was taken when it was recorded.
-_VERIFY_K_ROWS = _qwen35moe_env("VERIFY_K_ROWS", "1") != "0"
 
 
 def _cs():
@@ -183,7 +178,8 @@ def _proj_mma(x2d, ld, base, n, fvk, device, state=None):
 class Nexn2DecodeState:
     """Persistent decode state: GDN recurrent/conv caches, KV cache, RoPE."""
 
-    def __init__(self, handles, max_seq, device):
+    def __init__(self, handles, max_seq, device, *,
+                 spec_graph_cache_max=None):
         self.handles = handles
         self.device = device
         self.max_seq = int(max_seq)
@@ -305,8 +301,20 @@ class Nexn2DecodeState:
         self.spec_capture = False
         # One captured graph per (pos, window): the KV slots, attention length
         # and RoPE slice are baked per position exactly as the decode graph's
-        # are. Same LRU bound, since each graph owns a memory pool.
+        # are, and each owns a memory pool, so this is LRU-bounded the same way.
+        #
+        # It is NOT bounded at the same number. A speculative graph covers k+1
+        # positions through the whole stack, so its pool is several times a
+        # decode step's, and the decode cap of 256 is sized for a step. Holding
+        # 256 of these alongside the model is more than a 32 GB board has at a
+        # 2048-token context -- measured there, it is what runs it out of
+        # memory. Sixteen keeps the windows a generation actually revisits
+        # (recapture costs two warmup runs) and bounds the pools at something
+        # the smallest supported board carries.
         self._spec_graphs = collections.OrderedDict()
+        self.spec_graph_cache_max = int(
+            spec_graph_cache_max if spec_graph_cache_max is not None
+            else _qwen35moe_env("SPEC_GRAPH_CACHE_MAX", "16"))
         # Its own memory pool, not the decode graphs'. The two are replayed
         # interleaved -- a window, then whatever the caller does next -- and
         # sharing a pool between graphs used that way is the case the runtime
@@ -367,8 +375,11 @@ def router_topk(fvk):
     over 800 inputs of which 397 had a tie inside the top-8 -- without the
     block kernel's 24 barriers.
     """
-    fn = getattr(fvk, 'moe_router_topk_warp_sm120_bf16', None)
-    return fn if fn is not None else fvk.moe_router_topk_sm120_bf16
+    if kernel_policy().warp_router_topk:
+        fn = getattr(fvk, 'moe_router_topk_warp_sm120_bf16', None)
+        if fn is not None:
+            return fn
+    return fvk.moe_router_topk_sm120_bf16
 
 
 def gdn_recurrent(fvk):
@@ -381,8 +392,11 @@ def gdn_recurrent(fvk):
     memory and walked five times; ncu measures 39 registers per thread for a
     128-float array. 51% of bandwidth against 87%.
     """
-    fn = getattr(fvk, 'gated_deltanet_recurrent_edge_qwen36_bf16', None)
-    return fn if fn is not None else fvk.gated_deltanet_recurrent_qwen36_bf16
+    if kernel_policy().gdn_recurrent_edge:
+        fn = getattr(fvk, 'gated_deltanet_recurrent_edge_qwen36_bf16', None)
+        if fn is not None:
+            return fn
+    return fvk.gated_deltanet_recurrent_qwen36_bf16
 
 
 def _gdn_gate_consts(ld, device):
@@ -619,7 +633,8 @@ def _shared_combine(routed, shared, glog, rows, fvk, device):
     the window issue, because the fixture and the speculative verify both rest
     on it.
     """
-    if hasattr(fvk, 'moe_shared_gate_combine_edge_bf16'):
+    if (kernel_policy().fused_shared_combine
+            and hasattr(fvk, 'moe_shared_gate_combine_edge_bf16')):
         out = torch.empty(rows, HID, dtype=torch.bfloat16, device=device)
         fvk.moe_shared_gate_combine_edge_bf16(
             routed.data_ptr(), shared.data_ptr(), glog.data_ptr(),
@@ -1244,7 +1259,7 @@ def _verify_block_usable(state) -> bool:
     # with it off decode reads the GDN in_proj at BF16 while the window reads
     # it at four bits -- a different function in thirty of the forty layers,
     # which is exactly the thing this block exists to rule out.
-    if not _VERIFY_K_ROWS or not state.dense_w4a16:
+    if not kernel_policy().verify_k_rows or not state.dense_w4a16:
         return False
     if not state.gdn_in_proj_w4a16:
         return False
@@ -1342,9 +1357,9 @@ def _ensure_spec_graph(state, pos, k, fvk, device):
         _restore()
 
     state._spec_graphs[key] = (g, hid)
-    cap = state.graph_cache_max
+    cap = state.spec_graph_cache_max
     if cap > 0 and len(state._spec_graphs) > cap:
-        state._spec_graphs.popitem(last=False)
+        state._spec_graphs.popitem(last=False)      # evict LRU
     return state._spec_graphs[key]
 
 

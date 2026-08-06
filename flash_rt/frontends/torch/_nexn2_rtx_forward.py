@@ -152,6 +152,106 @@ def _proj(x2d, ld, base, n, fvk, device):
 # force the hand-written kernel.
 import os as _os_early
 
+
+class KernelPolicy:
+    """Which implementation each interchangeable step of this model calls.
+
+    The forward and decode paths have, at several steps, more than one kernel
+    that computes the same thing: a fused form and the chain it replaces, a
+    warp-per-row form and a block-per-row one, an "edge" shared-memory layout
+    and the original. Each pair was checked against the other with
+    ``torch.equal`` -- not a tolerance -- so which one runs decides speed and
+    cannot decide output.
+
+    They are gathered here rather than decided at each call site by asking the
+    module what symbols it happens to export. A kernel appearing in a build is
+    not a reason to change what an already-validated model path does; a caller
+    saying so is. The frontend owns one of these and can hand a different one
+    down, and the environment variables that predate it remain the defaults, so
+    an existing configuration behaves exactly as it did.
+
+    Fields are read at call time. A policy must therefore not be changed
+    between a CUDA graph capture and its replay -- the replay repeats whichever
+    branch the capture took, so the two would disagree.
+    """
+
+    __slots__ = ('dense_cublaslt', 'cublaslt_max_algos', 'wy_gdn',
+                 'edge_w4a16', 'route_kernel', 'fused_shared_combine',
+                 'warp_router_topk', 'gdn_recurrent_edge', 'verify_k_rows')
+
+    def __init__(self, *,
+                 dense_cublaslt=None,
+                 cublaslt_max_algos=1,
+                 wy_gdn=None,
+                 edge_w4a16=None,
+                 route_kernel=None,
+                 fused_shared_combine=True,
+                 warp_router_topk=True,
+                 gdn_recurrent_edge=True,
+                 verify_k_rows=None):
+        env = _os_early.environ.get
+
+        def _flag(value, name, default='1'):
+            if value is not None:
+                return bool(value)
+            return env(name, default) != '0'
+
+        # cuBLASLt for the dense bf16 GEMMs; the in-house kernel is also
+        # deterministic but 66% slower at 2048 (693 against 418 ms).
+        self.dense_cublaslt = _flag(dense_cublaslt, 'NEXN2_DENSE_CUBLASLT')
+        # How many cuBLASLt candidates the first call for a shape times. 1
+        # takes the heuristic's own pick; see _gemm_w16a16.
+        self.cublaslt_max_algos = int(cublaslt_max_algos)
+        # WY chunked gated-delta scan for the GDN prefill instead of the
+        # sequential scan (11x at S=2048).
+        self.wy_gdn = _flag(wy_gdn, 'NEXN2_WY_GDN')
+        # The "edge" shared-memory layout of the two weight-only 4-bit GEMVs.
+        self.edge_w4a16 = _flag(
+            edge_w4a16, 'FLASHRT_QWEN35MOE_W4A16_EDGE')
+        # The five-kernel routing producer instead of the tensor chain.
+        self.route_kernel = _flag(route_kernel, 'NEXN2_ROUTE_KERNEL')
+        # Decode-side fusions, each bit-identical to the chain it replaces.
+        self.fused_shared_combine = bool(fused_shared_combine)
+        self.warp_router_topk = bool(warp_router_topk)
+        self.gdn_recurrent_edge = bool(gdn_recurrent_edge)
+        # Run a speculative verify window through the decode kernels at k+1
+        # rows rather than through the prefill forward. Two names, as the rest
+        # of this model's variables have: the generic one and the one it
+        # shipped under.
+        if verify_k_rows is not None:
+            self.verify_k_rows = bool(verify_k_rows)
+        else:
+            self.verify_k_rows = env(
+                'FLASHRT_QWEN35MOE_VERIFY_K_ROWS',
+                env('FLASHRT_NEXN2_VERIFY_K_ROWS', '1')) != '0'
+
+    def __repr__(self) -> str:                              # pragma: no cover
+        fields = ', '.join(
+            f'{name}={getattr(self, name)!r}' for name in self.__slots__)
+        return f'KernelPolicy({fields})'
+
+
+_POLICY = KernelPolicy()
+
+
+def kernel_policy():
+    """The policy the forward and decode paths are currently reading."""
+    return _POLICY
+
+
+def set_kernel_policy(policy):
+    """Install ``policy``; returns the one it replaced.
+
+    Not to be called between a CUDA graph capture and its replay.
+    """
+    global _POLICY
+    if not isinstance(policy, KernelPolicy):
+        raise TypeError(
+            f'expected a KernelPolicy, got {type(policy).__name__}')
+    previous, _POLICY = _POLICY, policy
+    return previous
+
+
 # The cuBLASLt wrapper picks its algorithm by *timing* eight candidates at
 # first use. Timing is noisy, so different processes pick different algorithms,
 # and different algorithms reduce in different orders -- which makes the model
@@ -166,27 +266,47 @@ import os as _os_early
 # the first call. Determinism and a faster first token for 1.6% of the warm
 # path.
 #
-# Set here rather than in the kernel, whose default is shared with other
-# frontends. FLASHRT_BF16_CUBLASLT_AUTOTUNE_ALGOS overrides.
-_os_early.environ.setdefault('FLASHRT_BF16_CUBLASLT_AUTOTUNE_ALGOS', '1')
+# Requested per call through KernelPolicy.cublaslt_max_algos, not by setting
+# the kernel's environment variable: that
+# variable is process-global and shared with every other frontend, so setting
+# it here would decide the algorithm for a model loaded later in the same
+# process that never asked. The kernel caches its plan per
+# (M, N, K, max_algos), so this choice stays with these call sites.
 
-# NEXN2_DENSE_CUBLASLT=0 drops to the in-house bf16 GEMM entirely, which is
-# also deterministic but 66% slower at 2048 (693 against 418 ms).
-_DENSE_CUBLASLT = _os_early.environ.get('NEXN2_DENSE_CUBLASLT', '1') != '0'
+# Set once, on the first call: a build predating the max_algos argument still
+# links and still runs, one autotune behaviour older.
+_CUBLASLT_TAKES_ALGOS = None
 
 
 def _gemm_w16a16(x2d, w, fvk, device):
     """y = x @ w.T via the deterministic bf16-act x bf16-weight tensor-core
     GEMM (fp32 register accumulate). Matches the fp32 path's argmax (cos 1.0)
     and is bit-identical run-to-run, at ~1.75x the fp32/TF32 op."""
+    global _CUBLASLT_TAKES_ALGOS
     m, k = x2d.shape
     n = w.shape[0]
     xc = x2d.contiguous()
     wc = w.contiguous()
     y = torch.empty(m, n, dtype=torch.bfloat16, device=device)
-    if _DENSE_CUBLASLT and hasattr(fvk, 'bf16_matmul_cublaslt_bf16'):
-        fvk.bf16_matmul_cublaslt_bf16(xc.data_ptr(), wc.data_ptr(),
-                                      y.data_ptr(), m, n, k, _cs())
+    policy = kernel_policy()
+    if policy.dense_cublaslt and hasattr(fvk, 'bf16_matmul_cublaslt_bf16'):
+        algos = policy.cublaslt_max_algos
+        if _CUBLASLT_TAKES_ALGOS is None:
+            try:
+                fvk.bf16_matmul_cublaslt_bf16(
+                    xc.data_ptr(), wc.data_ptr(), y.data_ptr(), m, n, k,
+                    _cs(), algos)
+                _CUBLASLT_TAKES_ALGOS = True
+                return y
+            except TypeError:
+                _CUBLASLT_TAKES_ALGOS = False
+        if _CUBLASLT_TAKES_ALGOS:
+            fvk.bf16_matmul_cublaslt_bf16(
+                xc.data_ptr(), wc.data_ptr(), y.data_ptr(), m, n, k, _cs(),
+                algos)
+        else:
+            fvk.bf16_matmul_cublaslt_bf16(xc.data_ptr(), wc.data_ptr(),
+                                          y.data_ptr(), m, n, k, _cs())
         return y
     fvk.w16a16_gemm_sm120_bf16(xc.data_ptr(), wc.data_ptr(), y.data_ptr(),
                                m, n, k, 1.0, _cs())
@@ -408,7 +528,6 @@ def _silu_mul(g, u, fvk, device):
 # the inter-chunk state recurrence is sequential -> 11x faster at S=2048,
 # bit-exact (out cos 0.99998, state cos 0.99997 vs the seq-scan). Default on.
 import os as _os
-_USE_WY_GDN = _os.environ.get('NEXN2_WY_GDN', '1') != '0'
 _WY_MIN_S = 64        # below this the seq-scan's lower fixed overhead wins
 
 
@@ -578,7 +697,7 @@ def _gdn_layer(h, ld, fvk, device, eps, cap=None, rank=None,
         a_bf.data_ptr(), b_bf.data_ptr(), neg.data_ptr(), dtb_c.data_ptr(),
         g_out.data_ptr(), bo.data_ptr(), B * S, NV, _cs())
 
-    if _USE_WY_GDN and S >= _WY_MIN_S:
+    if kernel_policy().wy_gdn and S >= _WY_MIN_S:
         # WY chunked delta-rule scan: 11x faster than the seq-scan at S=2048,
         # bit-exact. qb/kb carry the 16->32 broadcast heads (src_h = h//2); the
         # front kernel reads the group leaders and re-expands where it packs,
@@ -889,13 +1008,13 @@ def _full_attn_layer(h, ld, ct, st, fvk, device, eps, cap=None, rank=None,
 # whose index differs per lane. Because the outputs are identical to the bit,
 # choosing between them is purely a performance decision and cannot move a
 # token, so preferring the variant needs no accuracy argument. Set
-# FLASHRT_QWEN35MOE_W4A16_EDGE=0 to force the original.
-_EDGE_W4A16 = _os.environ.get("FLASHRT_QWEN35MOE_W4A16_EDGE", "1") != "0"
+# KernelPolicy.edge_w4a16 to False (or FLASHRT_QWEN35MOE_W4A16_EDGE=0) to force
+# the original.
 
 
 def w4a16_matvec(fvk):
     """The dense 4-bit GEMV entry point this build should call."""
-    if _EDGE_W4A16:
+    if kernel_policy().edge_w4a16:
         fn = getattr(fvk, 'w4a16_matvec_edge_sm120_bf16', None)
         if fn is not None:
             return fn
@@ -904,7 +1023,7 @@ def w4a16_matvec(fvk):
 
 def moe_grouped_w4a16(fvk):
     """The grouped per-slot 4-bit GEMV entry point this build should call."""
-    if _EDGE_W4A16:
+    if kernel_policy().edge_w4a16:
         fn = getattr(fvk, 'moe_grouped_w4a16_edge_sm120_bf16', None)
         if fn is not None:
             return fn
@@ -1133,7 +1252,6 @@ _ROUTE_CONST = {}
 _ROUTE_BUF = {}
 # Off puts the routing back on the tensor chain, which is how the kernel's
 # output is A/B'd against it end to end rather than only in a probe.
-_USE_ROUTE_KERNEL = _os.environ.get('NEXN2_ROUTE_KERNEL', '1') != '0'
 
 
 def _route_constants(S, device):
@@ -1197,7 +1315,8 @@ def _route_prefill(logits, fvk, device):
     Returns None where the kernel is absent, so the tensor chain stays the
     fallback rather than this being a hard dependency.
     """
-    if not _USE_ROUTE_KERNEL or not hasattr(fvk, 'moe_route_prefill_bf16'):
+    if (not kernel_policy().route_kernel
+            or not hasattr(fvk, 'moe_route_prefill_bf16')):
         return None
     S = logits.shape[0]
     b = _route_buffers(S, fvk, device)
