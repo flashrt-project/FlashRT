@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import statistics
 import time
 
 import torch
@@ -33,9 +34,9 @@ def main() -> None:
     parser.add_argument("--checkpoint", required=True,
                         help="path to the BF16 checkpoint directory")
     parser.add_argument("--prompt-tokens", type=int, default=64)
-    parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--prefill-reps", type=int, default=5)
-    parser.add_argument("--decode-reps", type=int, default=3)
+    parser.add_argument("--decode-reps", type=int, default=8)
     parser.add_argument("--max-seq", type=int, default=512)
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
@@ -85,18 +86,25 @@ def main() -> None:
     print(f"subsequent prefill                   "
           f"{min(warm):8.2f}-{max(warm):.2f} ms")
 
-    def run(fn) -> tuple[float, list[int]]:
-        best, toks = 0.0, None
+    def run(fn) -> tuple[list[float], list[int]]:
+        # Median and range over every repetition, not a best-of: a single best
+        # sample hides both contention and variance, and the baseline this is
+        # compared against reports the same shape.
+        rates, toks = [], None
         for _ in range(args.decode_reps):
             frontend.set_prompt_ids(ids)
             _sync(args.device)
             t0 = time.perf_counter()
             out = fn()
             _sync(args.device)
-            rate = args.max_new_tokens / (time.perf_counter() - t0)
-            best = max(best, rate)
+            rates.append(args.max_new_tokens / (time.perf_counter() - t0))
             toks = list(out)
-        return best, toks
+        return sorted(rates), toks
+
+    def report(label: str, rates: list[float]) -> None:
+        med = statistics.median(rates)
+        print(f"{label:<44}{med:8.2f} tok/s   "
+              f"(range {rates[0]:.2f}-{rates[-1]:.2f} over {len(rates)} runs)")
 
     state = frontend._decode_state
     from flash_rt.frontends.torch import _nexn2_rtx_decode as dec
@@ -111,11 +119,13 @@ def main() -> None:
     graph_rate, graph_toks = run(
         lambda: frontend.generate(max_new_tokens=args.max_new_tokens))
 
-    print(f"{args.prompt_tokens}-token prompt, "
-          f"{args.max_new_tokens}-token eager decode    {eager_rate:8.2f} tok/s")
-    print(f"{args.prompt_tokens}-token prompt, "
-          f"{args.max_new_tokens}-token warm graph decode "
-          f"{graph_rate:8.2f} tok/s")
+    report(f"{args.prompt_tokens}/{args.max_new_tokens} eager decode",
+           eager_rate)
+    report(f"{args.prompt_tokens}/{args.max_new_tokens} warm graph decode",
+           graph_rate)
+    free, total = torch.cuda.mem_get_info(args.device)
+    print(f"{'device free memory at exit':<44}{free / GIB:8.2f} GiB "
+          f"of {total / GIB:.2f} -- a shared device invalidates the timings")
     same = eager_toks == graph_toks
     print(f"eager and graph emit the same tokens {str(same):>8}"
           f"   ({sum(a == b for a, b in zip(eager_toks, graph_toks))}"

@@ -1574,6 +1574,16 @@ if(FLASHRT_ENABLE_QWEN35MOE_W4A16)
     csrc/kernels/w4a16_gemm_sm120.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE
     FLASHRT_HAVE_QWEN35MOE_W4A16=1)
+  # Packed-weight loads in flight per row in the W4A16 GEMVs. The kernels
+  # default to 4, which is the value the SM120 path was validated with. Thor
+  # measures faster at 2 because the kernel is register-limited there (8 blocks
+  # per SM where every other limit allows 24); that is a property of a 20-SM
+  # part and is not assumed to transfer, so it is set only for that target.
+  # Either value produces bit-identical output; see w4a16_edge_sm120.cu.
+  if(GPU_ARCH STREQUAL "110")
+    target_compile_definitions(flash_rt_kernels PRIVATE
+      FLASHRT_W4A16_EDGE_UNROLL=2)
+  endif()
   message(STATUS "qwen3_5_moe weight-only 4-bit kernels: ENABLED (sm_${GPU_ARCH})")
 endif()
 

@@ -14,13 +14,13 @@ namespace {
 // blocks off each other's banks.
 constexpr int kWarps = 2;
 constexpr int kThreads = kWarps * 32;
-// Two, matching the M=1 entry: this kernel inherited 4 when it was written and
-// kept it after the sweep moved the single-row path, which left the verify
-// paying registers for depth while decode had already traded them for warps.
-// Same argument, same invariance -- the main loop advances by 32*kUnroll and
-// the tail takes the remainder, so a lane visits the same k-blocks in the same
-// order and every output row stays bit-identical to the per-row GEMV.
-constexpr int kUnroll = 2;
+// Loads in flight per row: the same build-time constant the single-row entry
+// uses, so the verify and the step it stands in for stay on the same tuning.
+// See w4a16_edge_sm120.cu for why it is set per architecture.
+#ifndef FLASHRT_W4A16_EDGE_UNROLL
+#define FLASHRT_W4A16_EDGE_UNROLL 4
+#endif
+constexpr int kUnroll = FLASHRT_W4A16_EDGE_UNROLL;
 constexpr int kBlockSlots = 24;
 constexpr int kBlockInt4 = kBlockSlots / 8;
 constexpr int kRowsDense = 2;

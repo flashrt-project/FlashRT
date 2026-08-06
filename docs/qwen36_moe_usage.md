@@ -222,18 +222,23 @@ official BF16 checkpoint:
 
 | Measurement | Result |
 |---|---:|
+| Runtime weight load | 47.96 s |
 | Resident allocated memory after load | 21.44 GiB |
 | Peak allocated memory during load | 22.94 GiB |
-| Subsequent 64-token prefill | 34.58–35.73 ms |
-| 64-token prompt, 32-token eager decode | 107.84 tok/s |
-| 64-token prompt, 32-token warm CUDA Graph decode | 238.55 tok/s |
+| First 21-token prefill, including warmup | 230.95 ms |
+| Subsequent 20–45-token prefill | 28.99–35.12 ms |
+| 64-token prompt, 32-token eager decode | 48.14 tok/s |
+| 64-token prompt, 32-token warm CUDA Graph decode | 195.49 tok/s |
 
-Against the original first-light run on the same card and checkpoint, warm
-CUDA-graph decode moved 195.49 -> 238.55 tok/s and the eager path 48.14 ->
-107.84. Resident and peak allocation are unchanged to the megabyte. Two rows of
-that first-light table are dropped rather than compared: weight load time is
-dominated by page-cache state, and its "first prefill including warmup" was
-measured by a different harness with a different notion of warmup.
+These are first-light figures and are quoted unchanged. The decode work
+described under *Speculative decode* was tuned and measured on Thor; the SM120
+kernels are byte-identical to before it, so these numbers stand, but they have
+not been re-measured on this branch. The correctness gate
+(`tests/test_qwen36_moe_gpu.py`) does pass on the current tree.
+
+A separate warm-graph measurement at `P=64, N=64` on the same card reports a
+decode median of 257.95 tok/s over eight runs; the two tables use different
+generation lengths and are not interchangeable.
 
 The eager, first-capture, and warm-graph runs produced the same 32 token IDs.
 These numbers are a first-light correctness run, not a context-length sweep.
