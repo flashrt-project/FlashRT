@@ -165,6 +165,32 @@ DGX Spark / GB10:
 | NVFP4, 128 | **170.1 ms** | **40.42 tok/s** | [Qwen3.6 Spark](docs/qwen36_spark.md#performance) |
 | NVFP4, 16 K | **8.545 s** | **54.94 tok/s** | [Qwen3.6 Spark](docs/qwen36_spark.md#performance) |
 
+#### Qwen3.6-35B-A3B
+
+RTX 5090:
+
+| Mode | Prefill | Decode | Source |
+|---|---:|---:|---|
+| NVFP4, 64 | **40.42 ms** | **257.95 tok/s** | [Qwen3.6-MoE usage](docs/qwen36_moe_usage.md#validation) |
+
+Jetson AGX Thor, against vLLM 0.26.0 on the same part and protocol:
+
+| Mode | Prefill | Decode | Source |
+|---|---:|---:|---|
+| NVFP4, 20 | **89.5 ms** (vLLM 102.3) | | [Qwen3.6-MoE Thor](docs/qwen36_moe_usage.md#jetson-agx-thor-numbers) |
+| NVFP4, 1 K | **216.0 ms** (vLLM 319.4) | **87.1 tok/s** (vLLM 31.6) | [Qwen3.6-MoE Thor](docs/qwen36_moe_usage.md#jetson-agx-thor-numbers) |
+| NVFP4, 2 K | **379.6 ms** (vLLM 495.0) | **86.3 tok/s** (vLLM 31.5) | [Qwen3.6-MoE Thor](docs/qwen36_moe_usage.md#jetson-agx-thor-numbers) |
+| NVFP4, 32 K | **7207.5 ms** (vLLM 7231.8) | | [Qwen3.6-MoE Thor](docs/qwen36_moe_usage.md#jetson-agx-thor-numbers) |
+
+TTFT leads at every length from 20 to 32768 tokens; 128 K context reaches the
+board at 2470 tok/s of prefill. The decode column was taken before a later
+round that moved the steady step from 89.0 to 102.6 tok/s, and vLLM's side is
+unaffected by it, so the ratios shown are lower bounds.
+
+Speculative decode with the MTP head reaches **106.74 tok/s** against 100.35
+plain in the same process, emitting the same tokens as greedy decoding. See
+[speculative decode](docs/qwen36_moe_usage.md#speculative-decode).
+
 #### Qwen3-8B
 
 | Hardware | Mode | Prefill | Decode | Source |
@@ -732,7 +758,7 @@ extension modules:
 | Artifact | Size | What it contains |
 |---|---|---|
 | `flash_rt/flash_rt_kernels.so` | ~3 MB | Hand-written memory-bound kernels (norm, activation, fusion, FP8 quant, cuBLASLt wrappers, Thor FMHA). **Always built.** |
-| `flash_rt/flash_rt_fa2.so` | ~135 MB | Vendored Flash-Attention 2 v2.7.4.post1 fwd (fp16 + bf16, SM80/86/89/120). **Built only on RTX targets** — Thor skips it and uses `fvk.attention_qkv_fp16` (cuBLAS-decomposed) for attention instead. |
+| `flash_rt/flash_rt_fa2.so` | ~135 MB | Vendored Flash-Attention 2 v2.7.4.post1 fwd (fp16 + bf16, SM80/86/89/120). **Built automatically on RTX targets.** Thor skips it by default and uses `fvk.attention_qkv_fp16` (cuBLAS-decomposed) instead; `-DFLASHRT_ENABLE_THOR_FA2=ON` builds it there for the one model whose long prefill needs it (Qwen3.6, bf16 head_dim 256 — a single instantiation). |
 
 **Crucially — no `pip install flash-attn` required.** The FA2 kernel
 is vendored at source level and built into `flash_rt_fa2.so` during
@@ -862,7 +888,7 @@ CMake reads `nvidia-smi --query-gpu=compute_cap` to pick the target
 arch. Override for cross-compilation or when auto-detect fails:
 
 ```bash
-cmake -B build -S . -DGPU_ARCH=110   # Jetson AGX Thor   (FA2 skipped, CUTLASS SM100 path ON)
+cmake -B build -S . -DGPU_ARCH=110   # Jetson AGX Thor   (FA2 opt-in, CUTLASS SM100 path ON)
 cmake -B build -S . -DGPU_ARCH=121   # DGX Spark / GB10   (FA2 sm_121 AOT, NVFP4 ON)
 cmake -B build -S . -DGPU_ARCH=120   # RTX 5090           (FA2 sm_120 AOT, NVFP4 ON)
 cmake -B build -S . -DGPU_ARCH=89    # RTX 4090           (FA2 sm_80 AOT natively runs on Ada)
@@ -870,10 +896,12 @@ cmake -B build -S . -DGPU_ARCH=86    # RTX 3090 / A10     (FA2 sm_80 AOT)
 cmake -B build -S . -DGPU_ARCH=80    # A100               (FA2 sm_80 AOT)
 ```
 
-FA2 is enabled by CMake when `GPU_ARCH ∈ {80, 86, 89, 120, 121}`. Other
-arches (notably Thor SM110 and SM90 Hopper) route attention through
-the cuBLAS-decomposed `fvk.attention_qkv_fp16` path instead of FA2 —
-`flash_rt_fa2.so` simply isn't built, and no runtime error results.
+FA2 is enabled by CMake when `GPU_ARCH ∈ {80, 86, 89, 120, 121}`, and on
+Thor SM110 when `-DFLASHRT_ENABLE_THOR_FA2=ON` is passed. Other arches
+(notably SM90 Hopper, and Thor without that flag) route attention
+through the cuBLAS-decomposed `fvk.attention_qkv_fp16` path instead of
+FA2 — `flash_rt_fa2.so` simply isn't built, and no runtime error
+results.
 
 ### Build timing (one-time)
 

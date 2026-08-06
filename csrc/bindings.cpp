@@ -39,6 +39,9 @@
 #ifdef ENABLE_CUTLASS_SM100_NVFP4_W4A16
 #include "gemm/fp4/cutlass_nvfp4_w4a16_gemm_sm100.cuh"
 #endif
+#ifdef FLASHRT_HAVE_QWEN35MOE_GROUPED_SM100
+#include "gemm/fp4/cutlass_nvfp4_moe_grouped_sm100.cuh"
+#endif
 #ifdef ENABLE_ACTION_FFN_MEGAKERNEL_V6T
 #include "kernels/megakernel/action_ffn_megakernel_v6t_sm120.cuh"
 #endif
@@ -179,22 +182,34 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS
 #include "kernels/qwen36_misc.cuh"
 #endif
-#ifdef FLASHRT_HAVE_QWEN35MOE
+#ifdef FLASHRT_HAVE_QWEN35MOE_CORE
 #include "kernels/qwen35moe_layout.cuh"
-#include "kernels/moe_grouped_gemv_sm120.cuh"
 #include "kernels/bf16_matvec_sm120.cuh"
-#include "kernels/w4a16_matvec_sm120.cuh"
-#include "kernels/moe_grouped_w4a16_sm120.cuh"
 #include "kernels/gdn_recurrent_seq_sm120.cuh"
+#include "kernels/gdn_wy_prefill_edge.cuh"
+#include "kernels/causal_conv1d_rows_edge.cuh"
 #include "kernels/act_fuse_sm120.cuh"
 #include "kernels/moe_router_topk_sm120.cuh"
+#include "kernels/moe_route_prefill_edge.cuh"
+#include "kernels/moe_shared_combine_edge.cuh"
+#include "kernels/moe_weighted_sum_sm120.cuh"
+#include "kernels/w16a16_gemm_sm120.cuh"
+#include "kernels/qwen35moe_e0m3_dequant.cuh"
+#endif  // FLASHRT_HAVE_QWEN35MOE_CORE
+#ifdef FLASHRT_HAVE_QWEN35MOE_W4A16
+#include "kernels/w4a16_matvec_sm120.cuh"
+#include "kernels/moe_grouped_w4a16_sm120.cuh"
+#include "kernels/w4a16_edge_sm120.cuh"
+#include "kernels/w4a16_mrows_edge_sm120.cuh"
+#include "kernels/w4a16_gemm_sm120.cuh"
+#include "kernels/qwen35moe_grouped_quant.cuh"
+#endif  // FLASHRT_HAVE_QWEN35MOE_W4A16
+#ifdef FLASHRT_HAVE_QWEN35MOE_W4A4
+#include "kernels/moe_grouped_gemv_sm120.cuh"
 #include "kernels/moe_m16_mma_sm120.cuh"
 #include "kernels/moe_m64_mma_sm120.cuh"
 #include "kernels/moe_blocktile_mma_sm120.cuh"
-#include "kernels/moe_weighted_sum_sm120.cuh"
-#include "kernels/w4a16_gemm_sm120.cuh"
-#include "kernels/w16a16_gemm_sm120.cuh"
-#endif  // FLASHRT_HAVE_QWEN35MOE
+#endif  // FLASHRT_HAVE_QWEN35MOE_W4A4
 #include "kernels/bf16_matvec_qwen36.cuh"
 #include "kernels/bf16_matmul_bf16.cuh"
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS
@@ -4679,17 +4694,21 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("x"), py::arg("W"), py::arg("out"),
         py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
 
+    // max_algos=0 (the default) keeps the environment-driven autotune this
+    // entry has always had; a caller passes 1 to take the heuristic's own pick
+    // and get a run-to-run reproducible reduction order. See the header.
     m.def("bf16_matmul_cublaslt_bf16",
         [](uintptr_t x, uintptr_t W, uintptr_t out,
-           int M, int N, int K, uintptr_t stream) {
+           int M, int N, int K, uintptr_t stream, int max_algos) {
             flash_rt::kernels::bf16_matmul_cublaslt_bf16(
                 reinterpret_cast<const __nv_bfloat16*>(x),
                 reinterpret_cast<const __nv_bfloat16*>(W),
                 reinterpret_cast<__nv_bfloat16*>(out),
-                M, N, K, to_stream(stream));
+                M, N, K, to_stream(stream), max_algos);
         },
         py::arg("x"), py::arg("W"), py::arg("out"),
-        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0,
+        py::arg("max_algos") = 0);
 
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS
     m.def("bf16_matmul_qwen36_bf16",
@@ -5469,6 +5488,36 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("head_k_dim"), py::arg("head_v_dim"),
         py::arg("use_qk_l2norm") = true, py::arg("stream") = 0);
 
+    m.def("gated_deltanet_recurrent_edge_qwen36_bf16",
+        [](uintptr_t q, uintptr_t k, uintptr_t v,
+           uintptr_t g, uintptr_t beta,
+           uintptr_t state, uintptr_t out,
+           int B, int num_v_heads, int head_k_dim, int head_v_dim,
+           bool use_qk_l2norm, uintptr_t stream) {
+            const int rc =
+                flash_rt::kernels::gated_deltanet_recurrent_edge_qwen36_bf16(
+                    to_ptr(q), to_ptr(k), to_ptr(v),
+                    to_ptr(g), to_ptr(beta),
+                    to_ptr(state), to_ptr(out),
+                    B, num_v_heads, head_k_dim, head_v_dim,
+                    use_qk_l2norm, to_stream(stream));
+            if (rc != 0) {
+                throw std::runtime_error(
+                    "gated_deltanet_recurrent_edge_qwen36_bf16 failed with "
+                    + std::to_string(rc) + " for B=" + std::to_string(B)
+                    + " num_v_heads=" + std::to_string(num_v_heads)
+                    + " head_k_dim=" + std::to_string(head_k_dim)
+                    + " head_v_dim=" + std::to_string(head_v_dim)
+                    + " (this entry supports head dims of 128 only)");
+            }
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"),
+        py::arg("g"), py::arg("beta"),
+        py::arg("state"), py::arg("out"),
+        py::arg("B"), py::arg("num_v_heads"),
+        py::arg("head_k_dim"), py::arg("head_v_dim"),
+        py::arg("use_qk_l2norm") = true, py::arg("stream") = 0);
+
     // In/out-state variant for K-iter chained per-step save (A2c-3).
     m.def("gated_deltanet_recurrent_inout_qwen36_bf16",
         [](uintptr_t q, uintptr_t k, uintptr_t v,
@@ -5588,7 +5637,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("S"), py::arg("stream") = 0);
 #endif  // FLASHRT_HAVE_QWEN36_KERNELS (gated_deltanet_qwen36 part 1)
 
-#ifdef FLASHRT_HAVE_QWEN35MOE
+#ifdef FLASHRT_HAVE_QWEN35MOE_CORE
     m.def("qwen35moe_lin_split_qkv_broadcast_bf16",
         [](uintptr_t conv_out, uintptr_t q32,
            uintptr_t k32, uintptr_t v32,
@@ -5621,6 +5670,197 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("x"), py::arg("W"), py::arg("out"),
         py::arg("N"), py::arg("K"), py::arg("stream") = 0);
 
+    m.def("moe_weighted_sum_sm120_bf16",
+        [](uintptr_t d_dn, uintptr_t rows, uintptr_t tw, uintptr_t out,
+           int S, int TOPK, int HID, int dn_stride, uintptr_t stream) -> int {
+            return flash_rt::kernels::moe_weighted_sum_sm120_bf16(
+                to_ptr(d_dn), to_ptr(rows), to_ptr(tw), to_ptr(out),
+                S, TOPK, HID, dn_stride, to_stream(stream));
+        },
+        py::arg("d_dn"), py::arg("rows"), py::arg("tw"), py::arg("out"),
+        py::arg("S"), py::arg("TOPK"), py::arg("HID"), py::arg("dn_stride"),
+        py::arg("stream") = 0);
+
+    m.def("w16a16_gemm_sm120_bf16",
+        [](uintptr_t X, uintptr_t W, uintptr_t Y,
+           int M, int N, int K, float alpha, uintptr_t stream) -> int {
+            return flash_rt::gemm::w16a16_gemm_sm120_bf16(
+                to_ptr(X), to_ptr(W), to_ptr(Y),
+                M, N, K, alpha, to_stream(stream));
+        },
+        py::arg("X"), py::arg("W"), py::arg("Y"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("alpha") = 1.0f, py::arg("stream") = 0);
+
+    m.def("moe_router_topk_warp_sm120_bf16",
+        [](uintptr_t logits, uintptr_t out_idx, uintptr_t out_val,
+           int n_experts, int k, uintptr_t stream) {
+            return flash_rt::kernels::moe_router_topk_warp_sm120_bf16(
+                to_ptr(logits), to_ptr(out_idx), to_ptr(out_val),
+                n_experts, k, to_stream(stream));
+        },
+        py::arg("logits"), py::arg("out_idx"), py::arg("out_val"),
+        py::arg("n_experts"), py::arg("k"), py::arg("stream") = 0);
+
+    m.def("moe_router_topk_sm120_bf16",
+        [](uintptr_t logits, uintptr_t out_idx, uintptr_t out_val,
+           int n_experts, int k, uintptr_t stream) -> int {
+            return flash_rt::kernels::moe_router_topk_sm120_bf16(
+                to_ptr(logits), to_ptr(out_idx), to_ptr(out_val),
+                n_experts, k, to_stream(stream));
+        },
+        py::arg("logits"), py::arg("out_idx"), py::arg("out_val"),
+        py::arg("n_experts"), py::arg("k"), py::arg("stream") = 0);
+
+    m.def("silu_mul_sm120_bf16",
+        [](uintptr_t g, uintptr_t u, uintptr_t out, int n,
+           uintptr_t stream) -> int {
+            return flash_rt::kernels::silu_mul_sm120_bf16(
+                to_ptr(g), to_ptr(u), to_ptr(out), n, to_stream(stream));
+        },
+        py::arg("g"), py::arg("u"), py::arg("out"), py::arg("n"),
+        py::arg("stream") = 0);
+
+    m.def("sigmoid_mul_sm120_bf16",
+        [](uintptr_t x, uintptr_t gate, uintptr_t out, int n,
+           uintptr_t stream) -> int {
+            return flash_rt::kernels::sigmoid_mul_sm120_bf16(
+                to_ptr(x), to_ptr(gate), to_ptr(out), n, to_stream(stream));
+        },
+        py::arg("x"), py::arg("gate"), py::arg("out"), py::arg("n"),
+        py::arg("stream") = 0);
+
+    m.def("qwen35moe_e0m3_dequant_bf16",
+        [](uintptr_t packed, uintptr_t scale, uintptr_t out,
+           int rows, int cols, int group_size, float global_scale,
+           uintptr_t stream) -> int {
+            return flash_rt::kernels::qwen35moe_e0m3_dequant_bf16(
+                to_ptr(packed), to_ptr(scale), to_ptr(out),
+                rows, cols, group_size, global_scale, to_stream(stream));
+        },
+        py::arg("packed"), py::arg("scale"), py::arg("out"),
+        py::arg("rows"), py::arg("cols"), py::arg("group_size"),
+        py::arg("global_scale"), py::arg("stream") = 0);
+
+    m.def("gdn_recurrent_seq_sm120_bf16",
+        [](uintptr_t q, uintptr_t k, uintptr_t v, uintptr_t g, uintptr_t beta,
+           uintptr_t state, uintptr_t out, int S, int num_v_heads,
+           int head_dim, bool use_qk_l2norm, uintptr_t stream) -> int {
+            return flash_rt::kernels::gdn_recurrent_seq_sm120_bf16(
+                to_ptr(q), to_ptr(k), to_ptr(v), to_ptr(g), to_ptr(beta),
+                to_ptr(state), to_ptr(out), S, num_v_heads, head_dim,
+                use_qk_l2norm, to_stream(stream));
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"), py::arg("beta"),
+        py::arg("state"), py::arg("out"), py::arg("S"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("use_qk_l2norm") = true,
+        py::arg("stream") = 0);
+
+    m.def("moe_shared_gate_combine_edge_bf16",
+        [](uintptr_t routed, uintptr_t shared, uintptr_t gate, uintptr_t out,
+           int S, int dim, uintptr_t stream) {
+            flash_rt::kernels::moe_shared_gate_combine_edge_bf16(
+                to_ptr(routed), to_ptr(shared), to_ptr(gate), to_ptr(out),
+                S, dim, to_stream(stream));
+        },
+        py::arg("routed"), py::arg("shared"), py::arg("gate"),
+        py::arg("out"), py::arg("S"), py::arg("dim"),
+        py::arg("stream") = 0);
+
+    m.def("moe_route_prefill_bf16",
+        [](uintptr_t logits, uintptr_t ti, uintptr_t tw, uintptr_t se,
+           uintptr_t stok, uintptr_t inv, uintptr_t group_off, uintptr_t ws,
+           int ws_bytes, int S, int n_experts, int topk,
+           uintptr_t stream) -> int {
+            return flash_rt::kernels::moe_route_prefill_bf16(
+                to_ptr(logits), to_ptr(ti), to_ptr(tw), to_ptr(se),
+                to_ptr(stok), to_ptr(inv), to_ptr(group_off), to_ptr(ws),
+                ws_bytes, S, n_experts, topk, to_stream(stream));
+        },
+        py::arg("logits"), py::arg("ti"), py::arg("tw"), py::arg("se"),
+        py::arg("stok"), py::arg("inv"), py::arg("group_off"), py::arg("ws"),
+        py::arg("ws_bytes"), py::arg("S"), py::arg("n_experts"),
+        py::arg("topk"), py::arg("stream") = 0);
+
+    m.def("moe_route_prefill_workspace_bytes",
+        [](int S, int topk, int n_experts) -> int {
+            return flash_rt::kernels::moe_route_prefill_workspace_bytes(
+                S, topk, n_experts);
+        },
+        py::arg("S"), py::arg("topk"), py::arg("n_experts"));
+
+    m.def("moe_route_sfa_offsets",
+        [](uintptr_t group_off, uintptr_t sfa_off, int n_experts, int n_col,
+           uintptr_t stream) {
+            flash_rt::kernels::moe_route_sfa_offsets(
+                to_ptr(group_off), to_ptr(sfa_off), n_experts, n_col,
+                to_stream(stream));
+        },
+        py::arg("group_off"), py::arg("sfa_off"), py::arg("n_experts"),
+        py::arg("n_col"), py::arg("stream") = 0);
+
+    m.def("causal_conv1d_qwen36_rows_hist_bf16",
+        [](uintptr_t x, uintptr_t w, uintptr_t bias, uintptr_t hist,
+           uintptr_t out, int B, int S, int conv_dim, int k, bool apply_silu,
+           uintptr_t stream) {
+            flash_rt::kernels::causal_conv1d_qwen36_rows_hist_bf16(
+                to_ptr(x), to_ptr(w), to_ptr(bias), to_ptr(hist), to_ptr(out),
+                B, S, conv_dim, k, apply_silu, to_stream(stream));
+        },
+        py::arg("x"), py::arg("w"), py::arg("bias"), py::arg("hist"),
+        py::arg("out"), py::arg("B"), py::arg("S"), py::arg("conv_dim"),
+        py::arg("k"), py::arg("apply_silu") = true, py::arg("stream") = 0);
+
+    m.def("causal_conv1d_qwen36_rows_bf16",
+        [](uintptr_t x, uintptr_t w, uintptr_t bias, uintptr_t out,
+           int B, int S, int conv_dim, int k, bool apply_silu,
+           uintptr_t stream) {
+            flash_rt::kernels::causal_conv1d_qwen36_rows_bf16(
+                to_ptr(x), to_ptr(w), to_ptr(bias), to_ptr(out),
+                B, S, conv_dim, k, apply_silu, to_stream(stream));
+        },
+        py::arg("x"), py::arg("w"), py::arg("bias"), py::arg("out"),
+        py::arg("B"), py::arg("S"), py::arg("conv_dim"), py::arg("k"),
+        py::arg("apply_silu") = true, py::arg("stream") = 0);
+
+    m.def("w4a16_mrows_edge_sm120_bf16",
+        [](uintptr_t x, uintptr_t W, uintptr_t SFB, uintptr_t out,
+           int M, int N, int K, double alpha, uintptr_t stream) -> int {
+            return flash_rt::kernels::w4a16_mrows_edge_sm120_bf16(
+                to_ptr(x), to_ptr(W), to_ptr(SFB), to_ptr(out),
+                M, N, K, static_cast<float>(alpha), to_stream(stream));
+        },
+        py::arg("x"), py::arg("W"), py::arg("SFB"), py::arg("out"),
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("alpha"),
+        py::arg("stream") = 0);
+
+    m.def("gdn_wy_norm_pack_q_cumsum_edge_bf16",
+        [](uintptr_t q, uintptr_t k, uintptr_t g, uintptr_t k_l2,
+           uintptr_t q_pack, uintptr_t g_cumsum, int S, int num_k_heads,
+           int num_v_heads, int head_dim, int qk_group, uintptr_t stream) {
+            flash_rt::kernels::gdn_wy_norm_pack_q_cumsum_edge_bf16(
+                to_ptr(q), to_ptr(k), to_ptr(g), to_ptr(k_l2),
+                to_ptr(q_pack), to_ptr(g_cumsum), S, num_k_heads,
+                num_v_heads, head_dim, qk_group, to_stream(stream));
+        },
+        py::arg("q"), py::arg("k"), py::arg("g"), py::arg("k_l2"),
+        py::arg("q_pack"), py::arg("g_cumsum"), py::arg("S"),
+        py::arg("num_k_heads"), py::arg("num_v_heads"), py::arg("head_dim"),
+        py::arg("qk_group"), py::arg("stream") = 0);
+
+    m.def("gdn_wy_pack_v_edge_bf16",
+        [](uintptr_t v, uintptr_t v_pack, int S, int num_v_heads,
+           int head_dim, uintptr_t stream) {
+            flash_rt::kernels::gdn_wy_pack_v_edge_bf16(
+                to_ptr(v), to_ptr(v_pack), S, num_v_heads, head_dim,
+                to_stream(stream));
+        },
+        py::arg("v"), py::arg("v_pack"), py::arg("S"),
+        py::arg("num_v_heads"), py::arg("head_dim"),
+        py::arg("stream") = 0);
+#endif  // FLASHRT_HAVE_QWEN35MOE_CORE
+
+#ifdef FLASHRT_HAVE_QWEN35MOE_W4A16
     m.def("w4a16_matvec_sm120_bf16",
         [](uintptr_t x, uintptr_t W, uintptr_t sfb, uintptr_t out,
            int N, int K, float alpha, uintptr_t stream) -> int {
@@ -5631,6 +5871,107 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("x"), py::arg("W"), py::arg("sfb"), py::arg("out"),
         py::arg("N"), py::arg("K"), py::arg("alpha"), py::arg("stream") = 0);
 
+    m.def("w4a16_gemm_sm120_bf16",
+        [](uintptr_t X, uintptr_t W, uintptr_t SFB, uintptr_t Y,
+           int M, int N, int K, float alpha, uintptr_t stream) -> int {
+            return flash_rt::gemm::w4a16_gemm_sm120_bf16(
+                to_ptr(X), to_ptr(W), to_ptr(SFB), to_ptr(Y),
+                M, N, K, alpha, to_stream(stream));
+        },
+        py::arg("X"), py::arg("W"), py::arg("SFB"), py::arg("Y"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("alpha") = 1.0f, py::arg("stream") = 0);
+
+    m.def("moe_grouped_w4a16_sm120_bf16",
+        [](uintptr_t A, uintptr_t W, uintptr_t sfb, uintptr_t alpha,
+           uintptr_t eidx, uintptr_t D, int slots, int N, int K,
+           long a_stride, long w_stride, long sfb_stride,
+           uintptr_t stream) -> int {
+            return flash_rt::kernels::moe_grouped_w4a16_sm120_bf16(
+                to_ptr(A), to_ptr(W), to_ptr(sfb), to_ptr(alpha), to_ptr(eidx),
+                to_ptr(D), slots, N, K, a_stride, w_stride, sfb_stride,
+                to_stream(stream));
+        },
+        py::arg("A"), py::arg("W"), py::arg("sfb"), py::arg("alpha"),
+        py::arg("eidx"), py::arg("D"), py::arg("slots"), py::arg("N"),
+        py::arg("K"), py::arg("a_stride"), py::arg("w_stride"),
+        py::arg("sfb_stride"), py::arg("stream") = 0);
+
+    // Bitwise-identical variants tuned for a part where these two are compute
+    // bound rather than bandwidth bound. See w4a16_edge_sm120.cuh.
+    m.def("w4a16_matvec_edge_sm120_bf16",
+        [](uintptr_t x, uintptr_t W, uintptr_t sfb, uintptr_t out,
+           int N, int K, float alpha, uintptr_t stream) -> int {
+            return flash_rt::kernels::w4a16_matvec_edge_sm120_bf16(
+                to_ptr(x), to_ptr(W), to_ptr(sfb), to_ptr(out),
+                N, K, alpha, to_stream(stream));
+        },
+        py::arg("x"), py::arg("W"), py::arg("sfb"), py::arg("out"),
+        py::arg("N"), py::arg("K"), py::arg("alpha"), py::arg("stream") = 0);
+
+    m.def("moe_grouped_w4a16_edge_sm120_bf16",
+        [](uintptr_t A, uintptr_t W, uintptr_t sfb, uintptr_t alpha,
+           uintptr_t eidx, uintptr_t D, int slots, int N, int K,
+           long a_stride, long w_stride, long sfb_stride,
+           uintptr_t stream) -> int {
+            return flash_rt::kernels::moe_grouped_w4a16_edge_sm120_bf16(
+                to_ptr(A), to_ptr(W), to_ptr(sfb), to_ptr(alpha), to_ptr(eidx),
+                to_ptr(D), slots, N, K, a_stride, w_stride, sfb_stride,
+                to_stream(stream));
+        },
+        py::arg("A"), py::arg("W"), py::arg("sfb"), py::arg("alpha"),
+        py::arg("eidx"), py::arg("D"), py::arg("slots"), py::arg("N"),
+        py::arg("K"), py::arg("a_stride"), py::arg("w_stride"),
+        py::arg("sfb_stride"), py::arg("stream") = 0);
+
+    // Grouped NVFP4 activation quantisers (csrc/kernels/qwen35moe_grouped_quant.cu).
+    // Only the MoE prefill of this model calls them, and they write the
+    // grouped GEMM's per-group scale-factor layout rather than the general
+    // quantiser's, so they are built and declared with this tier.
+    m.def("moe_grouped_silu_quant_nvfp4_bf16",
+        [](uintptr_t merged, uintptr_t expert_of_row, uintptr_t group_off,
+           uintptr_t sfa_off, uintptr_t out_packed, uintptr_t out_sf,
+           int slots, int inter, uintptr_t stream) -> int {
+            return moe_grouped_silu_quant_nvfp4_bf16(
+                to_ptr(merged), to_ptr(expert_of_row), to_ptr(group_off),
+                to_ptr(sfa_off), to_ptr(out_packed), to_ptr(out_sf),
+                slots, inter, to_stream(stream));
+        },
+        py::arg("merged"), py::arg("expert_of_row"), py::arg("group_off"),
+        py::arg("sfa_off"), py::arg("out_packed"), py::arg("out_sf"),
+        py::arg("slots"), py::arg("inter"), py::arg("stream") = 0);
+
+    m.def("moe_grouped_silu_quant_nvfp4_warp_bf16",
+        [](uintptr_t merged, uintptr_t expert_of_row, uintptr_t group_off,
+           uintptr_t sfa_off, uintptr_t out_packed, uintptr_t out_sf,
+           int slots, int inter, uintptr_t stream) -> int {
+            return moe_grouped_silu_quant_nvfp4_warp_bf16(
+                to_ptr(merged), to_ptr(expert_of_row), to_ptr(group_off),
+                to_ptr(sfa_off), to_ptr(out_packed), to_ptr(out_sf),
+                slots, inter, to_stream(stream));
+        },
+        py::arg("merged"), py::arg("expert_of_row"), py::arg("group_off"),
+        py::arg("sfa_off"), py::arg("out_packed"), py::arg("out_sf"),
+        py::arg("slots"), py::arg("inter"), py::arg("stream") = 0);
+
+    m.def("moe_grouped_quant_nvfp4_bf16",
+        [](uintptr_t A, uintptr_t expert_of_row, uintptr_t group_off,
+           uintptr_t sfa_off, uintptr_t src_row,
+           uintptr_t out_packed, uintptr_t out_sf,
+           int slots, int K, uintptr_t stream) -> int {
+            return moe_grouped_quant_nvfp4_bf16(
+                to_ptr(A), to_ptr(expert_of_row), to_ptr(group_off),
+                to_ptr(sfa_off), to_ptr(src_row),
+                to_ptr(out_packed), to_ptr(out_sf),
+                slots, K, to_stream(stream));
+        },
+        py::arg("A"), py::arg("expert_of_row"), py::arg("group_off"),
+        py::arg("sfa_off"), py::arg("src_row"),
+        py::arg("out_packed"), py::arg("out_sf"),
+        py::arg("slots"), py::arg("K"), py::arg("stream") = 0);
+#endif  // FLASHRT_HAVE_QWEN35MOE_W4A16
+
+#ifdef FLASHRT_HAVE_QWEN35MOE_W4A4
     m.def("moe_m16_mma_sm120_bf16",
         [](uintptr_t A, uintptr_t B, uintptr_t sfa, uintptr_t sfb, uintptr_t D,
            uintptr_t alpha, uintptr_t te, int num_tiles, int N, int K,
@@ -5676,96 +6017,6 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("N"), py::arg("K"), py::arg("sfa_stride"), py::arg("w_stride"),
         py::arg("sfb_stride"), py::arg("stream") = 0);
 
-    m.def("moe_weighted_sum_sm120_bf16",
-        [](uintptr_t d_dn, uintptr_t rows, uintptr_t tw, uintptr_t out,
-           int S, int TOPK, int HID, int dn_stride, uintptr_t stream) -> int {
-            return flash_rt::kernels::moe_weighted_sum_sm120_bf16(
-                to_ptr(d_dn), to_ptr(rows), to_ptr(tw), to_ptr(out),
-                S, TOPK, HID, dn_stride, to_stream(stream));
-        },
-        py::arg("d_dn"), py::arg("rows"), py::arg("tw"), py::arg("out"),
-        py::arg("S"), py::arg("TOPK"), py::arg("HID"), py::arg("dn_stride"),
-        py::arg("stream") = 0);
-
-    m.def("w4a16_gemm_sm120_bf16",
-        [](uintptr_t X, uintptr_t W, uintptr_t SFB, uintptr_t Y,
-           int M, int N, int K, float alpha, uintptr_t stream) -> int {
-            return flash_rt::gemm::w4a16_gemm_sm120_bf16(
-                to_ptr(X), to_ptr(W), to_ptr(SFB), to_ptr(Y),
-                M, N, K, alpha, to_stream(stream));
-        },
-        py::arg("X"), py::arg("W"), py::arg("SFB"), py::arg("Y"),
-        py::arg("M"), py::arg("N"), py::arg("K"),
-        py::arg("alpha") = 1.0f, py::arg("stream") = 0);
-
-    m.def("w16a16_gemm_sm120_bf16",
-        [](uintptr_t X, uintptr_t W, uintptr_t Y,
-           int M, int N, int K, float alpha, uintptr_t stream) -> int {
-            return flash_rt::gemm::w16a16_gemm_sm120_bf16(
-                to_ptr(X), to_ptr(W), to_ptr(Y),
-                M, N, K, alpha, to_stream(stream));
-        },
-        py::arg("X"), py::arg("W"), py::arg("Y"),
-        py::arg("M"), py::arg("N"), py::arg("K"),
-        py::arg("alpha") = 1.0f, py::arg("stream") = 0);
-
-    m.def("moe_router_topk_sm120_bf16",
-        [](uintptr_t logits, uintptr_t out_idx, uintptr_t out_val,
-           int n_experts, int k, uintptr_t stream) -> int {
-            return flash_rt::kernels::moe_router_topk_sm120_bf16(
-                to_ptr(logits), to_ptr(out_idx), to_ptr(out_val),
-                n_experts, k, to_stream(stream));
-        },
-        py::arg("logits"), py::arg("out_idx"), py::arg("out_val"),
-        py::arg("n_experts"), py::arg("k"), py::arg("stream") = 0);
-
-    m.def("silu_mul_sm120_bf16",
-        [](uintptr_t g, uintptr_t u, uintptr_t out, int n,
-           uintptr_t stream) -> int {
-            return flash_rt::kernels::silu_mul_sm120_bf16(
-                to_ptr(g), to_ptr(u), to_ptr(out), n, to_stream(stream));
-        },
-        py::arg("g"), py::arg("u"), py::arg("out"), py::arg("n"),
-        py::arg("stream") = 0);
-
-    m.def("sigmoid_mul_sm120_bf16",
-        [](uintptr_t x, uintptr_t gate, uintptr_t out, int n,
-           uintptr_t stream) -> int {
-            return flash_rt::kernels::sigmoid_mul_sm120_bf16(
-                to_ptr(x), to_ptr(gate), to_ptr(out), n, to_stream(stream));
-        },
-        py::arg("x"), py::arg("gate"), py::arg("out"), py::arg("n"),
-        py::arg("stream") = 0);
-
-    m.def("gdn_recurrent_seq_sm120_bf16",
-        [](uintptr_t q, uintptr_t k, uintptr_t v, uintptr_t g, uintptr_t beta,
-           uintptr_t state, uintptr_t out, int S, int num_v_heads,
-           int head_dim, bool use_qk_l2norm, uintptr_t stream) -> int {
-            return flash_rt::kernels::gdn_recurrent_seq_sm120_bf16(
-                to_ptr(q), to_ptr(k), to_ptr(v), to_ptr(g), to_ptr(beta),
-                to_ptr(state), to_ptr(out), S, num_v_heads, head_dim,
-                use_qk_l2norm, to_stream(stream));
-        },
-        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"), py::arg("beta"),
-        py::arg("state"), py::arg("out"), py::arg("S"), py::arg("num_v_heads"),
-        py::arg("head_dim"), py::arg("use_qk_l2norm") = true,
-        py::arg("stream") = 0);
-
-    m.def("moe_grouped_w4a16_sm120_bf16",
-        [](uintptr_t A, uintptr_t W, uintptr_t sfb, uintptr_t alpha,
-           uintptr_t eidx, uintptr_t D, int slots, int N, int K,
-           long a_stride, long w_stride, long sfb_stride,
-           uintptr_t stream) -> int {
-            return flash_rt::kernels::moe_grouped_w4a16_sm120_bf16(
-                to_ptr(A), to_ptr(W), to_ptr(sfb), to_ptr(alpha), to_ptr(eidx),
-                to_ptr(D), slots, N, K, a_stride, w_stride, sfb_stride,
-                to_stream(stream));
-        },
-        py::arg("A"), py::arg("W"), py::arg("sfb"), py::arg("alpha"),
-        py::arg("eidx"), py::arg("D"), py::arg("slots"), py::arg("N"),
-        py::arg("K"), py::arg("a_stride"), py::arg("w_stride"),
-        py::arg("sfb_stride"), py::arg("stream") = 0);
-
     m.def("moe_grouped_gemv_sm120_bf16",
         [](uintptr_t A_stack, uintptr_t B_stack, uintptr_t D,
            uintptr_t SFA_stack, uintptr_t SFB_stack,
@@ -5787,7 +6038,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("a_stride"), py::arg("sfa_stride"),
         py::arg("w_stride"), py::arg("sfb_stride"),
         py::arg("stream") = 0);
-#endif  // FLASHRT_HAVE_QWEN35MOE
+#endif  // FLASHRT_HAVE_QWEN35MOE_W4A4
 
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS
     m.def("qwen36_gdn_gating_bf16",
@@ -7497,7 +7748,42 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
     m.def("nvfp4_sf_swizzled_bytes",
         &flash_rt::fp4::nvfp4_sf_swizzled_bytes,
         py::arg("rows"), py::arg("D"));
-#endif
+#endif  // ENABLE_CUTLASS_SM100_NVFP4_W4A16
+
+// Grouped NVFP4 MoE GEMM (qwen3_5_moe weight-only tier on Thor). Its own
+// object library and its own gate: a Thor build that does not ask for this
+// model neither compiles it nor exports these names.
+#ifdef FLASHRT_HAVE_QWEN35MOE_GROUPED_SM100
+    // Every routed expert of a layer in one launch, with the per-group shapes
+    // taken from device memory so the routing never reaches the host.
+    m.def("moe_grouped_gemm_nvfp4_sm100_bf16out",
+        [](uintptr_t A_packed, uintptr_t SFA, uintptr_t W_stack,
+           uintptr_t SFB_stack, uintptr_t alpha_dev, uintptr_t D,
+           uintptr_t group_off, uintptr_t sfa_off,
+           int groups, int N, int K, long w_stride, long sfb_stride,
+           uintptr_t scratch, size_t scratch_bytes,
+           uintptr_t stream) -> int {
+            return flash_rt::gemm::moe_grouped_gemm_nvfp4_sm100_bf16out(
+                to_ptr(A_packed), to_ptr(SFA), to_ptr(W_stack),
+                to_ptr(SFB_stack), to_ptr(alpha_dev), to_ptr(D),
+                to_ptr(group_off), to_ptr(sfa_off),
+                groups, N, K, w_stride, sfb_stride,
+                to_ptr(scratch), scratch_bytes, to_stream(stream));
+        },
+        py::arg("A_packed"), py::arg("SFA"), py::arg("W_stack"),
+        py::arg("SFB_stack"), py::arg("alpha_dev"), py::arg("D"),
+        py::arg("group_off"), py::arg("sfa_off"), py::arg("groups"),
+        py::arg("N"), py::arg("K"), py::arg("w_stride"),
+        py::arg("sfb_stride"), py::arg("scratch"),
+        py::arg("scratch_bytes"), py::arg("stream") = 0);
+
+    m.def("moe_grouped_gemm_nvfp4_sm100_scratch_bytes",
+        [](int groups) -> size_t {
+            return flash_rt::gemm::moe_grouped_gemm_nvfp4_sm100_scratch_bytes(
+                groups);
+        },
+        py::arg("groups"));
+#endif  // FLASHRT_HAVE_QWEN35MOE_GROUPED_SM100
 
 #ifdef ENABLE_ACTION_FFN_MEGAKERNEL_V6T
     // Action FFN megakernel V6tuned (ku256_sd4_su3 tile). Fused FP8

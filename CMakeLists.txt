@@ -82,18 +82,38 @@ message(STATUS "Using gencode flag: ${GPU_GENCODE}")
 # SM86/87/89 share the same source instantiations; we emit arch-specific
 # codegen per target so Jetson Orin (SM87) is not forced through an
 # incompatible cubin. SM120 (5090) uses PTX JIT from
-# compute_80. Thor SM110 has its own attention path (fvk.attention_qkv_fp16
-# cuBLAS decomposed), hand-tuned for unified LPDDR memory — building
-# FA2 there would add ~10 MB to the .so and unused compile time.
+# compute_80.
+#
+# Thor SM110 was excluded on the grounds that it has its own attention path
+# (fvk.attention_qkv_fp16, cuBLAS decomposed) and that FA2 would cost ~10 MB
+# of .so for nothing. That trade does not survive a long prefill: the
+# decomposed path materialises an (S * heads, S_kv) score buffer, which is
+# 3.4 GB per layer at ten thousand tokens, and the model that needs it here
+# is bf16 at head_dim 256 -- one instantiation, not the twelve the size
+# estimate assumed. FA2_HDIMS/FA2_DTYPES are narrowed for this target below.
+#
+# It stays opt-in all the same: every other Thor model still uses its own
+# attention path and would only be paying the compile time and the binary, so
+# the target that wants it asks for it. Default OFF keeps a Thor build's
+# sources and symbols exactly what they were.
+option(FLASHRT_ENABLE_THOR_FA2
+       "Build the vendored FA2 attention kernels on Jetson AGX Thor (sm_110)" OFF)
+if(FLASHRT_ENABLE_THOR_FA2 AND NOT GPU_ARCH STREQUAL "110")
+  message(FATAL_ERROR
+    "FLASHRT_ENABLE_THOR_FA2 is the Thor (sm_110) FA2 gate; current "
+    "GPU_ARCH=${GPU_ARCH} decides FA2 by architecture and needs no flag.")
+endif()
 if(GPU_ARCH STREQUAL "80"  OR GPU_ARCH STREQUAL "86" OR
    GPU_ARCH STREQUAL "87"  OR
-   GPU_ARCH STREQUAL "89"  OR GPU_ARCH STREQUAL "120" OR
+   GPU_ARCH STREQUAL "89"  OR
+   (GPU_ARCH STREQUAL "110" AND FLASHRT_ENABLE_THOR_FA2) OR
+   GPU_ARCH STREQUAL "120" OR
    GPU_ARCH STREQUAL "121")
   set(ENABLE_FA2 ON)
   message(STATUS "FA2 in-SO attention: ENABLED (sm_${GPU_ARCH})")
 else()
   set(ENABLE_FA2 OFF)
-  message(STATUS "FA2 in-SO attention: DISABLED (Thor SM110 uses fvk.attention_qkv_fp16 cuBLAS path)")
+  message(STATUS "FA2 in-SO attention: DISABLED (sm_${GPU_ARCH})")
 endif()
 
 # SM80-family CUTLASS INT8 kernels used by the Jetson Orin SM87 Pi0.5 fast
@@ -137,6 +157,21 @@ set(FA2_HDIMS "64;96;128;256" CACHE STRING
     "Semicolon-separated FA2 head_dim instantiations to build. Qwen3-VL 2B vision uses 64; other shipped models use 96 and 256.")
 set(FA2_DTYPES "fp16;bf16" CACHE STRING
     "Semicolon-separated FA2 dtype instantiations to build. Pi0 uses fp16; pi0.5/groot use bf16.")
+
+# Thor runs one model family through FA2 -- Qwen3.6 full attention, bf16 at
+# head_dim 256 -- so the default there is that one instantiation rather than
+# the twelve-file matrix the RTX targets distribute. This is why enabling FA2
+# on this arch does not cost what the original exclusion assumed. Both remain
+# cache variables: an explicit -DFA2_HDIMS on the command line still wins.
+if(GPU_ARCH STREQUAL "110" AND ENABLE_FA2)
+  if(NOT DEFINED CACHE{FA2_HDIMS} OR FA2_HDIMS STREQUAL "64;96;128;256")
+    set(FA2_HDIMS "256" CACHE STRING "" FORCE)
+  endif()
+  if(NOT DEFINED CACHE{FA2_DTYPES} OR FA2_DTYPES STREQUAL "fp16;bf16")
+    set(FA2_DTYPES "bf16" CACHE STRING "" FORCE)
+  endif()
+endif()
+
 option(FLASHRT_ENABLE_NATIVE_CPP
        "Build Python-free operation libraries for native C++ consumers" OFF)
 option(FLASHRT_BUILD_FA2_PYTHON_ADAPTER
@@ -163,13 +198,47 @@ option(FLASHRT_ENABLE_LINGBOT
        "Build LingBot-VLA Thor (sm_110) model kernels and bindings" ON)
 option(FLASHRT_ENABLE_MOTUS
        "Build Motus-specific RTX SM120 kernels and bindings" ON)
-# qwen3_5_moe family (Nex-N2-mini / Qwen3.5-3.6-35B-A3B) RTX SM120 kernels.
-# OFF by default: these are NVFP4/sm_120a-only block-scaled kernels and must
-# not enter the default flash_rt_kernels build on SM89/87/110 or for models
-# that don't use them. Enable explicitly (-DFLASHRT_ENABLE_QWEN35MOE=ON) on a
-# Blackwell build to get the Nex-N2 / Qwen3.6-35B-A3B path.
+# qwen3_5_moe family (Nex-N2-mini / Qwen3.5-3.6-35B-A3B) kernels, split into
+# three tiers by the hardware each tier actually requires. All are OFF by
+# default so they never enter the flash_rt_kernels build for models that do
+# not use them.
+#
+#   _CORE    Architecture-neutral: layout/split, bf16 matvec, router top-k,
+#            activation fusion, GDN recurrence, weighted-sum reducer, and the
+#            bf16 GEMM. Uses only bf16 intrinsics plus cp.async and
+#            mma.m16n8k16.bf16, i.e. SM80 and newer.
+#   _W4A16   Weight-only 4-bit: converts packed operands with the
+#            __nv_cvt_fp4x2_to_halfraw2 intrinsic and accumulates in bf16, so
+#            it needs no block-scaled MMA. SM89 and newer emit the hardware
+#            conversion; older targets take the intrinsic's software path.
+#   _W4A4    Block-scaled 4-bit MMA through CUTLASS. Requires the
+#            CUTE_ARCH_F8F6F4_MMA_ENABLED path, which only sm_120a/sm_121a
+#            provide. On other targets CUTLASS still compiles these
+#            translation units but replaces the MMA with
+#            CUTE_INVALID_CONTROL_PATH, so the gate must be explicit: a
+#            successful build would otherwise produce kernels that fail at
+#            run time.
+#
+# FLASHRT_ENABLE_QWEN35MOE remains the single switch for a full Blackwell
+# build and turns on all three tiers, so existing configure lines are
+# unchanged.
 option(FLASHRT_ENABLE_QWEN35MOE
-       "Build qwen3_5_moe (Nex-N2 / Qwen3.6-35B-A3B) RTX SM120 kernels" OFF)
+       "Build all qwen3_5_moe (Nex-N2 / Qwen3.6-35B-A3B) kernel tiers" OFF)
+option(FLASHRT_ENABLE_QWEN35MOE_CORE
+       "Build architecture-neutral qwen3_5_moe kernels" OFF)
+option(FLASHRT_ENABLE_QWEN35MOE_W4A16
+       "Build weight-only 4-bit qwen3_5_moe kernels" OFF)
+option(FLASHRT_ENABLE_QWEN35MOE_W4A4
+       "Build block-scaled 4-bit MMA qwen3_5_moe kernels (sm_120a/sm_121a)" OFF)
+if(FLASHRT_ENABLE_QWEN35MOE)
+  set(FLASHRT_ENABLE_QWEN35MOE_CORE ON)
+  set(FLASHRT_ENABLE_QWEN35MOE_W4A16 ON)
+  set(FLASHRT_ENABLE_QWEN35MOE_W4A4 ON)
+endif()
+# The upper tiers reuse the core layout, reducer, and activation kernels.
+if(FLASHRT_ENABLE_QWEN35MOE_W4A16 OR FLASHRT_ENABLE_QWEN35MOE_W4A4)
+  set(FLASHRT_ENABLE_QWEN35MOE_CORE ON)
+endif()
 # Qwen3-VL adds a handful of kernels (rotate_half RoPE, ...) that the shared
 # binary does not yet need. Built into a SEPARATE flash_rt_qwen3_vl_kernels
 # module so flash_rt_kernels.so stays stable; OFF by default.
@@ -628,6 +697,7 @@ if(GPU_ARCH STREQUAL "110")
     POSITION_INDEPENDENT_CODE ON
   )
   target_include_directories(cutlass_nvfp4_w4a16_sm100_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/fp4
     ${CUTLASS_INCLUDE}
@@ -640,6 +710,37 @@ if(GPU_ARCH STREQUAL "110")
     >
   )
   message(STATUS "SM100 CUTLASS NVFP4 W4A16 GEMM (Thor): ENABLED")
+endif()
+
+# ── Grouped NVFP4 MoE GEMM (qwen3_5_moe weight-only tier, Thor SM110) ──
+# One launch per layer over every routed expert, with the per-group shapes read
+# from device memory. Only the qwen3_5_moe MoE prefill calls it, so it is its
+# own object gated on that model's tier rather than a second source in the
+# W4A16 object above: a Thor build that does not ask for this model must not
+# pay its CUTLASS grouped-kernel compile time or carry its symbols. The
+# matching bindings are guarded on FLASHRT_HAVE_QWEN35MOE_GROUPED_SM100.
+if(GPU_ARCH STREQUAL "110" AND FLASHRT_ENABLE_QWEN35MOE_W4A16)
+  add_library(qwen35moe_nvfp4_grouped_sm100_obj OBJECT
+    csrc/gemm/fp4/cutlass_nvfp4_moe_grouped_sm100.cu)
+  set_target_properties(qwen35moe_nvfp4_grouped_sm100_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(qwen35moe_nvfp4_grouped_sm100_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/fp4
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(qwen35moe_nvfp4_grouped_sm100_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+  set(ENABLE_QWEN35MOE_GROUPED_SM100 ON)
+  message(STATUS "qwen3_5_moe grouped NVFP4 MoE GEMM (Thor): ENABLED")
 endif()
 
 # ── Dedicated M=1 decode GEMV (FP8 + BF16) ──
@@ -954,6 +1055,15 @@ if(ENABLE_FA2 AND
         >
       )
       message(STATUS "FA2 vendor arch: sm_${GPU_ARCH} AOT only (FA2_ARCH_NATIVE_ONLY=ON)")
+    elseif(GPU_ARCH STREQUAL "110")
+      # Native SASS via the same gencode the rest of this build uses, not
+      # compute_80 PTX. The 5090 learned that lesson: routing it through
+      # compute_80 PTX produced SASS that drifted from the native build by
+      # about an fp16 ULP a layer.
+      target_compile_options(fa2_vendor_obj PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:${GPU_GENCODE}>
+      )
+      message(STATUS "FA2 vendor arch: sm_110a AOT only (FA2_ARCH_NATIVE_ONLY=ON)")
     elseif(GPU_ARCH STREQUAL "120")
       target_compile_options(fa2_vendor_obj PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:
@@ -975,16 +1085,26 @@ if(ENABLE_FA2 AND
     # build). See commit history for the reason each gencode matters —
     # routing 5090 through compute_80 PTX produced a subtle sm_120 SASS
     # drift that accumulated to cos 0.98 under Pi0 FP8.
-    target_compile_options(fa2_vendor_obj PRIVATE
-      $<$<COMPILE_LANGUAGE:CUDA>:
-        "SHELL:-gencode arch=compute_80,code=sm_80"
-        "SHELL:-gencode arch=compute_120,code=sm_120"
-        "SHELL:-gencode arch=compute_120,code=compute_120"
-        "SHELL:-gencode arch=compute_121,code=sm_121"
-        "SHELL:-gencode arch=compute_121,code=compute_121"
-      >
-    )
-    message(STATUS "FA2 vendor arch: sm_80 + sm_120/sm_121 AOT + Blackwell PTX fallback (default)")
+    # sm_110 is not in the consumer family this multi-arch list distributes
+    # for, and compute_80 SASS does not run on it, so it takes its own
+    # gencode here as well rather than silently getting no cubin.
+    if(GPU_ARCH STREQUAL "110")
+      target_compile_options(fa2_vendor_obj PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:${GPU_GENCODE}>
+      )
+      message(STATUS "FA2 vendor arch: sm_110a AOT (Thor)")
+    else()
+      target_compile_options(fa2_vendor_obj PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:
+          "SHELL:-gencode arch=compute_80,code=sm_80"
+          "SHELL:-gencode arch=compute_120,code=sm_120"
+          "SHELL:-gencode arch=compute_120,code=compute_120"
+          "SHELL:-gencode arch=compute_121,code=sm_121"
+          "SHELL:-gencode arch=compute_121,code=compute_121"
+        >
+      )
+      message(STATUS "FA2 vendor arch: sm_80 + sm_120/sm_121 AOT + Blackwell PTX fallback (default)")
+    endif()
   endif()
 
   # Macros the wrapper reads to #ifdef-guard optional hdim/dtype
@@ -1520,30 +1640,72 @@ else()
   message(STATUS "NVFP4 swizzle/quantize kernels: SKIPPED (slim build)")
 endif()
 
-# ── qwen3_5_moe family (Nex-N2 / Qwen3.6-35B-A3B) SM120 kernels ──
-# Gated: only compiled when explicitly enabled AND on a Blackwell (NVFP4)
-# build. The bindings are #ifdef FLASHRT_HAVE_QWEN35MOE in bindings.cpp, so
-# the symbols are absent (and the .cu never compiled) on every other target.
-if(FLASHRT_ENABLE_QWEN35MOE AND ENABLE_NVFP4)
+# ── qwen3_5_moe family (Nex-N2 / Qwen3.6-35B-A3B) kernels ──
+# Three tiers, each with its own compile definition. The matching bindings in
+# csrc/bindings.cpp are guarded on the same macros, so a tier that is off
+# contributes neither symbols nor translation units.
+if(FLASHRT_ENABLE_QWEN35MOE_CORE)
   target_sources(flash_rt_kernels PRIVATE
     csrc/kernels/qwen35moe_layout.cu
-    csrc/kernels/moe_grouped_gemv_sm120.cu
     csrc/kernels/bf16_matvec_sm120.cu
-    csrc/kernels/w4a16_matvec_sm120.cu
-    csrc/kernels/moe_grouped_w4a16_sm120.cu
     csrc/kernels/gdn_recurrent_seq_sm120.cu
+    csrc/kernels/gdn_wy_prefill_edge.cu
+    csrc/kernels/causal_conv1d_rows_edge.cu
     csrc/kernels/act_fuse_sm120.cu
     csrc/kernels/moe_router_topk_sm120.cu
+    csrc/kernels/moe_route_prefill_edge.cu
+    csrc/kernels/moe_shared_combine_edge.cu
+    csrc/kernels/moe_weighted_sum_sm120.cu
+    csrc/kernels/w16a16_gemm_sm120.cu
+    csrc/kernels/qwen35moe_e0m3_dequant.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    FLASHRT_HAVE_QWEN35MOE_CORE=1)
+  message(STATUS "qwen3_5_moe core kernels: ENABLED (sm_${GPU_ARCH})")
+endif()
+
+if(FLASHRT_ENABLE_QWEN35MOE_W4A16)
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/w4a16_matvec_sm120.cu
+    csrc/kernels/moe_grouped_w4a16_sm120.cu
+    csrc/kernels/w4a16_edge_sm120.cu
+    csrc/kernels/w4a16_mrows_edge_sm120.cu
+    csrc/kernels/w4a16_gemm_sm120.cu
+    csrc/kernels/qwen35moe_grouped_quant.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    FLASHRT_HAVE_QWEN35MOE_W4A16=1)
+  # Packed-weight loads in flight per row in the W4A16 GEMVs. The kernels
+  # default to 4, which is the value the SM120 path was validated with. Thor
+  # measures faster at 2 because the kernel is register-limited there (8 blocks
+  # per SM where every other limit allows 24); that is a property of a 20-SM
+  # part and is not assumed to transfer, so it is set only for that target.
+  # Either value produces bit-identical output; see w4a16_edge_sm120.cu.
+  if(GPU_ARCH STREQUAL "110")
+    target_compile_definitions(flash_rt_kernels PRIVATE
+      FLASHRT_W4A16_EDGE_UNROLL=2)
+  endif()
+  message(STATUS "qwen3_5_moe weight-only 4-bit kernels: ENABLED (sm_${GPU_ARCH})")
+endif()
+
+# Block-scaled 4-bit MMA needs the sm_120a/sm_121a CUTLASS path. Refuse rather
+# than build silently broken kernels on other targets.
+if(FLASHRT_ENABLE_QWEN35MOE_W4A4)
+  if(NOT ENABLE_NVFP4)
+    message(FATAL_ERROR
+      "FLASHRT_ENABLE_QWEN35MOE_W4A4 requires a block-scaled-MMA target "
+      "(current GPU_ARCH=${GPU_ARCH}). CUTLASS compiles these kernels on "
+      "other architectures but replaces the MMA with an invalid control "
+      "path, so they would fail at run time. Use "
+      "FLASHRT_ENABLE_QWEN35MOE_CORE and FLASHRT_ENABLE_QWEN35MOE_W4A16 "
+      "instead.")
+  endif()
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/moe_grouped_gemv_sm120.cu
     csrc/kernels/moe_m16_mma_sm120.cu
     csrc/kernels/moe_m64_mma_sm120.cu
-    csrc/kernels/moe_blocktile_mma_sm120.cu
-    csrc/kernels/moe_weighted_sum_sm120.cu
-    csrc/kernels/w4a16_gemm_sm120.cu
-    csrc/kernels/w16a16_gemm_sm120.cu)
-  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_QWEN35MOE=1)
-  message(STATUS "qwen3_5_moe (Nex-N2 / Qwen3.6-35B-A3B) SM120 kernels: ENABLED")
-elseif(FLASHRT_ENABLE_QWEN35MOE)
-  message(STATUS "qwen3_5_moe SM120 kernels: SKIPPED (requires Blackwell NVFP4)")
+    csrc/kernels/moe_blocktile_mma_sm120.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    FLASHRT_HAVE_QWEN35MOE_W4A4=1)
+  message(STATUS "qwen3_5_moe block-scaled 4-bit kernels: ENABLED (sm_${GPU_ARCH})")
 endif()
 
 # ── MelBandRoformer custom fused kernels (BF16/FP8, gated) ──
@@ -1640,6 +1802,15 @@ if(GPU_ARCH STREQUAL "110")
     csrc/quantize/nvfp4_sf_reshape_sm120.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE
     ENABLE_CUTLASS_SM100_NVFP4_W4A16=1)
+endif()
+
+# The grouped MoE GEMM built above, linked and declared only when the model
+# tier that calls it is on.
+if(ENABLE_QWEN35MOE_GROUPED_SM100)
+  target_sources(flash_rt_kernels PRIVATE
+    $<TARGET_OBJECTS:qwen35moe_nvfp4_grouped_sm100_obj>)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    FLASHRT_HAVE_QWEN35MOE_GROUPED_SM100=1)
 endif()
 
 if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR

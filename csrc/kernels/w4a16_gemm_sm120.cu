@@ -18,7 +18,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include <cuda_fp4.h>
+#include "kernels/fp4_e2m1_compat.cuh"
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstdint>
@@ -166,10 +166,10 @@ __global__ __launch_bounds__(GM_THREADS) void w4a16_gemm_kernel(
         const int ncol = warp_n * 32 + jb * 8 + r;
         const uint8_t* wq = &sWq[cur][ncol * KT_half];
         float sf = c_w4a16_ue4m3[sSFB[cur][ncol * GM_KSUB + ksub]] * alpha;
-        __half2_raw h0 = __nv_cvt_fp4x2_to_halfraw2(
-            static_cast<__nv_fp4x2_storage_t>(wq[byte0]), __NV_E2M1);
-        __half2_raw h1 = __nv_cvt_fp4x2_to_halfraw2(
-            static_cast<__nv_fp4x2_storage_t>(wq[byte0 + 4]), __NV_E2M1);
+        __half2_raw h0 = flash_rt::fp4::cvt_e2m1x2_to_halfraw2(
+            static_cast<uint8_t>(wq[byte0]));
+        __half2_raw h1 = flash_rt::fp4::cvt_e2m1x2_to_halfraw2(
+            static_cast<uint8_t>(wq[byte0 + 4]));
         float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&h0));
         float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&h1));
         bb0[jb] = pack_bf16x2(f0.x * sf, f0.y * sf);

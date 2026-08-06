@@ -165,17 +165,26 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
 
     # ── Nex-N2-mini / Qwen3.6-35B-A3B (qwen3_5_moe) ──
     # Text LLM, not a VLA: GDN linear-attn + full-attn-every-4th + 256-expert
-    # NVFP4 MoE. RTX 5090 (SM120) only, and requires the gated kernel build
-    # (-DFLASHRT_ENABLE_QWEN35MOE=ON). Registered here for discoverability /
-    # resolve_pipeline_class, but the frontend exposes an LLM surface
-    # (infer()->logits, generate_greedy) rather than the VLA predict(images)
-    # API, so these are used via direct frontend construction rather than
-    # load_model's VLAModel wrapper.
+    # NVFP4 MoE. Registered here for discoverability / resolve_pipeline_class,
+    # but the frontend exposes an LLM surface (infer()->logits,
+    # generate_greedy) rather than the VLA predict(images) API, so these are
+    # used via direct frontend construction rather than load_model's VLAModel
+    # wrapper.
+    #
+    # Nex-N2 is RTX 5090 (SM120) and needs the full gated kernel build
+    # (-DFLASHRT_ENABLE_QWEN35MOE=ON).
     ("nexn2", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.nexn2_rtx", "Nexn2TorchFrontendRtx"),
+    # Qwen3.6 runs the same frontend on RTX SM120 and on Jetson AGX Thor
+    # (SM110). The two differ only in which kernel tiers the build has:
+    # SM120 takes the whole switch, Thor takes the two tiers its toolchain can
+    # compile. See docs/qwen36_moe_usage.md for the exact command per target.
     ("qwen36_moe", "torch", "rtx_sm120"):
-        ("flash_rt.frontends.torch.qwen36_moe_rtx",
-         "Qwen36MoeTextFrontendRtx"),
+        ("flash_rt.frontends.torch.qwen36_moe",
+         "Qwen36MoeTextFrontend"),
+    ("qwen36_moe", "torch", "thor"):
+        ("flash_rt.frontends.torch.qwen36_moe",
+         "Qwen36MoeTextFrontend"),
 
     # ── Pi0-FAST ── (SM120 runtime fork inside pipeline, no AttentionBackend protocol.)
     ("pi0fast", "torch", "thor"):
