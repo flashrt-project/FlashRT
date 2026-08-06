@@ -256,11 +256,52 @@ changed between a CUDA graph capture and its replay.
 
 ## Validation
 
+### Build and symbol matrix
+
+A build with every `qwen3_5_moe` option off must compile the same sources and
+export the same symbols it did before the tiers existed. That is a property of
+the gates, so it is checked by reading them:
+
+```bash
+python scripts/qwen35moe_build_matrix.py           # print sources + symbols per tier
+python scripts/qwen35moe_build_matrix.py --check   # exit 1 if any tier leaks
+PYTHONPATH=. PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  pytest -q -p no:cacheprovider tests/test_qwen35moe_build_matrix.py
+```
+
+The five configurations behind it, each configure-only:
+
+| configuration | flags | result |
+|---|---|---|
+| baseline SM120 | `-DGPU_ARCH=120` | `FA2 ENABLED`; no `qwen3_5_moe` source or symbol |
+| baseline SM110 | `-DGPU_ARCH=110` | `FA2 DISABLED`; no `qwen3_5_moe` source or symbol |
+| SM110 supported | `-DGPU_ARCH=110 -DFLASHRT_ENABLE_QWEN35MOE_CORE=ON -DFLASHRT_ENABLE_QWEN35MOE_W4A16=ON -DFLASHRT_ENABLE_THOR_FA2=ON` | core + weight-only tiers, grouped MoE GEMM, FA2 at `hdim={256} x dtype={bf16}` |
+| SM120 supported | `-DGPU_ARCH=120 -DFLASHRT_ENABLE_QWEN35MOE=ON` | all three tiers |
+| SM110 block-scaled | `-DGPU_ARCH=110 -DFLASHRT_ENABLE_QWEN35MOE_W4A4=ON` | **configure fails**, naming the two tiers that do apply |
+
+The last row is the point of the explicit gate: CUTLASS would otherwise compile
+those translation units on sm_110 with the MMA replaced by an invalid control
+path, and the failure would arrive at run time instead.
+
+### Tests
+
 The repository smoke test is checkpoint-independent:
 
 ```bash
 PYTHONPATH=. PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   pytest -q -p no:cacheprovider tests/test_qwen36_moe_smoke.py
+```
+
+Speculative decode has its own file. The constructor contract and the graph
+cache's eviction policy run anywhere; the equivalence tests -- K=1 and K=2
+against plain greedy, the window's logits and recurrent, conv and KV state
+against the decode steps they stand in for, the rejected-tail rewind, and the
+boundary token counts -- need a GPU and a checkpoint and skip without them:
+
+```bash
+FLASHRT_QWEN36_MOE_CKPT_DIR=/models/Qwen3.6-35B-A3B \
+PYTHONPATH=. PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+pytest -q -p no:cacheprovider tests/test_qwen36_moe_spec_decode.py
 ```
 
 Set `FLASHRT_QWEN36_MOE_CKPT_DIR` to include the official checkpoint contract

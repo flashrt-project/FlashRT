@@ -48,6 +48,22 @@ def _qwen35moe_env(name: str, default: str) -> str:
 _BATCHED_PREFILL_MIN_S = 8
 
 
+def _cache_put(cache, key, value, cap):
+    """Insert ``value`` and evict least-recently-used down to ``cap``.
+
+    Both graph caches go through this. A captured graph owns its memory pool,
+    so an unbounded cache leaks device memory across a long generation -- one
+    graph per absolute position. ``cap <= 0`` disables the bound.
+
+    Returns the value, so a caller can insert and use in one expression.
+    """
+    cache[key] = value
+    if cap > 0:
+        while len(cache) > cap:
+            cache.popitem(last=False)           # evict LRU
+    return value
+
+
 def _cs():
     """Current CUDA stream handle. Inside torch.cuda.graph capture this is
     the capture stream; eager, the default stream. fvk calls MUST use it --
@@ -1356,11 +1372,8 @@ def _ensure_spec_graph(state, pos, k, fvk, device):
     with torch.no_grad():
         _restore()
 
-    state._spec_graphs[key] = (g, hid)
-    cap = state.spec_graph_cache_max
-    if cap > 0 and len(state._spec_graphs) > cap:
-        state._spec_graphs.popitem(last=False)      # evict LRU
-    return state._spec_graphs[key]
+    return _cache_put(state._spec_graphs, key, (g, hid),
+                      state.spec_graph_cache_max)
 
 
 def spec_decode_step(state, token_id, pos, k, fvk, device):
@@ -1558,11 +1571,7 @@ def _ensure_decode_graph(state, pos, fvk, device):
     with torch.no_grad():
         _restore()
 
-    state._graphs[pos] = (g, out)
-    cap = state.graph_cache_max
-    if cap > 0 and len(state._graphs) > cap:
-        state._graphs.popitem(last=False)       # evict LRU
-    return state._graphs[pos]
+    return _cache_put(state._graphs, pos, (g, out), state.graph_cache_max)
 
 
 def generate_greedy_graph(state, input_ids, max_new_tokens, fvk, device):
