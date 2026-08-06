@@ -173,15 +173,21 @@ RTX 5090:
 |---|---:|---:|---|
 | NVFP4, 64 | **40.42 ms** | **257.95 tok/s** | [Qwen3.6-MoE usage](docs/qwen36_moe_usage.md#validation) |
 
-Jetson AGX Thor:
+Jetson AGX Thor, against vLLM 0.26.0 on the same part and protocol:
 
 | Mode | Prefill | Decode | Source |
 |---|---:|---:|---|
-| NVFP4, 20 | **89.5 ms** | **100.4 tok/s** | [Qwen3.6-MoE Thor](docs/qwen36_moe_usage.md#jetson-agx-thor-numbers) |
-| NVFP4, 2 K | **382.3 ms** | **103.4 tok/s** | [Qwen3.6-MoE Thor](docs/qwen36_moe_usage.md#jetson-agx-thor-numbers) |
+| NVFP4, 20 | **89.5 ms** (vLLM 102.3) | | [Qwen3.6-MoE Thor](docs/qwen36_moe_usage.md#jetson-agx-thor-numbers) |
+| NVFP4, 1 K | **216.0 ms** (vLLM 319.4) | **87.1 tok/s** (vLLM 31.6) | [Qwen3.6-MoE Thor](docs/qwen36_moe_usage.md#jetson-agx-thor-numbers) |
+| NVFP4, 2 K | **379.6 ms** (vLLM 495.0) | **86.3 tok/s** (vLLM 31.5) | [Qwen3.6-MoE Thor](docs/qwen36_moe_usage.md#jetson-agx-thor-numbers) |
+| NVFP4, 32 K | **7207.5 ms** (vLLM 7231.8) | | [Qwen3.6-MoE Thor](docs/qwen36_moe_usage.md#jetson-agx-thor-numbers) |
 
-Speculative decode with the MTP head reaches **106.74 tok/s** on Thor at K=2,
-emitting the same tokens as greedy decoding. See
+TTFT leads at every length from 20 to 32768 tokens; 128 K context reaches the
+board at 2470 tok/s of prefill. The decode column predates a later round that
+moved the steady step from 89.0 to 102.6 tok/s, so it is a lower bound.
+
+Speculative decode with the MTP head reaches **106.74 tok/s** against 100.35
+plain in the same process, emitting the same tokens as greedy decoding. See
 [speculative decode](docs/qwen36_moe_usage.md#speculative-decode).
 
 #### Qwen3-8B

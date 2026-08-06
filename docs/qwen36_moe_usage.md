@@ -386,21 +386,67 @@ greedy sequences were token-exact for 16 generated tokens on all four prompts.
 ## Jetson AGX Thor numbers
 
 Measured on Jetson AGX Thor (sm_110), unified memory, the same BF16 checkpoint
-with runtime NVFP4 conversion. Prefill is the wall time to first-token logits;
-decode is the warm CUDA-graph steady-state rate.
+with runtime NVFP4 conversion, against vLLM 0.26.0 on the same part with the
+same pre-tokenized prompts and the same protocol on both sides: TTFT is the
+wall time of a one-token generate, decode is the rest of a 64-token generate
+with that TTFT subtracted, best of three after a warm-up. One prompt length per
+process on both sides. The vision tower is off on both, since this frontend is
+text-only.
 
-| Prompt | Prefill | Decode |
-|---:|---:|---:|
-| 20 | 89.5 ms | 100.4 tok/s |
-| 2 K | 382.3 ms | 103.4 tok/s |
-| 32 K | 7.208 s | |
+| prompt | TTFT | vLLM TTFT | |
+|---:|---:|---:|---|
+| 20 | **89.5 ms** | 102.3 ms | +14% |
+| 256 | **104.7 ms** | 214.5 ms | +105% |
+| 512 | **144.5 ms** | 251.1 ms | +74% |
+| 1024 | **216.0 ms** | 319.4 ms | +48% |
+| 2048 | **379.6 ms** | 495.0 ms | +30% |
+| 4096 | **748.6 ms** | 867.4 ms | +16% |
+| 10240 | **1890.7 ms** | 2144.5 ms | +13% |
+| 32768 | **7207.5 ms** | 7231.8 ms | +0.3% |
 
-Context reaches 128 K on this board at 2470 tok/s of prefill. The decode figure
-moves a few percent with what else the board is running; the prefill figures
-are one length per process.
+Where the prefill is dominated by per-layer work -- projections, routing, the
+linear-attention scan -- the kernels win, and win by more the shorter the
+prompt. Where it is dominated by attention's O(S^2) the lead narrows, because
+attention is the one component still reached through torch.
 
-With the draft head loaded, speculative decode reaches 106.74 tok/s at K=2 --
-see below.
+Decode, from the same sweep:
+
+| prompt | decode | vLLM decode | |
+|---:|---:|---:|---|
+| 1024 | **87.1 tok/s** | 31.6 tok/s | 2.8x |
+| 2048 | **86.3 tok/s** | 31.5 tok/s | 2.7x |
+| 4096 | **85.1 tok/s** | 31.2 tok/s | 2.7x |
+
+That sweep predates the decode round below, which moved the steady step 15.3%
+and does not touch vLLM's side, so it is a lower bound on the current ratio.
+
+Context reaches 128 K on this board, at 2470 tok/s of prefill. It could not
+before FA2 was available here: the default configuration chunks past 8192
+tokens and every chunk asked for a non-square causal window, which had no fused
+backend, so the scores were materialised.
+
+### The decode round
+
+Five changes, each bit-identical to what it replaced, measured in the captured
+steady step at a 20-token prompt. This is a different protocol from the sweep
+above, which times a whole generate, so the two numbers are not
+interchangeable.
+
+| | step | tok/s |
+|---|---:|---:|
+| round start | 11.238 ms | 89.0 |
+| gating constants derived once, not per step | 11.059 ms | 90.4 |
+| MoE tail fused into one kernel | 10.827 ms | 92.4 |
+| spill-free gated-DeltaNet recurrence | 10.379 ms | 96.4 |
+| single-warp router top-8 | 10.297 ms | 97.1 |
+| grouped GEMV `kUnroll` 4 -> 2 | **9.743 ms** | **102.6** |
+
+The last row is a build-time constant and is bit-identical by construction: the
+main loop advances by `32*kUnroll` and the tail takes the remainder, so a lane
+visits the same k-blocks in the same order for any value. The sweep is not
+monotone -- 1: 99.7, **2: 102.6**, 3: 96.5, 4: 96.3 -- so two is a genuine
+optimum, and it is scoped to sm_110 in CMake because it was measured on a
+20-SM part.
 
 ## Speculative decode
 
@@ -416,38 +462,38 @@ to be plain greedy's, and it is checked directly: logits rows, per-token
 recurrent and conv snapshots, and the KV rows written are all compared with
 `torch.equal` against a decode step run over the same tokens.
 
-Both the plain and the speculative rate below come from the same process, so
-the ratio is a paired comparison. The absolute figures move a few percent with
-what else the board is running; the ratio is the stable part.
+Plain and speculative are measured in the same process, so every ratio is
+paired with a baseline from its own run. The absolute rates move a few percent
+with what else the board is doing; the ratio is the stable part. Every row
+emitted plain greedy's sequence token for token, with the 16-token golden
+fixture passing on the same build.
 
-20-token prompt, 128 generated tokens:
+| tree | plain | K=2 | |
+|---|---:|---:|---:|
+| after the fused MoE tail | 91.18 | 97.34 | 1.07x |
+| after the single-warp router | 91.98 | 98.57 | 1.07x |
+| after `kUnroll` 4 -> 2 | 96.64 | 100.66 | 1.04x |
+| current | **100.35** | **106.74** | **1.06x** |
 
-| | tok/s | vs plain |
-|---|---:|---:|
-| plain greedy | 100.35 | |
-| speculative, K=1 | 105.22 | 1.05x |
-| speculative, K=2 | **106.74** | 1.06x |
+K=1 on the current tree reads 105.22 against the same 100.35.
 
-The same comparison at longer context, 128 generated tokens per point:
+`K=2` is the operating point. Above it the window costs more than the extra
+accepted tokens return: each additional verified row re-reads the routed
+experts, which do not amortise across a window the way the dense weights do,
+and each additional draft pays a full-vocabulary projection.
 
-| context | plain | K=1 | K=2 | K=3 |
-|---:|---:|---:|---:|---:|
-| 512 | 90.4 | 95.4 (1.06x) | **99.4 (1.10x)** | 96.3 (1.06x) |
-| 2048 | 79.9 | 84.1 (1.05x) | **86.5 (1.08x)** | 73.8 (0.92x) |
+Acceptance rises with context -- 2.60 tokens kept per window at a 20-token
+prompt, 2.72 at 512, 2.74 at 2048 -- while the ratio does not, because the
+verify runs `K+1` separate single-query attention passes. That is the price of
+keeping the window bit-exact, and it is the largest remaining lever on this
+path.
 
-Every row emitted the same text as plain greedy decoding in the same process.
-
-`K=2` is the operating point at every context measured. Above it the window
-costs more than the extra accepted tokens return: each additional verified row
-re-reads the routed experts, which do not amortise across a window the way the
-dense weights do, and each additional draft pays a full-vocabulary projection.
-At 2048 tokens `K=3` is already a loss, and its acceptance falls too -- 3.46
-kept per window at 512, 3.00 at 2048.
-
-Acceptance rises with context (2.60 kept per window at a 20-token prompt, 2.72
-at 512, 2.74 at 2048) while the ratio does not, because the verify runs `K+1`
-separate single-query attention passes. That is the price of keeping the window
-bit-exact, and it is the largest remaining lever on this path.
+For scale, vLLM 0.26.0 supports `Qwen3_5MoeMTP` -- the same head -- and with
+`num_speculative_tokens=2` reaches 55.00 tok/s at a 20-token prompt against its
+own 31.59, a 1.74x gain. The larger gain rests on a step three times heavier: a
+fixed per-draft cost is proportionally three times cheaper against 31.7 ms than
+against 9.7 ms. Plain greedy decoding here is faster than that speculative
+figure by 1.8x, with no speculation at all.
 
 Enable it with `load_mtp=True` on the constructor; the window width is the `k`
 argument to `generate_spec`:
