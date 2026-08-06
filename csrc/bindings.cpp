@@ -5325,12 +5325,22 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
            uintptr_t state, uintptr_t out,
            int B, int num_v_heads, int head_k_dim, int head_v_dim,
            bool use_qk_l2norm, uintptr_t stream) {
-            flash_rt::kernels::gated_deltanet_recurrent_edge_qwen36_bf16(
-                to_ptr(q), to_ptr(k), to_ptr(v),
-                to_ptr(g), to_ptr(beta),
-                to_ptr(state), to_ptr(out),
-                B, num_v_heads, head_k_dim, head_v_dim,
-                use_qk_l2norm, to_stream(stream));
+            const int rc =
+                flash_rt::kernels::gated_deltanet_recurrent_edge_qwen36_bf16(
+                    to_ptr(q), to_ptr(k), to_ptr(v),
+                    to_ptr(g), to_ptr(beta),
+                    to_ptr(state), to_ptr(out),
+                    B, num_v_heads, head_k_dim, head_v_dim,
+                    use_qk_l2norm, to_stream(stream));
+            if (rc != 0) {
+                throw std::runtime_error(
+                    "gated_deltanet_recurrent_edge_qwen36_bf16 failed with "
+                    + std::to_string(rc) + " for B=" + std::to_string(B)
+                    + " num_v_heads=" + std::to_string(num_v_heads)
+                    + " head_k_dim=" + std::to_string(head_k_dim)
+                    + " head_v_dim=" + std::to_string(head_v_dim)
+                    + " (this entry supports head dims of 128 only)");
+            }
         },
         py::arg("q"), py::arg("k"), py::arg("v"),
         py::arg("g"), py::arg("beta"),

@@ -63,7 +63,12 @@ void gated_deltanet_recurrent_qwen36_bf16(
 // Spill-free variant of the above: identical arithmetic and accumulation
 // order, but the thread's state column is re-read rather than held in a
 // 128-float local array. Same arguments, same results, bit for bit.
-void gated_deltanet_recurrent_edge_qwen36_bf16(
+//
+// Shape-specialized: head_k_dim and head_v_dim must both be 128. Returns
+// non-zero for a null pointer (1), an unsupported head dim (2) or a
+// non-positive batch/head count (3), rather than leaving the output buffer
+// undefined -- the binding turns that into an exception.
+int gated_deltanet_recurrent_edge_qwen36_bf16(
     const void* q,
     const void* k,
     const void* v,

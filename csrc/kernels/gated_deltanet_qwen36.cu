@@ -247,7 +247,7 @@ __global__ void gated_deltanet_recurrent_edge_kernel(
 
 }  // namespace
 
-void gated_deltanet_recurrent_edge_qwen36_bf16(
+int gated_deltanet_recurrent_edge_qwen36_bf16(
     const void* q,
     const void* k,
     const void* v,
@@ -260,7 +260,9 @@ void gated_deltanet_recurrent_edge_qwen36_bf16(
     cudaStream_t stream)
 {
   constexpr int kHD = 128;
-  if (head_k_dim != kHD || head_v_dim != kHD) return;
+  if (head_k_dim != kHD || head_v_dim != kHD) return 2;
+  if (!q || !k || !v || !g || !beta || !state || !out) return 1;
+  if (B <= 0 || num_v_heads <= 0) return 3;
   dim3 grid(num_v_heads, B);
   dim3 block(kHD);
   gated_deltanet_recurrent_edge_kernel<kHD><<<grid, block, 0, stream>>>(
@@ -272,6 +274,7 @@ void gated_deltanet_recurrent_edge_qwen36_bf16(
       reinterpret_cast<__nv_bfloat16*>(state),
       reinterpret_cast<__nv_bfloat16*>(out),
       num_v_heads, use_qk_l2norm);
+  return 0;
 }
 
 namespace {

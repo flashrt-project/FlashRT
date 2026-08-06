@@ -15,11 +15,11 @@ decode are not part of this interface.
 | | |
 |---|---|
 | Checkpoint | `Qwen/Qwen3.6-35B-A3B` BF16 safetensors |
-| Hardware | RTX 5090 / SM120 |
-| GPU memory | 32 GB |
+| Hardware | RTX 5090 / SM120, Jetson AGX Thor / SM110 |
+| GPU memory | 32 GB (SM120); unified memory on Thor |
 | Framework | PyTorch |
 | Runtime quantization | NVFP4 |
-| Build flags | `-DGPU_ARCH=120 -DFLASHRT_ENABLE_QWEN35MOE=ON` |
+| Build flags | `-DGPU_ARCH=120 -DFLASHRT_ENABLE_QWEN35MOE=ON` (SM120), `-DGPU_ARCH=110 ...` (Thor) |
 
 Configure and build the gated `qwen3_5_moe` kernels:
 
@@ -69,6 +69,20 @@ for this model.
 
 Selecting tiers by reading the source's own grouping is therefore not enough to
 know what a target needs; the call sites are what decide.
+
+Two further kernels are **optional** and are not part of that required set,
+because the frontend resolves each through `getattr` and falls back to the
+kernel it replaces when a build does not carry it:
+
+| symbol | gate | replaces | why |
+|---|---|---|---|
+| `gated_deltanet_recurrent_edge_qwen36_bf16` | `FLASHRT_HAVE_QWEN36_KERNELS` | `gated_deltanet_recurrent_qwen36_bf16` | same arithmetic without the local-memory round trip for the state column |
+| `moe_router_topk_warp_sm120_bf16` | `FLASHRT_HAVE_QWEN35MOE_CORE` | `moe_router_topk_sm120_bf16` | same selection in one warp instead of `k` rounds of block-wide barriers |
+
+Both produce output identical to the kernel they stand in for, so the fallback
+is a performance difference and never a numerical one. The edge recurrence is
+shape-specialized to a head dim of 128 and raises for anything else rather than
+leaving the output buffer undefined.
 
 ### Attention differs by target, by design
 
@@ -208,16 +222,37 @@ official BF16 checkpoint:
 
 | Measurement | Result |
 |---|---:|
-| Runtime weight load | 47.96 s |
 | Resident allocated memory after load | 21.44 GiB |
 | Peak allocated memory during load | 22.94 GiB |
-| First 21-token prefill, including warmup | 230.95 ms |
-| Subsequent 20–45-token prefill | 28.99–35.12 ms |
-| 64-token prompt, 32-token eager decode | 48.14 tok/s |
-| 64-token prompt, 32-token warm CUDA Graph decode | 195.49 tok/s |
+| Subsequent 64-token prefill | 34.58–35.73 ms |
+| 64-token prompt, 32-token eager decode | 107.84 tok/s |
+| 64-token prompt, 32-token warm CUDA Graph decode | 238.55 tok/s |
+
+Against the original first-light run on the same card and checkpoint, warm
+CUDA-graph decode moved 195.49 -> 238.55 tok/s and the eager path 48.14 ->
+107.84. Resident and peak allocation are unchanged to the megabyte. Two rows of
+that first-light table are dropped rather than compared: weight load time is
+dominated by page-cache state, and its "first prefill including warmup" was
+measured by a different harness with a different notion of warmup.
 
 The eager, first-capture, and warm-graph runs produced the same 32 token IDs.
 These numbers are a first-light correctness run, not a context-length sweep.
+
+Reproduce with:
+
+```bash
+PYTHONPATH=. python benchmarks/qwen36_moe_edge_decode.py \
+    --checkpoint /path/to/Qwen3.6-35B-A3B \
+    --prompt-tokens 64 --max-new-tokens 32
+```
+
+The benchmark refuses to report throughput if the eager and captured paths
+disagree on any token, because a rate for a path that emits different text is
+not a rate for the same work.
+
+The table above predates the decode work described under *Speculative decode*
+below; the correctness gate (`tests/test_qwen36_moe_gpu.py`) passes on the
+current tree, but the SM120 latency figures have not been re-measured since.
 
 Four chat prompts from 12 to 45 tokens were also compared with the official
 Transformers BF16 implementation:
@@ -232,12 +267,43 @@ Transformers BF16 implementation:
 The logit cosine is lower than the Nex-N2-mini measurement, but the tested
 greedy sequences were token-exact for 16 generated tokens on all four prompts.
 
+## Speculative decode
+
+The MTP head ships with the checkpoint and is loaded on request. It is a
+DeepSeek-V3-style single module: it reads the pre-final-norm hidden state of the
+previous position and the token emitted at this one, and predicts the next.
+Drafts are chained, so acceptance decays with each additional draft.
+
+The window is verified through the decode kernels at `K+1` rows, over the
+weights the decode step caches, so a verified row is the decode step it stands
+in for -- bit for bit, not approximately. That is what allows the emitted text
+to be plain greedy's, and it is checked directly: logits rows, per-token
+recurrent and conv snapshots, and the KV rows written are all compared with
+`torch.equal` against a decode step run over the same tokens.
+
+Measured on Jetson AGX Thor, 20-token prompt, 128 generated tokens, one process
+per point, best of five:
+
+| | tok/s | vs plain |
+|---|---:|---:|
+| plain greedy | 100.35 | |
+| speculative, K=1 | 105.22 | 1.09x |
+| speculative, K=2 | **106.74** | 1.06x |
+
+`K=2` is the operating point. Above it the window costs more than the extra
+accepted tokens return: each additional verified row re-reads the routed
+experts, which do not amortise across a window the way the dense weights do,
+and each additional draft pays a full-vocabulary projection.
+
+Enable it with `_load_mtp = True` on the frontend subclass; the window width is
+the `k` argument to `generate_spec`. `FLASHRT_QWEN35MOE_VERIFY_K_ROWS=0` falls
+back to verifying through the prefill forward.
+
 ## Limitations
 
 - Text only; the vision tower is not loaded.
 - The kernelized runtime NVFP4 path is required.
-- Greedy decode only.
-- The MTP tensors are validated but not loaded, so speculative decode is not
-  enabled.
+- Greedy decode only. Speculative decode is greedy as well: it emits the
+  sequence plain greedy decoding would emit, token for token, or it is a bug.
 - Only the BF16 source checkpoint with runtime NVFP4 conversion is supported.
-- SM120 only.
+- Sampling, batching, and beam search are not implemented.
