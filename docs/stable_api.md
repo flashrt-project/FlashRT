@@ -259,6 +259,8 @@ based on `use_fp8` / `use_fp16`; `rtx_sm89` resolves directly to the
 dedicated SM89 frontend class.
 Wan2.2 TI2V-5B is registered for `(config="wan22_ti2v_5b",
 framework="torch", arch="rtx_sm120")`.
+Hy-Embodied-0.5-VLA is registered for `(config="hyvla",
+framework="torch", arch in {"thor", "rtx_sm87"})`.
 
 ### `_PIPELINE_MAP`
 
