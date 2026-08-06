@@ -1,14 +1,20 @@
 # Qwen3.6-35B-A3B text inference
 
 FlashRT runs the language backbone from the official
-`Qwen/Qwen3.6-35B-A3B` BF16 checkpoint on an RTX 5090. The checkpoint uses the
-same `qwen3_5_moe` text architecture as Nex-N2-mini, so both models share the
-same weight loader, prefill, attention, MoE, recurrent-state, and CUDA Graph
-decode implementation.
+`Qwen/Qwen3.6-35B-A3B` BF16 checkpoint on an RTX 5090 (SM120) and on Jetson AGX
+Thor (SM110). The checkpoint uses the same `qwen3_5_moe` text architecture as
+Nex-N2-mini, so both models share the same weight loader, prefill, attention,
+MoE, recurrent-state, and CUDA Graph decode implementation, and both
+architectures run the same frontend -- what differs is which kernel tiers the
+build has.
 
-This entry is text-only. It does not load the vision tower and it validates but
-does not execute the checkpoint's MTP head. Image/video input and speculative
-decode are not part of this interface.
+This entry is text-only: it does not load the vision tower, and image or video
+input is not part of this interface.
+
+It does execute the checkpoint's MTP draft head, but only when asked. Pass
+`load_mtp=True` to the constructor and call `generate_spec()`; see *Speculative
+decode* below. `generate()` never reads the head, and without `load_mtp=True`
+the loader does not read it either.
 
 ## Requirements
 
@@ -19,9 +25,13 @@ decode are not part of this interface.
 | GPU memory | 32 GB (SM120); unified memory on Thor |
 | Framework | PyTorch |
 | Runtime quantization | NVFP4 |
-| Build flags | `-DGPU_ARCH=120 -DFLASHRT_ENABLE_QWEN35MOE=ON` (SM120), `-DGPU_ARCH=110 ...` (Thor) |
 
-Configure and build the gated `qwen3_5_moe` kernels:
+Configure and build the gated `qwen3_5_moe` kernels. **The two targets take
+different flags** -- `FLASHRT_ENABLE_QWEN35MOE` turns on the block-scaled 4-bit
+MMA tier as well, which sm_110 refuses at configure time, so Thor names the two
+tiers it can compile:
+
+RTX 5090 (SM120):
 
 ```bash
 cmake -S . -B build \
@@ -30,6 +40,23 @@ cmake -S . -B build \
 cmake --build build -j
 pip install -e ".[torch]"
 ```
+
+Jetson AGX Thor (SM110):
+
+```bash
+cmake -S . -B build \
+  -DGPU_ARCH=110 \
+  -DFLASHRT_ENABLE_QWEN35MOE_CORE=ON \
+  -DFLASHRT_ENABLE_QWEN35MOE_W4A16=ON \
+  -DFLASHRT_ENABLE_THOR_FA2=ON
+cmake --build build -j 2
+pip install -e ".[torch]"
+```
+
+`FLASHRT_ENABLE_THOR_FA2` is what builds the vendored FA2 kernels on sm_110;
+see *Attention differs by target* below for what it buys and why it is opt-in.
+Without it the model still runs, and produces the same tokens, but a long
+prefill is far slower.
 
 ### Kernel tiers
 
@@ -42,8 +69,9 @@ below. Targets that cannot run a tier can select the remainder explicitly.
 | `FLASHRT_ENABLE_QWEN35MOE_W4A16` | weight-only 4-bit matvec, grouped matvec, GEMM | SM80 and newer; hardware operand conversion from SM89 |
 | `FLASHRT_ENABLE_QWEN35MOE_W4A4` | block-scaled 4-bit MMA: grouped GEMV, M16/M64/block-tile MMA | sm_120a / sm_121a |
 
-The upper tiers depend on the core tier, so enabling either turns it on. The
-SM120 text runtime documented here needs all three.
+The upper tiers depend on the core tier, so enabling either turns it on. SM120
+runs all three; sm_110 runs the first two, and the block-scaled tier refuses to
+configure there rather than building kernels that fail at run time.
 
 **These three tiers are not the whole dependency set.** Walking every `fvk`
 call the pipeline makes and resolving each to the preprocessor guard active
@@ -78,25 +106,47 @@ kernel it replaces when a build does not carry it:
 |---|---|---|---|
 | `gated_deltanet_recurrent_edge_qwen36_bf16` | `FLASHRT_HAVE_QWEN36_KERNELS` | `gated_deltanet_recurrent_qwen36_bf16` | same arithmetic without the local-memory round trip for the state column |
 | `moe_router_topk_warp_sm120_bf16` | `FLASHRT_HAVE_QWEN35MOE_CORE` | `moe_router_topk_sm120_bf16` | same selection in one warp instead of `k` rounds of block-wide barriers |
+| `moe_shared_gate_combine_edge_bf16` | `FLASHRT_HAVE_QWEN35MOE_CORE` | a five-launch tensor chain | one kernel, same arithmetic in the same order, rounded once at the store |
+| `moe_grouped_gemm_nvfp4_sm100_bf16out` | `FLASHRT_HAVE_QWEN35MOE_GROUPED_SM100` (sm_110 + `_W4A16`) | the per-expert GEMM loop, or the grouped GEMV | every routed expert of a layer in one launch, with the per-group shapes read from device memory |
 
-Both produce output identical to the kernel they stand in for, so the fallback
-is a performance difference and never a numerical one. The edge recurrence is
+All produce output identical to the path they stand in for, so the fallback is
+a performance difference and never a numerical one. The edge recurrence is
 shape-specialized to a head dim of 128 and raises for anything else rather than
 leaving the output buffer undefined.
 
-### Attention differs by target, by design
+Which of each pair actually runs is a `KernelPolicy` field, not the answer to
+"is the symbol there" — see *Runtime controls*.
 
-The ten full-attention layers do not use the same kernel everywhere, and the
-arch lists reflect that rather than overlooking it:
+### Attention differs by target
 
-| target | attention | why |
+The ten full-attention layers do not use the same kernel everywhere:
+
+| target | attention | how it is built |
 |---|---|---|
-| SM120 / SM89 / SM87 | vendored FA2 | the SM80-family source, which `__CUDA_ARCH__ >= 800` admits |
+| SM120 / SM89 / SM87 | vendored FA2 | automatic: the SM80-family source, which `__CUDA_ARCH__ >= 800` admits |
+| Thor SM110 | vendored FA2, or the decomposed reference | opt-in: `-DFLASHRT_ENABLE_THOR_FA2=ON` |
 | Thor SM110 | FA4 | its SM100-class CuTe-DSL kernel needs Blackwell tensor memory; ships as the `thor-fa4` pip extra, not compiled into `flash_rt_kernels` |
 
-So FA2 is deliberately absent from the Thor build, and FA4 cannot serve
-Ampere-class SM87. Treat a missing FA2 as a signal to fall back, not as a
-build error.
+FA2 was originally excluded from sm_110 on the grounds that Thor has its own
+attention path and FA2 would add about 10 MB of `.so` for nothing. That holds
+for the models that use the decomposed path, and it does not hold for a long
+prefill of this one: the decomposed path materialises an `(S * heads, S_kv)`
+score buffer -- 3.4 GB per layer at ten thousand tokens -- and this model needs
+one instantiation (bf16, head_dim 256), not the twelve the size estimate
+assumed. Enabling it takes the chunking penalty of a chunked prefill from 64%
+to 4%.
+
+It stays opt-in because every other Thor model still uses its own attention
+path and would only be paying the compile time and the binary size. A build
+without it runs this model correctly and emits the same tokens; only a long
+prefill is slower. Treat a missing FA2 as a signal to fall back, not as a build
+error.
+
+At the *decode* shape the two are the same answer to bf16 precision -- measured
+against an fp32 reference, 2.0e-3 relative for both at kv=64, 2.2e-3 against
+2.1e-3 at kv=2048 -- so decode on sm_110 keeps the reference path the golden
+fixture was recorded through, and takes FA2 only for prefill.
+`FLASHRT_NEXN2_DECODE_FA2=1` overrides that.
 
 The attention backend probes its kernel at construction: it runs one case
 through the same launch the hot path uses and compares against
@@ -118,11 +168,9 @@ fail at run time. The explicit gate turns that into a configure-time error.
 ## Usage
 
 ```python
-from flash_rt.frontends.torch.qwen36_moe_rtx import (
-    Qwen36MoeTextFrontendRtx,
-)
+from flash_rt.frontends.torch.qwen36_moe import Qwen36MoeTextFrontend
 
-frontend = Qwen36MoeTextFrontendRtx(
+frontend = Qwen36MoeTextFrontend(
     "/models/Qwen3.6-35B-A3B",
     device="cuda:0",
     max_seq=4096,
@@ -173,7 +221,7 @@ validation can be run without loading model weights:
 
 ```bash
 PYTHONPATH=. python - <<'PY'
-from flash_rt.frontends.torch.qwen36_moe_rtx import (
+from flash_rt.frontends.torch.qwen36_moe import (
     validate_qwen36_moe_checkpoint,
 )
 print(validate_qwen36_moe_checkpoint("/models/Qwen3.6-35B-A3B"))
@@ -188,9 +236,23 @@ The shared architecture uses:
   `8192`; `0` disables chunking.
 - `FLASHRT_QWEN35MOE_GRAPH_CACHE_MAX` — decode CUDA Graph LRU capacity,
   default `256`.
+- `FLASHRT_QWEN35MOE_SPEC_GRAPH_CACHE_MAX` — speculative-window CUDA Graph LRU
+  capacity, default `16`. Bounded separately and far lower than the decode
+  cache: a speculative graph covers `k+1` positions through the whole stack, so
+  its memory pool is several times a decode step's. The constructor argument
+  `spec_graph_cache_max` sets it per frontend.
 
 The older `FLASHRT_NEXN2_PREFILL_CHUNK` and
 `FLASHRT_NEXN2_GRAPH_CACHE_MAX` names remain compatible aliases.
+
+Which of several interchangeable kernels each step calls is a
+`KernelPolicy` (`flash_rt.frontends.torch._nexn2_rtx_forward`), not a symbol
+lookup: every field selects between implementations checked against each other
+with `torch.equal`, so a field decides speed and never output. The environment
+variables above and `NEXN2_WY_GDN`, `NEXN2_ROUTE_KERNEL`,
+`NEXN2_DENSE_CUBLASLT`, `FLASHRT_QWEN35MOE_W4A16_EDGE` and
+`FLASHRT_QWEN35MOE_VERIFY_K_ROWS` are its defaults. A policy must not be
+changed between a CUDA graph capture and its replay.
 
 ## Validation
 
@@ -313,23 +375,57 @@ to be plain greedy's, and it is checked directly: logits rows, per-token
 recurrent and conv snapshots, and the KV rows written are all compared with
 `torch.equal` against a decode step run over the same tokens.
 
-Measured on Jetson AGX Thor, 20-token prompt, 128 generated tokens, one process
-per point, best of five:
+Both the plain and the speculative rate below come from the same process, so
+the ratio is a paired comparison. The absolute figures move a few percent with
+what else the board is running; the ratio is the stable part.
+
+20-token prompt, 128 generated tokens:
 
 | | tok/s | vs plain |
 |---|---:|---:|
 | plain greedy | 100.35 | |
-| speculative, K=1 | 105.22 | 1.09x |
+| speculative, K=1 | 105.22 | 1.05x |
 | speculative, K=2 | **106.74** | 1.06x |
 
-`K=2` is the operating point. Above it the window costs more than the extra
-accepted tokens return: each additional verified row re-reads the routed
-experts, which do not amortise across a window the way the dense weights do,
-and each additional draft pays a full-vocabulary projection.
+The same comparison at longer context, 128 generated tokens per point:
 
-Enable it with `_load_mtp = True` on the frontend subclass; the window width is
-the `k` argument to `generate_spec`. `FLASHRT_QWEN35MOE_VERIFY_K_ROWS=0` falls
-back to verifying through the prefill forward.
+| context | plain | K=1 | K=2 | K=3 |
+|---:|---:|---:|---:|---:|
+| 512 | 90.4 | 95.4 (1.06x) | **99.4 (1.10x)** | 96.3 (1.06x) |
+| 2048 | 79.9 | 84.1 (1.05x) | **86.5 (1.08x)** | 73.8 (0.92x) |
+
+Every row emitted the same text as plain greedy decoding in the same process.
+
+`K=2` is the operating point at every context measured. Above it the window
+costs more than the extra accepted tokens return: each additional verified row
+re-reads the routed experts, which do not amortise across a window the way the
+dense weights do, and each additional draft pays a full-vocabulary projection.
+At 2048 tokens `K=3` is already a loss, and its acceptance falls too -- 3.46
+kept per window at 512, 3.00 at 2048.
+
+Acceptance rises with context (2.60 kept per window at a 20-token prompt, 2.72
+at 512, 2.74 at 2048) while the ratio does not, because the verify runs `K+1`
+separate single-query attention passes. That is the price of keeping the window
+bit-exact, and it is the largest remaining lever on this path.
+
+Enable it with `load_mtp=True` on the constructor; the window width is the `k`
+argument to `generate_spec`:
+
+```python
+frontend = Qwen36MoeTextFrontend(
+    "/models/Qwen3.6-35B-A3B",
+    device="cuda:0",
+    max_seq=2048,
+    load_mtp=True,
+    spec_graph_cache_max=16,
+)
+frontend.set_prompt("Explain why deterministic reductions matter.")
+token_ids = frontend.generate_spec(max_new_tokens=128, k=2)
+print(frontend.tokenizer.decode(token_ids))
+```
+
+`FLASHRT_QWEN35MOE_VERIFY_K_ROWS=0` falls back to verifying through the prefill
+forward, which is slower and produces the same tokens.
 
 ## Limitations
 
