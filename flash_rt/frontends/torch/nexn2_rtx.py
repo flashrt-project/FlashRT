@@ -34,13 +34,42 @@ _REQUIRED_FVK = (
 )
 
 
+# The tier combination each target can build. FLASHRT_ENABLE_QWEN35MOE turns on
+# all three tiers including the block-scaled 4-bit MMA one, which needs
+# sm_120a/sm_121a; recommending it on a target whose toolchain refuses it sends
+# the reader to a configure error. So the advice is keyed by the device in
+# front of them.
+_TIER_ADVICE = {
+    (11, 0): ("-DGPU_ARCH=110 -DFLASHRT_ENABLE_QWEN35MOE_CORE=ON "
+              "-DFLASHRT_ENABLE_QWEN35MOE_W4A16=ON"),
+    (12, 0): "-DGPU_ARCH=120 -DFLASHRT_ENABLE_QWEN35MOE=ON",
+    (12, 1): "-DGPU_ARCH=121 -DFLASHRT_ENABLE_QWEN35MOE=ON",
+}
+
+
+def _build_advice() -> str:
+    """The configure flags for the device this process is actually running."""
+    try:
+        import torch
+
+        cap = torch.cuda.get_device_capability()
+    except Exception:                                       # pragma: no cover
+        return ("-DFLASHRT_ENABLE_QWEN35MOE=ON on sm_120a/sm_121a, or "
+                "-DFLASHRT_ENABLE_QWEN35MOE_CORE=ON "
+                "-DFLASHRT_ENABLE_QWEN35MOE_W4A16=ON elsewhere")
+    return _TIER_ADVICE.get(
+        cap,
+        f"the tiers sm_{cap[0]}{cap[1]} can compile "
+        "(FLASHRT_ENABLE_QWEN35MOE_CORE / _W4A16; _W4A4 needs sm_120a)")
+
+
 def _require_kernels(
         fvk, *, model_label: str = "Nex-N2",
         usage_doc: str = "docs/nexn2_usage.md",
         required=None, require_fa2: bool = True) -> None:
     """Raise a clear RuntimeError if the gated qwen3_5_moe kernels or the FA2
-    module are missing (build was not configured with
-    -DFLASHRT_ENABLE_QWEN35MOE=ON, or flash_rt_fa2 is absent).
+    module are missing (the build did not enable the qwen3_5_moe tiers, or
+    flash_rt_fa2 is absent).
 
     ``required`` lets a configuration that calls fewer kernels say so. A list
     demanding more than a path uses turns a working build into a refusal; one
@@ -50,15 +79,14 @@ def _require_kernels(
     missing = [s for s in (required or _REQUIRED_FVK) if not hasattr(fvk, s)]
     if missing:
         raise RuntimeError(
-            f"{model_label} kernelized path needs the qwen3_5_moe SM120 "
-            "kernels, which "
-            "are absent from flash_rt_kernels (missing: "
-            f"{', '.join(missing)}). Rebuild on an SM120 toolchain with "
-            f"-DFLASHRT_ENABLE_QWEN35MOE=ON. See {usage_doc}.")
+            f"{model_label} kernelized path needs the gated qwen3_5_moe "
+            "kernels, which are absent from flash_rt_kernels (missing: "
+            f"{', '.join(missing)}). Reconfigure with {_build_advice()}. "
+            f"See {usage_doc}.")
     if not require_fa2:
         # The attention backend probes its kernel and falls back to a
-        # reference implementation, so a target that builds no FA2 -- Thor
-        # uses FA4 instead -- still runs.
+        # reference implementation, so a target that builds no FA2 still runs
+        # -- more slowly on a long prompt, and never differently.
         return
     try:
         from flash_rt import flash_rt_fa2 as _fa2
@@ -66,7 +94,8 @@ def _require_kernels(
         raise RuntimeError(
             f"{model_label} full attention needs the vendored FA2 module "
             "(flash_rt_fa2), which failed to import. Build with FA2 enabled "
-            "(ENABLE_FA2, auto-on for SM120).") from e
+            "(automatic on sm_80/86/87/89/120/121; on Thor sm_110 it is "
+            "opt-in with -DFLASHRT_ENABLE_THOR_FA2=ON).") from e
     fa2_missing = [s for s in ('fwd_bf16', 'fwd_bf16_causal')
                    if not hasattr(_fa2, s)]
     if fa2_missing:                                         # pragma: no cover

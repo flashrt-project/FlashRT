@@ -91,9 +91,22 @@ message(STATUS "Using gencode flag: ${GPU_GENCODE}")
 # 3.4 GB per layer at ten thousand tokens, and the model that needs it here
 # is bf16 at head_dim 256 -- one instantiation, not the twelve the size
 # estimate assumed. FA2_HDIMS/FA2_DTYPES are narrowed for this target below.
+#
+# It stays opt-in all the same: every other Thor model still uses its own
+# attention path and would only be paying the compile time and the binary, so
+# the target that wants it asks for it. Default OFF keeps a Thor build's
+# sources and symbols exactly what they were.
+option(FLASHRT_ENABLE_THOR_FA2
+       "Build the vendored FA2 attention kernels on Jetson AGX Thor (sm_110)" OFF)
+if(FLASHRT_ENABLE_THOR_FA2 AND NOT GPU_ARCH STREQUAL "110")
+  message(FATAL_ERROR
+    "FLASHRT_ENABLE_THOR_FA2 is the Thor (sm_110) FA2 gate; current "
+    "GPU_ARCH=${GPU_ARCH} decides FA2 by architecture and needs no flag.")
+endif()
 if(GPU_ARCH STREQUAL "80"  OR GPU_ARCH STREQUAL "86" OR
    GPU_ARCH STREQUAL "87"  OR
-   GPU_ARCH STREQUAL "89"  OR GPU_ARCH STREQUAL "110" OR
+   GPU_ARCH STREQUAL "89"  OR
+   (GPU_ARCH STREQUAL "110" AND FLASHRT_ENABLE_THOR_FA2) OR
    GPU_ARCH STREQUAL "120" OR
    GPU_ARCH STREQUAL "121")
   set(ENABLE_FA2 ON)
@@ -150,7 +163,7 @@ set(FA2_DTYPES "fp16;bf16" CACHE STRING
 # the twelve-file matrix the RTX targets distribute. This is why enabling FA2
 # on this arch does not cost what the original exclusion assumed. Both remain
 # cache variables: an explicit -DFA2_HDIMS on the command line still wins.
-if(GPU_ARCH STREQUAL "110")
+if(GPU_ARCH STREQUAL "110" AND ENABLE_FA2)
   if(NOT DEFINED CACHE{FA2_HDIMS} OR FA2_HDIMS STREQUAL "64;96;128;256")
     set(FA2_HDIMS "256" CACHE STRING "" FORCE)
   endif()
@@ -678,8 +691,7 @@ endif()
 # -gencode arch=compute_110a,code=sm_110a via GPU_GENCODE.
 if(GPU_ARCH STREQUAL "110")
   add_library(cutlass_nvfp4_w4a16_sm100_obj OBJECT
-    csrc/gemm/fp4/cutlass_nvfp4_w4a16_gemm_sm100.cu
-    csrc/gemm/fp4/cutlass_nvfp4_moe_grouped_sm100.cu)
+    csrc/gemm/fp4/cutlass_nvfp4_w4a16_gemm_sm100.cu)
   set_target_properties(cutlass_nvfp4_w4a16_sm100_obj PROPERTIES
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
@@ -698,6 +710,37 @@ if(GPU_ARCH STREQUAL "110")
     >
   )
   message(STATUS "SM100 CUTLASS NVFP4 W4A16 GEMM (Thor): ENABLED")
+endif()
+
+# ── Grouped NVFP4 MoE GEMM (qwen3_5_moe weight-only tier, Thor SM110) ──
+# One launch per layer over every routed expert, with the per-group shapes read
+# from device memory. Only the qwen3_5_moe MoE prefill calls it, so it is its
+# own object gated on that model's tier rather than a second source in the
+# W4A16 object above: a Thor build that does not ask for this model must not
+# pay its CUTLASS grouped-kernel compile time or carry its symbols. The
+# matching bindings are guarded on FLASHRT_HAVE_QWEN35MOE_GROUPED_SM100.
+if(GPU_ARCH STREQUAL "110" AND FLASHRT_ENABLE_QWEN35MOE_W4A16)
+  add_library(qwen35moe_nvfp4_grouped_sm100_obj OBJECT
+    csrc/gemm/fp4/cutlass_nvfp4_moe_grouped_sm100.cu)
+  set_target_properties(qwen35moe_nvfp4_grouped_sm100_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(qwen35moe_nvfp4_grouped_sm100_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/fp4
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(qwen35moe_nvfp4_grouped_sm100_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+  set(ENABLE_QWEN35MOE_GROUPED_SM100 ON)
+  message(STATUS "qwen3_5_moe grouped NVFP4 MoE GEMM (Thor): ENABLED")
 endif()
 
 # ── Dedicated M=1 decode GEMV (FP8 + BF16) ──
@@ -1626,7 +1669,8 @@ if(FLASHRT_ENABLE_QWEN35MOE_W4A16)
     csrc/kernels/moe_grouped_w4a16_sm120.cu
     csrc/kernels/w4a16_edge_sm120.cu
     csrc/kernels/w4a16_mrows_edge_sm120.cu
-    csrc/kernels/w4a16_gemm_sm120.cu)
+    csrc/kernels/w4a16_gemm_sm120.cu
+    csrc/kernels/qwen35moe_grouped_quant.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE
     FLASHRT_HAVE_QWEN35MOE_W4A16=1)
   # Packed-weight loads in flight per row in the W4A16 GEMVs. The kernels
@@ -1758,6 +1802,15 @@ if(GPU_ARCH STREQUAL "110")
     csrc/quantize/nvfp4_sf_reshape_sm120.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE
     ENABLE_CUTLASS_SM100_NVFP4_W4A16=1)
+endif()
+
+# The grouped MoE GEMM built above, linked and declared only when the model
+# tier that calls it is on.
+if(ENABLE_QWEN35MOE_GROUPED_SM100)
+  target_sources(flash_rt_kernels PRIVATE
+    $<TARGET_OBJECTS:qwen35moe_nvfp4_grouped_sm100_obj>)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    FLASHRT_HAVE_QWEN35MOE_GROUPED_SM100=1)
 endif()
 
 if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
