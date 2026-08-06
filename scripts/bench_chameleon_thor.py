@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Real-image latency benchmark for standalone Chameleon-7B on Thor.
 
 Measures HF BF16, FlashRT FP16, and FlashRT dynamic FP8 prefill

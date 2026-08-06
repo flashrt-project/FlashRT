@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Nsight Systems profiling helper for standalone Chameleon Thor.
 
 Use with CUDA profiler capture range, for example:

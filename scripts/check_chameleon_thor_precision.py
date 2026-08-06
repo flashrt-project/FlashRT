@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Real-image precision gate for standalone Chameleon-7B on Thor.
 
 Compares:
