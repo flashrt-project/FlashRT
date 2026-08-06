@@ -1,7 +1,10 @@
 """FlashRT -- Nex-N2-mini (qwen3_5_moe) kernelized NVFP4 forward.
 
-Production prefill forward (S>1) that drives the fvk SM120 kernels off the
+Production prefill forward (S>1) that drives the gated fvk kernels off the
 pre-quantized :class:`WeightHandles` produced by ``extract_weights_nexn2_nvfp4``.
+The ``sm120`` in several kernel names is where each was written, not where it
+runs: this path also serves Qwen3.6 on Jetson AGX Thor, and which of several
+interchangeable kernels each step calls is a :class:`KernelPolicy` below.
 Every heavy op runs on a FlashRT kernel -- no ``torch`` matmul, no
 ``F.scaled_dot_product_attention``, no host-side sync in the hot path -- so the
 prefill is fully on-device and bit-reproducible (it seeds the decode state).
