@@ -189,12 +189,18 @@ def test_speculative_decode_emits_what_greedy_emits(spec_frontend, k):
 @requires_gpu_checkpoint
 @pytest.mark.parametrize("k", [1, 2])
 def test_a_window_computes_what_the_decode_steps_compute(spec_frontend, k):
-    """Logits, recurrent state, conv state and written KV, bit for bit.
+    """Emitted argmax, recurrent state, conv state and written KV, bit for bit.
 
     Token equality is the outcome; this is the mechanism. A window that agreed
     on tokens while drifting in state would pass the test above and diverge
     later, so the state is compared directly -- with torch.equal, because a
     verified row is meant to *be* the decode row, not to approximate it.
+
+    Note the replay. Capturing the graph snapshots everything the block
+    mutates and restores it afterwards, so the state right after
+    ``_ensure_spec_graph`` is the state *before* the window; only the replay
+    advances it. Reading it any earlier compares a prefill to k+1 decode steps
+    and fails for a reason that has nothing to do with the window.
     """
     import torch
 
@@ -212,35 +218,42 @@ def test_a_window_computes_what_the_decode_steps_compute(spec_frontend, k):
     window = k + 1
     decode._ensure_spec_buffers(state, window, device)
     state._spec_tokens[0].copy_(token[0])
-    _, hidden = decode._ensure_spec_graph(state, pos, k, fvk, device)
+    graph, _ = decode._ensure_spec_graph(state, pos, k, fvk, device)
+    graph.replay()
+    torch.cuda.synchronize()
 
-    # What the window says, per position, and the state it leaves behind.
-    window_logits = hidden.clone()
+    # What the window emitted, and the state it advanced to.
+    drafted = state._spec_tokens[:window].tolist()
+    window_argmax = state._spec_argmax[:window].tolist()
     window_lin = [t.clone() for t in state.lin_state]
     window_conv = [t.clone() for t in state.lin_conv_state]
-    window_kv_k = state.attn.K_cache[:, pos:pos + window].clone()
-    window_kv_v = state.attn.V_cache[:, pos:pos + window].clone()
-    drafted = state._spec_tokens[:window].tolist()
+    # The model's own full-attention ranks only. The draft head owns one more
+    # (state.mtp_rank), which the window writes and a plain decode step has no
+    # counterpart for -- there is nothing to compare it against here. That the
+    # head's own KV is right is what the K=1/K=2 token-equality test above
+    # exercises: a draft computed off a wrong slot is not accepted.
+    full = state.n_full
+    window_kv_k = state.attn.K_cache[:full, pos:pos + window].clone()
+    window_kv_v = state.attn.V_cache[:full, pos:pos + window].clone()
 
     # The same tokens through the plain decode step, from the same prefill.
     decode.seed_prefill(state, ids, fvk, device)
-    step_logits = []
+    step_argmax = []
     for i, tok in enumerate(drafted):
         t = torch.tensor([tok], dtype=torch.long, device=device)
-        step_logits.append(
-            decode.decode_step(state, t.view(1, 1), pos + i, fvk, device)
-            .clone())
+        out = decode.decode_step(state, t.view(1, 1), pos + i, fvk, device)
+        step_argmax.append(int(out.reshape(-1).argmax()))
 
-    assert torch.equal(state.lin_state[0], window_lin[0])
-    for a, b in zip(state.lin_state, window_lin):
-        assert torch.equal(a, b), "recurrent state diverged"
-    for a, b in zip(state.lin_conv_state, window_conv):
-        assert torch.equal(a, b), "conv state diverged"
+    assert window_argmax == step_argmax, (
+        "the window and the decode steps disagree on what comes next")
+    for rank, (a, b) in enumerate(zip(state.lin_state, window_lin)):
+        assert torch.equal(a, b), f"recurrent state diverged at rank {rank}"
+    for rank, (a, b) in enumerate(zip(state.lin_conv_state, window_conv)):
+        assert torch.equal(a, b), f"conv state diverged at rank {rank}"
     assert torch.equal(
-        state.attn.K_cache[:, pos:pos + window], window_kv_k)
+        state.attn.K_cache[:full, pos:pos + window], window_kv_k), "K diverged"
     assert torch.equal(
-        state.attn.V_cache[:, pos:pos + window], window_kv_v)
-    assert len(step_logits) == window_logits.shape[0]
+        state.attn.V_cache[:full, pos:pos + window], window_kv_v), "V diverged"
 
 
 @requires_gpu_checkpoint
