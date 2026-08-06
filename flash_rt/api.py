@@ -454,6 +454,24 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "See docs/qwen3_vl_fp8_sm89.md, docs/qwen3_vl_nvfp4.md, "
             "docs/qwen3_vl_thor.md and docs/qwen3_vl_rtx_bf16.md.")
 
+    # Chameleon-7B is a chat-style VLM, not a VLA: its frontends expose
+    # set_prompt(...) + generate() rather than predict(images, ...), so
+    # VLAModel's result['actions'] contract does not apply. Registered in
+    # _PIPELINE_MAP for discoverability only.
+    if config == "chameleon":
+        raise NotImplementedError(
+            "config='chameleon' is a chat-style VLM and is not served through "
+            "load_model's VLA wrapper. Construct it directly:\n"
+            "    from flash_rt.frontends.torch.chameleon_rtx_sm87 import "
+            "ChameleonTorchFrontendRtxSm87  # Jetson Orin SM87\n"
+            "    from flash_rt.frontends.torch.chameleon_thor import "
+            "ChameleonTorchFrontendThor  # Jetson Thor SM110\n"
+            "    f = ChameleonTorchFrontendRtxSm87('/path/to/Chameleon_7B_mGPT')\n"
+            "    f.set_prompt('<image>Describe this image.', images=[img])\n"
+            "    print(f.generate(max_new_tokens=32))\n"
+            "See docs/chameleon7b_rtx_sm87.md, docs/chameleon_thor_sm110.md "
+            "and docs/chameleon_usage.md.")
+
     if framework == "jetson_pi":
         if config not in ("pi0", "pi05", "llm", "mllm"):
             raise ValueError(

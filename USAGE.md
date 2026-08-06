@@ -681,6 +681,39 @@ once and reused, so per-chunk cost is just the infer row.
 This path does not change CMake targets, C++ bindings, or existing
 Pi0/Pi0.5/GROOT N1.6 runtime dispatch.
 
+### Chameleon-7B (Thor)
+
+Standalone Chameleon-7B (text + image) is a direct-instantiation Thor
+frontend — it is registered in `_PIPELINE_MAP` but is **not** dispatched by
+`flash_rt.load_model` (same pattern as Qwen3-VL). The VQGAN image
+tokenizer defaults to the generic eager Chameleon path; if compatible
+TensorRT engines exist in the deployment, it is recommended to opt in
+explicitly (`use_trt_vqgan=True`). A Jetson Orin (SM87) INT8/QuaRot
+frontend is also available; see [`docs/chameleon_usage.md`](docs/chameleon_usage.md),
+[`docs/chameleon_thor_sm110.md`](docs/chameleon_thor_sm110.md) and
+[`docs/chameleon7b_rtx_sm87.md`](docs/chameleon7b_rtx_sm87.md).
+
+```python
+from flash_rt.frontends.torch.chameleon_thor import ChameleonTorchFrontendThor
+
+fe = ChameleonTorchFrontendThor(
+    "/path/to/Chameleon_7B_mGPT",
+    use_fp8=True,            # dynamic per-tensor FP8 (recommended default)
+    use_cuda_graph=True,
+    use_trt_vqgan=False,     # generic default = eager VQGAN; set True when engines exist
+    target_size=512,
+)
+
+out = fe.prefill("Describe the image.", [pil_image])
+# out["logits"]: (65536,) fp32 with mask_image_logits applied
+```
+
+FA4 attention is an explicit opt-in fast path
+(`use_fa4_attn=True` / `FLASHRT_CHAMELEON_FA4_ATTN=1`, needs the
+`thor-fa4` pip extra); measured transformer-prefill-only ≈ **104 ms** at
+Se≈1056 vs ≈111 ms with CUTLASS FMHA. E2E (TRT VQGAN + FA4) ≈ **120 ms**
+vs HF BF16 ≈ 403 ms transformer-only (~3.4×).
+
 ### Wan2.2 TI2V-5B
 
 Wan2.2 TI2V-5B is exposed as an RTX SM120 official-pipeline baseline:

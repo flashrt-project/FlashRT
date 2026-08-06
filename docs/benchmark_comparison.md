@@ -255,6 +255,27 @@ TRT-aligned FP4 loop comparison, using the same quantization scheme.
 | 25 | ~304 ms | **97.5 ms** | **~3.1x** |
 | 50 | ~608 ms | **155.8 ms** | **~3.9x** |
 
+## Chameleon-7B
+
+Baseline: HF `transformers` BF16 eager, transformer-only (input ids
+built by FlashRT, model forward timed). FlashRT rows are the same harness
+(real image `hand_1.jpg`, prompt "Describe the image.", target_size=512,
+Se≈1053-1072, wall-clock P50). VQGAN backend and FA4 state are recorded per
+row — generic default is eager VQGAN + CUTLASS FMHA; TRT VQGAN and FA4 are
+explicit opt-ins.
+
+| FlashRT FP8 | VQGAN | FA4 | Latency | Speedup vs HF |
+|---|---:|---:|---:|---:|
+| transformer-only | (n/a) | on | **104.2 ms** | **3.9×** |
+| transformer-only | (n/a) | off | 111.2 ms | 3.6× |
+| E2E | TRT opt-in | on | **120.2 ms** | **3.4×** |
+| E2E | eager | on | 177.3 ms | 2.3× |
+| E2E | eager | off | ~190 ms | ~2.1× |
+
+| Baseline (HF BF16) | Latency |
+|---|---:|
+| transformer-only | 402.9 ms |
+
 ## Qwen3-8B
 
 LLM rows list the baseline and FlashRT measurements without speedup.
