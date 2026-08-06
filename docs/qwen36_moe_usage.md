@@ -280,6 +280,25 @@ Transformers BF16 implementation:
 The logit cosine is lower than the Nex-N2-mini measurement, but the tested
 greedy sequences were token-exact for 16 generated tokens on all four prompts.
 
+## Jetson AGX Thor numbers
+
+Measured on Jetson AGX Thor (sm_110), unified memory, the same BF16 checkpoint
+with runtime NVFP4 conversion. Prefill is the wall time to first-token logits;
+decode is the warm CUDA-graph steady-state rate.
+
+| Prompt | Prefill | Decode |
+|---:|---:|---:|
+| 20 | 89.5 ms | 100.4 tok/s |
+| 2 K | 382.3 ms | 103.4 tok/s |
+| 32 K | 7.208 s | |
+
+Context reaches 128 K on this board at 2470 tok/s of prefill. The decode figure
+moves a few percent with what else the board is running; the prefill figures
+are one length per process.
+
+With the draft head loaded, speculative decode reaches 106.74 tok/s at K=2 --
+see below.
+
 ## Speculative decode
 
 The MTP head ships with the checkpoint and is loaded on request. It is a

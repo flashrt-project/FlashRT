@@ -165,6 +165,25 @@ DGX Spark / GB10:
 | NVFP4, 128 | **170.1 ms** | **40.42 tok/s** | [Qwen3.6 Spark](docs/qwen36_spark.md#performance) |
 | NVFP4, 16 K | **8.545 s** | **54.94 tok/s** | [Qwen3.6 Spark](docs/qwen36_spark.md#performance) |
 
+#### Qwen3.6-35B-A3B
+
+RTX 5090:
+
+| Mode | Prefill | Decode | Source |
+|---|---:|---:|---|
+| NVFP4, 64 | **40.42 ms** | **257.95 tok/s** | [Qwen3.6-MoE usage](docs/qwen36_moe_usage.md#validation) |
+
+Jetson AGX Thor:
+
+| Mode | Prefill | Decode | Source |
+|---|---:|---:|---|
+| NVFP4, 20 | **89.5 ms** | **100.4 tok/s** | [Qwen3.6-MoE Thor](docs/qwen36_moe_usage.md#jetson-agx-thor-numbers) |
+| NVFP4, 2 K | **382.3 ms** | **103.4 tok/s** | [Qwen3.6-MoE Thor](docs/qwen36_moe_usage.md#jetson-agx-thor-numbers) |
+
+Speculative decode with the MTP head reaches **106.74 tok/s** on Thor at K=2,
+emitting the same tokens as greedy decoding. See
+[speculative decode](docs/qwen36_moe_usage.md#speculative-decode).
+
 #### Qwen3-8B
 
 | Hardware | Mode | Prefill | Decode | Source |
