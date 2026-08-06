@@ -144,7 +144,66 @@ extern "C" int cutlass_int8_rowwise_bf16out(
 extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
     void const*, void const*, void const*, void const*, void*,
     int, int, int, cudaStream_t);
+extern "C" int cutlass_int8_rowwise_fp16out(
+    void const*, void const*, void const*, void const*, void*,
+    int, int, int, cudaStream_t);
+extern "C" int cutlass_int8_rowwise_fp16out_bias(
+    void const*, void const*, void const*, void const*, void const*, void*,
+    int, int, int, cudaStream_t);
+// INT4 W4A4 (QuaRot rotated) rowwise family — Orin SM87.
+extern "C" int cutlass_int4_rowwise_fp16out(
+    void const*, void const*, void const*, void const*, void*,
+    int, int, int, cudaStream_t);
+extern "C" int cutlass_int4_rowwise_fp16out_bias(
+    void const*, void const*, void const*, void const*, void const*, void*,
+    int, int, int, cudaStream_t);
+extern "C" int cutlass_int4_rowwise_bf16out(
+    void const*, void const*, void const*, void const*, void*,
+    int, int, int, cudaStream_t);
+extern "C" int cutlass_int4_silu_gated_bf16out(
+    void const*, void const*, void const*, void const*, void const*, void*,
+    int, int, int, cudaStream_t);
+extern "C" void residual_add_rms_norm_fht_int4_fp16(
+    __half*, const __half*, const __half*, uint8_t*, float*,
+    int, int, float, cudaStream_t);
+extern "C" void rms_norm_fht_int4_fp16(
+    const __half*, const __half*, uint8_t*, float*,
+    int, int, float, cudaStream_t);
+extern "C" void fht_int4_quant_fp16(
+    const __half*, uint8_t*, float*, int, int, cudaStream_t);
+extern "C" void residual_add_rms_norm_fht_int8_fp16(
+    __half*, const __half*, const __half*, int8_t*, float*,
+    int, int, float, cudaStream_t);
+extern "C" void rms_norm_fht_int8_fp16(
+    const __half*, const __half*, int8_t*, float*,
+    int, int, float, cudaStream_t);
+extern "C" void fht_int8_quant_fp16(
+    const __half*, int8_t*, float*, int, int, cudaStream_t);
+extern "C" void fht128_int4_quant_bf16(
+    const __nv_bfloat16*, uint8_t*, float*, int, int, cudaStream_t);
 #endif
+
+// Fused QK-LayerNorm + rotate_half RoPE kernel.
+// Implementation: csrc/kernels/qk_norm_rope_fused.cu
+extern "C" void flash_rt_qk_norm_rope_fused_fp16(
+    const __half* q,    const __half* k,
+    const __half* q_w,  const __half* q_b,
+    const __half* k_w,  const __half* k_b,
+    const __half* cos_t, const __half* sin_t,
+    __half* q_out, __half* k_out,
+    int seq_len, int num_heads, int dim, float eps,
+    cudaStream_t stream);
+
+// Fused per-K AWQ inv_s mul + per-tensor static FP8 quantize for FP16
+// inputs. Implementation: csrc/quantize/awq_quant_fp8_static_fp16.cu
+extern "C" void flash_rt_awq_quant_fp8_static_fp16(
+    const void*  in_fp16,
+    const void*  inv_s_fp16,
+    void*        out_fp8,
+    const float* act_scale,
+    long long M, int K,
+    cudaStream_t stream);
+
 #include "kernels/kernels.h"
 #include "kernels/fusion.cuh"
 #ifdef FLASHRT_HAVE_MELBAND_ROFORMER
@@ -636,6 +695,18 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         }, py::arg("A"), py::arg("B"), py::arg("D"),
            py::arg("M"), py::arg("N"), py::arg("K"),
            py::arg("d_scale_a"), py::arg("d_scale_b"), py::arg("stream") = 0)
+        // FP8 no-transpose with FP16 output (row-major, device scale ptrs)
+        .def("fp8_nn_dev_fp16", [](GemmRunner& self,
+                                    uintptr_t A, uintptr_t B, uintptr_t D,
+                                    int M, int N, int K,
+                                    uintptr_t d_scale_a, uintptr_t d_scale_b,
+                                    uintptr_t stream) {
+            self.fp8_nn_dev_fp16(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K,
+                                 reinterpret_cast<float*>(d_scale_a),
+                                 reinterpret_cast<float*>(d_scale_b), to_stream(stream));
+        }, py::arg("A"), py::arg("B"), py::arg("D"),
+           py::arg("M"), py::arg("N"), py::arg("K"),
+           py::arg("d_scale_a"), py::arg("d_scale_b"), py::arg("stream") = 0)
         // FP8 with device descale → FP16 (GemmRunner handle, matching pi05)
         .def("fp8_descale_fp16", [](GemmRunner& self,
                                      uintptr_t A, uintptr_t B, uintptr_t D,
@@ -711,6 +782,26 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         }, py::arg("A"), py::arg("B"), py::arg("D"),
            py::arg("M"), py::arg("N"), py::arg("K"),
            py::arg("d_scale_a"), py::arg("d_scale_b"), py::arg("num_algos") = 16)
+        .def("autotune_fp8_nn_dev_fp16", [](GemmRunner& self,
+                                             uintptr_t A, uintptr_t B, uintptr_t D,
+                                             int M, int N, int K,
+                                             uintptr_t d_scale_a, uintptr_t d_scale_b,
+                                             int num_algos) {
+            self.autotune_fp8_nn_dev_fp16(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K,
+                                           reinterpret_cast<float*>(d_scale_a),
+                                           reinterpret_cast<float*>(d_scale_b), num_algos);
+        }, py::arg("A"), py::arg("B"), py::arg("D"),
+           py::arg("M"), py::arg("N"), py::arg("K"),
+           py::arg("d_scale_a"), py::arg("d_scale_b"), py::arg("num_algos") = 16)
+        .def("autotune_fp8_nn_bias", [](GemmRunner& self,
+                                         uintptr_t A, uintptr_t B, uintptr_t D, uintptr_t bias,
+                                         int M, int N, int K, float alpha,
+                                         int num_algos) {
+            self.autotune_fp8_nn_bias(to_ptr(A), to_ptr(B), to_ptr(D), to_ptr(bias),
+                                       M, N, K, alpha, num_algos);
+        }, py::arg("A"), py::arg("B"), py::arg("D"), py::arg("bias"),
+           py::arg("M"), py::arg("N"), py::arg("K"),
+           py::arg("alpha") = 1.0f, py::arg("num_algos") = 16)
 #ifdef ENABLE_NVFP4
         .def("fp4_nn_dev", [](GemmRunner& self,
                                uintptr_t A_fp4, uintptr_t SFA,
@@ -830,6 +921,19 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                                typed_ptr<__nv_bfloat16>(weight),
                                typed_ptr<__nv_bfloat16>(out),
                                seq_len, dim, eps, to_stream(stream));
+    }, py::arg("residual"), py::arg("x"), py::arg("weight"), py::arg("out"),
+       py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+
+    // Fused: residual_add + rms_norm with FP16 output (no quantize).
+    m.def("residual_add_rms_norm_fp16", [](uintptr_t residual, uintptr_t x,
+                                            uintptr_t weight, uintptr_t out,
+                                            int seq_len, int dim, float eps,
+                                            uintptr_t stream) {
+        residual_add_rms_norm_fp16(reinterpret_cast<__half*>(residual),
+                                    reinterpret_cast<const __half*>(x),
+                                    reinterpret_cast<const __half*>(weight),
+                                    reinterpret_cast<__half*>(out),
+                                    seq_len, dim, eps, to_stream(stream));
     }, py::arg("residual"), py::arg("x"), py::arg("weight"), py::arg("out"),
        py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f, py::arg("stream") = 0);
 
@@ -1092,6 +1196,44 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                                   typed_ptr<__nv_fp8_e4m3>(output),
                                   reinterpret_cast<float*>(d_scale), n, to_stream(stream));
     }, py::arg("input"), py::arg("output"), py::arg("d_scale"), py::arg("n"), py::arg("stream") = 0);
+
+    // Fused RMSNorm + dynamic per-tensor FP8 quantize (FP16 backbone).
+    m.def("rms_norm_quantize_dynamic_fp8_fp16", [](uintptr_t x, uintptr_t weight,
+                                                     uintptr_t xn_out, uintptr_t fp8_out,
+                                                     uintptr_t d_scale, int seq_len, int dim,
+                                                     float eps, uintptr_t stream) {
+        rms_norm_quantize_dynamic_fp8_fp16(
+            reinterpret_cast<const __half*>(x), reinterpret_cast<const __half*>(weight),
+            reinterpret_cast<__half*>(xn_out), typed_ptr<__nv_fp8_e4m3>(fp8_out),
+            reinterpret_cast<float*>(d_scale), seq_len, dim, eps, to_stream(stream));
+    }, py::arg("x"), py::arg("weight"), py::arg("xn_out"), py::arg("fp8_out"),
+       py::arg("d_scale"), py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-5f,
+       py::arg("stream") = 0);
+
+    // Fused GEGLU (tanh-approx GELU(gate)*up) + dynamic per-tensor FP8 quantize.
+    m.def("gate_geglu_quantize_dynamic_fp8_fp16", [](uintptr_t gate, uintptr_t up,
+                                                      uintptr_t h_out, uintptr_t fp8_out,
+                                                      uintptr_t d_scale, int n, uintptr_t stream) {
+        gate_geglu_quantize_dynamic_fp8_fp16(
+            reinterpret_cast<const __half*>(gate), reinterpret_cast<const __half*>(up),
+            reinterpret_cast<__half*>(h_out), typed_ptr<__nv_fp8_e4m3>(fp8_out),
+            reinterpret_cast<float*>(d_scale), n, to_stream(stream));
+    }, py::arg("gate"), py::arg("up"), py::arg("h_out"), py::arg("fp8_out"),
+       py::arg("d_scale"), py::arg("n"), py::arg("stream") = 0);
+
+    // Fused residual add (in-place) + RMSNorm + dynamic per-tensor FP8 quantize.
+    m.def("residual_add_rms_norm_quantize_dynamic_fp8_fp16",
+          [](uintptr_t residual, uintptr_t x, uintptr_t weight,
+             uintptr_t xn_out, uintptr_t fp8_out, uintptr_t d_scale,
+             int seq_len, int dim, float eps, uintptr_t stream) {
+        residual_add_rms_norm_quantize_dynamic_fp8_fp16(
+            reinterpret_cast<__half*>(residual), reinterpret_cast<const __half*>(x),
+            reinterpret_cast<const __half*>(weight), reinterpret_cast<__half*>(xn_out),
+            typed_ptr<__nv_fp8_e4m3>(fp8_out), reinterpret_cast<float*>(d_scale),
+            seq_len, dim, eps, to_stream(stream));
+    }, py::arg("residual"), py::arg("x"), py::arg("weight"), py::arg("xn_out"),
+       py::arg("fp8_out"), py::arg("d_scale"), py::arg("seq_len"), py::arg("dim"),
+       py::arg("eps") = 1e-5f, py::arg("stream") = 0);
 
 // Bindings below cover the BF16->NVFP4 quantize / norm-fused-quantize
 // family. The kernels themselves live in csrc/kernels/quantize.cu and
@@ -1560,6 +1702,39 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         residual_add_fp16(reinterpret_cast<__half*>(residual), reinterpret_cast<const __half*>(x),
                            n, to_stream(stream));
     }, py::arg("residual"), py::arg("x"), py::arg("n"), py::arg("stream") = 0);
+
+    m.def("clamp_inplace_fp16", [](uintptr_t x, float limit, int n, uintptr_t stream) {
+        clamp_inplace_fp16(reinterpret_cast<__half*>(x), limit, n, to_stream(stream));
+    }, py::arg("x"), py::arg("limit"), py::arg("n"), py::arg("stream") = 0,
+       "In-place symmetric clamp: x = min(max(x, -limit), +limit). "
+       "CUDA-Graph safe. Keeps FP16 activations in range before a "
+       "down_proj GEMM (Chameleon-7B L31).");
+
+    // Fused QK-LayerNorm + rotate_half RoPE, FP16, in-place on q/k.
+    //   q, k       : [Se, NH*HD] FP16 (head-interleaved, in-place)
+    //   q_w/q_b    : [HD] FP16 (per-head LayerNorm params, shared across heads)
+    //   cos/sin    : [Se, HD] FP16 (rotate_half-tiled)
+    //   dim        : HD (must be ≤ 256 for the warp-only path)
+    m.def("qk_norm_rope_fused_fp16", [](uintptr_t q, uintptr_t k,
+                                         uintptr_t q_weight, uintptr_t q_bias,
+                                         uintptr_t k_weight, uintptr_t k_bias,
+                                         uintptr_t cos_table, uintptr_t sin_table,
+                                         int seq_len, int num_heads, int dim,
+                                         float eps, uintptr_t stream) {
+        flash_rt_qk_norm_rope_fused_fp16(
+            reinterpret_cast<const __half*>(q),       reinterpret_cast<const __half*>(k),
+            reinterpret_cast<const __half*>(q_weight), reinterpret_cast<const __half*>(q_bias),
+            reinterpret_cast<const __half*>(k_weight), reinterpret_cast<const __half*>(k_bias),
+            reinterpret_cast<const __half*>(cos_table),
+            reinterpret_cast<const __half*>(sin_table),
+            reinterpret_cast<__half*>(q), reinterpret_cast<__half*>(k),
+            seq_len, num_heads, dim, eps, to_stream(stream));
+    }, py::arg("q"), py::arg("k"),
+       py::arg("q_weight"), py::arg("q_bias"),
+       py::arg("k_weight"), py::arg("k_bias"),
+       py::arg("cos_table"), py::arg("sin_table"),
+       py::arg("seq_len"), py::arg("num_heads"), py::arg("dim"),
+       py::arg("eps") = 1e-5f, py::arg("stream") = 0);
 
     m.def("gate_mul_residual_fp16",
           [](uintptr_t residual, uintptr_t x, uintptr_t gate,
@@ -3346,6 +3521,23 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                 M, K, to_stream(stream));
         },
         py::arg("in_bf16"), py::arg("inv_s_bf16"),
+        py::arg("out_fp8"), py::arg("act_scale"),
+        py::arg("M"), py::arg("K"),
+        py::arg("stream") = 0);
+
+    // FP16 variant of awq_quant_fp8_static for FP16-backbone models
+    // (Chameleon-7B residual stream).
+    m.def("awq_quant_fp8_static_fp16",
+        [](uintptr_t in_fp16, uintptr_t inv_s_fp16, uintptr_t out_fp8,
+           uintptr_t act_scale, long long M, int K, uintptr_t stream) {
+            flash_rt_awq_quant_fp8_static_fp16(
+                to_ptr(in_fp16),
+                to_ptr(inv_s_fp16),
+                to_ptr(out_fp8),
+                reinterpret_cast<const float*>(act_scale),
+                M, K, to_stream(stream));
+        },
+        py::arg("in_fp16"), py::arg("inv_s_fp16"),
         py::arg("out_fp8"), py::arg("act_scale"),
         py::arg("M"), py::arg("K"),
         py::arg("stream") = 0);
@@ -7880,6 +8072,32 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
        py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f,
        py::arg("stream") = 0);
 
+    m.def("rms_norm_int8_rowwise_fp16", [](uintptr_t x, uintptr_t weight,
+                                            uintptr_t out, uintptr_t scales,
+                                            int seq_len, int dim, float eps,
+                                            uintptr_t stream) {
+        rms_norm_int8_rowwise_fp16(
+            typed_ptr<__half>(x), typed_ptr<__half>(weight),
+            typed_ptr<int8_t>(out), reinterpret_cast<float*>(scales),
+            seq_len, dim, eps, to_stream(stream));
+    }, py::arg("x"), py::arg("weight"), py::arg("out"), py::arg("scales"),
+       py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f,
+       py::arg("stream") = 0);
+
+    m.def("residual_add_rms_norm_int8_rowwise_fp16",
+          [](uintptr_t residual, uintptr_t x, uintptr_t weight,
+             uintptr_t out, uintptr_t scales,
+             int seq_len, int dim, float eps, uintptr_t stream) {
+        residual_add_rms_norm_int8_rowwise_fp16(
+            typed_ptr<__half>(residual), typed_ptr<__half>(x),
+            typed_ptr<__half>(weight),
+            typed_ptr<int8_t>(out), reinterpret_cast<float*>(scales),
+            seq_len, dim, eps, to_stream(stream));
+    }, py::arg("residual"), py::arg("x"), py::arg("weight"),
+       py::arg("out"), py::arg("scales"),
+       py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f,
+       py::arg("stream") = 0);
+
     m.def("bias_residual_layer_norm_bf16", [](uintptr_t residual, uintptr_t x,
                                                 uintptr_t bias_pre,
                                                 uintptr_t ln_weight, uintptr_t ln_bias,
@@ -7950,6 +8168,13 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
                               reinterpret_cast<float*>(d_scales), rows, cols, to_stream(stream));
     }, py::arg("input"), py::arg("output"), py::arg("d_scales"), py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
 
+    m.def("quantize_int8_rowwise_fp16", [](uintptr_t input, uintptr_t output,
+                                            uintptr_t d_scales, int rows, int cols,
+                                            uintptr_t stream) {
+        quantize_int8_rowwise_fp16(typed_ptr<__half>(input), typed_ptr<int8_t>(output),
+                                    reinterpret_cast<float*>(d_scales), rows, cols, to_stream(stream));
+    }, py::arg("input"), py::arg("output"), py::arg("d_scales"), py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
+
     m.def("quantize_int8_rowwise_static", [](uintptr_t input, uintptr_t output,
                                               uintptr_t d_scales, int rows, int cols,
                                               uintptr_t stream) {
@@ -8001,6 +8226,190 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
 #endif
           }, py::arg("A"), py::arg("B"), py::arg("act_scale"), py::arg("weight_scale"),
           py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+
+    m.def("cutlass_int8_rowwise_fp16out",
+          [](uintptr_t A, uintptr_t B, uintptr_t act_scale, uintptr_t weight_scale,
+             uintptr_t D, int M, int N, int K, uintptr_t stream) {
+#ifdef ENABLE_SM80_INT8_CUTLASS
+              return cutlass_int8_rowwise_fp16out(to_ptr(A), to_ptr(B), to_ptr(act_scale),
+                  to_ptr(weight_scale), to_ptr(D), M, N, K, to_stream(stream));
+#else
+              throw std::runtime_error("cutlass_int8_rowwise_fp16out was not built");
+#endif
+          }, py::arg("A"), py::arg("B"), py::arg("act_scale"), py::arg("weight_scale"),
+          py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+
+    m.def("cutlass_int8_rowwise_fp16out_bias",
+          [](uintptr_t A, uintptr_t B, uintptr_t act_scale, uintptr_t weight_scale,
+             uintptr_t bias, uintptr_t D, int M, int N, int K, uintptr_t stream) {
+#ifdef ENABLE_SM80_INT8_CUTLASS
+              return cutlass_int8_rowwise_fp16out_bias(to_ptr(A), to_ptr(B), to_ptr(act_scale),
+                  to_ptr(weight_scale), to_ptr(bias), to_ptr(D), M, N, K, to_stream(stream));
+#else
+              throw std::runtime_error("cutlass_int8_rowwise_fp16out_bias was not built");
+#endif
+          }, py::arg("A"), py::arg("B"), py::arg("act_scale"), py::arg("weight_scale"),
+          py::arg("bias"), py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),
+          py::arg("stream") = 0);
+
+    m.def("cutlass_int4_rowwise_fp16out",
+          [](uintptr_t A, uintptr_t B, uintptr_t act_scale, uintptr_t weight_scale,
+             uintptr_t D, int M, int N, int K, uintptr_t stream) {
+#ifdef ENABLE_SM80_INT8_CUTLASS
+              return cutlass_int4_rowwise_fp16out(to_ptr(A), to_ptr(B), to_ptr(act_scale),
+                  to_ptr(weight_scale), to_ptr(D), M, N, K, to_stream(stream));
+#else
+              throw std::runtime_error("cutlass_int4_rowwise_fp16out was not built");
+#endif
+          }, py::arg("A"), py::arg("B"), py::arg("act_scale"), py::arg("weight_scale"),
+          py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+
+    m.def("cutlass_int4_rowwise_fp16out_bias",
+          [](uintptr_t A, uintptr_t B, uintptr_t act_scale, uintptr_t weight_scale,
+             uintptr_t bias, uintptr_t D, int M, int N, int K, uintptr_t stream) {
+#ifdef ENABLE_SM80_INT8_CUTLASS
+              return cutlass_int4_rowwise_fp16out_bias(to_ptr(A), to_ptr(B), to_ptr(act_scale),
+                  to_ptr(weight_scale), to_ptr(bias), to_ptr(D), M, N, K, to_stream(stream));
+#else
+              throw std::runtime_error("cutlass_int4_rowwise_fp16out_bias was not built");
+#endif
+          }, py::arg("A"), py::arg("B"), py::arg("act_scale"), py::arg("weight_scale"),
+          py::arg("bias"), py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),
+          py::arg("stream") = 0);
+
+    m.def("cutlass_int4_rowwise_bf16out",
+          [](uintptr_t A, uintptr_t B, uintptr_t act_scale, uintptr_t weight_scale,
+             uintptr_t D, int M, int N, int K, uintptr_t stream) {
+#ifdef ENABLE_SM80_INT8_CUTLASS
+              return cutlass_int4_rowwise_bf16out(to_ptr(A), to_ptr(B), to_ptr(act_scale),
+                  to_ptr(weight_scale), to_ptr(D), M, N, K, to_stream(stream));
+#else
+              throw std::runtime_error("cutlass_int4_rowwise_bf16out was not built");
+#endif
+          }, py::arg("A"), py::arg("B"), py::arg("act_scale"), py::arg("weight_scale"),
+          py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+
+    m.def("cutlass_int4_silu_gated_bf16out",
+          [](uintptr_t act, uintptr_t up_w, uintptr_t act_s, uintptr_t wt_s,
+             uintptr_t gate, uintptr_t D, int M, int N, int K, uintptr_t stream) {
+#ifdef ENABLE_SM80_INT8_CUTLASS
+              return cutlass_int4_silu_gated_bf16out(to_ptr(act), to_ptr(up_w), to_ptr(act_s),
+                  to_ptr(wt_s), to_ptr(gate), to_ptr(D), M, N, K, to_stream(stream));
+#else
+              throw std::runtime_error("cutlass_int4_silu_gated_bf16out was not built");
+#endif
+          }, py::arg("act"), py::arg("up_w"), py::arg("act_scale"), py::arg("wt_scale"),
+             py::arg("gate_buf"), py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),
+             py::arg("stream") = 0);
+
+    m.def("residual_add_rms_norm_fht_int4_fp16",
+          [](uintptr_t residual, uintptr_t x, uintptr_t weight, uintptr_t out,
+             uintptr_t scales, int seq_len, int dim, float eps, uintptr_t stream) {
+#ifdef ENABLE_SM80_INT8_CUTLASS
+              residual_add_rms_norm_fht_int4_fp16(
+                  typed_ptr<__half>(residual), typed_ptr<__half>(x),
+                  typed_ptr<__half>(weight), typed_ptr<uint8_t>(out),
+                  reinterpret_cast<float*>(scales), seq_len, dim, eps,
+                  to_stream(stream));
+#else
+              throw std::runtime_error("residual_add_rms_norm_fht_int4_fp16 was not built");
+#endif
+          }, py::arg("residual"), py::arg("x"), py::arg("weight"), py::arg("out"),
+          py::arg("scales"), py::arg("seq_len"), py::arg("dim"),
+          py::arg("eps") = 1e-5f, py::arg("stream") = 0);
+
+    m.def("rms_norm_fht_int4_fp16",
+          [](uintptr_t x, uintptr_t weight, uintptr_t out, uintptr_t scales,
+             int seq_len, int dim, float eps, uintptr_t stream) {
+#ifdef ENABLE_SM80_INT8_CUTLASS
+              rms_norm_fht_int4_fp16(
+                  typed_ptr<__half>(x), typed_ptr<__half>(weight),
+                  typed_ptr<uint8_t>(out), reinterpret_cast<float*>(scales),
+                  seq_len, dim, eps, to_stream(stream));
+#else
+              throw std::runtime_error("rms_norm_fht_int4_fp16 was not built");
+#endif
+          }, py::arg("x"), py::arg("weight"), py::arg("out"), py::arg("scales"),
+          py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-5f,
+          py::arg("stream") = 0);
+
+    m.def("fht_int4_quant_fp16",
+          [](uintptr_t x, uintptr_t out, uintptr_t scales,
+             int seq_len, int dim, uintptr_t stream) {
+#ifdef ENABLE_SM80_INT8_CUTLASS
+              fht_int4_quant_fp16(
+                  typed_ptr<__half>(x), typed_ptr<uint8_t>(out),
+                  reinterpret_cast<float*>(scales), seq_len, dim,
+                  to_stream(stream));
+#else
+              throw std::runtime_error("fht_int4_quant_fp16 was not built");
+#endif
+          }, py::arg("x"), py::arg("out"), py::arg("scales"),
+          py::arg("seq_len"), py::arg("dim"), py::arg("stream") = 0);
+
+    // W8A8 + Hadamard: same rotation as the int4 entries, int8 output, so
+    // the unmodified cutlass_int8_rowwise_* GEMMs consume it. Conditions
+    // massive-activation channels at 8-bit resolution.
+    //   out    : int8 [seq_len, dim]  (NOT nibble-packed)
+    //   scales : fp32 [seq_len], with 1/sqrt(dim) already folded in
+    m.def("residual_add_rms_norm_fht_int8_fp16",
+          [](uintptr_t residual, uintptr_t x, uintptr_t weight, uintptr_t out,
+             uintptr_t scales, int seq_len, int dim, float eps, uintptr_t stream) {
+#ifdef ENABLE_SM80_INT8_CUTLASS
+              residual_add_rms_norm_fht_int8_fp16(
+                  typed_ptr<__half>(residual), typed_ptr<__half>(x),
+                  typed_ptr<__half>(weight), typed_ptr<int8_t>(out),
+                  reinterpret_cast<float*>(scales), seq_len, dim, eps,
+                  to_stream(stream));
+#else
+              throw std::runtime_error("residual_add_rms_norm_fht_int8_fp16 was not built");
+#endif
+          }, py::arg("residual"), py::arg("x"), py::arg("weight"), py::arg("out"),
+          py::arg("scales"), py::arg("seq_len"), py::arg("dim"),
+          py::arg("eps") = 1e-5f, py::arg("stream") = 0);
+
+    m.def("rms_norm_fht_int8_fp16",
+          [](uintptr_t x, uintptr_t weight, uintptr_t out, uintptr_t scales,
+             int seq_len, int dim, float eps, uintptr_t stream) {
+#ifdef ENABLE_SM80_INT8_CUTLASS
+              rms_norm_fht_int8_fp16(
+                  typed_ptr<__half>(x), typed_ptr<__half>(weight),
+                  typed_ptr<int8_t>(out), reinterpret_cast<float*>(scales),
+                  seq_len, dim, eps, to_stream(stream));
+#else
+              throw std::runtime_error("rms_norm_fht_int8_fp16 was not built");
+#endif
+          }, py::arg("x"), py::arg("weight"), py::arg("out"), py::arg("scales"),
+          py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-5f,
+          py::arg("stream") = 0);
+
+    m.def("fht_int8_quant_fp16",
+          [](uintptr_t x, uintptr_t out, uintptr_t scales,
+             int seq_len, int dim, uintptr_t stream) {
+#ifdef ENABLE_SM80_INT8_CUTLASS
+              fht_int8_quant_fp16(
+                  typed_ptr<__half>(x), typed_ptr<int8_t>(out),
+                  reinterpret_cast<float*>(scales), seq_len, dim,
+                  to_stream(stream));
+#else
+              throw std::runtime_error("fht_int8_quant_fp16 was not built");
+#endif
+          }, py::arg("x"), py::arg("out"), py::arg("scales"),
+          py::arg("seq_len"), py::arg("dim"), py::arg("stream") = 0);
+
+    m.def("fht128_int4_quant_bf16",
+          [](uintptr_t x, uintptr_t out, uintptr_t scales,
+             int seq_len, int dim, uintptr_t stream) {
+#ifdef ENABLE_SM80_INT8_CUTLASS
+              fht128_int4_quant_bf16(
+                  typed_ptr<__nv_bfloat16>(x), typed_ptr<uint8_t>(out),
+                  reinterpret_cast<float*>(scales), seq_len, dim,
+                  to_stream(stream));
+#else
+              throw std::runtime_error("fht128_int4_quant_bf16 was not built");
+#endif
+          }, py::arg("x"), py::arg("out"), py::arg("scales"),
+          py::arg("seq_len"), py::arg("dim"), py::arg("stream") = 0);
 
 
 #ifdef ENABLE_MOTUS

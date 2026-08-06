@@ -91,6 +91,25 @@ Quality measurements, the `max_pixels` resolution knob, and the per-projection
 `wq_overrides` sweep surface are in
 [`docs/qwen3_vl_thor.md`](../../docs/qwen3_vl_thor.md).
 
+## Chameleon-7B (multimodal chat)
+
+`chameleon_quickstart.py` runs standalone Chameleon-7B (image + text) with
+the dynamic per-tensor FP8 backbone and CUDA-graph prefill:
+
+```bash
+python examples/thor/chameleon_quickstart.py \
+    --checkpoint /path/to/Chameleon_7B_mGPT \
+    --image /path/to/image.jpg \
+    --prompt "Describe the image." \
+    --benchmark
+```
+
+Add `--use-trt-vqgan` when compatible TensorRT VQ-GAN engines exist
+(`scripts/build_vqgan_trt.py`), and `FLASHRT_CHAMELEON_FA4_ATTN=1` for the
+optional FA4 attention fast path. Measured ~190 ms E2E prefill (eager
+VQGAN), ~120 ms with TRT VQGAN + FA4, and ~30 tok/s incremental decode.
+Full details in [`docs/chameleon_usage.md`](../../docs/chameleon_usage.md).
+
 ## Thor VLA performance
 
 ### Precision (Pi0.5, 2-view LIBERO)

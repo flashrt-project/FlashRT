@@ -62,3 +62,9 @@ void gate_silu_mul_merged_fp8_fp16(const __half* merged, __nv_fp8_e4m3* out,
 void silu_mul_split_fp8_fp16(const __half* gate, const __half* up,
                               __nv_fp8_e4m3* out, int n,
                               const float* d_scale, cudaStream_t stream = 0);
+
+// GeGLU with fused per-tensor amax: writes fp16 output and folds its
+// abs-max into a caller-zeroed device accumulator (for fused dynamic
+// FP8 quantize). d_amax must be memset to 0 by the caller first.
+void gate_geglu_amax_fp16(const __half* gate, const __half* up, __half* out,
+                          float* d_amax, int n, cudaStream_t stream = 0);

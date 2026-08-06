@@ -428,3 +428,44 @@ void relu2_inplace_bf16(__nv_bfloat16* x, int n, cudaStream_t stream) {
     relu2_inplace_kernel<__nv_bfloat16>
         <<<(work_items + 255) / 256, 256, 0, stream>>>(x, n);
 }
+
+// ── GeGLU (GELU(gate)*up) with fused per-tensor amax ──
+// Writes the fp16 SwiGLU output while block-reducing its abs-max into
+// a caller-zeroed device scale accumulator (atomicMax across blocks).
+// d_amax must be memset to 0 by the caller first. Lets a dynamic
+// per-tensor FP8 quantize of `out` skip the separate absmax_kernel
+// read pass over the FFN intermediate.
+template<typename T>
+__global__ void gate_geglu_amax_kernel(const T* __restrict__ gate,
+                                        const T* __restrict__ up,
+                                        T* __restrict__ out,
+                                        float* __restrict__ max_val,
+                                        int n) {
+    extern __shared__ float shared[];
+    float local_max = 0.0f;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n;
+         idx += gridDim.x * blockDim.x) {
+        float g = to_f32(gate[idx]);
+        float u = to_f32(up[idx]);
+        float gelu = g / (1.0f + expf(-1.5957691216057308f * g * (1.0f + 0.044715f * g * g)));
+        float h = gelu * u;
+        T h_r = from_f32<T>(h);
+        out[idx] = h_r;
+        // amax over the fp16-rounded stored value, matching absmax_kernel
+        // reading the fp16 SwiGLU output afterwards.
+        local_max = fmaxf(local_max, fabsf(to_f32(h_r)));
+    }
+    float block_max = block_reduce_max(local_max, shared);
+    if (threadIdx.x == 0) atomicMax((int*)max_val, __float_as_int(block_max));
+}
+
+template __global__ void gate_geglu_amax_kernel<__half>(const __half*, const __half*, __half*, float*, int);
+
+void gate_geglu_amax_fp16(const __half* gate, const __half* up, __half* out,
+                          float* d_amax, int n, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    if (blocks > 1024) blocks = 1024;
+    gate_geglu_amax_kernel<__half><<<blocks, threads, threads * sizeof(float), stream>>>(
+        gate, up, out, d_amax, n);
+}

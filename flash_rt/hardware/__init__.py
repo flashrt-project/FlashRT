@@ -159,6 +159,24 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
         ("flash_rt.frontends.torch.qwen3_vl_rtx_bf16",
          "Qwen3VlTorchFrontendRtxBF16"),
 
+    # ── Chameleon-7B ──
+    # Direct frontend (set_prompt/generate), not the VLA predict() surface.
+    # Orin SM87: INT8/INT4+QuaRot-Hadamard path; compute in
+    # flash_rt/models/chameleon/pipeline_rtx.py. Registered for resolver /
+    # direct-construction discovery only; load_model(config="chameleon")
+    # raises a redirect because this exposes set_prompt() + generate(),
+    # not the VLA predict() surface. See docs/chameleon7b_rtx_sm87.md.
+    ("chameleon", "torch", "rtx_sm87"):
+        ("flash_rt.frontends.torch.chameleon_rtx_sm87",
+         "ChameleonTorchFrontendRtxSm87"),
+    # Thor SM110: dynamic-FP8 backbone (optional NVFP4 FFN), attention via
+    # the dedicated Chameleon Thor backend (FA4 -> CUTLASS causal FMHA ->
+    # cuBLAS fallback). Compute in flash_rt/models/chameleon/pipeline_thor.py.
+    # See docs/chameleon_usage.md.
+    ("chameleon", "torch", "thor"):
+        ("flash_rt.frontends.torch.chameleon_thor",
+         "ChameleonTorchFrontendThor"),
+
     # Cosmos3-Edge official Thor baseline.
     ("cosmos3_edge", "torch", "thor"):
         ("flash_rt.frontends.torch.cosmos3_edge_thor", "Cosmos3EdgeTorchFrontendThor"),
@@ -195,6 +213,7 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
 # resolving here and crashing later at the first kernel launch.
 _SM87_ALLOWED = {
     ("pi05", "torch", "rtx_sm87"),
+    ("chameleon", "torch", "rtx_sm87"),
     ("qwen3_vl", "torch", "rtx_sm87"),
 }
 

@@ -453,3 +453,7 @@ void cfg_combine_into_residual_fp16(__half* residual,
                                     const __half* v_uncond,
                                     float beta, int n,
                                     cudaStream_t stream = 0);
+
+// Symmetric in-place clamp: x = min(max(x, -limit), +limit)
+void clamp_inplace_fp16(__half* x, float limit, int n,
+                        cudaStream_t stream = 0);

@@ -121,6 +121,14 @@ public:
                     float* d_scale_a, float* d_scale_b,
                     cudaStream_t stream = 0);
 
+    // FP8 no-transpose: D_fp16 = A_fp8(M,K) @ B_fp8(K,N) with device scale pointers
+    // Same as fp8_nn_dev but with FP16 output (avoids bf16→fp16 cast overhead).
+    // Supports autotuning via autotune_fp8_nn_dev_fp16.
+    void fp8_nn_dev_fp16(void* A, void* B, void* D,
+                         int M, int N, int K,
+                         float* d_scale_a, float* d_scale_b,
+                         cudaStream_t stream = 0);
+
     // FP8 transpose-B path for SM89-compatible cuBLASLt layouts:
     // D_bf16 = A_fp8(M,K) @ B_fp8(N,K)^T with device scale pointers.
     // B is stored as (N,K) row-major.
@@ -181,6 +189,17 @@ public:
                              int M, int N, int K,
                              float* d_scale_a, float* d_scale_b,
                              int num_algos = 16);
+    void autotune_fp8_nn_dev_fp16(void* A, void* B, void* D,
+                                  int M, int N, int K,
+                                  float* d_scale_a, float* d_scale_b,
+                                  int num_algos = 16);
+    // Autotune fp8_nn_bias: benchmark top-N candidate algorithms for the
+    // bias-fused FP8 GEMM shapes (Chameleon-7B QKV/O projections). Must be
+    // called before CUDA Graph capture so the cached algorithm descriptor
+    // is baked into the captured graph.
+    void autotune_fp8_nn_bias(void* A, void* B, void* D, void* bias,
+                              int M, int N, int K, float alpha,
+                              int num_algos = 16);
     void autotune_fp8_nt_dev(void* A, void* B, void* D,
                              int M, int N, int K,
                              float* d_scale_a, float* d_scale_b,
@@ -201,7 +220,7 @@ private:
 
     // ── GEMM descriptor + algorithm cache ──
     enum GemmType { BF16_NN = 0, BF16_NN_RES = 1, FP8_NN_DEV = 2,
-                    FP8_NT_DEV = 5, FP16_NN = 4
+                    FP8_NT_DEV = 5, FP16_NN = 4, FP8_NN_DEV_FP16 = 6
 #ifdef ENABLE_NVFP4
         , FP4_NN_DEV = 3
 #endif
