@@ -203,7 +203,7 @@ class ChameleonTorchFrontendThor:
     def _build_image_token_mask(self) -> None:
         """Image-codebook vocab ids to suppress for text generation.
 
-        Mirrors vendor ``ChameleonForConditionalGeneration``'s
+        Mirrors HF ``ChameleonForConditionalGeneration``'s
         ``mask_image_logits``: without this, greedy decode on a text
         prompt can emit VQGAN codebook ids (garbage BPE decode) because
         those ids are heavily represented in training and the raw
@@ -436,7 +436,7 @@ class ChameleonTorchFrontendThor:
         return available
 
     def _preprocess_image_for_trt(self, pil_image, out_hw):
-        """PIL uint8 -> CUDA [1,3,H,W] float32 [-1,1] (vendor-matched)."""
+        """PIL uint8 -> CUDA [1,3,H,W] float32 [-1,1] (matches the HF reference preprocessing)."""
         H_out, W_out = out_hw
         if pil_image.size != (W_out, H_out):
             pil_image = pil_image.resize((W_out, H_out), resample=PIL.Image.BICUBIC)
