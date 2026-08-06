@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Gate-1 correctness harness for Chameleon-7B on Orin SM87.
 
 Compares the FlashRT INT8/INT4 frontend against a **stock transformers 4.57.1**

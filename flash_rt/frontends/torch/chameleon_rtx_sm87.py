@@ -65,7 +65,7 @@ import torch
 
 import flash_rt.flash_rt_kernels as fvk
 from flash_rt.frontends.torch import _chameleon_quant as cq
-from flash_rt.frontends.torch._chameleon_spec import build_spec
+from flash_rt.frontends.torch._chameleon_rtx_sm87_spec import build_spec
 from flash_rt.hardware.rtx.attn_backend_chameleon import (
     ChameleonAttnBackend, make_chameleon_attention_spec)
 from flash_rt.models.chameleon.pipeline_rtx import chameleon_forward

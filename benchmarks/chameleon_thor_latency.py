@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Chameleon-7B (Thor sm_110) latency benchmark.
 
 Measures standalone Chameleon-7B prefill latency on real images with clean

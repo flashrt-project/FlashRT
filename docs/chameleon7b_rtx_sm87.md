@@ -10,11 +10,7 @@
 > overflow (§4.6).
 >
 > This is the authoritative document for **upstream Chameleon-7B as an image+text
-> → text VLM** on Orin SM87. It is a knowledge migration from the RynnVLA-001
-> port in the derivative repo this was migrated from (same Chameleon-7B
-> backbone, but *prefill-only* + action head); the cross-model mechanism
-> analysis and the decode-regime methodology on the same platform that it built
-> on are documented in that repo.
+> → text VLM** on Orin SM87.
 
 ---
 
@@ -48,25 +44,6 @@ granularity, smoothing, or a per-layer precision fallback — and because the
 rotation preserves per-row scales it reuses the stock CUTLASS INT8 GEMMs, so it
 costs nothing (§4.5).
 
-### What this port had to add over RynnVLA-001
-
-RynnVLA-001 shares this exact backbone but is **prefill-only**
-(the RynnVLA pipeline in the derivative repo sets `layer_stride_llm = 0`, so all
-32 layers share one K/V scratch — no KV cache, lm_head loaded but idle, no
-sampler). So:
-
-* **Prefill / TTFT** — RynnVLA's whole Orin tuning ladder (L2 swizzle Id4,
-  stages-5, t256x128, vec8 elementwise) lives in the kernels and transferred for
-  free; measured 91 % of ceiling with zero new tuning.
-* **Decode (M=1)** — a different regime (weight-bandwidth-bound, not
-  FLOPs-bound) with different levers. This was the new work, and it still needed
-  **zero new CUDA kernels** for the QK-Norm / RoPE / KV-write path (§3.1): the
-  K/V GEMMs write straight into the cache slab and the RoPE position rides in
-  the cos/sin table pointer.
-
-The one kernel this port *did* add is the INT8 twin of the existing FHT pack
-(§4.5) — a device-side function inside `csrc/kernels/fht_int4.cu`, no new GEMM.
-
 ## 1. Platform
 
 | Field | Value |
@@ -87,9 +64,8 @@ picking the wrong one produces >100 % "efficiency" nonsense:
 | single-stream vectorized reduce (`roofline.py --measure-bw`) | 99 GB/s | nothing — undersaturated |
 | **best achieved by a real weight-streaming kernel** (int8 gate GEMM @ M=1) | **173.3 GB/s** = 85 % of spec | **the decode roofline denominator** |
 
-The RynnVLA-001 documentation in the derivative repo quotes 166 GB/s for a D2D
-copy; we measure 124.5 in this container. Treat 173 GB/s (kernel-achieved,
-read-dominated) as the decode ceiling.
+A D2D copy measures 124.5 GB/s in this container. Treat 173 GB/s
+(kernel-achieved, read-dominated) as the decode ceiling.
 
 > ⚠️ `/sys/devices/gpu.0/devfreq/*/cur_freq` is **not readable in this container**, so clocks
 > cannot be locked or even observed. Every number below is warm (≥30 warmup iters) and a median
@@ -108,8 +84,8 @@ num_splits = fa2_num_splits_heuristic_causal(batch*num_heads_q*num_m_blocks, num
 ```
 
 Chameleon decode: `1*32*1 = 32` vs `0.8 * (16*2) = 25.6` → **`num_splits = 1`**. Passing the
-accumulators does nothing. RynnBrain's +12 % split-KV win (documented in the
-derivative repo) worked *only* because Qwen3-VL-2B has **16** Q heads.
+accumulators does nothing. A split-KV win works *only* when the model has few
+enough Q heads (e.g. **16**) for the heuristic to engage splitting.
 
 `num_sms` is a pure heuristic knob in this wrapper, so biasing it selects the split count.
 Measured (q=1, kv=1040, 32 Q heads, head_dim 128, fp16):
@@ -194,9 +170,9 @@ match on a deterministic 512×512 input, versus a full-fp32 reference:
 | **fp16 convs + fp32 distance/argmin** | 99.02 % |
 
 The fp32-argmin fix helps (`z²+e²−2ez` is cancellation-prone in fp16;
-`modeling_chameleon.py:850-861`) and costs <0.1 ms. This probe used random noise; the
-~92 % divergence recorded by the derivative repo's layerwise precision tests was on **real
-images**, so re-measure on real content at Phase 5 before declaring the fix sufficient.
+`modeling_chameleon.py:850-861`) and costs <0.1 ms. This probe used random noise;
+divergence on **real images** can be much higher (~92 % has been observed), so
+re-measure on real content at Phase 5 before declaring the fix sufficient.
 
 ### 2.5 R8 — decode-graph primitives are graph-safe: **PASS**
 
@@ -235,9 +211,9 @@ Therefore:
 * **decode** — point them at `+ pos*4096*2` and call the same kernel with `seq_len=1` and cos/sin
   pre-offset by `pos*128*2`.
 
-Also required: **`Se` must not be even-padded** (the RynnVLA pipeline in the derivative repo
-pads `Se` for FP8 GEMM alignment) — with a real KV cache the pad row is junk that decode *will*
-attend to, and CUTLASS constrains only `K`.
+Also required: **`Se` must not be even-padded** (e.g. for FP8 GEMM alignment) —
+with a real KV cache the pad row is junk that decode *will* attend to, and
+CUTLASS constrains only `K`.
 
 Attention correctness: FA2 causal is **bottom-right aligned**
 (`fa2_wrapper_causal.cu:126-138`), so `q=1, kv=N` attends all N keys. The cuBLAS fallback
@@ -257,24 +233,23 @@ rather than degrade to it.
 Decode always uses **dynamic per-row** activation quant — never the prefill static calibration,
 which was fitted at M=Se and does not describe a single decode row.
 
-### 3.3 Token contract (upstream Chameleon — do NOT reuse RynnVLA's ids)
+### 3.3 Token contract
 
 `[BOS 0] + n_img × ([8197 <racm3:break>] + [8711 <image>]×1024 + [8196 <eoss>]) + text + [8710 sep]`,
 so `S = 1 + n_img*1026 + n_text + 1`. Image token id = **VQ codebook index + 4**, exactly, for
 all 8192 codes; the 1024 tokens are a raster scan of the 32×32 latent grid.
 
-> ⚠️ **Trap:** the RynnVLA port in the derivative repo hardcodes
-> `<racm3:break>: 8710, <eoss>: 8720`. Both are **wrong** for upstream Chameleon (8710 is the
-> `sep_token`). Its `_init_special_token_ids` also sets ids 65536-65539, which are out of range
-> for `vocab_size=65536`. This is one of three reasons the Chameleon frontend is standalone
-> rather than a subclass of the RynnVLA frontend — see §4.
+> ⚠️ **Trap:** do not hardcode `<racm3:break>: 8710, <eoss>: 8720`. Both are
+> **wrong** for upstream Chameleon (8710 is the `sep_token`). Likewise, special
+> ids 65536-65539 are out of range for `vocab_size=65536`. This is one of three
+> reasons the Chameleon frontend is standalone rather than a subclass — see §4.
 >
 > ⚠️ `config.json` says `bos_token_id: 1`, which is **stale** (`<pad>`); `tokenizer.json` gives
 > `<s> = 0` and that is what the processor emits.
 
 ### 3.4 Why the frontend is standalone (not a subclass)
 
-Three of the most attractive inheritable helpers from the derivative repo's RynnVLA port are
+Three of the most attractive inheritable helpers from a VLA-style frontend are
 *actively wrong* for upstream Chameleon: its `_preprocess_image` is bicubic/384/`x*2-1` where
 Chameleon needs PIL **LANCZOS**/512/`u8*0.0078-1.0` → `[-1, +0.989]`; its `_vqgan_encode` emits a
 grid+newline token layout instead of a bare 1024 raster; its `_load_tokenizer` /
@@ -335,10 +310,10 @@ Total GPU 281.1 ms (measured before the clamp restriction in §4.2.3):
 
 ### 4.2.2 The real GEMM ceiling is 64.4 TOPS, not 84.8 — GEMM tuning is spent
 
-The 84.8 TOPS quoted by the RynnVLA-001 documentation in the derivative repo is
-the **raw `mma.s8` issue rate** from a register-only probe. What CUTLASS actually
-achieves on its best-case shape is lower: big-square probes measure **58.7 TOPS
-at 4096^3 and 64.4 TOPS at 8192^3**. Against that realistic ceiling:
+The often-quoted 84.8 TOPS figure is the **raw `mma.s8` issue rate** from a
+register-only probe. What CUTLASS actually achieves on its best-case shape is
+lower: big-square probes measure **58.7 TOPS at 4096^3 and 64.4 TOPS at
+8192^3**. Against that realistic ceiling:
 
 | shape | ms/call | TOPS | vs 64.4 ceiling |
 |---|---|---|---|
@@ -350,18 +325,17 @@ at 4096^3 and 64.4 TOPS at 8192^3**. Against that realistic ceiling:
 The prefill GEMMs are at **91 % of the achievable CUTLASS ceiling**, and the
 isolated probe reproduces the in-pipeline time to within 0.5 % (0.567 vs
 0.568 ms on Q/K/V/O) — so there is no pipeline overhead left to recover. This
-independently confirms RynnVLA-001's conclusion that the GEMM ladder (swizzle
-Id4 / stages-5 / t256x128) is spent. Only `gate/up` at 85 % shows slack, and
-RynnVLA already swept tiles there and measured 256x128 as "only ~2 % better, not
-worth a 4th instantiation".
+confirms that the GEMM ladder (swizzle Id4 / stages-5 / t256x128) is spent.
+Only `gate/up` at 85 % shows slack, and tile sweeps there measured 256x128 as
+"only ~2 % better, not worth a 4th instantiation".
 
 > WARNING: **the roofline probe itself had a DVFS bug**, found here. Whichever
 > shape was measured *first* was penalised by clock ramp: Q/K/V/O reported
 > **28.3 TOPS** measured first versus **61.1** for the identical shape after
 > adding a 3-second saturating pre-ramp, and the per-shape TOPS ascended purely
 > in measurement order (28.3 -> 53.8 -> 60.5). `_ramp_clocks()` now runs before
-> any timing in the roofline script (in the derivative repo,
-> `scripts/bench/orin_int8_roofline.py`). Any earlier per-shape number from that
+> any timing in the roofline script
+> (`scripts/bench/orin_int8_roofline.py`). Any earlier per-shape number from that
 > script is suspect.
 
 ### 4.2.3 Clamp restricted to the last 4 layers: -6.3 ms
@@ -444,10 +418,11 @@ Measured on the same prompt, all three tiers:
 | 1032 | INT4+down | 0.9334 | 0.9313 | — | — | 0.998881 | **0/16** |
 | **1032** | **INT8+Hadamard** | **0.9989** | **0.9989** | **0.99972** | **0.99945** | **0.999968** | **16/16** |
 
-> This **contradicts the RynnVLA-001 Orin conclusion** ("both INT4 tiers beat
-> INT8 at every layer probe on every frame"). That doc is not wrong — it
-> measured a *prefill-only VLA at fixed Se*; the verdict is ISL-dependent, and
-> a VLM's production ISL sits in the opposite regime.
+> This may appear to **contradict an earlier prefill-only conclusion** ("both
+> INT4 tiers beat INT8 at every layer probe on every frame"). That measurement
+> is not wrong — it was taken on a *prefill-only workload at fixed short Se*;
+> the verdict is ISL-dependent, and a VLM's production ISL sits in the opposite
+> regime.
 
 So the INT8-vs-INT4 verdict *inverts with sequence length* — at short ISL the
 sink row is 1/7 of the tensor and rotation dominates; at long ISL it is 1/1032
@@ -478,7 +453,7 @@ hand-written ceiling on 16-SM Orin measured just 41 TOPS. A per-layer FP16
 fallback would also have worked, but it is checkpoint-specific tuning that
 permanently costs throughput — the rotation is free and generalizes.
 
-### 4.6 SOLVED — the FP16 overflow, via RynnVLA-002's `ffn_down_clamp`
+### 4.6 SOLVED — the FP16 overflow, via `ffn_down_clamp`
 
 With a real image the reference's L31 residual reaches **max|x| = 89088**, above
 FP16's 65504, so FlashRT stored `inf` and the final RMSNorm turned that row's
@@ -486,15 +461,7 @@ logits into `nan`. It affects **both** precision tiers — it is a property of t
 residual *dtype*, not of the quantization.
 
 The first instinct (a BF16 residual stream, ~1 new kernel) was **wrong** — the
-answer already existed in the lineage. The derivative repo's Chameleon
-acceleration-methodology documentation records this exact failure for the
-Chameleon backbone, and its FP8 optimization playbook had already flagged the
-missing clamp as a *latent, unverified* risk for RynnVLA-001:
-
-> **可复用到 001**：001 当前**无 clamp**，是潜在的 inf 风险点（尤其长序列）。直接移植
-> `clamp_inplace_fp16` 即可。
-
-This port empirically confirmed that prediction.
+answer is a clamp. This port empirically confirmed that a clamp is sufficient.
 
 **Why a clamp is sufficient** — measured per-layer magnitudes in the bf16
 reference (ISL=1032). The explosion is confined to **exactly one layer**:
@@ -511,9 +478,9 @@ Because the pre-L31 residual is only ~2032, clamping the down **output** at
 (already in `flash_rt_kernels`, CUDA-Graph safe) removes the overflow with
 **zero new kernels and no dtype change**.
 
-Unlike RynnVLA-002's Thor path we do **not** need to clamp the down *input*:
-ours is BF16 (`cutlass_int8_silu_gated_bf16out`), whose range absorbs 151552
-without issue. The clamp is applied on every layer because L0-L30 are three
+We do **not** need to clamp the down *input*: ours is BF16
+(`cutlass_int8_silu_gated_bf16out`), whose range absorbs 151552 without issue.
+The clamp is applied on every layer because L0-L30 are three
 orders of magnitude below it and therefore untouched; cost is 32 extra
 elementwise launches (<0.3 % of the decode budget, ~0.7 % of prefill).
 
@@ -527,14 +494,13 @@ elementwise launches (<0.3 % of the decode budget, ~0.7 % of prefill).
 | last-row logit cosine | 0.999916 | 0.999916 |
 | greedy prefix vs HF | 8/16 | 8/16 |
 
-Exposed as `ffn_down_clamp` (default 60000, env `FLASHRT_CHAMELEON_DOWN_CLAMP`),
-named after the corresponding RynnVLA-002 env var in the derivative repo.
+Exposed as `ffn_down_clamp` (default 60000, env `FLASHRT_CHAMELEON_DOWN_CLAMP`).
 
 ⚠️ **The clamp did not change the text divergence** (still 8/16). That confirms
 the overflow was confined to the sink row's post-L31 residual, which feeds only
 that row's final norm — so it was never the cause of the divergence. The
 remaining gap is ordinary INT8 error at high-confidence text decisions and is
-still open; see §6 for the ranked options inherited from the RynnVLA lineage.
+still open; see §6 for the ranked options.
 
 Also note the **gate itself was wrong** at first: an absolute
 "max|x| < 30000" threshold fails by construction on a backbone whose reference
@@ -584,7 +550,7 @@ FHT norm absorb part of it. A prediction that is close *and* slightly pessimisti
 is the sign the bottleneck model is right (a large gap in either direction would
 mean the model of the bottleneck is wrong, not that there is tuning left).
 
-**Prefill**: predicted ~255 ms by scaling RynnVLA's measured Se=1214 numbers to
+**Prefill**: predicted ~255 ms by scaling a measured Se=1214 prefill to
 Se=1032; **measured 273.8 ms warm** (within 7 %), of which GEMM is 229.2 ms at
 **91 % of the achievable CUTLASS ceiling** (§4.2.2). Image tokenize adds ~53 ms
 (PyTorch VQ-GAN; ~27 ms with a 512x512 TRT engine, not built).
@@ -602,7 +568,7 @@ Se=1032; **measured 273.8 ms warm** (within 7 %), of which GEMM is 229.2 ms at
 | # | lever | outcome |
 |---|---|---|
 | 1 | **W8A8 + Hadamard (QuaRot at 8 bits)** | **DONE — this closed it.** greedy 8/16 → **16/16**, worst layer 0.9946 → 0.9986, last-row logit 0.999916 → 0.999968, at no throughput cost. Default tier. |
-| 2 | `ffn_down_clamp` (ported from RynnVLA-002) | **DONE** — removed the L31 FP16 `inf` (§4.6) |
+| 2 | `ffn_down_clamp` | **DONE** — removed the L31 FP16 `inf` (§4.6) |
 | ~~3~~ | ~~Tier-3 FP16 fallback for L31~~ | **not needed** — the rotation fixed the same layer at 8 bits. A per-layer precision fallback is checkpoint-specific tuning and costs throughput permanently; prefer the quantization method. |
 | ~~4~~ | ~~AWQ / SmoothQuant per-K smoothing~~ | **not needed** — and principle #17's measured ladder on this backbone puts smoothing (0.641) far below rotation (0.9914). Kept only as a fallback if a future checkpoint defeats rotation. |
 | 5 | ISL-adaptive tier selection | **obsolete** — W8A8+Hadamard wins at both short and long ISL, so there is nothing to switch between |
@@ -619,7 +585,7 @@ Se=1032; **measured 273.8 ms warm** (within 7 %), of which GEMM is 229.2 ms at
 | 5 | INT8 Q/K/V/O at 67 % of ceiling (small-N tail: 4096/128 = 32 tiles on 16 SMs) | up to +12 % if it reached 100 % | high (hand GEMV) | open |
 | 6 | Devpos kernel + fp16 seqused-splitkv FA2 → *one* decode graph | 0 % throughput; removes capture cost + `max_new_tokens` cap | high (1 `.cu` + FA2 rebuild) | deferred |
 | 7 | Reduced lm_head (drop rows 4..8195) | +0.5–1 % | low | deferred |
-| 8 | INT8 KV cache | +3.8 % @1040, **+12 % @4096** | high (needs a 32Q/32KV variant; RynnBrain measured break-even) | S≥4096 only |
+| 8 | INT8 KV cache | +3.8 % @1040, **+12 % @4096** | high (needs a 32Q/32KV variant; break-even measured) | S≥4096 only |
 | ~~9~~ | ~~M=1 up-projection split~~ | ~~+7 %~~ → **measured 0.9 %, net ≈0** | — | **DEAD (§2.2)** |
 | 10 | Speculative decode | 1.5–2× | N/A — no draft model | — |
 
@@ -665,8 +631,7 @@ PYTHONPATH=. python3 scripts/chameleon_orin_check.py \
 #   ... --vq-fp16-argmin      measure VQ index drift instead of avoiding it
 
 # M=1 decode roofline (no checkpoint) — the "do we need a GEMV?" gate
-# (the roofline probe script lives in the derivative repo this was migrated
-# from: scripts/bench/orin_int8_roofline.py)
+# (roofline probe script: scripts/bench/orin_int8_roofline.py)
 python3 scripts/bench/orin_int8_roofline.py --decode
 
 # large-M prefill roofline at the production shape
@@ -731,7 +696,7 @@ entry yet (out of scope this round), so these are the frontend kwargs.
 |---|---|
 | `precision_tier` / `precision_spec()` / `get_model_info()` | report the resolved configuration; `timing` carries `prompt_ms` / `prefill_ms` / `decode_tok_s` |
 
-**Not accepted** (unlike the RynnVLA frontends): `use_fp8`, `use_fp4`,
+**Not accepted**: `use_fp8`, `use_fp4`,
 `use_fp8_attn`, `use_awq_v_proj`, `num_views`, `action_dim`,
 `action_chunk_size`, `state_dim` — SM87 has no FP8/FP4 tensor cores and this is
 not a VLA. Unknown kwargs are swallowed by `**_ignored`.
