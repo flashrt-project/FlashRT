@@ -230,15 +230,23 @@ official BF16 checkpoint:
 | 64-token prompt, 32-token eager decode | 48.14 tok/s |
 | 64-token prompt, 32-token warm CUDA Graph decode | 195.49 tok/s |
 
-These are first-light figures and are quoted unchanged. The decode work
-described under *Speculative decode* was tuned and measured on Thor; the SM120
-kernels are byte-identical to before it, so these numbers stand, but they have
-not been re-measured on this branch. The correctness gate
-(`tests/test_qwen36_moe_gpu.py`) does pass on the current tree.
+These are the original first-light figures, measured with a 32-token
+generation. The current SM120 reference for this path is the same-shape
+measurement at `P=64, N=64`, warm CUDA Graph:
 
-A separate warm-graph measurement at `P=64, N=64` on the same card reports a
-decode median of 257.95 tok/s over eight runs; the two tables use different
-generation lengths and are not interchangeable.
+| Measurement | Result |
+|---|---:|
+| Prefill | 40.42 ms |
+| Decode, median of 8 runs | 257.95 tok/s |
+| Decode, range across 8 runs | 256.90–258.22 tok/s |
+| Repeated sequences identical | 8 / 8 |
+
+Quote that one, not the 32-token row above: the two use different generation
+lengths and are not interchangeable.
+
+The decode work described under *Speculative decode* was tuned and measured on
+Thor, and its one tuning constant is scoped to that architecture, so the SM120
+kernels are byte-identical to the ones these numbers were taken on.
 
 The eager, first-capture, and warm-graph runs produced the same 32 token IDs.
 These numbers are a first-light correctness run, not a context-length sweep.
