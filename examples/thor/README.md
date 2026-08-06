@@ -54,6 +54,43 @@ python examples/thor/eval_libero.py \
 See [Thor VLA performance](#thor-vla-performance) below for the
 latency/accuracy table across 1/2/3 views.
 
+## Qwen3-VL (multimodal chat)
+
+`qwen3_vl_quickstart.py` runs the official BF16 Qwen3-VL checkpoint as a chat
+VLM (text-only, or a single image plus text). It needs the gated Qwen3-VL
+kernel module in addition to `flash_rt_kernels`:
+
+```bash
+cmake -B build -S . -DGPU_ARCH=110 -DFLASHRT_BUILD_QWEN3_VL=ON
+cmake --build build -j$(nproc) \
+    --target flash_rt_kernels flash_rt_qwen3_vl_kernels
+```
+
+```bash
+python examples/thor/qwen3_vl_quickstart.py \
+    --checkpoint /path/to/Qwen3-VL-2B-Instruct \
+    --image FlashRT.png \
+    --prompt "Describe this image in one sentence." \
+    --max-new-tokens 32
+```
+
+Omit `--image` for a text-only prompt, `--no-graph` for the eager decode
+reference, and `--benchmark N` to time prefill and warm graph decode
+separately. `--weight-mode` picks the weight-only decode tier; measured on a
+full-resolution image prompt (1581 tokens, 6256 vision patches):
+
+| `--weight-mode` | decode | vs BF16 |
+|---|---:|---:|
+| `bf16` | 66.4 tok/s | 1.00× |
+| `w8` | 106.6 tok/s | 1.61× |
+| `w4` | 158.1 tok/s | 2.38× |
+
+Prefill is eager on Thor (a prefill graph measured 0.3% — it is GPU-bound) and
+measured ~230 ms P50 at full resolution with the cuDNN ViT patch attention.
+Quality measurements, the `max_pixels` resolution knob, and the per-projection
+`wq_overrides` sweep surface are in
+[`docs/qwen3_vl_thor.md`](../../docs/qwen3_vl_thor.md).
+
 ## Thor VLA performance
 
 ### Precision (Pi0.5, 2-view LIBERO)

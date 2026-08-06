@@ -40,6 +40,11 @@ class GrootN17TorchFrontendThor:
     # accuracy baseline).
     _DIT_USE_FP8 = True
     _DIT_FP8_IMPL = "thor_epilogue"
+    # DiT quantization tier: "fp8" (calibrated FFN/QKV FP8, default) or
+    # "fp4" (every DiT GEMM as block-scaled NVFP4 with fused epilogues —
+    # see GrootN17TorchFrontendThorFP4). The DiT at M=41 is
+    # weight-bandwidth-bound, so the FP4 tier halves its dominant cost.
+    _DIT_QUANT = "fp8"
 
     def __init__(
         self,
@@ -833,7 +838,11 @@ class GrootN17TorchFrontendThor:
         # quantize. Skipped for the full-FP16 reference (``_DIT_USE_FP8`` off),
         # which keeps the DiT bf16 — dit_forward / _step_fwd fall back to the
         # bf16 path when the FP8 weights are absent from ``step_weights`` / ``bp``.
-        if self._DIT_USE_FP8:
+        if getattr(self, "_DIT_QUANT", "fp8") == "fp4":
+            # NVFP4 needs no activation calibration (per-16-element dynamic
+            # scales); just quantize the weights and splice the pointers.
+            self._quantize_dit_fp4(step_weights, bp, action_horizon)
+        elif self._DIT_USE_FP8:
             self._calibrate_quantize_dit_ffn(
                 num_inference_timesteps, action_horizon, _state_fwd, _ae_fwd,
                 _post_fwd, step_weights, bp, dims)
@@ -842,7 +851,8 @@ class GrootN17TorchFrontendThor:
             _ae_fwd(step, s)
             pipeline_thor.dit_forward(
                 gemm=self._gemm, fvk=K, bufs=bp, weights=step_weights[step],
-                dims=dims, attn=self._dit_attn, stream=s)
+                dims=dims, attn=self._dit_attn, stream=s,
+                fvk_fp4=getattr(self, "_fvk_fp4", None))
             _post_fwd(step, s)
 
         self._kdit_fwd = (_state_fwd, _step_fwd)
@@ -1443,6 +1453,55 @@ class GrootN17TorchFrontendThor:
             self._fvk = _fvk
         if not hasattr(self, "_mlp_gemm"):
             self._mlp_gemm = self._fvk.GemmRunner()
+        # NVFP4 cross-KV projections (FP4 DiT tier only): the 32 per-frame
+        # K/V GEMMs are weight-bandwidth-bound (bf16 weights are ~200 MB per
+        # frame); NVFP4 quarters the weight bytes and fuses the bias adds
+        # into the GEMM epilogues. The gathered text/image sources are
+        # shared across all 16 cross layers, so only two activation
+        # quantizes run per frame.
+        if (getattr(self, "_DIT_QUANT", "fp8") == "fp4"
+                and getattr(self, "_CK_FP4", True)):
+            import flash_rt.flash_rt_fp4 as fvk_fp4
+            self._fvk_fp4 = fvk_fp4
+            keep = []
+            self._ck_fp4_keep = keep
+
+            def quant_w(w_kn):
+                w_nk = w_kn.t().contiguous().to(torch.float16)
+                Nw, Kw = w_nk.shape
+                packed = torch.empty(Nw, Kw // 2, dtype=torch.uint8,
+                                     device=dev)
+                sfb = torch.zeros(fvk_fp4.sfa_size_bytes(Nw, Kw, True),
+                                  dtype=torch.uint8, device=dev)
+                rc = fvk_fp4.quantize_fp4_dynamic_sfa_mse_fp16(
+                    w_nk.data_ptr(), packed.data_ptr(), sfb.data_ptr(),
+                    Nw, Kw, True, 0)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"cross-KV FP4 weight quantize failed rc={rc}")
+                keep.extend([packed, sfb])
+                return packed.data_ptr(), sfb.data_ptr()
+
+            self._ck_kw_fp4 = []
+            self._ck_vw_fp4 = []
+            for j in range(16):
+                li = 2 * j
+                self._ck_kw_fp4.append(quant_w(self._dit_k_w[li]))
+                self._ck_vw_fp4.append(quant_w(self._dit_v_w[li]))
+            torch.cuda.synchronize()
+
+            def act_buf(rows, cols):
+                packed = torch.empty(rows, cols // 2, dtype=torch.uint8,
+                                     device=dev)
+                sfa = torch.zeros(
+                    fvk_fp4.sfa_size_bytes(rows, cols, False),
+                    dtype=torch.uint8, device=dev)
+                keep.extend([packed, sfa])
+                return packed, sfa
+
+            self._ck_text_fp4, self._ck_text_sfa = act_buf(nt, 2048)
+            self._ck_image_fp4, self._ck_image_sfa = act_buf(ni, 2048)
+
         # seed the buffers from the current backbone (eager) so a non-graph
         # consumer sees valid K/V immediately.
         self._ck_bb_src.copy_(self._backbone_features.reshape(S, 2048).half())
@@ -1462,11 +1521,44 @@ class GrootN17TorchFrontendThor:
         K.embedding_lookup_bf16(
             self._ck_image_idx.data_ptr(), self._ck_bb.data_ptr(),
             self._ck_image_src.data_ptr(), ni, 2048, s)
+        fp4 = getattr(self, "_fvk_fp4", None)
+        use_fp4 = fp4 is not None and hasattr(self, "_ck_kw_fp4")
+        if use_fp4:
+            rc = fp4.quantize_fp4_dynamic_sfa_bf16_vec(
+                self._ck_text_src.data_ptr(), self._ck_text_fp4.data_ptr(),
+                self._ck_text_sfa.data_ptr(), nt, 2048, False, s)
+            if rc != 0:
+                raise RuntimeError(f"cross-KV text quantize failed rc={rc}")
+            rc = fp4.quantize_fp4_dynamic_sfa_bf16_vec(
+                self._ck_image_src.data_ptr(), self._ck_image_fp4.data_ptr(),
+                self._ck_image_sfa.data_ptr(), ni, 2048, False, s)
+            if rc != 0:
+                raise RuntimeError(f"cross-KV image quantize failed rc={rc}")
         for j in range(16):
             li = 2 * j
             text = (li % 4 == 0)
-            src = self._ck_text_src if text else self._ck_image_src
             N = nt if text else ni
+            if use_fp4:
+                a_fp4 = self._ck_text_fp4 if text else self._ck_image_fp4
+                a_sfa = self._ck_text_sfa if text else self._ck_image_sfa
+                kw, ksf = self._ck_kw_fp4[j]
+                vw, vsf = self._ck_vw_fp4[j]
+                rc = fp4.cutlass_fp4_gemm_bias_bf16(
+                    a_fp4.data_ptr(), a_sfa.data_ptr(), kw, ksf,
+                    self._dit_k_b[li].data_ptr(),
+                    self._dit_cross_K[j].data_ptr(), N, 1536, 2048, s)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"cross-KV FP4 K GEMM layer {li} failed rc={rc}")
+                rc = fp4.cutlass_fp4_gemm_bias_bf16(
+                    a_fp4.data_ptr(), a_sfa.data_ptr(), vw, vsf,
+                    self._dit_v_b[li].data_ptr(),
+                    self._dit_cross_V[j].data_ptr(), N, 1536, 2048, s)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"cross-KV FP4 V GEMM layer {li} failed rc={rc}")
+                continue
+            src = self._ck_text_src if text else self._ck_image_src
             mg.bf16_nn(src.data_ptr(), self._dit_k_w[li].data_ptr(),
                        self._dit_cross_K[j].data_ptr(), N, 1536, 2048, s)
             K.add_bias_bf16(self._dit_cross_K[j].data_ptr(),
@@ -1748,6 +1840,8 @@ class GrootN17TorchFrontendThor:
                 "scale": 1.0 / (HD ** 0.5),
             },
         )
+        if getattr(self, "_KBB_VEC", False):
+            self._dit_attn._use_masked_softmax = True
 
     # ────────────────────────────────────────────────────────────────
     # Normalize / Denormalize helpers (statistics.json, q01/q99)

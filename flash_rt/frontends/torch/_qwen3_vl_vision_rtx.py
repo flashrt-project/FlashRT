@@ -19,6 +19,7 @@ Sibling of the language path in ``qwen3_rtx`` / ``qwen3_vl_rtx``.
 """
 from __future__ import annotations
 
+import contextlib
 import math
 from typing import Any
 
@@ -30,13 +31,14 @@ class Qwen3VlVisionRtx:
     early-layer paths can stay BF16 via explicit config overrides.
 
     Public surface:
-      __init__(checkpoint_path, *, device='cuda:0')
+      __init__(checkpoint_path, *, device='cuda:0', attention_backend='fa2')
       forward(pixel_values, pos_embeds, rope_cos, rope_sin)
         -> (image_embeds, deepstack_features)
     """
 
     def __init__(self, checkpoint_path: str, *, device: str = 'cuda:0',
-                 config: dict | None = None) -> None:
+                 config: dict | None = None, fp8: bool | None = None,
+                 attention_backend: str = 'fa2') -> None:
         import torch
 
         from safetensors import safe_open
@@ -45,10 +47,16 @@ class Qwen3VlVisionRtx:
         self._fvk = None
         self._fa2 = None
         self._vlk = None
+        self._vit_sdpa_ctx = None  # set by _kernels() for explicit SDPA
         # patch-count -> (graph, static_inputs, captured_outputs)
         self._graphs: dict = {}
         self._graph_stream = None
         self._use_fp8_gemm = False
+        if attention_backend not in ('fa2', 'sdpa'):
+            raise ValueError(
+                f'attention_backend must be "fa2" or "sdpa", got '
+                f'{attention_backend!r}')
+        self._attention_backend = attention_backend
 
         cfg = config if config is not None else _read_vision_config(
             checkpoint_path)
@@ -65,6 +73,11 @@ class Qwen3VlVisionRtx:
             torch.device(device))[0] * 10 + torch.cuda.get_device_capability(
                 torch.device(device))[1]
         self._use_fp8_gemm = self._device_sm >= 89
+        if fp8 is not None:
+            # Explicit override. Thor (sm_110) passes the sm>=89 test but its
+            # Qwen3-VL module omits the FP8 block-128 ViT kernels, so it has to
+            # ask for the BF16 tower.
+            self._use_fp8_gemm = bool(fp8)
 
         import json
         import os
@@ -180,13 +193,43 @@ class Qwen3VlVisionRtx:
 
     def _kernels(self):
         if self._fvk is None:
-            from flash_rt import flash_rt_fa2 as fa2
+            if self._attention_backend == 'fa2':
+                from flash_rt import flash_rt_fa2 as fa2
+            else:
+                fa2 = None
             from flash_rt import flash_rt_kernels as fvk
             from flash_rt import flash_rt_qwen3_vl_kernels as vlk
             self._fvk, self._fa2, self._vlk = fvk, fa2, vlk
             import torch
             self._num_sms = torch.cuda.get_device_properties(
                 torch.device(self.device)).multi_processor_count
+            # Capability check on the module and symbol only. Do NOT also gate
+            # on head_dim: FA2 does instantiate the ViT's head_dim 64 (see
+            # FA2_HDIMS), and excluding it would silently reroute the working
+            # SM89/SM120 ViT attention to SDPA.
+            self._vit_use_fa2 = self._attention_backend == 'fa2'
+            if self._vit_use_fa2 and not hasattr(fa2, 'fwd_bf16'):
+                raise RuntimeError(
+                    'attention_backend="fa2" requires flash_rt_fa2.fwd_bf16')
+            # On Thor's explicit SDPA path, prefer the cuDNN backend:
+            # at the ViT shape (head_dim 64, non-causal) it measures ~2.3x
+            # faster than torch's flash backend there. Probe once here, not on
+            # the first forward — the probe launches an SDPA, which must not
+            # happen inside a CUDA Graph capture.
+            self._vit_sdpa_ctx = None
+            if not self._vit_use_fa2:
+                try:
+                    from torch.nn.attention import SDPBackend, sdpa_kernel
+                    probe = torch.zeros(
+                        1, self.num_heads, 8, self.head_dim,
+                        device=self.device, dtype=torch.bfloat16)
+                    with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+                        torch.nn.functional.scaled_dot_product_attention(
+                            probe, probe, probe)
+                    self._vit_sdpa_ctx = (
+                        lambda: sdpa_kernel(SDPBackend.CUDNN_ATTENTION))
+                except Exception:
+                    self._vit_sdpa_ctx = None
         return self._fvk, self._fa2, self._vlk
 
     # ── primitives ──
@@ -394,17 +437,32 @@ class Qwen3VlVisionRtx:
             qv = q.view(1, S, nh, hd)
             kv = k.view(1, S, nh, hd)
             vv = v.view(1, S, nh, hd)
-            fa2.fwd_bf16(
-                Q=qv.data_ptr(), K=kv.data_ptr(), V=vv.data_ptr(),
-                O=o.data_ptr(), softmax_lse=lse.data_ptr(),
-                softmax_lse_accum=0, o_accum=0, batch=1,
-                seqlen_q=S, seqlen_k=S,
-                num_heads_q=nh, num_heads_kv=nh, head_dim=hd,
-                q_strides=(qv.stride(0), qv.stride(1), qv.stride(2)),
-                k_strides=(kv.stride(0), kv.stride(1), kv.stride(2)),
-                v_strides=(vv.stride(0), vv.stride(1), vv.stride(2)),
-                o_strides=(o.stride(0), o.stride(1), o.stride(2)),
-                softmax_scale=scale, num_sms=self._num_sms, stream=stream)
+            if self._vit_use_fa2:
+                fa2.fwd_bf16(
+                    Q=qv.data_ptr(), K=kv.data_ptr(), V=vv.data_ptr(),
+                    O=o.data_ptr(), softmax_lse=lse.data_ptr(),
+                    softmax_lse_accum=0, o_accum=0, batch=1,
+                    seqlen_q=S, seqlen_k=S,
+                    num_heads_q=nh, num_heads_kv=nh, head_dim=hd,
+                    q_strides=(qv.stride(0), qv.stride(1), qv.stride(2)),
+                    k_strides=(kv.stride(0), kv.stride(1), kv.stride(2)),
+                    v_strides=(vv.stride(0), vv.stride(1), vv.stride(2)),
+                    o_strides=(o.stride(0), o.stride(1), o.stride(2)),
+                    softmax_scale=scale, num_sms=self._num_sms, stream=stream)
+            else:
+                # flash_rt_fa2 is not built (Thor sm_110). Patch attention is
+                # bidirectional, so plain non-causal SDPA is equivalent. The
+                # probed cuDNN backend is ~2.3x the flash backend at this
+                # shape; fall back to the default dispatcher when the probe
+                # failed.
+                ctx = (self._vit_sdpa_ctx() if self._vit_sdpa_ctx is not None
+                       else contextlib.nullcontext())
+                with ctx:
+                    oh = torch.nn.functional.scaled_dot_product_attention(
+                        qv.transpose(1, 2), kv.transpose(1, 2),
+                        vv.transpose(1, 2),
+                        attn_mask=None, is_causal=False, scale=scale)
+                o.copy_(oh.transpose(1, 2))
             # proj input is the attention output (not a norm/gelu), so its
             # quant cannot be fused upstream; the proj bias rides the residual.
             if blk['proj'][0] is not None:

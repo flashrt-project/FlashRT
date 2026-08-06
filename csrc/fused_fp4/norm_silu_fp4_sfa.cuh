@@ -18,6 +18,11 @@ namespace fused_fp4 {
 
 // F2: rms_norm → fp4 packed + SFA tile-interleaved.
 // x [S, D] fp16 → packed [S, D/2] uint8 + sfa (CUTLASS SFA layout, is_sfb=false)
+// F2 + AWQ: rms_norm(x) * inv_s[c] → fp4 + SFA.
+void rms_norm_mul_fp4_sfa_fp16(
+    const __half* x, const __half* inv_s, uint8_t* packed, uint8_t* sfa,
+    int seq_len, int dim, cudaStream_t stream);
+
 void rms_norm_fp4_sfa_fp16(
     const __half* x, uint8_t* packed, uint8_t* sfa,
     int seq_len, int dim, cudaStream_t stream);
@@ -36,6 +41,33 @@ void residual_add_rms_norm_fp4_sfa_v2_fp16(
     uint8_t* packed, uint8_t* sfa,
     int seq_len, int dim, cudaStream_t stream);
 
+// Pi0.5 decoder C1: AdaRMSNorm(x, style) -> FP4 + SFA and fp16 gate.
+// style is [S, 3D] with scale, shift, gate contiguous along the last axis.
+void pi05_adarms_fp4_sfa_fp16(
+    const __half* x, const __half* style,
+    uint8_t* packed, uint8_t* sfa, __half* gate,
+    int seq_len, int dim, cudaStream_t stream);
+
+// Pi0.5 decoder C4->C5 / C7->C1: residual += x * prev_gate, then
+// AdaRMSNorm(residual, style) -> FP4 + SFA and the next fp16 gate.
+void pi05_gate_res_adarms_fp4_sfa_fp16(
+    const __half* x, const __half* prev_gate, __half* residual,
+    const __half* style, uint8_t* packed, uint8_t* sfa, __half* gate,
+    int seq_len, int dim, cudaStream_t stream);
+
+// Same Pi0.5 fused preprocessing with native SM110 round-to-nearest-even
+// E2M1x2 output conversion. RMS, fp16 rounding, SFA, residual, and gate
+// semantics are unchanged.
+void pi05_adarms_fp4_sfa_native_fp16(
+    const __half* x, const __half* style,
+    uint8_t* packed, uint8_t* sfa, __half* gate,
+    int seq_len, int dim, cudaStream_t stream);
+
+void pi05_gate_res_adarms_fp4_sfa_native_fp16(
+    const __half* x, const __half* prev_gate, __half* residual,
+    const __half* style, uint8_t* packed, uint8_t* sfa, __half* gate,
+    int seq_len, int dim, cudaStream_t stream);
+
 // F4: gate_silu_mul_merged(merged [S, 2H]) → hid [S, H] → fp4 packed + SFA.
 //     GELU(gate) * up, where merged = [gate || up] along dim 1.
 void gate_silu_mul_fp4_sfa_fp16(
@@ -45,6 +77,14 @@ void gate_silu_mul_fp4_sfa_fp16(
 // F4 v2: same semantics as F4, streamlined 1-thread-per-NVFP4-block layout
 // (no shared memory, no syncthreads). Typically ~1.3-1.5x faster at H=8192.
 void gate_silu_mul_fp4_sfa_v2_fp16(
+    const __half* merged, uint8_t* packed, uint8_t* sfa,
+    int seq_len, int half_dim, cudaStream_t stream);
+
+// Vectorized bit-exact variant of gate_silu_mul_fp4_sfa_v2_fp16 (16B loads,
+// 8B packed stores). Returns nonzero without launching on unaligned
+// buffers; callers fall back to the v2 kernel. Implemented in
+// silu_mul_fp4_sfa_vec.cu.
+int gate_silu_mul_fp4_sfa_vec_fp16(
     const __half* merged, uint8_t* packed, uint8_t* sfa,
     int seq_len, int half_dim, cudaStream_t stream);
 

@@ -1,6 +1,6 @@
 """P8 validation: AWQ in-place requant skips graph recapture.
 
-Loads Pi05TorchFrontendThorFP4 with use_awq=True full-18 layers, runs the
+Loads Pi05TorchFrontendThorFP4 with use_awq=True across all 17 live layers, runs the
 AWQ recalibration path (which now updates packed/sfb buffers in place),
 then compares cos vs the pytorch fp32 reference and the FP8 prod canary.
 
@@ -38,7 +38,7 @@ def main():
         os.environ.get("FLASH_RT_PI05_CKPT", "/workspace/pytorch_checkpoints/pi05_libero_converted"),
         num_views=2, autotune=3,
         use_fp4_encoder_ffn=True,
-        fp4_layers=tuple(range(18)),
+        fp4_layers=tuple(range(17)),
         use_awq=True,
         awq_alpha=0.5,
     )

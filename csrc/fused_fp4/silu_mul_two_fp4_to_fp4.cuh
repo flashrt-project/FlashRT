@@ -34,5 +34,23 @@ void silu_mul_two_mul_fp4_to_fp4(
     uint8_t* out_packed, uint8_t* out_sfa,
     int seq_len, int H, cudaStream_t stream);
 
+// Explicit LUT implementation of the AWQ combiner. The LUT contains the
+// exact device-computed GELU value for each (UE4M3 scale byte, FP4 code).
+void silu_mul_two_mul_fp4_to_fp4_lut(
+    const uint8_t* gate_packed, const uint8_t* gate_sfa,
+    const uint8_t* up_packed,   const uint8_t* up_sfa,
+    const __half*  inv_s,
+    uint8_t* out_packed, uint8_t* out_sfa,
+    int seq_len, int H, cudaStream_t stream);
+
+// Explicit SM110 native E2M1 conversion experiment. Gate evaluation is the
+// same LUT path; input decode and output encode use CUDA FP4 instructions.
+void silu_mul_two_mul_fp4_to_fp4_lut_native(
+    const uint8_t* gate_packed, const uint8_t* gate_sfa,
+    const uint8_t* up_packed,   const uint8_t* up_sfa,
+    const __half*  inv_s,
+    uint8_t* out_packed, uint8_t* out_sfa,
+    int seq_len, int H, cudaStream_t stream);
+
 }  // namespace fused_fp4
 }  // namespace flash_rt

@@ -22,8 +22,17 @@ namespace gemv_m1_sm89 {
 
 namespace {
 
+// minBlocks=8 only fits blocks of <=192 threads: 8 x 256 exceeds the 1536
+// threads/SM cap on sm_87/89/110/120/121, so ptxas discards the whole hint.
+// Clamp it to what the arch can hold, keeping the honored W=4 hint intact.
+constexpr int kMaxThreadsPerSM = 1536;
+template <int W>
+constexpr int kMinBlocks = (kMaxThreadsPerSM / (W * 32)) < 8
+                               ? (kMaxThreadsPerSM / (W * 32))
+                               : 8;
+
 template <int WARPS_PER_BLOCK>
-__global__ __launch_bounds__(WARPS_PER_BLOCK * 32, 8)
+__global__ __launch_bounds__(WARPS_PER_BLOCK * 32, kMinBlocks<WARPS_PER_BLOCK>)
 void gemv_fp8_block128_m1_kernel(
     const __nv_fp8_e4m3* __restrict__ A,   // [K]
     const __nv_fp8_e4m3* __restrict__ B,   // [N, K]
@@ -91,7 +100,7 @@ int launch_block128_(const void* A, const void* B, void* D,
 // BF16-input variant: skips activation FP8 quantization.
 // A is BF16, B is FP8 with block-128 weight scale. No act_scale needed.
 template <int WARPS_PER_BLOCK>
-__global__ __launch_bounds__(WARPS_PER_BLOCK * 32, 8)
+__global__ __launch_bounds__(WARPS_PER_BLOCK * 32, kMinBlocks<WARPS_PER_BLOCK>)
 void gemv_fp8_block128_m1_bf16in_kernel(
     const __nv_bfloat16* __restrict__ A,   // [K] BF16
     const __nv_fp8_e4m3* __restrict__ B,   // [N, K] FP8

@@ -197,6 +197,10 @@ def main():
                     help="comma-separated traj:step pairs")
     ap.add_argument("--seed", type=int, default=0,
                     help="deterministic noise seed (re-applied per sample)")
+    ap.add_argument("--views", type=int, default=None,
+                    help="keep only the first N camera views of the "
+                         "embodiment's video modality (default: all). Use "
+                         "1 to capture a single-camera fixture.")
     ap.add_argument("--out", required=True,
                     help="output .pt path (list of aux dicts)")
     args = ap.parse_args()
@@ -224,6 +228,18 @@ def main():
         embodiment_tag=EmbodimentTag.resolve(args.tag),
         model_path=ckpt, device="cuda:0",
     )
+    if args.views is not None:
+        # Restrict the video modality to the first N camera keys. Both the
+        # policy transforms and the episode loader must agree, so trim the
+        # shared ModalityConfig before the loader is built.
+        vid = policy.modality_configs["video"]
+        if args.views < 1 or args.views > len(vid.modality_keys):
+            raise ValueError(
+                f"--views must be in [1, {len(vid.modality_keys)}] for tag "
+                f"{args.tag}")
+        vid.modality_keys = list(vid.modality_keys[:args.views])
+        print(f"views:   {vid.modality_keys}")
+
     print("loading dataset ...", flush=True)
     loader = LeRobotEpisodeLoader(
         dataset_path=args.dataset,
@@ -259,6 +275,7 @@ def main():
         entry["_meta"] = {
             "traj": traj_idx, "step": step_idx, "seed": args.seed,
             "ckpt": ckpt, "tag": args.tag,
+            "video_keys": list(policy.modality_configs["video"].modality_keys),
         }
         for k, v in entry.items():
             if hasattr(v, "shape"):

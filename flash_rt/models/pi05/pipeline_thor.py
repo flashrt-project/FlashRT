@@ -249,6 +249,246 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
 
 
 # ══════════════════════════════════════════════════════════════════
+# Decoder NVFP4 path (Thor SM110, exact Pi0.5 business shape)
+# ══════════════════════════════════════════════════════════════════
+
+def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
+                        attn=None, rtc_prefix_len: int = 0):
+    """Pi0.5 action-expert decoder with all four projections in NVFP4.
+
+    This is an explicit Thor-only path. It accepts only the production Pi0.5
+    decoder shape and raises on any missing buffer, weight, or failed CUTLASS
+    launch; it never routes back to FP8.
+    """
+    S = int(dims['S'])
+    D = int(dims['D'])
+    H = int(dims['H'])
+    NH = int(dims['NH'])
+    HD = int(dims['HD'])
+    steps = int(dims['steps'])
+    layers = int(dims['layers'])
+    enc_seq = int(dims['enc_seq'])
+    total_keys = int(dims['total_keys'])
+    shape = (S, D, H, NH, HD, steps, layers)
+    expected = (10, 1024, 4096, 8, 256, 10, 18)
+    if shape != expected:
+        raise ValueError(
+            f"Pi0.5 Thor decoder FP4 requires shape {expected}, got {shape}")
+    fixed_shape = bool(dims.get('fixed_shape', False))
+    if fixed_shape and attn is None:
+        raise ValueError("Pi0.5 Thor fixed_shape decoder requires attn backend")
+
+    variants = tuple(int(v) for v in dims['fp4_variants'])
+    if len(variants) != 4 or any(v < 0 for v in variants):
+        raise ValueError(
+            "Pi0.5 Thor decoder FP4 requires four non-negative GEMM variants")
+    variant_qkv, variant_o, variant_gu, variant_down = variants
+    weight_format = str(dims.get('weight_format', 'nvfp4'))
+    act_format = str(dims.get('act_format', 'nvfp4'))
+    rht = 1 if dims.get('rht') else 0
+    fused_geglu = bool(dims.get('fused_geglu')) and weight_format == 'nvfp4'
+    act_e0m3 = act_format == 'e0m3'
+    if act_format not in ('nvfp4', 'e0m3'):
+        raise ValueError(
+            f"Pi0.5 Thor decoder FP4 unknown act_format {act_format!r}")
+    if (act_e0m3 or rht) and weight_format != 'e0m3':
+        raise ValueError(
+            "Pi0.5 Thor decoder FP4 E0M3 activations/RHT require "
+            "weight_format='e0m3'")
+    if weight_format == 'e0m3':
+        # Uniform-INT4 weights: route every projection through the
+        # runtime-idesc GEMM (fixed v10 tile); the variant index is unused.
+        a_fmt = 0 if act_e0m3 else 1
+        def dec_gemm(variant, *args):
+            return fvk_fp4.cutlass_fp4_gemm_e0m3w(*args, a_format=a_fmt)
+    elif weight_format == 'nvfp4':
+        dec_gemm = fvk_fp4.cutlass_fp4_gemm_variant
+    else:
+        raise ValueError(
+            f"Pi0.5 Thor decoder FP4 unknown weight_format {weight_format!r}")
+    for name in ('qw_fp4', 'qw_sfb', 'ow_fp4', 'ow_sfb',
+                 'gw_fp4', 'gw_sfb', 'dw_fp4', 'dw_sfb'):
+        if len(weights[name]) != layers:
+            raise ValueError(
+                f"Pi0.5 Thor decoder FP4 requires {layers} {name} pointers, "
+                f"got {len(weights[name])}")
+
+    D3 = 3 * D
+    Q_dim = NH * HD
+    K_dim = HD
+    attn_scale = 1.0 / math.sqrt(float(HD))
+
+    noise = bufs['noise']
+    x = bufs['x']
+    xn = bufs['xn']
+    gate = bufs['gate']
+    qkv = bufs['qkv']
+    logits = bufs['logits']
+    attn_out = bufs['attn_out']
+    fg = bufs['fg']
+    action_f32 = bufs.get('action_f32')
+    xn_fp4 = bufs['xn_fp4']
+    xn_sfa = bufs['xn_sfa']
+    ctx_fp4 = bufs['ctx_fp4']
+    ctx_sfa = bufs['ctx_sfa']
+    hid_fp4 = bufs['hid_fp4']
+    hid_sfa = bufs['hid_sfa']
+
+    ain_w = weights['ain_w']
+    ain_b = weights['ain_b']
+    sa = weights['sa']
+    Kc = weights['Kc']
+    Vc = weights['Vc']
+    sf = weights['sf']
+    aow = weights['aow']
+    aob = weights['aob']
+    aob_dt = weights.get('aob_dt')
+    dt = weights.get('dt')
+    fs = weights['fs']
+    rope = weights['rope']
+    rtc_prefix_len = int(rtc_prefix_len or 0)
+
+    for s in range(steps):
+        _copy_rtc_prefix(bufs, dims, stream, rtc_prefix_len)
+        fvk.gmm_fp16(ctx, noise, ain_w, x, S, D, 32, 0.0, stream)
+        fvk.add_bias_fp16(x, ain_b, S, D, stream)
+
+        for l in range(layers):
+            si = (s * layers + l) * S * D3
+            sa_ptr = sa + si * 2
+            sf_ptr = sf + si * 2
+
+            if l == 0:
+                if act_e0m3:
+                    fvk_fp4.pi05_adarms_e0m3_sfa_fp16(
+                        x, sa_ptr, xn_fp4, xn_sfa, gate, S, D, rht, stream)
+                else:
+                    fvk_fp4.pi05_adarms_fp4_sfa_native_fp16(
+                        x, sa_ptr, xn_fp4, xn_sfa, gate, S, D, stream)
+
+            rc = dec_gemm(
+                variant_qkv, xn_fp4, xn_sfa,
+                weights['qw_fp4'][l], weights['qw_sfb'][l], qkv,
+                S, 2560, D, 1.0, 0.0, stream)
+            if rc != 0:
+                raise RuntimeError(
+                    f"Pi0.5 decoder FP4 qkv layer {l} failed rc={rc}")
+
+            if fixed_shape:
+                kv_offset = l * total_keys * HD
+                fvk.qkv_split_rope_kvcache_fp16_devpos(
+                    qkv, rope, attn_out, Kc, Vc, weights['dec_devpos'],
+                    S, Q_dim, K_dim, HD, 2560, kv_offset, HD, stream)
+            else:
+                kv_offset = l * total_keys * HD + enc_seq * HD
+                rc = fvk.qkv_split_rope_kvcache_fp16_vec(
+                    qkv, rope, attn_out, Kc, Vc,
+                    S, Q_dim, K_dim, HD, 2560, kv_offset, HD, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 qkv split layer {l} failed "
+                        f"rc={rc}")
+
+            if attn is not None:
+                attn.run("decoder", l, q_seq=S, kv_seq=total_keys,
+                         stream=stream)
+            else:
+                K_ptr = Kc + l * total_keys * HD * 2
+                V_ptr = Vc + l * total_keys * HD * 2
+                fvk.attention_qkv_fp16(
+                    ctx, attn_out, K_ptr, V_ptr, logits, attn_out,
+                    S, total_keys, NH, HD, attn_scale, stream)
+
+            if act_e0m3:
+                rc = fvk_fp4.quantize_e0m3_dynamic_sfa_fp16_vec(
+                    attn_out, ctx_fp4, ctx_sfa, S, NH * HD, False, rht,
+                    stream)
+            else:
+                rc = fvk_fp4.quantize_fp4_dynamic_sfa_fp16_vec(
+                    attn_out, ctx_fp4, ctx_sfa, S, NH * HD, False, stream)
+            if rc != 0:
+                raise RuntimeError(
+                    f"Pi0.5 decoder FP4 O activation layer {l} failed rc={rc}")
+            rc = dec_gemm(
+                variant_o, ctx_fp4, ctx_sfa,
+                weights['ow_fp4'][l], weights['ow_sfb'][l], fg,
+                S, D, NH * HD, 1.0, 0.0, stream)
+            if rc != 0:
+                raise RuntimeError(
+                    f"Pi0.5 decoder FP4 O layer {l} failed rc={rc}")
+
+            if act_e0m3:
+                fvk_fp4.pi05_gate_res_adarms_e0m3_sfa_fp16(
+                    fg, gate, x, sf_ptr, xn_fp4, xn_sfa, gate, S, D, rht,
+                    stream)
+            else:
+                fvk_fp4.pi05_gate_res_adarms_fp4_sfa_native_fp16(
+                    fg, gate, x, sf_ptr, xn_fp4, xn_sfa, gate, S, D, stream)
+            if fused_geglu and not act_e0m3:
+                # One interleaved GeGLU GEMM: the epilogue computes
+                # gelu(gate)*up per column pair and writes the Down input
+                # (hid_fp4/hid_sfa) directly; the gate_up fp16 output and
+                # the GeGLU-quantize kernel disappear.
+                rc = fvk_fp4.cutlass_fp4_gemm_geglu_il_hw_v10(
+                    xn_fp4, xn_sfa,
+                    weights['gwil_fp4'][l], weights['gwil_sfb'][l],
+                    weights['gu_dummy'], hid_fp4, hid_sfa,
+                    S, H * 2, D, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder fused GeGLU layer {l} failed "
+                        f"rc={rc}")
+            else:
+                rc = dec_gemm(
+                    variant_gu, xn_fp4, xn_sfa,
+                    weights['gw_fp4'][l], weights['gw_sfb'][l], fg,
+                    S, H * 2, D, 1.0, 0.0, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 gate_up layer {l} failed "
+                        f"rc={rc}")
+
+                if act_e0m3:
+                    rc = fvk_fp4.gate_geglu_e0m3_sfa_vec_fp16(
+                        fg, hid_fp4, hid_sfa, S, H, rht, stream)
+                else:
+                    rc = fvk_fp4.gate_geglu_fp4_sfa_vec_fp16(
+                        fg, hid_fp4, hid_sfa, S, H, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 GeGLU layer {l} failed rc={rc}")
+            rc = dec_gemm(
+                variant_down, hid_fp4, hid_sfa,
+                weights['dw_fp4'][l], weights['dw_sfb'][l], fg,
+                S, D, H, 1.0, 0.0, stream)
+            if rc != 0:
+                raise RuntimeError(
+                    f"Pi0.5 decoder FP4 down layer {l} failed rc={rc}")
+
+            if l < layers - 1:
+                si_next = (s * layers + l + 1) * S * D3
+                sa_next_ptr = sa + si_next * 2
+                if act_e0m3:
+                    fvk_fp4.pi05_gate_res_adarms_e0m3_sfa_fp16(
+                        fg, gate, x, sa_next_ptr,
+                        xn_fp4, xn_sfa, gate, S, D, rht, stream)
+                else:
+                    fvk_fp4.pi05_gate_res_adarms_fp4_sfa_native_fp16(
+                        fg, gate, x, sa_next_ptr,
+                        xn_fp4, xn_sfa, gate, S, D, stream)
+            else:
+                fvk.gate_res_fp16(fg, gate, x, S * D, stream)
+
+        fi = s * S * D3
+        fs_ptr = fs + fi * 2
+        fvk.adarms_fp16(x, fs_ptr, xn, gate, S, D, stream)
+        _action_update_fp16(
+            ctx, fvk, xn, aow, aob, noise, S, 32, D,
+            stream, dt, action_f32, aob_dt)
+        _copy_rtc_prefix(bufs, dims, stream, rtc_prefix_len)
+
+
+# ══════════════════════════════════════════════════════════════════
 # FP16 decoder path (no quantization, FP16 weights, baseline only)
 # ══════════════════════════════════════════════════════════════════
 

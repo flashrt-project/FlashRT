@@ -91,7 +91,9 @@ def quant_weight_nvfp4_from_cb(w_cb: CudaBuffer, N: int, K: int) -> dict:
 
     packed_cb = CudaBuffer.device_empty(N * (K // 2), np.uint8)
     sfb_bytes = fvk_fp4.sfa_size_bytes(N, K, True)
-    sfb_cb    = CudaBuffer.device_empty(sfb_bytes, np.uint8)
+    # Zero-init: SF layout padding entries are never written by the
+    # quantize kernels and must stay inert (see fp4_utils.quant_weight_nvfp4).
+    sfb_cb    = CudaBuffer.device_zeros(sfb_bytes, np.uint8)
 
     rc = fvk_fp4.quantize_fp4_dynamic_sfa_fp16(
         int(w_cb.ptr.value),
@@ -155,7 +157,8 @@ class FP4ActScratchCB:
         self.K = int(K)
         self.packed_cb = CudaBuffer.device_empty(max_M * (K // 2), np.uint8)
         sfa_bytes = fvk_fp4.sfa_size_bytes(max_M, K, False)
-        self.sfa_cb = CudaBuffer.device_empty(sfa_bytes, np.uint8)
+        # Zero-init: SF layout padding must stay inert (see fp4_utils).
+        self.sfa_cb = CudaBuffer.device_zeros(sfa_bytes, np.uint8)
         self.packed = _PtrShim(self.packed_cb)
         self.sfa    = _PtrShim(self.sfa_cb)
         self.packed_ptr = int(self.packed_cb.ptr.value)
@@ -196,7 +199,8 @@ class FP4BufferCB:
         self.N = int(N)
         self.packed_cb = CudaBuffer.device_empty(M * (N // 2), np.uint8)
         sfa_bytes = fvk_fp4.sfa_size_bytes(M, N, False)
-        self.sfa_cb = CudaBuffer.device_empty(sfa_bytes, np.uint8)
+        # Zero-init: SF layout padding must stay inert (see fp4_utils).
+        self.sfa_cb = CudaBuffer.device_zeros(sfa_bytes, np.uint8)
         self.packed = _PtrShim(self.packed_cb)
         self.sfa    = _PtrShim(self.sfa_cb)
         self.packed_ptr = int(self.packed_cb.ptr.value)

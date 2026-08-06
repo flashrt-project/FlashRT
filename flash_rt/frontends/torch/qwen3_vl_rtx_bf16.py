@@ -42,6 +42,17 @@ _QWEN3_VL_RTX_BF16_CORE_FNS = (
     'qwen3_k_norm_rope_kvwrite_prefill_bf16',
 )
 
+# Decode weight-only quantization tiers, in weight bytes/element:
+#   bf16 2.0 | int8, w8 1.125 | int4, w4 0.625
+# int8/int4 dequantize via a hardware I2F and are the tiers that pay off on
+# Ampere; w8/w4 (e4m3/e2m1) need the FP8 conversion sm_87 lacks, so there they
+# turn ALU-bound. Prefill always uses the bf16 weights.
+_WEIGHT_MODES = ('bf16', 'int8', 'int4', 'w8', 'w4')
+
+# The int8/int4 GEMVs are compiled per-K, for the Qwen3-VL-2B shapes only.
+_K_TEMPLATED_MODES = ('int8', 'int4')
+_TEMPLATED_K = (2048, 6144)
+
 
 def _require_qwen3_vl_rtx_bf16_kernels():
     try:
@@ -75,12 +86,39 @@ class Qwen3VlTorchFrontendRtxBF16:
     This is the BF16 precision variant for the RTX-family backend. The first
     validated target is Jetson Orin SM87, where the FP8/NVFP4 Qwen3-VL paths
     are not available.
+
+    Two optional knobs trade decode precision for bandwidth. Both default to
+    ``'bf16'``, and both affect only the M=1 decode path — prefill always runs
+    the BF16 weights and BF16 KV:
+
+    ``weight_mode``
+        ``'bf16'`` | ``'int8'`` | ``'int4'`` | ``'w8'`` | ``'w4'`` — weight-only
+        quantization of the language linears and lm_head. On Ampere use
+        ``int8``/``int4``: they dequantize via a hardware I2F, whereas the
+        e4m3/e2m1 tiers (``w8``/``w4``) need an FP8 conversion sm_87 lacks and
+        become ALU-bound. ``int8``/``int4`` require the Qwen3-VL-2B dimensions.
+
+    ``kv_mode``
+        ``'bf16'`` | ``'int8'`` — KV cache precision for decode attention.
     """
 
     def __init__(self, checkpoint_path: str, *, device: str = 'cuda:0',
                  max_seq: int = 2048, max_pixels: int | None = None,
                  max_prefill_graphs: int | None = None,
-                 max_decode_graphs: int | None = None) -> None:
+                 max_decode_graphs: int | None = None,
+                 weight_mode: str = 'bf16',
+                 kv_mode: str = 'bf16') -> None:
+        if weight_mode not in _WEIGHT_MODES:
+            raise ValueError(
+                f'weight_mode must be one of {_WEIGHT_MODES}, '
+                f'got {weight_mode!r}')
+        if kv_mode not in ('bf16', 'int8'):
+            raise ValueError(
+                f"kv_mode must be 'bf16' or 'int8', got {kv_mode!r}")
+        self._wq_mode = weight_mode
+        self._use_wq = weight_mode != 'bf16'
+        self._kv_mode = kv_mode
+
         import torch
         from transformers import AutoProcessor
 
@@ -110,6 +148,10 @@ class Qwen3VlTorchFrontendRtxBF16:
         self.max_decode_graphs = int(max_decode_graphs)
         self._decode_graphs: collections.OrderedDict[tuple[int, int], Any] = (
             collections.OrderedDict())
+        # Decode graphs that also capture the argmax and the token feedback, so
+        # a replay needs no host round-trip. Keyed the same way as above.
+        self._decode_da_graphs: collections.OrderedDict[
+            tuple[int, int], Any] = collections.OrderedDict()
         self._prefill_graphs: collections.OrderedDict[
             tuple[int, int, int, int], Any] = collections.OrderedDict()
         self._pg_buffers: collections.OrderedDict[
@@ -177,6 +219,17 @@ class Qwen3VlTorchFrontendRtxBF16:
                 'longest_edge': int(max_pixels),
             }
 
+        if self._wq_mode in _K_TEMPLATED_MODES:
+            bad = [k for k in (self._cfg['hidden_size'],
+                               self._cfg['intermediate'])
+                   if k not in _TEMPLATED_K]
+            if bad:
+                raise RuntimeError(
+                    f'weight_mode={self._wq_mode!r} uses a K-templated decode '
+                    f'GEMV built only for K in {_TEMPLATED_K} (the Qwen3-VL-2B '
+                    f'shapes); this checkpoint needs K={sorted(set(bad))}. Use '
+                    "weight_mode='w8'/'w4' or 'bf16' instead.")
+
         self._weights = extract_weights_qwen3_vl_bf16(
             self.checkpoint_path, device=self.device)
         assert_extraction_invariants_qwen3_vl_bf16(self._weights)
@@ -188,9 +241,12 @@ class Qwen3VlTorchFrontendRtxBF16:
             num_q_heads=self._cfg['num_q_heads'],
             num_kv_heads=self._cfg['num_kv_heads'],
             head_dim=self._cfg['head_dim'],
-            device=self.device)
+            device=self.device,
+            use_int8_kv=(self._kv_mode == 'int8'))
         self._alloc_buffers()
         self._build_mrope_caches()
+        if self._use_wq:
+            self._load_wq_weights()
 
     _PG_KEYS = ('input_ids', 'pixel_values', 'pos_embeds',
                 'vcos', 'vsin', 'mcos', 'msin')
@@ -235,6 +291,10 @@ class Qwen3VlTorchFrontendRtxBF16:
         self._norm_buf = torch.empty(S, H, device=d, dtype=bf16)
         self._logits = torch.empty(1, cfg['vocab_size'], device=d, dtype=bf16)
         self._static_token_id = torch.zeros(1, 1, device=d, dtype=torch.long)
+        # Generated-token ring for the device-argmax decode graphs: each graph
+        # bakes in a write to one slot, so the host only reads slots back for
+        # the EOS check instead of syncing every token.
+        self._out_ids_buf = torch.zeros(S, device=d, dtype=torch.long)
         self._graph_stream = torch.cuda.Stream(device=d)
 
     def _build_mrope_caches(self) -> None:
@@ -277,7 +337,8 @@ class Qwen3VlTorchFrontendRtxBF16:
 
     def clear_graphs(self) -> None:
         """Drop captured Qwen3-VL BF16 prefill/decode CUDA Graphs."""
-        for attr in ('_prefill_graphs', '_decode_graphs', '_pg_buffers'):
+        for attr in ('_prefill_graphs', '_decode_graphs', '_decode_da_graphs',
+                     '_pg_buffers'):
             cache = getattr(self, attr, None)
             if cache:
                 cache.clear()
@@ -296,6 +357,11 @@ class Qwen3VlTorchFrontendRtxBF16:
                 'max_graphs': self.max_decode_graphs,
                 'graph_count': len(self._decode_graphs),
                 'graph_keys': list(self._decode_graphs.keys()),
+            },
+            'decode_device_argmax': {
+                'max_graphs': self.max_decode_graphs,
+                'graph_count': len(self._decode_da_graphs),
+                'graph_keys': list(self._decode_da_graphs.keys()),
             },
         }
 
@@ -367,6 +433,89 @@ class Qwen3VlTorchFrontendRtxBF16:
             'mrope_max': int(pos_ids.max()),
         }
         self._prompt['pg_key'] = self._stage_prefill_inputs(n_patch, S, sg['span'])
+
+    def _quant_wq(self, w):
+        """bf16 [N, K] -> (packed uint8, bf16 per-16 block scales [N, K/16]).
+
+        Weight-only: the GEMV dequantizes to bf16 in-kernel, so no FP8/FP4
+        tensor core is involved and this is safe on Ampere.
+        """
+        import torch
+
+        N, K = w.shape
+        g = w.float().view(N, K // 16, 16)
+        if self._wq_mode == 'int8':
+            scale = (g.abs().amax(2, keepdim=True) / 127.0).clamp(min=1e-8)
+            q = (g / scale).round().clamp_(-127, 127).to(torch.int8).view(N, K)
+            packed = q.view(torch.uint8).contiguous()
+        elif self._wq_mode == 'int4':
+            scale = (g.abs().amax(2, keepdim=True) / 7.0).clamp(min=1e-8)
+            q = (g / scale).round().clamp_(-7, 7).to(torch.int32).view(N, K)
+            lo = q[:, 0::2] & 0xF
+            hi = q[:, 1::2] & 0xF
+            packed = (lo | (hi << 4)).to(torch.uint8).contiguous()
+        elif self._wq_mode == 'w8':
+            scale = (g.abs().amax(2, keepdim=True) / 448.0).clamp(min=1e-8)
+            q = (g / scale).to(torch.float8_e4m3fn).view(N, K)
+            packed = q.view(torch.uint8).contiguous()
+        else:   # 'w4' — e2m1: nearest of 8 magnitudes plus sign, 2 per byte
+            mags = torch.tensor(
+                [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=w.device)
+            scale = (g.abs().amax(2, keepdim=True) / 6.0).clamp(min=1e-8)
+            s = g / scale
+            idx = (s.abs().unsqueeze(-1)
+                   - mags.view(1, 1, 1, 8)).abs().argmin(dim=-1)
+            code = (idx | (s < 0).to(torch.int64).mul(8)).view(N, K)
+            packed = (code[:, 0::2]
+                      | (code[:, 1::2] << 4)).to(torch.uint8).contiguous()
+        scales = scale.view(N, K // 16).to(torch.bfloat16).contiguous()
+        return packed, scales
+
+    def _load_wq_weights(self) -> None:
+        """Quantize the language linears and lm_head for the decode GEMV.
+
+        Quantizes from the resident device tensors the weight loader kept under
+        its '_t' keys, so sharded checkpoints work without re-implementing the
+        loader's shard handling. The bf16 weights stay resident for prefill.
+        """
+        self._wq_gemv = {
+            'int8': 'qwen3_vl_int8_gemv_m1',
+            'int4': 'qwen3_vl_int4_gemv_m1',
+            'w8': 'qwen3_vl_w8_gemv_m1',
+            'w4': 'qwen3_vl_w4_gemv_m1',
+        }[self._wq_mode]
+        if not hasattr(self._vlk, self._wq_gemv):
+            raise RuntimeError(
+                f'weight_mode={self._wq_mode!r} requires {self._wq_gemv} in '
+                'flash_rt_qwen3_vl_kernels (rebuild with -DGPU_ARCH=87 '
+                '-DFLASHRT_BUILD_QWEN3_VL=ON)')
+        self._wq_gemv = getattr(self._vlk, self._wq_gemv)
+        # Anchors keep the packed buffers alive: captured graphs bake in their
+        # pointers.
+        self._wq_anchors: list = []
+        layers = self._weights.ptrs['layers']
+
+        def store(lw, key):
+            p, s = self._quant_wq(lw[key + '_t'])
+            self._wq_anchors += [p, s]
+            lw[key + '_wq'] = (int(p.data_ptr()), int(s.data_ptr()))
+
+        for L in range(self._cfg['num_hidden_layers']):
+            for key in ('qkv_proj', 'o_proj', 'gate_up', 'mlp_down'):
+                store(layers[L], key)
+
+        p, s = self._quant_wq(self._weights.ptrs['lm_head_t'])
+        self._wq_anchors += [p, s]
+        self._lmhead_wq = (int(p.data_ptr()), int(s.data_ptr()))
+
+    def _decode_gemv(self, lw, key, x, out, N: int, K: int, stream) -> None:
+        """M=1 decode projection: quantized GEMV when enabled, else bf16."""
+        wq = lw.get(key + '_wq') if self._use_wq else None
+        if wq is not None:
+            self._wq_gemv(x.data_ptr(), wq[0], wq[1], out.data_ptr(),
+                          N, K, stream)
+        else:
+            self._bf16_gemm(x, int(lw[key + '_w']), out, 1, N, K, stream)
 
     def _bf16_gemm(self, x, weight_ptr: int, out, M: int, N: int, K: int,
                    stream: int) -> None:
@@ -476,9 +625,8 @@ class Qwen3VlTorchFrontendRtxBF16:
             h2.data_ptr(), int(lw['input_norm_w']), xn.data_ptr(),
             1, H, eps, stream)
         qkv = self._qkv_out[:1]
-        self._bf16_gemm(
-            xn, int(lw['qkv_proj_w']), qkv, 1, int(lw['qkv_proj_N']), H,
-            stream)
+        self._decode_gemv(
+            lw, 'qkv_proj', xn, qkv, int(lw['qkv_proj_N']), H, stream)
         kv_layer_stride = self._attn.kv_layer_stride_bytes
         kv_row_stride = self._attn.kv_row_stride_bytes
         kv_slot_off = L * kv_layer_stride + cur_pos * kv_row_stride
@@ -492,32 +640,30 @@ class Qwen3VlTorchFrontendRtxBF16:
             self._attn.K_cache.data_ptr() + kv_slot_off,
             self._attn.V_cache.data_ptr() + kv_slot_off,
             NKV, eps, stream)
+        # Mirror the rows just written; no-op when kv_mode='bf16'.
+        self._attn.quantize_kv_rows(L, cur_pos, stream)
         self._attn.run(
             'full', layer_idx=L, q_seq=1, kv_seq=cur_pos + 1,
             stream=stream, causal=True)
         attn_2d = self._attn.O_buf[:, :1].reshape(1, H).contiguous()
         attn_out = self._tmp_hidden[:1]
-        self._bf16_gemm(
-            attn_2d, int(lw['o_proj_w']), attn_out, 1, H, H, stream)
+        self._decode_gemv(lw, 'o_proj', attn_2d, attn_out, H, H, stream)
 
         xn2 = self._norm_buf[:1]
         fvk.residual_add_rms_norm(
             h.data_ptr(), attn_out.view(1, 1, H).data_ptr(),
             int(lw['post_attn_norm_w']), xn2.data_ptr(), 1, H, eps, stream)
         gate_up = self._gate_up[:1]
-        self._bf16_gemm(
-            xn2, int(lw['gate_up_w']), gate_up, 1, int(lw['gate_up_N']), H,
-            stream)
-        gate = self._gate_tmp[:1]
-        up = self._up_tmp[:1]
-        gate.copy_(gate_up[:, :I])
-        up.copy_(gate_up[:, I:])
+        self._decode_gemv(
+            lw, 'gate_up', xn2, gate_up, int(lw['gate_up_N']), H, stream)
+        # gate_up is one contiguous [1, 2I] row, so hand silu_mul the two
+        # halves by pointer offset rather than copying them out.
+        gu = gate_up.view(-1)
         fvk.silu_mul_qwen36_bf16(
-            gate.data_ptr(), up.data_ptr(), self._mlp_act[:1].data_ptr(),
-            I, stream)
+            gu[:I].data_ptr(), gu[I:].data_ptr(),
+            self._mlp_act[:1].data_ptr(), I, stream)
         down = self._tmp_hidden[:1]
-        self._bf16_gemm(
-            self._mlp_act[:1], int(lw['mlp_down_w']), down, 1, H, I, stream)
+        self._decode_gemv(lw, 'mlp_down', self._mlp_act[:1], down, H, I, stream)
         h_out = (self._h_a if (L % 2 == 0) else self._h_b)[:, :1]
         torch.add(h, down.view(1, 1, H), out=h_out)
         return h_out
@@ -556,6 +702,10 @@ class Qwen3VlTorchFrontendRtxBF16:
                     cur[0, a:b].data_ptr(),
                     deepstack[L].to(torch.bfloat16).data_ptr(),
                     (b - a) * H, stream)
+
+        # Mirror the freshly written KV prefix into the int8 cache in one bulk
+        # pass; captured into the prefill graph, no-op when kv_mode='bf16'.
+        self._attn.quantize_kv_prefix(S, stream)
 
         x = cur.view(S, H)[S - 1:S].contiguous()
         xn = self._norm_buf[:1]
@@ -649,9 +799,16 @@ class Qwen3VlTorchFrontendRtxBF16:
             cur.view(1, H).contiguous().data_ptr(),
             int(self._weights.ptrs['final_norm_w']),
             xn.data_ptr(), 1, H, cfg['rms_norm_eps'], stream)
-        self._bf16_gemm(
-            xn, int(self._weights.ptrs['lm_head_w']), self._logits,
-            1, cfg['vocab_size'], H, stream)
+        # lm_head is the largest single decode GEMV, so it follows weight_mode
+        # too. Prefill keeps using the bf16 weights.
+        if self._use_wq:
+            self._wq_gemv(
+                xn.data_ptr(), self._lmhead_wq[0], self._lmhead_wq[1],
+                self._logits.data_ptr(), cfg['vocab_size'], H, stream)
+        else:
+            self._bf16_gemm(
+                xn, int(self._weights.ptrs['lm_head_w']), self._logits,
+                1, cfg['vocab_size'], H, stream)
         return self._logits
 
     def decode_step(self, token_id: int, *, cache_pos: int, rope_pos: int):
@@ -702,33 +859,170 @@ class Qwen3VlTorchFrontendRtxBF16:
     def warmup_decode_graphs(self, n_tokens: int) -> None:
         if self._prompt is None:
             raise RuntimeError('call set_prompt() before warmup_decode_graphs()')
+        n_tokens = int(n_tokens)
+        if n_tokens < 1:
+            raise ValueError(f'n_tokens must be >= 1, got {n_tokens}')
         base_slot = int(self._prompt['S'])
         base_rope = int(self._prompt['mrope_max']) + 1
-        for i in range(int(n_tokens)):
+        required_slots = base_slot + n_tokens
+        if required_slots > self.max_seq:
+            raise ValueError(
+                f'prompt ({base_slot} tokens) + {n_tokens} decode warmup '
+                f'steps needs {required_slots} KV slots, but max_seq='
+                f'{self.max_seq}')
+        for i in range(n_tokens):
             self._ensure_decode_graph(base_slot + i, base_rope + i)
+
+    # ── device-argmax decode ──
+    # These graphs capture the argmax and the token feedback as well as the
+    # forward, so replaying one produces the next token without the host
+    # reading logits back, running argmax and refilling the input.
+
+    def _decode_body_da(self, *, cache_pos: int, rope_pos: int, out_idx: int):
+        import torch
+
+        logits = self._decode_token_tensor(
+            self._static_token_id, cache_pos=cache_pos, rope_pos=rope_pos)
+        # argmax straight on the bf16 logits: fp32 is a superset of bf16, so
+        # the ordering — hence the argmax — is identical, and skipping the cast
+        # avoids materializing an fp32 copy of the vocab row inside the graph.
+        tok = torch.argmax(logits, dim=-1)
+        self._static_token_id.copy_(tok.view(1, 1))
+        self._out_ids_buf[out_idx].copy_(tok[0])
+        return logits
+
+    def _ensure_decode_graph_da(self, cache_pos: int, rope_pos: int,
+                                out_idx: int):
+        import torch
+
+        # out_idx is part of the key: the captured body bakes in a write to
+        # that exact ring slot. Two prompts of different lengths can otherwise
+        # reach the same (cache_pos, rope_pos) at different ring positions,
+        # since base_slot and base_rope shift together.
+        key = (int(cache_pos), int(rope_pos), int(out_idx))
+        graph = self._graph_cache_get(self._decode_da_graphs, key)
+        if graph is not None:
+            return graph
+        gs = self._graph_stream
+        gs.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(gs), torch.inference_mode():
+            for _ in range(2):
+                self._decode_body_da(
+                    cache_pos=cache_pos, rope_pos=rope_pos, out_idx=out_idx)
+        gs.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=gs), torch.inference_mode():
+            self._decode_body_da(
+                cache_pos=cache_pos, rope_pos=rope_pos, out_idx=out_idx)
+        gs.synchronize()
+        torch.cuda.current_stream().wait_stream(gs)
+        self._decode_da_graphs[key] = graph
+        self._decode_da_graphs.move_to_end(key)
+        self._trim_lru_graph_cache(
+            self._decode_da_graphs, self.max_decode_graphs)
+        return graph
+
+    def warmup_decode_da_graphs(self, n_tokens: int) -> None:
+        if self._prompt is None:
+            raise RuntimeError(
+                'call set_prompt() before warmup_decode_da_graphs()')
+        n_tokens = int(n_tokens)
+        if n_tokens < 1:
+            raise ValueError(f'n_tokens must be >= 1, got {n_tokens}')
+        base_slot = int(self._prompt['S'])
+        base_rope = int(self._prompt['mrope_max']) + 1
+        required_slots = base_slot + n_tokens - 1
+        if required_slots > self.max_seq:
+            raise ValueError(
+                f'prompt ({base_slot} tokens) + n_tokens={n_tokens} needs '
+                f'{required_slots} KV slots, but max_seq={self.max_seq}')
+        for i in range(n_tokens - 1):
+            self._ensure_decode_graph_da(base_slot + i, base_rope + i, i + 1)
 
     def generate(self, messages: list, *, max_new_tokens: int = 64,
                  use_graph: bool = True) -> str:
-        """Greedy single-image generation."""
+        """Greedy single-image generation.
+
+        With ``use_graph`` the decode loop runs entirely on the device: each
+        graph replay produces the next token and feeds it back. EOS is checked
+        from an async copy one step behind, so the host never blocks between
+        tokens, at the cost of at most one replay past EOS.
+        """
+        import torch
+
+        max_new_tokens = int(max_new_tokens)
+        if max_new_tokens < 1:
+            raise ValueError(
+                f'max_new_tokens must be >= 1, got {max_new_tokens}')
+        if use_graph:
+            if max_new_tokens - 1 > self.max_decode_graphs:
+                raise ValueError(
+                    f'max_new_tokens={max_new_tokens} exceeds the decode graph '
+                    f'cache cap ({self.max_decode_graphs}); raise '
+                    'FLASHRT_QWEN3_VL_DECODE_GRAPH_CACHE_MAX or lower '
+                    'max_new_tokens')
         self.set_prompt(messages)
-        logits = self.prefill_graph() if use_graph else self.prefill()
         p = self._prompt
         assert p is not None
         base_slot = int(p['S'])
         base_rope = int(p['mrope_max']) + 1
-        tok = int(logits[0].float().argmax())
-        out_ids = [tok]
-        for i in range(max_new_tokens - 1):
-            if tok in self._eos_token_ids:
-                break
-            if use_graph:
-                logits = self.decode_step_with_graph(
-                    tok, cache_pos=base_slot + i, rope_pos=base_rope + i)
-            else:
+        required_slots = base_slot + max_new_tokens - 1
+        if required_slots > self.max_seq:
+            raise ValueError(
+                f'prompt ({base_slot} tokens) + max_new_tokens='
+                f'{max_new_tokens} needs {required_slots} KV slots, but '
+                f'max_seq={self.max_seq}')
+        logits = self.prefill_graph() if use_graph else self.prefill()
+
+        if not use_graph:
+            tok = int(logits[0].float().argmax())
+            out_ids = [tok]
+            for i in range(max_new_tokens - 1):
+                if tok in self._eos_token_ids:
+                    break
                 logits = self.decode_step(
                     tok, cache_pos=base_slot + i, rope_pos=base_rope + i)
-            tok = int(logits[0].float().argmax())
-            out_ids.append(tok)
+                tok = int(logits[0].float().argmax())
+                out_ids.append(tok)
+        else:
+            # Seed from the prefill logits before capturing: capture runs
+            # warmup bodies whose argmax overwrites _static_token_id and
+            # _logits, so this has to be read (and cloned) first.
+            tok0 = torch.argmax(self._logits.float(), dim=-1).clone()
+            first = int(tok0)
+            if first in self._eos_token_ids:
+                # Nothing to decode. The loop below never inspects slot 0 (it
+                # only checks tokens a graph wrote), so without this an EOS
+                # straight out of prefill would replay every captured graph.
+                return ''
+            # Capture every graph up front for the same reason — capturing
+            # inside the replay loop would corrupt the token chain.
+            for i in range(max_new_tokens - 1):
+                self._ensure_decode_graph_da(
+                    base_slot + i, base_rope + i, i + 1)
+            self._static_token_id.copy_(tok0.view(1, 1))
+            self._out_ids_buf[0].copy_(tok0[0])
+            # Pinned double buffer: after each replay start an async copy of
+            # the new token and test the previous one while the GPU works.
+            tok_host = [torch.zeros(1, dtype=torch.long, pin_memory=True)
+                        for _ in range(2)]
+            events = [torch.cuda.Event(), torch.cuda.Event()]
+            n_done = 1
+            prev = -1
+            for i in range(max_new_tokens - 1):
+                self._decode_da_graphs[
+                    (base_slot + i, base_rope + i, i + 1)].replay()
+                n_done += 1
+                cur = i & 1
+                tok_host[cur].copy_(self._out_ids_buf[i + 1],
+                                    non_blocking=True)
+                events[cur].record()
+                if prev >= 0:
+                    events[prev].synchronize()
+                    if int(tok_host[prev][0]) in self._eos_token_ids:
+                        break
+                prev = cur
+            out_ids = [int(t) for t in self._out_ids_buf[:n_done].tolist()]
 
         eos = [t for t in out_ids if t in self._eos_token_ids]
         if eos:

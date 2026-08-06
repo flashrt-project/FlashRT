@@ -278,10 +278,28 @@ class ThorGrootN17AttnBackend(AttentionBackendBase):
         dtype = site_spec.extra.get("dtype", "fp16")
         is_causal = bool(site_spec.extra.get("causal", False))
 
+        # Masked-softmax tier (opt-in): the masked MHA variants softmax only
+        # the valid S_kv columns, so the full-buffer -inf pre-fill (a DRAM
+        # sweep per layer) disappears. The causal fp16 kernel already masks
+        # by position internally (including the padding columns), so its
+        # pre-fill is skipped outright.
+        masked = bool(getattr(self, "_use_masked_softmax", False))
+
         if dtype == "bf16":
             if is_causal:
                 raise ValueError(
                     f"site {site!r}: bf16 attention has no causal variant yet")
+            if masked:
+                fvk.attention_mha_bf16_masked(
+                    self._ctx_cpp[site],
+                    int(s["Q"]), K_ptr, V_ptr,
+                    int(s["logits"]), int(s["O"]),
+                    q_seq, kv_seq,
+                    site_spec.num_q_heads, site_spec.head_dim,
+                    float(s["scale"]), int(mkv),
+                    int(s.get("qkv_stride", 0)), stream,
+                )
+                return int(s["O"])
             fvk.gpu_fill_neginf_bf16(int(s["logits"]), nh * mq * mkv, stream)
             # logits buffer is allocated as (NH, max_q_seq, max_kv_seq)
             # row-major; pass the kv-axis stride so the GEMM head batching
@@ -297,9 +315,19 @@ class ThorGrootN17AttnBackend(AttentionBackendBase):
             )
             return int(s["O"])
 
-        fvk.gpu_fill_neginf_fp16(int(s["logits"]), nh * mq * mkv, stream)
+        if not masked:
+            fvk.gpu_fill_neginf_fp16(int(s["logits"]), nh * mq * mkv, stream)
         if is_causal:
             fvk.attention_mha_causal_fp16(
+                self._ctx_cpp[site],
+                int(s["Q"]), K_ptr, V_ptr,
+                int(s["logits"]), int(s["O"]),
+                q_seq, kv_seq,
+                site_spec.num_q_heads, site_spec.head_dim,
+                float(s["scale"]), stream,
+            )
+        elif masked:
+            fvk.attention_mha_fp16_masked(
                 self._ctx_cpp[site],
                 int(s["Q"]), K_ptr, V_ptr,
                 int(s["logits"]), int(s["O"]),

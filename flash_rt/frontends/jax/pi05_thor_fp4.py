@@ -21,7 +21,7 @@ Usage::
         "/path/to/checkpoint",
         num_views=2,
         use_fp4_encoder_ffn=True,    # default False → bit-identical to base
-        fp4_layers=(0, 1, ..., 17),  # 18 layers = full production preset
+        fp4_layers=(0, 1, ..., 16),  # all 17 live encoder FFN layers
         use_awq=True,
         use_p1_split_gu=True,
     )
@@ -126,6 +126,13 @@ class Pi05JaxFrontendThorFP4(Pi05JaxFrontendThor):
             state_prompt_fixed_max_len=state_prompt_fixed_max_len,
             **kwargs,
         )
+
+        invalid_layers = sorted(
+            l for l in self._fp4_layers if l < 0 or l >= self.Le - 1)
+        if invalid_layers:
+            raise ValueError(
+                "fp4_layers contains non-live encoder FFN layers "
+                f"{invalid_layers}; valid layers are [0, {self.Le - 2}]")
 
         if self._fp4_layers:
             if not _HAS_FP4:

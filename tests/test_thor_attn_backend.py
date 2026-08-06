@@ -218,6 +218,117 @@ def test_reject_extra_site():
     raise AssertionError("extra site should have been rejected")
 
 
+def test_required_fa4_unavailable_raises():
+    from flash_rt.hardware.thor import fa4_backend
+    from flash_rt.hardware.thor.attn_backend import (
+        ThorFlashAttnBackend, make_pi05_attention_spec,
+    )
+
+    siglip, encoder, decoder, _, _ = _fake_slots()
+    spec = make_pi05_attention_spec(num_views=2, enc_seq_max=600)
+    original_fwd = fa4_backend.fa4_fwd
+    original_status = fa4_backend.status
+    fa4_backend.fa4_fwd = lambda: None
+    fa4_backend.status = lambda: "missing-test-runtime"
+    try:
+        class _C: cpp = 0
+        try:
+            ThorFlashAttnBackend(
+                spec, _C(), siglip_slots=siglip, encoder_slots=encoder,
+                decoder_slots=decoder, use_fa4=True)
+        except RuntimeError as exc:
+            assert "missing-test-runtime" in str(exc), str(exc)
+        else:
+            raise AssertionError("required FA4 must not select another kernel")
+    finally:
+        fa4_backend.fa4_fwd = original_fwd
+        fa4_backend.status = original_status
+
+
+def test_required_fa4_rejects_fixed_shape():
+    from flash_rt.hardware.thor import fa4_backend
+    from flash_rt.hardware.thor.attn_backend import (
+        ThorFlashAttnBackend, make_pi05_attention_spec,
+    )
+
+    siglip, encoder, decoder, _, _ = _fake_slots()
+    spec = make_pi05_attention_spec(num_views=2, enc_seq_max=600)
+    original_fwd = fa4_backend.fa4_fwd
+    fa4_backend.fa4_fwd = lambda: object()
+    try:
+        class _C: cpp = 0
+        backend = ThorFlashAttnBackend(
+            spec, _C(), siglip_slots=siglip, encoder_slots=encoder,
+            decoder_slots=decoder, use_fa4=True)
+        try:
+            backend.set_fixed_shape(True)
+        except RuntimeError as exc:
+            assert "does not support fixed-shape" in str(exc), str(exc)
+        else:
+            raise AssertionError("FA4 fixed-shape must fail explicitly")
+    finally:
+        fa4_backend.fa4_fwd = original_fwd
+
+
+def test_fa4_writes_pipeline_owned_outputs():
+    import flash_rt.hardware.thor.attn_backend as attn_backend
+    from flash_rt.hardware.thor import fa4_backend
+    from flash_rt.hardware.thor.attn_backend import (
+        ThorFlashAttnBackend, make_pi05_attention_spec,
+    )
+
+    siglip, encoder, decoder, _, _ = _fake_slots()
+    spec = make_pi05_attention_spec(num_views=2, enc_seq_max=600)
+    original_fwd = fa4_backend.fa4_fwd
+    original_view = attn_backend._fp16_tensor_from_ptr
+    calls = []
+    views = []
+
+    class _TensorView:
+        def __init__(self, ptr, shape, strides, offset):
+            self.ptr = ptr
+            self.shape = shape
+            self.strides = strides
+            self.offset = offset
+            self.copied_from = None
+
+        def copy_(self, source):
+            self.copied_from = source
+
+    def fake_view(ptr, shape, strides=None, offset=0):
+        view = _TensorView(ptr, shape, strides, offset)
+        views.append(view)
+        return view
+
+    def fake_fwd(q, k, v, **kwargs):
+        calls.append((q, k, v, kwargs))
+        return kwargs["out"], None
+
+    fa4_backend.fa4_fwd = lambda: fake_fwd
+    attn_backend._fp16_tensor_from_ptr = fake_view
+    try:
+        class _C: cpp = 0
+        backend = ThorFlashAttnBackend(
+            spec, _C(), siglip_slots=siglip, encoder_slots=encoder,
+            decoder_slots=decoder, use_fa4=True)
+        backend._fvk = object()
+
+        assert backend.run("siglip", 0, q_seq=256) == siglip["O"]
+        assert calls[0][3]["out"].ptr == siglip["O"]
+        assert calls[0][3]["out"].shape == (2, 256, 16, 72)
+        assert calls[0][3]["pack_gqa"] is False
+
+        assert backend.run("encoder", 0, q_seq=600) == encoder["Q_O"]
+        assert calls[1][3]["out"].ptr == encoder["logits"]
+        assert calls[1][3]["out"].shape == (1, 600, 8, 256)
+        assert calls[1][3]["pack_gqa"] is True
+        assert calls[1][0].copied_from is calls[1][3]["out"]
+        assert not hasattr(backend, "_fa4_outputs")
+    finally:
+        fa4_backend.fa4_fwd = original_fwd
+        attn_backend._fp16_tensor_from_ptr = original_view
+
+
 def _make_pi0_backend():
     """Helper: build a Pi0-spec'd ThorFlashAttnBackend with fake ptrs."""
     from flash_rt.hardware.thor.attn_backend import (
@@ -306,6 +417,9 @@ def main() -> int:
         test_reject_null_ptr,
         test_reject_bad_D,
         test_reject_extra_site,
+        test_required_fa4_unavailable_raises,
+        test_required_fa4_rejects_fixed_shape,
+        test_fa4_writes_pipeline_owned_outputs,
         test_pi0_spec_decoder_extra,
         test_state_masked_requires_state_nk,
         test_state_masked_state_nk_range,

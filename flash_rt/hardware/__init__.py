@@ -145,6 +145,19 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("qwen3_vl", "torch", "rtx_sm89"):
         ("flash_rt.frontends.torch.qwen3_vl_fp8_sm89_multimodal",
          "Qwen3VlFp8Sm89Frontend"),
+    # Jetson Thor (SM110): BF16 frontend. The vendored FA2 is not built on
+    # sm_110, so attention runs through the Thor SDPA backend; dims come from
+    # config.json. See docs/qwen3_vl_thor.md.
+    ("qwen3_vl", "torch", "thor"):
+        ("flash_rt.frontends.torch.qwen3_vl_thor",
+         "Qwen3VlTorchFrontendThor"),
+    # Jetson Orin (SM87, Ampere): no FP8/FP4 tensor cores, so neither the FP8
+    # nor the NVFP4 Qwen3-VL path applies. BF16 language stack over the FA2
+    # (sm_80 codegen) attention backend, with opt-in INT8/INT4 decode weight
+    # quantization. See docs/qwen3_vl_rtx_bf16.md.
+    ("qwen3_vl", "torch", "rtx_sm87"):
+        ("flash_rt.frontends.torch.qwen3_vl_rtx_bf16",
+         "Qwen3VlTorchFrontendRtxBF16"),
 
     # Cosmos3-Edge official Thor baseline.
     ("cosmos3_edge", "torch", "thor"):
@@ -176,6 +189,16 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
 }
 
 
+# (config, framework, "rtx_sm87") keys supported on Jetson Orin. Ampere has no
+# FP8/FP4 tensor cores, so each model needs an arch-specific INT8/BF16
+# frontend; an explicit allowlist keeps an unrelated FP8 frontend from
+# resolving here and crashing later at the first kernel launch.
+_SM87_ALLOWED = {
+    ("pi05", "torch", "rtx_sm87"),
+    ("qwen3_vl", "torch", "rtx_sm87"),
+}
+
+
 def resolve_pipeline_class(config: str, framework: str, arch: str):
     """Resolve (config, framework, arch) to a pipeline class object.
 
@@ -183,11 +206,12 @@ def resolve_pipeline_class(config: str, framework: str, arch: str):
     does not pull in torch/jax/rtx code until a load happens.
     """
     key = (config, framework, arch)
-    if arch == "rtx_sm87" and key != ("pi05", "torch", "rtx_sm87"):
+    if arch == "rtx_sm87" and key not in _SM87_ALLOWED:
+        supported = sorted({c for (c, f, _) in _SM87_ALLOWED if f == framework})
         raise RuntimeError(
-            "FlashRT: Jetson Orin SM87 currently supports only "
-            "config='pi05' with framework='torch'. "
-            f"config={config!r} framework={framework!r} is not supported yet."
+            "FlashRT: Jetson Orin SM87 supports the following configs with "
+            f"framework={framework!r}: {supported}. "
+            f"config={config!r} is not supported yet."
         )
     if key not in _PIPELINE_MAP:
         supported = sorted(

@@ -37,12 +37,26 @@
 
 #ifdef ENABLE_QWEN3_VL_BF16_GEMV_M1
 #include "kernels/qwen3_vl_bf16_gemv_m1.cuh"
+#include "kernels/qwen3_vl_w8_gemv_m1.cuh"
+#include "kernels/qwen3_vl_w4_gemv_m1.cuh"
+#endif
+
+// INT8/INT4 decode GEMVs + INT8 KV cache: Orin only (see CMakeLists.txt).
+#ifdef ENABLE_QWEN3_VL_INT_DECODE
+#include "kernels/qwen3_vl_int8_gemv_m1.cuh"
+#include "kernels/qwen3_vl_int4_gemv_m1.cuh"
+#include "kernels/qwen3_int8_kv.cuh"
 #endif
 
 #ifdef ENABLE_SM89_BLOCK_FP8_GEMM
 #include "gemm/fp8_block128_gemm_mma_sm89.cuh"
 #include "gemm/fp8_gemv_m1_sm89.cuh"
 #include "quantize/fp8_per_token_block_quant.cuh"
+#endif
+
+// Fused QK norm-rope-kvwrite. Compiled on every arch that builds
+// qwen3_qkv_post_proc.cu: SM89 for the FP8 path, SM110 (Thor) for BF16 prefill.
+#ifdef ENABLE_QWEN3_VL_QKV_POSTPROC
 #include "kernels/qwen3_qkv_post_proc.cuh"
 #endif
 
@@ -97,7 +111,7 @@ static T* as_ptr(uintptr_t p) {
     return reinterpret_cast<T*>(p);
 }
 
-#ifdef ENABLE_SM89_BLOCK_FP8_GEMM
+#if defined(ENABLE_SM89_BLOCK_FP8_GEMM) || defined(ENABLE_QWEN3_VL_QKV_POSTPROC)
 static void* to_ptr(uintptr_t addr) { return reinterpret_cast<void*>(addr); }
 #endif
 
@@ -373,6 +387,53 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
 #undef BIND_GEGLU_TILE
 #endif
 
+#define BIND_BLOCK128_GEMV_M1(NAME)                                           \
+    m.def("ht_" #NAME,                                                       \
+        [](uintptr_t A, uintptr_t B, uintptr_t D,                            \
+           int M, int N, int K, uintptr_t act_scale, uintptr_t w_scale,       \
+           float alpha, uintptr_t stream) {                                  \
+            return flash_rt::gemm::gemv_m1_sm89::NAME(                            \
+                to_ptr(A), to_ptr(B), to_ptr(D),                             \
+                M, N, K, reinterpret_cast<const float*>(act_scale),          \
+                reinterpret_cast<const float*>(w_scale), alpha,              \
+                to_stream(stream));                                          \
+        },                                                                   \
+        py::arg("A"), py::arg("B"), py::arg("D"),                          \
+        py::arg("M"), py::arg("N"), py::arg("K"),                          \
+        py::arg("act_scale"), py::arg("w_scale"), py::arg("alpha"),        \
+        py::arg("stream") = 0)
+
+    BIND_BLOCK128_GEMV_M1(gemv_fp8_block128_m1_w4);
+    BIND_BLOCK128_GEMV_M1(gemv_fp8_block128_m1_w8);
+    BIND_BLOCK128_GEMV_M1(gemv_fp8_block128_m1_w16);
+
+    // BF16-input GEMV: A is BF16, B is FP8 with block-128 weight scale.
+    // Eliminates standalone FP8 activation quantization before O-proj.
+#define BIND_BLOCK128_GEMV_M1_BF16IN(NAME)                                     \
+    m.def("ht_" #NAME,                                                         \
+        [](uintptr_t A, uintptr_t B, uintptr_t D,                              \
+           int M, int N, int K, uintptr_t w_scale, uintptr_t stream) {         \
+            return flash_rt::gemm::gemv_m1_sm89::NAME(                          \
+                to_ptr(A), to_ptr(B), to_ptr(D),                               \
+                M, N, K, reinterpret_cast<const float*>(w_scale),              \
+                to_stream(stream));                                            \
+        },                                                                     \
+        py::arg("A"), py::arg("B"), py::arg("D"),                              \
+        py::arg("M"), py::arg("N"), py::arg("K"),                              \
+        py::arg("w_scale"), py::arg("stream") = 0)
+
+    BIND_BLOCK128_GEMV_M1_BF16IN(gemv_fp8_block128_m1_bf16in_w8);
+    BIND_BLOCK128_GEMV_M1_BF16IN(gemv_fp8_block128_m1_bf16in_w16);
+
+#undef BIND_BLOCK128_GEMV_M1_BF16IN
+
+#endif  // ENABLE_SM89_BLOCK_FP8_GEMM
+
+// ── Fused QK norm-rope-kvwrite ──
+// Shared by the SM89 FP8 path and the SM110 (Thor) BF16 prefill, which builds
+// qwen3_qkv_post_proc.cu without the SM89 block-FP8 GEMM. The batched variant
+// is the one the Thor prefill uses.
+#ifdef ENABLE_QWEN3_VL_QKV_POSTPROC
     m.def("qwen3_qk_norm_rope_kvwrite_bf16",
         [](uintptr_t q_pre, uintptr_t k_pre, uintptr_t v_pre,
            uintptr_t q_norm_w, uintptr_t k_norm_w,
@@ -430,51 +491,10 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
         py::arg("q_dst_row_elems"), py::arg("kv_dst_row_elems"),
         py::arg("n_q_heads"), py::arg("n_kv_heads"),
         py::arg("eps") = 1e-6f, py::arg("stream") = 0);
-
-#define BIND_BLOCK128_GEMV_M1(NAME)                                           \
-    m.def("ht_" #NAME,                                                       \
-        [](uintptr_t A, uintptr_t B, uintptr_t D,                            \
-           int M, int N, int K, uintptr_t act_scale, uintptr_t w_scale,       \
-           float alpha, uintptr_t stream) {                                  \
-            return flash_rt::gemm::gemv_m1_sm89::NAME(                            \
-                to_ptr(A), to_ptr(B), to_ptr(D),                             \
-                M, N, K, reinterpret_cast<const float*>(act_scale),          \
-                reinterpret_cast<const float*>(w_scale), alpha,              \
-                to_stream(stream));                                          \
-        },                                                                   \
-        py::arg("A"), py::arg("B"), py::arg("D"),                          \
-        py::arg("M"), py::arg("N"), py::arg("K"),                          \
-        py::arg("act_scale"), py::arg("w_scale"), py::arg("alpha"),        \
-        py::arg("stream") = 0)
-
-    BIND_BLOCK128_GEMV_M1(gemv_fp8_block128_m1_w4);
-    BIND_BLOCK128_GEMV_M1(gemv_fp8_block128_m1_w8);
-    BIND_BLOCK128_GEMV_M1(gemv_fp8_block128_m1_w16);
-
-    // BF16-input GEMV: A is BF16, B is FP8 with block-128 weight scale.
-    // Eliminates standalone FP8 activation quantization before O-proj.
-#define BIND_BLOCK128_GEMV_M1_BF16IN(NAME)                                     \
-    m.def("ht_" #NAME,                                                         \
-        [](uintptr_t A, uintptr_t B, uintptr_t D,                              \
-           int M, int N, int K, uintptr_t w_scale, uintptr_t stream) {         \
-            return flash_rt::gemm::gemv_m1_sm89::NAME(                          \
-                to_ptr(A), to_ptr(B), to_ptr(D),                               \
-                M, N, K, reinterpret_cast<const float*>(w_scale),              \
-                to_stream(stream));                                            \
-        },                                                                     \
-        py::arg("A"), py::arg("B"), py::arg("D"),                              \
-        py::arg("M"), py::arg("N"), py::arg("K"),                              \
-        py::arg("w_scale"), py::arg("stream") = 0)
-
-    BIND_BLOCK128_GEMV_M1_BF16IN(gemv_fp8_block128_m1_bf16in_w8);
-    BIND_BLOCK128_GEMV_M1_BF16IN(gemv_fp8_block128_m1_bf16in_w16);
-
-#undef BIND_BLOCK128_GEMV_M1_BF16IN
-
-#endif  // ENABLE_SM89_BLOCK_FP8_GEMM
+#endif  // ENABLE_QWEN3_VL_QKV_POSTPROC
 
 #ifdef ENABLE_QWEN3_VL_BF16_CUBLASLT
-    // BF16 cuBLASLt matmul for Qwen3-VL BF16 linears on SM87/SM89. SM120
+    // BF16 cuBLASLt matmul for Qwen3-VL BF16 linears on SM87/SM89/SM110. SM120
     // uses w16a16_gemm_sm120_bf16 from flash_rt_kernels instead.
     m.def("bf16_matmul_cublaslt_bf16",
         [](uintptr_t x, uintptr_t W, uintptr_t out,
@@ -500,6 +520,133 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
         },
         py::arg("x"), py::arg("W"), py::arg("out"),
         py::arg("N"), py::arg("K"), py::arg("stream") = 0);
-#endif
-#endif
+
+    // ── Weight-only quantized M=1 decode GEMVs ──
+    // Decode at M=1 is bound by the weight HBM read, so shrinking the weights
+    // buys throughput directly. All of these take packed weights + bf16 per-16
+    // block scales and dequantize in-kernel to bf16, so no FP8/FP4 tensor core
+    // is required. Prefill keeps using the bf16 weights.
+
+    // FP8 e4m3 (scale = amax/448): 1.125 B/elem vs bf16 2.0. Relies on the
+    // hardware e4m3 conversion, so it only stays bandwidth-bound on sm_89+.
+    m.def("qwen3_vl_w8_gemv_m1",
+        [](uintptr_t x, uintptr_t Wp, uintptr_t Ws, uintptr_t out,
+           int N, int K, uintptr_t stream) {
+            flash_rt::kernels::qwen3_vl_w8_gemv_m1(
+                reinterpret_cast<const __nv_bfloat16*>(x),
+                reinterpret_cast<const uint8_t*>(Wp),
+                reinterpret_cast<const __nv_bfloat16*>(Ws),
+                reinterpret_cast<__nv_bfloat16*>(out),
+                N, K, to_stream(stream));
+        },
+        py::arg("x"), py::arg("Wp"), py::arg("Ws"), py::arg("out"),
+        py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+
+    // NVFP4 e2m1 (scale = amax/6), two nibbles per byte: 0.625 B/elem, ~3.2x
+    // less weight traffic than bf16. Dequant is a __byte_perm LUT into e4m3, so
+    // like the W8 sibling it wants sm_89+.
+    m.def("qwen3_vl_w4_gemv_m1",
+        [](uintptr_t x, uintptr_t Wp, uintptr_t Ws, uintptr_t out,
+           int N, int K, uintptr_t stream) {
+            flash_rt::kernels::qwen3_vl_w4_gemv_m1(
+                reinterpret_cast<const __nv_bfloat16*>(x),
+                reinterpret_cast<const uint8_t*>(Wp),
+                reinterpret_cast<const __nv_bfloat16*>(Ws),
+                reinterpret_cast<__nv_bfloat16*>(out),
+                N, K, to_stream(stream));
+        },
+        py::arg("x"), py::arg("Wp"), py::arg("Ws"), py::arg("out"),
+        py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+#endif  // ENABLE_QWEN3_VL_BF16_GEMV_M1
+#endif  // ENABLE_QWEN3_VL_BF16_CUBLASLT
+
+#ifdef ENABLE_QWEN3_VL_INT_DECODE
+    // INT8 symmetric (scale = amax/127): 1.125 B/elem vs bf16 2.0. Dequant is
+    // a hardware I2F, which is why this — not the e4m3 sibling — is the W8
+    // choice on Ampere (sm_87), where FP8 conversion is emulated in software.
+    m.def("qwen3_vl_int8_gemv_m1",
+        [](uintptr_t x, uintptr_t Wp, uintptr_t Ws, uintptr_t out,
+           int N, int K, uintptr_t stream) {
+            flash_rt::kernels::qwen3_vl_int8_gemv_m1(
+                reinterpret_cast<const __nv_bfloat16*>(x),
+                reinterpret_cast<const uint8_t*>(Wp),
+                reinterpret_cast<const __nv_bfloat16*>(Ws),
+                reinterpret_cast<__nv_bfloat16*>(out),
+                N, K, to_stream(stream));
+        },
+        py::arg("x"), py::arg("Wp"), py::arg("Ws"), py::arg("out"),
+        py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+
+    // INT4 symmetric (scale = amax/7), two nibbles per byte: 0.625 B/elem.
+    // Unpack is shift + sign-extend + I2F, also Ampere-friendly. Coarser than
+    // INT8 (15 levels) — validate per model.
+    m.def("qwen3_vl_int4_gemv_m1",
+        [](uintptr_t x, uintptr_t Wp, uintptr_t Ws, uintptr_t out,
+           int N, int K, uintptr_t stream) {
+            flash_rt::kernels::qwen3_vl_int4_gemv_m1(
+                reinterpret_cast<const __nv_bfloat16*>(x),
+                reinterpret_cast<const uint8_t*>(Wp),
+                reinterpret_cast<const __nv_bfloat16*>(Ws),
+                reinterpret_cast<__nv_bfloat16*>(out),
+                N, K, to_stream(stream));
+        },
+        py::arg("x"), py::arg("Wp"), py::arg("Ws"), py::arg("out"),
+        py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+
+    // ── INT8 KV cache: row quantize + q=1 flash-decoding attention ──
+    // KV rows are mirrored into int8 with one bf16 scale per (position,
+    // kv-head) 128-element row, halving the KV bytes each decode step reads.
+    // Prefill still runs FA2 against the bf16 cache.
+
+    // Quantize n_rows contiguous 128-element bf16 rows. Layout-agnostic, so it
+    // serves both the per-step pass (n_rows = kv_heads at one layer/position)
+    // and the post-prefill bulk pass over the whole cache prefix.
+    m.def("qwen3_kv_rows_quant_int8",
+        [](uintptr_t src, uintptr_t dst, uintptr_t scales, int n_rows,
+           uintptr_t stream) {
+            flash_rt::kernels::qwen3_kv_rows_quant_int8(
+                reinterpret_cast<const __nv_bfloat16*>(src),
+                reinterpret_cast<int8_t*>(dst),
+                reinterpret_cast<__nv_bfloat16*>(scales),
+                n_rows, to_stream(stream));
+        },
+        py::arg("src"), py::arg("dst"), py::arg("scales"),
+        py::arg("n_rows"), py::arg("stream") = 0);
+
+    // Partial pass: one block per (kv-head, 128-position chunk). Specialized
+    // for GQA 16Q/8KV with head_dim 128.
+    m.def("qwen3_attn_decode_int8kv_partial",
+        [](uintptr_t q, uintptr_t k8, uintptr_t v8, uintptr_t ks,
+           uintptr_t vs, uintptr_t part_o, uintptr_t part_m, uintptr_t part_l,
+           int kv_len, int n_chunks, float softmax_scale, uintptr_t stream) {
+            flash_rt::kernels::qwen3_attn_decode_int8kv_partial(
+                reinterpret_cast<const __nv_bfloat16*>(q),
+                reinterpret_cast<const int8_t*>(k8),
+                reinterpret_cast<const int8_t*>(v8),
+                reinterpret_cast<const __nv_bfloat16*>(ks),
+                reinterpret_cast<const __nv_bfloat16*>(vs),
+                reinterpret_cast<float*>(part_o),
+                reinterpret_cast<float*>(part_m),
+                reinterpret_cast<float*>(part_l),
+                kv_len, n_chunks, softmax_scale, to_stream(stream));
+        },
+        py::arg("q"), py::arg("k8"), py::arg("v8"), py::arg("ks"),
+        py::arg("vs"), py::arg("part_o"), py::arg("part_m"), py::arg("part_l"),
+        py::arg("kv_len"), py::arg("n_chunks"), py::arg("softmax_scale"),
+        py::arg("stream") = 0);
+
+    // Combine pass: rescale and merge the chunk partials into bf16 O.
+    m.def("qwen3_attn_decode_int8kv_combine",
+        [](uintptr_t part_o, uintptr_t part_m, uintptr_t part_l,
+           uintptr_t out, int n_chunks, uintptr_t stream) {
+            flash_rt::kernels::qwen3_attn_decode_int8kv_combine(
+                reinterpret_cast<const float*>(part_o),
+                reinterpret_cast<const float*>(part_m),
+                reinterpret_cast<const float*>(part_l),
+                reinterpret_cast<__nv_bfloat16*>(out),
+                n_chunks, to_stream(stream));
+        },
+        py::arg("part_o"), py::arg("part_m"), py::arg("part_l"),
+        py::arg("out"), py::arg("n_chunks"), py::arg("stream") = 0);
+#endif  // ENABLE_QWEN3_VL_INT_DECODE
 }

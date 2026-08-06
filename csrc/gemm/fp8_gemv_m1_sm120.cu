@@ -23,11 +23,20 @@ namespace gemv_m1 {
 
 namespace {
 
+// minBlocks=8 only fits blocks of <=192 threads: 8 x 256 exceeds the 1536
+// threads/SM cap on sm_87/89/110/120/121, so ptxas discards the whole hint.
+// Clamp it to what the arch can hold, keeping the honored W=4 hint intact.
+constexpr int kMaxThreadsPerSM = 1536;
+template <int W>
+constexpr int kMinBlocks = (kMaxThreadsPerSM / (W * 32)) < 8
+                               ? (kMaxThreadsPerSM / (W * 32))
+                               : 8;
+
 // One warp per output row n. A staged in smem as raw fp8 (K bytes). B row read
 // in uint4 (16 fp8) coalesced chunks, stride 32 across the warp. K assumed a
 // multiple of 16 (all Higgs/Qwen3 GEMM K: 2560/4096/9728).
 template <int WARPS_PER_BLOCK>
-__global__ __launch_bounds__(WARPS_PER_BLOCK * 32, 8)
+__global__ __launch_bounds__(WARPS_PER_BLOCK * 32, kMinBlocks<WARPS_PER_BLOCK>)
 void gemv_fp8_m1_kernel(
     const __nv_fp8_e4m3* __restrict__ A,   // [K]
     const __nv_fp8_e4m3* __restrict__ B,   // [N, K]
@@ -74,7 +83,7 @@ void gemv_fp8_m1_kernel(
 // dependency like the norm — so it folds into the epilogue for free, removing
 // the separate residual_add launch. Each output n is written by one warp lane.
 template <int WARPS_PER_BLOCK>
-__global__ __launch_bounds__(WARPS_PER_BLOCK * 32, 8)
+__global__ __launch_bounds__(WARPS_PER_BLOCK * 32, kMinBlocks<WARPS_PER_BLOCK>)
 void gemv_fp8_m1_resadd_kernel(
     const __nv_fp8_e4m3* __restrict__ A,
     const __nv_fp8_e4m3* __restrict__ B,
@@ -108,7 +117,7 @@ void gemv_fp8_m1_resadd_kernel(
 // per-call activation scale never needs a host round-trip. Identical dot product
 // to gemv_fp8_m1_kernel; only the epilogue scale source differs.
 template <int WARPS_PER_BLOCK>
-__global__ __launch_bounds__(WARPS_PER_BLOCK * 32, 8)
+__global__ __launch_bounds__(WARPS_PER_BLOCK * 32, kMinBlocks<WARPS_PER_BLOCK>)
 void gemv_fp8_m1_dscale_kernel(
     const __nv_fp8_e4m3* __restrict__ A,
     const __nv_fp8_e4m3* __restrict__ B,

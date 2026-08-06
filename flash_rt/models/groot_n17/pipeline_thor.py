@@ -47,6 +47,12 @@ def vlln_forward(gemm, fvk, bufs, weights, dims,
         weights["vlln_b"]    — beta  fp16 (D,)
         dims["S"], dims["D"] — flat sequence × hidden
     """
+    if dims.get("vec_kernels"):
+        fvk.layer_norm_fp16_vec(
+            int(bufs["x"]), int(weights["vlln_w"]), int(weights["vlln_b"]),
+            int(bufs["out"]), int(dims["S"]), int(dims["D"]), 1e-5,
+            int(stream))
+        return
     fvk.layer_norm_fp16(
         int(bufs["x"]),
         int(weights["vlln_w"]),
@@ -62,6 +68,14 @@ def vlln_forward(gemm, fvk, bufs, weights, dims,
 # ─────────────────────────────────────────────────────────────────────────
 # Stages still pending (Phase 3b.2)
 # ─────────────────────────────────────────────────────────────────────────
+
+
+def _fa4(dims):
+    """Resolve the optional FA4 attention callable (None = fmha fallback)."""
+    if not dims.get("fa4"):
+        return None
+    from flash_rt.hardware.thor.fa4_backend import fa4_func
+    return fa4_func()
 
 
 def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
@@ -152,22 +166,53 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
     layer_iter = range(24) if layers_subset is None else list(layers_subset)
     Sper = int(dims.get("Sper_view", S))
 
+    # Vectorized small-kernel tier (16-byte loads): same element math as the
+    # scalar kernels, far better DRAM efficiency at these shapes.
+    vec = bool(dims.get("vec_kernels"))
+    fa4 = _fa4(dims)
+
+    def _res(dst, src, n):
+        if vec:
+            fvk.residual_add_fp16_vec(dst, src, n, int(stream))
+        else:
+            fvk.residual_add_fp16(dst, src, n, int(stream))
+
+    def _ln(x, w, b, out, rows):
+        if vec:
+            fvk.layer_norm_fp16_vec(x, w, b, out, rows, D, 1e-6, int(stream))
+        else:
+            fvk.layer_norm_fp16(x, w, b, out, rows, D, 1e-6, int(stream))
+
+    def _q8(src, dst, scale, n):
+        if vec:
+            fvk.quantize_fp8_static_fp16_vec(src, dst, scale, n, int(stream))
+        else:
+            fvk.quantize_fp8_static_fp16(src, dst, scale, n, int(stream))
+
+    def _rope(ptr):
+        if vec:
+            fvk.rope_rotate_half_fp16_vec(ptr, cos_ptr, sin_ptr, S, NH, HD, int(stream))
+        else:
+            fvk.rope_rotate_half_fp16(ptr, cos_ptr, sin_ptr, S, NH, HD, int(stream))
+
     for li in layer_iter:
         slots = attn.get_slot_ptrs("vit", li)
         Q_ptr, K_ptr, V_ptr, O_ptr = slots["Q"], slots["K"], slots["V"], slots["O"]
 
-        # ── Pre-attn LayerNorm ──────────────────────────────────────────
-        fvk.layer_norm_fp16(
-            h_ptr, int(weights["norm1_w"][li]), int(weights["norm1_b"][li]),
-            xn_ptr, S, D, 1e-6, int(stream),
-        )
+        # ── Pre-attn LayerNorm (+ fused FP8 quantize on the vec tier) ───
+        if vec and use_fp8:
+            fvk.layer_norm_fp8_static_fp16_vec(
+                h_ptr, int(weights["norm1_w"][li]),
+                int(weights["norm1_b"][li]), xn_fp8_ptr,
+                int(scales_dev["act_qkv"][li]), S, D, 1e-6, int(stream))
+        else:
+            _ln(h_ptr, int(weights["norm1_w"][li]),
+                int(weights["norm1_b"][li]), xn_ptr, S)
 
         # ── Q/K/V projections (single shared act-scale on xn for FP8) ───
         if use_fp8:
-            fvk.quantize_fp8_static_fp16(
-                xn_ptr, xn_fp8_ptr, int(scales_dev["act_qkv"][li]),
-                S * D, int(stream),
-            )
+            if not vec:
+                _q8(xn_ptr, xn_fp8_ptr, int(scales_dev["act_qkv"][li]), S * D)
             gemm.fp8_nn_bias(
                 xn_fp8_ptr, int(weights["q_w"][li]), Q_ptr, int(weights["q_b"][li]),
                 S, D, D, float(weights["alpha_q"][li]), int(stream),
@@ -188,18 +233,28 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
                 fvk.add_bias_fp16(out, int(weights[bk][li]), S, D, int(stream))
 
         # ── Split-half RoPE on Q and K (contiguous (S, NH, HD)) ─────────
-        fvk.rope_rotate_half_fp16(Q_ptr, cos_ptr, sin_ptr, S, NH, HD, int(stream))
-        fvk.rope_rotate_half_fp16(K_ptr, cos_ptr, sin_ptr, S, NH, HD, int(stream))
+        _rope(Q_ptr)
+        _rope(K_ptr)
 
-        # ── Multi-view batched FMHA (separated Q/K/V, stride=D) ─────────
-        attn.run("vit", li, q_seq=Sper, kv_seq=Sper, stream=int(stream))
+        # ── Multi-view batched attention (separated Q/K/V) ──────────────
+        # FA4 (CuTe-DSL) when available: one kernel per layer, views as the
+        # batch axis, output consumed directly by the o_proj quantize.
+        if fa4 is not None and use_fp8:
+            nv = max(1, S // Sper)
+            o_t = fa4(bufs["Q_t"].view(nv, Sper, NH, HD),
+                      bufs["K_t"].view(nv, Sper, NH, HD),
+                      bufs["V_t"].view(nv, Sper, NH, HD),
+                      causal=False)
+            if isinstance(o_t, tuple):
+                o_t = o_t[0]
+            attn_out_ptr = o_t.data_ptr()
+        else:
+            attn.run("vit", li, q_seq=Sper, kv_seq=Sper, stream=int(stream))
+            attn_out_ptr = O_ptr
 
         # ── o_proj ──────────────────────────────────────────────────────
         if use_fp8:
-            fvk.quantize_fp8_static_fp16(
-                O_ptr, xn_fp8_ptr, int(scales_dev["act_o"][li]),
-                S * D, int(stream),
-            )
+            _q8(attn_out_ptr, xn_fp8_ptr, int(scales_dev["act_o"][li]), S * D)
             gemm.fp8_nn_bias(
                 xn_fp8_ptr, int(weights["o_w"][li]), o_proj_out,
                 int(weights["o_b"][li]),
@@ -210,29 +265,29 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
             fvk.add_bias_fp16(o_proj_out, int(weights["o_b"][li]), S, D, int(stream))
 
         # ── Residual 1 ─────────────────────────────────────────────────
-        fvk.residual_add_fp16(h_ptr, o_proj_out, S * D, int(stream))
+        _res(h_ptr, o_proj_out, S * D)
 
-        # ── Pre-FF LayerNorm ───────────────────────────────────────────
-        fvk.layer_norm_fp16(
-            h_ptr, int(weights["norm2_w"][li]), int(weights["norm2_b"][li]),
-            xn_ptr, S, D, 1e-6, int(stream),
-        )
+        # ── Pre-FF LayerNorm (+ fused FP8 quantize on the vec tier) ────
+        if vec and use_fp8:
+            fvk.layer_norm_fp8_static_fp16_vec(
+                h_ptr, int(weights["norm2_w"][li]),
+                int(weights["norm2_b"][li]), xn_fp8_ptr,
+                int(scales_dev["act_fc1"][li]), S, D, 1e-6, int(stream))
+        else:
+            _ln(h_ptr, int(weights["norm2_w"][li]),
+                int(weights["norm2_b"][li]), xn_ptr, S)
 
         # ── FF: D → FF (GELU) → D ──────────────────────────────────────
         if use_fp8:
-            fvk.quantize_fp8_static_fp16(
-                xn_ptr, xn_fp8_ptr, int(scales_dev["act_fc1"][li]),
-                S * D, int(stream),
-            )
+            if not vec:
+                _q8(xn_ptr, xn_fp8_ptr, int(scales_dev["act_fc1"][li]), S * D)
             gemm.fp8_nn_gelu_bias(
                 xn_fp8_ptr, int(weights["fc1_w"][li]), fc1_out_ptr,
                 int(weights["fc1_b"][li]),
                 S, FF, D, float(weights["alpha_fc1"][li]), int(stream),
             )
-            fvk.quantize_fp8_static_fp16(
-                fc1_out_ptr, fc1_fp8_ptr, int(scales_dev["act_fc2"][li]),
-                S * FF, int(stream),
-            )
+            _q8(fc1_out_ptr, fc1_fp8_ptr, int(scales_dev["act_fc2"][li]),
+                S * FF)
             gemm.fp8_nn_bias(
                 fc1_fp8_ptr, int(weights["fc2_w"][li]), o_proj_out,
                 int(weights["fc2_b"][li]),
@@ -246,7 +301,7 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
             fvk.add_bias_fp16(o_proj_out, int(weights["fc2_b"][li]), S, D, int(stream))
 
         # ── Residual 2 ─────────────────────────────────────────────────
-        fvk.residual_add_fp16(h_ptr, o_proj_out, S * D, int(stream))
+        _res(h_ptr, o_proj_out, S * D)
 
         # ── DeepStack tap callback ─────────────────────────────────────
         if deepstack_capture is not None and li in deepstack_taps:
@@ -444,6 +499,14 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
 
     inject_ptrs = weights.get("deepstack_inject", [0] * 16)
     layer_iter = range(16) if layers_subset is None else list(layers_subset)
+    vec = bool(dims.get("vec_kernels"))
+    fa4 = _fa4(dims)
+
+    def _res(dst, src, n):
+        if vec:
+            fvk.residual_add_fp16_vec(dst, src, n, int(stream))
+        else:
+            fvk.residual_add_fp16(dst, src, n, int(stream))
     # Per-layer precision protection: layers in ``fp16_layers`` run their
     # QKV / O / gate / up GEMMs in fp16 (no input fp8 quant) to protect the
     # large visual-token activation spikes that wreck per-tensor FP8 on the
@@ -499,38 +562,76 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
             )
 
         # ── Per-head q_norm / k_norm (BEFORE M-RoPE — Qwen3 standard) ──
-        fvk.rms_norm_fp16(
-            Q_ptr, int(weights["q_norm_w"][li]), Q_ptr,
-            S * NHQ, HD, 1e-6, int(stream),
-        )
-        fvk.rms_norm_fp16(
-            K_ptr, int(weights["k_norm_w"][li]), K_ptr,
-            S * NHKV, HD, 1e-6, int(stream),
-        )
+        # These view (S, NH*HD) as (S*NH, HD): thousands of 128-wide rows,
+        # where the block-per-row scalar kernel is latency-bound — the vec
+        # tier runs a warp-per-row 16-byte-load variant instead.
+        if vec:
+            fvk.rms_norm_fp16_vec(
+                Q_ptr, int(weights["q_norm_w"][li]), Q_ptr,
+                S * NHQ, HD, 1e-6, int(stream))
+            fvk.rms_norm_fp16_vec(
+                K_ptr, int(weights["k_norm_w"][li]), K_ptr,
+                S * NHKV, HD, 1e-6, int(stream))
+        else:
+            fvk.rms_norm_fp16(
+                Q_ptr, int(weights["q_norm_w"][li]), Q_ptr,
+                S * NHQ, HD, 1e-6, int(stream),
+            )
+            fvk.rms_norm_fp16(
+                K_ptr, int(weights["k_norm_w"][li]), K_ptr,
+                S * NHKV, HD, 1e-6, int(stream),
+            )
 
         # ── M-RoPE on Q and K ──────────────────────────────────────────
-        fvk.rope_rotate_half_fp16(Q_ptr, cos_ptr, sin_ptr, S, NHQ,  HD, int(stream))
-        fvk.rope_rotate_half_fp16(K_ptr, cos_ptr, sin_ptr, S, NHKV, HD, int(stream))
+        if vec:
+            fvk.rope_rotate_half_fp16_vec(Q_ptr, cos_ptr, sin_ptr, S, NHQ,  HD, int(stream))
+            fvk.rope_rotate_half_fp16_vec(K_ptr, cos_ptr, sin_ptr, S, NHKV, HD, int(stream))
+        else:
+            fvk.rope_rotate_half_fp16(Q_ptr, cos_ptr, sin_ptr, S, NHQ,  HD, int(stream))
+            fvk.rope_rotate_half_fp16(K_ptr, cos_ptr, sin_ptr, S, NHKV, HD, int(stream))
 
-        # ── GQA expand: K, V from NHKV → NHQ heads ─────────────────────
-        fvk.gpu_repeat_interleave_heads(K_ptr, K_exp_ptr, S, NHKV, HD, GQA, int(stream))
-        fvk.gpu_repeat_interleave_heads(V_ptr, V_exp_ptr, S, NHKV, HD, GQA, int(stream))
+        # ── Attention ──────────────────────────────────────────────────
+        # FA4 (CuTe-DSL) when available: causal GQA-native (pack_gqa), so
+        # the K/V head expand disappears and the output feeds the o_proj
+        # quantize directly. Fallback: expand to MHA + the cublas chain.
+        if fa4 is not None and not hi_prec:
+            o_t = fa4(bufs["Q_t"].view(1, S, NHQ, HD),
+                      bufs["K_t"].view(1, S, NHKV, HD),
+                      bufs["V_t"].view(1, S, NHKV, HD),
+                      causal=True, pack_gqa=True)
+            if isinstance(o_t, tuple):
+                o_t = o_t[0]
+            attn_out_ptr = o_t.data_ptr()
+        else:
+            # ── GQA expand: K, V from NHKV → NHQ heads ─────────────────
+            if vec:
+                fvk.gpu_repeat_interleave_heads_vec(K_ptr, K_exp_ptr, S, NHKV, HD, GQA, int(stream))
+                fvk.gpu_repeat_interleave_heads_vec(V_ptr, V_exp_ptr, S, NHKV, HD, GQA, int(stream))
+            else:
+                fvk.gpu_repeat_interleave_heads(K_ptr, K_exp_ptr, S, NHKV, HD, GQA, int(stream))
+                fvk.gpu_repeat_interleave_heads(V_ptr, V_exp_ptr, S, NHKV, HD, GQA, int(stream))
 
-        # ── MHA via attn backend ───────────────────────────────────────
-        # Backend reads the LLM site's Q/K/V/O slots; we wrote the expanded
-        # K_exp/V_exp into those slot ptrs at allocation time so the kernel
-        # call is unchanged.
-        attn.run("llm", li, q_seq=S, kv_seq=S, stream=int(stream))
+            # ── MHA via attn backend ───────────────────────────────────
+            # Backend reads the LLM site's Q/K/V/O slots; we wrote the
+            # expanded K_exp/V_exp into those slot ptrs at allocation time
+            # so the kernel call is unchanged.
+            attn.run("llm", li, q_seq=S, kv_seq=S, stream=int(stream))
+            attn_out_ptr = int(slots["O"])
 
         if hi_prec:
             gemm.fp16_nn(int(slots["O"]), int(weights["o_w_fp16"][li]),
                          o_out_ptr, S, D, NHQ * HD, int(stream))
         else:
             # ── Quantize O for o_proj ──────────────────────────────────
-            fvk.quantize_fp8_static_fp16(
-                int(slots["O"]), xn_fp8_ptr, int(scales_dev["act_o"][li]),
-                S * NHQ * HD, int(stream),
-            )
+            if vec:
+                fvk.quantize_fp8_static_fp16_vec(
+                    attn_out_ptr, xn_fp8_ptr, int(scales_dev["act_o"][li]),
+                    S * NHQ * HD, int(stream))
+            else:
+                fvk.quantize_fp8_static_fp16(
+                    attn_out_ptr, xn_fp8_ptr, int(scales_dev["act_o"][li]),
+                    S * NHQ * HD, int(stream),
+                )
             gemm.fp8_nn_bias(
                 xn_fp8_ptr, int(weights["o_w"][li]), o_out_ptr,
                 int(bufs["zero_bias"]), S, D, NHQ * HD,
@@ -540,7 +641,7 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
         # ── Residual 1 + Pre-FFN RMSNorm ──────────────────────────────
         # FP8 path fuses residual-add + RMSNorm + quantize into one kernel.
         if hi_prec:
-            fvk.residual_add_fp16(h_ptr, o_out_ptr, S * D, int(stream))
+            _res(h_ptr, o_out_ptr, S * D)
             fvk.rms_norm_fp16(
                 h_ptr, int(weights["post_ln_w"][li]), xn_ptr,
                 S, D, 1e-6, int(stream),
@@ -584,12 +685,12 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
             )
 
         # ── Residual 2 ────────────────────────────────────────────────
-        fvk.residual_add_fp16(h_ptr, o_out_ptr, S * D, int(stream))
+        _res(h_ptr, o_out_ptr, S * D)
 
         # ── DeepStack injection (HF: layers 0, 1, 2) ──────────────────
         inject_ptr = int(inject_ptrs[li]) if li < len(inject_ptrs) else 0
         if inject_ptr != 0:
-            fvk.residual_add_fp16(h_ptr, inject_ptr, S * D, int(stream))
+            _res(h_ptr, inject_ptr, S * D)
 
 
 def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
@@ -648,6 +749,14 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
     NH = int(dims["NH"])
     HD = int(dims["HD"])
     FF = int(dims["ff_inner"])
+    vec = bool(dims.get("vec_kernels"))
+    fa4 = _fa4(dims)
+
+    def _res(dst, src, n):
+        if vec:
+            fvk.residual_add_fp16_vec(dst, src, n, int(stream))
+        else:
+            fvk.residual_add_fp16(dst, src, n, int(stream))
 
     h_ptr        = int(bufs["h"])
     xn_ptr       = int(bufs["xn"])
@@ -662,18 +771,29 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
         slots = attn.get_slot_ptrs("vl_self_attn", li)
         Q_ptr, K_ptr, V_ptr, O_ptr = slots["Q"], slots["K"], slots["V"], slots["O"]
 
-        # ── Pre-attn LayerNorm ──────────────────────────────────────────
-        fvk.layer_norm_fp16(
-            h_ptr, int(weights["norm1_w"][li]), int(weights["norm1_b"][li]),
-            xn_ptr, T, D, 1e-5, int(stream),
-        )
+        # ── Pre-attn LayerNorm (+ fused FP8 quantize on the vec tier) ───
+        if vec and use_fp8:
+            fvk.layer_norm_fp8_static_fp16_vec(
+                h_ptr, int(weights["norm1_w"][li]), int(weights["norm1_b"][li]),
+                xn_fp8_ptr, int(scales_dev["act_qkv"][li]), T, D, 1e-5,
+                int(stream))
+        elif vec:
+            fvk.layer_norm_fp16_vec(
+                h_ptr, int(weights["norm1_w"][li]), int(weights["norm1_b"][li]),
+                xn_ptr, T, D, 1e-5, int(stream))
+        else:
+            fvk.layer_norm_fp16(
+                h_ptr, int(weights["norm1_w"][li]), int(weights["norm1_b"][li]),
+                xn_ptr, T, D, 1e-5, int(stream),
+            )
 
         # ── Q / K / V projections (single shared act scale for FP8) ──────
         if use_fp8:
-            fvk.quantize_fp8_static_fp16(
-                xn_ptr, xn_fp8_ptr, int(scales_dev["act_qkv"][li]),
-                T * D, int(stream),
-            )
+            if not vec:
+                fvk.quantize_fp8_static_fp16(
+                    xn_ptr, xn_fp8_ptr, int(scales_dev["act_qkv"][li]),
+                    T * D, int(stream),
+                )
             gemm.fp8_nn_bias(
                 xn_fp8_ptr, int(weights["q_w"][li]), Q_ptr, int(weights["q_b"][li]),
                 T, D, D, float(weights["alpha_q"][li]), int(stream),
@@ -693,15 +813,30 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
                 gemm.fp16_nn(xn_ptr, int(weights[wk][li]), out, T, D, D, int(stream))
                 fvk.add_bias_fp16(out, int(weights[bk][li]), T, D, int(stream))
 
-        # ── MHA via attn backend (kernel pre-fills logits as needed) ────
-        attn.run("vl_self_attn", li, q_seq=T, kv_seq=T, stream=int(stream))
+        # ── Self-attention ─────────────────────────────────────────────
+        if fa4 is not None and use_fp8:
+            o_t = fa4(bufs["Q_t"].view(1, T, NH, HD),
+                      bufs["K_t"].view(1, T, NH, HD),
+                      bufs["V_t"].view(1, T, NH, HD),
+                      causal=False)
+            if isinstance(o_t, tuple):
+                o_t = o_t[0]
+            attn_out_ptr = o_t.data_ptr()
+        else:
+            attn.run("vl_self_attn", li, q_seq=T, kv_seq=T, stream=int(stream))
+            attn_out_ptr = O_ptr
 
         # ── o_proj ──────────────────────────────────────────────────────
         if use_fp8:
-            fvk.quantize_fp8_static_fp16(
-                O_ptr, xn_fp8_ptr, int(scales_dev["act_o"][li]),
-                T * D, int(stream),
-            )
+            if vec:
+                fvk.quantize_fp8_static_fp16_vec(
+                    attn_out_ptr, xn_fp8_ptr, int(scales_dev["act_o"][li]),
+                    T * D, int(stream))
+            else:
+                fvk.quantize_fp8_static_fp16(
+                    attn_out_ptr, xn_fp8_ptr, int(scales_dev["act_o"][li]),
+                    T * D, int(stream),
+                )
             gemm.fp8_nn_bias(
                 xn_fp8_ptr, int(weights["o_w"][li]), o_proj_out, int(weights["o_b"][li]),
                 T, D, D, float(weights["alpha_o"][li]), int(stream),
@@ -711,29 +846,45 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
             fvk.add_bias_fp16(o_proj_out, int(weights["o_b"][li]), T, D, int(stream))
 
         # ── Residual 1: h += o_proj_out ────────────────────────────────
-        fvk.residual_add_fp16(h_ptr, o_proj_out, T * D, int(stream))
+        _res(h_ptr, o_proj_out, T * D)
 
-        # ── Pre-FF LayerNorm ───────────────────────────────────────────
-        fvk.layer_norm_fp16(
-            h_ptr, int(weights["norm3_w"][li]), int(weights["norm3_b"][li]),
-            xn_ptr, T, D, 1e-5, int(stream),
-        )
+        # ── Pre-FF LayerNorm (+ fused FP8 quantize on the vec tier) ────
+        if vec and use_fp8:
+            fvk.layer_norm_fp8_static_fp16_vec(
+                h_ptr, int(weights["norm3_w"][li]), int(weights["norm3_b"][li]),
+                xn_fp8_ptr, int(scales_dev["act_fc1"][li]), T, D, 1e-5,
+                int(stream))
+        elif vec:
+            fvk.layer_norm_fp16_vec(
+                h_ptr, int(weights["norm3_w"][li]), int(weights["norm3_b"][li]),
+                xn_ptr, T, D, 1e-5, int(stream))
+        else:
+            fvk.layer_norm_fp16(
+                h_ptr, int(weights["norm3_w"][li]), int(weights["norm3_b"][li]),
+                xn_ptr, T, D, 1e-5, int(stream),
+            )
 
         # ── FF: 2048 → 8192 (GELU) → 2048 ──────────────────────────────
         if use_fp8:
-            fvk.quantize_fp8_static_fp16(
-                xn_ptr, xn_fp8_ptr, int(scales_dev["act_fc1"][li]),
-                T * D, int(stream),
-            )
+            if not vec:
+                fvk.quantize_fp8_static_fp16(
+                    xn_ptr, xn_fp8_ptr, int(scales_dev["act_fc1"][li]),
+                    T * D, int(stream),
+                )
             gemm.fp8_nn_gelu_bias(
                 xn_fp8_ptr, int(weights["fc1_w"][li]), fc1_out_ptr,
                 int(weights["fc1_b"][li]),
                 T, FF, D, float(weights["alpha_fc1"][li]), int(stream),
             )
-            fvk.quantize_fp8_static_fp16(
-                fc1_out_ptr, fc1_fp8_ptr, int(scales_dev["act_fc2"][li]),
-                T * FF, int(stream),
-            )
+            if vec:
+                fvk.quantize_fp8_static_fp16_vec(
+                    fc1_out_ptr, fc1_fp8_ptr, int(scales_dev["act_fc2"][li]),
+                    T * FF, int(stream))
+            else:
+                fvk.quantize_fp8_static_fp16(
+                    fc1_out_ptr, fc1_fp8_ptr, int(scales_dev["act_fc2"][li]),
+                    T * FF, int(stream),
+                )
             gemm.fp8_nn_bias(
                 fc1_fp8_ptr, int(weights["fc2_w"][li]), o_proj_out,
                 int(weights["fc2_b"][li]),
@@ -747,11 +898,12 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
             fvk.add_bias_fp16(o_proj_out, int(weights["fc2_b"][li]), T, D, int(stream))
 
         # ── Residual 2: h += fc2_out ───────────────────────────────────
-        fvk.residual_add_fp16(h_ptr, o_proj_out, T * D, int(stream))
+        _res(h_ptr, o_proj_out, T * D)
 
 
 def dit_forward(gemm, fvk, bufs, weights, dims,
-                *, attn, stream: int = 0, layers_subset=None) -> None:
+                *, attn, stream: int = 0, layers_subset=None,
+                fvk_fp4=None) -> None:
     """32-layer ``AlternateVLDiT`` (interleave_self_attention=True,
     attend_text_every_n_blocks=2). All bf16 GEMMs (no FP8 — N1.6 pattern).
 
@@ -822,12 +974,100 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
 
     layer_iter = range(32) if layers_subset is None else list(layers_subset)
 
+    # NVFP4 fast path: every DiT GEMM (fused QKV / cross-Q / O / FFN up /
+    # FFN down) runs as a block-scaled NVFP4 GEMM with a fused bf16 bias
+    # epilogue. At M=Sa=41 the DiT is weight-bandwidth-bound, so halving
+    # the weight bytes is the dominant win; the fused epilogues (bias,
+    # bias+residual, bias+GELU+fp4out) and the fused norm->fp4 front-ends
+    # additionally remove most of the per-layer elementwise launches.
+    use_fp4 = fvk_fp4 is not None and "ff_proj_w_fp4" in weights
+
+    def _ck(rc, what, li):
+        if rc != 0:
+            raise RuntimeError(
+                f"N1.7 DiT FP4 {what} layer {li} failed rc={rc}")
+
     for li in layer_iter:
         is_self = (li % 2 == 1)
         # Backend's ``dit_self`` and ``dit_cross`` sites are indexed
         # cross-only / self-only (16 entries each, NOT the full 0..31
         # layer index). Map here.
         j_attn = (li - 1) // 2 if is_self else li // 2
+
+        if use_fp4:
+            xn_fp4, xn_sfa = int(bufs["xn_fp4"]), int(bufs["xn_sfa"])
+            slots = attn.get_slot_ptrs("dit_self" if is_self else "dit_cross",
+                                       j_attn)
+            Q_ptr, K_ptr, V_ptr, O_ptr = (slots["Q"], slots["K"], slots["V"],
+                                          slots["O"])
+            # AdaLN-modulated norm1 -> fp4 + SFA (one fused kernel).
+            rc = fvk_fp4.ada_layer_norm_fp4_sfa_bf16(
+                h_ptr, int(weights["scale_msa"][li]),
+                int(weights["shift_msa"][li]),
+                xn_fp4, xn_sfa, Sa, D, 1e-5, int(stream))
+            _ck(rc, "adaln", li)
+            if is_self:
+                j = (li - 1) // 2
+                rc = fvk_fp4.cutlass_fp4_gemm_bias_bf16(
+                    xn_fp4, xn_sfa,
+                    int(weights["qkv_w_fp4"][j]), int(weights["qkv_sfb"][j]),
+                    int(weights["qkv_b_fp4"][j]), int(bufs["qkv_buf"]),
+                    Sa, 3 * D, D, int(stream))
+                _ck(rc, "qkv", li)
+                if not bufs.get("qkv_strided"):
+                    # The self-attn slots normally alias the fused QKV
+                    # output (token stride 3D); split into packed per-slot
+                    # buffers only when they do not.
+                    fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), Q_ptr, Sa, D, 3 * D, 0, int(stream))
+                    fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), K_ptr, Sa, D, 3 * D, D, int(stream))
+                    fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), V_ptr, Sa, D, 3 * D, 2 * D, int(stream))
+                attn.run("dit_self", j_attn, q_seq=Sa, kv_seq=Sa,
+                         stream=int(stream))
+            else:
+                rc = fvk_fp4.cutlass_fp4_gemm_bias_bf16(
+                    xn_fp4, xn_sfa,
+                    int(weights["q_w_fp4"][j_attn]),
+                    int(weights["q_sfb"][j_attn]),
+                    int(weights["q_b"][li]), Q_ptr,
+                    Sa, D, D, int(stream))
+                _ck(rc, "q", li)
+                target_text = (li % 4 == 0)
+                kv_seq = Skv_text if target_text else Skv_image
+                attn.run("dit_cross", j_attn, q_seq=Sa, kv_seq=kv_seq,
+                         stream=int(stream))
+            # O projection: quantize the attention output, then fused
+            # bias + residual straight into h.
+            rc = fvk_fp4.quantize_fp4_dynamic_sfa_bf16_vec(
+                O_ptr, int(bufs["octx_fp4"]), int(bufs["octx_sfa"]),
+                Sa, D, False, int(stream))
+            _ck(rc, "o-quant", li)
+            rc = fvk_fp4.cutlass_fp4_gemm_bias_res_bf16(
+                int(bufs["octx_fp4"]), int(bufs["octx_sfa"]),
+                int(weights["o_w_fp4"][li]), int(weights["o_sfb"][li]),
+                int(weights["o_b"][li]), h_ptr, h_ptr,
+                Sa, D, D, int(stream))
+            _ck(rc, "o", li)
+            # FFN: LN -> fp4, up GEMM with fused bias+GELU+fp4out, down
+            # GEMM with fused bias+residual into h.
+            rc = fvk_fp4.layer_norm_no_affine_fp4_sfa_bf16(
+                h_ptr, xn_fp4, xn_sfa, Sa, D, 1e-5, int(stream))
+            _ck(rc, "ffn-ln", li)
+            rc = fvk_fp4.cutlass_fp4_gemm_bias_gelu_fp4out_bf16(
+                xn_fp4, xn_sfa,
+                int(weights["ff_proj_w_fp4"][li]),
+                int(weights["ff_proj_sfb"][li]),
+                int(weights["ff_proj_b"][li]),
+                int(bufs["hid_fp4"]), int(bufs["hid_sfa"]),
+                Sa, FF, D, int(stream))
+            _ck(rc, "ffn-up", li)
+            rc = fvk_fp4.cutlass_fp4_gemm_bias_res_bf16(
+                int(bufs["hid_fp4"]), int(bufs["hid_sfa"]),
+                int(weights["ff_down_w_fp4"][li]),
+                int(weights["ff_down_sfb"][li]),
+                int(weights["ff_down_b"][li]), h_ptr, h_ptr,
+                Sa, D, FF, int(stream))
+            _ck(rc, "ffn-down", li)
+            continue
 
         # ── AdaLN modulated norm1 ─────────────────────────────────────
         # For self-attn FP8 QKV, fuse the AdaLN and the FP8 quantize into one

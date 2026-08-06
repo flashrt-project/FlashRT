@@ -85,9 +85,17 @@ Baseline comparisons and source methodology live in [Benchmark Comparison](docs/
 | Hardware | Mode | Latency | Throughput | Source |
 |---|---|---:|---:|---|
 | Jetson AGX Thor | FP8, 2-view | **44.0 ms** | **23 Hz** | [Thor VLA](examples/thor/README.md#thor-vla-performance) |
-| Jetson AGX Thor | NVFP4, 2-view | **39.78 ms** | **25 Hz** | [NVFP4](#nvfp4-encoder-ffn-pi05-only) |
-| Jetson AGX Thor | NVFP4, 3-view | **51.51 ms** | **19 Hz** | [NVFP4](#nvfp4-encoder-ffn-pi05-only) |
+| Jetson AGX Thor | NVFP4 + FA4, 1-view † | **23.01 ms** | **43 Hz** | [Pi0.5 Thor NVFP4](docs/pi05_thor_decoder_fp4_e2e.md) |
+| Jetson AGX Thor | NVFP4 + FA4, 2-view | **27.17 ms** | **37 Hz** | [Pi0.5 Thor NVFP4](docs/pi05_thor_decoder_fp4_e2e.md) |
+| Jetson AGX Thor | NVFP4 + FA4, 3-view | **31.74 ms** | **32 Hz** | [Pi0.5 Thor NVFP4](docs/pi05_thor_decoder_fp4_e2e.md) |
 | RTX 5090 | FP8, 2-view | **17.58 ms** | **57 Hz** | [Blackwell VLA](examples/blackwell/README.md#vla-latency-rtx-5090) |
+
+† At 1 view the per-sample action cosine against the FP8 reference does
+not clear the 0.995 gate (worst sample 0.971): with single-view input the
+flow-matching field itself is near a decision boundary on some samples,
+so trajectories land in a different action basin. See
+[one-view fidelity](docs/pi05_thor_decoder_fp4_e2e.md#one-view-fidelity-diagnosis-and-passing-configuration-2026-07-27)
+for the diagnosis and a configuration that does clear the gates at 1 view.
 
 #### Pi0
 
@@ -111,8 +119,11 @@ Baseline comparisons and source methodology live in [Benchmark Comparison](docs/
 
 | Hardware | Mode | Latency | Throughput | Source |
 |---|---|---:|---:|---|
-| Jetson AGX Thor | DiT path | **49 ms** | **20 Hz** | [GROOT N1.7 API](#groot-n17-rtx) |
-| RTX 5090 | DiT path | **22 ms** | **45 Hz** | [GROOT N1.7 API](#groot-n17-rtx) |
+| Jetson AGX Thor | NVFP4 + FA4, LIBERO 1-view | **23.7 ms** | **42 Hz** | [N1.7 Thor NVFP4](USAGE.md#groot-n17-thor) |
+| Jetson AGX Thor | FP8, LIBERO 1-view | **36.8 ms** | **27 Hz** | [Benchmark comparison](docs/benchmark_comparison.md#groot-n17-on-jetson-agx-thor) |
+| Jetson AGX Thor | NVFP4 + FA4, 2-view | **29.9 ms** | **33 Hz** | [N1.7 Thor NVFP4](USAGE.md#groot-n17-thor) |
+| Jetson AGX Thor | FP8, 2-view | **50.2 ms** | **20 Hz** | [GROOT N1.7 API](#groot-n17-rtx) |
+| RTX 5090 | FP8, 2-view base, full graph | **16.6 ms** | **60 Hz** | [GROOT N1.7 API](#groot-n17-rtx) |
 
 #### Pi0-FAST
 
@@ -169,6 +180,22 @@ RTX 5090, NVFP4 language stack + FP8 ViT, image + text:
 |---|---:|---:|---:|---|
 | Full resolution | 1581 | **~100 ms** | **~150 tok/s** | [Qwen3-VL RTX 5090](docs/qwen3_vl_nvfp4.md#1-headline-performance) |
 | 0.5 MP cap | 473 | **~32 ms** | **~150 tok/s** | [Qwen3-VL resolution sweep](docs/qwen3_vl_nvfp4.md#ttft-vs-resolution-the-dominant-knob) |
+
+#### Qwen3-VL-2B on Jetson
+
+Official BF16 checkpoint, full-resolution image + text (1581 prompt tokens,
+6256 vision patches), with opt-in weight-only decode quantization:
+
+| Hardware | Decode tier | Prefill | Decode | Source |
+|---|---|---:|---:|---|
+| Jetson AGX Thor | BF16 | **230 ms** (eager) | **66.4 tok/s** | [Qwen3-VL Jetson Thor](docs/qwen3_vl_thor.md#jetson-thor-validation) |
+| Jetson AGX Thor | `w8` (FP8 e4m3) | 230 ms (eager) | **106.6 tok/s** | [Measured tiers](docs/qwen3_vl_thor.md#measured-tiers) |
+| Jetson AGX Thor | `w4` (NVFP4 e2m1) | 230 ms (eager) | **158.1 tok/s** | [Measured tiers](docs/qwen3_vl_thor.md#measured-tiers) |
+| Jetson AGX Orin | BF16 | 927 ms (graph) | 36.8 tok/s | [Qwen3-VL Jetson Orin](docs/qwen3_vl_rtx_bf16.md#jetson-orin-validation) |
+
+Thor prefill is eager by measurement, not omission: a prefill CUDA Graph
+prototype bought 0.3% there (GPU-bound), so it was not shipped; see
+[Where prefill time goes](docs/qwen3_vl_thor.md#where-prefill-time-goes).
 
 #### Higgs Audio v3
 
@@ -512,6 +539,7 @@ model = flash_rt.load_model(
 model.set_prompt(aux=aux, prompt="put the blue block in the green bowl")
 actions_normalized = model.infer(
     state_normalized,
+    aux=aux,  # fresh observation/model inputs
     initial_noise=initial_noise,
     use_dit_graph=True,
 )
@@ -524,7 +552,12 @@ production frontend when `use_fp16=False`; `rtx_sm89` is registered
 directly to its dedicated FP8 frontend. `use_fp16=True, use_fp8=False`
 selects the explicit RTX reference frontend for the selected hardware. It
 uses the N1.7 `set_prompt(aux=...)` / normalized-state `infer(...)`
-contract; see [USAGE.md](USAGE.md#groot-n17-rtx).
+contract. On the RTX FP8 path, the first `infer(aux=...)` lazily captures the
+backbone graph; later compatible calls replay it before the existing action
+graph, covering the complete backbone-to-action execution without rebuilding
+per-call scratch buffers. Omitting `aux` keeps the original eager backbone from
+`set_prompt()` and does not capture the optional graph. See
+[USAGE.md](USAGE.md#groot-n17-rtx).
 
 ### Autotune
 
@@ -587,7 +620,8 @@ data regardless of cache.
 Optional NVFP4 (Blackwell block-scaled FP4) quantization on the Pi0.5 encoder
 FFN stack. Implemented for **Pi0.5 torch and JAX on Thor** — passing
 `use_fp4=True` with any other config (pi0 / groot / pi0fast) emits a warning
-and uses the FP8 route.
+and uses the FP8 route. (`config="groot_n17"` on Thor has its own NVFP4
+tier behind the same flag — see [GROOT N1.7 Thor](USAGE.md#groot-n17-thor).)
 
 ```python
 model = flash_rt.load_model(
@@ -598,21 +632,41 @@ model = flash_rt.load_model(
 ```
 
 `use_fp4=True` resolves to the best-known production preset automatically:
-- `fp4_layers` = full 18 encoder FFN layers
+- `fp4_layers` = all 17 live encoder FFN layers (0-16)
 - `use_awq` = `True` — activation-aware weight quantization (AWQ)
 - `use_p1_split_gu` = `True` — P1 split-GU 2-GEMM path
+
+Adding `use_fp4_decoder=True` selects the complete Thor NVFP4 tier the
+latency table above is measured with, resolving the remaining sub-flags to
+`awq_alpha=0.8`, `use_fp4_encoder_attn=True`, `use_fp4_siglip_ffn=True` and
+`encoder_p1_combiner="epilogue_hw"`:
+
+```python
+model = flash_rt.load_model(
+    checkpoint, config="pi05", framework="torch", hardware="thor",
+    num_views=3,
+    use_fp4=True, use_fp4_decoder=True,
+    use_fa4=True,    # attention backend; independent of the NVFP4 flags
+)
+```
+
+The decoder path is a strict opt-in: unavailable kernels and unsupported
+modes raise errors rather than selecting FP8 projections. `use_fa4=True` is
+also supported on the FP8 frontend and is what the FP8 baseline in that
+table runs, so the reported speedup isolates NVFP4 rather than the
+attention backend.
 
 Advanced users can override any sub-flag explicitly at `load_model()` call
 time (e.g. `fp4_layers=(7, 8, 9), use_awq=False` reverts to the conservative
 L7-9 subset).
 
 **What it does**:
-- Gate+Up and Down GEMMs across all 18 encoder FFN layers run in NVFP4
+- Gate+Up and Down GEMMs across all 17 live encoder FFN layers run in NVFP4
   (block-size 16, UE4M3 block scales) instead of FP8.
 - **AWQ** applies activation-aware per-input-channel pre-scaling to the
   quantized weights, with the inverse scale fused into pre-GEMM kernels
   (`residual_add_rms_norm_mul_fp4_sfa`, `geglu_two_mul_fp4_to_fp4`). This
-  preserves precision under 18-layer FP4 (without AWQ, full-scope FP4 cos
+  preserves precision under full-scope FP4 (without AWQ, full-scope FP4 cos
   drops from ~0.998 to ~0.33 due to cumulative multi-layer drift).
 - **P1 split-GU** splits the merged Gate+Up GEMM into separate gate_proj /
   up_proj NVFP4 GEMMs that emit packed FP4 + SFA directly (via
@@ -632,10 +686,10 @@ L7-9 subset).
 | Config | Task success | E2E P50 (normal) |
 |---|---|---|
 | FP8 baseline | 491 / 500 (98.2%) | ~43.5 ms |
-| **NVFP4 full-18 + AWQ + P1 (`--use_fp4`)** | **491 / 500 (98.2%)** | **~43.5 ms** |
+| **NVFP4 full-17 + AWQ + P1 (`--use_fp4`)** | **491 / 500 (98.2%)** | **~43.5 ms** |
 
 Task-level parity with the FP8 baseline (491/500 for both — P1 + AWQ
-preserves FP4 precision across all 18 FFN layers).
+preserves FP4 precision across all 17 live FFN layers).
 
 **Replay-latency benchmark (1-view / 2-view / 3-view, N=8 LIBERO
 stratified calibration, 50 graph replays, Thor SM110)**:
@@ -657,7 +711,9 @@ Reproduce with
 (defaults now include `jax_fp4`).
 
 **What's next**:
-- Decoder FP4 (S2 precision-validated set — 72 weight tensors, ~-6 ms estimated)
+- Decoder FP4 is implemented as a draft all-projection W4A4 path. The current
+  multi-view latency and precision blockers are tracked in
+  [`docs/pi05_thor_decoder_fp4_e2e.md`](docs/pi05_thor_decoder_fp4_e2e.md).
 - `geglu_two_mul` SFA-prefetch optimization (O1, ~-0.5-1.1 ms)
 - SigLIP FFN FP4 / AWQ auto-tune / Pi0.6 port
 
@@ -1038,14 +1094,14 @@ examples/
 - **Pi0.5** (`config="pi05"`) — [quickstart](#quick-start), [API reference](USAGE.md#api-reference), [NVFP4 notes](USAGE.md#nvfp4-pi05-only), [Thor example](examples/thor/README.md), [RTX 5090 example](examples/blackwell/README.md)
 - **Pi0** (`config="pi0"`) — [API snippets](#api-snippets), [usage guide](USAGE.md#api-reference)
 - **GROOT N1.6** (`config="groot"`) — [API snippets](#api-snippets), [GROOT embodiment slots](#groot-n16-embodiment-slots)
-- **GROOT N1.7** (`config="groot_n17"`) — 49 ms on Jetson AGX Thor, 22 ms on RTX 5090; [usage guide](USAGE.md#groot-n17-rtx), [API snippet](#groot-n17-rtx)
+- **GROOT N1.7** (`config="groot_n17"`) — 23.7 ms on Jetson AGX Thor (NVFP4 + FA4 tier, LIBERO 1-view; 36.8 ms FP8), 16.6 ms on RTX 5090 (2-view base, full graph); [usage guide](USAGE.md#groot-n17-rtx), [API snippet](#groot-n17-rtx)
 - **Pi0-FAST** (`config="pi0fast"`) — [usage guide](USAGE.md#pi0-fast), [performance modes](#pi0-fast-performance-modes)
 - **LingBot-VLA** — [LingBot usage](docs/lingbot_usage.md), [Thor latency](docs/lingbot_usage.md#5-accuracy--latency-thor-sm_110-cuda-graph-replay)
 - **Motus Stage3 RTX beta** (`config="motus"`) — [Motus usage](docs/motus_usage_beta.md), [legacy async chunk runner](docs/rtc_lite_design.md)
 - **Wan2.2 TI2V-5B** (`config="wan22_ti2v_5b"`) — [Wan2.2 usage](docs/wan22_usage.md)
 - **Cosmos3-Nano text-to-video** (`config="cosmos3_video"`) — RTX 5090 BF16/FP8 denoise and complete benchmark workflow; [usage and performance](docs/cosmos3_video_usage.md)
 - **Cosmos3-Edge AV inverse dynamics and Reasoner** (`config="cosmos3_edge"`) — Jetson AGX Thor official baseline, 6.60x no-cache AV denoise, and NVFP4 multimodal chat decode; [complete usage and performance](docs/cosmos3_edge_thor.md)
-- **Qwen3-VL-8B** — RTX 5090 NVFP4/FP8 multimodal path and RTX 4090 official-FP8 path; [RTX 5090 usage](docs/qwen3_vl_nvfp4.md), [RTX 4090 usage](docs/qwen3_vl_fp8_sm89.md)
+- **Qwen3-VL-8B** — RTX 5090 NVFP4/FP8 multimodal path, RTX 4090 official-FP8 path, and Jetson BF16 paths for Thor and Orin; [RTX 5090 usage](docs/qwen3_vl_nvfp4.md), [RTX 4090 usage](docs/qwen3_vl_fp8_sm89.md), [Jetson Thor usage](docs/qwen3_vl_thor.md), [Jetson Orin usage](docs/qwen3_vl_rtx_bf16.md)
 - **MiniMax-Remover** — FP8 transformer + NVFP4 VAE video inpainting; [usage and performance](docs/minimax_remover_usage.md)
 - **MelBandRoformer** — kernelized FP8 audio source separation; [usage and performance](docs/melband_roformer_usage.md)
 - **OmniVoice TTS** — BF16/FP4 acceleration and HTTP serving; [serving quickstart](serving/omnivoice_agent/README.md)
@@ -1065,13 +1121,13 @@ artifacts and dispatch map are.
 
 | Hardware | SM | Status | Validated paths / notes |
 |---|---:|---|---|
-| Jetson AGX Thor | SM110 | Production target | Pi0, Pi0.5, GROOT N1.6, Pi0-FAST, Qwen3.6 Thor path, Lingbot, and Cosmos3-Edge AV/Reasoner; CUTLASS FMHA / Thor attention paths; Pi0.5 FP8 and NVFP4 validation live in [examples/thor](examples/thor/README.md#thor-vla-performance). |
+| Jetson AGX Thor | SM110 | Production target | Pi0, Pi0.5, GROOT N1.6, Pi0-FAST, Qwen3.6 Thor path, Lingbot, Cosmos3-Edge AV/Reasoner, and Qwen3-VL BF16 with opt-in W8/W4 decode ([docs](docs/qwen3_vl_thor.md)); CUTLASS FMHA / Thor attention paths; Pi0.5 FP8 and NVFP4 validation live in [examples/thor](examples/thor/README.md#thor-vla-performance). |
 | RTX 5090 | SM120 | Production target | Pi0/Pi0.5/GROOT/Pi0-FAST RTX paths, Qwen3.6, Qwen3-8B, Qwen3-VL, Higgs Audio v3 FP8, Motus, Wan2.2, Cosmos3-Nano, and HF Kernel Hub package validation; see [RTX 5090 latency](examples/blackwell/README.md#vla-latency-rtx-5090). |
 | RTX 4090 | SM89 | Validated / supported target | RTX VLA build path and deployment recipe; Higgs BF16 path compiles/configures. See [deployment_rtx4090.md](docs/deployment_rtx4090.md). |
 | RTX 5060 Ti | SM120 | Community validated | Pi0.5 FP8 and LIBERO Spatial submission; see [Community benchmarks](#community-benchmarks). |
 | RTX 4060 Ti | SM89 | Validated build/run target | Included in current tested hardware list; run local benchmarks before making model-specific latency claims. |
 | NVIDIA L40 | SM89 | Community validated | Pi0.5 FP8 submission; see [Community benchmarks](#community-benchmarks). |
-| Jetson AGX Orin | SM87 | Community port | Pi0.5 INT8/BF16 paths, Orin tile dispatch, frame-cache inference; see [deployment_orin.md](docs/deployment_orin.md). |
+| Jetson AGX Orin | SM87 | Community port | Pi0.5 INT8/BF16 paths, Orin tile dispatch, frame-cache inference, and Qwen3-VL BF16 with opt-in INT8/INT4 decode ([docs](docs/qwen3_vl_rtx_bf16.md)); see [deployment_orin.md](docs/deployment_orin.md). |
 | A100 / A10 / RTX 3090 / RTX 3080 / A5000 / A6000 and other SM80/86/89 GPUs | SM80/86/89 | Build target | CMake and FA2 gates cover Ampere/Ada shapes. Treat unlisted cards as expected to build until a benchmark or regression row is submitted. |
 
 Feature notes:

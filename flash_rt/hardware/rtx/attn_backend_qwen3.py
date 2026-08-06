@@ -51,7 +51,8 @@ class RtxFlashAttnBackendQwen3:
                  num_q_heads: int | None = None,
                  num_kv_heads: int | None = None,
                  head_dim: int | None = None,
-                 device: str = "cuda"):
+                 device: str = "cuda",
+                 use_int8_kv: bool = False):
         import os
 
         import torch
@@ -117,6 +118,47 @@ class RtxFlashAttnBackendQwen3:
             n_splits, 1, self.NUM_Q_HEADS, self._max_q_seq, self.HEAD_DIM,
             dtype=torch.float32, device=d,
         )
+
+        # ── INT8 KV cache (opt-in) ──
+        # int8 mirrors of K/V with one bf16 scale per (position, kv-head) row.
+        # q=1 decode reads these instead of the bf16 cache, halving the KV
+        # bytes per step; prefill still runs FA2 against the bf16 cache.
+        # Everything is allocated here so the decode path stays graph-safe.
+        self._use_int8_kv = bool(use_int8_kv)
+        if self._use_int8_kv:
+            from flash_rt import flash_rt_qwen3_vl_kernels as _vlk
+            for fn in ('qwen3_kv_rows_quant_int8',
+                       'qwen3_attn_decode_int8kv_partial',
+                       'qwen3_attn_decode_int8kv_combine'):
+                if not hasattr(_vlk, fn):
+                    raise RuntimeError(
+                        f'use_int8_kv=True requires {fn} in '
+                        'flash_rt_qwen3_vl_kernels (rebuild with '
+                        '-DFLASHRT_BUILD_QWEN3_VL=ON)')
+            self._vlk = _vlk
+            if (self.NUM_Q_HEADS, self.NUM_KV_HEADS, self.HEAD_DIM) != (
+                    16, 8, 128):
+                raise RuntimeError(
+                    'the int8-KV decode kernel is specialized for GQA 16Q/8KV '
+                    f'head_dim=128; got {self.NUM_Q_HEADS}Q/'
+                    f'{self.NUM_KV_HEADS}KV head_dim={self.HEAD_DIM}')
+            self.K8 = torch.empty(
+                self.NUM_FULL_LAYERS, self._max_seq,
+                self.NUM_KV_HEADS, self.HEAD_DIM,
+                dtype=torch.int8, device=d)
+            self.V8 = torch.empty_like(self.K8)
+            self.KS = torch.empty(
+                self.NUM_FULL_LAYERS, self._max_seq, self.NUM_KV_HEADS,
+                dtype=bf16, device=d)
+            self.VS = torch.empty_like(self.KS)
+            n_chunks_max = (self._max_seq + 127) // 128
+            self._i8_part_o = torch.empty(
+                n_chunks_max, self.NUM_Q_HEADS, self.HEAD_DIM,
+                dtype=torch.float32, device=d)
+            self._i8_part_m = torch.empty(
+                n_chunks_max, self.NUM_Q_HEADS,
+                dtype=torch.float32, device=d)
+            self._i8_part_l = torch.empty_like(self._i8_part_m)
 
         # FA2 module. Fail loud if missing — Qwen3 path requires the
         # vendored fp16/bf16 FA2 build.
@@ -252,6 +294,37 @@ class RtxFlashAttnBackendQwen3:
         self.K_cache.zero_()
         self.V_cache.zero_()
 
+    # ── INT8 KV maintenance (no-ops unless use_int8_kv) ──
+
+    def quantize_kv_rows(self, layer_idx: int, pos: int,
+                         stream: int = 0) -> None:
+        """Mirror the K/V rows a decode step just wrote at (layer, pos) into
+        int8. Graph-safe: fixed pointers, one tiny launch each."""
+        if not self._use_int8_kv:
+            return
+        nkv = self.NUM_KV_HEADS
+        self._vlk.qwen3_kv_rows_quant_int8(
+            self.K_cache[layer_idx, pos].data_ptr(),
+            self.K8[layer_idx, pos].data_ptr(),
+            self.KS[layer_idx, pos].data_ptr(), nkv, stream)
+        self._vlk.qwen3_kv_rows_quant_int8(
+            self.V_cache[layer_idx, pos].data_ptr(),
+            self.V8[layer_idx, pos].data_ptr(),
+            self.VS[layer_idx, pos].data_ptr(), nkv, stream)
+
+    def quantize_kv_prefix(self, kv_len: int, stream: int = 0) -> None:
+        """Bulk-mirror KV[0:kv_len] for every layer after prefill."""
+        if not self._use_int8_kv:
+            return
+        n_rows = int(kv_len) * self.NUM_KV_HEADS
+        for L in range(self.NUM_FULL_LAYERS):
+            self._vlk.qwen3_kv_rows_quant_int8(
+                self.K_cache[L, 0].data_ptr(), self.K8[L, 0].data_ptr(),
+                self.KS[L, 0].data_ptr(), n_rows, stream)
+            self._vlk.qwen3_kv_rows_quant_int8(
+                self.V_cache[L, 0].data_ptr(), self.V8[L, 0].data_ptr(),
+                self.VS[L, 0].data_ptr(), n_rows, stream)
+
     # ── Attention call ──
 
     def run(self, site: str, layer_idx: int, q_seq: int,
@@ -297,6 +370,28 @@ class RtxFlashAttnBackendQwen3:
         # binding (template Is_causal=true). Both paths handle GQA
         # natively via FA2's h_h_k_ratio — no repeat_interleave / SDPA
         # detour.
+        if self._use_int8_kv and q_seq == 1:
+            # Flash-decoding over the int8 KV mirrors: half the KV HBM bytes
+            # of the bf16 FA2 path. Partials + combine buffers were
+            # pre-allocated in __init__, so this is graph-safe.
+            n_chunks = (kv_seq + 127) // 128
+            self._vlk.qwen3_attn_decode_int8kv_partial(
+                self.Q_buf[0, 0].data_ptr(),
+                self.K8[layer_idx].data_ptr(),
+                self.V8[layer_idx].data_ptr(),
+                self.KS[layer_idx].data_ptr(),
+                self.VS[layer_idx].data_ptr(),
+                self._i8_part_o.data_ptr(),
+                self._i8_part_m.data_ptr(),
+                self._i8_part_l.data_ptr(),
+                kv_seq, n_chunks, float(softmax_scale), stream)
+            self._vlk.qwen3_attn_decode_int8kv_combine(
+                self._i8_part_o.data_ptr(),
+                self._i8_part_m.data_ptr(),
+                self._i8_part_l.data_ptr(),
+                self.O_buf[0, 0].data_ptr(), n_chunks, stream)
+            return o.data_ptr()
+
         if self._use_fvk_fa2 and q_seq == 1:
             self._fa2_fwd(
                 Q=q.data_ptr(), K=k.data_ptr(), V=v.data_ptr(),

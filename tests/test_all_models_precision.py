@@ -108,7 +108,7 @@ print(json.dumps({
 
 # ══════════════════════════════════════════════════════════════
 # Pi0.5 FP4 preset: same monkey-patch flow as Pi0.5, with
-# use_fp4=True (auto = 18 layers + AWQ + P1 split-GU).
+# use_fp4=True (auto = 17 live layers + AWQ + P1 split-GU).
 # Compared vs pytorch fp32 ref, FP8 prod canary, and old torch.
 # ══════════════════════════════════════════════════════════════
 PI05_FP4_SCRIPT = '''

@@ -376,6 +376,9 @@ def test_qwen3_vl_rtx_bf16_graph_caches_are_lru_bounded(monkeypatch):
     monkeypatch.setattr(
         Qwen3VlTorchFrontendRtxBF16, "_decode_token_tensor",
         lambda self, token, *, cache_pos, rope_pos: None)
+    monkeypatch.setattr(
+        Qwen3VlTorchFrontendRtxBF16, "_decode_body_da",
+        lambda self, *, cache_pos, rope_pos, out_idx: None)
 
     fe = Qwen3VlTorchFrontendRtxBF16.__new__(
         Qwen3VlTorchFrontendRtxBF16)
@@ -384,6 +387,7 @@ def test_qwen3_vl_rtx_bf16_graph_caches_are_lru_bounded(monkeypatch):
     fe._prefill_graphs = collections.OrderedDict()
     fe._pg_buffers = collections.OrderedDict()
     fe._decode_graphs = collections.OrderedDict()
+    fe._decode_da_graphs = collections.OrderedDict()
     fe._graph_stream = _FakeStream()
     fe._static_token_id = object()
 
@@ -405,16 +409,82 @@ def test_qwen3_vl_rtx_bf16_graph_caches_are_lru_bounded(monkeypatch):
 
     assert len(fe._decode_graphs) == fe.max_decode_graphs
     assert list(fe._decode_graphs) == [(3, 103), (4, 104)]
+
+    for i in range(5):
+        fe._ensure_decode_graph_da(cache_pos=i, rope_pos=100 + i,
+                                   out_idx=i + 1)
+
+    assert len(fe._decode_da_graphs) == fe.max_decode_graphs
+    assert list(fe._decode_da_graphs) == [(3, 103, 4), (4, 104, 5)]
+
     stats = fe.graph_cache_stats()
     assert stats["prefill"]["graph_count"] == 2
     assert stats["prefill"]["buffer_count"] == 2
     assert stats["decode"]["graph_count"] == 2
+    assert stats["decode_device_argmax"]["graph_count"] == 2
 
     fe.clear_graphs()
 
     assert fe._prefill_graphs == collections.OrderedDict()
     assert fe._pg_buffers == collections.OrderedDict()
     assert fe._decode_graphs == collections.OrderedDict()
+    assert fe._decode_da_graphs == collections.OrderedDict()
+
+
+def test_qwen3_vl_rtx_bf16_device_argmax_key_includes_ring_slot(monkeypatch):
+    """base_slot and base_rope shift together with prompt length, so two
+    prompts of different lengths hit the same (cache_pos, rope_pos) at
+    different ring slots. The captured body bakes in a write to one slot, so
+    the slot must be part of the cache key or the second prompt replays the
+    first's graph and writes the wrong slot."""
+    import torch
+
+    from flash_rt.frontends.torch.qwen3_vl_rtx_bf16 import (
+        Qwen3VlTorchFrontendRtxBF16,
+    )
+
+    class _FakeStream:
+        cuda_stream = 0
+
+        def wait_stream(self, _other):
+            pass
+
+        def synchronize(self):
+            pass
+
+    monkeypatch.setattr(torch.cuda, "current_stream",
+                        lambda: _FakeStream(), raising=False)
+    monkeypatch.setattr(torch.cuda, "stream",
+                        lambda _stream: contextlib.nullcontext(),
+                        raising=False)
+    monkeypatch.setattr(torch.cuda, "graph",
+                        lambda _graph, stream=None: contextlib.nullcontext(),
+                        raising=False)
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: object(),
+                        raising=False)
+    monkeypatch.setattr(torch, "inference_mode",
+                        lambda: contextlib.nullcontext())
+    monkeypatch.setattr(
+        Qwen3VlTorchFrontendRtxBF16, "_decode_body_da",
+        lambda self, *, cache_pos, rope_pos, out_idx: None)
+
+    fe = Qwen3VlTorchFrontendRtxBF16.__new__(Qwen3VlTorchFrontendRtxBF16)
+    fe.max_decode_graphs = 8
+    fe._decode_da_graphs = collections.OrderedDict()
+    fe._graph_stream = _FakeStream()
+
+    # Prompt A: S=100, so i=0 -> (100, 100) writing ring slot 1.
+    a = fe._ensure_decode_graph_da(cache_pos=100, rope_pos=100, out_idx=1)
+    # Prompt B: S=99, so i=1 -> (100, 100) too, but writing ring slot 2.
+    b = fe._ensure_decode_graph_da(cache_pos=100, rope_pos=100, out_idx=2)
+
+    assert a is not b, 'graph reused for a different ring slot'
+    assert len(fe._decode_da_graphs) == 2
+    assert all(len(k) == 3 for k in fe._decode_da_graphs), \
+        'device-argmax cache key must include the ring slot'
+    # The same (position, slot) triple still hits the cache.
+    assert fe._ensure_decode_graph_da(
+        cache_pos=100, rope_pos=100, out_idx=1) is a
 
 
 def test_qwen3_vl_rtx_bf16_prefill_graph_restages_after_clear(monkeypatch):

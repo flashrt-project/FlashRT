@@ -202,7 +202,7 @@ ref_tokens  = ref["arg7_tokenized_prompt"][0][:int(tok_mask.sum())].astype(np.in
 from flash_rt.frontends.torch.pi05_thor_fp4 import Pi05TorchFrontendThorFP4
 pipe = Pi05TorchFrontendThorFP4(
     CKPT, num_views=3, autotune=3,
-    use_fp4_encoder_ffn=True, fp4_layers=tuple(range(18)),
+    use_fp4_encoder_ffn=True, fp4_layers=tuple(range(17)),
     use_awq=True, use_p1_split_gu=True)
 pipe.set_prompt(ref_tokens.tolist())
 
@@ -822,7 +822,7 @@ ref_tokens = ref["arg7_tokenized_prompt"][0][:int(tok_mask.sum())].astype(np.int
 from flash_rt.frontends.jax.pi05_thor_fp4 import Pi05JaxFrontendThorFP4
 pipe = Pi05JaxFrontendThorFP4(
     CKPT, num_views=3, autotune=3, weight_cache=True,
-    use_fp4_encoder_ffn=True, fp4_layers=tuple(range(18)),
+    use_fp4_encoder_ffn=True, fp4_layers=tuple(range(17)),
     use_awq=True, use_p1_split_gu=True)
 pipe.set_prompt(ref_tokens.tolist())
 

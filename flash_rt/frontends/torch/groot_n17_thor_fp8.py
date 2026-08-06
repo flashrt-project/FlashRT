@@ -293,6 +293,14 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
         # FP8 path. No activation scales are needed in this mode.
         fp16_ref = not self._KBB_USE_FP8
         sh = self._fp16_shadow_weights if fp16_ref else None
+        # Vectorized small-kernel tier (16-byte-load norm/rope/quant/expand
+        # rewrites) — opt-in via the FP4 frontend; element math matches the
+        # scalar kernels.
+        vec = bool(getattr(self, "_KBB_VEC", False))
+        # FA4 (CuTe-DSL) attention tier for the backbone's three MHA sites
+        # (ViT / LLM causal-GQA / VL-self-attn). Optional: the pipeline
+        # falls back to the fmha/cublas chain when FA4 is unavailable.
+        fa4_flag = bool(getattr(self, "_KBB_FA4", False))
 
         keep: list = []
         self._kbb_keep = keep
@@ -352,6 +360,10 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
                              "O": 4, "logits": 5, "scale": 1.0 / (48 ** 0.5)},
         )
         self._kbb_attn = attn
+        if vec:
+            # Masked-softmax attention: drops the per-layer -inf logits
+            # pre-fill (see attn_backend run()).
+            attn._use_masked_softmax = True
 
         # ═══ ViT (24L) ═══
         vit_h = buf(Sv, 1024)
@@ -382,7 +394,8 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
                     "xn_fp8": buf8(Sv, 1024).data_ptr(),
                     "o_proj_out": buf(Sv, 1024).data_ptr(),
                     "fc1_out": buf(Sv, 4096).data_ptr(),
-                    "fc1_fp8": buf8(Sv, 4096).data_ptr()}
+                    "fc1_fp8": buf8(Sv, 4096).data_ptr(),
+                    "Q_t": vitQ, "K_t": vitKk, "V_t": vitV}
         vw = {k: [] for k in (
             "norm1_w", "norm1_b", "norm2_w", "norm2_b", "q_w", "q_b",
             "k_w", "k_b", "v_w", "v_b", "o_w", "o_b", "fc1_w", "fc1_b",
@@ -448,7 +461,8 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
         P.qwen3vl_vit_forward(
             gemm=gemm, fvk=fvkm, bufs=vit_bufs, weights=vw, scales_dev=vit_scales,
             dims={"S": Sv, "D": 1024, "NH": 16, "HD": 64,
-                  "ff_inner": 4096, "Sper_view": Sv // nv},
+                  "ff_inner": 4096, "Sper_view": Sv // nv,
+                  "vec_kernels": vec, "fa4": fa4_flag},
             attn=attn, deepstack_taps=tap_layers, deepstack_capture=dcap,
             use_fp8=self._KBB_USE_FP8)
 
@@ -593,8 +607,9 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
             "h": llm_h.data_ptr(), "xn": buf(Se, 2048).data_ptr(),
             "xn_fp8": buf8(Se, 2048).data_ptr(),
             "zero_bias": self._llm_zero_bias.data_ptr(),
-            "Q": llmQ.data_ptr(), "K": buf(Se, 1024).data_ptr(),
-            "V": buf(Se, 1024).data_ptr(),
+            "Q": llmQ.data_ptr(), "K": (llmKn := buf(Se, 1024)).data_ptr(),
+            "V": (llmVn := buf(Se, 1024)).data_ptr(),
+            "Q_t": llmQ, "K_t": llmKn, "V_t": llmVn,
             "K_exp": llmKx.data_ptr(), "V_exp": llmVx.data_ptr(),
             "o_proj_out": buf(Se, 2048).data_ptr(),
             "gate_out": buf(Se, 6144).data_ptr(),
@@ -602,7 +617,8 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
             "gu_fp8": buf8(Se, 6144).data_ptr()}
         P.qwen3vl_llm_forward(
             gemm=gemm, fvk=fvkm, bufs=llm_bufs, weights=lw, scales_dev=llm_scales,
-            dims={"S": Se, "D": 2048, "NHQ": 16, "NHKV": 8, "HD": 128, "FF": 6144},
+            dims={"S": Se, "D": 2048, "NHQ": 16, "NHKV": 8, "HD": 128,
+                  "FF": 6144, "vec_kernels": vec, "fa4": fa4_flag},
             attn=attn, fp16_layers=self.PROTECT_LLM_FP16)
 
         # ═══ vlln + VL self-attn (4L) ═══
@@ -652,11 +668,13 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
                     "xn_fp8": buf8(Se, 2048).data_ptr(),
                     "o_proj_out": buf(Se, 2048).data_ptr(),
                     "fc1_out": buf(Se, 8192).data_ptr(),
-                    "fc1_fp8": buf8(Se, 8192).data_ptr()}
+                    "fc1_fp8": buf8(Se, 8192).data_ptr(),
+                    "Q_t": vsaQ, "K_t": vsaK, "V_t": vsaV}
         P.vl_self_attn_forward(
             gemm=gemm, fvk=fvkm, bufs=vsa_bufs,
             weights=vsw, scales_dev=vsa_scales,
-            dims={"T": Se, "D": 2048, "NH": 32, "HD": 64, "ff_inner": 8192},
+            dims={"T": Se, "D": 2048, "NH": 32, "HD": 64, "ff_inner": 8192,
+                  "vec_kernels": vec, "fa4": fa4_flag},
             attn=attn, use_fp8=self._KBB_USE_FP8)
         torch.cuda.synchronize()
 
@@ -666,12 +684,15 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
         # the caller before replay; the DeepStack inject scatter uses a fixed
         # index_copy (capturable) instead of boolean-mask assignment. ──
         vit_dims = {"S": Sv, "D": 1024, "NH": 16, "HD": 64,
-                    "ff_inner": 4096, "Sper_view": Sv // nv}
+                    "ff_inner": 4096, "Sper_view": Sv // nv,
+                    "vec_kernels": vec, "fa4": fa4_flag}
         ds_dims = {"Nin": Sv, "Din": 1024, "Nout": Nout, "Dmid": 4096, "Dout": 2048}
-        llm_dims = {"S": Se, "D": 2048, "NHQ": 16, "NHKV": 8, "HD": 128, "FF": 6144}
+        llm_dims = {"S": Se, "D": 2048, "NHQ": 16, "NHKV": 8, "HD": 128,
+                    "FF": 6144, "vec_kernels": vec, "fa4": fa4_flag}
         vlln_bufs = {"x": llm_h.data_ptr(), "out": vlsa_h.data_ptr()}
         vlln_w = {"vlln_w": self._vlln_w.data_ptr(), "vlln_b": self._vlln_b.data_ptr()}
-        vsa_dims = {"T": Se, "D": 2048, "NH": 32, "HD": 64, "ff_inner": 8192}
+        vsa_dims = {"T": Se, "D": 2048, "NH": 32, "HD": 64, "ff_inner": 8192,
+                    "vec_kernels": vec, "fa4": fa4_flag}
         use_fp8 = self._KBB_USE_FP8
 
         def _kbb_forward(s=0):
@@ -709,7 +730,8 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
                                   scales_dev=llm_scales, dims=llm_dims, attn=attn,
                                   fp16_layers=self.PROTECT_LLM_FP16, stream=s)
             P.vlln_forward(gemm=None, fvk=fvkm, bufs=vlln_bufs, weights=vlln_w,
-                           dims={"S": Se, "D": 2048}, stream=s)
+                           dims={"S": Se, "D": 2048, "vec_kernels": vec},
+                           stream=s)
             P.vl_self_attn_forward(gemm=gemm, fvk=fvkm, bufs=vsa_bufs, weights=vsw,
                                    scales_dev=vsa_scales, dims=vsa_dims, attn=attn,
                                    use_fp8=use_fp8, stream=s)

@@ -54,6 +54,42 @@ void patch_im2col(const half* input, half* output, int nv, cudaStream_t stream)
     patch_im2col_kernel<<<blocks, threads, 0, stream>>>(input, output, nv);
 }
 
+__global__ void patch_im2col_uint8_kernel(
+    const uint8_t* __restrict__ input,
+    const half* __restrict__ lut,
+    half* __restrict__ output,
+    int nv)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = nv * 256 * 588;
+    if (idx >= total) return;
+
+    int patch_idx = idx / 588;
+    int feat_idx = idx % 588;
+    int batch = patch_idx / 256;
+    int local_patch = patch_idx % 256;
+    int ph = local_patch / 16;
+    int pw = local_patch % 16;
+    int pxh = feat_idx / 42;
+    int pxw = (feat_idx % 42) / 3;
+    int c = feat_idx % 3;
+    int row = ph * 14 + pxh;
+    int col = pw * 14 + pxw;
+    int src = batch * (224 * 224 * 3) + row * (224 * 3) + col * 3 + c;
+
+    output[idx] = lut[input[src]];
+}
+
+void patch_im2col_uint8(const uint8_t* input, const half* lut, half* output,
+                        int nv, cudaStream_t stream)
+{
+    int total = nv * 256 * 588;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    patch_im2col_uint8_kernel<<<blocks, threads, 0, stream>>>(
+        input, lut, output, nv);
+}
+
 // ── Bias + positional embedding ──
 
 __global__ void patch_embed_bias_pos_kernel(

@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""LIBERO eval for FP4 Pi0.5 (L7-9 encoder FFN NVFP4).
-
-Monkey-patches Pi05TorchFrontendThor → Pi05TorchFrontendThorFP4 before the
-standard eval flow runs.
+"""LIBERO eval for the Pi0.5 encoder-FP4 + decoder-FP4 + FA4 path.
 
 Usage:
     python tests/eval_libero_fp4.py \\
@@ -43,19 +40,23 @@ def run(args):
         num_views=2, autotune=args.autotune, config="pi05", hardware="auto",
         use_fp4=True, fp4_layers=fp4_layers,
         use_awq=args.use_awq, awq_alpha=args.awq_alpha,
-        use_p1_split_gu=args.use_p1_split_gu)
+        use_p1_split_gu=args.use_p1_split_gu,
+        use_fp4_decoder=True, use_fa4=True)
     _hook(model)
 
-    # Verify FP4 actually activated
-    pipe_obj = getattr(model, "pipe", None) or getattr(model, "_pipe", None)
-    if pipe_obj is not None and hasattr(pipe_obj, "use_fp4_encoder_ffn"):
-        print(f"[FP4 active] layers = {sorted(pipe_obj._fp4_layers)}", flush=True)
-    else:
-        # Walk attrs
-        for k, v in vars(model).items():
-            if hasattr(v, 'use_fp4_encoder_ffn'):
-                print(f"[FP4 active via {k}] layers = {sorted(v._fp4_layers)}", flush=True)
-                break
+    pipe_obj = model._pipe
+    if not pipe_obj.use_fp4_encoder_ffn or not pipe_obj.use_fp4_decoder:
+        raise RuntimeError("strict LIBERO eval requires encoder and decoder FP4")
+    if not pipe_obj.use_fa4:
+        raise RuntimeError("strict LIBERO eval requires FA4")
+    if pipe_obj._fp4_layers != frozenset(fp4_layers):
+        raise RuntimeError(
+            f"requested FP4 layers {fp4_layers}, got "
+            f"{sorted(pipe_obj._fp4_layers)}")
+    print(
+        f"[FP4+FP4+FA4 active] layers={sorted(pipe_obj._fp4_layers)} "
+        f"AWQ={pipe_obj.use_awq} alpha={pipe_obj.awq_alpha} "
+        f"P1={pipe_obj.use_p1_split_gu}", flush=True)
 
     from libero.libero import benchmark as _lb
     import tqdm
@@ -117,11 +118,15 @@ def main():
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--full", action="store_true", help="run all tasks, else 3x3 quick")
     p.add_argument("--trials_per_task", type=int, default=10)
-    p.add_argument("--fp4_layers", default="7,8,9", help="comma list, e.g. '0,1,...,17'")
-    p.add_argument("--use_awq", action="store_true")
-    p.add_argument("--awq_alpha", type=float, default=0.5)
-    p.add_argument("--use_p1_split_gu", action="store_true",
-                   help="P1 split-GU 2-GEMM path (additive, opt-in)")
+    p.add_argument(
+        "--fp4_layers", default=",".join(str(i) for i in range(17)),
+        help="comma-separated live encoder FFN layers")
+    p.add_argument(
+        "--use_awq", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--awq_alpha", type=float, default=0.8)
+    p.add_argument(
+        "--use_p1_split_gu", action=argparse.BooleanOptionalAction,
+        default=True, help="P1 split-GU 2-GEMM path")
     args = p.parse_args()
     t0 = time.perf_counter()
     run(args)

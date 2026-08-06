@@ -7,9 +7,9 @@ matching the existing ``Pi0.5 RTX 5090`` table structure.
 Matrix (per view count):
   Frontend          Calibration     Precision
   ----------------  --------------  ---------
-  Pi0.5 Torch FP4   N=8 LIBERO       NVFP4 encoder (18 layers + AWQ + P1)
+  Pi0.5 Torch FP4   N=8 LIBERO       NVFP4 encoder (17 live layers + AWQ + P1)
   Pi0.5 Torch FP8   N=8 LIBERO       FP8 baseline
-  Pi0.5 JAX  FP4    N=8 LIBERO       NVFP4 encoder (18 layers + AWQ + P1)
+  Pi0.5 JAX  FP4    N=8 LIBERO       NVFP4 encoder (17 live layers + AWQ + P1)
   Pi0.5 JAX  FP8    N=1 (lazy)       FP8 baseline  [JAX FP8 does not
                                                      support N>=2 dataset
                                                      calibrate today]
@@ -73,7 +73,7 @@ if USE_FP4:
     from flash_rt.frontends.torch.pi05_thor_fp4 import Pi05TorchFrontendThorFP4
     pipe = Pi05TorchFrontendThorFP4(
         CKPT, num_views=NV, autotune=3,
-        use_fp4_encoder_ffn=True, fp4_layers=tuple(range(18)),
+        use_fp4_encoder_ffn=True, fp4_layers=tuple(range(17)),
         use_awq=True, use_p1_split_gu=True)
 else:
     from flash_rt.frontends.torch.pi05_thor import Pi05TorchFrontendThor
@@ -185,7 +185,7 @@ if USE_FP4:
     from flash_rt.frontends.jax.pi05_thor_fp4 import Pi05JaxFrontendThorFP4
     pipe = Pi05JaxFrontendThorFP4(
         JAX_CKPT, num_views=NV, autotune=3, weight_cache=True,
-        use_fp4_encoder_ffn=True, fp4_layers=tuple(range(18)),
+        use_fp4_encoder_ffn=True, fp4_layers=tuple(range(17)),
         use_awq=True, use_p1_split_gu=True)
 else:
     from flash_rt.frontends.jax.pi05_thor import Pi05JaxFrontendThor

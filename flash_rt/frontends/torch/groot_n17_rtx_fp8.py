@@ -147,6 +147,7 @@ class _GrootN17FP8BackboneMixin:
         self._num_vit_views = len(grid_thw)
         self._S_vit = sum(int(t * h * w) for t, h, w in grid_thw)
         self._visual_pos_masks = aux["visual_pos_masks"][0].to(device)
+        self._backbone_graph_contract = self._snapshot_backbone_graph_contract(aux)
 
         # ── Activation scales: warm cache load (no torch) or one-time shadow ──
         self._ensure_act_scales(aux)
@@ -159,6 +160,104 @@ class _GrootN17FP8BackboneMixin:
         except Exception as e:  # noqa: BLE001
             warnings.warn(f"set_prompt warmup failed (non-fatal): {e!r}")
         self.latency_records.clear()
+
+    def infer(
+        self,
+        state_normalized: torch.Tensor,
+        *,
+        aux: dict | None = None,
+        initial_noise: torch.Tensor | None = None,
+        num_inference_timesteps: int = 4,
+        action_horizon: int = 40,
+        num_timestep_buckets: int = 1000,
+        use_dit_graph: bool = True,
+    ) -> torch.Tensor:
+        """Run the backbone graph for fresh inputs, then the action graph.
+
+        Omitting ``aux`` preserves the original set-prompt backbone path and
+        does not capture or replay the optional backbone CUDA Graph.
+        """
+        if aux is not None:
+            self._validate_backbone_graph_contract(aux)
+            if not hasattr(self, "_kbb_graph"):
+                self._capture_backbone_graph()
+            self._backbone_features = self.run_backbone_graph(aux)
+        return super().infer(
+            state_normalized,
+            initial_noise=initial_noise,
+            num_inference_timesteps=num_inference_timesteps,
+            action_horizon=action_horizon,
+            num_timestep_buckets=num_timestep_buckets,
+            use_dit_graph=use_dit_graph,
+        )
+
+    @staticmethod
+    def _snapshot_backbone_graph_contract(aux: dict) -> dict:
+        """Record metadata baked into the fixed-shape backbone graph."""
+        required = (
+            "pixel_features", "llm_input_embeds", "grid_thw",
+            "visual_pos_masks", "rope_cos", "rope_sin",
+        )
+        missing = [name for name in required if name not in aux]
+        if missing:
+            raise ValueError(
+                "backbone aux is missing required keys: " + ", ".join(missing))
+
+        def snapshot(name):
+            source = torch.as_tensor(aux[name])
+            return {
+                "value": source.detach().cpu().clone(),
+                "source": source,
+                "version": getattr(source, "_version", None),
+                "validated_source": None,
+                "validated_version": None,
+            }
+
+        return {
+            "pixel_features_shape": tuple(aux["pixel_features"].shape),
+            "llm_input_embeds_shape": tuple(aux["llm_input_embeds"].shape),
+            "grid_thw": snapshot("grid_thw"),
+            "visual_pos_masks": snapshot("visual_pos_masks"),
+            "rope_cos": snapshot("rope_cos"),
+            "rope_sin": snapshot("rope_sin"),
+        }
+
+    def _validate_backbone_graph_contract(self, aux: dict) -> None:
+        """Reject fresh inputs whose graph-owned metadata changed."""
+        expected = self._backbone_graph_contract
+        shape_fields = {
+            "pixel_features": expected["pixel_features_shape"],
+            "llm_input_embeds": expected["llm_input_embeds_shape"],
+        }
+        for name, shape in shape_fields.items():
+            if name not in aux:
+                raise ValueError(f"backbone aux is missing required key: {name}")
+            actual = tuple(aux[name].shape)
+            if actual != shape:
+                raise ValueError(
+                    f"backbone graph requires {name} shape {shape}, got {actual}")
+
+        for name in ("grid_thw", "visual_pos_masks", "rope_cos", "rope_sin"):
+            if name not in aux:
+                raise ValueError(f"backbone aux is missing required key: {name}")
+            source = torch.as_tensor(aux[name])
+            version = getattr(source, "_version", None)
+            entry = expected[name]
+            if ((source is entry["source"] and version == entry["version"])
+                    or (source is entry["validated_source"]
+                        and version == entry["validated_version"])):
+                continue
+            actual = source.detach().cpu()
+            reference = entry["value"]
+            if actual.dtype != reference.dtype or not torch.equal(actual, reference):
+                raise ValueError(
+                    f"backbone graph requires {name} to match the set_prompt() "
+                    "metadata; construct a new frontend for a changed structure")
+            # Keep the most recently validated metadata tensors alive. Repeated
+            # observations normally reuse them, so identity + PyTorch's mutation
+            # version avoids a host tensor comparison on the steady-state path.
+            entry["validated_source"] = source
+            entry["validated_version"] = version
 
     # ── FP8 kernel backbone: ViT → DeepStack → LLM → vlln → VL-self-attn ──
     def _run_kernel_backbone_fp8(self, aux: dict) -> "torch.Tensor":
@@ -247,10 +346,13 @@ class _GrootN17FP8BackboneMixin:
 
         tap_layers = (5, 11, 17)
         tap_bufs = {l: buf(Sv, 1024) for l in tap_layers}
+        scell = [0]
+        self._kbb_scell = scell
 
         def mk_cb(l):
             def cb(h_ptr):
-                fvkm.gpu_copy(tap_bufs[l].data_ptr(), int(h_ptr), Sv * 1024 * 2, 0)
+                fvkm.gpu_copy(
+                    tap_bufs[l].data_ptr(), int(h_ptr), Sv * 1024 * 2, scell[0])
             return cb
         dcap = [mk_cb(l) for l in tap_layers]
 
@@ -276,23 +378,27 @@ class _GrootN17FP8BackboneMixin:
             dsw["fc2_ws"].append(wsc(self._dsm_alpha[j * 2 + 1]))
         ds_scales = {"act_fc1": adv(self._dsm_act_fc1_dev),
                      "act_fc2": adv(self._dsm_act_fc2_dev)}
+        ds_bufs = {"in": [tap_bufs[l].data_ptr() for l in tap_layers],
+                   "ln_out": buf(Nout, 4096).data_ptr(),
+                   "fp8_scratch": buf8(Nout, 4096).data_ptr(),
+                   "fc1_out": buf(Nout, 4096).data_ptr(),
+                   "out": [t.data_ptr() for t in ds_out]}
         P.deepstack_merge_forward(
-            gemm=gemm, fvk=fvkm,
-            bufs={"in": [tap_bufs[l].data_ptr() for l in tap_layers],
-                  "ln_out": buf(Nout, 4096).data_ptr(),
-                  "fp8_scratch": buf8(Nout, 4096).data_ptr(),
-                  "fc1_out": buf(Nout, 4096).data_ptr(),
-                  "out": [t.data_ptr() for t in ds_out]},
+            gemm=gemm, fvk=fvkm, bufs=ds_bufs,
             weights=dsw, scales_dev=ds_scales,
             dims={"Nin": Sv, "Din": 1024, "Nout": Nout, "Dmid": 4096, "Dout": 2048})
 
         # DeepStack inject buffers (S, D) — zero except visual positions.
         mask = self._visual_pos_masks
+        vis_idx = K(mask.reshape(-1).nonzero(as_tuple=True)[0].to(torch.long))
         inject = [0] * 16
+        injb = []
         for j in range(3):
-            ib = K(torch.zeros(Se, 2048, dtype=_FP16, device=dev))
-            ib[mask] = ds_out[j]
+            ib = buf(Se, 2048)
+            ib.zero_()
+            ib.index_copy_(0, vis_idx, ds_out[j])
             inject[j] = ib.data_ptr()
+            injb.append(ib)
 
         # ═══ LLM (16L, causal, GQA) ═══
         llm_h = buf(Se, 2048)
@@ -347,11 +453,11 @@ class _GrootN17FP8BackboneMixin:
 
         # ═══ vlln + VL self-attn (4L) ═══
         vlsa_h = buf(Se, 2048)
+        vlln_bufs = {"x": llm_h.data_ptr(), "out": vlsa_h.data_ptr()}
+        vlln_weights = {"vlln_w": self._vlln_w.data_ptr(),
+                        "vlln_b": self._vlln_b.data_ptr()}
         P.vlln_forward(
-            gemm=gemm, fvk=fvkm,
-            bufs={"x": llm_h.data_ptr(), "out": vlsa_h.data_ptr()},
-            weights={"vlln_w": self._vlln_w.data_ptr(),
-                     "vlln_b": self._vlln_b.data_ptr()},
+            gemm=gemm, fvk=fvkm, bufs=vlln_bufs, weights=vlln_weights,
             dims={"S": Se, "D": 2048})
         vsw = {k: [] for k in (
             "norm1_w", "norm1_b", "norm3_w", "norm3_b", "q_w", "q_b",
@@ -383,18 +489,86 @@ class _GrootN17FP8BackboneMixin:
         vlsa_scales = {
             "act_qkv": adv(self._vlsa_act_qkv_dev), "act_o": adv(self._vlsa_act_o_dev),
             "act_fc1": adv(self._vlsa_act_fc1_dev), "act_fc2": adv(self._vlsa_act_fc2_dev)}
+        vlsa_bufs = {"h": vlsa_h.data_ptr(), "xn": buf(Se, 2048).data_ptr(),
+                     "xn_fp8": buf8(Se, 2048).data_ptr(),
+                     "o_proj_out": buf(Se, 2048).data_ptr(),
+                     "fc1_out": buf(Se, 8192).data_ptr(),
+                     "fc1_fp8": buf8(Se, 8192).data_ptr()}
         P.vl_self_attn_forward(
-            gemm=gemm, fvk=fvkm,
-            bufs={"h": vlsa_h.data_ptr(), "xn": buf(Se, 2048).data_ptr(),
-                  "xn_fp8": buf8(Se, 2048).data_ptr(),
-                  "o_proj_out": buf(Se, 2048).data_ptr(),
-                  "fc1_out": buf(Se, 8192).data_ptr(),
-                  "fc1_fp8": buf8(Se, 8192).data_ptr()},
+            gemm=gemm, fvk=fvkm, bufs=vlsa_bufs,
             weights=vsw, scales_dev=vlsa_scales,
             dims={"T": Se, "D": 2048, "NH": 32, "HD": 64, "ff_inner": 8192},
             attn=attn)
         torch.cuda.synchronize()
+
+        vit_dims = {"S": Sv, "D": 1024, "NH": 16, "HD": 64,
+                    "ff_inner": 4096, "Sper_view": Sv // nv}
+        ds_dims = {"Nin": Sv, "Din": 1024, "Nout": Nout,
+                   "Dmid": 4096, "Dout": 2048}
+        llm_dims = {"S": Se, "D": 2048, "NHQ": 16, "NHKV": 8,
+                    "HD": 128, "FF": 6144}
+        vlsa_dims = {"T": Se, "D": 2048, "NH": 32, "HD": 64,
+                     "ff_inner": 8192}
+
+        def _kbb_forward(stream=0):
+            scell[0] = stream
+            P.qwen3vl_vit_forward(
+                gemm=gemm, fvk=fvkm, bufs=vit_bufs, weights=vw,
+                scales_dev=vit_scales, dims=vit_dims, attn=attn,
+                deepstack_taps=tap_layers, deepstack_capture=dcap,
+                stream=stream)
+            P.deepstack_merge_forward(
+                gemm=gemm, fvk=fvkm, bufs=ds_bufs, weights=dsw,
+                scales_dev=ds_scales, dims=ds_dims, stream=stream)
+            for j in range(3):
+                injb[j].zero_()
+                injb[j].index_copy_(0, vis_idx, ds_out[j])
+            P.qwen3vl_llm_forward(
+                gemm=gemm, fvk=fvkm, bufs=llm_bufs, weights=lw,
+                scales_dev=llm_scales, dims=llm_dims, attn=attn,
+                stream=stream)
+            P.vlln_forward(
+                gemm=gemm, fvk=fvkm, bufs=vlln_bufs,
+                weights=vlln_weights, dims={"S": Se, "D": 2048},
+                stream=stream)
+            P.vl_self_attn_forward(
+                gemm=gemm, fvk=fvkm, bufs=vlsa_bufs, weights=vsw,
+                scales_dev=vlsa_scales, dims=vlsa_dims, attn=attn,
+                stream=stream)
+            return vlsa_h
+
+        self._kbb_forward = _kbb_forward
+        self._kbb_vit_h = vit_h
+        self._kbb_llm_h = llm_h
+        self._kbb_vlsa_h = vlsa_h
         return vlsa_h.unsqueeze(0)
+
+    def _capture_backbone_graph(self) -> None:
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                self._kbb_forward(stream.cuda_stream)
+        torch.cuda.synchronize()
+
+        self._kbb_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream):
+            self._kbb_graph.capture_begin()
+            self._kbb_forward(stream.cuda_stream)
+            self._kbb_graph.capture_end()
+        torch.cuda.synchronize()
+        self._kbb_scell[0] = 0
+
+    def run_backbone_graph(self, aux: dict) -> "torch.Tensor":
+        """Replay the captured backbone graph with a fresh observation."""
+        self._validate_backbone_graph_contract(aux)
+        self._kbb_vit_h.copy_(
+            aux["pixel_features"].to(self.device).half().reshape(
+                self._S_vit, 1024))
+        self._kbb_llm_h.copy_(
+            aux["llm_input_embeds"].to(self.device).half().reshape(
+                self.Se, 2048))
+        self._kbb_graph.replay()
+        return self._kbb_vlsa_h.unsqueeze(0)
 
 
 class GrootN17TorchFrontendRtxFP8(_GrootN17FP8BackboneMixin, GrootN17TorchFrontendRtx):

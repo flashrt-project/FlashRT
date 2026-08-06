@@ -59,10 +59,15 @@ def _to_bf16(t: torch.Tensor, device: str) -> torch.Tensor:
 
 
 def _load_bf16_linear(handles: WeightHandles, out: dict, short: str,
-                      base: str, handles_d, wmap, device: str) -> None:
-    out[short + '_w'] = _anchor(
-        handles, _to_bf16(_get_tensor(handles_d, wmap, base + '.weight'),
-                          device))
+                      base: str, handles_d, wmap, device: str,
+                      keep_tensor: bool = False) -> None:
+    t = _to_bf16(_get_tensor(handles_d, wmap, base + '.weight'), device)
+    out[short + '_w'] = _anchor(handles, t)
+    if keep_tensor:
+        # Exposed under '_t' for weight-only decode quantization, which needs
+        # to read the weights back. _anchor already keeps the tensor alive, so
+        # this costs no extra memory.
+        out[short + '_t'] = t
 
 
 def extract_weights_qwen3_vl_bf16(ckpt_dir: str,
@@ -108,7 +113,9 @@ def extract_weights_qwen3_vl_bf16(ckpt_dir: str,
         raise RuntimeError(
             'Qwen3-VL BF16 ckpt has neither lm_head.weight nor '
             'tie_word_embeddings=true')
-    handles.ptrs['lm_head_w'] = _anchor(handles, _to_bf16(lm_head_cpu, device))
+    lm_head = _to_bf16(lm_head_cpu, device)
+    handles.ptrs['lm_head_w'] = _anchor(handles, lm_head)
+    handles.ptrs['lm_head_t'] = lm_head
 
     per_layer: list[dict] = [None] * num_layers   # type: ignore[list-item]
     for L in range(num_layers):
@@ -130,9 +137,10 @@ def extract_weights_qwen3_vl_bf16(ckpt_dir: str,
                      device)
         qkv = torch.cat([q, k, v], dim=0).contiguous()
         ld['qkv_proj_w'] = _anchor(handles, qkv)
+        ld['qkv_proj_t'] = qkv
         ld['qkv_proj_N'] = int(qkv.shape[0])
         _load_bf16_linear(handles, ld, 'o_proj', sa + 'o_proj',
-                          handles_d, wmap, device)
+                          handles_d, wmap, device, keep_tensor=True)
         ld['q_norm_w'] = _anchor(handles, _to_bf16(
             _get_tensor(handles_d, wmap, sa + 'q_norm.weight'), device))
         ld['k_norm_w'] = _anchor(handles, _to_bf16(
@@ -145,9 +153,10 @@ def extract_weights_qwen3_vl_bf16(ckpt_dir: str,
                       device)
         gate_up = torch.cat([gate, up], dim=0).contiguous()
         ld['gate_up_w'] = _anchor(handles, gate_up)
+        ld['gate_up_t'] = gate_up
         ld['gate_up_N'] = int(gate_up.shape[0])
         _load_bf16_linear(handles, ld, 'mlp_down', mp + 'down_proj',
-                          handles_d, wmap, device)
+                          handles_d, wmap, device, keep_tensor=True)
         per_layer[L] = ld
 
     handles.ptrs.update({

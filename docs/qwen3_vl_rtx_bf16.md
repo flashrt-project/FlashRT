@@ -86,7 +86,7 @@ decode graphs per `(cache_pos, rope_pos)` bucket.
 
 ```bash
 python examples/orin/qwen3_vl_quickstart.py \
-  --checkpoint /root/models/Qwen3-VL-2B-Instruct \
+  --checkpoint /path/to/Qwen3-VL-2B-Instruct \
   --image FlashRT.png \
   --prompt "Describe this image in one sentence." \
   --max-new-tokens 32
@@ -94,12 +94,22 @@ python examples/orin/qwen3_vl_quickstart.py \
 
 Use `--no-graph` to run the eager correctness path without CUDA Graph replay.
 
+Both decode-quantization flags default to `bf16`, so the command above is the
+plain BF16 path. Add `--weight-mode int8 --kv-mode int8` for the recommended
+Orin decode configuration; see [Decode weight quantization](#decode-weight-quantization-weight_mode)
+below for the full menu and why the FP8/FP4 tiers are the wrong choice here.
+
+The frontend is registered for `('qwen3_vl', 'torch', 'rtx_sm87')`, so
+`flash_rt.hardware.resolve_pipeline_class` finds it. `load_model()` still
+raises a redirect, because Qwen3-VL exposes a chat surface
+(`generate(messages) -> str`) rather than the VLA `predict()` surface.
+
 For the full-resolution comparison workload used by the existing Qwen3-VL
 FP8/NVFP4 reports:
 
 ```bash
 python examples/orin/qwen3_vl_quickstart.py \
-  --checkpoint /root/models/Qwen3-VL-2B-Instruct \
+  --checkpoint /path/to/Qwen3-VL-2B-Instruct \
   --image FlashRT.png \
   --prompt "Describe this image in one sentence." \
   --max-new-tokens 4 \
@@ -119,7 +129,7 @@ Environment:
 - L4T: R36.4.7
 - CUDA Toolkit: 12.6.68
 - PyTorch: 2.8.0 + CUDA 12.6
-- Checkpoint: `/root/models/Qwen3-VL-2B-Instruct`
+- Checkpoint: `/path/to/Qwen3-VL-2B-Instruct`
 - Workload: `FlashRT.png`, prompt `Describe this image in one sentence.`
 
 Local checks:
@@ -168,6 +178,91 @@ The fixed-K M=1 GEMV helper provides the larger decode win. The cuBLASLt
 autotune mainly affects M>1 prefill replay; it has little effect on decode
 throughput once the M=1 GEMV helper is enabled.
 
+### Decode weight quantization (`weight_mode`)
+
+Decode runs at M=1, so every step reads the whole weight set once and is bound
+by weight bandwidth rather than math. Shrinking the weights converts almost
+directly into tokens/s. `weight_mode` picks a weight-only tier; the GEMV
+dequantizes to BF16 in-kernel, so no FP8/FP4 tensor core is involved. Prefill
+always keeps using the BF16 weights.
+
+| `weight_mode` | format | weight bytes/element | notes |
+|---|---|---:|---|
+| `bf16` (default) | BF16 | 2.0 | unchanged baseline |
+| `int8` | INT8 symmetric, scale = amax/127 | 1.125 | recommended on Orin |
+| `int4` | INT4 symmetric, scale = amax/7 | 0.625 | chat-grade precision |
+| `w8` | FP8 e4m3, scale = amax/448 | 1.125 | **not recommended on Orin** |
+| `w4` | NVFP4 e2m1, scale = amax/6 | 0.625 | **not recommended on Orin** |
+
+Scales are per 16 elements, stored BF16.
+
+**Why the integer tiers and not the float ones.** Orin is Ampere (sm_87), which
+has no hardware FP8 conversion instruction. The e4m3/e2m1 dequant therefore
+compiles to a software bit sequence and the GEMV flips from bandwidth-bound to
+ALU-bound, so `w8` and `w4` measure *slower than BF16* here despite moving fewer
+bytes. `int8`/`int4` dequantize with a hardware integer-to-float conversion and
+keep the bandwidth win. The `w8`/`w4` tiers remain available because they are
+the right choice on sm_89+, where that conversion exists.
+
+`int8` and `int4` use K-templated kernels built for the Qwen3-VL-2B dimensions
+(K in {2048, 6144}). The constructor rejects other dimensions up front rather
+than failing partway through the first decode step; use `w8`/`w4` or `bf16` for
+8B.
+
+### INT8 KV cache (`kv_mode`)
+
+`kv_mode='int8'` keeps INT8 mirrors of the KV cache with one BF16 scale per
+(position, KV-head) row and runs q=1 decode attention over those mirrors with a
+two-pass flash-decoding kernel, halving the KV bytes each decode step reads.
+That matters more as the prompt grows, since attention reads the whole KV cache
+every token. Prefill still runs FA2 against the BF16 cache.
+
+The decode kernel is specialized for the 2B attention geometry (GQA 16Q/8KV,
+head_dim 128) and is rejected at construction otherwise.
+
+### Measured tiers
+
+Measured during development on Jetson AGX Orin with a Qwen3-VL-2B-architecture
+checkpoint at prompt = 1581 tokens (6256 vision patches). Absolute throughput
+depends on device, prompt length and clocks, so treat the ratios as the
+portable result and re-measure locally:
+
+```bash
+python examples/orin/qwen3_vl_quickstart.py --checkpoint <ckpt> \
+  --image FlashRT.png --prompt "Describe this image in one sentence." \
+  --max-new-tokens 64 --benchmark 20 --weight-mode int8 --kv-mode int8
+```
+
+| `weight_mode` | vs BF16 decode | logit cosine vs BF16 |
+|---|---:|---:|
+| `bf16` | 1.00× | — |
+| `int8` | ~1.7× | 0.99985 (effectively lossless) |
+| `int4` | ~2.3× | 0.989 (chat-grade) |
+| `w8` | ~0.8× (regression) | 0.99932 |
+| `w4` | ~0.65× (regression) | not measured |
+
+`kv_mode='int8'` is orthogonal to the weight tier. Its speedup grows with prompt
+length, since attention reads the whole KV cache every token, and it does not
+change prefill. Its effect on output quality has not been characterised yet —
+validate it against the BF16 KV path for your workload before relying on it.
+
+Two results are worth recording because they look like obvious wins and are
+not: staging the activation in shared memory *cost* throughput (Orin has 16 SMs,
+so the occupancy loss outweighed the saved L2 re-reads, and the activation was
+already L2-hot), and the FP8/FP4 tiers regress for the hardware reason above.
+
+### In-graph argmax decode
+
+`generate(use_graph=True)` captures the argmax and the token feedback into each
+decode graph, so a replay yields the next token with no host round-trip. EOS is
+checked from a pinned async copy one step behind, so decoding can overshoot EOS
+by at most one token; the returned text is trimmed at the first EOS either way,
+so callers see no difference.
+
+The argmax runs on the BF16 logits directly. FP32 is a superset of BF16, so the
+ordering — and therefore the argmax — is identical to an FP32 argmax. This is
+exact, not an approximation.
+
 ### Resolution knob
 
 Resolution capping is an explicit deployment knob. It reduces both vision
@@ -211,7 +306,7 @@ after graph capture and warmup:
 nsys profile --trace=cuda \
   --capture-range=cudaProfilerApi --capture-range-end=stop \
   --cuda-graph-trace=node \
-  -o /root/qwen3_vl_bf16_prefill_replay \
+  -o /path/to/qwen3_vl_bf16_prefill_replay \
   python ...
 ```
 
@@ -245,8 +340,12 @@ quantized path.
   pressure is high.
 - Single-image prompts are supported. Multi-image and video are not part of
   this BF16 bring-up.
-- The frontend is instantiated directly; server integration and `load_model()`
-  registration are not included.
-- The path is BF16-only. It is a correctness and portability baseline for
-  official checkpoints, not a replacement for the optimized FP8/NVFP4 paths.
+- The frontend can be instantiated directly or resolved through
+  `resolve_pipeline_class`; `load_model()` deliberately redirects, since this is
+  a chat VLM rather than a VLA. Server integration is not included.
+- Weights and prefill are BF16. Decode weight quantization and the INT8 KV
+  cache are opt-in and off by default; the `int8`/`int4` tiers additionally
+  require the Qwen3-VL-2B dimensions. This path is a correctness and
+  portability baseline for official checkpoints, not a replacement for the
+  optimized FP8/NVFP4 paths on sm_89+.
 - Decode graphs are captured per cache position and RoPE position.

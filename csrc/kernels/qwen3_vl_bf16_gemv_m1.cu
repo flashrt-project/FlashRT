@@ -11,34 +11,29 @@ constexpr int kWarpsPerBlock = 8;
 constexpr int kThreads = kWarpsPerBlock * 32;
 
 template<int K_FIXED>
-__global__ void qwen3_vl_bf16_gemv_m1_kernel(
+__global__ __launch_bounds__(kThreads) void qwen3_vl_bf16_gemv_m1_kernel(
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ W,
     __nv_bfloat16* __restrict__ out,
     int N) {
-    __shared__ __nv_bfloat16 x_sh[K_FIXED];
-
-    const int4* x_i4 = reinterpret_cast<const int4*>(x);
-    int4* x_sh_i4 = reinterpret_cast<int4*>(x_sh);
-    constexpr int K_INT4 = K_FIXED / 8;
-    #pragma unroll 1
-    for (int j = threadIdx.x; j < K_INT4; j += kThreads) {
-        x_sh_i4[j] = x_i4[j];
-    }
-    __syncthreads();
-
+    // No shared-memory staging of x: x is tiny (K bf16 = 4-12 KB) and stays
+    // hot in L2 across the many weight-row blocks, so reading it from global
+    // keeps smem=0 and occupancy maximal — the decode is HBM-bound on the
+    // weight read, which this saturates (mirrors bf16_gemv_m1_sm120).
     const int warp_id = threadIdx.x / 32;
     const int lane = threadIdx.x & 31;
     const int n = blockIdx.x * kWarpsPerBlock + warp_id;
     if (n >= N) return;
 
+    const int4* x_i4 = reinterpret_cast<const int4*>(x);
     const int4* w_row_i4 = reinterpret_cast<const int4*>(W + n * K_FIXED);
+    constexpr int K_INT4 = K_FIXED / 8;
 
     float acc = 0.0f;
     #pragma unroll 1
     for (int i4 = lane; i4 < K_INT4; i4 += 32) {
         int4 wv = w_row_i4[i4];
-        int4 xv = x_sh_i4[i4];
+        int4 xv = x_i4[i4];
         #pragma unroll
         for (int k = 0; k < 4; ++k) {
             __nv_bfloat162 wb = *reinterpret_cast<__nv_bfloat162*>(

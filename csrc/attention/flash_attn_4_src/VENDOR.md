@@ -18,6 +18,11 @@ there are no `.cu`/`.cpp` sources here and nothing is compiled into
 `flash_rt_kernels`. The runtime deps (`nvidia-cutlass-dsl`, `quack-kernels`)
 ship via the `thor-fa4` pip extra.
 
+On Thor, the loader compiles with `CUTE_DSL_ARCH=sm_110a` but intentionally
+uses `FLASH_ATTENTION_ARCH=sm_100a` for dispatch. This vendor retains the
+SM100-compatible forward implementation; the runtime key is not claiming a
+separate SM110 kernel.
+
 ## Private package name (isolation)
 
 The package is renamed `flash_attn` → **`flashrt_fa4`** so that importing it
@@ -33,6 +38,7 @@ Forward, SM100-class, inference only. The kept files are exactly the import
 closure of the SM100 forward kernel + the forward-only public entry:
 
 - `flash_fwd_sm100.py`            — the SM100 forward kernel
+- `sm100_hd256_2cta_fmha_forward.py` — Pi0.5 encoder HD256 forward kernel
 - `flash_fwd_combine.py`          — split-KV partial-result combine
 - `pack_gqa.py`, `paged_kv.py`    — GQA packing / paged-KV
 - `mask.py`, `softmax.py`, `seqlen_info.py`, `block_info.py`
@@ -51,7 +57,8 @@ closure of the SM100 forward kernel + the forward-only public entry:
 - **Non-SM100 forward kernels**: `flash_fwd.py` (SM80), `flash_fwd_sm90.py`,
   `flash_fwd_sm120.py`.
 - **MLA** forward: `flash_fwd_mla_sm100.py`, `topk_gather_kv.py`.
-- **head_dim=256 2CTA** kernels: `sm100_hd256_2cta_fmha_*.py`.
+- **head_dim=256 2CTA backward** kernel:
+  `sm100_hd256_2cta_fmha_backward.py`.
 - Benchmarks / search: `benchmark*.py`, `bench_utils.py`,
   `sm90_config_search.py`, `compute_block_sparsity.py`.
 - All non-`cute` packages of the wheel: `models/`, `modules/`, `layers/`,
@@ -62,11 +69,11 @@ closure of the SM100 forward kernel + the forward-only public entry:
 
 1. **`flashrt_fa4/cute/interface_fwd_sm100.py`** (renamed from `interface.py`):
    - The heavy unconditional top-level imports of the backward / SM80 / SM90 /
-     SM120 / MLA / 2CTA kernels were removed. Upstream `interface.py` imported
+     SM120 / MLA / 2CTA backward kernels were removed. Upstream `interface.py` imported
      all of them at module load even for a single forward call.
    - The removed forward classes (`FlashAttentionForwardSm80/90/120`,
-     `FlashAttentionMLAForwardSm100`, `BlackwellFusedMultiHeadAttentionForward`)
-     are replaced with stubs that raise a clear `RuntimeError`. They are only
+     `FlashAttentionMLAForwardSm100`) are replaced with stubs that raise a
+     clear `RuntimeError`. They are only
      referenced by dead arch-dispatch branches inside `_flash_attn_fwd`; on
      Blackwell those branches never execute. The SM100 forward control flow is
      **byte-identical** to upstream (verified bit-exact, see below).
@@ -79,7 +86,7 @@ closure of the SM100 forward kernel + the forward-only public entry:
    Python) so the tree passes `git diff --check`.
 
 Trim result: the full `flash_attn` wheel (100+ files across `cute/`, `models/`,
-`modules/`, `layers/`, `ops/`, …) is reduced to **32 vendored files** — 30 under
+`modules/`, `layers/`, `ops/`, …) is reduced to **33 vendored files** — 31 under
 `flashrt_fa4/cute/` (27 `.py` plus `LICENSE`, `AUTHORS`, `.flake8`), the
 `flashrt_fa4/__init__.py` namespace shim, and this `VENDOR.md`. The SM100
 forward output is **bit-exact** vs the full upstream FA4 forward
@@ -89,7 +96,8 @@ forward output is **bit-exact** vs the full upstream FA4 forward
 
 1. Pull the desired upstream `flash_attn/cute/` snapshot.
 2. Re-apply the trim: keep the SM100-forward import closure listed above;
-   delete backward / SM80 / SM90 / SM120 / MLA / 2CTA / benchmarks / non-cute.
+   delete backward / SM80 / SM90 / SM120 / MLA / HD256 2CTA backward /
+   benchmarks / non-cute.
 3. Re-apply the three local patches (forward-only `interface_fwd_sm100.py`,
    `__init__.py` entry, `flash_attn`→`flashrt_fa4` rename:
    `grep -rl 'flash_attn\.cute' | xargs sed -i 's/flash_attn\.cute/flashrt_fa4.cute/g'`).

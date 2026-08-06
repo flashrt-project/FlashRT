@@ -7,6 +7,7 @@
 #include "norm.cuh"
 #include "activation.cuh"
 #include "rope.cuh"
+#include "rope_vec.cuh"
 #include "quantize.cuh"
 #include "elementwise.cuh"
 #include "fusion.cuh"

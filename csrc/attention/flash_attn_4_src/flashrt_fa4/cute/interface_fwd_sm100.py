@@ -56,7 +56,9 @@ FlashAttentionForwardSm80 = _fa4_trimmed("FlashAttentionForwardSm80")
 FlashAttentionForwardSm90 = _fa4_trimmed("FlashAttentionForwardSm90")
 FlashAttentionForwardSm120 = _fa4_trimmed("FlashAttentionForwardSm120")
 FlashAttentionMLAForwardSm100 = _fa4_trimmed("FlashAttentionMLAForwardSm100")
-BlackwellFusedMultiHeadAttentionForward = _fa4_trimmed("BlackwellFusedMultiHeadAttentionForward")
+from flashrt_fa4.cute.sm100_hd256_2cta_fmha_forward import (
+    BlackwellFusedMultiHeadAttentionForward,
+)
 
 from flashrt_fa4.cute.block_sparsity import (
     BlockSparseTensorsTorch,
@@ -578,8 +580,12 @@ def _flash_attn_fwd(
         and (tile_m % qhead_per_kvhead == 0 or not pack_gqa)
     )
 
-    # hd=256 2CTA forward uses dedicated kernel (SM100 only)
-    use_dedicated_hd256_kernel = arch // 10 == 10 and head_dim == 256 and head_dim_v == 256
+    # hd=256 2CTA forward uses the dedicated kernel on both SM100 and SM110.
+    use_dedicated_hd256_kernel = (
+        arch // 10 in [10, 11]
+        and head_dim == 256
+        and head_dim_v == 256
+    )
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
 
     if softcap is not None:

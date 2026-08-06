@@ -25,7 +25,11 @@
 
 #include <cstdint>
 #include <cuda_fp16.h>
+#include <cuda_fp4.h>
 #include <cuda_fp8.h>
+#include <mutex>
+#include <stdexcept>
+#include <string>
 
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) || defined(__CUDA_ARCH__)
 #  include "cutlass/cutlass.h"
@@ -69,6 +73,62 @@ __device__ __forceinline__ float silu_mul_p1(float g, float u) {
     // Same formula as csrc/kernels/activation.cu and silu_mul_fp4_sfa_v2.cu.
     float gelu = g / (1.0f + expf(-1.5957691216057308f * g * (1.0f + 0.044715f * g * g)));
     return gelu * u;
+}
+
+__device__ float geglu_gate_lut_p1[256 * 16];
+
+std::once_flag g_geglu_gate_lut_once;
+
+inline void check_fp4_kernel_launch(const char* kernel_name) {
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        throw std::runtime_error(
+            std::string(kernel_name) + " launch failed: "
+            + cudaGetErrorString(error));
+    }
+}
+
+__global__ void init_geglu_gate_lut_p1_kernel() {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= 256 * 16) return;
+    const uint8_t scale_byte = static_cast<uint8_t>(index >> 4);
+    const uint8_t fp4_code = static_cast<uint8_t>(index & 0xF);
+    __nv_fp8_e4m3 scale_q;
+    *reinterpret_cast<uint8_t*>(&scale_q) = scale_byte;
+    const float g = e2m1_to_fp32_p1(fp4_code) * static_cast<float>(scale_q);
+    geglu_gate_lut_p1[index] =
+        g / (1.0f + expf(
+            -1.5957691216057308f * g * (1.0f + 0.044715f * g * g)));
+}
+
+inline void ensure_geglu_gate_lut(cudaStream_t stream) {
+    std::call_once(g_geglu_gate_lut_once, [stream] {
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        cudaError_t error = cudaStreamIsCapturing(stream, &capture_status);
+        if (error != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("cudaStreamIsCapturing failed: ")
+                + cudaGetErrorString(error));
+        }
+        if (capture_status != cudaStreamCaptureStatusNone) {
+            throw std::runtime_error(
+                "geglu gate LUT must be initialized before CUDA graph capture");
+        }
+
+        init_geglu_gate_lut_p1_kernel<<<16, 256, 0, stream>>>();
+        error = cudaGetLastError();
+        if (error != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("init_geglu_gate_lut_p1_kernel launch failed: ")
+                + cudaGetErrorString(error));
+        }
+        error = cudaStreamSynchronize(stream);
+        if (error != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("init_geglu_gate_lut_p1_kernel execution failed: ")
+                + cudaGetErrorString(error));
+        }
+    });
 }
 
 template <class LayoutSF>
@@ -145,7 +205,7 @@ __global__ void silu_mul_two_fp4_to_fp4_kernel(
 
 // AWQ-Down variant: fuse per-input-channel inv_s multiply between
 // silu_mul and FP4 quant. Used by P1 split-GU path with use_awq=True.
-template <class LayoutSF>
+template <bool UseGateLut, bool UseVectorIo, bool UseNativeFp4, class LayoutSF>
 __global__ void silu_mul_two_mul_fp4_to_fp4_kernel(
     const uint8_t* __restrict__ gate_packed,
     const uint8_t* __restrict__ gate_sfa,
@@ -175,18 +235,68 @@ __global__ void silu_mul_two_mul_fp4_to_fp4_kernel(
     const uint8_t* up = up_packed   + row * (H/2) + block_idx * 8;
     const __half* inv = inv_s + col_base;
 
+    uint64_t gate_codes = 0;
+    uint64_t up_codes = 0;
+    if constexpr (UseVectorIo) {
+        const uint2 gate_vec = *reinterpret_cast<const uint2*>(gp);
+        const uint2 up_vec = *reinterpret_cast<const uint2*>(up);
+        gate_codes = static_cast<uint64_t>(gate_vec.x) |
+                     (static_cast<uint64_t>(gate_vec.y) << 32);
+        up_codes = static_cast<uint64_t>(up_vec.x) |
+                   (static_cast<uint64_t>(up_vec.y) << 32);
+    }
+
     float vals[16];
     float amax = 0.f;
     #pragma unroll
     for (int p = 0; p < 8; ++p) {
-        uint8_t gb = gp[p];
-        uint8_t ub = up[p];
-        float g_lo = e2m1_to_fp32_p1(gb & 0xF) * gs;
-        float g_hi = e2m1_to_fp32_p1(gb >> 4)  * gs;
-        float u_lo = e2m1_to_fp32_p1(ub & 0xF) * us;
-        float u_hi = e2m1_to_fp32_p1(ub >> 4)  * us;
-        float v0 = silu_mul_p1(g_lo, u_lo) * __half2float(inv[2*p]);
-        float v1 = silu_mul_p1(g_hi, u_hi) * __half2float(inv[2*p+1]);
+        uint8_t gb;
+        uint8_t ub;
+        if constexpr (UseVectorIo) {
+            gb = static_cast<uint8_t>(gate_codes >> (p * 8));
+            ub = static_cast<uint8_t>(up_codes >> (p * 8));
+        } else {
+            gb = gp[p];
+            ub = up[p];
+        }
+        float u_lo;
+        float u_hi;
+        if constexpr (UseNativeFp4) {
+            const __half2_raw raw = __nv_cvt_fp4x2_to_halfraw2(
+                static_cast<__nv_fp4x2_storage_t>(ub), __NV_E2M1);
+            const float2 pair = __half22float2(
+                *reinterpret_cast<const __half2*>(&raw));
+            u_lo = pair.x * us;
+            u_hi = pair.y * us;
+        } else {
+            u_lo = e2m1_to_fp32_p1(ub & 0xF) * us;
+            u_hi = e2m1_to_fp32_p1(ub >> 4)  * us;
+        }
+        float inv_lo;
+        float inv_hi;
+        if constexpr (UseVectorIo) {
+            const float2 inv_pair = __half22float2(
+                reinterpret_cast<const __half2*>(inv)[p]);
+            inv_lo = inv_pair.x;
+            inv_hi = inv_pair.y;
+        } else {
+            inv_lo = __half2float(inv[2*p]);
+            inv_hi = __half2float(inv[2*p+1]);
+        }
+        float v0, v1;
+        if constexpr (UseGateLut) {
+            v0 = geglu_gate_lut_p1[
+                     (static_cast<int>(gsf) << 4) | (gb & 0xF)] *
+                 u_lo * inv_lo;
+            v1 = geglu_gate_lut_p1[
+                     (static_cast<int>(gsf) << 4) | (gb >> 4)] *
+                 u_hi * inv_hi;
+        } else {
+            float g_lo = e2m1_to_fp32_p1(gb & 0xF) * gs;
+            float g_hi = e2m1_to_fp32_p1(gb >> 4)  * gs;
+            v0 = silu_mul_p1(g_lo, u_lo) * inv_lo;
+            v1 = silu_mul_p1(g_hi, u_hi) * inv_hi;
+        }
         vals[2*p]   = v0;
         vals[2*p+1] = v1;
         float a0 = fabsf(v0), a1 = fabsf(v1);
@@ -203,11 +313,29 @@ __global__ void silu_mul_two_mul_fp4_to_fp4_kernel(
 
     uint8_t* op = out_packed + row * (H/2) + block_idx * 8;
     const float inv_bs = 1.f / bs_dq;
+    uint64_t packed_result = 0;
     #pragma unroll
     for (int p = 0; p < 8; ++p) {
-        uint8_t lo = fp32_to_e2m1_p1(vals[2*p]   * inv_bs);
-        uint8_t hi = fp32_to_e2m1_p1(vals[2*p+1] * inv_bs);
-        op[p] = lo | (hi << 4);
+        uint8_t packed_byte;
+        if constexpr (UseNativeFp4) {
+            packed_byte = static_cast<uint8_t>(__nv_cvt_float2_to_fp4x2(
+                make_float2(vals[2*p] * inv_bs, vals[2*p+1] * inv_bs),
+                __NV_E2M1, cudaRoundNearest));
+        } else {
+            uint8_t lo = fp32_to_e2m1_p1(vals[2*p]   * inv_bs);
+            uint8_t hi = fp32_to_e2m1_p1(vals[2*p+1] * inv_bs);
+            packed_byte = lo | (hi << 4);
+        }
+        if constexpr (UseVectorIo) {
+            packed_result |= static_cast<uint64_t>(packed_byte) << (p * 8);
+        } else {
+            op[p] = packed_byte;
+        }
+    }
+    if constexpr (UseVectorIo) {
+        *reinterpret_cast<uint2*>(op) = make_uint2(
+            static_cast<uint32_t>(packed_result),
+            static_cast<uint32_t>(packed_result >> 32));
     }
 }
 
@@ -230,6 +358,7 @@ void silu_mul_two_fp4_to_fp4(
     silu_mul_two_fp4_to_fp4_kernel<<<grid, block, 0, stream>>>(
         gate_packed, gate_sfa, up_packed, up_sfa,
         out_packed, out_sfa, layout, layout, H);
+    check_fp4_kernel_launch("silu_mul_two_fp4_to_fp4");
 #else
     (void)gate_packed; (void)gate_sfa; (void)up_packed; (void)up_sfa;
     (void)out_packed; (void)out_sfa; (void)seq_len; (void)H; (void)stream;
@@ -250,9 +379,62 @@ void silu_mul_two_mul_fp4_to_fp4(
     const int y_groups = (n_blocks + threads - 1) / threads;
     dim3 grid(seq_len, y_groups);
     dim3 block(threads);
-    silu_mul_two_mul_fp4_to_fp4_kernel<<<grid, block, 0, stream>>>(
+    silu_mul_two_mul_fp4_to_fp4_kernel<false, false, false><<<grid, block, 0, stream>>>(
         gate_packed, gate_sfa, up_packed, up_sfa, inv_s,
         out_packed, out_sfa, layout, layout, H);
+    check_fp4_kernel_launch("silu_mul_two_mul_fp4_to_fp4");
+#else
+    (void)gate_packed; (void)gate_sfa; (void)up_packed; (void)up_sfa;
+    (void)inv_s; (void)out_packed; (void)out_sfa;
+    (void)seq_len; (void)H; (void)stream;
+#endif
+}
+
+void silu_mul_two_mul_fp4_to_fp4_lut(
+    const uint8_t* gate_packed, const uint8_t* gate_sfa,
+    const uint8_t* up_packed,   const uint8_t* up_sfa,
+    const __half*  inv_s,
+    uint8_t* out_packed, uint8_t* out_sfa,
+    int seq_len, int H, cudaStream_t stream) {
+#if FV_HAVE_CUTLASS
+    ensure_geglu_gate_lut(stream);
+    auto shape = cute::make_shape(seq_len, 1, H, 1);
+    auto layout = CfgF4P1::tile_atom_to_shape_SFA(shape);
+    const int n_blocks = H / 16;
+    const int threads = 512;
+    const int y_groups = (n_blocks + threads - 1) / threads;
+    dim3 grid(seq_len, y_groups);
+    dim3 block(threads);
+    silu_mul_two_mul_fp4_to_fp4_kernel<true, true, false><<<grid, block, 0, stream>>>(
+        gate_packed, gate_sfa, up_packed, up_sfa, inv_s,
+        out_packed, out_sfa, layout, layout, H);
+    check_fp4_kernel_launch("silu_mul_two_mul_fp4_to_fp4_lut");
+#else
+    (void)gate_packed; (void)gate_sfa; (void)up_packed; (void)up_sfa;
+    (void)inv_s; (void)out_packed; (void)out_sfa;
+    (void)seq_len; (void)H; (void)stream;
+#endif
+}
+
+void silu_mul_two_mul_fp4_to_fp4_lut_native(
+    const uint8_t* gate_packed, const uint8_t* gate_sfa,
+    const uint8_t* up_packed,   const uint8_t* up_sfa,
+    const __half*  inv_s,
+    uint8_t* out_packed, uint8_t* out_sfa,
+    int seq_len, int H, cudaStream_t stream) {
+#if FV_HAVE_CUTLASS
+    ensure_geglu_gate_lut(stream);
+    auto shape = cute::make_shape(seq_len, 1, H, 1);
+    auto layout = CfgF4P1::tile_atom_to_shape_SFA(shape);
+    const int n_blocks = H / 16;
+    const int threads = 512;
+    const int y_groups = (n_blocks + threads - 1) / threads;
+    dim3 grid(seq_len, y_groups);
+    dim3 block(threads);
+    silu_mul_two_mul_fp4_to_fp4_kernel<true, true, true><<<grid, block, 0, stream>>>(
+        gate_packed, gate_sfa, up_packed, up_sfa, inv_s,
+        out_packed, out_sfa, layout, layout, H);
+    check_fp4_kernel_launch("silu_mul_two_mul_fp4_to_fp4_lut_native");
 #else
     (void)gate_packed; (void)gate_sfa; (void)up_packed; (void)up_sfa;
     (void)inv_s; (void)out_packed; (void)out_sfa;

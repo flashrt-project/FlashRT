@@ -8,7 +8,7 @@
 // warp; the partial sums are folded by a warp-shuffle reduction. A is read from
 // global (no smem staging): at BF16 the FP8 variant's smem stage would be 2x
 // the bytes (K=9728 -> 19.5 KB/block) and cap blocks/SM under
-// launch_bounds(.,8); A is tiny (<=19 KB) and stays hot in L2 across blocks, so
+// the launch_bounds; A is tiny (<=19 KB) and stays hot in L2 across blocks, so
 // reading it from global keeps smem=0 and occupancy maximal — the all-BF16
 // decode is HBM-bound on the weight read, which this saturates.
 
@@ -24,8 +24,17 @@ namespace gemv_m1 {
 
 namespace {
 
+// minBlocks=8 only fits blocks of <=192 threads: 8 x 256 exceeds the 1536
+// threads/SM cap on sm_87/89/110/120/121, so ptxas discards the whole hint.
+// Clamp it to what the arch can hold, keeping the honored W=4 hint intact.
+constexpr int kMaxThreadsPerSM = 1536;
+template <int W>
+constexpr int kMinBlocks = (kMaxThreadsPerSM / (W * 32)) < 8
+                               ? (kMaxThreadsPerSM / (W * 32))
+                               : 8;
+
 template <int WARPS_PER_BLOCK>
-__global__ __launch_bounds__(WARPS_PER_BLOCK * 32, 8)
+__global__ __launch_bounds__(WARPS_PER_BLOCK * 32, kMinBlocks<WARPS_PER_BLOCK>)
 void gemv_bf16_m1_kernel(
     const __nv_bfloat16* __restrict__ A,   // [K]
     const __nv_bfloat16* __restrict__ B,   // [N, K]

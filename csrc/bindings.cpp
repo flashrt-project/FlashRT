@@ -148,6 +148,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #endif
 #include "kernels/kernels.h"
 #include "kernels/fusion.cuh"
+#include "kernels/attention_seqused_fused.cuh"
 #ifdef FLASHRT_HAVE_MELBAND_ROFORMER
 #include "kernels/mbr_kernels.cuh"
 #endif
@@ -495,6 +496,35 @@ extern "C" int cutlass_fp8_t1_bf16out(void*, void*, void*, int, int, int, float,
 #ifdef ENABLE_LINGBOT
 #include "kernels/lingbot_kernels.h"   // LingBot-VLA model kernel decls (lingbot_-prefixed, Thor sm_110a)
 #endif
+
+#ifdef FLASHRT_HAVE_THOR_VLA_KERNELS
+// Vectorized fp16 backbone helpers (csrc/kernels/vec_fp16_backbone.cu) and
+// the masked-softmax MHA variants (csrc/kernels/attention_mha_masked.cu).
+// Both compile only on SM100-class builds; see the CMake gate.
+extern "C" {
+int rms_norm_fp16_vec(const __half*, const __half*, __half*, int, int, float,
+                      cudaStream_t);
+int layer_norm_fp16_vec(const __half*, const __half*, const __half*, __half*,
+                        int, int, float, cudaStream_t);
+int layer_norm_fp8_static_fp16_vec(const __half*, const __half*, const __half*,
+                                   __nv_fp8_e4m3*, const float*, int, int,
+                                   float, cudaStream_t);
+int rope_rotate_half_fp16_vec(__half*, const __half*, const __half*, int, int,
+                              int, cudaStream_t);
+int quantize_fp8_static_fp16_vec(const __half*, __nv_fp8_e4m3*, const float*,
+                                 int, cudaStream_t);
+int gpu_repeat_interleave_heads_vec(const __half*, __half*, int, int, int,
+                                    int, cudaStream_t);
+int residual_add_fp16_vec(__half*, const __half*, int, cudaStream_t);
+void attention_mha_fp16_masked(cublasHandle_t, const __half*, const __half*,
+                               const __half*, __half*, __half*, int, int, int,
+                               int, float, cudaStream_t);
+void attention_mha_bf16_masked(cublasHandle_t, const __nv_bfloat16*,
+                               const __nv_bfloat16*, const __nv_bfloat16*,
+                               __nv_bfloat16*, __nv_bfloat16*, int, int, int,
+                               int, float, int, int, cudaStream_t);
+}
+#endif  // FLASHRT_HAVE_THOR_VLA_KERNELS
 
 PYBIND11_MODULE(flash_rt_kernels, m) {
     m.doc() = "FlashRT C++/CUDA inference kernels";
@@ -1456,6 +1486,16 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                      reinterpret_cast<half*>(output), nv, to_stream(stream));
     }, py::arg("input"), py::arg("output"), py::arg("nv"), py::arg("stream") = 0);
 
+    m.def("patch_im2col_uint8",
+          [](uintptr_t input, uintptr_t lut, uintptr_t output, int nv,
+             uintptr_t stream) {
+              patch_im2col_uint8(
+                  reinterpret_cast<const uint8_t*>(input),
+                  reinterpret_cast<const half*>(lut),
+                  reinterpret_cast<half*>(output), nv, to_stream(stream));
+          }, py::arg("input"), py::arg("lut"), py::arg("output"),
+             py::arg("nv"), py::arg("stream") = 0);
+
     m.def("patch_embed_bias_pos", [](uintptr_t output, uintptr_t bias, uintptr_t pos_emb,
                                       int S, int D, int S_per_view, uintptr_t stream) {
         patch_embed_bias_pos(reinterpret_cast<half*>(output),
@@ -1523,6 +1563,26 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("qkv"), py::arg("rope"), py::arg("Q"), py::arg("Kc"), py::arg("Vc"),
        py::arg("S"), py::arg("Q_dim"), py::arg("K_dim"), py::arg("HD"), py::arg("qkv_stride"),
        py::arg("kc_offset"), py::arg("kc_stride"), py::arg("stream") = 0);
+
+#ifdef FLASHRT_HAVE_THOR_VLA_KERNELS
+    // Vectorized bit-exact variant (16B moves); returns nonzero without
+    // launching on unaligned shapes so callers can use the scalar kernel.
+    m.def("qkv_split_rope_kvcache_fp16_vec", [](uintptr_t qkv, uintptr_t rope,
+                                              uintptr_t Q, uintptr_t Kc, uintptr_t Vc,
+                                              int S, int Q_dim, int K_dim, int HD, int qkv_stride,
+                                              long kc_offset, int kc_stride, uintptr_t stream) {
+        return qkv_split_rope_kvcache_fp16_vec(
+                                     reinterpret_cast<const __half*>(qkv),
+                                     reinterpret_cast<const __half*>(rope),
+                                     reinterpret_cast<__half*>(Q),
+                                     reinterpret_cast<__half*>(Kc),
+                                     reinterpret_cast<__half*>(Vc),
+                                     S, Q_dim, K_dim, HD, qkv_stride,
+                                     kc_offset, kc_stride, to_stream(stream));
+    }, py::arg("qkv"), py::arg("rope"), py::arg("Q"), py::arg("Kc"), py::arg("Vc"),
+       py::arg("S"), py::arg("Q_dim"), py::arg("K_dim"), py::arg("HD"), py::arg("qkv_stride"),
+       py::arg("kc_offset"), py::arg("kc_stride"), py::arg("stream") = 0);
+#endif  // FLASHRT_HAVE_THOR_VLA_KERNELS
 
     // QKV Split + RoPE + KV Cache (FP16) with runtime device K/V row offset.
     // Same shape contract as qkv_split_rope_kvcache_fp16; K/V row =
@@ -1891,6 +1951,28 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("logits"), py::arg("out"),
        py::arg("S"), py::arg("S_kv_max"), py::arg("NH"), py::arg("HD"),
        py::arg("seqused_k"), py::arg("attn_scale") = 1.0f, py::arg("stream") = 0);
+
+#ifdef FLASHRT_HAVE_THOR_VLA_KERNELS
+    m.def("attention_qkv_fp16_seqused_v2", [](FvkContext& ctx, uintptr_t Q, uintptr_t K, uintptr_t V,
+                                    uintptr_t logits, uintptr_t out,
+                                    int S, int S_kv_max, int NH, int HD,
+                                    uintptr_t seqused_k, float attn_scale, uintptr_t stream) {
+        attention_qkv_fp16_seqused_v2(ctx.cublas_handle,
+                            reinterpret_cast<const __half*>(Q),
+                            reinterpret_cast<const __half*>(K),
+                            reinterpret_cast<const __half*>(V),
+                            reinterpret_cast<__half*>(logits),
+                            reinterpret_cast<__half*>(out),
+                            S, S_kv_max, NH, HD,
+                            reinterpret_cast<const int*>(seqused_k),
+                            attn_scale, to_stream(stream));
+    }, py::arg("ctx"), py::arg("Q"), py::arg("K"), py::arg("V"),
+       py::arg("logits"), py::arg("out"),
+       py::arg("S"), py::arg("S_kv_max"), py::arg("NH"), py::arg("HD"),
+       py::arg("seqused_k"), py::arg("attn_scale") = 1.0f, py::arg("stream") = 0,
+       "seqused attention with the -inf mask folded into softmax "
+       "(one fewer kernel than the mask + softmax chain)");
+#endif  // FLASHRT_HAVE_THOR_VLA_KERNELS
 
     // Padded attention: supports odd S_kv (pads logits lda to even).
     // logits buffer must have room for S*NH * (S_kv + S_kv%2) elements.
@@ -2423,6 +2505,86 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("x"), py::arg("cos_table"), py::arg("sin_table"),
        py::arg("S"), py::arg("NH"), py::arg("HD"), py::arg("stream") = 0);
 
+#ifdef FLASHRT_HAVE_THOR_VLA_KERNELS
+    // ── Vectorized fp16 backbone helpers (16-byte loads; additive) ──
+    m.def("rms_norm_fp16_vec", [](uintptr_t x, uintptr_t w, uintptr_t out,
+                                  int rows, int dim, float eps,
+                                  uintptr_t stream) -> int {
+        return rms_norm_fp16_vec(reinterpret_cast<const __half*>(x),
+                                 reinterpret_cast<const __half*>(w),
+                                 reinterpret_cast<__half*>(out),
+                                 rows, dim, eps, to_stream(stream));
+    }, py::arg("x"), py::arg("w"), py::arg("out"), py::arg("rows"),
+       py::arg("dim"), py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+
+    m.def("layer_norm_fp16_vec", [](uintptr_t x, uintptr_t w, uintptr_t b,
+                                    uintptr_t out, int rows, int dim,
+                                    float eps, uintptr_t stream) -> int {
+        return layer_norm_fp16_vec(reinterpret_cast<const __half*>(x),
+                                   reinterpret_cast<const __half*>(w),
+                                   reinterpret_cast<const __half*>(b),
+                                   reinterpret_cast<__half*>(out),
+                                   rows, dim, eps, to_stream(stream));
+    }, py::arg("x"), py::arg("w"), py::arg("b"), py::arg("out"),
+       py::arg("rows"), py::arg("dim"), py::arg("eps") = 1e-6f,
+       py::arg("stream") = 0);
+
+    m.def("layer_norm_fp8_static_fp16_vec",
+          [](uintptr_t x, uintptr_t w, uintptr_t b, uintptr_t out,
+             uintptr_t d_scale, int rows, int dim, float eps,
+             uintptr_t stream) -> int {
+        return layer_norm_fp8_static_fp16_vec(
+            reinterpret_cast<const __half*>(x),
+            reinterpret_cast<const __half*>(w),
+            reinterpret_cast<const __half*>(b),
+            reinterpret_cast<__nv_fp8_e4m3*>(out),
+            reinterpret_cast<const float*>(d_scale),
+            rows, dim, eps, to_stream(stream));
+    }, py::arg("x"), py::arg("w"), py::arg("b"), py::arg("out"),
+       py::arg("d_scale"), py::arg("rows"), py::arg("dim"),
+       py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+
+    m.def("rope_rotate_half_fp16_vec", [](uintptr_t x, uintptr_t cos_table,
+                                          uintptr_t sin_table, int S, int NH,
+                                          int HD, uintptr_t stream) -> int {
+        return rope_rotate_half_fp16_vec(
+            reinterpret_cast<__half*>(x),
+            reinterpret_cast<const __half*>(cos_table),
+            reinterpret_cast<const __half*>(sin_table),
+            S, NH, HD, to_stream(stream));
+    }, py::arg("x"), py::arg("cos_table"), py::arg("sin_table"),
+       py::arg("S"), py::arg("NH"), py::arg("HD"), py::arg("stream") = 0);
+
+    m.def("quantize_fp8_static_fp16_vec", [](uintptr_t in, uintptr_t out,
+                                             uintptr_t d_scale, int n,
+                                             uintptr_t stream) -> int {
+        return quantize_fp8_static_fp16_vec(
+            reinterpret_cast<const __half*>(in),
+            reinterpret_cast<__nv_fp8_e4m3*>(out),
+            reinterpret_cast<const float*>(d_scale), n, to_stream(stream));
+    }, py::arg("in"), py::arg("out"), py::arg("d_scale"), py::arg("n"),
+       py::arg("stream") = 0);
+
+    m.def("residual_add_fp16_vec", [](uintptr_t residual, uintptr_t x, int n,
+                                      uintptr_t stream) -> int {
+        return residual_add_fp16_vec(reinterpret_cast<__half*>(residual),
+                                     reinterpret_cast<const __half*>(x),
+                                     n, to_stream(stream));
+    }, py::arg("residual"), py::arg("x"), py::arg("n"), py::arg("stream") = 0);
+
+    m.def("gpu_repeat_interleave_heads_vec", [](uintptr_t src, uintptr_t dst,
+                                                int S, int NH_src, int HD,
+                                                int repeat,
+                                                uintptr_t stream) -> int {
+        return gpu_repeat_interleave_heads_vec(
+            reinterpret_cast<const __half*>(src),
+            reinterpret_cast<__half*>(dst),
+            S, NH_src, HD, repeat, to_stream(stream));
+    }, py::arg("src"), py::arg("dst"), py::arg("S"), py::arg("NH_src"),
+       py::arg("HD"), py::arg("repeat"), py::arg("stream") = 0);
+
+#endif  // FLASHRT_HAVE_THOR_VLA_KERNELS
+
     // MHA batched cuBLAS attention (for DiT — per-head independent attention)
     m.def("attention_mha_fp16", [](FvkContext& ctx, uintptr_t Q, uintptr_t K, uintptr_t V,
                                     uintptr_t logits, uintptr_t out,
@@ -2564,6 +2726,48 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("S_q"), py::arg("S_kv"), py::arg("NH"), py::arg("HD"),
        py::arg("attn_scale") = 1.0f, py::arg("logits_kv_stride") = 0,
        py::arg("stream") = 0);
+
+#ifdef FLASHRT_HAVE_THOR_VLA_KERNELS
+    // Masked-softmax MHA variants: no -inf logits pre-fill needed (the
+    // softmax reads/writes only the valid S_kv columns).
+    m.def("attention_mha_fp16_masked",
+          [](FvkContext& ctx, uintptr_t Q, uintptr_t K, uintptr_t V,
+             uintptr_t logits, uintptr_t out,
+             int S_q, int S_kv, int NH, int HD,
+             float attn_scale, uintptr_t stream) {
+        attention_mha_fp16_masked(ctx.cublas_handle,
+                            reinterpret_cast<const __half*>(Q),
+                            reinterpret_cast<const __half*>(K),
+                            reinterpret_cast<const __half*>(V),
+                            reinterpret_cast<__half*>(logits),
+                            reinterpret_cast<__half*>(out),
+                            S_q, S_kv, NH, HD, attn_scale, to_stream(stream));
+    }, py::arg("ctx"), py::arg("Q"), py::arg("K"), py::arg("V"),
+       py::arg("logits"), py::arg("out"),
+       py::arg("S_q"), py::arg("S_kv"), py::arg("NH"), py::arg("HD"),
+       py::arg("attn_scale") = 1.0f, py::arg("stream") = 0);
+
+    m.def("attention_mha_bf16_masked",
+          [](FvkContext& ctx, uintptr_t Q, uintptr_t K, uintptr_t V,
+             uintptr_t logits, uintptr_t out,
+             int S_q, int S_kv, int NH, int HD,
+             float attn_scale, int logits_kv_stride, int qkv_token_stride,
+             uintptr_t stream) {
+        attention_mha_bf16_masked(ctx.cublas_handle,
+                            reinterpret_cast<const __nv_bfloat16*>(Q),
+                            reinterpret_cast<const __nv_bfloat16*>(K),
+                            reinterpret_cast<const __nv_bfloat16*>(V),
+                            reinterpret_cast<__nv_bfloat16*>(logits),
+                            reinterpret_cast<__nv_bfloat16*>(out),
+                            S_q, S_kv, NH, HD, attn_scale,
+                            logits_kv_stride, qkv_token_stride,
+                            to_stream(stream));
+    }, py::arg("ctx"), py::arg("Q"), py::arg("K"), py::arg("V"),
+       py::arg("logits"), py::arg("out"),
+       py::arg("S_q"), py::arg("S_kv"), py::arg("NH"), py::arg("HD"),
+       py::arg("attn_scale") = 1.0f, py::arg("logits_kv_stride") = 0,
+       py::arg("qkv_token_stride") = 0, py::arg("stream") = 0);
+#endif  // FLASHRT_HAVE_THOR_VLA_KERNELS
 
     // ------------------------------------------------------------------
     //  FP8 block-128 dequantization + GEMM.

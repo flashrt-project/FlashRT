@@ -146,6 +146,9 @@ using V9 = Variant<Shape<_128,_128,_128>, Shape<_2,_1,_1>>;  // same as V0 → s
 // Note: MMA instruction forces tile_M=128 minimum for NVFP4 SM100 block-scaled.
 // Cannot reduce tile_M further without switching MMA primitive (GEMV path).
 
+// v10: narrow N + wide K → fewer mainloop iters, same block count as v5
+using V10 = Variant<Shape<_128, _64,_256>, Shape<_1,_1,_1>>;
+
 }  // namespace variants
 
 // Dispatch by index (exposed via pybind).
@@ -165,6 +168,7 @@ int cutlass_fp4_gemm_variant(int idx,
     case 7: return V7::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     case 8: return V8::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     case 9: return V9::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 10: return V10::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     default: return -99;
   }
 }
@@ -181,11 +185,12 @@ const char* cutlass_fp4_gemm_variant_name(int idx) {
     case 7: return "tile128x128x256 cluster1x1x1 (wide K)";
     case 8: return "tile128x256x256 cluster1x1x1 (wide N+K)";
     case 9: return "tile128x128x128 cluster2x1x1 (sanity)";
+    case 10: return "tile128x64x256  cluster1x1x1 (narrow N + wide K)";
     default: return "<invalid>";
   }
 }
 
-int cutlass_fp4_gemm_num_variants() { return 10; }
+int cutlass_fp4_gemm_num_variants() { return 11; }
 
 }  // namespace fp4
 }  // namespace flash_rt

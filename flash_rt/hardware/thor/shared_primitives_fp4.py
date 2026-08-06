@@ -23,12 +23,28 @@ Uses:
 import math
 
 
+def _check(rc, kernel, layer, **shape):
+    """Raise on a non-zero NVFP4 GEMM status.
+
+    The NVFP4 GEMM bindings report can_implement, initialize, workspace and
+    run failures through a return code rather than an exception, so an
+    unchecked call would leave the destination buffer untouched and let the
+    pipeline consume stale data. (The fused elementwise bindings validate in
+    C++ and raise directly; they return nothing and are not wrapped here.)
+    """
+    if rc != 0:
+        dims = ", ".join(f"{name}={value}" for name, value in shape.items())
+        raise RuntimeError(
+            f"{kernel} failed at encoder layer {layer} ({dims}) rc={rc}")
+
+
 def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
                                      stream=0, *, attn=None,
                                      fp4_layers: set = None,
                                      fp4_weights: dict = None,
                                      fp4_scratch: dict = None,
-                                     use_p1_split_gu: bool = False):
+                                     use_p1_split_gu: bool = False,
+                                     fp4_attn_weights: dict = None):
     """Encoder forward with FP4 Gate+Up / Down on selected layers.
 
     When fp4_layers is empty / None, behaves identically to encoder_forward.
@@ -53,6 +69,11 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
     fp4_layers = set(fp4_layers or ())
     if fp4_layers and (fp4_weights is None or fp4_scratch is None):
         raise ValueError("fp4_weights and fp4_scratch required when fp4_layers non-empty")
+    attn_fp4 = fp4_attn_weights or {}
+    if attn_fp4 and not fp4_layers:
+        raise ValueError(
+            "fp4_attn_weights requires the FP4 encoder scratch "
+            "(fp4_layers must be non-empty)")
 
     Se = dims['Se']
     D = dims['D']
@@ -88,12 +109,23 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
         fg_fp16_ptr = fp4_scratch['fg_fp16']
         variant_gu = fp4_scratch['variant_gu']
         variant_dn = fp4_scratch['variant_dn']
+        if attn_fp4:
+            sc_at = fp4_scratch['attn_act']
+            attn_variant = fp4_scratch['attn_variant']
         # P1 split-GU scratch (only used when use_p1_split_gu=True)
         if use_p1_split_gu:
-            p1_gate_p4   = fp4_scratch['p1_gate_p4']
-            p1_gate_sfa  = fp4_scratch['p1_gate_sfa']
-            p1_up_p4     = fp4_scratch['p1_up_p4']
-            p1_up_sfa    = fp4_scratch['p1_up_sfa']
+            p1_combiner = fp4_scratch['p1_combiner']
+            if p1_combiner == 'epilogue':
+                p1_il_p4     = fp4_scratch['p1_il_p4']
+                p1_il_sfa    = fp4_scratch['p1_il_sfa']
+                variant_dn_x = fp4_scratch['variant_dn_x']
+            elif p1_combiner == 'epilogue_hw':
+                p1_dummy = fp4_scratch['p1_dummy']
+            else:
+                p1_gate_p4   = fp4_scratch['p1_gate_p4']
+                p1_gate_sfa  = fp4_scratch['p1_gate_sfa']
+                p1_up_p4     = fp4_scratch['p1_up_p4']
+                p1_up_sfa    = fp4_scratch['p1_up_sfa']
             # Down input scratch for P1 (replaces sc_dn in this branch — same buffers)
 
     for l in range(L):
@@ -105,30 +137,54 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
         as_gu  = act_scales + (l * 4 + 2) * 4
         as_d   = act_scales + (l * 4 + 3) * 4
 
-        # 1. RMSNorm → FP8 (unchanged, QKV path always FP8)
+        aw_attn = attn_fp4.get(l)
+
+        # 1+2. RMSNorm + QKV GEMM. Default: FP8 with static scales. With
+        # an AWQ-calibrated NVFP4 QKV weight ('qkv' in the layer entry),
+        # the input runs weightless RMSNorm x per-channel AWQ inverse
+        # scale straight into NVFP4 (input_layernorm stays folded into
+        # the quantized weight).
         #
-        # NOTE: on paper, this step for layer l>=1 is redundant with the
-        # previous layer's step 11 (same scale, unchanged x). However, the
-        # FP8 calibration scales were collected by encoder_forward_calibrate
-        # WITH step 1 in place. Step 11 uses fp32 (r+x) intermediate; step 1
-        # re-reads the fp16-cast residual and recomputes rms from the
-        # rounded value. The resulting x_fp8 differs at the fp16 rounding
-        # level — calibration was tuned to step-1's output, so skipping it
-        # introduces a systematic scale-mismatch that compounds across 17
-        # layers. Empirically cos drops from 0.997 to 0.91. Keep the call.
-        fvk.rms_norm_fp8_noweight_fp16(x, x_fp8, Se, D, as_qkv, stream)
+        # NOTE (FP8 path): on paper, step 1 for layer l>=1 is redundant
+        # with the previous layer's step 11 (same scale, unchanged x).
+        # However, the FP8 calibration scales were collected by
+        # encoder_forward_calibrate WITH step 1 in place. Step 11 uses
+        # fp32 (r+x) intermediate; step 1 re-reads the fp16-cast residual
+        # and recomputes rms from the rounded value. The resulting x_fp8
+        # differs at the fp16 rounding level — calibration was tuned to
+        # step-1's output, so skipping it introduces a systematic
+        # scale-mismatch that compounds across 17 layers. Empirically cos
+        # drops from 0.997 to 0.91. Keep the call.
+        if aw_attn is not None and 'qkv' in aw_attn:
+            fvk_fp4.rms_norm_mul_fp4_sfa_fp16(
+                x, aw_attn['qkv_inv_s'],
+                sc_at.packed.data_ptr(), sc_at.sfa.data_ptr(),
+                Se, D, stream)
+            rc = fvk_fp4.cutlass_fp4_gemm_variant(
+                attn_variant,
+                sc_at.packed.data_ptr(), sc_at.sfa.data_ptr(),
+                aw_attn['qkv']['packed'].data_ptr(),
+                aw_attn['qkv']['sfb'].data_ptr(),
+                qkv, Se, 2560, D, 1.0, 0.0, stream)
+            if rc != 0:
+                raise RuntimeError(
+                    f"encoder FP4 qkv GEMM layer {l} failed rc={rc}")
+        else:
+            fvk.rms_norm_fp8_noweight_fp16(x, x_fp8, Se, D, as_qkv, stream)
+            fvk.cutlass_fp8_sq(x_fp8, weights['qkv_w'][l], qkv,
+                               Se, 2560, D, alpha_host[l * 4 + 0], 0.0,
+                               stream)
 
-        # 2. QKV GEMM FP8 (unchanged)
-        fvk.cutlass_fp8_sq(x_fp8, weights['qkv_w'][l], qkv,
-                           Se, 2560, D, alpha_host[l * 4 + 0], 0.0, stream)
-
-        # 3+4. QKV split + RoPE + KV cache write (unchanged)
+        # 3+4. QKV split + RoPE + KV cache write (vectorized, bit-exact)
         kv_elem_off = l * total_keys * HD
-        fvk.qkv_split_rope_kvcache_fp16(
+        rc = fvk.qkv_split_rope_kvcache_fp16_vec(
             qkv, weights['rope'], attn_out,
             weights['Kc'], weights['Vc'],
             Se, Q_dim, K_dim, HD, 2560,
             kv_elem_off, HD, stream)
+        if rc != 0:
+            raise RuntimeError(
+                f"encoder qkv split layer {l} failed rc={rc}")
 
         if not last:
             # 5. Attention (unchanged)
@@ -141,10 +197,30 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
                                         logits, attn_out,
                                         Se, Se, NH, HD, attn_scale, stream)
 
-            # 6. quantize attn→FP8 + O GEMM (unchanged)
-            fvk.quantize_fp8_static_fp16(attn_out, o_fp8, as_o, Se * D, stream)
-            fvk.cutlass_fp8_sq(o_fp8, weights['o_w'][l], fg,
-                               Se, D, D, alpha_host[l * 4 + 1], 0.0, stream)
+            # 6. quantize attn output + O GEMM (FP8 static scales, or
+            # dynamic NVFP4 with fp4_attn_weights).
+            if aw_attn is not None and 'o' in aw_attn:
+                rc = fvk_fp4.quantize_fp4_dynamic_sfa_fp16_vec(
+                    attn_out, sc_at.packed.data_ptr(),
+                    sc_at.sfa.data_ptr(), Se, D, False, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"encoder FP4 O quantize layer {l} failed rc={rc}")
+                rc = fvk_fp4.cutlass_fp4_gemm_variant(
+                    attn_variant,
+                    sc_at.packed.data_ptr(), sc_at.sfa.data_ptr(),
+                    aw_attn['o']['packed'].data_ptr(),
+                    aw_attn['o']['sfb'].data_ptr(),
+                    fg, Se, D, D, 1.0, 0.0, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"encoder FP4 O GEMM layer {l} failed rc={rc}")
+            else:
+                fvk.quantize_fp8_static_fp16(attn_out, o_fp8, as_o, Se * D,
+                                             stream)
+                fvk.cutlass_fp8_sq(o_fp8, weights['o_w'][l], fg,
+                                   Se, D, D, alpha_host[l * 4 + 1], 0.0,
+                                   stream)
 
             if is_fp4:
                 # ── FP4 path. Residual stream stays fp16.
@@ -165,20 +241,49 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
                         sc_gu.packed.data_ptr(), sc_gu.sfa.data_ptr(),
                         Se, D, stream)
 
-                if use_p1_split_gu and 'gate' in fp4_weights[l]:
+                if use_p1_split_gu and 'gu_il' in fp4_weights[l]:
+                    # ── P1 fused-epilogue path: one interleaved GeGLU GEMM ──
+                    # The gate/up weight is pairwise interleaved along N and
+                    # the epilogue computes gelu(gate)*up per column pair;
+                    # the combiner kernel and the separate gate/up GEMMs
+                    # disappear. 'epilogue' duplicates the result full-width
+                    # (Down reads it via a K-expanded weight below);
+                    # 'epilogue_hw' quantizes at compact granularity in the
+                    # epilogue and writes Down's stock input buffer directly.
+                    w_il = fp4_weights[l]['gu_il']
+                    if p1_combiner == 'epilogue_hw':
+                        _check(fvk_fp4.cutlass_fp4_gemm_geglu_il_hw(
+                            sc_gu.packed.data_ptr(), sc_gu.sfa.data_ptr(),
+                            w_il['packed'].data_ptr(), w_il['sfb'].data_ptr(),
+                            p1_dummy,
+                            sc_dn.packed.data_ptr(), sc_dn.sfa.data_ptr(),
+                            Se, 2 * H, D, stream),
+                            "cutlass_fp4_gemm_geglu_il_hw", l,
+                            M=Se, N_il=2 * H, K=D)
+                    else:
+                        _check(fvk_fp4.cutlass_fp4_gemm_geglu_il(
+                            sc_gu.packed.data_ptr(), sc_gu.sfa.data_ptr(),
+                            w_il['packed'].data_ptr(), w_il['sfb'].data_ptr(),
+                            p1_il_p4, p1_il_sfa,
+                            Se, 2 * H, D, stream),
+                            "cutlass_fp4_gemm_geglu_il", l,
+                            M=Se, N_il=2 * H, K=D)
+                elif use_p1_split_gu and 'gate' in fp4_weights[l]:
                     # ── P1 split-GU path: 2× fp4out GEMM + geglu_two_fp4 ──
                     w_g = fp4_weights[l]['gate']
                     w_u = fp4_weights[l]['up']
-                    fvk_fp4.cutlass_fp4_gemm_fp4out(
+                    _check(fvk_fp4.cutlass_fp4_gemm_fp4out(
                         sc_gu.packed.data_ptr(), sc_gu.sfa.data_ptr(),
                         w_g['packed'].data_ptr(), w_g['sfb'].data_ptr(),
                         p1_gate_p4, p1_gate_sfa,
-                        Se, H, D, stream)
-                    fvk_fp4.cutlass_fp4_gemm_fp4out(
+                        Se, H, D, stream),
+                        "cutlass_fp4_gemm_fp4out[gate]", l, M=Se, N=H, K=D)
+                    _check(fvk_fp4.cutlass_fp4_gemm_fp4out(
                         sc_gu.packed.data_ptr(), sc_gu.sfa.data_ptr(),
                         w_u['packed'].data_ptr(), w_u['sfb'].data_ptr(),
                         p1_up_p4, p1_up_sfa,
-                        Se, H, D, stream)
+                        Se, H, D, stream),
+                        "cutlass_fp4_gemm_fp4out[up]", l, M=Se, N=H, K=D)
                     # silu_mul → fp4 + SFA, write to sc_dn so the Down GEMM
                     # consumes it identically to the non-P1 path. With AWQ,
                     # apply Down inv_s in the same kernel.
@@ -188,21 +293,40 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
                             p1_up_p4,   p1_up_sfa,
                             sc_dn.packed.data_ptr(), sc_dn.sfa.data_ptr(),
                             Se, H, stream)
-                    else:
+                    elif p1_combiner == 'lut':
+                        fvk_fp4.geglu_two_mul_fp4_to_fp4_lut(
+                            p1_gate_p4, p1_gate_sfa,
+                            p1_up_p4,   p1_up_sfa,
+                            awq_dn,
+                            sc_dn.packed.data_ptr(), sc_dn.sfa.data_ptr(),
+                            Se, H, stream)
+                    elif p1_combiner == 'lut_native':
+                        fvk_fp4.geglu_two_mul_fp4_to_fp4_lut_native(
+                            p1_gate_p4, p1_gate_sfa,
+                            p1_up_p4,   p1_up_sfa,
+                            awq_dn,
+                            sc_dn.packed.data_ptr(), sc_dn.sfa.data_ptr(),
+                            Se, H, stream)
+                    elif p1_combiner == 'direct':
                         fvk_fp4.geglu_two_mul_fp4_to_fp4(
                             p1_gate_p4, p1_gate_sfa,
                             p1_up_p4,   p1_up_sfa,
                             awq_dn,
                             sc_dn.packed.data_ptr(), sc_dn.sfa.data_ptr(),
                             Se, H, stream)
+                    else:
+                        raise ValueError(
+                            f"unknown P1 combiner: {p1_combiner!r}")
                 else:
                     # ── Original AWQ-fused (or non-AWQ) path ──
-                    fvk_fp4.cutlass_fp4_gemm_variant(
+                    _check(fvk_fp4.cutlass_fp4_gemm_variant(
                         variant_gu,
                         sc_gu.packed.data_ptr(), sc_gu.sfa.data_ptr(),
                         w_gu['packed'].data_ptr(), w_gu['sfb'].data_ptr(),
                         gate_fp16_ptr,
-                        Se, H * 2, D, 1.0, 0.0, stream)
+                        Se, H * 2, D, 1.0, 0.0, stream),
+                        f"cutlass_fp4_gemm_variant[gate_up,v{variant_gu}]", l,
+                        M=Se, N=H * 2, K=D)
 
                     if awq_dn is None:
                         fvk_fp4.gate_geglu_fp4_sfa_v2_fp16(
@@ -215,12 +339,26 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
                             sc_dn.packed.data_ptr(), sc_dn.sfa.data_ptr(),
                             Se, H, stream)
 
-                fvk_fp4.cutlass_fp4_gemm_variant(
-                    variant_dn,
-                    sc_dn.packed.data_ptr(), sc_dn.sfa.data_ptr(),
-                    w_dn['packed'].data_ptr(), w_dn['sfb'].data_ptr(),
-                    fg_fp16_ptr,
-                    Se, D, H, 1.0, 0.0, stream)
+                if (use_p1_split_gu and 'gu_il' in fp4_weights[l]
+                        and p1_combiner == 'epilogue'):
+                    w_dx = fp4_weights[l]['down_x']
+                    _check(fvk_fp4.cutlass_fp4_gemm_variant(
+                        variant_dn_x,
+                        p1_il_p4, p1_il_sfa,
+                        w_dx['packed'].data_ptr(), w_dx['sfb'].data_ptr(),
+                        fg_fp16_ptr,
+                        Se, D, 2 * H, 1.0, 0.0, stream),
+                        f"cutlass_fp4_gemm_variant[down_x,v{variant_dn_x}]", l,
+                        M=Se, N=D, K=2 * H)
+                else:
+                    _check(fvk_fp4.cutlass_fp4_gemm_variant(
+                        variant_dn,
+                        sc_dn.packed.data_ptr(), sc_dn.sfa.data_ptr(),
+                        w_dn['packed'].data_ptr(), w_dn['sfb'].data_ptr(),
+                        fg_fp16_ptr,
+                        Se, D, H, 1.0, 0.0, stream),
+                        f"cutlass_fp4_gemm_variant[down,v{variant_dn}]", l,
+                        M=Se, N=D, K=H)
 
                 # 11. residual + RMSNorm → FP8 for next layer (unchanged)
                 # Uses fg_fp16 (Down GEMM fp16 output) as the residual delta.
@@ -249,3 +387,126 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
                 as_next = act_scales + ((l + 1) * 4 + 0) * 4
                 fvk.residual_add_rms_norm_fp8_noweight_fp16(x, fg, x_fp8,
                                                               Se, D, as_next, stream)
+
+
+def siglip_forward_with_fp4_ffn(gemm, fvk, fvk_fp4, bufs, weights, dims,
+                                stream=0, *, attn=None,
+                                fp4_weights: dict = None,
+                                fp4_scratch: dict = None):
+    """SigLIP vision encoder with the FFN in NVFP4.
+
+    The attention half of every layer is identical to
+    ``shared_primitives.siglip_forward`` (FP8 with static scales). The FFN
+    runs LayerNorm straight into NVFP4 activations, an Up GEMM with fused
+    bias + tanh-GELU + fp4/SFA output, and a Down GEMM with fused bias +
+    residual accumulate. The FFN hidden dimension is zero-padded to a
+    multiple of 32 (fp4 TMA alignment); pad rows/columns carry zero
+    weights and biases so the padding is mathematically inert.
+
+    Args:
+        fp4_weights: {layer: {'up': quantized, 'up_bias': ptr,
+                              'down': quantized}} where the quantized
+            entries are ``quant_weight_nvfp4`` dicts over the PADDED
+            hidden dimension and ``up_bias`` points to the padded fp16
+            bias. The Down bias reuses ``weights['down_b']``.
+        fp4_scratch: {'ln_act': FP4ActScratch(S, D),
+                      'hid_act': FP4ActScratch(S, H_pad), 'H_pad': int}
+    """
+    if fp4_weights is None or fp4_scratch is None:
+        raise ValueError(
+            "siglip_forward_with_fp4_ffn requires fp4_weights and "
+            "fp4_scratch")
+    S = dims['S']
+    D = dims['D']
+    H = dims['H']
+    NH = dims['NH']
+    HD = dims['HD']
+    L = dims['L']
+    nv = dims['num_views']
+    spv = dims['seq_per_view']
+
+    x = bufs['x']
+    x_fp8 = bufs['x_fp8']
+    qkv = bufs['qkv']
+    attn_out = bufs['attn_out']
+    hidden = bufs['hidden']
+    hid_fp8 = bufs['hid_fp8']
+
+    alpha = weights['alpha']
+    sc_ln = fp4_scratch['ln_act']
+    sc_hid = fp4_scratch['hid_act']
+    H_pad = int(fp4_scratch['H_pad'])
+
+    for l in range(L):
+        a_qkv = alpha[l * 4 + 0]
+        a_o = alpha[l * 4 + 1]
+        a_up = alpha[l * 4 + 2]
+        a_down = alpha[l * 4 + 3]
+
+        # ── Attention half: identical to siglip_forward (FP8) ──
+        # Vectorized single-pass LayerNorm; falls back to the original
+        # kernel on unsupported dims.
+        rc = fvk_fp4.layer_norm_fp8_vec_fp16(
+            x, weights['ln_attn_w'][l], weights['ln_attn_b'][l], x_fp8,
+            S, D, 1e-5, stream)
+        if rc != 0:
+            fvk.layer_norm_fp8(x, x_fp8, weights['ln_attn_w'][l],
+                               weights['ln_attn_b'][l], S, D, 1e-5, stream)
+        gemm.fp8_nn_bias(x_fp8, weights['qkv_w'][l], qkv,
+                         weights['qkv_b'][l], S, 3 * D, D, a_qkv, stream)
+        if attn is not None:
+            attn.run("siglip", 0, q_seq=spv, stream=stream)
+        else:
+            stride = 3 * D
+            fvk.fmha_strided_full(qkv, qkv + D * 2, qkv + 2 * D * 2,
+                                  attn_out, nv, spv, spv, NH, NH, HD,
+                                  stride, stride, stream)
+        fvk.quantize_fp8_static_fp16(attn_out, x_fp8,
+                                     weights['unit_scale'], S * D, stream)
+        gemm.fp8_nn_bias_res(x_fp8, weights['o_w'][l], x,
+                             weights['o_b'][l], S, D, D, a_o, stream)
+
+        # ── FFN: NVFP4 when the layer is quantized, FP8 otherwise ──
+        w = fp4_weights.get(l)
+        if w is None:
+            fvk.layer_norm_fp8(x, x_fp8, weights['ln_ffn_w'][l],
+                               weights['ln_ffn_b'][l], S, D, 1e-5, stream)
+            gemm.fp8_nn_gelu_bias(x_fp8, weights['up_w'][l], hidden,
+                                  weights['up_b'][l], S, H, D, a_up, stream)
+            fvk.quantize_fp8_static_fp16(hidden, hid_fp8,
+                                         weights['unit_scale'], S * H,
+                                         stream)
+            gemm.fp8_nn_bias_res(hid_fp8, weights['down_w'][l], x,
+                                 weights['down_b'][l], S, D, H, a_down,
+                                 stream)
+            continue
+        rc = fvk_fp4.layer_norm_mul_fp4_sfa_vec_fp16(
+            x, weights['ln_ffn_w'][l], weights['ln_ffn_b'][l],
+            w.get('ln_inv_s', 0),
+            sc_ln.packed.data_ptr(), sc_ln.sfa.data_ptr(),
+            S, D, 1e-5, stream)
+        if rc != 0:
+            rc = fvk_fp4.layer_norm_mul_fp4_sfa_fp16(
+                x, weights['ln_ffn_w'][l], weights['ln_ffn_b'][l],
+                w.get('ln_inv_s', 0),
+                sc_ln.packed.data_ptr(), sc_ln.sfa.data_ptr(),
+                S, D, 1e-5, stream)
+        if rc != 0:
+            raise RuntimeError(
+                f"SigLIP FP4 FFN LayerNorm layer {l} failed rc={rc}")
+        rc = fvk_fp4.cutlass_fp4_gemm_bias_gelu_fp4out(
+            sc_ln.packed.data_ptr(), sc_ln.sfa.data_ptr(),
+            w['up']['packed'].data_ptr(), w['up']['sfb'].data_ptr(),
+            w['up_bias'],
+            sc_hid.packed.data_ptr(), sc_hid.sfa.data_ptr(),
+            S, H_pad, D, stream)
+        if rc != 0:
+            raise RuntimeError(
+                f"SigLIP FP4 FFN Up GEMM layer {l} failed rc={rc}")
+        rc = fvk_fp4.cutlass_fp4_gemm_bias_res_fp16(
+            sc_hid.packed.data_ptr(), sc_hid.sfa.data_ptr(),
+            w['down']['packed'].data_ptr(), w['down']['sfb'].data_ptr(),
+            weights['down_b'][l], x, x, S, D, H_pad, stream)
+        if rc != 0:
+            raise RuntimeError(
+                f"SigLIP FP4 FFN Down GEMM layer {l} failed rc={rc}")

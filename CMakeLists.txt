@@ -1233,13 +1233,15 @@ if(FLASHRT_BUILD_QWEN3_VL)
   # GEMM/GEMV + fused act/norm-quant + QK norm-rope kernels for the official
   # FP8 Qwen3-VL path. SM87 (Jetson Orin): BF16 ViT helper module only; the
   # language path reuses the generic flash_rt_kernels BF16 Qwen3 helpers.
+  # SM110 (Jetson Thor): BF16 ViT tower (SDPA attention, no FP8 block-128
+  # path) plus the M=1 decode GEMVs and the batched QK norm-rope prefill.
   # All build into a separate module so neither bloats flash_rt_kernels.so.
   if(NOT (GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "89" OR
-          GPU_ARCH STREQUAL "87"))
+          GPU_ARCH STREQUAL "87" OR GPU_ARCH STREQUAL "110"))
     message(FATAL_ERROR
       "FLASHRT_BUILD_QWEN3_VL requires GPU_ARCH=120 (RTX 5090 / sm_120) or "
-      "GPU_ARCH=89 (Ada / sm_89) or GPU_ARCH=87 (Jetson Orin / sm_87); "
-      "got '${GPU_ARCH}'.")
+      "GPU_ARCH=89 (Ada / sm_89) or GPU_ARCH=87 (Jetson Orin / sm_87) or "
+      "GPU_ARCH=110 (Jetson Thor / sm_110); got '${GPU_ARCH}'.")
   endif()
 
   set(QWEN3_VL_SOURCES
@@ -1262,9 +1264,27 @@ if(FLASHRT_BUILD_QWEN3_VL)
       csrc/kernels/qwen3_qkv_post_proc.cu
       csrc/kernels/bf16_matmul_bf16.cu)
   elseif(GPU_ARCH STREQUAL "87")
+    # Weight-only quantized decode GEMVs ship alongside the bf16 one; the
+    # int8/int4 pair is the Ampere-friendly tier (hardware I2F dequant),
+    # while e4m3/e2m1 need the FP8 conversion sm_87 lacks.
     list(APPEND QWEN3_VL_SOURCES
       csrc/kernels/bf16_matmul_bf16.cu
-      csrc/kernels/qwen3_vl_bf16_gemv_m1.cu)
+      csrc/kernels/qwen3_vl_bf16_gemv_m1.cu
+      csrc/kernels/qwen3_vl_int8_gemv_m1.cu
+      csrc/kernels/qwen3_vl_int4_gemv_m1.cu
+      csrc/kernels/qwen3_vl_w8_gemv_m1.cu
+      csrc/kernels/qwen3_vl_w4_gemv_m1.cu
+      csrc/kernels/qwen3_int8_kv.cu)
+  elseif(GPU_ARCH STREQUAL "110")
+    # Thor: BF16 ViT tower (SDPA attention — no FP8 block-128 ViT path here),
+    # the e4m3/e2m1 decode GEMVs (Thor has hardware FP8 conversion, unlike
+    # Orin), plus the batched QK norm-rope kernel the BF16 prefill uses.
+    list(APPEND QWEN3_VL_SOURCES
+      csrc/kernels/bf16_matmul_bf16.cu
+      csrc/kernels/qwen3_vl_bf16_gemv_m1.cu
+      csrc/kernels/qwen3_vl_w8_gemv_m1.cu
+      csrc/kernels/qwen3_vl_w4_gemv_m1.cu
+      csrc/kernels/qwen3_qkv_post_proc.cu)
   endif()
 
   pybind11_add_module(flash_rt_qwen3_vl_kernels ${QWEN3_VL_SOURCES})
@@ -1272,13 +1292,27 @@ if(FLASHRT_BUILD_QWEN3_VL)
     target_compile_definitions(flash_rt_qwen3_vl_kernels PRIVATE
       ENABLE_QWEN3_VL_FP8_ACT=1)
   endif()
-  if(GPU_ARCH STREQUAL "87" OR GPU_ARCH STREQUAL "89")
+  if(GPU_ARCH STREQUAL "87" OR GPU_ARCH STREQUAL "89" OR
+     GPU_ARCH STREQUAL "110")
     target_compile_definitions(flash_rt_qwen3_vl_kernels PRIVATE
       ENABLE_QWEN3_VL_BF16_CUBLASLT=1)
   endif()
-  if(GPU_ARCH STREQUAL "87")
+  if(GPU_ARCH STREQUAL "87" OR GPU_ARCH STREQUAL "110")
     target_compile_definitions(flash_rt_qwen3_vl_kernels PRIVATE
       ENABLE_QWEN3_VL_BF16_GEMV_M1=1)
+  endif()
+  # INT8/INT4 decode GEMVs + INT8 KV cache: Orin only. Thor has hardware FP8
+  # conversion so it uses the e4m3/e2m1 tiers, and its attention backend has no
+  # INT8 KV path, so building these there would export unused bindings.
+  if(GPU_ARCH STREQUAL "87")
+    target_compile_definitions(flash_rt_qwen3_vl_kernels PRIVATE
+      ENABLE_QWEN3_VL_INT_DECODE=1)
+  endif()
+  # Arches that compile qwen3_qkv_post_proc.cu. Kept separate from
+  # ENABLE_SM89_BLOCK_FP8_GEMM so Thor binds these without the FP8 path.
+  if(GPU_ARCH STREQUAL "89" OR GPU_ARCH STREQUAL "110")
+    target_compile_definitions(flash_rt_qwen3_vl_kernels PRIVATE
+      ENABLE_QWEN3_VL_QKV_POSTPROC=1)
   endif()
   if(GPU_ARCH STREQUAL "89")
     target_compile_definitions(flash_rt_qwen3_vl_kernels PRIVATE
@@ -1303,7 +1337,8 @@ if(FLASHRT_BUILD_QWEN3_VL)
       ${GPU_GENCODE}
     >)
   target_link_libraries(flash_rt_qwen3_vl_kernels PRIVATE CUDA::cudart)
-  if(GPU_ARCH STREQUAL "87" OR GPU_ARCH STREQUAL "89")
+  if(GPU_ARCH STREQUAL "87" OR GPU_ARCH STREQUAL "89" OR
+     GPU_ARCH STREQUAL "110")
     # bf16_matmul_bf16 (ViT/language bf16 linears) uses cuBLASLt.
     target_link_libraries(flash_rt_qwen3_vl_kernels PRIVATE CUDA::cublasLt)
   endif()
@@ -1409,6 +1444,26 @@ pybind11_add_module(flash_rt_kernels
 set_target_properties(flash_rt_kernels PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+
+# ── Thor-class VLA helper kernels (SM100/SM110 only) ──
+# The masked-softmax MHA variants, the 16-byte-load norm/rope/quantize
+# rewrites, the seqused-fold decoder attention and the vectorized QKV
+# split-RoPE exist for the GROOT N1.7 and Pi0.5 Thor paths; their element
+# math targets SM100-class memory behaviour and no SM8x frontend calls
+# them. Their bindings in csrc/bindings.cpp are guarded by
+# FLASHRT_HAVE_THOR_VLA_KERNELS so source and binding drop together on
+# other architectures.
+if(ENABLE_SM100_CUTLASS)
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/attention_mha_masked.cu
+    csrc/kernels/vec_fp16_backbone.cu
+    csrc/kernels/attention_seqused_fused.cu
+    csrc/kernels/rope_vec.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_THOR_VLA_KERNELS=1)
+  message(STATUS "Thor VLA helper kernels: ENABLED (sm_${GPU_ARCH})")
+else()
+  message(STATUS "Thor VLA helper kernels: DISABLED (SM100-class only)")
+endif()
 
 if(FLASHRT_ENABLE_COSMOS3_EDGE)
   target_sources(flash_rt_kernels PRIVATE csrc/kernels/cosmos3_edge_misc.cu)
@@ -1788,15 +1843,27 @@ if(ENABLE_SM100_CUTLASS)
     csrc/quantize/quantize_fp4_dynamic.cu
     csrc/quantize/reshape_scales_sfa.cu
     csrc/quantize/quantize_fp4_sfa.cu
+    csrc/quantize/quantize_fp4_sfa_vec.cu
     csrc/fused_fp16/rms_norm_noweight_fp16.cu
     csrc/fused_fp4/norm_silu_fp4_sfa.cu
     csrc/fused_fp4/silu_mul_fp4_sfa_v2.cu
+    csrc/fused_fp4/silu_mul_fp4_sfa_vec.cu
+    csrc/fused_fp4/layer_norm_fp4_sfa.cu
+    csrc/gemm/fp4/cutlass_fp4_gemm_siglip_ffn_sm100.cu
     csrc/fused_fp4/res_rms_fp4_sfa_v2.cu
     csrc/fused_fp4/per_channel_mul_fp16.cu
     csrc/fused_fp4/res_rms_mul_fp4_sfa.cu
     csrc/fused_fp4/silu_mul_mul_fp4_sfa_v2.cu
     csrc/fused_fp4/silu_mul_two_fp4_to_fp4.cu
     csrc/gemm/fp4/cutlass_fp4_gemm_fp4out.cu
+    csrc/gemm/fp4/cutlass_fp4_gemm_bias_bf16_sm100.cu
+    csrc/quantize/quantize_fp4_sfa_bf16.cu
+    csrc/fused_fp4/dit_norm_fp4_sfa.cu
+    csrc/gemm/fp4/cutlass_fp4_gemm_geglu_il_sm100.cu
+    csrc/quantize/quantize_e0m3_sfa.cu
+    csrc/gemm/fp4/cutlass_fp4_gemm_e0m3w_sm100.cu
+    csrc/fused_fp4/pi05_e0m3_act.cu
+    csrc/fused_fp4/siglip_ln_vec.cu
   )
   if(FLASHRT_ENABLE_COSMOS3_EDGE)
     target_sources(fp4_kernels_obj PRIVATE

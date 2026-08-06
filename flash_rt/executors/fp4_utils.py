@@ -81,7 +81,13 @@ def quant_weight_nvfp4(w: torch.Tensor) -> dict:
     device = w.device
     packed = torch.empty(N, K // 2, dtype=torch.uint8, device=device)
     sfb_bytes = fvk_fp4.sfa_size_bytes(N, K, True)
-    sfb = torch.empty(sfb_bytes, dtype=torch.uint8, device=device)
+    # Scale-factor buffers must be zero-initialized: the tile-interleaved
+    # layout rounds K up to 64-element atoms, and the quantize kernels only
+    # write entries for real (row, block) coordinates. When K is not a
+    # multiple of 64 the padding entries are never written; allocation
+    # garbage there can decode as UE4M3 NaN and poison the block-scaled
+    # GEMM accumulator. Zero scales keep the padding mathematically inert.
+    sfb = torch.zeros(sfb_bytes, dtype=torch.uint8, device=device)
 
     rc = fvk_fp4.quantize_fp4_dynamic_sfa_fp16(
         w.data_ptr(), packed.data_ptr(), sfb.data_ptr(), N, K, True, 0
@@ -133,7 +139,9 @@ class FP4ActScratch:
         self.K = K
         self.packed = torch.empty(max_M, K // 2, dtype=torch.uint8, device=device)
         sfa_bytes = fvk_fp4.sfa_size_bytes(max_M, K, False)
-        self.sfa = torch.empty(sfa_bytes, dtype=torch.uint8, device=device)
+        # Zero-init: layout padding entries are never written by the
+        # quantize kernels and must stay inert (see quant_weight_nvfp4).
+        self.sfa = torch.zeros(sfa_bytes, dtype=torch.uint8, device=device)
 
 
 def quant_act_nvfp4(x: torch.Tensor, scratch: FP4ActScratch,
@@ -170,7 +178,9 @@ class FP4Buffer:
         self.N = N
         self.packed = torch.empty(M, N // 2, dtype=torch.uint8, device=device)
         sfa_bytes = fvk_fp4.sfa_size_bytes(M, N, False)
-        self.sfa = torch.empty(sfa_bytes, dtype=torch.uint8, device=device)
+        # Zero-init: layout padding entries are never written by the fp4out
+        # GEMM epilogue and must stay inert (see quant_weight_nvfp4).
+        self.sfa = torch.zeros(sfa_bytes, dtype=torch.uint8, device=device)
 
 
 def fp4out_gemm(scratch: FP4ActScratch, w_quant: dict,
