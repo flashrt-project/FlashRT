@@ -156,6 +156,14 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/gated_deltanet_qwen36.cuh"
 #endif
 #include "kernels/qwen3_qkv_post_proc.cuh"
+#if defined(FLASHRT_HAVE_HYVLA_THOR) || defined(FLASHRT_HAVE_HYVLA_ORIN)
+#include "kernels/hyvla_fused_thor.cuh"
+#include "kernels/hyvla_vit_fuse.cuh"
+#ifdef FLASHRT_HAVE_HYVLA_THOR
+#include "kernels/hyvla_quant_fp8_thor.cuh"
+#include "kernels/hyvla_ffn_fp8_thor.cuh"
+#endif
+#endif
 #ifdef FLASHRT_HAVE_NVFP4_SWIZZLE
 #include "kernels/silu_mul_to_nvfp4_swizzled.cuh"
 #include "kernels/fp4_swiglu_compact_sm120.cuh"
@@ -8110,6 +8118,87 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
         py::arg("q_scale"), py::arg("kv_scale"), py::arg("enable_pdl"),
         py::arg("k_stride_page"), py::arg("k_stride_token"),
         py::arg("k_stride_head"), py::arg("stream") = 0);
+#endif
+
+#if defined(FLASHRT_HAVE_HYVLA_THOR) || defined(FLASHRT_HAVE_HYVLA_ORIN)
+    m.def("hyvla_rope_qknorm_kvwrite_bf16",
+        [](uintptr_t qkv, uintptr_t cos, uintptr_t sin, uintptr_t qn_w,
+           uintptr_t kn_w, uintptr_t q_out, uintptr_t kbuf, uintptr_t vbuf,
+           int S, int nq, int nkv, int hd, int S_tot, int off, float eps,
+           int kv_rep, uintptr_t stream) {
+            hyvla_rope_qknorm_kvwrite_bf16(
+                reinterpret_cast<const void*>(qkv),
+                reinterpret_cast<const void*>(cos),
+                reinterpret_cast<const void*>(sin),
+                reinterpret_cast<const void*>(qn_w),
+                reinterpret_cast<const void*>(kn_w),
+                reinterpret_cast<void*>(q_out),
+                reinterpret_cast<void*>(kbuf),
+                reinterpret_cast<void*>(vbuf),
+                S, nq, nkv, hd, S_tot, off, eps, kv_rep, to_stream(stream));
+        },
+        py::arg("qkv"), py::arg("cos"), py::arg("sin"), py::arg("qn_w"),
+        py::arg("kn_w"), py::arg("q_out"), py::arg("kbuf"), py::arg("vbuf"),
+        py::arg("S"), py::arg("nq"), py::arg("nkv"), py::arg("hd"),
+        py::arg("S_tot"), py::arg("off"), py::arg("eps") = 1e-5f,
+        py::arg("kv_rep") = 1, py::arg("stream") = 0,
+        "Hy-VLA fused RoPE(q,k)+QK-Norm(q,k)+KV-write megakernel (bf16). "
+        "kv_rep>1 stores the KV cache pre-expanded for GQA.");
+
+    m.def("hyvla_vit_add_layer_norm_bf16",
+        [](uintptr_t residual, uintptr_t x_add, uintptr_t ln_weight,
+           uintptr_t ln_bias, uintptr_t out, int rows, int dim, float eps,
+           uintptr_t stream) {
+            hyvla_vit_add_layer_norm_bf16(
+                reinterpret_cast<void*>(residual),
+                reinterpret_cast<const void*>(x_add),
+                reinterpret_cast<const void*>(ln_weight),
+                reinterpret_cast<const void*>(ln_bias),
+                reinterpret_cast<void*>(out), rows, dim, eps,
+                to_stream(stream));
+        },
+        py::arg("residual"), py::arg("x_add"), py::arg("ln_weight"),
+        py::arg("ln_bias"), py::arg("out"), py::arg("rows"), py::arg("dim"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "Hy-VLA ViT fused residual-add (bf16 round, in-place) + LayerNorm.");
+
+#ifdef FLASHRT_HAVE_HYVLA_THOR
+    m.def("hyvla_quant_fp8_dyn_bf16",
+        [](uintptr_t x, uintptr_t out, uintptr_t scale, int n, uintptr_t stream) {
+            hyvla_quant_fp8_dyn_bf16(
+                reinterpret_cast<const void*>(x),
+                reinterpret_cast<void*>(out),
+                reinterpret_cast<float*>(scale), n, to_stream(stream));
+        },
+        py::arg("x"), py::arg("out"), py::arg("scale"), py::arg("n"),
+        py::arg("stream") = 0,
+        "Hy-VLA single-CTA dynamic per-tensor FP8 quant (small M, graph-safe).");
+
+    m.def("hyvla_ffn_gu_silu_bf16",
+        [](uintptr_t x, uintptr_t gu, uintptr_t act, int M, int K, int Nout,
+           uintptr_t sx, float sgu, uintptr_t stream) {
+            hyvla_ffn_gu_silu_bf16(
+                reinterpret_cast<const void*>(x), reinterpret_cast<const void*>(gu),
+                reinterpret_cast<void*>(act), M, K, Nout,
+                reinterpret_cast<const void*>(sx), sgu, to_stream(stream));
+        },
+        py::arg("x"), py::arg("gu"), py::arg("act"), py::arg("M"), py::arg("K"),
+        py::arg("Nout"), py::arg("sx"), py::arg("sgu"), py::arg("stream") = 0,
+        "Hy-VLA FFN kernel A: gu-GEMM gate/up + silu_mul -> bf16 act (Thor).");
+
+    m.def("hyvla_ffn_dn_res_bf16",
+        [](uintptr_t a, uintptr_t dn, uintptr_t res, uintptr_t y, int M, int K, int N,
+           uintptr_t sa, float sdn, uintptr_t stream) {
+            hyvla_ffn_dn_res_bf16(
+                reinterpret_cast<const void*>(a), reinterpret_cast<const void*>(dn),
+                reinterpret_cast<const void*>(res), reinterpret_cast<void*>(y),
+                M, K, N, reinterpret_cast<const void*>(sa), sdn, to_stream(stream));
+        },
+        py::arg("a"), py::arg("dn"), py::arg("res"), py::arg("y"), py::arg("M"),
+        py::arg("K"), py::arg("N"), py::arg("sa"), py::arg("sdn"),
+        py::arg("stream") = 0,
+        "Hy-VLA FFN kernel B: dn-GEMM + residual -> bf16 (Thor).");
+#endif
 #endif
 
 #ifdef ENABLE_LINGBOT

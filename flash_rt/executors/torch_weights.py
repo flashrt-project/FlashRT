@@ -43,6 +43,7 @@ from flash_rt.executors.weight_loader import (
 
 _FP16 = torch.float16
 _FP32 = torch.float32
+_BF16 = torch.bfloat16
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -337,6 +338,11 @@ class ToFp32:
         return x.to(_FP32)
 
 
+class ToBf16:
+    def apply(self, x, ctx):
+        return x.to(_BF16)
+
+
 class T:
     """``.T.contiguous()`` — CUTLASS FP8 col-major path (encoder GEMMs)."""
 
@@ -481,6 +487,7 @@ __all__ = [
     "FusedGateUp",
     "ToFp16",
     "ToFp32",
+    "ToBf16",
     "T",
     "tT",
     "InterleaveQK",

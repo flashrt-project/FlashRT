@@ -461,12 +461,12 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 "Supported: pi0, pi05, llm, mllm")
     elif config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
                       "motus", "wan22_ti2v_5b", "cosmos3_video",
-                      "cosmos3_edge", "nexn2", "qwen36_moe"):
+                      "cosmos3_edge", "nexn2", "qwen36_moe", "hyvla"):
         raise ValueError(
             f"Unknown config: {config}. "
             f"Supported: pi05, groot, groot_n17, pi0, pi0fast, motus, "
             f"wan22_ti2v_5b, cosmos3_video, cosmos3_edge, nexn2, "
-            f"qwen36_moe")
+            f"qwen36_moe, hyvla")
     if framework not in ("torch", "jax", "jetson_pi"):
         raise ValueError(
             f"Unknown framework: {framework}. Supported: torch, jax, jetson_pi")
@@ -699,14 +699,25 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             logger.info("GROOT N1.7 Thor NVFP4 tier enabled")
         use_fp4 = False  # do not fall through to the Pi0.5 FP4 routing
 
-    # ── FP4 routing (Pi0.5 torch + Pi0.5 JAX on Thor) ──
+    # ── FP4 routing (Pi0.5 torch + Pi0.5 JAX on Thor, HyVLA torch on Thor) ──
     if use_fp4:
-        if config != "pi05" or framework not in ("torch", "jax") or arch != "thor":
-            logger.warning(
-                "use_fp4=True is only supported for config='pi05' with "
-                "framework in ('torch', 'jax') on Thor; got config='%s' "
-                "framework='%s' hardware='%s'. Falling back to FP8.",
-                config, framework, arch)
+        _fp4_ok = (
+            (config == "pi05" and framework in ("torch", "jax") and arch == "thor")
+            or (config == "hyvla" and framework == "torch" and arch == "thor")
+        )
+        if not _fp4_ok:
+            if config == "hyvla" and arch == "rtx_sm87":
+                logger.warning(
+                    "use_fp4=True is not supported for config='hyvla' on "
+                    "Jetson Orin SM87 (no native FP4 tensor cores). "
+                    "Falling back to the HyVLA INT8/BF16 path.")
+            else:
+                logger.warning(
+                    "use_fp4=True is only supported for config='pi05' with "
+                    "framework in ('torch', 'jax') on Thor, or config='hyvla' "
+                    "with framework='torch' on Thor; got config='%s' "
+                    "framework='%s' hardware='%s'. Falling back to FP8.",
+                    config, framework, arch)
             use_fp4 = False
         else:
             try:
@@ -722,7 +733,14 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 use_fp4 = False
 
             if use_fp4:
-                if framework == "torch":
+                if config == "hyvla":
+                    from flash_rt.frontends.torch.hyvla_thor import (
+                        HyVLATorchFrontendThor,
+                    )
+                    pipe_cls = HyVLATorchFrontendThor
+                    logger.info("HyVLA Thor FP4 tier enabled")
+                    use_fp4 = False  # routed; skip Pi0.5 path below
+                elif framework == "torch":
                     from flash_rt.frontends.torch.pi05_thor_fp4 import (
                         Pi05TorchFrontendThorFP4,
                     )
