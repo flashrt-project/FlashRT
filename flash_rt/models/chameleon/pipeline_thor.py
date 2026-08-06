@@ -34,10 +34,10 @@ except Exception:
 
 
 def _parse_fp4_layer_policy() -> frozenset:
-    """FP4 FFN layer policy from FLASHRT_RYNNVLA2_FP4_LAYERS env var.
+    """FP4 FFN layer policy from FLASHRT_CHAMELEON_FP4_LAYERS env var.
 
     Values:
-      - unset / "": default = L0-L2 FP4, L3-L31 FP8 (safe, matches 001).
+      - unset / "": default = L0-L2 FP4, L3-L31 FP8 (safe default).
       - "0-7": FP4 for L0..L7 inclusive.
       - "0-14,20-31": FP4 for L0..L14 + L20..L31 (skip outlier L15-L19).
         This is the SM120-sweep-validated aggressive setting (13ms savings on
@@ -47,7 +47,7 @@ def _parse_fp4_layer_policy() -> frozenset:
     Returns the frozenset of FP8 layer indices (complement of FP4 set).
     """
     import os as _os
-    val = _os.environ.get("FLASHRT_RYNNVLA2_FP4_LAYERS", "").strip()
+    val = _os.environ.get("FLASHRT_CHAMELEON_FP4_LAYERS", "").strip()
     if not val:
         return frozenset(range(3, 32))  # default: L0-L2 FP4
 
@@ -340,7 +340,7 @@ def chameleon_forward(
         # ═══ End dynamic per-tensor FP8 branch ═══
 
         # ── QKV FP8 GEMMs ──
-        # 002 has no attention bias; pass zero-buffer for fp8_nn_bias epilogue
+        # Chameleon has no attention bias; pass zero-buffer for fp8_nn_bias epilogue
         if alpha_host is not None:
             alpha_qkv = float(alpha_host[li * 4 + 0])
             zero_bias_ptr = int(bufs['zero_bias_d'])
@@ -746,7 +746,7 @@ def chameleon_forward_fp16(
     Ported from pipeline_rtx.chameleon_forward. All 32 layers run pure
     FP16 GEMMs via ``gemm.fp16_nn`` — same on Thor as RTX.
 
-    Precision-optimal path (cosine target ≥ 0.99 vs vendor bf16) at the
+    Precision-optimal path (cosine target ≥ 0.99 vs HF bf16) at the
     cost of ~2× the FP8 path latency in the LLM. Recommended when
     downstream ActionHead is sensitive to accumulated FP8 error.
 
@@ -809,7 +809,7 @@ def chameleon_forward_fp16(
             Se, D, 1e-5, int(stream),
         )
 
-        # Q / K / V GEMMs (no bias in 002).
+        # Q / K / V GEMMs (no bias in Chameleon).
         # NOTE: Q_ptr aliases xn_ptr on Thor (chameleon slots["Q_O"] =
         # bufs['xn'].data_ptr()). Because gemm.fp16_nn reads A (xn) and
         # writes D (Q) at the SAME fp16 dtype and SAME buffer, cuBLAS
@@ -979,7 +979,7 @@ def chameleon_forward_calibrate(
             Se * D, int(stream),
         )
 
-        # ── 3. Q/K/V FP8 GEMMs (no bias for 002) ──
+        # ── 3. Q/K/V FP8 GEMMs (no bias in Chameleon) ──
         q_w_ptr = int(weights['q_w'][li])
         k_w_ptr = int(weights['k_w'][li])
         v_w_ptr = int(weights['v_w'][li])
