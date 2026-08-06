@@ -43,8 +43,8 @@ from flash_rt.frontends.torch._nexn2_rtx_decode import (
     Nexn2DecodeState,
     generate_greedy,
 )
-from flash_rt.frontends.torch.qwen36_moe_rtx import (
-    Qwen36MoeTextFrontendRtx,
+from flash_rt.frontends.torch.qwen36_moe import (
+    Qwen36MoeTextFrontend,
 )
 
 
@@ -321,7 +321,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
 
-    frontend = Qwen36MoeTextFrontendRtx(
+    frontend = Qwen36MoeTextFrontend(
         args.checkpoint,
         device=args.device,
         max_seq=args.max_seq,

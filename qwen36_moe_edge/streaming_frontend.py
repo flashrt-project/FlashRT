@@ -18,12 +18,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from flash_rt.frontends.torch.qwen36_moe_rtx import Qwen36MoeTextFrontendRtx
+from flash_rt.frontends.torch.qwen36_moe import Qwen36MoeTextFrontend
 
 from qwen36_moe_edge.expert_cache import CacheConfig, ExpertCache
 
 
-class Qwen36MoeStreamingFrontend(Qwen36MoeTextFrontendRtx):
+class Qwen36MoeStreamingFrontend(Qwen36MoeTextFrontend):
     """Routed experts streamed from a bundle rather than held in memory."""
 
     _MODEL_LABEL = "Qwen3.6-35B-A3B text, streamed experts"
@@ -35,7 +35,7 @@ class Qwen36MoeStreamingFrontend(Qwen36MoeTextFrontendRtx):
     # which is what happened on the first attempt, on a target where the tier is
     # correctly not built at all.
     _REQUIRED_KERNELS = tuple(
-        name for name in Qwen36MoeTextFrontendRtx._REQUIRED_KERNELS
+        name for name in Qwen36MoeTextFrontend._REQUIRED_KERNELS
         if not name.startswith(('moe_blocktile_mma', 'moe_m16_mma'))
     ) + ('qwen35moe_e0m3_dequant_bf16', 'bf16_matvec_sm120_bf16')
 

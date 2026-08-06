@@ -160,11 +160,11 @@ def collect_activations(
         Nexn2DecodeState,
         generate_greedy,
     )
-    from flash_rt.frontends.torch.qwen36_moe_rtx import (
-        Qwen36MoeTextFrontendRtx,
+    from flash_rt.frontends.torch.qwen36_moe import (
+        Qwen36MoeTextFrontend,
     )
 
-    frontend = Qwen36MoeTextFrontendRtx(
+    frontend = Qwen36MoeTextFrontend(
         checkpoint, device=device, max_seq=max_seq, quant_scope="experts")
     input_ids = frontend.tokenizer(
         prompt, return_tensors="pt", add_special_tokens=False,

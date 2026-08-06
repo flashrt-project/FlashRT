@@ -41,7 +41,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
 
-    from flash_rt.frontends.torch.qwen36_moe_rtx import Qwen36MoeTextFrontendRtx
+    from flash_rt.frontends.torch.qwen36_moe import Qwen36MoeTextFrontend
 
     # Select and initialise the device before touching the memory stats: they
     # are per-device counters and are not addressable until then.
@@ -49,7 +49,7 @@ def main() -> None:
     torch.cuda.init()
     torch.cuda.reset_peak_memory_stats(args.device)
     t0 = time.perf_counter()
-    frontend = Qwen36MoeTextFrontendRtx(
+    frontend = Qwen36MoeTextFrontend(
         args.checkpoint, device=args.device, max_seq=args.max_seq)
     _sync(args.device)
     load_s = time.perf_counter() - t0
