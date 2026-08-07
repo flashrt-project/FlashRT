@@ -1696,6 +1696,32 @@ target_include_directories(flash_rt_kernels PRIVATE
   ${CUTLASS_DIR}/tools/util/include
 )
 
+# ── Hy-Embodied-0.5-VLA model kernels (opt-in) ──
+# HyVLA sources compile only when FLASHRT_ENABLE_HYVLA=ON together with the
+# matching architecture gate. HyVLA OFF leaves the default SM87/SM110 build
+# and symbol surface unchanged.
+option(FLASHRT_ENABLE_HYVLA "Build HyVLA model kernels" OFF)
+if(FLASHRT_ENABLE_HYVLA AND GPU_ARCH STREQUAL "110")
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/hyvla_fused_thor.cu
+    csrc/kernels/hyvla_vit_fuse.cu
+    csrc/kernels/hyvla_quant_fp8_thor.cu
+    csrc/kernels/hyvla_ffn_fp8_thor.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_HYVLA_THOR=1)
+  message(STATUS "Hy-VLA Thor SM110 kernels: ENABLED")
+endif()
+
+# The fused RoPE+QKNorm+KV-write megakernel is plain CUDA (no SM110-only
+# instructions) and removes ~11 launches per attention block; the FP8
+# Thor kernels stay SM110-only.
+if(FLASHRT_ENABLE_HYVLA AND GPU_ARCH STREQUAL "87")
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/hyvla_fused_thor.cu
+    csrc/kernels/hyvla_vit_fuse.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_HYVLA_ORIN=1)
+  message(STATUS "Hy-VLA Orin SM87 fused attention-prep kernel: ENABLED")
+endif()
+
 target_link_libraries(flash_rt_kernels PRIVATE
   CUDA::cublas
   CUDA::cublasLt
