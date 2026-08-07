@@ -78,6 +78,31 @@ def _camera_tensor(image):
 
 
 class HyVLATorchFrontendThor:
+    #: Development override for the hardware gate (e.g. running the weight
+    #: loader on a non-Thor box). Any non-empty value skips the capability
+    #: probe; kernels still require the real hardware at runtime. Not a
+    #: supported production path.
+    _FORCE_ARCH_ENV = "FLASHRT_HYVLA_FORCE_ARCH"
+    _REQUIRED_CAPABILITY = (11, 0)
+    _ARCH_NAME = "Jetson Thor SM110"
+
+    def _require_arch(self):
+        import os
+
+        if os.environ.get(self._FORCE_ARCH_ENV, ""):
+            return  # explicit documented dev override: skip the probe
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"HyVLA frontend requires a CUDA device ({self._ARCH_NAME}); "
+                "CUDA is not available.")
+        cap = torch.cuda.get_device_capability()
+        if cap != self._REQUIRED_CAPABILITY:
+            raise RuntimeError(
+                f"HyVLA frontend requires {self._ARCH_NAME} (capability "
+                f"{self._REQUIRED_CAPABILITY}), found capability {cap}. Set "
+                f"{self._FORCE_ARCH_ENV}=1 to bypass this check for "
+                "development only.")
+
     def __init__(self, checkpoint_dir: str, *, hardware: str = "thor",
                  use_fp8: bool = False, use_fp8_vit: bool = False,
                  use_fused: bool = False, use_fp4: bool = False,
@@ -85,6 +110,7 @@ class HyVLATorchFrontendThor:
                  use_ffn_mega: bool = False, **kwargs):
         self.checkpoint_dir = str(checkpoint_dir)
         self.device = "cuda"
+        self._require_arch()
         self.use_fp8 = bool(use_fp8)
         self.use_fp8_vit = bool(use_fp8_vit)
         self.use_fused = bool(use_fused)
@@ -238,7 +264,9 @@ class HyVLATorchFrontendThor:
 
         def q_nvfp4(w_bf16):
             N, K = w_bf16.shape
-            assert K % 64 == 0, f"cutlass_fp4_sq_fp16 needs K%64==0, got K={K}"
+            if K % 64 != 0:
+                raise ValueError(
+                    f"cutlass_fp4_sq_fp16 needs K%64==0, got K={K}")
             w16 = w_bf16.to(torch.float16).contiguous()
             packed = torch.empty(N, K // 2, dtype=torch.uint8, device=self.device)
             sf = torch.empty(F4.sfa_size_bytes(N, K, True), dtype=torch.uint8, device=self.device)
@@ -299,8 +327,10 @@ class HyVLATorchFrontendThor:
     def tokenizer(self):
         if self._tokenizer is None:
             from transformers import AutoTokenizer
+            # Standard tokenizer path only — never execute checkpoint-provided
+            # Python code (no trust_remote_code).
             self._tokenizer = AutoTokenizer.from_pretrained(
-                self.checkpoint_dir, trust_remote_code=True)
+                self.checkpoint_dir)
         return self._tokenizer
 
     def _tokenize(self, prompt):
@@ -554,7 +584,8 @@ class HyVLATorchFrontendThor:
         Returns raw action chunk (1, chunk, max_action_dim) as numpy fp32."""
         if prompt is not None and prompt != self._prompt:
             self.set_prompt(prompt)
-        assert self._lang_tokens is not None, "call set_prompt() first"
+        if self._lang_tokens is None:
+            raise RuntimeError("call set_prompt() before predict_actions()")
         dev = self.device
 
         if not torch.is_tensor(images):
@@ -568,6 +599,10 @@ class HyVLATorchFrontendThor:
             state_t = torch.zeros(1, self.max_state_dim, device=dev, dtype=_BF16)
         else:
             st = torch.as_tensor(np.asarray(state), device=dev, dtype=_BF16).reshape(1, -1)
+            if st.shape[1] > self.max_state_dim:
+                raise ValueError(
+                    f"state has {st.shape[1]} dims, max_state_dim is "
+                    f"{self.max_state_dim}")
             if st.shape[1] < self.max_state_dim:
                 st = F.pad(st, (0, self.max_state_dim - st.shape[1]))
             state_t = st
@@ -604,6 +639,13 @@ class HyVLATorchFrontendThor:
                                   dtype=torch.float32, device=dev)
         else:
             noise_t = torch.as_tensor(np.asarray(noise), device=dev, dtype=torch.float32)
+            want = self.chunk * self.max_action_dim
+            if noise_t.numel() != want:
+                raise ValueError(
+                    f"noise must have {want} elements "
+                    f"(chunk={self.chunk} x max_action_dim={self.max_action_dim}), "
+                    f"got {noise_t.numel()}")
+            noise_t = noise_t.reshape(1, self.chunk, self.max_action_dim)
 
         x_t = self._graph_forward(S_p, n_vis, prefix_embs, pmask, pcos, psin,
                                   smask, scos, ssin, state_t, noise_t,

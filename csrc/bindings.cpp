@@ -8126,6 +8126,25 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
            uintptr_t kn_w, uintptr_t q_out, uintptr_t kbuf, uintptr_t vbuf,
            int S, int nq, int nkv, int hd, int S_tot, int off, float eps,
            int kv_rep, uintptr_t stream) {
+            if (S <= 0 || nq <= 0 || nkv <= 0 || S_tot <= 0)
+                throw py::value_error(
+                    "hyvla_rope_qknorm_kvwrite_bf16 requires S>0, nq>0, "
+                    "nkv>0, S_tot>0");
+            if (hd != 128)
+                throw py::value_error(
+                    "hyvla_rope_qknorm_kvwrite_bf16 supports hd==128 only, "
+                    "got " + std::to_string(hd));
+            if (off < 0 || off + S > S_tot)
+                throw py::value_error(
+                    "hyvla_rope_qknorm_kvwrite_bf16: invalid offset window "
+                    "off=" + std::to_string(off) + " S=" + std::to_string(S) +
+                    " S_tot=" + std::to_string(S_tot));
+            if (!(eps > 0.f))
+                throw py::value_error(
+                    "hyvla_rope_qknorm_kvwrite_bf16 requires eps>0");
+            if (kv_rep < 1)
+                throw py::value_error(
+                    "hyvla_rope_qknorm_kvwrite_bf16 requires kv_rep>=1");
             hyvla_rope_qknorm_kvwrite_bf16(
                 reinterpret_cast<const void*>(qkv),
                 reinterpret_cast<const void*>(cos),
@@ -8149,6 +8168,13 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
         [](uintptr_t residual, uintptr_t x_add, uintptr_t ln_weight,
            uintptr_t ln_bias, uintptr_t out, int rows, int dim, float eps,
            uintptr_t stream) {
+            if (rows <= 0 || dim <= 0 || (dim & 1) != 0)
+                throw py::value_error(
+                    "hyvla_vit_add_layer_norm_bf16 requires rows>0 and a "
+                    "positive even dim");
+            if (!(eps > 0.f))
+                throw py::value_error(
+                    "hyvla_vit_add_layer_norm_bf16 requires eps>0");
             hyvla_vit_add_layer_norm_bf16(
                 reinterpret_cast<void*>(residual),
                 reinterpret_cast<const void*>(x_add),
@@ -8165,6 +8191,8 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
 #ifdef FLASHRT_HAVE_HYVLA_THOR
     m.def("hyvla_quant_fp8_dyn_bf16",
         [](uintptr_t x, uintptr_t out, uintptr_t scale, int n, uintptr_t stream) {
+            if (n <= 0)
+                throw py::value_error("hyvla_quant_fp8_dyn_bf16 requires n>0");
             hyvla_quant_fp8_dyn_bf16(
                 reinterpret_cast<const void*>(x),
                 reinterpret_cast<void*>(out),
@@ -8177,6 +8205,17 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
     m.def("hyvla_ffn_gu_silu_bf16",
         [](uintptr_t x, uintptr_t gu, uintptr_t act, int M, int K, int Nout,
            uintptr_t sx, float sgu, uintptr_t stream) {
+            if (M <= 0 || K <= 0 || Nout <= 0)
+                throw py::value_error(
+                    "hyvla_ffn_gu_silu_bf16 requires M>0, K>0, Nout>0");
+            if (K % 16 != 0)
+                throw py::value_error(
+                    "hyvla_ffn_gu_silu_bf16 requires K%16==0, got K=" +
+                    std::to_string(K));
+            if (Nout % 32 != 0)
+                throw py::value_error(
+                    "hyvla_ffn_gu_silu_bf16 requires Nout%32==0, got Nout=" +
+                    std::to_string(Nout));
             hyvla_ffn_gu_silu_bf16(
                 reinterpret_cast<const void*>(x), reinterpret_cast<const void*>(gu),
                 reinterpret_cast<void*>(act), M, K, Nout,
@@ -8189,6 +8228,17 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
     m.def("hyvla_ffn_dn_res_bf16",
         [](uintptr_t a, uintptr_t dn, uintptr_t res, uintptr_t y, int M, int K, int N,
            uintptr_t sa, float sdn, uintptr_t stream) {
+            if (M <= 0 || K <= 0 || N <= 0)
+                throw py::value_error(
+                    "hyvla_ffn_dn_res_bf16 requires M>0, K>0, N>0");
+            if (K % 16 != 0)
+                throw py::value_error(
+                    "hyvla_ffn_dn_res_bf16 requires K%16==0, got K=" +
+                    std::to_string(K));
+            if (N % 32 != 0)
+                throw py::value_error(
+                    "hyvla_ffn_dn_res_bf16 requires N%32==0, got N=" +
+                    std::to_string(N));
             hyvla_ffn_dn_res_bf16(
                 reinterpret_cast<const void*>(a), reinterpret_cast<const void*>(dn),
                 reinterpret_cast<const void*>(res), reinterpret_cast<void*>(y),

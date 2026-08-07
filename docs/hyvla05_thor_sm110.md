@@ -11,10 +11,12 @@
 > + ViT trailing-stage history-frame drop + per-shape FP8 GEMM autotune.
 >
 > ```bash
+> cmake -B build -S . -DGPU_ARCH=110 -DFLASHRT_ENABLE_HYVLA=ON
 > cmake --build build --target flash_rt_kernels            # fused kernels (first build)
-> PYTHONPATH=. python3 tests/test_thor_hyvla05_e2e_check.py --fp8 --fused   # precision gate cos >= 0.999
-> PYTHONPATH=. python3 tests/test_thor_hyvla05_graphsafe.py --fp8 --fused   # graph-safety bitwise gate
-> PYTHONPATH=. python3 tests/test_thor_hyvla05_stageprof.py --fp8 --fused   # per-stage latency
+> python -m pytest tests/test_hyvla_thor_dispatch.py tests/test_hyvla_arch_gate.py \
+>     tests/test_hyvla_fp4_routing.py tests/test_hyvla_kernel_contracts.py -q
+> FLASHRT_HYVLA_CHECKPOINT=/path/to/Hy-Embodied-0.5-VLA \
+>     python -m pytest tests/test_hyvla_thor_graphsafe.py -q   # graph==eager + replay stability
 > ```
 
 ## Key Takeaway
@@ -42,11 +44,11 @@ Industry anchor: NVIDIA achieves 44 ms / 23 Hz on Pi0.5 with hand-written kernel
 | `csrc/kernels/hyvla_quant_fp8_thor.cu` | Single-CTA dynamic FP8 quantization (`use_fused_quant` diagnostic; measured net loss, see dead ends) |
 | `csrc/kernels/hyvla_ffn_fp8_thor.cu` | FFN megakernel (gu+silu_mul / dn+residual, `use_ffn_mega` diagnostic; measured neutral, see dead ends); reusable Thor plain-FP8-MMA GEMM reference |
 | `flash_rt/{executors/torch_weights.py,hardware/__init__.py,api.py,configs/hyvla.yaml}` | `ToBf16` transform / `_PIPELINE_MAP` registration / config allowlist / metadata |
-| `tests/test_thor_hyvla05_{baseline,tower_check,vit_check,e2e_check}.py` | Precision oracles + segmented/full-chain precision gates (`--fp8 --fused --fp4`) |
-| `tests/test_thor_hyvla05_{bench,stageprof,graphsafe}.py` | Latency benchmark / per-stage profiling / graph-safety bitwise gate |
-| `tests/test_thor_hyvla05_{gemm_ceiling,vit_prof,fp4_sf_check}.py` | GEMM ceiling / ViT internal profiling / NVFP4 SF validation |
+| `tests/test_hyvla_thor_dispatch.py`, `test_hyvla_arch_gate.py`, `test_hyvla_fp4_routing.py` | Registration, SM110 fail-fast, and FP4/fused routing gates (no GPU required) |
+| `tests/test_hyvla_kernel_contracts.py` | Host-side contract validation of the fused-kernel pybind APIs |
+| `tests/test_hyvla_thor_graphsafe.py` | graph==eager equivalence + replay stability gate (needs Thor + checkpoint) |
 
-## Precision Gates (all vs. HF/transformers eager, same fixed noise; `e2e_check`/`tower_check`/`vit_check`)
+## Precision Gates (recorded values, all vs. HF/transformers eager, same fixed noise)
 
 | Checkpoint | cosine |
 |---|---|
@@ -55,8 +57,8 @@ Industry anchor: NVIDIA achieves 44 ms / 23 Hz on Pi0.5 with hand-written kernel
 | Full-chain native BF16 (load_model path) | 0.999910 |
 | **Full-chain production (fp8 + fused + efficient-SDPA + autotune)** | **0.999706** |
 
-Graph-safety gate (`graphsafe.py`): `use_graph=True vs False` bitwise identical (`max|delta|=0`) + stable replay,
-verified for both the ViT graph and the main graph.
+Graph-safety gate (`tests/test_hyvla_thor_graphsafe.py`): `use_graph=True vs False`
+equivalence + stable replay, covering the ViT graph and the main graph.
 
 ## Key Mechanisms / Correctness Pitfalls (Highest Reuse Value)
 
@@ -153,13 +155,15 @@ The building blocks are in place and have high reuse value: plain-FP8-MMA layout
 
 ## Early Inductor Prototype (`--v4`, Historical Reference, Not Production)
 
-`tests/test_thor_hyvla05_fast.py --v4 --compile-vit`: `torch.compile` whole-block fusion + static FP8 +
-grouped-bmm/FA2 + full-graph capture, E2E **98.8 ms (8.6–9.1x)**, cos 0.9985–0.9998. It proved the benefit
-of the "whole-layer fusion" approach (ViT 51.5, denoise 29 are both below native), but due to **30–60 s
-recompilation per prompt, 15% Inductor cache-bloat degradation, silent dynamo fallback, and no integration
-with `load_model`**, it is not used in production. Its six measurement methodology lessons (L2 residency
-illusion / no-fusion baseline illusion / nsys sum != wall clock / synchronization floor / Inductor cache
-bloat / dynamo silent downgrade) and the FP4-in-Inductor verdict have been distilled into internal documentation.
+An early `torch.compile` whole-block fusion + static FP8 + grouped-bmm/FA2 +
+full-graph capture prototype reached E2E **98.8 ms (8.6–9.1x)**, cos 0.9985–0.9998.
+It proved the benefit of the "whole-layer fusion" approach (ViT 51.5, denoise 29
+are both below native), but due to **30–60 s recompilation per prompt, 15%
+Inductor cache-bloat degradation, silent dynamo fallback, and no integration
+with `load_model`**, it is not used in production. The six measurement
+methodology lessons it exposed (L2 residency illusion / no-fusion baseline
+illusion / nsys sum != wall clock / synchronization floor / Inductor cache
+bloat / dynamo silent downgrade) informed the production path design.
 
 ## Hardware and Model Profile (Measured)
 

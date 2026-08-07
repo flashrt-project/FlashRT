@@ -700,6 +700,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         use_fp4 = False  # do not fall through to the Pi0.5 FP4 routing
 
     # ── FP4 routing (Pi0.5 torch + Pi0.5 JAX on Thor, HyVLA torch on Thor) ──
+    _hyvla_fp4 = False
     if use_fp4:
         _fp4_ok = (
             (config == "pi05" and framework in ("torch", "jax") and arch == "thor")
@@ -738,6 +739,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                         HyVLATorchFrontendThor,
                     )
                     pipe_cls = HyVLATorchFrontendThor
+                    _hyvla_fp4 = True
                     logger.info("HyVLA Thor FP4 tier enabled")
                     use_fp4 = False  # routed; skip Pi0.5 path below
                 elif framework == "torch":
@@ -784,6 +786,17 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     elif config == "wan22_ti2v_5b":
         if "autotune" in sig.parameters:
             kwargs["autotune"] = autotune
+    elif config == "hyvla":
+        # The routed FP4 tier must reach the frontend explicitly; the
+        # generic kwarg set never forwards use_fp4.
+        if _hyvla_fp4 and "use_fp4" in sig.parameters:
+            kwargs["use_fp4"] = True
+        # FP8 tier = the validated production config (fp8 + fused
+        # megakernels); select it explicitly when the frontend accepts it.
+        if use_fp8 and "use_fused" in sig.parameters:
+            kwargs["use_fused"] = True
+        if "use_autotune" in sig.parameters:
+            kwargs["use_autotune"] = bool(autotune)
     elif config == "cosmos3_edge":
         # Official Cosmos Framework baseline runner. Runtime knobs such as
         # output_dir, seed, benchmark, and local Wan VAE path are infer() args.
