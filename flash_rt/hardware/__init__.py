@@ -102,6 +102,12 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("pi0", "jax", "rtx_sm89"):
         ("flash_rt.frontends.jax.pi0_rtx", "Pi0JaxFrontendRtx"),
 
+    # ── Hy-Embodied-0.5-VLA (HunYuan MoT dual-tower + flow matching) ──
+    ("hyvla", "torch", "thor"):
+        ("flash_rt.frontends.torch.hyvla_thor", "HyVLATorchFrontendThor"),
+    ("hyvla", "torch", "rtx_sm87"):
+        ("flash_rt.frontends.torch.hyvla_orin", "HyVLATorchFrontendOrin"),
+
     # ── GROOT N1.6 ──
     ("groot", "torch", "thor"):
         ("flash_rt.frontends.torch.groot_thor", "GrootTorchFrontendThor"),
@@ -196,6 +202,7 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
 _SM87_ALLOWED = {
     ("pi05", "torch", "rtx_sm87"),
     ("qwen3_vl", "torch", "rtx_sm87"),
+    ("hyvla", "torch", "rtx_sm87"),
 }
 
 

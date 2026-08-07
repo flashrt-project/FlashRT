@@ -1,0 +1,65 @@
+# FlashRT — Hy-Embodied-0.5-VLA configuration (metadata; runtime dims are code constants)
+name: hyvla
+arch: hy
+vision_type: hyvit2_siglip           # SigLIP-so400m isomorphic + 6-frame spacetime
+backbone: hunyuan_vl_mot             # Mixture-of-Transformers dual-tower
+vlm_hidden: 2048
+expert_hidden: 1024
+vlm_layers: 32
+expert_layers: 32
+decoder_steps: 10                    # flow-matching Euler steps
+action_dim: 32
+state_dim: 32
+chunk_size: 40
+
+# Attention (GQA)
+num_heads: 16
+num_kv_heads: 4
+head_dim: 128
+rope_type: ntk_alpha                 # base = 10000 * 1000^(128/126) = 1.1158847e7
+qk_norm: rms_after_rope              # RMSNorm over head_dim, applied AFTER RoPE
+rms_norm_eps: 1.0e-5
+
+# MoT routing: every proj + norm has a text and a vision (_v) copy, routed per-token.
+# Expert tower runs 100% through the _v branch; QK-norm is a single shared copy.
+mot_routing: static_vision_text      # sorted [vision|text] contiguous slices
+
+# FFN
+activation: silu                     # SwiGLU
+intermediate_vlm: 6144
+intermediate_expert: 2048
+
+# Vision encoder (HYViT2-400M)
+vision:
+  patch_size: 16
+  image_size: 224
+  num_patches: 196                   # 14x14, merged 2x2 -> 49 tokens/camera
+  merged_tokens_per_cam: 49
+  hidden_dim: 1152
+  num_layers: 27
+  num_heads: 16
+  head_dim: 72
+  layernorm_eps: 1.0e-6
+  spacetime_layer_stride: 4          # blocks {3,7,11,15,19,23} attend over 6 history frames
+  history_frames: 6
+  num_cameras: 3
+
+# Production config (2026-08-04): use_fp8=True, use_fused=True
+#   -> E2E 172.9 ms (the reference eager path ~930 ms, 5.38x), action cos 0.999706.
+#   One CUDA graph over prefill + 10-step denoise; dynamic per-tensor FP8
+#   (calibration-free, graph-safe) on prefill+denoise GEMMs; bf16 ViT +
+#   action head; custom fused megakernel (rope+qknorm+kvwrite); and the
+#   memory-efficient SDPA backend.
+# Gated experimental (default off, both measured):
+#   use_fp8_vit — FP8 ViT is a NET LOSS (+14 ms: quant/bias passes outweigh
+#                 the large-M GEMM saving).
+#   use_fp4     — NVFP4 W4A4 prefill FFN is correct (cos 0.993) but only
+#                 ~neutral in E2E at this model's M sizes.
+quant:
+  enabled: true
+  dtype: fp8_dynamic_per_tensor
+  prefill: fp8
+  denoise: fp8
+  vision: bf16
+  action_head: bf16
+  calibration: none          # dynamic amax computed on GPU each forward

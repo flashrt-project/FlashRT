@@ -29,7 +29,7 @@ def load_model(
     autotune: int = 3,              # 0=off, 3=default, 5+=thorough
     recalibrate: bool = False,
     weight_cache: bool = True,      # JAX only
-    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "groot_n17" | "pi0fast" | "motus" | "wan22_ti2v_5b" | "cosmos3_video" | "cosmos3_edge"
+    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "groot_n17" | "pi0fast" | "motus" | "wan22_ti2v_5b" | "cosmos3_video" | "cosmos3_edge" | "hyvla"
     device=None,                    # reserved
     # Pi0-FAST-specific:
     decode_cuda_graph: bool = False,
@@ -162,6 +162,10 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   frontend; `rtx_sm89` resolves directly to its dedicated SM89 frontend.
   `use_fp16=True, use_fp8=False` requests the explicit RTX reference
   frontend for the selected hardware.
+- `config="hyvla"` (Hy-Embodied-0.5-VLA) is registered for
+  `framework="torch"` on `hardware="thor"`. Thor uses runtime dynamic
+  FP8 with fused megakernels and optional NVFP4 FFN (`use_fp4=True`).
+  See `docs/hyvla05_thor_sm110.md`.
 
 ### `flash_rt.VLAModel`
 
@@ -296,6 +300,8 @@ based on `use_fp8` / `use_fp16`; `rtx_sm89` resolves directly to the
 dedicated SM89 frontend class.
 Wan2.2 TI2V-5B is registered for `(config="wan22_ti2v_5b",
 framework="torch", arch="rtx_sm120")`.
+Hy-Embodied-0.5-VLA is registered for `(config="hyvla",
+framework="torch", arch in {"thor", "rtx_sm87"})`.
 
 ### `_PIPELINE_MAP`
 
