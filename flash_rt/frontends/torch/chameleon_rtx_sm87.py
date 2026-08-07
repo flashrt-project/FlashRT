@@ -633,6 +633,11 @@ class ChameleonTorchFrontendRtxSm87:
         if text is not None:
             self.set_prompt(text, images)
         self._require_prompt()
+        if max_new_tokens < 0:
+            raise ValueError(
+                f"max_new_tokens must be >= 0, got {max_new_tokens}")
+        if max_new_tokens == 0:
+            return [] if return_ids else ""
         eos = self.EOS_ID if eos_token_id is None else int(eos_token_id)
         budget = min(max_new_tokens, self.max_seq - self.S)
         if budget < max_new_tokens:

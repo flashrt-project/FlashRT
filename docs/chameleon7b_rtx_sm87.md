@@ -709,3 +709,14 @@ not a VLA. Unknown kwargs are swallowed by `**_ignored`.
 | int8 plain | `use_hadamard=False` | works; loses the outlier conditioning (8/16 greedy) — kept for A/B |
 | int4 (QuaRot) | `use_int4=True` | works; best at very short ISL, below int8+hadamard at production ISL |
 | int4+down | `use_int4_down=True` | works but **not recommended** — worst at production ISL (§4.5) |
+
+## 11. Hardware gate and generation boundary
+
+- `ChameleonTorchFrontendRtxSm87` fail-fasts on non-Orin hardware: it checks
+  `torch.cuda.get_device_capability()` before checkpoint loading / weight
+  quantization / large CUDA allocation and raises on anything other than SM87.
+  The documented development override is `FLASHRT_CHAMELEON_SM87_FORCE=1`
+  (skips the probe only; kernels still need the real hardware at runtime).
+- `generate(...)` defines `max_new_tokens` explicitly: negative values raise
+  `ValueError`, zero returns an empty result (no prefill, no decode), and
+  values above remaining `max_seq` capacity are clipped with a warning.

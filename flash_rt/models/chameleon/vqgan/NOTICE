@@ -1,0 +1,35 @@
+VQ-GAN vendored code — provenance and license
+==============================================
+
+The files in this directory (vqgan.py, image_tokenizer.py, vocab.py) are
+vendored third-party code and are NOT covered by this repository's root
+Apache-2.0 license. They are governed by the Chameleon Research License,
+included verbatim in LICENSE in this directory.
+
+Provenance
+----------
+* Source: Meta Chameleon, https://github.com/facebookresearch/chameleon
+  (chameleon/vae/ subtree), Copyright (c) Meta Platforms, Inc. and affiliates.
+* The core module vqgan.py is itself derived by Meta from the MIT-licensed
+  CompVis implementation:
+  https://github.com/CompVis/taming-transformers/blob/3ba01b241669f5ade541ce990f7650a3b8f65318/taming/models/vqgan.py
+  The MIT attribution is preserved in the vqgan.py module docstring.
+
+Modifications
+-------------
+FlashRT has modified these files relative to upstream. The changes are
+inference-only and do not add training/optimizer code:
+* Removed training steps and optimizer components (upstream note preserved in
+  vqgan.py).
+* Trimmed unused dependencies to keep the runtime self-contained.
+* Adapted the tokenizer interface for FlashRT's image-token decode path.
+
+License compatibility notice
+----------------------------
+The Chameleon Research License grants rights for Noncommercial Research Uses
+only. It is therefore more restrictive than this repository's Apache-2.0
+license. This subdirectory must be treated as a separately-licensed component:
+do not redistribute or use it in a manner inconsistent with the Chameleon
+Research License. If a deployment requires rights beyond the noncommercial
+research grant, obtain them from Meta directly or substitute an
+independently-licensed VQ-GAN implementation.

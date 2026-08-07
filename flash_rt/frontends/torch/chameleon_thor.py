@@ -63,6 +63,25 @@ PATCH_SIZE = 32
 class ChameleonTorchFrontendThor:
     """Standalone Chameleon-7B Thor prefill frontend."""
 
+    #: Required CUDA capability (Jetson Thor SM110) and the documented
+    #: dev override that skips the probe. Mirrors the Orin frontend's gate.
+    _REQUIRED_CAPABILITY = (11, 0)
+    _FORCE_ARCH_ENV = "FLASHRT_CHAMELEON_THOR_FORCE"
+
+    def _require_arch(self) -> None:
+        if os.environ.get(self._FORCE_ARCH_ENV) == "1":
+            return  # explicit documented dev override: skip the probe
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "ChameleonTorchFrontendThor requires a Jetson Thor SM110 CUDA "
+                "device; CUDA is not available.")
+        cc = torch.cuda.get_device_capability(0)
+        if cc != self._REQUIRED_CAPABILITY:
+            raise RuntimeError(
+                f"ChameleonTorchFrontendThor targets SM110 (Thor); found "
+                f"SM{cc[0]}{cc[1]}. The FP8 path needs the Thor kernel set. "
+                f"Set {self._FORCE_ARCH_ENV}=1 to override for development.")
+
     def __init__(
         self,
         checkpoint_dir: str,
@@ -80,6 +99,7 @@ class ChameleonTorchFrontendThor:
         fp4_ffn_layers: Optional[List[int]] = None,
         use_fa4_attn: Optional[bool] = None,
     ) -> None:
+        self._require_arch()
         self.checkpoint_dir = pathlib.Path(checkpoint_dir).expanduser().resolve()
         if not self.checkpoint_dir.exists():
             raise FileNotFoundError(f"checkpoint_dir not found: {self.checkpoint_dir}")
@@ -521,7 +541,10 @@ class ChameleonTorchFrontendThor:
                 *with_nl, IMG_END_ID]
 
     def _allocate_buffers(self) -> None:
-        Se = self._max_pos
+        # Capacity is floored to a multiple of 16 so the pad-to-16 in
+        # set_prompt can never overshoot the allocated buffers/KV cache when
+        # max_seq itself is not a multiple of 16.
+        Se = (self._max_pos // 16) * 16
         D = D_LLM
         Dff = DFF_LLM
         self._Se_max = Se
@@ -664,10 +687,13 @@ class ChameleonTorchFrontendThor:
 
     def set_prompt(self, text: str, images: Optional[list] = None) -> list[int]:
         input_ids = self.encode_prompt(text, images)
-        if len(input_ids) > self._Se_max:
-            raise ValueError(f"sequence length {len(input_ids)} exceeds max_seq={self._Se_max}")
         self._real_len = len(input_ids)
         rem = len(input_ids) % 16
+        padded_len = len(input_ids) + ((16 - rem) if rem else 0)
+        if padded_len > self._Se_max:
+            raise ValueError(
+                f"padded sequence length {padded_len} exceeds max_seq="
+                f"{self._Se_max} (prompt has {len(input_ids)} tokens)")
         if rem:
             input_ids.extend([PAD_ID] * (16 - rem))
         self.Se = len(input_ids)
@@ -827,7 +853,10 @@ class ChameleonTorchFrontendThor:
         generated = list(self._last_input_ids[:self._real_len])
         eos = EOS_ID if eos_token_id is None else int(eos_token_id)
         budget = int(max_new_tokens)
-        if budget <= 0:
+        if budget < 0:
+            raise ValueError(
+                f"max_new_tokens must be >= 0, got {max_new_tokens}")
+        if budget == 0:
             return {"input_ids": generated,
                     "text": self.tokenizer.decode(generated)}
 

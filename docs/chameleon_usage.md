@@ -128,6 +128,16 @@ quantize, norm+quantize) and the FA4 attention fast path.
 
 ## 8. Notes
 
+- The frontend fail-fasts on non-Thor hardware: `ChameleonTorchFrontendThor`
+  checks `torch.cuda.get_device_capability()` before checkpoint loading and
+  raises on anything other than SM110. The documented development override is
+  `FLASHRT_CHAMELEON_THOR_FORCE=1` (skips the probe only; kernels still need
+  the real hardware at runtime).
+- Prompt capacity is floored to a multiple of 16 at allocation, and
+  `set_prompt` validates the **padded** length against that capacity, so a
+  non-aligned `max_seq` can never let pad-to-16 overshoot the buffers or the
+  KV cache. `generate_greedy` rejects negative `max_new_tokens` and returns
+  the prompt-only result for zero.
 - `generate_greedy(...)` runs **incremental KV-cache decode**: one prefill
   over the prompt, then M=1 decode steps (`chameleon_decode_step` +
   bottom-right causal FMHA `fmha_fp16_causal_br`). Measured ~30 tok/s
@@ -141,3 +151,12 @@ quantize, norm+quantize) and the FA4 attention fast path.
   resize while eager uses aspect-preserving `var_center_crop` — token
   counts can differ slightly between backends (expected behavior
   difference, not a bug).
+
+## 9. Third-party license (VQ-GAN)
+
+The VQ-GAN module under `flash_rt/models/chameleon/vqgan/` is vendored from
+Meta Chameleon and is governed by the Chameleon Research License — not by this
+repository's Apache-2.0 license. See `flash_rt/models/chameleon/vqgan/LICENSE`
+and `NOTICE` for the full text, provenance (including the upstream CompVis
+MIT attribution), and the modification record. The license is noncommercial-
+research-only; treat that subdirectory as a separately-licensed component.
