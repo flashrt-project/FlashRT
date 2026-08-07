@@ -2463,3 +2463,20 @@ void gpu_euler_step(float* actions, const __half* velocity,
     euler_step_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
         actions, velocity, dt, n, vel_elem_offset);
 }
+
+// ── Symmetric in-place clamp: x = min(max(x, -limit), +limit) ──
+// Used by Chameleon-7B L31 to keep gate*up in fp16 range so the
+// subsequent down_proj (K=11008) GEMM's fp32 accumulator doesn't overflow
+// fp16 max (65504) on cast-back. Symmetric to keep the kernel branchless.
+__global__ void clamp_inplace_fp16_kernel(__half* x, float limit, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float v = __half2float(x[idx]);
+    if (v > limit) v = limit;
+    else if (v < -limit) v = -limit;
+    x[idx] = __float2half(v);
+}
+
+void clamp_inplace_fp16(__half* x, float limit, int n, cudaStream_t stream) {
+    clamp_inplace_fp16_kernel<<<(n + 255) / 256, 256, 0, stream>>>(x, limit, n);
+}

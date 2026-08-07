@@ -7,8 +7,9 @@
 // and is exposed to Python as `flash_rt_fa2.fwd_bf16_causal`
 // (binding added in csrc/fa2_bindings.cpp).
 //
-// Build set is intentionally small: bf16 hdim=128 for Qwen3-8B and
-// bf16 hdim=256 for Qwen3.6 full-attention chunked prefill.
+// Build set: bf16 hdim=128 for Qwen3-8B, bf16 hdim=256 for Qwen3.6
+// full-attention chunked prefill, and fp16 hdim=128 for Chameleon-7B
+// causal attention on Orin SM87.
 //
 // The non-causal wrapper's helpers (fill_params, splitkv heuristic)
 // are duplicated here intentionally to keep this file standalone
@@ -22,6 +23,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <algorithm>
+#include <stdexcept>
+#include <string>
 
 #include "flash_attn_2_src/flash_attn/namespace_config.h"
 #include "flash_attn_2_src/flash_attn/flash.h"
@@ -169,6 +172,7 @@ static int setup_splitkv_causal(FLASH_NAMESPACE::Flash_fwd_params& params,
     return num_splits;
 }
 
+#ifdef FA2_HAS_BF16
 extern "C" void fvk_attention_fa2_fwd_bf16_causal(
     const void* q_ptr, const void* k_ptr, const void* v_ptr,
     void* o_ptr, void* softmax_lse_ptr,
@@ -190,10 +194,9 @@ extern "C" void fvk_attention_fa2_fwd_bf16_causal(
     supported = supported || head_dim == 256;
 #endif
     if (!supported) {
-        fprintf(stderr,
-            "fvk_attention_fa2_fwd_bf16_causal: head_dim=%d not built. "
-            "Enable its FA2_HDIMS entry and rebuild.\n", head_dim);
-        std::abort();
+        throw std::runtime_error(
+            "fvk_attention_fa2_fwd_bf16_causal: head_dim=" + std::to_string(head_dim) +
+            " not built. Enable its FA2_HDIMS entry and rebuild.");
     }
 #else
     if ((head_dim != 128)
@@ -202,15 +205,14 @@ extern "C" void fvk_attention_fa2_fwd_bf16_causal(
 #endif
         ) {
 #ifdef FA2_HAS_HDIM_256
-        fprintf(stderr,
-            "fvk_attention_fa2_fwd_bf16_causal: head_dim=%d not built. "
-            "Only head_dim=128 and 256 are currently instantiated.\n", head_dim);
+        throw std::runtime_error(
+            "fvk_attention_fa2_fwd_bf16_causal: head_dim=" + std::to_string(head_dim) +
+            " not built. Only head_dim=128 and 256 are currently instantiated.");
 #else
-        fprintf(stderr,
-            "fvk_attention_fa2_fwd_bf16_causal: head_dim=%d not built. "
-            "Only head_dim=128 is currently instantiated.\n", head_dim);
+        throw std::runtime_error(
+            "fvk_attention_fa2_fwd_bf16_causal: head_dim=" + std::to_string(head_dim) +
+            " not built. Only head_dim=128 is currently instantiated.");
 #endif
-        std::abort();
     }
 #endif
 
@@ -253,10 +255,9 @@ extern "C" void fvk_attention_fa2_fwd_bf16_causal(
             return;
 #endif
         default:
-            fprintf(stderr,
-                "fvk_attention_fa2_fwd_bf16_causal: head_dim=%d not built "
-                "in this FA2 matrix.\n", head_dim);
-            std::abort();
+            throw std::runtime_error(
+                "fvk_attention_fa2_fwd_bf16_causal: head_dim=" + std::to_string(head_dim) +
+                " not built in this FA2 matrix.");
     }
 #else
     if (head_dim == 128 && num_splits > 1) {
@@ -272,11 +273,87 @@ extern "C" void fvk_attention_fa2_fwd_bf16_causal(
     }
 #else
     else {
-        fprintf(stderr,
-            "fvk_attention_fa2_fwd_bf16_causal: head_dim=%d not built "
-            "(hdim=256 disabled at compile time).\n", head_dim);
-        std::abort();
+        throw std::runtime_error(
+            "fvk_attention_fa2_fwd_bf16_causal: head_dim=" + std::to_string(head_dim) +
+            " not built (hdim=256 disabled at compile time).");
     }
 #endif
 #endif
 }
+#else  // !FA2_HAS_BF16
+extern "C" void fvk_attention_fa2_fwd_bf16_causal(
+    const void*, const void*, const void*, void*, void*,
+    void*, void*,
+    int, int, int, int, int, int,
+    int, int, int, int, int, int,
+    int, int, int, int, int, int,
+    float, int, cudaStream_t)
+{
+    throw std::runtime_error(
+        "fvk_attention_fa2_fwd_bf16_causal: bf16 entry was not compiled. "
+        "Rebuild with -DFA2_DTYPES=\"fp16;bf16\" to enable it.");
+}
+#endif  // FA2_HAS_BF16
+
+// FP16 causal sibling. Only head_dim=128 is instantiated (Chameleon-7B
+// on Orin SM87 is the consumer; bf16 covers the head_dim=256 shapes
+// used by Qwen3.6 chunked prefill).
+#if defined(FA2_HAS_FP16) && defined(FA2_HAS_HDIM_128)
+extern "C" void fvk_attention_fa2_fwd_fp16_causal(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr,
+    void* softmax_lse_accum_ptr, void* o_accum_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream)
+{
+    if (head_dim != 128) {
+        throw std::runtime_error(
+            "fvk_attention_fa2_fwd_fp16_causal: head_dim=" + std::to_string(head_dim) +
+            " not built. Only head_dim=128 is currently instantiated for the "
+            "fp16 causal path. Add a new file under csrc/attention/fa2_causal_inst/ "
+            "and extend the dispatch in fa2_wrapper_causal.cu to support "
+            "additional shapes.");
+    }
+
+    FLASH_NAMESPACE::Flash_fwd_params params;
+    fill_params_causal(params,
+                       q_ptr, k_ptr, v_ptr, o_ptr, softmax_lse_ptr,
+                       batch, seqlen_q, seqlen_k,
+                       num_heads_q, num_heads_kv, head_dim,
+                       q_batch_stride, q_row_stride, q_head_stride,
+                       k_batch_stride, k_row_stride, k_head_stride,
+                       v_batch_stride, v_row_stride, v_head_stride,
+                       o_batch_stride, o_row_stride, o_head_stride,
+                       softmax_scale);
+    // fill_params_causal hardcodes is_bf16=true; flip it for the fp16 path.
+    params.is_bf16 = false;
+
+    int num_splits = setup_splitkv_causal(params, softmax_lse_accum_ptr, o_accum_ptr,
+                                          num_sms, seqlen_q, seqlen_k,
+                                          head_dim, batch, num_heads_q);
+    if (num_splits > 1) {
+        FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::half_t, 128, true>(params, stream);
+    } else {
+        FLASH_NAMESPACE::run_mha_fwd_<cutlass::half_t, 128, true>(params, stream);
+    }
+}
+#else  // !(FA2_HAS_FP16 && FA2_HAS_HDIM_128)
+extern "C" void fvk_attention_fa2_fwd_fp16_causal(
+    const void*, const void*, const void*, void*, void*,
+    void*, void*,
+    int, int, int, int, int, int,
+    int, int, int, int, int, int,
+    int, int, int, int, int, int,
+    float, int, cudaStream_t)
+{
+    throw std::runtime_error(
+        "fvk_attention_fa2_fwd_fp16_causal: fp16 hdim=128 entry was not "
+        "compiled. Rebuild with -DFA2_DTYPES=\"fp16;bf16\" and "
+        "-DFA2_HDIMS including 128 (and FLASHRT_ENABLE_CHAMELEON=ON) to enable it.");
+}
+#endif  // FA2_HAS_FP16 && FA2_HAS_HDIM_128

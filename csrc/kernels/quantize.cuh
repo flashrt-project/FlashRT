@@ -325,3 +325,27 @@ void quantize_int8_rowwise_static(const __nv_bfloat16* input, int8_t* output,
 void dequant_int32_to_bf16(const int32_t* input, __nv_bfloat16* output,
                            const float* d_act_scale, const float* d_weight_scale,
                            int n, cudaStream_t stream = 0);
+
+// FP16-input per-row INT8 quantize (FP16 sibling of quantize_int8_rowwise)
+#ifdef FLASHRT_ENABLE_CHAMELEON
+void quantize_int8_rowwise_fp16(const __half* input, int8_t* output,
+                                 float* d_scales, int rows, int cols,
+                                 cudaStream_t stream = 0);
+#endif  // FLASHRT_ENABLE_CHAMELEON
+
+// ---- Fused norm/activation + dynamic per-tensor FP8 quantize (FP16) ----
+// Measure the amax inside the norm/activation write pass (one fewer full
+// read of the output buffer vs. norm + quantize_fp8_device_fp16 pairs).
+// CUDA-Graph safe. The fp16 output buffer is always written as well.
+void rms_norm_quantize_dynamic_fp8_fp16(const __half* x, const __half* weight,
+                                         __half* xn_out, __nv_fp8_e4m3* fp8_out,
+                                         float* d_scale, int seq_len, int dim,
+                                         float eps, cudaStream_t stream = 0);
+void gate_geglu_quantize_dynamic_fp8_fp16(const __half* gate, const __half* up,
+                                           __half* h_out, __nv_fp8_e4m3* fp8_out,
+                                           float* d_scale, int n,
+                                           cudaStream_t stream = 0);
+void residual_add_rms_norm_quantize_dynamic_fp8_fp16(
+        __half* residual, const __half* x, const __half* weight,
+        __half* xn_out, __nv_fp8_e4m3* fp8_out, float* d_scale,
+        int seq_len, int dim, float eps, cudaStream_t stream = 0);

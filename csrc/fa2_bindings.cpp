@@ -184,9 +184,24 @@ PYBIND11_MODULE(flash_rt_fa2, m) {
 
     // Causal sibling. Same signature as fwd_bf16 but applies a causal
     // mask inside FA2 (template Is_causal=true). Currently only
-    // head_dim=128 is built; calls with other head_dim abort with a
-    // clear message. Used by Qwen3-8B prefill (S=N causal self-attn).
+    // head_dim=128 is built; calls with other head_dim raise a
+    // RuntimeError with a clear message. Used by Qwen3-8B prefill
+    // (S=N causal self-attn).
     m.def("fwd_bf16_causal", make_fwd(&fvk_attention_fa2_fwd_bf16_causal),
+        py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),
+        py::arg("softmax_lse_accum") = 0, py::arg("o_accum") = 0,
+        py::arg("batch"), py::arg("seqlen_q"), py::arg("seqlen_k"),
+        py::arg("num_heads_q"), py::arg("num_heads_kv"), py::arg("head_dim"),
+        py::arg("q_strides"), py::arg("k_strides"),
+        py::arg("v_strides"), py::arg("o_strides"),
+        py::arg("softmax_scale") = 1.0f,
+        py::arg("num_sms") = 0,
+        py::arg("stream") = 0,
+        kDocstring);
+
+    // FP16 causal sibling — head_dim=128 only. Used by Chameleon-7B
+    // causal self-attention (32 layers MHA 32x128) on Orin SM87.
+    m.def("fwd_fp16_causal", make_fwd(&fvk_attention_fa2_fwd_fp16_causal),
         py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),
         py::arg("softmax_lse_accum") = 0, py::arg("o_accum") = 0,
         py::arg("batch"), py::arg("seqlen_q"), py::arg("seqlen_k"),

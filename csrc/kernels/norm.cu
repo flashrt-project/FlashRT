@@ -1379,3 +1379,248 @@ void avg_pool_vision_tokens(
         x, out, nv, H, W, dim, pool_factor);
 
 }
+
+// RMSNorm that also block-reduces the abs-max of its own fp16 output into
+// a caller-zeroed device scale accumulator (atomicMax across blocks). Lets
+// a dynamic per-tensor FP8 quantize of the normalized output skip the
+// separate absmax_kernel full read pass (fused into this kernel's existing
+// write pass instead). `max_val` must be memset to 0 by the caller first.
+template<typename T>
+__global__ void rms_norm_amax_kernel(const T* __restrict__ x,
+                                      const T* __restrict__ weight,
+                                      T* __restrict__ out,
+                                      float* __restrict__ max_val,
+                                      int dim, float eps) {
+    using T2 = typename packed2<T>::type;
+    int row = blockIdx.x;
+    const T2* x2 = reinterpret_cast<const T2*>(x + row * dim);
+    T2* out2 = reinterpret_cast<T2*>(out + row * dim);
+    const T2* w2 = reinterpret_cast<const T2*>(weight);
+    int dim2 = dim >> 1;
+
+    extern __shared__ float shared[];
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+        T2 val = x2[i];
+        float v0 = to_f32(val.x), v1 = to_f32(val.y);
+        local_sum += v0 * v0 + v1 * v1;
+    }
+    float rms = rsqrtf(block_reduce_sum(local_sum, shared) / dim + eps);
+
+    float local_max = 0.0f;
+    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+        T2 xv = x2[i], wv = w2[i];
+        float v0 = to_f32(xv.x) * rms * to_f32(wv.x);
+        float v1 = to_f32(xv.y) * rms * to_f32(wv.y);
+        out2[i] = make_packed2<T>(from_f32<T>(v0), from_f32<T>(v1));
+        // amax over the fp16-rounded stored values, matching absmax_kernel
+        // reading the fp16 buffer afterwards (quantize consumes those).
+        float q0 = to_f32(from_f32<T>(v0));
+        float q1 = to_f32(from_f32<T>(v1));
+        local_max = fmaxf(local_max, fmaxf(fabsf(q0), fabsf(q1)));
+    }
+    float block_max = block_reduce_max(local_max, shared);
+    if (threadIdx.x == 0) atomicMax((int*)max_val, __float_as_int(block_max));
+}
+
+template __global__ void rms_norm_amax_kernel<__half>(const __half*, const __half*, __half*, float*, int, float);
+
+void rms_norm_amax_fp16(const __half* x, const __half* weight,
+                         __half* out, float* d_amax,
+                         int seq_len, int dim, float eps,
+                         cudaStream_t stream) {
+    rms_norm_amax_kernel<__half><<<seq_len, 256, 256 * sizeof(float), stream>>>(
+        x, weight, out, d_amax, dim, eps);
+}
+
+// Residual add + RMSNorm with amax fused into the xn write pass.
+// residual[row,:] += x[row,:] (fp16-rounded, same as residual_add_fp16);
+// ssq is computed over the ROUNDED fp16 residual values (same as rms_norm
+// reading the fp16 residual buffer afterwards); the normalized xn output
+// is computed from register-cached residuals (no global re-read); the
+// abs-max of xn is block-reduced and atomically folded into max_val
+// (caller must memset max_val to 0 first). One kernel replaces
+// residual_add_fp16 + rms_norm_fp16 + absmax over xn.
+template<typename T>
+__global__ void residual_add_rms_norm_amax_kernel(
+    T* __restrict__ residual, const T* __restrict__ x,
+    const T* __restrict__ weight, T* __restrict__ xn_out,
+    float* __restrict__ max_val, int dim, float eps) {
+    using T2 = typename packed2<T>::type;
+    constexpr int MAX_CHUNKS = 16;  // dim2/blockDim; D=4096 -> 8 at 256 threads
+    int row = blockIdx.x;
+    T2* res2 = reinterpret_cast<T2*>(residual + row * dim);
+    const T2* x2 = reinterpret_cast<const T2*>(x + row * dim);
+    const T2* w2 = reinterpret_cast<const T2*>(weight);
+    T2* out2 = reinterpret_cast<T2*>(xn_out + row * dim);
+    int dim2 = dim >> 1;
+    int chunks = (dim2 + blockDim.x - 1) / blockDim.x;
+    T2 regs[MAX_CHUNKS];
+
+    extern __shared__ float shared[];
+    float local_sum = 0.0f;
+    for (int c = 0; c < chunks && c < MAX_CHUNKS; c++) {
+        int i = c * blockDim.x + threadIdx.x;
+        if (i < dim2) {
+            T2 rv = res2[i], xv = x2[i];
+            float r0 = to_f32(rv.x) + to_f32(xv.x);
+            float r1 = to_f32(rv.y) + to_f32(xv.y);
+            T2 rn = make_packed2<T>(from_f32<T>(r0), from_f32<T>(r1));
+            res2[i] = rn;
+            regs[c] = rn;
+            float q0 = to_f32(rn.x), q1 = to_f32(rn.y);
+            local_sum += q0 * q0 + q1 * q1;
+        }
+    }
+    float rms = rsqrtf(block_reduce_sum(local_sum, shared) / dim + eps);
+
+    float local_max = 0.0f;
+    for (int c = 0; c < chunks && c < MAX_CHUNKS; c++) {
+        int i = c * blockDim.x + threadIdx.x;
+        if (i < dim2) {
+            T2 rv = regs[c], wv = w2[i];
+            float v0 = to_f32(rv.x) * rms * to_f32(wv.x);
+            float v1 = to_f32(rv.y) * rms * to_f32(wv.y);
+            out2[i] = make_packed2<T>(from_f32<T>(v0), from_f32<T>(v1));
+            // amax over the fp16-rounded stored values, matching
+            // absmax_kernel reading the fp16 buffer afterwards.
+            float q0 = to_f32(from_f32<T>(v0));
+            float q1 = to_f32(from_f32<T>(v1));
+            local_max = fmaxf(local_max, fmaxf(fabsf(q0), fabsf(q1)));
+        }
+    }
+    float block_max = block_reduce_max(local_max, shared);
+    if (threadIdx.x == 0) atomicMax((int*)max_val, __float_as_int(block_max));
+}
+
+template __global__ void residual_add_rms_norm_amax_kernel<__half>(__half*, const __half*, const __half*, __half*, float*, int, float);
+
+void residual_add_rms_norm_amax_fp16(__half* residual, const __half* x,
+                                      const __half* weight, __half* xn_out,
+                                      float* d_amax, int seq_len, int dim,
+                                      float eps, cudaStream_t stream) {
+    residual_add_rms_norm_amax_kernel<__half><<<seq_len, 256, 256 * sizeof(float), stream>>>(
+        residual, x, weight, xn_out, d_amax, dim, eps);
+}
+
+// FP16 host wrapper — re-uses the existing __half template instantiation.
+void residual_add_rms_norm_fp16(__half* residual, const __half* x,
+                                 const __half* weight, __half* out,
+                                 int seq_len, int dim, float eps,
+                                 cudaStream_t stream) {
+    residual_add_rms_norm_kernel<__half><<<seq_len, 256, 256 * sizeof(float), stream>>>(
+        residual, x, weight, out, dim, eps);
+}
+
+#ifdef FLASHRT_ENABLE_CHAMELEON
+// ── FP16 variants of the INT8-rowwise fused norms ──
+// Same math as the bf16 kernels above, reading/writing FP16 residual
+// streams (FP16-backbone models on Orin SM87).
+__global__ void rms_norm_int8_rowwise_fp16_kernel(
+        const __half* __restrict__ x,
+        const __half* __restrict__ weight,
+        int8_t*  __restrict__ out,
+        float*   __restrict__ scales,
+        int rows, int cols, float eps) {
+    extern __shared__ float smem[];
+    float* partial = smem + cols;
+
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    const __half* xr = x + (int64_t)row * cols;
+    int8_t* outr = out + (int64_t)row * cols;
+
+    // Pass 1: load x → smem, accumulate sum of squares
+    float sum_sq = 0.f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float xi = to_f32(xr[i]);
+        smem[i] = xi;
+        sum_sq += xi * xi;
+    }
+    float rms = rsqrtf(block_reduce_sum(sum_sq, partial) / cols + eps);
+
+    // Pass 2: normalize (reuse smem), accumulate max_abs
+    float max_abs = 0.f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float v = smem[i] * rms * to_f32(weight[i]);
+        smem[i] = v;
+        max_abs = fmaxf(max_abs, fabsf(v));
+    }
+    float scale = fmaxf(block_reduce_max(max_abs, partial) / 127.f, 1e-12f);
+    if (threadIdx.x == 0) scales[row] = scale;
+    float inv_s = 1.f / scale;
+
+    // Pass 3: write INT8
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float v = smem[i] * inv_s;
+        outr[i] = (int8_t)__float2int_rn(fmaxf(-127.f, fminf(127.f, v)));
+    }
+}
+
+void rms_norm_int8_rowwise_fp16(const __half* x,
+                                 const __half* weight,
+                                 int8_t* out, float* scales,
+                                 int seq_len, int dim, float eps,
+                                 cudaStream_t stream) {
+    int smem = (dim + 32) * sizeof(float);
+    rms_norm_int8_rowwise_fp16_kernel<<<seq_len, 256, smem, stream>>>(
+        x, weight, out, scales, seq_len, dim, eps);
+}
+
+__global__ void residual_add_rms_norm_int8_rowwise_fp16_kernel(
+        __half* __restrict__ residual,
+        const __half* __restrict__ x,
+        const __half* __restrict__ weight,
+        int8_t* __restrict__ out,
+        float*  __restrict__ scales,
+        int rows, int cols, float eps) {
+    extern __shared__ float smem[];
+    float* partial = smem + cols;
+
+    int row = blockIdx.x;
+    if (row >= rows) return;
+
+    __half* res_row = residual + (int64_t)row * cols;
+    const __half* x_row = x + (int64_t)row * cols;
+    int8_t* out_row = out + (int64_t)row * cols;
+
+    // Pass 1: residual += x, load into smem, accumulate sum_sq
+    float sum_sq = 0.f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float ri = to_f32(res_row[i]) + to_f32(x_row[i]);
+        res_row[i] = from_f32<__half>(ri);
+        smem[i] = ri;
+        sum_sq += ri * ri;
+    }
+    float rms = rsqrtf(block_reduce_sum(sum_sq, partial) / cols + eps);
+
+    // Pass 2: normalize, accumulate max_abs
+    float max_abs = 0.f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float v = smem[i] * rms * to_f32(weight[i]);
+        smem[i] = v;
+        max_abs = fmaxf(max_abs, fabsf(v));
+    }
+    float scale = fmaxf(block_reduce_max(max_abs, partial) / 127.f, 1e-12f);
+    if (threadIdx.x == 0) scales[row] = scale;
+    float inv_s = 1.f / scale;
+
+    // Pass 3: write INT8
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float v = smem[i] * inv_s;
+        out_row[i] = (int8_t)__float2int_rn(fmaxf(-127.f, fminf(127.f, v)));
+    }
+}
+
+void residual_add_rms_norm_int8_rowwise_fp16(
+        __half* residual, const __half* x,
+        const __half* weight,
+        int8_t* out, float* scales,
+        int seq_len, int dim, float eps,
+        cudaStream_t stream) {
+    int smem = (dim + 32) * sizeof(float);
+    residual_add_rms_norm_int8_rowwise_fp16_kernel<<<seq_len, 256, smem, stream>>>(
+        residual, x, weight, out, scales, seq_len, dim, eps);
+}
+#endif  // FLASHRT_ENABLE_CHAMELEON
