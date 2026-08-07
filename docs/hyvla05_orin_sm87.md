@@ -38,9 +38,9 @@ Orin.
 | `flash_rt/frontends/torch/hyvla_orin.py` | Orin frontend; inherits Thor tokenizer/preprocess/prefix/graph orchestration; disables Thor-only FP8/FP4 fused options; materializes INT8 per-row weights. |
 | `flash_rt/models/hyvla/pipeline_orin.py` | Orin pipeline subclass; inherits BF16 math and overrides the lower-precision GEMM slot with INT8 W8A8 rowwise CUTLASS; fused ViT forward (pending-add+LN, efficient SDPA). |
 | `csrc/kernels/hyvla_vit_fuse.cu` | Fused ViT residual-add + LayerNorm kernel (SM87 + SM110 builds). |
-| `tests/test_orin_hyvla05_e2e_check.py` | HF/transformers eager vs Orin native action cosine with fixed noise. |
-| `tests/test_orin_hyvla05_graphsafe.py` | Graph-vs-eager and replay-stability gate. |
-| `tests/test_orin_hyvla05_stageprof.py` | Stage timing split for ViT, prefix assembly, and prefill+denoise graph replay. |
+| `tests/test_orin_hyvla05_e2e_check.py` | BF16 baseline vs default-INT8 fixed-noise action cosine gate (>= 0.999) plus state/noise/prompt input boundaries. |
+| `tests/test_orin_hyvla05_graphsafe.py` | Graph-vs-eager, replay-stability, and fused-vs-unfused (attention-prep, ViT add+LN) gates. |
+| `tests/test_orin_hyvla05_arch_gate.py` | SM87 fail-fast hardware gate and FP4 rejection (mocked CUDA, no device needed). |
 
 ## Precision policy
 
@@ -237,6 +237,7 @@ when needed.
 ```bash
 cmake -B build_orin_sm87 -S . \
   -DGPU_ARCH=87 \
+  -DFLASHRT_ENABLE_HYVLA=ON \
   -DFA2_ARCH_NATIVE_ONLY=ON \
   -DFA2_HDIMS='128;256' \
   -DFA2_DTYPES='bf16'
@@ -248,20 +249,22 @@ rowwise INT8 CUTLASS kernels into `flash_rt_kernels`.
 
 ## Verification
 
-BF16 baseline:
+Checkpoint-gated precision and graph-safety gates (skipped automatically when
+`FLASHRT_HYVLA_CHECKPOINT` is unset):
 
 ```bash
-PYTHONPATH=. python tests/test_orin_hyvla05_e2e_check.py --bf16
-PYTHONPATH=. python tests/test_orin_hyvla05_graphsafe.py --bf16
-PYTHONPATH=. python tests/test_orin_hyvla05_stageprof.py --bf16
+FLASHRT_HYVLA_CHECKPOINT=/path/to/Hy-Embodied-0.5-VLA-RoboTwin \
+  PYTHONPATH=. python -m pytest \
+  tests/test_orin_hyvla05_e2e_check.py \
+  tests/test_orin_hyvla05_graphsafe.py -v
 ```
 
-INT8 path:
+Hardware fail-fast and dispatch gates run without a device or checkpoint:
 
 ```bash
-PYTHONPATH=. python tests/test_orin_hyvla05_e2e_check.py --int8
-PYTHONPATH=. python tests/test_orin_hyvla05_graphsafe.py --int8
-PYTHONPATH=. python tests/test_orin_hyvla05_stageprof.py --int8
+PYTHONPATH=. python -m pytest \
+  tests/test_orin_hyvla05_arch_gate.py \
+  tests/test_orin_hyvla05_dispatch.py -v
 ```
 
 ## Current caveats

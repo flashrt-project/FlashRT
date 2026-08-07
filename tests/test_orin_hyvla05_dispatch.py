@@ -1,5 +1,10 @@
 """Dispatch smoke for HyVLA on Jetson Orin SM87."""
 
+import pytest
+
+pytest.importorskip("numpy")
+pytest.importorskip("torch")
+
 
 def test_hyvla_orin_dispatch_resolves():
     from flash_rt.hardware import resolve_pipeline_class

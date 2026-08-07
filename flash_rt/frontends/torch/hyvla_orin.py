@@ -37,16 +37,19 @@ def _quantize_per_row_int8(w_bf16: torch.Tensor) -> tuple[torch.Tensor, torch.Te
 
 
 class HyVLATorchFrontendOrin(HyVLATorchFrontendThor):
+    _REQUIRED_CAPABILITY = (8, 7)
+    _ARCH_NAME = "Jetson Orin SM87"
+
     def __init__(self, checkpoint_dir: str, *, hardware: str = "rtx_sm87",
                  use_fp8: bool = True, use_fp8_vit: bool = False,
                  use_fused: bool = True, use_fp4: bool = False,
                  use_fused_quant: bool = False, use_autotune: bool = False,
                  use_ffn_mega: bool = False, use_int8: bool | None = None,
-                 use_int8_vlm: bool = False,  # experimental: not validated at cosine >= 0.999
-                 use_int8_vlm_ffn: bool | None = None,  # experimental: not validated at cosine >= 0.999
-                 use_int8_exp: bool = True,  # experimental: not validated at cosine >= 0.999
-                 use_int8_vit: bool | None = None,  # experimental: not validated at cosine >= 0.999
-                 vit_int8_parts: tuple = ("qkv", "proj", "fc1", "fc2"),  # experimental: not validated at cosine >= 0.999
+                 use_int8_vlm: bool = False,  # opt-in: fails the 0.999 E2E cosine gate
+                 use_int8_vlm_ffn: bool | None = None,  # validated default tier (cosine >= 0.999)
+                 use_int8_exp: bool = True,  # validated default tier (cosine >= 0.999)
+                 use_int8_vit: bool | None = None,  # opt-in: fails the 0.999 E2E cosine gate
+                 vit_int8_parts: tuple = ("qkv", "proj", "fc1", "fc2"),  # only used by opt-in use_int8_vit
                  **kwargs):
         if use_fp4:
             raise RuntimeError(
@@ -210,7 +213,8 @@ class HyVLATorchFrontendOrin(HyVLATorchFrontendThor):
         rebuilt each call."""
         if prompt is not None and prompt != self._prompt:
             self.set_prompt(prompt)
-        assert self._lang_tokens is not None, "call set_prompt() first"
+        if self._lang_tokens is None:
+            raise RuntimeError("call set_prompt() before predict_actions()")
         dev = self.device
 
         if not torch.is_tensor(images):
@@ -223,6 +227,10 @@ class HyVLATorchFrontendOrin(HyVLATorchFrontendThor):
             state_t = torch.zeros(1, self.max_state_dim, device=dev, dtype=_BF16)
         else:
             st = torch.as_tensor(np.asarray(state), device=dev, dtype=_BF16).reshape(1, -1)
+            if st.shape[1] > self.max_state_dim:
+                raise ValueError(
+                    f"state has {st.shape[1]} dims, max_state_dim is "
+                    f"{self.max_state_dim}")
             if st.shape[1] < self.max_state_dim:
                 st = F.pad(st, (0, self.max_state_dim - st.shape[1]))
             state_t = st
@@ -267,6 +275,13 @@ class HyVLATorchFrontendOrin(HyVLATorchFrontendThor):
                                   dtype=torch.float32, device=dev)
         else:
             noise_t = torch.as_tensor(np.asarray(noise), device=dev, dtype=torch.float32)
+            want = self.chunk * self.max_action_dim
+            if noise_t.numel() != want:
+                raise ValueError(
+                    f"noise must have {want} elements "
+                    f"(chunk={self.chunk} x max_action_dim={self.max_action_dim}), "
+                    f"got {noise_t.numel()}")
+            noise_t = noise_t.reshape(1, self.chunk, self.max_action_dim)
 
         x_t = self._graph_forward(stat["S_p"], stat["n_vis"], prefix_embs,
                                   stat["pmask"], stat["pcos"], stat["psin"],
@@ -276,4 +291,3 @@ class HyVLATorchFrontendOrin(HyVLATorchFrontendThor):
 
 
 __all__ = ["HyVLATorchFrontendOrin"]
-
