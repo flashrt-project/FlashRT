@@ -1,0 +1,27 @@
+binding: smolvla_tick
+structure: vla_tick_pipeline
+
+stages:
+  obs_encode:
+    seam: "model.embed_prefix + model.vlm_with_expert(fill_kv_cache=True)"
+    capture: eager              # SmolVLM vision embeddings use boolean-mask
+                                # scatter (position_ids[mask]=...) which is
+                                # illegal on a capturing stream — same class
+                                # as the GR00T SigLIP2 CPU-indexing ruling
+    outputs:
+      cond_features: "past_key_values"   # prefix KV, copied into static
+                                         # buffers, read-only in the loop
+  action_denoise:
+    seam: "model.denoise_step"
+    loop_steps: 10                  # config.num_steps
+    noise_window: injectable        # sample_actions(noise=...) native window
+
+cadences:
+  observation: obs_encode
+  tick: [obs_encode, action_denoise]   # eager prefill + denoise graph replay
+  replan: action_denoise               # denoise-only replay, static prefix KV
+
+hosts:
+  lerobot:
+    module_path: "policy.model"
+    versions: "smolvla_base"

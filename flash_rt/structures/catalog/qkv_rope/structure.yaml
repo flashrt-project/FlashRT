@@ -1,0 +1,55 @@
+structure: qkv_rope
+version: 1
+description: >
+  Add a packed QKV bias, split equal-head or GQA Q/K/V, and apply an
+  already-expanded rotate-half RoPE table to Q and K. This boundary is for
+  attention families without Q/K normalization; qk_norm_rope owns the
+  normalized form, while attention and KV-cache mutation remain separate.
+
+reference:
+  module: qkv_rope.reference
+  entrypoint: qkv_rope_ref
+
+boundary:
+  symbolic_dims: [B, T, Hq, Hkv, D]
+  inputs:
+    - {name: packed_qkv, dims: [B, T, "(Hq+2*Hkv)*D"], dtype: bf16}
+    - {name: cos, dims: [B, T, "D/2|D"], dtype: fp32}
+    - {name: sin, dims: [B, T, "D/2|D"], dtype: fp32}
+  outputs:
+    - {name: q_after_rope, dims: [B, T, Hq, D], dtype: bf16}
+    - {name: k_after_rope, dims: [B, T, Hkv, D], dtype: bf16}
+    - {name: v, dims: [B, T, Hkv, D], dtype: bf16}
+
+weights:
+  - {slot: qkv_bias, dims: ["(Hq+2*Hkv)*D"]}
+
+variants:
+  rope_layout: [half]
+  head_layout: [equal, gqa]
+
+calibration:
+  points: []
+  optional_when: always
+
+gates:
+  parity:
+    metrics: [cosine, max_abs, p99_abs]
+    data: real_distribution
+  latency:
+    baselines: [torch_compile, unfused_chain]
+    rule: net_positive_including_boundary
+    per_shape: true
+  qualification:
+    head_dim_even: true
+    position_table_preexpanded: true
+
+qualification:
+  - "packed_qkv and qkv_bias use fixed Q, K, V order"
+  - "head_dim is positive, even, and no larger than 256"
+  - "cos and sin are FP32 half-width or full-width rotate-half tables"
+  - "Q/K normalization, position generation, attention and cache mutation are excluded"
+
+evidence:
+  - "Qwen3-VL vision uses equal-head packed QKV with bias and 2-D rotate-half RoPE"
+  - "the same boundary appears in packed-QKV vision and text attention families"

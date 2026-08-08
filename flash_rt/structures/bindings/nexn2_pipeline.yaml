@@ -1,0 +1,112 @@
+binding: nexn2_pipeline
+structure: autoregressive_decode_pipeline
+
+stages:
+  input_prepare:
+    seam: "Nexn2TorchFrontendRtx.set_prompt"
+    capture: eager
+  prefill:
+    seam: "nexn2_forward_nvfp4 or seed_prefill_batched"
+    capture: eager_or_chunked
+  decode:
+    seam: "decode_step or generate_greedy_graph"
+    capture: position_bucketed_cuda_graph
+  token_select:
+    seam: "generate_greedy or generate_greedy_graph"
+    policy: greedy
+
+coverage:
+  contract: complete_hot_path
+  hot_path:
+    - request_tokenize
+    - prefill_route
+    - prefill_embedding
+    - prefill_gdn
+    - prefill_full_attention
+    - prefill_moe
+    - prefill_state_write
+    - prefill_readout
+    - decode_loop
+    - decode_embedding
+    - decode_gdn
+    - decode_full_attention
+    - decode_moe
+    - decode_state_update
+    - decode_readout
+    - token_selection
+  segments:
+    - name: request_tokenize
+      stage: input_prepare
+      classification: host_stage
+      seam: "Nexn2TorchFrontendRtx.set_prompt"
+    - name: prefill_route
+      stage: prefill
+      classification: control
+      seam: "single-pass, batched, or chunked prefill selection"
+    - name: prefill_embedding
+      stage: prefill
+      classification: host_stage
+      seam: "token embedding lookup"
+    - name: prefill_gdn
+      stage: prefill
+      classification: host_stage
+      seam: "_gdn_layer and _gdn_wy_chunk"
+    - name: prefill_full_attention
+      stage: prefill
+      classification: structure
+      seam: "_full_attn_layer"
+      structures: [qkv_pack, qk_norm_rope, attention_core, linear_proj]
+    - name: prefill_moe
+      stage: prefill
+      classification: host_stage
+      seam: "_moe_layer top-8 routed experts plus shared expert"
+    - name: prefill_state_write
+      stage: prefill
+      classification: state_region
+      seam: "Nexn2DecodeState GDN recurrent/conv state and full-attention KV"
+    - name: prefill_readout
+      stage: prefill
+      classification: structure
+      seam: "final RMSNorm and NVFP4 lm_head"
+      structures: [linear_proj]
+    - name: decode_loop
+      stage: decode
+      classification: control
+      seam: "generate_greedy or generate_greedy_graph"
+    - name: decode_embedding
+      stage: decode
+      classification: host_stage
+      seam: "single-token embedding lookup"
+    - name: decode_gdn
+      stage: decode
+      classification: structure
+      seam: "_decode_gdn"
+      structures: [gated_delta_core]
+    - name: decode_full_attention
+      stage: decode
+      classification: structure
+      seam: "_decode_full"
+      structures: [qkv_pack, qk_norm_rope, attention_core, linear_proj]
+    - name: decode_moe
+      stage: decode
+      classification: host_stage
+      seam: "_moe_layer_decode"
+    - name: decode_state_update
+      stage: decode
+      classification: state_region
+      seam: "GDN state and position-indexed KV update"
+    - name: decode_readout
+      stage: decode
+      classification: structure
+      seam: "final RMSNorm and NVFP4 lm_head"
+      structures: [linear_proj]
+    - name: token_selection
+      stage: token_select
+      classification: control
+      seam: "device or host argmax and max-token stop"
+
+hosts:
+  native:
+    module_path: "flash_rt.models.nexn2.pipeline_rtx.Nexn2Pipeline"
+  torch:
+    module_path: "flash_rt.frontends.torch.nexn2_rtx.Nexn2TorchFrontendRtx"

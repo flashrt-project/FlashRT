@@ -1,0 +1,23 @@
+binding: pi05_vision
+structure: vision_ffn
+dims: {D: 1152, F: 4304, layers: 27}
+variant: {activation: gelu}
+boundary_dtype: float32   # lerobot selective-bf16 recipe keeps vision fp32
+
+m_profile:
+  vision: {m_class: medium, phase: vision}   # M = views x 256 tokens
+
+weights_map:
+  transformers:
+    layout: out_in_native   # fc weights consumed in checkpoint layout
+    w_fc1: "paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.{i}.mlp.fc1.weight"
+    b_fc1: "paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.{i}.mlp.fc1.bias"
+    w_fc2: "paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.{i}.mlp.fc2.weight"
+    b_fc2: "paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.{i}.mlp.fc2.bias"
+    w_norm: "paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.{i}.layer_norm2.weight"
+    b_norm: "paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.{i}.layer_norm2.bias"
+
+hosts:
+  lerobot:
+    module_path: "model.paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.{i}"
+    versions: ">=0.5,<0.6"

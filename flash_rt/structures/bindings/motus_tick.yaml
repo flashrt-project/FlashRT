@@ -1,0 +1,120 @@
+binding: motus_tick
+structure: vla_tick_pipeline
+
+stages:
+  obs_encode:
+    seam: "MotusPipelineRtx.encode_first_frame + prompt condition producers"
+    capture: precomputed_or_eager
+    outputs:
+      cond_features: "condition latent + T5 context + understanding tokens"
+  action_denoise:
+    seam: "MotusPipelineRtx.run fixed-step joint denoise loop"
+    loop_steps: "@pipeline.dims.num_inference_steps"
+    noise_window: "video_latent + action_latent"
+    capture: host_dependent
+  readout:
+    seam: "MotusPipelineRtx.decode_video + cast_bf16_to_float"
+    capture: eager
+
+cadences:
+  request: obs_encode
+  tick: [action_denoise, readout]
+
+coverage:
+  contract: complete_hot_path
+  hot_path:
+    - first_frame_encode
+    - t5_context
+    - understanding_tokens
+    - condition_cache
+    - latent_initialization
+    - denoise_control
+    - token_prepare
+    - time_modulation
+    - joint_attention
+    - cross_attention
+    - branch_ffns
+    - output_heads
+    - euler_update
+    - condition_reinject
+    - video_decode
+    - action_readout
+  segments:
+    - name: first_frame_encode
+      stage: obs_encode
+      classification: host_stage
+      seam: "MotusPipelineRtx.encode_first_frame Wan VAE encoder"
+    - name: t5_context
+      stage: obs_encode
+      classification: structure
+      seam: "MotusPipelineRtx.preprocess_t5_context"
+      structures: [linear_proj]
+    - name: understanding_tokens
+      stage: obs_encode
+      classification: host_stage
+      seam: "MotusPipelineRtx.extract_und_tokens Qwen3-VL producer"
+    - name: condition_cache
+      stage: obs_encode
+      classification: state_region
+      seam: "cached T5, understanding, timestep, and modulation buffers"
+      structures: [cadence_static]
+    - name: latent_initialization
+      stage: action_denoise
+      classification: state_region
+      seam: "init_video_latent + init_action_latent"
+    - name: denoise_control
+      stage: action_denoise
+      classification: control
+      seam: "fixed num_inference_steps and per-layer branch schedule"
+    - name: token_prepare
+      stage: action_denoise
+      classification: structure
+      seam: "prepare_video_tokens + prepare_action_tokens"
+      structures: [linear_proj]
+    - name: time_modulation
+      stage: action_denoise
+      classification: structure
+      seam: "per-step video/action AdaLN modulation tables"
+      structures: [adaln_producer]
+    - name: joint_attention
+      stage: action_denoise
+      classification: structure
+      seam: "MotusPipelineRtx.denoise_layer_joint_attention"
+      structures: [qkv_pack, attention_core, linear_proj]
+    - name: cross_attention
+      stage: action_denoise
+      classification: structure
+      seam: "MotusPipelineRtx.denoise_layer_cross_attn_to_t5"
+      structures: [qkv_pack, attention_core, linear_proj]
+    - name: branch_ffns
+      stage: action_denoise
+      classification: structure
+      seam: "video, action, and understanding FFN branches"
+      structures: [decoder_ffn, vision_ffn, linear_proj]
+    - name: output_heads
+      stage: action_denoise
+      classification: structure
+      seam: "video_output_head + action_output_head"
+      structures: [adaln_producer, linear_proj]
+    - name: euler_update
+      stage: action_denoise
+      classification: state_region
+      seam: "video/action latent Euler updates"
+    - name: condition_reinject
+      stage: action_denoise
+      classification: state_region
+      seam: "teacher_force_first_frame"
+    - name: video_decode
+      stage: readout
+      classification: host_stage
+      seam: "MotusPipelineRtx.decode_video Wan VAE decoder"
+    - name: action_readout
+      stage: readout
+      classification: host_stage
+      seam: "MotusPipelineRtx.cast_bf16_to_float"
+
+hosts:
+  native:
+    module_path: "flash_rt.models.motus.pipeline_rtx.MotusPipelineRtx"
+  torch:
+    module_path: "flash_rt.frontends.torch.motus_rtx.MotusTorchFrontendRtx"

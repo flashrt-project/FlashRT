@@ -1,0 +1,22 @@
+impl: fp8_static
+structure: decoder_ffn
+version: 1
+recipe: fp8_static
+backends: [cuda, rocm]
+form: hub
+module: fp8_static
+entrypoint: bind
+
+kernels:
+  - {provider: hf, repo: flashrt/flashrt-fp8-swiglu-ffn, version: ">=1"}
+
+envelope:
+  support:
+    D: {min: 512, max: 16384}
+    F: {min: 1024, max: 16384}
+    align: {}
+    m_classes: [micro, small, medium]
+  notes: >
+    Support bounds mirror the checks enforced in bind(); a kernel-side
+    can_implement probe should replace them once exposed. Activation
+    scales are static per-tensor and require calibration inputs at bind.

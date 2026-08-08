@@ -1520,10 +1520,21 @@ else()
   message(STATUS "NVFP4 swizzle/quantize kernels: SKIPPED (slim build)")
 endif()
 
+# ── Shared SM120 dense GEMM ──
+# Qwen3-VL and qwen3_5_moe both consume this core symbol. Keep its ownership
+# independent of the larger, opt-in MoE source group below.
+if((FLASHRT_BUILD_QWEN3_VL OR FLASHRT_ENABLE_QWEN35MOE) AND ENABLE_NVFP4)
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/w16a16_gemm_sm120.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    FLASHRT_HAVE_W16A16_SM120=1)
+  message(STATUS "SM120 W16A16 dense GEMM: ENABLED")
+endif()
+
 # ── qwen3_5_moe family (Nex-N2 / Qwen3.6-35B-A3B) SM120 kernels ──
 # Gated: only compiled when explicitly enabled AND on a Blackwell (NVFP4)
 # build. The bindings are #ifdef FLASHRT_HAVE_QWEN35MOE in bindings.cpp, so
-# the symbols are absent (and the .cu never compiled) on every other target.
+# these MoE symbols are absent on every other target.
 if(FLASHRT_ENABLE_QWEN35MOE AND ENABLE_NVFP4)
   target_sources(flash_rt_kernels PRIVATE
     csrc/kernels/qwen35moe_layout.cu
@@ -1538,8 +1549,7 @@ if(FLASHRT_ENABLE_QWEN35MOE AND ENABLE_NVFP4)
     csrc/kernels/moe_m64_mma_sm120.cu
     csrc/kernels/moe_blocktile_mma_sm120.cu
     csrc/kernels/moe_weighted_sum_sm120.cu
-    csrc/kernels/w4a16_gemm_sm120.cu
-    csrc/kernels/w16a16_gemm_sm120.cu)
+    csrc/kernels/w4a16_gemm_sm120.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_QWEN35MOE=1)
   message(STATUS "qwen3_5_moe (Nex-N2 / Qwen3.6-35B-A3B) SM120 kernels: ENABLED")
 elseif(FLASHRT_ENABLE_QWEN35MOE)

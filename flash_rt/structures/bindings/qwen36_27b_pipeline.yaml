@@ -1,0 +1,130 @@
+binding: qwen36_27b_pipeline
+structure: autoregressive_decode_pipeline
+
+stages:
+  input_prepare:
+    seam: "Qwen36TorchFrontendRtx.set_prompt"
+    capture: eager
+  prefill:
+    seam: "native NVFP4 prompt prefill or long-context chunked prefill"
+    capture: eager_or_position_bucketed_cuda_graph
+  decode:
+    seam: "single-token, MTP, or DFlash verify decode"
+    capture: position_and_verify_bucketed_cuda_graph
+  token_select:
+    seam: "greedy or speculative acceptance control"
+    policy: greedy_or_verified_draft
+
+coverage:
+  contract: complete_hot_path
+  hot_path:
+    - request_tokenize
+    - prefill_route
+    - prefill_embedding
+    - prefill_gdn
+    - prefill_full_attention
+    - prefill_ffn
+    - prefill_state_write
+    - prefill_readout
+    - decode_loop
+    - decode_embedding
+    - decode_gdn
+    - decode_full_attention
+    - decode_ffn
+    - decode_state_update
+    - mtp_drafter
+    - speculative_verify
+    - decode_readout
+    - token_selection
+  segments:
+    - name: request_tokenize
+      stage: input_prepare
+      classification: host_stage
+      seam: "Qwen36TorchFrontendRtx.set_prompt"
+    - name: prefill_route
+      stage: prefill
+      classification: control
+      seam: "short, chunked, FP8-KV, or TurboQuant prefill selection"
+    - name: prefill_embedding
+      stage: prefill
+      classification: host_stage
+      seam: "token embedding lookup"
+    - name: prefill_gdn
+      stage: prefill
+      classification: host_stage
+      seam: "three-of-four Gated DeltaNet layers and carried recurrent state"
+    - name: prefill_full_attention
+      stage: prefill
+      classification: structure
+      seam: "_layer_forward_full_K_nvfp4"
+      structures: [qkv_pack, qk_norm_rope, attention_core, linear_proj]
+    - name: prefill_ffn
+      stage: prefill
+      classification: structure
+      seam: "dense SwiGLU projections in all 64 layers"
+      structures: [decoder_ffn, linear_proj]
+    - name: prefill_state_write
+      stage: prefill
+      classification: state_region
+      seam: "GDN recurrent/conv state plus BF16, FP8, or packed KV state"
+    - name: prefill_readout
+      stage: prefill
+      classification: structure
+      seam: "final RMSNorm and lm_head"
+      structures: [linear_proj]
+    - name: decode_loop
+      stage: decode
+      classification: control
+      seam: "generate_own and speculative decode loops"
+    - name: decode_embedding
+      stage: decode
+      classification: host_stage
+      seam: "single-token embedding lookup"
+    - name: decode_gdn
+      stage: decode
+      classification: structure
+      seam: "_layer_forward_lin_nvfp4 Gated DeltaNet state update"
+      structures: [gated_delta_core]
+    - name: decode_full_attention
+      stage: decode
+      classification: structure
+      seam: "_layer_forward_full_nvfp4"
+      structures: [qkv_pack, qk_norm_rope, attention_core, linear_proj]
+    - name: decode_ffn
+      stage: decode
+      classification: structure
+      seam: "NVFP4 dense SwiGLU decode projections"
+      structures: [decoder_ffn, linear_proj]
+    - name: decode_state_update
+      stage: decode
+      classification: state_region
+      seam: "position-indexed GDN state and KV write with snapshot rollback"
+    - name: mtp_drafter
+      stage: decode
+      classification: structure
+      seam: "forward_mtp_head_nvfp4 or DFlash drafter"
+      structures: [decoder_ffn, qkv_pack, qk_norm_rope, attention_core,
+                   linear_proj]
+    - name: speculative_verify
+      stage: decode
+      classification: control
+      seam: "K-token verify, accept-prefix, and partial rollback"
+    - name: decode_readout
+      stage: decode
+      classification: structure
+      seam: "final RMSNorm and lm_head matvec"
+      structures: [linear_proj]
+    - name: token_selection
+      stage: token_select
+      classification: control
+      seam: "argmax or verified draft acceptance and stop conditions"
+
+hosts:
+  native:
+    module_path: "flash_rt.models.qwen36.pipeline_rtx.Qwen36Pipeline"
+  torch_rtx:
+    module_path: "flash_rt.frontends.torch.qwen36_rtx.Qwen36TorchFrontendRtx"
+  torch_thor:
+    module_path: "flash_rt.frontends.torch.qwen36_thor.Qwen36TorchFrontendThor"
+  torch_spark:
+    module_path: "flash_rt.frontends.torch.qwen36_spark.Qwen36TorchFrontendSpark"

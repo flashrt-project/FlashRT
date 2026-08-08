@@ -1,0 +1,44 @@
+structure: decoder_ffn
+version: 1
+description: >
+  Post-attention feed-forward block of a transformer decoder layer:
+  x -> RMSNorm (optionally AdaLN-modulated) -> gate/up projections ->
+  activation(gate) * up -> down projection -> residual add (optionally
+  gated by an AdaLN gate term).
+
+reference:
+  module: decoder_ffn.reference
+  entrypoint: decoder_ffn_ref
+
+boundary:
+  symbolic_dims: [M, D, F]
+  inputs:
+    - {name: x, dims: [M, D], dtype: "@binding"}
+    - {name: cond_scale, dims: [M, D], dtype: "@binding", optional: true}
+    - {name: cond_shift, dims: [M, D], dtype: "@binding", optional: true}
+    - {name: cond_gate, dims: [M, D], dtype: "@binding", optional: true}
+  outputs:
+    - {name: x, dims: [M, D], dtype: "@binding"}
+
+weights:
+  - {slot: w_norm, dims: [D]}
+  - {slot: w_gate, dims: [D, F]}
+  - {slot: w_up, dims: [D, F]}
+  - {slot: w_down, dims: [F, D]}
+
+variants:
+  activation: [gelu, silu]
+  norm_weight_mode: [offset, direct]
+  conditioning: [none, ada_ln]
+
+calibration:
+  points: [x_after_norm, act_after_mul]
+
+gates:
+  parity:
+    metrics: [cosine, max_abs, p99_abs]
+    data: real_distribution
+  latency:
+    baselines: [torch_compile, unfused_chain, vendor]
+    rule: net_positive_including_boundary
+    per_shape: true

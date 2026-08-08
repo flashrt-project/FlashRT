@@ -1,0 +1,22 @@
+binding: qwen25_15b
+structure: decoder_ffn
+dims: {D: 1536, F: 8960, layers: 28}
+variant: {activation: silu, norm_weight_mode: direct, conditioning: none}
+boundary_dtype: bf16
+
+m_profile:
+  prefill: {m_class: medium, phase: prefill}
+  decode: {m_class: micro, phase: decode}
+
+weights_map:
+  transformers:
+    layout: out_in
+    w_gate: "model.layers.{i}.mlp.gate_proj.weight"
+    w_up: "model.layers.{i}.mlp.up_proj.weight"
+    w_down: "model.layers.{i}.mlp.down_proj.weight"
+    w_norm: "model.layers.{i}.post_attention_layernorm.weight"
+
+hosts:
+  transformers:
+    module_path: "model.layers.{i}"
+    versions: ">=4.50,<6"

@@ -1,0 +1,21 @@
+binding: groot_n16_llm
+structure: decoder_ffn
+dims: {D: 2048, F: 6144, layers: 16}
+variant: {activation: silu, norm_weight_mode: direct, conditioning: none}
+boundary_dtype: bf16
+
+m_profile:
+  prefix: {m_class: medium, phase: prefill}   # M = vision+language prefix
+
+weights_map:
+  isaac_gr00t:
+    layout: out_in
+    w_gate: "backbone.model.language_model.model.layers.{i}.mlp.gate_proj.weight"
+    w_up: "backbone.model.language_model.model.layers.{i}.mlp.up_proj.weight"
+    w_down: "backbone.model.language_model.model.layers.{i}.mlp.down_proj.weight"
+    w_norm: "backbone.model.language_model.model.layers.{i}.post_attention_layernorm.weight"
+
+hosts:
+  isaac_gr00t:
+    module_path: "backbone.model.language_model.model.layers.{i}"
+    versions: "n1.6"

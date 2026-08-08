@@ -1,0 +1,131 @@
+binding: qwen3_vl_8b_pipeline
+structure: autoregressive_decode_pipeline
+
+stages:
+  input_prepare:
+    seam: "Qwen3VlTorchFrontendRtx.set_prompt"
+    capture: eager_geometry_and_staging
+  modality_encode:
+    seam: "Qwen3VlVisionRtx.forward"
+    capture: eager_or_patch_count_cuda_graph
+  prefill:
+    seam: "Qwen3VlTorchFrontendRtx.prefill_graph"
+    capture: geometry_bucketed_cuda_graph
+    eager_seam: "Qwen3VlTorchFrontendRtx.prefill"
+  decode:
+    seam: "Qwen3VlTorchFrontendRtx._decode_step_graph"
+    capture: cache_and_rope_position_bucketed_cuda_graph
+  token_select:
+    seam: "Qwen3VlTorchFrontendRtx.generate"
+    policy: greedy
+
+coverage:
+  contract: complete_hot_path
+  hot_path:
+    - message_preprocess
+    - vision_patch_embed
+    - vision_qkv_rope
+    - vision_transformer
+    - vision_merge
+    - multimodal_scatter
+    - deepstack_injection
+    - prefill_mrope
+    - prefill_transformer
+    - prefill_kv_write
+    - prefill_readout
+    - decode_loop
+    - decode_embedding
+    - decode_mrope
+    - decode_transformer
+    - decode_kv_update
+    - decode_readout
+    - token_selection
+  segments:
+    - name: message_preprocess
+      stage: input_prepare
+      classification: host_stage
+      seam: "processor + multimodal geometry construction"
+    - name: vision_patch_embed
+      stage: modality_encode
+      classification: structure
+      seam: "preflattened full-patch Conv3D lowered to one BF16 projection"
+      structures: [patch_projection]
+    - name: vision_qkv_rope
+      stage: modality_encode
+      classification: structure
+      seam: "packed vision QKV bias/split + pre-expanded 2D rotate-half RoPE"
+      structures: [qkv_rope]
+    - name: vision_transformer
+      stage: modality_encode
+      classification: structure
+      seam: "Qwen3VlVisionRtx.forward block loop"
+      structures: [vision_ffn, qkv_rope, attention_core, linear_proj]
+    - name: vision_merge
+      stage: modality_encode
+      classification: structure
+      seam: "Qwen3VlVisionRtx._merger_forward"
+      structures: [vision_ffn, linear_proj]
+    - name: multimodal_scatter
+      stage: prefill
+      classification: host_stage
+      seam: "image features replace placeholder token embeddings"
+    - name: deepstack_injection
+      stage: prefill
+      classification: host_stage
+      seam: "vision merger features added to early LLM hidden states"
+    - name: prefill_mrope
+      stage: prefill
+      classification: structure
+      seam: "interleaved MRoPE q/k post-processing"
+      structures: [qk_norm_rope]
+    - name: prefill_transformer
+      stage: prefill
+      classification: structure
+      seam: "Qwen3TorchFrontendRtx._layer_forward_full_nvfp4_prefill"
+      structures: [decoder_ffn, qkv_pack, attention_core, linear_proj]
+    - name: prefill_kv_write
+      stage: prefill
+      classification: state_region
+      seam: "language attention K_cache/V_cache prefill"
+    - name: prefill_readout
+      stage: prefill
+      classification: structure
+      seam: "final RMSNorm + lm_head"
+      structures: [linear_proj]
+    - name: decode_loop
+      stage: decode
+      classification: control
+      seam: "Qwen3VlTorchFrontendRtx.generate token loop"
+    - name: decode_embedding
+      stage: decode
+      classification: host_stage
+      seam: "single-token language embedding lookup"
+    - name: decode_mrope
+      stage: decode
+      classification: structure
+      seam: "cache-position and MRoPE-position keyed q/k post-processing"
+      structures: [qk_norm_rope]
+    - name: decode_transformer
+      stage: decode
+      classification: structure
+      seam: "Qwen3TorchFrontendRtx._layer_forward_full_nvfp4"
+      structures: [decoder_ffn, qkv_pack, attention_core, linear_proj]
+    - name: decode_kv_update
+      stage: decode
+      classification: state_region
+      seam: "language attention K_cache/V_cache token update"
+    - name: decode_readout
+      stage: decode
+      classification: structure
+      seam: "final RMSNorm + lm_head BF16 matvec"
+      structures: [linear_proj]
+    - name: token_selection
+      stage: token_select
+      classification: control
+      seam: "argmax + EOS/max-token stop"
+
+hosts:
+  native:
+    module_path: "flash_rt.models.qwen3_vl.pipeline_rtx.Qwen3VlPipeline"
+  torch:
+    module_path: "flash_rt.frontends.torch.qwen3_vl_rtx.Qwen3VlTorchFrontendRtx"

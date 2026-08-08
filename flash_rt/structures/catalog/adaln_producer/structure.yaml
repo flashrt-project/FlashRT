@@ -1,0 +1,106 @@
+structure: adaln_producer
+version: 1
+description: >
+  An adaptive norm driven by a step-quantized conditioning vector:
+  norm, modulation by a conditioning-derived style, and an optional
+  static FP8 quantization of the output, resolved as one region. The
+  conditioning takes one of a small fixed set of values over a tick,
+  so the style projection is memoized at bind time and the step is
+  recovered in-graph by a fingerprint lookup. The FP8 output form is
+  the upstream half of a producer-consumer seam: the shared activation
+  scale lets the consuming projection skip its own input quantization.
+
+reference:
+  module: adaln_producer.reference
+  entrypoint: adaln_producer_ref
+
+boundary:
+  symbolic_dims: [M, D]
+  inputs:
+    - {name: x, dims: [M, D], dtype: "@binding"}
+    - {name: cond, dims: [1, C], dtype: "@binding"}
+  outputs:
+    - {name: y, dims: [M, D], dtype: "@binding"}
+    - {name: gate, dims: [1, D], dtype: "@binding", optional: true}
+
+weights:
+  - {slot: style_w, dims: [C, "3*D"]}
+  - {slot: style_b, dims: ["3*D"], optional: true}
+  - {slot: norm_w, dims: [D], optional: true}
+
+variants:
+  bind: [table_only, fused_norm]   # table_only replaces just the
+                                   # conditioning projection; fused_norm
+                                   # replaces the whole adaptive norm
+  norm: [rms, layer]
+  out_dtype: [bf16, fp8_static]
+  epilogue: [none, gate_residual]
+  style_cadence: [per_call, per_step]   # per_step shares one
+                                        # materialisation across every
+                                        # producer on one conditioning
+                                        # stream (see the broker below)
+
+calibration:
+  points: [cond, x]
+
+gates:
+  parity:
+    metrics: [cosine, max_abs, p99_abs]
+    data: real_distribution
+  latency:
+    baselines: [torch_compile, vendor]
+    rule: net_positive_including_boundary
+    per_shape: true
+  qualification:
+    max_steps: 64
+    fingerprint_rel_margin: 0.001
+
+qualification:
+  - "the conditioning must be step-quantized: more distinct vectors
+     than max_steps means it depends on more than the step and a table
+     would alias different inputs onto one row"
+  - "the fingerprint coordinates must separate the stored vectors by a
+     real margin, otherwise the in-graph lookup is not decidable"
+  - "the step lookup is pure tensor work (no host-side state), so it
+     stays valid under both dynamo tracing and graph capture"
+  - "bind scope is a measurement, not a default: the fused_norm form
+     pays a kernel the host may already fuse, so it earns its place
+     only where it also feeds a downstream seam (pi05 r15: fused_norm
+     at the 19 bf16 sites cost 1.9% against table_only)"
+
+style_broker:
+  # The kernel takes style as a contiguous (rows, W) tensor, so the one
+  # style row of a step has to be repeated to the row count. Done per
+  # producer that is correct and, across a stream, redundant: every
+  # producer on one conditioning stream resolves the same step, so the
+  # whole stream's styles are fixed for the step's duration. The broker
+  # fills one (P, rows, W) buffer per step and each producer reads a
+  # contiguous slice — the kernel's contract is untouched.
+  qualification:
+    - "producers must share one step locator (same conditioning stream),
+       one style width and one row count; anything else cannot share a
+       buffer and keeps its own materialisation"
+    - "the writer is the producer the host calls first, taken from the
+       observed call order of the calibration pass rather than from the
+       module tree's order, which need not match the forward's"
+    - "the fill is an opaque op on purpose: written as plain tensor work
+       the compiler inlines it into each reader — a correct buffer
+       elimination that undoes the sharing"
+  note: >
+    This removes launches, not bytes: the same (steps * P * rows * W)
+    elements are still written each tick. A kernel entry taking a
+    broadcast style would remove the bytes, and the two compose.
+
+evidence:
+  - "pi05 expert AdaRMS — r4 step table (fp32 GEMV 3.67ms bucket
+     removed), r11 fingerprint locator (cuBLAS GEMV 370x removed)"
+  - "pi05 expert fused fp8 producer — r7..r14, feeds the packed
+     projection seam"
+  - "GROOT DiT AdaLayerNorm — round3 fp8 producer, 32 blocks"
+  - "pi05 style broker, 36 producers on one stream — paired interleaved
+     timing -0.419 ms (range -0.418/-0.431), tick parity unchanged at
+     0.999906 either way: the broker reorganises work, it does not
+     change arithmetic"
+  - "the opacity is load-bearing, not defensive: as plain tensor work
+     the same broker measured -0.164 ms, because the fill stayed at 720
+     launches and merely moved bucket. Behind an opaque op: -0.419 ms"

@@ -1,0 +1,106 @@
+binding: lingbot_vla_pipeline
+structure: vla_tick_pipeline
+
+stages:
+  obs_encode:
+    seam: "embed_prefix + prefix_encode_36L"
+    capture: split_prefix_cuda_graph
+    outputs:
+      cond_features: "prefix embeddings and mixed-head KV cache"
+  action_denoise:
+    seam: "sample_actions or sample_actions_split_graph decoder replay"
+    loop_steps: "@num_steps"
+    noise_window: "sample_actions(noise=...)"
+    capture: decoder_cuda_graph
+
+cadences:
+  observation: obs_encode
+  tick: [obs_encode, action_denoise]
+  replan: action_denoise
+
+coverage:
+  contract: complete_hot_path
+  hot_path:
+    - observation_inputs
+    - vision_patch_embed
+    - vision_transformer
+    - vision_merge
+    - prefix_pack
+    - prefix_transformer
+    - prefix_kv_state
+    - denoise_control
+    - state_action_embedding
+    - timestep_conditioning
+    - mixed_head_expert
+    - euler_update
+    - action_readout
+  segments:
+    - name: observation_inputs
+      stage: obs_encode
+      classification: host_stage
+      seam: "LingBot policy image, mask, token, and state preprocessing"
+    - name: vision_patch_embed
+      stage: obs_encode
+      classification: structure
+      seam: "preflattened full-patch Conv3D lowered to one BF16 projection"
+      structures: [patch_projection]
+    - name: vision_transformer
+      stage: obs_encode
+      classification: structure
+      seam: "vit_forward block loop"
+      structures: [vision_ffn, qkv_pack, attention_core, linear_proj,
+                   norm_fused]
+    - name: vision_merge
+      stage: obs_encode
+      classification: structure
+      seam: "vit_merger"
+      structures: [vision_ffn, linear_proj]
+    - name: prefix_pack
+      stage: obs_encode
+      classification: host_stage
+      seam: "embed_prefix image/language layout and attention masks"
+    - name: prefix_transformer
+      stage: obs_encode
+      classification: structure
+      seam: "prefix_encode_36L"
+      structures: [decoder_ffn, qkv_pack, qk_norm_rope, attention_core,
+                   linear_proj, norm_fused]
+    - name: prefix_kv_state
+      stage: obs_encode
+      classification: state_region
+      seam: "mixed-head prefix KV cache"
+      structures: [cadence_static]
+    - name: denoise_control
+      stage: action_denoise
+      classification: control
+      seam: "sample_actions fixed-step Euler loop"
+    - name: state_action_embedding
+      stage: action_denoise
+      classification: structure
+      seam: "embed_suffix state and action projections"
+      structures: [linear_proj]
+    - name: timestep_conditioning
+      stage: action_denoise
+      classification: structure
+      seam: "precompute_film expert modulation table"
+      structures: [adaln_producer]
+    - name: mixed_head_expert
+      stage: action_denoise
+      classification: structure
+      seam: "predict_velocity and denoise_step_36L"
+      structures: [decoder_ffn, qkv_pack, qk_norm_rope, attention_core,
+                   adaln_producer, linear_proj, norm_fused]
+    - name: euler_update
+      stage: action_denoise
+      classification: state_region
+      seam: "x_t = x_t + dt * v_t"
+    - name: action_readout
+      stage: action_denoise
+      classification: state_region
+      seam: "captured final action tensor"
+
+hosts:
+  native:
+    module_path: "flash_rt.models.lingbot"
+  torch:
+    module_path: "flash_rt.frontends.torch.lingbot_thor.LingbotTorchFrontendThor"

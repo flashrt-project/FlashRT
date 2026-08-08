@@ -1,0 +1,21 @@
+binding: pi05_prefix
+structure: decoder_ffn
+dims: {D: 2048, F: 16384, layers: 18}
+variant: {activation: gelu, norm_weight_mode: offset, conditioning: none}
+boundary_dtype: bf16
+
+m_profile:
+  prefill: {m_class: medium, phase: vision_text_prefix}  # M = prefix tokens
+
+weights_map:
+  transformers:
+    layout: out_in
+    w_gate: "paligemma_with_expert.paligemma.model.language_model.layers.{i}.mlp.gate_proj.weight"
+    w_up: "paligemma_with_expert.paligemma.model.language_model.layers.{i}.mlp.up_proj.weight"
+    w_down: "paligemma_with_expert.paligemma.model.language_model.layers.{i}.mlp.down_proj.weight"
+    w_norm: "paligemma_with_expert.paligemma.model.language_model.layers.{i}.post_attention_layernorm.weight"
+
+hosts:
+  lerobot:
+    module_path: "model.paligemma_with_expert.paligemma.model.language_model.layers.{i}"
+    versions: ">=0.5,<0.6"

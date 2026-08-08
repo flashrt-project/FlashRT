@@ -1,0 +1,81 @@
+structure: video_generation_pipeline
+kind: stage_pipeline
+family: cond_iter_pipeline
+version: 1
+description: >
+  Schedule-layer structure for conditional image and video generation:
+  request-level text/image conditioning and explicit latent initialization
+  feed a fixed-step denoise loop, followed by an optional VAE decode. The
+  condition is read-only during denoise, while the latent and scheduler state
+  are mutable request-local buffers. This is the generation sibling of the VLA
+  tick pipeline; it does not inherit action-chunk or observation-cadence
+  semantics.
+
+stages:
+  - name: input_prepare
+    optional: true
+    cadence: request
+    inputs:
+      - {name: request, window: host}
+    outputs:
+      - {name: prepared_inputs, window: staged}
+    capture: host_dependent
+  - name: condition_encode
+    cadence: request
+    inputs:
+      - {name: prepared_inputs, window: staged}
+    outputs:
+      - {name: condition, buffer: static}
+    capture: host_dependent
+  - name: latent_prepare
+    cadence: request
+    inputs:
+      - {name: seed_or_source, window: staged}
+      - {name: condition, buffer: static}
+    outputs:
+      - {name: latent, window: swap}
+    capture: host_dependent
+  - name: denoise
+    cadence: generation_step
+    loop: {steps: "@binding", fixed_shape: host_dependent}
+    inputs:
+      - {name: condition, buffer: static, access: read_only}
+      - {name: latent, window: swap}
+      - {name: timestep, window: swap}
+    outputs:
+      - {name: latent, window: swap}
+    capture: host_dependent
+  - name: decode
+    optional: true
+    cadence: request
+    inputs:
+      - {name: latent, window: swap}
+    outputs:
+      - {name: media, window: readback}
+    capture: host_dependent
+
+embedded_regions: [decoder_ffn, vision_ffn, qkv_pack, qk_norm_rope,
+                   attention_core, adaln_producer, linear_proj, norm_fused]
+
+state_regions:
+  - {name: condition_cache, cadence: request, reader: denoise}
+  - {name: latent, writers: [latent_prepare, denoise], reader: denoise}
+  - {name: scheduler_state, cadence: generation_step}
+  - {name: graph_buckets, cadence: shape_or_step}
+
+conformance:
+  - condition_is_read_only_in_denoise
+  - initial_latent_or_noise_is_explicit
+  - scheduler_update_is_explicit
+  - fixed_shape_contract_is_declared
+  - skipped_step_cache_has_a_quality_gate
+  - decode_cost_is_reported_when_present
+
+gates:
+  parity:
+    reference: host_eager_same_seed
+    boundary: latent_or_media
+    metrics: [cosine, relative_l2, max_abs]
+  net_win:
+    rule: same_request_e2e_and_per_stage_vs_host
+    report: [condition_latency, denoise_latency, decode_latency]

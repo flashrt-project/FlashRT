@@ -1,0 +1,86 @@
+structure: decoder_block
+version: 1
+description: >
+  The pre-norm transformer block as one boundary: two sublayers, each a
+  norm feeding a compute region and closing on a (gated) residual add.
+  The region structures bind inside this block and cannot see the
+  dataflow between them, which is where the residual adds, the gate
+  broadcasts and the seam dtypes live. Owning the block hands the
+  pending "residual + sublayer_out * gate" to the adaptive-norm
+  producer, whose kernel already computes it before it norms — the
+  host's elementwise add disappears, the producer's FP8 output becomes
+  the MLP's input, and the step lookup is resolved once for both
+  producers instead of once per norm. The block owns composition only:
+  every slot is a module bound by its own structure, and a slot that did
+  not bind keeps the host's child.
+
+reference:
+  module: decoder_block.reference
+  entrypoint: decoder_block_ref
+
+boundary:
+  symbolic_dims: [B, S, D, C]
+  inputs:
+    - {name: x, dims: [B, S, D], dtype: "@binding"}
+    - {name: cond, dims: [B, C], dtype: "@binding", optional: true}
+  outputs:
+    - {name: y, dims: [B, S, D], dtype: "@binding"}
+
+weights: []          # the block owns none; they belong to its sublayers
+
+variants:
+  residual: [gated]
+  norm: [adaln_rms]
+  ffn_entry: [fp8_static]
+  attention: [host_module, packed_sublayer]
+
+calibration:
+  points: []         # each sublayer structure carries its own; the block
+                     # adds no calibration of its own
+
+qualification:
+  - "the host block exposes exactly the four sublayer slots
+     (self_attn, mlp, input_layernorm, post_attention_layernorm) and no
+     other parameterised child — a fifth one is a sublayer this
+     structure would silently drop, so it is refused"
+  - "both norms are adaptive producers on the same conditioning stream
+     and share one step locator; without the shared locator the lookup
+     still runs twice and the block buys nothing"
+  - "the second producer must be the rms form with fp8 output: the
+     residual fold and the MLP's fp8 entry are the same decision"
+  - "what the host forward actually does with those slots is not
+     inspected — it is adjudicated by the parity gate below, which is
+     declared at the tick boundary"
+  - "the packed_sublayer attention variant additionally needs a bound
+     attention core whose packed plan's suffix is exactly the tokens the
+     projections produce; a host that carries its own KV cache into
+     attention fails that equality and keeps its attention module"
+
+gates:
+  parity:
+    reference: host_eager_same_seed
+    boundary: tick_output
+    metrics: [cosine, max_abs, p99_abs]
+    data: real_distribution
+  latency:
+    baselines: [torch_compile, vendor]
+    rule: net_positive_including_boundary
+    report: kernel_buckets   # the block trades host glue for our kernels,
+                             # so a bucket account is part of the verdict
+
+discovery:
+  families: >
+    decoder layers carrying the four sublayer slots — the HF decoder
+    layer shape, adaptive-norm specialisations included
+
+evidence:
+  - "pi05 expert, 18 blocks, paired interleaved timing over 9 rounds —
+     26.581 -> 25.392 ms, paired delta -1.189 ms (range -1.175/-1.192),
+     tick parity 0.999922 -> 0.999939"
+  - "kernel account: total 24.470 -> 23.695 ms, launches 6236 -> 5040;
+     the inductor bucket carries it (2.393 -> 1.469 ms, 2424 -> 1054
+     launches) — host glue traded for kernels already in the stack"
+  - "attention: host_module variant alone is time-neutral (-0.037 ms).
+     The residual fold pays for the second producer's kernel and the
+     win comes from packed_sublayer removing the cancelling transposes.
+     Both halves of the boundary are needed"

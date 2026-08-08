@@ -1,0 +1,23 @@
+binding: smolvla_vision
+structure: vision_ffn
+dims: {D: 768, F: 3072, layers: 12}
+variant: {activation: gelu}
+boundary_dtype: f32
+
+m_profile:
+  encode: {m_class: medium, phase: vision_encode}   # M = patch tokens/view
+
+weights_map:
+  lerobot:
+    layout: out_in
+    w_fc1: "model.vlm_with_expert.vlm.model.vision_model.encoder.layers.{i}.mlp.fc1.weight"
+    b_fc1: "model.vlm_with_expert.vlm.model.vision_model.encoder.layers.{i}.mlp.fc1.bias"
+    w_fc2: "model.vlm_with_expert.vlm.model.vision_model.encoder.layers.{i}.mlp.fc2.weight"
+    b_fc2: "model.vlm_with_expert.vlm.model.vision_model.encoder.layers.{i}.mlp.fc2.bias"
+    w_norm: "model.vlm_with_expert.vlm.model.vision_model.encoder.layers.{i}.layer_norm2.weight"
+    b_norm: "model.vlm_with_expert.vlm.model.vision_model.encoder.layers.{i}.layer_norm2.bias"
+
+hosts:
+  lerobot:
+    module_path: "model.vlm_with_expert.vlm.model.vision_model.encoder.layers.{i}"
+    versions: ">=0.5,<0.6"

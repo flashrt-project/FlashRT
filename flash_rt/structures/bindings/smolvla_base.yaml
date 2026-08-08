@@ -1,0 +1,21 @@
+binding: smolvla_base
+structure: decoder_ffn
+dims: {D: 960, F: 2560, layers: 16}
+variant: {activation: silu, norm_weight_mode: direct, conditioning: none}
+boundary_dtype: f32
+
+m_profile:
+  prefix: {m_class: medium, phase: prefill}   # M = vision+language prefix
+
+weights_map:
+  lerobot:
+    layout: out_in
+    w_gate: "model.vlm_with_expert.vlm.model.text_model.layers.{i}.mlp.gate_proj.weight"
+    w_up: "model.vlm_with_expert.vlm.model.text_model.layers.{i}.mlp.up_proj.weight"
+    w_down: "model.vlm_with_expert.vlm.model.text_model.layers.{i}.mlp.down_proj.weight"
+    w_norm: "model.vlm_with_expert.vlm.model.text_model.layers.{i}.post_attention_layernorm.weight"
+
+hosts:
+  lerobot:
+    module_path: "model.vlm_with_expert.vlm.model.text_model.layers.{i}"
+    versions: ">=0.5,<0.6"

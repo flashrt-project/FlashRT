@@ -192,6 +192,15 @@ class MotusTorchFrontendRtx:
         **kwargs,
     ):
         _apply_fp4_profile_from_env()
+        if (os.environ.get("FLASH_RT_MOTUS_NO_G4", "0") != "1"
+                and torch.cuda.is_available()
+                and torch.cuda.get_device_capability() == (12, 0)):
+            from flash_rt.runtime.cuda_libraries import require_cublas13
+
+            self._cublas_version = require_cublas13(
+                130100, feature="Motus RTX FP8")
+        else:
+            self._cublas_version = None
 
         self.checkpoint_dir = pathlib.Path(checkpoint_dir)
         self.dtype = dtype

@@ -1,0 +1,93 @@
+binding: smolvla_pipeline
+structure: vla_tick_pipeline
+
+stages:
+  obs_encode:
+    seam: "embed_prefix + vlm_with_expert(fill_kv_cache=True)"
+    capture: eager_then_static_kv_copy
+    outputs:
+      cond_features: "prefix embeddings and past_key_values"
+  action_denoise:
+    seam: "sample_actions fixed-step flow-matching loop"
+    loop_steps: "@policy.config.num_steps"
+    noise_window: "sample_actions(noise=...)"
+    capture: decoder_cuda_graph
+
+cadences:
+  observation: obs_encode
+  tick: [obs_encode, action_denoise]
+  replan: action_denoise
+
+coverage:
+  contract: complete_hot_path
+  hot_path:
+    - observation_preprocess
+    - image_embedding
+    - language_embedding
+    - prefix_transformer
+    - prefix_kv_state
+    - denoise_control
+    - state_action_embedding
+    - timestep_conditioning
+    - action_expert
+    - euler_update
+    - action_readout
+  segments:
+    - name: observation_preprocess
+      stage: obs_encode
+      classification: host_stage
+      seam: "SmolVLAPolicy preprocessing and missing-camera masks"
+    - name: image_embedding
+      stage: obs_encode
+      classification: structure
+      seam: "embed_prefix image encoder and projector"
+      structures: [vision_ffn, qkv_pack, attention_core, linear_proj]
+    - name: language_embedding
+      stage: obs_encode
+      classification: host_stage
+      seam: "embed_language_tokens"
+    - name: prefix_transformer
+      stage: obs_encode
+      classification: structure
+      seam: "vlm_with_expert(fill_kv_cache=True)"
+      structures: [decoder_ffn, qkv_pack, attention_core, linear_proj,
+                   norm_fused]
+    - name: prefix_kv_state
+      stage: obs_encode
+      classification: state_region
+      seam: "past_key_values copied into decoder static buffers"
+      structures: [cadence_static]
+    - name: denoise_control
+      stage: action_denoise
+      classification: control
+      seam: "sample_actions timestep loop"
+    - name: state_action_embedding
+      stage: action_denoise
+      classification: structure
+      seam: "embed_suffix state and noisy-action projections"
+      structures: [linear_proj]
+    - name: timestep_conditioning
+      stage: action_denoise
+      classification: structure
+      seam: "precompute_film per-step expert conditioning"
+      structures: [adaln_producer]
+    - name: action_expert
+      stage: action_denoise
+      classification: structure
+      seam: "predict_velocity expert transformer"
+      structures: [decoder_ffn, qkv_pack, attention_core, adaln_producer,
+                   linear_proj, norm_fused]
+    - name: euler_update
+      stage: action_denoise
+      classification: state_region
+      seam: "x_t = x_t + dt * v_t"
+    - name: action_readout
+      stage: action_denoise
+      classification: state_region
+      seam: "final x_t action chunk window"
+
+hosts:
+  lerobot:
+    module_path: "policy.model"
+    versions: "smolvla_base"
+

@@ -21,6 +21,29 @@ import torch
 
 from flash_rt.frontends.torch import _qwen3_vl_geometry as geo
 
+
+def test_processor_pixel_cap_supports_mapping_like_size_objects():
+    class SizeLike:
+        def __init__(self):
+            self.values = {"longest_edge": 16_777_216}
+
+        def __setitem__(self, key, value):
+            self.values[key] = value
+
+    class SubProcessor:
+        def __init__(self):
+            self.size = SizeLike()
+
+    class Processor:
+        def __init__(self):
+            self.image_processor = SubProcessor()
+            self.video_processor = SubProcessor()
+
+    processor = Processor()
+    geo.set_processor_max_pixels(processor, 262_144)
+    assert processor.image_processor.size.values["longest_edge"] == 262_144
+    assert processor.video_processor.size.values["longest_edge"] == 262_144
+
 IMG, VID, VSTART = 100, 101, 102
 MERGE = 2
 

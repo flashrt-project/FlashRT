@@ -87,6 +87,12 @@ algorithm tests should provide the same precomputed `t5_embed.pt` and
 
 Motus FP4/VAE kernels are built into `flash_rt.flash_rt_kernels` by CMake.
 There is no separate Motus kernel library directory in the public build.
+The RTX FP8 path requires cuBLAS 13.1 or newer; install the Motus runtime
+extra before running the quickstart:
+
+```bash
+pip install 'flash-rt[motus]'
+```
 
 ---
 
@@ -680,6 +686,7 @@ precision and graph-capture defaults for that run.
 | Symptom | Fix |
 |---|---|
 | `No module named flash_rt_kernels` | Re-run the build and copy `flash_rt*.so` into `flash_rt/`. |
+| `Motus RTX FP8 requires cuBLAS >= 13.1` | Install `flash-rt[motus]`, or set `FLASH_RT_CUDA13_LIB_DIR` to a compatible CUDA 13 library directory before importing FlashRT. |
 | `ModuleNotFoundError` for Motus/Wan modules | Set `FLASH_RT_MOTUS_ROOT` or pass `--motus-root`. |
 | Quickstart reports missing paths | Set `MOTUS_ROOT`, `MOTUS_CHECKPOINT`, `MOTUS_WAN_PATH`, `MOTUS_VLM_PATH`, and `MOTUS_INPUT_BUNDLE`, or pass the matching CLI flags. |
 | `--fp4-profile on` does not enable VAE FP4 | Rebuild with `cmake -B build -S . -DGPU_ARCH=120` and confirm the Motus VAE FP4 symbols are present in `flash_rt_kernels`. |

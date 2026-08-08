@@ -1,0 +1,23 @@
+binding: qwen3_vl_8b_vision
+structure: vision_ffn
+dims: {D: 1152, F: 4304, layers: 27}
+variant: {activation: gelu}
+boundary_dtype: bf16
+
+m_profile:
+  encode: {m_class: medium, phase: vision_encode}   # M = vision patch tokens
+
+weights_map:
+  transformers:
+    layout: out_in
+    w_fc1: "model.visual.blocks.{i}.mlp.linear_fc1.weight"
+    b_fc1: "model.visual.blocks.{i}.mlp.linear_fc1.bias"
+    w_fc2: "model.visual.blocks.{i}.mlp.linear_fc2.weight"
+    b_fc2: "model.visual.blocks.{i}.mlp.linear_fc2.bias"
+    w_norm: "model.visual.blocks.{i}.norm2.weight"
+    b_norm: "model.visual.blocks.{i}.norm2.bias"
+
+hosts:
+  transformers:
+    module_path: "model.visual.blocks.{i}"
+    versions: ">=5.0,<6"

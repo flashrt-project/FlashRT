@@ -1,0 +1,26 @@
+binding: groot_n16_tick
+structure: vla_tick_pipeline
+
+stages:
+  obs_encode:
+    seam: "model.backbone"
+    capture: eager            # SigLIP2 window reordering uses CPU indexing
+    outputs:
+      cond_features: "backbone_features"
+    mutation_guard: shallow_copy   # action_head reassigns backbone_features
+                                   # (vlln write-back); loop must receive a
+                                   # fresh shallow-copy wrapper per call
+  action_denoise:
+    seam: "model.action_head.get_action"
+    loop_steps: 4             # num_inference_timesteps
+    noise_window: single_randn_site   # hoisted; recorded at first eager run
+
+cadences:
+  observation: obs_encode
+  tick: action_denoise
+  replan: action_denoise    # dit-only replay while observation unchanged
+
+hosts:
+  isaac_gr00t:
+    module_path: "policy.model"
+    versions: "n1.6"

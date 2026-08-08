@@ -134,6 +134,32 @@ def _load_inventory():
 inv = _load_inventory()
 
 
+def test_qwen3_vl_owns_shared_sm120_dense_gemm():
+    """Qwen3-VL must not require enabling the unrelated qwen3_5_moe bundle."""
+    cmake = (REPO_ROOT / "CMakeLists.txt").read_text()
+    shared_start = cmake.index(
+        "if((FLASHRT_BUILD_QWEN3_VL OR FLASHRT_ENABLE_QWEN35MOE) "
+        "AND ENABLE_NVFP4)")
+    moe_start = cmake.index(
+        "if(FLASHRT_ENABLE_QWEN35MOE AND ENABLE_NVFP4)", shared_start)
+    shared = cmake[shared_start:moe_start]
+    assert "csrc/kernels/w16a16_gemm_sm120.cu" in shared
+    assert "FLASHRT_HAVE_W16A16_SM120=1" in shared
+
+    bindings = (REPO_ROOT / "csrc" / "bindings.cpp").read_text()
+    assert (
+        "#ifdef FLASHRT_HAVE_W16A16_SM120\n"
+        '#include "kernels/w16a16_gemm_sm120.cuh"\n'
+        "#endif"
+    ) in bindings
+    definition = bindings.index('m.def("w16a16_gemm_sm120_bf16"')
+    bind_start = bindings.rfind(
+        "#ifdef FLASHRT_HAVE_W16A16_SM120", 0, definition)
+    bind_end = bindings.index("#endif", definition)
+    assert bind_start >= 0
+    assert definition < bind_end
+
+
 def _require_build_dir():
     if not BUILD_DIR.is_dir():
         pytest.skip(f"no configured build dir at {BUILD_DIR}")

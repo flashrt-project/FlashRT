@@ -131,12 +131,7 @@ class Qwen3VlTorchFrontendRtx:
         # processor's smart_resize (rounds to the patch grid). None keeps the
         # checkpoint default (full resolution).
         self.max_pixels = max_pixels
-        if max_pixels is not None:
-            for proc in (getattr(self.processor, 'image_processor', None),
-                         getattr(self.processor, 'video_processor', None)):
-                size = getattr(proc, 'size', None)
-                if isinstance(size, dict) and 'longest_edge' in size:
-                    size['longest_edge'] = int(max_pixels)
+        geo.set_processor_max_pixels(self.processor, max_pixels)
 
         self.latency_records: list[float] = []
         self._prompt: dict[str, Any] | None = None

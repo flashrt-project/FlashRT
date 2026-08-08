@@ -1,0 +1,117 @@
+binding: groot_n17_pipeline
+structure: vla_tick_pipeline
+
+stages:
+  obs_encode:
+    seam: "GrootN17TorchFrontendThor.set_prompt backbone calibration chain"
+    capture: eager_or_backbone_cuda_graph
+    outputs:
+      cond_features: "backbone_features and visual_pos_masks"
+  action_denoise:
+    seam: "GrootN17TorchFrontendThor.infer"
+    loop_steps: 4
+    noise_window: "initial_noise or persistent action buffer"
+    capture: kernel_dit_cuda_graph
+
+cadences:
+  observation: obs_encode
+  tick: [obs_encode, action_denoise]
+  replan: action_denoise
+
+coverage:
+  contract: complete_hot_path
+  hot_path:
+    - observation_inputs
+    - vision_encoder
+    - vision_merge
+    - deepstack_features
+    - multimodal_backbone
+    - vision_language_adapter
+    - backbone_features
+    - cross_kv_refresh
+    - denoise_control
+    - state_action_projection
+    - timestep_conditioning
+    - dit_transformer
+    - euler_update
+    - action_readout
+  segments:
+    - name: observation_inputs
+      stage: obs_encode
+      classification: host_stage
+      seam: "official GROOT N1.7 processor aux tensors"
+    - name: vision_encoder
+      stage: obs_encode
+      classification: structure
+      seam: "calibrate_vit or kernelized ViT block loop"
+      structures: [vision_ffn, qkv_pack, attention_core, linear_proj]
+    - name: vision_merge
+      stage: obs_encode
+      classification: structure
+      seam: "vision merger projection"
+      structures: [vision_ffn, linear_proj]
+    - name: deepstack_features
+      stage: obs_encode
+      classification: state_region
+      seam: "three request-cadence DeepStack injection buffers"
+      structures: [cadence_static]
+    - name: multimodal_backbone
+      stage: obs_encode
+      classification: structure
+      seam: "Qwen3-VL language block loop"
+      structures: [decoder_ffn, qkv_pack, qk_norm_rope, attention_core,
+                   linear_proj, norm_fused]
+    - name: vision_language_adapter
+      stage: obs_encode
+      classification: structure
+      seam: "VLSA four-layer adapter"
+      structures: [vision_ffn, qkv_pack, attention_core, linear_proj,
+                   norm_fused]
+    - name: backbone_features
+      stage: obs_encode
+      classification: state_region
+      seam: "_backbone_features observation-cadence buffer"
+      structures: [cadence_static]
+    - name: cross_kv_refresh
+      stage: obs_encode
+      classification: state_region
+      seam: "_cross_kv_fwd refreshes persistent DiT K/V buffers"
+      structures: [cadence_static, linear_proj]
+    - name: denoise_control
+      stage: action_denoise
+      classification: control
+      seam: "infer fixed-step flow-matching schedule"
+    - name: state_action_projection
+      stage: action_denoise
+      classification: structure
+      seam: "state encoder and action encoder"
+      structures: [linear_proj]
+    - name: timestep_conditioning
+      stage: action_denoise
+      classification: structure
+      seam: "_precompute_diffusion_modulators"
+      structures: [adaln_producer]
+    - name: dit_transformer
+      stage: action_denoise
+      classification: structure
+      seam: "dit_forward alternating self/cross attention blocks"
+      structures: [decoder_ffn, qkv_pack, qk_norm_rope, attention_core,
+                   adaln_producer, modnorm_qkv_chain, linear_proj,
+                   norm_fused]
+    - name: euler_update
+      stage: action_denoise
+      classification: state_region
+      seam: "captured action buffer Euler update"
+    - name: action_readout
+      stage: action_denoise
+      classification: structure
+      seam: "DiT output projection and action decoder"
+      structures: [adaln_producer, linear_proj]
+
+hosts:
+  native:
+    module_path: "flash_rt.models.groot_n17.pipeline_thor"
+  torch_rtx:
+    module_path: "flash_rt.frontends.torch.groot_n17_rtx.GrootN17TorchFrontendRtx"
+  torch_thor:
+    module_path: "flash_rt.frontends.torch.groot_n17_thor.GrootN17TorchFrontendThor"

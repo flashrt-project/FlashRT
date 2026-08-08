@@ -103,12 +103,7 @@ class Qwen3VlFp8Sm89Frontend:
         self._eos_token_ids = set(
             [] if eos is None else (eos if isinstance(eos, list) else [eos]))
         self.max_pixels = max_pixels
-        if max_pixels is not None:
-            for proc in (getattr(self.processor, 'image_processor', None),
-                         getattr(self.processor, 'video_processor', None)):
-                size = getattr(proc, 'size', None)
-                if isinstance(size, dict) and 'longest_edge' in size:
-                    size['longest_edge'] = int(max_pixels)
+        geo.set_processor_max_pixels(self.processor, max_pixels)
         self._prompt: dict[str, Any] | None = None
         self._decode_graphs: collections.OrderedDict[tuple[int, int], Any] = (
             collections.OrderedDict())

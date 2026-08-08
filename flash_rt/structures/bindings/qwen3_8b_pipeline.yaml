@@ -1,0 +1,98 @@
+binding: qwen3_8b_pipeline
+structure: autoregressive_decode_pipeline
+
+stages:
+  input_prepare:
+    seam: "Qwen3TorchFrontendRtx.set_prompt"
+    capture: eager
+  prefill:
+    seam: "Qwen3TorchFrontendRtx.prefill_with_graph"
+    capture: bucketed_cuda_graph
+    eager_seam: "Qwen3TorchFrontendRtx.forward_prefill_nvfp4"
+  decode:
+    seam: "Qwen3TorchFrontendRtx.decode_step_with_graph"
+    capture: position_bucketed_cuda_graph
+    eager_seam: "Qwen3TorchFrontendRtx.forward_own_decode_nvfp4"
+  token_select:
+    seam: "Qwen3TorchFrontendRtx.greedy_decode_from_prompt"
+    policy: greedy
+
+coverage:
+  contract: complete_hot_path
+  hot_path:
+    - request_tokenize
+    - prefill_embedding
+    - prefill_norm_rope
+    - prefill_transformer
+    - prefill_kv_write
+    - prefill_readout
+    - decode_loop
+    - decode_embedding
+    - decode_norm_rope
+    - decode_transformer
+    - decode_kv_update
+    - decode_readout
+    - token_selection
+  segments:
+    - name: request_tokenize
+      stage: input_prepare
+      classification: host_stage
+      seam: "Qwen3TorchFrontendRtx.set_prompt"
+    - name: prefill_embedding
+      stage: prefill
+      classification: host_stage
+      seam: "embedding_lookup_bf16"
+    - name: prefill_norm_rope
+      stage: prefill
+      classification: host_stage
+      seam: "q/k RMSNorm + 1D RoPE fused post-processing"
+    - name: prefill_transformer
+      stage: prefill
+      classification: structure
+      seam: "Qwen3TorchFrontendRtx._layer_forward_full_nvfp4_prefill"
+      structures: [decoder_ffn, qkv_pack, attention_core, linear_proj]
+    - name: prefill_kv_write
+      stage: prefill
+      classification: state_region
+      seam: "attention K_cache/V_cache rows [start_pos:start_pos+S]"
+    - name: prefill_readout
+      stage: prefill
+      classification: structure
+      seam: "final RMSNorm + lm_head"
+      structures: [linear_proj]
+    - name: decode_loop
+      stage: decode
+      classification: control
+      seam: "greedy_decode_from_prompt token loop"
+    - name: decode_embedding
+      stage: decode
+      classification: host_stage
+      seam: "single-token embedding lookup"
+    - name: decode_norm_rope
+      stage: decode
+      classification: host_stage
+      seam: "qwen3_q_norm_rope_qstage + qwen3_k_norm_rope_kvwrite"
+    - name: decode_transformer
+      stage: decode
+      classification: structure
+      seam: "Qwen3TorchFrontendRtx._layer_forward_full_nvfp4"
+      structures: [decoder_ffn, qkv_pack, attention_core, linear_proj]
+    - name: decode_kv_update
+      stage: decode
+      classification: state_region
+      seam: "position-indexed attention K_cache/V_cache update"
+    - name: decode_readout
+      stage: decode
+      classification: structure
+      seam: "final RMSNorm + lm_head BF16 matvec"
+      structures: [linear_proj]
+    - name: token_selection
+      stage: token_select
+      classification: control
+      seam: "argmax + EOS/max-token stop"
+
+hosts:
+  native:
+    module_path: "flash_rt.models.qwen3.pipeline_rtx.Qwen3Pipeline"
+  torch:
+    module_path: "flash_rt.frontends.torch.qwen3_rtx.Qwen3TorchFrontendRtx"

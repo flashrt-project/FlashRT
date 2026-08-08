@@ -1,0 +1,119 @@
+binding: wan22_video_pipeline
+structure: video_generation_pipeline
+
+stages:
+  input_prepare:
+    seam: "Wan22TorchFrontendRtx.set_prompt and WanTI2V.generate preprocessing"
+    capture: eager
+  condition_encode:
+    seam: "Wan T5 text encoder and optional image conditioning"
+    capture: eager_or_offloaded
+  latent_prepare:
+    seam: "WanTI2V latent, mask, and seed initialization"
+    capture: eager
+  denoise:
+    seam: "WanModel.forward under the sampling solver loop"
+    loop_steps: "@infer.steps"
+    capture: host_dependent
+  decode:
+    seam: "Wan2_2_VAE.decode"
+    capture: eager
+
+coverage:
+  contract: complete_hot_path
+  hot_path:
+    - request_validation
+    - prompt_encode
+    - image_condition
+    - latent_initialization
+    - classifier_free_guidance
+    - denoise_control
+    - patch_embedding
+    - six_chunk_modulation
+    - qk_norm_rope
+    - self_attention
+    - cross_attention
+    - modulated_ffn
+    - denoise_head
+    - scheduler_update
+    - vae_decode
+    - video_readout
+  segments:
+    - name: request_validation
+      stage: input_prepare
+      classification: host_stage
+      seam: "Wan22TorchFrontendRtx.infer shape and mode validation"
+    - name: prompt_encode
+      stage: condition_encode
+      classification: host_stage
+      seam: "Wan T5 text_encoder"
+    - name: image_condition
+      stage: condition_encode
+      classification: host_stage
+      seam: "optional CLIP and Wan2_2_VAE.encode image condition"
+    - name: latent_initialization
+      stage: latent_prepare
+      classification: state_region
+      seam: "seeded latent plus image mask/source latent"
+    - name: classifier_free_guidance
+      stage: denoise
+      classification: control
+      seam: "conditional and unconditional branch scheduling"
+    - name: denoise_control
+      stage: denoise
+      classification: control
+      seam: "sampling solver timestep loop and optional TeaCache decision"
+    - name: patch_embedding
+      stage: denoise
+      classification: structure
+      seam: "WanModel.patch_embedding"
+      structures: [linear_proj]
+    - name: six_chunk_modulation
+      stage: denoise
+      classification: host_stage
+      seam: "WanAttentionBlock.modulation plus timestep embedding chunk(6)"
+    - name: qk_norm_rope
+      stage: denoise
+      classification: structure
+      seam: "WanSelfAttention q_norm, k_norm, and 3D RoPE"
+      structures: [qk_norm_rope]
+    - name: self_attention
+      stage: denoise
+      classification: structure
+      seam: "WanAttentionBlock.self_attn"
+      structures: [qkv_pack, attention_core, linear_proj]
+    - name: cross_attention
+      stage: denoise
+      classification: structure
+      seam: "WanAttentionBlock.cross_attn"
+      structures: [qkv_pack, attention_core, linear_proj]
+    - name: modulated_ffn
+      stage: denoise
+      classification: structure
+      seam: "WanAttentionBlock modulated GELU FFN and gated residual"
+      structures: [vision_ffn]   # diffusers FeedForward (net.0.proj/net.2)
+                                 # binds as the MLP slice; modulation and
+                                 # gated residual stay host
+    - name: denoise_head
+      stage: denoise
+      classification: structure
+      seam: "WanModel.head projection"
+      structures: [linear_proj]
+    - name: scheduler_update
+      stage: denoise
+      classification: state_region
+      seam: "solver latent update and optional TeaCache residual"
+    - name: vae_decode
+      stage: decode
+      classification: host_stage
+      seam: "Wan2_2_VAE.decode causal Conv3d stack"
+    - name: video_readout
+      stage: decode
+      classification: host_stage
+      seam: "decoded frame tensor and optional save"
+
+hosts:
+  native:
+    module_path: "flash_rt.models.wan22.pipeline_rtx"
+  torch:
+    module_path: "flash_rt.frontends.torch.wan22_rtx.Wan22TorchFrontendRtx"

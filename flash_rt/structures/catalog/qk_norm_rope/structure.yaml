@@ -1,0 +1,83 @@
+structure: qk_norm_rope
+version: 1
+description: >
+  Q/K RMSNorm followed by rotary position encoding, with V passed through
+  unchanged. The reduction scope is explicit: decoder, Cosmos, and audio
+  families normalize each head, while Wan normalizes the complete projection
+  before reshaping it into heads. The boundary consumes an already-expanded
+  position table, so decoder 1D RoPE, multimodal RoPE, and decomposed video
+  3D RoPE share one structure without making position generation part of it.
+  Projection packing may fuse into this region, while KV-cache mutation is a
+  separate state structure even when one backend kernel spans both.
+
+reference:
+  module: qk_norm_rope.reference
+  entrypoint: qk_norm_rope_ref
+
+boundary:
+  symbolic_dims: [B, T, Hq, Hkv, D, R, Wq, Wkv]
+  inputs:
+    - {name: q, dims: [B, T, Hq, D], dtype: "@binding"}
+    - {name: k, dims: [B, T, Hkv, D], dtype: "@binding"}
+    - {name: v, dims: [B, T, Hkv, D], dtype: "@binding"}
+    - {name: cos, dims: [B, T, "R/2"], dtype: "@binding"}
+    - {name: sin, dims: [B, T, "R/2"], dtype: "@binding"}
+  outputs:
+    - {name: q_after_rope, dims: [B, T, Hq, D], dtype: "@binding"}
+    - {name: k_after_rope, dims: [B, T, Hkv, D], dtype: "@binding"}
+    - {name: v, dims: [B, T, Hkv, D], dtype: "@binding", alias: v}
+
+weights:
+  - {slot: q_norm_weight, dims: [Wq]}
+  - {slot: k_norm_weight, dims: [Wkv]}
+
+variants:
+  normalization_scope: [per_head, projection]
+  rope_layout: [half, interleaved]
+  rotary_extent: [full, partial]
+  norm_weight_mode: [direct, offset]
+  out_dtype: [bf16, fp8_static, nvfp4]
+
+calibration:
+  points: [q_after_rope, k_after_rope]
+  optional_when: "out_dtype == bf16 or out_dtype == nvfp4"
+
+gates:
+  parity:
+    metrics: [cosine, max_abs, p99_abs]
+    data: real_distribution
+  latency:
+    baselines: [torch_compile, unfused_chain, vendor]
+    rule: net_positive_including_boundary
+    per_shape: true
+  qualification:
+    head_dim_even: true
+    rope_dim_even: true
+    position_table_preexpanded: true
+
+qualification:
+  - "Q and K must share head_dim; K and V must share shape, while GQA may
+     use different Q and KV head counts"
+  - "per_head scope uses D norm weights shared across heads; projection scope
+     uses Hq*D and Hkv*D weights and reduces across the corresponding complete
+     projection before RoPE"
+  - "rotary_dim is positive, even, and no larger than head_dim; the suffix
+     of a partial-RoPE head is preserved exactly"
+  - "cos and sin are already expanded for every token by the host; whether
+     they came from 1D, multimodal, or decomposed 3D geometry is outside
+     this structure"
+  - "KV-cache writes, cache positions, rollback, and watermarks are excluded
+     state semantics; a fused backend spanning this boundary and cache update
+     must still qualify the composed state unit"
+  - "quantized output scales belong to the selected scheme and are calibrated
+     at q_after_rope and k_after_rope; dynamic NVFP4 block scales need no
+     static activation statistic"
+
+evidence:
+  - "Cosmos video and audio paths independently fuse per-head RMSNorm with
+     full half-rotation RoPE"
+  - "Wan2.2 applies RMSNorm over the complete Q/K projection before reshaping
+     into heads, then applies decomposed 3D position math"
+  - "Qwen decoder kernels fuse the same math with a following KV-cache write,
+     which remains a separate state boundary"
+  - "OmniVoice and related audio paths repeat the same warp-per-head region"

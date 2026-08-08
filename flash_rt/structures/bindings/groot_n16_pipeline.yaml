@@ -1,0 +1,107 @@
+binding: groot_n16_pipeline
+structure: vla_tick_pipeline
+
+stages:
+  obs_encode:
+    seam: "GrootSigLIP2.forward + GrootQwen3.forward"
+    capture: eager_or_full_graph
+    outputs:
+      cond_features: "backbone_features"
+  action_denoise:
+    seam: "GrootDiT.run_steps"
+    loop_steps: 4
+    noise_window: "GrootDiT.bufs.actions"
+    capture: full_dit_cuda_graph
+
+cadences:
+  observation: obs_encode
+  tick: [obs_encode, action_denoise]
+  replan: action_denoise
+
+coverage:
+  contract: complete_hot_path
+  hot_path:
+    - observation_inputs
+    - vision_encoder
+    - vision_merge
+    - multimodal_pack
+    - backbone_transformer
+    - backbone_features
+    - cross_kv_precompute
+    - denoise_control
+    - state_action_projection
+    - timestep_conditioning
+    - dit_transformer
+    - euler_update
+    - action_readout
+  segments:
+    - name: observation_inputs
+      stage: obs_encode
+      classification: host_stage
+      seam: "official GROOT processor image, language, and state preparation"
+    - name: vision_encoder
+      stage: obs_encode
+      classification: structure
+      seam: "GrootSigLIP2._siglip_layers"
+      structures: [vision_ffn, qkv_pack, attention_core, linear_proj]
+    - name: vision_merge
+      stage: obs_encode
+      classification: structure
+      seam: "GrootSigLIP2._post_ln_unshuffle_mlp1"
+      structures: [vision_ffn, linear_proj]
+    - name: multimodal_pack
+      stage: obs_encode
+      classification: host_stage
+      seam: "vision and language token assembly"
+    - name: backbone_transformer
+      stage: obs_encode
+      classification: structure
+      seam: "GrootQwen3.forward"
+      structures: [decoder_ffn, qkv_pack, qk_norm_rope, attention_core,
+                   linear_proj, norm_fused]
+    - name: backbone_features
+      stage: obs_encode
+      classification: state_region
+      seam: "GrootQwen3.bufs.backbone_features"
+      structures: [cadence_static]
+    - name: cross_kv_precompute
+      stage: obs_encode
+      classification: state_region
+      seam: "GrootDiT.precompute_cross_kv"
+      structures: [cadence_static, linear_proj]
+    - name: denoise_control
+      stage: action_denoise
+      classification: control
+      seam: "GrootDiT.run_steps fixed four-step loop"
+    - name: state_action_projection
+      stage: action_denoise
+      classification: structure
+      seam: "state encoder and action encoder projections"
+      structures: [linear_proj]
+    - name: timestep_conditioning
+      stage: action_denoise
+      classification: structure
+      seam: "action_time_embeds and per-layer AdaLayerNorm conditioning"
+      structures: [adaln_producer]
+    - name: dit_transformer
+      stage: action_denoise
+      classification: structure
+      seam: "GrootDiT._run_step alternating self/cross blocks"
+      structures: [decoder_ffn, qkv_pack, qk_norm_rope, attention_core,
+                   adaln_producer, modnorm_qkv_chain, linear_proj,
+                   norm_fused]
+    - name: euler_update
+      stage: action_denoise
+      classification: state_region
+      seam: "gpu_euler_step over the actions buffer"
+    - name: action_readout
+      stage: action_denoise
+      classification: structure
+      seam: "final AdaLayerNorm, output projection, and action decoder"
+      structures: [adaln_producer, linear_proj]
+
+hosts:
+  native:
+    module_path: "flash_rt.models.groot.pipeline_rtx"
+  torch:
+    module_path: "flash_rt.frontends.torch.groot_rtx"

@@ -1,0 +1,59 @@
+structure: modnorm_qkv_chain
+version: 3
+description: >
+  A conditional LayerNorm whose output directly feeds sibling Q, K and V
+  projections. The producer writes the shared static FP8 wire once and all
+  three projections consume it without separate input quantization.
+  Version 3 adds the per-token-table modulation form: the conditioning is
+  a per-token embedding (one modulation vector per activation row, e.g. a
+  [B, M, chunks, D] timestep table) combined with the block's own
+  [chunks, D] modulation parameter. In that form the producer performs
+  the table add, chunk selection, normalization, modulation and FP8
+  quantization in one pass, and the block-level composition also carries
+  the sibling FFN front (its own chunk pair on the same table), because
+  the modulation is inline in the host block's forward and only a block
+  owner can reroute it.
+
+reference:
+  module: modnorm_qkv_chain.reference
+  entrypoint: modnorm_qkv_chain_ref
+
+boundary:
+  symbolic_dims: [B, M, D, C, Nq, Nk, Nv]
+  inputs:
+    - {name: x, dims: [B, M, D], dtype: "@binding"}
+    - {name: cond, dims: [B, C], dtype: "@binding"}
+  outputs:
+    - {name: q, dims: [B, M, Nq], dtype: "@binding"}
+    - {name: k, dims: [B, M, Nk], dtype: "@binding", optional: true}
+    - {name: v, dims: [B, M, Nv], dtype: "@binding", optional: true}
+
+weights:
+  - {slot: w_cond, dims: [2D, C]}
+  - {slot: b_cond, dims: [2D]}
+  - {slot: w_q, dims: [Nq, D]}
+  - {slot: b_q, dims: [Nq], optional: true}
+  - {slot: w_k, dims: [Nk, D], optional: true}
+  - {slot: b_k, dims: [Nk], optional: true}
+  - {slot: w_v, dims: [Nv, D], optional: true}
+  - {slot: b_v, dims: [Nv], optional: true}
+
+variants:
+  modulation: [scale_shift, per_token_table]
+  wire_dtype: [fp8_static]
+  fanout: [qkv, q_only]
+
+calibration:
+  points: []
+  # the per_token_table form calibrates four static activation scales at
+  # the seams its composition owns; the scale_shift form keeps no points
+  per_token_table_points: [attn_in, o_in, ffn_in, ffn_hid]
+
+gates:
+  parity:
+    metrics: [cosine, max_abs, p99_abs]
+    data: real_distribution
+  latency:
+    baselines: [host_chain]
+    rule: net_positive_including_boundary
+    per_shape: true

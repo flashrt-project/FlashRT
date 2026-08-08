@@ -1,0 +1,72 @@
+structure: attention_core
+version: 1
+description: >
+  Attention run on a fused kernel, with the host's additive mask
+  resolved into packed keys and values at bind time. A mask that blocks
+  one contiguous run of positions has no form the kernel accepts, but
+  the surviving positions do: packing them leaves a dense attention.
+  The packed prefix is encoder output for the current observation and
+  therefore belongs to a slower cadence — it is filled once and
+  refreshed by an update function, while the suffix is written per
+  call.
+
+reference:
+  module: attention_core.reference
+  entrypoint: attention_core_ref
+
+boundary:
+  symbolic_dims: [B, H, Sq, Skv, D]
+  inputs:
+    - {name: q, dims: [B, H, Sq, D], dtype: "@binding"}
+    - {name: k, dims: [B, Hkv, Skv, D], dtype: "@binding"}
+    - {name: v, dims: [B, Hkv, Skv, D], dtype: "@binding"}
+    - {name: mask, dims: [B, 1, Sq, Skv], dtype: "@binding", optional: true}
+  outputs:
+    - {name: out, dims: [B, Sq, H, D], dtype: "@binding"}
+
+weights: []
+
+variants:
+  kernel: [fa2_seqused, fa2_dense, host_fallback]
+  kv_cadence: [static_prefix, per_call]
+  segment_layout: [single_dense, packed_varlen_host]
+
+calibration:
+  points: [q, k, v, mask]
+
+gates:
+  parity:
+    metrics: [cosine, max_abs, p99_abs]
+    data: real_distribution
+  latency:
+    baselines: [torch_compile, vendor]
+    rule: net_positive_including_boundary
+    per_shape: true
+  qualification:
+    head_dims: [64, 96, 128, 256]
+    mask_runs_max: 1
+    prefix_static_rtol: 0.001
+
+qualification:
+  - "head_dim must be one the kernel supports; binding returns nothing
+     rather than failing, so the host keeps a fallback attention"
+  - "every query row must see the same mask and the blocked positions
+     must form a single contiguous run — anything else is not a packed
+     dense attention"
+  - "the prefix keys must not move across the hot loop; a moving
+     prefix means the cadence split is wrong, and it is rejected here
+     where the reason is still legible rather than downstream as a
+     parity failure"
+  - "a cu-seqlens host with exactly one segment is the ordinary dense
+     per-call form; multiple packed segments remain on the host unless
+     a compile- and capture-qualified varlen artifact is available"
+
+evidence:
+  - "standalone at pi05 denoise shapes — cos 0.9999979 vs eager+mask,
+     2.04x (11.7 vs 23.9us), split-KV workspace selected"
+  - "pi05 structures stack — round13, 2.246 -> 2.308x"
+  - "pi05 hub-kernel demo e2e — own FA2 21.42ms vs community 21.61ms,
+     action cosine 0.99987 against the native FlashRT pipeline"
+  - "Qwen3-VL single-image vision attention — one 6256-token segment,
+     27/27 sites, full forward 1.026x for qkv_rope+attention_core,
+     complete structure stack E2E 1.195x, exact generated token IDs"

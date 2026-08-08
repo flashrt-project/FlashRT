@@ -24,6 +24,17 @@ from __future__ import annotations
 import torch
 
 
+def set_processor_max_pixels(processor, max_pixels: int | None) -> None:
+    """Apply a shared image/video resolution cap across Transformers versions."""
+    if max_pixels is None:
+        return
+    for proc in (getattr(processor, 'image_processor', None),
+                 getattr(processor, 'video_processor', None)):
+        size = getattr(proc, 'size', None)
+        if size is not None and hasattr(size, '__setitem__'):
+            size['longest_edge'] = int(max_pixels)
+
+
 def vision_segments(input_ids, image_grid_thw=None, video_grid_thw=None, *,
                     image_token_id, video_token_id, spatial_merge_size):
     """Walk the image/video token runs of a sequence in order.

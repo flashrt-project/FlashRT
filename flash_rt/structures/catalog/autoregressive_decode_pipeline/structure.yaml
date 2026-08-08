@@ -1,0 +1,82 @@
+structure: autoregressive_decode_pipeline
+kind: stage_pipeline
+family: autoregressive_decode
+version: 2
+description: >
+  Schedule-layer structure for autoregressive generation: optional host
+  input preparation and modality encoding feed a causal prefill that
+  materializes KV state, followed by single-token decode and explicit token
+  selection/control. Text-only and multimodal frontends share the same
+  prefill/decode stages; modality_encode is an optional stage rather than a
+  separate language pipeline.
+
+stages:
+  - name: input_prepare
+    optional: true
+    cadence: request
+    inputs:
+      - {name: request, window: host}
+    outputs:
+      - {name: token_ids, window: staged}
+      - {name: geometry, buffer: static, optional: true}
+    capture: host_dependent
+  - name: modality_encode
+    optional: true
+    cadence: request
+    inputs:
+      - {name: modality_inputs, window: staged}
+      - {name: geometry, buffer: static, optional: true}
+    outputs:
+      - {name: modality_features, buffer: static}
+    capture: host_dependent
+  - name: prefill
+    cadence: request
+    inputs:
+      - {name: token_ids, window: staged}
+      - {name: modality_features, buffer: static, optional: true}
+    outputs:
+      - {name: kv_state, buffer: mutable}
+      - {name: logits, window: readback}
+    capture: bucketed_or_eager
+  - name: decode
+    cadence: token
+    loop: {steps: "@binding", fixed_shape: host_dependent}
+    inputs:
+      - {name: token_id, window: swap}
+      - {name: kv_state, buffer: mutable}
+    outputs:
+      - {name: kv_state, buffer: mutable}
+      - {name: logits, window: readback}
+    capture: bucketed_or_eager
+  - name: token_select
+    cadence: token
+    inputs:
+      - {name: logits, window: readback}
+    outputs:
+      - {name: token_id, window: swap}
+      - {name: stop, window: host}
+    capture: host_dependent
+
+embedded_regions: [decoder_ffn, vision_ffn, qkv_pack, qk_norm_rope, qkv_rope,
+                   attention_core, gated_delta_core, linear_proj,
+                   patch_projection]
+
+state_regions:
+  - {name: kv_state, writers: [prefill, decode], reader: decode}
+  - {name: graph_buckets, cadence: shape_or_position}
+
+conformance:
+  - prefill_populates_decode_state
+  - decode_state_update_is_explicit
+  - token_selection_is_outside_decoder_blocks
+  - modality_features_have_request_cadence
+  - graph_bucket_fallback_is_reported
+
+gates:
+  parity:
+    reference: host_eager_same_tokens
+    boundary: logits
+    metrics: [token_agreement, cosine, max_abs]
+  net_win:
+    rule: request_ttft_and_steady_state_tpot_vs_host
+    report: [prefill_latency, decode_latency, token_select_latency]

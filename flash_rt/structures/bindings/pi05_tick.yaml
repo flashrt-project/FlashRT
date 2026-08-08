@@ -1,0 +1,94 @@
+binding: pi05_tick
+structure: vla_tick_pipeline
+
+stages:
+  obs_encode:
+    seam: "Pi05Pipeline.vision_encoder + Pi05Pipeline.transformer_encoder"
+    capture: full_graph_or_eager
+    outputs:
+      cond_features: "encoder K/V buffers"
+  action_denoise:
+    seam: "Pi05Pipeline.transformer_decoder"
+    loop_steps: "@pipeline.num_steps"
+    noise_window: "Pi05Pipeline.input_noise_buf"
+    capture: full_graph_or_decoder_only_graph
+
+cadences:
+  observation: obs_encode
+  tick: [obs_encode, action_denoise]
+  replan: action_denoise
+
+coverage:
+  contract: complete_hot_path
+  hot_path:
+    - observation_inputs
+    - vision_encoder
+    - multimodal_projector
+    - prefix_transformer
+    - prefix_kv_state
+    - denoise_control
+    - time_conditioning
+    - action_in_projection
+    - denoise_transformer
+    - action_readout
+    - action_window
+  segments:
+    - name: observation_inputs
+      stage: obs_encode
+      classification: host_stage
+      seam: "input_images_buf + set_language_embeds"
+    - name: vision_encoder
+      stage: obs_encode
+      classification: structure
+      seam: "Pi05Pipeline.vision_encoder"
+      structures: [vision_ffn, qkv_pack, attention_core, norm_fused]
+    - name: multimodal_projector
+      stage: obs_encode
+      classification: structure
+      seam: "vision projector into encoder_x"
+      structures: [linear_proj]
+    - name: prefix_transformer
+      stage: obs_encode
+      classification: structure
+      seam: "Pi05Pipeline.transformer_encoder"
+      structures: [decoder_ffn, qkv_pack, attention_core, norm_fused]
+    - name: prefix_kv_state
+      stage: obs_encode
+      classification: state_region
+      seam: "encoder K/V buffers retained by decoder-only replay"
+      structures: [cadence_static]
+    - name: denoise_control
+      stage: action_denoise
+      classification: control
+      seam: "Pi05Pipeline.transformer_decoder fixed-step loop"
+    - name: time_conditioning
+      stage: action_denoise
+      classification: structure
+      seam: "decoder time embeddings and per-layer style tables"
+      structures: [adaln_producer]
+    - name: action_in_projection
+      stage: action_denoise
+      classification: structure
+      seam: "decoder_action_in_proj"
+      structures: [linear_proj]
+    - name: denoise_transformer
+      stage: action_denoise
+      classification: structure
+      seam: "Pi05Pipeline._decoder_layer"
+      structures: [decoder_ffn, qkv_pack, attention_core, adaln_producer,
+                   norm_fused]
+    - name: action_readout
+      stage: action_denoise
+      classification: structure
+      seam: "decoder final adaptive norm and action projection"
+      structures: [adaln_producer, linear_proj]
+    - name: action_window
+      stage: action_denoise
+      classification: state_region
+      seam: "input_noise_buf SWAP window becomes the action output"
+
+hosts:
+  native:
+    module_path: "flash_rt.models.pi05.pipeline_rtx.Pi05Pipeline"
+  torch:
+    module_path: "flash_rt.frontends.torch.pi05_rtx"

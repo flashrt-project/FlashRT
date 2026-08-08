@@ -1,0 +1,42 @@
+structure: vision_ffn
+version: 2
+description: >
+  Feed-forward block of a vision-transformer encoder layer:
+  x -> LayerNorm (learned affine or identity affine) -> fc1 (+bias) -> GELU ->
+  fc2 (+bias) -> residual add. Non-gated MLP, as used by the SigLIP
+  towers shared across the supported VLA families.
+
+reference:
+  module: vision_ffn.reference
+  entrypoint: vision_ffn_ref
+
+boundary:
+  symbolic_dims: [M, D, F]
+  inputs:
+    - {name: x, dims: [M, D], dtype: "@binding"}
+  outputs:
+    - {name: x, dims: [M, D], dtype: "@binding"}
+
+weights:
+  - {slot: w_norm, dims: [D], optional: true}
+  - {slot: b_norm, dims: [D], optional: true}
+  - {slot: w_fc1, dims: [F, D]}
+  - {slot: b_fc1, dims: [F]}
+  - {slot: w_fc2, dims: [D, F]}
+  - {slot: b_fc2, dims: [D]}
+
+variants:
+  activation: [gelu]
+  norm_affine: [learned, identity]
+
+calibration:
+  points: [x_after_norm, hidden_after_act]
+
+gates:
+  parity:
+    metrics: [cosine, max_abs, p99_abs]
+    data: real_distribution
+  latency:
+    baselines: [torch_compile, unfused_chain, vendor]
+    rule: net_positive_including_boundary
+    per_shape: true

@@ -1,0 +1,56 @@
+structure: cadence_static
+version: 1
+description: >
+  Work that changes on a slower cadence than the hot loop, held in
+  static buffers the captured graph reads and refreshed by an explicit
+  update function outside it. Cross-attention key/value projections
+  over a fixed prompt, encoder features over one observation, and
+  prefix KV in an action-chunk decoder are all instances: the hot loop
+  re-executes them every tick although their inputs only move when a
+  new observation arrives.
+
+reference:
+  module: cadence_static.reference
+  entrypoint: cadence_static_ref
+
+boundary:
+  symbolic_dims: [M, N]
+  inputs:
+    - {name: x, dims: [M, "*"], dtype: "@binding"}
+  outputs:
+    - {name: y, dims: [M, N], dtype: "@binding"}
+
+weights: []
+
+variants:
+  cadence: [observation, prompt]
+  update: [host_recompute, external_write]
+
+calibration:
+  points: [y]
+
+gates:
+  parity:
+    metrics: [cosine, max_abs, p99_abs]
+    data: real_distribution
+  latency:
+    baselines: [torch_compile, vendor]
+    rule: net_positive_including_boundary
+    per_shape: true
+  qualification:
+    invariance_rtol: 0.001
+    min_hot_loop_captures: 2
+
+qualification:
+  - "the wrapped output must be constant across the fast loop, proven
+     from captures of several hot-loop iterations — a per-step output
+     is not a cadence substructure and freezing it would silently
+     change the model"
+  - "the update function is returned to the caller, not hidden inside
+     the replacement: the recipe registers it as an outside update so
+     the slower cadence stays visible and its cost stays measured"
+
+evidence:
+  - "GROOT cross-attention KV — round2, 16 blocks, L3 14.32 -> 12.71ms"
+  - "pi05 prefix KV in the packed attention core — round13, the
+     obs-cadence mismatch was caught by the parity gate (0.984)"

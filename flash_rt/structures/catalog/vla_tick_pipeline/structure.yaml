@@ -1,0 +1,82 @@
+structure: vla_tick_pipeline
+kind: stage_pipeline
+family: cond_iter_pipeline
+version: 2
+description: >
+  Schedule-layer structure for tick-driven VLA inference: a condition
+  encoding stage (vision tower + LLM + adapters) that runs at observation
+  cadence, feeding a fixed-shape iterative denoise hot loop (diffusion or
+  flow action head, K steps) that runs at tick cadence and is captured as
+  a single graph. An optional readout stage covers deployments whose
+  iterative state needs a VAE or other output decoder. Noise is an explicit
+  SWAP window; condition features are static read-only buffers across the
+  loop.
+
+family_note: >
+  cond_iter_pipeline family = cond_encode once + fixed-shape iterative hot
+  loop + explicit noise/init window + static condition buffers. Sibling
+  specializations: one-shot image/video generation (cadence axis degenerates
+  to once per generation; capture yield ~0 in the compute-bound large-step
+  regime, net-win gate routes to in-step region structures) and streaming
+  frame loops (TTS frames, speculative-decode draft loops). This
+  specialization adds tick/cadence semantics: observation, replan and
+  prompt cadences plus action-chunk readback.
+
+stages:
+  - name: obs_encode
+    cadence: observation
+    inputs:
+      - {name: images, window: swap}
+      - {name: language, cadence: prompt}
+      - {name: state, window: swap}
+    outputs:
+      - {name: cond_features, buffer: static}
+    capture: host_dependent   # CPU-side indexing in vision towers is common;
+                              # compile-then-capture or eager+copy both conform
+  - name: action_denoise
+    cadence: tick
+    loop: {steps: "@binding", fixed_shape: true}
+    inputs:
+      - {name: cond_features, buffer: static, access: read_only}
+      - {name: state, window: swap, optional: true}
+      - {name: noise, window: swap}
+    outputs:
+      - {name: action_chunk, window: swap, readback: true}
+    capture: required_for_yield
+  - name: readout
+    optional: true
+    cadence: tick
+    inputs:
+      - {name: iterative_state, window: swap}
+    outputs:
+      - {name: deployment_output, window: readback}
+    capture: host_dependent
+
+embedded_regions: [decoder_ffn, vision_ffn, qkv_pack, qk_norm_rope,
+                   attention_core, adaln_producer, modnorm_qkv_chain,
+                   linear_proj, patch_projection, norm_fused]
+
+cadence_substructures:
+  - {name: cross_kv_precompute, cadence: prompt}
+  - {name: adaln_step_table, cadence: static_per_plan}
+
+conformance:
+  # audited per host before binding; failures route to sibling
+  # specializations or refusal
+  - stage_seam_exists
+  - hot_loop_fixed_shape_fixed_steps
+  - noise_single_hoistable_site
+  - condition_read_only_in_loop
+  - action_chunk_cadence
+  - readout_cost_reported_when_present
+  - capture_blockers_enumerated
+
+gates:
+  parity:
+    reference: host_eager_same_seed
+    boundary: action_chunk
+    rule: noise_must_be_explicit_window   # in-graph RNG never matches eager
+    metrics: [cosine, max_abs]
+  net_win:
+    rule: tick_latency_ab_vs_host_eager
+    report: per_stage_times   # cadence amortization is part of the account

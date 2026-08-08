@@ -1,0 +1,50 @@
+structure: norm_fused
+version: 1
+description: >
+  A plain affine norm executed by one fused kernel at compute dtype.
+  Vision towers keep their LayerNorms in FP32 while the block around
+  them runs in BF16, so each norm costs a dtype round trip and an
+  unfused statistics pass; collapsing it into a fused BF16 kernel
+  removes both. A norm the host already runs at compute dtype is
+  refused — there is nothing left to collapse.
+
+reference:
+  module: norm_fused.reference
+  entrypoint: norm_fused_ref
+
+boundary:
+  symbolic_dims: [M, D]
+  inputs:
+    - {name: x, dims: [M, D], dtype: "@binding"}
+  outputs:
+    - {name: y, dims: [M, D], dtype: "@binding"}
+
+weights:
+  - {slot: w, dims: [D]}
+  - {slot: b, dims: [D]}
+
+variants:
+  norm: [layer]
+  compute_dtype: [bf16]
+
+calibration:
+  points: [x]
+
+gates:
+  parity:
+    metrics: [cosine, max_abs, p99_abs]
+    data: real_distribution
+  latency:
+    baselines: [torch_compile, vendor]
+    rule: net_positive_including_boundary
+    per_shape: true
+  qualification:
+    host_dtype: float32
+
+qualification:
+  - "the host must run this norm in FP32: the win is collapsing that
+     into a fused BF16 kernel, so a BF16 norm is refused"
+  - "affine only — weight and bias are part of the fused kernel"
+
+evidence:
+  - "pi05 SigLIP tower — r11, 55 norms, part of a +0.123 ratio step"

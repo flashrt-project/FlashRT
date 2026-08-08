@@ -1,0 +1,94 @@
+binding: cosmos3_video_pipeline
+structure: video_generation_pipeline
+
+stages:
+  input_prepare:
+    seam: "Cosmos3VideoTorchFrontendRtx.set_prompt reference conditioning load"
+    capture: eager
+  condition_encode:
+    seam: "CosmosVideo.precompute_und"
+    capture: eager_once
+  latent_prepare:
+    seam: "initial vision latent and CosmosVideo.embed_gen"
+    capture: eager
+  denoise:
+    seam: "Cosmos3VideoTorchFrontendRtx._denoise"
+    loop_steps: "@reference_dump"
+    capture: per_step_gen_cuda_graph
+
+coverage:
+  contract: complete_hot_path
+  hot_path:
+    - reference_condition_load
+    - rope_tables
+    - text_tower
+    - text_kv_cache
+    - latent_initialization
+    - denoise_control
+    - latent_embedding
+    - timestep_embedding
+    - qk_norm_rope
+    - generation_tower
+    - scheduler_update
+    - latent_readout
+  segments:
+    - name: reference_condition_load
+      stage: input_prepare
+      classification: host_stage
+      seam: "official reference safetensors and geometry load"
+    - name: rope_tables
+      stage: condition_encode
+      classification: host_stage
+      seam: "CosmosVideo.set_rope"
+    - name: text_tower
+      stage: condition_encode
+      classification: structure
+      seam: "CosmosVideo.precompute_und two-tower text branch"
+      structures: [decoder_ffn, qkv_pack, attention_core, linear_proj]
+    - name: text_kv_cache
+      stage: condition_encode
+      classification: state_region
+      seam: "CosmosVideo.cK and CosmosVideo.cV"
+    - name: latent_initialization
+      stage: latent_prepare
+      classification: state_region
+      seam: "reference initial latent and patchify window"
+    - name: denoise_control
+      stage: denoise
+      classification: control
+      seam: "FlowUniPCMultistepScheduler timestep loop and optional skip set"
+    - name: latent_embedding
+      stage: denoise
+      classification: structure
+      seam: "CosmosVideo.embed_gen vae2llm projection"
+      structures: [linear_proj]
+    - name: timestep_embedding
+      stage: denoise
+      classification: host_stage
+      seam: "reference per-step timestep embedding"
+    - name: qk_norm_rope
+      stage: denoise
+      classification: structure
+      seam: "factored causal/full QKV -> per-head Q/K RMSNorm -> RoPE"
+      structures: [qk_norm_rope]
+    - name: generation_tower
+      stage: denoise
+      classification: structure
+      seam: "CosmosVideo.forward generation branch"
+      structures: [decoder_ffn, qkv_pack, attention_core, linear_proj]
+    - name: scheduler_update
+      stage: denoise
+      classification: state_region
+      seam: "FlowUniPCMultistepScheduler.step latent update"
+    - name: latent_readout
+      stage: denoise
+      classification: host_stage
+      seam: "unpatchify denoised latent"
+
+hosts:
+  official:
+    module_path: "diffusers_cosmos3.transformer.Cosmos3OmniTransformer"
+  native:
+    module_path: "flash_rt.models.cosmos3_video.pipeline_rtx.CosmosVideo"
+  torch:
+    module_path: "flash_rt.frontends.torch.cosmos3_video_rtx.Cosmos3VideoTorchFrontendRtx"

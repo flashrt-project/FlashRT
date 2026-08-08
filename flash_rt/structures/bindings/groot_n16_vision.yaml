@@ -1,0 +1,23 @@
+binding: groot_n16_vision
+structure: vision_ffn
+dims: {D: 1152, F: 4304, layers: 27}
+variant: {activation: gelu}
+boundary_dtype: bf16
+
+m_profile:
+  encode: {m_class: medium, phase: vision_encode}   # M = patch tokens/view
+
+weights_map:
+  isaac_gr00t:
+    layout: out_in
+    w_fc1: "backbone.model.vision_model.vision_model.encoder.layers.{i}.mlp.fc1.weight"
+    b_fc1: "backbone.model.vision_model.vision_model.encoder.layers.{i}.mlp.fc1.bias"
+    w_fc2: "backbone.model.vision_model.vision_model.encoder.layers.{i}.mlp.fc2.weight"
+    b_fc2: "backbone.model.vision_model.vision_model.encoder.layers.{i}.mlp.fc2.bias"
+    w_norm: "backbone.model.vision_model.vision_model.encoder.layers.{i}.layer_norm2.weight"
+    b_norm: "backbone.model.vision_model.vision_model.encoder.layers.{i}.layer_norm2.bias"
+
+hosts:
+  isaac_gr00t:
+    module_path: "backbone.model.vision_model.vision_model.encoder.layers.{i}"
+    versions: "n1.6"

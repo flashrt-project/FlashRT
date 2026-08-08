@@ -19,6 +19,10 @@ torch = ["torch", "safetensors", "sentencepiece"]
 jax = ["jax", "jaxlib", "ml_dtypes", "orbax-checkpoint", "flax"]
 server = ["fastapi", "uvicorn"]
 eval = ["opencv-python", "tqdm"]
+# Motus RTX FP8 uses a cuBLASLt shape that is unsupported by CUDA 13.0.
+# The frontend preloads this wheel before flash_rt_kernels so it also works
+# when the extension was built on a machine whose toolkit RUNPATH is older.
+motus = ["nvidia-cublas>=13.1,<14"]
 # MiniMax-Remover NVFP4 video-inpainting pipeline. Optional: only needed to
 # construct/run flash_rt.models.minimax_remover (importing the package needs
 # none of these). diffusers + einops are the runtime model deps; scipy is used
@@ -42,7 +46,7 @@ flash-attn = ["flash-attn"]
 # (flash_rt/hardware/thor/fa4_backend.py) sets CUTE_DSL_ARCH=sm_101a.
 # Requires an editable / source-tree install (pip install -e). pip install ".[thor-fa4]".
 thor-fa4 = ["nvidia-cutlass-dsl==4.5.1", "quack-kernels==0.4.1"]
-all = ["flash-rt[torch,jax,server,eval,minimax-remover]"]
+all = ["flash-rt[torch,jax,server,eval,minimax-remover,motus]"]
 
 [tool.setuptools.packages.find]
 include = ["flash_rt*"]

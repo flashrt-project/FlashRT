@@ -1,0 +1,60 @@
+structure: gated_delta_core
+version: 1
+description: >
+  Stateful Gated DeltaNet recurrence over Q/K/V, log-decay and update
+  strength. The structure owns the recurrent state transition and exposes the
+  final state explicitly; projections, causal convolution and output gating
+  remain composable neighbouring structures.
+
+reference:
+  module: gated_delta_core.reference
+  entrypoint: gated_delta_core_ref
+
+boundary:
+  symbolic_dims: [B, S, H, D]
+  inputs:
+    - {name: q, dims: [B, S, H, D], dtype: "@binding"}
+    - {name: k, dims: [B, S, H, D], dtype: "@binding"}
+    - {name: v, dims: [B, S, H, D], dtype: "@binding"}
+    - {name: log_decay, dims: [B, S, H], dtype: "@binding"}
+    - {name: beta, dims: [B, S, H], dtype: "@binding"}
+    - {name: state, dims: [B, H, D, D], dtype: "@binding", optional: true}
+  outputs:
+    - {name: out, dims: [B, S, H, D], dtype: "@binding"}
+    - {name: final_state, dims: [B, H, D, D], dtype: "@binding", optional: true}
+
+weights: []
+
+variants:
+  phase: [decode_recurrent, sequence_scan, wy_chunk]
+  state_update: [in_place, explicit_output]
+  qk_norm: [l2_in_kernel, host]
+
+calibration:
+  points: []
+
+gates:
+  parity:
+    metrics: [cosine, max_abs, p99_abs]
+    data: real_distribution
+  latency:
+    baselines: [torch_compile, vendor]
+    rule: net_positive_including_state_transition
+    per_shape: true
+  qualification:
+    state_is_explicit: true
+    deterministic_transition: true
+
+qualification:
+  - "Q/K/V, log-decay and beta must share B/S/H and the same head width"
+  - "the state transition is part of the boundary; a route that updates an
+     untracked cache is not this structure"
+  - "decode and prefill may select different executable forms, but must
+     produce a final state accepted by the next invocation"
+
+evidence:
+  - "Qwen3.6/Qwen3.5 hybrid decoder: 48 of 64 layers carry this state"
+  - "Nex-N2 hybrid decoder uses the same recurrent and WY chunk boundary at
+     H=32 while Qwen3.6 uses H=48"
+  - "flashrt/gated-delta-attention v3 validates recurrent and sequence forms
+     on RTX 5090 at both H=32 and H=48 with D=128"

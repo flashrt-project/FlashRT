@@ -193,8 +193,10 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/moe_blocktile_mma_sm120.cuh"
 #include "kernels/moe_weighted_sum_sm120.cuh"
 #include "kernels/w4a16_gemm_sm120.cuh"
-#include "kernels/w16a16_gemm_sm120.cuh"
 #endif  // FLASHRT_HAVE_QWEN35MOE
+#ifdef FLASHRT_HAVE_W16A16_SM120
+#include "kernels/w16a16_gemm_sm120.cuh"
+#endif
 #include "kernels/bf16_matvec_qwen36.cuh"
 #include "kernels/bf16_matmul_bf16.cuh"
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS
@@ -5698,17 +5700,6 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("M"), py::arg("N"), py::arg("K"),
         py::arg("alpha") = 1.0f, py::arg("stream") = 0);
 
-    m.def("w16a16_gemm_sm120_bf16",
-        [](uintptr_t X, uintptr_t W, uintptr_t Y,
-           int M, int N, int K, float alpha, uintptr_t stream) -> int {
-            return flash_rt::gemm::w16a16_gemm_sm120_bf16(
-                to_ptr(X), to_ptr(W), to_ptr(Y),
-                M, N, K, alpha, to_stream(stream));
-        },
-        py::arg("X"), py::arg("W"), py::arg("Y"),
-        py::arg("M"), py::arg("N"), py::arg("K"),
-        py::arg("alpha") = 1.0f, py::arg("stream") = 0);
-
     m.def("moe_router_topk_sm120_bf16",
         [](uintptr_t logits, uintptr_t out_idx, uintptr_t out_val,
            int n_experts, int k, uintptr_t stream) -> int {
@@ -5788,6 +5779,19 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("w_stride"), py::arg("sfb_stride"),
         py::arg("stream") = 0);
 #endif  // FLASHRT_HAVE_QWEN35MOE
+
+#ifdef FLASHRT_HAVE_W16A16_SM120
+    m.def("w16a16_gemm_sm120_bf16",
+        [](uintptr_t X, uintptr_t W, uintptr_t Y,
+           int M, int N, int K, float alpha, uintptr_t stream) -> int {
+            return flash_rt::gemm::w16a16_gemm_sm120_bf16(
+                to_ptr(X), to_ptr(W), to_ptr(Y),
+                M, N, K, alpha, to_stream(stream));
+        },
+        py::arg("X"), py::arg("W"), py::arg("Y"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("alpha") = 1.0f, py::arg("stream") = 0);
+#endif
 
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS
     m.def("qwen36_gdn_gating_bf16",
