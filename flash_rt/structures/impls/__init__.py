@@ -208,7 +208,12 @@ def hub_kernel(repo: str, version: str):
                 # serve the same call site.
                 _LOADED[key] = (get_kernel(repo, revision=rev) if rev
                                 else get_kernel(repo))  # pre-semver band
-        except (OSError, RuntimeError, ValueError) as unavailable:
+        except (ImportError, OSError, RuntimeError,
+                ValueError) as unavailable:
+            # ImportError: the kernels library validates a package's own
+            # python-dependency declarations before serving it; a host
+            # missing one cannot supply the package, same as any other
+            # unavailability
             _record_unavailable(repo, version, unavailable)
             raise KernelUnavailable(
                 f"kernel package {repo!r} ({version}) is unavailable on "

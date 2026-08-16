@@ -50,6 +50,20 @@ _QKV_ROPE_ADAPTERS: list = []
 _GATED_DELTA_ADAPTERS: list = []
 
 
+class _AttentionOverride:
+    """The caller's own answer to the question a scheme usually answers.
+
+    Adapters read ``attention_forms`` off the scheme; an explicit argument
+    is the same statement made directly, so it arrives the same way rather
+    than through a second parameter every adapter would have to learn.
+    """
+
+    __slots__ = ("attention_forms",)
+
+    def __init__(self, forms):
+        self.attention_forms = tuple(forms)
+
+
 def register_attention_adapter(adapter) -> None:
     """Register a host-family attention adapter (callable)."""
     _ATTENTION_ADAPTERS.append(adapter)
@@ -115,6 +129,15 @@ class AutoPlan:
     #: anything. A seam that cannot be turned off cannot be measured.
     toggles: list[tuple[Callable[[], None], Callable[[], None]]] = field(
         default_factory=list)
+    #: callables that drop an adapter's own hold on the forms it bound.
+    #: Reverting a routed seam puts the host processor back but does not
+    #: free anything: the bound form stays reachable through ``observed``
+    #: and through the very closures that reverted it. That is right while
+    #: the form might still be activated and wrong once it cannot be, and
+    #: the difference is a form's whole working set — at long sequence
+    #: lengths, hundreds of megabytes per site, held for something that
+    #: will never run.
+    releases: list[Callable[[], None]] = field(default_factory=list)
     #: ``flash_rt.core.precision_spec.ModelPrecisionSpec`` for the scales
     #: this plan baked in — the repo's introspection format, not a private
     #: one, so ``plan.precision_spec`` reads like ``rt.precision_spec``
@@ -127,6 +150,22 @@ class AutoPlan:
     def disable_routed(self) -> None:
         for _, off in self.toggles:
             off()
+
+    def release_routed(self) -> None:
+        """Give back routed forms that will not be activated. Idempotent.
+
+        Called when the gate has settled and no routed unit won: the host
+        processors are already back, and what remains is memory held for a
+        form the gate declined. The revert callables stay in place and stay
+        correct — an adapter's release empties its own route list, so those
+        closures survive with nothing left to undo.
+        """
+        self.disable_routed()
+        for release in self.releases:
+            release()
+        self.releases.clear()
+        self.toggles.clear()
+        self.observed.clear()
 
     def abort(self) -> None:
         """Roll back everything this plan touched without an attach.
@@ -544,6 +583,7 @@ def auto_swaps(
     percentile: float = 99.9,
     max_samples: int | None = None,
     scheme: str | Any = "auto",
+    attention_forms: Sequence[str] | None = None,
     verbose: bool = False,
     stream_store: Any = None,
 ) -> AutoPlan:
@@ -1263,8 +1303,25 @@ def auto_swaps(
                     # sample entry, where that callable takes a sample —
                     # the whole point of normalising the three ways in was
                     # that nothing downstream should see the difference
-                    result = adapter(model, thunks[0],
-                                     prefix_cadence=prefix_cadence)
+                    # same convention as the gated-delta adapters: an
+                    # adapter that declares scheme awareness receives the
+                    # active scheme, because which executable form may
+                    # serve its seam is a precision decision and the
+                    # scheme is where those are stated
+                    if getattr(adapter, "scheme_aware", False):
+                        # an explicit argument outranks the profile: it is
+                        # the caller answering the same question directly,
+                        # which is how a deployment tunes one seam without
+                        # having to register a scheme for it
+                        result = adapter(
+                            model, thunks[0],
+                            prefix_cadence=prefix_cadence,
+                            scheme=(_AttentionOverride(attention_forms)
+                                    if attention_forms is not None
+                                    else scheme_obj))
+                    else:
+                        result = adapter(model, thunks[0],
+                                         prefix_cadence=prefix_cadence)
                 except (ValueError, RuntimeError) as refusal:
                     plan.notes.setdefault("refused", []).append(
                         ("attention_core", str(refusal)[:200]))
@@ -1294,6 +1351,7 @@ def auto_swaps(
                         "attention_core_variants", {}).update(
                             extras["attention_variants"])
                 plan.revert.extend(extras.get("revert", ()))
+                plan.releases.extend(extras.get("release", ()))
                 if extras.get("toggle") is not None:
                     plan.toggles.append(extras["toggle"])
                 if update is not None:

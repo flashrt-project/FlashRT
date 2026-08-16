@@ -6,7 +6,7 @@ from .fa2_seqused import (DenseAttention, PackedKVAttention,
 from .two_way_fa2 import FactoredTwoWayAttention, bind_two_way_attention
 
 
-def bind_dense_attention_best(captures):
+def bind_dense_attention_best(captures, *, prefer=()):
     """Dense attention across the variant family, precision-descending.
 
     One structure, parallel executable forms, and no second hardware
@@ -26,6 +26,15 @@ def bind_dense_attention_best(captures):
     package is merely absent looks identical to one where it was
     weighed and rejected — the two need different fixes, and only the
     trail tells them apart.
+
+    ``prefer`` names forms to try ahead of that order, and is empty by
+    default because the order above is a precision order: the quantized
+    forms trade a bounded error for speed, which is a decision about the
+    deployment rather than about the device, and a device-shaped ladder
+    is the wrong place to make it. A caller that has judged the trade —
+    a host binding, a qualification run — names the form it wants and
+    gets the same qualification walk, speed gate and trail as any other
+    rung. An unknown name is a caller error, not a silent no-op.
     """
     # a package can refuse a device three ways: its arch declaration
     # (ValueError from the loader's metadata check), the kernels
@@ -47,10 +56,26 @@ def bind_dense_attention_best(captures):
         from . import fa4_fp8
         return fa4_fp8.bind_dense_attention(caps)
 
+    def _sage2(caps):
+        from . import sage2_blackwell
+        return sage2_blackwell.bind_dense_attention(caps)
+
+    def _sage3(caps):
+        from . import sage3_blackwell
+        return sage3_blackwell.bind_dense_attention(caps)
+
+    order = [("fa2", _fa2), ("fa4_cute", _fa4_cute),
+             ("masked_mha", _masked_mha), ("fa4_fp8", _fa4_fp8)]
+    by_name = dict(order, sage2=_sage2, sage3=_sage3)
+    for name in reversed(tuple(prefer)):
+        if name not in by_name:
+            raise ValueError(
+                f"attention_core: unknown preferred form {name!r}; "
+                f"available: {sorted(by_name)}")
+        order.insert(0, (name, by_name[name]))
+
     refusals, declined = [], 0
-    for name, binder in (("fa2", _fa2), ("fa4_cute", _fa4_cute),
-                         ("masked_mha", _masked_mha),
-                         ("fa4_fp8", _fa4_fp8)):
+    for name, binder in order:
         try:
             core = binder(captures)
         except (ValueError, RuntimeError, OSError) as refusal:
