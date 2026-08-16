@@ -121,6 +121,20 @@ def decode_loop(model, *, max_len, compile_step=True,
                              kv_band=kv_band)
 
 
+def maskgit_loop(model, *, cfg_ratio: float = 0.05,
+                 bookend: bool = False):
+    """Serving door: the MaskGIT two-phase schedule over an attached
+    ``decoder_llm`` seam — the decode_loop twin for non-text hosts.
+
+    ``generate(task, gen_config)`` runs the BF16-CFG steps then the FP4
+    noCFG single-stream graph replays (the OmniVoice-style schedule).
+    See :mod:`flash_rt.structures.impls.decoder_llm.nvfp4`.
+    """
+    from flash_rt.structures.impls.decoder_llm.nvfp4 import MaskgitLoop
+
+    return MaskgitLoop(model, cfg_ratio=cfg_ratio, bookend=bookend)
+
+
 def aot_package(module, args=(), kwargs=None,
                 package_path="module_aot.pt2", **opts):
     """Whole-graph door: export the swapped module and AOT-compile it
@@ -151,6 +165,7 @@ __all__ = [
     "aot_load",
     "aot_package",
     "decode_loop",
+    "maskgit_loop",
     "explain",
     "attach",
     "capture",

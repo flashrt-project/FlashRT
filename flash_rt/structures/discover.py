@@ -371,6 +371,42 @@ def discover(
                          "norm": "adaln_rms" if gated else "rms",
                          "ffn_entry": "fp8_static"},
                 family=family, layer_index=idx))
+        if "audio_codec" in structures and all(
+            hasattr(module, a)
+            for a in ("decode", "quantizer", "acoustic_decoder",
+                      "decoder_semantic")
+        ):
+            # the neural codec decode region: DAC-style acoustic/semantic
+            # decoders behind a quantizer. HiggsAudioV2TokenizerModel is
+            # shared by OmniVoice and Higgs-Audio-v3 (recurring family).
+            seams.append(Seam(
+                structure="audio_codec", path=path,
+                parent_path=parent_path, norm_attr=None,
+                dims={"T": 0, "C": 0},
+                variant={"backend": "fp16_codec"},
+                family="audio_codec", layer_index=0))
+            continue
+        if "decoder_llm" in structures and all(
+            hasattr(module, a) for a in ("layers", "embed_tokens",
+                                         "norm", "rotary_emb")
+        ):
+            # the whole decoder stack: layers + embeddings + final norm +
+            # rotary. One seam per host (named_modules yields the stack
+            # itself once; nested module lists are skipped by the slots
+            # check). The NVFP4 impl's profile envelope refuses hosts
+            # outside the native engine's v1 contract.
+            if not any(isinstance(getattr(m, "layers", None),
+                                  torch.nn.ModuleList)
+                       for _, m in (("", module),)):
+                continue
+            dim = int(module.embed_tokens.weight.shape[-1])
+            seams.append(Seam(
+                structure="decoder_llm", path=path,
+                parent_path=parent_path, norm_attr="norm",
+                dims={"D": dim, "L": len(module.layers)},
+                variant={"backend": "nvfp4_llm"},
+                family="decoder_stack", layer_index=0))
+            continue
         if "modnorm_qkv_chain" in structures:
             chain_dims = _is_modnorm_qkv_chain(module)
             if chain_dims is not None:
