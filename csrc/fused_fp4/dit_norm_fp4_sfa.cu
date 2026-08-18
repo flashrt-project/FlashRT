@@ -206,3 +206,104 @@ int layer_norm_no_affine_fp4_sfa_bf16(
 
 }  // namespace fused_fp4
 }  // namespace flash_rt
+
+// ----------------------------------------------------------------------------
+//  Weighted RMSNorm (bf16) -> NVFP4 quantize + SFA (GR00T N1.6 Qwen3 tier).
+//  y = x * rsqrt(mean(x^2) + eps) * weight, rounded through bf16 before
+//  quantization (matches the torch RMSNorm(bf16) + quantize chain).
+// ----------------------------------------------------------------------------
+namespace flash_rt {
+namespace fused_fp4 {
+
+#if FV_HAVE_CUTLASS
+
+namespace {
+
+template <class LayoutSF>
+__global__ void rms_norm_w_fp4_sfa_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ weight,
+    uint2* __restrict__ packed,
+    uint8_t* __restrict__ dst_sfa,
+    LayoutSF layout,
+    int D, float eps) {
+    const int r = blockIdx.x;
+    const __nv_bfloat162* row2 =
+        reinterpret_cast<const __nv_bfloat162*>(x + static_cast<long>(r) * D);
+    const int D2 = D >> 1;
+    __shared__ float sh[32];
+
+    float ssq = 0.f;
+    for (int i = threadIdx.x; i < D2; i += blockDim.x) {
+        const __nv_bfloat162 v = row2[i];
+        const float a = __bfloat162float(v.x);
+        const float b = __bfloat162float(v.y);
+        ssq += a * a + b * b;
+    }
+    const float rstd = rsqrtf(block_sum_dn(ssq, sh) / D + eps);
+
+    const int n_blocks = D >> 4;
+    const int4* x4 = reinterpret_cast<const int4*>(x + static_cast<long>(r) * D);
+    const int4* w4 = reinterpret_cast<const int4*>(weight);
+    for (int blk = threadIdx.x; blk < n_blocks; blk += blockDim.x) {
+        const int4 xr[2] = {x4[2 * blk], x4[2 * blk + 1]};
+        const int4 wr[2] = {w4[2 * blk], w4[2 * blk + 1]};
+        const __nv_bfloat16* xh = reinterpret_cast<const __nv_bfloat16*>(xr);
+        const __nv_bfloat16* wh = reinterpret_cast<const __nv_bfloat16*>(wr);
+        float vals[16];
+        float amax = 0.f;
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const float normed =
+                __bfloat162float(xh[i]) * rstd * __bfloat162float(wh[i]);
+            vals[i] = __bfloat162float(__float2bfloat16(normed));
+            const float a = fabsf(vals[i]);
+            if (a > amax) amax = a;
+        }
+        float desired = amax / 6.f;
+        if (desired < 1e-12f) desired = 1e-12f;
+        __nv_fp8_e4m3 bs_q = __nv_fp8_e4m3(fmaxf(desired, 0.f));
+        const float bs_dq = static_cast<float>(bs_q);
+        dst_sfa[layout(r, blk * 16, 0)] = *reinterpret_cast<uint8_t*>(&bs_q);
+        const float inv_bs = 1.f / bs_dq;
+        uint2 out;
+        uint8_t* ob = reinterpret_cast<uint8_t*>(&out);
+        #pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            const uint8_t lo = fp32_to_e2m1_dn(vals[2 * p] * inv_bs);
+            const uint8_t hi = fp32_to_e2m1_dn(vals[2 * p + 1] * inv_bs);
+            ob[p] = static_cast<uint8_t>(lo | (hi << 4));
+        }
+        packed[static_cast<long>(r) * n_blocks + blk] = out;
+    }
+}
+
+}  // namespace
+
+#endif  // FV_HAVE_CUTLASS
+
+int rms_norm_weight_fp4_sfa_bf16(
+    const void* x, const void* weight, void* packed, void* sfa,
+    int seq_len, int dim, float eps, cudaStream_t stream) {
+#if FV_HAVE_CUTLASS
+    if (check_dn_args(x, packed, dim) != 0) return -1;
+    if (reinterpret_cast<uintptr_t>(weight) & 15) return -1;
+    auto shape = cute::make_shape(seq_len, 1, dim, 1);
+    auto layout = CfgDN::tile_atom_to_shape_SFA(shape);
+    rms_norm_w_fp4_sfa_kernel<<<seq_len, 128, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x),
+        reinterpret_cast<const __nv_bfloat16*>(weight),
+        reinterpret_cast<uint2*>(packed),
+        reinterpret_cast<uint8_t*>(sfa),
+        layout, dim, eps);
+    const cudaError_t e = cudaGetLastError();
+    return (e == cudaSuccess) ? 0 : -static_cast<int>(e);
+#else
+    (void)x; (void)weight; (void)packed; (void)sfa;
+    (void)seq_len; (void)dim; (void)eps; (void)stream;
+    return -2;
+#endif
+}
+
+}  // namespace fused_fp4
+}  // namespace flash_rt

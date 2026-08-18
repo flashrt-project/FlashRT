@@ -41,6 +41,7 @@
 #include "gemm/fp4/cutlass_fp4_gemm_bias_bf16_sm100.cuh"
 #include "quantize/quantize_fp4_sfa_bf16.cuh"
 #include "fused_fp4/dit_norm_fp4_sfa.cuh"
+#include "fused_fp4/silu_mul_fp4_sfa_bf16.cuh"
 #include "fused_fp4/layer_norm_fp4_sfa.cuh"
 #include "gemm/fp4/cutlass_fp4_gemm_siglip_ffn_sm100.cuh"
 
@@ -1227,6 +1228,37 @@ same contract as cutlass_fp4_gemm_geglu_il_hw.
         py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-5f,
         py::arg("stream") = 0,
         "Fused no-affine LayerNorm (bf16) -> NVFP4 packed + SFA.");
+
+  m.def("rms_norm_weight_fp4_sfa_bf16",
+        [](uintptr_t x, uintptr_t weight, uintptr_t packed, uintptr_t sfa,
+           int seq_len, int dim, float eps, uintptr_t stream) -> int {
+          return flash_rt::fused_fp4::rms_norm_weight_fp4_sfa_bf16(
+              reinterpret_cast<void const*>(x),
+              reinterpret_cast<void const*>(weight),
+              reinterpret_cast<void*>(packed),
+              reinterpret_cast<void*>(sfa),
+              seq_len, dim, eps,
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("x"), py::arg("weight"), py::arg("packed"), py::arg("sfa"),
+        py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-5f,
+        py::arg("stream") = 0,
+        "Fused weighted RMSNorm (bf16) -> NVFP4 packed + SFA.");
+
+  m.def("silu_mul_fp4_sfa_bf16",
+        [](uintptr_t gate, uintptr_t up, uintptr_t packed, uintptr_t sfa,
+           int N, int D, bool is_sfb, uintptr_t stream) -> int {
+          return flash_rt::fused_fp4::silu_mul_fp4_sfa_bf16(
+              reinterpret_cast<void const*>(gate),
+              reinterpret_cast<void const*>(up),
+              reinterpret_cast<void*>(packed),
+              reinterpret_cast<void*>(sfa),
+              N, D, is_sfb,
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("gate"), py::arg("up"), py::arg("packed"), py::arg("sfa"),
+        py::arg("N"), py::arg("D"), py::arg("is_sfb"), py::arg("stream") = 0,
+        "Fused SiLU(gate)*up (bf16) -> NVFP4 packed + SFA.");
 
   m.attr("__version__") = "0.1.0-dev";
   m.attr("layout_note") = "scales are linear [N, D/16]; Phase 4 adds tile-interleave conversion";

@@ -1588,7 +1588,8 @@ if(ENABLE_SM100_CUTLASS)
     csrc/kernels/attention_mha_masked.cu
     csrc/kernels/vec_fp16_backbone.cu
     csrc/kernels/attention_seqused_fused.cu
-    csrc/kernels/rope_vec.cu)
+    csrc/kernels/rope_vec.cu
+    csrc/kernels/qk_norm_rope_rotate_half_bf16.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_THOR_VLA_KERNELS=1)
   message(STATUS "Thor VLA helper kernels: ENABLED (sm_${GPU_ARCH})")
 else()
@@ -2056,6 +2057,7 @@ if(ENABLE_SM100_CUTLASS)
     csrc/gemm/fp4/cutlass_fp4_gemm_bias_bf16_sm100.cu
     csrc/quantize/quantize_fp4_sfa_bf16.cu
     csrc/fused_fp4/dit_norm_fp4_sfa.cu
+    csrc/fused_fp4/silu_mul_fp4_sfa_bf16.cu
     csrc/gemm/fp4/cutlass_fp4_gemm_geglu_il_sm100.cu
     csrc/quantize/quantize_e0m3_sfa.cu
     csrc/gemm/fp4/cutlass_fp4_gemm_e0m3w_sm100.cu

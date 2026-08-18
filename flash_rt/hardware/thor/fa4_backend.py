@@ -53,21 +53,12 @@ def _load() -> None:
         _REASON = "disabled (FLASHRT_THOR_FA4=0)"
         return
 
-    # Thor compilation target. The accepted chip string depends on the
-    # installed nvidia-cutlass-dsl: 4.5+ needs ``sm_101a`` (the legacy
-    # sm_110 alias; its ``sm_110a`` path hits a chip-string bug), while
-    # 4.4.x only knows ``sm_110a``. Either way the vendored SM100-compatible
-    # forward is what runs — this tree ships no separate SM110 kernel — so
-    # FLASH_ATTENTION_ARCH stays sm_100a below. Don't clobber a user value.
-    try:
-        import cutlass as _ctl  # nvidia-cutlass-dsl
-        _dsl_ver = tuple(
-            int(x) for x in str(getattr(_ctl, "__version__", "0.0"))
-            .split(".")[:2])
-    except Exception:  # noqa: BLE001 — any failure: assume the newer alias
-        _dsl_ver = (4, 5)
-    os.environ.setdefault(
-        "CUTE_DSL_ARCH", "sm_101a" if _dsl_ver >= (4, 5) else "sm_110a")
+    # Thor compilation target: sm_101a (the legacy alias of sm_110).
+    # Must be set BEFORE importing cutlass-dsl, which caches the device
+    # arch at import time; setting it after is too late (NVVM ICE on
+    # sm_110a). Requires nvidia-cutlass-dsl >= 4.5 (which accepts the
+    # sm_101a alias); 4.4.x only knows sm_110a and is NOT supported.
+    os.environ.setdefault("CUTE_DSL_ARCH", "sm_101a")
     os.environ.setdefault("FLASH_ATTENTION_ARCH", "sm_100a")
 
     # Allow an override dir (e.g. for local FA4 development), else the vendor.
