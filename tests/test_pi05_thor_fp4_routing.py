@@ -43,6 +43,30 @@ BENCH = _load_bench_module()
 PRESET = BENCH.PUBLIC_API_PRESET
 
 
+def test_benchmark_defaults_distinguish_reference_from_regression_gate():
+    assert BENCH.DEFAULT_WARMUP == 300
+    assert BENCH.RESULT_SCHEMA_VERSION == 2
+    assert BENCH.README_REFERENCE_P50_MS == {1: 23.01, 2: 27.17, 3: 31.74}
+    assert BENCH.REGRESSION_BASELINE_P50_MS == {1: 30.5, 2: 36.3, 3: 42.8}
+    assert BENCH.REQUIRED_REGRESSION_MARGIN_MS == 2.0
+
+
+def test_benchmark_latency_groups_preserve_measurement_order():
+    samples_ms = [
+        value
+        for group in range(10)
+        for value in (float(group), float(group + 2))
+    ]
+    assert BENCH.latency_group_medians(samples_ms) == [
+        float(group + 1) for group in range(10)
+    ]
+
+
+def test_benchmark_latency_groups_require_ten_samples():
+    with pytest.raises(ValueError, match="at least 10 samples"):
+        BENCH.latency_group_medians([1.0] * 9)
+
+
 # The constructor parameters the Pi0.5 Thor frontends expose. load_model
 # feature-detects with inspect.signature, so the stubs must declare them for
 # the routing to be exercised at all. test_stub_signatures_match_frontends

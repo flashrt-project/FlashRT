@@ -90,6 +90,9 @@ Baseline comparisons and source methodology live in [Benchmark Comparison](docs/
 | Jetson AGX Thor | NVFP4 + FA4, 3-view | **31.74 ms** | **32 Hz** | [Pi0.5 Thor NVFP4](docs/pi05_thor_decoder_fp4_e2e.md) |
 | RTX 5090 | FP8, 2-view | **17.58 ms** | **57 Hz** | [Blackwell VLA](examples/blackwell/README.md#vla-latency-rtx-5090) |
 
+For the Pi0.5 Thor rows, use about 300 warmup calls; 20 can be insufficient.
+See the [warmup and latency reference notes](docs/pi05_thor_decoder_fp4_e2e.md#warmup-and-latency-references).
+
 † At 1 view the per-sample action cosine against the FP8 reference does
 not clear the 0.995 gate (worst sample 0.971): with single-view input the
 flow-matching field itself is near a decision boundary on some samples,
