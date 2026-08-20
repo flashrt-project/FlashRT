@@ -787,7 +787,7 @@ modalities::Status frontend_gated_activation(
         if (!scale) return invalid("SM120 gated-activation scale is invalid");
         *linear_input = binding->fp8_linear->scratch_data();
         *prequantized = true;
-        ::gate_silu_mul_merged_fp8(
+        ::gate_geglu_merged_fp8(
             static_cast<const __nv_bfloat16*>(gate),
             static_cast<__nv_fp8_e4m3*>(
                 binding->fp8_linear->scratch_data()),
@@ -797,12 +797,12 @@ modalities::Status frontend_gated_activation(
     *linear_input = output;
     *prequantized = false;
     if (merged) {
-        ::gate_silu_mul_merged(
+        ::gate_geglu_merged(
             static_cast<const __nv_bfloat16*>(gate),
             static_cast<__nv_bfloat16*>(output), rows, hidden_width,
             cuda_stream);
     } else {
-        ::gate_silu_mul(
+        ::gate_geglu(
             static_cast<const __nv_bfloat16*>(gate),
             static_cast<const __nv_bfloat16*>(up),
             static_cast<__nv_bfloat16*>(output), rows * hidden_width,

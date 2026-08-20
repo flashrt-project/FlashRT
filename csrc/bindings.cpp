@@ -960,12 +960,12 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
 
     // Activation — GEGLU (tanh-approx GELU(gate) * up), not SiLU.
     m.def("gate_geglu", [](uintptr_t gate, uintptr_t up, uintptr_t out, int n, uintptr_t stream) {
-        gate_silu_mul(typed_ptr<__nv_bfloat16>(gate), typed_ptr<__nv_bfloat16>(up),
+        gate_geglu(typed_ptr<__nv_bfloat16>(gate), typed_ptr<__nv_bfloat16>(up),
                       typed_ptr<__nv_bfloat16>(out), n, to_stream(stream));
     }, py::arg("gate"), py::arg("up"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
 
     m.def("gate_geglu_fp16", [](uintptr_t gate, uintptr_t up, uintptr_t out, int n, uintptr_t stream) {
-        gate_silu_mul_fp16(typed_ptr<__half>(gate), typed_ptr<__half>(up),
+        gate_geglu_fp16(typed_ptr<__half>(gate), typed_ptr<__half>(up),
                            typed_ptr<__half>(out), n, to_stream(stream));
     }, py::arg("gate"), py::arg("up"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
 
@@ -1030,14 +1030,14 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
 
     m.def("gate_geglu_merged", [](uintptr_t merged, uintptr_t out,
                                    int seq, int half_dim, uintptr_t stream) {
-        gate_silu_mul_merged(typed_ptr<__nv_bfloat16>(merged),
+        gate_geglu_merged(typed_ptr<__nv_bfloat16>(merged),
                               typed_ptr<__nv_bfloat16>(out), seq, half_dim, to_stream(stream));
     }, py::arg("merged"), py::arg("out"), py::arg("seq"), py::arg("half_dim"), py::arg("stream") = 0);
 
     m.def("gate_geglu_merged_fp8", [](uintptr_t merged, uintptr_t out,
                                        int seq, int half_dim,
                                        uintptr_t d_scale, uintptr_t stream) {
-        gate_silu_mul_merged_fp8(typed_ptr<__nv_bfloat16>(merged),
+        gate_geglu_merged_fp8(typed_ptr<__nv_bfloat16>(merged),
                                   typed_ptr<__nv_fp8_e4m3>(out), seq, half_dim,
                                   reinterpret_cast<const float*>(d_scale), to_stream(stream));
     }, py::arg("merged"), py::arg("out"), py::arg("seq"), py::arg("half_dim"),
@@ -1838,7 +1838,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
 
     m.def("gate_geglu_merged_fp16", [](uintptr_t merged, uintptr_t out,
                                         int seq, int half_dim, uintptr_t stream) {
-        gate_silu_mul_merged_fp16(reinterpret_cast<const __half*>(merged),
+        gate_geglu_merged_fp16(reinterpret_cast<const __half*>(merged),
                                    reinterpret_cast<__half*>(out), seq, half_dim, to_stream(stream));
     }, py::arg("merged"), py::arg("out"), py::arg("seq"), py::arg("half_dim"), py::arg("stream") = 0);
 
@@ -1853,7 +1853,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     m.def("gate_geglu_merged_fp8_fp16", [](uintptr_t merged, uintptr_t out,
                                             int seq, int half_dim,
                                             uintptr_t d_scale, uintptr_t stream) {
-        gate_silu_mul_merged_fp8_fp16(reinterpret_cast<const __half*>(merged),
+        gate_geglu_merged_fp8_fp16(reinterpret_cast<const __half*>(merged),
                                        typed_ptr<__nv_fp8_e4m3>(out), seq, half_dim,
                                        reinterpret_cast<const float*>(d_scale), to_stream(stream));
     }, py::arg("merged"), py::arg("out"), py::arg("seq"), py::arg("half_dim"),

@@ -9,8 +9,10 @@
 
 // ── Gate GELU Multiply ──
 // GELU(x) approx: x * sigmoid(1.5957691216 * x * (1 + 0.044715 * x^2))
+// NOTE: previously misnamed `gate_silu_mul_kernel`; this is the tanh/sigmoid
+// approx GELU, not SiLU. Renamed to reflect the actual activation.
 template<typename T>
-__global__ void gate_silu_mul_kernel(const T* __restrict__ gate,
+__global__ void gate_geglu_kernel(const T* __restrict__ gate,
                                      const T* __restrict__ up,
                                      T* __restrict__ out, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -22,16 +24,16 @@ __global__ void gate_silu_mul_kernel(const T* __restrict__ gate,
     }
 }
 
-template __global__ void gate_silu_mul_kernel<__half>(const __half*, const __half*, __half*, int);
-template __global__ void gate_silu_mul_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int);
+template __global__ void gate_geglu_kernel<__half>(const __half*, const __half*, __half*, int);
+template __global__ void gate_geglu_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int);
 
-void gate_silu_mul(const __nv_bfloat16* gate, const __nv_bfloat16* up,
+void gate_geglu(const __nv_bfloat16* gate, const __nv_bfloat16* up,
                    __nv_bfloat16* out, int n, cudaStream_t stream) {
-    gate_silu_mul_kernel<__nv_bfloat16><<<(n + 255) / 256, 256, 0, stream>>>(gate, up, out, n);
+    gate_geglu_kernel<__nv_bfloat16><<<(n + 255) / 256, 256, 0, stream>>>(gate, up, out, n);
 }
-void gate_silu_mul_fp16(const __half* gate, const __half* up,
+void gate_geglu_fp16(const __half* gate, const __half* up,
                         __half* out, int n, cudaStream_t stream) {
-    gate_silu_mul_kernel<__half><<<(n + 255) / 256, 256, 0, stream>>>(gate, up, out, n);
+    gate_geglu_kernel<__half><<<(n + 255) / 256, 256, 0, stream>>>(gate, up, out, n);
 }
 
 // ── GELU in-place ──
@@ -139,7 +141,7 @@ void bias_gelu_inplace_bf16_strict(__nv_bfloat16* x,
 // ── Gate GELU Mul Merged ──
 // Input: (seq, 2*half_dim), gate = [:, :half_dim], up = [:, half_dim:]
 template<typename T>
-__global__ void gate_silu_mul_merged_kernel(const T* __restrict__ merged,
+__global__ void gate_geglu_merged_kernel(const T* __restrict__ merged,
                                              T* __restrict__ out,
                                              int seq, int half_dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -155,24 +157,24 @@ __global__ void gate_silu_mul_merged_kernel(const T* __restrict__ merged,
     }
 }
 
-template __global__ void gate_silu_mul_merged_kernel<__half>(const __half*, __half*, int, int);
-template __global__ void gate_silu_mul_merged_kernel<__nv_bfloat16>(const __nv_bfloat16*, __nv_bfloat16*, int, int);
+template __global__ void gate_geglu_merged_kernel<__half>(const __half*, __half*, int, int);
+template __global__ void gate_geglu_merged_kernel<__nv_bfloat16>(const __nv_bfloat16*, __nv_bfloat16*, int, int);
 
-void gate_silu_mul_merged(const __nv_bfloat16* merged, __nv_bfloat16* out,
+void gate_geglu_merged(const __nv_bfloat16* merged, __nv_bfloat16* out,
                            int seq, int half_dim, cudaStream_t stream) {
     int total = seq * half_dim;
     int blocks = (total + 255) / 256;
-    gate_silu_mul_merged_kernel<__nv_bfloat16><<<blocks, 256, 0, stream>>>(merged, out, seq, half_dim);
+    gate_geglu_merged_kernel<__nv_bfloat16><<<blocks, 256, 0, stream>>>(merged, out, seq, half_dim);
 }
-void gate_silu_mul_merged_fp16(const __half* merged, __half* out,
+void gate_geglu_merged_fp16(const __half* merged, __half* out,
                                 int seq, int half_dim, cudaStream_t stream) {
     int total = seq * half_dim;
     int blocks = (total + 255) / 256;
-    gate_silu_mul_merged_kernel<__half><<<blocks, 256, 0, stream>>>(merged, out, seq, half_dim);
+    gate_geglu_merged_kernel<__half><<<blocks, 256, 0, stream>>>(merged, out, seq, half_dim);
 }
 
 // Vectorized 8-half / thread element-wise multiply.  BW-bound; pairs
-// with two split-G7 GEMMs in R3.1 to replace gate_silu_mul_merged_fp16.
+// with two split-G7 GEMMs in R3.1 to replace gate_geglu_merged_fp16.
 __global__ void mul_fp16_kernel(const __half* __restrict__ a,
                                  const __half* __restrict__ b,
                                  __half* __restrict__ out, int n) {
@@ -216,7 +218,7 @@ void mul_fp16(const __half* a, const __half* b, __half* out, int n, cudaStream_t
 // ── Gate GELU Mul Merged -> FP8 ──
 // 4 elem/thread vectorized, matching production silu_mul_split_fp8_k throughput.
 // Merged layout: merged[s, 0..H-1] = gate, merged[s, H..2H-1] = up
-__global__ void gate_silu_mul_merged_fp8_kernel_fp16(const __half* merged, __nv_fp8_e4m3* out, int S, int H,
+__global__ void gate_geglu_merged_fp8_kernel_fp16(const __half* merged, __nv_fp8_e4m3* out, int S, int H,
                                        const float* descale_ptr) {
     int i = (blockIdx.x * blockDim.x + threadIdx.x) * 4;  // 4 elements per thread
     if (i >= S * H) return;
@@ -246,7 +248,7 @@ __global__ void gate_silu_mul_merged_fp8_kernel_fp16(const __half* merged, __nv_
 
 // BF16 generic version (non-encoder paths)
 template<typename T>
-__global__ void gate_silu_mul_merged_fp8_kernel(const T* __restrict__ merged,
+__global__ void gate_geglu_merged_fp8_kernel(const T* __restrict__ merged,
                                                  __nv_fp8_e4m3* __restrict__ out,
                                                  int seq, int half_dim,
                                                  const float* __restrict__ d_scale) {
@@ -266,24 +268,24 @@ __global__ void gate_silu_mul_merged_fp8_kernel(const T* __restrict__ merged,
     }
 }
 
-template __global__ void gate_silu_mul_merged_fp8_kernel<__half>(const __half*, __nv_fp8_e4m3*, int, int, const float*);
-template __global__ void gate_silu_mul_merged_fp8_kernel<__nv_bfloat16>(const __nv_bfloat16*, __nv_fp8_e4m3*, int, int, const float*);
+template __global__ void gate_geglu_merged_fp8_kernel<__half>(const __half*, __nv_fp8_e4m3*, int, int, const float*);
+template __global__ void gate_geglu_merged_fp8_kernel<__nv_bfloat16>(const __nv_bfloat16*, __nv_fp8_e4m3*, int, int, const float*);
 
-void gate_silu_mul_merged_fp8(const __nv_bfloat16* merged, __nv_fp8_e4m3* out,
+void gate_geglu_merged_fp8(const __nv_bfloat16* merged, __nv_fp8_e4m3* out,
                                int seq, int half_dim,
                                const float* d_scale, cudaStream_t stream) {
     int total = seq * half_dim;
     int blocks = (total + 255) / 256;
-    gate_silu_mul_merged_fp8_kernel<__nv_bfloat16><<<blocks, 256, 0, stream>>>(
+    gate_geglu_merged_fp8_kernel<__nv_bfloat16><<<blocks, 256, 0, stream>>>(
         merged, out, seq, half_dim, d_scale);
 }
-void gate_silu_mul_merged_fp8_fp16(const __half* merged, __nv_fp8_e4m3* out,
+void gate_geglu_merged_fp8_fp16(const __half* merged, __nv_fp8_e4m3* out,
                                     int seq, int half_dim,
                                     const float* d_scale, cudaStream_t stream) {
     // 4 elem/thread, matching production throughput
     int total = seq * half_dim;
     int blocks = (total / 4 + 255) / 256;
-    gate_silu_mul_merged_fp8_kernel_fp16<<<blocks, 256, 0, stream>>>(
+    gate_geglu_merged_fp8_kernel_fp16<<<blocks, 256, 0, stream>>>(
         merged, out, seq, half_dim, d_scale);
 }
 
