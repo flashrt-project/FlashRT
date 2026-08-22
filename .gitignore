@@ -44,3 +44,4 @@ internal-tests/
 internal-docs/
 notes/
 third_party/cutlass
+*.pt
