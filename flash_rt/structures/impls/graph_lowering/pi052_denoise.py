@@ -16,6 +16,8 @@ device resolves to a cached resident tensor — same values, same
 device, same dtype, allocated once outside capture. Everything else
 passes straight through, the schedule stays value-identical by
 construction, and the undo restores the host method bit-for-bit.
+Scalar constructors use device-native fills instead of a CPU staging copy;
+unlike list schedules, mutable scalars are not cached between calls.
 """
 
 from __future__ import annotations
@@ -60,6 +62,9 @@ class Pi05DenoiseGraphLoweringAdapter:
 
         def caching_tensor(data, *args, **kwargs):
             device = kwargs.get("device")
+            if (device is not None and not args
+                    and isinstance(data, (float, int, bool))):
+                return torch.full((), data, **kwargs)
             if (device is not None and isinstance(data, (list, tuple))
                     and data
                     and all(isinstance(x, (float, int, bool))
