@@ -63,6 +63,9 @@ def parse_args():
                    help="Enable INT8 fast path (sets FVK_PI05_RTX_FORCE_INT8=1, default ON)")
     p.add_argument("--no-int8", dest="int8", action="store_false",
                    help="Run BF16 reference path instead of INT8 fast path")
+    p.add_argument("--no-cuda-graph", dest="use_cuda_graph",
+                   action="store_false", default=True,
+                   help="Disable CUDA Graph capture/replay for kernel profiling")
     return p.parse_args()
 
 
@@ -101,6 +104,7 @@ def main():
         vision_pool_factor=args.pool,
         vision_num_layers=args.layers,
         cache_frames=args.cache_frames,
+        use_cuda_graph=args.use_cuda_graph,
     )
 
     pipe.set_prompt(args.prompt)
@@ -130,7 +134,8 @@ def main():
     print("=" * 55)
     print(f"  Config : num_views={args.num_views}  pool={args.pool}"
           f"  layers={args.layers}  steps={args.steps}"
-          f"  cache_frames={args.cache_frames}")
+          f"  cache_frames={args.cache_frames}"
+          f"  cuda_graph={args.use_cuda_graph}")
     print(f"  Actions: {out['actions'].shape}")
     print(f"  p50    : {p50:.1f} ms   → {1000/p50:.2f} Hz")
     print(f"  p95    : {p95:.1f} ms")
