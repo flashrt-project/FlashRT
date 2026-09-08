@@ -129,3 +129,35 @@ class GeluMulQuant(_NativeLibrary):
         if code:
             raise RuntimeError(f"native GELU quantization rejected arguments: {code}")
         return out
+
+
+class RmsRowQuant(_NativeLibrary):
+    """Optional BF16 residual addition, RMS normalization and static INT8."""
+    def __init__(self):
+        super().__init__()
+        self.launch = self.library.flashrt_npu_rms_row_quant
+        self.launch.argtypes = [C.c_void_p] * 7 + [C.c_int] * 2
+        self.launch.restype = C.c_int
+
+    def __call__(self, x, other, gamma, inverse_scales):
+        import torch
+        if (x.ndim != 2 or x.shape[1] != 2048 or x.dtype != torch.bfloat16
+                or x.device.type != "npu" or not x.is_contiguous()):
+            raise ValueError("RMS quantization requires a contiguous BF16 NPU (rows,2048) matrix")
+        tensors = [(gamma, torch.bfloat16, (2048,)),
+                   (inverse_scales, torch.float32, (x.shape[0],))]
+        if other is not None:
+            tensors.append((other, x.dtype, x.shape))
+        for tensor, dtype, shape in tensors:
+            if (tensor.dtype != dtype or tensor.shape != shape or tensor.device != x.device
+                    or not tensor.is_contiguous()):
+                raise ValueError("invalid RMS quantization operand or row scales")
+        quantized = torch.empty_like(x, dtype=torch.int8)
+        residual = torch.empty_like(x) if other is not None else x
+        code = self.launch(torch.npu.current_stream(x.device).npu_stream,
+            x.data_ptr(), other.data_ptr() if other is not None else None,
+            gamma.data_ptr(), inverse_scales.data_ptr(), quantized.data_ptr(),
+            residual.data_ptr(), x.shape[0], int(other is not None))
+        if code:
+            raise RuntimeError(f"native RMS quantization rejected arguments: {code}")
+        return quantized, residual
