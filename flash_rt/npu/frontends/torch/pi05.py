@@ -132,7 +132,8 @@ class Pi05TorchFrontendNpu:
     def _to_serving(key: str, t: torch.Tensor) -> torch.Tensor:
         """Keep serving GEMMs BF16; retain explicit FP32 setup operations."""
         if ".vision_model.encoder.layers." in key and key.endswith(".bias"):
-            return t.to(torch.bfloat16).to("npu")
+            # Preserve BF16 bias values; native biased GEMM consumes FP32 bias.
+            return t.to(torch.bfloat16).to(torch.float32).to("npu")
         if (".dense." in key or "layer_norm" in key or key.endswith(".bias")
                 or "patch_embedding" in key):
             return t.to(torch.float32).to("npu")
@@ -223,7 +224,7 @@ class Pi05TorchFrontendNpu:
             raise ValueError("INT8 calibration requires real observations")
         import hashlib
         from flash_rt.npu.models.pi05.quantization import calibrate_encoder
-        from flash_rt.npu.core.native_kernels import RowQuantizer, GeluMulQuant
+        from flash_rt.npu.core.native_kernels import RowQuantizer, GeluMulQuant, RmsRowQuant
         quantizer = RowQuantizer()
         fingerprints = []
         rng = np.random.default_rng(0)
@@ -254,7 +255,7 @@ class Pi05TorchFrontendNpu:
 
         bound, report = calibrate_encoder(self._encoder_bf16, observations,
             make_runner, self.num_views * npu_pl.VIS_TOKENS_PER_VIEW,
-            percentile, quantizer, GeluMulQuant())
+            percentile, quantizer, GeluMulQuant(), RmsRowQuant())
         report["sample_sha256"] = fingerprints
         self.wfe = bound
         self._calibration_report = report

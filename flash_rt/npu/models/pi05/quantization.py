@@ -9,7 +9,7 @@ from .pipeline import _EP, ENC_L
 
 
 def calibrate_encoder(weights, samples, make_runner, image_rows, percentile=99.9,
-                      quantizer=None, activation_producer=None):
+                      quantizer=None, activation_producer=None, norm_producer=None):
     """Collect one eager sample at a time; bind immutable INT8 operands.
 
     ``make_runner(sample, observed_weights)`` owns host preprocessing and
@@ -52,6 +52,9 @@ def calibrate_encoder(weights, samples, make_runner, image_rows, percentile=99.9
                                 ("gu", ("mlp.gate_proj", "mlp.up_proj"))):
                 bound[f"{prefix}.{name}.group"] = StaticRowInt8Group.bind(
                     bound[f"{prefix}.{site}.weight"] for site in projections)
+                if norm_producer is not None:
+                    bound[f"{prefix}.{name}.norm"] = RmsQuantProjection(
+                        bound[f"{prefix}.{name}.group"], norm_producer)
             if activation_producer is not None:
                 bound[f"{prefix}.down.fused"] = GeluMulProjection(
                     bound[f"{prefix}.mlp.down_proj.weight"], activation_producer)
@@ -70,3 +73,16 @@ class GeluMulProjection:
         acts, inverse, _ = self.weight.scales_for_rows(gate.shape[0], gate.shape[1], gate.device)
         quantized = self.producer(gate, up, inverse)
         return self.weight.project_quantized(quantized, acts, gate.shape, gate.dtype)
+
+
+@dataclass(frozen=True)
+class RmsQuantProjection:
+    group: StaticRowInt8Group
+    producer: object
+
+    def __call__(self, x, other, gamma):
+        acts, inverse, _ = self.group.weights[0].scales_for_rows(x.shape[0], x.shape[1], x.device)
+        quantized, residual = self.producer(x, other, gamma, inverse)
+        outputs = tuple(w.project_quantized(quantized, acts, x.shape, x.dtype)
+                        for w in self.group.weights)
+        return outputs, residual

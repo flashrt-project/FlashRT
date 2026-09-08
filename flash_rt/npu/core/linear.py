@@ -72,6 +72,12 @@ def linear(x, weight, bias=None):
     """Resolve a setup-time binding while constructing a captured graph."""
     if isinstance(weight, (CalibrationWeight, StaticInt8Weight, StaticRowInt8Weight)):
         return weight(x, bias)
+    if (bias is not None and bias.dtype == torch.float32
+            and x.dtype == torch.bfloat16 and x.device.type == "npu"
+            and weight.dtype == torch.bfloat16):
+        import torch_npu
+        shape = x.shape[:-1] + (weight.shape[0],)
+        return torch_npu.npu_linear(x.reshape(-1, x.shape[-1]), weight, bias).reshape(shape)
     return F.linear(x, weight, bias)
 
 

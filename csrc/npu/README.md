@@ -36,3 +36,10 @@ uses 8192-element tiles and up to 40 vector blocks.
 `flashrt_npu_soc_version()` exposes the compiled target. Frontends compare it
 with the active device before loading weights, matching the AMD backend's
 architecture validation contract.
+
+`flashrt_npu_rms_row_quant` fuses an optional residual addition, RMSNorm and
+frozen row quantization for 2048-wide encoder rows. The residual addition is
+rounded to BF16 before the FP32 variance reduction; the normalized value is
+also rounded to BF16 before scaling and direct INT8 output. With no addition,
+the residual input remains unchanged. Gamma is BF16 and inverse row scales
+are FP32. The caller owns all storage and the completion boundary.

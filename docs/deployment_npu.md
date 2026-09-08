@@ -51,7 +51,9 @@ before capture. An unseen prompt length reuses the calibrated language
 scale; it does not collect statistics from a serving request. The decoder
 and vision tower remain BF16, with explicit FP32 setup/reference operations.
 QKV and gate/up projections share quantized inputs while keeping separate
-GEMMs. The encoder down projection consumes INT8 produced directly by fused
+GEMMs. Their inputs come directly from fused RMSNorm and frozen row
+quantization, including the attention residual update before the MLP.
+The encoder down projection consumes INT8 produced directly by fused
 GELU, multiplication and static quantization. Decoder kernels fuse rotary
 embedding with KV writes and gated residual updates with AdaRMS normalization.
 
@@ -86,13 +88,26 @@ and heldout episodes. Judge per-sample full raw-action cosine, and also
 report the seven action channels and unnormalized robot actions. Layer
 comparisons are diagnostics, not the final accuracy gate.
 
-The corrected BF16 path passed 16 real LIBERO frames against an official
-FP32 host with minimum raw-action cosine 0.9999829. A paired vision precision
-change reduced median infer latency from about 79.4 to 71.9 ms on the tested
-machine. These timings include host image/noise upload, normalization,
-complete model execution, output unnormalization and download. They exclude
-checkpoint loading, camera resize, tokenization, calibration and capture.
-They are not a claim of a hardware limit or task-success validation.
+The INT8 path passed 56 real LIBERO frames against the independent official
+FP32 host, including 48 heldout frames and an additional 40-task coverage set.
+Eight frames from disjoint calibration episodes determine the frozen scales.
+Minimum cosine was 0.996257 for full raw actions, 0.996363 for the seven action
+channels and 0.997555 for unnormalized robot actions. These are numerical
+agreement results, not task-success measurements.
+
+On the tested 910B4, the median of per-frame latency medians was 53.52 ms
+for the 16-frame paired benchmark. The preceding producer/bias ablation in
+the same process measured 54.17 ms. The frozen corrected BF16 baseline at
+the same boundary measured 91.08 ms, giving approximately 1.70x acceleration.
+Timings include host image/noise upload, normalization, complete model
+execution, output unnormalization and download. They exclude checkpoint
+loading, camera resize, tokenization, calibration and capture.
+
+The captured profile contains 2730 device kernels, including 126 INT8 GEMMs,
+36 RMSNorm/quantization producers and 18 GELU/product/quantization producers.
+There remain 18 standalone row quantizers and 205 casts. Vendor utilization
+counters have not established normalized compute or HBM efficiency; this
+result does not establish a hardware limit or complete fusion.
 
 The historical 200-to-86 ms report used a local golden that shared model
 errors with its serving path: incorrect vision attention axes and an omitted
