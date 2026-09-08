@@ -69,3 +69,35 @@ class DecoderRope(_NativeLibrary):
         if code:
             raise RuntimeError(f"native decoder rotary rejected arguments: {code}")
         return query
+
+
+class GatedAdaRms(_NativeLibrary):
+    """FP32 residual, BF16-rounded gated update, and shifted AdaRMS output."""
+    def __init__(self):
+        super().__init__()
+        self.launch = self.library.flashrt_npu_gated_ada
+        self.launch.argtypes = [C.c_void_p] * 8 + [C.c_int] * 2
+        self.launch.restype = C.c_int
+
+    def __call__(self, residual, branch, gate, gamma, shift):
+        import torch
+        if (residual.dtype != torch.float32 or residual.ndim != 2
+                or residual.shape[1] != 1024 or not residual.is_contiguous()
+                or residual.device.type != "npu"):
+            raise ValueError("gated AdaRMS requires a contiguous FP32 NPU (rows,1024) residual")
+        tensors = [(gamma, torch.bfloat16, (1024,)), (shift, torch.float32, (1024,))]
+        if branch is not None:
+            tensors += [(branch, torch.bfloat16, residual.shape), (gate, torch.bfloat16, (1024,))]
+        for tensor, dtype, shape in tensors:
+            if (tensor is None or tensor.dtype != dtype or tensor.shape != shape
+                    or tensor.device != residual.device or not tensor.is_contiguous()):
+                raise ValueError("invalid gated AdaRMS input or style")
+        norm = torch.empty_like(residual, dtype=torch.bfloat16)
+        updated = torch.empty_like(residual) if branch is not None else residual
+        code = self.launch(torch.npu.current_stream(residual.device).npu_stream,
+            residual.data_ptr(), branch.data_ptr() if branch is not None else None,
+            gate.data_ptr() if gate is not None else None, gamma.data_ptr(), shift.data_ptr(),
+            norm.data_ptr(), updated.data_ptr(), residual.shape[0], int(branch is not None))
+        if code:
+            raise RuntimeError(f"native gated AdaRMS rejected arguments: {code}")
+        return norm, updated

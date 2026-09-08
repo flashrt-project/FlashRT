@@ -16,9 +16,10 @@ class _CapturedRunner:
 
     def __init__(self, wb, num_views: int, lang_len: int, chunk: int,
                  num_steps: int, conds, wfast=None, styles=None, wfe=None,
-                 norm_stats=None, decoder_rope=None):
+                 norm_stats=None, decoder_rope=None, ada_kernel=None):
         self.num_steps = num_steps
         self.decoder_rope = decoder_rope
+        self.ada_kernel = ada_kernel
         self.chunk = chunk
         self.num_views = num_views
         self.lang_len = lang_len
@@ -95,7 +96,7 @@ class _CapturedRunner:
                 out = npu_fast.decoder_step_fast_nocat(
                     act, self.kbufs, self.vbufs, self.wfast, attn[s], mlp[s],
                     top[s], plen, self.chunk, self.cos_t, self.sin_t,
-                    rope_kernel=self.decoder_rope)
+                    rope_kernel=self.decoder_rope, ada_kernel=self.ada_kernel)
             else:
                 out = npu_pl._decoder_step(act, cache, self.conds[s], self.wb,
                                            plen, self.chunk)

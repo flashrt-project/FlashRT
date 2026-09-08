@@ -315,7 +315,7 @@ def fill_kv_prefix(enc_cache, kbufs, vbufs, prefix_len: int) -> None:
 
 def decoder_step_fast_nocat(x_t, kbufs, vbufs, wf, style_attn, style_mlp,
                             style_top, prefix_len: int, chunk: int,
-                            cos_t=None, sin_t=None, rope_kernel=None):
+                            cos_t=None, sin_t=None, rope_kernel=None, ada_kernel=None):
     """decoder_step_fast without per-step K/V ``cat``: suffix rows are
     written in place into the preallocated buffers and one cross-attention
     runs over rows ``[0, prefix_len + chunk)``. Values are identical to the
@@ -323,9 +323,14 @@ def decoder_step_fast_nocat(x_t, kbufs, vbufs, wf, style_attn, style_mlp,
     dev = x_t.device
     use_tbl = cos_t is not None and sin_t is not None
     x = x_t
+    pending = pending_gate = None
     for i in range(DEC_L):
         p = f"{_DP}.{i}"
-        x_mod, gate_a = _ada_opt(x, style_attn[i])
+        if ada_kernel is not None:
+            gamma, shift, gate_a = style_attn[i]
+            x_mod, x = ada_kernel(x, pending, pending_gate, gamma, shift)
+        else:
+            x_mod, gate_a = _ada_opt(x, style_attn[i])
         qkv = linear(x_mod, wf[f"{p}.qkv.weight"])
         total = prefix_len + chunk
         if rope_kernel is not None:
@@ -349,14 +354,24 @@ def decoder_step_fast_nocat(x_t, kbufs, vbufs, wf, style_attn, style_mlp,
         o = attention_flash(q_rot, kbufs[i][:total], vbufs[i][:total],
                             DEC_NH, DEC_NKV)
         o = linear(o, wf[f"{p}.self_attn.o_proj.weight"])
-        x = x + o * gate_a
-        x_mod, gate_f = _ada_opt(x, style_mlp[i])
+        if ada_kernel is not None:
+            gamma, shift, gate_f = style_mlp[i]
+            x_mod, x = ada_kernel(x, o, gate_a, gamma, shift)
+        else:
+            x = x + o * gate_a
+            x_mod, gate_f = _ada_opt(x, style_mlp[i])
         gu = linear(x_mod, wf[f"{p}.gu.weight"])
         import torch_npu
         hidden = torch_npu.npu_geglu(gu, dim=-1, approximate=1, activate_left=True)[0]
         d = linear(hidden, wf[f"{p}.mlp.down_proj.weight"])
-        x = x + d * gate_f
-    x_final, _ = _ada_opt(x, style_top)
+        if ada_kernel is not None:
+            pending, pending_gate = d, gate_f
+        else:
+            x = x + d * gate_f
+    if ada_kernel is not None:
+        x_final, _ = ada_kernel(x, pending, pending_gate, style_top[0], style_top[1])
+    else:
+        x_final, _ = _ada_opt(x, style_top)
     return x_final
 
 
