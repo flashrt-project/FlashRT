@@ -4,14 +4,19 @@ import os
 from pathlib import Path
 
 
-class RowQuantizer:
+class _NativeLibrary:
     def __init__(self):
         library = os.environ.get("FLASHRT_NPU_LIBRARY")
         path = Path(library) if library else Path(__file__).parents[1] / "lib" / "libflashrt_npu.so"
         try:
             self.library = C.CDLL(str(path))
         except OSError as exc:
-            raise ImportError("Build the Ascend kernels with scripts/npu/build.sh before INT8 calibration") from exc
+            raise ImportError("Build the Ascend kernels with scripts/npu/build.sh before NPU graph construction") from exc
+
+
+class RowQuantizer(_NativeLibrary):
+    def __init__(self):
+        super().__init__()
         self.launch = self.library.flashrt_npu_quantize_rows
         self.launch.argtypes = [C.c_void_p] * 4 + [C.c_int] * 2
         self.launch.restype = C.c_int
@@ -33,3 +38,34 @@ class RowQuantizer:
         if code:
             raise RuntimeError(f"native row quantization rejected arguments: {code}")
         return out
+
+
+class DecoderRope(_NativeLibrary):
+    """Fused merged-QKV split, FP32 rotary math and in-place KV append."""
+    def __init__(self):
+        super().__init__()
+        self.launch = self.library.flashrt_npu_decoder_rope
+        self.launch.argtypes = [C.c_void_p] * 7 + [C.c_int] * 2
+        self.launch.restype = C.c_int
+
+    def __call__(self, qkv, cos, sin, keys, values, prefix):
+        import torch
+        if (qkv.dtype != torch.bfloat16 or qkv.ndim != 2 or qkv.shape[1] != 2560
+                or not qkv.is_contiguous() or qkv.device.type != "npu"):
+            raise ValueError("decoder rotary input must be a contiguous BF16 NPU (rows,2560) matrix")
+        rows = qkv.shape[0]
+        if prefix < 0 or rows <= 0:
+            raise ValueError("invalid KV prefix or action row count")
+        for tensor, dtype in ((cos, torch.float32), (sin, torch.float32),
+                               (keys, torch.bfloat16), (values, torch.bfloat16)):
+            if (tensor.dtype != dtype or not tensor.is_contiguous() or tensor.ndim != 2
+                    or tensor.shape[1] != 256 or tensor.shape[0] < prefix + rows
+                    or tensor.device != qkv.device):
+                raise ValueError("invalid rotary table or KV buffer")
+        query = torch.empty((rows, 2048), dtype=qkv.dtype, device=qkv.device)
+        code = self.launch(torch.npu.current_stream(qkv.device).npu_stream,
+            qkv.data_ptr(), cos.data_ptr(), sin.data_ptr(), query.data_ptr(),
+            keys.data_ptr(), values.data_ptr(), prefix, rows)
+        if code:
+            raise RuntimeError(f"native decoder rotary rejected arguments: {code}")
+        return query

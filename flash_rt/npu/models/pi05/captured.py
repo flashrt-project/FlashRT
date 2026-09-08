@@ -16,8 +16,9 @@ class _CapturedRunner:
 
     def __init__(self, wb, num_views: int, lang_len: int, chunk: int,
                  num_steps: int, conds, wfast=None, styles=None, wfe=None,
-                 norm_stats=None):
+                 norm_stats=None, decoder_rope=None):
         self.num_steps = num_steps
+        self.decoder_rope = decoder_rope
         self.chunk = chunk
         self.num_views = num_views
         self.lang_len = lang_len
@@ -93,7 +94,8 @@ class _CapturedRunner:
                 attn, mlp, top = self.styles
                 out = npu_fast.decoder_step_fast_nocat(
                     act, self.kbufs, self.vbufs, self.wfast, attn[s], mlp[s],
-                    top[s], plen, self.chunk, self.cos_t, self.sin_t)
+                    top[s], plen, self.chunk, self.cos_t, self.sin_t,
+                    rope_kernel=self.decoder_rope)
             else:
                 out = npu_pl._decoder_step(act, cache, self.conds[s], self.wb,
                                            plen, self.chunk)
@@ -137,7 +139,8 @@ class _CapturedRunner:
             dependencies = tuple(tensors(tuple(self.__dict__.values())))
             self.native = NativeReplay(
                 self.runtime, handle, self.stream.npu_stream,
-                owner=(g, self.stream, dependencies),
+                owner=(g, self.stream, dependencies,
+                       tuple(v for k, v in self.__dict__.items() if k != "native")),
                 inputs=[(self.host_images, self.raw_images.data_ptr()),
                         (self.host_noise, self.noise.data_ptr())],
                 outputs=[(self.out.data_ptr(), self.host_raw),

@@ -315,7 +315,7 @@ def fill_kv_prefix(enc_cache, kbufs, vbufs, prefix_len: int) -> None:
 
 def decoder_step_fast_nocat(x_t, kbufs, vbufs, wf, style_attn, style_mlp,
                             style_top, prefix_len: int, chunk: int,
-                            cos_t=None, sin_t=None):
+                            cos_t=None, sin_t=None, rope_kernel=None):
     """decoder_step_fast without per-step K/V ``cat``: suffix rows are
     written in place into the preallocated buffers and one cross-attention
     runs over rows ``[0, prefix_len + chunk)``. Values are identical to the
@@ -327,22 +327,25 @@ def decoder_step_fast_nocat(x_t, kbufs, vbufs, wf, style_attn, style_mlp,
         p = f"{_DP}.{i}"
         x_mod, gate_a = _ada_opt(x, style_attn[i])
         qkv = linear(x_mod, wf[f"{p}.qkv.weight"])
-        q, k, v = qkv.split([DEC_NH * DEC_HD, DEC_HD, DEC_HD], dim=-1)
-        if use_tbl:
-            q_rot = rope_fast(q, cos_t, sin_t, prefix_len, DEC_HD)
-            k_rot = rope_fast(k, cos_t, sin_t, prefix_len, DEC_HD)
-        else:
-            inv = _rope_inv_freqs(DEC_HD, device=dev)
-            pos = torch.arange(prefix_len, prefix_len + chunk, device=dev)
-            q_rot = rope_half_split(q, pos, inv, DEC_HD)
-            k_rot = rope_half_split(k, pos, inv, DEC_HD)
         total = prefix_len + chunk
-        if kv_store_fused_enabled() and qkv.is_contiguous():
-            _kv_cache_store_ext.kv_cache_store(
-                k_rot, qkv, kbufs[i], vbufs[i], prefix_len)
+        if rope_kernel is not None:
+            q_rot = rope_kernel(qkv, cos_t, sin_t, kbufs[i], vbufs[i], prefix_len)
         else:
-            kbufs[i][prefix_len:total].copy_(k_rot)
-            vbufs[i][prefix_len:total].copy_(v)
+            q, k, v = qkv.split([DEC_NH * DEC_HD, DEC_HD, DEC_HD], dim=-1)
+            if use_tbl:
+                q_rot = rope_fast(q, cos_t, sin_t, prefix_len, DEC_HD)
+                k_rot = rope_fast(k, cos_t, sin_t, prefix_len, DEC_HD)
+            else:
+                inv = _rope_inv_freqs(DEC_HD, device=dev)
+                pos = torch.arange(prefix_len, prefix_len + chunk, device=dev)
+                q_rot = rope_half_split(q, pos, inv, DEC_HD)
+                k_rot = rope_half_split(k, pos, inv, DEC_HD)
+            if kv_store_fused_enabled() and qkv.is_contiguous():
+                _kv_cache_store_ext.kv_cache_store(
+                    k_rot, qkv, kbufs[i], vbufs[i], prefix_len)
+            else:
+                kbufs[i][prefix_len:total].copy_(k_rot)
+                vbufs[i][prefix_len:total].copy_(v)
         o = attention_flash(q_rot, kbufs[i][:total], vbufs[i][:total],
                             DEC_NH, DEC_NKV)
         o = linear(o, wf[f"{p}.self_attn.o_proj.weight"])

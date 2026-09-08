@@ -56,6 +56,8 @@ class Pi05TorchFrontendNpu:
                  state_prompt_fixed_max_len=None, use_int8=False, **kwargs):
         from flash_rt.npu.core import device
         device.ensure_npu()
+        from flash_rt.npu.core.native_kernels import DecoderRope
+        self._decoder_rope = DecoderRope()
         ckpt = pathlib.Path(checkpoint_dir)
         self.checkpoint_dir = ckpt
         if num_views not in (2, 3):
@@ -104,6 +106,7 @@ class Pi05TorchFrontendNpu:
         self.current_prompt_len = 0
         self._lat = []
         self._current_prompt_text = None
+        self._current_state = None
         self._native_io = True
 
     # ── weight conversion ──────────────────────────────────────────────
@@ -125,6 +128,7 @@ class Pi05TorchFrontendNpu:
         self._set_lang(len(tokens), tokens)
         self.current_prompt_len = len(tokens)
         self._current_prompt_text = prompt_text
+        self._current_state = None if state is None else np.asarray(state).copy()
 
     def _tokenize(self, prompt_text: str, state) -> list:
         try:
@@ -153,7 +157,8 @@ class Pi05TorchFrontendNpu:
                                      self.chunk_size, self.num_steps,
                                      self.conds, wfast=self.wfast,
                                      styles=self.styles, wfe=self.wfe,
-                                     norm_stats=self.norm_stats if self._native_io else None)
+                                     norm_stats=self.norm_stats if self._native_io else None,
+                                     decoder_rope=self._decoder_rope)
             self._runners[lang_len] = runner
         from contextlib import nullcontext
         with runner.native.lock if runner.native is not None else nullcontext():
@@ -209,7 +214,7 @@ class Pi05TorchFrontendNpu:
             prompt = sample.get("prompt", self._current_prompt_text)
             if prompt is None:
                 raise ValueError("set a prompt or include prompt in every sample")
-            tokens = self._tokenize(str(prompt), sample.get("state"))
+            tokens = self._tokenize(str(prompt), sample.get("state", self._current_state))
             images = self._stack_observation(sample)
             noise = np.asarray(sample.get("noise", rng.standard_normal(
                 (self.chunk_size, npu_pl.ACTION_DIM))), dtype=np.float32)
@@ -222,7 +227,7 @@ class Pi05TorchFrontendNpu:
             fingerprints.append(digest.hexdigest())
             runner = _CapturedRunner(self.wb, self.num_views, len(tokens),
                 self.chunk_size, self.num_steps, self.conds, wfast=self.wfast,
-                styles=self.styles, wfe=weights)
+                styles=self.styles, wfe=weights, decoder_rope=self._decoder_rope)
             ids = torch.tensor(tokens, device="npu", dtype=torch.long)
             runner.lang.copy_(F.embedding(ids, self.wb[npu_pl._LM]) * npu_pl.ENC_D ** 0.5)
             runner.fill(images, torch.tensor(noise, device="npu"))
