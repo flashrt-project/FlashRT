@@ -43,103 +43,7 @@ logger = logging.getLogger(__name__)
 _NPU_ONLY = object()
 
 
-class _CapturedRunner:
-    """One captured full-frame execution at a fixed prompt length.
-
-    All device buffers are allocated once; between frames only the
-    image/noise contents change (``copy_`` into the same storage), which
-    is exactly what the captured graph replays.
-    """
-
-    def __init__(self, wb, num_views: int, lang_len: int, chunk: int,
-                 num_steps: int, conds, wfast=None, styles=None, wfe=None):
-        self.num_steps = num_steps
-        self.chunk = chunk
-        self.num_views = num_views
-        self.lang_len = lang_len
-        self.wb = wb
-        self.conds = conds
-        self.wfast = wfast            # merged-GEMM decoder overlay (or None)
-        self.styles = styles          # precomputed AdaRMS styles (or None)
-        self.wfe = wfe                # merged-GEMM encoder overlay (or None)
-        if wfast is not None and styles is not None:
-            plen = (num_views * npu_pl.VIS_TOKENS_PER_VIEW + lang_len)
-            self.kbufs, self.vbufs = npu_fast.make_kv_buffers(plen, chunk)
-            self.cos_t, self.sin_t = npu_fast.make_rope_tables(
-                plen + chunk, npu_pl.DEC_HD, device="npu")
-        else:
-            self.kbufs = self.vbufs = None
-            self.cos_t = self.sin_t = None
-        # one persistent zero row, expanded per call inside the fused LN
-        self.z = torch.zeros(1, npu_pl.VIS_D, dtype=torch.bfloat16,
-                             device="npu")
-        self.imgs = torch.empty(num_views, 3, npu_pl.IMG_HW, npu_pl.IMG_HW,
-                                dtype=torch.bfloat16, device="npu")
-        self.lang = torch.empty(lang_len, npu_pl.ENC_D, dtype=torch.bfloat16,
-                                device="npu")
-        self.noise = torch.empty(chunk, npu_pl.ACTION_DIM, dtype=torch.float32,
-                                 device="npu")
-        self.out = torch.empty(chunk, npu_pl.ACTION_DIM, dtype=torch.float32,
-                               device="npu")
-        self._graph = None
-
-    # -- static prefix length used by the captured graph -----------------
-    @property
-    def prefix_len(self) -> int:
-        return self.num_views * npu_pl.VIS_TOKENS_PER_VIEW + self.lang_len
-
-    def _run(self):
-        vis = npu_fast.vision_tower_opt(self.imgs, self.wb, self.z)
-        pref = torch.cat([vis, self.lang], dim=0)
-        if self.wfe is not None:
-            cache = npu_fast.encoder_pass_opt(pref, self.wfe,
-                                              self.cos_t, self.sin_t)
-        else:
-            cache = npu_pl.encoder_pass(pref, self.wb)
-        x_t = self.noise
-        plen = pref.shape[0]
-        fast = self.wfast is not None and self.styles is not None
-        if fast:
-            npu_fast.fill_kv_prefix(cache, self.kbufs, self.vbufs, plen)
-        for s in range(self.num_steps):
-            act = F.linear(x_t, self.wb["action_in_proj.weight"],
-                           self.wb["action_in_proj.bias"])
-            if fast:
-                attn, mlp, top = self.styles
-                out = npu_fast.decoder_step_fast_nocat(
-                    act, self.kbufs, self.vbufs, self.wfast, attn[s], mlp[s],
-                    top[s], plen, self.chunk, self.cos_t, self.sin_t)
-            else:
-                out = npu_pl._decoder_step(act, cache, self.conds[s], self.wb,
-                                           plen, self.chunk)
-            v = F.linear(out, self.wb["action_out_proj.weight"],
-                         self.wb["action_out_proj.bias"])
-            x_t = x_t - (1.0 / self.num_steps) * v
-        self.out.copy_(x_t)
-
-    def capture(self):
-        from flash_rt.npu.core.npu_graph import NpuGraph
-        # warm-up replays so aclnn workspace/layouts are stable before capture
-        for _ in range(3):
-            self._run()
-        torch.npu.synchronize()
-        g = NpuGraph()
-        with g:
-            self._run()
-        torch.npu.synchronize()
-        self._graph = g
-
-    def replay(self):
-        self._graph.replay()
-
-    def fill(self, imgs_norm: torch.Tensor, noise: Optional[torch.Tensor]):
-        """imgs_norm (num_views,3,224,224) on npu; noise (chunk,32) npu or None."""
-        self.imgs.copy_(imgs_norm)
-        if noise is None:
-            self.noise.normal_()
-        else:
-            self.noise.copy_(noise)
-        torch.npu.synchronize()
+from flash_rt.npu.models.pi05.captured import _CapturedRunner
 
 
 class Pi05TorchFrontendNpu:
@@ -197,6 +101,7 @@ class Pi05TorchFrontendNpu:
         self.current_prompt_len = 0
         self._lat = []
         self._current_prompt_text = None
+        self._native_io = True
 
     # ── weight conversion ──────────────────────────────────────────────
     @staticmethod
@@ -242,7 +147,8 @@ class Pi05TorchFrontendNpu:
             runner = _CapturedRunner(self.wb, self.num_views, lang_len,
                                      self.chunk_size, self.num_steps,
                                      self.conds, wfast=self.wfast,
-                                     styles=self.styles, wfe=self.wfe)
+                                     styles=self.styles, wfe=self.wfe,
+                                     norm_stats=self.norm_stats if self._native_io else None)
             self._runners[lang_len] = runner
         runner.lang.copy_(emb)
         if runner._graph is None:
@@ -288,6 +194,8 @@ class Pi05TorchFrontendNpu:
         runner = self._runners.get(self.current_prompt_len)
         if runner is None or runner._graph is None:
             raise RuntimeError("call set_prompt(...) before infer()")
+        if runner.native is not None:
+            return self._infer_native(runner, observation, noise)
         imgs = self._stack_observation(observation)
         noise_t = None
         if noise is not None:
@@ -306,6 +214,32 @@ class Pi05TorchFrontendNpu:
         unnorm = unnormalize_actions(raw, self.norm_stats)
         robot = unnorm[:, :LIBERO_ACTION_DIM]
         return {"actions": robot, "raw_actions": raw}
+
+    def _infer_native(self, runner, observation, noise):
+        images = observation.get("images")
+        if images is None:
+            keys = ("image", "wrist_image", "wrist_image_right")
+            images = [observation[key] for key in keys[:self.num_views]]
+        if len(images) != self.num_views:
+            raise ValueError(f"expected {self.num_views} camera views")
+        with runner.native.lock:
+            for index, image in enumerate(images):
+                image = np.asarray(image)
+                if image.dtype != np.uint8 or image.shape != (224, 224, 3):
+                    raise ValueError("each view must be a uint8 (224,224,3) array")
+                np.copyto(runner.host_images.array[index], image)
+            if noise is None:
+                runner.host_noise.array[:] = np.random.standard_normal(runner.host_noise.shape)
+            else:
+                noise = np.asarray(noise, dtype=np.float32)
+                if noise.shape != runner.host_noise.shape:
+                    raise ValueError(f"noise must have shape {runner.host_noise.shape}")
+                np.copyto(runner.host_noise.array, noise)
+            runner.native.execute()
+            self._lat.append(runner.native.last_replay_ms)
+            # Returned arrays own their storage and survive the next replay.
+            return {"actions": runner.host_robot.array.copy(),
+                    "raw_actions": runner.host_raw.array.copy()}
 
     # ── reports / precision ────────────────────────────────────────────
     def reference_actions(self, observation: dict, noise: Optional[np.ndarray]):
