@@ -17,3 +17,22 @@ mkdir -p "$npu_output_dir"
  -I"$npu_toolkit_root/compiler/tikcpp/tikcfw/impl" \
  -I"$npu_toolkit_root/compiler/tikcpp/tikcfw/interface" -I"$npu_toolkit_root/include" \
  -o "$npu_output_dir/libflashrt_npu.so" "$npu_repo_root/csrc/npu/dispatch_910b.cpp"
+# Mixed Cube/Vector translation unit and host tiling stay independent of torch.
+npu_arch_root="$npu_toolkit_root/$(uname -m)-linux"
+if [[ ! -d "$npu_arch_root/asc/include" ]]; then npu_arch_root="$npu_toolkit_root"; fi
+npu_tiling_object="$(mktemp "$npu_output_dir/gu_tiling.XXXXXX.o")"
+trap 'rm -f "$npu_tiling_object"' EXIT
+c++ -c -fPIC -O2 -std=c++17 \
+ -I"$npu_arch_root/asc/include" -I"$npu_arch_root/asc/include/adv_api" \
+ -I"$npu_arch_root/include" "$npu_repo_root/csrc/npu/gu_tiling.cpp" -o "$npu_tiling_object"
+"$npu_toolkit_root/bin/bisheng" -fPIC -shared -xcce -O2 -std=c++17 \
+ --cce-aicore-arch=dav-c220 \
+ -I"$npu_arch_root/asc/include" -I"$npu_arch_root/asc/include/adv_api" \
+ -I"$npu_arch_root/asc" -I"$npu_arch_root/asc/impl/basic_api" \
+ -I"$npu_arch_root/asc/impl/adv_api" -I"$npu_arch_root/include" \
+ -I"$npu_toolkit_root/compiler/tikcpp/tikcfw" \
+ -I"$npu_toolkit_root/compiler/tikcpp/tikcfw/impl" \
+ -I"$npu_toolkit_root/compiler/tikcpp/tikcfw/interface" \
+ "$npu_repo_root/csrc/npu/kernels/gu_int8_910b.cpp" -x none "$npu_tiling_object" \
+ -L"$npu_arch_root/lib64" -ltiling_api -lplatform -lregister -lascendalog -lruntime -ldl \
+ -o "$npu_output_dir/libflashrt_npu_cube.so"
