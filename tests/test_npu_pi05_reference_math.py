@@ -1,6 +1,7 @@
 """CPU checks against independent model operations, not a self-generated golden."""
 import torch
 import torch.nn.functional as F
+import pytest
 
 from flash_rt.npu.models.pi05 import pipeline
 
@@ -107,3 +108,32 @@ def test_shared_pages_preserve_bidirectional_query_attention():
     batched = F.scaled_dot_product_attention(
         q.unsqueeze(2), k[slots].unsqueeze(1), v[slots].unsqueeze(1)).squeeze(2)
     torch.testing.assert_close(batched, dense, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("queries", [3, 10])
+def test_decoder_attention_scheduling_preserves_dense_result(monkeypatch, queries):
+    import sys
+    from types import SimpleNamespace
+    from flash_rt.npu.models.pi05.attention import PagedDecoderAttention
+
+    def paged_attention(q, k, v, **options):
+        table = options["block_table"]
+        block = options["block_size"]
+        total = options["actual_seq_lengths"][0]
+        slots = (table[:, :, None] * block + torch.arange(block)).flatten(1)[:, :total]
+        return F.scaled_dot_product_attention(
+            q, k.flatten(0, 2)[slots].unsqueeze(1),
+            v.flatten(0, 2)[slots].unsqueeze(1), scale=options["scale_value"])
+
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(
+        npu_incre_flash_attention=paged_attention))
+    paging = PagedDecoderAttention.create(19, queries, device="cpu", block_size=16)
+    generator = torch.Generator().manual_seed(93)
+    q = torch.randn(queries, 8, 256, generator=generator, dtype=torch.float64)
+    k = torch.randn(paging.capacity, 256, generator=generator, dtype=torch.float64)
+    v = torch.randn(paging.capacity, 256, generator=generator, dtype=torch.float64)
+    expected = F.scaled_dot_product_attention(
+        q.transpose(0, 1)[None], k[:19][None, None], v[:19][None, None]
+    ).squeeze(0).transpose(0, 1).reshape(queries, 2048)
+    torch.testing.assert_close(paging(q.reshape(queries, 2048), k, v), expected,
+                               atol=1e-12, rtol=1e-12)
