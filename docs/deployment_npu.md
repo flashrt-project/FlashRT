@@ -121,17 +121,22 @@ and heldout episodes. Judge per-sample full raw-action cosine, and also
 report the seven action channels and unnormalized robot actions. Layer
 comparisons are diagnostics, not the final accuracy gate.
 
-The INT8 path passed 56 real LIBERO frames against the independent official
-FP32 host. Calibration used 80 real frames covering 40 tasks at house
-percentile 90, with no episode overlap with those 56 evaluation frames.
-Minimum cosine was 0.996777 for full raw actions, 0.996900 for the seven action
-channels and 0.998212 for unnormalized robot actions. Percentile selection
-used these evaluation results; they are not an untouched statistical test.
-The default percentile remains 99.9: the original eight-frame calibration
-recipe also passed all 56 frames (48 heldout), with minimum raw cosine
-0.995850. Expanding calibration to 80 frames at percentile 99.9 failed the
-E2E gate; more calibration samples alone do not guarantee better scales.
-The BF16 path passed all 56 frames with minimum raw cosine 0.999981.
+The INT8 and BF16 paths passed 96 real LIBERO frames against an independent
+official FP32 host. INT8 calibration used 80 real frames covering 40 tasks at
+house percentile 90. The first 56 evaluation frames were episode-disjoint
+from calibration but were used for percentile selection. A further 40
+frames, one per task from separate episodes, provided independent confirmation.
+The minimum cosine across all 96 frames was 0.993905 for full raw actions,
+0.993986 for the seven action channels and 0.997725 for robot actions.
+Every raw/action7 result passed the 0.99 INT8 hard gate; one confirmation
+frame did not reach the 0.995 target.
+
+The default percentile remains 99.9. The original eight-frame calibration
+recipe also passed all 96 frames (88 heldout), with minimum raw cosine
+0.993202; one confirmation frame missed the 0.995 target. Expanding
+calibration to 80 frames at percentile 99.9 failed the E2E gate. More
+calibration samples alone do not guarantee better scales. The BF16 path
+passed all 96 frames with minimum raw cosine 0.999981, above its 0.9999 gate.
 These are numerical agreement results, not task-success measurements.
 
 On the tested 910B4, the median of per-frame latency medians was 44.49 ms
