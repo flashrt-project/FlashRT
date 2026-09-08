@@ -27,6 +27,7 @@ import os
 
 import torch
 import torch.nn.functional as F
+from flash_rt.npu.core.linear import linear
 
 from flash_rt.npu.models.pi05.pipeline import (
     DEC_L, DEC_D, DEC_HD, DEC_NH, DEC_NKV, _DP, _TOP_EXP_NORM,
@@ -97,18 +98,18 @@ def make_styles(wb: dict, conds: list) -> tuple:
 
     Returns ``(attn, mlp, top)`` indexed ``[step][layer]`` / ``[step]`` with
     the raw (3072,) tensor whose chunks are (scale, shift, gate) — identical
-    values to the reference's per-call ``F.linear(cond, dense)``, computed
+    values to the reference's per-call ``linear(cond, dense)``, computed
     once outside the captured graph.
     """
     attn, mlp, top = [], [], []
     for c in conds:
-        a = [F.linear(c, wb[f"{_DP}.{i}.input_layernorm.dense.weight"],
+        a = [linear(c, wb[f"{_DP}.{i}.input_layernorm.dense.weight"],
                       wb[f"{_DP}.{i}.input_layernorm.dense.bias"])
              for i in range(DEC_L)]
-        m = [F.linear(c, wb[f"{_DP}.{i}.post_attention_layernorm.dense.weight"],
+        m = [linear(c, wb[f"{_DP}.{i}.post_attention_layernorm.dense.weight"],
                       wb[f"{_DP}.{i}.post_attention_layernorm.dense.bias"])
              for i in range(DEC_L)]
-        t = F.linear(c, wb[f"{_TOP_EXP_NORM}.weight"],
+        t = linear(c, wb[f"{_TOP_EXP_NORM}.weight"],
                      wb[f"{_TOP_EXP_NORM}.bias"])
         attn.append(a)
         mlp.append(m)
@@ -125,7 +126,7 @@ def make_styles_opt(wb: dict, conds: list) -> tuple:
     for c in conds:
         a = []
         for i in range(DEC_L):
-            s = F.linear(c, wb[f"{_DP}.{i}.input_layernorm.dense.weight"],
+            s = linear(c, wb[f"{_DP}.{i}.input_layernorm.dense.weight"],
                          wb[f"{_DP}.{i}.input_layernorm.dense.bias"])
             sc, sh, g = s.chunk(3, dim=-1)
             a.append(((1.0 + sc).to(torch.bfloat16), sh.contiguous(),
@@ -133,13 +134,13 @@ def make_styles_opt(wb: dict, conds: list) -> tuple:
         attn.append(a)
         m = []
         for i in range(DEC_L):
-            s = F.linear(c, wb[f"{_DP}.{i}.post_attention_layernorm.dense.weight"],
+            s = linear(c, wb[f"{_DP}.{i}.post_attention_layernorm.dense.weight"],
                          wb[f"{_DP}.{i}.post_attention_layernorm.dense.bias"])
             sc, sh, g = s.chunk(3, dim=-1)
             m.append(((1.0 + sc).to(torch.bfloat16), sh.contiguous(),
                       g.to(torch.bfloat16)))
         mlp.append(m)
-        s = F.linear(c, wb[f"{_TOP_EXP_NORM}.weight"],
+        s = linear(c, wb[f"{_TOP_EXP_NORM}.weight"],
                      wb[f"{_TOP_EXP_NORM}.bias"])
         sc, sh, g = s.chunk(3, dim=-1)
         top.append(((1.0 + sc).to(torch.bfloat16), sh.contiguous(),
@@ -176,7 +177,7 @@ def encoder_pass_fast(prefix_emb: torch.Tensor, wf: dict):
     for i in range(ENC_L):
         p = f"{_EP}.{i}"
         xn = rms_norm(x, wf[f"{p}.input_layernorm.weight"])
-        qkv = F.linear(xn, wf[f"{p}.qkv.weight"])
+        qkv = linear(xn, wf[f"{p}.qkv.weight"])
         q, k, v = qkv.split([ENC_NH * ENC_HD, ENC_HD, ENC_HD], dim=-1)
         q_rot = rope_half_split(q, pos, inv, ENC_HD)
         k_rot = rope_half_split(k, pos, inv, ENC_HD)
@@ -186,14 +187,13 @@ def encoder_pass_fast(prefix_emb: torch.Tensor, wf: dict):
         vh = v.reshape(S, ENC_NKV, ENC_HD).transpose(0, 1).expand(
             ENC_NH, S, ENC_HD)
         o = attention(qh, kh, vh)
-        o = F.linear(o, wf[f"{p}.self_attn.o_proj.weight"])
+        o = linear(o, wf[f"{p}.self_attn.o_proj.weight"])
         x = x + o
         xn = rms_norm(x, wf[f"{p}.post_attention_layernorm.weight"])
-        gu = F.linear(xn, wf[f"{p}.gu.weight"])
-        half = gu.shape[-1] // 2
-        g, u = gu[..., :half], gu[..., half:]
-        d = F.linear(F.gelu(g, approximate="tanh") * u,
-                     wf[f"{p}.mlp.down_proj.weight"])
+        gu = linear(xn, wf[f"{p}.gu.weight"])
+        import torch_npu
+        hidden = torch_npu.npu_geglu(gu, dim=-1, approximate=1, activate_left=True)[0]
+        d = linear(hidden, wf[f"{p}.mlp.down_proj.weight"])
         x = x + d
         cache.append((k_rot.contiguous(), v.contiguous()))
     return cache
@@ -227,18 +227,18 @@ def encoder_pass_opt(prefix_emb: torch.Tensor, wf: dict, cos_t, sin_t):
         p = f"{_EP}.{i}"
         x = x.to(torch.bfloat16)  # keep the bf16 contract (residual cast etc.)
         xn = torch_npu.npu_rms_norm(x, wf[f"{p}.gamma_a"], EPS)[0]
-        q = F.linear(xn, wf[f"{p}.self_attn.q_proj.weight"])
-        k = F.linear(xn, wf[f"{p}.self_attn.k_proj.weight"])
-        v = F.linear(xn, wf[f"{p}.self_attn.v_proj.weight"])
+        q = linear(xn, wf[f"{p}.self_attn.q_proj.weight"])
+        k = linear(xn, wf[f"{p}.self_attn.k_proj.weight"])
+        v = linear(xn, wf[f"{p}.self_attn.v_proj.weight"])
         q_rot = rope_fast(q, cos_t, sin_t, 0, ENC_HD)
         k_rot = rope_fast(k, cos_t, sin_t, 0, ENC_HD)
         o = attention_flash(q_rot, k_rot, v, ENC_NH, ENC_NKV)
-        o = F.linear(o, wf[f"{p}.self_attn.o_proj.weight"])
+        o = linear(o, wf[f"{p}.self_attn.o_proj.weight"])
         xn_ff, _, x = torch_npu.npu_add_rms_norm(x, o, wf[f"{p}.gamma_f"], EPS)
         x = x.to(torch.bfloat16)  # npu residual comes back fp32; keep bf16 chain
-        g = F.linear(xn_ff, wf[f"{p}.mlp.gate_proj.weight"])
-        u = F.linear(xn_ff, wf[f"{p}.mlp.up_proj.weight"])
-        d = F.linear(F.gelu(g, approximate="tanh") * u,
+        g = linear(xn_ff, wf[f"{p}.mlp.gate_proj.weight"])
+        u = linear(xn_ff, wf[f"{p}.mlp.up_proj.weight"])
+        d = linear(F.gelu(g, approximate="tanh") * u,
                      wf[f"{p}.mlp.down_proj.weight"])
         x = x + d
         cache.append((k_rot.contiguous(), v.contiguous()))
@@ -280,7 +280,7 @@ def decoder_step_fast(x_t, enc_cache, wf, style_attn, style_mlp, style_top,
     for i in range(DEC_L):
         p = f"{_DP}.{i}"
         x_mod, gate_a = _ada(x, style_attn[i])
-        qkv = F.linear(x_mod, wf[f"{p}.qkv.weight"])
+        qkv = linear(x_mod, wf[f"{p}.qkv.weight"])
         q, k, v = qkv.split([DEC_NH * DEC_HD, DEC_HD, DEC_HD], dim=-1)
         q_rot = rope_half_split(q, pos, inv, DEC_HD)
         k_rot = rope_half_split(k, pos, inv, DEC_HD)
@@ -292,14 +292,13 @@ def decoder_step_fast(x_t, enc_cache, wf, style_attn, style_mlp, style_top,
         vh = v_full.reshape(-1, DEC_NKV, DEC_HD).transpose(0, 1).expand(
             DEC_NH, -1, DEC_HD)
         o = attention(qh, kh, vh)
-        o = F.linear(o, wf[f"{p}.self_attn.o_proj.weight"])
+        o = linear(o, wf[f"{p}.self_attn.o_proj.weight"])
         x = x + o * gate_a
         x_mod, gate_f = _ada(x, style_mlp[i])
-        gu = F.linear(x_mod, wf[f"{p}.gu.weight"])
-        half = gu.shape[-1] // 2
-        g, u = gu[..., :half], gu[..., half:]
-        d = F.linear(F.gelu(g, approximate="tanh") * u,
-                     wf[f"{p}.mlp.down_proj.weight"])
+        gu = linear(x_mod, wf[f"{p}.gu.weight"])
+        import torch_npu
+        hidden = torch_npu.npu_geglu(gu, dim=-1, approximate=1, activate_left=True)[0]
+        d = linear(hidden, wf[f"{p}.mlp.down_proj.weight"])
         x = x + d * gate_f
     x_final, _ = _ada(x, style_top)
     return x_final
@@ -341,7 +340,7 @@ def decoder_step_fast_nocat(x_t, kbufs, vbufs, wf, style_attn, style_mlp,
     for i in range(DEC_L):
         p = f"{_DP}.{i}"
         x_mod, gate_a = _ada_opt(x, style_attn[i])
-        qkv = F.linear(x_mod, wf[f"{p}.qkv.weight"])
+        qkv = linear(x_mod, wf[f"{p}.qkv.weight"])
         q, k, v = qkv.split([DEC_NH * DEC_HD, DEC_HD, DEC_HD], dim=-1)
         if use_tbl:
             q_rot = rope_fast(q, cos_t, sin_t, prefix_len, DEC_HD)
@@ -360,14 +359,13 @@ def decoder_step_fast_nocat(x_t, kbufs, vbufs, wf, style_attn, style_mlp,
             vbufs[i][prefix_len:total].copy_(v)
         o = attention_flash(q_rot, kbufs[i][:total], vbufs[i][:total],
                             DEC_NH, DEC_NKV)
-        o = F.linear(o, wf[f"{p}.self_attn.o_proj.weight"])
+        o = linear(o, wf[f"{p}.self_attn.o_proj.weight"])
         x = x + o * gate_a
         x_mod, gate_f = _ada_opt(x, style_mlp[i])
-        gu = F.linear(x_mod, wf[f"{p}.gu.weight"])
-        half = gu.shape[-1] // 2
-        g, u = gu[..., :half], gu[..., half:]
-        d = F.linear(F.gelu(g, approximate="tanh") * u,
-                     wf[f"{p}.mlp.down_proj.weight"])
+        gu = linear(x_mod, wf[f"{p}.gu.weight"])
+        import torch_npu
+        hidden = torch_npu.npu_geglu(gu, dim=-1, approximate=1, activate_left=True)[0]
+        d = linear(hidden, wf[f"{p}.mlp.down_proj.weight"])
         x = x + d * gate_f
     x_final, _ = _ada_opt(x, style_top)
     return x_final
@@ -393,11 +391,9 @@ def rope_fast(x: torch.Tensor, cos_t: torch.Tensor, sin_t: torch.Tensor,
     R = x.shape[0]
     c = cos_t[pos0:pos0 + R][:, None, :]
     s = sin_t[pos0:pos0 + R][:, None, :]
-    x32 = x.to(torch.float32)
-    half = hd // 2
-    xr = x32.reshape(R, -1, hd)
-    rot = torch.cat([-xr[..., half:], xr[..., :half]], dim=-1)
-    return (xr * c + rot * s).reshape(x.shape).to(x.dtype)
+    import torch_npu
+    xr = x.to(torch.float32).reshape(1, R, -1, hd)
+    return torch_npu.npu_rotary_mul(xr, c.unsqueeze(0), s.unsqueeze(0)).reshape(x.shape).to(x.dtype)
 
 
 def attention_flash(q, k, v, nh: int, nkv: int) -> torch.Tensor:
@@ -449,26 +445,26 @@ def vision_tower_opt(images: torch.Tensor, w: dict, zeros: torch.Tensor):
     for i in range(VIS_L):
         xn = ln(x, w[f"{vp}.encoder.layers.{i}.layer_norm1.weight"],
                 w[f"{vp}.encoder.layers.{i}.layer_norm1.bias"])
-        q = F.linear(xn, w[f"{vp}.encoder.layers.{i}.self_attn.q_proj.weight"],
+        q = linear(xn, w[f"{vp}.encoder.layers.{i}.self_attn.q_proj.weight"],
                      w[f"{vp}.encoder.layers.{i}.self_attn.q_proj.bias"])
-        k = F.linear(xn, w[f"{vp}.encoder.layers.{i}.self_attn.k_proj.weight"],
+        k = linear(xn, w[f"{vp}.encoder.layers.{i}.self_attn.k_proj.weight"],
                      w[f"{vp}.encoder.layers.{i}.self_attn.k_proj.bias"])
-        v = F.linear(xn, w[f"{vp}.encoder.layers.{i}.self_attn.v_proj.weight"],
+        v = linear(xn, w[f"{vp}.encoder.layers.{i}.self_attn.v_proj.weight"],
                      w[f"{vp}.encoder.layers.{i}.self_attn.v_proj.bias"])
         o = vision_attention(q, k, v)
-        o = F.linear(o, w[f"{vp}.encoder.layers.{i}.self_attn.out_proj.weight"],
+        o = linear(o, w[f"{vp}.encoder.layers.{i}.self_attn.out_proj.weight"],
                      w[f"{vp}.encoder.layers.{i}.self_attn.out_proj.bias"])
         x = x + o
         res2 = x
         xn = ln(x, w[f"{vp}.encoder.layers.{i}.layer_norm2.weight"],
                 w[f"{vp}.encoder.layers.{i}.layer_norm2.bias"])
-        h = F.linear(xn, w[f"{vp}.encoder.layers.{i}.mlp.fc1.weight"],
+        h = linear(xn, w[f"{vp}.encoder.layers.{i}.mlp.fc1.weight"],
                      w[f"{vp}.encoder.layers.{i}.mlp.fc1.bias"])
         h = F.gelu(h, approximate=GELU_TANH_APPROX)
-        h = F.linear(h, w[f"{vp}.encoder.layers.{i}.mlp.fc2.weight"],
+        h = linear(h, w[f"{vp}.encoder.layers.{i}.mlp.fc2.weight"],
                      w[f"{vp}.encoder.layers.{i}.mlp.fc2.bias"])
         x = res2 + h
     x = ln(x, w[f"{vp}.post_layernorm.weight"],
            w[f"{vp}.post_layernorm.bias"])
-    x = F.linear(x, w[f"{_MP}.weight"], w[f"{_MP}.bias"])
+    x = linear(x, w[f"{_MP}.weight"], w[f"{_MP}.bias"])
     return x.reshape(nv * VIS_TOKENS_PER_VIEW, ENC_D)
