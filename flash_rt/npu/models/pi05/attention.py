@@ -28,12 +28,18 @@ class PagedDecoderAttention:
 
     def __call__(self, q, k, v):
         import torch_npu
+        # Every action query attends to the same bidirectional KV rows. Pair
+        # queries as additional heads without moving data or changing softmax's
+        # reduction domain. This geometry is tuned for the ten-action replay;
+        # other chunk sizes retain their original scheduling.
+        batch = self.queries // 2 if self.queries == 10 else self.queries
+        heads = self.queries * DEC_NH // batch
         return torch_npu.npu_incre_flash_attention(
-            q.reshape(self.queries, DEC_NH, 1, DEC_HD),
+            q.reshape(batch, heads, 1, DEC_HD),
             k.reshape(-1, DEC_NKV, self.block_size, DEC_HD),
             v.reshape(-1, DEC_NKV, self.block_size, DEC_HD),
-            num_heads=DEC_NH, num_key_value_heads=DEC_NKV,
+            num_heads=heads, num_key_value_heads=DEC_NKV,
             input_layout="BNSD", scale_value=DEC_HD ** -0.5,
-            block_table=self.table, block_size=self.block_size,
-            actual_seq_lengths=[self.total] * self.queries,
+            block_table=self.table[:batch], block_size=self.block_size,
+            actual_seq_lengths=[self.total] * batch,
             inner_precise=0).reshape(self.queries, DEC_NH * DEC_HD)
