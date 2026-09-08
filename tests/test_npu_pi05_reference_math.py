@@ -54,3 +54,28 @@ def test_encoder_output_projection_affects_next_layer_cache(monkeypatch):
     projected_cache = pipeline.encoder_pass(x, weights)
     torch.testing.assert_close(zero_cache[0][0], projected_cache[0][0])
     assert not torch.allclose(zero_cache[1][0], projected_cache[1][0])
+
+
+def test_setup_head_padding_preserves_full_attention_projection(monkeypatch):
+    from flash_rt.npu.models.pi05 import fast
+    for key, value in {"VIS_L": 1, "VIS_D": 6, "VIS_NH": 2, "VIS_HD": 3}.items():
+        monkeypatch.setattr(fast, key, value)
+    generator = torch.Generator().manual_seed(43)
+    prefix = f"{fast._VP}.encoder.layers.0.self_attn"
+    weights = {}
+    for name in ("q_proj", "k_proj", "v_proj", "out_proj"):
+        weights[f"{prefix}.{name}.weight"] = torch.randn(6, 6, generator=generator, dtype=torch.float64)
+        weights[f"{prefix}.{name}.bias"] = torch.randn(6, generator=generator, dtype=torch.float64)
+    padded = fast.make_vision_padded_weights(weights, padded_head_dim=4)
+    x = torch.randn(2, 5, 6, generator=generator, dtype=torch.float64)
+
+    def full_attention(w, width):
+        q, k, v = [F.linear(x, w[f"{prefix}.{name}.weight"], w[f"{prefix}.{name}.bias"])
+                   .reshape(2, 5, 2, width).transpose(1, 2)
+                   for name in ("q_proj", "k_proj", "v_proj")]
+        out = F.scaled_dot_product_attention(q, k, v, scale=3 ** -0.5)
+        return F.linear(out.transpose(1, 2).reshape(2, 5, 2 * width),
+                        w[f"{prefix}.out_proj.weight"], w[f"{prefix}.out_proj.bias"])
+
+    torch.testing.assert_close(full_attention(padded, 4), full_attention(weights, 3),
+                               atol=1e-12, rtol=1e-12)

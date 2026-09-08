@@ -57,6 +57,33 @@ def kv_store_fused_enabled() -> bool:
 # ── build-time weight/style preparation ───────────────────────────────
 
 
+def make_vision_padded_weights(wb: dict, padded_head_dim: int = 80) -> dict:
+    """Pad QKV outputs and attention projection inputs once at setup.
+
+    The original head dimension still determines the attention scale. Zero
+    channels contribute neither logits nor projected values, while GEMMs
+    directly produce the vendor attention kernel's aligned head layout.
+    """
+    if padded_head_dim < VIS_HD:
+        raise ValueError("padded head dimension cannot discard model channels")
+    result = dict(wb)
+    extra = padded_head_dim - VIS_HD
+    for layer in range(VIS_L):
+        prefix = f"{_VP}.encoder.layers.{layer}.self_attn"
+        for name in ("q_proj", "k_proj", "v_proj"):
+            key = f"{prefix}.{name}"
+            weight = wb[f"{key}.weight"].reshape(VIS_NH, VIS_HD, VIS_D)
+            bias = wb[f"{key}.bias"].reshape(VIS_NH, VIS_HD)
+            result[f"{key}.weight"] = F.pad(weight, (0, 0, 0, extra)).reshape(
+                VIS_NH * padded_head_dim, VIS_D).contiguous()
+            result[f"{key}.bias"] = F.pad(bias, (0, extra)).reshape(-1).contiguous()
+        key = f"{prefix}.out_proj.weight"
+        weight = wb[key].reshape(VIS_D, VIS_NH, VIS_HD)
+        result[key] = F.pad(weight, (0, extra)).reshape(
+            VIS_D, VIS_NH * padded_head_dim).contiguous()
+    return result
+
+
 def make_fast_weights(wb: dict) -> dict:
     """Shallow overlay of ``wb`` with per-decoder-layer merged GEMM weights.
 

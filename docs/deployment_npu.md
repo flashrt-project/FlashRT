@@ -57,6 +57,13 @@ The encoder down projection consumes INT8 produced directly by fused
 GELU, multiplication and static quantization. Decoder kernels fuse rotary
 embedding with KV writes and gated residual updates with AdaRMS normalization.
 
+Vision attention weights are padded at setup from 72 to 80 channels per
+head, including zero QKV bias channels and zero input columns in the output
+projection. Attention still uses the original 72-channel scale. The aligned
+GEMM outputs eliminate runtime padding, clearing and output slicing without
+changing the real-valued attention expression. Vendor kernel tiling can alter
+floating-point rounding, so the complete padded path is qualified separately.
+
 This follows the useful parts of the Orin W8A8 pipeline: row/channel scale
 separation, native quantization producers, shape-aware kernels, and immutable
 replay buffers. The Ascend implementation uses its own kernels and ABI.
@@ -91,19 +98,19 @@ comparisons are diagnostics, not the final accuracy gate.
 The INT8 path passed 56 real LIBERO frames against the independent official
 FP32 host, including 48 heldout frames and an additional 40-task coverage set.
 Eight frames from disjoint calibration episodes determine the frozen scales.
-Minimum cosine was 0.996257 for full raw actions, 0.996363 for the seven action
-channels and 0.997555 for unnormalized robot actions. These are numerical
+Minimum cosine was 0.995409 for full raw actions, 0.995540 for the seven action
+channels and 0.997636 for unnormalized robot actions. These are numerical
 agreement results, not task-success measurements.
 
-On the tested 910B4, the median of per-frame latency medians was 53.52 ms
-for the 16-frame paired benchmark. The preceding producer/bias ablation in
-the same process measured 54.17 ms. The frozen corrected BF16 baseline at
-the same boundary measured 91.08 ms, giving approximately 1.70x acceleration.
+On the tested 910B4, the median of per-frame latency medians was 51.91 ms
+for the 16-frame paired benchmark. The unpadded attention-weight ablation in
+the same process measured 53.90 ms. The frozen corrected BF16 baseline at
+the same boundary measured 91.08 ms, giving approximately 1.75x acceleration.
 Timings include host image/noise upload, normalization, complete model
 execution, output unnormalization and download. They exclude checkpoint
 loading, camera resize, tokenization, calibration and capture.
 
-The captured profile contains 2730 device kernels, including 126 INT8 GEMMs,
+The captured profile contains 2541 device kernels, including 126 INT8 GEMMs,
 36 RMSNorm/quantization producers and 18 GELU/product/quantization producers.
 There remain 18 standalone row quantizers and 205 casts. Vendor utilization
 counters have not established normalized compute or HBM efficiency; this

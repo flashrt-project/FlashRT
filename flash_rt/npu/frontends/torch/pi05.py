@@ -94,7 +94,8 @@ class Pi05TorchFrontendNpu:
 
         # weights: fp32 CPU reference kept for gating; BF16/NPU for serving
         self.wref = npu_pl.load_weights_fp32(ckpt / "model.safetensors")
-        self.wb = {k: self._to_serving(k, v) for k, v in self.wref.items()}
+        self.wb = npu_fast.make_vision_padded_weights(
+            {k: self._to_serving(k, v) for k, v in self.wref.items()})
 
         # per-step time conditioning (computed once, fp32/npu)
         self.conds = []
