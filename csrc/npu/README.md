@@ -15,3 +15,14 @@ one INT8 unit from an ideal FP32-only rounding expression.
 The 910B implementation uses 4096-element tiles for smaller dimensions and
 8192-element tiles for large dimensions, with up to 40 vector blocks. Native
 replay and memory ownership remain model-independent in `flash_rt/npu/core`.
+
+`flashrt_npu_decoder_rope` splits merged BF16 QKV, computes rotary products
+in FP32, and appends the action rows to persistent KV buffers in one launch.
+The existing prefix remains unchanged.
+
+`flashrt_npu_gated_ada` combines a gated branch update with shifted AdaRMS
+normalization for 1024-wide decoder rows. Residuals remain FP32. The branch
+product and normalized value preserve the pipeline's BF16 rounding boundaries;
+the RMS reduction uses FP32. It returns a BF16 normalized activation and,
+when a branch is present, the updated FP32 residual. All inputs and outputs
+are caller-owned and must remain alive through stream completion.

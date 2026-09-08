@@ -56,8 +56,9 @@ class Pi05TorchFrontendNpu:
                  state_prompt_fixed_max_len=None, use_int8=False, **kwargs):
         from flash_rt.npu.core import device
         device.ensure_npu()
-        from flash_rt.npu.core.native_kernels import DecoderRope
+        from flash_rt.npu.core.native_kernels import DecoderRope, GatedAdaRms
         self._decoder_rope = DecoderRope()
+        self._ada_kernel = GatedAdaRms()
         ckpt = pathlib.Path(checkpoint_dir)
         self.checkpoint_dir = ckpt
         if num_views not in (2, 3):
@@ -158,7 +159,7 @@ class Pi05TorchFrontendNpu:
                                      self.conds, wfast=self.wfast,
                                      styles=self.styles, wfe=self.wfe,
                                      norm_stats=self.norm_stats if self._native_io else None,
-                                     decoder_rope=self._decoder_rope)
+                                     decoder_rope=self._decoder_rope, ada_kernel=self._ada_kernel)
             self._runners[lang_len] = runner
         from contextlib import nullcontext
         with runner.native.lock if runner.native is not None else nullcontext():
@@ -227,7 +228,8 @@ class Pi05TorchFrontendNpu:
             fingerprints.append(digest.hexdigest())
             runner = _CapturedRunner(self.wb, self.num_views, len(tokens),
                 self.chunk_size, self.num_steps, self.conds, wfast=self.wfast,
-                styles=self.styles, wfe=weights, decoder_rope=self._decoder_rope)
+                styles=self.styles, wfe=weights, decoder_rope=self._decoder_rope,
+                ada_kernel=self._ada_kernel)
             ids = torch.tensor(tokens, device="npu", dtype=torch.long)
             runner.lang.copy_(F.embedding(ids, self.wb[npu_pl._LM]) * npu_pl.ENC_D ** 0.5)
             runner.fill(images, torch.tensor(noise, device="npu"))
