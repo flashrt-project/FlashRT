@@ -35,7 +35,8 @@ class _CapturedRunner:
         self.wfast = wfast            # merged-GEMM decoder overlay (or None)
         self.styles = styles          # precomputed AdaRMS styles (or None)
         self.attention_kernel = None
-        self.wfe = wfe                # merged-GEMM encoder overlay (or None)
+        from .quantization import prepare_encoder_mlp
+        self.wfe = prepare_encoder_mlp(wfe, num_views * npu_pl.VIS_TOKENS_PER_VIEW + lang_len)
         if wfast is not None and styles is not None:
             plen = (num_views * npu_pl.VIS_TOKENS_PER_VIEW + lang_len)
             if paged_attention:

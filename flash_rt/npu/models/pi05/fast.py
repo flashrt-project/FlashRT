@@ -266,21 +266,24 @@ def encoder_pass_opt(prefix_emb: torch.Tensor, wf: dict, cos_t, sin_t, rope_kern
         else:
             o = attention_flash(q_rot, k_rot, v, ENC_NH, ENC_NKV)
             o = linear(o, wf[f"{p}.self_attn.o_proj.weight"])
-        if f"{p}.gu.norm" in wf:
-            (g, u), x = wf[f"{p}.gu.norm"](x, o, wf[f"{p}.gamma_f"])
+        if f"{p}.mlp.native" in wf:
+            d, x = wf[f"{p}.mlp.native"](x, o, wf[f"{p}.gamma_f"])
         else:
-            xn_ff, _, x = torch_npu.npu_add_rms_norm(x, o, wf[f"{p}.gamma_f"], EPS)
-            x = x.to(torch.bfloat16)
-            if f"{p}.gu.group" in wf:
-                g, u = wf[f"{p}.gu.group"](xn_ff)
+            if f"{p}.gu.norm" in wf:
+                (g, u), x = wf[f"{p}.gu.norm"](x, o, wf[f"{p}.gamma_f"])
             else:
-                g = linear(xn_ff, wf[f"{p}.mlp.gate_proj.weight"])
-                u = linear(xn_ff, wf[f"{p}.mlp.up_proj.weight"])
-        if f"{p}.down.fused" in wf:
-            d = wf[f"{p}.down.fused"](g, u)
-        else:
-            d = linear(F.gelu(g, approximate="tanh") * u,
-                         wf[f"{p}.mlp.down_proj.weight"])
+                xn_ff, _, x = torch_npu.npu_add_rms_norm(x, o, wf[f"{p}.gamma_f"], EPS)
+                x = x.to(torch.bfloat16)
+                if f"{p}.gu.group" in wf:
+                    g, u = wf[f"{p}.gu.group"](xn_ff)
+                else:
+                    g = linear(xn_ff, wf[f"{p}.mlp.gate_proj.weight"])
+                    u = linear(xn_ff, wf[f"{p}.mlp.up_proj.weight"])
+            if f"{p}.down.fused" in wf:
+                d = wf[f"{p}.down.fused"](g, u)
+            else:
+                d = linear(F.gelu(g, approximate="tanh") * u,
+                             wf[f"{p}.mlp.down_proj.weight"])
         if defer_residual and f"{_EP}.{i + 1}.qkv.norm" in wf:
             pending = d
         else:

@@ -65,3 +65,20 @@ normalization and BF16 rounding. The 608 int32 indices encode byte offsets
 from padded 14-row HWC tiles into CHW patches; the last 20 entries are zero.
 Setup creates and retains both tables. The native call checks pointer and
 view-count arguments, then copies only the 588 valid output values per patch.
+
+`libflashrt_npu_cube.so` provides the standalone 910B INT8 gate/up path.
+Weights are packed as adjacent 512-channel gate/up blocks during setup.
+The mixed kernel uses 128×1024 tiles, overlapping Cube INT32 accumulation
+with Vector dequantization, BF16 rounding, GELU product and frozen row-scale
+INT8 quantization. The intermediate is a bounded 20 MiB GM double buffer;
+this is not a direct Cube-to-UB transfer or a claim of measured L2 residency.
+The runtime C2C control address is initialized before cross-core events.
+
+Each captured Pi0.5 runner owns its workspace and shares it only between
+its sequential encoder layers. Packed weights and calibration scales may
+be shared by runners. The down projection remains a separate INT8 GEMM.
+Calibration uses the existing real-observation statistics and precision
+specification; fusion does not introduce another scale-selection method.
+Both native libraries are built by `scripts/npu/build.sh` without CUDA,
+HIP, or a PyTorch C++ extension dependency. `FLASHRT_NPU_CUBE_LIBRARY`
+can select an alternate mixed-kernel library during setup.

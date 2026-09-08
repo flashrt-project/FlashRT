@@ -66,6 +66,16 @@ def calibrate_encoder(weights, samples, make_runner, image_rows, percentile=99.9
                 bound[key] = projection.weight
                 bound[f"{prefix}.attention.quantized"] = projection
                 attention_scales[key] = float(projection.weight.activation_scales[0].cpu())
+    if activation_producer is not None and norm_producer is not None:
+        from flash_rt.npu.core.gu_int8 import GuInt8Weights
+        for layer in range(ENC_L - 1):
+            prefix = f"{_EP}.{layer}"
+            norm = bound[f"{prefix}.gu.norm"]
+            gate, up = norm.group.weights
+            packed = GuInt8Weights.create(gate.tensor, up.tensor,
+                                          gate.weight_scales, up.weight_scales)
+            bound[f"{prefix}.mlp.native"] = NativeEncoderMlp(
+                norm, bound[f"{prefix}.mlp.down_proj.weight"], packed)
     return bound, {'samples': len(per_sample), 'percentile': percentile,
                    'method': 'sample-call max then house percentile; image-row and language-group scales',
                    'image_rows': image_rows,
@@ -124,3 +134,47 @@ class AttentionQuantProjection:
             quant_scale2=self.inverse_scale).reshape(q.shape)
         acts, _, _ = self.weight.scales_for_rows(q.shape[0], q.shape[1], q.device)
         return self.weight.project_quantized(out, acts, q.shape, q.dtype)
+
+
+@dataclass(frozen=True)
+class NativeEncoderMlp:
+    norm: RmsQuantProjection
+    down: StaticRowInt8Weight
+    packed: object
+
+    def prepare(self, rows, workspace):
+        first = self.norm.group.weights[0]
+        acts, inverse, _ = first.scales_for_rows(rows, self.packed.columns, first.tensor.device)
+        down_acts, down_inverse, _ = self.down.scales_for_rows(rows, self.packed.hidden, first.tensor.device)
+        return PreparedEncoderMlp(self.norm.producer, inverse, self.down, down_acts,
+                                  self.packed.prepare(rows, acts, down_inverse, workspace))
+
+
+@dataclass(frozen=True)
+class PreparedEncoderMlp:
+    norm: object
+    inverse: object
+    down: StaticRowInt8Weight
+    down_acts: object
+    gu: object
+
+    def __call__(self, x, other, gamma):
+        q, residual = self.norm(x, other, gamma, self.inverse)
+        hidden = self.gu(q)
+        out = self.down.project_quantized(hidden, self.down_acts, hidden.shape, x.dtype)
+        return out, residual
+
+
+def prepare_encoder_mlp(weights, rows):
+    """Each runner owns one scratch buffer, shared only by its sequential layers."""
+    if weights is None:
+        return None
+    sites = {key: value for key, value in weights.items() if isinstance(value, NativeEncoderMlp)}
+    if not sites:
+        return weights
+    first = next(iter(sites.values()))
+    workspace = torch.empty(20 * 2 * 128 * 1024, dtype=torch.int32, device=first.packed.packed.device)
+    result = dict(weights)
+    for key, value in sites.items():
+        result[key] = value.prepare(rows, workspace)
+    return result
