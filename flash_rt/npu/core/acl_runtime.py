@@ -98,6 +98,7 @@ class NativeReplay:
             runtime.call("aclrtCreateEventWithFlag", C.byref(self.end), 8)
         except Exception:
             runtime.call("aclrtDestroyEvent", self.begin)
+            self.begin = C.c_void_p()
             raise
         self.lock = threading.Lock()
         self.last_replay_ms = 0.0
