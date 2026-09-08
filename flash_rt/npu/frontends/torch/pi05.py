@@ -2,10 +2,10 @@
 
 Mirrors the AMD frontend's public contract
 (``flash_rt.amd.frontends.torch.pi05.Pi05TorchFrontendAmd``) but drives
-the plain-torch NPU pipeline in ``flash_rt/npu/models/pi05/pipeline.py``
+the captured NPU pipeline in ``flash_rt/npu/models/pi05/captured.py``
 and replaces CUDA/HIP-graph capture with ``torch.npu.graph`` capture.
 
-Execution model (BF16 only; 910/A2 has no FP8 tensor hardware):
+Execution model (BF16 or real-data calibrated static encoder INT8):
 
 - the checkpoint's BF16 weights live on the NPU;
 - ``set_prompt`` tokenizes the prompt (openpi layout, SentencePiece
@@ -53,7 +53,7 @@ class Pi05TorchFrontendNpu:
                  max_prompt_len=48, num_steps=10, vision_pool_factor=1,
                  vision_num_layers=None, cache_frames=1, use_fp8=False,
                  hardware=None, fp8_layout=None, state_prompt_mode="exact",
-                 state_prompt_fixed_max_len=None, **kwargs):
+                 state_prompt_fixed_max_len=None, use_int8=False, **kwargs):
         from flash_rt.npu.core import device
         device.ensure_npu()
         ckpt = pathlib.Path(checkpoint_dir)
@@ -63,6 +63,8 @@ class Pi05TorchFrontendNpu:
         self.num_views = num_views
         self.chunk_size = int(chunk_size)
         self.num_steps = int(num_steps)
+        self.use_int8 = bool(use_int8)
+        self._int8_calibrated = False
         if use_fp8:
             logger.warning("NPU backend has no FP8 tier; ignoring use_fp8=True")
         if vision_pool_factor != 1:
@@ -91,6 +93,7 @@ class Pi05TorchFrontendNpu:
         self.wfast = npu_fast.make_fast_weights(self.wb)
         self.styles = npu_fast.make_styles_opt(self.wb, self.conds)
         self.wfe = npu_fast.make_encoder_opt_weights(self.wb)
+        self._encoder_bf16 = dict(self.wfe)
 
         # observation normalisation stats (openpi assets or lerobot meta)
         self.norm_stats = load_norm_stats(
@@ -106,7 +109,9 @@ class Pi05TorchFrontendNpu:
     # ── weight conversion ──────────────────────────────────────────────
     @staticmethod
     def _to_serving(key: str, t: torch.Tensor) -> torch.Tensor:
-        """GEMM weights → BF16; norm/bias/dense stay FP32 (reference recipe)."""
+        """Keep serving GEMMs BF16; retain explicit FP32 setup operations."""
+        if ".vision_model.encoder.layers." in key and key.endswith(".bias"):
+            return t.to(torch.bfloat16).to("npu")
         if (".dense." in key or "layer_norm" in key or key.endswith(".bias")
                 or "patch_embedding" in key):
             return t.to(torch.float32).to("npu")
@@ -150,7 +155,13 @@ class Pi05TorchFrontendNpu:
                                      styles=self.styles, wfe=self.wfe,
                                      norm_stats=self.norm_stats if self._native_io else None)
             self._runners[lang_len] = runner
-        runner.lang.copy_(emb)
+        from contextlib import nullcontext
+        with runner.native.lock if runner.native is not None else nullcontext():
+            runner.lang.copy_(emb)
+            # Prompt updates are setup work. Finish the current-stream upload
+            # before a cached graph consumes it on its dedicated replay stream.
+            if runner._graph is not None:
+                torch.npu.current_stream().synchronize()
         if runner._graph is None:
             runner.capture()
 
@@ -175,12 +186,62 @@ class Pi05TorchFrontendNpu:
         return torch.stack(out).to("npu")                    # (nv,3,224,224)
 
     # ── serving API (mirrors the AMD frontend) ─────────────────────────
-    def calibrate(self, observations=None, **kwargs):
-        """BF16 tier needs no activation calibration; graph already captured."""
-        return None
+    def calibrate(self, observations=None, *, percentile=99.9):
+        """Freeze encoder INT8 scales from real camera observations.
+
+        Samples contain camera arrays and may supply ``prompt``, normalized
+        ``state`` and ``noise``. Missing prompts use the current prompt;
+        missing diffusion noise uses a reproducible model noise draw.
+        Call only while this frontend is idle, before serving requests.
+        """
+        if not self.use_int8:
+            return None
+        if observations is None:
+            raise ValueError("INT8 calibration requires real observations")
+        import hashlib
+        from flash_rt.npu.models.pi05.quantization import calibrate_encoder
+        from flash_rt.npu.core.native_kernels import RowQuantizer
+        quantizer = RowQuantizer()
+        fingerprints = []
+        rng = np.random.default_rng(0)
+
+        def make_runner(sample, weights):
+            prompt = sample.get("prompt", self._current_prompt_text)
+            if prompt is None:
+                raise ValueError("set a prompt or include prompt in every sample")
+            tokens = self._tokenize(str(prompt), sample.get("state"))
+            images = self._stack_observation(sample)
+            noise = np.asarray(sample.get("noise", rng.standard_normal(
+                (self.chunk_size, npu_pl.ACTION_DIM))), dtype=np.float32)
+            if noise.shape != (self.chunk_size, npu_pl.ACTION_DIM) or not np.isfinite(noise).all():
+                raise ValueError("invalid calibration diffusion noise")
+            digest = hashlib.sha256()
+            digest.update(images.cpu().numpy().tobytes())
+            digest.update(np.asarray(tokens, dtype=np.int64).tobytes())
+            digest.update(noise.tobytes())
+            fingerprints.append(digest.hexdigest())
+            runner = _CapturedRunner(self.wb, self.num_views, len(tokens),
+                self.chunk_size, self.num_steps, self.conds, wfast=self.wfast,
+                styles=self.styles, wfe=weights)
+            ids = torch.tensor(tokens, device="npu", dtype=torch.long)
+            runner.lang.copy_(F.embedding(ids, self.wb[npu_pl._LM]) * npu_pl.ENC_D ** 0.5)
+            runner.fill(images, torch.tensor(noise, device="npu"))
+            return runner
+
+        bound, report = calibrate_encoder(self._encoder_bf16, observations,
+            make_runner, self.num_views * npu_pl.VIS_TOKENS_PER_VIEW,
+            percentile, quantizer)
+        report["sample_sha256"] = fingerprints
+        self.wfe = bound
+        self._calibration_report = report
+        self._int8_calibrated = True
+        self._runners.clear()
+        if self._current_prompt_text is not None:
+            self._set_lang(len(self._current_tokens), self._current_tokens)
+        return report
 
     def calibrate_with_real_data(self, *args, **kwargs):
-        return self.calibrate()
+        return self.calibrate(*args, **kwargs)
 
     def warm_state_prompt_buckets(self, prompt_text, states, sample_observation):
         lens = []
@@ -191,6 +252,8 @@ class Pi05TorchFrontendNpu:
 
     def infer(self, observation: dict, noise: Optional[np.ndarray] = None,
               debug: bool = False):
+        if self.use_int8 and not self._int8_calibrated:
+            raise RuntimeError("call calibrate_with_real_data before INT8 inference")
         runner = self._runners.get(self.current_prompt_len)
         if runner is None or runner._graph is None:
             raise RuntimeError("call set_prompt(...) before infer()")
@@ -274,9 +337,27 @@ class Pi05TorchFrontendNpu:
 
     @property
     def precision_spec(self):
-        from flash_rt.core.precision_spec import ModelPrecisionSpec
-        # BF16 tier: no quantization, so the aggregate spec is empty.
-        return ModelPrecisionSpec(source="manual")
+        from flash_rt.core.precision_spec import ModelPrecisionSpec, PrecisionSpec
+        from flash_rt.npu.core.linear import StaticRowInt8Weight
+        if not self._int8_calibrated:
+            return ModelPrecisionSpec(source="manual")
+        spec = ModelPrecisionSpec(source="calibration")
+        report = self._calibration_report
+        for key, weight in self.wfe.items():
+            if not isinstance(weight, StaticRowInt8Weight):
+                continue
+            spec.weight_specs[key] = PrecisionSpec(dtype="int8", granularity="per_channel",
+                axis=0, scale_source="manual", scale=weight.weight_scales.cpu().numpy().copy())
+            scales = weight.activation_scales.cpu().numpy()
+            metadata = dict(dtype="int8", scale_source="calibration",
+                calibration_method=report["method"], calibration_samples=report["samples"],
+                calibration_percentile=report["percentile"])
+            spec.activation_specs[key + ".image_tokens"] = PrecisionSpec(
+                granularity="per_channel", axis=0, scale=scales[:-1].copy(), **metadata)
+            spec.activation_specs[key + ".language_tokens"] = PrecisionSpec(
+                scale=scales[-1:].copy(), **metadata)
+        spec.validate()
+        return spec
 
     # RTX-only / not-yet-ported surfaces fail loudly
     def set_rl_mode(self, *a, **k):

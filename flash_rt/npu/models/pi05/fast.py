@@ -1,23 +1,9 @@
-"""Pi0.5 NPU serving fast-path (capture-safe decoder fusion).
+"""Pi0.5 capture-time graph construction with CANN fused operators.
 
-Reference math stays untouched in ``flash_rt/npu/models/pi05/pipeline.py``
-(the fp32 CPU ``sample`` is the numeric floor the golden file is made
-from). This module is the serving-side decoder only — the largest single
-captured segment (~67% of the full frame) — and cuts graph nodes without
-touching anything that is not proven capturable:
-
-- per-layer QKV (three F.linear) merged into one GEMM over a concatenated
-  weight, and gate/up merged the same way (two F.linear per layer saved);
-- the AdaRMS ``dense`` linears that only depend on ``(step, layer)`` are
-  precomputed **outside the graph** (2 per decoder layer + 1 top, ×10
-  steps ≈ 370 full runs of a K=1024→3072 fp32 linear) and handed in as
-  static style tensors;
-- everything else (manual fp32 bmm attention, rope, cat cache append)
-  is byte-for-byte the reference recipe, so the numerics contract is only
-  as relaxed as the GEMM merge, which the fp32 reference gate holds.
-
-``encoder_pass``/``vision_tower``/``attention`` are reused unchanged from
-``pipeline``; only the decoder loop is replaced here.
+Weights, merged projections, rotary tables and timestep styles are prepared
+once. Runtime replay lives in the independent AscendCL pointer/stream layer.
+The separate CPU pipeline is a diagnostic; correctness promotion requires
+an independent full-model reference on real observations.
 """
 
 from __future__ import annotations
@@ -451,7 +437,11 @@ def vision_tower_opt(images: torch.Tensor, w: dict, zeros: torch.Tensor):
                      w[f"{vp}.encoder.layers.{i}.self_attn.k_proj.bias"])
         v = linear(xn, w[f"{vp}.encoder.layers.{i}.self_attn.v_proj.weight"],
                      w[f"{vp}.encoder.layers.{i}.self_attn.v_proj.bias"])
-        o = vision_attention(q, k, v)
+        o = torch_npu.npu_prompt_flash_attention(
+            q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16),
+            num_heads=16, num_key_value_heads=16, scale_value=72 ** -0.5,
+            input_layout="BSH", pre_tokens=2147483647, next_tokens=2147483647,
+            sparse_mode=0).to(q.dtype)
         o = linear(o, w[f"{vp}.encoder.layers.{i}.self_attn.out_proj.weight"],
                      w[f"{vp}.encoder.layers.{i}.self_attn.out_proj.bias"])
         x = x + o

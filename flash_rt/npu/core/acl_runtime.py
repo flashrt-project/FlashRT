@@ -57,12 +57,19 @@ class PinnedBuffer:
             raise ValueError("buffer size must be positive")
         runtime.call("aclrtMallocHost", C.byref(self.ptr), self.nbytes)
         self._storage = (C.c_ubyte * self.nbytes).from_address(self.ptr.value)
-        self.array = np.frombuffer(self._storage, dtype=self.dtype).reshape(shape)
+        self._array = np.frombuffer(self._storage, dtype=self.dtype).reshape(shape)
+
+    @property
+    def array(self):
+        if not self.ptr.value:
+            raise RuntimeError("pinned buffer is closed")
+        return self._array
 
     def close(self):
         if self.ptr.value:
             self.runtime.call("aclrtFreeHost", self.ptr)
             self.ptr = C.c_void_p()
+            self._array = self._storage = None
 
     def __del__(self):
         try:
@@ -94,8 +101,26 @@ class NativeReplay:
             raise
         self.lock = threading.Lock()
         self.last_replay_ms = 0.0
+        self._closed = False
+        self._pending = False
 
     def execute(self):
+        self.enqueue()
+        self.wait()
+
+    def enqueue(self):
+        """Submit fixed-address work without a CPU completion barrier."""
+        if self._closed or self._pending:
+            raise RuntimeError("replay is closed or already pending")
+        self._timed = False
+        self._pending = True
+        try:
+            self._enqueue()
+        except Exception:
+            self.wait()
+            raise
+
+    def _enqueue(self):
         rt = self.runtime
         rt.call("aclrtSetCurrentContext", self.context)
         for host, device_ptr in self.inputs:
@@ -104,20 +129,33 @@ class NativeReplay:
         rt.call("aclrtRecordEvent", self.begin, self.stream)
         rt.call("aclmdlRIExecuteAsync", self.handle, self.stream)
         rt.call("aclrtRecordEvent", self.end, self.stream)
+        self._timed = True
         for device_ptr, host in self.outputs:
             rt.call("aclrtMemcpyAsync", host.ptr, host.nbytes,
                     C.c_void_p(device_ptr), host.nbytes, 2, self.stream)
+    def wait(self):
+        """Complete host output access outside the asynchronous replay path."""
+        if not self._pending:
+            return
+        rt = self.runtime
+        rt.call("aclrtSetCurrentContext", self.context)
         rt.call("aclrtSynchronizeStream", self.stream)
+        self._pending = False
+        if not self._timed:
+            return
         elapsed = C.c_float()
         rt.call("aclrtEventElapsedTime", C.byref(elapsed), self.begin, self.end)
         self.last_replay_ms = float(elapsed.value)
 
     def close(self):
+        if getattr(self, "_pending", False):
+            self.wait()
         for name in ("begin", "end"):
             event = getattr(self, name, None)
             if event and event.value:
                 self.runtime.call("aclrtDestroyEvent", event)
                 setattr(self, name, C.c_void_p())
+        self._closed = True
 
     def __del__(self):
         try:
