@@ -230,8 +230,11 @@ def encoder_pass_opt(prefix_emb: torch.Tensor, wf: dict, cos_t, sin_t):
         else:
             g = linear(xn_ff, wf[f"{p}.mlp.gate_proj.weight"])
             u = linear(xn_ff, wf[f"{p}.mlp.up_proj.weight"])
-        d = linear(F.gelu(g, approximate="tanh") * u,
-                     wf[f"{p}.mlp.down_proj.weight"])
+        if f"{p}.down.fused" in wf:
+            d = wf[f"{p}.down.fused"](g, u)
+        else:
+            d = linear(F.gelu(g, approximate="tanh") * u,
+                         wf[f"{p}.mlp.down_proj.weight"])
         x = x + d
         cache.append((k_rot.contiguous(), v.contiguous()))
     return cache

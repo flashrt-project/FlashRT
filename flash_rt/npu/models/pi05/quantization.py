@@ -1,6 +1,7 @@
 """Real-observation static encoder calibration, outside graph replay."""
 import numpy as np
 import torch
+from dataclasses import dataclass
 
 from flash_rt.core.calibration import accumulate_amax
 from flash_rt.npu.core.linear import RowCalibrationWeight, StaticRowInt8Weight, StaticRowInt8Group
@@ -8,7 +9,7 @@ from .pipeline import _EP, ENC_L
 
 
 def calibrate_encoder(weights, samples, make_runner, image_rows, percentile=99.9,
-                      quantizer=None):
+                      quantizer=None, activation_producer=None):
     """Collect one eager sample at a time; bind immutable INT8 operands.
 
     ``make_runner(sample, observed_weights)`` owns host preprocessing and
@@ -51,7 +52,21 @@ def calibrate_encoder(weights, samples, make_runner, image_rows, percentile=99.9
                                 ("gu", ("mlp.gate_proj", "mlp.up_proj"))):
                 bound[f"{prefix}.{name}.group"] = StaticRowInt8Group.bind(
                     bound[f"{prefix}.{site}.weight"] for site in projections)
+            if activation_producer is not None:
+                bound[f"{prefix}.down.fused"] = GeluMulProjection(
+                    bound[f"{prefix}.mlp.down_proj.weight"], activation_producer)
     return bound, {'samples': len(per_sample), 'percentile': percentile,
                    'method': 'sample-call max then house percentile; image-row and language-group scales',
                    'image_rows': image_rows,
                    'amax': {key: final[index].copy() for index, key in enumerate(sites)}}
+
+
+@dataclass(frozen=True)
+class GeluMulProjection:
+    weight: StaticRowInt8Weight
+    producer: object
+
+    def __call__(self, gate, up):
+        acts, inverse, _ = self.weight.scales_for_rows(gate.shape[0], gate.shape[1], gate.device)
+        quantized = self.producer(gate, up, inverse)
+        return self.weight.project_quantized(quantized, acts, gate.shape, gate.dtype)

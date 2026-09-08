@@ -101,3 +101,31 @@ class GatedAdaRms(_NativeLibrary):
         if code:
             raise RuntimeError(f"native gated AdaRMS rejected arguments: {code}")
         return norm, updated
+
+
+class GeluMulQuant(_NativeLibrary):
+    """Tanh GELU, BF16-rounded product, then frozen row quantization."""
+    def __init__(self):
+        super().__init__()
+        self.launch = self.library.flashrt_npu_gelu_mul_quant
+        self.launch.argtypes = [C.c_void_p] * 5 + [C.c_int] * 2
+        self.launch.restype = C.c_int
+
+    def __call__(self, gate, up, inverse_scales):
+        import torch
+        if (gate.ndim != 2 or gate.dtype != torch.bfloat16 or gate.device.type != "npu"
+                or not gate.is_contiguous() or gate.shape[1] % 32):
+            raise ValueError("GELU quantization requires a contiguous BF16 NPU matrix")
+        if (up.shape != gate.shape or up.dtype != gate.dtype or up.device != gate.device
+                or not up.is_contiguous()):
+            raise ValueError("gate and up matrices must have identical layout")
+        if (inverse_scales.shape != (gate.shape[0],) or inverse_scales.dtype != torch.float32
+                or inverse_scales.device != gate.device or not inverse_scales.is_contiguous()):
+            raise ValueError("GELU quantization requires contiguous FP32 row scales")
+        out = torch.empty_like(gate, dtype=torch.int8)
+        code = self.launch(torch.npu.current_stream(gate.device).npu_stream,
+            gate.data_ptr(), up.data_ptr(), inverse_scales.data_ptr(), out.data_ptr(),
+            gate.shape[0], gate.shape[1])
+        if code:
+            raise RuntimeError(f"native GELU quantization rejected arguments: {code}")
+        return out

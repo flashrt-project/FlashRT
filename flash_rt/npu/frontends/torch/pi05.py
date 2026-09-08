@@ -54,11 +54,28 @@ class Pi05TorchFrontendNpu:
                  vision_num_layers=None, cache_frames=1, use_fp8=False,
                  hardware=None, fp8_layout=None, state_prompt_mode="exact",
                  state_prompt_fixed_max_len=None, use_int8=False, **kwargs):
+        if state_prompt_mode != "exact" or state_prompt_fixed_max_len is not None:
+            raise NotImplementedError("NPU supports exact cached prompt buckets; fixed padded prompts are not implemented")
+        if vision_num_layers not in (None, npu_pl.VIS_L):
+            raise NotImplementedError("NPU inference requires the complete vision tower")
+        if int(chunk_size) <= 0 or int(num_steps) <= 0:
+            raise ValueError("chunk_size and num_steps must be positive")
         from flash_rt.npu.core import device
         device.ensure_npu()
         from flash_rt.npu.core.native_kernels import DecoderRope, GatedAdaRms
         self._decoder_rope = DecoderRope()
         self._ada_kernel = GatedAdaRms()
+        import ctypes
+        import torch
+        try:
+            query_soc = self._decoder_rope.library.flashrt_npu_soc_version
+        except AttributeError as exc:
+            raise ImportError("Rebuild the NPU library with scripts/npu/build.sh") from exc
+        query_soc.restype = ctypes.c_char_p
+        compiled_soc = query_soc().decode()
+        running_soc = device.device_name(torch.npu.current_device())
+        if compiled_soc != running_soc:
+            raise RuntimeError(f"NPU library targets {compiled_soc}, but the current device is {running_soc}")
         ckpt = pathlib.Path(checkpoint_dir)
         self.checkpoint_dir = ckpt
         if num_views not in (2, 3):
@@ -206,7 +223,7 @@ class Pi05TorchFrontendNpu:
             raise ValueError("INT8 calibration requires real observations")
         import hashlib
         from flash_rt.npu.models.pi05.quantization import calibrate_encoder
-        from flash_rt.npu.core.native_kernels import RowQuantizer
+        from flash_rt.npu.core.native_kernels import RowQuantizer, GeluMulQuant
         quantizer = RowQuantizer()
         fingerprints = []
         rng = np.random.default_rng(0)
@@ -237,7 +254,7 @@ class Pi05TorchFrontendNpu:
 
         bound, report = calibrate_encoder(self._encoder_bf16, observations,
             make_runner, self.num_views * npu_pl.VIS_TOKENS_PER_VIEW,
-            percentile, quantizer)
+            percentile, quantizer, GeluMulQuant())
         report["sample_sha256"] = fingerprints
         self.wfe = bound
         self._calibration_report = report

@@ -19,6 +19,9 @@ compiler target (default `Ascend910B4`), and `FLASHRT_NPU_BUILD_DIR` selects
 the output directory. A nondefault library location can be supplied using
 `FLASHRT_NPU_LIBRARY`.
 
+The compiled target must match the current device. A stale library or an
+architecture mismatch fails before the checkpoint is loaded.
+
 ```python
 from flash_rt.npu.frontends.torch.pi05 import Pi05TorchFrontendNpu
 
@@ -47,6 +50,10 @@ for language tokens, first across calls within each sample and then through
 before capture. An unseen prompt length reuses the calibrated language
 scale; it does not collect statistics from a serving request. The decoder
 and vision tower remain BF16, with explicit FP32 setup/reference operations.
+QKV and gate/up projections share quantized inputs while keeping separate
+GEMMs. The encoder down projection consumes INT8 produced directly by fused
+GELU, multiplication and static quantization. Decoder kernels fuse rotary
+embedding with KV writes and gated residual updates with AdaRMS normalization.
 
 This follows the useful parts of the Orin W8A8 pipeline: row/channel scale
 separation, native quantization producers, shape-aware kernels, and immutable
@@ -59,6 +66,11 @@ prompt length. Cached prompt updates complete their producer stream before
 replay. The graph covers image normalization, all vision and encoder layers,
 all denoising steps, and action unnormalization. No temporal KV reuse or
 step reduction is enabled.
+
+Only `state_prompt_mode="exact"` is implemented: warm representative state
+prompt buckets before serving to avoid capture on a new length. Fixed padded
+prompts and reduced vision depth raise explicitly. This preserves the AMD
+frontend's API boundary without silently changing the requested behavior.
 
 Steady-state execution uses AscendCL host copies and native graph replay.
 `NativeReplay.enqueue()` submits without a CPU wait; `wait()` completes

@@ -26,3 +26,13 @@ product and normalized value preserve the pipeline's BF16 rounding boundaries;
 the RMS reduction uses FP32. It returns a BF16 normalized activation and,
 when a branch is present, the updated FP32 residual. All inputs and outputs
 are caller-owned and must remain alive through stream completion.
+
+`flashrt_npu_gelu_mul_quant` combines tanh-approximate GELU, a BF16-rounded
+gate/up product and frozen row quantization. It writes INT8 directly, avoiding
+the full GELU and product intermediates. The sigmoid form of tanh GELU is
+computed in FP32; both BF16 rounding boundaries remain explicit. The kernel
+uses 8192-element tiles and up to 40 vector blocks.
+
+`flashrt_npu_soc_version()` exposes the compiled target. Frontends compare it
+with the active device before loading weights, matching the AMD backend's
+architecture validation contract.

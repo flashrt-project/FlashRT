@@ -4,9 +4,15 @@ set -euo pipefail
 npu_repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 npu_toolkit_root="${ASCEND_TOOLKIT_HOME:-${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/latest}}"
 npu_output_dir="${FLASHRT_NPU_BUILD_DIR:-$npu_repo_root/flash_rt/npu/lib}"
+npu_soc_version="${ASCEND_SOC_VERSION:-Ascend910B4}"
+case "$npu_soc_version" in
+    Ascend910B[1-4]) ;;
+    *) echo "The native kernels require an Ascend910B compiler target" >&2; exit 1 ;;
+esac
 mkdir -p "$npu_output_dir"
 "$npu_toolkit_root/bin/bisheng" -fPIC -shared -xcce -O2 -std=c++17 \
- --cce-soc-version="${ASCEND_SOC_VERSION:-Ascend910B4}" --cce-soc-core-type=VecCore \
+ --cce-soc-version="$npu_soc_version" --cce-soc-core-type=VecCore \
+ "-DFLASHRT_NPU_SOC_VERSION=\"$npu_soc_version\"" \
  -I"$npu_toolkit_root/compiler/tikcpp/tikcfw" \
  -I"$npu_toolkit_root/compiler/tikcpp/tikcfw/impl" \
  -I"$npu_toolkit_root/compiler/tikcpp/tikcfw/interface" -I"$npu_toolkit_root/include" \
