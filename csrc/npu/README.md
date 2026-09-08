@@ -57,3 +57,11 @@ velocities, with a count divisible by 32 and a finite step in `(0,1]`. It
 promotes velocity to FP32, multiplies by the step, then subtracts separately.
 The biased GEMM's BF16 rounding precedes the update; there is no BF16 rounding
 of the scaled velocity. The native symbol rejects invalid pointers and sizes.
+
+`flashrt_npu_image_patches(stream, raw, indices, lut, output, views)` accepts
+one to three contiguous uint8 HWC224 images and writes FP32 `(views,256,588)`
+patch tokens. The FP32 LUT has 256 entries preserving the original
+normalization and BF16 rounding. The 608 int32 indices encode byte offsets
+from padded 14-row HWC tiles into CHW patches; the last 20 entries are zero.
+Setup creates and retains both tables. The native call checks pointer and
+view-count arguments, then copies only the 588 valid output values per patch.

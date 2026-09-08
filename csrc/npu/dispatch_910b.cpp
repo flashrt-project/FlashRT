@@ -4,6 +4,7 @@
 #include "kernels/decoder_rope_910b.cpp"
 #include "kernels/encoder_rope_910b.cpp"
 #include "kernels/euler_update_910b.cpp"
+#include "kernels/image_patches_910b.cpp"
 #include "kernels/gated_ada_910b.cpp"
 
 #include "kernels/gelu_quant_910b.cpp"

@@ -92,9 +92,10 @@ class Pi05TorchFrontendNpu:
         if cache_frames != 1:
             raise NotImplementedError("temporal K/V caching not ported yet")
 
-        from flash_rt.npu.core.native_kernels import EncoderRope, EulerUpdate
+        from flash_rt.npu.core.native_kernels import EncoderRope, EulerUpdate, ImagePatches
         self._encoder_rope = EncoderRope()
         self._euler_kernel = EulerUpdate()
+        self._image_patches = ImagePatches()
 
         # weights: fp32 CPU reference kept for gating; BF16/NPU for serving
         self.wref = npu_pl.load_weights_fp32(ckpt / "model.safetensors")
@@ -189,7 +190,8 @@ class Pi05TorchFrontendNpu:
                                      norm_stats=self.norm_stats if self._native_io else None,
                                      decoder_rope=self._decoder_rope, ada_kernel=self._ada_kernel,
                                      encoder_rope=self._encoder_rope, euler_kernel=self._euler_kernel,
-                                     cache_only=True, defer_residual=True, paged_attention=True)
+                                     cache_only=True, defer_residual=True, paged_attention=True,
+                                     image_patches=self._image_patches)
             self._runners[lang_len] = runner
         from contextlib import nullcontext
         with runner.native.lock if runner.native is not None else nullcontext():
