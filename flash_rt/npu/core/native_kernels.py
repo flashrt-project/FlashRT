@@ -164,7 +164,7 @@ class RmsRowQuant(_NativeLibrary):
 
 
 class EncoderRope(_NativeLibrary):
-    """FP32 half-split rotation of eight BF16 Q heads and one K head."""
+    """FP32 Q/K rotation; tables must repeat their first 128 columns."""
     def __init__(self):
         super().__init__()
         self.launch = self.library.flashrt_npu_encoder_rope
@@ -193,3 +193,29 @@ class EncoderRope(_NativeLibrary):
         if code:
             raise RuntimeError(f"native encoder RoPE rejected arguments: {code}")
         return qo, ko
+
+
+class EulerUpdate(_NativeLibrary):
+    """Promote BF16 velocity, then multiply and subtract separately in FP32."""
+    def __init__(self):
+        super().__init__()
+        self.launch = self.library.flashrt_npu_euler_update
+        self.launch.argtypes = [C.c_void_p] * 4 + [C.c_int, C.c_float]
+        self.launch.restype = C.c_int
+
+    def __call__(self, x, velocity, dt):
+        import torch
+        if (x.ndim != 2 or x.shape[1] != 32 or x.dtype != torch.float32
+                or x.device.type != "npu" or not x.is_contiguous()):
+            raise ValueError("Euler update requires contiguous FP32 NPU (rows,32) actions")
+        if (velocity.shape != x.shape or velocity.dtype != torch.bfloat16
+                or velocity.device != x.device or not velocity.is_contiguous()):
+            raise ValueError("Euler update requires matching BF16 velocity")
+        if not 0.0 < dt <= 1.0:
+            raise ValueError("Euler step must be finite and in (0,1]")
+        out = torch.empty_like(x)
+        code = self.launch(torch.npu.current_stream(x.device).npu_stream,
+            x.data_ptr(), velocity.data_ptr(), out.data_ptr(), x.numel(), dt)
+        if code:
+            raise RuntimeError(f"native Euler update rejected arguments: {code}")
+        return out

@@ -16,10 +16,15 @@ class _CapturedRunner:
 
     def __init__(self, wb, num_views: int, lang_len: int, chunk: int,
                  num_steps: int, conds, wfast=None, styles=None, wfe=None,
-                 norm_stats=None, decoder_rope=None, ada_kernel=None, encoder_rope=None):
+                 norm_stats=None, decoder_rope=None, ada_kernel=None, encoder_rope=None,
+                 euler_kernel=None, cache_only=False, defer_residual=False,
+                 paged_attention=False):
         self.num_steps = num_steps
         self.decoder_rope = decoder_rope
         self.encoder_rope = encoder_rope
+        self.euler_kernel = euler_kernel
+        self.cache_only = cache_only
+        self.defer_residual = defer_residual
         self.ada_kernel = ada_kernel
         self.chunk = chunk
         self.num_views = num_views
@@ -28,10 +33,15 @@ class _CapturedRunner:
         self.conds = conds
         self.wfast = wfast            # merged-GEMM decoder overlay (or None)
         self.styles = styles          # precomputed AdaRMS styles (or None)
+        self.attention_kernel = None
         self.wfe = wfe                # merged-GEMM encoder overlay (or None)
         if wfast is not None and styles is not None:
             plen = (num_views * npu_pl.VIS_TOKENS_PER_VIEW + lang_len)
-            self.kbufs, self.vbufs = npu_fast.make_kv_buffers(plen, chunk)
+            if paged_attention:
+                from .attention import PagedDecoderAttention
+                self.attention_kernel = PagedDecoderAttention.create(plen + chunk, chunk)
+            capacity = self.attention_kernel.capacity if self.attention_kernel else None
+            self.kbufs, self.vbufs = npu_fast.make_kv_buffers(plen, chunk, capacity)
             self.cos_t, self.sin_t = npu_fast.make_rope_tables(
                 plen + chunk, npu_pl.DEC_HD, device="npu")
         else:
@@ -82,7 +92,8 @@ class _CapturedRunner:
         pref = torch.cat([vis, self.lang], dim=0)
         if self.wfe is not None:
             cache = npu_fast.encoder_pass_opt(pref, self.wfe,
-                                              self.cos_t, self.sin_t, self.encoder_rope)
+                                              self.cos_t, self.sin_t, self.encoder_rope,
+                                              cache_only=self.cache_only, defer_residual=self.defer_residual)
         else:
             cache = npu_pl.encoder_pass(pref, self.wb)
         x_t = self.noise
@@ -98,13 +109,23 @@ class _CapturedRunner:
                 out = npu_fast.decoder_step_fast_nocat(
                     act, self.kbufs, self.vbufs, self.wfast, attn[s], mlp[s],
                     top[s], plen, self.chunk, self.cos_t, self.sin_t,
-                    rope_kernel=self.decoder_rope, ada_kernel=self.ada_kernel)
+                    rope_kernel=self.decoder_rope, ada_kernel=self.ada_kernel,
+                    attention_kernel=self.attention_kernel)
             else:
                 out = npu_pl._decoder_step(act, cache, self.conds[s], self.wb,
                                            plen, self.chunk)
-            v = F.linear(out, self.wb["action_out_proj.weight"],
-                         self.wb["action_out_proj.bias"])
-            x_t = x_t - (1.0 / self.num_steps) * v
+            if self.euler_kernel is not None:
+                import torch_npu
+                # F.linear with this mixed bias dtype returns the native
+                # BF16 biased result promoted to FP32. Keep that conversion
+                # inside the update kernel; multiply and subtract remain FP32.
+                v = torch_npu.npu_linear(out, self.wb["action_out_proj.weight"],
+                                        self.wb["action_out_proj.bias"])
+                x_t = self.euler_kernel(x_t, v, 1.0 / self.num_steps)
+            else:
+                v = F.linear(out, self.wb["action_out_proj.weight"],
+                             self.wb["action_out_proj.bias"])
+                x_t = x_t - (1.0 / self.num_steps) * v
         self.out.copy_(x_t)
         if self.norm_stats is not None:
             self.robot.copy_((self.out[:, :7].clamp(-1.0, 1.0) + 1.0) / 2.0
