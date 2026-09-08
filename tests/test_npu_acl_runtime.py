@@ -27,6 +27,21 @@ def make(runtime):
                         [(host, 4)], [(5, host)])
 
 
+def test_second_event_creation_failure_does_not_double_destroy():
+    class SecondEventFailure(Runtime):
+        def call(self, name, *args):
+            if name == "aclrtCreateEventWithFlag" and name in self.calls:
+                raise RuntimeError("second event failed")
+            super().call(name, *args)
+
+    rt = SecondEventFailure()
+    with pytest.raises(RuntimeError, match="second event failed"):
+        make(rt)
+    import gc
+    gc.collect()
+    assert rt.calls.count("aclrtDestroyEvent") == 1
+
+
 def test_enqueue_defers_completion_and_close_drains():
     rt = Runtime()
     replay = make(rt)
