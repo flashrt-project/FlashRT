@@ -132,6 +132,9 @@ class Pi05TorchFrontendNpu:
     @staticmethod
     def _to_serving(key: str, t: torch.Tensor) -> torch.Tensor:
         """Keep serving GEMMs BF16; retain explicit FP32 setup operations."""
+        if ".vision_model." in key and ("layer_norm" in key or "post_layernorm" in key):
+            # Native vision normalization always consumes BF16 parameters.
+            return t.to(torch.bfloat16).to("npu")
         if ".vision_model.encoder.layers." in key and key.endswith(".bias"):
             # Preserve BF16 bias values; native biased GEMM consumes FP32 bias.
             return t.to(torch.bfloat16).to(torch.float32).to("npu")

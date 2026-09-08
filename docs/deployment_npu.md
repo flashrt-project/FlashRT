@@ -63,6 +63,9 @@ projection. Attention still uses the original 72-channel scale. The aligned
 GEMM outputs eliminate runtime padding, clearing and output slicing without
 changing the real-valued attention expression. Vendor kernel tiling can alter
 floating-point rounding, so the complete padded path is qualified separately.
+Vision normalization parameters are converted to BF16 once during setup; a
+persistent full-size zero operand also avoids per-normalization broadcasting.
+This constant preparation was bit-exact on all 56 BF16 and 56 INT8 frames.
 
 This follows the useful parts of the Orin W8A8 pipeline: row/channel scale
 separation, native quantization producers, shape-aware kernels, and immutable
@@ -102,17 +105,17 @@ Minimum cosine was 0.995409 for full raw actions, 0.995540 for the seven action
 channels and 0.997636 for unnormalized robot actions. These are numerical
 agreement results, not task-success measurements.
 
-On the tested 910B4, the median of per-frame latency medians was 51.91 ms
-for the 16-frame paired benchmark. The unpadded attention-weight ablation in
-the same process measured 53.90 ms. The frozen corrected BF16 baseline at
-the same boundary measured 91.08 ms, giving approximately 1.75x acceleration.
+On the tested 910B4, the median of per-frame latency medians was 51.05 ms
+for the 16-frame paired benchmark. The runtime constant-conversion/broadcast ablation in
+the same process measured 51.67 ms. The frozen corrected BF16 baseline at
+the same boundary measured 91.08 ms, giving approximately 1.78x acceleration.
 Timings include host image/noise upload, normalization, complete model
 execution, output unnormalization and download. They exclude checkpoint
 loading, camera resize, tokenization, calibration and capture.
 
-The captured profile contains 2541 device kernels, including 126 INT8 GEMMs,
+The captured profile contains 2377 device kernels, including 126 INT8 GEMMs,
 36 RMSNorm/quantization producers and 18 GELU/product/quantization producers.
-There remain 18 standalone row quantizers and 205 casts. Vendor utilization
+There remain 18 standalone row quantizers and 96 casts. Vendor utilization
 counters have not established normalized compute or HBM efficiency; this
 result does not establish a hardware limit or complete fusion.
 

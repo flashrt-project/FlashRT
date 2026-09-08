@@ -37,7 +37,8 @@ class _CapturedRunner:
             self.kbufs = self.vbufs = None
             self.cos_t = self.sin_t = None
         # one persistent zero row, expanded per call inside the fused LN
-        self.z = torch.zeros(1, npu_pl.VIS_D, dtype=torch.bfloat16,
+        self.z = torch.zeros(num_views * npu_pl.VIS_TOKENS_PER_VIEW, npu_pl.VIS_D,
+                             dtype=torch.bfloat16,
                              device="npu")
         self.imgs = torch.empty(num_views, 3, npu_pl.IMG_HW, npu_pl.IMG_HW,
                                 dtype=torch.bfloat16, device="npu")
