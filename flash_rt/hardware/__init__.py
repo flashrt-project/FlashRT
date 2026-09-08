@@ -33,21 +33,34 @@ def detect_arch() -> str:
     """Return a short string identifier for the current CUDA device.
 
     Supported:
+        ``"npu"``       — Huawei Ascend via torch_npu (CANN 7/8, 910/A2+)
         ``"thor"``      — Jetson AGX Thor, SM110 (cc 11.0)
         ``"rtx_sm120"`` — RTX 5090 / DGX Spark GB10 Blackwell, SM120/SM121
         ``"rtx_sm89"``  — RTX 4090 / Ada, SM89 (cc 8.9)
         ``"rtx_sm87"``  — Jetson Orin via RTX consumer backend, SM87 (cc 8.7)
         ``"amd_cdna4"`` — AMD Instinct MI350 series, ROCm (gfx950)
 
-    Raises RuntimeError if CUDA is unavailable or the card has an
-    unsupported SM level. Deliberately strict: silently falling back to
-    the wrong backend would hide latency/correctness regressions.
+    Raises RuntimeError if no supported accelerator is available or the
+    card has an unsupported SM level. Deliberately strict: silently
+    falling back to the wrong backend would hide latency/correctness
+    regressions.
     """
     try:
         import torch
     except ImportError as e:
         raise RuntimeError(
             "FlashRT requires PyTorch for GPU detection") from e
+    # Ascend NPU (torch_npu). Routed before CUDA because on a CANN box
+    # ``torch.cuda.is_available()`` is False while ``torch.npu`` exists.
+    # Importing torch_npu registers the ``torch.npu`` namespace; on a
+    # non-Ascend machine the import simply fails and we fall through.
+    try:
+        import torch_npu  # noqa: F401
+        npu_available = bool(torch.npu.is_available())
+    except Exception:
+        npu_available = False
+    if npu_available:
+        return "npu"
     if not torch.cuda.is_available():
         raise RuntimeError(
             "FlashRT requires a CUDA- or ROCm-capable GPU "
@@ -91,6 +104,8 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
         ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
     ("pi05", "torch", "amd_cdna4"):
         ("flash_rt.amd.frontends.torch.pi05", "Pi05TorchFrontendAmd"),
+    ("pi05", "torch", "npu"):
+        ("flash_rt.npu.frontends.torch.pi05", "Pi05TorchFrontendNpu"),
     ("pi05", "torch", "rtx_sm89"):
         ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
     ("pi05", "jax", "thor"):
