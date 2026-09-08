@@ -695,6 +695,25 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 "or: cmake -B build-amd -S csrc/amd -DGPU_ARCH=gfx950 && "
                 "cmake --build build-amd -j\n"
                 "See docs/deployment_amd.md.") from exc
+    elif arch == "npu":
+        # Ascend NPU backend runs on torch_npu ops (aclnn); no C++
+        # extension is built or required. 910/A2+ parts have no FP8
+        # tensor hardware, so the default use_fp8=True is coerced to the
+        # BF16 tier with a warning rather than silently executing a
+        # precision the part cannot honour.
+        try:
+            import torch_npu  # noqa: F401
+        except ImportError as exc:
+            raise ImportError(
+                "the 'npu' backend requires the CANN/torch_npu runtime "
+                "(import torch_npu failed). Install torch_npu matching "
+                "the installed CANN toolkit before loading a model with "
+                "hardware='npu'.") from exc
+        if use_fp8:
+            use_fp8 = False
+            logger.warning(
+                "Ascend NPU backend: FP8 is not available on 910/A2 parts "
+                "(no FP8 tensor hardware); falling back to the BF16 tier.")
     else:
         from flash_rt import _extensions
         _extensions.require(config=config)
