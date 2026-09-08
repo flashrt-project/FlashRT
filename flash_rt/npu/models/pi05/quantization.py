@@ -3,8 +3,8 @@ import numpy as np
 import torch
 
 from flash_rt.core.calibration import accumulate_amax
-from flash_rt.npu.core.linear import RowCalibrationWeight, StaticRowInt8Weight
-from .pipeline import _EP
+from flash_rt.npu.core.linear import RowCalibrationWeight, StaticRowInt8Weight, StaticRowInt8Group
+from .pipeline import _EP, ENC_L
 
 
 def calibrate_encoder(weights, samples, make_runner, image_rows, percentile=99.9,
@@ -45,6 +45,12 @@ def calibrate_encoder(weights, samples, make_runner, image_rows, percentile=99.9
         for index, (key, observer) in enumerate(sites.items()):
             bound[key] = StaticRowInt8Weight.bind(observer.tensor, final[index],
                                                   image_rows, quantizer)
+        for layer in range(ENC_L):
+            prefix = f"{_EP}.{layer}"
+            for name, projections in (("qkv", ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj")),
+                                ("gu", ("mlp.gate_proj", "mlp.up_proj"))):
+                bound[f"{prefix}.{name}.group"] = StaticRowInt8Group.bind(
+                    bound[f"{prefix}.{site}.weight"] for site in projections)
     return bound, {'samples': len(per_sample), 'percentile': percentile,
                    'method': 'sample-call max then house percentile; image-row and language-group scales',
                    'image_rows': image_rows,

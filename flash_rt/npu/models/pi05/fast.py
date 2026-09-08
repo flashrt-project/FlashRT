@@ -203,8 +203,8 @@ def make_encoder_opt_weights(wb: dict) -> dict:
 def encoder_pass_opt(prefix_emb: torch.Tensor, wf: dict, cos_t, sin_t):
     """Encoder with fused norm ops and table-based rope: ``npu_rms_norm``
     for the pre-attention norm and ``npu_add_rms_norm`` for the
-    post-attention residual+norm. QKV/GateUp stay separate (merging was
-    measured slower). Same cache contract as pipeline.encoder_pass."""
+    post-attention residual+norm. Static INT8 groups share input quantization
+    while keeping separate GEMMs. Same cache contract as pipeline.encoder_pass."""
     import torch_npu
     S = prefix_emb.shape[0]
     x = prefix_emb
@@ -213,17 +213,23 @@ def encoder_pass_opt(prefix_emb: torch.Tensor, wf: dict, cos_t, sin_t):
         p = f"{_EP}.{i}"
         x = x.to(torch.bfloat16)  # keep the bf16 contract (residual cast etc.)
         xn = torch_npu.npu_rms_norm(x, wf[f"{p}.gamma_a"], EPS)[0]
-        q = linear(xn, wf[f"{p}.self_attn.q_proj.weight"])
-        k = linear(xn, wf[f"{p}.self_attn.k_proj.weight"])
-        v = linear(xn, wf[f"{p}.self_attn.v_proj.weight"])
+        if f"{p}.qkv.group" in wf:
+            q, k, v = wf[f"{p}.qkv.group"](xn)
+        else:
+            q = linear(xn, wf[f"{p}.self_attn.q_proj.weight"])
+            k = linear(xn, wf[f"{p}.self_attn.k_proj.weight"])
+            v = linear(xn, wf[f"{p}.self_attn.v_proj.weight"])
         q_rot = rope_fast(q, cos_t, sin_t, 0, ENC_HD)
         k_rot = rope_fast(k, cos_t, sin_t, 0, ENC_HD)
         o = attention_flash(q_rot, k_rot, v, ENC_NH, ENC_NKV)
         o = linear(o, wf[f"{p}.self_attn.o_proj.weight"])
         xn_ff, _, x = torch_npu.npu_add_rms_norm(x, o, wf[f"{p}.gamma_f"], EPS)
         x = x.to(torch.bfloat16)  # npu residual comes back fp32; keep bf16 chain
-        g = linear(xn_ff, wf[f"{p}.mlp.gate_proj.weight"])
-        u = linear(xn_ff, wf[f"{p}.mlp.up_proj.weight"])
+        if f"{p}.gu.group" in wf:
+            g, u = wf[f"{p}.gu.group"](xn_ff)
+        else:
+            g = linear(xn_ff, wf[f"{p}.mlp.gate_proj.weight"])
+            u = linear(xn_ff, wf[f"{p}.mlp.up_proj.weight"])
         d = linear(F.gelu(g, approximate="tanh") * u,
                      wf[f"{p}.mlp.down_proj.weight"])
         x = x + d

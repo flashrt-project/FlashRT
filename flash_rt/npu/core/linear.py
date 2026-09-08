@@ -126,7 +126,7 @@ class StaticRowInt8Weight:
         quantized = (weight.float() / scales[:, None]).round().clamp(-127, 127).to(torch.int8)
         return cls(quantized.contiguous().t(), acts, scales, image_rows, {}, quantizer)
 
-    def __call__(self, x, bias=None):
+    def quantize_input(self, x):
         import torch_npu
         flat = x.reshape(-1, x.shape[-1])
         rows = flat.shape[0]
@@ -143,7 +143,39 @@ class StaticRowInt8Weight:
                                        None, torch.qint8, axis=-1, div_mode=False)
         else:
             q = self.quantizer(flat, inverse)
+        return q, acts
+
+    def project_quantized(self, q, acts, shape, dtype, bias=None):
+        import torch_npu
         out = torch_npu.npu_quant_matmul(q, self.tensor, self.weight_scales,
                                         pertoken_scale=acts, output_dtype=torch.bfloat16)
-        out = out.reshape(x.shape[:-1] + (self.tensor.shape[-1],)).to(x.dtype)
+        out = out.reshape(shape[:-1] + (self.tensor.shape[-1],)).to(dtype)
         return out if bias is None else out + bias
+
+    def __call__(self, x, bias=None):
+        q, acts = self.quantize_input(x)
+        return self.project_quantized(q, acts, x.shape, x.dtype, bias)
+
+
+@dataclass(frozen=True)
+class StaticRowInt8Group:
+    """Share one frozen input quantization across separate native GEMMs."""
+    weights: tuple
+
+    @classmethod
+    def bind(cls, weights):
+        weights = tuple(weights)
+        if not weights or not all(isinstance(w, StaticRowInt8Weight) for w in weights):
+            raise ValueError("group requires static row INT8 weights")
+        first = weights[0]
+        for weight in weights[1:]:
+            if (weight.image_rows != first.image_rows
+                    or weight.tensor.shape[0] != first.tensor.shape[0]
+                    or weight.tensor.device != first.tensor.device
+                    or not torch.equal(weight.activation_scales, first.activation_scales)):
+                raise ValueError("shared quantization requires identical input scales and layout")
+        return cls(weights)
+
+    def __call__(self, x):
+        q, acts = self.weights[0].quantize_input(x)
+        return tuple(w.project_quantized(q, acts, x.shape, x.dtype) for w in self.weights)
