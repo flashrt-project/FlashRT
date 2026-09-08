@@ -1,3 +1,10 @@
+> Historical experiment notes. The old local golden shared a vision attention
+> layout error and a missing encoder output projection with the serving path.
+> Its correctness and speedup claims do not qualify the corrected model.
+> Earlier custom-vector failures also do not establish hardware limitations:
+> the standalone BF16-input/FP32-compute row quantizer now executes on Ascend.
+> See [current deployment contract](deployment_npu.md).
+
 # Pi0.5 Ascend NPU L3 Fusion Programme (reuse-first + custom-kernel gaps)
 
 > STATUS NOTE (2026-09-08): L3-P0 official-op fusions are all landed at

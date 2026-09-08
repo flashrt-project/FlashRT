@@ -120,11 +120,24 @@ class _CapturedRunner:
         self._graph = g
         if self.norm_stats is not None:
             from flash_rt.npu.core.acl_runtime import NativeReplay
-            # The native borrower retains the graph owner, not this runner,
-            # avoiding a graph/runner ownership cycle.
+            # Snapshot every external tensor dependency, including weights
+            # and setup constants. The borrower can outlive this runner.
+            def tensors(value):
+                if isinstance(value, torch.Tensor):
+                    yield value
+                elif isinstance(value, dict):
+                    for item in value.values():
+                        yield from tensors(item)
+                elif isinstance(value, (tuple, list)):
+                    for item in value:
+                        yield from tensors(item)
+                elif hasattr(value, "__dataclass_fields__"):
+                    for name in value.__dataclass_fields__:
+                        yield from tensors(getattr(value, name))
+            dependencies = tuple(tensors(tuple(self.__dict__.values())))
             self.native = NativeReplay(
                 self.runtime, handle, self.stream.npu_stream,
-                owner=(g, self.stream, self.raw_images, self.noise, self.out, self.robot),
+                owner=(g, self.stream, dependencies),
                 inputs=[(self.host_images, self.raw_images.data_ptr()),
                         (self.host_noise, self.noise.data_ptr())],
                 outputs=[(self.out.data_ptr(), self.host_raw),

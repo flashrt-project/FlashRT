@@ -1,3 +1,10 @@
+> Historical experiment notes. The old local golden shared a vision attention
+> layout error and a missing encoder output projection with the serving path.
+> Its correctness and speedup claims do not qualify the corrected model.
+> Earlier custom-vector failures also do not establish hardware limitations:
+> the standalone BF16-input/FP32-compute row quantizer now executes on Ascend.
+> See [current deployment contract](deployment_npu.md).
+
 # Pi0.5 NPU inference: optimisation report from ~200 ms to ~86 ms (M1/M2/L1 + L3-P0 closure)
 
 Date: 2026-09-08 · Hardware: Ascend 910B4 (Atlas 800I A2) · CANN 8.5.2 ·

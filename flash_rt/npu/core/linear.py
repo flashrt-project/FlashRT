@@ -46,7 +46,7 @@ class StaticInt8Weight:
         weight_scale = max(float(weight.float().abs().amax().cpu()) / 127.0, 1e-12)
         quantized = (weight.float() / weight_scale).round().clamp(-127, 127).to(torch.int8)
         # CANN consumes logical (K,N); packing is setup-only.
-        quantized = quantized.t().contiguous()
+        quantized = quantized.contiguous().t()
         scales = torch.full((weight.shape[1],), 1.0 / act_scale,
                             dtype=torch.float32, device=weight.device)
         # Compute the descale product once in FP32, as the house contract requires.
@@ -70,6 +70,80 @@ class StaticInt8Weight:
 
 def linear(x, weight, bias=None):
     """Resolve a setup-time binding while constructing a captured graph."""
-    if isinstance(weight, (CalibrationWeight, StaticInt8Weight)):
+    if isinstance(weight, (CalibrationWeight, StaticInt8Weight, StaticRowInt8Weight)):
         return weight(x, bias)
     return F.linear(x, weight, bias)
+
+
+@dataclass
+class RowCalibrationWeight(CalibrationWeight):
+    image_rows: int = 0
+
+    @classmethod
+    def create(cls, tensor, name, image_rows):
+        return cls(tensor, name, torch.zeros(image_rows + 1, device=tensor.device),
+                   image_rows=image_rows)
+
+    def __call__(self, x, bias=None):
+        rows = x.float().abs().reshape(-1, x.shape[-1]).amax(-1)
+        if rows.numel() <= self.image_rows:
+            raise ValueError("calibration requires image and language tokens")
+        # Camera token positions have individual scales. Language tokens
+        # share a conservative scale across positions and prompt lengths.
+        values = torch.cat((rows[:self.image_rows], rows[self.image_rows:].amax().view(1)))
+        self.amax.copy_(torch.maximum(self.amax, values))
+        self.calls += 1
+        return F.linear(x, self.tensor, bias)
+
+
+@dataclass(frozen=True)
+class StaticRowInt8Weight:
+    """Static token-row activations and output-channel INT8 weights.
+
+    Buckets are prepared during warmup before graph capture. No reduction or
+    scale update occurs in captured execution. Language rows share the last
+    calibration scale, so an unseen prompt length needs no invented samples.
+    """
+    tensor: torch.Tensor
+    activation_scales: torch.Tensor
+    weight_scales: torch.Tensor
+    image_rows: int
+    buckets: dict
+    quantizer: object = None
+
+    @classmethod
+    def bind(cls, weight, activation_amax, image_rows, quantizer=None):
+        import numpy as np
+        amax = np.asarray(activation_amax, dtype=np.float32)
+        if amax.shape != (image_rows + 1,) or not np.isfinite(amax).all() or (amax < 0).any():
+            raise ValueError("invalid real-data activation statistics")
+        if weight.ndim != 2:
+            raise ValueError("linear weight must be a matrix")
+        acts = torch.as_tensor(amax.copy(), device=weight.device).clamp_min(1e-10) / 127.0
+        scales = (weight.float().abs().amax(-1) / 127.0).clamp_min(1e-10)
+        if not bool(torch.isfinite(scales).all().cpu()):
+            raise ValueError("weight contains nonfinite values")
+        quantized = (weight.float() / scales[:, None]).round().clamp(-127, 127).to(torch.int8)
+        return cls(quantized.contiguous().t(), acts, scales, image_rows, {}, quantizer)
+
+    def __call__(self, x, bias=None):
+        import torch_npu
+        flat = x.reshape(-1, x.shape[-1])
+        rows = flat.shape[0]
+        if rows <= self.image_rows:
+            raise ValueError("expected image and language token rows")
+        if rows not in self.buckets:
+            acts = torch.cat((self.activation_scales[:self.image_rows],
+                              self.activation_scales[-1:].expand(rows - self.image_rows)))
+            self.buckets[rows] = (acts, acts.reciprocal().contiguous(),
+                                  torch.ones(flat.shape[-1], device=x.device))
+        acts, inverse, ones = self.buckets[rows]
+        if self.quantizer is None:
+            q = torch_npu.npu_quantize(flat.float() * inverse[:, None], ones,
+                                       None, torch.qint8, axis=-1, div_mode=False)
+        else:
+            q = self.quantizer(flat, inverse)
+        out = torch_npu.npu_quant_matmul(q, self.tensor, self.weight_scales,
+                                        pertoken_scale=acts, output_dtype=torch.bfloat16)
+        out = out.reshape(x.shape[:-1] + (self.tensor.shape[-1],)).to(x.dtype)
+        return out if bias is None else out + bias
