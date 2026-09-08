@@ -33,6 +33,7 @@ ENC_L, ENC_D, ENC_H, ENC_NH, ENC_NKV, ENC_HD = 18, 2048, 16384, 8, 1, 256
 DEC_L, DEC_D, DEC_H, DEC_NH, DEC_NKV, DEC_HD = 18, 1024, 4096, 8, 1, 256
 ACTION_DIM = 32
 NUM_STEPS_DEFAULT = 10
+CHUNK_DEFAULT = 10
 IMG_HW = 224
 EPS = 1e-6
 ROPE_THETA = 10000.0
@@ -64,7 +65,7 @@ def load_weights_fp32(path: str) -> dict:
     out = {}
     with safe_open(path, framework="pt") as f:
         for k in keys:
-            raw = f.get_tensor(k if not strip else k[len("model."):])
+            raw = f.get_tensor(k)
             out[k[len("model."):] if strip else k] = raw.to(torch.float32)
     return out
 
@@ -142,6 +143,22 @@ def attention(q, k, v, mask=None, scale=None):
     return o.transpose(0, 1).reshape(o.shape[1], -1).to(q.dtype)
 
 
+def vision_attention(q, k, v, num_heads: int = VIS_NH):
+    """Independent image attention with explicit batch, token and head axes.
+
+    Input and output are (views, tokens, width). Folding contiguous tokens
+    directly into heads changes which tokens attend to one another.
+    """
+    batch, tokens, width = q.shape
+    head_dim = width // num_heads
+    def heads(x):
+        return x.reshape(batch, tokens, num_heads, head_dim).transpose(1, 2)
+    qh, kh, vh = heads(q), heads(k), heads(v)
+    logits = (qh.float() @ kh.float().transpose(-1, -2)) * (head_dim ** -0.5)
+    out = logits.softmax(dim=-1).to(vh.dtype) @ vh
+    return out.transpose(1, 2).reshape(batch, tokens, width)
+
+
 def time_embedding(t: float, dim: int) -> torch.Tensor:
     """openpi sinusoidal time embedding (fp64), fp32 (dim,)."""
     half = dim // 2
@@ -182,12 +199,7 @@ def vision_tower(images: torch.Tensor, w: dict) -> torch.Tensor:
                      w[f"{vp}.encoder.layers.{i}.self_attn.k_proj.bias"])
         v = F.linear(xn, w[f"{vp}.encoder.layers.{i}.self_attn.v_proj.weight"],
                      w[f"{vp}.encoder.layers.{i}.self_attn.v_proj.bias"])
-        # fold the nv views into the head axis: independent per-view attention
-        q = q.reshape(nv * VIS_NH, -1, VIS_HD)
-        k = k.reshape(nv * VIS_NH, -1, VIS_HD)
-        v = v.reshape(nv * VIS_NH, -1, VIS_HD)
-        o = attention(q, k, v)                       # (S, nv*1152)
-        o = o.reshape(nv, -1, VIS_D)
+        o = vision_attention(q, k, v)
         o = F.linear(o, w[f"{vp}.encoder.layers.{i}.self_attn.out_proj.weight"],
                      w[f"{vp}.encoder.layers.{i}.self_attn.out_proj.bias"])
         x = x + o
@@ -235,6 +247,7 @@ def encoder_pass(prefix_emb: torch.Tensor, w: dict):
         kh = k_rot.reshape(S, ENC_NKV, ENC_HD).transpose(0, 1).expand(ENC_NH, S, ENC_HD)
         vh = v.reshape(S, ENC_NKV, ENC_HD).transpose(0, 1).expand(ENC_NH, S, ENC_HD)
         o = attention(qh, kh, vh)                                    # (S,2048)
+        o = F.linear(o, w[f"{_EP}.{i}.self_attn.o_proj.weight"])
         x = x + o
         xn = rms_norm(x, w[f"{_EP}.{i}.post_attention_layernorm.weight"])
         g = F.linear(xn, w[f"{_EP}.{i}.mlp.gate_proj.weight"])

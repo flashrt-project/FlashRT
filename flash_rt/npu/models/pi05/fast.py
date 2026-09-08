@@ -33,7 +33,7 @@ from flash_rt.npu.models.pi05.pipeline import (
     ENC_L, ENC_D, ENC_HD, ENC_NH, ENC_NKV, _EP,
     VIS_L, VIS_D, VIS_NH, VIS_HD, VIS_TOKENS_PER_VIEW, _VP, _MP,
     GELU_TANH_APPROX,
-    EPS, rope_half_split, attention, rms_norm, _rope_inv_freqs,
+    EPS, rope_half_split, attention, vision_attention, rms_norm, _rope_inv_freqs,
 )
 
 # Optional fused K/V suffix-store kernel (option-c library, 16-bit copy
@@ -186,6 +186,7 @@ def encoder_pass_fast(prefix_emb: torch.Tensor, wf: dict):
         vh = v.reshape(S, ENC_NKV, ENC_HD).transpose(0, 1).expand(
             ENC_NH, S, ENC_HD)
         o = attention(qh, kh, vh)
+        o = F.linear(o, wf[f"{p}.self_attn.o_proj.weight"])
         x = x + o
         xn = rms_norm(x, wf[f"{p}.post_attention_layernorm.weight"])
         gu = F.linear(xn, wf[f"{p}.gu.weight"])
@@ -232,6 +233,7 @@ def encoder_pass_opt(prefix_emb: torch.Tensor, wf: dict, cos_t, sin_t):
         q_rot = rope_fast(q, cos_t, sin_t, 0, ENC_HD)
         k_rot = rope_fast(k, cos_t, sin_t, 0, ENC_HD)
         o = attention_flash(q_rot, k_rot, v, ENC_NH, ENC_NKV)
+        o = F.linear(o, wf[f"{p}.self_attn.o_proj.weight"])
         xn_ff, _, x = torch_npu.npu_add_rms_norm(x, o, wf[f"{p}.gamma_f"], EPS)
         x = x.to(torch.bfloat16)  # npu residual comes back fp32; keep bf16 chain
         g = F.linear(xn_ff, wf[f"{p}.mlp.gate_proj.weight"])
@@ -453,11 +455,7 @@ def vision_tower_opt(images: torch.Tensor, w: dict, zeros: torch.Tensor):
                      w[f"{vp}.encoder.layers.{i}.self_attn.k_proj.bias"])
         v = F.linear(xn, w[f"{vp}.encoder.layers.{i}.self_attn.v_proj.weight"],
                      w[f"{vp}.encoder.layers.{i}.self_attn.v_proj.bias"])
-        q = q.reshape(nv * VIS_NH, -1, VIS_HD)
-        k = k.reshape(nv * VIS_NH, -1, VIS_HD)
-        v = v.reshape(nv * VIS_NH, -1, VIS_HD)
-        o = attention(q, k, v)
-        o = o.reshape(nv, -1, VIS_D)
+        o = vision_attention(q, k, v)
         o = F.linear(o, w[f"{vp}.encoder.layers.{i}.self_attn.out_proj.weight"],
                      w[f"{vp}.encoder.layers.{i}.self_attn.out_proj.bias"])
         x = x + o
