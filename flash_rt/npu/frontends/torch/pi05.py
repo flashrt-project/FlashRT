@@ -92,8 +92,9 @@ class Pi05TorchFrontendNpu:
         if cache_frames != 1:
             raise NotImplementedError("temporal K/V caching not ported yet")
 
-        from flash_rt.npu.core.native_kernels import EncoderRope
+        from flash_rt.npu.core.native_kernels import EncoderRope, EulerUpdate
         self._encoder_rope = EncoderRope()
+        self._euler_kernel = EulerUpdate()
 
         # weights: fp32 CPU reference kept for gating; BF16/NPU for serving
         self.wref = npu_pl.load_weights_fp32(ckpt / "model.safetensors")
@@ -135,6 +136,8 @@ class Pi05TorchFrontendNpu:
     @staticmethod
     def _to_serving(key: str, t: torch.Tensor) -> torch.Tensor:
         """Keep serving GEMMs BF16; retain explicit FP32 setup operations."""
+        if key == "action_in_proj.weight":
+            return t.to(torch.bfloat16).to(torch.float32).to("npu")
         if ".vision_model." in key and ("layer_norm" in key or "post_layernorm" in key):
             # Native vision normalization always consumes BF16 parameters.
             return t.to(torch.bfloat16).to("npu")
@@ -185,7 +188,8 @@ class Pi05TorchFrontendNpu:
                                      styles=self.styles, wfe=self.wfe,
                                      norm_stats=self.norm_stats if self._native_io else None,
                                      decoder_rope=self._decoder_rope, ada_kernel=self._ada_kernel,
-                                     encoder_rope=self._encoder_rope)
+                                     encoder_rope=self._encoder_rope, euler_kernel=self._euler_kernel,
+                                     cache_only=True, defer_residual=True, paged_attention=True)
             self._runners[lang_len] = runner
         from contextlib import nullcontext
         with runner.native.lock if runner.native is not None else nullcontext():
@@ -379,6 +383,9 @@ class Pi05TorchFrontendNpu:
         for key, weight in self.wfe.items():
             if not isinstance(weight, StaticRowInt8Weight):
                 continue
+            if (key.startswith(f"{npu_pl._EP}.{npu_pl.ENC_L - 1}.")
+                    and (".mlp." in key or ".self_attn.o_proj." in key)):
+                continue  # These calibrated bindings are dead in cache-only serving.
             spec.weight_specs[key] = PrecisionSpec(dtype="int8", granularity="per_channel",
                 axis=0, scale_source="manual", scale=weight.weight_scales.cpu().numpy().copy())
             scales = weight.activation_scales.cpu().numpy()

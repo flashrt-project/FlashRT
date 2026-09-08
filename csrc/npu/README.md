@@ -51,3 +51,9 @@ columns and cover all rows; each table repeats its first 128 columns in the
 second half, as required by half-split RoPE. The kernel keeps products and
 addition in FP32, then rounds once to BF16. It removes separate conversion
 and rotary-output intermediates while retaining the original table precision.
+
+`flashrt_npu_euler_update` accepts contiguous FP32 actions and BF16 biased
+velocities, with a count divisible by 32 and a finite step in `(0,1]`. It
+promotes velocity to FP32, multiplies by the step, then subtracts separately.
+The biased GEMM's BF16 rounding precedes the update; there is no BF16 rounding
+of the scaled velocity. The native symbol rejects invalid pointers and sizes.

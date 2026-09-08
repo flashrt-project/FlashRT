@@ -55,6 +55,16 @@ def test_encoder_output_projection_affects_next_layer_cache(monkeypatch):
     torch.testing.assert_close(zero_cache[0][0], projected_cache[0][0])
     assert not torch.allclose(zero_cache[1][0], projected_cache[1][0])
 
+    # The cache-only inference contract discards the final encoder hidden
+    # state. Changing its final attention output and MLP cannot alter any KV.
+    final = f"{pipeline._EP}.1"
+    for suffix in ("self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"):
+        weights[f"{final}.{suffix}.weight"] = torch.randn(8, 8, generator=generator)
+    changed_final_hidden = pipeline.encoder_pass(x, weights)
+    for before, after in zip(projected_cache, changed_final_hidden):
+        for expected, actual in zip(before, after):
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
 
 def test_setup_head_padding_preserves_full_attention_projection(monkeypatch):
     from flash_rt.npu.models.pi05 import fast
@@ -79,3 +89,21 @@ def test_setup_head_padding_preserves_full_attention_projection(monkeypatch):
 
     torch.testing.assert_close(full_attention(padded, 4), full_attention(weights, 3),
                                atol=1e-12, rtol=1e-12)
+
+
+def test_shared_pages_preserve_bidirectional_query_attention():
+    from flash_rt.npu.models.pi05.attention import PagedDecoderAttention
+    total, queries, heads, dim = 19, 3, 2, 4
+    paging = PagedDecoderAttention.create(total, queries, device="cpu", block_size=16)
+    generator = torch.Generator().manual_seed(71)
+    q = torch.randn(queries, heads, dim, generator=generator)
+    k = torch.randn(paging.capacity, dim, generator=generator)
+    v = torch.randn(paging.capacity, dim, generator=generator)
+    dense = F.scaled_dot_product_attention(
+        q.transpose(0, 1).unsqueeze(0), k[:total][None, None],
+        v[:total][None, None]).squeeze(0).transpose(0, 1)
+    slots = (paging.table[:, :, None] * paging.block_size
+             + torch.arange(paging.block_size)).reshape(queries, -1)[:, :total]
+    batched = F.scaled_dot_product_attention(
+        q.unsqueeze(2), k[slots].unsqueeze(1), v[slots].unsqueeze(1)).squeeze(2)
+    torch.testing.assert_close(batched, dense, atol=1e-6, rtol=1e-6)

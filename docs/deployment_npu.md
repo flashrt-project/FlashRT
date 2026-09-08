@@ -79,8 +79,28 @@ INT8 inference before real-data calibration also fails explicitly.
 `set_prompt` computes language embeddings and constructs a graph for the
 prompt length. Cached prompt updates complete their producer stream before
 replay. The graph covers image normalization, all vision and encoder layers,
-all denoising steps, and action unnormalization. No temporal KV reuse or
-step reduction is enabled.
+all denoising steps, and action unnormalization. All 18 encoder K/V pairs
+are preserved. Once the final pair is produced, its unused attention output
+and MLP calculations are omitted because the action API never consumes the
+final encoder hidden state. Calibration still executes every observer site;
+precision metadata describes only live serving bindings. In the INT8 path,
+MLP residual additions enter the following layer's fused RMS quantizer.
+No temporal KV reuse or step reduction is enabled.
+
+The decoder treats action queries as separate single-query batches sharing
+the same current-frame K/V page table. This retains the original fully
+bidirectional attention expression with one KV head. It uses CANN's
+incremental attention kernel; its rounding is qualified by full-model E2E,
+not assumed bit-exact. The vendor API requires page capacity summed over
+queries even when page indices are shared. For the tested ten-query shapes,
+K/V storage is about 112.5 MiB per prompt bucket, roughly 102 MiB more than
+the contiguous baseline. This implementation is specific to Pi0.5's single
+KV head and does not claim a general multi-KV-head paging layout.
+
+The action input weight is rounded to BF16 and promoted to FP32 once at
+setup. The biased action output GEMM rounds to BF16; the update kernel
+promotes that velocity and performs multiplication and subtraction
+separately in FP32. It introduces no BF16 rounding of the scaled velocity.
 
 Only `state_prompt_mode="exact"` is implemented: warm representative state
 prompt buckets before serving to avoid capture on a new length. Fixed padded
@@ -104,28 +124,28 @@ comparisons are diagnostics, not the final accuracy gate.
 The INT8 path passed 56 real LIBERO frames against the independent official
 FP32 host. Calibration used 80 real frames covering 40 tasks at house
 percentile 90, with no episode overlap with those 56 evaluation frames.
-Minimum cosine was 0.996816 for full raw actions, 0.996935 for the seven action
-channels and 0.998213 for unnormalized robot actions. Percentile selection
+Minimum cosine was 0.996777 for full raw actions, 0.996900 for the seven action
+channels and 0.998212 for unnormalized robot actions. Percentile selection
 used these evaluation results; they are not an untouched statistical test.
 The default percentile remains 99.9: the original eight-frame calibration
 recipe also passed all 56 frames (48 heldout), with minimum raw cosine
-0.995861. Expanding calibration to 80 frames at percentile 99.9 failed the
+0.995850. Expanding calibration to 80 frames at percentile 99.9 failed the
 E2E gate; more calibration samples alone do not guarantee better scales.
-The BF16 path passed all 56 frames with minimum raw cosine 0.999980.
+The BF16 path passed all 56 frames with minimum raw cosine 0.999981.
 These are numerical agreement results, not task-success measurements.
 
-On the tested 910B4, the median of per-frame latency medians was 50.06 ms
-for the 16-frame paired benchmark. Disabling native encoder rotary fusion
-and attention INT8 output in the same process measured 51.03 ms. The frozen
-corrected BF16 baseline at the same boundary measured 91.08 ms, giving
-approximately 1.82x acceleration. Timings include host image/noise upload,
+On the tested 910B4, the median of per-frame latency medians was 44.49 ms
+for the 16-frame paired benchmark. Disabling the cache-only encoder pruning,
+deferred residual, action update and paged decoder changes in the same
+process measured 50.49 ms. The frozen corrected BF16 baseline at the same
+boundary measured 91.08 ms, giving approximately 2.05x acceleration. Timings include host image/noise upload,
 normalization, complete model execution, output unnormalization and download.
 They exclude checkpoint loading, camera resize, tokenization, calibration
 and capture.
 
-The captured profile contains 2269 device kernels, including 126 INT8 GEMMs,
-36 RMSNorm/quantization producers and 18 GELU/product/quantization producers.
-It has no standalone row quantizers and retains 24 casts. Vendor utilization
+The captured profile contains 2214 device kernels, including 122 INT8 GEMMs,
+35 RMSNorm/quantization producers and 17 GELU/product/quantization producers.
+It has no standalone row quantizers and retains four casts. Vendor utilization
 counters have not established normalized compute or HBM efficiency; this
 result does not establish a hardware limit or complete fusion.
 

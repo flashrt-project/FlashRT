@@ -227,7 +227,8 @@ def make_encoder_opt_weights(wb: dict) -> dict:
     return wfe
 
 
-def encoder_pass_opt(prefix_emb: torch.Tensor, wf: dict, cos_t, sin_t, rope_kernel=None):
+def encoder_pass_opt(prefix_emb: torch.Tensor, wf: dict, cos_t, sin_t, rope_kernel=None,
+                     cache_only=False, defer_residual=False):
     """Encoder with fused norm ops and table-based rope: ``npu_rms_norm``
     for the pre-attention norm and ``npu_add_rms_norm`` for the
     post-attention residual+norm. Static INT8 groups share input quantization
@@ -236,11 +237,12 @@ def encoder_pass_opt(prefix_emb: torch.Tensor, wf: dict, cos_t, sin_t, rope_kern
     S = prefix_emb.shape[0]
     x = prefix_emb
     cache = []
+    pending = None
     for i in range(ENC_L):
         p = f"{_EP}.{i}"
         x = x.to(torch.bfloat16)  # keep the bf16 contract (residual cast etc.)
         if f"{p}.qkv.norm" in wf:
-            (q, k, v), _ = wf[f"{p}.qkv.norm"](x, None, wf[f"{p}.gamma_a"])
+            (q, k, v), x = wf[f"{p}.qkv.norm"](x, pending, wf[f"{p}.gamma_a"])
         else:
             xn = torch_npu.npu_rms_norm(x, wf[f"{p}.gamma_a"], EPS)[0]
             if f"{p}.qkv.group" in wf:
@@ -254,6 +256,11 @@ def encoder_pass_opt(prefix_emb: torch.Tensor, wf: dict, cos_t, sin_t, rope_kern
         else:
             q_rot = rope_fast(q, cos_t, sin_t, 0, ENC_HD)
             k_rot = rope_fast(k, cos_t, sin_t, 0, ENC_HD)
+        # The action decoder consumes every layer's K/V, not the final
+        # encoder hidden state. Everything after the final cache write is dead.
+        if cache_only and i == ENC_L - 1:
+            cache.append((k_rot.contiguous(), v.contiguous()))
+            break
         if f"{p}.attention.quantized" in wf:
             o = wf[f"{p}.attention.quantized"](q_rot, k_rot, v)
         else:
@@ -274,7 +281,11 @@ def encoder_pass_opt(prefix_emb: torch.Tensor, wf: dict, cos_t, sin_t, rope_kern
         else:
             d = linear(F.gelu(g, approximate="tanh") * u,
                          wf[f"{p}.mlp.down_proj.weight"])
-        x = x + d
+        if defer_residual and f"{_EP}.{i + 1}.qkv.norm" in wf:
+            pending = d
+        else:
+            x = x + d
+            pending = None
         cache.append((k_rot.contiguous(), v.contiguous()))
     return cache
 
@@ -340,16 +351,19 @@ def decoder_step_fast(x_t, enc_cache, wf, style_attn, style_mlp, style_top,
 
 # ── no-cat cross-attention K/V (L1b) ──────────────────────────────────
 
-def make_kv_buffers(prefix_len: int, chunk_cap: int) -> tuple:
+def make_kv_buffers(prefix_len: int, chunk_cap: int, capacity=None) -> tuple:
     """One contiguous (prefix_len + chunk_cap, 256) K/V buffer per decoder
     layer. Encoder prefix rows are copied in once per frame
     (``fill_kv_prefix``); each denoise step overwrites only its own suffix
     rows in place. Removes the two per-layer ``torch.cat`` (+ their repeated
     copy of the whole prefix) from every decoder step."""
-    rows = prefix_len + chunk_cap
-    kbufs = [torch.empty(rows, DEC_HD, dtype=torch.bfloat16, device="npu")
+    rows = capacity if capacity is not None else prefix_len + chunk_cap
+    if rows < prefix_len + chunk_cap:
+        raise ValueError("KV capacity does not cover the prefix and action suffix")
+    allocate = torch.zeros if capacity is not None else torch.empty
+    kbufs = [allocate(rows, DEC_HD, dtype=torch.bfloat16, device="npu")
              for _ in range(DEC_L)]
-    vbufs = [torch.empty(rows, DEC_HD, dtype=torch.bfloat16, device="npu")
+    vbufs = [allocate(rows, DEC_HD, dtype=torch.bfloat16, device="npu")
              for _ in range(DEC_L)]
     return kbufs, vbufs
 
@@ -363,7 +377,8 @@ def fill_kv_prefix(enc_cache, kbufs, vbufs, prefix_len: int) -> None:
 
 def decoder_step_fast_nocat(x_t, kbufs, vbufs, wf, style_attn, style_mlp,
                             style_top, prefix_len: int, chunk: int,
-                            cos_t=None, sin_t=None, rope_kernel=None, ada_kernel=None):
+                            cos_t=None, sin_t=None, rope_kernel=None, ada_kernel=None,
+                            attention_kernel=None):
     """decoder_step_fast without per-step K/V ``cat``: suffix rows are
     written in place into the preallocated buffers and one cross-attention
     runs over rows ``[0, prefix_len + chunk)``. Values are identical to the
@@ -399,8 +414,11 @@ def decoder_step_fast_nocat(x_t, kbufs, vbufs, wf, style_attn, style_mlp,
             else:
                 kbufs[i][prefix_len:total].copy_(k_rot)
                 vbufs[i][prefix_len:total].copy_(v)
-        o = attention_flash(q_rot, kbufs[i][:total], vbufs[i][:total],
-                            DEC_NH, DEC_NKV)
+        if attention_kernel is not None:
+            o = attention_kernel(q_rot, kbufs[i], vbufs[i])
+        else:
+            o = attention_flash(q_rot, kbufs[i][:total], vbufs[i][:total],
+                                DEC_NH, DEC_NKV)
         o = linear(o, wf[f"{p}.self_attn.o_proj.weight"])
         if ada_kernel is not None:
             gamma, shift, gate_f = style_mlp[i]
