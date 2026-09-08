@@ -45,7 +45,8 @@ __global__ __aicore__ void row_quant_kernel(GM_ADDR input, GM_ADDR inv_scale,
 // buffer lifetime and observes completion through its stream or graph.
 extern "C" int flashrt_npu_quantize_rows(void* stream, void* input, void* inv_scale,
                                         void* output, int rows, int columns) {
-    if (!input || !inv_scale || !output || rows <= 0 || columns <= 0 || columns % 32)
+    if (!input || !inv_scale || !output || rows <= 0 || columns <= 0 || columns % 32
+            || rows > 2147483647 / columns)
         return 1;
     const int blocks = rows < 40 ? rows : 40;
     if (columns >= 8192) {

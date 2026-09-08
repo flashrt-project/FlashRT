@@ -8,7 +8,7 @@ PyTorch 2.7.1 and matching torch_npu 2.7.1.post2.
 ## Build and run
 
 Activate the matching PyTorch environment and source the CANN toolkit's
-`set_env.sh`, then build the optional INT8 kernels:
+`set_env.sh`, then build the native kernels:
 
 ```bash
 bash scripts/npu/build.sh

@@ -10,4 +10,4 @@ mkdir -p "$npu_output_dir"
  -I"$npu_toolkit_root/compiler/tikcpp/tikcfw" \
  -I"$npu_toolkit_root/compiler/tikcpp/tikcfw/impl" \
  -I"$npu_toolkit_root/compiler/tikcpp/tikcfw/interface" -I"$npu_toolkit_root/include" \
- -o "$npu_output_dir/libflashrt_npu.so" "$npu_repo_root/csrc/npu/kernels/row_quant_910b.cpp"
+ -o "$npu_output_dir/libflashrt_npu.so" "$npu_repo_root/csrc/npu/dispatch_910b.cpp"
