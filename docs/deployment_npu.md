@@ -66,6 +66,11 @@ projection. Attention still uses the original 72-channel scale. The aligned
 GEMM outputs eliminate runtime padding, clearing and output slicing without
 changing the real-valued attention expression. Vendor kernel tiling can alter
 floating-point rounding, so the complete padded path is qualified separately.
+Uint8 normalization and CHW patch gathering share a native input kernel. A
+256-entry setup lookup preserves the original FP32 divide/subtract and BF16
+rounding exactly for every byte value. The kernel writes FP32 patch tokens
+directly for the patch projection.
+
 Vision normalization parameters are converted to BF16 once during setup; a
 persistent full-size zero operand also avoids per-normalization broadcasting.
 This constant preparation was bit-exact on all 56 BF16 and 56 INT8 frames.
@@ -139,20 +144,20 @@ calibration samples alone do not guarantee better scales. The BF16 path
 passed all 96 frames with minimum raw cosine 0.999981, above its 0.9999 gate.
 These are numerical agreement results, not task-success measurements.
 
-On the tested 910B4, the median of per-frame latency medians was 44.49 ms
-for the 16-frame paired benchmark. Disabling the cache-only encoder pruning,
-deferred residual, action update and paged decoder changes in the same
-process measured 50.49 ms. The frozen corrected BF16 baseline at the same
-boundary measured 91.08 ms, giving approximately 2.05x acceleration. Timings include host image/noise upload,
-normalization, complete model execution, output unnormalization and download.
-They exclude checkpoint loading, camera resize, tokenization, calibration
-and capture.
+On the tested 910B4, the median of per-frame latency medians was 44.31 ms
+for the 16-frame paired benchmark, versus 44.44 ms with the previous image
+preprocessing path in the same process. All 96 INT8 outputs were bitwise
+identical to that parent. The frozen corrected BF16 baseline at the same
+boundary measured 91.08 ms, giving approximately 2.06x acceleration.
+Timings include host image/noise upload, normalization, complete model
+execution, output unnormalization and download. They exclude checkpoint
+loading, camera resize, tokenization, calibration and capture.
 
-The captured profile contains 2214 device kernels, including 122 INT8 GEMMs,
+The captured profile contains 2207 device kernels, including 122 INT8 GEMMs,
 35 RMSNorm/quantization producers and 17 GELU/product/quantization producers.
-It has no standalone row quantizers and retains four casts. Vendor utilization
-counters have not established normalized compute or HBM efficiency; this
-result does not establish a hardware limit or complete fusion.
+It has no standalone row quantizers and retains one cast. This result does
+not establish a hardware limit or complete fusion; normalized compute and
+HBM utilization have not been measured for this exact implementation.
 
 The historical 200-to-86 ms report used a local golden that shared model
 errors with its serving path: incorrect vision attention axes and an omitted

@@ -481,7 +481,7 @@ def attention_flash(q, k, v, nh: int, nkv: int) -> torch.Tensor:
     return out.reshape(q.shape)
 
 
-def vision_tower_opt(images: torch.Tensor, w: dict, zeros: torch.Tensor):
+def vision_tower_opt(images: torch.Tensor, w: dict, zeros: torch.Tensor, patch_tokens=None):
     """SigLIP vision tower with fused LayerNorms.
 
     ``npu_layer_norm_eval`` (the natural fit) is an aclop operator and cannot
@@ -495,9 +495,12 @@ def vision_tower_opt(images: torch.Tensor, w: dict, zeros: torch.Tensor):
     w_dtype = images.dtype
     pe_w = w[f"{vp}.embeddings.patch_embedding.weight"].to(torch.float32)
     pe_b = w[f"{vp}.embeddings.patch_embedding.bias"].to(torch.float32)
-    imgs32 = images.to(torch.float32)
-    blocks = imgs32.view(nv, 3, 16, 14, 16, 14).permute(0, 2, 4, 1, 3, 5)
-    tokens = blocks.reshape(nv, VIS_TOKENS_PER_VIEW, 3 * 14 * 14).contiguous()
+    if patch_tokens is None:
+        imgs32 = images.to(torch.float32)
+        blocks = imgs32.view(nv, 3, 16, 14, 16, 14).permute(0, 2, 4, 1, 3, 5)
+        tokens = blocks.reshape(nv, VIS_TOKENS_PER_VIEW, 3 * 14 * 14).contiguous()
+    else:
+        tokens = patch_tokens
     x = torch.matmul(tokens.reshape(-1, 588), pe_w.reshape(VIS_D, -1).t())
     x = (x + pe_b).reshape(nv, VIS_TOKENS_PER_VIEW, VIS_D).to(w_dtype)
     x = x + w[f"{vp}.embeddings.position_embedding.weight"].unsqueeze(0)

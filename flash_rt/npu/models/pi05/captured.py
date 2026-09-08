@@ -18,11 +18,12 @@ class _CapturedRunner:
                  num_steps: int, conds, wfast=None, styles=None, wfe=None,
                  norm_stats=None, decoder_rope=None, ada_kernel=None, encoder_rope=None,
                  euler_kernel=None, cache_only=False, defer_residual=False,
-                 paged_attention=False):
+                 paged_attention=False, image_patches=None):
         self.num_steps = num_steps
         self.decoder_rope = decoder_rope
         self.encoder_rope = encoder_rope
         self.euler_kernel = euler_kernel
+        self.image_patches = image_patches
         self.cache_only = cache_only
         self.defer_residual = defer_residual
         self.ada_kernel = ada_kernel
@@ -85,10 +86,14 @@ class _CapturedRunner:
         return self.num_views * npu_pl.VIS_TOKENS_PER_VIEW + self.lang_len
 
     def _run(self):
+        patch_tokens = None
         if self.norm_stats is not None:
-            self.imgs.copy_((self.raw_images.permute(0, 3, 1, 2).float() / 127.5 - 1.0)
-                            .to(torch.bfloat16))
-        vis = npu_fast.vision_tower_opt(self.imgs, self.wb, self.z)
+            if self.image_patches is not None:
+                patch_tokens = self.image_patches(self.raw_images)
+            else:
+                self.imgs.copy_((self.raw_images.permute(0, 3, 1, 2).float() / 127.5 - 1.0)
+                                .to(torch.bfloat16))
+        vis = npu_fast.vision_tower_opt(self.imgs, self.wb, self.z, patch_tokens)
         pref = torch.cat([vis, self.lang], dim=0)
         if self.wfe is not None:
             cache = npu_fast.encoder_pass_opt(pref, self.wfe,

@@ -1,4 +1,5 @@
 """Setup/capture adapters for the standalone checked NPU pointer ABI."""
+from dataclasses import dataclass
 import ctypes as C
 import os
 from pathlib import Path
@@ -218,4 +219,49 @@ class EulerUpdate(_NativeLibrary):
             x.data_ptr(), velocity.data_ptr(), out.data_ptr(), x.numel(), dt)
         if code:
             raise RuntimeError(f"native Euler update rejected arguments: {code}")
+        return out
+
+
+@dataclass(init=False)
+class ImagePatches(_NativeLibrary):
+    """Gather uint8 HWC images into exactly normalized FP32 patch tokens.
+
+    Tensor fields are explicit graph dependencies. Their snapshot survives
+    replacement of the builder or its setup constants after capture.
+    """
+    indices: object
+    lut: object
+
+    def __init__(self):
+        import torch
+        super().__init__()
+        self.launch = self.library.flashrt_npu_image_patches
+        self.launch.argtypes = [C.c_void_p] * 5 + [C.c_int]
+        self.launch.restype = C.c_int
+        # Preserve the existing divide/subtract/BF16/FP32 sequence for every
+        # possible byte. Reciprocal multiplication changes some BF16 values.
+        self.lut = (torch.arange(256, device="npu", dtype=torch.float32)
+                    / 127.5 - 1.0).to(torch.bfloat16).float()
+        offsets = [((i // 14 % 14) * 64 + (i % 14) * 3 + i // 196) * 4
+                   for i in range(588)] + [0] * 20
+        self.indices = torch.tensor(offsets, device=self.lut.device, dtype=torch.int32)
+
+    def __call__(self, raw):
+        import torch
+        if (raw.dtype != torch.uint8 or raw.ndim != 4
+                or tuple(raw.shape[1:]) != (224, 224, 3)
+                or not 1 <= raw.shape[0] <= 3 or not raw.is_contiguous()
+                or raw.device.type != "npu" or raw.device != self.lut.device):
+            raise ValueError("image patches require contiguous NPU uint8 (views,224,224,3) input")
+        for value, dtype, shape in ((self.lut, torch.float32, (256,)),
+                                     (self.indices, torch.int32, (608,))):
+            if (value.dtype != dtype or value.shape != shape
+                    or value.device != raw.device or not value.is_contiguous()):
+                raise ValueError("invalid image patch lookup tables")
+        out = torch.empty((raw.shape[0], 256, 588), device=raw.device, dtype=torch.float32)
+        code = self.launch(torch.npu.current_stream(raw.device).npu_stream,
+                           raw.data_ptr(), self.indices.data_ptr(), self.lut.data_ptr(),
+                           out.data_ptr(), raw.shape[0])
+        if code:
+            raise RuntimeError(f"native image patches rejected arguments: {code}")
         return out
