@@ -126,18 +126,20 @@ class StaticRowInt8Weight:
         quantized = (weight.float() / scales[:, None]).round().clamp(-127, 127).to(torch.int8)
         return cls(quantized.contiguous().t(), acts, scales, image_rows, {}, quantizer)
 
-    def quantize_input(self, x):
-        import torch_npu
-        flat = x.reshape(-1, x.shape[-1])
-        rows = flat.shape[0]
+    def scales_for_rows(self, rows, columns, device):
         if rows <= self.image_rows:
             raise ValueError("expected image and language token rows")
         if rows not in self.buckets:
             acts = torch.cat((self.activation_scales[:self.image_rows],
                               self.activation_scales[-1:].expand(rows - self.image_rows)))
             self.buckets[rows] = (acts, acts.reciprocal().contiguous(),
-                                  torch.ones(flat.shape[-1], device=x.device))
-        acts, inverse, ones = self.buckets[rows]
+                                  torch.ones(columns, device=device))
+        return self.buckets[rows]
+
+    def quantize_input(self, x):
+        import torch_npu
+        flat = x.reshape(-1, x.shape[-1])
+        acts, inverse, ones = self.scales_for_rows(flat.shape[0], flat.shape[1], x.device)
         if self.quantizer is None:
             q = torch_npu.npu_quantize(flat.float() * inverse[:, None], ones,
                                        None, torch.qint8, axis=-1, div_mode=False)

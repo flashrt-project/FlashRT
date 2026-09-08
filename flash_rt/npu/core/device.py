@@ -1,11 +1,8 @@
-"""Ascend NPU device helpers (torch_npu).
+"""Setup-time Ascend device helpers.
 
-The CUDA/AMD backends manage device memory through ctypes over
-libcudart/libamdhip64 and pass raw pointers to C++ kernels. The NPU
-backend has no such kernel ABI: torch_npu tensors are the buffers and
-every op goes through torch_npu/aclnn. These helpers are the small
-shared seam (init, streams, synchronize) the rest of ``flash_rt/npu``
-builds on.
+Torch-NPU constructs captured graphs and their buffers. Steady-state
+pointer/stream submission and completion live in the independent AscendCL
+runtime; these framework helpers are not used by native replay.
 """
 
 from __future__ import annotations
