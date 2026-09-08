@@ -16,9 +16,10 @@ class _CapturedRunner:
 
     def __init__(self, wb, num_views: int, lang_len: int, chunk: int,
                  num_steps: int, conds, wfast=None, styles=None, wfe=None,
-                 norm_stats=None, decoder_rope=None, ada_kernel=None):
+                 norm_stats=None, decoder_rope=None, ada_kernel=None, encoder_rope=None):
         self.num_steps = num_steps
         self.decoder_rope = decoder_rope
+        self.encoder_rope = encoder_rope
         self.ada_kernel = ada_kernel
         self.chunk = chunk
         self.num_views = num_views
@@ -81,7 +82,7 @@ class _CapturedRunner:
         pref = torch.cat([vis, self.lang], dim=0)
         if self.wfe is not None:
             cache = npu_fast.encoder_pass_opt(pref, self.wfe,
-                                              self.cos_t, self.sin_t)
+                                              self.cos_t, self.sin_t, self.encoder_rope)
         else:
             cache = npu_pl.encoder_pass(pref, self.wb)
         x_t = self.noise

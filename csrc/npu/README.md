@@ -43,3 +43,11 @@ rounded to BF16 before the FP32 variance reduction; the normalized value is
 also rounded to BF16 before scaling and direct INT8 output. With no addition,
 the residual input remains unchanged. Gamma is BF16 and inverse row scales
 are FP32. The caller owns all storage and the completion boundary.
+
+`flashrt_npu_encoder_rope` rotates eight BF16 query heads and one BF16 key
+head together, with 256 channels per head. Input/output matrices are
+contiguous `(rows,2048)` and `(rows,256)`. FP32 cosine/sine tables have 256
+columns and cover all rows; each table repeats its first 128 columns in the
+second half, as required by half-split RoPE. The kernel keeps products and
+addition in FP32, then rounds once to BF16. It removes separate conversion
+and rotary-output intermediates while retaining the original table precision.

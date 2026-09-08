@@ -227,7 +227,7 @@ def make_encoder_opt_weights(wb: dict) -> dict:
     return wfe
 
 
-def encoder_pass_opt(prefix_emb: torch.Tensor, wf: dict, cos_t, sin_t):
+def encoder_pass_opt(prefix_emb: torch.Tensor, wf: dict, cos_t, sin_t, rope_kernel=None):
     """Encoder with fused norm ops and table-based rope: ``npu_rms_norm``
     for the pre-attention norm and ``npu_add_rms_norm`` for the
     post-attention residual+norm. Static INT8 groups share input quantization
@@ -249,10 +249,16 @@ def encoder_pass_opt(prefix_emb: torch.Tensor, wf: dict, cos_t, sin_t):
                 q = linear(xn, wf[f"{p}.self_attn.q_proj.weight"])
                 k = linear(xn, wf[f"{p}.self_attn.k_proj.weight"])
                 v = linear(xn, wf[f"{p}.self_attn.v_proj.weight"])
-        q_rot = rope_fast(q, cos_t, sin_t, 0, ENC_HD)
-        k_rot = rope_fast(k, cos_t, sin_t, 0, ENC_HD)
-        o = attention_flash(q_rot, k_rot, v, ENC_NH, ENC_NKV)
-        o = linear(o, wf[f"{p}.self_attn.o_proj.weight"])
+        if rope_kernel is not None:
+            q_rot, k_rot = rope_kernel(q, k, cos_t, sin_t)
+        else:
+            q_rot = rope_fast(q, cos_t, sin_t, 0, ENC_HD)
+            k_rot = rope_fast(k, cos_t, sin_t, 0, ENC_HD)
+        if f"{p}.attention.quantized" in wf:
+            o = wf[f"{p}.attention.quantized"](q_rot, k_rot, v)
+        else:
+            o = attention_flash(q_rot, k_rot, v, ENC_NH, ENC_NKV)
+            o = linear(o, wf[f"{p}.self_attn.o_proj.weight"])
         if f"{p}.gu.norm" in wf:
             (g, u), x = wf[f"{p}.gu.norm"](x, o, wf[f"{p}.gamma_f"])
         else:

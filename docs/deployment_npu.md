@@ -27,7 +27,7 @@ from flash_rt.npu.frontends.torch.pi05 import Pi05TorchFrontendNpu
 
 pipe = Pi05TorchFrontendNpu(checkpoint_dir, num_views=2, use_int8=True)
 pipe.set_prompt(task, state=normalized_state)
-pipe.calibrate_with_real_data(real_calibration_observations)
+pipe.calibrate_with_real_data(real_calibration_observations, percentile=90)
 result = pipe.infer(observation, noise=fixed_noise)
 pipe.precision_spec.to_json("precision.json")
 ```
@@ -54,7 +54,10 @@ QKV and gate/up projections share quantized inputs while keeping separate
 GEMMs. Their inputs come directly from fused RMSNorm and frozen row
 quantization, including the attention residual update before the MLP.
 The encoder down projection consumes INT8 produced directly by fused
-GELU, multiplication and static quantization. Decoder kernels fuse rotary
+GELU, multiplication and static quantization. Encoder attention writes INT8
+directly for its output projection, using the maximum of frozen row scales
+after house aggregation as its scalar output scale. Q/K rotary embedding
+shares one native kernel and retains FP32 arithmetic before BF16 rounding. Decoder kernels fuse rotary
 embedding with KV writes and gated residual updates with AdaRMS normalization.
 
 Vision attention weights are padded at setup from 72 to 80 channels per
@@ -99,23 +102,30 @@ report the seven action channels and unnormalized robot actions. Layer
 comparisons are diagnostics, not the final accuracy gate.
 
 The INT8 path passed 56 real LIBERO frames against the independent official
-FP32 host, including 48 heldout frames and an additional 40-task coverage set.
-Eight frames from disjoint calibration episodes determine the frozen scales.
-Minimum cosine was 0.995409 for full raw actions, 0.995540 for the seven action
-channels and 0.997636 for unnormalized robot actions. These are numerical
-agreement results, not task-success measurements.
+FP32 host. Calibration used 80 real frames covering 40 tasks at house
+percentile 90, with no episode overlap with those 56 evaluation frames.
+Minimum cosine was 0.996816 for full raw actions, 0.996935 for the seven action
+channels and 0.998213 for unnormalized robot actions. Percentile selection
+used these evaluation results; they are not an untouched statistical test.
+The default percentile remains 99.9: the original eight-frame calibration
+recipe also passed all 56 frames (48 heldout), with minimum raw cosine
+0.995861. Expanding calibration to 80 frames at percentile 99.9 failed the
+E2E gate; more calibration samples alone do not guarantee better scales.
+The BF16 path passed all 56 frames with minimum raw cosine 0.999980.
+These are numerical agreement results, not task-success measurements.
 
-On the tested 910B4, the median of per-frame latency medians was 51.05 ms
-for the 16-frame paired benchmark. The runtime constant-conversion/broadcast ablation in
-the same process measured 51.67 ms. The frozen corrected BF16 baseline at
-the same boundary measured 91.08 ms, giving approximately 1.78x acceleration.
-Timings include host image/noise upload, normalization, complete model
-execution, output unnormalization and download. They exclude checkpoint
-loading, camera resize, tokenization, calibration and capture.
+On the tested 910B4, the median of per-frame latency medians was 50.06 ms
+for the 16-frame paired benchmark. Disabling native encoder rotary fusion
+and attention INT8 output in the same process measured 51.03 ms. The frozen
+corrected BF16 baseline at the same boundary measured 91.08 ms, giving
+approximately 1.82x acceleration. Timings include host image/noise upload,
+normalization, complete model execution, output unnormalization and download.
+They exclude checkpoint loading, camera resize, tokenization, calibration
+and capture.
 
-The captured profile contains 2377 device kernels, including 126 INT8 GEMMs,
+The captured profile contains 2269 device kernels, including 126 INT8 GEMMs,
 36 RMSNorm/quantization producers and 18 GELU/product/quantization producers.
-There remain 18 standalone row quantizers and 96 casts. Vendor utilization
+It has no standalone row quantizers and retains 24 casts. Vendor utilization
 counters have not established normalized compute or HBM efficiency; this
 result does not establish a hardware limit or complete fusion.
 

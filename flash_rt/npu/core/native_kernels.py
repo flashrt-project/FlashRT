@@ -161,3 +161,35 @@ class RmsRowQuant(_NativeLibrary):
         if code:
             raise RuntimeError(f"native RMS quantization rejected arguments: {code}")
         return quantized, residual
+
+
+class EncoderRope(_NativeLibrary):
+    """FP32 half-split rotation of eight BF16 Q heads and one K head."""
+    def __init__(self):
+        super().__init__()
+        self.launch = self.library.flashrt_npu_encoder_rope
+        self.launch.argtypes = [C.c_void_p] * 7 + [C.c_int]
+        self.launch.restype = C.c_int
+
+    def __call__(self, q, k, cos, sin):
+        import torch
+        if (q.ndim != 2 or q.shape[1] != 2048 or q.dtype != torch.bfloat16
+                or q.device.type != "npu" or not q.is_contiguous()):
+            raise ValueError("encoder RoPE requires a contiguous BF16 NPU (rows,2048) query")
+        if (k.shape != (q.shape[0], 256) or k.dtype != q.dtype or k.device != q.device
+                or not k.is_contiguous()):
+            raise ValueError("encoder RoPE requires a matching contiguous (rows,256) key")
+        if (cos.ndim != 2 or cos.shape[1] != 256 or cos.shape[0] < q.shape[0]
+                or sin.shape != cos.shape):
+            raise ValueError("encoder RoPE tables must cover every query row")
+        for table in (cos, sin):
+            if (table.dtype != torch.float32 or table.device != q.device
+                    or not table.is_contiguous()):
+                raise ValueError("encoder RoPE requires contiguous FP32 device tables")
+        qo, ko = torch.empty_like(q), torch.empty_like(k)
+        code = self.launch(torch.npu.current_stream(q.device).npu_stream,
+            q.data_ptr(), k.data_ptr(), cos.data_ptr(), sin.data_ptr(),
+            qo.data_ptr(), ko.data_ptr(), q.shape[0])
+        if code:
+            raise RuntimeError(f"native encoder RoPE rejected arguments: {code}")
+        return qo, ko
