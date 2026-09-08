@@ -1,15 +1,16 @@
 """Real-observation static encoder calibration, outside graph replay."""
 import numpy as np
 import torch
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from flash_rt.core.calibration import accumulate_amax
 from flash_rt.npu.core.linear import RowCalibrationWeight, StaticRowInt8Weight, StaticRowInt8Group
-from .pipeline import _EP, ENC_L
+from .pipeline import _EP, ENC_L, ENC_NH, ENC_NKV, ENC_HD
 
 
 def calibrate_encoder(weights, samples, make_runner, image_rows, percentile=99.9,
-                      quantizer=None, activation_producer=None, norm_producer=None):
+                      quantizer=None, activation_producer=None, norm_producer=None,
+                      attention_output_quant=False):
     """Collect one eager sample at a time; bind immutable INT8 operands.
 
     ``make_runner(sample, observed_weights)`` owns host preprocessing and
@@ -25,6 +26,7 @@ def calibrate_encoder(weights, samples, make_runner, image_rows, percentile=99.9
     if not sites:
         raise ValueError("encoder has no calibratable linear weights")
     per_sample = []
+    attention_scales = {}
     with torch.inference_mode():
         for sample in samples:
             for observer in sites.values():
@@ -58,9 +60,17 @@ def calibrate_encoder(weights, samples, make_runner, image_rows, percentile=99.9
             if activation_producer is not None:
                 bound[f"{prefix}.down.fused"] = GeluMulProjection(
                     bound[f"{prefix}.mlp.down_proj.weight"], activation_producer)
+            if attention_output_quant:
+                key = f"{prefix}.self_attn.o_proj.weight"
+                projection = AttentionQuantProjection.bind(bound[key])
+                bound[key] = projection.weight
+                bound[f"{prefix}.attention.quantized"] = projection
+                attention_scales[key] = float(projection.weight.activation_scales[0].cpu())
     return bound, {'samples': len(per_sample), 'percentile': percentile,
                    'method': 'sample-call max then house percentile; image-row and language-group scales',
                    'image_rows': image_rows,
+                   'attention_output_scales': attention_scales,
+                   'attention_scale_rule': 'maximum of frozen row scales after house aggregation',
                    'amax': {key: final[index].copy() for index, key in enumerate(sites)}}
 
 
@@ -86,3 +96,31 @@ class RmsQuantProjection:
         outputs = tuple(w.project_quantized(quantized, acts, x.shape, x.dtype)
                         for w in self.group.weights)
         return outputs, residual
+
+
+@dataclass(frozen=True)
+class AttentionQuantProjection:
+    """CANN attention INT8 output followed by its static output projection."""
+    weight: StaticRowInt8Weight
+    inverse_scale: torch.Tensor
+
+    @classmethod
+    def bind(cls, weight):
+        # CANN attention supports a scalar output scale. Freeze the maximum
+        # across the already calibrated row scales and expose that same scale
+        # through the linear binding and precision specification.
+        scale = weight.activation_scales.max().reshape(1)
+        bound = replace(weight, activation_scales=scale.expand_as(
+            weight.activation_scales).clone(), buckets={})
+        return cls(bound, scale.reciprocal())
+
+    def __call__(self, q, k, v):
+        import torch_npu
+        out = torch_npu.npu_prompt_flash_attention(
+            q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
+            num_heads=ENC_NH, num_key_value_heads=ENC_NKV,
+            input_layout="BSH", scale_value=ENC_HD ** -0.5,
+            pre_tokens=2147483647, next_tokens=2147483647,
+            quant_scale2=self.inverse_scale).reshape(q.shape)
+        acts, _, _ = self.weight.scales_for_rows(q.shape[0], q.shape[1], q.device)
+        return self.weight.project_quantized(out, acts, q.shape, q.dtype)

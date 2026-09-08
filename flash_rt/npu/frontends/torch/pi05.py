@@ -92,6 +92,9 @@ class Pi05TorchFrontendNpu:
         if cache_frames != 1:
             raise NotImplementedError("temporal K/V caching not ported yet")
 
+        from flash_rt.npu.core.native_kernels import EncoderRope
+        self._encoder_rope = EncoderRope()
+
         # weights: fp32 CPU reference kept for gating; BF16/NPU for serving
         self.wref = npu_pl.load_weights_fp32(ckpt / "model.safetensors")
         self.wb = npu_fast.make_vision_padded_weights(
@@ -181,7 +184,8 @@ class Pi05TorchFrontendNpu:
                                      self.conds, wfast=self.wfast,
                                      styles=self.styles, wfe=self.wfe,
                                      norm_stats=self.norm_stats if self._native_io else None,
-                                     decoder_rope=self._decoder_rope, ada_kernel=self._ada_kernel)
+                                     decoder_rope=self._decoder_rope, ada_kernel=self._ada_kernel,
+                                     encoder_rope=self._encoder_rope)
             self._runners[lang_len] = runner
         from contextlib import nullcontext
         with runner.native.lock if runner.native is not None else nullcontext():
@@ -251,7 +255,7 @@ class Pi05TorchFrontendNpu:
             runner = _CapturedRunner(self.wb, self.num_views, len(tokens),
                 self.chunk_size, self.num_steps, self.conds, wfast=self.wfast,
                 styles=self.styles, wfe=weights, decoder_rope=self._decoder_rope,
-                ada_kernel=self._ada_kernel)
+                ada_kernel=self._ada_kernel, encoder_rope=self._encoder_rope)
             ids = torch.tensor(tokens, device="npu", dtype=torch.long)
             runner.lang.copy_(F.embedding(ids, self.wb[npu_pl._LM]) * npu_pl.ENC_D ** 0.5)
             runner.fill(images, torch.tensor(noise, device="npu"))
@@ -259,7 +263,7 @@ class Pi05TorchFrontendNpu:
 
         bound, report = calibrate_encoder(self._encoder_bf16, observations,
             make_runner, self.num_views * npu_pl.VIS_TOKENS_PER_VIEW,
-            percentile, quantizer, GeluMulQuant(), RmsRowQuant())
+            percentile, quantizer, GeluMulQuant(), RmsRowQuant(), attention_output_quant=True)
         report["sample_sha256"] = fingerprints
         self.wfe = bound
         self._calibration_report = report
