@@ -121,6 +121,23 @@ def make_vision_mlp_nz_weights(wb: dict, padded_hidden: int = VIS_H_PADDED) -> d
     return result
 
 
+def make_vision_attn_nz_weights(wb: dict) -> dict:
+    """Overlay the SigLIP attention projections that measure faster in NZ.
+
+    Q/K/V are bit-identical in NZ at this shape and slightly faster. The output
+    projection measures slower in NZ and is deliberately left in ND.
+    """
+    result = dict(wb)
+    for layer in range(VIS_L):
+        prefix = f"{_VP}.encoder.layers.{layer}.self_attn"
+        for name in ("q_proj", "k_proj", "v_proj"):
+            result[f"{prefix}.{name}.weight"] = NzBf16Weight.bind(
+                wb[f"{prefix}.{name}.weight"])
+            result[f"{prefix}.{name}.bias"] = wb[f"{prefix}.{name}.bias"].to(
+                torch.bfloat16).contiguous()
+    return result
+
+
 def make_fast_weights(wb: dict) -> dict:
     """Shallow overlay of ``wb`` with per-decoder-layer merged GEMM weights.
 
