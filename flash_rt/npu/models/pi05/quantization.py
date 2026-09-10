@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 
 from flash_rt.core.calibration import accumulate_amax
 from flash_rt.npu.core.linear import RowCalibrationWeight, StaticRowInt8Weight, StaticRowInt8Group
-from .pipeline import _EP, ENC_L, ENC_NH, ENC_NKV, ENC_HD
+from .pipeline import _DP, _EP, ENC_L, ENC_NH, ENC_NKV, ENC_HD
 
 
 def calibrate_encoder(weights, samples, make_runner, image_rows, percentile=99.9,
@@ -182,3 +182,54 @@ def prepare_encoder_mlp(weights, rows):
     for key, value in sites.items():
         result[key] = value.prepare(rows, workspace)
     return result
+
+
+def calibrate_decoder(weights, samples, make_runner, layers, steps, rows,
+                      percentile=99.9):
+    """Freeze the four decoder projections against per-step real activations.
+
+    ``make_runner(sample, observed_weights)`` returns a filled runner whose
+    decoder overlay is ``observed_weights``. Same shape as the encoder pass:
+    one eager sample at a time, reset between samples, and every site has to
+    have run.
+    """
+    from flash_rt.npu.core.decoder_int8 import DecoderInt8Pack
+    from flash_rt.npu.core.linear import StepCalibrationWeight
+
+    names = ("qkv", "self_attn.o_proj", "gu", "mlp.down_proj")
+    observed = dict(weights)
+    sites = {}
+    for layer in range(layers):
+        for name in names:
+            key = f"{_DP}.{layer}.{name}.weight"
+            if key not in weights:
+                raise ValueError(f"decoder overlay is missing {name}")
+            sites[key] = StepCalibrationWeight.create(weights[key], key, steps)
+            observed[key] = sites[key]
+    per_sample = []
+    with torch.inference_mode():
+        for sample in samples:
+            for observer in sites.values():
+                observer.reset()
+            runner = make_runner(sample, observed)
+            runner._run()
+            torch.npu.synchronize()
+            if any(observer.calls != steps for observer in sites.values()):
+                raise RuntimeError("calibration did not run every decoder site once a step")
+            values = np.stack([observer.amax.cpu().numpy() for observer in sites.values()])
+            if not np.isfinite(values).all():
+                raise ValueError("nonfinite decoder activation in calibration sample")
+            per_sample.append(values.reshape(-1))
+            del runner
+    if not per_sample:
+        raise ValueError("INT8 requires nonempty real observations")
+    final = accumulate_amax(per_sample, percentile).reshape(len(sites), steps)
+    amax = {name: np.empty((layers, steps), dtype=np.float64) for name in names}
+    for index, key in enumerate(sites):
+        layer = int(key[len(_DP) + 1:].split(".", 1)[0])
+        amax[key.rsplit(".weight", 1)[0].split(f".{layer}.", 1)[1]][layer] = final[index]
+    for name in names:
+        if not (amax[name] > 0).all():
+            raise ValueError(f"'{name}' saw a zero activation on some step")
+    report = {name: {"min": float(a.min()), "max": float(a.max())} for name, a in amax.items()}
+    return DecoderInt8Pack.build(weights, _DP, layers, amax, rows, steps), report

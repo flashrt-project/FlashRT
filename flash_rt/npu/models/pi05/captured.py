@@ -18,7 +18,7 @@ class _CapturedRunner:
                  num_steps: int, conds, wfast=None, styles=None, wfe=None,
                  norm_stats=None, decoder_rope=None, ada_kernel=None, encoder_rope=None,
                  euler_kernel=None, cache_only=False, defer_residual=False,
-                 paged_attention=False, image_patches=None):
+                 paged_attention=False, image_patches=None, decoder_int8=None):
         self.num_steps = num_steps
         self.decoder_rope = decoder_rope
         self.encoder_rope = encoder_rope
@@ -27,6 +27,7 @@ class _CapturedRunner:
         self.cache_only = cache_only
         self.defer_residual = defer_residual
         self.ada_kernel = ada_kernel
+        self.decoder_int8 = decoder_int8
         self.chunk = chunk
         self.num_views = num_views
         self.lang_len = lang_len
@@ -110,7 +111,13 @@ class _CapturedRunner:
         for s in range(self.num_steps):
             act = F.linear(x_t, self.wb["action_in_proj.weight"],
                            self.wb["action_in_proj.bias"])
-            if fast:
+            if fast and self.decoder_int8 is not None:
+                attn, mlp, top = self.styles
+                out = npu_fast.decoder_step_int8(
+                    act, self.kbufs, self.vbufs, attn[s], mlp[s], top[s],
+                    plen, self.chunk, self.cos_t, self.sin_t, self.decoder_int8,
+                    s, attention_kernel=self.attention_kernel)
+            elif fast:
                 attn, mlp, top = self.styles
                 out = npu_fast.decoder_step_fast_nocat(
                     act, self.kbufs, self.vbufs, self.wfast, attn[s], mlp[s],

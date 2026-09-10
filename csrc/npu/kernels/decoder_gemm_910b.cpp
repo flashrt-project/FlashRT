@@ -116,6 +116,15 @@ __global__ __aicore__ void decoder_gemm_kernel(GM_ADDR a, GM_ADDR b, GM_ADDR deq
         fp.quantPre = QuantMode_t::VDEQF16;
         fp.ndNum = 1;
         if (nzout) {
+            // A fractal-NZ block holds sixteen rows interleaved at 32-byte
+            // granularity, so writing only the M live ones threads gaps through
+            // it. That partial write is not safe between cores: with every
+            // projection running, a captured frame stops replaying to one answer
+            // -- 38 of 300 replays disagree, in 19 different ways. Writing the
+            // whole block is exact 300 of 300 and costs nothing measurable. The
+            // rows past M come from an A operand that was never loaded and are
+            // never gathered by the consumer, which walks rows 0..M-1.
+            fp.mSize = (uint16_t)M16;
             fp.dstStride = (uint32_t)M16;
             Fixpipe<half, int32_t, CFG_NZ>(cg[(uint32_t)tile * M16 * NT], co, dl[n0], fp);
         } else {

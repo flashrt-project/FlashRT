@@ -81,7 +81,11 @@ class DecoderQuantKernels(_NativeLibrary):
         if branch is not None:
             if branch.dtype not in (torch.bfloat16, torch.float16):
                 raise ValueError("the AdaRMS branch must be BF16 or FP16")
-            checks += [(branch, branch.dtype, residual.shape), (gate, torch.bfloat16, (1024,))]
+            # A fractal-NZ branch is one flat run of 16-row blocks, so it is
+            # 16 * D elements whatever the row count, and the kernel gathers a
+            # row out of it with one strided copy.
+            shape = (16 * 1024,) if branch_nz else residual.shape
+            checks += [(branch, branch.dtype, shape), (gate, torch.bfloat16, (1024,))]
         if quantize:
             checks.append((inverse, torch.float32, inverse.shape))
             if inverse.numel() != 1:
@@ -191,7 +195,7 @@ class DecoderInt8Projection:
     rows: int
 
     @classmethod
-    def bind(cls, weight, activation_amax, rows, nz=False):
+    def bind(cls, weight, activation_amax, rows, nz=False, out=None):
         """Freeze a stored ``(N, K)`` BF16 weight against per-step activations."""
         import numpy as np
         import torch
@@ -214,13 +218,28 @@ class DecoderInt8Projection:
         dequant = torch.from_numpy(product.view(np.uint32).astype(np.int64)).to(weight.device)
         inverse = torch.tensor(1.0 / activation, dtype=torch.float32, device=weight.device)
         columns, depth = column_tile(k)
-        # A fractal-NZ result is one flat run of 16-row blocks, not a matrix:
-        # element (r, c) sits at (c // 16) * 256 + r * 16 + (c % 16), which is
-        # independent of the column tile that produced it.
-        shape = (_L0C_ROWS * n,) if nz else (int(rows), n)
-        return cls(packed, dequant.contiguous(), inverse.contiguous(),
-                   torch.zeros(*shape, dtype=torch.float16, device=weight.device),
+        if out is None:
+            out = cls.result(n, int(rows), nz, weight.device)
+        return cls(packed, dequant.contiguous(), inverse.contiguous(), out,
                    DecoderGemmLibrary(), columns, depth, nz, int(rows))
+
+    @staticmethod
+    def result(columns: int, rows: int, nz: bool, device):
+        """The buffer a projection writes into.
+
+        A fractal-NZ result is one flat run of 16-row blocks rather than a
+        matrix: element (r, c) sits at (c // 16) * 256 + r * 16 + (c % 16),
+        which is independent of the column tile that produced it.
+
+        Every layer shares one of these per site. A projection's result is read
+        by the next kernel and dead by the time the following layer reaches the
+        same site, so the write-after-read between adjacent layers is real
+        ordering rather than an accident, and eighteen separate buffers only
+        remove it.
+        """
+        import torch
+        shape = (_L0C_ROWS * columns,) if nz else (rows, columns)
+        return torch.zeros(*shape, dtype=torch.float16, device=device)
 
     def __call__(self, activation, step: int):
         """INT8 ``activation`` times the frozen weight, dequantised to FP16."""
@@ -269,18 +288,22 @@ class DecoderInt8Pack:
         # Fractal NZ is worth it where the row is too narrow to hand whole
         # 512-byte regions to twenty cores: at 1024 columns a row is four
         # regions and grouping drops to four cores, while at 2560 and 8192 the
-        # row-major write with grouping is free or nearly so. Measured per site.
+        # row-major write with grouping is free or nearly so.
         names = {"qkv": False, "self_attn.o_proj": True,
                  "gu": False, "mlp.down_proj": True}
         for name in names:
             block = np.asarray(amax[name], dtype=np.float64)
             if block.shape != (layers, steps):
                 raise ValueError(f"'{name}' needs one activation maximum per layer and step")
+        first = weights[f"{prefix}.0.qkv.weight"]
+        shared = {name: DecoderInt8Projection.result(
+            weights[f"{prefix}.0.{name}.weight"].shape[0], rows, nz, first.device)
+            for name, nz in names.items()}
         bound = []
         for i in range(layers):
             bound.append({name: DecoderInt8Projection.bind(
                 weights[f"{prefix}.{i}.{name}.weight"], np.asarray(amax[name])[i],
-                rows, nz) for name, nz in names.items()})
+                rows, nz, shared[name]) for name, nz in names.items()})
         device = bound[0]["qkv"].weight.device
         attention = np.maximum(np.asarray(amax["self_attn.o_proj"], dtype=np.float64), 1e-12)
         scales = torch.tensor(np.repeat((127.0 / attention)[:, :, None], rows, axis=2),

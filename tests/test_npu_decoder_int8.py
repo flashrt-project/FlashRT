@@ -106,6 +106,20 @@ def test_only_the_narrow_projections_write_nz():
     assert '"self_attn.o_proj": True' in source and '"mlp.down_proj": True' in source
 
 
+def test_the_nz_write_covers_the_whole_fractal_block():
+    """Writing only the live rows of a 16-row block threads gaps through it, and
+    that partial write is not safe between cores."""
+    import inspect
+    import pathlib
+    from flash_rt.npu.core import decoder_int8
+
+    root = pathlib.Path(inspect.getfile(decoder_int8)).parents[3]
+    source = (root / "csrc/npu/kernels/decoder_gemm_910b.cpp").read_text()
+    branch = source.index("if (nzout) {")
+    fixpipe = source.index("CFG_NZ", branch)
+    assert "fp.mSize = (uint16_t)M16;" in source[branch:fixpipe]
+
+
 def test_the_column_tile_keeps_the_l0b_slot_at_half_the_buffer():
     from flash_rt.npu.core.decoder_int8 import column_tile
 

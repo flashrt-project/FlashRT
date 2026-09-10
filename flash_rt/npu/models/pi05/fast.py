@@ -602,3 +602,43 @@ def vision_tower_opt(images: torch.Tensor, w: dict, zeros: torch.Tensor, patch_t
            w[f"{vp}.post_layernorm.bias"])
     x = linear(x, w[f"{_MP}.weight"], w[f"{_MP}.bias"])
     return x.reshape(nv * VIS_TOKENS_PER_VIEW, ENC_D)
+
+
+def decoder_step_int8(x_t, kbufs, vbufs, style_attn, style_mlp, style_top,
+                      prefix_len: int, chunk: int, cos_t, sin_t, island,
+                      step: int, attention_kernel=None):
+    """``decoder_step_fast_nocat`` with the four projections frozen to INT8.
+
+    The launch count is the BF16 path's plus one: the attention output is the
+    only activation with no kernel of ours in front of it, so it takes the
+    shipped row quantiser, while the other three are quantised by the kernel
+    that was already writing them. Two of the four projections return their
+    result in fractal NZ and both are consumed by the AdaRMS branch, which
+    gathers a row from it directly.
+    """
+    x = x_t
+    pending = pending_gate = None
+    for i in range(DEC_L):
+        layer = island.layers[i]
+        gamma, shift, gate_a = style_attn[i]
+        x_mod, x = island.kernels.gated_ada(
+            x, pending, pending_gate, gamma, shift,
+            inverse=layer["qkv"].inverse[step],
+            branch_nz=island.layers[i - 1]["mlp.down_proj"].nz)
+        qkv = layer["qkv"](x_mod, step)
+        q_rot = island.kernels.decoder_rope(qkv, cos_t, sin_t, island.query,
+                                            kbufs[i], vbufs[i], prefix_len)
+        o = attention_kernel(q_rot, kbufs[i], vbufs[i])
+        o = layer["self_attn.o_proj"](island.quantize_attention(o, i, step), step)
+        gamma, shift, gate_f = style_mlp[i]
+        x_mod, x = island.kernels.gated_ada(
+            x, o, gate_a, gamma, shift, inverse=layer["gu"].inverse[step],
+            branch_nz=layer["self_attn.o_proj"].nz)
+        gu = layer["gu"](x_mod, step)
+        hidden = island.kernels.gated_gelu(
+            gu, layer["mlp.down_proj"].inverse[step], island.hidden)
+        pending, pending_gate = layer["mlp.down_proj"](hidden, step), gate_f
+    x_final, _ = island.kernels.gated_ada(
+        x, pending, pending_gate, style_top[0], style_top[1],
+        branch_nz=island.layers[DEC_L - 1]["mlp.down_proj"].nz)
+    return x_final
