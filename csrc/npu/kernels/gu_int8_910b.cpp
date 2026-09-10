@@ -29,7 +29,13 @@ __global__ __aicore__ void flashrt_gu_int8_kernel(GM_ADDR aa,GM_ADDR bb,GM_ADDR 
  }
  int core=GetBlockIdx()/GetTaskRation(),nt=H/GH,mt=(M+SM-1)/SM,count=0;
  for(int tile=core;tile<mt*nt;tile+=20,++count){
-  int mi=tile/nt,ni=tile%nt,m=mi*SM,n=ni*SN,cm=M-m<SM?M-m:SM,slot=count%2;
+  // Column index outermost. Tiles go out as tile += 20, so consecutive indices
+  // are the ones running at the same time; putting the mt tiles that share a
+  // column block of B on consecutive indices means all but the first read that
+  // block from L2. With the row index outermost each column block is fetched
+  // once per M tile and the kernel sits MTE2 bound at 0.74. Each tile
+  // accumulates on its own, so the walk order cannot change the arithmetic.
+  int ni=tile/mt,mi=tile%mt,m=mi*SM,n=ni*SN,cm=M-m<SM?M-m:SM,slot=count%2;
   int off=(core*2+slot)*SM*SN;
   if ASCEND_IS_AIC {
    if(count>=2)WaitEvent(6+slot);
