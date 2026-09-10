@@ -34,6 +34,38 @@ class CalibrationWeight:
         return F.linear(x, self.tensor, bias)
 
 
+@dataclass
+class StepCalibrationWeight:
+    """Observer for a projection the decoder runs once per denoise step.
+
+    The activation magnitude moves along the ODE trajectory, so one scale for
+    the whole trajectory spends most of its range on steps that do not need it.
+    The step index is the call index: the decoder loop visits every layer once
+    per step, in step order, so the k-th call to a given projection is step k.
+    """
+
+    tensor: torch.Tensor
+    name: str
+    amax: torch.Tensor
+    calls: int = 0
+
+    @classmethod
+    def create(cls, tensor, name, steps):
+        if steps <= 0:
+            raise ValueError("a step observer needs a positive step count")
+        return cls(tensor, name, torch.zeros(steps, device=tensor.device))
+
+    def reset(self):
+        self.amax.zero_()
+        self.calls = 0
+
+    def __call__(self, x, bias=None):
+        step = self.calls % self.amax.numel()
+        self.amax[step] = torch.maximum(self.amax[step], x.float().abs().amax())
+        self.calls += 1
+        return F.linear(x, self.tensor, bias)
+
+
 @dataclass(frozen=True)
 class StaticInt8Weight:
     tensor: torch.Tensor
@@ -126,7 +158,7 @@ class NzBf16Weight:
 def linear(x, weight, bias=None):
     """Resolve a setup-time binding while constructing a captured graph."""
     if isinstance(weight, (CalibrationWeight, StaticInt8Weight, StaticRowInt8Weight,
-                           NzBf16Weight)):
+                           NzBf16Weight, StepCalibrationWeight)):
         return weight(x, bias)
     if (bias is not None and bias.dtype == torch.float32
             and x.dtype == torch.bfloat16 and x.device.type == "npu"

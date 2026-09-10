@@ -85,6 +85,7 @@ class Pi05TorchFrontendNpu:
         self.num_steps = int(num_steps)
         self.use_int8 = bool(use_int8)
         self._int8_calibrated = False
+        self.decoder_int8 = None
         if use_fp8:
             logger.warning("NPU backend has no FP8 tier; ignoring use_fp8=True")
         if vision_pool_factor != 1:
@@ -196,7 +197,8 @@ class Pi05TorchFrontendNpu:
                                      decoder_rope=self._decoder_rope, ada_kernel=self._ada_kernel,
                                      encoder_rope=self._encoder_rope, euler_kernel=self._euler_kernel,
                                      cache_only=True, defer_residual=True, paged_attention=True,
-                                     image_patches=self._image_patches)
+                                     image_patches=self._image_patches,
+                                     decoder_int8=self.decoder_int8)
             self._runners[lang_len] = runner
         from contextlib import nullcontext
         with runner.native.lock if runner.native is not None else nullcontext():
@@ -242,13 +244,14 @@ class Pi05TorchFrontendNpu:
         if observations is None:
             raise ValueError("INT8 calibration requires real observations")
         import hashlib
-        from flash_rt.npu.models.pi05.quantization import calibrate_encoder
+        from flash_rt.npu.models.pi05.quantization import (calibrate_decoder,
+                                                          calibrate_encoder)
         from flash_rt.npu.core.native_kernels import RowQuantizer, GeluMulQuant, RmsRowQuant
         quantizer = RowQuantizer()
         fingerprints = []
         rng = np.random.default_rng(0)
 
-        def make_runner(sample, weights):
+        def make_runner(sample, weights, overlay=None):
             prompt = sample.get("prompt", self._current_prompt_text)
             if prompt is None:
                 raise ValueError("set a prompt or include prompt in every sample")
@@ -264,7 +267,8 @@ class Pi05TorchFrontendNpu:
             digest.update(noise.tobytes())
             fingerprints.append(digest.hexdigest())
             runner = _CapturedRunner(self.wb, self.num_views, len(tokens),
-                self.chunk_size, self.num_steps, self.conds, wfast=self.wfast,
+                self.chunk_size, self.num_steps, self.conds,
+                wfast=self.wfast if overlay is None else overlay,
                 styles=self.styles, wfe=weights, decoder_rope=self._decoder_rope,
                 ada_kernel=self._ada_kernel, encoder_rope=self._encoder_rope)
             ids = torch.tensor(tokens, device="npu", dtype=torch.long)
@@ -277,6 +281,14 @@ class Pi05TorchFrontendNpu:
             percentile, quantizer, GeluMulQuant(), RmsRowQuant(), attention_output_quant=True)
         report["sample_sha256"] = fingerprints
         self.wfe = bound
+        # The decoder is calibrated against the bound encoder, so its per-step
+        # activation maxima are the ones the served frame will actually see.
+        island, decoder_report = calibrate_decoder(
+            self.wfast, observations,
+            lambda sample, overlay: make_runner(sample, bound, overlay),
+            npu_pl.DEC_L, self.num_steps, self.chunk_size, percentile)
+        self.decoder_int8 = island
+        report["decoder"] = decoder_report
         self._calibration_report = report
         self._int8_calibrated = True
         self._runners.clear()
