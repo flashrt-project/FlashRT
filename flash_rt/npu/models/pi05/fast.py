@@ -13,12 +13,12 @@ import os
 
 import torch
 import torch.nn.functional as F
-from flash_rt.npu.core.linear import linear
+from flash_rt.npu.core.linear import NzBf16Weight, linear
 
 from flash_rt.npu.models.pi05.pipeline import (
     DEC_L, DEC_D, DEC_HD, DEC_NH, DEC_NKV, _DP, _TOP_EXP_NORM,
     ENC_L, ENC_D, ENC_HD, ENC_NH, ENC_NKV, _EP,
-    VIS_L, VIS_D, VIS_NH, VIS_HD, VIS_TOKENS_PER_VIEW, _VP, _MP,
+    VIS_L, VIS_D, VIS_H, VIS_NH, VIS_HD, VIS_TOKENS_PER_VIEW, _VP, _MP,
     GELU_TANH_APPROX,
     EPS, rope_half_split, attention, vision_attention, rms_norm, _rope_inv_freqs,
 )
@@ -81,6 +81,43 @@ def make_vision_padded_weights(wb: dict, padded_head_dim: int = 80) -> dict:
         weight = wb[key].reshape(VIS_D, VIS_NH, VIS_HD)
         result[key] = F.pad(weight, (0, extra)).reshape(
             VIS_D, VIS_NH * padded_head_dim).contiguous()
+    return result
+
+
+# SigLIP's MLP width is 4304, which is 16.81 fractal tiles of 256 and leaves the
+# cube pipeline tiling badly. Rounding it up to 17 whole tiles costs 48 zero
+# channels and measures far better on both MLP GEMMs.
+VIS_H_PADDED = 4352
+
+
+def make_vision_mlp_nz_weights(wb: dict, padded_hidden: int = VIS_H_PADDED) -> dict:
+    """Overlay the SigLIP MLP with fractal-NZ weights on a tile-aligned width.
+
+    ``fc1`` grows by ``padded_hidden - VIS_H`` zero output rows and a matching
+    zero bias, so the extra channels leave the projection as exact zeros;
+    ``gelu(0)`` is exactly zero for the tanh approximation, and ``fc2`` consumes
+    them through zero input columns that contribute exactly nothing. The
+    represented function is unchanged. What does change is the GEMM tiling, and
+    therefore the fp32 accumulation grouping inside ``fc2``'s K reduction, so
+    this is a reference-cosine change rather than a bit-identical one.
+
+    Biases are also emitted in BF16. The checkpoint conversion already rounds
+    the SigLIP layer biases to BF16 before widening them to FP32, so no value
+    is lost; it only keeps ``addmm`` from promoting the activation chain.
+    """
+    if padded_hidden < VIS_H:
+        raise ValueError("padded hidden width cannot discard model channels")
+    extra = padded_hidden - VIS_H
+    result = dict(wb)
+    for layer in range(VIS_L):
+        prefix = f"{_VP}.encoder.layers.{layer}.mlp"
+        result[f"{prefix}.fc1.weight"] = NzBf16Weight.bind(
+            wb[f"{prefix}.fc1.weight"], pad_out=extra)
+        result[f"{prefix}.fc1.bias"] = F.pad(
+            wb[f"{prefix}.fc1.bias"], (0, extra)).to(torch.bfloat16).contiguous()
+        result[f"{prefix}.fc2.weight"] = NzBf16Weight.bind(
+            wb[f"{prefix}.fc2.weight"], pad_in=extra)
+        result[f"{prefix}.fc2.bias"] = wb[f"{prefix}.fc2.bias"].to(torch.bfloat16).contiguous()
     return result
 
 

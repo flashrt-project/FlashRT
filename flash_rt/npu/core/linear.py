@@ -9,6 +9,9 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+# acl.ACL_FORMAT_FRACTAL_NZ: the cube-friendly fractal weight layout.
+_ACL_FORMAT_FRACTAL_NZ = 29
+
 
 @dataclass
 class CalibrationWeight:
@@ -68,9 +71,62 @@ class StaticInt8Weight:
         return out if bias is None else out + bias
 
 
+@dataclass(frozen=True)
+class NzBf16Weight:
+    """BF16 projection whose weight is held in Ascend fractal-NZ layout.
+
+    CANN reads an NZ operand with contiguous fractal loads instead of the
+    strided row gather an ND weight forces, which is the layout the cube
+    pipeline wants. The cast is setup-only: ``tensor`` is the logical ``(K, N)``
+    transpose of the stored ``(N, K)`` weight, converted once and then never
+    touched again, so replay sees a plain ``addmm``.
+
+    ``npu_linear`` cannot consume an NZ operand (it resolves to an aclop matmul,
+    which graph capture rejects), so the biased form is ``addmm``.
+    """
+
+    tensor: torch.Tensor
+    out_features: int
+
+    @classmethod
+    def bind(cls, weight, pad_in: int = 0, pad_out: int = 0):
+        """Convert a stored ``(N, K)`` BF16 weight, optionally zero-padded.
+
+        ``pad_in``/``pad_out`` extend K and N with zeros. A zero column adds
+        exactly nothing to the dot product and a zero row produces exactly zero,
+        so padding changes the GEMM tiling without changing the represented
+        function. It does change fp32 accumulation grouping, so a padded weight
+        is validated against the reference cosine gate rather than bit equality.
+        """
+        import torch_npu
+
+        if weight.dtype != torch.bfloat16:
+            raise ValueError("NZ binding expects a BF16 serving weight")
+        if pad_in or pad_out:
+            weight = F.pad(weight, (0, pad_in, 0, pad_out))
+        return cls(
+            torch_npu.npu_format_cast(weight.t().contiguous(), _ACL_FORMAT_FRACTAL_NZ),
+            weight.shape[0],
+        )
+
+    def __call__(self, x, bias=None):
+        flat = x.reshape(-1, x.shape[-1])
+        if bias is None:
+            out = torch.matmul(flat, self.tensor)
+        else:
+            # addmm promotes to the widest operand, so an FP32 bias would make
+            # the whole activation chain FP32. The stored vision biases are
+            # already BF16 values held in an FP32 container, so matching the
+            # activation dtype is lossless; callers pre-cast to keep this a
+            # no-op on the hot path.
+            out = torch.addmm(bias.to(flat.dtype), flat, self.tensor)
+        return out.reshape(x.shape[:-1] + (self.out_features,))
+
+
 def linear(x, weight, bias=None):
     """Resolve a setup-time binding while constructing a captured graph."""
-    if isinstance(weight, (CalibrationWeight, StaticInt8Weight, StaticRowInt8Weight)):
+    if isinstance(weight, (CalibrationWeight, StaticInt8Weight, StaticRowInt8Weight,
+                           NzBf16Weight)):
         return weight(x, bias)
     if (bias is not None and bias.dtype == torch.float32
             and x.dtype == torch.bfloat16 and x.device.type == "npu"
@@ -122,11 +178,10 @@ class StaticRowInt8Weight:
         import numpy as np
         amax = np.asarray(activation_amax, dtype=np.float32)
         if amax.shape != (image_rows + 1,) or not np.isfinite(amax).all() or (amax < 0).any():
-            raise ValueError("invalid real-data activation statistics")
-        if weight.ndim != 2:
-            raise ValueError("linear weight must be a matrix")
-        acts = torch.as_tensor(amax.copy(), device=weight.device).clamp_min(1e-10) / 127.0
-        scales = (weight.float().abs().amax(-1) / 127.0).clamp_min(1e-10)
+            raise ValueError("row activation amax must be a finite nonnegative vector")
+        acts = torch.from_numpy(amax).to(weight.device)
+        weight = weight.float()
+        scales = weight.abs().amax(dim=1).clamp_min(1e-12) / 127.0
         if not bool(torch.isfinite(scales).all().cpu()):
             raise ValueError("weight contains nonfinite values")
         quantized = (weight.float() / scales[:, None]).round().clamp(-127, 127).to(torch.int8)

@@ -45,3 +45,8 @@ internal-docs/
 notes/
 third_party/cutlass
 /artifacts/omega_e0m3/*.pt
+
+# CANN graph-fusion and op-check reports, written into the working
+# directory by the Ascend runtime at execution time.
+fusion_result.json
+ge_check_op.json
