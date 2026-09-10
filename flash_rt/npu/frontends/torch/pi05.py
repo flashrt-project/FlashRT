@@ -101,6 +101,10 @@ class Pi05TorchFrontendNpu:
         self.wref = npu_pl.load_weights_fp32(ckpt / "model.safetensors")
         self.wb = npu_fast.make_vision_padded_weights(
             {k: self._to_serving(k, v) for k, v in self.wref.items()})
+        # SigLIP MLP on a tile-aligned width with fractal-NZ operands; see
+        # ``make_vision_mlp_nz_weights``. Applied before the encoder/decoder
+        # overlays, which only read their own key prefixes.
+        self.wb = npu_fast.make_vision_mlp_nz_weights(self.wb)
 
         # per-step time conditioning (computed once, fp32/npu)
         self.conds = []
