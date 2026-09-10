@@ -46,8 +46,12 @@ def calibrate_encoder(weights, samples, make_runner, image_rows, percentile=99.9
         final = accumulate_amax(per_sample, percentile).reshape(len(sites), image_rows + 1)
         bound = dict(weights)
         for index, (key, observer) in enumerate(sites.items()):
+            # The MLP down projection reduces over 16384 columns, which is where
+            # a fractal-NZ operand pays; the 2048- and 256-wide projections
+            # measure slower in NZ and stay ND.
             bound[key] = StaticRowInt8Weight.bind(observer.tensor, final[index],
-                                                  image_rows, quantizer)
+                                                  image_rows, quantizer,
+                                                  nz=key.endswith(".mlp.down_proj.weight"))
         for layer in range(ENC_L):
             prefix = f"{_EP}.{layer}"
             for name, projections in (("qkv", ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj")),

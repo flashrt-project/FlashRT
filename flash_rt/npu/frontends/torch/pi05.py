@@ -105,6 +105,7 @@ class Pi05TorchFrontendNpu:
         # ``make_vision_mlp_nz_weights``. Applied before the encoder/decoder
         # overlays, which only read their own key prefixes.
         self.wb = npu_fast.make_vision_mlp_nz_weights(self.wb)
+        self.wb = npu_fast.make_vision_attn_nz_weights(self.wb)
 
         # per-step time conditioning (computed once, fp32/npu)
         self.conds = []

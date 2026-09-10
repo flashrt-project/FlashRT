@@ -174,18 +174,25 @@ class StaticRowInt8Weight:
     quantizer: object = None
 
     @classmethod
-    def bind(cls, weight, activation_amax, image_rows, quantizer=None):
+    def bind(cls, weight, activation_amax, image_rows, quantizer=None, nz=False):
         import numpy as np
         amax = np.asarray(activation_amax, dtype=np.float32)
         if amax.shape != (image_rows + 1,) or not np.isfinite(amax).all() or (amax < 0).any():
-            raise ValueError("row activation amax must be a finite nonnegative vector")
-        acts = torch.from_numpy(amax).to(weight.device)
-        weight = weight.float()
-        scales = weight.abs().amax(dim=1).clamp_min(1e-12) / 127.0
+            raise ValueError("invalid real-data activation statistics")
+        if weight.ndim != 2:
+            raise ValueError("linear weight must be a matrix")
+        acts = torch.as_tensor(amax.copy(), device=weight.device).clamp_min(1e-10) / 127.0
+        scales = (weight.float().abs().amax(-1) / 127.0).clamp_min(1e-10)
         if not bool(torch.isfinite(scales).all().cpu()):
             raise ValueError("weight contains nonfinite values")
         quantized = (weight.float() / scales[:, None]).round().clamp(-127, 127).to(torch.int8)
-        return cls(quantized.contiguous().t(), acts, scales, image_rows, {}, quantizer)
+        packed = quantized.contiguous().t()
+        if nz:
+            # Fractal-NZ pays on the wide-K reduction and loses on the narrow
+            # ones, so callers opt in per site rather than globally.
+            import torch_npu
+            packed = torch_npu.npu_format_cast(packed.contiguous(), _ACL_FORMAT_FRACTAL_NZ)
+        return cls(packed, acts, scales, image_rows, {}, quantizer)
 
     def scales_for_rows(self, rows, columns, device):
         if rows <= self.image_rows:
