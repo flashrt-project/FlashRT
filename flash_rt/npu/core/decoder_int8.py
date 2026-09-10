@@ -67,6 +67,12 @@ class DecoderQuantKernels(_NativeLibrary):
         self.rope = self.library.flashrt_npu_decoder_rope_fp16
         self.rope.argtypes = [C.c_void_p] * 7 + [C.c_int] * 2
         self.rope.restype = C.c_int
+        self.rope_vt = self.library.flashrt_npu_decoder_rope_vt
+        self.rope_vt.argtypes = [C.c_void_p] * 7 + [C.c_int] * 2
+        self.rope_vt.restype = C.c_int
+        self.vt_prefix = self.library.flashrt_npu_vt_prefix
+        self.vt_prefix.argtypes = [C.c_void_p] * 3 + [C.c_int] * 2
+        self.vt_prefix.restype = C.c_int
 
     def gated_ada(self, residual, branch, gate, gamma, shift, inverse=None,
                   branch_nz=False):
@@ -154,6 +160,61 @@ class DecoderQuantKernels(_NativeLibrary):
         if code:
             raise RuntimeError(f"native FP16 decoder rotary rejected arguments: {code}")
         return query
+
+    def decoder_rope_transposed(self, qkv, cos, sin, query, keys, values, position):
+        """``decoder_rope`` for the cache that keeps V transposed in fractal NZ.
+
+        The rotation and its FP16 input are identical; what differs is where
+        the two cache halves land. Keys take rows ``[0, rows)`` because the
+        action suffix leads that cache, and values are transposed into fractal
+        block zero. ``position`` is still the real rotary position of the first
+        action row, so the numbers are the same ones.
+        """
+        import torch
+        rows = query.shape[0]
+        if (qkv.dtype != torch.float16 or qkv.ndim != 2 or qkv.shape != (rows, 2560)
+                or not qkv.is_contiguous() or qkv.device.type != "npu"):
+            raise ValueError("decoder rotary expects a contiguous FP16 NPU (rows,2560) slab")
+        if position < 0 or rows <= 0 or rows > 16:
+            raise ValueError("invalid rotary position or action row count")
+        for tensor, dtype, columns in ((cos, torch.float32, 256), (sin, torch.float32, 256),
+                                       (keys, torch.bfloat16, 256), (query, torch.bfloat16, 2048)):
+            if (tensor.dtype != dtype or tensor.ndim != 2 or tensor.shape[1] != columns
+                    or tensor.device != qkv.device or not tensor.is_contiguous()):
+                raise ValueError("invalid rotary table, query or key buffer")
+        if (values.dtype != torch.bfloat16 or values.ndim != 1
+                or values.numel() < 16 * 256 or not values.is_contiguous()):
+            raise ValueError("the transposed value cache must be a flat contiguous BF16 buffer")
+        if keys.shape[0] < rows:
+            raise ValueError("the key buffer must cover the appended rows")
+        code = self.rope_vt(torch.npu.current_stream(qkv.device).npu_stream,
+            qkv.data_ptr(), cos.data_ptr(), sin.data_ptr(), query.data_ptr(),
+            keys.data_ptr(), values.data_ptr(), position, rows)
+        if code:
+            raise RuntimeError(f"native transposed decoder rotary rejected arguments: {code}")
+        return query
+
+    def transpose_prefix(self, source, values, rows: int, column: int):
+        """One layer of encoder prefix values into the NZ transpose, starting
+        at cache column ``column``. Replaces the straight copy the row-major
+        cache took, so the frame does not grow a launch for the layout.
+        """
+        import torch
+        if (source.dtype != torch.bfloat16 or source.ndim != 2 or source.shape[1] != 256
+                or not source.is_contiguous() or source.device.type != "npu"):
+            raise ValueError("the prefix transpose expects a contiguous BF16 (rows,256) source")
+        if (values.dtype != torch.bfloat16 or values.ndim != 1 or not values.is_contiguous()
+                or values.device != source.device):
+            raise ValueError("the transposed value cache must be a flat contiguous BF16 buffer")
+        if rows <= 0 or rows > source.shape[0] or column < 0 or column % 16:
+            raise ValueError("invalid prefix row count or 16-aligned cache column")
+        if values.numel() < (column + rows) * 256:
+            raise ValueError("the transposed value cache must cover the prefix")
+        code = self.vt_prefix(torch.npu.current_stream(source.device).npu_stream,
+                              source.data_ptr(), values.data_ptr(), rows, column)
+        if code:
+            raise RuntimeError(f"native prefix transpose rejected arguments: {code}")
+        return values
 
 
 def column_tile(k: int) -> tuple:

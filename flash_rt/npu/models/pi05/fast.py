@@ -408,12 +408,22 @@ def decoder_step_fast(x_t, enc_cache, wf, style_attn, style_mlp, style_top,
 
 # ── no-cat cross-attention K/V (L1b) ──────────────────────────────────
 
-def make_kv_buffers(prefix_len: int, chunk_cap: int, capacity=None) -> tuple:
+def make_kv_buffers(prefix_len: int, chunk_cap: int, capacity=None, cache=None) -> tuple:
     """One contiguous (prefix_len + chunk_cap, 256) K/V buffer per decoder
     layer. Encoder prefix rows are copied in once per frame
     (``fill_kv_prefix``); each denoise step overwrites only its own suffix
     rows in place. Removes the two per-layer ``torch.cat`` (+ their repeated
     copy of the whole prefix) from every decoder step."""
+    if cache is not None:
+        # The transposed cache is sized by the attention kernel's key tile, and
+        # its value half is a flat fractal-NZ buffer rather than a row-major
+        # matrix. Both halves start at zero because the columns neither the
+        # prefix nor the suffix reaches are padding and have to stay zero.
+        kbufs = [torch.zeros(cache.kvp, DEC_HD, dtype=torch.bfloat16, device="npu")
+                 for _ in range(DEC_L)]
+        vbufs = [torch.zeros(cache.kvp * DEC_HD, dtype=torch.bfloat16, device="npu")
+                 for _ in range(DEC_L)]
+        return kbufs, vbufs
     rows = capacity if capacity is not None else prefix_len + chunk_cap
     if rows < prefix_len + chunk_cap:
         raise ValueError("KV capacity does not cover the prefix and action suffix")
@@ -425,8 +435,16 @@ def make_kv_buffers(prefix_len: int, chunk_cap: int, capacity=None) -> tuple:
     return kbufs, vbufs
 
 
-def fill_kv_prefix(enc_cache, kbufs, vbufs, prefix_len: int) -> None:
+def fill_kv_prefix(enc_cache, kbufs, vbufs, prefix_len: int, cache=None,
+                   kernels=None) -> None:
     """Copy the encoder prefix K/V into the buffer head — once per frame."""
+    if cache is not None:
+        # Same launch count as the row-major cache: the value copy becomes the
+        # transposing kernel rather than gaining one.
+        for i in range(DEC_L):
+            kbufs[i][cache.column:cache.end].copy_(enc_cache[i][0])
+            kernels.transpose_prefix(enc_cache[i][1], vbufs[i], prefix_len, cache.column)
+        return
     for i in range(DEC_L):
         kbufs[i][:prefix_len].copy_(enc_cache[i][0])
         vbufs[i][:prefix_len].copy_(enc_cache[i][1])
@@ -626,8 +644,12 @@ def decoder_step_int8(x_t, kbufs, vbufs, style_attn, style_mlp, style_top,
             inverse=layer["qkv"].inverse[step],
             branch_nz=island.layers[i - 1]["mlp.down_proj"].nz)
         qkv = layer["qkv"](x_mod, step)
-        q_rot = island.kernels.decoder_rope(qkv, cos_t, sin_t, island.query,
-                                            kbufs[i], vbufs[i], prefix_len)
+        if getattr(attention_kernel, "transposed", False):
+            q_rot = island.kernels.decoder_rope_transposed(
+                qkv, cos_t, sin_t, island.query, kbufs[i], vbufs[i], prefix_len)
+        else:
+            q_rot = island.kernels.decoder_rope(qkv, cos_t, sin_t, island.query,
+                                                kbufs[i], vbufs[i], prefix_len)
         o = attention_kernel(q_rot, kbufs[i], vbufs[i])
         o = layer["self_attn.o_proj"](island.quantize_attention(o, i, step), step)
         gamma, shift, gate_f = style_mlp[i]
