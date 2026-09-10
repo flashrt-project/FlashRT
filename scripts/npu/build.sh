@@ -36,3 +36,17 @@ c++ -c -fPIC -O2 -std=c++17 \
  "$npu_repo_root/csrc/npu/kernels/gu_int8_910b.cpp" -x none "$npu_tiling_object" \
  -L"$npu_arch_root/lib64" -ltiling_api -lplatform -lregister -lascendalog -lruntime -ldl \
  -o "$npu_output_dir/libflashrt_npu_cube.so"
+# The decoder INT8 GEMM declares itself cube only at file scope, so it cannot
+# share a translation unit with the mixed gate/up kernel, and the kernel
+# headers define a per-unit tiling symbol, so it cannot share a library.
+"$npu_toolkit_root/bin/bisheng" -fPIC -shared -xcce -O2 -std=c++17 \
+ --cce-aicore-arch=dav-c220 \
+ -I"$npu_arch_root/asc/include" -I"$npu_arch_root/asc/include/adv_api" \
+ -I"$npu_arch_root/asc" -I"$npu_arch_root/asc/impl/basic_api" \
+ -I"$npu_arch_root/asc/impl/adv_api" -I"$npu_arch_root/include" \
+ -I"$npu_toolkit_root/compiler/tikcpp/tikcfw" \
+ -I"$npu_toolkit_root/compiler/tikcpp/tikcfw/impl" \
+ -I"$npu_toolkit_root/compiler/tikcpp/tikcfw/interface" \
+ "$npu_repo_root/csrc/npu/kernels/decoder_gemm_910b.cpp" \
+ -L"$npu_arch_root/lib64" -lascendalog -lruntime -ldl \
+ -o "$npu_output_dir/libflashrt_npu_decoder.so"
