@@ -41,10 +41,21 @@ class _CapturedRunner:
         if wfast is not None and styles is not None:
             plen = (num_views * npu_pl.VIS_TOKENS_PER_VIEW + lang_len)
             if paged_attention:
-                from .attention import PagedDecoderAttention
-                self.attention_kernel = PagedDecoderAttention.create(plen + chunk, chunk)
-            capacity = self.attention_kernel.capacity if self.attention_kernel else None
-            self.kbufs, self.vbufs = npu_fast.make_kv_buffers(plen, chunk, capacity)
+                from .attention import (PagedDecoderAttention, TransposedDecoderAttention,
+                                        transposed_attention_enabled)
+                # The transposed cache rides on the INT8 decoder's rotary, which
+                # is the only producer that writes the NZ value block. The BF16
+                # arm keeps the vendor operator and the row-major cache, so it
+                # stays a control of the shipped path rather than a variant.
+                if decoder_int8 is not None and transposed_attention_enabled():
+                    self.attention_kernel = TransposedDecoderAttention.create(plen, chunk)
+                else:
+                    self.attention_kernel = PagedDecoderAttention.create(plen + chunk, chunk)
+            transposed = getattr(self.attention_kernel, "transposed", False)
+            capacity = (None if transposed else
+                        (self.attention_kernel.capacity if self.attention_kernel else None))
+            self.kbufs, self.vbufs = npu_fast.make_kv_buffers(
+                plen, chunk, capacity, cache=self.attention_kernel if transposed else None)
             self.cos_t, self.sin_t = npu_fast.make_rope_tables(
                 plen + chunk, npu_pl.DEC_HD, device="npu")
         else:
@@ -107,7 +118,12 @@ class _CapturedRunner:
         plen = pref.shape[0]
         fast = self.wfast is not None and self.styles is not None
         if fast:
-            npu_fast.fill_kv_prefix(cache, self.kbufs, self.vbufs, plen)
+            if getattr(self.attention_kernel, "transposed", False):
+                npu_fast.fill_kv_prefix(cache, self.kbufs, self.vbufs, plen,
+                                        cache=self.attention_kernel,
+                                        kernels=self.decoder_int8.kernels)
+            else:
+                npu_fast.fill_kv_prefix(cache, self.kbufs, self.vbufs, plen)
         for s in range(self.num_steps):
             act = F.linear(x_t, self.wb["action_in_proj.weight"],
                            self.wb["action_in_proj.bias"])
