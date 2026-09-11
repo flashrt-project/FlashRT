@@ -27,6 +27,15 @@ of them removes launches from the replayed graph:
   bias=shift)``, so each of the 128 modulated norms is one kernel instead of
   three.
 
+* **Each residual joins the norm that follows it.** ``npu_add_layer_norm``
+  computes the sum and the normalisation of the sum in one launch and hands
+  back both, and the sum it returns is bit-identical to the separate add. At
+  the DiT's width that pair costs 7.66 us fused against 13.52 us apart, and it
+  runs 256 times a frame -- twice per layer-step, once across each layer
+  boundary. The loop is therefore carried as ``(residual, normalised)``: a
+  layer is entered with its modulated norm already computed by its
+  predecessor's residual.
+
 * **Cross-attention K/V is computed once per frame, over one token class.**
   It is a function of the backbone features alone, and the reference
   recomputes all 32 of those projections on every one of the four steps. The
@@ -249,19 +258,38 @@ class BoundChain:
 #  Frame forward
 # ══════════════════════════════════════════════════════════════════════
 
+def add_norm(residual, branch, weight, bias, eps):
+    """``branch + residual``, and the LayerNorm of the sum, in one launch.
+
+    Returns ``(normalised, sum)``. The sum is bit-identical to the separate
+    add; the normalisation rounds once in the kernel where the separate pair
+    rounds twice, which the end-to-end cosine judges.
+    """
+    import torch_npu
+    normalised, _, _, total = torch_npu.npu_add_layer_norm(
+        residual, branch, weight, bias, eps, True)
+    return normalised, total
+
+
 def encode_backbone_features(bound: BoundChain, features: torch.Tensor) -> torch.Tensor:
-    """vlln + the 4-layer VL self-attention adapter, over 461 tokens."""
+    """vlln + the 4-layer VL self-attention adapter, over the whole sequence."""
     x = F.layer_norm(features, (BACKBONE_DIM,), bound.vlln[0], bound.vlln[1], EPS)
-    for layer in bound.vlsa:
-        h = F.layer_norm(x, (BACKBONE_DIM,), layer["norm1"][0], layer["norm1"][1], EPS)
+    h = F.layer_norm(x, (BACKBONE_DIM,), bound.vlsa[0]["norm1"][0],
+                     bound.vlsa[0]["norm1"][1], EPS)
+    for index, layer in enumerate(bound.vlsa):
         q = layer["q"][0](h, layer["q"][1])
         k = layer["k"][0](h, layer["k"][1])
         v = layer["v"][0](h, layer["v"][1])
         a = attention(q, k, v, VLSA_HEADS, VLSA_HEAD_DIM)
-        x = x + layer["o"][0](a, layer["o"][1])
-        h = F.layer_norm(x, (BACKBONE_DIM,), layer["norm3"][0], layer["norm3"][1], EPS)
+        h, x = add_norm(x, layer["o"][0](a, layer["o"][1]),
+                        layer["norm3"][0], layer["norm3"][1], EPS)
         h = F.gelu(layer["fc1"][0](h, layer["fc1"][1]), approximate="tanh")
-        x = x + layer["fc2"][0](h, layer["fc2"][1])
+        branch = layer["fc2"][0](h, layer["fc2"][1])
+        if index + 1 < len(bound.vlsa):
+            following = bound.vlsa[index + 1]["norm1"]
+            h, x = add_norm(x, branch, following[0], following[1], EPS)
+        else:
+            x = x + branch
     return x
 
 
@@ -302,10 +330,14 @@ def encode_actions(bound: BoundChain, actions: torch.Tensor, step: int) -> torch
 
 
 def dit_layer(bound: BoundChain, index: int, step: int, x: torch.Tensor,
-              cross_kv) -> torch.Tensor:
+              h: torch.Tensor, cross_kv):
+    """One block, entered with its modulated norm ``h`` already computed.
+
+    Returns the residual and the norm the *next* consumer needs, which is the
+    following block's modulated norm or, after the last block, the output
+    head's.
+    """
     layer = bound.layers[index]
-    gamma, beta = bound.ada[index]
-    h = F.layer_norm(x, (DIT_DIM,), gamma[step], beta[step], EPS)
     q = layer["q"][0](h, layer["q"][1])
     if layer["cross"]:
         key, value = cross_kv[index]
@@ -313,18 +345,23 @@ def dit_layer(bound: BoundChain, index: int, step: int, x: torch.Tensor,
         key = layer["k"][0](h, layer["k"][1])
         value = layer["v"][0](h, layer["v"][1])
     a = attention(q, key, value, DIT_HEADS, DIT_HEAD_DIM)
-    x = x + layer["o"][0](a, layer["o"][1])
-    h = F.layer_norm(x, (DIT_DIM,), bound.unit, bound.zero, EPS)
+    h, x = add_norm(x, layer["o"][0](a, layer["o"][1]), bound.unit, bound.zero, EPS)
     h = F.gelu(layer["ff1"][0](h, layer["ff1"][1]), approximate="tanh")
-    return x + layer["ff2"][0](h, layer["ff2"][1])
+    branch = layer["ff2"][0](h, layer["ff2"][1])
+    if index + 1 < DIT_LAYERS:
+        gamma, beta = bound.ada[index + 1]
+        return add_norm(x, branch, gamma[step], beta[step], EPS)
+    gamma, beta = bound.out_norm
+    return add_norm(x, branch, gamma[step], beta[step], NORM_OUT_EPS)
 
 
 def dit(bound: BoundChain, hidden: torch.Tensor, step: int, cross_kv):
+    gamma, beta = bound.ada[0]
+    h = F.layer_norm(hidden, (DIT_DIM,), gamma[step], beta[step], EPS)
+    x = hidden
     for index in range(DIT_LAYERS):
-        hidden = dit_layer(bound, index, step, hidden, cross_kv)
-    gamma, beta = bound.out_norm
-    hidden = F.layer_norm(hidden, (DIT_DIM,), gamma[step], beta[step], NORM_OUT_EPS)
-    return bound.proj_out_2[0](hidden, bound.proj_out_2[1])
+        h, x = dit_layer(bound, index, step, x, h, cross_kv)
+    return bound.proj_out_2[0](h, bound.proj_out_2[1])
 
 
 def denoise(bound: BoundChain, text: torch.Tensor, image: torch.Tensor,
