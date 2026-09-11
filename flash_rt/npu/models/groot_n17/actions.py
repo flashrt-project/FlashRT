@@ -140,3 +140,55 @@ class ActionDecoder:
         translation = (relative[:, :3] @ rotation_reference.transpose(-1, -2)
                        + reference[:3])
         return torch.cat((translation, rotation[:, :2, :].reshape(-1, 6)), dim=-1)
+
+
+class StateEncoder:
+    """The robot's raw state to the model's normalised state vector.
+
+    The forward half of the same contract the decoder inverts, and the same
+    discipline: bounds and modality order come from the processor's own
+    parameters, and the vector is padded to the action head's width the way the
+    reference pads it.
+    """
+
+    def __init__(self, processor, embodiment_tag: str, width: int, *,
+                 device="npu:0", dtype=torch.float32):
+        state_action = processor.state_action_processor
+        config = state_action.modality_configs[embodiment_tag]["state"]
+        params = state_action.norm_params[embodiment_tag]["state"]
+        if config.mean_std_embedding_keys:
+            raise NotImplementedError(
+                "this encoder implements the min/max contract; the checkpoint "
+                f"normalises {config.mean_std_embedding_keys} by mean and standard "
+                "deviation")
+        self.keys = list(config.modality_keys)
+        self.width = int(width)
+        self.device = device
+        self.dtype = dtype
+        self.bounds = {}
+        total = 0
+        for key in self.keys:
+            low = torch.as_tensor(params[key]["min"]).to(device, dtype).reshape(-1)
+            high = torch.as_tensor(params[key]["max"]).to(device, dtype).reshape(-1)
+            self.bounds[key] = (low, high - low)
+            total += low.numel()
+        if total > self.width:
+            raise ValueError(
+                f"the state modalities total {total} values, wider than the "
+                f"action head's {self.width}")
+        self.used = total
+
+    def __call__(self, state: dict) -> torch.Tensor:
+        """``{modality: (..., dim)}`` to ``(1, 1, width)``."""
+        out = torch.zeros(self.width, device=self.device, dtype=self.dtype)
+        at = 0
+        for key in self.keys:
+            low, span = self.bounds[key]
+            values = torch.as_tensor(state[key]).to(self.device, self.dtype).reshape(-1)
+            if values.numel() != low.numel():
+                raise ValueError(
+                    f"state {key!r} has {values.numel()} values, the checkpoint "
+                    f"declares {low.numel()}")
+            out[at:at + low.numel()] = 2.0 * (values - low) / span - 1.0
+            at += low.numel()
+        return out.view(1, 1, self.width)
