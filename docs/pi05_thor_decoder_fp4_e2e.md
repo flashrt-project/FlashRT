@@ -559,10 +559,34 @@ classes directly and is required for the exploratory A/B knobs, and results
 from that mode are not public-API numbers. The recorded `result.json` carries
 the mode in `construction` and the exact call in `children.*.public_api_call`.
 
+### Warmup and latency references
+
+The harness defaults to 300 warmup calls per mode. On Thor, 20 calls can leave
+the system warming up during the timed run: a reproduced 2-view run moved from
+41.38 / 29.05 ms FP8 / FP4 p50 with 20 warmups to 38.62 / 27.25 ms with 300.
+Each child result also records ten ordered group medians in
+`latency_group_medians_ms`. A clear step between groups suggests the timing
+regime changed while samples were being collected.
+
+The latest README values and the performance gate serve different purposes:
+
+| Views | README reference | Earlier-tier regression baseline | Gate limit |
+|---:|---:|---:|---:|
+| 1 | 23.01 ms | 30.5 ms | 28.5 ms |
+| 2 | 27.17 ms | 36.3 ms | 34.3 ms |
+| 3 | 31.74 ms | 42.8 ms | 40.8 ms |
+
+The README column is the current comparison point. The regression baseline is
+retained only for the existing acceptance gate, which requires a 2 ms margin
+over that earlier tier. Passing the gate therefore does not claim that a run
+reproduced the latest README latency. These names replace the ambiguous
+`published_sota_p50_ms` fields and gate in earlier artifacts, so new
+`result.json` files carry `schema_version: 2`.
+
 Both processes run FA4: the comparison isolates NVFP4 against FP8 with the
 attention backend held fixed, so the reported speedup is not an FA4 speedup.
 
-The current multi-view run used:
+The 2026-08-05 multi-view run used:
 
 - NVIDIA Thor, compute capability 11.0, MAXN.
 - GPC min/max/current 1.575 GHz.
@@ -579,10 +603,10 @@ The current multi-view run used:
 
 The suite requires a clean tracked worktree and fails unless clocks and device
 identity match, all outputs are finite, FP4 is faster than FP8, and the
-per-view published-minus-2-ms p50 target passes. It also requires 2-view p95
-at most 40 ms and 3-view p50 at most 40 ms. Final 7D action cosine must be at
-least 0.999 globally and 0.995 for every sample; internal raw cosine must be at
-least 0.995 globally and for every sample.
+per-view earlier-tier regression baseline minus 2 ms limit passes. It also
+requires 2-view p95 at most 40 ms and 3-view p50 at most 40 ms. Final 7D action
+cosine must be at least 0.999 globally and 0.995 for every sample; internal raw
+cosine must be at least 0.995 globally and for every sample.
 
 ## Encoder Down v7 Multi-View Result (commit `8424808`, 2026-07-26)
 

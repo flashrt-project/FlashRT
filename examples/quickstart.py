@@ -50,7 +50,8 @@ def main():
     parser.add_argument('--benchmark', type=int, default=0)
     parser.add_argument('--warmup', type=int, default=500,
                         help="Warmup iters before timed run. RTX 5090 needs "
-                             "~500 to reach boost P-state; Thor can use 20.")
+                             "~500 to reach boost P-state; Pi0.5 on Thor "
+                             "may need ~300 for stable results.")
     parser.add_argument('--autotune', type=int, default=3,
                         help="Autotune trials: 0=off, 3=default, 5=thorough")
     parser.add_argument('--recalibrate', action='store_true',
@@ -130,7 +131,8 @@ def main():
     if args.benchmark > 0:
         # RTX 5090 takes ~500 replay iterations to climb from idle P8
         # (195 MHz) to boost P1 (~2870 MHz). Small warmup biases P50 by
-        # 2-3 ms. Jetson Thor settles faster, 50 is plenty there.
+        # 2-3 ms. Pi0.5 on Thor can also need ~300 iterations before the
+        # latency regime settles.
         warmup = args.warmup
         for _ in range(warmup):
             model.predict(images=imgs)

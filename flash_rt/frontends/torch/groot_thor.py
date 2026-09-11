@@ -13,6 +13,7 @@ import ctypes
 import json
 import logging
 import math
+import os
 import pathlib
 import time
 from typing import Optional
@@ -80,7 +81,8 @@ class GrootTorchFrontendThor:
     """GROOT N1.6 inference pipeline on Thor SM110."""
 
     def __init__(self, checkpoint, num_views=2, autotune=3,
-                 embodiment_tag="new_embodiment", use_fp8=True):
+                 embodiment_tag="new_embodiment", use_fp8=True,
+                 image_size=224, parity=False):
         """Initialize GROOT pipeline.
 
         Args:
@@ -88,6 +90,12 @@ class GrootTorchFrontendThor:
             num_views: camera views (default 2)
             autotune: CUDA Graph autotune intensity (0=off, 3=default)
             embodiment_tag: target embodiment for per-embodiment MLPs
+            image_size: SigLIP input edge (must be divisible by 14).
+                224 = 16x16 patches (legacy); 252 = 18x18 patches, the
+                GR00T N1.6 training/eval resolution (HF processor chain
+                LetterBoxPad -> 256 -> 0.95 crop -> 252).
+            parity: opt into the HF-native BF16 backbone and DiT. The default
+                keeps the pre-existing fully-kernelized execution path.
         """
         if embodiment_tag not in EMBODIMENT_TAG_TO_INDEX:
             raise ValueError(
@@ -98,8 +106,28 @@ class GrootTorchFrontendThor:
         self._num_views = num_views
         self._autotune = autotune
         self.use_fp8 = bool(use_fp8)
+        if parity and self.use_fp8:
+            raise ValueError(
+                "parity=True requires use_fp8=False; mixing the FP8 backbone "
+                "with the HF-native DiT is not a supported precision profile")
+        if parity and image_size != 252:
+            raise ValueError(
+                "parity=True requires image_size=252 to match the GR00T "
+                "N1.6 evaluation preprocessing contract")
+        # Working dtype of the vision/LLM feature path: FP8 mode keeps the
+        # legacy fp16 buffers; parity mode stays bf16 end-to-end to match HF.
+        self._bd = (torch.float16 if (self.use_fp8 or not parity)
+                    else torch.bfloat16)
+        # parity=True: HF-native torch modules (exact, ~110ms).
+        # parity=False: FlashRT kernel fast path (fp16/fp8 GEMM+FMHA, ~30ms).
+        self.parity = bool(parity)
         self._embodiment_tag = embodiment_tag
         self._embodiment_id = EMBODIMENT_TAG_TO_INDEX[embodiment_tag]
+        if image_size % 14 != 0 or (image_size // 14) % 2 != 0:
+            raise ValueError(
+                f"image_size must be divisible by 28 (got {image_size}); "
+                "the patch grid must be even for pixel_unshuffle(2).")
+        self.image_size = image_size
         self._real_data_calibrated = False
         self.calibrated = False
 
@@ -133,8 +161,8 @@ class GrootTorchFrontendThor:
         self.HD_sig = 72
         self.H_sig = 4304
         self.L_sig = 27
-        self.spv_raw = 256   # raw patches per view (before pixel unshuffle)
-        self.spv = 64        # tokens per view after 2x2 pixel_unshuffle (C4)
+        self.spv_raw = (image_size // 14) ** 2  # raw patches per view
+        self.spv = (image_size // 28) ** 2      # tokens per view after 2x2 pixel_unshuffle (C4)
         self.mlp1_in = 4608  # 1152 * 4 after pixel unshuffle (C5)
 
         # Qwen3 (★16 layers★, select_layer=16, checkpoint truncated) (C1)
@@ -158,7 +186,7 @@ class GrootTorchFrontendThor:
         self.action_dim = 128    # ★ NOT 29 — padded max, per-embodiment actual varies ★
         self.state_dim = 128     # ★ NOT 29 ★
         self.action_horizon = 50 # ★ NOT 16 — padded max ★
-        self.num_steps = 4       # flow-matching Euler steps
+        self.num_steps = max(1, int(os.environ.get("FLASHRT_N16_DIT_STEPS", "4")))
         self.Sa = self.action_horizon + 1  # 51 = 1 state + 50 actions
 
         # ── Load checkpoint (keep full sd; SigLIP init deferred to _capture_all_graphs) ──
@@ -227,8 +255,18 @@ class GrootTorchFrontendThor:
         self._sig_patch_w = sd[f"{VIS_PREFIX}.embeddings.patch_embedding.weight"].to(fp16)  # [1152, 588]
         self._sig_patch_b = sd[f"{VIS_PREFIX}.embeddings.patch_embedding.bias"].to(fp16)    # [1152]
 
-        # Position embedding: [256, 1152] — 256 patches, NO CLS (C15)
-        self._sig_pos_embed = sd[f"{VIS_PREFIX}.embeddings.position_embedding.weight"].to(fp16)  # [256, 1152]
+        # Position embedding: [256, 1152] — 256 patches, NO CLS (C15).
+        # Resize 16x16 -> grid x grid to match HF resize_positional_embeddings
+        # (bilinear, align_corners=False, antialias=True, fp32).
+        pos = sd[f"{VIS_PREFIX}.embeddings.position_embedding.weight"].float()
+        grid = int(math.sqrt(self.spv_raw))
+        if grid != 16:
+            pos = (torch.nn.functional.interpolate(
+                pos.reshape(1, 16, 16, -1).permute(0, 3, 1, 2),
+                size=(grid, grid), mode="bilinear",
+                align_corners=False, antialias=True)
+                .permute(0, 2, 3, 1).reshape(-1, self.D_sig))
+        self._sig_pos_embed = pos.to(fp16)  # [spv_raw, 1152]
 
         # mlp1: LN(4608) → Linear(4608,2048) → GELU → Linear(2048,2048) (C5)
         self._mlp1_ln_w = sd[f"{MLP1_PREFIX}.0.weight"].to(fp16)    # [4608]
@@ -598,7 +636,7 @@ class GrootTorchFrontendThor:
             # flip_sin_to_cos=True, downscale_freq_shift=1
             half_dim = 128  # 256 / 2
             exponent = -torch.arange(half_dim, dtype=torch.float32, device='cuda') * \
-                       (math.log(10000.0) / half_dim)
+                       (math.log(10000.0) / (half_dim - 1))
             emb_freqs = exponent.exp()  # [128]
 
             t_values = [0, 250, 500, 750]
@@ -734,7 +772,7 @@ class GrootTorchFrontendThor:
         """Timesteps(256) → TimestepEmbedding → temb [1, 1536]."""
         half_dim = 128
         exp = -torch.arange(half_dim, dtype=torch.float32, device='cuda') * \
-              (math.log(10000.0) / half_dim)
+              (math.log(10000.0) / (half_dim - 1))
         t_tensor = torch.tensor([t_disc], dtype=torch.float32, device='cuda')
         args = t_tensor[:, None] * exp.exp()
         sincos = torch.cat([torch.cos(args), torch.sin(args)], dim=-1).to(fp16)
@@ -751,6 +789,949 @@ class GrootTorchFrontendThor:
                    + self._state_enc_b1)
         h = self._fp16_gemm(h, self._state_enc_w2, 1, self.D_dit, 1024) + self._state_enc_b2
         return h.unsqueeze(0)  # [1, 1, D_dit]
+
+    def _fill_dit_kv(self):
+        """Compact valid backbone rows into the DiT cross-attention KV buffers.
+
+        HF excludes the other modality's backbone tokens from each DiT
+        cross-attention layer via an attention mask. Writing zero-masked
+        full-length rows instead would leave bias-only K/V rows that still
+        receive attention mass and corrupt the velocity field (the
+        flow-matching noise then fails to collapse). Gather only the valid
+        rows and report their counts so the kernels attend the right length.
+        """
+        txt = self._g_vlln_buf[self._g_non_img[0]]      # (n_text, D) fp16
+        img = self._g_vlln_buf[self._g_img_m[0]]        # (n_img, D)  fp16
+        self._g_dit.b_kv_text[:txt.shape[0]].copy_(txt)
+        self._g_dit.b_kv_img[:img.shape[0]].copy_(img)
+        self._g_dit.set_kv_counts(txt.shape[0], img.shape[0])
+
+    def _setup_torch_dit(self):
+        """Extract action-head weights from ``_full_sd`` for the
+        HF-faithful torch DiT path. Call while ``_full_sd`` is alive.
+        Parity mode runs the DiT in fp32 (bf16 denoising amplifies
+        rounding into visible chunk wobble vs HF)."""
+        sd = self._full_sd
+        AH = "action_head"
+        eid = self._embodiment_id
+        # HF runs the DiT in bf16; parity mode matches it exactly.
+        dt = torch.bfloat16
+        self._dit_dt = dt
+        w = {}
+        ts = f"{AH}.model.timestep_encoder.timestep_embedder"
+        w['ts_l1_w'] = sd[f"{ts}.linear_1.weight"].to(dt)
+        w['ts_l1_b'] = sd[f"{ts}.linear_1.bias"].to(dt)
+        w['ts_l2_w'] = sd[f"{ts}.linear_2.weight"].to(dt)
+        w['ts_l2_b'] = sd[f"{ts}.linear_2.bias"].to(dt)
+        w['proj1_w'] = sd[f"{AH}.model.proj_out_1.weight"].to(dt)
+        w['proj1_b'] = sd[f"{AH}.model.proj_out_1.bias"].to(dt)
+        w['proj2_w'] = sd[f"{AH}.model.proj_out_2.weight"].to(dt)
+        w['proj2_b'] = sd[f"{AH}.model.proj_out_2.bias"].to(dt)
+        blocks = []
+        for l in range(32):
+            p = f"{AH}.model.transformer_blocks.{l}"
+            blocks.append({k: sd[f"{p}.{n}"].to(dt) for k, n in (
+                ('n1w', 'norm1.linear.weight'), ('n1b', 'norm1.linear.bias'),
+                ('qw', 'attn1.to_q.weight'),    ('qb', 'attn1.to_q.bias'),
+                ('kw', 'attn1.to_k.weight'),    ('kb', 'attn1.to_k.bias'),
+                ('vw', 'attn1.to_v.weight'),    ('vb', 'attn1.to_v.bias'),
+                ('ow', 'attn1.to_out.0.weight'), ('ob', 'attn1.to_out.0.bias'),
+                ('fw', 'ff.net.0.proj.weight'), ('fb', 'ff.net.0.proj.bias'),
+                ('dw', 'ff.net.2.weight'),      ('db', 'ff.net.2.bias'))})
+        w['blocks'] = blocks
+        # Per-embodiment MLPs (CategorySpecificLinear: x @ W[eid] + b[eid])
+        w['ae_w1'] = sd[f"{AH}.action_encoder.W1.W"][eid].to(dt)
+        w['ae_b1'] = sd[f"{AH}.action_encoder.W1.b"][eid].to(dt)
+        w['ae_w2'] = sd[f"{AH}.action_encoder.W2.W"][eid].to(dt)
+        w['ae_b2'] = sd[f"{AH}.action_encoder.W2.b"][eid].to(dt)
+        w['ae_w3'] = sd[f"{AH}.action_encoder.W3.W"][eid].to(dt)
+        w['ae_b3'] = sd[f"{AH}.action_encoder.W3.b"][eid].to(dt)
+        w['se_w1'] = sd[f"{AH}.state_encoder.layer1.W"][eid].to(dt)
+        w['se_b1'] = sd[f"{AH}.state_encoder.layer1.b"][eid].to(dt)
+        w['se_w2'] = sd[f"{AH}.state_encoder.layer2.W"][eid].to(dt)
+        w['se_b2'] = sd[f"{AH}.state_encoder.layer2.b"][eid].to(dt)
+        w['ad_w1'] = sd[f"{AH}.action_decoder.layer1.W"][eid].to(dt)
+        w['ad_b1'] = sd[f"{AH}.action_decoder.layer1.b"][eid].to(dt)
+        w['ad_w2'] = sd[f"{AH}.action_decoder.layer2.W"][eid].to(dt)
+        w['ad_b2'] = sd[f"{AH}.action_decoder.layer2.b"][eid].to(dt)
+        w['posemb'] = sd[f"{AH}.position_embedding.weight"].to(dt)
+        # diffusers Timesteps(256, flip_sin_to_cos=True, downscale_freq_shift=1)
+        half = 128
+        self._dit_ts_freqs = torch.exp(
+            -torch.arange(half, dtype=torch.float32, device='cuda')
+            * (math.log(10000.0) / (half - 1)))
+        # SinusoidalPositionalEncoding(1536): sin-first, exact half_dim denom
+        hd = self.D_dit // 2
+        self._dit_tau_freqs = torch.exp(
+            -torch.arange(hd, dtype=torch.float32, device='cuda')
+            * (math.log(10000.0) / hd))
+        self._dit_tw = w
+
+    def _resolve_eagle_dir(self) -> pathlib.Path:
+        """Locate the Eagle-Block2A-2B-v2 remote-code directory.
+
+        Only checkpoint-local code or an explicitly selected checkout is
+        accepted. Selecting a cache directory by sort order is not
+        reproducible when several revisions are installed.
+        """
+        override = os.environ.get("FLASHRT_N16_EAGLE_DIR")
+        if override:
+            p = pathlib.Path(override)
+            if (p / "modeling_siglip2.py").is_file():
+                return p
+            raise RuntimeError(
+                f"FLASHRT_N16_EAGLE_DIR={override} has no modeling_siglip2.py")
+        for candidate in (
+                self._checkpoint_path,
+                self._checkpoint_path / "Eagle-Block2A-2B-v2"):
+            if (candidate / "modeling_siglip2.py").is_file():
+                return candidate
+        raise RuntimeError(
+            "Eagle-Block2A-2B-v2 remote code was not found in the checkpoint. "
+            "Set FLASHRT_N16_EAGLE_DIR to an explicitly pinned checkout; "
+            "FlashRT does not select an arbitrary Hugging Face cache revision.")
+
+    def _setup_torch_siglip(self):
+        """Parity mode: HF-native Siglip2VisionModel (bf16) from the Eagle
+        remote code, weights from the checkpoint state dict."""
+        import importlib.util as _ilu
+        import json as _json
+        eagle_dir = self._resolve_eagle_dir()
+        mod_path = eagle_dir / "modeling_siglip2.py"
+        if not mod_path.exists():
+            raise RuntimeError(
+                f"modeling_siglip2.py not found in {eagle_dir}")
+        spec = _ilu.spec_from_file_location("eagle_siglip2_parity", str(mod_path))
+        mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        cfg_json = eagle_dir / "config.json"
+        if cfg_json.exists():
+            vc = dict(_json.load(open(cfg_json))["vision_config"])
+        else:
+            vc = dict(
+                hidden_size=self.D_sig, num_attention_heads=self.NH_sig,
+                num_hidden_layers=self.L_sig, intermediate_size=self.H_sig,
+                image_size=252, patch_size=14, hidden_act="gelu_pytorch_tanh",
+                layer_norm_eps=1e-6, attention_dropout=0.0, dropout=0.0,
+            )
+        vc.pop("_attn_implementation_autoset", None)
+        model = mod.Siglip2VisionModel(mod.Siglip2VisionConfig(**vc))
+        model = model.to(torch.bfloat16).cuda().eval()
+        prefix = "backbone.model.vision_model."
+        sub = {k[len(prefix):]: v.to(torch.bfloat16)
+               for k, v in self._full_sd.items() if k.startswith(prefix)}
+        missing, unexpected = model.load_state_dict(sub, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                f"torch SigLIP weight mismatch: missing={missing[:5]} "
+                f"unexpected={unexpected[:5]}")
+        self._torch_siglip = model
+        self._patch_siglip_fa4(mod)
+        self._setup_siglip_fp4()
+        logger.info("Torch SigLIP (parity mode) loaded: 27L bf16")
+
+    def _patch_siglip_fa4(self, mod):
+        """Route Siglip2Attention through FA4 (flash_rt.hardware.thor.fa4_backend).
+
+        The parity encoder does cross-view FULL attention over the packed
+        648-token sequence (sdpa silently ignores the NaFlex window
+        segmentation — see docs/groot_n16_thor_sm110.md bug #3), so FA4's
+        causal=False path is an exact drop-in for the sdpa call. Measured
+        encoder-graph 10.3 -> 9.0 ms, actions cos 1.000000 vs sdpa
+        (2026-08-14). FLASHRT_N16_FA4=0 forces sdpa; a missing FA4 runtime
+        falls back silently. Must run before the encoder graph is captured.
+        """
+        if os.environ.get("FLASHRT_N16_FA4", "0") != "1":
+            return
+        try:
+            from flash_rt.hardware.thor import fa4_backend
+        except Exception:  # noqa: BLE001
+            return
+        if not fa4_backend.is_available():
+            logger.info("SigLIP FA4 skipped: %s", fa4_backend.status())
+            return
+        fa4 = fa4_backend.fa4_func()
+        attn_cls = type(self._torch_siglip.vision_model.encoder.layers[0].self_attn)
+        if getattr(attn_cls, "_flashrt_fa4_patched", False):
+            return
+        apply_rope = attn_cls.forward.__globals__.get("apply_rope")
+
+        def fa4_forward(self, hidden_states, output_attentions=False,
+                        rope_freqs_cis=None, win_meta_list=None,
+                        windows_attn=False):
+            B, S, E = hidden_states.shape
+            q = self.q_proj(hidden_states).view(B, S, self.num_heads, self.head_dim)
+            k = self.k_proj(hidden_states).view(B, S, self.num_heads, self.head_dim)
+            v = self.v_proj(hidden_states).view(B, S, self.num_heads, self.head_dim)
+            if self.use_rope and apply_rope is not None:
+                q, k = apply_rope(q, k, rope_freqs_cis)
+            o = fa4(q.contiguous(), k.contiguous(), v.contiguous(),
+                    causal=False, softmax_scale=self.scale)
+            if isinstance(o, tuple):
+                o = o[0]
+            return self.out_proj(o.view(B, S, E)), None
+
+        attn_cls.forward = fa4_forward
+        attn_cls._flashrt_fa4_patched = True
+        logger.info("SigLIP attention routed through FA4 (%s)", fa4_backend.status())
+
+    def _setup_torch_qwen3(self):
+        """Parity mode: load HF-native Qwen3Model (bf16, sdpa) from the
+        checkpoint state dict. Same math as the eager HF baseline."""
+        import json as _json
+        from transformers import Qwen3Config, Qwen3Model
+        eagle_dir = self._resolve_eagle_dir()
+        cfg_json = eagle_dir / "config.json"
+        if cfg_json.exists():
+            tc = dict(_json.load(open(cfg_json)).get("text_config", {}))
+        else:
+            tc = {}
+        if not tc:
+            tc = dict(
+                hidden_size=self.D_llm, num_attention_heads=self.NHQ,
+                num_key_value_heads=self.NHKV, head_dim=self.HD_llm,
+                intermediate_size=self.H_llm, hidden_act="silu",
+                max_position_embeddings=4096, rms_norm_eps=1e-6,
+                rope_theta=1000000.0, use_sliding_window=False,
+                vocab_size=151680,
+            )
+        tc["num_hidden_layers"] = 16  # checkpoint is truncated
+        tc["_attn_implementation"] = "sdpa"
+        config = Qwen3Config(**tc)
+        model = Qwen3Model(config).to(torch.bfloat16).cuda().eval()
+        prefix = "backbone.model.language_model.model."
+        sub = {k[len(prefix):]: v.to(torch.bfloat16)
+               for k, v in self._full_sd.items()
+               if k.startswith(prefix)}
+        missing, unexpected = model.load_state_dict(sub, strict=False)
+        missing = [m for m in missing if "embed_tokens" not in m]
+        if missing or unexpected:
+            raise RuntimeError(
+                f"torch Qwen3 weight mismatch: missing={missing[:5]} "
+                f"unexpected={unexpected[:5]}")
+        self._torch_qwen3 = model
+        logger.info("Torch Qwen3 (parity mode) loaded: 16L bf16 sdpa")
+
+    def _setup_qwen3_fp4(self):
+        """FLASHRT_N16_QWEN3_FP4=1: NVFP4 fused-epilogue GEMMs for all 16
+        Qwen3 layers (same kernel family as the DiT fused chain, upstream
+        #163). RMSNorm / q-k norms / RoPE / sdpa / SiLU-mul stay bf16 torch;
+        every projection GEMM runs W4A4 with fused bias (+residual) epilogue
+        and the residual stream is updated in place. Weight traffic drops
+        2.85 GB -> ~0.8 GB per inference.
+        """
+        if os.environ.get("FLASHRT_N16_QWEN3_FP4", "0") != "1":
+            return
+        if getattr(self, "_qwen3_fp4_done", False):
+            return
+        try:
+            import flash_rt.flash_rt_fp4 as _f4
+        except ImportError:
+            logger.warning("FLASHRT_N16_QWEN3_FP4=1 but flash_rt_fp4 is "
+                           "missing; Qwen3 stays bf16")
+            return
+        if not hasattr(_f4, "cutlass_fp4_gemm_bias_res_bf16"):
+            logger.warning("Qwen3 FP4 needs the fused-epilogue kernels "
+                           "(rebuild flash_rt_fp4); staying bf16")
+            return
+        from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
+        dt = torch.bfloat16
+        Se = self._Se
+        D = self.D_llm
+        KV = self.NHKV * self.HD_llm
+        FF = self.H_llm
+        NH, NHKV, HD = self.NHQ, self.NHKV, self.HD_llm
+
+        def _qw(w_bf):
+            w16 = w_bf.to(torch.float16).contiguous()
+            N, K = w16.shape
+            packed = torch.empty(N, K // 2, dtype=torch.uint8, device='cuda')
+            sfb = torch.zeros(_f4.sfa_size_bytes(N, K, True),
+                              dtype=torch.uint8, device='cuda')
+            rc = _f4.quantize_fp4_dynamic_sfa_fp16(
+                w16.data_ptr(), packed.data_ptr(), sfb.data_ptr(), N, K, True, 0)
+            if rc != 0:
+                raise RuntimeError(f"Qwen3 fp4 weight quantize rc={rc}")
+            return packed, sfb
+
+        def _sfa(cols):
+            return torch.zeros(_f4.sfa_size_bytes(Se, cols, False),
+                               dtype=torch.uint8, device='cuda')
+
+        def _ck(rc, what, li):
+            if rc != 0:
+                raise RuntimeError(f"Qwen3 fp4 {what} layer {li} rc={rc}")
+
+        def _make_fwd(tab, bufs, ln1_w, ln2_w, ln_eps, qn, kn, ob, gb, ub,
+                      db, li):
+            def fwd(hidden_states, position_embeddings, attention_mask=None,
+                    **kwargs):
+                s = torch.cuda.current_stream().cuda_stream
+                h = hidden_states.view(Se, D)
+                hp = h.data_ptr()
+                xn_p, xn_s = bufs['xn_p'].data_ptr(), bufs['xn_s'].data_ptr()
+                # ── attn block ──
+                _ck(_f4.rms_norm_weight_fp4_sfa_bf16(
+                    hp, ln1_w.data_ptr(), xn_p, xn_s, Se, D, ln_eps, s),
+                    "q-ln", li)
+                packed, sfb = tab['q']
+                _ck(_f4.cutlass_fp4_gemm_bias_bf16(
+                    xn_p, xn_s, packed.data_ptr(), sfb.data_ptr(),
+                    attn_q_b[li].data_ptr(), bufs['q'].data_ptr(),
+                    Se, D, D, s), "q", li)
+                packed, sfb = tab['k']
+                _ck(_f4.cutlass_fp4_gemm_bias_bf16(
+                    xn_p, xn_s, packed.data_ptr(), sfb.data_ptr(),
+                    attn_k_b[li].data_ptr(), bufs['k'].data_ptr(),
+                    Se, KV, D, s), "k", li)
+                packed, sfb = tab['v']
+                _ck(_f4.cutlass_fp4_gemm_bias_bf16(
+                    xn_p, xn_s, packed.data_ptr(), sfb.data_ptr(),
+                    attn_v_b[li].data_ptr(), bufs['v'].data_ptr(),
+                    Se, KV, D, s), "v", li)
+                cos, sin = position_embeddings
+                _ck(fvk.qk_norm_rope_rotate_half_bf16(
+                    bufs['q'].data_ptr(), qn.weight.data_ptr(),
+                    cos.data_ptr(), sin.data_ptr(),
+                    Se, NH, HD, qn.variance_epsilon, s), "q-norm-rope", li)
+                _ck(fvk.qk_norm_rope_rotate_half_bf16(
+                    bufs['k'].data_ptr(), kn.weight.data_ptr(),
+                    cos.data_ptr(), sin.data_ptr(),
+                    Se, NHKV, HD, kn.variance_epsilon, s), "k-norm-rope", li)
+                q = bufs['q'].view(1, Se, NH, HD).transpose(1, 2)
+                k = bufs['k'].view(1, Se, NHKV, HD).transpose(1, 2)
+                v = bufs['v'].view(1, Se, NHKV, HD).transpose(1, 2)
+                # Torch's fused attention backends reject mismatched Q/KV
+                # head counts (enable_gqa falls back to unfused math: 2 fp16
+                # GEMMs + materialized softmax per layer). Expanding KV
+                # enables the fused path (measured Qwen3 7.0 -> 5.0 ms).
+                if NHKV != NH:
+                    k = k.repeat_interleave(NH // NHKV, dim=1)
+                    v = v.repeat_interleave(NH // NHKV, dim=1)
+                if attention_mask is None:
+                    o = torch.nn.functional.scaled_dot_product_attention(
+                        q, k, v, is_causal=q.shape[2] > 1)
+                else:
+                    o = torch.nn.functional.scaled_dot_product_attention(
+                        q, k, v, attn_mask=attention_mask)
+                o_flat = o.transpose(1, 2).reshape(Se, D)
+                o_p, o_s = bufs['o_p'].data_ptr(), bufs['o_s'].data_ptr()
+                _ck(_f4.quantize_fp4_dynamic_sfa_bf16_vec(
+                    o_flat.data_ptr(), o_p, o_s, Se, D, False, s), "o-q", li)
+                packed, sfb = tab['o']
+                _ck(_f4.cutlass_fp4_gemm_bias_res_bf16(
+                    o_p, o_s, packed.data_ptr(), sfb.data_ptr(),
+                    ob.data_ptr(), hp, hp, Se, D, D, s), "o", li)
+                # ── FFN block ──
+                _ck(_f4.rms_norm_weight_fp4_sfa_bf16(
+                    hp, ln2_w.data_ptr(), xn_p, xn_s, Se, D, ln_eps, s),
+                    "f-ln", li)
+                packed, sfb = tab['gate']
+                _ck(_f4.cutlass_fp4_gemm_bias_bf16(
+                    xn_p, xn_s, packed.data_ptr(), sfb.data_ptr(),
+                    gb.data_ptr(), bufs['gate'].data_ptr(),
+                    Se, FF, D, s), "gate", li)
+                packed, sfb = tab['up']
+                _ck(_f4.cutlass_fp4_gemm_bias_bf16(
+                    xn_p, xn_s, packed.data_ptr(), sfb.data_ptr(),
+                    ub.data_ptr(), bufs['up'].data_ptr(),
+                    Se, FF, D, s), "up", li)
+                gu_p, gu_s = bufs['gu_p'].data_ptr(), bufs['gu_s'].data_ptr()
+                _ck(_f4.silu_mul_fp4_sfa_bf16(
+                    bufs['gate'].data_ptr(), bufs['up'].data_ptr(),
+                    gu_p, gu_s, Se, FF, False, s), "gu-q", li)
+                packed, sfb = tab['dn']
+                _ck(_f4.cutlass_fp4_gemm_bias_res_bf16(
+                    gu_p, gu_s, packed.data_ptr(), sfb.data_ptr(),
+                    db.data_ptr(), hp, hp, Se, D, FF, s), "dn", li)
+                return h.view(1, Se, D)
+            return fwd
+
+        zero_bias = torch.zeros(FF, dtype=dt, device='cuda')
+
+        def _bias(t):
+            return t if t is not None else zero_bias
+
+        attn_q_b, attn_k_b, attn_v_b = [], [], []
+        for li, layer in enumerate(self._torch_qwen3.layers):
+            attn, mlp = layer.self_attn, layer.mlp
+            tab = {n: _qw(getattr(attn, n + "_proj").weight)
+                   for n in ('q', 'k', 'v', 'o')}
+            tab['gate'] = _qw(mlp.gate_proj.weight)
+            tab['up'] = _qw(mlp.up_proj.weight)
+            tab['dn'] = _qw(mlp.down_proj.weight)
+            attn_q_b.append(_bias(attn.q_proj.bias))
+            attn_k_b.append(_bias(attn.k_proj.bias))
+            attn_v_b.append(_bias(attn.v_proj.bias))
+            bufs = {
+                'xn_p': torch.empty(Se, D // 2, dtype=torch.uint8, device='cuda'),
+                'xn_s': _sfa(D),
+                'q': torch.empty(Se, D, dtype=dt, device='cuda'),
+                'k': torch.empty(Se, KV, dtype=dt, device='cuda'),
+                'v': torch.empty(Se, KV, dtype=dt, device='cuda'),
+                'o_p': torch.empty(Se, D // 2, dtype=torch.uint8, device='cuda'),
+                'o_s': _sfa(D),
+                'gate': torch.empty(Se, FF, dtype=dt, device='cuda'),
+                'up': torch.empty(Se, FF, dtype=dt, device='cuda'),
+                'gu_p': torch.empty(Se, FF // 2, dtype=torch.uint8, device='cuda'),
+                'gu_s': _sfa(FF),
+            }
+            layer.forward = _make_fwd(
+                tab, bufs, layer.input_layernorm.weight,
+                layer.post_attention_layernorm.weight,
+                layer.input_layernorm.variance_epsilon,
+                attn.q_norm, attn.k_norm,
+                _bias(attn.o_proj.bias), _bias(mlp.gate_proj.bias),
+                _bias(mlp.up_proj.bias), _bias(mlp.down_proj.bias), li)
+        self._qwen3_fp4_done = True
+        logger.info("Qwen3 NVFP4 fused-epilogue tier enabled (16 layers)")
+
+    def _setup_siglip_fp4(self):
+        """FLASHRT_N16_SIGLIP_FP4=1: NVFP4 fused-epilogue encoder.
+
+        Every layer runs the kernel chain: LN->fp4 producer (affine LayerNorm
+        expressed as AdaLN with scale=w-1, shift=b), q/k/v bias GEMMs into
+        contiguous buffers, FA4 full attention, o bias+residual GEMM, LN->fp4,
+        fc1 bias+tanh-GELU+fp4out (N padded 4304->4352 so both fp4 dims are
+        mult-64; the pad columns stay zero end-to-end), fc2 bias+residual.
+        Measured encoder 9.0 -> 7.6 ms; actions vs HF cos 0.99997 / maxd
+        0.038 (vs 0.023 bf16) — the vision-quality trade is simulation-gated;
+        set FLASHRT_N16_SIGLIP_FP4=0 to revert to bf16.
+        """
+        if os.environ.get("FLASHRT_N16_SIGLIP_FP4", "0") != "1":
+            return
+        if getattr(self, "_siglip_fp4_done", False):
+            return
+        try:
+            import flash_rt.flash_rt_fp4 as _f4
+        except ImportError:
+            logger.warning("FLASHRT_N16_SIGLIP_FP4 on but flash_rt_fp4 "
+                           "missing; SigLIP stays bf16")
+            return
+        if not hasattr(_f4, "cutlass_fp4_gemm_bias_gelu_fp4out_bf16"):
+            logger.warning("SigLIP FP4 needs the fused-epilogue kernels "
+                           "(rebuild flash_rt_fp4); staying bf16")
+            return
+        from flash_rt.hardware.thor import fa4_backend
+        if not fa4_backend.is_available():
+            logger.warning("SigLIP FP4 tier requires FA4; staying bf16")
+            return
+        fa4 = fa4_backend.fa4_func()
+        dt = torch.bfloat16
+        enc = self._torch_siglip.vision_model.encoder
+        S = self._num_views * self.spv_raw
+        head0 = enc.layers[0]
+        attn0, D = head0.self_attn, head0.self_attn.embed_dim
+        NH, HD = attn0.num_heads, attn0.head_dim
+        FF = head0.mlp.fc1.out_features
+        FFP = (FF + 63) // 64 * 64
+        eps = head0.layer_norm1.eps
+        gmod = type(attn0).forward.__globals__
+        apply_rope = gmod.get("apply_rope")
+
+        def _qw(w_bf, pad_rows=0, pad_cols=0):
+            w16 = w_bf.to(torch.float16)
+            if pad_cols:
+                w16 = F.pad(w16, (0, pad_cols))
+            if pad_rows:
+                w16 = F.pad(w16, (0, 0, 0, pad_rows))
+            w16 = w16.contiguous()
+            N, K = w16.shape
+            packed = torch.empty(N, K // 2, dtype=torch.uint8, device='cuda')
+            sfb = torch.zeros(_f4.sfa_size_bytes(N, K, True),
+                              dtype=torch.uint8, device='cuda')
+            rc = _f4.quantize_fp4_dynamic_sfa_fp16(
+                w16.data_ptr(), packed.data_ptr(), sfb.data_ptr(),
+                N, K, True, 0)
+            if rc != 0:
+                raise RuntimeError(f"SigLIP fp4 weight quantize rc={rc}")
+            return packed, sfb
+
+        def _ck(rc, what, l):
+            if rc != 0:
+                raise RuntimeError(f"SigLIP fp4 {what} layer {l} rc={rc}")
+
+        def _make_fwd(tab, bufs, use_rope, scale, li):
+            def fwd(hidden_states, output_attentions=False,
+                    rope_freqs_cis=None, win_meta_list=None,
+                    windows_attn=False):
+                s = torch.cuda.current_stream().cuda_stream
+                h = hidden_states.view(S, D)
+                hp = h.data_ptr()
+                xn_p, xn_s = bufs['xn_p'].data_ptr(), bufs['xn_s'].data_ptr()
+                _ck(_f4.ada_layer_norm_fp4_sfa_bf16(
+                    hp, tab['ln1_sc'].data_ptr(), tab['ln1_sh'].data_ptr(),
+                    xn_p, xn_s, S, D, eps, s), "ln1", li)
+                for n in ('q', 'k', 'v'):
+                    packed, sfb = tab[n]
+                    _ck(_f4.cutlass_fp4_gemm_bias_bf16(
+                        xn_p, xn_s, packed.data_ptr(), sfb.data_ptr(),
+                        tab[n + '_b'].data_ptr(), bufs[n].data_ptr(),
+                        S, D, D, s), n, li)
+                q = bufs['q'].view(1, S, NH, HD)
+                k = bufs['k'].view(1, S, NH, HD)
+                v = bufs['v'].view(1, S, NH, HD)
+                if use_rope and apply_rope is not None:
+                    q, k = apply_rope(q, k, rope_freqs_cis)
+                    q = q.contiguous()
+                    k = k.contiguous()
+                o = fa4(q, k, v, causal=False, softmax_scale=scale)
+                if isinstance(o, tuple):
+                    o = o[0]
+                o_p, o_s = bufs['o_p'].data_ptr(), bufs['o_s'].data_ptr()
+                _ck(_f4.quantize_fp4_dynamic_sfa_bf16_vec(
+                    o.data_ptr(), o_p, o_s, S, D, False, s), "o-q", li)
+                packed, sfb = tab['o']
+                _ck(_f4.cutlass_fp4_gemm_bias_res_bf16(
+                    o_p, o_s, packed.data_ptr(), sfb.data_ptr(),
+                    tab['o_b'].data_ptr(), hp, hp, S, D, D, s), "o", li)
+                _ck(_f4.ada_layer_norm_fp4_sfa_bf16(
+                    hp, tab['ln2_sc'].data_ptr(), tab['ln2_sh'].data_ptr(),
+                    xn_p, xn_s, S, D, eps, s), "ln2", li)
+                packed, sfb = tab['fc1']
+                hid_p, hid_s = bufs['hid_p'].data_ptr(), bufs['hid_s'].data_ptr()
+                _ck(_f4.cutlass_fp4_gemm_bias_gelu_fp4out_bf16(
+                    xn_p, xn_s, packed.data_ptr(), sfb.data_ptr(),
+                    tab['fc1_b'].data_ptr(), hid_p, hid_s,
+                    S, FFP, D, s), "fc1", li)
+                packed, sfb = tab['fc2']
+                _ck(_f4.cutlass_fp4_gemm_bias_res_bf16(
+                    hid_p, hid_s, packed.data_ptr(), sfb.data_ptr(),
+                    tab['fc2_b'].data_ptr(), hp, hp, S, D, FFP, s), "fc2", li)
+                return (h.view(1, S, D),)
+            return fwd
+
+        for li, layer in enumerate(enc.layers):
+            attn, mlp = layer.self_attn, layer.mlp
+            ln1, ln2 = layer.layer_norm1, layer.layer_norm2
+            tab = {
+                'q': _qw(attn.q_proj.weight), 'q_b': attn.q_proj.bias,
+                'k': _qw(attn.k_proj.weight), 'k_b': attn.k_proj.bias,
+                'v': _qw(attn.v_proj.weight), 'v_b': attn.v_proj.bias,
+                'o': _qw(attn.out_proj.weight), 'o_b': attn.out_proj.bias,
+                'fc1': _qw(mlp.fc1.weight, pad_rows=FFP - FF),
+                'fc1_b': F.pad(mlp.fc1.bias, (0, FFP - FF)),
+                'fc2': _qw(mlp.fc2.weight, pad_cols=FFP - FF),
+                'fc2_b': mlp.fc2.bias,
+                'ln1_sc': (ln1.weight - 1).contiguous(),
+                'ln1_sh': ln1.bias.contiguous(),
+                'ln2_sc': (ln2.weight - 1).contiguous(),
+                'ln2_sh': ln2.bias.contiguous(),
+            }
+            bufs = {
+                'xn_p': torch.empty(S, D // 2, dtype=torch.uint8, device='cuda'),
+                'xn_s': torch.zeros(_f4.sfa_size_bytes(S, D, False),
+                                    dtype=torch.uint8, device='cuda'),
+                'q': torch.empty(S, D, dtype=dt, device='cuda'),
+                'k': torch.empty(S, D, dtype=dt, device='cuda'),
+                'v': torch.empty(S, D, dtype=dt, device='cuda'),
+                'o_p': torch.empty(S, D // 2, dtype=torch.uint8, device='cuda'),
+                'o_s': torch.zeros(_f4.sfa_size_bytes(S, D, False),
+                                   dtype=torch.uint8, device='cuda'),
+                'hid_p': torch.empty(S, FFP // 2, dtype=torch.uint8, device='cuda'),
+                'hid_s': torch.zeros(_f4.sfa_size_bytes(S, FFP, False),
+                                     dtype=torch.uint8, device='cuda'),
+            }
+            layer.forward = _make_fwd(tab, bufs, attn.use_rope, attn.scale, li)
+        self._siglip_fp4_done = True
+        logger.info("SigLIP NVFP4 fused-epilogue encoder enabled "
+                    "(27 layers, S=%d)", S)
+
+    def _run_torch_dit(self, state):
+        """4-step flow-matching DiT in bf16 torch — HF-faithful.
+
+        The CUDA-kernel DiT cannot reproduce HF's numerics on this model
+        (see docs/groot_n16_dit_kernel_nonconvergence.md), so the action head
+        runs as bf16 torch. To avoid the 32-layer x 4-step eager kernel-launch
+        overhead, the step-invariant parts are precomputed and the per-frame
+        compute is captured as a CUDA graph over static buffers (set
+        FLASHRT_N16_DIT_GRAPH=0 to force the eager fallback).
+        """
+        if not hasattr(self, '_dit_in_state'):
+            self._dit_setup_graph_buffers()
+        dt = self._dit_dt
+        # Fill static input buffers from the current frame.
+        st = torch.as_tensor(np.asarray(state), dtype=torch.float32).cuda().reshape(1, -1).to(dt)
+        self._dit_in_state.copy_(st)
+        ehs = self._g_vlln_buf
+        self._dit_in_kvt.copy_(ehs.index_select(0, self._dit_txt_idx).to(dt))
+        self._dit_in_kvi.copy_(ehs.index_select(0, self._dit_img_idx).to(dt))
+        self._dit_in_noise.normal_()
+
+        if self._dit_torch_graph is not None:
+            self._dit_torch_graph.replay()
+            return self._dit_out
+        # Eager fallback.
+        self._dit_body()
+        return self._dit_out
+
+    def _dit_setup_graph_buffers(self):
+        """Allocate static DiT I/O buffers, precompute step-invariant tensors,
+        and capture the 4-step DiT as a CUDA graph."""
+        w = self._dit_tw
+        dt = self._dit_dt
+        T, D = self.action_horizon, self.D_dit
+        N, NH, HD = self.num_steps, self.NH_dit, self.HD_dit
+
+        self._dit_txt_idx = self._g_non_img[0].nonzero(as_tuple=True)[0].long()
+        self._dit_img_idx = self._g_img_m[0].nonzero(as_tuple=True)[0].long()
+        n_txt, n_img = self._dit_txt_idx.numel(), self._dit_img_idx.numel()
+        self._dit_in_kvt = torch.empty(n_txt, 2048, dtype=dt, device='cuda')
+        self._dit_in_kvi = torch.empty(n_img, 2048, dtype=dt, device='cuda')
+        self._dit_in_state = torch.empty(1, self.state_dim, dtype=dt, device='cuda')
+        self._dit_in_noise = torch.empty(1, T, self.action_dim, dtype=dt, device='cuda')
+        self._dit_out = torch.empty(1, T, self.action_dim, dtype=dt, device='cuda')
+
+        # Step-invariant embeddings (depend only on weights + step).
+        # Recomputed from self.num_steps so step-count experiments keep the
+        # uniform schedule t_disc = step/N*1000 (HF FlowMatchEuler).
+        self._dit_posemb = w['posemb'][:T].unsqueeze(0)
+        self._dit_silu_tembs, self._dit_taus = [], []
+        for step in range(self.num_steps):
+            t_disc = int(step / float(self.num_steps) * 1000)
+            args = t_disc * self._dit_ts_freqs
+            sincos = torch.cat([torch.cos(args), torch.sin(args)], -1).to(dt).unsqueeze(0)
+            temb = F.linear(F.silu(F.linear(sincos, w['ts_l1_w'], w['ts_l1_b'])),
+                            w['ts_l2_w'], w['ts_l2_b'])
+            self._dit_silu_tembs.append(F.silu(temb))
+            freqs = t_disc * self._dit_tau_freqs
+            self._dit_taus.append(torch.cat([torch.sin(freqs), torch.cos(freqs)], -1)
+                                  .to(dt).unsqueeze(0).expand(1, T, -1).contiguous())
+
+        # Precompute the per-block adaLN conditioning embeddings for every
+        # (step, layer): they depend only on weights + step, yet the HF loop
+        # re-runs the M=1 F.linear inside the denoising loop, streaming
+        # 4*32*9.4MB of n1w weights per inference. Hoisting them out is
+        # numerically identical (same bf16 kernel, same inputs).
+        self._dit_ada_embs = [
+            [F.linear(temb, blk['n1w'], blk['n1b']) for blk in w['blocks']]
+            for temb in self._dit_silu_tembs]
+
+        # Optional NVFP4 tier (FLASHRT_N16_DIT_FP4=1): every block GEMM runs
+        # as a block-scaled W4A4 CUTLASS GEMM (port of the N1.7 FP4 tier,
+        # #163). At M=51 the DiT is weight-bandwidth-bound; fp4 quarters the
+        # weight bytes. Measured DiT 36.6 -> 29.4 ms, actions vs HF
+        # cos 0.999994 / maxd 0.012 (2026-08-14). Weight tables are static
+        # and survive graph re-captures.
+        self._dit_use_fp4 = False
+        if os.environ.get("FLASHRT_N16_DIT_FP4", "0") == "1":
+            try:
+                import flash_rt.flash_rt_fp4 as _f4
+            except ImportError:
+                _f4 = None
+                logger.warning("FLASHRT_N16_DIT_FP4=1 but flash_rt_fp4 is "
+                               "missing; DiT stays bf16")
+            if _f4 is not None:
+                if not hasattr(self, "_dit_fq"):
+                    def _qw(wt):
+                        w16 = wt.to(torch.float16).contiguous()
+                        N, K = w16.shape
+                        packed = torch.empty(N, K // 2, dtype=torch.uint8,
+                                             device='cuda')
+                        # Zero-init: the tile-interleaved SF layout rounds up
+                        # to atom size; unwritten padding must not decode as
+                        # garbage scales (upstream #163 pitfall).
+                        sfb = torch.zeros(_f4.sfa_size_bytes(N, K, True),
+                                          dtype=torch.uint8, device='cuda')
+                        rc = _f4.quantize_fp4_dynamic_sfa_fp16(
+                            w16.data_ptr(), packed.data_ptr(), sfb.data_ptr(),
+                            N, K, True, 0)
+                        if rc != 0:
+                            raise RuntimeError(f"DiT fp4 quantize rc={rc}")
+                        return packed, sfb
+                    self._dit_fq = [
+                        {n: _qw(blk[n]) for n in ('qw', 'kw', 'vw', 'ow',
+                                                  'fw', 'dw')}
+                        for blk in w['blocks']]
+                self._dit_fp4_mod = _f4
+                self._dit_fp4_bufs = {}
+                self._dit_use_fp4 = True
+                logger.info("DiT NVFP4 tier enabled (block GEMMs W4A4)")
+                # Fused-epilogue chain (upstream N1.7 #163 port): norm->fp4
+                # producers + bias/residual/GELU inside the GEMM epilogues.
+                if hasattr(_f4, "ada_layer_norm_fp4_sfa_bf16"):
+                    self._dit_fp4_fused = True
+                    if not hasattr(self, "_dit_fqf"):
+                        Sa, FF = T + 1, self.H_dit
+                        fqf = []
+                        for l, blk in enumerate(w['blocks']):
+                            e = {}
+                            if l % 2 == 1:  # self-attn: fused QKV
+                                qkvw = torch.cat([blk['qw'], blk['kw'], blk['vw']], 0)
+                                e['qkv'] = _qw(qkvw)
+                                e['qkv_b'] = torch.cat(
+                                    [blk['qb'], blk['kb'], blk['vb']]).contiguous()
+                            else:           # cross-attn: Q only (K/V precomputed)
+                                e['q'] = _qw(blk['qw'])
+                                e['q_b'] = blk['qb'].contiguous()
+                            e['o'] = _qw(blk['ow'])
+                            e['up'] = _qw(blk['fw'])
+                            e['dn'] = _qw(blk['dw'])
+                            fqf.append(e)
+                        self._dit_fqf = fqf
+                        # Per-step AdaLN modulators (scale, shift) and the final
+                        # proj1 (shift, scale) as pointer-stable tensors.
+                        ada_sc = torch.stack(
+                            [torch.stack([emb[0, :D] for emb in embs])
+                             for embs in self._dit_ada_embs]).contiguous()
+                        ada_sh = torch.stack(
+                            [torch.stack([emb[0, D:] for emb in embs])
+                             for embs in self._dit_ada_embs]).contiguous()
+                        self._dit_ada_scale = ada_sc
+                        self._dit_ada_shift = ada_sh
+                        self._dit_proj1 = torch.stack([
+                            F.linear(temb, w['proj1_w'], w['proj1_b'])[0]
+                            for temb in self._dit_silu_tembs]).contiguous()
+                        # Static scratch (graph-capture stable).
+                        self._dit_h = torch.empty(Sa, D, dtype=dt, device='cuda')
+                        self._dit_qkv_buf = torch.empty(Sa, 3 * D, dtype=dt, device='cuda')
+                        self._dit_q_buf = torch.empty(Sa, D, dtype=dt, device='cuda')
+                        self._dit_xn_p = torch.empty(Sa, D // 2, dtype=torch.uint8, device='cuda')
+                        self._dit_xn_s = torch.zeros(_f4.sfa_size_bytes(Sa, D, False),
+                                                     dtype=torch.uint8, device='cuda')
+                        self._dit_o_p = torch.empty(Sa, D // 2, dtype=torch.uint8, device='cuda')
+                        self._dit_o_s = torch.zeros(_f4.sfa_size_bytes(Sa, D, False),
+                                                    dtype=torch.uint8, device='cuda')
+                        self._dit_hid_p = torch.empty(Sa, FF // 2, dtype=torch.uint8, device='cuda')
+                        self._dit_hid_s = torch.zeros(_f4.sfa_size_bytes(Sa, FF, False),
+                                                      dtype=torch.uint8, device='cuda')
+                    logger.info("DiT NVFP4 fused-epilogue chain enabled")
+                else:
+                    self._dit_fp4_fused = False
+
+        # Seed the inputs so warmup/capture run on valid data.
+        self._dit_in_state.zero_()
+        self._dit_in_kvt.zero_(); self._dit_in_kvi.zero_()
+        self._dit_in_noise.normal_()
+
+        self._dit_torch_graph = None
+        # Graph the torch DiT by default (~15ms vs 40ms eager); reset paths
+        # delete and re-capture it safely. Set FLASHRT_N16_DIT_GRAPH=0 to
+        # force the eager fallback.
+        if os.environ.get("FLASHRT_N16_DIT_GRAPH", "1") != "0":
+            try:
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    for _ in range(2):
+                        self._dit_body()
+                torch.cuda.current_stream().wait_stream(s)
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    self._dit_body()
+                self._dit_torch_graph = g
+                logger.info("torch DiT captured as CUDA graph (n_txt=%d, n_img=%d)",
+                            n_txt, n_img)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("torch DiT graph capture failed (%r); using eager", e)
+                self._dit_torch_graph = None
+
+    def _dit_fp4_linear(self, x_bf, fq, N, K, bias):
+        """NVFP4 W4A4 GEMM replacement for F.linear inside the DiT graph.
+
+        Static per-shape buffers (graph-safe): bf16->fp16 cast, dynamic
+        per-16 activation quant, cutlass_fp4_sq_fp16, bf16 bias add.
+        """
+        f4 = self._dit_fp4_mod
+        M = x_bf.shape[-2]
+        key = (M, K, N)
+        bufs = self._dit_fp4_bufs
+        if key not in bufs:
+            bufs[key] = (torch.empty(M, K, dtype=torch.float16, device='cuda'),
+                         torch.empty(M, K // 2, dtype=torch.uint8, device='cuda'),
+                         torch.zeros(f4.sfa_size_bytes(M, K, False),
+                                     dtype=torch.uint8, device='cuda'),
+                         torch.empty(M, N, dtype=torch.float16, device='cuda'))
+        x16b, xq, xs, out = bufs[key]
+        packed, sfb = fq
+        x16b.copy_(x_bf.reshape(M, K).to(torch.float16))
+        s = torch.cuda.current_stream().cuda_stream
+        f4.quantize_fp4_dynamic_sfa_fp16(x16b.data_ptr(), xq.data_ptr(),
+                                         xs.data_ptr(), M, K, False, s)
+        f4.cutlass_fp4_sq_fp16(xq.data_ptr(), xs.data_ptr(), packed.data_ptr(),
+                               sfb.data_ptr(), out.data_ptr(), M, N, K,
+                               1.0, 0.0, s)
+        y = out.to(torch.bfloat16)
+        if bias is not None:
+            y = y + bias
+        return y.reshape(*x_bf.shape[:-1], N)
+
+    def _dit_body_fp4_fused(self):
+        """Fused-epilogue NVFP4 DiT chain (upstream N1.7 #163 port).
+
+        Per block: adaLN-modulated norm emits fp4 directly; QKV/cross-Q/O/
+        FFN run as block-scaled NVFP4 GEMMs with bias (and residual /
+        tanh-GELU+fp4out) fused into the epilogues — 8 kernels per layer,
+        no elementwise traffic between them. Attention stays bf16 sdpa.
+        """
+        w = self._dit_tw
+        dt = self._dit_dt
+        f4 = self._dit_fp4_mod
+        T, D = self.action_horizon, self.D_dit
+        N, NH, HD = self.num_steps, self.NH_dit, self.HD_dit
+        FF = self.H_dit
+        Sa = T + 1
+
+        h = self._dit_h
+        qkv_buf, q_buf = self._dit_qkv_buf, self._dit_q_buf
+        xn_p, xn_s = self._dit_xn_p.data_ptr(), self._dit_xn_s.data_ptr()
+        o_p, o_s = self._dit_o_p.data_ptr(), self._dit_o_s.data_ptr()
+        hid_p, hid_s = self._dit_hid_p.data_ptr(), self._dit_hid_s.data_ptr()
+        fqf = self._dit_fqf
+
+        state = self._dit_in_state
+        st = F.relu(state @ w['se_w1'] + w['se_b1'])
+        state_feat = (st @ w['se_w2'] + w['se_b2'])                  # (1, D)
+        kv_text, kv_img = self._dit_in_kvt, self._dit_in_kvi
+
+        # Cross-attn K/V in bf16, once per inference (backbone constant).
+        # fp4 here was measured to degrade actions 5x (cos 0.9992 / maxd
+        # 0.105) for ~0 ms gain — cross features feed every cross layer.
+        cross_kv = {}
+        for l, blk in enumerate(w['blocks']):
+            if l % 2 == 0:
+                kv = kv_text if l % 4 == 0 else kv_img
+                cross_kv[l] = (
+                    F.linear(kv, blk['kw'], blk['kb']).view(1, -1, NH, HD).transpose(1, 2),
+                    F.linear(kv, blk['vw'], blk['vb']).view(1, -1, NH, HD).transpose(1, 2))
+
+        def _ck(rc, what, l):
+            if rc != 0:
+                raise RuntimeError(f"DiT fp4 fused {what} layer {l} rc={rc}")
+
+        actions = self._dit_in_noise
+        for step in range(N):
+            s = torch.cuda.current_stream().cuda_stream
+            a_emb = actions @ w['ae_w1'] + w['ae_b1']
+            x = torch.cat([a_emb, self._dit_taus[step]], -1)
+            af = (F.silu(x @ w['ae_w2'] + w['ae_b2']) @ w['ae_w3']
+                  + w['ae_b3']) + self._dit_posemb
+            h[:1].copy_(state_feat)
+            h[1:].copy_(af.view(T, D))
+            h_ptr = h.data_ptr()
+            for l, blk in enumerate(w['blocks']):
+                e = fqf[l]
+                _ck(f4.ada_layer_norm_fp4_sfa_bf16(
+                    h_ptr, self._dit_ada_scale[step, l].data_ptr(),
+                    self._dit_ada_shift[step, l].data_ptr(), xn_p, xn_s,
+                    Sa, D, 1e-5, s), "adaln", l)
+                if l % 2 == 1:                                        # self-attn
+                    packed, sfb = e['qkv']
+                    _ck(f4.cutlass_fp4_gemm_bias_bf16(
+                        xn_p, xn_s, packed.data_ptr(), sfb.data_ptr(),
+                        e['qkv_b'].data_ptr(), qkv_buf.data_ptr(),
+                        Sa, 3 * D, D, s), "qkv", l)
+                    q = qkv_buf[:, :D].view(1, Sa, NH, HD).transpose(1, 2)
+                    k = qkv_buf[:, D:2 * D].view(1, Sa, NH, HD).transpose(1, 2)
+                    v = qkv_buf[:, 2 * D:].view(1, Sa, NH, HD).transpose(1, 2)
+                else:                                                 # cross-attn
+                    packed, sfb = e['q']
+                    _ck(f4.cutlass_fp4_gemm_bias_bf16(
+                        xn_p, xn_s, packed.data_ptr(), sfb.data_ptr(),
+                        e['q_b'].data_ptr(), q_buf.data_ptr(),
+                        Sa, D, D, s), "q", l)
+                    q = q_buf.view(1, Sa, NH, HD).transpose(1, 2)
+                    k, v = cross_kv[l]
+                o = F.scaled_dot_product_attention(q, k, v)
+                o_flat = o.transpose(1, 2).reshape(Sa, D)
+                _ck(f4.quantize_fp4_dynamic_sfa_bf16_vec(
+                    o_flat.data_ptr(), o_p, o_s, Sa, D, False, s), "o-quant", l)
+                packed, sfb = e['o']
+                _ck(f4.cutlass_fp4_gemm_bias_res_bf16(
+                    o_p, o_s, packed.data_ptr(), sfb.data_ptr(),
+                    blk['ob'].data_ptr(), h_ptr, h_ptr,
+                    Sa, D, D, s), "o", l)
+                _ck(f4.layer_norm_no_affine_fp4_sfa_bf16(
+                    h_ptr, xn_p, xn_s, Sa, D, 1e-5, s), "ffn-ln", l)
+                packed, sfb = e['up']
+                _ck(f4.cutlass_fp4_gemm_bias_gelu_fp4out_bf16(
+                    xn_p, xn_s, packed.data_ptr(), sfb.data_ptr(),
+                    blk['fb'].data_ptr(), hid_p, hid_s,
+                    Sa, FF, D, s), "ffn-up", l)
+                packed, sfb = e['dn']
+                _ck(f4.cutlass_fp4_gemm_bias_res_bf16(
+                    hid_p, hid_s, packed.data_ptr(), sfb.data_ptr(),
+                    blk['db'].data_ptr(), h_ptr, h_ptr,
+                    Sa, D, FF, s), "ffn-down", l)
+            p1 = self._dit_proj1[step]
+            shift, scale = p1.chunk(2, dim=0)
+            hn = F.layer_norm(h, (D,), None, None, 1e-6) * (1 + scale) + shift
+            out = F.linear(hn, w['proj2_w'], w['proj2_b'])
+            dec = F.relu(out @ w['ad_w1'] + w['ad_b1'])
+            pred = dec @ w['ad_w2'] + w['ad_b2']
+            actions = actions + (1.0 / N) * pred[-T:]
+        self._dit_out.copy_(actions)
+
+    def _dit_body(self):
+        """The 4-step DiT over static input buffers; writes self._dit_out."""
+        if getattr(self, "_dit_fp4_fused", False):
+            return self._dit_body_fp4_fused()
+        w = self._dit_tw
+        dt = self._dit_dt
+        T, D = self.action_horizon, self.D_dit
+        N, NH, HD = self.num_steps, self.NH_dit, self.HD_dit
+        use_fp4 = getattr(self, "_dit_use_fp4", False)
+        H = self.H_dit
+
+        def lin(x, l, name, Nout, Kin, bias):
+            if use_fp4:
+                return self._dit_fp4_linear(x, self._dit_fq[l][name],
+                                            Nout, Kin, bias)
+            return F.linear(x, w['blocks'][l][name], bias)
+
+        state = self._dit_in_state
+        st = F.relu(state @ w['se_w1'] + w['se_b1'])
+        state_feat = (st @ w['se_w2'] + w['se_b2']).unsqueeze(0)      # (1,1,D)
+        kv_text, kv_img = self._dit_in_kvt, self._dit_in_kvi
+
+        # Cross-attn K/V: backbone is constant across the 4 steps.
+        cross_kv = {}
+        for l, blk in enumerate(w['blocks']):
+            if l % 2 == 0:
+                kv = kv_text if l % 4 == 0 else kv_img
+                Kkv = blk['kw'].shape[1]
+                cross_kv[l] = (
+                    lin(kv, l, 'kw', D, Kkv, blk['kb']).view(1, -1, NH, HD).transpose(1, 2),
+                    lin(kv, l, 'vw', D, Kkv, blk['vb']).view(1, -1, NH, HD).transpose(1, 2))
+
+        actions = self._dit_in_noise
+        for step in range(N):
+            silu_temb = self._dit_silu_tembs[step]
+            a_emb = actions @ w['ae_w1'] + w['ae_b1']
+            x = torch.cat([a_emb, self._dit_taus[step]], -1)
+            af = (F.silu(x @ w['ae_w2'] + w['ae_b2']) @ w['ae_w3']
+                  + w['ae_b3']) + self._dit_posemb
+            hidden = torch.cat([state_feat, af], 1)                   # (1,1+T,D)
+            for l, blk in enumerate(w['blocks']):
+                emb = self._dit_ada_embs[step][l]
+                scale, shift = emb.chunk(2, dim=1)
+                hnorm = (F.layer_norm(hidden, (D,), None, None, 1e-5)
+                         * (1 + scale[:, None]) + shift[:, None])
+                q = lin(hnorm, l, 'qw', D, D, blk['qb'])
+                S_q = q.shape[1]
+                q = q.view(1, S_q, NH, HD).transpose(1, 2)
+                if l % 2 == 1:                                        # self-attn
+                    k = lin(hnorm, l, 'kw', D, D, blk['kb']).view(1, S_q, NH, HD).transpose(1, 2)
+                    v = lin(hnorm, l, 'vw', D, D, blk['vb']).view(1, S_q, NH, HD).transpose(1, 2)
+                else:                                                 # cross-attn
+                    k, v = cross_kv[l]
+                o = F.scaled_dot_product_attention(q, k, v)
+                o = o.transpose(1, 2).reshape(1, S_q, D)
+                hidden = hidden + lin(o, l, 'ow', D, D, blk['ob'])
+                hnorm = F.layer_norm(hidden, (D,), None, None, 1e-5)
+                ff = F.gelu(lin(hnorm, l, 'fw', H, D, blk['fb']),
+                            approximate='tanh')
+                hidden = hidden + lin(ff, l, 'dw', D, H, blk['db'])
+            emb = F.linear(silu_temb, w['proj1_w'], w['proj1_b'])
+            # HF DiT proj_out_1 chunk order is (shift, scale) — not (scale, shift).
+            shift, scale = emb.chunk(2, dim=1)
+            hidden = (F.layer_norm(hidden, (D,), None, None, 1e-6)
+                      * (1 + scale[:, None]) + shift[:, None])
+            out = F.linear(hidden, w['proj2_w'], w['proj2_b'])
+            dec = F.relu(out @ w['ad_w1'] + w['ad_b1'])
+            pred = dec @ w['ad_w2'] + w['ad_b2']
+            actions = actions + (1.0 / N) * pred[:, -T:]
+        self._dit_out.copy_(actions)
 
     def _copy_state_feature_to_dit(self, state):
         """Encode current robot state into the captured DiT input buffer.
@@ -897,47 +1878,112 @@ class GrootTorchFrontendThor:
         return output.unsqueeze(0)  # [1, Sa, output_dim]
 
     # ─────────────────────────────────────────────────────────────
+    # CUDA-graph idle guard
+    #
+    # Jetson Thor silently invalidates captured graphs after a few seconds
+    # of GPU idle (replays then run fast but emit garbage); see
+    # docs/thor_gpu_idle_reset_workaround.md. infer() re-captures instead
+    # of replaying once the GPU has been idle longer than
+    # FLASHRT_GRAPH_IDLE_REINIT_S.
+    # ─────────────────────────────────────────────────────────────
+
+    @property
+    def _graph_idle_limit_s(self) -> float:
+        return float(os.environ.get("FLASHRT_GRAPH_IDLE_REINIT_S", "2"))
+
+    def _graph_idle_stale(self) -> bool:
+        return (time.monotonic() - getattr(
+            self, "_last_graph_use", time.monotonic())) > self._graph_idle_limit_s
+
+    def invalidate_graphs(self) -> None:
+        """Force the captured CUDA graphs to be re-captured on next use."""
+        self._last_graph_use = 0.0
+
+    def reset_graph_runtime(self) -> None:
+        """Drop every capture-time artifact so the next ``infer`` re-captures.
+
+        Prompt state (``set_prompt`` outputs) is kept; ``_full_sd`` was
+        released after the first capture and is reloaded by ``infer`` before
+        re-capture. The calibration disk cache makes re-capture cheap.
+        """
+        stale_prefixes = ("_sig_", "_g_", "_mlp1_")
+        stale_exact = ("_siglip_graph", "_qwen3_graph", "_dit_graph",
+                       "_attn", "_vision_features", "_unit_scale",
+                       "_qwen3_torch_graph", "_siglip_torch_graph",
+                       "_qwen3_fp4_done", "_siglip_fp4_done",
+                       # DiT static buffers/indexes depend on Se/masks and
+                       # must be rebuilt on prompt-switch re-capture.
+                       "_dit_in_state", "_dit_in_kvt", "_dit_in_kvi",
+                       "_dit_in_noise", "_dit_out", "_dit_txt_idx",
+                       "_dit_img_idx")
+        for name in list(vars(self)):
+            if name.startswith(stale_prefixes) or name in stale_exact:
+                delattr(self, name)
+        self._graphs_built = False
+        torch.cuda.empty_cache()
+
+    # ─────────────────────────────────────────────────────────────
     # Public API
     # ─────────────────────────────────────────────────────────────
 
-    def set_prompt(self, prompt):
-        """Tokenize prompt and prepare text embeddings for Qwen3 backbone."""
-        if getattr(self, '_graphs_built', False):
-            raise RuntimeError(
-                "set_prompt() after the pipeline is built is not supported; "
-                "construct a new GrootTorchFrontendThor instance for a new prompt")
+    def set_prompt(self, prompt, input_ids=None):
+        """Tokenize prompt and prepare text embeddings for Qwen3 backbone.
 
-        from transformers import AutoTokenizer
+        Args:
+            prompt: language instruction (used for logging / change-detect).
+            input_ids: optional pre-computed HF token sequence (list[int]).
+                HF wraps the instruction in a chat template (system + user
+                headers) and expands each view into a per-view
+                ``<img>…IMG_CONTEXT…</img>`` block; a naive ``encode(prompt)``
+                yields a DIFFERENT sequence whose backbone features are
+                uncorrelated with HF's (cos~0), breaking DiT conditioning.
+                When supplied (e.g. from the serving aux builder, which
+                reproduces HF exactly), these ids are used verbatim.
+        """
+        # Image special-token ids (fixed for the Eagle vocab).
+        self._img_token_id = 151669   # <IMG_CONTEXT>
+        self._img_start_id = 151670   # <img>
+        self._img_end_id = 151671     # </img>
 
-        if not hasattr(self, '_tokenizer'):
-            eagle_dir = pathlib.Path(__file__).parent.parent.parent.parent / "configs"
-            # Try multiple tokenizer locations
-            for tok_path in [
-                str(self._checkpoint_path),  # checkpoint dir may have tokenizer
-                str(self._checkpoint_path / "tokenizer"),  # subfolder
-                # Local GROOT code Eagle dir
-                str(pathlib.Path(__file__).parent.parent.parent.parent.parent /
-                    "GR00T" / "Isaac-GR00T" / "gr00t" / "model" / "modules" / "nvidia" / "Eagle-Block2A-2B-v2"),
-                "nvidia/Eagle-Block2A-2B-v2",  # HF hub (fallback)
-            ]:
-                try:
-                    self._tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
-                    break
-                except Exception:
-                    continue
+        if input_ids is not None:
+            full_ids = list(input_ids)
+            text_count = sum(1 for t in full_ids if t != self._img_token_id)
+        else:
+            from transformers import AutoTokenizer
+
             if not hasattr(self, '_tokenizer'):
-                raise RuntimeError("Cannot load Qwen3 tokenizer")
-            self._img_token_id = 151669   # <IMG_CONTEXT>
-            self._img_start_id = 151670   # <img>
-            self._img_end_id = 151671     # </img>
+                for tok_path in [
+                    str(self._checkpoint_path),  # checkpoint dir may have tokenizer
+                    str(self._checkpoint_path / "tokenizer"),  # subfolder
+                    # Local GROOT code Eagle dir
+                    str(pathlib.Path(__file__).parent.parent.parent.parent.parent /
+                        "GR00T" / "Isaac-GR00T" / "gr00t" / "model" / "modules" / "nvidia" / "Eagle-Block2A-2B-v2"),
+                ]:
+                    try:
+                        self._tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
+                        break
+                    except Exception:
+                        continue
+                if not hasattr(self, '_tokenizer'):
+                    raise RuntimeError("Cannot load Qwen3 tokenizer")
 
-        S_img = self._num_views * self.spv  # image tokens after pixel unshuffle
-        text_ids = self._tokenizer.encode(prompt, add_special_tokens=False)
-        # Build: text + <img> + <IMG_CONTEXT>*S_img + </img>
-        full_ids = text_ids + [self._img_start_id] + [self._img_token_id] * S_img + [self._img_end_id]
+            S_img = self._num_views * self.spv  # image tokens after pixel unshuffle
+            text_ids = self._tokenizer.encode(prompt, add_special_tokens=False)
+            # Build: text + <img> + <IMG_CONTEXT>*S_img + </img>
+            full_ids = text_ids + [self._img_start_id] + [self._img_token_id] * S_img + [self._img_end_id]
+            text_count = len(text_ids)
+
+        input_id_values = tuple(full_ids)
+        if getattr(self, '_graphs_built', False):
+            if input_id_values == getattr(self, '_input_id_values', None):
+                self._prompt_text = prompt
+                return
+            logger.info("Prompt changed after graph capture; resetting graph runtime")
+            self.reset_graph_runtime()
 
         self._input_ids = torch.tensor([full_ids], dtype=torch.long, device='cuda')
-        self._text_len = len(text_ids)
+        self._input_id_values = input_id_values
+        self._text_len = text_count
         self._Se = len(full_ids)
         self._prompt_text = prompt
 
@@ -948,8 +1994,10 @@ class GrootTorchFrontendThor:
         self._image_mask = (self._input_ids == self._img_token_id)  # [1, Se]
         self._backbone_mask = torch.ones(1, self._Se, dtype=torch.bool, device='cuda')
 
-        logger.info("Prompt set: '%s' (%d text + %d img = %d total tokens)",
-                     prompt[:50], self._text_len, S_img, self._Se)
+        n_img_tok = int(self._image_mask.sum())
+        logger.info("Prompt set: '%s' (%d non-img + %d IMG_CONTEXT = %d total tokens%s)",
+                     prompt[:50], self._text_len, n_img_tok, self._Se,
+                     ", HF input_ids" if input_ids is not None else "")
 
     def infer_action_head(self, backbone_features, image_mask, backbone_mask,
                           state, action_horizon=None, noise_seed=None):
@@ -1207,7 +2255,11 @@ class GrootTorchFrontendThor:
         pixel = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(fp16).cuda()
 
         patches = pixel.unfold(2, patch_size, patch_size).unfold(3, patch_size, patch_size)
-        patches = patches.permute(0, 2, 3, 1, 4, 5).reshape(S, -1)  # [S, 588]
+        # HF NaFlex convert_images_to_patches flattens each patch as
+        # (ph, pw, C) — channel-LAST. The openpi-lineage (C, ph, pw) order
+        # feeds the HF-trained patch_embedding the wrong column order
+        # (embed cos 0.966 vs HF).
+        patches = patches.permute(0, 2, 3, 4, 5, 1).reshape(S, -1)  # [S, 588]
 
         # Linear patch embed + position embed → write into SigLIP buffer
         self._sig_x[:S].copy_(
@@ -1445,45 +2497,111 @@ class GrootTorchFrontendThor:
         if not hasattr(self, '_input_ids'):
             raise RuntimeError("Call set_prompt() before infer()")
 
-        # ── Lazy graph capture on first call ──
+        # ── Lazy graph capture on first call; idle re-capture guard ──
+        # Thor invalidates captured graphs after a few seconds of GPU idle
+        # (replays then run fast but emit garbage) — re-capture instead.
+        if getattr(self, '_graphs_built', False) and self._graph_idle_stale():
+            logger.info("CUDA graphs idle-stale (>%.1fs) — re-capturing",
+                        self._graph_idle_limit_s)
+            self.reset_graph_runtime()
         if not getattr(self, '_graphs_built', False):
+            if not hasattr(self, '_full_sd'):
+                self._load_checkpoint()
             self._capture_all_graphs(obs)
 
         # ── 1. SigLIP: patch embed + graph replay + mlp1 ──
         views = [obs['image']]
         if 'wrist_image' in obs and self._num_views >= 2:
             views.append(obs['wrist_image'])
-        self._patch_embed_2views(views)
-        self._siglip_graph.replay()
-        torch.cuda.synchronize()  # pixel_unshuffle needs SigLIP output
-        self._run_pixel_unshuffle_mlp1()
+        if getattr(self, "_torch_siglip", None) is not None:
+            # Parity mode: HF-native bf16 SigLIP. Embeddings (patch embed +
+            # pos + NaFlex window split) run eager; encoder runs as a graph.
+            self._run_torch_siglip(views)
+        else:
+            self._patch_embed_2views(views)
+            self._siglip_graph.replay()
+            torch.cuda.synchronize()  # pixel_unshuffle needs SigLIP output
+        if getattr(self, "_torch_siglip", None) is not None:
+            self._run_pixel_unshuffle_mlp1_bd()
+        else:
+            self._run_pixel_unshuffle_mlp1()
 
         # ── 2. Build input embeddings (pre-allocated buffer) ──
-        self._g_ie_buf.copy_(self._text_embeds.squeeze(0).to(fp16))
-        self._g_ie_buf[self._image_mask[0]] = self._g_vision_out.to(fp16)
-        fvk.gpu_copy(self._g_qwen3.b_x.data_ptr(), self._g_ie_buf.data_ptr(),
-                     self._Se * self.D_llm * 2, 0)
+        self._g_ie_buf.copy_(self._text_embeds.squeeze(0).to(self._bd))
+        self._g_ie_buf[self._image_mask[0]] = self._g_vision_out.to(self._bd)
 
         # ── 3. Qwen3 graph replay (+ vlln) ──
-        self._qwen3_graph.replay()
-        torch.cuda.synchronize()  # KV update needs Qwen3 output
+        if getattr(self, "_torch_qwen3", None) is not None:
+            # Parity mode (--no-fp8): HF-native Qwen3Model (bf16, sdpa)
+            # captured as a CUDA graph — identical math to the HF eager
+            # baseline backbone at graph-replay latency.
+            self._tq_in.copy_(self._g_ie_buf.to(torch.bfloat16))
+            self._qwen3_torch_graph.replay()
+            torch.cuda.synchronize()
+        else:
+            fvk.gpu_copy(self._g_qwen3.b_x.data_ptr(),
+                         self._g_ie_buf.data_ptr(),
+                         self._Se * self.D_llm * 2, 0)
+            self._qwen3_graph.replay()
+            torch.cuda.synchronize()  # KV update needs Qwen3 output
+        # Thor can silently invalidate captured graphs (replays stay fast
+        # but emit NaN/garbage — see docs/thor_gpu_idle_reset_workaround.md).
+        # The vlln LN output is the first cheap full-width signal after the
+        # backbone replay; if it is non-finite, re-capture once and retry
+        # this observation instead of serving garbage.
+        if not bool(torch.isfinite(self._g_vlln_buf).all()):
+            logger.error(
+                "Non-finite backbone output detected after graph replay — "
+                "graphs invalidated; re-capturing and retrying this frame")
+            self.reset_graph_runtime()
+            if not hasattr(self, '_full_sd'):
+                self._load_checkpoint()
+            self._capture_all_graphs(obs)
+            if getattr(self, "_torch_siglip", None) is not None:
+                self._run_torch_siglip(views)
+                self._run_pixel_unshuffle_mlp1_bd()
+            else:
+                self._patch_embed_2views(views)
+                self._siglip_graph.replay()
+                torch.cuda.synchronize()
+                self._run_pixel_unshuffle_mlp1()
+                torch.cuda.synchronize()
+            self._g_ie_buf.copy_(self._text_embeds.squeeze(0).to(self._bd))
+            self._g_ie_buf[self._image_mask[0]] = self._g_vision_out.to(self._bd)
+            if getattr(self, "_torch_qwen3", None) is not None:
+                self._tq_in.copy_(self._g_ie_buf.to(torch.bfloat16))
+                self._qwen3_torch_graph.replay()
+                torch.cuda.synchronize()
+            else:
+                fvk.gpu_copy(self._g_qwen3.b_x.data_ptr(),
+                             self._g_ie_buf.data_ptr(),
+                             self._Se * self.D_llm * 2, 0)
+                self._qwen3_graph.replay()
+                torch.cuda.synchronize()
+            if not bool(torch.isfinite(self._g_vlln_buf).all()):
+                raise RuntimeError(
+                    "backbone graph output still non-finite after re-capture")
 
-        # ── 4. Update DiT KV + init noise ──
-        bb = self._g_vlln_buf.unsqueeze(0)
-        self._g_dit.b_kv_text.copy_((bb * self._g_non_img.unsqueeze(-1).to(fp16)).squeeze(0))
-        self._g_dit.b_kv_img.copy_((bb * self._g_img_m.unsqueeze(-1).to(fp16)).squeeze(0))
-
-        # Precompute cross-attention K/V projections (runs once, reused across 4 steps)
-        self._g_dit.precompute_cross_kv()
-        self._copy_state_feature_to_dit(
-            obs.get('state', np.zeros(self.state_dim, dtype=np.float32)))
-        self._g_dit.b_actions.normal_()
-
-        # ── 5. DiT graph replay ──
-        self._dit_graph.replay()
+        # ── 4. DiT ──
+        # parity mode: HF-faithful fp32 torch DiT (max accuracy).
+        # fast mode (--no-parity): kernel DiT (concat bug fixed; ~4ms).
+        if not self.parity:
+            kd = self._g_dit
+            self._fill_dit_kv()
+            kd.precompute_cross_kv()
+            self._copy_state_feature_to_dit(
+                obs.get('state', np.zeros(self.state_dim, dtype=np.float32)))
+            kd.b_actions.normal_()
+            self._dit_graph.replay()
+            torch.cuda.synchronize()
+            actions = kd.b_actions
+        else:
+            actions = self._run_torch_dit(
+                obs.get('state', np.zeros(self.state_dim, dtype=np.float32)))
         torch.cuda.synchronize()
 
-        return {'actions': self._g_dit.b_actions.squeeze(0).cpu().numpy()}
+        self._last_graph_use = time.monotonic()
+        return {'actions': actions.squeeze(0).float().cpu().numpy()}
 
     # ─────────────────────────────────────────────────────────────
     # FP8 Activation Calibration
@@ -1657,8 +2775,9 @@ class GrootTorchFrontendThor:
         ae_concat = torch.empty(T, 2*D, dtype=fp16, device='cuda')
         self._gemm.fp16_nn(actions_fp16.data_ptr(), dit.ae_w1.data_ptr(), a_emb_out.data_ptr(), T, D, dit.action_dim, 0)
         fvk.add_bias_fp16(a_emb_out.data_ptr(), dit.ae_b1.data_ptr(), T, D, 0)
-        fvk.gpu_copy(ae_concat.data_ptr(), a_emb_out.data_ptr(), T*D*2, 0)
-        fvk.gpu_copy(ae_concat.data_ptr()+T*D*2, dit.action_time_embeds[0].data_ptr(), T*D*2, 0)
+        fvk.concat2_bf16(a_emb_out.data_ptr(),
+                         dit.action_time_embeds[0].data_ptr(),
+                         ae_concat.data_ptr(), T, D, D, 0)
         enc_h = torch.empty(T, D, dtype=fp16, device='cuda')
         self._gemm.fp16_nn(ae_concat.data_ptr(), dit.ae_w2.data_ptr(), enc_h.data_ptr(), T, D, 2*D, 0)
         fvk.add_bias_fp16(enc_h.data_ptr(), dit.ae_b2.data_ptr(), T, D, 0)
@@ -1789,6 +2908,8 @@ class GrootTorchFrontendThor:
     def _calibrate_single_frame(self, obs):
         """N=1 path: build pipeline (which calibrates) and snapshot the spec."""
         if not getattr(self, "_graphs_built", False):
+            if not hasattr(self, "_full_sd"):
+                self._load_checkpoint()
             self._capture_all_graphs(obs)
         self._calibrated = True
         self._precision_spec = self._snapshot_precision_spec(
@@ -1822,6 +2943,8 @@ class GrootTorchFrontendThor:
             n, percentile)
 
         if not getattr(self, "_graphs_built", False):
+            if not hasattr(self, "_full_sd"):
+                self._load_checkpoint()
             self._capture_all_graphs(obs_list[0], release_full_sd=False)
 
         # ── Pass A: collect per-sample Qwen3 amax (uses _full_sd) ──
@@ -1898,9 +3021,7 @@ class GrootTorchFrontendThor:
                             vlln_b.data_ptr(), self._g_vlln_buf.data_ptr(),
                             Se, self.D_llm, 1e-5, 0)
         torch.cuda.synchronize()
-        bb = self._g_vlln_buf.unsqueeze(0)
-        self._g_dit.b_kv_text.copy_((bb * self._g_non_img.unsqueeze(-1).to(fp16)).squeeze(0))
-        self._g_dit.b_kv_img.copy_((bb * self._g_img_m.unsqueeze(-1).to(fp16)).squeeze(0))
+        self._fill_dit_kv()
         self._g_dit.precompute_cross_kv()
         torch.cuda.synchronize()
 
@@ -1992,11 +3113,89 @@ class GrootTorchFrontendThor:
             arr = (arr - 0.5) / 0.5
             pixel = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(fp16).cuda()
             patches = pixel.unfold(2, 14, 14).unfold(3, 14, 14)
-            patches = patches.permute(0, 2, 3, 1, 4, 5).reshape(self.spv_raw, -1)
+            # HF NaFlex patch order is channel-LAST (ph, pw, C); see
+            # _patch_embed_image for why the openpi (C, ph, pw) order is wrong.
+            patches = patches.permute(0, 2, 3, 4, 5, 1).reshape(self.spv_raw, -1)
             embedded = (F.linear(patches.float(), self._sig_patch_w.float(),
                                  self._sig_patch_b.float())
                         + self._sig_pos_embed[:self.spv_raw].float()).to(fp16)
             self._sig_x[idx * self.spv_raw:(idx + 1) * self.spv_raw].copy_(embedded)
+
+    def _run_torch_siglip(self, views):
+        """Parity mode: HF-native bf16 SigLIP (embeddings eager + encoder graph)."""
+        if getattr(self, "_tsig_u8", None) is None:
+            self._tsig_u8 = torch.empty(
+                self._num_views, self.image_size, self.image_size, 3,
+                dtype=torch.uint8, device='cuda')
+        for i, v in enumerate(views):
+            arr = np.array(v, dtype=np.uint8, copy=True)
+            if not arr.flags['C_CONTIGUOUS']:
+                arr = np.ascontiguousarray(arr)
+            self._tsig_u8[i].copy_(torch.from_numpy(arr))
+            x = self._tsig_u8[i].to(torch.float32).div_(255.0).sub_(0.5).div_(0.5)
+            self._tsig_in[i].copy_(x.permute(2, 0, 1).to(torch.bfloat16))
+        if not getattr(self, "_sig_embed_in_graph", False):
+            if getattr(self, "_tsig_gidx", None) is not None:
+                with torch.no_grad():
+                    pv = self._tsig_in
+                    nv, _, nph, ps, npw = (pv.shape[0], pv.shape[1],
+                                           self._tsig_nph, self._tsig_ps,
+                                           self._tsig_npw)
+                    patched = (pv.reshape(nv, 3, nph, ps, npw, ps)
+                               .permute(0, 2, 4, 3, 5, 1)
+                               .reshape(nv * nph * npw, -1))
+                    emb_mod = self._torch_siglip.vision_model.embeddings
+                    pe = emb_mod.patch_embedding(patched)
+                    self._tw_in.copy_(
+                        (pe + self._tsig_pos).index_select(
+                            0, self._tsig_gidx).unsqueeze(0))
+            else:
+                with torch.no_grad():
+                    _wt, _, _, _ = self._torch_siglip.vision_model.embeddings(
+                        [self._tsig_in[i:i + 1] for i in range(len(views))])
+                self._tw_in.copy_(_wt)
+        if getattr(self, "_siglip_torch_graph", None) is not None:
+            self._siglip_torch_graph.replay()
+        else:
+            # Capture-time fallback: encoder runs eager.
+            with torch.no_grad():
+                _enc = self._torch_siglip.vision_model.encoder(
+                    inputs_embeds=self._tw_in,
+                    win_meta_list=self._tw_meta,
+                    spatial_shapes=self._tw_shapes)
+                _lh = self._torch_siglip.vision_model.post_layernorm(
+                    _enc.last_hidden_state)
+                self._g_sig_postln.copy_(
+                    _lh[:, self._tw_rm].to(self._bd).squeeze(0))
+        torch.cuda.synchronize()
+
+    def _run_pixel_unshuffle_mlp1_bd(self):
+        """Parity mode: pixel unshuffle + mlp1 in bf16 torch (HF-exact math)."""
+        if getattr(self, "_mlp1_fc1_w_lin", None) is None:
+            # Cache F.linear-layout bf16 weights once (the fp16 sources are
+            # transposed for the kernel NN convention); avoids per-frame
+            # .T.contiguous()/.float() re-materialization.
+            self._mlp1_ln_w_f32 = self._mlp1_ln_w.to(torch.float32)
+            self._mlp1_ln_b_f32 = self._mlp1_ln_b.to(torch.float32)
+            self._mlp1_fc1_w_lin = self._mlp1_fc1_w.t().contiguous().to(self._bd)
+            self._mlp1_fc1_b_bd = self._mlp1_fc1_b.to(self._bd)
+            self._mlp1_fc2_w_lin = self._mlp1_fc2_w.t().contiguous().to(self._bd)
+            self._mlp1_fc2_b_bd = self._mlp1_fc2_b.to(self._bd)
+        nH = int(math.sqrt(self.spv_raw))
+        D, S_img = self.D_sig, self._num_views * self.spv
+        all_flat = []
+        for v in range(self._num_views):
+            view_out = self._g_sig_postln[v * self.spv_raw:(v + 1) * self.spv_raw]
+            spatial = view_out.view(1, nH, nH, D).permute(0, 3, 1, 2)
+            flat = F.pixel_unshuffle(spatial, 2).view(self.mlp1_in, -1).T.contiguous()
+            all_flat.append(flat)
+        combined = torch.cat(all_flat, dim=0)
+        h = F.layer_norm(combined.float(), (self.mlp1_in,),
+                         self._mlp1_ln_w_f32, self._mlp1_ln_b_f32,
+                         1e-5).to(self._bd)
+        h = F.gelu(F.linear(h, self._mlp1_fc1_w_lin, self._mlp1_fc1_b_bd))
+        h = F.linear(h, self._mlp1_fc2_w_lin, self._mlp1_fc2_b_bd)
+        self._g_vision_out.copy_(h)
 
     def _run_pixel_unshuffle_mlp1(self):
         """Pixel unshuffle + mlp1 (runs outside graph, ~0.3ms)."""
@@ -2037,6 +3236,30 @@ class GrootTorchFrontendThor:
         from flash_rt.models.groot.pipeline_thor import CKernelQwen3, CKernelDiTHead
         logger.info("Capturing CUDA Graphs for E2E pipeline...")
 
+        # Extract bf16 action-head weights for the HF-faithful torch DiT
+        # path (must happen while _full_sd is alive).
+        if self.parity:
+            self._setup_torch_dit()
+        if self.parity and not hasattr(self, "_torch_qwen3"):
+            self._setup_torch_qwen3()
+        if self.parity:
+            self._setup_qwen3_fp4()
+        if self.parity and not hasattr(self, "_torch_siglip"):
+            self._setup_torch_siglip()
+            # Static NaFlex window meta (shapes fixed per image_size):
+            # needed by the capture-time eager encoder run before 6c.
+            self._tsig_in = torch.empty(
+                self._num_views, 3, self.image_size, self.image_size,
+                dtype=torch.bfloat16, device='cuda')
+            with torch.no_grad():
+                _wt0, self._tw_meta, self._tw_shapes, self._tw_rm = \
+                    self._torch_siglip.vision_model.embeddings(
+                        [torch.zeros(1, 3, self.image_size, self.image_size,
+                                     dtype=torch.bfloat16, device='cuda')
+                         for _ in range(self._num_views)])
+            self._tw_rm = self._tw_rm.to(torch.long).cuda()
+            self._tw_in = torch.empty_like(_wt0)
+
         Se = self._Se
         S_sig = self._num_views * self.spv_raw
         S_img = self._num_views * self.spv
@@ -2044,15 +3267,22 @@ class GrootTorchFrontendThor:
         # ── 1. Build CKernel objects FIRST (from sd dict, before SigLIP FP8 init) ──
         # This ensures cuBLASLt workspace is not polluted by SigLIP FP8 quantization
         self._g_qwen3 = CKernelQwen3(self._full_sd, Se, use_fp8=self.use_fp8)
-        vlln_w = self._vlln_w.to(fp16)
-        vlln_b = self._vlln_b.to(fp16)
+        # Persistent (NOT local): these pointers are baked into the Qwen3
+        # graph's vlln LayerNorm. Local tensors would be freed when this
+        # function returns and their blocks reused — replays would then
+        # dereference dangling memory and emit NaN.
+        self._g_vlln_w = self._vlln_w.to(fp16).contiguous()
+        self._g_vlln_b = self._vlln_b.to(fp16).contiguous()
+        vlln_w = self._g_vlln_w
+        vlln_b = self._g_vlln_b
 
         self._g_non_img = (~self._image_mask) & self._backbone_mask
         self._g_img_m = self._image_mask & self._backbone_mask
 
         T = self.action_horizon
         self._g_dit = CKernelDiTHead(self._full_sd, self._embodiment_id, T,
-                                      (1, Se, self.D_llm), use_fp8=self.use_fp8)
+                                      (1, Se, self.D_llm), use_fp8=self.use_fp8,
+                                      num_steps=self.num_steps)
 
         # ── 2. SigLIP init (after CKernel objects, so FP8 quant doesn't pollute cuBLAS state) ──
         self._load_siglip2_weights(self._full_sd)
@@ -2073,11 +3303,20 @@ class GrootTorchFrontendThor:
                 qwen3_seq_max=Se,
                 sa=self._g_dit.Sa,
                 s_kv=self._g_dit.S_kv,
+                # Live HF N1.6 runs SigLIP2 under sdpa, which ignores the
+                # NaFlex per-view seq_len_list segmentation -> all packed
+                # views attend jointly (cross-view full attention).
+                siglip_cross_view=True,
             ),
             siglip_slots={
                 "qkv": self._sig_qkv.data_ptr(),
                 "O":   self._sig_attn.data_ptr(),
                 "D":   self.D_sig,
+                # tensor views let the backend run exact torch sdpa for
+                # SigLIP (strided FMHA kernel unreliable at non-power-of-2
+                # seqs like 648)
+                "qkv_t": self._sig_qkv,
+                "O_t":   self._sig_attn,
             },
             qwen3_slots={
                 "ctx":    self._g_qwen3.ctx,       # Qwen3's cuBLAS handle
@@ -2112,16 +3351,19 @@ class GrootTorchFrontendThor:
         self._g_qwen3.attn = self._attn
         self._g_dit.attn = self._attn
 
+        # HF N1.6 (sdpa) does cross-view full attention over all packed
+        # views, so run SigLIP as ONE batch-1 sequence of S_sig tokens
+        # instead of num_views independent 256-token views.
         sig_dims = {'S': S_sig, 'D': self.D_sig, 'H': self.H_sig,
                     'NH': self.NH_sig, 'HD': self.HD_sig, 'L': self.L_sig,
-                    'num_views': self._num_views, 'seq_per_view': self.spv_raw}
+                    'num_views': 1, 'seq_per_view': S_sig}
 
         # Allocate graph-persistent buffers
-        self._g_sig_postln = torch.empty(S_sig, self.D_sig, dtype=fp16, device='cuda')
-        self._g_mlp1_ln = torch.empty(S_img, self.mlp1_in, dtype=fp16, device='cuda')
-        self._g_mlp1_fc1 = torch.empty(S_img, self.D_llm, dtype=fp16, device='cuda')
-        self._g_vision_out = torch.empty(S_img, self.D_llm, dtype=fp16, device='cuda')
-        self._g_vlln_buf = torch.empty(Se, self.D_llm, dtype=fp16, device='cuda')
+        self._g_sig_postln = torch.empty(S_sig, self.D_sig, dtype=self._bd, device='cuda')
+        self._g_mlp1_ln = torch.empty(S_img, self.mlp1_in, dtype=self._bd, device='cuda')
+        self._g_mlp1_fc1 = torch.empty(S_img, self.D_llm, dtype=self._bd, device='cuda')
+        self._g_vision_out = torch.empty(S_img, self.D_llm, dtype=self._bd, device='cuda')
+        self._g_vlln_buf = torch.empty(Se, self.D_llm, dtype=self._bd, device='cuda')
 
         # ── 3. SigLIP graph ──
         stream = torch.cuda.Stream()
@@ -2148,15 +3390,19 @@ class GrootTorchFrontendThor:
         views = [obs['image']]
         if 'wrist_image' in obs and self._num_views >= 2:
             views.append(obs['wrist_image'])
-        self._patch_embed_2views(views)
-        self._siglip_graph.replay()
-        torch.cuda.synchronize()
-        self._run_pixel_unshuffle_mlp1()
-        torch.cuda.synchronize()
+        if getattr(self, "_torch_siglip", None) is not None:
+            self._run_torch_siglip(views)
+            self._run_pixel_unshuffle_mlp1_bd()
+        else:
+            self._patch_embed_2views(views)
+            self._siglip_graph.replay()
+            torch.cuda.synchronize()
+            self._run_pixel_unshuffle_mlp1()
+            torch.cuda.synchronize()
 
         input_embeds = self._text_embeds.clone()
         input_embeds[0, self._image_mask[0]] = self._g_vision_out.to(input_embeds.dtype)
-        ie_fp16 = input_embeds.squeeze(0).to(fp16).contiguous()
+        ie_fp16 = input_embeds.squeeze(0).to(self._bd).contiguous()
 
         # ── 4. Calibrate + run Qwen3 ──
         self._calibrate_qwen3(ie_fp16)
@@ -2169,9 +3415,7 @@ class GrootTorchFrontendThor:
                             Se, self.D_llm, 1e-5, 0)
         torch.cuda.synchronize()
 
-        bb = self._g_vlln_buf.unsqueeze(0)
-        self._g_dit.b_kv_text.copy_((bb * self._g_non_img.unsqueeze(-1).to(fp16)).squeeze(0))
-        self._g_dit.b_kv_img.copy_((bb * self._g_img_m.unsqueeze(-1).to(fp16)).squeeze(0))
+        self._fill_dit_kv()
 
         # Precompute cross-attention K/V projections (constant across steps)
         self._g_dit.precompute_cross_kv()
@@ -2222,6 +3466,150 @@ class GrootTorchFrontendThor:
             self._qwen3_graph.capture_end()
         torch.cuda.synchronize()
         logger.info("  Qwen3 graph captured (Se=%d)", Se)
+
+        # ── 6b. Torch Qwen3 graph (parity mode) ──
+        if getattr(self, "_torch_qwen3", None) is not None:
+            self._tq_in = torch.empty(
+                1, Se, self.D_llm, dtype=torch.bfloat16, device='cuda')
+
+            def _run_tq():
+                with torch.no_grad():
+                    _out = self._torch_qwen3(
+                        inputs_embeds=self._tq_in).last_hidden_state.squeeze(0)
+                    _v = torch.nn.functional.layer_norm(
+                        _out.float(), (self.D_llm,),
+                        self._g_vlln_w.float(), self._g_vlln_b.float(),
+                        1e-5).to(self._bd)
+                    self._g_vlln_buf.copy_(_v)
+
+            stream_tq = torch.cuda.Stream()
+            with torch.cuda.stream(stream_tq):
+                for _ in range(2):
+                    _run_tq()
+            torch.cuda.synchronize()
+            self._qwen3_torch_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.stream(stream_tq):
+                self._qwen3_torch_graph.capture_begin()
+                _run_tq()
+                self._qwen3_torch_graph.capture_end()
+            torch.cuda.synchronize()
+            logger.info("  Torch Qwen3 graph captured (Se=%d)", Se)
+
+        # ── 6c. Torch SigLIP graph (parity mode) ──
+        # The NaFlex window split contains a non-capturable GPU index op, so
+        # embeddings run eager per frame; only the 27-layer encoder (+post-LN
+        # + reverse mapping) is captured, over a static windows buffer.
+        if getattr(self, "_torch_siglip", None) is not None:
+            nv = self._num_views
+            if not hasattr(self, "_tsig_in"):
+                self._tsig_in = torch.empty(
+                    nv, 3, self.image_size, self.image_size,
+                    dtype=torch.bfloat16, device='cuda')
+            if not hasattr(self, "_tw_in"):
+                with torch.no_grad():
+                    _wt, self._tw_meta, self._tw_shapes, self._tw_rm = \
+                        self._torch_siglip.vision_model.embeddings(
+                            [self._tsig_in[i:i + 1] for i in range(nv)])
+                self._tw_rm = self._tw_rm.to(torch.long).cuda()
+                self._tw_in = torch.empty_like(_wt)
+
+            # Fast embeddings: the NaFlex window split is a static gather for a
+            # fixed image size, and the antialias positional-embedding resize
+            # depends only on static shapes. Precompute both once so the
+            # per-frame path is patchify + patch_embedding + pos_add + gather
+            # (all capture-safe), skipping the unfold/im2col + antialias
+            # interpolate (~0.4 ms/frame). Verified bit-exact vs the HF
+            # embeddings forward (max diff 0.0).
+            if not hasattr(self, "_tsig_gidx"):
+                emb = self._torch_siglip.vision_model.embeddings
+                ps = emb.patch_size
+                nph = self.image_size // ps
+                npw = self.image_size // ps
+                self._tsig_ps, self._tsig_nph, self._tsig_npw = ps, nph, npw
+                bchw = [torch.Size((1, 3, self.image_size, self.image_size))
+                        for _ in range(nv)]
+                ss = emb.get_spatial_shapes(bchw)
+                fake = torch.arange(nv * nph * npw, dtype=torch.float32,
+                                    device='cuda').view(1, nv * nph * npw, 1)
+                wt, _, _ = emb.split_patch_embeddings_to_windows_with_meta(
+                    fake, ss, emb.window_size)
+                self._tsig_gidx = wt.view(-1).long().cuda()
+                pos = emb.position_embedding.weight.reshape(
+                    emb.position_embedding_size, emb.position_embedding_size, -1)
+                self._tsig_pos = emb.resize_positional_embeddings(pos, ss)[0]
+
+            def _sig_embed_to_twin():
+                # Capture-safe fast embeddings: patchify + patch_embedding +
+                # precomputed pos add + static gather, _tsig_in -> _tw_in.
+                pv = self._tsig_in
+                nv, nph, ps, npw = (pv.shape[0], self._tsig_nph,
+                                    self._tsig_ps, self._tsig_npw)
+                patched = (pv.reshape(nv, 3, nph, ps, npw, ps)
+                           .permute(0, 2, 4, 3, 5, 1)
+                           .reshape(nv * nph * npw, -1))
+                pe = self._torch_siglip.vision_model.embeddings.patch_embedding(
+                    patched)
+                self._tw_in.copy_(
+                    (pe + self._tsig_pos).index_select(
+                        0, self._tsig_gidx).unsqueeze(0))
+
+            def _run_ts():
+                with torch.no_grad():
+                    _sig_embed_to_twin()
+                    _enc = self._torch_siglip.vision_model.encoder(
+                        inputs_embeds=self._tw_in,
+                        win_meta_list=self._tw_meta,
+                        spatial_shapes=self._tw_shapes)
+                    _lh = self._torch_siglip.vision_model.post_layernorm(
+                        _enc.last_hidden_state)
+                    self._g_sig_postln.copy_(
+                        _lh[:, self._tw_rm].to(self._bd).squeeze(0))
+
+            stream_ts = torch.cuda.Stream()
+            with torch.cuda.stream(stream_ts):
+                for _ in range(2):
+                    _run_ts()
+            torch.cuda.synchronize()
+            # Try capturing embeddings+encoder together. If any NaFlex op is
+            # not capture-safe, fall back to an encoder-only graph and run the
+            # (fast) embeddings eager per frame.
+            self._sig_embed_in_graph = False
+            try:
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.stream(stream_ts):
+                    g.capture_begin()
+                    _run_ts()
+                    g.capture_end()
+                torch.cuda.synchronize()
+                self._siglip_torch_graph = g
+                self._sig_embed_in_graph = True
+                logger.info("  Torch SigLIP graph captured embeddings+encoder "
+                            "(S=%d)", nv * self.spv_raw)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("SigLIP embeddings not capture-safe (%r); "
+                               "encoder-only graph + eager embeddings", e)
+                torch.cuda.synchronize()
+                g = torch.cuda.CUDAGraph()
+                def _enc_only():
+                    with torch.no_grad():
+                        _enc = self._torch_siglip.vision_model.encoder(
+                            inputs_embeds=self._tw_in,
+                            win_meta_list=self._tw_meta,
+                            spatial_shapes=self._tw_shapes)
+                        _lh = self._torch_siglip.vision_model.post_layernorm(
+                            _enc.last_hidden_state)
+                        self._g_sig_postln.copy_(
+                            _lh[:, self._tw_rm].to(self._bd).squeeze(0))
+                with torch.cuda.stream(stream_ts):
+                    for _ in range(2):
+                        _enc_only()
+                torch.cuda.synchronize()
+                with torch.cuda.stream(stream_ts):
+                    g.capture_begin()
+                    _enc_only()
+                    g.capture_end()
+                torch.cuda.synchronize()
+                self._siglip_torch_graph = g
 
         # Reuse the exact buffer the Qwen3 graph baked into its captured
         # ``gpu_copy(b_x, ie_fp16)`` so per-frame ``_g_ie_buf`` writes land at

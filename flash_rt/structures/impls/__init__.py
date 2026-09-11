@@ -147,7 +147,24 @@ _LOADED: dict[tuple[str, str], object] = {}
 
 @lru_cache(maxsize=None)
 def hub_kernel(repo: str, version: str):
-    from kernels import get_kernel
+    try:
+        from kernels import get_kernel
+    except ImportError as absent:
+        # The client itself is missing or shadowed. This is the same
+        # event as every other way a package fails to arrive - "not
+        # here" - and it must travel as one, or the layers that catch a
+        # refusal to record it and keep going will instead abort on the
+        # one unavailability nobody declared. It is also the state a
+        # fresh ``pip install flash-rt`` is in, since the client is not
+        # a hard dependency, so the message says how to leave it.
+        _record_unavailable(repo, version, absent)
+        raise KernelUnavailable(
+            f"kernel package {repo!r} ({version}) is unavailable on this "
+            f"host: the kernel client is not installed "
+            f"({type(absent).__name__}: {absent}).\n"
+            f"    pip install kernels\n"
+            f"or install this distribution with its hub extra:\n"
+            f"    pip install 'flash-rt[hub]'") from absent
 
     key = (repo, version)
     if key not in _LOADED:

@@ -107,8 +107,18 @@ class LinearProjNvfp4Dynamic(GuardedSeam, torch.nn.Module):
         # K a multiple of 64*warps). Absence is not a refusal - the
         # tiled GEMM serves every shape correctly, the GEMV just fills
         # the SMs it underfills at long-K decode shapes.
+        # The entry's presence in the build is not its qualification to
+        # run: the aarch64 package carries it and the kernel refuses at
+        # call time on anything below SM120, which surfaces as a runtime
+        # error on the first M=1 row rather than as a choice made here.
+        # The engine adapters already withhold it off SM120; deciding it
+        # once, where the arm is selected, means an impl bound directly -
+        # through structures.get(), or any hand assembly - behaves the
+        # same as one bound through a door.
         gemv = getattr(kern, "fp4_w4a4_gemv_warpsplit_bf16", None)
-        self._gemv = (gemv if gemv is not None
+        cc = (torch.cuda.get_device_capability(w_packed.device)
+              if w_packed.is_cuda else (0, 0))
+        self._gemv = (gemv if gemv is not None and cc >= (12, 0)
                       and n % 8 == 0 and k % (64 * 4) == 0 else None)
         self._frt_arm(dtypes=CAST_OK, device=w_packed.device, k=int(k))
 

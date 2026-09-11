@@ -27,6 +27,18 @@ Decode contract (q_seq=1):
 from __future__ import annotations
 
 
+def _load_optional_fa2():
+    """Load FA2, treating only this module's absence as optional."""
+    import importlib
+
+    try:
+        return importlib.import_module("flash_rt.flash_rt_fa2")
+    except ModuleNotFoundError as exc:
+        if exc.name != "flash_rt.flash_rt_fa2":
+            raise
+        return None
+
+
 class RtxFlashAttnBackendNexn2:
     """Nex-N2-mini full-attention backend (BF16 attention math).
 
@@ -46,12 +58,20 @@ class RtxFlashAttnBackendNexn2:
     NUM_KV_HEADS = 2
     HEAD_DIM = 256
 
-    def __init__(self, max_seq: int, max_q_seq: int = 1, dtype=None):
+    def __init__(self, max_seq: int, max_q_seq: int = 1, dtype=None,
+                 num_full_layers: int | None = None,
+                 use_fa2: bool | None = None):
         import torch
 
         self._torch = torch
         bf16 = dtype if dtype is not None else torch.bfloat16
         d = "cuda"
+        # The model's ten full-attention layers by default. A speculative
+        # draft head is one more full-attention layer carrying its own KV, so
+        # it asks for an extra slot rather than owning a second cache.
+        self.NUM_FULL_LAYERS = (
+            int(num_full_layers) if num_full_layers is not None
+            else type(self).NUM_FULL_LAYERS)
 
         self._max_seq = int(max_seq)
         self._max_q_seq = int(max_q_seq)
@@ -95,12 +115,166 @@ class RtxFlashAttnBackendNexn2:
             dtype=torch.float32, device=d,
         )
 
-        from flash_rt import flash_rt_fa2 as _fa2
-        self._fa2 = _fa2
-        self._fa2_fwd = _fa2.fwd_bf16
+        # A target may not build FA2 at all. Absence is a fallback, not an
+        # error, because the reference path below computes the same thing.
+        #
+        # Prefill and decode want different answers about FA2. Prefill gains
+        # 20x on a chunked block's non-square window. At the decode shape the
+        # two are the same answer to bf16 precision -- measured against an
+        # fp32 reference, 2.0e-3 relative for both at kv=64, 2.2e-3 against
+        # 2.1e-3 at kv=2048 -- so taking it there buys about 1% of a step and
+        # moves two of the sixteen golden tokens, because a bf16-level
+        # difference in one step flips a later one. That is the fixture losing
+        # its meaning in exchange for 1%, which is the wrong trade.
+        #
+        # So the caller says. ``use_fa2=None`` keeps what each target already
+        # validated: on the arch that has always had FA2 in decode, keep it;
+        # on sm_110, where FA2 has only just started building and the fixture
+        # was recorded through the reference path, decline it.
+        # FLASHRT_NEXN2_DECODE_FA2 overrides either way.
+        import os as _os
+        _env_override = "FLASHRT_NEXN2_DECODE_FA2" in _os.environ
+        if use_fa2 is None:
+            _cap = torch.cuda.get_device_capability()
+            _default = "0" if _cap == (11, 0) else "1"
+            want_fa2 = _os.environ.get(
+                "FLASHRT_NEXN2_DECODE_FA2", _default) != "0"
+        else:
+            want_fa2 = bool(use_fa2)
+        self._require_fa2 = bool(
+            use_fa2 is True or (_env_override and want_fa2))
+        _fa2 = _load_optional_fa2()
+        if want_fa2 and _fa2 is None and self._require_fa2:
+            raise RuntimeError(
+                "FA2 was explicitly requested, but flash_rt.flash_rt_fa2 "
+                "is not installed. Build the FA2 module or disable the "
+                "explicit FA2 request.")
+        self._fa2 = _fa2 if want_fa2 else None
+        self._fa2_fwd = _fa2.fwd_bf16 if self._fa2 is not None else None
         self._num_sms = torch.cuda.get_device_properties(
             torch.cuda.current_device()
         ).multi_processor_count
+        self._fa2_usable = (
+            self._fa2_fwd is not None and self._probe_fa2())
+
+    def _probe_fa2(self) -> bool:
+        """Does the vendored kernel actually compute on this device?
+
+        Importing it and finding its symbols proves neither. Its own arch
+        handling can leave a build that links, loads, prints a complaint to
+        stdout and returns without writing the output -- which downstream looks
+        like plausible-but-wrong attention rather than a failure. Measured on
+        an SM110 part: the module imported, every symbol was present, and the
+        kernel refused at run time.
+
+        So run one small case against a reference and compare. The cost is one
+        launch at construction.
+        """
+        # Imported here, not at module scope, for the same reason as F: this
+        # module is written to import without torch present. The body had
+        # never run on a target that builds FA2, so the missing name sat
+        # unnoticed until this arch started building one.
+        import torch
+        import torch.nn.functional as F
+
+        q_seq, kv_seq = 1, 8
+        generator = torch.Generator(device=self.Q_buf.device).manual_seed(1)
+        q = torch.randn(
+            1, q_seq, self.NUM_Q_HEADS, self.HEAD_DIM, generator=generator,
+            device=self.Q_buf.device, dtype=torch.bfloat16)
+        k = torch.randn(
+            1, kv_seq, self.NUM_KV_HEADS, self.HEAD_DIM, generator=generator,
+            device=self.Q_buf.device, dtype=torch.bfloat16)
+        v = torch.randn_like(k)
+        self.Q_buf[:, :q_seq].copy_(q)
+        self.K_cache[0:1, :kv_seq].copy_(k)
+        self.V_cache[0:1, :kv_seq].copy_(v)
+        self.O_buf[:, :q_seq].zero_()
+        try:
+            self._launch_fa2(0, q_seq, kv_seq, 0,
+                             1.0 / (self.HEAD_DIM ** 0.5))
+            torch.cuda.synchronize()
+        except Exception as exc:                             # noqa: BLE001
+            if self._require_fa2:
+                raise RuntimeError(
+                    "FA2 was explicitly requested, but its runtime probe "
+                    "failed.") from exc
+            import warnings
+
+            warnings.warn(
+                "FA2 runtime probe failed; using the SDPA attention "
+                f"fallback: {exc!r}", RuntimeWarning, stacklevel=2)
+            return False
+        produced = self.O_buf[:, :q_seq].float().clone()
+
+        groups = self.NUM_Q_HEADS // self.NUM_KV_HEADS
+        kr = k.repeat_interleave(groups, dim=2)
+        vr = v.repeat_interleave(groups, dim=2)
+        expected = F.scaled_dot_product_attention(
+            q.transpose(1, 2).float(), kr.transpose(1, 2).float(),
+            vr.transpose(1, 2).float()).transpose(1, 2)
+        if not torch.isfinite(produced).all():
+            usable = False
+        else:
+            reference = expected.norm().clamp_min(1e-6)
+            usable = bool(
+                ((produced - expected).norm() / reference).item() < 0.05)
+        if not usable:
+            message = (
+                "FA2 runtime probe produced invalid or mismatched output.")
+            if self._require_fa2:
+                raise RuntimeError(message)
+            import warnings
+
+            warnings.warn(
+                message + " Using the SDPA attention fallback.",
+                RuntimeWarning, stacklevel=2)
+        return usable
+
+    def _sdpa(self, layer_idx: int, q_seq: int, kv_seq: int,
+              softmax_scale: float) -> None:
+        """Bottom-right causal reference for a rejected/absent FA2 kernel."""
+        import torch
+        import torch.nn.functional as F
+
+        # BF16 throughout. The cache is bf16, so upcasting it materialises the
+        # whole history in fp32 every step -- hundreds of MB of temporaries per
+        # token at a long context, which is what made decode fall from 26 to 11
+        # tok/s between 4k and 10k. SDPA accumulates in fp32 regardless.
+        q = self.Q_buf[:, :q_seq].transpose(1, 2)
+        k = self.K_cache[layer_idx:layer_idx + 1, :kv_seq]
+        v = self.V_cache[layer_idx:layer_idx + 1, :kv_seq]
+        # Broadcasting the KV to the query head count materialises it: at
+        # decode that is 8x2xkv_seqx256 floats twice per layer, ~48 MB a step
+        # across the ten full-attention layers, purely to be read once. Native
+        # GQA does the same thing without the copy. fp32 either way, so the
+        # numerics are untouched -- this path seeds a token-exact decode.
+        groups = self.NUM_Q_HEADS // self.NUM_KV_HEADS
+        if q_seq > kv_seq:
+            raise ValueError(
+                f"q_seq={q_seq} cannot exceed kv_seq={kv_seq} for causal "
+                "attention")
+        mask = None
+        if 1 < q_seq < kv_seq:
+            q_positions = torch.arange(
+                kv_seq - q_seq, kv_seq, device=q.device).unsqueeze(1)
+            mask = torch.arange(
+                kv_seq, device=q.device).unsqueeze(0) <= q_positions
+        try:
+            out = F.scaled_dot_product_attention(
+                q, k.transpose(1, 2), v.transpose(1, 2),
+                attn_mask=mask, is_causal=q_seq == kv_seq and q_seq > 1,
+                scale=softmax_scale, enable_gqa=True,
+            ).transpose(1, 2)
+        except TypeError:                       # torch without native GQA
+            out = F.scaled_dot_product_attention(
+                q,
+                k.repeat_interleave(groups, dim=2).transpose(1, 2),
+                v.repeat_interleave(groups, dim=2).transpose(1, 2),
+                attn_mask=mask, is_causal=q_seq == kv_seq and q_seq > 1,
+                scale=softmax_scale,
+            ).transpose(1, 2)
+        self.O_buf[:, :q_seq].copy_(out.to(self.O_buf.dtype))
 
     # ── Layer cache pointer math ──
 
@@ -175,6 +349,21 @@ class RtxFlashAttnBackendNexn2:
         if softmax_scale is None:
             softmax_scale = 1.0 / (self.HEAD_DIM ** 0.5)
 
+        if not self._fa2_usable:
+            self._sdpa(layer_idx, q_seq, kv_seq, softmax_scale)
+            return o.data_ptr()
+
+        self._launch_fa2(layer_idx, q_seq, kv_seq, stream, softmax_scale)
+        return o.data_ptr()
+
+    def _launch_fa2(self, layer_idx: int, q_seq: int, kv_seq: int,
+                    stream: int, softmax_scale: float) -> None:
+        """One vendored-FA2 launch. Shared with the construction-time probe so
+        the probe exercises the same call the hot path makes."""
+        q = self.Q_buf[:, :q_seq]
+        k = self.K_cache[layer_idx:layer_idx + 1, :kv_seq]
+        v = self.V_cache[layer_idx:layer_idx + 1, :kv_seq]
+        o = self.O_buf[:, :q_seq]
         self._fa2_fwd(
             Q=q.data_ptr(), K=k.data_ptr(), V=v.data_ptr(),
             O=o.data_ptr(), softmax_lse=self.lse_buf.data_ptr(),
@@ -192,7 +381,6 @@ class RtxFlashAttnBackendNexn2:
             num_sms=self._num_sms,
             stream=stream,
         )
-        return o.data_ptr()
 
 
 def make_nexn2_attention_spec(*, max_seq: int, max_q_seq: int = 1) -> dict:

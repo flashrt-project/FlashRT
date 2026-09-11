@@ -12,7 +12,9 @@
 
 // ── BF16 (original signatures, backward compatible) ──
 
-void gate_silu_mul(const __nv_bfloat16* gate, const __nv_bfloat16* up,
+// NOTE: these were previously misnamed `gate_silu_mul*`; they compute the
+// tanh/sigmoid-approx GELU (GeGLU), not SiLU. Renamed to `gate_geglu*`.
+void gate_geglu(const __nv_bfloat16* gate, const __nv_bfloat16* up,
                    __nv_bfloat16* out, int n, cudaStream_t stream = 0);
 
 void gelu_inplace(__nv_bfloat16* x, int n, cudaStream_t stream = 0);
@@ -30,21 +32,21 @@ void bias_gelu_inplace_bf16_strict(__nv_bfloat16* x,
                                    const __nv_bfloat16* bias,
                                    int M, int N, cudaStream_t stream = 0);
 
-void gate_silu_mul_merged(const __nv_bfloat16* merged, __nv_bfloat16* out,
+void gate_geglu_merged(const __nv_bfloat16* merged, __nv_bfloat16* out,
                            int seq, int half_dim, cudaStream_t stream = 0);
 
-void gate_silu_mul_merged_fp8(const __nv_bfloat16* merged, __nv_fp8_e4m3* out,
+void gate_geglu_merged_fp8(const __nv_bfloat16* merged, __nv_fp8_e4m3* out,
                                int seq, int half_dim,
                                const float* d_scale, cudaStream_t stream = 0);
 
 // ── FP16 variants ──
 
-void gate_silu_mul_fp16(const __half* gate, const __half* up,
+void gate_geglu_fp16(const __half* gate, const __half* up,
                         __half* out, int n, cudaStream_t stream = 0);
 
 void gelu_inplace_fp16(__half* x, int n, cudaStream_t stream = 0);
 
-void gate_silu_mul_merged_fp16(const __half* merged, __half* out,
+void gate_geglu_merged_fp16(const __half* merged, __half* out,
                                 int seq, int half_dim, cudaStream_t stream = 0);
 
 // Element-wise multiply: out[i] = a[i] * b[i] for i in [0, n).
@@ -53,7 +55,7 @@ void gate_silu_mul_merged_fp16(const __half* merged, __half* out,
 void mul_fp16(const __half* a, const __half* b, __half* out,
               int n, cudaStream_t stream = 0);
 
-void gate_silu_mul_merged_fp8_fp16(const __half* merged, __nv_fp8_e4m3* out,
+void gate_geglu_merged_fp8_fp16(const __half* merged, __nv_fp8_e4m3* out,
                                     int seq, int half_dim,
                                     const float* d_scale, cudaStream_t stream = 0);
 

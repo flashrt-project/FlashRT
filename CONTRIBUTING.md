@@ -18,6 +18,8 @@ Before opening a PR:
    - New model integration: [`docs/adding_new_model.md`](docs/adding_new_model.md)
    - Kernel catalog: [`docs/kernel_catalog.md`](docs/kernel_catalog.md)
    - Calibration contract: [`docs/calibration.md`](docs/calibration.md)
+   - Structures contributions and self-review:
+     [`docs/structure_contributing.md`](docs/structure_contributing.md)
 2. Build the extension modules locally.
 3. Run the smallest test set that covers your change.
 4. Include the exact GPU, CUDA, command lines, and latency/precision numbers
@@ -30,7 +32,7 @@ the source tree under `flash_rt/`, so non-editable installs commonly import
 a stale copy.
 
 ```bash
-git clone https://github.com/LiangSu8899/FlashRT.git
+git clone https://github.com/flashrt-project/FlashRT.git
 cd FlashRT
 git clone --depth 1 --branch v4.4.2 \
     https://github.com/NVIDIA/cutlass.git third_party/cutlass
@@ -335,12 +337,12 @@ say so in the PR and include the reason.
 For external contributors, use the standard fork workflow:
 
 ```bash
-# 1. Fork LiangSu8899/FlashRT on GitHub, then clone your fork.
+# 1. Fork flashrt-project/FlashRT on GitHub, then clone your fork.
 git clone git@github.com:<your-user>/FlashRT.git
 cd FlashRT
 
 # 2. Keep the upstream repository available for sync.
-git remote add upstream git@github.com:LiangSu8899/FlashRT.git
+git remote add upstream git@github.com:flashrt-project/FlashRT.git
 git fetch upstream
 
 # 3. Start from the latest upstream main.
@@ -362,6 +364,9 @@ Open the pull request from:
 
 Before requesting review:
 
+- For changes under `flash_rt/structures/`, complete the dedicated
+  [`structures contribution and PR self-review`](docs/structure_contributing.md)
+  checklist.
 - Read the full public review standard in
   [`docs/pr_review_checklist.md`](docs/pr_review_checklist.md) for the
   long-term maintenance rules reviewers will apply.

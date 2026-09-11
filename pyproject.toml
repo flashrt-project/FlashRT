@@ -30,6 +30,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# The structures layer obtains kernels through the Hugging Face kernel
+# hub client. Optional because the catalog, the specs and the adapters
+# are all readable without it; a bind refuses legibly and names this
+# extra when it is absent.
+#
+# Deliberately only the client. Naming torch here makes pip install the
+# newest one into an environment that had none, and which kernels exist
+# is decided by the torch version: the hub's published face is thickest
+# at torch 2.11, thin at the newest. Bring your own torch, and see the
+# README for what that choice costs you.
+hub = ["kernels>=0.12"]
 torch = ["torch", "safetensors", "sentencepiece"]
 chameleon = ["torch", "safetensors", "transformers>=4.43,<4.56", "Pillow"]
 jax = ["jax", "jaxlib", "ml_dtypes", "orbax-checkpoint", "flax"]

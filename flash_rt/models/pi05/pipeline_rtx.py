@@ -2148,17 +2148,8 @@ class Pi05Pipeline:
             self._lang_embeds_buf.ptr,
             self._lang_embeds_buf.nbytes, 3, stream)  # D2D
 
-    def forward(self) -> int:
-        """Replay the captured graph (or fall back to ``run_pipeline``).
-
-        The frontend must have already written the inputs:
-            - ``input_images_buf``       (observation images)
-            - ``input_noise_buf``        (initial diffusion noise)
-            - language embeds via :meth:`set_language_embeds` (once per prompt)
-
-        After this returns, ``input_noise_buf`` contains the final actions.
-        Returns the device pointer of that buffer for the frontend to read.
-        """
+    def forward(self, stream: int | None = None) -> int:
+        """Replay the captured graph, or run the pipeline without a graph."""
         if self._graph is not None:
             if getattr(self, "_use_exec", False):
                 rc = self._exec_full.replay(0, self._exec_gs_id)
@@ -2168,20 +2159,13 @@ class Pi05Pipeline:
                 self._graph.replay(self._graph_stream)
             self._cudart.cudaStreamSynchronize(self._graph_stream)
         else:
-            self.run_pipeline(stream=0)
-            self._cudart.cudaDeviceSynchronize()
+            run_stream = 0 if stream is None else int(stream)
+            self.run_pipeline(stream=run_stream)
+            self._cudart.cudaStreamSynchronize(ctypes.c_void_p(run_stream))
         return self.bufs["diffusion_noise"].ptr.value
 
-    def forward_decode_only(self) -> int:
-        """Replay the decoder-only graph for temporal K/V caching.
-
-        Skips vision_encoder + transformer_encoder and runs only
-        transformer_decoder, reusing the encoder K/V cache from the last
-        full :meth:`forward` call. The frontend must write fresh noise into
-        ``input_noise_buf`` before calling this.
-
-        Returns the device pointer of ``diffusion_noise`` (final actions).
-        """
+    def forward_decode_only(self, stream: int | None = None) -> int:
+        """Replay the decoder-only graph, or run the decoder without a graph."""
         if hasattr(self, "_decoder_only_graph") and self._decoder_only_graph is not None:
             if getattr(self, "_use_exec", False):
                 rc = self._exec_dec.replay(0, self._exec_gs_id)
@@ -2191,8 +2175,9 @@ class Pi05Pipeline:
                 self._decoder_only_graph.replay(self._graph_stream)
             self._cudart.cudaStreamSynchronize(self._graph_stream)
         else:
-            self.transformer_decoder(stream=0)
-            self._cudart.cudaDeviceSynchronize()
+            run_stream = 0 if stream is None else int(stream)
+            self.transformer_decoder(stream=run_stream)
+            self._cudart.cudaStreamSynchronize(ctypes.c_void_p(run_stream))
         return self.bufs["diffusion_noise"].ptr.value
 
     def export_runtime(self, identity=None, extra_regions=None):

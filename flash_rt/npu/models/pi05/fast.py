@@ -1,0 +1,666 @@
+"""Pi0.5 capture-time graph construction with CANN fused operators.
+
+Weights, merged projections, rotary tables and timestep styles are prepared
+once. Runtime replay lives in the independent AscendCL pointer/stream layer.
+The separate CPU pipeline is a diagnostic; correctness promotion requires
+an independent full-model reference on real observations.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+
+import torch
+import torch.nn.functional as F
+from flash_rt.npu.core.linear import NzBf16Weight, linear
+
+from flash_rt.npu.models.pi05.pipeline import (
+    DEC_L, DEC_D, DEC_HD, DEC_NH, DEC_NKV, _DP, _TOP_EXP_NORM,
+    ENC_L, ENC_D, ENC_HD, ENC_NH, ENC_NKV, _EP,
+    VIS_L, VIS_D, VIS_H, VIS_NH, VIS_HD, VIS_TOKENS_PER_VIEW, _VP, _MP,
+    GELU_TANH_APPROX,
+    EPS, rope_half_split, attention, vision_attention, rms_norm, _rope_inv_freqs,
+)
+
+# Optional fused K/V suffix-store kernel (option-c library, 16-bit copy
+# only). Falls back to the two torch slice copies when the extension is not
+# installed or the mode is disabled. `_kv_store_mode` is a runtime knob so
+# paired A/B can interleave arms inside one process (never compare across
+# processes).
+#
+# A/B (paired, 910B4, 2026-09-08): fused kernel p50 88.55 ms vs torch copies
+# 86.31 ms on the same process (raw cos 1.0) — the serialized per-row kernel
+# is ~2.2 ms slower than the captured aclnn copies. DEFAULT IS TORCH COPIES
+# (mode 0); the kernel stays as a validated library capability and can be
+# re-enabled per experiment via `set_kv_store_mode(1)` / env.
+try:
+    import kv_cache_store_ext as _kv_cache_store_ext
+    _KV_EXT_OK = True
+except Exception:  # pragma: no cover - env without the extension
+    _kv_cache_store_ext = None
+    _KV_EXT_OK = False
+
+_kv_store_mode = int(os.environ.get("FLASH_RT_NPU_PI05_KV_KERNEL", "0"))
+
+
+def set_kv_store_mode(mode: int) -> None:
+    """0 = torch copies, 1 = fused kernel (if importable). For A/B only."""
+    global _kv_store_mode
+    _kv_store_mode = int(mode)
+
+
+def kv_store_fused_enabled() -> bool:
+    return _KV_EXT_OK and _kv_store_mode == 1
+
+
+# ── build-time weight/style preparation ───────────────────────────────
+
+
+def make_vision_padded_weights(wb: dict, padded_head_dim: int = 80) -> dict:
+    """Pad QKV outputs and attention projection inputs once at setup.
+
+    The original head dimension still determines the attention scale. Zero
+    channels contribute neither logits nor projected values, while GEMMs
+    directly produce the vendor attention kernel's aligned head layout.
+    """
+    if padded_head_dim < VIS_HD:
+        raise ValueError("padded head dimension cannot discard model channels")
+    result = dict(wb)
+    extra = padded_head_dim - VIS_HD
+    for layer in range(VIS_L):
+        prefix = f"{_VP}.encoder.layers.{layer}.self_attn"
+        for name in ("q_proj", "k_proj", "v_proj"):
+            key = f"{prefix}.{name}"
+            weight = wb[f"{key}.weight"].reshape(VIS_NH, VIS_HD, VIS_D)
+            bias = wb[f"{key}.bias"].reshape(VIS_NH, VIS_HD)
+            result[f"{key}.weight"] = F.pad(weight, (0, 0, 0, extra)).reshape(
+                VIS_NH * padded_head_dim, VIS_D).contiguous()
+            result[f"{key}.bias"] = F.pad(bias, (0, extra)).reshape(-1).contiguous()
+        key = f"{prefix}.out_proj.weight"
+        weight = wb[key].reshape(VIS_D, VIS_NH, VIS_HD)
+        result[key] = F.pad(weight, (0, extra)).reshape(
+            VIS_D, VIS_NH * padded_head_dim).contiguous()
+    return result
+
+
+# SigLIP's MLP width is 4304, which is 16.81 fractal tiles of 256 and leaves the
+# cube pipeline tiling badly. Rounding it up to 17 whole tiles costs 48 zero
+# channels and measures far better on both MLP GEMMs.
+VIS_H_PADDED = 4352
+
+
+def make_vision_mlp_nz_weights(wb: dict, padded_hidden: int = VIS_H_PADDED) -> dict:
+    """Overlay the SigLIP MLP with fractal-NZ weights on a tile-aligned width.
+
+    ``fc1`` grows by ``padded_hidden - VIS_H`` zero output rows and a matching
+    zero bias, so the extra channels leave the projection as exact zeros;
+    ``gelu(0)`` is exactly zero for the tanh approximation, and ``fc2`` consumes
+    them through zero input columns that contribute exactly nothing. The
+    represented function is unchanged. What does change is the GEMM tiling, and
+    therefore the fp32 accumulation grouping inside ``fc2``'s K reduction, so
+    this is a reference-cosine change rather than a bit-identical one.
+
+    Biases are also emitted in BF16. The checkpoint conversion already rounds
+    the SigLIP layer biases to BF16 before widening them to FP32, so no value
+    is lost; it only keeps ``addmm`` from promoting the activation chain.
+    """
+    if padded_hidden < VIS_H:
+        raise ValueError("padded hidden width cannot discard model channels")
+    extra = padded_hidden - VIS_H
+    result = dict(wb)
+    for layer in range(VIS_L):
+        prefix = f"{_VP}.encoder.layers.{layer}.mlp"
+        result[f"{prefix}.fc1.weight"] = NzBf16Weight.bind(
+            wb[f"{prefix}.fc1.weight"], pad_out=extra)
+        result[f"{prefix}.fc1.bias"] = F.pad(
+            wb[f"{prefix}.fc1.bias"], (0, extra)).to(torch.bfloat16).contiguous()
+        result[f"{prefix}.fc2.weight"] = NzBf16Weight.bind(
+            wb[f"{prefix}.fc2.weight"], pad_in=extra)
+        result[f"{prefix}.fc2.bias"] = wb[f"{prefix}.fc2.bias"].to(torch.bfloat16).contiguous()
+    return result
+
+
+def make_vision_attn_nz_weights(wb: dict) -> dict:
+    """Overlay the SigLIP attention projections that measure faster in NZ.
+
+    Q/K/V are bit-identical in NZ at this shape and slightly faster. The output
+    projection measures slower in NZ and is deliberately left in ND.
+    """
+    result = dict(wb)
+    for layer in range(VIS_L):
+        prefix = f"{_VP}.encoder.layers.{layer}.self_attn"
+        for name in ("q_proj", "k_proj", "v_proj"):
+            result[f"{prefix}.{name}.weight"] = NzBf16Weight.bind(
+                wb[f"{prefix}.{name}.weight"])
+            result[f"{prefix}.{name}.bias"] = wb[f"{prefix}.{name}.bias"].to(
+                torch.bfloat16).contiguous()
+    return result
+
+
+def make_fast_weights(wb: dict) -> dict:
+    """Shallow overlay of ``wb`` with per-decoder-layer merged GEMM weights.
+
+    Adds ``qkv`` (q|k|v concatenated over rows) and ``gu`` (gate|up
+    concatenated) for every decoder layer; all other entries stay the same
+    objects so no extra device copies are created.
+    """
+    wf = dict(wb)
+    for i in range(DEC_L):
+        p = f"{_DP}.{i}"
+        # Gemma decoder attention/MLP linears are bias-free (mirrors the
+        # reference recipe, which passes weight only).
+        wf[f"{p}.qkv.weight"] = torch.cat(
+            [wb[f"{p}.self_attn.q_proj.weight"],
+             wb[f"{p}.self_attn.k_proj.weight"],
+             wb[f"{p}.self_attn.v_proj.weight"]], dim=0)
+        wf[f"{p}.gu.weight"] = torch.cat(
+            [wb[f"{p}.mlp.gate_proj.weight"],
+             wb[f"{p}.mlp.up_proj.weight"]], dim=0)
+    return wf
+
+
+def make_styles(wb: dict, conds: list) -> tuple:
+    """Precompute every AdaRMS ``dense`` linear output (3·DEC_D fp32).
+
+    Returns ``(attn, mlp, top)`` indexed ``[step][layer]`` / ``[step]`` with
+    the raw (3072,) tensor whose chunks are (scale, shift, gate) — identical
+    values to the reference's per-call ``linear(cond, dense)``, computed
+    once outside the captured graph.
+    """
+    attn, mlp, top = [], [], []
+    for c in conds:
+        a = [linear(c, wb[f"{_DP}.{i}.input_layernorm.dense.weight"],
+                      wb[f"{_DP}.{i}.input_layernorm.dense.bias"])
+             for i in range(DEC_L)]
+        m = [linear(c, wb[f"{_DP}.{i}.post_attention_layernorm.dense.weight"],
+                      wb[f"{_DP}.{i}.post_attention_layernorm.dense.bias"])
+             for i in range(DEC_L)]
+        t = linear(c, wb[f"{_TOP_EXP_NORM}.weight"],
+                     wb[f"{_TOP_EXP_NORM}.bias"])
+        attn.append(a)
+        mlp.append(m)
+        top.append(t)
+    return attn, mlp, top
+
+
+def make_styles_opt(wb: dict, conds: list) -> tuple:
+    """AdaRMS styles precomputed for the fused path. Each entry is
+    ``(gamma_bf16, shift_f32, gate_bf16)`` where ``gamma = (1 + scale)`` so
+    ``npu_rms_norm(x, gamma)`` reproduces ``x*rms*(1+scale)`` and only the
+    ``+ shift`` stays elementwise. Indexed ``[step][layer]`` / ``[step]``."""
+    attn, mlp, top = [], [], []
+    for c in conds:
+        a = []
+        for i in range(DEC_L):
+            s = linear(c, wb[f"{_DP}.{i}.input_layernorm.dense.weight"],
+                         wb[f"{_DP}.{i}.input_layernorm.dense.bias"])
+            sc, sh, g = s.chunk(3, dim=-1)
+            a.append(((1.0 + sc).to(torch.bfloat16), sh.contiguous(),
+                      g.to(torch.bfloat16)))
+        attn.append(a)
+        m = []
+        for i in range(DEC_L):
+            s = linear(c, wb[f"{_DP}.{i}.post_attention_layernorm.dense.weight"],
+                         wb[f"{_DP}.{i}.post_attention_layernorm.dense.bias"])
+            sc, sh, g = s.chunk(3, dim=-1)
+            m.append(((1.0 + sc).to(torch.bfloat16), sh.contiguous(),
+                      g.to(torch.bfloat16)))
+        mlp.append(m)
+        s = linear(c, wb[f"{_TOP_EXP_NORM}.weight"],
+                     wb[f"{_TOP_EXP_NORM}.bias"])
+        sc, sh, g = s.chunk(3, dim=-1)
+        top.append(((1.0 + sc).to(torch.bfloat16), sh.contiguous(),
+                    g.to(torch.bfloat16)))
+    return attn, mlp, top
+
+
+def make_encoder_fast_weights(wb: dict) -> dict:
+    """Overlay of ``wb`` with merged per-encoder-layer GEMM weights
+    (``qkv`` and ``gu``), mirroring the decoder overlay. Bias-free."""
+    wfe = dict(wb)
+    for i in range(ENC_L):
+        p = f"{_EP}.{i}"
+        wfe[f"{p}.qkv.weight"] = torch.cat(
+            [wb[f"{p}.self_attn.q_proj.weight"],
+             wb[f"{p}.self_attn.k_proj.weight"],
+             wb[f"{p}.self_attn.v_proj.weight"]], dim=0)
+        wfe[f"{p}.gu.weight"] = torch.cat(
+            [wb[f"{p}.mlp.gate_proj.weight"],
+             wb[f"{p}.mlp.up_proj.weight"]], dim=0)
+    return wfe
+
+
+def encoder_pass_fast(prefix_emb: torch.Tensor, wf: dict):
+    """Gemma encoder with merged QKV/GateUp GEMMs — same cache contract as
+    ``pipeline.encoder_pass`` (list of 18 (K_rot, V), each (S,256)); the
+    decoder's prefix fill reads it unchanged."""
+    S = prefix_emb.shape[0]
+    dev = prefix_emb.device
+    inv = _rope_inv_freqs(ENC_HD, device=dev)
+    pos = torch.arange(S, device=dev)
+    x = prefix_emb
+    cache = []
+    for i in range(ENC_L):
+        p = f"{_EP}.{i}"
+        xn = rms_norm(x, wf[f"{p}.input_layernorm.weight"])
+        qkv = linear(xn, wf[f"{p}.qkv.weight"])
+        q, k, v = qkv.split([ENC_NH * ENC_HD, ENC_HD, ENC_HD], dim=-1)
+        q_rot = rope_half_split(q, pos, inv, ENC_HD)
+        k_rot = rope_half_split(k, pos, inv, ENC_HD)
+        qh = q_rot.reshape(S, ENC_NH, ENC_HD).transpose(0, 1)
+        kh = k_rot.reshape(S, ENC_NKV, ENC_HD).transpose(0, 1).expand(
+            ENC_NH, S, ENC_HD)
+        vh = v.reshape(S, ENC_NKV, ENC_HD).transpose(0, 1).expand(
+            ENC_NH, S, ENC_HD)
+        o = attention(qh, kh, vh)
+        o = linear(o, wf[f"{p}.self_attn.o_proj.weight"])
+        x = x + o
+        xn = rms_norm(x, wf[f"{p}.post_attention_layernorm.weight"])
+        gu = linear(xn, wf[f"{p}.gu.weight"])
+        import torch_npu
+        hidden = torch_npu.npu_geglu(gu, dim=-1, approximate=1, activate_left=True)[0]
+        d = linear(hidden, wf[f"{p}.mlp.down_proj.weight"])
+        x = x + d
+        cache.append((k_rot.contiguous(), v.contiguous()))
+    return cache
+
+
+# ── encoder with fused residual+rms (P0 reuse: npu_rms_norm / add_rms) ─
+
+def make_encoder_opt_weights(wb: dict) -> dict:
+    """Overlay with per-encoder-layer bf16 gamma=(1+w) for the fused norm
+    ops (reference rms multiplies by (1+w); npu_rms_norm expects gamma)."""
+    wfe = dict(wb)
+    for i in range(ENC_L):
+        p = f"{_EP}.{i}"
+        a = wb[f"{p}.input_layernorm.weight"]
+        f = wb[f"{p}.post_attention_layernorm.weight"]
+        wfe[f"{p}.gamma_a"] = (1.0 + a.float()).to(torch.bfloat16)
+        wfe[f"{p}.gamma_f"] = (1.0 + f.float()).to(torch.bfloat16)
+    return wfe
+
+
+def encoder_pass_opt(prefix_emb: torch.Tensor, wf: dict, cos_t, sin_t, rope_kernel=None,
+                     cache_only=False, defer_residual=False):
+    """Encoder with fused norm ops and table-based rope: ``npu_rms_norm``
+    for the pre-attention norm and ``npu_add_rms_norm`` for the
+    post-attention residual+norm. Static INT8 groups share input quantization
+    while keeping separate GEMMs. Same cache contract as pipeline.encoder_pass."""
+    import torch_npu
+    S = prefix_emb.shape[0]
+    x = prefix_emb
+    cache = []
+    pending = None
+    for i in range(ENC_L):
+        p = f"{_EP}.{i}"
+        x = x.to(torch.bfloat16)  # keep the bf16 contract (residual cast etc.)
+        if f"{p}.qkv.norm" in wf:
+            (q, k, v), x = wf[f"{p}.qkv.norm"](x, pending, wf[f"{p}.gamma_a"])
+        else:
+            xn = torch_npu.npu_rms_norm(x, wf[f"{p}.gamma_a"], EPS)[0]
+            if f"{p}.qkv.group" in wf:
+                q, k, v = wf[f"{p}.qkv.group"](xn)
+            else:
+                q = linear(xn, wf[f"{p}.self_attn.q_proj.weight"])
+                k = linear(xn, wf[f"{p}.self_attn.k_proj.weight"])
+                v = linear(xn, wf[f"{p}.self_attn.v_proj.weight"])
+        if rope_kernel is not None:
+            q_rot, k_rot = rope_kernel(q, k, cos_t, sin_t)
+        else:
+            q_rot = rope_fast(q, cos_t, sin_t, 0, ENC_HD)
+            k_rot = rope_fast(k, cos_t, sin_t, 0, ENC_HD)
+        # The action decoder consumes every layer's K/V, not the final
+        # encoder hidden state. Everything after the final cache write is dead.
+        if cache_only and i == ENC_L - 1:
+            cache.append((k_rot.contiguous(), v.contiguous()))
+            break
+        if f"{p}.attention.quantized" in wf:
+            o = wf[f"{p}.attention.quantized"](q_rot, k_rot, v)
+        else:
+            o = attention_flash(q_rot, k_rot, v, ENC_NH, ENC_NKV)
+            o = linear(o, wf[f"{p}.self_attn.o_proj.weight"])
+        if f"{p}.mlp.native" in wf:
+            d, x = wf[f"{p}.mlp.native"](x, o, wf[f"{p}.gamma_f"])
+        else:
+            if f"{p}.gu.norm" in wf:
+                (g, u), x = wf[f"{p}.gu.norm"](x, o, wf[f"{p}.gamma_f"])
+            else:
+                xn_ff, _, x = torch_npu.npu_add_rms_norm(x, o, wf[f"{p}.gamma_f"], EPS)
+                x = x.to(torch.bfloat16)
+                if f"{p}.gu.group" in wf:
+                    g, u = wf[f"{p}.gu.group"](xn_ff)
+                else:
+                    g = linear(xn_ff, wf[f"{p}.mlp.gate_proj.weight"])
+                    u = linear(xn_ff, wf[f"{p}.mlp.up_proj.weight"])
+            if f"{p}.down.fused" in wf:
+                d = wf[f"{p}.down.fused"](g, u)
+            else:
+                d = linear(F.gelu(g, approximate="tanh") * u,
+                             wf[f"{p}.mlp.down_proj.weight"])
+        if defer_residual and f"{_EP}.{i + 1}.qkv.norm" in wf:
+            pending = d
+        else:
+            x = x + d
+            pending = None
+        cache.append((k_rot.contiguous(), v.contiguous()))
+    return cache
+
+
+# ── in-graph decoder math (capture-safe subset of the reference) ──────
+
+def _ada(x: torch.Tensor, style: torch.Tensor) -> tuple:
+    """AdaRMSNorm with a precomputed style tensor; same math as pipeline.ada_rms_norm."""
+    x32 = x.to(torch.float32)
+    scale, shift, gate = style.chunk(3, dim=-1)
+    var = x32.pow(2).mean(dim=-1, keepdim=True)
+    xn = x32 * torch.rsqrt(var + EPS)
+    y = (xn * (1.0 + scale) + shift).to(x.dtype)
+    return y, gate.to(x.dtype)
+
+
+def _ada_opt(x: torch.Tensor, style: tuple) -> tuple:
+    """AdaRMS with ``npu_rms_norm`` + elementwise shift: style is
+    ``(gamma_bf16=(1+scale), shift_f32, gate_bf16)``. Replaces the manual
+    var/rsqrt/mul fp32 chain with one fused rms node per call."""
+    import torch_npu
+    gamma_b, shift_f, gate_b = style
+    xb = x.to(torch.bfloat16)
+    xn = torch_npu.npu_rms_norm(xb, gamma_b, EPS)[0]
+    y = (xn.to(torch.float32) + shift_f).to(xb.dtype)
+    return y, gate_b
+
+
+def decoder_step_fast(x_t, enc_cache, wf, style_attn, style_mlp, style_top,
+                      prefix_len: int, chunk: int):
+    """One denoise step over the whole chunk, merged-GEMM / precomputed-style
+    decoder. Mirrors ``pipeline._decoder_step``; returns (chunk,1024)."""
+    dev = x_t.device
+    inv = _rope_inv_freqs(DEC_HD, device=dev)
+    pos = torch.arange(prefix_len, prefix_len + chunk, device=dev)
+    x = x_t
+    for i in range(DEC_L):
+        p = f"{_DP}.{i}"
+        x_mod, gate_a = _ada(x, style_attn[i])
+        qkv = linear(x_mod, wf[f"{p}.qkv.weight"])
+        q, k, v = qkv.split([DEC_NH * DEC_HD, DEC_HD, DEC_HD], dim=-1)
+        q_rot = rope_half_split(q, pos, inv, DEC_HD)
+        k_rot = rope_half_split(k, pos, inv, DEC_HD)
+        k_full = torch.cat([enc_cache[i][0], k_rot], dim=0)
+        v_full = torch.cat([enc_cache[i][1], v], dim=0)
+        qh = q_rot.reshape(chunk, DEC_NH, DEC_HD).transpose(0, 1)
+        kh = k_full.reshape(-1, DEC_NKV, DEC_HD).transpose(0, 1).expand(
+            DEC_NH, -1, DEC_HD)
+        vh = v_full.reshape(-1, DEC_NKV, DEC_HD).transpose(0, 1).expand(
+            DEC_NH, -1, DEC_HD)
+        o = attention(qh, kh, vh)
+        o = linear(o, wf[f"{p}.self_attn.o_proj.weight"])
+        x = x + o * gate_a
+        x_mod, gate_f = _ada(x, style_mlp[i])
+        gu = linear(x_mod, wf[f"{p}.gu.weight"])
+        import torch_npu
+        hidden = torch_npu.npu_geglu(gu, dim=-1, approximate=1, activate_left=True)[0]
+        d = linear(hidden, wf[f"{p}.mlp.down_proj.weight"])
+        x = x + d * gate_f
+    x_final, _ = _ada(x, style_top)
+    return x_final
+
+
+# ── no-cat cross-attention K/V (L1b) ──────────────────────────────────
+
+def make_kv_buffers(prefix_len: int, chunk_cap: int, capacity=None, cache=None) -> tuple:
+    """One contiguous (prefix_len + chunk_cap, 256) K/V buffer per decoder
+    layer. Encoder prefix rows are copied in once per frame
+    (``fill_kv_prefix``); each denoise step overwrites only its own suffix
+    rows in place. Removes the two per-layer ``torch.cat`` (+ their repeated
+    copy of the whole prefix) from every decoder step."""
+    if cache is not None:
+        # The transposed cache is sized by the attention kernel's key tile, and
+        # its value half is a flat fractal-NZ buffer rather than a row-major
+        # matrix. Both halves start at zero because the columns neither the
+        # prefix nor the suffix reaches are padding and have to stay zero.
+        kbufs = [torch.zeros(cache.kvp, DEC_HD, dtype=torch.bfloat16, device="npu")
+                 for _ in range(DEC_L)]
+        vbufs = [torch.zeros(cache.kvp * DEC_HD, dtype=torch.bfloat16, device="npu")
+                 for _ in range(DEC_L)]
+        return kbufs, vbufs
+    rows = capacity if capacity is not None else prefix_len + chunk_cap
+    if rows < prefix_len + chunk_cap:
+        raise ValueError("KV capacity does not cover the prefix and action suffix")
+    allocate = torch.zeros if capacity is not None else torch.empty
+    kbufs = [allocate(rows, DEC_HD, dtype=torch.bfloat16, device="npu")
+             for _ in range(DEC_L)]
+    vbufs = [allocate(rows, DEC_HD, dtype=torch.bfloat16, device="npu")
+             for _ in range(DEC_L)]
+    return kbufs, vbufs
+
+
+def fill_kv_prefix(enc_cache, kbufs, vbufs, prefix_len: int, cache=None,
+                   kernels=None) -> None:
+    """Copy the encoder prefix K/V into the buffer head — once per frame."""
+    if cache is not None:
+        # Same launch count as the row-major cache: the value copy becomes the
+        # transposing kernel rather than gaining one.
+        for i in range(DEC_L):
+            kbufs[i][cache.column:cache.end].copy_(enc_cache[i][0])
+            kernels.transpose_prefix(enc_cache[i][1], vbufs[i], prefix_len, cache.column)
+        return
+    for i in range(DEC_L):
+        kbufs[i][:prefix_len].copy_(enc_cache[i][0])
+        vbufs[i][:prefix_len].copy_(enc_cache[i][1])
+
+
+def decoder_step_fast_nocat(x_t, kbufs, vbufs, wf, style_attn, style_mlp,
+                            style_top, prefix_len: int, chunk: int,
+                            cos_t=None, sin_t=None, rope_kernel=None, ada_kernel=None,
+                            attention_kernel=None):
+    """decoder_step_fast without per-step K/V ``cat``: suffix rows are
+    written in place into the preallocated buffers and one cross-attention
+    runs over rows ``[0, prefix_len + chunk)``. Values are identical to the
+    cat form (same rows, same order), so the numerics are unchanged."""
+    dev = x_t.device
+    use_tbl = cos_t is not None and sin_t is not None
+    x = x_t
+    pending = pending_gate = None
+    for i in range(DEC_L):
+        p = f"{_DP}.{i}"
+        if ada_kernel is not None:
+            gamma, shift, gate_a = style_attn[i]
+            x_mod, x = ada_kernel(x, pending, pending_gate, gamma, shift)
+        else:
+            x_mod, gate_a = _ada_opt(x, style_attn[i])
+        qkv = linear(x_mod, wf[f"{p}.qkv.weight"])
+        total = prefix_len + chunk
+        if rope_kernel is not None:
+            q_rot = rope_kernel(qkv, cos_t, sin_t, kbufs[i], vbufs[i], prefix_len)
+        else:
+            q, k, v = qkv.split([DEC_NH * DEC_HD, DEC_HD, DEC_HD], dim=-1)
+            if use_tbl:
+                q_rot = rope_fast(q, cos_t, sin_t, prefix_len, DEC_HD)
+                k_rot = rope_fast(k, cos_t, sin_t, prefix_len, DEC_HD)
+            else:
+                inv = _rope_inv_freqs(DEC_HD, device=dev)
+                pos = torch.arange(prefix_len, prefix_len + chunk, device=dev)
+                q_rot = rope_half_split(q, pos, inv, DEC_HD)
+                k_rot = rope_half_split(k, pos, inv, DEC_HD)
+            if kv_store_fused_enabled() and qkv.is_contiguous():
+                _kv_cache_store_ext.kv_cache_store(
+                    k_rot, qkv, kbufs[i], vbufs[i], prefix_len)
+            else:
+                kbufs[i][prefix_len:total].copy_(k_rot)
+                vbufs[i][prefix_len:total].copy_(v)
+        if attention_kernel is not None:
+            o = attention_kernel(q_rot, kbufs[i], vbufs[i])
+        else:
+            o = attention_flash(q_rot, kbufs[i][:total], vbufs[i][:total],
+                                DEC_NH, DEC_NKV)
+        o = linear(o, wf[f"{p}.self_attn.o_proj.weight"])
+        if ada_kernel is not None:
+            gamma, shift, gate_f = style_mlp[i]
+            x_mod, x = ada_kernel(x, o, gate_a, gamma, shift)
+        else:
+            x = x + o * gate_a
+            x_mod, gate_f = _ada_opt(x, style_mlp[i])
+        gu = linear(x_mod, wf[f"{p}.gu.weight"])
+        import torch_npu
+        hidden = torch_npu.npu_geglu(gu, dim=-1, approximate=1, activate_left=True)[0]
+        d = linear(hidden, wf[f"{p}.mlp.down_proj.weight"])
+        if ada_kernel is not None:
+            pending, pending_gate = d, gate_f
+        else:
+            x = x + d * gate_f
+    if ada_kernel is not None:
+        x_final, _ = ada_kernel(x, pending, pending_gate, style_top[0], style_top[1])
+    else:
+        x_final, _ = _ada_opt(x, style_top)
+    return x_final
+
+
+def make_rope_tables(capacity: int, hd: int, device) -> tuple:
+    """Precomputed per-position cos/sin rows (capacity, hd) for the
+    half-split rope. Built once outside the graph with the same arithmetic
+    as ``pipeline.rope_half_split`` (identical values, so results are
+    bit-identical to the eager path)."""
+    half = hd // 2
+    inv = _rope_inv_freqs(hd, device=device)
+    pos = torch.arange(capacity, device=device).float().unsqueeze(1)
+    emb = pos * inv.unsqueeze(0)                       # (capacity, hd/2)
+    emb2 = torch.cat([emb, emb], dim=-1)               # (capacity, hd)
+    return torch.cos(emb2), torch.sin(emb2)
+
+
+def rope_fast(x: torch.Tensor, cos_t: torch.Tensor, sin_t: torch.Tensor,
+              pos0: int, hd: int) -> torch.Tensor:
+    """Half-split RoPE from a cos/sin table (no per-call trig). Same
+    rotation math as pipeline.rope_half_split; x (rows, D) with D % hd == 0."""
+    R = x.shape[0]
+    c = cos_t[pos0:pos0 + R][:, None, :]
+    s = sin_t[pos0:pos0 + R][:, None, :]
+    import torch_npu
+    xr = x.to(torch.float32).reshape(1, R, -1, hd)
+    return torch_npu.npu_rotary_mul(xr, c.unsqueeze(0), s.unsqueeze(0)).reshape(x.shape).to(x.dtype)
+
+
+def attention_flash(q, k, v, nh: int, nkv: int) -> torch.Tensor:
+    """Full (non-causal) attention via ``npu_prompt_flash_attention`` — one
+    capturable aclnn node replacing the manual bmm/softmax chain. ``q`` is
+    (Sq, nh*hd), ``k``/``v`` are (Skv, nkv*hd). Scale is 1/sqrt(hd)."""
+    import torch_npu
+    hd = q.shape[-1] // nh
+    out = torch_npu.npu_prompt_flash_attention(
+        q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
+        num_heads=nh, num_key_value_heads=nkv,
+        scale_value=1.0 / math.sqrt(hd),
+        pre_tokens=2147483647, next_tokens=2147483647,
+        input_layout="BSH", sparse_mode=0)
+    return out.reshape(q.shape)
+
+
+def vision_tower_opt(images: torch.Tensor, w: dict, zeros: torch.Tensor, patch_tokens=None):
+    """SigLIP vision tower with fused LayerNorms.
+
+    ``npu_layer_norm_eval`` (the natural fit) is an aclop operator and cannot
+    be captured, so each LayerNorm runs as ``npu_add_layer_norm(x, zeros,
+    gamma, beta, eps)[0]`` — same plain-LN result (fp32 gamma/beta, measured
+    cos 1.0) but one capturable aclnn node instead of the ~7-op manual fp32
+    chain. ``zeros`` is a persistent (S, VIS_D) bf16 zero tensor."""
+    import torch_npu
+    nv = images.shape[0]
+    vp = _VP
+    w_dtype = images.dtype
+    pe_w = w[f"{vp}.embeddings.patch_embedding.weight"].to(torch.float32)
+    pe_b = w[f"{vp}.embeddings.patch_embedding.bias"].to(torch.float32)
+    if patch_tokens is None:
+        imgs32 = images.to(torch.float32)
+        blocks = imgs32.view(nv, 3, 16, 14, 16, 14).permute(0, 2, 4, 1, 3, 5)
+        tokens = blocks.reshape(nv, VIS_TOKENS_PER_VIEW, 3 * 14 * 14).contiguous()
+    else:
+        tokens = patch_tokens
+    x = torch.matmul(tokens.reshape(-1, 588), pe_w.reshape(VIS_D, -1).t())
+    x = (x + pe_b).reshape(nv, VIS_TOKENS_PER_VIEW, VIS_D).to(w_dtype)
+    x = x + w[f"{vp}.embeddings.position_embedding.weight"].unsqueeze(0)
+
+    def ln(xn, lw, lb):
+        # npu_add_layer_norm: bf16 x1/x2 with matching-dtype gamma/beta
+        # (probe: fp32 gamma is also accepted with bf16 x; matching bf16 is
+        # the safe combo across the model's stored dtypes).
+        x2 = xn.to(torch.bfloat16).reshape(-1, xn.shape[-1])
+        z2 = zeros.expand(x2.shape[0], xn.shape[-1])
+        y = torch_npu.npu_add_layer_norm(
+            x2, z2, lw.to(torch.bfloat16), lb.to(torch.bfloat16), EPS)[0]
+        return y.to(xn.dtype).reshape(xn.shape)
+
+    for i in range(VIS_L):
+        xn = ln(x, w[f"{vp}.encoder.layers.{i}.layer_norm1.weight"],
+                w[f"{vp}.encoder.layers.{i}.layer_norm1.bias"])
+        q = linear(xn, w[f"{vp}.encoder.layers.{i}.self_attn.q_proj.weight"],
+                     w[f"{vp}.encoder.layers.{i}.self_attn.q_proj.bias"])
+        k = linear(xn, w[f"{vp}.encoder.layers.{i}.self_attn.k_proj.weight"],
+                     w[f"{vp}.encoder.layers.{i}.self_attn.k_proj.bias"])
+        v = linear(xn, w[f"{vp}.encoder.layers.{i}.self_attn.v_proj.weight"],
+                     w[f"{vp}.encoder.layers.{i}.self_attn.v_proj.bias"])
+        o = torch_npu.npu_prompt_flash_attention(
+            q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16),
+            num_heads=16, num_key_value_heads=16, scale_value=72 ** -0.5,
+            input_layout="BSH", pre_tokens=2147483647, next_tokens=2147483647,
+            sparse_mode=0).to(q.dtype)
+        o = linear(o, w[f"{vp}.encoder.layers.{i}.self_attn.out_proj.weight"],
+                     w[f"{vp}.encoder.layers.{i}.self_attn.out_proj.bias"])
+        x = x + o
+        res2 = x
+        xn = ln(x, w[f"{vp}.encoder.layers.{i}.layer_norm2.weight"],
+                w[f"{vp}.encoder.layers.{i}.layer_norm2.bias"])
+        h = linear(xn, w[f"{vp}.encoder.layers.{i}.mlp.fc1.weight"],
+                     w[f"{vp}.encoder.layers.{i}.mlp.fc1.bias"])
+        h = F.gelu(h, approximate=GELU_TANH_APPROX)
+        h = linear(h, w[f"{vp}.encoder.layers.{i}.mlp.fc2.weight"],
+                     w[f"{vp}.encoder.layers.{i}.mlp.fc2.bias"])
+        x = res2 + h
+    x = ln(x, w[f"{vp}.post_layernorm.weight"],
+           w[f"{vp}.post_layernorm.bias"])
+    x = linear(x, w[f"{_MP}.weight"], w[f"{_MP}.bias"])
+    return x.reshape(nv * VIS_TOKENS_PER_VIEW, ENC_D)
+
+
+def decoder_step_int8(x_t, kbufs, vbufs, style_attn, style_mlp, style_top,
+                      prefix_len: int, chunk: int, cos_t, sin_t, island,
+                      step: int, attention_kernel=None):
+    """``decoder_step_fast_nocat`` with the four projections frozen to INT8.
+
+    The launch count is the BF16 path's plus one: the attention output is the
+    only activation with no kernel of ours in front of it, so it takes the
+    shipped row quantiser, while the other three are quantised by the kernel
+    that was already writing them. Two of the four projections return their
+    result in fractal NZ and both are consumed by the AdaRMS branch, which
+    gathers a row from it directly.
+    """
+    x = x_t
+    pending = pending_gate = None
+    for i in range(DEC_L):
+        layer = island.layers[i]
+        gamma, shift, gate_a = style_attn[i]
+        x_mod, x = island.kernels.gated_ada(
+            x, pending, pending_gate, gamma, shift,
+            inverse=layer["qkv"].inverse[step],
+            branch_nz=island.layers[i - 1]["mlp.down_proj"].nz)
+        qkv = layer["qkv"](x_mod, step)
+        if getattr(attention_kernel, "transposed", False):
+            q_rot = island.kernels.decoder_rope_transposed(
+                qkv, cos_t, sin_t, island.query, kbufs[i], vbufs[i], prefix_len)
+        else:
+            q_rot = island.kernels.decoder_rope(qkv, cos_t, sin_t, island.query,
+                                                kbufs[i], vbufs[i], prefix_len)
+        o = attention_kernel(q_rot, kbufs[i], vbufs[i])
+        o = layer["self_attn.o_proj"](island.quantize_attention(o, i, step), step)
+        gamma, shift, gate_f = style_mlp[i]
+        x_mod, x = island.kernels.gated_ada(
+            x, o, gate_a, gamma, shift, inverse=layer["gu"].inverse[step],
+            branch_nz=layer["self_attn.o_proj"].nz)
+        gu = layer["gu"](x_mod, step)
+        hidden = island.kernels.gated_gelu(
+            gu, layer["mlp.down_proj"].inverse[step], island.hidden)
+        pending, pending_gate = layer["mlp.down_proj"](hidden, step), gate_f
+    x_final, _ = island.kernels.gated_ada(
+        x, pending, pending_gate, style_top[0], style_top[1],
+        branch_nz=island.layers[DEC_L - 1]["mlp.down_proj"].nz)
+    return x_final

@@ -69,6 +69,79 @@ __global__ void router_topk_kernel(const __nv_bfloat16* __restrict__ logits,
   }
 }
 
+// One warp, no barriers.
+//
+// The kernel above spreads 256 logits over 256 threads and runs k rounds, each
+// with a warp reduction plus three block-wide barriers to publish the winner
+// and mask it. That is 24 barriers to pick eight of 256 values -- 6.5 us to
+// read 512 bytes, which is latency, not work.
+//
+// Here one warp owns all the logits in registers, eight per lane, and the same
+// k rounds run entirely in shuffles. Nothing to synchronise, nothing in shared
+// memory.
+//
+// The result is identical rather than merely equivalent, and for a reason
+// worth stating: argmax under a total order -- greater value wins, lower index
+// breaks ties -- selects one specific element, so the answer does not depend
+// on the shape of the reduction tree the way a floating-point sum does.
+// Changing which lane holds which logit therefore cannot change the output.
+template <int kPerLane>
+__global__ void router_topk_warp1_kernel(const __nv_bfloat16* __restrict__ logits,
+                                         int* __restrict__ out_idx,
+                                         float* __restrict__ out_val,
+                                         int n, int k) {
+  const int lane = threadIdx.x;
+  float v[kPerLane];
+#pragma unroll
+  for (int j = 0; j < kPerLane; ++j) {
+    const int i = j * 32 + lane;
+    v[j] = (i < n) ? static_cast<float>(logits[i]) : -FLT_MAX;
+  }
+
+  for (int r = 0; r < k; ++r) {
+    float best = -FLT_MAX;
+    int bidx = -1;
+#pragma unroll
+    for (int j = 0; j < kPerLane; ++j) {
+      const int i = j * 32 + lane;
+      if (v[j] > best || (v[j] == best && i < bidx)) { best = v[j]; bidx = i; }
+    }
+    warp_argmax(best, bidx);          // butterfly: every lane ends with it
+    if (lane == 0) {
+      out_idx[r] = bidx;
+      out_val[r] = best;
+    }
+    // The lane that owns the winner clears it. bidx = j * 32 + owner, so the
+    // low five bits are the owner and the rest is the slot.
+    if (bidx >= 0 && (bidx & 31) == lane) v[bidx >> 5] = -FLT_MAX;
+  }
+}
+
+}  // namespace
+
+int moe_router_topk_warp_sm120_bf16(const void* logits, void* out_idx,
+                                    void* out_val, int n_experts, int k,
+                                    cudaStream_t stream) {
+  if (!logits || !out_idx || !out_val) return 1;
+  if (n_experts <= 0 || k <= 0 || k > 32) return 2;
+  auto* oi = reinterpret_cast<int*>(out_idx);
+  auto* ov = reinterpret_cast<float*>(out_val);
+  const auto* lg = reinterpret_cast<const __nv_bfloat16*>(logits);
+  if (n_experts <= 32)
+    router_topk_warp1_kernel<1><<<1, 32, 0, stream>>>(lg, oi, ov, n_experts, k);
+  else if (n_experts <= 64)
+    router_topk_warp1_kernel<2><<<1, 32, 0, stream>>>(lg, oi, ov, n_experts, k);
+  else if (n_experts <= 128)
+    router_topk_warp1_kernel<4><<<1, 32, 0, stream>>>(lg, oi, ov, n_experts, k);
+  else if (n_experts <= 256)
+    router_topk_warp1_kernel<8><<<1, 32, 0, stream>>>(lg, oi, ov, n_experts, k);
+  else
+    return 3;                         // caller falls back to the block kernel
+  return 0;
+}
+
+namespace {
+
 }  // namespace
 
 int moe_router_topk_sm120_bf16(const void* logits, void* out_idx, void* out_val,

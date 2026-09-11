@@ -1,0 +1,139 @@
+"""CPU checks against independent model operations, not a self-generated golden."""
+import torch
+import torch.nn.functional as F
+import pytest
+
+from flash_rt.npu.models.pi05 import pipeline
+
+
+def test_vision_attention_preserves_token_head_and_view_axes():
+    generator = torch.Generator().manual_seed(27)
+    q, k, v = [torch.randn(2, 7, 12, generator=generator) for _ in range(3)]
+    expected = []
+    for view in range(2):
+        qh, kh, vh = [x[view].reshape(7, 3, 4).transpose(0, 1)
+                      for x in (q, k, v)]
+        expected.append(F.scaled_dot_product_attention(qh, kh, vh)
+                        .transpose(0, 1).reshape(7, 12))
+    torch.testing.assert_close(pipeline.vision_attention(q, k, v, 3),
+                               torch.stack(expected), atol=1e-6, rtol=1e-6)
+    changed = v.clone()
+    changed[1].add_(100)
+    torch.testing.assert_close(pipeline.vision_attention(q, k, changed, 3)[0],
+                               expected[0], atol=1e-6, rtol=1e-6)
+
+
+def test_wrapped_safetensors_keys_are_read_before_prefix_removal(tmp_path):
+    from safetensors.torch import save_file
+    path = tmp_path / "weights.safetensors"
+    value = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    save_file({"model.proj.weight": value}, path)
+    loaded = pipeline.load_weights_fp32(path)
+    assert list(loaded) == ["proj.weight"]
+    torch.testing.assert_close(loaded["proj.weight"], value)
+
+
+def test_encoder_output_projection_affects_next_layer_cache(monkeypatch):
+    for key, value in {"ENC_L": 2, "ENC_D": 8, "ENC_HD": 4,
+                       "ENC_NH": 2, "ENC_NKV": 1}.items():
+        monkeypatch.setattr(pipeline, key, value)
+    generator = torch.Generator().manual_seed(19)
+    weights = {}
+    for layer in range(2):
+        prefix = f"{pipeline._EP}.{layer}"
+        for norm in ("input_layernorm", "post_attention_layernorm"):
+            weights[f"{prefix}.{norm}.weight"] = torch.zeros(8)
+        for proj, rows in (("q_proj", 8), ("k_proj", 4), ("v_proj", 4), ("o_proj", 8)):
+            weights[f"{prefix}.self_attn.{proj}.weight"] = torch.randn(rows, 8, generator=generator)
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            weights[f"{prefix}.mlp.{proj}.weight"] = torch.zeros(8, 8)
+    x = torch.randn(3, 8, generator=generator)
+    key = f"{pipeline._EP}.0.self_attn.o_proj.weight"
+    weights[key].zero_()
+    zero_cache = pipeline.encoder_pass(x, weights)
+    weights[key] = torch.eye(8)
+    projected_cache = pipeline.encoder_pass(x, weights)
+    torch.testing.assert_close(zero_cache[0][0], projected_cache[0][0])
+    assert not torch.allclose(zero_cache[1][0], projected_cache[1][0])
+
+    # The cache-only inference contract discards the final encoder hidden
+    # state. Changing its final attention output and MLP cannot alter any KV.
+    final = f"{pipeline._EP}.1"
+    for suffix in ("self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"):
+        weights[f"{final}.{suffix}.weight"] = torch.randn(8, 8, generator=generator)
+    changed_final_hidden = pipeline.encoder_pass(x, weights)
+    for before, after in zip(projected_cache, changed_final_hidden):
+        for expected, actual in zip(before, after):
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_setup_head_padding_preserves_full_attention_projection(monkeypatch):
+    from flash_rt.npu.models.pi05 import fast
+    for key, value in {"VIS_L": 1, "VIS_D": 6, "VIS_NH": 2, "VIS_HD": 3}.items():
+        monkeypatch.setattr(fast, key, value)
+    generator = torch.Generator().manual_seed(43)
+    prefix = f"{fast._VP}.encoder.layers.0.self_attn"
+    weights = {}
+    for name in ("q_proj", "k_proj", "v_proj", "out_proj"):
+        weights[f"{prefix}.{name}.weight"] = torch.randn(6, 6, generator=generator, dtype=torch.float64)
+        weights[f"{prefix}.{name}.bias"] = torch.randn(6, generator=generator, dtype=torch.float64)
+    padded = fast.make_vision_padded_weights(weights, padded_head_dim=4)
+    x = torch.randn(2, 5, 6, generator=generator, dtype=torch.float64)
+
+    def full_attention(w, width):
+        q, k, v = [F.linear(x, w[f"{prefix}.{name}.weight"], w[f"{prefix}.{name}.bias"])
+                   .reshape(2, 5, 2, width).transpose(1, 2)
+                   for name in ("q_proj", "k_proj", "v_proj")]
+        out = F.scaled_dot_product_attention(q, k, v, scale=3 ** -0.5)
+        return F.linear(out.transpose(1, 2).reshape(2, 5, 2 * width),
+                        w[f"{prefix}.out_proj.weight"], w[f"{prefix}.out_proj.bias"])
+
+    torch.testing.assert_close(full_attention(padded, 4), full_attention(weights, 3),
+                               atol=1e-12, rtol=1e-12)
+
+
+def test_shared_pages_preserve_bidirectional_query_attention():
+    from flash_rt.npu.models.pi05.attention import PagedDecoderAttention
+    total, queries, heads, dim = 19, 3, 2, 4
+    paging = PagedDecoderAttention.create(total, queries, device="cpu", block_size=16)
+    generator = torch.Generator().manual_seed(71)
+    q = torch.randn(queries, heads, dim, generator=generator)
+    k = torch.randn(paging.capacity, dim, generator=generator)
+    v = torch.randn(paging.capacity, dim, generator=generator)
+    dense = F.scaled_dot_product_attention(
+        q.transpose(0, 1).unsqueeze(0), k[:total][None, None],
+        v[:total][None, None]).squeeze(0).transpose(0, 1)
+    slots = (paging.table[:, :, None] * paging.block_size
+             + torch.arange(paging.block_size)).reshape(queries, -1)[:, :total]
+    batched = F.scaled_dot_product_attention(
+        q.unsqueeze(2), k[slots].unsqueeze(1), v[slots].unsqueeze(1)).squeeze(2)
+    torch.testing.assert_close(batched, dense, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("queries", [3, 10])
+def test_decoder_attention_scheduling_preserves_dense_result(monkeypatch, queries):
+    import sys
+    from types import SimpleNamespace
+    from flash_rt.npu.models.pi05.attention import PagedDecoderAttention
+
+    def paged_attention(q, k, v, **options):
+        table = options["block_table"]
+        block = options["block_size"]
+        total = options["actual_seq_lengths"][0]
+        slots = (table[:, :, None] * block + torch.arange(block)).flatten(1)[:, :total]
+        return F.scaled_dot_product_attention(
+            q, k.flatten(0, 2)[slots].unsqueeze(1),
+            v.flatten(0, 2)[slots].unsqueeze(1), scale=options["scale_value"])
+
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(
+        npu_incre_flash_attention=paged_attention))
+    paging = PagedDecoderAttention.create(19, queries, device="cpu", block_size=16)
+    generator = torch.Generator().manual_seed(93)
+    q = torch.randn(queries, 8, 256, generator=generator, dtype=torch.float64)
+    k = torch.randn(paging.capacity, 256, generator=generator, dtype=torch.float64)
+    v = torch.randn(paging.capacity, 256, generator=generator, dtype=torch.float64)
+    expected = F.scaled_dot_product_attention(
+        q.transpose(0, 1)[None], k[:19][None, None], v[:19][None, None]
+    ).squeeze(0).transpose(0, 1).reshape(queries, 2048)
+    torch.testing.assert_close(paging(q.reshape(queries, 2048), k, v), expected,
+                               atol=1e-12, rtol=1e-12)

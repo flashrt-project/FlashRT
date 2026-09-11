@@ -56,7 +56,7 @@ def _config():
 
 
 def _checkpoint(tmp_path):
-    from flash_rt.frontends.torch.qwen36_moe_rtx import (
+    from flash_rt.frontends.torch.qwen36_moe import (
         _MTP_KEYS,
         _required_text_keys,
     )
@@ -76,14 +76,14 @@ def _checkpoint(tmp_path):
 
 
 def _mock_checkpoint_shapes(monkeypatch, overrides=None):
-    from flash_rt.frontends.torch import qwen36_moe_rtx
+    from flash_rt.frontends.torch import qwen36_moe
 
-    shapes = qwen36_moe_rtx._expected_text_shapes(
-        qwen36_moe_rtx._EXPECTED_LAYER_TYPES)
-    shapes.update(qwen36_moe_rtx._expected_mtp_shapes())
+    shapes = qwen36_moe._expected_text_shapes(
+        qwen36_moe._EXPECTED_LAYER_TYPES)
+    shapes.update(qwen36_moe._expected_mtp_shapes())
     shapes.update(overrides or {})
     monkeypatch.setattr(
-        qwen36_moe_rtx,
+        qwen36_moe,
         "_read_tensor_shapes",
         lambda checkpoint_path, weight_map, tensor_names: {
             name: shapes[name] for name in tensor_names
@@ -93,26 +93,50 @@ def _mock_checkpoint_shapes(monkeypatch, overrides=None):
 
 def test_frontend_is_a_thin_qwen_entry():
     from flash_rt.frontends.torch.nexn2_rtx import Nexn2TorchFrontendRtx
+    from flash_rt.frontends.torch.qwen36_moe import (
+        Qwen36MoeTextFrontend,
+    )
+
+    assert issubclass(Qwen36MoeTextFrontend, Nexn2TorchFrontendRtx)
+    assert Qwen36MoeTextFrontend._MODEL_LABEL == (
+        "Qwen3.6-35B-A3B text")
+    assert inspect.signature(
+        Qwen36MoeTextFrontend).parameters["kernelized"].default is True
+
+
+@pytest.mark.parametrize("arch", ["rtx_sm120", "thor"])
+def test_registry_resolves_qwen36_moe(arch):
+    from flash_rt.hardware import _PIPELINE_MAP, resolve_pipeline_class
+
+    assert _PIPELINE_MAP[("qwen36_moe", "torch", arch)] == (
+        "flash_rt.frontends.torch.qwen36_moe",
+        "Qwen36MoeTextFrontend",
+    )
+    cls = resolve_pipeline_class("qwen36_moe", "torch", arch)
+    assert cls.__name__ == "Qwen36MoeTextFrontend"
+
+
+def test_both_architectures_resolve_to_one_frontend():
+    """Thor and RTX run the same code, so they must resolve to one class.
+
+    Two entries pointing at two classes would be two paths to keep in step;
+    what differs between the targets is which kernel tiers the build has, not
+    which Python runs.
+    """
+    from flash_rt.hardware import resolve_pipeline_class
+
+    assert (resolve_pipeline_class("qwen36_moe", "torch", "thor")
+            is resolve_pipeline_class("qwen36_moe", "torch", "rtx_sm120"))
+
+
+def test_previous_import_path_still_works():
+    """The module was renamed when it stopped being RTX-only."""
+    from flash_rt.frontends.torch.qwen36_moe import Qwen36MoeTextFrontend
     from flash_rt.frontends.torch.qwen36_moe_rtx import (
         Qwen36MoeTextFrontendRtx,
     )
 
-    assert issubclass(Qwen36MoeTextFrontendRtx, Nexn2TorchFrontendRtx)
-    assert Qwen36MoeTextFrontendRtx._MODEL_LABEL == (
-        "Qwen3.6-35B-A3B text")
-    assert inspect.signature(
-        Qwen36MoeTextFrontendRtx).parameters["kernelized"].default is True
-
-
-def test_registry_resolves_qwen36_moe():
-    from flash_rt.hardware import _PIPELINE_MAP, resolve_pipeline_class
-
-    assert _PIPELINE_MAP[("qwen36_moe", "torch", "rtx_sm120")] == (
-        "flash_rt.frontends.torch.qwen36_moe_rtx",
-        "Qwen36MoeTextFrontendRtx",
-    )
-    cls = resolve_pipeline_class("qwen36_moe", "torch", "rtx_sm120")
-    assert cls.__name__ == "Qwen36MoeTextFrontendRtx"
+    assert Qwen36MoeTextFrontendRtx is Qwen36MoeTextFrontend
 
 
 def test_load_model_redirects_to_text_frontend():
@@ -121,30 +145,30 @@ def test_load_model_redirects_to_text_frontend():
     with pytest.raises(NotImplementedError) as exc:
         flash_rt.load_model("/nonexistent", config="qwen36_moe")
     message = str(exc.value)
-    assert "Qwen36MoeTextFrontendRtx" in message
+    assert "Qwen36MoeTextFrontend" in message
     assert "text LLM" in message
 
 
 def test_constructor_rejects_quant_before_checkpoint_access():
-    from flash_rt.frontends.torch.qwen36_moe_rtx import (
-        Qwen36MoeTextFrontendRtx,
+    from flash_rt.frontends.torch.qwen36_moe import (
+        Qwen36MoeTextFrontend,
     )
 
     with pytest.raises(NotImplementedError, match="only 'nvfp4'"):
-        Qwen36MoeTextFrontendRtx("/nonexistent", quant="fp8")
+        Qwen36MoeTextFrontend("/nonexistent", quant="fp8")
 
 
 def test_constructor_rejects_reference_path_before_checkpoint_access():
-    from flash_rt.frontends.torch.qwen36_moe_rtx import (
-        Qwen36MoeTextFrontendRtx,
+    from flash_rt.frontends.torch.qwen36_moe import (
+        Qwen36MoeTextFrontend,
     )
 
     with pytest.raises(NotImplementedError, match="kernelized=True"):
-        Qwen36MoeTextFrontendRtx("/nonexistent", kernelized=False)
+        Qwen36MoeTextFrontend("/nonexistent", kernelized=False)
 
 
 def test_checkpoint_contract_accepts_complete_layout(tmp_path, monkeypatch):
-    from flash_rt.frontends.torch.qwen36_moe_rtx import (
+    from flash_rt.frontends.torch.qwen36_moe import (
         validate_qwen36_moe_checkpoint,
     )
 
@@ -178,7 +202,7 @@ def test_checkpoint_contract_accepts_complete_layout(tmp_path, monkeypatch):
 )
 def test_checkpoint_contract_rejects_wrong_geometry(
         tmp_path, path, invalid, message):
-    from flash_rt.frontends.torch.qwen36_moe_rtx import (
+    from flash_rt.frontends.torch.qwen36_moe import (
         validate_qwen36_moe_checkpoint,
     )
 
@@ -196,7 +220,7 @@ def test_checkpoint_contract_rejects_wrong_geometry(
 
 
 def test_checkpoint_contract_rejects_missing_text_tensor(tmp_path):
-    from flash_rt.frontends.torch.qwen36_moe_rtx import (
+    from flash_rt.frontends.torch.qwen36_moe import (
         validate_qwen36_moe_checkpoint,
     )
 
@@ -211,7 +235,7 @@ def test_checkpoint_contract_rejects_missing_text_tensor(tmp_path):
 
 
 def test_checkpoint_contract_rejects_partial_mtp(tmp_path):
-    from flash_rt.frontends.torch.qwen36_moe_rtx import (
+    from flash_rt.frontends.torch.qwen36_moe import (
         validate_qwen36_moe_checkpoint,
     )
 
@@ -226,7 +250,7 @@ def test_checkpoint_contract_rejects_partial_mtp(tmp_path):
 
 
 def test_checkpoint_contract_rejects_missing_shard(tmp_path):
-    from flash_rt.frontends.torch.qwen36_moe_rtx import (
+    from flash_rt.frontends.torch.qwen36_moe import (
         validate_qwen36_moe_checkpoint,
     )
 
@@ -239,7 +263,7 @@ def test_checkpoint_contract_rejects_missing_shard(tmp_path):
 
 def test_checkpoint_contract_rejects_wrong_tensor_shape(
         tmp_path, monkeypatch):
-    from flash_rt.frontends.torch.qwen36_moe_rtx import (
+    from flash_rt.frontends.torch.qwen36_moe import (
         validate_qwen36_moe_checkpoint,
     )
 
@@ -261,15 +285,17 @@ def test_generic_env_names_precede_legacy_aliases(monkeypatch):
 
 def test_kernelized_generate_uses_shared_graph_path(monkeypatch):
     from flash_rt.frontends.torch import _nexn2_rtx_decode as decode
-    from flash_rt.frontends.torch.qwen36_moe_rtx import (
-        Qwen36MoeTextFrontendRtx,
+    from flash_rt.frontends.torch.qwen36_moe import (
+        Qwen36MoeTextFrontend,
     )
 
     calls = {}
 
     class FakeState:
-        def __init__(self, weights, max_seq, device):
+        def __init__(self, weights, max_seq, device, *,
+                     spec_graph_cache_max=None):
             calls["state"] = (weights, max_seq, device)
+            calls["spec_cap"] = spec_graph_cache_max
 
     def fake_generate(state, prompt_ids, count, fvk, device):
         calls["generate"] = (state, prompt_ids, count, fvk, device)
@@ -278,8 +304,8 @@ def test_kernelized_generate_uses_shared_graph_path(monkeypatch):
     monkeypatch.setattr(decode, "Nexn2DecodeState", FakeState)
     monkeypatch.setattr(decode, "generate_greedy_graph", fake_generate)
 
-    frontend = Qwen36MoeTextFrontendRtx.__new__(
-        Qwen36MoeTextFrontendRtx)
+    frontend = Qwen36MoeTextFrontend.__new__(
+        Qwen36MoeTextFrontend)
     frontend._kernelized = True
     frontend._prompt_ids = object()
     frontend._decode_state = None
@@ -287,6 +313,7 @@ def test_kernelized_generate_uses_shared_graph_path(monkeypatch):
     frontend._user_max_seq = 128
     frontend.device = "cuda:0"
     frontend._fvk = object()
+    frontend._spec_graph_cache_max = None
 
     assert frontend.generate(3) == [7, 7, 7]
     assert calls["state"] == (
@@ -302,7 +329,7 @@ def test_kernelized_generate_uses_shared_graph_path(monkeypatch):
     reason="set FLASHRT_QWEN36_MOE_CKPT_DIR for checkpoint validation",
 )
 def test_real_checkpoint_contract():
-    from flash_rt.frontends.torch.qwen36_moe_rtx import (
+    from flash_rt.frontends.torch.qwen36_moe import (
         validate_qwen36_moe_checkpoint,
     )
 

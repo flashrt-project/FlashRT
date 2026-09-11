@@ -211,6 +211,21 @@ class ThorGrootAttnBackend(AttentionBackendBase):
             HD = site_spec.head_dim
             if kv_seq is None:
                 kv_seq = q_seq
+            # The strided FMHA kernel is only validated for power-of-two
+            # sequences on real data (648-seq cross-view SigLIP at the 252
+            # training resolution diverges silently). Use torch sdpa when
+            # tensor views are provided (graph-capturable, exact).
+            if "qkv_t" in s:
+                import torch.nn.functional as F
+                qkv_t = s["qkv_t"]
+                O_t = s["O_t"]
+                seq = int(q_seq)
+                q = qkv_t[:seq, :D].view(seq, NH, HD).transpose(0, 1)
+                k = qkv_t[:seq, D:2 * D].view(seq, NH, HD).transpose(0, 1)
+                v = qkv_t[:seq, 2 * D:].view(seq, NH, HD).transpose(0, 1)
+                o = F.scaled_dot_product_attention(q, k, v)
+                O_t[:seq].copy_(o.transpose(0, 1).reshape(seq, D))
+                return int(s["O"])
             stride = 3 * D
             Q = int(s["qkv"])
             K = Q + D * 2
@@ -261,7 +276,8 @@ class ThorGrootAttnBackend(AttentionBackendBase):
 
 
 def make_groot_attention_spec(*, num_views: int, qwen3_seq_max: int,
-                               sa: int, s_kv: int) -> AttentionSpec:
+                               sa: int, s_kv: int,
+                               siglip_cross_view: bool = False) -> AttentionSpec:
     """Build the GROOT AttentionSpec (4 sites).
 
     Args:
@@ -269,13 +285,28 @@ def make_groot_attention_spec(*, num_views: int, qwen3_seq_max: int,
         qwen3_seq_max: max Qwen3 sequence length (prompt + vision tokens).
         sa: DiT action sequence length (hidden tokens = 1 state + T actions).
         s_kv: DiT cross-attention KV length (non_img + img backbone features).
+        siglip_cross_view: N1.6 HF semantics — the live HF baseline runs
+            SigLIP2 under sdpa, which ignores the NaFlex per-view
+            ``seq_len_list`` segmentation, so all packed views attend
+            jointly. Model the SigLIP site as one batch-1 sequence of
+            ``num_views * 256`` tokens instead of ``num_views``
+            independent 256-token views. Default False keeps the legacy
+            per-view behaviour.
     """
     spec = AttentionSpec()
-    spec.add_site(
-        "siglip",
-        num_layers=27, num_q_heads=16, num_kv_heads=16, head_dim=72,
-        max_q_seq=256, max_kv_seq=256, batch_axis=int(num_views),
-    )
+    if siglip_cross_view:
+        spec.add_site(
+            "siglip",
+            num_layers=27, num_q_heads=16, num_kv_heads=16, head_dim=72,
+            max_q_seq=256 * int(num_views), max_kv_seq=256 * int(num_views),
+            batch_axis=1,
+        )
+    else:
+        spec.add_site(
+            "siglip",
+            num_layers=27, num_q_heads=16, num_kv_heads=16, head_dim=72,
+            max_q_seq=256, max_kv_seq=256, batch_axis=int(num_views),
+        )
     spec.add_site(
         "qwen3",
         num_layers=16, num_q_heads=16, num_kv_heads=16, head_dim=128,

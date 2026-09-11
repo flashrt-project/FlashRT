@@ -7,7 +7,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include <cuda_fp4.h>
+#include "kernels/fp4_e2m1_compat.cuh"
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstdint>
@@ -34,9 +34,8 @@ __device__ __forceinline__ float blockdot_g(uint64_t b_pack,
   float acc = 0.0f;
 #pragma unroll
   for (int j = 0; j < 8; ++j) {
-    const __nv_fp4x2_storage_t bb =
-        static_cast<__nv_fp4x2_storage_t>(b_pack >> (j * 8));
-    const __half2_raw wr = __nv_cvt_fp4x2_to_halfraw2(bb, __NV_E2M1);
+    const __half2_raw wr = flash_rt::fp4::cvt_e2m1x2_to_halfraw2(
+        static_cast<uint8_t>(b_pack >> (j * 8)));
     const float2 wf = __half22float2(*reinterpret_cast<const __half2*>(&wr));
     const float2 xf = __bfloat1622float2(xb2[j]);
     acc = fmaf(wf.x, xf.x, acc);

@@ -9,7 +9,8 @@ scales share one representation.
 Scope for v1:
     * The current shipped kernels support experimental
       ``dtype in {"fp8_e4m3", "int8"}`` with
-      ``granularity="per_tensor"`` + ``scheme="symmetric"``.
+      ``granularity="per_tensor"`` + ``scheme="symmetric"``, and static
+      INT8 per-channel descriptors with an explicit axis.
     * ``PrecisionSpec.validate()`` raises ``NotImplementedError`` for any
       other combination — this is intentional. It forces future extensions
       (QAT, per-channel, asymmetric) to touch this file first, keeping
@@ -58,6 +59,7 @@ class PrecisionSpec:
     calibration_method: Optional[str] = None
     calibration_samples: Optional[int] = None
     calibration_percentile: Optional[float] = None
+    axis: Optional[int] = None
 
     def validate(self) -> None:
         """Assert the spec is expressible by currently-shipped kernels.
@@ -78,7 +80,10 @@ class PrecisionSpec:
             raise NotImplementedError(
                 f"dtype={self.dtype!r} is not supported by shipped kernels. "
                 f"v1 supports only {sorted(_SUPPORTED_DTYPES)}.")
-        if self.granularity not in _SUPPORTED_GRANULARITIES:
+        channel_int8 = self.dtype == "int8" and self.granularity == "per_channel"
+        if channel_int8 and self.axis is None:
+            raise ValueError("per-channel INT8 requires an explicit axis")
+        if self.granularity not in _SUPPORTED_GRANULARITIES and not channel_int8:
             raise NotImplementedError(
                 f"granularity={self.granularity!r} is not supported by shipped "
                 f"kernels. v1 supports only {sorted(_SUPPORTED_GRANULARITIES)}.")

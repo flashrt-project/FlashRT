@@ -640,14 +640,21 @@ class CKernelDiTHead:
     """
 
     def __init__(self, sd_or_path, embodiment_id, action_horizon, backbone_shape,
-                 use_fp8=True):
+                 use_fp8=True, num_steps=4):
         self.gemm = fvk.GemmRunner()
         self.ctx = fvk.FvkContext()
         self.use_fp8 = bool(use_fp8)
         self.D = 1536; self.H = 6144; self.NH = 32; self.HD = 48
-        self.L = 32; self.action_dim = 128; self.num_steps = 4
+        self.L = 32; self.action_dim = 128; self.num_steps = int(num_steps)
         self.T = action_horizon; self.Sa = 1 + action_horizon
         self.S_kv = backbone_shape[1]; self.D_kv = backbone_shape[2]
+        # Compact-KV counts: number of VALID backbone rows written into
+        # b_kv_text / b_kv_img by the frontend. HF excludes the other
+        # modality's tokens from each cross-attention layer via an
+        # attention mask; we instead attend only to the valid rows, so the
+        # per-layer kv length must come from these counts (not S_kv).
+        self.n_kv_text = self.S_kv
+        self.n_kv_img = self.S_kv
         # Optional AttentionBackend (ThorGrootAttnBackend); set post-construct
         # by the frontend. When None, _run_step uses the direct
         # fvk.attention_mha_fp16 calls below (bit-identical legacy path).
@@ -721,7 +728,9 @@ class CKernelDiTHead:
         proj_out_1_w = sd["action_head.model.proj_out_1.weight"].T.contiguous().to(fp16)
         proj_out_1_b = sd["action_head.model.proj_out_1.bias"].to(fp16)
         half_dim = 128
-        exp = -torch.arange(half_dim, dtype=torch.float32, device='cuda') * (math.log(10000.0) / half_dim)
+        # diffusers Timesteps(downscale_freq_shift=1): denominator is
+        # (half_dim - 1), NOT half_dim — HF's exact convention.
+        exp = -torch.arange(half_dim, dtype=torch.float32, device='cuda') * (math.log(10000.0) / (half_dim - 1))
         half_d = D // 2
         exp_d = (-torch.arange(half_d, dtype=torch.float, device='cuda') * (math.log(10000.0) / half_d)).exp()
         self.ada_scales = []; self.ada_shifts = []
@@ -755,6 +764,11 @@ class CKernelDiTHead:
         self.out_scales = torch.stack(self.out_scales); self.out_shifts = torch.stack(self.out_shifts)
         self.action_time_embeds = torch.stack(self.action_time_embeds)
 
+    def set_kv_counts(self, n_text, n_img):
+        """Report the number of valid compact rows in b_kv_text / b_kv_img."""
+        self.n_kv_text = int(n_text)
+        self.n_kv_img = int(n_img)
+
     def precompute_cross_kv(self, s=0):
         """Precompute K/V projections for all cross-attention blocks.
 
@@ -762,22 +776,28 @@ class CKernelDiTHead:
         through per-block K/V weight matrices. The backbone features are CONSTANT
         across diffusion steps, so these projections only need to run once.
 
+        Only the first n_kv_text / n_kv_img rows are valid (compact layout);
+        the other modality's tokens are excluded, matching HF's attention mask.
+
         Without this: 16 blocks × 2 projections × 4 steps = 128 GEMMs
         With this:    16 blocks × 2 projections × 1 time  = 32 GEMMs (save 96)
         """
-        D, S_kv = self.D, self.S_kv
+        D = self.D
         for block_idx in range(self.L // 2):
             l = block_idx * 2  # cross-attention layers: 0, 2, 4, ..., 30
             w = self.dit[l]
-            kv_src = self.b_kv_text if l % 4 == 0 else self.b_kv_img
+            if l % 4 == 0:
+                kv_src, n_kv = self.b_kv_text, self.n_kv_text
+            else:
+                kv_src, n_kv = self.b_kv_img, self.n_kv_img
             self._fp16_gemm(kv_src.data_ptr(), w['k_w'].data_ptr(),
-                            self._precomp_k[block_idx].data_ptr(), S_kv, D, self.D_kv, s)
+                            self._precomp_k[block_idx].data_ptr(), n_kv, D, self.D_kv, s)
             fvk.add_bias_fp16(self._precomp_k[block_idx].data_ptr(),
-                              w['k_b'].data_ptr(), S_kv, D, s)
+                              w['k_b'].data_ptr(), n_kv, D, s)
             self._fp16_gemm(kv_src.data_ptr(), w['v_w'].data_ptr(),
-                            self._precomp_v[block_idx].data_ptr(), S_kv, D, self.D_kv, s)
+                            self._precomp_v[block_idx].data_ptr(), n_kv, D, self.D_kv, s)
             fvk.add_bias_fp16(self._precomp_v[block_idx].data_ptr(),
-                              w['v_b'].data_ptr(), S_kv, D, s)
+                              w['v_b'].data_ptr(), n_kv, D, s)
 
     def _alloc_buffers(self):
         D, H, T, Sa = self.D, self.H, self.T, self.Sa
@@ -871,8 +891,11 @@ class CKernelDiTHead:
         fvk.gpu_cast_fp32_to_fp16(self.b_actions.data_ptr(), self.b_actions_fp16.data_ptr(), T*self.action_dim, s)
         self._fp16_gemm(self.b_actions_fp16.data_ptr(), self.ae_w1.data_ptr(), self.b_a_emb.data_ptr(), T, D, self.action_dim, s)
         fvk.add_bias_fp16(self.b_a_emb.data_ptr(), self.ae_b1.data_ptr(), T, D, s)
-        fvk.gpu_copy(self.b_concat.data_ptr(), self.b_a_emb.data_ptr(), T*D*2, s)
-        fvk.gpu_copy(self.b_concat.data_ptr()+T*D*2, self.action_time_embeds[step].data_ptr(), T*D*2, s)
+        # gpu_copy is a raw memcpy: it cannot place (T,D) rows into the first
+        # D columns of a (T,2D) buffer (row stride differs). Use concat2_bf16.
+        fvk.concat2_bf16(self.b_a_emb.data_ptr(),
+                         self.action_time_embeds[step].data_ptr(),
+                         self.b_concat.data_ptr(), T, D, D, s)
         self._fp16_gemm(self.b_concat.data_ptr(), self.ae_w2.data_ptr(), self.b_enc_h.data_ptr(), T, D, 2*D, s)
         fvk.add_bias_fp16(self.b_enc_h.data_ptr(), self.ae_b2.data_ptr(), T, D, s)
         fvk.silu_inplace_fp16(self.b_enc_h.data_ptr(), T*D, s)
@@ -909,8 +932,11 @@ class CKernelDiTHead:
             else:
                 self._fp16_gemm(self.b_h_norm.data_ptr(), w['q_w'].data_ptr(), self.b_q_cross.data_ptr(), Sa, D, D, s)
                 fvk.add_bias_fp16(self.b_q_cross.data_ptr(), w['q_b'].data_ptr(), Sa, D, s)
-                # Use precomputed K/V projections (computed once before step loop)
+                # Use precomputed K/V projections (computed once before step loop).
+                # kv length = compact valid-row count for this layer's modality
+                # (text layers see n_kv_text rows, image layers n_kv_img).
                 cross_idx = l // 2
+                kv_seq = self.n_kv_text if l % 4 == 0 else self.n_kv_img
                 k_ptr = self._precomp_k[cross_idx].data_ptr()
                 v_ptr = self._precomp_v[cross_idx].data_ptr()
                 fvk.gpu_fill_neginf_fp16(self.b_attn_logits_cross.data_ptr(), self.b_attn_logits_cross.nelement(), s)
@@ -918,10 +944,10 @@ class CKernelDiTHead:
                     # dit_cross site: cross_idx = l // 2 indexes the 16 cross layers
                     # (even DiT layers 0, 2, ..., 30).
                     self.attn.run("dit_cross", cross_idx,
-                                   q_seq=Sa, kv_seq=S_kv, stream=s)
+                                   q_seq=Sa, kv_seq=kv_seq, stream=s)
                 else:
                     fvk.attention_mha_fp16(self.ctx, self.b_q_cross.data_ptr(), k_ptr, v_ptr,
-                                           self.b_attn_logits_cross.data_ptr(), self.b_attn_out.data_ptr(), Sa, S_kv, NH, HD, 1.0/math.sqrt(HD), s)
+                                           self.b_attn_logits_cross.data_ptr(), self.b_attn_out.data_ptr(), Sa, kv_seq, NH, HD, 1.0/math.sqrt(HD), s)
             self._fp16_gemm(self.b_attn_out.data_ptr(), w['o_w'].data_ptr(), self.b_o.data_ptr(), Sa, D, D, s)
             fvk.add_bias_fp16(self.b_o.data_ptr(), w['o_b'].data_ptr(), Sa, D, s)
             fvk.residual_add_fp16(self.b_hidden.data_ptr(), self.b_o.data_ptr(), Sa*D, s)

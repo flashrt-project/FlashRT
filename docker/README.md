@@ -23,7 +23,7 @@ Flash-Attention 2, so its image deliberately does NOT produce
 
 > **Note on the prebuilt registry image.** Following the
 > `flash_vla → flash_rt` package-rename refactor that landed in
-> [#6](https://github.com/LiangSu8899/FlashRT/pull/6), the
+> [#6](https://github.com/flashrt-project/FlashRT/pull/6), the
 > `ghcr.io/liangsu8899/flashrt` image has not been re-pushed yet —
 > we plan to push the new image once the post-rename surface is
 > fully stable. Until then, build the image yourself with the

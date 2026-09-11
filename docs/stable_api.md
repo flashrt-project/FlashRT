@@ -35,7 +35,7 @@ def load_model(
     decode_cuda_graph: bool = False,
     decode_graph_steps: int = 80,
     max_decode_steps: int = 256,
-    hardware: str = "auto",         # "auto" | "thor" | "rtx_sm120" | "rtx_sm89" | "rtx_sm87"
+    hardware: str = "auto",         # "auto" | "thor" | "rtx_sm120" | "rtx_sm89" | "rtx_sm87" | "amd_cdna4"
     # GROOT-specific:
     embodiment_tag: str | None = None,
     action_horizon: int | None = None,
@@ -123,6 +123,13 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   roughly a 1 ms normal overhead versus a warmed exact graph, while larger caps
   pay for the extra padded tokens. It can also be set with
   `FLASHRT_PI05_STATE_PROMPT_FIXED_MAX_LEN`.
+- `hardware="amd_cdna4"` (auto-detected on ROCm builds for gfx950 /
+  MI350-series) routes `config="pi05"`, `framework="torch"` to the
+  self-contained AMD backend (`flash_rt/amd/`, HIP module
+  `flash_rt_amd_kernels`). Single-stream surface only: `set_prompt` /
+  `calibrate` / `infer` with both `state_prompt_mode` graphs; the RL and
+  CFG-batched extensions raise `NotImplementedError`. Build and usage:
+  `docs/deployment_amd.md`.
 - `use_fp8=False` disables FP8 where the selected frontend exposes a
   BF16 fallback; unsupported frontends ignore it. GROOT N1.7 on RTX/Thor
   is stricter: the default route is FP8, and `use_fp8=False` alone

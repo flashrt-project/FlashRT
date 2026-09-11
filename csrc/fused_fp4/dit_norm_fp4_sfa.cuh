@@ -29,5 +29,11 @@ int layer_norm_no_affine_fp4_sfa_bf16(
     const void* x, void* packed, void* sfa,
     int seq_len, int dim, float eps, cudaStream_t stream);
 
+// packed/sfa = quantize(RMSNorm(x[row]) * weight)  — no mean removal.
+// x: bf16 [S, D]; weight: bf16 [D]. Qwen3 pre-attn / pre-FF norms.
+int rms_norm_weight_fp4_sfa_bf16(
+    const void* x, const void* weight, void* packed, void* sfa,
+    int seq_len, int dim, float eps, cudaStream_t stream);
+
 }  // namespace fused_fp4
 }  // namespace flash_rt

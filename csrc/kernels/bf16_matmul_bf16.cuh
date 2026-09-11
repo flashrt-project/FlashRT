@@ -36,6 +36,18 @@ void bf16_matmul_bf16(
     int K,
     cudaStream_t stream);
 
+// ``max_algos`` bounds how many cuBLASLt candidates the first call for a shape
+// times before it commits to one. 0 (the default, and what every existing call
+// site passes) keeps the current behaviour: the count comes from
+// FLASHRT_BF16_CUBLASLT_AUTOTUNE_ALGOS, defaulting to 8.
+//
+// A caller passes 1 to take the heuristic's own first choice and skip the
+// timing loop. That matters beyond speed: timing is noisy, so different
+// processes pick different algorithms, different algorithms reduce in
+// different orders, and a model whose output is compared token for token then
+// disagrees with itself across runs. Plans are cached per (M, N, K, max_algos),
+// so one caller asking for a deterministic pick does not decide the algorithm
+// for another that did not.
 void bf16_matmul_cublaslt_bf16(
     const __nv_bfloat16* x,
     const __nv_bfloat16* W,
@@ -43,6 +55,7 @@ void bf16_matmul_cublaslt_bf16(
     int M,
     int N,
     int K,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    int max_algos = 0);
 
 }  // namespace flash_rt::kernels

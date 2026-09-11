@@ -14,6 +14,7 @@ like. Follow it literally. When unsure, stop and ask; do not guess.
 | Document | What you take from it |
 |---|---|
 | `docs/structures.md` | The norm: what a structure is, the three-layer split, calibration reuse, accuracy bands, runtime contract and ledger, how to add structures/backends/hosts/schemes, and §7 — norms that came from being wrong |
+| `docs/structure_contributing.md` | The external contribution boundary and copyable PR self-review checklist |
 | `docs/calibration.md` | The house calibration standard (statistics, two-level reduction, diagnostics). You must not invent a second one |
 | `catalog/*/structure.yaml` + `reference.py` | Worked precedents; copy the format of `decoder_ffn` |
 

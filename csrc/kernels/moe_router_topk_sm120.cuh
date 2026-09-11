@@ -18,5 +18,13 @@ namespace kernels {
 int moe_router_topk_sm120_bf16(const void* logits, void* out_idx, void* out_val,
                            int n_experts, int k, cudaStream_t stream);
 
+// Single-warp variant, for n_experts <= 256. Same selection rule and the same
+// descending order, and identical output -- argmax under a total order does not
+// depend on the reduction tree. Returns 3 for a width it cannot hold, so the
+// caller can fall back to the block kernel above.
+int moe_router_topk_warp_sm120_bf16(const void* logits, void* out_idx,
+                                    void* out_val, int n_experts, int k,
+                                    cudaStream_t stream);
+
 }  // namespace kernels
 }  // namespace flash_rt

@@ -219,15 +219,14 @@ def test_predict_recalibrates_when_prompt_bucket_changes():
     assert BucketFrontend.calibrations == 2
 
 
-def test_groot_thor_rejects_prompt_changes_after_graph_build():
+def test_groot_thor_resets_graphs_before_accepting_prompt_changes():
     source = Path("flash_rt/frontends/torch/groot_thor.py").read_text()
-    set_prompt_pos = source.index("    def set_prompt(self, prompt):")
-    guard_pos = source.index("getattr(self, '_graphs_built', False)",
-                             set_prompt_pos)
-    tokenizer_pos = source.index("from transformers import AutoTokenizer",
-                                 set_prompt_pos)
+    set_prompt_pos = source.index("    def set_prompt(self, prompt, input_ids=None):")
+    reset_pos = source.index("self.reset_graph_runtime()", set_prompt_pos)
+    assign_pos = source.index("self._input_ids = torch.tensor", set_prompt_pos)
 
-    assert guard_pos < tokenizer_pos
+    assert reset_pos < assign_pos
+    assert "set_prompt() after the pipeline is built is not supported" not in source
 
 
 def test_groot_thor_infer_refreshes_state_before_dit_graph_replay():

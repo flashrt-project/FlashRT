@@ -65,6 +65,7 @@ pipe = Pi05TorchFrontendRtx(
     vision_pool_factor=1,  # 1=no pool, 2=2×2, 4=4×4
     vision_num_layers=27,  # SigLIP layers (1-27)
     cache_frames=1,        # 1=bit-equal lossless, 2=K/V reuse (cos 0.991)
+    use_cuda_graph=True,   # False=normal kernel dispatch for inspecting kernels with nsys
 )
 pipe.set_prompt("pick up the black envelope on the table")
 pipe.calibrate_with_real_data([obs])  # once at startup, ~2 s
@@ -155,6 +156,26 @@ python examples/orin/bench_pi05.py \
 `bench_pi05.py` reports p50 / p95 / min latency and computed Hz. The cosine
 numbers above were measured separately against the BF16 reference path on the
 same fixed-seed sequence.
+
+### Inspect individual kernels with Nsight Systems
+
+The benchmark uses CUDA Graph capture/replay by default. To make individual
+kernel launches visible in an Nsight Systems timeline, add `--no-cuda-graph`:
+
+```bash
+nsys profile --trace=cuda,nvtx,osrt -o pi05_no_graph \
+  python examples/orin/bench_pi05.py \
+  --checkpoint /path/to/pi05_droid_pytorch \
+  --preset lossless \
+  --warmup 3 --reps 10 \
+  --no-int8 --no-cuda-graph
+```
+
+`--no-cuda-graph` disables only CUDA Graph capture/replay; calibration and
+kernel autotuning still run. It supports both `cache_frames=1` and
+`cache_frames=2`. This mode is intended for kernel inspection and debugging,
+not for measuring production latency. The benchmark prints
+`cuda_graph=False` when the option is active.
 
 ## Known limitations on SM87
 

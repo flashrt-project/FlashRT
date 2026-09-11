@@ -96,8 +96,10 @@ def test_attn_backend_shape_metadata():
 
 def _fvk_or_skip():
     try:
-        from flash_rt import flash_rt_kernels as fvk
-    except Exception as e:                          # pragma: no cover
+        fvk = importlib.import_module("flash_rt.flash_rt_kernels")
+    except ModuleNotFoundError as e:                # pragma: no cover
+        if e.name != "flash_rt.flash_rt_kernels":
+            raise
         pytest.skip(f"flash_rt_kernels not importable: {e}")
     return fvk
 
@@ -128,7 +130,9 @@ def test_qwen35moe_kernel_symbols_present():
 def test_fa2_causal_available():
     """Prefill full-attn depends on the vendored FA2 causal kernel."""
     try:
-        from flash_rt import flash_rt_fa2 as fa2
-    except Exception as e:                          # pragma: no cover
+        fa2 = importlib.import_module("flash_rt.flash_rt_fa2")
+    except ModuleNotFoundError as e:                # pragma: no cover
+        if e.name != "flash_rt.flash_rt_fa2":
+            raise
         pytest.skip(f"flash_rt_fa2 not importable: {e}")
     assert hasattr(fa2, "fwd_bf16_causal")

@@ -358,7 +358,7 @@ modalities::Status Sm110OperationDriver::gate_gelu_fp16(
     if (!merged || !output || rows <= 0 || hidden <= 0) {
         return invalid("SM110 FP16 gated GELU arguments are invalid");
     }
-    ::gate_silu_mul_merged_fp16(
+    ::gate_geglu_merged_fp16(
         static_cast<const __half*>(merged), static_cast<__half*>(output),
         rows, hidden, reinterpret_cast<cudaStream_t>(stream));
     return launch_status();
@@ -370,7 +370,7 @@ modalities::Status Sm110OperationDriver::gate_gelu_fp8(
     if (!merged || !output || !scale || rows <= 0 || hidden <= 0) {
         return invalid("SM110 FP8 gated GELU arguments are invalid");
     }
-    ::gate_silu_mul_merged_fp8_fp16(
+    ::gate_geglu_merged_fp8_fp16(
         static_cast<const __half*>(merged),
         static_cast<__nv_fp8_e4m3*>(output), rows, hidden, scale,
         reinterpret_cast<cudaStream_t>(stream));

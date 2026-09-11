@@ -1160,7 +1160,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
     #   Public API: input/output buffer handles for the batched path
     # ══════════════════════════════════════════════════════════════════
 
-    def forward(self) -> int:
+    def forward(self, stream: int | None = None) -> int:
         """Replay the captured B=2 graph and return the batched-noise ptr.
 
         Override of :meth:`Pi05Pipeline.forward` so the returned pointer
@@ -1172,8 +1172,9 @@ class Pi05BatchedPipeline(Pi05Pipeline):
             self._graph.replay(self._graph_stream)
             self._cudart.cudaStreamSynchronize(self._graph_stream)
         else:
-            self.run_pipeline(stream=0)
-            self._cudart.cudaDeviceSynchronize()
+            run_stream = 0 if stream is None else int(stream)
+            self.run_pipeline(stream=run_stream)
+            self._cudart.cudaStreamSynchronize(ctypes.c_void_p(run_stream))
         return self.bufs["diffusion_noise_b2"].ptr.value
 
     @property

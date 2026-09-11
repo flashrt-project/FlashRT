@@ -33,24 +33,55 @@ def detect_arch() -> str:
     """Return a short string identifier for the current CUDA device.
 
     Supported:
+        ``"npu"``       — Huawei Ascend via torch_npu (CANN 7/8, 910/A2+)
         ``"thor"``      — Jetson AGX Thor, SM110 (cc 11.0)
         ``"rtx_sm120"`` — RTX 5090 / DGX Spark GB10 Blackwell, SM120/SM121
         ``"rtx_sm89"``  — RTX 4090 / Ada, SM89 (cc 8.9)
         ``"rtx_sm87"``  — Jetson Orin via RTX consumer backend, SM87 (cc 8.7)
+        ``"amd_cdna4"`` — AMD Instinct MI350 series, ROCm (gfx950)
 
-    Raises RuntimeError if CUDA is unavailable or the card has an
-    unsupported SM level. Deliberately strict: silently falling back to
-    the wrong backend would hide latency/correctness regressions.
+    Raises RuntimeError if no supported accelerator is available or the
+    card has an unsupported SM level. Deliberately strict: silently
+    falling back to the wrong backend would hide latency/correctness
+    regressions.
+
+    **Order matters and is visible to callers.** The Ascend probe runs
+    before the CUDA one, because on a CANN box ``torch.cuda.is_available()``
+    is False while the part is perfectly usable, so a CUDA-first order would
+    reject a working machine. The consequence is that on a host carrying both
+    a usable Ascend device and a CUDA GPU, ``hardware="auto"`` selects the
+    NPU. Pass ``hardware="rtx_sm120"`` (or whichever applies) to pin the
+    other one; an explicit choice is never overridden.
     """
     try:
         import torch
     except ImportError as e:
         raise RuntimeError(
             "FlashRT requires PyTorch for GPU detection") from e
+    # Ascend NPU (torch_npu). Routed before CUDA because on a CANN box
+    # ``torch.cuda.is_available()`` is False while ``torch.npu`` exists.
+    # Importing torch_npu registers the ``torch.npu`` namespace; on a
+    # non-Ascend machine the import simply fails and we fall through.
+    try:
+        import torch_npu  # noqa: F401
+        npu_available = bool(torch.npu.is_available())
+    except Exception:
+        npu_available = False
+    if npu_available:
+        return "npu"
     if not torch.cuda.is_available():
         raise RuntimeError(
-            "FlashRT requires a CUDA-capable GPU "
+            "FlashRT requires a CUDA- or ROCm-capable GPU "
             "(torch.cuda.is_available()==False)")
+    if getattr(torch.version, "hip", None):
+        # ROCm build: route by the gfx architecture name, not the CUDA
+        # cc tuple (which ROCm fills with unrelated values).
+        gcn = torch.cuda.get_device_properties(0).gcnArchName
+        if gcn.split(":")[0] == "gfx950":
+            return "amd_cdna4"
+        raise RuntimeError(
+            f"FlashRT: unsupported ROCm GPU arch {gcn!r}. "
+            "Supported: gfx950 (MI350 series / CDNA4).")
     major, minor = torch.cuda.get_device_capability()
     if (major, minor) == (11, 0):
         return "thor"
@@ -79,6 +110,10 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
         ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
     ("pi05", "torch", "rtx_sm87"):
         ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
+    ("pi05", "torch", "amd_cdna4"):
+        ("flash_rt.amd.frontends.torch.pi05", "Pi05TorchFrontendAmd"),
+    ("pi05", "torch", "npu"):
+        ("flash_rt.npu.frontends.torch.pi05", "Pi05TorchFrontendNpu"),
     ("pi05", "torch", "rtx_sm89"):
         ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
     ("pi05", "jax", "thor"):
@@ -124,6 +159,9 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("groot_n17", "torch", "rtx_sm89"):
         ("flash_rt.frontends.torch.groot_n17_rtx_sm89",
          "GrootN17TorchFrontendRtxSm89"),
+    ("groot_n17", "torch", "amd_cdna4"):
+        ("flash_rt.amd.frontends.torch.groot_n17",
+         "GrootN17TorchFrontendAmd"),
 
     # ── Motus (Wan2.2 + Qwen-VL + action/understanding experts) ──
     # RTX 5090 path only for now. Motus uses a bundle-based E2E contract
@@ -134,6 +172,10 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     # ── Wan2.2 TI2V-5B official pipeline baseline ──
     ("wan22_ti2v_5b", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.wan22_rtx", "Wan22TorchFrontendRtx"),
+
+    # ── LTX-2.5 22B distilled audio+video (RTX SM120 only) ──
+    ("ltx25", "torch", "rtx_sm120"):
+        ("flash_rt.frontends.torch.ltx25_rtx", "Ltx25TorchFrontendRtx"),
 
     # ── Cosmos3-Nano text2video FP8 denoise (RTX SM120 only) ──
     ("cosmos3_video", "torch", "rtx_sm120"):
@@ -189,17 +231,26 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
 
     # ── Nex-N2-mini / Qwen3.6-35B-A3B (qwen3_5_moe) ──
     # Text LLM, not a VLA: GDN linear-attn + full-attn-every-4th + 256-expert
-    # NVFP4 MoE. RTX 5090 (SM120) only, and requires the gated kernel build
-    # (-DFLASHRT_ENABLE_QWEN35MOE=ON). Registered here for discoverability /
-    # resolve_pipeline_class, but the frontend exposes an LLM surface
-    # (infer()->logits, generate_greedy) rather than the VLA predict(images)
-    # API, so these are used via direct frontend construction rather than
-    # load_model's VLAModel wrapper.
+    # NVFP4 MoE. Registered here for discoverability / resolve_pipeline_class,
+    # but the frontend exposes an LLM surface (infer()->logits,
+    # generate_greedy) rather than the VLA predict(images) API, so these are
+    # used via direct frontend construction rather than load_model's VLAModel
+    # wrapper.
+    #
+    # Nex-N2 is RTX 5090 (SM120) and needs the full gated kernel build
+    # (-DFLASHRT_ENABLE_QWEN35MOE=ON).
     ("nexn2", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.nexn2_rtx", "Nexn2TorchFrontendRtx"),
+    # Qwen3.6 runs the same frontend on RTX SM120 and on Jetson AGX Thor
+    # (SM110). The two differ only in which kernel tiers the build has:
+    # SM120 takes the whole switch, Thor takes the two tiers its toolchain can
+    # compile. See docs/qwen36_moe_usage.md for the exact command per target.
     ("qwen36_moe", "torch", "rtx_sm120"):
-        ("flash_rt.frontends.torch.qwen36_moe_rtx",
-         "Qwen36MoeTextFrontendRtx"),
+        ("flash_rt.frontends.torch.qwen36_moe",
+         "Qwen36MoeTextFrontend"),
+    ("qwen36_moe", "torch", "thor"):
+        ("flash_rt.frontends.torch.qwen36_moe",
+         "Qwen36MoeTextFrontend"),
 
     # ── Pi0-FAST ── (SM120 runtime fork inside pipeline, no AttentionBackend protocol.)
     ("pi0fast", "torch", "thor"):

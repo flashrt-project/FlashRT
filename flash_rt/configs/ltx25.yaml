@@ -1,0 +1,41 @@
+# FlashRT — LTX-2.5 model configuration (metadata only).
+# The frontend (flash_rt/frontends/torch/ltx25_rtx.py) holds the source of
+# truth for shapes; this file is metadata for logging / registries.
+name: ltx25
+
+# Architecture summary — 22B distilled joint audio+video DiT
+total_params_billion: 22
+num_layers: 48
+
+video:
+  hidden_dim: 4096
+  num_heads: 32
+  head_dim: 128
+  ffn_intermediate: 16384      # GELU
+  cross_attention_dim: 4096    # text context
+  vae_scale: [8, 32, 32]       # time, height, width
+  latent_channels: 128
+
+audio:
+  hidden_dim: 2048
+  num_heads: 32
+  head_dim: 64
+  ffn_intermediate: 8192
+  cross_attention_dim: 2048
+
+text_encoder:
+  backbone: Gemma4-12B + projection
+  max_tokens: 1024
+
+# Distilled two-stage schedule
+pipeline:
+  stage_1_steps: 8             # ancestral Euler at half resolution
+  stage_2_steps: 3             # deterministic refine at full resolution
+  default_width: 1536
+  default_height: 1024
+  default_frames: 121
+  default_fps: 24.0
+
+quantization:
+  transformer: nvfp4           # prequantized block-16, static input scales
+  attention: sage2-qk8-pvfp8   # video sites d128; audio sites stay SDPA

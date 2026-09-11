@@ -315,17 +315,69 @@ def attach_engine(model, *, seats=DENSE_SEAT_SUFFIXES, experts=True,
     return handle
 
 
-def install_load_hook(*, on_attached=None, **attach_kwargs):
+#: every handle :func:`install_load_hook` has seated, in order. A caller
+#: that wants certainty rather than a log line asserts on this after the
+#: engine is up: empty means the hook never fired.
+_ATTACHED: list = []
+
+
+def attached() -> list:
+    """The handles seated so far. Empty after an engine came up means the
+    patch never reached the process that loaded the model — see
+    :func:`install_load_hook` on the start method."""
+    return list(_ATTACHED)
+
+
+def _patch_would_not_survive() -> str | None:
+    """Why a patch made here would not exist in the worker process.
+
+    The engine starts its worker with ``fork`` by default, which
+    inherits this patch, and that is why the four-line integration
+    works at all. But it switches to ``spawn`` under conditions the
+    caller can walk into without noticing — a spawned worker re-imports
+    the engine from scratch and the patch is simply not there.
+
+    The failure is silent: patching succeeds here, the hook never fires,
+    and the run comes out at baseline speed with no error anywhere. That
+    is the one outcome this layer refuses to produce, so it is checked
+    before the caller builds an engine rather than discovered afterwards
+    from a missing log line.
+    """
+    if os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING", "1") == "0":
+        return None                     # the engine runs in this process
+    if os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") == "spawn":
+        return "VLLM_WORKER_MULTIPROC_METHOD is set to 'spawn'"
+    if torch.cuda.is_initialized():
+        return ("CUDA is already initialized in this process, and the "
+                "engine forces 'spawn' when it is")
+    return None
+
+
+def install_load_hook(*, on_attached=None, allow_spawn=False,
+                      **attach_kwargs):
     """Patch every importable vLLM model-runner so :func:`attach_engine`
     runs after weights load and before the engine's first trace. Set
     ``VLLM_DISABLE_COMPILE_CACHE=1``: the engine's compile cache key
     does not see the module tree, and a stale artifact resolves
-    parameters that the seats replaced."""
+    parameters that the seats replaced.
+
+    Call this before touching CUDA. The engine forks its worker by
+    default, which is what carries this patch into the process that
+    loads the model, but it switches to spawning one the moment CUDA is
+    already initialized here — and a spawned worker re-imports the
+    engine without the patch. Nothing raises in that case: the seats
+    simply never go in and the run comes out at baseline. So the
+    condition is refused here instead, with the two ways out. Pass
+    ``allow_spawn=True`` to proceed anyway.
+    """
     import importlib
     import os
 
-    os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
-    patched = []
+    # Find the runners before changing anything: "there is no host here"
+    # is the more fundamental refusal, and a caller without vLLM should
+    # hear that rather than a lecture about start methods. Nothing is
+    # mutated until both questions have been answered.
+    found = []
     for modname in ("vllm.v1.worker.gpu.model_runner",
                     "vllm.v1.worker.gpu_model_runner",
                     "vllm.v2.worker.gpu_model_runner"):
@@ -336,17 +388,37 @@ def install_load_hook(*, on_attached=None, **attach_kwargs):
         runner = getattr(module, "GPUModelRunner", None)
         if runner is None or not hasattr(runner, "load_model"):
             continue
+        found.append((modname, runner))
+    if not found:
+        raise RuntimeError(
+            "refused: no vLLM model runner found to hook; the engine "
+            "layout is outside this adapter's profile")
+
+    lost = None if allow_spawn else _patch_would_not_survive()
+    if lost is not None:
+        raise RuntimeError(
+            "refused: this patch would not reach the process that loads "
+            "the model — " + lost + ".\n"
+            "The engine would start its worker with 'spawn', which "
+            "re-imports it from scratch, so the seats would never be "
+            "installed and the run would come out at baseline speed "
+            "with nothing raised anywhere.\n"
+            "Either call install_load_hook() before anything touches "
+            "CUDA, or run the engine in this process with "
+            "VLLM_ENABLE_V1_MULTIPROCESSING=0. Pass allow_spawn=True to "
+            "proceed regardless.")
+
+    os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
+    patched = []
+    for modname, runner in found:
         orig = runner.load_model
 
         def load_model(self, *a, __orig=orig, **kw):
             __orig(self, *a, **kw)
             handle = attach_engine(self.model, **attach_kwargs)
+            _ATTACHED.append(handle)
             if on_attached is not None:
                 on_attached(handle)
         runner.load_model = load_model
         patched.append(modname)
-    if not patched:
-        raise RuntimeError(
-            "refused: no vLLM model runner found to hook; the engine "
-            "layout is outside this adapter's profile")
     return patched

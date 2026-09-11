@@ -516,12 +516,32 @@ def discover(
                         and isinstance(fc2, nn.Linear)):
                     continue
                 if (fc1.out_features != fc2.in_features
-                        or fc1.in_features != fc2.out_features
-                        or fc1.bias is None or fc2.bias is None):
+                        or fc1.in_features != fc2.out_features):
+                    continue  # not an FFN pair: silence is right here
+                # Past this point the seam has been recognised, and every
+                # exit is a refusal against a declared boundary. Those
+                # must reach the trail: a silent skip reads as "nothing
+                # here" when the truth is "this shape, refused for this
+                # reason", and the difference is a debugging session.
+                if fc1.bias is None or fc2.bias is None:
+                    if refused is not None:
+                        refused.append((
+                            path,
+                            "vision_ffn refused: b_fc1/b_fc2 are required "
+                            "slots and this host's projections carry no "
+                            "bias",
+                        ))
                     continue
                 norm_attr = _norm_attr_of(model, parent_path)
                 if norm_attr is None:
-                    continue  # vision_ffn boundary includes a LayerNorm
+                    if refused is not None:
+                        refused.append((
+                            path,
+                            "vision_ffn refused: the boundary includes a "
+                            "norm and no norm attribute was found beside "
+                            "this feed-forward",
+                        ))
+                    continue
                 norm = _resolve(
                     model,
                     (parent_path + "." + norm_attr).lstrip("."),
