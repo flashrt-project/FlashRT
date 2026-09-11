@@ -19,7 +19,7 @@ Before opening a PR:
    - Kernel catalog: [`docs/kernel_catalog.md`](docs/kernel_catalog.md)
    - Calibration contract: [`docs/calibration.md`](docs/calibration.md)
    - Structures contributions and self-review:
-     [`docs/structure_contributing.md`](docs/structure_contributing.md)
+     the [FlashRT-Structures contribution guide](https://github.com/flashrt-project/FlashRT-Structures/blob/main/docs/structure_contributing.md)
 2. Build the extension modules locally.
 3. Run the smallest test set that covers your change.
 4. Include the exact GPU, CUDA, command lines, and latency/precision numbers
@@ -364,8 +364,11 @@ Open the pull request from:
 
 Before requesting review:
 
-- For changes under `flash_rt/structures/`, complete the dedicated
-  [`structures contribution and PR self-review`](docs/structure_contributing.md)
+- Changes to the host-attach layer belong in
+  [FlashRT-Structures](https://github.com/flashrt-project/FlashRT-Structures);
+  changes under `flash_rt/catalog/` (structure specs, references, host
+  bindings) follow that repository's
+  [contribution and PR self-review](https://github.com/flashrt-project/FlashRT-Structures/blob/main/docs/structure_contributing.md)
   checklist.
 - Read the full public review standard in
   [`docs/pr_review_checklist.md`](docs/pr_review_checklist.md) for the

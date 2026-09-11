@@ -168,10 +168,10 @@ end.
 - **PyTorch and JAX frontends** share one kernel binary, equivalent results (cosine ≥ 0.999)
 - **Plugin model registration** — add a new VLA via one frontend file + a declarative `WEIGHT_SPEC`, no fork required
 - **LIBERO benchmark integration** out of the box; ~6 minutes from `git clone` to first inference
-- **FlashRT Structures** — attach the kernel catalog onto an **unmodified** PyTorch host, no fork and no edit to its source; works on `lerobot`, Isaac-GR00T, `openpi`, `transformers`, `diffusers`, and inside vLLM / SGLang
+- **FlashRT Structures** — attach the kernel catalog onto an **unmodified** PyTorch host, no fork and no edit to its source; works on `lerobot`, Isaac-GR00T, `openpi`, `transformers`, `diffusers`, and inside vLLM / SGLang. Its own package and repository: [FlashRT-Structures](https://github.com/flashrt-project/FlashRT-Structures)
 
 ```python
-from flash_rt import structures
+import flashrt_structures as structures    # pip install flashrt-structures
 
 plan = structures.attach(model, forward)   # discover → calibrate → gate → activate
 print(structures.explain(plan))            # bound / routed / kept-at-host / refused, with reasons
@@ -180,14 +180,14 @@ loop = structures.decode_loop(model, max_len=4096)      # serving door
 out  = loop.generate(input_ids, max_new_tokens=256)
 ```
 
-Structures: [reference](docs/structures.md) · [explicit pipeline examples](examples/structure_pipeline/README.md) · [walkthrough with films](https://huggingface.co/spaces/liangsu9988/fast-kernels-are-not-fast-pipelines)
+Structures: [repository](https://github.com/flashrt-project/FlashRT-Structures) · [explicit pipeline examples](https://github.com/flashrt-project/FlashRT-Structures/tree/main/examples) · [walkthrough with films](https://huggingface.co/spaces/liangsu9988/fast-kernels-are-not-fast-pipelines)
 
 See [Supported Models](#supported-models), [Hardware Support](#hardware-support), and [Benchmark](#benchmark) for the current map.
 
 ## News
 
 - **Aug 2026** — **AMD Instinct MI350X (CDNA4)** joins the VLA line: **Pi0.5 at 16.4 ms** (2.47× over `torch.compile` max-autotune, 7.1× over eager) and **GROOT N1.7 at 16.0 ms** full-frame (4.24× over eager). A standalone ROCm/HIP backend — hand-written HIP kernels, hipBLASLt FP8 GEMM, MFMA attention, HIP graph capture — arch-gated to gfx950 at both build and run time, carrying no CUDA assumptions. See [AMD deployment](docs/deployment_amd.md) and [Pi0.5 on MI350X](docs/deployment_amd_pi05.md).
-- **Aug 2026** — **FlashRT Structures** ships: the kernel catalog attaches to an *unmodified* PyTorch host — `lerobot`, Isaac-GR00T, `openpi`, `transformers`, `diffusers`, and inside vLLM / SGLang — with no fork and no edit to the host. Measured on VLA, VLM, LLM and video models across RTX 5090 and Jetson AGX Thor. See [Structures](docs/structures.md), [explicit pipeline examples](examples/structure_pipeline/README.md), and the [walkthrough with films](https://huggingface.co/spaces/liangsu9988/fast-kernels-are-not-fast-pipelines).
+- **Aug 2026** — **FlashRT Structures** ships: the kernel catalog attaches to an *unmodified* PyTorch host — `lerobot`, Isaac-GR00T, `openpi`, `transformers`, `diffusers`, and inside vLLM / SGLang — with no fork and no edit to the host. Measured on VLA, VLM, LLM and video models across RTX 5090 and Jetson AGX Thor. Now its own package: [FlashRT-Structures](https://github.com/flashrt-project/FlashRT-Structures). See also the [walkthrough with films](https://huggingface.co/spaces/liangsu9988/fast-kernels-are-not-fast-pipelines).
 - **Jul 2026** — **Cosmos3-Edge on Jetson AGX Thor** reaches **6.60x** no-cache AV denoise speedup; its NVFP4 Reasoner decodes text/image/video at **104.3 / 112.6 / 108.7 tok/s**. The earlier **Cosmos3-Nano RTX 5090** path reaches **4.8 s E2E** with FP8 for a 480p, 49-frame, 10-step workload. See [Cosmos3-Edge](docs/cosmos3_edge_thor.md) and [Cosmos3-Nano](docs/cosmos3_video_usage.md).
 - **Jul 2026** — **Native C++ PI0.5** now owns checkpoint loading, preprocessing, graph capture, FP8 calibration, and action postprocessing behind `frt_model_runtime_v1`. [FlashRT Nexus](https://github.com/LiangSu8899/FlashRT-Nexus) adopts that ABI for embedded robot loops, HTTP serving, and execution-state capsules.
 - **Jun 2026** — **Qwen3-VL-8B on RTX 5090** adds an NVFP4 language stack, FP8 ViT, whole-prefill CUDA Graph, image/multi-image/video inputs, **~100 ms** full-resolution TTFT, and **~150 tok/s** decode. At 0.5 MP, TTFT is **~32 ms**. See [Qwen3-VL RTX 5090](docs/qwen3_vl_nvfp4.md).
@@ -889,48 +889,27 @@ Reproduce with
 
 ---
 
-## Install from PyPI (structures layer, no local build)
+## Install from PyPI (pure Python, no local build)
 
 ```bash
 pip install flash-rt
 ```
 
 The published distribution is **pure Python**: it carries the frontends,
-the structure catalog, the engine adapters and the kernel sources, and no
-`.so` at all. That is enough to read the catalog, inspect a binding, and
-attach the structures layer to a serving host — kernels arrive from the
-kernel hub at bind time. It is *not* enough for the native
-`flash_rt.load_model` path, which needs compiled extensions; asking for
-them without a build produces a refusal that names the cmake line rather
-than a missing-module traceback. Build them with the section below.
+the structure catalog (`flash_rt.catalog`) and the kernel sources, and no
+`.so` at all. That is enough to read the catalog and inspect a binding.
+It is *not* enough for the native `flash_rt.load_model` path, which needs
+compiled extensions; asking for them without a build produces a refusal
+that names the cmake line rather than a missing-module traceback. Build
+them with the section below.
 
-Start at **[`docs/hosts.md`](docs/hosts.md)**: which door your host takes,
-how to tell a seated run from a refused one from a door that never fired,
-how to read a refusal, and what has actually been measured where.
-
-To attach inside a serving engine — vLLM or SGLang, without forking
-either — see **[`docs/serving_engines.md`](docs/serving_engines.md)**: the
-four-line integration, why it hooks the loader rather than the model, the
-start-method trap that makes the hook silently do nothing, the batch band
-and its knob, air-gapped kernel staging, and what each refusal means.
-
-Three boundaries are worth knowing before you start, because each one
-produces a refusal that looks like a bug and is not:
-
-- **Kernel availability follows the hub's build matrix, not this
-  package's.** The wheel installs on any torch; the kernels do not exist
-  for every torch. Coverage today is thickest at `torch 2.11 / cu128` on
-  x86-64 — the current PyPI default is torch 2.13, where the published
-  face is much thinner. If binds refuse on a fresh install, check the
-  torch version first.
-- **`HF_HUB_OFFLINE=1` makes every kernel unavailable, even with a fully
-  warm cache**, because a version specifier has to resolve refs online.
-  Air-gapped deployments should stage packages and point at them with
-  `LOCAL_KERNELS=<repo>=<path>` rather than switching the hub offline.
-- **aarch64 (Jetson Thor, sm_110) is not covered by the current
-  qualification pass.** Nothing in the wheel is architecture-bound, but
-  the engine adapters were last verified against vLLM 0.26 on Thor in
-  August 2026, not in the release run.
+Attaching structures to an unmodified PyTorch host, or inside vLLM /
+SGLang, is the job of the separate
+[FlashRT-Structures](https://github.com/flashrt-project/FlashRT-Structures) package
+(`pip install flashrt-structures`). It depends on this distribution for
+the catalog and the calibration contract, and obtains its kernels from
+the kernel hub at bind time. Its README covers which door a host takes,
+how to read a refusal, and the hub build-matrix boundaries.
 
 ## Build & install
 
