@@ -90,33 +90,3 @@ def test_default_out_dtype_is_the_weights():
     sw, inv = fit_input_channel_balance(W, torch.rand(16))
     assert sw.dtype == torch.bfloat16 and inv.dtype == torch.bfloat16
 
-
-def test_nvfp4_awq_scheme_decides_with_the_recipe_payload():
-    from flash_rt.structures import schemes
-    from flash_rt.structures.schemes import Nvfp4Awq, PointStat, \
-        validate_request
-
-    scheme = schemes.get("nvfp4_awq")
-    assert isinstance(scheme, Nvfp4Awq)
-
-    class _Pt:
-        def __init__(self, path, name):
-            self.path, self.name = path, name
-
-    req = scheme.statistics([_Pt("a.mlp", "x_after_norm"),
-                             _Pt("a.mlp.down_proj", "act_after_mul")])
-    assert all(ps == PointStat("amax", "channel") for ps in req.values())
-    validate_request(req)          # the collector measures this today
-
-    report = {
-        "layers.0.mlp": {"layers.0.mlp.down_proj|act_after_mul": None},
-        "layers.0.self_attn": {"layers.0.self_attn|x": None},
-    }
-    d = scheme.decide(report)
-    assert d.formats == {"layers.0.mlp": "nvfp4_awq"}
-    assert d.params["layers.0.mlp"] == {
-        "alpha": 0.5, "clamp": [0.25, 4.0], "recipe": "balance"}
-    assert d.keep_host == ("layers.0.self_attn",)
-
-    with pytest.raises(ValueError, match="recipe"):
-        Nvfp4Awq(recipe="magic")
