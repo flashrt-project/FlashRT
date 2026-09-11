@@ -3,7 +3,7 @@ structure: vla_tick_pipeline
 
 # Host: ggml/llama.cpp server (PKU-SEC-Lab/Jetson-PI-Edge fork) running pi0.5
 # on Jetson AGX Thor (SM110) with the native ggml adapter
-# (hosts/ggml/). Structure regions execute as fused
+# (the FlashRT-llama.cpp overlay). Structure regions execute as fused
 # subgraph windows matched inside ggml-cuda's graph evaluation; the mapping
 # below is window <-> catalog structure.
 
