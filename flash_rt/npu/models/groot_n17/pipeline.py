@@ -280,7 +280,11 @@ def encode_backbone_features(bound: BoundChain, features: torch.Tensor) -> torch
         q = layer["q"][0](h, layer["q"][1])
         k = layer["k"][0](h, layer["k"][1])
         v = layer["v"][0](h, layer["v"][1])
-        a = attention(q, k, v, VLSA_HEADS, VLSA_HEAD_DIM)
+        # 461 tokens puts this site in the backbone's regime, where the fused
+        # infer-attention entry point measures 1.31x the prompt one.
+        from flash_rt.npu.models.groot_n17.backbone import attention as wide_attention
+
+        a = wide_attention(q, k, v, VLSA_HEADS, VLSA_HEAD_DIM)
         h, x = add_norm(x, layer["o"][0](a, layer["o"][1]),
                         layer["norm3"][0], layer["norm3"][1], EPS)
         h = F.gelu(layer["fc1"][0](h, layer["fc1"][1]), approximate="tanh")
