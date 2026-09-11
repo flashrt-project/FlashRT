@@ -1,0 +1,15 @@
+binding: omnivoice_audio_codec
+structure: audio_codec
+dims: {C: 8, T: dynamic}
+variant: {backend: fp16_codec}
+boundary_dtype: int64
+
+m_profile:
+  decode: {m_class: medium, phase: decode}
+
+hosts:
+  omnivoice:
+    module_path: "audio_tokenizer"
+    versions: ">=0.2"
+  higgs_audio_v3:
+    module_path: "audio_tokenizer"
