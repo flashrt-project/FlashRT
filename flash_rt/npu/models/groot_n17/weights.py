@@ -1,0 +1,94 @@
+"""Checkpoint loading for the Ascend GR00T N1.7 action chain.
+
+The checkpoint's tensors are already described once, declaratively, in
+``flash_rt.frontends.torch._groot_n17_thor_spec``. That description is of the
+file on disk rather than of a backend, so this module *derives* the Ascend
+variant from it instead of restating it: the FP16 casts become BF16 -- the
+dtype this part serves and the dtype the reference policy itself serves -- the
+FP8 quantization steps drop out, and the blocks the action chain never reads
+are filtered away.
+
+Deriving keeps one description of the checkpoint layout. A spec that drifts
+from the file fails at load with the missing key named, which is the failure
+this arrangement is meant to produce.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import pathlib
+
+from flash_rt.executors.weight_loader import Item, LayerBlock, ModelWeightSpec, WeightLoader
+from flash_rt.executors.torch_weights import (MultiSafetensorsSource, Quant,
+                                              SafetensorsSource, ToBf16, ToFp16)
+
+# Blocks and singleton prefixes the action chain reads. The ViT and LLM blocks
+# belong to the backbone and are deliberately not loaded here: loading them
+# would cost 3 GB of device memory that this stage never touches.
+_CHAIN_BLOCKS = ("vl_self_attn", "dit")
+_CHAIN_SINGLETONS = ("vlln_", "ah_pos_embed", "ts_", "proj_out_",
+                     "st_enc_", "ac_enc_", "ac_dec_")
+
+
+def _to_bf16(transforms):
+    """Rewrite one item's transform chain for a BF16 Ascend load."""
+    rewritten = []
+    for transform in transforms:
+        if isinstance(transform, Quant):
+            continue                      # no FP8 tensor hardware on this part
+        rewritten.append(ToBf16() if isinstance(transform, ToFp16) else transform)
+    return rewritten
+
+
+def _rewrite(item: Item) -> Item:
+    return dataclasses.replace(item, transforms=_to_bf16(item.transforms),
+                               scale_into=None)
+
+
+def action_chain_spec() -> ModelWeightSpec:
+    """The BF16 spec for the VL adapter, the DiT and the action encoders."""
+    from flash_rt.frontends.torch._groot_n17_thor_spec import build_spec
+
+    shared = build_spec()
+    blocks = [
+        LayerBlock(prefix_fmt=block.prefix_fmt, num_layers=block.num_layers,
+                   items=[_rewrite(item) for item in block.items], name=block.name)
+        for block in shared.blocks if block.name in _CHAIN_BLOCKS
+    ]
+    if len(blocks) != len(_CHAIN_BLOCKS):
+        raise ImportError(
+            "the shared GR00T N1.7 checkpoint spec no longer carries the "
+            f"{_CHAIN_BLOCKS} blocks this backend derives from")
+    singletons = [_rewrite(item) for item in shared.singletons
+                  if item.name.startswith(_CHAIN_SINGLETONS)]
+    return ModelWeightSpec(framework="torch", blocks=blocks, singletons=singletons)
+
+
+class ChainWeights:
+    """Plain attribute holder the spec's sinks write into."""
+
+
+def shard_paths(checkpoint_dir) -> list[pathlib.Path]:
+    directory = pathlib.Path(checkpoint_dir)
+    shards = sorted(directory.glob("*.safetensors"))
+    if not shards:
+        raise FileNotFoundError(
+            f"no safetensors shard in {directory.name}; this backend loads the "
+            "published GR00T N1.7 checkpoint directory")
+    return shards
+
+
+def load_action_chain(checkpoint_dir) -> ChainWeights:
+    """Read the action-chain weights onto the host in BF16.
+
+    The tensors land on the host because the device copy is the caller's
+    business: every projection is bound into a fractal-NZ operand or sliced to
+    one embodiment first, and both of those are setup-time transforms that
+    would otherwise be paid twice.
+    """
+    shards = shard_paths(checkpoint_dir)
+    source = (SafetensorsSource(str(shards[0]), device="cpu") if len(shards) == 1
+              else MultiSafetensorsSource([str(p) for p in shards], device="cpu"))
+    weights = ChainWeights()
+    WeightLoader(source=source, target=weights, spec=action_chain_spec()).run()
+    return weights
