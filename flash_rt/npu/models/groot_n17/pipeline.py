@@ -27,11 +27,19 @@ of them removes launches from the replayed graph:
   bias=shift)``, so each of the 128 modulated norms is one kernel instead of
   three.
 
-* **Cross-attention K/V is computed once per frame.** It is a function of the
-  backbone features alone, and the reference recomputes all 32 of those
-  projections on every one of the four steps.
+* **Cross-attention K/V is computed once per frame, over one token class.**
+  It is a function of the backbone features alone, and the reference
+  recomputes all 32 of those projections on every one of the four steps. The
+  reference also hands every cross layer all of the backbone tokens together
+  with a mask that hides the ones it does not want; the token classes are a
+  property of the prompt, so this path gathers them once and each layer
+  projects and attends over only its own class. On the shipped observation
+  geometry that is 13 keys for a text layer rather than 461 with 448 of them
+  masked out.
 
-The vendor constraint that shapes the rest: ``F.scaled_dot_product_attention``
+Gathering the classes also means no attention mask is built or passed: every
+key a layer is given is a key it attends. The vendor constraint that shapes
+the rest: ``F.scaled_dot_product_attention``
 routes to ``npu_fusion_attention`` and **a capture containing one cannot be
 ended** -- CANN reports a stream that was never joined. The PFA family captures
 at every geometry this model uses, and it also accepts the ``[B, N, Sq, Skv]``
@@ -88,14 +96,16 @@ def _bias(tensor, device):
     return tensor.to(torch.bfloat16).to(device).contiguous()
 
 
-def attention(query, key, value, heads, head_dim, mask=None):
-    """One capturable attention call in the layout the projections produce."""
+def attention(query, key, value, heads, head_dim):
+    """One capturable attention call in the layout the projections produce.
+
+    No mask: every site on this path is given exactly the keys it attends.
+    """
     import torch_npu
     return torch_npu.npu_prompt_flash_attention(
-        query, key, value, atten_mask=mask, num_heads=heads,
-        num_key_value_heads=heads, scale_value=head_dim ** -0.5,
-        input_layout="BSH", pre_tokens=_INT_MAX, next_tokens=_INT_MAX,
-        sparse_mode=0)
+        query, key, value, num_heads=heads, num_key_value_heads=heads,
+        scale_value=head_dim ** -0.5, input_layout="BSH",
+        pre_tokens=_INT_MAX, next_tokens=_INT_MAX, sparse_mode=0)
 
 
 def _timestep_projection(steps: int, channels: int = 256,
@@ -189,6 +199,12 @@ class BoundChain:
                 ff2=(_nz(weights._dit_ff_down_w[i], dev), _bias(weights._dit_ff_down_b[i], dev)),
             ))
 
+        # An affine-free LayerNorm synthesises unit weight and zero bias on
+        # every call -- two extra launches and 2.5 us a call, measured. These
+        # hold them instead.
+        self.unit = torch.ones(DIT_DIM, dtype=torch.bfloat16, device=dev)
+        self.zero = torch.zeros(DIT_DIM, dtype=torch.bfloat16, device=dev)
+
         self._build_modulators(weights)
 
     # ------------------------------------------------------------------
@@ -256,20 +272,23 @@ def encode_state(bound: BoundChain, state: torch.Tensor) -> torch.Tensor:
     return w2(F.relu(w1(flat, b1)), b2)
 
 
-def cross_key_values(bound: BoundChain, vl: torch.Tensor):
-    """K/V for every cross-attention layer, once per frame.
+def cross_key_values(bound: BoundChain, text: torch.Tensor, image: torch.Tensor):
+    """K/V for every cross-attention layer, once per frame and per class.
 
-    These depend on the backbone features alone. The reference recomputes all
-    32 projections inside each of the four denoise steps; here the four steps
-    read one table.
+    These depend on the backbone features alone; the reference recomputes all
+    32 projections inside each of the four denoise steps. Each layer is also
+    given only the token class it attends, so a text layer's projection runs
+    over the prompt's handful of language tokens rather than over the whole
+    sequence with the image tokens masked away.
     """
     cache = []
     for layer in bound.layers:
         if not layer["cross"]:
             cache.append(None)
             continue
-        cache.append((layer["k"][0](vl, layer["k"][1]),
-                      layer["v"][0](vl, layer["v"][1])))
+        source = text if layer["text"] else image
+        cache.append((layer["k"][0](source, layer["k"][1]),
+                      layer["v"][0](source, layer["v"][1])))
     return cache
 
 
@@ -283,59 +302,63 @@ def encode_actions(bound: BoundChain, actions: torch.Tensor, step: int) -> torch
 
 
 def dit_layer(bound: BoundChain, index: int, step: int, x: torch.Tensor,
-              cross_kv, masks) -> torch.Tensor:
+              cross_kv) -> torch.Tensor:
     layer = bound.layers[index]
     gamma, beta = bound.ada[index]
     h = F.layer_norm(x, (DIT_DIM,), gamma[step], beta[step], EPS)
     q = layer["q"][0](h, layer["q"][1])
     if layer["cross"]:
         key, value = cross_kv[index]
-        mask = masks[0] if layer["text"] else masks[1]
-        a = attention(q, key, value, DIT_HEADS, DIT_HEAD_DIM, mask)
     else:
-        k = layer["k"][0](h, layer["k"][1])
-        v = layer["v"][0](h, layer["v"][1])
-        a = attention(q, k, v, DIT_HEADS, DIT_HEAD_DIM)
+        key = layer["k"][0](h, layer["k"][1])
+        value = layer["v"][0](h, layer["v"][1])
+    a = attention(q, key, value, DIT_HEADS, DIT_HEAD_DIM)
     x = x + layer["o"][0](a, layer["o"][1])
-    h = F.layer_norm(x, (DIT_DIM,), None, None, EPS)
+    h = F.layer_norm(x, (DIT_DIM,), bound.unit, bound.zero, EPS)
     h = F.gelu(layer["ff1"][0](h, layer["ff1"][1]), approximate="tanh")
     return x + layer["ff2"][0](h, layer["ff2"][1])
 
 
-def dit(bound: BoundChain, hidden: torch.Tensor, step: int, cross_kv, masks):
+def dit(bound: BoundChain, hidden: torch.Tensor, step: int, cross_kv):
     for index in range(DIT_LAYERS):
-        hidden = dit_layer(bound, index, step, hidden, cross_kv, masks)
+        hidden = dit_layer(bound, index, step, hidden, cross_kv)
     gamma, beta = bound.out_norm
     hidden = F.layer_norm(hidden, (DIT_DIM,), gamma[step], beta[step], NORM_OUT_EPS)
     return bound.proj_out_2[0](hidden, bound.proj_out_2[1])
 
 
-def denoise(bound: BoundChain, vl: torch.Tensor, state_features: torch.Tensor,
-            masks, noise: torch.Tensor) -> torch.Tensor:
+def denoise(bound: BoundChain, text: torch.Tensor, image: torch.Tensor,
+            state_features: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
     """Four Euler steps over the DiT, from a supplied initial noise draw."""
-    cross_kv = cross_key_values(bound, vl)
+    cross_kv = cross_key_values(bound, text, image)
     (dw1, db1), (dw2, db2) = bound.action_decoder
     actions = noise
     dt = 1.0 / bound.steps
     for step in range(bound.steps):
         features = encode_actions(bound, actions, step) + bound.position_embedding
         hidden = torch.cat((state_features, features), dim=1)
-        out = dit(bound, hidden, step, cross_kv, masks)
+        out = dit(bound, hidden, step, cross_kv)
         pred = dw2(F.relu(dw1(out, db1)), db2)
         actions = actions + dt * pred[:, -bound.horizon:]
     return actions
 
 
-def attention_masks(image_mask: torch.Tensor, attention_mask: torch.Tensor,
-                    queries: int):
-    """The two key masks the cross-attention layers alternate between.
+def token_partition(image_mask: torch.Tensor, attention_mask: torch.Tensor):
+    """Split the backbone sequence into the two classes the DiT cross-attends.
 
-    PFA masks out where the entry is True, the opposite of the reference's
-    keep-mask, and it wants the query axis materialised rather than broadcast.
-    Both masks are frame constants, so both are built once.
+    A prompt's token layout does not change between frames, so this runs when
+    the prompt is set and the captured graph reads the resulting index vectors.
+    Padding is dropped here rather than masked later: a token outside
+    ``attention_mask`` lands in neither class, so no site is ever handed a key
+    it must then be told to ignore.
     """
-    keep_text = (~image_mask) & attention_mask
-    keep_image = image_mask & attention_mask
-    def expand(keep):
-        return (~keep).reshape(1, -1).expand(queries, keep.shape[-1]).contiguous()
-    return expand(keep_text), expand(keep_image)
+    image = image_mask.reshape(-1).bool()
+    attend = attention_mask.reshape(-1).bool()
+    text_index = torch.nonzero((~image) & attend, as_tuple=False).reshape(-1)
+    image_index = torch.nonzero(image & attend, as_tuple=False).reshape(-1)
+    if text_index.numel() == 0 or image_index.numel() == 0:
+        raise ValueError(
+            "the DiT cross-attention alternates between language and image "
+            f"tokens; this prompt has {text_index.numel()} language and "
+            f"{image_index.numel()} image tokens")
+    return text_index, image_index

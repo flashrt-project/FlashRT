@@ -111,29 +111,34 @@ def test_folding_the_modulators_into_the_norm_affine_is_exact():
     assert torch.allclose(reference, folded, atol=1e-6)
 
 
-def test_key_masks_invert_the_reference_and_materialise_the_query_axis():
+def test_token_partition_splits_the_classes_and_drops_padding():
     image = torch.tensor([[True, True, False, False, False]])
     attend = torch.tensor([[True, True, True, True, False]])
-    text_mask, image_mask = pl.attention_masks(image.reshape(-1), attend.reshape(-1), 3)
-    # The operator masks out where the entry is True: the inverse of the
-    # reference's "attend here" mask, with the query axis written out.
-    assert text_mask.shape == image_mask.shape == (3, 5)
-    assert text_mask[0].tolist() == [True, True, False, False, True]
-    assert image_mask[0].tolist() == [False, False, True, True, True]
-    assert torch.equal(text_mask[0], text_mask[2])
-    assert text_mask.is_contiguous() and image_mask.is_contiguous()
+    text_index, image_index = pl.token_partition(image, attend)
+    assert text_index.tolist() == [2, 3]
+    assert image_index.tolist() == [0, 1]
 
 
-def test_every_key_is_masked_out_in_exactly_one_of_the_two_masks():
-    """Together the two masks partition the attended tokens, as the
-    reference's ``image & attn`` / ``~image & attn`` pair does."""
+def test_token_partition_covers_exactly_the_attended_tokens():
+    """The two index vectors partition the attended tokens, the way the
+    reference's ``image & attn`` / ``~image & attn`` mask pair does."""
     torch.manual_seed(1)
     image = torch.rand(461) > 0.5
     attend = torch.rand(461) > 0.05
-    text_mask, image_mask = pl.attention_masks(image, attend, 41)
-    kept = (~text_mask[0]).int() + (~image_mask[0]).int()
-    assert torch.equal(kept.bool(), attend)
-    assert kept.max().item() == 1
+    text_index, image_index = pl.token_partition(image, attend)
+    covered = torch.zeros(461, dtype=torch.bool)
+    covered[text_index] = True
+    covered[image_index] = True
+    assert torch.equal(covered, attend)
+    assert text_index.numel() + image_index.numel() == int(attend.sum())
+    assert not set(text_index.tolist()) & set(image_index.tolist())
+
+
+def test_a_prompt_with_no_language_tokens_is_refused_with_the_counts():
+    image = torch.ones(1, 8, dtype=torch.bool)
+    attend = torch.ones(1, 8, dtype=torch.bool)
+    with pytest.raises(ValueError, match="0 language and 8 image"):
+        pl.token_partition(image, attend)
 
 
 # ── the step-constant tables ──────────────────────────────────────────

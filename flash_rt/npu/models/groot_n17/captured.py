@@ -1,10 +1,14 @@
-"""One captured action chain at a fixed backbone-token count.
+"""One captured action chain, at a fixed prompt token layout.
 
 Every tensor the graph reads is allocated here and refilled with ``copy_``
-between frames, so the captured sequence always sees the same addresses. The
-two cross-attention key masks are frame-independent -- they are a function of
-where the prompt's image tokens sit in the sequence -- so they are built when
-the prompt is set and then read, not rebuilt.
+between frames, so the captured sequence always sees the same addresses.
+
+The token layout is part of the shape the graph is built for. A prompt fixes
+how many of the backbone's tokens are language and how many are image, and the
+DiT's cross-attention layers read one class each, so those two counts appear in
+the buffer shapes exactly the way the token count does. A different prompt
+length builds a different runner, which is the same rule the Pi0.5 port applies
+to its prompt buckets.
 """
 
 from __future__ import annotations
@@ -18,37 +22,33 @@ from flash_rt.npu.models.groot_n17 import pipeline as pl
 class CapturedChain:
     """Backbone features and a noise draw in, an action trajectory out."""
 
-    def __init__(self, bound: pl.BoundChain, tokens: int, *, batch: int = 1,
+    def __init__(self, bound: pl.BoundChain, image_mask: torch.Tensor,
+                 attention_mask: torch.Tensor, *, batch: int = 1,
                  state_history: int = 1):
         if batch != 1:
             raise NotImplementedError(
                 "the Ascend GR00T N1.7 chain serves one observation per call")
         self.bound = bound
-        self.tokens = int(tokens)
         device = bound.device
+        text_index, image_index = pl.token_partition(
+            image_mask.to(device), attention_mask.to(device))
+        self.text_index = text_index.to(torch.int32).to(device)
+        self.image_index = image_index.to(torch.int32).to(device)
+        self.tokens = int(image_mask.reshape(-1).shape[0])
+        self.text_tokens = int(self.text_index.numel())
+        self.image_tokens = int(self.image_index.numel())
+
         self.features = torch.zeros(batch, self.tokens, pl.BACKBONE_DIM,
                                     dtype=torch.bfloat16, device=device)
         self.state = torch.zeros(batch, state_history, pl.STATE_DIM,
                                  dtype=torch.bfloat16, device=device)
         self.noise = torch.zeros(batch, bound.horizon, pl.ACTION_DIM,
                                  dtype=torch.bfloat16, device=device)
-        self.text_mask = torch.zeros(bound.horizon + state_history, self.tokens,
-                                     dtype=torch.bool, device=device)
-        self.image_mask = torch.zeros_like(self.text_mask)
         self.actions = torch.zeros(batch, bound.horizon, pl.ACTION_DIM,
                                    dtype=torch.bfloat16, device=device)
         self._graph = None
 
     # ------------------------------------------------------------------
-    def set_prompt(self, image_mask: torch.Tensor, attention_mask: torch.Tensor):
-        """Freeze the two key masks for a prompt's token layout."""
-        text, image = pl.attention_masks(
-            image_mask.reshape(-1).to(self.text_mask.device),
-            attention_mask.reshape(-1).to(self.text_mask.device).bool(),
-            self.text_mask.shape[0])
-        self.text_mask.copy_(text)
-        self.image_mask.copy_(image)
-
     def fill(self, features: torch.Tensor, state: torch.Tensor,
              noise: torch.Tensor) -> None:
         self.features.copy_(features.reshape(self.features.shape))
@@ -57,9 +57,10 @@ class CapturedChain:
 
     def _run(self) -> torch.Tensor:
         vl = pl.encode_backbone_features(self.bound, self.features)
+        text = torch.index_select(vl, 1, self.text_index)
+        image = torch.index_select(vl, 1, self.image_index)
         state_features = pl.encode_state(self.bound, self.state)
-        return pl.denoise(self.bound, vl, state_features,
-                          (self.text_mask, self.image_mask), self.noise)
+        return pl.denoise(self.bound, text, image, state_features, self.noise)
 
     def capture(self) -> None:
         """Warm up on the default stream, then capture on a dedicated one.
