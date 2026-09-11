@@ -1,0 +1,27 @@
+binding: ltx25_dit
+structure: vision_ffn
+dims: {D: 4096, F: 16384, layers: 48}
+variant: {activation: gelu}    # host applies the tanh approximation
+boundary_dtype: bf16
+
+m_profile:
+  denoise_stage1: {m_class: large, phase: denoise}   # M = video tokens, first distilled phase
+  denoise_stage2: {m_class: large, phase: denoise}   # M = 4x tokens after latent upsample
+
+weights_map:
+  diffusers:
+    layout: out_in
+    w_fc1: "transformer_blocks.{i}.ff.net.0.proj.weight"
+    b_fc1: {const: zeros}    # ff_bias=false on this host family
+    w_fc2: "transformer_blocks.{i}.ff.net.2.weight"
+    b_fc2: {const: zeros}
+    w_norm: {const: ones}    # norm2 is non-affine; scale/shift come from the
+    b_norm: {const: zeros}   # per-token adaptive tables, outside this seam
+
+quantized_layers: "0-41"     # the checkpoint's own quantization whitelist:
+                             # the last six blocks stay at host precision
+
+hosts:
+  diffusers:
+    module_path: "transformer_blocks.{i}.ff"
+    versions: ">=0.40"
