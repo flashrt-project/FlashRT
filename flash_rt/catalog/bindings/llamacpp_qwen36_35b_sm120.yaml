@@ -30,7 +30,7 @@ cadences:
   spec_step: [decode, token_select, spec_draft]
 
 # Machine-readable model facts consumed by the ggml adapter (build-time
-# header generation: adapters/ggml/tools/gen_binding_header.py). This is the
+# header generation: tools/gen_binding_header.py in FlashRT-llama.cpp). This is the
 # single source for every model-specific constant in the window code; the
 # window logic itself is family-level.
 host_params:
