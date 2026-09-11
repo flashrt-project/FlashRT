@@ -1,0 +1,36 @@
+structure: audio_codec
+version: 1
+description: >
+  Neural audio codec decode: discrete codes -> waveform. The region is
+  a conv stack (DAC-style acoustic/semantic decoders, fp32 cuDNN
+  convolutions + elementwise upsampling). The fp16 impl runs the decode
+  under fp16 autocast — the only measured lever here (1.22x, waveform
+  cosine 1.00000 vs the fp32 host; torch.compile and CUDA graph both
+  measure ~1.0x on this compute-bound region). Host family: the
+  HiggsAudioV2TokenizerModel is shared by OmniVoice and Higgs-Audio-v3.
+
+reference:
+  module: audio_codec.reference
+  entrypoint: audio_codec_ref
+
+boundary:
+  symbolic_dims: [B, C, T, N]
+  inputs:
+    - {name: codes, dims: [B, C, T], dtype: int64}
+  outputs:
+    - {name: audio_values, dims: [B, 1, N], dtype: float32}
+
+weights: []
+
+variants: {}
+
+calibration: {}
+
+gates:
+  parity:
+    metrics: [cosine, max_abs, p99_abs]
+    data: real_distribution
+  latency:
+    baselines: [torch_compile, unfused_chain]
+    rule: net_positive_including_boundary
+    per_shape: true
