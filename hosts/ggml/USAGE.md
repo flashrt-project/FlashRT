@@ -2,6 +2,11 @@
 
 ## Building a host against the adapter
 
+The adapter sources live at `hosts/ggml/` in the FlashRT checkout (they
+were under `flash_rt/structures/adapters/ggml/` before the structures
+layer moved to its own repository). A host CMake that lists the
+translation units by path must use `hosts/ggml/`.
+
 The reference host is the Jetson-PI-Edge llama.cpp tree, which carries the
 integration side (CMake wiring, fuse-hook call sites, pi0 graph changes)
 on its FlashRT branch and consumes this repository as a submodule at

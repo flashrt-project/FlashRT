@@ -17,7 +17,7 @@ import sys
 import yaml
 
 _HERE = pathlib.Path(__file__).resolve().parent
-_REPO = _HERE.parents[4]
+_REPO = _HERE.parents[2]
 _BINDINGS = _REPO / "flash_rt" / "structures" / "bindings"
 
 

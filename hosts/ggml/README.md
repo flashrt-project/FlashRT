@@ -49,7 +49,7 @@ through pattern-matched subgraph windows. Heavy math is single-source:
 - `fa4_aot/` — AOT FlashAttention-4 modules (vision and prefill shapes)
   plus their regeneration script and provenance notes.
 - `qualification/` — the release gates (see TESTING.md).
-- `../../bindings/jetson_pi_edge_pi05.yaml` — the pipeline binding that
+- `flash_rt/structures/bindings/jetson_pi_edge_pi05.yaml` — the pipeline binding that
   maps the host's hot path onto catalog structures under the
   complete-hot-path contract.
 

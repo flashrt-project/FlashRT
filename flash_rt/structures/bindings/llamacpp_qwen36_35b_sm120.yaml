@@ -3,7 +3,7 @@ structure: autoregressive_decode_pipeline
 
 # Host: stock llama.cpp (upstream master lineage) running Qwen3.6-35B-A3B
 # UD-Q4_K_M on RTX 5090 (SM120) with the native ggml adapter
-# (flash_rt/structures/adapters/ggml/fr_win_qwen36_sm120.cu). Structure
+# (hosts/ggml/fr_win_qwen36_sm120.cu). Structure
 # regions execute as fused subgraph windows matched inside ggml-cuda's
 # graph evaluation. Two quality tiers share one binary: the safe tier keeps
 # the target head and all matched math bit-comparable to stock (24-chunk

@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
-_REPO = _HERE.parents[4]
+_REPO = _HERE.parents[2]
 sys.path.insert(0, str(_REPO))
 
 import torch  # noqa: E402

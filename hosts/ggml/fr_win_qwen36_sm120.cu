@@ -25,8 +25,8 @@
 
 // Heavy math comes from csrc (single source; the adapter only translates):
 // the M-rows activation quantizer and the warp-split-K W4A4 GEMV.
-#include "../../../../csrc/quantize/f32_act_to_nvfp4_swizzled_mrows_sm120.cuh"
-#include "../../../../csrc/kernels/fp4_w4a4_mma_warpsplit_mrows_f32out_sm120.cuh"
+#include "../../csrc/quantize/f32_act_to_nvfp4_swizzled_mrows_sm120.cuh"
+#include "../../csrc/kernels/fp4_w4a4_mma_warpsplit_mrows_f32out_sm120.cuh"
 
 // Model-specific constants come from the binding (single source:
 // flash_rt/structures/bindings/llamacpp_qwen36_35b_sm120.yaml); regenerate
