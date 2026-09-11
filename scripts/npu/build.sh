@@ -74,6 +74,18 @@ c++ -c -fPIC -O2 -std=c++17 \
  "$npu_repo_root/csrc/npu/kernels/decode_attn_910b.cpp" \
  -L"$npu_arch_root/lib64" -lascendalog -lruntime -ldl \
  -o "$npu_output_dir/libflashrt_npu_attn.so"
+# The action head's two elementwise shapes are vector only, so they need
+# neither the mixed nor the cube toolchain -- only their own library, because a
+# loader that can be pointed at a stale shared object has to be able to refuse
+# exactly one unit.
+"$npu_toolkit_root/bin/bisheng" -fPIC -shared -xcce -O2 -std=c++17 \
+ --cce-soc-version="$npu_soc_version" --cce-soc-core-type=VecCore \
+ "${npu_abi_defines[@]}" \
+ -I"$npu_toolkit_root/compiler/tikcpp/tikcfw" \
+ -I"$npu_toolkit_root/compiler/tikcpp/tikcfw/impl" \
+ -I"$npu_toolkit_root/compiler/tikcpp/tikcfw/interface" -I"$npu_toolkit_root/include" \
+ -o "$npu_output_dir/libflashrt_npu_dit_vector.so" \
+ "$npu_repo_root/csrc/npu/kernels/dit_vector_910b.cpp"
 # The DiT attention kernel is a second mixed unit: same reason as above, it
 # cannot share a translation unit with a cube-only one nor a library with any
 # other kernel unit.

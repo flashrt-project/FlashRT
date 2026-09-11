@@ -63,6 +63,7 @@ import torch
 import torch.nn.functional as F
 
 from flash_rt.npu.core.linear import NzBf16Weight
+from flash_rt.npu.models.groot_n17 import vector as vec
 from flash_rt.npu.models.groot_n17.attention import DitAttention
 
 # Geometry. These are the shipped GR00T-N1.7-3B configuration; the frontend
@@ -350,6 +351,8 @@ def add_norm(residual, branch, weight, bias, eps):
     add; the normalisation rounds once in the kernel where the separate pair
     rounds twice, which the end-to-end cosine judges.
     """
+    if vec.serves(residual) and vec.serves(branch):
+        return vec.add_layer_norm(residual, branch, weight, bias, eps)
     import torch_npu
     normalised, _, _, total = torch_npu.npu_add_layer_norm(
         residual, branch, weight, bias, eps, True)
