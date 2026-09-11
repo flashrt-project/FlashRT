@@ -83,7 +83,8 @@ _STRUCTURE_BY_IMPL = {
 #: hands the consumer a dtype it refuses — which the ledger would report
 #: as a family that fell back, from a split this gate created itself.
 _CHAIN = "negotiated_fp8_chain"
-_ROUTED = "attention_core_routed"
+_ROUTED_SUFFIX = "_routed"
+_ROUTED = "attention_core" + _ROUTED_SUFFIX
 
 
 def _cuda_time_ms(fn: Callable[[], Any], warmup: int = 3,
@@ -294,6 +295,7 @@ def attach(
     iters: int = 10,
     on_guard_fail: str = "fallback",
     scheme: str | Any = "auto",
+    attention_forms: Sequence[str] | None = None,
     negotiate_fp8: bool = True,
     verbose: bool = True,
 ) -> Plan:
@@ -348,8 +350,8 @@ def attach(
     plan = auto_swaps(model, forward, structures=structures,
                       observations=observations, percentile=percentile,
                       max_samples=max_samples, prefix_cadence=prefix_cadence,
-                      scheme=scheme, negotiate_fp8=negotiate_fp8,
-                      verbose=verbose)
+                      scheme=scheme, attention_forms=attention_forms,
+                      negotiate_fp8=negotiate_fp8, verbose=verbose)
     if not plan.swaps and not plan.toggles:
         plan.revert_all()
         return Plan({}, {}, {"digest": "none", "seams": 0,
@@ -411,6 +413,9 @@ def attach(
                     f"the host module, so this unit did not run: "
                     f"{led['seams_fell_back'][:3]}")
                 continue
+            stat["shape"] = _measured_shape(paths, plan)
+            stat["per_shape_rule"] = _per_shape_rule(name)
+            stat["memory"] = _memory_delta(paths)
             timing = _paired_ab(eval_thunk, arm.on, arm.off,
                                 rounds=rounds, iters=iters)
             stat["e2e"] = timing
@@ -418,7 +423,11 @@ def attach(
                 stat["outcome"] = "refused"
                 stat["reason"] = (
                     f"no net win ({timing['speedup']:.3f}x, spread "
-                    f"{timing['spread']:.3f}) at {_shape_note(plan)}")
+                    f"{timing['spread']:.3f}){_memory_note(stat['memory'])} "
+                    f"at {stat['shape']}"
+                    + (" — this unit's latency qualification is per shape, "
+                       "so the verdict holds for that shape and no other"
+                       if stat["per_shape_rule"] else ""))
                 continue
             stat["outcome"] = "activated"
             if routed:
@@ -484,6 +493,14 @@ def attach(
     if not winners and not routed_winner:
         plan.revert_all()
         say("outcome: whole-host refusal — model left untouched")
+    elif not routed_winner:
+        # Some units won and the routed ones did not. Reverting them put
+        # the host processors back, but the forms themselves were still
+        # reachable — through the plan, for as long as the caller holds it
+        # to detach with. A declined form's working set is not small, so
+        # holding it made an attachment cost more memory than the host it
+        # replaced at exactly the shapes where that matters most.
+        plan.release_routed()
 
     activated = dict(winners)
     if routed_winner:
@@ -560,6 +577,143 @@ def _say_band(where: str, band: str, note: str, say) -> None:
 def _round(metrics: Mapping[str, Any]) -> dict[str, Any]:
     return {k: (round(v, 7) if isinstance(v, float) else v)
             for k, v in metrics.items()}
+
+
+def _per_shape_rule(unit: str) -> bool:
+    """Whether this unit's spec says its latency verdict is per shape.
+
+    Thirteen catalog specs declare ``latency.per_shape: true`` and nothing
+    has ever read it, so every verdict has been recorded as though it were
+    universal. Reading it does not change any decision; it changes what a
+    refusal claims, which is the difference between "this form does not
+    help" and "this form did not help at the one size it was measured at".
+    """
+    from .registry import load
+
+    try:
+        spec = load(unit[:-len(_ROUTED_SUFFIX)]
+                    if unit.endswith(_ROUTED_SUFFIX) else unit)
+    except (KeyError, ValueError):
+        return False
+    latency = (spec.gates or {}).get("latency") or {}
+    return bool(latency.get("per_shape"))
+
+
+def _measured_shape(paths, plan: AutoPlan) -> str:
+    """The form the bound seams were armed for, read off their guards.
+
+    ``m_profile`` carries this for hosts whose bindings declare it and is
+    empty for the rest, where the refusal then reads "rows unrecorded" —
+    a shape-scoped verdict with no shape on it. The guards know: every
+    bound seam declares the row count or capacity it was armed for.
+    """
+    rows = set()
+    for module in (paths.values() if hasattr(paths, "values") else paths):
+        guard = getattr(module, "_frt_guard", None)
+        if guard is None:
+            continue
+        if getattr(guard, "rows", None):
+            rows.add(f"rows={guard.rows}")
+        elif getattr(guard, "row_capacity", None):
+            rows.add(f"rows<={guard.row_capacity}")
+    if rows:
+        return ", ".join(sorted(rows))
+    declared = sorted({m for s in plan.seams for m in (s.m_profile or ())})
+    return f"rows={declared}" if declared else "rows unrecorded"
+
+
+def _tensors_of(module, depth: int = 2):
+    """Every device tensor a bound form holds, however it holds it.
+
+    Parameters and buffers are the easy half. The rest — staging, packed
+    weights, a workspace object an artifact handed back — hangs off plain
+    attributes and off containers inside them, which is exactly where a
+    form's working set lives, so a walk that stops at ``parameters()``
+    reports the largest holdings as zero.
+    """
+    if module is None:
+        return
+    if torch.is_tensor(module):
+        yield module
+        return
+    if depth <= 0:
+        return
+    if isinstance(module, torch.nn.Module):
+        yield from module.parameters()
+        yield from module.buffers()
+        for sub in module.modules():
+            for value in vars(sub).values():
+                yield from _tensors_of(value, depth - 1)
+        return
+    if isinstance(module, (tuple, list, set)):
+        for item in module:
+            yield from _tensors_of(item, depth - 1)
+        return
+    if isinstance(module, Mapping):
+        for item in module.values():
+            yield from _tensors_of(item, depth - 1)
+        return
+    for value in getattr(module, "__dict__", {}).values():
+        yield from _tensors_of(value, depth - 1)
+
+
+def _device_bytes(modules, exclude: set[int] | None = None) -> tuple[int, set]:
+    """Device bytes these hold, counting each storage once.
+
+    Deduplication by pointer is the whole point: a family that pools one
+    staging set across its sites would otherwise be counted once per site
+    and read as many times its real cost. ``exclude`` keeps a retained host
+    module out of its replacement's total — the bound form holds it for
+    fallback, and counting it on both sides would report a form that halves
+    the weights as costing nothing.
+    """
+    seen, total = set(), 0
+    exclude = exclude or set()
+    for module in modules:
+        for tensor in _tensors_of(module):
+            ptr = tensor.data_ptr()
+            if not tensor.is_cuda or ptr in seen or ptr in exclude:
+                continue
+            seen.add(ptr)
+            total += tensor.numel() * tensor.element_size()
+    return total, seen
+
+
+def _memory_delta(paths) -> dict[str, int]:
+    """What this unit changes about resident memory. Recorded, not judged.
+
+    The latency gate has always decided alone, which is right until a unit
+    that loses on time turns out to hold — or to have saved — gigabytes.
+    Today that consequence does not appear in the receipt at all, so it
+    cannot even be discussed; a refusal reads as free when it may be the
+    most expensive line in the run.
+
+    ``bound`` is what the unit's forms hold, ``host`` what the modules they
+    replace hold, and the difference is what activating this unit does to
+    resident memory: negative when a quantized form replaces host weights,
+    positive when a form brings a working set the host did not need.
+    """
+    if not torch.cuda.is_available():
+        return {}
+    modules = list(paths.values() if hasattr(paths, "values") else paths)
+    hosts = []
+    for module in modules:
+        host = getattr(module, "_frt_host", None)
+        hosts.append(host() if callable(host) else None)
+    host_bytes, host_ptrs = _device_bytes(hosts)
+    bound, _ = _device_bytes(modules, exclude=host_ptrs)
+    return {"bound_bytes": bound, "host_bytes": host_bytes,
+            "delta_bytes": bound - host_bytes}
+
+
+def _memory_note(memory) -> str:
+    """The memory consequence, in the refusal itself."""
+    if not memory:
+        return ""
+    delta = memory.get("delta_bytes", 0)
+    if abs(delta) < 64 << 20:
+        return ""
+    return f", {delta / 2 ** 30:+.2f} GiB resident"
 
 
 def _shape_note(plan: AutoPlan) -> str:

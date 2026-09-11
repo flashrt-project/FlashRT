@@ -121,6 +121,18 @@ class QuantScheme:
     #: quantising those projections is a precision decision.
     gdn_projection_format: str | None = None
 
+    #: Executable forms of ``attention_core`` to weigh ahead of the
+    #: family's published order, most preferred first. Empty keeps that
+    #: order, which is precision-descending: the BF16 forms preserve the
+    #: host's numerics and every existing receipt was measured against
+    #: them. A quantized attention form trades a bounded error for
+    #: speed, so it belongs to the same axis as the two attributes above
+    #: and arrives the same way — named by a scheme the caller selected,
+    #: never by a device check or a host binding. The names are impl
+    #: variants, exactly as in ``Decision.formats``; the family still
+    #: qualifies and speed-gates whatever is named.
+    attention_forms: tuple[str, ...] = ()
+
     def statistics(self, points: Sequence) -> dict[str, PointStat]:
         """Per point key (``"path|name"``): what to measure there."""
         return {f"{p.path}|{p.name}": PointStat() for p in points}
@@ -298,9 +310,20 @@ class Nvfp4Balance(QuantScheme):
 
     def __init__(self, alpha: float = 0.5,
                  clamp: tuple[float, float] = (0.25, 4.0),
-                 fuse_ffn_wire: bool = False) -> None:
+                 fuse_ffn_wire: bool = False,
+                 attention_forms: tuple[str, ...] = ()) -> None:
         self.alpha = float(alpha)
         self.clamp = (float(clamp[0]), float(clamp[1]))
+        # Naming quantized attention forms is the same kind of statement
+        # this scheme already makes about GEMM seams, on the same axis:
+        # the family still qualifies and speed-gates each one, and an
+        # unserved device falls through to the published order. It is a
+        # separate registered profile rather than a default here because
+        # it changes the numerics of a seam this scheme otherwise leaves
+        # at host precision.
+        self.attention_forms = tuple(attention_forms)
+        if attention_forms:
+            self.name = "nvfp4_balance_sage"
         # the FFN's FP4-wire chain (GEMM emits bias+GELU re-quantized,
         # the second GEMM consumes it) drops fc2's input-side balance —
         # a numerics change, so it is a scheme decision the receipt
@@ -488,3 +511,5 @@ register("bf16_structural", Bf16Structural())
 register("nvfp4_awq", Nvfp4Awq())
 register("nvfp4_balance", Nvfp4Balance())
 register("nvfp4_balance_wire", Nvfp4Balance(fuse_ffn_wire=True))
+register("nvfp4_balance_sage", Nvfp4Balance(
+    attention_forms=("sage2", "sage3")))
