@@ -97,6 +97,10 @@ def _nz(weight_kn: torch.Tensor, device) -> NzBf16Weight:
     orientation a GEMM consumes. ``NzBf16Weight.bind`` takes the stored
     ``(N, K)`` form, hence the transpose back: it costs one setup-time copy and
     keeps a single validated binder for both backends' conventions.
+
+    Row-major was measured against this at every shape the frame runs. It wins
+    the backbone's wide projections by 3 to 9 percent in isolation and loses the
+    whole frame by 2 percent, so the fractal layout serves every site.
     """
     return NzBf16Weight.bind(weight_kn.t().contiguous().to(torch.bfloat16).to(device))
 

@@ -8,6 +8,12 @@ the text embedding lookup, both of which the caller performs and hands over as
 
 Three stages, in order:
 
+* **The patch projection**, which the checkpoint stores as a ``Conv3d`` over
+  ``(3, 2, 16, 16)`` voxels and which is a plain matmul once the patch is
+  flattened -- the host hands over raw patches and the graph projects them.
+  The interpolated position table depends only on the image grid, so it is a
+  prompt constant the projection adds.
+
 * **A 24-block vision tower** over the patch features, with 2-D rotary
   embeddings and attention that does *not* cross views: the reference splits
   the sequence by ``cu_seqlens`` per image, which here is one batched call with
@@ -53,6 +59,7 @@ VIT_HEADS = 16
 VIT_HEAD_DIM = 64
 VIT_FF_DIM = 4096
 VIT_EPS = 1e-6
+PATCH_DIM = 3 * 2 * 16 * 16                    # channels x temporal x 16 x 16
 SPATIAL_MERGE = 2
 MERGED_DIM = VIT_DIM * SPATIAL_MERGE ** 2      # 4096
 DEEPSTACK_TAPS = (5, 11, 17)
@@ -115,6 +122,12 @@ class BoundBackbone:
         self.device = device
         dev = device
 
+        # The Conv3d's weight is (out, channels, temporal, h, w); flattened over
+        # everything but the output it is exactly the matmul's (N, K).
+        self.patch_embed = (
+            _nz(weights._patch_embed_w.reshape(VIT_DIM, PATCH_DIM).t().contiguous(), dev),
+            _bias(weights._patch_embed_b, dev))
+
         self.vit = []
         for i in range(VIT_LAYERS):
             self.vit.append(dict(
@@ -161,6 +174,12 @@ class BoundBackbone:
 # ══════════════════════════════════════════════════════════════════════
 #  Vision tower
 # ══════════════════════════════════════════════════════════════════════
+
+def patch_project(bound: BoundBackbone, patches: torch.Tensor,
+                  positions: torch.Tensor) -> torch.Tensor:
+    """Raw flattened patches to vision-tower features."""
+    return bound.patch_embed[0](patches, bound.patch_embed[1]) + positions
+
 
 def vision(bound: BoundBackbone, features: torch.Tensor, cos: torch.Tensor,
            sin: torch.Tensor, views: int):

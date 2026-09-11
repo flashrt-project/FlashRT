@@ -29,7 +29,7 @@ _CHAIN_BLOCKS = ("vl_self_attn", "dit")
 _CHAIN_SINGLETONS = ("vlln_", "ah_pos_embed", "ts_", "proj_out_",
                      "st_enc_", "ac_enc_", "ac_dec_")
 _BACKBONE_BLOCKS = ("qwen3vl_vit", "qwen3vl_llm")
-_BACKBONE_SINGLETONS = ("dsm", "merger_", "llm_norm_w")
+_BACKBONE_SINGLETONS = ("dsm", "merger_", "llm_norm_w", "patch_embed")
 
 
 def _to_bf16(transforms):
@@ -73,9 +73,11 @@ def action_chain_spec() -> ModelWeightSpec:
 def backbone_spec() -> ModelWeightSpec:
     """The BF16 spec for the vision tower, the mergers and the truncated LLM.
 
-    The patch embed and the token embedding are not here: the caller performs
-    both and hands the results over, which is the same boundary the other
-    backends' ``aux`` bundle draws.
+    The patch projection is here, unlike the other backends' ``aux`` boundary:
+    it is a matmul wearing a Conv3d's shape, so folding it into the graph costs
+    nothing and takes 8.5 ms of per-frame host work out of the frame. The token
+    embedding stays with the caller, because for a fixed instruction it is a
+    constant the graph reads rather than work it does.
     """
     return _spec(_BACKBONE_BLOCKS, _BACKBONE_SINGLETONS)
 

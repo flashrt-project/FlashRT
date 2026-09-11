@@ -134,8 +134,14 @@ class CapturedFrame:
         self.embeds = aux["text_embeds"].to(device).to(torch.bfloat16).contiguous()
 
         patch_tokens, patch_dim = aux["patch_shape"]
+        if patch_dim != bb.PATCH_DIM:
+            raise ValueError(
+                f"the patch projection consumes {bb.PATCH_DIM}-wide voxels, "
+                f"got {patch_dim}")
         self.patches = torch.zeros(patch_tokens, patch_dim, dtype=torch.bfloat16,
                                    device=device)
+        # The interpolated position table depends only on the image grid.
+        self.positions = aux["patch_positions"].to(device).to(torch.bfloat16).contiguous()
         self.state = torch.zeros(1, state_history, pl.STATE_DIM,
                                  dtype=torch.bfloat16, device=device)
         self.noise = torch.zeros(1, chain.horizon, pl.ACTION_DIM,
@@ -152,7 +158,8 @@ class CapturedFrame:
         self.noise.copy_(noise.reshape(self.noise.shape))
 
     def _run(self) -> torch.Tensor:
-        merged, taps = bb.vision(self.backbone, self.patches, self.vit_cos,
+        features = bb.patch_project(self.backbone, self.patches, self.positions)
+        merged, taps = bb.vision(self.backbone, features, self.vit_cos,
                                  self.vit_sin, self.views)
         self.embeds.reshape(-1, bb.LLM_DIM).index_copy_(0, self.visual_index, merged)
         features = bb.language(self.backbone, self.embeds, self.llm_cos, self.llm_sin,
