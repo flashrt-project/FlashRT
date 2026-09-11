@@ -214,6 +214,46 @@ class W8A16Decode(QuantScheme):
                         formats=formats)
 
 
+class Nvfp4Static(QuantScheme):
+    """Native NVFP4 W4A4 FFN — the large-M sibling of the W4A16 decode
+    band, served by the local native build's fp4 GEMM tier (no hub
+    package needed; the impl refuses without the built kernels).
+
+    Weight-only per-16-block quantization at bind time, per-call
+    activation quantization — needs no calibration data, exactly like
+    the weight-only decode twins. Routes ``decoder_ffn`` seams to the
+    ``nvfp4_static`` impl, whose native GEMM covers MaskGIT-scale M
+    (the hub decode bands stop at M=8). Other structures stay at host
+    precision.
+    """
+
+    name = "nvfp4_static"
+    _format = "nvfp4_static"
+    _linear_format = "nvfp4_static"
+
+    def statistics(self, points: Sequence) -> dict[str, PointStat]:
+        return {f"{p.path}|{p.name}": PointStat(None) for p in points}
+
+    def decide(self, report: Mapping[str, Mapping[str, float]]) -> Decision:
+        formats, keep = {}, []
+        for seam_path, pts in report.items():
+            if any(k.endswith("|act_after_mul") for k in pts):
+                formats[seam_path] = self._format
+            elif getattr(pts, "structure", None) == "decoder_llm":
+                formats[seam_path] = self._format
+            elif getattr(pts, "structure", None) == "audio_codec":
+                formats[seam_path] = "fp16_codec"
+            elif (self._linear_format is not None
+                    and getattr(pts, "structure", None) == "linear_proj"):
+                formats[seam_path] = self._linear_format
+            else:
+                keep.append(seam_path)
+        return Decision(keep_host=tuple(keep),
+                        reasons={p: f"{self.name} binds LLM/MLP/proj "
+                                 f"seams only" for p in keep},
+                        formats=formats)
+
+
 class W4A16Decode(W8A16Decode):
     """Weight-only NVFP4 (E2M1 packed + block scale factors) twin of
     :class:`W8A16Decode` — same decode band, same M-dispatch, half the
@@ -481,6 +521,7 @@ register("fp8_static", Fp8Static())
 register("fp8_static_keep_outliers", Fp8Static(keep_outliers=20.0))
 register("w8a16_decode", W8A16Decode())
 register("w4a16_decode", W4A16Decode())
+register("nvfp4_static", Nvfp4Static())
 register("w4a4_decode", W4A4Decode())
 register("w4a4_decode_release", W4A4Decode(release_host_weights=True))
 register("none", NoQuant())

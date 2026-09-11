@@ -100,6 +100,10 @@ class AutoPlan:
     updates: list[Callable[[], None]] = field(default_factory=list)
     seams: list[Seam] = field(default_factory=list)
     notes: dict[str, Any] = field(default_factory=dict)
+    #: the host the plan was discovered on; ``attach`` installs the
+    #: swaps at their paths relative to this root (the one-call door:
+    #: ``plan = auto_swaps(model, forward); handle = plan.attach()``)
+    root: torch.nn.Module | None = field(default=None, repr=False)
     #: modules that carry a guard but are not swapped at a path — an
     #: adapter's routed seam. Reported by the attachment's ledger, never
     #: installed by it, so a seam that cannot be swapped can still be
@@ -119,6 +123,26 @@ class AutoPlan:
     #: this plan baked in — the repo's introspection format, not a private
     #: one, so ``plan.precision_spec`` reads like ``rt.precision_spec``
     precision_spec: Any = None
+
+    def attach(self):
+        """Commit the plan: install every swap at its path on ``root``.
+
+        The one-call door (the article's ``plan.attach()``): atomic
+        resolution + install, with the plan's observed seams and revert
+        callables carried along. Returns the attachment handle
+        (``detach()`` restores the host bit-for-bit).
+        """
+        from .swap import attach as _swap_attach
+
+        if self.root is None:
+            raise ValueError(
+                "refused: plan carries no root host (auto_swaps did not "
+                "record one); pass the model to auto_swaps")
+        if not self.swaps and not self.observed:
+            raise ValueError("no swaps or routed seams staged")
+        return _swap_attach(
+            self.root, self.swaps,
+            observe=self.observed, revert=self.revert)
 
     def enable_routed(self) -> None:
         for on, _ in self.toggles:
@@ -655,7 +679,7 @@ def auto_swaps(
     adapter_only = not seams and bool(
         {"attention_core", "gated_delta_core"}.intersection(structures))
     if not seams and not adapter_only:
-        plan = AutoPlan()
+        plan = AutoPlan(root=model)
         if region_extras is not None:
             _merge_region_extras(plan, region_extras)
         return plan
@@ -1023,7 +1047,7 @@ def auto_swaps(
     # for fp8 input whose producer failed to bind would be handed BF16,
     # and the host would silently grow a quantize fused into whatever
     # produced it. Bind the pair together, or leave both on BF16.
-    plan = AutoPlan(seams=seams)
+    plan = AutoPlan(seams=seams, root=model)
     plan._requested_structures = frozenset(structures)
     if region_extras is not None:
         _merge_region_extras(plan, region_extras)
@@ -1583,8 +1607,28 @@ def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8,
                     and fmt in ("bf16_pack", "nvfp4_balance")) \
             and not (seam.structure == "vision_ffn"
                      and fmt == "nvfp4_balance") \
-            and seam.structure not in ("decoder_ffn", "linear_proj"):
+            and seam.structure not in ("decoder_ffn", "linear_proj",
+                                       "decoder_llm", "audio_codec"):
         raise ValueError(f"scheme routed {seam.structure} to format "
+                         f"{fmt!r}, which has no impl variant here")
+
+    if seam.structure == "audio_codec":
+        if fmt == "fp16_codec":
+            from .impls.audio_codec import fp16 as codec_impl
+            return {seam.path: codec_impl.bind_codec_decode(
+                _resolve(model, seam.path),
+                original=_resolve(model, seam.path))}
+        raise ValueError(f"scheme routed audio_codec to format "
+                         f"{fmt!r}, which has no impl variant here")
+
+    if seam.structure == "decoder_llm":
+        if fmt == "nvfp4_static":
+            from .impls.decoder_llm import nvfp4 as llm_impl
+            return {seam.path: llm_impl.bind_decoder_stack(
+                _resolve(model, seam.path),
+                variant=seam.variant,
+                original=_resolve(model, seam.path))}
+        raise ValueError(f"scheme routed decoder_llm to format "
                          f"{fmt!r}, which has no impl variant here")
 
     if seam.structure == "decoder_ffn":
@@ -1606,6 +1650,16 @@ def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8,
                      w_up=w["w_up"].t().contiguous(),
                      w_down=w["w_down"].t().contiguous())
             return wq_impl.bind_mlp_seam(
+                w, variant=seam.variant,
+                original=_resolve(model, seam.path))
+        if fmt == "nvfp4_static":
+            from .impls.decoder_ffn import nvfp4_static as nv_impl
+            w = seam_weights(model, seam)
+            w = dict(w,
+                     w_gate=w["w_gate"].t().contiguous(),
+                     w_up=w["w_up"].t().contiguous(),
+                     w_down=w["w_down"].t().contiguous())
+            return nv_impl.bind_mlp_seam(
                 w, variant=seam.variant,
                 original=_resolve(model, seam.path))
         if fmt not in (None, "fp8_static"):
@@ -1696,6 +1750,12 @@ def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8,
             # and the weight dict is already the kernel's [N, K] layout
             from .impls.linear_proj import w8a16_static as proj_w8
             return proj_w8.bind_proj_seam(
+                seam_weights(model, seam),
+                original=_resolve(model, seam.path))
+        if fmt == "nvfp4_static":
+            # native-build fp4 GEMM tier for large-M projection calls
+            from .impls.linear_proj import nvfp4_static as proj_nv
+            return proj_nv.bind_proj_seam(
                 seam_weights(model, seam),
                 original=_resolve(model, seam.path))
         if fmt not in (None, "fp8_static"):
