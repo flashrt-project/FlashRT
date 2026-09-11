@@ -86,6 +86,17 @@ c++ -c -fPIC -O2 -std=c++17 \
  -I"$npu_toolkit_root/compiler/tikcpp/tikcfw/interface" -I"$npu_toolkit_root/include" \
  -o "$npu_output_dir/libflashrt_npu_dit_vector.so" \
  "$npu_repo_root/csrc/npu/kernels/dit_vector_910b.cpp"
+# The evaluation transform's resize is vector only and belongs to the image
+# path rather than to the action head, so it gets its own unit and its own
+# shared object.
+"$npu_toolkit_root/bin/bisheng" -fPIC -shared -xcce -O2 -std=c++17 \
+ --cce-soc-version="$npu_soc_version" --cce-soc-core-type=VecCore \
+ "${npu_abi_defines[@]}" \
+ -I"$npu_toolkit_root/compiler/tikcpp/tikcfw" \
+ -I"$npu_toolkit_root/compiler/tikcpp/tikcfw/impl" \
+ -I"$npu_toolkit_root/compiler/tikcpp/tikcfw/interface" -I"$npu_toolkit_root/include" \
+ -o "$npu_output_dir/libflashrt_npu_image.so" \
+ "$npu_repo_root/csrc/npu/kernels/area_resize_910b.cpp"
 # The DiT attention kernel is a second mixed unit: same reason as above, it
 # cannot share a translation unit with a cube-only one nor a library with any
 # other kernel unit.
