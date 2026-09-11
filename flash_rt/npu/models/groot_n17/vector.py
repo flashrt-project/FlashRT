@@ -34,7 +34,7 @@ class DitVectorLibrary:
         from flash_rt.npu.core import abi
         abi.verify(self.library, "DiT elementwise")
         self.add_layer_norm = self.library.flashrt_npu_dit_add_layer_norm
-        self.add_layer_norm.argtypes = [C.c_void_p] * 7 + [C.c_int] * 2 + [C.c_float]
+        self.add_layer_norm.argtypes = [C.c_void_p] * 8 + [C.c_int] * 3 + [C.c_float]
         self.add_layer_norm.restype = C.c_int
 
 
@@ -63,21 +63,36 @@ def serves(x: torch.Tensor) -> bool:
 
 
 def add_layer_norm(residual: torch.Tensor, branch: torch.Tensor, gamma: torch.Tensor,
-                   beta: torch.Tensor, eps: float):
+                   beta: torch.Tensor, eps: float, branch_bias=None, out=None):
     """``residual + branch``, and the affine LayerNorm of the sum.
 
     Returns ``(normalised, sum)``, the same pair and the same arithmetic as the
     vendor's fused form: the sum is rounded to BF16 before it is normalised,
     because the sum is what the next block carries forward.
+
+    ``branch_bias`` is the bias of the projection that produced ``branch``, added
+    here instead of by that projection. It is the same number added to the same
+    sum in FP32, and it saves a launch: a biased matmul casts its bias on every
+    call, as its own kernel, for numbers that never change.
+
+    ``out`` is a preallocated destination for the normalised row, wider than the
+    row itself. The extra columns are the caller's -- typically a constant one, so
+    that the *next* projection can carry its bias as one more input channel -- and
+    this only ever writes the first ``cols`` of each row.
     """
     shape = residual.shape
     rows, cols = residual.numel() // shape[-1], shape[-1]
-    norm = torch.empty_like(residual)
+    if out is None:
+        norm, pitch = torch.empty_like(residual), cols
+    else:
+        norm, pitch = out, out.shape[-1]
     total = torch.empty_like(residual)
     code = library().add_layer_norm(
         torch.npu.current_stream(residual.device).npu_stream,
         residual.data_ptr(), branch.data_ptr(), gamma.data_ptr(), beta.data_ptr(),
-        norm.data_ptr(), total.data_ptr(), rows, cols, float(eps))
+        norm.data_ptr(), total.data_ptr(),
+        0 if branch_bias is None else branch_bias.data_ptr(),
+        rows, cols, pitch, float(eps))
     if code:
         raise RuntimeError(f"native add-layer-norm rejected arguments: {code}")
     return norm, total

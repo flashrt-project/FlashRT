@@ -17,6 +17,14 @@
 // A row to a core, every read of the launch issued before any of it is waited
 // on, and the two reductions broadcast back through Brcb rather than read on
 // the scalar unit.
+//
+// It also carries two things that belong to the projection in front of it. The
+// branch's bias is added here rather than by that projection, because aclnn's
+// biased matmul casts its bias on every call -- 1536 numbers that never change,
+// once a call, as its own kernel launch -- while this one already has the row in
+// UB and reads the affine pair once a launch anyway. And the normalised row is
+// written at a pitch, so it can end in a constant one and let *its* consumer
+// carry a bias as one more input channel for the same reason.
 #include "kernel_operator.h"
 using namespace AscendC;
 
@@ -34,12 +42,13 @@ __aicore__ inline void BroadcastRow(const LocalTensor<float>& dst,
 __global__ __aicore__ void dit_add_layer_norm_kernel(GM_ADDR residual, GM_ADDR branch,
                                                      GM_ADDR gamma, GM_ADDR beta,
                                                      GM_ADDR norm, GM_ADDR total,
-                                                     int rows, int cols, float eps) {
+                                                     GM_ADDR branchBias, int rows,
+                                                     int cols, int pitch, float eps) {
     using namespace flashrt_dit_vector;
     TPipe pipe;
-    TQue<TPosition::VECIN, 1> rq, bq, gq, cq;
+    TQue<TPosition::VECIN, 1> rq, bq, gq, cq, pq;
     TQue<TPosition::VECOUT, 1> nq, tq;
-    TBuf<TPosition::VECCALC> xbuf, sbuf, gbuf, cbuf, wbuf, rbuf, mbuf;
+    TBuf<TPosition::VECCALC> xbuf, sbuf, gbuf, cbuf, wbuf, rbuf, mbuf, pbuf, hbuf;
     pipe.InitBuffer(rq, 1, MAX_NORM_COLS * 2);
     pipe.InitBuffer(bq, 1, MAX_NORM_COLS * 2);
     pipe.InitBuffer(gq, 1, MAX_NORM_COLS * 2);
@@ -53,8 +62,12 @@ __global__ __aicore__ void dit_add_layer_norm_kernel(GM_ADDR residual, GM_ADDR b
     pipe.InitBuffer(wbuf, MAX_NORM_COLS * 4);
     pipe.InitBuffer(rbuf, 256);
     pipe.InitBuffer(mbuf, 256);
+    pipe.InitBuffer(pq, 1, MAX_NORM_COLS * 2);
+    pipe.InitBuffer(pbuf, MAX_NORM_COLS * 4);
+    pipe.InitBuffer(hbuf, MAX_NORM_COLS * 2);
 
-    GlobalTensor<bfloat16_t> rg, bg, gg, cg, ng, tg;
+    GlobalTensor<bfloat16_t> rg, bg, gg, cg, ng, tg, pg;
+    if (branchBias) { pg.SetGlobalBuffer((__gm__ bfloat16_t*)branchBias); }
     rg.SetGlobalBuffer((__gm__ bfloat16_t*)residual);
     bg.SetGlobalBuffer((__gm__ bfloat16_t*)branch);
     gg.SetGlobalBuffer((__gm__ bfloat16_t*)gamma);
@@ -93,6 +106,17 @@ __global__ __aicore__ void dit_add_layer_norm_kernel(GM_ADDR residual, GM_ADDR b
         DataCopy(b0, bg[(uint32_t)first * cols], cols);
         bq.EnQue(b0);
     }
+    // The branch's bias, read once for the launch beside the affine pair.
+    auto bias = pbuf.Get<float>();
+    if (branchBias) {
+        auto bl = pq.AllocTensor<bfloat16_t>();
+        DataCopy(bl, pg, cols);
+        pq.EnQue(bl);
+        bl = pq.DeQue<bfloat16_t>();
+        Cast(bias, bl, RoundMode::CAST_NONE, cols);
+        PipeBarrier<PIPE_V>();
+        pq.FreeTensor(bl);
+    }
     gl = gq.DeQue<bfloat16_t>();
     Cast(gf, gl, RoundMode::CAST_NONE, cols);
     PipeBarrier<PIPE_V>();
@@ -120,6 +144,22 @@ __global__ __aicore__ void dit_add_layer_norm_kernel(GM_ADDR residual, GM_ADDR b
         PipeBarrier<PIPE_V>();
         rq.FreeTensor(r);
         bq.FreeTensor(b);
+        if (branchBias) {
+            // The bias goes onto the branch and the branch is then rounded to
+            // BF16, which is exactly what the biased matmul this replaced did.
+            // Adding it straight into the FP32 sum instead is *better*
+            // arithmetic and a worse answer: the reference rounds here, so the
+            // end-to-end cosine reads the missing rounding as drift -- it cost
+            // the combined figure 0.9999614 -> 0.9999531 and the gripper
+            // modality 0.9946 -> 0.9910 before this was put back.
+            auto rounded = hbuf.Get<bfloat16_t>();
+            Add(sq, sq, bias, cols);
+            PipeBarrier<PIPE_V>();
+            Cast(rounded, sq, RoundMode::CAST_RINT, cols);
+            PipeBarrier<PIPE_V>();
+            Cast(sq, rounded, RoundMode::CAST_NONE, cols);
+            PipeBarrier<PIPE_V>();
+        }
         Add(x, x, sq, cols);
         PipeBarrier<PIPE_V>();
 
@@ -166,23 +206,28 @@ __global__ __aicore__ void dit_add_layer_norm_kernel(GM_ADDR residual, GM_ADDR b
         PipeBarrier<PIPE_V>();
         nq.EnQue(n);
         n = nq.DeQue<bfloat16_t>();
-        DataCopy(ng[base], n, cols);
+        DataCopy(ng[(uint32_t)row * pitch], n, cols);
         nq.FreeTensor(n);
     }
 }
 
 extern "C" int flashrt_npu_dit_add_layer_norm(void* stream, void* residual, void* branch,
                                               void* gamma, void* beta, void* norm,
-                                              void* total, int rows, int cols, float eps) {
+                                              void* total, void* branchBias, int rows,
+                                              int cols, int pitch, float eps) {
     using namespace flashrt_dit_vector;
     if (!stream || !residual || !branch || !gamma || !beta || !norm || !total) { return 1; }
     // A 64-element repeat is what carries the broadcast of the mean and the
     // reciprocal square root, so the row has to be a whole number of them.
     if (rows <= 0 || cols <= 0 || cols % 64 || cols > MAX_NORM_COLS) { return 2; }
+    // The normalised row is written at `pitch` and the sum at `cols`: the sum is
+    // a residual and nothing projects from it. A 16-element pitch step keeps the
+    // store block aligned.
+    if (pitch < cols || (pitch - cols) % 16) { return 3; }
     const int blocks = rows < 40 ? rows : 40;
     dit_add_layer_norm_kernel<<<blocks, nullptr, stream>>>(
         (uint8_t*)residual, (uint8_t*)branch, (uint8_t*)gamma, (uint8_t*)beta,
-        (uint8_t*)norm, (uint8_t*)total, rows, cols, eps);
+        (uint8_t*)norm, (uint8_t*)total, (uint8_t*)branchBias, rows, cols, pitch, eps);
     return 0;
 }
 

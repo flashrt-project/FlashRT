@@ -15,7 +15,7 @@ if [[ "$npu_soc_version" != "Ascend910B4" ]]; then
 fi
 # Bumped whenever an exported entry point's signature or contract changes, so a
 # stale shared object is refused at load rather than called with wrong arguments.
-npu_abi_version="${FLASHRT_NPU_ABI_VERSION:-2}"
+npu_abi_version="${FLASHRT_NPU_ABI_VERSION:-3}"
 npu_abi_defines=(
   "-DFLASHRT_NPU_SOC_VERSION=\"$npu_soc_version\""
   "-DFLASHRT_NPU_ABI_VERSION=$npu_abi_version"

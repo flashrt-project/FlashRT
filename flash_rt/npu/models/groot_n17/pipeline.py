@@ -111,6 +111,34 @@ def _bias(tensor, device):
     return tensor.to(torch.bfloat16).to(device).contiguous()
 
 
+#: Input channels appended to a projection so its bias can be one more row of the
+#: weight instead of an ``addmm`` bias. See ``_nz_folded``.
+BIAS_CHANNEL = 16
+
+
+def _nz_folded(weight_kn: torch.Tensor, bias: torch.Tensor, device) -> NzBf16Weight:
+    """Bind a projection with its bias folded in as one more input channel.
+
+    ``aclnn``'s biased matmul casts its bias on every call, as its own kernel
+    launch: 512 of the frame's 711 ``Cast`` calls are the DiT's, for numbers that
+    never change. Two ways out, and which one a site uses depends on what reads
+    its result.
+
+    Where the consumer is one of ours and already walks the row, it adds the bias
+    -- that is ``o`` and ``ff2``, whose consumer is the fused add-and-normalise.
+    Where the consumer is the cube or a vendor kernel, the bias folds in here: the
+    activation's row ends in a constant one, so that channel's contribution *is*
+    the bias. Identical to ``addmm`` at cosine 1.0000000, because both add it in
+    FP32 and only the order differs, at the cost of one more 16-channel block of
+    weight -- 1% of these shapes.
+    """
+    k, n = int(weight_kn.shape[0]), int(weight_kn.shape[1])
+    padded = torch.zeros(k + BIAS_CHANNEL, n, dtype=torch.bfloat16)
+    padded[:k] = weight_kn.to(torch.bfloat16)
+    padded[k] = bias.to(torch.bfloat16)
+    return _nz(padded, device)
+
+
 def attention(query, key, value, heads, head_dim):
     """One capturable attention call in the layout the projections produce.
 
@@ -162,9 +190,15 @@ class DitAttentionSite:
         return tuple(torch.zeros(self.columns, self.width, dtype=torch.bfloat16,
                                  device=self.device) for _ in range(2))
 
-    def query_into(self, weight, x, bias):
-        torch.addmm(bias, x.reshape(-1, x.shape[-1]), weight.tensor,
-                    out=self.query[:self.queries])
+    def query_into(self, weight, x, bias=None):
+        """``bias`` is ``None`` wherever the projection folded it into its
+        weight, which is every site whose activation is a padded normalised row."""
+        flat = x.reshape(-1, x.shape[-1])
+        out = self.query[:self.queries]
+        if bias is None:
+            torch.matmul(flat, weight.tensor, out=out)
+        else:
+            torch.addmm(bias, flat, weight.tensor, out=out)
 
     def key_into(self, weight, x, bias, key):
         torch.addmm(bias, x.reshape(-1, x.shape[-1]), weight.tensor,
@@ -183,7 +217,7 @@ class DitAttentionSite:
                     out=value[:self.keys])
         return value.t().contiguous()
 
-    def fused_into(self, weight, x, bias):
+    def fused_into(self, weight, x, bias=None):
         """One projection for query, key and value, read back as three slices.
 
         All three slices stay in place. The value used to be permuted out of
@@ -191,8 +225,12 @@ class DitAttentionSite:
         -- 3.6 and 13.8 us at 48 by 1536, both of them fixed cost -- and the
         kernel now transposes it on the way into L0B instead.
         """
-        torch.addmm(bias, x.reshape(-1, x.shape[-1]), weight.tensor,
-                    out=self.fused[:self.queries])
+        flat = x.reshape(-1, x.shape[-1])
+        out = self.fused[:self.queries]
+        if bias is None:
+            torch.matmul(flat, weight.tensor, out=out)
+        else:
+            torch.addmm(bias, flat, weight.tensor, out=out)
         width = self.width
         return (self.fused[:, :width], self.fused[:, width:2 * width],
                 self.fused[:, 2 * width:])
@@ -287,10 +325,17 @@ class BoundChain:
             layer = dict(
                 cross=cross,
                 text=(i % (2 * ATTEND_TEXT_EVERY_N_BLOCKS) == 0),
-                q=(_nz(weights._dit_q_w[i], dev), _bias(weights._dit_q_b[i], dev)),
+                # The attention projections and the first feed-forward hand
+                # their result to the cube or to the vendor's GELU, so they carry
+                # their bias as an extra input channel. The output projection and
+                # the second feed-forward hand theirs to the fused
+                # add-and-normalise, which adds the bias itself for nothing.
+                q=(_nz_folded(weights._dit_q_w[i], weights._dit_q_b[i], dev), None),
                 o=(_nz(weights._dit_o_w[i], dev), _bias(weights._dit_o_b[i], dev)),
-                ff1=(_nz(weights._dit_ff_proj_w[i], dev), _bias(weights._dit_ff_proj_b[i], dev)),
-                ff2=(_nz(weights._dit_ff_down_w[i], dev), _bias(weights._dit_ff_down_b[i], dev)),
+                ff1=(_nz_folded(weights._dit_ff_proj_w[i],
+                                weights._dit_ff_proj_b[i], dev), None),
+                ff2=(_nz(weights._dit_ff_down_w[i], dev),
+                     _bias(weights._dit_ff_down_b[i], dev)),
             )
             if cross:
                 # A cross layer's key and value are frame constants over the
@@ -306,10 +351,11 @@ class BoundChain:
                 # here and dim 0 after _nz transposes. Only the fused form is
                 # kept: holding both costs 226 MB for nothing.
                 layer["qkv"] = (
-                    _nz(torch.cat((weights._dit_q_w[i], weights._dit_k_w[i],
-                                   weights._dit_v_w[i]), dim=1), dev),
-                    _bias(torch.cat((weights._dit_q_b[i], weights._dit_k_b[i],
-                                     weights._dit_v_b[i]), dim=0), dev))
+                    _nz_folded(torch.cat((weights._dit_q_w[i], weights._dit_k_w[i],
+                                          weights._dit_v_w[i]), dim=1),
+                               torch.cat((weights._dit_q_b[i], weights._dit_k_b[i],
+                                          weights._dit_v_b[i]), dim=0), dev),
+                    None)
                 del layer["q"]
             self.layers.append(layer)
 
@@ -319,9 +365,22 @@ class BoundChain:
         self.unit = torch.ones(DIT_DIM, dtype=torch.bfloat16, device=dev)
         self.zero = torch.zeros(DIT_DIM, dtype=torch.bfloat16, device=dev)
 
+        # Every normalised row in the DiT lands here, at a pitch, with the last
+        # channel a constant one so that the projections reading it carry their
+        # bias in the weight (`_nz_folded`). One buffer serves all of them: the
+        # block's two norms and the entry norm are strictly sequential, and each
+        # row is consumed before the next is written.
+        self.norm_pitch = DIT_DIM + BIAS_CHANNEL
+
         # The DiT is entered with the state token in front of the action
         # horizon, so every attention site on this path has that many queries.
         self.action_tokens = self.horizon + 1
+        self.normalised = torch.zeros(1, self.action_tokens, self.norm_pitch,
+                                      dtype=torch.bfloat16, device=dev)
+        self.normalised[..., DIT_DIM] = 1.0
+        # The entry norm has no residual branch of its own.
+        self.no_branch = torch.zeros(1, self.action_tokens, DIT_DIM,
+                                     dtype=torch.bfloat16, device=dev)
         # Attention sites and each cross layer's key/value pair are built the
         # first time they are asked for, which is during warm-up: capture runs
         # after three eager passes, so the graph never sees an allocation.
@@ -376,8 +435,10 @@ class BoundChain:
         shift, scale = out.chunk(2, dim=1)
         self.out_norm = ((1.0 + scale).to(torch.bfloat16).to(dev).contiguous(),
                          shift.to(torch.bfloat16).to(dev).contiguous())
-        self.proj_out_2 = (_nz(weights._proj_out_2_w, dev),
-                           _bias(weights._proj_out_2_b, dev))
+        # The output head reads the last block's normalised row, which is padded
+        # like every other one, so it folds its bias in too.
+        self.proj_out_2 = (_nz_folded(weights._proj_out_2_w,
+                                      weights._proj_out_2_b, dev), None)
 
         # The action encoder's tau features are a step constant too.
         self.tau = _tau_encoding(self.steps, DIT_DIM).to(torch.bfloat16).to(dev)
@@ -387,18 +448,28 @@ class BoundChain:
 #  Frame forward
 # ══════════════════════════════════════════════════════════════════════
 
-def add_norm(residual, branch, weight, bias, eps):
+def add_norm(residual, branch, weight, bias, eps, branch_bias=None, out=None):
     """``branch + residual``, and the LayerNorm of the sum, in one launch.
 
     Returns ``(normalised, sum)``. The sum is bit-identical to the separate
     add; the normalisation rounds once in the kernel where the separate pair
     rounds twice, which the end-to-end cosine judges.
+
+    ``branch_bias`` is the bias of the projection that produced ``branch``, which
+    this adds instead of that projection -- the same number into the same FP32
+    sum, and one launch fewer. ``out`` is the padded destination described in
+    ``vector.add_layer_norm``.
     """
     if vec.serves(residual) and vec.serves(branch):
-        return vec.add_layer_norm(residual, branch, weight, bias, eps)
+        return vec.add_layer_norm(residual, branch, weight, bias, eps, branch_bias, out)
     import torch_npu
+    if branch_bias is not None:
+        branch = branch + branch_bias
     normalised, _, _, total = torch_npu.npu_add_layer_norm(
         residual, branch, weight, bias, eps, True)
+    if out is not None:
+        out[..., :normalised.shape[-1]] = normalised
+        normalised = out
     return normalised, total
 
 
@@ -485,23 +556,31 @@ def dit_layer(bound: BoundChain, index: int, step: int, x: torch.Tensor,
         query, key, value = site.fused_into(layer["qkv"][0], h, layer["qkv"][1])
         pitch = 3 * site.width
         a = site(key, value, query=query, stride=pitch, value_stride=pitch)
-    h, x = add_norm(x, layer["o"][0](a, layer["o"][1]), bound.unit, bound.zero, EPS)
-    h = F.gelu(layer["ff1"][0](h, layer["ff1"][1]), approximate="tanh")
-    branch = layer["ff2"][0](h, layer["ff2"][1])
+    h, x = add_norm(x, layer["o"][0](a), bound.unit, bound.zero, EPS,
+                    branch_bias=layer["o"][1], out=bound.normalised)
+    h = F.gelu(layer["ff1"][0](h), approximate="tanh")
+    branch = layer["ff2"][0](h)
     if index + 1 < DIT_LAYERS:
         gamma, beta = bound.ada[index + 1]
-        return add_norm(x, branch, gamma[step], beta[step], EPS)
+        return add_norm(x, branch, gamma[step], beta[step], EPS,
+                        branch_bias=layer["ff2"][1], out=bound.normalised)
     gamma, beta = bound.out_norm
-    return add_norm(x, branch, gamma[step], beta[step], NORM_OUT_EPS)
+    return add_norm(x, branch, gamma[step], beta[step], NORM_OUT_EPS,
+                    branch_bias=layer["ff2"][1], out=bound.normalised)
 
 
 def dit(bound: BoundChain, hidden: torch.Tensor, step: int, cross_kv):
     gamma, beta = bound.ada[0]
-    h = F.layer_norm(hidden, (DIT_DIM,), gamma[step], beta[step], EPS)
+    # The same kernel every other norm in the block uses, with no branch: it
+    # writes the padded row the first layer's projection wants, and using the
+    # vendor's LayerNorm here instead would put a second norm implementation in
+    # a loop that charges for every kernel type in it.
+    h, _ = add_norm(hidden, bound.no_branch, gamma[step], beta[step], EPS,
+                    out=bound.normalised)
     x = hidden
     for index in range(DIT_LAYERS):
         h, x = dit_layer(bound, index, step, x, h, cross_kv)
-    return bound.proj_out_2[0](h, bound.proj_out_2[1])
+    return bound.proj_out_2[0](h)
 
 
 def denoise(bound: BoundChain, text: torch.Tensor, image: torch.Tensor,
