@@ -148,6 +148,13 @@ class DitAttentionSite:
         self.query = torch.zeros(self.rows, self.width, dtype=torch.bfloat16,
                                  device=device)
         self.self_key, self.self_value = self.key_buffers()
+        # Query, key and value of a self-attention site share one activation, so
+        # they are one GEMM of three times the width. One call of 4608 columns
+        # costs 26 us where three of 1536 cost 34, and the slices are read in
+        # place rather than copied out -- which is what ate the same fusion on
+        # the other model on this part.
+        self.fused = torch.zeros(self.rows, 3 * self.width, dtype=torch.bfloat16,
+                                 device=device)
 
     def key_buffers(self):
         """Zero-padded key and value buffers for one layer."""
@@ -175,8 +182,19 @@ class DitAttentionSite:
                     out=value[:self.keys])
         return value.t().contiguous()
 
-    def __call__(self, key, value_t):
-        return self.kernel(self.query, key, value_t)[:self.queries].unsqueeze(0)
+    def fused_into(self, weight, x, bias):
+        """One projection for query, key and value, read back as three slices."""
+        torch.addmm(bias, x.reshape(-1, x.shape[-1]), weight.tensor,
+                    out=self.fused[:self.queries])
+        width = self.width
+        value = self.fused[:, 2 * width:]
+        return (self.fused[:, :width], self.fused[:, width:2 * width],
+                value.t().contiguous())
+
+    def __call__(self, key, value_t, query=None, stride=None):
+        query = self.query if query is None else query
+        return self.kernel(query, key, value_t,
+                           stride)[:self.queries].unsqueeze(0)
 
 
 def _timestep_projection(steps: int, channels: int = 256,
@@ -259,16 +277,35 @@ class BoundChain:
         # ── DiT layers ────────────────────────────────────────────────
         self.layers = []
         for i in range(DIT_LAYERS):
-            self.layers.append(dict(
-                cross=(i % 2 == 0),
+            cross = i % 2 == 0
+            layer = dict(
+                cross=cross,
                 text=(i % (2 * ATTEND_TEXT_EVERY_N_BLOCKS) == 0),
                 q=(_nz(weights._dit_q_w[i], dev), _bias(weights._dit_q_b[i], dev)),
-                k=(_nz(weights._dit_k_w[i], dev), _bias(weights._dit_k_b[i], dev)),
-                v=(_nz(weights._dit_v_w[i], dev), _bias(weights._dit_v_b[i], dev)),
                 o=(_nz(weights._dit_o_w[i], dev), _bias(weights._dit_o_b[i], dev)),
                 ff1=(_nz(weights._dit_ff_proj_w[i], dev), _bias(weights._dit_ff_proj_b[i], dev)),
                 ff2=(_nz(weights._dit_ff_down_w[i], dev), _bias(weights._dit_ff_down_b[i], dev)),
-            ))
+            )
+            if cross:
+                # A cross layer's key and value are frame constants over the
+                # backbone tokens, so they stay separate; only a self layer's
+                # three projections share an activation.
+                layer["k"] = (_nz(weights._dit_k_w[i], dev),
+                              _bias(weights._dit_k_b[i], dev))
+                layer["v"] = (_nz(weights._dit_v_w[i], dev),
+                              _bias(weights._dit_v_b[i], dev))
+            else:
+                # The checkpoint stores these transposed, so the three
+                # projections concatenate along the output axis, which is dim 1
+                # here and dim 0 after _nz transposes. Only the fused form is
+                # kept: holding both costs 226 MB for nothing.
+                layer["qkv"] = (
+                    _nz(torch.cat((weights._dit_q_w[i], weights._dit_k_w[i],
+                                   weights._dit_v_w[i]), dim=1), dev),
+                    _bias(torch.cat((weights._dit_q_b[i], weights._dit_k_b[i],
+                                     weights._dit_v_b[i]), dim=0), dev))
+                del layer["q"]
+            self.layers.append(layer)
 
         # An affine-free LayerNorm synthesises unit weight and zero bias on
         # every call -- two extra launches and 2.5 us a call, measured. These
@@ -435,13 +472,12 @@ def dit_layer(bound: BoundChain, index: int, step: int, x: torch.Tensor,
     layer = bound.layers[index]
     if layer["cross"]:
         site, key, value_t = cross_kv[index]
+        site.query_into(layer["q"][0], h, layer["q"][1])
+        a = site(key, value_t)
     else:
         site = bound.site(h.shape[-2])
-        key = site.self_key
-        site.key_into(layer["k"][0], h, layer["k"][1], key)
-        value_t = site.value_into(layer["v"][0], h, layer["v"][1], site.self_value)
-    site.query_into(layer["q"][0], h, layer["q"][1])
-    a = site(key, value_t)
+        query, key, value_t = site.fused_into(layer["qkv"][0], h, layer["qkv"][1])
+        a = site(key, value_t, query=query, stride=3 * site.width)
     h, x = add_norm(x, layer["o"][0](a, layer["o"][1]), bound.unit, bound.zero, EPS)
     h = F.gelu(layer["ff1"][0](h, layer["ff1"][1]), approximate="tanh")
     branch = layer["ff2"][0](h, layer["ff2"][1])

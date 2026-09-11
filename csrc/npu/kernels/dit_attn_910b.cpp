@@ -181,7 +181,7 @@ __aicore__ inline void LoadA(const LocalTensor<T>& dst, const LocalTensor<T>& sr
 __global__ __aicore__ void dit_attn_kernel(GM_ADDR q, GM_ADDR k, GM_ADDR vt, GM_ADDR out,
                                            GM_ADDR scores, GM_ADDR probs, GM_ADDR ctx,
                                            int heads, int sq, int skv, int hd,
-                                           float scale, uint64_t sync) {
+                                           int stride, float scale, uint64_t sync) {
     using namespace flashrt_dit_attn;
     SetSyncBaseAddr(sync);
     TPipe pipe;
@@ -217,8 +217,11 @@ __global__ __aicore__ void dit_attn_kernel(GM_ADDR q, GM_ADDR k, GM_ADDR vt, GM_
         for (int h = blk; h < heads; h += cores) {
             const uint32_t sbase = (uint32_t)h * sq16 * skv16;
             auto a1 = a1q.AllocTensor<bfloat16_t>();
+            // The query and key rows may be a slice of a wider buffer: three
+            // projections that share an activation are one GEMM, and one GEMM
+            // of 4608 columns costs 26 us where three of 1536 cost 34.
             DataCopy(a1, qg[(uint32_t)h * hd],
-                     Nd2NzParams{1, (uint16_t)sq16, (uint16_t)hd, 0, (uint16_t)width,
+                     Nd2NzParams{1, (uint16_t)sq16, (uint16_t)hd, 0, (uint16_t)stride,
                                  (uint16_t)sq16, 1, 0});
             a1q.EnQue(a1);
             a1 = a1q.DeQue<bfloat16_t>();
@@ -230,7 +233,7 @@ __global__ __aicore__ void dit_attn_kernel(GM_ADDR q, GM_ADDR k, GM_ADDR vt, GM_
 
             auto b1 = b1q.AllocTensor<bfloat16_t>();
             DataCopy(b1, kg[(uint32_t)h * hd],
-                     Nd2NzParams{1, (uint16_t)skv16, (uint16_t)hd, 0, (uint16_t)width,
+                     Nd2NzParams{1, (uint16_t)skv16, (uint16_t)hd, 0, (uint16_t)stride,
                                  (uint16_t)skv16, 1, 0});
             b1q.EnQue(b1);
             b1 = b1q.DeQue<bfloat16_t>();
@@ -410,12 +413,13 @@ extern "C" int rtGetC2cCtrlAddr(uint64_t*, uint32_t*);
 extern "C" int flashrt_npu_dit_attn(void* stream, void* q, void* k, void* vt, void* out,
                                     void* scores, void* probs, void* ctx,
                                     int heads, int sq, int skv, int hd, int cores,
-                                    float scale) {
+                                    int stride, float scale) {
     using namespace flashrt_dit_attn;
     if (!stream || !q || !k || !vt || !out || !scores || !probs || !ctx) { return 1; }
     if (heads <= 0 || heads > 128 || hd <= 0 || hd % MBLK || hd > MAX_HD) { return 2; }
     if (sq <= 0 || sq > 512 || skv <= 0 || skv > MAX_SKV) { return 3; }
     if (cores <= 0 || cores > 20 || cores > heads) { return 4; }
+    if (stride < heads * hd) { return 11; }
     // The whole head lives in L0 untiled, which is what makes this kernel worth
     // writing; a geometry that does not fit is refused rather than silently
     // producing a result the accumulator could not have held.
@@ -435,7 +439,7 @@ extern "C" int flashrt_npu_dit_attn(void* stream, void* q, void* k, void* vt, vo
     if (rc) { return rc; }
     dit_attn_kernel<<<cores, nullptr, stream>>>(
         (uint8_t*)q, (uint8_t*)k, (uint8_t*)vt, (uint8_t*)out, (uint8_t*)scores,
-        (uint8_t*)probs, (uint8_t*)ctx, heads, sq, skv, hd, scale, sync);
+        (uint8_t*)probs, (uint8_t*)ctx, heads, sq, skv, hd, stride, scale, sync);
     return 0;
 }
 

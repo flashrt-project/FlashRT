@@ -48,7 +48,7 @@ class DitAttentionLibrary:
         from flash_rt.npu.core import abi
         abi.verify(self.library, "DiT attention")
         self.launch = self.library.flashrt_npu_dit_attn
-        self.launch.argtypes = [C.c_void_p] * 8 + [C.c_int] * 5 + [C.c_float]
+        self.launch.argtypes = [C.c_void_p] * 8 + [C.c_int] * 6 + [C.c_float]
         self.launch.restype = C.c_int
 
 
@@ -110,22 +110,29 @@ class DitAttention:
                                        value_t[:, :self.keys])
 
     def __call__(self, query: torch.Tensor, key: torch.Tensor,
-                 value_t: torch.Tensor) -> torch.Tensor:
-        for tensor, shape in ((query, (self.rows, self.width)),
-                              (key, (self.columns, self.width)),
-                              (value_t, (self.width, self.columns))):
-            if (tensor.dtype != torch.bfloat16 or not tensor.is_contiguous()
-                    or tuple(tensor.shape) != shape
+                 value_t: torch.Tensor, stride: int | None = None) -> torch.Tensor:
+        """``stride`` is the query and key row pitch, for when they are column
+        slices of a wider buffer that one GEMM produced."""
+        stride = self.width if stride is None else int(stride)
+        for tensor, rows in ((query, self.rows), (key, self.columns)):
+            if (tensor.dtype != torch.bfloat16 or tensor.shape[0] != rows
+                    or tensor.shape[-1] != self.width or tensor.stride(0) != stride
                     or tensor.device != self.out.device):
                 raise ValueError(
-                    "native DiT attention expects a contiguous BF16 "
-                    f"{shape[0]}x{shape[1]} operand on {self.out.device}; pad "
-                    "with DitAttention.buffers()")
+                    f"native DiT attention expects a BF16 {rows}x{self.width} "
+                    f"operand of row pitch {stride} on {self.out.device}; pad with "
+                    "DitAttention.buffers()")
+        if (value_t.dtype != torch.bfloat16 or not value_t.is_contiguous()
+                or tuple(value_t.shape) != (self.width, self.columns)
+                or value_t.device != self.out.device):
+            raise ValueError(
+                "native DiT attention expects a contiguous BF16 transposed value")
         code = self.library.launch(
             torch.npu.current_stream(self.out.device).npu_stream,
             query.data_ptr(), key.data_ptr(), value_t.data_ptr(), self.out.data_ptr(),
             self.scores.data_ptr(), self.probs.data_ptr(), self.context.data_ptr(),
-            self.heads, self.queries, self.keys, self.head_dim, self.cores, self.scale)
+            self.heads, self.queries, self.keys, self.head_dim, self.cores, stride,
+            self.scale)
         if code:
             raise RuntimeError(f"native DiT attention rejected arguments: {code}")
         return self.out
