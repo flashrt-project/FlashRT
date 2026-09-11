@@ -65,17 +65,10 @@ class Pi05TorchFrontendNpu:
         from flash_rt.npu.core.native_kernels import DecoderRope, GatedAdaRms
         self._decoder_rope = DecoderRope()
         self._ada_kernel = GatedAdaRms()
-        import ctypes
-        import torch
-        try:
-            query_soc = self._decoder_rope.library.flashrt_npu_soc_version
-        except AttributeError as exc:
-            raise ImportError("Rebuild the NPU library with scripts/npu/build.sh") from exc
-        query_soc.restype = ctypes.c_char_p
-        compiled_soc = query_soc().decode()
-        running_soc = device.device_name(torch.npu.current_device())
-        if compiled_soc != running_soc:
-            raise RuntimeError(f"NPU library targets {compiled_soc}, but the current device is {running_soc}")
+        # Every shared object is checked for ABI and SoC as it loads, by
+        # flash_rt.npu.core.abi; constructing the kernels above has already
+        # done it for the dispatch unit, and the INT8 libraries check
+        # themselves when the island binds.
         ckpt = pathlib.Path(checkpoint_dir)
         self.checkpoint_dir = ckpt
         if num_views not in (2, 3):
@@ -231,18 +224,33 @@ class Pi05TorchFrontendNpu:
         return torch.stack(out).to("npu")                    # (nv,3,224,224)
 
     # ── serving API (mirrors the AMD frontend) ─────────────────────────
-    def calibrate(self, observations=None, *, percentile=99.9):
-        """Freeze encoder INT8 scales from real camera observations.
+    def calibrate(self, observations=None, *, percentile=99.9,
+                  max_samples=None, verbose=False):
+        """Freeze encoder and decoder INT8 scales from real observations.
+
+        This is the repo's unified calibration signature, so the INT8 tier is
+        reachable through ``VLAModel.calibrate`` rather than only by holding
+        the frontend directly.
 
         Samples contain camera arrays and may supply ``prompt``, normalized
         ``state`` and ``noise``. Missing prompts use the current prompt;
         missing diffusion noise uses a reproducible model noise draw.
         Call only while this frontend is idle, before serving requests.
+
+        One observation will produce scales and they will be bad ones: the
+        frozen tier reads its range from what it is shown, so show it the
+        distribution the robot will actually run.
         """
         if not self.use_int8:
             return None
         if observations is None:
             raise ValueError("INT8 calibration requires real observations")
+        observations = list(observations)
+        if max_samples is not None:
+            observations = observations[:int(max_samples)]
+        if verbose:
+            logger.info("NPU INT8 calibration over %d observations at "
+                        "percentile %.4g", len(observations), percentile)
         import hashlib
         from flash_rt.npu.models.pi05.quantization import (calibrate_decoder,
                                                           calibrate_encoder)
@@ -309,7 +317,11 @@ class Pi05TorchFrontendNpu:
     def infer(self, observation: dict, noise: Optional[np.ndarray] = None,
               debug: bool = False):
         if self.use_int8 and not self._int8_calibrated:
-            raise RuntimeError("call calibrate_with_real_data before INT8 inference")
+            raise RuntimeError(
+                "the INT8 tier serves only from frozen scales: call "
+                "VLAModel.calibrate(observations) — or this frontend's "
+                "calibrate_with_real_data(observations) — with several real "
+                "observations before the first infer()")
         runner = self._runners.get(self.current_prompt_len)
         if runner is None or runner._graph is None:
             raise RuntimeError("call set_prompt(...) before infer()")

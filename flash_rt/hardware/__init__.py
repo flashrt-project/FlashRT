@@ -44,6 +44,14 @@ def detect_arch() -> str:
     card has an unsupported SM level. Deliberately strict: silently
     falling back to the wrong backend would hide latency/correctness
     regressions.
+
+    **Order matters and is visible to callers.** The Ascend probe runs
+    before the CUDA one, because on a CANN box ``torch.cuda.is_available()``
+    is False while the part is perfectly usable, so a CUDA-first order would
+    reject a working machine. The consequence is that on a host carrying both
+    a usable Ascend device and a CUDA GPU, ``hardware="auto"`` selects the
+    NPU. Pass ``hardware="rtx_sm120"`` (or whichever applies) to pin the
+    other one; an explicit choice is never overridden.
     """
     try:
         import torch

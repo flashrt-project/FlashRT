@@ -13,7 +13,14 @@ class DecodeAttentionLibrary:
     def __init__(self):
         path = os.environ.get("FLASHRT_NPU_ATTENTION_LIBRARY")
         path = path or Path(__file__).parents[1] / "lib" / "libflashrt_npu_attn.so"
-        self.library = C.CDLL(str(path))
+        try:
+            self.library = C.CDLL(str(path))
+        except OSError as exc:
+            raise ImportError(
+                "Build the Ascend kernels with scripts/npu/build.sh before NPU "
+                "graph construction") from exc
+        from flash_rt.npu.core import abi
+        abi.verify(self.library, "decode attention")
         self.launch = self.library.flashrt_npu_decode_attn
         self.launch.argtypes = [C.c_void_p] * 8 + [C.c_int] * 5 + [C.c_float]
         self.launch.restype = C.c_int

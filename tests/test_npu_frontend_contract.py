@@ -13,16 +13,22 @@ def test_fixed_prompt_mode_is_not_silently_ignored():
 
 
 def test_compiled_architecture_must_match_current_device(monkeypatch):
-    from flash_rt.npu.core import device, native_kernels
+    """The check moved out of this frontend and into the loader that every
+    shared object goes through, so it now covers all four rather than one."""
+    from flash_rt.npu.core import abi
 
-    def query_soc():
-        return b"Ascend910B4"
+    class _Symbol:
+        def __init__(self, value):
+            self._value = value
+            self.restype = None
+            self.argtypes = None
 
-    library = SimpleNamespace(flashrt_npu_soc_version=query_soc)
-    monkeypatch.setattr(device, "ensure_npu", lambda: None)
-    monkeypatch.setattr(device, "device_name", lambda index: "Ascend310P3")
-    monkeypatch.setattr(torch, "npu", SimpleNamespace(current_device=lambda: 0), raising=False)
-    monkeypatch.setattr(native_kernels, "DecoderRope", lambda: SimpleNamespace(library=library))
-    monkeypatch.setattr(native_kernels, "GatedAdaRms", lambda: object())
+        def __call__(self):
+            return self._value
+
+    library = SimpleNamespace(
+        flashrt_npu_abi_version=_Symbol(abi.ABI_VERSION),
+        flashrt_npu_soc_version=_Symbol(abi.SOC_VERSION.encode()))
+    monkeypatch.setattr(abi, "_running_soc", lambda: "Ascend310P3")
     with pytest.raises(RuntimeError, match="targets Ascend910B4.*Ascend310P3"):
-        Pi05TorchFrontendNpu("missing-checkpoint")
+        abi.verify(library, "dispatch")

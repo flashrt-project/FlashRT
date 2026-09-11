@@ -78,3 +78,5 @@ extern "C" int flashrt_npu_gu_int8(void* stream,void* a,void* b,void* ws,void* a
  uint64_t sync=0;uint32_t len=0;int rc=rtGetC2cCtrlAddr(&sync,&len);if(rc)return rc;
  flashrt_gu_int8_kernel<<<20,nullptr,stream>>>((uint8_t*)a,(uint8_t*)b,(uint8_t*)ws,(uint8_t*)acts,(uint8_t*)inv,(uint8_t*)ix,(uint8_t*)out,(uint8_t*)scratch,(uint8_t*)tiling,M,H,K,sync);return 0;
 }
+
+#include "../abi.h"

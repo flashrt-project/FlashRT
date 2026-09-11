@@ -14,20 +14,52 @@ Activate the matching PyTorch environment and source the CANN toolkit's
 bash scripts/npu/build.sh
 ```
 
-`ASCEND_TOOLKIT_HOME` selects the toolkit, `ASCEND_SOC_VERSION` selects the
-compiler target (default `Ascend910B4`), and `FLASHRT_NPU_BUILD_DIR` selects
-the output directory. A nondefault library location can be supplied using
-`FLASHRT_NPU_LIBRARY`.
+That produces four shared objects in `flash_rt/npu/lib`. They are separate
+because the CANN kernel headers define a per-translation-unit tiling symbol and
+a cube-only unit cannot share a file scope with a mixed cube/vector one: the
+vector dispatch unit, the gate/up cube unit, the decoder GEMM and the decode
+attention.
 
-The compiled target must match the current device. A stale library or an
-architecture mismatch fails before the checkpoint is loaded.
+`ASCEND_TOOLKIT_HOME` selects the toolkit and `FLASHRT_NPU_BUILD_DIR` the output
+directory. `ASCEND_SOC_VERSION` exists but accepts only `Ascend910B4`: the host
+tiling names that part and several kernels divide work by its twenty cube cores,
+so the build refuses to emit libraries whose tiling would be wrong for another
+target. Individual libraries can be overridden with `FLASHRT_NPU_LIBRARY`,
+`FLASHRT_NPU_CUBE_LIBRARY`, `FLASHRT_NPU_DECODER_LIBRARY` and
+`FLASHRT_NPU_ATTENTION_LIBRARY`.
+
+Every library exports its SoC target and an ABI number, and every loader checks
+both against each other and against the running device before binding an entry
+point. A partial rebuild or a mismatched override therefore fails at load with a
+message naming the library, rather than calling a stale contract behind
+identical symbol names.
+
+## Selecting a tier
 
 ```python
-from flash_rt.npu.frontends.torch.pi05 import Pi05TorchFrontendNpu
+from flash_rt.api import load_model
 
-pipe = Pi05TorchFrontendNpu(checkpoint_dir, num_views=2, use_int8=True)
+model = load_model(checkpoint_dir, hardware="npu", precision="int8", num_views=2)
+model.calibrate(real_calibration_observations, percentile=90)
+actions = model.predict(images, prompt=task, state=normalized_state)
+```
+
+`precision` takes `"bf16"` (the default tier for this part), `"int8"`, or
+`"auto"`. 910/A2 parts have no FP8 hardware, so `precision="fp8"` is refused
+rather than silently downgraded.
+
+The INT8 tier freezes its scales at setup and cannot serve until it has seen
+real data, so `predict()` raises until `calibrate()` has run. Give it
+observations from the distribution the robot will actually run: one frame will
+produce scales, and they will be bad ones.
+
+Parity work needs the diffusion noise pinned to the reference's draw, which
+`predict()` deliberately does not expose. `model.pipeline` reaches the
+frontend's own `set_prompt`/`infer`/`precision_spec` surface for that:
+
+```python
+pipe = model.pipeline
 pipe.set_prompt(task, state=normalized_state)
-pipe.calibrate_with_real_data(real_calibration_observations, percentile=90)
 result = pipe.infer(observation, noise=fixed_noise)
 pipe.precision_spec.to_json("precision.json")
 ```
@@ -126,38 +158,59 @@ and heldout episodes. Judge per-sample full raw-action cosine, and also
 report the seven action channels and unnormalized robot actions. Layer
 comparisons are diagnostics, not the final accuracy gate.
 
-The INT8 and BF16 paths passed 96 real LIBERO frames against an independent
-official FP32 host. INT8 calibration used 80 real frames covering 40 tasks at
-house percentile 90. The first 56 evaluation frames were episode-disjoint
-from calibration but were used for percentile selection. A further 40
-frames, one per task from separate episodes, provided independent confirmation.
-The minimum cosine across all 96 frames was 0.993905 for full raw actions,
-0.993986 for the seven action channels and 0.997725 for robot actions.
-Every raw/action7 result passed the 0.99 INT8 hard gate; one confirmation
-frame did not reach the 0.995 target.
+Both tiers were built through `load_model` and judged against an independent
+official FP32 host, on a 910B4. INT8 calibration used 80 real frames covering
+40 tasks at house percentile 90. Two evaluation groups: 16 in-distribution
+frames, and 40 held-out frames one per task from separate episodes. No
+evaluation frame appears in the calibration set; the check is by content hash,
+not by construction.
 
-The default percentile remains 99.9. The original eight-frame calibration
-recipe also passed all 96 frames (88 heldout), with minimum raw cosine
-0.993202; one confirmation frame missed the 0.995 target. Expanding
-calibration to 80 frames at percentile 99.9 failed the E2E gate. More
-calibration samples alone do not guarantee better scales. The BF16 path
-passed all 96 frames with minimum raw cosine 0.999981, above its 0.9999 gate.
-These are numerical agreement results, not task-success measurements.
+Per-frame full raw-action cosine:
 
-On the tested 910B4, the median of per-frame latency medians was 44.31 ms
-for the 16-frame paired benchmark, versus 44.44 ms with the previous image
-preprocessing path in the same process. All 96 INT8 outputs were bitwise
-identical to that parent. The frozen corrected BF16 baseline at the same
-boundary measured 91.08 ms, giving approximately 2.06x acceleration.
+| tier | group | minimum | median | below 0.995 |
+|---|---|---|---|---|
+| bf16 | in-distribution (16) | 0.999983 | 0.999997 | 0 |
+| bf16 | held-out (40) | 0.999992 | 0.999997 | 0 |
+| int8 | in-distribution (16) | 0.996836 | 0.999293 | 0 |
+| int8 | held-out (40) | **0.994491** | 0.999231 | **1** |
+
+The seven action channels track raw within 1e-4 throughout. All outputs finite.
+
+**The accepted standard, stated rather than implied.** The BF16 tier clears the
+0.995 bring-up target on every frame with three orders of magnitude to spare,
+and it is the default. The INT8 tier is opt-in, clears 0.99 everywhere, and has
+a median of 0.9992 — but one of the 40 held-out frames sits at 0.9945, below
+0.995. That frame's BF16 result is 0.99999, so the shortfall belongs to the
+INT8 tier, not to this port's numerics. Ship INT8 where a 1.25x frame-rate gain
+is worth a tail frame at 0.9945 and measure task success before relying on it;
+otherwise stay on BF16. Raising percentile to 99.9, and the earlier
+eight-frame calibration recipe, were both measured and neither removed the
+frame. These are numerical agreement results, not task-success measurements.
+
+Steady-state frame latency, production form — one prompt, one observation, graph
+captured, timed after warm-up, 50 frames:
+
+| tier | median | p90 | frame-0 cosine |
+|---|---|---|---|
+| bf16 | 45.131 ms | 45.231 ms | 0.9999963 |
+| int8 | **36.028 ms** | 36.176 ms | 0.9992928 |
+
 Timings include host image/noise upload, normalization, complete model
 execution, output unnormalization and download. They exclude checkpoint
-loading, camera resize, tokenization, calibration and capture.
+loading, camera resize, tokenization, calibration and capture. A per-frame
+benchmark that changes prompt every frame reads higher — 41.0 ms INT8 and
+49.9 ms BF16 over the 56 evaluation frames — because a new token length pays
+graph capture.
 
-The captured profile contains 2207 device kernels, including 122 INT8 GEMMs,
-35 RMSNorm/quantization producers and 17 GELU/product/quantization producers.
-It has no standalone row quantizers and retains one cast. This result does
-not establish a hardware limit or complete fusion; normalized compute and
-HBM utilization have not been measured for this exact implementation.
+Replay is bit-exact: 300 replays of the captured INT8 frame produce one
+distinct answer, with the BF16 decoder arm through the same harness as the
+control. Judge determinism on at least 300 replays; a five-replay check passes
+about half the time on a broken arrangement and has signed one off before.
+
+This result does not establish a hardware limit. `cube_utilization` on the
+decode attention reads 24% and the kernel is still the frame's most idle
+bucket; splitting its key range takes occupancy to 95% and does not move the
+wall, because 9.4 us of its 19 us is spent before the kernel does any work.
 
 The historical 200-to-86 ms report used a local golden that shared model
 errors with its serving path: incorrect vision attention axes and an omitted
