@@ -8,11 +8,15 @@ plus about a microsecond. This binds a kernel written for that gap.
 
 Two things the kernel asks of its caller:
 
-* **V arrives transposed**, as ``(heads * head_dim, keys)``. A raw ``Mmad`` B
-  operand takes its source in ``(N, K)`` form, and the second GEMM's B operand
-  is V with K on the key axis; supplying it that way is what keeps the value
-  stream free of a conversion. It costs nothing wherever V is a frame constant,
-  which is every cross-attention layer of this model.
+* **V comes in one of two layouts.** A raw ``Mmad`` B operand takes its source
+  in ``(N, K)`` form, and the second GEMM's B operand is V with K on the key
+  axis, so ``(heads * head_dim, keys)`` needs no conversion -- which is free
+  wherever V is a frame constant, as it is in every cross-attention layer of
+  this model. Where it is not, pass V exactly as the projection wrote it,
+  ``(keys, heads * head_dim)`` with a row pitch, and the kernel transposes it on
+  the way from L1 to L0B: producing the transposed form for a self-attention
+  layer cost a slice and a permute, 17 us a layer for 147 KB, because at this
+  size both are fixed cost.
 
 * **Every operand is padded to the fractal with real zeros.** Nd2Nz fills only
   the rows it is given, so a tail the kernel pretends is zero is actually
@@ -48,7 +52,7 @@ class DitAttentionLibrary:
         from flash_rt.npu.core import abi
         abi.verify(self.library, "DiT attention")
         self.launch = self.library.flashrt_npu_dit_attn
-        self.launch.argtypes = [C.c_void_p] * 8 + [C.c_int] * 6 + [C.c_float]
+        self.launch.argtypes = [C.c_void_p] * 8 + [C.c_int] * 7 + [C.c_float]
         self.launch.restype = C.c_int
 
 
@@ -109,11 +113,15 @@ class DitAttention:
         return (query, key, value_t), (query[:self.queries], key[:self.keys],
                                        value_t[:, :self.keys])
 
-    def __call__(self, query: torch.Tensor, key: torch.Tensor,
-                 value_t: torch.Tensor, stride: int | None = None) -> torch.Tensor:
+    def __call__(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                 stride: int | None = None,
+                 value_stride: int = 0) -> torch.Tensor:
         """``stride`` is the query and key row pitch, for when they are column
-        slices of a wider buffer that one GEMM produced."""
+        slices of a wider buffer that one GEMM produced. ``value_stride`` says
+        the same of the value and, by being non-zero, that the value is in the
+        layout the projection wrote rather than transposed."""
         stride = self.width if stride is None else int(stride)
+        value_stride = int(value_stride)
         for tensor, rows in ((query, self.rows), (key, self.columns)):
             if (tensor.dtype != torch.bfloat16 or tensor.shape[0] != rows
                     or tensor.shape[-1] != self.width or tensor.stride(0) != stride
@@ -122,17 +130,25 @@ class DitAttention:
                     f"native DiT attention expects a BF16 {rows}x{self.width} "
                     f"operand of row pitch {stride} on {self.out.device}; pad with "
                     "DitAttention.buffers()")
-        if (value_t.dtype != torch.bfloat16 or not value_t.is_contiguous()
-                or tuple(value_t.shape) != (self.width, self.columns)
-                or value_t.device != self.out.device):
+        if value_stride:
+            if (value.dtype != torch.bfloat16
+                    or tuple(value.shape) != (self.columns, self.width)
+                    or value.stride(0) != value_stride or value.stride(1) != 1
+                    or value.device != self.out.device):
+                raise ValueError(
+                    f"native DiT attention expects a BF16 {self.columns}x{self.width} "
+                    f"value of row pitch {value_stride} on {self.out.device}")
+        elif (value.dtype != torch.bfloat16 or not value.is_contiguous()
+                or tuple(value.shape) != (self.width, self.columns)
+                or value.device != self.out.device):
             raise ValueError(
                 "native DiT attention expects a contiguous BF16 transposed value")
         code = self.library.launch(
             torch.npu.current_stream(self.out.device).npu_stream,
-            query.data_ptr(), key.data_ptr(), value_t.data_ptr(), self.out.data_ptr(),
+            query.data_ptr(), key.data_ptr(), value.data_ptr(), self.out.data_ptr(),
             self.scores.data_ptr(), self.probs.data_ptr(), self.context.data_ptr(),
             self.heads, self.queries, self.keys, self.head_dim, self.cores, stride,
-            self.scale)
+            value_stride, self.scale)
         if code:
             raise RuntimeError(f"native DiT attention rejected arguments: {code}")
         return self.out

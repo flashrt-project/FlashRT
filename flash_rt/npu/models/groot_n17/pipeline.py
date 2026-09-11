@@ -126,18 +126,19 @@ def attention(query, key, value, heads, head_dim):
 class DitAttentionSite:
     """One DiT attention geometry: the native kernel plus its operand buffers.
 
-    The kernel wants three things the projections do not produce on their own.
-    Query rows are padded to the fractal, key rows are padded *with zeros* --
-    a padded key has to score exactly zero for the kernel's closed-form
-    padding correction to hold -- and the value arrives transposed, as
-    ``(heads * head_dim, keys)``, because a raw ``Mmad`` B operand takes its
-    source in ``(N, K)`` form.
+    The kernel wants two things the projections do not produce on their own.
+    Query rows are padded to the fractal, and key rows are padded *with zeros*
+    -- a padded key has to score exactly zero for the kernel's closed-form
+    padding correction to hold. Neither costs a kernel: the projections write
+    into their padded buffers directly through ``addmm``'s ``out``, and the
+    padding, written once at allocation, is never touched again.
 
-    None of that costs a kernel except the value's permute: the query and key
-    projections write into their padded buffers directly through ``addmm``'s
-    ``out``, and the padding, written once at allocation, is never touched
-    again. A cross-attention layer's key and value are frame constants, so its
-    permute runs once a frame rather than once a step.
+    The value is the third operand and it goes in whichever way is free. A
+    cross-attention layer's value is a frame constant, so it is transposed once
+    a frame into the ``(heads * head_dim, keys)`` form the B operand takes
+    directly. A self-attention layer's is not, and slicing and permuting it
+    cost 17 us a layer for 147 KB, so it goes in as the projection wrote it and
+    the kernel transposes it between L1 and L0B.
     """
 
     def __init__(self, queries: int, keys: int, device):
@@ -183,18 +184,23 @@ class DitAttentionSite:
         return value.t().contiguous()
 
     def fused_into(self, weight, x, bias):
-        """One projection for query, key and value, read back as three slices."""
+        """One projection for query, key and value, read back as three slices.
+
+        All three slices stay in place. The value used to be permuted out of
+        this buffer for the kernel's B operand, which is a slice and a transpose
+        -- 3.6 and 13.8 us at 48 by 1536, both of them fixed cost -- and the
+        kernel now transposes it on the way into L0B instead.
+        """
         torch.addmm(bias, x.reshape(-1, x.shape[-1]), weight.tensor,
                     out=self.fused[:self.queries])
         width = self.width
-        value = self.fused[:, 2 * width:]
         return (self.fused[:, :width], self.fused[:, width:2 * width],
-                value.t().contiguous())
+                self.fused[:, 2 * width:])
 
-    def __call__(self, key, value_t, query=None, stride=None):
+    def __call__(self, key, value, query=None, stride=None, value_stride=0):
         query = self.query if query is None else query
-        return self.kernel(query, key, value_t,
-                           stride)[:self.queries].unsqueeze(0)
+        return self.kernel(query, key, value, stride,
+                           value_stride)[:self.queries].unsqueeze(0)
 
 
 def _timestep_projection(steps: int, channels: int = 256,
@@ -476,8 +482,9 @@ def dit_layer(bound: BoundChain, index: int, step: int, x: torch.Tensor,
         a = site(key, value_t)
     else:
         site = bound.site(h.shape[-2])
-        query, key, value_t = site.fused_into(layer["qkv"][0], h, layer["qkv"][1])
-        a = site(key, value_t, query=query, stride=3 * site.width)
+        query, key, value = site.fused_into(layer["qkv"][0], h, layer["qkv"][1])
+        pitch = 3 * site.width
+        a = site(key, value, query=query, stride=pitch, value_stride=pitch)
     h, x = add_norm(x, layer["o"][0](a, layer["o"][1]), bound.unit, bound.zero, EPS)
     h = F.gelu(layer["ff1"][0](h, layer["ff1"][1]), approximate="tanh")
     branch = layer["ff2"][0](h, layer["ff2"][1])

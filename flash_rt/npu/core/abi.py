@@ -16,7 +16,7 @@ import ctypes as C
 
 # Bumped whenever an exported entry point's signature or contract changes.
 # ``scripts/npu/build.sh`` compiles the same number into every shared object.
-ABI_VERSION = 1
+ABI_VERSION = 2
 
 # The only part these kernels are validated for. The host tiling names it and
 # several kernels divide work by its twenty cube cores.

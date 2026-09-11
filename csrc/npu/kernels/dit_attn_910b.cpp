@@ -12,17 +12,19 @@
 //     S = Q(Sq,HD) * K(Skv,HD)^T ;  P = softmax(S*scale) ;  O = P * V(Skv,HD)
 //
 // Both GEMMs drive Mmad directly. A raw B operand takes its L1 source in (N,K)
-// form, which K already is as the projection writes it, and which V is only if
-// V arrives transposed -- so the caller hands V in as (heads*HD, Skv). That
-// costs the caller nothing where V is a frame constant, which is every
-// cross-attention layer.
+// form, which K already is as the projection writes it. V is not, and it comes
+// in either way: transposed to (heads*HD, Skv), which costs nothing where V is
+// a frame constant, or row major with a pitch, which the load from L1 to L0B
+// transposes on the way. Producing the transposed form for a value that is not
+// a frame constant cost a slice and a permute -- 17 us a layer for 147 KB --
+// and the transposed load costs one more load index.
 //
 // Every extent the cube sees is 16-aligned and every byte of that alignment is
 // a real zero the caller wrote. That is not fussiness: Nd2Nz fills only the
 // rows it is given, so a buffer padded to the fractal by the *kernel* leaves
 // uninitialised L1 in the tail, which the Mmad then reads. So the caller hands
-// in Q padded to Sq16 rows, K padded to Skv16 rows and V^T padded to Skv16
-// columns, all zero past the live extent, and the probability plane is
+// in Q padded to Sq16 rows, K padded to Skv16 rows and V padded to Skv16 along
+// the key axis, all zero past the live extent, and the probability plane is
 // allocated zero and only ever written over the live keys.
 //
 // Padding is then arithmetic rather than masking: a zero key scores zero, takes
@@ -181,7 +183,8 @@ __aicore__ inline void LoadA(const LocalTensor<T>& dst, const LocalTensor<T>& sr
 __global__ __aicore__ void dit_attn_kernel(GM_ADDR q, GM_ADDR k, GM_ADDR vt, GM_ADDR out,
                                            GM_ADDR scores, GM_ADDR probs, GM_ADDR ctx,
                                            int heads, int sq, int skv, int hd,
-                                           int stride, float scale, uint64_t sync) {
+                                           int stride, int vstride, float scale,
+                                           uint64_t sync) {
     using namespace flashrt_dit_attn;
     SetSyncBaseAddr(sync);
     TPipe pipe;
@@ -285,17 +288,48 @@ __global__ __aicore__ void dit_attn_kernel(GM_ADDR q, GM_ADDR k, GM_ADDR vt, GM_
             p2 = a2q.DeQue<bfloat16_t>();
             a1q.FreeTensor(p1);
 
-            // V arrives transposed, so this tile is the (N, K) source the B
-            // operand wants with nothing to convert.
+            // Two ways in, and which one the caller chose is `vstride`.
+            //
+            // Transposed, as (heads * HD, Skv): the tile is already the (N, K)
+            // source the B operand wants and a flat load finishes it. That is
+            // what a cross-attention layer hands in, because its value is a
+            // frame constant and the permute runs once rather than once a step.
+            //
+            // Row major, as (Skv, heads * HD) with a pitch: this is the value
+            // exactly as the projection wrote it, and the transpose happens on
+            // the way from L1 to L0B. A self-attention layer's value is not a
+            // frame constant, and producing the transposed form for it cost a
+            // slice and a permute -- 17 us a layer for 147 KB, because at this
+            // size both are fixed cost. Here it costs one more load index.
             auto v1 = b1q.AllocTensor<bfloat16_t>();
-            DataCopy(v1, vg[(uint32_t)h * hd * skv16],
-                     Nd2NzParams{1, (uint16_t)hd, (uint16_t)skv16, 0, (uint16_t)skv16,
-                                 (uint16_t)hd, 1, 0});
-            b1q.EnQue(v1);
-            v1 = b1q.DeQue<bfloat16_t>();
             auto v2 = b2q.AllocTensor<bfloat16_t>();
-            LoadData(v2, v1, LoadData2DParams{0, (uint8_t)((hd / 16) * (skv16 / 16)), 1, 0,
-                                              0, false, 0});
+            if (vstride > 0) {
+                DataCopy(v1, vg[(uint32_t)h * hd],
+                         Nd2NzParams{1, (uint16_t)skv16, (uint16_t)hd, 0,
+                                     (uint16_t)vstride, (uint16_t)skv16, 1, 0});
+                b1q.EnQue(v1);
+                v1 = b1q.DeQue<bfloat16_t>();
+                // L1 holds (Skv, HD) as fractals ordered column-block first, so
+                // fractal (d, n) is at d * (Skv16 / 16) + n. L0B wants them
+                // ordered by the reduction axis with each one transposed, which
+                // is a load per key block walking the d axis with that stride.
+                const int kblocks = skv16 / 16;
+                const int nblocks = hd / 16;
+                for (int kb = 0; kb < kblocks; ++kb) {
+                    LoadDataWithTranspose(
+                        v2[(uint32_t)kb * nblocks * 256], v1,
+                        LoadData2dTransposeParams{(uint16_t)kb, (uint8_t)nblocks,
+                                                  (uint16_t)kblocks, 0, 0});
+                }
+            } else {
+                DataCopy(v1, vg[(uint32_t)h * hd * skv16],
+                         Nd2NzParams{1, (uint16_t)hd, (uint16_t)skv16, 0, (uint16_t)skv16,
+                                     (uint16_t)hd, 1, 0});
+                b1q.EnQue(v1);
+                v1 = b1q.DeQue<bfloat16_t>();
+                LoadData(v2, v1, LoadData2DParams{0, (uint8_t)((hd / 16) * (skv16 / 16)),
+                                                  1, 0, 0, false, 0});
+            }
             b2q.EnQue(v2);
             v2 = b2q.DeQue<bfloat16_t>();
             b1q.FreeTensor(v1);
@@ -413,13 +447,14 @@ extern "C" int rtGetC2cCtrlAddr(uint64_t*, uint32_t*);
 extern "C" int flashrt_npu_dit_attn(void* stream, void* q, void* k, void* vt, void* out,
                                     void* scores, void* probs, void* ctx,
                                     int heads, int sq, int skv, int hd, int cores,
-                                    int stride, float scale) {
+                                    int stride, int vstride, float scale) {
     using namespace flashrt_dit_attn;
     if (!stream || !q || !k || !vt || !out || !scores || !probs || !ctx) { return 1; }
     if (heads <= 0 || heads > 128 || hd <= 0 || hd % MBLK || hd > MAX_HD) { return 2; }
     if (sq <= 0 || sq > 512 || skv <= 0 || skv > MAX_SKV) { return 3; }
     if (cores <= 0 || cores > 20 || cores > heads) { return 4; }
     if (stride < heads * hd) { return 11; }
+    if (vstride && vstride < heads * hd) { return 12; }
     // The whole head lives in L0 untiled, which is what makes this kernel worth
     // writing; a geometry that does not fit is refused rather than silently
     // producing a result the accumulator could not have held.
@@ -439,7 +474,8 @@ extern "C" int flashrt_npu_dit_attn(void* stream, void* q, void* k, void* vt, vo
     if (rc) { return rc; }
     dit_attn_kernel<<<cores, nullptr, stream>>>(
         (uint8_t*)q, (uint8_t*)k, (uint8_t*)vt, (uint8_t*)out, (uint8_t*)scores,
-        (uint8_t*)probs, (uint8_t*)ctx, heads, sq, skv, hd, stride, scale, sync);
+        (uint8_t*)probs, (uint8_t*)ctx, heads, sq, skv, hd, stride, vstride, scale,
+        sync);
     return 0;
 }
 
