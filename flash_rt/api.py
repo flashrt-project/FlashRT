@@ -460,9 +460,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         awq_alpha: AWQ activation scaling exponent. ``None`` selects 0.8 for
             the encoder-FP4 + decoder-FP4 preset and 0.5 otherwise.
         encoder_p1_combiner: FP4 encoder split-GU combiner. ``None`` resolves
-            to the preset: ``"epilogue_hw"`` (fused GeGLU epilogue) with
-            ``use_fp4_decoder=True``, ``"lut_native"`` otherwise.
-            ``"direct"``, ``"lut"`` and ``"epilogue"`` remain available for
+            to the preset: ``"epilogue_hw_nod"`` (fused GeGLU epilogue with
+            the collective's D store elided) with ``use_fp4_decoder=True``,
+            ``"lut_native"`` otherwise. ``"direct"``, ``"lut"``,
+            ``"epilogue"`` and ``"epilogue_hw"`` remain available for
             explicit A/B runs.
         encoder_down_variant: Cutlass NVFP4 encoder Down GEMM variant
             (production default ``7``).
@@ -653,7 +654,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         if use_fp4_siglip_ffn is None:
             use_fp4_siglip_ffn = bool(use_fp4_decoder)
         if encoder_p1_combiner is None:
-            encoder_p1_combiner = ("epilogue_hw" if use_fp4_decoder
+            encoder_p1_combiner = ("epilogue_hw_nod" if use_fp4_decoder
                                    else "lut_native")
     else:
         if fp4_layers is None:

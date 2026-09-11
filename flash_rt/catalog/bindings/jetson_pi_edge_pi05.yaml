@@ -1,0 +1,97 @@
+binding: jetson_pi_edge_pi05
+structure: vla_tick_pipeline
+
+# Host: ggml/llama.cpp server (PKU-SEC-Lab/Jetson-PI-Edge fork) running pi0.5
+# on Jetson AGX Thor (SM110) with the native ggml adapter
+# (the FlashRT-llama.cpp overlay). Structure regions execute as fused
+# subgraph windows matched inside ggml-cuda's graph evaluation; the mapping
+# below is window <-> catalog structure.
+
+stages:
+  obs_encode:
+    seam: "clip batched ViT encode (SigLIP graph) + llama_encode prefix"
+    capture: cuda_graphs_keyed   # llama.cpp keyed multi-graph CUDA graphs
+    outputs:
+      cond_features: "prefix KV cache + device-resident image embeddings"
+  action_denoise:
+    seam: "llama_decode denoise loop over the pi0 action-expert stack"
+    loop_steps: 10
+    noise_window: "seeded host-side noise tensor (PI0 seed window)"
+    capture: cuda_graphs_keyed
+
+cadences:
+  observation: obs_encode
+  tick: [obs_encode, action_denoise]
+  replan: action_denoise
+
+coverage:
+  contract: complete_hot_path
+  hot_path:
+    - observation_inputs
+    - vision_encoder
+    - vision_projection
+    - image_embd_residency
+    - prefix_prefill
+    - prefix_kv
+    - denoise_control
+    - timestep_conditioning
+    - action_expert_transformer
+    - euler_update
+    - action_readout
+  segments:
+    - name: observation_inputs
+      stage: obs_encode
+      classification: host_stage
+      seam: "mtmd bitmap load, patchify, and state ingestion"
+    - name: vision_encoder
+      stage: obs_encode
+      classification: structure
+      seam: "SigLIP tower graph (flash-attention path, padded heads baked into repacked weights)"
+      structures: [vision_ffn, qkv_pack, attention_core, linear_proj]
+    - name: vision_projection
+      stage: obs_encode
+      classification: structure
+      seam: "multimodal projector head"
+      structures: [linear_proj]
+    - name: image_embd_residency
+      stage: obs_encode
+      classification: state_region
+      seam: "device-resident image embeddings (D2D into a persistent buffer, no host round-trip)"
+      structures: [cadence_static]
+    - name: prefix_prefill
+      stage: obs_encode
+      classification: structure
+      seam: "llama_encode over the prefix backbone layers"
+      structures: [decoder_ffn, qkv_pack, attention_core, linear_proj]
+    - name: prefix_kv
+      stage: obs_encode
+      classification: state_region
+      seam: "persistent prefix KV cache reused across denoise steps"
+      structures: [cadence_static]
+    - name: denoise_control
+      stage: action_denoise
+      classification: control
+      seam: "per-step row-index upload and loop synchronization"
+    - name: timestep_conditioning
+      stage: action_denoise
+      classification: state_region
+      seam: "precomputed per-step modulation table, selected by row indices in-graph"
+      structures: [adaln_producer]
+    - name: action_expert_transformer
+      stage: action_denoise
+      classification: structure
+      seam: "action-expert decoder layers (modulated norms, fused QKV+RoPE, GeGLU FFN, gated residuals)"
+      structures: [modnorm_qkv_chain, qkv_pack, attention_core, decoder_ffn,
+                   linear_proj, norm_fused, adaln_producer]
+    - name: euler_update
+      stage: action_denoise
+      classification: host_stage
+      seam: "host-side Euler integration between denoise steps"
+    - name: action_readout
+      stage: action_denoise
+      classification: host_stage
+      seam: "action chunk fetch and denormalization"
+
+hosts:
+  jetson_pi_edge:
+    versions: "feat/flashrt-thor-kernels"

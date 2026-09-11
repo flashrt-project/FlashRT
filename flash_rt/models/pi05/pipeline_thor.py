@@ -287,6 +287,7 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
     act_format = str(dims.get('act_format', 'nvfp4'))
     rht = 1 if dims.get('rht') else 0
     fused_geglu = bool(dims.get('fused_geglu')) and weight_format == 'nvfp4'
+    fused_geglu_nod = bool(dims.get('fused_geglu_nod')) and fused_geglu
     act_e0m3 = act_format == 'e0m3'
     if act_format not in ('nvfp4', 'e0m3'):
         raise ValueError(
@@ -429,7 +430,10 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
                 # gelu(gate)*up per column pair and writes the Down input
                 # (hid_fp4/hid_sfa) directly; the gate_up fp16 output and
                 # the GeGLU-quantize kernel disappear.
-                rc = fvk_fp4.cutlass_fp4_gemm_geglu_il_hw_v10(
+                geglu_v10 = (fvk_fp4.cutlass_fp4_gemm_geglu_il_hw_nod_v10
+                             if fused_geglu_nod
+                             else fvk_fp4.cutlass_fp4_gemm_geglu_il_hw_v10)
+                rc = geglu_v10(
                     xn_fp4, xn_sfa,
                     weights['gwil_fp4'][l], weights['gwil_sfb'][l],
                     weights['gu_dummy'], hid_fp4, hid_sfa,

@@ -10,7 +10,7 @@ This package holds only the specifications and their loaders. It carries
 no kernels, no host adapters and no runtime machinery, and is readable
 without torch. Its consumers are:
 
-- the native ggml host adapter (``hosts/ggml``), whose qualification
+- the native ggml host adapter (FlashRT-llama.cpp), whose qualification
   gates check a binding against the catalog;
 - the runtime exporters, which serialise ``BindingSpec.manifest()``;
 - the FlashRT-Structures package, which attaches structures onto an

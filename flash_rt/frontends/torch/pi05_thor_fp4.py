@@ -84,7 +84,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  awq_alpha: float = 0.5,
                  awq_calib_iters: int = 8,
                  use_p1_split_gu: bool = False,
-                 encoder_p1_combiner: str = "epilogue_hw",
+                 encoder_p1_combiner: str = "epilogue_hw_nod",
                  encoder_down_variant: int = 7,
                  encoder_down_x_variant: int = 6,
                  decoder_qkv_variant: int = 10,
@@ -95,6 +95,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  decoder_act_format: str = "nvfp4",
                  decoder_fused_attn: bool = False,
                  decoder_fused_geglu: bool = True,
+                 decoder_fused_geglu_nod: bool = False,
                  decoder_rht: bool = False,
                  use_fp8: bool = True,
                  state_prompt_mode: str = "exact",
@@ -147,11 +148,12 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                 "fp4_layers contains non-live encoder FFN layers "
                 f"{invalid_layers}; valid layers are [0, {self.Le - 2}]")
         if encoder_p1_combiner not in ("direct", "lut", "lut_native",
-                                       "epilogue", "epilogue_hw"):
+                                       "epilogue", "epilogue_hw",
+                                       "epilogue_hw_nod"):
             raise ValueError(
                 "encoder_p1_combiner must be 'direct', 'lut', "
-                "'lut_native', 'epilogue', or 'epilogue_hw', got "
-                f"{encoder_p1_combiner!r}")
+                "'lut_native', 'epilogue', 'epilogue_hw', or "
+                f"'epilogue_hw_nod', got {encoder_p1_combiner!r}")
         self.encoder_p1_combiner = encoder_p1_combiner
         self.encoder_down_variant = int(encoder_down_variant)
         # Tile variant for the K-expanded Down GEMM of the 'epilogue' P1
@@ -189,6 +191,10 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         # the gate_up GEMM + GeGLU-quantize kernel (nvfp4 weights only).
         self.decoder_fused_geglu = (bool(decoder_fused_geglu)
                                     and decoder_weight_format == 'nvfp4')
+        # No-D-store variant of the fused decoder GeGLU (same contract,
+        # the collective's own D store elided).
+        self.decoder_fused_geglu_nod = (bool(decoder_fused_geglu_nod)
+                                        and self.decoder_fused_geglu)
 
         if self._fp4_layers:
             if not _HAS_FP4:
@@ -639,7 +645,8 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                     g_fp16 = gu_fp16[:He, :].contiguous()
                     u_fp16 = gu_fp16[He:, :].contiguous()
                     if self.encoder_p1_combiner in ('epilogue',
-                                                    'epilogue_hw'):
+                                                    'epilogue_hw',
+                                                    'epilogue_hw_nod'):
                         # Fused-epilogue paths: single interleaved gate/up
                         # weight (down AWQ inv_s folded into the up rows).
                         # Full-width 'epilogue' additionally needs the
@@ -1119,9 +1126,12 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                 # Fused-epilogue path: one full-width [Se, 2H] FP4 buffer
                 # between the interleaved GEMM and the K-expanded Down.
                 self._fp4_p1_il = FP4Buffer(Se, 2 * He, device='cuda')
-            elif self.encoder_p1_combiner == 'epilogue_hw':
+            elif self.encoder_p1_combiner in ('epilogue_hw',
+                                              'epilogue_hw_nod'):
                 # Half-width path writes Down's stock input scratch; the
-                # collective's D output lands in this reusable dummy.
+                # collective's D output lands in this reusable dummy
+                # ('epilogue_hw_nod' never writes it but the host-side TMA
+                # descriptor still needs a real pointer).
                 self._fp4_p1_dummy = torch.zeros(
                     Se, He, dtype=torch.uint8, device='cuda')
             else:
@@ -1150,7 +1160,8 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                 self._fp4_scratch_dict['p1_il_p4']  = self._fp4_p1_il.packed.data_ptr()
                 self._fp4_scratch_dict['p1_il_sfa'] = self._fp4_p1_il.sfa.data_ptr()
                 self._fp4_scratch_dict['variant_dn_x'] = self.encoder_down_x_variant
-            elif self.encoder_p1_combiner == 'epilogue_hw':
+            elif self.encoder_p1_combiner in ('epilogue_hw',
+                                              'epilogue_hw_nod'):
                 self._fp4_scratch_dict['p1_dummy'] = self._fp4_p1_dummy.data_ptr()
             else:
                 self._fp4_scratch_dict['p1_gate_p4']  = self._fp4_p1_gate.packed.data_ptr()
@@ -1402,6 +1413,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
             ae_dims['act_format'] = self.decoder_act_format
             ae_dims['rht'] = self.decoder_rht
             ae_dims['fused_geglu'] = self.decoder_fused_geglu
+            ae_dims['fused_geglu_nod'] = self.decoder_fused_geglu_nod
             if self._attn is not None:
                 # Fold the decoder seqused mask into the softmax kernel.
                 self._attn.use_fused_softmax = self.decoder_fused_attn
