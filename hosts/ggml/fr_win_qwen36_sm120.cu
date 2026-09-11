@@ -29,7 +29,7 @@
 #include "../../csrc/kernels/fp4_w4a4_mma_warpsplit_mrows_f32out_sm120.cuh"
 
 // Model-specific constants come from the binding (single source:
-// flash_rt/structures/bindings/llamacpp_qwen36_35b_sm120.yaml); regenerate
+// flash_rt/catalog/bindings/llamacpp_qwen36_35b_sm120.yaml); regenerate
 // the header with tools/gen_binding_header.py after editing the binding.
 #include "fr_binding_qwen36_35b_sm120.h"
 

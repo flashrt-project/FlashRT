@@ -38,8 +38,8 @@ _REPO = _HERE.parents[2]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from flash_rt.structures.binding import load_binding          # noqa: E402
-from flash_rt.structures.registry import load as load_structure  # noqa: E402
+from flash_rt.catalog.binding import load_binding          # noqa: E402
+from flash_rt.catalog.registry import load as load_structure  # noqa: E402
 
 GOLDEN = _HERE / "goldens" / "pi05_thor_action.json"
 

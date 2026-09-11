@@ -19,7 +19,7 @@ Documentation:
 
 ## What it is
 
-The adapter is the third host of the `flash_rt/structures` catalog. The
+The adapter is the native host of the `flash_rt/catalog` structure catalog. The
 same structures that the torch frontend and the vllm/sglang adapters
 consume — block-scaled NVFP4 GEMMs with fused epilogues, fused
 norm/modulation producers, the decomposed tiny-M decode attention, the
@@ -49,7 +49,7 @@ through pattern-matched subgraph windows. Heavy math is single-source:
 - `fa4_aot/` — AOT FlashAttention-4 modules (vision and prefill shapes)
   plus their regeneration script and provenance notes.
 - `qualification/` — the release gates (see TESTING.md).
-- `flash_rt/structures/bindings/jetson_pi_edge_pi05.yaml` — the pipeline binding that
+- `flash_rt/catalog/bindings/jetson_pi_edge_pi05.yaml` — the pipeline binding that
   maps the host's hot path onto catalog structures under the
   complete-hot-path contract.
 
@@ -84,5 +84,5 @@ the ggml-facing half by construction. Windows are M<=4 aware (speculative
 verify batches) and carry the recurrent-state snapshot/checkpoint discipline
 documented in DEVELOPMENT.md.
 
-Binding: `flash_rt/structures/bindings/llamacpp_qwen36_35b_sm120.yaml`;
+Binding: `flash_rt/catalog/bindings/llamacpp_qwen36_35b_sm120.yaml`;
 gates: `qualification/pins_qwen36_sm120.yaml`.

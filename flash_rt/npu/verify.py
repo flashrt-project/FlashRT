@@ -50,15 +50,15 @@ def pinned_noise(seed: int = 1) -> np.ndarray:
 def parity_metrics(a: np.ndarray, b: np.ndarray) -> dict[str, float]:
     """Official FlashRT judge on numpy arrays.
 
-    Delegates to ``flash_rt.structures.gates.parity_metrics`` (the repo's
+    Delegates to ``flash_rt.core.parity.parity_metrics`` (the repo's
     single source of accuracy math) so the NPU gates reuse the same
-    cosine / max_abs / p99_abs the structures layer ships, instead of a
-    private third copy of the formula. Returns ``{"cosine", "max_abs",
+    cosine / max_abs / p99_abs the structures layer judges with, instead
+    of a private third copy of the formula. Returns ``{"cosine", "max_abs",
     "p99_abs"}``; a fusion change must clear cosine >= 0.9999 with the
     error metrics available for localising a regression.
     """
     import torch
-    from flash_rt.structures.gates import parity_metrics as _judge
+    from flash_rt.core.parity import parity_metrics as _judge
     got = torch.as_tensor(np.asarray(a, dtype=np.float64))
     want = torch.as_tensor(np.asarray(b, dtype=np.float64))
     return _judge(got, want)
