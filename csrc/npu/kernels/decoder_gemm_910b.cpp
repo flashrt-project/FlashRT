@@ -168,3 +168,5 @@ extern "C" int flashrt_npu_decoder_gemm(void* stream, void* a, void* b, void* de
         grain > 0 ? grain : WRITE_GRAIN, nzout);
     return 0;
 }
+
+#include "../abi.h"

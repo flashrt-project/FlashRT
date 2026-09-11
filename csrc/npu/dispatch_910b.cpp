@@ -12,6 +12,4 @@
 #include "kernels/decoder_int8_910b.cpp"
 #include "kernels/decoder_vt_910b.cpp"
 
-extern "C" const char* flashrt_npu_soc_version() {
-    return FLASHRT_NPU_SOC_VERSION;
-}
+#include "abi.h"

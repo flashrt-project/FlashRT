@@ -275,3 +275,5 @@ extern "C" int flashrt_npu_decode_attn(void* stream, void* q, void* k, void* vnz
         (uint8_t*)probs, (uint8_t*)ctx, lo, hi, end, kvp, scale, sync);
     return 0;
 }
+
+#include "../abi.h"

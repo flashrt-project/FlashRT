@@ -13,6 +13,8 @@ class _NativeLibrary:
             self.library = C.CDLL(str(path))
         except OSError as exc:
             raise ImportError("Build the Ascend kernels with scripts/npu/build.sh before NPU graph construction") from exc
+        from flash_rt.npu.core import abi
+        abi.verify(self.library, "dispatch")
 
 
 class RowQuantizer(_NativeLibrary):

@@ -31,6 +31,11 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+# Precision tiers load_model() accepts. Backend-neutral on purpose: a caller
+# asks for a tier, and the selected frontend either has it or the call fails.
+_PRECISION_TIERS = ("auto", "bf16", "int8", "fp8")
+
+
 class VLAModel:
     """Unified VLA inference model. Wraps ThorPipelineTorch or ThorPipelineJax."""
 
@@ -338,6 +343,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                use_fp8=True,
                state_prompt_mode="exact",
                state_prompt_fixed_max_len=None,
+               precision="auto",
                *,
                mmproj_path=None,
                backend="cpu",
@@ -461,6 +467,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             (production default ``7``).
         decoder_gate_up_variant: Cutlass NVFP4 decoder Gate+Up GEMM variant
             (production default ``10``).
+        precision: Execution tier, one of ``"auto"`` (each frontend's own
+            default), ``"bf16"``, ``"int8"`` or ``"fp8"``. Backend-neutral:
+            the tier is forwarded to the selected frontend and the call fails
+            if that frontend has no such tier, rather than silently running
+            something else. ``"int8"`` on Ascend selects the frozen static
+            INT8 encoder/decoder tier, which must then be given real data
+            through :meth:`VLAModel.calibrate` before the first ``predict()``.
         use_fp8: Enable FP8 execution where the selected frontend supports
             an FP8/BF16 switch. Defaults to True to preserve existing
             performance-oriented behavior.
@@ -696,8 +709,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 "cmake --build build-amd -j\n"
                 "See docs/deployment_amd.md.") from exc
     elif arch == "npu":
-        # Ascend NPU backend runs on torch_npu ops (aclnn); no C++
-        # extension is built or required. 910/A2+ parts have no FP8
+        # Ascend NPU backend runs on torch_npu ops (aclnn) plus this repo's own
+        # CCE kernels. No root CMake target and no PyTorch C++ extension is
+        # involved, but the standalone Ascend shared objects do have to be
+        # built first with scripts/npu/build.sh. 910/A2+ parts have no FP8
         # tensor hardware, so the default use_fp8=True is coerced to the
         # BF16 tier with a warning rather than silently executing a
         # precision the part cannot honour.
@@ -711,9 +726,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 "hardware='npu'.") from exc
         if use_fp8:
             use_fp8 = False
-            logger.warning(
-                "Ascend NPU backend: FP8 is not available on 910/A2 parts "
-                "(no FP8 tensor hardware); falling back to the BF16 tier.")
+            if precision == "auto":
+                logger.warning(
+                    "Ascend NPU backend: FP8 is not available on 910/A2 parts "
+                    "(no FP8 tensor hardware); falling back to the BF16 tier.")
     else:
         from flash_rt import _extensions
         _extensions.require(config=config)
@@ -983,6 +999,24 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         kwargs["hardware"] = arch
     if "use_fp8" in sig.parameters:
         kwargs["use_fp8"] = use_fp8
+    # Precision tier, generic across backends rather than one flag per part.
+    # "auto" leaves every frontend on its own default, which is what callers
+    # got before this parameter existed. A named tier is forwarded to the
+    # frontend that can honour it and refused where none can: a request for
+    # INT8 that quietly ran BF16 would be measured as a regression and
+    # reported as a win.
+    if precision not in _PRECISION_TIERS:
+        raise ValueError(
+            f"precision must be one of {sorted(_PRECISION_TIERS)}, got {precision!r}")
+    if precision != "auto":
+        wants = {"int8": "use_int8", "fp8": "use_fp8"}.get(precision)
+        if wants is not None and wants not in sig.parameters:
+            raise ValueError(
+                f"{pipe_cls.__name__} (config={config}, arch={arch}) has no "
+                f"{precision} tier; it accepts precision='auto' or 'bf16'")
+        for flag, tier in (("use_int8", "int8"), ("use_fp8", "fp8")):
+            if flag in sig.parameters:
+                kwargs[flag] = precision == tier
     if use_fa4 and "use_fa4" in sig.parameters:
         kwargs["use_fa4"] = True
     if config == "pi0fast":

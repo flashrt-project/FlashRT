@@ -9,7 +9,14 @@ class GuLibrary:
     def __init__(self):
         path = os.environ.get('FLASHRT_NPU_CUBE_LIBRARY')
         path = path or Path(__file__).parents[1] / 'lib' / 'libflashrt_npu_cube.so'
-        self.library = C.CDLL(str(path))
+        try:
+            self.library = C.CDLL(str(path))
+        except OSError as exc:
+            raise ImportError(
+                'Build the Ascend kernels with scripts/npu/build.sh before NPU '
+                'graph construction') from exc
+        from flash_rt.npu.core import abi
+        abi.verify(self.library, 'gate/up cube')
         self.launch = self.library.flashrt_npu_gu_int8
         self.launch.argtypes = [C.c_void_p] * 10 + [C.c_int] * 3
         self.launch.restype = C.c_int
