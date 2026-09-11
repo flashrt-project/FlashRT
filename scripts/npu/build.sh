@@ -74,3 +74,17 @@ c++ -c -fPIC -O2 -std=c++17 \
  "$npu_repo_root/csrc/npu/kernels/decode_attn_910b.cpp" \
  -L"$npu_arch_root/lib64" -lascendalog -lruntime -ldl \
  -o "$npu_output_dir/libflashrt_npu_attn.so"
+# The DiT attention kernel is a second mixed unit: same reason as above, it
+# cannot share a translation unit with a cube-only one nor a library with any
+# other kernel unit.
+"$npu_toolkit_root/bin/bisheng" -fPIC -shared -xcce -O2 -std=c++17 \
+ --cce-aicore-arch=dav-c220 "${npu_abi_defines[@]}" \
+ -I"$npu_arch_root/asc/include" -I"$npu_arch_root/asc/include/adv_api" \
+ -I"$npu_arch_root/asc" -I"$npu_arch_root/asc/impl/basic_api" \
+ -I"$npu_arch_root/asc/impl/adv_api" -I"$npu_arch_root/include" \
+ -I"$npu_toolkit_root/compiler/tikcpp/tikcfw" \
+ -I"$npu_toolkit_root/compiler/tikcpp/tikcfw/impl" \
+ -I"$npu_toolkit_root/compiler/tikcpp/tikcfw/interface" \
+ "$npu_repo_root/csrc/npu/kernels/dit_attn_910b.cpp" \
+ -L"$npu_arch_root/lib64" -lascendalog -lruntime -ldl \
+ -o "$npu_output_dir/libflashrt_npu_dit_attn.so"

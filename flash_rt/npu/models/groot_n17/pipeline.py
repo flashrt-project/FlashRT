@@ -63,6 +63,7 @@ import torch
 import torch.nn.functional as F
 
 from flash_rt.npu.core.linear import NzBf16Weight
+from flash_rt.npu.models.groot_n17.attention import DitAttention
 
 # Geometry. These are the shipped GR00T-N1.7-3B configuration; the frontend
 # checks the checkpoint's own config against them rather than assuming.
@@ -119,6 +120,62 @@ def attention(query, key, value, heads, head_dim):
         query, key, value, num_heads=heads, num_key_value_heads=heads,
         scale_value=head_dim ** -0.5, input_layout="BSH",
         pre_tokens=_INT_MAX, next_tokens=_INT_MAX, sparse_mode=0)
+
+
+class DitAttentionSite:
+    """One DiT attention geometry: the native kernel plus its operand buffers.
+
+    The kernel wants three things the projections do not produce on their own.
+    Query rows are padded to the fractal, key rows are padded *with zeros* --
+    a padded key has to score exactly zero for the kernel's closed-form
+    padding correction to hold -- and the value arrives transposed, as
+    ``(heads * head_dim, keys)``, because a raw ``Mmad`` B operand takes its
+    source in ``(N, K)`` form.
+
+    None of that costs a kernel except the value's permute: the query and key
+    projections write into their padded buffers directly through ``addmm``'s
+    ``out``, and the padding, written once at allocation, is never touched
+    again. A cross-attention layer's key and value are frame constants, so its
+    permute runs once a frame rather than once a step.
+    """
+
+    def __init__(self, queries: int, keys: int, device):
+        self.kernel = DitAttention(DIT_HEADS, queries, keys, DIT_HEAD_DIM, device=device)
+        self.queries, self.keys = int(queries), int(keys)
+        self.rows, self.columns = self.kernel.rows, self.kernel.columns
+        self.width, self.device = self.kernel.width, device
+        self.query = torch.zeros(self.rows, self.width, dtype=torch.bfloat16,
+                                 device=device)
+        self.self_key, self.self_value = self.key_buffers()
+
+    def key_buffers(self):
+        """Zero-padded key and value buffers for one layer."""
+        return tuple(torch.zeros(self.columns, self.width, dtype=torch.bfloat16,
+                                 device=self.device) for _ in range(2))
+
+    def query_into(self, weight, x, bias):
+        torch.addmm(bias, x.reshape(-1, x.shape[-1]), weight.tensor,
+                    out=self.query[:self.queries])
+
+    def key_into(self, weight, x, bias, key):
+        torch.addmm(bias, x.reshape(-1, x.shape[-1]), weight.tensor,
+                    out=key[:self.keys])
+
+    def value_into(self, weight, x, bias, value):
+        """The projection, padded, and then its transpose.
+
+        Transposing the padded projection into a fresh contiguous tensor costs
+        15 us; writing a permuted view into a padded destination -- which looks
+        like the same thing and saves an allocation -- costs 45, because it
+        lowers to a transpose followed by a scatter. The transpose itself is
+        flat in the operand size, so this is a fixed cost either way.
+        """
+        torch.addmm(bias, x.reshape(-1, x.shape[-1]), weight.tensor,
+                    out=value[:self.keys])
+        return value.t().contiguous()
+
+    def __call__(self, key, value_t):
+        return self.kernel(self.query, key, value_t)[:self.queries].unsqueeze(0)
 
 
 def _timestep_projection(steps: int, channels: int = 256,
@@ -218,7 +275,31 @@ class BoundChain:
         self.unit = torch.ones(DIT_DIM, dtype=torch.bfloat16, device=dev)
         self.zero = torch.zeros(DIT_DIM, dtype=torch.bfloat16, device=dev)
 
+        # The DiT is entered with the state token in front of the action
+        # horizon, so every attention site on this path has that many queries.
+        self.action_tokens = self.horizon + 1
+        # Attention sites and each cross layer's key/value pair are built the
+        # first time they are asked for, which is during warm-up: capture runs
+        # after three eager passes, so the graph never sees an allocation.
+        self._sites: dict[int, DitAttentionSite] = {}
+        self._cross_buffers: dict[int, tuple] = {}
+
         self._build_modulators(weights)
+
+    # ------------------------------------------------------------------
+    def site(self, keys: int) -> DitAttentionSite:
+        site = self._sites.get(int(keys))
+        if site is None:
+            site = DitAttentionSite(self.action_tokens, int(keys), self.device)
+            self._sites[int(keys)] = site
+        return site
+
+    def cross_buffers(self, index: int, site: DitAttentionSite):
+        entry = self._cross_buffers.get(int(index))
+        if entry is None:
+            entry = site.key_buffers()
+            self._cross_buffers[int(index)] = entry
+        return entry
 
     # ------------------------------------------------------------------
     def _build_modulators(self, weights):
@@ -318,13 +399,16 @@ def cross_key_values(bound: BoundChain, text: torch.Tensor, image: torch.Tensor)
     sequence with the image tokens masked away.
     """
     cache = []
-    for layer in bound.layers:
+    for index, layer in enumerate(bound.layers):
         if not layer["cross"]:
             cache.append(None)
             continue
         source = text if layer["text"] else image
-        cache.append((layer["k"][0](source, layer["k"][1]),
-                      layer["v"][0](source, layer["v"][1])))
+        site = bound.site(source.shape[-2])
+        key, value = bound.cross_buffers(index, site)
+        site.key_into(layer["k"][0], source, layer["k"][1], key)
+        value_t = site.value_into(layer["v"][0], source, layer["v"][1], value)
+        cache.append((site, key, value_t))
     return cache
 
 
@@ -346,13 +430,15 @@ def dit_layer(bound: BoundChain, index: int, step: int, x: torch.Tensor,
     head's.
     """
     layer = bound.layers[index]
-    q = layer["q"][0](h, layer["q"][1])
     if layer["cross"]:
-        key, value = cross_kv[index]
+        site, key, value_t = cross_kv[index]
     else:
-        key = layer["k"][0](h, layer["k"][1])
-        value = layer["v"][0](h, layer["v"][1])
-    a = attention(q, key, value, DIT_HEADS, DIT_HEAD_DIM)
+        site = bound.site(h.shape[-2])
+        key = site.self_key
+        site.key_into(layer["k"][0], h, layer["k"][1], key)
+        value_t = site.value_into(layer["v"][0], h, layer["v"][1], site.self_value)
+    site.query_into(layer["q"][0], h, layer["q"][1])
+    a = site(key, value_t)
     h, x = add_norm(x, layer["o"][0](a, layer["o"][1]), bound.unit, bound.zero, EPS)
     h = F.gelu(layer["ff1"][0](h, layer["ff1"][1]), approximate="tanh")
     branch = layer["ff2"][0](h, layer["ff2"][1])
