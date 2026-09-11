@@ -161,6 +161,41 @@ def test_every_loader_checks_its_own_library():
         assert "abi.verify" in source
 
 
+def test_a_failing_device_query_is_a_fault_not_a_skip(monkeypatch):
+    """The SoC half of the check used to swallow every exception and return
+    None, which skipped the hardware comparison on exactly the machine the
+    comparison exists for. Absent runtime and absent device still return None;
+    a device that is present and cannot be named must raise."""
+    import sys
+    import types
+
+    from flash_rt.npu.core import abi
+
+    torch_npu = types.ModuleType("torch_npu")
+    fake_torch = types.ModuleType("torch")
+    fake_torch.npu = types.SimpleNamespace(
+        is_available=lambda: True,
+        current_device=lambda: 0,
+        get_device_name=lambda _i: (_ for _ in ()).throw(RuntimeError("driver busy")))
+    monkeypatch.setitem(sys.modules, "torch_npu", torch_npu)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    with pytest.raises(RuntimeError, match="driver busy"):
+        abi._running_soc()
+
+
+def test_no_device_is_still_a_skip(monkeypatch):
+    import sys
+    import types
+
+    from flash_rt.npu.core import abi
+
+    fake_torch = types.ModuleType("torch")
+    fake_torch.npu = types.SimpleNamespace(is_available=lambda: False)
+    monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    assert abi._running_soc() is None
+
+
 def test_the_build_script_targets_only_the_validated_part():
     """The host tiling names Ascend910B4 and several kernels divide work by
     its twenty cube cores, so accepting the rest of the B-series would build
@@ -192,9 +227,86 @@ def test_the_build_script_emits_each_library_once():
 # ── the public API reaches the optimised tier ─────────────────────────
 
 def test_load_model_rejects_an_unknown_precision():
-    from flash_rt.api import _PRECISION_TIERS
+    from flash_rt.api import load_model
 
-    assert set(_PRECISION_TIERS) == {"auto", "bf16", "int8", "fp8"}
+    with pytest.raises(ValueError, match="precision must be one of"):
+        load_model("unused", hardware="npu", precision="int4")
+
+
+def test_fp8_is_refused_on_a_part_that_has_no_fp8(monkeypatch):
+    """The frontend used to warn and run BF16, which is the failure this
+    parameter exists to prevent: a tier that was asked for, not delivered, and
+    not reported. It is refused before any backend import, so it fails the same
+    way on a machine with no Ascend runtime installed."""
+    from flash_rt.api import load_model
+
+    with pytest.raises(ValueError, match="no FP8 tensor hardware"):
+        load_model("unused", hardware="npu", precision="fp8")
+
+
+@pytest.mark.parametrize("arch", ["rtx_sm120", "thor", "amd_cdna4"])
+@pytest.mark.parametrize("tier", ["bf16", "int8", "fp8"])
+def test_a_named_tier_is_refused_on_the_backends_that_do_not_read_it(arch, tier):
+    """Those backends pick their frontend class from use_fp8/use_fp4/use_fp16
+    before a generic tier could be consulted, so honouring precision= there
+    would silently mean something else — precision='bf16' would still land on
+    an FP4 frontend. Refused rather than ignored until that routing is
+    reworked."""
+    from flash_rt.api import load_model
+
+    with pytest.raises(ValueError, match="Ascend NPU backend only"):
+        load_model("unused", hardware=arch, precision=tier)
+
+
+def test_auto_leaves_every_other_backend_exactly_as_it_was():
+    """The parameter has to be inert at its default, or adding it changed the
+    other platforms."""
+    from flash_rt.api import load_model
+
+    try:
+        load_model("unused", hardware="rtx_sm120", precision="auto")
+    except Exception as exc:  # something further along; never the tier check
+        assert "precision" not in str(exc), exc
+
+
+def _capture_routing(monkeypatch, **options):
+    """Drive load_model to the point of constructing a frontend and return the
+    keyword arguments it would have been built with."""
+    import sys
+    import types
+
+    import flash_rt.api as api
+    import flash_rt.hardware as hardware
+
+    monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
+    seen = {}
+
+    class _Fake:
+        def __init__(self, checkpoint, num_views=2, use_fp8=True, use_int8=False,
+                     **rest):
+            seen.update(checkpoint=checkpoint, num_views=num_views,
+                        use_fp8=use_fp8, use_int8=use_int8, **rest)
+
+    monkeypatch.setattr(hardware, "resolve_pipeline_class", lambda *a, **k: _Fake)
+    monkeypatch.setattr(api, "VLAModel", lambda pipe, framework: pipe)
+    api.load_model("unused", hardware="npu", **options)
+    return seen
+
+
+def test_int8_actually_reaches_the_frontend(monkeypatch):
+    assert _capture_routing(monkeypatch, precision="int8")["use_int8"] is True
+
+
+def test_bf16_actually_turns_the_int8_tier_off(monkeypatch):
+    seen = _capture_routing(monkeypatch, precision="bf16")
+    assert seen["use_int8"] is False
+
+
+def test_the_npu_never_receives_use_fp8_true(monkeypatch):
+    """load_model defaults use_fp8=True, and the part has no FP8 tensor
+    hardware; the coercion has to survive every tier."""
+    for tier in ("auto", "bf16", "int8"):
+        assert _capture_routing(monkeypatch, precision=tier)["use_fp8"] is False
 
 
 def test_the_npu_frontend_accepts_the_int8_tier():

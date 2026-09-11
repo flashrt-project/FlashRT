@@ -80,8 +80,8 @@ calibration collects per-image-token activation maxima and a shared maximum
 for language tokens, first across calls within each sample and then through
 `flash_rt.core.calibration.accumulate_amax` across samples. Scales are frozen
 before capture. An unseen prompt length reuses the calibrated language
-scale; it does not collect statistics from a serving request. The decoder
-and vision tower remain BF16, with explicit FP32 setup/reference operations.
+scale; it does not collect statistics from a serving request. The vision
+tower remains BF16, with explicit FP32 setup/reference operations.
 QKV and gate/up projections share quantized inputs while keeping separate
 GEMMs. Their inputs come directly from fused RMSNorm and frozen row
 quantization, including the attention residual update before the MLP.
@@ -91,6 +91,17 @@ directly for its output projection, using the maximum of frozen row scales
 after house aggregation as its scalar output scale. Q/K rotary embedding
 shares one native kernel and retains FP32 arithmetic before BF16 rounding. Decoder kernels fuse rotary
 embedding with KV writes and gated residual updates with AdaRMS normalization.
+
+The action decoder's four projections — QKV, attention output, gate/up and the
+MLP down projection — are INT8 as well, on the same frozen-scale contract, with
+one activation scale per (layer, denoise step, projection). Their quantization
+rides in the AdaRMS and the GELU that already write the activation rather than
+adding a kernel to feed them, and the FP16 the cube emits is consumed directly
+by the rotary. The decoder's cross attention runs on the raw cube path over a
+KV cache that keeps the values transposed in fractal NZ; that layout is what
+lets both of its GEMMs take the operand form a raw `Mmad` wants, with nothing
+to convert. Selecting `precision="bf16"` leaves the whole decoder, and the
+encoder, in BF16.
 
 Vision attention weights are padded at setup from 72 to 80 channels per
 head, including zero QKV bias channels and zero input columns in the output

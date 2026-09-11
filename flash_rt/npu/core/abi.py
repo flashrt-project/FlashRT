@@ -63,15 +63,19 @@ def verify(library, role: str) -> str:
 def _running_soc():
     """The device's own name, or None when there is no device to ask.
 
-    Returning None rather than raising keeps the ABI and SoC halves of the
-    check usable on a machine with no NPU, which is where most of the tests
-    for this file run.
+    None means exactly one thing: no Ascend runtime, or no usable device. That
+    keeps both halves of the check usable on a machine with no NPU, which is
+    where most of the tests for this file run.
+
+    It does not mean "the query failed". Once a device is present, failing to
+    name it is a fault and propagates: swallowing it would skip the hardware
+    half of the check on precisely the machine the check exists for.
     """
     try:
         import torch
         import torch_npu  # noqa: F401
-        if not torch.npu.is_available():
-            return None
-        return str(torch.npu.get_device_name(torch.npu.current_device()))
     except Exception:
         return None
+    if not torch.npu.is_available():
+        return None
+    return str(torch.npu.get_device_name(torch.npu.current_device()))
