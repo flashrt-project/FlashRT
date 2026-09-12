@@ -5,6 +5,10 @@ The NPU backend keeps its code in `flash_rt/npu`, native kernels in
 CUDA or AMD build trees. Tested environment: Ascend 910B4, CANN 8.5.2,
 PyTorch 2.7.1 and matching torch_npu 2.7.1.post2.
 
+This page is Pi0.5. The build section below is shared by every model on this
+backend; for GR00T N1.7 see
+[deployment_npu_groot_n17.md](deployment_npu_groot_n17.md).
+
 ## Build and run
 
 Activate the matching PyTorch environment and source the CANN toolkit's
@@ -14,11 +18,22 @@ Activate the matching PyTorch environment and source the CANN toolkit's
 bash scripts/npu/build.sh
 ```
 
-That produces four shared objects in `flash_rt/npu/lib`. They are separate
-because the CANN kernel headers define a per-translation-unit tiling symbol and
-a cube-only unit cannot share a file scope with a mixed cube/vector one: the
+That produces the four shared objects Pi0.5 loads in `flash_rt/npu/lib`: the
 vector dispatch unit, the gate/up cube unit, the decoder GEMM and the decode
-attention.
+attention. They are separate because the CANN kernel headers define a
+per-translation-unit tiling symbol and a cube-only unit cannot share a file scope
+with a mixed cube/vector one.
+
+Which models' units are compiled is chosen, because a shared object no selected
+model loads has no business being built:
+
+| variable | default | units |
+|---|---|---|
+| `FLASHRT_ENABLE_NPU_PI05` | `ON` | the four above |
+| `FLASHRT_ENABLE_NPU_GROOT_N17` | `OFF` | the GR00T N1.7 attention, its fused add-and-normalise, and the evaluation image transform's resize |
+
+At least one has to be `ON`. See
+[deployment_npu_groot_n17.md](deployment_npu_groot_n17.md) for the second group.
 
 `ASCEND_TOOLKIT_HOME` selects the toolkit and `FLASHRT_NPU_BUILD_DIR` the output
 directory. `ASCEND_SOC_VERSION` exists but accepts only `Ascend910B4`: the host
@@ -26,7 +41,9 @@ tiling names that part and several kernels divide work by its twenty cube cores,
 so the build refuses to emit libraries whose tiling would be wrong for another
 target. Individual libraries can be overridden with `FLASHRT_NPU_LIBRARY`,
 `FLASHRT_NPU_CUBE_LIBRARY`, `FLASHRT_NPU_DECODER_LIBRARY` and
-`FLASHRT_NPU_ATTENTION_LIBRARY`.
+`FLASHRT_NPU_ATTENTION_LIBRARY`, and the GR00T N1.7 group with
+`FLASHRT_NPU_DIT_ATTENTION_LIBRARY`, `FLASHRT_NPU_DIT_NORM_LIBRARY` and
+`FLASHRT_NPU_IMAGE_LIBRARY`.
 
 Every library exports its SoC target and an ABI number, and every loader checks
 both against each other and against the running device before binding an entry

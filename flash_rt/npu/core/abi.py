@@ -1,10 +1,12 @@
 """Identity checks for the Ascend shared objects.
 
-The backend ships four separately loaded shared objects — the vector dispatch
-unit, the gate/up cube unit, the decoder GEMM and the decode attention. They
-are separate because the kernel headers define a per-translation-unit tiling
-symbol and a cube-only unit cannot share a file scope with a mixed one, and
-each honours its own environment override so a developer can swap one out.
+The backend ships one separately loaded shared object per translation unit —
+four for Pi0.5 (the vector dispatch unit, the gate/up cube unit, the decoder
+GEMM and the decode attention) and three for the GR00T N1.7 action head and
+image path, each group built only when that model is selected. They are
+separate because the kernel headers define a per-translation-unit tiling symbol
+and a cube-only unit cannot share a file scope with a mixed one, and each
+honours its own environment override so a developer can swap one out.
 
 Nothing else stops a process from mixing a freshly built library with a stale
 one, or with one compiled for a different part. Both failures are silent: the
@@ -16,6 +18,12 @@ import ctypes as C
 
 # Bumped whenever an exported entry point's signature or contract changes.
 # ``scripts/npu/build.sh`` compiles the same number into every shared object.
+#
+# Adding a new unit with new symbols is not such a change: the contract behind
+# every already-published entry point is untouched, and bumping would refuse
+# every shared object a user has already built for no reason. Nor does
+# iterating on a *new* entry point before it is released — the number tracks
+# what has shipped, not how many times an unreleased signature was edited.
 ABI_VERSION = 1
 
 # The only part these kernels are validated for. The host tiling names it and
