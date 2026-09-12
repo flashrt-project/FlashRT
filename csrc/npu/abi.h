@@ -1,9 +1,11 @@
 // Identity a shared object carries so the loader can refuse the wrong one.
 //
-// The Ascend backend ships four shared objects — the vector dispatch unit, the
-// gate/up cube unit, the decoder GEMM and the decode attention — because the
-// kernel headers define a per-translation-unit tiling symbol and a cube-only
-// unit cannot share a file scope with a mixed one. Each is loaded separately
+// The Ascend backend ships one shared object per translation unit — four for
+// Pi0.5 (the vector dispatch unit, the gate/up cube unit, the decoder GEMM and
+// the decode attention) and three for the GR00T N1.7 action head and image
+// path — because the kernel headers define a per-translation-unit tiling symbol
+// and a cube-only unit cannot share a file scope with a mixed one. Each is
+// loaded separately
 // and each honours its own environment override, so nothing otherwise stops a
 // process from mixing a freshly built library with a stale one, or with one
 // compiled for a different part. Both are silent: a stale library has the same

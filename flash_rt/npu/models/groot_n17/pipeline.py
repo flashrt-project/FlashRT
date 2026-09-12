@@ -63,7 +63,7 @@ import torch
 import torch.nn.functional as F
 
 from flash_rt.npu.core.linear import NzBf16Weight
-from flash_rt.npu.models.groot_n17 import vector as vec
+from flash_rt.npu.models.groot_n17 import norm as fused
 from flash_rt.npu.models.groot_n17.attention import DitAttention
 
 # Geometry. These are the shipped GR00T-N1.7-3B configuration; the frontend
@@ -460,8 +460,8 @@ def add_norm(residual, branch, weight, bias, eps, branch_bias=None, out=None):
     sum, and one launch fewer. ``out`` is the padded destination described in
     ``vector.add_layer_norm``.
     """
-    if vec.serves(residual) and vec.serves(branch):
-        return vec.add_layer_norm(residual, branch, weight, bias, eps, branch_bias, out)
+    if fused.serves(residual) and fused.serves(branch):
+        return fused.add_layer_norm(residual, branch, weight, bias, eps, branch_bias, out)
     import torch_npu
     if branch_bias is not None:
         branch = branch + branch_bias

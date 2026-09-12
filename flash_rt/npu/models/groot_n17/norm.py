@@ -14,8 +14,10 @@ from pathlib import Path
 
 import torch
 
+from flash_rt.npu.core import operands
 
-class DitVectorLibrary:
+
+class DitNormLibrary:
     """Vector-only translation unit, and its own shared object.
 
     Each Ascend unit here is loaded separately and honours its own environment
@@ -23,8 +25,8 @@ class DitVectorLibrary:
     """
 
     def __init__(self):
-        path = os.environ.get("FLASHRT_NPU_DIT_VECTOR_LIBRARY")
-        path = path or Path(__file__).parents[2] / "lib" / "libflashrt_npu_dit_vector.so"
+        path = os.environ.get("FLASHRT_NPU_DIT_NORM_LIBRARY")
+        path = path or Path(__file__).parents[2] / "lib" / "libflashrt_npu_dit_norm.so"
         try:
             self.library = C.CDLL(str(path))
         except OSError as exc:
@@ -32,7 +34,7 @@ class DitVectorLibrary:
                 "Build the Ascend kernels with scripts/npu/build.sh before NPU "
                 "graph construction") from exc
         from flash_rt.npu.core import abi
-        abi.verify(self.library, "DiT elementwise")
+        abi.verify(self.library, "DiT add-and-normalise")
         self.add_layer_norm = self.library.flashrt_npu_dit_add_layer_norm
         self.add_layer_norm.argtypes = [C.c_void_p] * 8 + [C.c_int] * 3 + [C.c_float]
         self.add_layer_norm.restype = C.c_int
@@ -41,10 +43,10 @@ class DitVectorLibrary:
 _library = None
 
 
-def library() -> DitVectorLibrary:
+def library() -> DitNormLibrary:
     global _library
     if _library is None:
-        _library = DitVectorLibrary()
+        _library = DitNormLibrary()
     return _library
 
 
@@ -56,10 +58,12 @@ def serves(x: torch.Tensor) -> bool:
 
     The broadcast of the mean and the reciprocal square root rides a 64-element
     repeat, so the row has to be a whole number of them, and the row is held in
-    UB in FP32.
+    UB in FP32. A tensor that is not on an Ascend device is not served either:
+    routing a host tensor here would hand its address to a kernel.
     """
-    return (x.dtype == torch.bfloat16 and x.is_contiguous()
-            and x.shape[-1] % 64 == 0 and x.shape[-1] <= MAX_NORM_COLS)
+    return (x.device.type == "npu" and x.dtype == torch.bfloat16
+            and x.is_contiguous() and x.shape[-1] % 64 == 0
+            and x.shape[-1] <= MAX_NORM_COLS)
 
 
 def add_layer_norm(residual: torch.Tensor, branch: torch.Tensor, gamma: torch.Tensor,
@@ -80,12 +84,39 @@ def add_layer_norm(residual: torch.Tensor, branch: torch.Tensor, gamma: torch.Te
     that the *next* projection can carry its bias as one more input channel -- and
     this only ever writes the first ``cols`` of each row.
     """
+    if not serves(residual):
+        raise ValueError(
+            f"the native norm takes a contiguous BF16 row on an Ascend device "
+            f"that is a whole number of 64 elements and at most {MAX_NORM_COLS} "
+            f"wide, got {tuple(residual.shape)} of {residual.dtype} on "
+            f"{residual.device}")
     shape = residual.shape
     rows, cols = residual.numel() // shape[-1], shape[-1]
+    device = operands.require_npu(residual, "residual")
+    # Every address this launch is handed, checked before any of them is taken.
+    # These are raw pointers: a host tensor, a mismatched width or a strided row
+    # is a device fault or a silent read of the wrong memory, not a wrong number.
+    operands.require(residual, "residual", device=device, dtype=torch.bfloat16,
+                     contiguous=True)
+    operands.require(branch, "branch", device=device, dtype=torch.bfloat16,
+                     shape=shape, contiguous=True)
+    for name, affine in (("gamma", gamma), ("beta", beta)):
+        operands.require(affine, name, device=device, dtype=torch.bfloat16,
+                         shape=(cols,), contiguous=True)
+    if branch_bias is not None:
+        operands.require(branch_bias, "branch_bias", device=device,
+                         dtype=torch.bfloat16, shape=(cols,), contiguous=True)
     if out is None:
         norm, pitch = torch.empty_like(residual), cols
     else:
-        norm, pitch = out, out.shape[-1]
+        pitch = out.shape[-1]
+        if pitch < cols or (pitch - cols) % 16:
+            raise ValueError(
+                f"the normalised row is written at a pitch, which must be at "
+                f"least {cols} and a multiple of 16 past it, got {pitch}")
+        operands.require(out, "out", device=device, dtype=torch.bfloat16,
+                         shape=shape[:-1] + (pitch,), contiguous=True)
+        norm = out
     total = torch.empty_like(residual)
     code = library().add_layer_norm(
         torch.npu.current_stream(residual.device).npu_stream,

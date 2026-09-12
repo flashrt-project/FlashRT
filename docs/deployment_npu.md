@@ -34,7 +34,7 @@ so the build refuses to emit libraries whose tiling would be wrong for another
 target. Individual libraries can be overridden with `FLASHRT_NPU_LIBRARY`,
 `FLASHRT_NPU_CUBE_LIBRARY`, `FLASHRT_NPU_DECODER_LIBRARY`,
 `FLASHRT_NPU_ATTENTION_LIBRARY`, `FLASHRT_NPU_DIT_ATTENTION_LIBRARY`,
-`FLASHRT_NPU_DIT_VECTOR_LIBRARY` and `FLASHRT_NPU_IMAGE_LIBRARY`.
+`FLASHRT_NPU_DIT_NORM_LIBRARY` and `FLASHRT_NPU_IMAGE_LIBRARY`.
 
 Every library exports its SoC target and an ABI number, and every loader checks
 both against each other and against the running device before binding an entry

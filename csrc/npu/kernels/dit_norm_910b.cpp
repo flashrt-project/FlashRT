@@ -28,7 +28,7 @@
 #include "kernel_operator.h"
 using namespace AscendC;
 
-namespace flashrt_dit_vector {
+namespace flashrt_dit_norm {
 constexpr int MAX_NORM_COLS = 2048;
 // Broadcast one reduced value across a whole row without a scalar read: Brcb
 // fills a 32-byte block with it, and a repeat stride of zero makes every
@@ -37,14 +37,14 @@ __aicore__ inline void BroadcastRow(const LocalTensor<float>& dst,
                                     const LocalTensor<float>& scalarSrc) {
     Brcb(dst, scalarSrc, 1, BrcbRepeatParams(1, 8));
 }
-}  // namespace flashrt_dit_vector
+}  // namespace flashrt_dit_norm
 
 __global__ __aicore__ void dit_add_layer_norm_kernel(GM_ADDR residual, GM_ADDR branch,
                                                      GM_ADDR gamma, GM_ADDR beta,
                                                      GM_ADDR norm, GM_ADDR total,
                                                      GM_ADDR branchBias, int rows,
                                                      int cols, int pitch, float eps) {
-    using namespace flashrt_dit_vector;
+    using namespace flashrt_dit_norm;
     TPipe pipe;
     TQue<TPosition::VECIN, 1> rq, bq, gq, cq, pq;
     TQue<TPosition::VECOUT, 1> nq, tq;
@@ -215,7 +215,7 @@ extern "C" int flashrt_npu_dit_add_layer_norm(void* stream, void* residual, void
                                               void* gamma, void* beta, void* norm,
                                               void* total, void* branchBias, int rows,
                                               int cols, int pitch, float eps) {
-    using namespace flashrt_dit_vector;
+    using namespace flashrt_dit_norm;
     if (!stream || !residual || !branch || !gamma || !beta || !norm || !total) { return 1; }
     // A 64-element repeat is what carries the broadcast of the mean and the
     // reciprocal square root, so the row has to be a whole number of them.
