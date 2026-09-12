@@ -28,6 +28,8 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+from flash_rt.npu.core import operands
+
 #: The published Qwen3-VL vision geometry. A checkpoint whose processor differs
 #: is a different model, so the frontend checks rather than adapts.
 PATCH = 16
@@ -68,6 +70,12 @@ def _area_taps(source: int, target: int, device):
       always sum to 2048 and one cannot be derived from the other.
     * **The weight arithmetic is FP32**, because OpenCV's is.
     """
+    if target <= source:
+        raise NotImplementedError(
+            f"these are OpenCV's weights for the enlarging case, and {source} to "
+            f"{target} does not enlarge. Shrinking takes a different branch inside "
+            "OpenCV -- true area interpolation over a variable number of taps -- "
+            "and applying these weights to it would be silently wrong.")
     inverse = target / source
     scale = 1.0 / inverse
     index = torch.arange(target, dtype=torch.float64)
@@ -175,11 +183,20 @@ class EvalImageTransform:
         crop_w = max(1, int(mid_w * crop_fraction))
         top, left = (mid_h - crop_h) // 2, (mid_w - crop_w) // 2
         target_h, target_w = self._resized(crop_h, crop_w, max_size)
-        if (mid_h, mid_w) == (height, width) or (target_h, target_w) == (crop_h, crop_w):
+        # Both steps have to *enlarge*, not merely differ. This reproduces the
+        # enlarging case of INTER_AREA, which is the one the reference's
+        # evaluation transform runs at the shipped camera geometry; shrinking is a
+        # different branch inside OpenCV -- true area interpolation over a
+        # variable number of taps -- so a frame whose smallest edge already
+        # exceeds `max_size` would otherwise be resized with the wrong weights and
+        # no error. Checking only for equality let that through.
+        if not (mid_h > height and mid_w > width
+                and target_h > crop_h and target_w > crop_w):
             raise NotImplementedError(
-                "this path reproduces the enlarging case of INTER_AREA, which is "
-                "the one the reference's evaluation transform runs; a frame that "
-                "does not enlarge takes a different branch inside OpenCV")
+                f"this path reproduces the enlarging case of INTER_AREA; "
+                f"{(height, width)} -> {(mid_h, mid_w)} -> crop {(crop_h, crop_w)} "
+                f"-> {(target_h, target_w)} does not enlarge at every step, and "
+                "shrinking takes a different branch inside OpenCV")
         self.target = (target_h, target_w)
 
         self.first = _ResizePlan((height, width), (mid_h, mid_w), 0, 0, device)
@@ -216,15 +233,18 @@ class EvalImageTransform:
             raise RuntimeError(f"the image resize rejected arguments: {code}")
 
     def __call__(self, frames: torch.Tensor) -> torch.Tensor:
-        """``(n, H, W, 3)`` uint8 frames to the ``(n, 3, H', W')`` uint8 the
-        patch path reads."""
-        if (frames.dtype != torch.uint8 or frames.dim() != 4
-                or tuple(frames.shape[1:3]) != self.source or frames.shape[3] != 3
-                or frames.shape[0] != self.images or not frames.is_contiguous()):
-            raise ValueError(
-                f"the evaluation transform was built for {self.images} contiguous "
-                f"{self.source} uint8 frames, got {tuple(frames.shape)} of "
-                f"{frames.dtype}")
+        """``(n, H, W, 3)`` uint8 frames **already on the device**, to the
+        ``(n, 3, H', W')`` uint8 the patch path reads.
+
+        The device is checked rather than assumed. Camera frames arrive on the
+        host, and this kernel is handed ``frames.data_ptr()`` directly, so a host
+        tensor here faults on the device instead of producing a wrong answer.
+        Upload before calling; the upload is part of the frame's cost and belongs
+        where the caller can see it.
+        """
+        operands.require(frames, "frames", device=self.out.device, dtype=torch.uint8,
+                         shape=(self.images, self.source[0], self.source[1], 3),
+                         contiguous=True)
         self._run(self.first, frames, self.source_stride,
                   self.source[0] * self.source_stride, self.mid, self.mid_stride,
                   self.source[1] * 3)

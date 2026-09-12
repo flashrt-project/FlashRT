@@ -33,6 +33,8 @@ from pathlib import Path
 
 import torch
 
+from flash_rt.npu.core import operands
+
 
 class DitAttentionLibrary:
     """The kernel drives ``Mmad`` on the cube and the softmax on the vector
@@ -122,27 +124,22 @@ class DitAttention:
         layout the projection wrote rather than transposed."""
         stride = self.width if stride is None else int(stride)
         value_stride = int(value_stride)
-        for tensor, rows in ((query, self.rows), (key, self.columns)):
-            if (tensor.dtype != torch.bfloat16 or tensor.shape[0] != rows
-                    or tensor.shape[-1] != self.width or tensor.stride(0) != stride
-                    or tensor.device != self.out.device):
-                raise ValueError(
-                    f"native DiT attention expects a BF16 {rows}x{self.width} "
-                    f"operand of row pitch {stride} on {self.out.device}; pad with "
-                    "DitAttention.buffers()")
+        # Raw addresses again: every operand is checked before any of them is
+        # taken, and the checks name the operand because "pad with buffers()" is
+        # only useful advice if the caller knows which one was wrong.
+        device = self.out.device
+        for name, tensor, rows in (("query", query, self.rows),
+                                   ("key", key, self.columns)):
+            operands.require(tensor, name, device=device, dtype=torch.bfloat16,
+                             shape=(rows, self.width), row_pitch=stride)
         if value_stride:
-            if (value.dtype != torch.bfloat16
-                    or tuple(value.shape) != (self.columns, self.width)
-                    or value.stride(0) != value_stride or value.stride(1) != 1
-                    or value.device != self.out.device):
-                raise ValueError(
-                    f"native DiT attention expects a BF16 {self.columns}x{self.width} "
-                    f"value of row pitch {value_stride} on {self.out.device}")
-        elif (value.dtype != torch.bfloat16 or not value.is_contiguous()
-                or tuple(value.shape) != (self.width, self.columns)
-                or value.device != self.out.device):
-            raise ValueError(
-                "native DiT attention expects a contiguous BF16 transposed value")
+            operands.require(value, "value", device=device, dtype=torch.bfloat16,
+                             shape=(self.columns, self.width),
+                             row_pitch=value_stride)
+        else:
+            operands.require(value, "value (transposed)", device=device,
+                             dtype=torch.bfloat16,
+                             shape=(self.width, self.columns), contiguous=True)
         code = self.library.launch(
             torch.npu.current_stream(self.out.device).npu_stream,
             query.data_ptr(), key.data_ptr(), value.data_ptr(), self.out.data_ptr(),
