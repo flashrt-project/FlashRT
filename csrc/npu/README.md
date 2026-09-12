@@ -3,6 +3,11 @@
 Build with `bash scripts/npu/build.sh` after activating CANN. This subtree
 has no CUDA, HIP, PyTorch C++ extension, or root CMake dependency.
 
+Which units enter the build is chosen per model, because a shared object that no
+selected model loads has no business being compiled:
+`FLASHRT_ENABLE_NPU_PI05` (default `ON`) covers everything below except the last
+section, and `FLASHRT_ENABLE_NPU_GROOT_N17` (default `OFF`) covers that one.
+
 `flashrt_npu_quantize_rows(stream, input, inverse_scales, output, rows, columns)`
 accepts contiguous BF16 input, one FP32 inverse scale per row, and INT8 output.
 Columns must be divisible by 32. The return value checks host arguments;
@@ -82,3 +87,50 @@ specification; fusion does not introduce another scale-selection method.
 Both native libraries are built by `scripts/npu/build.sh` without CUDA,
 HIP, or a PyTorch C++ extension dependency. `FLASHRT_NPU_CUBE_LIBRARY`
 can select an alternate mixed-kernel library during setup.
+
+## GR00T N1.7 action head and image path
+
+Three units, built only with `FLASHRT_ENABLE_NPU_GROOT_N17=ON`, and named for
+the operation rather than the model in keeping with the rest of this subtree.
+Their Python wrappers live under `flash_rt/npu/models/groot_n17/`, because it is
+only that model's geometries that have been validated; every one of them refuses
+anything outside its envelope with a code rather than returning an undefined
+result. See `docs/deployment_npu_groot_n17.md`.
+
+`flashrt_npu_dit_attn(stream, q, k, vt, out, scores, probs, ctx, heads, sq, skv,
+hd, cores, stride, vstride, scale)` — multi-head attention on the raw `Mmad`
+path, for a short query against a short key sequence. One head per iteration and
+the whole head in L0 untiled, which is what the geometry refusals protect: L0C,
+L0A, L0B and the UB plane are each checked against the requested extents, as are
+a 16-aligned head width and a query count the plane-wise softmax can hold. `q`
+and `k` may be column slices of one wider projection (`stride` is their row
+pitch). `vt` is the value either transposed to `(heads*hd, skv)` with
+`vstride = 0`, or in the layout the projection wrote with `vstride` as its row
+pitch, in which case the load from L1 to L0B transposes it. Every operand is
+padded to the fractal with real zeros by the caller: `Nd2Nz` fills only the rows
+it is given, so a tail the kernel assumed were zero would be uninitialised L1
+that the `Mmad` then reads. Scores, probabilities and the FP32 context are
+caller-owned scratch, written and consumed inside one launch.
+
+`flashrt_npu_dit_add_layer_norm(stream, residual, branch, gamma, beta, norm,
+total, branchBias, rows, cols, pitch, eps)` — `residual + branch`, and the
+affine LayerNorm of that sum, in one launch. The sum is rounded to BF16 before it
+is normalised, because the sum is what the next block carries forward, and the
+normalisation then runs in FP32 from it. `branchBias` is optional and is added to
+the branch and rounded there, which is where the biased matmul it replaces
+rounded. `cols` must be a whole number of 64-element repeats and at most 2048;
+`norm` is written at `pitch`, which must be at least `cols` and a multiple of 16
+past it, so its row can end in a constant the next projection reads as a bias
+channel.
+
+`flashrt_npu_area_resize(stream, src, dst, offsets, weights, rows, rowWeights,
+images, srcPlane, srcRowStride, rowOffset, srcSamples, dstPlane, dstRowStride,
+dstHeight, dstSamples, tableStride, cores)` — one resize step of OpenCV's
+`INTER_AREA` **enlarging** path on uint8, bit for bit. Shrinking is a different
+branch inside OpenCV and is refused on the host rather than approximated here.
+The tap tables are built on the host and each is padded to a 32-byte block,
+because a copy out of global memory has to start on one. Row strides must be
+whole 32-byte blocks. The horizontal pass is exact in FP32; the vertical pass is
+the 8-bit specialisation, which truncates three separate times, and rounding its
+accumulator once instead is off by one least significant bit on about eight
+percent of the samples.
