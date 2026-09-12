@@ -1,7 +1,7 @@
 """Checkpoint loading for the Ascend GR00T N1.7 action chain.
 
 The checkpoint's tensors are already described once, declaratively, in
-``flash_rt.frontends.torch._groot_n17_thor_spec``. That description is of the
+``flash_rt.models.groot_n17.weight_spec``. That description is of the
 file on disk rather than of a backend, so this module *derives* the Ascend
 variant from it instead of restating it: the FP16 casts become BF16 -- the
 dtype this part serves and the dtype the reference policy itself serves -- the
@@ -48,7 +48,7 @@ def _rewrite(item: Item) -> Item:
 
 
 def _spec(block_names, singleton_prefixes) -> ModelWeightSpec:
-    from flash_rt.frontends.torch._groot_n17_thor_spec import build_spec
+    from flash_rt.models.groot_n17.weight_spec import build_spec
 
     shared = build_spec()
     blocks = [
