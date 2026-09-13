@@ -96,6 +96,9 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  decoder_fused_attn: bool = False,
                  decoder_fused_geglu: bool = True,
                  decoder_fused_geglu_nod: bool = False,
+                 decoder_attn_splitkv: bool = False,
+                 rowops_v2: bool = False,
+                 rowops_res_epilogue: bool = True,
                  decoder_rht: bool = False,
                  use_fp8: bool = True,
                  state_prompt_mode: str = "exact",
@@ -195,6 +198,10 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         # the collective's own D store elided).
         self.decoder_fused_geglu_nod = (bool(decoder_fused_geglu_nod)
                                         and self.decoder_fused_geglu)
+        self.decoder_attn_splitkv = bool(decoder_attn_splitkv)
+        self.rowops_v2 = bool(rowops_v2)
+        self.rowops_res_epilogue = bool(rowops_res_epilogue)
+        self._decoder_attn_ws = None
 
         if self._fp4_layers:
             if not _HAS_FP4:
@@ -359,6 +366,19 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
     # -------------------------------------------------------------------
     # Calibration override — block multi-sample on active FP4 layers
     # -------------------------------------------------------------------
+
+    def _decoder_attn_ws_ptr(self) -> int:
+        """Workspace for the split-KV decoder attention (0 when disabled)."""
+        if not self.decoder_attn_splitkv:
+            return 0
+        if self._decoder_attn_ws is None:
+            import torch
+            from flash_rt import flash_rt_fp4 as fvk_fp4
+            n = int(fvk_fp4.pi05_dec_attn_splitkv_ws_bytes())
+            self._decoder_attn_ws = torch.zeros(n, dtype=torch.uint8,
+                                                device='cuda')
+        return int(self._decoder_attn_ws.data_ptr())
+
 
     def _calibrate_multi_frame(self, obs_list, *, percentile: float, verbose: bool):
         """Pi0.5 FP4 multi-sample (N>=2) calibration.
@@ -838,6 +858,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
             'ln_act': FP4ActScratch(self.sig_S, D, device='cuda'),
             'hid_act': FP4ActScratch(self.sig_S, H_pad, device='cuda'),
             'H_pad': H_pad,
+            'rowops_v2': self.rowops_v2,
         }
         logger.info("Pi05 SigLIP FFN NVFP4 quantized (%d layers, H_pad=%d)",
                     len(self._sig_fp4_weights), H_pad)
@@ -1154,6 +1175,8 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                 {l: self._awq_inv_s_dn[l].data_ptr() for l in self._fp4_layers}
                 if self.use_awq else None),
         }
+        self._fp4_scratch_dict['rowops_v2'] = self.rowops_v2
+        self._fp4_scratch_dict['res_epilogue'] = self.rowops_res_epilogue
         if self.use_p1_split_gu:
             self._fp4_scratch_dict['p1_combiner'] = self.encoder_p1_combiner
             if self.encoder_p1_combiner == 'epilogue':
@@ -1350,6 +1373,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                 'xn_sfa': self._decoder_fp4_xn.sfa.data_ptr(),
                 'ctx_fp4': self._decoder_fp4_ctx.packed.data_ptr(),
                 'ctx_sfa': self._decoder_fp4_ctx.sfa.data_ptr(),
+                'attn_ws': self._decoder_attn_ws_ptr(),
                 'hid_fp4': self._decoder_fp4_hid.packed.data_ptr(),
                 'hid_sfa': self._decoder_fp4_hid.sfa.data_ptr(),
             })
@@ -1414,6 +1438,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
             ae_dims['rht'] = self.decoder_rht
             ae_dims['fused_geglu'] = self.decoder_fused_geglu
             ae_dims['fused_geglu_nod'] = self.decoder_fused_geglu_nod
+            ae_dims['attn_splitkv'] = self.decoder_attn_splitkv
             if self._attn is not None:
                 # Fold the decoder seqused mask into the softmax kernel.
                 self._attn.use_fused_softmax = self.decoder_fused_attn

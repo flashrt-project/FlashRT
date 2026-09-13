@@ -31,6 +31,10 @@
 #include "gemm/fp4/cutlass_fp4_gemm_e0m3w_sm100.cuh"
 #include "fused_fp4/pi05_e0m3_act.cuh"
 #include "fused_fp4/siglip_ln_vec.cuh"
+#include "fused_fp4/pi05_dec_attn_splitkv.cuh"
+#include "fused_fp4/pi05_rowops_v2.cuh"
+#include "gemm/fp4/nvfp4_m16_gemm_sm110.cuh"
+#include "fused_fp4/l2_prefetch.cuh"
 #include "quantize/reshape_scales_sfa.cuh"
 #include "fused_fp16/rms_norm_noweight_fp16.cuh"
 #ifdef FLASHRT_HAVE_COSMOS3_EDGE
@@ -312,6 +316,120 @@ tile-interleave conversion is required.
 Fused: fp16 [N, D] → NVFP4 packed [N, D/2] + CUTLASS tile-interleaved SFA/SFB.
 Bit-exact equivalent of quantize_fp4_dynamic_fp16 followed by
 reshape_linear_scales_to_sfa, in a single kernel launch.
+)pbdoc");
+
+  m.def("rowops_residual_rms_mul_fp4_sfa_v2",
+        [](uintptr_t residual, uintptr_t x, uintptr_t inv_s, uintptr_t packed,
+           uintptr_t sfa, int S, int D, uintptr_t stream) -> int {
+          return flash_rt::fused_fp4::rowops_residual_rms_mul_fp4_sfa_v2(
+              reinterpret_cast<__half*>(residual), reinterpret_cast<const __half*>(x),
+              reinterpret_cast<const __half*>(inv_s), reinterpret_cast<void*>(packed),
+              reinterpret_cast<void*>(sfa), S, D, reinterpret_cast<cudaStream_t>(stream));
+        }, py::arg("residual"), py::arg("x"), py::arg("inv_s"), py::arg("packed"),
+        py::arg("sfa"), py::arg("S"), py::arg("D"), py::arg("stream") = 0,
+        "Warp-per-row residual + RMSNorm [* inv_s] -> NVFP4 + SFA (v2).");
+  m.def("l2_prefetch_regions",
+        [](const std::vector<std::pair<uintptr_t, unsigned long long>>& regions,
+           uintptr_t stream, int mode, uintptr_t sink) -> int {
+          if (regions.size() > 8) return -1;
+          flash_rt::fp4::L2PrefetchRegions r{};
+          r.count = static_cast<int>(regions.size());
+          for (size_t i = 0; i < regions.size(); ++i) {
+            r.ptr[i] = reinterpret_cast<const void*>(regions[i].first);
+            r.bytes[i] = regions[i].second;
+          }
+          return flash_rt::fp4::l2_prefetch_regions(r, reinterpret_cast<cudaStream_t>(stream), mode,
+                                                    reinterpret_cast<void*>(sink));
+        }, py::arg("regions"), py::arg("stream") = 0, py::arg("mode") = 0, py::arg("sink") = 0,
+        "Issue cp.async.bulk.prefetch.L2 over up to 8 (ptr, bytes) regions; returns without waiting.");
+  m.def("nvfp4_m16_gemm_fp16out",
+        [](uintptr_t A, uintptr_t SFA, uintptr_t B, uintptr_t SFB, uintptr_t D,
+           int M, int N, int K, uintptr_t stream) -> int {
+          return flash_rt::fp4::nvfp4_m16_gemm_fp16out(
+              reinterpret_cast<void const*>(A), reinterpret_cast<void const*>(SFA),
+              reinterpret_cast<void const*>(B), reinterpret_cast<void const*>(SFB),
+              reinterpret_cast<void*>(D), M, N, K, reinterpret_cast<cudaStream_t>(stream));
+        }, py::arg("A"), py::arg("SFA"), py::arg("B"), py::arg("SFB"), py::arg("D"),
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0,
+        "M<=16 NVFP4 GEMM: 16-column CTAs, 8-way in-CTA split-K, mma.sync fp16 with folded block scales.");
+  m.def("rowops_rms_mul_fp4_sfa_v2",
+        [](uintptr_t x, uintptr_t inv_s, uintptr_t packed, uintptr_t sfa, int S, int D,
+           uintptr_t stream) -> int {
+          return flash_rt::fused_fp4::rowops_rms_mul_fp4_sfa_v2(
+              reinterpret_cast<const __half*>(x), reinterpret_cast<const __half*>(inv_s),
+              reinterpret_cast<void*>(packed), reinterpret_cast<void*>(sfa), S, D,
+              reinterpret_cast<cudaStream_t>(stream));
+        }, py::arg("x"), py::arg("inv_s"), py::arg("packed"), py::arg("sfa"), py::arg("S"),
+        py::arg("D"), py::arg("stream") = 0,
+        "Warp-per-row RMSNorm [* inv_s] -> NVFP4 + SFA, no residual (v2).");
+  m.def("rowops_quantize_fp4_sfa_v2",
+        [](uintptr_t src, uintptr_t packed, uintptr_t sfa, int N, int D, uintptr_t stream) -> int {
+          return flash_rt::fused_fp4::rowops_quantize_fp4_sfa_v2(
+              reinterpret_cast<const __half*>(src), reinterpret_cast<void*>(packed),
+              reinterpret_cast<void*>(sfa), N, D, reinterpret_cast<cudaStream_t>(stream));
+        }, py::arg("src"), py::arg("packed"), py::arg("sfa"), py::arg("N"), py::arg("D"),
+        py::arg("stream") = 0, "Warp-per-row NVFP4 + SFA quantizer (v2).");
+  m.def("rowops_residual_rms_fp8_v2",
+        [](uintptr_t residual, uintptr_t x, uintptr_t out, int S, int D, uintptr_t descale,
+           uintptr_t stream) -> int {
+          return flash_rt::fused_fp4::rowops_residual_rms_fp8_v2(
+              reinterpret_cast<__half*>(residual), reinterpret_cast<const __half*>(x),
+              reinterpret_cast<void*>(out), S, D, reinterpret_cast<const float*>(descale),
+              reinterpret_cast<cudaStream_t>(stream));
+        }, py::arg("residual"), py::arg("x"), py::arg("out"), py::arg("S"), py::arg("D"),
+        py::arg("descale"), py::arg("stream") = 0,
+        "Warp-per-row residual + RMSNorm -> e4m3 with static descale (v2).");
+  m.def("rowops_rms_fp8_v2",
+        [](uintptr_t x, uintptr_t out, int S, int D, uintptr_t descale, uintptr_t stream) -> int {
+          return flash_rt::fused_fp4::rowops_rms_fp8_v2(
+              reinterpret_cast<const __half*>(x), reinterpret_cast<void*>(out), S, D,
+              reinterpret_cast<const float*>(descale), reinterpret_cast<cudaStream_t>(stream));
+        }, py::arg("x"), py::arg("out"), py::arg("S"), py::arg("D"), py::arg("descale"),
+        py::arg("stream") = 0, "Warp-per-row RMSNorm -> e4m3 with static descale (v2).");
+  m.def("rowops_layer_norm_mul_fp4_sfa_v2",
+        [](uintptr_t x, uintptr_t gamma, uintptr_t beta, uintptr_t inv_s, uintptr_t packed,
+           uintptr_t sfa, int S, int D, float eps, uintptr_t stream) -> int {
+          return flash_rt::fused_fp4::rowops_layer_norm_mul_fp4_sfa_v2(
+              reinterpret_cast<const __half*>(x), reinterpret_cast<const __half*>(gamma),
+              reinterpret_cast<const __half*>(beta), reinterpret_cast<const __half*>(inv_s),
+              reinterpret_cast<void*>(packed), reinterpret_cast<void*>(sfa), S, D, eps,
+              reinterpret_cast<cudaStream_t>(stream));
+        }, py::arg("x"), py::arg("gamma"), py::arg("beta"), py::arg("inv_s"), py::arg("packed"),
+        py::arg("sfa"), py::arg("S"), py::arg("D"), py::arg("eps"), py::arg("stream") = 0,
+        "Warp-per-row LayerNorm [* inv_s] -> NVFP4 + SFA (v2).");
+  m.def("rowops_layer_norm_fp8_v2",
+        [](uintptr_t x, uintptr_t gamma, uintptr_t beta, uintptr_t out, int S, int D, float eps,
+           uintptr_t stream) -> int {
+          return flash_rt::fused_fp4::rowops_layer_norm_fp8_v2(
+              reinterpret_cast<const __half*>(x), reinterpret_cast<const __half*>(gamma),
+              reinterpret_cast<const __half*>(beta), reinterpret_cast<void*>(out), S, D, eps,
+              reinterpret_cast<cudaStream_t>(stream));
+        }, py::arg("x"), py::arg("gamma"), py::arg("beta"), py::arg("out"), py::arg("S"),
+        py::arg("D"), py::arg("eps"), py::arg("stream") = 0,
+        "Warp-per-row LayerNorm -> e4m3 (v2).");
+
+  m.def("pi05_dec_attn_splitkv_ws_bytes",
+        []() -> size_t { return flash_rt::fp4::pi05_dec_attn_splitkv_ws_bytes(); },
+        "Workspace bytes for pi05_dec_attn_splitkv_fp4.");
+  m.def("pi05_dec_attn_splitkv_fp4",
+        [](uintptr_t Q, uintptr_t K, uintptr_t V, uintptr_t ws,
+           uintptr_t packed, uintptr_t sfa, int S, int S_kv, int NH, int HD,
+           float attn_scale, uintptr_t stream) -> int {
+          return flash_rt::fp4::pi05_dec_attn_splitkv_fp4(
+              reinterpret_cast<void const*>(Q), reinterpret_cast<void const*>(K),
+              reinterpret_cast<void const*>(V), reinterpret_cast<void*>(ws),
+              reinterpret_cast<void*>(packed), reinterpret_cast<void*>(sfa),
+              S, S_kv, NH, HD, attn_scale,
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("ws"),
+        py::arg("packed"), py::arg("sfa"), py::arg("S"), py::arg("S_kv"),
+        py::arg("NH"), py::arg("HD"), py::arg("attn_scale"), py::arg("stream") = 0,
+        R"pbdoc(
+Pi0.5 decoder attention (10 tokens x 8 heads, 1 KV head, head_dim 256) as a
+split-KV partial kernel plus a combine kernel that emits the NVFP4 packed
+activation and CUTLASS SFA bytes directly (replaces cuBLAS QK^T, softmax,
+cuBLAS PV and quantize_fp4_dynamic_sfa_fp16_vec). Q must already carry RoPE.
 )pbdoc");
 
   m.def("quantize_fp4_dynamic_sfa_fp16_vec",

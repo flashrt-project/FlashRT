@@ -16,6 +16,10 @@
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/gemm/kernel/tile_scheduler_params.h"
+#include <map>
+#include <tuple>
+#include <mutex>
 #include "cutlass/util/packed_stride.hpp"
 #include "cutlass/detail/sm100_blockscaled_layout.hpp"
 #include "cute/tensor.hpp"
@@ -149,6 +153,102 @@ using V9 = Variant<Shape<_128,_128,_128>, Shape<_2,_1,_1>>;  // same as V0 → s
 // v10: narrow N + wide K → fewer mainloop iters, same block count as v5
 using V10 = Variant<Shape<_128, _64,_256>, Shape<_1,_1,_1>>;
 
+// ── Stream-K / split-K variants for the M=10 decoder projections ───────────
+// The static scheduler gives N/64 CTAs (16 for N=1024) on a 20-SM part, so the
+// weight stream never fills DRAM. Stream-K splits K across CTAs and reduces
+// through a workspace, which is cached per (variant, M, N, K) so the launch is
+// CUDA-graph capturable after a first warm call.
+template <class MmaTile, class Cluster, int Splits>
+struct VariantSK {
+  using ElementA   = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+  using LayoutATag = cutlass::layout::RowMajor;
+  static constexpr int AlignmentA = 32;
+  using ElementB   = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+  using LayoutBTag = cutlass::layout::ColumnMajor;
+  static constexpr int AlignmentB = 32;
+  using ElementD   = cutlass::half_t;
+  using ElementC   = cutlass::half_t;
+  using LayoutCTag = cutlass::layout::RowMajor;
+  using LayoutDTag = cutlass::layout::RowMajor;
+  static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
+  static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+  using ElementAccumulator = float;
+  using ArchTag            = cutlass::arch::Sm100;
+  using OperatorClass      = cutlass::arch::OpClassBlockScaledTensorOp;
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      ArchTag, OperatorClass, MmaTile, Cluster,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      ElementAccumulator, ElementAccumulator,
+      ElementC, LayoutCTag, AlignmentC, ElementD, LayoutDTag, AlignmentD,
+      cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      ArchTag, OperatorClass, ElementA, LayoutATag, AlignmentA,
+      ElementB, LayoutBTag, AlignmentB, ElementAccumulator, MmaTile, Cluster,
+      cutlass::gemm::collective::StageCountAutoCarveout<
+          static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue,
+      cutlass::gemm::StreamKScheduler>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+  using StrideA = typename Gemm::GemmKernel::StrideA;
+  using StrideB = typename Gemm::GemmKernel::StrideB;
+  using StrideC = typename Gemm::GemmKernel::StrideC;
+  using StrideD = typename Gemm::GemmKernel::StrideD;
+  using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+  using DecompositionMode = cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90StreamKParams::DecompositionMode;
+  using ReductionMode = cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90StreamKParams::ReductionMode;
+
+  static void* workspace_for(size_t bytes, int M, int N, int K) {
+    static std::map<std::tuple<int,int,int>, std::pair<void*, size_t>> cache;
+    static std::mutex mu;
+    std::lock_guard<std::mutex> g(mu);
+    auto key = std::make_tuple(M, N, K);
+    auto it = cache.find(key);
+    if (it != cache.end() && it->second.second >= bytes) return it->second.first;
+    void* p = nullptr;
+    if (bytes > 0 && cudaMalloc(&p, bytes) != cudaSuccess) return nullptr;
+    cache[key] = {p, bytes};
+    return p;
+  }
+
+  static int run(void const* A, void const* SFA, void const* B, void const* SFB,
+                 void* D, int M, int N, int K, float alpha, float beta,
+                 cudaStream_t stream) {
+    auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
+    auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+    auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
+    auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
+    auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(M, N, K, 1));
+    auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(M, N, K, 1));
+    using EA = typename ElementA::DataType; using SA = typename ElementA::ScaleFactorType;
+    using EB = typename ElementB::DataType; using SB = typename ElementB::ScaleFactorType;
+    typename Gemm::Arguments args{
+        cutlass::gemm::GemmUniversalMode::kGemm, {M, N, K, 1},
+        { reinterpret_cast<EA const*>(A), stride_A, reinterpret_cast<EB const*>(B), stride_B,
+          reinterpret_cast<SA const*>(SFA), layout_SFA, reinterpret_cast<SB const*>(SFB), layout_SFB },
+        { {alpha, beta}, reinterpret_cast<ElementC*>(D), stride_C, reinterpret_cast<ElementD*>(D), stride_D }
+    };
+    args.scheduler.splits = Splits;
+    args.scheduler.decomposition_mode = (Splits > 1) ? DecompositionMode::SplitK : DecompositionMode::StreamK;
+    args.scheduler.reduction_mode = ReductionMode::Deterministic;
+    Gemm gemm;
+    auto st = gemm.can_implement(args);
+    if (st != cutlass::Status::kSuccess) return static_cast<int>(st) | 0x10000;
+    size_t ws_sz = Gemm::get_workspace_size(args);
+    void* ws = workspace_for(ws_sz, M, N, K);
+    if (ws_sz > 0 && ws == nullptr) return -1;
+    st = gemm.initialize(args, ws, stream);
+    if (st != cutlass::Status::kSuccess) return static_cast<int>(st) | 0x20000;
+    st = gemm.run(stream);
+    return (st == cutlass::Status::kSuccess) ? 0 : (static_cast<int>(st) | 0x30000);
+  }
+};
+using V11 = VariantSK<Shape<_128, _64,_256>, Shape<_1,_1,_1>, 2>;   // split-K 2
+using V12 = VariantSK<Shape<_128, _64,_256>, Shape<_1,_1,_1>, 4>;   // split-K 4
+using V13 = VariantSK<Shape<_128, _64,_256>, Shape<_1,_1,_1>, 1>;   // stream-K heuristic
+using V14 = VariantSK<Shape<_128,_128,_256>, Shape<_1,_1,_1>, 4>;   // wider N, split-K 4
+
 }  // namespace variants
 
 // Dispatch by index (exposed via pybind).
@@ -169,6 +269,10 @@ int cutlass_fp4_gemm_variant(int idx,
     case 8: return V8::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     case 9: return V9::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     case 10: return V10::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 11: return V11::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 12: return V12::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 13: return V13::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 14: return V14::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     default: return -99;
   }
 }
@@ -186,11 +290,15 @@ const char* cutlass_fp4_gemm_variant_name(int idx) {
     case 8: return "tile128x256x256 cluster1x1x1 (wide N+K)";
     case 9: return "tile128x128x128 cluster2x1x1 (sanity)";
     case 10: return "tile128x64x256  cluster1x1x1 (narrow N + wide K)";
+    case 11: return "tile128x64x256  split-K 2 (stream-K scheduler, cached workspace)";
+    case 12: return "tile128x64x256  split-K 4 (stream-K scheduler, cached workspace)";
+    case 13: return "tile128x64x256  stream-K (stream-K scheduler, cached workspace)";
+    case 14: return "tile128x128x256 split-K 4 (stream-K scheduler, cached workspace)";
     default: return "<invalid>";
   }
 }
 
-int cutlass_fp4_gemm_num_variants() { return 11; }
+int cutlass_fp4_gemm_num_variants() { return 15; }
 
 }  // namespace fp4
 }  // namespace flash_rt

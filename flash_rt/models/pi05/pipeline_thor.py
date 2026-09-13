@@ -289,6 +289,12 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
     fused_geglu = bool(dims.get('fused_geglu')) and weight_format == 'nvfp4'
     fused_geglu_nod = bool(dims.get('fused_geglu_nod')) and fused_geglu
     act_e0m3 = act_format == 'e0m3'
+    attn_splitkv = (bool(dims.get('attn_splitkv')) and not fixed_shape
+                    and not act_e0m3)
+    attn_ws = bufs.get('attn_ws', 0)
+    if attn_splitkv and not attn_ws:
+        raise ValueError(
+            "Pi0.5 Thor decoder attn_splitkv requires bufs['attn_ws']")
     if act_format not in ('nvfp4', 'e0m3'):
         raise ValueError(
             f"Pi0.5 Thor decoder FP4 unknown act_format {act_format!r}")
@@ -390,26 +396,38 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
                         f"Pi0.5 decoder FP4 qkv split layer {l} failed "
                         f"rc={rc}")
 
-            if attn is not None:
-                attn.run("decoder", l, q_seq=S, kv_seq=total_keys,
-                         stream=stream)
-            else:
+            if attn_splitkv:
                 K_ptr = Kc + l * total_keys * HD * 2
                 V_ptr = Vc + l * total_keys * HD * 2
-                fvk.attention_qkv_fp16(
-                    ctx, attn_out, K_ptr, V_ptr, logits, attn_out,
+                rc = fvk_fp4.pi05_dec_attn_splitkv_fp4(
+                    attn_out, K_ptr, V_ptr, attn_ws, ctx_fp4, ctx_sfa,
                     S, total_keys, NH, HD, attn_scale, stream)
-
-            if act_e0m3:
-                rc = fvk_fp4.quantize_e0m3_dynamic_sfa_fp16_vec(
-                    attn_out, ctx_fp4, ctx_sfa, S, NH * HD, False, rht,
-                    stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 split-KV attention layer {l} "
+                        f"failed rc={rc}")
             else:
-                rc = fvk_fp4.quantize_fp4_dynamic_sfa_fp16_vec(
-                    attn_out, ctx_fp4, ctx_sfa, S, NH * HD, False, stream)
-            if rc != 0:
-                raise RuntimeError(
-                    f"Pi0.5 decoder FP4 O activation layer {l} failed rc={rc}")
+                if attn is not None:
+                    attn.run("decoder", l, q_seq=S, kv_seq=total_keys,
+                             stream=stream)
+                else:
+                    K_ptr = Kc + l * total_keys * HD * 2
+                    V_ptr = Vc + l * total_keys * HD * 2
+                    fvk.attention_qkv_fp16(
+                        ctx, attn_out, K_ptr, V_ptr, logits, attn_out,
+                        S, total_keys, NH, HD, attn_scale, stream)
+
+                if act_e0m3:
+                    rc = fvk_fp4.quantize_e0m3_dynamic_sfa_fp16_vec(
+                        attn_out, ctx_fp4, ctx_sfa, S, NH * HD, False, rht,
+                        stream)
+                else:
+                    rc = fvk_fp4.quantize_fp4_dynamic_sfa_fp16_vec(
+                        attn_out, ctx_fp4, ctx_sfa, S, NH * HD, False, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 O activation layer {l} failed "
+                        f"rc={rc}")
             rc = dec_gemm(
                 variant_o, ctx_fp4, ctx_sfa,
                 weights['ow_fp4'][l], weights['ow_sfb'][l], fg,

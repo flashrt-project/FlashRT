@@ -66,6 +66,7 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
             'variant_gu' — int NVFP4 variant idx for Gate+Up
             'variant_dn' — int NVFP4 variant idx for Down
     """
+    rowops_v2 = bool((fp4_scratch or {}).get('rowops_v2'))
     fp4_layers = set(fp4_layers or ())
     if fp4_layers and (fp4_weights is None or fp4_scratch is None):
         raise ValueError("fp4_weights and fp4_scratch required when fp4_layers non-empty")
@@ -170,7 +171,11 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
                 raise RuntimeError(
                     f"encoder FP4 qkv GEMM layer {l} failed rc={rc}")
         else:
-            fvk.rms_norm_fp8_noweight_fp16(x, x_fp8, Se, D, as_qkv, stream)
+            if rowops_v2:
+                _check(fvk_fp4.rowops_rms_fp8_v2(x, x_fp8, Se, D, as_qkv, stream),
+                       'rowops_rms_fp8_v2', l, M=Se, N=D)
+            else:
+                fvk.rms_norm_fp8_noweight_fp16(x, x_fp8, Se, D, as_qkv, stream)
             fvk.cutlass_fp8_sq(x_fp8, weights['qkv_w'][l], qkv,
                                Se, 2560, D, alpha_host[l * 4 + 0], 0.0,
                                stream)
@@ -200,22 +205,34 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
             # 6. quantize attn output + O GEMM (FP8 static scales, or
             # dynamic NVFP4 with fp4_attn_weights).
             if aw_attn is not None and 'o' in aw_attn:
-                rc = fvk_fp4.quantize_fp4_dynamic_sfa_fp16_vec(
-                    attn_out, sc_at.packed.data_ptr(),
-                    sc_at.sfa.data_ptr(), Se, D, False, stream)
+                if rowops_v2:
+                    rc = fvk_fp4.rowops_quantize_fp4_sfa_v2(
+                        attn_out, sc_at.packed.data_ptr(),
+                        sc_at.sfa.data_ptr(), Se, D, stream)
+                else:
+                    rc = fvk_fp4.quantize_fp4_dynamic_sfa_fp16_vec(
+                        attn_out, sc_at.packed.data_ptr(),
+                        sc_at.sfa.data_ptr(), Se, D, False, stream)
                 if rc != 0:
                     raise RuntimeError(
                         f"encoder FP4 O quantize layer {l} failed rc={rc}")
+                # rowops_v2 on an FP4 layer: accumulate the O projection
+                # straight into the residual stream (beta = 1, C = D = x) so
+                # the pre-FFN norm reads x once instead of x + fg.
+                res_in_epilogue = (rowops_v2 and is_fp4
+                                   and bool(fp4_scratch.get('res_epilogue', True)))
                 rc = fvk_fp4.cutlass_fp4_gemm_variant(
                     attn_variant,
                     sc_at.packed.data_ptr(), sc_at.sfa.data_ptr(),
                     aw_attn['o']['packed'].data_ptr(),
                     aw_attn['o']['sfb'].data_ptr(),
-                    fg, Se, D, D, 1.0, 0.0, stream)
+                    x if res_in_epilogue else fg, Se, D, D, 1.0,
+                    1.0 if res_in_epilogue else 0.0, stream)
                 if rc != 0:
                     raise RuntimeError(
                         f"encoder FP4 O GEMM layer {l} failed rc={rc}")
             else:
+                res_in_epilogue = False
                 fvk.quantize_fp8_static_fp16(attn_out, o_fp8, as_o, Se * D,
                                              stream)
                 fvk.cutlass_fp8_sq(o_fp8, weights['o_w'][l], fg,
@@ -230,11 +247,23 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
                 awq_dn = (fp4_scratch.get('awq_inv_s_dn') or {}).get(l)
 
                 # Pre-GEMM: F3 / F3+mul → x_fp4 + SFA at sc_gu
-                if awq_gu is None:
+                if rowops_v2 and res_in_epilogue:
+                    _check(fvk_fp4.rowops_rms_mul_fp4_sfa_v2(
+                        x, awq_gu or 0,
+                        sc_gu.packed.data_ptr(), sc_gu.sfa.data_ptr(),
+                        Se, D, stream), 'rowops_rms_mul_fp4_sfa_v2',
+                        l, M=Se, N=D)
+                elif awq_gu is None:
                     fvk_fp4.residual_add_rms_norm_fp4_sfa_fp16(
                         x, fg,
                         sc_gu.packed.data_ptr(), sc_gu.sfa.data_ptr(),
                         Se, D, stream)
+                elif rowops_v2:
+                    _check(fvk_fp4.rowops_residual_rms_mul_fp4_sfa_v2(
+                        x, fg, awq_gu,
+                        sc_gu.packed.data_ptr(), sc_gu.sfa.data_ptr(),
+                        Se, D, stream), 'rowops_residual_rms_mul_fp4_sfa_v2',
+                        l, M=Se, N=D)
                 else:
                     fvk_fp4.residual_add_rms_norm_mul_fp4_sfa_fp16(
                         x, fg, awq_gu,
@@ -357,20 +386,31 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
                         f"cutlass_fp4_gemm_variant[down_x,v{variant_dn_x}]", l,
                         M=Se, N=D, K=2 * H)
                 else:
+                    down_res = rowops_v2 and res_in_epilogue
                     _check(fvk_fp4.cutlass_fp4_gemm_variant(
                         variant_dn,
                         sc_dn.packed.data_ptr(), sc_dn.sfa.data_ptr(),
                         w_dn['packed'].data_ptr(), w_dn['sfb'].data_ptr(),
-                        fg_fp16_ptr,
-                        Se, D, H, 1.0, 0.0, stream),
+                        x if down_res else fg_fp16_ptr,
+                        Se, D, H, 1.0, 1.0 if down_res else 0.0, stream),
                         f"cutlass_fp4_gemm_variant[down,v{variant_dn}]", l,
                         M=Se, N=D, K=H)
 
                 # 11. residual + RMSNorm → FP8 for next layer (unchanged)
                 # Uses fg_fp16 (Down GEMM fp16 output) as the residual delta.
                 as_next = act_scales + ((l + 1) * 4 + 0) * 4
-                fvk.residual_add_rms_norm_fp8_noweight_fp16(
-                    x, fg_fp16_ptr, x_fp8, Se, D, as_next, stream)
+                if (rowops_v2 and res_in_epilogue
+                        and fp4_scratch.get('p1_combiner') != 'epilogue'):
+                    _check(fvk_fp4.rowops_rms_fp8_v2(
+                        x, x_fp8, Se, D, as_next, stream),
+                        'rowops_rms_fp8_v2', l, M=Se, N=D)
+                elif rowops_v2:
+                    _check(fvk_fp4.rowops_residual_rms_fp8_v2(
+                        x, fg_fp16_ptr, x_fp8, Se, D, as_next, stream),
+                        'rowops_residual_rms_fp8_v2', l, M=Se, N=D)
+                else:
+                    fvk.residual_add_rms_norm_fp8_noweight_fp16(
+                        x, fg_fp16_ptr, x_fp8, Se, D, as_next, stream)
             else:
                 # ── FP8 path: identical to original encoder_forward ──
                 # 7. residual + RMSNorm → FP8
@@ -418,6 +458,7 @@ def siglip_forward_with_fp4_ffn(gemm, fvk, fvk_fp4, bufs, weights, dims,
         fp4_scratch: {'ln_act': FP4ActScratch(S, D),
                       'hid_act': FP4ActScratch(S, H_pad), 'H_pad': int}
     """
+    rowops_v2 = bool((fp4_scratch or {}).get('rowops_v2'))
     if fp4_weights is None or fp4_scratch is None:
         raise ValueError(
             "siglip_forward_with_fp4_ffn requires fp4_weights and "
@@ -452,9 +493,14 @@ def siglip_forward_with_fp4_ffn(gemm, fvk, fvk_fp4, bufs, weights, dims,
         # ── Attention half: identical to siglip_forward (FP8) ──
         # Vectorized single-pass LayerNorm; falls back to the original
         # kernel on unsupported dims.
-        rc = fvk_fp4.layer_norm_fp8_vec_fp16(
-            x, weights['ln_attn_w'][l], weights['ln_attn_b'][l], x_fp8,
-            S, D, 1e-5, stream)
+        if rowops_v2:
+            rc = fvk_fp4.rowops_layer_norm_fp8_v2(
+                x, weights['ln_attn_w'][l], weights['ln_attn_b'][l], x_fp8,
+                S, D, 1e-5, stream)
+        else:
+            rc = fvk_fp4.layer_norm_fp8_vec_fp16(
+                x, weights['ln_attn_w'][l], weights['ln_attn_b'][l], x_fp8,
+                S, D, 1e-5, stream)
         if rc != 0:
             fvk.layer_norm_fp8(x, x_fp8, weights['ln_attn_w'][l],
                                weights['ln_attn_b'][l], S, D, 1e-5, stream)
@@ -486,11 +532,18 @@ def siglip_forward_with_fp4_ffn(gemm, fvk, fvk_fp4, bufs, weights, dims,
                                  weights['down_b'][l], S, D, H, a_down,
                                  stream)
             continue
-        rc = fvk_fp4.layer_norm_mul_fp4_sfa_vec_fp16(
-            x, weights['ln_ffn_w'][l], weights['ln_ffn_b'][l],
-            w.get('ln_inv_s', 0),
-            sc_ln.packed.data_ptr(), sc_ln.sfa.data_ptr(),
-            S, D, 1e-5, stream)
+        if rowops_v2:
+            rc = fvk_fp4.rowops_layer_norm_mul_fp4_sfa_v2(
+                x, weights['ln_ffn_w'][l], weights['ln_ffn_b'][l],
+                w.get('ln_inv_s', 0),
+                sc_ln.packed.data_ptr(), sc_ln.sfa.data_ptr(),
+                S, D, 1e-5, stream)
+        else:
+            rc = fvk_fp4.layer_norm_mul_fp4_sfa_vec_fp16(
+                x, weights['ln_ffn_w'][l], weights['ln_ffn_b'][l],
+                w.get('ln_inv_s', 0),
+                sc_ln.packed.data_ptr(), sc_ln.sfa.data_ptr(),
+                S, D, 1e-5, stream)
         if rc != 0:
             rc = fvk_fp4.layer_norm_mul_fp4_sfa_fp16(
                 x, weights['ln_ffn_w'][l], weights['ln_ffn_b'][l],

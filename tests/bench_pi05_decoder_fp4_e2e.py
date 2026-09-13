@@ -53,6 +53,9 @@ PUBLIC_API_PRESET = {
     "decoder_fused_attn": 0,
     "decoder_fused_geglu": 1,
     "decoder_fused_geglu_nod": 0,
+    "decoder_attn_splitkv": 0,
+    "rowops_v2": 0,
+    "rowops_res_epilogue": 1,
     "awq_alpha": 0.8,
     "encoder_attn_o_fp4": 1,
     "encoder_attn_qkv_fp4": 0,
@@ -163,6 +166,21 @@ def main() -> int:
         "--decoder-fused-geglu-nod", type=int, choices=(0, 1), default=0,
         help="No-D-store variant of the fused decoder GeGLU (requires "
              "--decoder-fused-geglu 1)")
+    parser.add_argument(
+        "--decoder-attn-splitkv", type=int, choices=(0, 1), default=0,
+        help="Single-pass split-KV decoder attention with the NVFP4 "
+             "activation quantize fused into its combine step (replaces "
+             "the cuBLAS QK^T/softmax/PV chain + quantize launch)")
+    parser.add_argument(
+        "--rowops-v2", type=int, choices=(0, 1), default=0,
+        help="Warp-per-row encoder/SigLIP norm + quantize kernels with the "
+             "hardware e2m1/e4m3 conversions (replaces the one-CTA-per-row "
+             "originals)")
+    parser.add_argument(
+        "--rowops-res-epilogue", type=int, choices=(0, 1), default=1,
+        help="With --rowops-v2 1: accumulate the encoder O and Down "
+             "projections into the residual stream inside the GEMM epilogue "
+             "(beta=1) instead of a separate residual-add kernel")
     parser.add_argument("--awq-alpha", type=float, default=0.8)
     parser.add_argument(
         "--encoder-attn-o-fp4", type=int, choices=(0, 1), default=1,
@@ -280,6 +298,9 @@ def main() -> int:
                 decoder_fused_attn=bool(args.decoder_fused_attn),
                 decoder_fused_geglu=bool(args.decoder_fused_geglu),
                 decoder_fused_geglu_nod=bool(args.decoder_fused_geglu_nod),
+                decoder_attn_splitkv=bool(args.decoder_attn_splitkv),
+                rowops_v2=bool(args.rowops_v2),
+                rowops_res_epilogue=bool(args.rowops_res_epilogue),
                 use_fp4_decoder=True,
                 use_fa4=True,
                 use_fp4_encoder_attn=bool(args.encoder_attn_o_fp4),
@@ -388,6 +409,9 @@ def main() -> int:
                     "decoder_fused_geglu": bool(args.decoder_fused_geglu),
                     "decoder_fused_geglu_nod": bool(
                         args.decoder_fused_geglu_nod),
+                    "decoder_attn_splitkv": bool(args.decoder_attn_splitkv),
+                    "rowops_v2": bool(args.rowops_v2),
+                    "rowops_res_epilogue": bool(args.rowops_res_epilogue),
                     "decoder_gate_up_variant": args.decoder_gate_up_variant,
                     "attention": "fa4_siglip_encoder",
                 }
@@ -454,6 +478,9 @@ def main() -> int:
             "--decoder-fused-attn", str(args.decoder_fused_attn),
             "--decoder-fused-geglu", str(args.decoder_fused_geglu),
             "--decoder-fused-geglu-nod", str(args.decoder_fused_geglu_nod),
+            "--decoder-attn-splitkv", str(args.decoder_attn_splitkv),
+            "--rowops-v2", str(args.rowops_v2),
+            "--rowops-res-epilogue", str(args.rowops_res_epilogue),
             "--awq-alpha", str(args.awq_alpha),
             "--encoder-fp4-layer-count", str(args.encoder_fp4_layer_count),
             "--encoder-attn-o-fp4", str(args.encoder_attn_o_fp4),
