@@ -306,6 +306,8 @@ Constructor keyword / bench flag pairs. Defaults are the production tier.
 | `siglip_down_variant` / `--siglip-down-variant` | `0` | SigLIP Down GEMM tile; the base 128x128x256 measures best |
 | `encoder_attn_o_variant` / `--encoder-attn-o-variant` | `1` | NVFP4 encoder attention-O projection GEMM variant |
 | `decoder_qkv_variant`, `decoder_o_variant`, `decoder_down_variant` | `28` | decoder projection GEMM variants (bench flags of the same names). `28` = operand-swapped 2-SM tile with three weight k-tiles streamed before the PDL wait (§8.3); `10` = the previous 128x64x256 tile |
+| `decoder_fused_geglu_swap` / `--decoder-fused-geglu-swap` | `False` | operand-swapped fused GeGLU (column compact store, byte-identical output); faster hot but slower in the pipeline (§8.3), off |
+| `decoder_attn_mqa` / `--decoder-attn-mqa` | `False` | single-kernel MQA decoder attention with the split merge and NVFP4 quantize fused (`mma.sync`); numerically equivalent, slower than the cuBLAS chain on Thor (§8.3), off |
 | `pdl` / `--pdl` | `True` | programmatic dependent launch for the NVFP4 GEMMs and the activation kernels of this module (§8.2) |
 | `pdl_fvk` / `--pdl-fvk` | `False` | also PDL-launch the rope/softmax/FP8-quantize kernels and the FP8 encoder GEMM; measured within noise |
 | decoder/encoder GEMM variants `15`–`17` | opt-in | mainloop fork that streams the weight tiles before the PDL wait; helps only when a GEMM directly follows a GEMM (72-GEMM chain 0.901 → 0.837 ms/step), within noise in the pipeline |
@@ -435,7 +437,11 @@ placement) costs 30%. The 72-GEMM decoder chain goes 0.900 → 0.761 ms per
 denoise step, 230 GB/s = 94% of the measured 246 GB/s read peak. Two
 alternating pipeline rounds at 3 views: 29.45 → 28.56 ms with identical
 outputs, which makes variant 28 the default for the qkv, O and down
-projections.
+projections. The fused GeGLU gate_up stays on the 128x64x256 tile: its
+swapped form (column compact store, `--decoder-fused-geglu-swap`) is
+byte-identical and 20% faster hot but 1.1 ms slower in the pipeline —
+with one tile per CTA its cost is waves × per-CTA latency, and the
+heavier epilogue lengthens every wave.
 
 ### Approaches measured and rejected
 
@@ -483,6 +489,24 @@ projections.
 - **No-D-store decoder GeGLU.** The same elision applied to the decoder
   tile is a wash (the dummy store there is 0.04 MB), so it ships opt-in
   (`--decoder-fused-geglu-nod`) and stays off by default.
+- **Persistent L2 weight pump** (`csrc/fused_fp4/l2_pump.cu`: resident
+  CTAs issuing `cp.async.bulk.prefetch.L2` one layer ahead, paced by a
+  progress counter, on a forked graph branch). On Thor the bulk prefetch
+  path delivers at most ~160 GB/s (a prefetch followed by a read takes
+  longer than the cold read alone; more CTAs only issue faster, the lines
+  arrive at the same rate), and a concurrent prefetch stream slows the
+  latency-bound hot GEMMs by 27%. The decoder chain went 0.87 → 1.25 ms
+  per step — every weight byte read twice.
+- **Single-kernel MQA decoder attention on `mma.sync`**
+  (`csrc/fused_fp4/attn_mqa_s16_fp4out.cu`, `--decoder-attn-mqa`):
+  QKᵀ/softmax/PV per head pair with a 64-key `cp.async` pipeline, split
+  merge and the NVFP4 quantize fused. Output bytes match the cuBLAS chain
+  plus quantize at 99.7–99.9% (scale factors 100%), but 21.6 µs against
+  9.7: on this part `mma.sync` runs at roughly a quarter of the UMMA rate
+  the cuBLAS kernels use (1.7 µs per 64-key tile of tensor-core work), and
+  the merge/partial traffic adds a fixed ~11 µs. A tcgen05 version would
+  be needed to beat the chain.
+
 ---
 
 ## 9. Reproducing
@@ -533,8 +557,9 @@ Measurement discipline:
 | SigLIP / encoder pipeline | `flash_rt/hardware/thor/shared_primitives_fp4.py` |
 | attention dispatch (FA4, cuBLAS, seqused) | `flash_rt/hardware/thor/attn_backend.py` |
 | NVFP4 / INT4 GEMM runners | `csrc/gemm/fp4/` |
-| fused GeGLU store epilogue | `csrc/gemm/fp4/sm100_gelu_mul_blockscale_visitor.hpp` |
+| fused GeGLU store epilogue (row compact store; column compact store for the swapped orientation) | `csrc/gemm/fp4/sm100_gelu_mul_blockscale_visitor.hpp`, `csrc/gemm/fp4/cutlass_fp4_gemm_geglu_il_swap_sm100.cu` |
 | operand-swapped decoder GEMMs, early-weight mainloop fork, forked kernel layer | `csrc/gemm/fp4/cutlass_fp4_gemm_variants_swap.cu`, `csrc/gemm/fp4/cutlass_fp4_gemm_variants_earlyb.cu`, `csrc/gemm/fp4/sm100_blockscaled_mma_earlyb.hpp`, `csrc/gemm/fp4/sm100_gemm_seq_kernel.hpp` |
+| measured-and-rejected kernels kept opt-in | `csrc/fused_fp4/l2_pump.cu`, `csrc/fused_fp4/attn_mqa_s16_fp4out.cu`, `csrc/fused_fp4/pi05_dec_attn_splitkv.cu` |
 | fused norm / quantize / activation kernels | `csrc/fused_fp4/`, `csrc/quantize/` |
 | E0M3 quantizer and activation kernels | `csrc/quantize/quantize_e0m3_sfa.cu`, `csrc/fused_fp4/pi05_e0m3_act.cu` |
 

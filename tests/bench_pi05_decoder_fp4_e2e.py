@@ -53,7 +53,9 @@ PUBLIC_API_PRESET = {
     "decoder_fused_attn": 0,
     "decoder_fused_geglu": 1,
     "decoder_fused_geglu_nod": 0,
+    "decoder_fused_geglu_swap": 0,
     "decoder_attn_splitkv": 0,
+    "decoder_attn_mqa": 0,
     "rowops_v2": 1,
     "rowops_res_epilogue": 1,
     "encoder_attn_o_variant": 1,
@@ -185,10 +187,18 @@ def main() -> int:
         help="No-D-store variant of the fused decoder GeGLU (requires "
              "--decoder-fused-geglu 1)")
     parser.add_argument(
+        "--decoder-fused-geglu-swap", type=int, choices=(0, 1), default=0,
+        help="Operand-swapped fused decoder GeGLU (weights as the A operand, "
+             "2-SM tile, early weight stream; requires --decoder-fused-geglu 1)")
+    parser.add_argument(
         "--decoder-attn-splitkv", type=int, choices=(0, 1), default=0,
         help="Single-pass split-KV decoder attention with the NVFP4 "
              "activation quantize fused into its combine step (replaces "
              "the cuBLAS QK^T/softmax/PV chain + quantize launch)")
+    parser.add_argument(
+        "--decoder-attn-mqa", type=int, choices=(0, 1), default=0,
+        help="Fused MQA decoder attention (QK^T/softmax/PV + split merge + "
+             "NVFP4 quantize in one kernel; replaces the cuBLAS chain)")
     parser.add_argument(
         "--rowops-v2", type=int, choices=(0, 1), default=1,
         help="Warp-per-row encoder/SigLIP norm + quantize kernels with the "
@@ -316,7 +326,9 @@ def main() -> int:
                 decoder_fused_attn=bool(args.decoder_fused_attn),
                 decoder_fused_geglu=bool(args.decoder_fused_geglu),
                 decoder_fused_geglu_nod=bool(args.decoder_fused_geglu_nod),
+                decoder_fused_geglu_swap=bool(args.decoder_fused_geglu_swap),
                 decoder_attn_splitkv=bool(args.decoder_attn_splitkv),
+                decoder_attn_mqa=bool(args.decoder_attn_mqa),
                 rowops_v2=bool(args.rowops_v2),
                 rowops_res_epilogue=bool(args.rowops_res_epilogue),
                 encoder_attn_o_variant=args.encoder_attn_o_variant,
@@ -435,7 +447,10 @@ def main() -> int:
                     "decoder_fused_geglu": bool(args.decoder_fused_geglu),
                     "decoder_fused_geglu_nod": bool(
                         args.decoder_fused_geglu_nod),
+                    "decoder_fused_geglu_swap": bool(
+                        args.decoder_fused_geglu_swap),
                     "decoder_attn_splitkv": bool(args.decoder_attn_splitkv),
+                    "decoder_attn_mqa": bool(args.decoder_attn_mqa),
                     "rowops_v2": bool(args.rowops_v2),
                     "rowops_res_epilogue": bool(args.rowops_res_epilogue),
                     "encoder_attn_o_variant": args.encoder_attn_o_variant,
@@ -512,7 +527,9 @@ def main() -> int:
             "--decoder-fused-attn", str(args.decoder_fused_attn),
             "--decoder-fused-geglu", str(args.decoder_fused_geglu),
             "--decoder-fused-geglu-nod", str(args.decoder_fused_geglu_nod),
+            "--decoder-fused-geglu-swap", str(args.decoder_fused_geglu_swap),
             "--decoder-attn-splitkv", str(args.decoder_attn_splitkv),
+            "--decoder-attn-mqa", str(args.decoder_attn_mqa),
             "--rowops-v2", str(args.rowops_v2),
             "--rowops-res-epilogue", str(args.rowops_res_epilogue),
             "--encoder-attn-o-variant", str(args.encoder_attn_o_variant),

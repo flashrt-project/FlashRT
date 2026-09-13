@@ -288,13 +288,16 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
     rht = 1 if dims.get('rht') else 0
     fused_geglu = bool(dims.get('fused_geglu')) and weight_format == 'nvfp4'
     fused_geglu_nod = bool(dims.get('fused_geglu_nod')) and fused_geglu
+    fused_geglu_swap = bool(dims.get('fused_geglu_swap')) and fused_geglu
     act_e0m3 = act_format == 'e0m3'
     attn_splitkv = (bool(dims.get('attn_splitkv')) and not fixed_shape
                     and not act_e0m3)
+    attn_mqa = (bool(dims.get('attn_mqa')) and not fixed_shape
+                and not act_e0m3 and not attn_splitkv)
     attn_ws = bufs.get('attn_ws', 0)
-    if attn_splitkv and not attn_ws:
+    if (attn_splitkv or attn_mqa) and not attn_ws:
         raise ValueError(
-            "Pi0.5 Thor decoder attn_splitkv requires bufs['attn_ws']")
+            "Pi0.5 Thor decoder attn_splitkv/attn_mqa requires bufs['attn_ws']")
     if act_format not in ('nvfp4', 'e0m3'):
         raise ValueError(
             f"Pi0.5 Thor decoder FP4 unknown act_format {act_format!r}")
@@ -406,6 +409,19 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
                     raise RuntimeError(
                         f"Pi0.5 decoder FP4 split-KV attention layer {l} "
                         f"failed rc={rc}")
+            elif attn_mqa:
+                # One kernel: QK^T, softmax, PV over the shared KV head with
+                # the split merge and the NVFP4 quantize fused (replaces the
+                # cuBLAS chain + quantize launch).
+                K_ptr = Kc + l * total_keys * HD * 2
+                V_ptr = Vc + l * total_keys * HD * 2
+                rc = fvk_fp4.attn_mqa_s16_fp4out(
+                    attn_out, K_ptr, V_ptr, attn_ws, ctx_fp4, ctx_sfa,
+                    S, total_keys, NH, HD, attn_scale, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 MQA attention layer {l} "
+                        f"failed rc={rc}")
             else:
                 if attn is not None:
                     attn.run("decoder", l, q_seq=S, kv_seq=total_keys,
@@ -451,6 +467,9 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
                 geglu_v10 = (fvk_fp4.cutlass_fp4_gemm_geglu_il_hw_nod_v10
                              if fused_geglu_nod
                              else fvk_fp4.cutlass_fp4_gemm_geglu_il_hw_v10)
+                if fused_geglu_swap:
+                    # Operand-swapped 2-SM form with the early weight stream.
+                    geglu_v10 = fvk_fp4.cutlass_fp4_gemm_geglu_il_hw_nod_swap
                 rc = geglu_v10(
                     xn_fp4, xn_sfa,
                     weights['gwil_fp4'][l], weights['gwil_sfb'][l],

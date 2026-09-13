@@ -75,5 +75,16 @@ int cutlass_fp4_gemm_geglu_il_hw_nod_v10(
     int M, int N_il, int K,
     cudaStream_t stream);
 
+// Operand-swapped form (weights as the A operand, 2-SM tile, early weight
+// stream); same argument order and the same compact outputs, byte for byte.
+int cutlass_fp4_gemm_geglu_il_hw_nod_swap(
+    void const* A_packed, void const* SFA,
+    void const* B_packed, void const* SFB,
+    void*       D_dummy,
+    void*       compact_packed,
+    void*       compact_sfa,
+    int M, int N_il, int K,
+    cudaStream_t stream);
+
 }  // namespace fp4
 }  // namespace flash_rt

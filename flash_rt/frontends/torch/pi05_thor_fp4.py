@@ -96,7 +96,9 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  decoder_fused_attn: bool = False,
                  decoder_fused_geglu: bool = True,
                  decoder_fused_geglu_nod: bool = False,
+                 decoder_fused_geglu_swap: bool = False,
                  decoder_attn_splitkv: bool = False,
+                 decoder_attn_mqa: bool = False,
                  rowops_v2: bool = True,
                  rowops_res_epilogue: bool = True,
                  encoder_attn_o_variant: int = 1,
@@ -203,7 +205,10 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         # the collective's own D store elided).
         self.decoder_fused_geglu_nod = (bool(decoder_fused_geglu_nod)
                                         and self.decoder_fused_geglu)
+        self.decoder_fused_geglu_swap = (bool(decoder_fused_geglu_swap)
+                                         and self.decoder_fused_geglu)
         self.decoder_attn_splitkv = bool(decoder_attn_splitkv)
+        self.decoder_attn_mqa = bool(decoder_attn_mqa)
         self.rowops_v2 = bool(rowops_v2)
         self.rowops_res_epilogue = bool(rowops_res_epilogue)
         self.encoder_attn_o_variant = int(encoder_attn_o_variant)
@@ -383,13 +388,17 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
     # -------------------------------------------------------------------
 
     def _decoder_attn_ws_ptr(self) -> int:
-        """Workspace for the split-KV decoder attention (0 when disabled)."""
-        if not self.decoder_attn_splitkv:
+        """Workspace for the fused decoder attention kernels (0 when disabled)."""
+        if not (self.decoder_attn_splitkv or self.decoder_attn_mqa):
             return 0
         if self._decoder_attn_ws is None:
             import torch
             from flash_rt import flash_rt_fp4 as fvk_fp4
-            n = int(fvk_fp4.pi05_dec_attn_splitkv_ws_bytes())
+            n = 0
+            if self.decoder_attn_splitkv:
+                n = max(n, int(fvk_fp4.pi05_dec_attn_splitkv_ws_bytes()))
+            if self.decoder_attn_mqa:
+                n = max(n, int(fvk_fp4.attn_mqa_s16_fp4out_ws_bytes(8)))
             self._decoder_attn_ws = torch.zeros(n, dtype=torch.uint8,
                                                 device='cuda')
         return int(self._decoder_attn_ws.data_ptr())
@@ -1455,7 +1464,9 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
             ae_dims['rht'] = self.decoder_rht
             ae_dims['fused_geglu'] = self.decoder_fused_geglu
             ae_dims['fused_geglu_nod'] = self.decoder_fused_geglu_nod
+            ae_dims['fused_geglu_swap'] = self.decoder_fused_geglu_swap
             ae_dims['attn_splitkv'] = self.decoder_attn_splitkv
+            ae_dims['attn_mqa'] = self.decoder_attn_mqa
             if self._attn is not None:
                 # Fold the decoder seqused mask into the softmax kernel.
                 self._attn.use_fused_softmax = self.decoder_fused_attn

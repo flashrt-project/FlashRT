@@ -35,6 +35,8 @@
 #include "fused_fp4/pi05_rowops_v2.cuh"
 #include "gemm/fp4/nvfp4_m16_gemm_sm110.cuh"
 #include "fused_fp4/l2_prefetch.cuh"
+#include "fused_fp4/l2_pump.cuh"
+#include "fused_fp4/attn_mqa_s16_fp4out.cuh"
 #include "fused_fp4/pdl.cuh"
 #include "gemm/fp4/cutlass_fp4_gemm_siglip_ffn_variants_sm100.cuh"
 #include "quantize/reshape_scales_sfa.cuh"
@@ -370,6 +372,48 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
                                                     reinterpret_cast<void*>(sink));
         }, py::arg("regions"), py::arg("stream") = 0, py::arg("mode") = 0, py::arg("sink") = 0,
         "Issue cp.async.bulk.prefetch.L2 over up to 8 (ptr, bytes) regions; returns without waiting.");
+  m.def("l2_pump_launch",
+        [](const std::vector<std::vector<std::pair<uintptr_t, unsigned long long>>>& units,
+           int total_units, int ahead, uintptr_t progress, unsigned chunk_bytes,
+           unsigned long long spin_limit, uintptr_t stream, int nctas) -> int {
+          flash_rt::fp4::L2PumpArgs a{};
+          if (units.empty() || units.size() > static_cast<size_t>(flash_rt::fp4::kL2PumpMaxUnits)) return -1;
+          int c = 0;
+          for (size_t u = 0; u < units.size(); ++u) {
+            a.unit_begin[u] = c;
+            for (auto const& r : units[u]) {
+              if (c >= flash_rt::fp4::kL2PumpMaxChunks) return -1;
+              a.ptr[c] = reinterpret_cast<const void*>(r.first); a.bytes[c] = r.second; ++c;
+            }
+          }
+          a.unit_begin[units.size()] = c;
+          a.nunits = static_cast<int>(units.size()); a.total_units = total_units; a.ahead = ahead;
+          a.progress = reinterpret_cast<const int*>(progress); a.chunk_bytes = chunk_bytes; a.spin_limit = spin_limit;
+          return flash_rt::fp4::l2_pump_launch(a, reinterpret_cast<cudaStream_t>(stream), nctas);
+        }, py::arg("units"), py::arg("total_units"), py::arg("ahead") = 1, py::arg("progress") = 0,
+        py::arg("chunk_bytes") = 32768, py::arg("spin_limit") = 2000000ull, py::arg("stream") = 0, py::arg("nctas") = 1,
+        "Persistent 1-CTA L2 pump: prefetch unit (i % nunits) for i in [0,total_units) once *progress >= i-ahead.");
+  m.def("attn_mqa_s16_fp4out_ws_bytes",
+        [](int NH) -> size_t { return flash_rt::fp4::attn_mqa_s16_fp4out_ws_bytes(NH); }, py::arg("NH"),
+        "Workspace bytes for attn_mqa_s16_fp4out (zero-fill once at allocation).");
+  m.def("attn_mqa_s16_fp4out",
+        [](uintptr_t Q, uintptr_t K, uintptr_t V, uintptr_t ws, uintptr_t packed, uintptr_t sfa,
+           int S, int T, int NH, int HD, float attn_scale, uintptr_t stream, int variant, int dbg) -> int {
+          return flash_rt::fp4::attn_mqa_s16_fp4out(
+              reinterpret_cast<void const*>(Q), reinterpret_cast<void const*>(K), reinterpret_cast<void const*>(V),
+              reinterpret_cast<void*>(ws), reinterpret_cast<void*>(packed), reinterpret_cast<void*>(sfa),
+              S, T, NH, HD, attn_scale, reinterpret_cast<cudaStream_t>(stream), variant, dbg);
+        },
+        py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("ws"), py::arg("packed"), py::arg("sfa"),
+        py::arg("S"), py::arg("T"), py::arg("NH"), py::arg("HD"), py::arg("attn_scale"), py::arg("stream") = 0,
+        py::arg("variant") = 0, py::arg("dbg") = 0,
+        "MQA attention (S<=16 query rows, one KV head, HD=256, fp16) with the split merge and the NVFP4 "
+        "activation quantize fused: emits the packed e2m1 rows and CUTLASS SFA bytes directly.");
+  m.def("l2_pump_progress_store",
+        [](uintptr_t progress, int value, uintptr_t stream) -> int {
+          return flash_rt::fp4::l2_pump_progress_store(reinterpret_cast<int*>(progress), value,
+                                                       reinterpret_cast<cudaStream_t>(stream));
+        }, py::arg("progress"), py::arg("value"), py::arg("stream") = 0);
   m.def("nvfp4_m16_gemm_fp16out",
         [](uintptr_t A, uintptr_t SFA, uintptr_t B, uintptr_t SFB, uintptr_t D,
            int M, int N, int K, uintptr_t stream) -> int {
@@ -1157,6 +1201,45 @@ pointer).  Same contract as cutlass_fp4_gemm_geglu_il_hw otherwise.
                       "and K a positive multiple of 16",
                       shape);
           return flash_rt::fp4::cutlass_fp4_gemm_geglu_il_hw_nod_v10(
+              reinterpret_cast<void const*>(A_packed),
+              reinterpret_cast<void const*>(SFA),
+              reinterpret_cast<void const*>(B_packed),
+              reinterpret_cast<void const*>(SFB),
+              reinterpret_cast<void*>(D_dummy),
+              reinterpret_cast<void*>(compact_packed),
+              reinterpret_cast<void*>(compact_sfa),
+              M, N_il, K,
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("A_packed"), py::arg("SFA"),
+        py::arg("B_packed"), py::arg("SFB"),
+        py::arg("D_dummy"), py::arg("compact_packed"), py::arg("compact_sfa"),
+        py::arg("M"), py::arg("N_il"), py::arg("K"),
+        py::arg("stream") = 0,
+        R"pbdoc(
+Skinny-M no-D-store fused GeGLU GEMM on the decoder tile (128x64x256);
+same contract as cutlass_fp4_gemm_geglu_il_hw_nod.
+)pbdoc");
+
+  m.def("cutlass_fp4_gemm_geglu_il_hw_nod_swap",
+        [](uintptr_t A_packed, uintptr_t SFA,
+           uintptr_t B_packed, uintptr_t SFB,
+           uintptr_t D_dummy, uintptr_t compact_packed, uintptr_t compact_sfa,
+           int M, int N_il, int K, uintptr_t stream) -> int {
+          const auto shape = fp4_kernel_shape({{"M", M}, {"N_il", N_il}, {"K", K}});
+          require_fp4_ptrs("cutlass_fp4_gemm_geglu_il_hw_nod_swap",
+                           {{"A_packed", A_packed}, {"SFA", SFA},
+                            {"B_packed", B_packed}, {"SFB", SFB},
+                            {"D_dummy", D_dummy},
+                            {"compact_packed", compact_packed},
+                            {"compact_sfa", compact_sfa}}, shape);
+          require_fp4(M > 0 && N_il > 0 && K > 0 && (N_il % 32) == 0 &&
+                      (K % 16) == 0,
+                      "cutlass_fp4_gemm_geglu_il_hw_nod_swap",
+                      "M must be positive, N_il a positive multiple of 32 "
+                      "and K a positive multiple of 16",
+                      shape);
+          return flash_rt::fp4::cutlass_fp4_gemm_geglu_il_hw_nod_swap(
               reinterpret_cast<void const*>(A_packed),
               reinterpret_cast<void const*>(SFA),
               reinterpret_cast<void const*>(B_packed),
