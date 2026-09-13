@@ -114,6 +114,7 @@ BF16_NP = ml_dtypes.bfloat16  # real BF16 numpy dtype for numeric staging
 FP8 = np.uint8
 FP32 = np.float32
 INT8 = np.int8
+INT32 = np.int32
 
 
 class Pi05Pipeline:
@@ -851,7 +852,31 @@ class Pi05Pipeline:
         self._skinny_partials: CudaBuffer | None = None
         self._skinny_partials_rows = 0
         self._skinny_ensure_partials(self.chunk_size)
+        # Single-launch split-KV cross-attention joining the PDL chain
+        # (FLASHRT_PI05_SKINNY_ATTN=0 keeps the FlashAttention-2 pair).
+        # Needs the packed decoder output buffer and a chunk of <= 16 rows.
+        self._skinny_attn = (os.environ.get("FLASHRT_PI05_SKINNY_ATTN", "1") != "0"
+                             and hasattr(self.fvk, "dec_skinny_attn")
+                             and self.chunk_size <= 16
+                             and bool(self._attn_ptrs.get("dec_O", 0)))
+        self._skinny_attn_scratch: CudaBuffer | None = None
+        self._skinny_attn_counters: CudaBuffer | None = None
+        self._skinny_attn_samples = 0
+        if self._skinny_attn:
+            self._skinny_ensure_attn_scratch(1)
         return True
+
+    def _skinny_ensure_attn_scratch(self, samples: int) -> None:
+        """Size the split-KV partial scratch and counters for ``samples``
+        batch slots (before capture; the batched pipeline calls it with B)."""
+        if samples <= self._skinny_attn_samples:
+            return
+        kv_len = self.encoder_seq_len + self.chunk_size
+        splits = self.fvk.dec_skinny_attn_splits(kv_len)
+        floats = self.fvk.dec_skinny_attn_scratch_floats(splits, samples, DEC_NH)
+        self._skinny_attn_scratch = CudaBuffer.device_zeros(int(floats), FP32)
+        self._skinny_attn_counters = CudaBuffer.device_zeros(samples * DEC_NH, INT32)
+        self._skinny_attn_samples = samples
 
     def _skinny_ensure_partials(self, rows: int) -> None:
         """Size the FP32 partial-sum scratch for ``rows`` decoder rows.
@@ -880,6 +905,7 @@ class Pi05Pipeline:
                               rows: int | None = None, suffix: str = "",
                               attn_ptrs: dict | None = None,
                               kv_ptrs: tuple[int, int] | None = None,
+                              kv_base_ptrs: tuple[int, int] | None = None,
                               devpos_ptr: int = 0, kv_sample_stride: int = 0,
                               dec_o_ptr_fn=None) -> None:
         """One decoder layer on the skinny FP8 family (calibrated FP8 only).
@@ -941,8 +967,19 @@ class Pi05Pipeline:
             devpos_ptr, m, DEC_NH * DEC_HD, DEC_NKV * DEC_HD, DEC_NKV * DEC_HD, DEC_HD,
             ds, kv_sample_stride, pdl, stream), "qkv rope")
 
-        # Cross-attention over the encoder cache + fresh action rows.
-        if dec_o_ptr_fn is not None:
+        # Cross-attention over the encoder cache + fresh action rows: one
+        # split-KV launch in the PDL chain, or the backend's FA2 pair.
+        if self._skinny_attn:
+            samples = m // ds
+            k_base, v_base = kv_base_ptrs if kv_base_ptrs is not None else self._enc_kv_layer_ptrs(i, 0)
+            seqused_ptr = self.attn.dec_seqused.data_ptr() if self._fixed_shape else 0
+            dec_o_ptr = ap["dec_O"]
+            _check(fvk.dec_skinny_attn(
+                ap["dec_Q"], k_base, v_base, dec_o_ptr, ds, samples, DEC_NH, DEC_NH * DEC_HD,
+                enc_seq + ds, seqused_ptr, kv_sample_stride, 1.0 / math.sqrt(DEC_HD),
+                self._skinny_attn_scratch.ptr.value, self._skinny_attn_counters.ptr.value,
+                pdl, stream), "attention")
+        elif dec_o_ptr_fn is not None:
             dec_o_ptr = dec_o_ptr_fn()
         else:
             dec_o_ptr = self.attn.run("decoder", i, q_seq=ds, kv_seq=enc_seq + ds, stream=stream)
@@ -1666,47 +1703,77 @@ class Pi05Pipeline:
             for step in range(self.num_steps):
                 self._fp8_current_decoder_step = step
                 self._copy_rtc_prefix(rtc_prefix_len, stream)
-                # C0: Action input projection: noise (ds, 32) → decoder_x (ds, 1024)
-                gemm.bf16_nn(
-                    B["diffusion_noise"].ptr.value,
-                    W["decoder_action_in_proj_w"],
-                    B["decoder_x"].ptr.value,
-                    ds, DEC_D, ACTION_DIM, stream=stream)
-                self._bias_add_bf16(
-                    B["decoder_x"].ptr.value, W["decoder_action_in_proj_b"],
-                    ds, DEC_D, stream)
+                skinny_step = fused and self._skinny
+                if skinny_step:
+                    # C0 + C1 of layer 0 in one launch: action input
+                    # projection with bias into the residual stream, then
+                    # the first adaptive norm to FP8.
+                    rc = fvk.dec_skinny_action_in_norm(
+                        B["diffusion_noise"].ptr.value,
+                        W["decoder_action_in_proj_w"], W["decoder_action_in_proj_b"],
+                        B["decoder_x"].ptr.value, self._rms_ones_dec.ptr.value,
+                        self._style_slice_ptr("decoder_style_attn", step, 0),
+                        B["dec_act_fp8"].ptr.value, B["gate_buf"].ptr.value,
+                        self._fp8_static_scale_ptr("decoder_attn_qkv_w_0"),
+                        ds, 1e-6, self._skinny_pdl, stream)
+                    if rc != 0:
+                        raise RuntimeError(f"skinny decoder action_in failed: cudaError {rc}")
+                else:
+                    # C0: Action input projection: noise (ds, 32) → decoder_x (ds, 1024)
+                    gemm.bf16_nn(
+                        B["diffusion_noise"].ptr.value,
+                        W["decoder_action_in_proj_w"],
+                        B["decoder_x"].ptr.value,
+                        ds, DEC_D, ACTION_DIM, stream=stream)
+                    self._bias_add_bf16(
+                        B["decoder_x"].ptr.value, W["decoder_action_in_proj_b"],
+                        ds, DEC_D, stream)
 
                 # 18 decoder layers
                 for i in range(DEC_L):
-                    skip_c1 = (fused or self.use_int8_decoder) and i > 0
+                    skip_c1 = ((fused or self.use_int8_decoder) and i > 0) or skinny_step
                     self._decoder_layer(i, step, enc_seq, ds, skip_c1, stream)
 
-                # C8: Final AdaRMSNorm + output projection (the skinny
-                # family folds the norm into the last layer's consumer)
-                if not (fused and self._skinny):
+                if skinny_step:
+                    # C8 in one launch: output projection with bias, the
+                    # trace copies, and the in-place Euler update.
+                    trace_x = trace_delta = 0
+                    if self.denoise_trace:
+                        off = step * ds * ACTION_DIM * 2
+                        trace_x = B["denoise_trace_x"].ptr.value + off
+                        trace_delta = B["denoise_trace_delta"].ptr.value + off
+                    rc = fvk.dec_skinny_action_out_residual(
+                        B["x_normed_buf"].ptr.value,
+                        W["decoder_action_out_proj_w"], W["decoder_action_out_proj_b"],
+                        B["decoder_action_buf"].ptr.value, B["diffusion_noise"].ptr.value,
+                        trace_x, trace_delta, ds, self._skinny_pdl, stream)
+                    if rc != 0:
+                        raise RuntimeError(f"skinny decoder action_out failed: cudaError {rc}")
+                else:
+                    # C8: Final AdaRMSNorm + output projection
                     fvk.ada_rms_norm_style(
                         B["decoder_x"].ptr.value, self._rms_ones_dec.ptr.value,
                         self._style_slice_ptr("decoder_style_final", step),
                         B["x_normed_buf"].ptr.value, B["gate_buf"].ptr.value,
                         ds, DEC_D, 1e-6, stream=stream)
-                gemm.bf16_nn(
-                    B["x_normed_buf"].ptr.value,
-                    W["decoder_action_out_proj_w"],
-                    B["decoder_action_buf"].ptr.value,
-                    ds, ACTION_DIM, DEC_D, stream=stream)
-                self._bias_add_bf16(
-                    B["decoder_action_buf"].ptr.value,
-                    W["decoder_action_out_proj_b"],
-                    ds, ACTION_DIM, stream)
-                if self.denoise_trace:
-                    self._record_denoise_step(
-                        step, B["diffusion_noise"], B["decoder_action_buf"],
-                        ds, stream)
-                # noise += action_buf (weights pre-scaled by -1/num_steps by frontend)
-                fvk.residual_add(
-                    B["diffusion_noise"].ptr.value,
-                    B["decoder_action_buf"].ptr.value,
-                    ds * ACTION_DIM, stream=stream)
+                    gemm.bf16_nn(
+                        B["x_normed_buf"].ptr.value,
+                        W["decoder_action_out_proj_w"],
+                        B["decoder_action_buf"].ptr.value,
+                        ds, ACTION_DIM, DEC_D, stream=stream)
+                    self._bias_add_bf16(
+                        B["decoder_action_buf"].ptr.value,
+                        W["decoder_action_out_proj_b"],
+                        ds, ACTION_DIM, stream)
+                    if self.denoise_trace:
+                        self._record_denoise_step(
+                            step, B["diffusion_noise"], B["decoder_action_buf"],
+                            ds, stream)
+                    # noise += action_buf (weights pre-scaled by -1/num_steps by frontend)
+                    fvk.residual_add(
+                        B["diffusion_noise"].ptr.value,
+                        B["decoder_action_buf"].ptr.value,
+                        ds * ACTION_DIM, stream=stream)
                 self._copy_rtc_prefix(rtc_prefix_len, stream)
         finally:
             self._fp8_current_decoder_step = prev_decoder_step

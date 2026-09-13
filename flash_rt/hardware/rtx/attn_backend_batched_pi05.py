@@ -158,6 +158,7 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
             "enc_K": self.enc_K_b2.data_ptr(),
             "enc_V": self.enc_V_b2.data_ptr(),
             "dec_Q": self.dec_Q_b2.data_ptr(),
+            "dec_O": self._dec_O_b2.data_ptr() if getattr(self, "_dec_O_b2", None) is not None else 0,
             "enc_k_layer_stride_bytes": self._enc_kv_layer_stride_bytes_b2,
             "enc_v_layer_stride_bytes": self._enc_kv_layer_stride_bytes_b2,
             "enc_k_sample_stride_bytes": self._enc_kv_sample_stride_bytes_b2,

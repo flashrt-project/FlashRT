@@ -21,19 +21,22 @@ decoder uses it; calibration, the BF16 decoder, INT8, the encoder and the
 vision tower are unchanged. `FLASHRT_PI05_SKINNY_PDL=0` disables the
 programmatic dependent launch attribute for debugging.
 
-Per decoder layer the family issues nine kernels instead of eleven:
+Per decoder layer the family issues ten kernels instead of eleven, and
+per denoising step two more replace the seven around the layer stack:
 
 | stage | kernel | replaces |
 |---|---|---|
+| step start | `action_in_norm`: input projection, bias, first adaptive norm to FP8 | cuBLASLt (K = 32) + bias add + `ada_rms_norm_style_fp8` |
 | QKV projection | `gemm` (K-split partials) | cuBLASLt |
 | | `sum_rope`: scale, BF16 round, RoPE, K/V cache append | `qkv_split_rope` |
-| attention | unchanged (FlashAttention-2 split-KV) | |
+| attention | `attn` split-KV pair: one CTA per 64 keys, head and sample (QK^T and PV on `mma.sync` bf16, K/V/Q staged with `cp.async`, V overlapped with QK^T), then one CTA per row, head and sample combining the partials; keys past the device count are masked, both launches join the PDL chain | FlashAttention-2 split-KV pair (outside the chain) |
 | output projection | `gemm_bf16_act`: BF16 attention output quantized on load | `quantize_fp8_static` + cuBLASLt |
 | | `residual_ada_norm`: gated residual, adaptive RMS norm, FP8 quantize | `gate_residual_ada_norm_fp8` |
 | gate/up | `gemm` | cuBLASLt |
 | | `gate_gelu_fp8`: GeGLU, FP8 quantize | `gate_geglu_merged_fp8` |
 | down | `gemm` | cuBLASLt |
 | | `residual_ada_norm` with the next layer's style (or the final norm in BF16 on the last layer) | `gate_residual_ada_norm_fp8` (+ `ada_rms_norm_style` at the end of the step) |
+| step end | `action_out_residual`: output projection (K = 1024, N = 32), bias, trace copies, Euler update | cuBLASLt (12.9 µs for a 64 KB weight) + bias add + two copies + `residual_add` |
 
 The GEMM kernel: `mma.sync.kind::f8f6f4.m16n8k32` on e4m3 operands, weight
 rows `[N, K]` loaded straight from global memory into the B fragments (a
@@ -79,20 +82,23 @@ four shapes is even, the consumer fusion and the launch chain still pay.
 
 End to end (`infer` median, host round trip included):
 
-| | library decoder | family | 
-|---|---:|---:|
-| B = 1, graph replay | 18.56 ms | 14.36 ms |
-| B = 1, `infer()` | 19.68 ms | 15.48 ms |
-| decoder span inside the graph | 9.08 ms | 5.34 ms |
-| B = 4, per environment | 10.09 ms | 9.24 ms |
-| B = 8, per environment | 8.73 ms | 8.33 ms |
+| | library decoder | family, GEMMs only | family, + attention + step kernels |
+|---|---:|---:|---:|
+| B = 1, graph replay | 18.56 ms | 14.36 ms | 12.94 ms |
+| B = 1, `infer()` | 19.68 ms | 15.48 ms | 14.03 ms |
+| decoder span inside the graph | 9.08 ms | 5.34 ms | 4.53 ms |
+| B = 4, per environment | 10.09 ms | 9.24 ms | 8.73 ms |
+| B = 8, per environment | 8.73 ms | 8.33 ms | 7.89 ms |
 
 Inside the graph the launch gaps were already 0.1–0.2 µs, so the gain comes
-from kernel efficiency and from overlapping the weight fetch of each GEMM
-with its predecessor, not from fewer graph nodes. The remaining decoder time
-per layer is roughly 30 µs: about 9 µs in the two FlashAttention-2 split-KV
-kernels (no PDL), the rest in the four GEMMs and four consumers whose weight
-traffic floor on this GPU is about 11 µs.
+from kernel efficiency and from overlapping each kernel's independent loads
+(weights, style rows, the K/V prefix) with its predecessor, not from fewer
+graph nodes. With PDL off the per-layer kernel costs are: GEMMs 2.5 + 2.4 +
+6.8 + 4.0 µs, consumers 1.5 + 2.4 + 1.4 + 2.3 µs, attention 3.6 + 1.3 µs;
+with PDL on a layer takes about 25 µs of span. The weight-traffic floor per
+layer on this GPU is about 11 µs; the consumers and the attention pair are
+latency-bound at ten rows and are the remaining decoder item (a last-CTA
+epilogue fusion would remove four launches per layer).
 
 Agreement, same prompt, real frames, same noise:
 
@@ -100,8 +106,9 @@ Agreement, same prompt, real frames, same noise:
 |---|---:|---:|
 | family vs library decoder, B = 1 | 0.99998 | 0.012 |
 | library decoder, this build vs the previous kernel build | 0.99998 | 0.012 |
-| family vs library decoder, B = 4, per slot | 0.99998–0.99999 | |
+| family vs library decoder, B = 4, per slot | 0.99997–0.99999 | |
 | 300 graph replays of one input | bit-identical | |
+| attention pair vs torch SDPA (random Q/K/V, masked tail) | 0.9999 | |
 
 The family's difference from the library path is the same size as the
 difference between two builds of the library path (cuBLASLt algorithm
@@ -113,6 +120,9 @@ decoder is untouched and bit-identical across builds.
 - sm_120a only (`mma.kind::f8f6f4`); other targets keep the library path
   automatically (`dec_skinny_available()` gates it at run time).
 - `residual_ada_norm` is specialised for the 1024-wide decoder.
-- The attention pair (about 9 µs per layer) is the largest remaining item;
-  a single-kernel decoder attention that joins the PDL chain is the next
-  step, followed by a per-row-tile weight-sharing variant for M > 16.
+- The attention kernels assume the packed decoder output buffer and a
+  chunk of at most 16 rows; other configurations keep the FlashAttention-2
+  pair (`FLASHRT_PI05_SKINNY_ATTN=0` forces it).
+- Next: fold the consumers into last-CTA GEMM epilogues, a weight-sharing
+  variant for M > 16 (batched rollouts), and the prefix, which is now two
+  thirds of the graph.

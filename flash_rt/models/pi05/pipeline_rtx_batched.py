@@ -79,6 +79,10 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         self._allocate_b2_buffers()
         if self._skinny:
             self._skinny_ensure_partials(self.B * self.chunk_size)
+            if self._skinny_attn:
+                self._skinny_attn = bool(self._attn_ptrs_b2.get("dec_O", 0))
+            if self._skinny_attn:
+                self._skinny_ensure_attn_scratch(self.B)
 
         # Per-sample language-embed CudaBuffers (set by
         # set_language_embeds_batch).
@@ -815,29 +819,55 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         fused = self.use_fp8_decoder and self.fp8_calibrated
 
         for step in range(self.num_steps):
-            # C0: Action input projection
-            gemm.bf16_nn(
-                Bb["diffusion_noise_b2"].ptr.value,
-                W["decoder_action_in_proj_w"],
-                Bb["decoder_x_b2"].ptr.value,
-                m, DEC_D, ACTION_DIM, stream=stream)
-            self._bias_add_bf16(
-                Bb["decoder_x_b2"].ptr.value, W["decoder_action_in_proj_b"],
-                m, DEC_D, stream)
+            skinny_step = fused and self._skinny
+            if skinny_step:
+                rc = fvk.dec_skinny_action_in_norm(
+                    Bb["diffusion_noise_b2"].ptr.value,
+                    W["decoder_action_in_proj_w"], W["decoder_action_in_proj_b"],
+                    Bb["decoder_x_b2"].ptr.value, self._rms_ones_dec.ptr.value,
+                    self._style_slice_ptr("decoder_style_attn", step, 0),
+                    Bb["dec_act_fp8_b2"].ptr.value, Bb["gate_buf_b2"].ptr.value,
+                    self.fp8_act_scales["decoder_attn_qkv_w_0"].ptr.value,
+                    m, 1e-6, self._skinny_pdl, stream)
+                if rc != 0:
+                    raise RuntimeError(f"skinny decoder action_in failed: cudaError {rc}")
+            else:
+                # C0: Action input projection
+                gemm.bf16_nn(
+                    Bb["diffusion_noise_b2"].ptr.value,
+                    W["decoder_action_in_proj_w"],
+                    Bb["decoder_x_b2"].ptr.value,
+                    m, DEC_D, ACTION_DIM, stream=stream)
+                self._bias_add_bf16(
+                    Bb["decoder_x_b2"].ptr.value, W["decoder_action_in_proj_b"],
+                    m, DEC_D, stream)
 
             for i in range(DEC_L):
-                skip_c1 = fused and i > 0
+                skip_c1 = (fused and i > 0) or skinny_step
                 self._decoder_layer_batched(i, step, enc_seq, ds, m,
                                              skip_c1, stream)
 
-            # C8: Final AdaRMSNorm + output projection (the skinny family
-            # folds the norm into the last layer's consumer)
-            if not (fused and self._skinny):
-                fvk.ada_rms_norm_style(
-                    Bb["decoder_x_b2"].ptr.value, self._rms_ones_dec.ptr.value,
-                    self._style_slice_ptr("decoder_style_final", step),
-                    Bb["x_normed_buf_b2"].ptr.value, Bb["gate_buf_b2"].ptr.value,
-                    m, DEC_D, 1e-6, stream=stream)
+            if skinny_step:
+                trace_x = trace_delta = 0
+                if self.denoise_trace:
+                    off = step * m * ACTION_DIM * 2
+                    trace_x = Bb["denoise_trace_x_b2"].ptr.value + off
+                    trace_delta = Bb["denoise_trace_delta_b2"].ptr.value + off
+                rc = fvk.dec_skinny_action_out_residual(
+                    Bb["x_normed_buf_b2"].ptr.value,
+                    W["decoder_action_out_proj_w"], W["decoder_action_out_proj_b"],
+                    Bb["decoder_action_buf_b2"].ptr.value, Bb["diffusion_noise_b2"].ptr.value,
+                    trace_x, trace_delta, m, self._skinny_pdl, stream)
+                if rc != 0:
+                    raise RuntimeError(f"skinny decoder action_out failed: cudaError {rc}")
+                continue
+
+            # C8: Final AdaRMSNorm + output projection
+            fvk.ada_rms_norm_style(
+                Bb["decoder_x_b2"].ptr.value, self._rms_ones_dec.ptr.value,
+                self._style_slice_ptr("decoder_style_final", step),
+                Bb["x_normed_buf_b2"].ptr.value, Bb["gate_buf_b2"].ptr.value,
+                m, DEC_D, 1e-6, stream=stream)
             gemm.bf16_nn(
                 Bb["x_normed_buf_b2"].ptr.value,
                 W["decoder_action_out_proj_w"],
@@ -878,6 +908,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 i, step, enc_seq, ds, skip_c1, stream,
                 rows=m, suffix="_b2", attn_ptrs=ap,
                 kv_ptrs=self._enc_kv_layer_ptrs_b2(i, offset_tokens=enc_seq),
+                kv_base_ptrs=self._enc_kv_layer_ptrs_b2(i, offset_tokens=0),
                 kv_sample_stride=kv_rows_per_sample,
                 dec_o_ptr_fn=lambda: self.attn.run_batched(
                     "decoder", i, q_seq=ds, kv_seq=enc_seq + ds, stream=stream))

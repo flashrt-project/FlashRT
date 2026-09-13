@@ -7271,6 +7271,44 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
             typed_ptr<__nv_fp8_e4m3>(out), rows, half, typed_ptr<float>(out_scale), pdl, to_stream(stream));
     }, py::arg("partials"), py::arg("splits"), py::arg("a_scale"), py::arg("w_scale"), py::arg("out"),
        py::arg("rows"), py::arg("half"), py::arg("out_scale"), py::arg("pdl") = true, py::arg("stream") = 0);
+    m.def("dec_skinny_attn_splits", [](int kv_len) { return flash_rt::dec_skinny::attn_splits(kv_len); },
+          py::arg("kv_len"));
+    m.def("dec_skinny_attn_scratch_floats", [](int splits, int samples, int heads) {
+        return flash_rt::dec_skinny::attn_scratch_floats(splits, samples, heads);
+    }, py::arg("splits"), py::arg("samples"), py::arg("heads"));
+    m.def("dec_skinny_attn", [](uintptr_t Q, uintptr_t K, uintptr_t V, uintptr_t O, int rows_per_sample,
+                                int samples, int heads, int q_row_stride, int kv_len, uintptr_t seqused,
+                                long long kv_sample_stride, float scale, uintptr_t scratch, uintptr_t counters,
+                                bool pdl, uintptr_t stream) {
+        return flash_rt::dec_skinny::attn(
+            typed_ptr<__nv_bfloat16>(Q), typed_ptr<__nv_bfloat16>(K), typed_ptr<__nv_bfloat16>(V),
+            typed_ptr<__nv_bfloat16>(O), rows_per_sample, samples, heads, q_row_stride, kv_len,
+            typed_ptr<int>(seqused), kv_sample_stride, scale, typed_ptr<float>(scratch),
+            typed_ptr<int>(counters), pdl, to_stream(stream));
+    }, py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("rows_per_sample"), py::arg("samples"),
+       py::arg("heads"), py::arg("q_row_stride"), py::arg("kv_len"), py::arg("seqused"), py::arg("kv_sample_stride"),
+       py::arg("scale"), py::arg("scratch"), py::arg("counters"), py::arg("pdl") = true, py::arg("stream") = 0);
+    m.def("dec_skinny_action_in_norm", [](uintptr_t noise, uintptr_t w_in, uintptr_t b_in, uintptr_t x,
+                                          uintptr_t weight, uintptr_t style, uintptr_t out, uintptr_t gate_out,
+                                          uintptr_t out_scale, int rows, float eps, bool pdl, uintptr_t stream) {
+        return flash_rt::dec_skinny::action_in_norm(
+            typed_ptr<__nv_bfloat16>(noise), typed_ptr<__nv_bfloat16>(w_in), typed_ptr<__nv_bfloat16>(b_in),
+            typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(weight), typed_ptr<__nv_bfloat16>(style),
+            typed_ptr<__nv_fp8_e4m3>(out), typed_ptr<__nv_bfloat16>(gate_out), typed_ptr<float>(out_scale),
+            rows, eps, pdl, to_stream(stream));
+    }, py::arg("noise"), py::arg("w_in"), py::arg("b_in"), py::arg("x"), py::arg("weight"), py::arg("style"),
+       py::arg("out"), py::arg("gate_out"), py::arg("out_scale"), py::arg("rows"), py::arg("eps") = 1e-6f,
+       py::arg("pdl") = true, py::arg("stream") = 0);
+    m.def("dec_skinny_action_out_residual", [](uintptr_t x, uintptr_t w_out, uintptr_t b_out, uintptr_t action,
+                                               uintptr_t noise, uintptr_t trace_x, uintptr_t trace_delta, int rows,
+                                               bool pdl, uintptr_t stream) {
+        return flash_rt::dec_skinny::action_out_residual(
+            typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(w_out), typed_ptr<__nv_bfloat16>(b_out),
+            typed_ptr<__nv_bfloat16>(action), typed_ptr<__nv_bfloat16>(noise), typed_ptr<__nv_bfloat16>(trace_x),
+            typed_ptr<__nv_bfloat16>(trace_delta), rows, pdl, to_stream(stream));
+    }, py::arg("x"), py::arg("w_out"), py::arg("b_out"), py::arg("action"), py::arg("noise"),
+       py::arg("trace_x") = 0, py::arg("trace_delta") = 0, py::arg("rows") = 0, py::arg("pdl") = true,
+       py::arg("stream") = 0);
 #endif  // FLASHRT_DECODER_SKINNY_SM120
 
 #ifdef ENABLE_DECODE_GEMV_M1

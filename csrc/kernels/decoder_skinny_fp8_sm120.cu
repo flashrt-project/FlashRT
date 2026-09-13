@@ -2,6 +2,7 @@
 // Skinny FP8 GEMM family for small-row action decoders on sm_120a. See the header.
 #include "decoder_skinny_fp8_sm120.cuh"
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 
@@ -230,11 +231,24 @@ residual_ada_norm_kernel(const float* __restrict__ partials, int splits, const f
                          __nv_bfloat16* __restrict__ out_bf16, const float* __restrict__ out_scale,
                          __nv_bfloat16* __restrict__ gate_out, int rows, float eps) {
     constexpr int PPT = DIM / 512;
-    if constexpr (PDL) pdl_prologue();
     __shared__ float warp_partial[8];
     const int row = blockIdx.x;
     const size_t base = static_cast<size_t>(row) * DIM;
     const size_t elements = static_cast<size_t>(rows) * DIM;
+    // Style and norm weight are constants of the graph: fetch them before
+    // waiting on the producer so the wait overlaps their latency.
+    const __nv_bfloat16* style_row = style + static_cast<size_t>(row) * 3 * DIM;
+    const __nv_bfloat162* sc2 = reinterpret_cast<const __nv_bfloat162*>(style_row);
+    const __nv_bfloat162* sh2 = reinterpret_cast<const __nv_bfloat162*>(style_row + DIM);
+    const __nv_bfloat162* gt2 = reinterpret_cast<const __nv_bfloat162*>(style_row + 2 * DIM);
+    const __nv_bfloat162* w2 = reinterpret_cast<const __nv_bfloat162*>(weight);
+    __nv_bfloat162 wv2[PPT], sv2[PPT], hv2[PPT], gv2[PPT];
+#pragma unroll
+    for (int p = 0; p < PPT; ++p) {
+        const int i = threadIdx.x + p * 256;
+        wv2[p] = w2[i]; sv2[p] = sc2[i]; hv2[p] = sh2[i]; gv2[p] = gt2[i];
+    }
+    if constexpr (PDL) pdl_prologue();
     const float alpha = (*a_scale) * (*w_scale);
     __nv_bfloat162* res2 = reinterpret_cast<__nv_bfloat162*>(residual + base);
     const __nv_bfloat162* g2 = reinterpret_cast<const __nv_bfloat162*>(gate + base);
@@ -264,19 +278,14 @@ residual_ada_norm_kernel(const float* __restrict__ partials, int splits, const f
 #pragma unroll
     for (int w = 0; w < 8; ++w) total += warp_partial[w];
     const float rms = rsqrtf(total / DIM + eps);
-    const __nv_bfloat16* style_row = style + static_cast<size_t>(row) * 3 * DIM;
-    const __nv_bfloat162* sc2 = reinterpret_cast<const __nv_bfloat162*>(style_row);
-    const __nv_bfloat162* sh2 = reinterpret_cast<const __nv_bfloat162*>(style_row + DIM);
-    const __nv_bfloat162* gt2 = reinterpret_cast<const __nv_bfloat162*>(style_row + 2 * DIM);
-    const __nv_bfloat162* w2 = reinterpret_cast<const __nv_bfloat162*>(weight);
     const float inv_scale = OUT_FP8 ? 1.0f / (*out_scale) : 1.0f;
 #pragma unroll
     for (int p = 0; p < PPT; ++p) {
         const int i = threadIdx.x + p * 256;
         const float2 rv = __bfloat1622float2(kept[p]);
-        const float2 wv = __bfloat1622float2(w2[i]);
-        const float2 sv = __bfloat1622float2(sc2[i]);
-        const float2 hv = __bfloat1622float2(sh2[i]);
+        const float2 wv = __bfloat1622float2(wv2[p]);
+        const float2 sv = __bfloat1622float2(sv2[p]);
+        const float2 hv = __bfloat1622float2(hv2[p]);
         const float n0 = rv.x * rms * wv.x;
         const float n1 = rv.y * rms * wv.y;
         const float v0 = n0 * (1.0f + sv.x) + hv.x;
@@ -287,7 +296,7 @@ residual_ada_norm_kernel(const float* __restrict__ partials, int splits, const f
         } else {
             reinterpret_cast<__nv_bfloat162*>(out_bf16 + base)[i] = __floats2bfloat162_rn(v0, v1);
         }
-        reinterpret_cast<__nv_bfloat162*>(gate_out + base)[i] = gt2[i];
+        reinterpret_cast<__nv_bfloat162*>(gate_out + base)[i] = gv2[p];
     }
 }
 
@@ -328,6 +337,330 @@ __global__ void gate_gelu_fp8_kernel(const float* __restrict__ partials, int spl
     const float v1 = tanh_gelu(g.y) * u.y;
     out[static_cast<size_t>(row) * half + 2 * pair] = __nv_fp8_e4m3(fminf(fmaxf(v0 * inv_scale, -448.0f), 448.0f));
     out[static_cast<size_t>(row) * half + 2 * pair + 1] = __nv_fp8_e4m3(fminf(fmaxf(v1 * inv_scale, -448.0f), 448.0f));
+}
+
+
+// ── Decoder cross-attention (split-KV pair, both launches in the PDL chain) ──
+namespace attn_impl {
+
+constexpr int HD = 256;
+constexpr int KCH = 64;                 // keys per CTA
+constexpr int THREADS = 128;            // 4 warps
+constexpr int KSTR = HD + 8;            // bf16 elements per K/V/Q smem row
+constexpr int PSTR = KCH + 8;           // bf16 elements per P smem row
+constexpr int PART = 32 + 16 * HD;      // floats per split partial: m[16], l[16], O[16][256]
+constexpr int MAX_SPLITS = 32;
+constexpr size_t SMEM = (2 * KCH + 16) * KSTR * 2 + 16 * PSTR * 2 + 16 * KCH * 4 + 32 * 4;
+
+__device__ __forceinline__ void mma_bf16(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                         uint32_t b0, uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ void ldmatrix_x2_trans(uint32_t& r0, uint32_t& r1, const void* p) {
+    const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(r0), "=r"(r1) : "r"(a));
+}
+
+__device__ __forceinline__ uint32_t ld32(const __nv_bfloat16* p) {
+    return *reinterpret_cast<const uint32_t*>(p);
+}
+
+// One CTA per (key chunk, head, sample): S = Q K^T over its keys, row max and
+// exp-sum, O = P V, written as an FP32 partial for the combine kernel.
+template <bool PDL>
+__global__ void __launch_bounds__(THREADS)
+attn_split_kernel(const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ K,
+                  const __nv_bfloat16* __restrict__ V, int rows, int heads, int q_row_stride,
+                  int kv_len, const int* __restrict__ seqused, long long kv_sample_stride,
+                  float scale, float* __restrict__ scratch, int splits) {
+    extern __shared__ __align__(16) uint8_t smem_raw[];
+    __nv_bfloat16* sK = reinterpret_cast<__nv_bfloat16*>(smem_raw);
+    __nv_bfloat16* sV = sK + KCH * KSTR;
+    __nv_bfloat16* sQ = sV + KCH * KSTR;
+    __nv_bfloat16* sP = sQ + 16 * KSTR;
+    float* sS = reinterpret_cast<float*>(sP + 16 * PSTR);
+    float* sM = sS + 16 * KCH;
+    float* sL = sM + 16;
+
+    const int split = blockIdx.x, head = blockIdx.y, sample = blockIdx.z;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+    if constexpr (PDL) pdl_prologue();
+
+    const int valid = seqused ? seqused[0] : kv_len;
+    const int k0 = split * KCH;
+    const __nv_bfloat16* Kb = K + static_cast<size_t>(sample) * kv_sample_stride * HD;
+    const __nv_bfloat16* Vb = V + static_cast<size_t>(sample) * kv_sample_stride * HD;
+    const __nv_bfloat16* Qb = Q + static_cast<size_t>(sample) * rows * q_row_stride + head * HD;
+    for (int c = tid; c < KCH * (HD / 8); c += THREADS) {
+        const int r = c / (HD / 8);
+        const int d = (c % (HD / 8)) * 8;
+        const bool ok = (k0 + r) < valid && (k0 + r) < kv_len;
+        const size_t src = static_cast<size_t>(ok ? k0 + r : 0) * HD + d;
+        cp_async_16(sK + r * KSTR + d, Kb + src, ok);
+    }
+    for (int c = tid; c < 16 * (HD / 8); c += THREADS) {
+        const int r = c / (HD / 8);
+        const int d = (c % (HD / 8)) * 8;
+        const bool ok = r < rows;
+        cp_async_16(sQ + r * KSTR + d, Qb + static_cast<size_t>(ok ? r : 0) * q_row_stride + d, ok);
+    }
+    asm volatile("cp.async.commit_group;\n" ::);
+    for (int c = tid; c < KCH * (HD / 8); c += THREADS) {
+        const int r = c / (HD / 8);
+        const int d = (c % (HD / 8)) * 8;
+        const bool ok = (k0 + r) < valid && (k0 + r) < kv_len;
+        const size_t src = static_cast<size_t>(ok ? k0 + r : 0) * HD + d;
+        cp_async_16(sV + r * KSTR + d, Vb + src, ok);
+    }
+    asm volatile("cp.async.commit_group;\n" ::);
+    asm volatile("cp.async.wait_group 1;\n" ::);   // K and Q landed; V still in flight
+    __syncthreads();
+
+    // S = Q K^T for this warp's 16 keys (two n8 tiles).
+    float s[2][4];
+#pragma unroll
+    for (int j = 0; j < 2; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) s[j][e] = 0.f;
+#pragma unroll
+    for (int ks = 0; ks < HD / 16; ++ks) {
+        const int d0 = ks * 16 + 2 * t;
+        const uint32_t a0 = ld32(sQ + g * KSTR + d0);
+        const uint32_t a1 = ld32(sQ + (g + 8) * KSTR + d0);
+        const uint32_t a2 = ld32(sQ + g * KSTR + d0 + 8);
+        const uint32_t a3 = ld32(sQ + (g + 8) * KSTR + d0 + 8);
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int key = (warp * 2 + j) * 8 + g;
+            const uint32_t b0 = ld32(sK + key * KSTR + d0);
+            const uint32_t b1 = ld32(sK + key * KSTR + d0 + 8);
+            mma_bf16(s[j], a0, a1, a2, a3, b0, b1);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < 2; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int row = g + (e >= 2 ? 8 : 0);
+            const int key = (warp * 2 + j) * 8 + 2 * t + (e & 1);
+            sS[row * KCH + key] = (k0 + key) < valid ? s[j][e] * scale : -INFINITY;
+        }
+    __syncthreads();
+
+    // Row statistics and P = exp(S - m): 8 threads per row, 8 keys each.
+    {
+        const int row = tid >> 3, part = tid & 7;
+        float m = -INFINITY;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) m = fmaxf(m, sS[row * KCH + part * 8 + k]);
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        float l = 0.f;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const float v = sS[row * KCH + part * 8 + k];
+            const float pval = (m == -INFINITY) ? 0.f : __expf(v - m);
+            l += pval;
+            sP[row * PSTR + part * 8 + k] = __float2bfloat16(pval);
+        }
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) l += __shfl_xor_sync(0xffffffffu, l, o);
+        if (part == 0) { sM[row] = m; sL[row] = l; }
+    }
+    asm volatile("cp.async.wait_group 0;\n" ::);   // V landed
+    __syncthreads();
+
+    // O = P V for this warp's 64 output dims (eight n8 tiles).
+    float o[8][4];
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) o[j][e] = 0.f;
+#pragma unroll
+    for (int ks = 0; ks < KCH / 16; ++ks) {
+        const int kk = ks * 16 + 2 * t;
+        const uint32_t a0 = ld32(sP + g * PSTR + kk);
+        const uint32_t a1 = ld32(sP + (g + 8) * PSTR + kk);
+        const uint32_t a2 = ld32(sP + g * PSTR + kk + 8);
+        const uint32_t a3 = ld32(sP + (g + 8) * PSTR + kk + 8);
+        const __nv_bfloat16* vrow = sV + (ks * 16 + (lane & 15)) * KSTR + warp * 64;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            uint32_t b0, b1;
+            ldmatrix_x2_trans(b0, b1, vrow + j * 8);
+            mma_bf16(o[j], a0, a1, a2, a3, b0, b1);
+        }
+    }
+
+    float* part = scratch + (static_cast<size_t>(sample * heads + head) * splits + split) * PART;
+    if (tid < 16) { part[tid] = sM[tid]; part[16 + tid] = sL[tid]; }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int d = warp * 64 + j * 8 + 2 * t;
+        *reinterpret_cast<float2*>(part + 32 + g * HD + d) = make_float2(o[j][0], o[j][1]);
+        *reinterpret_cast<float2*>(part + 32 + (g + 8) * HD + d) = make_float2(o[j][2], o[j][3]);
+    }
+}
+
+// One CTA per (row, head, sample); thread owns two output dims. All split
+// loads are independent, so they overlap.
+template <bool PDL>
+__global__ void __launch_bounds__(THREADS)
+attn_combine_kernel(const float* __restrict__ scratch, __nv_bfloat16* __restrict__ O, int rows,
+                    int heads, int q_row_stride, int splits) {
+    __shared__ float sW[MAX_SPLITS];
+    __shared__ float sInv;
+    const int row = blockIdx.x, head = blockIdx.y, sample = blockIdx.z;
+    const int tid = threadIdx.x;
+    if constexpr (PDL) pdl_prologue();
+    const float* base = scratch + static_cast<size_t>(sample * heads + head) * splits * PART;
+    if (tid < 32) {
+        const float ms = tid < splits ? base[tid * PART + row] : -INFINITY;
+        const float ls = tid < splits ? base[tid * PART + 16 + row] : 0.f;
+        float M = ms;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, o));
+        const float w = (ms == -INFINITY) ? 0.f : __expf(ms - M);
+        float L = w * ls;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) L += __shfl_xor_sync(0xffffffffu, L, o);
+        sW[tid] = w;
+        if (tid == 0) sInv = 1.0f / L;
+    }
+    __syncthreads();
+    float acc0 = 0.f, acc1 = 0.f;
+#pragma unroll 8
+    for (int sp = 0; sp < splits; ++sp) {
+        const float2 ov = *reinterpret_cast<const float2*>(base + sp * PART + 32 + row * HD + 2 * tid);
+        const float w = sW[sp];
+        acc0 += w * ov.x;
+        acc1 += w * ov.y;
+    }
+    *reinterpret_cast<__nv_bfloat162*>(
+        O + (static_cast<size_t>(sample) * rows + row) * q_row_stride + head * HD + 2 * tid) =
+        __floats2bfloat162_rn(acc0 * sInv, acc1 * sInv);
+}
+
+}  // namespace attn_impl
+
+
+// ── Action projections around the layer stack ────────────────────────────
+// in: x = bf16(bf16(noise @ W_in) + b_in) into the residual stream, then the
+// first layer's adaptive RMS norm to FP8 (as ada_rms_norm_style_fp8).
+template <bool PDL>
+__global__ void __launch_bounds__(256)
+action_in_norm_kernel(const __nv_bfloat16* __restrict__ noise, const __nv_bfloat16* __restrict__ w_in,
+                      const __nv_bfloat16* __restrict__ b_in, __nv_bfloat16* __restrict__ x,
+                      const __nv_bfloat16* __restrict__ weight, const __nv_bfloat16* __restrict__ style,
+                      __nv_fp8_e4m3* __restrict__ out, __nv_bfloat16* __restrict__ gate_out,
+                      const float* __restrict__ out_scale, float eps) {
+    constexpr int DIM = 1024, KDIM = 32;
+    __shared__ float warp_partial[8];
+    const int row = blockIdx.x, tid = threadIdx.x;
+    const int n0 = tid * 4;
+    const __nv_bfloat16* style_row = style + static_cast<size_t>(row) * 3 * DIM;
+    // graph constants first (overlap the producer wait)
+    float2 wq[KDIM][2];
+#pragma unroll
+    for (int k = 0; k < KDIM; ++k) {
+        const __nv_bfloat162* wp = reinterpret_cast<const __nv_bfloat162*>(w_in + k * DIM + n0);
+        wq[k][0] = __bfloat1622float2(wp[0]);
+        wq[k][1] = __bfloat1622float2(wp[1]);
+    }
+    const float2 bv0 = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(b_in + n0)[0]);
+    const float2 bv1 = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(b_in + n0)[1]);
+    const float2 wv0 = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(weight + n0)[0]);
+    const float2 wv1 = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(weight + n0)[1]);
+    const __nv_bfloat162 sc0 = reinterpret_cast<const __nv_bfloat162*>(style_row + n0)[0];
+    const __nv_bfloat162 sc1 = reinterpret_cast<const __nv_bfloat162*>(style_row + n0)[1];
+    const __nv_bfloat162 sh0 = reinterpret_cast<const __nv_bfloat162*>(style_row + DIM + n0)[0];
+    const __nv_bfloat162 sh1 = reinterpret_cast<const __nv_bfloat162*>(style_row + DIM + n0)[1];
+    const __nv_bfloat162 gt0 = reinterpret_cast<const __nv_bfloat162*>(style_row + 2 * DIM + n0)[0];
+    const __nv_bfloat162 gt1 = reinterpret_cast<const __nv_bfloat162*>(style_row + 2 * DIM + n0)[1];
+    if constexpr (PDL) pdl_prologue();
+    float nv[KDIM];
+#pragma unroll
+    for (int k = 0; k < KDIM; k += 2) {
+        const float2 v = __bfloat1622float2(
+            *reinterpret_cast<const __nv_bfloat162*>(noise + static_cast<size_t>(row) * KDIM + k));
+        nv[k] = v.x; nv[k + 1] = v.y;
+    }
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+    for (int k = 0; k < KDIM; ++k) {
+        acc[0] += nv[k] * wq[k][0].x; acc[1] += nv[k] * wq[k][0].y;
+        acc[2] += nv[k] * wq[k][1].x; acc[3] += nv[k] * wq[k][1].y;
+    }
+    // GEMM output rounded to BF16, then bias added and rounded again
+    const float2 g0 = __bfloat1622float2(__floats2bfloat162_rn(acc[0], acc[1]));
+    const float2 g1 = __bfloat1622float2(__floats2bfloat162_rn(acc[2], acc[3]));
+    const __nv_bfloat162 x0 = __floats2bfloat162_rn(g0.x + bv0.x, g0.y + bv0.y);
+    const __nv_bfloat162 x1 = __floats2bfloat162_rn(g1.x + bv1.x, g1.y + bv1.y);
+    __nv_bfloat162* xrow = reinterpret_cast<__nv_bfloat162*>(x + static_cast<size_t>(row) * DIM + n0);
+    xrow[0] = x0; xrow[1] = x1;
+    const float2 xf0 = __bfloat1622float2(x0), xf1 = __bfloat1622float2(x1);
+    float sq = xf0.x * xf0.x + xf0.y * xf0.y + xf1.x * xf1.x + xf1.y * xf1.y;
+    sq = warp_sum(sq);
+    if ((tid & 31) == 0) warp_partial[tid >> 5] = sq;
+    __syncthreads();
+    float total = 0.f;
+#pragma unroll
+    for (int w = 0; w < 8; ++w) total += warp_partial[w];
+    const float rms = rsqrtf(total / DIM + eps);
+    const float inv_scale = 1.0f / (*out_scale);
+    const float2 s0 = __bfloat1622float2(sc0), s1 = __bfloat1622float2(sc1);
+    const float2 h0 = __bfloat1622float2(sh0), h1 = __bfloat1622float2(sh1);
+    const float vals[4] = {
+        (xf0.x * rms * wv0.x * (1.0f + s0.x) + h0.x) * inv_scale,
+        (xf0.y * rms * wv0.y * (1.0f + s0.y) + h0.y) * inv_scale,
+        (xf1.x * rms * wv1.x * (1.0f + s1.x) + h1.x) * inv_scale,
+        (xf1.y * rms * wv1.y * (1.0f + s1.y) + h1.y) * inv_scale};
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+        out[static_cast<size_t>(row) * DIM + n0 + j] = __nv_fp8_e4m3(fminf(fmaxf(vals[j], -448.0f), 448.0f));
+    __nv_bfloat162* grow = reinterpret_cast<__nv_bfloat162*>(gate_out + static_cast<size_t>(row) * DIM + n0);
+    grow[0] = gt0; grow[1] = gt1;
+}
+
+// out: a = bf16(bf16(x_normed @ W_out) + b_out) (W_out, b_out carry the
+// -1/num_steps factor), optionally traced, then noise += a in BF16.
+template <bool PDL>
+__global__ void __launch_bounds__(256)
+action_out_residual_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w_out,
+                           const __nv_bfloat16* __restrict__ b_out, __nv_bfloat16* __restrict__ action,
+                           __nv_bfloat16* __restrict__ noise, __nv_bfloat16* __restrict__ trace_x,
+                           __nv_bfloat16* __restrict__ trace_delta) {
+    constexpr int KDIM = 1024, NDIM = 32, SLICES = 8, KS = KDIM / SLICES;
+    __shared__ float part[SLICES][NDIM];
+    const int row = blockIdx.x, tid = threadIdx.x;
+    const int n = tid & 31, slice = tid >> 5;
+    const float bias = __bfloat162float(b_out[n]);
+    if constexpr (PDL) pdl_prologue();
+    const __nv_bfloat16* xr = x + static_cast<size_t>(row) * KDIM + slice * KS;
+    const __nv_bfloat16* wr = w_out + static_cast<size_t>(slice) * KS * NDIM + n;
+    float acc = 0.f;
+#pragma unroll 8
+    for (int k = 0; k < KS; ++k) acc += __bfloat162float(xr[k]) * __bfloat162float(wr[k * NDIM]);
+    part[slice][n] = acc;
+    __syncthreads();
+    if (slice == 0) {
+        float total = 0.f;
+#pragma unroll
+        for (int s2 = 0; s2 < SLICES; ++s2) total += part[s2][n];
+        const float g = __bfloat162float(__float2bfloat16(total));
+        const __nv_bfloat16 a = __float2bfloat16(g + bias);
+        const size_t idx = static_cast<size_t>(row) * NDIM + n;
+        const __nv_bfloat16 old = noise[idx];
+        action[idx] = a;
+        if (trace_x) { trace_x[idx] = old; trace_delta[idx] = a; }
+        noise[idx] = __float2bfloat16(__bfloat162float(old) + __bfloat162float(a));
+    }
 }
 
 template <typename... Args>
@@ -459,6 +792,84 @@ int gate_gelu_fp8(const float* partials, int splits, const float* a_scale, const
                          a_scale, w_scale, out, rows, half, out_scale);
     return launch_ex((const void*)gate_gelu_fp8_kernel<false>, grid, dim3(256), stream, false, partials, splits,
                      a_scale, w_scale, out, rows, half, out_scale);
+}
+
+
+int attn_splits(int kv_len) { return (kv_len + attn_impl::KCH - 1) / attn_impl::KCH; }
+
+size_t attn_scratch_floats(int splits, int samples, int heads) {
+    return static_cast<size_t>(splits) * samples * heads * attn_impl::PART;
+}
+
+int attn(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V, __nv_bfloat16* O,
+         int rows_per_sample, int samples, int heads, int q_row_stride, int kv_len, const int* seqused,
+         long long kv_sample_stride, float scale, float* scratch, int* counters, bool pdl,
+         cudaStream_t stream) {
+    using namespace attn_impl;
+    (void)counters;
+    const int splits = attn_splits(kv_len);
+    if (rows_per_sample < 1 || rows_per_sample > 16 || kv_len < 1 || heads < 1 || samples < 1 ||
+        splits > MAX_SPLITS)
+        return static_cast<int>(cudaErrorInvalidValue);
+    static bool attr_set = false;
+    if (!attr_set) {
+        cudaFuncSetAttribute((const void*)attn_split_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM);
+        cudaFuncSetAttribute((const void*)attn_split_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM);
+        attr_set = true;
+    }
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(splits, heads, samples);
+    cfg.blockDim = dim3(THREADS);
+    cfg.dynamicSmemBytes = SMEM;
+    cfg.stream = stream;
+    cfg.attrs = attr;
+    cfg.numAttrs = pdl ? 1 : 0;
+    const void* fn = pdl ? (const void*)attn_split_kernel<true> : (const void*)attn_split_kernel<false>;
+    void* args[] = {(void*)&Q, (void*)&K, (void*)&V, (void*)&rows_per_sample, (void*)&heads,
+                    (void*)&q_row_stride, (void*)&kv_len, (void*)&seqused, (void*)&kv_sample_stride,
+                    (void*)&scale, (void*)&scratch, (void*)&splits};
+    const int rc = static_cast<int>(cudaLaunchKernelExC(&cfg, fn, args));
+    if (rc != 0) return rc;
+
+    cudaLaunchConfig_t cfg2 = {};
+    cfg2.gridDim = dim3(rows_per_sample, heads, samples);
+    cfg2.blockDim = dim3(THREADS);
+    cfg2.dynamicSmemBytes = 0;
+    cfg2.stream = stream;
+    cfg2.attrs = attr;
+    cfg2.numAttrs = pdl ? 1 : 0;
+    const void* fn2 = pdl ? (const void*)attn_combine_kernel<true> : (const void*)attn_combine_kernel<false>;
+    void* args2[] = {(void*)&scratch, (void*)&O, (void*)&rows_per_sample, (void*)&heads, (void*)&q_row_stride,
+                     (void*)&splits};
+    return static_cast<int>(cudaLaunchKernelExC(&cfg2, fn2, args2));
+}
+
+
+int action_in_norm(const __nv_bfloat16* noise, const __nv_bfloat16* w_in, const __nv_bfloat16* b_in,
+                   __nv_bfloat16* x, const __nv_bfloat16* weight, const __nv_bfloat16* style,
+                   __nv_fp8_e4m3* out, __nv_bfloat16* gate_out, const float* out_scale, int rows,
+                   float eps, bool pdl, cudaStream_t stream) {
+    const dim3 grid(rows);
+    if (pdl)
+        return launch_ex((const void*)action_in_norm_kernel<true>, grid, dim3(256), stream, true, noise, w_in,
+                         b_in, x, weight, style, out, gate_out, out_scale, eps);
+    return launch_ex((const void*)action_in_norm_kernel<false>, grid, dim3(256), stream, false, noise, w_in,
+                     b_in, x, weight, style, out, gate_out, out_scale, eps);
+}
+
+int action_out_residual(const __nv_bfloat16* x, const __nv_bfloat16* w_out, const __nv_bfloat16* b_out,
+                        __nv_bfloat16* action, __nv_bfloat16* noise, __nv_bfloat16* trace_x,
+                        __nv_bfloat16* trace_delta, int rows, bool pdl, cudaStream_t stream) {
+    const dim3 grid(rows);
+    if (pdl)
+        return launch_ex((const void*)action_out_residual_kernel<true>, grid, dim3(256), stream, true, x, w_out,
+                         b_out, action, noise, trace_x, trace_delta);
+    return launch_ex((const void*)action_out_residual_kernel<false>, grid, dim3(256), stream, false, x, w_out,
+                     b_out, action, noise, trace_x, trace_delta);
 }
 
 }  // namespace dec_skinny

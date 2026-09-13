@@ -340,7 +340,7 @@ The batched attention backend and `Pi05BatchedPipeline` take their
 width from `batch_size`; every folded buffer scales with it. On
 sm_120a builds the calibrated FP8 decoder runs on the skinny GEMM
 family in both the single and the batched pipeline (see
-`docs/pi05_decoder_skinny.md`: 19.7 → 15.5 ms per `infer()` at B = 1). Slots are
+`docs/pi05_decoder_skinny.md`: 19.7 → 14.0 ms per `infer()` at B = 1). Slots are
 independent: identical inputs give bit-identical outputs per slot.
 The mixed-slot FP8 test compares each slot with independent B=1 inference
 under identical calibration and the existing synthetic-input cosine gate

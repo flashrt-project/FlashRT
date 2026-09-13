@@ -76,5 +76,40 @@ int gate_gelu_fp8(const float* partials, int splits, const float* a_scale,
                   const float* w_scale, __nv_fp8_e4m3* out, int rows, int half,
                   const float* out_scale, bool pdl, cudaStream_t stream);
 
+// Decoder cross-attention: rows_per_sample query rows (<= 16) times `heads`
+// query heads over one shared K/V head of width 256, keys [0, valid) with
+// valid = *seqused if given else kv_len. Two launches, both able to join the
+// PDL chain: split-KV partials (one CTA per 64 keys, head, sample) and the
+// combine (one CTA per row, head, sample). scratch holds
+// splits * samples * heads * (32 + 16 * 256) floats; counters is unused.
+// Q/O rows have q_row_stride elements (heads * 256 for the packed layout);
+// sample b's K/V start kv_sample_stride rows after sample 0's.
+int attn_splits(int kv_len);
+size_t attn_scratch_floats(int splits, int samples, int heads);
+int attn(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
+         __nv_bfloat16* O, int rows_per_sample, int samples, int heads,
+         int q_row_stride, int kv_len, const int* seqused,
+         long long kv_sample_stride, float scale, float* scratch,
+         int* counters, bool pdl, cudaStream_t stream);
+
+// Action input projection (K = 32, N = 1024) with bias, written to the
+// residual stream x, followed by the first layer's adaptive RMS norm to FP8
+// (weight, style, out_scale as in residual_ada_norm). One CTA per row.
+int action_in_norm(const __nv_bfloat16* noise, const __nv_bfloat16* w_in,
+                   const __nv_bfloat16* b_in, __nv_bfloat16* x,
+                   const __nv_bfloat16* weight, const __nv_bfloat16* style,
+                   __nv_fp8_e4m3* out, __nv_bfloat16* gate_out,
+                   const float* out_scale, int rows, float eps, bool pdl,
+                   cudaStream_t stream);
+
+// Action output projection (K = 1024, N = 32) with bias into `action`, the
+// optional trace copies (pre-update noise, increment), then the in-place
+// BF16 update noise += action. One CTA per row.
+int action_out_residual(const __nv_bfloat16* x, const __nv_bfloat16* w_out,
+                        const __nv_bfloat16* b_out, __nv_bfloat16* action,
+                        __nv_bfloat16* noise, __nv_bfloat16* trace_x,
+                        __nv_bfloat16* trace_delta, int rows, bool pdl,
+                        cudaStream_t stream);
+
 }  // namespace dec_skinny
 }  // namespace flash_rt
