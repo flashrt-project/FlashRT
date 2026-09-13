@@ -77,6 +77,8 @@ class Pi05BatchedPipeline(Pi05Pipeline):
             raise ValueError(f"batched backend reports B={self.B}")
         self._attn_ptrs_b2 = self.attn.get_ptrs_b2()
         self._allocate_b2_buffers()
+        if self._skinny:
+            self._skinny_ensure_partials(self.B * self.chunk_size)
 
         # Per-sample language-embed CudaBuffers (set by
         # set_language_embeds_batch).
@@ -828,12 +830,14 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 self._decoder_layer_batched(i, step, enc_seq, ds, m,
                                              skip_c1, stream)
 
-            # C8: Final AdaRMSNorm + output projection
-            fvk.ada_rms_norm_style(
-                Bb["decoder_x_b2"].ptr.value, self._rms_ones_dec.ptr.value,
-                self._style_slice_ptr("decoder_style_final", step),
-                Bb["x_normed_buf_b2"].ptr.value, Bb["gate_buf_b2"].ptr.value,
-                m, DEC_D, 1e-6, stream=stream)
+            # C8: Final AdaRMSNorm + output projection (the skinny family
+            # folds the norm into the last layer's consumer)
+            if not (fused and self._skinny):
+                fvk.ada_rms_norm_style(
+                    Bb["decoder_x_b2"].ptr.value, self._rms_ones_dec.ptr.value,
+                    self._style_slice_ptr("decoder_style_final", step),
+                    Bb["x_normed_buf_b2"].ptr.value, Bb["gate_buf_b2"].ptr.value,
+                    m, DEC_D, 1e-6, stream=stream)
             gemm.bf16_nn(
                 Bb["x_normed_buf_b2"].ptr.value,
                 W["decoder_action_out_proj_w"],
@@ -866,6 +870,18 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         Bb = self.bufs
         ap = self._attn_ptrs_b2
         fused = self.use_fp8_decoder and self.fp8_calibrated
+        if fused and self._skinny:
+            # Skinny FP8 family over the B-folded rows: the per-sample K/V
+            # cache slots are addressed by the consumer's sample stride.
+            kv_rows_per_sample = ap["enc_k_sample_stride_bytes"] // (DEC_NKV * DEC_HD * 2)
+            self._decoder_layer_skinny(
+                i, step, enc_seq, ds, skip_c1, stream,
+                rows=m, suffix="_b2", attn_ptrs=ap,
+                kv_ptrs=self._enc_kv_layer_ptrs_b2(i, offset_tokens=enc_seq),
+                kv_sample_stride=kv_rows_per_sample,
+                dec_o_ptr_fn=lambda: self.attn.run_batched(
+                    "decoder", i, q_seq=ds, kv_seq=enc_seq + ds, stream=stream))
+            return
 
         # C1: AdaRMSNorm with style → FP8 (fused) or BF16
         qkv_name = f"decoder_attn_qkv_w_{i}"

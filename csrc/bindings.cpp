@@ -54,6 +54,9 @@
 #endif
 #ifdef ENABLE_QWEN36_FLASHINFER_XQA
 #include "kernels/qwen36_flashinfer_xqa.cuh"
+#ifdef FLASHRT_DECODER_SKINNY_SM120
+#include "kernels/decoder_skinny_fp8_sm120.cuh"
+#endif
 #endif
 #if defined(ENABLE_CUTLASS_SM120_NVFP4_W4A16) || defined(ENABLE_CUTLASS_SM100_NVFP4_W4A16)
 #include "quantize/nvfp4_sf_reshape_sm120.cuh"
@@ -7194,6 +7197,81 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
 
 #undef BIND_SPLITK
 #endif  // ENABLE_CUTLASS_SM120_BLOCK_FP8
+
+#ifdef FLASHRT_DECODER_SKINNY_SM120
+    // Skinny FP8 decoder GEMM family (sm_120a): K-split partials + fused consumers,
+    // optional programmatic dependent launch. See kernels/decoder_skinny_fp8_sm120.cuh.
+    m.def("dec_skinny_available", []() {
+        int dev = 0, major = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) return false;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) return false;
+        return major == 12;
+    });
+    m.def("dec_skinny_config_count", []() { return flash_rt::dec_skinny::config_count(); });
+    m.def("dec_skinny_config_k_chunk", [](int cfg) { return flash_rt::dec_skinny::config_k_chunk(cfg); },
+          py::arg("cfg"));
+    m.def("dec_skinny_config_supports", [](int cfg, int N, int K) {
+        return flash_rt::dec_skinny::config_supports(cfg, N, K);
+    }, py::arg("cfg"), py::arg("N"), py::arg("K"));
+    m.def("dec_skinny_gemm", [](uintptr_t A, uintptr_t W, uintptr_t partials,
+                                int M, int N, int K, int cfg, bool pdl, uintptr_t stream) {
+        return flash_rt::dec_skinny::gemm(to_ptr(A), to_ptr(W), typed_ptr<float>(partials),
+                                          M, N, K, cfg, pdl, to_stream(stream));
+    }, py::arg("A"), py::arg("W"), py::arg("partials"), py::arg("M"), py::arg("N"), py::arg("K"),
+       py::arg("cfg"), py::arg("pdl") = true, py::arg("stream") = 0);
+    m.def("dec_skinny_gemm_bf16_act", [](uintptr_t A, uintptr_t a_scale, uintptr_t W, uintptr_t partials,
+                                         int M, int N, int K, int cfg, bool pdl, uintptr_t stream) {
+        return flash_rt::dec_skinny::gemm_bf16_act(typed_ptr<__nv_bfloat16>(A), typed_ptr<float>(a_scale),
+                                                   to_ptr(W), typed_ptr<float>(partials),
+                                                   M, N, K, cfg, pdl, to_stream(stream));
+    }, py::arg("A"), py::arg("a_scale"), py::arg("W"), py::arg("partials"), py::arg("M"), py::arg("N"),
+       py::arg("K"), py::arg("cfg"), py::arg("pdl") = true, py::arg("stream") = 0);
+    m.def("dec_skinny_sum_rope", [](uintptr_t partials, int splits, uintptr_t a_scale, uintptr_t w_scale,
+                                    uintptr_t rope, uintptr_t Q, uintptr_t K, uintptr_t V, uintptr_t devpos,
+                                    int rows, int q_dim, int k_dim, int v_dim, int head_dim,
+                                    int sample_rows, long long kv_sample_stride, bool pdl,
+                                    uintptr_t stream) {
+        return flash_rt::dec_skinny::sum_rope(typed_ptr<float>(partials), splits, typed_ptr<float>(a_scale),
+                                              typed_ptr<float>(w_scale), typed_ptr<__nv_bfloat16>(rope),
+                                              typed_ptr<__nv_bfloat16>(Q), typed_ptr<__nv_bfloat16>(K),
+                                              typed_ptr<__nv_bfloat16>(V), typed_ptr<int>(devpos),
+                                              rows, q_dim, k_dim, v_dim, head_dim, sample_rows,
+                                              kv_sample_stride, pdl, to_stream(stream));
+    }, py::arg("partials"), py::arg("splits"), py::arg("a_scale"), py::arg("w_scale"), py::arg("rope"),
+       py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("devpos"), py::arg("rows"), py::arg("q_dim"),
+       py::arg("k_dim"), py::arg("v_dim"), py::arg("head_dim"), py::arg("sample_rows") = 0,
+       py::arg("kv_sample_stride") = 0, py::arg("pdl") = true, py::arg("stream") = 0);
+    m.def("dec_skinny_residual_ada_norm", [](uintptr_t partials, int splits, uintptr_t a_scale, uintptr_t w_scale,
+                                             uintptr_t residual, uintptr_t gate, uintptr_t weight, uintptr_t style,
+                                             uintptr_t out_fp8, uintptr_t out_bf16, uintptr_t out_scale,
+                                             uintptr_t gate_out, int rows, int dim, float eps, bool pdl,
+                                             uintptr_t stream) {
+        return flash_rt::dec_skinny::residual_ada_norm(
+            typed_ptr<float>(partials), splits, typed_ptr<float>(a_scale), typed_ptr<float>(w_scale),
+            typed_ptr<__nv_bfloat16>(residual), typed_ptr<__nv_bfloat16>(gate), typed_ptr<__nv_bfloat16>(weight),
+            typed_ptr<__nv_bfloat16>(style), typed_ptr<__nv_fp8_e4m3>(out_fp8), typed_ptr<__nv_bfloat16>(out_bf16),
+            typed_ptr<float>(out_scale), typed_ptr<__nv_bfloat16>(gate_out), rows, dim, eps, pdl, to_stream(stream));
+    }, py::arg("partials"), py::arg("splits"), py::arg("a_scale"), py::arg("w_scale"), py::arg("residual"),
+       py::arg("gate"), py::arg("weight"), py::arg("style"), py::arg("out_fp8") = 0, py::arg("out_bf16") = 0,
+       py::arg("out_scale") = 0, py::arg("gate_out") = 0, py::arg("rows") = 0, py::arg("dim") = 1024,
+       py::arg("eps") = 1e-6f, py::arg("pdl") = true, py::arg("stream") = 0);
+    m.def("dec_skinny_residual_gate_mul", [](uintptr_t partials, int splits, uintptr_t a_scale, uintptr_t w_scale,
+                                             uintptr_t residual, uintptr_t gate, int rows, int dim, bool pdl,
+                                             uintptr_t stream) {
+        return flash_rt::dec_skinny::residual_gate_mul(
+            typed_ptr<float>(partials), splits, typed_ptr<float>(a_scale), typed_ptr<float>(w_scale),
+            typed_ptr<__nv_bfloat16>(residual), typed_ptr<__nv_bfloat16>(gate), rows, dim, pdl, to_stream(stream));
+    }, py::arg("partials"), py::arg("splits"), py::arg("a_scale"), py::arg("w_scale"), py::arg("residual"),
+       py::arg("gate"), py::arg("rows"), py::arg("dim"), py::arg("pdl") = true, py::arg("stream") = 0);
+    m.def("dec_skinny_gate_gelu_fp8", [](uintptr_t partials, int splits, uintptr_t a_scale, uintptr_t w_scale,
+                                         uintptr_t out, int rows, int half, uintptr_t out_scale, bool pdl,
+                                         uintptr_t stream) {
+        return flash_rt::dec_skinny::gate_gelu_fp8(
+            typed_ptr<float>(partials), splits, typed_ptr<float>(a_scale), typed_ptr<float>(w_scale),
+            typed_ptr<__nv_fp8_e4m3>(out), rows, half, typed_ptr<float>(out_scale), pdl, to_stream(stream));
+    }, py::arg("partials"), py::arg("splits"), py::arg("a_scale"), py::arg("w_scale"), py::arg("out"),
+       py::arg("rows"), py::arg("half"), py::arg("out_scale"), py::arg("pdl") = true, py::arg("stream") = 0);
+#endif  // FLASHRT_DECODER_SKINNY_SM120
 
 #ifdef ENABLE_DECODE_GEMV_M1
     // Dedicated M=1 GEMV (FP8 + BF16), warp-per-output-row, no MMA padding tax.

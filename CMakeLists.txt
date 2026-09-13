@@ -675,6 +675,27 @@ if(GPU_ARCH STREQUAL "120")
   )
 endif()
 
+# ── Skinny FP8 decoder GEMM family (sm_120a mma.kind::f8f6f4 + PDL) ──
+# Small-row action-decoder GEMMs with K split across CTAs and fused consumers.
+if(GPU_ARCH STREQUAL "120")
+  add_library(sm120_decoder_skinny_obj OBJECT
+    csrc/kernels/decoder_skinny_fp8_sm120.cu)
+  set_target_properties(sm120_decoder_skinny_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(sm120_decoder_skinny_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
+  )
+  target_compile_options(sm120_decoder_skinny_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3
+      --ftz=true --prec-div=false --prec-sqrt=false
+      ${GPU_GENCODE}
+    >
+  )
+endif()
+
 # ── CUTLASS SM120a NVFP4 W4A16 GEMM (Qwen3.6 NVFP4 ckpt) ──
 # Block-scaled FP4 e2m1 weights × FP4 e2m1 act (post quant) × FP8 ue4m3
 # group scales × BF16 output. Ported from NVIDIA unit test
@@ -1874,6 +1895,14 @@ if(GPU_ARCH STREQUAL "120")
     $<TARGET_OBJECTS:sm120_fp8_smallm_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE
     ENABLE_CUTLASS_SM120_BLOCK_FP8=1)
+endif()
+
+# Skinny FP8 decoder GEMM family: sm_120a only (mma.kind::f8f6f4).
+if(GPU_ARCH STREQUAL "120")
+  target_sources(flash_rt_kernels PRIVATE
+    $<TARGET_OBJECTS:sm120_decoder_skinny_obj>)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    FLASHRT_DECODER_SKINNY_SM120=1)
 endif()
 
 # Dedicated M=1 decode GEMV (FP8 + BF16); linked + macro defined wherever the

@@ -481,8 +481,15 @@ class Pi05TorchFrontendRtx:
                  state_prompt_mode: str = "exact",
                  use_cuda_graph: bool = True,
                  denoise_trace: bool = False,
-                 prefix_features: bool = False):
+                 prefix_features: bool = False,
+                 decoder_kernel: Optional[str] = None):
         checkpoint_dir = pathlib.Path(checkpoint_dir)
+        # Decoder GEMM family for the calibrated FP8 decoder: "auto" picks
+        # the skinny K-split kernels on sm_120a builds, "cublaslt" keeps
+        # the library GEMMs, "skinny" requires the kernels. The environment
+        # variable FLASHRT_PI05_DECODER_KERNEL overrides the default.
+        self._decoder_kernel = (decoder_kernel
+                                or os.environ.get("FLASHRT_PI05_DECODER_KERNEL", "auto"))
         # Batched-mode width; set_batched_mode(batch_size=N) changes it.
         self._batch_size = PI05_BATCH_SIZE
         # Prefix features: pipelines export the encoder's final hidden
@@ -688,6 +695,11 @@ class Pi05TorchFrontendRtx:
                     self.max_prompt_len)
 
     def _pipeline_precision_kwargs(self) -> dict:
+        kwargs = self._pipeline_precision_kwargs_base()
+        kwargs["decoder_kernel"] = self._decoder_kernel
+        return kwargs
+
+    def _pipeline_precision_kwargs_base(self) -> dict:
         if self._force_int8_decoder or getattr(self, "_int8_encoder_only", False):
             mode = ("INT8 encoder+decoder" if self._force_int8_decoder
                     else "INT8 encoder only (decoder stays BF16 for M=10 efficiency)")
@@ -748,12 +760,15 @@ class Pi05TorchFrontendRtx:
         store = self._fp8_store
         fp8 = self._fp8_weights
 
+        store_index: dict[str, int] = {}
+
         def quant(name: str, w: torch.Tensor):
             if self.fp8_layout == "nk":
                 w = w.t().contiguous()
             else:
                 w = w.contiguous()
             w_fp8, scale = _quantize_fp8_e4m3(w)
+            store_index[name] = len(store)
             store.append(w_fp8)
             store.append(scale)
             fp8[name] = (w_fp8.data_ptr(), scale.data_ptr())
@@ -787,6 +802,31 @@ class Pi05TorchFrontendRtx:
             quant(f"decoder_ffn_down_w_{i}", W["decoder_ffn_down_w"][i])
 
         logger.info("FP8 quantized %d GEMM weights (layout=%s)", len(fp8), self.fp8_layout)
+
+        # The skinny decoder family streams weight rows, i.e. wants [N, K].
+        # On the "kn" layout keep a transposed copy of the decoder weights
+        # under "<name>__nk" (same values, same per-tensor scale); the
+        # calibration and fallback paths keep using the "kn" tensors.
+        if self.fp8_layout == "kn" and self._skinny_weights_wanted():
+            n_copies = 0
+            for i in range(DEC_L):
+                for base in ("decoder_attn_qkv_w", "decoder_attn_o_w",
+                             "decoder_ffn_gate_up_w", "decoder_ffn_down_w"):
+                    name = f"{base}_{i}"
+                    w_fp8, scale = store[store_index[name]], store[store_index[name] + 1]
+                    w_nk = w_fp8.view(torch.uint8).t().contiguous().view(w_fp8.dtype)
+                    store.append(w_nk)
+                    fp8[name + "__nk"] = (w_nk.data_ptr(), scale.data_ptr())
+                    n_copies += 1
+            logger.info("FP8 decoder weights transposed for the skinny family: %d", n_copies)
+
+    def _skinny_weights_wanted(self) -> bool:
+        """Whether the FP8 decoder may run on the skinny GEMM family."""
+        if not self.use_fp8 or self._decoder_kernel == "cublaslt":
+            return False
+        from flash_rt import flash_rt_kernels as fvk
+        probe = getattr(fvk, "dec_skinny_available", None)
+        return bool(probe is not None and probe())
 
     def _quantize_decoder_int8(self) -> None:
         """Pre-quantize the decoder hot-path GEMM weights to INT8."""
