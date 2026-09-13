@@ -251,10 +251,80 @@ The residual gap (~0.001–0.002) is per-frontend FP8 calibration noise
 amplified by the CFG combine; it is not a correctness issue (well
 inside the deployment cosine floor of 0.99 vs PyTorch FP32 reference).
 
+## Reproducible sampling and denoise trace (RL rollouts)
+
+RL training loops need two things from the sampler that deployment
+does not: a way to reproduce a sample, and a view of how it was
+produced. Both are engine-level capabilities on the Pi0.5 RTX
+frontend; the RL semantics (log-probabilities, importance ratios)
+stay with the training code that consumes them.
+
+### Noise injection and seeding
+
+```python
+rt = Pi05TorchFrontendRtx(ckpt, num_views=2)
+rt.set_prompt("pick up the cup")
+
+out = rt.infer(obs)                          # unseeded, as before
+noise = out["noise"]                         # (chunk_size, 32) float32
+same = rt.infer(obs, noise=noise)            # bit-identical actions
+
+g = torch.Generator(device="cuda").manual_seed(1234)
+seeded = rt.infer(obs, generator=g)          # reproducible draw
+
+batch = rt.infer_batch([obs_a, obs_b], noise=noise_pair)   # (B, chunk, 32)
+```
+
+Contract: same weights, prompt and noise give bit-identical actions
+(graph replay is deterministic). `noise` is taken as given (rounded
+to bf16); `generator` seeds the internal draw; passing both is an
+error. Every result carries `"noise"`, the bf16-rounded noise that was
+used, which round-trips exactly when passed back. The CFG batched
+path accepts the same arguments (one noise, replicated across the
+conditioned and unconditioned slots). No pipeline change is involved
+and the default path is untouched.
+
+### Denoise trace
+
+```python
+rt = Pi05TorchFrontendRtx(ckpt, num_views=2, denoise_trace=True)
+rt.set_prompt("pick up the cup")
+out = rt.infer(obs, noise=noise)
+tr = out["denoise_trace"]      # x, delta: (num_steps, chunk, 32) float32
+out["raw_actions"]             # normalized (chunk, 32), before unnormalization
+```
+
+`x[s]` is the state entering denoising step `s` (`x[0]` is the input
+noise) and `delta[s]` is what the step adds, so
+
+    x[s+1] == x[s] + delta[s]        (bf16 arithmetic, exact)
+    x[-1] + delta[-1] == raw_actions
+
+and for the linear flow-matching schedule `delta[s] == -v[s] / num_steps`
+where `v[s]` is the action expert's velocity prediction at flow time
+`timesteps[s]` (`1, 1-dt, ..., dt`). A consumer computing a flow-SDE
+log-probability needs exactly `x`, `delta` and `timesteps`.
+
+Mechanics: the pipeline is built with two extra buffers of
+`(num_steps, chunk, 32)` bf16 (64 KB at the defaults) and issues two
+device-to-device copies per step inside `transformer_decoder`, so the
+copies are captured into the same CUDA graph as the rest of the
+denoise loop and replay with it. The option is decided at
+construction because the graph either contains those copies or not;
+with it off, the pipeline and its graph are unchanged from before.
+The batched pipeline records a per-slot trace, returned per entry of
+`infer_batch`.
+
+Scope: Pi0.5 RTX `Pi05Pipeline` and `Pi05BatchedPipeline`. The CFG
+pipelines do not record a trace yet and `set_rl_mode` refuses a
+trace-enabled frontend. Thor and FP16 pipelines and the C++ runtime
+export are not covered.
+
 ## Tests
 
 | test | what it validates |
 |---|---|
+| `tests/test_pi05_seeded_noise_trace.py` | noise injection / seeded reproducibility, trace self-consistency, batched per-slot trace |
 | `tests/test_rl_cfg_inference.py` | RTX serial + batched CFG, all βs, validation gates |
 | `tests/test_thor_rl_cfg_inference.py --backends torch,jax` | Thor serial CFG: validation, β=1.0 collapse, β=1.5 finite |
 | `tests/test_cfg_correctness_oracle.py` | per-step C1–C5 contract (RTX) vs frozen reference |

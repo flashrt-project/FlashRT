@@ -107,6 +107,8 @@ class Pi05BatchedPipeline(Pi05Pipeline):
             B * nv * 224 * 224 * 3, BF16)
         self.bufs["diffusion_noise_b2"] = CudaBuffer.device_empty(
             B * ds * ACTION_DIM, BF16)
+        if self.denoise_trace:
+            self._allocate_denoise_trace_buffers(self.bufs, B * ds, suffix="_b2")
 
         # ── Vision ──
         self.bufs["vision_x_b2"] = CudaBuffer.device_empty(B * vs * VIS_D, BF16)
@@ -838,6 +840,10 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 Bb["decoder_action_buf_b2"].ptr.value,
                 W["decoder_action_out_proj_b"],
                 m, ACTION_DIM, stream)
+            if self.denoise_trace:
+                self._record_denoise_step(
+                    step, Bb["diffusion_noise_b2"], Bb["decoder_action_buf_b2"],
+                    m, stream, suffix="_b2")
             fvk.residual_add(
                 Bb["diffusion_noise_b2"].ptr.value,
                 Bb["decoder_action_buf_b2"].ptr.value,
@@ -1186,3 +1192,17 @@ class Pi05BatchedPipeline(Pi05Pipeline):
     def input_noise_buf_b2(self) -> CudaBuffer:
         """Pipeline input/output: per-sample diffusion noise (B*chunk, 32)."""
         return self.bufs["diffusion_noise_b2"]
+
+    @property
+    def denoise_trace_x_buf_b2(self) -> CudaBuffer:
+        """Trace output: per-step input state, ``(num_steps, B*chunk, 32)`` bf16."""
+        if not self.denoise_trace:
+            raise RuntimeError("pipeline was built without denoise_trace=True")
+        return self.bufs["denoise_trace_x_b2"]
+
+    @property
+    def denoise_trace_delta_buf_b2(self) -> CudaBuffer:
+        """Trace output: per-step increment, ``(num_steps, B*chunk, 32)`` bf16."""
+        if not self.denoise_trace:
+            raise RuntimeError("pipeline was built without denoise_trace=True")
+        return self.bufs["denoise_trace_delta_b2"]

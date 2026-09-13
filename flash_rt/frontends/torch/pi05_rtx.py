@@ -474,8 +474,15 @@ class Pi05TorchFrontendRtx:
                  hardware: Optional[str] = None,
                  fp8_layout: Optional[str] = None,
                  state_prompt_mode: str = "exact",
-                 use_cuda_graph: bool = True):
+                 use_cuda_graph: bool = True,
+                 denoise_trace: bool = False):
         checkpoint_dir = pathlib.Path(checkpoint_dir)
+        # Denoise trace: every pipeline this frontend builds records the
+        # per-step state and increment of the denoising loop, returned by
+        # infer()/infer_batch() under "denoise_trace". Construction-time
+        # because the copies are captured into the CUDA graph. Off by
+        # default; the default graphs are then unchanged.
+        self._denoise_trace = bool(denoise_trace)
         # State-in-prompt graph strategy (Pi0.5 renders robot state into the
         # prompt, so its token length drifts with the state values):
         #   "exact" (default): a separate pipeline captured per exact length,
@@ -635,6 +642,11 @@ class Pi05TorchFrontendRtx:
             self.chunk_size, ACTION_DIM, dtype=bf16, device="cuda")
         self._noise_out = torch.empty(
             self.chunk_size, ACTION_DIM, dtype=bf16, device="cuda")
+        if self._denoise_trace:
+            self._trace_x_out = torch.empty(
+                self._num_steps, self.chunk_size, ACTION_DIM,
+                dtype=bf16, device="cuda")
+            self._trace_delta_out = torch.empty_like(self._trace_x_out)
         from flash_rt.core.cuda_buffer import _cudart
         self._cudart = _cudart
 
@@ -983,6 +995,10 @@ class Pi05TorchFrontendRtx:
                 self.graph_recorded = False
                 self.calibrated = False
             return
+        if self._denoise_trace:
+            raise NotImplementedError(
+                "denoise_trace is not recorded by the CFG pipelines yet; "
+                "build the frontend with denoise_trace=False to use RL CFG mode")
         if cfg_beta < 1.0:
             raise ValueError(
                 f"cfg_beta must be >= 1.0 (1.0 disables CFG); got {cfg_beta}")
@@ -1073,6 +1089,7 @@ class Pi05TorchFrontendRtx:
                 vision_pool_factor=self._vision_pool_factor,
                 vision_num_layers=self._vision_num_layers,
                 fixed_shape=True,
+                denoise_trace=self._denoise_trace,
                 **self._pipeline_precision_kwargs())
             if self._fixed_pipeline.use_int8_vision_static:
                 self._fixed_pipeline.vis_int8_static_calibrated = False
@@ -1123,6 +1140,7 @@ class Pi05TorchFrontendRtx:
                     num_steps=self._num_steps,
                     vision_pool_factor=self._vision_pool_factor,
                     vision_num_layers=self._vision_num_layers,
+                    denoise_trace=self._denoise_trace,
                     **self._pipeline_precision_kwargs())
                 self._prompt_pipeline_cache[prompt_len] = self.pipeline
                 # Static INT8 vision scales are per-pipeline-instance.
@@ -1554,12 +1572,23 @@ class Pi05TorchFrontendRtx:
         """:class:`ModelPrecisionSpec` captured at calibration time."""
         return getattr(self, "_precision_spec", None)
 
-    def infer(self, observation: dict, debug: bool = False) -> dict:
+    def infer(self, observation: dict, debug: bool = False, *,
+              noise=None, generator=None) -> dict:
         """Run inference on a single observation.
 
         All GPU work happens on ``self._graph_torch_stream`` — the same
         stream the graph was captured on — so replay + pre/post D2D copies
         are serialized correctly.
+
+        Sampling is reproducible on request: ``noise`` supplies the
+        initial diffusion noise ``(chunk_size, 32)`` directly and
+        ``generator`` (a CUDA ``torch.Generator``) seeds the internal
+        draw; with neither, the draw is unseeded as before. The noise
+        actually used is returned under ``"noise"``; the same noise,
+        prompt and weights give bit-identical actions. When the
+        frontend was built with ``denoise_trace=True`` the result also
+        carries ``"raw_actions"`` (normalized, ``(chunk, 32)``) and
+        ``"denoise_trace"`` (see :meth:`_download_denoise_trace`).
 
         When the active pipeline is :class:`Pi05CFGBatchedPipeline`
         (RL mode + batched mode both on), this routes through a B=2
@@ -1573,7 +1602,8 @@ class Pi05TorchFrontendRtx:
             raise RuntimeError("set_prompt must be called before infer")
 
         if isinstance(self.pipeline, Pi05CFGBatchedPipeline):
-            return self._infer_cfg_batched(observation, debug=debug)
+            return self._infer_cfg_batched(
+                observation, debug=debug, noise=noise, generator=generator)
 
         t0 = time.perf_counter()
 
@@ -1586,7 +1616,7 @@ class Pi05TorchFrontendRtx:
         with torch.cuda.stream(self._graph_torch_stream):
             stream_int = self._graph_torch_stream.cuda_stream
 
-            self._noise_buf.normal_()
+            noise_used = self._fill_noise(self._noise_buf, noise, generator)
             self._copy_tensor_to_pipeline_buf_stream(
                 self._noise_buf, self.pipeline.input_noise_buf, stream_int)
 
@@ -1604,6 +1634,8 @@ class Pi05TorchFrontendRtx:
                 ctypes.c_void_p(self._noise_out.data_ptr()),
                 ctypes.c_void_p(out_ptr),
                 self._noise_out.numel() * 2, 3, stream_int)
+            if self._denoise_trace:
+                self._enqueue_denoise_trace_download(stream_int)
 
         self._cudart.cudaStreamSynchronize(
             ctypes.c_void_p(self._graph_torch_stream.cuda_stream))
@@ -1619,7 +1651,11 @@ class Pi05TorchFrontendRtx:
             logger.info("Raw actions[0,:5]: %s", raw_actions[0, :5])
             logger.info("Latency: %.1f ms", latency_ms)
 
-        return {"actions": robot_actions}
+        result = {"actions": robot_actions, "noise": noise_used}
+        if self._denoise_trace:
+            result["raw_actions"] = raw_actions
+            result["denoise_trace"] = self._denoise_trace_result()
+        return result
 
     def _use_full_pipeline_for_next_frame(self) -> bool:
         """Advance the frame counter and select full vs decode-only work."""
@@ -1628,7 +1664,8 @@ class Pi05TorchFrontendRtx:
                 self._frame_count % self._cache_frames == 1)
 
     def _infer_cfg_batched(self, observation: dict,
-                           debug: bool = False) -> dict:
+                           debug: bool = False, *,
+                           noise=None, generator=None) -> dict:
         """Batched CFG inference: single obs replicated across cond + uncond slots."""
         t0 = time.perf_counter()
 
@@ -1644,7 +1681,7 @@ class Pi05TorchFrontendRtx:
             # once and copying into both slots ensures the uncond slot
             # starts at the same noise the cond does, which matches
             # the paper-faithful CFG contract.
-            self._noise_buf.normal_()
+            noise_used = self._fill_noise(self._noise_buf, noise, generator)
             for b in range(PI05_BATCH_SIZE):
                 self._noise_buf_b2[b].copy_(self._noise_buf)
 
@@ -1677,7 +1714,7 @@ class Pi05TorchFrontendRtx:
                 "CFG batched raw actions[0,:5]: %s", raw_actions[0, :5])
             logger.info("CFG batched latency: %.1f ms", latency_ms)
 
-        return {"actions": robot_actions}
+        return {"actions": robot_actions, "noise": noise_used}
 
     # -----------------------------------------------------------------
     # Batched (B=2) inference path — additive, default API unchanged
@@ -1792,6 +1829,7 @@ class Pi05TorchFrontendRtx:
                 num_views=self.num_views,
                 max_prompt_len=target_len,
                 chunk_size=self.chunk_size,
+                denoise_trace=self._denoise_trace,
                 **self._pipeline_precision_kwargs())
         # B=1 pipeline path is what calibrate_fp8 uses for FP8 scale collection.
         self.pipeline.set_language_embeds(padded_np_list[0])
@@ -1835,16 +1873,23 @@ class Pi05TorchFrontendRtx:
         self.calibrated = True
         self.graph_recorded = self.use_cuda_graph
 
-    def infer_batch(self, observations: list) -> list:
+    def infer_batch(self, observations: list, *,
+                    noise=None, generator=None) -> list:
         """Run B=2 inference on two independent observations.
 
         Args:
             observations: list of length B (currently 2) of obs dicts
                 matching :meth:`infer`'s contract (``image``,
                 ``wrist_image`` if ``num_views >= 2``, ``state``).
+            noise: optional initial noise ``(B, chunk_size, 32)``; one
+                slot per observation. ``generator`` seeds the internal
+                draw instead. See :meth:`infer`.
 
         Returns:
-            List of length B; each entry is ``{"actions": (action_horizon, action_dim)}``.
+            List of length B; each entry is ``{"actions": (action_horizon,
+            action_dim), "noise": (chunk_size, 32)}`` plus
+            ``"raw_actions"`` and ``"denoise_trace"`` when the frontend
+            was built with ``denoise_trace=True``.
         """
         if not isinstance(self.pipeline, Pi05BatchedPipeline):
             raise RuntimeError("set_batched_mode + set_prompt_batch required")
@@ -1857,7 +1902,7 @@ class Pi05TorchFrontendRtx:
         # Stage per-sample inputs into the B=2 staging tensors, then D2D.
         for b, obs in enumerate(observations):
             self._img_buf_b2[b].copy_(self._stack_images(obs))
-        self._noise_buf_b2.normal_()
+        noise_used = self._fill_noise(self._noise_buf_b2, noise, generator)
 
         with torch.cuda.stream(self._graph_torch_stream):
             stream_int = self._graph_torch_stream.cuda_stream
@@ -1872,6 +1917,8 @@ class Pi05TorchFrontendRtx:
                 ctypes.c_void_p(self._noise_out_b2.data_ptr()),
                 ctypes.c_void_p(out_ptr),
                 self._noise_out_b2.numel() * 2, 3, stream_int)
+            if self._denoise_trace:
+                self._enqueue_denoise_trace_download(stream_int, batched=True)
 
         self._cudart.cudaStreamSynchronize(
             ctypes.c_void_p(self._graph_torch_stream.cuda_stream))
@@ -1879,11 +1926,19 @@ class Pi05TorchFrontendRtx:
         latency_ms = (time.perf_counter() - t0) * 1000
         self.latency_records.append(latency_ms)
 
+        trace = self._denoise_trace_result(batched=True) if self._denoise_trace else None
         results = []
         for b in range(PI05_BATCH_SIZE):
             raw = self._noise_out_b2[b].float().cpu().numpy()
             unnorm = unnormalize_actions(raw, self.norm_stats)
-            results.append({"actions": unnorm[:, :LIBERO_ACTION_DIM]})
+            entry = {"actions": unnorm[:, :LIBERO_ACTION_DIM],
+                     "noise": noise_used[b]}
+            if trace is not None:
+                entry["raw_actions"] = raw
+                entry["denoise_trace"] = {
+                    "x": trace["x"][:, b], "delta": trace["delta"][:, b],
+                    "timesteps": trace["timesteps"]}
+            results.append(entry)
         return results
 
     def get_latency_stats(self) -> dict:
@@ -1938,6 +1993,73 @@ class Pi05TorchFrontendRtx:
         """
         stream_int = torch.cuda.current_stream().cuda_stream
         self._copy_tensor_to_pipeline_buf_stream(src, dst_buf, stream_int)
+
+    # ── Reproducible sampling + denoise trace ────────────────────────
+
+    def _fill_noise(self, buf: torch.Tensor, noise, generator) -> np.ndarray:
+        """Fill the staging noise tensor and return a float32 copy of it.
+
+        ``noise`` (tensor or array shaped like ``buf``) is copied in;
+        otherwise ``buf`` is drawn from ``generator`` when given, else
+        from the default CUDA generator. The returned copy is what the
+        caller must pass back as ``noise=`` to reproduce the sample.
+        """
+        if noise is not None:
+            if generator is not None:
+                raise ValueError("pass either noise or generator, not both")
+            src = torch.as_tensor(noise)
+            if tuple(src.shape) != tuple(buf.shape):
+                raise ValueError(
+                    f"noise must have shape {tuple(buf.shape)}, got {tuple(src.shape)}")
+            buf.copy_(src.to(device=buf.device, dtype=buf.dtype))
+        elif generator is not None:
+            buf.normal_(generator=generator)
+        else:
+            buf.normal_()
+        return buf.float().cpu().numpy()
+
+    def denoise_timesteps(self) -> list:
+        """Flow-matching time of each denoising step (``1, 1-dt, ..., dt``)."""
+        dt = -1.0 / self._num_steps
+        return [1.0 + k * dt for k in range(self._num_steps)]
+
+    def _enqueue_denoise_trace_download(self, stream_int: int,
+                                        batched: bool = False) -> None:
+        """Queue D2D copies of the pipeline trace buffers into staging tensors."""
+        if batched:
+            x_buf = self.pipeline.denoise_trace_x_buf_b2
+            d_buf = self.pipeline.denoise_trace_delta_buf_b2
+            need = (self._num_steps, PI05_BATCH_SIZE, self.chunk_size, ACTION_DIM)
+        else:
+            x_buf = self.pipeline.denoise_trace_x_buf
+            d_buf = self.pipeline.denoise_trace_delta_buf
+            need = (self._num_steps, self.chunk_size, ACTION_DIM)
+        if tuple(self._trace_x_out.shape) != need:
+            self._trace_x_out = torch.empty(need, dtype=bf16, device="cuda")
+            self._trace_delta_out = torch.empty_like(self._trace_x_out)
+        for dst, src in ((self._trace_x_out, x_buf), (self._trace_delta_out, d_buf)):
+            nbytes = dst.numel() * dst.element_size()
+            assert nbytes == src.nbytes, f"trace size mismatch: {nbytes} vs {src.nbytes}"
+            self._cudart.cudaMemcpyAsync(
+                ctypes.c_void_p(dst.data_ptr()), src.ptr, nbytes, 3, stream_int)
+
+    def _denoise_trace_result(self, batched: bool = False) -> dict:
+        """Host copy of the last trace. Call after the stream is synchronized.
+
+        ``x[s]`` is the denoising state entering step ``s`` (``x[0]`` is
+        the initial noise) and ``delta[s]`` the increment the step adds,
+        so ``x[s+1] == x[s] + delta[s]`` and the final raw actions are
+        ``x[-1] + delta[-1]``. For the linear flow-matching schedule
+        ``delta[s] == -v[s] / num_steps``. Shapes are
+        ``(num_steps, chunk, 32)`` (``(num_steps, B, chunk, 32)`` when
+        batched), float32 on the host; ``timesteps`` lists the flow time
+        of each step.
+        """
+        return {
+            "x": self._trace_x_out.float().cpu().numpy(),
+            "delta": self._trace_delta_out.float().cpu().numpy(),
+            "timesteps": self.denoise_timesteps(),
+        }
 
     def _copy_tensor_to_pipeline_buf_stream(
             self, src: torch.Tensor, dst_buf, stream_int: int) -> None:

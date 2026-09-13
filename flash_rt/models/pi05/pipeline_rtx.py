@@ -185,11 +185,18 @@ class Pi05Pipeline:
                  vision_pool_factor: int = 1,
                  vision_num_layers: int = VIS_L,
                  num_steps: int = NUM_STEPS_DEFAULT,
-                 fixed_shape: bool = False):
+                 fixed_shape: bool = False,
+                 denoise_trace: bool = False):
         self.gemm = gemm
         self.fvk = fvk
         self.attn = attn_backend
         self.weights = weights
+        # Denoise trace: record every denoising step's input x_s and its
+        # increment delta_s into two extra buffers. The copies are issued
+        # inside transformer_decoder, so they are captured into the graph
+        # with everything else; off by default, in which case the default
+        # graph is byte-identical to a pipeline built without the option.
+        self.denoise_trace = bool(denoise_trace)
 
         # Fixed-shape state-prompt mode: one captured graph at the MAX prompt
         # length serves every length via seqused masking + devpos K/V append.
@@ -388,6 +395,8 @@ class Pi05Pipeline:
         # them and therefore keep byte-identical behavior.
         B["rtc_prefix_weights"] = CudaBuffer.device_empty(ds, FP32)
         B["rtc_guidance_weight"] = CudaBuffer.device_empty(1, FP32)
+        if self.denoise_trace:
+            self._allocate_denoise_trace_buffers(B, ds)
         # Decoder scratch for ada_rms_norm output + gate
         B["x_normed_buf"] = CudaBuffer.device_empty(ds * DEC_D, BF16)
         B["gate_buf"] = CudaBuffer.device_empty(ds * DEC_D, BF16)
@@ -1494,6 +1503,10 @@ class Pi05Pipeline:
                     B["decoder_action_buf"].ptr.value,
                     W["decoder_action_out_proj_b"],
                     ds, ACTION_DIM, stream)
+                if self.denoise_trace:
+                    self._record_denoise_step(
+                        step, B["diffusion_noise"], B["decoder_action_buf"],
+                        ds, stream)
                 # noise += action_buf (weights pre-scaled by -1/num_steps by frontend)
                 fvk.residual_add(
                     B["diffusion_noise"].ptr.value,
@@ -2072,6 +2085,58 @@ class Pi05Pipeline:
     def input_rtc_prev_action_chunk_buf(self) -> CudaBuffer:
         """Optional RTC-prefix input: previous raw action chunk (chunk, 32)."""
         return self.bufs["rtc_prev_action_chunk"]
+
+    # ── Denoise trace (optional, construction-time) ─────────────────
+
+    def _allocate_denoise_trace_buffers(self, B: dict, rows: int,
+                                        suffix: str = "") -> None:
+        """Allocate ``(num_steps, rows, 32)`` bf16 slots for x_s and delta_s."""
+        n = self.num_steps * int(rows) * ACTION_DIM
+        B["denoise_trace_x" + suffix] = CudaBuffer.device_empty(n, BF16)
+        B["denoise_trace_delta" + suffix] = CudaBuffer.device_empty(n, BF16)
+
+    def _record_denoise_step(self, step: int, x_buf: CudaBuffer,
+                             delta_buf: CudaBuffer, rows: int, stream: int,
+                             suffix: str = "") -> None:
+        """Copy the step's pre-update state and increment into the trace.
+
+        Issued on ``stream`` right before the in-place Euler update, so
+        ``trace_x[step]`` is x_s and ``trace_delta[step]`` is the value
+        the update adds (``-v_s / num_steps`` for the flow-matching
+        schedule). Two device-to-device copies of ``rows * 32`` bf16;
+        captured into the CUDA graph like every other node.
+        """
+        nbytes = int(rows) * ACTION_DIM * 2
+        off = int(step) * nbytes
+        self.fvk.gpu_copy(
+            self.bufs["denoise_trace_x" + suffix].ptr.value + off,
+            x_buf.ptr.value, nbytes, stream)
+        self.fvk.gpu_copy(
+            self.bufs["denoise_trace_delta" + suffix].ptr.value + off,
+            delta_buf.ptr.value, nbytes, stream)
+
+    @property
+    def denoise_trace_x_buf(self) -> CudaBuffer:
+        """Trace output: per-step input state, ``(num_steps, chunk, 32)`` bf16."""
+        if not self.denoise_trace:
+            raise RuntimeError("pipeline was built without denoise_trace=True")
+        return self.bufs["denoise_trace_x"]
+
+    @property
+    def denoise_trace_delta_buf(self) -> CudaBuffer:
+        """Trace output: per-step increment, ``(num_steps, chunk, 32)`` bf16."""
+        if not self.denoise_trace:
+            raise RuntimeError("pipeline was built without denoise_trace=True")
+        return self.bufs["denoise_trace_delta"]
+
+    def denoise_timesteps(self) -> list[float]:
+        """Flow-matching time of each denoising step: ``1, 1-dt, ..., dt``.
+
+        Matches the sinusoidal time-embedding schedule the frontend
+        precomputes (``t_k = 1 + k * dt`` with ``dt = -1 / num_steps``).
+        """
+        dt = -1.0 / self.num_steps
+        return [1.0 + k * dt for k in range(self.num_steps)]
 
     @property
     def input_rtc_prefix_weights_buf(self) -> CudaBuffer:
