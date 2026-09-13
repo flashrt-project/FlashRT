@@ -252,6 +252,9 @@ using V14 = VariantSK<Shape<_128,_128,_256>, Shape<_1,_1,_1>, 4>;   // wider N, 
 
 }  // namespace variants
 
+int cutlass_fp4_gemm_variant_earlyb(int idx, void const* A, void const* SFA, void const* B, void const* SFB,
+    void* D, int M, int N, int K, float alpha, float beta, cudaStream_t stream);
+
 // Dispatch by index (exposed via pybind).
 int cutlass_fp4_gemm_variant(int idx,
     void const* A, void const* SFA, void const* B, void const* SFB,
@@ -274,6 +277,8 @@ int cutlass_fp4_gemm_variant(int idx,
     case 12: return V12::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     case 13: return V13::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     case 14: return V14::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 15: case 16: case 17:
+      return cutlass_fp4_gemm_variant_earlyb(idx - 15, A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     default: return -99;
   }
 }
@@ -295,11 +300,14 @@ const char* cutlass_fp4_gemm_variant_name(int idx) {
     case 12: return "tile128x64x256  split-K 4 (stream-K scheduler, cached workspace)";
     case 13: return "tile128x64x256  stream-K (stream-K scheduler, cached workspace)";
     case 14: return "tile128x128x256 split-K 4 (stream-K scheduler, cached workspace)";
+    case 15: return "tile128x64x256  cluster1x1x1, weights streamed before the PDL wait";
+    case 16: return "tile128x128x256 cluster1x1x1, weights streamed before the PDL wait";
+    case 17: return "tile128x256x256 cluster1x1x1, weights streamed before the PDL wait";
     default: return "<invalid>";
   }
 }
 
-int cutlass_fp4_gemm_num_variants() { return 15; }
+int cutlass_fp4_gemm_num_variants() { return 18; }
 
 }  // namespace fp4
 }  // namespace flash_rt
