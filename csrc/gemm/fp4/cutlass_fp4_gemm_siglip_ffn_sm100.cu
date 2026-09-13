@@ -8,6 +8,7 @@
 //    Down: LinCombPerColBias (fp16 out, beta = 1 residual source)
 // ============================================================================
 #include "gemm/fp4/cutlass_fp4_gemm_siglip_ffn_sm100.cuh"
+#include "fused_fp4/pdl.cuh"
 
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/thread/activation.h"
@@ -190,7 +191,7 @@ int cutlass_fp4_gemm_bias_gelu_fp4out(
     if (ws) cudaFree(ws);
     return static_cast<int>(st) | 0x20000;
   }
-  st = gemm.run(stream);
+  st = gemm.run(stream, nullptr, flash_rt::fp4::pdl_launch());
   if (ws) cudaFree(ws);
   return (st == cutlass::Status::kSuccess) ? 0
                                            : (static_cast<int>(st) | 0x30000);
@@ -247,7 +248,7 @@ int cutlass_fp4_gemm_bias_res_fp16(
     if (ws) cudaFree(ws);
     return static_cast<int>(st) | 0x20000;
   }
-  st = gemm.run(stream);
+  st = gemm.run(stream, nullptr, flash_rt::fp4::pdl_launch());
   if (ws) cudaFree(ws);
   return (st == cutlass::Status::kSuccess) ? 0
                                            : (static_cast<int>(st) | 0x30000);

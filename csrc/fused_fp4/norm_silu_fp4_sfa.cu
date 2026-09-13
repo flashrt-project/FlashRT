@@ -14,6 +14,7 @@
 //  scale, e2m1-pack elements, and write scale byte to CUTLASS SFA layout.
 // ============================================================================
 #include "fused_fp4/norm_silu_fp4_sfa.cuh"
+#include "fused_fp4/pdl.cuh"
 
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
@@ -153,6 +154,7 @@ __global__ void pi05_adarms_fp4_sfa_register_kernel(
     __half* __restrict__ gate,
     LayoutSF layout,
     int D) {
+    flashrt_pdl_wait_and_trigger();
     const int row_idx = blockIdx.x;
     const __half* row = x + row_idx * D;
     const __half* sc = style + row_idx * 3 * D;
@@ -217,6 +219,7 @@ __global__ void pi05_gate_res_adarms_fp4_sfa_register_kernel(
     __half* __restrict__ gate,
     LayoutSF layout,
     int D) {
+    flashrt_pdl_wait_and_trigger();
     const int row_idx = blockIdx.x;
     const __half* sc = style + row_idx * 3 * D;
     const __half* sh = sc + D;
@@ -587,8 +590,8 @@ void pi05_adarms_fp4_sfa_fp16(
 #if FV_HAVE_CUTLASS
     auto shape = cute::make_shape(seq_len, 1, dim, 1);
     auto layout = Cfg::tile_atom_to_shape_SFA(shape);
-    pi05_adarms_fp4_sfa_register_kernel<false><<<seq_len, 256, 0, stream>>>(
-        x, style, packed, sfa, gate, layout, dim);
+    flash_rt::fp4::launch_maybe_pdl(pi05_adarms_fp4_sfa_register_kernel<false, decltype(layout)>,
+        dim3(seq_len), dim3(256), 0, stream, x, style, packed, sfa, gate, layout, dim);
     check_fp4_kernel_launch("pi05_adarms_fp4_sfa_fp16");
 #else
     (void)x; (void)style; (void)packed; (void)sfa; (void)gate;
@@ -603,8 +606,8 @@ void pi05_gate_res_adarms_fp4_sfa_fp16(
 #if FV_HAVE_CUTLASS
     auto shape = cute::make_shape(seq_len, 1, dim, 1);
     auto layout = Cfg::tile_atom_to_shape_SFA(shape);
-    pi05_gate_res_adarms_fp4_sfa_register_kernel<false><<<seq_len, 256, 0, stream>>>(
-            x, prev_gate, residual, style, packed, sfa, gate, layout, dim);
+    flash_rt::fp4::launch_maybe_pdl(pi05_gate_res_adarms_fp4_sfa_register_kernel<false, decltype(layout)>,
+        dim3(seq_len), dim3(256), 0, stream, x, prev_gate, residual, style, packed, sfa, gate, layout, dim);
     check_fp4_kernel_launch("pi05_gate_res_adarms_fp4_sfa_fp16");
 #else
     (void)x; (void)prev_gate; (void)residual; (void)style;
@@ -620,8 +623,8 @@ void pi05_adarms_fp4_sfa_native_fp16(
 #if FV_HAVE_CUTLASS
     auto shape = cute::make_shape(seq_len, 1, dim, 1);
     auto layout = Cfg::tile_atom_to_shape_SFA(shape);
-    pi05_adarms_fp4_sfa_register_kernel<true><<<seq_len, 256, 0, stream>>>(
-        x, style, packed, sfa, gate, layout, dim);
+    flash_rt::fp4::launch_maybe_pdl(pi05_adarms_fp4_sfa_register_kernel<true, decltype(layout)>,
+        dim3(seq_len), dim3(256), 0, stream, x, style, packed, sfa, gate, layout, dim);
     check_fp4_kernel_launch("pi05_adarms_fp4_sfa_native_fp16");
 #else
     (void)x; (void)style; (void)packed; (void)sfa; (void)gate;
@@ -636,9 +639,8 @@ void pi05_gate_res_adarms_fp4_sfa_native_fp16(
 #if FV_HAVE_CUTLASS
     auto shape = cute::make_shape(seq_len, 1, dim, 1);
     auto layout = Cfg::tile_atom_to_shape_SFA(shape);
-    pi05_gate_res_adarms_fp4_sfa_register_kernel<true><<<
-        seq_len, 256, 0, stream>>>(
-            x, prev_gate, residual, style, packed, sfa, gate, layout, dim);
+    flash_rt::fp4::launch_maybe_pdl(pi05_gate_res_adarms_fp4_sfa_register_kernel<true, decltype(layout)>,
+        dim3(seq_len), dim3(256), 0, stream, x, prev_gate, residual, style, packed, sfa, gate, layout, dim);
     check_fp4_kernel_launch("pi05_gate_res_adarms_fp4_sfa_native_fp16");
 #else
     (void)x; (void)prev_gate; (void)residual; (void)style;

@@ -1,5 +1,6 @@
 // See pi05_rowops_v2.cuh.
 #include "fused_fp4/pi05_rowops_v2.cuh"
+#include "fused_fp4/pdl.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -165,6 +166,7 @@ rowops_kernel(__half* __restrict__ residual, const __half* __restrict__ x,
               uint2* __restrict__ packed, uint8_t* __restrict__ sfa,
               uint8_t* __restrict__ out_fp8, LayoutSF layout,
               int S, int D, float eps) {
+  flashrt_pdl_wait_and_trigger();
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
   const int row = blockIdx.x * ROWS_PER_CTA + warp;
@@ -288,10 +290,10 @@ int launch(__half* residual, const __half* x, const __half* gamma,
   auto* sf = reinterpret_cast<uint8_t*>(sfa);
   auto* o8 = reinterpret_cast<uint8_t*>(out_fp8);
   switch (bpl) {
-    case 1: rowops_kernel<MODE, 1><<<grid, THREADS, 0, stream>>>(residual, x, gamma, beta, inv_s, descale, pk, sf, o8, layout, S, D, eps); break;
-    case 2: rowops_kernel<MODE, 2><<<grid, THREADS, 0, stream>>>(residual, x, gamma, beta, inv_s, descale, pk, sf, o8, layout, S, D, eps); break;
-    case 3: rowops_kernel<MODE, 3><<<grid, THREADS, 0, stream>>>(residual, x, gamma, beta, inv_s, descale, pk, sf, o8, layout, S, D, eps); break;
-    case 4: rowops_kernel<MODE, 4><<<grid, THREADS, 0, stream>>>(residual, x, gamma, beta, inv_s, descale, pk, sf, o8, layout, S, D, eps); break;
+    case 1: flash_rt::fp4::launch_maybe_pdl(rowops_kernel<MODE, 1, decltype(layout)>, grid, dim3(THREADS), 0, stream, residual, x, gamma, beta, inv_s, descale, pk, sf, o8, layout, S, D, eps); break;
+    case 2: flash_rt::fp4::launch_maybe_pdl(rowops_kernel<MODE, 2, decltype(layout)>, grid, dim3(THREADS), 0, stream, residual, x, gamma, beta, inv_s, descale, pk, sf, o8, layout, S, D, eps); break;
+    case 3: flash_rt::fp4::launch_maybe_pdl(rowops_kernel<MODE, 3, decltype(layout)>, grid, dim3(THREADS), 0, stream, residual, x, gamma, beta, inv_s, descale, pk, sf, o8, layout, S, D, eps); break;
+    case 4: flash_rt::fp4::launch_maybe_pdl(rowops_kernel<MODE, 4, decltype(layout)>, grid, dim3(THREADS), 0, stream, residual, x, gamma, beta, inv_s, descale, pk, sf, o8, layout, S, D, eps); break;
     default: return -1;
   }
   const cudaError_t e = cudaGetLastError();

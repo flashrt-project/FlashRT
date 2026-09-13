@@ -13,6 +13,7 @@
 // ============================================================================
 
 #include "cutlass_fp4_gemm_e0m3w_sm100.cuh"
+#include "fused_fp4/pdl.cuh"
 
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/thread/linear_combination.h"
@@ -131,7 +132,7 @@ struct RunnerV10 {
     if (ws_sz > 0 && cudaMalloc(&ws, ws_sz) != cudaSuccess) return -1;
     st = gemm.initialize(args, ws, stream);
     if (st != cutlass::Status::kSuccess) { if (ws) cudaFree(ws); return static_cast<int>(st) | 0x20000; }
-    st = gemm.run(stream);
+    st = gemm.run(stream, nullptr, flash_rt::fp4::pdl_launch());
     if (ws) cudaFree(ws);
     return (st == cutlass::Status::kSuccess) ? 0 : (static_cast<int>(st) | 0x30000);
   }

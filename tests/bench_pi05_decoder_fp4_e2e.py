@@ -59,6 +59,7 @@ PUBLIC_API_PRESET = {
     "encoder_attn_o_variant": 1,
     "siglip_up_variant": 2,
     "siglip_down_variant": 0,
+    "pdl": 1,
     "decoder_qkv_variant": 10,
     "decoder_o_variant": 10,
     "decoder_down_variant": 10,
@@ -150,6 +151,8 @@ def main() -> int:
     parser.add_argument("--encoder-attn-o-variant", type=int, default=1)
     parser.add_argument("--siglip-up-variant", type=int, default=2)
     parser.add_argument("--siglip-down-variant", type=int, default=0)
+    parser.add_argument("--pdl", type=int, choices=(0, 1), default=1,
+                        help="programmatic dependent launch for the NVFP4 GEMMs and activation kernels")
     parser.add_argument(
         "--decoder-weight-format", choices=("nvfp4", "e0m3"),
         default="nvfp4",
@@ -316,6 +319,7 @@ def main() -> int:
                 encoder_attn_o_variant=args.encoder_attn_o_variant,
                 siglip_up_variant=args.siglip_up_variant,
                 siglip_down_variant=args.siglip_down_variant,
+                pdl=bool(args.pdl),
                 decoder_qkv_variant=args.decoder_qkv_variant,
                 decoder_o_variant=args.decoder_o_variant,
                 decoder_down_variant=args.decoder_down_variant,
@@ -433,6 +437,7 @@ def main() -> int:
                     "encoder_attn_o_variant": args.encoder_attn_o_variant,
                     "siglip_up_variant": args.siglip_up_variant,
                     "siglip_down_variant": args.siglip_down_variant,
+                    "pdl": bool(args.pdl),
                     "decoder_qkv_variant": args.decoder_qkv_variant,
                     "decoder_o_variant": args.decoder_o_variant,
                     "decoder_down_variant": args.decoder_down_variant,
@@ -508,6 +513,7 @@ def main() -> int:
             "--encoder-attn-o-variant", str(args.encoder_attn_o_variant),
             "--siglip-up-variant", str(args.siglip_up_variant),
             "--siglip-down-variant", str(args.siglip_down_variant),
+            "--pdl", str(args.pdl),
             "--decoder-qkv-variant", str(args.decoder_qkv_variant),
             "--decoder-o-variant", str(args.decoder_o_variant),
             "--decoder-down-variant", str(args.decoder_down_variant),

@@ -9,6 +9,7 @@
 // ============================================================================
 
 #include "cutlass_fp4_gemm.cuh"
+#include "fused_fp4/pdl.cuh"
 
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) || defined(__CUDA_ARCH__)
 #  include "cutlass/cutlass.h"
@@ -178,7 +179,7 @@ int cutlass_fp4_sq_fp16(
     return static_cast<int>(st) | 0x20000;
   }
 
-  st = gemm.run(stream);
+  st = gemm.run(stream, nullptr, flash_rt::fp4::pdl_launch());
   if (ws_ptr) cudaFree(ws_ptr);
   if (st != cutlass::Status::kSuccess) {
     return static_cast<int>(st) | 0x30000;

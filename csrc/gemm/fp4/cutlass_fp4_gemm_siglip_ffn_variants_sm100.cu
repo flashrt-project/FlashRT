@@ -2,6 +2,7 @@
 // on the MMA tile so the M=768, N=4304/1152, K=1152/4304 SigLIP shapes can be
 // tuned for a 20-SM part (the 128x256 Up tile gives 102 CTAs = 5.1 waves).
 #include "gemm/fp4/cutlass_fp4_gemm_siglip_ffn_variants_sm100.cuh"
+#include "fused_fp4/pdl.cuh"
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/thread/activation.h"
 #include "cutlass/epilogue/dispatch_policy.hpp"
@@ -88,7 +89,7 @@ struct Up {
     if (ws_sz > 0 && cudaMalloc(&ws, ws_sz) != cudaSuccess) return -1;
     st = gemm.initialize(args, ws, stream);
     if (st != cutlass::Status::kSuccess) { if (ws) cudaFree(ws); return static_cast<int>(st) | 0x20000; }
-    st = gemm.run(stream);
+    st = gemm.run(stream, nullptr, flash_rt::fp4::pdl_launch());
     if (ws) cudaFree(ws);
     return (st == cutlass::Status::kSuccess) ? 0 : (static_cast<int>(st) | 0x30000);
   }
@@ -139,7 +140,7 @@ struct Down {
     if (ws_sz > 0 && cudaMalloc(&ws, ws_sz) != cudaSuccess) return -1;
     st = gemm.initialize(args, ws, stream);
     if (st != cutlass::Status::kSuccess) { if (ws) cudaFree(ws); return static_cast<int>(st) | 0x20000; }
-    st = gemm.run(stream);
+    st = gemm.run(stream, nullptr, flash_rt::fp4::pdl_launch());
     if (ws) cudaFree(ws);
     return (st == cutlass::Status::kSuccess) ? 0 : (static_cast<int>(st) | 0x30000);
   }

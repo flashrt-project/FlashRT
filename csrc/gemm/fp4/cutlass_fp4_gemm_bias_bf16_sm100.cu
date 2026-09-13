@@ -10,6 +10,7 @@
 //               (fp4 + SFA out for the following NVFP4 GEMM)
 // ============================================================================
 #include "gemm/fp4/cutlass_fp4_gemm_bias_bf16_sm100.cuh"
+#include "fused_fp4/pdl.cuh"
 
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/thread/activation.h"
@@ -104,7 +105,7 @@ static int run_gemm(typename Gemm::Arguments& args, cudaStream_t stream) {
     if (ws) cudaFree(ws);
     return static_cast<int>(st) | 0x20000;
   }
-  st = gemm.run(stream);
+  st = gemm.run(stream, nullptr, flash_rt::fp4::pdl_launch());
   if (ws) cudaFree(ws);
   return (st == cutlass::Status::kSuccess) ? 0
                                            : (static_cast<int>(st) | 0x30000);

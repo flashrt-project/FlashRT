@@ -102,6 +102,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  encoder_attn_o_variant: int = 1,
                  siglip_up_variant: int = 2,
                  siglip_down_variant: int = 0,
+                 pdl: bool = True,
                  decoder_rht: bool = False,
                  use_fp8: bool = True,
                  state_prompt_mode: str = "exact",
@@ -207,6 +208,9 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         self.encoder_attn_o_variant = int(encoder_attn_o_variant)
         self.siglip_up_variant = int(siglip_up_variant)
         self.siglip_down_variant = int(siglip_down_variant)
+        self.pdl = bool(pdl)
+        from flash_rt import flash_rt_fp4 as _fvk_fp4_pdl
+        _fvk_fp4_pdl.set_pdl(self.pdl)
         self._decoder_attn_ws = None
 
         if self._fp4_layers:

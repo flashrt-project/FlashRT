@@ -1894,6 +1894,7 @@ if(ENABLE_SM100_CUTLASS)
     csrc/gemm/fp4/nvfp4_m16_gemm_sm110.cu
     csrc/fused_fp4/l2_prefetch.cu
     csrc/gemm/fp4/cutlass_fp4_gemm_siglip_ffn_variants_sm100.cu
+    csrc/fused_fp4/pdl.cu
   )
   if(FLASHRT_ENABLE_COSMOS3_EDGE)
     target_sources(fp4_kernels_obj PRIVATE
@@ -1901,6 +1902,7 @@ if(ENABLE_SM100_CUTLASS)
       csrc/gemm/fp4/cosmos3_edge_fp4_gemm_relu2_fp4out.cu)
     target_compile_definitions(fp4_kernels_obj PRIVATE FLASHRT_HAVE_COSMOS3_EDGE=1)
   endif()
+  target_compile_definitions(fp4_kernels_obj PRIVATE CUTLASS_ENABLE_GDC_FOR_SM100=1)
   set_target_properties(fp4_kernels_obj PROPERTIES
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON

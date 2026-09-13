@@ -10,6 +10,7 @@
 //  Additive: does not modify quantize_fp4_sfa.cu.
 // ============================================================================
 #include "quantize_fp4_sfa.cuh"
+#include "fused_fp4/pdl.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -68,6 +69,7 @@ __global__ void kernel_quantize_fp4_sfa_vec(
   float amax = 0.f;
   #pragma unroll
   for (int i = 0; i < 8; ++i) {
+  flashrt_pdl_wait_and_trigger();
     vals[i] = __half2float(h0[i]);
     vals[8 + i] = __half2float(h1[i]);
   }
@@ -120,14 +122,14 @@ int quantize_fp4_dynamic_sfa_fp16_vec(
 
   if (is_sfb) {
     auto layout = CfgVec::tile_atom_to_shape_SFB(shape);
-    kernel_quantize_fp4_sfa_vec<<<grid, threads, 0, stream>>>(
+    launch_maybe_pdl(kernel_quantize_fp4_sfa_vec<decltype(layout)>, grid, dim3(threads), 0, stream,
         reinterpret_cast<const int4*>(src_fp16),
         reinterpret_cast<uint2*>(dst_packed),
         reinterpret_cast<uint8_t*>(dst_sfa),
         layout, N, D >> 3);
   } else {
     auto layout = CfgVec::tile_atom_to_shape_SFA(shape);
-    kernel_quantize_fp4_sfa_vec<<<grid, threads, 0, stream>>>(
+    launch_maybe_pdl(kernel_quantize_fp4_sfa_vec<decltype(layout)>, grid, dim3(threads), 0, stream,
         reinterpret_cast<const int4*>(src_fp16),
         reinterpret_cast<uint2*>(dst_packed),
         reinterpret_cast<uint8_t*>(dst_sfa),

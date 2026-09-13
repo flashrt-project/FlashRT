@@ -35,6 +35,7 @@
 #include "fused_fp4/pi05_rowops_v2.cuh"
 #include "gemm/fp4/nvfp4_m16_gemm_sm110.cuh"
 #include "fused_fp4/l2_prefetch.cuh"
+#include "fused_fp4/pdl.cuh"
 #include "gemm/fp4/cutlass_fp4_gemm_siglip_ffn_variants_sm100.cuh"
 #include "quantize/reshape_scales_sfa.cuh"
 #include "fused_fp16/rms_norm_noweight_fp16.cuh"
@@ -352,6 +353,9 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
         py::arg("C"), py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0,
         "SigLIP Down GEMM (bias + residual, fp16 out) with a selectable MMA tile.");
   m.def("siglip_ffn_variant_name", &flash_rt::fp4::siglip_ffn_variant_name);
+  m.def("set_pdl", [](bool on) { flash_rt::fp4::pdl_flag() = on; }, py::arg("on"),
+        "Enable programmatic dependent launch for this module's GEMMs and activation kernels (process-wide).");
+  m.def("get_pdl", []() { return flash_rt::fp4::pdl_flag(); });
   m.def("l2_prefetch_regions",
         [](const std::vector<std::pair<uintptr_t, unsigned long long>>& regions,
            uintptr_t stream, int mode, uintptr_t sink) -> int {

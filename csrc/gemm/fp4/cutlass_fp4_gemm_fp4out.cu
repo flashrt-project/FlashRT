@@ -7,6 +7,7 @@
 //  feed directly into the next NVFP4 GEMM as A's SFA.
 // ============================================================================
 #include "gemm/fp4/cutlass_fp4_gemm_fp4out.cuh"
+#include "fused_fp4/pdl.cuh"
 
 #include "cutlass/cutlass.h"
 #include "cutlass/tensor_ref.h"
@@ -157,7 +158,7 @@ int cutlass_fp4_gemm_fp4out(
     if (ws) cudaFree(ws);
     return static_cast<int>(st) | 0x20000;
   }
-  st = gemm.run(stream);
+  st = gemm.run(stream, nullptr, flash_rt::fp4::pdl_launch());
   if (ws) cudaFree(ws);
   return (st == cutlass::Status::kSuccess) ? 0 : (static_cast<int>(st) | 0x30000);
 }
