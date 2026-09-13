@@ -23,6 +23,10 @@ Uses:
 import math
 
 
+import os as _os
+def _rowops_flag(name, default):
+    v = _os.environ.get('FLASHRT_ROWOPS_' + name)
+    return default if v is None else v == '1'
 def _check(rc, kernel, layer, **shape):
     """Raise on a non-zero NVFP4 GEMM status.
 
@@ -171,7 +175,7 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
                 raise RuntimeError(
                     f"encoder FP4 qkv GEMM layer {l} failed rc={rc}")
         else:
-            if rowops_v2:
+            if rowops_v2 and _rowops_flag('RMS', True):
                 _check(fvk_fp4.rowops_rms_fp8_v2(x, x_fp8, Se, D, as_qkv, stream),
                        'rowops_rms_fp8_v2', l, M=Se, N=D)
             else:
@@ -205,7 +209,7 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
             # 6. quantize attn output + O GEMM (FP8 static scales, or
             # dynamic NVFP4 with fp4_attn_weights).
             if aw_attn is not None and 'o' in aw_attn:
-                if rowops_v2:
+                if rowops_v2 and _rowops_flag('QUANT', True):
                     rc = fvk_fp4.rowops_quantize_fp4_sfa_v2(
                         attn_out, sc_at.packed.data_ptr(),
                         sc_at.sfa.data_ptr(), Se, D, stream)
@@ -258,7 +262,7 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
                         x, fg,
                         sc_gu.packed.data_ptr(), sc_gu.sfa.data_ptr(),
                         Se, D, stream)
-                elif rowops_v2:
+                elif rowops_v2 and _rowops_flag('F3M', True):
                     _check(fvk_fp4.rowops_residual_rms_mul_fp4_sfa_v2(
                         x, fg, awq_gu,
                         sc_gu.packed.data_ptr(), sc_gu.sfa.data_ptr(),
@@ -404,7 +408,7 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
                     _check(fvk_fp4.rowops_rms_fp8_v2(
                         x, x_fp8, Se, D, as_next, stream),
                         'rowops_rms_fp8_v2', l, M=Se, N=D)
-                elif rowops_v2:
+                elif rowops_v2 and _rowops_flag('RESRMS', True):
                     _check(fvk_fp4.rowops_residual_rms_fp8_v2(
                         x, fg_fp16_ptr, x_fp8, Se, D, as_next, stream),
                         'rowops_residual_rms_fp8_v2', l, M=Se, N=D)
@@ -458,6 +462,8 @@ def siglip_forward_with_fp4_ffn(gemm, fvk, fvk_fp4, bufs, weights, dims,
         fp4_scratch: {'ln_act': FP4ActScratch(S, D),
                       'hid_act': FP4ActScratch(S, H_pad), 'H_pad': int}
     """
+    up_variant = int((fp4_scratch or {}).get('siglip_up_variant', 0))
+    down_variant = int((fp4_scratch or {}).get('siglip_down_variant', 0))
     rowops_v2 = bool((fp4_scratch or {}).get('rowops_v2'))
     if fp4_weights is None or fp4_scratch is None:
         raise ValueError(
@@ -493,7 +499,7 @@ def siglip_forward_with_fp4_ffn(gemm, fvk, fvk_fp4, bufs, weights, dims,
         # ── Attention half: identical to siglip_forward (FP8) ──
         # Vectorized single-pass LayerNorm; falls back to the original
         # kernel on unsupported dims.
-        if rowops_v2:
+        if rowops_v2 and _rowops_flag('LN8', True):
             rc = fvk_fp4.rowops_layer_norm_fp8_v2(
                 x, weights['ln_attn_w'][l], weights['ln_attn_b'][l], x_fp8,
                 S, D, 1e-5, stream)
@@ -532,7 +538,7 @@ def siglip_forward_with_fp4_ffn(gemm, fvk, fvk_fp4, bufs, weights, dims,
                                  weights['down_b'][l], S, D, H, a_down,
                                  stream)
             continue
-        if rowops_v2:
+        if rowops_v2 and _rowops_flag('LN4', True):
             rc = fvk_fp4.rowops_layer_norm_mul_fp4_sfa_v2(
                 x, weights['ln_ffn_w'][l], weights['ln_ffn_b'][l],
                 w.get('ln_inv_s', 0),
@@ -553,19 +559,37 @@ def siglip_forward_with_fp4_ffn(gemm, fvk, fvk_fp4, bufs, weights, dims,
         if rc != 0:
             raise RuntimeError(
                 f"SigLIP FP4 FFN LayerNorm layer {l} failed rc={rc}")
-        rc = fvk_fp4.cutlass_fp4_gemm_bias_gelu_fp4out(
-            sc_ln.packed.data_ptr(), sc_ln.sfa.data_ptr(),
-            w['up']['packed'].data_ptr(), w['up']['sfb'].data_ptr(),
-            w['up_bias'],
-            sc_hid.packed.data_ptr(), sc_hid.sfa.data_ptr(),
-            S, H_pad, D, stream)
+        if up_variant:
+            rc = fvk_fp4.cutlass_fp4_gemm_bias_gelu_fp4out_v(
+                up_variant,
+                sc_ln.packed.data_ptr(), sc_ln.sfa.data_ptr(),
+                w['up']['packed'].data_ptr(), w['up']['sfb'].data_ptr(),
+                w['up_bias'],
+                sc_hid.packed.data_ptr(), sc_hid.sfa.data_ptr(),
+                S, H_pad, D, stream)
+        else:
+            rc = fvk_fp4.cutlass_fp4_gemm_bias_gelu_fp4out(
+                sc_ln.packed.data_ptr(), sc_ln.sfa.data_ptr(),
+                w['up']['packed'].data_ptr(), w['up']['sfb'].data_ptr(),
+                w['up_bias'],
+                sc_hid.packed.data_ptr(), sc_hid.sfa.data_ptr(),
+                S, H_pad, D, stream)
         if rc != 0:
             raise RuntimeError(
                 f"SigLIP FP4 FFN Up GEMM layer {l} failed rc={rc}")
-        rc = fvk_fp4.cutlass_fp4_gemm_bias_res_fp16(
-            sc_hid.packed.data_ptr(), sc_hid.sfa.data_ptr(),
-            w['down']['packed'].data_ptr(), w['down']['sfb'].data_ptr(),
-            weights['down_b'][l], x, x, S, D, H_pad, stream)
+        if down_variant:
+            rc = fvk_fp4.cutlass_fp4_gemm_bias_res_fp16_v(
+                down_variant,
+                sc_hid.packed.data_ptr(), sc_hid.sfa.data_ptr(),
+                w['down']['packed'].data_ptr(), w['down']['sfb'].data_ptr(),
+                weights['down_b'][l], x, x, S, D, H_pad, stream)
+        else:
+            rc = fvk_fp4.cutlass_fp4_gemm_bias_res_fp16(
+                sc_hid.packed.data_ptr(), sc_hid.sfa.data_ptr(),
+                w['down']['packed'].data_ptr(), w['down']['sfb'].data_ptr(),
+                weights['down_b'][l], x, x, S, D, H_pad, stream)
         if rc != 0:
             raise RuntimeError(
                 f"SigLIP FP4 FFN Down GEMM layer {l} failed rc={rc}")
+
+_ROWOPS_ENV = True

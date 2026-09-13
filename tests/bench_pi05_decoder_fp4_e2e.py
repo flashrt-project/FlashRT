@@ -44,7 +44,7 @@ PROMPT_TOKENS = [
 PUBLIC_API_PRESET = {
     "encoder_gu_mode": "p1",
     "encoder_p1_combiner": "epilogue_hw_nod",
-    "encoder_down_variant": 7,
+    "encoder_down_variant": 8,
     "encoder_down_x_variant": 6,
     "decoder_gate_up_variant": 10,
     "decoder_weight_format": "nvfp4",
@@ -54,8 +54,14 @@ PUBLIC_API_PRESET = {
     "decoder_fused_geglu": 1,
     "decoder_fused_geglu_nod": 0,
     "decoder_attn_splitkv": 0,
-    "rowops_v2": 0,
+    "rowops_v2": 1,
     "rowops_res_epilogue": 1,
+    "encoder_attn_o_variant": 1,
+    "siglip_up_variant": 2,
+    "siglip_down_variant": 0,
+    "decoder_qkv_variant": 10,
+    "decoder_o_variant": 10,
+    "decoder_down_variant": 10,
     "awq_alpha": 0.8,
     "encoder_attn_o_fp4": 1,
     "encoder_attn_qkv_fp4": 0,
@@ -135,9 +141,15 @@ def main() -> int:
         choices=("direct", "lut", "lut_native", "epilogue", "epilogue_hw",
                  "epilogue_hw_nod"),
         default="epilogue_hw_nod")
-    parser.add_argument("--encoder-down-variant", type=int, default=7)
+    parser.add_argument("--encoder-down-variant", type=int, default=8)
     parser.add_argument("--encoder-down-x-variant", type=int, default=6)
     parser.add_argument("--decoder-gate-up-variant", type=int, default=10)
+    parser.add_argument("--decoder-qkv-variant", type=int, default=10)
+    parser.add_argument("--decoder-o-variant", type=int, default=10)
+    parser.add_argument("--decoder-down-variant", type=int, default=10)
+    parser.add_argument("--encoder-attn-o-variant", type=int, default=1)
+    parser.add_argument("--siglip-up-variant", type=int, default=2)
+    parser.add_argument("--siglip-down-variant", type=int, default=0)
     parser.add_argument(
         "--decoder-weight-format", choices=("nvfp4", "e0m3"),
         default="nvfp4",
@@ -172,7 +184,7 @@ def main() -> int:
              "activation quantize fused into its combine step (replaces "
              "the cuBLAS QK^T/softmax/PV chain + quantize launch)")
     parser.add_argument(
-        "--rowops-v2", type=int, choices=(0, 1), default=0,
+        "--rowops-v2", type=int, choices=(0, 1), default=1,
         help="Warp-per-row encoder/SigLIP norm + quantize kernels with the "
              "hardware e2m1/e4m3 conversions (replaces the one-CTA-per-row "
              "originals)")
@@ -301,6 +313,12 @@ def main() -> int:
                 decoder_attn_splitkv=bool(args.decoder_attn_splitkv),
                 rowops_v2=bool(args.rowops_v2),
                 rowops_res_epilogue=bool(args.rowops_res_epilogue),
+                encoder_attn_o_variant=args.encoder_attn_o_variant,
+                siglip_up_variant=args.siglip_up_variant,
+                siglip_down_variant=args.siglip_down_variant,
+                decoder_qkv_variant=args.decoder_qkv_variant,
+                decoder_o_variant=args.decoder_o_variant,
+                decoder_down_variant=args.decoder_down_variant,
                 use_fp4_decoder=True,
                 use_fa4=True,
                 use_fp4_encoder_attn=bool(args.encoder_attn_o_fp4),
@@ -412,6 +430,12 @@ def main() -> int:
                     "decoder_attn_splitkv": bool(args.decoder_attn_splitkv),
                     "rowops_v2": bool(args.rowops_v2),
                     "rowops_res_epilogue": bool(args.rowops_res_epilogue),
+                    "encoder_attn_o_variant": args.encoder_attn_o_variant,
+                    "siglip_up_variant": args.siglip_up_variant,
+                    "siglip_down_variant": args.siglip_down_variant,
+                    "decoder_qkv_variant": args.decoder_qkv_variant,
+                    "decoder_o_variant": args.decoder_o_variant,
+                    "decoder_down_variant": args.decoder_down_variant,
                     "decoder_gate_up_variant": args.decoder_gate_up_variant,
                     "attention": "fa4_siglip_encoder",
                 }
@@ -481,6 +505,12 @@ def main() -> int:
             "--decoder-attn-splitkv", str(args.decoder_attn_splitkv),
             "--rowops-v2", str(args.rowops_v2),
             "--rowops-res-epilogue", str(args.rowops_res_epilogue),
+            "--encoder-attn-o-variant", str(args.encoder_attn_o_variant),
+            "--siglip-up-variant", str(args.siglip_up_variant),
+            "--siglip-down-variant", str(args.siglip_down_variant),
+            "--decoder-qkv-variant", str(args.decoder_qkv_variant),
+            "--decoder-o-variant", str(args.decoder_o_variant),
+            "--decoder-down-variant", str(args.decoder_down_variant),
             "--awq-alpha", str(args.awq_alpha),
             "--encoder-fp4-layer-count", str(args.encoder_fp4_layer_count),
             "--encoder-attn-o-fp4", str(args.encoder_attn_o_fp4),

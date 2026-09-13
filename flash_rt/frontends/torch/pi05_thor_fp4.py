@@ -85,7 +85,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  awq_calib_iters: int = 8,
                  use_p1_split_gu: bool = False,
                  encoder_p1_combiner: str = "epilogue_hw_nod",
-                 encoder_down_variant: int = 7,
+                 encoder_down_variant: int = 8,
                  encoder_down_x_variant: int = 6,
                  decoder_qkv_variant: int = 10,
                  decoder_o_variant: int = 10,
@@ -97,8 +97,11 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  decoder_fused_geglu: bool = True,
                  decoder_fused_geglu_nod: bool = False,
                  decoder_attn_splitkv: bool = False,
-                 rowops_v2: bool = False,
+                 rowops_v2: bool = True,
                  rowops_res_epilogue: bool = True,
+                 encoder_attn_o_variant: int = 1,
+                 siglip_up_variant: int = 2,
+                 siglip_down_variant: int = 0,
                  decoder_rht: bool = False,
                  use_fp8: bool = True,
                  state_prompt_mode: str = "exact",
@@ -201,6 +204,9 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         self.decoder_attn_splitkv = bool(decoder_attn_splitkv)
         self.rowops_v2 = bool(rowops_v2)
         self.rowops_res_epilogue = bool(rowops_res_epilogue)
+        self.encoder_attn_o_variant = int(encoder_attn_o_variant)
+        self.siglip_up_variant = int(siglip_up_variant)
+        self.siglip_down_variant = int(siglip_down_variant)
         self._decoder_attn_ws = None
 
         if self._fp4_layers:
@@ -859,6 +865,8 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
             'hid_act': FP4ActScratch(self.sig_S, H_pad, device='cuda'),
             'H_pad': H_pad,
             'rowops_v2': self.rowops_v2,
+            'siglip_up_variant': self.siglip_up_variant,
+            'siglip_down_variant': self.siglip_down_variant,
         }
         logger.info("Pi05 SigLIP FFN NVFP4 quantized (%d layers, H_pad=%d)",
                     len(self._sig_fp4_weights), H_pad)
@@ -1194,7 +1202,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         if self.use_fp4_encoder_attn:
             self._fp4_attn_scratch = FP4ActScratch(Se, De, device='cuda')
             self._fp4_scratch_dict['attn_act'] = self._fp4_attn_scratch
-            self._fp4_scratch_dict['attn_variant'] = 7
+            self._fp4_scratch_dict['attn_variant'] = self.encoder_attn_o_variant
         self._fp4_scratch_Se = Se
 
     # -------------------------------------------------------------------

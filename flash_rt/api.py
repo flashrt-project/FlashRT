@@ -330,7 +330,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                seed=1,
                max_tokens=512,
                encoder_p1_combiner=None,
-               encoder_down_variant=7,
+               encoder_down_variant=8,
                decoder_gate_up_variant=10):
     """Load a FlashRT model.
 

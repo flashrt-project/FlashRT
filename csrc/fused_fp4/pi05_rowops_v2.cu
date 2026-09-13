@@ -26,6 +26,74 @@ __device__ __forceinline__ float warp_sum(float v) {
   return v;
 }
 
+// Reduction with exactly the original vectorized-LayerNorm order: thread b
+// (block of 16) partial -> xor tree inside its 32-thread warp -> xor tree over
+// 32 slots holding the warp sums (slots >= nwarps are zero).
+template <int BPL>
+__device__ __forceinline__ float ln_block_sum(const float* part, int lane) {
+  float w[4] = {0.f, 0.f, 0.f, 0.f};
+  #pragma unroll
+  for (int j = 0; j < BPL; ++j) w[j] = warp_sum(part[j]);
+  float v[32];
+  #pragma unroll
+  for (int i = 0; i < 32; ++i) v[i] = (i < BPL) ? w[i] : 0.f;
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1) {
+    float nv[32];
+    #pragma unroll
+    for (int i = 0; i < 32; ++i) nv[i] = v[i] + v[i ^ o];
+    #pragma unroll
+    for (int i = 0; i < 32; ++i) v[i] = nv[i];
+  }
+  (void)lane;
+  return v[0];
+}
+
+// Sum of squares in exactly the order of the 256-thread RMS kernels
+// (norm.cu / res_rms_mul_fp4_sfa.cu) for D == 2048: original thread t owns
+// element pairs (2t + 512*it, +1), it = 0..3, i.e. pairs i = t % 8 of the
+// four blocks b = t / 8 + 32*it, which all live in this lane (l = t / 8).
+// Per original warp: 32 partials -> xor tree (slot 0 order); then the
+// 8 warp sums -> xor tree over 32 slots (slot 0 order).
+__device__ __forceinline__ float rms_ssq_exact2048(const float v[4][16], int lane) {
+  float p[8];
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    float ssq = 0.f;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) ssq += v[j][2 * i] * v[j][2 * i] + v[j][2 * i + 1] * v[j][2 * i + 1];
+    p[i] = ssq;
+  }
+  // original warp w = lane / 4 holds slots m = 8*(lane%4) + i; xor over m.
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) p[i] += __shfl_xor_sync(0xffffffffu, p[i], 2);   // o = 16 -> lane ^ 2
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) p[i] += __shfl_xor_sync(0xffffffffu, p[i], 1);   // o = 8  -> lane ^ 1
+  float q[8];
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) q[i] = p[i] + p[i ^ 4];                          // o = 4
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) p[i] = q[i] + q[i ^ 2];                          // o = 2
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) q[i] = p[i] + p[i ^ 1];                          // o = 1
+  const float wsum = q[0];                          // slot 0 of this lane's original warp
+  float w[8];
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) w[k] = __shfl_sync(0xffffffffu, wsum, 4 * k);
+  float sl[32];
+  #pragma unroll
+  for (int i = 0; i < 32; ++i) sl[i] = (i < 8) ? w[i] : 0.f;
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1) {
+    float nv[32];
+    #pragma unroll
+    for (int i = 0; i < 32; ++i) nv[i] = sl[i] + sl[i ^ o];
+    #pragma unroll
+    for (int i = 0; i < 32; ++i) sl[i] = nv[i];
+  }
+  return sl[0];
+}
+
 __device__ __forceinline__ void load16(const __half* p, float* v) {
   const int4 a = reinterpret_cast<const int4*>(p)[0];
   const int4 b = reinterpret_cast<const int4*>(p)[1];
@@ -58,14 +126,20 @@ __device__ __forceinline__ void quant16_store(
   __nv_fp8_e4m3 bs_q = __nv_fp8_e4m3(fmaxf(desired, 0.f));
   const float bs_dq = static_cast<float>(bs_q);
   sfa[layout(row, blk * 16, 0)] = *reinterpret_cast<uint8_t*>(&bs_q);
+  // The reference quantizer rounds exact midpoints toward zero (its compare
+  // chain uses <= at the thresholds); hardware cvt rounds ties to even. The
+  // two differ only at |v| in {0.75, 1.75, 3.5}, so nudge exactly those
+  // values below the midpoint before the conversion.
   const float inv_bs = 1.f / bs_dq;
   uint2 out;
   uint8_t* ob = reinterpret_cast<uint8_t*>(&out);
   #pragma unroll
   for (int p = 0; p < 8; ++p) {
-    ob[p] = __nv_cvt_float2_to_fp4x2(
-        make_float2(vals[2 * p] * inv_bs, vals[2 * p + 1] * inv_bs),
-        __NV_E2M1, cudaRoundNearest);
+    float v0 = vals[2 * p] * inv_bs, v1 = vals[2 * p + 1] * inv_bs;
+    const float a0 = fabsf(v0), a1 = fabsf(v1);
+    if (a0 == 0.75f || a0 == 1.75f || a0 == 3.5f) v0 *= 0.999f;
+    if (a1 == 0.75f || a1 == 1.75f || a1 == 3.5f) v1 *= 0.999f;
+    ob[p] = __nv_cvt_float2_to_fp4x2(make_float2(v0, v1), __NV_E2M1, cudaRoundNearest);
   }
   packed[static_cast<size_t>(row) * nb + blk] = out;
 }
@@ -100,6 +174,9 @@ rowops_kernel(__half* __restrict__ residual, const __half* __restrict__ x,
 
   float v[BPL][16];
   float acc = 0.f;
+  float part[BPL];
+  #pragma unroll
+  for (int j = 0; j < BPL; ++j) part[j] = 0.f;
   #pragma unroll
   for (int j = 0; j < BPL; ++j) {
     const int b = lane + 32 * j;
@@ -117,8 +194,10 @@ rowops_kernel(__half* __restrict__ residual, const __half* __restrict__ x,
           #pragma unroll
           for (int i = 0; i < 16; ++i) acc += v[j][i] * v[j][i];
         } else if (MODE == kLnMulFp4 || MODE == kLnFp8) {
+          float s16 = 0.f;
           #pragma unroll
-          for (int i = 0; i < 16; ++i) acc += v[j][i];
+          for (int i = 0; i < 16; ++i) s16 += v[j][i];
+          part[j] = s16;
         }
       }
     } else {
@@ -129,20 +208,24 @@ rowops_kernel(__half* __restrict__ residual, const __half* __restrict__ x,
 
   float scale = 1.f, mean = 0.f, rstd = 1.f;
   if (MODE == kResRmsMulFp4 || MODE == kResRmsFp8 || MODE == kRmsFp8 || MODE == kRmsMulFp4) {
-    const float ssq = warp_sum(acc);
+    float ssq;
+    if (BPL == 4 && D == 2048) ssq = rms_ssq_exact2048(v, lane);   // bit-exact vs the originals
+    else ssq = warp_sum(acc);
     scale = __frsqrt_rn(ssq / D + 1e-6f);
     if (MODE == kResRmsFp8 || MODE == kRmsFp8) scale /= fmaxf(*descale, 1e-12f);
   } else if (MODE == kLnMulFp4 || MODE == kLnFp8) {
-    mean = warp_sum(acc) / D;
-    float var = 0.f;
+    mean = ln_block_sum<BPL>(part, lane) / D;
+    float vpart[BPL];
     #pragma unroll
     for (int j = 0; j < BPL; ++j) {
+      float var = 0.f;
       if (lane + 32 * j < nb) {
         #pragma unroll
         for (int i = 0; i < 16; ++i) { const float d = v[j][i] - mean; var += d * d; }
       }
+      vpart[j] = var;
     }
-    rstd = rsqrtf(warp_sum(var) / D + eps);
+    rstd = rsqrtf(ln_block_sum<BPL>(vpart, lane) / D + eps);
   }
 
   #pragma unroll

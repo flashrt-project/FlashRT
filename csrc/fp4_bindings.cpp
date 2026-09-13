@@ -35,6 +35,7 @@
 #include "fused_fp4/pi05_rowops_v2.cuh"
 #include "gemm/fp4/nvfp4_m16_gemm_sm110.cuh"
 #include "fused_fp4/l2_prefetch.cuh"
+#include "gemm/fp4/cutlass_fp4_gemm_siglip_ffn_variants_sm100.cuh"
 #include "quantize/reshape_scales_sfa.cuh"
 #include "fused_fp16/rms_norm_noweight_fp16.cuh"
 #ifdef FLASHRT_HAVE_COSMOS3_EDGE
@@ -328,6 +329,29 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
         }, py::arg("residual"), py::arg("x"), py::arg("inv_s"), py::arg("packed"),
         py::arg("sfa"), py::arg("S"), py::arg("D"), py::arg("stream") = 0,
         "Warp-per-row residual + RMSNorm [* inv_s] -> NVFP4 + SFA (v2).");
+  m.def("cutlass_fp4_gemm_bias_gelu_fp4out_v",
+        [](int idx, uintptr_t A, uintptr_t SFA, uintptr_t B, uintptr_t SFB, uintptr_t bias,
+           uintptr_t D, uintptr_t SFD, int M, int N, int K, uintptr_t stream) -> int {
+          return flash_rt::fp4::cutlass_fp4_gemm_bias_gelu_fp4out_v(idx,
+              reinterpret_cast<void const*>(A), reinterpret_cast<void const*>(SFA),
+              reinterpret_cast<void const*>(B), reinterpret_cast<void const*>(SFB),
+              reinterpret_cast<void const*>(bias), reinterpret_cast<void*>(D),
+              reinterpret_cast<void*>(SFD), M, N, K, reinterpret_cast<cudaStream_t>(stream));
+        }, py::arg("idx"), py::arg("A"), py::arg("SFA"), py::arg("B"), py::arg("SFB"), py::arg("bias"),
+        py::arg("D"), py::arg("SFD"), py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0,
+        "SigLIP Up GEMM (bias + GELU + fp4/SFA out) with a selectable MMA tile.");
+  m.def("cutlass_fp4_gemm_bias_res_fp16_v",
+        [](int idx, uintptr_t A, uintptr_t SFA, uintptr_t B, uintptr_t SFB, uintptr_t bias,
+           uintptr_t C, uintptr_t D, int M, int N, int K, uintptr_t stream) -> int {
+          return flash_rt::fp4::cutlass_fp4_gemm_bias_res_fp16_v(idx,
+              reinterpret_cast<void const*>(A), reinterpret_cast<void const*>(SFA),
+              reinterpret_cast<void const*>(B), reinterpret_cast<void const*>(SFB),
+              reinterpret_cast<void const*>(bias), reinterpret_cast<void const*>(C),
+              reinterpret_cast<void*>(D), M, N, K, reinterpret_cast<cudaStream_t>(stream));
+        }, py::arg("idx"), py::arg("A"), py::arg("SFA"), py::arg("B"), py::arg("SFB"), py::arg("bias"),
+        py::arg("C"), py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0,
+        "SigLIP Down GEMM (bias + residual, fp16 out) with a selectable MMA tile.");
+  m.def("siglip_ffn_variant_name", &flash_rt::fp4::siglip_ffn_variant_name);
   m.def("l2_prefetch_regions",
         [](const std::vector<std::pair<uintptr_t, unsigned long long>>& regions,
            uintptr_t stream, int mode, uintptr_t sink) -> int {
