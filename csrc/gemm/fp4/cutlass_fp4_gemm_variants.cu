@@ -252,6 +252,8 @@ using V14 = VariantSK<Shape<_128,_128,_256>, Shape<_1,_1,_1>, 4>;   // wider N, 
 
 }  // namespace variants
 
+int cutlass_fp4_gemm_variant_swap(int idx, void const* A, void const* SFA, void const* B, void const* SFB,
+    void* D, int M, int N, int K, float alpha, float beta, cudaStream_t stream);
 int cutlass_fp4_gemm_variant_earlyb(int idx, void const* A, void const* SFA, void const* B, void const* SFB,
     void* D, int M, int N, int K, float alpha, float beta, cudaStream_t stream);
 
@@ -277,7 +279,10 @@ int cutlass_fp4_gemm_variant(int idx,
     case 12: return V12::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     case 13: return V13::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     case 14: return V14::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
-    case 15: case 16: case 17: case 18:
+    case 21: case 22: case 23: case 24:
+      return cutlass_fp4_gemm_variant_swap(idx - 21, A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 15: case 16: case 17: case 18: case 19: case 20:
+    case 25: case 26: case 27: case 28: case 29: case 30: case 31: case 32:
       return cutlass_fp4_gemm_variant_earlyb(idx - 15, A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     default: return -99;
   }
@@ -304,11 +309,25 @@ const char* cutlass_fp4_gemm_variant_name(int idx) {
     case 16: return "tile128x128x256 cluster1x1x1, weights streamed before the PDL wait";
     case 17: return "tile128x256x256 cluster1x1x1, weights streamed before the PDL wait";
     case 18: return "tile128x64x256  through the forked sequence kernel (step 0: identical behaviour)";
+    case 19: return "tile128x64x256  2 pipeline stages (probe)";
+    case 20: return "tile128x64x256  4 pipeline stages (probe)";
+    case 21: return "swapped operands (weights as A) tile128x64x256";
+    case 22: return "swapped operands (weights as A) tile256x64x256 cluster2x1x1 (2-SM UMMA)";
+    case 23: return "swapped operands (weights as A) tile128x128x256";
+    case 24: return "swapped operands (weights as A) tile128x64x128";
+    case 25: return "swapped operands tile128x64x256, weights streamed before the PDL wait";
+    case 26: return "swapped operands tile256x64x256 cluster2x1x1 (2-SM UMMA), weights streamed before the PDL wait";
+    case 27: return "swapped 2-SM, 2 weight k-tiles streamed before the PDL wait";
+    case 28: return "swapped 2-SM, 3 weight k-tiles streamed before the PDL wait";
+    case 29: return "swapped tile128x64x256, 2 weight k-tiles streamed before the PDL wait";
+    case 30: return "swapped 2-SM, 2 weight k-tiles early, dependents triggered from the MMA warp";
+    case 31: return "swapped 2-SM, all weight k-tiles early, dependents triggered from the MMA warp";
+    case 32: return "swapped 2-SM, activations early (control), dependents triggered from the MMA warp";
     default: return "<invalid>";
   }
 }
 
-int cutlass_fp4_gemm_num_variants() { return 19; }
+int cutlass_fp4_gemm_num_variants() { return 33; }
 
 }  // namespace fp4
 }  // namespace flash_rt

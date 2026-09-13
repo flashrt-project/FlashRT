@@ -23,9 +23,13 @@ template <int A, int B> struct is_seq_schedule<KernelTmaWarpSpecializedBlockScal
 
 template<int Stages_, int SchedulerPipelineStageCount_, int AccumulatorPipelineStageCount_,
          class ClusterShape_ = cute::Shape<cute::_1, cute::_1, cute::_1>,
-         class Schedule_ = KernelTmaWarpSpecializedBlockScaledSm100<SchedulerPipelineStageCount_, AccumulatorPipelineStageCount_>>
+         class Schedule_ = KernelTmaWarpSpecializedBlockScaledSm100<SchedulerPipelineStageCount_, AccumulatorPipelineStageCount_>,
+         bool EarlyA_ = false, int EarlyStages_ = 0, bool TriggerInMma_ = false>
 struct MainloopSm100TmaUmmaWarpSpecializedBlockScaledEarlyB {
+  constexpr static bool TriggerInMma = TriggerInMma_;   // griddepcontrol.launch_dependents from the MMA warp after its loop (stock placement) instead of the load warp
   constexpr static int Stages = Stages_;
+  constexpr static bool EarlyA = EarlyA_;
+  constexpr static int EarlyStages = (EarlyStages_ > 0 && EarlyStages_ < Stages_) ? EarlyStages_ : Stages_;   // k-tiles of the early operand issued before the PDL wait   // true: A/SFA (weights of the swapped-operand GEMM) are the early operand
   using ClusterShape = ClusterShape_;
   using ArchTag = arch::Sm100;
   constexpr static bool IsOverlappingAccum = AccumulatorPipelineStageCount_ == 1;
@@ -46,6 +50,9 @@ template <
   int AccumulatorPipelineStageCount,
   class ClusterShape,   // Static cluster shape or dynamic (int, int, _1)
   class ScheduleTag_,
+  bool EarlyA_,
+  int EarlyStages_,
+  bool TriggerInMma_,
   class TileShape_,     // (MmaAtomShapeM, MmaAtomShapeN, TileK)
   class ElementPairA_,
   class StridePairA_,
@@ -66,7 +73,10 @@ struct CollectiveMma<
       SchedulerPipelineStageCount,
       AccumulatorPipelineStageCount,
       ClusterShape,
-      ScheduleTag_>,
+      ScheduleTag_,
+      EarlyA_,
+      EarlyStages_,
+      TriggerInMma_>,
     TileShape_,
     ElementPairA_,
     StridePairA_,
@@ -93,7 +103,10 @@ struct CollectiveMma<
                           SchedulerPipelineStageCount,
                           AccumulatorPipelineStageCount,
                           ClusterShape,
-                          ScheduleTag_>;
+                          ScheduleTag_,
+                          EarlyA_,
+                          EarlyStages_,
+                          TriggerInMma_>;
   using TileShape = TileShape_;
   using TiledMMA_SF = TiledMMA<MMA_Atom<typename TiledMma::MMA_ScaleFactor>,
                                         Layout<Shape<_1,_1,_1>>,
@@ -881,7 +894,7 @@ struct CollectiveMma<
     // ---- FlashRT: weights first. B / SFB do not depend on the previous grid,
     // so stream them for the first stages before the grid-dependency wait.
     using BarrierType = typename MainloopPipeline::ProducerBarrierType;
-    constexpr int kPre = DispatchPolicy::Stages;
+    constexpr int kPre = DispatchPolicy::EarlyStages;
     BarrierType* pre_barrier[kPre];
     int pre_stage[kPre];
     const int pre = (k_tile_count < kPre) ? k_tile_count : kPre;
@@ -893,8 +906,13 @@ struct CollectiveMma<
       ++mainloop_pipe_producer_state;
       barrier_token = mainloop_pipeline.producer_try_acquire(mainloop_pipe_producer_state);
       if (cute::elect_one_sync()) {
-        copy(observed_tma_load_b_->with(*pre_barrier[i], mcast_mask_b), tBgB(_,*k_tile_iter_b), tBsB(_,pre_stage[i]));
-        copy(observed_tma_load_sfb_->with(*pre_barrier[i], mcast_mask_sfb), tBgSFB(_,*k_tile_iter_b), tBsSFB(_,pre_stage[i]));
+        if constexpr (DispatchPolicy::EarlyA) {
+          copy(observed_tma_load_a_->with(*pre_barrier[i], mcast_mask_a), tAgA(_,*k_tile_iter_b), tAsA(_,pre_stage[i]));
+          copy(observed_tma_load_sfa_->with(*pre_barrier[i], mcast_mask_sfa), tAgSFA(_,*k_tile_iter_b), tAsSFA(_,pre_stage[i]));
+        } else {
+          copy(observed_tma_load_b_->with(*pre_barrier[i], mcast_mask_b), tBgB(_,*k_tile_iter_b), tBsB(_,pre_stage[i]));
+          copy(observed_tma_load_sfb_->with(*pre_barrier[i], mcast_mask_sfb), tBgSFB(_,*k_tile_iter_b), tBsSFB(_,pre_stage[i]));
+        }
       }
       ++k_tile_iter_b;
     }
@@ -903,8 +921,13 @@ struct CollectiveMma<
 #endif
     for (int i = 0; i < pre; ++i) {
       if (cute::elect_one_sync()) {
-        copy(observed_tma_load_a_->with(*pre_barrier[i], mcast_mask_a), tAgA(_,*k_tile_iter), tAsA(_,pre_stage[i]));
-        copy(observed_tma_load_sfa_->with(*pre_barrier[i], mcast_mask_sfa), tAgSFA(_,*k_tile_iter), tAsSFA(_,pre_stage[i]));
+        if constexpr (DispatchPolicy::EarlyA) {
+          copy(observed_tma_load_b_->with(*pre_barrier[i], mcast_mask_b), tBgB(_,*k_tile_iter), tBsB(_,pre_stage[i]));
+          copy(observed_tma_load_sfb_->with(*pre_barrier[i], mcast_mask_sfb), tBgSFB(_,*k_tile_iter), tBsSFB(_,pre_stage[i]));
+        } else {
+          copy(observed_tma_load_a_->with(*pre_barrier[i], mcast_mask_a), tAgA(_,*k_tile_iter), tAsA(_,pre_stage[i]));
+          copy(observed_tma_load_sfa_->with(*pre_barrier[i], mcast_mask_sfa), tAgSFA(_,*k_tile_iter), tAsSFA(_,pre_stage[i]));
+        }
       }
       --k_tile_count;
       ++k_tile_iter;
@@ -935,7 +958,9 @@ struct CollectiveMma<
       ++k_tile_iter;
     }
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    if constexpr (!DispatchPolicy::TriggerInMma) {
+      asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    }
 #endif
 
     return cute::make_tuple(mainloop_pipe_producer_state, k_tile_iter);
@@ -1097,6 +1122,11 @@ struct CollectiveMma<
 
       mainloop_pipeline.consumer_release(curr_mainloop_pipe_consumer_state);
     }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    if constexpr (DispatchPolicy::TriggerInMma) {
+      asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    }
+#endif
 
     return mainloop_pipe_consumer_state;
   }

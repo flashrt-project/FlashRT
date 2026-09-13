@@ -61,9 +61,9 @@ PUBLIC_API_PRESET = {
     "siglip_down_variant": 0,
     "pdl": 1,
     "pdl_fvk": 0,
-    "decoder_qkv_variant": 10,
-    "decoder_o_variant": 10,
-    "decoder_down_variant": 10,
+    "decoder_qkv_variant": 28,
+    "decoder_o_variant": 28,
+    "decoder_down_variant": 28,
     "awq_alpha": 0.8,
     "encoder_attn_o_fp4": 1,
     "encoder_attn_qkv_fp4": 0,
@@ -146,9 +146,9 @@ def main() -> int:
     parser.add_argument("--encoder-down-variant", type=int, default=8)
     parser.add_argument("--encoder-down-x-variant", type=int, default=6)
     parser.add_argument("--decoder-gate-up-variant", type=int, default=10)
-    parser.add_argument("--decoder-qkv-variant", type=int, default=10)
-    parser.add_argument("--decoder-o-variant", type=int, default=10)
-    parser.add_argument("--decoder-down-variant", type=int, default=10)
+    parser.add_argument("--decoder-qkv-variant", type=int, default=28)
+    parser.add_argument("--decoder-o-variant", type=int, default=28)
+    parser.add_argument("--decoder-down-variant", type=int, default=28)
     parser.add_argument("--encoder-attn-o-variant", type=int, default=1)
     parser.add_argument("--siglip-up-variant", type=int, default=2)
     parser.add_argument("--siglip-down-variant", type=int, default=0)

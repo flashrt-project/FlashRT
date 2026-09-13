@@ -4,6 +4,8 @@
 // load() performs the wait after the weight prefetch.
 #undef CUTLASS_ENABLE_GDC_FOR_SM100
 #include "fused_fp4/pdl.cuh"
+#include <utility>
+#include <type_traits>
 #include "cutlass/cutlass.h"
 #include "cutlass/tensor_ref.h"
 #include "cutlass/epilogue/thread/linear_combination.h"
@@ -23,22 +25,24 @@ namespace fp4 {
 namespace variants_earlyb {
 using namespace cute;
 
-template <class T, bool Seq> struct ToEarlyB;
-template <int S, int SP, int AP, class CS, class... Rest>
+template <class T, bool Seq, int StagesOverride = 0, bool EarlyA = false, int EarlyStages = 0, bool TriggerInMma = false> struct ToEarlyB;
+template <int S, int SP, int AP, class CS, class... Rest, int SO, bool EA, int ES, bool TM>
 struct ToEarlyB<cutlass::gemm::collective::CollectiveMma<
-    cutlass::gemm::MainloopSm100TmaUmmaWarpSpecializedBlockScaled<S, SP, AP, CS>, Rest...>, false> {
+    cutlass::gemm::MainloopSm100TmaUmmaWarpSpecializedBlockScaled<S, SP, AP, CS>, Rest...>, false, SO, EA, ES, TM> {
   using type = cutlass::gemm::collective::CollectiveMma<
-      cutlass::gemm::MainloopSm100TmaUmmaWarpSpecializedBlockScaledEarlyB<S, SP, AP, CS>, Rest...>;
+      cutlass::gemm::MainloopSm100TmaUmmaWarpSpecializedBlockScaledEarlyB<(SO ? SO : S), SP, AP, CS,
+          cutlass::gemm::KernelTmaWarpSpecializedBlockScaledSm100<SP, AP>, EA, ES, TM>, Rest...>;
 };
-template <int S, int SP, int AP, class CS, class... Rest>
+template <int S, int SP, int AP, class CS, class... Rest, int SO, bool EA, int ES, bool TM>
 struct ToEarlyB<cutlass::gemm::collective::CollectiveMma<
-    cutlass::gemm::MainloopSm100TmaUmmaWarpSpecializedBlockScaled<S, SP, AP, CS>, Rest...>, true> {
+    cutlass::gemm::MainloopSm100TmaUmmaWarpSpecializedBlockScaled<S, SP, AP, CS>, Rest...>, true, SO, EA, ES, TM> {
   using type = cutlass::gemm::collective::CollectiveMma<
-      cutlass::gemm::MainloopSm100TmaUmmaWarpSpecializedBlockScaledEarlyB<S, SP, AP, CS,
-          cutlass::gemm::KernelTmaWarpSpecializedBlockScaledSm100Seq<SP, AP>>, Rest...>;
+      cutlass::gemm::MainloopSm100TmaUmmaWarpSpecializedBlockScaledEarlyB<(SO ? SO : S), SP, AP, CS,
+          cutlass::gemm::KernelTmaWarpSpecializedBlockScaledSm100Seq<SP, AP>, EA, ES, TM>, Rest...>;
 };
 
-template <class MmaTile, class Cluster, bool Seq = false>
+template <class MmaTile, class Cluster, bool Seq = false, int StagesOverride = 0, bool Swapped = false,
+          int EarlyStages = 0, bool EarlyA = Swapped, bool TriggerInMma = false>
 struct Variant {
   using ElementA   = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
   using LayoutATag = cutlass::layout::RowMajor;
@@ -48,8 +52,9 @@ struct Variant {
   static constexpr int AlignmentB = 32;
   using ElementD   = cutlass::half_t;
   using ElementC   = cutlass::half_t;
-  using LayoutCTag = cutlass::layout::RowMajor;
-  using LayoutDTag = cutlass::layout::RowMajor;
+  // Swapped: D is (N_out, M_act) column-major == the (M_act, N_out) row-major buffer the callers expect.
+  using LayoutCTag = std::conditional_t<Swapped, cutlass::layout::ColumnMajor, cutlass::layout::RowMajor>;
+  using LayoutDTag = std::conditional_t<Swapped, cutlass::layout::ColumnMajor, cutlass::layout::RowMajor>;
   static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
   static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
   using ElementAccumulator = float;
@@ -67,7 +72,7 @@ struct Variant {
       cutlass::gemm::collective::StageCountAutoCarveout<
           static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
       cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
-  using CollectiveMainloop = typename ToEarlyB<BaseMainloop, Seq>::type;
+  using CollectiveMainloop = typename ToEarlyB<BaseMainloop, Seq, StagesOverride, EarlyA, EarlyStages, TriggerInMma>::type;
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
       Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
@@ -79,6 +84,7 @@ struct Variant {
 
   static int run(void const* A, void const* SFA, void const* B, void const* SFB,
                  void* D, int M, int N, int K, float alpha, float beta, cudaStream_t stream) {
+    if constexpr (Swapped) { std::swap(A, B); std::swap(SFA, SFB); std::swap(M, N); }
     auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
     auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
     auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
@@ -110,6 +116,16 @@ using E0 = Variant<Shape<_128, _64,_256>, Shape<_1,_1,_1>>;   // v10 tile
 using E1 = Variant<Shape<_128,_128,_256>, Shape<_1,_1,_1>>;   // v7 tile
 using E2 = Variant<Shape<_128,_256,_256>, Shape<_1,_1,_1>>;   // v8 tile
 using E3 = Variant<Shape<_128, _64,_256>, Shape<_1,_1,_1>, true>;   // v10 tile through the forked (sequence) kernel
+using E4 = Variant<Shape<_128, _64,_256>, Shape<_1,_1,_1>, false, 2>;   // v10 tile, 2 stages (probe)
+using E5 = Variant<Shape<_128, _64,_256>, Shape<_1,_1,_1>, false, 4>;   // v10 tile, 4 stages (probe)
+using E10 = Variant<Shape<_128, _64,_256>, Shape<_1,_1,_1>, false, 0, true>;   // swapped operands, weights streamed before the PDL wait
+using E11 = Variant<Shape<_256, _64,_256>, Shape<_2,_1,_1>, false, 0, true>;   // swapped operands, 2-SM UMMA, weights streamed before the PDL wait
+using E12 = Variant<Shape<_256, _64,_256>, Shape<_2,_1,_1>, false, 0, true, 2>;   // ... only 2 weight k-tiles before the wait
+using E13 = Variant<Shape<_256, _64,_256>, Shape<_2,_1,_1>, false, 0, true, 3>;   // ... 3 weight k-tiles before the wait
+using E14 = Variant<Shape<_128, _64,_256>, Shape<_1,_1,_1>, false, 0, true, 2>;   // 1-SM swapped, 2 weight k-tiles before the wait
+using E15 = Variant<Shape<_256, _64,_256>, Shape<_2,_1,_1>, false, 0, true, 2, true, true>;    // 2 early, dependents triggered from the MMA warp
+using E16 = Variant<Shape<_256, _64,_256>, Shape<_2,_1,_1>, false, 0, true, 0, true, true>;    // all early, trigger from the MMA warp
+using E17 = Variant<Shape<_256, _64,_256>, Shape<_2,_1,_1>, false, 0, true, 0, false, true>;   // activations early (control), trigger from the MMA warp
 }  // namespace variants_earlyb
 
 int cutlass_fp4_gemm_variant_earlyb(int idx, void const* A, void const* SFA, void const* B, void const* SFB,
@@ -120,6 +136,16 @@ int cutlass_fp4_gemm_variant_earlyb(int idx, void const* A, void const* SFA, voi
     case 1: return E1::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     case 2: return E2::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     case 3: return E3::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 4: return E4::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 5: return E5::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 10: return E10::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 11: return E11::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 12: return E12::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 13: return E13::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 14: return E14::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 15: return E15::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 16: return E16::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 17: return E17::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     default: return -99;
   }
 }

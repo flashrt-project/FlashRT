@@ -153,7 +153,8 @@ the final action chunk.
 | FP8 (reference) | 46.62 | 1.000 | — | — | — | — | — |
 | **NVFP4 (default)** | **31.98** | **1.458** | 0.99904 | 0.99766 | 0.99974 | 0.99944 | PASS |
 | NVFP4 + row kernels v2 (§8.1) | 30.74 | 1.615 | 0.99801 | 0.99683 | 0.99931 | 0.99828 | PASS |
-| **+ programmatic dependent launch** (current default, §8.2) | **29.7** | **1.67** | 0.99816 | 0.99683 | 0.99925 | 0.99828 | PASS |
+| + programmatic dependent launch (§8.2) | 29.7 | 1.67 | 0.99816 | 0.99683 | 0.99925 | 0.99828 | PASS |
+| **+ operand-swapped decoder GEMMs, early weight stream** (current default, §8.3) | **28.6** | **1.72** | 0.99816 | 0.99683 | 0.99925 | 0.99828 | PASS |
 | INT4 | 32.54 | 1.461 | 0.99838 | 0.99512 | 0.99961 | 0.99939 | PASS |
 | INT4+RHT | 32.60 | 1.452 | 0.99918 | 0.99742 | 0.99983 | 0.99970 | PASS |
 
@@ -304,12 +305,14 @@ Constructor keyword / bench flag pairs. Defaults are the production tier.
 | `siglip_up_variant` / `--siglip-up-variant` | `2` | SigLIP Up GEMM tile: 0 = 128x256x256, 1 = 128x128x256, 2 = 128x128x128, 3 = 128x64x256 (outputs identical) |
 | `siglip_down_variant` / `--siglip-down-variant` | `0` | SigLIP Down GEMM tile; the base 128x128x256 measures best |
 | `encoder_attn_o_variant` / `--encoder-attn-o-variant` | `1` | NVFP4 encoder attention-O projection GEMM variant |
-| `decoder_qkv_variant`, `decoder_o_variant`, `decoder_down_variant` | `10` | decoder projection GEMM variants (bench flags of the same names) |
+| `decoder_qkv_variant`, `decoder_o_variant`, `decoder_down_variant` | `28` | decoder projection GEMM variants (bench flags of the same names). `28` = operand-swapped 2-SM tile with three weight k-tiles streamed before the PDL wait (§8.3); `10` = the previous 128x64x256 tile |
 | `pdl` / `--pdl` | `True` | programmatic dependent launch for the NVFP4 GEMMs and the activation kernels of this module (§8.2) |
 | `pdl_fvk` / `--pdl-fvk` | `False` | also PDL-launch the rope/softmax/FP8-quantize kernels and the FP8 encoder GEMM; measured within noise |
 | decoder/encoder GEMM variants `15`–`17` | opt-in | mainloop fork that streams the weight tiles before the PDL wait; helps only when a GEMM directly follows a GEMM (72-GEMM chain 0.901 → 0.837 ms/step), within noise in the pipeline |
+| decoder GEMM variants `21`–`24` | opt-in | operand-swapped tiles through the stock kernel (`cutlass_fp4_gemm_variants_swap.cu`): 128x64x256, 256x64x256 (2-SM), 128x128x256, 128x64x128 |
+| decoder GEMM variants `25`–`32` | opt-in | operand-swapped tiles through the mainloop fork: all / 2 / 3 weight k-tiles before the PDL wait, dependents triggered from the load warp or the MMA warp (the §8.3 matrix); `28` is the default |
 | `awq_alpha` / `--awq-alpha` | `0.8` | AWQ per-channel scale exponent |
-| `encoder_down_variant`, `decoder_*_variant` | `7`, `10` | GEMM tile selection |
+| `encoder_down_variant`, `decoder_*_variant` | `8`, `28` | GEMM tile selection |
 
 **Tile selection warning.** Cluster-launch GEMM variants invert between
 isolated and in-pipeline benchmarks on Thor: the isolated-best tile for
@@ -402,7 +405,37 @@ at 3 views: 30.76 → 29.94 ms; the decoder's 72-GEMM chain alone goes
 FP8 kernels measured no further change.
 
 Under the profiler the kernels now overlap (busy time exceeds the frame
-span): frame 29.8 ms span, SigLIP 5.0, encoder 11.9, decoder 12.9.
+span): frame 29.8 ms span, SigLIP 5.0, encoder 11.9, decoder 12.9
+(with §8.3: 28.7 span, decoder 12.2).
+
+### 8.3 Operand-swapped decoder GEMMs and the early weight stream
+
+Aliasing all 18 decoder layers onto one layer's weights (everything
+L2-hot) only saves 1.9 ms of the decoder's 12.9, so its GEMMs were not
+DRAM-bound. The M=10 tile was paying for its A operand: TMA fetches the
+full 128-row activation box every k-tile and the 118 out-of-bounds rows
+are zero-filled through the same L2/TMA path (Nsight counts 2.1 MB of A
+traffic against 1.1 MB of weights for the O projection), so the L2 → SM
+path (~1 TB/s measured with plain loads, ~0.45 µs per 128x64x256 k-tile
+at 16 CTAs) was the limiter. Computing D^T = W X^T instead makes the
+weights the A operand (every streamed row useful) and the activations
+the 64-wide B tile; a column-major D is byte-for-byte the row-major
+buffer the pipeline already uses and the Sm1xx SFA/SFB layouts coincide,
+so no data moves. Outputs are bit-identical. Hot, the four projections
+go 41.0 → 19.3 µs (2-SM 256x64x256 tile best).
+
+Cold, a single GEMM is bound by its own ramp, so the mainloop fork now
+streams the weight k-tiles before the PDL wait in the swapped
+orientation. Two details matter (variants 25–32 sweep): only 2–3 k-tiles
+may go ahead of the wait — all seven put 126 KB of weights ahead of the
+activation tile in the TMA queue and the kernel gets slower — and
+`griddepcontrol.launch_dependents` must come from the load warp as soon
+as its loads are issued; issuing it from the MMA warp (the stock
+placement) costs 30%. The 72-GEMM decoder chain goes 0.900 → 0.761 ms per
+denoise step, 230 GB/s = 94% of the measured 246 GB/s read peak. Two
+alternating pipeline rounds at 3 views: 29.45 → 28.56 ms with identical
+outputs, which makes variant 28 the default for the qkv, O and down
+projections.
 
 ### Approaches measured and rejected
 
@@ -450,7 +483,6 @@ span): frame 29.8 ms span, SigLIP 5.0, encoder 11.9, decoder 12.9.
 - **No-D-store decoder GeGLU.** The same elision applied to the decoder
   tile is a wash (the dummy store there is 0.04 MB), so it ships opt-in
   (`--decoder-fused-geglu-nod`) and stays off by default.
-
 ---
 
 ## 9. Reproducing
@@ -502,6 +534,7 @@ Measurement discipline:
 | attention dispatch (FA4, cuBLAS, seqused) | `flash_rt/hardware/thor/attn_backend.py` |
 | NVFP4 / INT4 GEMM runners | `csrc/gemm/fp4/` |
 | fused GeGLU store epilogue | `csrc/gemm/fp4/sm100_gelu_mul_blockscale_visitor.hpp` |
+| operand-swapped decoder GEMMs, early-weight mainloop fork, forked kernel layer | `csrc/gemm/fp4/cutlass_fp4_gemm_variants_swap.cu`, `csrc/gemm/fp4/cutlass_fp4_gemm_variants_earlyb.cu`, `csrc/gemm/fp4/sm100_blockscaled_mma_earlyb.hpp`, `csrc/gemm/fp4/sm100_gemm_seq_kernel.hpp` |
 | fused norm / quantize / activation kernels | `csrc/fused_fp4/`, `csrc/quantize/` |
 | E0M3 quantizer and activation kernels | `csrc/quantize/quantize_e0m3_sfa.cu`, `csrc/fused_fp4/pi05_e0m3_act.cu` |
 
