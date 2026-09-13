@@ -189,7 +189,8 @@ class Pi05Pipeline:
                  fixed_shape: bool = False,
                  denoise_trace: bool = False,
                  prefix_export: bool = False,
-                 decoder_kernel: str = "cublaslt"):
+                 decoder_kernel: str = "cublaslt",
+                 prefix_precision: str = "fp8"):
         self.gemm = gemm
         self.fvk = fvk
         self.attn = attn_backend
@@ -311,6 +312,10 @@ class Pi05Pipeline:
         # ``decoder_kernel`` ("auto" | "skinny" | "cublaslt"); only the
         # calibrated FP8 decoder path uses it, everything else is unchanged.
         self._skinny = self._init_skinny_decoder(decoder_kernel)
+        # NVFP4 prefix: the vision and encoder GEMM sites listed in
+        # weights["nvfp4"] run on block-scaled 4-bit operands (activations
+        # quantized per call, no calibration); everything else unchanged.
+        self._nvfp4 = self._init_nvfp4_prefix(prefix_precision)
         self.int8_act_scales = {}  # name -> CudaBuffer(rows, fp32), runtime-dynamic
         self._allocate_int8_scratch()
         self._allocate_encoder_int8_scratch()
@@ -1019,6 +1024,87 @@ class Pi05Pipeline:
                 self._style_slice_ptr("decoder_style_final", step),
                 0, x_normed, 0, gate, m, DEC_D, 1e-6, pdl, stream), "final norm")
 
+    # ══════════════════════════════════════════════════════════════════
+    #   NVFP4 prefix GEMMs (sm_120a)
+    # ══════════════════════════════════════════════════════════════════
+
+    def _init_nvfp4_prefix(self, precision: str) -> dict:
+        precision = (precision or "fp8").lower()
+        if precision == "fp8":
+            return {}
+        if precision != "nvfp4":
+            raise ValueError(f"prefix_precision must be fp8 or nvfp4, got {precision!r}")
+        table = self.weights.get("nvfp4") or {}
+        if not table:
+            raise RuntimeError("prefix_precision='nvfp4' but the frontend provided no NVFP4 weights")
+        for fn in ("quantize_bf16_to_nvfp4_swizzled_v2", "fp4_w4a16_gemm_sm120_bf16out_pingpong"):
+            if not hasattr(self.fvk, fn):
+                raise RuntimeError(f"this kernel build lacks {fn}")
+        self._nvfp4_rows = 0
+        self._nvfp4_act = None
+        self._nvfp4_sf = None
+        self._nvfp4_pad = None
+        self._nvfp4_ensure_scratch(max(self.vision_seq, self.encoder_seq_len))
+        return dict(table)
+
+    def _nvfp4_ensure_scratch(self, rows: int) -> None:
+        """Activation scratch for up to ``rows`` rows: packed e2m1 [rows, K/2],
+        swizzled SF, and a zero-tailed K-padded staging buffer for sites
+        whose K is not a multiple of 64. Sized before capture."""
+        if rows <= self._nvfp4_rows:
+            return
+        table = self.weights["nvfp4"].values()
+        k_max = max(kp for (_, _, _, kp, _) in table)
+        n_blocks = k_max // 16
+        self._nvfp4_act = CudaBuffer.device_zeros(rows * k_max // 2, FP8)
+        self._nvfp4_sf = CudaBuffer.device_zeros(((rows + 127) // 128) * ((n_blocks + 3) // 4) * 512, FP8)
+        pad_k = max([kp for (_, _, _, kp, k) in table if kp != k] or [64])
+        self._nvfp4_pad = CudaBuffer.device_zeros(rows * pad_k, BF16)
+        self._nvfp4_rows = rows
+
+    def _nvfp4_gemm(self, act_bf16_ptr: int, weight_name: str, out_bf16_ptr: int,
+                    M: int, N: int, K: int, stream: int) -> None:
+        """NVFP4 GEMM at a prefix site: quantize the BF16 activation rows to
+        e2m1 with per-16 UE4M3 scales, then the block-scaled GEMM. A site
+        whose K is not a multiple of 64 is staged into a zero-tailed
+        padded buffer first (the weight carries matching zero columns)."""
+        fvk = self.fvk
+        packed, sf_w, alpha, Kp, _k = self._nvfp4[weight_name]
+        if M > self._nvfp4_rows:
+            raise RuntimeError(f"NVFP4 scratch sized for {self._nvfp4_rows} rows, got {M}")
+        src = act_bf16_ptr
+        if Kp != K:
+            dst = self._nvfp4_pad.ptr.value
+            rc = self._cudart.cudaMemcpy2DAsync(
+                ctypes.c_void_p(dst), ctypes.c_size_t(Kp * 2),
+                ctypes.c_void_p(src), ctypes.c_size_t(K * 2),
+                ctypes.c_size_t(K * 2), ctypes.c_size_t(M), 3, ctypes.c_void_p(stream))
+            if rc != 0:
+                raise RuntimeError(f"NVFP4 pad copy failed: cudaError {rc}")
+            src = dst
+        fvk.quantize_bf16_to_nvfp4_swizzled_v2(
+            src, self._nvfp4_act.ptr.value, self._nvfp4_sf.ptr.value, M, Kp, stream)
+        fvk.fp4_w4a16_gemm_sm120_bf16out_pingpong(
+            self._nvfp4_act.ptr.value, packed, out_bf16_ptr, M, N, Kp,
+            self._nvfp4_sf.ptr.value, sf_w, alpha, stream)
+
+    def _nvfp4_geglu_down(self, merged_ptr: int, weight_name: str, out_bf16_ptr: int,
+                          M: int, N: int, K: int, stream: int) -> None:
+        """Encoder FFN tail on the NVFP4 tier: GeGLU over the merged
+        [gate | up] buffer quantized straight to e2m1 (one pass), then the
+        block-scaled down projection."""
+        fvk = self.fvk
+        packed, sf_w, alpha, Kp, _k = self._nvfp4[weight_name]
+        if Kp != K or M > self._nvfp4_rows:
+            raise RuntimeError("NVFP4 GeGLU path needs an unpadded K and sized scratch")
+        rc = fvk.pi05_geglu_merged_to_nvfp4_swizzled(
+            merged_ptr, self._nvfp4_act.ptr.value, self._nvfp4_sf.ptr.value, M, K, stream)
+        if rc != 0:
+            raise RuntimeError(f"pi05_geglu_merged_to_nvfp4_swizzled failed: cudaError {rc}")
+        fvk.fp4_w4a16_gemm_sm120_bf16out_pingpong(
+            self._nvfp4_act.ptr.value, packed, out_bf16_ptr, M, N, Kp,
+            self._nvfp4_sf.ptr.value, sf_w, alpha, stream)
+
     def _fp8_gemm(self, act_bf16_ptr: int, act_n: int, weight_name: str,
                   out_bf16_ptr: int, M: int, N: int, K: int, stream: int) -> None:
         """FP8 GEMM path: dynamic-quantize activation → FP8 matmul → BF16 out.
@@ -1028,6 +1114,9 @@ class Pi05Pipeline:
         layer's static scale buffer so subsequent inference can reuse it.
         """
         fvk = self.fvk
+        if weight_name in self._nvfp4:
+            self._nvfp4_gemm(act_bf16_ptr, weight_name, out_bf16_ptr, M, N, K, stream)
+            return
         w_fp8_ptr, w_scale_ptr = self._weight_fp8(weight_name)
         act_fp8_ptr, scratch_scale_ptr = self._pick_fp8_scratch(weight_name, act_n)
 
@@ -1439,7 +1528,7 @@ class Pi05Pipeline:
         # Language embeds have been written by frontend into encoder_x[vs_enc:vs_enc+lang_len]
 
         # B1-B5: 18 encoder layers. Fuse previous B5 residual into this B1's RMS→FP8
-        fused = use_fp8 and self.fp8_calibrated
+        fused = use_fp8 and self.fp8_calibrated and not self._nvfp4
         for i in range(ENC_L):
             self._encoder_layer(i, seq, fuse_b1=(i > 0 and fused), stream=stream)
 
@@ -1450,7 +1539,7 @@ class Pi05Pipeline:
         W = self.weights
         B = self.bufs
         attn_ptrs = self._attn_ptrs
-        fused = self.use_fp8 and self.fp8_calibrated
+        fused = self.use_fp8 and self.fp8_calibrated and not self._nvfp4
         use_int8_enc = self.use_int8_encoder
 
         # B1: RMSNorm → QKV GEMM
@@ -1641,6 +1730,10 @@ class Pi05Pipeline:
                 B["enc_act_fp8_large"].ptr.value, down_name,
                 B["encoder_x_norm"].ptr.value,
                 seq, ENC_D, ENC_H, act_scale_down, stream)
+        elif self.use_fp8 and f"encoder_ffn_down_w_{i}" in self._nvfp4:
+            self._nvfp4_geglu_down(
+                B["encoder_gate_merged"].ptr.value, f"encoder_ffn_down_w_{i}",
+                B["encoder_x_norm"].ptr.value, seq, ENC_D, ENC_H, stream)
         elif self.use_fp8:
             fvk.gate_geglu_merged(
                 B["encoder_gate_merged"].ptr.value,
@@ -2122,8 +2215,8 @@ class Pi05Pipeline:
                     B[out_key].ptr.value,
                     M_val, N_val, K_val)
 
-        # Vision FP8 shapes
-        if self.use_fp8 and self.fp8_calibrated and "vision_attn_qkv_w_0" in self.weights.get("fp8", {}):
+        # Vision FP8 shapes (the NVFP4 prefix tier does not use them)
+        if self.use_fp8 and self.fp8_calibrated and not self._nvfp4 and "vision_attn_qkv_w_0" in self.weights.get("fp8", {}):
             for name_prefix, M_val, N_val, K_val, out_key in [
                 ("vision_attn_qkv_w_0", vs, 3 * VIS_D, VIS_D, "vision_QKV"),
                 ("vision_attn_o_w_0",   vs, VIS_D,     VIS_D, "vision_x_norm"),
@@ -2139,7 +2232,7 @@ class Pi05Pipeline:
                     M_val, N_val, K_val, act_scale_ptr, w_scale_ptr)
 
         # Encoder FP8 shapes
-        if self.use_fp8 and self.fp8_calibrated:
+        if self.use_fp8 and self.fp8_calibrated and not self._nvfp4:
             for name_prefix, M_val, N_val, K_val, out_key in [
                 ("encoder_attn_qkv_w_0",    seq, (ENC_NH + 2 * ENC_NKV) * ENC_HD, ENC_D, "encoder_QKV"),
                 ("encoder_attn_o_w_0",      seq, ENC_D,      ENC_D, "encoder_x_norm"),

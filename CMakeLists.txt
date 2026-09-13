@@ -678,6 +678,10 @@ endif()
 # ── Skinny FP8 decoder GEMM family (sm_120a mma.kind::f8f6f4 + PDL) ──
 # Small-row action-decoder GEMMs with K split across CTAs and fused consumers.
 option(FLASHRT_ENABLE_PI05_SKINNY "Build experimental Pi0.5 SM120 decoder kernels" OFF)
+option(FLASHRT_ENABLE_PI05_NVFP4 "Build Pi0.5 NVFP4 prefix kernels" OFF)
+if(FLASHRT_ENABLE_PI05_NVFP4 AND NOT GPU_ARCH STREQUAL "120")
+  message(FATAL_ERROR "Pi0.5 NVFP4 kernels require GPU_ARCH=120")
+endif()
 if(FLASHRT_ENABLE_PI05_SKINNY AND NOT GPU_ARCH STREQUAL "120")
   message(FATAL_ERROR "Pi0.5 skinny kernels require GPU_ARCH=120")
 endif()
@@ -1905,6 +1909,10 @@ if(GPU_ARCH STREQUAL "120")
 endif()
 
 # Skinny FP8 decoder GEMM family: sm_120a only (mma.kind::f8f6f4).
+if(FLASHRT_ENABLE_PI05_NVFP4)
+  target_sources(flash_rt_kernels PRIVATE csrc/kernels/geglu_nvfp4_quant.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_PI05_NVFP4=1)
+endif()
 if(FLASHRT_ENABLE_PI05_SKINNY)
   target_sources(flash_rt_kernels PRIVATE
     $<TARGET_OBJECTS:pi05_decoder_skinny_sm120_obj>)

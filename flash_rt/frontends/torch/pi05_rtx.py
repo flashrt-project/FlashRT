@@ -556,8 +556,17 @@ class Pi05TorchFrontendRtx:
                  use_cuda_graph: bool = True,
                  denoise_trace: bool = False,
                  prefix_features: bool = False,
-                 decoder_kernel: Optional[str] = None):
+                 decoder_kernel: Optional[str] = None,
+                 prefix_precision: Optional[str] = None):
         checkpoint_dir = pathlib.Path(checkpoint_dir)
+        # Prefix (SigLIP + Gemma-2B) GEMM precision: "fp8" (per-tensor,
+        # calibrated) or "nvfp4" (block-scaled 4-bit weights and
+        # activations, no calibration, sm_120a only). The decoder is not
+        # affected. FLASHRT_PI05_PREFIX_PRECISION overrides the default.
+        self._prefix_precision = (prefix_precision
+                                  or os.environ.get("FLASHRT_PI05_PREFIX_PRECISION", "fp8")).lower()
+        if self._prefix_precision not in ("fp8", "nvfp4"):
+            raise ValueError(f"prefix_precision must be fp8 or nvfp4, got {self._prefix_precision!r}")
         # Decoder GEMM family for the calibrated FP8 decoder: "auto" picks
         # the skinny K-split kernels on sm_120a builds, "cublaslt" keeps
         # the library GEMMs, "skinny" requires the kernels. The environment
@@ -705,6 +714,12 @@ class Pi05TorchFrontendRtx:
         self._int8_weight_scales: dict[str, torch.Tensor] = {}
         if self.use_fp8 and not self._force_bf16 and not self._force_int8_decoder:
             self._quantize_all_fp8()
+        self._nvfp4_weights: dict = {}
+        self._nvfp4_store: list = []
+        if self._prefix_precision == "nvfp4":
+            if not (self.use_fp8 and not self._force_bf16 and not self._force_int8_decoder):
+                raise ValueError("prefix_precision='nvfp4' needs the FP8 frontend (use_fp8=True)")
+            self._quantize_prefix_nvfp4()
         if self._force_int8_decoder:
             self._quantize_decoder_int8()
         if self._use_int8_encoder:
@@ -773,6 +788,7 @@ class Pi05TorchFrontendRtx:
     def _pipeline_precision_kwargs(self) -> dict:
         kwargs = self._pipeline_precision_kwargs_base()
         kwargs["decoder_kernel"] = self._decoder_kernel
+        kwargs["prefix_precision"] = self._prefix_precision
         return kwargs
 
     def _pipeline_precision_kwargs_base(self) -> dict:
@@ -1020,6 +1036,8 @@ class Pi05TorchFrontendRtx:
             torch.cuda.synchronize(); phases["convert_copy"] = time.perf_counter() - t0
             if self._fp8_weights:
                 self._quantize_all_fp8(inplace=True)
+            if self._nvfp4_weights:
+                self._quantize_prefix_nvfp4(inplace=True)
             torch.cuda.synchronize(); phases["quantize"] = time.perf_counter() - t0 - sum(phases.values())
             self._precomputed_styles = _precompute_decoder_styles(
                 self._ckpt_bf16, self.chunk_size, num_steps=self._num_steps)
@@ -1042,6 +1060,75 @@ class Pi05TorchFrontendRtx:
         logger.info("Weights reloaded in place (version %d, %.2f s: %s)", self._weight_version, elapsed,
                     ", ".join(f"{k} {v:.2f}" for k, v in phases.items()))
         return elapsed
+
+    # Prefix GEMM sites quantized to NVFP4: name -> (checkpoint key, layer index or None)
+    _NVFP4_PREFIX_SITES = (
+        [(f"vision_attn_qkv_w_{i}", "vision_attn_qkv_w", i) for i in range(VIS_L)]
+        + [(f"vision_attn_o_w_{i}", "vision_attn_o_w", i) for i in range(VIS_L)]
+        + [(f"vision_ffn_up_w_{i}", "vision_ffn_up_w", i) for i in range(VIS_L)]
+        + [(f"vision_ffn_down_w_{i}", "vision_ffn_down_w", i) for i in range(VIS_L)]
+        + [("vision_projector_w", "encoder_multi_modal_projector_w", None)]
+        + [(f"encoder_attn_qkv_w_{i}", "encoder_attn_qkv_w", i) for i in range(ENC_L)]
+        + [(f"encoder_attn_o_w_{i}", "encoder_attn_o_w", i) for i in range(ENC_L)]
+        + [(f"encoder_ffn_gate_up_w_{i}", None, i) for i in range(ENC_L)]
+        + [(f"encoder_ffn_down_w_{i}", "encoder_ffn_down_w", i) for i in range(ENC_L)]
+    )
+
+    @staticmethod
+    def _nvfp4_k_pad(k: int) -> int:
+        return (k + 63) // 64 * 64
+
+    def _quantize_prefix_nvfp4(self, inplace: bool = False) -> None:
+        """Quantize the vision and encoder GEMM weights to NVFP4 (e2m1 with
+        per-16 UE4M3 block scales in the swizzled layout and a per-tensor
+        global scale). Weights are laid out [N, K]; K is padded to a
+        multiple of 64 with zero columns where needed (SigLIP FFN down,
+        K = 4304). With ``inplace=True`` the existing buffers are refilled
+        (weight reload)."""
+        from flash_rt import flash_rt_kernels as fvk
+        if not hasattr(fvk, "bf16_weight_to_nvfp4_swizzled"):
+            raise RuntimeError("this kernel build has no NVFP4 quantizer")
+        W = self._ckpt_bf16
+        store = self._nvfp4_store
+        if inplace:
+            index = self._nvfp4_store_index
+        else:
+            index = {}
+            self._nvfp4_store_index = index
+        scratch_amax = torch.zeros(1, dtype=torch.float32, device="cuda")
+        out_gs = torch.zeros(1, dtype=torch.float32, device="cuda")
+        for name, key, layer in self._NVFP4_PREFIX_SITES:
+            if key is None:   # merged encoder gate|up, [K, 2H] as the FP8 path builds it
+                w_kn = torch.cat([W["encoder_ffn_gate_w"][layer], W["encoder_ffn_up_w"][layer]], dim=1)
+            else:
+                w_kn = W[key] if layer is None else W[key][layer]
+            w_nk = w_kn.t().contiguous()                     # [N, K]
+            N, K = w_nk.shape
+            Kp = self._nvfp4_k_pad(K)
+            if Kp != K:
+                w_nk = torch.nn.functional.pad(w_nk, (0, Kp - K))
+            n_blocks = Kp // 16
+            sf_bytes = ((N + 127) // 128) * ((n_blocks + 3) // 4) * 512
+            if inplace:
+                packed, sf = store[index[name]], store[index[name] + 1]
+            else:
+                packed = torch.empty(N, Kp // 2, dtype=torch.uint8, device="cuda")
+                sf = torch.zeros(sf_bytes, dtype=torch.uint8, device="cuda")
+            scratch_amax.zero_()
+            fvk.bf16_weight_to_nvfp4_swizzled(
+                w_nk.data_ptr(), packed.data_ptr(), sf.data_ptr(),
+                scratch_amax.data_ptr(), out_gs.data_ptr(), N, Kp, 0)
+            alpha = float(out_gs.item())
+            if not inplace:
+                index[name] = len(store)
+                store.append(packed)
+                store.append(sf)
+            self._nvfp4_weights[name] = (packed.data_ptr(), sf.data_ptr(), alpha, Kp, K)
+        for pipe in self._live_pipelines() if inplace else []:
+            pipe.weights["nvfp4"] = self._nvfp4_weights
+            pipe._nvfp4 = self._nvfp4_weights
+        if not inplace:
+            logger.info("NVFP4 prefix weights: %d tensors", len(self._nvfp4_weights))
 
     def _skinny_weights_wanted(self) -> bool:
         """Whether the FP8 decoder may run on the skinny GEMM family."""
@@ -1217,6 +1304,8 @@ class Pi05TorchFrontendRtx:
 
             # FP8 quantized weights
             "fp8": self._fp8_weights,
+            # NVFP4 prefix weights: name -> (packed, swizzled SF, alpha, K padded, K)
+            "nvfp4": self._nvfp4_weights,
             "int8": self._int8_weights,
             "fp8_layout": self.fp8_layout,
             "hardware": self.hardware,

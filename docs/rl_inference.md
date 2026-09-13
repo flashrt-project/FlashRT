@@ -341,7 +341,10 @@ width from `batch_size`; every folded buffer scales with it. The decoder
 defaults to cuBLASLt. The skinny GEMM family requires both
 `FLASHRT_ENABLE_PI05_SKINNY=ON` and explicit `decoder_kernel="skinny"`
 in the single or batched frontend; see `docs/pi05_decoder_skinny.md`.
-Slots are
+The separate `FLASHRT_ENABLE_PI05_NVFP4=ON` build option and explicit
+`prefix_precision="nvfp4"` move vision and encoder GEMMs to approximate
+block-scaled 4-bit operands; FP8 remains the default. See
+`docs/pi05_prefix_nvfp4.md` for the opt-in tier's contract. Slots are
 independent: identical inputs give bit-identical outputs per slot.
 The mixed-slot FP8 test compares each slot with independent B=1 inference
 under identical calibration and the existing synthetic-input cosine gate
@@ -418,6 +421,7 @@ INT8 modes are not supported.
 | `tests/test_pi05_batched_n.py` | B = 4 / 8 batched slots vs B = 1, per-env timing, prefix features single vs batched and FP8 vs BF16, CFG refuses B ≠ 2 |
 | `tests/test_pi05_decoder_skinny.py` | skinny FP8 decoder family (sm_120a): GEMM vs FP32, consumers bit-identical to the kernels they replace, attention vs torch, frontend vs the library decoder plus 300 bit-identical replays, batched vs batched |
 | `tests/test_pi05_weight_reload.py` | in-place weight reload vs a fresh build (BF16 and FP8), no re-capture, batched pipeline, mapping source, restore |
+| `tests/test_pi05_prefix_nvfp4.py` | NVFP4 prefix tier: fused GeGLU quantizer bit-identical to the unfused pair, tier vs FP8, batched, reload |
 | `tests/test_rl_cfg_inference.py` | RTX serial + batched CFG, all βs, validation gates |
 | `tests/test_thor_rl_cfg_inference.py --backends torch,jax` | Thor serial CFG: validation, β=1.0 collapse, β=1.5 finite |
 | `tests/test_cfg_correctness_oracle.py` | per-step C1–C5 contract (RTX) vs frozen reference |

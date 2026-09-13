@@ -55,6 +55,9 @@
 #ifdef ENABLE_QWEN36_FLASHINFER_XQA
 #include "kernels/qwen36_flashinfer_xqa.cuh"
 #endif
+#ifdef ENABLE_PI05_NVFP4
+#include "kernels/geglu_nvfp4_quant.cuh"
+#endif
 #ifdef FLASHRT_PI05_DECODER_SKINNY_SM120
 #include "kernels/pi05/pi05_decoder_skinny_fp8_sm120.cuh"
 #endif
@@ -1290,6 +1293,16 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("input"), py::arg("fp4_data"), py::arg("scale_factors"),
        py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
 
+#ifdef ENABLE_PI05_NVFP4
+    m.def("pi05_geglu_merged_to_nvfp4_swizzled", [](uintptr_t merged, uintptr_t fp4_out, uintptr_t sf_out,
+                                               int rows, int half, uintptr_t stream) {
+        return flash_rt::quantize::pi05_geglu_merged_to_nvfp4_swizzled(
+            typed_ptr<__nv_bfloat16>(merged), reinterpret_cast<uint8_t*>(fp4_out),
+            reinterpret_cast<uint8_t*>(sf_out), rows, half, to_stream(stream));
+    }, py::arg("merged"), py::arg("fp4_out"), py::arg("sf_out"), py::arg("rows"), py::arg("half"),
+       py::arg("stream") = 0);
+
+#endif
     m.def("quantize_bf16_to_nvfp4_swizzled_v2", [](uintptr_t input, uintptr_t fp4_data,
                                                    uintptr_t scale_factors, int rows, int cols,
                                                    uintptr_t stream) {
