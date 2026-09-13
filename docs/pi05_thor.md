@@ -152,7 +152,8 @@ the final action chunk.
 |---|---|---|---|---|---|---|---|
 | FP8 (reference) | 46.62 | 1.000 | — | — | — | — | — |
 | **NVFP4 (default)** | **31.98** | **1.458** | 0.99904 | 0.99766 | 0.99974 | 0.99944 | PASS |
-| **NVFP4 + row kernels v2** (current default, §8.1) | **30.74** | **1.615** | 0.99801 | 0.99683 | 0.99931 | 0.99828 | PASS |
+| NVFP4 + row kernels v2 (§8.1) | 30.74 | 1.615 | 0.99801 | 0.99683 | 0.99931 | 0.99828 | PASS |
+| **+ programmatic dependent launch** (current default, §8.2) | **29.7** | **1.67** | 0.99816 | 0.99683 | 0.99925 | 0.99828 | PASS |
 | INT4 | 32.54 | 1.461 | 0.99838 | 0.99512 | 0.99961 | 0.99939 | PASS |
 | INT4+RHT | 32.60 | 1.452 | 0.99918 | 0.99742 | 0.99983 | 0.99970 | PASS |
 
@@ -304,6 +305,9 @@ Constructor keyword / bench flag pairs. Defaults are the production tier.
 | `siglip_down_variant` / `--siglip-down-variant` | `0` | SigLIP Down GEMM tile; the base 128x128x256 measures best |
 | `encoder_attn_o_variant` / `--encoder-attn-o-variant` | `1` | NVFP4 encoder attention-O projection GEMM variant |
 | `decoder_qkv_variant`, `decoder_o_variant`, `decoder_down_variant` | `10` | decoder projection GEMM variants (bench flags of the same names) |
+| `pdl` / `--pdl` | `True` | programmatic dependent launch for the NVFP4 GEMMs and the activation kernels of this module (§8.2) |
+| `pdl_fvk` / `--pdl-fvk` | `False` | also PDL-launch the rope/softmax/FP8-quantize kernels and the FP8 encoder GEMM; measured within noise |
+| decoder/encoder GEMM variants `15`–`17` | opt-in | mainloop fork that streams the weight tiles before the PDL wait; helps only when a GEMM directly follows a GEMM (72-GEMM chain 0.901 → 0.837 ms/step), within noise in the pipeline |
 | `awq_alpha` / `--awq-alpha` | `0.8` | AWQ per-channel scale exponent |
 | `encoder_down_variant`, `decoder_*_variant` | `7`, `10` | GEMM tile selection |
 
@@ -381,6 +385,24 @@ kernel-family ceiling, and the decoder's 720 GEMMs stream 175 MB/step at
 (SigLIP 2.5 + encoder 9.5 + decoder 7.5); what remains above it is the
 decoder's per-launch ramp/tail and its ~4 ms of launch-floor kernels,
 which only a persistent decoder kernel can remove.
+
+### 8.2 Programmatic dependent launch
+
+With ~2450 kernels per frame, most of them a few microseconds, the launch
+ramp of each kernel (CTA scheduling, TMA descriptor prefetch, barrier
+init) is a large share of the decoder. The CUTLASS runners are now launched
+with `launch_with_pdl` (built with `CUTLASS_ENABLE_GDC_FOR_SM100`) and the
+decoder AdaRMS / quantize / row kernels with the programmatic-stream-
+serialization attribute; each executes `griddepcontrol.wait` before
+touching its inputs and `launch_dependents` right after, so a kernel's
+prologue overlaps the previous kernel's tail. CUDA-graph capture keeps
+the programmatic edges. Outputs are bit-identical. Three alternating legs
+at 3 views: 30.76 → 29.94 ms; the decoder's 72-GEMM chain alone goes
+0.949 → 0.902 ms per denoise step. Extending PDL to the rope / softmax /
+FP8 kernels measured no further change.
+
+Under the profiler the kernels now overlap (busy time exceeds the frame
+span): frame 29.8 ms span, SigLIP 5.0, encoder 11.9, decoder 12.9.
 
 ### Approaches measured and rejected
 
