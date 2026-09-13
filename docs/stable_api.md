@@ -163,12 +163,20 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   validates and benchmarks the optimized denoise boundary. See
   `docs/cosmos3_edge_thor.md`.
 - `config="groot_n17"` is registered for `framework="torch"` on
-  `hardware in {"thor", "rtx_sm120", "rtx_sm89"}`. On RTX,
+  `hardware in {"thor", "rtx_sm120", "rtx_sm89", "amd_cdna4", "npu"}`. On RTX,
   `rtx_sm120` resolves through the historical shared RTX registration and
   `load_model()` refines that default route to the FP8 production
   frontend; `rtx_sm89` resolves directly to its dedicated SM89 frontend.
   `use_fp16=True, use_fp8=False` requests the explicit RTX reference
-  frontend for the selected hardware.
+  frontend for the selected hardware. On `npu` the tier is BF16 and
+  `precision="int8"` is refused rather than downgraded; that backend's
+  native kernels are built per model, so
+  `FLASHRT_ENABLE_NPU_GROOT_N17=ON` is required before this route can
+  load. See `docs/deployment_npu_groot_n17.md`.
+  On every hardware this model takes its observation bundle from the
+  caller, so it is driven through `model.pipeline` —
+  `set_prompt(aux=...)`, `normalize_state`, `infer`,
+  `denormalize_action` — rather than through `VLAModel.predict`.
 - `config="chameleon"` is a chat-style VLM and is not served through
   `load_model`'s VLA wrapper. Calling `load_model(config="chameleon")`
   raises `NotImplementedError` with direct-construction instructions.
@@ -307,7 +315,7 @@ Lazily imports and returns the concrete frontend class for the given
 Motus beta is registered for `(config="motus", framework="torch",
 arch="rtx_sm120")`.
 GROOT N1.7 is registered for `(config="groot_n17", framework="torch",
-arch in {"thor", "rtx_sm120", "rtx_sm89"})`. On RTX, `rtx_sm120`
+arch in {"thor", "rtx_sm120", "rtx_sm89", "amd_cdna4", "npu"})`. On RTX, `rtx_sm120`
 keeps the shared-base registration and `load_model()` refines that
 resolved class to the FP8 default or the explicit RTX reference frontend
 based on `use_fp8` / `use_fp16`; `rtx_sm89` resolves directly to the
