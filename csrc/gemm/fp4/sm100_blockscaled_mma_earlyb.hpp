@@ -11,14 +11,25 @@
 // ============================================================================
 #pragma once
 namespace cutlass { namespace gemm {
+// Kernel schedule tag for the FlashRT dependent-GEMM-sequence kernel fork
+// (csrc/gemm/fp4/sm100_gemm_seq_kernel.hpp).
+template<int SchedulerPipelineStageCount_, int AccumulatorPipelineStageCount_>
+struct KernelTmaWarpSpecializedBlockScaledSm100Seq final {
+  static constexpr int SchedulerPipelineStageCount = SchedulerPipelineStageCount_;
+  static constexpr int AccumulatorPipelineStageCount = AccumulatorPipelineStageCount_;
+};
+template <class T> struct is_seq_schedule : cute::false_type {};
+template <int A, int B> struct is_seq_schedule<KernelTmaWarpSpecializedBlockScaledSm100Seq<A, B>> : cute::true_type {};
+
 template<int Stages_, int SchedulerPipelineStageCount_, int AccumulatorPipelineStageCount_,
-         class ClusterShape_ = cute::Shape<cute::_1, cute::_1, cute::_1>>
+         class ClusterShape_ = cute::Shape<cute::_1, cute::_1, cute::_1>,
+         class Schedule_ = KernelTmaWarpSpecializedBlockScaledSm100<SchedulerPipelineStageCount_, AccumulatorPipelineStageCount_>>
 struct MainloopSm100TmaUmmaWarpSpecializedBlockScaledEarlyB {
   constexpr static int Stages = Stages_;
   using ClusterShape = ClusterShape_;
   using ArchTag = arch::Sm100;
   constexpr static bool IsOverlappingAccum = AccumulatorPipelineStageCount_ == 1;
-  using Schedule = KernelTmaWarpSpecializedBlockScaledSm100<SchedulerPipelineStageCount_, AccumulatorPipelineStageCount_>;
+  using Schedule = Schedule_;
 };
 }}  // namespace cutlass::gemm
 
@@ -34,6 +45,7 @@ template <
   int SchedulerPipelineStageCount,
   int AccumulatorPipelineStageCount,
   class ClusterShape,   // Static cluster shape or dynamic (int, int, _1)
+  class ScheduleTag_,
   class TileShape_,     // (MmaAtomShapeM, MmaAtomShapeN, TileK)
   class ElementPairA_,
   class StridePairA_,
@@ -53,7 +65,8 @@ struct CollectiveMma<
       Stages,
       SchedulerPipelineStageCount,
       AccumulatorPipelineStageCount,
-      ClusterShape>,
+      ClusterShape,
+      ScheduleTag_>,
     TileShape_,
     ElementPairA_,
     StridePairA_,
@@ -79,7 +92,8 @@ struct CollectiveMma<
                           Stages,
                           SchedulerPipelineStageCount,
                           AccumulatorPipelineStageCount,
-                          ClusterShape>;
+                          ClusterShape,
+                          ScheduleTag_>;
   using TileShape = TileShape_;
   using TiledMMA_SF = TiledMMA<MMA_Atom<typename TiledMma::MMA_ScaleFactor>,
                                         Layout<Shape<_1,_1,_1>>,

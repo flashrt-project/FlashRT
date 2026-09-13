@@ -16,21 +16,29 @@
 #include "cutlass/detail/sm100_blockscaled_layout.hpp"
 #include "cute/tensor.hpp"
 #include "gemm/fp4/sm100_blockscaled_mma_earlyb.hpp"
+#include "gemm/fp4/sm100_gemm_seq_kernel.hpp"
 
 namespace flash_rt {
 namespace fp4 {
 namespace variants_earlyb {
 using namespace cute;
 
-template <class T> struct ToEarlyB;
+template <class T, bool Seq> struct ToEarlyB;
 template <int S, int SP, int AP, class CS, class... Rest>
 struct ToEarlyB<cutlass::gemm::collective::CollectiveMma<
-    cutlass::gemm::MainloopSm100TmaUmmaWarpSpecializedBlockScaled<S, SP, AP, CS>, Rest...>> {
+    cutlass::gemm::MainloopSm100TmaUmmaWarpSpecializedBlockScaled<S, SP, AP, CS>, Rest...>, false> {
   using type = cutlass::gemm::collective::CollectiveMma<
       cutlass::gemm::MainloopSm100TmaUmmaWarpSpecializedBlockScaledEarlyB<S, SP, AP, CS>, Rest...>;
 };
+template <int S, int SP, int AP, class CS, class... Rest>
+struct ToEarlyB<cutlass::gemm::collective::CollectiveMma<
+    cutlass::gemm::MainloopSm100TmaUmmaWarpSpecializedBlockScaled<S, SP, AP, CS>, Rest...>, true> {
+  using type = cutlass::gemm::collective::CollectiveMma<
+      cutlass::gemm::MainloopSm100TmaUmmaWarpSpecializedBlockScaledEarlyB<S, SP, AP, CS,
+          cutlass::gemm::KernelTmaWarpSpecializedBlockScaledSm100Seq<SP, AP>>, Rest...>;
+};
 
-template <class MmaTile, class Cluster>
+template <class MmaTile, class Cluster, bool Seq = false>
 struct Variant {
   using ElementA   = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
   using LayoutATag = cutlass::layout::RowMajor;
@@ -59,7 +67,7 @@ struct Variant {
       cutlass::gemm::collective::StageCountAutoCarveout<
           static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
       cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
-  using CollectiveMainloop = typename ToEarlyB<BaseMainloop>::type;
+  using CollectiveMainloop = typename ToEarlyB<BaseMainloop, Seq>::type;
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
       Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
@@ -101,6 +109,7 @@ struct Variant {
 using E0 = Variant<Shape<_128, _64,_256>, Shape<_1,_1,_1>>;   // v10 tile
 using E1 = Variant<Shape<_128,_128,_256>, Shape<_1,_1,_1>>;   // v7 tile
 using E2 = Variant<Shape<_128,_256,_256>, Shape<_1,_1,_1>>;   // v8 tile
+using E3 = Variant<Shape<_128, _64,_256>, Shape<_1,_1,_1>, true>;   // v10 tile through the forked (sequence) kernel
 }  // namespace variants_earlyb
 
 int cutlass_fp4_gemm_variant_earlyb(int idx, void const* A, void const* SFA, void const* B, void const* SFB,
@@ -110,6 +119,7 @@ int cutlass_fp4_gemm_variant_earlyb(int idx, void const* A, void const* SFA, voi
     case 0: return E0::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     case 1: return E1::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     case 2: return E2::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 3: return E3::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     default: return -99;
   }
 }

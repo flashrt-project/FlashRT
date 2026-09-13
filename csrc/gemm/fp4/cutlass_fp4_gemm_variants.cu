@@ -277,7 +277,7 @@ int cutlass_fp4_gemm_variant(int idx,
     case 12: return V12::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     case 13: return V13::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     case 14: return V14::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
-    case 15: case 16: case 17:
+    case 15: case 16: case 17: case 18:
       return cutlass_fp4_gemm_variant_earlyb(idx - 15, A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     default: return -99;
   }
@@ -303,11 +303,12 @@ const char* cutlass_fp4_gemm_variant_name(int idx) {
     case 15: return "tile128x64x256  cluster1x1x1, weights streamed before the PDL wait";
     case 16: return "tile128x128x256 cluster1x1x1, weights streamed before the PDL wait";
     case 17: return "tile128x256x256 cluster1x1x1, weights streamed before the PDL wait";
+    case 18: return "tile128x64x256  through the forked sequence kernel (step 0: identical behaviour)";
     default: return "<invalid>";
   }
 }
 
-int cutlass_fp4_gemm_num_variants() { return 18; }
+int cutlass_fp4_gemm_num_variants() { return 19; }
 
 }  // namespace fp4
 }  // namespace flash_rt
