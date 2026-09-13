@@ -152,6 +152,7 @@ the final action chunk.
 |---|---|---|---|---|---|---|---|
 | FP8 (reference) | 46.62 | 1.000 | — | — | — | — | — |
 | **NVFP4 (default)** | **31.98** | **1.458** | 0.99904 | 0.99766 | 0.99974 | 0.99944 | PASS |
+| **NVFP4 + row kernels v2** (current default, §8.1) | **30.74** | **1.615** | 0.99801 | 0.99683 | 0.99931 | 0.99828 | PASS |
 | INT4 | 32.54 | 1.461 | 0.99838 | 0.99512 | 0.99961 | 0.99939 | PASS |
 | INT4+RHT | 32.60 | 1.452 | 0.99918 | 0.99742 | 0.99983 | 0.99970 | PASS |
 
@@ -297,6 +298,12 @@ Constructor keyword / bench flag pairs. Defaults are the production tier.
 | `encoder_p1_combiner` / `--encoder-p1-combiner` | `epilogue_hw_nod` | `epilogue_hw_nod` (fused, compact store, collective D store elided), `epilogue_hw` (fused, compact store), `epilogue` (fused, full width — parity with the old path), `lut_native` (separate GEMMs + combiner kernel) |
 | `use_fp4_encoder_attn_qkv` / `--encoder-attn-qkv-fp4` | `False` | implemented and passing, but that GEMM is not weight-bandwidth-bound, so FP4 only matches FP8 while costing an extra quantize step |
 | `decoder_fused_attn` / `--decoder-fused-attn` | `False` | folds the seqused mask into softmax (bit-identical, one fewer launch). Only the fixed-shape state-prompt path takes the seqused kernels, which this suite does not exercise |
+| `rowops_v2` / `--rowops-v2` | `True` | warp-per-row encoder/SigLIP norm + quantize kernels (hardware e2m1/e4m3 conversions, reduction order and tie rounding identical to the originals — bit-exact end to end) |
+| `rowops_res_epilogue` / `--rowops-res-epilogue` | `True` | with `rowops_v2`: the encoder O and Down projections accumulate into the residual stream inside the GEMM epilogue (`beta = 1`), so the following norm reads `x` once. Single rounding instead of double; worst-sample raw cosine 0.99683 vs 0.99681 |
+| `siglip_up_variant` / `--siglip-up-variant` | `2` | SigLIP Up GEMM tile: 0 = 128x256x256, 1 = 128x128x256, 2 = 128x128x128, 3 = 128x64x256 (outputs identical) |
+| `siglip_down_variant` / `--siglip-down-variant` | `0` | SigLIP Down GEMM tile; the base 128x128x256 measures best |
+| `encoder_attn_o_variant` / `--encoder-attn-o-variant` | `1` | NVFP4 encoder attention-O projection GEMM variant |
+| `decoder_qkv_variant`, `decoder_o_variant`, `decoder_down_variant` | `10` | decoder projection GEMM variants (bench flags of the same names) |
 | `awq_alpha` / `--awq-alpha` | `0.8` | AWQ per-channel scale exponent |
 | `encoder_down_variant`, `decoder_*_variant` | `7`, `10` | GEMM tile selection |
 
@@ -339,6 +346,42 @@ Headroom is thin and mostly hard floors:
    makes it a net loss. AWQ for the SigLIP up-projection remains the one
    accuracy-gated candidate.
 
+### 8.1 Row kernels v2 and the remaining floor
+
+Nsight Compute on the original one-CTA-per-row kernels showed them
+instruction-bound (IPC 3.06, ~50 instructions per element in the eight-
+compare e2m1 chain), not bandwidth-bound. The v2 kernels
+(`csrc/fused_fp4/pi05_rowops_v2.cu`) use one warp per row, 16-byte loads,
+shuffle reductions and the hardware `cvt` for e2m1x2 / e4m3x2. Two details
+keep them bit-exact against the originals in the real pipeline (random-data
+parity is not enough — SigLIP activations flipped the worst LIBERO sample
+from 0.99681 to 0.99287 before this was fixed): the fp32 reduction
+follows the originals' thread partition and xor-tree order, and exact
+e2m1 midpoints (|v| ∈ {0.75, 1.75, 3.5}) are rounded toward zero as the
+compare chain does, where the hardware rounds to even.
+
+| kernel (782×2048 / 768×1152, L2-hot) | before | after |
+|---|---|---|
+| encoder quantize → NVFP4 + SFA | 18.3 µs | 8.3 µs |
+| encoder RMSNorm → FP8 | 12.8 µs | 7.2 µs |
+| encoder residual + RMSNorm × inv_s → NVFP4 | 33.9 µs | 19.4 µs |
+| SigLIP LayerNorm × inv_s → NVFP4 | 22.5 µs | 14.3 µs |
+| SigLIP LayerNorm → FP8 | 9.0 µs | 7.2 µs |
+
+Together with the SigLIP Up tile and the encoder Down (v8) / O-projection
+(v1) variants, one alternating four-leg A/B measures 31.91 → 31.22 →
+31.03 → 30.79 ms; the strict suite through `load_model` lands at 30.74 ms.
+
+Measured device ceilings on this part (locked clocks): device copy
+256 GB/s; cuBLAS FP16 ~100 TFLOPS, FP8 ~205 TFLOPS, CUTLASS block-scaled
+NVFP4 ~360 TFLOPS — about 40% of the nominal figures. Against those, the
+encoder gate_up GEMM (370 TFLOPS) and the FP8 QKV GEMMs are at the
+kernel-family ceiling, and the decoder's 720 GEMMs stream 175 MB/step at
+185 GB/s (72% of copy). The hard floor for 3 views is therefore ~20 ms
+(SigLIP 2.5 + encoder 9.5 + decoder 7.5); what remains above it is the
+decoder's per-launch ramp/tail and its ~4 ms of launch-floor kernels,
+which only a persistent decoder kernel can remove.
+
 ### Approaches measured and rejected
 
 - **Single-kernel decoder attention.** Implemented and numerically
@@ -361,6 +404,27 @@ Headroom is thin and mostly hard floors:
   warning above), and under `nsys --cuda-graph-trace=node` the two
   variants converge entirely — the win only exists unprofiled, so
   per-kernel traces cannot attribute it.
+- **Split-KV decoder attention with fused NVFP4 output.** Three designs
+  (`csrc/fused_fp4/pi05_dec_attn_splitkv.cu`, opt-in
+  `--decoder-attn-splitkv`): 26–37 µs against 10.7 µs for the cuBLAS
+  QKᵀ/softmax/PV chain. Nsight: 17% occupancy, 84% of cycles with no
+  eligible warp — the cross-CTA merge serialises behind this part's
+  ~700-cycle L2 latency. Numerics are right (e2m1 codes 99.6% identical).
+- **Stream-K / split-K decoder GEMMs** (variants v11–v14): 18–68 µs cold
+  against 10 µs for the static tile; the reduction workspace round trip
+  costs more than the extra CTAs gain. Narrower N tiles are ruled out by
+  the SM100 block-scaled mainloop (`Cta N` must be 64/128/192/256).
+- **L2 prefetch of the next layer's decoder weights**
+  (`csrc/fused_fp4/l2_prefetch.cu`, `cp.async.bulk.prefetch.L2` or real
+  loads on a side stream): every variant slower than none
+  (0.951 → 1.034–1.641 ms per denoise step on the 72-GEMM chain). The chain
+  is DRAM-throughput bound as a whole; prefetching only reorders traffic.
+- **FA4 tiling.** The SM100 hd256 kernel accepts only tile 128×128 and no
+  SplitKV; SigLIP hd72 is already at the best tile.
+- **M≤16 NVFP4 GEMM on `mma.sync`** (`csrc/gemm/fp4/nvfp4_m16_gemm_sm110.cu`):
+  bit-identical to the CUTLASS runner, but ALU-bound on the dequantisation
+  (~45 instructions per k-block per warp) and not faster; kept as the
+  reference implementation of the scale-factor layout.
 - **No-D-store decoder GeGLU.** The same elision applied to the decoder
   tile is a wash (the dummy store there is 0.04 MB), so it ships opt-in
   (`--decoder-fused-geglu-nod`) and stays off by default.
