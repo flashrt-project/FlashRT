@@ -296,7 +296,9 @@ if(ENABLE_SM100_CUTLASS)
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
   )
+  target_compile_definitions(cutlass_sm100_obj PRIVATE CUTLASS_ENABLE_GDC_FOR_SM100=1)
   target_include_directories(cutlass_sm100_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
     ${CUTLASS_INCLUDE}
     ${CUTLASS_DIR}/tools/util/include
@@ -1414,6 +1416,7 @@ endif()
 # and tests/test_build_inventory.py for the measured per-target surface.
 pybind11_add_module(flash_rt_kernels
   csrc/gemm/gemm_runner.cu
+  csrc/fused_fp4/pdl.cu
   csrc/kernels/norm.cu
   csrc/kernels/activation.cu
   csrc/kernels/rope.cu

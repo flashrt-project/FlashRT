@@ -5,12 +5,14 @@
 // ================================================================
 
 #include "softmax.cuh"
+#include "fused_fp4/pdl.cuh"
 
 #define SM_WARP_SIZE 32
 #define SM_MAX_COLS 1024
 #define SM_ITERS (SM_MAX_COLS / SM_WARP_SIZE)  // 32
 
 __global__ void softmax_fp16_kernel(__half* data, int rows, int cols) {
+    flashrt_pdl_wait_and_trigger();
     int lane = threadIdx.x % SM_WARP_SIZE;
     int row = blockIdx.x;
     if (row >= rows) return;
@@ -77,7 +79,7 @@ __global__ void softmax_fp16_kernel(__half* data, int rows, int cols) {
 
 void softmax_fp16(__half* data, int rows, int cols, cudaStream_t stream) {
     // 1 warp per row, 1 row per block (matching pi05)
-    softmax_fp16_kernel<<<rows, SM_WARP_SIZE, 0, stream>>>(data, rows, cols);
+    flash_rt::fp4::launch_maybe_pdl(softmax_fp16_kernel, dim3(rows), dim3(SM_WARP_SIZE), 0, stream, data, rows, cols);
 }
 
 // State-masked softmax with pad handling:

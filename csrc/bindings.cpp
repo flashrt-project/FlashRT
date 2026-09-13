@@ -4,6 +4,7 @@
 // ================================================================
 
 #include <pybind11/pybind11.h>
+#include "fused_fp4/pdl.cuh"
 #include <pybind11/stl.h>
 #include <cmath>
 #include <cstdint>
@@ -1930,6 +1931,9 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("input"), py::arg("output"), py::arg("n"), py::arg("stream") = 0);
 
     // Quantize FP16→FP8
+    m.def("set_pdl", [](bool on) { flash_rt::fp4::pdl_flag() = on; }, py::arg("on"),
+          "Programmatic dependent launch for this module's rope/softmax/FP8 quantize kernels and the SM100 FP8 GEMM.");
+    m.def("get_pdl", []() { return flash_rt::fp4::pdl_flag(); });
     m.def("quantize_fp8_static_fp16", [](uintptr_t input, uintptr_t output,
                                           uintptr_t d_scale, int n, uintptr_t stream) {
         quantize_fp8_static_fp16(reinterpret_cast<const __half*>(input),

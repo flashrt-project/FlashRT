@@ -13,6 +13,7 @@
 #include <cuda_fp16.h>
 
 #include "rope_vec.cuh"
+#include "fused_fp4/pdl.cuh"
 
 namespace {
 
@@ -40,6 +41,7 @@ __global__ void qkv_split_rope_kvcache_fp16_vec_kernel(
     int4* __restrict__ Q, int4* __restrict__ Kc, int4* __restrict__ Vc,
     int S, int Q_dim8, int K_dim8, int HD8, int qkv_stride8,
     long kc_offset8, int kc_stride8) {
+    flashrt_pdl_wait_and_trigger();
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = S * qkv_stride8;
     if (idx >= total) return;
@@ -79,7 +81,7 @@ int qkv_split_rope_kvcache_fp16_vec(
     const int total = S * (qkv_stride >> 3);
     const int threads = 256;
     const int blocks = (total + threads - 1) / threads;
-    qkv_split_rope_kvcache_fp16_vec_kernel<<<blocks, threads, 0, stream>>>(
+    flash_rt::fp4::launch_maybe_pdl(qkv_split_rope_kvcache_fp16_vec_kernel, dim3(blocks), dim3(threads), 0, stream,
         reinterpret_cast<const int4*>(qkv),
         reinterpret_cast<const int4*>(rope),
         reinterpret_cast<int4*>(Q),

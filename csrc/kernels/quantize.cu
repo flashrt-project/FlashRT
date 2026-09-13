@@ -5,6 +5,7 @@
 // ================================================================
 
 #include "quantize.cuh"
+#include "fused_fp4/pdl.cuh"
 #include "common.cuh"
 #include "norm.cuh"
 #include "activation.cuh"
@@ -41,6 +42,7 @@ template __global__ void absmax_kernel<__nv_bfloat16>(const __nv_bfloat16*, floa
 
 // Verbatim production quant_fp8_static_k: 4 elem/thread, packed uint32 store
 __global__ void quantize_fp8_kernel(const __half* in, __nv_fp8_e4m3* out, const float* descale_ptr, int n) {
+    flashrt_pdl_wait_and_trigger();
     int i = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
     if (i >= n) return;
     float inv_scale = 1.0f / fmaxf(*descale_ptr, 1e-12f);
@@ -268,7 +270,7 @@ void quantize_fp8_static_fp16(const __half* input, __nv_fp8_e4m3* output,
     // 4 elem/thread, matching production quant_fp8_static_k
     int threads = 256;
     int blocks = (n / 4 + threads - 1) / threads;
-    quantize_fp8_kernel<<<blocks, threads, 0, stream>>>(input, output, d_scale, n);
+    flash_rt::fp4::launch_maybe_pdl(quantize_fp8_kernel, dim3(blocks), dim3(threads), 0, stream, input, output, d_scale, n);
 }
 
 // ── L2 Weight Prefetch ──

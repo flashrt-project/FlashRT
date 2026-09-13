@@ -13,6 +13,7 @@
 // ================================================================
 
 #include "gemm_types_sm100.h"
+#include "fused_fp4/pdl.cuh"
 #include "cutlass/util/device_memory.h"
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -61,7 +62,7 @@ static int cutlass_run_impl(void* A, void* B, void* D,
         return -2;
     }
 
-    status = gemm.run(stream);
+    status = gemm.run(stream, nullptr, flash_rt::fp4::pdl_launch());
     if (status != cutlass::Status::kSuccess) {
         fprintf(stderr, "[CUTLASS] run failed: M=%d N=%d K=%d\n", M, N, K);
         return -3;
