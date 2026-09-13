@@ -79,8 +79,74 @@ def _interleave_qk(w: torch.Tensor, num_heads: int) -> torch.Tensor:
     )
 
 
-def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict:
+class _StateReader:
+    """Uniform ``keys()`` / ``get_tensor()`` over a safetensors file or an
+    in-memory state dict (safetensors-style names)."""
+
+    def __init__(self, source):
+        if isinstance(source, (str, pathlib.Path)):
+            from safetensors import safe_open
+            self._file = safe_open(str(source), framework="pt")
+            self._dict = None
+        else:
+            self._file = None
+            self._dict = source
+
+    def keys(self):
+        return self._file.keys() if self._file is not None else list(self._dict.keys())
+
+    def get_tensor(self, key: str) -> torch.Tensor:
+        if self._file is not None:
+            return self._file.get_tensor(key)
+        return self._dict[key]
+
+
+class _SinkDict(dict):
+    """dict that hands every stored tensor to ``sink(key, tensor, layer)``
+    and keeps nothing, so a conversion can stream into existing buffers."""
+
+    def __init__(self, sink):
+        super().__init__()
+        self._sink = sink
+
+    def __setitem__(self, key, value):
+        if value is not None:
+            self._sink(key, value, None)
+
+    def put_layer(self, key, layer, value):
+        self._sink(key, value, layer)
+
+
+class _LayerList(list):
+    """Per-layer tensors of one stacked checkpoint group. With a sink
+    destination every appended tensor is handed over at once (layer by
+    layer) instead of being kept for the final stack."""
+
+    def __init__(self, key, ckpt):
+        super().__init__()
+        self._key = key
+        self._ckpt = ckpt if isinstance(ckpt, _SinkDict) else None
+        self._layer = 0
+
+    def append(self, value):
+        if self._ckpt is not None:
+            self._ckpt.put_layer(self._key, self._layer, value)
+            self._layer += 1
+        else:
+            super().append(value)
+
+
+def _stack(layers: list):
+    return torch.stack(layers) if len(layers) else None
+
+
+def convert_pi05_safetensors(safetensors_path, sink=None) -> dict:
     """Convert a HuggingFace Pi0.5 safetensors file to BF16 torch tensor dict.
+
+    ``safetensors_path`` may also be an in-memory mapping of the same
+    tensor names (a merged checkpoint that never touched disk). With
+    ``sink`` the converted tensors are passed to ``sink(key, tensor)`` one
+    by one instead of being collected (the returned dict is then empty).
 
     Key transformations (verified bit-exact against the openpi PyTorch
     reference forward on LIBERO data):
@@ -97,22 +163,26 @@ def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict
         by ``-1.0 / num_steps`` (matching the flow-matching residual accumulation).
       - 10-step sinusoidal time embeddings.
     """
-    from safetensors import safe_open
     from flash_rt.executors.torch_weights import _autodetect_strip_prefix
 
-    logger.info("Loading Pi0.5 safetensors: %s", safetensors_path)
-    f = safe_open(str(safetensors_path), framework="pt")
+    if isinstance(safetensors_path, (str, pathlib.Path)):
+        logger.info("Loading Pi0.5 safetensors: %s", safetensors_path)
+    f = _StateReader(safetensors_path)
+    ckpt: dict = _SinkDict(sink) if sink is not None else {}
     # Auto-strip the lerobot HF policy ``model.`` wrap so the openpi
     # bare-key lookups below resolve transparently on either layout.
     _strip = _autodetect_strip_prefix(set(f.keys()))
 
+    # Tensors are moved to the GPU as they are read: the layout work below
+    # (transposes, head interleaving, norm folds) is hundreds of small ops
+    # that are slow on the host, and streaming one tensor at a time keeps
+    # the peak at one converted copy of the model.
     def g(key: str) -> torch.Tensor:
-        return f.get_tensor((_strip + key) if _strip else key).to(bf16)
+        return f.get_tensor((_strip + key) if _strip else key).to("cuda", bf16, non_blocking=True)
 
     def g_raw(key: str) -> torch.Tensor:
-        return f.get_tensor((_strip + key) if _strip else key)
+        return f.get_tensor((_strip + key) if _strip else key).to("cuda", non_blocking=True)
 
-    ckpt: dict = {}
 
     # ── Vision encoder (27 SigLIP layers) ──
     vp = "paligemma_with_expert.paligemma.model.vision_tower.vision_model"
@@ -123,12 +193,12 @@ def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict
     ckpt["vision_patch_embedding_b"] = g(f"{vp}.embeddings.patch_embedding.bias")
     ckpt["vision_position_embedding"] = g(f"{vp}.embeddings.position_embedding.weight")
 
-    qkv_w_list, qkv_b_list = [], []
-    o_w_list, o_b_list = [], []
-    up_w_list, up_b_list = [], []
-    down_w_list, down_b_list = [], []
-    ln1_w_list, ln1_b_list = [], []
-    ln2_w_list, ln2_b_list = [], []
+    qkv_w_list, qkv_b_list = _LayerList("vision_attn_qkv_w", ckpt), _LayerList("vision_attn_qkv_b", ckpt)
+    o_w_list, o_b_list = _LayerList("vision_attn_o_w", ckpt), _LayerList("vision_attn_o_b", ckpt)
+    up_w_list, up_b_list = _LayerList("vision_ffn_up_w", ckpt), _LayerList("vision_ffn_up_b", ckpt)
+    down_w_list, down_b_list = _LayerList("vision_ffn_down_w", ckpt), _LayerList("vision_ffn_down_b", ckpt)
+    ln1_w_list, ln1_b_list = _LayerList("vision_pre_attn_norm_w", ckpt), _LayerList("vision_pre_attn_norm_b", ckpt)
+    ln2_w_list, ln2_b_list = _LayerList("vision_pre_ffn_norm_w", ckpt), _LayerList("vision_pre_ffn_norm_b", ckpt)
 
     for i in range(VIS_L):
         lp = f"{vp}.encoder.layers.{i}"
@@ -156,18 +226,18 @@ def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict
         ln2_w_list.append(g(f"{lp}.layer_norm2.weight"))
         ln2_b_list.append(g(f"{lp}.layer_norm2.bias"))
 
-    ckpt["vision_attn_qkv_w"] = torch.stack(qkv_w_list)
-    ckpt["vision_attn_qkv_b"] = torch.stack(qkv_b_list)
-    ckpt["vision_attn_o_w"] = torch.stack(o_w_list)
-    ckpt["vision_attn_o_b"] = torch.stack(o_b_list)
-    ckpt["vision_ffn_up_w"] = torch.stack(up_w_list)
-    ckpt["vision_ffn_up_b"] = torch.stack(up_b_list)
-    ckpt["vision_ffn_down_w"] = torch.stack(down_w_list)
-    ckpt["vision_ffn_down_b"] = torch.stack(down_b_list)
-    ckpt["vision_pre_attn_norm_w"] = torch.stack(ln1_w_list)
-    ckpt["vision_pre_attn_norm_b"] = torch.stack(ln1_b_list)
-    ckpt["vision_pre_ffn_norm_w"] = torch.stack(ln2_w_list)
-    ckpt["vision_pre_ffn_norm_b"] = torch.stack(ln2_b_list)
+    ckpt["vision_attn_qkv_w"] = _stack(qkv_w_list)
+    ckpt["vision_attn_qkv_b"] = _stack(qkv_b_list)
+    ckpt["vision_attn_o_w"] = _stack(o_w_list)
+    ckpt["vision_attn_o_b"] = _stack(o_b_list)
+    ckpt["vision_ffn_up_w"] = _stack(up_w_list)
+    ckpt["vision_ffn_up_b"] = _stack(up_b_list)
+    ckpt["vision_ffn_down_w"] = _stack(down_w_list)
+    ckpt["vision_ffn_down_b"] = _stack(down_b_list)
+    ckpt["vision_pre_attn_norm_w"] = _stack(ln1_w_list)
+    ckpt["vision_pre_attn_norm_b"] = _stack(ln1_b_list)
+    ckpt["vision_pre_ffn_norm_w"] = _stack(ln2_w_list)
+    ckpt["vision_pre_ffn_norm_b"] = _stack(ln2_b_list)
     ckpt["vision_final_norm_w"] = g(f"{vp}.post_layernorm.weight")
     ckpt["vision_final_norm_b"] = g(f"{vp}.post_layernorm.bias")
 
@@ -178,8 +248,8 @@ def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict
 
     # ── Encoder (18 Gemma-2B layers with RMSNorm fold) ──
     ep = "paligemma_with_expert.paligemma.model.language_model.layers"
-    enc_qkv_list, enc_o_list = [], []
-    enc_gate_list, enc_up_list, enc_down_list = [], [], []
+    enc_qkv_list, enc_o_list = _LayerList("encoder_attn_qkv_w", ckpt), _LayerList("encoder_attn_o_w", ckpt)
+    enc_gate_list, enc_up_list, enc_down_list = _LayerList("encoder_ffn_gate_w", ckpt), _LayerList("encoder_ffn_up_w", ckpt), _LayerList("encoder_ffn_down_w", ckpt)
 
     for i in range(ENC_L):
         # CRITICAL: fuse in FP32 — bf16 rounds values near -1.0 to exactly
@@ -210,18 +280,18 @@ def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict
 
         enc_down_list.append(g(f"{ep}.{i}.mlp.down_proj.weight").t())
 
-    ckpt["encoder_attn_qkv_w"] = torch.stack(enc_qkv_list)
-    ckpt["encoder_attn_o_w"] = torch.stack(enc_o_list)
-    ckpt["encoder_ffn_gate_w"] = torch.stack(enc_gate_list)
-    ckpt["encoder_ffn_up_w"] = torch.stack(enc_up_list)
-    ckpt["encoder_ffn_down_w"] = torch.stack(enc_down_list)
+    ckpt["encoder_attn_qkv_w"] = _stack(enc_qkv_list)
+    ckpt["encoder_attn_o_w"] = _stack(enc_o_list)
+    ckpt["encoder_ffn_gate_w"] = _stack(enc_gate_list)
+    ckpt["encoder_ffn_up_w"] = _stack(enc_up_list)
+    ckpt["encoder_ffn_down_w"] = _stack(enc_down_list)
 
     # ── Decoder (18 Gemma-300M layers) ──
     dp = "paligemma_with_expert.gemma_expert.model.layers"
-    dec_qkv_list, dec_o_list = [], []
-    dec_gate_list, dec_up_list, dec_down_list = [], [], []
-    dec_attn_mod_w_list, dec_attn_mod_b_list = [], []
-    dec_ffn_mod_w_list, dec_ffn_mod_b_list = [], []
+    dec_qkv_list, dec_o_list = _LayerList("decoder_attn_qkv_w", ckpt), _LayerList("decoder_attn_o_w", ckpt)
+    dec_gate_list, dec_up_list, dec_down_list = _LayerList("decoder_ffn_gate_w", ckpt), _LayerList("decoder_ffn_up_w", ckpt), _LayerList("decoder_ffn_down_w", ckpt)
+    dec_attn_mod_w_list, dec_attn_mod_b_list = _LayerList("decoder_pre_attn_norm_mod_w", ckpt), _LayerList("decoder_pre_attn_norm_mod_b", ckpt)
+    dec_ffn_mod_w_list, dec_ffn_mod_b_list = _LayerList("decoder_pre_ffn_norm_mod_w", ckpt), _LayerList("decoder_pre_ffn_norm_mod_b", ckpt)
 
     for i in range(DEC_L):
         dec_attn_mod_w_list.append(g(f"{dp}.{i}.input_layernorm.dense.weight").t())
@@ -245,15 +315,15 @@ def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict
         dec_up_list.append(g(f"{dp}.{i}.mlp.up_proj.weight").t())
         dec_down_list.append(g(f"{dp}.{i}.mlp.down_proj.weight").t())
 
-    ckpt["decoder_attn_qkv_w"] = torch.stack(dec_qkv_list)
-    ckpt["decoder_attn_o_w"] = torch.stack(dec_o_list)
-    ckpt["decoder_ffn_gate_w"] = torch.stack(dec_gate_list)
-    ckpt["decoder_ffn_up_w"] = torch.stack(dec_up_list)
-    ckpt["decoder_ffn_down_w"] = torch.stack(dec_down_list)
-    ckpt["decoder_pre_attn_norm_mod_w"] = torch.stack(dec_attn_mod_w_list)
-    ckpt["decoder_pre_attn_norm_mod_b"] = torch.stack(dec_attn_mod_b_list)
-    ckpt["decoder_pre_ffn_norm_mod_w"] = torch.stack(dec_ffn_mod_w_list)
-    ckpt["decoder_pre_ffn_norm_mod_b"] = torch.stack(dec_ffn_mod_b_list)
+    ckpt["decoder_attn_qkv_w"] = _stack(dec_qkv_list)
+    ckpt["decoder_attn_o_w"] = _stack(dec_o_list)
+    ckpt["decoder_ffn_gate_w"] = _stack(dec_gate_list)
+    ckpt["decoder_ffn_up_w"] = _stack(dec_up_list)
+    ckpt["decoder_ffn_down_w"] = _stack(dec_down_list)
+    ckpt["decoder_pre_attn_norm_mod_w"] = _stack(dec_attn_mod_w_list)
+    ckpt["decoder_pre_attn_norm_mod_b"] = _stack(dec_attn_mod_b_list)
+    ckpt["decoder_pre_ffn_norm_mod_w"] = _stack(dec_ffn_mod_w_list)
+    ckpt["decoder_pre_ffn_norm_mod_b"] = _stack(dec_ffn_mod_b_list)
 
     ckpt["decoder_final_norm_mod_w"] = g(
         "paligemma_with_expert.gemma_expert.model.norm.dense.weight").t()
@@ -347,11 +417,11 @@ def _embed_prompt(prompt_text: str, embedding_weight: torch.Tensor,
 
 
 def _quantize_fp8_e4m3(w_bf16: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-tensor symmetric FP8 E4M3 quantization."""
-    amax = w_bf16.float().abs().max().item()
-    scale = max(amax / 448.0, 1e-12)
-    w_fp8 = (w_bf16.float() / scale).clamp(-448.0, 448.0).to(fp8_e4m3)
-    scale_tensor = torch.tensor([scale], dtype=torch.float32, device="cuda")
+    """Per-tensor symmetric FP8 E4M3 quantization (no host sync: the scale
+    stays a device tensor so hundreds of tensors quantize back to back)."""
+    w = w_bf16.float()
+    scale_tensor = (w.abs().amax() / 448.0).clamp_min(1e-12).reshape(1).to(torch.float32)
+    w_fp8 = (w / scale_tensor).clamp(-448.0, 448.0).to(fp8_e4m3)
     return w_fp8, scale_tensor
 
 
@@ -754,13 +824,21 @@ class Pi05TorchFrontendRtx:
             raise FileNotFoundError(
                 f"norm_stats not found near checkpoint: {e}") from e
 
-    def _quantize_all_fp8(self) -> None:
-        """Pre-quantize all large GEMM weights to FP8 E4M3."""
+    def _quantize_all_fp8(self, inplace: bool = False) -> None:
+        """Pre-quantize all large GEMM weights to FP8 E4M3.
+
+        With ``inplace=True`` (weight reload) every quantized tensor and
+        scale is written into the buffer the pipelines already point at.
+        """
         W = self._ckpt_bf16
         store = self._fp8_store
         fp8 = self._fp8_weights
 
-        store_index: dict[str, int] = {}
+        if inplace:
+            store_index = self._fp8_store_index
+        else:
+            store_index = {}
+            self._fp8_store_index = store_index
 
         def quant(name: str, w: torch.Tensor):
             if self.fp8_layout == "nk":
@@ -768,6 +846,11 @@ class Pi05TorchFrontendRtx:
             else:
                 w = w.contiguous()
             w_fp8, scale = _quantize_fp8_e4m3(w)
+            if inplace:
+                idx = store_index[name]
+                store[idx].copy_(w_fp8)
+                store[idx + 1].copy_(scale)
+                return
             store_index[name] = len(store)
             store.append(w_fp8)
             store.append(scale)
@@ -815,10 +898,117 @@ class Pi05TorchFrontendRtx:
                     name = f"{base}_{i}"
                     w_fp8, scale = store[store_index[name]], store[store_index[name] + 1]
                     w_nk = w_fp8.view(torch.uint8).t().contiguous().view(w_fp8.dtype)
+                    if inplace:
+                        store[store_index[name + "__nk"]].copy_(w_nk)
+                        continue
+                    store_index[name + "__nk"] = len(store)
                     store.append(w_nk)
                     fp8[name + "__nk"] = (w_nk.data_ptr(), scale.data_ptr())
                     n_copies += 1
-            logger.info("FP8 decoder weights transposed for the skinny family: %d", n_copies)
+            if not inplace:
+                logger.info("FP8 decoder weights transposed for the skinny family: %d", n_copies)
+
+    # -----------------------------------------------------------------
+    # Weight hot swap
+    # -----------------------------------------------------------------
+
+    @property
+    def weight_version(self) -> int:
+        """Number of successful :meth:`reload_weights` calls."""
+        return getattr(self, "_weight_version", 0)
+
+    def _live_pipelines(self) -> list:
+        seen: dict[int, object] = {}
+        for pipe in [self.pipeline, getattr(self, "_fixed_pipeline", None),
+                     *getattr(self, "_prompt_pipeline_cache", {}).values()]:
+            if pipe is not None:
+                seen[id(pipe)] = pipe
+        return list(seen.values())
+
+    def reload_weights(self, source) -> float:
+        """Replace every model weight in place without rebuilding or
+        re-capturing anything.
+
+        ``source`` is a checkpoint directory, a ``model.safetensors`` path
+        or an in-memory mapping of safetensors-style tensor names (for
+        example a LoRA merge that never touched disk). The tensors must
+        have the shapes of the loaded model.
+
+        What is refreshed: the BF16 weight tensors the pipelines point at
+        (copied in place, output projection pre-scaled as at load time),
+        the FP8 weight tensors and their per-tensor scales (re-quantized
+        into the same buffers, transposed copies included), the
+        pre-computed decoder styles of every live pipeline (uploaded into
+        the existing device buffers) and the language embeddings of the
+        current prompt(s). Captured CUDA graphs keep replaying; they read
+        the same addresses.
+
+        What is kept: the FP8 activation scales from the last calibration.
+        They describe the activation range of the model that was
+        calibrated; for the usual fine-tuning steps of an RL loop that
+        range moves little. Call :meth:`calibrate` again to refresh them
+        (that re-captures the graph).
+
+        INT8 modes are not supported. Returns the wall time in seconds.
+        """
+        if self._int8_weights or self._force_int8_decoder:
+            raise NotImplementedError("weight reload is not available for INT8 modes")
+        t0 = time.perf_counter()
+        if isinstance(source, (str, pathlib.Path)):
+            from safetensors.torch import load_file
+            path = pathlib.Path(source)
+            if path.is_dir():
+                path = path / "model.safetensors"
+            source = load_file(str(path))
+        scale_out = -1.0 / self._num_steps
+
+        def sink(key: str, value, layer) -> None:
+            if not isinstance(value, torch.Tensor):
+                return
+            dst = self._ckpt_bf16.get(key)
+            if dst is None:
+                return
+            if layer is not None:
+                dst = dst[layer]
+            if tuple(dst.shape) != tuple(value.shape):
+                raise ValueError(
+                    f"reload_weights: {key} has shape {tuple(value.shape)}, "
+                    f"loaded model has {tuple(dst.shape)}")
+            value = value.to("cuda", bf16)
+            if key in ("decoder_action_out_proj_w", "decoder_action_out_proj_b"):
+                value = value * scale_out
+            dst.copy_(value)
+
+        phases = {}
+        with torch.no_grad():
+            # Streams group by group into the existing tensors: the peak is
+            # one converted group, not a second copy of the model.
+            convert_pi05_safetensors(source, sink=sink)
+            torch.cuda.synchronize(); phases["convert_copy"] = time.perf_counter() - t0
+            if self._fp8_weights:
+                self._quantize_all_fp8(inplace=True)
+            torch.cuda.synchronize(); phases["quantize"] = time.perf_counter() - t0 - sum(phases.values())
+            self._precomputed_styles = _precompute_decoder_styles(
+                self._ckpt_bf16, self.chunk_size, num_steps=self._num_steps)
+        for pipe in self._live_pipelines():
+            pipe.weights["precomputed"] = self._precomputed_styles
+            pipe._upload_precomputed_styles()
+        torch.cuda.synchronize(); phases["styles"] = time.perf_counter() - t0 - sum(phases.values())
+        # Prompt embeddings come from the (now updated) embedding table.
+        call = getattr(self, "_last_prompt_call", None)
+        if call is not None:
+            if call[0] == "single":
+                self.set_prompt(call[1], call[2])
+            else:
+                self.set_prompt_batch(list(call[1]))
+        torch.cuda.synchronize()
+        self._weight_version = self.weight_version + 1
+        elapsed = time.perf_counter() - t0
+        phases["prompt"] = elapsed - sum(phases.values())
+        self._last_reload_phases = phases
+        logger.info("Weights reloaded in place (version %d, %.2f s: %s)", self._weight_version, elapsed,
+                    ", ".join(f"{k} {v:.2f}" for k, v in phases.items()))
+        return elapsed
 
     def _skinny_weights_wanted(self) -> bool:
         """Whether the FP8 decoder may run on the skinny GEMM family."""
@@ -1082,6 +1272,7 @@ class Pi05TorchFrontendRtx:
         builds the unconditioned prompt embeddings and uploads both into
         the CFG-aware pipeline.
         """
+        self._last_prompt_call = ("single", prompt_text, state)
         if self._rl_config is not None:
             if state is not None:
                 raise ValueError(
@@ -1873,6 +2064,7 @@ class Pi05TorchFrontendRtx:
             raise ValueError(
                 f"set_prompt_batch expects {self._batch_size} prompts, "
                 f"got {len(prompts)}")
+        self._last_prompt_call = ("batch", tuple(prompts))
         embeds_list = []
         prompt_lens = []
         for p in prompts:

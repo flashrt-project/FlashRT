@@ -226,16 +226,32 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         # Override :meth:`_style_slice_ptr` to return b2 slice pointers
         # so all decoder calls automatically pick up the fix without
         # touching call sites.
+        self._upload_b2_styles()
+
+    def _upload_b2_styles(self) -> None:
+        """Tile the per-step styles B times along the row dimension into the
+        ``*_b2`` buffers (allocated on the first call, uploaded in place
+        afterwards so a weight reload never moves them)."""
         import numpy as np
+        B = self.B
         pre = self.weights["precomputed"]
         # style_attn / style_ffn: (num_steps, DEC_L, ds, 3*DEC_D)
         sa = np.ascontiguousarray(np.tile(pre["style_attn"], (1, 1, B, 1)))
         sf = np.ascontiguousarray(np.tile(pre["style_ffn"], (1, 1, B, 1)))
         # style_final: (num_steps, ds, 3*DEC_D)
         sfin = np.ascontiguousarray(np.tile(pre["style_final"], (1, B, 1)))
-        self.bufs["decoder_style_attn_b2"] = CudaBuffer.from_numpy(sa)
-        self.bufs["decoder_style_ffn_b2"] = CudaBuffer.from_numpy(sf)
-        self.bufs["decoder_style_final_b2"] = CudaBuffer.from_numpy(sfin)
+        for key, arr in (("decoder_style_attn_b2", sa), ("decoder_style_ffn_b2", sf),
+                         ("decoder_style_final_b2", sfin)):
+            buf = self.bufs.get(key)
+            if buf is not None and buf.nbytes == arr.nbytes:
+                buf.upload(arr)
+            else:
+                self.bufs[key] = CudaBuffer.from_numpy(arr)
+
+    def _upload_precomputed_styles(self) -> None:
+        super()._upload_precomputed_styles()
+        if getattr(self, "B", 0) and "decoder_style_attn_b2" in self.bufs:
+            self._upload_b2_styles()
 
     def _style_slice_ptr(self, buf_name: str, step: int,
                           layer: int | None = None) -> int:
