@@ -663,6 +663,45 @@ action_out_residual_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloa
     }
 }
 
+// Stochastic variant: noise += a + sigma * eps (fp32 fma, one bf16
+// rounding). With *sigma == 0 it is bit-identical to action_out_residual,
+// so one captured graph serves the ODE and the SDE sampler. The trace
+// records the step mean increment a; eps is the caller's per-step noise.
+template <bool PDL>
+__global__ void __launch_bounds__(256)
+action_out_residual_sde_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w_out,
+                               const __nv_bfloat16* __restrict__ b_out, __nv_bfloat16* __restrict__ action,
+                               __nv_bfloat16* __restrict__ noise, __nv_bfloat16* __restrict__ trace_x,
+                               __nv_bfloat16* __restrict__ trace_delta, const __nv_bfloat16* __restrict__ eps,
+                               const float* __restrict__ sigma) {
+    constexpr int KDIM = 1024, NDIM = 32, SLICES = 8, KS = KDIM / SLICES;
+    __shared__ float part[SLICES][NDIM];
+    const int row = blockIdx.x, tid = threadIdx.x;
+    const int n = tid & 31, slice = tid >> 5;
+    const float bias = __bfloat162float(b_out[n]);
+    if constexpr (PDL) pdl_prologue();
+    const __nv_bfloat16* xr = x + static_cast<size_t>(row) * KDIM + slice * KS;
+    const __nv_bfloat16* wr = w_out + static_cast<size_t>(slice) * KS * NDIM + n;
+    float acc = 0.f;
+#pragma unroll 8
+    for (int k = 0; k < KS; ++k) acc += __bfloat162float(xr[k]) * __bfloat162float(wr[k * NDIM]);
+    part[slice][n] = acc;
+    __syncthreads();
+    if (slice == 0) {
+        float total = 0.f;
+#pragma unroll
+        for (int s2 = 0; s2 < SLICES; ++s2) total += part[s2][n];
+        const float g = __bfloat162float(__float2bfloat16(total));
+        const __nv_bfloat16 a = __float2bfloat16(g + bias);
+        const size_t idx = static_cast<size_t>(row) * NDIM + n;
+        const __nv_bfloat16 old = noise[idx];
+        action[idx] = a;
+        if (trace_x) { trace_x[idx] = old; trace_delta[idx] = a; }
+        const float inc = fmaf(*sigma, __bfloat162float(eps[idx]), __bfloat162float(a));
+        noise[idx] = __float2bfloat16(__bfloat162float(old) + inc);
+    }
+}
+
 template <typename... Args>
 int launch_ex(const void* fn, dim3 grid, dim3 block, cudaStream_t stream, bool pdl, Args... args) {
     cudaLaunchConfig_t cfg = {};
@@ -870,6 +909,18 @@ int action_out_residual(const __nv_bfloat16* x, const __nv_bfloat16* w_out, cons
                          b_out, action, noise, trace_x, trace_delta);
     return launch_ex((const void*)action_out_residual_kernel<false>, grid, dim3(256), stream, false, x, w_out,
                      b_out, action, noise, trace_x, trace_delta);
+}
+
+int action_out_residual_sde(const __nv_bfloat16* x, const __nv_bfloat16* w_out, const __nv_bfloat16* b_out,
+                            __nv_bfloat16* action, __nv_bfloat16* noise, __nv_bfloat16* trace_x,
+                            __nv_bfloat16* trace_delta, const __nv_bfloat16* eps, const float* sigma, int rows,
+                            bool pdl, cudaStream_t stream) {
+    const dim3 grid(rows);
+    if (pdl)
+        return launch_ex((const void*)action_out_residual_sde_kernel<true>, grid, dim3(256), stream, true, x,
+                         w_out, b_out, action, noise, trace_x, trace_delta, eps, sigma);
+    return launch_ex((const void*)action_out_residual_sde_kernel<false>, grid, dim3(256), stream, false, x, w_out,
+                     b_out, action, noise, trace_x, trace_delta, eps, sigma);
 }
 
 }  // namespace pi05_dec_skinny

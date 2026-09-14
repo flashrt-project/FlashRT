@@ -632,8 +632,14 @@ class Pi05TorchFrontendRtx:
                  denoise_trace: bool = False,
                  prefix_features: bool = False,
                  decoder_kernel: Optional[str] = None,
-                 prefix_precision: Optional[str] = None):
+                 prefix_precision: Optional[str] = None,
+                 sde: bool = False):
         checkpoint_dir = pathlib.Path(checkpoint_dir)
+        # Stochastic sampler: pipelines take a per-step noise scale and
+        # per-step noise (infer(..., sde_sigma=, step_noise=)); with no
+        # sigma the sampler is the ODE one bit for bit. Construction-time
+        # because the buffers are read by the captured graph.
+        self._sde = bool(sde)
         # Prefix (SigLIP + Gemma-2B) GEMM precision: "fp8" (per-tensor,
         # calibrated) or "nvfp4" (block-scaled 4-bit weights and
         # activations, no calibration, sm_120a only). The decoder is not
@@ -1441,9 +1447,9 @@ class Pi05TorchFrontendRtx:
                 self.graph_recorded = False
                 self.calibrated = False
             return
-        if self._denoise_trace or self._prefix_features:
+        if self._denoise_trace or self._prefix_features or self._sde:
             raise NotImplementedError(
-                "denoise_trace / prefix_features are not recorded by the CFG "
+                "denoise_trace / prefix_features / sde are not supported by the CFG "
                 "pipelines yet; build the frontend without them to use RL CFG mode")
         if getattr(self, "_batched_active", False) and self._batch_size != 2:
             raise ValueError(
@@ -1563,6 +1569,7 @@ class Pi05TorchFrontendRtx:
                 fixed_shape=True,
                 denoise_trace=self._denoise_trace,
                 prefix_export=self._prefix_features,
+                sde=self._sde,
                 **self._pipeline_precision_kwargs())
             if self._fixed_pipeline.use_int8_vision_static:
                 self._fixed_pipeline.vis_int8_static_calibrated = False
@@ -1615,6 +1622,7 @@ class Pi05TorchFrontendRtx:
                     vision_num_layers=self._vision_num_layers,
                     denoise_trace=self._denoise_trace,
                 prefix_export=self._prefix_features,
+                sde=self._sde,
                     **self._pipeline_precision_kwargs())
                 self._prompt_pipeline_cache[prompt_len] = self.pipeline
                 # Static INT8 vision scales are per-pipeline-instance.
@@ -2050,7 +2058,7 @@ class Pi05TorchFrontendRtx:
 
     @serialized
     def infer(self, observation: dict, debug: bool = False, *,
-              noise=None, generator=None, return_noise: bool = False) -> dict:
+              noise=None, generator=None, step_noise=None, sde_sigma=None, return_noise: bool = False) -> dict:
         """Run inference on a single observation.
 
         All GPU work happens on ``self._graph_torch_stream`` — the same
@@ -2095,9 +2103,13 @@ class Pi05TorchFrontendRtx:
         with torch.cuda.stream(self._graph_torch_stream):
             stream_int = self._graph_torch_stream.cuda_stream
 
-            self._fill_noise(self._noise_buf, noise, generator)
+            # With an explicit initial noise and a schedule, the generator
+            # feeds the step noise only.
+            init_gen = None if (noise is not None and sde_sigma is not None and step_noise is None) else generator
+            self._fill_noise(self._noise_buf, noise, init_gen)
             self._copy_tensor_to_pipeline_buf_stream(
                 self._noise_buf, self.pipeline.input_noise_buf, stream_int)
+            sde_used = self._fill_sde(step_noise, sde_sigma, generator, stream_int)
 
             if use_full:
                 self._fill_img_buf(observation)
@@ -2140,6 +2152,8 @@ class Pi05TorchFrontendRtx:
             result["denoise_trace"] = self._denoise_trace_result()
         if self._prefix_features:
             result["prefix_features"] = self._prefix_features_result()[0]
+        if sde_used is not None:
+            result["step_noise"], result["sde_sigma"] = sde_used
         return result
 
     def _use_full_pipeline_for_next_frame(self) -> bool:
@@ -2280,7 +2294,7 @@ class Pi05TorchFrontendRtx:
         "attn_backend", "pipeline", "current_prompt_len", "graph_recorded",
         "calibrated", "_batched_active", "_batch_size", "_img_buf_b2",
         "_noise_buf_b2", "_noise_out_b2", "_batch_prompt_texts", "_batch_prompt_lens",
-        "_last_prompt_call", "_graph_torch_stream")
+        "_last_prompt_call", "_graph_torch_stream", "_sde_eps_stage")
 
     @property
     def batch_sizes(self) -> tuple:
@@ -2395,6 +2409,7 @@ class Pi05TorchFrontendRtx:
                 chunk_size=self.chunk_size,
                 denoise_trace=self._denoise_trace,
                 prefix_export=self._prefix_features,
+                sde=self._sde,
                 **self._pipeline_precision_kwargs())
         # Only the slots whose prompt changed are uploaded again (same
         # padded length, so the device rows are the same size); a fleet
@@ -2455,7 +2470,7 @@ class Pi05TorchFrontendRtx:
 
     @serialized
     def infer_batch(self, observations: list, *,
-                    noise=None, generator=None, return_noise: bool = False) -> list:
+                    noise=None, generator=None, step_noise=None, sde_sigma=None, return_noise: bool = False) -> list:
         """Run B=N inference on N independent observations.
 
         Args:
@@ -2484,7 +2499,10 @@ class Pi05TorchFrontendRtx:
             # Stage per-sample inputs into B=N tensors (_b2 is a legacy suffix).
             for b, obs in enumerate(observations):
                 self._img_buf_b2[b].copy_(self._stack_images(obs))
-            self._fill_noise(self._noise_buf_b2, noise, generator)
+            init_gen = None if (noise is not None and sde_sigma is not None and step_noise is None) else generator
+            self._fill_noise(self._noise_buf_b2, noise, init_gen)
+            sde_used = self._fill_sde(step_noise, sde_sigma, generator,
+                                      self._graph_torch_stream.cuda_stream, batched=True)
             stream_int = self._graph_torch_stream.cuda_stream
             self._copy_tensor_to_pipeline_buf_stream(
                 self._img_buf_b2, self.pipeline.input_images_buf_b2, stream_int)
@@ -2524,6 +2542,9 @@ class Pi05TorchFrontendRtx:
                 entry["denoise_trace"] = {
                     "x": trace["x"][:, b], "delta": trace["delta"][:, b],
                     "timesteps": trace["timesteps"]}
+            if sde_used is not None:
+                entry["step_noise"] = sde_used[0][:, b]
+                entry["sde_sigma"] = sde_used[1]
             results.append(entry)
         return results
 
@@ -2602,6 +2623,53 @@ class Pi05TorchFrontendRtx:
             buf.normal_(generator=generator)
         else:
             buf.normal_()
+
+    def _fill_sde(self, step_noise, sde_sigma, generator, stream_int: int,
+                  batched: bool = False):
+        """Upload the stochastic sampler's per-step sigma and noise.
+
+        ``sde_sigma`` is a sequence of ``num_steps`` non-negative floats
+        (the std of the Gaussian added after step ``s``: ``x[s+1] = x[s] +
+        delta[s] + sigma[s] * eps[s]``); ``step_noise`` is
+        ``(num_steps, chunk, 32)`` (``(num_steps, B, chunk, 32)`` batched),
+        else drawn from ``generator`` or the default CUDA generator. Returns
+        ``(step_noise_f32, sigma_list)`` when a sigma was given (what a
+        caller passes back to reproduce the sample), ``None`` otherwise;
+        without a sigma the sigma buffer is zeroed and the sampler is the
+        ODE one bit for bit.
+        """
+        if sde_sigma is None and step_noise is None:
+            if self._sde:
+                self._sde_sigma_dev().zero_()
+                self._copy_tensor_to_pipeline_buf_stream(
+                    self._sde_sigma_dev(), self.pipeline.sde_sigma_buf, stream_int)
+            return None
+        if not self._sde:
+            raise ValueError("step_noise / sde_sigma need a frontend built with sde=True")
+        if sde_sigma is None:
+            raise ValueError("step_noise needs sde_sigma")
+        sigma = np.asarray(sde_sigma, dtype=np.float32).reshape(-1)
+        if sigma.shape[0] != self._num_steps or (sigma < 0).any():
+            raise ValueError(f"sde_sigma must hold {self._num_steps} non-negative values")
+        self._sde_sigma_dev().copy_(torch.from_numpy(sigma))
+        self._copy_tensor_to_pipeline_buf_stream(
+            self._sde_sigma_dev(), self.pipeline.sde_sigma_buf, stream_int)
+        shape = ((self._num_steps, self._batch_size, self.chunk_size, ACTION_DIM) if batched
+                 else (self._num_steps, self.chunk_size, ACTION_DIM))
+        buf = getattr(self, "_sde_eps_stage", None)
+        if buf is None or tuple(buf.shape) != shape:
+            buf = self._sde_eps_stage = torch.empty(shape, dtype=bf16, device="cuda")
+        self._fill_noise(buf, step_noise, generator)
+        eps_used = buf.float().cpu().numpy()
+        dst = self.pipeline.sde_eps_buf_b2 if batched else self.pipeline.sde_eps_buf
+        self._copy_tensor_to_pipeline_buf_stream(buf, dst, stream_int)
+        return eps_used, [float(v) for v in sigma]
+
+    def _sde_sigma_dev(self) -> torch.Tensor:
+        t = getattr(self, "_sde_sigma_stage", None)
+        if t is None or t.numel() != self._num_steps:
+            t = self._sde_sigma_stage = torch.zeros(self._num_steps, dtype=torch.float32, device="cuda")
+        return t
 
     def denoise_timesteps(self) -> list:
         """Flow-matching time of each denoising step (``1, 1-dt, ..., dt``)."""

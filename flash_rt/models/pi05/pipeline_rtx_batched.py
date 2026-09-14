@@ -116,6 +116,8 @@ class Pi05BatchedPipeline(Pi05Pipeline):
             B * ds * ACTION_DIM, BF16)
         if self.denoise_trace:
             self._allocate_denoise_trace_buffers(self.bufs, B * ds, suffix="_b2")
+        if self.sde:
+            self._allocate_sde_buffers(self.bufs, B * ds, suffix="_b2")
         if self.prefix_export:
             self.bufs["prefix_hidden_b2"] = CudaBuffer.device_empty(
                 B * es * ENC_D, BF16)
@@ -896,11 +898,19 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                     off = step * m * ACTION_DIM * 2
                     trace_x = Bb["denoise_trace_x_b2"].ptr.value + off
                     trace_delta = Bb["denoise_trace_delta_b2"].ptr.value + off
-                rc = fvk.pi05_dec_skinny_action_out_residual(
-                    Bb["x_normed_buf_b2"].ptr.value,
-                    W["decoder_action_out_proj_w"], W["decoder_action_out_proj_b"],
-                    Bb["decoder_action_buf_b2"].ptr.value, Bb["diffusion_noise_b2"].ptr.value,
-                    trace_x, trace_delta, m, self._skinny_pdl, stream)
+                if self.sde:
+                    rc = fvk.pi05_dec_skinny_action_out_residual_sde(
+                        Bb["x_normed_buf_b2"].ptr.value,
+                        W["decoder_action_out_proj_w"], W["decoder_action_out_proj_b"],
+                        Bb["decoder_action_buf_b2"].ptr.value, Bb["diffusion_noise_b2"].ptr.value,
+                        trace_x, trace_delta, *self._sde_step_ptrs(step, m, suffix="_b2"),
+                        m, self._skinny_pdl, stream)
+                else:
+                    rc = fvk.pi05_dec_skinny_action_out_residual(
+                        Bb["x_normed_buf_b2"].ptr.value,
+                        W["decoder_action_out_proj_w"], W["decoder_action_out_proj_b"],
+                        Bb["decoder_action_buf_b2"].ptr.value, Bb["diffusion_noise_b2"].ptr.value,
+                        trace_x, trace_delta, m, self._skinny_pdl, stream)
                 if rc != 0:
                     raise RuntimeError(f"skinny decoder action_out failed: cudaError {rc}")
                 continue
@@ -924,10 +934,19 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 self._record_denoise_step(
                     step, Bb["diffusion_noise_b2"], Bb["decoder_action_buf_b2"],
                     m, stream, suffix="_b2")
-            fvk.residual_add(
-                Bb["diffusion_noise_b2"].ptr.value,
-                Bb["decoder_action_buf_b2"].ptr.value,
-                m * ACTION_DIM, stream=stream)
+            if self.sde:
+                eps_ptr, sigma_ptr = self._sde_step_ptrs(step, m, suffix="_b2")
+                rc = fvk.pi05_sde_residual_add(
+                    Bb["diffusion_noise_b2"].ptr.value,
+                    Bb["decoder_action_buf_b2"].ptr.value,
+                    eps_ptr, sigma_ptr, m * ACTION_DIM, stream)
+                if rc != 0:
+                    raise RuntimeError(f"pi05_sde_residual_add failed: cudaError {rc}")
+            else:
+                fvk.residual_add(
+                    Bb["diffusion_noise_b2"].ptr.value,
+                    Bb["decoder_action_buf_b2"].ptr.value,
+                    m * ACTION_DIM, stream=stream)
 
     def _decoder_layer_batched(self, i: int, step: int, enc_seq: int,
                                 ds: int, m: int, skip_c1: bool,
@@ -1288,6 +1307,13 @@ class Pi05BatchedPipeline(Pi05Pipeline):
     def input_noise_buf_b2(self) -> CudaBuffer:
         """Pipeline input/output: per-sample diffusion noise (B*chunk, 32)."""
         return self.bufs["diffusion_noise_b2"]
+
+    @property
+    def sde_eps_buf_b2(self) -> CudaBuffer:
+        """Sampler input: per-step noise, ``(num_steps, B, chunk, 32)`` bf16."""
+        if not self.sde:
+            raise RuntimeError("pipeline was built without sde=True")
+        return self.bufs["sde_eps_b2"]
 
     @property
     def denoise_trace_x_buf_b2(self) -> CudaBuffer:

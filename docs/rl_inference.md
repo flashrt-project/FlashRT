@@ -388,6 +388,37 @@ requests. Width switches, reload and inference use the same instance lock.
 serving latency must be measured separately with queueing included, not
 inferred from graph replay timing.
 
+### Stochastic sampler (flow-SDE rollouts)
+
+Build with `-DFLASHRT_ENABLE_PI05_SDE=ON` before selecting `sde=True`.
+Both the build option and runtime sampler are off by default.
+
+```python
+rt = Pi05TorchFrontendRtx(ckpt, num_views=2, denoise_trace=True, sde=True)
+out = rt.infer(obs, noise=z, sde_sigma=[0.08] * 9 + [0.0], generator=g)   # or step_noise=eps
+out["step_noise"], out["sde_sigma"]          # (num_steps, chunk, 32) float32 and the schedule
+rt.infer(obs, noise=z)                        # no schedule: the ODE sampler, bit for bit
+```
+
+A frontend built with `sde=True` runs the denoising step as
+`x[s+1] = bf16(x[s] + fma(sigma[s], eps[s], delta[s]))`: the flow
+increment `delta[s]` (what the trace records, so the step mean is still
+`x[s] + delta[s]`) plus per-step Gaussian noise scaled by a per-step
+`sigma`. Both `eps` and `sigma` live in device buffers written per call,
+so one captured graph serves the ODE sampler (no schedule, or all zeros:
+the fused multiply-add with a zero multiplier is exact) and the SDE
+sampler. `step_noise` is `(num_steps, chunk, 32)` (`(num_steps, B, chunk,
+32)` for `infer_batch`); when only a schedule is given the noise is drawn
+from `generator` (after the initial noise) or the default CUDA generator
+and returned, so `(noise, step_noise, sde_sigma)` reproduces the sample
+bit for bit. The skinny step kernel and the library path each have an
+SDE variant; the CFG pipelines do not take it. An on-policy trainer
+evaluates each stochastic step's Gaussian density from `denoise_trace`
+and the schedule (physis `trajectory_log_prob`); steps with `sigma 0`
+are deterministic and carry no density, so a schedule usually ends in
+`0.0` and the final action is the last step's mean.
+`tests/test_pi05_sde_sampler.py`.
+
 ### Prefix hidden-state export
 
 ```python
@@ -457,6 +488,7 @@ INT8 modes are not supported.
 | `tests/test_pi05_prefix_nvfp4.py` | NVFP4 prefix tier: fused GeGLU quantizer bit-identical to the unfused pair, tier vs FP8, batched, reload |
 | `tests/test_pi05_prompt_cache.py` | prompt embedding cache: LRU and tokenizer helpers (host), rotated batch prompts bit-identical to a cold re-embedding and cheap, single-prompt switch, reload drops the cache |
 | `tests/test_pi05_batched_widths.py` | several batched widths in one frontend: width 2 next to width 4 (shared weights, cosine 0.999 per slot), exact swap back, reload reaches the parked width |
+| `tests/test_pi05_sde_sampler.py` | stochastic sampler: no schedule equals the plain frontend (skinny FP8, library FP8, BF16), zero schedule bit-identical, trace consistent under the SDE rule, seeded reproduction, batched per slot |
 | `tests/test_rl_cfg_inference.py` | RTX serial + batched CFG, all βs, validation gates |
 | `tests/test_thor_rl_cfg_inference.py --backends torch,jax` | Thor serial CFG: validation, β=1.0 collapse, β=1.5 finite |
 | `tests/test_cfg_correctness_oracle.py` | per-step C1–C5 contract (RTX) vs frozen reference |

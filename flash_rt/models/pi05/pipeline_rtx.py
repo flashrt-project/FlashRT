@@ -190,7 +190,8 @@ class Pi05Pipeline:
                  denoise_trace: bool = False,
                  prefix_export: bool = False,
                  decoder_kernel: str = "cublaslt",
-                 prefix_precision: str = "fp8"):
+                 prefix_precision: str = "fp8",
+                 sde: bool = False):
         self.gemm = gemm
         self.fvk = fvk
         self.attn = attn_backend
@@ -206,6 +207,13 @@ class Pi05Pipeline:
         # consumer can pool it as a feature (value functions). Captured
         # into the graph like the trace; off by default.
         self.prefix_export = bool(prefix_export)
+        # Stochastic sampler: every denoising step adds sigma[step] * eps[step]
+        # on top of the flow increment (eps and sigma live in device buffers
+        # written per call; sigma == 0 reproduces the ODE sampler bit for bit,
+        # so one captured graph serves both).
+        self.sde = bool(sde)
+        if self.sde and not hasattr(fvk, "pi05_sde_residual_add"):
+            raise RuntimeError("sde=True requires FLASHRT_ENABLE_PI05_SDE=ON")
 
         # Fixed-shape state-prompt mode: one captured graph at the MAX prompt
         # length serves every length via seqused masking + devpos K/V append.
@@ -415,6 +423,8 @@ class Pi05Pipeline:
         B["rtc_guidance_weight"] = CudaBuffer.device_empty(1, FP32)
         if self.denoise_trace:
             self._allocate_denoise_trace_buffers(B, ds)
+        if self.sde:
+            self._allocate_sde_buffers(B, ds)
         if self.prefix_export:
             B["prefix_hidden"] = CudaBuffer.device_empty(es * ENC_D, BF16)
         # Decoder scratch for ada_rms_norm output + gate
@@ -1836,11 +1846,19 @@ class Pi05Pipeline:
                         off = step * ds * ACTION_DIM * 2
                         trace_x = B["denoise_trace_x"].ptr.value + off
                         trace_delta = B["denoise_trace_delta"].ptr.value + off
-                    rc = fvk.pi05_dec_skinny_action_out_residual(
-                        B["x_normed_buf"].ptr.value,
-                        W["decoder_action_out_proj_w"], W["decoder_action_out_proj_b"],
-                        B["decoder_action_buf"].ptr.value, B["diffusion_noise"].ptr.value,
-                        trace_x, trace_delta, ds, self._skinny_pdl, stream)
+                    if self.sde:
+                        rc = fvk.pi05_dec_skinny_action_out_residual_sde(
+                            B["x_normed_buf"].ptr.value,
+                            W["decoder_action_out_proj_w"], W["decoder_action_out_proj_b"],
+                            B["decoder_action_buf"].ptr.value, B["diffusion_noise"].ptr.value,
+                            trace_x, trace_delta, *self._sde_step_ptrs(step, ds),
+                            ds, self._skinny_pdl, stream)
+                    else:
+                        rc = fvk.pi05_dec_skinny_action_out_residual(
+                            B["x_normed_buf"].ptr.value,
+                            W["decoder_action_out_proj_w"], W["decoder_action_out_proj_b"],
+                            B["decoder_action_buf"].ptr.value, B["diffusion_noise"].ptr.value,
+                            trace_x, trace_delta, ds, self._skinny_pdl, stream)
                     if rc != 0:
                         raise RuntimeError(f"skinny decoder action_out failed: cudaError {rc}")
                 else:
@@ -1864,10 +1882,19 @@ class Pi05Pipeline:
                             step, B["diffusion_noise"], B["decoder_action_buf"],
                             ds, stream)
                     # noise += action_buf (weights pre-scaled by -1/num_steps by frontend)
-                    fvk.residual_add(
-                        B["diffusion_noise"].ptr.value,
-                        B["decoder_action_buf"].ptr.value,
-                        ds * ACTION_DIM, stream=stream)
+                    if self.sde:
+                        eps_ptr, sigma_ptr = self._sde_step_ptrs(step, ds)
+                        rc = fvk.pi05_sde_residual_add(
+                            B["diffusion_noise"].ptr.value,
+                            B["decoder_action_buf"].ptr.value,
+                            eps_ptr, sigma_ptr, ds * ACTION_DIM, stream)
+                        if rc != 0:
+                            raise RuntimeError(f"pi05_sde_residual_add failed: cudaError {rc}")
+                    else:
+                        fvk.residual_add(
+                            B["diffusion_noise"].ptr.value,
+                            B["decoder_action_buf"].ptr.value,
+                            ds * ACTION_DIM, stream=stream)
                 self._copy_rtc_prefix(rtc_prefix_len, stream)
         finally:
             self._fp8_current_decoder_step = prev_decoder_step
@@ -2475,6 +2502,35 @@ class Pi05Pipeline:
         self.fvk.gpu_copy(
             self.bufs["denoise_trace_delta" + suffix].ptr.value + off,
             delta_buf.ptr.value, nbytes, stream)
+
+    # ── Stochastic sampler buffers (optional, construction-time) ─────
+
+    def _allocate_sde_buffers(self, B: dict, rows: int, suffix: str = "") -> None:
+        """``(num_steps, rows, 32)`` bf16 per-step noise and, once per pipeline,
+        ``(num_steps,)`` fp32 sigmas; both zero so the sampler starts as the ODE."""
+        B["sde_eps" + suffix] = CudaBuffer.device_zeros(self.num_steps * int(rows) * ACTION_DIM, BF16)
+        if "sde_sigma" not in B:
+            B["sde_sigma"] = CudaBuffer.device_zeros(self.num_steps, FP32)
+
+    def _sde_step_ptrs(self, step: int, rows: int, suffix: str = "") -> tuple:
+        """Device pointers of step ``step``'s noise rows and sigma."""
+        eps = self.bufs["sde_eps" + suffix].ptr.value + int(step) * int(rows) * ACTION_DIM * 2
+        sigma = self.bufs["sde_sigma"].ptr.value + int(step) * 4
+        return eps, sigma
+
+    @property
+    def sde_eps_buf(self) -> CudaBuffer:
+        """Sampler input: per-step noise, ``(num_steps, chunk, 32)`` bf16."""
+        if not self.sde:
+            raise RuntimeError("pipeline was built without sde=True")
+        return self.bufs["sde_eps"]
+
+    @property
+    def sde_sigma_buf(self) -> CudaBuffer:
+        """Sampler input: per-step noise scale, ``(num_steps,)`` fp32."""
+        if not self.sde:
+            raise RuntimeError("pipeline was built without sde=True")
+        return self.bufs["sde_sigma"]
 
     @property
     def denoise_trace_x_buf(self) -> CudaBuffer:

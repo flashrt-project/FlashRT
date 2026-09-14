@@ -58,6 +58,9 @@
 #ifdef ENABLE_PI05_NVFP4
 #include "kernels/pi05/pi05_geglu_nvfp4_quant.cuh"
 #endif
+#ifdef ENABLE_PI05_SDE
+#include "kernels/sde_step.cuh"
+#endif
 #ifdef FLASHRT_PI05_DECODER_SKINNY_SM120
 #include "kernels/pi05/pi05_decoder_skinny_fp8_sm120.cuh"
 #endif
@@ -1127,6 +1130,17 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                      typed_ptr<__nv_bfloat16>(x), n, to_stream(stream));
     }, py::arg("residual"), py::arg("x"), py::arg("n"), py::arg("stream") = 0);
 
+#ifdef ENABLE_PI05_SDE
+    // Stochastic denoising step: x += a + (*sigma) * eps, bit-identical to
+    // residual_add when *sigma == 0 (device-side sigma, graph-safe).
+    m.def("pi05_sde_residual_add", [](uintptr_t x, uintptr_t a, uintptr_t eps, uintptr_t sigma, int n,
+                                 uintptr_t stream) {
+        return flash_rt::pi05_sde_residual_add(typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(a),
+                                          typed_ptr<__nv_bfloat16>(eps), typed_ptr<float>(sigma), n,
+                                          to_stream(stream));
+    }, py::arg("x"), py::arg("a"), py::arg("eps"), py::arg("sigma"), py::arg("n"), py::arg("stream") = 0);
+#endif
+
     // G6.7: residual += (x + bias) * gate. Replaces add_bias + gate_mul_residual chain.
     m.def("bias_gate_mul_residual_bf16",
           [](uintptr_t residual, uintptr_t x, uintptr_t bias, uintptr_t gate,
@@ -1301,8 +1315,8 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
             reinterpret_cast<uint8_t*>(sf_out), rows, half, to_stream(stream));
     }, py::arg("merged"), py::arg("fp4_out"), py::arg("sf_out"), py::arg("rows"), py::arg("half"),
        py::arg("stream") = 0);
-
 #endif
+
     m.def("quantize_bf16_to_nvfp4_swizzled_v2", [](uintptr_t input, uintptr_t fp4_data,
                                                    uintptr_t scale_factors, int rows, int cols,
                                                    uintptr_t stream) {
@@ -7322,6 +7336,18 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("x"), py::arg("w_out"), py::arg("b_out"), py::arg("action"), py::arg("noise"),
        py::arg("trace_x") = 0, py::arg("trace_delta") = 0, py::arg("rows") = 0, py::arg("pdl") = true,
        py::arg("stream") = 0);
+    m.def("pi05_dec_skinny_action_out_residual_sde", [](uintptr_t x, uintptr_t w_out, uintptr_t b_out, uintptr_t action,
+                                                   uintptr_t noise, uintptr_t trace_x, uintptr_t trace_delta,
+                                                   uintptr_t eps, uintptr_t sigma, int rows, bool pdl,
+                                                   uintptr_t stream) {
+        return flash_rt::pi05_dec_skinny::action_out_residual_sde(
+            typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(w_out), typed_ptr<__nv_bfloat16>(b_out),
+            typed_ptr<__nv_bfloat16>(action), typed_ptr<__nv_bfloat16>(noise), typed_ptr<__nv_bfloat16>(trace_x),
+            typed_ptr<__nv_bfloat16>(trace_delta), typed_ptr<__nv_bfloat16>(eps), typed_ptr<float>(sigma), rows,
+            pdl, to_stream(stream));
+    }, py::arg("x"), py::arg("w_out"), py::arg("b_out"), py::arg("action"), py::arg("noise"),
+       py::arg("trace_x"), py::arg("trace_delta"), py::arg("eps"), py::arg("sigma"), py::arg("rows"),
+       py::arg("pdl") = true, py::arg("stream") = 0);
 #endif  // FLASHRT_PI05_DECODER_SKINNY_SM120
 
 #ifdef ENABLE_DECODE_GEMV_M1
