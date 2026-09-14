@@ -99,6 +99,9 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  decoder_fused_geglu_swap: bool = False,
                  decoder_attn_splitkv: bool = False,
                  decoder_attn_mqa: bool = False,
+                 decoder_phase_cta: int = 0,
+                 decoder_fused_geglu_earlyb: int = 0,
+                 decoder_weight_evict_first: int = 0,
                  decoder_seq: bool = False,
                  decoder_rowops_quant: bool = True,
                  decoder_seq_variant: int = 0,
@@ -212,6 +215,12 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                                          and self.decoder_fused_geglu)
         self.decoder_attn_splitkv = bool(decoder_attn_splitkv)
         self.decoder_attn_mqa = bool(decoder_attn_mqa)
+        self.decoder_phase_cta = int(decoder_phase_cta)
+        self.decoder_fused_geglu_earlyb = int(decoder_fused_geglu_earlyb)
+        self.decoder_weight_evict_first = int(decoder_weight_evict_first)
+        if self.decoder_weight_evict_first and hasattr(fvk_fp4, 'set_weight_evict_first'):
+            fvk_fp4.set_weight_evict_first(1)
+        self._decoder_phase_counters = None
         self.decoder_seq = bool(decoder_seq)
         self.decoder_rowops_quant = bool(decoder_rowops_quant)
         self.decoder_seq_variant = int(decoder_seq_variant)
@@ -414,6 +423,14 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         return (int(self._decoder_seq_counter.data_ptr()), int(self._decoder_seq_gu_dummy.data_ptr()),
                 int(self._decoder_seq_partials.data_ptr()), int(self._decoder_seq_slot_packed.data_ptr()),
                 int(self._decoder_seq_slot_sfa.data_ptr()))
+
+    def _decoder_phase_counters_ptr(self) -> int:
+        """Arrival/done counters for the phase-CTA GEMM launches (zeroed once)."""
+        if not self.decoder_phase_cta:
+            return 0
+        if self._decoder_phase_counters is None:
+            self._decoder_phase_counters = torch.zeros(64, dtype=torch.int32, device="cuda")
+        return int(self._decoder_phase_counters.data_ptr())
 
     def _decoder_attn_ws_ptr(self) -> int:
         """Workspace for the fused decoder attention kernels (0 when disabled)."""
@@ -1428,6 +1445,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                 'ctx_fp4': self._decoder_fp4_ctx.packed.data_ptr(),
                 'ctx_sfa': self._decoder_fp4_ctx.sfa.data_ptr(),
                 'attn_ws': self._decoder_attn_ws_ptr(),
+                'phase_counters': self._decoder_phase_counters_ptr(),
                 'seq_counter': self._decoder_seq_ptrs()[0],
                 'seq_gu_dummy': self._decoder_seq_ptrs()[1],
                 'seq_partials': self._decoder_seq_ptrs()[2],
@@ -1500,6 +1518,8 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
             ae_dims['fused_geglu_swap'] = self.decoder_fused_geglu_swap
             ae_dims['attn_splitkv'] = self.decoder_attn_splitkv
             ae_dims['attn_mqa'] = self.decoder_attn_mqa
+            ae_dims['phase_cta'] = self.decoder_phase_cta
+            ae_dims['fused_geglu_earlyb'] = self.decoder_fused_geglu_earlyb
             ae_dims['dec_seq'] = self.decoder_seq
             ae_dims['dec_rowops_quant'] = self.decoder_rowops_quant
             ae_dims['dec_seq_variant'] = self.decoder_seq_variant

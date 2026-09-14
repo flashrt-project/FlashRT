@@ -289,6 +289,7 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
     fused_geglu = bool(dims.get('fused_geglu')) and weight_format == 'nvfp4'
     fused_geglu_nod = bool(dims.get('fused_geglu_nod')) and fused_geglu
     fused_geglu_swap = bool(dims.get('fused_geglu_swap')) and fused_geglu
+    fused_geglu_earlyb = int(dims.get('fused_geglu_earlyb') or 0) if fused_geglu else 0
     act_e0m3 = act_format == 'e0m3'
     attn_splitkv = (bool(dims.get('attn_splitkv')) and not fixed_shape
                     and not act_e0m3)
@@ -302,6 +303,12 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
     # (GeGLU) -> down -> AdaRMS -> next qkv (weights streamed continuously).
     dec_seq = (bool(dims.get('dec_seq')) and fused_geglu and not act_e0m3
                and weight_format == 'nvfp4')
+    dec_phase = (bool(dims.get('phase_cta')) and not fixed_shape and not act_e0m3
+                 and not dec_seq)
+    phase_npc = 0 if int(dims.get('phase_cta') or 0) == 2 else (S + 1) // 2 * 2
+    phase_counters = bufs.get('phase_counters', 0)
+    if dec_phase and not phase_counters:
+        raise RuntimeError("Pi0.5 Thor decoder phase_cta requires bufs['phase_counters']")
     seq_counter = bufs.get('seq_counter', 0)
     seq_gu_dummy = bufs.get('seq_gu_dummy', 0)
     seq_partials = bufs.get('seq_partials', 0)
@@ -526,21 +533,33 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
                         f"Pi0.5 decoder FP4 sequence grid {grid} does not "
                         f"match {seq_slots} activation slots")
                 continue
-            rc = dec_gemm(
-                variant_o, ctx_fp4, ctx_sfa,
-                weights['ow_fp4'][l], weights['ow_sfb'][l], fg,
-                S, D, NH * HD, 1.0, 0.0, stream)
-            if rc != 0:
-                raise RuntimeError(
-                    f"Pi0.5 decoder FP4 O layer {l} failed rc={rc}")
-
-            if act_e0m3:
-                fvk_fp4.pi05_gate_res_adarms_e0m3_sfa_fp16(
-                    fg, gate, x, sf_ptr, xn_fp4, xn_sfa, gate, S, D, rht,
-                    stream)
+            if dec_phase:
+                # O GEMM whose launch also carries the gated residual + AdaRMS
+                # + quantize (extra CTAs run it once the GEMM CTAs stored), so
+                # gate_up launches at this kernel's trigger.
+                rc = fvk_fp4.cutlass_fp4_gemm_phase(
+                    ctx_fp4, ctx_sfa, weights['ow_fp4'][l], weights['ow_sfb'][l], fg,
+                    S, D, NH * HD, 1.0, 0.0, stream, phase_counters, 1, phase_npc,
+                    (fg, gate, x, sf_ptr, xn_fp4, xn_sfa, gate, S, D))
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 O+phase layer {l} failed rc={rc}")
             else:
-                fvk_fp4.pi05_gate_res_adarms_fp4_sfa_native_fp16(
-                    fg, gate, x, sf_ptr, xn_fp4, xn_sfa, gate, S, D, stream)
+                rc = dec_gemm(
+                    variant_o, ctx_fp4, ctx_sfa,
+                    weights['ow_fp4'][l], weights['ow_sfb'][l], fg,
+                    S, D, NH * HD, 1.0, 0.0, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 O layer {l} failed rc={rc}")
+
+                if act_e0m3:
+                    fvk_fp4.pi05_gate_res_adarms_e0m3_sfa_fp16(
+                        fg, gate, x, sf_ptr, xn_fp4, xn_sfa, gate, S, D, rht,
+                        stream)
+                else:
+                    fvk_fp4.pi05_gate_res_adarms_fp4_sfa_native_fp16(
+                        fg, gate, x, sf_ptr, xn_fp4, xn_sfa, gate, S, D, stream)
             if fused_geglu and not act_e0m3:
                 # One interleaved GeGLU GEMM: the epilogue computes
                 # gelu(gate)*up per column pair and writes the Down input
@@ -552,11 +571,19 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
                 if fused_geglu_swap:
                     # Operand-swapped 2-SM form with the early weight stream.
                     geglu_v10 = fvk_fp4.cutlass_fp4_gemm_geglu_il_hw_nod_swap
-                rc = geglu_v10(
-                    xn_fp4, xn_sfa,
-                    weights['gwil_fp4'][l], weights['gwil_sfb'][l],
-                    weights['gu_dummy'], hid_fp4, hid_sfa,
-                    S, H * 2, D, stream)
+                if fused_geglu_earlyb and fused_geglu_nod and not fused_geglu_swap:
+                    # v10 tile with the weight k-tiles streamed before the PDL wait.
+                    rc = fvk_fp4.cutlass_fp4_gemm_geglu_il_hw_nod_v10_earlyb(
+                        xn_fp4, xn_sfa,
+                        weights['gwil_fp4'][l], weights['gwil_sfb'][l],
+                        weights['gu_dummy'], hid_fp4, hid_sfa,
+                        S, H * 2, D, stream, fused_geglu_earlyb)
+                else:
+                    rc = geglu_v10(
+                        xn_fp4, xn_sfa,
+                        weights['gwil_fp4'][l], weights['gwil_sfb'][l],
+                        weights['gu_dummy'], hid_fp4, hid_sfa,
+                        S, H * 2, D, stream)
                 if rc != 0:
                     raise RuntimeError(
                         f"Pi0.5 decoder fused GeGLU layer {l} failed "
@@ -580,27 +607,44 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
                 if rc != 0:
                     raise RuntimeError(
                         f"Pi0.5 decoder FP4 GeGLU layer {l} failed rc={rc}")
-            rc = dec_gemm(
-                variant_down, hid_fp4, hid_sfa,
-                weights['dw_fp4'][l], weights['dw_sfb'][l], fg,
-                S, D, H, 1.0, 0.0, stream)
-            if rc != 0:
-                raise RuntimeError(
-                    f"Pi0.5 decoder FP4 down layer {l} failed rc={rc}")
-
-            if l < layers - 1:
-                si_next = (s * layers + l + 1) * S * D3
-                sa_next_ptr = sa + si_next * 2
-                if act_e0m3:
-                    fvk_fp4.pi05_gate_res_adarms_e0m3_sfa_fp16(
-                        fg, gate, x, sa_next_ptr,
-                        xn_fp4, xn_sfa, gate, S, D, rht, stream)
+            if dec_phase:
+                # down GEMM + (next layer's) gated residual + AdaRMS + quantize
+                # in one launch; the last layer carries the plain gated residual.
+                if l < layers - 1:
+                    si_next = (s * layers + l + 1) * S * D3
+                    sa_next_ptr = sa + si_next * 2
+                    ph = (1, (fg, gate, x, sa_next_ptr, xn_fp4, xn_sfa, gate, S, D))
                 else:
-                    fvk_fp4.pi05_gate_res_adarms_fp4_sfa_native_fp16(
-                        fg, gate, x, sa_next_ptr,
-                        xn_fp4, xn_sfa, gate, S, D, stream)
+                    ph = (2, (fg, gate, x, 0, 0, 0, 0, S, D))
+                rc = fvk_fp4.cutlass_fp4_gemm_phase(
+                    hid_fp4, hid_sfa, weights['dw_fp4'][l], weights['dw_sfb'][l], fg,
+                    S, D, H, 1.0, 0.0, stream, phase_counters + 16, ph[0], phase_npc,
+                    ph[1])
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 down+phase layer {l} failed rc={rc}")
             else:
-                fvk.gate_res_fp16(fg, gate, x, S * D, stream)
+                rc = dec_gemm(
+                    variant_down, hid_fp4, hid_sfa,
+                    weights['dw_fp4'][l], weights['dw_sfb'][l], fg,
+                    S, D, H, 1.0, 0.0, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 down layer {l} failed rc={rc}")
+
+                if l < layers - 1:
+                    si_next = (s * layers + l + 1) * S * D3
+                    sa_next_ptr = sa + si_next * 2
+                    if act_e0m3:
+                        fvk_fp4.pi05_gate_res_adarms_e0m3_sfa_fp16(
+                            fg, gate, x, sa_next_ptr,
+                            xn_fp4, xn_sfa, gate, S, D, rht, stream)
+                    else:
+                        fvk_fp4.pi05_gate_res_adarms_fp4_sfa_native_fp16(
+                            fg, gate, x, sa_next_ptr,
+                            xn_fp4, xn_sfa, gate, S, D, stream)
+                else:
+                    fvk.gate_res_fp16(fg, gate, x, S * D, stream)
 
         fi = s * S * D3
         fs_ptr = fs + fi * 2

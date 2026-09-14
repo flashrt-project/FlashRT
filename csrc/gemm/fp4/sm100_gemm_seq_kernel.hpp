@@ -7,6 +7,7 @@
 //  barrier, fused elementwise phases) can be developed inside this copy.
 // ============================================================================
 #pragma once
+#include "gemm/fp4/sm100_gemm_phase_cta.hpp"
 #include "gemm/fp4/sm100_blockscaled_mma_earlyb.hpp"
 
 
@@ -195,6 +196,7 @@ public:
     EpilogueArguments epilogue{};
     KernelHardwareInfo hw_info{};
     TileSchedulerArguments scheduler{};
+    flash_rt::fp4::PhaseCtaParams phase{};
   };
 
   // Kernel device entry point API
@@ -205,6 +207,7 @@ public:
     EpilogueParams epilogue{};
     TileSchedulerParams scheduler{};
     KernelHardwareInfo hw_info{}; 
+    flash_rt::fp4::PhaseCtaParams phase{};
   };
 
   enum class WarpCategory : int32_t {
@@ -270,6 +273,7 @@ public:
         args.hw_info, args.scheduler, scheduler_workspace
       )
       ,args.hw_info
+      ,args.phase
     };
   }
 
@@ -358,6 +362,15 @@ public:
   // Computes the kernel launch grid shape based on runtime parameters
   static dim3
   get_grid_shape(Params const& params) {
+    dim3 g = get_grid_shape_gemm(params);
+    // The static scheduler's linear CTA index is blockIdx.x + blockIdx.y * gridDim.x (x = cluster width):
+    // append the phase CTAs as whole rows so the GEMM CTAs keep linear ids [0, num_gemm_ctas).
+    if (params.phase.kind != 0) g.y += (params.phase.num_phase_ctas + g.x - 1) / g.x;
+    return g;
+  }
+
+  static dim3
+  get_grid_shape_gemm(Params const& params) {
     // NOTE cluster_shape here is the major cluster shape, not fallback one
     auto cluster_shape = cutlass::detail::select_cluster_shape(ClusterShape{}, params.hw_info.cluster_shape);
 
@@ -403,6 +416,16 @@ public:
     bool is_mma_leader_cta = cta_coord_v == 0;
     constexpr bool has_mma_peer_cta = size(AtomThrShapeMNK{}) == 2;
     [[maybe_unused]] uint32_t mma_peer_cta_rank = has_mma_peer_cta ? cta_rank_in_cluster ^ 1 : cta_rank_in_cluster;
+
+    // FlashRT phase CTAs: the clusters appended to the grid never touch the GEMM state.
+    const int phase_cta_linear = static_cast<int>(blockIdx.x + blockIdx.y * gridDim.x);
+    if (params.phase.kind != 0 && params.phase.num_phase_ctas > 0) {
+      const int cta_linear = phase_cta_linear;
+      if (cta_linear >= params.phase.num_gemm_ctas) {
+        flash_rt::fp4::phase_cta_run(params.phase, cta_linear - params.phase.num_gemm_ctas, smem_buf);
+        return;
+      }
+    }
 
     // Kernel level shared memory storage
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
@@ -926,6 +949,15 @@ public:
           epi_load_pipeline, epi_load_pipe_consumer_state,
           epi_store_pipeline, epi_store_pipe_producer_state,
           CtaShape_MNK{});
+      }
+      if (params.phase.kind != 0) {
+        const int epi_thread = static_cast<int>(threadIdx.x) - static_cast<int>(MaxThreadsPerBlock - NumEpilogueThreads);
+        if (params.phase.num_phase_ctas == 0) {
+          flash_rt::fp4::phase_in_gemm(params.phase, phase_cta_linear, epi_thread, NumEpilogueThreads,
+                                       reinterpret_cast<char*>(&shared_storage.tensors.epilogue));
+        } else {
+          flash_rt::fp4::phase_gemm_arrive(params.phase, epi_thread == 0, NumEpilogueThreads, 1);   // user barrier 1
+        }
       }
     }
 

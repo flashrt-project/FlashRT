@@ -77,6 +77,17 @@ int cutlass_fp4_gemm_geglu_il_hw_nod_v10(
 
 // Operand-swapped form (weights as the A operand, 2-SM tile, early weight
 // stream); same argument order and the same compact outputs, byte for byte.
+// v10 tile + compact store with the weight k-tiles streamed before the PDL wait
+// (EarlyB fork; early_stages in {3, 5, 7}); same bytes as ..._hw_nod_v10.
+int cutlass_fp4_gemm_geglu_il_hw_nod_v10_earlyb(
+    void const* A_packed, void const* SFA,
+    void const* B_packed, void const* SFB,
+    void*       D_dummy,
+    void*       compact_packed,
+    void*       compact_sfa,
+    int M, int N_il, int K,
+    cudaStream_t stream, int early_stages);
+
 int cutlass_fp4_gemm_geglu_il_hw_nod_swap(
     void const* A_packed, void const* SFA,
     void const* B_packed, void const* SFB,

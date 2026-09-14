@@ -38,6 +38,18 @@ struct MainloopSm100TmaUmmaWarpSpecializedBlockScaledEarlyB {
 }}  // namespace cutlass::gemm
 
 namespace cutlass::gemm::collective {
+// FlashRT: L2 cache hint for the weight operand's TMA loads; converts to the SM90 or SM100
+// hint enum depending on which TMA copy traits the configuration instantiates.
+struct flashrt_tma_hint {
+  bool evict_first;
+  CUTLASS_DEVICE operator cute::TMA::CacheHintSm90() const {
+    return evict_first ? cute::TMA::CacheHintSm90::EVICT_FIRST : cute::TMA::CacheHintSm90::EVICT_NORMAL;
+  }
+  CUTLASS_DEVICE operator cute::TMA::CacheHintSm100() const {
+    return evict_first ? cute::TMA::CacheHintSm100::EVICT_FIRST : cute::TMA::CacheHintSm100::EVICT_NORMAL;
+  }
+};
+
 using namespace cute;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -386,6 +398,7 @@ struct CollectiveMma<
     LayoutSFB layout_SFB{};
     RuntimeDataTypeA runtime_data_type_a{};
     RuntimeDataTypeB runtime_data_type_b{};
+    int weight_evict_first{0};   // FlashRT: EVICT_FIRST cache hint on the weight (early) operand's TMA loads
   };
 
   // Device side kernel params
@@ -447,6 +460,7 @@ struct CollectiveMma<
     dim3 cluster_shape_fallback;
     RuntimeDataTypeA runtime_data_type_a;
     RuntimeDataTypeB runtime_data_type_b;
+    int weight_evict_first;
   };
 
   CUTLASS_DEVICE
@@ -456,7 +470,8 @@ struct CollectiveMma<
     , layout_SFA_(params.layout_SFA)
     , layout_SFB_(params.layout_SFB)
     , runtime_data_type_a_(params.runtime_data_type_a)
-    , runtime_data_type_b_(params.runtime_data_type_b) {
+    , runtime_data_type_b_(params.runtime_data_type_b)
+    , weight_evict_first_(params.weight_evict_first) {
     if constexpr (IsDynamicCluster) {
       const bool is_fallback_cluster = (cute::size<0>(cluster_shape_) == params.cluster_shape_fallback.x &&
                                         cute::size<1>(cluster_shape_) == params.cluster_shape_fallback.y);
@@ -580,7 +595,8 @@ struct CollectiveMma<
       args.layout_SFB,
       hw_info.cluster_shape_fallback,
       args.runtime_data_type_a,
-      args.runtime_data_type_b
+      args.runtime_data_type_b,
+      args.weight_evict_first
     };
   }
 
@@ -911,6 +927,12 @@ struct CollectiveMma<
 
     auto barrier_token = mainloop_pipeline.producer_try_acquire(mainloop_pipe_producer_state);
 
+    // FlashRT: the weight (early) operand streams through L2 once per step; EVICT_FIRST keeps the
+    // KV cache and activations resident instead.
+    // (converts to whichever cache-hint enum the TMA copy traits of this configuration take)
+    const flashrt_tma_hint hint_a{DispatchPolicy::EarlyA ? (weight_evict_first_ != 0) : false};
+    const flashrt_tma_hint hint_b{DispatchPolicy::EarlyA ? false : (weight_evict_first_ != 0)};
+
     // ---- FlashRT: weights first. B / SFB do not depend on the previous grid,
     // so stream them for the first stages before the grid-dependency wait.
     using BarrierType = typename MainloopPipeline::ProducerBarrierType;
@@ -929,11 +951,11 @@ struct CollectiveMma<
       barrier_token = mainloop_pipeline.producer_try_acquire(mainloop_pipe_producer_state);
       if (cute::elect_one_sync()) {
         if constexpr (DispatchPolicy::EarlyA) {
-          copy(observed_tma_load_a_->with(*pre_barrier[i], mcast_mask_a), tAgA(_,*k_tile_iter_b), tAsA(_,pre_stage[i]));
-          copy(observed_tma_load_sfa_->with(*pre_barrier[i], mcast_mask_sfa), tAgSFA(_,*k_tile_iter_b), tAsSFA(_,pre_stage[i]));
+          copy(observed_tma_load_a_->with(*pre_barrier[i], mcast_mask_a, hint_a), tAgA(_,*k_tile_iter_b), tAsA(_,pre_stage[i]));
+          copy(observed_tma_load_sfa_->with(*pre_barrier[i], mcast_mask_sfa, hint_a), tAgSFA(_,*k_tile_iter_b), tAsSFA(_,pre_stage[i]));
         } else {
-          copy(observed_tma_load_b_->with(*pre_barrier[i], mcast_mask_b), tBgB(_,*k_tile_iter_b), tBsB(_,pre_stage[i]));
-          copy(observed_tma_load_sfb_->with(*pre_barrier[i], mcast_mask_sfb), tBgSFB(_,*k_tile_iter_b), tBsSFB(_,pre_stage[i]));
+          copy(observed_tma_load_b_->with(*pre_barrier[i], mcast_mask_b, hint_b), tBgB(_,*k_tile_iter_b), tBsB(_,pre_stage[i]));
+          copy(observed_tma_load_sfb_->with(*pre_barrier[i], mcast_mask_sfb, hint_b), tBgSFB(_,*k_tile_iter_b), tBsSFB(_,pre_stage[i]));
         }
       }
       ++k_tile_iter_b;
@@ -942,11 +964,11 @@ struct CollectiveMma<
     for (int i = 0; i < pre; ++i) {
       if (cute::elect_one_sync()) {
         if constexpr (DispatchPolicy::EarlyA) {
-          copy(observed_tma_load_b_->with(*pre_barrier[i], mcast_mask_b), tBgB(_,*k_tile_iter), tBsB(_,pre_stage[i]));
-          copy(observed_tma_load_sfb_->with(*pre_barrier[i], mcast_mask_sfb), tBgSFB(_,*k_tile_iter), tBsSFB(_,pre_stage[i]));
+          copy(observed_tma_load_b_->with(*pre_barrier[i], mcast_mask_b, hint_b), tBgB(_,*k_tile_iter), tBsB(_,pre_stage[i]));
+          copy(observed_tma_load_sfb_->with(*pre_barrier[i], mcast_mask_sfb, hint_b), tBgSFB(_,*k_tile_iter), tBsSFB(_,pre_stage[i]));
         } else {
-          copy(observed_tma_load_a_->with(*pre_barrier[i], mcast_mask_a), tAgA(_,*k_tile_iter), tAsA(_,pre_stage[i]));
-          copy(observed_tma_load_sfa_->with(*pre_barrier[i], mcast_mask_sfa), tAgSFA(_,*k_tile_iter), tAsSFA(_,pre_stage[i]));
+          copy(observed_tma_load_a_->with(*pre_barrier[i], mcast_mask_a, hint_a), tAgA(_,*k_tile_iter), tAsA(_,pre_stage[i]));
+          copy(observed_tma_load_sfa_->with(*pre_barrier[i], mcast_mask_sfa, hint_a), tAgSFA(_,*k_tile_iter), tAsSFA(_,pre_stage[i]));
         }
       }
       --k_tile_count;
@@ -968,10 +990,10 @@ struct CollectiveMma<
       barrier_token = mainloop_pipeline.producer_try_acquire(mainloop_pipe_producer_state);
 
       if (cute::elect_one_sync()) {
-        copy(observed_tma_load_a_->with(*tma_barrier, mcast_mask_a), tAgA(_,*k_tile_iter), tAsA(_,write_stage));
-        copy(observed_tma_load_b_->with(*tma_barrier, mcast_mask_b), tBgB(_,*k_tile_iter), tBsB(_,write_stage));
-        copy(observed_tma_load_sfa_->with(*tma_barrier, mcast_mask_sfa), tAgSFA(_,*k_tile_iter), tAsSFA(_,write_stage));
-        copy(observed_tma_load_sfb_->with(*tma_barrier, mcast_mask_sfb), tBgSFB(_,*k_tile_iter), tBsSFB(_,write_stage));
+        copy(observed_tma_load_a_->with(*tma_barrier, mcast_mask_a, hint_a), tAgA(_,*k_tile_iter), tAsA(_,write_stage));
+        copy(observed_tma_load_b_->with(*tma_barrier, mcast_mask_b, hint_b), tBgB(_,*k_tile_iter), tBsB(_,write_stage));
+        copy(observed_tma_load_sfa_->with(*tma_barrier, mcast_mask_sfa, hint_a), tAgSFA(_,*k_tile_iter), tAsSFA(_,write_stage));
+        copy(observed_tma_load_sfb_->with(*tma_barrier, mcast_mask_sfb, hint_b), tBgSFB(_,*k_tile_iter), tBsSFB(_,write_stage));
       }
 
       --k_tile_count;
@@ -1156,6 +1178,8 @@ struct CollectiveMma<
 protected:
 
   typename Params::TMA_A const* observed_tma_load_a_{nullptr};
+
+  int weight_evict_first_ = 0;
   typename Params::TMA_B const* observed_tma_load_b_{nullptr};
   typename Params::TMA_SFA const* observed_tma_load_sfa_{nullptr};
   typename Params::TMA_SFB const* observed_tma_load_sfb_{nullptr};

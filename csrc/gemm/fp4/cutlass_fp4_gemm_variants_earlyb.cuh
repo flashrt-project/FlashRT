@@ -4,6 +4,8 @@
 #undef CUTLASS_ENABLE_GDC_FOR_SM100
 #include "fused_fp4/pdl.cuh"
 #include <utility>
+#include <cstdlib>
+#include <cstdio>
 #include <type_traits>
 #include "cutlass/kernel_hardware_info.hpp"
 #include "cutlass/cutlass.h"
@@ -19,6 +21,8 @@
 #include "cute/tensor.hpp"
 #include "gemm/fp4/sm100_blockscaled_mma_earlyb.hpp"
 #include "gemm/fp4/sm100_gemm_seq_kernel.hpp"
+#include "gemm/fp4/sm100_gemm_phase_cta.hpp"
+#include "gemm/fp4/fp4_runtime_knobs.cuh"
 
 namespace flash_rt {
 namespace fp4 {
@@ -84,6 +88,20 @@ struct Variant {
 
   static int run(void const* A, void const* SFA, void const* B, void const* SFB,
                  void* D, int M, int N, int K, float alpha, float beta, cudaStream_t stream) {
+    return run_impl(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream, nullptr);
+  }
+  // Forked kernel + static scheduler only: appends the phase CTAs to the grid and
+  // sizes the persistent grid to one tile per cluster (the static scheduler
+  // strides by gridDim, so no cluster may own more than one tile).
+  static int run_phase(void const* A, void const* SFA, void const* B, void const* SFB,
+                       void* D, int M, int N, int K, float alpha, float beta, cudaStream_t stream,
+                       PhaseCtaParams const& phase) {
+    static_assert(Seq && !std::is_void_v<Sched>, "run_phase needs the forked kernel with the static scheduler");
+    return run_impl(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream, &phase);
+  }
+  static int run_impl(void const* A, void const* SFA, void const* B, void const* SFB,
+                      void* D, int M, int N, int K, float alpha, float beta, cudaStream_t stream,
+                      PhaseCtaParams const* phase) {
     if constexpr (Swapped) { std::swap(A, B); std::swap(SFA, SFB); std::swap(M, N); }
     auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
     auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
@@ -99,6 +117,7 @@ struct Variant {
           reinterpret_cast<SA const*>(SFA), layout_SFA, reinterpret_cast<SB const*>(SFB), layout_SFB },
         { {alpha, beta}, reinterpret_cast<ElementC*>(D), stride_C, reinterpret_cast<ElementD*>(D), stride_D }
     };
+    args.mainloop.weight_evict_first = get_weight_evict_first();
     if constexpr (!std::is_void_v<Sched>) {
       // The static persistent scheduler sizes its grid from hw_info (the CLC scheduler queries the device itself).
       static int sm_count = 0;
@@ -121,6 +140,19 @@ struct Variant {
         }
       }
       args.hw_info.sm_count = sm_count;
+    }
+    if constexpr (Seq && !std::is_void_v<Sched>) {
+      if (phase != nullptr) {
+        args.phase = *phase;
+        args.hw_info.sm_count = phase->num_gemm_ctas;   // one tile per cluster
+      }
+      if (phase != nullptr && std::getenv("FLASHRT_PHASE_DEBUG")) {
+        auto params = GemmKernel::to_underlying_arguments(args, nullptr);
+        const dim3 g = GemmKernel::get_grid_shape(params);
+        const dim3 gg = GemmKernel::get_grid_shape_gemm(params);
+        std::fprintf(stderr, "[phase] grid (%u,%u,%u) gemm grid (%u,%u,%u) num_gemm_ctas %d num_phase_ctas %d kind %d dbg %d smem %d\n",
+                     g.x, g.y, g.z, gg.x, gg.y, gg.z, phase->num_gemm_ctas, phase->num_phase_ctas, phase->kind, phase->dbg, GemmKernel::SharedStorageSize);
+      }
     }
     Gemm gemm;
     auto st = gemm.can_implement(args);

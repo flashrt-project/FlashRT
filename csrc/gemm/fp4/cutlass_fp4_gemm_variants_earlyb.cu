@@ -6,6 +6,9 @@
 
 namespace flash_rt {
 namespace fp4 {
+namespace { int g_weight_evict_first = 0; }
+void set_weight_evict_first(int on) { g_weight_evict_first = on ? 1 : 0; }
+int get_weight_evict_first() { return g_weight_evict_first; }
 namespace variants_earlyb {
 using namespace cute;
 

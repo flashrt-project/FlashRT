@@ -39,6 +39,8 @@
 #include "fused_fp4/attn_mqa_s16_fp4out.cuh"
 #include "fused_fp4/attn_mqa_fused_fp4out.cuh"
 #include "gemm/fp4/cutlass_fp4_gemm_seq_sm100.cuh"
+#include "gemm/fp4/cutlass_fp4_gemm_phase_sm100.cuh"
+#include "gemm/fp4/fp4_runtime_knobs.cuh"
 #include "fused_fp4/pdl.cuh"
 #include "gemm/fp4/cutlass_fp4_gemm_siglip_ffn_variants_sm100.cuh"
 #include "quantize/reshape_scales_sfa.cuh"
@@ -429,6 +431,37 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
         "Fused decoder MQA attention (S<=16 rows, one KV head, HD=256, fp16): RoPE of the fresh q/k rows, "
         "KV-cache append, QK^T/softmax/PV over the whole cache (16 key splits merged in-kernel) and the NVFP4 "
         "quantize of the context rows, in one launch.");
+  m.def("set_weight_evict_first", [](int on) { flash_rt::fp4::set_weight_evict_first(on); }, py::arg("on"),
+        "EVICT_FIRST cache hint on the weight operand of the forked NVFP4 decoder GEMMs (set before graph capture).");
+  m.def("get_weight_evict_first", []() { return flash_rt::fp4::get_weight_evict_first(); });
+  m.def("cutlass_fp4_gemm_phase",
+        [](uintptr_t A, uintptr_t SFA, uintptr_t B, uintptr_t SFB, uintptr_t D, int M, int N, int K,
+           float alpha, float beta, uintptr_t stream, uintptr_t counter, int kind, int num_phase_ctas,
+           const std::tuple<uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, int, int>& ph, int dbg) -> int {
+          flash_rt::fp4::PhaseHostArgs p;
+          p.kind = kind;
+          p.num_phase_ctas = num_phase_ctas;
+          p.counter = reinterpret_cast<void*>(counter);
+          // Same order as pi05_gate_res_adarms_fp4_sfa_native_fp16(fg, gate, x, style, packed, sfa, gate_out, S, D).
+          p.x = reinterpret_cast<const void*>(std::get<0>(ph));
+          p.prev_gate = reinterpret_cast<const void*>(std::get<1>(ph));
+          p.residual = reinterpret_cast<void*>(std::get<2>(ph));
+          p.style = reinterpret_cast<const void*>(std::get<3>(ph));
+          p.packed = reinterpret_cast<void*>(std::get<4>(ph));
+          p.sfa = reinterpret_cast<void*>(std::get<5>(ph));
+          p.gate_out = reinterpret_cast<void*>(std::get<6>(ph));
+          p.S = std::get<7>(ph);
+          p.D = std::get<8>(ph);
+          p.dbg = dbg;
+          return flash_rt::fp4::cutlass_fp4_gemm_phase(
+              reinterpret_cast<void const*>(A), reinterpret_cast<void const*>(SFA),
+              reinterpret_cast<void const*>(B), reinterpret_cast<void const*>(SFB), reinterpret_cast<void*>(D),
+              M, N, K, alpha, beta, reinterpret_cast<cudaStream_t>(stream), p);
+        },
+        py::arg("A"), py::arg("SFA"), py::arg("B"), py::arg("SFB"), py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("alpha"), py::arg("beta"), py::arg("stream"), py::arg("counter"), py::arg("kind"), py::arg("num_phase_ctas"), py::arg("phase"), py::arg("dbg") = 0,
+        "Decoder NVFP4 GEMM (variant 28 configuration) whose launch also carries the element-wise phase "
+        "(kind 1: gated residual + AdaRMS + NVFP4 quantize) run by extra CTAs once every GEMM CTA has stored.");
   m.def("cutlass_fp4_gemm_seq",
         [](const std::vector<std::tuple<uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, int, int, int, float, float>>& probs,
            uintptr_t counter, uintptr_t stream, int variant, int flags,
@@ -1285,6 +1318,45 @@ pointer).  Same contract as cutlass_fp4_gemm_geglu_il_hw otherwise.
         py::arg("D_dummy"), py::arg("compact_packed"), py::arg("compact_sfa"),
         py::arg("M"), py::arg("N_il"), py::arg("K"),
         py::arg("stream") = 0,
+        R"pbdoc(
+Skinny-M no-D-store fused GeGLU GEMM on the decoder tile (128x64x256);
+same contract as cutlass_fp4_gemm_geglu_il_hw_nod.
+)pbdoc");
+
+  m.def("cutlass_fp4_gemm_geglu_il_hw_nod_v10_earlyb",
+        [](uintptr_t A_packed, uintptr_t SFA,
+           uintptr_t B_packed, uintptr_t SFB,
+           uintptr_t D_dummy, uintptr_t compact_packed, uintptr_t compact_sfa,
+           int M, int N_il, int K, uintptr_t stream, int early_stages) -> int {
+          const auto shape = fp4_kernel_shape({{"M", M}, {"N_il", N_il}, {"K", K}});
+          require_fp4_ptrs("cutlass_fp4_gemm_geglu_il_hw_nod_v10_earlyb",
+                           {{"A_packed", A_packed}, {"SFA", SFA},
+                            {"B_packed", B_packed}, {"SFB", SFB},
+                            {"D_dummy", D_dummy},
+                            {"compact_packed", compact_packed},
+                            {"compact_sfa", compact_sfa}}, shape);
+          require_fp4(M > 0 && N_il > 0 && K > 0 && (N_il % 32) == 0 &&
+                      (K % 16) == 0,
+                      "cutlass_fp4_gemm_geglu_il_hw_nod_v10_earlyb",
+                      "M must be positive, N_il a positive multiple of 32 "
+                      "and K a positive multiple of 16",
+                      shape);
+          return flash_rt::fp4::cutlass_fp4_gemm_geglu_il_hw_nod_v10_earlyb(
+              reinterpret_cast<void const*>(A_packed),
+              reinterpret_cast<void const*>(SFA),
+              reinterpret_cast<void const*>(B_packed),
+              reinterpret_cast<void const*>(SFB),
+              reinterpret_cast<void*>(D_dummy),
+              reinterpret_cast<void*>(compact_packed),
+              reinterpret_cast<void*>(compact_sfa),
+              M, N_il, K,
+              reinterpret_cast<cudaStream_t>(stream), early_stages);
+        },
+        py::arg("A_packed"), py::arg("SFA"),
+        py::arg("B_packed"), py::arg("SFB"),
+        py::arg("D_dummy"), py::arg("compact_packed"), py::arg("compact_sfa"),
+        py::arg("M"), py::arg("N_il"), py::arg("K"),
+        py::arg("stream") = 0, py::arg("early_stages") = 3,
         R"pbdoc(
 Skinny-M no-D-store fused GeGLU GEMM on the decoder tile (128x64x256);
 same contract as cutlass_fp4_gemm_geglu_il_hw_nod.
