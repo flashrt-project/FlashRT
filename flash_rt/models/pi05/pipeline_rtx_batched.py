@@ -302,7 +302,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
     #   Public API: per-sample language-embed upload
     # ══════════════════════════════════════════════════════════════════
 
-    def set_language_embeds_batch(self, embeds_np_list) -> None:
+    def set_language_embeds_batch(self, embeds_np_list, slots=None) -> None:
         """Store per-sample language embeddings.
 
         Args:
@@ -310,6 +310,10 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 of shape ``(prompt_len, ENC_D)`` with 2-byte BF16
                 elements. All entries must share the same prompt_len
                 so the encoder can run on a fixed-shape buffer.
+            slots: optional list of sample indices to upload; the other
+                samples keep their stored rows, which must already exist
+                with the same prompt_len (same-size prompt rotation in
+                a fleet). ``None`` uploads every sample.
         """
         if len(embeds_np_list) != self.B:
             raise ValueError(
@@ -329,8 +333,22 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 f"prompt_len {prompt_len} exceeds max_prompt_len "
                 f"{self.max_prompt_len}")
         import numpy as np
-        for b, e in enumerate(embeds_np_list):
-            arr = np.ascontiguousarray(e)
+        if slots is not None:
+            slots = sorted(set(int(b) for b in slots))
+            if slots and not (0 <= slots[0] and slots[-1] < self.B):
+                raise ValueError(f"slots must lie in [0, {self.B})")
+            for b in range(self.B):
+                if b in slots:
+                    continue
+                kept = self._lang_embeds_buf_b2[b]
+                if kept is None or kept.nbytes != embeds_np_list[b].nbytes:
+                    raise ValueError(
+                        f"sample {b} is not being uploaded but has no stored "
+                        "rows of this size; pass slots=None")
+        else:
+            slots = list(range(self.B))
+        for b in slots:
+            arr = np.ascontiguousarray(embeds_np_list[b])
             old = self._lang_embeds_buf_b2[b]
             if old is not None and old.nbytes == arr.nbytes:
                 old.upload(arr)

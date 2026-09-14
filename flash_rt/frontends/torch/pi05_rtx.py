@@ -367,43 +367,79 @@ def convert_pi05_safetensors(safetensors_path, sink=None) -> dict:
     return ckpt
 
 
-def _embed_prompt(prompt_text: str, embedding_weight: torch.Tensor,
-                  max_len: int = 48, state=None) -> tuple[torch.Tensor, int]:
-    """Tokenise + embed via PaliGemma embedding table (CUDA, bf16)."""
-    # PaliGemma tokenizer resolution — see
-    # `flash_rt.utils.paligemma_tokenizer` for the search order and
-    # the download instructions emitted on failure.
+_TOKENIZERS: dict = {}
+
+
+def _get_tokenizer(max_len: int):
+    """Tokenizer instance, built once per process.
+
+    Returns ``("openpi", PaligemmaTokenizer)`` when openpi is importable
+    and its tokenizer can be constructed, else ``("sp", SentencePiece)``
+    through the FlashRT locator. Building either re-reads the 4 MiB
+    SentencePiece model from disk (~40 ms), which used to be paid on
+    every prompt change, per prompt.
+    """
+    key = ("openpi", int(max_len))
+    tok = _TOKENIZERS.get(key)
+    if tok is not None:
+        return tok
     try:
         # Preferred: openpi's PaligemmaTokenizer (exact same vocab,
         # same prompt prefix logic FlashRT was built against).
         from openpi.models.tokenizer import PaligemmaTokenizer
-        tokenizer = PaligemmaTokenizer(max_len=max_len)
-        tokens_np, mask_np = tokenizer.tokenize(prompt_text, state=state)
-        prompt_len = int(mask_np.sum())
-        token_ids = torch.tensor(
-            tokens_np[:prompt_len], dtype=torch.long, device="cuda")
+        tok = ("openpi", PaligemmaTokenizer(max_len=max_len))
+        _TOKENIZERS[key] = tok
+        return tok
     except (ImportError, FileNotFoundError, OSError, RuntimeError):
+        pass
+    tok = _TOKENIZERS.get(("sp",))
+    if tok is None:
         # Fallback: locate the SentencePiece model directly via the
         # FlashRT helper (clear error if not found — never silent
         # segfault).
         from flash_rt.utils.paligemma_tokenizer import (
             load_paligemma_sentencepiece,
         )
-        sp = load_paligemma_sentencepiece()
-        if state is None:
-            # Same normalization as openpi's PaligemmaTokenizer (strip,
-            # "_" and "\n" become spaces) so both tokenizer paths yield
-            # the same ids; matters for RL prompts that carry a "\n"
-            # before the advantage tag. 108 is PaliGemma's `\n` token,
-            # used by openpi as the prompt-end separator before the
-            # action prefix.
-            from flash_rt.utils.paligemma_tokenizer import encode_pi05_prompt
-            tokens = encode_pi05_prompt(sp, prompt_text)
-        else:
-            tokens = sp.Encode(format_pi05_prompt(prompt_text, state),
-                               add_bos=True)
-        token_ids = torch.tensor(tokens, dtype=torch.long, device="cuda")
-        prompt_len = len(token_ids)
+        tok = ("sp", load_paligemma_sentencepiece())
+        _TOKENIZERS[("sp",)] = tok
+    return tok
+
+
+def _prompt_token_ids(prompt_text: str, max_len: int = 48, state=None) -> list:
+    """Token ids for a prompt (host side), via the cached tokenizer."""
+    kind, tok = _get_tokenizer(max_len)
+    if kind == "openpi":
+        try:
+            tokens_np, mask_np = tok.tokenize(prompt_text, state=state)
+            prompt_len = int(mask_np.sum())
+            return [int(t) for t in tokens_np[:prompt_len]]
+        except (FileNotFoundError, OSError, RuntimeError):
+            _TOKENIZERS.pop(("openpi", int(max_len)), None)
+            kind, tok = _get_tokenizer(max_len)
+            if kind == "openpi":
+                raise
+    sp = tok
+    if state is None:
+        # Same normalization as openpi's PaligemmaTokenizer (strip,
+        # "_" and "\n" become spaces) so both tokenizer paths yield
+        # the same ids; matters for RL prompts that carry a "\n"
+        # before the advantage tag. 108 is PaliGemma's `\n` token,
+        # used by openpi as the prompt-end separator before the
+        # action prefix.
+        from flash_rt.utils.paligemma_tokenizer import encode_pi05_prompt
+        return encode_pi05_prompt(sp, prompt_text)
+    return list(sp.Encode(format_pi05_prompt(prompt_text, state), add_bos=True))
+
+
+def _embed_prompt(prompt_text: str, embedding_weight: torch.Tensor,
+                  max_len: int = 48, state=None) -> tuple[torch.Tensor, int]:
+    """Tokenise + embed via PaliGemma embedding table (CUDA, bf16)."""
+    # PaliGemma tokenizer resolution — see
+    # `flash_rt.utils.paligemma_tokenizer` for the search order and
+    # the download instructions emitted on failure.
+    tokens = _prompt_token_ids(prompt_text, max_len=max_len, state=state)
+    token_ids = torch.tensor(tokens, dtype=torch.long, device="cuda")
+    prompt_len = len(tokens)
 
     if embedding_weight.device.type != "cuda":
         embedding_weight = embedding_weight.to(device="cuda")
@@ -411,6 +447,45 @@ def _embed_prompt(prompt_text: str, embedding_weight: torch.Tensor,
     embeds = F.embedding(token_ids, embedding_weight)
     embeds = embeds * float(embeds.shape[-1] ** 0.5)
     return embeds, prompt_len
+
+
+class _PromptEmbedCache:
+    """Per-frontend cache of prompt embeddings (device bf16 rows + the
+    host uint16 copy the pipelines upload), keyed by prompt text, state
+    and max length. A fleet cycles through a few dozen task strings;
+    without the cache every episode boundary re-tokenised, re-embedded
+    and synchronised every slot of the batch. Cleared on weight reload
+    (the embedding table changes)."""
+
+    def __init__(self, capacity: int = 512):
+        self._d: dict = {}
+        self._cap = int(capacity)
+
+    @staticmethod
+    def key(prompt_text: str, max_len: int, state):
+        st = None
+        if state is not None:
+            st = np.asarray(state, dtype=np.float32).tobytes()
+        return (str(prompt_text), int(max_len), st)
+
+    def get(self, key):
+        v = self._d.get(key)
+        if v is not None:
+            # move to the back: least recently used is evicted first
+            self._d.pop(key)
+            self._d[key] = v
+        return v
+
+    def put(self, key, value) -> None:
+        if len(self._d) >= self._cap:
+            self._d.pop(next(iter(self._d)))
+        self._d[key] = value
+
+    def clear(self) -> None:
+        self._d.clear()
+
+    def __len__(self) -> int:
+        return len(self._d)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -941,8 +1016,9 @@ class Pi05TorchFrontendRtx:
 
     def _live_pipelines(self) -> list:
         seen: dict[int, object] = {}
+        parked = [c.get("pipeline") for c in getattr(self, "_batch_ctx", {}).values()]
         for pipe in [self.pipeline, getattr(self, "_fixed_pipeline", None),
-                     *getattr(self, "_prompt_pipeline_cache", {}).values()]:
+                     *getattr(self, "_prompt_pipeline_cache", {}).values(), *parked]:
             if pipe is not None:
                 seen[id(pipe)] = pipe
         return list(seen.values())
@@ -1046,6 +1122,10 @@ class Pi05TorchFrontendRtx:
             pipe._upload_precomputed_styles()
         torch.cuda.synchronize(); phases["styles"] = time.perf_counter() - t0 - sum(phases.values())
         # Prompt embeddings come from the (now updated) embedding table.
+        cache = getattr(self, "_prompt_embed_cache", None)
+        if cache is not None:
+            cache.clear()
+        self._batch_prompt_texts = None
         call = getattr(self, "_last_prompt_call", None)
         if call is not None:
             if call[0] == "single":
@@ -1388,6 +1468,24 @@ class Pi05TorchFrontendRtx:
             "RL mode enabled: cfg_beta=%.2f, advantage_positive=%s",
             new_config["cfg_beta"], new_config["advantage_positive"])
 
+    def _embed_prompt_cached(self, prompt_text: str, max_len: int, state=None):
+        """``(embeds_bf16_cuda, prompt_len, host_uint16)`` for a prompt, from
+        the per-frontend cache when seen before (see :class:`_PromptEmbedCache`)."""
+        cache = getattr(self, "_prompt_embed_cache", None)
+        if cache is None:
+            cache = self._prompt_embed_cache = _PromptEmbedCache()
+        key = _PromptEmbedCache.key(prompt_text, max_len, state)
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        embeds, prompt_len = _embed_prompt(
+            prompt_text, self.embedding_weight, max_len=max_len, state=state)
+        embeds = embeds.contiguous()
+        host = np.ascontiguousarray(embeds.view(torch.uint16).cpu().numpy())
+        hit = (embeds, int(prompt_len), host)
+        cache.put(key, hit)
+        return hit
+
     @serialized
     def set_prompt(self, prompt_text: str, state=None) -> None:
         """Tokenise prompt + (re)build the pipeline for the exact prompt length.
@@ -1410,8 +1508,8 @@ class Pi05TorchFrontendRtx:
 
         max_len = (PI05_STATE_PROMPT_MAX_LEN if state is not None
                    else MAX_PROMPT_LEN_DEFAULT)
-        embeds, prompt_len = _embed_prompt(
-            prompt_text, self.embedding_weight, max_len=max_len, state=state)
+        embeds, prompt_len, embeds_np = self._embed_prompt_cached(
+            prompt_text, max_len, state=state)
         self._last_prompt_len = int(prompt_len)
 
         if self._state_prompt_mode == "fixed" and state is not None:
@@ -1429,7 +1527,6 @@ class Pi05TorchFrontendRtx:
 
         # Upload language embeds into pipeline's encoder_x slot. In fixed mode
         # set_language_embeds pads to max + updates the seqused/devpos buffers.
-        embeds_np = embeds.contiguous().view(torch.uint16).cpu().numpy()
         self.pipeline.set_language_embeds(embeds_np)
         self._frame_count = 0
         logger.info("Set prompt: '%s' (%d tokens, state=%s, mode=%s)",
@@ -2175,6 +2272,71 @@ class Pi05TorchFrontendRtx:
             "Pi05TorchFrontendRtx: batched mode enabled (B=%d)",
             self._batch_size)
 
+    # Per-width state of a batched pipeline (everything set_batched_mode,
+    # set_prompt_batch and calibrate_batch touch); the weights are shared.
+    _BATCH_CTX_ATTRS = (
+        "attn_backend", "pipeline", "current_prompt_len", "graph_recorded",
+        "calibrated", "_batched_active", "_batch_size", "_img_buf_b2",
+        "_noise_buf_b2", "_noise_out_b2", "_batch_prompt_texts", "_batch_prompt_lens",
+        "_last_prompt_call", "_graph_torch_stream")
+
+    @property
+    def batch_sizes(self) -> tuple:
+        """Widths that have a batched pipeline: the active one and the parked ones."""
+        out = set(getattr(self, "_batch_ctx", {}).keys())
+        if getattr(self, "_batched_active", False):
+            out.add(int(self._batch_size))
+        return tuple(sorted(out))
+
+    def select_batch_size(self, batch_size: int) -> None:
+        """Make the batched pipeline of width ``batch_size`` the active one.
+
+        Several batched pipelines can live in one frontend. They share every
+        weight buffer (BF16, FP8 and NVFP4 copies, decoder styles); each has
+        its own attention backend, staging tensors, prompts, FP8 activation
+        scales and captured graph. The first call for a new width parks the
+        current one and enables batched mode for the new width, after which
+        :meth:`set_prompt_batch` and :meth:`calibrate_batch` build it as
+        usual; later calls swap the active width in O(1). A fleet server
+        runs the smallest width that fits the pending requests instead of
+        padding every call to the largest.
+
+        Weights reloaded while a width was parked are already in place when
+        it comes back (the buffers are shared and :meth:`reload_weights`
+        refreshes every live pipeline's styles); its prompts are re-embedded
+        from the new embedding table on the swap.
+        """
+        bs = int(batch_size)
+        if bs < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        active = getattr(self, "_batched_active", False)
+        cur = int(self._batch_size) if active else None
+        if cur == bs:
+            return
+        ctxs = self.__dict__.setdefault("_batch_ctx", {})
+        if cur is not None:
+            saved = {a: getattr(self, a, None) for a in self._BATCH_CTX_ATTRS}
+            saved["_weight_version"] = self.weight_version
+            ctxs[cur] = saved
+        if bs in ctxs:
+            saved = ctxs.pop(bs)
+            version = saved.pop("_weight_version")
+            for a, v in saved.items():
+                setattr(self, a, v)
+            call = self._last_prompt_call
+            if version != self.weight_version and call is not None and call[0] == "batch":
+                self._batch_prompt_texts = None
+                self.set_prompt_batch(list(call[1]))
+            return
+        # New width: a fresh backend, staging tensors and (on the next
+        # set_prompt_batch) pipeline. Parked widths keep theirs.
+        self.attn_backend = None
+        self.pipeline = None
+        self._last_prompt_call = None
+        self._batch_prompt_texts = None
+        self._batched_active = False
+        self.set_batched_mode(enable=True, batch_size=bs)
+
     @serialized
     def set_prompt_batch(self, prompts: list) -> None:
         """Set per-sample prompts for the batched pipeline.
@@ -2194,25 +2356,20 @@ class Pi05TorchFrontendRtx:
                 f"set_prompt_batch expects {self._batch_size} prompts, "
                 f"got {len(prompts)}")
         self._last_prompt_call = ("batch", tuple(prompts))
-        embeds_list = []
-        prompt_lens = []
-        for p in prompts:
-            e, plen = _embed_prompt(p, self.embedding_weight,
-                                    max_len=MAX_PROMPT_LEN_DEFAULT)
-            embeds_list.append(e)
-            prompt_lens.append(plen)
+        entries = [self._embed_prompt_cached(p, MAX_PROMPT_LEN_DEFAULT)
+                   for p in prompts]
+        prompt_lens = [e[1] for e in entries]
         target_len = max(prompt_lens)
         self._batch_prompt_lens = tuple(prompt_lens)
 
         # Pad each embed to target_len (BF16 zeros are valid pad tokens).
         padded_np_list = []
-        for e, plen in zip(embeds_list, prompt_lens):
-            arr = e.contiguous().view(torch.uint16).cpu().numpy()
+        for (_, plen, arr) in entries:
             if plen < target_len:
                 pad = np.zeros(
                     (target_len - plen, arr.shape[1]), dtype=arr.dtype)
-                arr = np.concatenate([arr, pad], axis=0)
-            padded_np_list.append(np.ascontiguousarray(arr))
+                arr = np.ascontiguousarray(np.concatenate([arr, pad], axis=0))
+            padded_np_list.append(arr)
 
         rebuild = (
             self.pipeline is None
@@ -2236,9 +2393,20 @@ class Pi05TorchFrontendRtx:
                 denoise_trace=self._denoise_trace,
                 prefix_export=self._prefix_features,
                 **self._pipeline_precision_kwargs())
-        # B=1 pipeline path is what calibrate_fp8 uses for FP8 scale collection.
-        self.pipeline.set_language_embeds(padded_np_list[0])
-        self.pipeline.set_language_embeds_batch(padded_np_list)
+        # Only the slots whose prompt changed are uploaded again (same
+        # padded length, so the device rows are the same size); a fleet
+        # whose tasks rotate at episode boundaries pays for the slots
+        # that actually changed.
+        prev = None if rebuild else getattr(self, "_batch_prompt_texts", None)
+        if prev is None or len(prev) != len(prompts):
+            slots = list(range(self._batch_size))
+        else:
+            slots = [b for b in range(self._batch_size) if prev[b] != prompts[b]]
+        if rebuild or 0 in slots:
+            # B=1 pipeline path is what calibrate_fp8 uses for FP8 scale collection.
+            self.pipeline.set_language_embeds(padded_np_list[0])
+        self.pipeline.set_language_embeds_batch(padded_np_list, slots=slots)
+        self._batch_prompt_texts = tuple(prompts)
         self._frame_count = 0
         logger.info(
             "Set batch prompt (B=%d, padded_len=%d): %s",

@@ -355,6 +355,42 @@ per-environment throughput is not individual request latency. The CFG batched pi
 still requires B = 2 (conditioned and unconditioned slots) and
 `set_rl_mode` refuses a wider backend.
 
+### Prompt rotation and several batched widths (fleet serving)
+
+Prompt embeddings are cached per frontend (text, state, max length) and
+the tokenizer is built once per process, so a fleet whose tasks rotate
+at episode boundaries pays nothing for `set_prompt_batch` beyond the
+device rows of the slots that actually changed (`set_language_embeds_batch(...,
+slots=[...])`); the cache is dropped on `reload_weights` because the
+embedding table changes. Before this every rotation re-read the 4 MiB
+SentencePiece model and re-embedded every slot: with two tasks
+alternating across 8 environments the batched actor cost 10.4 ms per
+environment instead of 8.0; now 8.1 ms with 1, 2 or 8 distinct prompts
+(`tests/test_pi05_prompt_cache.py`: rotated prompts bit-identical to a
+cold re-embedding, rotation under 20 ms).
+
+```python
+rt.set_batched_mode(enable=True, batch_size=8)
+rt.set_prompt_batch(prompts_8); rt.calibrate_batch([obs])
+rt.select_batch_size(2)                        # parks width 8, enables width 2
+rt.set_prompt_batch(prompts_2); rt.calibrate_batch([obs])
+rt.select_batch_size(8)                        # O(1) swap back; rt.batch_sizes == (2, 8)
+```
+
+`select_batch_size` keeps several batched pipelines in one frontend.
+They share every weight buffer (BF16, FP8 and NVFP4 copies, decoder
+styles: `reload_weights` reaches the parked ones too); each has its own
+attention backend, staging tensors, prompts, FP8 activation scales and
+captured graph, about 0.2–0.4 s and well under a GiB per extra width. A
+request-level batcher then runs the smallest width that fits the pending
+requests: one robot's request costs the width-1 graph (14 ms) instead of
+the width-8 one (63 ms). Measured through physis's batcher on RTX 5090
+with widths 1/2/4/8 (real frames, 4 ms batching deadline): 1 robot 20 ms
+per request, 2 robots 28 ms, 4 robots 42 ms, 8 robots 80–89 ms at the
+99th percentile with control periods of 100–250 ms; with the single
+width 8 the same fleet stayed at 63 ms for one robot and only 4 robots
+met a 100 ms budget (`tests/test_pi05_batched_widths.py`).
+
 ### Prefix hidden-state export
 
 ```python
@@ -422,6 +458,8 @@ INT8 modes are not supported.
 | `tests/test_pi05_decoder_skinny.py` | skinny FP8 decoder family (sm_120a): GEMM vs FP32, consumers bit-identical to the kernels they replace, attention vs torch, frontend vs the library decoder plus 300 bit-identical replays, batched vs batched |
 | `tests/test_pi05_weight_reload.py` | in-place weight reload vs a fresh build (BF16 and FP8), no re-capture, batched pipeline, mapping source, restore |
 | `tests/test_pi05_prefix_nvfp4.py` | NVFP4 prefix tier: fused GeGLU quantizer bit-identical to the unfused pair, tier vs FP8, batched, reload |
+| `tests/test_pi05_prompt_cache.py` | prompt embedding cache: LRU and tokenizer helpers (host), rotated batch prompts bit-identical to a cold re-embedding and cheap, single-prompt switch, reload drops the cache |
+| `tests/test_pi05_batched_widths.py` | several batched widths in one frontend: width 2 next to width 4 (shared weights, cosine 0.999 per slot), exact swap back, reload reaches the parked width |
 | `tests/test_rl_cfg_inference.py` | RTX serial + batched CFG, all βs, validation gates |
 | `tests/test_thor_rl_cfg_inference.py --backends torch,jax` | Thor serial CFG: validation, β=1.0 collapse, β=1.5 finite |
 | `tests/test_cfg_correctness_oracle.py` | per-step C1–C5 contract (RTX) vs frozen reference |
