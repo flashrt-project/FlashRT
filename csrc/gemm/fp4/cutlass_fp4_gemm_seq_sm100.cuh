@@ -21,12 +21,19 @@ struct SeqGemmDesc {
   // GeGLU gate_up problem: B holds the interleaved gate/up weights (N = N_il); the epilogue
   // writes the compact NVFP4 hidden (M x N/2) + SFA instead of D (D must still point at a
   // (M x N) fp16 scratch the descriptor can describe).
-  int geglu = 0;
+  int geglu = 0;                      // epilogue mode: 0 pass-through, 1 GeGLU compact store, 2 gated residual + ssq partials
   void* compact_packed = nullptr; void* compact_sfa = nullptr;
+  // mode 2: D must be the residual buffer (M x N fp16 row-major); gate rows come from the previous style block.
+  const void* res_in = nullptr; const void* gate_in = nullptr; long res_pitch = 0; long gate_pitch = 0; void* partials = nullptr;
+  // B / SFB point at the base of per-cluster activation slots (batch index = cluster id).
+  int b_private = 0; int b_slots = 0;
+  // phase after this problem: 0 none, 1 gate_res_adarms (rows over CTAs, two sync points), 2 gate_res, 3 private adarms
   int phase = 0;
   const void* ph_prev_gate = nullptr; void* ph_residual = nullptr; const void* ph_style = nullptr;
   void* ph_packed = nullptr; void* ph_sfa = nullptr; void* ph_gate = nullptr;
   int ph_S = 0; int ph_D = 0;
+  const void* ph_partials = nullptr; void* ph_slot_packed = nullptr; void* ph_slot_sfa = nullptr;
+  long ph_slot_packed_pitch = 0; long ph_slot_sfa_pitch = 0;
 };
 
 // Runs the n problems (n <= kSeqMaxProblems) in one persistent launch. `counter`

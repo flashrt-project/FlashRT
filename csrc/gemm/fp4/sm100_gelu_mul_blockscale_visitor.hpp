@@ -995,7 +995,13 @@ struct Sm100GeluMulCompactBlockScaleFactorColStoreOrPass {
     NormalConstStrideMNL norm_constant_stride = {};
     uint8_t* compact_ptr = nullptr;     // packed e2m1 [M_act, N_il/2] row-major
     uint8_t* compact_sf_ptr = nullptr;  // UE4M3 SFA tile-atom layout on (M_act, N_il/2)
-    int mode = 0;                       // 0: pass-through fp16 store, 1: GeGLU compact store
+    int mode = 0;                       // 0: pass-through fp16 store, 1: GeGLU compact store, 2: gated residual + row ssq partials
+    // mode 2: D = x_new = half(x + half(acc) * gate); partials[n*32 + (m0>>7)*4 + warp] = sum of value^2 over the warp's rows.
+    const cutlass::half_t* res_in = nullptr;    // (M_act, res_pitch) residual (read; D must point at the same buffer)
+    const cutlass::half_t* gate_in = nullptr;   // gate section of the previous AdaRMS style rows
+    long res_pitch = 0;
+    long gate_pitch = 0;
+    float* partials = nullptr;                  // (M_act, 32)
   };
 
   using Params = Arguments;
@@ -1013,6 +1019,7 @@ struct Sm100GeluMulCompactBlockScaleFactorColStoreOrPass {
     auto problem_shape_MNKL = append<4>(problem_shape, 1);
     auto [M,N,K,L] = problem_shape_MNKL;
     if (args.mode == 0) return true;
+    if (args.mode == 2) return args.res_in && args.gate_in && args.partials;
     // M is the interleaved gate/up axis: whole warps of 32 rows.
     return (M % (2 * SFVecSize) == 0) && args.compact_ptr && args.compact_sf_ptr;
   }
@@ -1083,6 +1090,56 @@ struct Sm100GeluMulCompactBlockScaleFactorColStoreOrPass {
     int tile_row_off;
     int tile_col_off;
 
+    // mode 2 (O / down projections of the persistent sequence): fold the gated residual
+    // add into the store and emit per-row sum-of-squares partials for the AdaRMS that follows.
+    template <class ElementInput, int FragmentSize>
+    CUTLASS_DEVICE Array<ElementOutput, FragmentSize>
+    visit_gated_residual(Array<ElementInput, FragmentSize> const& frg_input, int epi_m, int epi_n) {
+      static_assert(FragmentSize == 32, "expects the 32-element TMEM fragment");
+      Tensor pred = tC_cD(_, _, _, epi_m, epi_n);
+      auto c0 = pred(0);
+      const int m0 = tile_row_off + static_cast<int>(get<0>(c0));
+      const int n0 = tile_col_off + static_cast<int>(get<1>(c0));
+      const unsigned lane = threadIdx.x & 31u;
+      const int lg = static_cast<int>(lane >> 2);
+      const int wrp = static_cast<int>((threadIdx.x >> 5) & 3u);      // epilogue warp 0..3
+      const unsigned full = 0xffffffffu;
+      const cutlass::half_t* __restrict__ res = params_ptr->res_in;
+      const cutlass::half_t* __restrict__ gate = params_ptr->gate_in;
+      Array<ElementOutput, FragmentSize> out;
+      CUTLASS_PRAGMA_UNROLL
+      for (int j = 0; j < 4; ++j) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int t = 0; t < 2; ++t) {
+          const int n = n0 + 8 * j + t;
+          const bool valid = n < m_act;
+          const int nn = valid ? n : 0;                       // clamp: loads stay in bounds, results masked
+          const cutlass::half_t* __restrict__ rrow = res + static_cast<long>(nn) * params_ptr->res_pitch + m0;
+          const cutlass::half_t* __restrict__ grow = gate + static_cast<long>(nn) * params_ptr->gate_pitch + m0;
+          float xo[4], gg[4];
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < 4; ++i) { xo[i] = static_cast<float>(rrow[8 * i]); gg[i] = static_cast<float>(grow[8 * i]); }
+          const float vmask = valid ? 1.f : 0.f;
+          float sq = 0.f;
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < 4; ++i) {
+            const int e = 16 * (i >> 1) + 4 * j + 2 * (i & 1) + t;
+            const float fg = static_cast<float>(cutlass::half_t(static_cast<float>(frg_input[e])));
+            const float value = (xo[i] + fg * gg[i]) * vmask;
+            out[e] = cutlass::half_t(value);
+            sq += value * value;
+          }
+          sq += __shfl_xor_sync(full, sq, 4);
+          sq += __shfl_xor_sync(full, sq, 8);
+          sq += __shfl_xor_sync(full, sq, 16);
+          if (lg == 0 && valid) {
+            params_ptr->partials[n * 32 + (m0 >> 7) * 4 + wrp] = sq;
+          }
+        }
+      }
+      return out;
+    }
+
     template <class ElementAccumulator, class ElementInput, int FragmentSize>
     CUTLASS_DEVICE auto
     visit(Array<ElementAccumulator, FragmentSize> const& frg_acc,
@@ -1100,6 +1157,9 @@ struct Sm100GeluMulCompactBlockScaleFactorColStoreOrPass {
       static_assert(FragmentSize == 32, "column compact store expects the 32-element TMEM fragment");
       if (params_ptr->mode == 0) {
         return NumericArrayConverter<ElementOutput, ElementInput, FragmentSize, RoundStyle>{}(frg_input);
+      }
+      if (params_ptr->mode == 2) {
+        return visit_gated_residual<ElementInput, FragmentSize>(frg_input, epi_m, epi_n);
       }
       Tensor pred = tC_cD(_, _, _, epi_m, epi_n);
       auto c0 = pred(0);
@@ -1237,6 +1297,11 @@ struct FusionCallbacks<
     uint8_t* compact_ptr = nullptr;
     uint8_t* compact_sf_ptr = nullptr;
     int mode = 0;
+    const cutlass::half_t* res_in = nullptr;
+    const cutlass::half_t* gate_in = nullptr;
+    long res_pitch = 0;
+    long gate_pitch = 0;
+    float* partials = nullptr;
 
     operator typename Impl::Arguments() const {
       return
@@ -1252,7 +1317,7 @@ struct FusionCallbacks<
             {}
           },
           {block_scale_factor_ptr, norm_constant_ptr, dNormConst,
-           compact_ptr, compact_sf_ptr, mode}
+           compact_ptr, compact_sf_ptr, mode, res_in, gate_in, res_pitch, gate_pitch, partials}
         };
     }
   };

@@ -302,17 +302,19 @@ Constructor keyword / bench flag pairs. Defaults are the production tier.
 | `decoder_fused_attn` / `--decoder-fused-attn` | `False` | folds the seqused mask into softmax (bit-identical, one fewer launch). Only the fixed-shape state-prompt path takes the seqused kernels, which this suite does not exercise |
 | `rowops_v2` / `--rowops-v2` | `True` | warp-per-row encoder/SigLIP norm + quantize kernels (hardware e2m1/e4m3 conversions, reduction order and tie rounding identical to the originals — bit-exact end to end) |
 | `rowops_res_epilogue` / `--rowops-res-epilogue` | `True` | with `rowops_v2`: the encoder O and Down projections accumulate into the residual stream inside the GEMM epilogue (`beta = 1`), so the following norm reads `x` once. Single rounding instead of double; worst-sample raw cosine 0.99683 vs 0.99681 |
-| `siglip_up_variant` / `--siglip-up-variant` | `2` | SigLIP Up GEMM tile: 0 = 128x256x256, 1 = 128x128x256, 2 = 128x128x128, 3 = 128x64x256 (outputs identical) |
-| `siglip_down_variant` / `--siglip-down-variant` | `0` | SigLIP Down GEMM tile; the base 128x128x256 measures best |
+| `siglip_up_variant` / `--siglip-up-variant` | `2` | SigLIP Up GEMM tile: 0 = 128x256x256, 1 = 128x128x256, 2 = 128x128x128, 3 = 128x64x256, 4–6 = 2-SM UMMA 256x128x128 / 256x256x128 / 256x128x256 (outputs identical; U4 34.1 µs vs 34.6 for v2) |
+| `siglip_down_variant` / `--siglip-down-variant` | `0` | SigLIP Down GEMM tile: 0 = 128x128x256, 1 = 128x64x256, 2 = 128x128x128, 3 = 128x256x256, 4–6 = 2-SM UMMA 256x{128,256,64}x256 (isolated: D4 22.6 µs vs 28.0 for the base) |
 | `encoder_attn_o_variant` / `--encoder-attn-o-variant` | `1` | NVFP4 encoder attention-O projection GEMM variant |
 | `decoder_qkv_variant`, `decoder_o_variant`, `decoder_down_variant` | `28` | decoder projection GEMM variants (bench flags of the same names). `28` = operand-swapped 2-SM tile with three weight k-tiles streamed before the PDL wait (§8.3); `10` = the previous 128x64x256 tile |
 | `decoder_fused_geglu_swap` / `--decoder-fused-geglu-swap` | `False` | operand-swapped fused GeGLU (column compact store, byte-identical output); faster hot but slower in the pipeline (§8.3), off |
+| `decoder_rowops_quant` / `--decoder-rowops-quant` | `True` | warp-per-row NVFP4 quantize (row kernels v2) for the decoder attention output; bit-identical, within noise end to end (the launch was already hidden by PDL) |
 | `decoder_seq` / `--decoder-seq` | `False` | persistent decoder GEMM sequence: one launch per layer for O, gate_up (GeGLU), down and the next qkv with the AdaRMS phases inside (§8.4); bit-identical, slower than the six launches, off |
 | `decoder_attn_mqa` / `--decoder-attn-mqa` | `False` | single-kernel MQA decoder attention with the split merge and NVFP4 quantize fused (`mma.sync`); numerically equivalent, slower than the cuBLAS chain on Thor (§8.3), off |
 | `pdl` / `--pdl` | `True` | programmatic dependent launch for the NVFP4 GEMMs and the activation kernels of this module (§8.2) |
 | `pdl_fvk` / `--pdl-fvk` | `False` | also PDL-launch the rope/softmax/FP8-quantize kernels and the FP8 encoder GEMM; measured within noise |
 | decoder/encoder GEMM variants `15`–`17` | opt-in | mainloop fork that streams the weight tiles before the PDL wait; helps only when a GEMM directly follows a GEMM (72-GEMM chain 0.901 → 0.837 ms/step), within noise in the pipeline |
 | decoder GEMM variants `21`–`24` | opt-in | operand-swapped tiles through the stock kernel (`cutlass_fp4_gemm_variants_swap.cu`): 128x64x256, 256x64x256 (2-SM), 128x128x256, 128x64x128 |
+| GEMM variants `35`–`38` | opt-in | 2-SM UMMA tiles 256x{128,256}x{128,256} cluster 2x1 for the large-M encoder projections (cold, Se=968: down v36 80 µs vs 105 for v8; attention-O v38 23 µs vs 25 for v1) |
 | decoder GEMM variants `25`–`32` | opt-in | operand-swapped tiles through the mainloop fork: all / 2 / 3 weight k-tiles before the PDL wait, dependents triggered from the load warp or the MMA warp (the §8.3 matrix); `28` is the default |
 | `awq_alpha` / `--awq-alpha` | `0.8` | AWQ per-channel scale exponent |
 | `encoder_down_variant`, `decoder_*_variant` | `8`, `28` | GEMM tile selection |
@@ -320,6 +322,9 @@ Constructor keyword / bench flag pairs. Defaults are the production tier.
 **Tile selection warning.** Cluster-launch GEMM variants invert between
 isolated and in-pipeline benchmarks on Thor: the isolated-best tile for
 one projection cost +2.2 ms end to end, and larger clusters +11–14 ms.
+The 2-SM UMMA tiles repeat it: encoder down v36 measures 80 µs against
+105 in isolation (cold weights, Se=968) and +1.0 ms in the pipeline;
+SigLIP down D4 22.6 vs 28.0 µs isolated and within noise end to end.
 Always A/B tiles inside the pipeline.
 
 ---
@@ -458,16 +463,25 @@ measured read peak (0.774 for the separate launches), and a full FFN
 half-layer — O, AdaRMS, gate_up with the column GeGLU store, down, AdaRMS,
 next qkv — is bit-identical to the pipeline's kernels.
 
-It does not win yet: with the phases the sequence measures 1.07 ms per
-step against 0.92 for the six launches. A phase needs two grid sync
-points (all stores visible, then all phase rows visible) and blocks the
-epilogue warps meanwhile; the probes attribute ~0.25 ms/step to the second
-point and ~0.10 to the blocked epilogue warps, the phase work itself is
-0.07. (Measurement note: a probe that skips a wait leaves the counter
-dirty and every later run silently unsynchronised — check the counter
-after each timed run.) The next form folds the gated residual add and the
-per-row sum-of-squares partials into the O/down epilogue so each CTA can
-finish the phase privately after a single sync point.
+It does not win: with the phases the sequence measures 1.07 ms per step
+against 0.92 for the six launches. A phase needs two grid sync points
+(all stores visible, then all phase rows visible) and blocks the epilogue
+warps meanwhile; the probes attribute ~0.25 ms/step to the second point
+and ~0.10 to the blocked epilogue warps, the phase work itself is 0.07.
+(Measurement note: a probe that skips a wait leaves the counter dirty and
+every later run silently unsynchronised — check the counter after each
+timed run.) The second form (`--decoder-seq` today) folds the gated
+residual add and per-row sum-of-squares partials into the O/down epilogue
+(mode 2 of the column store) and lets every cluster quantize the AdaRMS
+rows privately into its own activation slot after a single sync point;
+still bit-identical, but 1.41 ms per step: the mode-2 epilogue and the
+private phase each cost ~0.2 ms/step of exposed work on the four epilogue
+warps, which the weight prefetch across the barrier cannot hide because
+the next GEMM's MMAs wait for the phase output rather than for DRAM. Even
+the phase-free pair gate_up → down as one launch measures 1.03–1.06
+against 0.92. The lesson: on this part the epilogue warps are the serial
+resource of a persistent kernel, and the six-kernel pipeline spreads the
+same epilogue work over many CTAs in parallel with everything else.
 
 ### Approaches measured and rejected
 

@@ -304,11 +304,18 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
                and weight_format == 'nvfp4')
     seq_counter = bufs.get('seq_counter', 0)
     seq_gu_dummy = bufs.get('seq_gu_dummy', 0)
+    seq_partials = bufs.get('seq_partials', 0)
+    seq_slot_packed = bufs.get('seq_slot_packed', 0)
+    seq_slot_sfa = bufs.get('seq_slot_sfa', 0)
+    seq_slots = int(dims.get('dec_seq_slots', 10))
     seq_variant = int(dims.get("dec_seq_variant", 0))
-    if dec_seq and not (seq_counter and seq_gu_dummy):
+    # Warp-per-row NVFP4 quantize (row kernels v2) for the attention output.
+    dec_rowops_quant = bool(dims.get('dec_rowops_quant', True)) and not act_e0m3
+    if dec_seq and not (seq_counter and seq_gu_dummy and seq_partials
+                        and seq_slot_packed and seq_slot_sfa):
         raise ValueError(
-            "Pi0.5 Thor decoder dec_seq requires bufs['seq_counter'] and "
-            "bufs['seq_gu_dummy']")
+            "Pi0.5 Thor decoder dec_seq requires bufs['seq_counter'], "
+            "'seq_gu_dummy', 'seq_partials', 'seq_slot_packed', 'seq_slot_sfa']")
     if act_format not in ('nvfp4', 'e0m3'):
         raise ValueError(
             f"Pi0.5 Thor decoder FP4 unknown act_format {act_format!r}")
@@ -449,6 +456,9 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
                     rc = fvk_fp4.quantize_e0m3_dynamic_sfa_fp16_vec(
                         attn_out, ctx_fp4, ctx_sfa, S, NH * HD, False, rht,
                         stream)
+                elif dec_rowops_quant:
+                    rc = fvk_fp4.rowops_quantize_fp4_sfa_v2(
+                        attn_out, ctx_fp4, ctx_sfa, S, NH * HD, stream)
                 else:
                     rc = fvk_fp4.quantize_fp4_dynamic_sfa_fp16_vec(
                         attn_out, ctx_fp4, ctx_sfa, S, NH * HD, False, stream)
@@ -457,41 +467,64 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
                         f"Pi0.5 decoder FP4 O activation layer {l} failed "
                         f"rc={rc}")
             if dec_seq:
+                # One persistent launch: O (gated residual into x, row ssq
+                # partials) -> private AdaRMS -> gate_up (GeGLU compact store,
+                # activations from the cluster slots) -> down (gated residual)
+                # -> private AdaRMS -> next layer's qkv. The gate of each
+                # residual add is read straight from the previous AdaRMS
+                # style rows.
                 last = (l == layers - 1)
+                gate_pitch = 3 * D
+                pp = 16 * (D // 2)
+                sp = 128 * (D // 16)
+                none_ph = (0,) * 14
+                none_epi = (0,) * 8
                 probs = [
                     (ctx_fp4, ctx_sfa, weights['ow_fp4'][l],
-                     weights['ow_sfb'][l], fg, S, D, NH * HD, 1.0, 0.0),
-                    (xn_fp4, xn_sfa, weights['gwil_fp4'][l],
+                     weights['ow_sfb'][l], x, S, D, NH * HD, 1.0, 0.0),
+                    (seq_slot_packed, seq_slot_sfa, weights['gwil_fp4'][l],
                      weights['gwil_sfb'][l], seq_gu_dummy, S, H * 2, D,
                      1.0, 0.0),
                     (hid_fp4, hid_sfa, weights['dw_fp4'][l],
-                     weights['dw_sfb'][l], fg, S, D, H, 1.0, 0.0),
+                     weights['dw_sfb'][l], x, S, D, H, 1.0, 0.0),
                 ]
-                none_ph = (0, 0, 0, 0, 0, 0, 0, 0, 0)
                 phases = [
-                    (1, gate, x, sf_ptr, xn_fp4, xn_sfa, gate, S, D),
+                    (3, 0, 0, sf_ptr, 0, 0, 0, S, D, seq_partials,
+                     seq_slot_packed, seq_slot_sfa, pp, sp),
                     none_ph,
                 ]
-                geglu = [(0, 0, 0), (1, hid_fp4, hid_sfa), (0, 0, 0)]
+                epi = [
+                    (2, 0, 0, x, sa_ptr + 2 * D * 2, D, gate_pitch,
+                     seq_partials),
+                    (1, hid_fp4, hid_sfa, 0, 0, 0, 0, 0),
+                    (2, 0, 0, x, sf_ptr + 2 * D * 2, D, gate_pitch,
+                     seq_partials),
+                ]
+                bpriv = [(0, 0), (1, seq_slots), (0, 0)]
                 if not last:
                     si_next = (s * layers + l + 1) * S * D3
                     sa_next_ptr = sa + si_next * 2
                     probs.append(
-                        (xn_fp4, xn_sfa, weights['qw_fp4'][l + 1],
+                        (seq_slot_packed, seq_slot_sfa, weights['qw_fp4'][l + 1],
                          weights['qw_sfb'][l + 1], qkv, S, 2560, D, 1.0, 0.0))
                     phases.append(
-                        (1, gate, x, sa_next_ptr, xn_fp4, xn_sfa, gate, S, D))
+                        (3, 0, 0, sa_next_ptr, 0, 0, 0, S, D, seq_partials,
+                         seq_slot_packed, seq_slot_sfa, pp, sp))
                     phases.append(none_ph)
-                    geglu.append((0, 0, 0))
+                    epi.append(none_epi)
+                    bpriv.append((1, seq_slots))
                 else:
                     phases.append(none_ph)
-                rc, _ = fvk_fp4.cutlass_fp4_gemm_seq(
-                    probs, seq_counter, stream, seq_variant, 0, phases, geglu)
+                rc, grid = fvk_fp4.cutlass_fp4_gemm_seq(
+                    probs, seq_counter, stream, seq_variant, 0, phases, epi,
+                    bpriv)
                 if rc != 0:
                     raise RuntimeError(
                         f"Pi0.5 decoder FP4 sequence layer {l} failed rc={rc}")
-                if last:
-                    fvk.gate_res_fp16(fg, gate, x, S * D, stream)
+                if grid[0] * grid[1] * grid[2] != 2 * seq_slots:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 sequence grid {grid} does not "
+                        f"match {seq_slots} activation slots")
                 continue
             rc = dec_gemm(
                 variant_o, ctx_fp4, ctx_sfa,

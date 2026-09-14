@@ -57,6 +57,7 @@ PUBLIC_API_PRESET = {
     "decoder_attn_splitkv": 0,
     "decoder_attn_mqa": 0,
     "decoder_seq": 0,
+    "decoder_rowops_quant": 1,
     "decoder_seq_variant": 0,
     "rowops_v2": 1,
     "rowops_res_epilogue": 1,
@@ -206,6 +207,10 @@ def main() -> int:
         help="Persistent decoder GEMM sequence: one launch per layer for the O, "
              "gate_up (GeGLU), down and next-qkv projections with the AdaRMS "
              "phases inside and the weights streamed across the barriers")
+    parser.add_argument(
+        "--decoder-rowops-quant", type=int, choices=(0, 1), default=1,
+        help="Warp-per-row NVFP4 quantize (row kernels v2) for the decoder "
+             "attention output instead of the one-block-per-thread kernel")
     parser.add_argument("--decoder-seq-variant", type=int, default=0,
                         help="early weight-stream depth choice of the sequence kernel")
     parser.add_argument(
@@ -339,6 +344,7 @@ def main() -> int:
                 decoder_attn_splitkv=bool(args.decoder_attn_splitkv),
                 decoder_attn_mqa=bool(args.decoder_attn_mqa),
                 decoder_seq=bool(args.decoder_seq),
+                decoder_rowops_quant=bool(args.decoder_rowops_quant),
                 decoder_seq_variant=args.decoder_seq_variant,
                 rowops_v2=bool(args.rowops_v2),
                 rowops_res_epilogue=bool(args.rowops_res_epilogue),
@@ -463,6 +469,7 @@ def main() -> int:
                     "decoder_attn_splitkv": bool(args.decoder_attn_splitkv),
                     "decoder_attn_mqa": bool(args.decoder_attn_mqa),
                     "decoder_seq": bool(args.decoder_seq),
+                    "decoder_rowops_quant": bool(args.decoder_rowops_quant),
                     "decoder_seq_variant": args.decoder_seq_variant,
                     "rowops_v2": bool(args.rowops_v2),
                     "rowops_res_epilogue": bool(args.rowops_res_epilogue),
@@ -544,6 +551,7 @@ def main() -> int:
             "--decoder-attn-splitkv", str(args.decoder_attn_splitkv),
             "--decoder-attn-mqa", str(args.decoder_attn_mqa),
             "--decoder-seq", str(args.decoder_seq),
+            "--decoder-rowops-quant", str(args.decoder_rowops_quant),
             "--decoder-seq-variant", str(args.decoder_seq_variant),
             "--rowops-v2", str(args.rowops_v2),
             "--rowops-res-epilogue", str(args.rowops_res_epilogue),

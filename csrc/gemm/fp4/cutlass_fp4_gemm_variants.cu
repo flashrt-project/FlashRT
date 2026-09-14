@@ -153,6 +153,11 @@ using V9 = Variant<Shape<_128,_128,_128>, Shape<_2,_1,_1>>;  // same as V0 → s
 
 // v10: narrow N + wide K → fewer mainloop iters, same block count as v5
 using V10 = Variant<Shape<_128, _64,_256>, Shape<_1,_1,_1>>;
+// 2-SM UMMA tiles (256-row MmaTile, cluster 2x1) for the large-M encoder projections.
+using V35 = Variant<Shape<_256,_128,_128>, Shape<_2,_1,_1>>;
+using V36 = Variant<Shape<_256,_256,_128>, Shape<_2,_1,_1>>;
+using V37 = Variant<Shape<_256,_128,_256>, Shape<_2,_1,_1>>;
+using V38 = Variant<Shape<_256,_256,_256>, Shape<_2,_1,_1>>;
 
 // ── Stream-K / split-K variants for the M=10 decoder projections ───────────
 // The static scheduler gives N/64 CTAs (16 for N=1024) on a 20-SM part, so the
@@ -279,6 +284,10 @@ int cutlass_fp4_gemm_variant(int idx,
     case 12: return V12::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     case 13: return V13::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     case 14: return V14::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 35: return V35::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 36: return V36::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 37: return V37::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 38: return V38::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     case 21: case 22: case 23: case 24:
       return cutlass_fp4_gemm_variant_swap(idx - 21, A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     case 15: case 16: case 17: case 18: case 19: case 20:
@@ -325,11 +334,15 @@ const char* cutlass_fp4_gemm_variant_name(int idx) {
     case 32: return "swapped 2-SM, activations early (control), dependents triggered from the MMA warp";
     case 33: return "tile128x64x256 through the forked kernel with the static persistent scheduler";
     case 34: return "variant 28 configuration through the forked kernel with the static persistent scheduler";
+    case 35: return "tile256x128x128 cluster2x1x1 (2-SM UMMA)";
+    case 36: return "tile256x256x128 cluster2x1x1 (2-SM UMMA)";
+    case 37: return "tile256x128x256 cluster2x1x1 (2-SM UMMA)";
+    case 38: return "tile256x256x256 cluster2x1x1 (2-SM UMMA)";
     default: return "<invalid>";
   }
 }
 
-int cutlass_fp4_gemm_num_variants() { return 35; }
+int cutlass_fp4_gemm_num_variants() { return 39; }
 
 }  // namespace fp4
 }  // namespace flash_rt

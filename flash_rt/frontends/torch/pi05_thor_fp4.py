@@ -100,6 +100,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  decoder_attn_splitkv: bool = False,
                  decoder_attn_mqa: bool = False,
                  decoder_seq: bool = False,
+                 decoder_rowops_quant: bool = True,
                  decoder_seq_variant: int = 0,
                  rowops_v2: bool = True,
                  rowops_res_epilogue: bool = True,
@@ -212,9 +213,13 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         self.decoder_attn_splitkv = bool(decoder_attn_splitkv)
         self.decoder_attn_mqa = bool(decoder_attn_mqa)
         self.decoder_seq = bool(decoder_seq)
+        self.decoder_rowops_quant = bool(decoder_rowops_quant)
         self.decoder_seq_variant = int(decoder_seq_variant)
         self._decoder_seq_counter = None
         self._decoder_seq_gu_dummy = None
+        self._decoder_seq_partials = None
+        self._decoder_seq_slot_packed = None
+        self._decoder_seq_slot_sfa = None
         self.rowops_v2 = bool(rowops_v2)
         self.rowops_res_epilogue = bool(rowops_res_epilogue)
         self.encoder_attn_o_variant = int(encoder_attn_o_variant)
@@ -394,14 +399,21 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
     # -------------------------------------------------------------------
 
     def _decoder_seq_ptrs(self):
-        """(sequence counter, fp16 gate_up D scratch) for the persistent decoder sequence; (0, 0) when off."""
+        """Device buffers of the persistent decoder sequence: (counter, gate_up fp16 D scratch,
+        row ssq partials, private activation slots packed / SFA); zeros when off."""
         if not self.decoder_seq:
-            return (0, 0)
+            return (0, 0, 0, 0, 0)
         if self._decoder_seq_counter is None:
             import torch
+            slots = 10
             self._decoder_seq_counter = torch.zeros(4, dtype=torch.int32, device='cuda')
             self._decoder_seq_gu_dummy = torch.zeros(self.Sa * self.Ha * 2, dtype=torch.half, device='cuda')
-        return (int(self._decoder_seq_counter.data_ptr()), int(self._decoder_seq_gu_dummy.data_ptr()))
+            self._decoder_seq_partials = torch.zeros(self.Sa * 32, dtype=torch.float32, device='cuda')
+            self._decoder_seq_slot_packed = torch.zeros(slots * 16 * (self.Da // 2), dtype=torch.uint8, device='cuda')
+            self._decoder_seq_slot_sfa = torch.zeros(slots * 128 * (self.Da // 16), dtype=torch.uint8, device='cuda')
+        return (int(self._decoder_seq_counter.data_ptr()), int(self._decoder_seq_gu_dummy.data_ptr()),
+                int(self._decoder_seq_partials.data_ptr()), int(self._decoder_seq_slot_packed.data_ptr()),
+                int(self._decoder_seq_slot_sfa.data_ptr()))
 
     def _decoder_attn_ws_ptr(self) -> int:
         """Workspace for the fused decoder attention kernels (0 when disabled)."""
@@ -1418,6 +1430,9 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                 'attn_ws': self._decoder_attn_ws_ptr(),
                 'seq_counter': self._decoder_seq_ptrs()[0],
                 'seq_gu_dummy': self._decoder_seq_ptrs()[1],
+                'seq_partials': self._decoder_seq_ptrs()[2],
+                'seq_slot_packed': self._decoder_seq_ptrs()[3],
+                'seq_slot_sfa': self._decoder_seq_ptrs()[4],
                 'hid_fp4': self._decoder_fp4_hid.packed.data_ptr(),
                 'hid_sfa': self._decoder_fp4_hid.sfa.data_ptr(),
             })
@@ -1486,7 +1501,9 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
             ae_dims['attn_splitkv'] = self.decoder_attn_splitkv
             ae_dims['attn_mqa'] = self.decoder_attn_mqa
             ae_dims['dec_seq'] = self.decoder_seq
+            ae_dims['dec_rowops_quant'] = self.decoder_rowops_quant
             ae_dims['dec_seq_variant'] = self.decoder_seq_variant
+            ae_dims['dec_seq_slots'] = 10   # 20 resident CTAs / cluster of 2 on Thor
             if self._attn is not None:
                 # Fold the decoder seqused mask into the softmax kernel.
                 self._attn.use_fused_softmax = self.decoder_fused_attn

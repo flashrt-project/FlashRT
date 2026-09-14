@@ -105,12 +105,17 @@ static int run_seq(int n, const SeqGemmDesc* d, int* counter, cudaStream_t strea
     const int Mw = d[i].N, Nx = d[i].M, K = d[i].K;
     if ((reinterpret_cast<uintptr_t>(d[i].A) & 31) || (reinterpret_cast<uintptr_t>(d[i].B) & 31) || (K % 256) || (Mw % 256)) return -2;
     auto shape = make_shape(Mw, Nx, K, 1);
-    auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {Mw, K, 1});
-    auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {Nx, K, 1});
+    // Private activation slots: the TMA descriptors for B / SFB span b_slots batches (16-row packed
+    // slots, 128-row scale-factor slots); the problem itself stays a single batch.
+    const int Lb = d[i].b_private ? d[i].b_slots : 1;
+    if (d[i].b_private && (Lb < 1 || Lb > 64)) return -12;
+    auto shape_desc = make_shape(Mw, Nx, K, Lb);
+    auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {Mw, K, Lb});
+    auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {16, K, Lb});
     auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, {Mw, Nx, 1});
     auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, {Mw, Nx, 1});
-    auto layout_SFA = Cfg::tile_atom_to_shape_SFA(shape);
-    auto layout_SFB = Cfg::tile_atom_to_shape_SFB(shape);
+    auto layout_SFA = Cfg::tile_atom_to_shape_SFA(shape_desc);
+    auto layout_SFB = Cfg::tile_atom_to_shape_SFB(shape_desc);
     using EA = typename ElementA::DataType; using SA = typename ElementA::ScaleFactorType;
     using EB = typename ElementB::DataType; using SB = typename ElementB::ScaleFactorType;
     typename Kernel::MainloopArguments margs{
@@ -120,33 +125,54 @@ static int run_seq(int n, const SeqGemmDesc* d, int* counter, cudaStream_t strea
         {}, nullptr, stride_C, reinterpret_cast<ElementD*>(d[i].D), stride_D };
     eargs.thread.alpha = d[i].alpha;
     eargs.thread.beta = 0.f;
-    if (d[i].geglu) {
+    if (d[i].geglu == 1) {
       if ((Mw % 32) || !d[i].compact_packed || !d[i].compact_sfa) return -10;
       eargs.thread.mode = 1;
       eargs.thread.compact_ptr = static_cast<uint8_t*>(d[i].compact_packed);
       eargs.thread.compact_sf_ptr = static_cast<uint8_t*>(d[i].compact_sfa);
+    } else if (d[i].geglu == 2) {
+      if (!d[i].res_in || !d[i].gate_in || !d[i].partials || d[i].res_in != d[i].D || d[i].res_pitch != Mw) return -13;
+      eargs.thread.mode = 2;
+      eargs.thread.res_in = static_cast<const cutlass::half_t*>(d[i].res_in);
+      eargs.thread.gate_in = static_cast<const cutlass::half_t*>(d[i].gate_in);
+      eargs.thread.res_pitch = d[i].res_pitch;
+      eargs.thread.gate_pitch = d[i].gate_pitch;
+      eargs.thread.partials = static_cast<float*>(d[i].partials);
     }
-    if (!CollectiveMainloopK::can_implement(shape, margs) || !CollectiveEpilogue::can_implement(shape, eargs)) return -3;
+    if (!CollectiveMainloopK::can_implement(shape_desc, margs) || !CollectiveEpilogue::can_implement(shape, eargs)) return -3;
     params.prob[i].shape = shape;
-    params.prob[i].mainloop = CollectiveMainloopK::to_underlying_arguments(shape, margs, nullptr, hw_info);
+    params.prob[i].b_batch_mode = d[i].b_private ? 1 : 0;
+    params.prob[i].mainloop = CollectiveMainloopK::to_underlying_arguments(shape_desc, margs, nullptr, hw_info);
     params.prob[i].epilogue = CollectiveEpilogue::to_underlying_arguments(shape, eargs, nullptr);
       typename Kernel::TileSchedulerArguments sargs{};
     params.prob[i].scheduler = Kernel::TileScheduler::to_underlying_arguments(
         shape, typename Kernel::TileShape{}, typename Kernel::AtomThrShapeMNK{}, typename Kernel::ClusterShape{}, hw_info, sargs, nullptr);
     params.prob[i].phase = d[i].phase;
     if (d[i].phase != 0) {
-      if (d[i].phase != 1 || d[i].ph_D != 1024 || d[i].ph_S < 1 || d[i].ph_S > 32 || d[i].ph_S != Nx) return -6;
+      if ((d[i].phase != 1 && d[i].phase != 3) || d[i].ph_D != 1024 || d[i].ph_S < 1 || d[i].ph_S > 32 || d[i].ph_S != Nx) return -6;
       if (i + 1 == n) return -7;   // a phase must feed a following problem
       auto& pa = params.prob[i].phase_args;
-      pa.x = static_cast<const __half*>(d[i].D);
-      pa.prev_gate = static_cast<const __half*>(d[i].ph_prev_gate);
-      pa.residual = static_cast<__half*>(d[i].ph_residual);
-      pa.style = static_cast<const __half*>(d[i].ph_style);
-      pa.packed = static_cast<uint8_t*>(d[i].ph_packed);
-      pa.sfa = static_cast<uint8_t*>(d[i].ph_sfa);
-      pa.gate = static_cast<__half*>(d[i].ph_gate);
-      pa.S = d[i].ph_S; pa.D = d[i].ph_D;
-      if (!pa.prev_gate || !pa.residual || !pa.style || !pa.packed || !pa.sfa || !pa.gate) return -8;
+      if (d[i].phase == 3) {
+        if (d[i].geglu != 2 || !d[i].ph_partials || !d[i].ph_slot_packed || !d[i].ph_slot_sfa || !d[i].ph_style) return -14;
+        pa.residual = static_cast<__half*>(d[i].D);   // x_new written by this problem's epilogue
+        pa.style = static_cast<const __half*>(d[i].ph_style);
+        pa.partials = static_cast<const float*>(d[i].ph_partials);
+        pa.slot_packed = static_cast<uint8_t*>(d[i].ph_slot_packed);
+        pa.slot_sfa = static_cast<uint8_t*>(d[i].ph_slot_sfa);
+        pa.slot_packed_pitch = d[i].ph_slot_packed_pitch;
+        pa.slot_sfa_pitch = d[i].ph_slot_sfa_pitch;
+        pa.S = d[i].ph_S; pa.D = d[i].ph_D;
+      } else {
+        pa.x = static_cast<const __half*>(d[i].D);
+        pa.prev_gate = static_cast<const __half*>(d[i].ph_prev_gate);
+        pa.residual = static_cast<__half*>(d[i].ph_residual);
+        pa.style = static_cast<const __half*>(d[i].ph_style);
+        pa.packed = static_cast<uint8_t*>(d[i].ph_packed);
+        pa.sfa = static_cast<uint8_t*>(d[i].ph_sfa);
+        pa.gate = static_cast<__half*>(d[i].ph_gate);
+        pa.S = d[i].ph_S; pa.D = d[i].ph_D;
+        if (!pa.prev_gate || !pa.residual || !pa.style || !pa.packed || !pa.sfa || !pa.gate) return -8;
+      }
     }
     dim3 g = Kernel::TileScheduler::get_grid_shape(params.prob[i].scheduler, shape, typename Kernel::TileShape{},
         typename Kernel::AtomThrShapeMNK{}, typename Kernel::ClusterShape{}, hw_info);

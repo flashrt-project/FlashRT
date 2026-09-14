@@ -31,9 +31,9 @@ using ElementCompute = float;
 using ArchTag = cutlass::arch::Sm100;
 using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
 constexpr int SFVecSize = 16;
-using ClusterShape = Shape<_1, _1, _1>;
+using DefaultClusterShape = Shape<_1, _1, _1>;
 
-template <class MmaTileShape>
+template <class MmaTileShape, class ClusterShape = Shape<_1, _1, _1>>
 struct Up {
   using ElementD = cutlass::float_e2m1_t;
   using ElementC = ElementD;
@@ -95,7 +95,7 @@ struct Up {
   }
 };
 
-template <class MmaTileShape>
+template <class MmaTileShape, class ClusterShape = Shape<_1, _1, _1>>
 struct Down {
   using ElementD = cutlass::half_t;
   using ElementC = cutlass::half_t;
@@ -150,10 +150,16 @@ using U0 = Up<Shape<_128, _256, _256>>;   // base
 using U1 = Up<Shape<_128, _128, _256>>;
 using U2 = Up<Shape<_128, _128, _128>>;
 using U3 = Up<Shape<_128, _64, _256>>;
+using U4 = Up<Shape<_256, _128, _128>, Shape<_2, _1, _1>>;   // 2-SM UMMA
+using U5 = Up<Shape<_256, _256, _128>, Shape<_2, _1, _1>>;
+using U6 = Up<Shape<_256, _128, _256>, Shape<_2, _1, _1>>;
 using D0 = Down<Shape<_128, _128, _256>>;  // base
 using D1 = Down<Shape<_128, _64, _256>>;
 using D2 = Down<Shape<_128, _128, _128>>;
 using D3 = Down<Shape<_128, _256, _256>>;
+using D4 = Down<Shape<_256, _128, _256>, Shape<_2, _1, _1>>;   // 2-SM UMMA
+using D5 = Down<Shape<_256, _256, _256>, Shape<_2, _1, _1>>;
+using D6 = Down<Shape<_256, _64, _256>, Shape<_2, _1, _1>>;
 }  // namespace siglip_ffn_v
 
 int cutlass_fp4_gemm_bias_gelu_fp4out_v(int idx, void const* A, void const* SFA, void const* B, void const* SFB,
@@ -164,6 +170,9 @@ int cutlass_fp4_gemm_bias_gelu_fp4out_v(int idx, void const* A, void const* SFA,
     case 1: return U1::run(A, SFA, B, SFB, bias, D, SFD, M, N, K, s);
     case 2: return U2::run(A, SFA, B, SFB, bias, D, SFD, M, N, K, s);
     case 3: return U3::run(A, SFA, B, SFB, bias, D, SFD, M, N, K, s);
+    case 4: return U4::run(A, SFA, B, SFB, bias, D, SFD, M, N, K, s);
+    case 5: return U5::run(A, SFA, B, SFB, bias, D, SFD, M, N, K, s);
+    case 6: return U6::run(A, SFA, B, SFB, bias, D, SFD, M, N, K, s);
     default: return -99;
   }
 }
@@ -175,6 +184,9 @@ int cutlass_fp4_gemm_bias_res_fp16_v(int idx, void const* A, void const* SFA, vo
     case 1: return D1::run(A, SFA, B, SFB, bias, C, D, M, N, K, s);
     case 2: return D2::run(A, SFA, B, SFB, bias, C, D, M, N, K, s);
     case 3: return D3::run(A, SFA, B, SFB, bias, C, D, M, N, K, s);
+    case 4: return D4::run(A, SFA, B, SFB, bias, C, D, M, N, K, s);
+    case 5: return D5::run(A, SFA, B, SFB, bias, C, D, M, N, K, s);
+    case 6: return D6::run(A, SFA, B, SFB, bias, C, D, M, N, K, s);
     default: return -99;
   }
 }

@@ -135,7 +135,7 @@ public:
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
   // Elementwise phase run by the epilogue warps after the barrier that closes a problem.
-  enum PhaseKind : int { kPhaseNone = 0, kPhaseGateResAdarms = 1, kPhaseGateRes = 2 };
+  enum PhaseKind : int { kPhaseNone = 0, kPhaseGateResAdarms = 1, kPhaseGateRes = 2, kPhasePrivateAdarms = 3 };
 
   struct Problem {
     ProblemShape shape{};
@@ -144,6 +144,7 @@ public:
     TileSchedulerParams scheduler{};
     int phase = kPhaseNone;
     SeqPhaseArgs phase_args{};
+    int b_batch_mode = 0;      // 1: B / SFB come from this cluster's slot (batch index = cluster id)
   };
 
   struct Params {
@@ -160,13 +161,17 @@ public:
 
   enum class WarpCategory : int32_t { MMA = 0, Sched = 1, MainloopLoad = 2, EpilogueLoad = 3, Epilogue = 4 };
 
-  // Named barrier among the epilogue threads (phase-internal syncs).
+  // Named barrier among the epilogue threads (phase-internal syncs) and the load-warp hand-off.
   static constexpr int kEpilogueSyncBarrierId = 9;
+  static constexpr int kPhaseBarrierId = 8;
 
   // Sync points before problem p may load its activations: one per closed problem, two when it ran a phase.
   static CUTLASS_DEVICE int sync_points_before(Params const& params, int p) {
     int n = 0;
-    for (int q = 0; q < p; ++q) n += ((params.prob[q].phase != kPhaseNone) && !(params.flags & 8)) ? 2 : 1;
+    for (int q = 0; q < p; ++q) {
+      const int ph = params.prob[q].phase;
+      n += ((ph == kPhaseGateResAdarms || ph == kPhaseGateRes) && !(params.flags & 8)) ? 2 : 1;
+    }
     return n;
   }
 
@@ -190,6 +195,7 @@ public:
 
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
     const int cta_linear_id = static_cast<int>(blockIdx.x + blockIdx.y * gridDim.x + blockIdx.z * gridDim.x * gridDim.y);
+    const int cluster_linear_id = cta_linear_id / size(ClusterShape{});
     const int num_problems = params.num_problems;
     const int num_ctas = params.num_ctas;
     int* counter = params.counter;
@@ -293,6 +299,7 @@ public:
         auto load_inputs = collective_mainloop.load_init(problem_shape_MNKL, shared_storage.tensors.mainloop);
         bool first_tile = true;
         const bool last_problem = (p + 1 == num_problems);
+        const int b_batch = pr.b_batch_mode ? cluster_linear_id : -1;
         while (work_tile_info.is_valid()) {
           auto k_tile_iter = scheduler.get_k_tile_iterator(work_tile_info, problem_shape_MNKL, CtaShape_MNK{}, load_inputs.k_tiles);
           auto k_tile_count = TileScheduler::get_work_k_tile_count(work_tile_info, problem_shape_MNKL, CtaShape_MNK{});
@@ -309,17 +316,20 @@ public:
                 if (lane_predicate) seq_detail::seq_wait(counter, num_ctas * sync_points_before(params, p));
                 __syncwarp();
               }
+              if (params.prob[p - 1].phase == kPhasePrivateAdarms) {
+                arch::NamedBarrier::sync(NumEpilogueThreads + NumMainloopLoadThreads, kPhaseBarrierId);
+              }
               seq_detail::fence_proxy_async();
             }
           };
           auto [mainloop_producer_state_next, k_tile_iter_next] = collective_mainloop.load(
             mainloop_pipeline, mainloop_pipe_producer_state, load_inputs, cta_coord_mnkl,
-            k_tile_iter, k_tile_prologue, wait_fn, /*trigger=*/false, first_tile ? params.early_first : params.early_rest);
+            k_tile_iter, k_tile_prologue, wait_fn, /*trigger=*/false, first_tile ? params.early_first : params.early_rest, b_batch);
           mainloop_pipe_producer_state = mainloop_producer_state_next;
           first_tile = false;
           auto [mainloop_producer_state_next_, unused_] = collective_mainloop.load(
             mainloop_pipeline, mainloop_pipe_producer_state, load_inputs, cta_coord_mnkl,
-            k_tile_iter_next, k_tile_count - k_tile_prologue, wait_fn, /*trigger=*/last_problem && last_tile, params.early_rest);
+            k_tile_iter_next, k_tile_count - k_tile_prologue, wait_fn, /*trigger=*/last_problem && last_tile, params.early_rest, b_batch);
           mainloop_pipe_producer_state = mainloop_producer_state_next_;
           __syncwarp();
           work_tile_info = next_work_tile_info;
@@ -462,7 +472,20 @@ public:
             __threadfence();
             atomicAdd(counter, 1);
           }
-          if (pr.phase != kPhaseNone) {
+          if (pr.phase == kPhasePrivateAdarms) {
+            // One sync point: once every CTA's stores (x_new, partials) are visible, this CTA
+            // quantizes every row into its cluster's slot and hands the load warp over locally.
+            if (!(params.flags & 5)) {
+              if (epi_thread == 0) seq_detail::seq_wait(counter, num_ctas * (sync_points_before(params, p) + 1));
+              arch::NamedBarrier::sync(NumEpilogueThreads, kEpilogueSyncBarrierId);
+            }
+            __threadfence();
+            if (!(params.flags & 2)) run_phase(params, p, epi_thread, shared_storage.phase, cluster_linear_id, num_ctas);
+            seq_detail::fence_proxy_async();
+            __threadfence();
+            arch::NamedBarrier::sync(NumEpilogueThreads + NumMainloopLoadThreads, kPhaseBarrierId);
+          }
+          else if (pr.phase != kPhaseNone) {
             // Every CTA waits until all stores of problem p are visible, runs its share of the
             // phase (rows strided over the grid) and arrives a second time; the load warps wait
             // for that second point before touching the phase outputs.
@@ -501,6 +524,8 @@ private:
       seq_phase_gate_res_adarms(params.prob[p].phase_args, phase_smem, epi_thread, sync, cta, num_ctas);
     } else if (params.prob[p].phase == kPhaseGateRes) {
       seq_phase_gate_res(params.prob[p].phase_args, epi_thread, cta, num_ctas);
+    } else if (params.prob[p].phase == kPhasePrivateAdarms) {
+      seq_phase_private_adarms(params.prob[p].phase_args, phase_smem, epi_thread, sync, /*slot=*/cta);
     }
   }
 
@@ -517,6 +542,9 @@ private:
     if (!(params.flags & 1)) {
       if (cute::elect_one_sync()) seq_detail::seq_wait(counter, num_ctas * sync_points_before(params, p));
       __syncwarp();
+    }
+    if (params.prob[p - 1].phase == kPhasePrivateAdarms) {
+      arch::NamedBarrier::sync(NumEpilogueThreads + NumMainloopLoadThreads, kPhaseBarrierId);
     }
   }
   template <class Pipe, class State, class CS>

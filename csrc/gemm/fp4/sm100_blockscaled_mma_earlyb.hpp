@@ -894,7 +894,7 @@ struct CollectiveMma<
     LoadParams const& load_inputs,
     TileCoordMNKL const& cta_coord_mnkl,
     KTileIterator k_tile_iter, int k_tile_count, WaitFn&& wait_fn, bool trigger,
-    int early_stages = DispatchPolicy::EarlyStages) {
+    int early_stages = DispatchPolicy::EarlyStages, int b_batch = -1) {
 
     auto [unused_k_tiles,
           tAgA_mkl, tBgB_nkl, tAsA, tBsB,
@@ -903,9 +903,11 @@ struct CollectiveMma<
 
     // slice out the work coord from partitioned tensors
     Tensor tAgA = tAgA_mkl(_, get<0>(cta_coord_mnkl) / size(typename TiledMma::AtomThrID{}), _, get<3>(cta_coord_mnkl));
-    Tensor tBgB = tBgB_nkl(_, get<1>(cta_coord_mnkl), _, get<3>(cta_coord_mnkl));
+    // FlashRT: the sequence kernel may point B / SFB at a per-cluster batch slot (private activations).
+    const int b_l = (b_batch >= 0) ? b_batch : static_cast<int>(get<3>(cta_coord_mnkl));
+    Tensor tBgB = tBgB_nkl(_, get<1>(cta_coord_mnkl), _, b_l);
     Tensor tAgSFA = tAgSFA_mkl(_, get<0>(cta_coord_mnkl) / size(typename TiledMma::AtomThrID{}), _, get<3>(cta_coord_mnkl));
-    Tensor tBgSFB = tBgSFB_nkl(_, get<1>(cta_coord_mnkl), _, get<3>(cta_coord_mnkl));
+    Tensor tBgSFB = tBgSFB_nkl(_, get<1>(cta_coord_mnkl), _, b_l);
 
     auto barrier_token = mainloop_pipeline.producer_try_acquire(mainloop_pipe_producer_state);
 
