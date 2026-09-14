@@ -37,6 +37,7 @@
 #include "fused_fp4/l2_prefetch.cuh"
 #include "fused_fp4/l2_pump.cuh"
 #include "fused_fp4/attn_mqa_s16_fp4out.cuh"
+#include "fused_fp4/attn_mqa_fused_fp4out.cuh"
 #include "gemm/fp4/cutlass_fp4_gemm_seq_sm100.cuh"
 #include "fused_fp4/pdl.cuh"
 #include "gemm/fp4/cutlass_fp4_gemm_siglip_ffn_variants_sm100.cuh"
@@ -410,6 +411,24 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
         py::arg("variant") = 0, py::arg("dbg") = 0,
         "MQA attention (S<=16 query rows, one KV head, HD=256, fp16) with the split merge and the NVFP4 "
         "activation quantize fused: emits the packed e2m1 rows and CUTLASS SFA bytes directly.");
+  m.def("attn_mqa_fused_ws_bytes",
+        []() -> size_t { return flash_rt::fp4::attn_mqa_fused_ws_bytes(); },
+        "Workspace bytes for attn_mqa_fused_fp4out (zero-fill once at allocation).");
+  m.def("attn_mqa_fused_fp4out",
+        [](uintptr_t qkv, uintptr_t rope, uintptr_t Kc, uintptr_t Vc, uintptr_t ws, uintptr_t packed, uintptr_t sfa,
+           int S, int enc_seq, int NH, int HD, int qkv_stride, float attn_scale, uintptr_t stream, int dbg) -> int {
+          return flash_rt::fp4::attn_mqa_fused_fp4out(
+              reinterpret_cast<void const*>(qkv), reinterpret_cast<void const*>(rope),
+              reinterpret_cast<void*>(Kc), reinterpret_cast<void*>(Vc), reinterpret_cast<void*>(ws),
+              reinterpret_cast<void*>(packed), reinterpret_cast<void*>(sfa),
+              S, enc_seq, NH, HD, qkv_stride, attn_scale, reinterpret_cast<cudaStream_t>(stream), dbg);
+        },
+        py::arg("qkv"), py::arg("rope"), py::arg("Kc"), py::arg("Vc"), py::arg("ws"), py::arg("packed"), py::arg("sfa"),
+        py::arg("S"), py::arg("enc_seq"), py::arg("NH"), py::arg("HD"), py::arg("qkv_stride"), py::arg("attn_scale"),
+        py::arg("stream") = 0, py::arg("dbg") = 0,
+        "Fused decoder MQA attention (S<=16 rows, one KV head, HD=256, fp16): RoPE of the fresh q/k rows, "
+        "KV-cache append, QK^T/softmax/PV over the whole cache (16 key splits merged in-kernel) and the NVFP4 "
+        "quantize of the context rows, in one launch.");
   m.def("cutlass_fp4_gemm_seq",
         [](const std::vector<std::tuple<uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, int, int, int, float, float>>& probs,
            uintptr_t counter, uintptr_t stream, int variant, int flags,

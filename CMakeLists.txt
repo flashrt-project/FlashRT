@@ -1899,10 +1899,13 @@ if(ENABLE_SM100_CUTLASS)
     csrc/gemm/fp4/cutlass_fp4_gemm_siglip_ffn_variants_sm100.cu
     csrc/fused_fp4/pdl.cu
     csrc/gemm/fp4/cutlass_fp4_gemm_variants_earlyb.cu
+    csrc/gemm/fp4/cutlass_fp4_gemm_variants_persist_a.cu
+    csrc/gemm/fp4/cutlass_fp4_gemm_variants_persist_b.cu
     csrc/gemm/fp4/cutlass_fp4_gemm_variants_swap.cu
     csrc/fused_fp4/l2_pump.cu
     csrc/gemm/fp4/cutlass_fp4_gemm_geglu_il_swap_sm100.cu
     csrc/fused_fp4/attn_mqa_s16_fp4out.cu
+    csrc/fused_fp4/attn_mqa_fused_fp4out.cu
     csrc/gemm/fp4/cutlass_fp4_gemm_seq_sm100.cu
   )
   if(FLASHRT_ENABLE_COSMOS3_EDGE)

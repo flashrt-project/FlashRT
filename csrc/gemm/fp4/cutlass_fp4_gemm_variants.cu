@@ -259,6 +259,10 @@ using V14 = VariantSK<Shape<_128,_128,_256>, Shape<_1,_1,_1>, 4>;   // wider N, 
 
 int cutlass_fp4_gemm_variant_swap(int idx, void const* A, void const* SFA, void const* B, void const* SFB,
     void* D, int M, int N, int K, float alpha, float beta, cudaStream_t stream);
+int cutlass_fp4_gemm_variant_persist_a(int idx, void const* A, void const* SFA, void const* B, void const* SFB,
+    void* D, int M, int N, int K, float alpha, float beta, cudaStream_t stream);
+int cutlass_fp4_gemm_variant_persist_b(int idx, void const* A, void const* SFA, void const* B, void const* SFB,
+    void* D, int M, int N, int K, float alpha, float beta, cudaStream_t stream);
 int cutlass_fp4_gemm_variant_earlyb(int idx, void const* A, void const* SFA, void const* B, void const* SFB,
     void* D, int M, int N, int K, float alpha, float beta, cudaStream_t stream);
 
@@ -293,6 +297,10 @@ int cutlass_fp4_gemm_variant(int idx,
     case 15: case 16: case 17: case 18: case 19: case 20:
     case 25: case 26: case 27: case 28: case 29: case 30: case 31: case 32: case 33: case 34:
       return cutlass_fp4_gemm_variant_earlyb(idx - 15, A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 39: case 40: case 41: case 42:
+      return cutlass_fp4_gemm_variant_persist_a(idx - 39, A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 43: case 44: case 45: case 46:
+      return cutlass_fp4_gemm_variant_persist_b(idx - 43, A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     default: return -99;
   }
 }
@@ -338,11 +346,19 @@ const char* cutlass_fp4_gemm_variant_name(int idx) {
     case 36: return "tile256x256x128 cluster2x1x1 (2-SM UMMA)";
     case 37: return "tile256x128x256 cluster2x1x1 (2-SM UMMA)";
     case 38: return "tile256x256x256 cluster2x1x1 (2-SM UMMA)";
+    case 39: return "tile128x256x256, static persistent scheduler (forked kernel)";
+    case 40: return "tile256x256x256 cluster2x1x1 (2-SM), static persistent";
+    case 41: return "tile256x256x256 cluster4x1x1 (2-SM, B multicast x2), static persistent";
+    case 42: return "tile256x256x256 cluster2x2x1 (2-SM, A multicast x2), static persistent";
+    case 43: return "tile256x128x256 cluster2x1x1 (2-SM), static persistent";
+    case 44: return "tile256x256x256 cluster4x1x1 (2-SM, B multicast x2), CLC";
+    case 45: return "tile128x256x256 cluster4x1x1 (B multicast x4), CLC";
+    case 46: return "tile128x256x256 cluster2x1x1 (B multicast x2), static persistent";
     default: return "<invalid>";
   }
 }
 
-int cutlass_fp4_gemm_num_variants() { return 39; }
+int cutlass_fp4_gemm_num_variants() { return 47; }
 
 }  // namespace fp4
 }  // namespace flash_rt
