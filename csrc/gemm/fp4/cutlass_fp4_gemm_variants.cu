@@ -282,7 +282,7 @@ int cutlass_fp4_gemm_variant(int idx,
     case 21: case 22: case 23: case 24:
       return cutlass_fp4_gemm_variant_swap(idx - 21, A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     case 15: case 16: case 17: case 18: case 19: case 20:
-    case 25: case 26: case 27: case 28: case 29: case 30: case 31: case 32:
+    case 25: case 26: case 27: case 28: case 29: case 30: case 31: case 32: case 33: case 34:
       return cutlass_fp4_gemm_variant_earlyb(idx - 15, A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     default: return -99;
   }
@@ -323,11 +323,13 @@ const char* cutlass_fp4_gemm_variant_name(int idx) {
     case 30: return "swapped 2-SM, 2 weight k-tiles early, dependents triggered from the MMA warp";
     case 31: return "swapped 2-SM, all weight k-tiles early, dependents triggered from the MMA warp";
     case 32: return "swapped 2-SM, activations early (control), dependents triggered from the MMA warp";
+    case 33: return "tile128x64x256 through the forked kernel with the static persistent scheduler";
+    case 34: return "variant 28 configuration through the forked kernel with the static persistent scheduler";
     default: return "<invalid>";
   }
 }
 
-int cutlass_fp4_gemm_num_variants() { return 33; }
+int cutlass_fp4_gemm_num_variants() { return 35; }
 
 }  // namespace fp4
 }  // namespace flash_rt

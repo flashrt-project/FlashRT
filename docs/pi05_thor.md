@@ -307,6 +307,7 @@ Constructor keyword / bench flag pairs. Defaults are the production tier.
 | `encoder_attn_o_variant` / `--encoder-attn-o-variant` | `1` | NVFP4 encoder attention-O projection GEMM variant |
 | `decoder_qkv_variant`, `decoder_o_variant`, `decoder_down_variant` | `28` | decoder projection GEMM variants (bench flags of the same names). `28` = operand-swapped 2-SM tile with three weight k-tiles streamed before the PDL wait (§8.3); `10` = the previous 128x64x256 tile |
 | `decoder_fused_geglu_swap` / `--decoder-fused-geglu-swap` | `False` | operand-swapped fused GeGLU (column compact store, byte-identical output); faster hot but slower in the pipeline (§8.3), off |
+| `decoder_seq` / `--decoder-seq` | `False` | persistent decoder GEMM sequence: one launch per layer for O, gate_up (GeGLU), down and the next qkv with the AdaRMS phases inside (§8.4); bit-identical, slower than the six launches, off |
 | `decoder_attn_mqa` / `--decoder-attn-mqa` | `False` | single-kernel MQA decoder attention with the split merge and NVFP4 quantize fused (`mma.sync`); numerically equivalent, slower than the cuBLAS chain on Thor (§8.3), off |
 | `pdl` / `--pdl` | `True` | programmatic dependent launch for the NVFP4 GEMMs and the activation kernels of this module (§8.2) |
 | `pdl_fvk` / `--pdl-fvk` | `False` | also PDL-launch the rope/softmax/FP8-quantize kernels and the FP8 encoder GEMM; measured within noise |
@@ -443,6 +444,31 @@ byte-identical and 20% faster hot but 1.1 ms slower in the pipeline —
 with one tile per CTA its cost is waves × per-CTA latency, and the
 heavier epilogue lengthens every wave.
 
+### 8.4 Persistent decoder GEMM sequence (opt-in)
+
+`csrc/gemm/fp4/sm100_gemm_seq_persistent_kernel.hpp` runs a list of NVFP4
+GEMM problems in one launch on a resident grid (20 CTAs, the operand-swapped
+2-SM tile of §8.3, static persistent scheduler): the CTAs synchronise on a
+global counter between problems, the load warp streams the next problem's
+weight k-tiles before it waits, and the epilogue warps run the decoder's
+AdaRMS phase (`sm100_seq_phases.hpp`, a bit-exact port of the row kernel)
+between GEMMs. With four independent problems per launch the 72-GEMM
+decoder chain reaches 0.721 ms per denoise step = 243 GB/s, 99% of the
+measured read peak (0.774 for the separate launches), and a full FFN
+half-layer — O, AdaRMS, gate_up with the column GeGLU store, down, AdaRMS,
+next qkv — is bit-identical to the pipeline's kernels.
+
+It does not win yet: with the phases the sequence measures 1.07 ms per
+step against 0.92 for the six launches. A phase needs two grid sync
+points (all stores visible, then all phase rows visible) and blocks the
+epilogue warps meanwhile; the probes attribute ~0.25 ms/step to the second
+point and ~0.10 to the blocked epilogue warps, the phase work itself is
+0.07. (Measurement note: a probe that skips a wait leaves the counter
+dirty and every later run silently unsynchronised — check the counter
+after each timed run.) The next form folds the gated residual add and the
+per-row sum-of-squares partials into the O/down epilogue so each CTA can
+finish the phase privately after a single sync point.
+
 ### Approaches measured and rejected
 
 - **Single-kernel decoder attention.** Implemented and numerically
@@ -560,6 +586,7 @@ Measurement discipline:
 | fused GeGLU store epilogue (row compact store; column compact store for the swapped orientation) | `csrc/gemm/fp4/sm100_gelu_mul_blockscale_visitor.hpp`, `csrc/gemm/fp4/cutlass_fp4_gemm_geglu_il_swap_sm100.cu` |
 | operand-swapped decoder GEMMs, early-weight mainloop fork, forked kernel layer | `csrc/gemm/fp4/cutlass_fp4_gemm_variants_swap.cu`, `csrc/gemm/fp4/cutlass_fp4_gemm_variants_earlyb.cu`, `csrc/gemm/fp4/sm100_blockscaled_mma_earlyb.hpp`, `csrc/gemm/fp4/sm100_gemm_seq_kernel.hpp` |
 | measured-and-rejected kernels kept opt-in | `csrc/fused_fp4/l2_pump.cu`, `csrc/fused_fp4/attn_mqa_s16_fp4out.cu`, `csrc/fused_fp4/pi05_dec_attn_splitkv.cu` |
+| persistent decoder GEMM sequence (§8.4) | `csrc/gemm/fp4/sm100_gemm_seq_persistent_kernel.hpp`, `csrc/gemm/fp4/sm100_seq_phases.hpp`, `csrc/gemm/fp4/cutlass_fp4_gemm_seq_sm100.cu` |
 | fused norm / quantize / activation kernels | `csrc/fused_fp4/`, `csrc/quantize/` |
 | E0M3 quantizer and activation kernels | `csrc/quantize/quantize_e0m3_sfa.cu`, `csrc/fused_fp4/pi05_e0m3_act.cu` |
 

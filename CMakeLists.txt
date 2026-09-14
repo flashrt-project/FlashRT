@@ -1903,6 +1903,7 @@ if(ENABLE_SM100_CUTLASS)
     csrc/fused_fp4/l2_pump.cu
     csrc/gemm/fp4/cutlass_fp4_gemm_geglu_il_swap_sm100.cu
     csrc/fused_fp4/attn_mqa_s16_fp4out.cu
+    csrc/gemm/fp4/cutlass_fp4_gemm_seq_sm100.cu
   )
   if(FLASHRT_ENABLE_COSMOS3_EDGE)
     target_sources(fp4_kernels_obj PRIVATE

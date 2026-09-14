@@ -37,6 +37,7 @@
 #include "fused_fp4/l2_prefetch.cuh"
 #include "fused_fp4/l2_pump.cuh"
 #include "fused_fp4/attn_mqa_s16_fp4out.cuh"
+#include "gemm/fp4/cutlass_fp4_gemm_seq_sm100.cuh"
 #include "fused_fp4/pdl.cuh"
 #include "gemm/fp4/cutlass_fp4_gemm_siglip_ffn_variants_sm100.cuh"
 #include "quantize/reshape_scales_sfa.cuh"
@@ -409,6 +410,45 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
         py::arg("variant") = 0, py::arg("dbg") = 0,
         "MQA attention (S<=16 query rows, one KV head, HD=256, fp16) with the split merge and the NVFP4 "
         "activation quantize fused: emits the packed e2m1 rows and CUTLASS SFA bytes directly.");
+  m.def("cutlass_fp4_gemm_seq",
+        [](const std::vector<std::tuple<uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, int, int, int, float, float>>& probs,
+           uintptr_t counter, uintptr_t stream, int variant, int flags,
+           const std::vector<std::tuple<int, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, int, int>>& phases,
+           const std::vector<std::tuple<int, uintptr_t, uintptr_t>>& geglu) {
+          std::vector<flash_rt::fp4::SeqGemmDesc> d;
+          for (auto const& t : probs) {
+            flash_rt::fp4::SeqGemmDesc x{};
+            x.A = reinterpret_cast<const void*>(std::get<0>(t)); x.SFA = reinterpret_cast<const void*>(std::get<1>(t));
+            x.B = reinterpret_cast<const void*>(std::get<2>(t)); x.SFB = reinterpret_cast<const void*>(std::get<3>(t));
+            x.D = reinterpret_cast<void*>(std::get<4>(t));
+            x.M = std::get<5>(t); x.N = std::get<6>(t); x.K = std::get<7>(t); x.alpha = std::get<8>(t); x.beta = std::get<9>(t);
+            d.push_back(x);
+          }
+          if (!phases.empty() && phases.size() != probs.size()) return std::make_pair(-9, std::vector<int>{0, 0, 0});
+          for (size_t i = 0; i < phases.size(); ++i) {
+            auto const& ph = phases[i];
+            d[i].phase = std::get<0>(ph);
+            d[i].ph_prev_gate = reinterpret_cast<const void*>(std::get<1>(ph)); d[i].ph_residual = reinterpret_cast<void*>(std::get<2>(ph));
+            d[i].ph_style = reinterpret_cast<const void*>(std::get<3>(ph)); d[i].ph_packed = reinterpret_cast<void*>(std::get<4>(ph));
+            d[i].ph_sfa = reinterpret_cast<void*>(std::get<5>(ph)); d[i].ph_gate = reinterpret_cast<void*>(std::get<6>(ph));
+            d[i].ph_S = std::get<7>(ph); d[i].ph_D = std::get<8>(ph);
+          }
+          if (!geglu.empty() && geglu.size() != probs.size()) return std::make_pair(-11, std::vector<int>{0, 0, 0});
+          for (size_t i = 0; i < geglu.size(); ++i) {
+            d[i].geglu = std::get<0>(geglu[i]);
+            d[i].compact_packed = reinterpret_cast<void*>(std::get<1>(geglu[i]));
+            d[i].compact_sfa = reinterpret_cast<void*>(std::get<2>(geglu[i]));
+          }
+          int grid[3] = {0, 0, 0};
+          const int rc = flash_rt::fp4::cutlass_fp4_gemm_seq_run(static_cast<int>(d.size()), d.data(),
+              reinterpret_cast<int*>(counter), reinterpret_cast<cudaStream_t>(stream), grid, variant, flags);
+          return std::make_pair(rc, std::vector<int>{grid[0], grid[1], grid[2]});
+        }, py::arg("problems"), py::arg("counter"), py::arg("stream") = 0, py::arg("variant") = 0, py::arg("flags") = 0,
+        py::arg("phases") = std::vector<std::tuple<int, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, int, int>>{},
+        py::arg("geglu") = std::vector<std::tuple<int, uintptr_t, uintptr_t>>{},
+        "Persistent NVFP4 GEMM sequence: problems are (A, SFA, B, SFB, D, M, N, K, alpha, beta) in the "
+        "cutlass_fp4_gemm_variant convention; one launch, grid barriers between problems, weights streamed "
+        "across them. Returns (rc, grid).");
   m.def("l2_pump_progress_store",
         [](uintptr_t progress, int value, uintptr_t stream) -> int {
           return flash_rt::fp4::l2_pump_progress_store(reinterpret_cast<int*>(progress), value,

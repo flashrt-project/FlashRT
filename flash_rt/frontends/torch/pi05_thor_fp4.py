@@ -99,6 +99,8 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  decoder_fused_geglu_swap: bool = False,
                  decoder_attn_splitkv: bool = False,
                  decoder_attn_mqa: bool = False,
+                 decoder_seq: bool = False,
+                 decoder_seq_variant: int = 0,
                  rowops_v2: bool = True,
                  rowops_res_epilogue: bool = True,
                  encoder_attn_o_variant: int = 1,
@@ -209,6 +211,10 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                                          and self.decoder_fused_geglu)
         self.decoder_attn_splitkv = bool(decoder_attn_splitkv)
         self.decoder_attn_mqa = bool(decoder_attn_mqa)
+        self.decoder_seq = bool(decoder_seq)
+        self.decoder_seq_variant = int(decoder_seq_variant)
+        self._decoder_seq_counter = None
+        self._decoder_seq_gu_dummy = None
         self.rowops_v2 = bool(rowops_v2)
         self.rowops_res_epilogue = bool(rowops_res_epilogue)
         self.encoder_attn_o_variant = int(encoder_attn_o_variant)
@@ -386,6 +392,16 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
     # -------------------------------------------------------------------
     # Calibration override — block multi-sample on active FP4 layers
     # -------------------------------------------------------------------
+
+    def _decoder_seq_ptrs(self):
+        """(sequence counter, fp16 gate_up D scratch) for the persistent decoder sequence; (0, 0) when off."""
+        if not self.decoder_seq:
+            return (0, 0)
+        if self._decoder_seq_counter is None:
+            import torch
+            self._decoder_seq_counter = torch.zeros(4, dtype=torch.int32, device='cuda')
+            self._decoder_seq_gu_dummy = torch.zeros(self.Sa * self.Ha * 2, dtype=torch.half, device='cuda')
+        return (int(self._decoder_seq_counter.data_ptr()), int(self._decoder_seq_gu_dummy.data_ptr()))
 
     def _decoder_attn_ws_ptr(self) -> int:
         """Workspace for the fused decoder attention kernels (0 when disabled)."""
@@ -1400,6 +1416,8 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                 'ctx_fp4': self._decoder_fp4_ctx.packed.data_ptr(),
                 'ctx_sfa': self._decoder_fp4_ctx.sfa.data_ptr(),
                 'attn_ws': self._decoder_attn_ws_ptr(),
+                'seq_counter': self._decoder_seq_ptrs()[0],
+                'seq_gu_dummy': self._decoder_seq_ptrs()[1],
                 'hid_fp4': self._decoder_fp4_hid.packed.data_ptr(),
                 'hid_sfa': self._decoder_fp4_hid.sfa.data_ptr(),
             })
@@ -1467,6 +1485,8 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
             ae_dims['fused_geglu_swap'] = self.decoder_fused_geglu_swap
             ae_dims['attn_splitkv'] = self.decoder_attn_splitkv
             ae_dims['attn_mqa'] = self.decoder_attn_mqa
+            ae_dims['dec_seq'] = self.decoder_seq
+            ae_dims['dec_seq_variant'] = self.decoder_seq_variant
             if self._attn is not None:
                 # Fold the decoder seqused mask into the softmax kernel.
                 self._attn.use_fused_softmax = self.decoder_fused_attn

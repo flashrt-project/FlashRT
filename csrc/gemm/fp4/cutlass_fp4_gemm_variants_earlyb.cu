@@ -6,6 +6,7 @@
 #include "fused_fp4/pdl.cuh"
 #include <utility>
 #include <type_traits>
+#include "cutlass/kernel_hardware_info.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/tensor_ref.h"
 #include "cutlass/epilogue/thread/linear_combination.h"
@@ -42,7 +43,7 @@ struct ToEarlyB<cutlass::gemm::collective::CollectiveMma<
 };
 
 template <class MmaTile, class Cluster, bool Seq = false, int StagesOverride = 0, bool Swapped = false,
-          int EarlyStages = 0, bool EarlyA = Swapped, bool TriggerInMma = false>
+          int EarlyStages = 0, bool EarlyA = Swapped, bool TriggerInMma = false, class Sched = void>
 struct Variant {
   using ElementA   = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
   using LayoutATag = cutlass::layout::RowMajor;
@@ -74,7 +75,7 @@ struct Variant {
       cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
   using CollectiveMainloop = typename ToEarlyB<BaseMainloop, Seq, StagesOverride, EarlyA, EarlyStages, TriggerInMma>::type;
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-      Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
+      Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, Sched>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
   using StrideA = typename Gemm::GemmKernel::StrideA;
   using StrideB = typename Gemm::GemmKernel::StrideB;
@@ -99,6 +100,12 @@ struct Variant {
           reinterpret_cast<SA const*>(SFA), layout_SFA, reinterpret_cast<SB const*>(SFB), layout_SFB },
         { {alpha, beta}, reinterpret_cast<ElementC*>(D), stride_C, reinterpret_cast<ElementD*>(D), stride_D }
     };
+    if constexpr (!std::is_void_v<Sched>) {
+      // The static persistent scheduler sizes its grid from hw_info (the CLC scheduler queries the device itself).
+      static int sm_count = 0;
+      if (sm_count == 0) sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
+      args.hw_info.sm_count = sm_count;
+    }
     Gemm gemm;
     auto st = gemm.can_implement(args);
     if (st != cutlass::Status::kSuccess) return static_cast<int>(st) | 0x10000;
@@ -126,6 +133,8 @@ using E14 = Variant<Shape<_128, _64,_256>, Shape<_1,_1,_1>, false, 0, true, 2>; 
 using E15 = Variant<Shape<_256, _64,_256>, Shape<_2,_1,_1>, false, 0, true, 2, true, true>;    // 2 early, dependents triggered from the MMA warp
 using E16 = Variant<Shape<_256, _64,_256>, Shape<_2,_1,_1>, false, 0, true, 0, true, true>;    // all early, trigger from the MMA warp
 using E17 = Variant<Shape<_256, _64,_256>, Shape<_2,_1,_1>, false, 0, true, 0, false, true>;   // activations early (control), trigger from the MMA warp
+using E18 = Variant<Shape<_128, _64,_256>, Shape<_1,_1,_1>, true, 0, false, 0, false, false, cutlass::gemm::StaticPersistentScheduler>;   // forked kernel + static persistent scheduler (no CLC)
+using E19 = Variant<Shape<_256, _64,_256>, Shape<_2,_1,_1>, true, 0, true, 3, true, false, cutlass::gemm::StaticPersistentScheduler>;    // v28 configuration through the forked kernel + static scheduler
 }  // namespace variants_earlyb
 
 int cutlass_fp4_gemm_variant_earlyb(int idx, void const* A, void const* SFA, void const* B, void const* SFB,
@@ -146,6 +155,8 @@ int cutlass_fp4_gemm_variant_earlyb(int idx, void const* A, void const* SFA, voi
     case 15: return E15::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     case 16: return E16::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     case 17: return E17::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 18: return E18::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
+    case 19: return E19::run(A, SFA, B, SFB, D, M, N, K, alpha, beta, stream);
     default: return -99;
   }
 }

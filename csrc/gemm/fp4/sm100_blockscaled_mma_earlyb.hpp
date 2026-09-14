@@ -865,10 +865,27 @@ struct CollectiveMma<
 
   /// Perform a collective-scoped matrix multiply-accumulate
   /// Producer Perspective
+  template <class LoadParams, class TileCoordMNKL, class KTileIterator>
+  CUTLASS_DEVICE auto
+  load(MainloopPipeline mainloop_pipeline, MainloopPipelineState mainloop_pipe_producer_state,
+       LoadParams const& load_inputs, TileCoordMNKL const& cta_coord_mnkl, KTileIterator k_tile_iter, int k_tile_count) {
+    return load(mainloop_pipeline, mainloop_pipe_producer_state, load_inputs, cta_coord_mnkl, k_tile_iter, k_tile_count,
+                []() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+                  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+                }, true);
+  }
+
+  // FlashRT: `wait_fn` runs after the early operand's k-tiles are issued and
+  // before the dependent operand's (griddepcontrol.wait in the stock form);
+  // `trigger` issues launch_dependents at the end (unless the policy moves it
+  // to the MMA warp). The persistent sequence kernel passes its own barrier.
   template <
     class LoadParams,
     class TileCoordMNKL,
-    class KTileIterator
+    class KTileIterator,
+    class WaitFn
   >
   CUTLASS_DEVICE auto
   load(
@@ -876,7 +893,8 @@ struct CollectiveMma<
     MainloopPipelineState mainloop_pipe_producer_state,
     LoadParams const& load_inputs,
     TileCoordMNKL const& cta_coord_mnkl,
-    KTileIterator k_tile_iter, int k_tile_count) {
+    KTileIterator k_tile_iter, int k_tile_count, WaitFn&& wait_fn, bool trigger,
+    int early_stages = DispatchPolicy::EarlyStages) {
 
     auto [unused_k_tiles,
           tAgA_mkl, tBgB_nkl, tAsA, tBsB,
@@ -894,10 +912,12 @@ struct CollectiveMma<
     // ---- FlashRT: weights first. B / SFB do not depend on the previous grid,
     // so stream them for the first stages before the grid-dependency wait.
     using BarrierType = typename MainloopPipeline::ProducerBarrierType;
-    constexpr int kPre = DispatchPolicy::EarlyStages;
+    constexpr int kPre = DispatchPolicy::Stages;   // array bound; the runtime depth is early_stages
     BarrierType* pre_barrier[kPre];
     int pre_stage[kPre];
-    const int pre = (k_tile_count < kPre) ? k_tile_count : kPre;
+    int pre = (early_stages < kPre) ? early_stages : kPre;
+    if (pre < 0) pre = 0;
+    if (k_tile_count < pre) pre = k_tile_count;
     auto k_tile_iter_b = k_tile_iter;
     for (int i = 0; i < pre; ++i) {
       mainloop_pipeline.producer_acquire(mainloop_pipe_producer_state, barrier_token);
@@ -916,9 +936,7 @@ struct CollectiveMma<
       }
       ++k_tile_iter_b;
     }
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-    asm volatile("griddepcontrol.wait;" ::: "memory");
-#endif
+    wait_fn();
     for (int i = 0; i < pre; ++i) {
       if (cute::elect_one_sync()) {
         if constexpr (DispatchPolicy::EarlyA) {
@@ -959,7 +977,9 @@ struct CollectiveMma<
     }
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     if constexpr (!DispatchPolicy::TriggerInMma) {
-      asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+      if (trigger) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+      }
     }
 #endif
 

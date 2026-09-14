@@ -298,6 +298,17 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
     if (attn_splitkv or attn_mqa) and not attn_ws:
         raise ValueError(
             "Pi0.5 Thor decoder attn_splitkv/attn_mqa requires bufs['attn_ws']")
+    # Persistent GEMM sequence: one launch per layer for O -> AdaRMS -> gate_up
+    # (GeGLU) -> down -> AdaRMS -> next qkv (weights streamed continuously).
+    dec_seq = (bool(dims.get('dec_seq')) and fused_geglu and not act_e0m3
+               and weight_format == 'nvfp4')
+    seq_counter = bufs.get('seq_counter', 0)
+    seq_gu_dummy = bufs.get('seq_gu_dummy', 0)
+    seq_variant = int(dims.get("dec_seq_variant", 0))
+    if dec_seq and not (seq_counter and seq_gu_dummy):
+        raise ValueError(
+            "Pi0.5 Thor decoder dec_seq requires bufs['seq_counter'] and "
+            "bufs['seq_gu_dummy']")
     if act_format not in ('nvfp4', 'e0m3'):
         raise ValueError(
             f"Pi0.5 Thor decoder FP4 unknown act_format {act_format!r}")
@@ -376,13 +387,14 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
                     fvk_fp4.pi05_adarms_fp4_sfa_native_fp16(
                         x, sa_ptr, xn_fp4, xn_sfa, gate, S, D, stream)
 
-            rc = dec_gemm(
-                variant_qkv, xn_fp4, xn_sfa,
-                weights['qw_fp4'][l], weights['qw_sfb'][l], qkv,
-                S, 2560, D, 1.0, 0.0, stream)
-            if rc != 0:
-                raise RuntimeError(
-                    f"Pi0.5 decoder FP4 qkv layer {l} failed rc={rc}")
+            if not dec_seq or l == 0:
+                rc = dec_gemm(
+                    variant_qkv, xn_fp4, xn_sfa,
+                    weights['qw_fp4'][l], weights['qw_sfb'][l], qkv,
+                    S, 2560, D, 1.0, 0.0, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 qkv layer {l} failed rc={rc}")
 
             if fixed_shape:
                 kv_offset = l * total_keys * HD
@@ -444,6 +456,43 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
                     raise RuntimeError(
                         f"Pi0.5 decoder FP4 O activation layer {l} failed "
                         f"rc={rc}")
+            if dec_seq:
+                last = (l == layers - 1)
+                probs = [
+                    (ctx_fp4, ctx_sfa, weights['ow_fp4'][l],
+                     weights['ow_sfb'][l], fg, S, D, NH * HD, 1.0, 0.0),
+                    (xn_fp4, xn_sfa, weights['gwil_fp4'][l],
+                     weights['gwil_sfb'][l], seq_gu_dummy, S, H * 2, D,
+                     1.0, 0.0),
+                    (hid_fp4, hid_sfa, weights['dw_fp4'][l],
+                     weights['dw_sfb'][l], fg, S, D, H, 1.0, 0.0),
+                ]
+                none_ph = (0, 0, 0, 0, 0, 0, 0, 0, 0)
+                phases = [
+                    (1, gate, x, sf_ptr, xn_fp4, xn_sfa, gate, S, D),
+                    none_ph,
+                ]
+                geglu = [(0, 0, 0), (1, hid_fp4, hid_sfa), (0, 0, 0)]
+                if not last:
+                    si_next = (s * layers + l + 1) * S * D3
+                    sa_next_ptr = sa + si_next * 2
+                    probs.append(
+                        (xn_fp4, xn_sfa, weights['qw_fp4'][l + 1],
+                         weights['qw_sfb'][l + 1], qkv, S, 2560, D, 1.0, 0.0))
+                    phases.append(
+                        (1, gate, x, sa_next_ptr, xn_fp4, xn_sfa, gate, S, D))
+                    phases.append(none_ph)
+                    geglu.append((0, 0, 0))
+                else:
+                    phases.append(none_ph)
+                rc, _ = fvk_fp4.cutlass_fp4_gemm_seq(
+                    probs, seq_counter, stream, seq_variant, 0, phases, geglu)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 sequence layer {l} failed rc={rc}")
+                if last:
+                    fvk.gate_res_fp16(fg, gate, x, S * D, stream)
+                continue
             rc = dec_gemm(
                 variant_o, ctx_fp4, ctx_sfa,
                 weights['ow_fp4'][l], weights['ow_sfb'][l], fg,

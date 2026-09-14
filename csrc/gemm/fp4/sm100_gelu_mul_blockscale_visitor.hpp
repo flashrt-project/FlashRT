@@ -823,7 +823,9 @@ struct Sm100GeluMulCompactBlockScaleFactorColStore {
       const bool writer = (lg == 0) || (lg == 4);
       uint8_t* const cbase = params_ptr->compact_ptr + (warp_base >> 2) + (lg >> 2);   // byte p = 2i + (lg>>2)
 
-      for (int j = 0; j < jmax; ++j) {                        // warp-uniform
+      CUTLASS_PRAGMA_UNROLL
+      for (int j = 0; j < 4; ++j) {                           // compile-time: keeps the fragment in registers
+        if (j >= jmax) break;                                 // warp-uniform
         CUTLASS_PRAGMA_UNROLL
         for (int t = 0; t < 2; ++t) {
           const int n = n0 + 8 * j + t;                       // this lane's activation row
@@ -956,6 +958,301 @@ struct FusionCallbacks<
           },
           {block_scale_factor_ptr, norm_constant_ptr, dNormConst,
            compact_ptr, compact_sf_ptr}
+        };
+    }
+  };
+
+  using Impl::Impl;
+};
+
+// ── Column compact store with a runtime pass-through mode (persistent sequence kernel:
+// one epilogue type for every problem; mode 0 stores the fp16 result, mode 1 runs the GeGLU
+// column compact store and feeds zeros to the collective's D store) ──────────────────────────────────
+// For the operand-swapped GeGLU GEMM (weights as A: M = N_il interleaved
+// gate/up rows, N = the activation rows) the accumulator holds the hidden
+// dimension along M, i.e. along the TMEM lanes: thread `lane` of an epilogue
+// warp owns interleaved row m = 32*warp + lane, so (gate, up) pairs are lane
+// pairs and one 16-wide scale block is exactly one warp. visit() folds the
+// pair with a shuffle, reduces the block amax across the warp and packs the
+// 16 e2m1 nibbles back into lane 0, writing the same compact [M_act, N_il/2]
+// buffer and UE4M3 SFA layout as the row store above, byte for byte.
+template <
+  int SFVecSize,
+  class EpilogueTile,
+  class ElementOutput,
+  class ElementCompute,
+  class ElementBlockScaleFactor,
+  FloatRoundStyle RoundStyle = FloatRoundStyle::round_to_nearest
+>
+struct Sm100GeluMulCompactBlockScaleFactorColStoreOrPass {
+  static_assert(SFVecSize == 16, "one scale block must be one warp of interleaved rows");
+  using NormalConstStrideMNL = Stride<_0,_0,int64_t>;
+  struct SharedStorage { };
+
+  struct Arguments {
+    ElementBlockScaleFactor* ptr_scale_factor = nullptr;  // unused (kept for arg shape)
+    ElementCompute const* norm_constant_ptr = nullptr;    // unused
+    NormalConstStrideMNL norm_constant_stride = {};
+    uint8_t* compact_ptr = nullptr;     // packed e2m1 [M_act, N_il/2] row-major
+    uint8_t* compact_sf_ptr = nullptr;  // UE4M3 SFA tile-atom layout on (M_act, N_il/2)
+    int mode = 0;                       // 0: pass-through fp16 store, 1: GeGLU compact store
+  };
+
+  using Params = Arguments;
+  using UnderlyingElementBlockScaleFactor = cute::remove_pointer_t<ElementBlockScaleFactor>;
+
+  template <class ProblemShape>
+  static constexpr Params
+  to_underlying_arguments(ProblemShape const& problem_shape, Arguments const& args, void* workspace) {
+    return args;
+  }
+
+  template <class ProblemShape>
+  static bool
+  can_implement(ProblemShape const& problem_shape, Arguments const& args) {
+    auto problem_shape_MNKL = append<4>(problem_shape, 1);
+    auto [M,N,K,L] = problem_shape_MNKL;
+    if (args.mode == 0) return true;
+    // M is the interleaved gate/up axis: whole warps of 32 rows.
+    return (M % (2 * SFVecSize) == 0) && args.compact_ptr && args.compact_sf_ptr;
+  }
+
+  template <class ProblemShape>
+  static size_t
+  get_workspace_size(ProblemShape const& problem_shape, Arguments const& args) {
+    return 0;
+  }
+
+  template <class ProblemShape>
+  static cutlass::Status
+  initialize_workspace(ProblemShape const& problem_shape, Arguments const& args, void* workspace, cudaStream_t stream,
+    CudaHostAdapter* cuda_adapter = nullptr) {
+    return cutlass::Status::kSuccess;
+  }
+
+  CUTLASS_HOST_DEVICE
+  Sm100GeluMulCompactBlockScaleFactorColStoreOrPass() { }
+
+  CUTLASS_HOST_DEVICE
+  Sm100GeluMulCompactBlockScaleFactorColStoreOrPass(Params const& params, SharedStorage const& shared_storage)
+      : params_ptr(&params) { }
+
+  Params const* params_ptr = nullptr;
+
+  CUTLASS_DEVICE bool is_producer_load_needed() const { return false; }
+  CUTLASS_DEVICE bool is_C_load_needed() const { return false; }
+
+  template <class... Args>
+  CUTLASS_DEVICE auto
+  get_producer_load_callbacks(ProducerLoadArgs<Args...> const& args) {
+    return EmptyProducerLoadCallbacks{};
+  }
+
+  CUTLASS_DEVICE static float
+  gelu_tanh_(float g) {
+    return g / (1.0f + expf(-1.5957691216057308f * g * (1.0f + 0.044715f * g * g)));
+  }
+
+  template <class CoordGTensor, class ThrResidue, class LayoutSFC>
+  struct ConsumerStoreCallbacks : EmptyConsumerStoreCallbacks {
+    CUTLASS_DEVICE
+    ConsumerStoreCallbacks(
+          CoordGTensor tC_cD_,
+          ThrResidue residue_tC_cD_,
+          Params const* params_ptr_,
+          LayoutSFC layout_sfc_,
+          int n_compact_bytes_,
+          int m_act_,
+          int tile_row_off_,
+          int tile_col_off_)
+      : tC_cD(tC_cD_)
+      , residue_tC_cD(residue_tC_cD_)
+      , params_ptr(params_ptr_)
+      , layout_sfc(layout_sfc_)
+      , n_compact_bytes(n_compact_bytes_)
+      , m_act(m_act_)
+      , tile_row_off(tile_row_off_)
+      , tile_col_off(tile_col_off_) {}
+
+    CoordGTensor tC_cD;
+    ThrResidue residue_tC_cD;
+    Params const* params_ptr;
+    LayoutSFC layout_sfc;
+    int n_compact_bytes;   // (N_il/2)/2 bytes per compact row
+    int m_act;             // real activation rows (the swapped problem's N)
+    int tile_row_off;
+    int tile_col_off;
+
+    template <class ElementAccumulator, class ElementInput, int FragmentSize>
+    CUTLASS_DEVICE auto
+    visit(Array<ElementAccumulator, FragmentSize> const& frg_acc,
+          int epi_v,
+          int epi_m,
+          int epi_n,
+          Array<ElementInput, FragmentSize> const& frg_input)
+    {
+      // SM100 TMEM-load register fragment (verified on sm_110a, 128x64 CTA tile,
+      // fp16 D): element e of this thread sits at row m0 + 8*i, column
+      // n0 + 8*j + t with i = ((e>>1)&1) + 2*(e>>4), j = (e>>2)&3, t = e&1,
+      // where m0 = 32*warp + lane/4 and n0 = 2*(lane&3) (+ subtile offset).
+      // A 16-hidden scale block = the warp's 32 interleaved rows: rows m0+8i
+      // over the 8 lane groups (lane/4) and the 4 in-thread row groups i.
+      static_assert(FragmentSize == 32, "column compact store expects the 32-element TMEM fragment");
+      if (params_ptr->mode == 0) {
+        return NumericArrayConverter<ElementOutput, ElementInput, FragmentSize, RoundStyle>{}(frg_input);
+      }
+      Tensor pred = tC_cD(_, _, _, epi_m, epi_n);
+      auto c0 = pred(0);
+      const int m0 = tile_row_off + static_cast<int>(get<0>(c0));
+      const int n0 = tile_col_off + static_cast<int>(get<1>(c0));
+      const unsigned lane = threadIdx.x & 31u;
+      const int lg = static_cast<int>(lane >> 2);            // lane group = row within the 8-row slab
+      if ((m0 & 31) != lg) { __trap(); }                      // layout assumption guard
+      const int warp_base = m0 - lg;                          // first interleaved row of this warp's block
+      const bool is_gate = (lg & 1) == 0;
+      const unsigned full = 0xffffffffu;
+      const int jmax = (m_act + 7) >> 3;                      // column groups that hold real activation rows
+      // Byte p of a block packs hidden (2p, 2p+1) = interleaved rows (4p, 4p+2): lane groups
+      // g = 4*(p&1) and g+2 of row group i = p>>1. Lane groups 0 and 4 own the even/odd bytes.
+      const bool writer = (lg == 0) || (lg == 4);
+      uint8_t* const cbase = params_ptr->compact_ptr + (warp_base >> 2) + (lg >> 2);   // byte p = 2i + (lg>>2)
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int j = 0; j < 4; ++j) {                           // compile-time: keeps the fragment in registers
+        if (j >= jmax) break;                                 // warp-uniform
+        CUTLASS_PRAGMA_UNROLL
+        for (int t = 0; t < 2; ++t) {
+          const int n = n0 + 8 * j + t;                       // this lane's activation row
+          float v[4];
+          float amax = 0.f;
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < 4; ++i) {
+            const int e = 16 * (i >> 1) + 4 * j + 2 * (i & 1) + t;
+            const float own = static_cast<float>(frg_input[e]);
+            const float other = __shfl_xor_sync(full, own, 4);   // partner row m0^1: lane group lg^1
+            const float g = is_gate ? own : other;
+            const float u = is_gate ? other : own;
+            v[i] = gelu_tanh_(g) * u;
+            amax = fmaxf(amax, fabsf(v[i]));
+          }
+          amax = fmaxf(amax, __shfl_xor_sync(full, amax, 4));
+          amax = fmaxf(amax, __shfl_xor_sync(full, amax, 8));
+          amax = fmaxf(amax, __shfl_xor_sync(full, amax, 16));
+          float desired = amax / 6.f;
+          if (desired < 1e-12f) desired = 1e-12f;
+          __nv_fp8_e4m3 bs_q = __nv_fp8_e4m3(desired);
+          const float inv_bs = 1.f / static_cast<float>(bs_q);
+          uint8_t bytes[4];
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < 4; ++i) {
+            const float a = v[i] * inv_bs;
+            const float b = __shfl_down_sync(full, a, 8);      // lane group lg+2 (row m0+2), same column
+            Array<ElementCompute, 2> pair;
+            pair[0] = static_cast<ElementCompute>(a);
+            pair[1] = static_cast<ElementCompute>(b);
+            auto packed_pair = NumericArrayConverter<cutlass::float_e2m1_t, ElementCompute, 2, RoundStyle>{}(pair);
+            bytes[i] = *reinterpret_cast<uint8_t const*>(&packed_pair);
+          }
+          if (writer && n < m_act) {
+            uint8_t* cp = cbase + static_cast<long>(n) * n_compact_bytes;
+            cp[0] = bytes[0]; cp[2] = bytes[1]; cp[4] = bytes[2]; cp[6] = bytes[3];
+            if (lg == 0)
+              params_ptr->compact_sf_ptr[layout_sfc(n, warp_base >> 1, 0)] = *reinterpret_cast<uint8_t*>(&bs_q);
+          }
+        }
+      }
+
+      // The collective's D path is elided (NoD epilogue); feed it zeros.
+      Array<ElementOutput, FragmentSize> frg_output;
+      frg_output.fill(ElementOutput(0));
+      return frg_output;
+    }
+  };
+
+  template <bool ReferenceSrc, class... Args>
+  CUTLASS_DEVICE auto
+  get_consumer_store_callbacks(ConsumerStoreArgs<Args...> const& args) {
+    auto [M, N, K, L] = args.problem_shape_mnkl;   // M = N_il (interleaved hidden), N = activation rows
+    using Cfg = cutlass::detail::Sm1xxBlockScaledConfig<SFVecSize>;
+    // Compact buffer is the next GEMM's activation operand: rows = activation rows, K = hidden.
+    auto layout_sfc = Cfg::tile_atom_to_shape_SFA(make_shape(N, 1, M / 2, 1));
+    return ConsumerStoreCallbacks<decltype(args.tCcD), decltype(args.residue_tCcD), decltype(layout_sfc)>(
+        args.tCcD, args.residue_tCcD, params_ptr, layout_sfc, M / 4, N,
+        M - static_cast<int>(get<0>(args.residue_tCcD)),
+        N - static_cast<int>(get<1>(args.residue_tCcD)));
+  }
+};
+
+template <
+  int SFVecsize, class EpilogueTile, class ElementOutput, class ElementCompute,
+  class ElementBlockScaleFactor,
+  class ElementSource = ElementOutput, class ElementScalar = ElementCompute,
+  FloatRoundStyle RoundStyle = FloatRoundStyle::round_to_nearest
+>
+using Sm100GeluMulCompactColOrPassBlockScaleFactor =
+  Sm90EVT<Sm100GeluMulCompactBlockScaleFactorColStoreOrPass<SFVecsize, EpilogueTile, ElementOutput, ElementCompute, ElementBlockScaleFactor, RoundStyle>,
+    Sm90LinearCombination<ElementCompute, ElementCompute, ElementSource, ElementScalar, RoundStyle>
+  >;
+
+template <
+  int SFVecSize, class ElementOutput, class ElementCompute,
+  class ElementBlockScaleFactor, class GmemLayoutTagScalefactor,
+  class ElementSource = ElementOutput, class ElementScalar = ElementCompute,
+  FloatRoundStyle RoundStyle = FloatRoundStyle::round_to_nearest
+>
+struct GeluMulCompactColOrPassBlockScaleFactor
+    : LinCombBlockScaleFactor<SFVecSize, ElementOutput, ElementCompute,
+        ElementBlockScaleFactor, GmemLayoutTagScalefactor, ElementSource,
+        ElementScalar, RoundStyle> {};
+
+template <
+  int StagesC, int StagesD, int FragmentSize, bool ReuseSmemC, bool DelayTmaStore,
+  class ElementOutput, class ElementCompute, class ElementBlockScaleFactor,
+  int SFVecSize, class ElementSource, class ElementScalar,
+  FloatRoundStyle RoundStyle, class CtaTileShapeMNK, class EpilogueTile
+>
+struct FusionCallbacks<
+    epilogue::Sm100TmaWarpSpecialized<StagesC, StagesD, FragmentSize, ReuseSmemC, DelayTmaStore>,
+    GeluMulCompactColOrPassBlockScaleFactor<SFVecSize, ElementOutput, ElementCompute, ElementBlockScaleFactor, cutlass::layout::RowMajor, ElementSource, ElementScalar, RoundStyle>,
+    CtaTileShapeMNK,
+    EpilogueTile
+> : Sm100GeluMulCompactColOrPassBlockScaleFactor<SFVecSize, EpilogueTile, typename cutlass::detail::get_unpacked_element_type<ElementOutput>::type, ElementCompute, ElementBlockScaleFactor, ElementSource, ElementScalar, RoundStyle> {
+
+  using Impl = Sm100GeluMulCompactColOrPassBlockScaleFactor<SFVecSize, EpilogueTile, typename cutlass::detail::get_unpacked_element_type<ElementOutput>::type, ElementCompute, ElementBlockScaleFactor, ElementSource, ElementScalar, RoundStyle>;
+  using Operation = GeluMulCompactColOrPassBlockScaleFactor<SFVecSize, ElementOutput, ElementCompute, ElementBlockScaleFactor, cutlass::layout::RowMajor, ElementSource, ElementScalar, RoundStyle>;
+
+  struct Arguments {
+    ElementScalar alpha = ElementScalar(1);
+    ElementScalar beta = ElementScalar(0);
+    ElementScalar const* alpha_ptr = nullptr;
+    ElementScalar const* beta_ptr = nullptr;
+    ElementBlockScaleFactor* block_scale_factor_ptr = nullptr;
+    using StrideNormConst = Stride<_0,_0,int64_t>;
+    ElementCompute const* norm_constant_ptr = nullptr;
+    StrideNormConst dNormConst = {_0{}, _0{}, 0};
+    using StrideAlpha = Stride<_0,_0,int64_t>;
+    using StrideBeta  = Stride<_0,_0,int64_t>;
+    StrideAlpha dAlpha = {_0{}, _0{}, 0};
+    StrideBeta  dBeta  = {_0{}, _0{}, 0};
+    uint8_t* compact_ptr = nullptr;
+    uint8_t* compact_sf_ptr = nullptr;
+    int mode = 0;
+
+    operator typename Impl::Arguments() const {
+      return
+        {
+          {
+            {{beta}, {beta_ptr}, {dBeta}},
+            {},
+            {
+              {{alpha}, {alpha_ptr}, {dAlpha}},
+              {},
+              {}
+            },
+            {}
+          },
+          {block_scale_factor_ptr, norm_constant_ptr, dNormConst,
+           compact_ptr, compact_sf_ptr, mode}
         };
     }
   };
