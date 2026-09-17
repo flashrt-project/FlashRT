@@ -22,8 +22,10 @@ Run::
 """
 
 import gc
+import json
 import os
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -110,6 +112,14 @@ def perturbed(tmp_path_factory):
             os.symlink(p, str(out / name))
         elif os.path.isdir(p):
             os.symlink(p, str(out / name))
+    # Original checkpoints may resolve statistics from a sibling directory.
+    # Make the copied fixture self-contained instead of relying on its parent.
+    if not (out / "norm_stats.json").exists():
+        from flash_rt.core.utils.norm_stats import load_norm_stats, pi05_candidates
+        checkpoint = Path(CKPT_PI05)
+        stats = load_norm_stats(pi05_candidates(checkpoint), checkpoint_dir=checkpoint)
+        (out / "norm_stats.json").write_text(
+            json.dumps({"norm_stats": stats}, default=lambda value: value.tolist()))
     return {"dir": str(out), "state": state}
 
 
@@ -133,6 +143,22 @@ def test_reload_matches_fresh_build(perturbed, use_fp8):
     before = [rt.infer(o, noise=noise)["actions"] for o in obs]
     graph_before = rt.pipeline._graph
     assert rt.weight_version == 0
+
+    # Malformed input must fail before changing any live weight or poisoning
+    # an otherwise usable frontend, even when the bad key is read last.
+    bad = dict(perturbed["state"])
+    embedding_key = next(k for k in bad if k.endswith("paligemma.lm_head.weight"))
+    del bad[embedding_key]
+    with pytest.raises(KeyError):
+        rt.reload_weights(bad)
+    bad[embedding_key] = perturbed["state"][embedding_key][:1]
+    with pytest.raises(ValueError, match="shape/dtype"):
+        rt.reload_weights(bad)
+    bad[embedding_key] = torch.zeros(1, dtype=torch.int64)
+    with pytest.raises(ValueError, match="floating-point"):
+        rt.reload_weights(bad)
+    assert rt.weight_version == 0
+    np.testing.assert_array_equal(rt.infer(obs[0], noise=noise)["actions"], before[0])
 
     elapsed = rt.reload_weights(perturbed["dir"])
     assert rt.weight_version == 1

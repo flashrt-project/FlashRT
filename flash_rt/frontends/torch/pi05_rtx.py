@@ -26,6 +26,7 @@ import math
 import os
 import pathlib
 import time
+import threading
 from typing import Optional, Union
 
 import numpy as np
@@ -34,6 +35,7 @@ import torch.nn.functional as F
 
 from flash_rt.core.utils.actions import unnormalize_actions, LIBERO_ACTION_DIM
 from flash_rt.frontends._fp8_layout import select_fp8_layout
+from flash_rt.models.pi05._lifecycle import serialized, reload_guard
 from flash_rt.hardware.rtx.attn_backend import RtxFlashAttnBackend
 from flash_rt.models.pi05.pipeline_rtx import (
     Pi05Pipeline,
@@ -558,6 +560,8 @@ class Pi05TorchFrontendRtx:
         # the skinny K-split kernels on sm_120a builds, "cublaslt" keeps
         # the library GEMMs, "skinny" requires the kernels. The environment
         # variable FLASHRT_PI05_DECODER_KERNEL overrides the default.
+        self._lifecycle_lock = threading.RLock()
+        self._reload_failed = False
         self._decoder_kernel = (decoder_kernel
                                 or os.environ.get("FLASHRT_PI05_DECODER_KERNEL", "cublaslt"))
         # Batched-mode width; set_batched_mode(batch_size=N) changes it.
@@ -925,6 +929,7 @@ class Pi05TorchFrontendRtx:
                 seen[id(pipe)] = pipe
         return list(seen.values())
 
+    @reload_guard
     def reload_weights(self, source) -> float:
         """Replace every model weight in place without rebuilding or
         re-capturing anything.
@@ -961,6 +966,32 @@ class Pi05TorchFrontendRtx:
                 path = path / "model.safetensors"
             source = load_file(str(path))
         scale_out = -1.0 / self._num_steps
+
+        # Complete conversion/shape preflight before touching graph-owned storage.
+        # Streaming twice avoids holding a second full model on the device.
+        seen = set()
+        def validate(key, value, layer):
+            if not isinstance(value, torch.Tensor):
+                return
+            if key not in self._ckpt_bf16:
+                raise ValueError(f"reload_weights: unexpected converted key {key}")
+            dst = self._ckpt_bf16[key]
+            if layer is not None:
+                dst = dst[layer]
+            if value.shape != dst.shape or value.dtype != dst.dtype:
+                raise ValueError(f"reload_weights: incompatible shape/dtype for {key}")
+            seen.add((key, layer))
+
+        for key, value in source.items():
+            if not isinstance(value, torch.Tensor) or not value.is_floating_point():
+                raise ValueError(f"reload_weights: {key} must be a floating-point tensor")
+        convert_pi05_safetensors(source, sink=validate)
+        for key, value in self._ckpt_bf16.items():
+            if isinstance(value, torch.Tensor) and (key, None) not in seen:
+                if not all((key, layer) in seen for layer in range(value.shape[0])):
+                    raise ValueError(f"reload_weights: missing converted weight {key}")
+        torch.cuda.synchronize()
+        self._reload_mutating = True
 
         def sink(key: str, value, layer) -> None:
             if not isinstance(value, torch.Tensor):
@@ -1197,6 +1228,7 @@ class Pi05TorchFrontendRtx:
     # Public API
     # -----------------------------------------------------------------
 
+    @serialized
     def set_rl_mode(
         self,
         *,
@@ -1265,6 +1297,7 @@ class Pi05TorchFrontendRtx:
             "RL mode enabled: cfg_beta=%.2f, advantage_positive=%s",
             new_config["cfg_beta"], new_config["advantage_positive"])
 
+    @serialized
     def set_prompt(self, prompt_text: str, state=None) -> None:
         """Tokenise prompt + (re)build the pipeline for the exact prompt length.
 
@@ -1532,6 +1565,7 @@ class Pi05TorchFrontendRtx:
             "Set RL prompt: '%s' (cond_len=%d, uncond_len=%d, padded=%d, batched=%s)",
             prompt_text, cond_len, uncond_len, target_len, use_batched_cfg)
 
+    @serialized
     def calibrate(
         self,
         observations,
@@ -1580,6 +1614,7 @@ class Pi05TorchFrontendRtx:
             self._calibrate_multi_frame(
                 obs_list, percentile=percentile, verbose=verbose)
 
+    @serialized
     def calibrate_with_real_data(self, sample_observations) -> None:
         """Legacy alias for :meth:`calibrate`."""
         self.calibrate(sample_observations)
@@ -1823,6 +1858,7 @@ class Pi05TorchFrontendRtx:
         """:class:`ModelPrecisionSpec` captured at calibration time."""
         return getattr(self, "_precision_spec", None)
 
+    @serialized
     def infer(self, observation: dict, debug: bool = False, *,
               noise=None, generator=None, return_noise: bool = False) -> dict:
         """Run inference on a single observation.
@@ -1982,6 +2018,7 @@ class Pi05TorchFrontendRtx:
     # Batched (B=N) inference path — _b2 names are historical, not a width limit
     # -----------------------------------------------------------------
 
+    @serialized
     def set_batched_mode(self, *, enable: bool = True,
                          batch_size: int = PI05_BATCH_SIZE) -> None:
         """Enable / disable B=N batching (N >= 1, default 2; opt-in).
@@ -2047,6 +2084,7 @@ class Pi05TorchFrontendRtx:
             "Pi05TorchFrontendRtx: batched mode enabled (B=%d)",
             self._batch_size)
 
+    @serialized
     def set_prompt_batch(self, prompts: list) -> None:
         """Set per-sample prompts for the batched pipeline.
 
@@ -2116,6 +2154,7 @@ class Pi05TorchFrontendRtx:
             self._batch_size, target_len,
             [p[:30] + ("…" if len(p) > 30 else "") for p in prompts])
 
+    @serialized
     def calibrate_batch(self, sample_observations) -> None:
         """Calibrate FP8 scales for the batched pipeline.
 
@@ -2152,6 +2191,7 @@ class Pi05TorchFrontendRtx:
         self.calibrated = True
         self.graph_recorded = self.use_cuda_graph
 
+    @serialized
     def infer_batch(self, observations: list, *,
                     noise=None, generator=None, return_noise: bool = False) -> list:
         """Run B=N inference on N independent observations.
