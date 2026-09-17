@@ -2,7 +2,7 @@
  * pi0.5 policy inference on a FlashRT TensorRT engine, as a TensorRT Edge-LLM
  * example (overlay: experimental_models/pi05).
  *
- * The engine comes from FlashRT-TensorRT tools/build_pi05_engine.sh: inputs
+ * The engine comes from FlashRT backends/tensorrt/tools/build_pi05_engine.sh: inputs
  * images fp16 [views, 224, 224, 3], lang_tokens int32 [n], noise fp16 [10, 32];
  * output actions fp16 [10, 32] (raw model space). It needs the FlashRT plugin
  * library, which is loaded into the TensorRT plugin registry before the engine

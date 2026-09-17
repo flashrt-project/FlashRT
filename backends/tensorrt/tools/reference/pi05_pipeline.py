@@ -1,4 +1,4 @@
-"""M1 step 1: a single-layer reference for the pi0.5 Thor FP4 encoder.
+"""a single-layer reference for the pi0.5 Thor FP4 encoder.
 
 Builds the production FP4 pipeline, reproduces one encoder layer with the
 same kernel sequence the library uses, checks that running the per-layer

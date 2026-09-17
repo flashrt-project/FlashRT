@@ -2,7 +2,6 @@
 
 #include <cuda_fp16.h>
 
-#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -29,22 +28,6 @@ int64_t sfa_bytes(int64_t rows, int64_t K) {
     return flash_rt::fp4::sfa_size_bytes(static_cast<int>(rows), static_cast<int>(K), false);
 }
 int64_t block_bytes(int64_t total, int layers) { return total / layers; }
-
-// Debug aid (FLASHRT_TRT_OPTIME=1): synchronize after each operation and
-// report the slow ones.
-struct OpTimer {
-    cudaStream_t stream;
-    bool on = std::getenv("FLASHRT_TRT_OPTIME") != nullptr;
-    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
-    void mark(const char* what, int layer) {
-        if (!on) return;
-        cudaStreamSynchronize(stream);
-        const auto now = std::chrono::steady_clock::now();
-        const double ms = std::chrono::duration<double, std::milli>(now - last).count();
-        if (ms > 50.0) std::fprintf(stderr, "[flashrt] slow op %s layer %d: %.1f ms\n", what, layer, ms);
-        last = now;
-    }
-};
 
 }  // namespace
 
@@ -95,8 +78,6 @@ int decoder_step_forward(const DecoderDims& d, const DecoderWeights& w, const De
     const float scale = 1.0f / std::sqrt(static_cast<float>(HD));
     if (enc_seq <= 0) return 1;
     if (cublasSetStream(cublas, stream) != CUBLAS_STATUS_SUCCESS) return 2;
-    OpTimer timer{stream};
-    timer.mark("entry", -1);
 
     // NVFP4 scale buffers: layout padding must read as zero.
     if (cudaMemsetAsync(s.xn_sfa, 0, sfa_bytes(S, D), stream) != cudaSuccess ||
@@ -129,7 +110,6 @@ int decoder_step_forward(const DecoderDims& d, const DecoderWeights& w, const De
 
     gmm_fp16(cublas, static_cast<const h16*>(noise), ain_w, x, S, D, kActionDim, 0.0f, stream);
     add_bias_fp16(x, static_cast<const h16*>(w.ain_b), S, D, stream);
-    timer.mark("action_in", -1);
 
     int rc = 0;
     for (int l = 0; l < L; ++l) {
@@ -137,14 +117,12 @@ int decoder_step_forward(const DecoderDims& d, const DecoderWeights& w, const De
         const auto* sf_l = reinterpret_cast<const h16*>(sf + style * l);
         if (l == 0) {
             pi05_adarms_fp4_sfa_native_fp16(x, sa_l, xn_p, xn_s, gate, S, D, stream);
-            timer.mark("adarms0", l);
         }
         if ((rc = cutlass_fp4_gemm_variant(d.v_qkv, xn_p, xn_s, at(w.qw_fp4, qw_p, l),
                                            at(w.qw_sfb, qw_s, l), s.qkv, S, kQkvWidth, D, 1.0f,
                                            0.0f, stream)) != 0) {
             return 100 + l;
         }
-        timer.mark("qkv_gemm", l);
         const long kv_off = static_cast<long>(l) * d.total_keys * HD + static_cast<long>(enc_seq) * HD;
         if ((rc = qkv_split_rope_kvcache_fp16_vec(
                  static_cast<const h16*>(s.qkv), static_cast<const h16*>(w.rope),
@@ -152,51 +130,42 @@ int decoder_step_forward(const DecoderDims& d, const DecoderWeights& w, const De
                  HD, kQkvWidth, kv_off, HD, stream)) != 0) {
             return 200 + l;
         }
-        timer.mark("qkv_split", l);
         const int64_t layer_kv = static_cast<int64_t>(l) * d.total_keys * HD * 2;
         attention_qkv_fp16(cublas, static_cast<const h16*>(s.attn),
                            static_cast<const h16*>(static_cast<void*>(static_cast<char*>(kv_k) + layer_kv)),
                            static_cast<const h16*>(static_cast<void*>(static_cast<char*>(kv_v) + layer_kv)),
                            static_cast<h16*>(s.logits), static_cast<h16*>(s.attn), S, d.total_keys, NH, HD,
                            scale, stream);
-        timer.mark("attention", l);
         if ((rc = flash_rt::fused_fp4::rowops_quantize_fp4_sfa_v2(
                  static_cast<const h16*>(s.attn), s.ctx_packed, s.ctx_sfa, S, A, stream)) != 0) {
             return 300 + l;
         }
-        timer.mark("quant", l);
         if ((rc = cutlass_fp4_gemm_variant(d.v_o, s.ctx_packed, s.ctx_sfa, at(w.ow_fp4, ow_p, l),
                                            at(w.ow_sfb, ow_s, l), fg, S, D, A, 1.0f, 0.0f, stream)) != 0) {
             return 400 + l;
         }
-        timer.mark("o_gemm", l);
         pi05_gate_res_adarms_fp4_sfa_native_fp16(fg, gate, x, sf_l, xn_p, xn_s, gate, S, D, stream);
-        timer.mark("gate_res_adarms_ffn", l);
         if ((rc = flash_rt::fp4::cutlass_fp4_gemm_geglu_il_hw_v10(
                  xn_p, xn_s, at(w.gwil_fp4, gw_p, l), at(w.gwil_sfb, gw_s, l), s.gu_dummy,
                  s.hid_packed, s.hid_sfa, S, 2 * H, D, stream)) != 0) {
             return 500 + l;
         }
-        timer.mark("geglu", l);
         if ((rc = cutlass_fp4_gemm_variant(d.v_down, s.hid_packed, s.hid_sfa, at(w.dw_fp4, dw_p, l),
                                            at(w.dw_sfb, dw_s, l), fg, S, D, H, 1.0f, 0.0f, stream)) != 0) {
             return 600 + l;
         }
-        timer.mark("down_gemm", l);
         if (l < L - 1) {
             const auto* sa_next = reinterpret_cast<const h16*>(sa + style * (l + 1));
             pi05_gate_res_adarms_fp4_sfa_native_fp16(fg, gate, x, sa_next, xn_p, xn_s, gate, S, D, stream);
         } else {
             gate_res_fp16(fg, gate, x, S * D, stream);
         }
-        timer.mark("gate_res_next", l);
     }
     adarms_fp16(x, static_cast<const h16*>(w.fs), static_cast<h16*>(s.xn), gate, S, D, stream);
     gmm_fp16_out_fp32(cublas, static_cast<const h16*>(s.xn), static_cast<const h16*>(w.aow),
                       static_cast<float*>(s.action_f32), S, kActionDim, D, stream);
     action_update_from_fp32(static_cast<const float*>(s.action_f32), static_cast<const h16*>(w.aob),
                             static_cast<h16*>(noise), S, kActionDim, d.dt, true, stream);
-    timer.mark("action_out", -1);
     return cudaGetLastError() == cudaSuccess ? 0 : 900;
 }
 

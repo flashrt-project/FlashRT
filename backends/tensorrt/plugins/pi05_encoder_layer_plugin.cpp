@@ -111,10 +111,6 @@ public:
         const int64_t max_se = in[0].max.d[0];
         const size_t bytes = max_se > 0 ? static_cast<size_t>(
             encoder_layer_scratch_bytes(dims_, static_cast<int>(max_se))) : 0;
-        if (std::getenv("FLASHRT_TRT_DEBUG") != nullptr) {
-            std::fprintf(stderr, "[flashrt] getWorkspaceSize max_se=%lld bytes=%zu D=%d H=%d NH=%d HD=%d\n",
-                         static_cast<long long>(max_se), bytes, dims_.D, dims_.H, dims_.NH, dims_.HD);
-        }
         return bytes;
     }
     // IPluginV3OneRuntime
@@ -207,10 +203,6 @@ public:
         for (int32_t i = 0; fc != nullptr && i < fc->nbFields; ++i) {
             const PluginField& f = fc->fields[i];
             if (f.name == nullptr || f.data == nullptr) continue;
-            if (std::getenv("FLASHRT_TRT_DEBUG") != nullptr) {
-                std::fprintf(stderr, "[flashrt] field %s type=%d length=%d\n", f.name,
-                             static_cast<int>(f.type), static_cast<int>(f.length));
-            }
             const std::string name(f.name);
             auto as_int = [&f]() -> int {
                 switch (f.type) {

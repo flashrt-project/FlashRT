@@ -1,4 +1,4 @@
-"""M2: the whole pi0.5 encoder as a chain of FlashRT layer plugins in one
+"""the whole pi0.5 encoder as a chain of FlashRT layer plugins in one
 TensorRT engine. Bitwise check of the final residual stream and every layer's
 K/V against the FlashRT library, eager and under an outer CUDA graph.
 
@@ -7,7 +7,10 @@ usage: engine_encoder_layer_chain.py <plugin.so> <encoder_dump.safetensors>
 import sys
 import time
 
-sys.path.append("/usr/lib/python3.12/dist-packages")
+try:
+    import tensorrt  # noqa: F401
+except ImportError:  # JetPack installs the TensorRT bindings for the system Python
+    sys.path.append(f"/usr/lib/python3.{sys.version_info.minor}/dist-packages")
 
 import numpy as np  # noqa: E402
 import tensorrt as trt  # noqa: E402
@@ -20,10 +23,8 @@ registry = trt.get_plugin_registry()
 registry.load_library(plugin_path)
 T = load_file(dump_path)
 Se, D, H, NH, HD, total_keys, o_variant, down_variant, L_full = T["meta"].tolist()
-import os
-L = int(os.environ.get("STAGE_LAYERS", L_full))
-NO_CONCAT = os.environ.get("NO_CONCAT") == "1"
-print(f"Se={Se} L={L} (of {L_full}) no_concat={NO_CONCAT}")
+L = L_full
+print(f"Se={Se} L={L}")
 
 
 def u8(t):
@@ -85,15 +86,11 @@ for l in range(L):
     k_outs.append(layer.get_output(1)); v_outs.append(layer.get_output(2))
 
 x.name = "x_out"; network.mark_output(x)
-if NO_CONCAT:
-    for l in range(L):
-        k_outs[l].name = f"k{l}"; network.mark_output(k_outs[l])
-        v_outs[l].name = f"v{l}"; network.mark_output(v_outs[l])
-else:
-    for name, outs in (("k", k_outs), ("v", v_outs)):
-        cat = network.add_concatenation(outs); cat.axis = 0
-        cat.get_output(0).name = name
-        network.mark_output(cat.get_output(0))
+# Per-layer K/V outputs: concatenating plugin outputs crashes execution
+# context creation on TensorRT 10.16.
+for l in range(L):
+    k_outs[l].name = f"k{l}"; network.mark_output(k_outs[l])
+    v_outs[l].name = f"v{l}"; network.mark_output(v_outs[l])
 
 config = builder.create_builder_config()
 config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30)
@@ -110,18 +107,14 @@ runtime = trt.Runtime(logger)
 engine = runtime.deserialize_cuda_engine(serialized)
 ctx = engine.create_execution_context()
 dev = torch.device("cuda")
-ref_x = T["x_out"].to(dev) if L == L_full else None
+ref_x = T["x_out"].to(dev)
 ref_k = torch.cat([T[f"L{l}.k_out"] for l in range(L)]).to(dev).view(L * Se, HD)
 ref_v = torch.cat([T[f"L{l}.v_out"] for l in range(L)]).to(dev).view(L * Se, HD)
 in_x = T["x_in"].to(dev).clone(); in_rope = T["rope"].to(dev).clone()
 outs = {"x_out": torch.empty(Se, D, dtype=torch.float16, device=dev)}
-if NO_CONCAT:
-    for l in range(L):
-        outs[f"k{l}"] = torch.empty(Se, HD, dtype=torch.float16, device=dev)
-        outs[f"v{l}"] = torch.empty(Se, HD, dtype=torch.float16, device=dev)
-else:
-    outs["k"] = torch.empty(L * Se, HD, dtype=torch.float16, device=dev)
-    outs["v"] = torch.empty(L * Se, HD, dtype=torch.float16, device=dev)
+for l in range(L):
+    outs[f"k{l}"] = torch.empty(Se, HD, dtype=torch.float16, device=dev)
+    outs[f"v{l}"] = torch.empty(Se, HD, dtype=torch.float16, device=dev)
 ctx.set_input_shape("x", (Se, D)); ctx.set_input_shape("rope", (Se, HD))
 ctx.set_tensor_address("x", in_x.data_ptr()); ctx.set_tensor_address("rope", in_rope.data_ptr())
 for n, t in outs.items():
@@ -130,8 +123,8 @@ side = torch.cuda.Stream()
 
 
 def check(tag):
-    k_all = torch.cat([outs[f"k{l}"] for l in range(L)]) if NO_CONCAT else outs["k"]
-    v_all = torch.cat([outs[f"v{l}"] for l in range(L)]) if NO_CONCAT else outs["v"]
+    k_all = torch.cat([outs[f"k{l}"] for l in range(L)])
+    v_all = torch.cat([outs[f"v{l}"] for l in range(L)])
     same = {"k": torch.equal(k_all, ref_k), "v": torch.equal(v_all, ref_v)}
     if ref_x is not None:
         same["x"] = torch.equal(outs["x_out"], ref_x)
@@ -166,4 +159,4 @@ with torch.cuda.stream(side):
     graph_ms = timed(graph.replay)
 print(f"encoder stage latency: eager median {eager_ms[0]:.2f} ms p90 {eager_ms[1]:.2f} | "
       f"graph median {graph_ms[0]:.2f} ms p90 {graph_ms[1]:.2f}")
-print("M2_ENCODER_" + ("PASS" if ok_eager and ok_graph else "FAIL"))
+print("ENGINE_ENCODER_" + ("PASS" if ok_eager and ok_graph else "FAIL"))

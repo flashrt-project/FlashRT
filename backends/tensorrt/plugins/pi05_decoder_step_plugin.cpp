@@ -116,8 +116,7 @@ public:
 
     int32_t onShapeChange(const PluginTensorDesc*, int32_t, const PluginTensorDesc*, int32_t) noexcept override {
         // Runs before execution, outside any CUDA graph capture.
-        const char* pdl = std::getenv("FLASHRT_TRT_PDL");
-        flash_rt::fp4::pdl_flag() = pdl == nullptr || pdl[0] != '0';
+        flash_rt::fp4::pdl_flag() = true;  // programmatic dependent launch, as in FlashRT's Thor default
         return shared_cublas() != nullptr ? 0 : -1;
     }
     int32_t enqueue(const PluginTensorDesc* inDesc, const PluginTensorDesc*, const void* const* inputs,

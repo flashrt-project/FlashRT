@@ -1,4 +1,4 @@
-"""M3: the pi0.5 action decoder as a chain of 10 Pi05DecoderStep plugins in
+"""the pi0.5 action decoder as a chain of 10 Pi05DecoderStep plugins in
 one TensorRT engine. Prefix K/V rows are flattened read-only inputs; each step
 keeps its cache in the plugin workspace. Every step's output is checked bitwise
 against the FlashRT library, eagerly and under an outer CUDA graph.
@@ -9,7 +9,10 @@ import os
 import sys
 import time
 
-sys.path.append("/usr/lib/python3.12/dist-packages")
+try:
+    import tensorrt  # noqa: F401
+except ImportError:  # JetPack installs the TensorRT bindings for the system Python
+    sys.path.append(f"/usr/lib/python3.{sys.version_info.minor}/dist-packages")
 
 import numpy as np  # noqa: E402
 import tensorrt as trt  # noqa: E402
@@ -141,4 +144,4 @@ with torch.cuda.stream(side):
     graph_ms = timed(graph.replay)
 print(f"decoder step chain latency (10 steps): eager median {eager_ms[0]:.2f} ms p90 {eager_ms[1]:.2f} | "
       f"graph median {graph_ms[0]:.2f} ms p90 {graph_ms[1]:.2f}")
-print("M3_DECODER_" + ("PASS" if ok_eager and ok_graph else "FAIL"))
+print("ENGINE_DECODER_STEPS_" + ("PASS" if ok_eager and ok_graph else "FAIL"))

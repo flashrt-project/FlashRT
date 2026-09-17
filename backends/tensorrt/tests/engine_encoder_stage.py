@@ -1,4 +1,4 @@
-"""M2: the full pi0.5 encoder as one Pi05Encoder stage node (the chain of
+"""the full pi0.5 encoder as one Pi05Encoder stage node (the chain of
 Pi05EncoderLayer nodes is tested by engine_encoder_layer_chain.py). Each is checked bitwise against the FlashRT library encoder
 output, eager and under an outer CUDA graph, with latency for both.
 
@@ -8,7 +8,10 @@ import os
 import sys
 import time
 
-sys.path.append("/usr/lib/python3.12/dist-packages")
+try:
+    import tensorrt  # noqa: F401
+except ImportError:  # JetPack installs the TensorRT bindings for the system Python
+    sys.path.append(f"/usr/lib/python3.{sys.version_info.minor}/dist-packages")
 
 import numpy as np  # noqa: E402
 import tensorrt as trt  # noqa: E402
@@ -190,4 +193,4 @@ for kind in ("stage",):  # the layer chain is covered by engine_encoder_layer_ch
     ok = ok and eager_ok and graph_ok
     del ctx, engine, g
     torch.cuda.empty_cache()
-print("M2_ENCODER_" + ("PASS" if ok else "FAIL"))
+print("ENGINE_ENCODER_" + ("PASS" if ok else "FAIL"))

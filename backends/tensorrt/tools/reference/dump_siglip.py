@@ -1,4 +1,4 @@
-"""M5: SigLIP reference dump for the pi0.5 Thor FP4 vision stage.
+"""SigLIP reference dump for the pi0.5 Thor FP4 vision stage.
 
 Builds the production FP4 pipeline (FA4, NVFP4 SigLIP FFN, rowops v2, AWQ
 calibrated on real observations), then for one observation:

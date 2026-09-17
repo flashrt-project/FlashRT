@@ -1,4 +1,4 @@
-"""M1 step 3: one pi0.5 encoder layer as a TensorRT engine with the FlashRT
+"""one pi0.5 encoder layer as a TensorRT engine with the FlashRT
 plugin. Checks bitwise parity against the FlashRT reference dump, then again
 under an outer CUDA graph, and reports latency for both.
 
@@ -7,7 +7,10 @@ usage: engine_encoder_layer.py <plugin.so> <layer.safetensors> <engine_out>
 import sys
 import time
 
-sys.path.append("/usr/lib/python3.12/dist-packages")
+try:
+    import tensorrt  # noqa: F401
+except ImportError:  # JetPack installs the TensorRT bindings for the system Python
+    sys.path.append(f"/usr/lib/python3.{sys.version_info.minor}/dist-packages")
 
 import numpy as np  # noqa: E402
 import tensorrt as trt  # noqa: E402
@@ -148,4 +151,4 @@ torch.cuda.synchronize()
 ok_graph = check("TRT + outer CUDA graph")
 graph_ms = timed(graph.replay)
 print(f"latency eager median {eager_ms[0]:.3f} ms p90 {eager_ms[1]:.3f} | graph replay median {graph_ms[0]:.3f} ms p90 {graph_ms[1]:.3f}")
-print("M1_TRT_" + ("PASS" if ok_eager and ok_graph else "FAIL"))
+print("ENGINE_ENCODER_LAYER_" + ("PASS" if ok_eager and ok_graph else "FAIL"))

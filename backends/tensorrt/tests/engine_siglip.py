@@ -1,4 +1,4 @@
-"""M5: pi0.5 SigLIP as TensorRT engines on FlashRT plugins, checked bitwise
+"""pi0.5 SigLIP as TensorRT engines on FlashRT plugins, checked bitwise
 against the FlashRT library forward (tools/reference/dump_siglip.py), eager and under
 an outer CUDA graph, with latency for both.
 
@@ -11,7 +11,10 @@ import os
 import sys
 import time
 
-sys.path.append("/usr/lib/python3.12/dist-packages")
+try:
+    import tensorrt  # noqa: F401
+except ImportError:  # JetPack installs the TensorRT bindings for the system Python
+    sys.path.append(f"/usr/lib/python3.{sys.version_info.minor}/dist-packages")
 
 import numpy as np  # noqa: E402
 import tensorrt as trt  # noqa: E402
@@ -168,4 +171,4 @@ for kind in os.environ.get("KINDS", "layers,stage").split(","):
     ok = ok and eager_ok and graph_ok
     del ctx, engine, g
     torch.cuda.empty_cache()
-print("M5_SIGLIP_" + ("PASS" if ok else "FAIL"))
+print("ENGINE_SIGLIP_" + ("PASS" if ok else "FAIL"))

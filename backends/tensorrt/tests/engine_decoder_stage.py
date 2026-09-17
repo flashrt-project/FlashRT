@@ -1,4 +1,4 @@
-"""M3: the whole pi0.5 action decoder (10 denoise steps) as one FlashRT
+"""the whole pi0.5 action decoder (10 denoise steps) as one FlashRT
 plugin in a TensorRT engine. The prefix K/V rows are engine inputs; the
 full cache lives in the plugin workspace. Bitwise check of the final raw
 actions against the FlashRT library, eager and under an outer CUDA graph.
@@ -9,7 +9,10 @@ import os
 import sys
 import time
 
-sys.path.append("/usr/lib/python3.12/dist-packages")
+try:
+    import tensorrt  # noqa: F401
+except ImportError:  # JetPack installs the TensorRT bindings for the system Python
+    sys.path.append(f"/usr/lib/python3.{sys.version_info.minor}/dist-packages")
 
 import numpy as np  # noqa: E402
 import tensorrt as trt  # noqa: E402
@@ -92,21 +95,7 @@ ctx.set_input_shape("prefix_k", tuple(in_k.shape)); ctx.set_input_shape("prefix_
 for n, t in (("noise", in_noise), ("prefix_k", in_k), ("prefix_v", in_v), ("actions", actions)):
     ctx.set_tensor_address(n, t.data_ptr())
 side = torch.cuda.Stream()
-if os.environ.get("FLASHRT_TRT_CHECKSUM"):
-    def wsum(t):
-        b = np.frombuffer(t.detach().contiguous().cpu().numpy().tobytes(), dtype=np.uint8).astype(np.uint64)
-        idx = (np.arange(b.size, dtype=np.uint64) % 65521) + 1
-        return int((b * idx).sum() % (1 << 64)), b[:8].astype(np.uint8).tobytes().hex()
-    named = [("noise", in_noise), ("prefix_k", in_k), ("prefix_v", in_v)]
-    named += [(n, torch.from_numpy(f16(n))) for n in ("ain_w", "ain_b", "aow", "aob", "rope", "sa", "sf", "fs")]
-    named += [(n, torch.from_numpy(blob(T[n]))) for n in ("qw_fp4", "qw_sfb", "ow_fp4", "ow_sfb", "gwil_fp4", "gwil_sfb", "dw_fp4", "dw_sfb")]
-    for n in ("noise", "prefix_k", "prefix_v", "actions"):
-        print(f"[py] {n}: engine shape {engine.get_tensor_shape(n)} ctx shape {ctx.get_tensor_shape(n)} "
-              f"format {engine.get_tensor_format_desc(n)} vectorized_dim {engine.get_tensor_vectorized_dim(n)}")
-    print("[py] user ptrs", hex(in_k.data_ptr()), hex(in_v.data_ptr()), "strides", in_k.stride())
-    for i, (n, t) in enumerate(named):
-        w, h = wsum(t)
-        print(f"[py] in{i:<2} {n:9s} wsum={w} head={h}")
+
 
 
 def check(tag):
@@ -141,4 +130,4 @@ with torch.cuda.stream(side):
     graph_ms = timed(graph.replay)
 print(f"decoder stage latency (10 steps): eager median {eager_ms[0]:.2f} ms p90 {eager_ms[1]:.2f} | "
       f"graph median {graph_ms[0]:.2f} ms p90 {graph_ms[1]:.2f}")
-print("M3_DECODER_STAGE_" + ("PASS" if ok_eager and ok_graph else "FAIL"))
+print("ENGINE_DECODER_STAGE_" + ("PASS" if ok_eager and ok_graph else "FAIL"))

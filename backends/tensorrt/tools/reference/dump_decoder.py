@@ -1,4 +1,4 @@
-"""M3 step 1: a per-denoise-step reference for the pi0.5 Thor FP4 decoder.
+"""a per-denoise-step reference for the pi0.5 Thor FP4 decoder.
 
 Runs the library encoder for a real observation, then the library decoder
 (10 steps) from a fixed noise, reproduces the decoder step by step with the

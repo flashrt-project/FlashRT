@@ -1,4 +1,4 @@
-"""M2: dump the whole pi0.5 Thor FP4 encoder (all layers) for the stage test.
+"""dump the whole pi0.5 Thor FP4 encoder (all layers) for the stage test.
 
 Reuses the M1 pipeline setup and per-layer reference. Writes the encoder
 input, every layer's packed weights and scales, the final residual stream and

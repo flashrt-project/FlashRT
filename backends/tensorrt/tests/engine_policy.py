@@ -1,4 +1,4 @@
-"""M4 step 1: the whole pi0.5 policy as one TensorRT engine on FlashRT stage
+"""the whole pi0.5 policy as one TensorRT engine on FlashRT stage
 plugins, images + noise -> raw actions:
 
   images fp16 [3, 224, 224, 3] -> Pi05Siglip -> image tokens [768, 2048]
@@ -16,7 +16,10 @@ import os
 import sys
 import time
 
-sys.path.append("/usr/lib/python3.12/dist-packages")
+try:
+    import tensorrt  # noqa: F401
+except ImportError:  # JetPack installs the TensorRT bindings for the system Python
+    sys.path.append(f"/usr/lib/python3.{sys.version_info.minor}/dist-packages")
 
 import numpy as np  # noqa: E402
 import tensorrt as trt  # noqa: E402
@@ -157,10 +160,6 @@ t0 = time.time()
 ser = builder.build_serialized_network(net, config)
 assert ser is not None, "engine build failed"
 print(f"engine built in {time.time() - t0:.1f}s, {ser.nbytes / 1e6:.0f} MB")
-engine_path = os.environ.get("ENGINE_OUT")
-if engine_path:
-    with open(engine_path, "wb") as f:
-        f.write(ser)
 engine = trt.Runtime(logger).deserialize_cuda_engine(ser)
 del ser
 ctx = engine.create_execution_context()
@@ -205,4 +204,4 @@ graph_ok = torch.equal(out, ref)
 graph_ms = timed(g.replay, n=200)
 print(f"[full] actions bitwise eager={eager_ok} (max|d| {d:.3g}) graph={graph_ok} | eager median "
       f"{eager_ms[0]:.2f} ms p90 {eager_ms[1]:.2f} | graph median {graph_ms[0]:.2f} ms p90 {graph_ms[1]:.2f}")
-print("M4_FULL_" + ("PASS" if eager_ok and graph_ok else "FAIL"))
+print("ENGINE_POLICY_" + ("PASS" if eager_ok and graph_ok else "FAIL"))

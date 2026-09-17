@@ -24,7 +24,7 @@ T=$(cd "$(dirname "$0")" && pwd); BACKEND=$(dirname "$T"); ROOT=$(cd "$BACKEND/.
 PYTHON=${PYTHON:-python3}; ONNX_PYTHON=${ONNX_PYTHON:-$PYTHON}
 B=${BUILD_DIR:-$ROOT/build/tensorrt}; P=$B/libflashrt_trt_pi05.so
 TRTEXEC=${TRTEXEC:-$(command -v trtexec || echo /usr/src/tensorrt/bin/trtexec)}
-export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" BUILDER_OPT_LEVEL=0 NO_CONCAT=1
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" BUILDER_OPT_LEVEL=0
 # FlashRT compiles FA4 for Thor under this CuTe DSL chip name (nvidia-cutlass-dsl 4.5).
 export CUTE_DSL_ARCH=${CUTE_DSL_ARCH:-sm_101a}
 CUBLAS_DIR=$($PYTHON -c "import nvidia, os; d = os.path.join(list(nvidia.__path__)[0], 'cu13', 'lib'); print(d if os.path.isdir(d) else '')" 2>/dev/null || true)

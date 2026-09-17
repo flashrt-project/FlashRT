@@ -1,4 +1,4 @@
-"""M4 step 2: run a serialized pi0.5 engine (built by trtexec from
+"""run a serialized pi0.5 engine (built by trtexec from
 tools/export_onnx.py output) and check its actions bitwise against the
 FlashRT library inference, eagerly and under an outer CUDA graph.
 
@@ -9,7 +9,10 @@ import struct
 import sys
 import time
 
-sys.path.append("/usr/lib/python3.12/dist-packages")
+try:
+    import tensorrt  # noqa: F401
+except ImportError:  # JetPack installs the TensorRT bindings for the system Python
+    sys.path.append(f"/usr/lib/python3.{sys.version_info.minor}/dist-packages")
 
 import numpy as np  # noqa: E402
 import tensorrt as trt  # noqa: E402
@@ -72,4 +75,4 @@ with torch.cuda.stream(stream):
     graph_ms = timed(g.replay)
 print(f"[engine file] actions bitwise eager={eager_ok} graph={graph_ok} | eager median {eager_ms[0]:.2f} ms "
       f"p90 {eager_ms[1]:.2f} | graph median {graph_ms[0]:.2f} ms p90 {graph_ms[1]:.2f}")
-print("M4_ENGINE_FILE_" + ("PASS" if eager_ok and graph_ok else "FAIL"))
+print("ENGINE_FILE_" + ("PASS" if eager_ok and graph_ok else "FAIL"))

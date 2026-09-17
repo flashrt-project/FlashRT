@@ -112,38 +112,13 @@ public:
     }
     int32_t onShapeChange(const PluginTensorDesc*, int32_t, const PluginTensorDesc*, int32_t) noexcept override {
         // Runs before execution, outside any CUDA graph capture.
-        const char* pdl = std::getenv("FLASHRT_TRT_PDL");
-        flash_rt::fp4::pdl_flag() = pdl == nullptr || pdl[0] != '0';
+        flash_rt::fp4::pdl_flag() = true;  // programmatic dependent launch, as in FlashRT's Thor default
         return shared_cublas() != nullptr ? 0 : -1;
     }
     int32_t enqueue(const PluginTensorDesc* inDesc, const PluginTensorDesc*, const void* const* inputs,
                     void* const* outputs, void* workspace, cudaStream_t stream) noexcept override {
         cublasHandle_t cublas = shared_cublas();
         if (cublas == nullptr) return -1;
-        if (std::getenv("FLASHRT_TRT_CHECKSUM") != nullptr) {
-            cudaStreamSynchronize(stream);
-            std::fprintf(stderr, "[flashrt] workspace=%p\n", workspace);
-            for (int i = 1; i <= 2; ++i) {
-                std::fprintf(stderr, "[flashrt] in%d nbDims=%d d=[%lld,%lld,%lld,%lld] ptr=%p\n", i, inDesc[i].dims.nbDims,
-                             static_cast<long long>(inDesc[i].dims.d[0]), static_cast<long long>(inDesc[i].dims.d[1]),
-                             static_cast<long long>(inDesc[i].dims.d[2]), static_cast<long long>(inDesc[i].dims.d[3]),
-                             static_cast<void*>(const_cast<void*>(inputs[i])));
-            }
-            for (int i = 0; i < kNbInputs; ++i) {
-                int64_t n = 1;
-                for (int k = 0; k < inDesc[i].dims.nbDims; ++k) n *= inDesc[i].dims.d[k];
-                const int64_t bytes = n * (inDesc[i].type == DataType::kINT32 ? 4 : 2);
-                std::vector<unsigned char> h(static_cast<size_t>(bytes));
-                cudaMemcpy(h.data(), inputs[i], h.size(), cudaMemcpyDeviceToHost);
-                uint64_t wsum = 0;
-                for (size_t j = 0; j < h.size(); ++j) wsum += static_cast<uint64_t>(h[j]) * ((j % 65521) + 1);
-                std::fprintf(stderr, "[flashrt] in%-2d fmt=%d bytes=%lld wsum=%llu head=", i,
-                             static_cast<int>(inDesc[i].format), static_cast<long long>(bytes),
-                             static_cast<unsigned long long>(wsum));
-                for (int j = 0; j < 8 && j < static_cast<int>(h.size()); ++j) std::fprintf(stderr, "%02x", h[j]);
-                std::fprintf(stderr, "\n");
-            }
-        }
         DecoderDims d = c_.dims;
         if (inDesc[1].dims.nbDims != 1 || inDesc[1].dims.d[0] % (static_cast<int64_t>(d.L) * d.HD) != 0) return -1;
         const int prefix = static_cast<int>(inDesc[1].dims.d[0] / (static_cast<int64_t>(d.L) * d.HD));

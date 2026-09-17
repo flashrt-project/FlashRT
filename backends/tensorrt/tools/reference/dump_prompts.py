@@ -1,4 +1,4 @@
-"""M6: prompt-dynamic references for the pi0.5 policy engine.
+"""prompt-dynamic references for the pi0.5 policy engine.
 
 With one calibrated FlashRT pipeline (calibrated on the default prompt), for
 each prompt: set the prompt, run the library SigLIP graph, encoder and decoder

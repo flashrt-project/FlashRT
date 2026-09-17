@@ -1,4 +1,4 @@
-"""M6: prompt-dynamic pi0.5 engine (tools/export_onnx.py --prompts, built with
+"""prompt-dynamic pi0.5 engine (tools/export_onnx.py --prompts, built with
 trtexec) against FlashRT: for every reference prompt, the engine's raw actions
 from the same images and pinned noise must match the library bit for bit,
 eagerly and under an outer CUDA graph captured for that prompt length.
@@ -10,7 +10,10 @@ import struct
 import sys
 import time
 
-sys.path.append("/usr/lib/python3.12/dist-packages")
+try:
+    import tensorrt  # noqa: F401
+except ImportError:  # JetPack installs the TensorRT bindings for the system Python
+    sys.path.append(f"/usr/lib/python3.{sys.version_info.minor}/dist-packages")
 
 import numpy as np  # noqa: E402
 import tensorrt as trt  # noqa: E402
@@ -100,4 +103,4 @@ with torch.cuda.stream(stream):
               f"eager {eager_ms:.2f} ms, graph {graph_ms:.2f} ms")
         ok = ok and eager_ok and graph_ok
         del g
-print("M6_PROMPT_ENGINE_" + ("PASS" if ok else "FAIL"))
+print("ENGINE_PROMPT_DYNAMIC_" + ("PASS" if ok else "FAIL"))
