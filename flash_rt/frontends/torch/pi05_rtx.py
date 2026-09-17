@@ -2288,6 +2288,7 @@ class Pi05TorchFrontendRtx:
             out.add(int(self._batch_size))
         return tuple(sorted(out))
 
+    @serialized
     def select_batch_size(self, batch_size: int) -> None:
         """Make the batched pipeline of width ``batch_size`` the active one.
 

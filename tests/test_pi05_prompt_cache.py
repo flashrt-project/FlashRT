@@ -59,6 +59,34 @@ def test_cache_is_lru_and_keys_on_text_len_state():
     c.clear(); assert len(c) == 0
 
 
+def test_batch_width_switch_uses_lifecycle_guard():
+    from types import SimpleNamespace
+    from threading import RLock
+    from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
+
+    class RecordingLock:
+        def __init__(self):
+            self.lock = RLock()
+            self.entries = 0
+
+        def __enter__(self):
+            self.lock.acquire()
+            self.entries += 1
+
+        def __exit__(self, *args):
+            self.lock.release()
+
+    lock = RecordingLock()
+    frontend = SimpleNamespace(_lifecycle_lock=lock, _reload_failed=False,
+                               _batched_active=True, _batch_size=4)
+    Pi05TorchFrontendRtx.select_batch_size(frontend, 4)
+    assert lock.entries == 1
+    frontend._reload_failed = True
+    with pytest.raises(RuntimeError, match="reload failed after mutation"):
+        Pi05TorchFrontendRtx.select_batch_size(frontend, 4)
+    assert lock.entries == 2
+
+
 def _tokenizer_available() -> bool:
     try:
         from flash_rt.frontends.torch.pi05_rtx import _get_tokenizer
