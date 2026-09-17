@@ -4,7 +4,7 @@
 // scale 1): out = quant(gelu_tanh(g) * u). One pass over the merged input,
 // one CTA per (row, 2048-column chunk of the output) so long rows do not
 // serialize on a single CTA the way the row-per-CTA quantizer does.
-#include "geglu_nvfp4_quant.cuh"
+#include "pi05_geglu_nvfp4_quant.cuh"
 #include "nvfp4_convert.cuh"
 
 #include <cuda_bf16.h>

@@ -1910,8 +1910,11 @@ endif()
 
 # Skinny FP8 decoder GEMM family: sm_120a only (mma.kind::f8f6f4).
 if(FLASHRT_ENABLE_PI05_NVFP4)
-  target_sources(flash_rt_kernels PRIVATE csrc/kernels/geglu_nvfp4_quant.cu)
+  message(STATUS "Pi0.5 NVFP4 prefix kernels: ENABLED (SM120, runtime opt-in)")
+  target_sources(flash_rt_kernels PRIVATE csrc/kernels/pi05/pi05_geglu_nvfp4_quant.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_PI05_NVFP4=1)
+else()
+  message(STATUS "Pi0.5 NVFP4 prefix kernels: DISABLED")
 endif()
 if(FLASHRT_ENABLE_PI05_SKINNY)
   target_sources(flash_rt_kernels PRIVATE

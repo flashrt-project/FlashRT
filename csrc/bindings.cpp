@@ -56,7 +56,7 @@
 #include "kernels/qwen36_flashinfer_xqa.cuh"
 #endif
 #ifdef ENABLE_PI05_NVFP4
-#include "kernels/geglu_nvfp4_quant.cuh"
+#include "kernels/pi05/pi05_geglu_nvfp4_quant.cuh"
 #endif
 #ifdef FLASHRT_PI05_DECODER_SKINNY_SM120
 #include "kernels/pi05/pi05_decoder_skinny_fp8_sm120.cuh"
