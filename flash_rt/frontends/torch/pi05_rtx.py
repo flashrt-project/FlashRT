@@ -422,8 +422,10 @@ def _quantize_fp8_e4m3(w_bf16: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
     """Per-tensor symmetric FP8 E4M3 quantization (no host sync: the scale
     stays a device tensor so hundreds of tensors quantize back to back)."""
     w = w_bf16.float()
-    scale_tensor = (w.abs().amax() / 448.0).clamp_min(1e-12).reshape(1).to(torch.float32)
-    w_fp8 = (w / scale_tensor).clamp(-448.0, 448.0).to(fp8_e4m3)
+    # Match the original Python-double scale and scalar-division rounding.
+    # FP32 scale arithmetic can move BF16 weights across FP8 midpoints.
+    scale_tensor = (w.abs().amax().double() / 448.0).clamp_min(1e-12).float().reshape(1)
+    w_fp8 = (w * scale_tensor.reciprocal()).clamp(-448.0, 448.0).to(fp8_e4m3)
     return w_fp8, scale_tensor
 
 
