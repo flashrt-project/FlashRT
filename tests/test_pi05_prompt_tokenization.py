@@ -14,7 +14,7 @@ def _sp():
         from flash_rt.utils.paligemma_tokenizer import load_paligemma_sentencepiece
 
         return load_paligemma_sentencepiece()
-    except Exception as exc:  # noqa: BLE001
+    except (FileNotFoundError, ModuleNotFoundError) as exc:
         pytest.skip(f"paligemma tokenizer unavailable: {exc}")
 
 
@@ -24,9 +24,8 @@ def _openpi_format(sp, prompt):
 
 
 def _fallback_format(sp, prompt):
-    # what _embed_prompt's fallback path builds before embedding
-    cleaned = prompt.strip().replace("_", " ").replace("\n", " ")
-    return [sp.bos_id()] + sp.Encode(cleaned) + [108]
+    from flash_rt.utils.paligemma_tokenizer import encode_pi05_prompt
+    return encode_pi05_prompt(sp, prompt)
 
 
 @pytest.mark.parametrize("prompt", [

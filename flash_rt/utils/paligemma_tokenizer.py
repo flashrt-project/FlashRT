@@ -118,6 +118,12 @@ def resolve_paligemma_tokenizer_path() -> str:
     raise FileNotFoundError(_format_help_message(probed))
 
 
+def encode_pi05_prompt(sp, prompt: str) -> list[int]:
+    """Encode a stateless Pi0.5 prompt with the openpi normalization contract."""
+    cleaned = prompt.strip().replace("_", " ").replace("\n", " ")
+    return [sp.bos_id()] + sp.Encode(cleaned) + [108]
+
+
 def load_paligemma_sentencepiece():
     """Return a loaded `sentencepiece.SentencePieceProcessor` for the
     PaliGemma model. Raises FileNotFoundError with a helpful download

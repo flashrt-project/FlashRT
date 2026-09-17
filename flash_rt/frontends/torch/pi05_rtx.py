@@ -325,8 +325,8 @@ def _embed_prompt(prompt_text: str, embedding_weight: torch.Tensor,
             # before the advantage tag. 108 is PaliGemma's `\n` token,
             # used by openpi as the prompt-end separator before the
             # action prefix.
-            cleaned = prompt_text.strip().replace("_", " ").replace("\n", " ")
-            tokens = [sp.bos_id()] + sp.Encode(cleaned) + [108]
+            from flash_rt.utils.paligemma_tokenizer import encode_pi05_prompt
+            tokens = encode_pi05_prompt(sp, prompt_text)
         else:
             tokens = sp.Encode(format_pi05_prompt(prompt_text, state),
                                add_bos=True)
