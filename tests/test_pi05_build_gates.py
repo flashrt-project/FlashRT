@@ -22,7 +22,7 @@ def test_headers_and_bindings_share_pi05_gates():
     for header, symbol, guard in (
         ("sde_step.cuh", "pi05_sde_residual_add", "ENABLE_PI05_SDE"),
         ("geglu_nvfp4_quant.cuh", "pi05_geglu_merged_to_nvfp4_swizzled", "ENABLE_PI05_NVFP4"),
-        ("decoder_skinny_fp8_sm120.cuh", "pi05_dec_skinny_available", "FLASHRT_DECODER_SKINNY_SM120"),
+        ("pi05/pi05_decoder_skinny_fp8_sm120.cuh", "pi05_dec_skinny_available", "FLASHRT_PI05_DECODER_SKINNY_SM120"),
     ):
         for needle in (f'#include "kernels/{header}"', f'm.def("{symbol}"'):
             guards = guards_at(text, needle)
@@ -36,3 +36,15 @@ def test_pi05_features_default_off():
         line = next(line for line in cmake.splitlines()
                     if line.startswith(f"option(FLASHRT_ENABLE_PI05_{option} "))
         assert line.endswith(" OFF)")
+
+
+def test_fused_sde_obeys_both_feature_gates():
+    binding = (ROOT / "csrc/bindings.cpp").read_text()
+    guards = guards_at(binding, 'm.def("pi05_dec_skinny_action_out_residual_sde"')
+    assert "#ifdef ENABLE_PI05_SDE" in guards
+    assert "#ifdef FLASHRT_PI05_DECODER_SKINNY_SM120" in guards
+    for suffix in ("cu", "cuh"):
+        source = (ROOT / f"csrc/kernels/pi05/pi05_decoder_skinny_fp8_sm120.{suffix}").read_text()
+        assert "#ifdef ENABLE_PI05_SDE" in guards_at(source, "int action_out_residual_sde(")
+    cmake = (ROOT / "CMakeLists.txt").read_text()
+    assert "target_compile_definitions(pi05_decoder_skinny_sm120_obj PRIVATE ENABLE_PI05_SDE=1)" in cmake

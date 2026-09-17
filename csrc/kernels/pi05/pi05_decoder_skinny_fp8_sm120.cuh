@@ -111,12 +111,14 @@ int action_out_residual(const __nv_bfloat16* x, const __nv_bfloat16* w_out,
                         __nv_bfloat16* trace_delta, int rows, bool pdl,
                         cudaStream_t stream);
 
+#ifdef ENABLE_PI05_SDE
 // Stochastic step: noise += a + sigma * eps (device-side sigma; bit-identical
 // to action_out_residual when *sigma == 0). eps rows match the noise rows.
 int action_out_residual_sde(const __nv_bfloat16* x, const __nv_bfloat16* w_out, const __nv_bfloat16* b_out,
                             __nv_bfloat16* action, __nv_bfloat16* noise, __nv_bfloat16* trace_x,
                             __nv_bfloat16* trace_delta, const __nv_bfloat16* eps, const float* sigma, int rows,
                             bool pdl, cudaStream_t stream);
+#endif
 
 }  // namespace pi05_dec_skinny
 }  // namespace flash_rt

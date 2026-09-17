@@ -663,6 +663,7 @@ action_out_residual_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloa
     }
 }
 
+#ifdef ENABLE_PI05_SDE
 // Stochastic variant: noise += a + sigma * eps (fp32 fma, one bf16
 // rounding). With *sigma == 0 it is bit-identical to action_out_residual,
 // so one captured graph serves the ODE and the SDE sampler. The trace
@@ -701,6 +702,8 @@ action_out_residual_sde_kernel(const __nv_bfloat16* __restrict__ x, const __nv_b
         noise[idx] = __float2bfloat16(__bfloat162float(old) + inc);
     }
 }
+
+#endif
 
 template <typename... Args>
 int launch_ex(const void* fn, dim3 grid, dim3 block, cudaStream_t stream, bool pdl, Args... args) {
@@ -911,6 +914,7 @@ int action_out_residual(const __nv_bfloat16* x, const __nv_bfloat16* w_out, cons
                      b_out, action, noise, trace_x, trace_delta);
 }
 
+#ifdef ENABLE_PI05_SDE
 int action_out_residual_sde(const __nv_bfloat16* x, const __nv_bfloat16* w_out, const __nv_bfloat16* b_out,
                             __nv_bfloat16* action, __nv_bfloat16* noise, __nv_bfloat16* trace_x,
                             __nv_bfloat16* trace_delta, const __nv_bfloat16* eps, const float* sigma, int rows,
@@ -922,6 +926,7 @@ int action_out_residual_sde(const __nv_bfloat16* x, const __nv_bfloat16* w_out, 
     return launch_ex((const void*)action_out_residual_sde_kernel<false>, grid, dim3(256), stream, false, x, w_out,
                      b_out, action, noise, trace_x, trace_delta, eps, sigma);
 }
+#endif
 
 }  // namespace pi05_dec_skinny
 }  // namespace flash_rt

@@ -7336,6 +7336,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("x"), py::arg("w_out"), py::arg("b_out"), py::arg("action"), py::arg("noise"),
        py::arg("trace_x") = 0, py::arg("trace_delta") = 0, py::arg("rows") = 0, py::arg("pdl") = true,
        py::arg("stream") = 0);
+#ifdef ENABLE_PI05_SDE
     m.def("pi05_dec_skinny_action_out_residual_sde", [](uintptr_t x, uintptr_t w_out, uintptr_t b_out, uintptr_t action,
                                                    uintptr_t noise, uintptr_t trace_x, uintptr_t trace_delta,
                                                    uintptr_t eps, uintptr_t sigma, int rows, bool pdl,
@@ -7348,6 +7349,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("x"), py::arg("w_out"), py::arg("b_out"), py::arg("action"), py::arg("noise"),
        py::arg("trace_x"), py::arg("trace_delta"), py::arg("eps"), py::arg("sigma"), py::arg("rows"),
        py::arg("pdl") = true, py::arg("stream") = 0);
+#endif  // ENABLE_PI05_SDE
 #endif  // FLASHRT_PI05_DECODER_SKINNY_SM120
 
 #ifdef ENABLE_DECODE_GEMV_M1
