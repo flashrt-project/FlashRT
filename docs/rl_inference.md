@@ -358,16 +358,14 @@ still requires B = 2 (conditioned and unconditioned slots) and
 ### Prompt rotation and several batched widths (fleet serving)
 
 Prompt embeddings are cached per frontend (text, state, max length) and
-the tokenizer is built once per process, so a fleet whose tasks rotate
-at episode boundaries pays nothing for `set_prompt_batch` beyond the
-device rows of the slots that actually changed (`set_language_embeds_batch(...,
+the tokenizer is built once per process, so repeated prompt/state pairs
+avoid tokenization and embedding. `set_prompt_batch` uploads only the
+device rows of slots that changed (`set_language_embeds_batch(...,
 slots=[...])`); the cache is dropped on `reload_weights` because the
-embedding table changes. Before this every rotation re-read the 4 MiB
-SentencePiece model and re-embedded every slot: with two tasks
-alternating across 8 environments the batched actor cost 10.4 ms per
-environment instead of 8.0; now 8.1 ms with 1, 2 or 8 distinct prompts
-(`tests/test_pi05_prompt_cache.py`: rotated prompts bit-identical to a
-cold re-embedding, rotation under 20 ms).
+embedding table changes. Unseen prompt/state pairs still perform the full
+embedding work. `tests/test_pi05_prompt_cache.py` checks rotated prompts
+against cold re-embedding; performance reports must label cache warmup
+and distinguish repeated-input workloads from unseen-input workloads.
 
 ```python
 rt.set_batched_mode(enable=True, batch_size=8)
@@ -381,15 +379,12 @@ rt.select_batch_size(8)                        # O(1) swap back; rt.batch_sizes 
 They share every weight buffer (BF16, FP8 and NVFP4 copies, decoder
 styles: `reload_weights` reaches the parked ones too); each has its own
 attention backend, staging tensors, prompts, FP8 activation scales and
-captured graph, about 0.2–0.4 s and well under a GiB per extra width. A
-request-level batcher then runs the smallest width that fits the pending
-requests: one robot's request costs the width-1 graph (14 ms) instead of
-the width-8 one (63 ms). Measured through physis's batcher on RTX 5090
-with widths 1/2/4/8 (real frames, 4 ms batching deadline): 1 robot 20 ms
-per request, 2 robots 28 ms, 4 robots 42 ms, 8 robots 80–89 ms at the
-99th percentile with control periods of 100–250 ms; with the single
-width 8 the same fleet stayed at 63 ms for one robot and only 4 robots
-met a 100 ms budget (`tests/test_pi05_batched_widths.py`).
+captured graph. Each extra width therefore consumes setup time and memory.
+A request-level batcher can select the smallest width that fits pending
+requests. Width switches, reload and inference use the same instance lock.
+`tests/test_pi05_batched_widths.py` covers width restoration and reload;
+serving latency must be measured separately with queueing included, not
+inferred from graph replay timing.
 
 ### Prefix hidden-state export
 
