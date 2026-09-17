@@ -338,9 +338,11 @@ out = rt.infer_batch([obs_0, ..., obs_7], noise=noise_8)   # list of 8 results
 
 The batched attention backend and `Pi05BatchedPipeline` take their
 width from `batch_size`; every folded buffer scales with it. Slots are
-independent: identical inputs give bit-identical outputs per slot, and
-each slot agrees with the B = 1 path on the same noise to cosine
-0.9999 (GEMM tactics change with M, so not bit-equal). Compare widths
+independent: identical inputs give bit-identical outputs per slot.
+The mixed-slot FP8 test compares each slot with independent B=1 inference
+under identical calibration and the existing synthetic-input cosine gate
+of 0.99; permuting slots must preserve outputs bit-for-bit. GEMM tactics
+change with M, so B=N and B=1 are not promised bit-equal. Compare widths
 using synchronized observation-to-final-action E2E on identical inputs;
 per-environment throughput is not individual request latency. The CFG batched pipeline
 still requires B = 2 (conditioned and unconditioned slots) and

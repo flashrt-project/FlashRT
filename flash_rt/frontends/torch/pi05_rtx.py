@@ -1911,6 +1911,9 @@ class Pi05TorchFrontendRtx:
                 images, self.pipeline.input_images_buf, stream_int)
             self._copy_tensor_to_pipeline_buf_stream(
                 noise, self.pipeline.input_noise_buf, stream_int)
+            # calibrate_fp8 runs the parent forward on stream 0. Its inputs
+            # must be complete before crossing from this non-default stream.
+            self._cudart.cudaStreamSynchronize(ctypes.c_void_p(stream_int))
             self.pipeline.calibrate_fp8()
             self.pipeline.autotune_gemms()
             self._record_infer_graph_if_enabled(stream_int)
