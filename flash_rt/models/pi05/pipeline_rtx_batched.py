@@ -1,18 +1,19 @@
-"""FlashRT — Pi0.5 RTX inference pipeline with hardcoded B=2 batched forward.
+"""FlashRT — Pi0.5 RTX inference pipeline with configurable B=N batching.
 
 Subclass of :class:`flash_rt.models.pi05.pipeline_rtx.Pi05Pipeline` that
-runs vision + Gemma-2B encoder + Gemma-300M decoder for two independent
+runs vision + Gemma-2B encoder + Gemma-300M decoder for N independent
 samples in a single forward pass. Sample-batched activation buffers and
 attention buffers live alongside the parent's B=1 buffers; the parent's
 methods are not modified.
 
-Hardcoded B=2 for v0.1.0 — chosen specifically as the foundation for
-:class:`Pi05CFGBatchedPipeline`, which fuses CFG's conditioned and
-unconditioned forwards into a single batched pass.
+The batch width is selected by the attention backend (any N >= 1, default
+2). Internal ``_b2`` names are retained for compatibility, not as a width
+restriction. Only :class:`Pi05CFGBatchedPipeline` requires exactly B=2
+to fuse conditioned and unconditioned forwards.
 
 Calibration: the parent's :meth:`Pi05Pipeline.calibrate_fp8` runs the
 B=1 pipeline once and writes per-tensor activation scales into
-``fp8_act_scales``. Those scales transfer to the B=2 path because
+``fp8_act_scales``. Those scales transfer to the B=N path because
 per-tensor FP8 scales depend on max activation magnitude across the
 ``M*N`` GEMM inputs, which is sample-invariant for the Pi0.5 model
 under typical observation distributions. The batched run therefore
@@ -87,7 +88,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
     # ══════════════════════════════════════════════════════════════════
 
     def _allocate_b2_buffers(self) -> None:
-        """Allocate B=2-folded versions of every per-sample working buffer.
+        """Allocate B=N-folded versions of every per-sample working buffer.
 
         Naming convention: every parent buffer key ``X`` gets a
         ``X_b2`` sibling here. Per-layer FP8 weights and per-tensor
@@ -333,12 +334,12 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 ctypes.c_void_p(dst), src.ptr, src.nbytes, 3, stream)
 
     # ══════════════════════════════════════════════════════════════════
-    #   Helper: B=2 FP8 scratch picker + dynamic-quant GEMM
+    #   Helper: B=N FP8 scratch picker + dynamic-quant GEMM
     # ══════════════════════════════════════════════════════════════════
 
     def _pick_fp8_scratch_b2(self, weight_name: str,
                              act_n: int) -> tuple[int, int]:
-        """B=2 sibling of :meth:`Pi05Pipeline._pick_fp8_scratch`.
+        """B=N sibling of :meth:`Pi05Pipeline._pick_fp8_scratch`.
 
         Returns ``(act_fp8_ptr, scratch_scale_ptr)`` from the b2
         scratch buffers. Used by :meth:`_fp8_gemm_b2`; the parent's
@@ -365,7 +366,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
     def _fp8_gemm_b2(self, act_bf16_ptr: int, act_n: int, weight_name: str,
                      out_bf16_ptr: int, M: int, N: int, K: int,
                      stream: int) -> None:
-        """B=2 sibling of :meth:`Pi05Pipeline._fp8_gemm`.
+        """B=N sibling of :meth:`Pi05Pipeline._fp8_gemm`.
 
         Identical math, but routes the dynamic-quantization scratch
         write through the b2 scratch buffers so M=B*seq writes do not
@@ -398,7 +399,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
 
     def _enc_kv_layer_ptrs_b2(self, layer: int,
                               offset_tokens: int = 0) -> tuple[int, int]:
-        """K/V buffer pointers for the given encoder layer in the B=2 cache.
+        """K/V buffer pointers for the given encoder layer in the B=N cache.
 
         Returns the pointer of slot ``[layer, sample=0, offset_tokens]``;
         the per-sample stride is :attr:`_attn_ptrs_b2["enc_k_sample_stride_bytes"]`.
@@ -609,7 +610,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
 
     def _encoder_layer_batched(self, i: int, m: int, seq: int,
                                 fuse_b1: bool, stream: int) -> None:
-        """One Gemma-2B encoder layer with B=2 sample batching.
+        """One Gemma-2B encoder layer with B=N sample batching.
 
         ``m = B * seq`` is the M-folded total row count for GEMMs and
         per-row ops; ``seq`` (per-sample) is what the batched attention
@@ -698,7 +699,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
             # Last layer stops after K/V unless the hidden state is exported.
             return
 
-        # B2: Batched attention (B=2 in the leading dim)
+        # B2: Batched attention (B=N in the leading dim)
         enc_o_ptr = self.attn.run_batched(
             "encoder", i, q_seq=seq, stream=stream)
 
@@ -854,7 +855,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
     def _decoder_layer_batched(self, i: int, step: int, enc_seq: int,
                                 ds: int, m: int, skip_c1: bool,
                                 stream: int) -> None:
-        """One Gemma-300M decoder layer with B=2 sample batching.
+        """One Gemma-300M decoder layer with B=N sample batching.
 
         ``ds`` is per-sample chunk length; ``m = B*ds`` is the M-fold
         for GEMMs and per-row ops.
@@ -1028,7 +1029,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
     # ══════════════════════════════════════════════════════════════════
 
     def run_pipeline(self, stream: int = 0) -> None:
-        """Run the B=2 pipeline end-to-end.
+        """Run the B=N pipeline end-to-end.
 
         Override of the parent's :meth:`Pi05Pipeline.run_pipeline`. The
         captured CUDA Graph (recorded by the inherited
@@ -1043,28 +1044,28 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         self.transformer_decoder_batched(stream)
 
     def autotune_gemms(self) -> None:
-        """Autotune GEMM tactics for both B=1 and B=2 M values.
+        """Autotune GEMM tactics for both B=1 and B=N M values.
 
         The parent's :meth:`Pi05Pipeline.autotune_gemms` only sees the
-        B=1 ``M = vs / seq / ds`` shapes; running with B=2 doubles each
-        M and cuBLASLt then has to pick a tactic on the fly, which can
+        B=1 ``M = vs / seq / ds`` shapes; running with B=N multiplies each
+        M by N and cuBLASLt then has to pick a tactic on the fly, which can
         fail (CUBLAS_STATUS_INTERNAL_ERROR) on shapes the autotune
         cache hasn't seen. We run the parent's tune first (so the B=1
         calibration / parent-path forwards remain bit-equal) and then
-        an additional pass at the B=2 M values using the b2 buffers.
+        an additional pass at the B=N M values using the b2 buffers.
         """
         # First, the parent's B=1 tune (covers calibration-time GEMMs).
         super().autotune_gemms()
         if getattr(self, "_gemms_autotuned_b2", False):
             return
 
-        # Then run an additional autotune at the B=2 ``M = B*seq`` shapes.
+        # Then run an additional autotune at the B=N ``M = B*seq`` shapes.
         # When this code first landed we hit
-        # ``CUBLAS_STATUS_INTERNAL_ERROR`` selecting a B=2 FP8 tactic on
+        # ``CUBLAS_STATUS_INTERNAL_ERROR`` selecting a B=N FP8 tactic on
         # RTX 5090; that turned out to depend on input-buffer state at
         # autotune time, not the shape itself, and was masked by simply
         # skipping the pass. After fixing Bugs 5+6 (slot-1 OOB in
-        # ``_bias_zero_buf`` and decoder style buffers), the B=2 buffers
+        # ``_bias_zero_buf`` and decoder style buffers), the B=N buffers
         # carry valid post-warmup activations during autotune and the
         # tactic picker no longer trips. Reaching M=B*seq tactics
         # tightens the production-path cosine vs serial CFG by ~1.5%
@@ -1149,7 +1150,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
 
         Per-tensor FP8 scales are sample-invariant for Pi0.5 under typical
         observation distributions, so the parent's single-sample
-        calibration pass produces scales that apply directly to the B=2
+        calibration pass produces scales that apply directly to the B=N
         forward. We run the parent's :meth:`Pi05Pipeline.run_pipeline`
         rather than this subclass's batched override so the calibration
         path uses the parent's B=1 buffers (already pre-populated by
@@ -1172,7 +1173,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
     # ══════════════════════════════════════════════════════════════════
 
     def forward(self, stream: int | None = None) -> int:
-        """Replay the captured B=2 graph and return the batched-noise ptr.
+        """Replay the captured B=N graph and return the batched-noise ptr.
 
         Override of :meth:`Pi05Pipeline.forward` so the returned pointer
         points at the batched diffusion-noise output buffer rather than

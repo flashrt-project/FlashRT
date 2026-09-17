@@ -1748,12 +1748,12 @@ class Pi05TorchFrontendRtx:
         return result
 
     # -----------------------------------------------------------------
-    # Batched (B=2) inference path — additive, default API unchanged
+    # Batched (B=N) inference path — _b2 names are historical, not a width limit
     # -----------------------------------------------------------------
 
     def set_batched_mode(self, *, enable: bool = True,
                          batch_size: int = PI05_BATCH_SIZE) -> None:
-        """Enable / disable the B=2 batched inference path (opt-in).
+        """Enable / disable B=N batching (N >= 1, default 2; opt-in).
 
         Once enabled, the next :meth:`set_prompt_batch` call builds a
         :class:`Pi05BatchedPipeline` (with a
@@ -1820,7 +1820,7 @@ class Pi05TorchFrontendRtx:
         """Set per-sample prompts for the batched pipeline.
 
         Args:
-            prompts: list of length B (currently 2). Each entry is a
+            prompts: list of length B (the configured batch_size). Each entry is a
                 task description string. Prompts are individually
                 tokenised, then padded to a common length so the
                 encoder sees a fixed-shape buffer.
@@ -1888,7 +1888,7 @@ class Pi05TorchFrontendRtx:
         """Calibrate FP8 scales for the batched pipeline.
 
         Uses the parent B=1 calibration pass (per-tensor scales are
-        sample-invariant) on the first observation; the batched B=2
+        sample-invariant) on the first observation; the batched B=N
         forward then reuses those scales.
         """
         if not isinstance(self.pipeline, Pi05BatchedPipeline):
@@ -1919,10 +1919,10 @@ class Pi05TorchFrontendRtx:
 
     def infer_batch(self, observations: list, *,
                     noise=None, generator=None, return_noise: bool = False) -> list:
-        """Run B=2 inference on two independent observations.
+        """Run B=N inference on N independent observations.
 
         Args:
-            observations: list of length B (currently 2) of obs dicts
+            observations: list of length B (the configured batch_size) of obs dicts
                 matching :meth:`infer`'s contract (``image``,
                 ``wrist_image`` if ``num_views >= 2``, ``state``).
             noise: optional initial noise ``(B, chunk_size, 32)``; one
@@ -1944,7 +1944,7 @@ class Pi05TorchFrontendRtx:
         t0 = time.perf_counter()
 
         with torch.cuda.stream(self._graph_torch_stream):
-            # Stage per-sample inputs into the B=2 staging tensors, then D2D.
+            # Stage per-sample inputs into B=N tensors (_b2 is a legacy suffix).
             for b, obs in enumerate(observations):
                 self._img_buf_b2[b].copy_(self._stack_images(obs))
             self._fill_noise(self._noise_buf_b2, noise, generator)

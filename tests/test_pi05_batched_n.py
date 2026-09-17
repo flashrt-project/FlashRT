@@ -122,6 +122,40 @@ def test_batched_b4_matches_b1_and_scales():
 
 
 @requires_gpu_ckpt
+def test_b4_mixed_slots_match_independent_b1_and_permutation():
+    from flash_rt.frontends.torch.pi05_rtx import ACTION_DIM, Pi05TorchFrontendRtx
+
+    observations = [_make_obs(30 + slot) for slot in range(4)]
+    ref = Pi05TorchFrontendRtx(CKPT_PI05, num_views=2)
+    ref.set_prompt(PROMPT)
+    ref.calibrate(observations)
+    noises = np.random.default_rng(40).standard_normal(
+        (4, ref.chunk_size, ACTION_DIM)).astype(np.float32)
+    expected = [ref.infer(obs, noise=noise)["actions"].copy()
+                for obs, noise in zip(observations, noises)]
+    del ref
+    torch.cuda.empty_cache()
+
+    rt = Pi05TorchFrontendRtx(CKPT_PI05, num_views=2)
+    rt.set_batched_mode(enable=True, batch_size=4)
+    rt.set_prompt_batch([PROMPT] * 4)
+    rt.calibrate_batch(observations)
+    outputs = rt.infer_batch(observations, noise=noises)
+    for slot, (output, reference) in enumerate(zip(outputs, expected)):
+        assert np.isfinite(output["actions"]).all()
+        cosine = _cos(output["actions"], reference)
+        assert cosine >= 0.999, (slot, cosine)
+    for slot in range(1, 4):
+        assert not np.array_equal(outputs[0]["actions"], outputs[slot]["actions"])
+
+    # Reusing the graph after moving every sample catches stale per-slot data.
+    order = [2, 0, 3, 1]
+    permuted = rt.infer_batch([observations[i] for i in order], noise=noises[order])
+    for slot, original in enumerate(order):
+        np.testing.assert_array_equal(permuted[slot]["actions"], outputs[original]["actions"])
+
+
+@requires_gpu_ckpt
 def test_prefix_features_single_and_batched():
     from flash_rt.frontends.torch.pi05_rtx import ENC_D, Pi05TorchFrontendRtx
 

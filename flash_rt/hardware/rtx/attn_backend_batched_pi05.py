@@ -1,7 +1,7 @@
 """Batched (B=N, default 2) Pi0.5 RTX attention backend.
 
 Subclass of :class:`flash_rt.hardware.rtx.attn_backend.RtxFlashAttnBackend`
-that adds B=2 sample-batched Q/K/V/output buffers for use by
+that adds B=N sample-batched Q/K/V/output buffers for use by
 :class:`flash_rt.models.pi05.pipeline_rtx_batched.Pi05BatchedPipeline`.
 
 The parent backend's B=1 buffers and methods are left untouched: all
@@ -9,7 +9,7 @@ existing pipelines (``Pi05Pipeline``, ``Pi05CFGPipeline``) continue to
 use the original ``vision_attn`` / ``encoder_attn`` / ``decoder_attn``
 entry points unchanged. The batched pipeline routes its attention calls
 through the new ``*_batched`` methods added here, which read from the
-new B=2 buffers (suffixed ``_b2``) and dispatch to the same FA2 wrapper
+new B=N buffers (legacy suffix ``_b2``) and dispatch to the same FA2 wrapper
 the parent uses.
 
 The default B=2 fuses the cond + uncond forwards of classifier-free
@@ -27,14 +27,13 @@ from .attn_backend import RtxFlashAttnBackend
 
 logger = logging.getLogger(__name__)
 
-# Hardcoded sample-batch size. The buffers here are sized for exactly
-# this many samples; the pipeline subclass that uses this backend asserts
-# the same value at construction time so the two stay locked.
+# Default width; instances size buffers from their configured batch_size.
+# The historical _b2 suffix does not constrain the actual width.
 PI05_BATCH_SIZE = 2
 
 
 class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
-    """Pi0.5-specific RTX attention backend with B=2 sample batching.
+    """Pi0.5-specific RTX attention backend with B=N sample batching.
 
     Adds these slots on top of the parent (all bf16/fp16 per the
     backend's selected dtype):
@@ -47,7 +46,7 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
     plus the corresponding ``_b2_O`` / ``_b2_lse`` / splitkv accumulator
     buffers used by the FA2 wrapper. Vision is "B*num_views" in the
     leading dim (matching the parent's "num_views"-fold layout) so the
-    same kernel call with a larger leading dim covers two samples.
+    same kernel call with a larger leading dim covers N samples.
     """
 
     def __init__(self, *args, batch_size: int = PI05_BATCH_SIZE, **kwargs):
@@ -82,7 +81,7 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
         # Decoder Q (B-folded)
         self.dec_Q_b2 = torch.empty(B, ds, 8, 256, dtype=bf16, device=d)
 
-        # Per-layer KV stride (bytes) for B=2
+        # Per-layer KV stride (bytes) for B=N
         # Per-layer slice in enc_K_b2 is (B, total_kv, 1, 256) elements.
         elem_size = self.enc_K_b2.element_size()
         self._enc_kv_layer_stride_bytes_b2 = (
@@ -150,7 +149,7 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
     # ──────────────────────────────────────────────────────────────
 
     def get_ptrs_b2(self) -> dict:
-        """Pointer dict for the B=2 buffers (used by Pi05BatchedPipeline)."""
+        """Pointer dict for the B=N buffers (used by Pi05BatchedPipeline)."""
         return {
             "vis_Q": self.vis_Q_b2.data_ptr(),
             "vis_K": self.vis_K_b2.data_ptr(),
@@ -178,7 +177,7 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
 
     # ── Held references for ``.contiguous()`` outputs (Bug 7) ──
     #
-    # The B=2 attention buffers are sliced ``[:, :seq]`` (vision uses
+    # The B=N attention buffers are sliced ``[:, :seq]`` (vision uses
     # the full leading dim and is already contiguous; encoder /
     # decoder slice the time dim < ``es_max`` / ``ds`` respectively).
     # Slicing along time when ``B > 1`` produces a NON-contiguous view
@@ -226,7 +225,7 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
 
     def encoder_attn_batched(self, layer_idx: int, seq: int,
                               stream: int = 0) -> int:
-        """Gemma-2B encoder self-attention with B=2 sample batching."""
+        """Gemma-2B encoder self-attention with B=N sample batching."""
         if not self._fa2_sites["encoder"]:
             raise RuntimeError(
                 "encoder_attn_batched requires fvk FA2 ('encoder' site)")
@@ -249,7 +248,7 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
 
     def decoder_attn_batched(self, layer_idx: int, enc_seq: int,
                               dec_seq: int, stream: int = 0) -> int:
-        """Gemma-300M decoder cross-attention with B=2 sample batching."""
+        """Gemma-300M decoder cross-attention with B=N sample batching."""
         if not self._fa2_sites["decoder"]:
             raise RuntimeError(
                 "decoder_attn_batched requires fvk FA2 ('decoder' site)")
@@ -279,7 +278,7 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
         kv_seq=None,
         stream: int = 0,
     ) -> int:
-        """Batched dispatch (B=2) — sibling to :meth:`run`.
+        """Batched dispatch (B=N) — sibling to :meth:`run`.
 
         Same contract as the parent's :meth:`run` but routes to the
         ``*_batched`` methods. Pi0-specific state-masked decoder mode
