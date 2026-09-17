@@ -6,6 +6,7 @@ AGX Thor (NVFP4 + FlashAttention-4), bitwise identical to FlashRT's runtime.
 
 - Usage: [docs/tensorrt_usage.md](../../docs/tensorrt_usage.md)
 - Design, operator reference, keeping in sync: [docs/tensorrt_backend.md](../../docs/tensorrt_backend.md)
+- TensorRT Edge-LLM: [docs/tensorrt_edgellm.md](../../docs/tensorrt_edgellm.md)
 
 | path | contents |
 |---|---|
@@ -15,4 +16,4 @@ AGX Thor (NVFP4 + FlashAttention-4), bitwise identical to FlashRT's runtime.
 | `tools/reference/` | calibration and reference recording through FlashRT's frontend |
 | `tests/` | native and engine parity tests, regression script |
 | `integrations/openpi/` | openpi policy hook |
-| `integrations/edgellm/` | TensorRT Edge-LLM example overlay |
+| `integrations/edgellm/` | TensorRT Edge-LLM example overlay and check |

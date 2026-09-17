@@ -3,13 +3,15 @@
 `pi05/pi05_policy_inference` runs a FlashRT pi0.5 engine inside a TensorRT
 Edge-LLM build, using Edge-LLM's image loading, `tokenizer.json` tokenizer and
 CUDA graph capture. It is an overlay: nothing in Edge-LLM is modified except
-one `add_subdirectory` line.
+one `add_subdirectory` line. How it fits Edge-LLM, the full reproduction and
+the integration status are in
+[docs/tensorrt_edgellm.md](../../../../docs/tensorrt_edgellm.md).
 
 ## Build
 
 ```bash
 backends/tensorrt/integrations/edgellm/install_overlay.sh <TensorRT-Edge-LLM>   # needs BUILD_EXPERIMENTAL_MODELS=ON
-cmake -S <TensorRT-Edge-LLM> -B <TensorRT-Edge-LLM>/build
+cmake -S <TensorRT-Edge-LLM> -B <TensorRT-Edge-LLM>/build -DBUILD_EXPERIMENTAL_MODELS=ON   # plus Edge-LLM's Thor options
 cmake --build <TensorRT-Edge-LLM>/build --target pi05_policy_inference -j 2
 ```
 
@@ -38,6 +40,17 @@ unnormalization. `--noise` takes a safetensors file with an fp16 `noise_in`
 tensor; otherwise noise is drawn from `--seed`. `--pixel_norm flashrt`
 reproduces FlashRT's uint8 table for bitwise checks (openpi's `x / 255 * 2 - 1`
 is the default).
+
+## Check
+
+```bash
+python backends/tensorrt/integrations/edgellm/check_pi05.py \
+    <TensorRT-Edge-LLM>/build/experimental_models/pi05/pi05_policy_inference <engine out_dir> <tokenizer dir>
+# ... EDGELLM_PI05_PASS
+```
+
+Runs the four prompts recorded by `build_pi05_engine.sh` and compares tokens
+and raw actions with FlashRT bit for bit.
 
 ## Checked on Jetson Thor (pi05_libero, 2 cameras)
 

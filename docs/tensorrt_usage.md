@@ -170,7 +170,8 @@ tutorial's.
 
 `backends/tensorrt/integrations/edgellm` adds a `pi05_policy_inference`
 example to a TensorRT Edge-LLM checkout (image loading, `tokenizer.json`
-tokenizer, CUDA graphs, openpi unnormalization); see its README.
+tokenizer, CUDA graphs, openpi unnormalization); see
+[tensorrt_edgellm.md](tensorrt_edgellm.md).
 
 ## 6. Troubleshooting
 
