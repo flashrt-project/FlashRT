@@ -6,9 +6,8 @@ and pipeline default to `cublaslt`; a default build excludes these kernels.
 
 The action expert of Pi0.5 runs ten denoising steps over a ten-row action
 chunk, and every step streams the whole Gemma-300M decoder (about 311 MB of
-FP8 weights) from HBM. On the library GEMM path that decoder took 8.8 ms of
-an 18.5 ms graph: 720 launches of a 64x32-tile kernel that was written for
-reuse the shape does not have, plus two 3 µs norm kernels per layer.
+FP8 weights) from HBM. This small-row workload has limited weight reuse
+and benefits from model-specific GEMMs and fused consumers.
 
 This page documents the replacement: a small family of kernels that stream
 each weight row exactly once, split K across CTAs, hand FP32 partial sums to
@@ -55,7 +54,7 @@ re-reads then come from L2.
 The `"kn"` FP8 layout used on sm_120 keeps the decoder weights as `[K, N]`
 for the library path; the frontend adds a transposed `[N, K]` copy of the 72
 decoder tensors under `<name>__nk` (same values, same per-tensor scale,
-about 311 MB) when the family is available. The `"nk"` layout uses the
+about 311 MB) only when the family is explicitly selected. The `"nk"` layout uses the
 tensors as they are.
 
 Consumers apply `alpha = a_scale * w_scale` from the device scale buffers,
@@ -66,58 +65,32 @@ kernels on identical inputs.
 
 ## Numbers
 
-RTX 5090, pi05_libero checkpoint, two 224x224 views, ten steps, FP8,
-calibrated on real LIBERO frames, medians.
+Report only synchronized observation-to-final-action E2E. Use the same
+container, checkpoint, observations, seed and input contract for both arms:
 
-Standalone GEMM, cold weights (a ring of copies larger than L2), including the
-partial-sum consumer, versus the autotuned cuBLASLt FP8 kernel, M = 10:
+```bash
+PYTHONPATH=. python tools/bench_pi05_e2e.py \
+  --checkpoint /path/to/pi05_checkpoint \
+  --observations /path/to/observations.npz \
+  --profile default --output /path/to/default.json
+PYTHONPATH=. python tools/bench_pi05_e2e.py \
+  --checkpoint /path/to/pi05_checkpoint \
+  --observations /path/to/observations.npz \
+  --profile skinny --output /path/to/skinny.json
+```
 
-| shape (N x K) | cuBLASLt µs | family µs, no PDL | family µs, PDL | effective GB/s |
-|---|---:|---:|---:|---:|
-| qkv 2560 x 1024 | 4.41 | 3.98 | 2.65 | 990 |
-| o 1024 x 2048 | 6.13 | 3.79 | 2.34 | 898 |
-| gate_up 8192 x 1024 | 7.57 | 7.44 | 6.40 | 1310 |
-| down 1024 x 4096 | 8.52 | 5.24 | 3.65 | 1148 |
+The default benchmark includes per-observation normalized state in the
+prompt, image preprocessing and transfer, vision/prefix, all ten denoise
+steps, and action unnormalization/download. It synchronizes before and after
+the timed call; loading, calibration and initial graph capture are excluded.
+The fixed-text-only contract requires an explicit `--no-state-prompt`.
+Do not compare timings across these input contracts or report graph/kernel
+time as E2E. JSON records the contract, environment, fixture and kernel hashes;
+the companion NPZ records final actions for cross-arm numerical comparisons.
 
-At M = 80 (eight environments batched) the family wins the two N = 1024
-shapes (o 4.27 vs 6.15 µs, down 6.64 vs 8.39) and loses gate_up (14.4 vs 11.0)
-where its per-row-tile CTAs re-read the weights through L2; the sum over the
-four shapes is even, the consumer fusion and the launch chain still pay.
-
-End to end (`infer` median, host round trip included):
-
-| | library decoder | family, GEMMs only | family, + attention + step kernels |
-|---|---:|---:|---:|
-| B = 1, graph replay | 18.56 ms | 14.36 ms | 12.94 ms |
-| B = 1, `infer()` | 19.68 ms | 15.48 ms | 14.03 ms |
-| decoder span inside the graph | 9.08 ms | 5.34 ms | 4.53 ms |
-| B = 4, per environment | 10.09 ms | 9.24 ms | 8.73 ms |
-| B = 8, per environment | 8.73 ms | 8.33 ms | 7.89 ms |
-
-Inside the graph the launch gaps were already 0.1–0.2 µs, so the gain comes
-from kernel efficiency and from overlapping each kernel's independent loads
-(weights, style rows, the K/V prefix) with its predecessor, not from fewer
-graph nodes. With PDL off the per-layer kernel costs are: GEMMs 2.5 + 2.4 +
-6.8 + 4.0 µs, consumers 1.5 + 2.4 + 1.4 + 2.3 µs, attention 3.6 + 1.3 µs;
-with PDL on a layer takes about 25 µs of span. The weight-traffic floor per
-layer on this GPU is about 11 µs; the consumers and the attention pair are
-latency-bound at ten rows and are the remaining decoder item (a last-CTA
-epilogue fusion would remove four launches per layer).
-
-Agreement, same prompt, real frames, same noise:
-
-| comparison | cosine (actions) | max abs diff |
-|---|---:|---:|
-| family vs library decoder, B = 1 | 0.99998 | 0.012 |
-| library decoder, this build vs the previous kernel build | 0.99998 | 0.012 |
-| family vs library decoder, B = 4, per slot | 0.99997–0.99999 | |
-| 300 graph replays of one input | bit-identical | |
-| attention pair vs torch SDPA (random Q/K/V, masked tail) | 0.9999 | |
-
-The family's difference from the library path is the same size as the
-difference between two builds of the library path (cuBLASLt algorithm
-selection is timing-based), i.e. within FP8 summation-order noise. The BF16
-decoder is untouched and bit-identical across builds.
+The tests separately cover fused-consumer rounding, deterministic replay,
+attention parity and final-action agreement with cuBLASLt. Approximate FP8
+summation orders may differ; task-level qualification is still required.
 
 ## Limits and next steps
 
