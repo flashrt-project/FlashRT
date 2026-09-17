@@ -480,8 +480,16 @@ class Pi05TorchFrontendRtx:
                  fp8_layout: Optional[str] = None,
                  state_prompt_mode: str = "exact",
                  use_cuda_graph: bool = True,
-                 denoise_trace: bool = False):
+                 denoise_trace: bool = False,
+                 prefix_features: bool = False):
         checkpoint_dir = pathlib.Path(checkpoint_dir)
+        # Batched-mode width; set_batched_mode(batch_size=N) changes it.
+        self._batch_size = PI05_BATCH_SIZE
+        # Prefix features: pipelines export the encoder's final hidden
+        # state and infer()/infer_batch() return its mean over the valid
+        # (vision + prompt) tokens under "prefix_features". Off by default.
+        self._prefix_features = bool(prefix_features)
+        self._last_prompt_len = 0
         # Denoise trace: every pipeline this frontend builds records the
         # per-step state and increment of the denoising loop, returned by
         # infer()/infer_batch() under "denoise_trace". Construction-time
@@ -1000,10 +1008,14 @@ class Pi05TorchFrontendRtx:
                 self.graph_recorded = False
                 self.calibrated = False
             return
-        if self._denoise_trace:
+        if self._denoise_trace or self._prefix_features:
             raise NotImplementedError(
-                "denoise_trace is not recorded by the CFG pipelines yet; "
-                "build the frontend with denoise_trace=False to use RL CFG mode")
+                "denoise_trace / prefix_features are not recorded by the CFG "
+                "pipelines yet; build the frontend without them to use RL CFG mode")
+        if getattr(self, "_batched_active", False) and self._batch_size != 2:
+            raise ValueError(
+                f"RL CFG batched mode needs batch_size=2 (cond + uncond); "
+                f"set_batched_mode was called with batch_size={self._batch_size}")
         if cfg_beta < 1.0:
             raise ValueError(
                 f"cfg_beta must be >= 1.0 (1.0 disables CFG); got {cfg_beta}")
@@ -1045,6 +1057,7 @@ class Pi05TorchFrontendRtx:
                    else MAX_PROMPT_LEN_DEFAULT)
         embeds, prompt_len = _embed_prompt(
             prompt_text, self.embedding_weight, max_len=max_len, state=state)
+        self._last_prompt_len = int(prompt_len)
 
         if self._state_prompt_mode == "fixed" and state is not None:
             self._set_prompt_fixed(prompt_len)
@@ -1095,6 +1108,7 @@ class Pi05TorchFrontendRtx:
                 vision_num_layers=self._vision_num_layers,
                 fixed_shape=True,
                 denoise_trace=self._denoise_trace,
+                prefix_export=self._prefix_features,
                 **self._pipeline_precision_kwargs())
             if self._fixed_pipeline.use_int8_vision_static:
                 self._fixed_pipeline.vis_int8_static_calibrated = False
@@ -1146,6 +1160,7 @@ class Pi05TorchFrontendRtx:
                     vision_pool_factor=self._vision_pool_factor,
                     vision_num_layers=self._vision_num_layers,
                     denoise_trace=self._denoise_trace,
+                prefix_export=self._prefix_features,
                     **self._pipeline_precision_kwargs())
                 self._prompt_pipeline_cache[prompt_len] = self.pipeline
                 # Static INT8 vision scales are per-pipeline-instance.
@@ -1589,7 +1604,8 @@ class Pi05TorchFrontendRtx:
         initial diffusion noise ``(chunk_size, 32)`` directly and
         ``generator`` (a CUDA ``torch.Generator``) seeds the internal
         draw; with neither, the draw is unseeded as before. The noise
-        actually used is returned under ``"noise"`` only with ``return_noise=True``; the same noise,
+        actually used is returned under ``"noise"`` only with
+        ``return_noise=True``; the same noise,
         prompt and weights give bit-identical actions. When the
         frontend was built with ``denoise_trace=True`` the result also
         carries ``"raw_actions"`` (normalized, ``(chunk, 32)``) and
@@ -1608,7 +1624,8 @@ class Pi05TorchFrontendRtx:
 
         if isinstance(self.pipeline, Pi05CFGBatchedPipeline):
             return self._infer_cfg_batched(
-                observation, debug=debug, noise=noise, generator=generator, return_noise=return_noise)
+                observation, debug=debug, noise=noise, generator=generator,
+                return_noise=return_noise)
 
         t0 = time.perf_counter()
 
@@ -1641,6 +1658,8 @@ class Pi05TorchFrontendRtx:
                 self._noise_out.numel() * 2, 3, stream_int)
             if self._denoise_trace:
                 self._enqueue_denoise_trace_download(stream_int)
+            if self._prefix_features:
+                self._enqueue_prefix_download(stream_int)
 
         self._cudart.cudaStreamSynchronize(
             ctypes.c_void_p(self._graph_torch_stream.cuda_stream))
@@ -1662,6 +1681,8 @@ class Pi05TorchFrontendRtx:
         if self._denoise_trace:
             result["raw_actions"] = raw_actions
             result["denoise_trace"] = self._denoise_trace_result()
+        if self._prefix_features:
+            result["prefix_features"] = self._prefix_features_result()[0]
         return result
 
     def _use_full_pipeline_for_next_frame(self) -> bool:
@@ -1681,7 +1702,7 @@ class Pi05TorchFrontendRtx:
 
             # Replicate the single observation into both batch slots.
             stacked = self._stack_images(observation)
-            for b in range(PI05_BATCH_SIZE):
+            for b in range(self._batch_size):
                 self._img_buf_b2[b].copy_(stacked)
             # Each denoising step starts from independent noise in each
             # slot; cond slot is the one CFG reads / updates. Sampling
@@ -1689,7 +1710,7 @@ class Pi05TorchFrontendRtx:
             # starts at the same noise the cond does, which matches
             # the paper-faithful CFG contract.
             self._fill_noise(self._noise_buf, noise, generator)
-            for b in range(PI05_BATCH_SIZE):
+            for b in range(self._batch_size):
                 self._noise_buf_b2[b].copy_(self._noise_buf)
 
             self._copy_tensor_to_pipeline_buf_stream(
@@ -1730,7 +1751,8 @@ class Pi05TorchFrontendRtx:
     # Batched (B=2) inference path — additive, default API unchanged
     # -----------------------------------------------------------------
 
-    def set_batched_mode(self, *, enable: bool = True) -> None:
+    def set_batched_mode(self, *, enable: bool = True,
+                         batch_size: int = PI05_BATCH_SIZE) -> None:
         """Enable / disable the B=2 batched inference path (opt-in).
 
         Once enabled, the next :meth:`set_prompt_batch` call builds a
@@ -1750,14 +1772,24 @@ class Pi05TorchFrontendRtx:
                 self.calibrated = False
                 self._batched_active = False
             return
-        # Switch to a batched-capable attention backend if not already.
-        if not isinstance(self.attn_backend, RtxFlashAttnBatchedBackendPi05):
+        if int(batch_size) < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        self._batch_size = int(batch_size)
+        # Switch to a batched-capable attention backend of the requested
+        # width if not already installed.
+        if (not isinstance(self.attn_backend, RtxFlashAttnBatchedBackendPi05)
+                or self.attn_backend.batch_size != self._batch_size):
             enc_seq_max = self.num_views * 256 + self.max_prompt_len
             self.attn_backend = RtxFlashAttnBatchedBackendPi05(
                 num_views=self.num_views,
                 encoder_seq_max=enc_seq_max,
                 chunk_size=self.chunk_size,
-                num_encoder_layers=ENC_L)
+                num_encoder_layers=ENC_L,
+                batch_size=self._batch_size)
+            self.pipeline = None
+            self.current_prompt_len = 0
+            self.graph_recorded = False
+            self.calibrated = False
             # Replacing the backend orphans any single-sample pipelines that were
             # bound to the old one; drop the caches so they are rebuilt on the
             # new backend (mirrors _ensure_prompt_capacity()).
@@ -1772,17 +1804,17 @@ class Pi05TorchFrontendRtx:
             self.calibrated = False
         # Pre-allocate batched input/output staging tensors.
         self._img_buf_b2 = torch.empty(
-            PI05_BATCH_SIZE, self.num_views, IMG_HW, IMG_HW, 3,
+            self._batch_size, self.num_views, IMG_HW, IMG_HW, 3,
             dtype=bf16, device="cuda")
         self._noise_buf_b2 = torch.empty(
-            PI05_BATCH_SIZE, self.chunk_size, ACTION_DIM,
+            self._batch_size, self.chunk_size, ACTION_DIM,
             dtype=bf16, device="cuda")
         self._noise_out_b2 = torch.empty(
-            PI05_BATCH_SIZE, self.chunk_size, ACTION_DIM,
+            self._batch_size, self.chunk_size, ACTION_DIM,
             dtype=bf16, device="cuda")
         logger.info(
             "Pi05TorchFrontendRtx: batched mode enabled (B=%d)",
-            PI05_BATCH_SIZE)
+            self._batch_size)
 
     def set_prompt_batch(self, prompts: list) -> None:
         """Set per-sample prompts for the batched pipeline.
@@ -1797,9 +1829,9 @@ class Pi05TorchFrontendRtx:
             raise RuntimeError(
                 "set_batched_mode(enable=True) must be called before "
                 "set_prompt_batch")
-        if len(prompts) != PI05_BATCH_SIZE:
+        if len(prompts) != self._batch_size:
             raise ValueError(
-                f"set_prompt_batch expects {PI05_BATCH_SIZE} prompts, "
+                f"set_prompt_batch expects {self._batch_size} prompts, "
                 f"got {len(prompts)}")
         embeds_list = []
         prompt_lens = []
@@ -1809,6 +1841,7 @@ class Pi05TorchFrontendRtx:
             embeds_list.append(e)
             prompt_lens.append(plen)
         target_len = max(prompt_lens)
+        self._batch_prompt_lens = tuple(prompt_lens)
 
         # Pad each embed to target_len (BF16 zeros are valid pad tokens).
         padded_np_list = []
@@ -1828,7 +1861,7 @@ class Pi05TorchFrontendRtx:
         if rebuild:
             logger.info(
                 "Building Pi05BatchedPipeline (B=%d) for prompt_len=%d...",
-                PI05_BATCH_SIZE, target_len)
+                self._batch_size, target_len)
             self.current_prompt_len = target_len
             self.graph_recorded = False
             self.calibrated = False
@@ -1840,6 +1873,7 @@ class Pi05TorchFrontendRtx:
                 max_prompt_len=target_len,
                 chunk_size=self.chunk_size,
                 denoise_trace=self._denoise_trace,
+                prefix_export=self._prefix_features,
                 **self._pipeline_precision_kwargs())
         # B=1 pipeline path is what calibrate_fp8 uses for FP8 scale collection.
         self.pipeline.set_language_embeds(padded_np_list[0])
@@ -1847,7 +1881,7 @@ class Pi05TorchFrontendRtx:
         self._frame_count = 0
         logger.info(
             "Set batch prompt (B=%d, padded_len=%d): %s",
-            PI05_BATCH_SIZE, target_len,
+            self._batch_size, target_len,
             [p[:30] + ("…" if len(p) > 30 else "") for p in prompts])
 
     def calibrate_batch(self, sample_observations) -> None:
@@ -1903,9 +1937,9 @@ class Pi05TorchFrontendRtx:
         """
         if not isinstance(self.pipeline, Pi05BatchedPipeline):
             raise RuntimeError("set_batched_mode + set_prompt_batch required")
-        if len(observations) != PI05_BATCH_SIZE:
+        if len(observations) != self._batch_size:
             raise ValueError(
-                f"infer_batch expects {PI05_BATCH_SIZE} observations, "
+                f"infer_batch expects {self._batch_size} observations, "
                 f"got {len(observations)}")
         t0 = time.perf_counter()
 
@@ -1928,6 +1962,8 @@ class Pi05TorchFrontendRtx:
                 self._noise_out_b2.numel() * 2, 3, stream_int)
             if self._denoise_trace:
                 self._enqueue_denoise_trace_download(stream_int, batched=True)
+            if self._prefix_features:
+                self._enqueue_prefix_download(stream_int, batched=True)
 
         self._cudart.cudaStreamSynchronize(
             ctypes.c_void_p(self._graph_torch_stream.cuda_stream))
@@ -1936,13 +1972,16 @@ class Pi05TorchFrontendRtx:
         self.latency_records.append(latency_ms)
 
         trace = self._denoise_trace_result(batched=True) if self._denoise_trace else None
+        prefix = self._prefix_features_result(batched=True) if self._prefix_features else None
         results = []
-        for b in range(PI05_BATCH_SIZE):
+        for b in range(self._batch_size):
             raw = self._noise_out_b2[b].float().cpu().numpy()
             unnorm = unnormalize_actions(raw, self.norm_stats)
             entry = {"actions": unnorm[:, :LIBERO_ACTION_DIM]}
             if return_noise:
                 entry["noise"] = self._noise_buf_b2[b].float().cpu().numpy()
+            if prefix is not None:
+                entry["prefix_features"] = prefix[b]
             if trace is not None:
                 entry["raw_actions"] = raw
                 entry["denoise_trace"] = {
@@ -2038,7 +2077,7 @@ class Pi05TorchFrontendRtx:
         if batched:
             x_buf = self.pipeline.denoise_trace_x_buf_b2
             d_buf = self.pipeline.denoise_trace_delta_buf_b2
-            need = (self._num_steps, PI05_BATCH_SIZE, self.chunk_size, ACTION_DIM)
+            need = (self._num_steps, self._batch_size, self.chunk_size, ACTION_DIM)
         else:
             x_buf = self.pipeline.denoise_trace_x_buf
             d_buf = self.pipeline.denoise_trace_delta_buf
@@ -2069,6 +2108,34 @@ class Pi05TorchFrontendRtx:
             "delta": self._trace_delta_out.float().cpu().numpy(),
             "timesteps": self.denoise_timesteps(),
         }
+
+    def _enqueue_prefix_download(self, stream_int: int, batched: bool = False) -> None:
+        """Queue a D2D copy of the exported prefix hidden state into staging."""
+        buf = self.pipeline.prefix_hidden_buf_b2 if batched else self.pipeline.prefix_hidden_buf
+        rows = buf.nbytes // (ENC_D * 2)
+        if getattr(self, "_prefix_out", None) is None or self._prefix_out.numel() != rows * ENC_D:
+            self._prefix_out = torch.empty(rows, ENC_D, dtype=bf16, device="cuda")
+        self._cudart.cudaMemcpyAsync(
+            ctypes.c_void_p(self._prefix_out.data_ptr()), buf.ptr, buf.nbytes, 3, stream_int)
+
+    def _prefix_features_result(self, batched: bool = False) -> np.ndarray:
+        """Mean of the exported hidden state over the valid tokens, ``(B, ENC_D)`` float32.
+
+        Valid tokens are the pooled vision tokens followed by the prompt
+        tokens; padded prompt positions are excluded. Call after the
+        stream is synchronized.
+        """
+        es = int(self.pipeline.encoder_seq_len)
+        if batched:
+            n_slots = self._batch_size
+            prompt_lens = self._batch_prompt_lens
+        else:
+            n_slots = 1
+            prompt_lens = (int(self._last_prompt_len),)
+        hidden = self._prefix_out.view(n_slots, es, ENC_D)
+        pooled = [hidden[b, :int(self.pipeline.vision_seq_enc) + plen].float().mean(dim=0)
+                  for b, plen in enumerate(prompt_lens)]
+        return torch.stack(pooled).cpu().numpy()
 
     def _copy_tensor_to_pipeline_buf_stream(
             self, src: torch.Tensor, dst_buf, stream_int: int) -> None:

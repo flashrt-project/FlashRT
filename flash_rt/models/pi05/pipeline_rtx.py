@@ -186,7 +186,8 @@ class Pi05Pipeline:
                  vision_num_layers: int = VIS_L,
                  num_steps: int = NUM_STEPS_DEFAULT,
                  fixed_shape: bool = False,
-                 denoise_trace: bool = False):
+                 denoise_trace: bool = False,
+                 prefix_export: bool = False):
         self.gemm = gemm
         self.fvk = fvk
         self.attn = attn_backend
@@ -197,6 +198,11 @@ class Pi05Pipeline:
         # with everything else; off by default, in which case the default
         # graph is byte-identical to a pipeline built without the option.
         self.denoise_trace = bool(denoise_trace)
+        # Prefix export: after the encoder, copy the final Gemma-2B hidden
+        # state (vision + language tokens) into a separate buffer so a
+        # consumer can pool it as a feature (value functions). Captured
+        # into the graph like the trace; off by default.
+        self.prefix_export = bool(prefix_export)
 
         # Fixed-shape state-prompt mode: one captured graph at the MAX prompt
         # length serves every length via seqused masking + devpos K/V append.
@@ -397,6 +403,8 @@ class Pi05Pipeline:
         B["rtc_guidance_weight"] = CudaBuffer.device_empty(1, FP32)
         if self.denoise_trace:
             self._allocate_denoise_trace_buffers(B, ds)
+        if self.prefix_export:
+            B["prefix_hidden"] = CudaBuffer.device_empty(es * ENC_D, BF16)
         # Decoder scratch for ada_rms_norm output + gate
         B["x_normed_buf"] = CudaBuffer.device_empty(ds * DEC_D, BF16)
         B["gate_buf"] = CudaBuffer.device_empty(ds * DEC_D, BF16)
@@ -1291,9 +1299,11 @@ class Pi05Pipeline:
             seq, ENC_NH * ENC_HD, ENC_NKV * ENC_HD, ENC_NKV * ENC_HD,
             ENC_HD, stream=stream)
 
-        if i == ENC_L - 1:
+        if i == ENC_L - 1 and not self.prefix_export:
             # Last layer: no post-attn projection/FFN needed — encoder output is
             # the K/V cache which the decoder reads. Skip to next phase.
+            # With prefix_export the layer runs to completion so the exported
+            # hidden state is the true final residual stream.
             return
 
         # B2: Attention (GQA) — returns output pointer (no copy).
@@ -1777,6 +1787,8 @@ class Pi05Pipeline:
         self._copy_lang_embeds_to_encoder_x(stream=stream)
         self.vision_encoder(stream)
         self.transformer_encoder(stream)
+        if self.prefix_export:
+            self._export_prefix_hidden(stream)
         self.transformer_decoder(stream)
 
     def calibrate_fp8(self) -> None:
@@ -2128,6 +2140,39 @@ class Pi05Pipeline:
         if not self.denoise_trace:
             raise RuntimeError("pipeline was built without denoise_trace=True")
         return self.bufs["denoise_trace_delta"]
+
+    # ── Prefix hidden-state export (optional, construction-time) ────
+
+    def _export_prefix_hidden(self, stream: int, suffix: str = "",
+                              rows: int | None = None) -> None:
+        """Materialize the encoder's final hidden state into ``prefix_hidden``.
+
+        ``encoder_x`` holds the residual stream. Without the export the
+        last layer stops after its K/V projection (the decoder only
+        reads per-layer K/V), so the buffer would hold the state after
+        17 of 18 layers; with ``prefix_export`` the last layer runs to
+        completion. In the fused FP8 path the last layer's FFN output is
+        then left pending in ``encoder_x_norm`` (the next layer's fused
+        residual+norm would have added it), so the export adds it; on
+        the non-fused paths the residual is already applied. Issued on
+        ``stream`` after the encoder, inside the captured graph.
+        """
+        rows = self.encoder_seq_len if rows is None else int(rows)
+        n = rows * ENC_D
+        dst = self.bufs["prefix_hidden" + suffix]
+        self.fvk.gpu_copy(dst.ptr.value, self.bufs["encoder_x" + suffix].ptr.value,
+                          n * 2, stream)
+        if self.use_fp8 and self.fp8_calibrated:
+            self.fvk.residual_add(dst.ptr.value,
+                                  self.bufs["encoder_x_norm" + suffix].ptr.value,
+                                  n, stream=stream)
+
+    @property
+    def prefix_hidden_buf(self) -> CudaBuffer:
+        """Export: final encoder hidden state, ``(encoder_seq_len, ENC_D)`` bf16."""
+        if not self.prefix_export:
+            raise RuntimeError("pipeline was built without prefix_export=True")
+        return self.bufs["prefix_hidden"]
 
     def denoise_timesteps(self) -> list[float]:
         """Flow-matching time of each denoising step: ``1, 1-dt, ..., dt``.

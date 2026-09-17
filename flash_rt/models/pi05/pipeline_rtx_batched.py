@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 
 
 class Pi05BatchedPipeline(Pi05Pipeline):
-    """Pi0.5 RTX pipeline running B=2 samples in a single forward pass.
+    """Pi0.5 RTX pipeline running B samples (default 2) in a single forward pass.
 
     The constructor requires ``attn_backend`` to be a
     :class:`RtxFlashAttnBatchedBackendPi05` so the batched attention
@@ -71,11 +71,9 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 "Pi05BatchedPipeline requires attn_backend to be a "
                 "RtxFlashAttnBatchedBackendPi05; got "
                 f"{type(self.attn).__name__}")
-        self.B = self.attn.batch_size
-        if self.B != PI05_BATCH_SIZE:
-            raise ValueError(
-                f"Pi05BatchedPipeline expects B={PI05_BATCH_SIZE}, "
-                f"backend reports {self.B}")
+        self.B = int(self.attn.batch_size)
+        if self.B < 1:
+            raise ValueError(f"batched backend reports B={self.B}")
         self._attn_ptrs_b2 = self.attn.get_ptrs_b2()
         self._allocate_b2_buffers()
 
@@ -109,6 +107,9 @@ class Pi05BatchedPipeline(Pi05Pipeline):
             B * ds * ACTION_DIM, BF16)
         if self.denoise_trace:
             self._allocate_denoise_trace_buffers(self.bufs, B * ds, suffix="_b2")
+        if self.prefix_export:
+            self.bufs["prefix_hidden_b2"] = CudaBuffer.device_empty(
+                B * es * ENC_D, BF16)
 
         # ── Vision ──
         self.bufs["vision_x_b2"] = CudaBuffer.device_empty(B * vs * VIS_D, BF16)
@@ -693,7 +694,8 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 seq, ENC_NH * ENC_HD, ENC_NKV * ENC_HD, ENC_NKV * ENC_HD,
                 ENC_HD, stream=stream)
 
-        if i == ENC_L - 1:
+        if i == ENC_L - 1 and not self.prefix_export:
+            # Last layer stops after K/V unless the hidden state is exported.
             return
 
         # B2: Batched attention (B=2 in the leading dim)
@@ -1035,6 +1037,9 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         self._copy_lang_embeds_to_encoder_x_b2(stream=stream)
         self.vision_encoder_batched(stream)
         self.transformer_encoder_batched(stream)
+        if self.prefix_export:
+            self._export_prefix_hidden(stream, suffix="_b2",
+                                       rows=self.B * self.encoder_seq_len)
         self.transformer_decoder_batched(stream)
 
     def autotune_gemms(self) -> None:
@@ -1199,6 +1204,13 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         if not self.denoise_trace:
             raise RuntimeError("pipeline was built without denoise_trace=True")
         return self.bufs["denoise_trace_x_b2"]
+
+    @property
+    def prefix_hidden_buf_b2(self) -> CudaBuffer:
+        """Export: final encoder hidden state, ``(B*encoder_seq_len, ENC_D)`` bf16."""
+        if not self.prefix_export:
+            raise RuntimeError("pipeline was built without prefix_export=True")
+        return self.bufs["prefix_hidden_b2"]
 
     @property
     def denoise_trace_delta_buf_b2(self) -> CudaBuffer:

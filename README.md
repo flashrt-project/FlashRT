@@ -489,7 +489,7 @@ First call: ~3 s (calibration + CUDA Graph capture). Every subsequent call: 44 m
 | **Understand FP8 calibration mechanics** | [`docs/calibration.md`](docs/calibration.md) |
 | **Train a Pi0.5 LoRA fine-tune (FP8 + LoRA, plain or RECAP/ACP-conditioned, PyTorch *or* JAX)** | [`training/README.md`](training/README.md). JAX companion at [`training/jax/README.md`](training/jax/README.md) |
 | **Run advantage-conditioned (RECAP / π\*0.6) policies with classifier-free guidance** | [`docs/rl_inference.md`](docs/rl_inference.md) — PyTorch + JAX frontends both supported |
-| **Reproduce a sample or inspect the denoise loop for RL rollouts (seeded noise, denoise trace)** | [`docs/rl_inference.md`](docs/rl_inference.md#reproducible-sampling-and-denoise-trace-rl-rollouts) — Pi0.5 RTX |
+| **Roll out many environments per forward, reproduce a sample, inspect the denoise loop, export prefix features (B=N batching, seeded noise, denoise trace, prefix hidden state)** | [`docs/rl_inference.md`](docs/rl_inference.md#reproducible-sampling-and-denoise-trace-rl-rollouts) — Pi0.5 RTX |
 | **See how FlashRT differs from TensorRT / vLLM / SGLang** | [`docs/inference_engine_differences.md`](docs/inference_engine_differences.md) |
 
 ---

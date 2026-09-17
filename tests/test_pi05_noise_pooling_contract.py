@@ -33,3 +33,17 @@ def test_noise_fill_never_downloads(monkeypatch):
         fill(None, buf, torch.zeros(1), None)
     with pytest.raises(ValueError):
         fill(None, buf, buf, torch.Generator())
+
+
+def test_unequal_prompt_pooling_matches_single_slots():
+    pool = method("_prefix_features_result")
+    hidden = torch.arange(48).reshape(2, 6, 4).float()
+    hidden[0, 3:] = 10000  # Padding must not contribute.
+    frontend = SimpleNamespace(
+        pipeline=SimpleNamespace(encoder_seq_len=6, vision_seq_enc=2),
+        _batch_size=2, _batch_prompt_lens=(1, 4), _prefix_out=hidden)
+    batched = pool(frontend, batched=True)
+    for slot, plen in enumerate(frontend._batch_prompt_lens):
+        single = SimpleNamespace(pipeline=frontend.pipeline,
+                                 _last_prompt_len=plen, _prefix_out=hidden[slot])
+        np.testing.assert_array_equal(batched[slot], pool(single)[0])

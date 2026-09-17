@@ -663,6 +663,16 @@ registering an external-plugin model via `_PIPELINE_MAP`.
 
 ## Adaptation / extension guides
 
+### Pi0.5 RTX Sampling Exports
+
+The Pi0.5 RTX frontend's `infer` and `infer_batch` accept optional
+`noise` or `generator` arguments. They are mutually exclusive for the
+initial noise draw. The default result does not contain a noise host copy.
+Pass `return_noise=True` to export the BF16-rounded initial noise under
+`"noise"`, after inference completes. This also applies to batched CFG.
+The construction-time `denoise_trace` and `prefix_features` exports remain
+opt-in; batch prefix pooling excludes each slot's padded prompt positions.
+
 When adding a new model or kernel, read these in order:
 
 1. [`docs/adding_new_model.md`](adding_new_model.md) — end-to-end

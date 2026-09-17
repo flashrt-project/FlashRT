@@ -84,6 +84,10 @@ class Pi05CFGBatchedPipeline(Pi05BatchedPipeline):
             raise ValueError(
                 f"cfg_beta must be >= 1.0 (1.0 disables CFG); got {cfg_beta}")
         super().__init__(*args, **kwargs)
+        if self.B != 2:
+            raise ValueError(
+                f"Pi05CFGBatchedPipeline needs B=2 (cond + uncond slots); "
+                f"the attention backend was built with batch_size={self.B}")
         self.cfg_beta = float(cfg_beta)
 
     # ══════════════════════════════════════════════════════════════════

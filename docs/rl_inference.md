@@ -265,7 +265,7 @@ stay with the training code that consumes them.
 rt = Pi05TorchFrontendRtx(ckpt, num_views=2)
 rt.set_prompt("pick up the cup")
 
-out = rt.infer(obs, return_noise=True)        # opt-in host noise export
+out = rt.infer(obs, return_noise=True)       # opt-in host noise export
 noise = out["noise"]                         # (chunk_size, 32) float32
 same = rt.infer(obs, noise=noise)            # bit-identical actions
 
@@ -326,11 +326,56 @@ pipelines do not record a trace yet and `set_rl_mode` refuses a
 trace-enabled frontend. Thor and FP16 pipelines and the C++ runtime
 export are not covered.
 
+### Batched rollouts, B = N
+
+```python
+rt = Pi05TorchFrontendRtx(ckpt, num_views=2)
+rt.set_batched_mode(enable=True, batch_size=8)   # any B >= 1; default 2
+rt.set_prompt_batch([prompt] * 8)                 # one prompt per slot, padded to a common length
+rt.calibrate_batch([obs])
+out = rt.infer_batch([obs_0, ..., obs_7], noise=noise_8)   # list of 8 results
+```
+
+The batched attention backend and `Pi05BatchedPipeline` take their
+width from `batch_size`; every folded buffer scales with it. Slots are
+independent: identical inputs give bit-identical outputs per slot, and
+each slot agrees with the B = 1 path on the same noise to cosine
+0.9999 (GEMM tactics change with M, so not bit-equal). Measured on
+RTX 5090, FP8, two views, ten denoising steps: 18.5 ms per
+environment at B = 1, 10.2 ms at B = 4, 8.6 ms at B = 8. The decoder
+streams its weights once per step regardless of rows, so its cost is
+nearly flat in B; the prefix scales linearly. The CFG batched pipeline
+still requires B = 2 (conditioned and unconditioned slots) and
+`set_rl_mode` refuses a wider backend.
+
+### Prefix hidden-state export
+
+```python
+rt = Pi05TorchFrontendRtx(ckpt, num_views=2, prefix_features=True)
+rt.set_prompt(prompt); rt.calibrate([obs])
+feat = rt.infer(obs)["prefix_features"]          # (2048,) float32
+```
+
+With `prefix_features=True` the pipeline copies the Gemma-2B encoder's
+final residual stream (vision + prompt tokens, before the final norm)
+into an export buffer inside the captured graph, and the frontend
+returns its mean over the valid tokens. This is the input a value
+function trained on the VLA's own representation needs, and it costs
+nothing beyond a 2 MB device copy per environment, plus one detail:
+by default the last encoder layer stops after its K/V projection
+because the decoder reads only per-layer K/V, so with the export
+enabled the last layer runs to completion (about 1/18 of the encoder).
+Checked against the torch reference's pre-norm residual stream on the
+same inputs: BF16 path per-token cosine 0.998 and pooled 1.0000; FP8
+path pooled 0.9999 (the export adds the last layer's residual that the
+fused FP8 path leaves pending). Batched: one feature vector per slot.
+
 ## Tests
 
 | test | what it validates |
 |---|---|
 | `tests/test_pi05_seeded_noise_trace.py` | noise injection / seeded reproducibility, trace self-consistency, batched per-slot trace |
+| `tests/test_pi05_batched_n.py` | B = 4 / 8 batched slots vs B = 1, per-env timing, prefix features single vs batched and FP8 vs BF16, CFG refuses B ≠ 2 |
 | `tests/test_rl_cfg_inference.py` | RTX serial + batched CFG, all βs, validation gates |
 | `tests/test_thor_rl_cfg_inference.py --backends torch,jax` | Thor serial CFG: validation, β=1.0 collapse, β=1.5 finite |
 | `tests/test_cfg_correctness_oracle.py` | per-step C1–C5 contract (RTX) vs frozen reference |

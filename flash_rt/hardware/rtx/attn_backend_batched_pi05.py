@@ -1,4 +1,4 @@
-"""Batched (B=2) Pi0.5 RTX attention backend.
+"""Batched (B=N, default 2) Pi0.5 RTX attention backend.
 
 Subclass of :class:`flash_rt.hardware.rtx.attn_backend.RtxFlashAttnBackend`
 that adds B=2 sample-batched Q/K/V/output buffers for use by
@@ -12,11 +12,11 @@ through the new ``*_batched`` methods added here, which read from the
 new B=2 buffers (suffixed ``_b2``) and dispatch to the same FA2 wrapper
 the parent uses.
 
-Hardcoded B=2 for v0.1.0 — chosen specifically to fuse the cond + uncond
-forwards of classifier-free guidance into a single batched pass
-(arXiv:2511.14759 Appendix E). Wider batch sizes are not exposed today;
-multi-robot RL rollout style B=N use cases are tracked separately as a
-future workstream.
+The default B=2 fuses the cond + uncond forwards of classifier-free
+guidance into a single batched pass (arXiv:2511.14759 Appendix E). Pass
+``batch_size=N`` to build the same buffers for N samples, which the
+batched pipeline uses for multi-environment rollouts; the CFG pipelines
+still require B=2.
 """
 
 from __future__ import annotations
@@ -50,14 +50,17 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
     same kernel call with a larger leading dim covers two samples.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, batch_size: int = PI05_BATCH_SIZE, **kwargs):
         super().__init__(*args, **kwargs)
+        if int(batch_size) < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        self._batch_size = int(batch_size)
         torch = self._torch
         # Pull the same dtype as the parent's vision Q so we stay
         # consistent across the whole stack.
         bf16 = self.vis_Q.dtype
         d = "cuda"
-        B = PI05_BATCH_SIZE
+        B = self._batch_size
         nv = self._num_views
         es_max = self._encoder_seq_max
         ds = self._chunk_size
@@ -165,8 +168,9 @@ class RtxFlashAttnBatchedBackendPi05(RtxFlashAttnBackend):
 
     @property
     def batch_size(self) -> int:
-        """Hardcoded sample batch dimension (B=2 for the v0.1.0 CFG path)."""
-        return PI05_BATCH_SIZE
+        """Sample batch dimension; ``PI05_BATCH_SIZE`` (2) unless the backend
+        was built with ``batch_size=N`` for wider rollout batches."""
+        return self._batch_size
 
     # ──────────────────────────────────────────────────────────────
     # Batched attention dispatch (additive — parent methods untouched)
