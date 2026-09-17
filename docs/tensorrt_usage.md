@@ -161,6 +161,10 @@ actions = policy.infer(example)["actions"]   # (10, 7)
 It needs the tutorial's `deployment_scripts` on `PYTHONPATH`.
 `compare_openpi_accuracy.py` compares engines with openpi PyTorch on a set of
 observations; `benchmark_openpi.py` times `policy.infer` for either engine.
+`run_official_pi05_inference.py` runs the openpi Thor tutorial's unchanged
+`deployment_scripts/pi05_inference.py` against the FlashRT engine
+(`FLASHRT_TRT_PLUGIN=<plugin.so>`), for numbers measured exactly like the
+tutorial's.
 
 ### TensorRT Edge-LLM
 
