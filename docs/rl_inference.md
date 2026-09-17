@@ -265,7 +265,7 @@ stay with the training code that consumes them.
 rt = Pi05TorchFrontendRtx(ckpt, num_views=2)
 rt.set_prompt("pick up the cup")
 
-out = rt.infer(obs)                          # unseeded, as before
+out = rt.infer(obs, return_noise=True)        # opt-in host noise export
 noise = out["noise"]                         # (chunk_size, 32) float32
 same = rt.infer(obs, noise=noise)            # bit-identical actions
 
@@ -278,7 +278,7 @@ batch = rt.infer_batch([obs_a, obs_b], noise=noise_pair)   # (B, chunk, 32)
 Contract: same weights, prompt and noise give bit-identical actions
 (graph replay is deterministic). `noise` is taken as given (rounded
 to bf16); `generator` seeds the internal draw; passing both is an
-error. Every result carries `"noise"`, the bf16-rounded noise that was
+error. With `return_noise=True`, the result carries `"noise"`, the bf16-rounded noise that was
 used, which round-trips exactly when passed back. The CFG batched
 path accepts the same arguments (one noise, replicated across the
 conditioned and unconditioned slots). No pipeline change is involved

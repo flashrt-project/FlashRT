@@ -1573,7 +1573,7 @@ class Pi05TorchFrontendRtx:
         return getattr(self, "_precision_spec", None)
 
     def infer(self, observation: dict, debug: bool = False, *,
-              noise=None, generator=None) -> dict:
+              noise=None, generator=None, return_noise: bool = False) -> dict:
         """Run inference on a single observation.
 
         All GPU work happens on ``self._graph_torch_stream`` — the same
@@ -1584,7 +1584,7 @@ class Pi05TorchFrontendRtx:
         initial diffusion noise ``(chunk_size, 32)`` directly and
         ``generator`` (a CUDA ``torch.Generator``) seeds the internal
         draw; with neither, the draw is unseeded as before. The noise
-        actually used is returned under ``"noise"``; the same noise,
+        actually used is returned under ``"noise"`` only with ``return_noise=True``; the same noise,
         prompt and weights give bit-identical actions. When the
         frontend was built with ``denoise_trace=True`` the result also
         carries ``"raw_actions"`` (normalized, ``(chunk, 32)``) and
@@ -1603,7 +1603,7 @@ class Pi05TorchFrontendRtx:
 
         if isinstance(self.pipeline, Pi05CFGBatchedPipeline):
             return self._infer_cfg_batched(
-                observation, debug=debug, noise=noise, generator=generator)
+                observation, debug=debug, noise=noise, generator=generator, return_noise=return_noise)
 
         t0 = time.perf_counter()
 
@@ -1616,7 +1616,7 @@ class Pi05TorchFrontendRtx:
         with torch.cuda.stream(self._graph_torch_stream):
             stream_int = self._graph_torch_stream.cuda_stream
 
-            noise_used = self._fill_noise(self._noise_buf, noise, generator)
+            self._fill_noise(self._noise_buf, noise, generator)
             self._copy_tensor_to_pipeline_buf_stream(
                 self._noise_buf, self.pipeline.input_noise_buf, stream_int)
 
@@ -1651,7 +1651,9 @@ class Pi05TorchFrontendRtx:
             logger.info("Raw actions[0,:5]: %s", raw_actions[0, :5])
             logger.info("Latency: %.1f ms", latency_ms)
 
-        result = {"actions": robot_actions, "noise": noise_used}
+        result = {"actions": robot_actions}
+        if return_noise:
+            result["noise"] = self._noise_buf.float().cpu().numpy()
         if self._denoise_trace:
             result["raw_actions"] = raw_actions
             result["denoise_trace"] = self._denoise_trace_result()
@@ -1665,7 +1667,7 @@ class Pi05TorchFrontendRtx:
 
     def _infer_cfg_batched(self, observation: dict,
                            debug: bool = False, *,
-                           noise=None, generator=None) -> dict:
+                           noise=None, generator=None, return_noise: bool = False) -> dict:
         """Batched CFG inference: single obs replicated across cond + uncond slots."""
         t0 = time.perf_counter()
 
@@ -1681,7 +1683,7 @@ class Pi05TorchFrontendRtx:
             # once and copying into both slots ensures the uncond slot
             # starts at the same noise the cond does, which matches
             # the paper-faithful CFG contract.
-            noise_used = self._fill_noise(self._noise_buf, noise, generator)
+            self._fill_noise(self._noise_buf, noise, generator)
             for b in range(PI05_BATCH_SIZE):
                 self._noise_buf_b2[b].copy_(self._noise_buf)
 
@@ -1714,7 +1716,10 @@ class Pi05TorchFrontendRtx:
                 "CFG batched raw actions[0,:5]: %s", raw_actions[0, :5])
             logger.info("CFG batched latency: %.1f ms", latency_ms)
 
-        return {"actions": robot_actions, "noise": noise_used}
+        result = {"actions": robot_actions}
+        if return_noise:
+            result["noise"] = self._noise_buf.float().cpu().numpy()
+        return result
 
     # -----------------------------------------------------------------
     # Batched (B=2) inference path — additive, default API unchanged
@@ -1874,7 +1879,7 @@ class Pi05TorchFrontendRtx:
         self.graph_recorded = self.use_cuda_graph
 
     def infer_batch(self, observations: list, *,
-                    noise=None, generator=None) -> list:
+                    noise=None, generator=None, return_noise: bool = False) -> list:
         """Run B=2 inference on two independent observations.
 
         Args:
@@ -1899,12 +1904,11 @@ class Pi05TorchFrontendRtx:
                 f"got {len(observations)}")
         t0 = time.perf_counter()
 
-        # Stage per-sample inputs into the B=2 staging tensors, then D2D.
-        for b, obs in enumerate(observations):
-            self._img_buf_b2[b].copy_(self._stack_images(obs))
-        noise_used = self._fill_noise(self._noise_buf_b2, noise, generator)
-
         with torch.cuda.stream(self._graph_torch_stream):
+            # Stage per-sample inputs into the B=2 staging tensors, then D2D.
+            for b, obs in enumerate(observations):
+                self._img_buf_b2[b].copy_(self._stack_images(obs))
+            self._fill_noise(self._noise_buf_b2, noise, generator)
             stream_int = self._graph_torch_stream.cuda_stream
             self._copy_tensor_to_pipeline_buf_stream(
                 self._img_buf_b2, self.pipeline.input_images_buf_b2, stream_int)
@@ -1931,8 +1935,9 @@ class Pi05TorchFrontendRtx:
         for b in range(PI05_BATCH_SIZE):
             raw = self._noise_out_b2[b].float().cpu().numpy()
             unnorm = unnormalize_actions(raw, self.norm_stats)
-            entry = {"actions": unnorm[:, :LIBERO_ACTION_DIM],
-                     "noise": noise_used[b]}
+            entry = {"actions": unnorm[:, :LIBERO_ACTION_DIM]}
+            if return_noise:
+                entry["noise"] = self._noise_buf_b2[b].float().cpu().numpy()
             if trace is not None:
                 entry["raw_actions"] = raw
                 entry["denoise_trace"] = {
@@ -1996,13 +2001,13 @@ class Pi05TorchFrontendRtx:
 
     # ── Reproducible sampling + denoise trace ────────────────────────
 
-    def _fill_noise(self, buf: torch.Tensor, noise, generator) -> np.ndarray:
-        """Fill the staging noise tensor and return a float32 copy of it.
+    def _fill_noise(self, buf: torch.Tensor, noise, generator) -> None:
+        """Fill the staging noise tensor without a host copy or synchronization.
 
         ``noise`` (tensor or array shaped like ``buf``) is copied in;
         otherwise ``buf`` is drawn from ``generator`` when given, else
-        from the default CUDA generator. The returned copy is what the
-        caller must pass back as ``noise=`` to reproduce the sample.
+        from the default CUDA generator. Host export is opt-in at the
+        inference boundary, after the forward stream has completed.
         """
         if noise is not None:
             if generator is not None:
@@ -2016,7 +2021,6 @@ class Pi05TorchFrontendRtx:
             buf.normal_(generator=generator)
         else:
             buf.normal_()
-        return buf.float().cpu().numpy()
 
     def denoise_timesteps(self) -> list:
         """Flow-matching time of each denoising step (``1, 1-dt, ..., dt``)."""

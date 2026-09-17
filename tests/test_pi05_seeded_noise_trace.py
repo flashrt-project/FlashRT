@@ -78,8 +78,8 @@ def test_noise_injection_is_reproducible_and_reported():
     rt.calibrate([obs])
     noise = np.random.default_rng(1).standard_normal((rt.chunk_size, ACTION_DIM)).astype(np.float32)
 
-    a = rt.infer(obs, noise=noise)
-    b = rt.infer(obs, noise=noise)
+    a = rt.infer(obs, noise=noise, return_noise=True)
+    b = rt.infer(obs, noise=noise, return_noise=True)
     np.testing.assert_array_equal(a["actions"], b["actions"])
     # the reported noise is the bf16-rounded input and round-trips exactly
     np.testing.assert_array_equal(a["noise"], b["noise"])
@@ -91,13 +91,13 @@ def test_noise_injection_is_reproducible_and_reported():
 
     g1 = torch.Generator(device="cuda").manual_seed(1234)
     g2 = torch.Generator(device="cuda").manual_seed(1234)
-    s1 = rt.infer(obs, generator=g1)
-    s2 = rt.infer(obs, generator=g2)
+    s1 = rt.infer(obs, generator=g1, return_noise=True)
+    s2 = rt.infer(obs, generator=g2, return_noise=True)
     np.testing.assert_array_equal(s1["noise"], s2["noise"])
     np.testing.assert_array_equal(s1["actions"], s2["actions"])
 
     default = rt.infer(obs)
-    assert set(default) == {"actions", "noise"}
+    assert set(default) == {"actions"}
     assert np.isfinite(default["actions"]).all()
 
     with pytest.raises(ValueError):
@@ -116,12 +116,12 @@ def test_denoise_trace_is_self_consistent():
     rt.calibrate([obs])
     noise = np.random.default_rng(5).standard_normal((rt.chunk_size, ACTION_DIM)).astype(np.float32)
 
-    res = rt.infer(obs, noise=noise)
+    res = rt.infer(obs, noise=noise, return_noise=True)
     assert {"actions", "noise", "raw_actions", "denoise_trace"} <= set(res)
     _check_trace(res["denoise_trace"], res["noise"], res["raw_actions"], rt._num_steps)
 
     # a second call overwrites the trace consistently
-    res2 = rt.infer(obs, noise=-noise)
+    res2 = rt.infer(obs, noise=-noise, return_noise=True)
     _check_trace(res2["denoise_trace"], res2["noise"], res2["raw_actions"], rt._num_steps)
     assert not np.array_equal(res["denoise_trace"]["x"][1], res2["denoise_trace"]["x"][1])
 
@@ -147,7 +147,7 @@ def test_trace_off_by_default_and_batched_trace_per_slot():
         (PI05_BATCH_SIZE, rt.chunk_size, ACTION_DIM)).astype(np.float32)
     noise[1] = noise[0]
 
-    out = rt.infer_batch([obs] * PI05_BATCH_SIZE, noise=noise)
+    out = rt.infer_batch([obs] * PI05_BATCH_SIZE, noise=noise, return_noise=True)
     assert len(out) == PI05_BATCH_SIZE
     for b in range(PI05_BATCH_SIZE):
         _check_trace(out[b]["denoise_trace"], out[b]["noise"], out[b]["raw_actions"], rt._num_steps)
