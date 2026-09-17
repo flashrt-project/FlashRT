@@ -340,11 +340,9 @@ The batched attention backend and `Pi05BatchedPipeline` take their
 width from `batch_size`; every folded buffer scales with it. Slots are
 independent: identical inputs give bit-identical outputs per slot, and
 each slot agrees with the B = 1 path on the same noise to cosine
-0.9999 (GEMM tactics change with M, so not bit-equal). Measured on
-RTX 5090, FP8, two views, ten denoising steps: 18.5 ms per
-environment at B = 1, 10.2 ms at B = 4, 8.6 ms at B = 8. The decoder
-streams its weights once per step regardless of rows, so its cost is
-nearly flat in B; the prefix scales linearly. The CFG batched pipeline
+0.9999 (GEMM tactics change with M, so not bit-equal). Compare widths
+using synchronized observation-to-final-action E2E on identical inputs;
+per-environment throughput is not individual request latency. The CFG batched pipeline
 still requires B = 2 (conditioned and unconditioned slots) and
 `set_rl_mode` refuses a wider backend.
 
