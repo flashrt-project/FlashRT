@@ -357,13 +357,15 @@ still requires B = 2 (conditioned and unconditioned slots) and
 
 ### Prompt rotation and several batched widths (fleet serving)
 
-Prompt embeddings are cached per frontend (text, state, max length) and
-the tokenizer is built once per process, so repeated prompt/state pairs
+Task-only prompt embeddings (`state is None`) are cached per frontend
+(text, max length), and the tokenizer is built once per process. Repeated tasks
 avoid tokenization and embedding. `set_prompt_batch` uploads only the
 device rows of slots that changed (`set_language_embeds_batch(...,
 slots=[...])`); the cache is dropped on `reload_weights` because the
-embedding table changes. Unseen prompt/state pairs still perform the full
-embedding work. `tests/test_pi05_prompt_cache.py` checks rotated prompts
+embedding table changes. State-bearing prompts always perform the full
+embedding work without retaining entries, so continuously changing robot
+states cannot fill the host/device embedding cache. Unseen tasks also perform
+the full embedding work. `tests/test_pi05_prompt_cache.py` checks rotated prompts
 against cold re-embedding; performance reports must label cache warmup
 and distinguish repeated-input workloads from unseen-input workloads.
 
