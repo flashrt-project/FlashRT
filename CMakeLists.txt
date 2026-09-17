@@ -1909,7 +1909,7 @@ if(FLASHRT_ENABLE_PI05_SKINNY)
   target_sources(flash_rt_kernels PRIVATE
     $<TARGET_OBJECTS:pi05_decoder_skinny_sm120_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE
-    FLASHRT_DECODER_SKINNY_SM120=1)
+    FLASHRT_PI05_DECODER_SKINNY_SM120=1)
 endif()
 
 # Dedicated M=1 decode GEMV (FP8 + BF16); linked + macro defined wherever the

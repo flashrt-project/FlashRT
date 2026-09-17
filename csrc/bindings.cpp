@@ -55,7 +55,7 @@
 #ifdef ENABLE_QWEN36_FLASHINFER_XQA
 #include "kernels/qwen36_flashinfer_xqa.cuh"
 #endif
-#ifdef FLASHRT_DECODER_SKINNY_SM120
+#ifdef FLASHRT_PI05_DECODER_SKINNY_SM120
 #include "kernels/pi05/pi05_decoder_skinny_fp8_sm120.cuh"
 #endif
 #if defined(ENABLE_CUTLASS_SM120_NVFP4_W4A16) || defined(ENABLE_CUTLASS_SM100_NVFP4_W4A16)
@@ -7198,7 +7198,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
 #undef BIND_SPLITK
 #endif  // ENABLE_CUTLASS_SM120_BLOCK_FP8
 
-#ifdef FLASHRT_DECODER_SKINNY_SM120
+#ifdef FLASHRT_PI05_DECODER_SKINNY_SM120
     // Skinny FP8 decoder GEMM family (sm_120a): K-split partials + fused consumers,
     // optional programmatic dependent launch. See kernels/pi05/pi05_decoder_skinny_fp8_sm120.cuh.
     m.def("pi05_dec_skinny_available", []() {
@@ -7309,7 +7309,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("x"), py::arg("w_out"), py::arg("b_out"), py::arg("action"), py::arg("noise"),
        py::arg("trace_x") = 0, py::arg("trace_delta") = 0, py::arg("rows") = 0, py::arg("pdl") = true,
        py::arg("stream") = 0);
-#endif  // FLASHRT_DECODER_SKINNY_SM120
+#endif  // FLASHRT_PI05_DECODER_SKINNY_SM120
 
 #ifdef ENABLE_DECODE_GEMV_M1
     // Dedicated M=1 GEMV (FP8 + BF16), warp-per-output-row, no MMA padding tax.
