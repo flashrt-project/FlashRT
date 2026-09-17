@@ -1621,8 +1621,8 @@ class Pi05TorchFrontendRtx:
                     vision_pool_factor=self._vision_pool_factor,
                     vision_num_layers=self._vision_num_layers,
                     denoise_trace=self._denoise_trace,
-                prefix_export=self._prefix_features,
-                sde=self._sde,
+                    prefix_export=self._prefix_features,
+                    sde=self._sde,
                     **self._pipeline_precision_kwargs())
                 self._prompt_pipeline_cache[prompt_len] = self.pipeline
                 # Static INT8 vision scales are per-pipeline-instance.
@@ -2649,8 +2649,9 @@ class Pi05TorchFrontendRtx:
         if sde_sigma is None:
             raise ValueError("step_noise needs sde_sigma")
         sigma = np.asarray(sde_sigma, dtype=np.float32).reshape(-1)
-        if sigma.shape[0] != self._num_steps or (sigma < 0).any():
-            raise ValueError(f"sde_sigma must hold {self._num_steps} non-negative values")
+        if (sigma.shape[0] != self._num_steps or not np.isfinite(sigma).all()
+                or (sigma < 0).any()):
+            raise ValueError(f"sde_sigma must hold {self._num_steps} finite non-negative values")
         self._sde_sigma_dev().copy_(torch.from_numpy(sigma))
         self._copy_tensor_to_pipeline_buf_stream(
             self._sde_sigma_dev(), self.pipeline.sde_sigma_buf, stream_int)

@@ -20,8 +20,8 @@ def guards_at(text, needle):
 def test_headers_and_bindings_share_pi05_gates():
     text = (ROOT / "csrc/bindings.cpp").read_text()
     for header, symbol, guard in (
-        ("sde_step.cuh", "pi05_sde_residual_add", "ENABLE_PI05_SDE"),
-        ("geglu_nvfp4_quant.cuh", "pi05_geglu_merged_to_nvfp4_swizzled", "ENABLE_PI05_NVFP4"),
+        ("pi05/pi05_sde_step.cuh", "pi05_sde_residual_add", "ENABLE_PI05_SDE"),
+        ("pi05/pi05_geglu_nvfp4_quant.cuh", "pi05_geglu_merged_to_nvfp4_swizzled", "ENABLE_PI05_NVFP4"),
         ("pi05/pi05_decoder_skinny_fp8_sm120.cuh", "pi05_dec_skinny_available", "FLASHRT_PI05_DECODER_SKINNY_SM120"),
     ):
         for needle in (f'#include "kernels/{header}"', f'm.def("{symbol}"'):
@@ -48,3 +48,14 @@ def test_fused_sde_obeys_both_feature_gates():
         assert "#ifdef ENABLE_PI05_SDE" in guards_at(source, "int action_out_residual_sde(")
     cmake = (ROOT / "CMakeLists.txt").read_text()
     assert "target_compile_definitions(pi05_decoder_skinny_sm120_obj PRIVATE ENABLE_PI05_SDE=1)" in cmake
+
+
+def test_pi05_kernel_ownership_and_status():
+    cmake = (ROOT / "CMakeLists.txt").read_text()
+    for name, status in (("geglu_nvfp4_quant", "NVFP4 prefix"), ("sde_step", "SDE")):
+        for suffix in ("cu", "cuh"):
+            assert (ROOT / f"csrc/kernels/pi05/pi05_{name}.{suffix}").is_file()
+            assert not (ROOT / f"csrc/kernels/{name}.{suffix}").exists()
+        assert f"csrc/kernels/pi05/pi05_{name}.cu" in cmake
+        assert f"Pi0.5 {status} kernels: ENABLED" in cmake
+        assert f"Pi0.5 {status} kernels: DISABLED" in cmake

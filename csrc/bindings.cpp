@@ -59,7 +59,7 @@
 #include "kernels/pi05/pi05_geglu_nvfp4_quant.cuh"
 #endif
 #ifdef ENABLE_PI05_SDE
-#include "kernels/sde_step.cuh"
+#include "kernels/pi05/pi05_sde_step.cuh"
 #endif
 #ifdef FLASHRT_PI05_DECODER_SKINNY_SM120
 #include "kernels/pi05/pi05_decoder_skinny_fp8_sm120.cuh"

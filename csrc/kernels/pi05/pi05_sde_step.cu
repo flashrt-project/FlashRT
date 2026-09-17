@@ -1,5 +1,5 @@
 // Stochastic denoising step for the flow-matching sampler.
-#include "sde_step.cuh"
+#include "pi05_sde_step.cuh"
 
 namespace flash_rt {
 
