@@ -394,11 +394,17 @@ scales stay as calibrated (they describe the activation range of the model
 that was calibrated, which moves little across the fine-tuning steps of an
 RL loop); call `calibrate` again to refresh them, which re-captures.
 
-Measured on RTX 5090, pi05_libero, FP8 with the skinny decoder: 0.46 s
-from a pinned host state dict or a CUDA-resident one (conversion and copy
-0.35 s, re-quantization 0.07 s, styles 0.01 s, prompt 0.03 s), 1.3 s from
-a pageable host state dict, 12.4 GiB peak with the 9.2 GiB frontend
-resident. Against a frontend built fresh from the same weights on the same
+Reload performs a complete streaming conversion preflight before writing
+live weights. Reload, inference, prompt changes and calibration are serialized
+per frontend. A preflight error leaves the model usable; any error after
+mutation permanently invalidates the frontend, and the caller must construct
+a new instance. It never continues inference with mixed weights.
+
+Neither construction nor reload calls `torch.cuda.empty_cache()`. Process-wide
+allocator management belongs to the caller. Earlier reload timing/memory
+measurements predate preflight validation and are not current guarantees.
+
+Against a frontend built fresh from the same weights on the same
 prompt, images and noise: BF16 cosine 0.99999, FP8 (scales kept) 0.9997–
 0.9999; replays after the reload are bit-identical; reloading the original
 weights restores the original output (`tests/test_pi05_weight_reload.py`).
