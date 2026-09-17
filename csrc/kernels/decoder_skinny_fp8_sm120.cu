@@ -7,7 +7,7 @@
 #include <cstdint>
 
 namespace flash_rt {
-namespace dec_skinny {
+namespace pi05_dec_skinny {
 namespace {
 
 __device__ __forceinline__ void mma_e4m3(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
@@ -872,5 +872,5 @@ int action_out_residual(const __nv_bfloat16* x, const __nv_bfloat16* w_out, cons
                      b_out, action, noise, trace_x, trace_delta);
 }
 
-}  // namespace dec_skinny
+}  // namespace pi05_dec_skinny
 }  // namespace flash_rt

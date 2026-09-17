@@ -1,5 +1,9 @@
 # Pi0.5 decoder on the skinny FP8 GEMM family (RTX 5090, sm_120a)
 
+This experimental path requires `-DFLASHRT_ENABLE_PI05_SKINNY=ON` at
+build time and `decoder_kernel="skinny"` at runtime. Both the frontend
+and pipeline default to `cublaslt`; a default build excludes these kernels.
+
 The action expert of Pi0.5 runs ten denoising steps over a ten-row action
 chunk, and every step streams the whole Gemma-300M decoder (about 311 MB of
 FP8 weights) from HBM. On the library GEMM path that decoder took 8.8 ms of
@@ -13,9 +17,9 @@ so every GEMM prefetches its weights while the previous kernel drains.
 
 ## What it is
 
-Source: `csrc/kernels/decoder_skinny_fp8_sm120.cu` (bindings `dec_skinny_*`),
+Source: `csrc/kernels/decoder_skinny_fp8_sm120.cu` (bindings `pi05_dec_skinny_*`),
 selected by the `Pi05Pipeline` / `Pi05TorchFrontendRtx` keyword
-`decoder_kernel` (`"auto"` default, `"skinny"`, `"cublaslt"`) or the
+`decoder_kernel` (`"cublaslt"` default, `"skinny"`, `"auto"`) or the
 environment variable `FLASHRT_PI05_DECODER_KERNEL`. Only the calibrated FP8
 decoder uses it; calibration, the BF16 decoder, INT8, the encoder and the
 vision tower are unchanged. `FLASHRT_PI05_SKINNY_PDL=0` disables the
@@ -118,7 +122,7 @@ decoder is untouched and bit-identical across builds.
 ## Limits and next steps
 
 - sm_120a only (`mma.kind::f8f6f4`); other targets keep the library path
-  automatically (`dec_skinny_available()` gates it at run time).
+  automatically (`pi05_dec_skinny_available()` gates it at run time).
 - `residual_ada_norm` is specialised for the 1024-wide decoder.
 - The attention kernels assume the packed decoder output buffer and a
   chunk of at most 16 rows; other configurations keep the FlashAttention-2

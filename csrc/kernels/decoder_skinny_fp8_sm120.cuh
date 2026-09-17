@@ -21,7 +21,7 @@
 #include <cuda_runtime.h>
 
 namespace flash_rt {
-namespace dec_skinny {
+namespace pi05_dec_skinny {
 
 // Tile configurations (BN x KC x warps). Returns the number of configs.
 int config_count();
@@ -111,5 +111,5 @@ int action_out_residual(const __nv_bfloat16* x, const __nv_bfloat16* w_out,
                         __nv_bfloat16* trace_delta, int rows, bool pdl,
                         cudaStream_t stream);
 
-}  // namespace dec_skinny
+}  // namespace pi05_dec_skinny
 }  // namespace flash_rt

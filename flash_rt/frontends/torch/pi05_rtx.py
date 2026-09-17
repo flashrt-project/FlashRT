@@ -489,7 +489,7 @@ class Pi05TorchFrontendRtx:
         # the library GEMMs, "skinny" requires the kernels. The environment
         # variable FLASHRT_PI05_DECODER_KERNEL overrides the default.
         self._decoder_kernel = (decoder_kernel
-                                or os.environ.get("FLASHRT_PI05_DECODER_KERNEL", "auto"))
+                                or os.environ.get("FLASHRT_PI05_DECODER_KERNEL", "cublaslt"))
         # Batched-mode width; set_batched_mode(batch_size=N) changes it.
         self._batch_size = PI05_BATCH_SIZE
         # Prefix features: pipelines export the encoder's final hidden
@@ -825,7 +825,7 @@ class Pi05TorchFrontendRtx:
         if not self.use_fp8 or self._decoder_kernel == "cublaslt":
             return False
         from flash_rt import flash_rt_kernels as fvk
-        probe = getattr(fvk, "dec_skinny_available", None)
+        probe = getattr(fvk, "pi05_dec_skinny_available", None)
         return bool(probe is not None and probe())
 
     def _quantize_decoder_int8(self) -> None:

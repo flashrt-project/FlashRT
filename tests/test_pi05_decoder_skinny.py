@@ -41,11 +41,14 @@ _CKPT_AVAILABLE = os.path.isdir(CKPT_PI05)
 def _family_available() -> bool:
     if not _GPU_AVAILABLE:
         return False
+    import importlib
     try:
-        from flash_rt import flash_rt_kernels as fvk
-    except ImportError:
-        return False
-    probe = getattr(fvk, "dec_skinny_available", None)
+        fvk = importlib.import_module("flash_rt.flash_rt_kernels")
+    except ModuleNotFoundError as exc:
+        if exc.name == "flash_rt.flash_rt_kernels":
+            return False
+        raise
+    probe = getattr(fvk, "pi05_dec_skinny_available", None)
     return bool(probe is not None and probe())
 
 
@@ -100,8 +103,8 @@ def test_gemm_matches_fp32_matmul(rows, pdl):
     torch.manual_seed(0)
     stream = torch.cuda.Stream()
     for name, N, K, cfg in SHAPES:
-        assert fvk.dec_skinny_config_supports(cfg, N, K)
-        splits = K // fvk.dec_skinny_config_k_chunk(cfg)
+        assert fvk.pi05_dec_skinny_config_supports(cfg, N, K)
+        splits = K // fvk.pi05_dec_skinny_config_k_chunk(cfg)
         A = _fp8(torch.randn(rows, K, device="cuda") * 0.5)
         W = _fp8(torch.randn(N, K, device="cuda") * 0.05)
         a_scale = torch.tensor([0.02], device="cuda"); w_scale = torch.tensor([0.01], device="cuda")
@@ -109,9 +112,9 @@ def test_gemm_matches_fp32_matmul(rows, pdl):
         residual = torch.zeros(rows, N, dtype=torch.bfloat16, device="cuda")
         gate = torch.ones(rows, N, dtype=torch.bfloat16, device="cuda")
         with torch.cuda.stream(stream):
-            rc = fvk.dec_skinny_gemm(A.data_ptr(), W.data_ptr(), partials.data_ptr(), rows, N, K, cfg, pdl, stream.cuda_stream)
+            rc = fvk.pi05_dec_skinny_gemm(A.data_ptr(), W.data_ptr(), partials.data_ptr(), rows, N, K, cfg, pdl, stream.cuda_stream)
             assert rc == 0, (name, rc)
-            rc = fvk.dec_skinny_residual_gate_mul(partials.data_ptr(), splits, a_scale.data_ptr(), w_scale.data_ptr(),
+            rc = fvk.pi05_dec_skinny_residual_gate_mul(partials.data_ptr(), splits, a_scale.data_ptr(), w_scale.data_ptr(),
                                                   residual.data_ptr(), gate.data_ptr(), rows, N, pdl, stream.cuda_stream)
             assert rc == 0, (name, rc)
         torch.cuda.synchronize()
@@ -122,11 +125,11 @@ def test_gemm_matches_fp32_matmul(rows, pdl):
         A16 = torch.randn(rows, K, device="cuda", dtype=torch.bfloat16)
         Aq = _fp8(torch.clamp(A16.float() / a_scale, -448, 448))
         with torch.cuda.stream(stream):
-            rc = fvk.dec_skinny_gemm_bf16_act(A16.data_ptr(), a_scale.data_ptr(), W.data_ptr(), partials.data_ptr(),
+            rc = fvk.pi05_dec_skinny_gemm_bf16_act(A16.data_ptr(), a_scale.data_ptr(), W.data_ptr(), partials.data_ptr(),
                                               rows, N, K, cfg, pdl, stream.cuda_stream)
             assert rc == 0
             residual.zero_()
-            fvk.dec_skinny_residual_gate_mul(partials.data_ptr(), splits, a_scale.data_ptr(), w_scale.data_ptr(),
+            fvk.pi05_dec_skinny_residual_gate_mul(partials.data_ptr(), splits, a_scale.data_ptr(), w_scale.data_ptr(),
                                              residual.data_ptr(), gate.data_ptr(), rows, N, pdl, stream.cuda_stream)
         torch.cuda.synchronize()
         ref = (Aq.float() @ W.float().T) * (a_scale * w_scale)
@@ -156,7 +159,7 @@ def test_consumers_bit_identical_to_unfused_kernels():
                                    style.data_ptr(), out_a.data_ptr(), gate_a.data_ptr(), rows, D, 1e-6,
                                    out_scale.data_ptr())
     partials = x.float().contiguous()  # splits = 1, alpha = 1
-    rc = fvk.dec_skinny_residual_ada_norm(partials.data_ptr(), 1, one.data_ptr(), one.data_ptr(), residual_b.data_ptr(),
+    rc = fvk.pi05_dec_skinny_residual_ada_norm(partials.data_ptr(), 1, one.data_ptr(), one.data_ptr(), residual_b.data_ptr(),
                                           gate_b.data_ptr(), weight.data_ptr(), style.data_ptr(), out_b.data_ptr(), 0,
                                           out_scale.data_ptr(), gate_b.data_ptr(), rows, D, 1e-6, False, 0)
     torch.cuda.synchronize()
@@ -172,7 +175,7 @@ def test_consumers_bit_identical_to_unfused_kernels():
     fvk.gate_mul_residual(residual_a.data_ptr(), x.data_ptr(), gate_a.data_ptr(), rows * D)
     fvk.ada_rms_norm_style(residual_a.data_ptr(), weight.data_ptr(), style.data_ptr(), normed_a.data_ptr(),
                            gate_a.data_ptr(), rows, D, 1e-6)
-    rc = fvk.dec_skinny_residual_ada_norm(partials.data_ptr(), 1, one.data_ptr(), one.data_ptr(), residual_b.data_ptr(),
+    rc = fvk.pi05_dec_skinny_residual_ada_norm(partials.data_ptr(), 1, one.data_ptr(), one.data_ptr(), residual_b.data_ptr(),
                                           gate_b.data_ptr(), weight.data_ptr(), style.data_ptr(), 0, normed_b.data_ptr(),
                                           0, gate_b.data_ptr(), rows, D, 1e-6, False, 0)
     torch.cuda.synchronize()
@@ -186,7 +189,7 @@ def test_consumers_bit_identical_to_unfused_kernels():
     out_a = torch.empty(rows, H, dtype=torch.float8_e4m3fn, device="cuda"); out_b = torch.empty_like(out_a)
     fvk.gate_geglu_merged_fp8(merged.data_ptr(), out_a.data_ptr(), rows, H, out_scale.data_ptr())
     partials = merged.float().contiguous()
-    rc = fvk.dec_skinny_gate_gelu_fp8(partials.data_ptr(), 1, one.data_ptr(), one.data_ptr(), out_b.data_ptr(),
+    rc = fvk.pi05_dec_skinny_gate_gelu_fp8(partials.data_ptr(), 1, one.data_ptr(), one.data_ptr(), out_b.data_ptr(),
                                       rows, H, out_scale.data_ptr(), False, 0)
     torch.cuda.synchronize()
     assert rc == 0
@@ -207,7 +210,7 @@ def test_consumers_bit_identical_to_unfused_kernels():
                            V_a.data_ptr() + (b * per_sample + enc) * kv_dim * 2,
                            rows, q_dim, kv_dim, kv_dim, hd)
     partials = qkv.float().contiguous()
-    rc = fvk.dec_skinny_sum_rope(partials.data_ptr(), 1, one.data_ptr(), one.data_ptr(), rope.data_ptr(),
+    rc = fvk.pi05_dec_skinny_sum_rope(partials.data_ptr(), 1, one.data_ptr(), one.data_ptr(), rope.data_ptr(),
                                  Q_b.data_ptr(), K_b.data_ptr() + enc * kv_dim * 2, V_b.data_ptr() + enc * kv_dim * 2,
                                  0, 2 * rows, q_dim, kv_dim, kv_dim, hd, rows, per_sample, False, 0)
     torch.cuda.synchronize()
@@ -235,11 +238,11 @@ def test_attention_matches_torch(pdl):
     K[:, valid:] = float("nan"); V[:, valid:] = float("nan")
     O = torch.zeros(samples, rows, heads, hd, device="cuda", dtype=torch.bfloat16)
     seqused = torch.tensor([valid], dtype=torch.int32, device="cuda")
-    splits = fvk.dec_skinny_attn_splits(kv_len)
-    scratch = torch.zeros(fvk.dec_skinny_attn_scratch_floats(splits, samples, heads), device="cuda")
+    splits = fvk.pi05_dec_skinny_attn_splits(kv_len)
+    scratch = torch.zeros(fvk.pi05_dec_skinny_attn_scratch_floats(splits, samples, heads), device="cuda")
     counters = torch.zeros(samples * heads, dtype=torch.int32, device="cuda")
     for _ in range(2):
-        rc = fvk.dec_skinny_attn(Q.data_ptr(), K.data_ptr(), V.data_ptr(), O.data_ptr(), rows, samples, heads,
+        rc = fvk.pi05_dec_skinny_attn(Q.data_ptr(), K.data_ptr(), V.data_ptr(), O.data_ptr(), rows, samples, heads,
                                  heads * hd, kv_len, seqused.data_ptr(), stride_rows, 1.0 / hd ** 0.5,
                                  scratch.data_ptr(), counters.data_ptr(), pdl, 0)
         torch.cuda.synchronize()
@@ -257,7 +260,7 @@ def test_attention_matches_torch(pdl):
     assert cos > 0.9999, cos
     # without a device count every key up to kv_len counts (no NaN rows then)
     K[:, valid:] = 0; V[:, valid:] = 0
-    rc = fvk.dec_skinny_attn(Q.data_ptr(), K.data_ptr(), V.data_ptr(), O.data_ptr(), rows, samples, heads,
+    rc = fvk.pi05_dec_skinny_attn(Q.data_ptr(), K.data_ptr(), V.data_ptr(), O.data_ptr(), rows, samples, heads,
                              heads * hd, kv_len, 0, stride_rows, 1.0 / hd ** 0.5,
                              scratch.data_ptr(), counters.data_ptr(), pdl, 0)
     torch.cuda.synchronize()
@@ -284,7 +287,7 @@ def test_action_projection_kernels():
     out_scale = torch.tensor([0.05], device="cuda")
     out = torch.empty(rows, D, dtype=torch.float8_e4m3fn, device="cuda")
     gate = torch.empty(rows, D, dtype=torch.bfloat16, device="cuda")
-    rc = fvk.dec_skinny_action_in_norm(noise.data_ptr(), w_in.data_ptr(), b_in.data_ptr(), x.data_ptr(),
+    rc = fvk.pi05_dec_skinny_action_in_norm(noise.data_ptr(), w_in.data_ptr(), b_in.data_ptr(), x.data_ptr(),
                                        weight.data_ptr(), style.data_ptr(), out.data_ptr(), gate.data_ptr(),
                                        out_scale.data_ptr(), rows, 1e-6, False, 0)
     torch.cuda.synchronize()
@@ -302,7 +305,7 @@ def test_action_projection_kernels():
     noise0 = noise.clone(); noise1 = noise.clone()
     action = torch.empty(rows, A, dtype=torch.bfloat16, device="cuda")
     tx = torch.empty(rows, A, dtype=torch.bfloat16, device="cuda"); td = torch.empty_like(tx)
-    rc = fvk.dec_skinny_action_out_residual(xn.data_ptr(), w_out.data_ptr(), b_out.data_ptr(), action.data_ptr(),
+    rc = fvk.pi05_dec_skinny_action_out_residual(xn.data_ptr(), w_out.data_ptr(), b_out.data_ptr(), action.data_ptr(),
                                             noise1.data_ptr(), tx.data_ptr(), td.data_ptr(), rows, False, 0)
     torch.cuda.synchronize()
     assert rc == 0
@@ -312,6 +315,17 @@ def test_action_projection_kernels():
     assert torch.equal(tx, noise0)
     assert torch.equal(td, action)
     assert torch.equal(noise1, (noise0.float() + action.float()).to(torch.bfloat16))
+
+
+@requires_ckpt
+def test_default_keeps_cublaslt_without_transposed_copies(monkeypatch):
+    from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
+    monkeypatch.delenv("FLASHRT_PI05_DECODER_KERNEL", raising=False)
+    rt = Pi05TorchFrontendRtx(CKPT_PI05, num_views=2)
+    assert rt._decoder_kernel == "cublaslt"
+    assert not any(key.endswith("__nk") for key in rt._fp8_weights)
+    rt.set_prompt(PROMPT)
+    assert not rt.pipeline._skinny
 
 
 @requires_ckpt

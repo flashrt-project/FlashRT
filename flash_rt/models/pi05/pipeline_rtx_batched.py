@@ -821,7 +821,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         for step in range(self.num_steps):
             skinny_step = fused and self._skinny
             if skinny_step:
-                rc = fvk.dec_skinny_action_in_norm(
+                rc = fvk.pi05_dec_skinny_action_in_norm(
                     Bb["diffusion_noise_b2"].ptr.value,
                     W["decoder_action_in_proj_w"], W["decoder_action_in_proj_b"],
                     Bb["decoder_x_b2"].ptr.value, self._rms_ones_dec.ptr.value,
@@ -853,7 +853,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                     off = step * m * ACTION_DIM * 2
                     trace_x = Bb["denoise_trace_x_b2"].ptr.value + off
                     trace_delta = Bb["denoise_trace_delta_b2"].ptr.value + off
-                rc = fvk.dec_skinny_action_out_residual(
+                rc = fvk.pi05_dec_skinny_action_out_residual(
                     Bb["x_normed_buf_b2"].ptr.value,
                     W["decoder_action_out_proj_w"], W["decoder_action_out_proj_b"],
                     Bb["decoder_action_buf_b2"].ptr.value, Bb["diffusion_noise_b2"].ptr.value,
