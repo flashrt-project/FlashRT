@@ -1,5 +1,8 @@
 # Pi0.5 prefix on NVFP4 (RTX 5090, sm_120a): an optional tier
 
+Build with `-DFLASHRT_ENABLE_PI05_NVFP4=ON` to use this optional tier.
+The option defaults to OFF and requires `GPU_ARCH=120`.
+
 The Pi0.5 prefix (SigLIP-L over two views plus the Gemma-2B encoder over
 about 520 tokens) is compute-bound on RTX 5090. On this GPU the per-tensor
 FP8 GEMMs with FP32 accumulation that cuBLASLt runs top out around 500-600

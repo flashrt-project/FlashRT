@@ -1037,7 +1037,8 @@ class Pi05Pipeline:
         table = self.weights.get("nvfp4") or {}
         if not table:
             raise RuntimeError("prefix_precision='nvfp4' but the frontend provided no NVFP4 weights")
-        for fn in ("quantize_bf16_to_nvfp4_swizzled_v2", "fp4_w4a16_gemm_sm120_bf16out_pingpong"):
+        for fn in ("quantize_bf16_to_nvfp4_swizzled_v2", "fp4_w4a16_gemm_sm120_bf16out_pingpong",
+                   "pi05_geglu_merged_to_nvfp4_swizzled"):
             if not hasattr(self.fvk, fn):
                 raise RuntimeError(f"this kernel build lacks {fn}")
         self._nvfp4_rows = 0
