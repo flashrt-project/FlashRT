@@ -3,13 +3,9 @@
 Build with `-DFLASHRT_ENABLE_PI05_NVFP4=ON` to use this optional tier.
 The option defaults to OFF and requires `GPU_ARCH=120`.
 
-The Pi0.5 prefix (SigLIP-L over two views plus the Gemma-2B encoder over
-about 520 tokens) is compute-bound on RTX 5090. On this GPU the per-tensor
-FP8 GEMMs with FP32 accumulation that cuBLASLt runs top out around 500-600
-TFLOPS, while the block-scaled NVFP4 tensor-core path runs 1000-1300
-TFLOPS. With the decoder on the skinny family (`docs/pi05_decoder_skinny.md`)
-the prefix was two thirds of the graph, so this page adds a prefix tier
-that runs the vision and encoder GEMMs on NVFP4 weights and activations.
+This optional tier runs the Pi0.5 prefix (SigLIP-L over two views plus the
+Gemma-2B encoder) on NVFP4 weights and activations. It can be combined with
+the explicitly selected skinny decoder (`docs/pi05_decoder_skinny.md`).
 
 It is a tier, not the default: 4-bit operands cost about 2.5e-3 of cosine
 against the BF16 engine on real frames where FP8 costs 5e-5. Use it where
@@ -52,30 +48,12 @@ NVFP4 weights in place.
 
 ## Numbers
 
-Standalone GEMM sweep, cold weights, RTX 5090 (TFLOPS; cosine against an
-FP32 matmul of the same BF16 operands, Gaussian data):
-
-| shape (N x K) | M | per-tensor FP8 (cuBLASLt) | block-128 FP8 (CUTLASS) | NVFP4 pingpong | NVFP4 cos / FP8 cos |
-|---|---:|---:|---:|---:|---|
-| enc gate_up 32768 x 2048 | 520 | 538 | 347 | 996 | 0.990 / 0.9993 |
-| enc down 2048 x 16384 | 520 | 365 | 184 | 677 | 0.990 / 0.9993 |
-| enc qkv 2560 x 2048 | 520 | 344 | 203 | 546 | 0.990 / 0.9993 |
-| enc gate_up | 4160 | 584 | 419 | 1284 | |
-| enc down | 4160 | 617 | 359 | 1248 | |
-| enc qkv | 4160 | 632 | 422 | 1222 | |
-| vis up 4304 x 1152 | 4096 | 473 | n/a | 1008 | |
-
-The block-128 FP8 CUTLASS kernel is slower than the library path at every
-shape and was dropped.
-
-End to end, pi05_libero, two views, FP8 decoder on the skinny family:
-
-| | FP8 prefix | NVFP4 prefix |
-|---|---:|---:|
-| B = 1 `infer()` | 14.04 ms | 11.82 ms |
-| B = 1 graph replay | 12.94 ms | 10.64 ms |
-| B = 4, per environment | 8.73 ms | 6.85 ms |
-| B = 8, per environment | 7.89 ms | 5.96 ms |
+Measure synchronized observation-to-final-action E2E with
+`tools/bench_pi05_e2e.py --profile nvfp4`, using the same checkpoint,
+observation fixture, input contract and container as `--profile skinny`.
+Both profiles explicitly select skinny; only the prefix precision differs.
+See the skinny documentation for the complete timing boundary. Kernel and
+partial graph timings are not E2E results.
 
 Agreement on real LIBERO frames, same prompt and noise (six frames):
 
@@ -92,12 +70,9 @@ on synthetic frames (0.99-0.998 there), the batched pipeline and a reload.
 
 ## Limits and next steps
 
-- sm_120a only; the FP4 kernels reach about 60 % of the 1990 TFLOPS the
-  instruction rate allows, so the prefix still has headroom in the GEMMs
-  themselves.
+- sm_120a only.
 - The activation quantizer for K = 4352 (SigLIP down) falls back to the
-  row-per-CTA kernel; the strided staging copy costs 27 x 4.5 µs per
-  forward. Writing the FFN up projection into a padded buffer would remove
-  both.
+  row-per-CTA kernel. Writing the FFN up projection into a padded buffer
+  could remove the strided staging copy.
 - Per-task success-rate qualification decides whether a deployment uses
   this tier; the numbers above are the engineering gate only.
