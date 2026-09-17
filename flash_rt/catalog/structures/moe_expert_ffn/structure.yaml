@@ -1,0 +1,67 @@
+structure: moe_expert_ffn
+version: 1
+description: >
+  Sparse mixture-of-experts feed-forward block: route x[M,D] over E experts,
+  gather the top-k expert gate/up/down triples, activation(gate) * up per
+  expert, down projection, routing-weighted combine, plus an optional
+  always-on shared expert whose output is sigmoid-gated by its own scalar
+  projection. The routing decision (softmax/top-k/renorm) is part of the
+  boundary under the fused variant; under the external variant the block
+  consumes precomputed ids/weights. Per-token expert sets are independent,
+  so token batches (M > 1) are part of the boundary, not a special case.
+
+reference:
+  module: moe_expert_ffn.reference
+  entrypoint: moe_expert_ffn_ref
+
+boundary:
+  symbolic_dims: [M, D, F, E, K_top]
+  inputs:
+    - {name: x, dims: [M, D], dtype: "@binding"}
+    - {name: expert_ids, dims: [M, K_top], dtype: int32, optional: true}     # external routing
+    - {name: expert_weights, dims: [M, K_top], dtype: "@binding", optional: true}
+    - {name: residual, dims: [M, D], dtype: "@binding", optional: true}
+  outputs:
+    - {name: y, dims: [M, D], dtype: "@binding"}
+
+weights:
+  - {slot: w_router, dims: [D, E], optional: true}       # fused routing only
+  - {slot: w_gate_exps, dims: [E, D, F]}
+  - {slot: w_up_exps, dims: [E, D, F]}
+  - {slot: w_down_exps, dims: [E, F, D]}
+  - {slot: w_gate_shexp, dims: [D, F_sh], optional: true}
+  - {slot: w_up_shexp, dims: [D, F_sh], optional: true}
+  - {slot: w_down_shexp, dims: [F_sh, D], optional: true}
+  - {slot: w_gate_inp_shexp, dims: [D], optional: true}  # sigmoid gate scalar
+
+variants:
+  routing: [external, fused]           # fused = router GEMM + exact top-k in-boundary
+  topk_norm: [softmax_topk_clamp_renorm]  # softmax over E, iterative top-k with
+                                       # lower-index tie-break, clamp, renormalize
+  shared_expert: [none, sigmoid_gated]
+  activation: [silu]
+  weight_consumption: [dequant_gemm, format_native]
+                                       # format_native = expert weights are
+                                       # consumed in the host's own storage
+                                       # format, activations quantized to the
+                                       # host's own convention — no repack, no
+                                       # dequant materialization
+  batch: [m1, m_le_4]
+
+calibration:
+  points: [x]
+
+gates:
+  parity:
+    metrics: [cosine, max_abs, p99_abs]
+    data: real_distribution
+
+boundary_notes:
+  - "expert_ids/expert_weights rows may be strided views of a sort output;
+     the row stride is part of the boundary, never assumed dense"
+  - "the routing decision under the fused variant is part of the boundary,
+     including the tie-break and normalization semantics"
+  - "per-token expert sets are independent: batch variants of the same token
+     denote the same computation row for row"
+  - "the combine (weighted sum + shared expert + residual) is part of the
+     boundary"
