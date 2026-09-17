@@ -13,7 +13,7 @@ def test_skinny_gate_is_default_off_and_independent_of_qwen():
     matches = 0
     for line in (ROOT / "csrc/bindings.cpp").read_text().splitlines():
         stripped = line.strip()
-        if ('#include "kernels/decoder_skinny_fp8_sm120.cuh"' in line
+        if ('#include "kernels/pi05/pi05_decoder_skinny_fp8_sm120.cuh"' in line
                 or 'm.def("pi05_dec_skinny_available"' in line):
             assert "#ifdef FLASHRT_DECODER_SKINNY_SM120" in stack
             assert not any("QWEN" in entry for entry in stack)

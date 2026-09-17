@@ -682,22 +682,25 @@ if(FLASHRT_ENABLE_PI05_SKINNY AND NOT GPU_ARCH STREQUAL "120")
   message(FATAL_ERROR "Pi0.5 skinny kernels require GPU_ARCH=120")
 endif()
 if(FLASHRT_ENABLE_PI05_SKINNY)
-  add_library(sm120_decoder_skinny_obj OBJECT
-    csrc/kernels/decoder_skinny_fp8_sm120.cu)
-  set_target_properties(sm120_decoder_skinny_obj PROPERTIES
+  message(STATUS "Pi0.5 skinny decoder kernels: ENABLED (SM120, runtime opt-in)")
+  add_library(pi05_decoder_skinny_sm120_obj OBJECT
+    csrc/kernels/pi05/pi05_decoder_skinny_fp8_sm120.cu)
+  set_target_properties(pi05_decoder_skinny_sm120_obj PROPERTIES
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
   )
-  target_include_directories(sm120_decoder_skinny_obj PRIVATE
+  target_include_directories(pi05_decoder_skinny_sm120_obj PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
   )
-  target_compile_options(sm120_decoder_skinny_obj PRIVATE
+  target_compile_options(pi05_decoder_skinny_sm120_obj PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
       --expt-relaxed-constexpr -O3
       --ftz=true --prec-div=false --prec-sqrt=false
       ${GPU_GENCODE}
     >
   )
+else()
+  message(STATUS "Pi0.5 skinny decoder kernels: DISABLED")
 endif()
 
 # ── CUTLASS SM120a NVFP4 W4A16 GEMM (Qwen3.6 NVFP4 ckpt) ──
@@ -1904,7 +1907,7 @@ endif()
 # Skinny FP8 decoder GEMM family: sm_120a only (mma.kind::f8f6f4).
 if(FLASHRT_ENABLE_PI05_SKINNY)
   target_sources(flash_rt_kernels PRIVATE
-    $<TARGET_OBJECTS:sm120_decoder_skinny_obj>)
+    $<TARGET_OBJECTS:pi05_decoder_skinny_sm120_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE
     FLASHRT_DECODER_SKINNY_SM120=1)
 endif()

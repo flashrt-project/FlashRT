@@ -56,7 +56,7 @@
 #include "kernels/qwen36_flashinfer_xqa.cuh"
 #endif
 #ifdef FLASHRT_DECODER_SKINNY_SM120
-#include "kernels/decoder_skinny_fp8_sm120.cuh"
+#include "kernels/pi05/pi05_decoder_skinny_fp8_sm120.cuh"
 #endif
 #if defined(ENABLE_CUTLASS_SM120_NVFP4_W4A16) || defined(ENABLE_CUTLASS_SM100_NVFP4_W4A16)
 #include "quantize/nvfp4_sf_reshape_sm120.cuh"
@@ -7200,7 +7200,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
 
 #ifdef FLASHRT_DECODER_SKINNY_SM120
     // Skinny FP8 decoder GEMM family (sm_120a): K-split partials + fused consumers,
-    // optional programmatic dependent launch. See kernels/decoder_skinny_fp8_sm120.cuh.
+    // optional programmatic dependent launch. See kernels/pi05/pi05_decoder_skinny_fp8_sm120.cuh.
     m.def("pi05_dec_skinny_available", []() {
         int dev = 0, major = 0;
         if (cudaGetDevice(&dev) != cudaSuccess) return false;

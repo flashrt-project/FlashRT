@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-// Skinny FP8 GEMM family for small-row action decoders on sm_120a.
+// Pi0.5 skinny FP8 GEMM family for its small-row action decoder on sm_120a.
 //
 // The action expert of a flow-matching VLA runs its denoising steps over a
 // handful of rows (the action chunk) while every step streams the full

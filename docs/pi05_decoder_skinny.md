@@ -16,7 +16,7 @@ so every GEMM prefetches its weights while the previous kernel drains.
 
 ## What it is
 
-Source: `csrc/kernels/decoder_skinny_fp8_sm120.cu` (bindings `pi05_dec_skinny_*`),
+Source: `csrc/kernels/pi05/pi05_decoder_skinny_fp8_sm120.cu` (bindings `pi05_dec_skinny_*`),
 selected by the `Pi05Pipeline` / `Pi05TorchFrontendRtx` keyword
 `decoder_kernel` (`"cublaslt"` default, `"skinny"`, `"auto"`) or the
 environment variable `FLASHRT_PI05_DECODER_KERNEL`. Only the calibrated FP8

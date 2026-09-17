@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Skinny FP8 GEMM family for small-row action decoders on sm_120a. See the header.
-#include "decoder_skinny_fp8_sm120.cuh"
+#include "pi05_decoder_skinny_fp8_sm120.cuh"
 
 #include <cmath>
 #include <cstddef>
