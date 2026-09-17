@@ -40,7 +40,7 @@ and matches its outputs bit for bit.
 - FlashRT built for Thor with FA4 (see [pi05_thor.md](pi05_thor.md) §2 and
   [INSTALL.md](INSTALL.md)): `cmake -B build -S . -DGPU_ARCH=110`,
   `pip install -e ".[thor-fa4]"`, CUTLASS v4.4.2 at `third_party/cutlass`
-  (`git submodule update --init third_party/cutlass`)
+  (`git clone --depth 1 --branch v4.4.2 https://github.com/NVIDIA/cutlass.git third_party/cutlass`)
 - Python packages `onnx` and `sentencepiece` for export
 - The PaliGemma tokenizer (`paligemma_tokenizer.model`), found through
   `$FLASH_RT_PALIGEMMA_TOKENIZER`, `~/.cache/flash_rt/` or

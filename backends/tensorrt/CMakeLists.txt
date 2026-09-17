@@ -31,7 +31,7 @@ option(FLASHRT_TRT_BUILD_TESTS "Build the native parity programs" OFF)
 set(NLOHMANN_JSON_INCLUDE_DIR "" CACHE PATH "nlohmann/json single_include (parity programs)")
 
 if(NOT EXISTS "${CUTLASS_DIR}/include/cutlass/cutlass.h")
-  message(FATAL_ERROR "CUTLASS v4.4.2 not found at ${CUTLASS_DIR} (set CUTLASS_DIR)")
+  message(FATAL_ERROR "CUTLASS v4.4.2 not found at ${CUTLASS_DIR}: git clone --depth 1 --branch v4.4.2 https://github.com/NVIDIA/cutlass.git third_party/cutlass (or set CUTLASS_DIR)")
 endif()
 
 find_package(CUDAToolkit REQUIRED)
