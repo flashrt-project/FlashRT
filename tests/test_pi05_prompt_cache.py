@@ -59,6 +59,28 @@ def test_cache_is_lru_and_keys_on_text_len_state():
     c.clear(); assert len(c) == 0
 
 
+def test_changing_state_does_not_grow_embedding_cache(monkeypatch):
+    from types import SimpleNamespace
+    from flash_rt.frontends.torch import pi05_rtx as module
+
+    calls = []
+    def embed(text, weight, max_len, state):
+        calls.append(state)
+        value = 0.0 if state is None else float(state[0])
+        return torch.full((2, 4), value, dtype=torch.bfloat16), 2
+
+    monkeypatch.setattr(module, "_embed_prompt", embed)
+    frontend = SimpleNamespace(embedding_weight=None)
+    run = module.Pi05TorchFrontendRtx._embed_prompt_cached
+    task = run(frontend, "task", 200)
+    for i in range(600):
+        result = run(frontend, "task", 200, np.array([i], dtype=np.float32))
+        assert float(result[0][0, 0]) == float(torch.tensor(i).bfloat16())
+        assert len(frontend._prompt_embed_cache) == 1
+    assert run(frontend, "task", 200) is task
+    assert len(calls) == 601
+
+
 def test_batch_width_switch_uses_lifecycle_guard():
     from types import SimpleNamespace
     from threading import RLock

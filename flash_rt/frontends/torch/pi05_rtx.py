@@ -1470,12 +1470,13 @@ class Pi05TorchFrontendRtx:
 
     def _embed_prompt_cached(self, prompt_text: str, max_len: int, state=None):
         """``(embeds_bf16_cuda, prompt_len, host_uint16)`` for a prompt, from
-        the per-frontend cache when seen before (see :class:`_PromptEmbedCache`)."""
+        the per-frontend cache for task-only prompts. Dynamic state bypasses
+        storage so per-frame states cannot retain host/device embeddings."""
         cache = getattr(self, "_prompt_embed_cache", None)
         if cache is None:
             cache = self._prompt_embed_cache = _PromptEmbedCache()
         key = _PromptEmbedCache.key(prompt_text, max_len, state)
-        hit = cache.get(key)
+        hit = cache.get(key) if state is None else None
         if hit is not None:
             return hit
         embeds, prompt_len = _embed_prompt(
@@ -1483,7 +1484,8 @@ class Pi05TorchFrontendRtx:
         embeds = embeds.contiguous()
         host = np.ascontiguousarray(embeds.view(torch.uint16).cpu().numpy())
         hit = (embeds, int(prompt_len), host)
-        cache.put(key, hit)
+        if state is None:
+            cache.put(key, hit)
         return hit
 
     @serialized
