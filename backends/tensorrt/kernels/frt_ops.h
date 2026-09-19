@@ -116,6 +116,24 @@ int32_t frt_fa4_mha_hd72(const void* q, int64_t q_row_stride,
                          int32_t b, int32_t s, int32_t nh, float scale,
                          cudaStream_t stream);
 
+// -------------------------------------------------------------- variants ---
+// A `variant`, `gate_variant` or `down_variant` index names a tile shape in the
+// table of the kernel that the mode and the epilogue select, so the tables are
+// enumerated per kernel. `gate_variant` is ignored for FRT_GATE_GEGLU_IL, whose
+// interleaved kernel has a single tile shape.
+typedef enum {
+    FRT_VARIANT_GEMM = 0,            // frt_nvfp4_linear, and the MLP down GEMM
+                                     // under FRT_EPI_NONE or FRT_EPI_ACCUM
+    FRT_VARIANT_GATE_BIAS_GELU = 1,  // the MLP gate/up GEMM under FRT_GATE_BIAS_GELU
+    FRT_VARIANT_DOWN_BIAS_RES = 2,   // the MLP down GEMM under FRT_EPI_BIAS_RES
+} frt_variant_kind;
+
+// How many tile variants the kernel has, and a short description of one. The
+// best tile depends on the shape, so a host that knows its own shapes can walk
+// the table once and keep the index it measured.
+int32_t frt_nvfp4_num_variants(int32_t kind);
+const char* frt_nvfp4_variant_name(int32_t kind, int32_t idx);
+
 // Programmatic dependent launch inside the GEMM kernels (default on).
 void frt_set_pdl(int32_t on);
 

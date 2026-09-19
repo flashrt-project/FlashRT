@@ -19,6 +19,12 @@ places plugin boundaries where FlashRT's own fusions end:
 |---|---|---|
 | stage | `Pi05Siglip`, `Pi05Encoder`, `Pi05Decoder` | whole-policy engines (default) |
 | layer / step | `Pi05SiglipLayer`, `Pi05EncoderLayer`, `Pi05DecoderStep` | custom graphs, per-layer placement |
+| operator | `FlashrtNvfp4Linear`, `FlashrtNvfp4Mlp`, `FlashrtFa4Attention` | a host that wants FlashRT kernels in a graph of its own, with no pi0.5 in it |
+
+The first two are bitwise equal to FlashRT and to each other; the layer
+granularity costs 1.3% over the stage on the encoder. The operator plugins are
+model-free and are documented, with what each granularity costs, in
+[tensorrt_ops.md](tensorrt_ops.md).
 
 TensorRT owns the graph, memory, execution context and CUDA graph capture.
 The plugins own the arithmetic, and that arithmetic is FlashRT's:
@@ -84,7 +90,14 @@ Thin `IPluginV3` classes: shape inference, format checks, workspace sizing,
 and binding TensorRT tensors to the stage's weight and scratch structs.
 `pi05_plugins.cpp` exports `getCreators()` for TensorRT's plugin registry.
 
-### 2.4 Weights and calibration — `backends/tensorrt/tools/reference/`
+### 2.4 Operator layer — `backends/tensorrt/kernels/frt_ops.h`
+
+A C ABI over the same kernels, taking raw device pointers and no model
+semantics, with `backends/tensorrt/plugins/ops/` as its `IPluginV3` shells.
+Stage plugins and operator plugins call the same kernels in the same order.
+See [tensorrt_ops.md](tensorrt_ops.md).
+
+### 2.5 Weights and calibration — `backends/tensorrt/tools/reference/`
 
 The backend does not re-implement quantization. FlashRT's Python frontend
 calibrates (static FP8 activation scales, AWQ, NVFP4 packing) on real
@@ -104,7 +117,7 @@ forward, and write weights, scales, inputs and outputs to safetensors:
 The same files are the ONNX weights (`export_onnx.py`) and the golden
 references for the tests.
 
-### 2.5 ONNX graph — `backends/tensorrt/tools/export_onnx.py`
+### 2.6 ONNX graph — `backends/tensorrt/tools/export_onnx.py`
 
 Writes the policy graph with weights as external-data initializers:
 
@@ -120,6 +133,9 @@ even by repeating the last prompt embedding; engine callers repeat the last
 token.
 
 ## 3. Operator reference (domain `flashrt`, version 1)
+
+The pi0.5 plugins are below; the model-free operator plugins are in
+[tensorrt_ops.md](tensorrt_ops.md) §2.
 
 Byte blobs are int32 tensors of `ceil(bytes / 4)` elements. `D`, `H`, `NH`,
 `HD`, `L` are hidden size, FFN width, heads, head dim and layers.

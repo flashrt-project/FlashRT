@@ -1,11 +1,21 @@
 """Latency of the FlashRT operator plugins at the pi0.5 shapes.
 
 One engine per operator, real recorded weights and activations, timed under an
-outer CUDA graph. The same numbers measured for TensorRT's own path are what
-the operator comparison in docs/tensorrt_ops.md reports.
+outer CUDA graph. The recordings come from the dump the stage tests use, so an
+operator here runs the bits production runs.
 
-usage: bench_ops.py <plugin.so> <encoder_all.safetensors> <siglip_all.safetensors> [--json out.json]
+`--save-engines` writes every engine and the shapes it was profiled for, which
+is what lets trtexec time these operators exactly like the TensorRT-native
+subgraphs they are compared with. `--sweep` walks the tile variants a GEMM
+exposes and reports the best one at that operator's own shape.
+
+usage:
+  bench_ops.py <plugin.so> <encoder_all.safetensors> <siglip_all.safetensors>
+               [--only TAG[,TAG...]] [--sweep TAG[,TAG...]] [--set TAG.FIELD=N]
+               [--save-engines DIR] [--json FILE] [--iters N]
 """
+import argparse
+import ctypes
 import json
 import os
 import sys
@@ -21,23 +31,35 @@ import tensorrt as trt  # noqa: E402
 import torch  # noqa: E402
 from safetensors.torch import load_file  # noqa: E402
 
-plugin_path, encoder_path, siglip_path = sys.argv[1:4]
-json_out = None
-if "--json" in sys.argv:
-    json_out = sys.argv[sys.argv.index("--json") + 1]
-save_dir = None
-if "--save-engines" in sys.argv:
-    save_dir = sys.argv[sys.argv.index("--save-engines") + 1]
-    os.makedirs(save_dir, exist_ok=True)
+# frt_variant_kind in kernels/frt_ops.h.
+VARIANT_GEMM, VARIANT_GATE_BIAS_GELU, VARIANT_DOWN_BIAS_RES = 0, 1, 2
+
+ap = argparse.ArgumentParser(description=__doc__,
+                             formatter_class=argparse.RawDescriptionHelpFormatter)
+ap.add_argument("plugin")
+ap.add_argument("encoder")
+ap.add_argument("siglip")
+ap.add_argument("--only", default="")
+ap.add_argument("--sweep", default="")
+ap.add_argument("--set", action="append", default=[], metavar="TAG.FIELD=N")
+ap.add_argument("--save-engines", default=None, metavar="DIR")
+ap.add_argument("--json", default=None, metavar="FILE")
+ap.add_argument("--iters", type=int, default=200)
+args = ap.parse_args()
+if args.save_engines:
+    os.makedirs(args.save_engines, exist_ok=True)
 
 logger = trt.Logger(trt.Logger.WARNING)
 registry = trt.get_plugin_registry()
-registry.load_library(plugin_path)
+registry.load_library(args.plugin)
+lib = ctypes.CDLL(args.plugin)
+lib.frt_nvfp4_num_variants.restype = ctypes.c_int32
+lib.frt_nvfp4_variant_name.restype = ctypes.c_char_p
 dev = torch.device("cuda")
 stream = torch.cuda.current_stream()
 
-E = load_file(encoder_path)
-S = load_file(siglip_path)
+E = load_file(args.encoder)
+S = load_file(args.siglip)
 Se, D_e, H_e, NH_e, HD_e, _total, o_variant, down_variant, _L = E["meta"].tolist()
 M_s, D_s, _H_s, NH_s, HD_s, _L_s, views, spv, H_s_pad, _De, up_variant = S["meta"].tolist()[:11]
 
@@ -52,23 +74,39 @@ def blob(t):
     return b.view(np.int32)
 
 
-def make_fields(ints, floats=()):
+def make_fields(ints, floats):
     fc = trt.PluginFieldCollection()
-    for name, value in ints:
+    for name, value in ints.items():
         keep.append(np.array([value], dtype=np.int32))
         fc.append(trt.PluginField(name, keep[-1], trt.PluginFieldType.INT32))
-    for name, value in floats:
+    for name, value in floats.items():
         keep.append(np.array([value], dtype=np.float32))
         fc.append(trt.PluginField(name, keep[-1], trt.PluginFieldType.FLOAT32))
     return fc
 
 
-def build(op, fields, inputs, out_cols, m):
-    """inputs: list of (name, tensor, kind) with kind in {"in", "blob", "half"}."""
+def tile_fields(case):
+    """Which attributes of this case are tile variant indices, and of which table.
+
+    The index selects a tile in the table of the kernel the mode and the
+    epilogue pick, so the table follows from the other attributes.
+    """
+    ints, fields = case["ints"], {}
+    if case["op"] == "FlashrtNvfp4Linear":
+        fields["variant"] = VARIANT_GEMM
+    elif case["op"] == "FlashrtNvfp4Mlp":
+        if ints["gate_mode"] == 1:  # FRT_GATE_BIAS_GELU
+            fields["gate_variant"] = VARIANT_GATE_BIAS_GELU
+        fields["down_variant"] = (VARIANT_DOWN_BIAS_RES if ints["epilogue"] == 2
+                                  else VARIANT_GEMM)
+    return fields
+
+
+def build(case, ints, tag):
     builder = trt.Builder(logger)
     net = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED))
     tensors, runtime_inputs = [], []
-    for name, t, kind in inputs:
+    for name, t, kind in case["inputs"]:
         if kind == "in":
             x = net.add_input(name, trt.float16, (-1, int(t.shape[1])))
             runtime_inputs.append((name, t))
@@ -78,6 +116,8 @@ def build(op, fields, inputs, out_cols, m):
             layer.name = name
             x = layer.get_output(0)
         tensors.append(x)
+    op = case["op"]
+    fields = make_fields(ints, case.get("floats", {}))
     plugin = registry.get_creator(op, "1", "").create_plugin(op, fields, trt.TensorRTPhase.BUILD)
     node = net.add_plugin_v3(tensors, [], plugin)
     node.name = f"flashrt_{op}"
@@ -89,25 +129,26 @@ def build(op, fields, inputs, out_cols, m):
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30)
     config.builder_optimization_level = int(os.environ.get("BUILDER_OPT_LEVEL", "0"))
     prof = builder.create_optimization_profile()
+    rows = case["rows"]
     for name, t in runtime_inputs:
-        prof.set_shape(name, (m, int(t.shape[1])), (m, int(t.shape[1])), (m, int(t.shape[1])))
+        prof.set_shape(name, (rows, int(t.shape[1])), (rows, int(t.shape[1])),
+                       (rows, int(t.shape[1])))
     config.add_optimization_profile(prof)
     ser = builder.build_serialized_network(net, config)
     assert ser is not None, f"{op} build failed"
-    if save_dir:
-        # Saved so trtexec can time this operator exactly like the TensorRT-native
-        # subgraphs: same flags, same CUDA graph, same GPU-compute clock.
-        tag = build.tag
-        with open(os.path.join(save_dir, f"{tag}.plan"), "wb") as f:
+    if args.save_engines and tag:
+        # Saved so trtexec can time this operator exactly like the
+        # TensorRT-native subgraphs: same flags, same CUDA graph, same clock.
+        with open(os.path.join(args.save_engines, f"{tag}.plan"), "wb") as f:
             f.write(ser)
-        shapes = ",".join(f"{n}:{m}x{int(t.shape[1])}" for n, t in runtime_inputs)
-        with open(os.path.join(save_dir, f"{tag}.shapes"), "w") as f:
+        shapes = ",".join(f"{n}:{rows}x{int(t.shape[1])}" for n, t in runtime_inputs)
+        with open(os.path.join(args.save_engines, f"{tag}.shapes"), "w") as f:
             f.write(shapes + "\n")
     engine = trt.Runtime(logger).deserialize_cuda_engine(ser)
-    return engine, runtime_inputs, out_cols
+    return engine, runtime_inputs
 
 
-def timed(fn, n=200, warm=20):
+def timed(fn, n, warm=20):
     for _ in range(warm):
         fn()
     stream.synchronize()
@@ -121,9 +162,9 @@ def timed(fn, n=200, warm=20):
     return ms[len(ms) // 2], ms[int(len(ms) * 0.9)]
 
 
-def run_case(label, op, fields, inputs, out_cols, m, note="", tag=None):
-    build.tag = tag or label.split()[0]
-    engine, runtime_inputs, cols = build(op, fields, inputs, out_cols, m)
+def measure(case, ints, tag, iters):
+    """Build and time one configuration. Returns None if the kernel refuses it."""
+    engine, runtime_inputs = build(case, ints, tag)
     ctx = engine.create_execution_context()
     held = []
     for name, t in runtime_inputs:
@@ -131,117 +172,183 @@ def run_case(label, op, fields, inputs, out_cols, m, note="", tag=None):
         held.append(d)
         ctx.set_input_shape(name, tuple(d.shape))
         ctx.set_tensor_address(name, d.data_ptr())
-    y = torch.empty(m, cols, dtype=torch.float16, device=dev)
+    y = torch.empty(case["rows"], case["out_cols"], dtype=torch.float16, device=dev)
     ctx.set_tensor_address("y", y.data_ptr())
-    assert ctx.execute_async_v3(stream.cuda_stream)
+    ok = ctx.execute_async_v3(stream.cuda_stream)
     stream.synchronize()
-    finite = bool(torch.isfinite(y).all())
-
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        ctx.execute_async_v3(torch.cuda.current_stream().cuda_stream)
-    med, p90 = timed(g.replay)
-    print(f"{label:22s} {op:20s} {med * 1000:8.1f} us  p90 {p90 * 1000:8.1f}  finite={finite}  {note}")
-    del ctx, engine, g
+    finite = ok and bool(torch.isfinite(y).all())
+    out = None
+    if ok and finite:
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            ctx.execute_async_v3(torch.cuda.current_stream().cuda_stream)
+        med, p90 = timed(g.replay, iters)
+        del g
+        out = {"case": case["label"], "tag": case["tag"], "op": case["op"],
+               "median_us": med * 1000, "p90_us": p90 * 1000, "finite": finite,
+               "note": case.get("note", ""),
+               "tiles": {f: ints[f] for f in tile_fields(case)}}
+    del ctx, engine
     torch.cuda.empty_cache()
-    return {"case": label, "op": op, "median_us": med * 1000, "p90_us": p90 * 1000,
-            "finite": finite, "note": note}
+    return out
 
 
-results = []
+def sweep(case, iters):
+    """Walk each tile table at this operator's own shape, one field at a time."""
+    fields = tile_fields(case)
+    if not fields:
+        print(f"{case['tag']}: no tile variants to sweep")
+        return None
+    ints = dict(case["ints"])
+    trail = []
+    for field, kind in fields.items():
+        n = lib.frt_nvfp4_num_variants(kind)
+        best = None
+        for idx in range(n):
+            probe = dict(ints)
+            probe[field] = idx
+            try:
+                r = measure(case, probe, None, iters)
+            except Exception as exc:  # a tile the kernel cannot build at this shape
+                r = None
+                note = str(exc).splitlines()[0][:60]
+            else:
+                note = "" if r else "rejected"
+            name = lib.frt_nvfp4_variant_name(kind, idx).decode()
+            us = f"{r['median_us']:8.1f}" if r else "       -"
+            mark = ""
+            if r and (best is None or r["median_us"] < best["median_us"]):
+                best, mark = dict(r, variant=idx), "  <"
+            print(f"  {case['tag']:20s} {field:13s} {idx:3d} {us} us  {name}{mark} {note}",
+                  flush=True)
+            if r:
+                trail.append({"field": field, "variant": idx, "name": name,
+                              "median_us": r["median_us"]})
+        if best is None:
+            print(f"  {case['tag']}: every {field} rejected")
+            return None
+        ints[field] = best["variant"]
+        print(f"  {case['tag']:20s} {field:13s} best {best['variant']} "
+              f"{best['median_us']:.1f} us  {lib.frt_nvfp4_variant_name(fields[field], best['variant']).decode()}",
+              flush=True)
+    return {"tag": case["tag"], "chosen": {f: ints[f] for f in fields},
+            "default": {f: case["ints"][f] for f in fields}, "trail": trail}
 
-# Encoder FFN: RMSNorm x AWQ -> NVFP4, interleaved GeGLU gate/up, down into the residual.
-results.append(run_case(
-    f"encoder_mlp M={Se}", "FlashrtNvfp4Mlp",
-    make_fields([("D", D_e), ("H", H_e), ("norm_mode", 1), ("gate_mode", 0),
-                 ("gate_variant", 0), ("down_variant", down_variant), ("epilogue", 1),
-                 ("opt_mask", (1 << 2) | (1 << 5))], [("eps", 1e-6)]),
-    [("x", E["x_in"], "in"),
-     ("gu_packed", E["L0.gu_il_packed"], "blob"), ("gu_sfb", E["L0.gu_il_sfb"], "blob"),
-     ("down_packed", E["L0.down_packed"], "blob"), ("down_sfb", E["L0.down_sfb"], "blob"),
-     ("awq", E["L0.awq_inv_s_gu"], "half"), ("residual", E["x_in"], "in")],
-    D_e, Se, f"D={D_e} H={H_e}"))
 
-# Encoder attention output projection: quantize -> NVFP4 GEMM -> += residual.
-results.append(run_case(
-    f"encoder_o M={Se}", "FlashrtNvfp4Linear",
-    make_fields([("N", D_e), ("K", D_e), ("norm_mode", 0), ("epilogue", 1),
-                 ("variant", o_variant), ("opt_mask", 1 << 4)], [("eps", 1e-6)]),
-    [("x", E["x_in"], "in"),
-     ("w_packed", E["L0.o_packed"], "blob"), ("w_sfb", E["L0.o_sfb"], "blob"),
-     ("residual", E["x_in"], "in")],
-    D_e, Se, f"N={D_e} K={D_e}"))
+# ---------------------------------------------------------------- the cases ---
+# Every case is one operator at the shape pi0.5 runs it. The `_plain` cases drop
+# the normalization and the residual so the boundary matches the TensorRT-native
+# subgraph cut from the same model.
+q_e = torch.empty(Se, NH_e * HD_e, dtype=torch.float16).normal_(0, 0.3)
+kv_e = torch.empty(Se, HD_e, dtype=torch.float16).normal_(0, 0.3)
+q_s = torch.empty(M_s, NH_s * HD_s, dtype=torch.float16).normal_(0, 0.3)
 
-# The same FFN without the normalization, matching a boundary that starts at
-# the already normalized activation.
-results.append(run_case(
-    f"encoder_mlp_plain M={Se}", "FlashrtNvfp4Mlp",
-    make_fields([("D", D_e), ("H", H_e), ("norm_mode", 0), ("gate_mode", 0),
-                 ("gate_variant", 0), ("down_variant", down_variant), ("epilogue", 0),
-                 ("opt_mask", 0)], [("eps", 1e-6)]),
-    [("x", E["x_in"], "in"),
-     ("gu_packed", E["L0.gu_il_packed"], "blob"), ("gu_sfb", E["L0.gu_il_sfb"], "blob"),
-     ("down_packed", E["L0.down_packed"], "blob"), ("down_sfb", E["L0.down_sfb"], "blob")],
-    D_e, Se, f"D={D_e} H={H_e}, no norm/residual", tag="encoder_mlp_plain"))
+CASES = [
+    # Encoder FFN: RMSNorm x AWQ -> NVFP4, interleaved GeGLU gate/up, down into
+    # the residual.
+    dict(tag="encoder_mlp", label=f"encoder_mlp M={Se}", op="FlashrtNvfp4Mlp",
+         ints=dict(D=D_e, H=H_e, norm_mode=1, gate_mode=0, gate_variant=0,
+                   down_variant=down_variant, epilogue=1, opt_mask=(1 << 2) | (1 << 5)),
+         floats=dict(eps=1e-6),
+         inputs=[("x", E["x_in"], "in"),
+                 ("gu_packed", E["L0.gu_il_packed"], "blob"),
+                 ("gu_sfb", E["L0.gu_il_sfb"], "blob"),
+                 ("down_packed", E["L0.down_packed"], "blob"),
+                 ("down_sfb", E["L0.down_sfb"], "blob"),
+                 ("awq", E["L0.awq_inv_s_gu"], "half"),
+                 ("residual", E["x_in"], "in")],
+         out_cols=D_e, rows=Se, note=f"D={D_e} H={H_e}"),
+    # Encoder attention output projection: quantize -> NVFP4 GEMM -> += residual.
+    dict(tag="encoder_o", label=f"encoder_o M={Se}", op="FlashrtNvfp4Linear",
+         ints=dict(N=D_e, K=D_e, norm_mode=0, epilogue=1, variant=o_variant,
+                   opt_mask=1 << 4),
+         floats=dict(eps=1e-6),
+         inputs=[("x", E["x_in"], "in"),
+                 ("w_packed", E["L0.o_packed"], "blob"),
+                 ("w_sfb", E["L0.o_sfb"], "blob"),
+                 ("residual", E["x_in"], "in")],
+         out_cols=D_e, rows=Se, note=f"N={D_e} K={D_e}"),
+    dict(tag="encoder_mlp_plain", label=f"encoder_mlp_plain M={Se}", op="FlashrtNvfp4Mlp",
+         ints=dict(D=D_e, H=H_e, norm_mode=0, gate_mode=0, gate_variant=0,
+                   down_variant=down_variant, epilogue=0, opt_mask=0),
+         floats=dict(eps=1e-6),
+         inputs=[("x", E["x_in"], "in"),
+                 ("gu_packed", E["L0.gu_il_packed"], "blob"),
+                 ("gu_sfb", E["L0.gu_il_sfb"], "blob"),
+                 ("down_packed", E["L0.down_packed"], "blob"),
+                 ("down_sfb", E["L0.down_sfb"], "blob")],
+         out_cols=D_e, rows=Se, note=f"D={D_e} H={H_e}, no norm/residual"),
+    dict(tag="encoder_o_plain", label=f"encoder_o_plain M={Se}", op="FlashrtNvfp4Linear",
+         ints=dict(N=D_e, K=D_e, norm_mode=0, epilogue=0, variant=o_variant, opt_mask=0),
+         floats=dict(eps=1e-6),
+         inputs=[("x", E["x_in"], "in"),
+                 ("w_packed", E["L0.o_packed"], "blob"),
+                 ("w_sfb", E["L0.o_sfb"], "blob")],
+         out_cols=D_e, rows=Se, note=f"N={D_e} K={D_e}, no residual"),
+    # SigLIP FFN: LayerNorm x AWQ -> NVFP4, up with bias and GELU, down with
+    # bias and residual.
+    dict(tag="siglip_mlp", label=f"siglip_mlp M={M_s}", op="FlashrtNvfp4Mlp",
+         ints=dict(D=D_s, H=H_s_pad, norm_mode=2, gate_mode=1, gate_variant=up_variant,
+                   down_variant=0, epilogue=2, opt_mask=0b111111),
+         floats=dict(eps=1e-6),
+         inputs=[("x", S["L0.x_out"], "in"),
+                 ("up_packed", S["L0.up_packed"], "blob"),
+                 ("up_sfb", S["L0.up_sfb"], "blob"),
+                 ("down_packed", S["L0.down_packed"], "blob"),
+                 ("down_sfb", S["L0.down_sfb"], "blob"),
+                 ("gamma", S["L0.ln_ffn_w"], "half"), ("beta", S["L0.ln_ffn_b"], "half"),
+                 ("awq", S["L0.awq_inv_s"], "half"), ("up_b", S["L0.up_b"], "half"),
+                 ("down_b", S["L0.down_b"], "half"), ("residual", S["L0.x_out"], "in")],
+         out_cols=D_s, rows=M_s, note=f"D={D_s} H={H_s_pad}"),
+    dict(tag="siglip_mlp_plain", label=f"siglip_mlp_plain M={M_s}", op="FlashrtNvfp4Mlp",
+         ints=dict(D=D_s, H=H_s_pad, norm_mode=0, gate_mode=1, gate_variant=up_variant,
+                   down_variant=0, epilogue=0, opt_mask=1 << 3),
+         floats=dict(eps=1e-6),
+         inputs=[("x", S["L0.x_out"], "in"),
+                 ("up_packed", S["L0.up_packed"], "blob"),
+                 ("up_sfb", S["L0.up_sfb"], "blob"),
+                 ("down_packed", S["L0.down_packed"], "blob"),
+                 ("down_sfb", S["L0.down_sfb"], "blob"),
+                 ("up_b", S["L0.up_b"], "half")],
+         out_cols=D_s, rows=M_s, note=f"D={D_s} H={H_s_pad}, no norm/residual"),
+    # Encoder attention: FlashAttention-4, head_dim 256, grouped queries over
+    # one KV head.
+    dict(tag="encoder_attn", label=f"encoder_attn Sq={Se}", op="FlashrtFa4Attention",
+         ints=dict(mode=0, NH=NH_e, head_dim=HD_e, batch=1), floats=dict(scale=0.0),
+         inputs=[("q", q_e, "in"), ("k", kv_e, "in"), ("v", kv_e, "in")],
+         out_cols=NH_e * HD_e, rows=Se, note=f"NH={NH_e} HD={HD_e} 1 KV head"),
+    # SigLIP attention: FlashAttention-4, head_dim 72, one batch entry per camera.
+    dict(tag="siglip_attn", label=f"siglip_attn S={spv}x{views}", op="FlashrtFa4Attention",
+         ints=dict(mode=1, NH=NH_s, head_dim=HD_s, batch=views), floats=dict(scale=0.0),
+         inputs=[("q", q_s, "in"), ("k", q_s, "in"), ("v", q_s, "in")],
+         out_cols=NH_s * HD_s, rows=M_s, note=f"NH={NH_s} HD={HD_s}"),
+]
 
-# The same projection without the residual: the boundary TensorRT's own
-# subgraph has (quantize + GEMM only).
-results.append(run_case(
-    f"encoder_o_plain M={Se}", "FlashrtNvfp4Linear",
-    make_fields([("N", D_e), ("K", D_e), ("norm_mode", 0), ("epilogue", 0),
-                 ("variant", o_variant), ("opt_mask", 0)], [("eps", 1e-6)]),
-    [("x", E["x_in"], "in"),
-     ("w_packed", E["L0.o_packed"], "blob"), ("w_sfb", E["L0.o_sfb"], "blob")],
-    D_e, Se, f"N={D_e} K={D_e}, no residual", tag="encoder_o_plain"))
+by_tag = {c["tag"]: c for c in CASES}
+for override in args.set:
+    key, value = override.split("=")
+    tag, field = key.split(".")
+    by_tag[tag]["ints"][field] = int(value)
 
-# SigLIP FFN: LayerNorm x AWQ -> NVFP4, up with bias and GELU, down with bias and residual.
-results.append(run_case(
-    f"siglip_mlp M={M_s}", "FlashrtNvfp4Mlp",
-    make_fields([("D", D_s), ("H", H_s_pad), ("norm_mode", 2), ("gate_mode", 1),
-                 ("gate_variant", up_variant), ("down_variant", 0), ("epilogue", 2),
-                 ("opt_mask", 0b111111)], [("eps", 1e-6)]),
-    [("x", S["L0.x_out"], "in"),
-     ("up_packed", S["L0.up_packed"], "blob"), ("up_sfb", S["L0.up_sfb"], "blob"),
-     ("down_packed", S["L0.down_packed"], "blob"), ("down_sfb", S["L0.down_sfb"], "blob"),
-     ("gamma", S["L0.ln_ffn_w"], "half"), ("beta", S["L0.ln_ffn_b"], "half"),
-     ("awq", S["L0.awq_inv_s"], "half"), ("up_b", S["L0.up_b"], "half"),
-     ("down_b", S["L0.down_b"], "half"), ("residual", S["L0.x_out"], "in")],
-    D_s, M_s, f"D={D_s} H={H_s_pad}"))
+selected = [by_tag[t] for t in args.only.split(",")] if args.only else CASES
+results, sweeps = [], []
+for case in selected:
+    if case["tag"] in args.sweep.split(","):
+        s = sweep(case, args.iters)
+        if s:
+            sweeps.append(s)
+            case["ints"].update(s["chosen"])
+    r = measure(case, case["ints"], case["tag"], args.iters)
+    if r is None:
+        print(f"{case['label']:22s} {case['op']:20s}  rejected")
+        continue
+    tiles = " ".join(f"{k}={v}" for k, v in r["tiles"].items())
+    print(f"{r['case']:22s} {r['op']:20s} {r['median_us']:8.1f} us  "
+          f"p90 {r['p90_us']:8.1f}  {tiles}  {r['note']}", flush=True)
+    results.append(r)
 
-results.append(run_case(
-    f"siglip_mlp_plain M={M_s}", "FlashrtNvfp4Mlp",
-    make_fields([("D", D_s), ("H", H_s_pad), ("norm_mode", 0), ("gate_mode", 1),
-                 ("gate_variant", up_variant), ("down_variant", 0), ("epilogue", 0),
-                 ("opt_mask", 1 << 3)], [("eps", 1e-6)]),
-    [("x", S["L0.x_out"], "in"),
-     ("up_packed", S["L0.up_packed"], "blob"), ("up_sfb", S["L0.up_sfb"], "blob"),
-     ("down_packed", S["L0.down_packed"], "blob"), ("down_sfb", S["L0.down_sfb"], "blob"),
-     ("up_b", S["L0.up_b"], "half")],
-    D_s, M_s, f"D={D_s} H={H_s_pad}, no norm/residual", tag="siglip_mlp_plain"))
-
-# Encoder attention: FlashAttention-4, head_dim 256, grouped queries over one KV head.
-q = torch.zeros(Se, NH_e * HD_e, dtype=torch.float16)
-kv = torch.zeros(Se, HD_e, dtype=torch.float16)
-q.normal_(0, 0.3)
-kv.normal_(0, 0.3)
-results.append(run_case(
-    f"encoder_attn Sq={Se}", "FlashrtFa4Attention",
-    make_fields([("mode", 0), ("NH", NH_e), ("head_dim", HD_e), ("batch", 1)], [("scale", 0.0)]),
-    [("q", q, "in"), ("k", kv, "in"), ("v", kv, "in")],
-    NH_e * HD_e, Se, f"NH={NH_e} HD={HD_e} 1 KV head"))
-
-# SigLIP attention: FlashAttention-4, head_dim 72, one batch entry per camera.
-qs = torch.zeros(M_s, NH_s * HD_s, dtype=torch.float16)
-qs.normal_(0, 0.3)
-results.append(run_case(
-    f"siglip_attn S={spv}x{views}", "FlashrtFa4Attention",
-    make_fields([("mode", 1), ("NH", NH_s), ("head_dim", HD_s), ("batch", views)],
-                [("scale", 0.0)]),
-    [("q", qs, "in"), ("k", qs, "in"), ("v", qs, "in")],
-    NH_s * HD_s, M_s, f"NH={NH_s} HD={HD_s}"))
-
-if json_out:
-    with open(json_out, "w") as f:
-        json.dump(results, f, indent=2)
-    print("wrote", json_out)
+if args.json:
+    with open(args.json, "w") as f:
+        json.dump({"results": results, "sweeps": sweeps}, f, indent=2)
+    print("wrote", args.json)
 print("BENCH_OPS_DONE")

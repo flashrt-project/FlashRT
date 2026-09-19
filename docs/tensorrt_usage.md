@@ -173,6 +173,13 @@ example to a TensorRT Edge-LLM checkout (image loading, `tokenizer.json`
 tokenizer, CUDA graphs, openpi unnormalization); see
 [tensorrt_edgellm.md](tensorrt_edgellm.md).
 
+### Your own graph
+
+The plugin library also registers three model-free operators
+(`FlashrtNvfp4Linear`, `FlashrtNvfp4Mlp`, `FlashrtFa4Attention`) and a C ABI
+behind them, for placing FlashRT kernels in a graph that has no pi0.5 in it:
+see [tensorrt_ops.md](tensorrt_ops.md).
+
 ## 6. Troubleshooting
 
 | symptom | cause |

@@ -200,7 +200,32 @@ Directions that need agreement with the Edge-LLM maintainers:
    libraries next to `libNvInfer_edgellm_plugin.so`, so FlashRT plugins do not
    need a custom host.
 
-## 6. Troubleshooting
+## 6. Taking the kernels without taking the model
+
+A whole pi0.5 stage is one way in; individual operators are another, and they
+do not require Edge-LLM to know what pi0.5 is.
+`backends/tensorrt/kernels/frt_ops.h` is a C ABI over raw device pointers with
+no model semantics, so an Edge-LLM plugin can call it from its own shell. The
+kernels behind it are CUDA C++ with CUTLASS and ahead-of-time compiled CuTe
+DSL — the two forms Edge-LLM already builds with.
+
+What is worth taking, measured on Thor against TensorRT at the pi0.5 shapes
+(method and full tables in [tensorrt_ops.md](tensorrt_ops.md)):
+
+| FlashRT operator | what a TensorRT graph does instead | measured |
+|---|---|---|
+| `FlashrtNvfp4Mlp` — gate/up epilogue emits NVFP4, down GEMM consumes it | dense NVFP4/FP8 linear layers lower to Q/DQ around two GEMMs, so the hidden activation lands in fp16 | **1.32×** (encoder FFN, NVFP4 both sides), **1.06×** (SigLIP FFN, FP8 there) |
+| `FlashrtFa4Attention` — FlashAttention-4, head_dim 72 and head_dim 256 GQA | the `Attention` operator, or MatMul/Softmax/MatMul when the export does not use it | **1.71×** and **1.25×** against `Attention`; **3.29×** against the chain |
+| `FlashrtNvfp4Linear` — quantize then block-scaled GEMM | one GEMM with the quantization fused into its prologue | **0.94×** — TensorRT is ahead here, and this is the operator not to take |
+
+The last row is the useful one for deciding where a boundary belongs: an
+isolated quantized GEMM is already well served, and the gain is in what a
+plugin can keep *between* kernels. That is why FlashRT's plugins are cut at
+fusion boundaries rather than at operator boundaries, and why the operator
+layer exists anyway — a host that wants finer pieces can have them and see
+what they cost ([tensorrt_ops.md](tensorrt_ops.md) §4).
+
+## 7. Troubleshooting
 
 | symptom | cause |
 |---|---|

@@ -50,6 +50,20 @@ int32_t quantize_activation(const void* x, const void* gamma, const void* beta,
     }
 }
 
+
+// The SigLIP FFN kernels name only the first four of the seven tiles they
+// build, so the last three are spelled out here; the shapes are the ones
+// cutlass_fp4_gemm_siglip_ffn_variants_sm100.cu instantiates.
+const char* kGateNames[] = {
+    "up   128x256x256 (base)", "up   128x128x256", "up   128x128x128", "up   128x64x256",
+    "up   256x128x128 cluster2x1x1 (2-SM UMMA)", "up   256x256x128 cluster2x1x1 (2-SM UMMA)",
+    "up   256x128x256 cluster2x1x1 (2-SM UMMA)"};
+const char* kDownNames[] = {
+    "down 128x128x256 (base)", "down 128x64x256", "down 128x128x128", "down 128x256x256",
+    "down 256x128x256 cluster2x1x1 (2-SM UMMA)", "down 256x256x256 cluster2x1x1 (2-SM UMMA)",
+    "down 256x64x256 cluster2x1x1 (2-SM UMMA)"};
+constexpr int32_t kSiglipVariants = 7;
+
 }  // namespace
 
 extern "C" {
@@ -165,6 +179,26 @@ int32_t frt_fa4_mha_hd72(const void* q, int64_t q_row_stride, const void* k, int
     return flashrt_trt::fa4_hd72_mha(const_cast<void*>(q), q_row_stride, const_cast<void*>(k),
                                      k_row_stride, const_cast<void*>(v), v_row_stride, o, b, s,
                                      nh, scale, stream);
+}
+
+int32_t frt_nvfp4_num_variants(int32_t kind) {
+    switch (kind) {
+    case FRT_VARIANT_GEMM: return flash_rt::fp4::cutlass_fp4_gemm_num_variants();
+    case FRT_VARIANT_GATE_BIAS_GELU:
+    case FRT_VARIANT_DOWN_BIAS_RES: return kSiglipVariants;
+    default: return 0;
+    }
+}
+
+const char* frt_nvfp4_variant_name(int32_t kind, int32_t idx) {
+    if (idx < 0 || idx >= frt_nvfp4_num_variants(kind)) {
+        return "<invalid>";
+    }
+    switch (kind) {
+    case FRT_VARIANT_GEMM: return flash_rt::fp4::cutlass_fp4_gemm_variant_name(idx);
+    case FRT_VARIANT_GATE_BIAS_GELU: return kGateNames[idx];
+    default: return kDownNames[idx];
+    }
 }
 
 void frt_set_pdl(int32_t on) { flash_rt::fp4::pdl_flag() = (on != 0); }
