@@ -238,16 +238,23 @@ layers that have an FFN and all 27 SigLIP layers:
 That is an upper bound: it assumes each swap is free at the boundary, and §3.4
 says a boundary costs a memory pass.
 
-The two numbers answer the same question at different granularities. The three
-operators cover 9.8 ms of the 23.8 ms this engine spends — 41% of it — and are
-worth about 2.9 ms against TensorRT's own versions. The action decoder, 11.67 ms
-and the largest single block, is not addressable at operator granularity at all:
-its speed comes from what a stage does between kernels, and §4's table prices
-that at 11% for step boundaries alone.
+Read the 2.9 ms against the right baseline. It is not 2.9 out of 23.7 — the
+engine's own time is not what is on the table. What is on the table is the
+distance between this engine and TensorRT's at the same shape, and the three
+operators recover about a third of it. They cover 9.8 ms of the 23.8 ms this
+engine spends, 41% of it, and inside that coverage TensorRT's own kernels are
+not bad: the bare projection is ahead, the SigLIP FFN is close.
 
-So the tiers are not variations of one integration. Operators are worth a few
-milliseconds and cost nothing to adopt; stages are worth the other twenty and
-require taking the pipeline.
+The rest is in two places that have no operator boundary at all. The action decoder, 11.67 ms and the largest single block, gets its speed
+from what a stage does *between* kernels — the side stream that pumps the next
+step's weights into L2 and the dependent launches chained through the step —
+and §4 prices step boundaries alone at 11%. The rest is inside a layer: the
+QKV projection, RoPE, the normalizations and the quantization are fused into
+their neighbours, so there is no operator to swap.
+
+So the tiers are not three sizes of the same integration. Operators cost
+nothing to adopt and recover the part of the advantage that survives being cut
+up; the stage boundary is where the rest of it lives.
 
 Mixing vendors in one graph — TensorRT's GEMM next to FlashRT's fused block —
 is possible at graph level, and §3.4 bounds what it buys: about 2 µs per bare
