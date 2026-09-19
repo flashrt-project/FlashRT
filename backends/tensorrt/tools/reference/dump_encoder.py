@@ -21,6 +21,8 @@ def main():
     p = argparse.ArgumentParser()
     m1.add_policy_args(p)
     p.add_argument("--obs-index", type=int, default=0)
+    p.add_argument("--ops-layer", type=int, default=0,
+                   help="layer to record at the operator boundaries as well")
     p.add_argument("--out", required=True)
     args = p.parse_args()
 
@@ -50,9 +52,12 @@ def main():
     x_lib = pipe._enc_x[:Se].clone()
     kc_flat = pipe._Kc.reshape(-1).clone(); vc_flat = pipe._Vc.reshape(-1).clone()
 
+    if not 0 <= args.ops_layer < L - 1:
+        raise SystemExit(f"--ops-layer must be in [0, {L - 2}]: the last layer has no FFN")
+    ops = {"x": pipe._enc_x, "attn": pipe._enc_attn}
     pipe._enc_x[:Se].copy_(x_in); pipe._Kc.zero_(); pipe._Vc.zero_()
     for l in range(L):
-        m1.ref_layer(l, a, k)
+        m1.ref_layer(l, a, k, capture=ops if l == args.ops_layer else None)
     torch.cuda.synchronize()
     ok = torch.equal(pipe._enc_x[:Se], x_lib) and torch.equal(pipe._Kc.reshape(-1), kc_flat) \
         and torch.equal(pipe._Vc.reshape(-1), vc_flat)
@@ -81,6 +86,11 @@ def main():
         out[f"L{l}.gu_il_sfb"] = fw["gu_il"]["sfb"]
         out[f"L{l}.down_packed"] = fw["down"]["packed"]
         out[f"L{l}.down_sfb"] = fw["down"]["sfb"]
+    # The same layer at the boundaries the operator plugins implement, so
+    # backends/tensorrt/tests/ops_parity.py can check them bit for bit.
+    for name in ("attn_q", "attn_out", "o_res", "o_out", "ffn_out"):
+        out[f"ops.{name}"] = ops[name]
+    out["ops.meta"] = torch.tensor([args.ops_layer], dtype=torch.int64)
     out["meta"] = torch.tensor([Se, D, dims["H"], dims["NH"], HD, total_keys,
                                 sc["attn_variant"], sc["variant_dn"], L], dtype=torch.int64)
     out = {n: t.detach().contiguous().cpu() for n, t in out.items()}

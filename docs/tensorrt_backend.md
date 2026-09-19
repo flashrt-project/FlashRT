@@ -21,9 +21,9 @@ places plugin boundaries where FlashRT's own fusions end:
 | layer / step | `Pi05SiglipLayer`, `Pi05EncoderLayer`, `Pi05DecoderStep` | custom graphs, per-layer placement |
 | operator | `FlashrtNvfp4Linear`, `FlashrtNvfp4Mlp`, `FlashrtFa4Attention` | a host that wants FlashRT kernels in a graph of its own, with no pi0.5 in it |
 
-The first two are bitwise equal to FlashRT and to each other; the layer
-granularity costs 1.3% over the stage on the encoder. The operator plugins are
-model-free and are documented, with what each granularity costs, in
+All three are bitwise equal to FlashRT; the layer granularity costs 1.3% over
+the stage on the encoder. The operator plugins are model-free and are
+documented, with what each granularity costs, in
 [tensorrt_ops.md](tensorrt_ops.md).
 
 TensorRT owns the graph, memory, execution context and CUDA graph capture.

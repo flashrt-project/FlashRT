@@ -43,6 +43,7 @@ run "engine: encoder stage plugin" $PYTHON "$T/engine_encoder_stage.py" "$P" "$M
 run "engine: 10 chained decoder step plugins" $PYTHON "$T/engine_decoder_step_chain.py" "$P" "$M/decoder_steps.safetensors"
 run "engine: decoder stage plugin" $PYTHON "$T/engine_decoder_stage.py" "$P" "$M/decoder_steps.safetensors"
 run "engine: SigLIP layer chain and stage plugins" $PYTHON "$T/engine_siglip.py" "$P" "$M/siglip_all.safetensors"
+run "engine: operator plugins" $PYTHON "$T/ops_parity.py" "$P" "$M/encoder_all.safetensors" "$M/siglip_all.safetensors"
 run "engine: whole policy (network API)" $PYTHON "$T/engine_policy.py" "$P" "$M/siglip_all.safetensors" "$M/encoder_all.safetensors" "$M/decoder_steps.safetensors"
 run "ONNX export" $ONNX_PYTHON "$BACKEND/tools/export_onnx.py" "$M/siglip_all.safetensors" "$M/encoder_all.safetensors" "$M/decoder_steps.safetensors" "$WORK/onnx"
 run "trtexec build" "$TRTEXEC" --onnx="$WORK/onnx/pi05.onnx" --dynamicPlugins="$P" --stronglyTyped --builderOptimizationLevel=0 --memPoolSize=workspace:2048 --saveEngine="$WORK/pi05.engine" --skipInference

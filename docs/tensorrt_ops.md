@@ -177,7 +177,7 @@ The encoder is available at all three. Measured with the same weights, the same
 
 | granularity | per block | 18 layers | bitwise vs FlashRT |
 |---|---|---|---|
-| operators (`bench_granularity.py`) | attention + projection + FFN, **no QKV, no RoPE, no normalization** | 7.580 ms | — |
+| operators (`bench_granularity.py`) | attention + projection + FFN, **no QKV, no RoPE, no normalization** | 7.580 ms | n/a, a timing model |
 | layer plugins (`engine_encoder_layer_chain.py`) | the whole layer | 8.620 ms | yes |
 | stage plugin (`engine_encoder_stage.py`) | all 18 layers in one node | 8.507 ms | yes |
 
@@ -259,7 +259,9 @@ before the sweep and is 1.06× after. The others move by a couple of percent,
 which is §3.4's point — at these shapes the tile is not what decides.
 
 Tiles are per shape, so the stage path keeps the ones its own end-to-end tuning
-picked; these are the operator path's.
+picked; these are the operator path's. Switching between them is free of
+numerical consequence — §7 checks that the output is bit-identical across
+tiles — so this table is a latency choice and nothing else.
 
 ## 6. Reproduce
 
@@ -297,17 +299,34 @@ itself is usually read-only.
 ## 7. Numerical contract
 
 The operators call the same kernels, in the same order, as the pi0.5 stages, so
-an operator and the matching slice of a stage produce the same bits. What the
-tests pin today:
+an operator and the matching slice of a stage produce the same bits. That is
+checked, not assumed. The recording tools save one encoder layer and one SigLIP
+layer at the operator boundaries (`ops.*` in the dumps), taken from the
+per-layer reference that is itself bitwise equal to the FlashRT library, and
+`backends/tensorrt/tests/ops_parity.py` replays each operator there:
 
-- the stage and layer plugins are bitwise equal to FlashRT's library, eagerly
-  and under an outer CUDA graph (`backends/tensorrt/tests/run_regression.sh`);
-- the operator plugins are checked for finiteness at the pi0.5 shapes by
-  `bench_ops.py`.
+| operator | boundary | bitwise, eager and under an outer CUDA graph |
+|---|---|---|
+| `FlashrtFa4Attention` (head_dim 256 GQA) | the layer's queries and its own K/V rows | yes |
+| `FlashrtNvfp4Linear` (accumulating epilogue) | the encoder output projection | yes |
+| `FlashrtNvfp4Mlp` (RMSNorm, interleaved GeGLU) | the encoder FFN | yes |
+| `FlashrtFa4Attention` (head_dim 72) | the SigLIP attention | yes |
+| `FlashrtNvfp4Mlp` (LayerNorm, bias+GELU, bias+residual) | the SigLIP FFN | yes |
 
-A bitwise check of an operator against the corresponding slice of a stage needs
-the recording tools to export the intermediate tensors at those boundaries;
-that is not in the dumps yet.
+The stage and layer plugins are bitwise equal to FlashRT in the same way; the
+whole suite is `backends/tensorrt/tests/run_regression.sh`.
+
+Two things the check taught us, both worth knowing before reading a number
+anywhere else in this document:
+
+- **The tile variant does not change the result.** Running the encoder FFN
+  through a different tile (§5) leaves the output bit-identical, so tuning is
+  free of numerical consequence here, and the tables in §5 are a pure latency
+  choice.
+- **The normalization epsilon does.** The vision tower's LayerNorm uses 1e-5;
+  running that operator with 1e-6 leaves 19308 of 589824 elements differing.
+  An operator is only equal to its stage when every attribute matches the
+  pipeline, not just the shapes.
 
 One place where operator granularity changes the arithmetic rather than the
 speed: `FRT_EPI_ACCUM` adds into its output buffer, so a plugin whose residual

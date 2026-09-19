@@ -25,8 +25,13 @@ fvk, fvk_fp4 = m1.fvk, m1.fvk_fp4
 check = m1.check
 
 
-def ref_layer(pipe, l, stream=0):
-    """One SigLIP layer, production branch only (rowops v2, FA4, NVFP4 FFN)."""
+def ref_layer(pipe, l, stream=0, capture=None):
+    """One SigLIP layer, production branch only (rowops v2, FA4, NVFP4 FFN).
+
+    `capture` records this layer at the boundaries the operator plugins in
+    backends/tensorrt/plugins/ops implement, so those can be checked bit for
+    bit.
+    """
     bufs, weights, dims = pipe._sig_bufs, pipe._sig_weights, pipe._sig_dims
     sc = pipe._sig_fp4_scratch
     w = pipe._sig_fp4_weights[l]
@@ -41,11 +46,19 @@ def ref_layer(pipe, l, stream=0):
                                            x_fp8, S, D, 1e-5, stream), "ln_fp8")
     pipe._gemm.fp8_nn_bias(x_fp8, weights["qkv_w"][l], qkv, weights["qkv_b"][l], S, 3 * D, D,
                            alpha[l * 4 + 0], stream)
+    if capture is not None:
+        qkv_rows = pipe._sig_qkv[:S]
+        for name, col in (("attn_q", 0), ("attn_k", 1), ("attn_v", 2)):
+            capture[name] = qkv_rows[:, col * D:(col + 1) * D].clone()
     pipe._attn.run("siglip", 0, q_seq=spv, stream=stream)
+    if capture is not None:
+        capture["attn_out"] = pipe._sig_attn[:S].clone()
     fvk.quantize_fp8_static_fp16(attn_out, x_fp8, weights["unit_scale"], S * D, stream)
     pipe._gemm.fp8_nn_bias_res(x_fp8, weights["o_w"][l], x, weights["o_b"][l], S, D, D,
                                alpha[l * 4 + 1], stream)
     ln, hid = sc["ln_act"], sc["hid_act"]
+    if capture is not None:
+        capture["ffn_in"] = pipe._sig_x[:S].clone()
     check(fvk_fp4.rowops_layer_norm_mul_fp4_sfa_v2(
         x, weights["ln_ffn_w"][l], weights["ln_ffn_b"][l], w["ln_inv_s"],
         ln.packed.data_ptr(), ln.sfa.data_ptr(), S, D, 1e-5, stream), "ln_fp4")
@@ -57,6 +70,8 @@ def ref_layer(pipe, l, stream=0):
         hid.packed.data_ptr(), hid.sfa.data_ptr(),
         w["down"]["packed"].data_ptr(), w["down"]["sfb"].data_ptr(),
         weights["down_b"][l], x, x, S, D, H_pad, stream), "down")
+    if capture is not None:
+        capture["ffn_out"] = pipe._sig_x[:S].clone()
 
 
 def by_ptr(tensors, ptr, what):
@@ -70,6 +85,8 @@ def main():
     p = argparse.ArgumentParser()
     m1.add_policy_args(p)
     p.add_argument("--obs-index", type=int, default=0)
+    p.add_argument("--ops-layer", type=int, default=0,
+                   help="layer to record at the operator boundaries as well")
     p.add_argument("--out", required=True)
     args = p.parse_args()
 
@@ -111,8 +128,9 @@ def main():
     # per-layer reproduction
     pipe._sig_x.copy_(x_embed)
     layer_out = []
+    ops = {}
     for l in range(L):
-        ref_layer(pipe, l)
+        ref_layer(pipe, l, capture=ops if l == args.ops_layer else None)
         torch.cuda.synchronize()
         layer_out.append(pipe._sig_x.clone())
     ok_layers = torch.equal(layer_out[-1], x_lib)
@@ -150,6 +168,11 @@ def main():
         out[f"L{l}.down_packed"] = w["down"]["packed"]
         out[f"L{l}.down_sfb"] = w["down"]["sfb"]
         out[f"L{l}.down_b"] = pipe._sig_down_b[l]
+    # The same layer at the boundaries the operator plugins implement, so
+    # backends/tensorrt/tests/ops_parity.py can check them bit for bit.
+    for name in ("attn_q", "attn_k", "attn_v", "attn_out", "ffn_in", "ffn_out"):
+        out[f"ops.{name}"] = ops[name]
+    out["ops.meta"] = torch.tensor([args.ops_layer], dtype=torch.int64)
     out["meta"] = torch.tensor([S, D, H, NH, HD, L, nv, spv, H_pad, De,
                                 sc["siglip_up_variant"], sc["siglip_down_variant"]], dtype=torch.int64)
     for n in ("L0.qkv_w", "L0.o_w", "L0.qkv_b", "L0.up_b", "L0.awq_inv_s", "pe_w", "proj_w"):

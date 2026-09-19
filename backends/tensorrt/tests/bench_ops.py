@@ -290,7 +290,8 @@ CASES = [
     dict(tag="siglip_mlp", label=f"siglip_mlp M={M_s}", op="FlashrtNvfp4Mlp",
          ints=dict(D=D_s, H=H_s_pad, norm_mode=2, gate_mode=1, gate_variant=up_variant,
                    down_variant=0, epilogue=2, opt_mask=0b111111),
-         floats=dict(eps=1e-6),
+         # the vision tower's LayerNorm epsilon, not this file's default
+         floats=dict(eps=1e-5),
          inputs=[("x", S["L0.x_out"], "in"),
                  ("up_packed", S["L0.up_packed"], "blob"),
                  ("up_sfb", S["L0.up_sfb"], "blob"),
@@ -303,7 +304,7 @@ CASES = [
     dict(tag="siglip_mlp_plain", label=f"siglip_mlp_plain M={M_s}", op="FlashrtNvfp4Mlp",
          ints=dict(D=D_s, H=H_s_pad, norm_mode=0, gate_mode=1, gate_variant=up_variant,
                    down_variant=0, epilogue=0, opt_mask=1 << 3),
-         floats=dict(eps=1e-6),
+         floats=dict(eps=1e-5),
          inputs=[("x", S["L0.x_out"], "in"),
                  ("up_packed", S["L0.up_packed"], "blob"),
                  ("up_sfb", S["L0.up_sfb"], "blob"),

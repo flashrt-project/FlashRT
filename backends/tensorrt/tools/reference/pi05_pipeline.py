@@ -69,9 +69,16 @@ def check(rc, what):
         raise RuntimeError(f"{what} rc={rc}")
 
 
-def ref_layer(l, a, k, stream=0):
+def ref_layer(l, a, k, stream=0, capture=None):
     """One encoder layer, production branch only (rowops v2, residual
-    epilogue, P1 epilogue_hw_nod, FP4 attention O, FP8 QKV)."""
+    epilogue, P1 epilogue_hw_nod, FP4 attention O, FP8 QKV).
+
+    `capture` records this layer at the boundaries the operator plugins in
+    backends/tensorrt/plugins/ops implement, so those can be checked bit for
+    bit. The caller puts the two buffers the layer writes through into it,
+    {"x": residual stream, "attn": attention buffer}, and gets back the input
+    and the output of each operator.
+    """
     gemm, fvk_, fvk_fp4_, bufs, weights, dims = a
     attn = k["attn"]
     fp4_weights = k["fp4_weights"]
@@ -94,7 +101,12 @@ def ref_layer(l, a, k, stream=0):
         Se, NH * HD, HD, HD, 2560, l * total_keys * HD, HD, stream), "qkv_split")
     if last:
         return
+    if capture is not None:
+        capture["attn_q"] = capture["attn"][:Se].clone()
     attn.run("encoder", l, q_seq=Se, stream=stream)
+    if capture is not None:
+        capture["attn_out"] = capture["attn"][:Se].clone()
+        capture["o_res"] = capture["x"][:Se].clone()
 
     aw = attn_fp4[l]
     assert "o" in aw and "qkv" not in aw
@@ -105,6 +117,9 @@ def ref_layer(l, a, k, stream=0):
         sc["attn_variant"], sc_at.packed.data_ptr(), sc_at.sfa.data_ptr(),
         aw["o"]["packed"].data_ptr(), aw["o"]["sfb"].data_ptr(),
         x, Se, D, D, 1.0, 1.0, stream), "o_gemm")
+
+    if capture is not None:
+        capture["o_out"] = capture["x"][:Se].clone()
 
     assert sc["res_epilogue"] and sc["p1_combiner"] == "epilogue_hw_nod"
     sc_gu, sc_dn = sc["gu_act"], sc["down_act"]
@@ -121,6 +136,8 @@ def ref_layer(l, a, k, stream=0):
         sc["variant_dn"], sc_dn.packed.data_ptr(), sc_dn.sfa.data_ptr(),
         w_dn["packed"].data_ptr(), w_dn["sfb"].data_ptr(),
         x, Se, D, H, 1.0, 1.0, stream), "down_gemm")
+    if capture is not None:
+        capture["ffn_out"] = capture["x"][:Se].clone()
     # The library also writes next-layer FP8 input here; the next layer
     # recomputes the identical value at its start, so it is omitted.
 
