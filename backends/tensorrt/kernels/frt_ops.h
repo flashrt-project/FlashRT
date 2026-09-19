@@ -116,6 +116,21 @@ int32_t frt_fa4_mha_hd72(const void* q, int64_t q_row_stride,
                          int32_t b, int32_t s, int32_t nh, float scale,
                          cudaStream_t stream);
 
+// --------------------------------------------------------------- weights ---
+// Turn an fp16 weight into the form the GEMMs read: e2m1 codes in `packed`,
+// and one UE4M3 scale per 16 elements along K in `sfb`, in the tile
+// interleaved order the kernels expect. A host needs nothing else to feed the
+// operators above -- no calibration, and no FlashRT frontend.
+//
+// `sfb` must be zeroed first: the layout has padding entries the quantizer
+// never writes, and the GEMM reads them.
+size_t frt_nvfp4_weight_sfb_bytes(int32_t N, int32_t K);
+
+int32_t frt_nvfp4_pack_weight(const void* w_fp16,  // fp16 [N, K], K a multiple of 16
+                              void* packed,         // uint8 [N, K/2]
+                              void* sfb,            // uint8, zeroed, see above
+                              int32_t N, int32_t K, cudaStream_t stream);
+
 // -------------------------------------------------------------- variants ---
 // A `variant`, `gate_variant` or `down_variant` index names a tile shape in the
 // table of the kernel that the mode and the epilogue select, so the tables are

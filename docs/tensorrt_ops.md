@@ -21,6 +21,7 @@ Raw device pointers, no model semantics, one CUDA stream, `0` on success.
 | `frt_fa4_gqa_hd256` | FlashAttention-4, head_dim 256, grouped queries over one KV head |
 | `frt_fa4_mha_hd72` | FlashAttention-4, head_dim 72, multi-head |
 | `frt_nvfp4_linear_workspace`, `frt_nvfp4_mlp_workspace` | scratch bytes the two need |
+| `frt_nvfp4_pack_weight`, `frt_nvfp4_weight_sfb_bytes` | encode an fp16 weight into what the GEMMs read, below |
 | `frt_nvfp4_num_variants`, `frt_nvfp4_variant_name` | the tile tables, for tuning at your own shape (§5) |
 | `frt_fa4_load`, `frt_fa4_default_scale`, `frt_set_pdl` | load the FA4 modules, the `1/sqrt(head_dim)` FlashRT uses, programmatic dependent launch |
 
@@ -33,6 +34,42 @@ NVFP4 is e2m1 with a UE4M3 scale every 16 elements along K: packed weights are
 
 The kernels are CUDA C++ with CUTLASS, except FlashAttention-4, which is CuTe
 DSL compiled ahead of time into the library — no Python, no JIT at run time.
+
+### Weights and calibration
+
+These operators need no calibration at all, which is what makes them usable
+outside FlashRT.
+
+The NVFP4 path is **dynamically quantized end to end**. A weight is encoded by
+taking the largest magnitude in each group of 16 values along K and storing
+that as the group's UE4M3 scale; an activation is encoded the same way, inside
+the operator, every call. There is no calibration table, no per-tensor scale
+to carry around, and no calibration data set. One call turns an fp16 weight
+into what the GEMMs read:
+
+```c
+size_t bytes = frt_nvfp4_weight_sfb_bytes(N, K);
+cudaMemset(sfb, 0, bytes);                    // the layout has padding entries
+frt_nvfp4_pack_weight(w_fp16, packed, sfb, N, K, stream);
+```
+
+`backends/tensorrt/tests/ops_parity.py` runs exactly that path on a weight
+FlashRT has never seen and checks the operator against an fp16 matmul: cosine
+0.991, which is what NVFP4 costs, not what the implementation costs.
+
+Two optional inputs are accuracy refinements rather than requirements:
+
+- `awq_inv_s` is a per-channel scale that moves quantization error off the
+  channels that matter. FlashRT's frontend derives it from observations; the
+  operators run without it, and pi0.5 uses it.
+- `norm_gamma` / `norm_beta` fold a normalization into the same pass. Without
+  them the operator quantizes what it is given.
+
+What does need calibration in pi0.5 is the FP8 part of the pipeline — the
+vision tower's QKV and output projections carry static activation scales — and
+that is inside the stage plugins, not in this operator layer. If a host brings
+its own FP8 scales it brings its own FP8 GEMM; these operators are the NVFP4
+and FlashAttention-4 ones.
 
 ## 2. The plugins — `backends/tensorrt/plugins/ops/`
 

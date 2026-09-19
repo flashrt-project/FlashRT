@@ -57,6 +57,7 @@ add_library(frt_fp4_kernels OBJECT
   ${C}/gemm/fp4/cutlass_fp4_gemm_variants_persist_a.cu
   ${C}/gemm/fp4/cutlass_fp4_gemm_variants_persist_b.cu
   ${C}/gemm/fp4/cutlass_fp4_gemm_variants_swap.cu
+  ${C}/quantize/quantize_fp4_sfa.cu
   ${C}/quantize/reshape_scales_sfa.cu)
 target_include_directories(frt_fp4_kernels PRIVATE ${C} ${CUTLASS_INCLUDES})
 target_compile_definitions(frt_fp4_kernels PRIVATE CUTLASS_ARCH_MMA_SM100_SUPPORTED=1 CUTLASS_ENABLE_GDC_FOR_SM100=1)

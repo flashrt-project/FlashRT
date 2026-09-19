@@ -8,6 +8,7 @@ recorded output, eagerly and under an outer CUDA graph.
 
 usage: ops_parity.py <plugin.so> <encoder_all.safetensors> <siglip_all.safetensors>
 """
+import ctypes
 import os
 import sys
 
@@ -25,6 +26,12 @@ plugin_path, encoder_path, siglip_path = sys.argv[1:4]
 logger = trt.Logger(trt.Logger.WARNING)
 registry = trt.get_plugin_registry()
 registry.load_library(plugin_path)
+lib = ctypes.CDLL(plugin_path)
+lib.frt_nvfp4_weight_sfb_bytes.restype = ctypes.c_size_t
+lib.frt_nvfp4_weight_sfb_bytes.argtypes = [ctypes.c_int32, ctypes.c_int32]
+lib.frt_nvfp4_pack_weight.restype = ctypes.c_int32
+lib.frt_nvfp4_pack_weight.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                                      ctypes.c_int32, ctypes.c_int32, ctypes.c_void_p]
 dev = torch.device("cuda")
 stream = torch.cuda.current_stream()
 
@@ -58,8 +65,13 @@ def fields(ints, floats=()):
     return fc
 
 
-def check(label, op, ints, floats, inputs, expect):
-    """inputs: (name, tensor, kind) with kind "in" (runtime) or "blob"/"half" (constant)."""
+def check(label, op, ints, floats, inputs, expect, min_cos=None):
+    """inputs: (name, tensor, kind) with kind "in" (runtime) or "blob"/"half" (constant).
+
+    Bitwise against `expect`, or, with `min_cos`, a cosine floor instead: the
+    packing round trip below compares against an fp16 matmul, which NVFP4
+    cannot reproduce exactly.
+    """
     builder = trt.Builder(logger)
     net = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED))
     tensors, runtime = [], []
@@ -99,8 +111,7 @@ def check(label, op, ints, floats, inputs, expect):
 
     assert ctx.execute_async_v3(stream.cuda_stream)
     stream.synchronize()
-    eager = torch.equal(y, ref)
-    diff = int((y != ref).sum())
+    eager_out = y.clone()
 
     y.zero_()
     g = torch.cuda.CUDAGraph()
@@ -108,12 +119,25 @@ def check(label, op, ints, floats, inputs, expect):
         ctx.execute_async_v3(torch.cuda.current_stream().cuda_stream)
     g.replay()
     stream.synchronize()
-    graph = torch.equal(y, ref)
-    print(f"{label:28s} {op:20s} bitwise eager={eager} graph={graph}"
-          + ("" if eager else f"  differing elements {diff}/{ref.numel()}"))
+    graph_out = y.clone()
     del ctx, engine, g
     torch.cuda.empty_cache()
-    return eager and graph
+
+    if min_cos is None:
+        eager, graph = torch.equal(eager_out, ref), torch.equal(graph_out, ref)
+        diff = int((eager_out != ref).sum())
+        print(f"{label:28s} {op:20s} bitwise eager={eager} graph={graph}"
+              + ("" if eager else f"  differing elements {diff}/{ref.numel()}"))
+        return eager and graph
+
+    def cos(a):
+        return torch.nn.functional.cosine_similarity(
+            a.float().reshape(-1), ref.float().reshape(-1), dim=0).item()
+    ce, cg = cos(eager_out), cos(graph_out)
+    passed = ce >= min_cos and cg >= min_cos and torch.equal(eager_out, graph_out)
+    print(f"{label:28s} {op:20s} cos eager={ce:.5f} graph={cg:.5f} "
+          f"(floor {min_cos})  pass={passed}")
+    return passed
 
 
 ok = True
@@ -177,6 +201,24 @@ ok &= check(
      ("awq", S[f"L{ls}.awq_inv_s"], "half"), ("up_b", S[f"L{ls}.up_b"], "half"),
      ("down_b", S[f"L{ls}.down_b"], "half"), ("residual", S["ops.ffn_in"], "in")],
     S["ops.ffn_out"])
+
+# A weight packed through the C ABI, with no FlashRT frontend anywhere: the
+# operator reads it and reproduces the matmul to NVFP4 accuracy. This is the
+# whole path a host needs to use the operators on its own weights.
+N, K, M = 1024, 2048, 256
+w = (torch.randn(N, K, dtype=torch.float16, device=dev) * 0.05).contiguous()
+x = (torch.randn(M, K, dtype=torch.float16, device=dev) * 0.5).contiguous()
+packed = torch.zeros(N * K // 2, dtype=torch.uint8, device=dev)
+sfb = torch.zeros(int(lib.frt_nvfp4_weight_sfb_bytes(N, K)), dtype=torch.uint8, device=dev)
+rc = lib.frt_nvfp4_pack_weight(w.data_ptr(), packed.data_ptr(), sfb.data_ptr(), N, K, None)
+torch.cuda.synchronize()
+assert rc == 0, f"frt_nvfp4_pack_weight failed rc={rc}"
+ok &= check(
+    "packed weight round trip", "FlashrtNvfp4Linear",
+    [("N", N), ("K", K), ("norm_mode", 0), ("epilogue", 0), ("variant", 0), ("opt_mask", 0)],
+    [("eps", 1e-6)],
+    [("x", x.cpu(), "in"), ("w_packed", packed.cpu(), "blob"), ("w_sfb", sfb.cpu(), "blob")],
+    (x.float() @ w.float().T).half().cpu(), min_cos=0.99)
 
 print("OPS_PARITY_PASS" if ok else "OPS_PARITY_FAIL")
 sys.exit(0 if ok else 1)

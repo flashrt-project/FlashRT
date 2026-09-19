@@ -15,6 +15,7 @@
 #include "gemm/fp4/cutlass_fp4_gemm_geglu_il_sm100.cuh"
 #include "gemm/fp4/cutlass_fp4_gemm_siglip_ffn_sm100.cuh"
 #include "gemm/fp4/cutlass_fp4_gemm_siglip_ffn_variants_sm100.cuh"
+#include "quantize/quantize_fp4_sfa.cuh"
 #include "quantize/reshape_scales_sfa.cuh"
 
 #include "stages/pi05_thor/fa4_attention.h"
@@ -179,6 +180,15 @@ int32_t frt_fa4_mha_hd72(const void* q, int64_t q_row_stride, const void* k, int
     return flashrt_trt::fa4_hd72_mha(const_cast<void*>(q), q_row_stride, const_cast<void*>(k),
                                      k_row_stride, const_cast<void*>(v), v_row_stride, o, b, s,
                                      nh, scale, stream);
+}
+
+size_t frt_nvfp4_weight_sfb_bytes(int32_t N, int32_t K) {
+    return static_cast<size_t>(flash_rt::fp4::sfa_size_bytes(N, K, true));
+}
+
+int32_t frt_nvfp4_pack_weight(const void* w_fp16, void* packed, void* sfb, int32_t N, int32_t K,
+                              cudaStream_t stream) {
+    return flash_rt::fp4::quantize_fp4_dynamic_sfa_fp16(w_fp16, packed, sfb, N, K, true, stream);
 }
 
 int32_t frt_nvfp4_num_variants(int32_t kind) {
