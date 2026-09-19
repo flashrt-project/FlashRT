@@ -45,9 +45,27 @@ The builder level is not what makes the difference: an optimization level has
 tactics to choose only for the layers TensorRT owns, and in the FlashRT graph
 those are Concat, Reshape and Slice. Built at the builder's default level
 instead, the FlashRT engine measures 32.47 and 33.21 ms over two rounds
-against 32.52 and 33.51 for the level-0 build. FlashRT's own native runtime
-runs the same shape in 32.82 ms: the engine runs FlashRT's kernels at
-FlashRT's speed and matches its outputs bit for bit.
+against 32.52 and 33.51 for the level-0 build.
+
+Nor does the engine cost anything over FlashRT itself. Running the same
+checkpoint at the same shape, FlashRT's own runtime measures a median
+`infer()` of 32.67 ms against the engine's 33.07 — two different clocks, a
+Python call against trtexec's GPU compute time — and the two agree bit for
+bit.
+
+What the rest of the difference between 33.07 and the 23.7 ms at the top is,
+measured on the same checkpoint and the same build, is shape:
+
+| FlashRT, three cameras | prefix | median |
+|---|---|---|
+| prompt padded to 208 tokens, as the tutorial engine does | 976 | 32.67 ms |
+| the prompt the observation actually has | 781 | **28.00 ms** |
+
+4.7 ms of the tutorial's shape is padding: 195 language tokens that are not in
+the instruction. The remaining step down to 23.7 ms is the third camera slot,
+which LIBERO fills with zeros and masks off. Both are available to any engine
+that is built for the observation instead of for a fixed maximum, which is
+what this backend's exporter does.
 
 ## 1. Requirements
 
