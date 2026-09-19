@@ -215,6 +215,40 @@ Two things a host cannot get back at operator granularity:
   kernels of a block, and the side stream that pumps the next layer's weights
   into L2, both live inside a stage.
 
+### What each tier is worth end to end
+
+The whole policy as three stage plugins, on this board, prompts of 6 and 14
+tokens, bitwise equal to FlashRT: **23.7 ms** (25.5 ms when the prefix length is
+not a multiple of 8). It divides into SigLIP 3.63, prefix encoder 8.51 and
+action decoder 11.67 ms.
+
+Now take the other end. A host that keeps its own graph and swaps in only these
+three operators gets, per the measurements in §3.3, and counting the 17 encoder
+layers that have an FFN and all 27 SigLIP layers:
+
+| | per layer, FlashRT | per layer, TensorRT | layers | saved |
+|---|---|---|---|---|
+| encoder FFN | 309.8 µs | 408.0 µs | 17 | 1.67 ms |
+| encoder output projection | 30.8 µs | 28.9 µs | 17 | −0.03 ms |
+| encoder attention | 91.6 µs | 114.0 µs | 17 | 0.38 ms |
+| SigLIP FFN | 49.4 µs | 52.2 µs | 27 | 0.08 ms |
+| SigLIP attention | 39.6 µs | 67.6 µs | 27 | 0.76 ms |
+| | | | | **≈ 2.9 ms** |
+
+That is an upper bound: it assumes each swap is free at the boundary, and §3.4
+says a boundary costs a memory pass.
+
+The two numbers answer the same question at different granularities. The three
+operators cover 9.8 ms of the 23.8 ms this engine spends — 41% of it — and are
+worth about 2.9 ms against TensorRT's own versions. The action decoder, 11.67 ms
+and the largest single block, is not addressable at operator granularity at all:
+its speed comes from what a stage does between kernels, and §4's table prices
+that at 11% for step boundaries alone.
+
+So the tiers are not variations of one integration. Operators are worth a few
+milliseconds and cost nothing to adopt; stages are worth the other twenty and
+require taking the pipeline.
+
 Mixing vendors in one graph — TensorRT's GEMM next to FlashRT's fused block —
 is possible at graph level, and §3.4 bounds what it buys: about 2 µs per bare
 projection, against the ≥1 ms per encoder pass that operator granularity costs.
