@@ -66,6 +66,19 @@ M_s, D_s, _H_s, NH_s, HD_s, _L_s, views, spv, H_s_pad, _De, up_variant = S["meta
 keep = []  # PluginField arrays must outlive plugin creation
 
 
+def normalized(t):
+    """A row-normalized copy, for the operators that start after the norm.
+
+    The `_plain` cases drop the normalization so their boundary matches the
+    subgraph cut from the export, which starts at an already normalized
+    activation. Handing the raw residual stream to the quantizer instead is
+    outside its contract — its block scales overflow on the prompt embeddings —
+    and these kernels take the same time either way.
+    """
+    x = t.float()
+    return (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)).to(t.dtype)
+
+
 def blob(t):
     b = t.contiguous().view(torch.uint8).reshape(-1).numpy()
     pad = (-b.size) % 4
@@ -272,7 +285,7 @@ CASES = [
          ints=dict(D=D_e, H=H_e, norm_mode=0, gate_mode=0, gate_variant=0,
                    down_variant=down_variant, epilogue=0, opt_mask=0),
          floats=dict(eps=1e-6),
-         inputs=[("x", E["x_in"], "in"),
+         inputs=[("x", normalized(E["x_in"]), "in"),
                  ("gu_packed", E["L0.gu_il_packed"], "blob"),
                  ("gu_sfb", E["L0.gu_il_sfb"], "blob"),
                  ("down_packed", E["L0.down_packed"], "blob"),
@@ -281,7 +294,7 @@ CASES = [
     dict(tag="encoder_o_plain", label=f"encoder_o_plain M={Se}", op="FlashrtNvfp4Linear",
          ints=dict(N=D_e, K=D_e, norm_mode=0, epilogue=0, variant=o_variant, opt_mask=0),
          floats=dict(eps=1e-6),
-         inputs=[("x", E["x_in"], "in"),
+         inputs=[("x", normalized(E["x_in"]), "in"),
                  ("w_packed", E["L0.o_packed"], "blob"),
                  ("w_sfb", E["L0.o_sfb"], "blob")],
          out_cols=D_e, rows=Se, note=f"N={D_e} K={D_e}, no residual"),
@@ -305,7 +318,7 @@ CASES = [
          ints=dict(D=D_s, H=H_s_pad, norm_mode=0, gate_mode=1, gate_variant=up_variant,
                    down_variant=0, epilogue=0, opt_mask=1 << 3),
          floats=dict(eps=1e-5),
-         inputs=[("x", S["L0.x_out"], "in"),
+         inputs=[("x", normalized(S["L0.x_out"]), "in"),
                  ("up_packed", S["L0.up_packed"], "blob"),
                  ("up_sfb", S["L0.up_sfb"], "blob"),
                  ("down_packed", S["L0.down_packed"], "blob"),

@@ -113,12 +113,15 @@ any number below is the harness.
 
 ### 3.3 Operators
 
-| operator, at the shape pi0.5 runs it | FlashRT | TensorRT | ratio |
+At the shape the tutorial's engine runs — three camera slots, a 208-token
+prompt, so 976 prefix rows:
+
+| operator | FlashRT | TensorRT | ratio |
 |---|---|---|---|
-| encoder FFN, `M=526, D=2048, H=16384`, NVFP4 both sides | **309.8 µs** | 408.0 µs | **1.32×** |
-| encoder output projection, `526×2048×2048`, quantize + GEMM | 30.8 µs | **28.9 µs** | 0.94× |
-| SigLIP FFN, `M=512, D=1152, H=4320` (FlashRT NVFP4, export FP8) | **49.4 µs** | 52.2 µs | **1.06×** |
-| SigLIP attention, head_dim 72, `2×16×256×72` | **39.6 µs** | 130.2 µs | **3.29×** |
+| encoder FFN, `M=976, D=2048, H=16384`, NVFP4 both sides | **450.3 µs** | 636.2 µs | **1.41×** |
+| encoder output projection, `976×2048×2048`, quantize + GEMM | **40.5 µs** | 43.7 µs | **1.08×** |
+| SigLIP FFN, `M=768, D=1152, H=4320` (FlashRT NVFP4, export FP8) | **69.9 µs** | 76.4 µs | **1.09×** |
+| SigLIP attention, head_dim 72, `3×16×256×72` | **52.6 µs** | 182.6 µs | **3.48×** |
 
 The export writes attention as MatMul/Softmax/MatMul, so that last row only
 says FlashAttention-4 beats *that graph*. Against TensorRT's own `Attention`
@@ -126,13 +129,28 @@ operator (`backends/tensorrt/tests/attention_arm.py` builds it, five rounds):
 
 | attention | FlashRT FA4 | TensorRT `Attention` | ratio |
 |---|---|---|---|
-| SigLIP, head_dim 72, `2×16×256×72` | **39.6 µs** | 67.6 µs | **1.71×** |
-| encoder, head_dim 256 GQA, `1×8×526×256`, one KV head | **91.6 µs** | 114.0 µs | **1.25×** |
+| SigLIP, head_dim 72, `3×16×256×72` | **52.2 µs** | 90.1 µs | **1.72×** |
+| encoder, head_dim 256 GQA, `1×8×976×256`, one KV head | **184.0 µs** | 282.8 µs | **1.54×** |
 
-### 3.4 Why the bare GEMM does not win
+The same operators at the shape this backend deploys — two cameras and the
+actual prompt, so 526 prefix rows — where every operator is smaller:
 
-The output projection is the one operator TensorRT takes. Holding everything
-else fixed and scaling `N`:
+| operator | FlashRT | TensorRT | ratio |
+|---|---|---|---|
+| encoder FFN, `M=526` | **309.8 µs** | 408.0 µs | **1.32×** |
+| encoder output projection, `526×2048×2048` | 30.8 µs | **28.9 µs** | 0.94× |
+| SigLIP FFN, `M=512` | **49.4 µs** | 52.2 µs | **1.06×** |
+| SigLIP attention, `2×16×256×72`, vs the export's chain | **39.6 µs** | 130.2 µs | **3.29×** |
+| SigLIP attention, vs `Attention` | **39.6 µs** | 67.6 µs | **1.71×** |
+| encoder attention, `1×8×526×256`, vs `Attention` | **91.6 µs** | 114.0 µs | **1.25×** |
+
+One row changes sign between the two shapes, and §3.4 is about that row.
+
+### 3.4 Why the bare GEMM is the close one
+
+The output projection is the only operator TensorRT ever takes, and it takes it
+at one shape and not the other: 0.94× at 526 rows, 1.08× at 976. Holding
+everything else fixed at 526 rows and scaling `N`:
 
 | `N` | 128 | 512 | 1024 | 2048 |
 |---|---|---|---|---|
@@ -159,6 +177,14 @@ difference between them is the extra round trip, not the arithmetic. It costs
 2.1 µs rather than the 4.7 µs the bytes alone suggest, because the quantized
 activation is written and read back immediately and much of it is still in L2.
 
+That is also why the row changes sign with the shape. The weights are 2.36 MB
+whatever `M` is, so at 526 rows they are a third of everything FlashRT moves
+and the extra pass is expensive relative to the work; at 976 rows the same
+pass is amortized over nearly twice the arithmetic, FlashRT moves 12.6 MB in
+40.5 µs (311 GB/s) and TensorRT 10.4 MB in 43.7 µs (237 GB/s), and the
+ordering reverses. An isolated quantized GEMM is close either way, which is
+the point: it is the operator where there is least to win.
+
 The same accounting explains the FFN in the other direction. TensorRT's FFN
 materializes the hidden activation in fp16 — 526×16384 written and read again,
 34 MB per layer — while FlashRT's gate/up epilogue emits NVFP4 with its block
@@ -166,14 +192,14 @@ scales, about 9 MB. The 25 MB difference is roughly 100 µs at the rates above;
 the measured difference is 98 µs. That is the 1.32×.
 
 So the ordering is not an accident of tiles, and it does not move much with
-them (§5): **an isolated GEMM is where a fused quantization prologue wins, and a
-block is where keeping the activation in NVFP4 wins.** It is also why
-FlashRT's plugins are cut at fusion boundaries.
+them (§5): **an isolated GEMM is where a fused quantization prologue is worth
+the most, and a block is where keeping the activation in NVFP4 is.** It is also
+why FlashRT's plugins are cut at fusion boundaries.
 
 ## 4. Granularity: operator, layer, stage
 
-The encoder is available at all three. Measured with the same weights, the same
-`Se=526`, under an outer CUDA graph:
+The encoder is available at all three. Measured at the deployment shape
+(`Se=526`) with the same weights, under an outer CUDA graph:
 
 | granularity | per block | 18 layers | bitwise vs FlashRT |
 |---|---|---|---|
@@ -217,40 +243,45 @@ Two things a host cannot get back at operator granularity:
 
 ### What each tier is worth end to end
 
-The whole policy as three stage plugins, on this board, prompts of 6 and 14
-tokens, bitwise equal to FlashRT: **23.7 ms** (25.5 ms when the prefix length is
-not a multiple of 8). It divides into SigLIP 3.63, prefix encoder 8.51 and
-action decoder 11.67 ms.
+Take the tutorial's own shape, where both whole engines can be measured against
+each other. Each was built on this machine from its own ONNX with its own build
+command, then timed alternately:
 
-Now take the other end. A host that keeps its own graph and swaps in only these
-three operators gets, per the measurements in §3.3, and counting the 17 encoder
+| engine, three cameras and a 208-token prompt | GPU compute median |
+|---|---|
+| openpi Thor tutorial | 47.48 ms |
+| FlashRT, stage plugins | **33.07 ms** |
+
+**14.41 ms apart.** That is what is on the table, and it is the baseline the
+rest of this section is read against. (At the shape this backend deploys — two
+cameras and the actual prompt — the same engine is 23.7 ms, bitwise equal to
+FlashRT: SigLIP 3.63, prefix encoder 8.51, action decoder 11.67.)
+
+Now the other end. A host that keeps its own graph and swaps in only these
+three operators gets, per §3.3 at that same shape, counting the 17 encoder
 layers that have an FFN and all 27 SigLIP layers:
 
 | | per layer, FlashRT | per layer, TensorRT | layers | saved |
 |---|---|---|---|---|
-| encoder FFN | 309.8 µs | 408.0 µs | 17 | 1.67 ms |
-| encoder output projection | 30.8 µs | 28.9 µs | 17 | −0.03 ms |
-| encoder attention | 91.6 µs | 114.0 µs | 17 | 0.38 ms |
-| SigLIP FFN | 49.4 µs | 52.2 µs | 27 | 0.08 ms |
-| SigLIP attention | 39.6 µs | 67.6 µs | 27 | 0.76 ms |
-| | | | | **≈ 2.9 ms** |
+| encoder FFN | 450.3 µs | 636.2 µs | 17 | 3.16 ms |
+| encoder attention | 184.0 µs | 282.8 µs | 17 | 1.68 ms |
+| SigLIP attention | 52.2 µs | 90.1 µs | 27 | 1.02 ms |
+| SigLIP FFN | 69.9 µs | 76.4 µs | 27 | 0.18 ms |
+| encoder output projection | 40.5 µs | 43.7 µs | 17 | 0.05 ms |
+| | | | | **≈ 6.1 ms** |
 
-That is an upper bound: it assumes each swap is free at the boundary, and §3.4
-says a boundary costs a memory pass.
+So operator granularity recovers **about 42%** of the distance, and that is an
+upper bound: it assumes each swap is free at the boundary, and §3.4 says a
+boundary costs a memory pass. The five operators cover 14.8 ms of the 33.07 ms
+the FlashRT engine spends, 45% of it.
 
-Read the 2.9 ms against the right baseline. It is not 2.9 out of 23.7 — the
-engine's own time is not what is on the table. What is on the table is the
-distance between this engine and TensorRT's at the same shape, and the three
-operators recover about a third of it. They cover 9.8 ms of the 23.8 ms this
-engine spends, 41% of it, and inside that coverage TensorRT's own kernels are
-not bad: the bare projection is ahead, the SigLIP FFN is close.
-
-The rest is in two places that have no operator boundary at all. The action decoder, 11.67 ms and the largest single block, gets its speed
-from what a stage does *between* kernels — the side stream that pumps the next
-step's weights into L2 and the dependent launches chained through the step —
-and §4 prices step boundaries alone at 11%. The rest is inside a layer: the
-QKV projection, RoPE, the normalizations and the quantization are fused into
-their neighbours, so there is no operator to swap.
+The rest has no operator boundary at all. The action decoder — the largest
+single block, 11.67 ms of the 23.8 ms engine at the deployment shape — gets its
+speed from what a stage does *between* kernels: the side stream that pumps the
+next step's weights into L2, and the dependent launches chained through the
+step. §4 prices step boundaries alone at 11%. The remainder is inside a layer:
+the QKV projection, RoPE, the normalizations and the quantization are fused
+into their neighbours, so there is no operator to swap.
 
 So the tiers are not three sizes of the same integration. Operators cost
 nothing to adopt and recover the part of the advantage that survives being cut
@@ -280,24 +311,21 @@ python backends/tensorrt/tests/bench_ops.py build/tensorrt/libflashrt_trt_pi05.s
     --only siglip_mlp --sweep siglip_mlp --json sweep.json
 ```
 
-What it found for pi0.5 on Thor, against the defaults the end-to-end tuning
-left behind. These are the operators at the boundary §3.3 measures (no
-normalization, no residual), so the down GEMM is the plain one:
+What it found for pi0.5 on Thor, at both shapes, against the defaults the
+end-to-end tuning left behind. These are the operators at the boundary §3.3
+measures (no normalization, no residual), so the down GEMM is the plain one:
 
-| operator | table | default | best at this shape | change |
+| operator | table | default | best at 526 rows | best at 976 rows |
 |---|---|---|---|---|
-| encoder FFN down GEMM | `GEMM` | 8 — `128x256x256` | **6** — `128x256x128 cluster1x1x1` | −3% |
-| encoder output projection | `GEMM` | 1 — `128x256x128 cluster2x1x1` | **6** — `128x256x128 cluster1x1x1` | −2% |
-| SigLIP up GEMM | `GATE_BIAS_GELU` | 2 — `128x128x128` | **6** — `256x128x256 cluster2x1x1` (2-SM) | −3% |
-| SigLIP down GEMM | `GEMM` | 0 — `128x128x128 cluster2x1x1` | **38** — `256x256x256 cluster2x1x1` (2-SM) | −15% |
+| encoder FFN down GEMM | `GEMM` | 8 — `128x256x256` | **6** — `128x256x128` (−3%) | **36** — `256x256x128` 2-SM (−14%) |
+| encoder output projection | `GEMM` | 1 — `128x256x128 cluster2x1x1` | **6** — `128x256x128` (−2%) | **36** — `256x256x128` 2-SM (−4%) |
+| SigLIP up GEMM | `GATE_BIAS_GELU` | 2 — `128x128x128` | **6** — `256x128x256` 2-SM | **4** — `256x128x128` 2-SM |
+| SigLIP down GEMM | `GEMM` | 0 — `128x128x128 cluster2x1x1` | **38** — `256x256x256` 2-SM | **38** — `256x256x256` 2-SM |
 
-With the residual epilogue the SigLIP FFN uses the other down table
-(`DOWN_BIAS_RES`), where the sweep picks 4 (`256x128x256 cluster2x1x1`) over
-the base 0, and its up GEMM picks 4 over 2.
-
-The SigLIP FFN is the one that moves the ordering: it was 0.88× of TensorRT
-before the sweep and is 1.06× after. The others move by a couple of percent,
-which is §3.4's point — at these shapes the tile is not what decides.
+The two columns disagree, which is the reason the tables are exposed at all:
+the best tile is a property of the shape, not of the kernel. The SigLIP FFN is
+where it moves the ordering — 0.88× of TensorRT before the sweep and 1.06×
+after, at 512 rows. Elsewhere it is a few percent, which is §3.4's point.
 
 Tiles are per shape, so the stage path keeps the ones its own end-to-end tuning
 picked; these are the operator path's. Switching between them is free of
@@ -311,13 +339,15 @@ with the recordings from `backends/tensorrt/tools/reference/`:
 
 ```bash
 # FlashRT arm: one engine per operator, plus the engines trtexec will re-time.
-# The tiles are the ones §5 measured for these shapes.
+# The tiles are the ones §5 measured for the recording's own shape.
 python backends/tensorrt/tests/bench_ops.py build/tensorrt/libflashrt_trt_pi05.so \
     encoder_all.safetensors siglip_all.safetensors --save-engines ops/ \
     --set encoder_mlp_plain.down_variant=6 --set encoder_o_plain.variant=6 \
     --set siglip_mlp_plain.gate_variant=6 --set siglip_mlp_plain.down_variant=38
 
-# TensorRT arm: subgraphs cut from the export, and the native Attention graphs
+# TensorRT arm: subgraphs cut from the export, and the native Attention graphs.
+# --rows/--views/--tokens must match the recording the FlashRT arm used; the
+# defaults are the two-camera shape, and the tutorial's is 976/3/256.
 python backends/tensorrt/tests/extract_trt_ops.py --onnx .../model_fp8_nvfp4.onnx --out ops/
 python backends/tensorrt/tests/attention_arm.py --out ops/
 

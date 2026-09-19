@@ -28,10 +28,26 @@ The observations are the calibration observations of both engines.
 
 The tutorial engine always computes three camera slots and a 208-token
 prompt; the FlashRT engine computes the unmasked cameras and the actual
-prompt. At the tutorial engine's shape, `trtexec --useCudaGraph` measures
-32.69 ms for the FlashRT engine against 47.76 ms, and FlashRT's native
-runtime runs 32.82 ms: the engine runs FlashRT's kernels at FlashRT's speed
-and matches its outputs bit for bit.
+prompt, which is most of the difference above. At the tutorial engine's own
+shape the two are still 1.44x apart. Both engines built on this machine from
+their own ONNX with their own build command — the tutorial's
+`deployment_scripts/build_engine.sh` flags for theirs, `--builderOptimizationLevel=0`
+for ours — then timed alternately, three rounds, `trtexec --useCudaGraph
+--noDataTransfers --iterations=200 --avgRuns=10`, each reported at its fastest
+round:
+
+| engine, three cameras and a 208-token prompt | GPU compute median |
+|---|---|
+| openpi Thor tutorial | 47.48 ms |
+| FlashRT TensorRT backend | **33.07 ms** |
+
+The builder level is not what makes the difference: an optimization level has
+tactics to choose only for the layers TensorRT owns, and in the FlashRT graph
+those are Concat, Reshape and Slice. Built at the builder's default level
+instead, the FlashRT engine measures 32.47 and 33.21 ms over two rounds
+against 32.52 and 33.51 for the level-0 build. FlashRT's own native runtime
+runs the same shape in 32.82 ms: the engine runs FlashRT's kernels at
+FlashRT's speed and matches its outputs bit for bit.
 
 ## 1. Requirements
 

@@ -209,14 +209,15 @@ no model semantics, so an Edge-LLM plugin can call it from its own shell. The
 kernels behind it are CUDA C++ with CUTLASS and ahead-of-time compiled CuTe
 DSL — the two forms Edge-LLM already builds with.
 
-What is worth taking, measured on Thor against TensorRT at the pi0.5 shapes
-(method and full tables in [tensorrt_ops.md](tensorrt_ops.md)):
+What is worth taking, measured on Thor against TensorRT at the shape the
+openpi tutorial's own engine runs — three camera slots and a 208-token prompt
+(method, both shapes and full tables in [tensorrt_ops.md](tensorrt_ops.md)):
 
 | FlashRT operator | what a TensorRT graph does instead | measured |
 |---|---|---|
-| `FlashrtNvfp4Mlp` — gate/up epilogue emits NVFP4, down GEMM consumes it | dense NVFP4/FP8 linear layers lower to Q/DQ around two GEMMs, so the hidden activation lands in fp16 | **1.32×** (encoder FFN, NVFP4 both sides), **1.06×** (SigLIP FFN, FP8 there) |
-| `FlashrtFa4Attention` — FlashAttention-4, head_dim 72 and head_dim 256 GQA | the `Attention` operator, or MatMul/Softmax/MatMul when the export does not use it | **1.71×** and **1.25×** against `Attention`; **3.29×** against the chain |
-| `FlashrtNvfp4Linear` — quantize then block-scaled GEMM | one GEMM with the quantization fused into its prologue | **0.94×** — TensorRT is ahead here, and this is the operator not to take |
+| `FlashrtNvfp4Mlp` — gate/up epilogue emits NVFP4, down GEMM consumes it | dense NVFP4/FP8 linear layers lower to Q/DQ around two GEMMs, so the hidden activation lands in fp16 | **1.41×** (encoder FFN, NVFP4 both sides), **1.09×** (SigLIP FFN, FP8 there) |
+| `FlashrtFa4Attention` — FlashAttention-4, head_dim 72 and head_dim 256 GQA | the `Attention` operator, or MatMul/Softmax/MatMul when the export does not use it | **1.72×** (head_dim 72) and **1.54×** (head_dim 256 GQA) against `Attention`; **3.48×** against the chain |
+| `FlashrtNvfp4Linear` — quantize then block-scaled GEMM | one GEMM with the quantization fused into its prologue | **1.08×** here, **0.94×** at the smaller deployment shape — the one operator where the two are close, and the one where an isolated boundary costs about what it saves |
 
 The last row is the useful one for deciding where a boundary belongs: an
 isolated quantized GEMM is already well served, and the gain is in what a
