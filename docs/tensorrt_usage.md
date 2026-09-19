@@ -27,8 +27,10 @@ pinned noise, cosine over the 7 action dimensions
 The observations are the calibration observations of both engines.
 
 The tutorial engine always computes three camera slots and a 208-token
-prompt; the FlashRT engine computes the unmasked cameras and the actual
-prompt, which is most of the difference above. At the tutorial engine's own
+prompt. The FlashRT engine above was exported for two cameras — the number
+LIBERO actually has — and takes the prompt as an input, so it computes the
+length the instruction has; neither engine detects anything at run time, and
+that shape difference is most of the gap above. At the tutorial engine's own
 shape the two are still 1.44x apart. Both engines built on this machine from
 their own ONNX with their own build command — the tutorial's
 `deployment_scripts/build_engine.sh` flags for theirs, `--builderOptimizationLevel=0`
