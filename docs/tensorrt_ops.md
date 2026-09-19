@@ -54,14 +54,25 @@ frt_nvfp4_pack_weight(w_fp16, packed, sfb, N, K, stream);
 ```
 
 `backends/tensorrt/tests/ops_parity.py` runs exactly that path on a weight
-FlashRT has never seen and checks the operator against an fp16 matmul: cosine
-0.991, which is what NVFP4 costs, not what the implementation costs.
+FlashRT has never seen: pack it, hand it to the operator, compare against an
+fp16 matmul. Cosine 0.991.
 
-Two optional inputs are accuracy refinements rather than requirements:
+That number is a floor, not the accuracy of anything shipped. It is one GEMM
+on random data with no per-channel scale, and it measures what four-bit
+weights cost at all. The accuracy that matters is measured on the model: with
+the scales pi0.5 calibrates, the whole policy's actions are cosine **0.99968**
+against PyTorch bf16 on eight LIBERO observations, against 0.99962 for the
+openpi Thor tutorial's own engine — see [tensorrt_usage.md](tensorrt_usage.md).
+The operators there are also bitwise equal to FlashRT (§7), so the encoding is
+the only thing between the two numbers.
+
+Two optional inputs are what closes that gap, and both are accuracy
+refinements rather than requirements:
 
 - `awq_inv_s` is a per-channel scale that moves quantization error off the
-  channels that matter. FlashRT's frontend derives it from observations; the
-  operators run without it, and pi0.5 uses it.
+  channels that matter. FlashRT's frontend derives it from observations, and
+  pi0.5 uses it everywhere it helps; the operators run without it, which is
+  the configuration the 0.991 above measures.
 - `norm_gamma` / `norm_beta` fold a normalization into the same pass. Without
   them the operator quantizes what it is given.
 

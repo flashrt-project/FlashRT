@@ -205,6 +205,10 @@ ok &= check(
 # A weight packed through the C ABI, with no FlashRT frontend anywhere: the
 # operator reads it and reproduces the matmul to NVFP4 accuracy. This is the
 # whole path a host needs to use the operators on its own weights.
+#
+# The cosine here is a floor: random data, one GEMM, no per-channel scale. It
+# says what four-bit weights cost, not what pi0.5 measures -- that is 0.99968
+# against PyTorch, with calibrated scales and the whole pipeline.
 N, K, M = 1024, 2048, 256
 w = (torch.randn(N, K, dtype=torch.float16, device=dev) * 0.05).contiguous()
 x = (torch.randn(M, K, dtype=torch.float16, device=dev) * 0.5).contiguous()
