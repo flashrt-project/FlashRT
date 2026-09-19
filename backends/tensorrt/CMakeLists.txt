@@ -87,11 +87,13 @@ target_compile_definitions(frt_kernels PRIVATE
 target_compile_options(frt_kernels PRIVATE -Xcompiler=-fvisibility=hidden --expt-relaxed-constexpr -O3
   --ftz=true --prec-div=false --prec-sqrt=false ${GENCODE})
 
-# Pi0.5 Thor native stages (csrc/stages/pi05_thor)
+# Model-free operator layer (kernels/frt_ops.h) and the Pi0.5 Thor native
+# stages (csrc/stages/pi05_thor); both call the same FlashRT kernels.
 add_library(pi05_stages OBJECT
   ${STAGES}/pi05_encoder_layer.cu ${STAGES}/pi05_decoder_step.cu ${STAGES}/pi05_siglip.cu
-  ${STAGES}/fa4_attention.cpp ${STAGES}/fa4_shims.c)
-target_include_directories(pi05_stages PUBLIC ${STAGES} ${C}/attention ${C} PRIVATE ${CUTLASS_INCLUDES})
+  ${STAGES}/fa4_attention.cpp ${STAGES}/fa4_shims.c
+  kernels/frt_ops.cu)
+target_include_directories(pi05_stages PUBLIC ${STAGES} ${C}/attention ${C} ${CMAKE_CURRENT_SOURCE_DIR}/kernels PRIVATE ${CUTLASS_INCLUDES})
 target_compile_definitions(pi05_stages PRIVATE CUTLASS_ENABLE_GDC_FOR_SM100=1 CUTLASS_ARCH_MMA_SM100_SUPPORTED=1)
 target_compile_options(pi05_stages PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr ${GENCODE}>)
 target_link_libraries(pi05_stages PUBLIC CUDA::cudart)
@@ -112,8 +114,9 @@ set(KERNEL_LIBS CUDA::cudart CUDA::cublas CUDA::cublasLt CUDA::cuda_driver)
 add_library(flashrt_trt_pi05 SHARED
   plugins/pi05_encoder_layer_plugin.cpp plugins/pi05_encoder_stage_plugin.cpp
   plugins/pi05_decoder_step_plugin.cpp plugins/pi05_decoder_plugin.cpp
-  plugins/pi05_siglip_plugin.cpp plugins/pi05_plugins.cpp ${KERNEL_OBJECTS})
-target_include_directories(flashrt_trt_pi05 PRIVATE ${STAGES} ${C} ${NVINFER_INCLUDE})
+  plugins/pi05_siglip_plugin.cpp plugins/ops/nvfp4_op_plugins.cpp
+  plugins/pi05_plugins.cpp ${KERNEL_OBJECTS})
+target_include_directories(flashrt_trt_pi05 PRIVATE ${STAGES} ${C} ${CMAKE_CURRENT_SOURCE_DIR}/kernels ${NVINFER_INCLUDE})
 target_link_libraries(flashrt_trt_pi05 PRIVATE ${NVINFER_LIB} ${KERNEL_LIBS})
 target_link_options(flashrt_trt_pi05 PRIVATE -Wl,--no-undefined)
 
