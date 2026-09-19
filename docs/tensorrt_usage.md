@@ -63,9 +63,34 @@ measured on the same checkpoint and the same build, is shape:
 
 4.7 ms of the tutorial's shape is padding: 195 language tokens that are not in
 the instruction. The remaining step down to 23.7 ms is the third camera slot,
-which LIBERO fills with zeros and masks off. Both are available to any engine
-that is built for the observation instead of for a fixed maximum, which is
-what this backend's exporter does.
+which LIBERO fills with zeros and masks off.
+
+Neither is a TensorRT limitation. The prompt length is an optimization profile:
+the tutorial's ONNX has a symbolic `seq_len`, and its build script pins that
+dimension to 208 in the minimum, the optimum and the maximum, so the engine
+always computes 208. Built with a range instead, one engine serves every
+length — this backend's prompt-dynamic export does that, and the time follows
+the prompt:
+
+| `lang_tokens` | prefix | median |
+|---|---|---|
+| 14 | 526 | 23.75 ms |
+| 32 | 544 | 25.61 ms |
+| 64 | 576 | 25.93 ms |
+| 128 | 640 | 26.38 ms |
+| 208 | 720 | 27.44 ms |
+| 256 | 768 | 27.52 ms |
+
+(Only the first row has `10 + tokens + 256 × cameras` a multiple of 8, which is
+worth about 1.8 ms on its own; the trend with length is the rest of the
+column.)
+
+The camera count is not a profile. It is a static dimension of the exported
+graph — nine image channels there, `[cameras, 224, 224, 3]` here — and
+`img_masks` masks attention rather than skipping work, so a static graph runs
+every slot it was exported with and discards the masked one. Serving two
+cameras from a three-slot engine costs three slots; the only way to spend two
+is to export for two.
 
 ## 1. Requirements
 
