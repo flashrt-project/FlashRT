@@ -4,17 +4,17 @@ FlashRT — Spark-X2.5-4B quickstart.
 
 Usage:
     python examples/spark_x25_quickstart.py \
-        --checkpoint /models/Spark-X2.5-4B-NVFP4 \
+        --checkpoint /models/Spark-X2.5-4B \
         --prompt "用一句话解释什么是量子纠缠。"
 
     # longer context, and a longer generation
     python examples/spark_x25_quickstart.py \
-        --checkpoint /models/Spark-X2.5-4B-NVFP4 \
+        --checkpoint /models/Spark-X2.5-4B \
         --max-seq 131072 --max-new-tokens 256
 
     # time it instead of reading it
     python examples/spark_x25_quickstart.py \
-        --checkpoint /models/Spark-X2.5-4B-NVFP4 --benchmark 128
+        --checkpoint /models/Spark-X2.5-4B --benchmark 128
 
 The decode loop is captured into one CUDA Graph and replayed, so the number
 `--benchmark` prints is steady-state TPOT (time per output token), not a cold

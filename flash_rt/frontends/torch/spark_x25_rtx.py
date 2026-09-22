@@ -12,7 +12,7 @@ drives are the separate ``flash_rt_sparkx25`` module (SM120 only) plus
 attention.
 
     from flash_rt.frontends.torch.spark_x25_rtx import SparkX25TorchFrontendRtx
-    fe = SparkX25TorchFrontendRtx("/models/Spark-X2.5-4B-NVFP4", max_seq=131072)
+    fe = SparkX25TorchFrontendRtx("/models/Spark-X2.5-4B", max_seq=131072)
     out = fe.generate(prompt_ids, max_new_tokens=128)
 
 The frontend is constructed directly rather than through ``load_model``:

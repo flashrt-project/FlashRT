@@ -29,12 +29,12 @@ frontend will not resolve.
 ```python
 from flash_rt.frontends.torch.spark_x25_rtx import SparkX25TorchFrontendRtx
 
-fe = SparkX25TorchFrontendRtx("/models/Spark-X2.5-4B-NVFP4", max_seq=131072)
+fe = SparkX25TorchFrontendRtx("/models/Spark-X2.5-4B", max_seq=131072)
 ```
 
 | argument | default | meaning |
 |---|---|---|
-| `checkpoint` | — | checkpoint directory; validated for 36 layers, head_dim 256, a 4:1 GQA group and a 512-token window |
+| `checkpoint` | — | **bf16** checkpoint directory, validated for 36 layers, head_dim 256, a 4:1 GQA group and a 512-token window. The NVFP4 packing is computed at load time by `flash_rt.models.spark_x25.weights.quantize_nvfp4`; no quantised artifact is shipped |
 | `max_seq` | `32768` | KV capacity and the largest position. Sizes the caches and **chooses the KV residency mode** (below) |
 | `prefill_cap` | `min(max_seq, 8192)` | largest single prefill forward; the prompt is walked in chunks of `prefill_chunk` |
 | `prefill_chunk` | `min(prefill_cap, 2048)` | rows per chunk. Sizes the activation working set and every sliding layer's linear cache |

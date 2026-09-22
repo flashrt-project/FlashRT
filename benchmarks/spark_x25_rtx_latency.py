@@ -9,7 +9,7 @@ The prompt is repeated text of the requested length. That is deliberate: this
 measures rate, not quality, so it must not depend on a corpus, and a decoder's
 cost is set by the number of keys, not by what they say.
 
-    python benchmarks/spark_x25_rtx_latency.py --checkpoint /models/Spark-X2.5-4B-NVFP4 \
+    python benchmarks/spark_x25_rtx_latency.py --checkpoint /models/Spark-X2.5-4B \
         --lengths 128,512,2048,32768,65536,131072,262144 --steps 128
 
 Each length constructs its own frontend, because ``max_seq`` sets both the KV
