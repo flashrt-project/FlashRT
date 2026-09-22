@@ -59,11 +59,18 @@ class SparkX25Runtime:
                  prefill_cap: int = 8192, device: str = "cuda",
                  prefill_chunk: int | None = None,
                  split_kv_sms: int | None = None,
-                 attn_impl: str = "native"):
+                 attn_impl: str = "native",
+                 attn_splits: int | None = None,
+                 attn_splits_slide: int | None = None):
         self.cfg = load_config(ckpt_dir)
         self.device = device
         self.max_seq = max_seq
         self.prefill_cap = prefill_cap
+        # Both split counts are partitions of a key range, so overriding them
+        # cannot change a result -- only the block count. `None` keeps the
+        # device-aware default chosen in `_alloc`.
+        self._attn_splits = attn_splits
+        self._attn_splits_slide = attn_splits_slide
         # Rows of the activation working set. Prefill walks the prompt in
         # chunks of this size and only the last chunk's logits are kept, so
         # this -- not `max_seq` -- is what sizes every activation buffer.
@@ -155,36 +162,40 @@ class SparkX25Runtime:
         self.attn_sum = zbuf(c.num_attention_heads, dtype=torch.float32)
         # Both are parallelism knobs, not correctness ones -- the split is a
         # partition of the key range and the combine is a sum, so neither can
-        # change a result. Measured on the 131k shape
-        # (scripts/attn_native_probe.py): the E4M3 pass 2 is
-        # memory-level-parallelism bound until ~256 splits there (1536 us at
-        # 64, 1134 at 128, 1008 at 256) and flat after that.
+        # change a result. The split count is not a monotone-in-context knob:
+        # the per-key segment has to be long enough to stream (so the count
+        # cannot be too small) but the combine reads nsplit x q_heads x head_dim
+        # partials per layer whatever the key count is (so it cannot be too
+        # large either).
         #
-        # But the count is a knob *in both directions*. The combine reads
-        # nsplit x q_heads x head_dim partials whatever the key count is, so a
-        # fixed 256 makes a 200-token prompt pay 4 MB of partial reads per
-        # layer. Sized to the context budget instead: one split per 512 keys.
-        # The split count is not a monotone-in-context knob with a single
-        # optimum: the per-key segment has to be long enough to stream (so the
-        # count cannot be too small) but the combine reads
-        # nsplit x q_heads x head_dim partials per layer whatever the key count
-        # is (so it cannot be too large either). Swept per length
-        # (scripts/attn_split_sweep.py), the optimum segment runs from ~16 keys
-        # at 512 to ~512 at 131k, which is close to one split per 32 tokens of
-        # budget, floored at 32 and capped at 256. The previous rule -- one
-        # split per 512 tokens -- was extrapolated from the 131k point alone and
-        # under-parallelised the middle by 2.5x: at klen 2048 it gave 8 splits
-        # for a measured 78.1 us where 64 gives 29.0, and at 8192, 16 for 157.9
-        # where 128 gives 61.7.
-        nsplit = min(256, max(32, self.max_seq // 32))
+        # The two rules below are per-part, because the optimum moves with the
+        # SM count. The 36-SM rule is the one the original sweeps picked
+        # (scripts/attn_split_sweep.py): one split per 32 tokens of budget,
+        # floored at 32 and capped at 256. Re-swept on a 170-SM 5090 (see
+        # docs/spark_x25_rtx.md), the optimum moves to one split per 128 tokens
+        # of budget, floored at 128 and capped at 1024; the capped-at-256 rule
+        # cost 18% at 128k and 51% at 1M there.
+        sm_count = int(torch.cuda.get_device_properties(
+            torch.cuda.current_device()).multi_processor_count)
+        if self._attn_splits is not None:
+            nsplit = int(self._attn_splits)
+        elif sm_count <= 64:
+            nsplit = min(256, max(32, self.max_seq // 32))
+        else:
+            nsplit = min(1024, max(128, self.max_seq // 128))
+        nsplit_cap = max(256, nsplit)
         self.attn_nsplit = nsplit
         # The sliding window is only W keys, but 8 splits gave it 8 blocks of
         # 64 threads -- 512 threads for 2 MB, which measured 794 us/token for
-        # 27 layers against a ~150 us floor. 32 is the balance point: 128 fixes
-        # the pass-2 side but the combine then costs more than it saves.
-        self.attn_nsplit_slide = 32
+        # 27 layers against a ~150 us floor. 32 is the balance point on the
+        # 36-SM part; on a 170-SM part the same 512-key window has only 64
+        # blocks across 32 splits, so 64 splits buys ~2% there.
+        if self._attn_splits_slide is not None:
+            self.attn_nsplit_slide = int(self._attn_splits_slide)
+        else:
+            self.attn_nsplit_slide = 32 if sm_count <= 64 else 64
         self.attn_nchunk = 16
-        self.attn_op = zbuf(256, c.num_attention_heads, c.head_dim,
+        self.attn_op = zbuf(nsplit_cap, c.num_attention_heads, c.head_dim,
                             dtype=torch.float32)
         self.o_accum = zbuf(128, c.num_attention_heads, 1, c.head_dim,
                             dtype=torch.float32)

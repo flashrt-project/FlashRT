@@ -72,7 +72,9 @@ class SparkX25TorchFrontendRtx:
 
     def __init__(self, checkpoint: str, *, max_seq: int = 32768,
                  prefill_cap: int | None = None, prefill_chunk: int | None = None,
-                 device: str = "cuda") -> None:
+                 device: str = "cuda",
+                 attn_splits: int | None = None,
+                 attn_splits_slide: int | None = None) -> None:
         self.checkpoint = checkpoint
         self.config = validate_spark_x25_checkpoint(checkpoint)
         self.max_seq = int(max_seq)
@@ -83,6 +85,8 @@ class SparkX25TorchFrontendRtx:
             prefill_cap=int(prefill_cap or min(self.max_seq, 8192)),
             prefill_chunk=prefill_chunk,
             device=device,
+            attn_splits=attn_splits,
+            attn_splits_slide=attn_splits_slide,
         )
         self._tokenizer = None
         self._prompt_len = 0
@@ -101,6 +105,16 @@ class SparkX25TorchFrontendRtx:
     def kv8_only(self) -> bool:
         """True when the full layers keep E4M3 alone (see the class docstring)."""
         return bool(self.runtime.kv8_only)
+
+    @property
+    def attn_splits(self) -> int:
+        """Full-layer decode KV split count baked into the captured graph."""
+        return int(self.runtime.attn_nsplit)
+
+    @property
+    def attn_splits_slide(self) -> int:
+        """Sliding-layer decode KV split count baked into the captured graph."""
+        return int(self.runtime.attn_nsplit_slide)
 
     # ── inference ────────────────────────────────────────────────────────
     def set_prompt(self, input_ids: torch.Tensor) -> torch.Tensor:
