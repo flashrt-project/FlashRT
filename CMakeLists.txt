@@ -878,7 +878,13 @@ endif()
 # ── Qwen3 SM120 fp8 prefill attention ──
 # Shared low-level sage2 fp8 code is compiled from a neutral Qwen3 object so
 # Qwen3 does not depend on FLASHRT_ENABLE_MOTUS. Runtime remains env-gated.
-if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
+# Its fmha entry statically allocates >48 KB of shared memory, which CUDA 13
+# accepts and older toolkits do not; the option lets a build that targets a
+# different model (Spark-X2.5, Qwen3.6) drop the group along with its bindings.
+option(FLASHRT_ENABLE_QWEN3_FP8_PREFILL
+       "Build Qwen3 SM120 FP8 prefill attention (sage2 + fmha)" ON)
+if((GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
+   AND FLASHRT_ENABLE_QWEN3_FP8_PREFILL)
   add_library(qwen3_prefill_sm120_obj OBJECT
     csrc/attention/sage2/sage2_attn_f8_raw.cu
     csrc/attention/fmha_fp8_causal_gqa_sm120.cu)
@@ -1984,7 +1990,8 @@ if(GPU_ARCH STREQUAL "110" OR GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121"
     ENABLE_DECODE_GEMV_M1=1)
 endif()
 
-if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
+if((GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
+   AND FLASHRT_ENABLE_QWEN3_FP8_PREFILL)
   target_sources(flash_rt_kernels PRIVATE
     $<TARGET_OBJECTS:qwen3_prefill_sm120_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE
