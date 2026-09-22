@@ -1389,6 +1389,47 @@ else()
   message(STATUS "MiniMax-Remover FP8/NVFP4 kernels: DISABLED")
 endif()
 
+# ── Spark-X2.5-4B (SM120) ────────────────────────────────────────────────
+#
+# The decode path for Spark-X2.5-4B: a two-pass attention over an E4M3 KV
+# cache, the KV writer (partial RoPE + E4M3 quantisation in one pass), the
+# boundary norm/quantiser, the per-head output gate, gproj, the device-side
+# position advance and the greedy argmax.
+#
+# A separate module rather than sources in flash_rt_kernels: this pipeline is
+# trained, validated and shipped as a unit (see docs/spark_x25_usage.md), so a
+# change here must not re-trigger the shared kernel build. Same reason the
+# MiniMax-Remover and Qwen3-VL modules are separate.
+#
+# sm_120 only: the KV cache is quantised to E4M3 with __nv_cvt_float_to_fp8 and
+# the softmax/score kernels assume the RTX shared-memory budget the tile sizes
+# were chosen against. The frontend refuses to resolve on any other arch.
+if(GPU_ARCH STREQUAL "120")
+  pybind11_add_module(flash_rt_sparkx25
+    csrc/spark_x25_bindings.cpp
+    csrc/kernels/spark_x25/spark_x25_kernels.cu)
+  set_target_properties(flash_rt_sparkx25 PROPERTIES
+    CUDA_STANDARD 17
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+  target_include_directories(flash_rt_sparkx25 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels)
+  target_compile_options(flash_rt_sparkx25 PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3
+      -U__CUDA_NO_HALF_OPERATORS__
+      -U__CUDA_NO_HALF2_OPERATORS__
+      -U__CUDA_NO_HALF_CONVERSIONS__
+      ${GPU_GENCODE}
+    >)
+  target_link_libraries(flash_rt_sparkx25 PRIVATE CUDA::cudart)
+  install(TARGETS flash_rt_sparkx25 LIBRARY DESTINATION flash_rt)
+  message(STATUS "Spark-X2.5-4B kernels: ENABLED (separate module flash_rt_sparkx25)")
+else()
+  message(STATUS "Spark-X2.5-4B kernels: DISABLED (sm_120 only)")
+endif()
+
 if(FLASHRT_BUILD_QWEN3_VL)
   # SM120 (RTX 5090): NVFP4/FP8 ViT helpers. SM89 (Ada): native FP8 block-128
   # GEMM/GEMV + fused act/norm-quant + QK norm-rope kernels for the official

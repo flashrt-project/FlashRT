@@ -103,6 +103,13 @@ def detect_arch() -> str:
 # drag in every backend. External plugins may add entries to this dict
 # to register new models — see ``docs/plugin_model_template.md``.
 _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
+    # ── Spark-X2.5-4B ──
+    # Discovery only, like qwen3_vl: this is a text decoder, not a VLA, so it is
+    # constructed directly rather than through load_model's wrapper. SM120 only
+    # -- the kernels build into a separate module gated on GPU_ARCH 120.
+    ("spark_x25", "torch", "rtx_sm120"):
+        ("flash_rt.frontends.torch.spark_x25_rtx", "SparkX25TorchFrontendRtx"),
+
     # ── Pi0.5 ──
     ("pi05", "torch", "thor"):
         ("flash_rt.frontends.torch.pi05_thor", "Pi05TorchFrontendThor"),

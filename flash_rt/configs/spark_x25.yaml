@@ -1,0 +1,43 @@
+# FlashRT — Spark-X2.5-4B configuration (metadata only).
+# The frontend (flash_rt/frontends/torch/spark_x25_rtx.py) and the pipeline
+# (flash_rt/models/spark_x25/pipeline_rtx.py) hold the source of truth for
+# shapes; this file is metadata for logging / registries.
+name: spark_x25
+family: spark
+frameworks: ["torch"]
+hardware: ["rtx_sm120"]
+
+model:
+  backbone: Spark-X2.5-4B
+  source: official_spark
+  license: Apache-2.0
+  parameters_billion: 4.1
+  hidden_size: 2560
+  num_hidden_layers: 36
+  num_attention_heads: 16
+  num_key_value_heads: 4
+  head_dim: 256
+  intermediate_size: 10240
+  vocab_size: 131072
+  max_position_embeddings: 1048576
+  tie_word_embeddings: true
+
+# 36 layers = 27 sliding_attention + 9 full_attention, one full layer every
+# fourth (indices 3, 7, ... 35). The sliding window is 512.
+attention:
+  pattern: "3 sliding : 1 full"
+  sliding_window: 512
+  sliding_layers: 27
+  full_layers: 9
+  rope:
+    full_attention:    {theta: 5000000.0, partial: 0.25}
+    sliding_attention: {theta: 10000.0,   partial: 1.0}
+
+precision:
+  weights: nvfp4            # W4A4, per-16-block UE4M3 scales
+  kv_cache: e4m3            # decode path; see docs/spark_x25_rtx.md for the modes
+
+runtime:
+  batch: 1
+  decode: cuda_graph        # whole loop captured and replayed
+  scale: single_gpu
