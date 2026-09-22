@@ -45,6 +45,19 @@ FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_bf16(
     int o_batch_stride, int o_row_stride, int o_head_stride,
     float softmax_scale, int num_sms, cudaStream_t stream);
 
+FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_bf16_window(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr,
+    void* softmax_lse_accum_ptr, void* o_accum_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int window_left, int window_right, int num_sms,
+    cudaStream_t stream);
+
 FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_bf16_seqused(
     const void* q_ptr, const void* k_ptr, const void* v_ptr,
     void* o_ptr, void* softmax_lse_ptr, const void* seqused_k_ptr,

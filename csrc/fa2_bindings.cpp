@@ -79,6 +79,34 @@ static auto make_fwd(Fn fn) {
     };
 }
 
+template <typename Fn>
+static auto make_fwd_window(Fn fn) {
+    return [fn](uintptr_t Q, uintptr_t K, uintptr_t V,
+                uintptr_t O, uintptr_t softmax_lse,
+                uintptr_t softmax_lse_accum, uintptr_t o_accum,
+                int batch, int seqlen_q, int seqlen_k,
+                int num_heads_q, int num_heads_kv, int head_dim,
+                py::tuple q_strides, py::tuple k_strides,
+                py::tuple v_strides, py::tuple o_strides,
+                float softmax_scale, int window_left, int window_right,
+                int num_sms, uintptr_t stream) {
+        fn(reinterpret_cast<const void*>(Q),
+           reinterpret_cast<const void*>(K),
+           reinterpret_cast<const void*>(V),
+           reinterpret_cast<void*>(O),
+           reinterpret_cast<void*>(softmax_lse),
+           reinterpret_cast<void*>(softmax_lse_accum),
+           reinterpret_cast<void*>(o_accum),
+           batch, seqlen_q, seqlen_k,
+           num_heads_q, num_heads_kv, head_dim,
+           py::cast<int>(q_strides[0]), py::cast<int>(q_strides[1]), py::cast<int>(q_strides[2]),
+           py::cast<int>(k_strides[0]), py::cast<int>(k_strides[1]), py::cast<int>(k_strides[2]),
+           py::cast<int>(v_strides[0]), py::cast<int>(v_strides[1]), py::cast<int>(v_strides[2]),
+           py::cast<int>(o_strides[0]), py::cast<int>(o_strides[1]), py::cast<int>(o_strides[2]),
+           softmax_scale, window_left, window_right, num_sms, to_stream(stream));
+    };
+}
+
 
 // seqused variant: same as make_fwd but with a device seqused_k pointer and no
 // splitkv accum args (num_splits is forced to 1 inside the entry).
@@ -178,6 +206,20 @@ PYBIND11_MODULE(flash_rt_fa2, m) {
         py::arg("q_strides"), py::arg("k_strides"),
         py::arg("v_strides"), py::arg("o_strides"),
         py::arg("softmax_scale") = 1.0f,
+        py::arg("num_sms") = 0,
+        py::arg("stream") = 0,
+        kDocstring);
+
+m.def("fwd_bf16_window", make_fwd_window(&fvk_attention_fa2_fwd_bf16_window),
+        py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),
+        py::arg("softmax_lse_accum") = 0, py::arg("o_accum") = 0,
+        py::arg("batch"), py::arg("seqlen_q"), py::arg("seqlen_k"),
+        py::arg("num_heads_q"), py::arg("num_heads_kv"), py::arg("head_dim"),
+        py::arg("q_strides"), py::arg("k_strides"),
+        py::arg("v_strides"), py::arg("o_strides"),
+        py::arg("softmax_scale") = 1.0f,
+      py::arg("window_left") = -1,
+      py::arg("window_right") = -1,
         py::arg("num_sms") = 0,
         py::arg("stream") = 0,
         kDocstring);

@@ -77,7 +77,7 @@ static void fill_params(
     int k_batch_stride, int k_row_stride, int k_head_stride,
     int v_batch_stride, int v_row_stride, int v_head_stride,
     int o_batch_stride, int o_row_stride, int o_head_stride,
-    float softmax_scale)
+    float softmax_scale, int window_left = -1, int window_right = -1)
 {
     params = {};
     params.is_bf16 = elem_is_bf16;
@@ -128,8 +128,10 @@ static void fill_params(
     params.scale_softmax_rp_dropout = softmax_scale;
 
     params.is_causal = false;
-    params.window_size_left = -1;
-    params.window_size_right = -1;
+    // A bounded past is a local mask: Is_local is enabled by
+    // LOCAL_SWITCH whenever window_size_* >= 0 and !Is_causal.
+    params.window_size_left = window_left;
+    params.window_size_right = window_right;
 
     params.alibi_slopes_ptr = nullptr;
     params.alibi_slopes_batch_stride = 0;
@@ -257,6 +259,36 @@ extern "C" void NAME(                                                           
     dispatch_hdim<ELEM_T>(head_dim, num_splits, params, stream);                 \
 }
 
+#define DEFINE_FA2_ENTRY_WINDOW(NAME, ELEM_T, IS_BF16)                                  \
+extern "C" void NAME(                                                            \
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,                     \
+    void* o_ptr, void* softmax_lse_ptr,                                          \
+    void* softmax_lse_accum_ptr, void* o_accum_ptr,                              \
+    int batch, int seqlen_q, int seqlen_k,                                       \
+    int num_heads_q, int num_heads_kv, int head_dim,                             \
+    int q_batch_stride, int q_row_stride, int q_head_stride,                     \
+    int k_batch_stride, int k_row_stride, int k_head_stride,                     \
+    int v_batch_stride, int v_row_stride, int v_head_stride,                     \
+    int o_batch_stride, int o_row_stride, int o_head_stride,                     \
+    float softmax_scale, int window_left, int window_right,                      \
+    int num_sms, cudaStream_t stream)                                    \
+{                                                                                \
+    FLASH_NAMESPACE::Flash_fwd_params params;                                    \
+    fill_params(params, IS_BF16,                                                 \
+                q_ptr, k_ptr, v_ptr, o_ptr, softmax_lse_ptr,                     \
+                batch, seqlen_q, seqlen_k,                                       \
+                num_heads_q, num_heads_kv, head_dim,                             \
+                q_batch_stride, q_row_stride, q_head_stride,                     \
+                k_batch_stride, k_row_stride, k_head_stride,                     \
+                v_batch_stride, v_row_stride, v_head_stride,                     \
+                o_batch_stride, o_row_stride, o_head_stride,                     \
+                softmax_scale, window_left, window_right);                       \
+    int num_splits = setup_splitkv(params, softmax_lse_accum_ptr, o_accum_ptr,   \
+                                    num_sms, seqlen_q, seqlen_k,                 \
+                                    head_dim, batch, num_heads_q);               \
+    dispatch_hdim<ELEM_T>(head_dim, num_splits, params, stream);                 \
+}
+
 // ──────────────────────────────────────────────────────────────
 // Entry symbols. Each dtype is guarded by an FA2_HAS_{FP16,BF16}
 // macro set from CMake via FA2_DTYPES. If a dtype was dropped to
@@ -288,6 +320,7 @@ DEFINE_FA2_STUB(fvk_attention_fa2_fwd_fp16,  "fp16")
 
 #ifdef FA2_HAS_BF16
 DEFINE_FA2_ENTRY(fvk_attention_fa2_fwd_bf16, cutlass::bfloat16_t, true)
+DEFINE_FA2_ENTRY_WINDOW(fvk_attention_fa2_fwd_bf16_window, cutlass::bfloat16_t, true)
 
 // seqused_k variant: K/V length is read per-batch from device memory
 // (seqused_k[b]); the kernel clamps n_block_max to that length and early-exits.

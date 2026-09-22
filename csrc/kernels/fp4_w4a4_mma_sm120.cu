@@ -685,6 +685,289 @@ __global__ void full_n_kernel(
   }
 }
 
+// ── Gated GeGLU epilogue helpers (this patch) ────────────────────────────────
+// Reproduced from csrc/kernels/nvfp4_convert.cuh so the bytes match the shipped
+// quantizers exactly.
+__device__ __forceinline__ uint8_t g_float_to_fp4_e2m1(float v) {
+  uint8_t sign = (v < 0.0f) ? 0x8u : 0x0u;
+  float a = fabsf(v);
+  uint8_t mag;
+  if      (a < 0.25f) mag = 0;
+  else if (a < 0.75f) mag = 1;
+  else if (a < 1.25f) mag = 2;
+  else if (a < 1.75f) mag = 3;
+  else if (a < 2.5f)  mag = 4;
+  else if (a < 3.5f)  mag = 5;
+  else if (a < 5.0f)  mag = 6;
+  else                mag = 7;
+  return sign | mag;
+}
+
+__device__ __forceinline__ uint8_t g_float_to_ue4m3_ceil(float v) {
+  if (v <= 0.0f) return 0;
+  if (v > 240.0f) return 0xFE;
+  uint32_t bits = __float_as_uint(v);
+  int float_exp = ((bits >> 23) & 0xFF) - 127;
+  uint32_t frac = bits & 0x7FFFFF;
+  int ue_exp = float_exp + 7;
+  if (ue_exp <= 0) {
+    float scaled = v * 512.0f;
+    int m = (int)ceilf(scaled);
+    if (m > 7) return (1 << 3) | 0;
+    if (m < 1) m = 1;
+    return (uint8_t)m;
+  }
+  if (ue_exp >= 15) return 0xFE;
+  int m = (int)(frac >> 20);
+  if (frac & 0xFFFFF) m++;
+  if (m >= 8) { m = 0; ue_exp++; }
+  if (ue_exp >= 15) return 0xFE;
+  return (uint8_t)((ue_exp << 3) | m);
+}
+
+__device__ __forceinline__ float g_ue4m3_to_float(uint8_t v) {
+  int e = (v >> 3) & 0xF;
+  int m = v & 0x7;
+  if (e == 0) return ldexpf((float)m / 8.0f, -6);
+  return ldexpf(1.0f + (float)m / 8.0f, e - 7);
+}
+
+// torch's GELU is the exact erf form, not the tanh approximation.
+__device__ __forceinline__ float g_gelu_f32(float x) {
+  return 0.5f * x * (1.0f + erff(x * 0.70710678118654752440f));
+}
+
+constexpr int S3G_WARPS_PER_BLOCK = 4;
+constexpr int S3G_THREADS_PER_BLOCK = S3G_WARPS_PER_BLOCK * 32;
+constexpr int S3G_PAIRS_PER_BLOCK = S3G_WARPS_PER_BLOCK * 4;   // = 16
+constexpr int S3G_COLS_PER_BLOCK = S3G_WARPS_PER_BLOCK * 8;    // = 32
+static_assert(S3G_PAIRS_PER_BLOCK == 16, "one block must cover one SF block");
+
+__global__ void full_n_gated_geglu_kernel(
+    const uint8_t* __restrict__ A_packed,    // (K/2,)
+    const uint8_t* __restrict__ B_packed,    // (N, K/2)
+    const uint8_t* __restrict__ SFA,         // (K/16,)
+    const uint8_t* __restrict__ SFB,         // (N, K/16)
+    uint8_t* __restrict__ D_packed,          // (N/2,)
+    uint8_t* __restrict__ SFD,               // swizzled, row 0
+    float alpha,
+    int N, int K) {
+  // Double-buffered A / B / SFA / SFB (per warp; kt%2 selects buffer).
+  // Per-warp A / SFA. Each warp drives its own cp.async pipeline, so a
+  // block-level copy would be overwritten under a neighbour's reads.
+  __shared__ alignas(16) uint8_t s_A_all[2][S3G_WARPS_PER_BLOCK][16 * 32];
+  __shared__ alignas(16) uint8_t s_SFA_all[2][S3G_WARPS_PER_BLOCK][16 * 4];
+  __shared__ alignas(16) uint8_t s_B_all[2][
+      S3G_WARPS_PER_BLOCK * 8 * 32];
+  __shared__ alignas(16) uint8_t s_SFB_all[2][
+      S3G_WARPS_PER_BLOCK * 8 * 4];
+
+  int tid = threadIdx.x;
+  int warp = tid >> 5;
+  int lane = tid & 31;
+
+  int block_n_off = blockIdx.x * S3G_COLS_PER_BLOCK;
+  int my_n_off = block_n_off + warp * S3_COLS_PER_WARP;
+  if (my_n_off >= N) return;
+
+  int t0 = lane & 3;
+  int t1 = lane >> 2;
+  int sfa_unique_row = (lane & 1) * 8 + (lane >> 2);
+  int sfb_unique_col = lane >> 2;
+
+  float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
+
+  const int K_iters = K / 64;
+  const int K_half = K / 2;
+  const int K_sf = K / 16;
+
+  // Pre-zero the high rows of s_A and s_SFA in BOTH double-buffer
+  // banks (constant for the kernel's lifetime per M=1 padding).
+  if (lane < 16) {
+    int row = lane;
+    if (row >= 1 && row <= 15) {
+      int4* a0_v = reinterpret_cast<int4*>(s_A_all[0][warp]);
+      int4* a1_v = reinterpret_cast<int4*>(s_A_all[1][warp]);
+      int4 z; z.x = 0; z.y = 0; z.z = 0; z.w = 0;
+      a0_v[row * 2 + 0] = z; a0_v[row * 2 + 1] = z;
+      a1_v[row * 2 + 0] = z; a1_v[row * 2 + 1] = z;
+    }
+  }
+  if (lane < 4) {
+    // SFA bytes 4..63 (rows 1..15) → zero in both banks.
+    for (int i = 4 + lane; i < 64; i += 4) {
+      s_SFA_all[0][warp][i] = 0;
+      s_SFA_all[1][warp][i] = 0;
+    }
+  }
+
+  // SFA / SFB swizzle parameters. The loader stores both SFs in the
+  // SM120 NVFP4 SF swizzle layout produced by
+  // `nvfp4_sf_linear_to_swizzled` (csrc/quantize/) — same scheme the
+  // SIMT matvec kernel decodes in
+  // csrc/kernels/fp4_w4a4_matvec_sm120.cu.
+  //
+  // For a single (M=1) NVFP4 GEMM:
+  //   K_blocks = K / 16   (number of 16-K-element SF groups)
+  //   n_col_super = (K_blocks + 3) / 4
+  //
+  // For row r at K-group b, the swizzled byte offset is:
+  //   rb = r >> 7;   ri = r & 127
+  //   cb = b >> 2;   ci = b & 3
+  //   super_idx = rb * n_col_super + cb
+  //   inner_off = (ri & 31) * 16 + ((ri >> 5) & 3) * 4 + ci
+  //   off       = super_idx * 512 + inner_off
+  //
+  // Critical property: within ONE of our K-tiles (= 64 K, = 4
+  // K-groups), all 4 K-groups share the same `cb = kt` because
+  // K-tile kt covers K-blocks {kt*4, kt*4+1, kt*4+2, kt*4+3}. So
+  // ci varies 0..3 and inner_off is contiguous. The 4 SF bytes for
+  // one row × one K-tile are 4 CONSECUTIVE bytes in the swizzled
+  // table — readable as one uint32.
+  const int K_blocks = K / 16;
+  const int n_col_super = (K_blocks + 3) / 4;
+
+  // ── Per-tile async load helper (lambda, captures by reference) ──
+  // Issues cp.async loads for K-tile `kt` into buffer `buf`.
+  // After all calls, caller issues cp_async_commit_group().
+  auto issue_async_load = [&](int buf, int kt) {
+    int byte_off = kt * 32;
+    // A row 0: 32 bytes = 8 uint32. Lanes 0..7.
+    if (lane < 8) {
+      cp_async_4(s_A_all[buf][warp] + lane * 4, A_packed + byte_off + lane * 4);
+    }
+    // SFA row 0: 4 bytes (one per K-group in this K-tile). Swizzled.
+    // For row 0: rb=0, ri=0, super_idx = 0 + kt, inner_off = 0..3 (ci).
+    // 4 consecutive bytes at SFA + kt*512.
+    if (lane == 0) {
+      cp_async_4(s_SFA_all[buf][warp] + 0, SFA + kt * 512);
+    }
+    // B (per-warp): 8 cols × 32 bytes = 64 uint32. 32 lanes × 2 each.
+    {
+      uint8_t* my_s_B = s_B_all[buf] + warp * (8 * 32);
+      for (int c = 0; c < 2; ++c) {
+        int chunk = lane + c * 32;
+        int col = chunk >> 3;
+        int off = chunk & 7;
+        cp_async_4(
+            my_s_B + chunk * 4,
+            B_packed + (my_n_off + col) * K_half + byte_off + off * 4);
+      }
+    }
+    // SFB (per-warp): 8 cols × 4 SF bytes. Swizzled — for col c at
+    // K-tile kt, the 4 bytes are at (rb*n_col_super + kt)*512 +
+    // ri-derived inner_off. ci = 0..3 gives 4 consecutive bytes.
+    if (lane < 8) {
+      uint8_t* my_s_SFB = s_SFB_all[buf] + warp * (8 * 4);
+      int col = my_n_off + lane;
+      int rb = col >> 7;
+      int ri = col & 127;
+      int super_idx = rb * n_col_super + kt;
+      int inner_base = (ri & 31) * 16 + ((ri >> 5) & 3) * 4;
+      cp_async_4(
+          my_s_SFB + lane * 4,
+          SFB + super_idx * 512 + inner_base);
+    }
+  };
+
+  // ── Prologue: prime both double-buffer banks ──
+  issue_async_load(0, 0);
+  cp_async_commit_group();
+  if (K_iters > 1) {
+    issue_async_load(1, 1);
+    cp_async_commit_group();
+  }
+
+  // ── Main loop ──
+  // At loop entry for kt, we need buf[kt%2] ready. The cp.async
+  // wait pattern: after each iter's MMA, issue load for kt+2 (the
+  // far-future tile reusing the just-consumed buffer), then wait
+  // until ≤ 1 group is pending → guarantees buf[(kt+1)%2] is ready.
+  for (int kt = 0; kt < K_iters; ++kt) {
+    int curr_buf = kt & 1;
+
+    // Wait for current buf to be ready.
+    // Pending groups at loop entry:
+    //   kt = 0: prologue committed K_iters>1 ? 2 : 1 groups
+    //   kt > 0: prev iter committed at most 1 new group
+    // We want to wait until current buf ready = wait until ≤ 1
+    // pending (the future tile, if any) for kt < K_iters-2,
+    // or until 0 pending for the last tile.
+    if (kt + 1 < K_iters) {
+      cp_async_wait_group(1);
+    } else {
+      cp_async_wait_group(0);
+    }
+    __syncwarp();
+
+    // Compose fragments + MMA on current buf.
+    uint32_t a0 = fast_load_a(s_A_all[curr_buf][warp], t0, t1, 0);
+    uint32_t a1 = fast_load_a(s_A_all[curr_buf][warp], t0, t1, 1);
+    uint32_t a2 = fast_load_a(s_A_all[curr_buf][warp], t0, t1, 2);
+    uint32_t a3 = fast_load_a(s_A_all[curr_buf][warp], t0, t1, 3);
+    uint8_t* my_s_B = s_B_all[curr_buf] + warp * (8 * 32);
+    uint8_t* my_s_SFB = s_SFB_all[curr_buf] + warp * (8 * 4);
+    uint32_t b0 = fast_load_b(my_s_B, t0, t1, 0);
+    uint32_t b1 = fast_load_b(my_s_B, t0, t1, 1);
+    uint32_t sfa = fast_load_sfa(s_SFA_all[curr_buf][warp], sfa_unique_row);
+    uint32_t sfb = fast_load_sfb(my_s_SFB, sfb_unique_col);
+
+    float d0, d1, d2, d3;
+    AtomType::fma(d0, d1, d2, d3,
+                  a0, a1, a2, a3,
+                  b0, b1,
+                  c0, c1, c2, c3,
+                  sfa, sfb);
+    c0 = d0; c1 = d1; c2 = d2; c3 = d3;
+
+    // Issue load for kt+2 (recycle curr_buf since we're done with it).
+    if (kt + 2 < K_iters) {
+      issue_async_load(curr_buf, kt + 2);
+      cp_async_commit_group();
+    }
+  }
+
+  // Gated epilogue: lane (q==0, r) owns the interleaved pair
+  // (my_n_off+2r, my_n_off+2r+1) = (gate, up) for one intermediate index.
+  __shared__ float s_gate[S3G_PAIRS_PER_BLOCK];
+  __shared__ float s_up[S3G_PAIRS_PER_BLOCK];
+  int q = lane >> 2;
+  int r = lane & 3;
+  if (q == 0) {
+    // bf16-round the accumulators first: the shipped path writes bf16 to HBM
+    // and the activation kernel reads it back, so the rounding is part of the
+    // contract, not an optimization.
+    s_gate[warp * 4 + r] = __bfloat162float(__float2bfloat16(c0 * alpha));
+    s_up[warp * 4 + r]   = __bfloat162float(__float2bfloat16(c1 * alpha));
+  }
+  __syncthreads();
+
+  // gelu(gate) -> bf16, times up -> bf16, exactly as the two-kernel path does.
+  for (int i = threadIdx.x; i < S3G_PAIRS_PER_BLOCK; i += blockDim.x) {
+    __nv_bfloat16 gelu_bf = __float2bfloat16(g_gelu_f32(s_gate[i]));
+    s_gate[i] = __bfloat162float(
+        __float2bfloat16(__bfloat162float(gelu_bf) * s_up[i]));
+  }
+  __syncthreads();
+
+  // One block covers exactly one 16-element NVFP4 block, so the amax reduction
+  // is block-local. The row is 0, so the swizzled SF index collapses to
+  // (blk/4)*512 + (blk%4).
+  float amax = 0.0f;
+  for (int i = 0; i < S3G_PAIRS_PER_BLOCK; ++i) amax = fmaxf(amax, fabsf(s_gate[i]));
+  const uint8_t ue = g_float_to_ue4m3_ceil(amax / 6.0f);
+  const float scale = g_ue4m3_to_float(ue);
+  const float inv = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+  const int half = S3G_PAIRS_PER_BLOCK >> 1;
+  for (int p = threadIdx.x; p < half; p += blockDim.x) {
+    float v0 = s_gate[2 * p] * inv;
+    float v1 = s_gate[2 * p + 1] * inv;
+    D_packed[(size_t)blockIdx.x * half + p] =
+        (uint8_t)((g_float_to_fp4_e2m1(v1) << 4) | (g_float_to_fp4_e2m1(v0) & 0x0F));
+  }
+  if (threadIdx.x == 0) SFD[(blockIdx.x / 4) * 512 + (blockIdx.x % 4)] = ue;
+}
+
 }  // namespace
 
 // ── Host dispatch ─────────────────────────────────────────────────
@@ -756,6 +1039,36 @@ int fp4_w4a4_mma_sm120_full_n_bf16out(
       reinterpret_cast<const uint8_t*>(SFA),
       reinterpret_cast<const uint8_t*>(SFB),
       reinterpret_cast<__nv_bfloat16*>(D_bf16),
+      alpha, N, K);
+  return 0;
+}
+
+// Gated GeGLU twin of fp4_w4a4_mma_sm120_full_n_bf16out. `B_packed` holds the
+// INTERLEAVED gate/up weight, so N is twice the intermediate width and the
+// output is N/2 gated values already packed to NVFP4 with swizzled scales.
+int fp4_w4a4_mma_sm120_gated_geglu_fp4out(
+    const void* A_packed,
+    const void* B_packed,
+    void*       D_packed,
+    void*       SFD,
+    const void* SFA,
+    const void* SFB,
+    float       alpha,
+    int N, int K,
+    cudaStream_t stream) {
+  if (!A_packed || !B_packed || !D_packed || !SFD || !SFA || !SFB) return 1;
+  if (K <= 0 || (K % 64) != 0) return 2;
+  if (N <= 0 || (N % S3G_PAIRS_PER_BLOCK) != 0) return 3;
+
+  dim3 block(S3G_THREADS_PER_BLOCK);
+  dim3 grid(N / S3G_PAIRS_PER_BLOCK);
+  full_n_gated_geglu_kernel<<<grid, block, 0, stream>>>(
+      reinterpret_cast<const uint8_t*>(A_packed),
+      reinterpret_cast<const uint8_t*>(B_packed),
+      reinterpret_cast<const uint8_t*>(SFA),
+      reinterpret_cast<const uint8_t*>(SFB),
+      reinterpret_cast<uint8_t*>(D_packed),
+      reinterpret_cast<uint8_t*>(SFD),
       alpha, N, K);
   return 0;
 }

@@ -104,5 +104,20 @@ int fp4_w4a4_mma_sm120_full_n_bf16out(
     float        alpha,
     cudaStream_t stream);
 
+// Gated GeGLU twin: `B_packed` holds the INTERLEAVED gate/up weight, so
+// N is twice the intermediate width; D_packed/SFD are the packed gated
+// activation. Purely additive; the shipped entry is unchanged.
+int fp4_w4a4_mma_sm120_gated_geglu_fp4out(
+    const void*  A_packed,
+    const void*  B_packed,
+    void*        D_packed,
+    void*        SFD,
+    const void*  SFA,
+    const void*  SFB,
+    float        alpha,
+    int          N,
+    int          K,
+    cudaStream_t stream);
+
 }  // namespace gemm
 }  // namespace flash_rt
