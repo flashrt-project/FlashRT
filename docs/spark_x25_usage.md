@@ -95,9 +95,16 @@ Measured on one RTX 5060 Ti 16 GB (SM120), batch 1, repeated-text prompt,
 
 ## Known limits
 
-- **SM120 only.** The module is gated on `GPU_ARCH=120`; the tile sizes were
-  chosen against that part's shared-memory budget and the KV writer quantises
-  with `__nv_cvt_float_to_fp8`.
+- **SM120 only, and tuned on a 36-SM part.** The module is gated on
+  `GPU_ARCH=120`; the KV writer quantises with `__nv_cvt_float_to_fp8`, and the
+  attention tile size, the KV split count and the decode GEMM's warp/stage
+  configuration were all chosen against a 36-SM, 16 GB part (RTX 5060 Ti). A
+  wider SM120 part -- a 5090 has 170 SMs -- runs the same code but leaves
+  tuning on the table: the split count is capped at 256, the scores grid at 512
+  context is only 64 blocks, and `_DECODE_SPLIT` in
+  `flash_rt/models/spark_x25/pipeline_rtx.py` is a per-shape table swept on the
+  36-SM card. Re-sweeping those three is the first thing to do on a different
+  part; see the context-scaling note in `docs/spark_x25_rtx.md`.
 - **Batch 1.** The capture is one query row wide. A batch would need a second
   capture at that batch.
 - **No speculative decoding.** The checkpoint has no MTP or draft head and

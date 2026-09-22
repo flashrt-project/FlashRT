@@ -161,6 +161,28 @@ trick (one batch element per query), which is exact but makes each query re-read
 its whole window: on a 2263-token prompt the 27 sliding layers then move ~128 GB
 of K/V and take 594 ms of a 660-680 ms TTFT.
 
+## Scaling to a wider SM120 part
+
+The step is a weight stream (2.31 GB/token) plus 9 full layers' KV read, and at
+short context the weight stream dominates: on the 5060 Ti it is 6.02 of the
+7.03 ms step, running at 384 GB/s against that part's 425.8 GB/s ceiling. The
+remaining 1.01 ms is launches, norms, the KV write, the gate and the argmax --
+**none of which shrink with a faster GPU**.
+
+So on a part with more bandwidth the step does not scale with it. Extrapolating
+from the measured decomposition to a 5090's ~1792 GB/s:
+
+| GEMM efficiency | step | decode |
+|---|---|---|
+| 100% | 2.30 ms | 435 tok/s |
+| 90% (what this card reaches) | 2.44 ms | 409 tok/s |
+| 70% | 2.85 ms | 351 tok/s |
+
+The fixed 1.01 ms caps the step at ~989 tok/s even with free bandwidth, and at
+short context it is 35% of a 5090-class step. Anything that is still tuned for
+36 SMs is therefore worth more there than it was here: the split count (capped
+at 256), the attention tile, and `_DECODE_SPLIT`'s per-shape warp/stage table.
+
 ## Scope
 
 Batch 1, SM120, greedy only. No speculative decoding — see above for why that is
