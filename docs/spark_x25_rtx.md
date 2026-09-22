@@ -161,16 +161,65 @@ trick (one batch element per query), which is exact but makes each query re-read
 its whole window: on a 2263-token prompt the 27 sliding layers then move ~128 GB
 of K/V and take 594 ms of a 660-680 ms TTFT.
 
-## Scaling to a wider SM120 part
+## A wider SM120 part: RTX 5090
 
-The step is a weight stream (2.31 GB/token) plus 9 full layers' KV read, and at
-short context the weight stream dominates: on the 5060 Ti it is 6.02 of the
-7.03 ms step, running at 384 GB/s against that part's 425.8 GB/s ceiling. The
-remaining 1.01 ms is launches, norms, the KV write, the gate and the argmax --
-**none of which shrink with a faster GPU**.
+The same code on one RTX 5090 (32 GB, 170 SMs, CUDA 12.8), same repeated-text
+prompt and 128-step captured graph (`benchmarks/spark_x25_rtx_latency.py`):
 
-So on a part with more bandwidth the step does not scale with it. Extrapolating
-from the measured decomposition to a 5090's ~1792 GB/s:
+| prompt ctx | 128 | 512 | 2 048 | 8 k | 32 k | 128 k | 512 k | 1 M |
+|---|---|---|---|---|---|---|---|---|
+| KV mode | bf16+E4M3 | bf16+E4M3 | bf16+E4M3 | bf16+E4M3 | bf16+E4M3 | bf16+E4M3 | E4M3 only | E4M3 only |
+| full-layer split | 128 | 128 | 128 | 128 | 257 | 1 024 | 1 024 | 1 024 |
+| TTFT ms | 5.7* | 8.7* | 27.7 | 131 | 878 | 9 208 | 131 108 | 511 961 |
+| decode tok/s | 360.6 | 354.7 | 347.0 | 319.0 | 276.7 | 198.7 | 95.4 | 56.4 |
+
+\* Warm median; the benchmark's single cold first prefill of a fresh process
+reports 16-63 ms there. Below ~8k the whole prompt is one prefill chunk, so
+TTFT is fixed-cost bound and not a throughput reading; from 8k up it is the
+benchmark's own number. 1M is the checkpoint's native maximum and fits in 32 GB
+(E4M3-only KV, ~30.4 GB peak).
+
+At short context the step is a weight stream (2.31 GB/token) plus 9 full layers'
+KV read. Both stream at the DRAM limit when the decode GEMMs run alone: a plain
+2-stream bf16 copy reaches **1 527 GB/s** here (nominal 1 792), and the isolated
+`lm_head` decode GEMM -- the one DRAM-resident shape at 167 MB -- reaches
+**1 635 GB/s**. The measured short-context 360 tok/s (2.777 ms) lands between
+the extrapolation table's 70% and 90% rows below, so the weight-bound end is
+behaving as predicted. What was *not* at speed was the KV attention.
+
+### The split count is a per-part knob
+
+The 36-SM rule above (one split per 32 tokens of budget, capped at 256)
+under-parallelises a 170-SM part. The split count is a partition of the key
+range and the combine is a sum, so re-sweeping it changes no arithmetic --
+only the block count. Swept per length on the 5090:
+
+| klen | optimum nsplit | tok/s at optimum | capped-256 tok/s |
+|---:|---:|---:|---:|
+| 8 192 | 256 | 321.6 | 321.6 |
+| 32 768 | 512 | 280.9 | 272.8 |
+| 131 072 | 768 | 197.6 | 167.1 |
+| 524 288 | 1 024 | 95.0 | 66.9 |
+| 1 048 576 | 1 024 | 56.3 | 37.3 |
+
+The cap cost **19% at 128k and 51% at 1M**. The default now scales with the
+part -- `min(1024, max(128, max_seq // 128))` on >64-SM parts, the 36-SM rule
+kept unchanged below that -- and the sliding-window split moves 32 -> 64 (a
+512-key window leaves most of a 170-SM part idle at 32 blocks). End to end on
+the same benchmark, before -> after the change:
+
+| ctx | 128 | 512 | 2 048 | 8 k | 32 k | 128 k | 512 k | 1 M |
+|---|---|---|---|---|---|---|---|---|
+| before | 360.1 | 345.8 | 336.7 | 320.3 | 272.4 | 167.3 | 67.0 | 37.4 |
+| after | 360.6 | 354.7 | 347.0 | 319.0 | 276.7 | 198.7 | 95.4 | 56.4 |
+| | +0% | **+3%** | **+3%** | -0% | +2% | **+19%** | **+42%** | **+51%** |
+
+After tuning the 1M step moves 21.6 GB in 17.73 ms = **1 218 GB/s**, 80% of the
+measured copy ceiling, against 808 GB/s before. The remaining long-context gap
+is the E4M3 load path (SM-side instruction throughput, not DRAM) and the
+attention tile; at short context it is the fixed ~1.4 ms of launches, norms, KV
+write, gate and argmax that caps a 5090-class step at ~989 tok/s even with free
+bandwidth:
 
 | GEMM efficiency | step | decode |
 |---|---|---|
@@ -178,10 +227,8 @@ from the measured decomposition to a 5090's ~1792 GB/s:
 | 90% (what this card reaches) | 2.44 ms | 409 tok/s |
 | 70% | 2.85 ms | 351 tok/s |
 
-The fixed 1.01 ms caps the step at ~989 tok/s even with free bandwidth, and at
-short context it is 35% of a 5090-class step. Anything that is still tuned for
-36 SMs is therefore worth more there than it was here: the split count (capped
-at 256), the attention tile, and `_DECODE_SPLIT`'s per-shape warp/stage table.
+The attention tile and `_DECODE_SPLIT`'s per-shape warp/stage table are still
+tuned for 36 SMs and are the next two things to re-sweep on a wider part.
 
 ## Scope
 

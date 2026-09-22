@@ -24,6 +24,11 @@ attention; both are required. The build prints
 third target is configured. On any other `GPU_ARCH` it is skipped and the
 frontend will not resolve.
 
+On a toolkit older than the SM120 FP8 prefill kernels -- `fmha_fp8_causal_gqa_sm120`
+and the sage2 group statically allocate more than 48 KB of shared memory, which
+CUDA 12.8's `ptxas` rejects -- configure with `-DFLASHRT_ENABLE_QWEN3_FP8_PREFILL=OFF`
+and `-DFLASHRT_ENABLE_MOTUS=OFF`. Neither group is used by this model.
+
 ## Constructor
 
 ```python
@@ -39,6 +44,8 @@ fe = SparkX25TorchFrontendRtx("/models/Spark-X2.5-4B", max_seq=131072)
 | `prefill_cap` | `min(max_seq, 8192)` | largest single prefill forward; the prompt is walked in chunks of `prefill_chunk` |
 | `prefill_chunk` | `min(prefill_cap, 2048)` | rows per chunk. Sizes the activation working set and every sliding layer's linear cache |
 | `device` | `"cuda"` | |
+| `attn_splits` | auto | full-layer decode KV split count baked into the captured graph. The part-aware default is `min(1024, max(128, max_seq // 128))` on >64-SM parts and `min(256, max(32, max_seq // 32))` on 36-SM parts. A split is a partition of the key range and the combine is a sum, so the value changes no arithmetic |
+| `attn_splits_slide` | auto | sliding-window decode split count: 32 on 36-SM parts, 64 otherwise |
 
 The frontend is constructed directly rather than through `flash_rt.api.load_model`:
 `load_model` wraps models in the VLA surface, which a text decoder does not have.
@@ -93,18 +100,27 @@ Measured on one RTX 5060 Ti 16 GB (SM120), batch 1, repeated-text prompt,
 | TTFT (ms) | 14 | 29 | 114 | 3 457 | 10 628 | 36 105 | 132 762 |
 | decode (tok/s) | 138.7 | 136.4 | 135.9 | 111.3 | 92.7 | 69.7 | 46.7 |
 
+On one RTX 5090 32 GB (170 SMs), same benchmark, after the split count was
+re-swept for the wider part (see `docs/spark_x25_rtx.md`):
+
+| prompt ctx | 128 | 512 | 2 048 | 8 k | 32 k | 128 k | 512 k | 1 M |
+|---|---|---|---|---|---|---|---|---|
+| KV mode | bf16+E4M3 | bf16+E4M3 | bf16+E4M3 | bf16+E4M3 | bf16+E4M3 | bf16+E4M3 | E4M3 only | E4M3 only |
+| decode (tok/s) | 360.6 | 354.7 | 347.0 | 319.0 | 276.7 | 198.7 | 95.4 | 56.4 |
+
+1M is the checkpoint's native maximum and fits in 32 GB in E4M3-only KV mode.
+
 ## Known limits
 
-- **SM120 only, and tuned on a 36-SM part.** The module is gated on
-  `GPU_ARCH=120`; the KV writer quantises with `__nv_cvt_float_to_fp8`, and the
-  attention tile size, the KV split count and the decode GEMM's warp/stage
-  configuration were all chosen against a 36-SM, 16 GB part (RTX 5060 Ti). A
-  wider SM120 part -- a 5090 has 170 SMs -- runs the same code but leaves
-  tuning on the table: the split count is capped at 256, the scores grid at 512
-  context is only 64 blocks, and `_DECODE_SPLIT` in
-  `flash_rt/models/spark_x25/pipeline_rtx.py` is a per-shape table swept on the
-  36-SM card. Re-sweeping those three is the first thing to do on a different
-  part; see the context-scaling note in `docs/spark_x25_rtx.md`.
+- **SM120 only.** The module is gated on `GPU_ARCH=120`; the KV writer
+  quantises with `__nv_cvt_float_to_fp8`. The decode KV split count scales with
+  the part: the original 36-SM rule (one split per 32 tokens, capped at 256)
+  cost 19% at 128k and 51% at 1M on a 170-SM 5090, so the default is now
+  `min(1024, max(128, max_seq // 128))` above 64 SMs, with `attn_splits` /
+  `attn_splits_slide` as overrides. The attention tile and `_DECODE_SPLIT`'s
+  per-shape warp/stage table are still swept on the 36-SM part and are the next
+  two to re-tune on a wider one; see the context-scaling note in
+  `docs/spark_x25_rtx.md`.
 - **Batch 1.** The capture is one query row wide. A batch would need a second
   capture at that batch.
 - **No speculative decoding.** The checkpoint has no MTP or draft head and
