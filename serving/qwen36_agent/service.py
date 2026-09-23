@@ -412,6 +412,17 @@ class AgentService:
             return remaining
         return max_tokens
 
+    @staticmethod
+    def _finish_reason(*, has_tool_calls: bool, natural_stop: bool,
+                       completion_tokens: int, max_tokens: int) -> str:
+        if not natural_stop and completion_tokens >= max_tokens:
+            reason = "length"
+        else:
+            reason = "stop"
+        if has_tool_calls and reason == "stop":
+            return "tool_calls"
+        return reason
+
     def validate_request_bounds(self, req: AgentRequest) -> None:
         """Fail hard context-limit errors before a StreamingResponse starts.
 
@@ -513,9 +524,12 @@ class AgentService:
         decode_started = time.perf_counter()
         state_lookahead = False
         saw_tool_call = False
+        natural_stop = False
         for chunk in self.engine.generate_stream(
                 max_tokens=max_tokens, K=decode_k):
             generated_ids.extend(int(t) for t in chunk.token_ids)
+            if chunk.stop:
+                natural_stop = True
             if getattr(chunk, "state_lookahead", 0):
                 state_lookahead = True
             evs = parser.feed(chunk.text)
@@ -541,14 +555,19 @@ class AgentService:
             else:
                 text_parts.append(str(ev.payload))
         text = "".join(text_parts)
-        finish_reason = "tool_calls" if tool_calls else "stop"
+        completion_tokens = len(generated_ids)
+        finish_reason = self._finish_reason(
+            has_tool_calls=bool(tool_calls),
+            natural_stop=natural_stop,
+            completion_tokens=completion_tokens,
+            max_tokens=max_tokens,
+        )
         session.commit([*engine_prompt_tokens, *generated_ids])
         visible_messages = self._copy_messages(req.messages)
         visible_messages.append(self._assistant_message(text, tool_calls))
         session.visible_messages = visible_messages
         self._mark_reusable(session, state_lookahead)
 
-        completion_tokens = len(generated_ids)
         decode_ms = max(0.0, (t_done - decode_started) * 1000.0)
         decode_tok_per_s = (
             completion_tokens * 1000.0 / decode_ms if decode_ms > 0 else 0.0
@@ -650,6 +669,7 @@ class AgentService:
         stream_started = time.perf_counter()
         backend_decode_ms = 0.0
         saw_tool_call = False
+        natural_stop = False
         chunks = iter(self.engine.generate_stream(max_tokens=max_tokens,
                                                   K=decode_k))
         while True:
@@ -662,6 +682,8 @@ class AgentService:
                 break
             backend_decode_ms += (time.perf_counter() - next_t0) * 1000.0
             generated_ids.extend(int(t) for t in chunk.token_ids)
+            if chunk.stop:
+                natural_stop = True
             if getattr(chunk, "state_lookahead", 0):
                 state_lookahead = True
             for ev in parser.feed(chunk.text):
@@ -706,6 +728,12 @@ class AgentService:
             },
         }
         completion_tokens = len(generated_ids)
+        finish_reason = self._finish_reason(
+            has_tool_calls=seen_tool_call,
+            natural_stop=natural_stop,
+            completion_tokens=completion_tokens,
+            max_tokens=max_tokens,
+        )
         decode_ms = max(0.0, backend_decode_ms)
         decode_tok_per_s = (
             completion_tokens * 1000.0 / decode_ms if decode_ms > 0 else 0.0
@@ -729,7 +757,7 @@ class AgentService:
             decode_tok_per_s=decode_tok_per_s,
             stream_wall_ms=stream_wall_ms,
             stream_wall_tok_per_s=stream_wall_tok_per_s,
-            finish="tool_calls" if seen_tool_call else "stop",
+            finish=finish_reason,
             tool_calls=len(tool_calls),
             state_lookahead=state_lookahead,
             hot_after=self.sessions.hot_session_id,
@@ -740,7 +768,7 @@ class AgentService:
         yield sse_data(done_chunk(
             completion_id,
             model,
-            finish_reason="tool_calls" if seen_tool_call else "stop",
+            finish_reason=finish_reason,
             usage=usage,
         ))
         yield "data: [DONE]\n\n"

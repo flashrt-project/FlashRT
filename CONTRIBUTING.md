@@ -1,5 +1,12 @@
 # Contributing to FlashRT
 
+We welcome contributions throughout the community, including code, reviews,
+documentation, testing, and downstream integrations. Our
+[community statement](docs/COMMUNITY_AND_CREDIT.md) explains how we
+encourage reuse and recognize contributions. When proposing adapted code,
+please identify its source and preserve applicable licenses and notices;
+corrections to our own attribution are welcome too.
+
 FlashRT is a realtime inference engine. Contributions are welcome, but
 changes need to preserve the repository's main contract: predictable
 latency, explicit hardware routing, stable public APIs, and clear failure

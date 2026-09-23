@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+title: "FlashRT"
+message: >-
+  If FlashRT is useful in your project or research, please cite and credit
+  the software and link to the repository. For work involving execution-state
+  capsules, please also cite the paper listed in references.
+type: software
+authors:
+  - family-names: "Su"
+    given-names: "Liang"
+repository-code: "https://github.com/flashrt-project/FlashRT"
+url: "https://github.com/flashrt-project/FlashRT"
+license: "Apache-2.0"
+references:
+- type: article
+  authors:
+    - family-names: "Su"
+      given-names: "Liang"
+  title: >-
+    Execution-State Capsules: Graph-Bound Execution-State Checkpoint and
+    Restore for Low-Latency, Small-Batch, On-Device Physical-AI Serving
+  year: 2026
+  doi: "10.48550/arXiv.2606.20537"
+  url: "https://arxiv.org/abs/2606.20537"
