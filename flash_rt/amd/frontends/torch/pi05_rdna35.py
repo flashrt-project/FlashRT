@@ -16,7 +16,7 @@ from typing import Optional, Union
 import numpy as np
 import torch
 
-from flash_rt.amd.frontends.torch.pi05 import (
+from flash_rt.frontends.torch.pi05_checkpoint import (
     ACTION_DIM,
     IMG_HW,
     NUM_STEPS_DEFAULT,
@@ -77,6 +77,7 @@ class Pi05TorchFrontendAmdRdna35:
         chunk_size: Optional[int] = None,
         use_fp8: bool = False,
         hardware: Optional[str] = None,
+        action_dim: Optional[int] = None,
     ):
         if hardware not in (None, "amd_rdna35"):
             raise ValueError(
@@ -134,7 +135,7 @@ class Pi05TorchFrontendAmdRdna35:
 
         if chunk_size is None:
             chunk_size = self._checkpoint_action_horizon(checkpoint_dir)
-        if chunk_size < 1:
+        if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size < 1:
             raise ValueError(f"chunk_size must be positive, got {chunk_size}")
 
         self.hardware = "amd_rdna35"
@@ -150,7 +151,7 @@ class Pi05TorchFrontendAmdRdna35:
 
         self.norm_stats = load_norm_stats(
             pi05_candidates(checkpoint_dir), checkpoint_dir=checkpoint_dir)
-        self.action_dim = self._infer_action_dim(self.norm_stats)
+        self.action_dim = self._resolve_action_dim(checkpoint_dir, action_dim, self.norm_stats)
 
         cpu_weights = convert_pi05_safetensors(checkpoint)
         cpu_weights["decoder_time_embeds"] = _build_time_embeddings(
@@ -218,14 +219,34 @@ class Pi05TorchFrontendAmdRdna35:
         return 10
 
     @staticmethod
-    def _infer_action_dim(norm_stats: dict) -> int:
+    def _resolve_action_dim(checkpoint_dir: pathlib.Path, action_dim, norm_stats: dict) -> int:
+        """Resolve the public robot schema, never infer padding from statistics.
+
+        ``action_dim`` is the caller's explicit output schema. Checkpoints may
+        instead declare ``output_action_dim``; model ``action_dim`` often
+        includes padded channels and is deliberately not used for this purpose.
+        """
+        if action_dim is None:
+            config_path = checkpoint_dir / "config.json"
+            if config_path.is_file():
+                action_dim = json.loads(config_path.read_text()).get("output_action_dim")
+        if (not isinstance(action_dim, int) or isinstance(action_dim, bool)
+                or not 1 <= action_dim <= ACTION_DIM):
+            raise ValueError(
+                "Set action_dim to the robot output dimension (1..32), or declare "
+                "output_action_dim in checkpoint config.json; norm_stats cannot "
+                "distinguish constant robot channels from padding")
         actions = norm_stats.get("actions", {})
         q01 = np.asarray(actions.get("q01", []), dtype=np.float32)
         q99 = np.asarray(actions.get("q99", []), dtype=np.float32)
-        if q01.shape != q99.shape or q01.ndim != 1 or q01.size == 0:
-            raise ValueError("Pi0.5 norm_stats actions must contain 1-D q01/q99")
-        active = np.flatnonzero(np.abs(q99 - q01) > 1e-8)
-        return int(active[-1] + 1) if active.size else int(q01.size)
+        if (q01.ndim != 1 or q01.shape != q99.shape
+                or not action_dim <= q01.size <= ACTION_DIM
+                or not np.isfinite(q01).all() or not np.isfinite(q99).all()
+                or np.any(q99 < q01)):
+            raise ValueError(
+                "Pi0.5 norm_stats actions must contain finite ordered 1-D q01/q99 "
+                "covering action_dim and no more than 32 channels")
+        return action_dim
 
     def set_prompt(self, prompt_text: str, state=None) -> None:
         embeds, prompt_len = _embed_prompt(

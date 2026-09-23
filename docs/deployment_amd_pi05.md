@@ -187,16 +187,13 @@ validation. General AMD build,
 routing, and source-layout information is in
 [deployment_amd.md](deployment_amd.md).
 
-## Performance
+## Validation status
 
-Pi0.5, 2 camera views, a 47-token prompt, action horizon 15, 10-step denoise,
-median end-to-end latency on fixed observation frames:
-
-| Configuration | Latency | vs torch.compile |
-|---|---|---|
-| PyTorch eager | 288.53 ms | — |
-| torch.compile (max-autotune) | 211.25 ms | 1.00× |
-| **FlashRT AMD, BF16** | **147.65 ms** | **1.43×** |
+The RDNA bindings now use the model-owned torch tensor pipeline. The contributor's
+original hardware measurements predate this restructuring and are not a performance
+claim for this revision. CPU checks cover import isolation, output schema, shared
+execution and routing. Native gfx1151 compilation and independent whole-model
+numerical parity have not been rerun for this revision.
 
 ## Quick start
 
@@ -228,10 +225,11 @@ Library use:
 import flash_rt
 
 model = flash_rt.load_model(
-    "/data/models/pi05_droid_pytorch",
+    "<checkpoint-dir>",
     config="pi05",
     framework="torch",
     hardware="amd_rdna35",  # optional on a gfx1151 machine
+    action_dim=7,  # use your robot's actual output dimension
     num_views=2,
     use_fp8=False,
 )
@@ -259,7 +257,11 @@ The public BF16 input range matches the CDNA Pi0.5 frontend:
   `images` list with exactly `num_views` entries or through the named
   `image`, `wrist_image`, and `wrist_image_right` keys.
 - Prompt length is dynamic up to `max_prompt_len` (default 200).
-- The action horizon is any positive value. By default it is read from
+- `action_dim` explicitly declares the robot output dimension (1..32). It may
+  instead be supplied as `output_action_dim` in checkpoint `config.json`. The
+  model's padded `action_dim` field and constant quantiles are not an output
+  schema. A real constant final joint or gripper channel is preserved.
+- The action horizon is any positive integer. By default it is read from
   `config.json`'s `action_horizon`, with 10 used when that field is absent.
 - `num_steps` is any positive integer. The frontend regenerates the
   sinusoidal time schedule and applies the matching `-1 / num_steps` ODE
@@ -286,6 +288,8 @@ same-process parity and performance comparisons:
 | `FLASHRT_RDNA35_HIP_FFN_GATE_UP` | `1` | merged decoder gate/up dataflow |
 | `FLASHRT_RDNA35_HIP_ENCODER_FFN` | `1` | merged encoder gate/up dataflow |
 | `FLASHRT_RDNA35_HIP_LARGE_OPS` | `1` | shape-specialized vision/encoder normalization and residual kernels |
+| `FLASHRT_RDNA35_PRECOMPUTE_MODULATION` | `1` | prepare timestep modulation before inference |
+| `FLASHRT_RDNA35_HIP_GQA_KEYS` | `4` | split-key group size: 1, 2, 4, or 8 |
 | `FLASHRT_RDNA35_COMPACT_ENCODER` | `1` | execute only the valid image + prompt prefix |
 | `FLASHRT_RDNA35_GEMM_AUTOTUNE` | `1` | instance-local timed hipBLASLt algorithm selection |
 | `FLASHRT_RDNA35_GEMM_ALGOS` | `16` | candidate count for the local GEMM selection |
@@ -315,7 +319,8 @@ does not include temporal caching or an asynchronous serving pipeline.
   tests/test_amd_rdna35_routing.py \
   tests/test_amd_rdna35_ops.py -q
 
-FLASH_RT_PI05_RDNA35_CKPT=/data/models/pi05_droid_pytorch \
+FLASH_RT_PI05_ACTION_DIM=7 \
+FLASH_RT_PI05_RDNA35_CKPT="<checkpoint-dir>" \
   .venv/bin/python -m pytest tests/test_amd_rdna35_model.py -q
 
 .venv/bin/python -m pytest tests/test_amd*.py -q
@@ -326,3 +331,56 @@ checkpoint-gated tests cover finite outputs, fixed-noise determinism, HIP
 Graph parity, and the optimized-versus-library fallback. Profile any extra
 local benchmark from an ignored build directory; benchmark harnesses are not
 part of the source distribution.
+
+
+## Model and target ownership
+
+`flash_rt.models.pi05.torch_pipeline.Pi05TorchPipeline` owns the tensor model
+semantics: vision layers, prefix encoding, decoder layers and denoising steps.
+It accepts tensor-operation, GEMM and attention providers. The RDNA module is
+only a constructor binding; it contains no model traversal. Native operation
+selection lives in `flash_rt.amd.hardware.rdna35.ops`, `gemm` and `attention`.
+The explicit portable torch provider runs the same model pipeline in CPU contract
+tests. It is a refactor regression tool, not an independent model oracle.
+Existing legacy RTX/Thor/CDNA production pipelines retain their routes; this
+change does not claim to migrate all legacy implementations.
+
+Safetensors conversion and prompt embedding are shared by the CDNA and RDNA
+frontends through `flash_rt.frontends.torch.pi05_checkpoint`. Importing them
+loads neither HIP nor CUDA runtime libraries. The CDNA names remain re-exported
+for existing callers.
+
+## Independent reference fixtures
+
+`test_independent_reference_fixture` accepts an NPZ produced by a pinned OpenPI
+revision, without pickled objects. It compares **both raw and public actions**
+for identical checkpoint, images, prompt, state and initial noise. It checks
+checkpoint SHA-256 before inference and requires cosine >= 0.999 plus elementwise
+`atol=0.1, rtol=0.03`; those BF16 bounds are acceptance criteria, not measured
+results. A missing fixture skips this optional hardware test.
+
+Required NPZ entries:
+
+- `metadata`: scalar JSON string containing `producer: "openpi"`, the 40-character
+  `producer_revision`, `checkpoint_sha256`, `num_steps`, `action_dim`, and
+  `action_horizon`.
+- `images`: uint8 `(num_views, 224, 224, 3)`, `prompt`: scalar string,
+  `state`: the exact state passed to prompt tokenization, and `noise`: float32
+  `(action_horizon, 32)` used by both producers (BF16-representable values avoid
+  different initial rounding).
+- `raw_actions`: float32 `(action_horizon, 32)` in normalized model space;
+  `actions`: float32 `(action_horizon, action_dim)` after the independent
+  reference's quantile unnormalization and explicit robot slicing.
+
+Use an independent OpenPI run to generate these arrays; never export expected
+outputs from this pipeline or its fallback provider. Save arrays with
+`numpy.savez` and keep fixtures out of the source distribution. Run with:
+
+```bash
+FLASH_RT_PI05_ACTION_DIM=7 \
+FLASH_RT_PI05_RDNA35_CKPT="<checkpoint-dir>" \
+FLASH_RT_PI05_REFERENCE="<openpi-fixture.npz>" \
+  python -m pytest tests/test_amd_rdna35_model.py -k independent_reference -q
+```
+
+No independent fixture was executed as part of this source-only restructuring.

@@ -414,6 +414,9 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             Pass ``"thor"`` / ``"rtx_sm120"`` / ``"rtx_sm89"`` /
             ``"rtx_sm87"`` explicitly to
             force a specific backend (useful for cross-hardware debugging).
+        action_dim: Explicit robot output dimension for the RDNA Pi0.5 and
+            Jetson Pi frontends. RDNA may instead read output_action_dim from
+            checkpoint config.json; normalization statistics are not a schema.
         embodiment_tag: GROOT only. Per-embodiment MLP slot to load. Passing
             ``None`` uses the backend default (``"new_embodiment"`` — unfit
             for the base 3B checkpoint demo; see below). The GR00T-N1.6-3B
@@ -1045,6 +1048,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     import inspect
     sig = inspect.signature(pipe_cls)
     kwargs: dict = {"num_views": num_views}
+    if arch == "amd_rdna35" and "action_dim" in sig.parameters and action_dim is not None:
+        kwargs["action_dim"] = action_dim
     if "hardware" in sig.parameters:
         kwargs["hardware"] = arch
     if "use_fp8" in sig.parameters:

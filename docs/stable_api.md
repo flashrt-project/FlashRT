@@ -35,7 +35,7 @@ def load_model(
     decode_cuda_graph: bool = False,
     decode_graph_steps: int = 80,
     max_decode_steps: int = 256,
-    hardware: str = "auto",         # "auto" | "thor" | "rtx_sm120" | "rtx_sm89" | "rtx_sm87" | "amd_cdna4"
+    hardware: str = "auto",         # "auto" | "thor" | "rtx_sm120" | "rtx_sm89" | "rtx_sm87" | "amd_cdna4" | "amd_rdna35"
     # GROOT-specific:
     embodiment_tag: str | None = None,
     action_horizon: int | None = None,
@@ -62,12 +62,19 @@ def load_model(
     use_fp8: bool = True,
     # Pi0.5 torch RTX SM120/SM89 opt-in:
     use_fp16: bool = False,
+    # Robot output schema (RDNA Pi0.5 / Jetson Pi):
+    action_dim: int | None = None,
 ) -> VLAModel
 ```
 
 Returns a `VLAModel` wrapping the appropriate frontend for the detected
 (or explicitly specified) GPU architecture.
 
+- `action_dim` declares the robot output width for RDNA Pi0.5 (1..32).
+  If omitted, this backend requires `output_action_dim` in checkpoint
+  `config.json`; it never infers padding from constant normalization statistics.
+  Constant final action channels are retained. Other existing hardware routes
+  keep their output conventions.
 - `decode_cuda_graph`, `decode_graph_steps`, `max_decode_steps` apply to
   Pi0-FAST.
 - `embodiment_tag` and `action_horizon` apply to GROOT.

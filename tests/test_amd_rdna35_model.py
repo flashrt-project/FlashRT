@@ -29,7 +29,8 @@ def model():
     import flash_rt
     loaded = flash_rt.load_model(
         _checkpoint(), framework="torch", config="pi05",
-        hardware="amd_rdna35", num_views=2, use_fp8=False)
+        hardware="amd_rdna35", num_views=2, use_fp8=False,
+        action_dim=int(os.environ["FLASH_RT_PI05_ACTION_DIM"]) if "FLASH_RT_PI05_ACTION_DIM" in os.environ else None)
     loaded.set_prompt("pick up the object", state=np.zeros(8, dtype=np.float32))
     return loaded
 
@@ -89,21 +90,21 @@ def test_optimized_path_matches_aten_fallback(model):
     ).to(device="cuda", dtype=torch.bfloat16)
     pipeline = frontend.pipeline
     pipeline_names = (
-        "hip_rope",
-        "hip_decoder",
-        "hip_ffn_gate_up",
-        "hip_encoder_ffn",
-        "hip_large_ops",
+        "fused_rope",
+        "fused_decoder_ops",
+        "merged_decoder_ffn",
+        "merged_encoder_ffn",
+        "fused_large_ops",
     )
     attention_names = ("hip_gqa", "hip_encoder_gqa")
     original_pipeline = {
-        name: getattr(pipeline, name) for name in pipeline_names}
+        name: getattr(pipeline.ops, name) for name in pipeline_names}
     original_attention = {
         name: getattr(pipeline.attn, name) for name in attention_names}
     prepared_smallm = pipeline.gemm._smallm_weights
     try:
         for name in pipeline_names:
-            setattr(pipeline, name, False)
+            setattr(pipeline.ops, name, False)
         for name in attention_names:
             setattr(pipeline.attn, name, False)
         pipeline.gemm._smallm_weights = {}
@@ -111,7 +112,7 @@ def test_optimized_path_matches_aten_fallback(model):
             frontend._image_buf, noise).clone()
 
         for name, enabled in original_pipeline.items():
-            setattr(pipeline, name, enabled)
+            setattr(pipeline.ops, name, enabled)
         for name, enabled in original_attention.items():
             setattr(pipeline.attn, name, enabled)
         pipeline.gemm._smallm_weights = prepared_smallm
@@ -119,7 +120,7 @@ def test_optimized_path_matches_aten_fallback(model):
             frontend._image_buf, noise).clone()
     finally:
         for name, enabled in original_pipeline.items():
-            setattr(pipeline, name, enabled)
+            setattr(pipeline.ops, name, enabled)
         for name, enabled in original_attention.items():
             setattr(pipeline.attn, name, enabled)
         pipeline.gemm._smallm_weights = prepared_smallm
@@ -166,3 +167,39 @@ def test_native_attention_and_smallm_match_library_fallback(model):
         reference.float().flatten(), optimized.float().flatten(), dim=0)
     assert cosine.item() >= 0.999
     torch.testing.assert_close(optimized, reference, atol=1e-2, rtol=1e-2)
+
+
+def test_independent_reference_fixture(model):
+    """Optional independent oracle; same-pipeline fallback tests are not an oracle."""
+    import hashlib
+    import json
+    from pathlib import Path
+    fixture_path = os.environ.get('FLASH_RT_PI05_REFERENCE')
+    if not fixture_path:
+        pytest.skip('set FLASH_RT_PI05_REFERENCE to an independently generated NPZ fixture')
+    frontend = model.pipeline
+    with np.load(fixture_path, allow_pickle=False) as fixture:
+        metadata = json.loads(str(fixture['metadata'].item()))
+        assert metadata['producer'] == 'openpi', 'fixture must come from independent OpenPI'
+        revision = metadata['producer_revision']
+        assert len(revision) == 40 and all(c in '0123456789abcdef' for c in revision)
+        digest = hashlib.sha256()
+        with Path(frontend._checkpoint_path).open('rb') as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                digest.update(chunk)
+        assert metadata['checkpoint_sha256'] == digest.hexdigest()
+        assert metadata['num_steps'] == frontend.num_steps
+        assert metadata['action_dim'] == frontend.action_dim
+        assert metadata['action_horizon'] == frontend.chunk_size
+        prompt = str(fixture['prompt'].item())
+        frontend.set_prompt(prompt, state=fixture['state'])
+        result = frontend.infer({'images': list(fixture['images'])}, debug=True, noise=fixture['noise'])
+        for key in ('raw_actions', 'actions'):
+            actual, expected = result[key], fixture[key]
+            assert actual.shape == expected.shape
+            assert np.isfinite(actual).all() and np.isfinite(expected).all()
+            # BF16 end-to-end acceptance bounds; do not loosen them based on a failing run.
+            np.testing.assert_allclose(actual, expected, atol=.1, rtol=.03)
+            x, y = actual.astype(np.float64).ravel(), expected.astype(np.float64).ravel()
+            denom = np.linalg.norm(x) * np.linalg.norm(y)
+            assert denom > 0 and np.dot(x, y) / denom >= .999
