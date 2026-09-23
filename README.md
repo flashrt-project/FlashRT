@@ -17,9 +17,10 @@ model-specific dataflows combine a latency-first static execution pipeline,
 system-level quantization and calibration, cross-layer fusion plans, captured
 graphs over stable buffers, and hand-written or explicitly adapted kernels —
 without ONNX export, engine compilation, or per-driver rebuild. The composition
-pattern itself is hardware-agnostic; today the codebase ships with NVIDIA
-implementations spanning edge to server (Jetson AGX Thor through A100 / RTX
-4090 / 5090).
+pattern itself is hardware-agnostic, with NVIDIA implementations spanning
+Jetson AGX Thor and Jetson Orin through A100 and RTX 4090 / 5090.
+Cross-platform support is actively expanding to AMD GPUs, NPUs, and other
+hardware backends.
 
 We share code, designs, and engineering experience to advance technology
 together with the community. We welcome learning, reuse, and new explorations,
