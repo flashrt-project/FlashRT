@@ -39,6 +39,8 @@ def _rocm_device_or_skip():
         ext = importlib.import_module("flash_rt.amd.flash_rt_amd_kernels")
     except ImportError as exc:
         pytest.skip(f"flash_rt_amd_kernels not importable: {exc}")
+    if ext.build_info().get("backend") == "rdna35":
+        pytest.skip("requires the CDNA4 AMD extension source set")
     arch = ext.device_arch()
     if arch in ("none", "unknown"):
         pytest.skip(f"no usable HIP device (device_arch()={arch!r})")

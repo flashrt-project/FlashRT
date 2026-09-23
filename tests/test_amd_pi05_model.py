@@ -77,9 +77,12 @@ def _resolve_ckpt():
 def amd_env():
     """ROCm torch + device + extension, or skip with the missing piece."""
     try:
-        importlib.import_module("flash_rt.amd.flash_rt_amd_kernels")
+        extension = importlib.import_module(
+            "flash_rt.amd.flash_rt_amd_kernels")
     except ImportError as exc:
         pytest.skip(f"flash_rt_amd_kernels not importable: {exc}")
+    if extension.build_info().get("backend") == "rdna35":
+        pytest.skip("requires the CDNA4 AMD extension source set")
     try:
         # The frontend pulls in the pipeline's third-party numeric helpers
         # (same ones the RTX pipeline imports, declared under an optional

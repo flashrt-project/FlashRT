@@ -77,9 +77,12 @@ def ext():
     box that has the .so built.
     """
     try:
-        return importlib.import_module("flash_rt.amd.flash_rt_amd_kernels")
+        module = importlib.import_module("flash_rt.amd.flash_rt_amd_kernels")
     except ImportError as exc:  # pragma: no cover - build/env dependent
         pytest.skip(f"flash_rt_amd_kernels not importable: {exc}")
+    if module.build_info().get("backend") == "rdna35":
+        pytest.skip("requires the CDNA4 AMD extension source set")
+    return module
 
 
 @pytest.fixture(scope="module")

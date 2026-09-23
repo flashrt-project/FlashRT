@@ -176,3 +176,153 @@ is a judging protocol, not a deployment setting.
 
 Cross-run medians move ±0.2–0.35 ms with the timed hipBLASLt algorithm
 selection; compare arms inside one process where possible.
+
+# Pi0.5 on AMD RDNA 3.5 (gfx1151)
+
+This is the BF16 Pi0.5 backend for the integrated Radeon 8060S GPU in
+Ryzen AI Max+ 395 (the GPUs in AMD Ryzen™ AI Embedded X100 Series processors
+share the same RDNA 3.5 architecture). Its public hardware key is
+`amd_rdna35`; `gfx1151` is used only for build-time and runtime hardware
+validation. General AMD build,
+routing, and source-layout information is in
+[deployment_amd.md](deployment_amd.md).
+
+## Performance
+
+Pi0.5, 2 camera views, a 47-token prompt, action horizon 15, 10-step denoise,
+median end-to-end latency on fixed observation frames:
+
+| Configuration | Latency | vs torch.compile |
+|---|---|---|
+| PyTorch eager | 288.53 ms | — |
+| torch.compile (max-autotune) | 211.25 ms | 1.00× |
+| **FlashRT AMD, BF16** | **147.65 ms** | **1.43×** |
+
+## Quick start
+
+Create a Python 3.11 environment with a gfx1151 ROCm PyTorch build and the
+ROCm development files, then build the architecture-selected extension:
+
+```bash
+uv venv --python 3.11 .venv
+uv pip install --python .venv/bin/python \
+  'torch[device-gfx1151]==2.12.0+rocm10.1.0a20260806' \
+  'torchvision[device-gfx1151]==0.27.0+rocm10.1.0a20260806' \
+  'torchaudio==2.11.0+rocm10.1.0a20260806' \
+  'rocm[devel,device-gfx1151]==10.1.0a20260806' \
+  --index-url https://rocm.nightlies.amd.com/whl-multi-arch/ \
+  --extra-index-url https://d183u042sr8tht.cloudfront.net/simple/ \
+  --extra-index-url https://pypi.org/simple/ \
+  --index-strategy unsafe-first-match \
+  --prerelease allow
+uv pip install --python .venv/bin/python -e '.[torch]' ml_dtypes pytest ninja build cmake pybind11
+.venv/bin/rocm-sdk init
+
+export ROCM_PATH="$(.venv/bin/rocm-sdk path --root)"
+PYTHON=.venv/bin/python bash scripts/amd/build_amd.sh gfx1151
+```
+
+Library use:
+
+```python
+import flash_rt
+
+model = flash_rt.load_model(
+    "/data/models/pi05_droid_pytorch",
+    config="pi05",
+    framework="torch",
+    hardware="amd_rdna35",  # optional on a gfx1151 machine
+    num_views=2,
+    use_fp8=False,
+)
+model.set_prompt("pick up the object", state=state_vector)
+actions = model.predict(images=[base_image, wrist_image])
+```
+
+`hardware="auto"` maps only the exact gfx1151 ISA to this backend. The
+frontend also verifies that the extension was built from the RDNA source set,
+uses wave32, and targets gfx1151 before loading the checkpoint.
+
+## Precision tier
+
+The RDNA 3.5 backend supports BF16 weights and activations only. It does not
+route through the CDNA4 FP8 kernels, packed MFMA layouts, aiter provider, or
+wave64 helpers. `load_model()` converts its historical `use_fp8=True` default
+to BF16 with a warning; direct frontend construction rejects `use_fp8=True`.
+
+## Observation contract
+
+The public BF16 input range matches the CDNA Pi0.5 frontend:
+
+- `num_views` is **2** (base + wrist) or **3** (+ right wrist).
+- Images are `uint8` arrays with shape `(224, 224, 3)`, supplied either as an
+  `images` list with exactly `num_views` entries or through the named
+  `image`, `wrist_image`, and `wrist_image_right` keys.
+- Prompt length is dynamic up to `max_prompt_len` (default 200).
+- The action horizon is any positive value. By default it is read from
+  `config.json`'s `action_horizon`, with 10 used when that field is absent.
+- `num_steps` is any positive integer. The frontend regenerates the
+  sinusoidal time schedule and applies the matching `-1 / num_steps` ODE
+  projection scale.
+
+Native decoder attention and the WMMA action projection are selected only
+inside their validated small-shape profiles. Larger horizons and sequences
+fall back to PyTorch SDPA or hipBLASLt, so changing the checkpoint profile
+does not launch a shape-incompatible kernel.
+
+## Environment knobs
+
+The native path is enabled by default. These switches are intended for
+same-process parity and performance comparisons:
+
+| Env | Default | Meaning |
+|---|---|---|
+| `FLASHRT_RDNA35_HIP_ROPE` | `1` | BF16x2 QKV/RoPE kernel |
+| `FLASHRT_RDNA35_HIP_DECODER` | `1` | decoder normalization, activation, and residual fusions |
+| `FLASHRT_RDNA35_HIP_GQA` | `1` | wave32 decoder GQA for queries up to 16 rows; row-owned K/V up to 1024 |
+| `FLASHRT_RDNA35_HIP_GQA_SPLIT_KEY` | `1` | split-key decoder GQA with K/V up to 2048 |
+| `FLASHRT_RDNA35_HIP_ENCODER_ATTN` | `1` | native encoder GQA up to 4096 rows and 16 query heads; dense inputs above 1024 use SDPA when faster |
+| `FLASHRT_RDNA35_HIP_SMALLM` | `1` | WMMA action projection for M up to 48 |
+| `FLASHRT_RDNA35_HIP_FFN_GATE_UP` | `1` | merged decoder gate/up dataflow |
+| `FLASHRT_RDNA35_HIP_ENCODER_FFN` | `1` | merged encoder gate/up dataflow |
+| `FLASHRT_RDNA35_HIP_LARGE_OPS` | `1` | shape-specialized vision/encoder normalization and residual kernels |
+| `FLASHRT_RDNA35_COMPACT_ENCODER` | `1` | execute only the valid image + prompt prefix |
+| `FLASHRT_RDNA35_GEMM_AUTOTUNE` | `1` | instance-local timed hipBLASLt algorithm selection |
+| `FLASHRT_RDNA35_GEMM_ALGOS` | `16` | candidate count for the local GEMM selection |
+
+No generated algorithm CSV is shipped and no process-global PyTorch
+TunableOp state is modified. Triton is not a runtime dependency.
+
+## Feature matrix
+
+| Surface | RDNA 3.5 BF16 |
+|---|---|
+| `set_prompt` / `infer` / `get_latency_stats` | ✅ |
+| 2/3 views, dynamic prompt, horizon, and denoise steps | ✅ |
+| Pinned-noise inference and optional full-model HIP Graph | ✅ |
+| Native HIP attention, QKV/RoPE, normalization, activation, residual, small-M projection | ✅ |
+| FP8 / FP4 | ❌ |
+| Temporal K/V reuse, decoder-only graph | ❌ |
+| CDNA4 aiter, MFMA, and wave64 kernels | ❌ isolated by build and routing |
+
+The first RDNA version is deliberately an operator-optimization backend. It
+does not include temporal caching or an asynchronous serving pipeline.
+
+## Validation
+
+```bash
+.venv/bin/python -m pytest \
+  tests/test_amd_rdna35_routing.py \
+  tests/test_amd_rdna35_ops.py -q
+
+FLASH_RT_PI05_RDNA35_CKPT=/data/models/pi05_droid_pytorch \
+  .venv/bin/python -m pytest tests/test_amd_rdna35_model.py -q
+
+.venv/bin/python -m pytest tests/test_amd*.py -q
+```
+
+Operator tests compare every native family with a PyTorch reference. The
+checkpoint-gated tests cover finite outputs, fixed-noise determinism, HIP
+Graph parity, and the optimized-versus-library fallback. Profile any extra
+local benchmark from an ignored build directory; benchmark harnesses are not
+part of the source distribution.
