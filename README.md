@@ -12,7 +12,20 @@
   | <a href="https://github.com/LiangSu8899/FlashRT-Nexus"><b>Nexus</b></a> |
 </p>
 
-A general kernel library composed into static graphs — no ONNX export, no engine compilation, no per-driver rebuild. Hand-written kernels (norm / activation / fusion / RoPE / FP8 / NVFP4 GEMM / attention) cover standard transformer, DiT, and SigLIP primitives. The composition pattern itself is hardware-agnostic; today the codebase ships with NVIDIA implementations spanning edge to server (Jetson AGX Thor through A100 / RTX 4090 / 5090).
+FlashRT is an integrated inference system. Its
+model-specific dataflows combine a latency-first static execution pipeline,
+system-level quantization and calibration, cross-layer fusion plans, captured
+graphs over stable buffers, and hand-written or explicitly adapted kernels —
+without ONNX export, engine compilation, or per-driver rebuild. The composition
+pattern itself is hardware-agnostic; today the codebase ships with NVIDIA
+implementations spanning edge to server (Jetson AGX Thor through A100 / RTX
+4090 / 5090).
+
+We share code, designs, and engineering experience to advance technology
+together with the community. We welcome learning, reuse, and new explorations,
+and value open sharing, respect for original contributions, and sincere
+collaboration. Read our [community statement](docs/COMMUNITY_AND_CREDIT.md)
+(English / 中文).
 
 The flagship integration today is **VLA control** — production frontends for Pi0, Pi0.5, GROOT N1.6, GROOT N1.7, and Pi0-FAST, validated on LIBERO where applicable. The same kernel set also powers BAGEL world-model research paths, Higgs Audio v3 TTS, Wan2.2 / Motus video-policy paths, and **single-stream LLM inference** with Qwen3.6-27B NVFP4 long-context serving. The pattern is workload-shaped (small-batch realtime), not model-class-shaped.
 
@@ -1253,7 +1266,11 @@ driver/CUDA/PyTorch versions, and `nvidia-smi` output. For new cards, start with
 
 ## Citation
 
-If you use FlashRT for your research, please cite our paper:
+If FlashRT is useful in your project or research, please cite and credit it,
+and link to [this repository](https://github.com/flashrt-project/FlashRT).
+See [`CITATION.cff`](CITATION.cff) for citation metadata.
+
+For research involving execution-state capsules, please also cite our paper:
 
 ```bibtex
 @misc{su2026executionstatecapsules,
@@ -1276,6 +1293,11 @@ If you use FlashRT for your research, please cite our paper:
 
 - [CUTLASS](https://github.com/NVIDIA/cutlass) — GEMM templates and FMHA kernels
 - [FlashAttention](https://github.com/Dao-AILab/flash-attention) — Attention backend for SM89/SM120
+- [FlashInfer](https://github.com/flashinfer-ai/flashinfer) — XQA-derived attention sources
 - [Physical Intelligence](https://www.physicalintelligence.company/) — Pi0/Pi0.5 model architecture
 - [OpenPI](https://github.com/Physical-Intelligence/openpi) — Reference PyTorch implementation
 - [NVIDIA Isaac GR00T](https://github.com/NVIDIA/Isaac-GR00T) — GROOT N1.6 model
+
+We thank these projects and all FlashRT contributors. Component-specific
+sources, licenses, and local changes are recorded in file headers and
+directory-local `VENDOR.md` files.
