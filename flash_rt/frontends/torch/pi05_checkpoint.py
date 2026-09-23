@@ -284,5 +284,3 @@ def _embed_prompt(prompt_text: str, embedding_weight: torch.Tensor,
     embeds = F.embedding(token_ids, embedding_weight)
     embeds = embeds * float(embeds.shape[-1] ** 0.5)
     return embeds, prompt_len
-
-
