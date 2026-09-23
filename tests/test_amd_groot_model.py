@@ -86,9 +86,12 @@ def _env(*names: str):
 def amd_env():
     """ROCm torch + device + extension + frontend, or skip with the reason."""
     try:
-        importlib.import_module("flash_rt.amd.flash_rt_amd_kernels")
+        extension = importlib.import_module(
+            "flash_rt.amd.flash_rt_amd_kernels")
     except ImportError as exc:
         pytest.skip(f"flash_rt_amd_kernels not importable: {exc}")
+    if extension.build_info().get("backend") == "rdna35":
+        pytest.skip("requires the CDNA4 AMD extension source set")
     try:
         # Pulls in the Thor base and its third-party helpers (declared
         # under an optional extra); skip rather than error on a lean env.

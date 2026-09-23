@@ -409,6 +409,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
               SM87  (Jetson Orin)  → ``flash_rt.hardware.rtx.*`` (experimental,
                                      Pi0.5 torch only; BF16 default, INT8
                                      via Orin env flags)
+              gfx950 (MI350 series) → ``flash_rt.amd`` CDNA4 backend
+              gfx1151 (Radeon 8060S) → ``flash_rt.amd`` BF16 backend
             Pass ``"thor"`` / ``"rtx_sm120"`` / ``"rtx_sm89"`` /
             ``"rtx_sm87"`` explicitly to
             force a specific backend (useful for cross-hardware debugging).
@@ -736,6 +738,24 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 "or: cmake -B build-amd -S csrc/amd -DGPU_ARCH=gfx950 && "
                 "cmake --build build-amd -j\n"
                 "See docs/deployment_amd.md.") from exc
+    elif arch == "amd_rdna35":
+        try:
+            import flash_rt.amd.flash_rt_amd_kernels  # noqa: F401
+        except ImportError as exc:
+            raise ImportError(
+                "flash_rt.amd.flash_rt_amd_kernels is not built for the "
+                "AMD RDNA 3.5 backend. Build it with:\n"
+                "    bash scripts/amd/build_amd.sh gfx1151\n"
+                "See the RDNA 3.5 section in docs/deployment_amd_pi05.md."
+            ) from exc
+        # The first RDNA 3.5 tier is intentionally BF16. load_model's
+        # historical default is use_fp8=True; coerce that default explicitly
+        # rather than routing to the gfx950 FP8 kernels.
+        if use_fp8:
+            use_fp8 = False
+            logger.warning(
+                "AMD RDNA 3.5 backend currently supports BF16 only; "
+                "disabling use_fp8.")
     elif arch == "npu":
         # Ascend NPU backend runs on torch_npu ops (aclnn) plus this repo's own
         # CCE kernels. No root CMake target and no PyTorch C++ extension is

@@ -7,15 +7,16 @@ surface as an AttributeError mid-graph-capture on an MI350X box. This file
 makes the whole bound surface a single loud collect-time-cheap assertion.
 
 The expected-name lists are written out explicitly (not derived from the
-module) and mirror, one to one:
+module). The CDNA4 inventory mirrors, one to one:
 
     csrc/amd/bindings.cpp                 (kernels, probes, memory ops)
     csrc/amd/gemm/bindings_gemm.inc       (FvkContext + GemmRunner)
     csrc/amd/gemm/bindings_smallm.inc     (hand-tuned small-M FP8 GEMM)
     csrc/amd/gemm/bindings_ffn_fused.inc  (fused decoder-FFN pair)
 
-If a name is deliberately removed from the bindings, remove it here in the
-same commit — that is the point.
+The smaller RDNA 3.5 inventory mirrors ``bindings_rdna.cpp``. If a name is
+deliberately removed from either binding surface, remove it here in the same
+commit — that is the point.
 
 Skip conditions: every test skips unless ``flash_rt.amd.flash_rt_amd_kernels``
 imports (the .so is built and libamdhip64 is loadable). Importing the module
@@ -55,16 +56,18 @@ def test_build_info_reports_hip_platform():
     assert isinstance(info["hip_runtime_version"], int)
 
 
-def test_build_info_gpu_arch_is_gfx950_when_stamped():
-    """FLASHRT_AMD_GPU_ARCH is stamped by csrc/amd/CMakeLists.txt at build
-    time; when present it must be the CDNA4 target this backend supports.
-    (Absent key = older build without the stamp; tolerated.)"""
+def test_build_info_gpu_arch_is_supported_when_stamped():
+    """The architecture stamp must identify a registered AMD source set."""
     m = _import_ext()
     info = m.build_info()
     if "gpu_arch" not in info:
         pytest.skip("build lacks the FLASHRT_AMD_GPU_ARCH stamp")
-    assert str(info["gpu_arch"]).startswith("gfx950"), (
-        f"AMD module built for {info['gpu_arch']!r}, expected gfx950*")
+    arch = str(info["gpu_arch"]).split(":", 1)[0]
+    assert arch in {"gfx950", "gfx1151"}, (
+        f"AMD module built for unsupported architecture {info['gpu_arch']!r}")
+    if arch == "gfx1151":
+        assert info.get("backend") == "rdna35"
+        assert info.get("wave_size") == 32
 
 
 def test_device_arch_coherent_with_build():
@@ -76,8 +79,9 @@ def test_device_arch_coherent_with_build():
     assert isinstance(arch, str)
     if arch in ("none", "unknown"):
         pytest.skip(f"no usable HIP device (device_arch()={arch!r})")
-    assert arch.split(":")[0] == "gfx950", (
-        f"extension is gfx950-only but the visible device is {arch!r}")
+    build_arch = str(m.build_info().get("gpu_arch", "")).split(":", 1)[0]
+    assert arch.split(":", 1)[0] == build_arch, (
+        f"extension build {build_arch!r} does not match device {arch!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +139,28 @@ _REQUIRED_FUNCS += [
 # csrc/amd/gemm/bindings_gemm.inc — classes.
 _REQUIRED_CLASSES = ["FvkContext", "GemmRunner"]
 
+_REQUIRED_RDNA_FUNCS = [
+    "build_info", "device_arch",
+    "qkv_rope_rdna",
+    "layer_norm_rdna", "rms_norm_rdna", "adarms_rdna",
+    "gelu_rdna", "gelu_mul_rdna", "gelu_mul_merged_rdna", "silu_rdna",
+    "residual_rdna", "residual_rms_rdna", "residual_adarms_rdna",
+    "attention_decoder_gqa_rdna",
+    "attention_decoder_gqa_splitkey_rdna",
+    "attention_encoder_gqa_rdna",
+    "smallm_wmma_bf16_rdna",
+    "smallm_wmma_bf16_residual_rdna",
+]
+_REQUIRED_RDNA_CLASSES = ["RdnaGemmRunner"]
+_REQUIRED_RDNA_GEMM_METHODS = [
+    "bf16_nn", "bf16_nn_bias", "enable_lazy_autotune",
+    "autotune_bf16_nn", "autotune_bf16_nn_bias",
+]
+
+
+def _is_rdna_module(module) -> bool:
+    return module.build_info().get("backend") == "rdna35"
+
 # GemmRunner methods the pi05 pipeline dispatches on by name.
 _REQUIRED_GEMM_METHODS = [
     "bf16_run", "bf16_nn", "bf16_nn_res", "bf16_nn_bias",
@@ -152,7 +178,12 @@ _REQUIRED_GEMM_METHODS = [
 def test_all_required_symbols_present():
     """One shot, full inventory: report EVERY missing name, not the first."""
     m = _import_ext()
-    missing = [n for n in _REQUIRED_FUNCS + _REQUIRED_CLASSES
+    required = (
+        _REQUIRED_RDNA_FUNCS + _REQUIRED_RDNA_CLASSES
+        if _is_rdna_module(m)
+        else _REQUIRED_FUNCS + _REQUIRED_CLASSES
+    )
+    missing = [n for n in required
                if not hasattr(m, n)]
     assert not missing, (
         "flash_rt_amd_kernels is missing bound symbols "
@@ -161,6 +192,12 @@ def test_all_required_symbols_present():
 
 def test_required_symbols_are_callable_or_types():
     m = _import_ext()
+    if _is_rdna_module(m):
+        for name in _REQUIRED_RDNA_FUNCS:
+            assert callable(getattr(m, name)), f"{name} bound but not callable"
+        for name in _REQUIRED_RDNA_CLASSES:
+            assert isinstance(getattr(m, name), type), f"{name} is not a class"
+        return
     for name in _REQUIRED_FUNCS:
         if hasattr(m, name):  # missing ones already reported above
             assert callable(getattr(m, name)), f"{name} bound but not callable"
@@ -173,6 +210,15 @@ def test_gemm_runner_method_surface():
     """The pipeline calls these methods on a GemmRunner instance; a method
     dropped from bindings_gemm.inc must fail here, not at capture time."""
     m = _import_ext()
+    if _is_rdna_module(m):
+        runner_cls = getattr(m, "RdnaGemmRunner", None)
+        assert runner_cls is not None
+        missing = [
+            name for name in _REQUIRED_RDNA_GEMM_METHODS
+            if not hasattr(runner_cls, name)
+        ]
+        assert not missing, f"RdnaGemmRunner missing methods: {missing}"
+        return
     runner_cls = getattr(m, "GemmRunner", None)
     if runner_cls is None:
         pytest.skip("GemmRunner missing (reported by the inventory test)")
@@ -184,6 +230,8 @@ def test_fvk_context_exposes_handle_ptr():
     """FvkContext.handle_ptr hands the hipBLASLt handle address to raw-ABI
     call sites; it is a readonly property on the class."""
     m = _import_ext()
+    if _is_rdna_module(m):
+        pytest.skip("RDNA module does not expose the CDNA hipBLASLt context")
     ctx_cls = getattr(m, "FvkContext", None)
     if ctx_cls is None:
         pytest.skip("FvkContext missing (reported by the inventory test)")
@@ -195,6 +243,8 @@ def test_variant_enumerators_answer():
     kernel launch, no device memory): they must answer on any box that can
     import the module, and their answers feed the tuning probes."""
     m = _import_ext()
+    if _is_rdna_module(m):
+        pytest.skip("RDNA module has no CDNA tuning enumerators")
     v = m.stream_probe_variants()
     assert len(v) > 0 and all("name" in d for d in v)
     fams = m.ew_tune_variants()
