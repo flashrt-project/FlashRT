@@ -92,6 +92,20 @@ def _cos(a, b) -> float:
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-30))
 
 
+def _fp8_spec(torch, ext):
+    info = dict(ext.build_info())
+    if info["fp8_format"] == "e4m3fnuz":
+        return torch.float8_e4m3fnuz, float(info["fp8_max_finite"])
+    return torch.float8_e4m3fn, float(info["fp8_max_finite"])
+
+
+def _require_fp8_gemm(ext):
+    info = dict(ext.build_info())
+    if (info["hardware"] == "amd_cdna3"
+            and int(info["hip_runtime_version"]) < 70_000_000):
+        pytest.skip("CDNA3 FP8 hipBLASLt validation requires ROCm 7.x")
+
+
 # Numerical gates, justified once:
 #  - COS_ELEMENTWISE 0.9999: elementwise/norm kernels share the reference's
 #    fp32 math except reduction order → agreement is a few bf16 ULPs; any
@@ -266,26 +280,27 @@ def test_qkv_split_rope_matches_reference(env):
 def test_quantize_fp8_static_byte_exact_vs_torch(env):
     """BYTE comparison against torch's float8_e4m3fn cast with the SAME
     scale, replicating the kernel's exact arithmetic (multiply by the fp32
-    reciprocal of the scale, clamp to ±448, RNE convert — verified in
+    reciprocal of the scale, clamp to the declared finite range, RNE convert —
     csrc/amd/kernels/quantize_fp8.hip). Comparing against unquantized fp32
     would be a category error: the contract is the encoding, not
     closeness."""
     torch, ext = env
+    fp8_dtype, fp8_max = _fp8_spec(torch, ext)
     n = 32768
     torch.manual_seed(5)
     x = (2.0 * torch.randn(n, device="cuda")).to(torch.bfloat16)
     # Production-style scale: amax/448 (per-tensor symmetric).
     amax = x.float().abs().max().item()
-    scale = torch.tensor([max(amax / 448.0, 1e-12)],
+    scale = torch.tensor([max(amax / fp8_max, 1e-12)],
                          dtype=torch.float32, device="cuda")
-    out = torch.empty(n, dtype=torch.float8_e4m3fn, device="cuda")
+    out = torch.empty(n, dtype=fp8_dtype, device="cuda")
 
     ext.quantize_fp8_static(x.data_ptr(), out.data_ptr(), scale.data_ptr(),
                             n, _stream(torch))
     torch.cuda.synchronize()
 
     inv_s = torch.reciprocal(scale)          # fp32, same op as the kernel
-    ref = (x.float() * inv_s).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    ref = (x.float() * inv_s).clamp(-fp8_max, fp8_max).to(fp8_dtype)
     mismatched = int((out.view(torch.uint8) != ref.view(torch.uint8))
                      .sum().item())
     assert mismatched == 0, (
@@ -330,11 +345,13 @@ def test_gemm_fp8_nn_dev_matches_quantized_reference(env, gemm):
     scales read from DEVICE pointers (A/B_SCALE_POINTER semantics). The
     reference multiplies the same fp8-decoded operands — never the
     pre-quantization fp32 originals."""
-    torch, _ = env
+    torch, ext = env
+    _require_fp8_gemm(ext)
+    fp8_dtype, _ = _fp8_spec(torch, ext)
     M, N, K = 64, 512, 1024
     torch.manual_seed(7)
-    A = (0.3 * torch.randn(M, K, device="cuda")).to(torch.float8_e4m3fn)
-    B = (0.3 * torch.randn(K, N, device="cuda")).to(torch.float8_e4m3fn)
+    A = (0.3 * torch.randn(M, K, device="cuda")).to(fp8_dtype)
+    B = (0.3 * torch.randn(K, N, device="cuda")).to(fp8_dtype)
     sa = torch.tensor([0.01], dtype=torch.float32, device="cuda")
     sb = torch.tensor([0.02], dtype=torch.float32, device="cuda")
     D = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
@@ -352,11 +369,13 @@ def test_gemm_fp8_nt_dev_matches_quantized_reference(env, gemm):
     """fp8_nt_dev: B stored (N,K) row-major, D = A @ B^T * sa * sb. This is
     the production pi05 layout (fp8_layout='nk', -2.8 ms E2E vs kn), so its
     transpose convention gets its own gate."""
-    torch, _ = env
+    torch, ext = env
+    _require_fp8_gemm(ext)
+    fp8_dtype, _ = _fp8_spec(torch, ext)
     M, N, K = 64, 512, 1024
     torch.manual_seed(8)
-    A = (0.3 * torch.randn(M, K, device="cuda")).to(torch.float8_e4m3fn)
-    Bt = (0.3 * torch.randn(N, K, device="cuda")).to(torch.float8_e4m3fn)
+    A = (0.3 * torch.randn(M, K, device="cuda")).to(fp8_dtype)
+    Bt = (0.3 * torch.randn(N, K, device="cuda")).to(fp8_dtype)
     sa = torch.tensor([0.01], dtype=torch.float32, device="cuda")
     sb = torch.tensor([0.02], dtype=torch.float32, device="cuda")
     D = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
@@ -390,12 +409,13 @@ COS_DECORRELATED = 0.99
 E4M3_MAX = 448.0
 
 
-def _quant_fp8(torch, x):
+def _quant_fp8(torch, x, ext):
     """Per-tensor symmetric e4m3 quantize, the way production calibration
     does it: scale = amax/448. Returns (fp8 tensor, fp32 scale scalar)."""
     amax = x.float().abs().max().clamp(min=1e-8)
-    scale = (amax / E4M3_MAX).float()
-    q = (x.float() / scale).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
+    dtype, fp8_max = _fp8_spec(torch, ext)
+    scale = (amax / fp8_max).float()
+    q = (x.float() / scale).clamp(-fp8_max, fp8_max).to(dtype)
     return q, scale
 
 
@@ -626,10 +646,11 @@ def test_gemm_fp8_nn_bias_applies_host_alpha_then_bias(env, gemm, label,
     e4m3's quantization error instead of the GEMM. The bias is added AFTER
     alpha scaling — the ordering matters and is pinned by the reference.
     """
-    torch, _ = env
+    torch, ext = env
+    _require_fp8_gemm(ext)
     A, B, bias = _groot_operands(torch, M, N, K, seed=50 + M + N + K)
-    A8, sa = _quant_fp8(torch, A)
-    B8, sb = _quant_fp8(torch, B)
+    A8, sa = _quant_fp8(torch, A, ext)
+    B8, sb = _quant_fp8(torch, B, ext)
     alpha = float(sa * sb)
     D = torch.empty(M, N, dtype=torch.half, device="cuda")
 
@@ -658,10 +679,11 @@ def test_gemm_fp8_nn_gelu_bias_is_tanh_approx(env, gemm, label, M, N, K):
     The GELU is the tanh approximation (hipBLASLt GELU_BIAS); erf-GELU or
     a missing activation both fail against this reference, and the extra
     discriminator pins that the activation ran at all."""
-    torch, _ = env
+    torch, ext = env
+    _require_fp8_gemm(ext)
     A, B, bias = _groot_operands(torch, M, N, K, seed=60 + M + N + K)
-    A8, sa = _quant_fp8(torch, A)
-    B8, sb = _quant_fp8(torch, B)
+    A8, sa = _quant_fp8(torch, A, ext)
+    B8, sb = _quant_fp8(torch, B, ext)
     alpha = float(sa * sb)
     D = torch.empty(M, N, dtype=torch.half, device="cuda")
 
@@ -686,10 +708,11 @@ def test_gemm_fp8_descale_fp16_matches_quantized_reference(env, gemm, label,
     descales read from DEVICE float pointers (A/B_SCALE_POINTER semantics)
     — same scale contract as fp8_nn_dev, only the output dtype differs.
     Reference over the same fp8-decoded operands."""
-    torch, _ = env
+    torch, ext = env
+    _require_fp8_gemm(ext)
     A, B, _bias = _groot_operands(torch, M, N, K, seed=70 + M + N + K)
-    A8, sa = _quant_fp8(torch, A)
-    B8, sb = _quant_fp8(torch, B)
+    A8, sa = _quant_fp8(torch, A, ext)
+    B8, sb = _quant_fp8(torch, B, ext)
     dsa = sa.reshape(1).contiguous().cuda()
     dsb = sb.reshape(1).contiguous().cuda()
     D = torch.empty(M, N, dtype=torch.half, device="cuda")
@@ -717,11 +740,13 @@ def test_gemm_fp8_descale_fp16_reads_the_scales_at_launch(env, gemm):
     it — a descriptor that baked in the first value would return the old
     result and pass every static parity test above.
     """
-    torch, _ = env
+    torch, ext = env
+    _require_fp8_gemm(ext)
+    fp8_dtype, _ = _fp8_spec(torch, ext)
     M, N, K = 64, 512, 1024
     torch.manual_seed(80)
-    A8 = (0.3 * torch.randn(M, K, device="cuda")).to(torch.float8_e4m3fn)
-    B8 = (0.3 * torch.randn(K, N, device="cuda")).to(torch.float8_e4m3fn)
+    A8 = (0.3 * torch.randn(M, K, device="cuda")).to(fp8_dtype)
+    B8 = (0.3 * torch.randn(K, N, device="cuda")).to(fp8_dtype)
     # Magnitudes chosen so both arms stay well inside fp16 normal range.
     dsa = torch.tensor([0.1], dtype=torch.float32, device="cuda")
     dsb = torch.tensor([1.0], dtype=torch.float32, device="cuda")
@@ -841,7 +866,9 @@ def test_gemm_mxfp4_nt_dev_matches_dequantized_reference(env, gemm, M, N, K):
     even with the block scales wired wrong.) B is (N,K): the NT layout is
     part of the contract and a swapped layout decorrelates.
     """
-    torch, _ = env
+    torch, ext = env
+    if not ext.build_info()["supports_mxfp4"]:
+        pytest.skip("MXFP4 is unavailable on this AMD architecture")
     torch.manual_seed(91)
     A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
     Bt = (0.5 * torch.randn(N, K, device="cuda")).to(torch.bfloat16)
@@ -939,8 +966,10 @@ def test_autotune_fp8_nn_dev_preserves_semantics(env):
     runner = _fresh_runner(ext)
     M, N, K = 64, 512, 1024
     torch.manual_seed(102)
-    A8 = (0.3 * torch.randn(M, K, device="cuda")).to(torch.float8_e4m3fn)
-    B8 = (0.3 * torch.randn(K, N, device="cuda")).to(torch.float8_e4m3fn)
+    _require_fp8_gemm(ext)
+    fp8_dtype, _ = _fp8_spec(torch, ext)
+    A8 = (0.3 * torch.randn(M, K, device="cuda")).to(fp8_dtype)
+    B8 = (0.3 * torch.randn(K, N, device="cuda")).to(fp8_dtype)
     dsa = torch.tensor([0.01], dtype=torch.float32, device="cuda")
     dsb = torch.tensor([0.02], dtype=torch.float32, device="cuda")
     D = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
@@ -965,8 +994,10 @@ def test_autotune_fp8_nt_dev_preserves_semantics(env):
     runner = _fresh_runner(ext)
     M, N, K = 64, 512, 1024
     torch.manual_seed(103)
-    A8 = (0.3 * torch.randn(M, K, device="cuda")).to(torch.float8_e4m3fn)
-    Bt8 = (0.3 * torch.randn(N, K, device="cuda")).to(torch.float8_e4m3fn)
+    _require_fp8_gemm(ext)
+    fp8_dtype, _ = _fp8_spec(torch, ext)
+    A8 = (0.3 * torch.randn(M, K, device="cuda")).to(fp8_dtype)
+    Bt8 = (0.3 * torch.randn(N, K, device="cuda")).to(fp8_dtype)
     dsa = torch.tensor([0.01], dtype=torch.float32, device="cuda")
     dsb = torch.tensor([0.02], dtype=torch.float32, device="cuda")
     D = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
@@ -987,11 +1018,12 @@ def test_autotune_fp8_descale_fp16_preserves_semantics(env):
     where split-K candidates differ most): the tuned algorithm must keep
     both the device-descale semantics and the FP16 output."""
     torch, ext = env
+    _require_fp8_gemm(ext)
     runner = _fresh_runner(ext)
     M, N, K = 41, 1536, 6144
     A, B, _bias = _groot_operands(torch, M, N, K, seed=104)
-    A8, sa = _quant_fp8(torch, A)
-    B8, sb = _quant_fp8(torch, B)
+    A8, sa = _quant_fp8(torch, A, ext)
+    B8, sb = _quant_fp8(torch, B, ext)
     dsa = sa.reshape(1).contiguous().cuda()
     dsb = sb.reshape(1).contiguous().cuda()
     D = torch.empty(M, N, dtype=torch.half, device="cuda")
@@ -1015,6 +1047,8 @@ def test_autotune_mxfp4_nt_dev_preserves_semantics(env):
     when hipBLASLt exposes no MXFP4 algorithm at all (an environment
     capability, not a kernel regression)."""
     torch, ext = env
+    if not ext.build_info()["supports_mxfp4"]:
+        pytest.skip("MXFP4 is unavailable on this AMD architecture")
     runner = _fresh_runner(ext)
     M, N, K = 64, 512, 1024
     torch.manual_seed(105)
@@ -1071,6 +1105,43 @@ def test_enable_lazy_autotune_preserves_semantics(env):
     ref = A.float() @ B.float()
     assert _cos(D.float().cpu(), ref.cpu()) > COS_GEMM
     torch.testing.assert_close(D.float(), ref, atol=0.5, rtol=0.05)
+
+
+# ---------------------------------------------------------------------------
+# BF16 decoder boundary fusion
+# ---------------------------------------------------------------------------
+
+def test_gate_residual_ada_norm_bf16_matches_two_kernel_chain(env):
+    """The fused boundary preserves both BF16 materialization points."""
+    torch, ext = env
+    torch.manual_seed(107)
+    rows, dim = 10, 1024
+    residual_a = torch.randn(rows, dim, device="cuda", dtype=torch.bfloat16)
+    residual_b = residual_a.clone()
+    x = torch.randn_like(residual_a)
+    gate = torch.randn_like(residual_a)
+    weight = torch.randn(dim, device="cuda", dtype=torch.bfloat16)
+    style = torch.randn(rows, 3 * dim, device="cuda", dtype=torch.bfloat16)
+    out_a = torch.empty_like(residual_a)
+    out_b = torch.empty_like(residual_a)
+    gate_a = torch.empty_like(residual_a)
+    gate_b = torch.empty_like(residual_a)
+    stream = _stream(torch)
+
+    ext.gate_mul_residual(residual_a.data_ptr(), x.data_ptr(),
+                          gate.data_ptr(), rows * dim, stream)
+    ext.ada_rms_norm_style(
+        residual_a.data_ptr(), weight.data_ptr(), style.data_ptr(),
+        out_a.data_ptr(), gate_a.data_ptr(), rows, dim, 1e-6, stream)
+    ext.gate_residual_ada_norm_bf16(
+        residual_b.data_ptr(), x.data_ptr(), gate.data_ptr(),
+        weight.data_ptr(), style.data_ptr(), out_b.data_ptr(),
+        gate_b.data_ptr(), rows, dim, 1e-6, stream)
+    torch.cuda.synchronize()
+
+    assert torch.equal(residual_a, residual_b)
+    assert torch.equal(out_a, out_b)
+    assert torch.equal(gate_a, gate_b)
 
 
 # ---------------------------------------------------------------------------

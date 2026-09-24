@@ -20,8 +20,8 @@ so a name added to the .inc without a gate fails this file.
 
 What the gates protect (why they are not loose cosines):
 
-  * FP8 outputs are compared BYTE-for-byte against a torch
-    ``float8_e4m3fn`` cast of the same fp32 reference through the SAME
+  * FP8 outputs are compared BYTE-for-byte against the architecture's torch
+    E4M3 cast (FNUZ on CDNA3, OCP on CDNA4) through the SAME
     device scale, replicating the kernel's exact arithmetic (multiply by
     the fp32 reciprocal of the scale, clamp to +-448, RNE convert).
     Comparing an FP8 output against an unquantized fp32 reference would
@@ -142,29 +142,37 @@ ATOL_BF16 = 2e-2
 FP8_MISMATCH_RNE = 1e-3
 FP8_MISMATCH_REDUCE = 5e-3
 
-E4M3_MAX = 448.0
-
-
 # ---------------------------------------------------------------------------
 # FP8 helpers
 # ---------------------------------------------------------------------------
 
 
+def _fp8_contract(torch):
+    """Return the format used by the live AMD architecture."""
+    gcn = torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0]
+    if gcn == "gfx942":
+        return torch.float8_e4m3fnuz, 240.0
+    if gcn == "gfx950":
+        return torch.float8_e4m3fn, 448.0
+    raise RuntimeError(f"unsupported AMD FP8 test architecture {gcn!r}")
+
+
 def _static_scale(torch, ref_f32):
-    """Per-tensor symmetric static scale (device fp32 scalar), computed the
-    way production calibration does: amax / 448."""
+    """Per-tensor symmetric scale using the architecture's finite maximum."""
+    _, max_finite = _fp8_contract(torch)
     amax = ref_f32.detach().float().abs().max().clamp(min=1e-8)
-    return (amax / E4M3_MAX).float().reshape(1).contiguous()
+    return (amax / max_finite).float().reshape(1).contiguous()
 
 
 def _fp8_ref_bytes(torch, ref_f32, scale):
-    """torch float8_e4m3fn cast of ``ref_f32`` through the SAME device
+    """Architecture-matched E4M3 cast of ``ref_f32`` through the SAME device
     scale, replicating the kernel arithmetic exactly: the kernels compute
     ``inv = 1.0f / (*d_scale)`` once and then ``value * inv``, clamp to
-    +-448 and RNE-convert. ``torch.reciprocal`` is the same fp32 op."""
+    finite range and RNE-convert. ``torch.reciprocal`` is the same fp32 op."""
+    dtype, max_finite = _fp8_contract(torch)
     inv = torch.reciprocal(scale)
-    q = (ref_f32.float() * inv).clamp(-E4M3_MAX, E4M3_MAX)
-    return q.to(torch.float8_e4m3fn).view(torch.uint8)
+    q = (ref_f32.float() * inv).clamp(-max_finite, max_finite)
+    return q.to(dtype).view(torch.uint8)
 
 
 def _assert_fp8(torch, name, out_u8, ref_f32, scale, max_mismatch):
@@ -181,8 +189,9 @@ def _assert_fp8(torch, name, out_u8, ref_f32, scale, max_mismatch):
         f"{name}: {mismatch:.5f} of FP8 bytes differ from torch e4m3 with "
         f"the same scale (budget {max_mismatch}) — encoding or scale-path "
         "drift silently poisons every downstream FP8 GEMM")
-    got = out_u8.view(torch.float8_e4m3fn).float()
-    ref = ref_u8.view(torch.float8_e4m3fn).float()
+    dtype, _ = _fp8_contract(torch)
+    got = out_u8.view(dtype).float()
+    ref = ref_u8.view(dtype).float()
     assert _cos(torch, got, ref) > COS_FP8_DEQ, f"{name}: dequantized cos"
 
 
@@ -236,7 +245,10 @@ def test_entry_point_inventory(ext):
     that keeps this file honest — a NEW m.def added to either .inc without
     a gate here has to be added to these lists in the same commit.
     """
-    expected = FP16_PORT_ENTRY_POINTS + SMALLM_BF16_ENTRY_POINTS
+    info = dict(ext.build_info())
+    expected = list(FP16_PORT_ENTRY_POINTS)
+    if info.get("supports_packed_bf16_mfma", False):
+        expected += SMALLM_BF16_ENTRY_POINTS
     missing = [n for n in expected if not hasattr(ext, n)]
     assert not missing, (
         "flash_rt_amd_kernels is missing bound entry points from "
@@ -555,7 +567,8 @@ def test_silu_mul_split_fp8_fp16_fuses_silu_mul_and_quantize(env):
 
     _assert_fp8(torch, "silu_mul_split_fp8_fp16", out, ref_f32, scale,
                 max_mismatch=FP8_MISMATCH_RNE)
-    got = out.view(torch.float8_e4m3fn).float() * scale
+    dtype, _ = _fp8_contract(torch)
+    got = out.view(dtype).float() * scale
     # Operand-order discriminators: silu(up)*gate and gate*up (no
     # activation) are both plausible mis-wirings and both decorrelate.
     swapped = (up.float() / (1.0 + torch.exp(-up.float()))) * g
@@ -1211,6 +1224,11 @@ def _valid_variants(ext, K):
     return ok
 
 
+def _require_smallm_bf16(ext):
+    if not dict(ext.build_info()).get("supports_packed_bf16_mfma", False):
+        pytest.skip("packed BF16 MFMA is not declared by this AMD architecture")
+
+
 def test_smallm_mfma_bf16_variants_enumerator(env):
     """The variant enumerator is pure host introspection and is what the
     parity/bench harnesses iterate; it must answer with at least the
@@ -1218,6 +1236,7 @@ def test_smallm_mfma_bf16_variants_enumerator(env):
     ids must be contiguous from 0 (the binding passes the index straight
     through as the ``variant`` argument)."""
     torch, ext = env
+    _require_smallm_bf16(ext)
     names = list(ext.smallm_mfma_bf16_variants())
     assert len(names) >= 5, f"expected auto + 4 launch forms, got {names}"
     assert names[0] == "auto", f"variant 0 must be the auto heuristic: {names}"
@@ -1247,6 +1266,7 @@ def test_smallm_mfma_bf16_epilogue_parity(env, label, M, N, K, epilogue):
     LDS-reduction bug can be present in one and absent in the others.
     """
     torch, ext = env
+    _require_smallm_bf16(ext)
     A, W, Wp, bias = _smallm_bf16_case(torch, M, N, K, seed=M * 7919 + N + K)
     base = A.float() @ W.float() + bias.float()
     if epilogue == "bias_gelu":
@@ -1301,6 +1321,7 @@ def test_smallm_mfma_bf16_requires_the_documented_pack_layout(env):
     (and every caller following it) would be silently wrong.
     """
     torch, ext = env
+    _require_smallm_bf16(ext)
     M, N, K = 41, 1536, 1536
     A, W, Wp, bias = _smallm_bf16_case(torch, M, N, K, seed=999)
     ref = A.float() @ W.float() + bias.float()
