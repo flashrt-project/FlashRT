@@ -108,6 +108,9 @@ class Pi05TorchPipeline:
         self._capture_probes = False
         self._graph = None
         self._graph_prompt_len = None
+        self._decoder_only_graph = None
+        self._decoder_only_graph_prompt_len = None
+        self._current_prompt_len = None
 
     @staticmethod
     def _patch_position(out, patch, position) -> None:
@@ -534,6 +537,29 @@ class Pi05TorchPipeline:
         valid_prefix = self._encoder(self.buf["input_prompt"][:prompt_len], prompt_len)
         self._decoder(valid_prefix)
 
+    def _run_decoder_static(self, valid_prefix: int) -> None:
+        """Run only denoising against the most recently encoded K/V prefix."""
+        self.buf["noise"].copy_(self.buf["input_noise"])
+        self._decoder(valid_prefix)
+
+    def _record_decoder_only_graph(self, prompt_len: int) -> None:
+        """Capture the decoder-only half of the current static-shape pipeline."""
+        valid_prefix = self.num_views * PATCHES_PER_VIEW + prompt_len
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                self._run_decoder_static(valid_prefix)
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            self._run_decoder_static(valid_prefix)
+        torch.cuda.synchronize()
+        self._decoder_only_graph = graph
+        self._decoder_only_graph_prompt_len = prompt_len
+
     def record_graph(self, prompt_len: int) -> None:
         if self._capture_probes:
             raise RuntimeError("Cannot capture a graph while debug probes are enabled")
@@ -609,6 +635,61 @@ class Pi05TorchPipeline:
                     noise.reshape(self.chunk_size, ACTION_DIM))
                 self._vision(images_nhwc)
                 valid_prefix = self._encoder(prompt_embeds, prompt_len)
+                self._decoder(valid_prefix)
+            self._current_prompt_len = prompt_len
+            self._save("final_raw_action", self.buf["noise"])
+        finally:
+            self._capture_probes = False
+        return self.buf["noise"].unsqueeze(0)
+
+    @torch.inference_mode()
+    def forward_decode_only(
+        self,
+        noise: torch.Tensor,
+        *,
+        capture_probes: bool = False,
+        use_graph: bool = False,
+    ) -> torch.Tensor:
+        """Denoise with the K/V prefix produced by the last full forward.
+
+        This is the tensor-pipeline equivalent of the CDNA4
+        ``forward_decode_only`` path. Images and prompt embeddings are not
+        consumed: the method intentionally reuses the last full forward's
+        per-layer encoder K/V cache. A full forward is therefore required
+        before the first call and whenever the prompt/context is invalidated.
+        """
+        if self._current_prompt_len is None:
+            raise RuntimeError(
+                "forward_decode_only requires a preceding full forward")
+        if noise.shape not in (
+            (self.chunk_size, ACTION_DIM),
+            (1, self.chunk_size, ACTION_DIM),
+        ):
+            raise ValueError(f"Unsupported noise shape {tuple(noise.shape)}")
+        if noise.device.type != self.device.type or noise.dtype != self.dtype:
+            raise TypeError("noise must be a BF16 tensor on the pipeline device")
+        if capture_probes and use_graph:
+            raise ValueError("Debug probes are only available in no-graph mode")
+        if capture_probes:
+            self.probes = {}
+        self._capture_probes = capture_probes
+        try:
+            if use_graph:
+                self.buf["input_noise"].copy_(
+                    noise.reshape(self.chunk_size, ACTION_DIM))
+                if (
+                    self._decoder_only_graph_prompt_len
+                    != self._current_prompt_len
+                ):
+                    self._record_decoder_only_graph(self._current_prompt_len)
+                self._decoder_only_graph.replay()
+            else:
+                self.buf["noise"].copy_(
+                    noise.reshape(self.chunk_size, ACTION_DIM))
+                valid_prefix = (
+                    self.num_views * PATCHES_PER_VIEW
+                    + self._current_prompt_len
+                )
                 self._decoder(valid_prefix)
             self._save("final_raw_action", self.buf["noise"])
         finally:

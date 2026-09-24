@@ -74,6 +74,26 @@ def test_shared_pipeline_precompute_matches_runtime(small_model, views, compact)
         torch.testing.assert_close(a.probes[key], b.probes[key], rtol=0, atol=0)
 
 
+@pytest.mark.parametrize('compact', [False, True])
+def test_shared_pipeline_decoder_only_reuses_last_encoder_cache(small_model, compact):
+    fixture = small_model
+    pipeline = model.Pi05TorchPipeline(
+        fixture.weights, TorchTensorOps(), TorchGemmBackend(),
+        TorchAttentionBackend(2), num_views=2, max_prompt_len=5,
+        chunk_size=3, num_steps=2, device='cpu', compact_encoder=compact,
+    )
+    images = fixture.rand(2, 224, 224, 3)
+    prompt = fixture.rand(3, 8)
+    noise = fixture.rand(3, 4)
+
+    with pytest.raises(RuntimeError, match='preceding full forward'):
+        pipeline.forward_decode_only(noise)
+
+    full = pipeline.forward_with_inputs(images, prompt, 3, noise).clone()
+    cached = pipeline.forward_decode_only(noise).clone()
+    torch.testing.assert_close(cached, full, rtol=0, atol=0)
+
+
 def test_rdna_binding_has_no_model_traversal():
     from flash_rt.amd.models.pi05_rdna35.pipeline import Pi05PipelineRdna35
     assert Pi05PipelineRdna35._vision is model.Pi05TorchPipeline._vision

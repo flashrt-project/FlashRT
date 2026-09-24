@@ -32,7 +32,7 @@ def test_rdna35_pipeline_registration_is_lazy():
     assert cls.__name__ == "Pi05TorchFrontendAmdRdna35"
 
 
-def test_rdna35_v1_has_no_temporal_cache_surface():
+def test_rdna35_temporal_cache_surface_matches_other_pi05_backends():
     from flash_rt.amd.frontends.torch.pi05_rdna35 import (
         Pi05TorchFrontendAmdRdna35,
     )
@@ -40,12 +40,21 @@ def test_rdna35_v1_has_no_temporal_cache_surface():
 
     frontend_parameters = inspect.signature(
         Pi05TorchFrontendAmdRdna35.__init__).parameters
-    pipeline_parameters = inspect.signature(
-        Pi05PipelineRdna35.forward_with_inputs).parameters
-    assert "cache_frames" not in frontend_parameters
-    assert "reuse_encoder_cache" not in pipeline_parameters
-    assert not hasattr(Pi05TorchFrontendAmdRdna35, "reset_temporal_cache")
-    assert not hasattr(Pi05PipelineRdna35, "record_decoder_graph")
+    assert "cache_frames" in frontend_parameters
+    assert hasattr(Pi05PipelineRdna35, "forward_decode_only")
+
+
+def test_rdna35_temporal_schedule_starts_with_full_and_refreshes_periodically():
+    from flash_rt.amd.frontends.torch.pi05_rdna35 import (
+        Pi05TorchFrontendAmdRdna35,
+    )
+
+    frontend = object.__new__(Pi05TorchFrontendAmdRdna35)
+    frontend._cache_frames = 3
+    frontend._frame_count = 0
+    assert [frontend._use_full_pipeline_for_next_frame() for _ in range(7)] == [
+        True, False, False, True, False, False, True,
+    ]
 
 
 @pytest.mark.parametrize("arch", ["gfx1151", "gfx1151:sramecc-:xnack-"])
@@ -227,12 +236,17 @@ def test_public_api_forwards_robot_action_schema(monkeypatch):
     import flash_rt.hardware as hardware
     captured = {}
     class Frontend:
-        def __init__(self, checkpoint, num_views=2, hardware=None, use_fp8=False, action_dim=None):
+        def __init__(self, checkpoint, num_views=2, hardware=None, use_fp8=False,
+                     action_dim=None, cache_frames=1):
             captured['action_dim'] = action_dim
+            captured['cache_frames'] = cache_frames
     monkeypatch.setitem(sys.modules, 'flash_rt.amd.flash_rt_amd_kernels', types.ModuleType('flash_rt.amd.flash_rt_amd_kernels'))
     monkeypatch.setattr(hardware, 'resolve_pipeline_class', lambda *a, **kw: Frontend)
-    flash_rt.load_model('unused', config='pi05', framework='torch', hardware='amd_rdna35', action_dim=3, use_fp8=False)
+    flash_rt.load_model('unused', config='pi05', framework='torch',
+                        hardware='amd_rdna35', action_dim=3,
+                        cache_frames=2, use_fp8=False)
     assert captured['action_dim'] == 3
+    assert captured['cache_frames'] == 2
 
 
 def test_public_actions_keep_constant_last_channel(monkeypatch, tmp_path):
@@ -243,6 +257,8 @@ def test_public_actions_keep_constant_last_channel(monkeypatch, tmp_path):
     frontend.norm_stats = {'actions': {'q01': [-1., -1., .5], 'q99': [1., 1., .5]}}
     frontend.action_dim = frontend._resolve_action_dim(tmp_path, 3, frontend.norm_stats)
     frontend._prompt_len = 1
+    frontend._cache_frames = 1
+    frontend._frame_count = 0
     frontend.dtype = torch.bfloat16
     frontend._noise_buf = torch.zeros(2, 32, dtype=torch.bfloat16)
     frontend._image_buf = torch.empty(0)

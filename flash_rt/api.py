@@ -499,7 +499,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         vision_num_layers: Pi0.5 torch RTX/Orin only. Number of SigLIP vision
             layers to execute; valid range is 1-27. ``None`` keeps the
             frontend default.
-        cache_frames: Pi0.5 torch RTX/Orin only. Temporal K/V reuse period.
+        cache_frames: Pi0.5 torch RTX/Orin and AMD CDNA4/RDNA 3.5 only.
+            Temporal K/V reuse period.
             1 runs the full vision+encoder+decoder path on every frame; 2
             alternates full and decoder-only frames. ``None`` keeps the
             frontend default.

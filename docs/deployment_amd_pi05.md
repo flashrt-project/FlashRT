@@ -189,11 +189,10 @@ routing, and source-layout information is in
 
 ## Validation status
 
-The RDNA bindings now use the model-owned torch tensor pipeline. The contributor's
-original hardware measurements predate this restructuring and are not a performance
-claim for this revision. CPU checks cover import isolation, output schema, shared
-execution and routing. Native gfx1151 compilation and independent whole-model
-numerical parity have not been rerun for this revision.
+The RDNA bindings use the model-owned torch tensor pipeline. The native gfx1151
+extension, independent OpenPI fixture, full and decoder-only HIP Graphs, temporal
+schedule, native/fallback parity, output schema and routing have been validated on
+Radeon 8060S. The default remains `cache_frames=1`; temporal reuse is explicit.
 
 ## Quick start
 
@@ -231,6 +230,7 @@ model = flash_rt.load_model(
     hardware="amd_rdna35",  # optional on a gfx1151 machine
     action_dim=7,  # use your robot's actual output dimension
     num_views=2,
+    cache_frames=1,  # set 2+ only after validating temporal quality
     use_fp8=False,
 )
 model.set_prompt("pick up the object", state=state_vector)
@@ -272,6 +272,13 @@ inside their validated small-shape profiles. Larger horizons and sequences
 fall back to PyTorch SDPA or hipBLASLt, so changing the checkpoint profile
 does not launch a shape-incompatible kernel.
 
+`cache_frames=1` refreshes image/prompt K/V on every call. With
+`cache_frames=2`, calls alternate between a full forward and decoder-only
+execution using the preceding frame's K/V. Calling `set_prompt()` resets the
+schedule, so the next inference is always a full refresh; consequently, a
+serving loop that updates state through `set_prompt(..., state=...)` on every
+frame intentionally receives no temporal-cache speedup.
+
 ## Environment knobs
 
 The native path is enabled by default. These switches are intended for
@@ -306,11 +313,14 @@ TunableOp state is modified. Triton is not a runtime dependency.
 | Pinned-noise inference and optional full-model HIP Graph | ✅ |
 | Native HIP attention, QKV/RoPE, normalization, activation, residual, small-M projection | ✅ |
 | FP8 / FP4 | ❌ |
-| Temporal K/V reuse, decoder-only graph | ❌ |
+| Temporal K/V reuse (`cache_frames`) and decoder-only execution | ✅ |
 | CDNA4 aiter, MFMA, and wave64 kernels | ❌ isolated by build and routing |
 
-The first RDNA version is deliberately an operator-optimization backend. It
-does not include temporal caching or an asynchronous serving pipeline.
+`cache_frames=1` is the lossless default and refreshes Vision/Encoder on every
+frame. Values greater than one reuse the most recently encoded K/V prefix for
+intermediate decoder-only frames. This improves effective throughput but uses
+stale visual/prompt context, so deployments must validate task quality on real
+trajectories. The RDNA backend does not enable an asynchronous serving pipeline.
 
 ## Validation
 
