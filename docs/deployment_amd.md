@@ -1,4 +1,4 @@
-# FlashRT on AMD Instinct (MI350X / CDNA4)
+# FlashRT on AMD Instinct (MI300X / CDNA3 and MI350X / CDNA4)
 
 This is the model-independent guide to the AMD backend: supported
 hardware, how to build the extension, how the tree is laid out, how
@@ -13,22 +13,20 @@ Per-model deployment guides:
 
 ## Supported hardware
 
-**gfx950 only** — CDNA4, i.e. the Instinct MI350 series, with ROCm 7.x
-and a ROCm build of PyTorch. The kernels use gfx950-specific MFMA shapes
-and FP8 (OCP `e4m3`) paths that produce wrong results, not a slow
-fallback, on other AMD architectures. The restriction is therefore
-enforced twice:
+The backend supports `gfx942` (CDNA3, MI300 series) and `gfx950`
+(CDNA4, MI350 series). Use ROCm 7.2 with a matching ROCm PyTorch build.
+The extension is built for exactly one architecture because their FP8 byte
+formats differ: CDNA3 uses E4M3 FNUZ (maximum finite value 240), while CDNA4
+uses OCP E4M3 (maximum finite value 448).
 
-- **At build time** — `scripts/amd/build_amd.sh` rejects a `GPU_ARCH`
-  argument that does not start with `gfx950`. Set
-  `FLASHRT_AMD_ALLOW_ARCH=1` to override when bringing up a port to a
-  future architecture.
+- **At build time** — `scripts/amd/build_amd.sh` accepts the exact base
+  targets `gfx942` and `gfx950` only.
 - **At frontend init** — the frontend reads the extension's
   `device_arch()` (the running device's `gcnArchName`, e.g.
   `gfx950:sramecc+:xnack-`) and `build_info()["gpu_arch"]` (the
-  compile-time target) and raises `RuntimeError` unless both are gfx950.
+  compile-time target) and raises `RuntimeError` unless both exactly match.
   This fires before the checkpoint is touched, so forcing
-  `hardware="amd_cdna4"` on another AMD card fails immediately instead
+  an explicit AMD hardware target on the other generation fails immediately instead
   of computing garbage.
 
 ## Build
@@ -39,11 +37,12 @@ CUDA or CUTLASS present.
 
 ```bash
 bash scripts/amd/build_amd.sh gfx950
+# or, on MI300X:
+bash scripts/amd/build_amd.sh gfx942
 ```
 
-Output: `flash_rt/amd/flash_rt_amd_kernels*.so`. The script prefers
-CMake and falls back to a direct `hipcc` one-shot compile when no usable
-CMake is available.
+Output: `flash_rt/amd/flash_rt_amd_kernels*.so`. CMake selects the source
+set for the target generation.
 
 Dependencies:
 
@@ -72,12 +71,13 @@ Dependencies:
 csrc/amd/                    standalone HIP tree (own CMake entry point)
   bindings.cpp               pybind module flash_rt_amd_kernels
   gemm/                      hipBLASLt runner + hand-written MFMA GEMMs
-  attention/                 hand-written CDNA4 attention kernels
+  arch.h                     FP8 format, datatype, and capability selection
+  attention/                 hand-written attention kernels
   kernels/                   norm / activation / quantize / fusion families
 flash_rt/amd/
   core/hip_buffer.py         ctypes device memory over libamdhip64
   core/hip_graph.py          ctypes HIP graph capture / instantiate / replay
-  hardware/cdna4/            attention backends (aiter, SDPA fallback)
+  hardware/cdna3|cdna4/      generation-specific attention entry points
   models/<model>/pipeline.py pointer-only forward passes
   frontends/torch/<model>.py weight load, calibration, capture, infer
 ```
@@ -90,10 +90,8 @@ or framework operations on the inference path.
 
 ## Hardware routing
 
-Auto-detection: when `torch.version.hip` is set and the device's
-`gcnArchName` is gfx950, `detect_arch()` returns `"amd_cdna4"`. Another
-ROCm architecture raises rather than falling through to an NVIDIA table
-entry.
+Auto-detection maps `gfx942` to `"amd_cdna3"` and `gfx950` to
+`"amd_cdna4"`. Other ROCm architectures raise.
 
 ```python
 import flash_rt
@@ -102,7 +100,7 @@ model = flash_rt.load_model(checkpoint_dir, config="pi05",
                             framework="torch")            # auto-detected
 model = flash_rt.load_model(checkpoint_dir, config="pi05",
                             framework="torch",
-                            hardware="amd_cdna4")         # explicit
+                            hardware="amd_cdna3")         # explicit MI300X
 ```
 
 Expected failures:
@@ -110,7 +108,7 @@ Expected failures:
 | Situation | Error |
 |---|---|
 | Extension not built | `ImportError` naming `flash_rt_amd_kernels` and the build command |
-| Non-gfx950 AMD device | `RuntimeError` naming the device and build architectures |
+| Extension/device architecture mismatch | `RuntimeError` naming both architectures |
 | Model/framework not ported to AMD | `RuntimeError` from pipeline resolution |
 | Thor-only options (`use_fp4_decoder`, `use_fa4`) | `ValueError` naming the supported hardware |
 
@@ -124,7 +122,6 @@ documented in the per-model guides.
 | `FVK_AMD_ATTN` | `aiter` | attention backend: `aiter` or `sdpa` (torch fallback) |
 | `FLASHRT_FP8_NT_AUTOTUNE` | `auto` | timed hipBLASLt algorithm selection at setup; `off` uses heuristic top-1 |
 | `FLASHRT_FP8_ALGO_POOL` | `16` | candidate pool depth for the timed selection. Deeper pools (64/128) sometimes find faster algorithms but widen run-to-run pick variance, and a single mis-timed trial can ship a slow algorithm |
-| `FLASHRT_AMD_ALLOW_ARCH` | `0` | build-script escape hatch for a non-gfx950 port |
 
 ## Tests
 
@@ -169,8 +166,9 @@ so the suite is safe to run in a CUDA-only CI.
 - The three-argument graph instantiate is `hipGraphInstantiateWithFlags`.
 - Memcpy-kind and capture-mode enum values match CUDA numerically
   (validated on hardware by the runtime-seam smoke test).
-- FP8 storage is OCP `e4m3` (`__hip_fp8_e4m3`, `HIP_R_8F_E4M3`) — never
-  the CDNA3 `fnuz` variant.
+- FP8 storage comes from `csrc/amd/arch.h`: E4M3 FNUZ with
+  `HIP_R_8F_E4M3_FNUZ` on CDNA3, and OCP E4M3 with `HIP_R_8F_E4M3` on
+  CDNA4. Weights and activation scales must be regenerated for the target.
 - hipBLASLt matmul is column-major; the GEMM runner uses the
   operand-swap form (`D_col = B_col @ A_col`), the same trick the CUDA
   FP8 paths use.
@@ -178,6 +176,9 @@ so the suite is safe to run in a CUDA-only CI.
   per-lane contiguous 8-byte fragments; the hand-written GEMMs repack
   weights at setup into per-lane consumption order so each workgroup
   streams its weight tile linearly.
+- On gfx942 the packed FNUZ FP8 and packed BF16 Pi0.5 decoder paths are
+  available. MXFP4 remains unavailable; unsupported forms route through
+  hipBLASLt. Encoder attention uses AITER.
 - Every HIP runtime call in the Python layer is return-code checked; a
   failed launch, copy or synchronise raises instead of letting a stale
   buffer be read back as a result.
