@@ -180,15 +180,13 @@ def test_bf16_gemm_supports_strided_output_rows():
         right, x @ right_weight, atol=7e-2, rtol=3e-2)
 
 
-def test_split_ffn_views_use_safe_activation_fallback(monkeypatch):
+def test_split_ffn_views_use_safe_activation_fallback():
     torch, kernels = _require_rdna35_hip()
     import torch.nn.functional as F
-    from flash_rt.amd.models.pi05_rdna35.pipeline import Pi05PipelineRdna35
+    from flash_rt.amd.hardware.rdna35.ops import Rdna35TensorOps
 
-    pipeline = Pi05PipelineRdna35.__new__(Pi05PipelineRdna35)
-    pipeline.fvk = kernels.fvk
-    pipeline.dtype = torch.bfloat16
-    pipeline.hip_decoder = True
+    ops = Rdna35TensorOps(kernels.fvk, torch.bfloat16)
+    ops.fused_decoder_ops = True
     generator = torch.Generator(device="cuda").manual_seed(10)
     packed = torch.randn(
         15, 8192, generator=generator, device="cuda", dtype=torch.bfloat16)
@@ -196,7 +194,7 @@ def test_split_ffn_views_use_safe_activation_fallback(monkeypatch):
     up = packed[:, 4096:]
     output = torch.empty_like(gate, memory_format=torch.contiguous_format)
 
-    pipeline._gelu_mul(output, gate, up)
+    ops.gelu_mul(output, gate, up)
     reference = (
         F.gelu(gate.float(), approximate="tanh") * up.float()
     ).to(torch.bfloat16)
@@ -220,12 +218,10 @@ def test_gemm_backend_does_not_mutate_torch_tunable_state():
 def test_pipeline_fallback_matches_float32_reference():
     torch, kernels = _require_rdna35_hip()
     import torch.nn.functional as F
-    from flash_rt.amd.models.pi05_rdna35.pipeline import Pi05PipelineRdna35
+    from flash_rt.amd.hardware.rdna35.ops import Rdna35TensorOps
 
-    pipeline = Pi05PipelineRdna35.__new__(Pi05PipelineRdna35)
-    pipeline.fvk = kernels.fvk
-    pipeline.dtype = torch.bfloat16
-    pipeline.hip_large_ops = False
+    ops = Rdna35TensorOps(kernels.fvk, torch.bfloat16)
+    ops.fused_large_ops = False
 
     generator = torch.Generator(device="cuda").manual_seed(11)
     x = torch.randn(8, 1024, generator=generator, device="cuda",
@@ -235,7 +231,7 @@ def test_pipeline_fallback_matches_float32_reference():
     bias = torch.randn(1024, generator=generator, device="cuda",
                        dtype=torch.bfloat16)
     out = torch.empty_like(x)
-    pipeline._layer_norm(out, x, weight, bias)
+    ops.layer_norm(out, x, weight, bias)
     ref = F.layer_norm(x.float(), (1024,), weight.float(), bias.float()).to(
         torch.bfloat16)
     torch.testing.assert_close(out, ref, atol=8e-3, rtol=3e-2)
