@@ -100,9 +100,9 @@ flash_rt/amd/
 The pybind entry points keep the same `uintptr_t` pointer + stream ABI as the
 CUDA module. RDNA-only entries carry an `_rdna` suffix so they cannot be
 silently routed on CDNA. CDNA model frontends warm up and replay a captured
-HIP graph on their production path. The first RDNA Pi0.5 frontend defaults to
-eager execution while exposing an optional full-model graph for validation
-and explicit use; it does not reuse encoder state across frames.
+HIP graph on their production path. The RDNA Pi0.5 frontend defaults to eager
+execution and `cache_frames=1`; explicit values greater than one enable
+decoder-only frames that reuse the last encoded K/V prefix.
 
 ## Hardware routing
 

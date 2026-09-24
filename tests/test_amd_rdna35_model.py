@@ -80,6 +80,68 @@ def test_full_graph_matches_eager(model):
     torch.testing.assert_close(captured, eager, atol=0, rtol=0)
 
 
+def test_decoder_only_reuses_last_full_encoder_cache(model):
+    torch = pytest.importorskip("torch")
+    frontend = model.pipeline
+    frontend._fill_images({"images": _images()})
+    noise = torch.from_numpy(
+        np.random.default_rng(31).standard_normal(
+            (frontend.chunk_size, 32)).astype(np.float32)
+    ).to(device="cuda", dtype=torch.bfloat16)
+
+    full = frontend.forward_with_fixed_noise(
+        frontend._image_buf, noise, use_graph=False).clone()
+    cached = frontend.pipeline.forward_decode_only(
+        noise, use_graph=False).clone()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(cached, full, atol=0, rtol=0)
+
+
+def test_decoder_only_graph_matches_full_graph_with_same_context(model):
+    torch = pytest.importorskip("torch")
+    frontend = model.pipeline
+    frontend._fill_images({"images": _images()})
+    noise = torch.from_numpy(
+        np.random.default_rng(37).standard_normal(
+            (frontend.chunk_size, 32)).astype(np.float32)
+    ).to(device="cuda", dtype=torch.bfloat16)
+
+    full = frontend.forward_with_fixed_noise(
+        frontend._image_buf, noise, use_graph=True).clone()
+    cached = frontend.pipeline.forward_decode_only(
+        noise, use_graph=True).clone()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(cached, full, atol=0, rtol=0)
+
+
+def test_frontend_cache_frames_alternates_full_and_decoder_only(model):
+    frontend = model.pipeline
+    images = _images()
+    changed_images = [np.roll(image, 1, axis=1) for image in images]
+    noise = np.random.default_rng(43).standard_normal(
+        (frontend.chunk_size, 32)).astype(np.float32)
+    original_cache_frames = frontend._cache_frames
+    try:
+        frontend._cache_frames = 2
+        frontend.set_prompt(
+            "pick up the object", state=np.zeros(8, dtype=np.float32))
+        full = frontend.infer({"images": images}, debug=True, noise=noise)
+        cached = frontend.infer(
+            {"images": changed_images}, debug=True, noise=noise)
+        refreshed = frontend.infer(
+            {"images": changed_images}, debug=True, noise=noise)
+
+        np.testing.assert_array_equal(cached["raw_actions"], full["raw_actions"])
+        assert not np.array_equal(
+            refreshed["raw_actions"], full["raw_actions"])
+    finally:
+        frontend._cache_frames = original_cache_frames
+        frontend.set_prompt(
+            "pick up the object", state=np.zeros(8, dtype=np.float32))
+
+
 def test_optimized_path_matches_aten_fallback(model):
     torch = pytest.importorskip("torch")
     frontend = model.pipeline

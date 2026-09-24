@@ -75,6 +75,7 @@ class Pi05TorchFrontendAmdRdna35:
         num_steps: int = NUM_STEPS_DEFAULT,
         max_prompt_len: int = 200,
         chunk_size: Optional[int] = None,
+        cache_frames: int = 1,
         use_fp8: bool = False,
         hardware: Optional[str] = None,
         action_dim: Optional[int] = None,
@@ -132,6 +133,13 @@ class Pi05TorchFrontendAmdRdna35:
         ):
             raise ValueError(
                 f"max_prompt_len must be a positive integer, got {max_prompt_len!r}")
+        if (
+            not isinstance(cache_frames, int)
+            or isinstance(cache_frames, bool)
+            or cache_frames < 1
+        ):
+            raise ValueError(
+                f"cache_frames must be a positive integer, got {cache_frames!r}")
 
         if chunk_size is None:
             chunk_size = self._checkpoint_action_horizon(checkpoint_dir)
@@ -143,6 +151,11 @@ class Pi05TorchFrontendAmdRdna35:
         self.num_steps = int(num_steps)
         self.max_prompt_len = int(max_prompt_len)
         self.chunk_size = int(chunk_size)
+        # Temporal K/V caching: run the full pipeline every `cache_frames`
+        # frames; intermediate frames reuse encoder K/V (decoder-only).
+        # cache_frames=1 (default) keeps every frame fresh.
+        self._cache_frames = int(cache_frames)
+        self._frame_count = 0
         self.dtype = torch.bfloat16
         self.latency_records: list[float] = []
         self._prompt_len = 0
@@ -262,6 +275,9 @@ class Pi05TorchFrontendAmdRdna35:
         self._prompt_buf[:prompt_len].copy_(embeds.to(self.dtype))
         self._prompt_len = prompt_len
         self._prompt_text = prompt_text
+        # A prompt/state change invalidates the context represented by the
+        # cached encoder K/V. The next inference must refresh it.
+        self._frame_count = 0
 
     def _gather_view_images(self, observation: dict) -> list[np.ndarray]:
         if "images" in observation:
@@ -315,6 +331,14 @@ class Pi05TorchFrontendAmdRdna35:
             use_graph=use_graph,
         )
 
+    def _use_full_pipeline_for_next_frame(self) -> bool:
+        """Advance the temporal schedule and select full or decoder-only work."""
+        self._frame_count += 1
+        return (
+            self._cache_frames <= 1
+            or self._frame_count % self._cache_frames == 1
+        )
+
     @torch.inference_mode()
     def infer(
         self,
@@ -325,7 +349,6 @@ class Pi05TorchFrontendAmdRdna35:
         if self._prompt_len == 0:
             raise RuntimeError("set_prompt must be called before infer")
         started = time.perf_counter()
-        self._fill_images(observation)
         if noise is None:
             self._noise_buf.normal_()
         else:
@@ -335,10 +358,17 @@ class Pi05TorchFrontendAmdRdna35:
                     f"noise has shape {tuple(value.shape)}; expected "
                     f"{tuple(self._noise_buf.shape)}")
             self._noise_buf.copy_(value.to(self.dtype))
-        raw = self.forward_with_fixed_noise(
-            self._image_buf,
-            self._noise_buf,
-        )[0]
+        # Match the CDNA/RTX temporal schedule: refresh Vision/Encoder on the
+        # first frame of each period and reuse their K/V on intermediate frames.
+        use_full = self._use_full_pipeline_for_next_frame()
+        if use_full:
+            self._fill_images(observation)
+            raw = self.forward_with_fixed_noise(
+                self._image_buf,
+                self._noise_buf,
+            )[0]
+        else:
+            raw = self.pipeline.forward_decode_only(self._noise_buf)[0]
         torch.cuda.synchronize()
         latency_ms = (time.perf_counter() - started) * 1000
         self.latency_records.append(latency_ms)
