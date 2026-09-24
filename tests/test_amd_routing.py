@@ -75,6 +75,7 @@ def test_pipeline_map_has_amd_pi05_entry():
     assert key in _PIPELINE_MAP, "AMD Pi0.5 dispatch entry disappeared"
     assert _PIPELINE_MAP[key] == (
         "flash_rt.amd.frontends.torch.pi05", "Pi05TorchFrontendAmd")
+    assert _PIPELINE_MAP[("pi05", "torch", "amd_cdna3")] == _PIPELINE_MAP[key]
 
 
 def test_amd_cdna4_is_a_documented_arch_string():
@@ -83,6 +84,7 @@ def test_amd_cdna4_is_a_documented_arch_string():
     from flash_rt.hardware import detect_arch
 
     assert "amd_cdna4" in (detect_arch.__doc__ or "")
+    assert "amd_cdna3" in (detect_arch.__doc__ or "")
 
 
 # ---------------------------------------------------------------------------
@@ -114,8 +116,14 @@ def test_detect_arch_maps_gfx950_to_amd_cdna4(monkeypatch, gcn):
     assert detect_arch() == "amd_cdna4"
 
 
+@pytest.mark.parametrize("gcn", ["gfx942:sramecc+:xnack-", "gfx942"])
+def test_detect_arch_maps_gfx942_to_amd_cdna3(monkeypatch, gcn):
+    from flash_rt.hardware import detect_arch
+    _patch_rocm(monkeypatch, gcn)
+    assert detect_arch() == "amd_cdna3"
+
+
 @pytest.mark.parametrize("gcn", [
-    "gfx942:sramecc+:xnack-",   # MI300X — not supported, must refuse
     "gfx90a",                   # MI200
     "gfx1100",                  # RDNA3
     "gfx9500",                  # prefix trap: startswith() would wrongly pass
@@ -137,8 +145,8 @@ def test_detect_arch_rocm_error_names_the_supported_arch(monkeypatch):
     """The refusal must tell the operator what IS supported."""
     from flash_rt.hardware import detect_arch
 
-    _patch_rocm(monkeypatch, "gfx942:sramecc+")
-    with pytest.raises(RuntimeError, match="gfx950"):
+    _patch_rocm(monkeypatch, "gfx90a:sramecc+")
+    with pytest.raises(RuntimeError, match="gfx942.*gfx950"):
         detect_arch()
 
 
@@ -260,11 +268,14 @@ def test_load_model_bare_use_fp4_falls_back_to_fp8_on_amd(caplog):
     ValueError/ImportError from the FP4 machinery) and the fallback must
     be announced in the log."""
     import flash_rt
+    from flash_rt.amd import flash_rt_amd_kernels as ext
+
+    hardware = dict(ext.build_info())["hardware"]
 
     with caplog.at_level(logging.WARNING, logger="flash_rt.api"):
         with pytest.raises(FileNotFoundError):
             flash_rt.load_model(_BOGUS_CKPT, framework="torch",
-                                config="pi05", hardware="amd_cdna4",
+                                config="pi05", hardware=hardware,
                                 use_fp4=True)
     assert any("Falling back to FP8" in rec.getMessage()
                for rec in caplog.records), (

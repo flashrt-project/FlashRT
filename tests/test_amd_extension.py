@@ -55,7 +55,7 @@ def test_build_info_reports_hip_platform():
     assert isinstance(info["hip_runtime_version"], int)
 
 
-def test_build_info_gpu_arch_is_gfx950_when_stamped():
+def test_build_info_gpu_arch_is_supported_when_stamped():
     """FLASHRT_AMD_GPU_ARCH is stamped by csrc/amd/CMakeLists.txt at build
     time; when present it must be the CDNA4 target this backend supports.
     (Absent key = older build without the stamp; tolerated.)"""
@@ -63,8 +63,15 @@ def test_build_info_gpu_arch_is_gfx950_when_stamped():
     info = m.build_info()
     if "gpu_arch" not in info:
         pytest.skip("build lacks the FLASHRT_AMD_GPU_ARCH stamp")
-    assert str(info["gpu_arch"]).startswith("gfx950"), (
-        f"AMD module built for {info['gpu_arch']!r}, expected gfx950*")
+    assert str(info["gpu_arch"]).split(":", 1)[0] in {"gfx942", "gfx950"}
+    if str(info["gpu_arch"]).split(":", 1)[0] == "gfx942":
+        assert info["hardware"] == "amd_cdna3"
+        assert info["fp8_format"] == "e4m3fnuz"
+        assert info["fp8_max_finite"] == 240.0
+    else:
+        assert info["hardware"] == "amd_cdna4"
+        assert info["fp8_format"] == "e4m3fn"
+        assert info["fp8_max_finite"] == 448.0
 
 
 def test_device_arch_coherent_with_build():
@@ -76,8 +83,9 @@ def test_device_arch_coherent_with_build():
     assert isinstance(arch, str)
     if arch in ("none", "unknown"):
         pytest.skip(f"no usable HIP device (device_arch()={arch!r})")
-    assert arch.split(":")[0] == "gfx950", (
-        f"extension is gfx950-only but the visible device is {arch!r}")
+    build_arch = str(m.build_info()["gpu_arch"]).split(":", 1)[0]
+    assert arch.split(":", 1)[0] == build_arch, (
+        f"extension target {build_arch!r} does not match device {arch!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -105,31 +113,44 @@ _REQUIRED_FUNCS = [
     "qkv_split", "qkv_split_rope", "qkv_split_rope_devpos",
     # attention
     "attention_decoder_gqa", "attention_decoder_gqa_fp8out",
-    "encoder_attention_flash", "attn_partial_probe",
+    "attn_partial_probe",
     # fusion
-    "gate_residual_ada_norm_fp8", "gate_residual_ada_norm_fp8_ksum",
+    "gate_residual_ada_norm_fp8",
     # quantize
     "quantize_fp8_static", "quantize_fp8_device", "fp8_accumulate_scale_max",
     # memory ops + probes
     "gpu_copy", "stream_probe", "stream_probe_variants",
     "ew_tune_quant", "ew_tune_norm", "ew_tune_rope", "ew_tune_variants",
-    # MFMA small-M FP8 GEMM (csrc/amd/gemm/smallm_mfma.h surface)
-    "smallm_mfma_nt", "smallm_mfma_nt_partial", "smallm_mfma_nt_packed",
-    "smallm_mfma_variants",
 ]
 
-# csrc/amd/gemm/bindings_smallm.inc — weight-streaming small-M FP8 GEMM.
-_REQUIRED_FUNCS += [
+_CDNA4_ONLY_FUNCS = [
+    "encoder_attention_flash",
     "smallm_fp8_nn_ws_bytes",
     "smallm_fp8_nn_dev", "smallm_fp8_nn_dev_alt",
     "smallm_fp8_nt_dev", "smallm_fp8_nt_lds_dev",
     "smallm_fp8_nt_lds_async_available", "smallm_fp8_nt_dev_alt",
 ]
 
+_REQUIRED_FUNCS += [
+    "gate_residual_ada_norm_fp8_ksum",
+    "smallm_mfma_nt", "smallm_mfma_nt_partial", "smallm_mfma_nt_packed",
+    "smallm_mfma_variants",
+]
+
 # csrc/amd/gemm/bindings_ffn_fused.inc — fused decoder-FFN pair.
 _REQUIRED_FUNCS += [
     "smallm_fp8_gateup_geglu", "smallm_fp8_gateup_geglu_alt",
     "smallm_fp8_down_gateres", "smallm_fp8_down_gateres_alt",
+]
+
+# Packed BF16 MFMA is exposed on both CDNA generations so new shape-specific
+# routes can be benchmarked and parity-gated before an architecture capability
+# enables production dispatch.
+_REQUIRED_FUNCS += [
+    "smallm_mfma_bf16_nn_bias",
+    "smallm_mfma_bf16_nn_bias_gelu",
+    "smallm_mfma_bf16_nn_bias_res",
+    "smallm_mfma_bf16_variants",
 ]
 
 # csrc/amd/gemm/bindings_gemm.inc — classes.
@@ -152,7 +173,10 @@ _REQUIRED_GEMM_METHODS = [
 def test_all_required_symbols_present():
     """One shot, full inventory: report EVERY missing name, not the first."""
     m = _import_ext()
-    missing = [n for n in _REQUIRED_FUNCS + _REQUIRED_CLASSES
+    required = list(_REQUIRED_FUNCS) + list(_REQUIRED_CLASSES)
+    if m.build_info()["hardware"] == "amd_cdna4":
+        required += _CDNA4_ONLY_FUNCS
+    missing = [n for n in required
                if not hasattr(m, n)]
     assert not missing, (
         "flash_rt_amd_kernels is missing bound symbols "
@@ -201,5 +225,7 @@ def test_variant_enumerators_answer():
     assert set(fams.keys()) == {"quant", "norm", "rope"}
     assert all(len(fams[k]) > 0 for k in fams)
     assert len(m.smallm_mfma_variants()) > 0
-    # smallm split-K workspace sizing is also pure host arithmetic.
-    assert m.smallm_fp8_nn_ws_bytes(10, 2048) > 0
+    if m.build_info()["hardware"] == "amd_cdna4":
+        assert m.smallm_fp8_nn_ws_bytes(10, 2048) > 0
+    else:
+        assert not hasattr(m, "smallm_fp8_nn_ws_bytes")
