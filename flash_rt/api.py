@@ -409,8 +409,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
               SM87  (Jetson Orin)  → ``flash_rt.hardware.rtx.*`` (experimental,
                                      Pi0.5 torch only; BF16 default, INT8
                                      via Orin env flags)
+              gfx942 (MI300 series) → ``flash_rt.amd.*`` (CDNA3)
+              gfx950 (MI350 series) → ``flash_rt.amd.*`` (CDNA4)
             Pass ``"thor"`` / ``"rtx_sm120"`` / ``"rtx_sm89"`` /
-            ``"rtx_sm87"`` explicitly to
+            ``"rtx_sm87"`` / ``"amd_cdna3"`` / ``"amd_cdna4"`` explicitly to
             force a specific backend (useful for cross-hardware debugging).
         embodiment_tag: GROOT only. Per-embodiment MLP slot to load. Passing
             ``None`` uses the backend default (``"new_embodiment"`` — unfit
@@ -725,15 +727,17 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     # a build the user still has to run. The AMD backend has its own
     # self-contained module (the CUDA extensions are neither needed nor
     # expected on a ROCm box).
-    if arch == "amd_cdna4":
+    if arch in ("amd_cdna3", "amd_cdna4"):
         try:
             import flash_rt.amd.flash_rt_amd_kernels  # noqa: F401
         except ImportError as exc:
             raise ImportError(
                 "flash_rt.amd.flash_rt_amd_kernels is not built (the "
                 "AMD/ROCm backend's core kernels). Build it with:\n"
-                "    bash scripts/amd/build_amd.sh gfx950\n"
-                "or: cmake -B build-amd -S csrc/amd -DGPU_ARCH=gfx950 && "
+                f"    bash scripts/amd/build_amd.sh "
+                f"{'gfx942' if arch == 'amd_cdna3' else 'gfx950'}\n"
+                "or: cmake -B build-amd -S csrc/amd "
+                f"-DGPU_ARCH={'gfx942' if arch == 'amd_cdna3' else 'gfx950'} && "
                 "cmake --build build-amd -j\n"
                 "See docs/deployment_amd.md.") from exc
     elif arch == "npu":
@@ -797,13 +801,14 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             ("groot_n17", "torch", "rtx_sm120"),
             ("groot_n17", "torch", "rtx_sm89"),
             ("groot_n17", "torch", "amd_cdna4"),
+            ("groot_n17", "torch", "amd_cdna3"),
         }:
             raise ValueError(
                 "use_fp16=True is currently experimental and only supports "
                 "('pi05', 'torch', 'thor'/'rtx_sm120'/'rtx_sm89'), "
                 "('groot', 'torch', 'thor'/'rtx_sm120'), and "
                 "('groot_n17', 'torch', "
-                "'thor'/'rtx_sm120'/'rtx_sm89'/'amd_cdna4')")
+                "'thor'/'rtx_sm120'/'rtx_sm89'/'amd_cdna3'/'amd_cdna4')")
 
     # FA4 is an attention-backend choice, not part of the NVFP4 tier: both
     # the FP8 Pi0.5 Thor frontend and its NVFP4 subclass accept use_fa4, and
@@ -855,12 +860,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     # no BF16-only fallback, and the full-FP16 reference is not yet
     # ported (use_fp16=True raises NotImplementedError below).
     if config == "groot_n17" and framework == "torch" \
-            and arch == "amd_cdna4" and not use_fp16 and not use_fp8:
+            and arch in ("amd_cdna3", "amd_cdna4") \
+            and not use_fp16 and not use_fp8:
         raise ValueError(
-            "GROOT N1.7 on AMD CDNA4 defaults to FP8; there is no "
+            f"GROOT N1.7 on {arch} defaults to FP8; there is no "
             "separate BF16-only fallback. The non-quantized full-FP16 "
             "reference (use_fp16=True, use_fp8=False) is not yet ported "
-            "to CDNA4.")
+            "to AMD.")
 
     # GROOT N1.7 on Thor (SM110) runs the FP8 backbone (+ bf16 DiT) by
     # default. There is no BF16-only fallback; the non-quantized reference is
@@ -915,10 +921,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 )
                 pipe_cls = GrootTorchFrontendRtxFP16
             else:  # config == "groot_n17"
-                if arch == "amd_cdna4":
+                if arch in ("amd_cdna3", "amd_cdna4"):
                     raise NotImplementedError(
                         "the GROOT N1.7 full-FP16 reference is not yet "
-                        "ported to AMD CDNA4; use the default FP8 tier "
+                        f"ported to {arch}; use the default FP8 tier "
                         "(use_fp8=True, use_fp16=False)")
                 if arch == "rtx_sm89":
                     from flash_rt.frontends.torch.groot_n17_rtx_sm89_fp16 import (
