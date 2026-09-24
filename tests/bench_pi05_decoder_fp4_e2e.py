@@ -47,7 +47,7 @@ PROMPT_TOKENS = [
 # configuration the public API reproduces.
 PUBLIC_API_PRESET = {
     "encoder_gu_mode": "p1",
-    "encoder_p1_combiner": "epilogue_hw",
+    "encoder_p1_combiner": "epilogue_hw_nod",
     "encoder_down_variant": 7,
     "encoder_down_x_variant": 6,
     "decoder_gate_up_variant": 10,
@@ -56,6 +56,7 @@ PUBLIC_API_PRESET = {
     "decoder_rht": 0,
     "decoder_fused_attn": 0,
     "decoder_fused_geglu": 1,
+    "decoder_fused_geglu_nod": 0,
     "awq_alpha": 0.8,
     "encoder_attn_o_fp4": 1,
     "encoder_attn_qkv_fp4": 0,
@@ -146,8 +147,9 @@ def main() -> int:
         "--encoder-gu-mode", choices=("p1", "merged"), default="p1")
     parser.add_argument(
         "--encoder-p1-combiner",
-        choices=("direct", "lut", "lut_native", "epilogue", "epilogue_hw"),
-        default="epilogue_hw")
+        choices=("direct", "lut", "lut_native", "epilogue", "epilogue_hw",
+                 "epilogue_hw_nod"),
+        default="epilogue_hw_nod")
     parser.add_argument("--encoder-down-variant", type=int, default=7)
     parser.add_argument("--encoder-down-x-variant", type=int, default=6)
     parser.add_argument("--decoder-gate-up-variant", type=int, default=10)
@@ -175,6 +177,10 @@ def main() -> int:
         "--decoder-fused-geglu", type=int, choices=(0, 1), default=1,
         help="Fused-epilogue decoder FFN: one interleaved GeGLU GEMM "
              "replaces the gate_up GEMM + GeGLU kernel (nvfp4 weights only)")
+    parser.add_argument(
+        "--decoder-fused-geglu-nod", type=int, choices=(0, 1), default=0,
+        help="No-D-store variant of the fused decoder GeGLU (requires "
+             "--decoder-fused-geglu 1)")
     parser.add_argument("--awq-alpha", type=float, default=0.8)
     parser.add_argument(
         "--encoder-attn-o-fp4", type=int, choices=(0, 1), default=1,
@@ -291,6 +297,7 @@ def main() -> int:
                 decoder_rht=bool(args.decoder_rht),
                 decoder_fused_attn=bool(args.decoder_fused_attn),
                 decoder_fused_geglu=bool(args.decoder_fused_geglu),
+                decoder_fused_geglu_nod=bool(args.decoder_fused_geglu_nod),
                 use_fp4_decoder=True,
                 use_fa4=True,
                 use_fp4_encoder_attn=bool(args.encoder_attn_o_fp4),
@@ -397,6 +404,8 @@ def main() -> int:
                     "decoder_rht": bool(args.decoder_rht),
                     "decoder_fused_attn": bool(args.decoder_fused_attn),
                     "decoder_fused_geglu": bool(args.decoder_fused_geglu),
+                    "decoder_fused_geglu_nod": bool(
+                        args.decoder_fused_geglu_nod),
                     "decoder_gate_up_variant": args.decoder_gate_up_variant,
                     "attention": "fa4_siglip_encoder",
                 }
@@ -463,6 +472,7 @@ def main() -> int:
             "--decoder-rht", str(args.decoder_rht),
             "--decoder-fused-attn", str(args.decoder_fused_attn),
             "--decoder-fused-geglu", str(args.decoder_fused_geglu),
+            "--decoder-fused-geglu-nod", str(args.decoder_fused_geglu_nod),
             "--awq-alpha", str(args.awq_alpha),
             "--encoder-fp4-layer-count", str(args.encoder_fp4_layer_count),
             "--encoder-attn-o-fp4", str(args.encoder_attn_o_fp4),

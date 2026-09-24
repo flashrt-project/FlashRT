@@ -1,0 +1,169 @@
+binding: llamacpp_qwen36_35b_sm120
+structure: autoregressive_decode_pipeline
+
+# Host: stock llama.cpp (upstream master lineage) running Qwen3.6-35B-A3B
+# UD-Q4_K_M on RTX 5090 (SM120) with the native ggml adapter
+# (FlashRT-llama.cpp: fr_win_qwen36_sm120.cu). Structure
+# regions execute as fused subgraph windows matched inside ggml-cuda's
+# graph evaluation. Two quality tiers share one binary: the safe tier keeps
+# the target head and all matched math bit-comparable to stock (24-chunk
+# PPL receipt), the full tier adds the NVFP4 lm-head swap. The speculative
+# form runs the pipeline's spec_draft stage through the model's trained MTP
+# head (single head, 3 chained drafts/step, verify batches M = 4).
+
+stages:
+  prefill:
+    seam: "llama_decode prompt processing (stock kernels; adapter windows are decode-shaped and stay out)"
+    capture: none
+  decode:
+    seam: "llama_decode token generation, M in [1,4] (speculative verify batches)"
+    capture: cuda_graphs_keyed
+  token_select:
+    seam: "server sampler chain; greedy or speculative acceptance (backend sampling via -bs)"
+    capture: host_dependent
+  spec_draft:
+    seam: "MTP draft chain evals + M=4 h-extraction eval (common/speculative draft-mtp driver)"
+    capture: cuda_graphs_keyed
+
+cadences:
+  token: [decode, token_select]
+  spec_step: [decode, token_select, spec_draft]
+
+# Machine-readable model facts consumed by the ggml adapter (build-time
+# header generation: tools/gen_binding_header.py in FlashRT-llama.cpp). This is the
+# single source for every model-specific constant in the window code; the
+# window logic itself is family-level.
+host_params:
+  arch: qwen35moe
+  n_layer: 40
+  layer_scan_max: 64          # matcher bound for blk.%d parsing
+  d_model: 2048
+  regions:                    # qkv_pack instances served by the fused NVFP4 GEMV
+    - kind: 0                 # GDN in_proj pack
+      layers: 30
+      k: 2048
+      members:                # [tensor suffix, rows, row offset in the pack]
+        - {name: attn_qkv.weight,  rows: 8192, row_off: 0, leader: true}
+        - {name: attn_gate.weight, rows: 4096, row_off: 8192}
+        - {name: ssm_alpha.weight, rows: 32,   row_off: 12288}
+        - {name: ssm_beta.weight,  rows: 32,   row_off: 12320}
+    - kind: 1                 # full-attention qkv pack
+      layers: 10
+      k: 2048
+      members:
+        - {name: attn_q.weight, rows: 8192, row_off: 0, leader: true}
+        - {name: attn_k.weight, rows: 512,  row_off: 8192}
+        - {name: attn_v.weight, rows: 512,  row_off: 8704}
+  gdn:                        # gated_delta_core instance dims
+    qkvz_rows: 12288          # qkv 8192 + z 4096 (in_proj GEMV span served to the cell)
+    qkv_rows: 8192
+    z_rows: 4096
+    conv_channels: 8192
+    conv_window: 3
+    conv_cache_row: 24576     # conv_channels * conv_window
+    state_size: 524288        # out_dim * head_dim (32 heads x 128 x 128)
+    out_dim: 4096
+    head_dim: 128
+  moe:                        # moe_expert_ffn instance (dims read from tensors at run time)
+    gate_exps: ffn_gate_exps
+    up_exps: ffn_up_exps
+    down_exps: ffn_down_exps
+    gate_shexp: ffn_gate_shexp.weight
+    up_shexp: ffn_up_shexp.weight
+    down_shexp: ffn_down_shexp.weight
+    gate_inp_shexp: ffn_gate_inp_shexp.weight
+    n_expert: 256
+    draft_prefix: mtp_        # MTP draft graph node-name prefix
+    out_names: [ffn_moe_out, ffn_out]
+    resid_names: [l_out, mtp_post_ffn]
+  out_proj:                   # linear_proj instances (Q8_0 GEMV + residual)
+    names: [ssm_out.weight, attn_output.weight]
+    k: 4096
+  head:                       # lm head linear_proj instance
+    name: output.weight
+    n_vocab: 248320
+    draft_copy_type: q8_0     # the spec draft's head copy is stored Q8_0;
+                              # the target head is not — this discriminates them
+
+coverage:
+  contract: complete_hot_path
+  hot_path:
+    - token_embed
+    - gdn_in_proj_pack
+    - gdn_cell_span
+    - attn_qkv_pack
+    - attention_full
+    - norms
+    - moe_expert_span
+    - out_proj
+    - recurrent_state
+    - lm_head
+    - token_select
+  segments:
+    - name: token_embed
+      stage: decode
+      classification: host_stage
+      seam: "embedding row gather (stock get_rows)"
+    - name: gdn_in_proj_pack
+      stage: decode
+      classification: structure
+      seam: "qkv|gate|alpha|beta sibling pack served from one NVFP4 W4A4 GEMV staging pass (30 GDN layers); qkv_pack leaf form, fp4 block-scaled input (variant value proposed, see pins)"
+      structures: [qkv_pack]
+    - name: gdn_cell_span
+      stage: decode
+      classification: structure
+      seam: "conv + gated-delta recurrence + gated norm + epilogue as one 4-launch region; decode_recurrent, l2 in kernel; M>1 verify batches under snapshot_per_token + replay_in_region"
+      structures: [gated_delta_core]
+    - name: attn_qkv_pack
+      stage: decode
+      classification: structure
+      seam: "attention q|k|v sibling pack, same GEMV (10 attention layers)"
+      structures: [qkv_pack]
+    - name: attention_full
+      stage: decode
+      classification: host_stage
+      seam: "flash-attention core runs on the host's own kernels (not taken over)"
+    - name: norms
+      stage: decode
+      classification: host_stage
+      seam: "rms/l2 norm chain outside the fused regions runs on stock kernels"
+    - name: moe_expert_span
+      stage: decode
+      classification: structure
+      seam: "K0 quant+meta / K1 gate|up|GLU / K2 down+combine over ggml-native K-quant blocks (format_native consumption); shared expert folded; routing fused for M>=2"
+      structures: [moe_expert_ffn]
+    - name: out_proj
+      stage: decode
+      classification: structure
+      seam: "ssm_out/attn_output Q8_0 GEMV + residual epilogue, consuming the GDN epilogue's q8 activation handoff"
+      structures: [linear_proj]
+    - name: recurrent_state
+      stage: decode
+      classification: state_region
+      seam: "conv/state caches updated in place at M=1, per-token snapshots + checkpoint replay under speculative verify"
+    - name: lm_head
+      stage: decode
+      classification: structure
+      seam: "full tier: NVFP4 W4A4 head (M<=4 one pass, weights from the BF16-checkpoint pack); safe tier: stock Q6_K mmvq"
+      structures: [linear_proj]
+    - name: token_select
+      stage: token_select
+      classification: host_stage
+      seam: "server sampler chain; backend sampling (-bs) keeps greedy/acceptance on device"
+    - name: prefill_stock
+      stage: prefill
+      classification: host_stage
+      seam: "prompt processing runs entirely on stock kernels (adapter windows are decode-shaped)"
+    - name: spec_draft_serving
+      stage: spec_draft
+      classification: structure
+      seam: "draft-side lm-head serving (the draft GGUF's Q8_0 head copy from the FP4 pack — acceptance-only by spec math) + the draft MTP layer's Q8_0 experts through the same MoE span"
+      structures: [linear_proj, moe_expert_ffn]
+    - name: host_graph_slots
+      stage: spec_draft
+      classification: host_stage
+      seam: "host-tree change (llama-context): per-shape graph slots keyed (n_tokens, gtype, has_embd), each owning its scheduler"
+
+hosts:
+  llamacpp_sm120:
+    versions: "upstream 95b8e33 + FlashRT hook guards (GGML_CUDA_FLASHRT_SM120)"
