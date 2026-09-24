@@ -266,6 +266,7 @@ class Cdna4GrootN17AttnBackend:
                 scale,      # softmax_scale
                 causal,
                 -1, -1,     # no local window
+                0,          # no attention sinks
                 False,      # return_softmax_lse
                 False,      # return_dropout_randval
                 out=o,
