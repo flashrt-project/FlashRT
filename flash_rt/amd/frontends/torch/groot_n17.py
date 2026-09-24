@@ -1,4 +1,4 @@
-"""FlashRT AMD -- GROOT N1.7 FP8 torch frontend for CDNA4 (MI350X, gfx950).
+"""FlashRT AMD GROOT N1.7 frontend for CDNA3/gfx942 and CDNA4/gfx950.
 
 FP8 kernel backbone with an unquantized bf16 action head. The whole
 VLM backbone (ViT / DeepStack / LLM / VL self-attn) runs through the AMD
@@ -28,12 +28,12 @@ device string, ``torch.cuda.Stream`` and ``torch.cuda.CUDAGraph``
 
 AMD-specific overrides:
 
-  * ``_run_kernel_backbone_fp8`` — AMD pipeline stages + the CDNA4
+  * ``_run_kernel_backbone_fp8`` — AMD pipeline stages + the selected
     attention backend. The llm stage's Q/K/V GEMMs write straight into
     the backend slots (Q 16 heads, K/V the NATIVE 8 KV heads — aiter
     handles GQA internally), so the RTX K/V staging buffers and the
     ``gpu_repeat_interleave_heads`` expand step are dropped.
-  * ``_build_dit_attn`` — one :class:`Cdna4GrootN17AttnBackend` serves
+  * ``_build_dit_attn`` — one generation-specific AITER backend serves
     all five sites; the backbone-time instance is reused for the DiT
     when the action-token count matches.
   * ``_setup_cross_kv_kernel`` / ``_cross_kv_fwd`` — the per-frame
@@ -87,7 +87,7 @@ def _fused_epilogue_enabled() -> bool:
 
 class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
                                GrootN17TorchFrontendThor):
-    """N1.7 CDNA4 frontend: FP8 kernel backbone + bf16 DiT action head."""
+    """N1.7 AMD frontend: FP8 kernel backbone + bf16 DiT action head."""
 
     # The DiT runs unquantized bf16 on AMD. NOTE this is a weaker tier
     # than the Thor/RTX FP8 frontends, which inherit _DIT_USE_FP8 = True
@@ -107,30 +107,14 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
         num_views: int = 2,
         embodiment_tag: str = "oxe_droid_relative_eef_relative_joint",
         device: str = "cuda:0",
+        hardware: str | None = None,
     ):
-        # gfx950-only gate, FIRST: the MFMA tile shapes and FP8 paths in
-        # the extension are CDNA4-specific — refuse before touching the
-        # checkpoint unless BOTH the visible device arch (e.g.
-        # "gfx950:sramecc+:xnack-") and the extension's compile-time
-        # gpu_arch are gfx950. Anything else computes garbage, not a
-        # fallback (a forced hardware="amd_cdna4" on gfx942 fails here).
-        # This runs ahead of super().__init__, which loads weights.
         from flash_rt.amd import flash_rt_amd_kernels as _fvk_gate
-        # Compare the base target only ("gfx950" from
-        # "gfx950:sramecc+:xnack-"); a prefix test would also accept a
-        # future "gfx9500".
-        _dev_arch = str(_fvk_gate.device_arch())
-        _build_arch = str(dict(_fvk_gate.build_info()).get("gpu_arch",
-                                                           "unknown"))
-        if not (_dev_arch.split(":", 1)[0] == "gfx950"
-                and _build_arch.split(":", 1)[0] == "gfx950"):
-            raise RuntimeError(
-                "GrootN17TorchFrontendAmd is gfx950-only (CDNA4 / "
-                f"MI350-series): running device arch is {_dev_arch!r} and "
-                f"the extension was built for gpu_arch {_build_arch!r}. "
-                "Rebuild with scripts/amd/build_amd.sh on a gfx950 "
-                "machine; other AMD arches are not supported by this "
-                "backend.")
+        from flash_rt.amd.hardware.capabilities import load_capabilities
+        self._amd_caps = load_capabilities(_fvk_gate, hardware)
+        self.hardware = self._amd_caps.hardware
+        self._weight_fp8_dtype = self._amd_caps.torch_fp8_dtype
+        self._weight_fp8_max_finite = self._amd_caps.fp8_max_finite
 
         # The strided-FMHA side-load is a CUDA-only .so (Thor ViT path);
         # the AMD ViT attention runs through the CDNA4 backend instead.
@@ -221,8 +205,27 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
         n_image = int(mask.sum().item())
         return n_text, n_image
 
+    def _groot_attn_backend_class(self):
+        """Resolve the generation-specific AITER backend at setup time."""
+        if not self._amd_caps.supports_aiter:
+            raise RuntimeError(
+                f"AITER is disabled for {self._amd_caps.hardware}")
+        if not self._amd_caps.aiter_installed:
+            raise ImportError(
+                "GROOT N1.7 AMD attention requires the AITER package; "
+                "install the wheel matching the active ROCm/PyTorch stack")
+        if self._amd_caps.hardware == "amd_cdna3":
+            from flash_rt.amd.hardware.cdna3.attn_backend_groot_n17 import (
+                Cdna3GrootN17AttnBackend,
+            )
+            return Cdna3GrootN17AttnBackend
+        from flash_rt.amd.hardware.cdna4.attn_backend_groot_n17 import (
+            Cdna4GrootN17AttnBackend,
+        )
+        return Cdna4GrootN17AttnBackend
+
     def _build_dit_attn(self, Sa: int) -> None:
-        """Bind the CDNA4 backend for the DiT sites.
+        """Bind the validated AMD backend for the DiT sites.
 
         Reuses the backbone-time backend when its DiT token capacity
         matches ``Sa``; otherwise constructs a fresh full backend with
@@ -234,9 +237,7 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
         prefix views, source and destination alias and the copy is
         skipped.
         """
-        from flash_rt.amd.hardware.cdna4.attn_backend_groot_n17 import (
-            Cdna4GrootN17AttnBackend,
-        )
+        AttnBackend = self._groot_attn_backend_class()
 
         Sa = int(Sa)
         n_text, n_image = self._dit_kv_split()
@@ -244,7 +245,7 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
 
         attn = getattr(self, "_kbb_attn", None)
         if attn is None or int(getattr(self, "_kbb_attn_sa", -1)) != Sa:
-            attn = Cdna4GrootN17AttnBackend(
+            attn = AttnBackend(
                 num_vit_views=int(getattr(self, "_num_vit_views",
                                           self.num_views)),
                 vit_seq=int(self._S_vit),
@@ -401,6 +402,13 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
             return
         self._dit_smallm_packed: dict = {}
         self._dit_smallm_store: list = []
+        if not self._amd_caps.supports_packed_bf16_mfma:
+            if os.environ.get("FVK_AMD_DIT_GEMM", "hipblaslt").strip().lower() \
+                    == "smallm":
+                raise ValueError(
+                    "FVK_AMD_DIT_GEMM=smallm requested, but this AMD build "
+                    "does not declare packed BF16 MFMA support")
+            return
         # FVK_AMD_DIT_GEMM: "smallm" (default) = pack + route the D→D
         # projections to the MFMA packed kernel; "hipblaslt" = library path.
         if os.environ.get("FVK_AMD_DIT_GEMM", "smallm").strip().lower() \
@@ -450,7 +458,7 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
         if getattr(self, "_DIT_USE_FP8", False) or \
                 getattr(self, "_DIT_QUANT", "fp8") == "fp4":
             raise NotImplementedError(
-                "the AMD CDNA4 N1.7 frontend runs the DiT bf16; the FP8/FP4 "
+                "the AMD N1.7 frontend runs the DiT bf16; the FP8/FP4 "
                 "DiT quantization tiers are not ported")
 
         Sa = action_horizon + 1
@@ -678,9 +686,6 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
         are allocated — aiter consumes the 8 KV heads natively.
         """
         from flash_rt.amd.models.groot_n17 import pipeline as P
-        from flash_rt.amd.hardware.cdna4.attn_backend_groot_n17 import (
-            Cdna4GrootN17AttnBackend,
-        )
 
         fvkm, gemm = self._fvk, self._gemm
         dev = self.device
@@ -747,7 +752,8 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
         # at first infer (reused by _build_dit_attn when Sa matches).
         n_text, n_image = self._dit_kv_split()
         sa = int(self._DEFAULT_SA)
-        attn = Cdna4GrootN17AttnBackend(
+        AttnBackend = self._groot_attn_backend_class()
+        attn = AttnBackend(
             num_vit_views=nv, vit_seq=Sv, llm_seq=Se, vl_self_attn_seq=Se,
             sa=sa, dit_kv_seq=max(n_text, n_image), device=dev)
         self._kbb_attn = attn
