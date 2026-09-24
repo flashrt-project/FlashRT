@@ -4,12 +4,12 @@
 #include <hip/hip_bf16.h>
 
 // ================================================================
-// FlashRT AMD — MFMA small-M BF16 packed-weight GEMM (gfx950, wave64)
+// FlashRT AMD — MFMA small-M BF16 packed-weight GEMM (gfx942/gfx950, wave64)
 //
 // BF16 sibling of the FP8 packed kernel (smallm_mfma.h): a weight-
 // streaming GEMM for the M<=48 "NN" projection sites where the whole
 // call is bounded by reading the (K,N) bf16 weight once. Target sites
-// are the GROOT N1.7 DiT projections at M=41:
+// include the GROOT N1.7 DiT projections at M=41:
 //   (41, 1536, 1536)  q/k/v/o        -> epilogue bias (o: bias_res)
 //   (41, 6144, 1536)  ffn up         -> epilogue bias_gelu
 //   (41, 1536, 6144)  ffn down       -> epilogue bias_res
@@ -36,7 +36,10 @@
 // (the stream_probe co-pattern; every lane an independent dwordx4
 // chain). From the (K, N) row-major bf16 weight, in torch:
 //
+// gfx950:
 //   Wp = W.view(K//32, 4, 8, N//16, 16).permute(3, 0, 1, 4, 2).contiguous()
+// gfx942:
+//   Wp = W.view(K//16, 4, 4, N//16, 16).permute(3, 0, 1, 4, 2).contiguous()
 //
 // (dims after permute: (N/16 tile, K/32 step, k-group, n-lane, k-elem);
 // flattened 16B-chunk index = tile*(2*K) + step*64 + lane, with
@@ -44,9 +47,8 @@
 //
 // Structure: grid.x = N/16 column tiles, WAVES waves per workgroup
 // split K into WAVES fixed segments (S = K/(32*WAVES) MFMA steps
-// each), consumed in rounds of 6 steps with the next round's weight
-// chunks prefetched behind the current round's MFMAs (6 independent
-// dwordx4 in flight per lane = the gfx950 streaming recipe). Partials
+// each), consumed in architecture-specific rounds with the next round's
+// weight chunks prefetched behind the current round's MFMAs. Partials
 // are reduced across waves through LDS in ascending wave order — no
 // atomics, graph replay is bit-identical.
 //
@@ -67,9 +69,9 @@
 // and M > 16, else the deepest valid split form. The parity/bench
 // gate drives all variants; production pins the measured winner.
 //
-// Constraints: 1 <= M <= 48, N % 16 == 0, and K/(32*waves) must land
-// in {6, 12, 24, 48} for the selected wave depth (waves 4: K in
-// {768, 1536, 3072, 6144}; waves 8: K in {1536, 3072, 6144, 12288}).
+// Constraints: 1 <= M <= 48 and N % 16 == 0. gfx950 retains its
+// K/(32*waves) set; gfx942's 16-deep path covers Pi0.5
+// K={1024,2048,4096}.
 // A, Wp, D 16-byte aligned; bias is a dense bf16 vector of length N.
 // ================================================================
 

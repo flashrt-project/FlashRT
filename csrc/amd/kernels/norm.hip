@@ -6,14 +6,11 @@
 // Mirrors csrc/kernels/norm.cu host-wrapper signatures exactly so
 // the pipeline layer stays portable text across platforms.
 //
-// FP8 output dtype: OCP e4m3 via <hip/hip_fp8.h> __hip_fp8_e4m3
-// (saturating RNE conversion, same as __nv_fp8_e4m3; values are
-// pre-clamped to ±448 exactly as in norm.cu). Same byte format as
-// the HIP_R_8F_E4M3 the hipBLASLt GEMM side consumes.
+// FP8 output storage and clamp come from arch.h for the target generation.
 // ================================================================
 
 #include "common_hip.h"
-#include <hip/hip_fp8.h>
+#include "../arch.h"
 
 // 16-byte packet (8 bf16) and 8-byte FP8 packet for the wide (CDNA
 // retune) kernel variants — measured on the ew_tune probe: wide
@@ -259,8 +256,8 @@ __global__ void rms_norm_fp8_kernel(const T* __restrict__ x,
         T2 xv = x2[i], wv = w2[i];
         float v0 = to_f32(xv.x) * rms * to_f32(wv.x) * inv_scale;
         float v1 = to_f32(xv.y) * rms * to_f32(wv.y) * inv_scale;
-        out_row[2*i]   = __hip_fp8_e4m3(fminf(fmaxf(v0, -448.0f), 448.0f));
-        out_row[2*i+1] = __hip_fp8_e4m3(fminf(fmaxf(v1, -448.0f), 448.0f));
+        out_row[2*i]   = __hip_fp8_e4m3(fminf(fmaxf(v0, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite));
+        out_row[2*i+1] = __hip_fp8_e4m3(fminf(fmaxf(v1, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite));
     }
 }
 
@@ -308,8 +305,8 @@ __global__ void ada_rms_norm_style_fp8_kernel(
         float n1 = to_f32(xv.y) * rms * to_f32(wv.y);
         float val0 = (n0 * (1.0f + to_f32(sv.x)) + to_f32(hv.x)) * inv_scale;
         float val1 = (n1 * (1.0f + to_f32(sv.y)) + to_f32(hv.y)) * inv_scale;
-        out_row[2*i]   = __hip_fp8_e4m3(fminf(fmaxf(val0, -448.0f), 448.0f));
-        out_row[2*i+1] = __hip_fp8_e4m3(fminf(fmaxf(val1, -448.0f), 448.0f));
+        out_row[2*i]   = __hip_fp8_e4m3(fminf(fmaxf(val0, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite));
+        out_row[2*i+1] = __hip_fp8_e4m3(fminf(fmaxf(val1, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite));
         gate2[i] = gv;
     }
 }
@@ -359,8 +356,8 @@ __global__ void residual_add_rms_norm_fp8_kernel(
         T2 rv = res2[i], wv = w2[i];
         float v0 = to_f32(rv.x) * rms * to_f32(wv.x) * inv_scale;
         float v1 = to_f32(rv.y) * rms * to_f32(wv.y) * inv_scale;
-        out_row[2*i]   = __hip_fp8_e4m3(fminf(fmaxf(v0, -448.0f), 448.0f));
-        out_row[2*i+1] = __hip_fp8_e4m3(fminf(fmaxf(v1, -448.0f), 448.0f));
+        out_row[2*i]   = __hip_fp8_e4m3(fminf(fmaxf(v0, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite));
+        out_row[2*i+1] = __hip_fp8_e4m3(fminf(fmaxf(v1, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite));
     }
 }
 
@@ -410,8 +407,8 @@ __global__ void residual_add_rms_norm_fp8_wide_kernel(
         for (int k = 0; k < 4; ++k) {
             const float v0 = to_f32(rv.p[k].x) * rms * to_f32(wv.p[k].x) * inv_scale;
             const float v1 = to_f32(rv.p[k].y) * rms * to_f32(wv.p[k].y) * inv_scale;
-            o.b[2*k]   = __hip_fp8_e4m3(fminf(fmaxf(v0, -448.0f), 448.0f)).__x;
-            o.b[2*k+1] = __hip_fp8_e4m3(fminf(fmaxf(v1, -448.0f), 448.0f)).__x;
+            o.b[2*k]   = __hip_fp8_e4m3(fminf(fmaxf(v0, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite)).__x;
+            o.b[2*k+1] = __hip_fp8_e4m3(fminf(fmaxf(v1, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite)).__x;
         }
         out8[c] = o;
     }

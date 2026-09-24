@@ -15,7 +15,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
-#include <hip/hip_fp8.h>
+#include "arch.h"
 
 #include <cstdint>
 #include <string>
@@ -114,6 +114,15 @@ void gate_residual_ada_norm_fp8(__hip_bfloat16* residual, const __hip_bfloat16* 
                                 __hip_fp8_e4m3* out, __hip_bfloat16* gate_out,
                                 int seq_len, int dim, float eps,
                                 const float* d_scale, hipStream_t stream);
+void gate_residual_ada_norm_bf16(__hip_bfloat16* residual,
+                                 const __hip_bfloat16* x,
+                                 const __hip_bfloat16* gate,
+                                 const __hip_bfloat16* weight,
+                                 const __hip_bfloat16* style,
+                                 __hip_bfloat16* out,
+                                 __hip_bfloat16* gate_out,
+                                 int seq_len, int dim, float eps,
+                                 hipStream_t stream);
 void gate_residual_ada_norm_fp8_ksum(
     __hip_bfloat16* residual, const float* partial, int splits,
     const float* d_scale_a, const float* d_scale_b,
@@ -158,6 +167,17 @@ PYBIND11_MODULE(flash_rt_amd_kernels, m) {
         int rt_version = 0;
         (void)hipRuntimeGetVersion(&rt_version);
         info["hip_runtime_version"] = rt_version;
+        info["hardware"] = flashrt::amd::arch::hardware_name;
+        info["fp8_format"] = flashrt::amd::arch::fp8_format;
+        info["fp8_max_finite"] = flashrt::amd::arch::fp8_max_finite;
+        info["supports_mxfp4"] = flashrt::amd::arch::supports_mxfp4;
+        info["supports_packed_fp8_mfma"] =
+            flashrt::amd::arch::supports_packed_fp8_mfma;
+        info["supports_packed_bf16_mfma"] =
+            flashrt::amd::arch::supports_packed_bf16_mfma;
+        info["supports_fused_attention_fp8_output"] =
+            flashrt::amd::arch::supports_fused_attention_fp8out;
+        info["supports_aiter"] = flashrt::amd::arch::supports_aiter;
         return info;
     });
 
@@ -429,6 +449,23 @@ PYBIND11_MODULE(flash_rt_amd_kernels, m) {
        py::arg("stream") = 0);
 
     // ── Fusion ──
+    m.def("gate_residual_ada_norm_bf16", [](uintptr_t residual, uintptr_t x,
+                                              uintptr_t gate, uintptr_t weight,
+                                              uintptr_t style, uintptr_t out,
+                                              uintptr_t gate_out, int seq_len,
+                                              int dim, float eps,
+                                              uintptr_t stream) {
+        gate_residual_ada_norm_bf16(
+            typed_ptr<__hip_bfloat16>(residual),
+            typed_ptr<__hip_bfloat16>(x), typed_ptr<__hip_bfloat16>(gate),
+            typed_ptr<__hip_bfloat16>(weight), typed_ptr<__hip_bfloat16>(style),
+            typed_ptr<__hip_bfloat16>(out), typed_ptr<__hip_bfloat16>(gate_out),
+            seq_len, dim, eps, to_stream(stream));
+    }, py::arg("residual"), py::arg("x"), py::arg("gate"), py::arg("weight"),
+       py::arg("style"), py::arg("out"), py::arg("gate_out"),
+       py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f,
+       py::arg("stream") = 0);
+
     m.def("gate_residual_ada_norm_fp8", [](uintptr_t residual, uintptr_t x,
                                             uintptr_t gate, uintptr_t weight,
                                             uintptr_t style,
@@ -506,6 +543,7 @@ PYBIND11_MODULE(flash_rt_amd_kernels, m) {
     });
 
     // ── Encoder MFMA flash attention (see attention/encoder_flash.hip) ──
+#if defined(FLASHRT_AMD_CDNA4)
     m.def("encoder_attention_flash", [](uintptr_t Q, uintptr_t K, uintptr_t V,
                                         uintptr_t O, int S, int Hq, int D,
                                         float scale, uintptr_t stream, int mask,
@@ -524,6 +562,7 @@ PYBIND11_MODULE(flash_rt_amd_kernels, m) {
        py::arg("S"), py::arg("Hq"), py::arg("D"),
        py::arg("scale") = 0.0625f, py::arg("stream") = 0, py::arg("mask") = 31,
        py::arg("seqused") = 0);
+#endif
 
     // ── Decoder-attention phase-ablation probe (see attention/attn_probe.hip) ──
     m.def("attn_partial_probe", [](uintptr_t Q, uintptr_t K, uintptr_t V,
@@ -618,9 +657,11 @@ PYBIND11_MODULE(flash_rt_amd_kernels, m) {
 #include "gemm/bindings_gemm.inc"
 
     // ── GEMM: hand-tuned small-M FP8 (weight-streaming) ──
+#if defined(FLASHRT_AMD_CDNA4)
 #include "gemm/bindings_smallm.inc"
+#endif
 
-    // ── MFMA small-M FP8 GEMM (see gemm/smallm_mfma.h) ──
+    // ── MFMA small-M FP8 GEMM (OCP on CDNA4, FNUZ on CDNA3) ──
     m.def("smallm_mfma_nt", [](int variant, uintptr_t A, uintptr_t W,
                                uintptr_t D, int M, int N, int K,
                                uintptr_t d_scale_a, uintptr_t d_scale_b,
@@ -690,7 +731,7 @@ PYBIND11_MODULE(flash_rt_amd_kernels, m) {
         return v;
     });
 
-    // ── MFMA small-M BF16 packed GEMM (see gemm/smallm_mfma_bf16.h) ──
+    // ── MFMA small-M BF16 packed GEMM ──
 #include "gemm/bindings_smallm_bf16.inc"
 
     // ── GEMM: fused decoder-FFN pair (gate|up+geglu, down+gate*res) ──

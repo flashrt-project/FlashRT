@@ -1,5 +1,5 @@
 // ================================================================
-// FlashRT AMD — MFMA small-M BF16 packed-weight GEMM (gfx950, wave64)
+// FlashRT AMD — MFMA small-M BF16 packed-weight GEMM (gfx942/gfx950, wave64)
 // See smallm_mfma_bf16.h for the contract, pack layout and rationale.
 //
 // Load ordering inside a round (perf-critical, mirrors the FP8 packed
@@ -22,9 +22,22 @@ namespace {
 
 typedef float floatx4 __attribute__((ext_vector_type(4)));
 typedef short shortx8 __attribute__((ext_vector_type(8)));
+typedef short shortx4 __attribute__((ext_vector_type(4)));
 
 // Steps consumed per round; every supported S is a multiple.
+#if defined(FLASHRT_AMD_CDNA3)
+// gfx942's BF16 MFMA is 16-deep and consumes four bf16 values (8B) per
+// lane. Eight independent loads retain the 64B/lane in-flight target.
+using Bf16Frag = shortx4;
+constexpr int BF16_MFMA_K = 16;
+constexpr int BF16_RSTEPS = 8;
+#else
+// The original gfx950 GROOT shapes use K={1536,6144} and were tuned with
+// six steps per round. Preserve that code generation unchanged.
+using Bf16Frag = shortx8;
+constexpr int BF16_MFMA_K = 32;
 constexpr int BF16_RSTEPS = 6;
+#endif
 // Reduction scratch stride per (wave, tile): 64 lanes x 4 floats,
 // +8 pad so the row stride is not 0 mod 128B.
 constexpr int RED_STRIDE = 64 * 4 + 8;
@@ -38,7 +51,7 @@ __device__ __forceinline__ float gelu_tanh_f32(float g) {
                               * (1.0f + 0.044715f * g * g)));
 }
 
-// S     = MFMA k-steps per wave segment (kseg = 32*S = K/WAVES)
+// S     = MFMA k-steps per wave segment (kseg = BF16_MFMA_K*S)
 // WAVES = waves per workgroup (K-split factor inside the WG)
 // MTPW  = m-tiles owned by this workgroup (1 = split grid.y, 3 = fused)
 // EPI   = 0 bias, 1 bias+gelu, 2 bias+residual-accumulate
@@ -46,7 +59,7 @@ template<int S, int WAVES, int MTPW, int EPI>
 __global__ __launch_bounds__(64 * WAVES)
 void smallm_bf16_nn_packed_kernel(
     const __hip_bfloat16* __restrict__ A,     // (M,K) bf16 row-major
-    const shortx8* __restrict__ Wp,           // packed 16B chunks (header)
+    const Bf16Frag* __restrict__ Wp,           // packed per-lane chunks
     const __hip_bfloat16* __restrict__ bias,  // (N)
     __hip_bfloat16* __restrict__ D,           // (M,N) bf16
     int M, int N, int K) {
@@ -60,8 +73,8 @@ void smallm_bf16_nn_packed_kernel(
     const int gt0  = blockIdx.y * MTPW;   // first global m-tile
 
     const int fcol = lane & 15;           // n for b / m for a / n for c
-    const int kgrp = lane >> 4;           // 8-elem sub-window of each 32k
-    const int kbase = wave * (32 * S);
+    const int kgrp = lane >> 4;           // one of four K sub-fragments
+    const int kbase = wave * (BF16_MFMA_K * S);
 
     // A row pointers per m-tile; pad rows (m >= M) clamp to the last
     // real row — their C rows are never stored, only their own
@@ -71,12 +84,15 @@ void smallm_bf16_nn_packed_kernel(
     for (int t = 0; t < MTPW; ++t) {
         int m = 16 * (gt0 + t) + fcol;
         if (m >= M) m = M - 1;
-        arow[t] = A + (size_t)m * K + kbase + kgrp * 8;
+        arow[t] = A + (size_t)m * K + kbase
+                    + kgrp * (BF16_MFMA_K / 4);
     }
 
-    // Packed stream: 2*K chunks per n-tile, chunk = step*64 + lane
-    // inside the tile, this wave starting at step wave*S.
-    const shortx8* wp = Wp + (size_t)blockIdx.x * 2 * K
+    // Packed stream: one architecture-specific fragment per (step, lane);
+    // this wave starts at step wave*S.
+    constexpr int CHUNKS_PER_TILE_PER_K =
+        (16 * 2) / (int)sizeof(Bf16Frag);
+    const Bf16Frag* wp = Wp + (size_t)blockIdx.x * CHUNKS_PER_TILE_PER_K * K
                            + (size_t)(wave * S) * 64 + lane;
 
     floatx4 acc[MTPW];
@@ -84,7 +100,7 @@ void smallm_bf16_nn_packed_kernel(
     for (int t = 0; t < MTPW; ++t)
         acc[t] = (floatx4){0.0f, 0.0f, 0.0f, 0.0f};
 
-    shortx8 bw[2][BF16_RSTEPS];
+    Bf16Frag bw[2][BF16_RSTEPS];
     #pragma unroll
     for (int s = 0; s < BF16_RSTEPS; ++s)
         bw[0][s] = wp[(size_t)s * 64];
@@ -92,13 +108,13 @@ void smallm_bf16_nn_packed_kernel(
     for (int r = 0; r < ROUNDS; ++r) {
         const int cur = r & 1;
         // (1) this round's a-fragments
-        shortx8 af[MTPW][BF16_RSTEPS];
+        Bf16Frag af[MTPW][BF16_RSTEPS];
         #pragma unroll
         for (int s = 0; s < BF16_RSTEPS; ++s) {
             #pragma unroll
             for (int t = 0; t < MTPW; ++t)
-                af[t][s] = *reinterpret_cast<const shortx8*>(
-                    arow[t] + (r * BF16_RSTEPS + s) * 32);
+                af[t][s] = *reinterpret_cast<const Bf16Frag*>(
+                    arow[t] + (r * BF16_RSTEPS + s) * BF16_MFMA_K);
         }
         // (2) next round's weight chunks stay in flight through (3)
         if (r + 1 < ROUNDS) {
@@ -111,8 +127,13 @@ void smallm_bf16_nn_packed_kernel(
         for (int s = 0; s < BF16_RSTEPS; ++s) {
             #pragma unroll
             for (int t = 0; t < MTPW; ++t)
+#if defined(FLASHRT_AMD_CDNA3)
+                acc[t] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
+                    af[t][s], bw[cur][s], acc[t], 0, 0, 0);
+#else
                 acc[t] = __builtin_amdgcn_mfma_f32_16x16x32_bf16(
                     af[t][s], bw[cur][s], acc[t], 0, 0, 0);
+#endif
         }
     }
 
@@ -165,7 +186,7 @@ const Bf16Variant kBf16Variants[] = {
 
 template<int S, int WAVES, int MTPW>
 void launch_epi(int epi, dim3 grid,
-                const __hip_bfloat16* A, const shortx8* Wp,
+                const __hip_bfloat16* A, const Bf16Frag* Wp,
                 const __hip_bfloat16* bias, __hip_bfloat16* D,
                 int M, int N, int K, hipStream_t stream) {
     const dim3 block(64 * WAVES);
@@ -183,25 +204,37 @@ void launch_epi(int epi, dim3 grid,
 
 template<int WAVES, int MTPW>
 void launch_steps(int steps, int epi, dim3 grid,
-                  const __hip_bfloat16* A, const shortx8* Wp,
+                  const __hip_bfloat16* A, const Bf16Frag* Wp,
                   const __hip_bfloat16* bias, __hip_bfloat16* D,
                   int M, int N, int K, hipStream_t stream) {
     switch (steps) {
+#if defined(FLASHRT_AMD_CDNA3)
+    case 8:  launch_epi<8,  WAVES, MTPW>(epi, grid, A, Wp, bias, D, M, N, K, stream); break;
+    case 16: launch_epi<16, WAVES, MTPW>(epi, grid, A, Wp, bias, D, M, N, K, stream); break;
+    case 32: launch_epi<32, WAVES, MTPW>(epi, grid, A, Wp, bias, D, M, N, K, stream); break;
+    case 48: launch_epi<48, WAVES, MTPW>(epi, grid, A, Wp, bias, D, M, N, K, stream); break;
+    case 64: launch_epi<64, WAVES, MTPW>(epi, grid, A, Wp, bias, D, M, N, K, stream); break;
+#else
     case 6:  launch_epi<6,  WAVES, MTPW>(epi, grid, A, Wp, bias, D, M, N, K, stream); break;
     case 12: launch_epi<12, WAVES, MTPW>(epi, grid, A, Wp, bias, D, M, N, K, stream); break;
     case 24: launch_epi<24, WAVES, MTPW>(epi, grid, A, Wp, bias, D, M, N, K, stream); break;
     case 48: launch_epi<48, WAVES, MTPW>(epi, grid, A, Wp, bias, D, M, N, K, stream); break;
+#endif
     default:
         throw std::runtime_error(
-            "smallm_mfma_bf16: K/(32*waves) must be 6/12/24/48, got K="
+            "smallm_mfma_bf16: unsupported MFMA step count for K="
             + std::to_string(K) + " waves=" + std::to_string(WAVES));
     }
 }
 
 bool steps_valid(int K, int waves) {
-    if (K % (32 * waves) != 0) return false;
-    int s = K / (32 * waves);
+    if (K % (BF16_MFMA_K * waves) != 0) return false;
+    int s = K / (BF16_MFMA_K * waves);
+#if defined(FLASHRT_AMD_CDNA3)
+    return s == 8 || s == 16 || s == 32 || s == 48 || s == 64;
+#else
     return s == 6 || s == 12 || s == 24 || s == 48;
+#endif
 }
 
 } // namespace
@@ -251,10 +284,10 @@ void smallm_mfma_bf16_nn_packed(int variant, int epilogue,
             "smallm_mfma_bf16: unsupported K for waves="
             + std::to_string(waves) + " (K=" + std::to_string(K) + ")");
 
-    const int steps = K / (32 * waves);
+    const int steps = K / (BF16_MFMA_K * waves);
     const dim3 grid(N / 16, fused ? 1 : mt);
     const __hip_bfloat16* A = static_cast<const __hip_bfloat16*>(A_bf16);
-    const shortx8* Wp = static_cast<const shortx8*>(Wp_bf16);
+    const Bf16Frag* Wp = static_cast<const Bf16Frag*>(Wp_bf16);
     const __hip_bfloat16* bias = static_cast<const __hip_bfloat16*>(bias_bf16);
 
     if (fused) {

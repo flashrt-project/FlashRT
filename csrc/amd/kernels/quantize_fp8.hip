@@ -4,12 +4,8 @@
 // Mirrors csrc/kernels/quantize.cu host-wrapper signatures exactly so
 // the pipeline layer stays portable text across platforms.
 //
-// FP8 dtype: OCP e4m3 via <hip/hip_fp8.h> __hip_fp8_e4m3 — the same
-// byte format the hipBLASLt GEMM side consumes as HIP_R_8F_E4M3.
-// __hip_fp8_e4m3(float) defaults to __HIP_SATFINITE + __HIP_E4M3,
-// matching the __nv_fp8_e4m3(float) saturating round-to-nearest-even
-// conversion of the CUDA original. Values are pre-clamped to ±448
-// (the e4m3 finite max) before conversion, exactly as in quantize.cu.
+// FP8 storage, hipBLASLt datatype, and finite bound come from arch.h:
+// E4M3 FNUZ/240 on CDNA3 and OCP E4M3/448 on CDNA4.
 //
 // Deviations from quantize.cu (noted, not silent):
 //   - only the deployed pi05 surface is ported: quantize_fp8_static,
@@ -21,7 +17,7 @@
 // ================================================================
 
 #include "common_hip.h"
-#include <hip/hip_fp8.h>
+#include "../arch.h"
 
 // ── FP8 Quantize ──
 
@@ -64,8 +60,8 @@ __global__ void quantize_fp8_kernel_generic(const T* __restrict__ input,
         float inv_s = 1.0f / (*scale);
         T2 val = in2[idx];
         float v0 = to_f32(val.x) * inv_s, v1 = to_f32(val.y) * inv_s;
-        output[2*idx]   = __hip_fp8_e4m3(fminf(fmaxf(v0, -448.0f), 448.0f));
-        output[2*idx+1] = __hip_fp8_e4m3(fminf(fmaxf(v1, -448.0f), 448.0f));
+        output[2*idx]   = __hip_fp8_e4m3(fminf(fmaxf(v0, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite));
+        output[2*idx+1] = __hip_fp8_e4m3(fminf(fmaxf(v1, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite));
     }
 }
 
@@ -75,7 +71,7 @@ template __global__ void quantize_fp8_kernel_generic<__hip_bfloat16>(const __hip
 // ── FP8 Quantize Device-Only (HIP Graph compatible) ──
 __global__ void compute_scale_kernel(const float* d_absmax, float* d_scale) {
     float amax = *d_absmax;
-    float scale = amax / 448.0f;
+    float scale = amax / flashrt::amd::arch::fp8_max_finite;
     if (scale < 1e-12f) scale = 1e-12f;
     *d_scale = scale;
 }
@@ -110,8 +106,8 @@ __global__ void quantize_fp8_kernel_wide8(const qz_bf16x8* __restrict__ in,
     for (int k = 0; k < 4; ++k) {
         float v0 = __bfloat162float(v.p[k].x) * inv_s;
         float v1 = __bfloat162float(v.p[k].y) * inv_s;
-        o.b[2*k]   = __hip_fp8_e4m3(fminf(fmaxf(v0, -448.0f), 448.0f)).__x;
-        o.b[2*k+1] = __hip_fp8_e4m3(fminf(fmaxf(v1, -448.0f), 448.0f)).__x;
+        o.b[2*k]   = __hip_fp8_e4m3(fminf(fmaxf(v0, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite)).__x;
+        o.b[2*k+1] = __hip_fp8_e4m3(fminf(fmaxf(v1, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite)).__x;
     }
     out[idx] = o;
 }

@@ -47,7 +47,7 @@
 //     g = bf16_round(acc_gate * sa * sw)        // fp8_nt_dev's BF16 D
 //     u = bf16_round(acc_up   * sa * sw)
 //     gelu = g / (1 + exp(-1.5957691216057308*g*(1 + 0.044715*g*g)))
-//     v = clamp(gelu*u / s_out, ±448) -> __hip_fp8_e4m3 (RNE, sat)
+//     v = clamp(gelu*u / s_out, target FP8 range) -> FP8 (RNE, sat)
 //
 //   Grid: 256-thread WGs (4 waves), NPW geglu-columns per wave.
 //   Default NPW=2 -> 8 columns (16 weight rows, 16 KB @ K=1024) per
@@ -77,7 +77,7 @@
 //   vs the unfused chain's ~13.0 MB + 460 KB of intermediates + 4
 //   launch/gap overheads.
 //
-// FP8 is OCP e4m3 (__hip_fp8_e4m3, HIP_R_8F_E4M3 — never fnuz).
+// FP8 storage is selected by csrc/amd/arch.h for the target generation.
 // Scales are DEVICE float pointers dereferenced in-kernel (HIP Graph
 // safe), matching the hipBLASLt A/B_SCALE_POINTER contract.
 //
