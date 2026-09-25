@@ -44,17 +44,23 @@ def test_rdna35_temporal_cache_surface_matches_other_pi05_backends():
     assert hasattr(Pi05PipelineRdna35, "forward_decode_only")
 
 
-def test_rdna35_temporal_schedule_starts_with_full_and_refreshes_periodically():
+@pytest.mark.parametrize("period", [1, 2, 3])
+def test_rdna35_temporal_schedule_starts_with_full_and_refreshes_periodically(period):
     from flash_rt.amd.frontends.torch.pi05_rdna35 import (
         Pi05TorchFrontendAmdRdna35,
     )
 
     frontend = object.__new__(Pi05TorchFrontendAmdRdna35)
-    frontend._cache_frames = 3
-    frontend._frame_count = 0
-    assert [frontend._use_full_pipeline_for_next_frame() for _ in range(7)] == [
-        True, False, False, True, False, False, True,
-    ]
+    frontend._cache_frames = period
+    frontend.pipeline = SimpleNamespace(has_encoder_cache=True)
+    for completed in range(7):
+        frontend._frame_count = completed
+        for _ in range(2):
+            assert frontend._use_full_pipeline_for_next_frame() == (completed % period == 0)
+            assert frontend._frame_count == completed
+    frontend.pipeline.has_encoder_cache = False
+    assert frontend._use_full_pipeline_for_next_frame()
+
 
 
 @pytest.mark.parametrize("arch", ["gfx1151", "gfx1151:sramecc-:xnack-"])
@@ -258,6 +264,7 @@ def test_public_actions_keep_constant_last_channel(monkeypatch, tmp_path):
     frontend.action_dim = frontend._resolve_action_dim(tmp_path, 3, frontend.norm_stats)
     frontend._prompt_len = 1
     frontend._cache_frames = 1
+    frontend.pipeline = SimpleNamespace(invalidate_encoder_cache=lambda: None)
     frontend._frame_count = 0
     frontend.dtype = torch.bfloat16
     frontend._noise_buf = torch.zeros(2, 32, dtype=torch.bfloat16)
