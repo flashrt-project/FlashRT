@@ -603,6 +603,15 @@ class Pi05TorchPipeline:
             if value.device.type != self.device.type or value.dtype != self.dtype:
                 raise TypeError(f"{name} must be a BF16 tensor on {self.device}")
 
+    @property
+    def has_encoder_cache(self) -> bool:
+        """Whether a full forward has produced a reusable encoder prefix."""
+        return self._current_prompt_len is not None
+
+    def invalidate_encoder_cache(self) -> None:
+        """Invalidate K/V contents while retaining reusable graph plans."""
+        self._current_prompt_len = None
+
     @torch.inference_mode()
     def forward_with_inputs(
         self,
@@ -614,6 +623,7 @@ class Pi05TorchPipeline:
         capture_probes: bool = False,
         use_graph: bool = False,
     ) -> torch.Tensor:
+        self.invalidate_encoder_cache()
         self._validate_inputs(images_nhwc, prompt_embeds, prompt_len, noise)
 
         if capture_probes and use_graph:
@@ -636,8 +646,11 @@ class Pi05TorchPipeline:
                 self._vision(images_nhwc)
                 valid_prefix = self._encoder(prompt_embeds, prompt_len)
                 self._decoder(valid_prefix)
-            self._current_prompt_len = prompt_len
             self._save("final_raw_action", self.buf["noise"])
+            self._current_prompt_len = prompt_len
+        except BaseException:
+            self.invalidate_encoder_cache()
+            raise
         finally:
             self._capture_probes = False
         return self.buf["noise"].unsqueeze(0)
@@ -692,6 +705,9 @@ class Pi05TorchPipeline:
                 )
                 self._decoder(valid_prefix)
             self._save("final_raw_action", self.buf["noise"])
+        except BaseException:
+            self.invalidate_encoder_cache()
+            raise
         finally:
             self._capture_probes = False
         return self.buf["noise"].unsqueeze(0)

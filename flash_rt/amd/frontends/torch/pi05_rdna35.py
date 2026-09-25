@@ -262,6 +262,9 @@ class Pi05TorchFrontendAmdRdna35:
         return action_dim
 
     def set_prompt(self, prompt_text: str, state=None) -> None:
+        self.pipeline.invalidate_encoder_cache()
+        self._frame_count = 0
+        self._prompt_len = 0
         embeds, prompt_len = _embed_prompt(
             prompt_text,
             self.weights["embedding_weight"],
@@ -275,9 +278,6 @@ class Pi05TorchFrontendAmdRdna35:
         self._prompt_buf[:prompt_len].copy_(embeds.to(self.dtype))
         self._prompt_len = prompt_len
         self._prompt_text = prompt_text
-        # A prompt/state change invalidates the context represented by the
-        # cached encoder K/V. The next inference must refresh it.
-        self._frame_count = 0
 
     def _gather_view_images(self, observation: dict) -> list[np.ndarray]:
         if "images" in observation:
@@ -332,11 +332,11 @@ class Pi05TorchFrontendAmdRdna35:
         )
 
     def _use_full_pipeline_for_next_frame(self) -> bool:
-        """Advance the temporal schedule and select full or decoder-only work."""
-        self._frame_count += 1
+        """Select work without advancing the successful-frame schedule."""
         return (
             self._cache_frames <= 1
-            or self._frame_count % self._cache_frames == 1
+            or self._frame_count % self._cache_frames == 0
+            or not self.pipeline.has_encoder_cache
         )
 
     @torch.inference_mode()
@@ -349,39 +349,46 @@ class Pi05TorchFrontendAmdRdna35:
         if self._prompt_len == 0:
             raise RuntimeError("set_prompt must be called before infer")
         started = time.perf_counter()
-        if noise is None:
-            self._noise_buf.normal_()
-        else:
-            value = torch.as_tensor(np.asarray(noise))
-            if value.shape != self._noise_buf.shape:
-                raise ValueError(
-                    f"noise has shape {tuple(value.shape)}; expected "
-                    f"{tuple(self._noise_buf.shape)}")
-            self._noise_buf.copy_(value.to(self.dtype))
-        # Match the CDNA/RTX temporal schedule: refresh Vision/Encoder on the
-        # first frame of each period and reuse their K/V on intermediate frames.
-        use_full = self._use_full_pipeline_for_next_frame()
-        if use_full:
-            self._fill_images(observation)
-            raw = self.forward_with_fixed_noise(
-                self._image_buf,
-                self._noise_buf,
-            )[0]
-        else:
-            raw = self.pipeline.forward_decode_only(self._noise_buf)[0]
-        torch.cuda.synchronize()
-        latency_ms = (time.perf_counter() - started) * 1000
-        self.latency_records.append(latency_ms)
+        try:
+            if noise is None:
+                self._noise_buf.normal_()
+            else:
+                value = torch.as_tensor(np.asarray(noise))
+                if value.shape != self._noise_buf.shape:
+                    raise ValueError(
+                        f"noise has shape {tuple(value.shape)}; expected "
+                        f"{tuple(self._noise_buf.shape)}")
+                self._noise_buf.copy_(value.to(self.dtype))
+            # Match the CDNA/RTX temporal schedule: refresh Vision/Encoder on the
+            # first frame of each period and reuse their K/V on intermediate frames.
+            use_full = self._use_full_pipeline_for_next_frame()
+            if use_full:
+                self.pipeline.invalidate_encoder_cache()
+                self._fill_images(observation)
+                raw = self.forward_with_fixed_noise(
+                    self._image_buf,
+                    self._noise_buf,
+                )[0]
+            else:
+                raw = self.pipeline.forward_decode_only(self._noise_buf)[0]
+            torch.cuda.synchronize()
+            latency_ms = (time.perf_counter() - started) * 1000
 
-        raw_actions = raw.float().cpu().numpy()
-        actions = unnormalize_actions(raw_actions, self.norm_stats)[
-            :, :self.action_dim]
-        result = {"actions": actions}
-        if debug:
-            result.update({
-                "raw_actions": raw_actions,
-                "latency_ms": latency_ms,
-            })
+            raw_actions = raw.float().cpu().numpy()
+            actions = unnormalize_actions(raw_actions, self.norm_stats)[
+                :, :self.action_dim]
+            result = {"actions": actions}
+            if debug:
+                result.update({
+                    "raw_actions": raw_actions,
+                    "latency_ms": latency_ms,
+                })
+        except BaseException:
+            self.pipeline.invalidate_encoder_cache()
+            self._frame_count = 0
+            raise
+        self._frame_count += 1
+        self.latency_records.append(latency_ms)
         return result
 
     @property

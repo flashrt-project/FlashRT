@@ -130,3 +130,167 @@ def test_legacy_model_exports_keep_their_provider(monkeypatch):
     finally:
         for name in package.__all__:
             package.__dict__.pop(name, None)
+
+
+@pytest.fixture
+def cpu_rdna_frontend(small_model, monkeypatch):
+    import numpy as np
+    from flash_rt.api import VLAModel
+    from flash_rt.amd.frontends.torch import pi05_rdna35 as frontend_module
+
+    pipeline = model.Pi05TorchPipeline(
+        small_model.weights, TorchTensorOps(), TorchGemmBackend(),
+        TorchAttentionBackend(2), num_views=2, max_prompt_len=3,
+        chunk_size=3, num_steps=2, device='cpu',
+    )
+    frontend = object.__new__(frontend_module.Pi05TorchFrontendAmdRdna35)
+    frontend.num_views = 2
+    frontend._cache_frames = 2
+    frontend._frame_count = 0
+    frontend._prompt_len = 0
+    frontend._prompt_text = None
+    frontend.max_prompt_len = 3
+    frontend.dtype = torch.bfloat16
+    frontend.weights = {'embedding_weight': torch.zeros(1)}
+    frontend._prompt_buf = torch.empty(3, 8, dtype=frontend.dtype)
+    frontend._image_buf = torch.empty(2, 224, 224, 3, dtype=frontend.dtype)
+    frontend._noise_buf = torch.empty(3, 4, dtype=frontend.dtype)
+    frontend.pipeline = pipeline
+    frontend.latency_records = []
+    frontend.action_dim = 4
+    frontend.norm_stats = {'actions': {'q01': [-1.] * 4, 'q99': [1.] * 4}}
+
+    def embed(text, *args, state=None, **kwargs):
+        value = 1. if text == 'A' else 5.
+        if state is not None:
+            value += 4. * float(np.asarray(state).sum())
+        return torch.full((1, 8), value, dtype=frontend.dtype), 1
+
+    monkeypatch.setattr(frontend_module, '_embed_prompt', embed)
+    monkeypatch.setattr(torch.cuda, 'synchronize', lambda: None)
+    calls = []
+    original_full = pipeline.forward_with_inputs
+    original_decode = pipeline.forward_decode_only
+
+    def full(*args, **kwargs):
+        calls.append('full')
+        return original_full(*args, **kwargs)
+
+    def decode(*args, **kwargs):
+        calls.append('decode')
+        return original_decode(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, 'forward_with_inputs', full)
+    monkeypatch.setattr(pipeline, 'forward_decode_only', decode)
+    images = [np.zeros((224, 224, 3), dtype=np.uint8) for _ in range(2)]
+    return SimpleNamespace(frontend=frontend, pipeline=pipeline,
+                           public=VLAModel(frontend, 'torch'), images=images,
+                           calls=calls, noise=torch.zeros(3, 4, dtype=frontend.dtype))
+
+
+@pytest.mark.parametrize('change', ['first', 'prompt', 'state', 'periodic'])
+def test_failed_refresh_retry_uses_full_pipeline(cpu_rdna_frontend, change):
+    f = cpu_rdna_frontend
+    prompt, state = 'A', None
+    old_prefix = None
+    if change != 'first':
+        f.public.predict(f.images, prompt=prompt, state=state)
+        old_prefix = f.pipeline.buf['encoder_k'][:, :513].clone()
+    if change == 'prompt':
+        prompt = 'B'  # Same token length as A; length alone is not a cache key.
+    elif change == 'state':
+        state = [1.]
+    elif change == 'periodic':
+        f.public.predict(f.images, prompt=prompt)
+        assert f.calls == ['full', 'decode']
+
+    with pytest.raises(ValueError, match='missing image'):
+        f.public.predict({'image': f.images[0]}, prompt=prompt, state=state)
+    assert f.frontend._frame_count == 0
+    assert not f.pipeline.has_encoder_cache
+    with pytest.raises(RuntimeError, match='preceding full forward'):
+        f.pipeline.forward_decode_only(f.noise)
+    f.calls.clear()
+
+    # The public wrapper has already stored the new prompt/state; a retry
+    # must recover without relying on another set_prompt call.
+    f.public.predict(f.images, prompt=prompt, state=state)
+    assert f.calls == ['full']
+    assert f.frontend._frame_count == 1
+    assert f.pipeline.has_encoder_cache
+    if change in ('prompt', 'state'):
+        assert not torch.equal(old_prefix, f.pipeline.buf['encoder_k'][:, :513])
+    f.public.predict(f.images, prompt=prompt, state=state)
+    assert f.calls == ['full', 'decode']
+
+
+@pytest.mark.parametrize('failure', ['decode', 'synchronize', 'postprocess'])
+def test_inference_failure_invalidates_cache(cpu_rdna_frontend, monkeypatch, failure):
+    from flash_rt.amd.frontends.torch import pi05_rdna35 as frontend_module
+    f = cpu_rdna_frontend
+    f.public.predict(f.images, prompt='A')
+    def fail(*args, **kwargs):
+        raise RuntimeError('injected inference failure')
+    with monkeypatch.context() as patch:
+        if failure == 'decode':
+            patch.setattr(f.pipeline, '_decoder', fail)
+        elif failure == 'synchronize':
+            patch.setattr(torch.cuda, 'synchronize', fail)
+        else:
+            patch.setattr(frontend_module, 'unnormalize_actions', fail)
+        with pytest.raises(RuntimeError, match='injected inference failure'):
+            f.public.predict(f.images)
+    assert f.frontend._frame_count == 0
+    assert not f.pipeline.has_encoder_cache
+    assert len(f.frontend.latency_records) == 1
+    f.calls.clear()
+    f.public.predict(f.images)
+    assert f.calls == ['full']
+    assert f.frontend._frame_count == 1
+
+
+@pytest.mark.parametrize('stage', ['_vision', '_encoder', '_decoder'])
+def test_partial_full_forward_cannot_leave_valid_cache(cpu_rdna_frontend, monkeypatch, stage):
+    f = cpu_rdna_frontend
+    f.public.predict(f.images, prompt='A')
+    original = getattr(f.pipeline, stage)
+    def fail_after_write(*args, **kwargs):
+        original(*args, **kwargs)
+        raise RuntimeError('partial full forward')
+    with monkeypatch.context() as patch:
+        patch.setattr(f.pipeline, stage, fail_after_write)
+        with pytest.raises(RuntimeError, match='partial full forward'):
+            f.frontend.forward_with_fixed_noise(f.frontend._image_buf, f.noise)
+    assert not f.pipeline.has_encoder_cache
+    with pytest.raises(RuntimeError, match='preceding full forward'):
+        f.pipeline.forward_decode_only(f.noise)
+    f.frontend.forward_with_fixed_noise(f.frontend._image_buf, f.noise)
+    assert f.pipeline.has_encoder_cache
+
+
+def test_prompt_invalidation_preserves_graph_plans(cpu_rdna_frontend):
+    f = cpu_rdna_frontend
+    f.public.predict(f.images, prompt='A')
+    full_graph, decoder_graph = object(), object()
+    f.pipeline._graph = full_graph
+    f.pipeline._decoder_only_graph = decoder_graph
+    f.pipeline._graph_prompt_len = 1
+    f.pipeline._decoder_only_graph_prompt_len = 1
+    f.frontend.set_prompt('B')
+    assert not f.pipeline.has_encoder_cache
+    assert f.frontend._frame_count == 0
+    assert f.pipeline._graph is full_graph
+    assert f.pipeline._decoder_only_graph is decoder_graph
+    assert f.pipeline._graph_prompt_len == f.pipeline._decoder_only_graph_prompt_len == 1
+    with pytest.raises(RuntimeError, match='preceding full forward'):
+        f.pipeline.forward_decode_only(f.noise)
+
+
+@pytest.mark.parametrize('period', [1, 2, 3])
+def test_successful_inference_preserves_cache_period(cpu_rdna_frontend, period):
+    f = cpu_rdna_frontend
+    f.frontend._cache_frames = period
+    for _ in range(7):
+        f.public.predict(f.images, prompt='A')
+    assert f.calls == ['full' if index % period == 0 else 'decode' for index in range(7)]
+    assert f.frontend._frame_count == 7

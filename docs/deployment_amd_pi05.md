@@ -275,9 +275,15 @@ does not launch a shape-incompatible kernel.
 `cache_frames=1` refreshes image/prompt K/V on every call. With
 `cache_frames=2`, calls alternate between a full forward and decoder-only
 execution using the preceding frame's K/V. Calling `set_prompt()` resets the
-schedule, so the next inference is always a full refresh; consequently, a
+schedule and invalidates cached K/V, so the next inference is always a full refresh; consequently, a
 serving loop that updates state through `set_prompt(..., state=...)` on every
 frame intentionally receives no temporal-cache speedup.
+
+Only successful inference calls advance the reuse period. An inference failure
+invalidates the cached prefix and resets the schedule, so retrying with valid
+inputs always performs a full refresh. The shared pipeline rejects decoder-only
+calls without a valid prefix. Invalidating K/V contents retains captured graph
+plans; a same-shape refresh updates the buffers used by their next replay.
 
 ## Environment knobs
 
