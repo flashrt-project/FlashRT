@@ -411,9 +411,14 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                                      via Orin env flags)
               gfx942 (MI300 series) → ``flash_rt.amd.*`` (CDNA3)
               gfx950 (MI350 series) → ``flash_rt.amd.*`` (CDNA4)
+              gfx1151 (Radeon 8060S) → ``flash_rt.amd.*`` (RDNA 3.5 BF16)
             Pass ``"thor"`` / ``"rtx_sm120"`` / ``"rtx_sm89"`` /
-            ``"rtx_sm87"`` / ``"amd_cdna3"`` / ``"amd_cdna4"`` explicitly to
-            force a specific backend (useful for cross-hardware debugging).
+            ``"rtx_sm87"`` / ``"amd_cdna3"`` / ``"amd_cdna4"`` /
+            ``"amd_rdna35"`` explicitly to force a specific backend (useful
+            for cross-hardware debugging).
+        action_dim: Explicit robot output dimension for the RDNA Pi0.5 and
+            Jetson Pi frontends. RDNA may instead read output_action_dim from
+            checkpoint config.json; normalization statistics are not a schema.
         embodiment_tag: GROOT only. Per-embodiment MLP slot to load. Passing
             ``None`` uses the backend default (``"new_embodiment"`` — unfit
             for the base 3B checkpoint demo; see below). The GR00T-N1.6-3B
@@ -496,7 +501,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         vision_num_layers: Pi0.5 torch RTX/Orin only. Number of SigLIP vision
             layers to execute; valid range is 1-27. ``None`` keeps the
             frontend default.
-        cache_frames: Pi0.5 torch RTX/Orin only. Temporal K/V reuse period.
+        cache_frames: Pi0.5 torch RTX/Orin and AMD CDNA4/RDNA 3.5 only.
+            Temporal K/V reuse period.
             1 runs the full vision+encoder+decoder path on every frame; 2
             alternates full and decoder-only frames. ``None`` keeps the
             frontend default.
@@ -740,6 +746,24 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 f"-DGPU_ARCH={'gfx942' if arch == 'amd_cdna3' else 'gfx950'} && "
                 "cmake --build build-amd -j\n"
                 "See docs/deployment_amd.md.") from exc
+    elif arch == "amd_rdna35":
+        try:
+            import flash_rt.amd.flash_rt_amd_kernels  # noqa: F401
+        except ImportError as exc:
+            raise ImportError(
+                "flash_rt.amd.flash_rt_amd_kernels is not built for the "
+                "AMD RDNA 3.5 backend. Build it with:\n"
+                "    bash scripts/amd/build_amd.sh gfx1151\n"
+                "See the RDNA 3.5 section in docs/deployment_amd_pi05.md."
+            ) from exc
+        # The first RDNA 3.5 tier is intentionally BF16. load_model's
+        # historical default is use_fp8=True; coerce that default explicitly
+        # rather than routing to the gfx950 FP8 kernels.
+        if use_fp8:
+            use_fp8 = False
+            logger.warning(
+                "AMD RDNA 3.5 backend currently supports BF16 only; "
+                "disabling use_fp8.")
     elif arch == "npu":
         # Ascend NPU backend runs on torch_npu ops (aclnn) plus this repo's own
         # CCE kernels. No root CMake target and no PyTorch C++ extension is
@@ -1031,6 +1055,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     import inspect
     sig = inspect.signature(pipe_cls)
     kwargs: dict = {"num_views": num_views}
+    if arch == "amd_rdna35" and "action_dim" in sig.parameters and action_dim is not None:
+        kwargs["action_dim"] = action_dim
     if "hardware" in sig.parameters:
         kwargs["hardware"] = arch
     if "use_fp8" in sig.parameters:

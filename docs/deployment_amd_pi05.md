@@ -229,3 +229,227 @@ is a judging protocol, not a deployment setting.
 
 Cross-run medians can move with host scheduling and hipBLASLt algorithm
 selection; compare arms under the same affinity and data protocol.
+
+# Pi0.5 on AMD RDNA 3.5 (gfx1151)
+
+This is the BF16 Pi0.5 backend for the integrated Radeon 8060S GPU in
+Ryzen AI Max+ 395 (the GPUs in AMD Ryzen™ AI Embedded X100 Series processors
+share the same RDNA 3.5 architecture). Its public hardware key is
+`amd_rdna35`; `gfx1151` is used only for build-time and runtime hardware
+validation. General AMD build,
+routing, and source-layout information is in
+[deployment_amd.md](deployment_amd.md).
+
+## Validation status
+
+The RDNA bindings use the model-owned torch tensor pipeline. The native gfx1151
+extension, independent OpenPI fixture, full and decoder-only HIP Graphs, temporal
+schedule, native/fallback parity, output schema and routing have been validated on
+Radeon 8060S. The default remains `cache_frames=1`; temporal reuse is explicit.
+
+## Quick start
+
+Create a Python 3.11 environment with a gfx1151 ROCm PyTorch build and the
+ROCm development files, then build the architecture-selected extension:
+
+```bash
+uv venv --python 3.11 .venv
+uv pip install --python .venv/bin/python \
+  'torch[device-gfx1151]==2.12.0+rocm10.1.0a20260806' \
+  'torchvision[device-gfx1151]==0.27.0+rocm10.1.0a20260806' \
+  'torchaudio==2.11.0+rocm10.1.0a20260806' \
+  'rocm[devel,device-gfx1151]==10.1.0a20260806' \
+  --index-url https://rocm.nightlies.amd.com/whl-multi-arch/ \
+  --extra-index-url https://d183u042sr8tht.cloudfront.net/simple/ \
+  --extra-index-url https://pypi.org/simple/ \
+  --index-strategy unsafe-first-match \
+  --prerelease allow
+uv pip install --python .venv/bin/python -e '.[torch]' ml_dtypes pytest ninja build cmake pybind11
+.venv/bin/rocm-sdk init
+
+export ROCM_PATH="$(.venv/bin/rocm-sdk path --root)"
+PYTHON=.venv/bin/python bash scripts/amd/build_amd.sh gfx1151
+```
+
+Library use:
+
+```python
+import flash_rt
+
+model = flash_rt.load_model(
+    "<checkpoint-dir>",
+    config="pi05",
+    framework="torch",
+    hardware="amd_rdna35",  # optional on a gfx1151 machine
+    action_dim=7,  # use your robot's actual output dimension
+    num_views=2,
+    cache_frames=1,  # set 2+ only after validating temporal quality
+    use_fp8=False,
+)
+model.set_prompt("pick up the object", state=state_vector)
+actions = model.predict(images=[base_image, wrist_image])
+```
+
+`hardware="auto"` maps only the exact gfx1151 ISA to this backend. The
+frontend also verifies that the extension was built from the RDNA source set,
+uses wave32, and targets gfx1151 before loading the checkpoint.
+
+## Precision tier
+
+The RDNA 3.5 backend supports BF16 weights and activations only. It does not
+route through the CDNA4 FP8 kernels, packed MFMA layouts, aiter provider, or
+wave64 helpers. `load_model()` converts its historical `use_fp8=True` default
+to BF16 with a warning; direct frontend construction rejects `use_fp8=True`.
+
+## Observation contract
+
+The public BF16 input range matches the CDNA Pi0.5 frontend:
+
+- `num_views` is **2** (base + wrist) or **3** (+ right wrist).
+- Images are `uint8` arrays with shape `(224, 224, 3)`, supplied either as an
+  `images` list with exactly `num_views` entries or through the named
+  `image`, `wrist_image`, and `wrist_image_right` keys.
+- Prompt length is dynamic up to `max_prompt_len` (default 200).
+- `action_dim` explicitly declares the robot output dimension (1..32). It may
+  instead be supplied as `output_action_dim` in checkpoint `config.json`. The
+  model's padded `action_dim` field and constant quantiles are not an output
+  schema. A real constant final joint or gripper channel is preserved.
+- The action horizon is any positive integer. By default it is read from
+  `config.json`'s `action_horizon`, with 10 used when that field is absent.
+- `num_steps` is any positive integer. The frontend regenerates the
+  sinusoidal time schedule and applies the matching `-1 / num_steps` ODE
+  projection scale.
+
+Native decoder attention and the WMMA action projection are selected only
+inside their validated small-shape profiles. Larger horizons and sequences
+fall back to PyTorch SDPA or hipBLASLt, so changing the checkpoint profile
+does not launch a shape-incompatible kernel.
+
+`cache_frames=1` refreshes image/prompt K/V on every call. With
+`cache_frames=2`, calls alternate between a full forward and decoder-only
+execution using the preceding frame's K/V. Calling `set_prompt()` resets the
+schedule and invalidates cached K/V, so the next inference is always a full refresh; consequently, a
+serving loop that updates state through `set_prompt(..., state=...)` on every
+frame intentionally receives no temporal-cache speedup.
+
+Only successful inference calls advance the reuse period. An inference failure
+invalidates the cached prefix and resets the schedule, so retrying with valid
+inputs always performs a full refresh. The shared pipeline rejects decoder-only
+calls without a valid prefix. Invalidating K/V contents retains captured graph
+plans; a same-shape refresh updates the buffers used by their next replay.
+
+## Environment knobs
+
+The native path is enabled by default. These switches are intended for
+same-process parity and performance comparisons:
+
+| Env | Default | Meaning |
+|---|---|---|
+| `FLASHRT_RDNA35_HIP_ROPE` | `1` | BF16x2 QKV/RoPE kernel |
+| `FLASHRT_RDNA35_HIP_DECODER` | `1` | decoder normalization, activation, and residual fusions |
+| `FLASHRT_RDNA35_HIP_GQA` | `1` | wave32 decoder GQA for queries up to 16 rows; row-owned K/V up to 1024 |
+| `FLASHRT_RDNA35_HIP_GQA_SPLIT_KEY` | `1` | split-key decoder GQA with K/V up to 2048 |
+| `FLASHRT_RDNA35_HIP_ENCODER_ATTN` | `1` | native encoder GQA up to 4096 rows and 16 query heads; dense inputs above 1024 use SDPA when faster |
+| `FLASHRT_RDNA35_HIP_SMALLM` | `1` | WMMA action projection for M up to 48 |
+| `FLASHRT_RDNA35_HIP_FFN_GATE_UP` | `1` | merged decoder gate/up dataflow |
+| `FLASHRT_RDNA35_HIP_ENCODER_FFN` | `1` | merged encoder gate/up dataflow |
+| `FLASHRT_RDNA35_HIP_LARGE_OPS` | `1` | shape-specialized vision/encoder normalization and residual kernels |
+| `FLASHRT_RDNA35_PRECOMPUTE_MODULATION` | `1` | prepare timestep modulation before inference |
+| `FLASHRT_RDNA35_HIP_GQA_KEYS` | `4` | split-key group size: 1, 2, 4, or 8 |
+| `FLASHRT_RDNA35_COMPACT_ENCODER` | `1` | execute only the valid image + prompt prefix |
+| `FLASHRT_RDNA35_GEMM_AUTOTUNE` | `1` | instance-local timed hipBLASLt algorithm selection |
+| `FLASHRT_RDNA35_GEMM_ALGOS` | `16` | candidate count for the local GEMM selection |
+
+No generated algorithm CSV is shipped and no process-global PyTorch
+TunableOp state is modified. Triton is not a runtime dependency.
+
+## Feature matrix
+
+| Surface | RDNA 3.5 BF16 |
+|---|---|
+| `set_prompt` / `infer` / `get_latency_stats` | ✅ |
+| 2/3 views, dynamic prompt, horizon, and denoise steps | ✅ |
+| Pinned-noise inference and optional full-model HIP Graph | ✅ |
+| Native HIP attention, QKV/RoPE, normalization, activation, residual, small-M projection | ✅ |
+| FP8 / FP4 | ❌ |
+| Temporal K/V reuse (`cache_frames`) and decoder-only execution | ✅ |
+| CDNA4 aiter, MFMA, and wave64 kernels | ❌ isolated by build and routing |
+
+`cache_frames=1` is the lossless default and refreshes Vision/Encoder on every
+frame. Values greater than one reuse the most recently encoded K/V prefix for
+intermediate decoder-only frames. This improves effective throughput but uses
+stale visual/prompt context, so deployments must validate task quality on real
+trajectories. The RDNA backend does not enable an asynchronous serving pipeline.
+
+## Validation
+
+```bash
+.venv/bin/python -m pytest \
+  tests/test_amd_rdna35_routing.py \
+  tests/test_amd_rdna35_ops.py -q
+
+FLASH_RT_PI05_ACTION_DIM=7 \
+FLASH_RT_PI05_RDNA35_CKPT="<checkpoint-dir>" \
+  .venv/bin/python -m pytest tests/test_amd_rdna35_model.py -q
+
+.venv/bin/python -m pytest tests/test_amd*.py -q
+```
+
+Operator tests compare every native family with a PyTorch reference. The
+checkpoint-gated tests cover finite outputs, fixed-noise determinism, HIP
+Graph parity, and the optimized-versus-library fallback. Profile any extra
+local benchmark from an ignored build directory; benchmark harnesses are not
+part of the source distribution.
+
+
+## Model and target ownership
+
+`flash_rt.models.pi05.torch_pipeline.Pi05TorchPipeline` owns the tensor model
+semantics: vision layers, prefix encoding, decoder layers and denoising steps.
+It accepts tensor-operation, GEMM and attention providers. The RDNA module is
+only a constructor binding; it contains no model traversal. Native operation
+selection lives in `flash_rt.amd.hardware.rdna35.ops`, `gemm` and `attention`.
+The explicit portable torch provider runs the same model pipeline in CPU contract
+tests. It is a refactor regression tool, not an independent model oracle.
+Existing legacy RTX/Thor/CDNA production pipelines retain their routes; this
+change does not claim to migrate all legacy implementations.
+
+Safetensors conversion and prompt embedding are shared by the CDNA and RDNA
+frontends through `flash_rt.frontends.torch.pi05_checkpoint`. Importing them
+loads neither HIP nor CUDA runtime libraries. The CDNA names remain re-exported
+for existing callers.
+
+## Independent reference fixtures
+
+`test_independent_reference_fixture` accepts an NPZ produced by a pinned OpenPI
+revision, without pickled objects. It compares **both raw and public actions**
+for identical checkpoint, images, prompt, state and initial noise. It checks
+checkpoint SHA-256 before inference and requires cosine >= 0.999 plus elementwise
+`atol=0.1, rtol=0.03`; those BF16 bounds are acceptance criteria, not measured
+results. A missing fixture skips this optional hardware test.
+
+Required NPZ entries:
+
+- `metadata`: scalar JSON string containing `producer: "openpi"`, the 40-character
+  `producer_revision`, `checkpoint_sha256`, `num_steps`, `action_dim`, and
+  `action_horizon`.
+- `images`: uint8 `(num_views, 224, 224, 3)`, `prompt`: scalar string,
+  `state`: the exact state passed to prompt tokenization, and `noise`: float32
+  `(action_horizon, 32)` used by both producers (BF16-representable values avoid
+  different initial rounding).
+- `raw_actions`: float32 `(action_horizon, 32)` in normalized model space;
+  `actions`: float32 `(action_horizon, action_dim)` after the independent
+  reference's quantile unnormalization and explicit robot slicing.
+
+Use an independent OpenPI run to generate these arrays; never export expected
+outputs from this pipeline or its fallback provider. Save arrays with
+`numpy.savez` and keep fixtures out of the source distribution. Run with:
+
+```bash
+FLASH_RT_PI05_ACTION_DIM=7 \
+FLASH_RT_PI05_RDNA35_CKPT="<checkpoint-dir>" \
+FLASH_RT_PI05_REFERENCE="<openpi-fixture.npz>" \
+  python -m pytest tests/test_amd_rdna35_model.py -k independent_reference -q
+```
+
+No independent fixture was executed as part of this source-only restructuring.

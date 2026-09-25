@@ -40,6 +40,7 @@ def detect_arch() -> str:
         ``"rtx_sm87"``  — Jetson Orin via RTX consumer backend, SM87 (cc 8.7)
         ``"amd_cdna3"`` — AMD Instinct MI300 series, ROCm (gfx942)
         ``"amd_cdna4"`` — AMD Instinct MI350 series, ROCm (gfx950)
+        ``"amd_rdna35"`` — AMD RDNA 3.5 (gfx1151 / Radeon 8060S)
 
     Raises RuntimeError if no supported accelerator is available or the
     card has an unsupported SM level. Deliberately strict: silently
@@ -78,15 +79,18 @@ def detect_arch() -> str:
         # ROCm build: route by the gfx architecture name, not the CUDA
         # cc tuple (which ROCm fills with unrelated values).
         gcn = torch.cuda.get_device_properties(0).gcnArchName
-        base_gcn = gcn.split(":", 1)[0]
-        if base_gcn == "gfx942":
+        base_arch = gcn.split(":", 1)[0]
+        if base_arch == "gfx942":
             return "amd_cdna3"
-        if base_gcn == "gfx950":
+        if base_arch == "gfx950":
             return "amd_cdna4"
+        if base_arch == "gfx1151":
+            return "amd_rdna35"
         raise RuntimeError(
             f"FlashRT: unsupported ROCm GPU arch {gcn!r}. "
             "Supported: gfx942 (MI300 series / CDNA3), "
-            "gfx950 (MI350 series / CDNA4).")
+            "gfx950 (MI350 series / CDNA4), or gfx1151 "
+            "(Radeon 8060S / Ryzen AI Max+ 395).")
     major, minor = torch.cuda.get_device_capability()
     if (major, minor) == (11, 0):
         return "thor"
@@ -119,6 +123,9 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
         ("flash_rt.amd.frontends.torch.pi05", "Pi05TorchFrontendAmd"),
     ("pi05", "torch", "amd_cdna3"):
         ("flash_rt.amd.frontends.torch.pi05", "Pi05TorchFrontendAmd"),
+    ("pi05", "torch", "amd_rdna35"):
+        ("flash_rt.amd.frontends.torch.pi05_rdna35",
+         "Pi05TorchFrontendAmdRdna35"),
     ("pi05", "torch", "npu"):
         ("flash_rt.npu.frontends.torch.pi05", "Pi05TorchFrontendNpu"),
     ("pi05", "torch", "rtx_sm89"):

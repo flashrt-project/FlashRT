@@ -1,14 +1,13 @@
-"""AMD (ROCm/CDNA4) hardware routing — dispatch-table and load_model gates.
+"""AMD ROCm hardware routing — dispatch-table and load_model gates.
 
 What this file protects:
 
   * the ``("pi05", "torch", "amd_cdna4")`` registration in
     ``flash_rt.hardware._PIPELINE_MAP`` (a silent unregistration would make
     every AMD load fall through to the "no pipeline" error);
-  * the ``detect_arch()`` ROCm branch: gfx950 (any ``gfx950:...`` suffix
-    variant) maps to ``"amd_cdna4"``, and every other ROCm arch REFUSES
-    instead of silently borrowing an NVIDIA backend (detect_arch is
-    documented "deliberately strict");
+  * the ``detect_arch()`` ROCm branch maps each registered AMD architecture
+    and refuses unregistered targets instead of silently borrowing an NVIDIA
+    backend (detect_arch is documented "deliberately strict");
   * the ``load_model`` front-door failure modes: an unbuilt AMD extension
     fails with build instructions (not a bare ModuleNotFoundError), an
     unknown hardware string never resolves, and the Thor-only FP4 knobs
@@ -33,10 +32,20 @@ import pytest
 
 
 def _amd_ext_importable() -> bool:
-    """True iff the compiled AMD module is importable in this env."""
+    """True iff any compiled AMD source set is importable."""
     try:
         import flash_rt.amd.flash_rt_amd_kernels  # noqa: F401
         return True
+    except ImportError:
+        return False
+
+
+def _amd_cdna_ext_importable() -> bool:
+    """True iff the compiled AMD module is the CDNA4 source set."""
+    try:
+        from flash_rt.amd import flash_rt_amd_kernels
+
+        return flash_rt_amd_kernels.build_info().get("backend") != "rdna35"
     except ImportError:
         return False
 
@@ -128,12 +137,8 @@ def test_detect_arch_maps_gfx942_to_amd_cdna3(monkeypatch, gcn):
     "gfx1100",                  # RDNA3
     "gfx9500",                  # prefix trap: startswith() would wrongly pass
 ])
-def test_detect_arch_refuses_non_gfx950_rocm(monkeypatch, gcn):
-    """Verified behavior: a non-gfx950 ROCm GPU raises RuntimeError (it does
-    NOT map to amd_cdna4 and does NOT fall through to the CUDA SM table —
-    flash_rt/hardware/__init__.py raises inside the hip branch). Silently
-    routing MI300/RDNA through the CDNA4 backend would fail much later at
-    the first MFMA kernel, so strictness here is the contract."""
+def test_detect_arch_refuses_unregistered_rocm(monkeypatch, gcn):
+    """An unregistered ROCm GPU must fail inside the HIP routing branch."""
     from flash_rt.hardware import detect_arch
 
     _patch_rocm(monkeypatch, gcn)
@@ -218,9 +223,8 @@ def test_load_model_unknown_hardware_string_errors():
 
 
 @pytest.mark.skipif(
-    not _amd_ext_importable(),
-    reason="flash_rt_amd_kernels not built (the amd_cdna4 extension gate "
-           "fires before the FP4 checks, masking them)")
+    not _amd_cdna_ext_importable(),
+    reason="CDNA4 flash_rt_amd_kernels source set is not built")
 def test_load_model_use_fp4_decoder_rejected_on_amd():
     """Verified behavior: the Thor NVFP4 tier's explicit sub-flags
     (use_fp4_decoder etc.) raise ValueError on any non-Thor arch — the
@@ -236,9 +240,8 @@ def test_load_model_use_fp4_decoder_rejected_on_amd():
 
 
 @pytest.mark.skipif(
-    not _amd_ext_importable(),
-    reason="flash_rt_amd_kernels not built (the amd_cdna4 extension gate "
-           "fires before the FA4 check, masking it)")
+    not _amd_cdna_ext_importable(),
+    reason="CDNA4 flash_rt_amd_kernels source set is not built")
 def test_load_model_use_fa4_rejected_on_amd():
     """FA4 is a Thor-only attention backend; verified: ValueError before
     resolution (flash_rt/api.py gates on config/framework/arch)."""
@@ -250,9 +253,8 @@ def test_load_model_use_fa4_rejected_on_amd():
 
 
 @pytest.mark.skipif(
-    not _amd_ext_importable(),
-    reason="flash_rt_amd_kernels not built (the extension gate raises "
-           "ImportError before the FP4 routing block is reached)")
+    not _amd_cdna_ext_importable(),
+    reason="CDNA4 flash_rt_amd_kernels source set is not built")
 @pytest.mark.skipif(
     not _amd_pipeline_importable(),
     reason="AMD pi05 frontend not importable here (optional numeric deps "

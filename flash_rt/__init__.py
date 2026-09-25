@@ -8,7 +8,8 @@ Public exports (stable API — see ``docs/stable_api.md``):
 
 Supported models: Pi0.5, Pi0, Pi0-FAST, GROOT N1.6, GROOT N1.7.
 Supported hardware: Jetson Thor (SM110), RTX 5090 (SM120), RTX 4090
-(SM89), AMD Instinct MI350 series (ROCm gfx950, pi05).
+(SM89), AMD Instinct MI350 series (ROCm gfx950), and AMD Radeon 8060S
+(ROCm gfx1151, Pi0.5 BF16).
 
 Extending with new models: see ``docs/plugin_model_template.md``.
 

@@ -24,6 +24,7 @@ _WATCHED = [
 
 _AMD_FRONTENDS = [
     "flash_rt.amd.frontends.torch.pi05",
+    "flash_rt.amd.frontends.torch.pi05_rdna35",
     "flash_rt.amd.frontends.torch.groot_n17",
 ]
 

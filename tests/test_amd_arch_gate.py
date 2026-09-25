@@ -1,4 +1,4 @@
-"""The AMD gates accept exact gfx942/gfx950 build/device pairs only.
+"""The CDNA gates accept exact gfx942/gfx950 build/device pairs only.
 
 The AMD backend supports exact gfx942 and gfx950 targets. Their FP8 formats
 are incompatible, so the extension and device must match. These tests pin
@@ -67,7 +67,7 @@ def test_frontends_use_shared_capability_gate():
 @pytest.mark.skipif(not _BUILD.exists(), reason="build script not present")
 @pytest.mark.parametrize("arch", ["gfx9500", "gfx9420", "gfx90a", "sm_120"])
 def test_build_script_rejects_unsupported_arch(arch):
-    """The build script must refuse a non-gfx950 target.
+    """The build script must refuse an unregistered AMD target.
 
     Building for another architecture yields a module that can never pass
     the runtime gate, so failing at build time is the cheaper error.
@@ -76,11 +76,12 @@ def test_build_script_rejects_unsupported_arch(arch):
                           capture_output=True, text=True, timeout=120)
     assert proc.returncode != 0, (
         f"build script accepted GPU_ARCH={arch}")
-    assert "gfx942 or gfx950" in (proc.stderr + proc.stdout), (
-        "the rejection message should name the supported architecture")
+    output = proc.stderr + proc.stdout
+    assert all(arch in output for arch in ("gfx942", "gfx950", "gfx1151")), (
+        "the rejection message should name every supported architecture")
 
 
 @pytest.mark.skipif(not _BUILD.exists(), reason="build script not present")
-def test_build_script_documents_both_supported_targets():
+def test_build_script_documents_all_supported_targets():
     text = _BUILD.read_text()
-    assert "gfx942|gfx950" in text
+    assert "gfx942|gfx950|gfx1151" in text

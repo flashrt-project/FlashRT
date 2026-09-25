@@ -146,6 +146,71 @@ class FakeAgentEngine:
         yield from self.outputs[:max_tokens]
 
 
+def test_agent_service_reports_length_when_output_budget_is_exhausted():
+    engine = FakeAgentEngine()
+    svc = AgentService(engine)
+
+    res = svc.complete(AgentRequest(
+        session_id="token-limit",
+        messages=[{"role": "user", "content": "abc"}],
+        max_tokens=2,
+    ))
+
+    payload = result_to_openai(res, model=engine.model_name)
+    assert res.usage["completion_tokens"] == 2
+    assert payload["choices"][0]["finish_reason"] == "length"
+
+
+def test_agent_service_reports_stop_when_engine_emits_natural_stop():
+    engine = FakeAgentEngine()
+    engine.outputs = [
+        DecodeChunk((ord("h"),), "h", 1),
+        DecodeChunk((ord("i"),), "i", 1, stop=True),
+    ]
+    svc = AgentService(engine)
+
+    res = svc.complete(AgentRequest(
+        session_id="natural-stop",
+        messages=[{"role": "user", "content": "abc"}],
+        max_tokens=2,
+    ))
+
+    assert res.usage["completion_tokens"] == 2
+    assert res.finish_reason == "stop"
+
+
+def test_agent_service_stream_reports_length_when_output_budget_is_exhausted():
+    engine = FakeAgentEngine()
+    svc = AgentService(engine)
+
+    chunks = list(svc.stream_openai(AgentRequest(
+        session_id="stream-token-limit",
+        messages=[{"role": "user", "content": "abc"}],
+        max_tokens=2,
+    ), model=engine.model_name))
+
+    assert '"completion_tokens":2' in chunks[-2]
+    assert '"finish_reason":"length"' in chunks[-2]
+
+
+def test_agent_service_stream_reports_stop_when_engine_emits_natural_stop():
+    engine = FakeAgentEngine()
+    engine.outputs = [
+        DecodeChunk((ord("h"),), "h", 1),
+        DecodeChunk((ord("i"),), "i", 1, stop=True),
+    ]
+    svc = AgentService(engine)
+
+    chunks = list(svc.stream_openai(AgentRequest(
+        session_id="stream-natural-stop",
+        messages=[{"role": "user", "content": "abc"}],
+        max_tokens=2,
+    ), model=engine.model_name))
+
+    assert '"completion_tokens":2' in chunks[-2]
+    assert '"finish_reason":"stop"' in chunks[-2]
+
+
 def test_agent_service_reuses_exact_session_prefix_when_history_is_returned():
     engine = FakeAgentEngine()
     svc = AgentService(engine)
@@ -159,7 +224,7 @@ def test_agent_service_reuses_exact_session_prefix_when_history_is_returned():
     assert res0.stats.new_prefill_tokens == 4
     assert engine.prefills[-1][1:] == (0, 2, 4)
     assert res0.text == "hi"
-    assert res0.finish_reason == "stop"
+    assert res0.finish_reason == "length"
 
     req1 = AgentRequest(
         session_id="agent-1",
@@ -191,8 +256,28 @@ def test_agent_service_clips_output_budget_to_remaining_context():
     ))
 
     assert res.usage["completion_tokens"] == 2
+    assert res.finish_reason == "length"
     assert engine.prefills[-1][2] == 2
     assert engine.generate_calls[-1] == (2, 4)
+
+
+def test_agent_service_stream_reports_length_at_clipped_context_limit():
+    class SmallContextEngine(FakeAgentEngine):
+        max_seq = 6
+
+    engine = SmallContextEngine()
+    svc = AgentService(engine)
+
+    chunks = list(svc.stream_openai(AgentRequest(
+        session_id="stream-small-context",
+        messages=[{"role": "user", "content": "abc"}],
+        max_tokens=8,
+    ), model=engine.model_name))
+
+    assert engine.prefills[-1][2] == 2
+    assert engine.generate_calls[-1] == (2, 4)
+    assert '"completion_tokens":2' in chunks[-2]
+    assert '"finish_reason":"length"' in chunks[-2]
 
 
 def test_agent_service_validation_uses_stateless_tokenizer_path():
@@ -307,17 +392,64 @@ def test_agent_service_parses_tool_calls_from_generated_stream():
     engine = FakeAgentEngine()
     engine.outputs = [
         DecodeChunk((1000,), "hello ", 1),
-        DecodeChunk((1001,), '<tool_call>{"name":"lookup","arguments":{"x":1}}</tool_call>', 1),
+        DecodeChunk(
+            (1001,),
+            '<tool_call>{"name":"lookup","arguments":{"x":1}}</tool_call>',
+            1,
+            stop=True,
+        ),
     ]
     svc = AgentService(engine)
     res = svc.complete(AgentRequest(
         session_id="agent-tools",
         messages=[{"role": "user", "content": "abc"}],
-        max_tokens=2,
+        max_tokens=8,
     ))
     assert res.text == "hello "
     assert res.finish_reason == "tool_calls"
     assert res.tool_calls[0]["function"]["name"] == "lookup"
+
+
+def test_agent_service_keeps_length_when_tool_call_hits_output_budget():
+    engine = FakeAgentEngine()
+    engine.outputs = [
+        DecodeChunk((1000,), "hello ", 1),
+        DecodeChunk(
+            (1001,),
+            '<tool_call>{"name":"lookup","arguments":{"x":1}}</tool_call>',
+            1,
+        ),
+    ]
+    svc = AgentService(engine)
+    res = svc.complete(AgentRequest(
+        session_id="agent-tools-length",
+        messages=[{"role": "user", "content": "abc"}],
+        max_tokens=2,
+    ))
+    assert res.tool_calls[0]["function"]["name"] == "lookup"
+    assert res.usage["completion_tokens"] == 2
+    assert res.finish_reason == "length"
+
+
+def test_agent_service_stream_keeps_length_when_tool_call_hits_output_budget():
+    engine = FakeAgentEngine()
+    engine.outputs = [
+        DecodeChunk((1000,), "hello ", 1),
+        DecodeChunk(
+            (1001,),
+            '<tool_call>{"name":"lookup","arguments":{"x":1}}</tool_call>',
+            1,
+        ),
+    ]
+    svc = AgentService(engine)
+    chunks = list(svc.stream_openai(AgentRequest(
+        session_id="agent-tools-stream-length",
+        messages=[{"role": "user", "content": "abc"}],
+        max_tokens=2,
+    ), model=engine.model_name))
+
+    assert '"tool_calls"' in "".join(chunks)
+    assert '"finish_reason":"length"' in chunks[-2]
 
 
 def test_agent_service_stops_decode_after_tool_call_to_keep_session_hot():
@@ -617,6 +749,7 @@ def test_qwen36_agent_fastapi_non_stream_and_stream_endpoints():
     assert resp.status_code == 200
     body = resp.json()
     assert body["choices"][0]["message"]["content"] == "hi"
+    assert body["choices"][0]["finish_reason"] == "length"
     assert body["flashrt"]["prefix_action"] == "append"
 
     stream_resp = client.post("/v1/chat/completions", json={
@@ -630,6 +763,7 @@ def test_qwen36_agent_fastapi_non_stream_and_stream_endpoints():
     text = stream_resp.text
     assert '"role":"assistant"' in text
     assert '"content":"h"' in text
+    assert '"finish_reason":"length"' in text
     assert "data: [DONE]" in text
 
 
