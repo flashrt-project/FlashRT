@@ -38,6 +38,7 @@ def detect_arch() -> str:
         ``"rtx_sm120"`` — RTX 5090 / DGX Spark GB10 Blackwell, SM120/SM121
         ``"rtx_sm89"``  — RTX 4090 / Ada, SM89 (cc 8.9)
         ``"rtx_sm87"``  — Jetson Orin via RTX consumer backend, SM87 (cc 8.7)
+        ``"amd_cdna3"`` — AMD Instinct MI300 series, ROCm (gfx942)
         ``"amd_cdna4"`` — AMD Instinct MI350 series, ROCm (gfx950)
         ``"amd_rdna35"`` — AMD RDNA 3.5 (gfx1151 / Radeon 8060S)
 
@@ -79,13 +80,16 @@ def detect_arch() -> str:
         # cc tuple (which ROCm fills with unrelated values).
         gcn = torch.cuda.get_device_properties(0).gcnArchName
         base_arch = gcn.split(":", 1)[0]
+        if base_arch == "gfx942":
+            return "amd_cdna3"
         if base_arch == "gfx950":
             return "amd_cdna4"
         if base_arch == "gfx1151":
             return "amd_rdna35"
         raise RuntimeError(
             f"FlashRT: unsupported ROCm GPU arch {gcn!r}. "
-            "Supported: gfx950 (MI350 series / CDNA4), gfx1151 "
+            "Supported: gfx942 (MI300 series / CDNA3), "
+            "gfx950 (MI350 series / CDNA4), or gfx1151 "
             "(Radeon 8060S / Ryzen AI Max+ 395).")
     major, minor = torch.cuda.get_device_capability()
     if (major, minor) == (11, 0):
@@ -116,6 +120,8 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("pi05", "torch", "rtx_sm87"):
         ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
     ("pi05", "torch", "amd_cdna4"):
+        ("flash_rt.amd.frontends.torch.pi05", "Pi05TorchFrontendAmd"),
+    ("pi05", "torch", "amd_cdna3"):
         ("flash_rt.amd.frontends.torch.pi05", "Pi05TorchFrontendAmd"),
     ("pi05", "torch", "amd_rdna35"):
         ("flash_rt.amd.frontends.torch.pi05_rdna35",
@@ -170,6 +176,9 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("groot_n17", "torch", "npu"):
         ("flash_rt.npu.frontends.torch.groot_n17", "GrootN17TorchFrontendNpu"),
     ("groot_n17", "torch", "amd_cdna4"):
+        ("flash_rt.amd.frontends.torch.groot_n17",
+         "GrootN17TorchFrontendAmd"),
+    ("groot_n17", "torch", "amd_cdna3"):
         ("flash_rt.amd.frontends.torch.groot_n17",
          "GrootN17TorchFrontendAmd"),
 

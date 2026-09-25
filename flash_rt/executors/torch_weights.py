@@ -382,7 +382,19 @@ class Quant:
     """
 
     def apply(self, x, ctx):
-        fp8, s = _quant_fp8_core(x)
+        fp8_dtype = getattr(ctx.target, "_weight_fp8_dtype", None)
+        fp8_max = getattr(ctx.target, "_weight_fp8_max_finite", None)
+        if fp8_dtype is None and fp8_max is None:
+            fp8, s = _quant_fp8_core(x)
+        elif fp8_dtype is None or fp8_max is None:
+            raise RuntimeError(
+                "weight FP8 override requires both dtype and max_finite")
+        else:
+            x = x.contiguous()
+            amax = x.float().abs().max().item()
+            s = max(amax / float(fp8_max), 1e-12)
+            fp8 = (x.float() / s).clamp(
+                -float(fp8_max), float(fp8_max)).to(fp8_dtype)
         ctx.scratch["_pending_scale"] = float(s)
         return fp8
 

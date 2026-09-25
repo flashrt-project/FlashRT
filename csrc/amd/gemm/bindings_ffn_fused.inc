@@ -49,6 +49,7 @@
        py::arg("M"), py::arg("N"), py::arg("K"),
        py::arg("d_scale_h"), py::arg("d_scale_w"), py::arg("stream") = 0);
 
+
     m.def("smallm_fp8_down_gateres_alt", [](uintptr_t H, uintptr_t W,
                                             uintptr_t residual, uintptr_t gate,
                                             int M, int N, int K,

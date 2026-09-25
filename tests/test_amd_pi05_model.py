@@ -1,9 +1,9 @@
-"""Pi0.5 on AMD CDNA4 — checkpoint-gated E2E gates for load_model.
+"""Pi0.5 on AMD CDNA3/CDNA4 — checkpoint-gated E2E gates for load_model.
 
-The full front-door path on an MI350X: load_model → Pi05TorchFrontendAmd →
+The full front-door path on an MI300X or MI350X: load_model → Pi05TorchFrontendAmd →
 Pi05Pipeline → HIP graph capture → replay. Gates:
 
-  * load_model(hardware="amd_cdna4") produces finite (chunk, 7) actions;
+  * load_model(hardware="auto") produces finite (chunk, 7) actions;
   * the inference graph really is captured (the latency story is replay);
   * two infers with the SAME pinned noise are BIT-identical — the flow
     integration is deterministic given (images, prompt, state, noise), so
@@ -114,7 +114,7 @@ def ckpt(amd_env):
 def _load(ckpt_path, **kw):
     import flash_rt
     return flash_rt.load_model(ckpt_path, framework="torch", config="pi05",
-                               num_views=2, hardware="amd_cdna4", **kw)
+                               num_views=2, hardware="auto", **kw)
 
 
 @pytest.fixture(scope="module")
@@ -147,10 +147,10 @@ def model_bf16(ckpt):
 
 
 def test_detect_arch_live(amd_env):
-    """On the real MI350X, auto-detection must land on amd_cdna4 (the
-    routing tests elsewhere only prove it with monkeypatched torch)."""
+    """Live ROCm detection must match the supported GPU generation."""
     from flash_rt.hardware import detect_arch
-    assert detect_arch() == "amd_cdna4"
+    gcn = amd_env.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0]
+    assert detect_arch() == {"gfx942": "amd_cdna3", "gfx950": "amd_cdna4"}[gcn]
 
 
 # ---------------------------------------------------------------------------

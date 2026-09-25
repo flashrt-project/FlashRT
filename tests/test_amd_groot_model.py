@@ -1,6 +1,6 @@
-"""GROOT N1.7 on AMD CDNA4 — checkpoint-gated E2E gates for the frontend.
+"""GROOT N1.7 on AMD CDNA3/CDNA4 — checkpoint-gated E2E gates for the frontend.
 
-The full path on an MI350X: :class:`GrootN17TorchFrontendAmd` →
+The full path on an MI300X or MI350X: :class:`GrootN17TorchFrontendAmd` →
 ``set_prompt`` (FP8 kernel backbone: ViT → DeepStack → truncated LLM → VL
 self-attn, plus the baked FP8 alphas) → ``infer`` (bf16 DiT action head
 replayed from a captured graph). Gates:

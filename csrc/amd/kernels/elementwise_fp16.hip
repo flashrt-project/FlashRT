@@ -20,13 +20,13 @@
 //
 // FP8 output dtype: OCP e4m3 via <hip/hip_fp8.h> __hip_fp8_e4m3
 // (saturating RNE conversion, same as __nv_fp8_e4m3; values are
-// pre-clamped to ±448 exactly as in the CUDA originals). Never fnuz.
+// pre-clamped to the target format's finite range).
 //
 // Existing kernel files are untouched (additive-only discipline).
 // ================================================================
 
 #include "common_hip.h"
-#include <hip/hip_fp8.h>
+#include "../arch.h"
 #include <algorithm>
 #include <cstdint>
 
@@ -217,7 +217,7 @@ __global__ void ew16_quantize_fp8_fp16_kernel(const __half* in,
     unsigned char pk[4];
     #pragma unroll
     for (int j = 0; j < 4; j++) {
-        pk[j] = __hip_fp8_e4m3(fminf(fmaxf(fv[j] * inv_scale, -448.f), 448.f)).__x;
+        pk[j] = __hip_fp8_e4m3(fminf(fmaxf(fv[j] * inv_scale, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite)).__x;
     }
     uint32_t w;
     __builtin_memcpy(&w, pk, 4);
@@ -238,7 +238,7 @@ __global__ void ew16_silu_mul_split_fp8_fp16_kernel(
     float u = __half2float(up[idx]);
     float silu_g = g / (1.0f + expf(-g));
     float val = silu_g * u * inv_scale;
-    out[idx] = __hip_fp8_e4m3(fminf(fmaxf(val, -448.0f), 448.0f));
+    out[idx] = __hip_fp8_e4m3(fminf(fmaxf(val, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite));
 }
 
 }  // namespace

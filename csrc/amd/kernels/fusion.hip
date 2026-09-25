@@ -6,12 +6,74 @@
 //
 // FP8 output dtype: OCP e4m3 via <hip/hip_fp8.h> __hip_fp8_e4m3
 // (saturating RNE conversion, same as __nv_fp8_e4m3; values are
-// pre-clamped to ±448 exactly as in fusion.cu). Only the FP8 path is
-// ported; gate_residual_ada_norm_fp16 stays CUDA-only.
+// pre-clamped to the target FP8 finite range). The BF16-output form
+// serves the unquantized gfx942 decoder and removes the same boundary
+// between the gated residual update and the following adaptive norm.
 // ================================================================
 
 #include "common_hip.h"
-#include <hip/hip_fp8.h>
+#include "../arch.h"
+
+// ── Fused Gate*Residual + AdaRMSNorm + Style -> BF16 ──
+// Preserve the two-kernel rounding point: residual is rounded to BF16
+// before both the RMS statistic and the normalized output are computed.
+__global__ void gate_residual_ada_norm_bf16_kernel(
+    __hip_bfloat16* __restrict__ residual,
+    const __hip_bfloat16* __restrict__ x,
+    const __hip_bfloat16* __restrict__ gate,
+    const __hip_bfloat16* __restrict__ weight,
+    const __hip_bfloat16* __restrict__ style,
+    __hip_bfloat16* __restrict__ out,
+    __hip_bfloat16* __restrict__ gate_out,
+    int dim, float eps) {
+    using T = __hip_bfloat16;
+    using T2 = __hip_bfloat162;
+    const int row = blockIdx.x;
+    T2* res2 = reinterpret_cast<T2*>(residual + (size_t)row * dim);
+    const T2* x2 = reinterpret_cast<const T2*>(x + (size_t)row * dim);
+    const T2* g2 = reinterpret_cast<const T2*>(gate + (size_t)row * dim);
+    const T2* w2 = reinterpret_cast<const T2*>(weight);
+    const T* style_row = style + (size_t)row * 3 * dim;
+    const T2* sc2 = reinterpret_cast<const T2*>(style_row);
+    const T2* sh2 = reinterpret_cast<const T2*>(style_row + dim);
+    const T2* gt2 = reinterpret_cast<const T2*>(style_row + 2 * dim);
+    T2* out2 = reinterpret_cast<T2*>(out + (size_t)row * dim);
+    T2* gout2 = reinterpret_cast<T2*>(gate_out + (size_t)row * dim);
+    const int dim2 = dim >> 1;
+    extern __shared__ float shared[];
+
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+        const T2 rv = res2[i], xv = x2[i], gv = g2[i];
+        const T r0 = from_f32<T>(to_f32(rv.x) + to_f32(xv.x) * to_f32(gv.x));
+        const T r1 = from_f32<T>(to_f32(rv.y) + to_f32(xv.y) * to_f32(gv.y));
+        res2[i] = make_packed2<T>(r0, r1);
+        const float f0 = to_f32(r0), f1 = to_f32(r1);
+        local_sum += f0 * f0 + f1 * f1;
+    }
+    const float rms = rsqrtf(block_reduce_sum(local_sum, shared) / dim + eps);
+
+    for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+        const T2 rv = res2[i], wv = w2[i];
+        const T2 sv = sc2[i], hv = sh2[i], gv = gt2[i];
+        const float n0 = to_f32(rv.x) * rms * to_f32(wv.x);
+        const float n1 = to_f32(rv.y) * rms * to_f32(wv.y);
+        out2[i] = make_packed2<T>(
+            from_f32<T>(n0 * (1.0f + to_f32(sv.x)) + to_f32(hv.x)),
+            from_f32<T>(n1 * (1.0f + to_f32(sv.y)) + to_f32(hv.y)));
+        gout2[i] = gv;
+    }
+}
+
+void gate_residual_ada_norm_bf16(
+    __hip_bfloat16* residual, const __hip_bfloat16* x,
+    const __hip_bfloat16* gate, const __hip_bfloat16* weight,
+    const __hip_bfloat16* style, __hip_bfloat16* out,
+    __hip_bfloat16* gate_out, int seq_len, int dim, float eps,
+    hipStream_t stream) {
+    gate_residual_ada_norm_bf16_kernel<<<seq_len, 256, 4 * sizeof(float), stream>>>(
+        residual, x, gate, weight, style, out, gate_out, dim, eps);
+}
 
 // ── Fused Gate*Residual + AdaRMSNorm + Style -> FP8 ──
 // Pass 1: residual += x * gate; sum_sq += residual^2
@@ -64,8 +126,8 @@ __global__ void gate_residual_ada_norm_fp8_kernel(
         float n1 = to_f32(rv.y) * rms * to_f32(wv.y);
         float val0 = (n0 * (1.0f + to_f32(sv.x)) + to_f32(hv.x)) * inv_scale;
         float val1 = (n1 * (1.0f + to_f32(sv.y)) + to_f32(hv.y)) * inv_scale;
-        out_row[2*i]   = __hip_fp8_e4m3(fminf(fmaxf(val0, -448.0f), 448.0f));
-        out_row[2*i+1] = __hip_fp8_e4m3(fminf(fmaxf(val1, -448.0f), 448.0f));
+        out_row[2*i]   = __hip_fp8_e4m3(fminf(fmaxf(val0, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite));
+        out_row[2*i+1] = __hip_fp8_e4m3(fminf(fmaxf(val1, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite));
         gate_out2[i] = gv;
     }
 }
@@ -139,8 +201,8 @@ __global__ void gate_residual_ada_norm_fp8_ksum_kernel(
         float n1 = to_f32(rv.y) * rms * to_f32(wv.y);
         float val0 = (n0 * (1.0f + to_f32(sv.x)) + to_f32(hv.x)) * inv_scale;
         float val1 = (n1 * (1.0f + to_f32(sv.y)) + to_f32(hv.y)) * inv_scale;
-        out_row[2*i]   = __hip_fp8_e4m3(fminf(fmaxf(val0, -448.0f), 448.0f));
-        out_row[2*i+1] = __hip_fp8_e4m3(fminf(fmaxf(val1, -448.0f), 448.0f));
+        out_row[2*i]   = __hip_fp8_e4m3(fminf(fmaxf(val0, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite));
+        out_row[2*i+1] = __hip_fp8_e4m3(fminf(fmaxf(val1, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite));
         gate_out2[i] = gv;
     }
 }
@@ -228,8 +290,8 @@ __global__ void gate_residual_ada_norm_fp8_wide_kernel(
             const float n1 = to_f32(rv.p[k].y) * rms * to_f32(wv.p[k].y);
             const float v0 = (n0 * (1.0f + to_f32(sv.p[k].x)) + to_f32(hv.p[k].x)) * inv_scale;
             const float v1 = (n1 * (1.0f + to_f32(sv.p[k].y)) + to_f32(hv.p[k].y)) * inv_scale;
-            o.b[2*k]   = __hip_fp8_e4m3(fminf(fmaxf(v0, -448.0f), 448.0f)).__x;
-            o.b[2*k+1] = __hip_fp8_e4m3(fminf(fmaxf(v1, -448.0f), 448.0f)).__x;
+            o.b[2*k]   = __hip_fp8_e4m3(fminf(fmaxf(v0, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite)).__x;
+            o.b[2*k+1] = __hip_fp8_e4m3(fminf(fmaxf(v1, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite)).__x;
         }
         out8[c] = o;
         gate_out8[c] = gv;

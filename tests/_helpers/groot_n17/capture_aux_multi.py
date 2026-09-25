@@ -170,7 +170,13 @@ def _restore_hooks(state: dict) -> None:
 
 def _build_parsed(loader, policy, traj_idx: int, step_idx: int) -> dict:
     from gr00t.data.dataset.sharded_single_step_dataset import extract_step_data
-    from gr00t.eval.open_loop_eval import parse_observation_gr00t
+    try:
+        # Isaac-GR00T main (2026-09) exposes the shared inference parser here.
+        from gr00t.data.utils import parse_observation_gr00t
+    except ImportError:
+        # Keep the capture helper usable with the older revision used to create
+        # the original checked-in fixtures.
+        from gr00t.eval.open_loop_eval import parse_observation_gr00t
 
     traj = loader[traj_idx]
     data_point = extract_step_data(
@@ -259,7 +265,7 @@ def main():
             torch.manual_seed(args.seed)
             np.random.seed(args.seed)
             with torch.inference_mode():
-                policy.get_action(parsed)
+                actions, _info = policy.get_action(parsed)
         finally:
             _restore_hooks(state)
 
@@ -272,6 +278,13 @@ def main():
             "dit_step_input", "dit_step_output", "dit_step_temb",
         )
         entry = {k: captured[k] for k in keep if k in captured}
+        # Preserve the real observation state and the official policy result
+        # in the schema consumed by test_amd_groot_model.py.  This makes one
+        # capture usable for both set_prompt and the denormalized E2E gate;
+        # images stay out of the fixture because set_prompt consumes their
+        # derived pixel features above.
+        entry["inputs"] = {"state": parsed["state"]}
+        entry["actions"] = actions
         entry["_meta"] = {
             "traj": traj_idx, "step": step_idx, "seed": args.seed,
             "ckpt": ckpt, "tag": args.tag,

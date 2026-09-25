@@ -1,4 +1,4 @@
-"""FlashRT AMD -- CDNA4 Pi0.5 torch frontend.
+"""FlashRT AMD Pi0.5 torch frontend for CDNA3 and CDNA4.
 
 Loads HuggingFace PyTorch safetensors checkpoints + drives the
 framework-agnostic :class:`~flash_rt.amd.models.pi05.pipeline.Pi05Pipeline`.
@@ -39,7 +39,6 @@ import torch
 import torch.nn.functional as F
 
 from flash_rt.core.utils.actions import unnormalize_actions, LIBERO_ACTION_DIM
-from flash_rt.amd.hardware.cdna4.attn_backend import Cdna4AttnBackend
 from flash_rt.amd.models.pi05.pipeline import (
     Pi05Pipeline,
     VIS_L, VIS_D, VIS_H, VIS_PATCH_FLAT,
@@ -52,7 +51,6 @@ from flash_rt.core.utils.pi05_prompt import PI05_STATE_PROMPT_MAX_LEN, format_pi
 logger = logging.getLogger(__name__)
 
 bf16 = torch.bfloat16
-fp8_e4m3 = torch.float8_e4m3fn
 
 CHUNK_SIZE = 10
 IMG_HW = 224
@@ -74,11 +72,13 @@ from flash_rt.frontends.torch.pi05_checkpoint import (
 # ════════════════════════════════════════════════════════════════════
 
 
-def _quantize_fp8_e4m3(w_bf16: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _quantize_fp8_e4m3(
+    w_bf16: torch.Tensor, *, dtype: torch.dtype, max_finite: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-tensor symmetric FP8 E4M3 quantization."""
     amax = w_bf16.float().abs().max().item()
-    scale = max(amax / 448.0, 1e-12)
-    w_fp8 = (w_bf16.float() / scale).clamp(-448.0, 448.0).to(fp8_e4m3)
+    scale = max(amax / max_finite, 1e-12)
+    w_fp8 = (w_bf16.float() / scale).clamp(-max_finite, max_finite).to(dtype)
     scale_tensor = torch.tensor([scale], dtype=torch.float32, device="cuda")
     return w_fp8, scale_tensor
 
@@ -186,7 +186,7 @@ def _precompute_decoder_styles(ckpt: dict, chunk_size: int,
 
 
 class Pi05TorchFrontendAmd:
-    """AMD CDNA4 Pi0.5 Torch frontend.
+    """AMD CDNA3/CDNA4 Pi0.5 Torch frontend.
 
     Mirrors the RTX frontend's public API (``set_prompt`` + ``infer`` +
     ``calibrate_with_real_data`` + ``get_latency_stats``) so the same
@@ -207,27 +207,9 @@ class Pi05TorchFrontendAmd:
                  fp8_layout: Optional[str] = None,
                  state_prompt_mode: str = "exact",
                  state_prompt_fixed_max_len: Optional[int] = None):
-        # gfx950-only gate, FIRST: the MFMA tile shapes and FP8 paths in
-        # the extension are CDNA4-specific — refuse before touching the
-        # checkpoint unless BOTH the visible device arch (e.g.
-        # "gfx950:sramecc+:xnack-") and the extension's compile-time
-        # gpu_arch are gfx950. Anything else computes garbage, not a
-        # fallback (a forced hardware="amd_cdna4" on gfx942 fails here).
         from flash_rt.amd import flash_rt_amd_kernels as _fvk_gate
-        # Compare the base target only ("gfx950" from
-        # "gfx950:sramecc+:xnack-"); a prefix test would also accept a
-        # future "gfx9500".
-        _dev_arch = str(_fvk_gate.device_arch())
-        _build_arch = str(dict(_fvk_gate.build_info()).get("gpu_arch",
-                                                           "unknown"))
-        if not (_dev_arch.split(":", 1)[0] == "gfx950"
-                and _build_arch.split(":", 1)[0] == "gfx950"):
-            raise RuntimeError(
-                "Pi05TorchFrontendAmd is gfx950-only (CDNA4 / MI350-series): "
-                f"running device arch is {_dev_arch!r} and the extension "
-                f"was built for gpu_arch {_build_arch!r}. Rebuild with "
-                "scripts/amd/build_amd.sh on a gfx950 machine; other AMD "
-                "arches are not supported by this backend.")
+        from flash_rt.amd.hardware.capabilities import load_capabilities
+        self._amd_caps = load_capabilities(_fvk_gate, hardware)
 
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         # State-in-prompt graph strategy (Pi0.5 renders robot state into the
@@ -297,7 +279,9 @@ class Pi05TorchFrontendAmd:
                 f"vision_num_layers must be in [1, {VIS_L}], "
                 f"got {self._vision_num_layers}")
         self.use_fp8 = bool(use_fp8)
-        self.hardware = hardware if hardware is not None else "amd_cdna4"
+        self.hardware = self._amd_caps.hardware
+        self._fp8_dtype = self._amd_caps.torch_fp8_dtype
+        self._fp8_max_finite = self._amd_caps.fp8_max_finite
         self.fp8_layout = _select_fp8_layout(fp8_layout)
 
         self.latency_records: list[float] = []
@@ -310,9 +294,8 @@ class Pi05TorchFrontendAmd:
         # switching to a no-state prompt and back reuses the already-calibrated,
         # already-captured graph instead of rebuilding it.
         self._fixed_pipeline: Optional[Pi05Pipeline] = None
-        # BF16-only escape hatch (no FP8 support probe needed on CDNA4 —
-        # MI350X has native OCP FP8 E4M3; use the env knob or use_fp8=False
-        # to force the BF16 baseline).
+        # BF16-only escape hatch. FP8 format selection was validated above;
+        # use the env knob or use_fp8=False to force the BF16 baseline.
         env_force_bf16 = os.environ.get("FVK_PI05_AMD_FORCE_BF16", "0") == "1"
         self._force_bf16 = env_force_bf16
 
@@ -357,6 +340,20 @@ class Pi05TorchFrontendAmd:
         if self.use_fp8 and not self._force_bf16:
             self._quantize_all_fp8()
 
+        # gfx942 BF16 packed copies for the measured BF16 configuration.
+        # Keep allocation behind the kernel control so hipBLASLt remains an
+        # explicit fallback.
+        self._bf16_packed: dict = {}
+        self._bf16_packed_store: list = []
+        bf16_decoder = self._force_bf16 or not self.use_fp8
+        self._cdna3_bf16_smallm = (
+            self._amd_caps.hardware == "amd_cdna3"
+            and bf16_decoder
+            and os.environ.get("FVK_AMD_CDNA3_BF16_SMALLM", "1") == "1"
+        )
+        if self._cdna3_bf16_smallm:
+            self._pack_cdna3_decoder_bf16()
+
         # ── Pre-compute decoder styles (time MLP + style modulation) ──
         self._precomputed_styles = _precompute_decoder_styles(
             self._ckpt_bf16, self.chunk_size, num_steps=self._num_steps)
@@ -391,7 +388,7 @@ class Pi05TorchFrontendAmd:
             self.num_views, self.chunk_size, self.fp8_layout)
 
     def _make_attn_backend(self, enc_seq_max: int):
-        """Construct the CDNA4 attention backend.
+        """Construct the attention backend for the validated CDNA target.
 
         ``FVK_AMD_ATTN=sdpa|aiter`` selects the implementation (default
         "sdpa" — the interim torch-SDPA backend). "aiter" dispatches to
@@ -410,17 +407,30 @@ class Pi05TorchFrontendAmd:
             raise ValueError(
                 f"FVK_AMD_ATTN must be 'sdpa' or 'aiter', got {choice!r}")
         if choice == "aiter":
-            from flash_rt.amd.hardware.cdna4.attn_backend_aiter import (
-                Cdna4AiterAttnBackend,
-            )
             try:
-                backend = Cdna4AiterAttnBackend(**kwargs)
-                logger.info("CDNA4 attention backend: aiter (FVK_AMD_ATTN)")
+                if not self._amd_caps.supports_aiter:
+                    raise ImportError(
+                        f"AITER is disabled for {self._amd_caps.hardware}")
+                if self._amd_caps.hardware == "amd_cdna3":
+                    from flash_rt.amd.hardware.cdna3.attn_backend_aiter import (
+                        Cdna3AiterAttnBackend as AiterAttnBackend,
+                    )
+                else:
+                    from flash_rt.amd.hardware.cdna4.attn_backend_aiter import (
+                        Cdna4AiterAttnBackend as AiterAttnBackend,
+                    )
+                backend = AiterAttnBackend(**kwargs)
+                logger.info("%s attention backend: aiter (FVK_AMD_ATTN)",
+                            self._amd_caps.hardware)
                 return backend
             except ImportError as ex:
                 logger.warning(
                     "FVK_AMD_ATTN=aiter but the aiter backend is "
                     "unavailable (%s); falling back to sdpa", ex)
+        if self._amd_caps.hardware == "amd_cdna3":
+            from flash_rt.amd.hardware.cdna3.attn_backend import Cdna3AttnBackend
+            return Cdna3AttnBackend(**kwargs)
+        from flash_rt.amd.hardware.cdna4.attn_backend import Cdna4AttnBackend
         return Cdna4AttnBackend(**kwargs)
 
     def _ensure_prompt_capacity(self, required_prompt_len: int) -> None:
@@ -479,7 +489,8 @@ class Pi05TorchFrontendAmd:
                 w = w.t().contiguous()
             else:
                 w = w.contiguous()
-            w_fp8, scale = _quantize_fp8_e4m3(w)
+            w_fp8, scale = _quantize_fp8_e4m3(
+                w, dtype=self._fp8_dtype, max_finite=self._fp8_max_finite)
             store.append(w_fp8)
             store.append(scale)
             fp8[name] = (w_fp8.data_ptr(), scale.data_ptr())
@@ -518,7 +529,8 @@ class Pi05TorchFrontendAmd:
         # decoder small-M GEMMs stream weights as one linear slab per
         # workgroup. The plain fp8 copy is kept for the hipBLASLt
         # fallback and autotune.
-        if self.fp8_layout == "nk":
+        if (self.fp8_layout == "nk"
+                and self._amd_caps.supports_packed_fp8_mfma):
             packed = self._fp8_packed
             for name, (w_ptr, _) in list(fp8.items()):
                 if not name.startswith("decoder_"):
@@ -536,6 +548,43 @@ class Pi05TorchFrontendAmd:
             logger.info("MFMA-packed %d decoder GEMM weights", len(packed))
 
         logger.info("FP8 quantized %d GEMM weights (layout=%s)", len(fp8), self.fp8_layout)
+
+    def _pack_cdna3_decoder_bf16(self) -> None:
+        """Pack the three gfx942 decoder shapes that beat hipBLASLt.
+
+        gfx942's ``16x16x16bf16_1k`` MFMA consumes four BF16 values per
+        lane. The flattened layout matches ``smallm_mfma_bf16.h``'s CDNA3
+        contract and is created once, before graph capture.
+        """
+        weights = self._ckpt_bf16
+
+        def pack(weight: torch.Tensor) -> torch.Tensor:
+            k_dim, n_dim = weight.shape
+            if k_dim % 16 or n_dim % 16:
+                raise ValueError(
+                    f"CDNA3 BF16 pack requires K,N divisible by 16; "
+                    f"got {(k_dim, n_dim)}")
+            return (weight.view(k_dim // 16, 4, 4, n_dim // 16, 16)
+                    .permute(3, 0, 1, 4, 2).contiguous())
+
+        packed = self._bf16_packed
+        store = self._bf16_packed_store
+        for name in ("decoder_attn_qkv_w", "decoder_attn_o_w"):
+            tensors = [pack(weights[name][i]) for i in range(DEC_L)]
+            store.extend(tensors)
+            packed[name] = [tensor.data_ptr() for tensor in tensors]
+
+        gate_up_tensors = []
+        for i in range(DEC_L):
+            merged = torch.cat(
+                [weights["decoder_ffn_gate_w"][i],
+                 weights["decoder_ffn_up_w"][i]], dim=1,
+            ).contiguous()
+            gate_up_tensors.append(pack(merged))
+        store.extend(gate_up_tensors)
+        packed["decoder_ffn_gate_up_w"] = [
+            tensor.data_ptr() for tensor in gate_up_tensors]
+        logger.info("Packed %d gfx942 BF16 decoder weights", len(store))
 
     def _build_pipeline_weights(self) -> dict:
         """Produce the pointer dict that Pi05Pipeline expects."""
@@ -593,7 +642,11 @@ class Pi05TorchFrontendAmd:
             # FP8 quantized weights
             "fp8": self._fp8_weights,
             "fp8_packed": self._fp8_packed,
+            "bf16_packed": self._bf16_packed,
+            "cdna3_bf16_smallm": self._cdna3_bf16_smallm,
             "fp8_layout": self.fp8_layout,
+            "supports_packed_fp8_mfma":
+                self._amd_caps.supports_packed_fp8_mfma,
             "hardware": self.hardware,
 
             # Precomputed decoder styles (numpy bf16 as uint16 view)

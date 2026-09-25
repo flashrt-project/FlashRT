@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include <hipblaslt/hipblaslt.h>
+#include "../arch.h"
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -18,8 +19,8 @@
 // the pi05 pipeline is ported; see hipblaslt_runner.hip for the
 // layout-convention note (col-major swap instead of ORDER_ROW).
 //
-// FP8 here is OCP e4m3 (HIP_R_8F_E4M3) — the gfx950 native format.
-// The fnuz variant (HIP_R_8F_E4M3_FNUZ, gfx942) is NOT used.
+// FP8 storage and hipBLASLt descriptor types come from arch.h: FNUZ on
+// CDNA3/gfx942 and OCP E4M3 on CDNA4/gfx950.
 // ================================================================
 
 // Check hipBLASLt status

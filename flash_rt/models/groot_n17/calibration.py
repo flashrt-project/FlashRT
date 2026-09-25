@@ -6,7 +6,7 @@ For each FP8 GEMM in the inference graph there are two scales that meet:
     (Quant transform; stored as ``_<block>_alpha[*]`` as host floats).
   * ``act_scale`` — captured here by running a fp32 shadow forward on
     the WHOLE pipeline (using dequantized FP8 weights as fp16-equivalent
-    operands) and recording ``max(|x|) / 448`` at every quant input.
+    operands) and recording ``max(|x|) / fp8_max`` at every quant input.
 
 After this routine returns, the frontend (Phase 3c.b2) bakes
 ``alpha = act_scale * weight_scale`` for every FP8 GEMM and stores the
@@ -427,13 +427,17 @@ def calibrate_pipeline_amax(fe, aux: dict) -> dict:
     }
 
 
-def amax_to_dev_scale(amax: float, *, device: str = "cuda") -> torch.Tensor:
+def amax_to_dev_scale(
+    amax: float, *, device: str = "cuda", fp8_max: float = FP8_MAX,
+) -> torch.Tensor:
     """fp32 device scalar consumed by ``quantize_fp8_static_fp16``."""
-    s = max(amax / FP8_MAX, 1e-8)
+    s = max(amax / fp8_max, 1e-8)
     return torch.tensor([s], dtype=torch.float32, device=device).contiguous()
 
 
-def alpha(amax_act: float, weight_scale: float) -> float:
+def alpha(
+    amax_act: float, weight_scale: float, *, fp8_max: float = FP8_MAX,
+) -> float:
     """Compose host alpha for ``GemmRunner.fp8_nn_*``."""
-    s_act = max(amax_act / FP8_MAX, 1e-8)
+    s_act = max(amax_act / fp8_max, 1e-8)
     return s_act * weight_scale
