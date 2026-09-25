@@ -116,6 +116,80 @@ def test_decoder_only_graph_matches_full_graph_with_same_context(model):
     torch.testing.assert_close(cached, full, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize(
+    "context_change",
+    ["same_length_state", "different_length_prompt"],
+)
+def test_decoder_only_graph_refreshes_changed_context(model, context_change):
+    torch = pytest.importorskip("torch")
+    frontend = model.pipeline
+    pipeline = frontend.pipeline
+    images = _images()
+    noise = torch.from_numpy(
+        np.random.default_rng(41).standard_normal(
+            (frontend.chunk_size, 32)).astype(np.float32)
+    ).to(device="cuda", dtype=torch.bfloat16)
+    initial_prompt = "pick up the object"
+    initial_state = np.zeros(8, dtype=np.float32)
+
+    try:
+        frontend.set_prompt(initial_prompt, state=initial_state)
+        initial_len = frontend._prompt_len
+        initial_embeds = frontend._prompt_buf[:initial_len].clone()
+        frontend._fill_images({"images": images})
+        frontend.forward_with_fixed_noise(
+            frontend._image_buf, noise, use_graph=True)
+        pipeline.forward_decode_only(noise, use_graph=True)
+        torch.cuda.synchronize()
+        decoder_graph_before = pipeline._decoder_only_graph
+        prompt_start = frontend.num_views * 256
+        initial_prompt_k = pipeline.buf["encoder_k"][
+            :, prompt_start:prompt_start + initial_len
+        ].clone()
+
+        if context_change == "same_length_state":
+            changed_prompt = initial_prompt
+            changed_state = np.full(8, 0.01, dtype=np.float32)
+        else:
+            changed_prompt = (
+                "carefully pick up the object and place it on the table"
+            )
+            changed_state = initial_state
+        frontend.set_prompt(changed_prompt, state=changed_state)
+        changed_len = frontend._prompt_len
+
+        if context_change == "same_length_state":
+            assert changed_len == initial_len
+            assert not torch.equal(
+                frontend._prompt_buf[:changed_len], initial_embeds)
+        else:
+            assert changed_len != initial_len
+        assert not pipeline.has_encoder_cache
+
+        frontend._fill_images({"images": images})
+        full = frontend.forward_with_fixed_noise(
+            frontend._image_buf, noise, use_graph=True).clone()
+        refreshed_prompt_k = pipeline.buf["encoder_k"][
+            :, prompt_start:prompt_start + min(initial_len, changed_len)
+        ]
+        assert not torch.equal(
+            refreshed_prompt_k,
+            initial_prompt_k[:, :min(initial_len, changed_len)],
+        )
+        cached = pipeline.forward_decode_only(
+            noise, use_graph=True).clone()
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(cached, full, atol=0, rtol=0)
+        assert pipeline._decoder_only_graph_prompt_len == changed_len
+        if context_change == "same_length_state":
+            assert pipeline._decoder_only_graph is decoder_graph_before
+        else:
+            assert pipeline._decoder_only_graph is not decoder_graph_before
+    finally:
+        frontend.set_prompt(initial_prompt, state=initial_state)
+
+
 def test_frontend_cache_frames_alternates_full_and_decoder_only(model):
     frontend = model.pipeline
     images = _images()
