@@ -91,19 +91,6 @@ PYBIND11_MODULE(flash_rt_sparkx25, m) {
               rows, heads, head_dim, to_stream(stream));
         });
 
-  m.def("attn_out_gate_to_nvfp4_bf16",
-        [](uintptr_t attn, uintptr_t gate, uintptr_t out,
-           uintptr_t packed, uintptr_t sf_swz,
-           int rows, int heads, int head_dim, uintptr_t stream) {
-          flash_rt::spark_x25::attn_out_gate_to_nvfp4_bf16(
-              reinterpret_cast<const void*>(attn),
-              reinterpret_cast<const void*>(gate),
-              reinterpret_cast<void*>(out),
-              reinterpret_cast<uint8_t*>(packed),
-              reinterpret_cast<uint8_t*>(sf_swz),
-              rows, heads, head_dim, to_stream(stream));
-        });
-
   m.def("set_int32",
         [](uintptr_t dst, int value, uintptr_t stream) {
           flash_rt::spark_x25::set_int32(reinterpret_cast<int*>(dst), value, to_stream(stream));

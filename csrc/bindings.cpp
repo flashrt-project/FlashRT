@@ -9219,11 +9219,12 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
 #include "kernels/lingbot_bindings.inc"   // m.def("lingbot_...", &lingbot_...) for the LingBot-VLA model
 #endif
 
-    // The implementation is in sm120_nvfp4_ffn_obj, whose sources compile
-    // only for GPU_ARCH 120/121 (CMakeLists.txt). Guard the binding with the
-    // SAME condition that defines ENABLE_CUTLASS_SM120_NVFP4_W4A16, so on
-    // every other arch the Python symbol and its implementation drop
-    // together -- the pattern the fp4_w4a4_* bindings above already use.
+    // The implementation is in csrc/kernels/fp4_w4a4_mma_sm120.cu, compiled
+    // into flash_rt_kernels by the Group A block (CMakeLists.txt) only for
+    // GPU_ARCH 120/121. Guard the binding with the SAME condition that defines
+    // ENABLE_CUTLASS_SM120_NVFP4_W4A16, so on every other arch the Python
+    // symbol and its implementation drop together -- the pattern the
+    // fp4_w4a4_* bindings above already use.
 #ifdef ENABLE_CUTLASS_SM120_NVFP4_W4A16
     m.def("fp4_w4a4_mma_sm120_gated_geglu_fp4out",
         [](uintptr_t A_packed, uintptr_t B_packed,
