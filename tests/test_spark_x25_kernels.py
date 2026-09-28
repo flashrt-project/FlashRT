@@ -8,7 +8,7 @@ isolate "did I write the kernel right" from "did I wire the model right", so
 the tables here are small and the tolerances are exact where the reference is
 exact.
 
-Run:  python tests/test_kernels.py
+Run:  python tests/test_spark_x25_kernels.py
 """
 from __future__ import annotations
 
