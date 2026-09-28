@@ -8005,8 +8005,6 @@ per-warp. Drop-in replacement signature for fp4_w4a4_matvec_sm120
 N must be a multiple of 32; K must be a multiple of 64.
 )pbdoc");
 
-
-
     m.def("fp4_w4a4_mma_sm120_warpsplit_bf16out",
         [](uintptr_t A, uintptr_t B, uintptr_t D, int N, int K, uintptr_t SFA,
            uintptr_t SFB, float alpha, int warps, int stages,
@@ -8082,8 +8080,6 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
         py::arg("SFA"), py::arg("SFB"),
         py::arg("alpha") = 1.0f,
         py::arg("stream") = 0);
-
-
 
     m.def("fp4_w4a16_gemm_sm120_bf16out_widen",
         [](uintptr_t A_packed, uintptr_t B_packed, uintptr_t D,
@@ -9223,6 +9219,12 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
 #include "kernels/lingbot_bindings.inc"   // m.def("lingbot_...", &lingbot_...) for the LingBot-VLA model
 #endif
 
+    // The implementation is in sm120_nvfp4_ffn_obj, whose sources compile
+    // only for GPU_ARCH 120/121 (CMakeLists.txt). Guard the binding with the
+    // SAME condition that defines ENABLE_CUTLASS_SM120_NVFP4_W4A16, so on
+    // every other arch the Python symbol and its implementation drop
+    // together -- the pattern the fp4_w4a4_* bindings above already use.
+#ifdef ENABLE_CUTLASS_SM120_NVFP4_W4A16
     m.def("fp4_w4a4_mma_sm120_gated_geglu_fp4out",
         [](uintptr_t A_packed, uintptr_t B_packed,
            uintptr_t D_packed, uintptr_t SFD,
@@ -9239,4 +9241,5 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
         py::arg("SFA"), py::arg("SFB"),
         py::arg("alpha") = 1.0f, py::arg("N"), py::arg("K"),
         py::arg("stream") = 0);
+#endif  // ENABLE_CUTLASS_SM120_NVFP4_W4A16
 }

@@ -210,7 +210,11 @@ PYBIND11_MODULE(flash_rt_fa2, m) {
         py::arg("stream") = 0,
         kDocstring);
 
-m.def("fwd_bf16_window", make_fwd_window(&fvk_attention_fa2_fwd_bf16_window),
+    // Non-causal entry carrying FA2's window fields. A bounded past is a
+    // local mask: Is_local switches on whenever window_size_* >= 0 and
+    // Is_causal is false, which is exactly the [q-W+1, q] band a sliding
+    // layer needs. Same signature as fwd_bf16 plus window_left/window_right.
+    m.def("fwd_bf16_window", make_fwd_window(&fvk_attention_fa2_fwd_bf16_window),
         py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),
         py::arg("softmax_lse_accum") = 0, py::arg("o_accum") = 0,
         py::arg("batch"), py::arg("seqlen_q"), py::arg("seqlen_k"),
@@ -218,8 +222,8 @@ m.def("fwd_bf16_window", make_fwd_window(&fvk_attention_fa2_fwd_bf16_window),
         py::arg("q_strides"), py::arg("k_strides"),
         py::arg("v_strides"), py::arg("o_strides"),
         py::arg("softmax_scale") = 1.0f,
-      py::arg("window_left") = -1,
-      py::arg("window_right") = -1,
+        py::arg("window_left") = -1,
+        py::arg("window_right") = -1,
         py::arg("num_sms") = 0,
         py::arg("stream") = 0,
         kDocstring);

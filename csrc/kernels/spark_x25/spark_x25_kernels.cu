@@ -31,60 +31,16 @@
 
 #include "spark_x25_kernels.cuh"
 
+// Shared NVFP4 element/scale converters. Included rather than copied so this
+// file and FlashRT's MMA path encode the same wire format from one source.
+#include "nvfp4_convert.cuh"
+
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cstdint>
 
 namespace flash_rt::spark_x25 {
-
-// ───────────────────────── NVFP4 helpers ─────────────────────────
-// Reproduced from FlashRT's csrc/kernels/nvfp4_convert.cuh so that bytes
-// produced here are identical to the ones its MMA path consumes.
-
-__device__ __forceinline__ uint8_t float_to_fp4_e2m1(float v) {
-  uint8_t sign = (v < 0.0f) ? 0x8u : 0x0u;
-  float a = fabsf(v);
-  uint8_t mag;
-  if      (a < 0.25f) mag = 0;
-  else if (a < 0.75f) mag = 1;
-  else if (a < 1.25f) mag = 2;
-  else if (a < 1.75f) mag = 3;
-  else if (a < 2.5f)  mag = 4;
-  else if (a < 3.5f)  mag = 5;
-  else if (a < 5.0f)  mag = 6;
-  else                mag = 7;
-  return sign | mag;
-}
-
-__device__ __forceinline__ uint8_t float_to_ue4m3_ceil(float v) {
-  if (v <= 0.0f) return 0;
-  if (v > 240.0f) return 0xFE;
-  uint32_t bits = __float_as_uint(v);
-  int float_exp = ((bits >> 23) & 0xFF) - 127;
-  uint32_t frac = bits & 0x7FFFFF;
-  int ue_exp = float_exp + 7;
-  if (ue_exp <= 0) {
-    float scaled = v * 512.0f;
-    int m = (int)ceilf(scaled);
-    if (m > 7) return (1 << 3) | 0;
-    if (m < 1) m = 1;
-    return (uint8_t)m;
-  }
-  if (ue_exp >= 15) return 0xFE;
-  int m = (int)(frac >> 20);
-  if (frac & 0xFFFFF) m++;
-  if (m >= 8) { m = 0; ue_exp++; }
-  if (ue_exp >= 15) return 0xFE;
-  return (uint8_t)((ue_exp << 3) | m);
-}
-
-__device__ __forceinline__ float ue4m3_to_float(uint8_t v) {
-  int e = (v >> 3) & 0xF;
-  int m = v & 0x7;
-  if (e == 0) return ldexpf((float)m / 8.0f, -6);
-  return ldexpf(1.0f + (float)m / 8.0f, e - 7);
-}
 
 // Exact erf GELU, matching torch's F.gelu(approximate='none') on bf16 inputs:
 // the op is widened to fp32, evaluated, and rounded back to bf16.

@@ -259,7 +259,7 @@ extern "C" void NAME(                                                           
     dispatch_hdim<ELEM_T>(head_dim, num_splits, params, stream);                 \
 }
 
-#define DEFINE_FA2_ENTRY_WINDOW(NAME, ELEM_T, IS_BF16)                                  \
+#define DEFINE_FA2_ENTRY_WINDOW(NAME, ELEM_T, IS_BF16)                           \
 extern "C" void NAME(                                                            \
     const void* q_ptr, const void* k_ptr, const void* v_ptr,                     \
     void* o_ptr, void* softmax_lse_ptr,                                          \
@@ -271,7 +271,7 @@ extern "C" void NAME(                                                           
     int v_batch_stride, int v_row_stride, int v_head_stride,                     \
     int o_batch_stride, int o_row_stride, int o_head_stride,                     \
     float softmax_scale, int window_left, int window_right,                      \
-    int num_sms, cudaStream_t stream)                                    \
+    int num_sms, cudaStream_t stream)                                            \
 {                                                                                \
     FLASH_NAMESPACE::Flash_fwd_params params;                                    \
     fill_params(params, IS_BF16,                                                 \

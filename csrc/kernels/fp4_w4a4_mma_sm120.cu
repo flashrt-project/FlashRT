@@ -6,6 +6,7 @@
 
 #include "fp4_w4a4_mma_sm120.cuh"
 
+#include "nvfp4_convert.cuh"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -685,53 +686,6 @@ __global__ void full_n_kernel(
   }
 }
 
-// ── Gated GeGLU epilogue helpers (this patch) ────────────────────────────────
-// Reproduced from csrc/kernels/nvfp4_convert.cuh so the bytes match the shipped
-// quantizers exactly.
-__device__ __forceinline__ uint8_t g_float_to_fp4_e2m1(float v) {
-  uint8_t sign = (v < 0.0f) ? 0x8u : 0x0u;
-  float a = fabsf(v);
-  uint8_t mag;
-  if      (a < 0.25f) mag = 0;
-  else if (a < 0.75f) mag = 1;
-  else if (a < 1.25f) mag = 2;
-  else if (a < 1.75f) mag = 3;
-  else if (a < 2.5f)  mag = 4;
-  else if (a < 3.5f)  mag = 5;
-  else if (a < 5.0f)  mag = 6;
-  else                mag = 7;
-  return sign | mag;
-}
-
-__device__ __forceinline__ uint8_t g_float_to_ue4m3_ceil(float v) {
-  if (v <= 0.0f) return 0;
-  if (v > 240.0f) return 0xFE;
-  uint32_t bits = __float_as_uint(v);
-  int float_exp = ((bits >> 23) & 0xFF) - 127;
-  uint32_t frac = bits & 0x7FFFFF;
-  int ue_exp = float_exp + 7;
-  if (ue_exp <= 0) {
-    float scaled = v * 512.0f;
-    int m = (int)ceilf(scaled);
-    if (m > 7) return (1 << 3) | 0;
-    if (m < 1) m = 1;
-    return (uint8_t)m;
-  }
-  if (ue_exp >= 15) return 0xFE;
-  int m = (int)(frac >> 20);
-  if (frac & 0xFFFFF) m++;
-  if (m >= 8) { m = 0; ue_exp++; }
-  if (ue_exp >= 15) return 0xFE;
-  return (uint8_t)((ue_exp << 3) | m);
-}
-
-__device__ __forceinline__ float g_ue4m3_to_float(uint8_t v) {
-  int e = (v >> 3) & 0xF;
-  int m = v & 0x7;
-  if (e == 0) return ldexpf((float)m / 8.0f, -6);
-  return ldexpf(1.0f + (float)m / 8.0f, e - 7);
-}
-
 // torch's GELU is the exact erf form, not the tanh approximation.
 __device__ __forceinline__ float g_gelu_f32(float x) {
   return 0.5f * x * (1.0f + erff(x * 0.70710678118654752440f));
@@ -955,15 +909,15 @@ __global__ void full_n_gated_geglu_kernel(
   // (blk/4)*512 + (blk%4).
   float amax = 0.0f;
   for (int i = 0; i < S3G_PAIRS_PER_BLOCK; ++i) amax = fmaxf(amax, fabsf(s_gate[i]));
-  const uint8_t ue = g_float_to_ue4m3_ceil(amax / 6.0f);
-  const float scale = g_ue4m3_to_float(ue);
+  const uint8_t ue = float_to_ue4m3_ceil(amax / 6.0f);
+  const float scale = ue4m3_to_float(ue);
   const float inv = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
   const int half = S3G_PAIRS_PER_BLOCK >> 1;
   for (int p = threadIdx.x; p < half; p += blockDim.x) {
     float v0 = s_gate[2 * p] * inv;
     float v1 = s_gate[2 * p + 1] * inv;
     D_packed[(size_t)blockIdx.x * half + p] =
-        (uint8_t)((g_float_to_fp4_e2m1(v1) << 4) | (g_float_to_fp4_e2m1(v0) & 0x0F));
+        (uint8_t)((float_to_fp4_e2m1(v1) << 4) | (float_to_fp4_e2m1(v0) & 0x0F));
   }
   if (threadIdx.x == 0) SFD[(blockIdx.x / 4) * 512 + (blockIdx.x % 4)] = ue;
 }
