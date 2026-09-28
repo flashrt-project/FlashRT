@@ -2,6 +2,7 @@
   global:
     fvk_attention_fa2_fwd_fp16;
     fvk_attention_fa2_fwd_bf16;
+    fvk_attention_fa2_fwd_bf16_window;
     fvk_attention_fa2_fwd_bf16_seqused;
     fvk_attention_fa2_fwd_bf16_seqused_splitkv;
     fvk_attention_fa2_fwd_bf16_causal;

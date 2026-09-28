@@ -312,6 +312,25 @@ extern "C" void NAME(                                                           
     std::abort();                                                                \
 }
 
+// Same, for the windowed entry, whose signature carries the two extra window
+// bounds the plain stub above does not have. Keeping the pair in step matters:
+// an entry with no stub here is an undefined symbol at link time for any build
+// whose FA2_DTYPES drops bf16.
+#define DEFINE_FA2_STUB_WINDOW(NAME, DTYPE_STR)                                  \
+extern "C" void NAME(                                                            \
+    const void*, const void*, const void*, void*, void*,                         \
+    void*, void*,                                                                \
+    int, int, int, int, int, int,                                                \
+    int, int, int, int, int, int,                                                \
+    int, int, int, int, int, int,                                                \
+    float, int, int, int, cudaStream_t)                                          \
+{                                                                                \
+    fprintf(stderr,                                                              \
+        "fvk_attention_fa2: " DTYPE_STR " window entry was not compiled. "       \
+        "Rebuild with -DFA2_DTYPES=\"fp16;bf16\" to enable it.\n");              \
+    std::abort();                                                                \
+}
+
 #ifdef FA2_HAS_FP16
 DEFINE_FA2_ENTRY(fvk_attention_fa2_fwd_fp16, cutlass::half_t,    false)
 #else
@@ -382,6 +401,7 @@ extern "C" void fvk_attention_fa2_fwd_bf16_seqused_splitkv(
 }
 #else
 DEFINE_FA2_STUB(fvk_attention_fa2_fwd_bf16,  "bf16")
+DEFINE_FA2_STUB_WINDOW(fvk_attention_fa2_fwd_bf16_window, "bf16")
 extern "C" void fvk_attention_fa2_fwd_bf16_seqused(
     const void*, const void*, const void*, void*, void*, const void*,
     int, int, int, int, int, int, int, int, int, int, int, int,
