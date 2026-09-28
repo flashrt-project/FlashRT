@@ -25,7 +25,6 @@ See ``docs/spark_x25_usage.md`` for the parameter reference and
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import torch

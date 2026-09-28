@@ -24,7 +24,13 @@ from typing import Dict, Optional
 
 import torch
 
-import flash_rt.flash_rt_kernels as fvk
+# Optional at import time, like pipeline_rtx's extensions: the quantiser below
+# is the only user and it runs from the runtime constructor, after
+# ``_require_kernels`` has already refused a build without this module.
+try:
+    import flash_rt.flash_rt_kernels as fvk
+except ImportError:                                     # pragma: no cover
+    fvk = None
 
 from flash_rt.models.spark_x25.config import SparkX25Config
 
@@ -124,7 +130,12 @@ def quantize_nvfp4(w_bf16: torch.Tensor, stream) -> Nvfp4Linear:
     (`alpha = global_scale`, because the kernel stores scales pre-divided by it).
     """
     n, k = w_bf16.shape
-    assert k % 16 == 0, f"K={k} must be a multiple of 16 for 16-element SF blocks"
+    # Raises rather than asserts: `python -O` would strip an assert and the
+    # pack below would silently produce a wrong SF layout.
+    if k % 16 != 0:
+        raise ValueError(
+            f"quantize_nvfp4: weight shape ({n}, {k}) has K={k}, which is not "
+            "a multiple of 16 (the NVFP4 16-element scale-factor block)")
     w = w_bf16.contiguous().to("cuda", torch.bfloat16)
     packed = torch.empty((n, k // 2), dtype=torch.uint8, device="cuda")
     sf_bytes = fvk.nvfp4_sf_swizzled_bytes(n, k)

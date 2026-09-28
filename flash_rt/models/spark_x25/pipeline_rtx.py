@@ -23,18 +23,56 @@ import math
 
 import torch
 
-import flash_rt.flash_rt_fa2 as fa2
-import flash_rt.flash_rt_kernels as fvk
+# The three extension modules are optional at import time: this file is
+# reachable from ``import flash_rt.models.spark_x25`` (config parsing, and the
+# checkpoint validation the frontend shares), which must work on a machine with
+# no SM120 build. Nothing at module scope dereferences them, so they are bound
+# to None and checked in ``_require_kernels`` from the runtime constructor --
+# the fail-fast style ``frontends/torch/nexn2_rtx.py`` uses.
+try:
+    import flash_rt.flash_rt_fa2 as fa2
+except ImportError:                                     # pragma: no cover
+    fa2 = None
+try:
+    import flash_rt.flash_rt_kernels as fvk
+except ImportError:                                     # pragma: no cover
+    fvk = None
+try:
+    from flash_rt import flash_rt_sparkx25 as sk
+except ImportError:                                     # pragma: no cover
+    sk = None
 
 from flash_rt.models.spark_x25.config import load_config
 from flash_rt.models.spark_x25.weights import load_weights
 
-try:
-    from flash_rt import flash_rt_sparkx25 as sk
-except ImportError as exc:  # pragma: no cover
-    raise ImportError(
-        "spark_x25_kernels is not built. Run: python scripts/build_kernels.py"
-    ) from exc
+#: What to tell a caller whose build does not carry the modules above.
+_BUILD_HINT = (
+    "Build them with:\n"
+    "    cmake -B build -S . -DGPU_ARCH=120\n"
+    "    cmake --build build -j4 --target flash_rt_kernels flash_rt_fa2 "
+    "flash_rt_sparkx25\n"
+    "flash_rt_sparkx25 is SM120 (RTX 50-series) only and is skipped on every "
+    "other GPU_ARCH. See docs/spark_x25_usage.md."
+)
+
+
+def _require_kernels() -> None:
+    """Raise unless every extension this pipeline drives is importable.
+
+    ``flash_rt_kernels`` supplies the NVFP4 W4A4 GEMMs, ``flash_rt_fa2`` the
+    prefill attention and ``flash_rt_sparkx25`` the decode path; all three are
+    needed, so a missing one is a refusal here rather than an AttributeError
+    mid-capture.
+    """
+    missing = [name for name, mod in (
+        ("flash_rt_kernels", fvk),
+        ("flash_rt_fa2", fa2),
+        ("flash_rt_sparkx25", sk)) if mod is None]
+    if missing:
+        raise RuntimeError(
+            "Spark-X2.5 decode needs the compiled extensions "
+            f"{', '.join(missing)}, which are not importable here. "
+            + _BUILD_HINT)
 
 
 def _sf_bytes(rows: int, k: int) -> int:
@@ -62,6 +100,7 @@ class SparkX25Runtime:
                  attn_impl: str = "native",
                  attn_splits: int | None = None,
                  attn_splits_slide: int | None = None):
+        _require_kernels()
         self.cfg = load_config(ckpt_dir)
         self.device = device
         self.max_seq = max_seq
@@ -291,7 +330,6 @@ class SparkX25Runtime:
         self.tokens_out = torch.zeros(R, dtype=torch.int64, device=d)
         self._loop_graph = None
         self._loop_steps = 0
-        self._loop_pos = -1
 
         # NVFP4 activation scratch, one (packed, sf) pair per distinct K
         self.act = {}
@@ -307,7 +345,6 @@ class SparkX25Runtime:
 
         self.q_row = c.q_dim          # elements per row of q_buf / o_raw
         self.kv_row = c.kv_dim        # elements per row of the KV caches
-        self._layer_base = c.num_hidden_layers * 0  # placeholder for clarity
 
     # ── RoPE tables ──────────────────────────────────────────────────────
     def _build_rope(self) -> None:
@@ -487,18 +524,13 @@ class SparkX25Runtime:
                                           ring is None)
             return
 
-        # The split-KV entry is not used. Splitting the KV range costs a second
-        # kernel and an fp32 partial-softmax round trip (splits x 16 heads x 256
-        # dims, written by the split kernel and read back by the combine), and a
-        # decode step is one query row whose parallelism comes from the 4 KV
-        # heads and the key blocks, not from the split. Measured in-graph at
-        # both ends of the workload, the plain entry is faster for every layer
-        # type: short prompt 365.6 vs 392.6 us/token of attention, and at a
-        # 1943-token prefill 1813.3 vs 1839.8 (the split kernel's 1029.7 plus
-        # its 16.5 us combine against 365.6/9 = 40.6 us per full layer on the
-        # plain one). The two entries agree to 7.6e-06 on attention outputs of
-        # magnitude 0.60 (cos = 0.9999999) on real roped Q and real KV, so this
-        # is the split reduction's fp32 association, not a different result.
+        # A/B reference only: the shipped path returns above, and the frontend
+        # does not expose `attn_impl`, so this is reached only when a caller
+        # asks for it explicitly. It is what the native two-pass attention was
+        # measured against (docs/spark_x25_rtx.md); the two agree to 7.6e-06 on
+        # attention outputs of magnitude 0.60 (cos = 0.9999999), so the gap is
+        # the split reduction's fp32 association rather than a different result.
+        # `split_kv_sms > 0` selects the split-KV entry, 0 the plain one.
         args = (
             self._p(self.q_buf), self._p(self.k_cache) + base * 2,
             self._p(self.v_cache) + base * 2, self._p(self.o_raw),
@@ -572,7 +604,7 @@ class SparkX25Runtime:
         shape (one block of 256 threads walking the row in 16 strided scalar
         steps, staging the normalized row through shared memory) costs more than
         the bytes justify, so this repository's kernel covers it. The two are
-        byte-compatible: tests/test_kernels.py compares the packed E2M1 nibbles
+        byte-compatible: tests/test_spark_x25_kernels.py compares the packed E2M1 nibbles
         and the swizzled UE4M3 scales against v2 directly, at three input
         magnitudes, and they match exactly. So prefill and decode hand the same
         activation format to the same GEMM.
@@ -674,7 +706,7 @@ class SparkX25Runtime:
         if R == 1:
             # Decode: the gated product rides the GEMM epilogue. The kernel's
             # output is bit-identical to gate_up GEMM + gelu_mul here (verified
-            # in tests/test_kernels.py) and costs 63.5 us against 67.7 us.
+            # in tests/test_spark_x25_kernels.py) and costs 63.5 us against 67.7 us.
             fvk.fp4_w4a4_mma_sm120_gated_geglu_fp4out(
                 self._p(self.act["qkv"][0]), self._p(lw.gate_up_il.packed),
                 self._p(self.act["down"][0]), self._p(self.act["down"][1]),
@@ -798,8 +830,17 @@ class SparkX25Runtime:
         # CUDA Graph capture -- and what makes replay follow the caller's stream.
         self.stream = torch.cuda.current_stream().cuda_stream
         rows = int(input_ids.numel())
-        assert rows <= self.prefill_cap, "prompt exceeds prefill_cap"
-        assert pos + rows <= self.max_seq, "sequence exceeds max_seq"
+        # Raises rather than asserts: the buffers below are sized from these
+        # two bounds and `python -O` would strip an assert.
+        if rows > self.prefill_cap:
+            raise ValueError(
+                f"prefill: prompt of {rows} rows exceeds prefill_cap="
+                f"{self.prefill_cap}; raise it in the constructor or chunk the "
+                "prompt yourself")
+        if pos + rows > self.max_seq:
+            raise ValueError(
+                f"prefill: positions [{pos}, {pos + rows}) exceed max_seq="
+                f"{self.max_seq}; raise max_seq in the constructor")
         ids = input_ids.to(torch.int64).contiguous()
 
         A = self.act_rows

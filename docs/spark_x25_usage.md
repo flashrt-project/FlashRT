@@ -21,8 +21,17 @@ cmake --build build --target flash_rt_kernels flash_rt_fa2 flash_rt_sparkx25 -j4
 `flash_rt_kernels` supplies the NVFP4 W4A4 GEMMs and `flash_rt_fa2` the prefill
 attention; both are required. The build prints
 `Spark-X2.5-4B kernels: ENABLED (separate module flash_rt_sparkx25)` when the
-third target is configured. On any other `GPU_ARCH` it is skipped and the
-frontend will not resolve.
+third target is configured.
+
+The target is built for `GPU_ARCH=120` only, because the KV writer quantises with
+`__nv_cvt_float_to_fp8` and the score kernels' tile sizes assume the RTX
+shared-memory budget. On any other `GPU_ARCH` the module is skipped and
+`SparkX25Runtime` raises a `RuntimeError` naming the missing extensions; the
+frontend and the config parser still import, so checkpoint validation works
+before a build exists. Note that `detect_arch()` reports `rtx_sm120` for both
+SM120 and SM121, so on an SM121 part (DGX Spark GB10) the route resolves but the
+module is absent -- that is the `RuntimeError` above, not a supported
+configuration.
 
 On a toolkit older than the SM120 FP8 prefill kernels -- `fmha_fp8_causal_gqa_sm120`
 and the sage2 group statically allocate more than 48 KB of shared memory, which
