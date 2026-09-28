@@ -9,21 +9,38 @@ the tables here are small and the tolerances are exact where the reference is
 exact.
 
 Run:  python tests/test_spark_x25_kernels.py
+      python -m pytest tests/test_spark_x25_kernels.py
+
+Needs a CUDA device and the SM120 core kernels; both are skipped rather than
+failed when absent, so the file is collection-safe on a CPU-only or non-SM120
+machine (``flash_rt_sparkx25`` is not built there).
 """
 from __future__ import annotations
 
 import sys
 
-import numpy as np
-import torch
-import torch.nn.functional as F
+import pytest
 
+torch = pytest.importorskip("torch")
+import torch.nn.functional as F  # noqa: E402
 
-from flash_rt import flash_rt_sparkx25 as sk  # noqa: E402
-from flash_rt import flash_rt_kernels as fvk  # noqa: E402
+import numpy as np  # noqa: E402
+
+if not torch.cuda.is_available():
+    pytest.skip("Spark-X2.5 kernels need a CUDA device", allow_module_level=True)
+
+sk = pytest.importorskip("flash_rt.flash_rt_sparkx25")
+fvk = pytest.importorskip("flash_rt.flash_rt_kernels")
 
 DEV = "cuda"
 FAILS = []
+
+#: ``check()`` raises on a mismatch by default, so a pytest run reports the
+#: kernel that failed instead of a bare count. The ``__main__`` entry point
+#: clears it to collect every mismatch and print them together, which is the
+#: form a bring-up run wants. Without one of the two, a mismatch only printed
+#: a FAIL line and every test still passed.
+RAISE_ON_FAIL = True
 
 
 def check(name, got, want, atol=0.0, rtol=0.0):
@@ -38,6 +55,8 @@ def check(name, got, want, atol=0.0, rtol=0.0):
     print(f"  [{status}] {name:38s} max|diff|={err:.3e}")
     if not ok:
         FAILS.append(name)
+        if RAISE_ON_FAIL:
+            raise AssertionError(f"{name}: max|diff|={err:.3e} (atol={atol}, rtol={rtol})")
     return ok
 
 
@@ -483,6 +502,10 @@ def test_gproj():
 
 
 if __name__ == "__main__":
+    # Collect every mismatch instead of stopping at the first one: this is the
+    # bring-up path, where seeing all the failing kernels in one run matters
+    # more than which one aborted.
+    RAISE_ON_FAIL = False
     torch.cuda.init()
     test_gelu_mul_nvfp4()
     test_qkv_post_rope()
