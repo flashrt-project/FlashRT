@@ -39,6 +39,11 @@ def _quantize_per_row_int8(w_bf16: torch.Tensor) -> tuple[torch.Tensor, torch.Te
 class HyVLATorchFrontendOrin(HyVLATorchFrontendThor):
     _REQUIRED_CAPABILITY = (8, 7)
     _ARCH_NAME = "Jetson Orin SM87"
+    #: Target profile: the pipeline class this (model, framework, hardware)
+    #: binds. Hardware subclasses (e.g. RTX SM120) override this to bind their
+    #: own lowered execution plan while reusing the shared frontend IO/graph
+    #: machinery; this is the documented "select a target profile" pattern.
+    _PIPE_CLS = HyVLAOrinBF16Pipeline
 
     def __init__(self, checkpoint_dir: str, *, hardware: str = "rtx_sm87",
                  use_fp8: bool = True, use_fp8_vit: bool = False,
@@ -94,7 +99,7 @@ class HyVLATorchFrontendOrin(HyVLATorchFrontendThor):
         )
         if self.use_int8_vit:
             self._quantize_vit_int8()
-        self.pipe = HyVLAOrinBF16Pipeline(self)
+        self.pipe = self._PIPE_CLS(self)
         import flash_rt.flash_rt_kernels as fvk
         # ViT levers: memory-efficient SDPA reads the strided QKV slices
         # directly (the flash backend force-copies them), and the fused

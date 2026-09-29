@@ -436,6 +436,12 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             Validated on LIBERO Spatial for the torch path: 491/500 = 98.2%
             (matches baseline). JAX FP4 has Thor precision / replay-latency
             validation against a same-origin PyTorch reference.
+            HyVLA torch on RTX SM120/SM121 is also reached through this
+            flag: the RTX default enables NVFP4 for the ViT + VLM prefill
+            tower and keeps the expert denoise tower on FP8 block-128
+            (action cosine 0.99977). Promoting the expert tower to NVFP4 is
+            an opt-in frontend kwarg (``use_fp4_expert=True``), not a
+            ``load_model`` argument.
         use_fp4_decoder: Pi0.5 torch on Thor only. Explicitly enable NVFP4 for
             all four action-expert decoder projections in addition to
             ``use_fp4=True``. Default False. Requires ``use_fp4=True`` and a
@@ -984,7 +990,14 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             (config == "pi05" and framework in ("torch", "jax") and arch == "thor")
             or (config == "hyvla" and framework == "torch" and arch == "thor")
         )
-        if not _fp4_ok:
+        # HyVLA on RTX SM120 provides its NVFP4 expert tier through
+        # flash_rt_kernels (tcgen05 NVFP4), not the Thor flash_rt_fp4
+        # extension, so route it explicitly and skip the _fvk_fp4 probe.
+        if config == "hyvla" and framework == "torch" and arch == "rtx_sm120":
+            _hyvla_fp4 = True
+            logger.info("HyVLA RTX SM120 NVFP4 expert tier enabled")
+            use_fp4 = False  # routed; skip the Pi0.5 path below
+        elif not _fp4_ok:
             if config == "hyvla" and arch == "rtx_sm87":
                 logger.warning(
                     "use_fp4=True is not supported for config='hyvla' on "
@@ -1101,10 +1114,19 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             if value is not None and name in sig.parameters:
                 kwargs[name] = value
     elif config == "hyvla":
-        # The routed FP4 tier must reach the frontend explicitly; the
-        # generic kwarg set never forwards use_fp4.
-        if _hyvla_fp4 and "use_fp4" in sig.parameters:
-            kwargs["use_fp4"] = True
+        # The NVFP4 tier must reach the frontend explicitly; the generic
+        # kwarg set never forwards use_fp4. It is the RTX SM120 default
+        # (NVFP4 ViT + prefill, expert tower on FP8 block-128: cosine
+        # 0.99977, ~55.6 ms) when the caller did not ask for the BF16
+        # reference path, and it is selected by an explicit
+        # load_model(use_fp4=True).
+        if "use_fp4" in sig.parameters:
+            if _hyvla_fp4 or (arch == "rtx_sm120" and use_fp8):
+                kwargs["use_fp4"] = True
+                # The expert denoise tower stays on FP8 unless the caller
+                # opts into use_fp4_expert (frontend default False).
+                if "use_fp4_expert" in sig.parameters:
+                    kwargs["use_fp4_expert"] = False
         # FP8 tier = the validated production config (fp8 + fused
         # megakernels); select it explicitly when the frontend accepts it.
         if use_fp8 and "use_fused" in sig.parameters:
