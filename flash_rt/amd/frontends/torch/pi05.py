@@ -347,7 +347,9 @@ class Pi05TorchFrontendAmd:
         self._bf16_packed_store: list = []
         bf16_decoder = self._force_bf16 or not self.use_fp8
         self._cdna3_bf16_smallm = (
-            self._amd_caps.hardware == "amd_cdna3"
+            all(self._amd_caps.supports_packed_bf16(
+                self.chunk_size, n, k, layout="mfma_k16_lane4")
+                for n, k in ((2560, 1024), (1024, 2048), (8192, 1024)))
             and bf16_decoder
             and os.environ.get("FVK_AMD_CDNA3_BF16_SMALLM", "1") == "1"
         )

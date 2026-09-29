@@ -63,7 +63,12 @@ constexpr const char* fp8_format = "e4m3fnuz";
 constexpr const char* hardware_name = "amd_cdna3";
 constexpr bool supports_mxfp4 = false;
 constexpr bool supports_packed_fp8_mfma = true;
-constexpr bool supports_packed_bf16_mfma = false;
+// Validated production forms only; GROOT's 32-deep layout is incompatible.
+constexpr bool supports_packed_bf16_mfma = true;
+constexpr const char* packed_bf16_layout = "mfma_k16_lane4";
+constexpr int packed_bf16_shapes[][3] = {
+    {10, 2560, 1024}, {10, 1024, 2048}, {10, 8192, 1024},
+};
 constexpr bool supports_fused_attention_fp8out = true;
 constexpr bool supports_aiter = true;
 
@@ -78,6 +83,9 @@ constexpr const char* hardware_name = "amd_cdna4";
 constexpr bool supports_mxfp4 = true;
 constexpr bool supports_packed_fp8_mfma = true;
 constexpr bool supports_packed_bf16_mfma = true;
+constexpr const char* packed_bf16_layout = "mfma_k32_lane8";
+// M range and (N,K) forms used by the DiT projection route.
+constexpr int packed_bf16_shapes[][3] = {{0, 1536, 1536}};
 constexpr bool supports_fused_attention_fp8out = true;
 constexpr bool supports_aiter = true;
 

@@ -175,6 +175,18 @@ PYBIND11_MODULE(flash_rt_amd_kernels, m) {
             flashrt::amd::arch::supports_packed_fp8_mfma;
         info["supports_packed_bf16_mfma"] =
             flashrt::amd::arch::supports_packed_bf16_mfma;
+        info["packed_bf16_layout"] = flashrt::amd::arch::packed_bf16_layout;
+        py::list bf16_shapes;
+        for (const auto& shape : flashrt::amd::arch::packed_bf16_shapes) {
+            // Zero M declares the kernel's supported small-M range.
+            if (shape[0] == 0) {
+                for (int m = 1; m <= 48; ++m)
+                    bf16_shapes.append(py::make_tuple(m, shape[1], shape[2]));
+            } else {
+                bf16_shapes.append(py::make_tuple(shape[0], shape[1], shape[2]));
+            }
+        }
+        info["packed_bf16_shapes"] = bf16_shapes;
         info["supports_fused_attention_fp8_output"] =
             flashrt::amd::arch::supports_fused_attention_fp8out;
         info["supports_aiter"] = flashrt::amd::arch::supports_aiter;

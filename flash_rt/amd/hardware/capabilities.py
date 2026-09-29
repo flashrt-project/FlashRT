@@ -19,9 +19,17 @@ class AmdCapabilities:
     supports_mxfp4: bool
     supports_packed_fp8_mfma: bool
     supports_packed_bf16_mfma: bool
+    packed_bf16_layout: str
+    packed_bf16_shapes: tuple[tuple[int, int, int], ...]
     supports_fused_attention_fp8_output: bool
     supports_aiter: bool
     aiter_installed: bool
+
+    def supports_packed_bf16(self, m: int, n: int, k: int, *, layout: str) -> bool:
+        """Check a validated (M,N,K) form and its weight packing contract."""
+        return (self.supports_packed_bf16_mfma
+                and layout == self.packed_bf16_layout
+                and (m, n, k) in self.packed_bf16_shapes)
 
     @property
     def torch_fp8_dtype(self):
@@ -60,6 +68,7 @@ def load_capabilities(fvk: Any, expected_hardware: str | None = None) -> AmdCapa
     required = (
         "fp8_format", "fp8_max_finite", "supports_mxfp4",
         "supports_packed_fp8_mfma", "supports_packed_bf16_mfma",
+        "packed_bf16_layout", "packed_bf16_shapes",
         "supports_fused_attention_fp8_output", "supports_aiter",
     )
     missing = [key for key in required if key not in info]
@@ -76,6 +85,8 @@ def load_capabilities(fvk: Any, expected_hardware: str | None = None) -> AmdCapa
         supports_mxfp4=bool(info["supports_mxfp4"]),
         supports_packed_fp8_mfma=bool(info["supports_packed_fp8_mfma"]),
         supports_packed_bf16_mfma=bool(info["supports_packed_bf16_mfma"]),
+        packed_bf16_layout=str(info["packed_bf16_layout"]),
+        packed_bf16_shapes=tuple(tuple(shape) for shape in info["packed_bf16_shapes"]),
         supports_fused_attention_fp8_output=bool(info["supports_fused_attention_fp8_output"]),
         supports_aiter=supports_aiter,
         aiter_installed=(supports_aiter and importlib.util.find_spec("aiter") is not None),

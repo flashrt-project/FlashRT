@@ -1228,8 +1228,10 @@ def _valid_variants(ext, K):
 
 
 def _require_smallm_bf16(ext):
-    if not dict(ext.build_info()).get("supports_packed_bf16_mfma", False):
-        pytest.skip("packed BF16 MFMA is not declared by this AMD architecture")
+    from flash_rt.amd.hardware.capabilities import load_capabilities
+    if not load_capabilities(ext).supports_packed_bf16(
+            41, 1536, 1536, layout="mfma_k32_lane8"):
+        pytest.skip("GROOT packed BF16 shape/layout is not declared by this AMD architecture")
 
 
 def test_smallm_mfma_bf16_variants_enumerator(env):

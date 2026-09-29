@@ -223,3 +223,12 @@ so the suite is safe to run in a CUDA-only CI.
 - Every HIP runtime call in the Python layer is return-code checked; a
   failed launch, copy or synchronise raises instead of letting a stale
   buffer be read back as a result.
+
+Packed BF16 routing uses `build_info()`'s `packed_bf16_shapes` (M, N, K)
+and `packed_bf16_layout` together. CDNA3 declares the Pi0.5 decoder forms
+(10, 2560, 1024), (10, 1024, 2048), and (10, 8192, 1024) with
+`mfma_k16_lane4` packing. CDNA4 declares the GROOT square projections
+(M, 1536, 1536), for 1 <= M <= 48, with `mfma_k32_lane8` packing.
+Both frontends require a matching shape and layout before packing; GROOT
+therefore retains hipBLASLt on CDNA3. The broad
+`supports_packed_bf16_mfma` flag alone does not authorize a model route.

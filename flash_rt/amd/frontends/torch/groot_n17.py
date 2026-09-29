@@ -375,7 +375,7 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
     # Fully-kernelized DiT graph (bf16, single combined graph)
     # ────────────────────────────────────────────────────────────────
 
-    def _pack_smallm_dit_weights(self) -> None:
+    def _pack_smallm_dit_weights(self, sa: int = 41) -> None:
         """MFMA-pack the DiT (41, 1536, 1536) projection weights ONCE at
         graph-build time (never per frame) for the gfx950 small-M packed
         bf16 kernel (csrc/amd/gemm/smallm_mfma_bf16.h).
@@ -398,17 +398,20 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
         the packing entirely; the AMD ``dit_forward`` reads the same
         env for routing.
         """
-        if getattr(self, "_dit_smallm_packed", None) is not None:
-            return
-        self._dit_smallm_packed: dict = {}
-        self._dit_smallm_store: list = []
-        if not self._amd_caps.supports_packed_bf16_mfma:
+        if not self._amd_caps.supports_packed_bf16(
+                sa, 1536, 1536, layout="mfma_k32_lane8"):
+            self._dit_smallm_packed = {}
+            self._dit_smallm_store = []
             if os.environ.get("FVK_AMD_DIT_GEMM", "hipblaslt").strip().lower() \
                     == "smallm":
                 raise ValueError(
                     "FVK_AMD_DIT_GEMM=smallm requested, but this AMD build "
-                    "does not declare packed BF16 MFMA support")
+                    "does not declare packed BF16 MFMA support for this shape/layout")
             return
+        if getattr(self, "_dit_smallm_packed", None) is not None:
+            return
+        self._dit_smallm_packed: dict = {}
+        self._dit_smallm_store: list = []
         # FVK_AMD_DIT_GEMM: "smallm" (default) = pack + route the D→D
         # projections to the MFMA packed kernel; "hipblaslt" = library path.
         if os.environ.get("FVK_AMD_DIT_GEMM", "smallm").strip().lower() \
@@ -472,7 +475,7 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
         if fused_ep:
             # Setup-time MFMA packing for the smallm D→D projection
             # routing in the AMD dit_forward (FVK_AMD_DIT_GEMM).
-            self._pack_smallm_dit_weights()
+            self._pack_smallm_dit_weights(Sa)
 
         K = self._fvk
         mg = self._mlp_gemm
