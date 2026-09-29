@@ -15,6 +15,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BUILD_DIR = Path(os.environ.get("FLASHRT_BUILD_DIR", REPO_ROOT / "build"))
 EXPECTED_RAW_EXPORTS = {
+    "fvk_attention_fa2_fwd_bf16_tile",
     "fvk_attention_fa2_fwd_fp16",
     "fvk_attention_fa2_fwd_bf16",
     "fvk_attention_fa2_fwd_bf16_seqused",
@@ -49,16 +50,19 @@ def _link_manifest(target: str) -> str | None:
         return manifest
     ninja = BUILD_DIR / "build.ninja"
     if ninja.is_file():
-        lines = [
-            line for line in ninja.read_text(errors="replace").splitlines()
-            if line.startswith("build ") and target in line
-        ]
+        # Keep per-edge variables (including LINK_FLAGS), not just the
+        # build line; exclude unrelated phony targets mentioning this name.
+        blocks = re.split(r"\n(?=build )", ninja.read_text(errors="replace"))
+        lines = [block for block in blocks
+                 if re.match(r"build .*: .*(?:SHARED|MODULE)_LIBRARY_LINKER__" +
+                             re.escape(target) + r"_", block)]
         return "\n".join(lines) if lines else None
     return None
 
 
 def _fa2_supported() -> bool:
-    return (_cache_value("GPU_ARCH") or "") in {
+    return (_cache_value("GPU_ARCH") == "110" and
+            _cache_bool("FLASHRT_ENABLE_THOR_FA2")) or (_cache_value("GPU_ARCH") or "") in {
         "80", "86", "87", "89", "120", "121",
     }
 
@@ -134,6 +138,7 @@ def test_built_raw_library_has_exact_export_surface():
         text=True,
         errors="replace",
     )
+    assert "run_mha_fwd_smallq_bf16" not in undefined
     assert " Py" not in undefined
     assert "fvk_attention_fa2_" not in undefined
 
@@ -166,6 +171,7 @@ def test_built_adapter_chameleon_symbol_matches_build_mode():
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    assert hasattr(module, "fwd_bf16_tile")
     assert hasattr(module, "fwd_fp16_causal") == _cache_bool(
         "FLASHRT_ENABLE_CHAMELEON")
 
@@ -194,3 +200,33 @@ def test_unused_fp8_bias_autotune_api_is_absent():
         "csrc/gemm/gemm_runner.cu",
     ):
         assert "autotune_fp8_nn_bias" not in (REPO_ROOT / relative).read_text()
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"),
+                    reason="raw C API check is Linux-specific")
+@pytest.mark.parametrize("head_dim", [96, 128])
+def test_small_query_rejects_unbuilt_profiles_before_launch(head_dim):
+    raw = os.environ.get("FLASHRT_FA2_RAW_LIBRARY")
+    if not raw:
+        pytest.skip("set FLASHRT_FA2_RAW_LIBRARY to validate a built raw library")
+    dtypes = (_cache_value("FA2_DTYPES") or "").split(";")
+    hdims = (_cache_value("FA2_HDIMS") or "").split(";")
+    if "bf16" in dtypes and str(head_dim) in hdims:
+        pytest.skip("supported profile requires device buffers; covered by GPU tests")
+    # An unsupported specialization must fail before using device pointers.
+    # A missing internal symbol would instead fail while loading the library.
+    script = """
+import ctypes, resource, sys
+resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+lib = ctypes.CDLL(sys.argv[1])
+f = lib.fvk_attention_fa2_fwd_bf16_tile
+f.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_int] * 18 + [ctypes.c_float, ctypes.c_int, ctypes.c_void_p]
+f.restype = None
+print('loaded', flush=True)
+f(*([None] * 6), 1, 1, 1, 1, 1, int(sys.argv[2]), *([1] * 12), 1.0, 1, None)
+"""
+    result = subprocess.run([sys.executable, "-c", script, raw, str(head_dim)],
+                            text=True, capture_output=True)
+    assert result.stdout.strip() == "loaded", result.stderr
+    assert result.returncode == -6, result.stderr  # SIGABRT, not a null dereference
+    if "bf16" in dtypes:
+        assert "not compiled" in result.stderr

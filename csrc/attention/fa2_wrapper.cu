@@ -369,12 +369,22 @@ extern "C" void fvk_attention_fa2_fwd_bf16_tile(
     int o_batch_stride, int o_row_stride, int o_head_stride,
     float softmax_scale, int /*num_sms*/, cudaStream_t stream)
 {
+#ifdef FA2_HAS_SMALLQ_BF16
     if (head_dim <= 0 || head_dim > 128) {
         std::fprintf(stderr,
             "[flash_rt_fa2] fwd_bf16_tile: head_dim=%d out of the supported "
             "(0, 128] range; use fwd_bf16/fwd_bf16_seqused instead.\n",
             head_dim);
         std::abort();
+    }
+    if (head_dim <= 96) {
+#ifndef FA2_HAS_HDIM_96
+        fa2_not_built("smallq head_dim<=96", head_dim);
+#endif
+    } else {
+#ifndef FA2_HAS_HDIM_128
+        fa2_not_built("smallq head_dim<=128", head_dim);
+#endif
     }
     FLASH_NAMESPACE::Flash_fwd_params params;
     fill_params(params, true, q_ptr, k_ptr, v_ptr, o_ptr, softmax_lse_ptr,
@@ -389,7 +399,11 @@ extern "C" void fvk_attention_fa2_fwd_bf16_tile(
     params.softmax_lseaccum_ptr = nullptr;
     params.oaccum_ptr = nullptr;
     FLASH_NAMESPACE::run_mha_fwd_smallq_bf16(head_dim, params, stream);
+#else
+    fa2_not_built("bf16 small-query tile head_dim", head_dim);
+#endif
 }
+
 #else
 DEFINE_FA2_STUB(fvk_attention_fa2_fwd_bf16,  "bf16")
 extern "C" void fvk_attention_fa2_fwd_bf16_seqused(

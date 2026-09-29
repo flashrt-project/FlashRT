@@ -1058,8 +1058,10 @@ if(ENABLE_FA2 AND
   # Short-query FA2 tile (bf16, head_dim <= 128) for models with a short
   # seqlen_q. Additive: a separate TU with its own traits, so the upstream
   # dispatch is untouched.
+  set(FA2_HAS_SMALLQ_BF16 OFF)
   if("bf16" IN_LIST FA2_DTYPES AND
      ("96" IN_LIST FA2_HDIMS OR "128" IN_LIST FA2_HDIMS))
+    set(FA2_HAS_SMALLQ_BF16 ON)
     list(APPEND FA2_SRCS
       csrc/attention/fa2_tile_inst/flash_fwd_smallq_bf16_sm80.cu
     )
@@ -1232,6 +1234,9 @@ if(ENABLE_FA2 AND
   # head_dim <= 128 branch stubs out at compile time so no
   # run_mha_fwd_<..., 128, ...> symbol is referenced from wrapper.cu
   # (which would otherwise break linking).
+  if(FA2_HAS_SMALLQ_BF16)
+    target_compile_definitions(fa2_vendor_obj PRIVATE FA2_HAS_SMALLQ_BF16=1)
+  endif()
   foreach(_hd IN LISTS FA2_BUILT_HDIMS)
     target_compile_definitions(fa2_vendor_obj PRIVATE FA2_HAS_HDIM_${_hd}=1)
   endforeach()

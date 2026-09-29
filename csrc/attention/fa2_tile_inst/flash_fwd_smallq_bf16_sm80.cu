@@ -33,13 +33,17 @@ namespace FLASH_NAMESPACE {
 void run_mha_fwd_smallq_bf16(int head_dim, Flash_fwd_params& params,
                              cudaStream_t stream) {
   if (head_dim <= 96) {
+#ifdef FA2_HAS_HDIM_96
     run_flash_fwd<Flash_fwd_kernel_traits<96, 64, 32, 4, false, false,
                                           cutlass::bfloat16_t>,
                   false, false>(params, stream);
+#endif
   } else {
+#ifdef FA2_HAS_HDIM_128
     run_flash_fwd<Flash_fwd_kernel_traits<128, 64, 64, 4, false, false,
                                           cutlass::bfloat16_t>,
                   false, false>(params, stream);
+#endif
   }
 }
 
