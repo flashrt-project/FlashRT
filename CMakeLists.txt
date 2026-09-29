@@ -632,7 +632,8 @@ endif()
 # 'a' arch-accelerated suffix that enables F8F6F4 MMA + TMA SM120).
 if(GPU_ARCH STREQUAL "120")
   add_library(cutlass_sm120_block_obj OBJECT
-    csrc/gemm/cutlass_sm120_block128_fp8_gemm.cu)
+    csrc/gemm/cutlass_sm120_block128_fp8_gemm.cu
+    csrc/gemm/cutlass_sm120_block128_fp8_gemm_bias_sm120.cu)
   set_target_properties(cutlass_sm120_block_obj PROPERTIES
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
@@ -658,6 +659,7 @@ if(GPU_ARCH STREQUAL "120")
   add_library(sm120_fp8_smallm_obj OBJECT
     csrc/gemm/fp8_smallM_handtuned_sm120.cu
     csrc/gemm/fp8_smallM_handtuned_splitk_sm120.cu
+    csrc/gemm/fp8_smallM_splitk_block128_sm120.cu
     csrc/gemm/fp8_smallM_handtuned_ldmatrix_sm120.cu)
   set_target_properties(sm120_fp8_smallm_obj PROPERTIES
     CUDA_STANDARD 17
@@ -1053,6 +1055,15 @@ if(ENABLE_FA2 AND
   endforeach()
   list(REMOVE_DUPLICATES FA2_BUILT_HDIMS)
   list(REMOVE_DUPLICATES FA2_BUILT_DTYPES)
+  # Short-query FA2 tile (bf16, head_dim <= 128) for models with a short
+  # seqlen_q. Additive: a separate TU with its own traits, so the upstream
+  # dispatch is untouched.
+  if("bf16" IN_LIST FA2_DTYPES AND
+     ("96" IN_LIST FA2_HDIMS OR "128" IN_LIST FA2_HDIMS))
+    list(APPEND FA2_SRCS
+      csrc/attention/fa2_tile_inst/flash_fwd_smallq_bf16_sm80.cu
+    )
+  endif()
   # Always include the wrapper — it ifdef-guards its entries based on
   # which hdim/dtype instantiations were built, so it links cleanly
   # against any subset of the matrix.
@@ -1590,6 +1601,7 @@ pybind11_add_module(flash_rt_kernels
   csrc/quantize/rope_apply_bf16.cu
   csrc/gemm/fp8_block128_gemm.cu
   csrc/kernels/silu_mul_qwen36.cu
+  csrc/kernels/act_bf16.cu
   csrc/kernels/embedding_lookup_bf16.cu
   # qwen3_5_moe-family RTX SM120 kernels are NOT listed here -- they are
   # gated into the module below (FLASHRT_ENABLE_QWEN35MOE), so SM89/87/110
@@ -1735,7 +1747,8 @@ if(NOT FLASHRT_SLIM_BUILD OR GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
     csrc/kernels/fp4_w4a4_matvec_sm120.cu
     csrc/kernels/fp4_w4a4_mma_sm120.cu
     csrc/kernels/fp4_w4a4_mma_warpsplit_sm120.cu
-    csrc/kernels/fp4_w4a4_mma_warpsplit_mrows_sm120.cu)
+    csrc/kernels/fp4_w4a4_mma_warpsplit_mrows_sm120.cu
+    csrc/kernels/fp4_w4a4_mma_cksplit_sm120.cu)
   message(STATUS "SM120 NVFP4 W4A16 fp4_w4a4 kernels: ENABLED")
 else()
   message(STATUS "SM120 NVFP4 W4A16 fp4_w4a4 kernels: SKIPPED (slim build)")
@@ -2059,12 +2072,15 @@ endif()
 # The fused RoPE+QKNorm+KV-write megakernel is plain CUDA (no SM110-only
 # instructions) and removes ~11 launches per attention block; the FP8
 # Thor kernels stay SM110-only.
-if(FLASHRT_ENABLE_HYVLA AND GPU_ARCH STREQUAL "87")
+if(FLASHRT_ENABLE_HYVLA AND (GPU_ARCH STREQUAL "87" OR
+                             GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121"))
   target_sources(flash_rt_kernels PRIVATE
     csrc/kernels/hyvla_fused_thor.cu
-    csrc/kernels/hyvla_vit_fuse.cu)
+    csrc/kernels/hyvla_vit_fuse.cu
+    csrc/kernels/hyvla_prefill_attn.cu
+    csrc/kernels/hyvla_euler.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_HYVLA_ORIN=1)
-  message(STATUS "Hy-VLA Orin SM87 fused attention-prep kernel: ENABLED")
+  message(STATUS "Hy-VLA SM87/SM120/SM121 fused attention-prep kernel: ENABLED")
 endif()
 
 target_link_libraries(flash_rt_kernels PRIVATE

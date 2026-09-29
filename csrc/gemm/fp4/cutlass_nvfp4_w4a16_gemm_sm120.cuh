@@ -66,6 +66,18 @@ void fp4_w4a16_gemm_sm120_bf16out(
     float        alpha,       // = sf_global_a * sf_global_b
     cudaStream_t stream);
 
+// Per-column bias variant: D = alpha*(A*B) + bias[n], bias bf16 (N,).
+void fp4_w4a16_gemm_sm120_bf16out_bias(
+    const void*  A_packed,
+    const void*  B_packed,
+    void*        D_bf16,
+    const void*  bias,        // (N,) bf16
+    int M, int N, int K,
+    const void*  SFA,
+    const void*  SFB,
+    float        alpha,
+    cudaStream_t stream);
+
 // Residual variant: D = alpha*(A*B) + C, C a per-element bf16 (M,N) addend.
 // Folds the post-GEMM residual add (o_proj/down) into the epilogue so the
 // following rms_norm reads one tensor (D) not two. Default tile (same as above).
@@ -102,6 +114,21 @@ void fp4_w4a16_gemm_sm120_bf16out_pingpong(
     const void*  A_packed,
     const void*  B_packed,
     void*        D_bf16,
+    int M, int N, int K,
+    const void*  SFA,
+    const void*  SFB,
+    float        alpha,
+    cudaStream_t stream);
+
+// Pingpong mainloop (<128,128,256>, KernelTmaWarpSpecializedPingpong) with the
+// fused per-column bias epilogue: D = alpha*(A*B) + bias[n]. Bit-identical to
+// fp4_w4a16_gemm_sm120_bf16out_bias but faster for large-M no-bias-amenable
+// shapes (ViT qkv/proj/fc2). bias bf16 (N,).
+void fp4_w4a16_gemm_sm120_bf16out_pingpong_bias(
+    const void*  A_packed,
+    const void*  B_packed,
+    void*        D_bf16,
+    const void*  bias,
     int M, int N, int K,
     const void*  SFA,
     const void*  SFB,

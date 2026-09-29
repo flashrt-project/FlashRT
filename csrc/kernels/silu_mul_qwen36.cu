@@ -54,6 +54,24 @@ __global__ void sigmoid_mul_kernel(
   out[idx] = __float2bfloat16(xv * sig_bf_rt);
 }
 
+__global__ void silu_mul_merged_kernel(
+    const __nv_bfloat16* __restrict__ merged,
+    __nv_bfloat16* __restrict__ out,
+    int seq, int half_dim)
+{
+  const int idx = blockIdx.x * kThreadsX + threadIdx.x;
+  const int total = seq * half_dim;
+  if (idx >= total) return;
+  const int row = idx / half_dim;
+  const int col = idx % half_dim;
+  const int full_dim = half_dim * 2;
+  const float g = static_cast<float>(merged[row * full_dim + col]);
+  const float u = static_cast<float>(merged[row * full_dim + half_dim + col]);
+  const float silu_g = silu_f32(g);
+  const float silu_g_bf_rt = static_cast<float>(__float2bfloat16(silu_g));
+  out[idx] = __float2bfloat16(silu_g_bf_rt * u);
+}
+
 }  // namespace
 
 void silu_mul_qwen36_bf16(
@@ -65,6 +83,18 @@ void silu_mul_qwen36_bf16(
 {
   const int grid = (n + kThreadsX - 1) / kThreadsX;
   silu_mul_kernel<<<grid, kThreadsX, 0, stream>>>(gate, up, out, n);
+}
+
+void silu_mul_merged_bf16(
+    const __nv_bfloat16* merged,
+    __nv_bfloat16* out,
+    int seq,
+    int half_dim,
+    cudaStream_t stream)
+{
+  const int total = seq * half_dim;
+  const int grid = (total + kThreadsX - 1) / kThreadsX;
+  silu_mul_merged_kernel<<<grid, kThreadsX, 0, stream>>>(merged, out, seq, half_dim);
 }
 
 void sigmoid_mul_qwen36_bf16(

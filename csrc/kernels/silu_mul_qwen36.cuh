@@ -24,6 +24,18 @@ void silu_mul_qwen36_bf16(
     int n,
     cudaStream_t stream);
 
+// Merged [gate|up] variant: `merged` is (seq, 2*half_dim) row-major with
+// gate = merged[:, :half_dim], up = merged[:, half_dim:]; `out` is
+// (seq, half_dim). Computes out[r,c] = silu(gate[r,c]) * up[r,c] with the
+// same bf16 two-step rounding as silu_mul_qwen36_bf16 (bit-exact with the
+// PyTorch `F.silu(g) * u` composite, so no cosine drift).
+void silu_mul_merged_bf16(
+    const __nv_bfloat16* merged,
+    __nv_bfloat16* out,
+    int seq,
+    int half_dim,
+    cudaStream_t stream);
+
 void sigmoid_mul_qwen36_bf16(
     const __nv_bfloat16* gate,
     const __nv_bfloat16* x,

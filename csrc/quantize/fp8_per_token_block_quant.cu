@@ -472,6 +472,45 @@ __global__ void silu_mul_merged_to_fp8_block128_kernel(
   output[out_idx] = __nv_fp8_e4m3(q);
 }
 
+__device__ __forceinline__ float gelu_erf_f32(float x) {
+  return 0.5f * x * (1.0f + erff(x * 0.7071067811865476f));
+}
+
+// Fused per-column bias-add + erf-GELU + block-128 FP8 quant. Replaces the
+// three-kernel sequence
+//   out = out + bias                    (torch add, bf16)
+//   gelu_erf_bf16(out)                  (in-place bf16)
+//   fp8_per_token_block128_quant(out)   (bf16 -> e4m3 + block scale)
+// bit-for-bit: each intermediate bf16 rounding is reproduced before the fp8
+// quant, so the emitted activation + scale are identical to the chain while
+// removing two HBM round-trips of the M x K activation.
+__global__ void gelu_erf_bias_to_fp8_block128_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ bias,
+    __nv_fp8_e4m3* __restrict__ output,
+    float* __restrict__ scale,
+    int K)
+{
+  const int m = blockIdx.y;
+  const int kb = blockIdx.x;
+  const int t = threadIdx.x;
+  const int k = kb * kBlock + t;
+  const size_t idx = (size_t)m * K + k;
+  __shared__ float red[4];
+
+  const float b = __bfloat162float(__float2bfloat16(
+      __bfloat162float(input[idx]) + __bfloat162float(bias[k])));
+  const float g = __bfloat162float(__float2bfloat16(gelu_erf_f32(b)));
+  const float v = g;
+
+  const float amax = block_reduce_max_128(fabsf(v), red);
+  const float sc = fmaxf(amax / kFp8Max, 1.0e-12f);
+  if (t == 0) scale[m * (K / kBlock) + kb] = sc;
+  float q = v / sc;
+  q = fminf(fmaxf(q, -kFp8Max), kFp8Max);
+  output[idx] = __nv_fp8_e4m3(q);
+}
+
 }  // namespace
 
 void fp8_per_token_block128_quant_bf16(
@@ -648,6 +687,26 @@ void silu_mul_merged_to_fp8_block128_bf16(
   dim3 grid(K / kBlock, M);
   silu_mul_merged_to_fp8_block128_kernel<<<grid, block, 0, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(gate_up),
+      reinterpret_cast<__nv_fp8_e4m3*>(output_fp8),
+      output_scale, K);
+}
+
+void gelu_erf_bias_to_fp8_block128_bf16(
+    const void* input,
+    const void* bias,
+    void* output_fp8,
+    float* output_scale,
+    int M, int K,
+    cudaStream_t stream)
+{
+  if ((K % kBlock) != 0)
+    throw std::runtime_error(
+        "gelu_erf_bias_to_fp8_block128_bf16 requires K multiple of 128");
+  dim3 block(kBlock);
+  dim3 grid(K / kBlock, M);
+  gelu_erf_bias_to_fp8_block128_kernel<<<grid, block, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(input),
+      reinterpret_cast<const __nv_bfloat16*>(bias),
       reinterpret_cast<__nv_fp8_e4m3*>(output_fp8),
       output_scale, K);
 }

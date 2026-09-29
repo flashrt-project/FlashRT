@@ -89,5 +89,16 @@ void silu_mul_merged_to_fp8_block128_bf16(
     int M, int K,
     cudaStream_t stream);
 
+// Fused per-column bias-add + erf-GELU + block-128 FP8 quant. Bit-exact with
+// (out+bias) -> gelu_erf -> fp8_per_token_block128_quant for the same bf16
+// input, bias and K (multiple of 128).
+void gelu_erf_bias_to_fp8_block128_bf16(
+    const void* input,
+    const void* bias,
+    void*       output_fp8,
+    float*      output_scale,
+    int M, int K,
+    cudaStream_t stream);
+
 }  // namespace quantize
 }  // namespace flash_rt

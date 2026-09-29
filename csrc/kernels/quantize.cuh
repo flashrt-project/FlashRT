@@ -160,6 +160,18 @@ void bias_gelu_quant_bf16_to_nvfp4_swizzled(
     int rows, int cols,
     cudaStream_t stream = 0);
 
+// Register-resident variant: one thread per 16-element scale block; single
+// GELU pass, no shared-memory atomics, contiguous fp4 store. Same output as
+// the kernel above. rows>0, cols>0 and cols % 8 == 0 required (falls back
+// internally otherwise).
+void bias_gelu_quant_bf16_to_nvfp4_swizzled_v2(
+    const __nv_bfloat16* input,
+    const __nv_bfloat16* bias,
+    uint8_t* fp4_data,
+    uint8_t* scale_factors,
+    int rows, int cols,
+    cudaStream_t stream = 0);
+
 // Diagnostic Motus FP4 rescue helpers:
 //   gather_bf16_cols: out[row, j] = input[row, indices[j]]
 //   add_side_bias_gelu_gather_zero_quant: gelu(main + side + bias), gather
@@ -296,6 +308,17 @@ void residual_add_rms_norm_to_nvfp4_swizzled_bf16_v2(
     const __nv_bfloat16* rms_weight,
     uint8_t* packed, uint8_t* sf_swz,
     int rows, int cols, float eps,
+    cudaStream_t stream = 0);
+
+// Bit-identical to v1; register-cached residual (no h_post re-read) with a
+// dynamic per-thread count. `threads` tunes per-row parallelism (128..1024).
+void residual_add_rms_norm_to_nvfp4_swizzled_bf16_v3(
+    const __nv_bfloat16* h_in,
+    const __nv_bfloat16* attn_proj,
+    __nv_bfloat16* h_post,
+    const __nv_bfloat16* rms_weight,
+    uint8_t* packed, uint8_t* sf_swz,
+    int rows, int cols, float eps, int threads,
     cudaStream_t stream = 0);
 
 void quantize_bf16_to_mxfp8(const __nv_bfloat16* input, __nv_fp8_e4m3* fp8_data,

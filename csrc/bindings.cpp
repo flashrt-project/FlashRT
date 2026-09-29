@@ -19,6 +19,8 @@
 #include "gemm/cutlass_sm120_block128_fp8_gemm.cuh"
 #include "gemm/fp8_smallM_handtuned_sm120.cuh"
 #include "gemm/fp8_smallM_handtuned_splitk_sm120.cuh"
+#include "gemm/cutlass_sm120_block128_fp8_gemm_bias_sm120.cuh"
+#include "gemm/fp8_smallM_splitk_block128_sm120.cuh"
 #include "gemm/fp8_smallM_handtuned_ldmatrix_sm120.cuh"
 #endif
 #ifdef ENABLE_DECODE_GEMV_M1
@@ -235,6 +237,8 @@ extern "C" void flash_rt_awq_quant_fp8_static_fp16(
 #if defined(FLASHRT_HAVE_HYVLA_THOR) || defined(FLASHRT_HAVE_HYVLA_ORIN)
 #include "kernels/hyvla_fused_thor.cuh"
 #include "kernels/hyvla_vit_fuse.cuh"
+#include "kernels/hyvla_prefill_attn.cuh"
+#include "kernels/hyvla_euler.cuh"
 #ifdef FLASHRT_HAVE_HYVLA_THOR
 #include "kernels/hyvla_quant_fp8_thor.cuh"
 #include "kernels/hyvla_ffn_fp8_thor.cuh"
@@ -248,6 +252,7 @@ extern "C" void flash_rt_awq_quant_fp8_static_fp16(
 #include "kernels/rms_norm_gated_silu_qwen36.cuh"
 #endif
 #include "kernels/silu_mul_qwen36.cuh"
+#include "kernels/act_bf16.cuh"
 #include "kernels/embedding_lookup_bf16.cuh"
 #ifdef FLASHRT_HAVE_AUDIO_CODEBOOK
 #include "kernels/delayed_codebook_kernels.cuh"
@@ -302,6 +307,7 @@ extern "C" void flash_rt_awq_quant_fp8_static_fp16(
 #include "kernels/fp4_w4a4_mma_sm120.cuh"
 #include "kernels/fp4_w4a4_mma_warpsplit_sm120.cuh"
 #include "kernels/fp4_w4a4_mma_warpsplit_mrows_sm120.cuh"
+#include "kernels/fp4_w4a4_mma_cksplit_sm120.cuh"
 #include "quantize/fp8_block128_dequant.cuh"
 #ifdef FLASHRT_HAVE_NVFP4_SWIZZLE
 #include "quantize/fp8_block128_to_nvfp4_swizzled.cuh"
@@ -1420,6 +1426,21 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("fp4_data"), py::arg("scale_factors"),
         py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
 
+    m.def("bias_gelu_quant_bf16_to_nvfp4_swizzled_v2",
+        [](uintptr_t input, uintptr_t bias,
+           uintptr_t fp4_data, uintptr_t scale_factors,
+           int rows, int cols, uintptr_t stream) {
+            bias_gelu_quant_bf16_to_nvfp4_swizzled_v2(
+                typed_ptr<__nv_bfloat16>(input),
+                typed_ptr<__nv_bfloat16>(bias),
+                reinterpret_cast<uint8_t*>(fp4_data),
+                reinterpret_cast<uint8_t*>(scale_factors),
+                rows, cols, to_stream(stream));
+        },
+        py::arg("input"), py::arg("bias"),
+        py::arg("fp4_data"), py::arg("scale_factors"),
+        py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
+
     m.def("gather_bf16_cols",
         [](uintptr_t input, uintptr_t indices, uintptr_t output,
            int rows, int cols, int n_idx, uintptr_t stream) {
@@ -1619,6 +1640,28 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("packed"), py::arg("sf_swz"),
         py::arg("rows"), py::arg("cols"),
         py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+
+    // Bit-identical to v1; register-cached residual (no re-read) + dynamic
+    // per-thread count + tunable threads (128..1024). Falls back to v1.
+    m.def("residual_add_rms_norm_to_nvfp4_swizzled_bf16_v3",
+        [](uintptr_t h_in, uintptr_t attn_proj, uintptr_t h_post,
+           uintptr_t weight, uintptr_t packed, uintptr_t sf_swz,
+           int rows, int cols, float eps, int threads, uintptr_t stream) {
+            residual_add_rms_norm_to_nvfp4_swizzled_bf16_v3(
+                typed_ptr<__nv_bfloat16>(h_in),
+                typed_ptr<__nv_bfloat16>(attn_proj),
+                typed_ptr<__nv_bfloat16>(h_post),
+                typed_ptr<__nv_bfloat16>(weight),
+                reinterpret_cast<uint8_t*>(packed),
+                reinterpret_cast<uint8_t*>(sf_swz),
+                rows, cols, eps, threads, to_stream(stream));
+        },
+        py::arg("h_in"), py::arg("attn_proj"), py::arg("h_post"),
+        py::arg("weight"),
+        py::arg("packed"), py::arg("sf_swz"),
+        py::arg("rows"), py::arg("cols"),
+        py::arg("eps") = 1e-6f, py::arg("threads") = 256,
+        py::arg("stream") = 0);
 #endif
 
     // Patch embedding
@@ -3457,6 +3500,65 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                 M, K, to_stream(stream));
         },
         py::arg("input"), py::arg("output_fp8"),
+        py::arg("output_scale"),
+        py::arg("M"), py::arg("K"), py::arg("stream") = 0);
+
+    // Fused RMSNorm / residual-add+RMSNorm / SwiGLU -> block-128 FP8 quant.
+    // Each writes the FP8 activation + per-128-K-block scale consumed directly
+    // by fp8_block128_gemm_cutlass_sm120_bf16out, removing the intermediate
+    // bf16 round-trip and the standalone quant launch. K must be a multiple of
+    // 128.
+    m.def("rms_norm_to_fp8_block128_bf16",
+        [](uintptr_t input, uintptr_t weight, uintptr_t output_fp8,
+           uintptr_t output_scale, int M, int K, float eps, uintptr_t stream) {
+            flash_rt::quantize::rms_norm_to_fp8_block128_bf16(
+                to_ptr(input), to_ptr(weight), to_ptr(output_fp8),
+                reinterpret_cast<float*>(output_scale),
+                M, K, eps, to_stream(stream));
+        },
+        py::arg("input"), py::arg("weight"), py::arg("output_fp8"),
+        py::arg("output_scale"),
+        py::arg("M"), py::arg("K"), py::arg("eps") = 1e-6f,
+        py::arg("stream") = 0);
+
+    m.def("residual_add_rms_norm_to_fp8_block128_bf16",
+        [](uintptr_t residual, uintptr_t x, uintptr_t residual_out,
+           uintptr_t weight, uintptr_t output_fp8, uintptr_t output_scale,
+           int M, int K, float eps, uintptr_t stream) {
+            flash_rt::quantize::residual_add_rms_norm_to_fp8_block128_bf16(
+                to_ptr(residual), to_ptr(x), to_ptr(residual_out),
+                to_ptr(weight), to_ptr(output_fp8),
+                reinterpret_cast<float*>(output_scale),
+                M, K, eps, to_stream(stream));
+        },
+        py::arg("residual"), py::arg("x"), py::arg("residual_out"),
+        py::arg("weight"), py::arg("output_fp8"), py::arg("output_scale"),
+        py::arg("M"), py::arg("K"), py::arg("eps") = 1e-6f,
+        py::arg("stream") = 0);
+
+    m.def("silu_mul_merged_to_fp8_block128_bf16",
+        [](uintptr_t gate_up, uintptr_t output_fp8, uintptr_t output_scale,
+           int M, int K, uintptr_t stream) {
+            flash_rt::quantize::silu_mul_merged_to_fp8_block128_bf16(
+                to_ptr(gate_up), to_ptr(output_fp8),
+                reinterpret_cast<float*>(output_scale),
+                M, K, to_stream(stream));
+        },
+        py::arg("gate_up"), py::arg("output_fp8"), py::arg("output_scale"),
+        py::arg("M"), py::arg("K"), py::arg("stream") = 0);
+
+    // Fused per-column bias-add + erf-GELU + block-128 FP8 quant (bit-exact
+    // with out+bias -> gelu_erf -> fp8_per_token_block128_quant). Removes the
+    // standalone bias-add + gelu + quant kernels for the ViT fc1->fc2 path.
+    m.def("gelu_erf_bias_to_fp8_block128_bf16",
+        [](uintptr_t input, uintptr_t bias, uintptr_t output_fp8,
+           uintptr_t output_scale, int M, int K, uintptr_t stream) {
+            flash_rt::quantize::gelu_erf_bias_to_fp8_block128_bf16(
+                to_ptr(input), to_ptr(bias), to_ptr(output_fp8),
+                reinterpret_cast<float*>(output_scale),
+                M, K, to_stream(stream));
+        },
+        py::arg("input"), py::arg("bias"), py::arg("output_fp8"),
         py::arg("output_scale"),
         py::arg("M"), py::arg("K"), py::arg("stream") = 0);
 
@@ -5700,6 +5802,32 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("gate"), py::arg("up"), py::arg("out"),
         py::arg("n"), py::arg("stream") = 0);
 
+    // Framework-free elementwise activations (shared hot path).
+    m.def("silu_bf16",
+        [](uintptr_t x, int n, uintptr_t stream) {
+            flash_rt::kernels::silu_bf16(
+                reinterpret_cast<__nv_bfloat16*>(x), n, to_stream(stream));
+        },
+        py::arg("x"), py::arg("n"), py::arg("stream") = 0);
+
+    m.def("gelu_erf_bf16",
+        [](uintptr_t x, int n, uintptr_t stream) {
+            flash_rt::kernels::gelu_erf_bf16(
+                reinterpret_cast<__nv_bfloat16*>(x), n, to_stream(stream));
+        },
+        py::arg("x"), py::arg("n"), py::arg("stream") = 0);
+
+    m.def("silu_mul_merged_bf16",
+        [](uintptr_t merged, uintptr_t out,
+           int seq, int half_dim, uintptr_t stream) {
+            flash_rt::kernels::silu_mul_merged_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(merged),
+                reinterpret_cast<__nv_bfloat16*>(out),
+                seq, half_dim, to_stream(stream));
+        },
+        py::arg("merged"), py::arg("out"),
+        py::arg("seq"), py::arg("half_dim"), py::arg("stream") = 0);
+
     m.def("sigmoid_mul_qwen36_bf16",
         [](uintptr_t gate, uintptr_t x, uintptr_t out,
            int n, uintptr_t stream) {
@@ -7087,6 +7215,24 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("act_block_scale"), py::arg("w_block_scale"),
         py::arg("stream") = 0);
 
+    // Same GEMM with a per-column (N,) bf16 bias fused in the epilogue.
+    m.def("fp8_block128_gemm_cutlass_sm120_bf16out_bias",
+        [](uintptr_t A, uintptr_t B, uintptr_t D, uintptr_t bias,
+           int M, int N, int K,
+           uintptr_t act_scale, uintptr_t w_scale,
+           uintptr_t stream) {
+            flash_rt::gemm::fp8_block128_gemm_cutlass_sm120_bf16out_bias(
+                to_ptr(A), to_ptr(B), to_ptr(D), to_ptr(bias),
+                M, N, K,
+                reinterpret_cast<const float*>(act_scale),
+                reinterpret_cast<const float*>(w_scale),
+                to_stream(stream));
+        },
+        py::arg("A"), py::arg("B"), py::arg("D"), py::arg("bias"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("act_block_scale"), py::arg("w_block_scale"),
+        py::arg("stream") = 0);
+
 
     // Hand-tuned inline-PTX FP8 GEMM (no cutlass scaffold).
 #define BIND_HANDTUNED(NAME)                                                 \
@@ -7223,6 +7369,23 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     BIND_SPLITK(splitk_fp8_gemm_32x64x128_w4);
 
 #undef BIND_SPLITK
+
+    // Block-128-scaled split-K: A/B block-128 FP8 + (M,K/128)/(N/128,K/128)
+    // fp32 scales. alpha is folded into the scales (pass 1).
+    m.def("splitk_b128_fp8_gemm_32x64x128_w4",
+        [](uintptr_t A, uintptr_t B, uintptr_t AS, uintptr_t WS, uintptr_t D,
+           int M, int N, int K, int Kb, int k_split, uintptr_t scratch,
+           uintptr_t stream) {
+            return flash_rt::gemm::smallM_splitk::splitk_b128_fp8_gemm_32x64x128_w4(
+                to_ptr(A), to_ptr(B),
+                reinterpret_cast<const float*>(AS),
+                reinterpret_cast<const float*>(WS),
+                to_ptr(D), M, N, K, Kb, k_split, to_ptr(scratch),
+                to_stream(stream));
+        },
+        py::arg("A"), py::arg("B"), py::arg("AS"), py::arg("WS"), py::arg("D"),
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("Kb"),
+        py::arg("k_split"), py::arg("scratch"), py::arg("stream") = 0);
 #endif  // ENABLE_CUTLASS_SM120_BLOCK_FP8
 
 #ifdef FLASHRT_PI05_DECODER_SKINNY_SM120
@@ -7590,6 +7753,19 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("alpha") = 1.0f,
         py::arg("stream") = 0);
 
+    m.def("fp4_w4a16_gemm_sm120_bf16out_bias",
+        [](uintptr_t A_packed, uintptr_t B_packed, uintptr_t D,
+           uintptr_t bias, int M, int N, int K,
+           uintptr_t SFA, uintptr_t SFB, float alpha, uintptr_t stream) {
+            flash_rt::gemm::fp4_w4a16_gemm_sm120_bf16out_bias(
+                to_ptr(A_packed), to_ptr(B_packed), to_ptr(D), to_ptr(bias),
+                M, N, K, to_ptr(SFA), to_ptr(SFB), alpha, to_stream(stream));
+        },
+        py::arg("A_packed"), py::arg("B_packed"), py::arg("D"),
+        py::arg("bias"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("SFA"), py::arg("SFB"),
+        py::arg("alpha") = 1.0f, py::arg("stream") = 0);
+
     m.def("fp4_w4a16_gemm_residual_sm120_bf16out",
         [](uintptr_t A_packed, uintptr_t B_packed, uintptr_t C_residual,
            uintptr_t D, int M, int N, int K,
@@ -7646,6 +7822,19 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("SFA"), py::arg("SFB"),
         py::arg("alpha") = 1.0f,
         py::arg("stream") = 0);
+
+    m.def("fp4_w4a16_gemm_sm120_bf16out_pingpong_bias",
+        [](uintptr_t A_packed, uintptr_t B_packed, uintptr_t D,
+           uintptr_t bias, int M, int N, int K,
+           uintptr_t SFA, uintptr_t SFB, float alpha, uintptr_t stream) {
+            flash_rt::gemm::fp4_w4a16_gemm_sm120_bf16out_pingpong_bias(
+                to_ptr(A_packed), to_ptr(B_packed), to_ptr(D), to_ptr(bias),
+                M, N, K, to_ptr(SFA), to_ptr(SFB), alpha, to_stream(stream));
+        },
+        py::arg("A_packed"), py::arg("B_packed"), py::arg("D"),
+        py::arg("bias"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("SFA"), py::arg("SFB"),
+        py::arg("alpha") = 1.0f, py::arg("stream") = 0);
 
     // Recipe C step 1: NVFP4 W4A16 GEMM with fused per-col bias + GELU(tanh)
     // epilogue, BF16 output. Replaces (cutlass GEMM_up + bias_gelu_inplace)
@@ -8042,6 +8231,27 @@ a full 16-row tile, so M<=16 rows cost the same weight HBM as M=1; combined with
 warp-split-K (K split across `warps`, partials summed in shared memory ->
 graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
 (K/64)%warps==0; warps in {2,4,8}; stages in {3,4,6}.
+)pbdoc");
+
+    m.def("fp4_w4a4_mma_sm120_cksplit_bf16out",
+        [](uintptr_t A, uintptr_t B, uintptr_t D, int M, int N, int K,
+           uintptr_t SFA, uintptr_t SFB, float alpha, int cols, int kg,
+           int stages, uintptr_t stream) -> int {
+            return flash_rt::gemm::fp4_w4a4_mma_cksplit_bf16out(
+                to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, to_ptr(SFA),
+                to_ptr(SFB), alpha, cols, kg, stages, to_stream(stream));
+        },
+        py::arg("A"), py::arg("B"), py::arg("D"), py::arg("M"), py::arg("N"),
+        py::arg("K"), py::arg("SFA"), py::arg("SFB"), py::arg("alpha") = 1.0f,
+        py::arg("cols") = 32, py::arg("kg") = 2, py::arg("stages") = 3,
+        py::arg("stream") = 0,
+        R"pbdoc(
+NVFP4 W4A4 small-M (M<=48) col-tile x K-group split GEMM (SM120) for the
+narrow-N long-K expert o/dn shapes (M=41, N=1024, K=2048). A block owns `cols`
+N-columns and splits K into `kg` groups; each K group's col-tiles share the
+same A/SFA smem tile, so A is read once per block. K-group partials are summed
+in shared memory (graph-replay safe). Configs: cols in {16,32,64}, kg in {2,4},
+stages in {2,3}. M in 1..48; K%64==0; (K/64)%kg==0; N%cols==0.
 )pbdoc");
 
 #endif
@@ -9128,6 +9338,146 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
         "Hy-VLA fused RoPE(q,k)+QK-Norm(q,k)+KV-write megakernel (bf16). "
         "kv_rep>1 stores the KV cache pre-expanded for GQA.");
 
+    m.def("hyvla_rope_qknorm_kvwrite_parallel_bf16",
+        [](uintptr_t qkv, uintptr_t cos, uintptr_t sin, uintptr_t qn_w,
+           uintptr_t kn_w, uintptr_t q_out, uintptr_t kbuf, uintptr_t vbuf,
+           int S, int nq, int nkv, int hd, int S_tot, int off, float eps,
+           int kv_rep, uintptr_t stream) {
+            if (S <= 0 || nq <= 0 || nkv <= 0 || S_tot <= 0)
+                throw py::value_error(
+                    "hyvla_rope_qknorm_kvwrite_parallel_bf16 requires S>0, "
+                    "nq>0, nkv>0, S_tot>0");
+            if (hd != 128)
+                throw py::value_error(
+                    "hyvla_rope_qknorm_kvwrite_parallel_bf16 supports hd==128 "
+                    "only, got " + std::to_string(hd));
+            if (off < 0 || S > S_tot || off > S_tot - S)
+                throw py::value_error(
+                    "hyvla_rope_qknorm_kvwrite_parallel_bf16: invalid offset "
+                    "window off=" + std::to_string(off) + " S=" +
+                    std::to_string(S) + " S_tot=" + std::to_string(S_tot));
+            if (!(eps > 0.f))
+                throw py::value_error(
+                    "hyvla_rope_qknorm_kvwrite_parallel_bf16 requires eps>0");
+            if (kv_rep < 1)
+                throw py::value_error(
+                    "hyvla_rope_qknorm_kvwrite_parallel_bf16 requires "
+                    "kv_rep>=1");
+            if (nq % nkv != 0 || nq / nkv != kv_rep)
+                throw py::value_error(
+                    "hyvla_rope_qknorm_kvwrite_parallel_bf16 requires "
+                    "nq == nkv * kv_rep; got nq=" + std::to_string(nq) +
+                    " nkv=" + std::to_string(nkv) +
+                    " kv_rep=" + std::to_string(kv_rep));
+            hyvla_rope_qknorm_kvwrite_parallel_bf16(
+                reinterpret_cast<const void*>(qkv),
+                reinterpret_cast<const void*>(cos),
+                reinterpret_cast<const void*>(sin),
+                reinterpret_cast<const void*>(qn_w),
+                reinterpret_cast<const void*>(kn_w),
+                reinterpret_cast<void*>(q_out),
+                reinterpret_cast<void*>(kbuf),
+                reinterpret_cast<void*>(vbuf),
+                S, nq, nkv, hd, S_tot, off, eps, kv_rep, to_stream(stream));
+        },
+        py::arg("qkv"), py::arg("cos"), py::arg("sin"), py::arg("qn_w"),
+        py::arg("kn_w"), py::arg("q_out"), py::arg("kbuf"), py::arg("vbuf"),
+        py::arg("S"), py::arg("nq"), py::arg("nkv"), py::arg("hd"),
+        py::arg("S_tot"), py::arg("off"), py::arg("eps") = 1e-5f,
+        py::arg("kv_rep") = 1, py::arg("stream") = 0,
+        "Hy-VLA fused RoPE(q,k)+QK-Norm(q,k)+KV-write (bf16), parallel-head "
+        "grid (S, nq+2*nkv); bit-exact with hyvla_rope_qknorm_kvwrite_bf16.");
+
+    m.def("hyvla_rope_qknorm_kvwrite_qb_bf16",
+        [](uintptr_t qkv, uintptr_t cos, uintptr_t sin, uintptr_t qn_w,
+           uintptr_t kn_w, uintptr_t qb, uintptr_t kbuf, uintptr_t vbuf,
+           int S, int nq, int nkv, int hd, int S_tot, int off, float eps,
+           int kv_rep, uintptr_t stream) {
+            if (S <= 0 || nq <= 0 || nkv <= 0 || S_tot <= 0)
+                throw py::value_error(
+                    "hyvla_rope_qknorm_kvwrite_qb_bf16 requires S>0, nq>0, "
+                    "nkv>0, S_tot>0");
+            if (hd != 128)
+                throw py::value_error(
+                    "hyvla_rope_qknorm_kvwrite_qb_bf16 supports hd==128 only, "
+                    "got " + std::to_string(hd));
+            if (off < 0 || S > S_tot || off > S_tot - S)
+                throw py::value_error(
+                    "hyvla_rope_qknorm_kvwrite_qb_bf16: invalid offset window "
+                    "off=" + std::to_string(off) + " S=" + std::to_string(S) +
+                    " S_tot=" + std::to_string(S_tot));
+            if (!(eps > 0.f))
+                throw py::value_error(
+                    "hyvla_rope_qknorm_kvwrite_qb_bf16 requires eps>0");
+            if (kv_rep < 1)
+                throw py::value_error(
+                    "hyvla_rope_qknorm_kvwrite_qb_bf16 requires kv_rep>=1");
+            if (nq % nkv != 0 || nq / nkv != kv_rep)
+                throw py::value_error(
+                    "hyvla_rope_qknorm_kvwrite_qb_bf16 requires "
+                    "nq == nkv * kv_rep; got nq=" + std::to_string(nq) +
+                    " nkv=" + std::to_string(nkv) +
+                    " kv_rep=" + std::to_string(kv_rep));
+            hyvla_rope_qknorm_kvwrite_qb_bf16(
+                reinterpret_cast<const void*>(qkv),
+                reinterpret_cast<const void*>(cos),
+                reinterpret_cast<const void*>(sin),
+                reinterpret_cast<const void*>(qn_w),
+                reinterpret_cast<const void*>(kn_w),
+                reinterpret_cast<void*>(qb),
+                reinterpret_cast<void*>(kbuf),
+                reinterpret_cast<void*>(vbuf),
+                S, nq, nkv, hd, S_tot, off, eps, kv_rep, to_stream(stream));
+        },
+        py::arg("qkv"), py::arg("cos"), py::arg("sin"), py::arg("qn_w"),
+        py::arg("kn_w"), py::arg("qb"), py::arg("kbuf"), py::arg("vbuf"),
+        py::arg("S"), py::arg("nq"), py::arg("nkv"), py::arg("hd"),
+        py::arg("S_tot"), py::arg("off"), py::arg("eps") = 1e-5f,
+        py::arg("kv_rep") = 1, py::arg("stream") = 0,
+        "Hy-VLA fused RoPE(q,k)+QK-Norm(q,k)+KV-write (bf16) writing Q directly "
+        "in the FA2 denoise (2,S,nq,hd) packing (replaces the prepare_q pass).");
+
+    m.def("hyvla_prefill_attn_bf16",
+        [](uintptr_t q, uintptr_t k, uintptr_t v, uintptr_t o,
+           uintptr_t mask, uintptr_t active, int S, int H, float scale,
+           int q_stride_h, int k_stride_h, int v_stride_h, uintptr_t stream) {
+            if (S <= 0 || H <= 0)
+                throw py::value_error(
+                    "hyvla_prefill_attn_bf16 requires S>0, H>0");
+            hyvla_prefill_attn_bf16(
+                reinterpret_cast<const void*>(q),
+                reinterpret_cast<const void*>(k),
+                reinterpret_cast<const void*>(v),
+                reinterpret_cast<void*>(o),
+                reinterpret_cast<const void*>(mask),
+                reinterpret_cast<const void*>(active),
+                S, H, scale, q_stride_h, k_stride_h, v_stride_h,
+                to_stream(stream));
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("o"),
+        py::arg("mask"), py::arg("active"), py::arg("S"), py::arg("H"),
+        py::arg("scale") = 1.0f,
+        py::arg("q_stride_h"), py::arg("k_stride_h"), py::arg("v_stride_h"),
+        py::arg("stream") = 0,
+        "Hy-VLA prefill block-sparse segment-mask attention (bf16, SM80 WMMA). "
+        "q/k/v are (H,S,128) row-major with d-stride 1 and row-stride 128; "
+        "*_stride_h is the head stride. O is written (S,H,128) row-major "
+        "(consumer layout). mask is (S,S) fp32 additive (0/-inf); "
+        "active is a (ceil(S/64),H) uint32 bitmask of active key blocks.");
+
+    m.def("hyvla_euler_update_bf16_fp32",
+        [](uintptr_t x, uintptr_t v, uintptr_t x_bf16, float dt, long n,
+           uintptr_t stream) {
+            hyvla_euler_update_bf16_fp32(
+                reinterpret_cast<void*>(x),
+                reinterpret_cast<const void*>(v),
+                reinterpret_cast<void*>(x_bf16), dt, n, to_stream(stream));
+        },
+        py::arg("x"), py::arg("v"), py::arg("x_bf16"), py::arg("dt"),
+        py::arg("n"), py::arg("stream") = 0,
+        "Hy-VLA denoise Euler update: x_fp32 += dt * (float)v_bf16, also "
+        "emitting a bf16 copy; v=0/dt=0 only refreshes the bf16 copy.");
+
     m.def("hyvla_vit_add_layer_norm_bf16",
         [](uintptr_t residual, uintptr_t x_add, uintptr_t ln_weight,
            uintptr_t ln_bias, uintptr_t out, int rows, int dim, float eps,
@@ -9151,6 +9501,278 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
         py::arg("ln_bias"), py::arg("out"), py::arg("rows"), py::arg("dim"),
         py::arg("eps") = 1e-6f, py::arg("stream") = 0,
         "Hy-VLA ViT fused residual-add (bf16 round, in-place) + LayerNorm.");
+
+    m.def("hyvla_vit_res_add_ln_time_bf16",
+        [](uintptr_t residual, uintptr_t x_add, uintptr_t pe,
+           uintptr_t ln_weight, uintptr_t ln_bias, uintptr_t out,
+           int rows, int dim, int n, int kf, float eps, uintptr_t stream) {
+            if (rows <= 0 || dim <= 0 || (dim & 1) != 0)
+                throw py::value_error(
+                    "hyvla_vit_res_add_ln_time_bf16 requires rows>0 and a "
+                    "positive even dim");
+            hyvla_vit_res_add_ln_time_bf16(
+                reinterpret_cast<void*>(residual),
+                reinterpret_cast<const void*>(x_add),
+                reinterpret_cast<const void*>(pe),
+                reinterpret_cast<const void*>(ln_weight),
+                reinterpret_cast<const void*>(ln_bias),
+                reinterpret_cast<void*>(out), rows, dim, n, kf, eps,
+                to_stream(stream));
+        },
+        py::arg("residual"), py::arg("x_add"), py::arg("pe"),
+        py::arg("ln_weight"), py::arg("ln_bias"), py::arg("out"),
+        py::arg("rows"), py::arg("dim"), py::arg("n"), py::arg("kf"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "Hy-VLA ViT spacetime fused residual-add (in-place) + "
+        "LayerNorm(residual + time_pe); x_add may be 0 to skip the add.");
+
+    m.def("hyvla_vit_tail_slice_bf16",
+        [](uintptr_t x, uintptr_t x_add, uintptr_t out,
+           int num_cam, int K, int n, int d, uintptr_t stream) {
+            hyvla_vit_tail_slice_bf16(
+                reinterpret_cast<const void*>(x),
+                reinterpret_cast<const void*>(x_add),
+                reinterpret_cast<void*>(out), num_cam, K, n, d,
+                to_stream(stream));
+        },
+        py::arg("x"), py::arg("x_add"), py::arg("out"),
+        py::arg("num_cam"), py::arg("K"), py::arg("n"), py::arg("d"),
+        py::arg("stream") = 0,
+        "Hy-VLA ViT tail: out(num_cam,n,d) = last history frame of (x + x_add); "
+        "x/x_add are (num_cam*K,n,d), x_add may be 0.");
+
+    m.def("hyvla_vit_pos_add_bf16",
+        [](uintptr_t xbuf, uintptr_t pe, uintptr_t out,
+           int B, int n, int d, uintptr_t stream) {
+            hyvla_vit_pos_add_bf16(
+                reinterpret_cast<const void*>(xbuf),
+                reinterpret_cast<const void*>(pe),
+                reinterpret_cast<void*>(out), B, n, d, to_stream(stream));
+        },
+        py::arg("xbuf"), py::arg("pe"), py::arg("out"),
+        py::arg("B"), py::arg("n"), py::arg("d"), py::arg("stream") = 0,
+        "Hy-VLA ViT patch+pos embedding: out(B,n,d) = xbuf(B,d,n)^T + pe(n,d).");
+
+    m.def("hyvla_vit_patch_bias_bf16",
+        [](uintptr_t y, uintptr_t bias, int B, int C, int H, int W,
+           uintptr_t stream) {
+            hyvla_vit_patch_bias_bf16(
+                reinterpret_cast<void*>(y),
+                reinterpret_cast<const void*>(bias), B, C, H, W,
+                to_stream(stream));
+        },
+        py::arg("y"), py::arg("bias"), py::arg("B"), py::arg("C"),
+        py::arg("H"), py::arg("W"), py::arg("stream") = 0,
+        "Hy-VLA ViT patch-embed bias add: y(B,C,H,W) += bias(C,).");
+
+    m.def("hyvla_merger_pool_bf16",
+        [](uintptr_t x, uintptr_t new_x, uintptr_t fused,
+           int B, int H, int W, int C, uintptr_t stream) {
+            hyvla_merger_pool_bf16(
+                reinterpret_cast<const void*>(x),
+                reinterpret_cast<void*>(new_x),
+                reinterpret_cast<void*>(fused), B, H, W, C,
+                to_stream(stream));
+        },
+        py::arg("x"), py::arg("new_x"), py::arg("fused"),
+        py::arg("B"), py::arg("H"), py::arg("W"), py::arg("C"),
+        py::arg("stream") = 0,
+        "Hy-VLA merger pool: new_x(B,H/2,W/2,4,C), fused(B,H/2,W/2,4,2C).");
+
+    m.def("hyvla_merger_gate_bf16",
+        [](uintptr_t score, uintptr_t new_x, uintptr_t out,
+           int B, int h, int w, int C, uintptr_t stream) {
+            hyvla_merger_gate_bf16(
+                reinterpret_cast<const void*>(score),
+                reinterpret_cast<const void*>(new_x),
+                reinterpret_cast<void*>(out), B, h, w, C, to_stream(stream));
+        },
+        py::arg("score"), py::arg("new_x"), py::arg("out"),
+        py::arg("B"), py::arg("h"), py::arg("w"), py::arg("C"),
+        py::arg("stream") = 0,
+        "Hy-VLA merger gate: out = sum_g new_x[g]*softmax_g(score).");
+
+    m.def("hyvla_prefix_scatter_bf16",
+        [](uintptr_t merged, uintptr_t buf, uintptr_t dest, int nt, int C,
+           uintptr_t stream) {
+            hyvla_prefix_scatter_bf16(
+                reinterpret_cast<const void*>(merged),
+                reinterpret_cast<void*>(buf),
+                reinterpret_cast<const void*>(dest), nt, C, to_stream(stream));
+        },
+        py::arg("merged"), py::arg("buf"), py::arg("dest"),
+        py::arg("nt"), py::arg("C"), py::arg("stream") = 0,
+        "Hy-VLA prefix scatter: buf[dest[j], :] = merged[j, :].");
+
+    m.def("hyvla_vit_add_layer_norm_to_fp8_block128_bf16",
+        [](uintptr_t residual, uintptr_t x_add, uintptr_t ln_weight,
+           uintptr_t ln_bias, uintptr_t out_fp8, uintptr_t scale,
+           int rows, int dim, float eps, uintptr_t stream) {
+            if (rows <= 0 || dim <= 0 || (dim % 128) != 0)
+                throw py::value_error(
+                    "hyvla_vit_add_layer_norm_to_fp8_block128_bf16 requires "
+                    "rows>0 and a dim multiple of 128");
+            if (!(eps > 0.f))
+                throw py::value_error(
+                    "hyvla_vit_add_layer_norm_to_fp8_block128_bf16 requires "
+                    "eps>0");
+            hyvla_vit_add_layer_norm_to_fp8_block128_bf16(
+                reinterpret_cast<void*>(residual),
+                reinterpret_cast<const void*>(x_add),
+                reinterpret_cast<const void*>(ln_weight),
+                reinterpret_cast<const void*>(ln_bias),
+                reinterpret_cast<void*>(out_fp8),
+                reinterpret_cast<float*>(scale),
+                rows, dim, eps, to_stream(stream));
+        },
+        py::arg("residual"), py::arg("x_add"), py::arg("ln_weight"),
+        py::arg("ln_bias"), py::arg("out_fp8"), py::arg("scale"),
+        py::arg("rows"), py::arg("dim"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "Hy-VLA ViT fused residual-add + LayerNorm + block-128 FP8 quant.");
+
+    m.def("hyvla_fa2_denoise_gather_o_fp8_block128_bf16",
+        [](uintptr_t ob, uintptr_t a8, uintptr_t ascale, int S, int H, int D,
+           uintptr_t stream) {
+            if (S <= 0 || H <= 0 || D <= 0 || (H * D) % 128 != 0)
+                throw py::value_error(
+                    "hyvla_fa2_denoise_gather_o_fp8_block128_bf16 requires "
+                    "S,H,D>0 and (H*D)%128==0");
+            hyvla_fa2_denoise_gather_o_fp8_block128_bf16(
+                reinterpret_cast<const void*>(ob),
+                reinterpret_cast<void*>(a8), reinterpret_cast<void*>(ascale),
+                S, H, D, to_stream(stream));
+        },
+        py::arg("ob"), py::arg("a8"), py::arg("ascale"),
+        py::arg("S"), py::arg("H"), py::arg("D"), py::arg("stream") = 0,
+        "Hy-VLA denoise FA2 output gather + block-128 FP8 quant.");
+
+    m.def("hyvla_fa2_denoise_gather_o_nvfp4_bf16",
+        [](uintptr_t ob, uintptr_t packed, uintptr_t sf_swz, int S, int H,
+           int D, uintptr_t stream) {
+            if (S <= 0 || H <= 0 || D <= 0 || (H * D) % 16 != 0)
+                throw py::value_error(
+                    "hyvla_fa2_denoise_gather_o_nvfp4_bf16 requires "
+                    "S,H,D>0 and (H*D)%16==0");
+            hyvla_fa2_denoise_gather_o_nvfp4_bf16(
+                reinterpret_cast<const void*>(ob),
+                reinterpret_cast<void*>(packed), reinterpret_cast<void*>(sf_swz),
+                S, H, D, to_stream(stream));
+        },
+        py::arg("ob"), py::arg("packed"), py::arg("sf_swz"),
+        py::arg("S"), py::arg("H"), py::arg("D"), py::arg("stream") = 0,
+        "Hy-VLA denoise FA2 output gather + NVFP4 swizzled quant.");
+
+    m.def("hyvla_vit_proj_gather_nvfp4_swizzled_bf16",
+        [](uintptr_t o, uintptr_t out_fp4, uintptr_t out_sfa, int bk, int H,
+           int N, int Ds, int Dh, uintptr_t stream) {
+            hyvla_vit_proj_gather_nvfp4_swizzled_bf16(
+                reinterpret_cast<const void*>(o),
+                reinterpret_cast<void*>(out_fp4),
+                reinterpret_cast<void*>(out_sfa), bk, H, N, Ds, Dh,
+                to_stream(stream));
+        },
+        py::arg("o"), py::arg("out_fp4"), py::arg("out_sfa"), py::arg("bk"),
+        py::arg("H"), py::arg("N"), py::arg("Ds"), py::arg("Dh"),
+        py::arg("stream") = 0,
+        "Hy-VLA ViT spatial-output gather + NVFP4 swizzled quant.");
+
+    m.def("hyvla_resize_pad_bilinear_bf16",
+        [](uintptr_t in, uintptr_t out, int B, int Cc, int H, int W,
+           int RH, int RW, int OH, int OW, int pad_top, int pad_left,
+           float pad_value, uintptr_t stream) {
+            hyvla_resize_pad_bilinear_bf16(
+                reinterpret_cast<const void*>(in),
+                reinterpret_cast<void*>(out), B, Cc, H, W, RH, RW, OH, OW,
+                pad_top, pad_left, pad_value, to_stream(stream));
+        },
+        py::arg("in"), py::arg("out"), py::arg("B"), py::arg("Cc"),
+        py::arg("H"), py::arg("W"), py::arg("RH"), py::arg("RW"),
+        py::arg("OH"), py::arg("OW"), py::arg("pad_top"), py::arg("pad_left"),
+        py::arg("pad_value") = 0.0f, py::arg("stream") = 0,
+        "Hy-VLA aspect-preserving bilinear resize + centre pad (bf16).");
+
+    m.def("hyvla_resize_pad_bilinear_scale_bf16",
+        [](uintptr_t in, uintptr_t out, int B, int Cc, int H, int W,
+           int RH, int RW, int OH, int OW, int pad_top, int pad_left,
+           float pad_value, float scale, float offset, uintptr_t stream) {
+            hyvla_resize_pad_bilinear_scale_bf16(
+                reinterpret_cast<const void*>(in),
+                reinterpret_cast<void*>(out), B, Cc, H, W, RH, RW, OH, OW,
+                pad_top, pad_left, pad_value, scale, offset, to_stream(stream));
+        },
+        py::arg("in"), py::arg("out"), py::arg("B"), py::arg("Cc"),
+        py::arg("H"), py::arg("W"), py::arg("RH"), py::arg("RW"),
+        py::arg("OH"), py::arg("OW"), py::arg("pad_top"), py::arg("pad_left"),
+        py::arg("pad_value") = 0.0f, py::arg("scale") = 1.0f,
+        py::arg("offset") = 0.0f, py::arg("stream") = 0,
+        "Hy-VLA resize+pad with a fused affine: out = resize(...)*scale + offset.");
+
+    m.def("hyvla_vit_add_layer_norm_to_nvfp4_swizzled_bf16",
+        [](uintptr_t residual, uintptr_t x_add, uintptr_t ln_weight,
+           uintptr_t ln_bias, uintptr_t out_fp4, uintptr_t out_sfa,
+           int rows, int dim, float eps, uintptr_t stream) {
+            if (rows <= 0 || dim <= 0 || (dim % 16) != 0)
+                throw py::value_error(
+                    "hyvla_vit_add_layer_norm_to_nvfp4_swizzled_bf16 requires "
+                    "rows>0 and dim%16==0");
+            if (!(eps > 0.f))
+                throw py::value_error(
+                    "hyvla_vit_add_layer_norm_to_nvfp4_swizzled_bf16 requires "
+                    "eps>0");
+            hyvla_vit_add_layer_norm_to_nvfp4_swizzled_bf16(
+                reinterpret_cast<void*>(residual),
+                reinterpret_cast<const void*>(x_add),
+                reinterpret_cast<const void*>(ln_weight),
+                reinterpret_cast<const void*>(ln_bias),
+                reinterpret_cast<void*>(out_fp4),
+                reinterpret_cast<void*>(out_sfa),
+                rows, dim, eps, to_stream(stream));
+        },
+        py::arg("residual"), py::arg("x_add"), py::arg("ln_weight"),
+        py::arg("ln_bias"), py::arg("out_fp4"), py::arg("out_sfa"),
+        py::arg("rows"), py::arg("dim"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "Hy-VLA ViT fused residual-add + LayerNorm + NVFP4 swizzled quant.");
+
+    m.def("hyvla_vit_temporal_mix_bf16",
+        [](uintptr_t q, uintptr_t k, uintptr_t v, uintptr_t out,
+           int b, int kf, int H, int N, int D,
+           int64_t s_bk, int64_t s_h, int64_t s_n,
+           float scale, uintptr_t stream) {
+            if (b <= 0 || H <= 0 || N <= 0 || D <= 0 || kf < 1 || kf > 8 ||
+                D > 128)
+                throw py::value_error(
+                    "hyvla_vit_temporal_mix_bf16 requires b,H,N,D>0, "
+                    "1<=kf<=8 and D<=128");
+            hyvla_vit_temporal_mix_bf16(
+                reinterpret_cast<const void*>(q),
+                reinterpret_cast<const void*>(k),
+                reinterpret_cast<const void*>(v),
+                reinterpret_cast<void*>(out),
+                b, kf, H, N, D, (long)s_bk, (long)s_h, (long)s_n, scale,
+                to_stream(stream));
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("out"),
+        py::arg("b"), py::arg("kf"), py::arg("H"), py::arg("N"), py::arg("D"),
+        py::arg("s_bk"), py::arg("s_h"), py::arg("s_n"),
+        py::arg("scale") = 1.0f, py::arg("stream") = 0,
+        "Hy-VLA ViT spacetime causal-in-time mix (bf16). q/k/v are "
+        "(b*kf,H,N,D) with caller strides; out is contiguous that shape.");
+
+    m.def("hyvla_fa2_denoise_prepare_q_bf16",
+        [](uintptr_t q, uintptr_t qb, int S, int H, int D, uintptr_t stream) {
+            if (S <= 1 || H <= 0 || D <= 0)
+                throw py::value_error(
+                    "hyvla_fa2_denoise_prepare_q_bf16 requires S>1, H>0, D>0");
+            hyvla_fa2_denoise_prepare_q_bf16(
+                reinterpret_cast<const void*>(q),
+                reinterpret_cast<void*>(qb), S, H, D, to_stream(stream));
+        },
+        py::arg("q"), py::arg("qb"), py::arg("S"), py::arg("H"), py::arg("D"),
+        py::arg("stream") = 0,
+        "Hy-VLA FA2 denoise query gather: q (1,H,S,D) -> qb (2,S,H,D); writes "
+        "only non-dummy rows (qb must be pre-zeroed).");
 
 #ifdef FLASHRT_HAVE_HYVLA_THOR
     m.def("hyvla_quant_fp8_dyn_bf16",

@@ -1234,6 +1234,87 @@ void bias_gelu_quant_bf16_to_nvfp4_swizzled(
             n_row_blocks, n_col_blocks);
 }
 
+// Register-resident variant: one thread owns one 16-element scale block, so
+// (a) each input element is read and GELU'd exactly once, (b) the per-block
+// amax is a thread-local max with no shared-memory atomics, and (c) the fp4
+// write is a contiguous 8-byte store. Bit-identical output to the atomic
+// kernel above (same gelu/scale/rounding helpers). Requires cols % 8 == 0 and
+// a 16-byte-aligned input base, which the ViT fc2 producer satisfies.
+template <bool UseAwq>
+__global__ void bias_gelu_quant_bf16_to_nvfp4_swizzled_v2_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ bias,
+    const __nv_bfloat16* __restrict__ inv_s,
+    uint8_t* __restrict__ fp4_data,
+    uint8_t* __restrict__ scale_factors,
+    int rows, int cols, int num_blocks, int n_col_blocks)
+{
+    const long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long total = (long long)rows * num_blocks;
+    if (g >= total) return;
+    const int row = (int)(g / num_blocks);
+    const int b = (int)(g - (long long)row * num_blocks);
+
+    const __nv_bfloat16* row_in = input + (size_t)row * cols + b * 16;
+    const __nv_bfloat16* bia = bias + b * 16;
+
+    float v[16];
+    float amax = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        float x = __bfloat162float(row_in[j]) + __bfloat162float(bia[j]);
+        x = gelu_tanh_nvfp4(x);
+        if constexpr (UseAwq) {
+            x *= __bfloat162float(inv_s[b * 16 + j]);
+        }
+        v[j] = x;
+        amax = fmaxf(amax, fabsf(x));
+    }
+
+    const uint8_t ue_scale = float_to_ue4m3_ceil(amax / 6.0f);
+    const float scale = ue4m3_to_float(ue_scale);
+    const float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+
+    const int rb = row >> 7;
+    const int ri = row & 127;
+    const int cb = b >> 2;
+    const int ci = b & 3;
+    const int out_idx = (rb * n_col_blocks + cb) * 512
+        + (ri & 31) * 16 + (ri >> 5) * 4 + ci;
+    scale_factors[out_idx] = ue_scale;
+
+    uint8_t* out = fp4_data + (size_t)row * (cols >> 1) + b * 8;
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        uint8_t lo = float_to_fp4_e2m1(v[2 * j] * inv_scale);
+        uint8_t hi = float_to_fp4_e2m1(v[2 * j + 1] * inv_scale);
+        out[j] = (uint8_t)((hi << 4) | (lo & 0x0Fu));
+    }
+}
+
+void bias_gelu_quant_bf16_to_nvfp4_swizzled_v2(
+    const __nv_bfloat16* input,
+    const __nv_bfloat16* bias,
+    uint8_t* fp4_data,
+    uint8_t* scale_factors,
+    int rows, int cols,
+    cudaStream_t stream) {
+    if (rows <= 0 || cols <= 0 || (cols & 7) != 0) {
+        bias_gelu_quant_bf16_to_nvfp4_swizzled(
+            input, bias, fp4_data, scale_factors, rows, cols, stream);
+        return;
+    }
+    int num_blocks = (cols + 15) / 16;
+    int n_col_blocks = (num_blocks + 3) / 4;
+    long long total = (long long)rows * num_blocks;
+    int threads = 256;
+    int blocks = (int)((total + threads - 1) / threads);
+    bias_gelu_quant_bf16_to_nvfp4_swizzled_v2_kernel<false>
+        <<<blocks, threads, 0, stream>>>(
+            input, bias, nullptr, fp4_data, scale_factors, rows, cols,
+            num_blocks, n_col_blocks);
+}
+
 __global__ void gather_bf16_cols_kernel(
     const __nv_bfloat16* __restrict__ input,
     const int* __restrict__ indices,
@@ -2333,6 +2414,133 @@ void residual_add_rms_norm_to_nvfp4_swizzled_bf16_v2(
                        + num_blocks * sizeof(float)
                        + cols * sizeof(__nv_bfloat16);
     residual_add_rms_norm_to_nvfp4_swizzled_bf16_v2_kernel
+        <<<rows, threads, smem_size, stream>>>(
+            h_in, attn_proj, h_post, rms_weight,
+            packed, sf_swz, cols, num_blocks, n_col_blocks, eps);
+}
+
+// ── v3: v1's memory structure (register-cached residual → no h_post global
+// re-read; nothing else changes) but with a *dynamic* per-thread element count
+// (eliminates v2's fixed MAXNPER=16 over-unroll, which is wasteful for the
+// small cols=1024 denoise producer).  amax/pack phases are byte-for-byte the
+// v1 phases, so v3 is bit-identical to v1 (verified).  `threads` is a runtime
+// knob so the per-row parallelism can be tuned; falls back to v1 when the
+// per-thread count would exceed MAXNPER. ──
+__global__ void residual_add_rms_norm_to_nvfp4_swizzled_bf16_v3_kernel(
+    const __nv_bfloat16* __restrict__ h_in,
+    const __nv_bfloat16* __restrict__ attn_proj,
+    __nv_bfloat16* __restrict__ h_post,
+    const __nv_bfloat16* __restrict__ rms_weight,
+    uint8_t* __restrict__ packed,
+    uint8_t* __restrict__ sf_swz,
+    int cols, int num_blocks, int n_col_blocks,
+    float eps)
+{
+    const int row = blockIdx.x;
+    const __nv_bfloat16* row_h_in = h_in + (size_t)row * cols;
+    const __nv_bfloat16* row_attn = attn_proj + (size_t)row * cols;
+    __nv_bfloat16* row_h_post = h_post + (size_t)row * cols;
+    uint8_t* row_fp4 = packed + (size_t)row * cols / 2;
+
+    extern __shared__ float smem_dyn[];
+    float* warp_red = smem_dyn;
+    float* sf_smem = smem_dyn + 32;
+    __nv_bfloat16* normed = reinterpret_cast<__nv_bfloat16*>(
+        sf_smem + num_blocks);
+
+    constexpr int MAXNPER = 16;
+    float rbf[MAXNPER];
+    const int nper = (cols + blockDim.x - 1) / blockDim.x;
+
+    // ── Phase 1: residual sum + ssq, write h_post, cache rounding in regs ──
+    float local_ssq = 0.f;
+    for (int k = 0; k < nper; ++k) {
+        int i = threadIdx.x + k * blockDim.x;
+        if (i < cols) {
+            float a = __bfloat162float(row_h_in[i]);
+            float b = __bfloat162float(row_attn[i]);
+            __nv_bfloat16 r_bf = __float2bfloat16(a + b);
+            row_h_post[i] = r_bf;
+            rbf[k] = __bfloat162float(r_bf);
+        } else {
+            rbf[k] = 0.f;
+        }
+        local_ssq += rbf[k] * rbf[k];
+    }
+    float ssq = block_reduce_sum(local_ssq, warp_red);
+    const float rms = rsqrtf(ssq / cols + eps);
+
+    // ── Phase 2: normalize from cached regs → smem + per-block amax ──
+    for (int b = threadIdx.x; b < num_blocks; b += blockDim.x)
+        sf_smem[b] = 0.f;
+    __syncthreads();
+
+    for (int k = 0; k < nper; ++k) {
+        int i = threadIdx.x + k * blockDim.x;
+        if (i < cols) {
+            float wv = __bfloat162float(rms_weight[i]);
+            __nv_bfloat16 nb = __float2bfloat16(rbf[k] * rms * wv);
+            normed[i] = nb;
+            int blk = i >> 4;
+            atomicMax((int*)&sf_smem[blk], __float_as_int(fabsf(__bfloat162float(nb))));
+        }
+    }
+    __syncthreads();
+
+    // ── Phase 3: per-block UE4M3 SF + swizzled write ──
+    int rb = row / 128;
+    int ri = row % 128;
+    for (int b = threadIdx.x; b < num_blocks; b += blockDim.x) {
+        float amax = __int_as_float(*(int*)&sf_smem[b]);
+        float scale = amax / 6.0f;
+        uint8_t ue_scale = float_to_ue4m3_ceil(scale);
+
+        int cb = b / 4;
+        int ci = b % 4;
+        int out_idx = (rb * n_col_blocks + cb) * 512
+                      + (ri % 32) * 16 + (ri / 32) * 4 + ci;
+        sf_swz[out_idx] = ue_scale;
+        sf_smem[b] = ue4m3_to_float(ue_scale);
+    }
+    __syncthreads();
+
+    // ── Phase 4: pack normed → FP4 e2m1 (2 per byte) ──
+    int half_cols = cols >> 1;
+    for (int p = threadIdx.x; p < half_cols; p += blockDim.x) {
+        int i = p * 2;
+        int blk = i >> 4;
+        float scale = sf_smem[blk];
+        float inv_scale = (scale > 0.f) ? (1.f / scale) : 0.f;
+
+        float v0 = __bfloat162float(normed[i]) * inv_scale;
+        float v1 = __bfloat162float(normed[i + 1]) * inv_scale;
+        uint8_t lo = float_to_fp4_e2m1(v0);
+        uint8_t hi = float_to_fp4_e2m1(v1);
+        row_fp4[p] = (hi << 4) | (lo & 0x0F);
+    }
+}
+
+void residual_add_rms_norm_to_nvfp4_swizzled_bf16_v3(
+    const __nv_bfloat16* h_in, const __nv_bfloat16* attn_proj,
+    __nv_bfloat16* h_post, const __nv_bfloat16* rms_weight,
+    uint8_t* packed, uint8_t* sf_swz,
+    int rows, int cols, float eps, int threads,
+    cudaStream_t stream)
+{
+    int num_blocks = (cols + 15) / 16;
+    int n_col_blocks = (num_blocks + 3) / 4;
+    if (threads < 128) threads = 128;
+    if (threads > 1024) threads = 1024;
+    if ((cols + threads - 1) / threads > 16) {
+        residual_add_rms_norm_to_nvfp4_swizzled_bf16(
+            h_in, attn_proj, h_post, rms_weight, packed, sf_swz,
+            rows, cols, eps, stream);
+        return;
+    }
+    size_t smem_size = 32 * sizeof(float)
+                       + num_blocks * sizeof(float)
+                       + cols * sizeof(__nv_bfloat16);
+    residual_add_rms_norm_to_nvfp4_swizzled_bf16_v3_kernel
         <<<rows, threads, smem_size, stream>>>(
             h_in, attn_proj, h_post, rms_weight,
             packed, sf_swz, cols, num_blocks, n_col_blocks, eps);

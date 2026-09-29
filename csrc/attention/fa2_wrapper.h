@@ -68,6 +68,20 @@ FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_bf16_seqused_splitkv(
     int o_batch_stride, int o_row_stride, int o_head_stride,
     float softmax_scale, int num_sms, cudaStream_t stream);
 
+// Short-query FA2 tile entry (bf16). head_dim in (0, 128]; seqused_k_ptr
+// may be null. Dispatches to the narrow-query-tile traits rather than the
+// vendored <128,64,4> default. See fa2_tile_inst/flash_fwd_smallq_bf16_sm80.cu.
+FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_bf16_tile(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr, const void* seqused_k_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream);
+
 FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_bf16_causal(
     const void* q_ptr, const void* k_ptr, const void* v_ptr,
     void* o_ptr, void* softmax_lse_ptr,

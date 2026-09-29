@@ -149,6 +149,19 @@ PYBIND11_MODULE(flash_rt_fa2, m) {
         py::arg("softmax_scale") = 1.0f, py::arg("num_sms") = 0,
         py::arg("stream") = 0);
 
+    m.def("fwd_bf16_tile", make_fwd_seqused(&fvk_attention_fa2_fwd_bf16_tile),
+        py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),
+        py::arg("seqused_k"),
+        py::arg("batch"), py::arg("seqlen_q"), py::arg("seqlen_k"),
+        py::arg("num_heads_q"), py::arg("num_heads_kv"), py::arg("head_dim"),
+        py::arg("q_strides"), py::arg("k_strides"),
+        py::arg("v_strides"), py::arg("o_strides"),
+        py::arg("softmax_scale") = 1.0f, py::arg("num_sms") = 0,
+        py::arg("stream") = 0,
+        "Hy-VLA small-N FA2 query-tile specialisation (bf16, head_dim<=128). "
+        "seqused_k may be 0 for full attention. Same semantics as fwd_bf16 / "
+        "fwd_bf16_seqused but with a narrow query tile tuned for short seqlen_q.");
+
     m.def("fwd_bf16_seqused_splitkv",
         make_fwd_seqused_splitkv(&fvk_attention_fa2_fwd_bf16_seqused_splitkv),
         py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),
