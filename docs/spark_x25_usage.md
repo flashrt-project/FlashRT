@@ -23,10 +23,11 @@ attention; both are required. The build prints
 `Spark-X2.5-4B kernels: ENABLED (separate module flash_rt_sparkx25)` when the
 third target is configured.
 
-The target is disabled by default and requires `FLASHRT_ENABLE_SPARK_X25=ON` with `GPU_ARCH=120`, because the KV writer quantises with
+The target is disabled by default. Enable it with
+`FLASHRT_ENABLE_SPARK_X25=ON` and `GPU_ARCH=120`: the KV writer quantises with
 `__nv_cvt_float_to_fp8` and the score kernels' tile sizes assume the RTX
-shared-memory budget. On any other `GPU_ARCH` the module is skipped and
-`SparkX25Runtime` raises a `RuntimeError` naming the missing extensions; the
+shared-memory budget. Enabling it on another architecture is a CMake error.
+Without the extensions, `SparkX25Runtime` raises a `RuntimeError` naming them; the
 frontend and the config parser still import, so checkpoint validation works
 before a build exists. Note that `detect_arch()` reports `rtx_sm120` for both
 SM120 and SM121, so on an SM121 part (DGX Spark GB10) the route resolves but the

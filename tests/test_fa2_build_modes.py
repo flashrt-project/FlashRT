@@ -15,7 +15,6 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BUILD_DIR = Path(os.environ.get("FLASHRT_BUILD_DIR", REPO_ROOT / "build"))
 EXPECTED_RAW_EXPORTS = {
-    "fvk_attention_fa2_fwd_bf16_window",
     "fvk_attention_fa2_fwd_fp16",
     "fvk_attention_fa2_fwd_bf16",
     "fvk_attention_fa2_fwd_bf16_window",
