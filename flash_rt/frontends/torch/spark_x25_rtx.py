@@ -119,25 +119,50 @@ class SparkX25TorchFrontendRtx:
     def set_prompt(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Prefill ``input_ids`` and return the last row's logits."""
         ids = input_ids.to(self.device).reshape(-1)
-        self._prompt_len = int(ids.numel())
+        if ids.numel() == 0:
+            raise ValueError("prompt must contain at least one token")
         with torch.no_grad():
-            self.runtime.forward(ids, pos=0)
-        return self.runtime.logits[:1]
+            logits = self.runtime.forward(ids, pos=0)
+        self._prompt_len = int(ids.numel())
+        return logits[-1:]
 
     def generate(self, input_ids: torch.Tensor, *, max_new_tokens: int = 128,
                  graph_steps: int | None = None) -> torch.Tensor:
         """Greedy decode. Returns the prompt followed by the new tokens.
 
         The decode loop is captured once and replayed; ``graph_steps`` sets how
-        many steps that graph covers (defaults to ``max_new_tokens``).
+        many steps each replay covers; a final shorter graph handles the tail.
         """
-        logits = self.set_prompt(input_ids)
-        self.runtime.next_token.fill_(int(logits[-1].argmax()))
-        steps = int(graph_steps or max_new_tokens)
-        with torch.no_grad():
-            new = self.runtime.decode_loop(self._prompt_len, steps)
+        if (not isinstance(max_new_tokens, int) or isinstance(max_new_tokens, bool)
+                or max_new_tokens < 0):
+            raise ValueError("max_new_tokens must be a nonnegative integer")
+        if graph_steps is not None and (
+                not isinstance(graph_steps, int) or isinstance(graph_steps, bool)
+                or graph_steps < 1):
+            raise ValueError("graph_steps must be a positive integer")
         ids = input_ids.to(self.device).reshape(-1)
-        return torch.cat([ids, new[:max_new_tokens]])
+        if ids.numel() == 0:
+            raise ValueError("prompt must contain at least one token")
+        if ids.numel() + max_new_tokens > self.max_seq:
+            raise ValueError("prompt plus max_new_tokens exceeds max_seq")
+        if max_new_tokens == 0:
+            self._prompt_len = int(ids.numel())
+            return ids.clone()
+        logits = self.set_prompt(ids)
+        with torch.no_grad():
+            # Prefill already predicts the first generated token. Decode consumes
+            # that token to predict its successor, so only N-1 steps are needed.
+            self.runtime.next_token.copy_(logits[-1].argmax().reshape(1))
+            generated = [self.runtime.next_token.clone()]
+            remaining = max_new_tokens - 1
+            pos = self._prompt_len
+            chunk = graph_steps if graph_steps is not None else max_new_tokens
+            while remaining:
+                steps = min(chunk, remaining)
+                generated.append(self.runtime.decode_loop(pos, steps))
+                pos += steps
+                remaining -= steps
+        return torch.cat([ids, *generated])
 
     def generate_text(self, prompt: str, *, max_new_tokens: int = 128,
                       enable_thinking: bool = False) -> str:

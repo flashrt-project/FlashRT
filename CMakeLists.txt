@@ -1409,7 +1409,11 @@ endif()
 # sm_120 only: the KV cache is quantised to E4M3 with __nv_cvt_float_to_fp8 and
 # the softmax/score kernels assume the RTX shared-memory budget the tile sizes
 # were chosen against. The frontend refuses to resolve on any other arch.
-if(GPU_ARCH STREQUAL "120")
+option(FLASHRT_ENABLE_SPARK_X25 "Build Spark-X2.5 SM120 model kernels" OFF)
+if(FLASHRT_ENABLE_SPARK_X25 AND NOT GPU_ARCH STREQUAL "120")
+  message(FATAL_ERROR "FLASHRT_ENABLE_SPARK_X25 requires GPU_ARCH=120")
+endif()
+if(FLASHRT_ENABLE_SPARK_X25)
   pybind11_add_module(flash_rt_sparkx25
     csrc/spark_x25_bindings.cpp
     csrc/kernels/spark_x25/spark_x25_kernels.cu)
@@ -1432,7 +1436,7 @@ if(GPU_ARCH STREQUAL "120")
   install(TARGETS flash_rt_sparkx25 LIBRARY DESTINATION flash_rt)
   message(STATUS "Spark-X2.5-4B kernels: ENABLED (separate module flash_rt_sparkx25)")
 else()
-  message(STATUS "Spark-X2.5-4B kernels: DISABLED (sm_120 only)")
+  message(STATUS "Spark-X2.5-4B kernels: DISABLED (set FLASHRT_ENABLE_SPARK_X25=ON on sm_120)")
 endif()
 
 if(FLASHRT_BUILD_QWEN3_VL)

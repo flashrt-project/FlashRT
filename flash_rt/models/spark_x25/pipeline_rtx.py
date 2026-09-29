@@ -48,7 +48,7 @@ from flash_rt.models.spark_x25.weights import load_weights
 #: What to tell a caller whose build does not carry the modules above.
 _BUILD_HINT = (
     "Build them with:\n"
-    "    cmake -B build -S . -DGPU_ARCH=120\n"
+    "    cmake -B build -S . -DGPU_ARCH=120 -DFLASHRT_ENABLE_SPARK_X25=ON\n"
     "    cmake --build build -j4 --target flash_rt_kernels flash_rt_fa2 "
     "flash_rt_sparkx25\n"
     "flash_rt_sparkx25 is SM120 (RTX 50-series) only and is skipped on every "
@@ -756,8 +756,39 @@ class SparkX25Runtime:
         sk.argmax_bf16(self._p(self.logits), self._p(self.next_token),
                        c.vocab_size, self.stream)
 
+    def _capture_state_views(self, steps: int) -> list[torch.Tensor]:
+        """Persistent slots capture can touch when started at position zero.
+
+        Save only the affected prefix/ring slots, not the entire long-context
+        cache. Scratch activations are overwritten by each decode iteration.
+        """
+        views = [self.pos_i, self.full_klen, self.slide_klen,
+                 self.next_token, self.tokens_out[:steps]]
+        width = self.cfg.kv_dim
+        for lin, ring, lin8 in self.kv_offset:
+            if ring is not None:
+                count = min(steps, self.lin_w) * width
+                for cache in (self.k_cache, self.v_cache):
+                    views.extend((cache[lin:lin + count],
+                                  cache[lin + self.lin_w * width:
+                                        lin + self.lin_w * width + count],
+                                  cache[ring:ring + min(steps, self.ring_w) * width]))
+            else:
+                if lin is not None:
+                    views.extend(cache[lin:lin + steps * width]
+                                 for cache in (self.k_cache, self.v_cache))
+                views.extend(cache[lin8:lin8 + steps * width]
+                             for cache in (self.k8_cache, self.v8_cache))
+                offset = lin8 // width * self.cfg.num_key_value_heads
+                count = steps * self.cfg.num_key_value_heads
+                views.extend(cache[offset:offset + count]
+                             for cache in (self.k8_scale, self.v8_scale))
+        return views
+
     def capture_decode_loop(self, steps: int) -> torch.cuda.CUDAGraph:
-        """Capture `steps` decode iterations into one replayable graph."""
+        """Capture without changing the caller's KV, token or position state."""
+        if not isinstance(steps, int) or isinstance(steps, bool) or not 1 <= steps <= self.max_seq:
+            raise ValueError("decode steps must be in [1, max_seq]")
         if self._capture_stream is None:
             self._capture_stream = torch.cuda.Stream()
         s = self._capture_stream
@@ -766,24 +797,36 @@ class SparkX25Runtime:
         self._in_loop = True
         try:
             with torch.cuda.stream(s):
-                for _ in range(2):
-                    self._decode_iteration(first=True)
-                g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g, stream=s):
-                    for k in range(steps):
-                        self._decode_iteration(first=(k == 0))
+                views = self._capture_state_views(steps)
+                saved = [value.clone() for value in views]
+                try:
+                    self.pos_i.zero_()
+                    for _ in range(2):
+                        self._decode_iteration(first=True)
+                    self.pos_i.zero_()
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g, stream=s):
+                        for k in range(steps):
+                            self._decode_iteration(first=(k == 0))
+                finally:
+                    for value, original in zip(views, saved):
+                        value.copy_(original)
         finally:
             self._in_loop = False
-        cur.wait_stream(s)
+            cur.wait_stream(s)
         self._loop_steps = steps
         return g
 
     def decode_loop(self, pos: int, steps: int) -> torch.Tensor:
         """Replay `steps` decode iterations starting at absolute position `pos`.
 
-        Returns `steps` sampled token ids, the first being the one generated at
-        absolute position `pos`.
+        Consumes ``next_token`` at ``pos`` and returns its ``steps`` successor
+        predictions. The input token itself is not part of the returned tensor.
         """
+        if (not isinstance(pos, int) or isinstance(pos, bool) or pos < 0
+                or not isinstance(steps, int) or isinstance(steps, bool)
+                or steps < 1 or pos + steps > self.max_seq):
+            raise ValueError("decode positions must fit within max_seq with positive steps")
         if self._loop_graph is None or self._loop_steps != steps:
             self._loop_graph = self.capture_decode_loop(steps)
         self.pos_i.fill_(pos)

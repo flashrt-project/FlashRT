@@ -15,6 +15,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BUILD_DIR = Path(os.environ.get("FLASHRT_BUILD_DIR", REPO_ROOT / "build"))
 EXPECTED_RAW_EXPORTS = {
+    "fvk_attention_fa2_fwd_bf16_window",
     "fvk_attention_fa2_fwd_fp16",
     "fvk_attention_fa2_fwd_bf16",
     "fvk_attention_fa2_fwd_bf16_window",
@@ -50,10 +51,12 @@ def _link_manifest(target: str) -> str | None:
         return manifest
     ninja = BUILD_DIR / "build.ninja"
     if ninja.is_file():
-        lines = [
-            line for line in ninja.read_text(errors="replace").splitlines()
-            if line.startswith("build ") and target in line
-        ]
+        # Keep per-edge variables (including LINK_FLAGS), not just the
+        # build line; exclude unrelated phony targets mentioning this name.
+        blocks = re.split(r"\n(?=build )", ninja.read_text(errors="replace"))
+        lines = [block for block in blocks
+                 if re.match(r"build .*: .*(?:SHARED|MODULE)_LIBRARY_LINKER__" +
+                             re.escape(target) + r"_", block)]
         return "\n".join(lines) if lines else None
     return None
 

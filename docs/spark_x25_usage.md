@@ -14,7 +14,7 @@ The kernels build into their own module, `flash_rt_sparkx25`, gated on SM120:
 
 ```bash
 git clone --depth 1 --branch v4.4.2 https://github.com/NVIDIA/cutlass.git third_party/cutlass
-cmake -B build -S . -DGPU_ARCH=120
+cmake -B build -S . -DGPU_ARCH=120 -DFLASHRT_ENABLE_SPARK_X25=ON
 cmake --build build --target flash_rt_kernels flash_rt_fa2 flash_rt_sparkx25 -j4
 ```
 
@@ -23,7 +23,7 @@ attention; both are required. The build prints
 `Spark-X2.5-4B kernels: ENABLED (separate module flash_rt_sparkx25)` when the
 third target is configured.
 
-The target is built for `GPU_ARCH=120` only, because the KV writer quantises with
+The target is disabled by default and requires `FLASHRT_ENABLE_SPARK_X25=ON` with `GPU_ARCH=120`, because the KV writer quantises with
 `__nv_cvt_float_to_fp8` and the score kernels' tile sizes assume the RTX
 shared-memory budget. On any other `GPU_ARCH` the module is skipped and
 `SparkX25Runtime` raises a `RuntimeError` naming the missing extensions; the
@@ -121,7 +121,7 @@ re-swept for the wider part (see `docs/spark_x25_rtx.md`):
 
 ## Known limits
 
-- **SM120 only.** The module is gated on `GPU_ARCH=120`; the KV writer
+- **SM120 only.** The module requires `FLASHRT_ENABLE_SPARK_X25=ON` and `GPU_ARCH=120`; the KV writer
   quantises with `__nv_cvt_float_to_fp8`. The decode KV split count scales with
   the part: the original 36-SM rule (one split per 32 tokens, capped at 256)
   cost 19% at 128k and 51% at 1M on a 170-SM 5090, so the default is now
