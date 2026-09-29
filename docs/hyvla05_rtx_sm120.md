@@ -153,6 +153,78 @@ default tier; 0.999942 for pure FP8). The e2e
 test asserts >= 0.999 on a recorded real-frame fixture when
 `HYVLA_RTX_PARITY_FIXTURE` points at one, and a >= 0.95 smoke otherwise.
 
+### Reproducing the measured gates
+
+The table above was produced with the following caliber. No fixture is shipped
+(the real-frame `.npz` is captured locally; `*.npz` is git-ignored), and the
+snippet below is self-contained:
+
+- **Input**: six real RoboTwin history frames `(3, 6, 3, 240, 320)`, a fixed
+  `state` `(1, 20)`, and one fixed shared flow noise `(1, 40, 32)`.
+- **Cosine**: vs the official eager raw action chunk, over `dims[:20]`.
+- **Latency**: wall-clock around `predict_actions` with `torch.cuda.synchronize()`
+  before/after, warmup 5 + median of 20. FlashRT is timed on the delivered
+  CUDA-graph path; the official model is eager only (it cannot be captured).
+
+```python
+# Per-tier cosine + E2E graph latency (load one ~9 GB frontend at a time).
+import time
+import numpy as np
+import torch
+from flash_rt.frontends.torch.hyvla_rtx import HyVLATorchFrontendRtx
+
+CKPT = "/path/to/Hy-Embodied-0.5-VLA-RoboTwin"
+d = np.load("real_hist.npz")                       # images/state/noise/raw
+images = torch.as_tensor(d["images"], dtype=torch.float32)
+state = torch.as_tensor(d["state"], dtype=torch.float32)
+noise = torch.as_tensor(d["noise"], dtype=torch.float32)
+raw = d["raw"].reshape(d["raw"].shape[0], -1)
+
+
+def cos(a, b):
+    a = a.ravel().astype(np.float64)
+    b = b.ravel().astype(np.float64)
+    return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
+
+
+def measure(label, **tier):
+    fe = HyVLATorchFrontendRtx(CKPT, **tier)
+    fe.set_prompt("pick up the bottle")
+    with torch.no_grad():
+        out = fe.predict_actions(images, state=state, noise=noise, use_graph=True)
+    b = np.asarray(out).reshape(out.shape[0], out.shape[1], -1)[0]
+    n = min(raw.shape[1], b.shape[1])
+    with torch.no_grad():
+        for _ in range(5):                         # warmup
+            fe.predict_actions(images, state=state, noise=noise, use_graph=True)
+    torch.cuda.synchronize()
+    ts = []
+    for _ in range(20):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            fe.predict_actions(images, state=state, noise=noise, use_graph=True)
+        torch.cuda.synchronize()
+        ts.append((time.perf_counter() - t0) * 1e3)
+    print(f"{label:16s} cos={cos(raw[:, :n], b[:, :n]):.6f} "
+          f"graph median={np.median(ts):.2f} ms")
+
+
+measure("BF16", use_fp8=False, use_int8=False, use_fused=True)
+measure("FP8", use_fp8=True)
+measure("default(V4NV)", use_fp8=True, use_fp4=True, use_fp4_expert=False)
+measure("all-NVFP4", use_fp8=True, use_fp4=True, use_fp4_expert=True)
+```
+
+**Ground truth (official eager).** Feed ~30 sequential real RoboTwin frames to
+`HyVLAPolicyWrapper` (`img_history_size=6`, `img_history_interval=5`); at a step
+where the 6-frame history is saturated, save `observation.images.*` as the
+`(3, 6, 3, 240, 320)` stack, plus `state` and the raw action chunk. Pass an
+explicit `noise=noise.clone()` on every official forward: the official eager
+path mutates the passed noise tensor in place, so reusing one tensor corrupts
+the reference (observed as a spurious ~0.95 cosine). Time it the same way
+(eager, warmup 5 + median of 20).
+
 ## Graph safety and determinism
 
 The default tier is graph-safe (graph-vs-eager cosine >= 0.9999) but **not
