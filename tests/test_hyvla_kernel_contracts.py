@@ -105,3 +105,81 @@ def test_ffn_gu_silu_rejects_misaligned_shapes():
 def test_ffn_dn_res_rejects_misaligned_shapes():
     with pytest.raises(ValueError, match="N%32"):
         fvk.hyvla_ffn_dn_res_bf16(0, 0, 0, 0, M=1, K=1024, N=1000, sa=0, sdn=1.0)
+
+
+# ── RTX SM120 kernels ────────────────────────────────────────────────
+# Required-symbol contract for the RTX (SM120/SM121) plan. A missing symbol
+# must surface here rather than as a deep AttributeError during capture.
+_RTX_REQUIRED_SYMBOLS = (
+    "hyvla_prefill_attn_bf16",
+    "hyvla_euler_update_bf16_fp32",
+    "hyvla_vit_pos_add_bf16",
+    "hyvla_merger_pool_bf16",
+    "hyvla_fa2_denoise_gather_o_fp8_block128_bf16",
+)
+
+
+@pytest.mark.skipif(not hasattr(fvk, "hyvla_prefill_attn_bf16"),
+                    reason="RTX-only HyVLA kernels (FLASHRT_ENABLE_HYVLA)")
+def test_rtx_required_symbols_are_exported():
+    missing = [name for name in _RTX_REQUIRED_SYMBOLS
+               if not hasattr(fvk, name)]
+    assert not missing, f"missing required RTX HyVLA kernels: {missing}"
+
+
+@pytest.mark.skipif(not hasattr(fvk, "hyvla_prefill_attn_bf16"),
+                    reason="RTX-only kernel")
+def test_prefill_attn_rejects_nonpositive_shapes():
+    for s, h in ((0, 4), (8, 0)):
+        with pytest.raises(ValueError, match="S>0, H>0"):
+            fvk.hyvla_prefill_attn_bf16(
+                0, 0, 0, 0, 0, 0, S=s, H=h,
+                q_stride_h=1, k_stride_h=1, v_stride_h=1)
+
+
+@pytest.mark.skipif(
+    not hasattr(fvk, "hyvla_fa2_denoise_gather_o_fp8_block128_bf16"),
+    reason="RTX-only kernel")
+def test_gather_o_fp8_rejects_misaligned_shape():
+    with pytest.raises(ValueError, match=r"\(H\*D\)%128"):
+        fvk.hyvla_fa2_denoise_gather_o_fp8_block128_bf16(
+            0, 0, 0, S=41, H=3, D=8)
+
+
+@pytest.mark.skipif(
+    not hasattr(fvk, "hyvla_fa2_denoise_gather_o_nvfp4_bf16"),
+    reason="RTX-only kernel")
+def test_gather_o_nvfp4_rejects_misaligned_shape():
+    with pytest.raises(ValueError, match=r"\(H\*D\)%16"):
+        fvk.hyvla_fa2_denoise_gather_o_nvfp4_bf16(
+            0, 0, 0, S=41, H=3, D=5)
+
+
+def test_fa2_smallq_tile_binding_present_or_fallback():
+    # The RTX plan prefers the short-query tile but documents a seqused
+    # fallback; either symbol must exist so the frontend's getattr default is
+    # reachable rather than silently missing.
+    fa2 = pytest.importorskip("flash_rt.flash_rt_fa2")
+    assert hasattr(fa2, "fwd_bf16_tile") or hasattr(fa2, "fwd_bf16_seqused")
+
+
+# ── shared bf16 activations (csrc/kernels/act_bf16.cu) ───────────────
+@pytest.mark.skipif(not hasattr(fvk, "silu_bf16"),
+                    reason="shared act_bf16 kernels not built")
+def test_act_bf16_matches_torch_silu_gelu():
+    import torch
+    import torch.nn.functional as F
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    stream = torch.cuda.current_stream().cuda_stream
+    # n not a multiple of 8 exercises the 8-wide vector body + scalar tail.
+    n = 8 * 256 * 4 + 5
+    x = torch.linspace(-6.0, 6.0, n, device="cuda", dtype=torch.bfloat16)
+    s = x.clone()
+    fvk.silu_bf16(s.data_ptr(), n, stream)
+    g = x.clone()
+    fvk.gelu_erf_bf16(g.data_ptr(), n, stream)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(s, F.silu(x), atol=1e-2, rtol=0)
+    torch.testing.assert_close(
+        g, F.gelu(x, approximate="none"), atol=1e-2, rtol=0)
