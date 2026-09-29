@@ -1189,6 +1189,7 @@ Expected: `P50: ~44 ms (23 Hz)` on Thor.
 - **GROOT N1.6** (`config="groot"`) — [API snippets](#api-snippets), [GROOT embodiment slots](#groot-n16-embodiment-slots)
 - **GROOT N1.7** (`config="groot_n17"`) — 23.7 ms on Jetson AGX Thor (NVFP4 + FA4 tier, LIBERO 1-view; 36.8 ms FP8), 16.6 ms on RTX 5090 (2-view base, full graph); [usage guide](USAGE.md#groot-n17-rtx), [API snippet](#groot-n17-rtx)
 - **Pi0-FAST** (`config="pi0fast"`) — [usage guide](USAGE.md#pi0-fast), [performance modes](#pi0-fast-performance-modes)
+- **Hy-Embodied-0.5-VLA** (`config="hyvla"`) — Jetson Thor SM110, Jetson Orin SM87, and RTX SM120/SM121 (SM120 block-128 FP8 with a default NVFP4 ViT + VLM-prefill tier, expert tower on FP8); [RTX SM120 usage](docs/hyvla05_rtx_sm120.md), [Thor notes](docs/hyvla05_thor_sm110.md), [Orin SM87 notes](docs/hyvla05_orin_sm87.md)
 - **LingBot-VLA** — [LingBot usage](docs/lingbot_usage.md), [Thor latency](docs/lingbot_usage.md#5-accuracy--latency-thor-sm_110-cuda-graph-replay)
 - **Motus Stage3 RTX beta** (`config="motus"`) — [Motus usage](docs/motus_usage_beta.md), [legacy async chunk runner](docs/rtc_lite_design.md)
 - **Wan2.2 TI2V-5B** (`config="wan22_ti2v_5b"`) — [Wan2.2 usage](docs/wan22_usage.md)
@@ -1220,7 +1221,7 @@ have been built and tested, and the dispatch map that selects them.
 | AMD Instinct MI350X | gfx950 (CDNA4) | Production target | Pi0.5 at **16.4 ms** FP8 and GROOT N1.7 at **16.0 ms** full-frame, on a standalone ROCm/HIP backend: hand-written HIP kernels, hipBLASLt FP8 GEMM, MFMA attention, HIP graph capture. Arch-gated to gfx950 at both build and run time. See [AMD deployment](docs/deployment_amd.md) and [Pi0.5 on MI350X](docs/deployment_amd_pi05.md). |
 | AMD Instinct MI300 | gfx942 (CDNA3) | Refused, not ported | The backend rejects any device whose architecture does not start with `gfx950`, because the kernels use CDNA4-specific MFMA shapes. `FLASHRT_AMD_ALLOW_ARCH=1` is a build-script escape hatch for porting work, not a supported path. |
 | RTX 4090 | SM89 | Validated / supported target | RTX VLA build path and deployment recipe; Higgs BF16 path compiles/configures. See [deployment_rtx4090.md](docs/deployment_rtx4090.md). |
-| RTX 5060 Ti | SM120 | Community validated | Pi0.5 FP8 and LIBERO Spatial submission; see [Community benchmarks](#community-benchmarks). |
+| RTX 5060 Ti | SM120 | Community validated | Pi0.5 FP8 and LIBERO Spatial submission, and Hy-Embodied-0.5-VLA (`config="hyvla"`, SM120 FP8 / NVFP4 ViT+prefill); see [Community benchmarks](#community-benchmarks) and [HyVLA RTX notes](docs/hyvla05_rtx_sm120.md). |
 | RTX 4060 Ti | SM89 | Validated build/run target | Included in current tested hardware list; run local benchmarks before making model-specific latency claims. |
 | NVIDIA L40 | SM89 | Community validated | Pi0.5 FP8 submission; see [Community benchmarks](#community-benchmarks). |
 | Jetson AGX Orin | SM87 | Community port | Pi0.5 INT8/BF16 paths, Orin tile dispatch, frame-cache inference, and Qwen3-VL BF16 with opt-in INT8/INT4 decode ([docs](docs/qwen3_vl_rtx_bf16.md)); see [deployment_orin.md](docs/deployment_orin.md). |

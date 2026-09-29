@@ -192,9 +192,14 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   `ChameleonTorchFrontendThor` (Jetson Thor SM110).
   See `docs/chameleon_usage.md`.
 - `config="hyvla"` (Hy-Embodied-0.5-VLA) is registered for
-  `framework="torch"` on `hardware="thor"`. Thor uses runtime dynamic
-  FP8 with fused megakernels and optional NVFP4 FFN (`use_fp4=True`).
-  See `docs/hyvla05_thor_sm110.md`.
+  `framework="torch"` on `hardware in {"thor", "rtx_sm87", "rtx_sm120"}`.
+  Thor and Orin SM87 use runtime dynamic FP8 with fused megakernels and
+  optional NVFP4 FFN (`use_fp4=True`). RTX SM120/SM121 runs SM120
+  block-128 FP8 and defaults to an NVFP4 ViT + VLM-prefill tier with the
+  expert denoise tower on FP8 (`use_fp4=True, use_fp4_expert=False`);
+  `use_fp4_expert=True` promotes the expert tower to NVFP4 (opt-in,
+  below the 0.999 precision gate). See `docs/hyvla05_thor_sm110.md`,
+  `docs/hyvla05_orin_sm87.md`, and `docs/hyvla05_rtx_sm120.md`.
 
 ### `flash_rt.VLAModel`
 
@@ -332,7 +337,7 @@ framework="torch", arch="rtx_sm120")`.
 Chameleon-7B is registered for `(config="chameleon", framework="torch",
 arch in {"rtx_sm87", "thor"})`.
 Hy-Embodied-0.5-VLA is registered for `(config="hyvla",
-framework="torch", arch in {"thor", "rtx_sm87"})`.
+framework="torch", arch in {"thor", "rtx_sm87", "rtx_sm120"})`.
 
 ### `_PIPELINE_MAP`
 
