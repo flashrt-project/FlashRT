@@ -1,7 +1,8 @@
-"""HyVLA RTX (SM120/SM121) hardware-gate and input-contract tests (no GPU needed).
+"""HyVLA RTX (SM120) hardware-gate and input-contract tests (no GPU needed).
 
 Mirrors ``tests/test_orin_hyvla05_arch_gate.py`` for the RTX consumer
 Blackwell target. ``torch.cuda`` is mocked, so this module runs anywhere.
+SM121 is deliberately rejected: this backend ships an sm_120a build.
 """
 
 import pytest
@@ -37,16 +38,25 @@ def test_rejects_wrong_capability(monkeypatch):
     monkeypatch.delenv("FLASHRT_HYVLA_FORCE_ARCH", raising=False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (11, 0))
-    with pytest.raises(RuntimeError, match="RTX Blackwell SM120/SM121"):
+    with pytest.raises(RuntimeError, match="RTX Blackwell SM120"):
         _Probe().run()
 
 
-@pytest.mark.parametrize("cap", [(12, 0), (12, 1)])
-def test_accepts_sm120_and_sm121(monkeypatch, cap):
+def test_accepts_sm120(monkeypatch):
     monkeypatch.delenv("FLASHRT_HYVLA_FORCE_ARCH", raising=False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: cap)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (12, 0))
     _Probe().run()  # must not raise
+
+
+def test_rejects_sm121(monkeypatch):
+    # SM121 / GB10 is out of scope for the sm_120a build; the gate must fail
+    # fast with a clear message rather than defer to a kernel-launch failure.
+    monkeypatch.delenv("FLASHRT_HYVLA_FORCE_ARCH", raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (12, 1))
+    with pytest.raises(RuntimeError, match="SM121"):
+        _Probe().run()
 
 
 def test_documented_env_override_skips_probe(monkeypatch):

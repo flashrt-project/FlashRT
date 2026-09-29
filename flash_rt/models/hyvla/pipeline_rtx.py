@@ -1,6 +1,6 @@
-"""HyVLA forward path for RTX consumer Blackwell (SM120 / SM121).
+"""HyVLA forward path for RTX consumer Blackwell (SM120).
 
-SM120/SM121 has the tcgen05 FP8 block-128 and NVFP4 tensor-core routes but not
+SM120 has the tcgen05 FP8 block-128 and NVFP4 tensor-core routes but not
 the SM110 (Thor) FP8 megakernel path, and it does not build the SM80-family
 INT8 W8A8 kernels the Orin SM87 path uses. This module owns the SM120 lowered
 execution plan:
@@ -20,7 +20,7 @@ supplies both the SM120 kernel bindings **and** the SM120 scheduling overrides
 (``_block`` / ``prefill`` / ``merger_forward`` with the fused residual
 producers, the ``_norm`` / ``_branch_gemm2`` hooks). No hardware fork lives in
 the shared files. Reachable via
-``flash_rt.load_model(ckpt, config="hyvla", framework="torch")`` on SM120/SM121.
+``flash_rt.load_model(ckpt, config="hyvla", framework="torch")`` on SM120.
 """
 
 from __future__ import annotations
@@ -75,7 +75,7 @@ def _rms_norm(x, normalized_shape, weight=None, eps=1e-5):
 
 
 class HyVLARTXBF16Pipeline(HyVLAOrinBF16Pipeline):
-    """SM120/SM121 lowered execution plan for Hy-Embodied-0.5-VLA."""
+    """SM120 lowered execution plan for Hy-Embodied-0.5-VLA."""
 
     def _block_ffn8(self, hs, n_vis, w_text, w_vis, qk_w, mask, cos, sin,
                     kbuf, vbuf, off, ffnv, ffnt):

@@ -1,4 +1,4 @@
-"""Graph-safety gate for HyVLATorchFrontendRtx (requires SM120/SM121 + checkpoint).
+"""Graph-safety gate for HyVLATorchFrontendRtx (requires SM120 + checkpoint).
 
 Verifies the invariants the CUDA-graph capture relies on for the SM120
 block-128 tier (``use_fp8=True``):
@@ -31,8 +31,8 @@ if not CKPT or not os.path.isdir(CKPT):
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
-if tuple(torch.cuda.get_device_capability()) not in ((12, 0), (12, 1)):
-    pytest.skip("requires an SM120/SM121 (RTX Blackwell) device",
+if tuple(torch.cuda.get_device_capability()) != (12, 0):
+    pytest.skip("requires an SM120 (RTX Blackwell) device",
                 allow_module_level=True)
 
 from flash_rt.frontends.torch.hyvla_rtx import HyVLATorchFrontendRtx  # noqa: E402

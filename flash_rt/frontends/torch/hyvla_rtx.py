@@ -1,6 +1,11 @@
-"""HyVLA frontend for RTX consumer Blackwell (SM120 / SM121).
+"""HyVLA frontend for RTX consumer Blackwell (SM120).
 
-SM120/SM121 has no SM110 (Thor) FP8 megakernel path, but it can reuse the
+This backend targets SM120 only (validated on an RTX 5060 Ti) and is built as
+``sm_120a``. SM121 / GB10 (DGX Spark) is out of scope for this build: it needs
+a separate ``-DGPU_ARCH=121`` build and has not been validated, so the
+capability gate rejects it up front.
+
+SM120 has no SM110 (Thor) FP8 megakernel path, but it can reuse the
 Orin SM87 implementation: BF16 math, the plain-CUDA fused attention-prep
 kernels (``hyvla_rope_qknorm_kvwrite_parallel_bf16`` and
 ``hyvla_rope_qknorm_kvwrite_qb_bf16``), the fused ViT add+LayerNorm
@@ -88,8 +93,8 @@ def _block128_quant_weight(w_bf16):
 
 class HyVLATorchFrontendRtx(HyVLATorchFrontendOrin):
     _REQUIRED_CAPABILITY = (12, 0)
-    _SUPPORTED_CAPABILITIES = ((12, 0), (12, 1))
-    _ARCH_NAME = "RTX Blackwell SM120/SM121"
+    _SUPPORTED_CAPABILITIES = ((12, 0),)
+    _ARCH_NAME = "RTX Blackwell SM120"
     _PIPE_CLS = HyVLARTXBF16Pipeline
 
     def _require_arch(self):
@@ -102,8 +107,10 @@ class HyVLATorchFrontendRtx(HyVLATorchFrontendOrin):
         cap = tuple(torch.cuda.get_device_capability())
         if cap not in self._SUPPORTED_CAPABILITIES:
             raise RuntimeError(
-                f"HyVLA frontend requires {self._ARCH_NAME} (capabilities "
-                f"{self._SUPPORTED_CAPABILITIES}), found capability {cap}. Set "
+                f"HyVLA frontend requires {self._ARCH_NAME} "
+                f"(capability {self._REQUIRED_CAPABILITY}), found capability "
+                f"{cap}. This backend is built for sm_120a; SM121 / GB10 needs "
+                "a separate -DGPU_ARCH=121 build and is not validated. Set "
                 f"{self._FORCE_ARCH_ENV}=1 to bypass this check for "
                 "development only.")
 
@@ -112,7 +119,7 @@ class HyVLATorchFrontendRtx(HyVLATorchFrontendOrin):
                  use_fp4_expert: bool = False,
                  use_fused: bool = True, use_fp8_block128: bool | None = None,
                  **kwargs):
-        """SM120/SM121 frontend.
+        """SM120 frontend.
 
         Precision tiers follow the same named-kwarg convention as
         ``HyVLATorchFrontendThor`` so that ``load_model`` (which forwards

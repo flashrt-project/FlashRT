@@ -1,4 +1,4 @@
-"""Dispatch smoke for HyVLA on RTX consumer Blackwell (SM120/SM121)."""
+"""Dispatch smoke for HyVLA on RTX consumer Blackwell (SM120)."""
 
 import pytest
 

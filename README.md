@@ -1189,7 +1189,7 @@ Expected: `P50: ~44 ms (23 Hz)` on Thor.
 - **GROOT N1.6** (`config="groot"`) — [API snippets](#api-snippets), [GROOT embodiment slots](#groot-n16-embodiment-slots)
 - **GROOT N1.7** (`config="groot_n17"`) — 23.7 ms on Jetson AGX Thor (NVFP4 + FA4 tier, LIBERO 1-view; 36.8 ms FP8), 16.6 ms on RTX 5090 (2-view base, full graph); [usage guide](USAGE.md#groot-n17-rtx), [API snippet](#groot-n17-rtx)
 - **Pi0-FAST** (`config="pi0fast"`) — [usage guide](USAGE.md#pi0-fast), [performance modes](#pi0-fast-performance-modes)
-- **Hy-Embodied-0.5-VLA** (`config="hyvla"`) — Jetson Thor SM110, Jetson Orin SM87, and RTX SM120/SM121 (SM120 block-128 FP8 with a default NVFP4 ViT + VLM-prefill tier, expert tower on FP8); [RTX SM120 usage](docs/hyvla05_rtx_sm120.md), [Thor notes](docs/hyvla05_thor_sm110.md), [Orin SM87 notes](docs/hyvla05_orin_sm87.md)
+- **Hy-Embodied-0.5-VLA** (`config="hyvla"`) — Jetson Thor SM110, Jetson Orin SM87, and RTX SM120 (SM120 block-128 FP8 with a default NVFP4 ViT + VLM-prefill tier, expert tower on FP8); [RTX SM120 usage](docs/hyvla05_rtx_sm120.md), [Thor notes](docs/hyvla05_thor_sm110.md), [Orin SM87 notes](docs/hyvla05_orin_sm87.md)
 - **LingBot-VLA** — [LingBot usage](docs/lingbot_usage.md), [Thor latency](docs/lingbot_usage.md#5-accuracy--latency-thor-sm_110-cuda-graph-replay)
 - **Motus Stage3 RTX beta** (`config="motus"`) — [Motus usage](docs/motus_usage_beta.md), [legacy async chunk runner](docs/rtc_lite_design.md)
 - **Wan2.2 TI2V-5B** (`config="wan22_ti2v_5b"`) — [Wan2.2 usage](docs/wan22_usage.md)

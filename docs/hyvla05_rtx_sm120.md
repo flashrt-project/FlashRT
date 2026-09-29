@@ -1,6 +1,6 @@
-# Hy-Embodied-0.5-VLA on RTX consumer Blackwell (SM120 / SM121)
+# Hy-Embodied-0.5-VLA on RTX consumer Blackwell (SM120)
 
-> RTX (SM120/SM121) adaptation of the existing HyVLA Thor path. SM120 has
+> RTX (SM120) adaptation of the existing HyVLA Thor path. SM120 has
 > tcgen05 FP8 (block-128) and NVFP4 tensor cores but neither the SM110 (Thor)
 > FP8 megakernel path nor the SM80-family INT8 W8A8 kernels that Orin SM87
 > uses. The RTX frontend keeps the validated HyVLA IO / prefix / CUDA-graph
@@ -12,7 +12,7 @@
 | Field | Value |
 |---|---|
 | Device | NVIDIA GeForce RTX 5060 Ti (Blackwell) — the validation target |
-| GPU family | SM120 (validated); SM121 is accepted by the gate but has **not** been run |
+| GPU family | SM120 only (validated); built as `sm_120a`. SM121 / GB10 is **out of scope** for this build (see Limitations) |
 | Native FP8 / FP4 | FP8 e4m3 block-128 (tcgen05), NVFP4 W4A4 |
 | CUDA toolkit | 13.0 |
 | Driver | 595.84 |
@@ -50,7 +50,7 @@ target without a hardware argument.
 | `csrc/attention/fa2_tile_inst/flash_fwd_smallq_bf16_sm80.cu` | short-query FA2 tile (`fwd_bf16_tile`, head_dim ≤ 128): `<96,64,32,4>` / `<128,64,64,4>` instead of the vendored `<128,64,4>`; handles a runtime head_dim 72 via the `is_even_K=false` path. |
 | `tests/test_rtx_hyvla05_e2e_check.py` | BF16 baseline vs default-tier fixed-noise smoke, eager reproducibility, input boundaries, and the optional real-frame 0.999 gate. |
 | `tests/test_rtx_hyvla05_graphsafe.py` | graph-vs-eager and replay-stability gates. |
-| `tests/test_rtx_hyvla05_arch_gate.py` | SM120/SM121 fail-fast gate and named-tier signature contract (mocked CUDA, no device). |
+| `tests/test_rtx_hyvla05_arch_gate.py` | SM120 fail-fast gate (rejects SM121) and named-tier signature contract (mocked CUDA, no device). |
 | `tests/test_rtx_hyvla05_dispatch.py` | dispatch resolution and pipeline binding. |
 | `tests/test_rtx_hyvla05_routing.py` | `load_model` named-tier forwarding. |
 
@@ -225,10 +225,12 @@ when needed.
   accumulation); precision is bounded by cosine, not exactness.
 - The prefix / mask / RoPE tables are cached per `(prompt, num_cam)` in the
   shared frontend, so the first call per prompt pays the build cost.
-- Only **SM120** (RTX 5060 Ti) has been validated end-to-end. The gate also
-  accepts SM121 (capability 12.1), but no SM121 device was available for this
-  bring-up; treat SM121 as structurally supported and unvalidated until a
-  hardware report is attached.
+- Only **SM120** (RTX 5060 Ti) has been validated end-to-end. SM121 / GB10
+  (capability 12.1) is **out of scope** for this backend: the shipped build is
+  `sm_120a` (architecture-specific), which does not run on SM121, and there is
+  no base PTX fallback. The dispatcher rejects capability 12.1 up front.
+  Supporting SM121 requires a separate `-DGPU_ARCH=121` build (`sm_121a`) plus
+  its own validation.
 - The `load_model` default on sm120 is `use_fp8=True, use_fp4=True,
   use_fp4_expert=False`; pass `use_fp8=False` for the BF16 reference path or
   `use_fp4_expert=True` (via the frontend constructor) for the all-NVFP4 tier.
