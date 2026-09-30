@@ -7,7 +7,7 @@
 //   layer_norm_fp8_static_fp16_vec
 // Mirrors csrc/kernels/norm.cu, csrc/kernels/rope_qwen3.cu and
 // csrc/kernels/vec_fp16_backbone.cu host-wrapper signatures and
-// per-element math exactly (fp32 intermediates, clamp ±448, and the
+// per-element math exactly (fp32 intermediates, target FP8 clamp, and the
 // fp16 round-through before quantize in layer_norm_fp8_static_*).
 //
 // Reductions use the tree's wave64 block_reduce_sum (common_hip.h);
@@ -21,11 +21,11 @@
 // later against profiles. rms_norm_fp16_vec binds to the existing
 // rms_norm_fp16 (kernels/norm.hip) — same math, not duplicated.
 //
-// FP8 output dtype: OCP e4m3 via __hip_fp8_e4m3 (never fnuz).
+// FP8 output dtype and finite range come from arch.h.
 // ================================================================
 
 #include "common_hip.h"
-#include <hip/hip_fp8.h>
+#include "../arch.h"
 #include <cstdint>
 
 // Existing launcher from kernels/norm.hip (host-side call only).
@@ -112,8 +112,8 @@ __global__ void nrm16_layer_norm_fp8_static_fp16_kernel(
             (__half2float(xv.x) - mean) * inv_std * __half2float(wv.x) + __half2float(bv.x)));
         const float v1 = __half2float(__float2half(
             (__half2float(xv.y) - mean) * inv_std * __half2float(wv.y) + __half2float(bv.y)));
-        out_row[2*i]   = __hip_fp8_e4m3(fminf(fmaxf(v0 * inv_scale, -448.f), 448.f));
-        out_row[2*i+1] = __hip_fp8_e4m3(fminf(fmaxf(v1 * inv_scale, -448.f), 448.f));
+        out_row[2*i]   = __hip_fp8_e4m3(fminf(fmaxf(v0 * inv_scale, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite));
+        out_row[2*i+1] = __hip_fp8_e4m3(fminf(fmaxf(v1 * inv_scale, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite));
     }
 }
 
@@ -173,8 +173,8 @@ __global__ void nrm16_rms_norm_fp8_fp16_kernel(
         __half2 xv = x2[i], wv = w2[i];
         float v0 = __half2float(xv.x) * rms * __half2float(wv.x) * inv_scale;
         float v1 = __half2float(xv.y) * rms * __half2float(wv.y) * inv_scale;
-        out_row[2*i]   = __hip_fp8_e4m3(fminf(fmaxf(v0, -448.0f), 448.0f));
-        out_row[2*i+1] = __hip_fp8_e4m3(fminf(fmaxf(v1, -448.0f), 448.0f));
+        out_row[2*i]   = __hip_fp8_e4m3(fminf(fmaxf(v0, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite));
+        out_row[2*i+1] = __hip_fp8_e4m3(fminf(fmaxf(v1, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite));
     }
 }
 
@@ -208,8 +208,8 @@ __global__ void nrm16_residual_add_rms_norm_fp8_fp16_kernel(
         __half2 rv = res2[i], wv = w2[i];
         float v0 = __half2float(rv.x) * rms * __half2float(wv.x) * inv_scale;
         float v1 = __half2float(rv.y) * rms * __half2float(wv.y) * inv_scale;
-        out_row[2*i]   = __hip_fp8_e4m3(fminf(fmaxf(v0, -448.0f), 448.0f));
-        out_row[2*i+1] = __hip_fp8_e4m3(fminf(fmaxf(v1, -448.0f), 448.0f));
+        out_row[2*i]   = __hip_fp8_e4m3(fminf(fmaxf(v0, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite));
+        out_row[2*i+1] = __hip_fp8_e4m3(fminf(fmaxf(v1, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite));
     }
 }
 

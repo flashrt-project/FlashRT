@@ -1,7 +1,7 @@
 #include "smallm_fp8.h"
 
 #include <hip/hip_bf16.h>
-#include <hip/hip_fp8.h>
+#include "../arch.h"
 #include <cstdint>
 #include <cstdlib>
 #include <stdexcept>

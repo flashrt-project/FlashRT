@@ -1,4 +1,4 @@
-# GROOT N1.7 on AMD Instinct (MI350X / CDNA4)
+# GROOT N1.7 on AMD Instinct (MI300X / CDNA3 and MI350X / CDNA4)
 
 Model-specific guide. For hardware support, the build, routing, shared
 environment knobs and the test suite, see
@@ -6,13 +6,18 @@ environment knobs and the test suite, see
 
 ## Performance
 
+GROOT uses OCP E4M3 and the packed small-M path on gfx950. On gfx942 it uses
+E4M3 FNUZ and hipBLASLt for GEMMs that have no CDNA3 packed implementation.
+
 GROOT N1.7 (3.1 B: Qwen3-VL ViT + truncated Cosmos-Reason2 LLM + VL
 adapter + 32-layer DiT action head), 2 camera views, 4-step flow
 matching, action horizon 40. Median **full-frame** end-to-end latency —
 a fresh observation through the backbone graph plus the action chain,
 i.e. what a serving loop pays per frame:
 
-| Configuration | Latency | vs eager |
+### MI350X (gfx950)
+
+| Configuration | Median latency | vs eager |
 |---|---|---|
 | PyTorch eager (official policy) | 67.9 ms | 1.00× |
 | torch.compile (max-autotune) | 77.9 ms | 0.87× |
@@ -30,6 +35,25 @@ Accuracy: combined denormalized-action cosine against the reference is
 **0.9995** with the initial noise pinned (per-modality: end-effector and
 joint targets above 0.999; the 1-D gripper signal is near-constant over
 a trajectory so its cosine is naturally lower and is not a useful gate).
+
+### MI300X (gfx942)
+
+Measured on this RunPod with ROCm 7.2.4 and AITER, from DROID trajectory 1,
+step 0, using the official two-view preprocessing path (277 sequence tokens
+and 1,024 vision tokens), 50 warmup replays and 100 measured calls:
+
+| Boundary | Min | Median | p95 | Max |
+|---|---:|---:|---:|---:|
+| Backbone + action chain | 19.52 ms | 19.58 ms | 19.77 ms | 34.37 ms |
+| Backbone graph | 8.05 ms | 8.10 ms | 8.14 ms | 8.18 ms |
+| Four-step action chain | 11.39 ms | 11.41 ms | 11.43 ms | 16.88 ms |
+
+The timed full boundary starts with the tensors emitted by the official GROOT
+processor and ends with the normalized action tensor. Video decode and CPU
+processor work are outside it. Graph replay is bit-identical. After official
+denormalization with the same real state, all 680 action values compare with
+cosine **0.999934**, maximum absolute error **0.04519**, and mean absolute
+error **0.00593** against the official policy output.
 
 ## Usage
 
@@ -58,8 +82,8 @@ The tier here is an **FP8 backbone with an unquantized bf16 DiT action
 head**. Note this is deliberately *less* quantized than the Thor and RTX
 FP8 frontends, which additionally run the DiT FFN and fused
 self-attention QKV in FP8 (`_DIT_USE_FP8 = True`); that DiT calibration
-path is not ported to CDNA4 yet, so it remains available headroom rather
-than a shipped capability.
+path is not ported to the AMD frontend yet, so it remains available headroom
+rather than a shipped capability.
 
 - ViT, DeepStack mergers, the truncated LLM and the VL self-attention
   adapter run FP8 GEMMs with per-tensor activation scales.
@@ -71,7 +95,7 @@ than a shipped capability.
 
 There is no BF16-only tier: `use_fp8=False` without `use_fp16=True` is
 rejected rather than silently ignored, and the non-quantized full-FP16
-reference tier is not ported to CDNA4 (`use_fp16=True` raises
+reference tier is not ported to AMD (`use_fp16=True` raises
 `NotImplementedError`).
 
 ## Attention
@@ -93,7 +117,7 @@ Both are controlled by environment knobs so either can be A/B'd against
 the decomposed form in one process.
 
 **Fused GEMM epilogues** (`FVK_AMD_FUSED_EPILOGUE`, default on) —
-hipBLASLt on gfx950 supports fused FP8 bias and bias+GELU epilogues that
+hipBLASLt supports fused FP8 bias and bias+GELU epilogues that
 the CUDA SM120 path cannot use, so the backbone runs
 `fp8_nn_bias`/`fp8_nn_gelu_bias` instead of a descale GEMM followed by
 separate bias and activation kernels. The DiT and the frontend's own
@@ -107,6 +131,11 @@ before the output rounding, where the decomposed form adds it after.
 The difference is last-ULP and is judged by the end-to-end cosine gate,
 not by bit equality.
 
+On gfx942 this switch is also decisive: the same real frame measured
+**19.72 ms median with fusion** and **29.42 ms without fusion**. Those A/B
+runs used 20 warmups and 50 calls; the longer result above is the reported
+absolute benchmark.
+
 **Packed-weight MFMA GEMMs** (`FVK_AMD_DIT_GEMM`, default `smallm`) —
 the DiT projections are a small-M, weight-bandwidth-bound shape
 (M = 41 action+state tokens). A hand-written MFMA kernel with weights
@@ -116,7 +145,10 @@ effective weight bandwidth) and is routed for the Q/K/V/O projections
 only. The FFN shapes measured slower than the library and deliberately
 stay on hipBLASLt — routing is by measured shape list, not blanket
 substitution. Set `FVK_AMD_DIT_GEMM=hipblaslt` to disable the routing;
-the packing costs roughly 430 MB of additional weight storage.
+the packing costs roughly 430 MB of additional weight storage. This route is
+a gfx950 capability for GROOT's BF16 DiT shapes. On gfx942 the capability
+layer rejects packed BF16 MFMA and uses hipBLASLt, even when the default knob
+remains `smallm`.
 
 ## Environment knobs
 
@@ -125,7 +157,7 @@ Shared knobs are in [deployment_amd.md](deployment_amd.md). GROOT-specific:
 | Env | Default | Meaning |
 |---|---|---|
 | `FVK_AMD_FUSED_EPILOGUE` | `1` | fused GEMM epilogues and fused norm→quantize chains; `0` selects the decomposed form (also switches the DiT driver back to the hardware-independent forward) |
-| `FVK_AMD_DIT_GEMM` | `smallm` | DiT projection GEMMs: `smallm` (packed-weight MFMA on the measured-faster shape) or `hipblaslt` |
+| `FVK_AMD_DIT_GEMM` | `smallm` | DiT projection GEMMs: `smallm` requests packed-weight MFMA where supported (gfx950); otherwise hipBLASLt is used |
 
 Both are read at setup and graph-build time, never on the inference
 path; changing them after the graphs are built has no effect.
@@ -149,12 +181,19 @@ without ROCm, the extension, or the checkpoint.
 
 ## Reproducing the numbers
 
-1. Build on a gfx950 machine (see the general guide) with aiter
+1. Build for the installed architecture (see the general guide) with aiter
    importable — without it attention falls back to torch SDPA and every
    number here shifts.
-2. Run a full-frame loop: `set_prompt` once, then `infer(state, aux=aux,
-   initial_noise=pinned)` in a timed loop after warmup, reporting the
-   median.
+2. Capture an aux fixture from official preprocessing, then run:
+
+   ```bash
+   taskset -c 48-63 python benchmarks/groot_n17_amd_latency.py \
+     --ckpt <groot_n17_checkpoint_dir> --aux <single_observation.pt> \
+     --warmup 50 --iters 100 --json-out groot-amd.json
+   ```
+
+   `48-63` is the compact GPU-local CPU set for the measured pod. Determine
+   the selected GPU's NUMA node before choosing a set on another host.
 3. Judge accuracy on the same call with the initial noise pinned to the
    array the reference was generated with, comparing denormalized
    actions per modality.

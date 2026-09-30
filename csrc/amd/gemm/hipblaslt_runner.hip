@@ -36,9 +36,8 @@
 //   "B" and d_scale_b (weights) to operand "A". The product
 //   scale_a * scale_b * (A@B) is unchanged.
 //
-// FP8 dtype: OCP e4m3 (HIP_R_8F_E4M3) — gfx950 native. Never the
-// fnuz variant. BF16 = HIP_R_16BF. Compute type = HIPBLAS_COMPUTE_32F
-// with FP32 scale type, matching CUBLAS_COMPUTE_32F / CUDA_R_32F.
+// FP8 storage and compute types are selected by arch.h. BF16 remains
+// HIP_R_16BF and scales remain FP32 on both supported generations.
 // ================================================================
 
 GemmRunner::GemmRunner() {
@@ -86,20 +85,21 @@ GemmRunner::CachedGemm& GemmRunner::get_or_create_cached(GemmType type, int M, i
     hipblasOperation_t op_T = HIPBLAS_OP_T;
 
     if (type == FP8_NN_DEV) {
-        HIPBLASLT_CHECK(hipblasLtMatmulDescCreate(&entry.matmul_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
+        HIPBLASLT_CHECK(hipblasLtMatmulDescCreate(&entry.matmul_desc, flashrt::amd::arch::fp8_compute_type, HIP_R_32F));
         HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSA, &op_N, sizeof(op_N)));
         HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSB, &op_N, sizeof(op_N)));
-        HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.op0_desc, HIP_R_8F_E4M3, N, K, N));
-        HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.op1_desc, HIP_R_8F_E4M3, K, M, K));
+        HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.op0_desc, flashrt::amd::arch::fp8_hip_type, N, K, N));
+        HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.op1_desc, flashrt::amd::arch::fp8_hip_type, K, M, K));
         HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.D_desc, HIP_R_16BF, N, M, N));
     } else if (type == FP8_NT_DEV) {
-        HIPBLASLT_CHECK(hipblasLtMatmulDescCreate(&entry.matmul_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
+        HIPBLASLT_CHECK(hipblasLtMatmulDescCreate(&entry.matmul_desc, flashrt::amd::arch::fp8_compute_type, HIP_R_32F));
         HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSA, &op_T, sizeof(op_T)));
         HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSB, &op_N, sizeof(op_N)));
-        HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.op0_desc, HIP_R_8F_E4M3, K, N, K));
-        HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.op1_desc, HIP_R_8F_E4M3, K, M, K));
+        HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.op0_desc, flashrt::amd::arch::fp8_hip_type, K, N, K));
+        HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.op1_desc, flashrt::amd::arch::fp8_hip_type, K, M, K));
         HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.D_desc, HIP_R_16BF, N, M, N));
     } else if (type == MXFP4_NT_DEV) {
+#if defined(FLASHRT_AMD_CDNA4)
         // MXFP4 a4w4: same NT col-major swap as FP8_NT_DEV, which lands on
         // library-TN (TRANSA=T, TRANSB=N) — the canonical (and, per the
         // hipBLASLt MX samples, only exercised) layout for fp4 GEMM.
@@ -123,6 +123,9 @@ GemmRunner::CachedGemm& GemmRunner::get_or_create_cached(GemmType type, int M, i
         HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.op0_desc, fp4_type, K, N, K));
         HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.op1_desc, fp4_type, K, M, K));
         HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.D_desc, HIP_R_16BF, N, M, N));
+#else
+        throw std::runtime_error("MXFP4 is unavailable on CDNA3/gfx942");
+#endif
     } else if (type == FP16_NN) {
         // FP16 in/out, same NN col-major swap as BF16_NN.
         HIPBLASLT_CHECK(hipblasLtMatmulDescCreate(&entry.matmul_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
@@ -133,11 +136,11 @@ GemmRunner::CachedGemm& GemmRunner::get_or_create_cached(GemmType type, int M, i
         HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.D_desc, HIP_R_16F, N, M, N));
     } else if (type == FP8_NN_DEV_FP16) {
         // FP8 inputs with device descale, FP16 output (fp8_descale_fp16).
-        HIPBLASLT_CHECK(hipblasLtMatmulDescCreate(&entry.matmul_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
+        HIPBLASLT_CHECK(hipblasLtMatmulDescCreate(&entry.matmul_desc, flashrt::amd::arch::fp8_compute_type, HIP_R_32F));
         HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSA, &op_N, sizeof(op_N)));
         HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSB, &op_N, sizeof(op_N)));
-        HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.op0_desc, HIP_R_8F_E4M3, N, K, N));
-        HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.op1_desc, HIP_R_8F_E4M3, K, M, K));
+        HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.op0_desc, flashrt::amd::arch::fp8_hip_type, N, K, N));
+        HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.op1_desc, flashrt::amd::arch::fp8_hip_type, K, M, K));
         HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.D_desc, HIP_R_16F, N, M, N));
     } else {
         // BF16_NN or BF16_NN_RES (identical descriptors — only the
@@ -732,7 +735,7 @@ static void fp8_epilogue_nn(hipblasLtHandle_t handle,
     hipblasLtMatmulDesc_t matmul_desc;
     hipblasLtMatrixLayout_t op0_desc, op1_desc, D_desc;
 
-    HIPBLASLT_CHECK(hipblasLtMatmulDescCreate(&matmul_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
+    HIPBLASLT_CHECK(hipblasLtMatmulDescCreate(&matmul_desc, flashrt::amd::arch::fp8_compute_type, HIP_R_32F));
     hipblasOperation_t op_N = HIPBLAS_OP_N;
     HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSA, &op_N, sizeof(op_N)));
     HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSB, &op_N, sizeof(op_N)));
@@ -742,8 +745,8 @@ static void fp8_epilogue_nn(hipblasLtHandle_t handle,
     hipDataType bias_type = HIP_R_16F;
     HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(matmul_desc, HIPBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bias_type, sizeof(bias_type)));
 
-    HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&op0_desc, HIP_R_8F_E4M3, N, K, N));
-    HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&op1_desc, HIP_R_8F_E4M3, K, M, K));
+    HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&op0_desc, flashrt::amd::arch::fp8_hip_type, N, K, N));
+    HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&op1_desc, flashrt::amd::arch::fp8_hip_type, K, M, K));
     HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&D_desc, HIP_R_16F, N, M, N));
 
     hipblasLtMatmulPreference_t preference;

@@ -21,16 +21,15 @@
 // summation order differs from the CUDA warp32 originals — last-ULP
 // differences only, gated by the cos parity suite.
 //
-// FP8 output dtype: OCP e4m3 via __hip_fp8_e4m3 (never fnuz);
-// values pre-clamped to ±448 exactly as in the CUDA originals.
+// FP8 output dtype and finite range come from arch.h.
 // ================================================================
 
 #include "common_hip.h"
-#include <hip/hip_fp8.h>
+#include "../arch.h"
 
 namespace {  // internal kernels
 
-constexpr float kFp8Max = 448.0f;
+constexpr float kFp8Max = flashrt::amd::arch::fp8_max_finite;
 
 // ── LayerNorm (no affine) — BF16, row per block ──
 __global__ void aln_layer_norm_no_affine_bf16_kernel(

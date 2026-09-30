@@ -218,7 +218,7 @@
 
 #include "../kernels/common_hip.h"
 
-#include <hip/hip_fp8.h>
+#include "../arch.h"
 
 #include <cfloat>
 #include <cstdlib>
@@ -546,7 +546,7 @@ void attention_decoder_gqa_reduce_kernel(
             // (single division), pre-clamp +-448, e4m3 convert.
             const float inv = 1.0f / (*d_scale);
             const float f =
-                fminf(fmaxf(__bfloat162float(b) * inv, -448.0f), 448.0f);
+                fminf(fmaxf(__bfloat162float(b) * inv, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite);
             O_fp8[o_off] = __hip_fp8_e4m3(f);
         }
     }
@@ -629,7 +629,7 @@ void attention_decoder_gqa_reduce_alt_kernel(
         if (O_fp8 != nullptr) {
             const float inv = 1.0f / (*d_scale);
             const float f =
-                fminf(fmaxf(__bfloat162float(b) * inv, -448.0f), 448.0f);
+                fminf(fmaxf(__bfloat162float(b) * inv, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite);
             O_fp8[o_off] = __hip_fp8_e4m3(f);
         }
     }
@@ -802,9 +802,9 @@ void attention_decoder_gqa_fused_kernel(
             // (single division), pre-clamp +-448, e4m3 convert.
             const float inv = 1.0f / (*d_scale);
             const float fx =
-                fminf(fmaxf(__bfloat162float(bx) * inv, -448.0f), 448.0f);
+                fminf(fmaxf(__bfloat162float(bx) * inv, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite);
             const float fy =
-                fminf(fmaxf(__bfloat162float(by) * inv, -448.0f), 448.0f);
+                fminf(fmaxf(__bfloat162float(by) * inv, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite);
             O_fp8[o_off]     = __hip_fp8_e4m3(fx);
             O_fp8[o_off + 1] = __hip_fp8_e4m3(fy);
         }

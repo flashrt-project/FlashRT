@@ -9,7 +9,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
-#include <hip/hip_fp8.h>
+#include "../arch.h"
 
 // ── kernels/elementwise_fp16.hip ──
 void add_bias_fp16(__half* x, const __half* b, int S, int D, hipStream_t stream);

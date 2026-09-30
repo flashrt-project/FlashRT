@@ -98,6 +98,8 @@ def test_pipeline_map_has_amd_groot_n17_entry():
     key = ("groot_n17", "torch", "amd_cdna4")
     assert key in _PIPELINE_MAP, "AMD GROOT N1.7 dispatch entry disappeared"
     assert _PIPELINE_MAP[key] == (_AMD_FRONTEND_MODULE, _AMD_FRONTEND_CLASS)
+    assert _PIPELINE_MAP[("groot_n17", "torch", "amd_cdna3")] == \
+        _PIPELINE_MAP[key]
 
 
 @_FRONTEND_SKIP
@@ -119,7 +121,7 @@ def test_resolver_rejects_unported_groot_n17_combos():
 
     for config, framework, arch in [
             ("groot_n17", "jax", "amd_cdna4"),
-            ("groot_n17", "torch", "amd_cdna3"),
+            ("groot_n17", "jax", "amd_cdna3"),
             ("groot_n17", "torch", "not_a_real_arch")]:
         with pytest.raises(RuntimeError, match="no pipeline"):
             resolve_pipeline_class(config, framework, arch)

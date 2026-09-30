@@ -185,6 +185,7 @@ class Pi05Pipeline:
         self.fvk = fvk
         self.attn = attn_backend
         self.weights = weights
+        self.cdna3_bf16_smallm = bool(weights.get("cdna3_bf16_smallm", False))
 
         # Fixed-shape state-prompt mode: one captured graph at the MAX prompt
         # length serves every length via seqused masking + devpos K/V append.
@@ -202,12 +203,24 @@ class Pi05Pipeline:
         self.num_steps = int(num_steps)
         self.use_fp8 = bool(use_fp8)
         self.use_fp8_decoder = bool(use_fp8_decoder)
+        self.hardware = weights.get("hardware")
+        self.cdna3_bf16_fusion = (
+            self.hardware == "amd_cdna3"
+            and not self.use_fp8_decoder
+            and os.environ.get("FVK_AMD_CDNA3_BF16_FUSION", "1") == "1"
+        )
         # Decoder small-M GEMM backend: "mfma" (default) routes the
         # decoder GEMMs whose weights carry an MFMA-packed copy to
         # smallm_mfma_nt_packed; "hipblaslt" keeps the library path.
         # Read once here (env flips after capture never re-evaluate).
+        _packed_fp8 = bool(weights.get("supports_packed_fp8_mfma", False))
         self.dec_gemm_backend = os.environ.get(
-            "FVK_AMD_DEC_GEMM", "mfma").strip().lower()
+            "FVK_AMD_DEC_GEMM", "mfma" if _packed_fp8 else "hipblaslt"
+        ).strip().lower()
+        if self.dec_gemm_backend == "mfma" and not _packed_fp8:
+            raise ValueError(
+                "FVK_AMD_DEC_GEMM=mfma requested, but this AMD build does "
+                "not declare packed FP8 MFMA support")
         self.vision_pool_factor = int(vision_pool_factor)
         self.vision_num_layers = int(vision_num_layers)
         if self.num_steps <= 0:
@@ -223,7 +236,6 @@ class Pi05Pipeline:
         self.fp8_layout = weights.get("fp8_layout", "kn")
         if self.fp8_layout not in ("kn", "nk"):
             raise ValueError(f"unsupported FP8 layout: {self.fp8_layout!r}")
-        self.hardware = weights.get("hardware")
         self._autotune_fp8_nt = _fp8_nt_autotune_enabled(
             self.hardware, self.fp8_layout)
         if self.fp8_layout == "nk" and not self._autotune_fp8_nt:
@@ -248,6 +260,12 @@ class Pi05Pipeline:
 
         # Allocate internal buffers (all HipBuffer, all BF16 unless noted)
         self.bufs = self._allocate_buffers()
+        if self.cdna3_bf16_smallm:
+            # The packed entry has a bias epilogue. Pi0.5 decoder projections
+            # are bias-free, so one persistent zero vector supplies the exact
+            # mathematical identity without a separate kernel.
+            self.bufs["decoder_smallm_zero_bias"] = HipBuffer.device_zeros(
+                2 * DEC_H, BF16)
 
         # RoPE table (max positions = encoder_seq_len + chunk_size)
         self._build_rope_table()
@@ -669,7 +687,7 @@ class Pi05Pipeline:
         # 64-workgroup K=4096 down-proj stays on hipblaslt (7.17 vs 6.2).
         if (self.dec_gemm_backend == "mfma"
                 and M <= 16 and N % 16 == 0 and K % 1024 == 0
-                and (K <= 2048 or N >= 8192)):
+                and (self.hardware == "amd_cdna3" or K <= 2048 or N >= 8192)):
             packed = self.weights.get("fp8_packed", {})
             wp_ptr = packed.get(weight_name)
             if wp_ptr is not None:
@@ -700,6 +718,21 @@ class Pi05Pipeline:
         self.fvk.bias_residual(
             x_ptr, self._bias_zero_buf.ptr.value, bias_ptr,
             seq, dim, stream=stream)
+
+    def _cdna3_bf16_decoder_gemm(
+            self, weight_name: str, layer: int, act_ptr: int, out_ptr: int,
+            M: int, N: int, K: int, stream: int) -> bool:
+        """Run a parity-gated packed BF16 decoder projection when present."""
+        if not self.cdna3_bf16_smallm:
+            return False
+        packed = self.weights.get("bf16_packed", {}).get(weight_name)
+        if packed is None:
+            return False
+        self.fvk.smallm_mfma_bf16_nn_bias(
+            act_ptr, packed[layer],
+            self.bufs["decoder_smallm_zero_bias"].ptr.value, out_ptr,
+            M, N, K, 3, stream)
+        return True
 
     # ══════════════════════════════════════════════════════════════════
     #   Phase A: Vision (SigLIP)
@@ -1153,7 +1186,7 @@ class Pi05Pipeline:
 
                 # 18 decoder layers
                 for i in range(DEC_L):
-                    skip_c1 = fused and i > 0
+                    skip_c1 = (fused or self.cdna3_bf16_fusion) and i > 0
                     self._decoder_layer(i, step, enc_seq, ds, skip_c1, stream)
 
                 # C8: Final AdaRMSNorm + output projection
@@ -1206,11 +1239,12 @@ class Pi05Pipeline:
                 ds, (DEC_NH + 2 * DEC_NKV) * DEC_HD, DEC_D,
                 act_scale_qkv, stream)
         else:
-            fvk.ada_rms_norm_style(
-                B["decoder_x"].ptr.value, self._rms_ones_dec.ptr.value,
-                self._style_slice_ptr("decoder_style_attn", step, i),
-                B["x_normed_buf"].ptr.value, B["gate_buf"].ptr.value,
-                ds, DEC_D, 1e-6, stream=stream)
+            if not skip_c1:
+                fvk.ada_rms_norm_style(
+                    B["decoder_x"].ptr.value, self._rms_ones_dec.ptr.value,
+                    self._style_slice_ptr("decoder_style_attn", step, i),
+                    B["x_normed_buf"].ptr.value, B["gate_buf"].ptr.value,
+                    ds, DEC_D, 1e-6, stream=stream)
             if self.use_fp8_decoder:
                 self._fp8_gemm(
                     B["x_normed_buf"].ptr.value, ds * DEC_D,
@@ -1218,10 +1252,17 @@ class Pi05Pipeline:
                     B["decoder_QKV"].ptr.value,
                     ds, (DEC_NH + 2 * DEC_NKV) * DEC_HD, DEC_D, stream)
             else:
-                gemm.bf16_nn(
-                    B["x_normed_buf"].ptr.value, W["decoder_attn_qkv_w"][i],
-                    B["decoder_QKV"].ptr.value,
-                    ds, (DEC_NH + 2 * DEC_NKV) * DEC_HD, DEC_D, stream=stream)
+                if not self._cdna3_bf16_decoder_gemm(
+                        "decoder_attn_qkv_w", i,
+                        B["x_normed_buf"].ptr.value,
+                        B["decoder_QKV"].ptr.value,
+                        ds, (DEC_NH + 2 * DEC_NKV) * DEC_HD, DEC_D, stream):
+                    gemm.bf16_nn(
+                        B["x_normed_buf"].ptr.value,
+                        W["decoder_attn_qkv_w"][i],
+                        B["decoder_QKV"].ptr.value,
+                        ds, (DEC_NH + 2 * DEC_NKV) * DEC_HD, DEC_D,
+                        stream=stream)
 
         # C2: QKV split + RoPE. Decoder K/V write into enc cache after prefix.
         if self._fixed_shape:
@@ -1283,10 +1324,14 @@ class Pi05Pipeline:
                 B["x_normed_buf"].ptr.value,
                 ds, DEC_D, DEC_NH * DEC_HD, stream)
         else:
-            gemm.bf16_nn(
-                dec_o_ptr, W["decoder_attn_o_w"][i],
-                B["x_normed_buf"].ptr.value,
-                ds, DEC_D, DEC_NH * DEC_HD, stream=stream)
+            if not self._cdna3_bf16_decoder_gemm(
+                    "decoder_attn_o_w", i, dec_o_ptr,
+                    B["x_normed_buf"].ptr.value,
+                    ds, DEC_D, DEC_NH * DEC_HD, stream):
+                gemm.bf16_nn(
+                    dec_o_ptr, W["decoder_attn_o_w"][i],
+                    B["x_normed_buf"].ptr.value,
+                    ds, DEC_D, DEC_NH * DEC_HD, stream=stream)
 
         # C4→C5: gate*residual + AdaRMSNorm + FFN gate_up
         gu_name = f"decoder_ffn_gate_up_w_{i}"    # FP8 merged name
@@ -1304,14 +1349,22 @@ class Pi05Pipeline:
                 B["decoder_gate_merged"].ptr.value,
                 ds, 2 * DEC_H, DEC_D, act_scale_gu, stream)
         else:
-            fvk.gate_mul_residual(
-                B["decoder_x"].ptr.value, B["x_normed_buf"].ptr.value,
-                B["gate_buf"].ptr.value, ds * DEC_D, stream=stream)
-            fvk.ada_rms_norm_style(
-                B["decoder_x"].ptr.value, self._rms_ones_dec.ptr.value,
-                self._style_slice_ptr("decoder_style_ffn", step, i),
-                B["x_normed_buf"].ptr.value, B["gate_buf"].ptr.value,
-                ds, DEC_D, 1e-6, stream=stream)
+            if self.cdna3_bf16_fusion:
+                fvk.gate_residual_ada_norm_bf16(
+                    B["decoder_x"].ptr.value, B["x_normed_buf"].ptr.value,
+                    B["gate_buf"].ptr.value, self._rms_ones_dec.ptr.value,
+                    self._style_slice_ptr("decoder_style_ffn", step, i),
+                    B["x_normed_buf"].ptr.value, B["gate_buf"].ptr.value,
+                    ds, DEC_D, 1e-6, stream=stream)
+            else:
+                fvk.gate_mul_residual(
+                    B["decoder_x"].ptr.value, B["x_normed_buf"].ptr.value,
+                    B["gate_buf"].ptr.value, ds * DEC_D, stream=stream)
+                fvk.ada_rms_norm_style(
+                    B["decoder_x"].ptr.value, self._rms_ones_dec.ptr.value,
+                    self._style_slice_ptr("decoder_style_ffn", step, i),
+                    B["x_normed_buf"].ptr.value, B["gate_buf"].ptr.value,
+                    ds, DEC_D, 1e-6, stream=stream)
             if self.use_fp8_decoder:
                 self._fp8_gemm(
                     B["x_normed_buf"].ptr.value, ds * DEC_D,
@@ -1319,14 +1372,21 @@ class Pi05Pipeline:
                     B["decoder_gate_merged"].ptr.value,
                     ds, 2 * DEC_H, DEC_D, stream)
             else:
-                gemm.bf16_nn(
-                    B["x_normed_buf"].ptr.value, W["decoder_ffn_gate_w"][i],
-                    B["decoder_gate_merged"].ptr.value,
-                    ds, DEC_H, DEC_D, stream=stream)
-                gemm.bf16_nn(
-                    B["x_normed_buf"].ptr.value, W["decoder_ffn_up_w"][i],
-                    B["decoder_hidden"].ptr.value,
-                    ds, DEC_H, DEC_D, stream=stream)
+                if not self._cdna3_bf16_decoder_gemm(
+                        "decoder_ffn_gate_up_w", i,
+                        B["x_normed_buf"].ptr.value,
+                        B["decoder_gate_merged"].ptr.value,
+                        ds, 2 * DEC_H, DEC_D, stream):
+                    gemm.bf16_nn(
+                        B["x_normed_buf"].ptr.value,
+                        W["decoder_ffn_gate_w"][i],
+                        B["decoder_gate_merged"].ptr.value,
+                        ds, DEC_H, DEC_D, stream=stream)
+                    gemm.bf16_nn(
+                        B["x_normed_buf"].ptr.value,
+                        W["decoder_ffn_up_w"][i],
+                        B["decoder_hidden"].ptr.value,
+                        ds, DEC_H, DEC_D, stream=stream)
 
         # C6: SiLU(gate) * up → FFN down
         down_name = f"decoder_ffn_down_w_{i}"
@@ -1351,11 +1411,17 @@ class Pi05Pipeline:
                 B["x_normed_buf"].ptr.value,
                 ds, DEC_D, DEC_H, stream)
         else:
-            fvk.gate_geglu(
-                B["decoder_gate_merged"].ptr.value,
-                B["decoder_hidden"].ptr.value,
-                B["decoder_hidden"].ptr.value,
-                ds * DEC_H, stream=stream)
+            if self.cdna3_bf16_smallm:
+                fvk.gate_geglu_merged(
+                    B["decoder_gate_merged"].ptr.value,
+                    B["decoder_hidden"].ptr.value,
+                    ds, DEC_H, stream=stream)
+            else:
+                fvk.gate_geglu(
+                    B["decoder_gate_merged"].ptr.value,
+                    B["decoder_hidden"].ptr.value,
+                    B["decoder_hidden"].ptr.value,
+                    ds * DEC_H, stream=stream)
             gemm.bf16_nn(
                 B["decoder_hidden"].ptr.value, W["decoder_ffn_down_w"][i],
                 B["x_normed_buf"].ptr.value,
@@ -1372,6 +1438,13 @@ class Pi05Pipeline:
                 self._style_slice_ptr("decoder_style_attn", step, i + 1),
                 B["dec_act_fp8"].ptr.value, B["gate_buf"].ptr.value,
                 ds, DEC_D, 1e-6, act_scale_next, stream=stream)
+        elif self.cdna3_bf16_fusion and i < DEC_L - 1:
+            fvk.gate_residual_ada_norm_bf16(
+                B["decoder_x"].ptr.value, B["x_normed_buf"].ptr.value,
+                B["gate_buf"].ptr.value, self._rms_ones_dec.ptr.value,
+                self._style_slice_ptr("decoder_style_attn", step, i + 1),
+                B["x_normed_buf"].ptr.value, B["gate_buf"].ptr.value,
+                ds, DEC_D, 1e-6, stream=stream)
         else:
             fvk.gate_mul_residual(
                 B["decoder_x"].ptr.value, B["x_normed_buf"].ptr.value,

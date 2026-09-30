@@ -4,7 +4,7 @@
 #include <hip/hip_bf16.h>
 
 // ================================================================
-// FlashRT AMD — MFMA small-M FP8 GEMM (gfx950, wave64)
+// FlashRT AMD — MFMA small-M FP8 GEMM (gfx942/gfx950, wave64)
 //
 // Second-generation hand kernel for the decoder's tiny-M GEMMs,
 // built on two measured facts from the M4/M5 campaigns:
@@ -26,8 +26,9 @@
 // Structure: grid = N/16 workgroups x 256 threads (4 waves). Each
 // workgroup owns a 16-column tile; the 4 waves split K in 4 fixed
 // segments, accumulate with V_MFMA_F32_16X16X32_FP8_FP8 (FP32
-// accumulators, OCP e4m3 operands — gfx950 MFMA fp8 is OCP, not
-// fnuz), then reduce the 4 partials in ascending-wave order through
+// accumulators). The instruction consumes architecture-native bytes:
+// E4M3 FNUZ on gfx942 and OCP E4M3 on gfx950; the packed fragment
+// geometry is shared. The 4 partials are reduced in order through
 // LDS and apply dsa*dsb before one BF16 store. No atomics; replay
 // inside a captured graph is bit-identical.
 //

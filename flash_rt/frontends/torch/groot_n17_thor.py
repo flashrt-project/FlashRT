@@ -900,25 +900,30 @@ class GrootN17TorchFrontendThor:
         they need in ``self.<stage>_*`` attrs."""
         from flash_rt.models.groot_n17 import calibration as cal
         device = self.device
+        fp8_max = float(getattr(self, "_weight_fp8_max_finite", cal.FP8_MAX))
 
         def to_devs(amaxes):
-            return [cal.amax_to_dev_scale(a, device=device) for a in amaxes]
+            return [cal.amax_to_dev_scale(
+                a, device=device, fp8_max=fp8_max) for a in amaxes]
+
+        def alpha(amax, weight_scale):
+            return cal.alpha(amax, weight_scale, fp8_max=fp8_max)
 
         # ── ViT (24L × 4 quants per layer; alpha = act × weight) ───────
         self._vit_act_qkv_dev = to_devs(out_vit["vit_act_qkv"])
         self._vit_act_o_dev   = to_devs(out_vit["vit_act_o"])
         self._vit_act_fc1_dev = to_devs(out_vit["vit_act_fc1"])
         self._vit_act_fc2_dev = to_devs(out_vit["vit_act_fc2"])
-        self._vit_alpha_q = [cal.alpha(out_vit["vit_act_qkv"][i], self._vit_alpha[i*4+0]) for i in range(24)]
-        self._vit_alpha_o = [cal.alpha(out_vit["vit_act_o"][i],   self._vit_alpha[i*4+1]) for i in range(24)]
-        self._vit_alpha_fc1 = [cal.alpha(out_vit["vit_act_fc1"][i], self._vit_alpha[i*4+2]) for i in range(24)]
-        self._vit_alpha_fc2 = [cal.alpha(out_vit["vit_act_fc2"][i], self._vit_alpha[i*4+3]) for i in range(24)]
+        self._vit_alpha_q = [alpha(out_vit["vit_act_qkv"][i], self._vit_alpha[i*4+0]) for i in range(24)]
+        self._vit_alpha_o = [alpha(out_vit["vit_act_o"][i], self._vit_alpha[i*4+1]) for i in range(24)]
+        self._vit_alpha_fc1 = [alpha(out_vit["vit_act_fc1"][i], self._vit_alpha[i*4+2]) for i in range(24)]
+        self._vit_alpha_fc2 = [alpha(out_vit["vit_act_fc2"][i], self._vit_alpha[i*4+3]) for i in range(24)]
 
         # ── DeepStack (3 mergers × 2 quants) ───────────────────────────
         self._dsm_act_fc1_dev = to_devs(out_ds["deepstack_act_fc1"])
         self._dsm_act_fc2_dev = to_devs(out_ds["deepstack_act_fc2"])
-        self._dsm_alpha_fc1 = [cal.alpha(out_ds["deepstack_act_fc1"][j], self._dsm_alpha[j*2+0]) for j in range(3)]
-        self._dsm_alpha_fc2 = [cal.alpha(out_ds["deepstack_act_fc2"][j], self._dsm_alpha[j*2+1]) for j in range(3)]
+        self._dsm_alpha_fc1 = [alpha(out_ds["deepstack_act_fc1"][j], self._dsm_alpha[j*2+0]) for j in range(3)]
+        self._dsm_alpha_fc2 = [alpha(out_ds["deepstack_act_fc2"][j], self._dsm_alpha[j*2+1]) for j in range(3)]
 
         # ── LLM (16L × 4 distinct act scales; 5 alphas/layer for 5 GEMMs) ──
         self._llm_act_qkv_dev    = to_devs(out_llm["llm_act_qkv"])
@@ -926,11 +931,11 @@ class GrootN17TorchFrontendThor:
         self._llm_act_gateup_dev = to_devs(out_llm["llm_act_gateup"])
         self._llm_act_down_dev   = to_devs(out_llm["llm_act_down"])
         # _llm_alpha layout: [qkv, o, gate, up, down] per layer
-        self._llm_alpha_qkv  = [cal.alpha(out_llm["llm_act_qkv"][i], self._llm_alpha[i*5+0]) for i in range(16)]
-        self._llm_alpha_o    = [cal.alpha(out_llm["llm_act_o"][i],   self._llm_alpha[i*5+1]) for i in range(16)]
-        self._llm_alpha_gate = [cal.alpha(out_llm["llm_act_gateup"][i], self._llm_alpha[i*5+2]) for i in range(16)]
-        self._llm_alpha_up   = [cal.alpha(out_llm["llm_act_gateup"][i], self._llm_alpha[i*5+3]) for i in range(16)]
-        self._llm_alpha_down = [cal.alpha(out_llm["llm_act_down"][i],   self._llm_alpha[i*5+4]) for i in range(16)]
+        self._llm_alpha_qkv = [alpha(out_llm["llm_act_qkv"][i], self._llm_alpha[i*5+0]) for i in range(16)]
+        self._llm_alpha_o = [alpha(out_llm["llm_act_o"][i], self._llm_alpha[i*5+1]) for i in range(16)]
+        self._llm_alpha_gate = [alpha(out_llm["llm_act_gateup"][i], self._llm_alpha[i*5+2]) for i in range(16)]
+        self._llm_alpha_up = [alpha(out_llm["llm_act_gateup"][i], self._llm_alpha[i*5+3]) for i in range(16)]
+        self._llm_alpha_down = [alpha(out_llm["llm_act_down"][i], self._llm_alpha[i*5+4]) for i in range(16)]
 
         # ── VLSA (4L × 4 distinct act scales; 6 alphas/layer for 6 GEMMs) ──
         self._vlsa_act_qkv_dev = to_devs(out_vlsa["vlsa_act_qkv"])
@@ -938,12 +943,12 @@ class GrootN17TorchFrontendThor:
         self._vlsa_act_fc1_dev = to_devs(out_vlsa["vlsa_act_fc1"])
         self._vlsa_act_fc2_dev = to_devs(out_vlsa["vlsa_act_fc2"])
         # _vlsa_alpha layout: [q, k, v, o, fc1, fc2] per layer
-        self._vlsa_alpha_q   = [cal.alpha(out_vlsa["vlsa_act_qkv"][i], self._vlsa_alpha[i*6+0]) for i in range(4)]
-        self._vlsa_alpha_k   = [cal.alpha(out_vlsa["vlsa_act_qkv"][i], self._vlsa_alpha[i*6+1]) for i in range(4)]
-        self._vlsa_alpha_v   = [cal.alpha(out_vlsa["vlsa_act_qkv"][i], self._vlsa_alpha[i*6+2]) for i in range(4)]
-        self._vlsa_alpha_o   = [cal.alpha(out_vlsa["vlsa_act_o"][i],   self._vlsa_alpha[i*6+3]) for i in range(4)]
-        self._vlsa_alpha_fc1 = [cal.alpha(out_vlsa["vlsa_act_fc1"][i], self._vlsa_alpha[i*6+4]) for i in range(4)]
-        self._vlsa_alpha_fc2 = [cal.alpha(out_vlsa["vlsa_act_fc2"][i], self._vlsa_alpha[i*6+5]) for i in range(4)]
+        self._vlsa_alpha_q = [alpha(out_vlsa["vlsa_act_qkv"][i], self._vlsa_alpha[i*6+0]) for i in range(4)]
+        self._vlsa_alpha_k = [alpha(out_vlsa["vlsa_act_qkv"][i], self._vlsa_alpha[i*6+1]) for i in range(4)]
+        self._vlsa_alpha_v = [alpha(out_vlsa["vlsa_act_qkv"][i], self._vlsa_alpha[i*6+2]) for i in range(4)]
+        self._vlsa_alpha_o = [alpha(out_vlsa["vlsa_act_o"][i], self._vlsa_alpha[i*6+3]) for i in range(4)]
+        self._vlsa_alpha_fc1 = [alpha(out_vlsa["vlsa_act_fc1"][i], self._vlsa_alpha[i*6+4]) for i in range(4)]
+        self._vlsa_alpha_fc2 = [alpha(out_vlsa["vlsa_act_fc2"][i], self._vlsa_alpha[i*6+5]) for i in range(4)]
 
     def _save_calibration_cache(self, out_vit, out_ds, out_llm, out_vlsa) -> None:
         """JSON cache so subsequent set_prompt calls skip the shadow forward.

@@ -2,7 +2,7 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
-#include <hip/hip_fp8.h>
+#include "../arch.h"
 
 // ================================================================
 // FlashRT AMD — elementwise launch-geometry tuning probe (CDNA4)

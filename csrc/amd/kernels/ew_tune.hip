@@ -6,7 +6,7 @@
 
 #include "common_hip.h"
 #include "ew_tune.h"
-#include <hip/hip_fp8.h>
+#include "../arch.h"
 #include <stdexcept>
 #include <string>
 
@@ -24,7 +24,7 @@ struct alignas(8) ew_fp8x8 {
 };
 
 __device__ __forceinline__ unsigned char fp8_byte(float v) {
-    return __hip_fp8_e4m3(fminf(fmaxf(v, -448.0f), 448.0f)).__x;
+    return __hip_fp8_e4m3(fminf(fmaxf(v, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite)).__x;
 }
 
 // Butterfly all-reduce: every lane ends with the full wave sum.
@@ -51,8 +51,8 @@ __global__ void ew_quant_legacy_kernel(const __hip_bfloat16* __restrict__ input,
         __hip_bfloat162 val = in2[idx];
         float v0 = __bfloat162float(val.x) * inv_s;
         float v1 = __bfloat162float(val.y) * inv_s;
-        output[2*idx]   = __hip_fp8_e4m3(fminf(fmaxf(v0, -448.0f), 448.0f));
-        output[2*idx+1] = __hip_fp8_e4m3(fminf(fmaxf(v1, -448.0f), 448.0f));
+        output[2*idx]   = __hip_fp8_e4m3(fminf(fmaxf(v0, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite));
+        output[2*idx+1] = __hip_fp8_e4m3(fminf(fmaxf(v1, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite));
     }
 }
 
@@ -203,8 +203,8 @@ __global__ void ew_norm_legacy_kernel(
         float n1 = to_f32(rv.y) * rms * to_f32(wv.y);
         float val0 = (n0 * (1.0f + to_f32(sv.x)) + to_f32(hv.x)) * inv_scale;
         float val1 = (n1 * (1.0f + to_f32(sv.y)) + to_f32(hv.y)) * inv_scale;
-        out_row[2*i]   = __hip_fp8_e4m3(fminf(fmaxf(val0, -448.0f), 448.0f));
-        out_row[2*i+1] = __hip_fp8_e4m3(fminf(fmaxf(val1, -448.0f), 448.0f));
+        out_row[2*i]   = __hip_fp8_e4m3(fminf(fmaxf(val0, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite));
+        out_row[2*i+1] = __hip_fp8_e4m3(fminf(fmaxf(val1, -flashrt::amd::arch::fp8_max_finite), flashrt::amd::arch::fp8_max_finite));
         gate_out2[i] = gv;
     }
 }

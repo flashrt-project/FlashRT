@@ -1,15 +1,16 @@
 #!/usr/bin/env python
-"""Pi0.5 on AMD Instinct (ROCm / CDNA4) quickstart.
+"""Pi0.5 on AMD Instinct (ROCm / CDNA3 or CDNA4) quickstart.
 
 Runs the pi05 AMD backend end-to-end — HIP-graph capture, real-data FP8
 calibration, N timed inferences — and prints the latency stats plus the
 precision spec. Works through the stable ``flash_rt.load_model`` door
-(``hardware="amd_cdna4"``, auto-detected on ROCm builds for gfx950).
+(``hardware="auto"`` detects gfx942 or gfx950 at runtime).
 
 Build first (self-contained HIP module; the CUDA tree is not involved):
 
-    bash scripts/amd/build_amd.sh gfx950
-    # or: cmake -B build-amd -S csrc/amd -DGPU_ARCH=gfx950
+    bash scripts/amd/build_amd.sh gfx942  # MI300 series
+    # use gfx950 for MI350 series
+    # or: cmake -B build-amd -S csrc/amd -DGPU_ARCH=gfx942
     #     cmake --build build-amd -j 8
 
 Run:
@@ -18,10 +19,8 @@ Run:
         --checkpoint /path/to/pi05_libero_pytorch \
         --prompt "pick up the black bowl and place it on the plate"
 
-Expected on an MI350-series part (gfx950, ROCm 7.x, FP8 default):
-~16-17 ms median per inference after warmup. ``--bf16`` selects the
-unquantized baseline (~30 ms). See docs/deployment_amd.md for the
-support matrix, environment knobs and measured numbers.
+``--bf16`` selects the unquantized baseline. See docs/deployment_amd.md
+for the support matrix, environment knobs and measured numbers.
 """
 import argparse
 import statistics
@@ -54,7 +53,7 @@ def main() -> None:
         args.checkpoint,
         config="pi05",
         framework="torch",
-        hardware="amd_cdna4",
+        hardware="auto",
         num_views=args.num_views,
         use_fp8=not args.bf16,
         state_prompt_mode=args.state_prompt_mode,

@@ -1,5 +1,5 @@
 // ================================================================
-// FlashRT AMD — MFMA small-M FP8 GEMM (gfx950, wave64)
+// FlashRT AMD — MFMA small-M FP8 GEMM (gfx942/gfx950, wave64)
 // See smallm_mfma.h for the contract and design rationale.
 //
 // Fragment layout of V_MFMA_F32_16X16X32_FP8_FP8 (verified by the
@@ -16,7 +16,7 @@
 // ================================================================
 
 #include "smallm_mfma.h"
-#include <hip/hip_fp8.h>
+#include "../arch.h"
 #include <stdexcept>
 #include <string>
 

@@ -7,13 +7,13 @@
 //
 // FP8 output dtype: OCP e4m3 via <hip/hip_fp8.h> __hip_fp8_e4m3
 // (saturating RNE conversion, same as __nv_fp8_e4m3; values are
-// pre-clamped to ±448 exactly as in activation.cu). Only the generic
+// pre-clamped to the target FP8 finite range). Only the generic
 // (BF16-bound) gate_geglu_merged_fp8 path is ported; the vectorized
 // FP16 encoder variant stays CUDA-only.
 // ================================================================
 
 #include "common_hip.h"
-#include <hip/hip_fp8.h>
+#include "../arch.h"
 
 // ── Gate GELU Multiply ──
 // GELU(x) approx: x * sigmoid(1.5957691216 * x * (1 + 0.044715 * x^2))
@@ -154,7 +154,8 @@ __global__ void gate_geglu_merged_fp8_kernel(const T* __restrict__ merged,
         float gelu = g / (1.0f + expf(-1.5957691216057308f * g * (1.0f + 0.044715f * g * g)));
         float val = gelu * u;
         float inv_scale = 1.0f / (*d_scale);
-        val = fminf(fmaxf(val * inv_scale, -448.0f), 448.0f);
+        val = fminf(fmaxf(val * inv_scale, -flashrt::amd::arch::fp8_max_finite),
+                    flashrt::amd::arch::fp8_max_finite);
         out[idx] = __hip_fp8_e4m3(val);
     }
 }

@@ -1,7 +1,7 @@
 # ================================================================
 # FlashRT AMD — standalone HIP build (never wired into root CMake).
 #
-#   cmake -B build-amd -S csrc/amd [-DGPU_ARCH=gfx950|gfx1151]
+#   cmake -B build-amd -S csrc/amd -DGPU_ARCH=gfx942|gfx950|gfx1151
 #   cmake --build build-amd -j 8
 #
 # Output: flash_rt/amd/flash_rt_amd_kernels*.so
@@ -30,27 +30,29 @@ if(NOT DEFINED GPU_ARCH)
     OUTPUT_VARIABLE GPU_ARCH_DETECTED
     OUTPUT_STRIP_TRAILING_WHITESPACE)
   if(GPU_ARCH_DETECTED STREQUAL "")
-    set(GPU_ARCH "gfx950")
-    message(STATUS "flash_rt_amd: no GPU visible, defaulting GPU_ARCH=${GPU_ARCH}")
+    message(FATAL_ERROR
+      "flash_rt_amd: GPU_ARCH is required when no AMD GPU is visible")
   else()
     set(GPU_ARCH "${GPU_ARCH_DETECTED}")
   endif()
 endif()
-message(STATUS "flash_rt_amd: GPU_ARCH=${GPU_ARCH}")
-
-string(REGEX MATCH "^gfx[0-9a-f]+" GPU_ARCH_BASE "${GPU_ARCH}")
+string(REPLACE ":" ";" GPU_ARCH_PARTS "${GPU_ARCH}")
+list(GET GPU_ARCH_PARTS 0 GPU_ARCH_BASE)
 option(FLASHRT_AMD_ALLOW_ARCH
   "Allow an unregistered AMD ISA while bringing up a new source set" OFF)
-if(NOT GPU_ARCH_BASE STREQUAL "gfx950"
+if(NOT GPU_ARCH_BASE STREQUAL "gfx942"
+   AND NOT GPU_ARCH_BASE STREQUAL "gfx950"
    AND NOT GPU_ARCH_BASE STREQUAL "gfx1151"
    AND NOT FLASHRT_AMD_ALLOW_ARCH)
   message(FATAL_ERROR
-    "GPU_ARCH=${GPU_ARCH} has no FlashRT AMD source set; use gfx950 or "
-    "gfx1151 (or opt in with FLASHRT_AMD_ALLOW_ARCH for porting work)")
+    "GPU_ARCH=${GPU_ARCH} has no FlashRT AMD source set; use gfx942, "
+    "gfx950, or gfx1151 (or opt in with FLASHRT_AMD_ALLOW_ARCH for "
+    "porting work)")
 endif()
+message(STATUS "flash_rt_amd: GPU_ARCH=${GPU_ARCH_BASE}")
 
 enable_language(HIP)
-set(CMAKE_HIP_ARCHITECTURES "${GPU_ARCH}")
+set(CMAKE_HIP_ARCHITECTURES "${GPU_ARCH_BASE}")
 set(CMAKE_HIP_STANDARD 17)
 
 find_package(hip REQUIRED)
@@ -95,20 +97,30 @@ else()
     kernels/ew_tune.hip
     attention/decoder_flash.hip
     attention/attn_probe.hip
-    attention/encoder_flash.hip
     gemm/hipblaslt_runner.hip
-    gemm/smallm_fp8.hip
     gemm/smallm_mfma.hip
     gemm/smallm_mfma_bf16.hip
     gemm/decoder_ffn_fused.hip
   )
+  if(GPU_ARCH_BASE STREQUAL "gfx950")
+    list(APPEND FLASHRT_AMD_SOURCES
+      attention/encoder_flash.hip
+      gemm/smallm_fp8.hip)
+  endif()
 endif()
 set_source_files_properties(${FLASHRT_AMD_SOURCES} PROPERTIES LANGUAGE HIP)
 
 pybind11_add_module(flash_rt_amd_kernels ${FLASHRT_AMD_SOURCES})
 
 target_compile_definitions(flash_rt_amd_kernels PRIVATE
-  FLASHRT_AMD_GPU_ARCH="${GPU_ARCH}")
+  FLASHRT_AMD_GPU_ARCH="${GPU_ARCH_BASE}")
+if(GPU_ARCH_BASE STREQUAL "gfx942")
+  target_compile_definitions(flash_rt_amd_kernels PRIVATE
+    FLASHRT_AMD_CDNA3=1)
+elseif(GPU_ARCH_BASE STREQUAL "gfx950")
+  target_compile_definitions(flash_rt_amd_kernels PRIVATE
+    FLASHRT_AMD_CDNA4=1)
+endif()
 target_compile_options(flash_rt_amd_kernels PRIVATE
   $<$<COMPILE_LANGUAGE:HIP>:-O3 -ffp-contract=fast>)
 target_link_libraries(flash_rt_amd_kernels PRIVATE hip::host roc::hipblaslt)

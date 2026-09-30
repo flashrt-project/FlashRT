@@ -290,6 +290,7 @@ class Cdna4AiterAttnBackend(Cdna4AttnBackend):
             False,        # is_causal
             -1,           # window_size_left  (no local window)
             -1,           # window_size_right (no local window)
+            0,            # sink_size (no attention sinks)
             False,        # return_softmax_lse
             False,        # return_dropout_randval
             out=out,

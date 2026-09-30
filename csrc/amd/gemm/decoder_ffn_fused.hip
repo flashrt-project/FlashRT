@@ -1,7 +1,7 @@
 #include "decoder_ffn_fused.h"
 
 #include <hip/hip_bf16.h>
-#include <hip/hip_fp8.h>
+#include "../arch.h"
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -33,7 +33,7 @@
 //     GEMM output as BF16 (fp8_nt_dev's D) and the elementwise
 //     kernels (gate_geglu_merged_fp8 / gate_mul_residual) read that
 //     BF16 buffer;
-//   * the geglu polynomial, 1/scale, ±448 clamp and __hip_fp8_e4m3
+//   * the geglu polynomial, 1/scale, target FP8 clamp and conversion
 //     construction are written with the exact same expressions as
 //     gate_geglu_merged_fp8 (activation.hip);
 //   * the residual update is f32(res) + f32(x_bf16)*f32(gate_bf16)
@@ -185,7 +185,8 @@ void smallm_fp8_gateup_geglu_kernel(const unsigned char* __restrict__ A,
                     // EXACT gate_geglu_merged_fp8 epilogue (activation.hip).
                     float gelu = g / (1.0f + expf(-1.5957691216057308f * g * (1.0f + 0.044715f * g * g)));
                     float val = gelu * u;
-                    val = fminf(fmaxf(val * inv_scale, -448.0f), 448.0f);
+                    val = fminf(fmaxf(val * inv_scale, -flashrt::amd::arch::fp8_max_finite),
+                                flashrt::amd::arch::fp8_max_finite);
                     out[(size_t)m * N_half + n] = __hip_fp8_e4m3(val);
                 }
             }

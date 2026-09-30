@@ -13,7 +13,7 @@
 
 #include "../kernels/common_hip.h"
 #include <cfloat>
-#include <hip/hip_fp8.h>
+#include "../arch.h"
 #include <stdexcept>
 
 #define APROBE_NTHREADS  256
