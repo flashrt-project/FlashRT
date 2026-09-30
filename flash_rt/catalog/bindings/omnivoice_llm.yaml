@@ -1,0 +1,27 @@
+binding: omnivoice_llm
+structure: decoder_llm
+dims: {D: 1024, L: 28, NH: 16, NKV: 8, HD: 128, FFN: 3072}
+variant: {backend: nvfp4_llm}
+boundary_dtype: bf16
+
+m_profile:
+  prefill: {m_class: medium, phase: prefill}
+  decode: {m_class: medium, phase: decode}
+
+# The NVFP4 whole-LLM backend binds the stack in place (weights are read
+# from the host module, not remapped by slot), so weights_map is
+# descriptive: the seams the backend fuses per layer.
+weights_map:
+  omnivoice:
+    layout: out_in
+    w_qkv: "llm.layers.{i}.self_attn.{q,k,v}_proj.weight"
+    w_o: "llm.layers.{i}.self_attn.o_proj.weight"
+    w_gu: "llm.layers.{i}.mlp.{gate,up}_proj.weight"
+    w_down: "llm.layers.{i}.mlp.down_proj.weight"
+    w_in_norm: "llm.layers.{i}.input_layernorm.weight"
+    w_post_norm: "llm.layers.{i}.post_attention_layernorm.weight"
+
+hosts:
+  omnivoice:
+    module_path: "llm"
+    versions: ">=0.2"
