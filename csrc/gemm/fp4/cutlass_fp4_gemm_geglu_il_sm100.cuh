@@ -54,5 +54,26 @@ int cutlass_fp4_gemm_geglu_il_hw_v10(
     int M, int N_il, int K,
     cudaStream_t stream);
 
+// No-D-store variants: identical contract, but the collective's own D store
+// is elided (D_dummy is never written; the pointer is still required for the
+// host-side TMA descriptor and may be the same small shared buffer).
+int cutlass_fp4_gemm_geglu_il_hw_nod(
+    void const* A_packed, void const* SFA,
+    void const* B_packed, void const* SFB,
+    void*       D_dummy,
+    void*       compact_packed,
+    void*       compact_sfa,
+    int M, int N_il, int K,
+    cudaStream_t stream);
+
+int cutlass_fp4_gemm_geglu_il_hw_nod_v10(
+    void const* A_packed, void const* SFA,
+    void const* B_packed, void const* SFB,
+    void*       D_dummy,
+    void*       compact_packed,
+    void*       compact_sfa,
+    int M, int N_il, int K,
+    cudaStream_t stream);
+
 }  // namespace fp4
 }  // namespace flash_rt

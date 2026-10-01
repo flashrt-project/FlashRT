@@ -952,6 +952,86 @@ Skinny-M half-width fused GeGLU GEMM on the decoder tile (128x64x256);
 same contract as cutlass_fp4_gemm_geglu_il_hw.
 )pbdoc");
 
+  m.def("cutlass_fp4_gemm_geglu_il_hw_nod",
+        [](uintptr_t A_packed, uintptr_t SFA,
+           uintptr_t B_packed, uintptr_t SFB,
+           uintptr_t D_dummy, uintptr_t compact_packed, uintptr_t compact_sfa,
+           int M, int N_il, int K, uintptr_t stream) -> int {
+          const auto shape = fp4_kernel_shape({{"M", M}, {"N_il", N_il}, {"K", K}});
+          require_fp4_ptrs("cutlass_fp4_gemm_geglu_il_hw_nod",
+                           {{"A_packed", A_packed}, {"SFA", SFA},
+                            {"B_packed", B_packed}, {"SFB", SFB},
+                            {"D_dummy", D_dummy},
+                            {"compact_packed", compact_packed},
+                            {"compact_sfa", compact_sfa}}, shape);
+          require_fp4(M > 0 && N_il > 0 && K > 0 && (N_il % 32) == 0 &&
+                      (K % 16) == 0,
+                      "cutlass_fp4_gemm_geglu_il_hw_nod",
+                      "M must be positive, N_il a positive multiple of 32 "
+                      "and K a positive multiple of 16",
+                      shape);
+          return flash_rt::fp4::cutlass_fp4_gemm_geglu_il_hw_nod(
+              reinterpret_cast<void const*>(A_packed),
+              reinterpret_cast<void const*>(SFA),
+              reinterpret_cast<void const*>(B_packed),
+              reinterpret_cast<void const*>(SFB),
+              reinterpret_cast<void*>(D_dummy),
+              reinterpret_cast<void*>(compact_packed),
+              reinterpret_cast<void*>(compact_sfa),
+              M, N_il, K,
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("A_packed"), py::arg("SFA"),
+        py::arg("B_packed"), py::arg("SFB"),
+        py::arg("D_dummy"), py::arg("compact_packed"), py::arg("compact_sfa"),
+        py::arg("M"), py::arg("N_il"), py::arg("K"),
+        py::arg("stream") = 0,
+        R"pbdoc(
+Half-width fused GeGLU GEMM with the collective's own D store elided:
+compact_packed/compact_sfa are the only outputs and D_dummy is never
+written (still validated; the host-side TMA descriptor needs a real
+pointer).  Same contract as cutlass_fp4_gemm_geglu_il_hw otherwise.
+)pbdoc");
+
+  m.def("cutlass_fp4_gemm_geglu_il_hw_nod_v10",
+        [](uintptr_t A_packed, uintptr_t SFA,
+           uintptr_t B_packed, uintptr_t SFB,
+           uintptr_t D_dummy, uintptr_t compact_packed, uintptr_t compact_sfa,
+           int M, int N_il, int K, uintptr_t stream) -> int {
+          const auto shape = fp4_kernel_shape({{"M", M}, {"N_il", N_il}, {"K", K}});
+          require_fp4_ptrs("cutlass_fp4_gemm_geglu_il_hw_nod_v10",
+                           {{"A_packed", A_packed}, {"SFA", SFA},
+                            {"B_packed", B_packed}, {"SFB", SFB},
+                            {"D_dummy", D_dummy},
+                            {"compact_packed", compact_packed},
+                            {"compact_sfa", compact_sfa}}, shape);
+          require_fp4(M > 0 && N_il > 0 && K > 0 && (N_il % 32) == 0 &&
+                      (K % 16) == 0,
+                      "cutlass_fp4_gemm_geglu_il_hw_nod_v10",
+                      "M must be positive, N_il a positive multiple of 32 "
+                      "and K a positive multiple of 16",
+                      shape);
+          return flash_rt::fp4::cutlass_fp4_gemm_geglu_il_hw_nod_v10(
+              reinterpret_cast<void const*>(A_packed),
+              reinterpret_cast<void const*>(SFA),
+              reinterpret_cast<void const*>(B_packed),
+              reinterpret_cast<void const*>(SFB),
+              reinterpret_cast<void*>(D_dummy),
+              reinterpret_cast<void*>(compact_packed),
+              reinterpret_cast<void*>(compact_sfa),
+              M, N_il, K,
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("A_packed"), py::arg("SFA"),
+        py::arg("B_packed"), py::arg("SFB"),
+        py::arg("D_dummy"), py::arg("compact_packed"), py::arg("compact_sfa"),
+        py::arg("M"), py::arg("N_il"), py::arg("K"),
+        py::arg("stream") = 0,
+        R"pbdoc(
+Skinny-M no-D-store fused GeGLU GEMM on the decoder tile (128x64x256);
+same contract as cutlass_fp4_gemm_geglu_il_hw_nod.
+)pbdoc");
+
 #ifdef FLASHRT_HAVE_COSMOS3_EDGE
   m.def("cosmos3_edge_fp4_gemm_relu2_fp4out",
         [](uintptr_t A_packed, uintptr_t SFA,

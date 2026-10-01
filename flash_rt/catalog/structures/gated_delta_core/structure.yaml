@@ -1,5 +1,5 @@
 structure: gated_delta_core
-version: 1
+version: 2
 description: >
   Stateful Gated DeltaNet recurrence over Q/K/V, log-decay and update
   strength. The structure owns the recurrent state transition and exposes the
@@ -27,8 +27,16 @@ weights: []
 
 variants:
   phase: [decode_recurrent, sequence_scan, wy_chunk]
-  state_update: [in_place, explicit_output]
+  state_update: [in_place, explicit_output, snapshot_per_token]
+                # snapshot_per_token: each token of a batch writes its own
+                # state snapshot and the source state slot stays pristine,
+                # so the host can roll back to any position
   qk_norm: [l2_in_kernel, host]
+  checkpoint: [none, replay_in_region]
+                # replay_in_region: checkpoint saves that the host graph
+                # places inside the region's span are part of the boundary
+                # and must be reproduced by the region (or the region must
+                # decline the whole span)
 
 calibration:
   points: []

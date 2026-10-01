@@ -119,7 +119,7 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
                 p1_il_p4     = fp4_scratch['p1_il_p4']
                 p1_il_sfa    = fp4_scratch['p1_il_sfa']
                 variant_dn_x = fp4_scratch['variant_dn_x']
-            elif p1_combiner == 'epilogue_hw':
+            elif p1_combiner in ('epilogue_hw', 'epilogue_hw_nod'):
                 p1_dummy = fp4_scratch['p1_dummy']
             else:
                 p1_gate_p4   = fp4_scratch['p1_gate_p4']
@@ -251,8 +251,14 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
                     # 'epilogue_hw' quantizes at compact granularity in the
                     # epilogue and writes Down's stock input buffer directly.
                     w_il = fp4_weights[l]['gu_il']
-                    if p1_combiner == 'epilogue_hw':
-                        _check(fvk_fp4.cutlass_fp4_gemm_geglu_il_hw(
+                    if p1_combiner in ('epilogue_hw', 'epilogue_hw_nod'):
+                        # 'epilogue_hw_nod' elides the collective's own D
+                        # store (p1_dummy is never written); otherwise the
+                        # two are identical.
+                        hw_gemm = (fvk_fp4.cutlass_fp4_gemm_geglu_il_hw_nod
+                                   if p1_combiner == 'epilogue_hw_nod'
+                                   else fvk_fp4.cutlass_fp4_gemm_geglu_il_hw)
+                        _check(hw_gemm(
                             sc_gu.packed.data_ptr(), sc_gu.sfa.data_ptr(),
                             w_il['packed'].data_ptr(), w_il['sfb'].data_ptr(),
                             p1_dummy,

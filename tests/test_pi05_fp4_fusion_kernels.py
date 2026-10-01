@@ -190,6 +190,50 @@ def test_fused_geglu_epilogue_matches_split_chain():
         f"fused epilogue lost accuracy: {cos_fused:.6f} < {cos_chain:.6f}")
 
 
+@pytest.mark.parametrize("shape,pair", [
+    ((968, 2048, 8192), ("cutlass_fp4_gemm_geglu_il_hw",
+                         "cutlass_fp4_gemm_geglu_il_hw_nod")),
+    ((10, 1024, 4096), ("cutlass_fp4_gemm_geglu_il_hw_v10",
+                        "cutlass_fp4_gemm_geglu_il_hw_nod_v10")),
+])
+def test_geglu_nod_matches_hw_and_skips_dummy(shape, pair):
+    """The no-D-store GeGLU GEMM must produce bit-identical compact output
+    to the store-carrying variant, and must never touch the dummy buffer."""
+    _require_thor()
+    torch.manual_seed(20260815)
+    M, D, H = shape
+    N_il = 2 * H
+
+    x = torch.randn(M, D, dtype=torch.float16, device='cuda')
+    w_il = torch.randn(N_il, D, dtype=torch.float16, device='cuda') * 0.02
+    q_il = quant_weight_nvfp4(w_il.contiguous())
+    act = FP4ActScratch(M, D, device='cuda')
+    quant_act_nvfp4(x, act, M)
+
+    outputs = {}
+    for name, fn in (("hw", getattr(fvk_fp4, pair[0])),
+                     ("nod", getattr(fvk_fp4, pair[1]))):
+        fused = FP4ActScratch(M, H, device='cuda')
+        fused.packed.fill_(0)
+        fused.sfa.fill_(0)
+        dummy = torch.full((M, H), 0xAB, dtype=torch.uint8, device='cuda')
+        assert fn(
+            act.packed.data_ptr(), act.sfa.data_ptr(),
+            q_il['packed'].data_ptr(), q_il['sfb'].data_ptr(),
+            dummy.data_ptr(), fused.packed.data_ptr(), fused.sfa.data_ptr(),
+            M, N_il, D, 0) == 0
+        torch.cuda.synchronize()
+        outputs[name] = (fused, dummy)
+
+    hw, nod = outputs["hw"], outputs["nod"]
+    assert torch.equal(nod[0].packed, hw[0].packed), \
+        "nod compact packed differs from hw"
+    assert torch.equal(nod[0].sfa, hw[0].sfa), "nod compact SFA differs from hw"
+    assert bool((nod[1] == 0xAB).all()), "nod wrote the dummy buffer"
+    assert not torch.equal(hw[1], nod[1]), \
+        "hw variant did not write the dummy (test would prove nothing)"
+
+
 def test_vectorized_siglip_layernorms_match_reference():
     """The single-pass LayerNorms must agree with the reference norm +
     quantize pair (reduction order differs at ulp level)."""

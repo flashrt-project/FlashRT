@@ -89,10 +89,10 @@ def test_pipeline_catalogs_declare_shared_schedule_families():
 
     assert autoregressive.kind == "stage_pipeline"
     assert autoregressive.family == "autoregressive_decode"
-    assert autoregressive.version == 2
+    assert autoregressive.version == 3
     assert _stage_sets(autoregressive) == (
         {"prefill", "decode", "token_select"},
-        {"input_prepare", "modality_encode"},
+        {"input_prepare", "modality_encode", "spec_draft"},
     )
 
     assert vla.kind == "stage_pipeline"

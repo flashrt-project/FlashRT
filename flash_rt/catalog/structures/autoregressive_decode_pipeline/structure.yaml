@@ -1,7 +1,7 @@
 structure: autoregressive_decode_pipeline
 kind: stage_pipeline
 family: autoregressive_decode
-version: 2
+version: 3
 description: >
   Schedule-layer structure for autoregressive generation: optional host
   input preparation and modality encoding feed a causal prefill that
@@ -56,13 +56,31 @@ stages:
       - {name: token_id, window: swap}
       - {name: stop, window: host}
     capture: host_dependent
+  - name: spec_draft
+    optional: true
+    cadence: token
+    description: >
+      Speculative drafting between decode steps: a draft model (or trained
+      MTP head chain) proposes n_draft tokens; the next decode step becomes
+      a verify batch over 1 + n_draft rows whose logits feed acceptance.
+      Draft state (KV / recurrent / conv) advances tentatively and is
+      rolled back to the accepted position.
+    inputs:
+      - {name: token_id, window: swap}
+      - {name: target_hidden, buffer: mutable, optional: true}   # MTP h rows
+      - {name: draft_state, buffer: mutable}
+    outputs:
+      - {name: draft_tokens, window: swap}
+      - {name: draft_state, buffer: mutable}
+    capture: bucketed_or_eager
 
-embedded_regions: [decoder_ffn, vision_ffn, qkv_pack, qk_norm_rope, qkv_rope,
-                   attention_core, gated_delta_core, linear_proj,
-                   patch_projection]
+embedded_regions: [decoder_ffn, vision_ffn, moe_expert_ffn, qkv_pack,
+                   qk_norm_rope, qkv_rope, attention_core, gated_delta_core,
+                   linear_proj, patch_projection]
 
 state_regions:
   - {name: kv_state, writers: [prefill, decode], reader: decode}
+  - {name: draft_state, writers: [spec_draft, decode], reader: spec_draft, optional: true}
   - {name: graph_buckets, cadence: shape_or_position}
 
 conformance:
@@ -71,6 +89,12 @@ conformance:
   - token_selection_is_outside_decoder_blocks
   - modality_features_have_request_cadence
   - graph_bucket_fallback_is_reported
+  # speculative (spec_draft stage present):
+  - spec_output_distribution_matches_target   # emitted tokens equal target-only
+                                              # decoding; the draft affects
+                                              # speed, never output
+  - draft_state_rollback_is_explicit          # verify batches leave every
+                                              # tentative state rollback-capable
 
 gates:
   parity:

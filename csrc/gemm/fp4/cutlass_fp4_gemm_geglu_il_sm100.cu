@@ -24,6 +24,7 @@
 #include "cute/tensor.hpp"
 
 #include "gemm/fp4/sm100_gelu_mul_blockscale_visitor.hpp"
+#include "gemm/fp4/sm100_epilogue_nod.hpp"
 
 namespace flash_rt {
 namespace fp4 {
@@ -173,6 +174,48 @@ using GemmKernelHwV10 = cutlass::gemm::kernel::GemmUniversal<
 
 using GemmHwV10 = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelHwV10>;
 
+// ── No-D-store instantiations ──
+// The builder's collective still stages the unread D tile through smem and
+// TMA-stores it (row-aliased, but the smem->L2 traffic and store instructions
+// remain).  Rebind the built epilogue onto CollectiveEpilogueNoD
+// (sm100_epilogue_nod.hpp), which elides that store entirely; the compact
+// store node is the only writer.  SharedStorage is unchanged, so the
+// mainloop carveout from the builder output stays valid.
+template <class BuiltEpilogue>
+struct MakeNoD;
+
+template <int StagesC, int StagesD, int FragmentSize,
+          bool ReuseSmemC, bool DelayTmaStore, class... Rest>
+struct MakeNoD<cutlass::epilogue::collective::CollectiveEpilogue<
+    cutlass::epilogue::Sm100TmaWarpSpecialized<
+        StagesC, StagesD, FragmentSize, ReuseSmemC, DelayTmaStore>,
+    Rest...>> {
+  using type = cutlass::epilogue::collective::CollectiveEpilogueNoD<
+      StagesC, StagesD, FragmentSize, ReuseSmemC, DelayTmaStore, Rest...>;
+};
+
+using CollectiveEpilogueHwNoD = typename MakeNoD<CollectiveEpilogueHw>::type;
+static_assert(sizeof(typename CollectiveEpilogueHwNoD::SharedStorage) ==
+              sizeof(typename CollectiveEpilogueHw::SharedStorage),
+              "NoD epilogue must keep the builder's smem footprint");
+
+using GemmKernelHwNoD = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int, int, int, int>,
+    CollectiveMainloopHw, CollectiveEpilogueHwNoD, void>;
+
+using GemmHwNoD = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelHwNoD>;
+
+using CollectiveEpilogueHwNoDV10 = typename MakeNoD<CollectiveEpilogueHwV10>::type;
+static_assert(sizeof(typename CollectiveEpilogueHwNoDV10::SharedStorage) ==
+              sizeof(typename CollectiveEpilogueHwV10::SharedStorage),
+              "NoD epilogue must keep the builder's smem footprint");
+
+using GemmKernelHwNoDV10 = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int, int, int, int>,
+    CollectiveMainloopHwV10, CollectiveEpilogueHwNoDV10, void>;
+
+using GemmHwNoDV10 = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelHwNoDV10>;
+
 }  // namespace geglu_il
 
 int cutlass_fp4_gemm_geglu_il(
@@ -253,7 +296,12 @@ static int run_geglu_il_hw(
   auto stride_A = cutlass::make_cute_packed_stride(StrideAT{}, {M, K, 1});
   auto stride_B = cutlass::make_cute_packed_stride(StrideBT{}, {N_il, K, 1});
   auto stride_C = cutlass::make_cute_packed_stride(StrideCT{}, {M, N_il, 1});
+  // The compact store node writes the real output itself; the collective's
+  // own D store lands in a buffer nothing reads. Aliasing every row onto
+  // row 0 shrinks that write from M*N_il to a single row, which at encoder
+  // shape is 12.8 MB of pure waste per call.
   auto stride_D = cutlass::make_cute_packed_stride(StrideDT{}, {M, N_il, 1});
+  cute::get<0>(stride_D) = 0;
   auto layout_SFA = CfgT::tile_atom_to_shape_SFA(make_shape(M, N_il, K, 1));
   auto layout_SFB = CfgT::tile_atom_to_shape_SFB(make_shape(M, N_il, K, 1));
 
@@ -315,6 +363,32 @@ int cutlass_fp4_gemm_geglu_il_hw_v10(
     int M, int N_il, int K,
     cudaStream_t stream) {
   return geglu_il::run_geglu_il_hw<geglu_il::GemmHwV10>(
+      A_packed, SFA, B_packed, SFB, D_dummy, compact_packed, compact_sfa,
+      M, N_il, K, stream);
+}
+
+int cutlass_fp4_gemm_geglu_il_hw_nod(
+    void const* A_packed, void const* SFA,
+    void const* B_packed, void const* SFB,
+    void*       D_dummy,
+    void*       compact_packed,
+    void*       compact_sfa,
+    int M, int N_il, int K,
+    cudaStream_t stream) {
+  return geglu_il::run_geglu_il_hw<geglu_il::GemmHwNoD>(
+      A_packed, SFA, B_packed, SFB, D_dummy, compact_packed, compact_sfa,
+      M, N_il, K, stream);
+}
+
+int cutlass_fp4_gemm_geglu_il_hw_nod_v10(
+    void const* A_packed, void const* SFA,
+    void const* B_packed, void const* SFB,
+    void*       D_dummy,
+    void*       compact_packed,
+    void*       compact_sfa,
+    int M, int N_il, int K,
+    cudaStream_t stream) {
+  return geglu_il::run_geglu_il_hw<geglu_il::GemmHwNoDV10>(
       A_packed, SFA, B_packed, SFB, D_dummy, compact_packed, compact_sfa,
       M, N_il, K, stream);
 }
