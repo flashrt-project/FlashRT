@@ -123,6 +123,92 @@ configuration selects one camera and links the weights without copying them.
 bash run-validation.sh groot
 ```
 
+## Use the FlashRT Thor frontend in Python
+
+This GR00T runtime exposes a lower-level frontend: processor inputs and
+normalized state go into model inference, then `denormalize_action` produces
+physical actions. The example below uses the bundled observation's prepared
+processor inputs, exactly as the supplied validator does for model execution.
+`validate groot` additionally runs fresh RGB/state/language preprocessing on
+every measured call.
+
+In native mode, keep `GROOT` and `REF` from the setup steps. For Docker,
+enter the prepared image and create its local model configuration:
+
+```bash
+docker run --rm -it --runtime=nvidia --gpus all --shm-size=8g \
+  -v "$MODELS:/models" -v "$OUT:/results" "$IMAGE" bash
+export REF=/opt/reference
+export GROOT=/results/GR00T-api
+if [ ! -d "$GROOT" ]; then
+  python local_groot_checkpoint.py \
+    --checkpoint /models/GR00T-N1.7-LIBERO/libero_10 \
+    --cosmos /models/Cosmos-Reason2-2B --out "$GROOT"
+fi
+```
+
+Then run:
+
+```bash
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+"$REF/groot-venv/bin/python" - <<'PY'
+import os
+import numpy as np
+import torch
+from flash_rt.frontends.torch.groot_n17_thor_fp4 import (
+    GrootN17TorchFrontendThorFP4,
+)
+
+fixture = torch.load("fixtures/groot-libero10-onecam.pt",
+                     map_location="cpu", weights_only=False)
+aux = fixture["aux"]
+state = {"state." + k: np.asarray(v) for k, v in fixture["state"].items()}
+
+frontend = GrootN17TorchFrontendThorFP4(
+    os.environ["GROOT"], num_views=1, embodiment_tag="libero_sim",
+)
+frontend.set_prompt(aux=aux, prompt="fixture prompt")
+torch.set_num_threads(2)
+
+normalized_state = frontend.normalize_state(state)
+noise = aux["initial_noise"].to("cuda").bfloat16().contiguous()
+frontend._backbone_features = frontend.run_backbone_graph(aux)
+normalized_actions = frontend.infer(
+    normalized_state, initial_noise=noise,
+    num_inference_timesteps=4, action_horizon=40,
+)
+decoded = frontend.denormalize_action(normalized_actions, state_dict=state)
+keys = ("x", "y", "z", "roll", "pitch", "yaw", "gripper")
+actions = np.concatenate([np.asarray(decoded[k]) for k in keys], axis=-1)
+assert actions.shape == (1, 16, 7) and np.isfinite(actions).all()
+print("Actions shape:", actions.shape)
+print("First action:", actions[0, 0])
+PY
+```
+
+- The constructor selects the NVFP4 action-head tier with the FP8 backbone.
+  `embodiment_tag="libero_sim"` selects LIBERO's state/action normalization.
+- `aux` contains the official processor's pixel patches, token IDs, image grid
+  and calibration inputs. `set_prompt(aux=...)` prepares the fixed prompt/grid,
+  quantization scales and execution graphs. The text is already encoded in
+  `aux`; the string argument alone does not replace that encoded instruction.
+  When the instruction or image grid changes, prepare new `aux` and call
+  `set_prompt` again.
+- `normalize_state` applies the checkpoint statistics. `run_backbone_graph`
+  executes the vision/language backbone; assigning its result refreshes the
+  features consumed by the four-step action head.
+- `infer` returns padded normalized actions. `denormalize_action` applies the
+  official physical-action decoding, yielding the **16 × 7** LIBERO chunk.
+  The initial noise is fixed here so repeated runs can be compared.
+
+Expected output starts with `Actions shape: (1, 16, 7)`. For a new observation,
+prepare fresh processor inputs and state, refresh the backbone, then infer and
+decode. The complete raw-input implementation is in
+[`verify_groot_fixture.py`](../../repro/thor/verify_groot_fixture.py): its
+`prepare()` calls the official processor and its `run()` executes these same
+backbone, action-head and decode steps. Use that validator for the reported
+model/preprocessing/complete-call timings.
+
 ## Check the results
 
 Successful validation ends with `combined accuracy status: 0`. Run this
