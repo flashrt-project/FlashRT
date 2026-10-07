@@ -13,7 +13,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends git cmake ninja
 COPY --from=selected_source /snapshot /opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93
 WORKDIR /opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93
 RUN git clone --depth 1 --branch v4.4.2 https://github.com/NVIDIA/cutlass.git third_party/cutlass
-RUN python -m pip install --index-url ${PIP_INDEX_URL} 'numpy==1.26.4' 'safetensors==0.8.0' sentencepiece pillow pytest pybind11 ninja 'nvidia-cutlass-dsl==4.5.1' 'quack-kernels==0.4.1' huggingface-hub
+RUN deps='numpy==1.26.4 safetensors==0.8.0 sentencepiece pillow pytest pybind11 ninja nvidia-cutlass-dsl==4.5.1 quack-kernels==0.4.1 huggingface-hub' && \
+    (python -m pip install --index-url "$PIP_INDEX_URL" $deps || \
+     python -m pip install --index-url https://pypi.org/simple $deps)
 RUN python -m pip install --no-deps --no-build-isolation -e .
 RUN cmake -S . -B build -DGPU_ARCH=110 -DCMAKE_BUILD_TYPE=Release && cmake --build build -j${BUILD_JOBS} --target flash_rt_kernels flash_rt_fp4 fmha_fp16_strided
 ENV PYTHONPATH=/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93
