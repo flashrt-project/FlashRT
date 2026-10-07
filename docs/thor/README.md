@@ -59,6 +59,10 @@ The included source-only archive needs no access to a private repository. The in
 
 For China pip access, export `PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple` before setup/model preparation. The CUDA torch wheels still use the CUDA wheel index above.
 
+If the selected mirror cannot install the native dependencies (for example,
+`ninja`), the native installer retries official PyPI automatically. Ensure that
+fallback endpoint is reachable as well.
+
 ## 3. Validate a model
 
 Follow its guide below. Source versions and download checksums are managed by scripts and manifests; users do not need to copy commit hashes or machine-specific paths.
