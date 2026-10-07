@@ -35,7 +35,7 @@ fetch_source() {
     [[ "$(git -C "$dest" rev-parse HEAD)" == "$revision" ]]
 }
 
-fetch_source https://github.com/NVIDIA/Isaac-GR00T.git "$ROOT/Isaac-GR00T" 4b1dca9d88d2a0b9ea5a65aa61c82ff89f5c4f0e
+fetch_source https://github.com/NVIDIA/Isaac-GR00T.git "$ROOT/Isaac-GR00T" 9c7e746b2cd37a810070a98ef41d290a07e806c2
 "$PYTHON" -m venv --system-site-packages "$ROOT/groot-venv"
 SITE="$("$ROOT/groot-venv/bin/python" -c 'import sysconfig;print(sysconfig.get_paths()["purelib"])')"
 printf "import site,sys; None if getattr(sys,'_jal_cuda_sites',False) else (setattr(sys,'_jal_cuda_sites',True),site.addsitedir('%s'),site.addsitedir('%s'))\n" "$BASE_SITE" "$TORCH_SITE" > "$SITE/cuda-runtime.pth"

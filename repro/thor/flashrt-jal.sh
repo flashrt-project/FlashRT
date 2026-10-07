@@ -12,7 +12,7 @@ validate)
   if [[ "$MODE" == groot || "$MODE" == all ]]; then
     mkdir -p "$OUT"
     OVERLAY="$(mktemp -d "$OUT/groot-overlay.XXXXXX")"; rmdir "$OVERLAY"
-    python "$ROOT/local_groot_checkpoint.py" --checkpoint "$MODELS/GR00T-N1.7-3B" --cosmos "$MODELS/Cosmos-Reason2-2B" --out "$OVERLAY"
+    python "$ROOT/local_groot_checkpoint.py" --checkpoint "$MODELS/GR00T-N1.7-LIBERO/libero_10" --cosmos "$MODELS/Cosmos-Reason2-2B" --out "$OVERLAY"
     export GROOT="$OVERLAY"
   fi
   exec bash "$ROOT/run-validation.sh" "$MODE";;

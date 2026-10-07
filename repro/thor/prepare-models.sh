@@ -19,7 +19,8 @@ groot)
   "$MODELS/download-venv/bin/pip" install --index-url "${PIP_INDEX_URL:-https://pypi.org/simple}" modelscope==1.40.0 modelscope-hub==0.4.2 requests
   for model in cosmos groot; do
     mapfile -t spec < <(python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))[sys.argv[2]];print(d["repo"]);print(d["revision"])' "$ROOT/versions.json" "$model")
-    "$MODELS/download-venv/bin/python" "$ROOT/modelscope_download.py" --repo "${spec[0]}" --revision "${spec[1]}" --out "$MODELS/${spec[0]##*/}"
+    args=(); [[ "$model" != groot ]] || args=(--subfolder libero_10 --inference-only)
+    "$MODELS/download-venv/bin/python" "$ROOT/modelscope_download.py" --repo "${spec[0]}" --revision "${spec[1]}" --out "$MODELS/${spec[0]##*/}" "${args[@]}"
   done
   ;;
 *) echo 'Choose pi05 or groot' >&2; exit 2;;

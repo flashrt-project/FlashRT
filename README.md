@@ -154,18 +154,21 @@ See [LIBERO settings and API comparison](docs/thor/pi05.md#4-match-the-libero-se
 
 #### GROOT N1.7
 
-| Hardware | Mode | Latency | Throughput | Source |
-|---|---|---:|---:|---|
-| Jetson AGX Thor | NVFP4 + FA4, DROID 2-view feature graph | **29.60 ms** | **33 Hz** | [Verified results](docs/thor/results.md) |
-| Jetson AGX Thor | FP8, DROID 2-view feature graph | **48.94 ms** | **20.4 Hz** | [Verified results](docs/thor/results.md) |
-| RTX 5090 | FP8, 2-view base, full graph | **16.6 ms** | **60 Hz** | [GROOT N1.7 API](#groot-n17-rtx) |
-| AMD Instinct MI350X | FP8 backbone + BF16 DiT, full frame | **16.0 ms** | **62 Hz** | [AMD deployment](docs/deployment_amd.md) |
+| Hardware | Mode | Model latency | Preprocessing | Complete call | Throughput | Source |
+|---|---|---:|---:|---:|---:|---|
+| Jetson AGX Thor | NVFP4 + FA4, LIBERO `libero_10`, 1 camera | **24.09 ms** | **4.68 ms** | **29.45 ms** | **41.5 Hz** (model) | [Reproduce](docs/thor/groot-n17.md) · [Results](docs/thor/results.md#libero-one-camera) |
+| Jetson AGX Thor | NVFP4 + FA4, DROID 2-view feature graph | **29.60 ms** | — | — | **33 Hz** | [Historical results](docs/thor/results.md) |
+| Jetson AGX Thor | FP8, DROID 2-view feature graph | **48.94 ms** | — | — | **20.4 Hz** | [Historical results](docs/thor/results.md) |
+| RTX 5090 | FP8, 2-view base, full graph | **16.6 ms** | — | — | **60 Hz** | [GROOT N1.7 API](#groot-n17-rtx) |
+| AMD Instinct MI350X | FP8 backbone + BF16 DiT, full frame | **16.0 ms** | — | — | **62 Hz** | [AMD deployment](docs/deployment_amd.md) |
 
-The audited Thor rows use the base GR00T-N1.7-3B checkpoint and captured
-features; image/text embedding generation and action decoding are excluded.
-They are separate from the official one-camera LIBERO end-to-end benchmark.
-See [timing boundaries and accuracy](docs/thor/results.md) and the
-[official reference comparison](docs/benchmark_comparison.md#groot-n17-on-jetson-agx-thor).
+The LIBERO row uses four denoising steps, batch 1 and two CPU threads. Model
+latency includes input transfer, backbone and action head; the complete call
+also includes fresh preprocessing and physical-action decoding. Values are
+directly measured native medians. The older DROID feature-graph rows exclude
+image/text embedding generation and physical decoding.
+See [reproduction and accuracy](docs/thor/groot-n17.md) and the
+[JAL comparison](docs/thor/comparison.md#groot-n17).
 
 #### Pi0-FAST
 

@@ -11,14 +11,14 @@ def cpu(x):
  return x
 
 def main():
- p=argparse.ArgumentParser();p.add_argument('--flashrt',required=True);p.add_argument('--checkpoint',required=True);p.add_argument('--dataset');p.add_argument('--input-fixture');p.add_argument('--out',required=True);p.add_argument('--pairs',default='1:0,1:50,1:100,1:150,2:0,2:50,2:100,2:150');a=p.parse_args()
+ p=argparse.ArgumentParser();p.add_argument('--embodiment',default='OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT');p.add_argument('--flashrt',required=True);p.add_argument('--checkpoint',required=True);p.add_argument('--dataset');p.add_argument('--input-fixture');p.add_argument('--out',required=True);p.add_argument('--pairs',default='1:0,1:50,1:100,1:150,2:0,2:50,2:100,2:150');a=p.parse_args()
  sys.path.insert(0,str(Path(a.flashrt)/'tests/_helpers/groot_n17'))
  from capture_aux_multi import _install_hooks,_restore_hooks,_build_parsed
  import gr00t.model
  from gr00t.policy.gr00t_policy import Gr00tPolicy
  from gr00t.data.embodiment_tags import EmbodimentTag
  from gr00t.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader
- tag='OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT'
+ tag=a.embodiment
  policy=Gr00tPolicy(embodiment_tag=EmbodimentTag.resolve(tag),model_path=a.checkpoint,device='cuda:0')
  if a.input_fixture:
   fixed=torch.load(a.input_fixture,map_location='cpu',weights_only=False)['inputs'];a.pairs='1:0';loader=None
@@ -56,7 +56,7 @@ def main():
    ids_hook.remove()
    _restore_hooks(hooks)
   actions=result[0] if isinstance(result,tuple) else result
-  record={'aux':cpu(captured),'state':cpu(parsed['state']),'actions':cpu(actions),'meta':{'traj':traj,'step':step,'seed':0,'tag':tag,'checkpoint':a.checkpoint,'instrumented_capture_ms':ms,'views':list(policy.modality_configs['video'].modality_keys)}}
+  record={'inputs':cpu(parsed),'aux':cpu(captured),'state':cpu(parsed['state']),'actions':cpu(actions),'meta':{'traj':traj,'step':step,'seed':0,'tag':tag,'instrumented_capture_ms':ms,'views':list(policy.modality_configs['video'].modality_keys)}}
   records.append(record);print('CAPTURED',pair,ms, list(actions),flush=True)
  out=Path(a.out);out.parent.mkdir(parents=True,exist_ok=True);torch.save(records,out);print('SAVED',out,len(records),flush=True)
 if __name__=='__main__':main()

@@ -9,12 +9,19 @@ def main():
     p.add_argument('--repo',required=True)
     p.add_argument('--revision',required=True)
     p.add_argument('--out',required=True)
+    p.add_argument('--subfolder')
+    p.add_argument('--inference-only',action='store_true')
     a=p.parse_args()
     response=requests.get(f'https://modelscope.cn/api/v1/models/{a.repo}/repo/files',params={'Revision':a.revision,'Recursive':'true'},timeout=60)
     response.raise_for_status(); metadata=response.json()
     if metadata.get('Code')!=200:raise RuntimeError(metadata)
     root=Path(a.out).resolve();root.mkdir(parents=True,exist_ok=True)
     files=[f for f in metadata['Data']['Files'] if f['Type']=='blob']
+    if a.subfolder:files=[f for f in files if f['Path'].startswith(a.subfolder.rstrip('/')+'/')]
+    if a.inference_only:
+        names={'config.json','processor_config.json','embodiment_id.json','statistics.json','model.safetensors.index.json'}
+        files=[f for f in files if Path(f['Path']).name in names or (Path(f['Path']).name.startswith('model-') and f['Path'].endswith('.safetensors')) or '/experiment_cfg/' in f['Path']]
+    if not files:raise RuntimeError('No files matched the requested checkpoint')
     missing=[]
     for f in files:
         path=root/f['Path']
@@ -26,7 +33,7 @@ def main():
     if missing:
         snapshot_download(a.repo,revision=a.revision,local_dir=str(root),allow_file_pattern=missing,max_workers=2)
     manifest=[]
-    for f in metadata['Data']['Files']:
+    for f in files:
         if f['Type']!='blob':continue
         path=root/f['Path']
         if not path.exists():

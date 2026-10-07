@@ -27,10 +27,13 @@ fi
 if [[ "$MODE" == groot || "$MODE" == all ]]; then
   GROOT="${GROOT:?Set GROOT to the local-path GR00T overlay}"
   export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
-  GROOT_FIXTURE="${GROOT_FIXTURE:-$PWD/fixtures/groot-droid-traj1-step0.pt}"
-  "$REF/groot-venv/bin/python" capture_groot.py --flashrt "$SOURCE" --checkpoint "$GROOT" --input-fixture "$GROOT_FIXTURE" --out "$OUT/groot-reference.pt" > "$OUT/groot-capture.log" 2>&1
+  GROOT_FIXTURE="${GROOT_FIXTURE:-$PWD/fixtures/groot-libero10-onecam.pt}"
+  GROOT_EMBODIMENT="${GROOT_EMBODIMENT:-LIBERO_PANDA}"
+  GROOT_NUM_VIEWS="${GROOT_NUM_VIEWS:-1}"
+  GROOT_CPU_THREADS="${GROOT_CPU_THREADS:-2}"
+  "$REF/groot-venv/bin/python" capture_groot.py --embodiment "$GROOT_EMBODIMENT" --flashrt "$SOURCE" --checkpoint "$GROOT" --input-fixture "$GROOT_FIXTURE" --out "$OUT/groot-reference.pt" > "$OUT/groot-capture.log" 2>&1
   for tier in fp8 fp4; do
-    "$REF/groot-venv/bin/python" verify_groot_fixture.py --checkpoint "$GROOT" --fixture "$GROOT_FIXTURE" --reference-records "$OUT/groot-reference.pt" --tier "$tier" --out "$OUT/groot-$tier.json" > "$OUT/groot-$tier.log" 2>&1 || status=1
+    "$REF/groot-venv/bin/python" verify_groot_fixture.py --embodiment "$GROOT_EMBODIMENT" --num-views "$GROOT_NUM_VIEWS" --cpu-threads "$GROOT_CPU_THREADS" --checkpoint "$GROOT" --fixture "$GROOT_FIXTURE" --reference-records "$OUT/groot-reference.pt" --tier "$tier" --out "$OUT/groot-$tier.json" > "$OUT/groot-$tier.log" 2>&1 || status=1
   done
 fi
 echo "Results: $OUT; combined accuracy status: $status"

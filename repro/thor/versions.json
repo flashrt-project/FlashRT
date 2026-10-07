@@ -6,8 +6,8 @@
     "revision": "69f09b4b56b25c8ba522052fbaa662e08f969931"
   },
   "groot": {
-    "repo": "nv-community/GR00T-N1.7-3B",
-    "revision": "bec3baae56a6a736ffa390bd43ae5ed179dd4646"
+    "repo": "nv-community/GR00T-N1.7-LIBERO",
+    "revision": "e63019488858f03a929060b050ee4b4db6fa2c9f"
   },
   "runtime_archive_sha256": "8904cee73dfee989d354de7d3da1878cfe73d744711b11641d2a2b6e7dafb033"
 }

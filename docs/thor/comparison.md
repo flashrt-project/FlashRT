@@ -19,38 +19,23 @@ The [JAL OpenPI tutorial](https://www.jetson-ai-lab.com/tutorials/openpi_on_thor
 
 ## GR00T N1.7
 
-The currently verified configurations differ:
+The default reproduction now uses **GR00T-N1.7-LIBERO/libero_10**, one camera, four denoising steps and batch 1, matching the model and input configuration stated in the [JAL tutorial](https://www.jetson-ai-lab.com/tutorials/groot_n17_on_thor/). Both FlashRT and the fresh official reference explicitly use the `image` camera. The overlay changes the processor's original two-camera configuration without changing weights.
 
-| Setting | FlashRT reproduction | JAL published TensorRT benchmark |
+| Measurement | FlashRT report | JAL report |
 |---|---|---|
-| Checkpoint | GR00T-N1.7-3B | GR00T-N1.7-LIBERO/libero_10 |
-| Embodiment/input | DROID, two cameras × two historical frames | LIBERO, one camera |
-| Denoising | 4 steps | 4 steps |
-| FlashRT FP4 recipe | FP8 backbone, NVFP4 DiT | Mixed NVFP4 also quantizes the LLM |
-| Default timed input/output | Raw RGB/state/language → physical actions | Full pipeline inference |
+| Model inference | Input transfer + backbone + action head; excludes CPU processor and physical decode | Backbone and action head reported separately |
+| Preprocessing | Fresh official processor on each RGB/state/language input | CPU data processing measured separately and shared across backends |
+| Complete call | Direct wall-clock measurement including physical decode | Per-iteration sum of processing, backbone and action-head measurements; excludes physical decode |
 
-The JAL configuration is documented in the [official GR00T tutorial](https://www.jetson-ai-lab.com/tutorials/groot_n17_on_thor/). Its number cannot be divided by FlashRT's older feature-input number, or by the new raw-input result using a different checkpoint and input configuration.
+FlashRT reports its own processor time, rather than substituting a separately measured shared processing array. The README model-latency column retains the model-inference boundary; preprocessing and complete-call latency have separate columns. Use the complete-call result when discussing raw-image response time.
 
-Verified FlashRT command after the [model overlay setup](groot-n17.md):
+The official PyTorch source revision is managed by the installer. Fresh capture verifies the same processor patches, tokens, grid and physical actions. Performance measurements run separately without capture hooks. The default validator uses two CPU threads; report the same thread count for the comparator. The JAL timing protocol is five warmups and 20 measured iterations; validator JSON records its actual settings.
+
+To repeat:
 
 ```bash
 export GROOT="$MODELS/GR00T-local"
 bash run-validation.sh groot
 ```
 
-This freshly executes the official policy from raw observations to obtain reference actions. Default `raw-full` FlashRT validation reruns the official processor on the raw RGB/state/language each call, computes embeddings and backbone/action head with FlashRT, and includes physical decode. Static prompt/grid setup and calibration occur before timing. Captured embeddings are calibration inputs only. Processor patches, token IDs and grid must exactly match the fresh reference. Warmup=20, measured calls=100, batch=1; both ends of each call are GPU synchronized.
-
-The independent native check passed both raw-input tiers: FP8 cosine 0.999835 at 76.74 ms; FP4 cosine 0.999751 at 56.81 ms. Official eager PyTorch on the same raw sample/checkpoint measured 133.38 ms, with no capture hooks and exactly matching reference actions. These are fixed-sample observations on the recorded native environment, not a TensorRT or optimized-PyTorch comparison.
-
-To repeat the clean eager measurement after reference capture, use the installed official reference environment:
-
-```bash
-"$REF/groot-venv/bin/python" benchmark_groot_reference.py \
-  --checkpoint "$GROOT" --fixture "$GROOT_FIXTURE" \
-  --reference-records "$OUT/groot-reference.pt" \
-  --out "$OUT/groot-official-eager.json"
-```
-
-The explicit optional `--boundary feature` validator starts from captured post-patch features and image/text embeddings and ends at normalized action. Keep that result separate from raw-input timing; physical decoding is compared but excluded from its timer.
-
-There is no executed, validated TensorRT harness for the exact FlashRT feature boundary in this release. Matching that boundary would require a separate instrumented TensorRT runner and a common fixture; no untested TensorRT command is provided here. See [verified results](results.md) for what has actually passed.
+See [model preparation](groot-n17.md) and [verified results](results.md). Earlier DROID two-camera feature-input results remain historical records and are not the current LIBERO comparison. The published JAL TensorRT result is approximately 40 ms, but its engine has not been executed on the same test device. Do not publish a matched TensorRT speedup ratio from these different-machine measurements.

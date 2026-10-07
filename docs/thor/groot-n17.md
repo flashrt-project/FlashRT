@@ -1,6 +1,6 @@
 # GR00T N1.7 on Thor
 
-First complete [Docker or native setup](README.md). The validated model is GR00T N1.7 3B with its Cosmos-Reason2-2B backbone. Download both, including processor/tokenizer files and action statistics.
+Complete [Docker or native setup](README.md). The default model is **GR00T-N1.7-LIBERO/libero_10**, with its Cosmos-Reason2-2B backbone, one camera, batch 1 and four denoising steps.
 
 ## 1. Prepare the models
 
@@ -11,13 +11,13 @@ docker run --rm --runtime=nvidia --gpus all --network=host --shm-size=8g \
   -e PIP_INDEX_URL -v "$MODELS:/models" "$IMAGE" prepare groot
 ```
 
-Native:
+Native, from `repro/thor`:
 
 ```bash
 bash prepare-models.sh groot
 ```
 
-The script downloads pinned complete snapshots from ModelScope and verifies every file. Existing matching files are reused. If already downloaded, use `$MODELS/GR00T-N1.7-3B` and `$MODELS/Cosmos-Reason2-2B`. GR00T weights/config/statistics matched the NVIDIA checkpoint in this audit; Cosmos was verified against the mirror, without independent gated-Hugging-Face verification.
+The downloader uses versioned ModelScope mirrors, verifies checksums and reuses matching local files. It selects the `libero_10` inference files, excluding other task suites and training optimizer states. Keep both `$MODELS/GR00T-N1.7-LIBERO/libero_10` and `$MODELS/Cosmos-Reason2-2B`.
 
 ## 2. Run reference and FlashRT checks
 
@@ -31,26 +31,44 @@ docker run --rm --runtime=nvidia --gpus all --network=host --shm-size=8g \
 Native:
 
 ```bash
-python local_groot_checkpoint.py --checkpoint "$MODELS/GR00T-N1.7-3B" \
+python local_groot_checkpoint.py \
+  --checkpoint "$MODELS/GR00T-N1.7-LIBERO/libero_10" \
   --cosmos "$MODELS/Cosmos-Reason2-2B" --out "$MODELS/GR00T-local"
 export GROOT="$MODELS/GR00T-local"
 bash run-validation.sh groot
 ```
 
-Native overlay creation needs a new output directory; reuse an existing valid overlay on subsequent runs. Docker creates it automatically in the result directory. Only local model paths are changed; original weights remain unchanged. Reference execution runs offline.
+Use a new output directory when first creating the overlay; reuse it on later runs. Docker creates it automatically. Original weights and statistics remain unchanged. The overlay points to the local backbone and explicitly selects the `image` camera: the checkpoint processor originally configures both `image` and `wrist_image`.
 
-The official policy reruns from raw RGB, state and language. FlashRT compares against these newly generated official actions. The fixture has two cameras with two historical frames each, four diffusion steps, and 40 output steps. FP4 means FP8 backbone plus NVFP4 DiT.
+The bundled fixture contains a real LIBERO observation. The official reference runs afresh from RGB, state and language. FlashRT uses the same input, prompt, initial noise and four denoising steps. Processor patches, token IDs and image grid must exactly match the fresh reference. The model generates a padded horizon of 40; official decoding delivers **16 × 7** physical actions.
 
-## 3. Read the result
+## 3. Read the accuracy reports
 
-Inspect `groot-fp8.json` and `groot-fp4.json` in the result directory. Checks compare all 40×17 physical actions after official decoding: EEF 9, gripper 1 and joints 7. Mean cosine must be ≥0.999, worst ≥0.995, EEF/joint cosine ≥0.995 and gripper maximum absolute error ≤0.05. Reports also include RMSE, maximum errors and repeated-input differences. Tested Docker FP4 cosine: 0.999844.
+Inspect `groot-fp8.json` and `groot-fp4.json`. Reports include overall and per-action-group cosine, RMSE, maximum absolute errors and repeated-input stability. Overall numerical acceptance requires mean cosine ≥0.999, worst-sample cosine ≥0.995 and repeat consistency. Strict per-group diagnostics are reported separately, including failures.
 
-`last_action_decoder_out` is velocity, not the integrated final action. Comparing it to final actions gives a misleading low score. Near-zero gripper outputs also need absolute-error checks.
+On the verified native FP4 fixture, overall cosine is **0.999825**. Rotation cosine is **0.97134**, with maximum absolute error **0.00556**; near-zero components need absolute-error interpretation as well as cosine. This is a fixed-sample numerical regression, not a robot task-success evaluation or proof that every action-group diagnostic passes. FP4 uses an FP8 backbone and NVFP4 action head.
 
-## 4. State the timing boundary
+`last_action_decoder_out` is velocity, not the integrated final action. Compare decoded physical actions against the official output.
 
-The default check now times raw RGB, state and language through fresh official processor preprocessing, FlashRT patch embedding/visual merger/backbone/action head, and physical action decoding. Prompt/grid setup and fixed-sample calibration occur once before timing. Each timed call processes the actual raw images; it does not replay official model embeddings. The processor patches, token IDs and grid are checked against the fresh official capture.
+## 4. Read the latency reports
 
-Use `--boundary feature` with `verify_groot_fixture.py` only when deliberately measuring the older post-patch-feature graph boundary. Its approximately 29 ms result excludes preprocessing and embedding generation; the newly verified complete FP4 boundary is approximately 57 ms on the second native machine. Official instrumented capture is not a speed baseline.
+The default uses process-local **two CPU threads**, with no image or state cache. Setup, prompt preparation, calibration and graph capture occur before warmup. Each measured call freshly processes RGB and state.
 
-The same-sample raw-input FP8/FP4 checks passed all physical-action and repeat gates. This is still a fixed-sample regression with calibration on that sample. Expanding samples, changing prompts/grids or preprocessing requires new setup and evaluation. See the [comparison contract](comparison.md) for the matched official eager-PyTorch measurement and why the JAL TensorRT result uses a different checkpoint/configuration.
+| Measurement | Scope |
+|---|---|
+| Preprocessing | Official CPU processor: image transforms, patch preparation, text/state processing and collation |
+| Model inference | Prepared processor input through FlashRT input transfer, backbone and four-step action head |
+| Complete call | Raw RGB/state/language through preprocessing, FlashRT inference and decoded physical actions |
+
+The controlled native two-thread measurement was **4.68 ms preprocessing** and **29.00 ms complete call**; the eight-thread control was 5.86 / 30.19 ms. Outputs were bitwise identical. Component medians need not sum to the complete-call median. See [verified measurements](results.md) for measured model latency and release-container results, and [comparison contract](comparison.md) for the JAL configuration.
+
+To time the official eager policy without capture hooks:
+
+```bash
+"$REF/groot-venv/bin/python" benchmark_groot_reference.py \
+  --checkpoint "$GROOT" --fixture fixtures/groot-libero10-onecam.pt \
+  --reference-records "$OUT/groot-reference.pt" --embodiment LIBERO_PANDA --cpu-threads 2 \
+  --out "$OUT/groot-official-eager.json"
+```
+
+Use `--boundary feature` only for the older captured-feature boundary. It excludes image/text embedding generation and cannot substitute for model-inference or complete-call latency.

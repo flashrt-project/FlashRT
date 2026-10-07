@@ -1,0 +1,320 @@
+{
+  "per_sample_cosine": [
+    0.9998247012401797
+  ],
+  "mean_sample_cosine": 0.9998247012401797,
+  "worst_sample_cosine": 0.9998247012401797,
+  "rmse": 0.00731318949093278,
+  "max_abs": 0.028485983610153198,
+  "reference": "fresh official policy capture of the included raw input",
+  "official_vs_historical": {
+    "per_sample_cosine": [
+      1.0
+    ],
+    "mean_sample_cosine": 1.0,
+    "worst_sample_cosine": 1.0,
+    "rmse": 0.0,
+    "max_abs": 0.0
+  },
+  "modalities": {
+    "gripper": {
+      "per_sample_cosine": [
+        0.9999972393312906
+      ],
+      "mean_sample_cosine": 0.9999972393312906,
+      "worst_sample_cosine": 0.9999972393312906,
+      "rmse": 0.0027621358640099515,
+      "max_abs": 0.0078125
+    },
+    "pitch": {
+      "per_sample_cosine": [
+        0.9892620063895616
+      ],
+      "mean_sample_cosine": 0.9892620063895616,
+      "worst_sample_cosine": 0.9892620063895616,
+      "rmse": 0.0008939139653302727,
+      "max_abs": 0.0020480267703533173
+    },
+    "roll": {
+      "per_sample_cosine": [
+        0.9900738231959266
+      ],
+      "mean_sample_cosine": 0.9900738231959266,
+      "worst_sample_cosine": 0.9900738231959266,
+      "rmse": 0.0014505086194047231,
+      "max_abs": 0.003208400681614876
+    },
+    "x": {
+      "per_sample_cosine": [
+        0.9856420826772546
+      ],
+      "mean_sample_cosine": 0.9856420826772546,
+      "worst_sample_cosine": 0.9856420826772546,
+      "rmse": 0.0074326601042709484,
+      "max_abs": 0.01338958740234375
+    },
+    "y": {
+      "per_sample_cosine": [
+        0.9977173634431191
+      ],
+      "mean_sample_cosine": 0.9977173634431191,
+      "worst_sample_cosine": 0.9977173634431191,
+      "rmse": 0.016071217897416425,
+      "max_abs": 0.028485983610153198
+    },
+    "yaw": {
+      "per_sample_cosine": [
+        0.9429440763796935
+      ],
+      "mean_sample_cosine": 0.9429440763796935,
+      "worst_sample_cosine": 0.9429440763796935,
+      "rmse": 0.0031297314117150745,
+      "max_abs": 0.005556466057896614
+    },
+    "z": {
+      "per_sample_cosine": [
+        0.9985431302746474
+      ],
+      "mean_sample_cosine": 0.9985431302746474,
+      "worst_sample_cosine": 0.9985431302746474,
+      "rmse": 0.006365770346710811,
+      "max_abs": 0.013288229703903198
+    }
+  },
+  "tier": "fp4",
+  "shape": [
+    1,
+    16,
+    7
+  ],
+  "boundary": "raw RGB/state/language -> fresh official processor patches -> FlashRT kernel backbone/action head -> physical action decode; static prompt/grid captured once",
+  "calibration": "documented set_prompt single fixture; no extra multi-frame calibration",
+  "repeat_identical": true,
+  "repeat_normalized": {
+    "per_sample_cosine": [
+      1.0000000000000002
+    ],
+    "mean_sample_cosine": 1.0000000000000002,
+    "worst_sample_cosine": 1.0000000000000002,
+    "rmse": 0.0,
+    "max_abs": 0.0
+  },
+  "p50_ms": 29.445815598592162,
+  "p95_ms": 29.616989963687956,
+  "samples_ms": [
+    29.64550699107349,
+    29.61548906750977,
+    29.49314611032605,
+    29.552303021773696,
+    29.54911906272173,
+    29.51197884976864,
+    29.5061559882015,
+    29.447626089677215,
+    29.417006066069007,
+    29.401831096038222,
+    29.398062033578753,
+    29.584248084574938,
+    29.557618079707026,
+    29.413034208118916,
+    29.427848989143968,
+    29.41054292023182,
+    29.44400510750711,
+    29.35283910483122,
+    29.384107096120715,
+    29.41350406035781
+  ],
+  "passed": true,
+  "component_samples": [
+    {
+      "data_processing_ms": 4.82161995023489,
+      "model_ms": 24.13890208117664,
+      "physical_decode_ms": 0.23569585755467415,
+      "jal_style_sum_ms": 28.96052203141153
+    },
+    {
+      "data_processing_ms": 4.815091844648123,
+      "model_ms": 24.116088170558214,
+      "physical_decode_ms": 0.2357889898121357,
+      "jal_style_sum_ms": 28.931180015206337
+    },
+    {
+      "data_processing_ms": 4.716451978310943,
+      "model_ms": 24.104125099256635,
+      "physical_decode_ms": 0.234140083193779,
+      "jal_style_sum_ms": 28.820577077567577
+    },
+    {
+      "data_processing_ms": 4.761165007948875,
+      "model_ms": 24.11760692484677,
+      "physical_decode_ms": 0.23171398788690567,
+      "jal_style_sum_ms": 28.878771932795644
+    },
+    {
+      "data_processing_ms": 4.761840915307403,
+      "model_ms": 24.102096911519766,
+      "physical_decode_ms": 0.22832490503787994,
+      "jal_style_sum_ms": 28.86393782682717
+    },
+    {
+      "data_processing_ms": 4.742580931633711,
+      "model_ms": 24.094051215797663,
+      "physical_decode_ms": 0.22807507775723934,
+      "jal_style_sum_ms": 28.836632147431374
+    },
+    {
+      "data_processing_ms": 4.727073013782501,
+      "model_ms": 24.093105923384428,
+      "physical_decode_ms": 0.23290817625820637,
+      "jal_style_sum_ms": 28.82017893716693
+    },
+    {
+      "data_processing_ms": 4.674386000260711,
+      "model_ms": 24.093661922961473,
+      "physical_decode_ms": 0.23220409639179707,
+      "jal_style_sum_ms": 28.768047923222184
+    },
+    {
+      "data_processing_ms": 4.656988894566894,
+      "model_ms": 24.08669888973236,
+      "physical_decode_ms": 0.23239897564053535,
+      "jal_style_sum_ms": 28.743687784299254
+    },
+    {
+      "data_processing_ms": 4.657359095290303,
+      "model_ms": 24.075485998764634,
+      "physical_decode_ms": 0.22957613691687584,
+      "jal_style_sum_ms": 28.732845094054937
+    },
+    {
+      "data_processing_ms": 4.647543886676431,
+      "model_ms": 24.086022982373834,
+      "physical_decode_ms": 0.23039011284708977,
+      "jal_style_sum_ms": 28.733566869050264
+    },
+    {
+      "data_processing_ms": 4.711859859526157,
+      "model_ms": 24.202245054766536,
+      "physical_decode_ms": 0.23162108846008778,
+      "jal_style_sum_ms": 28.914104914292693
+    },
+    {
+      "data_processing_ms": 4.810358863323927,
+      "model_ms": 24.073866195976734,
+      "physical_decode_ms": 0.2291679847985506,
+      "jal_style_sum_ms": 28.88422505930066
+    },
+    {
+      "data_processing_ms": 4.650739021599293,
+      "model_ms": 24.09201394766569,
+      "physical_decode_ms": 0.22747390903532505,
+      "jal_style_sum_ms": 28.742752969264984
+    },
+    {
+      "data_processing_ms": 4.653913900256157,
+      "model_ms": 24.105857126414776,
+      "physical_decode_ms": 0.2273060381412506,
+      "jal_style_sum_ms": 28.759771026670933
+    },
+    {
+      "data_processing_ms": 4.670933121815324,
+      "model_ms": 24.061771808192134,
+      "physical_decode_ms": 0.23826002143323421,
+      "jal_style_sum_ms": 28.732704930007458
+    },
+    {
+      "data_processing_ms": 4.685637075453997,
+      "model_ms": 24.088020902127028,
+      "physical_decode_ms": 0.2290019765496254,
+      "jal_style_sum_ms": 28.773657977581024
+    },
+    {
+      "data_processing_ms": 4.605728900060058,
+      "model_ms": 24.080992909148335,
+      "physical_decode_ms": 0.22855703718960285,
+      "jal_style_sum_ms": 28.686721809208393
+    },
+    {
+      "data_processing_ms": 4.600265994668007,
+      "model_ms": 24.12188402377069,
+      "physical_decode_ms": 0.22801104933023453,
+      "jal_style_sum_ms": 28.722150018438697
+    },
+    {
+      "data_processing_ms": 4.640534985810518,
+      "model_ms": 24.100217036902905,
+      "physical_decode_ms": 0.2306029200553894,
+      "jal_style_sum_ms": 28.740752022713423
+    }
+  ],
+  "component_medians_ms": {
+    "data_processing_ms": 4.680011537857354,
+    "model_ms": 24.093856569379568,
+    "physical_decode_ms": 0.23049651645123959,
+    "jal_style_sum_ms": 28.770852950401604
+  },
+  "component_boundary": "model includes input GPU transfer, patch/vision backbone and four-step action head; excludes CPU processor and physical decode; JAL-style total is per-call processor+model sum",
+  "input_boundary": "raw-full",
+  "cpu_threads": 2,
+  "interop_threads": 8,
+  "warmup": 5,
+  "iters": 20,
+  "per_call_reference_model_execution": false,
+  "setup": "one-time fixed prompt/grid graph setup and calibration; captured embeddings used only during calibration",
+  "thresholds": {
+    "combined_mean_cosine": 0.999,
+    "combined_worst_cosine": 0.995,
+    "eef_and_joint_cosine": 0.995,
+    "gripper_max_abs": 0.05,
+    "repeat_normalized_cosine": 0.9999,
+    "repeat_normalized_max_abs": 0.05
+  },
+  "action_groups": {
+    "position": {
+      "per_sample_cosine": [
+        0.997499972012119
+      ],
+      "mean_sample_cosine": 0.997499972012119,
+      "worst_sample_cosine": 0.997499972012119,
+      "rmse": 0.010863570822384962,
+      "max_abs": 0.028485983610153198
+    },
+    "rotation": {
+      "per_sample_cosine": [
+        0.9713423921626193
+      ],
+      "mean_sample_cosine": 0.9713423921626193,
+      "worst_sample_cosine": 0.9713423921626193,
+      "rmse": 0.0020573669371193788,
+      "max_abs": 0.005556466057896614
+    },
+    "gripper": {
+      "per_sample_cosine": [
+        0.9999972393312906
+      ],
+      "mean_sample_cosine": 0.9999972393312906,
+      "worst_sample_cosine": 0.9999972393312906,
+      "rmse": 0.0027621358640099515,
+      "max_abs": 0.0078125
+    }
+  },
+  "strict_group_diagnostic_passed": false,
+  "acceptance_scope": "combined physical-action cosine and identical repeated normalized output; per-group thresholds are separate strict diagnostics, not task-success validation",
+  "embodiment": "libero_sim",
+  "requested_num_views": 1,
+  "image_grid_thw": [
+    [
+      1,
+      16,
+      16
+    ]
+  ],
+  "delivered_action_keys": [
+    "gripper",
+    "pitch",
+    "roll",
+    "x",
+    "y",
+    "yaw",
+    "z"
+  ]
+}

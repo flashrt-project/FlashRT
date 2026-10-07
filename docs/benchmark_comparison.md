@@ -91,12 +91,19 @@ JetPack 7.2 MAXN.
 | TensorRT optimized FP8 | 14.1 ms | 21.1 ms | ~44 ms | 22.6 Hz |
 | TensorRT optimized mixed NVFP4 | 13.6 ms | 17.2 ms | ~40 ms | 25.1 Hz |
 
-Our current verification uses **GR00T-N1.7-3B, DROID, two cameras**:
-**48.94 ms FP8** / **29.60 ms NVFP4**, p50 feature-input graph latency.
-Action cosine against the official reference is **0.999958** / **0.999844**.
-Embedding generation and physical-action decoding are outside this timing
-boundary. See [results and reproduction](thor/results.md). These measurements
-do not form an end-to-end speedup comparison with NVIDIA's LIBERO rows.
+Our current reproduction uses **GR00T-N1.7-LIBERO/libero_10, one camera,
+four denoising steps and batch 1**. The public native validator measures
+**24.09 ms model inference**, **4.68 ms preprocessing** and **29.45 ms complete
+RGB-to-physical-action call**, with overall action cosine **0.999825**.
+Strict per-group diagnostics and absolute errors are included in
+[results and reproduction](thor/groot-n17.md).
+
+Model latency includes input transfer, backbone and action head. JAL's total
+uses separately measured preprocessing plus backbone and head, excluding
+physical decode; our complete-call timing includes physical decode and uses
+our own fresh preprocessing. The TensorRT engine has not been benchmarked on
+the same test device, so no matched speedup ratio is claimed. See the
+[comparison contract](thor/comparison.md).
 
 <details>
 <summary>Historical FlashRT Thor measurements and fixture commands</summary>

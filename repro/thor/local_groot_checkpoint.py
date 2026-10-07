@@ -3,7 +3,7 @@ import argparse,json
 from pathlib import Path
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--checkpoint',required=True);p.add_argument('--cosmos',required=True);p.add_argument('--out',required=True);a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--checkpoint',required=True);p.add_argument('--cosmos',required=True);p.add_argument('--out',required=True);p.add_argument('--preserve-cameras',action='store_true',help='Keep original processor camera configuration (for optional DROID checks)');a=p.parse_args()
     source=Path(a.checkpoint).resolve();cosmos=Path(a.cosmos).resolve();out=Path(a.out).resolve()
     if out.exists():raise FileExistsError('Choose a new overlay directory')
     # Official code dispatches its backbone using this substring.
@@ -15,7 +15,13 @@ def main():
         if path.name in ('config.json','processor_config.json'):
             config=json.loads(path.read_text())
             if path.name=='config.json':config['model_name']=str(alias)
-            else:config['processor_kwargs']['model_name']=str(alias)
+            else:
+                config['processor_kwargs']['model_name']=str(alias)
+                if not a.preserve_cameras:
+                    mods=config['processor_kwargs']['modality_configs']['libero_sim']
+                    if mods['video']['delta_indices']!=[0] or len(mods['action']['delta_indices'])!=16 or len(mods['action']['modality_keys'])!=7:
+                        raise ValueError('Expected LIBERO single-history, 16-step, seven-action configuration')
+                    mods['video']['modality_keys']=['image']
             (out/path.name).write_text(json.dumps(config,indent=2))
         else:(out/path.name).symlink_to(path,target_is_directory=path.is_dir())
     print(out)

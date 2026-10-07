@@ -1,4 +1,34 @@
-# Verified results — 2026-10-07
+# Verified Thor results
+
+## LIBERO one camera
+
+The current GR00T default is **GR00T-N1.7-LIBERO/libero_10**, one camera,
+four denoising steps, batch 1 and two CPU threads. The native public validator
+directly measured these medians over 100 calls after 20 warmups:
+
+| Tier | Model inference | Preprocessing | Physical decode | Complete call | Overall cosine |
+|---|---:|---:|---:|---:|---:|
+| FP4 | **24.09 ms** | **4.68 ms** | 0.23 ms | **29.45 ms** | **0.999825** |
+
+Model inference includes input transfer, patch/vision backbone and the action
+head. Complete-call latency is measured independently; component medians do
+not necessarily add up to its median. No images or state are cached.
+
+The overall numerical acceptance passed and repeated actions were bitwise
+identical. Strict rotation cosine diagnostics did not pass: cosine 0.97134,
+maximum absolute error 0.00556. All diagnostics remain in the
+[numerical report](../../repro/thor/evidence/libero/groot-fp4-native.json).
+This checks a fixed real observation, not robot task success.
+
+In a separate balanced same-process thread comparison, 2 versus 8 CPU threads
+reduced full-call median from 30.19 to 29.00 ms, with bitwise-identical output.
+That controlled gain is 1.19 ms (3.9%); the table above uses the final public
+validator rather than substituting the separate optimization probe.
+
+The sections below retain earlier DROID/base-checkpoint and installation
+validation records. They use different inputs and timing boundaries.
+
+## Earlier DROID and installation checks
 
 Both routes passed all four numerical checks. Docker `run-validation.sh all` returned exit code 0. Native π0.5 and GR00T checks each passed.
 
