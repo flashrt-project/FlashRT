@@ -33,3 +33,27 @@ Both the internal CLI candidate and the source-only repackaged release candidate
 - [groot-fp4.json](../../repro/thor/evidence/release/groot-fp4.json): PASS.
 
 Published evidence replaces private host paths with generic paths and omits sudo user prompts. Numerical results and runtime versions are unchanged.
+
+## Independent Thor native reproduction
+
+On a second Jetson Thor, all three CUDA targets were compiled from the packaged source. Separate reference environments were installed for the pinned official OpenPI, LeRobot and Isaac GR00T revisions. `run-validation.sh all` completed with exit code 0.
+
+| Model/tier | Mean cosine | Worst cosine | RMSE | Max absolute error | Latency ms | Gate |
+|---|---:|---:|---:|---:|---:|---|
+| π0.5 FP8 | 0.999900 | 0.999742 | 0.006365 | 0.047594 | 38.52 | PASS |
+| π0.5 FP4 | 0.999690 | 0.999297 | 0.013618 | 0.079562 | 20.16 | PASS |
+| GR00T FP8 | 0.999950 | 0.999950 | 0.008030 | 0.032921 | 48.02 | PASS |
+| GR00T FP4 | 0.999776 | 0.999776 | 0.016821 | 0.060902 | 28.75 | PASS |
+
+See [numerical evidence](../../repro/thor/evidence/cross-machine/accuracy.json) for the complete per-modality and repeated-input checks. Both π0.5 tiers have zero gripper sign disagreement. These use the same fixtures and timing boundaries described above; GR00T timing excludes image/text feature generation.
+
+This verifies fresh native compilation and new pinned reference installations while reusing existing immutable checkpoints, PyTorch/CUDA dependencies and CUTLASS source. It does not certify a fresh Docker installation on this second machine. Host dependency conflicts required isolated package/search-order adjustments; [installation scope](../../repro/thor/evidence/cross-machine/installation-scope.json) lists each exception. The [environment](../../repro/thor/evidence/cross-machine/environment.json) uses PyTorch 2.14.0+cu130, CUDA 13.0 and L4T R38.2.1. Hardware protection settings were left unchanged; EXT_POWER state was not readable without privileged access, so these latencies are verification observations rather than a certified stock-power benchmark.
+
+## Complete public-source Docker build
+
+The full `Dockerfile.thor` build completed on Thor; `validate all` completed successfully. All four checks passed:
+
+- [pi05-fp8-accuracy.json](../../repro/thor/evidence/public-docker/pi05-fp8-accuracy.json): mean cosine 0.99990046, PASS.
+- [pi05-fp4-accuracy.json](../../repro/thor/evidence/public-docker/pi05-fp4-accuracy.json): mean cosine 0.99969050, PASS.
+- [groot-fp8.json](../../repro/thor/evidence/public-docker/groot-fp8.json): mean cosine 0.99995844, PASS.
+- [groot-fp4.json](../../repro/thor/evidence/public-docker/groot-fp4.json): mean cosine 0.99984395, PASS.

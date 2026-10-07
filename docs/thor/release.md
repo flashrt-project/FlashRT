@@ -43,7 +43,7 @@ On the validation machine, if repackaging the already validated local runtime, `
 
 Before pushing, all four numerical checks must pass. Review the final image contents and license notices; retain the build log and accuracy reports with the release. The repackaged source-only candidate was built on Thor and passed both models in FP8 and FP4. Its build/validation log is in `../../repro/thor/evidence/release-validation.log`, with accuracy reports in `../../repro/thor/evidence/release`. A fresh full source build should also run these checks before publication.
 
-For this review branch, the new archive-based Docker recipe has passed its [source-stage check](../../repro/thor/evidence/public-source-build.json) on Thor. Its full image build has not been rerun. Build it and run `validate all` before publishing an image from this branch.
+The complete archive-based `Dockerfile.thor` image has now been built on Thor and passed all four numerical checks. See the [public-source Docker evidence](../../repro/thor/evidence/public-docker). Registry publication, image-layer privacy review, and anonymous pull verification remain release requirements.
 
 ## 4. Publish
 

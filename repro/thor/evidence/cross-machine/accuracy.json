@@ -1,0 +1,112 @@
+{
+  "pi05-fp8": {
+    "passed": true,
+    "mean_sample_cosine": 0.9999004977466377,
+    "worst_sample_cosine": 0.999741801950569,
+    "rmse": 0.00636515069256017,
+    "max_abs": 0.0475944775354864,
+    "gripper_sign_disagreement": 0.0,
+    "p50_ms": 38.520449539646506
+  },
+  "pi05-fp4": {
+    "passed": true,
+    "mean_sample_cosine": 0.9996903536373212,
+    "worst_sample_cosine": 0.999296787939344,
+    "rmse": 0.013618219813528029,
+    "max_abs": 0.07956191502213472,
+    "gripper_sign_disagreement": 0.0,
+    "p50_ms": 20.160470507107675
+  },
+  "groot-fp8": {
+    "passed": true,
+    "mean_sample_cosine": 0.9999496910332215,
+    "worst_sample_cosine": 0.9999496910332215,
+    "rmse": 0.00802997448871132,
+    "max_abs": 0.03292134404182434,
+    "p50_ms": 48.01907099317759,
+    "repeat_normalized": {
+      "per_sample_cosine": [
+        0.9999947122018641
+      ],
+      "mean_sample_cosine": 0.9999947122018641,
+      "worst_sample_cosine": 0.9999947122018641,
+      "rmse": 0.0034862381495120685,
+      "max_abs": 0.0234375
+    },
+    "modalities": {
+      "eef_9d": {
+        "per_sample_cosine": [
+          0.9998636647080558
+        ],
+        "mean_sample_cosine": 0.9998636647080558,
+        "worst_sample_cosine": 0.9998636647080558,
+        "rmse": 0.008730723605188638,
+        "max_abs": 0.02778918296098709
+      },
+      "gripper_position": {
+        "per_sample_cosine": [
+          0.8971877169567105
+        ],
+        "mean_sample_cosine": 0.8971877169567105,
+        "worst_sample_cosine": 0.8971877169567105,
+        "rmse": 0.0020484547815823274,
+        "max_abs": 0.005859375
+      },
+      "joint_position": {
+        "per_sample_cosine": [
+          0.999977269013305
+        ],
+        "mean_sample_cosine": 0.999977269013305,
+        "worst_sample_cosine": 0.999977269013305,
+        "rmse": 0.00761523244082973,
+        "max_abs": 0.03292134404182434
+      }
+    }
+  },
+  "groot-fp4": {
+    "passed": true,
+    "mean_sample_cosine": 0.9997758276367209,
+    "worst_sample_cosine": 0.9997758276367209,
+    "rmse": 0.01682067669669622,
+    "max_abs": 0.06090220948681235,
+    "p50_ms": 28.748149052262306,
+    "repeat_normalized": {
+      "per_sample_cosine": [
+        0.9999999999999999
+      ],
+      "mean_sample_cosine": 0.9999999999999999,
+      "worst_sample_cosine": 0.9999999999999999,
+      "rmse": 0.0,
+      "max_abs": 0.0
+    },
+    "modalities": {
+      "eef_9d": {
+        "per_sample_cosine": [
+          0.9996146857643241
+        ],
+        "mean_sample_cosine": 0.9996146857643241,
+        "worst_sample_cosine": 0.9996146857643241,
+        "rmse": 0.014654067849591716,
+        "max_abs": 0.03884461522102356
+      },
+      "gripper_position": {
+        "per_sample_cosine": [
+          0.7583510251054997
+        ],
+        "mean_sample_cosine": 0.7583510251054997,
+        "worst_sample_cosine": 0.7583510251054997,
+        "rmse": 0.0034388314182927752,
+        "max_abs": 0.009765625
+      },
+      "joint_position": {
+        "per_sample_cosine": [
+          0.9998257122756659
+        ],
+        "mean_sample_cosine": 0.9998257122756659,
+        "worst_sample_cosine": 0.9998257122756659,
+        "rmse": 0.020232212274714906,
+        "max_abs": 0.06090220948681235
+      }
+    }
+  }
+}

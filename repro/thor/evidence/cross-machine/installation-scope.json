@@ -1,0 +1,18 @@
+{
+  "native_cuda_binaries": "All three native CUDA targets freshly compiled from the packaged source.",
+  "reference_code": "Pinned official OpenPI, LeRobot and Isaac GR00T source; separate newly installed reference environments.",
+  "reused_readonly": [
+    "Existing converted OpenPI and GR00T/Cosmos weights",
+    "Existing PyTorch and CUDA dependency wheels",
+    "Existing matching CUTLASS source"
+  ],
+  "setup_exceptions": [
+    "LeRobot exact pinned Git revision fetched from an existing local Git object cache after remote fetch failed.",
+    "Pinned LeRobot source placed before an unrelated inherited LeRobot package in the isolated environment search order.",
+    "GROOT reference environment installed pyOpenSSL 26.4.0 and disabled user-site imports to avoid unrelated inherited system/user package conflicts.",
+    "LIBERO environment added missing matplotlib support packages in the isolated native environment; NumPy remained 1.26.4."
+  ],
+  "fresh_docker_install_tested": false,
+  "hardware": "Jetson Thor; L4T R38.2.1; CUDA toolkit 13.0; MAXN. Stock protection settings were not modified. EXT_POWER state could not be read without privileged access.",
+  "timing_scope": "Single-machine verification observations, not an apples-to-apples comparison against a different timing boundary."
+}

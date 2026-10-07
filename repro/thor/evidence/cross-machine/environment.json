@@ -1,0 +1,12 @@
+{
+  "python": "3.12.3 (main, Jan  8 2026, 11:30:50) [GCC 13.3.0]",
+  "torch": "2.14.0+cu130",
+  "cuda": "13.0",
+  "gpu": "NVIDIA Thor",
+  "capability": [
+    11,
+    0
+  ],
+  "fa4_available": true,
+  "fa4_status": "active"
+}
