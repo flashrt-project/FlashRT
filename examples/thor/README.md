@@ -1,5 +1,8 @@
 # FlashRT on Jetson AGX Thor (SM110)
 
+For the validated OpenPI π0.5 and GR00T N1.7 Thor reproduction workflow, see [setup](../../docs/thor/README.md), [π0.5](../../docs/thor/pi05.md), [GR00T](../../docs/thor/groot-n17.md), and [Docker](../../docs/thor/docker.md). GR00T feature-input graph timings in that workflow are separate from raw-image end-to-end demo results.
+
+
 End-to-end Pi0.5 evaluation on Jetson AGX Thor. For the full install
 guide (Docker / native, dependencies, CMake build of the kernel
 library) see [`docs/INSTALL.md`](../../docs/INSTALL.md). This page

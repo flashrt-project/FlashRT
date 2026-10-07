@@ -1,0 +1,97 @@
+{
+  "groot_inputs": {
+    "video": {
+      "exterior_image_1_left": [
+        1,
+        2,
+        180,
+        320,
+        3
+      ],
+      "wrist_image_left": [
+        1,
+        2,
+        180,
+        320,
+        3
+      ]
+    },
+    "state": {
+      "eef_9d": [
+        1,
+        1,
+        9
+      ],
+      "gripper_position": [
+        1,
+        1,
+        1
+      ],
+      "joint_position": [
+        1,
+        1,
+        7
+      ]
+    },
+    "language": {
+      "annotation.language.language_instruction": [
+        1,
+        1
+      ]
+    }
+  },
+  "groot_aux": {
+    "visual_pos_masks": [
+      1,
+      277
+    ],
+    "position_ids": [
+      3,
+      1,
+      277
+    ],
+    "rope_cos": [
+      1,
+      277,
+      128
+    ],
+    "rope_sin": [
+      1,
+      277,
+      128
+    ],
+    "llm_input_embeds": [
+      1,
+      277,
+      2048
+    ],
+    "pixel_features": [
+      1024,
+      1024
+    ],
+    "grid_thw": [
+      4,
+      3
+    ],
+    "initial_noise": [
+      1,
+      40,
+      132
+    ]
+  },
+  "pi05": {
+    "img_0": [
+      224,
+      224,
+      3
+    ],
+    "wrist_0": [
+      224,
+      224,
+      3
+    ],
+    "state_0": [
+      8
+    ]
+  }
+}

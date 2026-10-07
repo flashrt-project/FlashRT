@@ -1,0 +1,15 @@
+{
+  "python": "3.12.3 (main, Mar 23 2026, 19:04:32) [GCC 13.3.0]",
+  "torch": "2.12.0a0+5aff3928d8.nv26.05",
+  "cuda": "13.2",
+  "gpu": "NVIDIA Thor",
+  "capability": [
+    11,
+    0
+  ],
+  "source": "/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/flash_rt/__init__.py",
+  "native_kernels": "/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/flash_rt/flash_rt_kernels.cpython-312-aarch64-linux-gnu.so",
+  "fp4_kernels": "/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/flash_rt/flash_rt_fp4.cpython-312-aarch64-linux-gnu.so",
+  "fa4_available": true,
+  "fa4_status": "active"
+}

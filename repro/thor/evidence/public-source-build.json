@@ -1,0 +1,9 @@
+{
+  "source_stage_built": true,
+  "checksum_verified_on_thor": true,
+  "shell_syntax_passed": true,
+  "python_syntax_passed": true,
+  "model_source_presence_passed": true,
+  "final_exit_code": 0,
+  "full_public_source_image_build_not_rerun": true
+}

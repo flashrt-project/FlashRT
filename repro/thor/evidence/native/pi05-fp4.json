@@ -1,0 +1,12 @@
+{
+  "mode": "fp4",
+  "checkpoint": "/models/pi05-openpi",
+  "fixture": "/workspace/reproduction/fixtures/libero_obs_2v_n8.npz",
+  "seed": 20261007,
+  "warmup": 20,
+  "iters": 100,
+  "p50_ms": 20.205165958032012,
+  "p95_ms": 20.322390762157738,
+  "torch": "2.14.0+cu130",
+  "flash_rt": "/workspace/reproduction/native/FlashRT-pi05-thor-limit-5421c93/flash_rt/__init__.py"
+}

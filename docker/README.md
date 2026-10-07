@@ -1,5 +1,8 @@
 # FlashRT — Docker
 
+For the validated OpenPI π0.5 and GR00T N1.7 Thor reproduction workflow, see [setup](../docs/thor/README.md), [π0.5](../docs/thor/pi05.md), [GR00T](../docs/thor/groot-n17.md), and [Docker](../docs/thor/docker.md). GR00T feature-input graph timings in that workflow are separate from raw-image end-to-end demo results.
+
+
 The fastest path to a working FlashRT install. One image, one
 command, no CUTLASS clone, no `flash-attn` wheel-hunting, no manual
 `cp *.so` step.
@@ -226,4 +229,3 @@ The image-build smoke deliberately asserts `libfmha_fp16_strided.so`
 is present and does NOT import `flash_rt_fa2`, so a future regression
 that reintroduces FA2 onto Thor by accident gets caught at build
 time.
-

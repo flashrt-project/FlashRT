@@ -1,0 +1,20 @@
+# Repackage the validated binaries without including private Git history layers.
+ARG RUNTIME_IMAGE=flashrt-jal:thor-5421c93
+FROM ${RUNTIME_IMAGE} AS validated_runtime
+FROM nvcr.io/nvidia/pytorch@sha256:222d8b18e671be5c3ef91cb41727a2572a0b23f59ded6c39f373a96946f6f2ba
+ARG PIP_INDEX_URL=https://pypi.org/simple
+LABEL org.flashrt.release-source-only="true"
+RUN apt-get update && apt-get install -y --no-install-recommends git cmake ninja-build ffmpeg libglib2.0-0 libgl1 && rm -rf /var/lib/apt/lists/*
+COPY --from=validated_runtime /opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93 /opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93
+WORKDIR /opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93
+RUN python -m pip install --index-url ${PIP_INDEX_URL} 'numpy==1.26.4' 'safetensors==0.8.0' sentencepiece pillow pytest pybind11 ninja 'nvidia-cutlass-dsl==4.5.1' 'quack-kernels==0.4.1' huggingface-hub && python -m pip install --no-deps --no-build-isolation -e . && python -m pip uninstall -y torchao
+COPY --from=validated_runtime /opt/reference /opt/reference
+COPY *.py *.sh /opt/jal/
+COPY versions.json official-files.json mirror-files.json /opt/jal/
+COPY fixtures/ /opt/jal/fixtures/
+ENV CUTE_DSL_ARCH=sm_101a
+ENV PYTHONPATH=/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93
+ENV LINGBOT_FA4_SRC=/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/csrc/attention/flash_attn_4_src
+WORKDIR /opt/jal
+ENTRYPOINT ["bash", "/opt/jal/flashrt-jal.sh"]
+CMD ["help"]

@@ -1,0 +1,13 @@
+{
+  "mode": "openpi",
+  "checkpoint": "/models/pi05-openpi",
+  "fixture": "/workspace/reproduction/fixtures/libero_obs_2v_n8.npz",
+  "seed": 20261007,
+  "warmup": 20,
+  "iters": 100,
+  "p50_ms": 262.8571621607989,
+  "p95_ms": 267.6946891238913,
+  "torch": "2.14.0+cu130",
+  "openpi_config": "Pi0Config(action_dim=32, action_horizon=10, max_token_len=200, dtype='bfloat16', paligemma_variant='gemma_2b', action_expert_variant='gemma_300m', pi05=True, discrete_state_input=False, pytorch_compile_mode='max-autotune')",
+  "reference_execution": "eager; TORCH_COMPILE_DISABLE=1; memory-efficient SDPA disabled (NGC torch dtype compatibility)"
+}

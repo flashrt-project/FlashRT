@@ -1,0 +1,1939 @@
+/opt/FlashRT-PAI
+/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93
+/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/docs
+/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/benchmarks
+/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/exec
+/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/docker
+/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/examples
+/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/cpp
+/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/.github
+/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/flash_wm
+/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/runtime
+/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/flash_rt
+/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/csrc
+/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/tests
+/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/training
+/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/scripts
+/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/build
+/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/cmake
+/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/third_party
+/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/tools
+/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/serving
+/results/groot-overlay.gl5nEP
+{
+  "python": "3.12.3 (main, Mar 23 2026, 19:04:32) [GCC 13.3.0]",
+  "torch": "2.12.0a0+5aff3928d8.nv26.05",
+  "cuda": "13.2",
+  "gpu": "NVIDIA Thor",
+  "capability": [
+    11,
+    0
+  ],
+  "source": "/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/flash_rt/__init__.py",
+  "native_kernels": "/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/flash_rt/flash_rt_kernels.cpython-312-aarch64-linux-gnu.so",
+  "fp4_kernels": "/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/flash_rt/flash_rt_fp4.cpython-312-aarch64-linux-gnu.so",
+  "fa4_available": true,
+  "fa4_status": "active"
+}
+{
+  "per_sample_cosine": [
+    0.9998342389941648,
+    0.9999144921102817,
+    0.9999784744562973,
+    0.9999720479566874,
+    0.9997435523971266,
+    0.9999000770326384,
+    0.9999229687252887,
+    0.9999378525755871
+  ],
+  "mean_sample_cosine": 0.999900463031009,
+  "worst_sample_cosine": 0.9997435523971266,
+  "rmse": 0.0063633580776911525,
+  "max_abs": 0.046260372619390644,
+  "gripper_sign_disagreement": 0.0,
+  "passed": true
+}
+{
+  "per_sample_cosine": [
+    0.9995750302073256,
+    0.9992986762759565,
+    0.999884591572687,
+    0.999852979513246,
+    0.9996327973251198,
+    0.9997440352658004,
+    0.9997158812243451,
+    0.9998200258937866
+  ],
+  "mean_sample_cosine": 0.9996905021597833,
+  "worst_sample_cosine": 0.9992986762759565,
+  "rmse": 0.013665586072040855,
+  "max_abs": 0.08103772961544986,
+  "gripper_sign_disagreement": 0.0,
+  "passed": true
+}
+Results: /results; combined accuracy status: 0
+
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile.release
+#1 transferring dockerfile: 1.49kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/flashrt-jal:thor-5421c93
+#2 DONE 0.0s
+
+#3 [internal] load metadata for nvcr.io/nvidia/pytorch@sha256:222d8b18e671be5c3ef91cb41727a2572a0b23f59ded6c39f373a96946f6f2ba
+#3 DONE 3.0s
+
+#4 [internal] load .dockerignore
+#4 transferring context: 582B done
+#4 DONE 0.0s
+
+#5 [validated_runtime 1/1] FROM docker.io/library/flashrt-jal:thor-5421c93@sha256:8a3e5527bfb2fd8b7f7eab5cf16271ec72f9a9dcbebf927554325675ac2d9ce6
+#5 resolve docker.io/library/flashrt-jal:thor-5421c93@sha256:8a3e5527bfb2fd8b7f7eab5cf16271ec72f9a9dcbebf927554325675ac2d9ce6 0.0s done
+#5 CACHED
+
+#6 [stage-1  1/10] FROM nvcr.io/nvidia/pytorch@sha256:222d8b18e671be5c3ef91cb41727a2572a0b23f59ded6c39f373a96946f6f2ba
+#6 resolve nvcr.io/nvidia/pytorch@sha256:222d8b18e671be5c3ef91cb41727a2572a0b23f59ded6c39f373a96946f6f2ba 0.0s done
+#6 CACHED
+
+#7 [internal] load build context
+#7 transferring context: 33.65kB done
+#7 DONE 0.0s
+
+#8 [stage-1  2/10] RUN apt-get update && apt-get install -y --no-install-recommends git cmake ninja-build ffmpeg libglib2.0-0 libgl1 && rm -rf /var/lib/apt/lists/*
+#8 2.644 Get:1 http://ports.ubuntu.com/ubuntu-ports noble InRelease [256 kB]
+#8 4.434 Get:2 http://ports.ubuntu.com/ubuntu-ports noble-updates InRelease [126 kB]
+#8 4.862 Get:3 http://ports.ubuntu.com/ubuntu-ports noble-backports InRelease [126 kB]
+#8 5.290 Get:4 http://ports.ubuntu.com/ubuntu-ports noble-security InRelease [126 kB]
+#8 5.720 Get:5 http://ports.ubuntu.com/ubuntu-ports noble/multiverse arm64 Packages [274 kB]
+#8 5.978 Get:6 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 Packages [19.0 MB]
+#8 10.10 Get:7 http://ports.ubuntu.com/ubuntu-ports noble/restricted arm64 Packages [113 kB]
+#8 10.10 Get:8 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 Packages [1776 kB]
+#8 10.44 Get:9 http://ports.ubuntu.com/ubuntu-ports noble-updates/multiverse arm64 Packages [96.8 kB]
+#8 10.45 Get:10 http://ports.ubuntu.com/ubuntu-ports noble-updates/restricted arm64 Packages [3132 kB]
+#8 11.34 Get:11 http://ports.ubuntu.com/ubuntu-ports noble-updates/universe arm64 Packages [2211 kB]
+#8 11.73 Get:12 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 Packages [1761 kB]
+#8 12.33 Get:13 http://ports.ubuntu.com/ubuntu-ports noble-backports/main arm64 Packages [49.0 kB]
+#8 12.34 Get:14 http://ports.ubuntu.com/ubuntu-ports noble-backports/multiverse arm64 Packages [671 B]
+#8 12.34 Get:15 http://ports.ubuntu.com/ubuntu-ports noble-backports/universe arm64 Packages [36.3 kB]
+#8 12.34 Get:16 http://ports.ubuntu.com/ubuntu-ports noble-security/restricted arm64 Packages [2886 kB]
+#8 12.62 Get:17 http://ports.ubuntu.com/ubuntu-ports noble-security/universe arm64 Packages [1634 kB]
+#8 12.88 Get:18 http://ports.ubuntu.com/ubuntu-ports noble-security/main arm64 Packages [1393 kB]
+#8 13.06 Get:19 http://ports.ubuntu.com/ubuntu-ports noble-security/multiverse arm64 Packages [91.7 kB]
+#8 13.12 Fetched 35.1 MB in 13s (2732 kB/s)
+#8 13.12 Reading package lists...
+#8 13.91 Reading package lists...
+#8 14.76 Building dependency tree...
+#8 15.00 Reading state information...
+#8 15.25 git is already the newest version (1:2.43.0-1ubuntu7.3).
+#8 15.25 ninja-build is already the newest version (1.11.1-2).
+#8 15.25 The following additional packages will be installed:
+#8 15.25   cmake-data fontconfig fontconfig-config fonts-dejavu-core fonts-dejavu-mono
+#8 15.25   libaom3 libapparmor1 libarchive13t64 libass9 libasyncns0 libavc1394-0
+#8 15.25   libavcodec60 libavdevice60 libavfilter9 libavformat60 libavutil58 libbluray2
+#8 15.25   libbs2b0 libcaca0 libcairo-gobject2 libcairo2 libcdio-cdda2t64
+#8 15.25   libcdio-paranoia2t64 libcdio19t64 libchromaprint1 libcjson1 libcodec2-1.2
+#8 15.25   libdatrie1 libdav1d7 libdc1394-25 libdecor-0-0 libdeflate0 libdrm-amdgpu1
+#8 15.25   libdrm-common libdrm2 libfftw3-double3 libflite1 libfontconfig1 libfreetype6
+#8 15.25   libfribidi0 libgbm1 libgdk-pixbuf-2.0-0 libgdk-pixbuf2.0-common
+#8 15.25   libgl1-mesa-dri libglvnd0 libglx-mesa0 libglx0 libgme0 libgraphite2-3
+#8 15.25   libharfbuzz0b libhwy1t64 libiec61883-0 libjack-jackd2-0 libjbig0
+#8 15.25   libjpeg-turbo8 libjpeg8 libjsoncpp25 libjxl0.7 liblcms2-2 liblerc4
+#8 15.25   liblilv-0-0 libllvm20 libmbedcrypto7t64 libmysofa1 libnorm1t64
+#8 15.25   libopenal-data libopenal1 libopenjp2-7 libopenmpt0t64 libpango-1.0-0
+#8 15.25   libpangocairo-1.0-0 libpangoft2-1.0-0 libpgm-5.3-0t64 libpixman-1-0
+#8 15.25   libplacebo338 libpocketsphinx3 libpostproc57 libpulse0 librabbitmq4
+#8 15.25   librav1e0 libraw1394-11 librhash0 librist4 librsvg2-2 librubberband2
+#8 15.25   libsamplerate0 libsdl2-2.0-0 libsensors-config libsensors5 libserd-0-0
+#8 15.25   libsharpyuv0 libshine3 libslang2 libsndio7.0 libsord-0-0 libsoxr0 libspeex1
+#8 15.25   libsphinxbase3t64 libsratom-0-0 libsrt1.5-gnutls libssh-4 libssh-gcrypt-4
+#8 15.25   libsvtav1enc1d1 libswresample4 libswscale7 libthai-data libthai0 libtheora0
+#8 15.25   libtiff6 libtwolame0 libudfread0 libunibreak5 libusb-1.0-0 libuv1t64
+#8 15.25   libva-drm2 libva-x11-2 libva2 libvdpau1 libvidstab1.1 libvpx9 libvulkan1
+#8 15.25   libwayland-client0 libwayland-cursor0 libwayland-egl1 libwebp7 libwebpmux3
+#8 15.25   libx11-6 libx11-data libx11-xcb1 libx264-164 libx265-199 libxau6
+#8 15.25   libxcb-dri3-0 libxcb-glx0 libxcb-present0 libxcb-randr0 libxcb-render0
+#8 15.25   libxcb-shape0 libxcb-shm0 libxcb-sync1 libxcb-xfixes0 libxcb1 libxcursor1
+#8 15.25   libxdmcp6 libxext6 libxfixes3 libxi6 libxkbcommon0 libxrandr2 libxrender1
+#8 15.25   libxshmfence1 libxss1 libxv1 libxvidcore4 libxxf86vm1 libzimg2 libzix-0-0
+#8 15.25   libzmq5 libzvbi-common libzvbi0t64 mesa-libgallium ocl-icd-libopencl1
+#8 15.25   shared-mime-info x11-common xkb-data
+#8 15.25 Suggested packages:
+#8 15.25   cmake-doc cmake-format elpa-cmake-mode ffmpeg-doc lrzip libcuda1 libnvcuvid1
+#8 15.25   libnvidia-encode1 libbluray-bdj libfftw3-bin libfftw3-dev low-memory-monitor
+#8 15.25   jackd2 liblcms2-utils libportaudio2 pulseaudio libraw1394-doc librsvg2-bin
+#8 15.25   xdg-utils lm-sensors serdi sndiod sordi speex opencl-icd
+#8 15.25 Recommended packages:
+#8 15.25   libaacs0 default-libdecor-0-plugin-1 | libdecor-0-plugin-1
+#8 15.25   libgdk-pixbuf2.0-bin libglib2.0-data xdg-user-dirs pocketsphinx-en-us
+#8 15.25   librsvg2-common va-driver-all | va-driver vdpau-driver-all | vdpau-driver
+#8 15.25   mesa-vulkan-drivers | vulkan-icd
+#8 15.58 The following NEW packages will be installed:
+#8 15.58   cmake cmake-data ffmpeg fontconfig fontconfig-config fonts-dejavu-core
+#8 15.58   fonts-dejavu-mono libaom3 libapparmor1 libarchive13t64 libass9 libasyncns0
+#8 15.58   libavc1394-0 libavcodec60 libavdevice60 libavfilter9 libavformat60
+#8 15.58   libavutil58 libbluray2 libbs2b0 libcaca0 libcairo-gobject2 libcairo2
+#8 15.58   libcdio-cdda2t64 libcdio-paranoia2t64 libcdio19t64 libchromaprint1 libcjson1
+#8 15.58   libcodec2-1.2 libdatrie1 libdav1d7 libdc1394-25 libdecor-0-0 libdeflate0
+#8 15.58   libdrm-amdgpu1 libdrm-common libdrm2 libfftw3-double3 libflite1
+#8 15.58   libfontconfig1 libfreetype6 libfribidi0 libgbm1 libgdk-pixbuf-2.0-0
+#8 15.58   libgdk-pixbuf2.0-common libgl1 libgl1-mesa-dri libglvnd0 libglx-mesa0
+#8 15.58   libglx0 libgme0 libgraphite2-3 libharfbuzz0b libhwy1t64 libiec61883-0
+#8 15.58   libjack-jackd2-0 libjbig0 libjpeg-turbo8 libjpeg8 libjsoncpp25 libjxl0.7
+#8 15.58   liblcms2-2 liblerc4 liblilv-0-0 libllvm20 libmbedcrypto7t64 libmysofa1
+#8 15.58   libnorm1t64 libopenal-data libopenal1 libopenjp2-7 libopenmpt0t64
+#8 15.58   libpango-1.0-0 libpangocairo-1.0-0 libpangoft2-1.0-0 libpgm-5.3-0t64
+#8 15.58   libpixman-1-0 libplacebo338 libpocketsphinx3 libpostproc57 libpulse0
+#8 15.58   librabbitmq4 librav1e0 libraw1394-11 librhash0 librist4 librsvg2-2
+#8 15.58   librubberband2 libsamplerate0 libsdl2-2.0-0 libsensors-config libsensors5
+#8 15.58   libserd-0-0 libsharpyuv0 libshine3 libslang2 libsndio7.0 libsord-0-0
+#8 15.58   libsoxr0 libspeex1 libsphinxbase3t64 libsratom-0-0 libsrt1.5-gnutls
+#8 15.58   libssh-gcrypt-4 libsvtav1enc1d1 libswresample4 libswscale7 libthai-data
+#8 15.58   libthai0 libtheora0 libtiff6 libtwolame0 libudfread0 libunibreak5
+#8 15.58   libusb-1.0-0 libuv1t64 libva-drm2 libva-x11-2 libva2 libvdpau1 libvidstab1.1
+#8 15.58   libvpx9 libvulkan1 libwayland-client0 libwayland-cursor0 libwayland-egl1
+#8 15.58   libwebp7 libwebpmux3 libx11-6 libx11-data libx11-xcb1 libx264-164
+#8 15.58   libx265-199 libxau6 libxcb-dri3-0 libxcb-glx0 libxcb-present0 libxcb-randr0
+#8 15.58   libxcb-render0 libxcb-shape0 libxcb-shm0 libxcb-sync1 libxcb-xfixes0 libxcb1
+#8 15.58   libxcursor1 libxdmcp6 libxext6 libxfixes3 libxi6 libxkbcommon0 libxrandr2
+#8 15.58   libxrender1 libxshmfence1 libxss1 libxv1 libxvidcore4 libxxf86vm1 libzimg2
+#8 15.58   libzix-0-0 libzmq5 libzvbi-common libzvbi0t64 mesa-libgallium
+#8 15.58   ocl-icd-libopencl1 shared-mime-info x11-common xkb-data
+#8 15.58 The following packages will be upgraded:
+#8 15.58   libglib2.0-0t64 libssh-4
+#8 16.24 2 upgraded, 167 newly installed, 0 to remove and 96 not upgraded.
+#8 16.24 Need to get 123 MB of archives.
+#8 16.24 After this operation, 411 MB of additional disk space will be used.
+#8 16.24 Get:1 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libapparmor1 arm64 4.0.1really4.0.1-0ubuntu0.24.04.8 [51.9 kB]
+#8 17.28 Get:2 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libfribidi0 arm64 1.0.13-3build1 [26.5 kB]
+#8 17.38 Get:3 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libglib2.0-0t64 arm64 2.80.0-6ubuntu3.9 [1533 kB]
+#8 18.90 Get:4 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libslang2 arm64 2.3.3-3build2 [476 kB]
+#8 19.02 Get:5 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 shared-mime-info arm64 2.4-4 [472 kB]
+#8 19.11 Get:6 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 xkb-data all 2.41-2ubuntu1.1 [397 kB]
+#8 19.18 Get:7 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libdrm-common all 2.4.125-1ubuntu0.1~24.04.2 [9250 B]
+#8 19.18 Get:8 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libdrm2 arm64 2.4.125-1ubuntu0.1~24.04.2 [42.9 kB]
+#8 19.19 Get:9 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libsensors-config all 1:3.6.0-9build1 [5546 B]
+#8 19.19 Get:10 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libsensors5 arm64 1:3.6.0-9build1 [27.0 kB]
+#8 19.19 Get:11 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libusb-1.0-0 arm64 2:1.0.27-1 [54.1 kB]
+#8 19.20 Get:12 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libuv1t64 arm64 1.48.0-1.1build1 [95.3 kB]
+#8 19.22 Get:13 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libxau6 arm64 1:1.0.9-1build6 [7264 B]
+#8 19.53 Get:14 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libxdmcp6 arm64 1:1.1.3-0ubuntu6 [10.4 kB]
+#8 19.53 Get:15 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libxcb1 arm64 1.15-1ubuntu2 [49.4 kB]
+#8 19.53 Get:16 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libx11-data all 2:1.8.7-1build1 [115 kB]
+#8 19.54 Get:17 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libx11-6 arm64 2:1.8.7-1build1 [649 kB]
+#8 19.59 Get:18 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libxext6 arm64 2:1.3.4-1build2 [30.4 kB]
+#8 19.59 Get:19 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libxkbcommon0 arm64 1.6.0-1build1 [122 kB]
+#8 19.60 Get:20 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libarchive13t64 arm64 3.7.2-2ubuntu0.8 [378 kB]
+#8 20.51 Get:21 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libjsoncpp25 arm64 1.9.5-6build1 [78.2 kB]
+#8 20.51 Get:22 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 librhash0 arm64 1.4.3-3build1 [126 kB]
+#8 20.52 Get:23 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 cmake-data all 3.28.3-1build7 [2155 kB]
+#8 20.53 Get:24 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 cmake arm64 3.28.3-1build7 [10.3 MB]
+#8 22.54 Get:25 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libaom3 arm64 3.8.2-2ubuntu0.2 [1620 kB]
+#8 22.78 Get:26 http://ports.ubuntu.com/ubuntu-ports noble-updates/universe arm64 libva2 arm64 2.20.0-2ubuntu0.2 [66.7 kB]
+#8 22.79 Get:27 http://ports.ubuntu.com/ubuntu-ports noble-updates/universe arm64 libva-drm2 arm64 2.20.0-2ubuntu0.2 [7076 B]
+#8 22.79 Get:28 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libx11-xcb1 arm64 2:1.8.7-1build1 [7870 B]
+#8 22.79 Get:29 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libxcb-dri3-0 arm64 1.15-1ubuntu2 [7196 B]
+#8 22.79 Get:30 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libxfixes3 arm64 1:6.0.0-2build1 [11.2 kB]
+#8 22.79 Get:31 http://ports.ubuntu.com/ubuntu-ports noble-updates/universe arm64 libva-x11-2 arm64 2.20.0-2ubuntu0.2 [12.1 kB]
+#8 22.80 Get:32 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libvdpau1 arm64 1.5-2build1 [26.4 kB]
+#8 22.80 Get:33 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 ocl-icd-libopencl1 arm64 2.3.2-1build1 [37.6 kB]
+#8 22.86 Get:34 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libavutil58 arm64 7:6.1.1-3ubuntu5 [388 kB]
+#8 23.12 Get:35 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libfreetype6 arm64 2.13.2+dfsg-1ubuntu0.2 [393 kB]
+#8 23.18 Get:36 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 fonts-dejavu-mono all 2.37-8 [502 kB]
+#8 23.25 Get:37 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 fonts-dejavu-core all 2.37-8 [835 kB]
+#8 23.37 Get:38 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 fontconfig-config arm64 2.15.0-1.1ubuntu2 [37.4 kB]
+#8 23.37 Get:39 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libfontconfig1 arm64 2.15.0-1.1ubuntu2 [142 kB]
+#8 23.39 Get:40 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libpixman-1-0 arm64 0.42.2-1build1 [204 kB]
+#8 23.42 Get:41 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libxcb-render0 arm64 1.15-1ubuntu2 [16.6 kB]
+#8 23.42 Get:42 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libxcb-shm0 arm64 1.15-1ubuntu2 [5876 B]
+#8 23.43 Get:43 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libxrender1 arm64 1:0.9.10-1.1build1 [18.8 kB]
+#8 23.49 Get:44 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libcairo2 arm64 1.18.0-3build1 [555 kB]
+#8 23.74 Get:45 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libcodec2-1.2 arm64 1.2.0-2build1 [8996 kB]
+#8 25.66 Get:46 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libdav1d7 arm64 1.4.1-1build1 [298 kB]
+#8 25.70 Get:47 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libhwy1t64 arm64 1.0.7-8.1build1 [437 kB]
+#8 25.75 Get:48 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 liblcms2-2 arm64 2.14-2ubuntu0.1 [161 kB]
+#8 25.77 Get:49 http://ports.ubuntu.com/ubuntu-ports noble-updates/universe arm64 libjxl0.7 arm64 0.7.0-10.2ubuntu6.1 [690 kB]
+#8 25.86 Get:50 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libopenjp2-7 arm64 2.5.0-2ubuntu0.5 [171 kB]
+#8 25.88 Get:51 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 librav1e0 arm64 0.7.1-2 [760 kB]
+#8 25.98 Get:52 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libcairo-gobject2 arm64 1.18.0-3build1 [127 kB]
+#8 26.00 Get:53 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libgdk-pixbuf2.0-common all 2.42.10+dfsg-3ubuntu3.3 [8302 B]
+#8 26.00 Get:54 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libjpeg-turbo8 arm64 2.1.5-2ubuntu2 [163 kB]
+#8 26.03 Get:55 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libjpeg8 arm64 8c-2ubuntu11 [2148 B]
+#8 26.29 Get:56 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libdeflate0 arm64 1.19-1build1.1 [43.5 kB]
+#8 26.29 Get:57 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libjbig0 arm64 2.1-6.1ubuntu2 [29.3 kB]
+#8 26.30 Get:58 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 liblerc4 arm64 4.0.0+ds-4ubuntu2 [154 kB]
+#8 26.32 Get:59 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libsharpyuv0 arm64 1.3.2-0.4build3 [14.5 kB]
+#8 26.32 Get:60 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libwebp7 arm64 1.3.2-0.4build3 [191 kB]
+#8 26.60 Get:61 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libtiff6 arm64 4.5.1+git230720-4ubuntu2.5 [192 kB]
+#8 26.62 Get:62 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libgdk-pixbuf-2.0-0 arm64 2.42.10+dfsg-3ubuntu3.3 [146 kB]
+#8 26.64 Get:63 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 fontconfig arm64 2.15.0-1.1ubuntu2 [190 kB]
+#8 26.66 Get:64 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libgraphite2-3 arm64 1.3.14-2ubuntu0.24.04.1 [71.1 kB]
+#8 26.67 Get:65 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libharfbuzz0b arm64 8.3.0-2build2 [463 kB]
+#8 26.92 Get:66 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libthai-data all 0.1.29-2build1 [158 kB]
+#8 26.94 Get:67 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libdatrie1 arm64 0.2.13-3build1 [19.2 kB]
+#8 26.94 Get:68 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libthai0 arm64 0.1.29-2build1 [18.2 kB]
+#8 26.94 Get:69 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libpango-1.0-0 arm64 1.52.1+ds-1build1 [228 kB]
+#8 26.96 Get:70 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libpangoft2-1.0-0 arm64 1.52.1+ds-1build1 [42.0 kB]
+#8 27.23 Get:71 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libpangocairo-1.0-0 arm64 1.52.1+ds-1build1 [27.4 kB]
+#8 27.24 Get:72 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 librsvg2-2 arm64 2.58.0+dfsg-1ubuntu0.1 [2037 kB]
+#8 27.84 Get:73 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libshine3 arm64 3.1.1-2build1 [25.8 kB]
+#8 27.84 Get:74 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libspeex1 arm64 1.2.1-2ubuntu2.24.04.1 [56.2 kB]
+#8 27.85 Get:75 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libsvtav1enc1d1 arm64 1.7.0+dfsg-2build1 [1276 kB]
+#8 27.98 Get:76 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libsoxr0 arm64 0.1.3-4build3 [56.4 kB]
+#8 27.99 Get:77 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libswresample4 arm64 7:6.1.1-3ubuntu5 [57.9 kB]
+#8 27.99 Get:78 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libtheora0 arm64 1.1.1+dfsg.1-16.1build3 [224 kB]
+#8 28.02 Get:79 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libtwolame0 arm64 0.4.0-2build3 [51.7 kB]
+#8 28.02 Get:80 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libvpx9 arm64 1.14.0-1ubuntu2.3 [1233 kB]
+#8 28.14 Get:81 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libwebpmux3 arm64 1.3.2-0.4build3 [25.0 kB]
+#8 28.18 Get:82 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libx264-164 arm64 2:0.164.3108+git31e19f9-1 [542 kB]
+#8 28.26 Get:83 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libx265-199 arm64 3.5-2build1 [714 kB]
+#8 28.35 Get:84 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libxvidcore4 arm64 2:1.3.7-1build1 [180 kB]
+#8 28.50 Get:85 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libzvbi-common all 0.2.42-2 [42.4 kB]
+#8 28.50 Get:86 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libzvbi0t64 arm64 0.2.42-2 [259 kB]
+#8 28.54 Get:87 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libavcodec60 arm64 7:6.1.1-3ubuntu5 [5769 kB]
+#8 29.67 Get:88 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libraw1394-11 arm64 2.1.2-2build3 [26.9 kB]
+#8 29.67 Get:89 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libavc1394-0 arm64 0.5.4-5build3 [15.8 kB]
+#8 29.67 Get:90 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libunibreak5 arm64 5.1-2build1 [25.3 kB]
+#8 29.67 Get:91 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libass9 arm64 1:0.17.1-2build1 [91.7 kB]
+#8 29.74 Get:92 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libudfread0 arm64 1.1.2-1build1 [17.0 kB]
+#8 29.74 Get:93 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libbluray2 arm64 1:1.3.4-1build1 [149 kB]
+#8 29.74 Get:94 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libchromaprint1 arm64 1.5.1-5 [29.3 kB]
+#8 29.74 Get:95 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libgme0 arm64 0.6.3-7build1 [129 kB]
+#8 29.74 Get:96 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libopenmpt0t64 arm64 0.7.3-1.1build3 [618 kB]
+#8 29.98 Get:97 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 librabbitmq4 arm64 0.11.0-1ubuntu0.2 [38.9 kB]
+#8 30.15 Get:98 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libcjson1 arm64 1.7.17-1 [25.1 kB]
+#8 30.15 Get:99 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libmbedcrypto7t64 arm64 2.28.8-1 [209 kB]
+#8 30.17 Get:100 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 librist4 arm64 0.2.10+dfsg-2 [76.2 kB]
+#8 30.18 Get:101 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libsrt1.5-gnutls arm64 1.5.3-1build2 [306 kB]
+#8 30.84 Get:102 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libssh-gcrypt-4 arm64 0.10.6-2ubuntu0.5 [227 kB]
+#8 32.59 Get:103 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libnorm1t64 arm64 1.5.9+dfsg-3.1build1 [150 kB]
+#8 32.75 Get:104 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libpgm-5.3-0t64 arm64 5.3.128~dfsg-2.1build1 [162 kB]
+#8 32.98 Get:105 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libzmq5 arm64 4.3.5-1build2 [247 kB]
+#8 33.21 Get:106 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libavformat60 arm64 7:6.1.1-3ubuntu5 [1188 kB]
+#8 33.66 Get:107 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libbs2b0 arm64 3.1.0+dfsg-7build1 [9976 B]
+#8 33.66 Get:108 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libflite1 arm64 2.2-6build3 [13.6 MB]
+#8 36.38 Get:109 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libserd-0-0 arm64 0.32.2-1 [42.9 kB]
+#8 36.38 Get:110 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libzix-0-0 arm64 0.4.2-2build1 [24.0 kB]
+#8 36.38 Get:111 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libsord-0-0 arm64 0.16.16-2build1 [15.7 kB]
+#8 36.38 Get:112 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libsratom-0-0 arm64 0.6.16-1build1 [15.8 kB]
+#8 36.38 Get:113 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 liblilv-0-0 arm64 0.24.22-1build1 [41.1 kB]
+#8 36.39 Get:114 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libmysofa1 arm64 1.3.2+dfsg-2ubuntu2 [1157 kB]
+#8 37.30 Get:115 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libvulkan1 arm64 1.3.275.0-1build1 [150 kB]
+#8 37.30 Get:116 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libplacebo338 arm64 6.338.2-2build1 [2570 kB]
+#8 37.33 Get:117 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libasyncns0 arm64 0.8-6build4 [11.2 kB]
+#8 37.34 Get:118 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libpulse0 arm64 1:16.1+dfsg1-2ubuntu10.1 [271 kB]
+#8 37.34 Get:119 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libsphinxbase3t64 arm64 0.8+5prealpha+1-17build2 [124 kB]
+#8 37.34 Get:120 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libpocketsphinx3 arm64 0.8.0+real5prealpha+1-15ubuntu5 [129 kB]
+#8 37.34 Get:121 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libpostproc57 arm64 7:6.1.1-3ubuntu5 [41.2 kB]
+#8 37.50 Get:122 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libfftw3-double3 arm64 3.3.10-1ubuntu3 [384 kB]
+#8 37.66 Get:123 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libsamplerate0 arm64 0.2.2-4build1 [1343 kB]
+#8 37.83 Get:124 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 librubberband2 arm64 3.3.0+dfsg-2build1 [120 kB]
+#8 37.93 Get:125 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libswscale7 arm64 7:6.1.1-3ubuntu5 [173 kB]
+#8 37.95 Get:126 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libvidstab1.1 arm64 1.1.0-2build1 [38.7 kB]
+#8 37.96 Get:127 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libzimg2 arm64 3.0.5+ds1-1build1 [119 kB]
+#8 37.97 Get:128 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libavfilter9 arm64 7:6.1.1-3ubuntu5 [4089 kB]
+#8 38.96 Get:129 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libcaca0 arm64 0.99.beta20-4ubuntu0.2 [206 kB]
+#8 38.96 Get:130 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libcdio19t64 arm64 2.1.0-4.1ubuntu1.2 [64.2 kB]
+#8 38.96 Get:131 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libcdio-cdda2t64 arm64 10.2+2.0.1-1.1build2 [16.2 kB]
+#8 38.96 Get:132 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libcdio-paranoia2t64 arm64 10.2+2.0.1-1.1build2 [15.8 kB]
+#8 38.96 Get:133 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libdc1394-25 arm64 2.2.6-4build1 [90.3 kB]
+#8 38.97 Get:134 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libglvnd0 arm64 1.7.0-1build1 [60.6 kB]
+#8 38.97 Get:135 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libxcb-glx0 arm64 1.15-1ubuntu2 [25.5 kB]
+#8 38.97 Get:136 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libxcb-present0 arm64 1.15-1ubuntu2 [5866 B]
+#8 38.97 Get:137 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libxcb-xfixes0 arm64 1.15-1ubuntu2 [10.6 kB]
+#8 39.27 Get:138 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libxxf86vm1 arm64 1:1.1.4-1build4 [9130 B]
+#8 39.28 Get:139 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libdrm-amdgpu1 arm64 2.4.125-1ubuntu0.1~24.04.2 [21.9 kB]
+#8 39.28 Get:140 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libllvm20 arm64 1:20.1.2-0ubuntu1~24.04.3 [29.3 MB]
+#8 45.62 Get:141 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libxcb-randr0 arm64 1.15-1ubuntu2 [18.4 kB]
+#8 46.25 Get:142 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libxcb-sync1 arm64 1.15-1ubuntu2 [9682 B]
+#8 46.56 Get:143 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libxshmfence1 arm64 1.3-1build5 [4938 B]
+#8 46.60 Get:144 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 mesa-libgallium arm64 25.2.8-0ubuntu0.24.04.4 [12.1 MB]
+#8 50.75 Get:145 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libgbm1 arm64 25.2.8-0ubuntu0.24.04.4 [35.0 kB]
+#8 50.75 Get:146 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libgl1-mesa-dri arm64 25.2.8-0ubuntu0.24.04.4 [37.0 kB]
+#8 50.76 Get:147 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libglx-mesa0 arm64 25.2.8-0ubuntu0.24.04.4 [111 kB]
+#8 50.78 Get:148 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libglx0 arm64 1.7.0-1build1 [33.2 kB]
+#8 50.78 Get:149 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libgl1 arm64 1.7.0-1build1 [106 kB]
+#8 50.79 Get:150 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libiec61883-0 arm64 1.2.0-6build1 [24.3 kB]
+#8 50.79 Get:151 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libjack-jackd2-0 arm64 1.9.21~dfsg-3ubuntu3 [285 kB]
+#8 50.82 Get:152 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libopenal-data all 1:1.23.1-4build1 [161 kB]
+#8 50.84 Get:153 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libsndio7.0 arm64 1.9.0-0.3build3 [29.0 kB]
+#8 51.07 Get:154 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libopenal1 arm64 1:1.23.1-4build1 [510 kB]
+#8 51.16 Get:155 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libwayland-client0 arm64 1.22.0-2.1build1 [25.9 kB]
+#8 51.16 Get:156 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libdecor-0-0 arm64 0.2.2-1build2 [16.5 kB]
+#8 51.16 Get:157 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libwayland-cursor0 arm64 1.22.0-2.1build1 [10.3 kB]
+#8 51.16 Get:158 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libwayland-egl1 arm64 1.22.0-2.1build1 [5622 B]
+#8 51.16 Get:159 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libxcursor1 arm64 1:1.2.1-1build1 [21.1 kB]
+#8 51.17 Get:160 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libxi6 arm64 2:1.8.1-1build1 [31.9 kB]
+#8 51.17 Get:161 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libxrandr2 arm64 2:1.5.2-2build1 [19.6 kB]
+#8 51.17 Get:162 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 x11-common all 1:7.7+23ubuntu3 [21.7 kB]
+#8 51.38 Get:163 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libxss1 arm64 1:1.2.3-1build3 [7244 B]
+#8 51.70 Get:164 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libsdl2-2.0-0 arm64 2.30.0+dfsg-1ubuntu3.1 [671 kB]
+#8 51.79 Get:165 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libxcb-shape0 arm64 1.15-1ubuntu2 [6250 B]
+#8 51.79 Get:166 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 libxv1 arm64 2:1.0.11-1.1build1 [10.7 kB]
+#8 51.79 Get:167 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 libavdevice60 arm64 7:6.1.1-3ubuntu5 [81.6 kB]
+#8 51.80 Get:168 http://ports.ubuntu.com/ubuntu-ports noble/universe arm64 ffmpeg arm64 7:6.1.1-3ubuntu5 [1880 kB]
+#8 52.06 Get:169 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 libssh-4 arm64 0.10.6-2ubuntu0.5 [192 kB]
+#8 52.26 debconf: unable to initialize frontend: Dialog
+#8 52.26 debconf: (TERM is not set, so the dialog frontend is not usable.)
+#8 52.26 debconf: falling back to frontend: Readline
+#8 52.27 debconf: unable to initialize frontend: Readline
+#8 52.27 debconf: (This frontend requires a controlling tty.)
+#8 52.27 debconf: falling back to frontend: Teletype
+#8 52.27 dpkg-preconfigure: unable to re-open stdin:
+#8 52.32 Fetched 123 MB in 36s (3368 kB/s)
+#8 52.34 Selecting previously unselected package libapparmor1:arm64.
+
+#8 52.34 (Reading database ...
+(Reading database ... 5%
+(Reading database ... 10%
+(Reading database ... 15%
+(Reading database ... 20%
+(Reading database ... 25%
+(Reading database ... 30%
+(Reading database ... 35%
+(Reading database ... 40%
+(Reading database ... 45%
+(Reading database ... 50%
+(Reading database ... 55%
+(Reading database ... 60%
+(Reading database ... 65%
+(Reading database ... 70%
+(Reading database ... 75%
+(Reading database ... 80%
+(Reading database ... 85%
+(Reading database ... 90%
+(Reading database ... 95%
+(Reading database ... 100%
+(Reading database ... 31049 files and directories currently installed.)
+
+#8 52.36 Preparing to unpack .../000-libapparmor1_4.0.1really4.0.1-0ubuntu0.24.04.8_arm64.deb ...
+
+#8 52.36 Unpacking libapparmor1:arm64 (4.0.1really4.0.1-0ubuntu0.24.04.8) ...
+
+#8 52.38 Selecting previously unselected package libfribidi0:arm64.
+
+#8 52.39 Preparing to unpack .../001-libfribidi0_1.0.13-3build1_arm64.deb ...
+
+#8 52.39 Unpacking libfribidi0:arm64 (1.0.13-3build1) ...
+
+#8 52.41 Preparing to unpack .../002-libglib2.0-0t64_2.80.0-6ubuntu3.9_arm64.deb ...
+
+#8 52.41 Unpacking libglib2.0-0t64:arm64 (2.80.0-6ubuntu3.9) over (2.80.0-6ubuntu3.8) ...
+
+#8 52.46 Selecting previously unselected package libslang2:arm64.
+
+#8 52.47 Preparing to unpack .../003-libslang2_2.3.3-3build2_arm64.deb ...
+
+#8 52.47 Unpacking libslang2:arm64 (2.3.3-3build2) ...
+
+#8 52.49 Selecting previously unselected package shared-mime-info.
+
+#8 52.49 Preparing to unpack .../004-shared-mime-info_2.4-4_arm64.deb ...
+
+#8 52.49 Unpacking shared-mime-info (2.4-4) ...
+
+#8 52.52 Selecting previously unselected package xkb-data.
+
+#8 52.52 Preparing to unpack .../005-xkb-data_2.41-2ubuntu1.1_all.deb ...
+
+#8 52.52 Unpacking xkb-data (2.41-2ubuntu1.1) ...
+
+#8 52.57 Selecting previously unselected package libdrm-common.
+
+#8 52.57 Preparing to unpack .../006-libdrm-common_2.4.125-1ubuntu0.1~24.04.2_all.deb ...
+
+#8 52.57 Unpacking libdrm-common (2.4.125-1ubuntu0.1~24.04.2) ...
+
+#8 52.58 Selecting previously unselected package libdrm2:arm64.
+
+#8 52.59 Preparing to unpack .../007-libdrm2_2.4.125-1ubuntu0.1~24.04.2_arm64.deb ...
+
+#8 52.59 Unpacking libdrm2:arm64 (2.4.125-1ubuntu0.1~24.04.2) ...
+
+#8 52.60 Selecting previously unselected package libsensors-config.
+
+#8 52.60 Preparing to unpack .../008-libsensors-config_1%3a3.6.0-9build1_all.deb ...
+
+#8 52.61 Unpacking libsensors-config (1:3.6.0-9build1) ...
+
+#8 52.62 Selecting previously unselected package libsensors5:arm64.
+
+#8 52.62 Preparing to unpack .../009-libsensors5_1%3a3.6.0-9build1_arm64.deb ...
+
+#8 52.63 Unpacking libsensors5:arm64 (1:3.6.0-9build1) ...
+
+#8 52.64 Selecting previously unselected package libusb-1.0-0:arm64.
+
+#8 52.64 Preparing to unpack .../010-libusb-1.0-0_2%3a1.0.27-1_arm64.deb ...
+
+#8 52.64 Unpacking libusb-1.0-0:arm64 (2:1.0.27-1) ...
+
+#8 52.66 Selecting previously unselected package libuv1t64:arm64.
+
+#8 52.66 Preparing to unpack .../011-libuv1t64_1.48.0-1.1build1_arm64.deb ...
+
+#8 52.66 Unpacking libuv1t64:arm64 (1.48.0-1.1build1) ...
+
+#8 52.68 Selecting previously unselected package libxau6:arm64.
+
+#8 52.68 Preparing to unpack .../012-libxau6_1%3a1.0.9-1build6_arm64.deb ...
+
+#8 52.68 Unpacking libxau6:arm64 (1:1.0.9-1build6) ...
+
+#8 52.69 Selecting previously unselected package libxdmcp6:arm64.
+
+#8 52.70 Preparing to unpack .../013-libxdmcp6_1%3a1.1.3-0ubuntu6_arm64.deb ...
+
+#8 52.70 Unpacking libxdmcp6:arm64 (1:1.1.3-0ubuntu6) ...
+
+#8 52.71 Selecting previously unselected package libxcb1:arm64.
+
+#8 52.71 Preparing to unpack .../014-libxcb1_1.15-1ubuntu2_arm64.deb ...
+
+#8 52.72 Unpacking libxcb1:arm64 (1.15-1ubuntu2) ...
+
+#8 52.73 Selecting previously unselected package libx11-data.
+
+#8 52.73 Preparing to unpack .../015-libx11-data_2%3a1.8.7-1build1_all.deb ...
+
+#8 52.73 Unpacking libx11-data (2:1.8.7-1build1) ...
+
+#8 52.76 Selecting previously unselected package libx11-6:arm64.
+
+#8 52.77 Preparing to unpack .../016-libx11-6_2%3a1.8.7-1build1_arm64.deb ...
+
+#8 52.77 Unpacking libx11-6:arm64 (2:1.8.7-1build1) ...
+
+#8 52.79 Selecting previously unselected package libxext6:arm64.
+
+#8 52.79 Preparing to unpack .../017-libxext6_2%3a1.3.4-1build2_arm64.deb ...
+
+#8 52.79 Unpacking libxext6:arm64 (2:1.3.4-1build2) ...
+
+#8 52.81 Selecting previously unselected package libxkbcommon0:arm64.
+
+#8 52.81 Preparing to unpack .../018-libxkbcommon0_1.6.0-1build1_arm64.deb ...
+
+#8 52.81 Unpacking libxkbcommon0:arm64 (1.6.0-1build1) ...
+
+#8 52.82 Selecting previously unselected package libarchive13t64:arm64.
+
+#8 52.83 Preparing to unpack .../019-libarchive13t64_3.7.2-2ubuntu0.8_arm64.deb ...
+
+#8 52.83 Unpacking libarchive13t64:arm64 (3.7.2-2ubuntu0.8) ...
+
+#8 52.85 Selecting previously unselected package libjsoncpp25:arm64.
+
+#8 52.85 Preparing to unpack .../020-libjsoncpp25_1.9.5-6build1_arm64.deb ...
+
+#8 52.85 Unpacking libjsoncpp25:arm64 (1.9.5-6build1) ...
+
+#8 52.86 Selecting previously unselected package librhash0:arm64.
+
+#8 52.87 Preparing to unpack .../021-librhash0_1.4.3-3build1_arm64.deb ...
+
+#8 52.87 Unpacking librhash0:arm64 (1.4.3-3build1) ...
+
+#8 52.88 Selecting previously unselected package cmake-data.
+
+#8 52.89 Preparing to unpack .../022-cmake-data_3.28.3-1build7_all.deb ...
+
+#8 52.89 Unpacking cmake-data (3.28.3-1build7) ...
+
+#8 53.13 Selecting previously unselected package cmake.
+
+#8 53.14 Preparing to unpack .../023-cmake_3.28.3-1build7_arm64.deb ...
+
+#8 53.14 Unpacking cmake (3.28.3-1build7) ...
+
+#8 53.31 Selecting previously unselected package libaom3:arm64.
+
+#8 53.31 Preparing to unpack .../024-libaom3_3.8.2-2ubuntu0.2_arm64.deb ...
+
+#8 53.31 Unpacking libaom3:arm64 (3.8.2-2ubuntu0.2) ...
+
+#8 53.34 Selecting previously unselected package libva2:arm64.
+
+#8 53.35 Preparing to unpack .../025-libva2_2.20.0-2ubuntu0.2_arm64.deb ...
+
+#8 53.35 Unpacking libva2:arm64 (2.20.0-2ubuntu0.2) ...
+
+#8 53.36 Selecting previously unselected package libva-drm2:arm64.
+
+#8 53.36 Preparing to unpack .../026-libva-drm2_2.20.0-2ubuntu0.2_arm64.deb ...
+
+#8 53.36 Unpacking libva-drm2:arm64 (2.20.0-2ubuntu0.2) ...
+
+#8 53.38 Selecting previously unselected package libx11-xcb1:arm64.
+
+#8 53.38 Preparing to unpack .../027-libx11-xcb1_2%3a1.8.7-1build1_arm64.deb ...
+
+#8 53.38 Unpacking libx11-xcb1:arm64 (2:1.8.7-1build1) ...
+
+#8 53.40 Selecting previously unselected package libxcb-dri3-0:arm64.
+
+#8 53.40 Preparing to unpack .../028-libxcb-dri3-0_1.15-1ubuntu2_arm64.deb ...
+
+#8 53.40 Unpacking libxcb-dri3-0:arm64 (1.15-1ubuntu2) ...
+
+#8 53.41 Selecting previously unselected package libxfixes3:arm64.
+
+#8 53.42 Preparing to unpack .../029-libxfixes3_1%3a6.0.0-2build1_arm64.deb ...
+
+#8 53.42 Unpacking libxfixes3:arm64 (1:6.0.0-2build1) ...
+
+#8 53.43 Selecting previously unselected package libva-x11-2:arm64.
+
+#8 53.43 Preparing to unpack .../030-libva-x11-2_2.20.0-2ubuntu0.2_arm64.deb ...
+
+#8 53.44 Unpacking libva-x11-2:arm64 (2.20.0-2ubuntu0.2) ...
+
+#8 53.45 Selecting previously unselected package libvdpau1:arm64.
+
+#8 53.45 Preparing to unpack .../031-libvdpau1_1.5-2build1_arm64.deb ...
+
+#8 53.45 Unpacking libvdpau1:arm64 (1.5-2build1) ...
+
+#8 53.47 Selecting previously unselected package ocl-icd-libopencl1:arm64.
+
+#8 53.47 Preparing to unpack .../032-ocl-icd-libopencl1_2.3.2-1build1_arm64.deb ...
+
+#8 53.47 Unpacking ocl-icd-libopencl1:arm64 (2.3.2-1build1) ...
+
+#8 53.49 Selecting previously unselected package libavutil58:arm64.
+
+#8 53.49 Preparing to unpack .../033-libavutil58_7%3a6.1.1-3ubuntu5_arm64.deb ...
+
+#8 53.49 Unpacking libavutil58:arm64 (7:6.1.1-3ubuntu5) ...
+
+#8 53.51 Selecting previously unselected package libfreetype6:arm64.
+
+#8 53.51 Preparing to unpack .../034-libfreetype6_2.13.2+dfsg-1ubuntu0.2_arm64.deb ...
+
+#8 53.51 Unpacking libfreetype6:arm64 (2.13.2+dfsg-1ubuntu0.2) ...
+
+#8 53.53 Selecting previously unselected package fonts-dejavu-mono.
+
+#8 53.53 Preparing to unpack .../035-fonts-dejavu-mono_2.37-8_all.deb ...
+
+#8 53.53 Unpacking fonts-dejavu-mono (2.37-8) ...
+
+#8 53.56 Selecting previously unselected package fonts-dejavu-core.
+
+#8 53.56 Preparing to unpack .../036-fonts-dejavu-core_2.37-8_all.deb ...
+
+#8 53.57 Unpacking fonts-dejavu-core (2.37-8) ...
+
+#8 53.60 Selecting previously unselected package fontconfig-config.
+
+#8 53.60 Preparing to unpack .../037-fontconfig-config_2.15.0-1.1ubuntu2_arm64.deb ...
+
+#8 53.74 Unpacking fontconfig-config (2.15.0-1.1ubuntu2) ...
+
+#8 53.76 Selecting previously unselected package libfontconfig1:arm64.
+
+#8 53.76 Preparing to unpack .../038-libfontconfig1_2.15.0-1.1ubuntu2_arm64.deb ...
+
+#8 53.76 Unpacking libfontconfig1:arm64 (2.15.0-1.1ubuntu2) ...
+
+#8 53.78 Selecting previously unselected package libpixman-1-0:arm64.
+
+#8 53.78 Preparing to unpack .../039-libpixman-1-0_0.42.2-1build1_arm64.deb ...
+
+#8 53.78 Unpacking libpixman-1-0:arm64 (0.42.2-1build1) ...
+
+#8 53.80 Selecting previously unselected package libxcb-render0:arm64.
+
+#8 53.80 Preparing to unpack .../040-libxcb-render0_1.15-1ubuntu2_arm64.deb ...
+
+#8 53.80 Unpacking libxcb-render0:arm64 (1.15-1ubuntu2) ...
+
+#8 53.82 Selecting previously unselected package libxcb-shm0:arm64.
+
+#8 53.82 Preparing to unpack .../041-libxcb-shm0_1.15-1ubuntu2_arm64.deb ...
+
+#8 53.82 Unpacking libxcb-shm0:arm64 (1.15-1ubuntu2) ...
+
+#8 53.84 Selecting previously unselected package libxrender1:arm64.
+
+#8 53.84 Preparing to unpack .../042-libxrender1_1%3a0.9.10-1.1build1_arm64.deb ...
+
+#8 53.84 Unpacking libxrender1:arm64 (1:0.9.10-1.1build1) ...
+
+#8 53.85 Selecting previously unselected package libcairo2:arm64.
+
+#8 53.86 Preparing to unpack .../043-libcairo2_1.18.0-3build1_arm64.deb ...
+
+#8 53.86 Unpacking libcairo2:arm64 (1.18.0-3build1) ...
+
+#8 53.88 Selecting previously unselected package libcodec2-1.2:arm64.
+
+#8 53.88 Preparing to unpack .../044-libcodec2-1.2_1.2.0-2build1_arm64.deb ...
+
+#8 53.88 Unpacking libcodec2-1.2:arm64 (1.2.0-2build1) ...
+
+#8 53.96 Selecting previously unselected package libdav1d7:arm64.
+
+#8 53.96 Preparing to unpack .../045-libdav1d7_1.4.1-1build1_arm64.deb ...
+
+#8 53.96 Unpacking libdav1d7:arm64 (1.4.1-1build1) ...
+
+#8 53.98 Selecting previously unselected package libhwy1t64:arm64.
+
+#8 53.98 Preparing to unpack .../046-libhwy1t64_1.0.7-8.1build1_arm64.deb ...
+
+#8 53.98 Unpacking libhwy1t64:arm64 (1.0.7-8.1build1) ...
+
+#8 54.00 Selecting previously unselected package liblcms2-2:arm64.
+
+#8 54.01 Preparing to unpack .../047-liblcms2-2_2.14-2ubuntu0.1_arm64.deb ...
+
+#8 54.01 Unpacking liblcms2-2:arm64 (2.14-2ubuntu0.1) ...
+
+#8 54.03 Selecting previously unselected package libjxl0.7:arm64.
+
+#8 54.03 Preparing to unpack .../048-libjxl0.7_0.7.0-10.2ubuntu6.1_arm64.deb ...
+
+#8 54.03 Unpacking libjxl0.7:arm64 (0.7.0-10.2ubuntu6.1) ...
+
+#8 54.05 Selecting previously unselected package libopenjp2-7:arm64.
+
+#8 54.05 Preparing to unpack .../049-libopenjp2-7_2.5.0-2ubuntu0.5_arm64.deb ...
+
+#8 54.05 Unpacking libopenjp2-7:arm64 (2.5.0-2ubuntu0.5) ...
+
+#8 54.07 Selecting previously unselected package librav1e0:arm64.
+
+#8 54.07 Preparing to unpack .../050-librav1e0_0.7.1-2_arm64.deb ...
+
+#8 54.07 Unpacking librav1e0:arm64 (0.7.1-2) ...
+
+#8 54.10 Selecting previously unselected package libcairo-gobject2:arm64.
+
+#8 54.10 Preparing to unpack .../051-libcairo-gobject2_1.18.0-3build1_arm64.deb ...
+
+#8 54.10 Unpacking libcairo-gobject2:arm64 (1.18.0-3build1) ...
+
+#8 54.12 Selecting previously unselected package libgdk-pixbuf2.0-common.
+
+#8 54.12 Preparing to unpack .../052-libgdk-pixbuf2.0-common_2.42.10+dfsg-3ubuntu3.3_all.deb ...
+
+#8 54.12 Unpacking libgdk-pixbuf2.0-common (2.42.10+dfsg-3ubuntu3.3) ...
+
+#8 54.13 Selecting previously unselected package libjpeg-turbo8:arm64.
+
+#8 54.14 Preparing to unpack .../053-libjpeg-turbo8_2.1.5-2ubuntu2_arm64.deb ...
+
+#8 54.14 Unpacking libjpeg-turbo8:arm64 (2.1.5-2ubuntu2) ...
+
+#8 54.15 Selecting previously unselected package libjpeg8:arm64.
+
+#8 54.15 Preparing to unpack .../054-libjpeg8_8c-2ubuntu11_arm64.deb ...
+
+#8 54.16 Unpacking libjpeg8:arm64 (8c-2ubuntu11) ...
+
+#8 54.17 Selecting previously unselected package libdeflate0:arm64.
+
+#8 54.17 Preparing to unpack .../055-libdeflate0_1.19-1build1.1_arm64.deb ...
+
+#8 54.17 Unpacking libdeflate0:arm64 (1.19-1build1.1) ...
+
+#8 54.19 Selecting previously unselected package libjbig0:arm64.
+
+#8 54.19 Preparing to unpack .../056-libjbig0_2.1-6.1ubuntu2_arm64.deb ...
+
+#8 54.19 Unpacking libjbig0:arm64 (2.1-6.1ubuntu2) ...
+
+#8 54.21 Selecting previously unselected package liblerc4:arm64.
+
+#8 54.21 Preparing to unpack .../057-liblerc4_4.0.0+ds-4ubuntu2_arm64.deb ...
+
+#8 54.21 Unpacking liblerc4:arm64 (4.0.0+ds-4ubuntu2) ...
+
+#8 54.22 Selecting previously unselected package libsharpyuv0:arm64.
+
+#8 54.23 Preparing to unpack .../058-libsharpyuv0_1.3.2-0.4build3_arm64.deb ...
+
+#8 54.23 Unpacking libsharpyuv0:arm64 (1.3.2-0.4build3) ...
+
+#8 54.24 Selecting previously unselected package libwebp7:arm64.
+
+#8 54.24 Preparing to unpack .../059-libwebp7_1.3.2-0.4build3_arm64.deb ...
+
+#8 54.25 Unpacking libwebp7:arm64 (1.3.2-0.4build3) ...
+
+#8 54.26 Selecting previously unselected package libtiff6:arm64.
+
+#8 54.26 Preparing to unpack .../060-libtiff6_4.5.1+git230720-4ubuntu2.5_arm64.deb ...
+
+#8 54.27 Unpacking libtiff6:arm64 (4.5.1+git230720-4ubuntu2.5) ...
+
+#8 54.28 Selecting previously unselected package libgdk-pixbuf-2.0-0:arm64.
+
+#8 54.29 Preparing to unpack .../061-libgdk-pixbuf-2.0-0_2.42.10+dfsg-3ubuntu3.3_arm64.deb ...
+
+#8 54.29 Unpacking libgdk-pixbuf-2.0-0:arm64 (2.42.10+dfsg-3ubuntu3.3) ...
+
+#8 54.31 Selecting previously unselected package fontconfig.
+
+#8 54.31 Preparing to unpack .../062-fontconfig_2.15.0-1.1ubuntu2_arm64.deb ...
+
+#8 54.31 Unpacking fontconfig (2.15.0-1.1ubuntu2) ...
+
+#8 54.33 Selecting previously unselected package libgraphite2-3:arm64.
+
+#8 54.33 Preparing to unpack .../063-libgraphite2-3_1.3.14-2ubuntu0.24.04.1_arm64.deb ...
+
+#8 54.33 Unpacking libgraphite2-3:arm64 (1.3.14-2ubuntu0.24.04.1) ...
+
+#8 54.35 Selecting previously unselected package libharfbuzz0b:arm64.
+
+#8 54.35 Preparing to unpack .../064-libharfbuzz0b_8.3.0-2build2_arm64.deb ...
+
+#8 54.35 Unpacking libharfbuzz0b:arm64 (8.3.0-2build2) ...
+
+#8 54.37 Selecting previously unselected package libthai-data.
+
+#8 54.37 Preparing to unpack .../065-libthai-data_0.1.29-2build1_all.deb ...
+
+#8 54.37 Unpacking libthai-data (0.1.29-2build1) ...
+
+#8 54.39 Selecting previously unselected package libdatrie1:arm64.
+
+#8 54.39 Preparing to unpack .../066-libdatrie1_0.2.13-3build1_arm64.deb ...
+
+#8 54.39 Unpacking libdatrie1:arm64 (0.2.13-3build1) ...
+
+#8 54.41 Selecting previously unselected package libthai0:arm64.
+
+#8 54.41 Preparing to unpack .../067-libthai0_0.1.29-2build1_arm64.deb ...
+
+#8 54.41 Unpacking libthai0:arm64 (0.1.29-2build1) ...
+
+#8 54.43 Selecting previously unselected package libpango-1.0-0:arm64.
+
+#8 54.43 Preparing to unpack .../068-libpango-1.0-0_1.52.1+ds-1build1_arm64.deb ...
+
+#8 54.43 Unpacking libpango-1.0-0:arm64 (1.52.1+ds-1build1) ...
+
+#8 54.45 Selecting previously unselected package libpangoft2-1.0-0:arm64.
+
+#8 54.45 Preparing to unpack .../069-libpangoft2-1.0-0_1.52.1+ds-1build1_arm64.deb ...
+
+#8 54.45 Unpacking libpangoft2-1.0-0:arm64 (1.52.1+ds-1build1) ...
+
+#8 54.47 Selecting previously unselected package libpangocairo-1.0-0:arm64.
+
+#8 54.47 Preparing to unpack .../070-libpangocairo-1.0-0_1.52.1+ds-1build1_arm64.deb ...
+
+#8 54.47 Unpacking libpangocairo-1.0-0:arm64 (1.52.1+ds-1build1) ...
+
+#8 54.48 Selecting previously unselected package librsvg2-2:arm64.
+
+#8 54.49 Preparing to unpack .../071-librsvg2-2_2.58.0+dfsg-1ubuntu0.1_arm64.deb ...
+
+#8 54.49 Unpacking librsvg2-2:arm64 (2.58.0+dfsg-1ubuntu0.1) ...
+
+#8 54.53 Selecting previously unselected package libshine3:arm64.
+
+#8 54.53 Preparing to unpack .../072-libshine3_3.1.1-2build1_arm64.deb ...
+
+#8 54.53 Unpacking libshine3:arm64 (3.1.1-2build1) ...
+
+#8 54.55 Selecting previously unselected package libspeex1:arm64.
+
+#8 54.55 Preparing to unpack .../073-libspeex1_1.2.1-2ubuntu2.24.04.1_arm64.deb ...
+
+#8 54.55 Unpacking libspeex1:arm64 (1.2.1-2ubuntu2.24.04.1) ...
+
+#8 54.57 Selecting previously unselected package libsvtav1enc1d1:arm64.
+
+#8 54.57 Preparing to unpack .../074-libsvtav1enc1d1_1.7.0+dfsg-2build1_arm64.deb ...
+
+#8 54.57 Unpacking libsvtav1enc1d1:arm64 (1.7.0+dfsg-2build1) ...
+
+#8 54.60 Selecting previously unselected package libsoxr0:arm64.
+
+#8 54.60 Preparing to unpack .../075-libsoxr0_0.1.3-4build3_arm64.deb ...
+
+#8 54.60 Unpacking libsoxr0:arm64 (0.1.3-4build3) ...
+
+#8 54.62 Selecting previously unselected package libswresample4:arm64.
+
+#8 54.62 Preparing to unpack .../076-libswresample4_7%3a6.1.1-3ubuntu5_arm64.deb ...
+
+#8 54.62 Unpacking libswresample4:arm64 (7:6.1.1-3ubuntu5) ...
+
+#8 54.64 Selecting previously unselected package libtheora0:arm64.
+
+#8 54.64 Preparing to unpack .../077-libtheora0_1.1.1+dfsg.1-16.1build3_arm64.deb ...
+
+#8 54.64 Unpacking libtheora0:arm64 (1.1.1+dfsg.1-16.1build3) ...
+
+#8 54.66 Selecting previously unselected package libtwolame0:arm64.
+
+#8 54.66 Preparing to unpack .../078-libtwolame0_0.4.0-2build3_arm64.deb ...
+
+#8 54.66 Unpacking libtwolame0:arm64 (0.4.0-2build3) ...
+
+#8 54.67 Selecting previously unselected package libvpx9:arm64.
+
+#8 54.68 Preparing to unpack .../079-libvpx9_1.14.0-1ubuntu2.3_arm64.deb ...
+
+#8 54.68 Unpacking libvpx9:arm64 (1.14.0-1ubuntu2.3) ...
+
+#8 54.71 Selecting previously unselected package libwebpmux3:arm64.
+
+#8 54.71 Preparing to unpack .../080-libwebpmux3_1.3.2-0.4build3_arm64.deb ...
+
+#8 54.71 Unpacking libwebpmux3:arm64 (1.3.2-0.4build3) ...
+
+#8 54.72 Selecting previously unselected package libx264-164:arm64.
+
+#8 54.73 Preparing to unpack .../081-libx264-164_2%3a0.164.3108+git31e19f9-1_arm64.deb ...
+
+#8 54.73 Unpacking libx264-164:arm64 (2:0.164.3108+git31e19f9-1) ...
+
+#8 54.75 Selecting previously unselected package libx265-199:arm64.
+
+#8 54.76 Preparing to unpack .../082-libx265-199_3.5-2build1_arm64.deb ...
+
+#8 54.76 Unpacking libx265-199:arm64 (3.5-2build1) ...
+
+#8 54.78 Selecting previously unselected package libxvidcore4:arm64.
+
+#8 54.79 Preparing to unpack .../083-libxvidcore4_2%3a1.3.7-1build1_arm64.deb ...
+
+#8 54.79 Unpacking libxvidcore4:arm64 (2:1.3.7-1build1) ...
+
+#8 54.80 Selecting previously unselected package libzvbi-common.
+
+#8 54.81 Preparing to unpack .../084-libzvbi-common_0.2.42-2_all.deb ...
+
+#8 54.81 Unpacking libzvbi-common (0.2.42-2) ...
+
+#8 54.82 Selecting previously unselected package libzvbi0t64:arm64.
+
+#8 54.83 Preparing to unpack .../085-libzvbi0t64_0.2.42-2_arm64.deb ...
+
+#8 54.83 Unpacking libzvbi0t64:arm64 (0.2.42-2) ...
+
+#8 54.84 Selecting previously unselected package libavcodec60:arm64.
+
+#8 54.85 Preparing to unpack .../086-libavcodec60_7%3a6.1.1-3ubuntu5_arm64.deb ...
+
+#8 54.85 Unpacking libavcodec60:arm64 (7:6.1.1-3ubuntu5) ...
+
+#8 54.92 Selecting previously unselected package libraw1394-11:arm64.
+
+#8 54.92 Preparing to unpack .../087-libraw1394-11_2.1.2-2build3_arm64.deb ...
+
+#8 54.92 Unpacking libraw1394-11:arm64 (2.1.2-2build3) ...
+
+#8 54.94 Selecting previously unselected package libavc1394-0:arm64.
+
+#8 54.94 Preparing to unpack .../088-libavc1394-0_0.5.4-5build3_arm64.deb ...
+
+#8 54.94 Unpacking libavc1394-0:arm64 (0.5.4-5build3) ...
+
+#8 54.96 Selecting previously unselected package libunibreak5:arm64.
+
+#8 54.96 Preparing to unpack .../089-libunibreak5_5.1-2build1_arm64.deb ...
+
+#8 54.96 Unpacking libunibreak5:arm64 (5.1-2build1) ...
+
+#8 54.98 Selecting previously unselected package libass9:arm64.
+
+#8 54.98 Preparing to unpack .../090-libass9_1%3a0.17.1-2build1_arm64.deb ...
+
+#8 54.98 Unpacking libass9:arm64 (1:0.17.1-2build1) ...
+
+#8 55.00 Selecting previously unselected package libudfread0:arm64.
+
+#8 55.00 Preparing to unpack .../091-libudfread0_1.1.2-1build1_arm64.deb ...
+
+#8 55.00 Unpacking libudfread0:arm64 (1.1.2-1build1) ...
+
+#8 55.02 Selecting previously unselected package libbluray2:arm64.
+
+#8 55.02 Preparing to unpack .../092-libbluray2_1%3a1.3.4-1build1_arm64.deb ...
+
+#8 55.02 Unpacking libbluray2:arm64 (1:1.3.4-1build1) ...
+
+#8 55.04 Selecting previously unselected package libchromaprint1:arm64.
+
+#8 55.04 Preparing to unpack .../093-libchromaprint1_1.5.1-5_arm64.deb ...
+
+#8 55.04 Unpacking libchromaprint1:arm64 (1.5.1-5) ...
+
+#8 55.06 Selecting previously unselected package libgme0:arm64.
+
+#8 55.06 Preparing to unpack .../094-libgme0_0.6.3-7build1_arm64.deb ...
+
+#8 55.06 Unpacking libgme0:arm64 (0.6.3-7build1) ...
+
+#8 55.08 Selecting previously unselected package libopenmpt0t64:arm64.
+
+#8 55.08 Preparing to unpack .../095-libopenmpt0t64_0.7.3-1.1build3_arm64.deb ...
+
+#8 55.08 Unpacking libopenmpt0t64:arm64 (0.7.3-1.1build3) ...
+
+#8 55.10 Selecting previously unselected package librabbitmq4:arm64.
+
+#8 55.10 Preparing to unpack .../096-librabbitmq4_0.11.0-1ubuntu0.2_arm64.deb ...
+
+#8 55.10 Unpacking librabbitmq4:arm64 (0.11.0-1ubuntu0.2) ...
+
+#8 55.12 Selecting previously unselected package libcjson1:arm64.
+
+#8 55.12 Preparing to unpack .../097-libcjson1_1.7.17-1_arm64.deb ...
+
+#8 55.12 Unpacking libcjson1:arm64 (1.7.17-1) ...
+
+#8 55.14 Selecting previously unselected package libmbedcrypto7t64:arm64.
+
+#8 55.14 Preparing to unpack .../098-libmbedcrypto7t64_2.28.8-1_arm64.deb ...
+
+#8 55.14 Unpacking libmbedcrypto7t64:arm64 (2.28.8-1) ...
+
+#8 55.16 Selecting previously unselected package librist4:arm64.
+
+#8 55.16 Preparing to unpack .../099-librist4_0.2.10+dfsg-2_arm64.deb ...
+
+#8 55.16 Unpacking librist4:arm64 (0.2.10+dfsg-2) ...
+
+#8 55.18 Selecting previously unselected package libsrt1.5-gnutls:arm64.
+
+#8 55.18 Preparing to unpack .../100-libsrt1.5-gnutls_1.5.3-1build2_arm64.deb ...
+
+#8 55.18 Unpacking libsrt1.5-gnutls:arm64 (1.5.3-1build2) ...
+
+#8 55.20 Selecting previously unselected package libssh-gcrypt-4:arm64.
+
+#8 55.20 Preparing to unpack .../101-libssh-gcrypt-4_0.10.6-2ubuntu0.5_arm64.deb ...
+
+#8 55.20 Unpacking libssh-gcrypt-4:arm64 (0.10.6-2ubuntu0.5) ...
+
+#8 55.22 Selecting previously unselected package libnorm1t64:arm64.
+
+#8 55.22 Preparing to unpack .../102-libnorm1t64_1.5.9+dfsg-3.1build1_arm64.deb ...
+
+#8 55.22 Unpacking libnorm1t64:arm64 (1.5.9+dfsg-3.1build1) ...
+
+#8 55.24 Selecting previously unselected package libpgm-5.3-0t64:arm64.
+
+#8 55.24 Preparing to unpack .../103-libpgm-5.3-0t64_5.3.128~dfsg-2.1build1_arm64.deb ...
+
+#8 55.24 Unpacking libpgm-5.3-0t64:arm64 (5.3.128~dfsg-2.1build1) ...
+
+#8 55.26 Selecting previously unselected package libzmq5:arm64.
+
+#8 55.26 Preparing to unpack .../104-libzmq5_4.3.5-1build2_arm64.deb ...
+
+#8 55.26 Unpacking libzmq5:arm64 (4.3.5-1build2) ...
+
+#8 55.28 Selecting previously unselected package libavformat60:arm64.
+
+#8 55.28 Preparing to unpack .../105-libavformat60_7%3a6.1.1-3ubuntu5_arm64.deb ...
+
+#8 55.28 Unpacking libavformat60:arm64 (7:6.1.1-3ubuntu5) ...
+
+#8 55.31 Selecting previously unselected package libbs2b0:arm64.
+
+#8 55.31 Preparing to unpack .../106-libbs2b0_3.1.0+dfsg-7build1_arm64.deb ...
+
+#8 55.31 Unpacking libbs2b0:arm64 (3.1.0+dfsg-7build1) ...
+
+#8 55.33 Selecting previously unselected package libflite1:arm64.
+
+#8 55.33 Preparing to unpack .../107-libflite1_2.2-6build3_arm64.deb ...
+
+#8 55.33 Unpacking libflite1:arm64 (2.2-6build3) ...
+
+#8 55.45 Selecting previously unselected package libserd-0-0:arm64.
+
+#8 55.45 Preparing to unpack .../108-libserd-0-0_0.32.2-1_arm64.deb ...
+
+#8 55.45 Unpacking libserd-0-0:arm64 (0.32.2-1) ...
+
+#8 55.47 Selecting previously unselected package libzix-0-0:arm64.
+
+#8 55.47 Preparing to unpack .../109-libzix-0-0_0.4.2-2build1_arm64.deb ...
+
+#8 55.47 Unpacking libzix-0-0:arm64 (0.4.2-2build1) ...
+
+#8 55.49 Selecting previously unselected package libsord-0-0:arm64.
+
+#8 55.49 Preparing to unpack .../110-libsord-0-0_0.16.16-2build1_arm64.deb ...
+
+#8 55.49 Unpacking libsord-0-0:arm64 (0.16.16-2build1) ...
+
+#8 55.51 Selecting previously unselected package libsratom-0-0:arm64.
+
+#8 55.51 Preparing to unpack .../111-libsratom-0-0_0.6.16-1build1_arm64.deb ...
+
+#8 55.51 Unpacking libsratom-0-0:arm64 (0.6.16-1build1) ...
+
+#8 55.52 Selecting previously unselected package liblilv-0-0:arm64.
+
+#8 55.53 Preparing to unpack .../112-liblilv-0-0_0.24.22-1build1_arm64.deb ...
+
+#8 55.53 Unpacking liblilv-0-0:arm64 (0.24.22-1build1) ...
+
+#8 55.54 Selecting previously unselected package libmysofa1:arm64.
+
+#8 55.54 Preparing to unpack .../113-libmysofa1_1.3.2+dfsg-2ubuntu2_arm64.deb ...
+
+#8 55.55 Unpacking libmysofa1:arm64 (1.3.2+dfsg-2ubuntu2) ...
+
+#8 55.57 Selecting previously unselected package libvulkan1:arm64.
+
+#8 55.57 Preparing to unpack .../114-libvulkan1_1.3.275.0-1build1_arm64.deb ...
+
+#8 55.57 Unpacking libvulkan1:arm64 (1.3.275.0-1build1) ...
+
+#8 55.59 Selecting previously unselected package libplacebo338:arm64.
+
+#8 55.59 Preparing to unpack .../115-libplacebo338_6.338.2-2build1_arm64.deb ...
+
+#8 55.59 Unpacking libplacebo338:arm64 (6.338.2-2build1) ...
+
+#8 55.64 Selecting previously unselected package libasyncns0:arm64.
+
+#8 55.64 Preparing to unpack .../116-libasyncns0_0.8-6build4_arm64.deb ...
+
+#8 55.64 Unpacking libasyncns0:arm64 (0.8-6build4) ...
+
+#8 55.66 Selecting previously unselected package libpulse0:arm64.
+
+#8 55.66 Preparing to unpack .../117-libpulse0_1%3a16.1+dfsg1-2ubuntu10.1_arm64.deb ...
+
+#8 55.67 Unpacking libpulse0:arm64 (1:16.1+dfsg1-2ubuntu10.1) ...
+
+#8 55.69 Selecting previously unselected package libsphinxbase3t64:arm64.
+
+#8 55.69 Preparing to unpack .../118-libsphinxbase3t64_0.8+5prealpha+1-17build2_arm64.deb ...
+
+#8 55.69 Unpacking libsphinxbase3t64:arm64 (0.8+5prealpha+1-17build2) ...
+
+#8 55.71 Selecting previously unselected package libpocketsphinx3:arm64.
+
+#8 55.71 Preparing to unpack .../119-libpocketsphinx3_0.8.0+real5prealpha+1-15ubuntu5_arm64.deb ...
+
+#8 55.71 Unpacking libpocketsphinx3:arm64 (0.8.0+real5prealpha+1-15ubuntu5) ...
+
+#8 55.73 Selecting previously unselected package libpostproc57:arm64.
+
+#8 55.73 Preparing to unpack .../120-libpostproc57_7%3a6.1.1-3ubuntu5_arm64.deb ...
+
+#8 55.73 Unpacking libpostproc57:arm64 (7:6.1.1-3ubuntu5) ...
+
+#8 55.74 Selecting previously unselected package libfftw3-double3:arm64.
+
+#8 55.75 Preparing to unpack .../121-libfftw3-double3_3.3.10-1ubuntu3_arm64.deb ...
+
+#8 55.75 Unpacking libfftw3-double3:arm64 (3.3.10-1ubuntu3) ...
+
+#8 55.77 Selecting previously unselected package libsamplerate0:arm64.
+
+#8 55.77 Preparing to unpack .../122-libsamplerate0_0.2.2-4build1_arm64.deb ...
+
+#8 55.77 Unpacking libsamplerate0:arm64 (0.2.2-4build1) ...
+
+#8 55.79 Selecting previously unselected package librubberband2:arm64.
+
+#8 55.79 Preparing to unpack .../123-librubberband2_3.3.0+dfsg-2build1_arm64.deb ...
+
+#8 55.80 Unpacking librubberband2:arm64 (3.3.0+dfsg-2build1) ...
+
+#8 55.81 Selecting previously unselected package libswscale7:arm64.
+
+#8 55.82 Preparing to unpack .../124-libswscale7_7%3a6.1.1-3ubuntu5_arm64.deb ...
+
+#8 55.82 Unpacking libswscale7:arm64 (7:6.1.1-3ubuntu5) ...
+
+#8 55.83 Selecting previously unselected package libvidstab1.1:arm64.
+
+#8 55.84 Preparing to unpack .../125-libvidstab1.1_1.1.0-2build1_arm64.deb ...
+
+#8 55.84 Unpacking libvidstab1.1:arm64 (1.1.0-2build1) ...
+
+#8 55.85 Selecting previously unselected package libzimg2:arm64.
+
+#8 55.86 Preparing to unpack .../126-libzimg2_3.0.5+ds1-1build1_arm64.deb ...
+
+#8 55.86 Unpacking libzimg2:arm64 (3.0.5+ds1-1build1) ...
+
+#8 55.87 Selecting previously unselected package libavfilter9:arm64.
+
+#8 55.88 Preparing to unpack .../127-libavfilter9_7%3a6.1.1-3ubuntu5_arm64.deb ...
+
+#8 55.89 Unpacking libavfilter9:arm64 (7:6.1.1-3ubuntu5) ...
+
+#8 55.95 Selecting previously unselected package libcaca0:arm64.
+
+#8 55.95 Preparing to unpack .../128-libcaca0_0.99.beta20-4ubuntu0.2_arm64.deb ...
+
+#8 55.95 Unpacking libcaca0:arm64 (0.99.beta20-4ubuntu0.2) ...
+
+#8 55.97 Selecting previously unselected package libcdio19t64:arm64.
+
+#8 55.98 Preparing to unpack .../129-libcdio19t64_2.1.0-4.1ubuntu1.2_arm64.deb ...
+
+#8 55.98 Unpacking libcdio19t64:arm64 (2.1.0-4.1ubuntu1.2) ...
+
+#8 55.99 Selecting previously unselected package libcdio-cdda2t64:arm64.
+
+#8 56.00 Preparing to unpack .../130-libcdio-cdda2t64_10.2+2.0.1-1.1build2_arm64.deb ...
+
+#8 56.00 Unpacking libcdio-cdda2t64:arm64 (10.2+2.0.1-1.1build2) ...
+
+#8 56.01 Selecting previously unselected package libcdio-paranoia2t64:arm64.
+
+#8 56.01 Preparing to unpack .../131-libcdio-paranoia2t64_10.2+2.0.1-1.1build2_arm64.deb ...
+
+#8 56.02 Unpacking libcdio-paranoia2t64:arm64 (10.2+2.0.1-1.1build2) ...
+
+#8 56.03 Selecting previously unselected package libdc1394-25:arm64.
+
+#8 56.03 Preparing to unpack .../132-libdc1394-25_2.2.6-4build1_arm64.deb ...
+
+#8 56.03 Unpacking libdc1394-25:arm64 (2.2.6-4build1) ...
+
+#8 56.05 Selecting previously unselected package libglvnd0:arm64.
+
+#8 56.05 Preparing to unpack .../133-libglvnd0_1.7.0-1build1_arm64.deb ...
+
+#8 56.05 Unpacking libglvnd0:arm64 (1.7.0-1build1) ...
+
+#8 56.07 Selecting previously unselected package libxcb-glx0:arm64.
+
+#8 56.08 Preparing to unpack .../134-libxcb-glx0_1.15-1ubuntu2_arm64.deb ...
+
+#8 56.08 Unpacking libxcb-glx0:arm64 (1.15-1ubuntu2) ...
+
+#8 56.09 Selecting previously unselected package libxcb-present0:arm64.
+
+#8 56.09 Preparing to unpack .../135-libxcb-present0_1.15-1ubuntu2_arm64.deb ...
+
+#8 56.09 Unpacking libxcb-present0:arm64 (1.15-1ubuntu2) ...
+
+#8 56.11 Selecting previously unselected package libxcb-xfixes0:arm64.
+
+#8 56.11 Preparing to unpack .../136-libxcb-xfixes0_1.15-1ubuntu2_arm64.deb ...
+
+#8 56.11 Unpacking libxcb-xfixes0:arm64 (1.15-1ubuntu2) ...
+
+#8 56.13 Selecting previously unselected package libxxf86vm1:arm64.
+
+#8 56.13 Preparing to unpack .../137-libxxf86vm1_1%3a1.1.4-1build4_arm64.deb ...
+
+#8 56.13 Unpacking libxxf86vm1:arm64 (1:1.1.4-1build4) ...
+
+#8 56.15 Selecting previously unselected package libdrm-amdgpu1:arm64.
+
+#8 56.15 Preparing to unpack .../138-libdrm-amdgpu1_2.4.125-1ubuntu0.1~24.04.2_arm64.deb ...
+
+#8 56.15 Unpacking libdrm-amdgpu1:arm64 (2.4.125-1ubuntu0.1~24.04.2) ...
+
+#8 56.16 Selecting previously unselected package libllvm20:arm64.
+
+#8 56.17 Preparing to unpack .../139-libllvm20_1%3a20.1.2-0ubuntu1~24.04.3_arm64.deb ...
+
+#8 56.17 Unpacking libllvm20:arm64 (1:20.1.2-0ubuntu1~24.04.3) ...
+
+#8 56.67 Selecting previously unselected package libxcb-randr0:arm64.
+
+#8 56.67 Preparing to unpack .../140-libxcb-randr0_1.15-1ubuntu2_arm64.deb ...
+
+#8 56.67 Unpacking libxcb-randr0:arm64 (1.15-1ubuntu2) ...
+
+#8 56.69 Selecting previously unselected package libxcb-sync1:arm64.
+
+#8 56.69 Preparing to unpack .../141-libxcb-sync1_1.15-1ubuntu2_arm64.deb ...
+
+#8 56.69 Unpacking libxcb-sync1:arm64 (1.15-1ubuntu2) ...
+
+#8 56.70 Selecting previously unselected package libxshmfence1:arm64.
+
+#8 56.71 Preparing to unpack .../142-libxshmfence1_1.3-1build5_arm64.deb ...
+
+#8 56.71 Unpacking libxshmfence1:arm64 (1.3-1build5) ...
+
+#8 56.72 Selecting previously unselected package mesa-libgallium:arm64.
+
+#8 56.73 Preparing to unpack .../143-mesa-libgallium_25.2.8-0ubuntu0.24.04.4_arm64.deb ...
+
+#8 56.73 Unpacking mesa-libgallium:arm64 (25.2.8-0ubuntu0.24.04.4) ...
+
+#8 56.92 Selecting previously unselected package libgbm1:arm64.
+
+#8 56.92 Preparing to unpack .../144-libgbm1_25.2.8-0ubuntu0.24.04.4_arm64.deb ...
+
+#8 56.92 Unpacking libgbm1:arm64 (25.2.8-0ubuntu0.24.04.4) ...
+
+#8 56.94 Selecting previously unselected package libgl1-mesa-dri:arm64.
+
+#8 56.94 Preparing to unpack .../145-libgl1-mesa-dri_25.2.8-0ubuntu0.24.04.4_arm64.deb ...
+
+#8 56.94 Unpacking libgl1-mesa-dri:arm64 (25.2.8-0ubuntu0.24.04.4) ...
+
+#8 56.96 Selecting previously unselected package libglx-mesa0:arm64.
+
+#8 56.96 Preparing to unpack .../146-libglx-mesa0_25.2.8-0ubuntu0.24.04.4_arm64.deb ...
+
+#8 56.97 Unpacking libglx-mesa0:arm64 (25.2.8-0ubuntu0.24.04.4) ...
+
+#8 56.98 Selecting previously unselected package libglx0:arm64.
+
+#8 56.99 Preparing to unpack .../147-libglx0_1.7.0-1build1_arm64.deb ...
+
+#8 56.99 Unpacking libglx0:arm64 (1.7.0-1build1) ...
+
+#8 57.00 Selecting previously unselected package libgl1:arm64.
+
+#8 57.00 Preparing to unpack .../148-libgl1_1.7.0-1build1_arm64.deb ...
+
+#8 57.01 Unpacking libgl1:arm64 (1.7.0-1build1) ...
+
+#8 57.02 Selecting previously unselected package libiec61883-0:arm64.
+
+#8 57.03 Preparing to unpack .../149-libiec61883-0_1.2.0-6build1_arm64.deb ...
+
+#8 57.03 Unpacking libiec61883-0:arm64 (1.2.0-6build1) ...
+
+#8 57.04 Selecting previously unselected package libjack-jackd2-0:arm64.
+
+#8 57.04 Preparing to unpack .../150-libjack-jackd2-0_1.9.21~dfsg-3ubuntu3_arm64.deb ...
+
+#8 57.05 Unpacking libjack-jackd2-0:arm64 (1.9.21~dfsg-3ubuntu3) ...
+
+#8 57.07 Selecting previously unselected package libopenal-data.
+
+#8 57.07 Preparing to unpack .../151-libopenal-data_1%3a1.23.1-4build1_all.deb ...
+
+#8 57.07 Unpacking libopenal-data (1:1.23.1-4build1) ...
+
+#8 57.08 Selecting previously unselected package libsndio7.0:arm64.
+
+#8 57.09 Preparing to unpack .../152-libsndio7.0_1.9.0-0.3build3_arm64.deb ...
+
+#8 57.09 Unpacking libsndio7.0:arm64 (1.9.0-0.3build3) ...
+
+#8 57.10 Selecting previously unselected package libopenal1:arm64.
+
+#8 57.11 Preparing to unpack .../153-libopenal1_1%3a1.23.1-4build1_arm64.deb ...
+
+#8 57.11 Unpacking libopenal1:arm64 (1:1.23.1-4build1) ...
+
+#8 57.13 Selecting previously unselected package libwayland-client0:arm64.
+
+#8 57.13 Preparing to unpack .../154-libwayland-client0_1.22.0-2.1build1_arm64.deb ...
+
+#8 57.13 Unpacking libwayland-client0:arm64 (1.22.0-2.1build1) ...
+
+#8 57.15 Selecting previously unselected package libdecor-0-0:arm64.
+
+#8 57.15 Preparing to unpack .../155-libdecor-0-0_0.2.2-1build2_arm64.deb ...
+
+#8 57.15 Unpacking libdecor-0-0:arm64 (0.2.2-1build2) ...
+
+#8 57.16 Selecting previously unselected package libwayland-cursor0:arm64.
+
+#8 57.17 Preparing to unpack .../156-libwayland-cursor0_1.22.0-2.1build1_arm64.deb ...
+
+#8 57.17 Unpacking libwayland-cursor0:arm64 (1.22.0-2.1build1) ...
+
+#8 57.18 Selecting previously unselected package libwayland-egl1:arm64.
+
+#8 57.18 Preparing to unpack .../157-libwayland-egl1_1.22.0-2.1build1_arm64.deb ...
+
+#8 57.18 Unpacking libwayland-egl1:arm64 (1.22.0-2.1build1) ...
+
+#8 57.20 Selecting previously unselected package libxcursor1:arm64.
+
+#8 57.20 Preparing to unpack .../158-libxcursor1_1%3a1.2.1-1build1_arm64.deb ...
+
+#8 57.20 Unpacking libxcursor1:arm64 (1:1.2.1-1build1) ...
+
+#8 57.22 Selecting previously unselected package libxi6:arm64.
+
+#8 57.22 Preparing to unpack .../159-libxi6_2%3a1.8.1-1build1_arm64.deb ...
+
+#8 57.22 Unpacking libxi6:arm64 (2:1.8.1-1build1) ...
+
+#8 57.24 Selecting previously unselected package libxrandr2:arm64.
+
+#8 57.24 Preparing to unpack .../160-libxrandr2_2%3a1.5.2-2build1_arm64.deb ...
+
+#8 57.24 Unpacking libxrandr2:arm64 (2:1.5.2-2build1) ...
+
+#8 57.26 Selecting previously unselected package x11-common.
+
+#8 57.26 Preparing to unpack .../161-x11-common_1%3a7.7+23ubuntu3_all.deb ...
+
+#8 57.26 Unpacking x11-common (1:7.7+23ubuntu3) ...
+
+#8 57.28 Selecting previously unselected package libxss1:arm64.
+
+#8 57.28 Preparing to unpack .../162-libxss1_1%3a1.2.3-1build3_arm64.deb ...
+
+#8 57.28 Unpacking libxss1:arm64 (1:1.2.3-1build3) ...
+
+#8 57.30 Selecting previously unselected package libsdl2-2.0-0:arm64.
+
+#8 57.30 Preparing to unpack .../163-libsdl2-2.0-0_2.30.0+dfsg-1ubuntu3.1_arm64.deb ...
+
+#8 57.30 Unpacking libsdl2-2.0-0:arm64 (2.30.0+dfsg-1ubuntu3.1) ...
+
+#8 57.32 Selecting previously unselected package libxcb-shape0:arm64.
+
+#8 57.33 Preparing to unpack .../164-libxcb-shape0_1.15-1ubuntu2_arm64.deb ...
+
+#8 57.33 Unpacking libxcb-shape0:arm64 (1.15-1ubuntu2) ...
+
+#8 57.34 Selecting previously unselected package libxv1:arm64.
+
+#8 57.34 Preparing to unpack .../165-libxv1_2%3a1.0.11-1.1build1_arm64.deb ...
+
+#8 57.35 Unpacking libxv1:arm64 (2:1.0.11-1.1build1) ...
+
+#8 57.37 Selecting previously unselected package libavdevice60:arm64.
+
+#8 57.37 Preparing to unpack .../166-libavdevice60_7%3a6.1.1-3ubuntu5_arm64.deb ...
+
+#8 57.37 Unpacking libavdevice60:arm64 (7:6.1.1-3ubuntu5) ...
+
+#8 57.39 Selecting previously unselected package ffmpeg.
+
+#8 57.39 Preparing to unpack .../167-ffmpeg_7%3a6.1.1-3ubuntu5_arm64.deb ...
+
+#8 57.39 Unpacking ffmpeg (7:6.1.1-3ubuntu5) ...
+
+#8 57.41 Preparing to unpack .../168-libssh-4_0.10.6-2ubuntu0.5_arm64.deb ...
+
+#8 57.42 Unpacking libssh-4:arm64 (0.10.6-2ubuntu0.5) over (0.10.6-2ubuntu0.4) ...
+
+#8 57.45 Setting up libgme0:arm64 (0.6.3-7build1) ...
+
+#8 57.45 Setting up libchromaprint1:arm64 (1.5.1-5) ...
+
+#8 57.45 Setting up libssh-gcrypt-4:arm64 (0.10.6-2ubuntu0.5) ...
+
+#8 57.46 Setting up libhwy1t64:arm64 (1.0.7-8.1build1) ...
+
+#8 57.46 Setting up libgraphite2-3:arm64 (1.3.14-2ubuntu0.24.04.1) ...
+
+#8 57.46 Setting up liblcms2-2:arm64 (2.14-2ubuntu0.1) ...
+
+#8 57.46 Setting up libpixman-1-0:arm64 (0.42.2-1build1) ...
+
+#8 57.46 Setting up libudfread0:arm64 (1.1.2-1build1) ...
+
+#8 57.46 Setting up libnorm1t64:arm64 (1.5.9+dfsg-3.1build1) ...
+
+#8 57.47 Setting up libsharpyuv0:arm64 (1.3.2-0.4build3) ...
+
+#8 57.47 Setting up libaom3:arm64 (3.8.2-2ubuntu0.2) ...
+
+#8 57.47 Setting up librabbitmq4:arm64 (0.11.0-1ubuntu0.2) ...
+
+#8 57.47 Setting up libxau6:arm64 (1:1.0.9-1build6) ...
+
+#8 57.47 Setting up libxdmcp6:arm64 (1:1.1.3-0ubuntu6) ...
+
+#8 57.48 Setting up libraw1394-11:arm64 (2.1.2-2build3) ...
+
+#8 57.48 Setting up libapparmor1:arm64 (4.0.1really4.0.1-0ubuntu0.24.04.8) ...
+
+#8 57.48 Setting up libxcb1:arm64 (1.15-1ubuntu2) ...
+
+#8 57.48 Setting up libxcb-xfixes0:arm64 (1.15-1ubuntu2) ...
+
+#8 57.48 Setting up liblerc4:arm64 (4.0.0+ds-4ubuntu2) ...
+
+#8 57.48 Setting up libspeex1:arm64 (1.2.1-2ubuntu2.24.04.1) ...
+
+#8 57.49 Setting up libshine3:arm64 (3.1.1-2build1) ...
+
+#8 57.49 Setting up libx264-164:arm64 (2:0.164.3108+git31e19f9-1) ...
+
+#8 57.49 Setting up libtwolame0:arm64 (0.4.0-2build3) ...
+
+#8 57.49 Setting up libmbedcrypto7t64:arm64 (2.28.8-1) ...
+
+#8 57.49 Setting up libdatrie1:arm64 (0.2.13-3build1) ...
+
+#8 57.50 Setting up libxcb-render0:arm64 (1.15-1ubuntu2) ...
+
+#8 57.50 Setting up libsoxr0:arm64 (0.1.3-4build3) ...
+
+#8 57.50 Setting up libzix-0-0:arm64 (0.4.2-2build1) ...
+
+#8 57.50 Setting up libglvnd0:arm64 (1.7.0-1build1) ...
+
+#8 57.50 Setting up libcodec2-1.2:arm64 (1.2.0-2build1) ...
+
+#8 57.51 Setting up libxcb-glx0:arm64 (1.15-1ubuntu2) ...
+
+#8 57.51 Setting up libgdk-pixbuf2.0-common (2.42.10+dfsg-3ubuntu3.3) ...
+
+#8 57.51 Setting up libuv1t64:arm64 (1.48.0-1.1build1) ...
+
+#8 57.51 Setting up libmysofa1:arm64 (1.3.2+dfsg-2ubuntu2) ...
+
+#8 57.51 Setting up libxcb-shape0:arm64 (1.15-1ubuntu2) ...
+
+#8 57.51 Setting up x11-common (1:7.7+23ubuntu3) ...
+
+#8 57.57 debconf: unable to initialize frontend: Dialog
+
+#8 57.57 debconf: (TERM is not set, so the dialog frontend is not usable.)
+
+#8 57.57 debconf: falling back to frontend: Readline
+
+#8 57.58 debconf: unable to initialize frontend: Readline
+
+#8 57.58 debconf: (This frontend requires a controlling tty.)
+
+#8 57.58 debconf: falling back to frontend: Teletype
+
+#8 57.59 invoke-rc.d: could not determine current runlevel
+
+#8 57.60 invoke-rc.d: policy-rc.d denied execution of start.
+
+#8 57.60 Setting up libsensors-config (1:3.6.0-9build1) ...
+
+#8 57.60 Setting up libcdio19t64:arm64 (2.1.0-4.1ubuntu1.2) ...
+
+#8 57.61 Setting up libdeflate0:arm64 (1.19-1build1.1) ...
+
+#8 57.61 Setting up xkb-data (2.41-2ubuntu1.1) ...
+
+#8 57.61 Setting up libsvtav1enc1d1:arm64 (1.7.0+dfsg-2build1) ...
+
+#8 57.61 Setting up libxcb-shm0:arm64 (1.15-1ubuntu2) ...
+
+#8 57.62 Setting up libcjson1:arm64 (1.7.17-1) ...
+
+#8 57.62 Setting up libxvidcore4:arm64 (2:1.3.7-1build1) ...
+
+#8 57.62 Setting up libjbig0:arm64 (2.1-6.1ubuntu2) ...
+
+#8 57.62 Setting up librav1e0:arm64 (0.7.1-2) ...
+
+#8 57.62 Setting up libcdio-cdda2t64:arm64 (10.2+2.0.1-1.1build2) ...
+
+#8 57.62 Setting up librist4:arm64 (0.2.10+dfsg-2) ...
+
+#8 57.63 Setting up libxcb-present0:arm64 (1.15-1ubuntu2) ...
+
+#8 57.63 Setting up libpgm-5.3-0t64:arm64 (5.3.128~dfsg-2.1build1) ...
+
+#8 57.63 Setting up libglib2.0-0t64:arm64 (2.80.0-6ubuntu3.9) ...
+
+#8 57.63 No schema files found: doing nothing.
+
+#8 57.64 Setting up libslang2:arm64 (2.3.3-3build2) ...
+
+#8 57.64 Setting up libva2:arm64 (2.20.0-2ubuntu0.2) ...
+
+#8 57.64 Setting up libfreetype6:arm64 (2.13.2+dfsg-1ubuntu0.2) ...
+
+#8 57.64 Setting up libx11-data (2:1.8.7-1build1) ...
+
+#8 57.65 Setting up libxcb-sync1:arm64 (1.15-1ubuntu2) ...
+
+#8 57.65 Setting up libfribidi0:arm64 (1.0.13-3build1) ...
+
+#8 57.65 Setting up shared-mime-info (2.4-4) ...
+
+#8 58.12 Setting up libcdio-paranoia2t64:arm64 (10.2+2.0.1-1.1build2) ...
+
+#8 58.12 Setting up fonts-dejavu-mono (2.37-8) ...
+
+#8 58.12 Setting up libjsoncpp25:arm64 (1.9.5-6build1) ...
+
+#8 58.13 Setting up libunibreak5:arm64 (5.1-2build1) ...
+
+#8 58.13 Setting up libllvm20:arm64 (1:20.1.2-0ubuntu1~24.04.3) ...
+
+#8 58.13 Setting up fonts-dejavu-core (2.37-8) ...
+
+#8 58.15 Setting up libsensors5:arm64 (1:3.6.0-9build1) ...
+
+#8 58.15 Setting up libjxl0.7:arm64 (0.7.0-10.2ubuntu6.1) ...
+
+#8 58.16 Setting up libjpeg-turbo8:arm64 (2.1.5-2ubuntu2) ...
+
+#8 58.16 Setting up libfftw3-double3:arm64 (3.3.10-1ubuntu3) ...
+
+#8 58.16 Setting up libssh-4:arm64 (0.10.6-2ubuntu0.5) ...
+
+#8 58.16 Setting up libvulkan1:arm64 (1.3.275.0-1build1) ...
+
+#8 58.16 Setting up libx265-199:arm64 (3.5-2build1) ...
+
+#8 58.17 Setting up libwebp7:arm64 (1.3.2-0.4build3) ...
+
+#8 58.17 Setting up libsndio7.0:arm64 (1.9.0-0.3build3) ...
+
+#8 58.17 Setting up libvidstab1.1:arm64 (1.1.0-2build1) ...
+
+#8 58.18 Setting up libvpx9:arm64 (1.14.0-1ubuntu2.3) ...
+
+#8 58.18 Setting up libsrt1.5-gnutls:arm64 (1.5.3-1build2) ...
+
+#8 58.18 Setting up libflite1:arm64 (2.2-6build3) ...
+
+#8 58.18 Setting up libdav1d7:arm64 (1.4.1-1build1) ...
+
+#8 58.18 Setting up ocl-icd-libopencl1:arm64 (2.3.2-1build1) ...
+
+#8 58.19 Setting up libasyncns0:arm64 (0.8-6build4) ...
+
+#8 58.19 Setting up libxshmfence1:arm64 (1.3-1build5) ...
+
+#8 58.19 Setting up librhash0:arm64 (1.4.3-3build1) ...
+
+#8 58.19 Setting up libbs2b0:arm64 (3.1.0+dfsg-7build1) ...
+
+#8 58.19 Setting up libxcb-randr0:arm64 (1.15-1ubuntu2) ...
+
+#8 58.20 Setting up libzimg2:arm64 (3.0.5+ds1-1build1) ...
+
+#8 58.20 Setting up libopenjp2-7:arm64 (2.5.0-2ubuntu0.5) ...
+
+#8 58.20 Setting up libx11-6:arm64 (2:1.8.7-1build1) ...
+
+#8 58.20 Setting up libharfbuzz0b:arm64 (8.3.0-2build2) ...
+
+#8 58.20 Setting up libopenal-data (1:1.23.1-4build1) ...
+
+#8 58.21 Setting up libthai-data (0.1.29-2build1) ...
+
+#8 58.21 Setting up cmake-data (3.28.3-1build7) ...
+
+#8 58.21 Setting up libwayland-egl1:arm64 (1.22.0-2.1build1) ...
+
+#8 58.22 Setting up libusb-1.0-0:arm64 (2:1.0.27-1) ...
+
+#8 58.22 Setting up libsamplerate0:arm64 (0.2.2-4build1) ...
+
+#8 58.22 Setting up libwebpmux3:arm64 (1.3.2-0.4build3) ...
+
+#8 58.22 Setting up libdrm-common (2.4.125-1ubuntu0.1~24.04.2) ...
+
+#8 58.22 Setting up libarchive13t64:arm64 (3.7.2-2ubuntu0.8) ...
+
+#8 58.23 Setting up libopenmpt0t64:arm64 (0.7.3-1.1build3) ...
+
+#8 58.23 Setting up libzvbi-common (0.2.42-2) ...
+
+#8 58.23 Setting up libiec61883-0:arm64 (1.2.0-6build1) ...
+
+#8 58.23 Setting up libserd-0-0:arm64 (0.32.2-1) ...
+
+#8 58.23 Setting up libxkbcommon0:arm64 (1.6.0-1build1) ...
+
+#8 58.24 Setting up libwayland-client0:arm64 (1.22.0-2.1build1) ...
+
+#8 58.24 Setting up libjpeg8:arm64 (8c-2ubuntu11) ...
+
+#8 58.24 Setting up libavc1394-0:arm64 (0.5.4-5build3) ...
+
+#8 58.24 Setting up libxcb-dri3-0:arm64 (1.15-1ubuntu2) ...
+
+#8 58.24 Setting up libx11-xcb1:arm64 (2:1.8.7-1build1) ...
+
+#8 58.24 Setting up libzmq5:arm64 (4.3.5-1build2) ...
+
+#8 58.25 Setting up libcaca0:arm64 (0.99.beta20-4ubuntu0.2) ...
+
+#8 58.25 Setting up libzvbi0t64:arm64 (0.2.42-2) ...
+
+#8 58.25 Setting up libxrender1:arm64 (1:0.9.10-1.1build1) ...
+
+#8 58.25 Setting up libpulse0:arm64 (1:16.1+dfsg1-2ubuntu10.1) ...
+
+#8 58.26 Setting up fontconfig-config (2.15.0-1.1ubuntu2) ...
+
+#8 58.40 Setting up libxext6:arm64 (2:1.3.4-1build2) ...
+
+#8 58.41 Setting up libopenal1:arm64 (1:1.23.1-4build1) ...
+
+#8 58.41 Setting up libxxf86vm1:arm64 (1:1.1.4-1build4) ...
+
+#8 58.41 Setting up libsphinxbase3t64:arm64 (0.8+5prealpha+1-17build2) ...
+
+#8 58.41 Setting up libthai0:arm64 (0.1.29-2build1) ...
+
+#8 58.41 Setting up libplacebo338:arm64 (6.338.2-2build1) ...
+
+#8 58.42 Setting up libxfixes3:arm64 (1:6.0.0-2build1) ...
+
+#8 58.42 Setting up libdc1394-25:arm64 (2.2.6-4build1) ...
+
+#8 58.42 Setting up libxv1:arm64 (2:1.0.11-1.1build1) ...
+
+#8 58.42 Setting up libxrandr2:arm64 (2:1.5.2-2build1) ...
+
+#8 58.42 Setting up librubberband2:arm64 (3.3.0+dfsg-2build1) ...
+
+#8 58.42 Setting up libjack-jackd2-0:arm64 (1.9.21~dfsg-3ubuntu3) ...
+
+#8 58.43 Setting up libdrm2:arm64 (2.4.125-1ubuntu0.1~24.04.2) ...
+
+#8 58.43 Setting up libva-drm2:arm64 (2.20.0-2ubuntu0.2) ...
+
+#8 58.43 Setting up libvdpau1:arm64 (1.5-2build1) ...
+
+#8 58.43 Setting up libsord-0-0:arm64 (0.16.16-2build1) ...
+
+#8 58.43 Setting up libtiff6:arm64 (4.5.1+git230720-4ubuntu2.5) ...
+
+#8 58.44 Setting up libwayland-cursor0:arm64 (1.22.0-2.1build1) ...
+
+#8 58.44 Setting up libsratom-0-0:arm64 (0.6.16-1build1) ...
+
+#8 58.44 Setting up libdecor-0-0:arm64 (0.2.2-1build2) ...
+
+#8 58.44 Setting up cmake (3.28.3-1build7) ...
+
+#8 58.44 Setting up libgdk-pixbuf-2.0-0:arm64 (2.42.10+dfsg-3ubuntu3.3) ...
+
+#8 58.46 Setting up libxss1:arm64 (1:1.2.3-1build3) ...
+
+#8 58.46 Setting up libva-x11-2:arm64 (2.20.0-2ubuntu0.2) ...
+
+#8 58.46 Setting up liblilv-0-0:arm64 (0.24.22-1build1) ...
+
+#8 58.46 Setting up libdrm-amdgpu1:arm64 (2.4.125-1ubuntu0.1~24.04.2) ...
+
+#8 58.46 Setting up mesa-libgallium:arm64 (25.2.8-0ubuntu0.24.04.4) ...
+
+#8 58.47 Setting up libxi6:arm64 (2:1.8.1-1build1) ...
+
+#8 58.47 Setting up libgbm1:arm64 (25.2.8-0ubuntu0.24.04.4) ...
+
+#8 58.47 Setting up libxcursor1:arm64 (1:1.2.1-1build1) ...
+
+#8 58.47 Setting up libgl1-mesa-dri:arm64 (25.2.8-0ubuntu0.24.04.4) ...
+
+#8 58.48 Setting up libavutil58:arm64 (7:6.1.1-3ubuntu5) ...
+
+#8 58.48 Setting up libpocketsphinx3:arm64 (0.8.0+real5prealpha+1-15ubuntu5) ...
+
+#8 58.48 Setting up libswresample4:arm64 (7:6.1.1-3ubuntu5) ...
+
+#8 58.48 Setting up libpostproc57:arm64 (7:6.1.1-3ubuntu5) ...
+
+#8 58.49 Setting up libsdl2-2.0-0:arm64 (2.30.0+dfsg-1ubuntu3.1) ...
+
+#8 58.49 Setting up libswscale7:arm64 (7:6.1.1-3ubuntu5) ...
+
+#8 58.49 Setting up libglx-mesa0:arm64 (25.2.8-0ubuntu0.24.04.4) ...
+
+#8 58.49 Setting up libglx0:arm64 (1.7.0-1build1) ...
+
+#8 58.49 Setting up libgl1:arm64 (1.7.0-1build1) ...
+
+#8 58.50 Processing triggers for sgml-base (1.31) ...
+
+#8 58.51 Setting up libfontconfig1:arm64 (2.15.0-1.1ubuntu2) ...
+
+#8 58.51 Setting up libbluray2:arm64 (1:1.3.4-1build1) ...
+
+#8 58.52 Setting up fontconfig (2.15.0-1.1ubuntu2) ...
+
+#8 58.53 Regenerating fonts cache... done.
+
+#8 60.54 Processing triggers for libc-bin (2.39-0ubuntu8.7) ...
+
+#8 60.56 /sbin/ldconfig.real: /opt/hpcx/nccl_spectrum-x_plugin/lib/libdoca_gpunetio_host.so.0 is not a symbolic link
+
+#8 60.57
+
+#8 60.57 Setting up libpango-1.0-0:arm64 (1.52.1+ds-1build1) ...
+
+#8 60.58 Setting up libcairo2:arm64 (1.18.0-3build1) ...
+
+#8 60.58 Setting up libass9:arm64 (1:0.17.1-2build1) ...
+
+#8 60.58 Setting up libtheora0:arm64 (1.1.1+dfsg.1-16.1build3) ...
+
+#8 60.58 Setting up libcairo-gobject2:arm64 (1.18.0-3build1) ...
+
+#8 60.58 Setting up libpangoft2-1.0-0:arm64 (1.52.1+ds-1build1) ...
+
+#8 60.59 Setting up libpangocairo-1.0-0:arm64 (1.52.1+ds-1build1) ...
+
+#8 60.59 Setting up librsvg2-2:arm64 (2.58.0+dfsg-1ubuntu0.1) ...
+
+#8 60.59 Setting up libavcodec60:arm64 (7:6.1.1-3ubuntu5) ...
+
+#8 60.60 Setting up libavformat60:arm64 (7:6.1.1-3ubuntu5) ...
+
+#8 60.60 Setting up libavfilter9:arm64 (7:6.1.1-3ubuntu5) ...
+
+#8 60.60 Setting up libavdevice60:arm64 (7:6.1.1-3ubuntu5) ...
+
+#8 60.60 Setting up ffmpeg (7:6.1.1-3ubuntu5) ...
+
+#8 60.60 Processing triggers for libc-bin (2.39-0ubuntu8.7) ...
+
+#8 60.62 /sbin/ldconfig.real: /opt/hpcx/nccl_spectrum-x_plugin/lib/libdoca_gpunetio_host.so.0 is not a symbolic link
+
+#8 60.62
+
+#8 DONE 60.9s
+
+#9 [stage-1  3/10] COPY --from=validated_runtime /opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93 /opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93
+#9 DONE 0.9s
+
+#10 [stage-1  4/10] WORKDIR /opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93
+#10 DONE 0.1s
+
+#11 [stage-1  5/10] RUN python -m pip install --index-url https://pypi.org/simple 'numpy==1.26.4' 'safetensors==0.8.0' sentencepiece pillow pytest pybind11 ninja 'nvidia-cutlass-dsl==4.5.1' 'quack-kernels==0.4.1' huggingface-hub && python -m pip install --no-deps --no-build-isolation -e . && python -m pip uninstall -y torchao
+#11 1.742 Collecting numpy==1.26.4
+#11 9.795   Downloading numpy-1.26.4-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl.metadata (62 kB)
+#11 10.24 Collecting safetensors==0.8.0
+#11 10.39   Downloading safetensors-0.8.0-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl.metadata (4.2 kB)
+#11 10.58 Collecting sentencepiece
+#11 10.73   Downloading sentencepiece-0.2.2-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl.metadata (33 kB)
+#11 10.75 Requirement already satisfied: pillow in /usr/local/lib/python3.12/dist-packages (12.2.0)
+#11 10.92 Collecting pytest
+#11 11.07   Downloading pytest-9.1.1-py3-none-any.whl.metadata (7.6 kB)
+#11 11.08 Requirement already satisfied: pybind11 in /usr/local/lib/python3.12/dist-packages (3.0.4)
+#11 11.08 Requirement already satisfied: ninja in /usr/local/lib/python3.12/dist-packages (1.13.0)
+#11 11.23 Collecting nvidia-cutlass-dsl==4.5.1
+#11 11.38   Downloading nvidia_cutlass_dsl-4.5.1-py3-none-any.whl.metadata (2.8 kB)
+#11 11.54 Collecting quack-kernels==0.4.1
+#11 11.69   Downloading quack_kernels-0.4.1-py3-none-any.whl.metadata (640 bytes)
+#11 11.69 Requirement already satisfied: huggingface-hub in /usr/local/lib/python3.12/dist-packages (1.14.0)
+#11 11.85 Collecting nvidia-cutlass-dsl-libs-base==4.5.1 (from nvidia-cutlass-dsl==4.5.1)
+#11 12.05   Downloading nvidia_cutlass_dsl_libs_base-4.5.1-cp312-cp312-manylinux_2_28_aarch64.whl.metadata (2.7 kB)
+#11 12.06 Requirement already satisfied: torch in /usr/local/lib/python3.12/dist-packages (from quack-kernels==0.4.1) (2.12.0a0+5aff3928d8.nv26.5.50603568)
+#11 12.24 Collecting apache-tvm-ffi<0.2,>=0.1.6 (from quack-kernels==0.4.1)
+#11 12.39   Downloading apache_tvm_ffi-0.1.14.post1-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl.metadata (6.2 kB)
+#11 12.55 Collecting torch-c-dlpack-ext (from quack-kernels==0.4.1)
+#11 12.70   Downloading torch_c_dlpack_ext-0.1.5-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl.metadata (14 kB)
+#11 12.71 Requirement already satisfied: einops in /usr/local/lib/python3.12/dist-packages (from quack-kernels==0.4.1) (0.8.2)
+#11 12.71 Requirement already satisfied: typing-extensions in /usr/local/lib/python3.12/dist-packages (from nvidia-cutlass-dsl-libs-base==4.5.1->nvidia-cutlass-dsl==4.5.1) (4.15.0)
+#11 12.71 Requirement already satisfied: cuda-python>=12.8 in /usr/local/lib/python3.12/dist-packages (from nvidia-cutlass-dsl-libs-base==4.5.1->nvidia-cutlass-dsl==4.5.1) (13.2.0)
+#11 12.87 Collecting iniconfig>=1.0.1 (from pytest)
+#11 13.01   Downloading iniconfig-2.3.1-py3-none-any.whl.metadata (2.8 kB)
+#11 13.02 Requirement already satisfied: packaging>=22 in /usr/local/lib/python3.12/dist-packages (from pytest) (26.0)
+#11 13.17 Collecting pluggy<2,>=1.5 (from pytest)
+#11 13.32   Downloading pluggy-1.6.0-py3-none-any.whl.metadata (4.8 kB)
+#11 13.32 Requirement already satisfied: pygments>=2.7.2 in /usr/lib/python3/dist-packages (from pytest) (2.17.2)
+#11 13.33 Requirement already satisfied: filelock>=3.10.0 in /usr/local/lib/python3.12/dist-packages (from huggingface-hub) (3.29.0)
+#11 13.33 Requirement already satisfied: fsspec>=2023.5.0 in /usr/local/lib/python3.12/dist-packages (from huggingface-hub) (2026.2.0)
+#11 13.33 Requirement already satisfied: hf-xet<2.0.0,>=1.4.3 in /usr/local/lib/python3.12/dist-packages (from huggingface-hub) (1.5.0)
+#11 13.33 Requirement already satisfied: httpx<1,>=0.23.0 in /usr/local/lib/python3.12/dist-packages (from huggingface-hub) (0.28.1)
+#11 13.33 Requirement already satisfied: pyyaml>=5.1 in /usr/lib/python3/dist-packages (from huggingface-hub) (6.0.1)
+#11 13.33 Requirement already satisfied: tqdm>=4.42.1 in /usr/local/lib/python3.12/dist-packages (from huggingface-hub) (4.67.3)
+#11 13.33 Requirement already satisfied: typer>=0.20.0 in /usr/local/lib/python3.12/dist-packages (from huggingface-hub) (0.25.1)
+#11 13.33 Requirement already satisfied: anyio in /usr/local/lib/python3.12/dist-packages (from httpx<1,>=0.23.0->huggingface-hub) (4.13.0)
+#11 13.33 Requirement already satisfied: certifi in /usr/local/lib/python3.12/dist-packages (from httpx<1,>=0.23.0->huggingface-hub) (2026.4.22)
+#11 13.33 Requirement already satisfied: httpcore==1.* in /usr/local/lib/python3.12/dist-packages (from httpx<1,>=0.23.0->huggingface-hub) (1.0.9)
+#11 13.33 Requirement already satisfied: idna in /usr/local/lib/python3.12/dist-packages (from httpx<1,>=0.23.0->huggingface-hub) (3.13)
+#11 13.33 Requirement already satisfied: h11>=0.16 in /usr/local/lib/python3.12/dist-packages (from httpcore==1.*->httpx<1,>=0.23.0->huggingface-hub) (0.16.0)
+#11 13.33 Requirement already satisfied: cuda-bindings~=13.2.0 in /usr/local/lib/python3.12/dist-packages (from cuda-python>=12.8->nvidia-cutlass-dsl-libs-base==4.5.1->nvidia-cutlass-dsl==4.5.1) (13.2.0)
+#11 13.33 Requirement already satisfied: cuda-pathfinder~=1.1 in /usr/local/lib/python3.12/dist-packages (from cuda-python>=12.8->nvidia-cutlass-dsl-libs-base==4.5.1->nvidia-cutlass-dsl==4.5.1) (1.5.4)
+#11 13.34 Requirement already satisfied: click>=8.2.1 in /usr/local/lib/python3.12/dist-packages (from typer>=0.20.0->huggingface-hub) (8.3.3)
+#11 13.34 Requirement already satisfied: shellingham>=1.3.0 in /usr/local/lib/python3.12/dist-packages (from typer>=0.20.0->huggingface-hub) (1.5.4)
+#11 13.34 Requirement already satisfied: rich>=13.8.0 in /usr/local/lib/python3.12/dist-packages (from typer>=0.20.0->huggingface-hub) (15.0.0)
+#11 13.34 Requirement already satisfied: annotated-doc>=0.0.2 in /usr/local/lib/python3.12/dist-packages (from typer>=0.20.0->huggingface-hub) (0.0.4)
+#11 13.35 Requirement already satisfied: markdown-it-py>=2.2.0 in /usr/local/lib/python3.12/dist-packages (from rich>=13.8.0->typer>=0.20.0->huggingface-hub) (4.2.0)
+#11 13.35 Requirement already satisfied: mdurl~=0.1 in /usr/local/lib/python3.12/dist-packages (from markdown-it-py>=2.2.0->rich>=13.8.0->typer>=0.20.0->huggingface-hub) (0.1.2)
+#11 13.35 Requirement already satisfied: setuptools<82 in /usr/local/lib/python3.12/dist-packages (from torch->quack-kernels==0.4.1) (81.0.0)
+#11 13.35 Requirement already satisfied: sympy>=1.13.3 in /usr/local/lib/python3.12/dist-packages (from torch->quack-kernels==0.4.1) (1.14.0)
+#11 13.35 Requirement already satisfied: networkx>=2.5.1 in /usr/local/lib/python3.12/dist-packages (from torch->quack-kernels==0.4.1) (3.6.1)
+#11 13.35 Requirement already satisfied: jinja2 in /usr/local/lib/python3.12/dist-packages (from torch->quack-kernels==0.4.1) (3.1.6)
+#11 13.36 Requirement already satisfied: mpmath<1.4,>=1.1.0 in /usr/local/lib/python3.12/dist-packages (from sympy>=1.13.3->torch->quack-kernels==0.4.1) (1.3.0)
+#11 13.36 Requirement already satisfied: MarkupSafe>=2.0 in /usr/local/lib/python3.12/dist-packages (from jinja2->torch->quack-kernels==0.4.1) (3.0.3)
+#11 13.51 Downloading numpy-1.26.4-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl (13.9 MB)
+#11 16.29    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 13.9/13.9 MB 5.3 MB/s  0:00:02
+#11 16.44 Downloading safetensors-0.8.0-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl (502 kB)
+#11 16.67 Downloading nvidia_cutlass_dsl-4.5.1-py3-none-any.whl (10 kB)
+#11 16.82 Downloading quack_kernels-0.4.1-py3-none-any.whl (260 kB)
+#11 17.08 Downloading nvidia_cutlass_dsl_libs_base-4.5.1-cp312-cp312-manylinux_2_28_aarch64.whl (75.6 MB)
+#11 31.47    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 75.6/75.6 MB 5.3 MB/s  0:00:14
+#11 31.62 Downloading apache_tvm_ffi-0.1.14.post1-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl (3.1 MB)
+#11 32.19    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 3.1/3.1 MB 5.3 MB/s  0:00:00
+#11 32.34 Downloading sentencepiece-0.2.2-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl (1.3 MB)
+#11 32.59    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.3/1.3 MB 5.3 MB/s  0:00:00
+#11 32.73 Downloading pytest-9.1.1-py3-none-any.whl (386 kB)
+#11 32.96 Downloading pluggy-1.6.0-py3-none-any.whl (20 kB)
+#11 33.12 Downloading iniconfig-2.3.1-py3-none-any.whl (7.6 kB)
+#11 33.29 Downloading torch_c_dlpack_ext-0.1.5-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl (443 kB)
+#11 33.61 Installing collected packages: sentencepiece, safetensors, pluggy, numpy, iniconfig, apache-tvm-ffi, pytest, torch-c-dlpack-ext, nvidia-cutlass-dsl-libs-base, nvidia-cutlass-dsl, quack-kernels
+#11 33.64   Attempting uninstall: safetensors
+#11 33.64     Found existing installation: safetensors 0.7.0
+#11 33.64     Uninstalling safetensors-0.7.0:
+#11 33.65       Successfully uninstalled safetensors-0.7.0
+#11 33.68   Attempting uninstall: numpy
+#11 33.69     Found existing installation: numpy 2.1.0
+#11 33.72     Uninstalling numpy-2.1.0:
+#11 34.03       Successfully uninstalled numpy-2.1.0
+#11 35.91   Attempting uninstall: nvidia-cutlass-dsl-libs-base
+#11 35.91     Found existing installation: nvidia-cutlass-dsl-libs-base 4.4.2
+#11 35.92     Uninstalling nvidia-cutlass-dsl-libs-base-4.4.2:
+#11 36.69       Successfully uninstalled nvidia-cutlass-dsl-libs-base-4.4.2
+#11 38.13   Attempting uninstall: nvidia-cutlass-dsl
+#11 38.13     Found existing installation: nvidia-cutlass-dsl 4.4.2
+#11 38.13     Uninstalling nvidia-cutlass-dsl-4.4.2:
+#11 38.14       Successfully uninstalled nvidia-cutlass-dsl-4.4.2
+#11 38.32
+#11 38.33 Successfully installed apache-tvm-ffi-0.1.14.post1 iniconfig-2.3.1 numpy-1.26.4 nvidia-cutlass-dsl-4.5.1 nvidia-cutlass-dsl-libs-base-4.5.1 pluggy-1.6.0 pytest-9.1.1 quack-kernels-0.4.1 safetensors-0.8.0 sentencepiece-0.2.2 torch-c-dlpack-ext-0.1.5
+#11 38.33 WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+#11 38.72 Obtaining file:///opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93
+#11 38.72   Checking if build backend supports build_editable: started
+#11 38.86   Checking if build backend supports build_editable: finished with status 'done'
+#11 38.86   Preparing editable metadata (pyproject.toml): started
+#11 39.23   Preparing editable metadata (pyproject.toml): finished with status 'done'
+#11 39.24 Building wheels for collected packages: flash-rt
+#11 39.24   Building editable for flash-rt (pyproject.toml): started
+#11 39.69   Building editable for flash-rt (pyproject.toml): finished with status 'done'
+#11 39.69   Created wheel for flash-rt: filename=flash_rt-0.1.0-0.editable-py3-none-any.whl size=31018 sha256=324128110de5292440155e6826046872ef6111820f427e717f705319bfd7f433
+#11 39.69   Stored in directory: /tmp/pip-ephem-wheel-cache-0_htdsb6/wheels/4f/a7/4d/fcbdb88dc7ce785908da3cec4e38a3a48b6a1c87edcc731144
+#11 39.69 Successfully built flash-rt
+#11 39.70 Installing collected packages: flash-rt
+#11 39.71 Successfully installed flash-rt-0.1.0
+#11 39.71 WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+#11 40.04 Found existing installation: torchao 0.18.0+git8781a869
+#11 40.07 Uninstalling torchao-0.18.0+git8781a869:
+#11 40.32   Successfully uninstalled torchao-0.18.0+git8781a869
+#11 40.34 WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+#11 DONE 40.5s
+
+#12 [stage-1  6/10] COPY --from=validated_runtime /opt/reference /opt/reference
+#12 DONE 3.9s
+
+#13 [stage-1  7/10] COPY *.py *.sh /opt/jal/
+#13 DONE 0.2s
+
+#14 [stage-1  8/10] COPY versions.json official-files.json mirror-files.json /opt/jal/
+#14 DONE 0.0s
+
+#15 [stage-1  9/10] COPY fixtures/ /opt/jal/fixtures/
+#15 DONE 0.0s
+
+#16 [stage-1 10/10] WORKDIR /opt/jal
+#16 DONE 0.0s
+
+#17 exporting to image
+#17 exporting layers
+#17 exporting layers 51.3s done
+#17 exporting manifest sha256:59f4c41943ec4121150bbbd851539802a7ebe2297401a81a13ab31b32dae232c done
+#17 exporting config sha256:f78d96d2f64dc8722f7b30ee717947b8f004a8cb12648eb6e2f1dab7707976ee done
+#17 exporting attestation manifest sha256:079ecee2869cbcf7f18ef4a189437e3152e1eb9f2fed42eb364801b6d2158b8e done
+#17 exporting manifest list sha256:8325f6848849277fd10285f6f2e903dc54111aa166be51639ea1a77b76e5cfaf done
+#17 naming to docker.io/library/flashrt-jal:thor-release done
+#17 unpacking to docker.io/library/flashrt-jal:thor-release
+#17 unpacking to docker.io/library/flashrt-jal:thor-release 12.8s done
+#17 DONE 64.2s
+
+EXIT:0

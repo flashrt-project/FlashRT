@@ -1,0 +1,12 @@
+{
+  "mode": "fp8",
+  "checkpoint": "/models/pi05-openpi",
+  "fixture": "/opt/jal/fixtures/libero_obs_2v_n8.npz",
+  "seed": 20261007,
+  "warmup": 20,
+  "iters": 100,
+  "p50_ms": 40.58828065171838,
+  "p95_ms": 40.7163675641641,
+  "torch": "2.12.0a0+5aff3928d8.nv26.05",
+  "flash_rt": "/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/flash_rt/__init__.py"
+}

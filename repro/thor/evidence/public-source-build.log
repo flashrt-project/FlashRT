@@ -1,0 +1,46 @@
+
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile.thor
+#1 transferring dockerfile: 2.06kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for nvcr.io/nvidia/pytorch@sha256:222d8b18e671be5c3ef91cb41727a2572a0b23f59ded6c39f373a96946f6f2ba
+#2 DONE 2.0s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 584B done
+#3 DONE 0.0s
+
+#4 [selected_source 1/3] FROM nvcr.io/nvidia/pytorch@sha256:222d8b18e671be5c3ef91cb41727a2572a0b23f59ded6c39f373a96946f6f2ba
+#4 resolve nvcr.io/nvidia/pytorch@sha256:222d8b18e671be5c3ef91cb41727a2572a0b23f59ded6c39f373a96946f6f2ba 0.0s done
+#4 CACHED
+
+#5 [internal] load build context
+#5 transferring context: 6.57MB 0.0s done
+#5 DONE 0.0s
+
+#6 [selected_source 2/3] COPY runtime-source.tar.gz versions.json unpack-runtime.py /source/
+#6 DONE 0.0s
+
+#7 [selected_source 3/3] RUN python /source/unpack-runtime.py --out /snapshot
+#7 0.679 /snapshot
+#7 DONE 0.7s
+
+#8 exporting to image
+#8 exporting layers
+#8 exporting layers 0.9s done
+#8 exporting manifest sha256:81874887358ff11f70d4447ff774ead2f5b7807564195677e0f20a770b91c989 done
+#8 exporting config sha256:ce88dfab9e334161066014f290c2b6a82717a9c85390b03eb4402427a0d907b2 done
+#8 exporting attestation manifest sha256:9e1a4feff8e36319eff761ce3db61bc496080ab702e5d149a5e978d6cf3d3154 done
+#8 exporting manifest list sha256:fe39162637e0fea05e8f962b660f560d246c9870b4b07ebf9e64c64b36bf99e3 done
+#8 naming to docker.io/library/flashrt-jal:thor-public-source done
+#8 unpacking to docker.io/library/flashrt-jal:thor-public-source
+#8 unpacking to docker.io/library/flashrt-jal:thor-public-source 0.3s done
+#8 DONE 1.2s
+
+EXIT:1
+Corrected source-presence check (actual model filenames):
+SOURCE_STAGE_OK
+
+FINAL_EXIT:0

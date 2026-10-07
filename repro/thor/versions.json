@@ -1,0 +1,13 @@
+{
+  "source_revision": "8efce63a2e77048426d6f30c71ec7118f08eeeb8",
+  "source_directory": "FlashRT-pi05-thor-limit-5421c93",
+  "cosmos": {
+    "repo": "nv-community/Cosmos-Reason2-2B",
+    "revision": "69f09b4b56b25c8ba522052fbaa662e08f969931"
+  },
+  "groot": {
+    "repo": "nv-community/GR00T-N1.7-3B",
+    "revision": "bec3baae56a6a736ffa390bd43ae5ed179dd4646"
+  },
+  "runtime_archive_sha256": "8904cee73dfee989d354de7d3da1878cfe73d744711b11641d2a2b6e7dafb033"
+}

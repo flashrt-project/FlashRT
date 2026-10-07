@@ -50,3 +50,6 @@ third_party/cutlass
 # directory by the Ascend runtime at execution time.
 fusion_result.json
 ge_check_op.json
+
+# Versioned Thor regression observations
+!repro/thor/fixtures/libero_obs_2v_n8.npz
