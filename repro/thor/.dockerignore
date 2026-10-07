@@ -27,3 +27,4 @@
 !versions.json
 !fixtures/
 !fixtures/**
+!benchmark_groot_reference.py
