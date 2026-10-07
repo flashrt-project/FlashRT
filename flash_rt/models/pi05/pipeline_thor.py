@@ -287,7 +287,103 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
     act_format = str(dims.get('act_format', 'nvfp4'))
     rht = 1 if dims.get('rht') else 0
     fused_geglu = bool(dims.get('fused_geglu')) and weight_format == 'nvfp4'
+    fused_geglu_nod = bool(dims.get('fused_geglu_nod')) and fused_geglu
+    fused_geglu_swap = bool(dims.get('fused_geglu_swap')) and fused_geglu
+    fused_geglu_swap_persist = bool(dims.get('fused_geglu_swap_persist')) and fused_geglu_swap
+    fused_geglu_swap_stages = int(dims.get('fused_geglu_swap_stages') or 0) if fused_geglu_swap else 0
+    fused_geglu_earlyb = int(dims.get('fused_geglu_earlyb') or 0) if fused_geglu else 0
     act_e0m3 = act_format == 'e0m3'
+    attn_splitkv = (bool(dims.get('attn_splitkv')) and not fixed_shape
+                    and not act_e0m3)
+    attn_mqa = (bool(dims.get('attn_mqa')) and not fixed_shape
+                and not act_e0m3 and not attn_splitkv)
+    attn_tc05 = (bool(dims.get('attn_tc05')) and not fixed_shape
+                 and not act_e0m3 and not attn_splitkv and not attn_mqa)
+    attn_mqa_fp8 = (bool(dims.get('attn_mqa_fp8')) and not fixed_shape
+                    and not act_e0m3 and not attn_splitkv and not attn_mqa and not attn_tc05
+                    and bool(weights.get('Kc8')))
+    attn_mqa_variant = int(dims.get('attn_mqa_variant', 1))
+    attn_decode = int(dims.get('attn_decode') or 0)
+    if attn_decode and (fixed_shape or act_e0m3 or attn_splitkv or attn_mqa or attn_tc05 or attn_mqa_fp8):
+        attn_decode = 0
+    if attn_decode in (2, 4) and not weights.get('Kc8'):
+        raise ValueError("attn_decode 2/4 needs the e4m3 KV cache (Kc8/Vc8)")
+    Kc8 = weights.get('Kc8', 0)
+    Vc8 = weights.get('Vc8', 0)
+    attn_ws = bufs.get('attn_ws', 0)
+    if (attn_splitkv or attn_mqa or attn_tc05 or attn_mqa_fp8 or attn_decode) and not attn_ws:
+        raise ValueError(
+            "Pi0.5 Thor decoder attn_splitkv/attn_mqa requires bufs['attn_ws']")
+    # Persistent GEMM sequence: one launch per layer for O -> AdaRMS -> gate_up
+    # (GeGLU) -> down -> AdaRMS -> next qkv (weights streamed continuously).
+    dec_seq = (bool(dims.get('dec_seq')) and fused_geglu and not act_e0m3
+               and weight_format == 'nvfp4')
+    dec_phase = (bool(dims.get('phase_cta')) and not fixed_shape and not act_e0m3
+                 and not dec_seq)
+    phase_npc = 0 if int(dims.get('phase_cta') or 0) == 2 else (S + 1) // 2 * 2
+    phase_counters = bufs.get('phase_counters', 0)
+    if dec_phase and not phase_counters:
+        raise RuntimeError("Pi0.5 Thor decoder phase_cta requires bufs['phase_counters']")
+    seq_counter = bufs.get('seq_counter', 0)
+    seq_gu_dummy = bufs.get('seq_gu_dummy', 0)
+    seq_partials = bufs.get('seq_partials', 0)
+    seq_slot_packed = bufs.get('seq_slot_packed', 0)
+    seq_slot_sfa = bufs.get('seq_slot_sfa', 0)
+    seq_slots = int(dims.get('dec_seq_slots', 10))
+    seq_variant = int(dims.get("dec_seq_variant", 0))
+    # Side-stream L2 touch of the layer's remaining weights (O, gate_up, down, next qkv) right after
+    # the qkv GEMM, so the attention chain and the small kernels run while DRAM streams the weights
+    # into L2 and the GEMMs find them hot. Off by default; opt-in via dims['dec_l2_touch'] = CTAs.
+    l2_touch = int(dims.get('dec_l2_touch') or 0)
+    l2_touch_hint = int(dims.get('dec_l2_touch_hint', 1))
+    l2_touch_depth = int(dims.get('dec_l2_touch_depth', 16))
+    l2_touch_pace = int(dims.get('dec_l2_touch_pace', 0))
+    l2_touch_ahead = int(dims.get('dec_l2_touch_ahead', 0))
+    l2_touch_threads = int(dims.get('dec_l2_touch_threads', 256))
+    l2_touch_kv = int(dims.get('dec_l2_touch_kv', 0))
+    l2_touch_mask = int(dims.get('dec_l2_touch_mask', 15))
+    l2_touch_sfb = int(dims.get('dec_l2_touch_sfb', 1))
+    l2_touch_fork = int(dims.get('dec_l2_touch_fork', 0))
+    l2_touch_kv_late = int(dims.get('dec_l2_touch_kv_late', 0))
+    action_fused = bool(dims.get('dec_action_fused', 0))
+
+    def l2_touch_regions(s_, l_):
+        # Weight regions (and optionally K/V) of layer l_ of step s_, in consumption order.
+        nb = l2_touch_bytes
+        regs = []
+        if l2_touch_mask & 1:
+            regs += [(weights['qw_fp4'][l_], nb['qw'][0])] + ([(weights['qw_sfb'][l_], nb['qw'][1])] if l2_touch_sfb else [])
+        if l2_touch_kv:
+            kvb = total_keys * HD * 2
+            regs += [(Kc + l_ * kvb, kvb), (Vc + l_ * kvb, kvb)]
+        if l2_touch_mask & 2:
+            regs += [(weights['ow_fp4'][l_], nb['ow'][0])] + ([(weights['ow_sfb'][l_], nb['ow'][1])] if l2_touch_sfb else [])
+        if l2_touch_mask & 4:
+            regs += [(weights['gwil_fp4'][l_], nb['gwil'][0])] + ([(weights['gwil_sfb'][l_], nb['gwil'][1])] if l2_touch_sfb else [])
+        if l2_touch_mask & 8:
+            regs += [(weights['dw_fp4'][l_], nb['dw'][0])] + ([(weights['dw_sfb'][l_], nb['dw'][1])] if l2_touch_sfb else [])
+        return regs
+
+    def l2_touch_launch(regs, where):
+        rc = 0 if not regs else fvk_fp4.l2_touch_fork(
+            regs, stream, l2_touch, l2_touch_hint, l2_touch_sink, l2_touch_depth, l2_touch_pace, l2_touch_threads)
+        if rc != 0:
+            raise RuntimeError(f"Pi0.5 decoder FP4 l2_touch {where} failed rc={rc}")
+    l2_touch_sink = bufs.get('l2_touch_sink', 0)
+    l2_touch_bytes = weights.get('fp4_bytes')
+    if l2_touch and (dec_seq or not fused_geglu or not l2_touch_sink or not l2_touch_bytes):
+        raise ValueError(
+            "Pi0.5 Thor decoder dec_l2_touch requires the fused-GeGLU per-kernel path, "
+            "bufs['l2_touch_sink'] and weights['fp4_bytes']")
+    # Warp-per-row NVFP4 quantize (row kernels v2) for the attention output.
+    dec_rowops_quant = bool(dims.get('dec_rowops_quant', False)) and not act_e0m3
+    dec_rowops_v5 = int(dims.get('rowops_v5', 0) or 0)
+    dec_ares = int(dims.get('dec_ares', 0) or 0)   # bit 0: activation-resident persistent GeGLU GEMM for gate_up
+    if dec_seq and not (seq_counter and seq_gu_dummy and seq_partials
+                        and seq_slot_packed and seq_slot_sfa):
+        raise ValueError(
+            "Pi0.5 Thor decoder dec_seq requires bufs['seq_counter'], "
+            "'seq_gu_dummy', 'seq_partials', 'seq_slot_packed', 'seq_slot_sfa']")
     if act_format not in ('nvfp4', 'e0m3'):
         raise ValueError(
             f"Pi0.5 Thor decoder FP4 unknown act_format {act_format!r}")
@@ -350,8 +446,13 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
 
     for s in range(steps):
         _copy_rtc_prefix(bufs, dims, stream, rtc_prefix_len)
-        fvk.gmm_fp16(ctx, noise, ain_w, x, S, D, 32, 0.0, stream)
-        fvk.add_bias_fp16(x, ain_b, S, D, stream)
+        if action_fused:
+            rc = fvk_fp4.pi05_action_in_fp16(noise, ain_w, ain_b, x, S, D, 32, stream)
+            if rc != 0:
+                raise RuntimeError(f"Pi0.5 decoder FP4 action_in step {s} failed rc={rc}")
+        else:
+            fvk.gmm_fp16(ctx, noise, ain_w, x, S, D, 32, 0.0, stream)
+            fvk.add_bias_fp16(x, ain_b, S, D, stream)
 
         for l in range(layers):
             si = (s * layers + l) * S * D3
@@ -366,74 +467,267 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
                     fvk_fp4.pi05_adarms_fp4_sfa_native_fp16(
                         x, sa_ptr, xn_fp4, xn_sfa, gate, S, D, stream)
 
-            rc = dec_gemm(
-                variant_qkv, xn_fp4, xn_sfa,
-                weights['qw_fp4'][l], weights['qw_sfb'][l], qkv,
-                S, 2560, D, 1.0, 0.0, stream)
-            if rc != 0:
-                raise RuntimeError(
-                    f"Pi0.5 decoder FP4 qkv layer {l} failed rc={rc}")
-
-            if fixed_shape:
-                kv_offset = l * total_keys * HD
-                fvk.qkv_split_rope_kvcache_fp16_devpos(
-                    qkv, rope, attn_out, Kc, Vc, weights['dec_devpos'],
-                    S, Q_dim, K_dim, HD, 2560, kv_offset, HD, stream)
-            else:
-                kv_offset = l * total_keys * HD + enc_seq * HD
-                rc = fvk.qkv_split_rope_kvcache_fp16_vec(
-                    qkv, rope, attn_out, Kc, Vc,
-                    S, Q_dim, K_dim, HD, 2560, kv_offset, HD, stream)
+            if not dec_seq or l == 0:
+                rc = dec_gemm(
+                    variant_qkv, xn_fp4, xn_sfa,
+                    weights['qw_fp4'][l], weights['qw_sfb'][l], qkv,
+                    S, 2560, D, 1.0, 0.0, stream)
                 if rc != 0:
                     raise RuntimeError(
-                        f"Pi0.5 decoder FP4 qkv split layer {l} failed "
-                        f"rc={rc}")
+                        f"Pi0.5 decoder FP4 qkv layer {l} failed rc={rc}")
+            if l2_touch and l2_touch_ahead == 1 and l2_touch_fork == 0:
+                # Warm the whole next layer (its qkv first) while this layer runs on hot weights.
+                ln = l + 1 if l + 1 < layers else (0 if s + 1 < steps else -1)
+                l2_touch_launch(l2_touch_regions(s, ln) if ln >= 0 else [], f"layer {l}")
+            elif l2_touch and l2_touch_ahead == 0:
+                nb = l2_touch_bytes
+                ln = l + 1 if l + 1 < layers else (0 if s + 1 < steps else -1)
+                regs = [(weights['ow_fp4'][l], nb['ow'][0]), (weights['ow_sfb'][l], nb['ow'][1]),
+                        (weights['gwil_fp4'][l], nb['gwil'][0]), (weights['gwil_sfb'][l], nb['gwil'][1]),
+                        (weights['dw_fp4'][l], nb['dw'][0]), (weights['dw_sfb'][l], nb['dw'][1])]
+                if ln >= 0:
+                    regs += [(weights['qw_fp4'][ln], nb['qw'][0]), (weights['qw_sfb'][ln], nb['qw'][1])]
+                l2_touch_launch(regs, f"layer {l}")
 
-            if attn is not None:
-                attn.run("decoder", l, q_seq=S, kv_seq=total_keys,
-                         stream=stream)
-            else:
+            if attn_tc05:
+                # tcgen05 fused attention: RoPE + KV append + attention + merge + quantize in one launch
                 K_ptr = Kc + l * total_keys * HD * 2
                 V_ptr = Vc + l * total_keys * HD * 2
-                fvk.attention_qkv_fp16(
-                    ctx, attn_out, K_ptr, V_ptr, logits, attn_out,
-                    S, total_keys, NH, HD, attn_scale, stream)
-
-            if act_e0m3:
-                rc = fvk_fp4.quantize_e0m3_dynamic_sfa_fp16_vec(
-                    attn_out, ctx_fp4, ctx_sfa, S, NH * HD, False, rht,
-                    stream)
+                rc = fvk_fp4.attn_mqa_tc05_fp4out(
+                    qkv, rope, K_ptr, V_ptr, attn_ws, ctx_fp4, ctx_sfa,
+                    S, enc_seq, NH, HD, 2560, attn_scale, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 tc05 attention layer {l} failed rc={rc}")
             else:
-                rc = fvk_fp4.quantize_fp4_dynamic_sfa_fp16_vec(
-                    attn_out, ctx_fp4, ctx_sfa, S, NH * HD, False, stream)
-            if rc != 0:
-                raise RuntimeError(
-                    f"Pi0.5 decoder FP4 O activation layer {l} failed rc={rc}")
-            rc = dec_gemm(
-                variant_o, ctx_fp4, ctx_sfa,
-                weights['ow_fp4'][l], weights['ow_sfb'][l], fg,
-                S, D, NH * HD, 1.0, 0.0, stream)
-            if rc != 0:
-                raise RuntimeError(
-                    f"Pi0.5 decoder FP4 O layer {l} failed rc={rc}")
+                if fixed_shape:
+                    kv_offset = l * total_keys * HD
+                    fvk.qkv_split_rope_kvcache_fp16_devpos(
+                        qkv, rope, attn_out, Kc, Vc, weights['dec_devpos'],
+                        S, Q_dim, K_dim, HD, 2560, kv_offset, HD, stream)
+                else:
+                    kv_offset = l * total_keys * HD + enc_seq * HD
+                    if attn_mqa_fp8 or attn_decode in (2, 4):
+                        rc = fvk_fp4.qkv_split_rope_kvcache_fp16_fp8_vec(
+                            qkv, rope, attn_out, Kc, Vc, Kc8, Vc8,
+                            S, Q_dim, K_dim, HD, 2560, kv_offset, HD, stream)
+                    else:
+                        rc = fvk.qkv_split_rope_kvcache_fp16_vec(
+                            qkv, rope, attn_out, Kc, Vc,
+                            S, Q_dim, K_dim, HD, 2560, kv_offset, HD, stream)
+                    if rc != 0:
+                        raise RuntimeError(
+                            f"Pi0.5 decoder FP4 qkv split layer {l} failed "
+                            f"rc={rc}")
 
-            if act_e0m3:
-                fvk_fp4.pi05_gate_res_adarms_e0m3_sfa_fp16(
-                    fg, gate, x, sf_ptr, xn_fp4, xn_sfa, gate, S, D, rht,
-                    stream)
+                if attn_splitkv:
+                    K_ptr = Kc + l * total_keys * HD * 2
+                    V_ptr = Vc + l * total_keys * HD * 2
+                    rc = fvk_fp4.pi05_dec_attn_splitkv_fp4(
+                        attn_out, K_ptr, V_ptr, attn_ws, ctx_fp4, ctx_sfa,
+                        S, total_keys, NH, HD, attn_scale, stream)
+                    if rc != 0:
+                        raise RuntimeError(
+                            f"Pi0.5 decoder FP4 split-KV attention layer {l} "
+                            f"failed rc={rc}")
+                elif attn_decode:
+                    # Flash-decoding form: one CTA per 64-key tile, merge + NVFP4 quantize fused.
+                    if attn_decode in (2, 4):
+                        Kd = Kc8 + l * total_keys * HD
+                        Vd = Vc8 + l * total_keys * HD
+                    else:
+                        Kd = Kc + l * total_keys * HD * 2
+                        Vd = Vc + l * total_keys * HD * 2
+                    dec_fn = fvk_fp4.attn_decode_tc05_fp4out if attn_decode >= 3 else fvk_fp4.attn_decode_mqa_fp4out
+                    rc = dec_fn(
+                        attn_out, Kd, Vd, attn_ws, ctx_fp4, ctx_sfa,
+                        S, total_keys, NH, HD, attn_scale, stream, 1 if attn_decode in (2, 4) else 0)
+                    if rc != 0:
+                        raise RuntimeError(
+                            f"Pi0.5 decoder FP4 decode attention layer {l} "
+                            f"failed rc={rc}")
+                elif attn_mqa_fp8:
+                    # attn_mqa_s16 over the e4m3 KV cache (half the KV DRAM traffic).
+                    K8_ptr = Kc8 + l * total_keys * HD
+                    V8_ptr = Vc8 + l * total_keys * HD
+                    rc = fvk_fp4.attn_mqa_s16_fp8kv_fp4out(
+                        attn_out, K8_ptr, V8_ptr, attn_ws, ctx_fp4, ctx_sfa,
+                        S, total_keys, NH, HD, attn_scale, stream, attn_mqa_variant)
+                    if rc != 0:
+                        raise RuntimeError(
+                            f"Pi0.5 decoder FP4 FP8-KV attention layer {l} "
+                            f"failed rc={rc}")
+                elif attn_mqa:
+                    # One kernel: QK^T, softmax, PV over the shared KV head with
+                    # the split merge and the NVFP4 quantize fused (replaces the
+                    # cuBLAS chain + quantize launch).
+                    K_ptr = Kc + l * total_keys * HD * 2
+                    V_ptr = Vc + l * total_keys * HD * 2
+                    rc = fvk_fp4.attn_mqa_s16_fp4out(
+                        attn_out, K_ptr, V_ptr, attn_ws, ctx_fp4, ctx_sfa,
+                        S, total_keys, NH, HD, attn_scale, stream)
+                    if rc != 0:
+                        raise RuntimeError(
+                            f"Pi0.5 decoder FP4 MQA attention layer {l} "
+                            f"failed rc={rc}")
+                else:
+                    if attn is not None:
+                        attn.run("decoder", l, q_seq=S, kv_seq=total_keys,
+                                 stream=stream)
+                    else:
+                        K_ptr = Kc + l * total_keys * HD * 2
+                        V_ptr = Vc + l * total_keys * HD * 2
+                        fvk.attention_qkv_fp16(
+                            ctx, attn_out, K_ptr, V_ptr, logits, attn_out,
+                            S, total_keys, NH, HD, attn_scale, stream)
+
+                    if act_e0m3:
+                        rc = fvk_fp4.quantize_e0m3_dynamic_sfa_fp16_vec(
+                            attn_out, ctx_fp4, ctx_sfa, S, NH * HD, False, rht,
+                            stream)
+                    elif dec_rowops_quant and (dec_rowops_v5 & 4):
+                        rc = fvk_fp4.rowops_quantize_fp4_sfa_v5(
+                            attn_out, ctx_fp4, ctx_sfa, S, NH * HD, stream)
+                    elif dec_rowops_quant:
+                        rc = fvk_fp4.rowops_quantize_fp4_sfa_v2(
+                            attn_out, ctx_fp4, ctx_sfa, S, NH * HD, stream)
+                    else:
+                        rc = fvk_fp4.quantize_fp4_dynamic_sfa_fp16_vec(
+                            attn_out, ctx_fp4, ctx_sfa, S, NH * HD, False, stream)
+                    if rc != 0:
+                        raise RuntimeError(
+                            f"Pi0.5 decoder FP4 O activation layer {l} failed "
+                            f"rc={rc}")
+            if dec_seq:
+                # One persistent launch: O (gated residual into x, row ssq
+                # partials) -> private AdaRMS -> gate_up (GeGLU compact store,
+                # activations from the cluster slots) -> down (gated residual)
+                # -> private AdaRMS -> next layer's qkv. The gate of each
+                # residual add is read straight from the previous AdaRMS
+                # style rows.
+                last = (l == layers - 1)
+                gate_pitch = 3 * D
+                pp = 16 * (D // 2)
+                sp = 128 * (D // 16)
+                none_ph = (0,) * 14
+                none_epi = (0,) * 8
+                probs = [
+                    (ctx_fp4, ctx_sfa, weights['ow_fp4'][l],
+                     weights['ow_sfb'][l], x, S, D, NH * HD, 1.0, 0.0),
+                    (seq_slot_packed, seq_slot_sfa, weights['gwil_fp4'][l],
+                     weights['gwil_sfb'][l], seq_gu_dummy, S, H * 2, D,
+                     1.0, 0.0),
+                    (hid_fp4, hid_sfa, weights['dw_fp4'][l],
+                     weights['dw_sfb'][l], x, S, D, H, 1.0, 0.0),
+                ]
+                phases = [
+                    (3, 0, 0, sf_ptr, 0, 0, 0, S, D, seq_partials,
+                     seq_slot_packed, seq_slot_sfa, pp, sp),
+                    none_ph,
+                ]
+                epi = [
+                    (2, 0, 0, x, sa_ptr + 2 * D * 2, D, gate_pitch,
+                     seq_partials),
+                    (1, hid_fp4, hid_sfa, 0, 0, 0, 0, 0),
+                    (2, 0, 0, x, sf_ptr + 2 * D * 2, D, gate_pitch,
+                     seq_partials),
+                ]
+                bpriv = [(0, 0), (1, seq_slots), (0, 0)]
+                if not last:
+                    si_next = (s * layers + l + 1) * S * D3
+                    sa_next_ptr = sa + si_next * 2
+                    probs.append(
+                        (seq_slot_packed, seq_slot_sfa, weights['qw_fp4'][l + 1],
+                         weights['qw_sfb'][l + 1], qkv, S, 2560, D, 1.0, 0.0))
+                    phases.append(
+                        (3, 0, 0, sa_next_ptr, 0, 0, 0, S, D, seq_partials,
+                         seq_slot_packed, seq_slot_sfa, pp, sp))
+                    phases.append(none_ph)
+                    epi.append(none_epi)
+                    bpriv.append((1, seq_slots))
+                else:
+                    phases.append(none_ph)
+                rc, grid = fvk_fp4.cutlass_fp4_gemm_seq(
+                    probs, seq_counter, stream, seq_variant, 0, phases, epi,
+                    bpriv)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 sequence layer {l} failed rc={rc}")
+                if grid[0] * grid[1] * grid[2] != 2 * seq_slots:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 sequence grid {grid} does not "
+                        f"match {seq_slots} activation slots")
+                continue
+            if dec_phase:
+                # O GEMM whose launch also carries the gated residual + AdaRMS
+                # + quantize (extra CTAs run it once the GEMM CTAs stored), so
+                # gate_up launches at this kernel's trigger.
+                rc = fvk_fp4.cutlass_fp4_gemm_phase(
+                    ctx_fp4, ctx_sfa, weights['ow_fp4'][l], weights['ow_sfb'][l], fg,
+                    S, D, NH * HD, 1.0, 0.0, stream, phase_counters, 1, phase_npc,
+                    (fg, gate, x, sf_ptr, xn_fp4, xn_sfa, gate, S, D))
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 O+phase layer {l} failed rc={rc}")
             else:
-                fvk_fp4.pi05_gate_res_adarms_fp4_sfa_native_fp16(
-                    fg, gate, x, sf_ptr, xn_fp4, xn_sfa, gate, S, D, stream)
+                if l2_touch and l2_touch_ahead == 1 and l2_touch_fork == 1:
+                    # Fork after the attention chain: its KV-cache cold reads go first, then the pump.
+                    ln = l + 1 if l + 1 < layers else (0 if s + 1 < steps else -1)
+                    l2_touch_launch(l2_touch_regions(s, ln) if ln >= 0 else [], f"layer {l} (post-attn)")
+                rc = dec_gemm(
+                    variant_o, ctx_fp4, ctx_sfa,
+                    weights['ow_fp4'][l], weights['ow_sfb'][l], fg,
+                    S, D, NH * HD, 1.0, 0.0, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 O layer {l} failed rc={rc}")
+
+                if act_e0m3:
+                    fvk_fp4.pi05_gate_res_adarms_e0m3_sfa_fp16(
+                        fg, gate, x, sf_ptr, xn_fp4, xn_sfa, gate, S, D, rht,
+                        stream)
+                else:
+                    fvk_fp4.pi05_gate_res_adarms_fp4_sfa_native_fp16(
+                        fg, gate, x, sf_ptr, xn_fp4, xn_sfa, gate, S, D, stream)
+            if l2_touch and l2_touch_ahead == 1 and l2_touch_fork == 2 and not dec_seq:
+                ln = l + 1 if l + 1 < layers else (0 if s + 1 < steps else -1)
+                l2_touch_launch(l2_touch_regions(s, ln) if ln >= 0 else [], f"layer {l} (post-O)")
             if fused_geglu and not act_e0m3:
                 # One interleaved GeGLU GEMM: the epilogue computes
                 # gelu(gate)*up per column pair and writes the Down input
                 # (hid_fp4/hid_sfa) directly; the gate_up fp16 output and
                 # the GeGLU-quantize kernel disappear.
-                rc = fvk_fp4.cutlass_fp4_gemm_geglu_il_hw_v10(
-                    xn_fp4, xn_sfa,
-                    weights['gwil_fp4'][l], weights['gwil_sfb'][l],
-                    weights['gu_dummy'], hid_fp4, hid_sfa,
-                    S, H * 2, D, stream)
+                geglu_v10 = (fvk_fp4.cutlass_fp4_gemm_geglu_il_hw_nod_v10
+                             if fused_geglu_nod
+                             else fvk_fp4.cutlass_fp4_gemm_geglu_il_hw_v10)
+                if fused_geglu_swap:
+                    # Operand-swapped 2-SM form with the early weight stream.
+                    geglu_v10 = fvk_fp4.cutlass_fp4_gemm_geglu_il_hw_nod_swap
+                if fused_geglu_swap_persist:
+                    # ... on the static persistent tile scheduler.
+                    geglu_v10 = fvk_fp4.cutlass_fp4_gemm_geglu_il_hw_nod_swap_persist
+                if fused_geglu_swap_stages:
+                    # ... with a smaller mainloop ring so several CTAs share an SM.
+                    def geglu_v10(*a, _st=fused_geglu_swap_stages):
+                        return fvk_fp4.cutlass_fp4_gemm_geglu_il_hw_nod_swap_stages(*a[:-1], _st, a[-1])
+                if dec_ares & 1:
+                    rc = fvk_fp4.pi05_dec_ares_geglu(
+                        xn_fp4, xn_sfa,
+                        weights['gwil_fp4'][l], weights['gwil_sfb'][l],
+                        hid_fp4, hid_sfa, S, H * 2, D, stream, 1 | (dec_ares & 2) | (((s * layers + l) & 511) << 8))
+                elif fused_geglu_earlyb and fused_geglu_nod and not fused_geglu_swap:
+                    # v10 tile with the weight k-tiles streamed before the PDL wait.
+                    rc = fvk_fp4.cutlass_fp4_gemm_geglu_il_hw_nod_v10_earlyb(
+                        xn_fp4, xn_sfa,
+                        weights['gwil_fp4'][l], weights['gwil_sfb'][l],
+                        weights['gu_dummy'], hid_fp4, hid_sfa,
+                        S, H * 2, D, stream, fused_geglu_earlyb)
+                else:
+                    rc = geglu_v10(
+                        xn_fp4, xn_sfa,
+                        weights['gwil_fp4'][l], weights['gwil_sfb'][l],
+                        weights['gu_dummy'], hid_fp4, hid_sfa,
+                        S, H * 2, D, stream)
                 if rc != 0:
                     raise RuntimeError(
                         f"Pi0.5 decoder fused GeGLU layer {l} failed "
@@ -457,35 +751,85 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
                 if rc != 0:
                     raise RuntimeError(
                         f"Pi0.5 decoder FP4 GeGLU layer {l} failed rc={rc}")
-            rc = dec_gemm(
-                variant_down, hid_fp4, hid_sfa,
-                weights['dw_fp4'][l], weights['dw_sfb'][l], fg,
-                S, D, H, 1.0, 0.0, stream)
-            if rc != 0:
-                raise RuntimeError(
-                    f"Pi0.5 decoder FP4 down layer {l} failed rc={rc}")
-
-            if l < layers - 1:
-                si_next = (s * layers + l + 1) * S * D3
-                sa_next_ptr = sa + si_next * 2
-                if act_e0m3:
-                    fvk_fp4.pi05_gate_res_adarms_e0m3_sfa_fp16(
-                        fg, gate, x, sa_next_ptr,
-                        xn_fp4, xn_sfa, gate, S, D, rht, stream)
+            if dec_phase:
+                # down GEMM + (next layer's) gated residual + AdaRMS + quantize
+                # in one launch; the last layer carries the plain gated residual.
+                if l < layers - 1:
+                    si_next = (s * layers + l + 1) * S * D3
+                    sa_next_ptr = sa + si_next * 2
+                    ph = (1, (fg, gate, x, sa_next_ptr, xn_fp4, xn_sfa, gate, S, D))
                 else:
-                    fvk_fp4.pi05_gate_res_adarms_fp4_sfa_native_fp16(
-                        fg, gate, x, sa_next_ptr,
-                        xn_fp4, xn_sfa, gate, S, D, stream)
+                    ph = (2, (fg, gate, x, 0, 0, 0, 0, S, D))
+                rc = fvk_fp4.cutlass_fp4_gemm_phase(
+                    hid_fp4, hid_sfa, weights['dw_fp4'][l], weights['dw_sfb'][l], fg,
+                    S, D, H, 1.0, 0.0, stream, phase_counters + 16, ph[0], phase_npc,
+                    ph[1])
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 down+phase layer {l} failed rc={rc}")
             else:
-                fvk.gate_res_fp16(fg, gate, x, S * D, stream)
+                if l2_touch and l2_touch_ahead == 1 and l2_touch_fork == 3:
+                    ln = l + 1 if l + 1 < layers else (0 if s + 1 < steps else -1)
+                    l2_touch_launch(l2_touch_regions(s, ln) if ln >= 0 else [], f"layer {l} (pre-down)")
+                if l2_touch and l2_touch_kv_late:
+                    # KV cache of the next layer alone, late: after the weight stream, before the down GEMM.
+                    ln = l + 1 if l + 1 < layers else (0 if s + 1 < steps else -1)
+                    if ln >= 0:
+                        kvb = total_keys * HD * 2
+                        l2_touch_launch([(Kc + ln * kvb, kvb), (Vc + ln * kvb, kvb)], f"layer {l} (kv late)")
+                rc = dec_gemm(
+                    variant_down, hid_fp4, hid_sfa,
+                    weights['dw_fp4'][l], weights['dw_sfb'][l], fg,
+                    S, D, H, 1.0, 0.0, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 down layer {l} failed rc={rc}")
+                if l2_touch and l2_touch_ahead == 2:
+                    # Two layers ahead, forked once this layer's weights are consumed: the side
+                    # stream never idles and at most two layers of weights are in flight in L2.
+                    if l + 2 < layers:
+                        ln, sn = l + 2, s
+                    elif s + 1 < steps:
+                        ln, sn = l + 2 - layers, s + 1
+                    else:
+                        ln, sn = -1, s
+                    if s == 0 and l == 0:
+                        # frame start: layer 1 has nobody to warm it
+                        l2_touch_launch(l2_touch_regions(0, 1), "layer 1 (frame start)")
+                    l2_touch_launch(l2_touch_regions(sn, ln) if ln >= 0 else [], f"layer {l} (+2)")
+
+                if l < layers - 1:
+                    si_next = (s * layers + l + 1) * S * D3
+                    sa_next_ptr = sa + si_next * 2
+                    if act_e0m3:
+                        fvk_fp4.pi05_gate_res_adarms_e0m3_sfa_fp16(
+                            fg, gate, x, sa_next_ptr,
+                            xn_fp4, xn_sfa, gate, S, D, rht, stream)
+                    else:
+                        fvk_fp4.pi05_gate_res_adarms_fp4_sfa_native_fp16(
+                            fg, gate, x, sa_next_ptr,
+                            xn_fp4, xn_sfa, gate, S, D, stream)
+                else:
+                    fvk.gate_res_fp16(fg, gate, x, S * D, stream)
 
         fi = s * S * D3
         fs_ptr = fs + fi * 2
-        fvk.adarms_fp16(x, fs_ptr, xn, gate, S, D, stream)
-        _action_update_fp16(
-            ctx, fvk, xn, aow, aob, noise, S, 32, D,
-            stream, dt, action_f32, aob_dt)
+        if action_fused and dt is not None and action_f32 is not None:
+            rc = fvk_fp4.pi05_adarms_action_out_fp16(
+                x, fs_ptr, xn, gate, aow, aob, noise, S, D, 32, float(dt), stream)
+            if rc != 0:
+                raise RuntimeError(f"Pi0.5 decoder FP4 action_out step {s} failed rc={rc}")
+        else:
+            fvk.adarms_fp16(x, fs_ptr, xn, gate, S, D, stream)
+            _action_update_fp16(
+                ctx, fvk, xn, aow, aob, noise, S, 32, D,
+                stream, dt, action_f32, aob_dt)
         _copy_rtc_prefix(bufs, dims, stream, rtc_prefix_len)
+    if l2_touch:
+        rc = fvk_fp4.l2_touch_join(stream)
+        if rc != 0:
+            raise RuntimeError(f"Pi0.5 decoder FP4 l2_touch join failed rc={rc}")
+
 
 
 # ══════════════════════════════════════════════════════════════════

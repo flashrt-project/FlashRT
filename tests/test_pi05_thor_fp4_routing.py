@@ -111,6 +111,9 @@ def _install_stub_frontends(monkeypatch):
     ):
         module = types.ModuleType(mod_name)
         setattr(module, cls_name, _make_stub(cls_name, params))
+        if cls_name == "Pi05TorchFrontendThorFP4":
+            setattr(module, "Pi05TorchFrontendThorFP4Optimized",
+                    _make_stub("Pi05TorchFrontendThorFP4Optimized", params))
         monkeypatch.setitem(sys.modules, mod_name, module)
 
 
@@ -203,7 +206,7 @@ def test_published_tier_matches_the_benchmark_preset(monkeypatch):
     """
     name, kwargs = _built(
         monkeypatch, use_fp4=True, use_fp4_decoder=True, use_fa4=True)
-    assert name == "Pi05TorchFrontendThorFP4"
+    assert name == "Pi05TorchFrontendThorFP4Optimized"
     expected = {
         "use_fp4_encoder_ffn": True,
         "fp4_layers": tuple(range(PRESET["encoder_fp4_layer_count"])),

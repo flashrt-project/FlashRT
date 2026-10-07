@@ -2325,3 +2325,39 @@ if(JAX_FFI_DETECT_RESULT EQUAL 0
 else()
   message(STATUS "JAX FFI: SKIPPED (jax.ffi not importable or ffi.h missing)")
 endif()
+
+# Optional Pi0.5 Thor lowering. Shared kernels and other hardware stay unchanged.
+option(FLASHRT_ENABLE_PI05_THOR "Build optimized Pi0.5 SM110 kernels" OFF)
+if(FLASHRT_ENABLE_PI05_THOR)
+  if(NOT GPU_ARCH STREQUAL "110" OR NOT ENABLE_SM100_CUTLASS)
+    message(FATAL_ERROR "FLASHRT_ENABLE_PI05_THOR requires GPU_ARCH=110 and SM100 CUTLASS")
+  endif()
+  add_library(pi05_thor_obj OBJECT
+    csrc/kernels/pi05/thor/pi05_rowops.cu
+    csrc/kernels/pi05/thor/pi05_rowops_swizzled.cu
+    csrc/kernels/pi05/thor/l2_prefetch.cu
+    csrc/kernels/pi05/thor/pi05_quantize_fp8.cu
+    csrc/kernels/pi05/thor/pi05_gemm_fp8.cu
+    csrc/kernels/pi05/thor/pi05_rope.cu
+    csrc/kernels/pi05/thor/pi05_norm_fp4.cu
+    csrc/kernels/pi05/thor/pdl.cu
+    csrc/kernels/pi05/thor/pi05_action_edges.cu
+    csrc/kernels/pi05/thor/attn_lt.cu
+    csrc/kernels/pi05/thor/cutlass_fp4_gemm_variants.cu
+    csrc/kernels/pi05/thor/cutlass_fp4_gemm_variants_earlyb.cu
+    csrc/kernels/pi05/thor/cutlass_fp4_gemm_variants_swapenc.cu
+    csrc/kernels/pi05/thor/cutlass_fp4_gemm_geglu_il_sm100.cu
+    csrc/kernels/pi05/thor/cutlass_fp4_gemm_geglu_il_swap_sm100.cu
+    csrc/kernels/pi05/thor/cutlass_fp4_gemm_siglip_ffn_variants_sm100.cu
+    csrc/kernels/pi05/thor/patch_embed.cu
+)
+  set_target_properties(pi05_thor_obj PROPERTIES CUDA_STANDARD 17 POSITION_INDEPENDENT_CODE ON CUDA_VISIBILITY_PRESET hidden CXX_VISIBILITY_PRESET hidden)
+  target_include_directories(pi05_thor_obj PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/csrc ${CUTLASS_INCLUDE} ${CUTLASS_DIR}/tools/util/include)
+  target_compile_options(pi05_thor_obj PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -O3 --use_fast_math ${GPU_GENCODE}>)
+  target_compile_definitions(pi05_thor_obj PRIVATE CUTLASS_ARCH_MMA_SM100_SUPPORTED=1 CUTLASS_ENABLE_GDC_FOR_SM100=1)
+  pybind11_add_module(flash_rt_pi05_thor csrc/kernels/pi05/thor/pi05_bindings.cpp)
+  target_sources(flash_rt_pi05_thor PRIVATE $<TARGET_OBJECTS:pi05_thor_obj>)
+  target_include_directories(flash_rt_pi05_thor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/csrc)
+  target_link_libraries(flash_rt_pi05_thor PRIVATE CUDA::cudart CUDA::cublasLt)
+  set_target_properties(flash_rt_pi05_thor PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+endif()

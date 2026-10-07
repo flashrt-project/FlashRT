@@ -677,6 +677,12 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
             self.fp16_nn(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, to_stream(stream));
         }, py::arg("A"), py::arg("B"), py::arg("D"),
            py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0)
+        .def("fp16_nn_bias", [](GemmRunner& self,
+                                 uintptr_t A, uintptr_t B, uintptr_t D, uintptr_t bias,
+                                 int M, int N, int K, uintptr_t stream) {
+            self.fp16_nn_bias(to_ptr(A), to_ptr(B), to_ptr(D), to_ptr(bias), M, N, K, to_stream(stream));
+        }, py::arg("A"), py::arg("B"), py::arg("D"), py::arg("bias"),
+           py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0)
         .def("bf16_nn", [](GemmRunner& self,
                             uintptr_t A, uintptr_t B, uintptr_t D,
                             int M, int N, int K, uintptr_t stream) {

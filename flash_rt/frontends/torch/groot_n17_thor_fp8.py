@@ -105,7 +105,8 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
             ckpt_hash = _checkpoint_hash(self.checkpoint_path)
         except Exception:
             return None
-        cache_path = CACHE_DIR / f"{ckpt_hash}_n17_Se{self.Se}.json"
+        observation=getattr(self,'_calibration_input_digest','legacy')
+        cache_path = CACHE_DIR / f"{ckpt_hash}_n17_Se{self.Se}_{observation}.json"
         if not cache_path.exists():
             return None
         try:
@@ -115,6 +116,7 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
             return None
         if data.get("ckpt_hash") != ckpt_hash:
             return None
+        if data.get('calibration_input_digest')!=observation:return None
         if int(data.get("Se", -1)) != int(self.Se):
             return None
         if int(data.get("embodiment_id", -1)) != int(self._embodiment_id):
@@ -178,6 +180,14 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
         device = self.device
         self._prompt = prompt
         self.Se = int(aux["llm_input_embeds"].shape[1])
+        # Cache identity includes the actual calibration observation and prompt.
+        import hashlib
+        digest=hashlib.sha256()
+        for key in ('pixel_features','llm_input_embeds','grid_thw','visual_pos_masks','rope_cos','rope_sin'):
+            value=aux[key].detach().cpu().contiguous()
+            digest.update(key.encode()+str(value.dtype).encode()+str(tuple(value.shape)).encode())
+            digest.update(value.view(torch.uint8).numpy().tobytes())
+        self._calibration_input_digest=digest.hexdigest()
         self._mrope_cos = aux["rope_cos"][0].to(device).half().contiguous()
         self._mrope_sin = aux["rope_sin"][0].to(device).half().contiguous()
         grid_thw = [tuple(int(x) for x in row) for row in aux["grid_thw"].tolist()]

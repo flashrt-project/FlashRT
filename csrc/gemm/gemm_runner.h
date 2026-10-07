@@ -71,6 +71,10 @@ public:
                   cudaStream_t stream = 0);
 
     // BF16: D = A(M,K) @ B(K,N)  (row-major, no transpose)
+    // FP16 GEMM with a fused per-column bias epilogue.
+    void fp16_nn_bias(void* A, void* B, void* D, void* bias,
+                      int M, int N, int K, cudaStream_t stream);
+
     void bf16_nn(void* A, void* B, void* D,
                  int M, int N, int K,
                  cudaStream_t stream = 0);

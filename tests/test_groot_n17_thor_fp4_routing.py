@@ -116,3 +116,21 @@ def test_default_still_selects_the_fp8_frontend(monkeypatch):
     model = _load(monkeypatch)
     inner = getattr(model, "_pipe", model)
     assert type(inner)._stub_name == "GrootN17TorchFrontendThorFP8"
+
+
+def test_inherited_libero_options_reach_fp4_frontend(monkeypatch):
+    """Forwarding subclasses must retain the base's embodiment selection."""
+    class Base:
+        def __init__(self, checkpoint, num_views=2, embodiment_tag="new_embodiment", autotune=False):
+            self.kwargs = dict(num_views=num_views, embodiment_tag=embodiment_tag, autotune=autotune)
+
+    class Forwarding(Base):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+
+    module = types.ModuleType("flash_rt.frontends.torch.groot_n17_thor_fp4")
+    module.GrootN17TorchFrontendThorFP4 = Forwarding
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    _stub_fp4_extension(monkeypatch, available=True)
+    model = _load(monkeypatch, use_fp4=True, num_views=1, embodiment_tag="libero_sim", autotune=True)
+    assert model.pipeline.kwargs == dict(num_views=1, embodiment_tag="libero_sim", autotune=True)
