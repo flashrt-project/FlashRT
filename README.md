@@ -358,6 +358,8 @@ First call: ~3 s (calibration + CUDA Graph capture). Every subsequent call: 44 m
 
 ## Start here
 
+For matched Thor measurements: [comparison settings and timing boundaries](docs/thor/comparison.md).
+
 For Jetson Thor: [setup](docs/thor/README.md) · [OpenPI π0.5](docs/thor/pi05.md) · [GR00T N1.7](docs/thor/groot-n17.md) · [Docker](docs/thor/docker.md) · [accuracy results](docs/thor/results.md).
 
 | If you want to … | Read |

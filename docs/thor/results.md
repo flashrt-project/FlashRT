@@ -49,6 +49,20 @@ See [numerical evidence](../../repro/thor/evidence/cross-machine/accuracy.json) 
 
 This verifies fresh native compilation and new pinned reference installations while reusing existing immutable checkpoints, PyTorch/CUDA dependencies and CUTLASS source. It does not certify a fresh Docker installation on this second machine. Host dependency conflicts required isolated package/search-order adjustments; [installation scope](../../repro/thor/evidence/cross-machine/installation-scope.json) lists each exception. The [environment](../../repro/thor/evidence/cross-machine/environment.json) uses PyTorch 2.14.0+cu130, CUDA 13.0 and L4T R38.2.1. Hardware protection settings were left unchanged; EXT_POWER state was not readable without privileged access, so these latencies are verification observations rather than a certified stock-power benchmark.
 
+## GR00T raw-input validation
+
+The newly shipped GR00T validator defaults to **raw RGB/state/language → physical actions**. On each call it reruns the official processor, then FlashRT patch embedding, visual merger, backbone and action head, and physical action decoding. Prompt/grid graph setup and fixed-sample calibration are outside timing; no official model embeddings are replayed per call. The processor's patches, token IDs and grid exactly matched a freshly captured official run.
+
+| Execution | Mean cosine | EEF cosine | Joint cosine | Latency ms | Result |
+|---|---:|---:|---:|---:|---|
+| [FlashRT FP8](../../repro/thor/evidence/cross-machine/groot-raw-full-fp8.json) | 0.999835 | 0.999536 | 0.999927 | 76.74 | PASS |
+| [FlashRT FP4](../../repro/thor/evidence/cross-machine/groot-raw-full-fp4.json) | 0.999751 | 0.999868 | 0.999718 | 56.69 | PASS |
+| [Official eager PyTorch](../../repro/thor/evidence/cross-machine/groot-official-eager.json) | 1.000000 | — | — | 133.38 | Exact reference actions |
+
+All FlashRT per-modality and repeated-input gates passed. These tests use the same base 3B DROID checkpoint, two-camera/history sample, four denoising steps and 40×17 decoded physical actions. Each benchmark uses 20 warmups, 100 measured calls and GPU synchronization before and after the complete call. The eager comparator runs without capture hooks. This verifies one calibrated sample on the recorded native environment; it is not an optimized PyTorch or TensorRT benchmark.
+
+Older GR00T numbers above remain **feature-input** results, reproduced with explicit `--boundary feature`. Their approximately 29 ms excludes processor/embedding generation and physical decoding. The [comparison contract](comparison.md) explains both boundaries and the incompatible checkpoint/camera settings in the current JAL TensorRT tutorial. No JAL TensorRT speedup ratio is claimed.
+
 ## Complete public-source Docker build
 
 The full `Dockerfile.thor` build completed on Thor; `validate all` completed successfully. All four checks passed:

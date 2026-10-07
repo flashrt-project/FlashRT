@@ -49,6 +49,8 @@ Inspect `groot-fp8.json` and `groot-fp4.json` in the result directory. Checks co
 
 ## 4. State the timing boundary
 
-FlashRT's validated benchmark starts from captured post-patch features and image/text embeddings, and ends at normalized actions. It excludes raw image preprocessing, patch embedding and production of captured embeddings. Report it as a **feature-input graph benchmark**. Official reference capture includes instrumentation and is not a speed baseline; dividing these times does not measure end-to-end acceleration.
+The default check now times raw RGB, state and language through fresh official processor preprocessing, FlashRT patch embedding/visual merger/backbone/action head, and physical action decoding. Prompt/grid setup and fixed-sample calibration occur once before timing. Each timed call processes the actual raw images; it does not replay official model embeddings. The processor patches, token IDs and grid are checked against the fresh official capture.
 
-This is a fixed-sample numerical regression, not robot task success. The additional raw-patch/merger path showed larger errors and remains unresolved; its results are separate from this validated path. Expanding samples or changing preprocessing requires a new calibration and evaluation report.
+Use `--boundary feature` with `verify_groot_fixture.py` only when deliberately measuring the older post-patch-feature graph boundary. Its approximately 29 ms result excludes preprocessing and embedding generation; the newly verified complete FP4 boundary is approximately 57 ms on the second native machine. Official instrumented capture is not a speed baseline.
+
+The same-sample raw-input FP8/FP4 checks passed all physical-action and repeat gates. This is still a fixed-sample regression with calibration on that sample. Expanding samples, changing prompts/grids or preprocessing requires new setup and evaluation. See the [comparison contract](comparison.md) for the matched official eager-PyTorch measurement and why the JAL TensorRT result uses a different checkpoint/configuration.
