@@ -40,6 +40,8 @@ The [demo gallery](docs/demos.md) keeps input settings, playback rates and links
 
 **Thanks to the [Cybernetic Physics](https://cyberneticphysics.com/) team** for extending FlashRT's AMD backend from MI350X/CDNA4 to MI300X/CDNA3, including CDNA3-specific kernel optimizations. Read our joint [technical write-up](https://cyberneticphysics.com/blog/real-time-vla-inference-on-amd-hardware), or start with the [AMD deployment guide](docs/deployment_amd.md).
 
+**[EagleVLA-Edge](https://github.com/PKU-SEC-Lab/EagleVLA-Edge) from PKU-SEC-Lab** integrates a C API provider that lets FlashRT call its llama.cpp-based PI0/PI0.5 GGUF runtime directly from Python. Their work combines an onboard inference engine with EagleVLA's asynchronous robot-control framework; see their [README](https://github.com/PKU-SEC-Lab/EagleVLA-Edge#readme) for the integration and deployment details.
+
 ## News
 
 - **Oct 2026** — Thor reproduction guides now cover [OpenPI π0.5](docs/thor/pi05.md), [GR00T N1.7](docs/thor/groot-n17.md), native builds and a [Thor Docker release candidate](docs/thor/docker.md). Both models passed FP8/FP4 fixed-sample numerical checks. Public image publication and anonymous pull verification are pending.
@@ -1194,6 +1196,8 @@ headers and directory-local `VENDOR.md` files.
 
 ## Reference
 
+We implement FlashRT adapters and kernel support for the projects below; see the [integration guide](docs/integrations.md) for implementations and usage, including the community-built EagleVLA-Edge provider.
+
 [HF Kernels](https://huggingface.co/flashrt) ([source](https://github.com/flashrt-project/FlashRT-HF-kernels)) ·
 [LeRobot](https://github.com/huggingface/lerobot) ·
 [OpenPI](https://github.com/Physical-Intelligence/openpi) ·
@@ -1201,4 +1205,5 @@ headers and directory-local `VENDOR.md` files.
 [Transformers](https://github.com/huggingface/transformers) ·
 [Diffusers](https://github.com/huggingface/diffusers) ·
 [vLLM](https://github.com/vllm-project/vllm) ·
-[SGLang](https://github.com/sgl-project/sglang).
+[SGLang](https://github.com/sgl-project/sglang) ·
+[EagleVLA-Edge](https://github.com/PKU-SEC-Lab/EagleVLA-Edge).
