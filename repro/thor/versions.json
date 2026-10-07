@@ -9,5 +9,9 @@
     "repo": "nv-community/GR00T-N1.7-LIBERO",
     "revision": "e63019488858f03a929060b050ee4b4db6fa2c9f"
   },
-  "runtime_archive_sha256": "8904cee73dfee989d354de7d3da1878cfe73d744711b11641d2a2b6e7dafb033"
+  "runtime_archive_sha256": "20d99147923bff520b82299e60244660cd291ba50dfd8ec9bd14064add983da5",
+  "runtime_patches": [
+    "GR00T Thor padded attention initialization",
+    "Checkpoint-content and calibration-input cache identity"
+  ]
 }

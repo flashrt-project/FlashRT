@@ -37,6 +37,22 @@ def _checkpoint_hash(checkpoint_path: str, read_bytes: int = 65536) -> str:
     """
     p = Path(checkpoint_path)
     if p.is_dir():
+        # A shard index describes tensor layout, not weight contents. Fine-tunes
+        # with identical layouts must never share calibration scales.
+        index=p/'model.safetensors.index.json'
+        if index.exists():
+            manifest=json.loads(index.read_text())
+            names=sorted(set(manifest['weight_map'].values()))+['model.safetensors.index.json']
+            names+=sorted(name for name in ('config.json','processor_config.json','statistics.json') if (p/name).exists())
+            h=hashlib.sha256(b'flashrt-sharded-checkpoint-v2\0')
+            for name in names:
+                path=p/name
+                if not path.is_file():raise FileNotFoundError(path)
+                content=hashlib.sha256()
+                with path.open('rb') as stream:
+                    for block in iter(lambda:stream.read(8*1024*1024),b''):content.update(block)
+                h.update(name.encode()+b'\0'+content.digest())
+            return h.hexdigest()
         # Look for a hashable file in the checkpoint directory
         candidates = [
             "model.safetensors", "model.pkl", "checkpoint.pkl",

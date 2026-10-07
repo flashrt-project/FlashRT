@@ -44,7 +44,7 @@ The bundled fixture contains a real LIBERO observation. The official reference r
 
 ## 3. Read the accuracy reports
 
-Inspect `groot-fp8.json` and `groot-fp4.json`. Reports include overall and per-action-group cosine, RMSE, maximum absolute errors and repeated-input stability. Overall numerical acceptance requires mean cosine ≥0.999, worst-sample cosine ≥0.995 and repeat consistency. Strict per-group diagnostics are reported separately, including failures.
+Inspect `groot-fp8.json` and `groot-fp4.json`. Reports include overall and per-action-group cosine, RMSE, maximum absolute errors and repeated-input stability. Overall numerical acceptance requires mean cosine ≥0.999 and worst-sample cosine ≥0.995. Repeated normalized outputs use the existing cosine ≥0.9999 and maximum absolute error ≤0.05 checks; bitwise identity is also reported. Strict per-group diagnostics are reported separately, including failures.
 
 On the verified native FP4 fixture, overall cosine is **0.999825**. Rotation cosine is **0.97134**, with maximum absolute error **0.00556**; near-zero components need absolute-error interpretation as well as cosine. This is a fixed-sample numerical regression, not a robot task-success evaluation or proof that every action-group diagnostic passes. FP4 uses an FP8 backbone and NVFP4 action head.
 

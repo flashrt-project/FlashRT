@@ -385,14 +385,14 @@ def make_groot_n17_attention_spec(
     spec.add_site(
         "llm",
         num_layers=16, num_q_heads=16, num_kv_heads=16, head_dim=128,
-        max_q_seq=int(llm_seq_max), max_kv_seq=int(llm_seq_max),
+        max_q_seq=int(llm_seq_max), max_kv_seq=((int(llm_seq_max)+7)//8)*8,
         extra={"kernel": "mha", "causal": True},
     )
     # vl_self_attention — 4 layers, MHA 32x64.
     spec.add_site(
         "vl_self_attn",
         num_layers=4, num_q_heads=32, num_kv_heads=32, head_dim=64,
-        max_q_seq=int(vl_self_attn_seq_max), max_kv_seq=int(vl_self_attn_seq_max),
+        max_q_seq=int(vl_self_attn_seq_max), max_kv_seq=((int(vl_self_attn_seq_max)+7)//8)*8,
         extra={"kernel": "mha"},
     )
     # DiT self-attention — 16 layers, MHA 32x48 (1536 hidden), self-attn over sa.

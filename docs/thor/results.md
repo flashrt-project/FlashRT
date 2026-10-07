@@ -28,6 +28,19 @@ validator rather than substituting the separate optimization probe.
 The sections below retain earlier DROID/base-checkpoint and installation
 validation records. They use different inputs and timing boundaries.
 
+### Cold-start FP8 correction
+
+The Thor FP8 attention specification now covers the full padded KV stride
+when initializing the LLM and visual self-attention logits. The earlier
+unpadded initialization left tail cells undefined for non-aligned sequence
+lengths. With the targeted correction, the [fresh native FP8 check](../../repro/thor/evidence/libero/groot-fp8-native.json)
+achieved overall cosine **0.999748** and bitwise-identical repeated output.
+This keeps the original attention backend and quantization configuration.
+
+Calibration-cache identity also includes actual sharded weight contents,
+configuration/statistics and calibration inputs, so distinct fine-tunes or
+observations do not reuse scales merely because their shard-index layout matches.
+
 ## Earlier DROID and installation checks
 
 Both routes passed all four numerical checks. Docker `run-validation.sh all` returned exit code 0. Native π0.5 and GR00T checks each passed.

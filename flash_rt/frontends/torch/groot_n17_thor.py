@@ -964,10 +964,12 @@ class GrootN17TorchFrontendThor:
         except Exception:
             return  # best-effort
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        cache_path = CACHE_DIR / f"{ckpt_hash}_n17_Se{self.Se}.json"
+        observation=getattr(self,'_calibration_input_digest','legacy')
+        cache_path = CACHE_DIR / f"{ckpt_hash}_n17_Se{self.Se}_{observation}.json"
 
         payload = {
             "version": 1, "ckpt_hash": ckpt_hash, "Se": self.Se,
+            'calibration_input_digest':observation,
             "embodiment_id": self._embodiment_id,
             "vit_act_qkv": out_vit["vit_act_qkv"],
             "vit_act_o":   out_vit["vit_act_o"],
