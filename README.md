@@ -1175,20 +1175,8 @@ For research involving execution-state capsules, please also cite our paper:
 
 
 
-## Acknowledgments
+## Acknowledgment
 
-FlashRT integrations and kernel packages:
-[HF Kernels](https://huggingface.co/flashrt) ([source](https://github.com/flashrt-project/FlashRT-HF-kernels)) ·
-[LeRobot](https://github.com/huggingface/lerobot) ·
-[OpenPI](https://github.com/Physical-Intelligence/openpi) ·
-[Isaac GR00T](https://github.com/NVIDIA/Isaac-GR00T) ·
-[Transformers](https://github.com/huggingface/transformers) ·
-[Diffusers](https://github.com/huggingface/diffusers) ·
-[vLLM](https://github.com/vllm-project/vllm) ·
-[SGLang](https://github.com/sgl-project/sglang).
-
-- [Yiannis Hadjiyianni](https://github.com/yiannisha) and [Cybernetic Physics](https://cyberneticphysics.com/) — AMD MI300X porting, kernel engineering and community support.
-- [MindOn](https://www.mindon.tech/) — support for the FlashRT community and their work integrating FlashRT within the Mind-1 inference system.
 
 - [CUTLASS](https://github.com/NVIDIA/cutlass) — GEMM templates and FMHA kernels
 - [FlashAttention](https://github.com/Dao-AILab/flash-attention) — Attention backend for SM89/SM120
@@ -1197,8 +1185,20 @@ FlashRT integrations and kernel packages:
 - [OpenPI](https://github.com/Physical-Intelligence/openpi) — Reference PyTorch implementation
 - [NVIDIA Isaac GR00T](https://github.com/NVIDIA/Isaac-GR00T) — GROOT N1.6 model
 
-We thank these projects and all FlashRT contributors. Component-specific
-sources, licenses, and local changes are recorded in file headers and
-directory-local `VENDOR.md` files.
+Component-specific sources, licenses, and local changes are recorded in file
+headers and directory-local `VENDOR.md` files.
 
 [Community statement](docs/COMMUNITY_AND_CREDIT.md) (English / 中文).
+
+---
+
+## Reference
+
+[HF Kernels](https://huggingface.co/flashrt) ([source](https://github.com/flashrt-project/FlashRT-HF-kernels)) ·
+[LeRobot](https://github.com/huggingface/lerobot) ·
+[OpenPI](https://github.com/Physical-Intelligence/openpi) ·
+[Isaac GR00T](https://github.com/NVIDIA/Isaac-GR00T) ·
+[Transformers](https://github.com/huggingface/transformers) ·
+[Diffusers](https://github.com/huggingface/diffusers) ·
+[vLLM](https://github.com/vllm-project/vllm) ·
+[SGLang](https://github.com/sgl-project/sglang).
