@@ -116,13 +116,14 @@ Baseline comparisons and source methodology live in [Benchmark Comparison](docs/
 
 | Hardware | Mode | Latency | Throughput | Source |
 |---|---|---:|---:|---|
-| Jetson AGX Thor | OpenPI FP8, 2 cameras | **38.51 ms** | **26.0 Hz** | [Verified results](docs/thor/pi05.md#4-check-the-result) |
-| Jetson AGX Thor | OpenPI NVFP4 + FA4, 2 cameras | **21.21 ms** | **47.1 Hz** | [Verified results](docs/thor/pi05.md#4-check-the-result) |
+| Jetson AGX Thor | OpenPI FP8, 2 cameras | **40.71 ms** | **24.6 Hz** | [Verified results](docs/thor/pi05.md#4-check-the-result) |
+| Jetson AGX Thor | OpenPI NVFP4 + FA4, 2 cameras | **20.33 ms** | **49.2 Hz** | [Verified results](docs/thor/pi05.md#4-check-the-result) |
 | RTX 5090 | FP8, 2-view | **17.58 ms** | **57 Hz** | [Blackwell VLA](examples/blackwell/README.md#vla-latency-rtx-5090) |
 | AMD Instinct MI350X | FP8, CDNA4 | **16.4 ms** | **61 Hz** | [AMD Pi0.5](docs/deployment_amd_pi05.md) |
 
 The Thor rows use OpenPI `pi05_libero`, two cameras and 10 denoising steps.
-Action cosine against OpenPI is 0.999901 (FP8) / 0.999710 (NVFP4).
+These are steady-state medians from the public Thor image after 200 warmups and
+1,000 measured calls. Action cosine against OpenPI is 0.999905 (FP8) / 0.999707 (NVFP4).
 
 **Guide:** [Thor](docs/thor/pi05.md) · [RTX 5090](examples/blackwell/README.md) · [AMD](docs/deployment_amd_pi05.md).
 
@@ -150,19 +151,21 @@ Action cosine against OpenPI is 0.999901 (FP8) / 0.999710 (NVFP4).
 
 #### GROOT N1.7
 
-| Hardware | Mode | Model latency | Preprocessing | Complete call | Throughput | Source |
-|---|---|---:|---:|---:|---:|---|
-| Jetson AGX Thor | NVFP4 + FA4, LIBERO `libero_10`, 1 camera | **23.23 ms** | **4.61 ms** | **28.53 ms** | **43.0 Hz** (model) | [Reproduce](docs/thor/groot-n17.md) |
-| Jetson AGX Thor | NVFP4 + FA4, DROID 2-view feature graph | **29.60 ms** | — | — | **33 Hz** | — |
-| Jetson AGX Thor | FP8, DROID 2-view feature graph | **48.94 ms** | — | — | **20.4 Hz** | — |
-| RTX 5090 | FP8, 2-view base, full graph | **16.6 ms** | — | — | **60 Hz** | [GROOT N1.7 API](#groot-n17-rtx) |
-| AMD Instinct MI350X | FP8 backbone + BF16 DiT, full frame | **16.0 ms** | — | — | **62 Hz** | [AMD deployment](docs/deployment_amd.md) |
+| Hardware | Mode | Latency | Throughput | Source |
+|---|---|---:|---:|---|
+| Jetson AGX Thor | NVFP4 + FA4, LIBERO `libero_10`, 1 camera | **23.23 ms** | **43.0 Hz** | [Reproduce](docs/thor/groot-n17.md) |
+| Jetson AGX Thor | NVFP4 + FA4, DROID 2-view feature graph | **29.60 ms** | **33 Hz** | — |
+| Jetson AGX Thor | FP8, DROID 2-view feature graph | **48.94 ms** | **20.4 Hz** | — |
+| RTX 5090 | FP8, 2-view base, full graph | **16.6 ms** | **60 Hz** | [GROOT N1.7 API](#groot-n17-rtx) |
+| AMD Instinct MI350X | FP8 backbone + BF16 DiT, full frame | **16.0 ms** | **62 Hz** | [AMD deployment](docs/deployment_amd.md) |
 
-The LIBERO row uses four denoising steps, batch 1 and two CPU threads. Model
-latency includes input transfer, backbone and action head; the complete call
-also includes fresh preprocessing and physical-action decoding. Values are
-directly measured native medians. The older DROID feature-graph rows exclude
-image/text embedding generation and physical decoding.
+The LIBERO row uses four denoising steps, batch 1 and two CPU threads. Latency
+includes input transfer, backbone and action head, measured as native medians.
+The older DROID feature-graph rows exclude image/text embedding generation and
+physical decoding.
+
+**Preprocessing:** approximately 4 ms per frame with the official GR00T processor
+and `--cpu-threads 2`, measured separately from model inference.
 
 **Guide:** [Thor](docs/thor/groot-n17.md) · [RTX 5090](#groot-n17-rtx) · [AMD](docs/deployment_amd.md).
 

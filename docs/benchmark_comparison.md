@@ -20,8 +20,9 @@ NVIDIA's [current OpenPI tutorial](https://www.jetson-ai-lab.com/tutorials/openp
 (checked October 7, 2026) uses `pi05_libero`, JetPack 7.2 MAXN, and 10 denoising
 steps. The rows above are total latency; model-only latency is approximately
 128 / 53 / 48 ms for BF16 / FP8 / FP8+NVFP4 respectively.
-FlashRT's newly verified two-camera OpenPI rows are **38.51 ms FP8** and
-**21.21 ms NVFP4**, both median observation-to-physical-action latency; see
+FlashRT's newly verified two-camera OpenPI rows are **40.71 ms FP8** and
+**20.33 ms NVFP4**, both median observation-to-physical-action latency in the
+public Thor image after 200 warmups and 1,000 measured calls; see
 [the run guide and numerical checks](thor/pi05.md#4-check-the-result). The published NVIDIA
 results and our verification run use different timing protocols and device
 states, so no cross-harness speedup is reported.
