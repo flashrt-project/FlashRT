@@ -9,13 +9,13 @@ Two Dockerfiles ship with the repo:
 | Hardware | Dockerfile | NGC base |
 |----------|------------|----------|
 | RTX 5090 / 4090 / 3090 / Ampere (x86_64)    | [`Dockerfile`](Dockerfile)         | `nvcr.io/nvidia/pytorch:25.10-py3` |
-| Jetson AGX Thor (SM110, aarch64)            | [`Dockerfile.thor`](Dockerfile.thor) | `nvcr.io/nvidia/pytorch:25.09-py3` (arm64 manifest) |
+| Jetson AGX Thor (SM110, aarch64)            | [`Dockerfile.thor`](Dockerfile.thor) | `nvcr.io/nvidia/pytorch:26.05-py3` (arm64 manifest) |
 
 Thor uses a hand-tuned cuBLAS-decomposed attention path
 (`csrc/attention/fmha_dispatch.cu`) instead of the vendored
 Flash-Attention 2, so its image deliberately does NOT produce
 `flash_rt_fa2.so`. Everything else builds the same way. Skip to
-[§4](#4-thor-jetson-agx-thor-sm110-aarch64) for the Thor flow.
+[Thor](#thor) for the Thor flow.
 
 ---
 
@@ -154,76 +154,43 @@ docker run --rm --gpus all flashrt:dev \
 
 ---
 
-## 4. Thor (Jetson AGX Thor, SM110, aarch64)
+<a id="thor"></a>
+## 4. Thor
 
-The Thor image uses a separate Dockerfile, [`Dockerfile.thor`](Dockerfile.thor),
-because Thor pulls a different NGC manifest (`linux/arm64`) and skips
-the FA2 build (Thor has its own attention path). Build on a Thor
-host so `nvidia-smi` auto-detects `sm_110a`:
+The official image contains FlashRT compiled from this repository, plus separate
+OpenPI and GR00T reference environments. Checkpoints are mounted from the host.
 
 ```bash
-# On the Thor host
-docker build -t flashrt:thor -f docker/Dockerfile.thor .
-
-# Run (note --runtime=nvidia for Jetson — see below for why)
-docker run --rm --gpus all -it --runtime=nvidia flashrt:thor
+docker pull ghcr.io/flashrt-project/flashrt-thor:thor-v0.2.0
+mkdir -p models results
+docker run --rm -it --runtime=nvidia --gpus all --network=host --shm-size=8g \
+  -v "$PWD/models:/models" -v "$PWD/results:/results" \
+  ghcr.io/flashrt-project/flashrt-thor:thor-v0.2.0
 ```
 
-### Why `--runtime=nvidia` on Jetson
+Inside the container, the source is in `/opt/FlashRT` and reference environments
+are in `/opt/reference`. Follow the complete model tutorials for weight preparation,
+inference, accuracy checks and expected results:
 
-Unlike a discrete-GPU host (where `--gpus all` alone is enough — the
-libnvidia-container shim auto-discovers `/dev/nvidia*` and the
-matching driver libs), Jetson's iGPU stack is bound to host kernel
-drivers and is exposed to containers through a **CSV-driven
-mount mechanism** owned by `nvidia-container-runtime`:
+- [OpenPI π0.5](../docs/thor/pi05.md)
+- [GR00T N1.7 LIBERO](../docs/thor/groot-n17.md)
 
+To build the same runtime directly from your checkout on a Thor host:
+
+```bash
+docker build -f docker/Dockerfile.thor -t flashrt:thor \
+  --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" --build-arg BUILD_JOBS=2 .
+docker run --rm --runtime=nvidia --gpus all flashrt:thor \
+  python -c "from flash_rt import flash_rt_kernels, flash_rt_fp4, flash_rt_pi05_thor; print('Thor build OK')"
 ```
-/etc/nvidia-container-runtime/host-files-for-container.d/
-├── devices.csv     # /dev/nvgpu, /dev/nvhost-*, /dev/nvmap, …
-└── drivers.csv     # /usr/lib/aarch64-linux-gnu/tegra/libcuda.so.*, …
-```
 
-Passing `--runtime=nvidia` is what activates that runtime, which in
-turn parses the two CSV files at container start and bind-mounts
-every listed device node and driver library from the Tegra host
-into the container. Without the flag the standard runc starts the
-container without those mounts; the result is no `/dev/nvgpu`, no
-`libcuda.so`, and `torch.cuda.is_available()` returns `False` even
-though `nvidia-smi` works on the host.
+Use `--build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple` when
+needed. `--runtime=nvidia` enables the Jetson driver mounts. This image builds
+SM110 kernels and the optional Pi0.5 Thor optimization target; it does not build
+Flash Attention 2. Source compilation and Docker run the same example scripts.
 
-`--gpus all` is left in the example for parity with the x86 docs and
-because the libnvidia-container CLI hook ignores it gracefully on
-Jetson, but the load-bearing flag here is `--runtime=nvidia`.
-
-### What's different vs the x86 image
-
-- **Base**: `nvcr.io/nvidia/pytorch:25.09-py3` (one minor older than the
-  x86 image — 25.09 has the validated arm64 / Thor manifest, 25.10
-  arm64 has not been smoke-tested on SM110 yet).
-- **Build targets**: 4 `.so` files (`flash_rt_kernels`,
-  `flash_rt_fp4`, `libfmha_fp16_strided`, `flash_rt_jax_ffi`).
-  Same artifact count as the default x86 build but with
-  `libfmha_fp16_strided` swapped in for `flash_rt_fa2`.
-- **No `flash_rt_fa2.so`**: Thor's `csrc/attention/fmha_dispatch.cu`
-  loads `libfmha_fp16_strided.so` at runtime via dlopen instead of
-  going through the FA2 template instantiation pass — that's the
-  largest cold-build saving on Thor vs x86.
-- **`flash_rt_fp4.so` on Thor**: built for sm_110a, but NVFP4 GEMM
-  paths gate to sm_120 only at runtime
-  (see [`docs/kernel_catalog.md`](../docs/kernel_catalog.md), the
-  `quantize_bf16_to_nvfp4` and `has_nvfp4()` entries). The kernel
-  object compiles fine on Thor; calls into NVFP4-only entry points
-  short-circuit when `has_nvfp4()` returns False.
-
-### Build args
-
-Same as the x86 image (`GPU_ARCH`, `CUTLASS_REF`), minus `FA2_HDIMS`
-which is a no-op on Thor.
-
-### Smoke check
-
-The image-build smoke deliberately asserts `libfmha_fp16_strided.so`
-is present and does NOT import `flash_rt_fa2`, so a future regression
-that reintroduces FA2 onto Thor by accident gets caught at build
-time.
-
+The tokenizer defaults to Google's official URL. If you already have it, reuse
+it while building with `--build-context tokenizer_cache=/path/to/tokenizer-directory`
+(the directory must contain `paligemma_tokenizer.model`).
+Only if the official URL is unavailable, add
+`--build-arg TOKENIZER_URL=https://modelscope.cn/models/AI-ModelScope/paligemma-3b-mix-448/resolve/master/tokenizer.model`.
