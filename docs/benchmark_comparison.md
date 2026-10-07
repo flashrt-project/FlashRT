@@ -92,9 +92,9 @@ JetPack 7.2 MAXN.
 | TensorRT optimized mixed NVFP4 | 13.6 ms | 17.2 ms | ~40 ms | 25.1 Hz |
 
 Our current reproduction uses **GR00T-N1.7-LIBERO/libero_10, one camera,
-four denoising steps and batch 1**. The public native validator measures
-**24.09 ms model inference**, **4.68 ms preprocessing** and **29.45 ms complete
-RGB-to-physical-action call**, with overall action cosine **0.999825**.
+four denoising steps and batch 1**. The release-container validator measures
+**24.26 ms model inference**, **3.25 ms preprocessing** and **27.89 ms complete
+RGB-to-physical-action call**, with overall action cosine **0.999694**.
 Strict per-group diagnostics and absolute errors are included in
 [results and reproduction](thor/groot-n17.md).
 

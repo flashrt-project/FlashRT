@@ -156,7 +156,7 @@ See [LIBERO settings and API comparison](docs/thor/pi05.md#4-match-the-libero-se
 
 | Hardware | Mode | Model latency | Preprocessing | Complete call | Throughput | Source |
 |---|---|---:|---:|---:|---:|---|
-| Jetson AGX Thor | NVFP4 + FA4, LIBERO `libero_10`, 1 camera | **24.09 ms** | **4.68 ms** | **29.45 ms** | **41.5 Hz** (model) | [Reproduce](docs/thor/groot-n17.md) · [Results](docs/thor/results.md#libero-one-camera) |
+| Jetson AGX Thor | NVFP4 + FA4, LIBERO `libero_10`, 1 camera | **24.26 ms** | **3.25 ms** | **27.89 ms** | **41.2 Hz** (model) | [Reproduce](docs/thor/groot-n17.md) · [Results](docs/thor/results.md#libero-one-camera) |
 | Jetson AGX Thor | NVFP4 + FA4, DROID 2-view feature graph | **29.60 ms** | — | — | **33 Hz** | [Historical results](docs/thor/results.md) |
 | Jetson AGX Thor | FP8, DROID 2-view feature graph | **48.94 ms** | — | — | **20.4 Hz** | [Historical results](docs/thor/results.md) |
 | RTX 5090 | FP8, 2-view base, full graph | **16.6 ms** | — | — | **60 Hz** | [GROOT N1.7 API](#groot-n17-rtx) |
@@ -165,7 +165,7 @@ See [LIBERO settings and API comparison](docs/thor/pi05.md#4-match-the-libero-se
 The LIBERO row uses four denoising steps, batch 1 and two CPU threads. Model
 latency includes input transfer, backbone and action head; the complete call
 also includes fresh preprocessing and physical-action decoding. Values are
-directly measured native medians. The older DROID feature-graph rows exclude
+directly measured release-container medians. The older DROID feature-graph rows exclude
 image/text embedding generation and physical decoding.
 See [reproduction and accuracy](docs/thor/groot-n17.md) and the
 [JAL comparison](docs/thor/comparison.md#groot-n17).

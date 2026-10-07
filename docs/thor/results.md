@@ -2,28 +2,33 @@
 
 ## LIBERO one camera
 
-The current GR00T default is **GR00T-N1.7-LIBERO/libero_10**, one camera,
-four denoising steps, batch 1 and two CPU threads. The native public validator
+The release-container GR00T default is **GR00T-N1.7-LIBERO/libero_10**,
+one camera, four denoising steps, batch 1 and two CPU threads. The validator
 directly measured these medians over 100 calls after 20 warmups:
 
 | Tier | Model inference | Preprocessing | Physical decode | Complete call | Overall cosine |
 |---|---:|---:|---:|---:|---:|
-| FP4 | **24.09 ms** | **4.68 ms** | 0.23 ms | **29.45 ms** | **0.999825** |
+| FP4 | **24.26 ms** | **3.25 ms** | 0.22 ms | **27.89 ms** | **0.999694** |
+| FP8 | 37.03 ms | 3.25 ms | 0.22 ms | 40.67 ms | 0.999467 |
 
 Model inference includes input transfer, patch/vision backbone and the action
 head. Complete-call latency is measured independently; component medians do
-not necessarily add up to its median. No images or state are cached.
+not necessarily add up to its median. No images or state are cached. The
+per-call preprocessing-plus-model sum is 27.51 ms for FP4; this excludes
+physical decoding, as does the JAL total. Official eager PyTorch with the
+same fixture and two CPU threads measured 92.59 ms complete-call latency.
 
-The overall numerical acceptance passed and repeated actions were bitwise
-identical. Strict rotation cosine diagnostics did not pass: cosine 0.97134,
-maximum absolute error 0.00556. All diagnostics remain in the
-[numerical report](../../repro/thor/evidence/libero/groot-fp4-native.json).
+Both overall numerical checks passed and repeated actions were bitwise
+identical. Strict action-group diagnostics did not all pass: FP4 rotation
+cosine is 0.96167, with maximum absolute error 0.00760; FP8 rotation cosine
+is 0.97314, with maximum absolute error 0.00702. All group errors remain in
+the [release-container report](../../repro/thor/evidence/libero/release-image-summary.json).
 This checks a fixed real observation, not robot task success.
 
-In a separate balanced same-process thread comparison, 2 versus 8 CPU threads
-reduced full-call median from 30.19 to 29.00 ms, with bitwise-identical output.
-That controlled gain is 1.19 ms (3.9%); the table above uses the final public
-validator rather than substituting the separate optimization probe.
+In a separate balanced native same-process thread comparison, 2 versus 8 CPU
+threads reduced full-call median from 30.19 to 29.00 ms, with bitwise-identical
+output. That controlled gain is 1.19 ms (3.9%); it is separate from the
+release-container measurement above.
 
 The sections below retain earlier DROID/base-checkpoint and installation
 validation records. They use different inputs and timing boundaries.

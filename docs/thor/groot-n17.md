@@ -46,7 +46,7 @@ The bundled fixture contains a real LIBERO observation. The official reference r
 
 Inspect `groot-fp8.json` and `groot-fp4.json`. Reports include overall and per-action-group cosine, RMSE, maximum absolute errors and repeated-input stability. Overall numerical acceptance requires mean cosine ≥0.999 and worst-sample cosine ≥0.995. Repeated normalized outputs use the existing cosine ≥0.9999 and maximum absolute error ≤0.05 checks; bitwise identity is also reported. Strict per-group diagnostics are reported separately, including failures.
 
-On the verified native FP4 fixture, overall cosine is **0.999825**. Rotation cosine is **0.97134**, with maximum absolute error **0.00556**; near-zero components need absolute-error interpretation as well as cosine. This is a fixed-sample numerical regression, not a robot task-success evaluation or proof that every action-group diagnostic passes. FP4 uses an FP8 backbone and NVFP4 action head.
+On the verified release-container FP4 fixture, overall cosine is **0.999694**. Rotation cosine is **0.96167**, with maximum absolute error **0.00760**; near-zero components need absolute-error interpretation as well as cosine. This is a fixed-sample numerical regression, not a robot task-success evaluation or proof that every action-group diagnostic passes. FP4 uses an FP8 backbone and NVFP4 action head.
 
 `last_action_decoder_out` is velocity, not the integrated final action. Compare decoded physical actions against the official output.
 
@@ -60,7 +60,7 @@ The default uses process-local **two CPU threads**, with no image or state cache
 | Model inference | Prepared processor input through FlashRT input transfer, backbone and four-step action head |
 | Complete call | Raw RGB/state/language through preprocessing, FlashRT inference and decoded physical actions |
 
-The controlled native two-thread measurement was **4.68 ms preprocessing** and **29.00 ms complete call**; the eight-thread control was 5.86 / 30.19 ms. Outputs were bitwise identical. Component medians need not sum to the complete-call median. See [verified measurements](results.md) for measured model latency and release-container results, and [comparison contract](comparison.md) for the JAL configuration.
+The release-container FP4 measurement was **24.26 ms model inference**, **3.25 ms preprocessing** and **27.89 ms complete call**. The separate controlled native two-thread comparison reduced complete-call latency from 30.19 to 29.00 ms (1.19 ms / 3.9%), with bitwise-identical output. Component medians need not sum to the complete-call median. See [verified measurements](results.md) for measured model latency and release-container results, and [comparison contract](comparison.md) for the JAL configuration.
 
 To time the official eager policy without capture hooks:
 
