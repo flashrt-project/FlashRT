@@ -2,7 +2,7 @@
 
 Goal: a public ARM64 image maintained by FlashRT. Users pull it, mount model/result directories, then run `prepare` and `validate`. Dependencies, compiled kernels, reference code and regression fixtures are inside the image; model weights remain external.
 
-The validated runtime image and offline tar already exist on the test machine. The source-only candidate has now also been built and passed both models in FP8/FP4. A public registry address has not been published. Build instructions are in [Thor setup](README.md); model commands are in the two model guides.
+A source-only release candidate, repackaged with existing compiled kernels, passed both models in FP8/FP4. The complete `Dockerfile.thor` build from public source is being validated separately and has not yet completed. No public registry image is available for `docker pull` yet. Build instructions are in [Thor setup](README.md); model commands are in the two model guides.
 
 Before public release:
 

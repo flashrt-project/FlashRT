@@ -18,6 +18,8 @@ Use the same power mode, clocks and cooling for both implementations. Keep manuf
 
 ## 2. Choose installation
 
+These guides are currently in [PR #219](https://github.com/flashrt-project/FlashRT/pull/219). Until it is merged, the commands below select its review branch; after merge, use the default branch.
+
 ### Docker
 
 Docker with NVIDIA Container Toolkit must already be installed. Commands assume your account can run Docker; otherwise run them with `sudo`. Use the toolkit's [official installation guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) for a fresh machine.
@@ -25,7 +27,7 @@ Docker with NVIDIA Container Toolkit must already be installed. Commands assume 
 A public Thor image has not been published yet. Until then, clone this repository, enter `repro/thor`, and build on Thor:
 
 ```bash
-git clone https://github.com/flashrt-project/FlashRT.git
+git clone --branch docs/thor-release-and-community https://github.com/flashrt-project/FlashRT.git
 cd FlashRT/repro/thor
 docker build --build-arg PIP_INDEX_URL -f Dockerfile.thor -t flashrt-jal:thor .
 export IMAGE=flashrt-jal:thor
@@ -41,7 +43,7 @@ Once released, replace the build command with `docker pull "$IMAGE"`, using the 
 Clone this repository and enter `repro/thor`. Install JetPack first, then:
 
 ```bash
-git clone https://github.com/flashrt-project/FlashRT.git
+git clone --branch docs/thor-release-and-community https://github.com/flashrt-project/FlashRT.git
 cd FlashRT/repro/thor
 sudo apt-get update
 sudo apt-get install -y python3.12-venv python3-dev build-essential cmake ninja-build git git-lfs ffmpeg libglib2.0-0 libgl1
