@@ -38,39 +38,7 @@ The [demo gallery](docs/demos.md) keeps input settings, playback rates and links
 
 **Congratulations to the [MindOn](https://www.mindon.tech/) team on [Mind-1](https://www.mindon.tech/blog/mind-1/index.html).** Their work spans the model, training, control stack and real-robot deployment. Physical deployment is a full-system effort; we are happy to see FlashRT contribute one part of Mind-1's inference stack. Thank you to MindOn for supporting the FlashRT open-source community and helping move the project forward.
 
-Thanks to the [Cybernetic Physics](https://cyberneticphysics.com/) team for extending FlashRT's AMD backend from MI350X/CDNA4 to MI300X/CDNA3, including CDNA3-specific kernel optimizations. Read our joint [technical write-up](https://cyberneticphysics.com/blog/real-time-vla-inference-on-amd-hardware), or start with the [AMD deployment guide](docs/deployment_amd.md).
-
-## FlashRT is fast with:
-
-- **Highly tuned hand-written kernels** for NVIDIA GPUs, AMD GPUs, and Ascend NPUs, covering attention, GEMM, normalization, quantization, and fused model operations
-- **Static graph execution** over stable buffers, using CUDA Graphs, HIP graphs, or NPU graphs on supported model paths
-- **Production FP8 (E4M3) and NVFP4** with automatic per-tensor calibration, JSON-cached to disk
-- **No compile, no export**: direct safetensors / Orbax loading, first call ~3 s, every call after is graph replay
-- Survives CUDA driver upgrades, GPU swaps, and prompt changes without rebuild
-- **Serving hosts** for OpenAI-compatible LLM/audio endpoints and robot execution-state scenarios
-
-## FlashRT is easy to use with:
-
-- **3-line API**: `flash_rt.load_model(...).predict(images, prompt)`
-- **Hardware dispatch**: a common model API with backend-specific kernels for NVIDIA, AMD, and Ascend
-- **PyTorch and JAX frontends** share one kernel binary, equivalent results (cosine ≥ 0.999)
-- **Plugin model registration** — add a new VLA via one frontend file + a declarative `WEIGHT_SPEC`, no fork required
-- **LIBERO benchmark integration** out of the box; ~6 minutes from `git clone` to first inference
-- **FlashRT Structures** — attach the kernel catalog onto an **unmodified** PyTorch host, no fork and no edit to its source; works on `lerobot`, Isaac-GR00T, `openpi`, `transformers`, `diffusers`, and inside vLLM / SGLang. Its own package and repository: [FlashRT-Structures](https://github.com/flashrt-project/FlashRT-Structures)
-
-```python
-import flashrt_structures as structures    # pip install flashrt-structures
-
-plan = structures.attach(model, forward)   # discover → calibrate → gate → activate
-print(structures.explain(plan))            # bound / routed / kept-at-host / refused, with reasons
-
-loop = structures.decode_loop(model, max_len=4096)      # serving door
-out  = loop.generate(input_ids, max_new_tokens=256)
-```
-
-Structures: [repository](https://github.com/flashrt-project/FlashRT-Structures) · [explicit pipeline examples](https://github.com/flashrt-project/FlashRT-Structures/tree/main/examples) · [walkthrough with films](https://huggingface.co/spaces/liangsu9988/fast-kernels-are-not-fast-pipelines)
-
-See [Supported Models](#supported-models), [Hardware Support](#hardware-support), and [Benchmark](#benchmark) for the current map.
+**Thanks to the [Cybernetic Physics](https://cyberneticphysics.com/) team** for extending FlashRT's AMD backend from MI350X/CDNA4 to MI300X/CDNA3, including CDNA3-specific kernel optimizations. Read our joint [technical write-up](https://cyberneticphysics.com/blog/real-time-vla-inference-on-amd-hardware), or start with the [AMD deployment guide](docs/deployment_amd.md).
 
 ## News
 
@@ -108,6 +76,38 @@ See [Supported Models](#supported-models), [Hardware Support](#hardware-support)
 
 <a name="performance"></a>
 
+## FlashRT is fast with:
+
+- **Highly tuned hand-written kernels** for NVIDIA GPUs, AMD GPUs, and Ascend NPUs, covering attention, GEMM, normalization, quantization, and fused model operations
+- **Static graph execution** over stable buffers, using CUDA Graphs, HIP graphs, or NPU graphs on supported model paths
+- **Production FP8 (E4M3) and NVFP4** with automatic per-tensor calibration, JSON-cached to disk
+- **No compile, no export**: direct safetensors / Orbax loading, first call ~3 s, every call after is graph replay
+- Survives CUDA driver upgrades, GPU swaps, and prompt changes without rebuild
+- **Serving hosts** for OpenAI-compatible LLM/audio endpoints and robot execution-state scenarios
+
+## FlashRT is easy to use with:
+
+- **3-line API**: `flash_rt.load_model(...).predict(images, prompt)`
+- **Hardware dispatch**: a common model API with backend-specific kernels for NVIDIA, AMD, and Ascend
+- **PyTorch and JAX frontends** share one kernel binary, equivalent results (cosine ≥ 0.999)
+- **Plugin model registration** — add a new VLA via one frontend file + a declarative `WEIGHT_SPEC`, no fork required
+- **LIBERO benchmark integration** out of the box; ~6 minutes from `git clone` to first inference
+- **FlashRT Structures** — attach the kernel catalog onto an **unmodified** PyTorch host, no fork and no edit to its source; works on `lerobot`, Isaac-GR00T, `openpi`, `transformers`, `diffusers`, and inside vLLM / SGLang. Its own package and repository: [FlashRT-Structures](https://github.com/flashrt-project/FlashRT-Structures)
+
+```python
+import flashrt_structures as structures    # pip install flashrt-structures
+
+plan = structures.attach(model, forward)   # discover → calibrate → gate → activate
+print(structures.explain(plan))            # bound / routed / kept-at-host / refused, with reasons
+
+loop = structures.decode_loop(model, max_len=4096)      # serving door
+out  = loop.generate(input_ids, max_new_tokens=256)
+```
+
+Structures: [repository](https://github.com/flashrt-project/FlashRT-Structures) · [explicit pipeline examples](https://github.com/flashrt-project/FlashRT-Structures/tree/main/examples) · [walkthrough with films](https://huggingface.co/spaces/liangsu9988/fast-kernels-are-not-fast-pipelines)
+
+See [Supported Models](#supported-models), [Hardware Support](#hardware-support), and [Benchmark](#benchmark) for the current map.
+
 ## Benchmark
 
 Baseline comparisons and source methodology live in [Benchmark Comparison](docs/benchmark_comparison.md).
@@ -116,8 +116,8 @@ Baseline comparisons and source methodology live in [Benchmark Comparison](docs/
 
 | Hardware | Mode | Latency | Throughput | Source |
 |---|---|---:|---:|---|
-| Jetson AGX Thor | OpenPI FP8, 2-view fixed-frame regression | **40.51 ms p50** | **24.7 Hz** | [Verified results](docs/thor/results.md) |
-| Jetson AGX Thor | OpenPI NVFP4 + FA4, 2-view fixed-frame regression | **20.06 ms p50** | **49.9 Hz** | [Verified results](docs/thor/results.md) |
+| Jetson AGX Thor | OpenPI FP8, 2-view fixed-frame regression | **40.51 ms** | **24.7 Hz** | [Verified results](docs/thor/results.md) |
+| Jetson AGX Thor | OpenPI NVFP4 + FA4, 2-view fixed-frame regression | **20.06 ms** | **49.9 Hz** | [Verified results](docs/thor/results.md) |
 | RTX 5090 | FP8, 2-view | **17.58 ms** | **57 Hz** | [Blackwell VLA](examples/blackwell/README.md#vla-latency-rtx-5090) |
 | AMD Instinct MI350X | FP8, CDNA4 | **16.4 ms** | **61 Hz** | [AMD Pi0.5](docs/deployment_amd_pi05.md) |
 
@@ -154,8 +154,8 @@ See [LIBERO settings and API comparison](docs/thor/pi05.md#4-match-the-libero-se
 
 | Hardware | Mode | Latency | Throughput | Source |
 |---|---|---:|---:|---|
-| Jetson AGX Thor | NVFP4 + FA4, DROID 2-view feature graph | **29.60 ms p50** | **33 Hz** | [Verified results](docs/thor/results.md) |
-| Jetson AGX Thor | FP8, DROID 2-view feature graph | **48.94 ms p50** | **20.4 Hz** | [Verified results](docs/thor/results.md) |
+| Jetson AGX Thor | NVFP4 + FA4, DROID 2-view feature graph | **29.60 ms** | **33 Hz** | [Verified results](docs/thor/results.md) |
+| Jetson AGX Thor | FP8, DROID 2-view feature graph | **48.94 ms** | **20.4 Hz** | [Verified results](docs/thor/results.md) |
 | RTX 5090 | FP8, 2-view base, full graph | **16.6 ms** | **60 Hz** | [GROOT N1.7 API](#groot-n17-rtx) |
 | AMD Instinct MI350X | FP8 backbone + BF16 DiT, full frame | **16.0 ms** | **62 Hz** | [AMD deployment](docs/deployment_amd.md) |
 
