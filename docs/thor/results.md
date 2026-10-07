@@ -46,6 +46,50 @@ Calibration-cache identity also includes actual sharded weight contents,
 configuration/statistics and calibration inputs, so distinct fine-tunes or
 observations do not reuse scales merely because their shard-index layout matches.
 
+## Published image validation
+
+Image: `ghcr.io/flashrt-project/flashrt-thor:thor-v0.1.1`
+
+Tested digest: `sha256:031908d864d047c08ce91aaf8567c7258e8fdf99f70c05067ca41220027aadff`.
+
+A fresh empty Docker credential directory successfully pulled this exact
+digest anonymously. The pulled image then ran `validate all` and the
+CPU-two-thread official eager comparison; both commands exited 0. No host
+source or reference environment was mounted. This test reused existing
+Docker layer storage on the build Thor; it is not a second-machine full
+download test. Model files were mounted externally and reused.
+
+| Check | Mean cosine | Model inference | Complete call | Result |
+|---|---:|---:|---:|---|
+| [π0.5 FP8](../../repro/thor/evidence/published-image/pi05-fp8-accuracy.json) | 0.999900 | — | 40.63 ms | PASS |
+| [π0.5 FP4](../../repro/thor/evidence/published-image/pi05-fp4-accuracy.json) | 0.999691 | — | 20.03 ms | PASS |
+| [GR00T LIBERO FP8](../../repro/thor/evidence/published-image/groot-fp8.json) | 0.999467 | 37.26 ms | 40.85 ms | PASS |
+| [GR00T LIBERO FP4](../../repro/thor/evidence/published-image/groot-fp4.json) | 0.999694 | 24.27 ms | 27.91 ms | PASS |
+
+All timings use 20 warmups and 100 measured calls. GR00T FP4 preprocessing
+was 3.25 ms and physical decoding 0.22 ms. The matched
+[official eager comparison](../../repro/thor/evidence/published-image/groot-official-eager.json)
+measured 93.66 ms complete-call latency with two CPU threads and exact
+reference actions. The earlier release-container measurements at the top
+of this page are an independent run of this same image.
+
+π0.5 timing and resolved kernel options are in the
+[FP8 report](../../repro/thor/evidence/published-image/pi05-fp8.json) and
+[FP4 report](../../repro/thor/evidence/published-image/pi05-fp4.json).
+
+Both GR00T overall numerical checks and existing repeat-stability gates
+passed; the strict action-group diagnostic remains false in both reports.
+This is numerical reproduction of the supplied fixtures. Robot task-success
+results are not part of this release evidence.
+
+The final image passed a full filesystem-layer, bytecode-path, link and
+OCI metadata privacy audit. See the
+[validation and audit summary](../../repro/thor/evidence/published-image/validation-summary.json)
+and [runtime report](../../repro/thor/evidence/published-image/runtime.json).
+
+<details>
+<summary>Earlier DROID and installation validation records</summary>
+
 ## Earlier DROID and installation checks
 
 Both routes passed all four numerical checks. Docker `run-validation.sh all` returned exit code 0. Native π0.5 and GR00T checks each passed.
@@ -99,7 +143,7 @@ This verifies fresh native compilation and new pinned reference installations wh
 
 ## GR00T raw-input validation
 
-The newly shipped GR00T validator defaults to **raw RGB/state/language → physical actions**. On each call it reruns the official processor, then FlashRT patch embedding, visual merger, backbone and action head, and physical action decoding. Prompt/grid graph setup and fixed-sample calibration are outside timing; no official model embeddings are replayed per call. The processor's patches, token IDs and grid exactly matched a freshly captured official run.
+This earlier DROID validation measured **raw RGB/state/language → physical actions**. On each call it reruns the official processor, then FlashRT patch embedding, visual merger, backbone and action head, and physical action decoding. Prompt/grid graph setup and fixed-sample calibration are outside timing; no official model embeddings are replayed per call. The processor's patches, token IDs and grid exactly matched a freshly captured official run.
 
 | Execution | Mean cosine | EEF cosine | Joint cosine | Latency ms | Result |
 |---|---:|---:|---:|---:|---|
@@ -119,3 +163,5 @@ The full `Dockerfile.thor` build completed on Thor; `validate all` completed suc
 - [pi05-fp4-accuracy.json](../../repro/thor/evidence/public-docker/pi05-fp4-accuracy.json): mean cosine 0.99969050, PASS.
 - [groot-fp8.json](../../repro/thor/evidence/public-docker/groot-fp8.json): mean cosine 0.99995844, PASS.
 - [groot-fp4.json](../../repro/thor/evidence/public-docker/groot-fp4.json): mean cosine 0.99984395, PASS.
+
+</details>

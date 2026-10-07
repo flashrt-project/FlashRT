@@ -43,14 +43,15 @@ On the validation machine, if repackaging the already validated local runtime, `
 
 Before pushing, all four numerical checks must pass. Review the final image contents and license notices; retain the build log and accuracy reports with the release. The repackaged source-only candidate was built on Thor and passed both models in FP8 and FP4. Its build/validation log is in `../../repro/thor/evidence/release-validation.log`, with accuracy reports in `../../repro/thor/evidence/release`. A fresh full source build should also run these checks before publication.
 
-The complete archive-based `Dockerfile.thor` image has now been built on Thor and passed all four numerical checks. See the [public-source Docker evidence](../../repro/thor/evidence/public-docker). Registry publication, image-layer privacy review, and anonymous pull verification remain release requirements.
+The complete archive-based `Dockerfile.thor` image has now been built on Thor and passed all four numerical checks. See the [public-source Docker evidence](../../repro/thor/evidence/public-docker). The current release passed image-layer privacy review and anonymous-pull container validation; see [published-image evidence](results.md#published-image-validation).
 
 ## 4. Publish
 
-Choose your actual namespace and a version tag. For the first release, a name such as `flashrt-thor` and a version such as `thor-v0.1.0` is suitable; these are proposed names, not an existing published release.
+The maintained release is `ghcr.io/flashrt-project/flashrt-thor:thor-v0.1.1`. Keep that tag unchanged. Enter a new, unused version for subsequent releases:
 
 ```bash
-export PUBLIC_IMAGE="ghcr.io/<your team>/flashrt-thor:thor-v0.1.0"
+read -rp 'New release version: ' RELEASE_VERSION
+export PUBLIC_IMAGE="ghcr.io/flashrt-project/flashrt-thor:$RELEASE_VERSION"
 bash publish-image.sh "$IMAGE" "$PUBLIC_IMAGE"
 ```
 
@@ -65,6 +66,6 @@ CLEAN_DOCKER_CONFIG="$(mktemp -d)"
 DOCKER_CONFIG="$CLEAN_DOCKER_CONFIG" docker pull "$PUBLIC_IMAGE"
 ```
 
-Then run each model guide using `IMAGE="$PUBLIC_IMAGE"`. Save the second machine's reports. Once this succeeds, put the real pull address into README and attach the reports to the release. Keep this version tag unchanged; publish later fixes under another version.
+Then run each model guide using `IMAGE="$PUBLIC_IMAGE"`. Save the reports with the device and runtime configuration. The current release's anonymous-pull validation was performed on the build Thor using an empty credential directory; it is not a second-machine Docker run. Keep this version tag unchanged; publish later fixes under another version.
 
 This is a FlashRT maintained official project image. Docker Official Images certification and NVIDIA endorsement are separate programs and are not required for public pull access.

@@ -1,33 +1,46 @@
-# FlashRT maintained Thor image
+# FlashRT official Thor image
 
-Goal: a public ARM64 image maintained by FlashRT. Users pull it, mount model/result directories, then run `prepare` and `validate`. Dependencies, compiled kernels, reference code and regression fixtures are inside the image; model weights remain external.
+The FlashRT-maintained ARM64 image includes compiled kernels, pinned official reference code, numerical validators and input fixtures for **OpenPI π0.5** and **GR00T N1.7 LIBERO**. Model weights stay in your mounted model directory.
 
-A source-only release candidate, repackaged with existing compiled kernels, passed both models in FP8/FP4. The complete `Dockerfile.thor` build from public source also finished and passed all four numerical checks; see [results](results.md). No public registry image is available for `docker pull` yet. Build instructions are in [Thor setup](README.md); model commands are in the two model guides.
+## 1. Pull
 
-Before public release:
-
-1. Select a team-owned GHCR or Docker Hub namespace and release tag.
-2. Build from only the intended FlashRT source snapshot. The current private runtime image contains a full repository Git history; do not push it publicly as-is. Removing files in a later Docker layer does not remove earlier layer contents.
-3. Run both model validators on Thor and preserve the reports.
-4. Push the release image, make the package public, and test pulling without registry credentials on another Thor.
-5. Replace the local build steps in the guide with the verified published image name. Keep released tags stable; release changes under a new tag.
-
-After publication, the user flow is:
+On a Thor with Docker and NVIDIA Container Toolkit:
 
 ```bash
-export IMAGE="<published FlashRT image>"
+export IMAGE=ghcr.io/flashrt-project/flashrt-thor:thor-v0.1.1
 export MODELS="$PWD/models"
 export OUT="$PWD/results"
 mkdir -p "$MODELS" "$OUT"
 docker pull "$IMAGE"
-docker run --rm --runtime=nvidia --gpus all --network=host --shm-size=8g \
-  -v "$MODELS:/models" "$IMAGE" prepare groot
-docker run --rm --runtime=nvidia --gpus all --network=host --shm-size=8g \
-  -v "$MODELS:/models" -v "$OUT:/results" "$IMAGE" validate groot
+docker run --rm --runtime=nvidia --gpus all "$IMAGE" doctor
 ```
 
-Replace `groot` with `pi05` for OpenPI. With already prepared weights, skip `prepare`.
+The package is public; registry login is not required. Use the versioned tag for reproducible runs.
 
-Public GHCR packages support anonymous pulls ([GitHub documentation](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)). “FlashRT maintained image” does not imply the separately curated [Docker Official Images](https://docs.docker.com/docker-hub/repos/manage/trusted-content/official-images/) badge or NVIDIA endorsement.
+## 2. Prepare weights
 
-First registry/account setup and publication: [release guide](release.md).
+For China pip access, optionally set `PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple` before these commands. GR00T and Cosmos download from versioned ModelScope mirrors with checksum verification. OpenPI downloads and converts the official `pi05_libero` checkpoint.
+
+```bash
+docker run --rm --runtime=nvidia --gpus all --network=host --shm-size=8g \
+  -e PIP_INDEX_URL -v "$MODELS:/models" "$IMAGE" prepare pi05
+docker run --rm --runtime=nvidia --gpus all --network=host --shm-size=8g \
+  -e PIP_INDEX_URL -v "$MODELS:/models" "$IMAGE" prepare groot
+```
+
+Already prepared? Use the directory layout in the [π0.5 guide](pi05.md) and [GR00T guide](groot-n17.md), then skip this step. Existing verified GR00T files are reused.
+
+## 3. Validate and benchmark
+
+```bash
+docker run --rm --runtime=nvidia --gpus all --network=host --shm-size=8g \
+  -v "$MODELS:/models" -v "$OUT:/results" "$IMAGE" validate all
+```
+
+Use `validate pi05` or `validate groot` to run one model. The command freshly runs the official reference and FlashRT FP8/FP4, saves numerical errors and latency reports, and returns nonzero when numerical acceptance fails. Read [results](results.md) and the [JAL comparison contract](comparison.md); model inference, preprocessing and complete-call latency are separate measurements.
+
+Reference loading, calibration and lazy kernel/graph initialization happen before measured inference. The first validation therefore takes longer than the latency shown in the benchmark table.
+
+The release image passed fresh numerical checks, verified calibration-cache reuse and an anonymous registry pull followed by actual container validation. The [release evidence](results.md#published-image-validation) records the tested digest and measurements. Image filesystem layers and metadata were audited before publication.
+
+To clone, install and compile yourself, or build the Docker image from source, follow [Thor setup](README.md). Maintainer publication steps are in the [release guide](release.md).

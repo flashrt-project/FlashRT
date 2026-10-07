@@ -24,19 +24,26 @@ These guides are currently in [PR #219](https://github.com/flashrt-project/Flash
 
 Docker with NVIDIA Container Toolkit must already be installed. Commands assume your account can run Docker; otherwise run them with `sudo`. Use the toolkit's [official installation guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) for a fresh machine.
 
-A public Thor image has not been published yet. Until then, clone this repository, enter `repro/thor`, and build on Thor:
+Pull the FlashRT-maintained image:
+
+```bash
+export IMAGE=ghcr.io/flashrt-project/flashrt-thor:thor-v0.1.1
+export MODELS="$PWD/models"
+export OUT="$PWD/results"
+mkdir -p "$MODELS" "$OUT"
+docker pull "$IMAGE"
+```
+
+Follow the [Docker guide](docker.md) to prepare weights and run both numerical checks. Runtime, reference environments, fixtures and validators are inside the image; mount only model and result directories.
+
+To build the image yourself on Thor:
 
 ```bash
 git clone --branch docs/thor-release-and-community https://github.com/flashrt-project/FlashRT.git
 cd FlashRT/repro/thor
-docker build --build-arg PIP_INDEX_URL -f Dockerfile.thor -t flashrt-jal:thor .
-export IMAGE=flashrt-jal:thor
-export MODELS="$PWD/models"
-export OUT="$PWD/results"
-mkdir -p "$MODELS" "$OUT"
+docker build --build-arg PIP_INDEX_URL -f Dockerfile.thor -t flashrt-thor:local .
+export IMAGE=flashrt-thor:local
 ```
-
-Once released, replace the build command with `docker pull "$IMAGE"`, using the published image name. Runtime, reference environments, fixtures and validators are inside the image; mount only model and result directories. See [image release status](docker.md).
 
 ### Native: clone, install and compile
 

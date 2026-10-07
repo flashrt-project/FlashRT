@@ -1,0 +1,66 @@
+{
+  "image": "ghcr.io/flashrt-project/flashrt-thor:thor-v0.1.1",
+  "digest": "sha256:031908d864d047c08ce91aaf8567c7258e8fdf99f70c05067ca41220027aadff",
+  "source_revision": "a2300e87d6658eab72bca4389a209471c0efe7c6",
+  "anonymous": {
+    "anonymous_pull": true,
+    "fresh_registry_config": true,
+    "existing_base_layer_cache_reused": true,
+    "validators": {
+      "pi05-fp8-accuracy.json": {
+        "passed": true,
+        "p50_ms": null,
+        "mean_sample_cosine": 0.999900463031009,
+        "worst_sample_cosine": 0.9997435523971266
+      },
+      "pi05-fp4-accuracy.json": {
+        "passed": true,
+        "p50_ms": null,
+        "mean_sample_cosine": 0.9996905021597833,
+        "worst_sample_cosine": 0.9992986762759565
+      },
+      "groot-fp8.json": {
+        "passed": true,
+        "p50_ms": 40.85201793350279,
+        "mean_sample_cosine": 0.999467280123274,
+        "worst_sample_cosine": 0.999467280123274
+      },
+      "groot-fp4.json": {
+        "passed": true,
+        "p50_ms": 27.906763134524226,
+        "mean_sample_cosine": 0.9996940260292451,
+        "worst_sample_cosine": 0.9996940260292451
+      },
+      "groot-official-eager.json": {
+        "passed": true,
+        "p50_ms": 93.66153506562114,
+        "mean_sample_cosine": 0.9999999999999998,
+        "worst_sample_cosine": 0.9999999999999998
+      }
+    },
+    "passed": true,
+    "status": "COMPLETE",
+    "all_four_validator_command_exit_code": 0,
+    "official_eager_command_exit_code": 0,
+    "digest_verified": true
+  },
+  "privacy": {
+    "new_oci_metadata_objects": 6,
+    "passed": true,
+    "earlier_failed_candidate_layers_excluded": true,
+    "base_regular_files": 340797,
+    "base_regular_file_bytes": 27043698517,
+    "base_unresolved_private_matches": 0,
+    "new_layers": 5,
+    "new_regular_file_bytes": 31090777,
+    "private_git_bundle_or_history_in_source": false,
+    "base_diff_ids": 91,
+    "bytecode_filenames_symlinks_pax_oci_metadata_scanned": true,
+    "base_link_targets_scanned": 2531,
+    "new_regular_files": 461,
+    "base_unique_filesystem_blobs": 73,
+    "base_substring_matches_classified_public": 38,
+    "new_unresolved_matches": 0
+  },
+  "runtime_archive_sha256": "20d99147923bff520b82299e60244660cd291ba50dfd8ec9bd14064add983da5"
+}

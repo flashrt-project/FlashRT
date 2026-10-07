@@ -44,7 +44,7 @@ The [demo gallery](docs/demos.md) keeps input settings, playback rates and links
 
 ## News
 
-- **Oct 2026** — Thor reproduction guides now cover [OpenPI π0.5](docs/thor/pi05.md), [GR00T N1.7](docs/thor/groot-n17.md), native builds and a [Thor Docker release candidate](docs/thor/docker.md). Both models passed FP8/FP4 fixed-sample numerical checks. Public image publication and anonymous pull verification are pending.
+- **Oct 2026** — Thor reproduction guides now cover [OpenPI π0.5](docs/thor/pi05.md), [GR00T N1.7](docs/thor/groot-n17.md), native builds and the [official Thor Docker image](docs/thor/docker.md). Both models passed FP8/FP4 fixed-sample numerical checks after an anonymous registry pull.
 - **Oct 2026** — [AMD MI300X support](https://github.com/flashrt-project/FlashRT/pull/214) is merged. Thanks to [Yiannis](https://github.com/yiannisha) and Cybernetic Physics; see the [porting story](https://cyberneticphysics.com/blog/real-time-vla-inference-on-amd-hardware).
 - **Oct 2026** — Thanks to [@tlitdc](https://github.com/tlitdc) for the [Hy-Embodied-0.5-VLA RTX SM120 backend](docs/hyvla05_rtx_sm120.md) ([#217](https://github.com/flashrt-project/FlashRT/pull/217)), extending the existing Thor model path to consumer Blackwell.
 - **Sep 2026** — Congratulations to [MindOn on Mind-1](https://www.mindon.tech/blog/mind-1/index.html), and thank you for supporting the FlashRT community.
@@ -362,6 +362,8 @@ First call: ~3 s (calibration + CUDA Graph capture). Every subsequent call: 44 m
 ## Start here
 
 For matched Thor measurements: [comparison settings and timing boundaries](docs/thor/comparison.md).
+
+The **official FlashRT Thor image** is `ghcr.io/flashrt-project/flashrt-thor:thor-v0.1.1` — [pull, prepare weights and validate](docs/thor/docker.md).
 
 For Jetson Thor: [setup](docs/thor/README.md) · [OpenPI π0.5](docs/thor/pi05.md) · [GR00T N1.7](docs/thor/groot-n17.md) · [Docker](docs/thor/docker.md) · [accuracy results](docs/thor/results.md).
 
@@ -863,7 +865,7 @@ image = modal.Image.from_registry("ghcr.io/liangsu8899/flashrt:0.2.0")
 Tags + advanced usage (build args, slim variants, mounting checkpoints):
 see [`docker/README.md`](docker/README.md).
 
-> **Thor (SM110 / ARM64)** uses a separate NVIDIA base. Follow the [Thor Docker guide](docs/thor/docker.md) or [native reproduction setup](docs/thor/README.md). The Thor candidate has passed its fixed-sample accuracy checks; its public pull address is pending publication.
+> **Thor (SM110 / ARM64)** uses a separate NVIDIA base. Follow the [Thor Docker guide](docs/thor/docker.md) or [native reproduction setup](docs/thor/README.md). Pull `ghcr.io/flashrt-project/flashrt-thor:thor-v0.1.1`; the public image passed anonymous-pull container validation.
 
 ### Option B — Build the Docker image yourself
 

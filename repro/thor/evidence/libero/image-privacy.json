@@ -1,0 +1,22 @@
+{
+  "image": "ghcr.io/flashrt-project/flashrt-thor:thor-v0.1.1",
+  "digest": "sha256:031908d864d047c08ce91aaf8567c7258e8fdf99f70c05067ca41220027aadff",
+  "privacy": {
+    "new_oci_metadata_objects": 6,
+    "passed": true,
+    "earlier_failed_candidate_layers_excluded": true,
+    "base_regular_files": 340797,
+    "base_regular_file_bytes": 27043698517,
+    "base_unresolved_private_matches": 0,
+    "new_layers": 5,
+    "new_regular_file_bytes": 31090777,
+    "private_git_bundle_or_history_in_source": false,
+    "base_diff_ids": 91,
+    "bytecode_filenames_symlinks_pax_oci_metadata_scanned": true,
+    "base_link_targets_scanned": 2531,
+    "new_regular_files": 461,
+    "base_unique_filesystem_blobs": 73,
+    "base_substring_matches_classified_public": 38,
+    "new_unresolved_matches": 0
+  }
+}

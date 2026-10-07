@@ -1,0 +1,29 @@
+{
+  "mode": "fp8",
+  "checkpoint": "/models/pi05-openpi",
+  "fixture": "/opt/jal/fixtures/libero_obs_2v_n8.npz",
+  "seed": 20261007,
+  "warmup": 20,
+  "iters": 100,
+  "p50_ms": 40.6321648042649,
+  "p95_ms": 40.72630119044334,
+  "torch": "2.12.0a0+5aff3928d8.nv26.05",
+  "flash_rt": "/opt/FlashRT-PAI/FlashRT-pi05-thor-limit-5421c93/flash_rt/__init__.py",
+  "entrypoint": "infer",
+  "resolved_options": {
+    "num_views": 2,
+    "autotune": 3,
+    "use_fa4": true,
+    "use_fp4_encoder_ffn": null,
+    "use_fp4_decoder": null,
+    "use_awq": null,
+    "awq_alpha": null,
+    "use_p1_split_gu": null,
+    "use_fp4_encoder_attn": null,
+    "use_fp4_siglip_ffn": null,
+    "encoder_p1_combiner": null,
+    "encoder_down_variant": null,
+    "decoder_gate_up_variant": null
+  },
+  "fp4_layers": []
+}
