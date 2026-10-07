@@ -103,7 +103,7 @@ uses separately measured preprocessing plus backbone and head, excluding
 physical decode; our complete-call timing includes physical decode and uses
 our own fresh preprocessing. The TensorRT engine has not been benchmarked on
 the same test device, so no matched speedup ratio is claimed. See the
-[comparison contract](thor/comparison.md).
+[GR00T tutorial](thor/groot-n17.md).
 
 <details>
 <summary>Historical FlashRT Thor measurements and fixture commands</summary>

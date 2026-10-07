@@ -1,10 +1,9 @@
-# FlashRT official Thor image
+# Run FlashRT on Thor with Docker
 
-The FlashRT-maintained ARM64 image includes compiled kernels, pinned official reference code, numerical validators and input fixtures for **OpenPI π0.5** and **GR00T N1.7 LIBERO**. Model weights stay in your mounted model directory.
+Requirements: Jetson AGX Thor, JetPack, Docker and NVIDIA Container Toolkit.
+The image was verified on L4T R39.2.1 / CUDA 13.2. Registry login is not required.
 
-## 1. Pull
-
-On a Thor with Docker and NVIDIA Container Toolkit:
+## 1. Pull and check the runtime
 
 ```bash
 export IMAGE=ghcr.io/flashrt-project/flashrt-thor:thor-v0.1.1
@@ -15,11 +14,11 @@ docker pull "$IMAGE"
 docker run --rm --runtime=nvidia --gpus all "$IMAGE" doctor
 ```
 
-The package is public; registry login is not required. Use the versioned tag for reproducible runs.
+Expected: Thor GPU, capability `[11, 0]` and `fa4_available: true`.
 
 ## 2. Prepare weights
 
-For China pip access, optionally set `PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple` before these commands. GR00T and Cosmos download from versioned ModelScope mirrors with checksum verification. OpenPI downloads and converts the official `pi05_libero` checkpoint.
+For China pip access, optionally set `PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple`.
 
 ```bash
 docker run --rm --runtime=nvidia --gpus all --network=host --shm-size=8g \
@@ -28,7 +27,9 @@ docker run --rm --runtime=nvidia --gpus all --network=host --shm-size=8g \
   -e PIP_INDEX_URL -v "$MODELS:/models" "$IMAGE" prepare groot
 ```
 
-Already prepared? Use the directory layout in the [π0.5 guide](pi05.md) and [GR00T guide](groot-n17.md), then skip this step. Existing verified GR00T files are reused.
+OpenPI weights are downloaded, checksum-verified and converted to BF16.
+GR00T and Cosmos download from ModelScope. To reuse weights, follow the
+directory layouts in the [π0.5](pi05.md) and [GR00T](groot-n17.md) tutorials.
 
 ## 3. Validate and benchmark
 
@@ -37,10 +38,29 @@ docker run --rm --runtime=nvidia --gpus all --network=host --shm-size=8g \
   -v "$MODELS:/models" -v "$OUT:/results" "$IMAGE" validate all
 ```
 
-Use `validate pi05` or `validate groot` to run one model. The command freshly runs the official reference and FlashRT FP8/FP4, saves numerical errors and latency reports, and returns nonzero when numerical acceptance fails. Read [results](results.md) and the [JAL comparison contract](comparison.md); model inference, preprocessing and complete-call latency are separate measurements.
+Use `validate pi05` or `validate groot` for one model. First-run loading,
+calibration and initialization happen before measured inference.
 
-Reference loading, calibration and lazy kernel/graph initialization happen before measured inference. The first validation therefore takes longer than the latency shown in the benchmark table.
+Expected final output: `combined accuracy status: 0`. The image runs fresh
+official references and checks FlashRT FP8 and FP4. Follow each model's
+**Check the results** section to print numerical status and latency from `$OUT`.
 
-The release image passed fresh numerical checks, verified calibration-cache reuse and an anonymous registry pull followed by actual container validation. The [release evidence](results.md#published-image-validation) records the tested digest and measurements. Image filesystem layers and metadata were audited before publication.
+| FP4 model | Expected latency |
+|---|---:|
+| π0.5 LIBERO | about 20 ms |
+| GR00T LIBERO model inference | about 24.3 ms |
+| GR00T LIBERO complete call | about 27.9 ms |
 
-To clone, install and compile yourself, or build the Docker image from source, follow [Thor setup](README.md). Maintainer publication steps are in the [release guide](release.md).
+[Verified public-image reports](results.md#published-image-validation).
+
+## Optional: build the Docker image yourself
+
+```bash
+git clone --branch docs/thor-release-and-community https://github.com/flashrt-project/FlashRT.git
+cd FlashRT/repro/thor
+docker build -f Dockerfile.thor -t flashrt-thor:local .
+export IMAGE=flashrt-thor:local
+```
+
+Use this `IMAGE` in the same preparation and validation commands above.
+For installation without Docker, use the native option in either model tutorial.

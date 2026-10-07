@@ -10,8 +10,6 @@
   | <a href="https://arxiv.org/abs/2606.20537"><b>Paper</b></a>
   | <a href="https://github.com/flashrt-project/FlashRT-HF-kernels"><b>HF Kernels</b></a>
   | <a href="https://github.com/LiangSu8899/FlashRT-Nexus"><b>Nexus</b></a>
-  | <a href="docs/thor/README.md"><b>Thor guides</b></a>
-  | <a href="docs/thor/docker.md"><b>Thor Docker</b></a>
   | <a href="docs/demos.md"><b>Demos</b></a> |
 </p>
 
@@ -32,7 +30,7 @@ The flagship integration today is **VLA control** — production frontends for P
 | Language models and serving | [Qwen3.6, vLLM and SGLang](docs/demos.md#llm) |
 | Video generation | [Wan2.2](docs/demos.md#video) |
 
-The [demo gallery](docs/demos.md) keeps input settings, playback rates and links to the real-time recordings together. Demo measurements use their own workloads; the [Thor reproduction guides](docs/thor/README.md) describe the separately validated OpenPI and GR00T regressions.
+More recordings and setup details: [demo gallery](docs/demos.md).
 
 ## Community highlights
 
@@ -123,16 +121,10 @@ Baseline comparisons and source methodology live in [Benchmark Comparison](docs/
 | RTX 5090 | FP8, 2-view | **17.58 ms** | **57 Hz** | [Blackwell VLA](examples/blackwell/README.md#vla-latency-rtx-5090) |
 | AMD Instinct MI350X | FP8, CDNA4 | **16.4 ms** | **61 Hz** | [AMD Pi0.5](docs/deployment_amd_pi05.md) |
 
-The Thor rows use OpenPI `pi05_libero`, two real cameras, 10 denoising steps,
-and observation-to-physical-action timing. Fixed-sample action cosine against
-OpenPI is **0.999900 (FP8)** / **0.999691 (NVFP4)**. These are observed
-verification measurements; hardware state and timing protocol are recorded in
-[the results](docs/thor/results.md). Other hardware rows use their linked
-protocols. Earlier view-count experiments remain in the
-[historical Thor notes](docs/pi05_thor_decoder_fp4_e2e.md).
+The Thor rows use OpenPI `pi05_libero`, two cameras and 10 denoising steps.
+Action cosine against OpenPI is 0.999900 (FP8) / 0.999691 (NVFP4).
 
-These fixed-frame latencies are separate from LIBERO rollout measurements.
-See [LIBERO settings and API comparison](docs/thor/pi05.md#4-match-the-libero-settings).
+**Documentation:** [Thor: run and verify](docs/thor/pi05.md) · [RTX 5090](examples/blackwell/README.md) · [AMD](docs/deployment_amd_pi05.md).
 
 #### Pi0
 
@@ -143,6 +135,8 @@ See [LIBERO settings and API comparison](docs/thor/pi05.md#4-match-the-libero-se
 | RTX 5090 | FP8, 2-view | **21.16 ms** | **47 Hz** | [API snippets](#api-snippets) |
 | RTX 5090 | FP8, 3-view | **24.48 ms** | **41 Hz** | [API snippets](#api-snippets) |
 
+**Documentation:** [Thor](examples/thor/README.md) · [RTX 5090](examples/blackwell/README.md).
+
 #### GROOT N1.6
 
 | Hardware | Mode | Latency | Throughput | Source |
@@ -151,6 +145,8 @@ See [LIBERO settings and API comparison](docs/thor/pi05.md#4-match-the-libero-se
 | Jetson AGX Thor | T=50 | **45 ms** | **22 Hz** | [Thor VLA](examples/thor/README.md#thor-vla-performance) |
 | RTX 5090 | T=16, 2-view | **12.53 ms** | **80 Hz** | [Blackwell VLA](examples/blackwell/README.md#vla-latency-rtx-5090) |
 | RTX 5090 | T=50, 2-view | **13.08 ms** | **76 Hz** | [Blackwell VLA](examples/blackwell/README.md#vla-latency-rtx-5090) |
+
+**Documentation:** [Thor](examples/thor/README.md) · [RTX 5090](examples/blackwell/README.md).
 
 #### GROOT N1.7
 
@@ -167,8 +163,8 @@ latency includes input transfer, backbone and action head; the complete call
 also includes fresh preprocessing and physical-action decoding. Values are
 directly measured release-container medians. The older DROID feature-graph rows exclude
 image/text embedding generation and physical decoding.
-See [reproduction and accuracy](docs/thor/groot-n17.md) and the
-[JAL comparison](docs/thor/comparison.md#groot-n17).
+
+**Documentation:** [Thor: run and verify](docs/thor/groot-n17.md) · [RTX 5090 API](#groot-n17-rtx) · [AMD](docs/deployment_amd.md).
 
 #### Pi0-FAST
 
@@ -177,6 +173,8 @@ See [reproduction and accuracy](docs/thor/groot-n17.md) and the
 | Jetson AGX Thor | max-perf | **8.1 ms/token** | **123 tok/s** | [Thor VLA](examples/thor/README.md#thor-vla-performance) |
 | RTX 5090 | max-perf | **2.39 ms/token** | **418 tok/s** | [Blackwell VLA](examples/blackwell/README.md#vla-latency-rtx-5090) |
 
+**Documentation:** [Thor](examples/thor/README.md) · [RTX 5090](examples/blackwell/README.md).
+
 #### LingBot-VLA
 
 | Hardware | Mode | Latency | Throughput | Source |
@@ -184,6 +182,8 @@ See [reproduction and accuracy](docs/thor/groot-n17.md) and the
 | Jetson AGX Thor | FA4, 10 steps | **64.1 ms** | **16 Hz** | [LingBot usage](docs/lingbot_usage.md#5-accuracy--latency-thor-sm_110-cuda-graph-replay) |
 | Jetson AGX Thor | FA4, 25 steps | **97.5 ms** | **10 Hz** | [LingBot usage](docs/lingbot_usage.md#5-accuracy--latency-thor-sm_110-cuda-graph-replay) |
 | Jetson AGX Thor | FA4, 50 steps | **155.8 ms** | **6 Hz** | [LingBot usage](docs/lingbot_usage.md#5-accuracy--latency-thor-sm_110-cuda-graph-replay) |
+
+**Documentation:** [Run LingBot-VLA](docs/lingbot_usage.md).
 
 #### Qwen3.6-27B
 
@@ -209,6 +209,8 @@ DGX Spark / GB10:
 |---|---:|---:|---|
 | NVFP4, 128 | **170.1 ms** | **40.42 tok/s** | [Qwen3.6 Spark](docs/qwen36_spark.md#performance) |
 | NVFP4, 16 K | **8.545 s** | **54.94 tok/s** | [Qwen3.6 Spark](docs/qwen36_spark.md#performance) |
+
+**Documentation:** [RTX 5090 / Thor](docs/qwen36_nvfp4.md) · [DGX Spark](docs/qwen36_spark.md).
 
 #### Qwen3.6-35B-A3B
 
@@ -236,12 +238,16 @@ Speculative decode with the MTP head reaches **106.74 tok/s** against 100.35
 plain in the same process, emitting the same tokens as greedy decoding. See
 [speculative decode](docs/qwen36_moe_usage.md#speculative-decode).
 
+**Documentation:** [Run Qwen3.6 MoE](docs/qwen36_moe_usage.md).
+
 #### Qwen3-8B
 
 | Hardware | Mode | Prefill | Decode | Source |
 |---|---|---:|---:|---|
 | RTX 5090 | P=64 | **9.1 ms** | **150 tok/s** | [Qwen3-8B NVFP4](docs/qwen3_8b_nvfp4.md) |
 | RTX 5090 | P=1024 | **24.8 ms** | **150 tok/s** | [Qwen3-8B NVFP4](docs/qwen3_8b_nvfp4.md) |
+
+**Documentation:** [Run Qwen3-8B](docs/qwen3_8b_nvfp4.md).
 
 #### Qwen3-VL-8B
 
@@ -251,6 +257,8 @@ RTX 5090, NVFP4 language stack + FP8 ViT, image + text:
 |---|---:|---:|---:|---|
 | Full resolution | 1581 | **~100 ms** | **~150 tok/s** | [Qwen3-VL RTX 5090](docs/qwen3_vl_nvfp4.md#1-headline-performance) |
 | 0.5 MP cap | 473 | **~32 ms** | **~150 tok/s** | [Qwen3-VL resolution sweep](docs/qwen3_vl_nvfp4.md#ttft-vs-resolution-the-dominant-knob) |
+
+**Documentation:** [Run Qwen3-VL-8B](docs/qwen3_vl_nvfp4.md).
 
 #### Qwen3-VL-2B on Jetson
 
@@ -268,12 +276,16 @@ Thor prefill is eager by measurement, not omission: a prefill CUDA Graph
 prototype bought 0.3% there (GPU-bound), so it was not shipped; see
 [Where prefill time goes](docs/qwen3_vl_thor.md#where-prefill-time-goes).
 
+**Documentation:** [Thor](docs/qwen3_vl_thor.md) · [Orin](docs/qwen3_vl_rtx_bf16.md).
+
 #### Higgs Audio v3
 
 | Hardware | Mode | Latency | TTFA | Throughput | Source |
 |---|---|---:|---:|---:|---|
 | RTX 5090 | FP8 AR decode | **3.6 ms/frame** | **~79 ms** | RTF **0.09** | [Higgs performance](docs/higgs_audio_v3.md#performance) |
 | RTX 5090 | BF16 AR decode | **6.0 ms/frame** | **~127 ms** | RTF **0.151** | [Higgs performance](docs/higgs_audio_v3.md#performance) |
+
+**Documentation:** [Run Higgs Audio](docs/higgs_audio_v3.md).
 
 #### Motus Stage3
 
@@ -282,12 +294,16 @@ prototype bought 0.3% there (GPU-bound), so it was not shipped; see
 | RTX 5090 | fast profile | **167 ms** | **6.0 Hz** | [Motus usage](docs/motus_usage_beta.md) |
 | RTX 5090 | TeaCache | **100 ms** | **10 Hz** | [Motus usage](docs/motus_usage_beta.md) |
 
+**Documentation:** [Run Motus](docs/motus_usage_beta.md).
+
 #### Wan2.2 TI2V-5B
 
 | Hardware | Mode | Generation time | Source |
 |---|---|---:|---|
 | RTX 5090 | 720p, 121f, 20 steps | **178.6 s** | [Wan2.2 benchmarks](docs/wan22_usage.md#benchmarks) |
 | RTX 5090 | TeaCache 0.3 | **114.2 s** | [Wan2.2 benchmarks](docs/wan22_usage.md#benchmarks) |
+
+**Documentation:** [Run Wan2.2](docs/wan22_usage.md).
 
 #### Cosmos3-Edge AV inverse dynamics and Reasoner
 
@@ -306,9 +322,7 @@ the public 1705/911/1263-token text/image/video profile:
 |---|---:|---:|---:|---|
 | FlashRT NVFP4 + whole-step CUDA Graph | **104.3 tok/s** | **112.6 tok/s** | **108.7 tok/s** | [Cosmos3-Edge Reasoner usage](docs/cosmos3_edge_thor.md) |
 
-See the [complete Cosmos3-Edge Thor usage guide](docs/cosmos3_edge_thor.md) for
-the SM110 build flags, official AV baseline and fixture workflow, FP8/NVFP4
-commands, Reasoner text/image/video inputs, accuracy checks, and limitations.
+**Documentation:** [Run Cosmos3-Edge](docs/cosmos3_edge_thor.md).
 
 #### Cosmos3-Nano text-to-video
 
@@ -319,6 +333,8 @@ RTX 5090, 480p, 49 frames, 10-step UniPC:
 | Official eager | ~53.5 s | ~2.3 s | **~55.8 s** | [Cosmos3-Nano usage](docs/cosmos3_video_usage.md#1-precision--speed-rtx-5090--sm120) |
 | FlashRT BF16, no step cache | 4.4 s | 2.3 s | **6.7 s** | [Cosmos3-Nano usage](docs/cosmos3_video_usage.md#1-precision--speed-rtx-5090--sm120) |
 | FlashRT FP8, no step cache | 2.5 s | 2.3 s | **4.8 s** | [Cosmos3-Nano usage](docs/cosmos3_video_usage.md#1-precision--speed-rtx-5090--sm120) |
+
+**Documentation:** [Run Cosmos3-Nano](docs/cosmos3_video_usage.md).
 
 ## Getting Started
 
@@ -360,8 +376,6 @@ First call: ~3 s (calibration + CUDA Graph capture). Every subsequent call: 44 m
 
 
 ## Start here
-
-For matched Thor measurements: [comparison settings and timing boundaries](docs/thor/comparison.md).
 
 The **official FlashRT Thor image** is `ghcr.io/flashrt-project/flashrt-thor:thor-v0.1.1` — [pull, prepare weights and validate](docs/thor/docker.md).
 
