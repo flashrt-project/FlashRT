@@ -201,6 +201,26 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   below the 0.999 precision gate). See `docs/hyvla05_thor_sm110.md`,
   `docs/hyvla05_orin_sm87.md`, and `docs/hyvla05_rtx_sm120.md`.
 
+### Pi0.5 optimized Thor decoder
+
+For the optimized torch/Thor full NVFP4 path, build with
+`-DFLASHRT_ENABLE_PI05_THOR=ON` and call:
+
+```python
+flash_rt.load_model(checkpoint, config="pi05", framework="torch", hardware="thor",
+                    num_views=2, use_fa4=True, use_fp4=True, use_fp4_decoder=True,
+                    awq_alpha=0.5, encoder_p1_combiner="epilogue_hw_nod",
+                    encoder_down_variant=8)
+```
+
+The optimized decoder uses the Pi0.5-owned `flash_rt_pi05_thor` module.
+An absent module raises an error naming the required build flag. Encoder-only,
+JAX and other hardware routes retain their existing frontend. See the
+[Thor guide](thor/pi05.md) for calibration and precision checks.
+
+Pi0.5 state prompts zero-pad shorter normalized states to 32 dimensions before
+discretization, matching OpenPI's tokenizer input. Text-only prompts are unchanged.
+
 ### `flash_rt.VLAModel`
 
 ```python

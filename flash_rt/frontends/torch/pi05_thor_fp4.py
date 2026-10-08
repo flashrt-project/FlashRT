@@ -1498,3 +1498,2202 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
             raise RuntimeError(
                 "Pi0.5 decoder FP4 model-runtime export is not implemented")
         return super()._ensure_model_runtime_export()
+
+
+from flash_rt.models.pi05.pipeline_thor_fp4 import (
+    encoder_forward_with_fp4_subset as encoder_forward_with_fp4_subset_optimized,
+)
+def _swz32(t):
+    """fp32 copy of a per-column table in the v5 row kernels' lane-major order:
+    block b = lane + 32*j, quarter q -> float4 index (j*4 + q)*32 + lane, padded
+    to a multiple of 32 blocks. Values are the fp16 originals exactly."""
+    t = t.detach().reshape(-1)
+    nb = t.numel() // 16
+    nbp = (nb + 31) // 32 * 32
+    f = torch.zeros(nbp * 16, dtype=torch.float32, device=t.device)
+    f[:t.numel()] = t.float()
+    return f.view(nbp // 32, 32, 4, 4).permute(0, 2, 1, 3).contiguous().view(-1)
+
+class Pi05TorchFrontendThorFP4Optimized(Pi05TorchFrontendThor):
+    """Pi0.5 Thor frontend with optional NVFP4 encoder and decoder paths."""
+
+    def __init__(
+        self,
+        checkpoint_dir,
+        num_views: int = 2,
+        use_cuda_graph: bool = True,
+        autotune: int = 3,
+        *,
+        use_fp4_encoder_ffn: bool = False,
+        use_fp4_decoder: bool = False,
+        fp4_layers: Iterable[int] = (7, 8, 9),
+        use_awq: bool = False,
+        awq_alpha: float = 0.5,
+        awq_calib_iters: int = 8,
+        use_p1_split_gu: bool = False,
+        encoder_p1_combiner: str = "epilogue_hw_nod",
+        encoder_down_variant: int = 7,
+        encoder_down_x_variant: int = 6,
+        decoder_qkv_variant: int = 28,
+        decoder_o_variant: int = 28,
+        decoder_gate_up_variant: int = 10,
+        decoder_down_variant: int = 28,
+        decoder_weight_format: str = "nvfp4",
+        decoder_act_format: str = "nvfp4",
+        decoder_fused_attn: bool = False,
+        decoder_fused_geglu: bool = True,
+        decoder_rht: bool = False,
+        use_fp8: bool = True,
+        state_prompt_mode: str = "exact",
+        state_prompt_fixed_max_len=None,
+        use_fa4: bool = False,
+        use_fp4_encoder_attn: bool = False,
+        use_fp4_encoder_attn_qkv: bool = False,
+        use_fp4_siglip_ffn: bool = False,
+        fp4_siglip_layers: Iterable[int] = None,
+    ):
+        global fvk_optimized, fp4_optimized
+        from flash_rt.models.pi05.thor_kernels import (
+            kernels as fvk_optimized,
+            fp4 as fp4_optimized,
+        )
+
+        if use_fp4_decoder and (not use_fp8):
+            raise ValueError("use_fp4_decoder=True requires the FP8 Thor encoder path")
+        if use_fp4_encoder_attn and (not use_fp4_encoder_ffn):
+            raise ValueError(
+                "use_fp4_encoder_attn=True requires use_fp4_encoder_ffn=True"
+            )
+        if use_fp4_encoder_attn_qkv and (not use_fp4_encoder_attn):
+            raise ValueError(
+                "use_fp4_encoder_attn_qkv=True requires use_fp4_encoder_attn=True"
+            )
+        super().__init__(
+            checkpoint_dir,
+            num_views=num_views,
+            use_cuda_graph=use_cuda_graph,
+            autotune=autotune,
+            use_fp8=use_fp8,
+            state_prompt_mode=state_prompt_mode,
+            state_prompt_fixed_max_len=state_prompt_fixed_max_len,
+            use_fa4=use_fa4,
+        )
+        self.use_fp4_encoder_ffn = bool(use_fp4_encoder_ffn)
+        self.use_fp4_decoder = bool(use_fp4_decoder)
+        self.use_fp4_encoder_attn = bool(use_fp4_encoder_attn)
+        self.use_fp4_encoder_attn_qkv = bool(use_fp4_encoder_attn_qkv)
+        self.use_fp4_siglip_ffn = bool(use_fp4_siglip_ffn)
+        self._fp4_siglip_layers = (
+            frozenset(fp4_siglip_layers)
+            if fp4_siglip_layers is not None
+            else frozenset(range(27))
+        )
+        self._fp4_layers = (
+            frozenset(fp4_layers) if self.use_fp4_encoder_ffn else frozenset()
+        )
+        self.use_awq = bool(use_awq) and self.use_fp4_encoder_ffn
+        self.awq_alpha = float(awq_alpha)
+        self.awq_calib_iters = int(awq_calib_iters)
+        self.use_p1_split_gu = bool(use_p1_split_gu) and self.use_fp4_encoder_ffn
+        invalid_layers = sorted(
+            (l for l in self._fp4_layers if l < 0 or l >= self.Le - 1)
+        )
+        if invalid_layers:
+            raise ValueError(
+                f"fp4_layers contains non-live encoder FFN layers {invalid_layers}; valid layers are [0, {self.Le - 2}]"
+            )
+        if encoder_p1_combiner not in (
+            "direct",
+            "lut",
+            "lut_native",
+            "epilogue",
+            "epilogue_hw",
+            "epilogue_hw_nod",
+            "epilogue_hw_nod_2sm",
+        ):
+            raise ValueError(
+                f"encoder_p1_combiner must be 'direct', 'lut', 'lut_native', 'epilogue', 'epilogue_hw', or 'epilogue_hw_nod', got {encoder_p1_combiner!r}"
+            )
+        self.encoder_p1_combiner = encoder_p1_combiner
+        self.encoder_down_variant = int(encoder_down_variant)
+        self.encoder_down_x_variant = int(encoder_down_x_variant)
+        self.decoder_qkv_variant = int(decoder_qkv_variant)
+        self.decoder_o_variant = int(decoder_o_variant)
+        self.decoder_gate_up_variant = int(decoder_gate_up_variant)
+        self.decoder_down_variant = int(decoder_down_variant)
+        if decoder_weight_format not in ("nvfp4", "e0m3"):
+            raise ValueError(
+                f"decoder_weight_format must be 'nvfp4' or 'e0m3', got {decoder_weight_format!r}"
+            )
+        if decoder_act_format not in ("nvfp4", "e0m3"):
+            raise ValueError(
+                f"decoder_act_format must be 'nvfp4' or 'e0m3', got {decoder_act_format!r}"
+            )
+        if decoder_act_format == "e0m3" and decoder_weight_format != "e0m3":
+            raise ValueError(
+                "decoder_act_format='e0m3' requires decoder_weight_format='e0m3'"
+            )
+        if decoder_rht and decoder_act_format != "e0m3":
+            raise ValueError(
+                "decoder_rht=True requires decoder_act_format='e0m3' (the rotation must be applied to both operands)"
+            )
+        self.decoder_weight_format = decoder_weight_format
+        self.decoder_act_format = decoder_act_format
+        self.decoder_rht = bool(decoder_rht)
+        self.decoder_fused_attn = bool(decoder_fused_attn)
+        self.decoder_fused_geglu = (
+            bool(decoder_fused_geglu) and decoder_weight_format == "nvfp4"
+        )
+        self.decoder_fused_geglu_nod = False and self.decoder_fused_geglu
+        self.decoder_fused_geglu_swap_persist = False
+        self.siglip_attn_custom = 0
+        self.prologue_opt = 31
+        self.rowops_ln_v3 = 0
+        self.siglip_quant_fp8_v2 = False
+        self.rowops_v5 = 7
+        self.encoder_skip_post_rms = True
+        self.encoder_qkv_lt = False
+        self.encoder_qkv_swap = 0
+        self.encoder_fa4_pack = 1
+        self.siglip_qkv_cutlass = 0
+        self.siglip_l2_touch = 1
+        self.siglip_l2_touch_mask = 5
+        self.siglip_l2_touch_hint = 4
+        self.siglip_l2_touch_threads = 128
+        self.siglip_l2_touch_fork = 0
+        self.siglip_l2_touch_pace = 12288
+        self.decoder_l2_persist = 0
+        self.decoder_l2_persist_mb = 16
+        self.decoder_action_fused = True
+        self.decoder_fused_geglu_swap_stages = 0
+        self.decoder_ares_gemm = 0
+        self.decoder_fused_geglu_swap = True and self.decoder_fused_geglu
+        self.decoder_attn_splitkv = False
+        self.decoder_attn_mqa = False
+        self.decoder_attn_decode = 0
+        self.decoder_kv_fp8 = False or 0 in (2, 4)
+        self.decoder_attn_mqa_variant = 1
+        self.decoder_attn_tc05 = False
+        self.decoder_phase_cta = 0
+        self.decoder_fused_geglu_earlyb = 0
+        self.decoder_weight_evict_first = 0
+        if 0 and hasattr(fp4_optimized, "set_weight_evict_first"):
+            fp4_optimized.set_weight_evict_first(1)
+        self._decoder_phase_counters = None
+        self.decoder_seq = False
+        self.decoder_rowops_quant = True
+        self.decoder_seq_variant = 0
+        self.decoder_l2_touch = 2
+        self.decoder_l2_touch_hint = 2
+        self.decoder_l2_touch_depth = 16
+        self.decoder_l2_touch_pace = 12288
+        self.decoder_l2_touch_ahead = 1
+        self.decoder_l2_touch_threads = 256
+        self.decoder_l2_touch_kv = 0
+        self.decoder_l2_touch_mask = 15
+        self.decoder_l2_touch_sfb = 1
+        self.decoder_l2_touch_fork = 1
+        self.decoder_l2_touch_kv_late = 0
+        self.encoder_l2_touch = 1
+        self.encoder_l2_touch_mask = 3
+        self.encoder_l2_touch_fork = 2
+        self.encoder_l2_touch_hint = 4
+        self.encoder_l2_touch_threads = 128
+        self._decoder_l2_touch_sink = None
+        rc = fp4_optimized.pi05_l2_touch_init()
+        if rc != 0:
+            raise RuntimeError(f"pi05_l2_touch_init failed rc={rc}")
+        self._decoder_seq_counter = None
+        self._decoder_seq_gu_dummy = None
+        self._decoder_seq_partials = None
+        self._decoder_seq_slot_packed = None
+        self._decoder_seq_slot_sfa = None
+        self.rowops_v2 = True
+        self.rowops_res_epilogue = True
+        self.encoder_attn_o_variant = 49
+        self.siglip_up_variant = 2
+        self.siglip_down_variant = 4
+        self.pdl = True
+        self.pdl_fvk = True
+        _fvk_fp4_pdl = fp4_optimized
+        _fvk_pdl = fvk_optimized
+        _fvk_fp4_pdl.set_pdl(True)
+        if hasattr(_fvk_pdl, "set_pdl"):
+            _fvk_pdl.set_pdl(True and True)
+        self._decoder_attn_ws = None
+        if self._fp4_layers:
+            if not _HAS_FP4:
+                raise RuntimeError(
+                    "use_fp4_encoder_ffn=True but flash_rt_fp4 not available. Ensure flash_rt_fp4.so is built with NVFP4 support."
+                )
+            fp4_variant_count = int(fp4_optimized.pi05_cutlass_fp4_gemm_num_variants())
+            if not 0 <= self.encoder_down_variant < fp4_variant_count:
+                raise ValueError(
+                    f"encoder_down_variant must be in [0, {fp4_variant_count}), got {self.encoder_down_variant}"
+                )
+            self._prepare_fp4_encoder()
+            if self.use_fp4_encoder_attn:
+                self._prepare_fp4_encoder_attn()
+            if self.use_fp4_siglip_ffn:
+                self._prepare_fp4_siglip_ffn()
+            logger.info(
+                "Pi05 FP4 enabled on encoder layers: %s  (AWQ=%s, attn=%s)",
+                sorted(self._fp4_layers),
+                self.use_awq,
+                self.use_fp4_encoder_attn,
+            )
+        if self.use_fp4_decoder:
+            if not _HAS_FP4:
+                raise RuntimeError(
+                    "use_fp4_decoder=True but flash_rt_fp4 is unavailable or was built without NVFP4 support"
+                )
+            device_name = torch.cuda.get_device_name(0)
+            capability = tuple(torch.cuda.get_device_capability(0))
+            if device_name != "NVIDIA Thor" or capability != (11, 0):
+                raise RuntimeError(
+                    f"Pi0.5 decoder FP4 requires NVIDIA Thor SM110; got {device_name} CC {capability}"
+                )
+            variants = (
+                self.decoder_qkv_variant,
+                self.decoder_o_variant,
+                self.decoder_gate_up_variant,
+                self.decoder_down_variant,
+            )
+            variant_count = int(fp4_optimized.pi05_cutlass_fp4_gemm_num_variants())
+            for name, v in (
+                ("decoder_qkv_variant", variants[0]),
+                ("decoder_o_variant", variants[1]),
+                ("decoder_gate_up_variant", variants[2]),
+                ("decoder_down_variant", variants[3]),
+            ):
+                if not 0 <= v < variant_count:
+                    raise ValueError(f"{name} must be in [0, {variant_count}), got {v}")
+            self._decoder_fp4_variants = variants
+            self._decoder_fp4_weights = []
+            if self.decoder_rht:
+                h = torch.ones(1, 1, dtype=torch.float32, device="cuda")
+                for _ in range(4):
+                    h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
+                self._rht_h16 = h / 4.0
+            from safetensors import safe_open
+            from flash_rt.executors.torch_weights import (
+                _autodetect_strip_prefix,
+                _interleave_qk_core,
+            )
+
+            root = "paligemma_with_expert.gemma_expert.model.layers"
+            with safe_open(self._checkpoint_path, framework="pt", device="cuda") as sf:
+                strip = _autodetect_strip_prefix(set(sf.keys()))
+
+                def get(key):
+                    return sf.get_tensor(strip + key if strip else key)
+
+                for layer in range(self.La):
+                    prefix = f"{root}.{layer}"
+                    q = _interleave_qk_core(
+                        get(f"{prefix}.self_attn.q_proj.weight").float(), 8
+                    )
+                    k = _interleave_qk_core(
+                        get(f"{prefix}.self_attn.k_proj.weight").float(), 1
+                    )
+                    v = get(f"{prefix}.self_attn.v_proj.weight").float()
+                    qkv = torch.cat([q, k, v], dim=0).to(fp16).contiguous()
+                    o = get(f"{prefix}.self_attn.o_proj.weight").to(fp16).contiguous()
+                    gate = get(f"{prefix}.mlp.gate_proj.weight").to(fp16)
+                    up = get(f"{prefix}.mlp.up_proj.weight").to(fp16)
+                    gate_up = torch.cat([gate, up], dim=0).contiguous()
+                    down = get(f"{prefix}.mlp.down_proj.weight").to(fp16).contiguous()
+                    actual = (qkv.shape, o.shape, gate_up.shape, down.shape)
+                    expected = (
+                        (2560, self.Da),
+                        (self.Da, 2048),
+                        (2 * self.Ha, self.Da),
+                        (self.Da, self.Ha),
+                    )
+                    if actual != expected:
+                        raise ValueError(
+                            f"decoder FP4 layer {layer} shapes {actual} != {expected}"
+                        )
+                    quantized = {}
+                    for name, weight in (
+                        ("qkv", qkv),
+                        ("o", o),
+                        ("gate_up", gate_up),
+                        ("down", down),
+                    ):
+                        packed = quant_weight_nvfp4(weight)
+                        if self.decoder_weight_format == "e0m3":
+                            if self.decoder_rht:
+                                Nw, Kw = weight.shape
+                                weight = (
+                                    (
+                                        weight.float().view(Nw, Kw // 16, 16)
+                                        @ self._rht_h16
+                                    )
+                                    .to(fp16)
+                                    .view(Nw, Kw)
+                                    .contiguous()
+                                )
+                            rc = fp4_optimized.quantize_e0m3_dynamic_sfa_fp16(
+                                weight.data_ptr(),
+                                packed["packed"].data_ptr(),
+                                packed["sfb"].data_ptr(),
+                                packed["N"],
+                                packed["K"],
+                                True,
+                                0,
+                            )
+                        else:
+                            rc = fp4_optimized.quantize_fp4_dynamic_sfa_mse_fp16(
+                                weight.data_ptr(),
+                                packed["packed"].data_ptr(),
+                                packed["sfb"].data_ptr(),
+                                packed["N"],
+                                packed["K"],
+                                True,
+                                0,
+                            )
+                        if rc != 0:
+                            raise RuntimeError(
+                                f"decoder {name} {self.decoder_weight_format} quantization failed at layer {layer}: rc={rc}"
+                            )
+                        quantized[name] = packed
+                    if self.decoder_fused_geglu:
+                        il = _interleave_gu_rows(
+                            gate_up[: self.Ha].contiguous(),
+                            gate_up[self.Ha :].contiguous(),
+                        )
+                        packed = quant_weight_nvfp4(il)
+                        rc = fp4_optimized.quantize_fp4_dynamic_sfa_mse_fp16(
+                            il.data_ptr(),
+                            packed["packed"].data_ptr(),
+                            packed["sfb"].data_ptr(),
+                            packed["N"],
+                            packed["K"],
+                            True,
+                            0,
+                        )
+                        if rc != 0:
+                            raise RuntimeError(
+                                f"decoder gu_il quantization failed at layer {layer}: rc={rc}"
+                            )
+                        quantized["gu_il"] = packed
+                    torch.cuda.synchronize()
+                    self._decoder_fp4_weights.append(quantized)
+            self._decoder_fp4_xn = FP4ActScratch(self.Sa, self.Da, device="cuda")
+            self._decoder_fp4_ctx = FP4ActScratch(self.Sa, 2048, device="cuda")
+            self._decoder_fp4_hid = FP4ActScratch(self.Sa, self.Ha, device="cuda")
+            if self.decoder_fused_geglu:
+                self._decoder_fp4_gu_dummy = torch.zeros(
+                    self.Sa, self.Ha, dtype=torch.uint8, device="cuda"
+                )
+            logger.info(
+                "Pi0.5 decoder NVFP4 enabled: variants=%s, layers=%d",
+                self._decoder_fp4_variants,
+                self.La,
+            )
+
+    def _decoder_l2_touch_sink_ptr(self):
+        if self._decoder_l2_touch_sink is None:
+            import torch
+
+            self._decoder_l2_touch_sink = torch.zeros(
+                4, dtype=torch.int32, device="cuda"
+            )
+        return int(self._decoder_l2_touch_sink.data_ptr())
+
+    def _decoder_seq_ptrs(self):
+        """Device buffers of the persistent decoder sequence: (counter, gate_up fp16 D scratch,
+        row ssq partials, private activation slots packed / SFA); zeros when off."""
+        return (0, 0, 0, 0, 0)
+        if self._decoder_seq_counter is None:
+            import torch
+
+            slots = 10
+            self._decoder_seq_counter = torch.zeros(4, dtype=torch.int32, device="cuda")
+            self._decoder_seq_gu_dummy = torch.zeros(
+                self.Sa * self.Ha * 2, dtype=torch.half, device="cuda"
+            )
+            self._decoder_seq_partials = torch.zeros(
+                self.Sa * 32, dtype=torch.float32, device="cuda"
+            )
+            self._decoder_seq_slot_packed = torch.zeros(
+                slots * 16 * (self.Da // 2), dtype=torch.uint8, device="cuda"
+            )
+            self._decoder_seq_slot_sfa = torch.zeros(
+                slots * 128 * (self.Da // 16), dtype=torch.uint8, device="cuda"
+            )
+        return (
+            int(self._decoder_seq_counter.data_ptr()),
+            int(self._decoder_seq_gu_dummy.data_ptr()),
+            int(self._decoder_seq_partials.data_ptr()),
+            int(self._decoder_seq_slot_packed.data_ptr()),
+            int(self._decoder_seq_slot_sfa.data_ptr()),
+        )
+
+    def _decoder_phase_counters_ptr(self) -> int:
+        """Arrival/done counters for the phase-CTA GEMM launches (zeroed once)."""
+        return 0
+        if self._decoder_phase_counters is None:
+            self._decoder_phase_counters = torch.zeros(
+                64, dtype=torch.int32, device="cuda"
+            )
+        return int(self._decoder_phase_counters.data_ptr())
+
+    def _decoder_attn_ws_ptr(self) -> int:
+        """Workspace for the fused decoder attention kernels (0 when disabled)."""
+        return 0
+        if self._decoder_attn_ws is None:
+            import torch
+            from flash_rt import flash_rt_fp4 as fvk_fp4
+
+            n = 0
+            self._decoder_attn_ws = torch.zeros(n, dtype=torch.uint8, device="cuda")
+        return int(self._decoder_attn_ws.data_ptr())
+
+    def _calibrate_multi_frame(self, obs_list, *, percentile: float, verbose: bool):
+        """Pi0.5 FP4 multi-sample (N>=2) calibration.
+
+        FP4 has three independent scale storages that all need to be
+        consistent with each other and with the captured CUDA graph:
+
+          * FP8 act scales (``_enc_calib_scales[72]``)         - FP4 layers'
+                                                                QKV/O path +
+                                                                every non-FP4
+                                                                layer.
+          * NVFP4 block scales (baked into ``_fp4_weights[l]['*']['sfb']``)
+          * AWQ per-input-channel inv_s (``_awq_inv_s_gu[l]``,
+            ``_awq_inv_s_dn[l]``)                              - only when
+                                                                AWQ is on.
+
+        The single-frame ``_recalibrate_with_real_data`` updates all three
+        in the right order; a naive super() call only updates the FP8
+        side and the captured graph ends up referencing stale AWQ +
+        stale NVFP4 weights (measured cos_vs_prod collapsed to 0.12).
+
+        Fix: do it in two phases.
+
+          Phase 1 (FP8 + graph recapture, delegated to the base class)
+            super()._calibrate_multi_frame(...)
+              - per-sample FP8 amax on encoder + decoder
+              - percentile reduce, upload, _enc_alpha_host recompute
+              - _capture_enc_ae_graph() via the FP4-aware override
+            Graph is now captured with fresh FP8 scales but the AWQ
+            inv_s + NVFP4 weight buffers still hold whatever values
+            _prepare_fp4_encoder wrote at construction time.
+
+          Phase 2 (AWQ + NVFP4 re-quant, in place)
+            For each obs: upload images + SigLIP.replay() so _enc_x
+              reflects this sample, then _collect_awq_activation_amax()
+              returns per-channel Gate+Up and Down amax for every active
+              FP4 layer using the now-fresh FP8 scales.
+            Percentile-reduce across samples.
+            _requant_fp4_weights_with_awq() writes new inv_s and re-
+              quantizes FP4 weights in place — the captured graph's
+              pointers do not change, so the next replay picks up the
+              new values without a second graph capture.
+
+        If AWQ is disabled (``self.use_awq == False``) there is no
+        per-channel scale to refit and the function reduces to Phase 1.
+        """
+        if not self._fp4_layers:
+            return super()._calibrate_multi_frame(
+                obs_list, percentile=percentile, verbose=verbose
+            )
+        import numpy as np
+        from flash_rt.core.calibration import (
+            accumulate_amax,
+            check_scale_ceiling,
+            format_summary,
+            summarize_amax_dispersion,
+        )
+
+        n = len(obs_list)
+        logger.info(
+            "Pi0.5 FP4 Thor: calibrating FP8 + AWQ across %d real samples (percentile=%.2f)...",
+            n,
+            percentile,
+        )
+        super()._calibrate_multi_frame(obs_list, percentile=percentile, verbose=verbose)
+        if not self.use_awq:
+            logger.info(
+                "Pi0.5 FP4 Thor: AWQ disabled, skipping Phase 2 AWQ refit (N=%d multi-frame limited to FP8 scales only)",
+                n,
+            )
+            return
+        nv = self.num_views
+        De = self.De
+        He = self.He
+        per_sample_gu: dict = {l: [] for l in self._fp4_layers}
+        per_sample_dn: dict = {l: [] for l in self._fp4_layers}
+        sig_layers = sorted(self._sig_fp4_weights) if self.use_fp4_siglip_ffn else []
+        per_sample_sig: dict = {l: [] for l in sig_layers}
+        per_sample_qkv: dict = {}
+        for i, obs in enumerate(obs_list):
+            if "images" in obs:
+                img_list = obs["images"]
+            else:
+                img_list = [obs["image"]]
+                if nv >= 2:
+                    img_list.append(obs.get("wrist_image", obs["image"]))
+                if nv >= 3:
+                    img_list.append(obs.get("wrist_image_right", img_list[-1]))
+
+            def _to_np16(im):
+                if isinstance(im, torch.Tensor):
+                    if im.dtype == torch.uint8 or (
+                        im.is_floating_point() and torch.max(im).item() > 1.5
+                    ):
+                        im = im.float() / 127.5 - 1.0
+                    return im.to(dtype=fp16).cpu().numpy()
+                if im.dtype == np.float16:
+                    return im
+                return (im.astype(np.float32) / 127.5 - 1.0).astype(np.float16)
+
+            images_np = np.stack([_to_np16(im) for im in img_list[:nv]])
+            self._img_buf.upload(images_np)
+            self._siglip_graph.replay()
+            torch.cuda.synchronize()
+            if self.use_fp4_encoder_attn_qkv:
+                act_gu, act_dn, act_qkv = self._collect_awq_activation_amax(
+                    collect_qkv=True
+                )
+                for l in act_qkv:
+                    per_sample_qkv.setdefault(l, []).append(
+                        act_qkv[l].detach().cpu().numpy().astype(np.float32)
+                    )
+            else:
+                act_gu, act_dn = self._collect_awq_activation_amax()
+            for l in self._fp4_layers:
+                per_sample_gu[l].append(
+                    act_gu[l].detach().cpu().numpy().astype(np.float32)
+                )
+                per_sample_dn[l].append(
+                    act_dn[l].detach().cpu().numpy().astype(np.float32)
+                )
+            if sig_layers:
+                sig_amax = self._collect_siglip_awq_amax()
+                for l in sig_layers:
+                    per_sample_sig[l].append(
+                        sig_amax[l].detach().cpu().numpy().astype(np.float32)
+                    )
+            if verbose and (i + 1) % max(1, n // 10) == 0:
+                logger.info("  AWQ sample %d/%d", i + 1, n)
+        final_gu: dict = {}
+        final_dn: dict = {}
+        for l in self._fp4_layers:
+            final_gu[l] = accumulate_amax(per_sample_gu[l], percentile=percentile)
+            final_dn[l] = accumulate_amax(per_sample_dn[l], percentile=percentile)
+            if verbose:
+                logger.info(
+                    "  layer %d: GU %s  Down %s",
+                    l,
+                    format_summary(
+                        summarize_amax_dispersion(per_sample_gu[l], final_gu[l])
+                    ),
+                    format_summary(
+                        summarize_amax_dispersion(per_sample_dn[l], final_dn[l])
+                    ),
+                )
+        check_scale_ceiling(
+            {f"L{l}_dn_max": float(final_dn[l].max()) for l in self._fp4_layers},
+            label=f"pi05_thor_fp4_awq_N{n}",
+        )
+        if sig_layers:
+            final_sig = {
+                l: accumulate_amax(per_sample_sig[l], percentile=percentile)
+                for l in sig_layers
+            }
+            self._requant_sig_fp4_weights_with_awq(
+                {l: torch.as_tensor(final_sig[l], device="cuda") for l in sig_layers}
+            )
+            self._sig_awq_calibrated = True
+        if per_sample_qkv:
+            self._requant_enc_attn_qkv_with_awq(
+                {
+                    l: torch.as_tensor(
+                        accumulate_amax(v, percentile=percentile), device="cuda"
+                    )
+                    for l, v in per_sample_qkv.items()
+                }
+            )
+        act_gu_dev = {l: torch.from_numpy(final_gu[l]).cuda() for l in self._fp4_layers}
+        act_dn_dev = {l: torch.from_numpy(final_dn[l]).cuda() for l in self._fp4_layers}
+        self._requant_fp4_weights_with_awq(act_gu_dev, act_dn_dev)
+        self._awq_calibrated = True
+        logger.info(
+            "Pi0.5 FP4 Thor multi-frame calibration complete (N=%d, percentile=%.2f, AWQ refit done in place)",
+            n,
+            percentile,
+        )
+
+    def _prepare_fp4_encoder(self):
+        De = self.De
+        He = self.He
+        self._fp4_weights = {}
+        self._load_fp4_weights_from_safetensors()
+        logger.info("FP4 weights loaded via fp16-native path (no FP8 intermediate)")
+        self._fp4_variant_gu = pick_variant(2 * He, De)
+        self._fp4_variant_dn = self.encoder_down_variant
+        self._fp4_scratch_dict = None
+        self._fp4_scratch_Se = -1
+
+    def _load_fp4_weights_from_safetensors(self):
+        """Load fp16 encoder weights directly from safetensors, apply
+        FusedGateUp (with post_attention_layernorm fuse) and NVFP4-quantize.
+        Mirrors paligemma_encoder_block's spec but stays in fp16 end-to-end.
+
+        When self.use_awq=True, also applies AWQ-style per-input-channel
+        weight scaling (W'[:, k] = W[:, k] * s[k]) before NVFP4 quantization,
+        with matching inverse scale stored for runtime activation scaling.
+        """
+        from safetensors import safe_open
+
+        De = self.De
+        He = self.He
+        model_root = "paligemma_with_expert.paligemma.model.language_model.layers"
+        self._awq_inv_s_gu = {} if self.use_awq else None
+        self._awq_inv_s_gu32 = {} if self.use_awq else None
+        self._awq_inv_s_dn = {} if self.use_awq else None
+        from flash_rt.executors.torch_weights import _autodetect_strip_prefix
+
+        with safe_open(self._checkpoint_path, framework="pt", device="cuda") as sf:
+            _strip = _autodetect_strip_prefix(set(sf.keys()))
+
+            def get(k):
+                return sf.get_tensor(_strip + k if _strip else k)
+
+            for l in self._fp4_layers:
+                p = f"{model_root}.{l}"
+                ff = 1.0 + get(f"{p}.post_attention_layernorm.weight").float()
+                ff_u = ff.unsqueeze(0)
+                gw = (get(f"{p}.mlp.gate_proj.weight").float() * ff_u).to(fp16)
+                uw = (get(f"{p}.mlp.up_proj.weight").float() * ff_u).to(fp16)
+                gu_fp16 = torch.cat([gw, uw], dim=0).contiguous()
+                d_fp16 = get(f"{p}.mlp.down_proj.weight").to(fp16).contiguous()
+                assert gu_fp16.shape == (
+                    2 * He,
+                    De,
+                ), f"gate_up shape {gu_fp16.shape} != {(2 * He, De)}"
+                assert d_fp16.shape == (
+                    De,
+                    He,
+                ), f"down shape {d_fp16.shape} != {(De, He)}"
+                if self.use_awq:
+                    gu_fp16, inv_s_gu = self._awq_scale_weight(gu_fp16)
+                    d_fp16, inv_s_dn = self._awq_scale_weight(d_fp16)
+                    self._awq_inv_s_gu[l] = inv_s_gu
+                    self._awq_inv_s_gu32[l] = _swz32(inv_s_gu)
+                    self._awq_inv_s_dn[l] = inv_s_dn
+                self._fp4_weights[l] = {
+                    "gate_up": quant_weight_nvfp4(gu_fp16),
+                    "down": quant_weight_nvfp4(d_fp16),
+                }
+                if self.use_p1_split_gu:
+                    g_fp16 = gu_fp16[:He, :].contiguous()
+                    u_fp16 = gu_fp16[He:, :].contiguous()
+                    if self.encoder_p1_combiner in (
+                        "epilogue",
+                        "epilogue_hw",
+                        "epilogue_hw_nod",
+                        "epilogue_hw_nod_2sm",
+                    ):
+                        inv_dn = self._awq_inv_s_dn[l] if self.use_awq else None
+                        self._fp4_weights[l]["gu_il"] = quant_weight_nvfp4(
+                            _interleave_gu_rows(g_fp16, u_fp16, inv_dn)
+                        )
+                        if self.encoder_p1_combiner == "epilogue":
+                            self._fp4_weights[l]["down_x"] = quant_weight_nvfp4(
+                                _expand_down_k(d_fp16)
+                            )
+                    else:
+                        self._fp4_weights[l]["gate"] = quant_weight_nvfp4(g_fp16)
+                        self._fp4_weights[l]["up"] = quant_weight_nvfp4(u_fp16)
+
+    def _prepare_fp4_encoder_attn(self):
+        """NVFP4-quantize the encoder attention projections.
+
+        O projections (all layers that run attention) use the per-block
+        MSE scale search. With ``use_fp4_encoder_attn_qkv`` the QKV
+        projections are quantized as well (input_layernorm folded, GQA
+        8/1 interleave, all layers); without AWQ their 4-bit Q/K weights
+        shift the attention logits enough to break the raw-cosine gate
+        (worst sample 0.97), so the QKV path relies on the
+        activation-aware requant during multi-sample calibration.
+        """
+        from safetensors import safe_open
+        from flash_rt.executors.torch_weights import (
+            _autodetect_strip_prefix,
+            _interleave_qk_core,
+        )
+
+        De = self.De
+        model_root = "paligemma_with_expert.paligemma.model.language_model.layers"
+        self._enc_attn_fp4_weights = {}
+        self._enc_attn_qkv_fp16 = {}
+        self._enc_attn_qkv_inv_s = {}
+        with safe_open(self._checkpoint_path, framework="pt", device="cuda") as sf:
+            _strip = _autodetect_strip_prefix(set(sf.keys()))
+
+            def get(k):
+                return sf.get_tensor(_strip + k if _strip else k)
+
+            for l in range(self.Le):
+                p = f"{model_root}.{l}"
+                entry = {}
+                if l < self.Le - 1:
+                    o_fp16 = get(f"{p}.self_attn.o_proj.weight").to(fp16).contiguous()
+                    if o_fp16.shape != (De, De):
+                        raise ValueError(
+                            f"encoder o shape {tuple(o_fp16.shape)} != {(De, De)}"
+                        )
+                    packed = quant_weight_nvfp4(o_fp16)
+                    rc = fp4_optimized.quantize_fp4_dynamic_sfa_mse_fp16(
+                        o_fp16.data_ptr(),
+                        packed["packed"].data_ptr(),
+                        packed["sfb"].data_ptr(),
+                        packed["N"],
+                        packed["K"],
+                        True,
+                        0,
+                    )
+                    if rc != 0:
+                        raise RuntimeError(
+                            f"encoder attn O FP4 MSE quantization failed at layer {l}: rc={rc}"
+                        )
+                    entry["o"] = packed
+                if self.use_fp4_encoder_attn_qkv:
+                    q = _interleave_qk_core(
+                        get(f"{p}.self_attn.q_proj.weight").float(), 8
+                    )
+                    k = _interleave_qk_core(
+                        get(f"{p}.self_attn.k_proj.weight").float(), 1
+                    )
+                    v = get(f"{p}.self_attn.v_proj.weight").float()
+                    fa = (1.0 + get(f"{p}.input_layernorm.weight").float()).unsqueeze(0)
+                    qkv_fp16 = (
+                        torch.cat([q * fa, k * fa, v * fa], dim=0).to(fp16).contiguous()
+                    )
+                    if qkv_fp16.shape != (2560, De):
+                        raise ValueError(
+                            f"encoder qkv shape {tuple(qkv_fp16.shape)} != {(2560, De)}"
+                        )
+                    packed_q = quant_weight_nvfp4(qkv_fp16)
+                    rc = fp4_optimized.quantize_fp4_dynamic_sfa_mse_fp16(
+                        qkv_fp16.data_ptr(),
+                        packed_q["packed"].data_ptr(),
+                        packed_q["sfb"].data_ptr(),
+                        packed_q["N"],
+                        packed_q["K"],
+                        True,
+                        0,
+                    )
+                    if rc != 0:
+                        raise RuntimeError(
+                            f"encoder attn QKV FP4 MSE quantization failed at layer {l}: rc={rc}"
+                        )
+                    inv = torch.ones(De, dtype=fp16, device="cuda")
+                    entry["qkv"] = packed_q
+                    entry["qkv_inv_s"] = inv.data_ptr()
+                    self._enc_attn_qkv_fp16[l] = qkv_fp16
+                    self._enc_attn_qkv_inv_s[l] = inv
+                if entry:
+                    torch.cuda.synchronize()
+                    self._enc_attn_fp4_weights[l] = entry
+        logger.info(
+            "Pi05 FP4 encoder attention projections quantized (%d layers, qkv=%s)",
+            len(self._enc_attn_fp4_weights),
+            self.use_fp4_encoder_attn_qkv,
+        )
+
+    def _requant_enc_attn_qkv_with_awq(self, qkv_amax: dict):
+        """In-place AWQ requant of the encoder attention QKV weights."""
+        for l, a in qkv_amax.items():
+            if l not in self._enc_attn_qkv_fp16:
+                continue
+            w_scaled, inv_s = self._awq_scale_weight(
+                self._enc_attn_qkv_fp16[l], activation_amax=a
+            )
+            packed = self._enc_attn_fp4_weights[l]["qkv"]
+            rc = fp4_optimized.quantize_fp4_dynamic_sfa_mse_fp16(
+                w_scaled.data_ptr(),
+                packed["packed"].data_ptr(),
+                packed["sfb"].data_ptr(),
+                packed["N"],
+                packed["K"],
+                True,
+                0,
+            )
+            if rc != 0:
+                raise RuntimeError(
+                    f"encoder attn QKV AWQ requant failed at layer {l}: rc={rc}"
+                )
+            self._enc_attn_qkv_inv_s[l].copy_(inv_s)
+        torch.cuda.synchronize()
+        logger.info("Encoder attn QKV AWQ requant complete (%d layers)", len(qkv_amax))
+
+    def _prepare_fp4_siglip_ffn(self):
+        """NVFP4-quantize the SigLIP FFN (fc1/fc2) with the hidden dim
+        zero-padded to a multiple of 32 (fp4 TMA alignment). Pad rows and
+        columns carry zero weights/biases, so padding is mathematically
+        inert. Also allocates the FFN activation scratch and re-captures
+        the SigLIP graph through siglip_forward_with_fp4_ffn.
+        """
+        from safetensors import safe_open
+        from flash_rt.executors.torch_weights import _autodetect_strip_prefix
+
+        D, H, L = (self.sig_D, self.sig_H, self.sig_L)
+        H_pad = (H + 31) // 32 * 32
+        root = "paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers"
+        self._sig_fp4_weights = {}
+        self._sig_fp4_up_bias = []
+        self._sig_fp4_up_fp16 = {}
+        self._sig_awq_inv_s = {}
+        self._sig_awq_inv_s32 = {}
+        with safe_open(self._checkpoint_path, framework="pt", device="cuda") as sf:
+            _strip = _autodetect_strip_prefix(set(sf.keys()))
+
+            def get(k):
+                return sf.get_tensor(_strip + k if _strip else k)
+
+            for l in sorted(self._fp4_siglip_layers):
+                p = f"{root}.{l}"
+                w_up = get(f"{p}.mlp.fc1.weight").to(fp16)
+                b_up = get(f"{p}.mlp.fc1.bias").to(fp16)
+                w_dn = get(f"{p}.mlp.fc2.weight").to(fp16)
+                if w_up.shape != (H, D) or w_dn.shape != (D, H):
+                    raise ValueError(
+                        f"SigLIP FFN layer {l} shapes {tuple(w_up.shape)}/{tuple(w_dn.shape)} != {(H, D)}/{(D, H)}"
+                    )
+                w_up_p = torch.zeros(H_pad, D, dtype=fp16, device="cuda")
+                w_up_p[:H] = w_up
+                b_up_p = torch.zeros(H_pad, dtype=fp16, device="cuda")
+                b_up_p[:H] = b_up
+                w_dn_p = torch.zeros(D, H_pad, dtype=fp16, device="cuda")
+                w_dn_p[:, :H] = w_dn
+                entry = {}
+                for name, w in (
+                    ("up", w_up_p.contiguous()),
+                    ("down", w_dn_p.contiguous()),
+                ):
+                    packed = quant_weight_nvfp4(w)
+                    rc = fp4_optimized.quantize_fp4_dynamic_sfa_mse_fp16(
+                        w.data_ptr(),
+                        packed["packed"].data_ptr(),
+                        packed["sfb"].data_ptr(),
+                        packed["N"],
+                        packed["K"],
+                        True,
+                        0,
+                    )
+                    if rc != 0:
+                        raise RuntimeError(
+                            f"SigLIP FFN {name} FP4 MSE quantization failed at layer {l}: rc={rc}"
+                        )
+                    entry[name] = packed
+                entry["up_bias"] = b_up_p.data_ptr()
+                self._sig_fp4_up_bias.append(b_up_p)
+                self._sig_fp4_up_fp16[l] = w_up_p.contiguous()
+                inv = torch.ones(D, dtype=fp16, device="cuda")
+                self._sig_awq_inv_s[l] = inv
+                entry["ln_inv_s"] = inv.data_ptr()
+                self._sig_awq_inv_s32[l] = _swz32(inv)
+                entry["ln_inv_s32"] = self._sig_awq_inv_s32[l].data_ptr()
+                torch.cuda.synchronize()
+                self._sig_fp4_weights[l] = entry
+        self._sig_fp4_scratch = {
+            "ln_act": FP4ActScratch(self.sig_S, D, device="cuda"),
+            "hid_act": FP4ActScratch(self.sig_S, H_pad, device="cuda"),
+            "H_pad": H_pad,
+            "rowops_v2": True,
+            "siglip_up_variant": 2,
+            "siglip_down_variant": 4,
+            "rowops_v5": 7,
+            "ln32": self._sig_ln32_tables(),
+        }
+        logger.info(
+            "Pi05 SigLIP FFN NVFP4 quantized (%d layers, H_pad=%d)",
+            len(self._sig_fp4_weights),
+            H_pad,
+        )
+
+    def _apply_l2_persist(self, stream_handle: int) -> None:
+        return
+        import ctypes
+
+        rt = ctypes.CDLL("libcudart.so.13")
+        mb = 16
+        raise ValueError(
+            f"decoder_l2_persist mode {0} not implemented (1 = KV cache, 2 = attention weights)"
+        )
+        rt.cudaDeviceSetLimit.argtypes = [ctypes.c_int, ctypes.c_size_t]
+        rc1 = rt.cudaDeviceSetLimit(6, ctypes.c_size_t(mb << 20))
+
+        class _Win(ctypes.Structure):
+            _fields_ = [
+                ("base_ptr", ctypes.c_void_p),
+                ("num_bytes", ctypes.c_size_t),
+                ("hitRatio", ctypes.c_float),
+                ("hitProp", ctypes.c_int),
+                ("missProp", ctypes.c_int),
+                ("_pad", ctypes.c_byte * 96),
+            ]
+
+        hit = min(1.0, float(mb << 20) / float(nbytes))
+        win = _Win(
+            ctypes.c_void_p(base), ctypes.c_size_t(nbytes), ctypes.c_float(hit), 2, 1
+        )
+        rt.cudaStreamSetAttribute.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        rc2 = rt.cudaStreamSetAttribute(
+            ctypes.c_void_p(int(stream_handle)), 1, ctypes.byref(win)
+        )
+        logger.info(
+            "L2 persist: mode %d window %.1f MB set-aside %d MB hitRatio %.3f (setLimit rc=%d, setAttr rc=%d)",
+            0,
+            nbytes / 2**20,
+            mb,
+            hit,
+            rc1,
+            rc2,
+        )
+        if rc1 != 0 or rc2 != 0:
+            raise RuntimeError(
+                f"L2 persist setup failed: setLimit rc={rc1} setAttribute rc={rc2}"
+            )
+
+    def _persist_prepare_weights(self) -> None:
+        """Pack the decoder attention weights (q/k/v/o NVFP4 packed + scales) of all layers into one
+        contiguous arena and repoint the weight dicts at it, so one L2 access-policy window can cover a
+        prefix of whole layers; the window is `decoder_l2_persist_mb` rounded down to whole layers.
+        """
+        if getattr(self, "_persist_arena", None) is not None:
+            return
+        parts = []
+        for l, w in enumerate(self._decoder_fp4_weights):
+            for proj in ("qkv", "o"):
+                for key in ("packed", "sfb"):
+                    parts.append((l, proj, key, w[proj][key]))
+        align = 1024
+        offs, total = ([], 0)
+        for _, _, _, t in parts:
+            total = (total + align - 1) // align * align
+            offs.append(total)
+            total += t.numel() * t.element_size()
+        arena = torch.empty(total, dtype=torch.uint8, device="cuda")
+        layer_end = {}
+        for (l, proj, key, t), off in zip(parts, offs):
+            n = t.numel() * t.element_size()
+            v = arena[off : off + n].view(t.dtype).view(t.shape)
+            v.copy_(t)
+            self._decoder_fp4_weights[l][proj][key] = v
+            layer_end[l] = off + n
+        torch.cuda.synchronize()
+        budget = 16 << 20
+        nl = 0
+        for l in range(len(self._decoder_fp4_weights)):
+            if layer_end[l] <= budget:
+                nl = l + 1
+        self._persist_arena = arena
+        self._persist_window_bytes = int(layer_end[nl - 1]) if nl else 0
+        self._persist_layers = nl
+        self._persist_sink = torch.zeros(4, dtype=torch.int32, device="cuda")
+        logger.info(
+            "L2 persist: attention-weight arena %.1f MB (%d layers), window = first %d layers = %.1f MB",
+            total / 2**20,
+            len(self._decoder_fp4_weights),
+            nl,
+            self._persist_window_bytes / 2**20,
+        )
+
+    def _persist_touch(self, stream_handle: int) -> None:
+        if not self._persist_window_bytes:
+            return
+        rc = fp4_optimized.l2_prefetch_regions(
+            [(int(self._persist_arena.data_ptr()), int(self._persist_window_bytes))],
+            int(stream_handle),
+            1,
+            int(self._persist_sink.data_ptr()),
+        )
+        if rc != 0:
+            raise RuntimeError(f"l2 persist touch failed rc={rc}")
+
+    def _sig_ln32_tables(self):
+        self._sig_ln32_keep = {
+            k: [_swz32(t) for t in getattr(self, "_sig_" + k)]
+            for k in ("ln_attn_w", "ln_attn_b", "ln_ffn_w", "ln_ffn_b")
+        }
+        return {k: [t.data_ptr() for t in v] for k, v in self._sig_ln32_keep.items()}
+
+    _PE_K_PAD = 592
+
+    def _prologue_pe_buffers(self):
+        if getattr(self, "_patches_pad_buf", None) is not None:
+            return
+        import ctypes
+        from flash_rt.hardware.thor.shared_primitives import _crt
+
+        S_sig, D_sig, K = (self.sig_S, self.sig_D, self._PE_K_PAD)
+        self._patches_pad_buf = torch.zeros(
+            S_sig * K, dtype=torch.float16, device="cuda"
+        )
+        self._pe_w_pad = torch.zeros(K * D_sig, dtype=torch.float16, device="cuda")
+        _crt.cudaMemcpy(
+            ctypes.c_void_p(self._pe_w_pad.data_ptr()),
+            ctypes.c_void_p(self._pe_w.ptr.value),
+            ctypes.c_size_t(588 * D_sig * 2),
+            3,
+        )
+        torch.cuda.synchronize()
+
+    def _patch_embed_ops(self, stream_int, *, uint8_input=False):
+        po = int(getattr(self, "prologue_opt", 0))
+        if not uint8_input or not po & 24:
+            return super()._patch_embed_ops(stream_int, uint8_input=uint8_input)
+        S_sig, D_sig = (self.sig_S, self.sig_D)
+        if po & 8:
+            self._prologue_pe_buffers()
+            K = self._PE_K_PAD
+            fvk_optimized.patch_im2col_uint8_pitch(
+                self._img_u8_buf.ptr.value,
+                self._img_u8_lut.ptr.value,
+                self._patches_pad_buf.data_ptr(),
+                self.num_views,
+                K,
+                stream_int,
+            )
+            self._gemm.fp16_nn(
+                self._patches_pad_buf.data_ptr(),
+                self._pe_w_pad.data_ptr(),
+                self._sig_x.data_ptr(),
+                S_sig,
+                D_sig,
+                K,
+                stream_int,
+            )
+        else:
+            fvk_optimized.patch_im2col_uint8(
+                self._img_u8_buf.ptr.value,
+                self._img_u8_lut.ptr.value,
+                self._patches_buf.ptr.value,
+                self.num_views,
+                stream_int,
+            )
+            self._gemm.fp16_nn(
+                self._patches_buf.ptr.value,
+                self._pe_w.ptr.value,
+                self._sig_x.data_ptr(),
+                S_sig,
+                D_sig,
+                588,
+                stream_int,
+            )
+        if po & 16:
+            fvk_optimized.patch_embed_bias_pos_v2(
+                self._sig_x.data_ptr(),
+                self._pe_b.ptr.value,
+                self._pos_emb.ptr.value,
+                S_sig,
+                D_sig,
+                256,
+                stream_int,
+            )
+        else:
+            fvk_optimized.patch_embed_bias_pos(
+                self._sig_x.data_ptr(),
+                self._pe_b.ptr.value,
+                self._pos_emb.ptr.value,
+                S_sig,
+                D_sig,
+                256,
+                stream_int,
+            )
+
+    def _postln_project_ops(self, stream_int):
+        po = int(getattr(self, "prologue_opt", 0))
+        if not po & 6:
+            return super()._postln_project_ops(stream_int)
+        import ctypes
+        from flash_rt.hardware.thor.shared_primitives import _crt
+
+        S_sig, D_sig, De = (self.sig_S, self.sig_D, self.De)
+        x_sig = self._sig_x.data_ptr()
+        enc_x = self._enc_x.data_ptr()
+        scratch = self._postln_scratch.data_ptr()
+        if po & 4:
+            ln_fn = (
+                fp4_optimized.rowops_layer_norm_fp16_v3
+                if po & 32
+                else fp4_optimized.rowops_layer_norm_fp16_v2
+            )
+            rc = ln_fn(
+                x_sig,
+                self._postln_w.data_ptr(),
+                self._postln_b.data_ptr(),
+                scratch,
+                S_sig,
+                D_sig,
+                1e-06,
+                stream_int,
+            )
+            if rc != 0:
+                raise RuntimeError(f"rowops_layer_norm_fp16_v2 failed rc={rc}")
+        else:
+            fvk_optimized.layer_norm_fp16(
+                x_sig,
+                self._postln_w.data_ptr(),
+                self._postln_b.data_ptr(),
+                scratch,
+                S_sig,
+                D_sig,
+                1e-06,
+                stream_int,
+            )
+        if po & 2:
+            self._gemm.fp16_nn_bias(
+                scratch,
+                self._proj_w.data_ptr(),
+                enc_x,
+                self._proj_b.data_ptr(),
+                S_sig,
+                De,
+                D_sig,
+                stream_int,
+            )
+        else:
+            self._gemm.fp16_nn(
+                scratch, self._proj_w.data_ptr(), enc_x, S_sig, De, D_sig, stream_int
+            )
+            fvk_optimized.add_bias_fp16(
+                enc_x, self._proj_b.data_ptr(), S_sig, De, stream_int
+            )
+        nbytes = self._S_lang * De * 2
+        _crt.cudaMemcpyAsync(
+            ctypes.c_void_p(enc_x + S_sig * De * 2),
+            ctypes.c_void_p(self._lang_emb.data_ptr()),
+            ctypes.c_size_t(nbytes),
+            3,
+            ctypes.c_void_p(stream_int),
+        )
+
+    def _capture_siglip_graph(self):
+        """Capture the SigLIP graphs; routes through the NVFP4 FFN when
+        use_fp4_siglip_ffn is enabled (base FP8 path otherwise, including
+        during base-class construction before the flag exists)."""
+        attn = getattr(self, "_attn", None)
+        if attn is not None:
+            attn.siglip_attn_custom = int(getattr(self, "siglip_attn_custom", 0))
+            attn.fa4_pack_heads = int(getattr(self, "encoder_fa4_pack", 0))
+        if not getattr(self, "use_fp4_siglip_ffn", False) or not hasattr(
+            self, "_sig_fp4_weights"
+        ):
+            return super()._capture_siglip_graph()
+        import numpy as np
+        from flash_rt.models.pi05.pipeline_thor_fp4 import (
+            siglip_forward_with_fp4_ffn as siglip_forward_with_fp4_ffn_optimized,
+        )
+
+        if 0 and "qkv_w_t" not in self._sig_weights:
+            self._sig_qkv_w_t = [w.t().contiguous() for w in self._sig_qkv_w]
+            self._sig_weights["qkv_w_t"] = [t.data_ptr() for t in self._sig_qkv_w_t]
+        if getattr(self, "siglip_l2_touch", 0):
+            if getattr(self, "_decoder_l2_touch_sink", None) is None:
+                self._decoder_l2_touch_sink = torch.zeros(
+                    4, dtype=torch.int32, device="cuda"
+                )
+                fp4_optimized.pi05_l2_touch_init()
+            mask = 5
+            regs = {}
+            for l in range(self.sig_L):
+                r = []
+                if mask & 1:
+                    t = self._sig_qkv_w[l]
+                    r.append((t.data_ptr(), t.numel() * t.element_size()))
+                if mask & 2:
+                    t = self._sig_o_w[l]
+                    r.append((t.data_ptr(), t.numel() * t.element_size()))
+                e = self._sig_fp4_weights.get(l)
+                if e is not None:
+                    if mask & 4:
+                        r += [
+                            (e["up"]["packed"].data_ptr(), e["up"]["packed"].numel()),
+                            (e["up"]["sfb"].data_ptr(), e["up"]["sfb"].numel()),
+                        ]
+                    if mask & 8:
+                        r += [
+                            (
+                                e["down"]["packed"].data_ptr(),
+                                e["down"]["packed"].numel(),
+                            ),
+                            (e["down"]["sfb"].data_ptr(), e["down"]["sfb"].numel()),
+                        ]
+                regs[l] = r
+            self._sig_fp4_scratch.update(
+                {
+                    "sig_l2_touch": 1,
+                    "sig_l2_touch_regions": regs,
+                    "sig_l2_touch_hint": 4,
+                    "sig_l2_touch_depth": 16,
+                    "sig_l2_touch_pace": 12288,
+                    "sig_l2_touch_threads": 128,
+                    "sig_l2_touch_fork": 0,
+                    "sig_l2_touch_sink": self._decoder_l2_touch_sink.data_ptr(),
+                }
+            )
+
+        def _sig_fwd(stream_int):
+            siglip_forward_with_fp4_ffn_optimized(
+                self._gemm,
+                fvk_optimized,
+                fp4_optimized,
+                self._sig_bufs,
+                self._sig_weights,
+                self._sig_dims,
+                stream=stream_int,
+                attn=self._attn,
+                fp4_weights=self._sig_fp4_weights,
+                fp4_scratch=self._sig_fp4_scratch,
+            )
+
+        dummy_img = np.zeros((self.num_views, 224, 224, 3), dtype=np.float16)
+        self._img_buf.upload(dummy_img)
+        for _ in range(3):
+            self._patch_embed_ops(0)
+            self._sig_x.zero_()
+            _sig_fwd(0)
+            self._postln_project_ops(0)
+        torch.cuda.synchronize()
+        stream = torch.cuda.Stream()
+        self._siglip_graph = torch.cuda.CUDAGraph()
+        s_int = stream.cuda_stream
+        with torch.cuda.stream(stream):
+            self._siglip_graph.capture_begin()
+            self._patch_embed_ops(s_int)
+            _sig_fwd(s_int)
+            self._postln_project_ops(s_int)
+            self._siglip_graph.capture_end()
+        torch.cuda.synchronize()
+        dummy_u8 = np.full((self.num_views, 224, 224, 3), 128, dtype=np.uint8)
+        self._img_u8_buf.upload(dummy_u8)
+        for _ in range(3):
+            self._patch_embed_ops(0, uint8_input=True)
+            self._sig_x.zero_()
+            _sig_fwd(0)
+            self._postln_project_ops(0)
+        torch.cuda.synchronize()
+        uint8_stream = torch.cuda.Stream()
+        self._siglip_u8_graph = torch.cuda.CUDAGraph()
+        u8_int = uint8_stream.cuda_stream
+        with torch.cuda.stream(uint8_stream):
+            self._siglip_u8_graph.capture_begin()
+            self._patch_embed_ops(u8_int, uint8_input=True)
+            _sig_fwd(u8_int)
+            self._postln_project_ops(u8_int)
+            self._siglip_u8_graph.capture_end()
+        torch.cuda.synchronize()
+        logger.info("SigLIP CUDA graph captured with NVFP4 FFN (S=%d)", self.sig_S)
+
+    def _awq_scale_weight(
+        self, W: torch.Tensor, activation_amax: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """AWQ per-input-channel (K axis) pre-scale.
+
+        If ``activation_amax`` is provided (shape [K], fp32), uses standard
+        activation-aware weight quantization:
+            s[k] = (activation_amax[k] / activation_amax.mean())^alpha
+        Otherwise fall back to the weight-only amax estimate.
+
+        Returns (W' = W * s broadcast along N, inv_s = 1/s).
+        Activation must be scaled by inv_s before the FP4 GEMM:
+            Y = (X * inv_s) @ (W * s).T = X @ W.T          (math preserved)
+        """
+        if activation_amax is not None:
+            a = activation_amax.float().clamp(min=1e-06)
+        else:
+            a = W.abs().amax(dim=0).float().clamp(min=1e-06)
+        s = (a / a.mean()).pow(self.awq_alpha).clamp(min=0.25, max=4.0)
+        inv_s = (1.0 / s).to(fp16).contiguous()
+        W_scaled = (W.float() * s.unsqueeze(0)).to(fp16).contiguous()
+        return (W_scaled, inv_s)
+
+    def _requant_fp4_weights_with_awq(self, act_amax_gu: dict, act_amax_dn: dict):
+        """Re-quantize FP4 weights using activation-aware AWQ scales.
+
+        Called after the first real-data forward pass collected per-channel
+        activation amax at each FP4 layer's Gate+Up and Down inputs.
+
+        Updates the packed/sfb buffers of ``self._fp4_weights[l]`` IN-PLACE
+        (same pointer addresses) and ``self._awq_inv_s_{gu,dn}[l]`` IN-PLACE.
+        This keeps the captured CUDA Graph valid — no recapture needed.
+        """
+        from safetensors import safe_open
+        from flash_rt.executors.torch_weights import _autodetect_strip_prefix
+
+        De = self.De
+        He = self.He
+        model_root = "paligemma_with_expert.paligemma.model.language_model.layers"
+        with safe_open(self._checkpoint_path, framework="pt", device="cuda") as sf:
+            _strip = _autodetect_strip_prefix(set(sf.keys()))
+
+            def get(k):
+                return sf.get_tensor(_strip + k if _strip else k)
+
+            for l in self._fp4_layers:
+                p = f"{model_root}.{l}"
+                ff = 1.0 + get(f"{p}.post_attention_layernorm.weight").float()
+                ff_u = ff.unsqueeze(0)
+                gw = (get(f"{p}.mlp.gate_proj.weight").float() * ff_u).to(fp16)
+                uw = (get(f"{p}.mlp.up_proj.weight").float() * ff_u).to(fp16)
+                gu_fp16 = torch.cat([gw, uw], dim=0).contiguous()
+                d_fp16 = get(f"{p}.mlp.down_proj.weight").to(fp16).contiguous()
+                gu_scaled, inv_s_gu = self._awq_scale_weight(gu_fp16, act_amax_gu[l])
+                d_scaled, inv_s_dn = self._awq_scale_weight(d_fp16, act_amax_dn[l])
+                self._awq_inv_s_gu[l].copy_(inv_s_gu)
+                self._awq_inv_s_gu32[l].copy_(_swz32(inv_s_gu))
+                self._awq_inv_s_dn[l].copy_(inv_s_dn)
+                quant_weight_nvfp4_inplace(gu_scaled, self._fp4_weights[l]["gate_up"])
+                quant_weight_nvfp4_inplace(d_scaled, self._fp4_weights[l]["down"])
+                if self.use_p1_split_gu and "gate" in self._fp4_weights[l]:
+                    quant_weight_nvfp4_inplace(
+                        gu_scaled[:He, :].contiguous(), self._fp4_weights[l]["gate"]
+                    )
+                    quant_weight_nvfp4_inplace(
+                        gu_scaled[He:, :].contiguous(), self._fp4_weights[l]["up"]
+                    )
+                if self.use_p1_split_gu and "gu_il" in self._fp4_weights[l]:
+                    quant_weight_nvfp4_inplace(
+                        _interleave_gu_rows(
+                            gu_scaled[:He, :].contiguous(),
+                            gu_scaled[He:, :].contiguous(),
+                            inv_s_dn,
+                        ),
+                        self._fp4_weights[l]["gu_il"],
+                    )
+                    if "down_x" in self._fp4_weights[l]:
+                        quant_weight_nvfp4_inplace(
+                            _expand_down_k(d_scaled), self._fp4_weights[l]["down_x"]
+                        )
+
+    def _collect_awq_activation_amax(self, collect_qkv=False):
+        """Run calibration forward with hook that snapshots fp16 activations
+        at FP4 layers' Gate+Up and Down inputs; return per-channel amax dicts."""
+        Se = self.Se
+        De = self.De
+        He = self.He
+        NHe = self.NHe
+        HDe = self.HDe
+        Le = self.Le
+        total_keys = self.total_keys
+        act_gu = {
+            l: torch.zeros(De, dtype=torch.float32, device="cuda")
+            for l in self._fp4_layers
+        }
+        act_dn = {
+            l: torch.zeros(He, dtype=torch.float32, device="cuda")
+            for l in self._fp4_layers
+        }
+        x_snap = {
+            l: torch.empty(Se, De, dtype=fp16, device="cuda") for l in self._fp4_layers
+        }
+        qkv_snap = {}
+        h_snap = {
+            l: torch.empty(Se, He, dtype=fp16, device="cuda") for l in self._fp4_layers
+        }
+        import math
+
+        Q_dim = NHe * HDe
+        K_dim = HDe
+        attn_scale = 1.0 / math.sqrt(float(HDe))
+        x = self._enc_x
+        x_fp8 = self._enc_x_fp8
+        qkv = self._enc_qkv_buf
+        attn_out = self._enc_attn
+        o_fp8 = self._enc_o_fp8
+        gate = self._enc_gate
+        hid_fp8 = self._enc_hid_fp8
+        fg = self._enc_fg
+        act_scales = self._enc_calib_scales.data_ptr()
+        alpha_host = self._enc_alpha_host
+        rope = self._enc_rope.data_ptr()
+        Kc = self._Kc.reshape(-1).data_ptr()
+        Vc = self._Vc.reshape(-1).data_ptr()
+        self._Kc.zero_()
+        self._Vc.zero_()
+        for l in range(Le):
+            last = l == Le - 1
+            as_qkv = act_scales + (l * 4 + 0) * 4
+            as_o = act_scales + (l * 4 + 1) * 4
+            as_gu = act_scales + (l * 4 + 2) * 4
+            as_d = act_scales + (l * 4 + 3) * 4
+            fvk_optimized.rms_norm_fp8_noweight_fp16(
+                x.data_ptr(), x_fp8.data_ptr(), Se, De, as_qkv, 0
+            )
+            if collect_qkv:
+                torch.cuda.synchronize()
+                qkv_snap[l] = x.clone()
+            fvk_optimized.cutlass_fp8_sq(
+                x_fp8.data_ptr(),
+                self._enc_qkv_w[l].data_ptr(),
+                qkv.data_ptr(),
+                Se,
+                2560,
+                De,
+                alpha_host[l * 4 + 0],
+                0.0,
+                0,
+            )
+            kv_elem_off = l * total_keys * HDe
+            fvk_optimized.qkv_split_rope_kvcache_fp16(
+                qkv.data_ptr(),
+                rope,
+                attn_out.data_ptr(),
+                Kc,
+                Vc,
+                Se,
+                Q_dim,
+                K_dim,
+                HDe,
+                2560,
+                kv_elem_off,
+                HDe,
+                0,
+            )
+            if last:
+                continue
+            if self._attn is not None:
+                self._attn.run("encoder", l, q_seq=Se, stream=0)
+            else:
+                fvk_optimized.attention_qkv_fp16(
+                    self._ctx,
+                    attn_out.data_ptr(),
+                    Kc + kv_elem_off * 2,
+                    Vc + kv_elem_off * 2,
+                    self._enc_logits.data_ptr(),
+                    attn_out.data_ptr(),
+                    Se,
+                    Se,
+                    NHe,
+                    HDe,
+                    attn_scale,
+                    0,
+                )
+            fvk_optimized.quantize_fp8_static_fp16(
+                attn_out.data_ptr(), o_fp8.data_ptr(), as_o, Se * De, 0
+            )
+            fvk_optimized.cutlass_fp8_sq(
+                o_fp8.data_ptr(),
+                self._enc_o_w[l].data_ptr(),
+                fg.data_ptr(),
+                Se,
+                De,
+                De,
+                alpha_host[l * 4 + 1],
+                0.0,
+                0,
+            )
+            if l in self._fp4_layers:
+                fp4_optimized.residual_add_rms_norm_noweight_fp16(
+                    x.data_ptr(), fg.data_ptr(), x_snap[l].data_ptr(), Se, De, 0
+                )
+                fvk_optimized.residual_add_rms_norm_fp8_noweight_fp16(
+                    x.data_ptr(), fg.data_ptr(), x_fp8.data_ptr(), Se, De, as_gu, 0
+                )
+            else:
+                fvk_optimized.residual_add_rms_norm_fp8_noweight_fp16(
+                    x.data_ptr(), fg.data_ptr(), x_fp8.data_ptr(), Se, De, as_gu, 0
+                )
+            fvk_optimized.cutlass_fp8_t1(
+                x_fp8.data_ptr(),
+                self._enc_gu_w[l].data_ptr(),
+                gate.data_ptr(),
+                Se,
+                He * 2,
+                De,
+                alpha_host[l * 4 + 2],
+                0.0,
+                0,
+            )
+            if l in self._fp4_layers:
+                fvk_optimized.gate_geglu_merged_fp16(
+                    gate.data_ptr(), h_snap[l].data_ptr(), Se, He, 0
+                )
+                fvk_optimized.gate_geglu_merged_fp8_fp16(
+                    gate.data_ptr(), hid_fp8.data_ptr(), Se, He, as_d, 0
+                )
+            else:
+                fvk_optimized.gate_geglu_merged_fp8_fp16(
+                    gate.data_ptr(), hid_fp8.data_ptr(), Se, He, as_d, 0
+                )
+            fvk_optimized.cutlass_fp8_wide(
+                hid_fp8.data_ptr(),
+                self._enc_d_w[l].data_ptr(),
+                fg.data_ptr(),
+                Se,
+                De,
+                He,
+                alpha_host[l * 4 + 3],
+                0.0,
+                0,
+            )
+            as_next = act_scales + ((l + 1) * 4 + 0) * 4
+            fvk_optimized.residual_add_rms_norm_fp8_noweight_fp16(
+                x.data_ptr(), fg.data_ptr(), x_fp8.data_ptr(), Se, De, as_next, 0
+            )
+        torch.cuda.synchronize()
+        for l in self._fp4_layers:
+            act_gu[l] = x_snap[l].abs().float().amax(dim=0)
+            act_dn[l] = h_snap[l].abs().float().amax(dim=0)
+        act_qkv = {}
+        if collect_qkv:
+            for l, xs in qkv_snap.items():
+                xn = xs.float()
+                xn = xn * torch.rsqrt(xn.pow(2).mean(dim=1, keepdim=True) + 1e-06)
+                act_qkv[l] = xn.abs().amax(dim=0)
+        del x_snap, h_snap, qkv_snap
+        torch.cuda.empty_cache()
+        if collect_qkv:
+            return (act_gu, act_dn, act_qkv)
+        return (act_gu, act_dn)
+
+    def _alloc_fp4_scratch_for_Se(self, Se: int):
+        """Allocate/resize FP4 scratch buffers for current encoder seq length."""
+        if self._fp4_scratch_Se == Se and self._fp4_scratch_dict is not None:
+            return
+        De = self.De
+        He = self.He
+        self._fp4_gu_scratch = FP4ActScratch(Se, De, device="cuda")
+        self._fp4_dn_scratch = FP4ActScratch(Se, He, device="cuda")
+        self._fp4_x_normed = torch.empty(Se, De, dtype=fp16, device="cuda")
+        self._fp4_gate_out = torch.empty(Se, 2 * He, dtype=fp16, device="cuda")
+        self._fp4_hid_fp16 = torch.empty(Se, He, dtype=fp16, device="cuda")
+        self._fp4_fg_fp16 = torch.empty(Se, De, dtype=fp16, device="cuda")
+        if self.use_p1_split_gu:
+            from flash_rt.executors.fp4_utils import FP4Buffer
+
+            if self.encoder_p1_combiner == "epilogue":
+                self._fp4_p1_il = FP4Buffer(Se, 2 * He, device="cuda")
+            elif self.encoder_p1_combiner in (
+                "epilogue_hw",
+                "epilogue_hw_nod",
+                "epilogue_hw_nod_2sm",
+            ):
+                self._fp4_p1_dummy = torch.zeros(
+                    Se, He, dtype=torch.uint8, device="cuda"
+                )
+            else:
+                self._fp4_p1_gate = FP4Buffer(Se, He, device="cuda")
+                self._fp4_p1_up = FP4Buffer(Se, He, device="cuda")
+        self._fp4_scratch_dict = {
+            "gu_act": self._fp4_gu_scratch,
+            "down_act": self._fp4_dn_scratch,
+            "x_normed": self._fp4_x_normed.data_ptr(),
+            "gate_out": self._fp4_gate_out.data_ptr(),
+            "hid_fp16": self._fp4_hid_fp16.data_ptr(),
+            "fg_fp16": self._fp4_fg_fp16.data_ptr(),
+            "variant_gu": self._fp4_variant_gu,
+            "variant_dn": self._fp4_variant_dn,
+            "awq_inv_s_gu": (
+                {l: self._awq_inv_s_gu[l].data_ptr() for l in self._fp4_layers}
+                if self.use_awq
+                else None
+            ),
+            "awq_inv_s_dn": (
+                {l: self._awq_inv_s_dn[l].data_ptr() for l in self._fp4_layers}
+                if self.use_awq
+                else None
+            ),
+        }
+        self._fp4_scratch_dict["rowops_v2"] = True
+        self._fp4_scratch_dict["rowops_ln_v3"] = 0
+        self._fp4_scratch_dict["quant_fp8_v2"] = False
+        self._fp4_scratch_dict["res_epilogue"] = True
+        self._fp4_scratch_dict["rowops_v5"] = 7
+        self._fp4_scratch_dict["skip_post_rms"] = True
+        self._fp4_scratch_dict["qkv_lt"] = False
+        self._fp4_scratch_dict["qkv_swap"] = 0
+        self._fp4_scratch_dict["awq_inv_s_gu32"] = (
+            {l: self._awq_inv_s_gu32[l].data_ptr() for l in self._fp4_layers}
+            if self.use_awq
+            else None
+        )
+        if self.use_p1_split_gu:
+            self._fp4_scratch_dict["p1_combiner"] = self.encoder_p1_combiner
+            if self.encoder_p1_combiner == "epilogue":
+                self._fp4_scratch_dict["p1_il_p4"] = self._fp4_p1_il.packed.data_ptr()
+                self._fp4_scratch_dict["p1_il_sfa"] = self._fp4_p1_il.sfa.data_ptr()
+                self._fp4_scratch_dict["variant_dn_x"] = self.encoder_down_x_variant
+            elif self.encoder_p1_combiner in (
+                "epilogue_hw",
+                "epilogue_hw_nod",
+                "epilogue_hw_nod_2sm",
+            ):
+                self._fp4_scratch_dict["p1_dummy"] = self._fp4_p1_dummy.data_ptr()
+            else:
+                self._fp4_scratch_dict["p1_gate_p4"] = (
+                    self._fp4_p1_gate.packed.data_ptr()
+                )
+                self._fp4_scratch_dict["p1_gate_sfa"] = self._fp4_p1_gate.sfa.data_ptr()
+                self._fp4_scratch_dict["p1_up_p4"] = self._fp4_p1_up.packed.data_ptr()
+                self._fp4_scratch_dict["p1_up_sfa"] = self._fp4_p1_up.sfa.data_ptr()
+        if self.use_fp4_encoder_attn:
+            self._fp4_attn_scratch = FP4ActScratch(Se, De, device="cuda")
+            self._fp4_scratch_dict["attn_act"] = self._fp4_attn_scratch
+            self._fp4_scratch_dict["attn_variant"] = 49
+        self._fp4_scratch_Se = Se
+
+    def _recalibrate_with_real_data(self):
+        super()._recalibrate_with_real_data()
+        if self.use_fp4_siglip_ffn and (
+            not getattr(self, "_sig_awq_calibrated", False)
+        ):
+            logger.info(
+                "Running SigLIP AWQ calibration on %d FP4 FFN layers...",
+                len(self._sig_fp4_weights),
+            )
+            sig_amax = self._collect_siglip_awq_amax()
+            self._requant_sig_fp4_weights_with_awq(sig_amax)
+            self._sig_awq_calibrated = True
+        if not self.use_awq or getattr(self, "_awq_calibrated", False):
+            return
+        logger.info(
+            "Running AWQ activation-aware calibration on %d FP4 layers...",
+            len(self._fp4_layers),
+        )
+        act_gu, act_dn = self._collect_awq_activation_amax()
+        self._requant_fp4_weights_with_awq(act_gu, act_dn)
+        self._awq_calibrated = True
+        logger.info("AWQ calibration complete (graph reused, in-place requant)")
+
+    def _collect_siglip_awq_amax(self):
+        """One eager FP8 SigLIP pass on the current calibration image,
+        snapshotting the FFN LayerNorm input at each NVFP4 layer; returns
+        {layer: per-channel amax of the fp16 LayerNorm output} (the Up GEMM
+        activation)."""
+        import torch.nn.functional as F
+
+        S, D, H = (self.sig_S, self.sig_D, self.sig_H)
+        L = self.sig_L
+        spv = 256
+        w = self._sig_weights
+        alpha = w["alpha"]
+        unit = w["unit_scale"]
+        x = self._sig_x
+        x_fp8 = self._sig_x_fp8
+        qkv = self._sig_qkv
+        attn_out = self._sig_attn
+        hidden = self._sig_hidden
+        hid_fp8 = self._sig_hid_fp8
+        amax = {}
+        self._patch_embed_ops(0)
+        for l in range(L):
+            a_qkv = alpha[l * 4 + 0]
+            a_o = alpha[l * 4 + 1]
+            a_up = alpha[l * 4 + 2]
+            a_down = alpha[l * 4 + 3]
+            fvk_optimized.layer_norm_fp8(
+                x.data_ptr(),
+                x_fp8.data_ptr(),
+                w["ln_attn_w"][l],
+                w["ln_attn_b"][l],
+                S,
+                D,
+                1e-05,
+                0,
+            )
+            self._gemm.fp8_nn_bias(
+                x_fp8.data_ptr(),
+                w["qkv_w"][l],
+                qkv.data_ptr(),
+                w["qkv_b"][l],
+                S,
+                3 * D,
+                D,
+                a_qkv,
+                0,
+            )
+            self._attn.run("siglip", 0, q_seq=spv, stream=0)
+            fvk_optimized.quantize_fp8_static_fp16(
+                attn_out.data_ptr(), x_fp8.data_ptr(), unit, S * D, 0
+            )
+            self._gemm.fp8_nn_bias_res(
+                x_fp8.data_ptr(),
+                w["o_w"][l],
+                x.data_ptr(),
+                w["o_b"][l],
+                S,
+                D,
+                D,
+                a_o,
+                0,
+            )
+            if l in self._sig_fp4_weights:
+                torch.cuda.synchronize()
+                xn = F.layer_norm(
+                    x.float(),
+                    (D,),
+                    self._sig_ln_ffn_w[l].float(),
+                    self._sig_ln_ffn_b[l].float(),
+                    1e-05,
+                )
+                amax[l] = xn.abs().amax(dim=0)
+            fvk_optimized.layer_norm_fp8(
+                x.data_ptr(),
+                x_fp8.data_ptr(),
+                w["ln_ffn_w"][l],
+                w["ln_ffn_b"][l],
+                S,
+                D,
+                1e-05,
+                0,
+            )
+            self._gemm.fp8_nn_gelu_bias(
+                x_fp8.data_ptr(),
+                w["up_w"][l],
+                hidden.data_ptr(),
+                w["up_b"][l],
+                S,
+                H,
+                D,
+                a_up,
+                0,
+            )
+            fvk_optimized.quantize_fp8_static_fp16(
+                hidden.data_ptr(), hid_fp8.data_ptr(), unit, S * H, 0
+            )
+            self._gemm.fp8_nn_bias_res(
+                hid_fp8.data_ptr(),
+                w["down_w"][l],
+                x.data_ptr(),
+                w["down_b"][l],
+                S,
+                D,
+                H,
+                a_down,
+                0,
+            )
+        torch.cuda.synchronize()
+        return amax
+
+    def _requant_sig_fp4_weights_with_awq(self, sig_amax: dict):
+        """In-place AWQ requant of the SigLIP Up weights (packed/sfb keep
+        their addresses, so the captured graphs pick up the new values)."""
+        for l, a in sig_amax.items():
+            w_fp16 = self._sig_fp4_up_fp16[l]
+            w_scaled, inv_s = self._awq_scale_weight(w_fp16, activation_amax=a)
+            packed = self._sig_fp4_weights[l]["up"]
+            rc = fp4_optimized.quantize_fp4_dynamic_sfa_mse_fp16(
+                w_scaled.data_ptr(),
+                packed["packed"].data_ptr(),
+                packed["sfb"].data_ptr(),
+                packed["N"],
+                packed["K"],
+                True,
+                0,
+            )
+            if rc != 0:
+                raise RuntimeError(
+                    f"SigLIP AWQ Up requant failed at layer {l}: rc={rc}"
+                )
+            self._sig_awq_inv_s[l].copy_(inv_s)
+            self._sig_awq_inv_s32[l].copy_(_swz32(inv_s))
+        torch.cuda.synchronize()
+        logger.info("SigLIP AWQ requant complete (%d layers, in place)", len(sig_amax))
+
+    def _capture_enc_ae_graph(self):
+        if not self._fp4_layers and (not self.use_fp4_decoder):
+            return super()._capture_enc_ae_graph()
+        Se = self.Se
+        if self._fp4_layers:
+            self._alloc_fp4_scratch_for_Se(Se)
+        total_keys = self.total_keys
+        Le = self.Le
+        De = self.De
+        He = self.He
+        NHe = self.NHe
+        HDe = self.HDe
+        Sa = self.Sa
+        Da = self.Da
+        Ha = self.Ha
+        La = self.La
+        enc_bufs = {
+            "x": self._enc_x.data_ptr(),
+            "x_fp8": self._enc_x_fp8.data_ptr(),
+            "qkv": self._enc_qkv_buf.data_ptr(),
+            "logits": self._enc_logits.data_ptr(),
+            "attn_out": self._enc_attn.data_ptr(),
+            "o_fp8": self._enc_o_fp8.data_ptr(),
+            "gate": self._enc_gate.data_ptr(),
+            "hidden": self._enc_hidden.data_ptr(),
+            "hid_fp8": self._enc_hid_fp8.data_ptr(),
+            "fg": self._enc_fg.data_ptr(),
+            "ctx": self._ctx,
+        }
+        if getattr(self, "_decoder_l2_touch_sink", None) is None:
+            self._decoder_l2_touch_sink = torch.zeros(
+                4, dtype=torch.int32, device="cuda"
+            )
+            fp4_optimized.pi05_l2_touch_init()
+        enc_bufs["l2_touch_sink"] = self._decoder_l2_touch_sink.data_ptr()
+        if False and getattr(self, "_enc_qkv_w_t", None) is None:
+            self._enc_qkv_w_t = [w.t().contiguous() for w in self._enc_qkv_w]
+            self._enc_qkv_zero_bias = torch.zeros(
+                2560, dtype=torch.float16, device="cuda"
+            )
+        enc_weights = {
+            "qkv_w": [w.data_ptr() for w in self._enc_qkv_w],
+            "qkv_w_bytes": [w.numel() * w.element_size() for w in self._enc_qkv_w],
+            "qkv_w_t": None,
+            "qkv_zero_bias": 0,
+            "Kc8": 0,
+            "Vc8": 0,
+            "o_w": [w.data_ptr() for w in self._enc_o_w],
+            "gate_w": [w.data_ptr() for w in self._enc_gu_w],
+            "down_w": [w.data_ptr() for w in self._enc_d_w],
+            "rope": self._enc_rope.data_ptr(),
+            "Kc": self._Kc.reshape(-1).data_ptr(),
+            "Vc": self._Vc.reshape(-1).data_ptr(),
+            "act_scales": self._enc_calib_scales.data_ptr(),
+            "alpha_host": self._enc_alpha_host,
+        }
+        enc_dims = {
+            "Se": Se,
+            "D": De,
+            "H": He,
+            "NH": NHe,
+            "HD": HDe,
+            "L": Le,
+            "total_keys": total_keys,
+            "enc_l2_touch": 1,
+            "enc_l2_touch_mask": 3,
+            "enc_l2_touch_fork": 2,
+            "enc_l2_touch_hint": 4,
+            "enc_l2_touch_threads": 128,
+            "enc_l2_touch_depth": 16,
+            "enc_l2_touch_pace": 12288,
+        }
+        ae_bufs = {
+            "noise": self._g_noise.data_ptr(),
+            "x": self._ae_x.data_ptr(),
+            "xn": self._ae_xn.data_ptr(),
+            "gate": self._ae_gate.data_ptr(),
+            "qkv": self._ae_qkv.data_ptr(),
+            "logits": self._ae_logits.data_ptr(),
+            "attn_out": self._ae_attn.data_ptr(),
+            "hid": self._ae_hid.data_ptr(),
+            "fg": self._ae_fg.data_ptr(),
+            "action_f32": self._ae_action_f32.data_ptr(),
+            "xn_fp8": self._ae_xn_fp8.data_ptr(),
+            "hid_fp8": self._ae_hid_fp8.data_ptr(),
+            "ctx_fp8": self._ae_ctx_fp8.data_ptr(),
+        }
+        if self.use_fp4_decoder:
+            ae_bufs.update(
+                {
+                    "xn_fp4": self._decoder_fp4_xn.packed.data_ptr(),
+                    "xn_sfa": self._decoder_fp4_xn.sfa.data_ptr(),
+                    "ctx_fp4": self._decoder_fp4_ctx.packed.data_ptr(),
+                    "ctx_sfa": self._decoder_fp4_ctx.sfa.data_ptr(),
+                    "attn_ws": self._decoder_attn_ws_ptr(),
+                    "phase_counters": self._decoder_phase_counters_ptr(),
+                    "seq_counter": self._decoder_seq_ptrs()[0],
+                    "seq_gu_dummy": self._decoder_seq_ptrs()[1],
+                    "seq_partials": self._decoder_seq_ptrs()[2],
+                    "seq_slot_packed": self._decoder_seq_ptrs()[3],
+                    "seq_slot_sfa": self._decoder_seq_ptrs()[4],
+                    "l2_touch_sink": self._decoder_l2_touch_sink_ptr(),
+                    "hid_fp4": self._decoder_fp4_hid.packed.data_ptr(),
+                    "hid_sfa": self._decoder_fp4_hid.sfa.data_ptr(),
+                }
+            )
+        ae_weights = {
+            "ain_w": self._ain_w.data_ptr(),
+            "ain_b": self._ain_b.data_ptr(),
+            "sa": self._sa_all.data_ptr(),
+            "qw": self._dec_qkv_flat.data_ptr(),
+            "Kc": self._Kc.reshape(-1).data_ptr(),
+            "Vc": self._Vc.reshape(-1).data_ptr(),
+            "Kc8": 0,
+            "Vc8": 0,
+            "dec_devpos": self._attn.dec_devpos.data_ptr(),
+            "ow": self._dec_o_flat.data_ptr(),
+            "sf": self._sf_all.data_ptr(),
+            "gw": self._dec_gu_flat.data_ptr(),
+            "dw": self._dec_d_flat.data_ptr(),
+            "aow": self._aow.data_ptr(),
+            "aob": self._aob.data_ptr(),
+            "aob_dt": self._aob_dt.data_ptr(),
+            "dt": self._ae_dt,
+            "fs": self._fs_all.data_ptr(),
+            "rope": self._dec_rope.data_ptr(),
+            "w_scales": self._ae_w_dev.data_ptr(),
+            "act_scales": self._ae_calib_scales.data_ptr(),
+        }
+        if self.use_fp4_decoder:
+            ae_weights.update(
+                {
+                    "qw_fp4": [
+                        w["qkv"]["packed"].data_ptr() for w in self._decoder_fp4_weights
+                    ],
+                    "qw_sfb": [
+                        w["qkv"]["sfb"].data_ptr() for w in self._decoder_fp4_weights
+                    ],
+                    "ow_fp4": [
+                        w["o"]["packed"].data_ptr() for w in self._decoder_fp4_weights
+                    ],
+                    "ow_sfb": [
+                        w["o"]["sfb"].data_ptr() for w in self._decoder_fp4_weights
+                    ],
+                    "gw_fp4": [
+                        w["gate_up"]["packed"].data_ptr()
+                        for w in self._decoder_fp4_weights
+                    ],
+                    "gw_sfb": [
+                        w["gate_up"]["sfb"].data_ptr()
+                        for w in self._decoder_fp4_weights
+                    ],
+                    "dw_fp4": [
+                        w["down"]["packed"].data_ptr()
+                        for w in self._decoder_fp4_weights
+                    ],
+                    "dw_sfb": [
+                        w["down"]["sfb"].data_ptr() for w in self._decoder_fp4_weights
+                    ],
+                }
+            )
+            if self.decoder_fused_geglu:
+                ae_weights.update(
+                    {
+                        "gwil_fp4": [
+                            w["gu_il"]["packed"].data_ptr()
+                            for w in self._decoder_fp4_weights
+                        ],
+                        "gwil_sfb": [
+                            w["gu_il"]["sfb"].data_ptr()
+                            for w in self._decoder_fp4_weights
+                        ],
+                        "gu_dummy": self._decoder_fp4_gu_dummy.data_ptr(),
+                    }
+                )
+            nb = lambda t: int(t.numel() * t.element_size())
+            w0 = self._decoder_fp4_weights[0]
+            ae_weights["fp4_bytes"] = {
+                "qw": (nb(w0["qkv"]["packed"]), nb(w0["qkv"]["sfb"])),
+                "ow": (nb(w0["o"]["packed"]), nb(w0["o"]["sfb"])),
+                "dw": (nb(w0["down"]["packed"]), nb(w0["down"]["sfb"])),
+                "gwil": (nb(w0["gu_il"]["packed"]), nb(w0["gu_il"]["sfb"])),
+            }
+        ae_dims = {
+            "S": Sa,
+            "D": Da,
+            "H": Ha,
+            "NH": 8,
+            "HD": 256,
+            "steps": 10,
+            "layers": La,
+            "enc_seq": Se,
+            "total_keys": total_keys,
+            "fixed_shape": self._fixed_shape_active,
+        }
+        if self.use_fp4_decoder:
+            ae_dims["fp4_variants"] = self._decoder_fp4_variants
+            ae_dims["weight_format"] = self.decoder_weight_format
+            ae_dims["act_format"] = self.decoder_act_format
+            ae_dims["rht"] = self.decoder_rht
+            ae_dims["fused_geglu"] = self.decoder_fused_geglu
+            ae_dims["fused_geglu_nod"] = False
+            ae_dims["fused_geglu_swap"] = True
+            ae_dims["fused_geglu_swap_persist"] = False
+            ae_dims["fused_geglu_swap_stages"] = 0
+            ae_dims["dec_ares"] = 0
+            ae_dims["attn_splitkv"] = False
+            ae_dims["attn_mqa"] = False
+            ae_dims["attn_mqa_fp8"] = False and (not 0)
+            ae_dims["attn_decode"] = 0
+            ae_dims["attn_mqa_variant"] = 1
+            ae_dims["attn_tc05"] = False
+            ae_dims["phase_cta"] = 0
+            ae_dims["fused_geglu_earlyb"] = 0
+            ae_dims["dec_seq"] = False
+            ae_dims["dec_rowops_quant"] = True
+            ae_dims["rowops_v5"] = 7
+            ae_dims["dec_seq_variant"] = 0
+            ae_dims["dec_l2_touch"] = 2
+            ae_dims["dec_l2_touch_hint"] = 2
+            ae_dims["dec_l2_touch_depth"] = 16
+            ae_dims["dec_l2_touch_pace"] = 12288
+            ae_dims["dec_l2_touch_ahead"] = 1
+            ae_dims["dec_l2_touch_threads"] = 256
+            ae_dims["dec_l2_touch_kv"] = 0
+            ae_dims["dec_l2_touch_mask"] = 15
+            ae_dims["dec_l2_touch_sfb"] = 1
+            ae_dims["dec_l2_touch_fork"] = 1
+            ae_dims["dec_l2_touch_kv_late"] = 0
+            ae_dims["dec_action_fused"] = True
+            ae_dims["dec_seq_slots"] = 10
+            if self._attn is not None:
+                self._attn.use_fused_softmax = self.decoder_fused_attn
+        fp4_layers = self._fp4_layers
+        fp4_weights = self._fp4_weights if fp4_layers else None
+        fp4_scratch = self._fp4_scratch_dict if fp4_layers else None
+        for _ in range(3):
+            self._Kc.zero_()
+            self._Vc.zero_()
+            if fp4_layers:
+                encoder_forward_with_fp4_subset_optimized(
+                    self._gemm,
+                    fvk_optimized,
+                    fp4_optimized,
+                    enc_bufs,
+                    enc_weights,
+                    enc_dims,
+                    stream=0,
+                    attn=self._attn,
+                    fp4_layers=fp4_layers,
+                    fp4_weights=fp4_weights,
+                    fp4_scratch=fp4_scratch,
+                    use_p1_split_gu=self.use_p1_split_gu,
+                    fp4_attn_weights=(
+                        self._enc_attn_fp4_weights
+                        if self.use_fp4_encoder_attn
+                        else None
+                    ),
+                )
+            else:
+                encoder_forward(
+                    self._gemm,
+                    fvk_optimized,
+                    enc_bufs,
+                    enc_weights,
+                    enc_dims,
+                    stream=0,
+                    attn=self._attn,
+                    use_fp8=self.use_fp8,
+                )
+            if self.use_fp4_decoder:
+                decoder_forward_fp4(
+                    self._ctx,
+                    fvk_optimized,
+                    fp4_optimized,
+                    ae_bufs,
+                    ae_weights,
+                    ae_dims,
+                    stream=0,
+                    attn=self._attn,
+                )
+            else:
+                decoder_forward(
+                    self._ctx,
+                    fvk_optimized,
+                    ae_bufs,
+                    ae_weights,
+                    ae_dims,
+                    stream=0,
+                    attn=self._attn,
+                )
+        torch.cuda.synchronize()
+        stream = torch.cuda.Stream()
+        self._enc_ae_graph = torch.cuda.CUDAGraph()
+        s_int = stream.cuda_stream
+        self._apply_l2_persist(s_int)
+        with torch.cuda.stream(stream):
+            self._enc_ae_graph.capture_begin()
+            if fp4_layers:
+                encoder_forward_with_fp4_subset_optimized(
+                    self._gemm,
+                    fvk_optimized,
+                    fp4_optimized,
+                    enc_bufs,
+                    enc_weights,
+                    enc_dims,
+                    stream=s_int,
+                    attn=self._attn,
+                    fp4_layers=fp4_layers,
+                    fp4_weights=fp4_weights,
+                    fp4_scratch=fp4_scratch,
+                    use_p1_split_gu=self.use_p1_split_gu,
+                    fp4_attn_weights=(
+                        self._enc_attn_fp4_weights
+                        if self.use_fp4_encoder_attn
+                        else None
+                    ),
+                )
+            else:
+                encoder_forward(
+                    self._gemm,
+                    fvk_optimized,
+                    enc_bufs,
+                    enc_weights,
+                    enc_dims,
+                    stream=s_int,
+                    attn=self._attn,
+                    use_fp8=self.use_fp8,
+                )
+            if self.use_fp4_decoder:
+                decoder_forward_fp4(
+                    self._ctx,
+                    fvk_optimized,
+                    fp4_optimized,
+                    ae_bufs,
+                    ae_weights,
+                    ae_dims,
+                    stream=s_int,
+                    attn=self._attn,
+                )
+            else:
+                decoder_forward(
+                    self._ctx,
+                    fvk_optimized,
+                    ae_bufs,
+                    ae_weights,
+                    ae_dims,
+                    stream=s_int,
+                    attn=self._attn,
+                )
+            self._enc_ae_graph.capture_end()
+        torch.cuda.synchronize()
+        self._model_runtime_full_graph = None
+        self._model_runtime_context_graph = None
+        self._model_runtime_decode_only_graph = None
+        self._model_runtime_rtc_prefix_graphs = {}
+        self.pipeline._decoder_only_graph = None
+        logger.info(
+            "Enc+AE CUDA graph captured with encoder FP4 layers=%s, decoder FP4=%s, P1=%s (Se=%d)",
+            sorted(self._fp4_layers),
+            self.use_fp4_decoder,
+            self.use_p1_split_gu,
+            Se,
+        )
+
+    def set_rl_mode(
+        self,
+        *,
+        cfg_enable: bool = True,
+        cfg_beta: float = 1.5,
+        advantage_positive: bool = True,
+    ) -> None:
+        if self.use_fp4_decoder and cfg_enable:
+            raise RuntimeError(
+                "Pi0.5 decoder FP4 currently supports standard B=1 inference only; CFG is not implemented"
+            )
+        return super().set_rl_mode(
+            cfg_enable=cfg_enable,
+            cfg_beta=cfg_beta,
+            advantage_positive=advantage_positive,
+        )
+
+    def set_batched_mode(self, *, enable: bool = True, batch_size: int = 2) -> None:
+        if self.use_fp4_decoder and enable:
+            raise RuntimeError(
+                "Pi0.5 decoder FP4 currently supports standard B=1 inference only; batched inference is not implemented"
+            )
+        return super().set_batched_mode(enable=enable, batch_size=batch_size)
+
+    def _ensure_model_runtime_export(self) -> None:
+        if self.use_fp4_decoder:
+            raise RuntimeError(
+                "Pi0.5 decoder FP4 model-runtime export is not implemented"
+            )
+        return super()._ensure_model_runtime_export()

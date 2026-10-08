@@ -6,7 +6,8 @@ build*/
 third_party/
 **/__pycache__/
 *.pyc
-.git/
+.git
+**/.git
 .gitignore
 .pytest_cache/
 .venv/
@@ -23,3 +24,10 @@ third_party/
 # CI / scratch
 .github/
 node_modules/
+
+.reference/
+models/
+results/
+work/
+outputs/
+.env*

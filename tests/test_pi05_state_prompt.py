@@ -9,9 +9,15 @@ def test_pi05_state_prompt_matches_openpi_format():
 
     state = np.array([-1.0, 0.0, 1.0, 2.0, -2.0], dtype=np.float32)
 
-    assert discretize_pi05_state(state).tolist() == [0, 128, 255, 255, -1]
+    # openpi zero-pads the state to max_state_dim=32 before discretizing;
+    # the padded zeros land in bin 128.
+    assert discretize_pi05_state(state).tolist() == (
+        [0, 128, 255, 255, -1] + [128] * 27)
+    assert discretize_pi05_state(state, state_dim=None).tolist() == (
+        [0, 128, 255, 255, -1])
     assert format_pi05_prompt("pick_up\nred", state) == (
-        "Task: pick up red, State: 0 128 255 255 -1;\nAction: "
+        "Task: pick up red, State: 0 128 255 255 -1" + " 128" * 27
+        + ";\nAction: "
     )
 
 
@@ -43,6 +49,6 @@ def test_jax_prompt_embedding_formats_state(monkeypatch):
     assert prompt_len == 3
     assert embeds.shape == (3, 4)
     assert seen["text"] == (
-        "Task: pick up red, State: 0 128 255;\nAction: "
+        "Task: pick up red, State: 0 128 255" + " 128" * 29 + ";\nAction: "
     )
     assert seen["add_bos"] is True

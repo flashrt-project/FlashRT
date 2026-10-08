@@ -1057,8 +1057,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 elif framework == "torch":
                     from flash_rt.frontends.torch.pi05_thor_fp4 import (
                         Pi05TorchFrontendThorFP4,
+                        Pi05TorchFrontendThorFP4Optimized,
                     )
-                    pipe_cls = Pi05TorchFrontendThorFP4
+                    pipe_cls = (Pi05TorchFrontendThorFP4Optimized
+                                if use_fp4_decoder else Pi05TorchFrontendThorFP4)
                 else:  # framework == "jax"
                     from flash_rt.frontends.jax.pi05_thor_fp4 import (
                         Pi05JaxFrontendThorFP4,
@@ -1074,6 +1076,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     # users specify groot/pi0fast knobs.
     import inspect
     sig = inspect.signature(pipe_cls)
+    if config == "groot_n17" and arch == "thor":
+        parameters = dict(sig.parameters)
+        for base in pipe_cls.__mro__[1:]:
+            for name, parameter in inspect.signature(base).parameters.items():
+                parameters.setdefault(name, parameter)
+        from types import SimpleNamespace
+        sig = SimpleNamespace(parameters=parameters)
     kwargs: dict = {"num_views": num_views}
     if arch == "amd_rdna35" and "action_dim" in sig.parameters and action_dim is not None:
         kwargs["action_dim"] = action_dim

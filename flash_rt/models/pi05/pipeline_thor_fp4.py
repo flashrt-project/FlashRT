@@ -1,0 +1,1228 @@
+"""Selected Pi0.5 SM110 NVFP4 encoder, vision and decoder lowering."""
+
+import math
+
+
+def _check(rc, kernel, layer, **shape):
+    """Raise on a non-zero NVFP4 GEMM status.
+
+    The NVFP4 GEMM bindings report can_implement, initialize, workspace and
+    run failures through a return code rather than an exception, so an
+    unchecked call would leave the destination buffer untouched and let the
+    pipeline consume stale data. (The fused elementwise bindings validate in
+    C++ and raise directly; they return nothing and are not wrapped here.)
+    """
+    if rc != 0:
+        dims = ", ".join((f"{name}={value}" for name, value in shape.items()))
+        raise RuntimeError(f"{kernel} failed at encoder layer {layer} ({dims}) rc={rc}")
+
+
+def encoder_forward_with_fp4_subset(
+    gemm,
+    fvk,
+    fvk_fp4,
+    bufs,
+    weights,
+    dims,
+    stream=0,
+    *,
+    attn=None,
+    fp4_layers: set = None,
+    fp4_weights: dict = None,
+    fp4_scratch: dict = None,
+    use_p1_split_gu: bool = False,
+    fp4_attn_weights: dict = None,
+):
+    """Encoder forward with FP4 Gate+Up / Down on selected layers.
+
+    When fp4_layers is empty / None, behaves identically to encoder_forward.
+
+    Args:
+        gemm, fvk, bufs, weights, dims, stream, attn: same as encoder_forward.
+        fp4_layers: iterable of layer indices (0..L-1) where Gate+Up and Down
+            should run in NVFP4. Other layers stay FP8.
+        fp4_weights: dict { layer_idx: { 'gate_up': {packed, sfb, N, K},
+                                         'down':    {packed, sfb, N, K} } }
+            Output of fp4_utils.quant_weight_nvfp4 on each weight.
+        fp4_scratch: dict with keys:
+            'gu_act'  — FP4ActScratch for Gate+Up input  (max_M=Se, K=D)
+            'down_act'— FP4ActScratch for Down input     (max_M=Se, K=H)
+            'x_normed'— fp16 scratch [Se, D]   (post-rms buffer for Gate+Up)
+            'gate_out'— fp16 scratch [Se, 2H]  (Gate+Up GEMM output)
+            'hid_fp16'— fp16 scratch [Se, H]   (post-silu_mul output, Down input)
+            'fg_fp16' — fp16 scratch [Se, D]   (Down GEMM output)
+            'variant_gu' — int NVFP4 variant idx for Gate+Up
+            'variant_dn' — int NVFP4 variant idx for Down
+    """
+    rowops_v2 = bool((fp4_scratch or {}).get("rowops_v2"))
+    rowops_v5 = int((fp4_scratch or {}).get("rowops_v5") or 0)
+    fp4_layers = set(fp4_layers or ())
+    if fp4_layers and (fp4_weights is None or fp4_scratch is None):
+        raise ValueError(
+            "fp4_weights and fp4_scratch required when fp4_layers non-empty"
+        )
+    attn_fp4 = fp4_attn_weights or {}
+    if attn_fp4 and (not fp4_layers):
+        raise ValueError(
+            "fp4_attn_weights requires the FP4 encoder scratch (fp4_layers must be non-empty)"
+        )
+    Se = dims["Se"]
+    D = dims["D"]
+    H = dims["H"]
+    NH = dims["NH"]
+    HD = dims["HD"]
+    L = dims["L"]
+    total_keys = dims["total_keys"]
+    Q_dim = NH * HD
+    K_dim = HD
+    attn_scale = 1.0 / math.sqrt(float(HD))
+    x = bufs["x"]
+    x_fp8 = bufs["x_fp8"]
+    qkv = bufs["qkv"]
+    logits = bufs["logits"]
+    attn_out = bufs["attn_out"]
+    o_fp8 = bufs["o_fp8"]
+    gate = bufs["gate"]
+    hid_fp8 = bufs["hid_fp8"]
+    fg = bufs["fg"]
+    act_scales = weights["act_scales"]
+    alpha_host = weights["alpha_host"]
+    if fp4_layers:
+        sc_gu = fp4_scratch["gu_act"]
+        sc_dn = fp4_scratch["down_act"]
+        x_normed_ptr = fp4_scratch["x_normed"]
+        gate_fp16_ptr = fp4_scratch["gate_out"]
+        hid_fp16_ptr = fp4_scratch["hid_fp16"]
+        fg_fp16_ptr = fp4_scratch["fg_fp16"]
+        variant_gu = fp4_scratch["variant_gu"]
+        variant_dn = fp4_scratch["variant_dn"]
+        if attn_fp4:
+            sc_at = fp4_scratch["attn_act"]
+            attn_variant = fp4_scratch["attn_variant"]
+        if use_p1_split_gu:
+            p1_combiner = fp4_scratch["p1_combiner"]
+            if p1_combiner == "epilogue":
+                p1_il_p4 = fp4_scratch["p1_il_p4"]
+                p1_il_sfa = fp4_scratch["p1_il_sfa"]
+                variant_dn_x = fp4_scratch["variant_dn_x"]
+            elif p1_combiner in (
+                "epilogue_hw",
+                "epilogue_hw_nod",
+                "epilogue_hw_nod_2sm",
+            ):
+                p1_dummy = fp4_scratch["p1_dummy"]
+            else:
+                p1_gate_p4 = fp4_scratch["p1_gate_p4"]
+                p1_gate_sfa = fp4_scratch["p1_gate_sfa"]
+                p1_up_p4 = fp4_scratch["p1_up_p4"]
+                p1_up_sfa = fp4_scratch["p1_up_sfa"]
+    enc_touch = int(dims.get("enc_l2_touch") or 0)
+    enc_touch_mask = int(dims.get("enc_l2_touch_mask", 15))
+    enc_touch_fork = int(dims.get("enc_l2_touch_fork", 0))
+    enc_touch_hint = int(dims.get("enc_l2_touch_hint", 2))
+    enc_touch_depth = int(dims.get("enc_l2_touch_depth", 16))
+    enc_touch_pace = int(dims.get("enc_l2_touch_pace", 12288))
+    enc_touch_threads = int(dims.get("enc_l2_touch_threads", 256))
+    enc_touch_sink = int(bufs.get("l2_touch_sink") or 0)
+    if enc_touch and (not enc_touch_sink):
+        raise ValueError("enc_l2_touch requires bufs['l2_touch_sink']")
+
+    def _enc_touch_regions(ln):
+        regs = []
+        if ln < 0 or ln >= int(dims["L"]):
+            return regs
+        if enc_touch_mask & 1 and weights.get("qkv_w_bytes"):
+            regs.append((weights["qkv_w"][ln], int(weights["qkv_w_bytes"][ln])))
+        aw = attn_fp4.get(ln)
+        if enc_touch_mask & 2 and aw is not None and ("o" in aw):
+            regs.append((aw["o"]["packed"].data_ptr(), aw["o"]["packed"].numel()))
+            regs.append((aw["o"]["sfb"].data_ptr(), aw["o"]["sfb"].numel()))
+        wl = (fp4_weights or {}).get(ln)
+        if wl is not None:
+            if enc_touch_mask & 4:
+                g = wl.get("gu_il") or wl.get("gate_up")
+                if g is not None:
+                    regs.append((g["packed"].data_ptr(), g["packed"].numel()))
+                    regs.append((g["sfb"].data_ptr(), g["sfb"].numel()))
+            if enc_touch_mask & 8:
+                d = wl.get("down_x") or wl.get("down")
+                if d is not None:
+                    regs.append((d["packed"].data_ptr(), d["packed"].numel()))
+                    regs.append((d["sfb"].data_ptr(), d["sfb"].numel()))
+        return regs
+
+    def _enc_touch_launch(ln, where):
+        regs = _enc_touch_regions(ln)
+        if not regs:
+            return
+        rc = fvk_fp4.pi05_l2_touch_fork(
+            regs,
+            stream,
+            enc_touch,
+            enc_touch_hint,
+            enc_touch_sink,
+            enc_touch_depth,
+            enc_touch_pace,
+            enc_touch_threads,
+        )
+        if rc != 0:
+            raise RuntimeError(f"encoder l2_touch {where} failed rc={rc}")
+
+    skip_post_rms = bool((fp4_scratch or {}).get("skip_post_rms"))
+    qkv_lt = bool((fp4_scratch or {}).get("qkv_lt"))
+    qkv_swap = int((fp4_scratch or {}).get("qkv_swap") or 0)
+    awq_inv_s_gu32 = (fp4_scratch or {}).get("awq_inv_s_gu32") or {}
+    for l in range(L):
+        last = l == L - 1
+        is_fp4 = l in fp4_layers
+        as_qkv = act_scales + (l * 4 + 0) * 4
+        as_o = act_scales + (l * 4 + 1) * 4
+        as_gu = act_scales + (l * 4 + 2) * 4
+        as_d = act_scales + (l * 4 + 3) * 4
+        aw_attn = attn_fp4.get(l)
+        if aw_attn is not None and "qkv" in aw_attn:
+            fvk_fp4.rms_norm_mul_fp4_sfa_fp16(
+                x,
+                aw_attn["qkv_inv_s"],
+                sc_at.packed.data_ptr(),
+                sc_at.sfa.data_ptr(),
+                Se,
+                D,
+                stream,
+            )
+            rc = fvk_fp4.pi05_cutlass_fp4_gemm_variant(
+                attn_variant,
+                sc_at.packed.data_ptr(),
+                sc_at.sfa.data_ptr(),
+                aw_attn["qkv"]["packed"].data_ptr(),
+                aw_attn["qkv"]["sfb"].data_ptr(),
+                qkv,
+                Se,
+                2560,
+                D,
+                1.0,
+                0.0,
+                stream,
+            )
+            if rc != 0:
+                raise RuntimeError(f"encoder FP4 qkv GEMM layer {l} failed rc={rc}")
+        else:
+            if rowops_v5 & 1 and True:
+                _check(
+                    fvk_fp4.rowops_rms_fp8_v5(x, x_fp8, Se, D, as_qkv, stream),
+                    "rowops_rms_fp8_v5",
+                    l,
+                    M=Se,
+                    N=D,
+                )
+            elif rowops_v2 and True:
+                _check(
+                    fvk_fp4.rowops_rms_fp8_v2(x, x_fp8, Se, D, as_qkv, stream),
+                    "rowops_rms_fp8_v2",
+                    l,
+                    M=Se,
+                    N=D,
+                )
+            else:
+                fvk.rms_norm_fp8_noweight_fp16(x, x_fp8, Se, D, as_qkv, stream)
+            if qkv_swap:
+                (
+                    fvk.cutlass_fp8_sq_swap
+                    if qkv_swap == 1
+                    else fvk.cutlass_fp8_sq_swap2
+                )(
+                    x_fp8,
+                    weights["qkv_w"][l],
+                    qkv,
+                    Se,
+                    2560,
+                    D,
+                    alpha_host[l * 4 + 0],
+                    0.0,
+                    stream,
+                )
+            elif qkv_lt:
+                gemm.fp8_nn_bias(
+                    x_fp8,
+                    weights["qkv_w_t"][l],
+                    qkv,
+                    weights["qkv_zero_bias"],
+                    Se,
+                    2560,
+                    D,
+                    alpha_host[l * 4 + 0],
+                    stream,
+                )
+            else:
+                fvk.cutlass_fp8_sq(
+                    x_fp8,
+                    weights["qkv_w"][l],
+                    qkv,
+                    Se,
+                    2560,
+                    D,
+                    alpha_host[l * 4 + 0],
+                    0.0,
+                    stream,
+                )
+        kv_elem_off = l * total_keys * HD
+        if enc_touch and enc_touch_fork == 0:
+            _enc_touch_launch(l + 1, f"layer {l} (post-qkv)")
+        if weights.get("Kc8"):
+            rc = fvk_fp4.qkv_split_rope_kvcache_fp16_fp8_vec(
+                qkv,
+                weights["rope"],
+                attn_out,
+                weights["Kc"],
+                weights["Vc"],
+                weights["Kc8"],
+                weights["Vc8"],
+                Se,
+                Q_dim,
+                K_dim,
+                HD,
+                2560,
+                kv_elem_off,
+                HD,
+                stream,
+            )
+        else:
+            rc = fvk.qkv_split_rope_kvcache_fp16_vec(
+                qkv,
+                weights["rope"],
+                attn_out,
+                weights["Kc"],
+                weights["Vc"],
+                Se,
+                Q_dim,
+                K_dim,
+                HD,
+                2560,
+                kv_elem_off,
+                HD,
+                stream,
+            )
+        if rc != 0:
+            raise RuntimeError(f"encoder qkv split layer {l} failed rc={rc}")
+        if not last:
+            if attn is not None:
+                attn.run("encoder", l, q_seq=Se, stream=stream)
+            else:
+                K_ptr = weights["Kc"] + kv_elem_off * 2
+                V_ptr = weights["Vc"] + kv_elem_off * 2
+                fvk.attention_qkv_fp16(
+                    bufs["ctx"],
+                    attn_out,
+                    K_ptr,
+                    V_ptr,
+                    logits,
+                    attn_out,
+                    Se,
+                    Se,
+                    NH,
+                    HD,
+                    attn_scale,
+                    stream,
+                )
+            if enc_touch and enc_touch_fork == 1:
+                _enc_touch_launch(l + 1, f"layer {l} (post-attn)")
+            if aw_attn is not None and "o" in aw_attn:
+                if rowops_v5 & 1 and True:
+                    rc = fvk_fp4.rowops_quantize_fp4_sfa_v5(
+                        attn_out,
+                        sc_at.packed.data_ptr(),
+                        sc_at.sfa.data_ptr(),
+                        Se,
+                        D,
+                        stream,
+                    )
+                elif rowops_v2 and True:
+                    rc = fvk_fp4.rowops_quantize_fp4_sfa_v2(
+                        attn_out,
+                        sc_at.packed.data_ptr(),
+                        sc_at.sfa.data_ptr(),
+                        Se,
+                        D,
+                        stream,
+                    )
+                else:
+                    rc = fvk_fp4.quantize_fp4_dynamic_sfa_fp16_vec(
+                        attn_out,
+                        sc_at.packed.data_ptr(),
+                        sc_at.sfa.data_ptr(),
+                        Se,
+                        D,
+                        False,
+                        stream,
+                    )
+                if rc != 0:
+                    raise RuntimeError(
+                        f"encoder FP4 O quantize layer {l} failed rc={rc}"
+                    )
+                res_in_epilogue = (
+                    rowops_v2 and is_fp4 and bool(fp4_scratch.get("res_epilogue", True))
+                )
+                rc = fvk_fp4.pi05_cutlass_fp4_gemm_variant(
+                    attn_variant,
+                    sc_at.packed.data_ptr(),
+                    sc_at.sfa.data_ptr(),
+                    aw_attn["o"]["packed"].data_ptr(),
+                    aw_attn["o"]["sfb"].data_ptr(),
+                    x if res_in_epilogue else fg,
+                    Se,
+                    D,
+                    D,
+                    1.0,
+                    1.0 if res_in_epilogue else 0.0,
+                    stream,
+                )
+                if rc != 0:
+                    raise RuntimeError(f"encoder FP4 O GEMM layer {l} failed rc={rc}")
+            else:
+                res_in_epilogue = False
+                fvk.quantize_fp8_static_fp16(attn_out, o_fp8, as_o, Se * D, stream)
+                fvk.cutlass_fp8_sq(
+                    o_fp8,
+                    weights["o_w"][l],
+                    fg,
+                    Se,
+                    D,
+                    D,
+                    alpha_host[l * 4 + 1],
+                    0.0,
+                    stream,
+                )
+            if is_fp4:
+                w_gu = fp4_weights[l]["gate_up"]
+                w_dn = fp4_weights[l]["down"]
+                awq_gu = (fp4_scratch.get("awq_inv_s_gu") or {}).get(l)
+                awq_dn = (fp4_scratch.get("awq_inv_s_dn") or {}).get(l)
+                if rowops_v5 & 1 and res_in_epilogue:
+                    if awq_gu and (not awq_inv_s_gu32.get(l)):
+                        raise RuntimeError(
+                            f"rowops_v5: no fp32 AWQ inv_s for layer {l}"
+                        )
+                    _check(
+                        fvk_fp4.rowops_rms_mul_fp4_sfa_v5(
+                            x,
+                            awq_inv_s_gu32.get(l) or 0 if awq_gu else 0,
+                            sc_gu.packed.data_ptr(),
+                            sc_gu.sfa.data_ptr(),
+                            Se,
+                            D,
+                            stream,
+                        ),
+                        "rowops_rms_mul_fp4_sfa_v5",
+                        l,
+                        M=Se,
+                        N=D,
+                    )
+                elif rowops_v2 and res_in_epilogue:
+                    _check(
+                        fvk_fp4.rowops_rms_mul_fp4_sfa_v2(
+                            x,
+                            awq_gu or 0,
+                            sc_gu.packed.data_ptr(),
+                            sc_gu.sfa.data_ptr(),
+                            Se,
+                            D,
+                            stream,
+                        ),
+                        "rowops_rms_mul_fp4_sfa_v2",
+                        l,
+                        M=Se,
+                        N=D,
+                    )
+                elif awq_gu is None:
+                    fvk_fp4.residual_add_rms_norm_fp4_sfa_fp16(
+                        x,
+                        fg,
+                        sc_gu.packed.data_ptr(),
+                        sc_gu.sfa.data_ptr(),
+                        Se,
+                        D,
+                        stream,
+                    )
+                elif rowops_v2 and True:
+                    _check(
+                        fvk_fp4.rowops_residual_rms_mul_fp4_sfa_v2(
+                            x,
+                            fg,
+                            awq_gu,
+                            sc_gu.packed.data_ptr(),
+                            sc_gu.sfa.data_ptr(),
+                            Se,
+                            D,
+                            stream,
+                        ),
+                        "rowops_residual_rms_mul_fp4_sfa_v2",
+                        l,
+                        M=Se,
+                        N=D,
+                    )
+                else:
+                    fvk_fp4.residual_add_rms_norm_mul_fp4_sfa_fp16(
+                        x,
+                        fg,
+                        awq_gu,
+                        sc_gu.packed.data_ptr(),
+                        sc_gu.sfa.data_ptr(),
+                        Se,
+                        D,
+                        stream,
+                    )
+                if use_p1_split_gu and "gu_il" in fp4_weights[l]:
+                    w_il = fp4_weights[l]["gu_il"]
+                    if p1_combiner in (
+                        "epilogue_hw",
+                        "epilogue_hw_nod",
+                        "epilogue_hw_nod_2sm",
+                    ):
+                        hw_gemm = getattr(
+                            fvk_fp4,
+                            {
+                                "epilogue_hw_nod": "pi05_cutlass_fp4_gemm_geglu_il_hw_nod",
+                                "epilogue_hw_nod_2sm": "cutlass_fp4_gemm_geglu_il_hw_nod_2sm",
+                                "epilogue_hw": "cutlass_fp4_gemm_geglu_il_hw",
+                            }[p1_combiner],
+                        )
+                        _check(
+                            hw_gemm(
+                                sc_gu.packed.data_ptr(),
+                                sc_gu.sfa.data_ptr(),
+                                w_il["packed"].data_ptr(),
+                                w_il["sfb"].data_ptr(),
+                                p1_dummy,
+                                sc_dn.packed.data_ptr(),
+                                sc_dn.sfa.data_ptr(),
+                                Se,
+                                2 * H,
+                                D,
+                                stream,
+                            ),
+                            "cutlass_fp4_gemm_geglu_il_hw",
+                            l,
+                            M=Se,
+                            N_il=2 * H,
+                            K=D,
+                        )
+                    else:
+                        _check(
+                            fvk_fp4.cutlass_fp4_gemm_geglu_il(
+                                sc_gu.packed.data_ptr(),
+                                sc_gu.sfa.data_ptr(),
+                                w_il["packed"].data_ptr(),
+                                w_il["sfb"].data_ptr(),
+                                p1_il_p4,
+                                p1_il_sfa,
+                                Se,
+                                2 * H,
+                                D,
+                                stream,
+                            ),
+                            "cutlass_fp4_gemm_geglu_il",
+                            l,
+                            M=Se,
+                            N_il=2 * H,
+                            K=D,
+                        )
+                elif use_p1_split_gu and "gate" in fp4_weights[l]:
+                    w_g = fp4_weights[l]["gate"]
+                    w_u = fp4_weights[l]["up"]
+                    _check(
+                        fvk_fp4.cutlass_fp4_gemm_fp4out(
+                            sc_gu.packed.data_ptr(),
+                            sc_gu.sfa.data_ptr(),
+                            w_g["packed"].data_ptr(),
+                            w_g["sfb"].data_ptr(),
+                            p1_gate_p4,
+                            p1_gate_sfa,
+                            Se,
+                            H,
+                            D,
+                            stream,
+                        ),
+                        "cutlass_fp4_gemm_fp4out[gate]",
+                        l,
+                        M=Se,
+                        N=H,
+                        K=D,
+                    )
+                    _check(
+                        fvk_fp4.cutlass_fp4_gemm_fp4out(
+                            sc_gu.packed.data_ptr(),
+                            sc_gu.sfa.data_ptr(),
+                            w_u["packed"].data_ptr(),
+                            w_u["sfb"].data_ptr(),
+                            p1_up_p4,
+                            p1_up_sfa,
+                            Se,
+                            H,
+                            D,
+                            stream,
+                        ),
+                        "cutlass_fp4_gemm_fp4out[up]",
+                        l,
+                        M=Se,
+                        N=H,
+                        K=D,
+                    )
+                    if awq_dn is None:
+                        fvk_fp4.geglu_two_fp4_to_fp4(
+                            p1_gate_p4,
+                            p1_gate_sfa,
+                            p1_up_p4,
+                            p1_up_sfa,
+                            sc_dn.packed.data_ptr(),
+                            sc_dn.sfa.data_ptr(),
+                            Se,
+                            H,
+                            stream,
+                        )
+                    elif p1_combiner == "lut":
+                        fvk_fp4.geglu_two_mul_fp4_to_fp4_lut(
+                            p1_gate_p4,
+                            p1_gate_sfa,
+                            p1_up_p4,
+                            p1_up_sfa,
+                            awq_dn,
+                            sc_dn.packed.data_ptr(),
+                            sc_dn.sfa.data_ptr(),
+                            Se,
+                            H,
+                            stream,
+                        )
+                    elif p1_combiner == "lut_native":
+                        fvk_fp4.geglu_two_mul_fp4_to_fp4_lut_native(
+                            p1_gate_p4,
+                            p1_gate_sfa,
+                            p1_up_p4,
+                            p1_up_sfa,
+                            awq_dn,
+                            sc_dn.packed.data_ptr(),
+                            sc_dn.sfa.data_ptr(),
+                            Se,
+                            H,
+                            stream,
+                        )
+                    elif p1_combiner == "direct":
+                        fvk_fp4.geglu_two_mul_fp4_to_fp4(
+                            p1_gate_p4,
+                            p1_gate_sfa,
+                            p1_up_p4,
+                            p1_up_sfa,
+                            awq_dn,
+                            sc_dn.packed.data_ptr(),
+                            sc_dn.sfa.data_ptr(),
+                            Se,
+                            H,
+                            stream,
+                        )
+                    else:
+                        raise ValueError(f"unknown P1 combiner: {p1_combiner!r}")
+                else:
+                    _check(
+                        fvk_fp4.pi05_cutlass_fp4_gemm_variant(
+                            variant_gu,
+                            sc_gu.packed.data_ptr(),
+                            sc_gu.sfa.data_ptr(),
+                            w_gu["packed"].data_ptr(),
+                            w_gu["sfb"].data_ptr(),
+                            gate_fp16_ptr,
+                            Se,
+                            H * 2,
+                            D,
+                            1.0,
+                            0.0,
+                            stream,
+                        ),
+                        f"pi05_cutlass_fp4_gemm_variant[gate_up,v{variant_gu}]",
+                        l,
+                        M=Se,
+                        N=H * 2,
+                        K=D,
+                    )
+                    if awq_dn is None:
+                        fvk_fp4.gate_geglu_fp4_sfa_v2_fp16(
+                            gate_fp16_ptr,
+                            sc_dn.packed.data_ptr(),
+                            sc_dn.sfa.data_ptr(),
+                            Se,
+                            H,
+                            stream,
+                        )
+                    else:
+                        fvk_fp4.gate_geglu_mul_fp4_sfa_v2_fp16(
+                            gate_fp16_ptr,
+                            awq_dn,
+                            sc_dn.packed.data_ptr(),
+                            sc_dn.sfa.data_ptr(),
+                            Se,
+                            H,
+                            stream,
+                        )
+                if enc_touch and enc_touch_fork == 2:
+                    _enc_touch_launch(l + 1, f"layer {l} (pre-down)")
+                if (
+                    use_p1_split_gu
+                    and "gu_il" in fp4_weights[l]
+                    and (p1_combiner == "epilogue")
+                ):
+                    w_dx = fp4_weights[l]["down_x"]
+                    _check(
+                        fvk_fp4.pi05_cutlass_fp4_gemm_variant(
+                            variant_dn_x,
+                            p1_il_p4,
+                            p1_il_sfa,
+                            w_dx["packed"].data_ptr(),
+                            w_dx["sfb"].data_ptr(),
+                            fg_fp16_ptr,
+                            Se,
+                            D,
+                            2 * H,
+                            1.0,
+                            0.0,
+                            stream,
+                        ),
+                        f"pi05_cutlass_fp4_gemm_variant[down_x,v{variant_dn_x}]",
+                        l,
+                        M=Se,
+                        N=D,
+                        K=2 * H,
+                    )
+                else:
+                    down_res = rowops_v2 and res_in_epilogue
+                    _check(
+                        fvk_fp4.pi05_cutlass_fp4_gemm_variant(
+                            variant_dn,
+                            sc_dn.packed.data_ptr(),
+                            sc_dn.sfa.data_ptr(),
+                            w_dn["packed"].data_ptr(),
+                            w_dn["sfb"].data_ptr(),
+                            x if down_res else fg_fp16_ptr,
+                            Se,
+                            D,
+                            H,
+                            1.0,
+                            1.0 if down_res else 0.0,
+                            stream,
+                        ),
+                        f"pi05_cutlass_fp4_gemm_variant[down,v{variant_dn}]",
+                        l,
+                        M=Se,
+                        N=D,
+                        K=H,
+                    )
+                as_next = act_scales + ((l + 1) * 4 + 0) * 4
+                if (
+                    skip_post_rms
+                    and res_in_epilogue
+                    and (l + 1 < L)
+                    and (fp4_scratch.get("p1_combiner") != "epilogue")
+                ):
+                    pass
+                elif (
+                    rowops_v2
+                    and res_in_epilogue
+                    and (fp4_scratch.get("p1_combiner") != "epilogue")
+                ):
+                    if rowops_v5 & 1:
+                        _check(
+                            fvk_fp4.rowops_rms_fp8_v5(x, x_fp8, Se, D, as_next, stream),
+                            "rowops_rms_fp8_v5",
+                            l,
+                            M=Se,
+                            N=D,
+                        )
+                    else:
+                        _check(
+                            fvk_fp4.rowops_rms_fp8_v2(x, x_fp8, Se, D, as_next, stream),
+                            "rowops_rms_fp8_v2",
+                            l,
+                            M=Se,
+                            N=D,
+                        )
+                elif rowops_v2 and True:
+                    _check(
+                        fvk_fp4.rowops_residual_rms_fp8_v2(
+                            x, fg_fp16_ptr, x_fp8, Se, D, as_next, stream
+                        ),
+                        "rowops_residual_rms_fp8_v2",
+                        l,
+                        M=Se,
+                        N=D,
+                    )
+                else:
+                    fvk.residual_add_rms_norm_fp8_noweight_fp16(
+                        x, fg_fp16_ptr, x_fp8, Se, D, as_next, stream
+                    )
+            else:
+                fvk.residual_add_rms_norm_fp8_noweight_fp16(
+                    x, fg, x_fp8, Se, D, as_gu, stream
+                )
+                fvk.cutlass_fp8_t1(
+                    x_fp8,
+                    weights["gate_w"][l],
+                    gate,
+                    Se,
+                    H * 2,
+                    D,
+                    alpha_host[l * 4 + 2],
+                    0.0,
+                    stream,
+                )
+                fvk.gate_geglu_merged_fp8_fp16(gate, hid_fp8, Se, H, as_d, stream)
+                fvk.cutlass_fp8_wide(
+                    hid_fp8,
+                    weights["down_w"][l],
+                    fg,
+                    Se,
+                    D,
+                    H,
+                    alpha_host[l * 4 + 3],
+                    0.0,
+                    stream,
+                )
+                as_next = act_scales + ((l + 1) * 4 + 0) * 4
+                fvk.residual_add_rms_norm_fp8_noweight_fp16(
+                    x, fg, x_fp8, Se, D, as_next, stream
+                )
+    if enc_touch:
+        fvk_fp4.pi05_l2_touch_join(stream)
+
+
+def siglip_forward_with_fp4_ffn(
+    gemm,
+    fvk,
+    fvk_fp4,
+    bufs,
+    weights,
+    dims,
+    stream=0,
+    *,
+    attn=None,
+    fp4_weights: dict = None,
+    fp4_scratch: dict = None,
+):
+    """SigLIP vision encoder with the FFN in NVFP4.
+
+    The attention half of every layer is identical to
+    ``shared_primitives.siglip_forward`` (FP8 with static scales). The FFN
+    runs LayerNorm straight into NVFP4 activations, an Up GEMM with fused
+    bias + tanh-GELU + fp4/SFA output, and a Down GEMM with fused bias +
+    residual accumulate. The FFN hidden dimension is zero-padded to a
+    multiple of 32 (fp4 TMA alignment); pad rows/columns carry zero
+    weights and biases so the padding is mathematically inert.
+
+    Args:
+        fp4_weights: {layer: {'up': quantized, 'up_bias': ptr,
+                              'down': quantized}} where the quantized
+            entries are ``quant_weight_nvfp4`` dicts over the PADDED
+            hidden dimension and ``up_bias`` points to the padded fp16
+            bias. The Down bias reuses ``weights['down_b']``.
+        fp4_scratch: {'ln_act': FP4ActScratch(S, D),
+                      'hid_act': FP4ActScratch(S, H_pad), 'H_pad': int}
+    """
+    up_variant = int((fp4_scratch or {}).get("siglip_up_variant", 0))
+    down_variant = int((fp4_scratch or {}).get("siglip_down_variant", 0))
+    rowops_v2 = bool((fp4_scratch or {}).get("rowops_v2"))
+    rowops_v5 = int((fp4_scratch or {}).get("rowops_v5") or 0)
+    rowops_ln_v3 = int((fp4_scratch or {}).get("rowops_ln_v3") or 0)
+    quant_fp8_v2 = bool((fp4_scratch or {}).get("quant_fp8_v2"))
+    ln32 = (fp4_scratch or {}).get("ln32")
+    sig_touch = int((fp4_scratch or {}).get("sig_l2_touch") or 0)
+    sig_touch_regions = (fp4_scratch or {}).get("sig_l2_touch_regions") or {}
+    sig_touch_hint = int((fp4_scratch or {}).get("sig_l2_touch_hint", 4))
+    sig_touch_depth = int((fp4_scratch or {}).get("sig_l2_touch_depth", 16))
+    sig_touch_pace = int((fp4_scratch or {}).get("sig_l2_touch_pace", 12288))
+    sig_touch_threads = int((fp4_scratch or {}).get("sig_l2_touch_threads", 128))
+    sig_touch_fork = int((fp4_scratch or {}).get("sig_l2_touch_fork", 0))
+    sig_touch_sink = int((fp4_scratch or {}).get("sig_l2_touch_sink") or 0)
+
+    def _sig_touch_launch(ln, where):
+        regs = sig_touch_regions.get(ln) if sig_touch else None
+        if not regs:
+            return
+        rc = fvk_fp4.pi05_l2_touch_fork(
+            regs,
+            stream,
+            sig_touch,
+            sig_touch_hint,
+            sig_touch_sink,
+            sig_touch_depth,
+            sig_touch_pace,
+            sig_touch_threads,
+        )
+        if rc != 0:
+            raise RuntimeError(f"SigLIP l2_touch {where} failed rc={rc}")
+
+    if fp4_weights is None or fp4_scratch is None:
+        raise ValueError(
+            "siglip_forward_with_fp4_ffn requires fp4_weights and fp4_scratch"
+        )
+    S = dims["S"]
+    D = dims["D"]
+    H = dims["H"]
+    NH = dims["NH"]
+    HD = dims["HD"]
+    L = dims["L"]
+    nv = dims["num_views"]
+    spv = dims["seq_per_view"]
+    x = bufs["x"]
+    x_fp8 = bufs["x_fp8"]
+    qkv = bufs["qkv"]
+    attn_out = bufs["attn_out"]
+    hidden = bufs["hidden"]
+    hid_fp8 = bufs["hid_fp8"]
+    alpha = weights["alpha"]
+    sc_ln = fp4_scratch["ln_act"]
+    sc_hid = fp4_scratch["hid_act"]
+    H_pad = int(fp4_scratch["H_pad"])
+    for l in range(L):
+        a_qkv = alpha[l * 4 + 0]
+        a_o = alpha[l * 4 + 1]
+        a_up = alpha[l * 4 + 2]
+        a_down = alpha[l * 4 + 3]
+        if rowops_v5 & 2:
+            rc = fvk_fp4.rowops_layer_norm_fp8_v5(
+                x,
+                ln32["ln_attn_w"][l],
+                ln32["ln_attn_b"][l],
+                x_fp8,
+                S,
+                D,
+                1e-05,
+                stream,
+            )
+        elif rowops_ln_v3 == 2:
+            rc = fvk_fp4.rowops_layer_norm_fp8_v4(
+                x,
+                weights["ln_attn_w"][l],
+                weights["ln_attn_b"][l],
+                x_fp8,
+                S,
+                D,
+                1e-05,
+                stream,
+            )
+        elif rowops_ln_v3:
+            rc = fvk_fp4.rowops_layer_norm_fp8_v3(
+                x,
+                weights["ln_attn_w"][l],
+                weights["ln_attn_b"][l],
+                x_fp8,
+                S,
+                D,
+                1e-05,
+                stream,
+            )
+        elif rowops_v2 and True:
+            rc = fvk_fp4.rowops_layer_norm_fp8_v2(
+                x,
+                weights["ln_attn_w"][l],
+                weights["ln_attn_b"][l],
+                x_fp8,
+                S,
+                D,
+                1e-05,
+                stream,
+            )
+        else:
+            rc = fvk_fp4.layer_norm_fp8_vec_fp16(
+                x,
+                weights["ln_attn_w"][l],
+                weights["ln_attn_b"][l],
+                x_fp8,
+                S,
+                D,
+                1e-05,
+                stream,
+            )
+        if rc != 0:
+            fvk.layer_norm_fp8(
+                x,
+                x_fp8,
+                weights["ln_attn_w"][l],
+                weights["ln_attn_b"][l],
+                S,
+                D,
+                1e-05,
+                stream,
+            )
+        if weights.get("qkv_w_t"):
+            rc = fvk.cutlass_fp8_sq_bias(
+                x_fp8,
+                weights["qkv_w_t"][l],
+                qkv,
+                weights["qkv_b"][l],
+                S,
+                3 * D,
+                D,
+                a_qkv,
+                0.0,
+                stream,
+            )
+            if rc != 0:
+                raise RuntimeError(f"SigLIP qkv cutlass GEMM layer {l} failed rc={rc}")
+        else:
+            gemm.fp8_nn_bias(
+                x_fp8,
+                weights["qkv_w"][l],
+                qkv,
+                weights["qkv_b"][l],
+                S,
+                3 * D,
+                D,
+                a_qkv,
+                stream,
+            )
+        if sig_touch and sig_touch_fork == 0:
+            _sig_touch_launch(l + 1, f"layer {l} (post-qkv)")
+        if attn is not None:
+            attn.run("siglip", 0, q_seq=spv, stream=stream)
+        else:
+            stride = 3 * D
+            fvk.fmha_strided_full(
+                qkv,
+                qkv + D * 2,
+                qkv + 2 * D * 2,
+                attn_out,
+                nv,
+                spv,
+                spv,
+                NH,
+                NH,
+                HD,
+                stride,
+                stride,
+                stream,
+            )
+        if quant_fp8_v2:
+            rc = fvk_fp4.quantize_fp8_static_fp16_v2(
+                attn_out, x_fp8, weights["unit_scale"], S * D, stream
+            )
+            if rc != 0:
+                raise RuntimeError(
+                    f"quantize_fp8_static_fp16_v2 layer {l} failed rc={rc}"
+                )
+        else:
+            fvk.quantize_fp8_static_fp16(
+                attn_out, x_fp8, weights["unit_scale"], S * D, stream
+            )
+        gemm.fp8_nn_bias_res(
+            x_fp8, weights["o_w"][l], x, weights["o_b"][l], S, D, D, a_o, stream
+        )
+        if sig_touch and sig_touch_fork == 1:
+            _sig_touch_launch(l + 1, f"layer {l} (post-O)")
+        w = fp4_weights.get(l)
+        if w is None:
+            fvk.layer_norm_fp8(
+                x,
+                x_fp8,
+                weights["ln_ffn_w"][l],
+                weights["ln_ffn_b"][l],
+                S,
+                D,
+                1e-05,
+                stream,
+            )
+            gemm.fp8_nn_gelu_bias(
+                x_fp8,
+                weights["up_w"][l],
+                hidden,
+                weights["up_b"][l],
+                S,
+                H,
+                D,
+                a_up,
+                stream,
+            )
+            fvk.quantize_fp8_static_fp16(
+                hidden, hid_fp8, weights["unit_scale"], S * H, stream
+            )
+            gemm.fp8_nn_bias_res(
+                hid_fp8,
+                weights["down_w"][l],
+                x,
+                weights["down_b"][l],
+                S,
+                D,
+                H,
+                a_down,
+                stream,
+            )
+            continue
+        if rowops_v5 & 2:
+            rc = fvk_fp4.rowops_layer_norm_mul_fp4_sfa_v5(
+                x,
+                ln32["ln_ffn_w"][l],
+                ln32["ln_ffn_b"][l],
+                w.get("ln_inv_s32", 0),
+                sc_ln.packed.data_ptr(),
+                sc_ln.sfa.data_ptr(),
+                S,
+                D,
+                1e-05,
+                stream,
+            )
+        elif rowops_ln_v3 == 2:
+            rc = fvk_fp4.rowops_layer_norm_mul_fp4_sfa_v4(
+                x,
+                weights["ln_ffn_w"][l],
+                weights["ln_ffn_b"][l],
+                w.get("ln_inv_s", 0),
+                sc_ln.packed.data_ptr(),
+                sc_ln.sfa.data_ptr(),
+                S,
+                D,
+                1e-05,
+                stream,
+            )
+        elif rowops_ln_v3:
+            rc = fvk_fp4.rowops_layer_norm_mul_fp4_sfa_v3(
+                x,
+                weights["ln_ffn_w"][l],
+                weights["ln_ffn_b"][l],
+                w.get("ln_inv_s", 0),
+                sc_ln.packed.data_ptr(),
+                sc_ln.sfa.data_ptr(),
+                S,
+                D,
+                1e-05,
+                stream,
+            )
+        elif rowops_v2 and True:
+            rc = fvk_fp4.rowops_layer_norm_mul_fp4_sfa_v2(
+                x,
+                weights["ln_ffn_w"][l],
+                weights["ln_ffn_b"][l],
+                w.get("ln_inv_s", 0),
+                sc_ln.packed.data_ptr(),
+                sc_ln.sfa.data_ptr(),
+                S,
+                D,
+                1e-05,
+                stream,
+            )
+        else:
+            rc = fvk_fp4.layer_norm_mul_fp4_sfa_vec_fp16(
+                x,
+                weights["ln_ffn_w"][l],
+                weights["ln_ffn_b"][l],
+                w.get("ln_inv_s", 0),
+                sc_ln.packed.data_ptr(),
+                sc_ln.sfa.data_ptr(),
+                S,
+                D,
+                1e-05,
+                stream,
+            )
+        if rc != 0:
+            rc = fvk_fp4.layer_norm_mul_fp4_sfa_fp16(
+                x,
+                weights["ln_ffn_w"][l],
+                weights["ln_ffn_b"][l],
+                w.get("ln_inv_s", 0),
+                sc_ln.packed.data_ptr(),
+                sc_ln.sfa.data_ptr(),
+                S,
+                D,
+                1e-05,
+                stream,
+            )
+        if rc != 0:
+            raise RuntimeError(f"SigLIP FP4 FFN LayerNorm layer {l} failed rc={rc}")
+        if up_variant >= 100:
+            rc = fvk_fp4.pi05_cutlass_fp4_gemm_variant(
+                up_variant - 100,
+                sc_ln.packed.data_ptr(),
+                sc_ln.sfa.data_ptr(),
+                w["up"]["packed"].data_ptr(),
+                w["up"]["sfb"].data_ptr(),
+                hidden,
+                S,
+                H_pad,
+                D,
+                1.0,
+                0.0,
+                stream,
+            )
+            if rc == 0:
+                rc = fvk_fp4.gelu_bias_quant_fp4_sfa(
+                    hidden,
+                    w["up_bias"],
+                    sc_hid.packed.data_ptr(),
+                    sc_hid.sfa.data_ptr(),
+                    S,
+                    H_pad,
+                    stream,
+                )
+        elif up_variant:
+            rc = fvk_fp4.pi05_siglip_gemm_bias_gelu_fp4out(
+                up_variant,
+                sc_ln.packed.data_ptr(),
+                sc_ln.sfa.data_ptr(),
+                w["up"]["packed"].data_ptr(),
+                w["up"]["sfb"].data_ptr(),
+                w["up_bias"],
+                sc_hid.packed.data_ptr(),
+                sc_hid.sfa.data_ptr(),
+                S,
+                H_pad,
+                D,
+                stream,
+            )
+        else:
+            rc = fvk_fp4.cutlass_fp4_gemm_bias_gelu_fp4out(
+                sc_ln.packed.data_ptr(),
+                sc_ln.sfa.data_ptr(),
+                w["up"]["packed"].data_ptr(),
+                w["up"]["sfb"].data_ptr(),
+                w["up_bias"],
+                sc_hid.packed.data_ptr(),
+                sc_hid.sfa.data_ptr(),
+                S,
+                H_pad,
+                D,
+                stream,
+            )
+        if rc != 0:
+            raise RuntimeError(f"SigLIP FP4 FFN Up GEMM layer {l} failed rc={rc}")
+        if down_variant:
+            rc = fvk_fp4.pi05_siglip_gemm_bias_res_fp16(
+                down_variant,
+                sc_hid.packed.data_ptr(),
+                sc_hid.sfa.data_ptr(),
+                w["down"]["packed"].data_ptr(),
+                w["down"]["sfb"].data_ptr(),
+                weights["down_b"][l],
+                x,
+                x,
+                S,
+                D,
+                H_pad,
+                stream,
+            )
+        else:
+            rc = fvk_fp4.cutlass_fp4_gemm_bias_res_fp16(
+                sc_hid.packed.data_ptr(),
+                sc_hid.sfa.data_ptr(),
+                w["down"]["packed"].data_ptr(),
+                w["down"]["sfb"].data_ptr(),
+                weights["down_b"][l],
+                x,
+                x,
+                S,
+                D,
+                H_pad,
+                stream,
+            )
+        if rc != 0:
+            raise RuntimeError(f"SigLIP FP4 FFN Down GEMM layer {l} failed rc={rc}")
+    if sig_touch:
+        rc = fvk_fp4.pi05_l2_touch_join(stream)
+        if rc != 0:
+            raise RuntimeError(f"SigLIP l2_touch join failed rc={rc}")
+
+
+_ROWOPS_ENV = True
