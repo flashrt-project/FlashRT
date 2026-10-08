@@ -125,8 +125,7 @@ The Thor rows use OpenPI `pi05_libero`, two cameras and 10 denoising steps.
 These are steady-state medians from the public Thor image after 200 warmups and
 1,000 measured calls. Action cosine against OpenPI is 0.999905 (FP8) / 0.999707 (NVFP4).
 
-Using OpenPI's `pi05_libero` model, FlashRT achieved **94.29% success on LIBERO-10**
-(4,243/4,500 episodes across 9 rounds) under the [evaluated rollout protocol](docs/thor/pi05.md#libero-10-rollout-result).
+Using OpenPI's `pi05_libero` model, FlashRT achieved **94.29% success on LIBERO-10**.
 
 **Guide:** [Thor](docs/thor/pi05.md) · [RTX 5090](examples/blackwell/README.md) · [AMD](docs/deployment_amd_pi05.md).
 
