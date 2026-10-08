@@ -25,10 +25,10 @@ The flagship integration today is **VLA control** — production frontends for P
 ### VLA
 
 **π0.5 on a Jetson AGX Thor.** LIBERO-spatial task 1, one flow-matching sample
-held fixed. Two hosts as their authors ship them, then the same model
-accelerated two ways. Per-decision latency **266.0 / 303.6 → 36.1 → 29.2 ms**,
-3.8 Hz to **34.2 Hz** of policy decisions; the task finishes in **6.0 s**
-instead of 23.5 s, and all four arms complete it.
+held fixed. OpenPI and LeRobot hosts as shipped, plus FlashRT structures and
+native inference. Median per-decision latency **266.0 / 303.6 → 36.1 → 22.2 ms**,
+3.8 Hz to **45.1 Hz** of policy decisions. On the shared policy + 20 Hz control
+timeline, the task completes at **5.4 s** versus 23.5 s; all four arms succeed.
 
 <img src="https://github.com/flashrt-project/FlashRT-assets/raw/main/demo/gif/thor_pi05.gif" alt="thor_pi05" width="100%">
 
