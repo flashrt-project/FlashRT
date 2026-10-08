@@ -1,8 +1,8 @@
 // Shared template for the forked-mainloop NVFP4 GEMM variants (see
-// cutlass_fp4_gemm_variants_earlyb.cu): ToEarlyB policy rewrite + Variant<>.
+// pi05_cutlass_fp4_gemm_variants_earlyb.cu): ToEarlyB policy rewrite + Variant<>.
 #pragma once
 #undef CUTLASS_ENABLE_GDC_FOR_SM100
-#include "kernels/pi05/thor/pdl.cuh"
+#include "kernels/pi05/thor/pi05_pdl.cuh"
 #include <utility>
 #include <cstdlib>
 #include <cstdio>
@@ -19,10 +19,10 @@
 #include "cutlass/util/packed_stride.hpp"
 #include "cutlass/detail/sm100_blockscaled_layout.hpp"
 #include "cute/tensor.hpp"
-#include "kernels/pi05/thor/sm100_blockscaled_mma_earlyb.hpp"
-#include "kernels/pi05/thor/sm100_gemm_seq_kernel.hpp"
-#include "kernels/pi05/thor/sm100_gemm_phase_cta.hpp"
-#include "kernels/pi05/thor/fp4_runtime_knobs.cuh"
+#include "kernels/pi05/thor/pi05_sm100_blockscaled_mma_earlyb.hpp"
+#include "kernels/pi05/thor/pi05_sm100_gemm_seq_kernel.hpp"
+#include "kernels/pi05/thor/pi05_sm100_gemm_phase_cta.hpp"
+#include "kernels/pi05/thor/pi05_fp4_runtime_knobs.cuh"
 
 namespace flash_rt {
 namespace fp4 {
@@ -117,7 +117,7 @@ struct Variant {
           reinterpret_cast<SA const*>(SFA), layout_SFA, reinterpret_cast<SB const*>(SFB), layout_SFB },
         { {alpha, beta}, reinterpret_cast<ElementC*>(D), stride_C, reinterpret_cast<ElementD*>(D), stride_D }
     };
-    args.mainloop.weight_evict_first = get_weight_evict_first();
+    args.mainloop.weight_evict_first = pi05_get_weight_evict_first();
     if constexpr (!std::is_void_v<Sched>) {
       // The static persistent scheduler sizes its grid from hw_info (the CLC scheduler queries the device itself).
       static int sm_count = 0;

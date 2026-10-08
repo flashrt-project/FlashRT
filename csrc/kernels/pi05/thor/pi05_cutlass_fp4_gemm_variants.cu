@@ -6,8 +6,8 @@
 //  that we benchmark from Python to pick the best.
 // ============================================================================
 
-#include "cutlass_fp4_gemm.cuh"
-#include "kernels/pi05/thor/pdl.cuh"
+#include "pi05_cutlass_fp4_gemm.cuh"
+#include "kernels/pi05/thor/pi05_pdl.cuh"
 
 #include "cutlass/cutlass.h"
 #include "cutlass/tensor_ref.h"
@@ -271,7 +271,7 @@ int cutlass_fp4_gemm_variant_mcast(int idx, void const* A, void const* SFA, void
     void* D, int M, int N, int K, float alpha, float beta, cudaStream_t stream);
 
 // Dispatch by index (exposed via pybind).
-int cutlass_fp4_gemm_variant(int idx,
+int pi05_cutlass_fp4_gemm_variant(int idx,
     void const* A, void const* SFA, void const* B, void const* SFB,
     void* D, int M, int N, int K, float alpha, float beta,
     cudaStream_t stream) {
@@ -300,7 +300,7 @@ int cutlass_fp4_gemm_variant(int idx,
   }
 }
 
-const char* cutlass_fp4_gemm_variant_name(int idx) {
+const char* pi05_cutlass_fp4_gemm_variant_name(int idx) {
   switch (idx) {
     case 0: return "tile128x128x128 cluster2x1x1 (old baseline)";
     case 1: return "tile128x256x128 cluster2x1x1";
@@ -360,7 +360,7 @@ const char* cutlass_fp4_gemm_variant_name(int idx) {
   }
 }
 
-int cutlass_fp4_gemm_num_variants() { return 54; }
+int pi05_cutlass_fp4_gemm_num_variants() { return 54; }
 
 }  // namespace fp4
 }  // namespace flash_rt

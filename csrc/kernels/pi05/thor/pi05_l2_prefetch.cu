@@ -1,5 +1,5 @@
-// See l2_prefetch.cuh.
-#include "kernels/pi05/thor/l2_prefetch.cuh"
+// See pi05_l2_prefetch.cuh.
+#include "kernels/pi05/thor/pi05_l2_prefetch.cuh"
 #include <cstdint>
 
 namespace flash_rt {
@@ -209,7 +209,7 @@ cudaEvent_t g_touch_join = nullptr;
 
 }  // namespace
 
-int l2_touch_init() {
+int pi05_l2_touch_init() {
   if (g_touch_side != nullptr) return 0;
   if (cudaStreamCreateWithFlags(&g_touch_side, cudaStreamNonBlocking) != cudaSuccess) return -1;
   if (cudaEventCreateWithFlags(&g_touch_fork, cudaEventDisableTiming) != cudaSuccess) return -2;
@@ -217,7 +217,7 @@ int l2_touch_init() {
   return 0;
 }
 
-int l2_touch_regions_ex(const L2PrefetchRegions& regions, cudaStream_t stream, int nctas, int hint, void* sink, int depth, unsigned pace_ns, int nthreads) {
+int pi05_l2_touch_regions_ex(const L2PrefetchRegions& regions, cudaStream_t stream, int nctas, int hint, void* sink, int depth, unsigned pace_ns, int nthreads) {
   if (regions.count <= 0 || regions.count > kL2TouchMaxRegions || nctas < 1 || nctas > 64 || sink == nullptr) return -1;
   if (nthreads < 32 || nthreads > 256 || (nthreads & 31)) return -1;
   for (int i = 0; i < regions.count; ++i)
@@ -266,22 +266,22 @@ int l2_touch_regions_ex(const L2PrefetchRegions& regions, cudaStream_t stream, i
   return (e == cudaSuccess) ? 0 : -static_cast<int>(e);
 }
 
-int l2_touch_fork(const L2PrefetchRegions& regions, cudaStream_t main_stream, int nctas, int hint, void* sink, int depth, unsigned pace_ns, int nthreads) {
-  const int rc = l2_touch_init();
+int pi05_l2_touch_fork(const L2PrefetchRegions& regions, cudaStream_t main_stream, int nctas, int hint, void* sink, int depth, unsigned pace_ns, int nthreads) {
+  const int rc = pi05_l2_touch_init();
   if (rc != 0) return rc;
   if (cudaEventRecord(g_touch_fork, main_stream) != cudaSuccess) return -4;
   if (cudaStreamWaitEvent(g_touch_side, g_touch_fork, 0) != cudaSuccess) return -5;
-  return l2_touch_regions_ex(regions, g_touch_side, nctas, hint, sink, depth, pace_ns, nthreads);
+  return pi05_l2_touch_regions_ex(regions, g_touch_side, nctas, hint, sink, depth, pace_ns, nthreads);
 }
 
-int l2_touch_join(cudaStream_t main_stream) {
+int pi05_l2_touch_join(cudaStream_t main_stream) {
   if (g_touch_side == nullptr) return 0;
   if (cudaEventRecord(g_touch_join, g_touch_side) != cudaSuccess) return -6;
   if (cudaStreamWaitEvent(main_stream, g_touch_join, 0) != cudaSuccess) return -7;
   return 0;
 }
 
-int l2_prefetch_regions(const L2PrefetchRegions& regions, cudaStream_t stream, int mode, void* sink) {
+int pi05_l2_prefetch_regions(const L2PrefetchRegions& regions, cudaStream_t stream, int mode, void* sink) {
   if (regions.count <= 0 || regions.count > 8) return -1;
   if (mode == 1) {
     const dim3 grid(64, regions.count);   // 64 x 128 threads per region, grid-stride

@@ -6,18 +6,15 @@
 #include <vector>
 #include "kernels/pi05/thor/pi05_rowops.cuh"
 #include "kernels/pi05/thor/pi05_rowops_swizzled.cuh"
-#include "kernels/pi05/thor/l2_prefetch.cuh"
-#include "kernels/pi05/thor/pdl.cuh"
+#include "kernels/pi05/thor/pi05_l2_prefetch.cuh"
+#include "kernels/pi05/thor/pi05_pdl.cuh"
 #include "kernels/pi05/thor/pi05_action_edges.cuh"
-#include "kernels/pi05/thor/attn_lt.cuh"
-#include "kernels/pi05/thor/cutlass_fp4_gemm.cuh"
-#include "kernels/pi05/thor/cutlass_fp4_gemm_geglu_il_sm100.cuh"
-#include "kernels/pi05/thor/cutlass_fp4_gemm_siglip_ffn_variants_sm100.cuh"
-#include "kernels/pi05/thor/patch_embed.cuh"
-#include "kernels/quantize.cuh"
-#include "kernels/rope_vec.cuh"
+#include "kernels/pi05/thor/pi05_cutlass_fp4_gemm.cuh"
+#include "kernels/pi05/thor/pi05_cutlass_fp4_gemm_geglu_il_sm100.cuh"
+#include "kernels/pi05/thor/pi05_cutlass_fp4_gemm_siglip_ffn_variants_sm100.cuh"
+#include "kernels/pi05/thor/pi05_patch_embed.cuh"
+#include "kernels/pi05/thor/pi05_fp8_primitives.cuh"
 #include "fused_fp4/norm_silu_fp4_sfa.cuh"
-extern "C" int cutlass_fp8_sq(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 static void* to_ptr(uintptr_t pointer) { return reinterpret_cast<void*>(pointer); }
 template <typename T>
 static T* typed_ptr(uintptr_t pointer) { return reinterpret_cast<T*>(pointer); }
@@ -58,21 +55,10 @@ static void require_fp4_ptrs(
 
 
 PYBIND11_MODULE(flash_rt_pi05_thor, m) {
-m.def("attention_qkv_fp16_lt",
-        [](uintptr_t Q, uintptr_t K, uintptr_t V, uintptr_t logits, uintptr_t out, int S, int S_kv, int NH, int HD,
-           float attn_scale, uintptr_t stream) -> int {
-          return flash_rt::fp4::attention_qkv_fp16_lt(reinterpret_cast<const void*>(Q), reinterpret_cast<const void*>(K),
-                                                      reinterpret_cast<const void*>(V), reinterpret_cast<void*>(logits),
-                                                      reinterpret_cast<void*>(out), S, S_kv, NH, HD, attn_scale,
-                                                      reinterpret_cast<cudaStream_t>(stream));
-        }, py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("logits"), py::arg("out"), py::arg("S"), py::arg("S_kv"),
-        py::arg("NH"), py::arg("HD"), py::arg("attn_scale"), py::arg("stream") = 0,
-        "attention_qkv_fp16 through cublasLt with per-shape autotuned heuristics (QK^T, softmax, PV).");
-
-m.def("cutlass_fp4_gemm_bias_gelu_fp4out_v",
+m.def("pi05_siglip_gemm_bias_gelu_fp4out",
         [](int idx, uintptr_t A, uintptr_t SFA, uintptr_t B, uintptr_t SFB, uintptr_t bias,
            uintptr_t D, uintptr_t SFD, int M, int N, int K, uintptr_t stream) -> int {
-          return flash_rt::fp4::cutlass_fp4_gemm_bias_gelu_fp4out_v(idx,
+          return flash_rt::fp4::pi05_siglip_gemm_bias_gelu_fp4out(idx,
               reinterpret_cast<void const*>(A), reinterpret_cast<void const*>(SFA),
               reinterpret_cast<void const*>(B), reinterpret_cast<void const*>(SFB),
               reinterpret_cast<void const*>(bias), reinterpret_cast<void*>(D),
@@ -81,10 +67,10 @@ m.def("cutlass_fp4_gemm_bias_gelu_fp4out_v",
         py::arg("D"), py::arg("SFD"), py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0,
         "SigLIP Up GEMM (bias + GELU + fp4/SFA out) with a selectable MMA tile.");
 
-m.def("cutlass_fp4_gemm_bias_res_fp16_v",
+m.def("pi05_siglip_gemm_bias_res_fp16",
         [](int idx, uintptr_t A, uintptr_t SFA, uintptr_t B, uintptr_t SFB, uintptr_t bias,
            uintptr_t C, uintptr_t D, int M, int N, int K, uintptr_t stream) -> int {
-          return flash_rt::fp4::cutlass_fp4_gemm_bias_res_fp16_v(idx,
+          return flash_rt::fp4::pi05_siglip_gemm_bias_res_fp16(idx,
               reinterpret_cast<void const*>(A), reinterpret_cast<void const*>(SFA),
               reinterpret_cast<void const*>(B), reinterpret_cast<void const*>(SFB),
               reinterpret_cast<void const*>(bias), reinterpret_cast<void const*>(C),
@@ -93,13 +79,13 @@ m.def("cutlass_fp4_gemm_bias_res_fp16_v",
         py::arg("C"), py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0,
         "SigLIP Down GEMM (bias + residual, fp16 out) with a selectable MMA tile.");
 
-m.def("cutlass_fp4_gemm_geglu_il_hw_nod",
+m.def("pi05_cutlass_fp4_gemm_geglu_il_hw_nod",
         [](uintptr_t A_packed, uintptr_t SFA,
            uintptr_t B_packed, uintptr_t SFB,
            uintptr_t D_dummy, uintptr_t compact_packed, uintptr_t compact_sfa,
            int M, int N_il, int K, uintptr_t stream) -> int {
           const auto shape = fp4_kernel_shape({{"M", M}, {"N_il", N_il}, {"K", K}});
-          require_fp4_ptrs("cutlass_fp4_gemm_geglu_il_hw_nod",
+          require_fp4_ptrs("pi05_cutlass_fp4_gemm_geglu_il_hw_nod",
                            {{"A_packed", A_packed}, {"SFA", SFA},
                             {"B_packed", B_packed}, {"SFB", SFB},
                             {"D_dummy", D_dummy},
@@ -107,11 +93,11 @@ m.def("cutlass_fp4_gemm_geglu_il_hw_nod",
                             {"compact_sfa", compact_sfa}}, shape);
           require_fp4(M > 0 && N_il > 0 && K > 0 && (N_il % 32) == 0 &&
                       (K % 16) == 0,
-                      "cutlass_fp4_gemm_geglu_il_hw_nod",
+                      "pi05_cutlass_fp4_gemm_geglu_il_hw_nod",
                       "M must be positive, N_il a positive multiple of 32 "
                       "and K a positive multiple of 16",
                       shape);
-          return flash_rt::fp4::cutlass_fp4_gemm_geglu_il_hw_nod(
+          return flash_rt::fp4::pi05_cutlass_fp4_gemm_geglu_il_hw_nod(
               reinterpret_cast<void const*>(A_packed),
               reinterpret_cast<void const*>(SFA),
               reinterpret_cast<void const*>(B_packed),
@@ -131,16 +117,16 @@ m.def("cutlass_fp4_gemm_geglu_il_hw_nod",
 Half-width fused GeGLU GEMM with the collective's own D store elided:
 compact_packed/compact_sfa are the only outputs and D_dummy is never
 written (still validated; the host-side TMA descriptor needs a real
-pointer).  Same contract as cutlass_fp4_gemm_geglu_il_hw otherwise.
+pointer).  Same contract as pi05_cutlass_fp4_gemm_geglu_il_hw otherwise.
 )pbdoc");
 
-m.def("cutlass_fp4_gemm_geglu_il_hw_nod_swap",
+m.def("pi05_cutlass_fp4_gemm_geglu_il_hw_nod_swap",
         [](uintptr_t A_packed, uintptr_t SFA,
            uintptr_t B_packed, uintptr_t SFB,
            uintptr_t D_dummy, uintptr_t compact_packed, uintptr_t compact_sfa,
            int M, int N_il, int K, uintptr_t stream) -> int {
           const auto shape = fp4_kernel_shape({{"M", M}, {"N_il", N_il}, {"K", K}});
-          require_fp4_ptrs("cutlass_fp4_gemm_geglu_il_hw_nod_swap",
+          require_fp4_ptrs("pi05_cutlass_fp4_gemm_geglu_il_hw_nod_swap",
                            {{"A_packed", A_packed}, {"SFA", SFA},
                             {"B_packed", B_packed}, {"SFB", SFB},
                             {"D_dummy", D_dummy},
@@ -148,11 +134,11 @@ m.def("cutlass_fp4_gemm_geglu_il_hw_nod_swap",
                             {"compact_sfa", compact_sfa}}, shape);
           require_fp4(M > 0 && N_il > 0 && K > 0 && (N_il % 32) == 0 &&
                       (K % 16) == 0,
-                      "cutlass_fp4_gemm_geglu_il_hw_nod_swap",
+                      "pi05_cutlass_fp4_gemm_geglu_il_hw_nod_swap",
                       "M must be positive, N_il a positive multiple of 32 "
                       "and K a positive multiple of 16",
                       shape);
-          return flash_rt::fp4::cutlass_fp4_gemm_geglu_il_hw_nod_swap(
+          return flash_rt::fp4::pi05_cutlass_fp4_gemm_geglu_il_hw_nod_swap(
               reinterpret_cast<void const*>(A_packed),
               reinterpret_cast<void const*>(SFA),
               reinterpret_cast<void const*>(B_packed),
@@ -170,17 +156,17 @@ m.def("cutlass_fp4_gemm_geglu_il_hw_nod_swap",
         py::arg("stream") = 0,
         R"pbdoc(
 Skinny-M no-D-store fused GeGLU GEMM on the decoder tile (128x64x256);
-same contract as cutlass_fp4_gemm_geglu_il_hw_nod.
+same contract as pi05_cutlass_fp4_gemm_geglu_il_hw_nod.
 )pbdoc");
 
-m.def("cutlass_fp4_gemm_num_variants", &flash_rt::fp4::cutlass_fp4_gemm_num_variants,
+m.def("pi05_cutlass_fp4_gemm_num_variants", &flash_rt::fp4::pi05_cutlass_fp4_gemm_num_variants,
         "Count of available GEMM variants.");
 
-m.def("cutlass_fp4_gemm_variant",
+m.def("pi05_cutlass_fp4_gemm_variant",
         [](int idx, uintptr_t A, uintptr_t SFA, uintptr_t B, uintptr_t SFB,
            uintptr_t D, int M, int N, int K, float alpha, float beta,
            uintptr_t stream) -> int {
-          return flash_rt::fp4::cutlass_fp4_gemm_variant(
+          return flash_rt::fp4::pi05_cutlass_fp4_gemm_variant(
               idx, reinterpret_cast<void const*>(A), reinterpret_cast<void const*>(SFA),
               reinterpret_cast<void const*>(B), reinterpret_cast<void const*>(SFB),
               reinterpret_cast<void*>(D), M, N, K, alpha, beta,
@@ -193,7 +179,7 @@ m.def("cutlass_fp4_gemm_variant",
         py::arg("stream") = 0,
         "Call one of the NVFP4 GEMM variants by index. Used for tile/schedule tuning.");
 
-m.def("l2_touch_fork",
+m.def("pi05_l2_touch_fork",
         [](const std::vector<std::pair<uintptr_t, unsigned long long>>& regions,
            uintptr_t main_stream, int nctas, int hint, uintptr_t sink, int depth, unsigned pace_ns, int nthreads) -> int {
           if (regions.size() > static_cast<size_t>(flash_rt::fp4::kL2TouchMaxRegions)) return -1;
@@ -203,18 +189,18 @@ m.def("l2_touch_fork",
             r.ptr[i] = reinterpret_cast<const void*>(regions[i].first);
             r.bytes[i] = regions[i].second;
           }
-          return flash_rt::fp4::l2_touch_fork(r, reinterpret_cast<cudaStream_t>(main_stream), nctas, hint,
+          return flash_rt::fp4::pi05_l2_touch_fork(r, reinterpret_cast<cudaStream_t>(main_stream), nctas, hint,
                                               reinterpret_cast<void*>(sink), depth, pace_ns, nthreads);
         }, py::arg("regions"), py::arg("main_stream") = 0, py::arg("nctas") = 4, py::arg("hint") = 1, py::arg("sink") = 0,
         py::arg("depth") = 16, py::arg("pace_ns") = 0, py::arg("nthreads") = 256,
         "Real-load L2 touch of up to 8 (ptr, bytes) regions on a side stream forked from main_stream "
         "(nctas CTAs; hint 1 = L2::evict_last).");
 
-m.def("l2_touch_init", []() -> int { return flash_rt::fp4::l2_touch_init(); },
+m.def("pi05_l2_touch_init", []() -> int { return flash_rt::fp4::pi05_l2_touch_init(); },
         "Create the L2 touch side stream and its fork/join events (call before any graph capture).");
 
-m.def("l2_touch_join",
-        [](uintptr_t main_stream) -> int { return flash_rt::fp4::l2_touch_join(reinterpret_cast<cudaStream_t>(main_stream)); },
+m.def("pi05_l2_touch_join",
+        [](uintptr_t main_stream) -> int { return flash_rt::fp4::pi05_l2_touch_join(reinterpret_cast<cudaStream_t>(main_stream)); },
         py::arg("main_stream") = 0, "Make main_stream wait for the L2 touch side stream.");
 
 m.def("pi05_patch_embed_bias_pos", [](uintptr_t output, uintptr_t bias, uintptr_t pos_emb,
@@ -314,18 +300,18 @@ m.def("pi05_row_rms_mul_fp4_sfa_swizzled",
         py::arg("D"), py::arg("stream") = 0,
         "Warp-per-row RMSNorm [* fp32 inv_s] -> NVFP4 + SFA (v5, slim).");
 
-m.def("set_pdl", [](bool on) { flash_rt::fp4::pdl_flag() = on; }, py::arg("on"),
+m.def("pi05_set_pdl", [](bool on) { flash_rt::fp4::pdl_flag() = on; }, py::arg("on"),
           "Programmatic dependent launch for this module's rope/softmax/FP8 quantize kernels and the SM100 FP8 GEMM.");
 m.def("pi05_quantize_fp8_static_fp16", [](uintptr_t input, uintptr_t output,
                                           uintptr_t d_scale, int n, uintptr_t stream) {
-        quantize_fp8_static_fp16(reinterpret_cast<const __half*>(input),
+        pi05_quantize_fp8_static_fp16(reinterpret_cast<const __half*>(input),
                                   typed_ptr<__nv_fp8_e4m3>(output),
                                   reinterpret_cast<const float*>(d_scale), n, to_stream(stream));
     }, py::arg("input"), py::arg("output"), py::arg("d_scale"), py::arg("n"), py::arg("stream") = 0);
 
 m.def("pi05_cutlass_fp8_sq", [](uintptr_t A, uintptr_t B, uintptr_t D,
                                  int M, int N, int K, float alpha, float beta, uintptr_t stream) {
-        return cutlass_fp8_sq(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, alpha, beta, to_stream(stream));
+        return pi05_cutlass_fp8_sq(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, alpha, beta, to_stream(stream));
     }, py::arg("A"), py::arg("B"), py::arg("D"),
        py::arg("M"), py::arg("N"), py::arg("K"),
        py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
@@ -334,7 +320,7 @@ m.def("pi05_qkv_split_rope_kvcache_fp16_vec", [](uintptr_t qkv, uintptr_t rope,
                                               uintptr_t Q, uintptr_t Kc, uintptr_t Vc,
                                               int S, int Q_dim, int K_dim, int HD, int qkv_stride,
                                               long kc_offset, int kc_stride, uintptr_t stream) {
-        return qkv_split_rope_kvcache_fp16_vec(
+        return pi05_qkv_split_rope_kvcache_fp16_vec(
                                      reinterpret_cast<const __half*>(qkv),
                                      reinterpret_cast<const __half*>(rope),
                                      reinterpret_cast<__half*>(Q),

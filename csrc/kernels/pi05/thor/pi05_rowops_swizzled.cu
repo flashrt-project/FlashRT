@@ -21,7 +21,7 @@
 //  only within a few fp32 ulps above a midpoint (rounded toward zero here).
 // ============================================================================
 #include "kernels/pi05/thor/pi05_rowops_swizzled.cuh"
-#include "kernels/pi05/thor/pdl.cuh"
+#include "kernels/pi05/thor/pi05_pdl.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>

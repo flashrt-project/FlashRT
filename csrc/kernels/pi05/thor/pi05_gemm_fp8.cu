@@ -1,5 +1,6 @@
+#include "kernels/pi05/thor/pi05_fp8_primitives.cuh"
 #include "gemm/gemm_types_sm100.h"
-#include "kernels/pi05/thor/pdl.cuh"
+#include "kernels/pi05/thor/pi05_pdl.cuh"
 #include "cutlass/util/device_memory.h"
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -56,7 +57,7 @@ static int cutlass_run_impl(void* A, void* B, void* D,
 }
 
 extern "C" {
-int cutlass_fp8_sq(void* A, void* B, void* D, int M, int N, int K,
+int pi05_cutlass_fp8_sq(void* A, void* B, void* D, int M, int N, int K,
                     float alpha, float beta, cudaStream_t stream) {
     return cutlass_run_impl<sm100_sq::Gemm>(A, B, D, M, N, K, alpha, beta, stream);
 }

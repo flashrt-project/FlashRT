@@ -1,14 +1,14 @@
 // NVFP4 GEMM variants whose mainloop streams the weight tiles before the
-// programmatic-dependency wait (see sm100_blockscaled_mma_earlyb.hpp).
+// programmatic-dependency wait (see pi05_sm100_blockscaled_mma_earlyb.hpp).
 // The kernel-level GDC waits are compiled out here on purpose: the fork's
 // load() performs the wait after the weight prefetch.
-#include "kernels/pi05/thor/cutlass_fp4_gemm_variants_earlyb.cuh"
+#include "kernels/pi05/thor/pi05_cutlass_fp4_gemm_variants_earlyb.cuh"
 
 namespace flash_rt {
 namespace fp4 {
 namespace { int g_weight_evict_first = 0; }
-void set_weight_evict_first(int on) { g_weight_evict_first = on ? 1 : 0; }
-int get_weight_evict_first() { return g_weight_evict_first; }
+void pi05_set_weight_evict_first(int on) { g_weight_evict_first = on ? 1 : 0; }
+int pi05_get_weight_evict_first() { return g_weight_evict_first; }
 namespace variants_earlyb {
 using namespace cute;
 

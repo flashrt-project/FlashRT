@@ -1,6 +1,6 @@
 // See pi05_rowops_v2.cuh.
 #include "kernels/pi05/thor/pi05_rowops.cuh"
-#include "kernels/pi05/thor/pdl.cuh"
+#include "kernels/pi05/thor/pi05_pdl.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -664,29 +664,29 @@ int launch(__half* residual, const __half* x, const __half* gamma,
 
 }  // namespace
 
-int rowops_residual_rms_mul_fp4_sfa_v2(__half* residual, const __half* x, const __half* inv_s,
+int pi05_rowops_residual_rms_mul_fp4_sfa_v2(__half* residual, const __half* x, const __half* inv_s,
                                        void* packed, void* sfa, int S, int D, cudaStream_t stream) {
   return launch<kResRmsMulFp4>(residual, x, nullptr, nullptr, inv_s, nullptr, packed, sfa, nullptr, S, D, 0.f, stream);
 }
-int rowops_rms_mul_fp4_sfa_v2(const __half* x, const __half* inv_s, void* packed, void* sfa,
+int pi05_rowops_rms_mul_fp4_sfa_v2(const __half* x, const __half* inv_s, void* packed, void* sfa,
                               int S, int D, cudaStream_t stream) {
   return launch<kRmsMulFp4>(nullptr, x, nullptr, nullptr, inv_s, nullptr, packed, sfa, nullptr, S, D, 0.f, stream);
 }
-int rowops_quantize_fp4_sfa_v2(const __half* src, void* packed, void* sfa, int N, int D, cudaStream_t stream) {
+int pi05_rowops_quantize_fp4_sfa_v2(const __half* src, void* packed, void* sfa, int N, int D, cudaStream_t stream) {
   return launch<kQuantFp4>(nullptr, src, nullptr, nullptr, nullptr, nullptr, packed, sfa, nullptr, N, D, 0.f, stream);
 }
-int rowops_residual_rms_fp8_v2(__half* residual, const __half* x, void* out_fp8, int S, int D,
+int pi05_rowops_residual_rms_fp8_v2(__half* residual, const __half* x, void* out_fp8, int S, int D,
                                const float* descale, cudaStream_t stream) {
   return launch<kResRmsFp8>(residual, x, nullptr, nullptr, nullptr, descale, nullptr, nullptr, out_fp8, S, D, 0.f, stream);
 }
-int rowops_rms_fp8_v2(const __half* x, void* out_fp8, int S, int D, const float* descale, cudaStream_t stream) {
+int pi05_rowops_rms_fp8_v2(const __half* x, void* out_fp8, int S, int D, const float* descale, cudaStream_t stream) {
   return launch<kRmsFp8>(nullptr, x, nullptr, nullptr, nullptr, descale, nullptr, nullptr, out_fp8, S, D, 0.f, stream);
 }
-int rowops_layer_norm_mul_fp4_sfa_v2(const __half* x, const __half* gamma, const __half* beta, const __half* inv_s,
+int pi05_rowops_layer_norm_mul_fp4_sfa_v2(const __half* x, const __half* gamma, const __half* beta, const __half* inv_s,
                                      void* packed, void* sfa, int S, int D, float eps, cudaStream_t stream) {
   return launch<kLnMulFp4>(nullptr, x, gamma, beta, inv_s, nullptr, packed, sfa, nullptr, S, D, eps, stream);
 }
-int rowops_layer_norm_fp8_v2(const __half* x, const __half* gamma, const __half* beta, void* out_fp8,
+int pi05_rowops_layer_norm_fp8_v2(const __half* x, const __half* gamma, const __half* beta, void* out_fp8,
                              int S, int D, float eps, cudaStream_t stream) {
   return launch<kLnFp8>(nullptr, x, gamma, beta, nullptr, nullptr, nullptr, nullptr, out_fp8, S, D, eps, stream);
 }
@@ -694,27 +694,27 @@ int pi05_row_layer_norm_fp16(const __half* x, const __half* gamma, const __half*
                               int S, int D, float eps, cudaStream_t stream) {
   return launch<kLnFp16>(nullptr, x, gamma, beta, nullptr, nullptr, nullptr, nullptr, out, S, D, eps, stream);
 }
-int rowops_layer_norm_mul_fp4_sfa_v3(const __half* x, const __half* gamma, const __half* beta, const __half* inv_s,
+int pi05_rowops_layer_norm_mul_fp4_sfa_v3(const __half* x, const __half* gamma, const __half* beta, const __half* inv_s,
                                      void* packed, void* sfa, int S, int D, float eps, cudaStream_t stream) {
   return launch_ln_v3<kLnMulFp4>(x, gamma, beta, inv_s, packed, sfa, nullptr, S, D, eps, stream);
 }
-int rowops_layer_norm_fp8_v3(const __half* x, const __half* gamma, const __half* beta, void* out_fp8,
+int pi05_rowops_layer_norm_fp8_v3(const __half* x, const __half* gamma, const __half* beta, void* out_fp8,
                              int S, int D, float eps, cudaStream_t stream) {
   return launch_ln_v3<kLnFp8>(x, gamma, beta, nullptr, nullptr, nullptr, out_fp8, S, D, eps, stream);
 }
-int rowops_layer_norm_fp16_v3(const __half* x, const __half* gamma, const __half* beta, void* out,
+int pi05_rowops_layer_norm_fp16_v3(const __half* x, const __half* gamma, const __half* beta, void* out,
                               int S, int D, float eps, cudaStream_t stream) {
   return launch_ln_v3<kLnFp16>(x, gamma, beta, nullptr, nullptr, nullptr, out, S, D, eps, stream);
 }
-int rowops_layer_norm_mul_fp4_sfa_v4(const __half* x, const __half* gamma, const __half* beta, const __half* inv_s,
+int pi05_rowops_layer_norm_mul_fp4_sfa_v4(const __half* x, const __half* gamma, const __half* beta, const __half* inv_s,
                                      void* packed, void* sfa, int S, int D, float eps, cudaStream_t stream) {
   return launch_ln_v4<kLnMulFp4>(x, gamma, beta, inv_s, packed, sfa, nullptr, S, D, eps, stream);
 }
-int rowops_layer_norm_fp8_v4(const __half* x, const __half* gamma, const __half* beta, void* out_fp8,
+int pi05_rowops_layer_norm_fp8_v4(const __half* x, const __half* gamma, const __half* beta, void* out_fp8,
                              int S, int D, float eps, cudaStream_t stream) {
   return launch_ln_v4<kLnFp8>(x, gamma, beta, nullptr, nullptr, nullptr, out_fp8, S, D, eps, stream);
 }
-int rowops_layer_norm_fp16_v4(const __half* x, const __half* gamma, const __half* beta, void* out,
+int pi05_rowops_layer_norm_fp16_v4(const __half* x, const __half* gamma, const __half* beta, void* out,
                               int S, int D, float eps, cudaStream_t stream) {
   return launch_ln_v4<kLnFp16>(x, gamma, beta, nullptr, nullptr, nullptr, out, S, D, eps, stream);
 }

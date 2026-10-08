@@ -4,14 +4,14 @@
 #include <cuda_runtime.h>
 namespace flash_rt {
 namespace fp4 {
-int cutlass_fp4_gemm_bias_gelu_fp4out_v(int idx,
+int pi05_siglip_gemm_bias_gelu_fp4out(int idx,
     void const* A_packed, void const* SFA, void const* B_packed, void const* SFB,
     void const* bias_fp16, void* D_packed, void* D_SFD, int M, int N, int K,
     cudaStream_t stream);
-int cutlass_fp4_gemm_bias_res_fp16_v(int idx,
+int pi05_siglip_gemm_bias_res_fp16(int idx,
     void const* A_packed, void const* SFA, void const* B_packed, void const* SFB,
     void const* bias_fp16, void const* C_fp16, void* D_fp16, int M, int N, int K,
     cudaStream_t stream);
-const char* siglip_ffn_variant_name(int which, int idx);   // which: 0 up, 1 down
+const char* pi05_siglip_ffn_variant_name(int which, int idx);   // which: 0 up, 1 down
 }  // namespace fp4
 }  // namespace flash_rt

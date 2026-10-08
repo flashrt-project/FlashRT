@@ -3,7 +3,7 @@
 // kernel params, so a CUDA graph captures whatever was set before capture).
 namespace flash_rt {
 namespace fp4 {
-void set_weight_evict_first(int on);
-int get_weight_evict_first();
+void pi05_set_weight_evict_first(int on);
+int pi05_get_weight_evict_first();
 }  // namespace fp4
 }  // namespace flash_rt

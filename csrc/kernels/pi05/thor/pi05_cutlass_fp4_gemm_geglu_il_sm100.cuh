@@ -20,7 +20,7 @@ namespace fp4 {
 // D: [M, N_il] NVFP4 packed row-major + SFD (tile-interleaved), each column
 //    pair holding the duplicated gelu(gate)*up value.
 // Returns 0 on success; CUTLASS status | stage flag otherwise.
-int cutlass_fp4_gemm_geglu_il(
+int pi05_cutlass_fp4_gemm_geglu_il(
     void const* A_packed, void const* SFA,
     void const* B_packed, void const* SFB,
     void*       D_packed,
@@ -34,7 +34,7 @@ int cutlass_fp4_gemm_geglu_il(
 // (M, N_il/2)) directly; D_dummy [M, N_il] receives zeros and can be one
 // small buffer shared across layers. The downstream GEMM consumes the
 // compact outputs with its original K = N_il/2 weight.
-int cutlass_fp4_gemm_geglu_il_hw(
+int pi05_cutlass_fp4_gemm_geglu_il_hw(
     void const* A_packed, void const* SFA,
     void const* B_packed, void const* SFB,
     void*       D_dummy,
@@ -44,8 +44,8 @@ int cutlass_fp4_gemm_geglu_il_hw(
     cudaStream_t stream);
 
 // Skinny-M variant on the decoder GEMM tile (128x64x256): same contract
-// as cutlass_fp4_gemm_geglu_il_hw with CTA parallelism suited to tiny M.
-int cutlass_fp4_gemm_geglu_il_hw_v10(
+// as pi05_cutlass_fp4_gemm_geglu_il_hw with CTA parallelism suited to tiny M.
+int pi05_cutlass_fp4_gemm_geglu_il_hw_v10(
     void const* A_packed, void const* SFA,
     void const* B_packed, void const* SFB,
     void*       D_dummy,
@@ -57,7 +57,7 @@ int cutlass_fp4_gemm_geglu_il_hw_v10(
 // No-D-store variants: identical contract, but the collective's own D store
 // is elided (D_dummy is never written; the pointer is still required for the
 // host-side TMA descriptor and may be the same small shared buffer).
-int cutlass_fp4_gemm_geglu_il_hw_nod(
+int pi05_cutlass_fp4_gemm_geglu_il_hw_nod(
     void const* A_packed, void const* SFA,
     void const* B_packed, void const* SFB,
     void*       D_dummy,
@@ -67,7 +67,7 @@ int cutlass_fp4_gemm_geglu_il_hw_nod(
     cudaStream_t stream);
 
 // 2-SM tile (256x256x256, cluster 2x1x1) form of ..._hw_nod: same bytes, one third fewer L2->SM bytes per FLOP.
-int cutlass_fp4_gemm_geglu_il_hw_nod_2sm(
+int pi05_cutlass_fp4_gemm_geglu_il_hw_nod_2sm(
     void const* A_packed, void const* SFA,
     void const* B_packed, void const* SFB,
     void*       D_dummy,
@@ -76,7 +76,7 @@ int cutlass_fp4_gemm_geglu_il_hw_nod_2sm(
     int M, int N_il, int K,
     cudaStream_t stream);
 
-int cutlass_fp4_gemm_geglu_il_hw_nod_v10(
+int pi05_cutlass_fp4_gemm_geglu_il_hw_nod_v10(
     void const* A_packed, void const* SFA,
     void const* B_packed, void const* SFB,
     void*       D_dummy,
@@ -89,7 +89,7 @@ int cutlass_fp4_gemm_geglu_il_hw_nod_v10(
 // stream); same argument order and the same compact outputs, byte for byte.
 // v10 tile + compact store with the weight k-tiles streamed before the PDL wait
 // (EarlyB fork; early_stages in {3, 5, 7}); same bytes as ..._hw_nod_v10.
-int cutlass_fp4_gemm_geglu_il_hw_nod_v10_earlyb(
+int pi05_cutlass_fp4_gemm_geglu_il_hw_nod_v10_earlyb(
     void const* A_packed, void const* SFA,
     void const* B_packed, void const* SFB,
     void*       D_dummy,
@@ -98,7 +98,7 @@ int cutlass_fp4_gemm_geglu_il_hw_nod_v10_earlyb(
     int M, int N_il, int K,
     cudaStream_t stream, int early_stages);
 
-int cutlass_fp4_gemm_geglu_il_hw_nod_swap(
+int pi05_cutlass_fp4_gemm_geglu_il_hw_nod_swap(
     void const* A_packed, void const* SFA,
     void const* B_packed, void const* SFB,
     void*       D_dummy,
@@ -107,7 +107,7 @@ int cutlass_fp4_gemm_geglu_il_hw_nod_swap(
     int M, int N_il, int K,
     cudaStream_t stream);
 // Same kernel with an explicit mainloop stage count (3 / 4 / 6) so several CTAs can share an SM.
-int cutlass_fp4_gemm_geglu_il_hw_nod_swap_stages(
+int pi05_cutlass_fp4_gemm_geglu_il_hw_nod_swap_stages(
     void const* A_packed, void const* SFA,
     void const* B_packed, void const* SFB,
     void*       D_dummy,
@@ -116,7 +116,7 @@ int cutlass_fp4_gemm_geglu_il_hw_nod_swap_stages(
     int M, int N_il, int K, int stages,
     cudaStream_t stream);
 // Same kernel on the static persistent tile scheduler (one cluster per SM pair loops over the tiles).
-int cutlass_fp4_gemm_geglu_il_hw_nod_swap_persist(
+int pi05_cutlass_fp4_gemm_geglu_il_hw_nod_swap_persist(
     void const* A_packed, void const* SFA,
     void const* B_packed, void const* SFB,
     void*       D_dummy,

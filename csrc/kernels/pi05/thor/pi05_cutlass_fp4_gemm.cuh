@@ -32,7 +32,7 @@ namespace fp4 {
 //
 // Returns 0 on success, nonzero CUTLASS/CUDA error code otherwise.
 
-int cutlass_fp4_sq_fp16(
+int pi05_cutlass_fp4_sq_fp16(
     void const* A_fp4_packed,   // device ptr, uint8 [M, K/2]
     void const* SFA,            // device ptr, fp8  [M, K/16]
     void const* B_fp4_packed,   // device ptr, uint8 [N, K/2]
@@ -43,15 +43,15 @@ int cutlass_fp4_sq_fp16(
     cudaStream_t stream);
 
 // Runtime capability check — cheap, no-arg.
-bool has_nvfp4_sm110();
+bool pi05_has_nvfp4_sm110();
 
 // Parametric variant dispatcher for tile/schedule tuning experiments.
-int cutlass_fp4_gemm_variant(int idx,
+int pi05_cutlass_fp4_gemm_variant(int idx,
     void const* A, void const* SFA, void const* B, void const* SFB,
     void* D, int M, int N, int K, float alpha, float beta,
     cudaStream_t stream);
-const char* cutlass_fp4_gemm_variant_name(int idx);
-int cutlass_fp4_gemm_num_variants();
+const char* pi05_cutlass_fp4_gemm_variant_name(int idx);
+int pi05_cutlass_fp4_gemm_num_variants();
 
 } // namespace fp4
 } // namespace flash_rt

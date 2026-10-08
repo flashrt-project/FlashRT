@@ -155,7 +155,7 @@ def encoder_forward_with_fp4_subset(
         regs = _enc_touch_regions(ln)
         if not regs:
             return
-        rc = fvk_fp4.l2_touch_fork(
+        rc = fvk_fp4.pi05_l2_touch_fork(
             regs,
             stream,
             enc_touch,
@@ -190,7 +190,7 @@ def encoder_forward_with_fp4_subset(
                 D,
                 stream,
             )
-            rc = fvk_fp4.cutlass_fp4_gemm_variant(
+            rc = fvk_fp4.pi05_cutlass_fp4_gemm_variant(
                 attn_variant,
                 sc_at.packed.data_ptr(),
                 sc_at.sfa.data_ptr(),
@@ -362,7 +362,7 @@ def encoder_forward_with_fp4_subset(
                 res_in_epilogue = (
                     rowops_v2 and is_fp4 and bool(fp4_scratch.get("res_epilogue", True))
                 )
-                rc = fvk_fp4.cutlass_fp4_gemm_variant(
+                rc = fvk_fp4.pi05_cutlass_fp4_gemm_variant(
                     attn_variant,
                     sc_at.packed.data_ptr(),
                     sc_at.sfa.data_ptr(),
@@ -481,7 +481,7 @@ def encoder_forward_with_fp4_subset(
                         hw_gemm = getattr(
                             fvk_fp4,
                             {
-                                "epilogue_hw_nod": "cutlass_fp4_gemm_geglu_il_hw_nod",
+                                "epilogue_hw_nod": "pi05_cutlass_fp4_gemm_geglu_il_hw_nod",
                                 "epilogue_hw_nod_2sm": "cutlass_fp4_gemm_geglu_il_hw_nod_2sm",
                                 "epilogue_hw": "cutlass_fp4_gemm_geglu_il_hw",
                             }[p1_combiner],
@@ -622,7 +622,7 @@ def encoder_forward_with_fp4_subset(
                         raise ValueError(f"unknown P1 combiner: {p1_combiner!r}")
                 else:
                     _check(
-                        fvk_fp4.cutlass_fp4_gemm_variant(
+                        fvk_fp4.pi05_cutlass_fp4_gemm_variant(
                             variant_gu,
                             sc_gu.packed.data_ptr(),
                             sc_gu.sfa.data_ptr(),
@@ -636,7 +636,7 @@ def encoder_forward_with_fp4_subset(
                             0.0,
                             stream,
                         ),
-                        f"cutlass_fp4_gemm_variant[gate_up,v{variant_gu}]",
+                        f"pi05_cutlass_fp4_gemm_variant[gate_up,v{variant_gu}]",
                         l,
                         M=Se,
                         N=H * 2,
@@ -670,7 +670,7 @@ def encoder_forward_with_fp4_subset(
                 ):
                     w_dx = fp4_weights[l]["down_x"]
                     _check(
-                        fvk_fp4.cutlass_fp4_gemm_variant(
+                        fvk_fp4.pi05_cutlass_fp4_gemm_variant(
                             variant_dn_x,
                             p1_il_p4,
                             p1_il_sfa,
@@ -684,7 +684,7 @@ def encoder_forward_with_fp4_subset(
                             0.0,
                             stream,
                         ),
-                        f"cutlass_fp4_gemm_variant[down_x,v{variant_dn_x}]",
+                        f"pi05_cutlass_fp4_gemm_variant[down_x,v{variant_dn_x}]",
                         l,
                         M=Se,
                         N=D,
@@ -693,7 +693,7 @@ def encoder_forward_with_fp4_subset(
                 else:
                     down_res = rowops_v2 and res_in_epilogue
                     _check(
-                        fvk_fp4.cutlass_fp4_gemm_variant(
+                        fvk_fp4.pi05_cutlass_fp4_gemm_variant(
                             variant_dn,
                             sc_dn.packed.data_ptr(),
                             sc_dn.sfa.data_ptr(),
@@ -707,7 +707,7 @@ def encoder_forward_with_fp4_subset(
                             1.0 if down_res else 0.0,
                             stream,
                         ),
-                        f"cutlass_fp4_gemm_variant[down,v{variant_dn}]",
+                        f"pi05_cutlass_fp4_gemm_variant[down,v{variant_dn}]",
                         l,
                         M=Se,
                         N=D,
@@ -788,7 +788,7 @@ def encoder_forward_with_fp4_subset(
                     x, fg, x_fp8, Se, D, as_next, stream
                 )
     if enc_touch:
-        fvk_fp4.l2_touch_join(stream)
+        fvk_fp4.pi05_l2_touch_join(stream)
 
 
 def siglip_forward_with_fp4_ffn(
@@ -843,7 +843,7 @@ def siglip_forward_with_fp4_ffn(
         regs = sig_touch_regions.get(ln) if sig_touch else None
         if not regs:
             return
-        rc = fvk_fp4.l2_touch_fork(
+        rc = fvk_fp4.pi05_l2_touch_fork(
             regs,
             stream,
             sig_touch,
@@ -1133,7 +1133,7 @@ def siglip_forward_with_fp4_ffn(
         if rc != 0:
             raise RuntimeError(f"SigLIP FP4 FFN LayerNorm layer {l} failed rc={rc}")
         if up_variant >= 100:
-            rc = fvk_fp4.cutlass_fp4_gemm_variant(
+            rc = fvk_fp4.pi05_cutlass_fp4_gemm_variant(
                 up_variant - 100,
                 sc_ln.packed.data_ptr(),
                 sc_ln.sfa.data_ptr(),
@@ -1158,7 +1158,7 @@ def siglip_forward_with_fp4_ffn(
                     stream,
                 )
         elif up_variant:
-            rc = fvk_fp4.cutlass_fp4_gemm_bias_gelu_fp4out_v(
+            rc = fvk_fp4.pi05_siglip_gemm_bias_gelu_fp4out(
                 up_variant,
                 sc_ln.packed.data_ptr(),
                 sc_ln.sfa.data_ptr(),
@@ -1189,7 +1189,7 @@ def siglip_forward_with_fp4_ffn(
         if rc != 0:
             raise RuntimeError(f"SigLIP FP4 FFN Up GEMM layer {l} failed rc={rc}")
         if down_variant:
-            rc = fvk_fp4.cutlass_fp4_gemm_bias_res_fp16_v(
+            rc = fvk_fp4.pi05_siglip_gemm_bias_res_fp16(
                 down_variant,
                 sc_hid.packed.data_ptr(),
                 sc_hid.sfa.data_ptr(),
@@ -1220,7 +1220,7 @@ def siglip_forward_with_fp4_ffn(
         if rc != 0:
             raise RuntimeError(f"SigLIP FP4 FFN Down GEMM layer {l} failed rc={rc}")
     if sig_touch:
-        rc = fvk_fp4.l2_touch_join(stream)
+        rc = fvk_fp4.pi05_l2_touch_join(stream)
         if rc != 0:
             raise RuntimeError(f"SigLIP l2_touch join failed rc={rc}")
 

@@ -1,7 +1,8 @@
+#include "kernels/pi05/thor/pi05_fp8_primitives.cuh"
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cstdint>
-#include "kernels/pi05/thor/pdl.cuh"
+#include "kernels/pi05/thor/pi05_pdl.cuh"
 
 __global__ void quantize_fp8_kernel(const __half* in, __nv_fp8_e4m3* out, const float* descale_ptr, int n) {
     flashrt_pdl_wait_and_trigger();
@@ -20,7 +21,7 @@ __global__ void quantize_fp8_kernel(const __half* in, __nv_fp8_e4m3* out, const 
     *reinterpret_cast<uint32_t*>(out + i) = *reinterpret_cast<uint32_t*>(fp8_pack);
 }
 
-void quantize_fp8_static_fp16(const __half* input, __nv_fp8_e4m3* output,
+void pi05_quantize_fp8_static_fp16(const __half* input, __nv_fp8_e4m3* output,
                                const float* d_scale, int n, cudaStream_t stream) {
     // 4 elem/thread, matching production quant_fp8_static_k
     int threads = 256;

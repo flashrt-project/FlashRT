@@ -4,11 +4,11 @@
 // (every streamed row useful), the activations as the 64-wide B tile, the
 // 2-SM UMMA tile of the swapped plain GEMMs and the weight k-tiles streamed
 // before the programmatic-dependency wait. The epilogue is the column
-// compact store (sm100_gelu_mul_blockscale_visitor.hpp): it writes the same
-// hid_fp4 / hid_sfa bytes as cutlass_fp4_gemm_geglu_il_hw_nod_v10.
+// compact store (pi05_sm100_gelu_mul_blockscale_visitor.hpp): it writes the same
+// hid_fp4 / hid_sfa bytes as pi05_cutlass_fp4_gemm_geglu_il_hw_nod_v10.
 #undef CUTLASS_ENABLE_GDC_FOR_SM100
-#include "kernels/pi05/thor/cutlass_fp4_gemm_geglu_il_sm100.cuh"
-#include "kernels/pi05/thor/pdl.cuh"
+#include "kernels/pi05/thor/pi05_cutlass_fp4_gemm_geglu_il_sm100.cuh"
+#include "kernels/pi05/thor/pi05_pdl.cuh"
 #include <utility>
 #include "cutlass/cutlass.h"
 #include "cutlass/tensor_ref.h"
@@ -23,9 +23,9 @@
 #include "cutlass/util/packed_stride.hpp"
 #include "cutlass/detail/sm100_blockscaled_layout.hpp"
 #include "cute/tensor.hpp"
-#include "kernels/pi05/thor/sm100_gelu_mul_blockscale_visitor.hpp"
-#include "kernels/pi05/thor/sm100_epilogue_nod.hpp"
-#include "kernels/pi05/thor/sm100_blockscaled_mma_earlyb.hpp"
+#include "kernels/pi05/thor/pi05_sm100_gelu_mul_blockscale_visitor.hpp"
+#include "kernels/pi05/thor/pi05_sm100_epilogue_nod.hpp"
+#include "kernels/pi05/thor/pi05_sm100_blockscaled_mma_earlyb.hpp"
 
 namespace flash_rt {
 namespace fp4 {
@@ -87,7 +87,7 @@ using BaseMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
         static_cast<int>(sizeof(typename CollectiveEpilogueBase::SharedStorage))>,
     cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
 
-// Same adaptation as cutlass_fp4_gemm_variants_earlyb.cu: weights (A) early, 3 k-tiles, trigger from the load warp.
+// Same adaptation as pi05_cutlass_fp4_gemm_variants_earlyb.cu: weights (A) early, 3 k-tiles, trigger from the load warp.
 template <class T> struct ToEarlyA;
 template <int S, int SP, int AP, class CS, class... Rest>
 struct ToEarlyA<cutlass::gemm::collective::CollectiveMma<
@@ -137,7 +137,7 @@ using Cfg = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
 
 }  // namespace geglu_il_swap
 
-int cutlass_fp4_gemm_geglu_il_hw_nod_swap(
+int pi05_cutlass_fp4_gemm_geglu_il_hw_nod_swap(
     void const* A_packed, void const* SFA,      // activations (M x K) + their SFA
     void const* B_packed, void const* SFB,      // interleaved gate/up weights (N_il x K) + their SFB
     void*       D_dummy,
@@ -217,7 +217,7 @@ static int run_swap_gemm(void const* A_packed, void const* SFA, void const* B_pa
   return (st == cutlass::Status::kSuccess) ? 0 : (static_cast<int>(st) | 0x30000);
 }
 
-int cutlass_fp4_gemm_geglu_il_hw_nod_swap_stages(
+int pi05_cutlass_fp4_gemm_geglu_il_hw_nod_swap_stages(
     void const* A_packed, void const* SFA,
     void const* B_packed, void const* SFB,
     void*       D_dummy,
@@ -234,7 +234,7 @@ int cutlass_fp4_gemm_geglu_il_hw_nod_swap_stages(
   }
 }
 
-int cutlass_fp4_gemm_geglu_il_hw_nod_swap_persist(
+int pi05_cutlass_fp4_gemm_geglu_il_hw_nod_swap_persist(
     void const* A_packed, void const* SFA,
     void const* B_packed, void const* SFB,
     void*       D_dummy,

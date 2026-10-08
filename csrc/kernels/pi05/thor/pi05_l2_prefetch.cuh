@@ -13,7 +13,7 @@
 namespace flash_rt {
 namespace fp4 {
 
-constexpr int kL2TouchMaxRegions = 12;   // l2_prefetch_regions itself still takes at most 8
+constexpr int kL2TouchMaxRegions = 12;   // pi05_l2_prefetch_regions itself still takes at most 8
 
 struct L2PrefetchRegions {
   const void* ptr[kL2TouchMaxRegions];
@@ -22,19 +22,19 @@ struct L2PrefetchRegions {
 };
 
 // mode 0: cp.async.bulk.prefetch.L2 (fire-and-forget); mode 1: real ld.global.cg touch (sink: 4-byte scratch).
-int l2_prefetch_regions(const L2PrefetchRegions& regions, cudaStream_t stream, int mode = 0, void* sink = nullptr);
+int pi05_l2_prefetch_regions(const L2PrefetchRegions& regions, cudaStream_t stream, int mode = 0, void* sink = nullptr);
 
 // Real-load L2 touch with a chosen CTA count (256 threads each, 16 loads in flight per thread) over the
-// regions in order; hint 1 tags the lines L2::evict_last. `l2_touch_fork` runs it on a private
+// regions in order; hint 1 tags the lines L2::evict_last. `pi05_l2_touch_fork` runs it on a private
 // non-blocking side stream forked from `main_stream` with an event (capture-safe, so inside a CUDA
-// graph it becomes a parallel branch), `l2_touch_join` makes `main_stream` wait for the side stream.
-// `l2_touch_init` creates the side stream and the events; call it once before any graph capture.
-int l2_touch_init();
-int l2_touch_regions_ex(const L2PrefetchRegions& regions, cudaStream_t stream, int nctas, int hint, void* sink,
+// graph it becomes a parallel branch), `pi05_l2_touch_join` makes `main_stream` wait for the side stream.
+// `pi05_l2_touch_init` creates the side stream and the events; call it once before any graph capture.
+int pi05_l2_touch_init();
+int pi05_l2_touch_regions_ex(const L2PrefetchRegions& regions, cudaStream_t stream, int nctas, int hint, void* sink,
                         int depth = 16, unsigned pace_ns = 0, int nthreads = 256);
-int l2_touch_fork(const L2PrefetchRegions& regions, cudaStream_t main_stream, int nctas, int hint, void* sink,
+int pi05_l2_touch_fork(const L2PrefetchRegions& regions, cudaStream_t main_stream, int nctas, int hint, void* sink,
                   int depth = 16, unsigned pace_ns = 0, int nthreads = 256);
-int l2_touch_join(cudaStream_t main_stream);
+int pi05_l2_touch_join(cudaStream_t main_stream);
 
 }  // namespace fp4
 }  // namespace flash_rt

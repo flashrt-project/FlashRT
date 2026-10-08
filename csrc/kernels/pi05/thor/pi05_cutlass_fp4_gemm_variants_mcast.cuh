@@ -7,7 +7,7 @@
 #include <mutex>
 #include <tuple>
 #include <type_traits>
-#include "kernels/pi05/thor/pdl.cuh"
+#include "kernels/pi05/thor/pi05_pdl.cuh"
 #include "cutlass/cutlass.h"
 #include "cutlass/tensor_ref.h"
 #include "cutlass/epilogue/thread/linear_combination.h"

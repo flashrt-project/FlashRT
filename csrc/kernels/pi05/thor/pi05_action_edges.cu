@@ -1,6 +1,6 @@
 // See pi05_action_edges.cuh.
 #include "kernels/pi05/thor/pi05_action_edges.cuh"
-#include "kernels/pi05/thor/pdl.cuh"
+#include "kernels/pi05/thor/pi05_pdl.cuh"
 #include <cuda_fp16.h>
 #include <cstdint>
 

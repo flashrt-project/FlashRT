@@ -14,7 +14,7 @@
 //  scale, e2m1-pack elements, and write scale byte to CUTLASS SFA layout.
 // ============================================================================
 #include "fused_fp4/norm_silu_fp4_sfa.cuh"
-#include "kernels/pi05/thor/pdl.cuh"
+#include "kernels/pi05/thor/pi05_pdl.cuh"
 
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>

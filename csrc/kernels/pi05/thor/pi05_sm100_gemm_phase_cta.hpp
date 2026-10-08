@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 #include "cutlass/arch/barrier.h"
-#include "kernels/pi05/thor/sm100_seq_phases.hpp"
+#include "kernels/pi05/thor/pi05_sm100_seq_phases.hpp"
 
 namespace flash_rt {
 namespace fp4 {

@@ -1,8 +1,8 @@
 // See header. Same fusions as cutlass_fp4_gemm_siglip_ffn_sm100.cu, templated
 // on the MMA tile so the M=768, N=4304/1152, K=1152/4304 SigLIP shapes can be
 // tuned for a 20-SM part (the 128x256 Up tile gives 102 CTAs = 5.1 waves).
-#include "kernels/pi05/thor/cutlass_fp4_gemm_siglip_ffn_variants_sm100.cuh"
-#include "kernels/pi05/thor/pdl.cuh"
+#include "kernels/pi05/thor/pi05_cutlass_fp4_gemm_siglip_ffn_variants_sm100.cuh"
+#include "kernels/pi05/thor/pi05_pdl.cuh"
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/thread/activation.h"
 #include "cutlass/epilogue/dispatch_policy.hpp"
@@ -179,7 +179,7 @@ using D10 = Down<Shape<_256, _128, _256>, Shape<_2, _1, _1>, cutlass::gemm::Stre
 using D11 = Down<Shape<_256, _128, _256>, Shape<_2, _1, _1>, cutlass::gemm::StreamKScheduler, 3>;  // 2-SM + split-K 3
 }  // namespace siglip_ffn_v
 
-int cutlass_fp4_gemm_bias_gelu_fp4out_v(int idx, void const* A, void const* SFA, void const* B, void const* SFB,
+int pi05_siglip_gemm_bias_gelu_fp4out(int idx, void const* A, void const* SFA, void const* B, void const* SFB,
     void const* bias, void* D, void* SFD, int M, int N, int K, cudaStream_t s) {
   using namespace siglip_ffn_v;
   switch (idx) {
@@ -193,7 +193,7 @@ int cutlass_fp4_gemm_bias_gelu_fp4out_v(int idx, void const* A, void const* SFA,
     default: return -99;
   }
 }
-int cutlass_fp4_gemm_bias_res_fp16_v(int idx, void const* A, void const* SFA, void const* B, void const* SFB,
+int pi05_siglip_gemm_bias_res_fp16(int idx, void const* A, void const* SFA, void const* B, void const* SFB,
     void const* bias, void const* C, void* D, int M, int N, int K, cudaStream_t s) {
   using namespace siglip_ffn_v;
   switch (idx) {
@@ -212,7 +212,7 @@ int cutlass_fp4_gemm_bias_res_fp16_v(int idx, void const* A, void const* SFA, vo
     default: return -99;
   }
 }
-const char* siglip_ffn_variant_name(int which, int idx) {
+const char* pi05_siglip_ffn_variant_name(int which, int idx) {
   static const char* up[] = {"up 128x256x256 (base)", "up 128x128x256", "up 128x128x128", "up 128x64x256"};
   static const char* dn[] = {"down 128x128x256 (base)", "down 128x64x256", "down 128x128x128", "down 128x256x256"};
   if (idx < 0 || idx > 3) return "<invalid>";

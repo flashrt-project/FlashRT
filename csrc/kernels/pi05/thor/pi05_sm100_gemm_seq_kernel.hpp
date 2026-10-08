@@ -7,8 +7,8 @@
 //  barrier, fused elementwise phases) can be developed inside this copy.
 // ============================================================================
 #pragma once
-#include "kernels/pi05/thor/sm100_gemm_phase_cta.hpp"
-#include "kernels/pi05/thor/sm100_blockscaled_mma_earlyb.hpp"
+#include "kernels/pi05/thor/pi05_sm100_gemm_phase_cta.hpp"
+#include "kernels/pi05/thor/pi05_sm100_blockscaled_mma_earlyb.hpp"
 
 
 #include "cutlass/cutlass.h"

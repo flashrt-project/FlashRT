@@ -5,7 +5,7 @@
 // 2. bias_pos: output[i,j] += bias[j] + pos_emb[i % S_per_view, j]
 // ================================================================
 
-#include "patch_embed.cuh"
+#include "pi05_patch_embed.cuh"
 
 // ── GPU im2col for SigLIP patch embedding ──
 // Input:  (nv, 224, 224, 3) FP16, row-major NHWC
@@ -46,7 +46,7 @@ __global__ void patch_im2col_kernel(
     output[idx] = input[src];
 }
 
-void patch_im2col(const half* input, half* output, int nv, cudaStream_t stream)
+void pi05_patch_im2col(const half* input, half* output, int nv, cudaStream_t stream)
 {
     int total = nv * 256 * 588;
     int threads = 256;
@@ -80,7 +80,7 @@ __global__ void patch_im2col_uint8_kernel(
     output[idx] = lut[input[src]];
 }
 
-void patch_im2col_uint8(const uint8_t* input, const half* lut, half* output,
+void pi05_patch_im2col_uint8(const uint8_t* input, const half* lut, half* output,
                         int nv, cudaStream_t stream)
 {
     int total = nv * 256 * 588;
@@ -183,7 +183,7 @@ void pi05_patch_embed_bias_pos(half* output, const half* bias, const half* pos_e
         (reinterpret_cast<uintptr_t>(bias) & 15) == 0 &&
         (reinterpret_cast<uintptr_t>(pos_emb) & 15) == 0;
     if (!aligned) {
-        patch_embed_bias_pos(output, bias, pos_emb, S, D, S_per_view, stream);
+        pi05_patch_embed_bias_pos_legacy(output, bias, pos_emb, S, D, S_per_view, stream);
         return;
     }
     long long total = static_cast<long long>(S) * (D / 8);
@@ -193,7 +193,7 @@ void pi05_patch_embed_bias_pos(half* output, const half* bias, const half* pos_e
         output, bias, pos_emb, S, D, S_per_view);
 }
 
-void patch_embed_bias_pos(half* output, const half* bias, const half* pos_emb,
+void pi05_patch_embed_bias_pos_legacy(half* output, const half* bias, const half* pos_emb,
                           int S, int D, int S_per_view, cudaStream_t stream)
 {
     int total = S * D;

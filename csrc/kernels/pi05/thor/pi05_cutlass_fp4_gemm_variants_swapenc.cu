@@ -7,7 +7,7 @@
 // 8 x 5 = 40 cluster tiles, exactly 4 waves. D is stored column-major, which
 // is byte-for-byte the row-major (M, N) output the callers already expect.
 // The clusters along M' multicast the activation tile to the CTA pairs.
-#include "kernels/pi05/thor/cutlass_fp4_gemm_variants_mcast.cuh"
+#include "kernels/pi05/thor/pi05_cutlass_fp4_gemm_variants_mcast.cuh"
 
 namespace flash_rt {
 namespace fp4 {
@@ -19,7 +19,7 @@ using E1 = Variant<Shape<_256,_192,_128>, Shape<_4,_1,_1>, true>;   // + activat
 using E2 = Variant<Shape<_256,_192,_256>, Shape<_4,_1,_1>, true>;   // same, k-tile 256
 }  // namespace variants_swapenc
 
-// Public entry keeps the (activation A, weight B, M, N, K) convention of cutlass_fp4_gemm_variant.
+// Public entry keeps the (activation A, weight B, M, N, K) convention of pi05_cutlass_fp4_gemm_variant.
 int cutlass_fp4_gemm_variant_swapenc(int idx, void const* A, void const* SFA, void const* B, void const* SFB,
     void* D, int M, int N, int K, float alpha, float beta, cudaStream_t stream) {
   using namespace variants_swapenc;

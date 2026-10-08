@@ -24,38 +24,38 @@ namespace flash_rt {
 namespace fused_fp4 {
 
 // residual += x (fp16 write-back); out = rms_norm(residual) [* inv_s] -> NVFP4 + SFA
-int rowops_residual_rms_mul_fp4_sfa_v2(
+int pi05_rowops_residual_rms_mul_fp4_sfa_v2(
     __half* residual, const __half* x, const __half* inv_s,
     void* packed, void* sfa, int S, int D, cudaStream_t stream);
 
 // out = rms_norm(x) [* inv_s] -> NVFP4 + SFA (no residual; pair with a beta=1 GEMM)
-int rowops_rms_mul_fp4_sfa_v2(
+int pi05_rowops_rms_mul_fp4_sfa_v2(
     const __half* x, const __half* inv_s, void* packed, void* sfa, int S, int D,
     cudaStream_t stream);
 
 // out = NVFP4(src) + SFA
-int rowops_quantize_fp4_sfa_v2(
+int pi05_rowops_quantize_fp4_sfa_v2(
     const __half* src, void* packed, void* sfa, int N, int D,
     cudaStream_t stream);
 
 // residual += x; out_fp8 = e4m3(rms_norm(residual) / descale)
-int rowops_residual_rms_fp8_v2(
+int pi05_rowops_residual_rms_fp8_v2(
     __half* residual, const __half* x, void* out_fp8, int S, int D,
     const float* descale, cudaStream_t stream);
 
 // out_fp8 = e4m3(rms_norm(x) / descale)
-int rowops_rms_fp8_v2(
+int pi05_rowops_rms_fp8_v2(
     const __half* x, void* out_fp8, int S, int D, const float* descale,
     cudaStream_t stream);
 
 // out = NVFP4(LayerNorm(x; gamma, beta) [* inv_s]) + SFA
-int rowops_layer_norm_mul_fp4_sfa_v2(
+int pi05_rowops_layer_norm_mul_fp4_sfa_v2(
     const __half* x, const __half* gamma, const __half* beta,
     const __half* inv_s, void* packed, void* sfa, int S, int D, float eps,
     cudaStream_t stream);
 
 // out_fp8 = e4m3(LayerNorm(x; gamma, beta))
-int rowops_layer_norm_fp8_v2(
+int pi05_rowops_layer_norm_fp8_v2(
     const __half* x, const __half* gamma, const __half* beta,
     void* out_fp8, int S, int D, float eps, cudaStream_t stream);
 
@@ -65,26 +65,26 @@ int pi05_row_layer_norm_fp16(
     void* out, int S, int D, float eps, cudaStream_t stream);
 
 // v3 LayerNorm rows (plain shuffle reductions, single wave); same outputs up to reduction order.
-int rowops_layer_norm_mul_fp4_sfa_v3(
+int pi05_rowops_layer_norm_mul_fp4_sfa_v3(
     const __half* x, const __half* gamma, const __half* beta,
     const __half* inv_s, void* packed, void* sfa, int S, int D, float eps,
     cudaStream_t stream);
-int rowops_layer_norm_fp8_v3(
+int pi05_rowops_layer_norm_fp8_v3(
     const __half* x, const __half* gamma, const __half* beta,
     void* out_fp8, int S, int D, float eps, cudaStream_t stream);
-int rowops_layer_norm_fp16_v3(
+int pi05_rowops_layer_norm_fp16_v3(
     const __half* x, const __half* gamma, const __half* beta,
     void* out, int S, int D, float eps, cudaStream_t stream);
 
 // v4 LayerNorm rows: two rows per warp (loads of both rows in flight together), single wave.
-int rowops_layer_norm_mul_fp4_sfa_v4(
+int pi05_rowops_layer_norm_mul_fp4_sfa_v4(
     const __half* x, const __half* gamma, const __half* beta,
     const __half* inv_s, void* packed, void* sfa, int S, int D, float eps,
     cudaStream_t stream);
-int rowops_layer_norm_fp8_v4(
+int pi05_rowops_layer_norm_fp8_v4(
     const __half* x, const __half* gamma, const __half* beta,
     void* out_fp8, int S, int D, float eps, cudaStream_t stream);
-int rowops_layer_norm_fp16_v4(
+int pi05_rowops_layer_norm_fp16_v4(
     const __half* x, const __half* gamma, const __half* beta,
     void* out, int S, int D, float eps, cudaStream_t stream);
 

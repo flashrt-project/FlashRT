@@ -1,3 +1,4 @@
+#include "kernels/pi05/thor/pi05_fp8_primitives.cuh"
 // ============================================================================
 //  FlashRT — vectorized QKV split + RoPE + KV-cache append (FP16).
 //
@@ -13,7 +14,7 @@
 #include <cuda_fp16.h>
 
 #include "kernels/rope_vec.cuh"
-#include "kernels/pi05/thor/pdl.cuh"
+#include "kernels/pi05/thor/pi05_pdl.cuh"
 
 namespace {
 
@@ -66,7 +67,7 @@ __global__ void qkv_split_rope_kvcache_fp16_vec_kernel(
 
 }  // namespace
 
-int qkv_split_rope_kvcache_fp16_vec(
+int pi05_qkv_split_rope_kvcache_fp16_vec(
     const __half* qkv, const __half* rope,
     __half* Q, __half* Kc, __half* Vc,
     int S, int Q_dim, int K_dim, int HD, int qkv_stride,

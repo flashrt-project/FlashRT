@@ -195,7 +195,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                 raise RuntimeError(
                     "use_fp4_encoder_ffn=True but flash_rt_fp4 not available. "
                     "Ensure flash_rt_fp4.so is built with NVFP4 support.")
-            fp4_variant_count = int(fvk_fp4.cutlass_fp4_gemm_num_variants())
+            fp4_variant_count = int(fvk_fp4.pi05_cutlass_fp4_gemm_num_variants())
             if not 0 <= self.encoder_down_variant < fp4_variant_count:
                 raise ValueError(
                     "encoder_down_variant must be in "
@@ -228,7 +228,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
             variants = (self.decoder_qkv_variant, self.decoder_o_variant,
                         self.decoder_gate_up_variant,
                         self.decoder_down_variant)
-            variant_count = int(fvk_fp4.cutlass_fp4_gemm_num_variants())
+            variant_count = int(fvk_fp4.pi05_cutlass_fp4_gemm_num_variants())
             for name, v in (("decoder_qkv_variant", variants[0]),
                             ("decoder_o_variant", variants[1]),
                             ("decoder_gate_up_variant", variants[2]),
@@ -1671,7 +1671,6 @@ class Pi05TorchFrontendThorFP4Optimized(Pi05TorchFrontendThor):
         self.decoder_attn_splitkv = False
         self.decoder_attn_mqa = False
         self.decoder_attn_decode = 0
-        self.decoder_attn_lt = True
         self.decoder_kv_fp8 = False or 0 in (2, 4)
         self.decoder_attn_mqa_variant = 1
         self.decoder_attn_tc05 = False
@@ -1701,9 +1700,9 @@ class Pi05TorchFrontendThorFP4Optimized(Pi05TorchFrontendThor):
         self.encoder_l2_touch_hint = 4
         self.encoder_l2_touch_threads = 128
         self._decoder_l2_touch_sink = None
-        rc = fp4_optimized.l2_touch_init()
+        rc = fp4_optimized.pi05_l2_touch_init()
         if rc != 0:
-            raise RuntimeError(f"l2_touch_init failed rc={rc}")
+            raise RuntimeError(f"pi05_l2_touch_init failed rc={rc}")
         self._decoder_seq_counter = None
         self._decoder_seq_gu_dummy = None
         self._decoder_seq_partials = None
@@ -1727,7 +1726,7 @@ class Pi05TorchFrontendThorFP4Optimized(Pi05TorchFrontendThor):
                 raise RuntimeError(
                     "use_fp4_encoder_ffn=True but flash_rt_fp4 not available. Ensure flash_rt_fp4.so is built with NVFP4 support."
                 )
-            fp4_variant_count = int(fp4_optimized.cutlass_fp4_gemm_num_variants())
+            fp4_variant_count = int(fp4_optimized.pi05_cutlass_fp4_gemm_num_variants())
             if not 0 <= self.encoder_down_variant < fp4_variant_count:
                 raise ValueError(
                     f"encoder_down_variant must be in [0, {fp4_variant_count}), got {self.encoder_down_variant}"
@@ -1760,7 +1759,7 @@ class Pi05TorchFrontendThorFP4Optimized(Pi05TorchFrontendThor):
                 self.decoder_gate_up_variant,
                 self.decoder_down_variant,
             )
-            variant_count = int(fp4_optimized.cutlass_fp4_gemm_num_variants())
+            variant_count = int(fp4_optimized.pi05_cutlass_fp4_gemm_num_variants())
             for name, v in (
                 ("decoder_qkv_variant", variants[0]),
                 ("decoder_o_variant", variants[1]),
@@ -2687,7 +2686,6 @@ class Pi05TorchFrontendThorFP4Optimized(Pi05TorchFrontendThor):
         attn = getattr(self, "_attn", None)
         if attn is not None:
             attn.siglip_attn_custom = int(getattr(self, "siglip_attn_custom", 0))
-            attn.decoder_attn_lt = int(getattr(self, "decoder_attn_lt", False))
             attn.fa4_pack_heads = int(getattr(self, "encoder_fa4_pack", 0))
         if not getattr(self, "use_fp4_siglip_ffn", False) or not hasattr(
             self, "_sig_fp4_weights"
@@ -2706,7 +2704,7 @@ class Pi05TorchFrontendThorFP4Optimized(Pi05TorchFrontendThor):
                 self._decoder_l2_touch_sink = torch.zeros(
                     4, dtype=torch.int32, device="cuda"
                 )
-                fp4_optimized.l2_touch_init()
+                fp4_optimized.pi05_l2_touch_init()
             mask = 5
             regs = {}
             for l in range(self.sig_L):
@@ -3337,7 +3335,7 @@ class Pi05TorchFrontendThorFP4Optimized(Pi05TorchFrontendThor):
             self._decoder_l2_touch_sink = torch.zeros(
                 4, dtype=torch.int32, device="cuda"
             )
-            fp4_optimized.l2_touch_init()
+            fp4_optimized.pi05_l2_touch_init()
         enc_bufs["l2_touch_sink"] = self._decoder_l2_touch_sink.data_ptr()
         if False and getattr(self, "_enc_qkv_w_t", None) is None:
             self._enc_qkv_w_t = [w.t().contiguous() for w in self._enc_qkv_w]

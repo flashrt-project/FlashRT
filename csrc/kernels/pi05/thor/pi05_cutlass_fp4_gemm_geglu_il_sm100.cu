@@ -5,10 +5,10 @@
 //  Structure mirrors cutlass_fp4_gemm_fp4out.cu (the production P1 fp4out
 //  GEMM); the only functional difference is the fusion operation, which
 //  applies gelu(gate)*up on adjacent accumulator column pairs before the
-//  block-scale-factor generation (sm100_gelu_mul_blockscale_visitor.hpp).
+//  block-scale-factor generation (pi05_sm100_gelu_mul_blockscale_visitor.hpp).
 // ============================================================================
-#include "kernels/pi05/thor/cutlass_fp4_gemm_geglu_il_sm100.cuh"
-#include "kernels/pi05/thor/pdl.cuh"
+#include "kernels/pi05/thor/pi05_cutlass_fp4_gemm_geglu_il_sm100.cuh"
+#include "kernels/pi05/thor/pi05_pdl.cuh"
 
 #include "cutlass/cutlass.h"
 #include "cutlass/tensor_ref.h"
@@ -24,8 +24,8 @@
 #include "cutlass/detail/sm100_blockscaled_layout.hpp"
 #include "cute/tensor.hpp"
 
-#include "kernels/pi05/thor/sm100_gelu_mul_blockscale_visitor.hpp"
-#include "kernels/pi05/thor/sm100_epilogue_nod.hpp"
+#include "kernels/pi05/thor/pi05_sm100_gelu_mul_blockscale_visitor.hpp"
+#include "kernels/pi05/thor/pi05_sm100_epilogue_nod.hpp"
 
 namespace flash_rt {
 namespace fp4 {
@@ -179,7 +179,7 @@ using GemmHwV10 = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelHwV10>;
 // The builder's collective still stages the unread D tile through smem and
 // TMA-stores it (row-aliased, but the smem->L2 traffic and store instructions
 // remain).  Rebind the built epilogue onto CollectiveEpilogueNoD
-// (sm100_epilogue_nod.hpp), which elides that store entirely; the compact
+// (pi05_sm100_epilogue_nod.hpp), which elides that store entirely; the compact
 // store node is the only writer.  SharedStorage is unchanged, so the
 // mainloop carveout from the builder output stays valid.
 template <class BuiltEpilogue>
@@ -252,7 +252,7 @@ using GemmHwNoDV10 = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelHwNoD
 
 }  // namespace geglu_il
 
-int cutlass_fp4_gemm_geglu_il(
+int pi05_cutlass_fp4_gemm_geglu_il(
     void const* A_packed, void const* SFA,
     void const* B_packed, void const* SFB,
     void*       D_packed,
@@ -375,7 +375,7 @@ static int run_geglu_il_hw(
 
 }  // namespace geglu_il
 
-int cutlass_fp4_gemm_geglu_il_hw(
+int pi05_cutlass_fp4_gemm_geglu_il_hw(
     void const* A_packed, void const* SFA,
     void const* B_packed, void const* SFB,
     void*       D_dummy,
@@ -388,7 +388,7 @@ int cutlass_fp4_gemm_geglu_il_hw(
       M, N_il, K, stream);
 }
 
-int cutlass_fp4_gemm_geglu_il_hw_v10(
+int pi05_cutlass_fp4_gemm_geglu_il_hw_v10(
     void const* A_packed, void const* SFA,
     void const* B_packed, void const* SFB,
     void*       D_dummy,
@@ -401,7 +401,7 @@ int cutlass_fp4_gemm_geglu_il_hw_v10(
       M, N_il, K, stream);
 }
 
-int cutlass_fp4_gemm_geglu_il_hw_nod(
+int pi05_cutlass_fp4_gemm_geglu_il_hw_nod(
     void const* A_packed, void const* SFA,
     void const* B_packed, void const* SFB,
     void*       D_dummy,
@@ -414,7 +414,7 @@ int cutlass_fp4_gemm_geglu_il_hw_nod(
       M, N_il, K, stream);
 }
 
-int cutlass_fp4_gemm_geglu_il_hw_nod_v10(
+int pi05_cutlass_fp4_gemm_geglu_il_hw_nod_v10(
     void const* A_packed, void const* SFA,
     void const* B_packed, void const* SFB,
     void*       D_dummy,
@@ -427,7 +427,7 @@ int cutlass_fp4_gemm_geglu_il_hw_nod_v10(
       M, N_il, K, stream);
 }
 
-int cutlass_fp4_gemm_geglu_il_hw_nod_2sm(
+int pi05_cutlass_fp4_gemm_geglu_il_hw_nod_2sm(
     void const* A_packed, void const* SFA,
     void const* B_packed, void const* SFB,
     void*       D_dummy,
