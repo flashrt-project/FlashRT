@@ -195,7 +195,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                 raise RuntimeError(
                     "use_fp4_encoder_ffn=True but flash_rt_fp4 not available. "
                     "Ensure flash_rt_fp4.so is built with NVFP4 support.")
-            fp4_variant_count = int(fvk_fp4.pi05_cutlass_fp4_gemm_num_variants())
+            fp4_variant_count = int(fvk_fp4.cutlass_fp4_gemm_num_variants())
             if not 0 <= self.encoder_down_variant < fp4_variant_count:
                 raise ValueError(
                     "encoder_down_variant must be in "
@@ -228,7 +228,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
             variants = (self.decoder_qkv_variant, self.decoder_o_variant,
                         self.decoder_gate_up_variant,
                         self.decoder_down_variant)
-            variant_count = int(fvk_fp4.pi05_cutlass_fp4_gemm_num_variants())
+            variant_count = int(fvk_fp4.cutlass_fp4_gemm_num_variants())
             for name, v in (("decoder_qkv_variant", variants[0]),
                             ("decoder_o_variant", variants[1]),
                             ("decoder_gate_up_variant", variants[2]),
