@@ -22,6 +22,18 @@ The flagship integration today is **VLA control** — production frontends for P
 
 ## Demos
 
+### VLA
+
+**π0.5 on a Jetson AGX Thor.** LIBERO-spatial task 1, one flow-matching sample
+held fixed. Two hosts as their authors ship them, then the same model
+accelerated two ways. Per-decision latency **266.0 / 303.6 → 36.1 → 29.2 ms**,
+3.8 Hz to **34.2 Hz** of policy decisions; the task finishes in **6.0 s**
+instead of 23.5 s, and all four arms complete it.
+
+<img src="https://github.com/flashrt-project/FlashRT-assets/raw/main/demo/gif/thor_pi05.gif" alt="thor_pi05" width="100%">
+
+<sub>2× playback. <a href="https://github.com/flashrt-project/FlashRT-assets/blob/main/demo/mp4/thor_pi05.mp4">Real-time recording</a>.</sub>
+
 | Workload | Watch |
 |---|---|
 | Real-robot deployment | [MindOn Mind-1 demo](https://www.youtube.com/watch?v=SsNYtZJZyLM) · [Blog](https://www.mindon.tech/blog/mind-1/index.html) |
