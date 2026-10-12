@@ -8,12 +8,15 @@
 // fast-math ex2/rcp forms, the cp.async width, the exact mma shapes) that the
 // DM05 bit-for-bit gates depend on, and none of it is needed by another model.
 //
-// The fast-math forms matter. The FlashRT quantize kernels are built with
-// --use_fast_math, so x * (1.0f / s) there lowers to an approximate reciprocal
-// and a flush-to-zero multiply, and a / b to div.approx.ftz. The epilogues in
-// this module spell those instructions out so that a value they produce rounds
-// exactly as the standalone FlashRT kernel it replaces would round it —
-// IEEE division differs from them on FP8 rounding ties.
+// The fast-math forms matter. The flash_rt_kernels target builds with
+// --ftz=true --prec-div=false --prec-sqrt=false (CMakeLists.txt), so a
+// reciprocal or division in the quantize kernels it holds lowers to
+// rcp.approx.ftz / div.approx.ftz and their multiplies flush to zero. The
+// epilogues in this module spell those instructions out so that a value they
+// produce rounds exactly as the standalone FlashRT kernel it replaces would
+// round it — IEEE division differs from them on FP8 rounding ties. This module
+// does not set those flags itself: it needs IEEE everywhere else, so it opts
+// in per instruction instead of per translation unit.
 
 #pragma once
 
