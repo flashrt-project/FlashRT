@@ -30,6 +30,7 @@ import logging
 import math
 import os
 import pathlib
+import threading
 from typing import Optional, Union
 
 import ml_dtypes
@@ -52,6 +53,7 @@ from flash_rt.frontends.torch.pi05_rtx import (
 )
 from flash_rt.frontends._fp8_layout import select_fp8_layout
 from flash_rt.core.utils.hardware import supports_fp8
+from flash_rt.hardware.rtx.attn_backend_batched_pi05 import PI05_BATCH_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -451,10 +453,42 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         use_fp8: bool = True,
         hardware: Optional[str] = None,
         fp8_layout: Optional[str] = None,
+        state_prompt_mode: str = "exact",
+        use_cuda_graph: bool = True,
+        denoise_trace: bool = False,
+        prefix_features: bool = False,
+        decoder_kernel: Optional[str] = None,
+        prefix_precision: Optional[str] = None,
+        sde: bool = False,
     ):
         # Don't chain to Pi05TorchFrontendRtx.__init__ — it expects a safetensors
         # file. We replicate the body and swap the loader.
         checkpoint_dir = pathlib.Path(checkpoint_dir)
+        self._sde = bool(sde)
+        self._prefix_precision = (
+            prefix_precision
+            or os.environ.get("FLASHRT_PI05_PREFIX_PRECISION", "fp8")
+        ).lower()
+        if self._prefix_precision not in ("fp8", "nvfp4"):
+            raise ValueError(
+                f"prefix_precision must be fp8 or nvfp4, got {self._prefix_precision!r}")
+        self._lifecycle_lock = threading.RLock()
+        self._reload_failed = False
+        self._decoder_kernel = (
+            decoder_kernel
+            or os.environ.get("FLASHRT_PI05_DECODER_KERNEL", "cublaslt")
+        )
+        self._batch_size = PI05_BATCH_SIZE
+        self._prefix_features = bool(prefix_features)
+        self._last_prompt_len = 0
+        self._denoise_trace = bool(denoise_trace)
+        resolved_state_prompt_mode = os.environ.get(
+            "FLASHRT_PI05_STATE_PROMPT_MODE", state_prompt_mode)
+        if resolved_state_prompt_mode not in ("fixed", "exact"):
+            raise ValueError(
+                "state_prompt_mode must be 'fixed' or 'exact', "
+                f"got {resolved_state_prompt_mode!r}")
+        self._state_prompt_mode = resolved_state_prompt_mode
         self.num_views = int(num_views)
         self.chunk_size = int(chunk_size)
         self.max_prompt_len = int(max_prompt_len)
@@ -478,6 +512,7 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
                 f"vision_num_layers must be in [1, {VIS_L}], "
                 f"got {self._vision_num_layers}")
         self.use_fp8 = bool(use_fp8)
+        self.use_cuda_graph = bool(use_cuda_graph)
         self.hardware = _resolve_effective_hardware(hardware)
         self.fp8_layout = select_fp8_layout(hardware, fp8_layout)
 
@@ -486,6 +521,8 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         self.graph_recorded = False
         self.current_prompt_len = 0
         self.pipeline = None
+        self._prompt_pipeline_cache = {}
+        self._fixed_pipeline = None
 
         # RL CFG state — kept in sync with the torch frontend so the JAX
         # path goes through the same set_prompt / infer hot path. Both
@@ -534,8 +571,19 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         self._int8_weights: dict = {}
         self._int8_store: list = []
         self._int8_weight_scales: dict[str, torch.Tensor] = {}
-        if self.use_fp8 and not self._force_bf16:
+        if self.use_fp8 and not self._force_bf16 and not self._force_int8_decoder:
             self._quantize_all_fp8()
+        self._nvfp4_weights: dict = {}
+        self._nvfp4_store: list = []
+        if self._prefix_precision == "nvfp4":
+            if not (
+                self.use_fp8
+                and not self._force_bf16
+                and not self._force_int8_decoder
+            ):
+                raise ValueError(
+                    "prefix_precision='nvfp4' needs the FP8 frontend (use_fp8=True)")
+            self._quantize_prefix_nvfp4()
 
         # ── Pre-compute decoder styles (shared helper) ──
         from flash_rt.frontends.torch.pi05_rtx import _precompute_decoder_styles
@@ -567,6 +615,15 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         self._noise_out = torch.empty(
             self.chunk_size, ACTION_DIM, dtype=bf16, device="cuda"
         )
+        if self._denoise_trace:
+            self._trace_x_out = torch.empty(
+                self._num_steps,
+                self.chunk_size,
+                ACTION_DIM,
+                dtype=bf16,
+                device="cuda",
+            )
+            self._trace_delta_out = torch.empty_like(self._trace_x_out)
         from flash_rt.core.cuda_buffer import _cudart
         self._cudart = _cudart
 

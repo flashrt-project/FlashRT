@@ -2061,43 +2061,48 @@ def test_vla_frontend_constructors_accept_use_fp8():
 
 def test_pi05_jax_rtx_frontend_mirrors_runtime_knobs():
     repo_root = Path(__file__).resolve().parents[1]
-    tree = ast.parse(
-        (repo_root / "flash_rt/frontends/jax/pi05_rtx.py").read_text())
-    cls = next(
-        node for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "Pi05JaxFrontendRtx")
-    init = next(
-        node for node in cls.body
-        if isinstance(node, ast.FunctionDef) and node.name == "__init__")
-    args = [arg.arg for arg in init.args.args]
-    assigned = set()
-    for node in ast.walk(init):
-        targets = list(getattr(node, "targets", []))
-        if isinstance(node, ast.AnnAssign):
-            targets.append(node.target)
-        for target in targets:
-            if (isinstance(target, ast.Attribute)
-                    and isinstance(target.value, ast.Name)
-                    and target.value.id == "self"):
-                assigned.add(target.attr)
 
-    for arg in (
-        "num_steps",
-        "vision_pool_factor",
-        "vision_num_layers",
-        "cache_frames",
-    ):
-        assert arg in args
-    for attr in (
-        "_num_steps",
-        "_vision_pool_factor",
-        "_vision_num_layers",
-        "_cache_frames",
-        "_frame_count",
-        "_int8_weights",
-        "_int8_weight_scales",
-    ):
-        assert attr in assigned
+    def constructor_contract(rel_path, class_name):
+        tree = ast.parse((repo_root / rel_path).read_text())
+        cls = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == class_name)
+        init = next(
+            node for node in cls.body
+            if isinstance(node, ast.FunctionDef) and node.name == "__init__")
+
+        positional = init.args.posonlyargs + init.args.args
+        defaults = [None] * (len(positional) - len(init.args.defaults))
+        defaults.extend(init.args.defaults)
+        parameters = [
+            (arg.arg, None if default is None else ast.dump(default))
+            for arg, default in zip(positional, defaults)
+            if arg.arg != "self"
+        ]
+        parameters.extend(
+            (arg.arg, None if default is None else ast.dump(default))
+            for arg, default in zip(init.args.kwonlyargs, init.args.kw_defaults)
+        )
+
+        assigned = {
+            node.attr
+            for node in ast.walk(init)
+            if (isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "self"
+                and isinstance(node.ctx, ast.Store))
+        }
+        return parameters, assigned
+
+    torch_parameters, torch_assigned = constructor_contract(
+        "flash_rt/frontends/torch/pi05_rtx.py", "Pi05TorchFrontendRtx")
+    jax_parameters, jax_assigned = constructor_contract(
+        "flash_rt/frontends/jax/pi05_rtx.py", "Pi05JaxFrontendRtx")
+
+    assert jax_parameters == torch_parameters
+    assert torch_assigned <= jax_assigned, (
+        f"Pi05JaxFrontendRtx is missing runtime state: "
+        f"{sorted(torch_assigned - jax_assigned)}")
 
 
 def _make_dit_fp8_fixtures(fp8_layout):
