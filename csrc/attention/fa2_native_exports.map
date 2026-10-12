@@ -7,6 +7,8 @@
     fvk_attention_fa2_fwd_bf16_seqused_splitkv;
     fvk_attention_fa2_fwd_bf16_causal;
     fvk_attention_fa2_fwd_bf16_tile;
+    fvk_attention_fa2_fwd_bf16_fp8out;
+    fvk_attention_fa2_fwd_bf16_causal_fp8out;
   local:
     *;
 };

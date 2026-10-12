@@ -355,7 +355,6 @@ DEFINE_FA2_ENTRY(fvk_attention_fa2_fwd_bf16, cutlass::bfloat16_t, true)
 // FlashRT local patch 4: bf16 full-attention entry that also emits the static-FP8 copy
 // of O. Kept as a separate symbol rather than an extra argument on the existing entry so
 // the published signature of fvk_attention_fa2_fwd_bf16 is untouched.
-#ifdef FA2_HAS_BF16
 extern "C" void fvk_attention_fa2_fwd_bf16_fp8out(
     const void* q_ptr, const void* k_ptr, const void* v_ptr,
     void* o_ptr, void* softmax_lse_ptr,
@@ -392,27 +391,7 @@ extern "C" void fvk_attention_fa2_fwd_bf16_fp8out(
                                     head_dim, batch, num_heads_q);
     dispatch_hdim<cutlass::bfloat16_t>(head_dim, num_splits, params, stream);
 }
-#else
-extern "C" void fvk_attention_fa2_fwd_bf16_fp8out(
-    const void*, const void*, const void*,
-    void* o_ptr, void* softmax_lse_ptr,
-    void* softmax_lse_accum_ptr, void* o_accum_ptr,
-    int batch, int seqlen_q, int seqlen_k,
-    int num_heads_q, int num_heads_kv, int head_dim,
-    int q_batch_stride, int q_row_stride, int q_head_stride,
-    int k_batch_stride, int k_row_stride, int k_head_stride,
-    int v_batch_stride, int v_row_stride, int v_head_stride,
-    int o_batch_stride, int o_row_stride, int o_head_stride,
-    float softmax_scale, int num_sms, cudaStream_t stream,
-    void* o_fp8_ptr, const void* o_fp8_scale_ptr,
-    int o_fp8_batch_stride, int o_fp8_row_stride, int o_fp8_head_stride,
-    int o_bf16_skip)
-{
-    throw std::runtime_error(
-        "fvk_attention_fa2_fwd_bf16_fp8out: bf16 entry was not compiled. "
-        "Rebuild with -DFA2_DTYPES=\"fp16;bf16\" to enable it.");
-}
-#endif  // FA2_HAS_BF16
+
 DEFINE_FA2_ENTRY_WINDOW(fvk_attention_fa2_fwd_bf16_window, cutlass::bfloat16_t, true)
 
 // seqused_k variant: K/V length is read per-batch from device memory
@@ -527,6 +506,25 @@ extern "C" void fvk_attention_fa2_fwd_bf16_tile(
 }
 
 #else
+extern "C" void fvk_attention_fa2_fwd_bf16_fp8out(
+    const void*, const void*, const void*,
+    void* o_ptr, void* softmax_lse_ptr,
+    void* softmax_lse_accum_ptr, void* o_accum_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream,
+    void* o_fp8_ptr, const void* o_fp8_scale_ptr,
+    int o_fp8_batch_stride, int o_fp8_row_stride, int o_fp8_head_stride,
+    int o_bf16_skip)
+{
+    throw std::runtime_error(
+        "fvk_attention_fa2_fwd_bf16_fp8out: bf16 entry was not compiled. "
+        "Rebuild with -DFA2_DTYPES=\"fp16;bf16\" to enable it.");
+}
 DEFINE_FA2_STUB(fvk_attention_fa2_fwd_bf16,  "bf16")
 DEFINE_FA2_STUB_WINDOW(fvk_attention_fa2_fwd_bf16_window, "bf16")
 extern "C" void fvk_attention_fa2_fwd_bf16_seqused(
