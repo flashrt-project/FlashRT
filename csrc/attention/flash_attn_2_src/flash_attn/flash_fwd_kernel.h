@@ -48,6 +48,57 @@ __forceinline__ __device__ auto get_lse_tile(const Params &params, const int bid
 }
 
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// FlashRT local patch 4: write the FP8 (e4m3) copy of the attention output from the
+// same registers that feed the bf16 store. `tOrO` holds Element values partitioned the
+// way `tOcO` reports (row, col) inside the kBlockM x kHeadDim tile.
+//
+// The per-element arithmetic mirrors quantize_fp8_static (csrc/kernels/quantize.cu,
+// quantize_fp8_kernel_generic): take the reciprocal of the scale once, multiply, clamp
+// to +/-448, convert. Both translation units are built with --use_fast_math, so the
+// reciprocal lowers to the same instruction and the result matches a standalone
+// quantize_fp8_static pass bit for bit.
+template <bool Is_even_K, typename Params, typename TensorO, typename TensorC, typename TensorP>
+inline __device__ void write_o_fp8(const Params &params, const TensorO &tOrO, const TensorC &tOcO,
+                                   const TensorP &tOpO, const int bidb, const int bidh,
+                                   const int row_base, const int row_limit) {
+    if (params.o_fp8_ptr == nullptr) { return; }
+    const float inv_s = 1.0f / (*params.o_fp8_scale_ptr);
+    auto out = reinterpret_cast<__nv_fp8_e4m3 *>(params.o_fp8_ptr)
+               + bidb * params.o_fp8_batch_stride + bidh * params.o_fp8_head_stride;
+    #pragma unroll
+    for (int m = 0; m < size<1>(tOrO); ++m) {
+        const int row = get<0>(tOcO(0, m, 0));
+        if (row >= row_limit) { continue; }
+        auto dst = out + (row_base + row) * params.o_fp8_row_stride;
+        #pragma unroll
+        for (int k = 0; k < size<2>(tOrO); ++k) {
+            if (!Is_even_K && !tOpO(k)) { continue; }
+            const int col = get<1>(tOcO(0, m, k));
+            constexpr int kN = decltype(size<0>(tOrO))::value;
+            // The gmem copy atom is 128-bit, so kN is 8 consecutive head_dim elements:
+            // pack them into one 8-byte store instead of 8 single-byte ones.
+            if (kN == 8 && (col % 8) == 0) {
+                uint64_t packed = 0;
+                #pragma unroll
+                for (int i = 0; i < kN; ++i) {
+                    const float v = static_cast<float>(tOrO(i, m, k)) * inv_s;
+                    __nv_fp8_e4m3 e(fminf(fmaxf(v, -448.0f), 448.0f));
+                    packed |= uint64_t(*reinterpret_cast<uint8_t *>(&e)) << (8 * i);
+                }
+                *reinterpret_cast<uint64_t *>(dst + col) = packed;
+            } else {
+                #pragma unroll
+                for (int i = 0; i < kN; ++i) {
+                    const float v = static_cast<float>(tOrO(i, m, k)) * inv_s;
+                    dst[col + i] = __nv_fp8_e4m3(fminf(fmaxf(v, -448.0f), 448.0f));
+                }
+            }
+        }
+    }
+}
+
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
 inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
 
@@ -116,14 +167,18 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d; }
         }
         // Clear_OOB_K must be false since we don't want to write zeros to gmem
-        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-            gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
-        );
+        if (!params.o_bf16_skip) {
+            FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+                gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
+            );
+        }
         #pragma unroll
         for (int m = 0; m < size<1>(tOgO); ++m) {
             const int row = get<0>(tOcO(0, m, 0));
             if (row < binfo.actual_seqlen_q - m_block * kBlockM && get<1>(tOcO(0, m, 0)) == 0) { gLSE(row) = INFINITY; }
         }
+        write_o_fp8<Is_even_K>(params, tOrO, tOcO, tOpO, bidb, bidh, m_block * kBlockM,
+                               binfo.actual_seqlen_q - m_block * kBlockM);
         return;
     }
     // if (tidx == 0) { printf("m_block = %d, n_block_min = %d, n_block_max = %d\n", m_block, n_block_min, n_block_max); }
@@ -488,9 +543,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d; }
     }
     // Clear_OOB_K must be false since we don't want to write zeros to gmem
-    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-        gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
-    );
+    if (!params.o_bf16_skip) {
+        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+            gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
+        );
+    }
+    write_o_fp8<Is_even_K>(params, tOrO, tOcO, tOpO, bidb, bidh, m_block * kBlockM,
+                           binfo.actual_seqlen_q - m_block * kBlockM);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1279,10 +1338,38 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
             for (int k = 0; k < size<2>(rO); ++k) {
                 if (Is_even_K || tOpOaccum(k)) {
                     const int col = get<1>(tOcOaccum(0, m, k));
-                    Tensor gO = make_tensor(make_gmem_ptr(o_ptr + col),
-                                            Shape<Int<decltype(size<0>(rO))::value>>{}, Stride<_1>{});
-                    // TODO: Should check if this is using vectorized store, but it seems pretty fast
-                    copy(rO(_, m, k), gO);
+                    if (!params.o_bf16_skip) {
+                        Tensor gO = make_tensor(make_gmem_ptr(o_ptr + col),
+                                                Shape<Int<decltype(size<0>(rO))::value>>{}, Stride<_1>{});
+                        // TODO: Should check if this is using vectorized store, but it seems pretty fast
+                        copy(rO(_, m, k), gO);
+                    }
+                    // FlashRT local patch 4: FP8 copy of the combined output, same
+                    // registers and the same arithmetic as write_o_fp8 above.
+                    if (params.o_fp8_ptr != nullptr) {
+                        const float inv_s = 1.0f / (*params.o_fp8_scale_ptr);
+                        auto o8 = reinterpret_cast<__nv_fp8_e4m3 *>(params.o_fp8_ptr)
+                                  + batch_idx * params.o_fp8_batch_stride
+                                  + head_idx * params.o_fp8_head_stride
+                                  + row * params.o_fp8_row_stride + col;
+                        constexpr int kN8 = decltype(size<0>(rO))::value;
+                        if (kN8 == 8 && (col % 8) == 0) {
+                            uint64_t packed = 0;
+                            #pragma unroll
+                            for (int i = 0; i < kN8; ++i) {
+                                const float v = static_cast<float>(rO(i, m, k)) * inv_s;
+                                __nv_fp8_e4m3 e(fminf(fmaxf(v, -448.0f), 448.0f));
+                                packed |= uint64_t(*reinterpret_cast<uint8_t *>(&e)) << (8 * i);
+                            }
+                            *reinterpret_cast<uint64_t *>(o8) = packed;
+                        } else {
+                            #pragma unroll
+                            for (int i = 0; i < kN8; ++i) {
+                                const float v = static_cast<float>(rO(i, m, k)) * inv_s;
+                                o8[i] = __nv_fp8_e4m3(fminf(fmaxf(v, -448.0f), 448.0f));
+                            }
+                        }
+                    }
                     // if (bidx == 0 && tidx == 0) { printf("tidx = %d, idx = %d, batch_idx = %d, head_idx = %d, row = %d, col = %d\n", tidx, idx, batch_idx, head_idx, row, col); print(rO(_, m, k)); print(gO); }
                     // reinterpret_cast<uint64_t *>(o_ptr)[col / 4] = recast<uint64_t>(rO)(0, m, k);
                 }

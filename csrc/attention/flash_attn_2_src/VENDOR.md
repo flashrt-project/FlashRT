@@ -43,8 +43,21 @@ the vendor: ship FA2 without the torch wheel environment):
 3. `philox_unpack.cuh`: replaced `#include <ATen/cuda/detail/UnpackRaw.cuh>`
    with a ~10-line inline stub for `at::cuda::philox::unpack()`.
 
-Total patch footprint: ~30 LoC. See commit history on this path for
-exact diffs.
+One feature patch:
+
+4. `flash.h` / `flash_fwd_kernel.h`: optional static-FP8 (e4m3) copy of the
+   attention output, written from the registers that already feed the bf16
+   store, plus a flag that drops the bf16 store when that copy is the only
+   consumer. Reached through the `fvk_attention_fa2_fwd_bf16{,_causal}_fp8out`
+   entries; with a null FP8 pointer the kernel is byte-for-byte upstream. The
+   per-element arithmetic is copied from `csrc/kernels/quantize.cu`
+   (`quantize_fp8_kernel_generic`) so the result matches a standalone
+   `quantize_fp8_static` pass bit for bit, which
+   `tests/test_fa2_fp8_output_epilogue.py` asserts on both the single-pass and
+   split-KV combine paths.
+
+Total patch footprint: ~30 LoC for the decoupling patches, ~90 LoC for the
+output epilogue. See commit history on this path for exact diffs.
 
 ## Backporting upstream bugfixes
 

@@ -145,6 +145,13 @@ static void fill_params_causal(
     params.alibi_slopes_batch_stride = 0;
     params.is_seqlens_k_cumulative = true;
     params.rotary_dim = 0;
+    // FlashRT local patch 4: quantized-output epilogue off unless a *_fp8out entry sets it
+    params.o_fp8_ptr = nullptr;
+    params.o_fp8_scale_ptr = nullptr;
+    params.o_fp8_batch_stride = 0;
+    params.o_fp8_row_stride = 0;
+    params.o_fp8_head_stride = 0;
+    params.o_bf16_skip = false;
 }
 
 static int setup_splitkv_causal(FLASH_NAMESPACE::Flash_fwd_params& params,
@@ -255,6 +262,73 @@ extern "C" void fvk_attention_fa2_fwd_bf16_causal(
         "Rebuild with -DFA2_DTYPES=\"fp16;bf16\" to enable it.");
 }
 #endif  // FA2_HAS_BF16
+
+// FlashRT local patch 4: causal sibling of fvk_attention_fa2_fwd_bf16_causal that also
+// emits the static-FP8 copy of O. Separate symbol so the published signature of the
+// existing entry is untouched; with o_fp8_ptr = nullptr the two are equivalent.
+#if defined(FA2_HAS_BF16) && defined(FA2_HAS_HDIM_256)
+extern "C" void fvk_attention_fa2_fwd_bf16_causal_fp8out(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr,
+    void* softmax_lse_accum_ptr, void* o_accum_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream,
+    void* o_fp8_ptr, const void* o_fp8_scale_ptr,
+    int o_fp8_batch_stride, int o_fp8_row_stride, int o_fp8_head_stride,
+    int o_bf16_skip)
+{
+    if (head_dim != 256) {
+        throw std::runtime_error(
+            "fvk_attention_fa2_fwd_bf16_causal_fp8out: head_dim=" + std::to_string(head_dim) +
+            " not built. Only head_dim=256 is instantiated for the quantized-output "
+            "causal path; add the instantiation and extend this dispatch to widen it.");
+    }
+    FLASH_NAMESPACE::Flash_fwd_params params;
+    fill_params_causal(params,
+                       q_ptr, k_ptr, v_ptr, o_ptr, softmax_lse_ptr,
+                       batch, seqlen_q, seqlen_k,
+                       num_heads_q, num_heads_kv, head_dim,
+                       q_batch_stride, q_row_stride, q_head_stride,
+                       k_batch_stride, k_row_stride, k_head_stride,
+                       v_batch_stride, v_row_stride, v_head_stride,
+                       o_batch_stride, o_row_stride, o_head_stride,
+                       softmax_scale);
+    params.o_fp8_ptr = o_fp8_ptr;
+    params.o_fp8_scale_ptr = reinterpret_cast<const float*>(o_fp8_scale_ptr);
+    params.o_fp8_batch_stride = o_fp8_batch_stride;
+    params.o_fp8_row_stride = o_fp8_row_stride;
+    params.o_fp8_head_stride = o_fp8_head_stride;
+    params.o_bf16_skip = (o_bf16_skip != 0) && (o_fp8_ptr != nullptr);
+
+    int num_splits = setup_splitkv_causal(params, softmax_lse_accum_ptr, o_accum_ptr,
+                                          num_sms, seqlen_q, seqlen_k,
+                                          head_dim, batch, num_heads_q);
+    if (num_splits > 1) {
+        FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, true>(params, stream);
+    } else {
+        FLASH_NAMESPACE::run_mha_fwd_<cutlass::bfloat16_t, 256, true>(params, stream);
+    }
+}
+#else
+extern "C" void fvk_attention_fa2_fwd_bf16_causal_fp8out(
+    const void*, const void*, const void*, void*, void*,
+    void*, void*,
+    int, int, int, int, int, int,
+    int, int, int, int, int, int,
+    int, int, int, int, int, int,
+    float, int, cudaStream_t,
+    void*, const void*, int, int, int, int)
+{
+    throw std::runtime_error(
+        "fvk_attention_fa2_fwd_bf16_causal_fp8out: not compiled. Rebuild with "
+        "-DFA2_DTYPES=\"bf16\" -DFA2_HDIMS=\"256\" (or wider) to enable it.");
+}
+#endif
 
 // FP16 causal sibling. Only head_dim=128 is instantiated (Chameleon-7B
 // on Orin SM87 is the consumer; bf16 covers the head_dim=256 shapes
