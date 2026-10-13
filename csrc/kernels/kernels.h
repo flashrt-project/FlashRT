@@ -6,6 +6,7 @@
 
 #include "norm.cuh"
 #include "linear_f32.cuh"
+#include "resize_norm.cuh"
 #include "activation.cuh"
 #include "rope.cuh"
 #include "rope_vec.cuh"

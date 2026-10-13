@@ -944,6 +944,20 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         "out[t, n] = sum_k fp32(x[t, k]) * W[n, k] + b[n], x bf16 and the output "
         "fp32. fp32 accumulate with no TF32; one warp per output element.");
 
+    m.def("resize_norm_u8_hwc_to_bf16_chw",
+        [](uintptr_t in, uintptr_t out, int nv, int H, int W, int OH, int OW,
+           uintptr_t stream) {
+            flash_rt::kernels::resize_norm_u8_hwc_to_bf16_chw(
+                reinterpret_cast<const uint8_t*>(in),
+                reinterpret_cast<__nv_bfloat16*>(out), nv, H, W, OH, OW,
+                to_stream(stream));
+        },
+        py::arg("in"), py::arg("out"), py::arg("nv"), py::arg("H"), py::arg("W"),
+        py::arg("OH"), py::arg("OW"), py::arg("stream") = 0,
+        "Bilinear resize of uint8 frames with OpenCV INTER_LINEAR arithmetic, then "
+        "rescale and normalize to bf16: (nv, H, W, 3) uint8 HWC in, (nv, 3, OH, OW) "
+        "bf16 CHW out, with (x - 127.5) / 127.5.");
+
     m.def("ada_rms_norm",
         [](uintptr_t x, uintptr_t mod, uintptr_t out, int rows, int dim,
            float eps, uintptr_t stream) {
