@@ -262,18 +262,23 @@ class Dm05PrefixStage:
         afterwards does no host work.
         """
         from torch import from_numpy
-        b = self.bufs
         s = int(len(ids))
         if s > self.max_seq:
             raise ValueError(f"prefix length {s} exceeds the preallocated {self.max_seq}")
-        b["ids"][:s].copy_(from_numpy(ids).to(b["ids"].device))
-        b["img_index"][:s].copy_(from_numpy(img_index).to(b["img_index"].device))
-        b["klim"][:s].copy_(from_numpy(key_limits).to(b["klim"].device))
+        if len(img_index) != s or len(key_limits) != s:
+            raise ValueError(f"prompt is {s} rows but the index and limit tables are "
+                             f"{len(img_index)} and {len(key_limits)}")
+        # Validate before writing anything: a rejected run table must leave the
+        # stage on its previous prompt rather than half bound to this one.
         for s0, s1, kk, causal in segments:
             if not (0 <= s0 < s1 <= s):
                 raise ValueError(f"segment {(s0, s1, kk, causal)} is outside 1..{s}")
             if not (s1 <= kk <= s):
                 raise ValueError(f"segment {(s0, s1, kk, causal)} reads keys past {s}")
+        b = self.bufs
+        b["ids"][:s].copy_(from_numpy(ids).to(b["ids"].device))
+        b["img_index"][:s].copy_(from_numpy(img_index).to(b["img_index"].device))
+        b["klim"][:s].copy_(from_numpy(key_limits).to(b["klim"].device))
         self.seq = s
         self.segments = [(int(a), int(b_), int(c), bool(d)) for a, b_, c, d in segments]
 
