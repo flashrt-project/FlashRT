@@ -18,6 +18,7 @@
 
 #include "kernels/dm05/dm05_ae_decode_attn.cuh"
 #include "kernels/dm05/dm05_prefix_attn.cuh"
+#include "kernels/dm05/dm05_w8a16.cuh"
 #include "kernels/dm05/dm05_vit_attn_hd72.cuh"
 
 namespace py = pybind11;
@@ -102,6 +103,68 @@ PYBIND11_MODULE(flash_rt_dm05, m) {
         "[S, NKV*256], with contiguous rows.");
     m.def("dm05_prefix_attn_smem_bytes", &flash_rt::dm05::prefix_attn_smem_bytes,
         "Dynamic shared memory the kernel requests per block, in bytes.");
+
+    m.def("dm05_w8a16_pack",
+        [](uintptr_t w, uintptr_t out, int N, int K, uintptr_t stream) {
+            flash_rt::dm05::w8a16_pack(reinterpret_cast<const int8_t*>(w),
+                                       reinterpret_cast<int8_t*>(out), N, K, to_stream(stream));
+        },
+        py::arg("w"), py::arg("out"), py::arg("N"), py::arg("K"), py::arg("stream") = 0,
+        "Repack an (N, K) int8 weight into the fragment order the W8A16 GEMMs read. "
+        "N must be a multiple of 16 and K of 32; `out` holds N*K bytes.");
+
+    m.def("dm05_w8a16_tc",
+        [](uintptr_t x, uintptr_t wp, uintptr_t ws, uintptr_t out,
+           int M, int N, int K, int warps, uintptr_t stream) {
+            flash_rt::dm05::w8a16_tc(
+                reinterpret_cast<const __nv_bfloat16*>(x),
+                reinterpret_cast<const int8_t*>(wp),
+                reinterpret_cast<const float*>(ws),
+                reinterpret_cast<__nv_bfloat16*>(out), M, N, K, warps, to_stream(stream));
+        },
+        py::arg("x"), py::arg("wp"), py::arg("ws"), py::arg("out"),
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("warps") = 8,
+        py::arg("stream") = 0,
+        "Weight-only int8 GEMM: out[m, n] = bf16(sum_k x[m, k] * dequant(w[n, k])). "
+        "M <= 16, N % 16 == 0, K % 32 == 0; wp is the output of dm05_w8a16_pack.");
+
+    m.def("dm05_w8a16_tc3",
+        [](uintptr_t x, uintptr_t wp, uintptr_t ws,
+           uintptr_t o0, int n0, int ld0, uintptr_t o1, int n1, int ld1,
+           uintptr_t o2, int n2, int ld2, int M, int K, int warps, uintptr_t stream) {
+            flash_rt::dm05::w8a16_tc3(
+                reinterpret_cast<const __nv_bfloat16*>(x),
+                reinterpret_cast<const int8_t*>(wp),
+                reinterpret_cast<const float*>(ws),
+                reinterpret_cast<__nv_bfloat16*>(o0), n0, ld0,
+                reinterpret_cast<__nv_bfloat16*>(o1), n1, ld1,
+                reinterpret_cast<__nv_bfloat16*>(o2), n2, ld2,
+                M, K, warps, to_stream(stream));
+        },
+        py::arg("x"), py::arg("wp"), py::arg("ws"),
+        py::arg("o0"), py::arg("n0"), py::arg("ld0"),
+        py::arg("o1"), py::arg("n1"), py::arg("ld1"),
+        py::arg("o2"), py::arg("n2"), py::arg("ld2"),
+        py::arg("M"), py::arg("K"), py::arg("warps") = 8, py::arg("stream") = 0,
+        "The same GEMM over a concatenated weight, each of three segments written to "
+        "its own buffer with its own leading dimension, so a fused q|k|v GEMM can put "
+        "k and v straight into cache rows.");
+
+    m.def("dm05_w8a16_tc_glu",
+        [](uintptr_t x, uintptr_t wp, uintptr_t ws, uintptr_t out,
+           int ff, int M, int K, int warps, uintptr_t stream) {
+            flash_rt::dm05::w8a16_tc_glu(
+                reinterpret_cast<const __nv_bfloat16*>(x),
+                reinterpret_cast<const int8_t*>(wp),
+                reinterpret_cast<const float*>(ws),
+                reinterpret_cast<__nv_bfloat16*>(out), ff, M, K, warps, to_stream(stream));
+        },
+        py::arg("x"), py::arg("wp"), py::arg("ws"), py::arg("out"),
+        py::arg("ff"), py::arg("M"), py::arg("K"), py::arg("warps") = 8,
+        py::arg("stream") = 0,
+        "Gated MLP epilogue over a fused [gate | up] weight of N = 2*ff: output "
+        "out[m, c] = bf16(bf16(gelu_tanh(bf16(gate))) * bf16(up)) with the separate "
+        "gate GEMM, up GEMM and multiply roundings.");
 
     m.def("dm05_ae_decode_attn_supports_r", &flash_rt::dm05::ae_decode_attn_supports_r,
         py::arg("r"), "Whether this build instantiates the G*T row count r.");

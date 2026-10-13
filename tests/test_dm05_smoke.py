@@ -374,5 +374,119 @@ class TestPrefixAttn:
                                lim.data_ptr(), S, 6, 4, 1.0, _stream())
 
 
+# ── weight-only int8 GEMM (W8A16) ────────────────────────────────────────────
+
+W8_SEQ = [(10, 1024, 32, 4), (10, 4096, 1024, 8), (1, 32, 1024, 4), (16, 128, 64, 2)]
+
+
+def _w8_case(m, N, K, seed=0):
+    """An int8 weight, its per-channel scale, and the packed form the GEMMs read."""
+    torch.manual_seed(seed)
+    w8 = torch.randint(-127, 128, (N, K), device="cuda", dtype=torch.int8)
+    sc = (torch.rand(N, device="cuda") * 0.01 + 0.001).to(torch.float32)
+    packed = torch.zeros(N * K, device="cuda", dtype=torch.int8)
+    m.dm05_w8a16_pack(w8.data_ptr(), packed.data_ptr(), N, K, _stream())
+    torch.cuda.synchronize()
+    return w8, sc, packed
+
+
+def _w8_ref(x, w8, sc):
+    """fp32 accumulate over the dequantized weight, scale applied after the reduction."""
+    return ((x.float() @ w8.float().t()) * sc[None, :]).to(torch.bfloat16)
+
+
+class TestW8A16:
+    @pytest.mark.parametrize("M,N,K,warps", W8_SEQ)
+    def test_gemm_matches_a_reference(self, M, N, K, warps):
+        m = _dm05()
+        w8, sc, packed = _w8_case(m, N, K, seed=1)
+        torch.manual_seed(2)
+        x = (torch.randn(M, K, device="cuda") * 0.5).to(torch.bfloat16)
+        out = torch.zeros(M, N, device="cuda", dtype=torch.bfloat16)
+        m.dm05_w8a16_tc(x.data_ptr(), packed.data_ptr(), sc.data_ptr(), out.data_ptr(),
+                        M, N, K, warps, _stream())
+        torch.cuda.synchronize()
+        ref = _w8_ref(x, w8, sc)
+        max_abs = (out.float() - ref.float()).abs().max().item()
+        assert max_abs < 0.05, f"max abs error {max_abs}"
+
+    def test_the_scale_is_applied_per_output_channel(self):
+        """A kernel folding the scale in wrongly still passes a loose check."""
+        m = _dm05()
+        N, K, M = 64, 32, 8
+        w8, sc, packed = _w8_case(m, N, K, seed=3)
+        torch.manual_seed(4)
+        x = (torch.randn(M, K, device="cuda") * 0.5).to(torch.bfloat16)
+        out = torch.zeros(M, N, device="cuda", dtype=torch.bfloat16)
+        m.dm05_w8a16_tc(x.data_ptr(), packed.data_ptr(), sc.data_ptr(), out.data_ptr(),
+                        M, N, K, 4, _stream())
+        torch.cuda.synchronize()
+        unscaled = (x.float() @ w8.float().t()).to(torch.bfloat16)
+        assert not torch.equal(out, unscaled)
+
+    def test_pack_is_a_permutation_of_the_weight(self):
+        """The packed layout must be the same bytes, reordered."""
+        m = _dm05()
+        N, K = 128, 64
+        w8, _, packed = _w8_case(m, N, K, seed=5)
+        assert sorted(packed.tolist()) == sorted(w8.reshape(-1).tolist())
+
+    def test_segmented_output_writes_each_leading_dimension(self):
+        """k and v must land in their own buffers with their own row stride."""
+        m = _dm05()
+        N, K, M = 4096, 1024, 10
+        w8, sc, packed = _w8_case(m, N, K, seed=6)
+        torch.manual_seed(7)
+        x = (torch.randn(M, K, device="cuda") * 0.5).to(torch.bfloat16)
+        o0 = torch.zeros(M, 2048, device="cuda", dtype=torch.bfloat16)
+        o1 = torch.zeros(M, 4096, device="cuda", dtype=torch.bfloat16)
+        o2 = torch.zeros(M, 4096, device="cuda", dtype=torch.bfloat16)
+        m.dm05_w8a16_tc3(x.data_ptr(), packed.data_ptr(), sc.data_ptr(),
+                         o0.data_ptr(), 2048, 2048, o1.data_ptr(), 1024, 4096,
+                         o2.data_ptr(), 1024, 4096, M, K, 8, _stream())
+        torch.cuda.synchronize()
+        full = _w8_ref(x, w8, sc)
+        assert (o0.float() - full[:, :2048].float()).abs().max().item() < 0.05
+        assert (o1[:, :1024].float() - full[:, 2048:3072].float()).abs().max().item() < 0.05
+        assert (o2[:, :1024].float() - full[:, 3072:].float()).abs().max().item() < 0.05
+        # the leading dimension is honoured: the tail of o1 must be untouched
+        assert torch.equal(o1[:, 1024:], torch.zeros_like(o1[:, 1024:]))
+
+    @pytest.mark.parametrize("M,ff,K", [(10, 2048, 1024), (10, 512, 32), (1, 128, 64)])
+    def test_glu_epilogue_matches_the_separate_roundings(self, M, ff, K):
+        m = _dm05()
+        N = 2 * ff
+        w8, sc, packed = _w8_case(m, N, K, seed=8)
+        torch.manual_seed(9)
+        x = (torch.randn(M, K, device="cuda") * 0.5).to(torch.bfloat16)
+        out = torch.zeros(M, ff, device="cuda", dtype=torch.bfloat16)
+        m.dm05_w8a16_tc_glu(x.data_ptr(), packed.data_ptr(), sc.data_ptr(), out.data_ptr(),
+                            ff, M, K, 8, _stream())
+        torch.cuda.synchronize()
+        # gate in block rows 0..7, up in 8..15, i.e. a permutation of the N blocks
+        full = _w8_ref(x, w8, sc)
+        gate = torch.empty(M, ff, device="cuda", dtype=torch.bfloat16)
+        up = torch.empty_like(gate)
+        for blk in range(ff // 8):
+            gate[:, blk * 8:(blk + 1) * 8] = full[:, blk * 16:blk * 16 + 8]
+            up[:, blk * 8:(blk + 1) * 8] = full[:, blk * 16 + 8:blk * 16 + 16]
+        # the activation rounds to bf16 before the multiply, as the separate
+        # gate GEMM, up GEMM and multiply in the unfused form do
+        act = torch.nn.functional.gelu(gate.float(), approximate="tanh").to(torch.bfloat16)
+        want = (act.float() * up.float()).to(torch.bfloat16)
+        max_abs = (out.float() - want.float()).abs().max().item()
+        assert max_abs < 0.05, f"max abs error {max_abs}"
+
+    def test_shape_guards(self):
+        m = _dm05()
+        w = torch.zeros(16, 32, device="cuda", dtype=torch.int8)
+        out = torch.zeros(16 * 32, device="cuda", dtype=torch.int8)
+        with pytest.raises(RuntimeError, match="multiple of 16"):
+            m.dm05_w8a16_pack(w.data_ptr(), out.data_ptr(), 15, 32, _stream())
+        with pytest.raises(RuntimeError, match="multiple of 32"):
+            m.dm05_w8a16_pack(w.data_ptr(), out.data_ptr(), 16, 31, _stream())
+        torch.cuda.synchronize()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
