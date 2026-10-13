@@ -5245,6 +5245,24 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("token_ids"), py::arg("embed"), py::arg("out"),
         py::arg("rows"), py::arg("hidden"), py::arg("stream") = 0);
 
+    m.def("embedding_lookup_merge_bf16",
+        [](uintptr_t token_ids, uintptr_t img_index, uintptr_t embed, uintptr_t img,
+           uintptr_t out, int rows, int hidden, float scale, uintptr_t stream) {
+            flash_rt::kernels::embedding_lookup_merge_bf16(
+                reinterpret_cast<const int64_t*>(token_ids),
+                reinterpret_cast<const int*>(img_index),
+                reinterpret_cast<const __nv_bfloat16*>(embed),
+                reinterpret_cast<const __nv_bfloat16*>(img),
+                reinterpret_cast<__nv_bfloat16*>(out),
+                rows, hidden, scale, to_stream(stream));
+        },
+        py::arg("token_ids"), py::arg("img_index"), py::arg("embed"), py::arg("img"),
+        py::arg("out"), py::arg("rows"), py::arg("hidden"), py::arg("scale"),
+        py::arg("stream") = 0,
+        "Prefix embedding with a multimodal merge. Row r takes img[img_index[r]] when "
+        "img_index[r] >= 0 (a host-computed -1 marks a text row) and "
+        "bf16(embed[token_ids[r]] * scale) otherwise.");
+
 #ifdef FLASHRT_HAVE_AUDIO_CODEBOOK
     m.def("delayed_codebook_argmax_embed_bf16",
         [](uintptr_t logits, uintptr_t codebook, uintptr_t codes_out,
