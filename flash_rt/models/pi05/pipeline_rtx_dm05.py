@@ -42,6 +42,49 @@ VIS_TOK_SIDE = 16     # after the 2x2 average pool
 PATCH_FEAT = 3 * VIS_P * VIS_P       # 588
 
 
+def fold_vision_kv_bias(weights, *, drop_k=False):
+    """Fold the SigLIP key/value biases away, in place, before any FP8 site is built.
+
+    The value bias passes straight through attention -- the weights sum to one, so
+    the output is ``(a + b_v) W_o + b_o`` -- and the key bias only shifts every
+    score of a query equally, which softmax removes. So
+
+        o_b  <-  o_b + b_v @ W_o            and the value third of qkv_b is zeroed
+
+    is exact in real arithmetic. It is not exact in bf16, which is why this is a
+    weight transformation and not a kernel trick: the folded checkpoint is a
+    different tensor set from the one on disk, and a parity run has to be against
+    the folded reference.
+
+    ``o_w`` is held ``(N, K)`` here where the reference holds it ``(K, N)``. The
+    transpose is materialised before the contraction rather than taken as a view:
+    ``b @ W.t()`` is the same arithmetic on paper but not in fp32, because the
+    strided view sends torch to a different matmul and a different accumulation
+    order, and the measured result is one element in 1152 differing on three of
+    the 27 layers. With ``(K, N)`` contiguous the operands are identical to the
+    reference's and the fold is bit-identical.
+
+    The fold is done in fp32 and rounded once, as the reference does -- a
+    checkpoint whose weights have already been through this must not be folded
+    twice, so the frontend applies it once at load and nothing downstream repeats
+    it.
+
+    ``drop_k`` also removes the key bias, which the reference uses only for a
+    variant that did not ship; the delivered configuration keeps it.
+    """
+    import torch
+    D = VIS_D
+    for ly in weights["layers"]:
+        b = ly["qkv_b"].float()
+        w_kn = ly["o_w"].float().t().contiguous()          # the reference's (K, N) layout
+        ly["o_b"] = (ly["o_b"].float() + b[2 * D:] @ w_kn).to(ly["o_b"].dtype).contiguous()
+        keep = D if drop_k else 2 * D
+        ly["qkv_b"] = torch.cat(
+            [b[:keep], torch.zeros(3 * D - keep, device=b.device, dtype=b.dtype)]).to(
+            ly["qkv_b"].dtype).contiguous()
+    return weights
+
+
 class Dm05VisionStage:
     """SigLIP tower + multimodal projector, reading ``pixels`` into ``out``.
 
