@@ -877,6 +877,76 @@ void GemmRunner::bf16_nn_bias(void* A, void* B, void* D, void* bias,
 }
 
 // ================================================================
+//  BF16 + BIAS epilogue over the (N,K) weight layout:
+//      D(M,N) = A(M,K) @ B(N,K)^T + bias(N)
+//
+//  bf16_nn_bias above asks cuBLASLt for row-order layouts with a BIAS
+//  epilogue. That combination returns CUBLAS_STATUS_NOT_SUPPORTED for a range
+//  of BF16 shapes on sm_120 -- callers elsewhere in this tree already work
+//  around it by falling back to a separate bias add (see
+//  flash_rt/models/motus/_linear_swap.py and
+//  flash_rt/models/lingbot/kernel_ops.py, which both document the same
+//  status), and the workaround costs an extra BF16 rounding on the sum. This
+//  entry reaches the same fused epilogue through column-major matrix views,
+//  the formulation fp16_nn_bias already uses: a row-major (M,N) buffer is a
+//  column-major (N,M) one, so the operands are issued in cuBLASLt's native
+//  order and D^T = B A^T is written directly.
+//
+//  Like fp16_nn_bias and unlike bf16_nn_bias, this walks the heuristic list
+//  until one actually launches, because a heuristic that reports success can
+//  still fail at matmul time on these shapes.
+void GemmRunner::bf16_nt_bias(void* A, void* B, void* D, void* bias,
+                              int M, int N, int K, cudaStream_t stream) {
+    cublasLtMatmulDesc_t matmul_desc;
+    cublasLtMatrixLayout_t A_desc, B_desc, D_desc;
+
+    CUBLAS_CHECK(cublasLtMatmulDescCreate(&matmul_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    // A is the weight (N,K) seen transposed, B is the activation (M,K) seen as is
+    cublasOperation_t op_T = CUBLAS_OP_T, op_N = CUBLAS_OP_N;
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_T, sizeof(op_T)));
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_N, sizeof(op_N)));
+    cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+    cudaDataType_t bias_type = CUDA_R_16BF;
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(matmul_desc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bias_type, sizeof(bias_type)));
+
+    // column-major views: A' = B (K x N, ld K), B' = A (K x M, ld K), D' = D (N x M, ld N)
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&A_desc, CUDA_R_16BF, K, N, K));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&B_desc, CUDA_R_16BF, K, M, K));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&D_desc, CUDA_R_16BF, N, M, N));
+
+    cublasLtMatmulPreference_t preference;
+    CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&preference));
+    CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(preference,
+        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size_, sizeof(workspace_size_)));
+
+    int returned_results = 0;
+    cublasLtMatmulHeuristicResult_t heuristics[8];
+    cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(handle_, matmul_desc,
+        A_desc, B_desc, D_desc, D_desc, preference, 8, heuristics, &returned_results);
+    cublasStatus_t st = CUBLAS_STATUS_NOT_SUPPORTED;
+    if (hs == CUBLAS_STATUS_SUCCESS) {
+        float alpha = 1.0f, beta = 0.0f;
+        for (int i = 0; i < returned_results; ++i) {
+            st = cublasLtMatmul(handle_, matmul_desc,
+                &alpha, B, A_desc, A, B_desc, &beta, D, D_desc, D, D_desc,
+                &heuristics[i].algo, workspace_, workspace_size_, stream);
+            if (st == CUBLAS_STATUS_SUCCESS) break;
+        }
+    }
+    cublasLtMatmulPreferenceDestroy(preference);
+    cublasLtMatrixLayoutDestroy(A_desc);
+    cublasLtMatrixLayoutDestroy(B_desc);
+    cublasLtMatrixLayoutDestroy(D_desc);
+    cublasLtMatmulDescDestroy(matmul_desc);
+    if (hs != CUBLAS_STATUS_SUCCESS || returned_results == 0)
+        throw std::runtime_error("cuBLASLt bf16_nt_bias: no algorithm found");
+    if (st != CUBLAS_STATUS_SUCCESS)
+        throw std::runtime_error("cuBLASLt bf16_nt_bias: matmul failed for every heuristic");
+}
+
+// ================================================================
 //  BF16 GEMM + BIAS + GELU epilogue: D(M,N) = GELU(A(M,K) @ B(K,N) + bias(N))
 //  Fuses GEMM + bias + GELU into single cuBLASLt launch.
 // ================================================================

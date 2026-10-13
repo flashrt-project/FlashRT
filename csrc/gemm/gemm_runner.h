@@ -70,6 +70,18 @@ public:
                   int M, int N, int K,
                   cudaStream_t stream = 0);
 
+    // BF16 + BIAS epilogue over the same B layout as bf16_run:
+    //   D(M,N) = A(M,K) @ B(N,K)^T + bias(N), all row-major BF16, fp32 accumulate.
+    // B is an nn.Linear weight as stored, (N,K), so no transpose or repack is
+    // needed on the caller's side, and the sum is rounded to BF16 exactly once.
+    // bf16_nn_bias computes the same shape from a (K,N) B; this is the (N,K)
+    // twin, and it reaches cuBLASLt through column-major views because the
+    // row-order formulation with a BIAS epilogue has no algorithm on sm_120 —
+    // see the note in gemm_runner.cu.
+    void bf16_nt_bias(void* A, void* B, void* D, void* bias,
+                      int M, int N, int K,
+                      cudaStream_t stream = 0);
+
     // BF16: D = A(M,K) @ B(K,N)  (row-major, no transpose)
     // FP16 GEMM with a fused per-column bias epilogue.
     void fp16_nn_bias(void* A, void* B, void* D, void* bias,
