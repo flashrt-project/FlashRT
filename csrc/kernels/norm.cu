@@ -1702,3 +1702,70 @@ void gemma3_rms_norm_bf16(const __nv_bfloat16* x, long long x_stride,
         x, x_stride, weight, out, out_stride, residual, res_stride,
         rows_per_group, group_stride, dim, eps);
 }
+
+// The vectorized Gemma3 form's reduction: 8 columns per thread, one value per
+// thread, reduced warp-first and then across warps through shared memory.
+//
+// This is a different summation order from gemma3_rms_norm_kernel's strided
+// loop above, so the two can disagree in the last fp32 ulp of the sum of
+// squares and a bf16 result can land either side of a rounding boundary. A
+// caller that has to reproduce one of them bit for bit has to use that one;
+// gemma3_rms_norm_bf16 deliberately implements the strided order.
+__device__ __forceinline__ float gemma3_block_sum(float v) {
+    __shared__ float red[32];
+    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    __syncthreads();
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = v;
+    __syncthreads();
+    float t = threadIdx.x < (blockDim.x + 31) / 32 ? red[threadIdx.x & 31] : 0.f;
+    if (threadIdx.x < 32)
+        for (int o = 16; o; o >>= 1) t += __shfl_xor_sync(0xffffffffu, t, o);
+    if (threadIdx.x == 0) red[0] = t;
+    __syncthreads();
+    return red[0];
+}
+
+// Gemma3 RMSNorm whose result is consumed straight as a static per-tensor FP8
+// (e4m3) GEMM input: one block per row, dim / 8 threads, 8 columns per thread.
+// The normalized row never reaches memory as bf16, because its only consumer is
+// the quantized GEMM and a bf16 copy would be written and never read.
+//
+// The quantization reproduces what a standalone quantize_fp8_static pass over
+// the bf16 norm output would produce -- round to bf16, then clamp(x / a_scale)
+// to e4m3 -- so the activation written here is byte-identical to the two-pass
+// form's. `a_scale` is the same device scalar that pass reads.
+__global__ void gemma3_rms_norm_fp8_kernel(const __nv_bfloat16* __restrict__ x,
+                                           const __nv_bfloat16* __restrict__ w,
+                                           const float* __restrict__ a_scale,
+                                           __nv_fp8_e4m3* __restrict__ q,
+                                           int dim, float eps) {
+    union Gemma3V8 { uint4 u; __nv_bfloat16 h[8]; };
+    const long long base = (long long)blockIdx.x * dim + threadIdx.x * 8;
+    Gemma3V8 xv, wv;
+    xv.u = *reinterpret_cast<const uint4*>(x + base);
+    wv.u = *reinterpret_cast<const uint4*>(w + threadIdx.x * 8);
+    float f[8], ss = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        f[j] = __bfloat162float(xv.h[j]);
+        ss += f[j] * f[j];
+    }
+    const float inv = rsqrtf(gemma3_block_sum(ss) / (float)dim + eps);
+    const float qi = 1.0f / a_scale[0];
+    __align__(8) __nv_fp8_e4m3 o[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const float y = __bfloat162float(__float2bfloat16(f[j] * inv * (1.0f + __bfloat162float(wv.h[j]))));
+        o[j] = __nv_fp8_e4m3(fminf(fmaxf(y * qi, -448.f), 448.f));
+    }
+    reinterpret_cast<uint2*>(q + base)[0] = *reinterpret_cast<uint2*>(o);
+}
+
+void gemma3_rms_norm_fp8_bf16(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                              __nv_fp8_e4m3* out, const float* a_scale,
+                              int rows, int dim, float eps, cudaStream_t stream) {
+    if (rows <= 0 || dim <= 0) return;
+    if (dim % 8 != 0)
+        throw std::runtime_error("gemma3_rms_norm_fp8_bf16: dim must be a multiple of 8");
+    gemma3_rms_norm_fp8_kernel<<<rows, dim / 8, 0, stream>>>(x, weight, a_scale, out, dim, eps);
+}

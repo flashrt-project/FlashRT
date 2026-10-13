@@ -253,5 +253,71 @@ class TestFp32StepOps:
         assert torch.equal(dst, kept) and torch.equal(src, kept)
 
 
+# ── Gemma3 RMSNorm writing a static FP8 GEMM input ───────────────────────────
+
+class TestGemma3RmsNormFp8:
+    """The fp8 form must be exactly the bf16 form plus the quantize pass.
+
+    The contract is byte identity with `quantize_fp8_static` applied to the bf16
+    output of the same norm, not a tolerance: a consumer calibrated against that
+    pass buckets a one-ULP drift into a different integer, so the fused kernel
+    has to land on the same side of every rounding boundary.
+    """
+
+    @pytest.mark.parametrize("rows,dim", [(568, 2048), (40, 256), (1, 4096), (7, 1152)])
+    def test_byte_identical_to_a_standalone_quantize(self, rows, dim):
+        fvk = _fvk()
+        torch.manual_seed(9)
+        x = _bf16(torch.randn(rows, dim, device="cuda") * 2)
+        w = _bf16(torch.randn(dim, device="cuda") * 0.3)
+        scale = torch.tensor([0.02], device="cuda", dtype=torch.float32)
+        fused = torch.zeros(rows, dim, device="cuda", dtype=torch.float8_e4m3fn)
+        fvk.gemma3_rms_norm_fp8_bf16(x.data_ptr(), w.data_ptr(), fused.data_ptr(),
+                                     scale.data_ptr(), rows, dim, 1e-6,
+                                     torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        # the two passes the fused form replaces, over the same input
+        normed = torch.empty(rows, dim, device="cuda", dtype=torch.bfloat16)
+        fvk.gemma3_rms_norm_bf16(x.data_ptr(), dim, w.data_ptr(), normed.data_ptr(), dim,
+                                 0, dim, rows, rows, 0, dim, 1e-6,
+                                 torch.cuda.current_stream().cuda_stream)
+        ref = torch.zeros_like(fused)
+        fvk.quantize_fp8_static(normed.reshape(-1).data_ptr(), ref.reshape(-1).data_ptr(),
+                                scale.data_ptr(), rows * dim,
+                                torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        nd = int((fused.view(torch.uint8) != ref.view(torch.uint8)).sum().item())
+        assert nd == 0, f"{nd} of {fused.numel()} bytes differ from the two-pass form"
+
+    def test_the_scale_is_actually_applied(self):
+        """A kernel that skipped the division would still pass a cosine check."""
+        fvk = _fvk()
+        torch.manual_seed(10)
+        rows, dim = 16, 512
+        x = _bf16(torch.randn(rows, dim, device="cuda") * 2)
+        w = _bf16(torch.randn(dim, device="cuda") * 0.3)
+        a = torch.tensor([0.02], device="cuda", dtype=torch.float32)
+        b = torch.tensor([0.5], device="cuda", dtype=torch.float32)
+        oa = torch.zeros(rows, dim, device="cuda", dtype=torch.float8_e4m3fn)
+        ob = torch.zeros_like(oa)
+        for scale, out in ((a, oa), (b, ob)):
+            fvk.gemma3_rms_norm_fp8_bf16(x.data_ptr(), w.data_ptr(), out.data_ptr(),
+                                         scale.data_ptr(), rows, dim, 1e-6,
+                                         torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        assert not torch.equal(oa.view(torch.uint8), ob.view(torch.uint8))
+
+    def test_rejects_an_unaligned_width(self):
+        fvk = _fvk()
+        x = _bf16(torch.zeros(2, 100, device="cuda"))
+        w = _bf16(torch.zeros(100, device="cuda"))
+        out = torch.zeros(2, 100, device="cuda", dtype=torch.float8_e4m3fn)
+        scale = torch.tensor([0.02], device="cuda", dtype=torch.float32)
+        with pytest.raises(RuntimeError, match="multiple of 8"):
+            fvk.gemma3_rms_norm_fp8_bf16(x.data_ptr(), w.data_ptr(), out.data_ptr(),
+                                         scale.data_ptr(), 2, 100, 1e-6,
+                                         torch.cuda.current_stream().cuda_stream)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

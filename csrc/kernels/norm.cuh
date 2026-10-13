@@ -231,3 +231,15 @@ void gemma3_rms_norm_bf16(const __nv_bfloat16* x, long long x_stride,
                           __nv_bfloat16* residual, long long res_stride,
                           int rows, int rows_per_group, long long group_stride,
                           int dim, float eps, cudaStream_t stream = 0);
+
+// The same norm, written straight out as a static per-tensor FP8 (e4m3) GEMM
+// input: round to bf16, then clamp(x / a_scale) to e4m3, i.e. byte-identical to
+// a standalone quantize_fp8_static over the bf16 norm output. One block per
+// row, dim / 8 threads; dim must be a multiple of 8.
+//
+// This uses a different summation order from gemma3_rms_norm_bf16 (the
+// vectorized form's block reduction rather than the strided loop), so the two
+// are not bit-comparable with each other.
+void gemma3_rms_norm_fp8_bf16(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                              __nv_fp8_e4m3* out, const float* a_scale,
+                              int rows, int dim, float eps, cudaStream_t stream = 0);

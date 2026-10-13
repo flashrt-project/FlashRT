@@ -903,6 +903,21 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         "Rows may be strided; a non-zero residual is updated with HF's two roundings. "
         "Pass out = 0 or residual = 0 to skip one of the two stores.");
 
+    m.def("gemma3_rms_norm_fp8_bf16",
+        [](uintptr_t x, uintptr_t weight, uintptr_t out, uintptr_t a_scale,
+           int rows, int dim, float eps, uintptr_t stream) {
+            gemma3_rms_norm_fp8_bf16(typed_ptr<__nv_bfloat16>(x),
+                                     typed_ptr<__nv_bfloat16>(weight),
+                                     typed_ptr<__nv_fp8_e4m3>(out),
+                                     reinterpret_cast<const float*>(a_scale),
+                                     rows, dim, eps, to_stream(stream));
+        },
+        py::arg("x"), py::arg("weight"), py::arg("out"), py::arg("a_scale"),
+        py::arg("rows"), py::arg("dim"), py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "Gemma3 RMSNorm writing a static per-tensor FP8 (e4m3) GEMM input directly. "
+        "Byte-identical to quantize_fp8_static over the bf16 norm output, so the "
+        "bf16 intermediate never has to be written. dim must be a multiple of 8.");
+
     m.def("bias_rms_norm_bf16", [](uintptr_t x, uintptr_t bias, uintptr_t weight,
                                     uintptr_t out, int seq_len, int dim,
                                     float eps, uintptr_t stream) {
