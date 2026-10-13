@@ -23,9 +23,6 @@ namespace flash_rt {
 namespace dm05 {
 namespace {
 
-using flash_rt::dm05::dm05_cp16;
-using flash_rt::dm05::dm05_mma_bf16_16816;
-
 constexpr int AHD = 256;   // head_dim
 constexpr int KC = 32;     // keys per pipeline chunk
 constexpr int QS = AHD + 8;

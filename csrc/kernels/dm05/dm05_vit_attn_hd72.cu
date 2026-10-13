@@ -23,13 +23,6 @@ namespace flash_rt {
 namespace dm05 {
 namespace {
 
-using flash_rt::dm05::dm05_cp16;
-using flash_rt::dm05::dm05_exp2;
-using flash_rt::dm05::dm05_mma_bf16_16816;
-using flash_rt::dm05::dm05_mma_bf16_1688;
-using flash_rt::dm05::dm05_mul;
-using flash_rt::dm05::dm05_rcp;
-
 // head_dim 72, padded to KP = 88 so a row of the K/V tile holds nine 8-wide
 // 16-byte groups and stays 16-byte aligned for the ldmatrix loads below.
 constexpr int HD = 72;
