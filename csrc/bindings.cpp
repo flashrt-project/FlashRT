@@ -1180,6 +1180,19 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("qkv"), py::arg("Q"), py::arg("K"), py::arg("V"),
        py::arg("seq"), py::arg("q_dim"), py::arg("k_dim"), py::arg("v_dim"), py::arg("stream") = 0);
 
+    m.def("rope_hf_bf16",
+        [](uintptr_t x, long long row_stride, int heads, int dim,
+           uintptr_t cos_tab, uintptr_t sin_tab, int seq, uintptr_t stream) {
+            rope_hf_bf16(typed_ptr<__nv_bfloat16>(x), row_stride, heads, dim,
+                         typed_ptr<__nv_bfloat16>(cos_tab), typed_ptr<__nv_bfloat16>(sin_tab),
+                         seq, to_stream(stream));
+        },
+        py::arg("x"), py::arg("row_stride"), py::arg("heads"), py::arg("dim"),
+        py::arg("cos_table"), py::arg("sin_table"), py::arg("seq"), py::arg("stream") = 0,
+        "HuggingFace rotate_half RoPE in place, with HF's intermediate bf16 roundings "
+        "on each product and full-width [seq, dim] cos/sin tables. Rows may be strided "
+        "so per-head slices of a fused QKV buffer rotate in place.");
+
     m.def("qkv_split_rope", [](uintptr_t qkv, uintptr_t rope_weights,
                                  uintptr_t Q, uintptr_t K, uintptr_t V,
                                  int seq, int q_dim, int k_dim, int v_dim,
