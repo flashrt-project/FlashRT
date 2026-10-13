@@ -918,6 +918,18 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         "Byte-identical to quantize_fp8_static over the bf16 norm output, so the "
         "bf16 intermediate never has to be written. dim must be a multiple of 8.");
 
+    m.def("ada_rms_norm",
+        [](uintptr_t x, uintptr_t mod, uintptr_t out, int rows, int dim,
+           float eps, uintptr_t stream) {
+            ada_rms_norm(typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(mod),
+                         typed_ptr<__nv_bfloat16>(out), rows, dim, eps, to_stream(stream));
+        },
+        py::arg("x"), py::arg("mod"), py::arg("out"), py::arg("rows"), py::arg("dim"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "Adaptive RMSNorm with one modulation shared by every row: mod is a 2*dim "
+        "bfloat16 vector, scale at [0,dim) and shift at [dim,2*dim). No weight and "
+        "no gate output; ada_rms_norm_style is the per-row styled variant.");
+
     m.def("bias_rms_norm_bf16", [](uintptr_t x, uintptr_t bias, uintptr_t weight,
                                     uintptr_t out, int seq_len, int dim,
                                     float eps, uintptr_t stream) {

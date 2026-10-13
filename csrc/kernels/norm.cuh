@@ -243,3 +243,15 @@ void gemma3_rms_norm_bf16(const __nv_bfloat16* x, long long x_stride,
 void gemma3_rms_norm_fp8_bf16(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                               __nv_fp8_e4m3* out, const float* a_scale,
                               int rows, int dim, float eps, cudaStream_t stream = 0);
+
+// ── Adaptive RMSNorm with one modulation shared by every row ──
+// y = bf16( bf16(x) * rsqrt(mean(fp32(x)^2) + eps) * (1 + scale) + shift ),
+// where `mod` is one 2*dim bf16 vector for all rows: scale at mod[0:dim],
+// shift at mod[dim:2*dim]. No weight and no gate output.
+//
+// Distinct from ada_rms_norm_style, which takes a per-row 3*dim style, applies
+// a per-channel weight and writes a gate; the two also reduce the sum of
+// squares in a different order.
+void ada_rms_norm(const __nv_bfloat16* x, const __nv_bfloat16* mod,
+                  __nv_bfloat16* out, int rows, int dim, float eps,
+                  cudaStream_t stream = 0);

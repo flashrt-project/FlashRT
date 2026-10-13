@@ -319,5 +319,63 @@ class TestGemma3RmsNormFp8:
                                          torch.cuda.current_stream().cuda_stream)
 
 
+# ── Adaptive RMSNorm with a shared modulation ────────────────────────────────
+
+class TestAdaRmsNorm:
+    """y = bf16( bf16(x) * rsqrt(mean(x^2) + eps) * (1 + scale) + shift ).
+
+    One (scale, shift) pair for every row, no weight, no gate output -- the
+    contract ada_rms_norm_style does not cover.
+    """
+
+    @pytest.mark.parametrize("rows,dim", [(10, 1024), (3, 256), (1, 4096), (50, 512)])
+    def test_matches_the_documented_form(self, rows, dim):
+        fvk = _fvk()
+        torch.manual_seed(11)
+        x = _bf16(torch.randn(rows, dim, device="cuda") * 2)
+        mod = _bf16(torch.randn(2 * dim, device="cuda") * 0.5)
+        out = torch.empty(rows, dim, device="cuda", dtype=torch.bfloat16)
+        fvk.ada_rms_norm(x.data_ptr(), mod.data_ptr(), out.data_ptr(), rows, dim, 1e-6,
+                         torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        xf = x.float()
+        inv = torch.rsqrt((xf * xf).mean(-1, keepdim=True) + 1e-6)
+        ref = _bf16(xf * inv * (1.0 + mod[:dim].float()) + mod[dim:].float())
+        assert (out != ref).float().mean().item() <= _MISMATCH_FRAC
+
+    def test_the_one_plus_scale_form_is_not_a_plain_scale(self):
+        """A kernel using scale instead of (1 + scale) must fail this."""
+        fvk = _fvk()
+        torch.manual_seed(12)
+        rows, dim = 4, 512
+        x = _bf16(torch.randn(rows, dim, device="cuda") * 2)
+        mod = _bf16(torch.randn(2 * dim, device="cuda") * 0.5)
+        out = torch.empty(rows, dim, device="cuda", dtype=torch.bfloat16)
+        fvk.ada_rms_norm(x.data_ptr(), mod.data_ptr(), out.data_ptr(), rows, dim, 1e-6,
+                         torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        xf = x.float()
+        inv = torch.rsqrt((xf * xf).mean(-1, keepdim=True) + 1e-6)
+        plain = _bf16(xf * inv * mod[:dim].float() + mod[dim:].float())
+        assert (out != plain).float().mean().item() > 0.5
+
+    def test_the_shift_half_is_read(self):
+        """A kernel reading only the scale half would ignore mod[dim:]."""
+        fvk = _fvk()
+        torch.manual_seed(13)
+        rows, dim = 4, 256
+        x = _bf16(torch.randn(rows, dim, device="cuda") * 2)
+        mod_a = _bf16(torch.randn(2 * dim, device="cuda") * 0.5)
+        mod_b = mod_a.clone()
+        mod_b[dim:] = _bf16(torch.randn(dim, device="cuda") * 0.5)
+        oa = torch.empty(rows, dim, device="cuda", dtype=torch.bfloat16)
+        ob = torch.empty_like(oa)
+        for m, o in ((mod_a, oa), (mod_b, ob)):
+            fvk.ada_rms_norm(x.data_ptr(), m.data_ptr(), o.data_ptr(), rows, dim, 1e-6,
+                             torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        assert not torch.equal(oa, ob)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

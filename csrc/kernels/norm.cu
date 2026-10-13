@@ -1703,15 +1703,15 @@ void gemma3_rms_norm_bf16(const __nv_bfloat16* x, long long x_stride,
         rows_per_group, group_stride, dim, eps);
 }
 
-// The vectorized Gemma3 form's reduction: 8 columns per thread, one value per
+// The vectorized form's block reduction: 8 columns per thread, one value per
 // thread, reduced warp-first and then across warps through shared memory.
 //
-// This is a different summation order from gemma3_rms_norm_kernel's strided
+// This is a different summation order from the strided-loop kernels'
 // loop above, so the two can disagree in the last fp32 ulp of the sum of
 // squares and a bf16 result can land either side of a rounding boundary. A
 // caller that has to reproduce one of them bit for bit has to use that one;
 // gemma3_rms_norm_bf16 deliberately implements the strided order.
-__device__ __forceinline__ float gemma3_block_sum(float v) {
+__device__ __forceinline__ float v8_block_sum(float v) {
     __shared__ float red[32];
     for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     __syncthreads();
@@ -1750,7 +1750,7 @@ __global__ void gemma3_rms_norm_fp8_kernel(const __nv_bfloat16* __restrict__ x,
         f[j] = __bfloat162float(xv.h[j]);
         ss += f[j] * f[j];
     }
-    const float inv = rsqrtf(gemma3_block_sum(ss) / (float)dim + eps);
+    const float inv = rsqrtf(v8_block_sum(ss) / (float)dim + eps);
     const float qi = 1.0f / a_scale[0];
     __align__(8) __nv_fp8_e4m3 o[8];
 #pragma unroll
@@ -1768,4 +1768,46 @@ void gemma3_rms_norm_fp8_bf16(const __nv_bfloat16* x, const __nv_bfloat16* weigh
     if (dim % 8 != 0)
         throw std::runtime_error("gemma3_rms_norm_fp8_bf16: dim must be a multiple of 8");
     gemma3_rms_norm_fp8_kernel<<<rows, dim / 8, 0, stream>>>(x, weight, a_scale, out, dim, eps);
+}
+
+// ── Adaptive RMSNorm with one modulation shared by every row ──
+//   y = bf16( bf16(x) * rsqrt(mean(fp32(x)^2) + eps) * (1 + scale) + shift )
+//
+// `mod` is a single 2*dim bf16 vector held for all rows: scale in mod[0:dim],
+// shift in mod[dim:2*dim]. The product of x and the inverse RMS is carried in
+// fp32 without an intermediate round; only the final sum is rounded.
+//
+// This is not ada_rms_norm_style. That one takes a per-row style of 3*dim
+// (scale, shift, gate), applies a per-channel weight, and writes a gate output.
+// Here the modulation is one shared pair, there is no weight -- the reference
+// does not use one on this path -- and there is no gate. A caller holding a
+// shared modulation cannot reach the styled kernel without materialising a
+// per-row style, and the two also reduce the sum of squares in a different
+// order, so this is the entry for that case rather than a second spelling of
+// the other.
+__global__ void ada_rms_norm_kernel(const __nv_bfloat16* __restrict__ x,
+                                    const __nv_bfloat16* __restrict__ mod,
+                                    __nv_bfloat16* __restrict__ out,
+                                    int dim, float eps) {
+    const __nv_bfloat16* xr = x + (long long)blockIdx.x * dim;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        const float v = __bfloat162float(xr[i]);
+        ss += v * v;
+    }
+    const float inv = rsqrtf(v8_block_sum(ss) / (float)dim + eps);
+    __nv_bfloat16* orow = out + (long long)blockIdx.x * dim;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        const float n = __bfloat162float(xr[i]) * inv;
+        const float sc = __bfloat162float(mod[i]), sh = __bfloat162float(mod[dim + i]);
+        orow[i] = __float2bfloat16(n * (1.0f + sc) + sh);
+    }
+}
+
+void ada_rms_norm(const __nv_bfloat16* x, const __nv_bfloat16* mod,
+                  __nv_bfloat16* out, int rows, int dim, float eps,
+                  cudaStream_t stream) {
+    if (rows <= 0 || dim <= 0) return;
+    const int threads = dim >= 1024 ? 1024 : (dim >= 256 ? 256 : 128);
+    ada_rms_norm_kernel<<<rows, threads, 0, stream>>>(x, mod, out, dim, eps);
 }
