@@ -22,3 +22,10 @@ void patch_im2col_uint8(const uint8_t* input, const half* lut, half* output,
 void patch_embed_bias_pos(half* output, const half* bias, const half* pos_emb,
                           int S, int D, int S_per_view,
                           cudaStream_t stream = 0);
+
+// bf16 NCHW patch im2col with a parametrised patch size:
+//   in  (nv, C, H, W) bf16 planar -> out (nv * gh * gw, C * P * P) bf16
+// Column order is (c, kh, kw), i.e. conv.weight.reshape(out_ch, C*P*P), and
+// patches are numbered row-major. H and W must be multiples of P.
+void patch_im2col_nchw_bf16(const __nv_bfloat16* input, __nv_bfloat16* output,
+                            int nv, int C, int H, int W, int P, cudaStream_t stream = 0);

@@ -5,6 +5,8 @@
 // ================================================================
 #pragma once
 
+#include <cstdint>
+
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -253,6 +255,16 @@ void gemma3_rms_norm_bf16(const __nv_bfloat16* x, long long x_stride,
 void gemma3_norm_gate_residual_v8_bf16(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                                        const __nv_bfloat16* gate, __nv_bfloat16* residual,
                                        int rows, int dim, float eps, cudaStream_t stream = 0);
+
+// Gemma3 RMSNorm written straight into a clipped static NVFP4 GEMM input:
+// e2m1 per 16-element group with UE4M3 block scales in the CUTLASS sm120
+// swizzled layout, the group amax clamped to cap (null or <= 0 disables the
+// clip). Same encoding as quantize_bf16_to_nvfp4_swizzled_clipped. dim must be
+// a multiple of 16 with dim/8 <= 1024.
+void gemma3_rms_norm_nvfp4_swizzled(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                                    const float* cap, uint8_t* packed, uint8_t* sf_swz,
+                                    int rows, int dim, float eps, cudaStream_t stream = 0);
+long long gemma3_rms_norm_nvfp4_sf_bytes(int rows, int dim);
 
 void gemma3_rms_norm_v8_bf16(const __nv_bfloat16* x, long long x_stride,
                              const __nv_bfloat16* weight,

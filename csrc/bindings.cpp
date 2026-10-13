@@ -994,6 +994,35 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         "rescale and normalize to bf16: (nv, H, W, 3) uint8 HWC in, (nv, 3, OH, OW) "
         "bf16 CHW out, with (x - 127.5) / 127.5.");
 
+    m.def("patch_im2col_nchw_bf16",
+        [](uintptr_t in, uintptr_t out, int nv, int C, int H, int W, int P, uintptr_t stream) {
+            patch_im2col_nchw_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(in),
+                reinterpret_cast<__nv_bfloat16*>(out), nv, C, H, W, P, to_stream(stream));
+        },
+        py::arg("input"), py::arg("output"), py::arg("nv"), py::arg("C"),
+        py::arg("H"), py::arg("W"), py::arg("P"), py::arg("stream") = 0,
+        "bf16 NCHW patch im2col: (nv, C, H, W) to (nv*gh*gw, C*P*P), column order "
+        "(c, kh, kw) to match conv.weight.reshape(out_ch, C*P*P), patches row-major. "
+        "H and W must be multiples of P.");
+
+    m.def("gemma3_rms_norm_nvfp4_swizzled",
+        [](uintptr_t x, uintptr_t weight, uintptr_t cap, uintptr_t packed, uintptr_t sf,
+           int rows, int dim, float eps, uintptr_t stream) {
+            gemma3_rms_norm_nvfp4_swizzled(
+                typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(weight),
+                cap ? reinterpret_cast<const float*>(cap) : nullptr,
+                reinterpret_cast<uint8_t*>(packed), reinterpret_cast<uint8_t*>(sf),
+                rows, dim, eps, to_stream(stream));
+        },
+        py::arg("x"), py::arg("weight"), py::arg("cap"), py::arg("packed"), py::arg("sf"),
+        py::arg("rows"), py::arg("dim"), py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "Gemma3 RMSNorm written straight into a clipped static NVFP4 GEMM input: "
+        "e2m1 per 16-element group, UE4M3 swizzled block scales, per-group clip from "
+        "cap (0 disables). dim must be a multiple of 16 with dim/8 <= 1024.");
+    m.def("gemma3_rms_norm_nvfp4_sf_bytes", &gemma3_rms_norm_nvfp4_sf_bytes,
+        py::arg("rows"), py::arg("dim"), "Bytes to allocate for the scale factors.");
+
     m.def("gelu_mul_bf16",
         [](uintptr_t gate, uintptr_t up, uintptr_t out, long long n, uintptr_t stream) {
             flash_rt::kernels::gelu_mul_bf16(

@@ -6,6 +6,7 @@
 
 #include "norm.cuh"
 #include "common.cuh"
+#include <cuda_fp8.h>
 #include <stdexcept>
 
 // ── RMSNorm ──
@@ -1919,6 +1920,119 @@ void gemma3_norm_gate_residual_v8_bf16(const __nv_bfloat16* x, const __nv_bfloat
     if (dim % 8 != 0)
         throw std::runtime_error("gemma3_norm_gate_residual_v8_bf16: dim must be a multiple of 8");
     gemma3_norm_gate_residual_v8_kernel<<<rows, dim / 8, 0, stream>>>(x, weight, gate, residual, dim, eps);
+}
+
+// The conversions below match quantize.cu's; the fused form has to write the
+// same scale factors and packed bytes as the unfused chain it replaces.
+__device__ __forceinline__ uint8_t gemma3_fp4_e2m1(float v) {
+    const float a = fabsf(v);
+    const uint8_t sign = (v < 0.0f) ? 0x8u : 0x0u;
+    return sign | (uint8_t)((a >= 0.25f) + (a >= 0.75f) + (a >= 1.25f) + (a >= 1.75f) +
+                            (a >= 2.5f) + (a >= 3.5f) + (a >= 5.0f));
+}
+
+__device__ __forceinline__ uint8_t gemma3_ue4m3_ceil(float v) {
+    if (v <= 0.0f) return 0;
+    if (v > 240.0f) return 0xFE;
+    const uint32_t bits = __float_as_uint(v);
+    const int float_exp = ((bits >> 23) & 0xFF) - 127;
+    const uint32_t frac = bits & 0x7FFFFF;
+    int ue_exp = float_exp + 7;
+    if (ue_exp <= 0) {
+        int m = (int)ceilf(v * 512.0f);
+        if (m > 7) return (1 << 3) | 0;
+        if (m < 1) m = 1;
+        return (uint8_t)m;
+    }
+    if (ue_exp >= 15) return 0xFE;
+    int m = (int)(frac >> 20);
+    if (frac & 0xFFFFF) m++;
+    if (m >= 8) { m = 0; ue_exp++; }
+    if (ue_exp >= 15) return 0xFE;
+    return (uint8_t)((ue_exp << 3) | m);
+}
+
+__device__ __forceinline__ float gemma3_ue4m3_to_float(uint8_t v) {
+    const int e = (v >> 3) & 0xF, m = v & 0x7;
+    if (e == 0) return ldexpf((float)m / 8.0f, -6);
+    return ldexpf(1.0f + (float)m / 8.0f, e - 7);
+}
+
+// Gemma3 RMSNorm whose bf16 result is written straight into a clipped static
+// NVFP4 GEMM input: e2m1 values per 16-element group with a UE4M3 block scale
+// in the CUTLASS sm120 swizzled layout, the group's amax clamped to `cap`
+// before the scale is formed.
+//
+// Same encoding as quantize_bf16_to_nvfp4_swizzled_clipped, so this equals that
+// quantizer run over the bf16 norm output. Two adjacent threads own one
+// 16-element group: each takes the amax of its 8 columns, they exchange it, and
+// the even thread writes the shared scale factor. One block per row,
+// dim / 8 threads; dim must be a multiple of 16 and at most 8192, and the block
+// must have at least 32 threads for the pair exchange to be defined.
+__global__ void gemma3_rms_norm_nvfp4_kernel(const __nv_bfloat16* __restrict__ x,
+                                             const __nv_bfloat16* __restrict__ w,
+                                             const float* __restrict__ cap,
+                                             uint8_t* __restrict__ q,
+                                             uint8_t* __restrict__ sf,
+                                             int dim, float eps) {
+    union Gemma3Nv { uint4 u; __nv_bfloat16 h[8]; };
+    const int row = blockIdx.x;
+    const int nb = dim / 16, ncb = (nb + 3) / 4;
+    const long long base = (long long)row * dim + threadIdx.x * 8;
+    Gemma3Nv xv, wv;
+    xv.u = *reinterpret_cast<const uint4*>(x + base);
+    wv.u = *reinterpret_cast<const uint4*>(w + threadIdx.x * 8);
+    float f[8], ss = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        f[j] = __bfloat162float(xv.h[j]);
+        ss += f[j] * f[j];
+    }
+    const float inv = rsqrtf(v8_block_sum(ss) / (float)dim + eps);
+    float y[8], a = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        y[j] = __bfloat162float(__float2bfloat16(f[j] * inv * (1.0f + __bfloat162float(wv.h[j]))));
+        a = fmaxf(a, fabsf(y[j]));
+    }
+    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 1));
+    const int b = threadIdx.x >> 1;
+    float amax = a;
+    const float clip = cap ? cap[b] : 0.0f;
+    if (clip > 0.0f && isfinite(clip)) amax = fminf(amax, clip);
+    const uint8_t ue = gemma3_ue4m3_ceil(amax / 6.0f);
+    const int rb = row / 128, ri = row % 128;
+    if ((threadIdx.x & 1) == 0)
+        sf[(rb * ncb + b / 4) * 512 + (ri % 32) * 16 + (ri / 32) * 4 + b % 4] = ue;
+    const float scale = gemma3_ue4m3_to_float(ue);
+    const float invs = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+    uint32_t r = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const uint8_t lo = gemma3_fp4_e2m1(y[2 * j] * invs);
+        const uint8_t hi = gemma3_fp4_e2m1(y[2 * j + 1] * invs);
+        r |= (uint32_t)(((hi << 4) | (lo & 0x0F)) & 0xFF) << (8 * j);
+    }
+    reinterpret_cast<uint32_t*>(q + (long long)row * (dim / 2))[threadIdx.x] = r;
+}
+
+// Bytes the caller must allocate for the scale factors.
+long long gemma3_rms_norm_nvfp4_sf_bytes(int rows, int dim) {
+    if (rows <= 0 || dim <= 0) return 0;
+    return (long long)((rows + 127) / 128) * (((dim / 16) + 3) / 4) * 512;
+}
+
+void gemma3_rms_norm_nvfp4_swizzled(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                                    const float* cap, uint8_t* packed, uint8_t* sf_swz,
+                                    int rows, int dim, float eps, cudaStream_t stream) {
+    if (rows <= 0 || dim <= 0) return;
+    if (!x || !weight || !packed || !sf_swz)
+        throw std::runtime_error("gemma3_rms_norm_nvfp4_swizzled: null pointer argument");
+    if (dim % 16 != 0)
+        throw std::runtime_error("gemma3_rms_norm_nvfp4_swizzled: dim must be a multiple of 16");
+    if (dim / 8 > 1024)
+        throw std::runtime_error("gemma3_rms_norm_nvfp4_swizzled: dim / 8 must not exceed 1024");
+    gemma3_rms_norm_nvfp4_kernel<<<rows, dim / 8, 0, stream>>>(x, weight, cap, packed, sf_swz, dim, eps);
 }
 
 void gemma3_rms_norm_v8_bf16(const __nv_bfloat16* x, long long x_stride,

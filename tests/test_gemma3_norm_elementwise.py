@@ -618,5 +618,91 @@ class TestGemma3NormGateResidualV8:
                                                   torch.cuda.current_stream().cuda_stream)
 
 
+# ── Gemma3 RMSNorm into a clipped static NVFP4 input ─────────────────────────
+
+class TestGemma3RmsNormNvfp4:
+    """The norm's bf16 result written straight as a clipped NVFP4 GEMM input.
+
+    Contract: equals quantize_bf16_to_nvfp4_swizzled_clipped run over the bf16
+    output of gemma3_rms_norm_v8_bf16. The encoding is shared, so what this pins
+    is that the norm half and the group amax are the ones that quantizer would
+    have seen.
+    """
+
+    def _outs(self, fvk, rows, dim, cap_mode, seed=0):
+        torch.manual_seed(seed)
+        x = _bf16(torch.randn(rows, dim, device="cuda") * 2)
+        w = _bf16(torch.randn(dim, device="cuda") * 0.3)
+        nb = dim // 16
+        cap = (None if cap_mode == "null"
+               else (torch.rand(nb, device="cuda") * 2 + 0.1).to(torch.float32))
+        nsf = int(fvk.gemma3_rms_norm_nvfp4_sf_bytes(rows, dim))
+        packed = torch.zeros(rows, dim // 2, device="cuda", dtype=torch.uint8)
+        sf = torch.zeros(nsf, device="cuda", dtype=torch.uint8)
+        fvk.gemma3_rms_norm_nvfp4_swizzled(
+            x.data_ptr(), w.data_ptr(), 0 if cap is None else cap.data_ptr(),
+            packed.data_ptr(), sf.data_ptr(), rows, dim, 1e-6,
+            torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        return x, w, cap, packed, sf
+
+    @pytest.mark.parametrize("rows,dim", [(568, 256), (2048, 1024), (16, 4096), (300, 512)])
+    def test_matches_the_unfused_chain(self, rows, dim):
+        fvk = _fvk()
+        x, w, cap, packed, sf = self._outs(fvk, rows, dim, "clipped")
+        normed = torch.empty(rows, dim, device="cuda", dtype=torch.bfloat16)
+        fvk.gemma3_rms_norm_v8_bf16(x.data_ptr(), dim, w.data_ptr(), normed.data_ptr(), dim,
+                                    0, dim, rows, rows, 0, dim, 1e-6,
+                                    torch.cuda.current_stream().cuda_stream)
+        ref_packed = torch.zeros_like(packed)
+        ref_sf = torch.zeros_like(sf)
+        fvk.quantize_bf16_to_nvfp4_swizzled_clipped(
+            normed.data_ptr(), cap.data_ptr(), ref_packed.data_ptr(), ref_sf.data_ptr(),
+            rows, dim, torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        dp = int((packed != ref_packed).sum().item())
+        ds = int((sf != ref_sf).sum().item())
+        assert dp == 0, f"{dp} of {packed.numel()} packed bytes differ"
+        assert ds == 0, f"{ds} of {sf.numel()} scale bytes differ"
+
+    def test_the_clip_is_applied(self):
+        fvk = _fvk()
+        _, _, _, loose, _ = self._outs(fvk, 256, 512, "null", seed=5)
+        _, _, _, tight, _ = self._outs(fvk, 256, 512, "tight", seed=5)
+        assert not torch.equal(loose, tight), "a clip changed nothing"
+
+    def test_a_null_cap_is_no_clip(self):
+        fvk = _fvk()
+        rows, dim = 256, 512
+        nb = dim // 16
+        _, _, _, null_cap, _ = self._outs(fvk, rows, dim, "null", seed=6)
+        x, w, _, _, _ = self._outs(fvk, rows, dim, "null", seed=6)
+        zcap = torch.zeros(nb, device="cuda", dtype=torch.float32)
+        nsf = int(fvk.gemma3_rms_norm_nvfp4_sf_bytes(rows, dim))
+        packed = torch.zeros(rows, dim // 2, device="cuda", dtype=torch.uint8)
+        sf = torch.zeros(nsf, device="cuda", dtype=torch.uint8)
+        fvk.gemma3_rms_norm_nvfp4_swizzled(
+            x.data_ptr(), w.data_ptr(), zcap.data_ptr(), packed.data_ptr(), sf.data_ptr(),
+            rows, dim, 1e-6, torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        assert torch.equal(packed, null_cap)
+
+    def test_guards(self):
+        fvk = _fvk()
+        x = _bf16(torch.zeros(4, 64, device="cuda"))
+        w = _bf16(torch.zeros(64, device="cuda"))
+        packed = torch.zeros(4, 32, device="cuda", dtype=torch.uint8)
+        sf = torch.zeros(512, device="cuda", dtype=torch.uint8)
+        with pytest.raises(RuntimeError, match="multiple of 16"):
+            fvk.gemma3_rms_norm_nvfp4_swizzled(x.data_ptr(), w.data_ptr(), 0,
+                                               packed.data_ptr(), sf.data_ptr(), 4, 56, 1e-6,
+                                               torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        with pytest.raises(RuntimeError, match="null pointer"):
+            fvk.gemma3_rms_norm_nvfp4_swizzled(0, w.data_ptr(), 0, packed.data_ptr(),
+                                               sf.data_ptr(), 4, 64, 1e-6,
+                                               torch.cuda.current_stream().cuda_stream)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
