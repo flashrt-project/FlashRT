@@ -96,9 +96,11 @@ void embedding_lookup_merge_bf16(
   // dereference, not a no-op: fail on the host rather than launch a kernel that
   // takes an illegal memory access and poisons the context for everything
   // after it.
+  // An empty call is a no-op and needs no pointers: a zero-element tensor can
+  // legitimately report a null data_ptr, so the null check has to come second.
+  if (rows <= 0 || hidden <= 0) return;
   if (!token_ids || !img_index || !embed || !img || !out)
     throw std::runtime_error("embedding_lookup_merge_bf16: null pointer argument");
-  if (rows <= 0 || hidden <= 0) return;
   const dim3 block(kThreads);
   const dim3 grid((hidden + kThreads - 1) / kThreads, rows);
   embedding_lookup_merge_bf16_kernel<<<grid, block, 0, stream>>>(

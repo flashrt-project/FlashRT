@@ -1675,6 +1675,7 @@ endif()
 pybind11_add_module(flash_rt_kernels
   csrc/gemm/gemm_runner.cu
   csrc/kernels/norm.cu
+  csrc/kernels/linear_f32.cu
   csrc/kernels/activation.cu
   csrc/kernels/rope.cu
   csrc/kernels/quantize.cu

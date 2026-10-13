@@ -918,6 +918,32 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         "Byte-identical to quantize_fp8_static over the bf16 norm output, so the "
         "bf16 intermediate never has to be written. dim must be a multiple of 8.");
 
+    m.def("linear_f32_in_bf16_out",
+        [](uintptr_t x, uintptr_t W, uintptr_t b, uintptr_t out,
+           int rows, int N, int K, uintptr_t stream) {
+            flash_rt::kernels::linear_f32_in_bf16_out(
+                reinterpret_cast<const float*>(x), reinterpret_cast<const float*>(W),
+                reinterpret_cast<const float*>(b),
+                reinterpret_cast<__nv_bfloat16*>(out), rows, N, K, to_stream(stream));
+        },
+        py::arg("x"), py::arg("W"), py::arg("b"), py::arg("out"),
+        py::arg("rows"), py::arg("N"), py::arg("K"), py::arg("stream") = 0,
+        "out[t, n] = bf16(sum_k x[t, k] * W[n, k] + b[n]), x/W/b fp32 and W stored "
+        "(N, K). fp32 accumulate with no TF32; one thread per output element.");
+
+    m.def("linear_bf16_in_f32_out",
+        [](uintptr_t x, uintptr_t W, uintptr_t b, uintptr_t out,
+           int rows, int N, int K, uintptr_t stream) {
+            flash_rt::kernels::linear_bf16_in_f32_out(
+                reinterpret_cast<const __nv_bfloat16*>(x),
+                reinterpret_cast<const float*>(W), reinterpret_cast<const float*>(b),
+                reinterpret_cast<float*>(out), rows, N, K, to_stream(stream));
+        },
+        py::arg("x"), py::arg("W"), py::arg("b"), py::arg("out"),
+        py::arg("rows"), py::arg("N"), py::arg("K"), py::arg("stream") = 0,
+        "out[t, n] = sum_k fp32(x[t, k]) * W[n, k] + b[n], x bf16 and the output "
+        "fp32. fp32 accumulate with no TF32; one warp per output element.");
+
     m.def("ada_rms_norm",
         [](uintptr_t x, uintptr_t mod, uintptr_t out, int rows, int dim,
            float eps, uintptr_t stream) {
