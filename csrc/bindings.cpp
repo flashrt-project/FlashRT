@@ -935,6 +935,24 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         "are per-column, dim-wide. Three roundings, one per store; gate_mul_residual "
         "is not a substitute (it takes x directly with a single rounding).");
 
+    m.def("gemma3_norm_gate_residual_ada_v8_bf16",
+        [](uintptr_t x, uintptr_t weight, uintptr_t gate, uintptr_t residual,
+           uintptr_t mod, uintptr_t out, int rows, int dim, float eps, uintptr_t stream) {
+            gemma3_norm_gate_residual_ada_v8_bf16(
+                typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(weight),
+                typed_ptr<__nv_bfloat16>(gate), typed_ptr<__nv_bfloat16>(residual),
+                typed_ptr<__nv_bfloat16>(mod), typed_ptr<__nv_bfloat16>(out),
+                rows, dim, eps, to_stream(stream));
+        },
+        py::arg("x"), py::arg("weight"), py::arg("gate"), py::arg("residual"),
+        py::arg("mod"), py::arg("out"), py::arg("rows"), py::arg("dim"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "residual = bf16(residual + bf16(bf16(norm(x)) * gate)), then "
+        "out = bf16(residual * rsqrt(mean(residual^2) + eps) * (1 + mod[:dim]) + mod[dim:]), "
+        "8 columns per thread over dim / 8 threads. One kernel rather than the "
+        "gate-residual kernel plus ada_rms_norm: the reference reduces the second "
+        "mean with this kernel's block shape, and the standalone entry reduces it "
+        "in the strided order, which differs on a few elements in ten thousand.");
     m.def("gemma3_rms_norm_v8_bf16",
         [](uintptr_t x, long long x_stride, uintptr_t weight,
            uintptr_t out, long long out_stride, uintptr_t residual, long long res_stride,

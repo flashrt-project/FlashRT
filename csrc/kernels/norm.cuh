@@ -252,6 +252,15 @@ void gemma3_rms_norm_bf16(const __nv_bfloat16* x, long long x_stride,
 // which takes x directly with a single rounding and has no norm. Contiguous
 // rows, one block per row; dim must be a multiple of 8. `w` and `gate` are
 // per-column (dim-wide, shared by every row); `x` and `residual` are (rows, dim).
+// gemma3_norm_gate_residual_v8_bf16 followed by an adaLN modulation of the
+// updated residual, in one pass. `mod` is 2*dim (scale | shift); the gate is a
+// separate argument. Fused because the reference computes the tail's own
+// RMSNorm with the first half's reduction and block shape.
+void gemma3_norm_gate_residual_ada_v8_bf16(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                                           const __nv_bfloat16* gate, __nv_bfloat16* residual,
+                                           const __nv_bfloat16* mod, __nv_bfloat16* out,
+                                           int rows, int dim, float eps, cudaStream_t stream = 0);
+
 void gemma3_norm_gate_residual_v8_bf16(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                                        const __nv_bfloat16* gate, __nv_bfloat16* residual,
                                        int rows, int dim, float eps, cudaStream_t stream = 0);

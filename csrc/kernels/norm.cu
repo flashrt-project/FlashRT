@@ -1674,7 +1674,7 @@ __global__ void gemma3_rms_norm_kernel(const __nv_bfloat16* __restrict__ x, long
         if (threadIdx.x == 0) red[0] = t;
     }
     __syncthreads();
-    const float inv = rsqrtf(red[0] / (float)dim + eps);
+    const float inv = rsqrtf(__fdiv_rn(red[0], (float)dim) + eps);
     const long long base_o = (long long)(r / rows_per_group) * group_stride +
                              (long long)(r % rows_per_group) * out_stride;
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
@@ -1712,6 +1712,14 @@ void gemma3_rms_norm_bf16(const __nv_bfloat16* x, long long x_stride,
 // squares and a bf16 result can land either side of a rounding boundary. A
 // caller that has to reproduce one of them bit for bit has to use that one;
 // gemma3_rms_norm_bf16 deliberately implements the strided order.
+// NOTE for every kernel below that reproduces a reference build's arithmetic:
+// this target compiles with --prec-div=false, where `a / b` is an approximate
+// division, while the DM05 extension is compiled with nvcc's defaults, where it
+// is correctly rounded. The two agree exactly when the divisor is a power of two
+// and can differ by an ulp otherwise -- enough to push a few elements per
+// million across a bf16 rounding boundary. Every division that feeds an `inv`
+// is therefore written as __fdiv_rn, which pins the reference's semantics
+// regardless of this target's flags.
 __device__ __forceinline__ float v8_block_sum(float v) {
     __shared__ float red[32];
     for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
@@ -1751,7 +1759,7 @@ __global__ void gemma3_rms_norm_fp8_kernel(const __nv_bfloat16* __restrict__ x,
         f[j] = __bfloat162float(xv.h[j]);
         ss += f[j] * f[j];
     }
-    const float inv = rsqrtf(v8_block_sum(ss) / (float)dim + eps);
+    const float inv = rsqrtf(__fdiv_rn(v8_block_sum(ss), (float)dim) + eps);
     const float qi = 1.0f / a_scale[0];
     __align__(8) __nv_fp8_e4m3 o[8];
 #pragma unroll
@@ -1796,7 +1804,7 @@ __global__ void ada_rms_norm_kernel(const __nv_bfloat16* __restrict__ x,
         const float v = __bfloat162float(xr[i]);
         ss += v * v;
     }
-    const float inv = rsqrtf(v8_block_sum(ss) / (float)dim + eps);
+    const float inv = rsqrtf(__fdiv_rn(v8_block_sum(ss), (float)dim) + eps);
     __nv_bfloat16* orow = out + (long long)blockIdx.x * dim;
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
         const float n = __bfloat162float(xr[i]) * inv;
@@ -1836,7 +1844,7 @@ __global__ void gemma3_rms_norm_v8_kernel(const __nv_bfloat16* __restrict__ x, l
         f[j] = __bfloat162float(xv.h[j]);
         ss += f[j] * f[j];
     }
-    const float inv = rsqrtf(v8_block_sum(ss) / (float)dim + eps);
+    const float inv = rsqrtf(__fdiv_rn(v8_block_sum(ss), (float)dim) + eps);
     Gemma3V8N yv;
 #pragma unroll
     for (int j = 0; j < 8; ++j)
@@ -1901,7 +1909,7 @@ __global__ void gemma3_norm_gate_residual_v8_kernel(const __nv_bfloat16* __restr
         f[j] = __bfloat162float(xv.h[j]);
         ss += f[j] * f[j];
     }
-    const float inv = rsqrtf(v8_block_sum(ss) / (float)dim + eps);
+    const float inv = rsqrtf(__fdiv_rn(v8_block_sum(ss), (float)dim) + eps);
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
         const float y = __bfloat162float(__float2bfloat16(f[j] * inv * (1.0f + __bfloat162float(wv.h[j]))));
@@ -1909,6 +1917,76 @@ __global__ void gemma3_norm_gate_residual_v8_kernel(const __nv_bfloat16* __restr
         rv.h[j] = __float2bfloat16(__bfloat162float(rv.h[j]) + t);
     }
     *reinterpret_cast<uint4*>(residual + base) = rv.u;
+}
+
+// Gemma3 gate + residual + adaLN norm, fused, bf16 out with the residual updated
+// in place. This is the reference's own fusion and it has to be one kernel: the
+// adaLN tail's own RMSNorm is taken over the updated residual with the same
+// 8-columns-per-thread reduction the first half uses, and `dim / 8` threads. Going
+// through the standalone ada_rms_norm entry instead reduces the same sum in the
+// strided order over a different block size, which moves about one element in
+// ten thousand across a bf16 rounding boundary -- a difference that survives the
+// whole action-expert loop.
+//
+//   y        = bf16(bf16(x * rsqrt(mean(x^2)+eps)) * (1 + w))
+//   residual = bf16(residual + bf16(y * gate))
+//   out      = bf16(residual * rsqrt(mean(residual^2)+eps) * (1 + mod[0:dim]) + mod[dim:2dim])
+//
+// with the two means reduced by v8_block_sum; the modulated norm has no weight,
+// as the reference's does not. `mod` is 2*dim wide here, not 3*dim: the gate is a
+// separate argument because the reference takes it from a different modulation.
+__global__ void gemma3_norm_gate_residual_ada_v8_kernel(
+        const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
+        const __nv_bfloat16* __restrict__ gate, __nv_bfloat16* __restrict__ residual,
+        const __nv_bfloat16* __restrict__ mod, __nv_bfloat16* __restrict__ out,
+        int dim, float eps) {
+    union Gemma3Ngra { uint4 u; __nv_bfloat16 h[8]; };
+    const long long base = (long long)blockIdx.x * dim + threadIdx.x * 8;
+    const int c = threadIdx.x * 8;
+    Gemma3Ngra xv, wv, gv, rv, sv, hv;
+    xv.u = *reinterpret_cast<const uint4*>(x + base);
+    wv.u = *reinterpret_cast<const uint4*>(w + c);
+    gv.u = *reinterpret_cast<const uint4*>(gate + c);
+    rv.u = *reinterpret_cast<const uint4*>(residual + base);
+    sv.u = *reinterpret_cast<const uint4*>(mod + c);
+    hv.u = *reinterpret_cast<const uint4*>(mod + dim + c);
+    float f[8], ss = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        f[j] = __bfloat162float(xv.h[j]);
+        ss += f[j] * f[j];
+    }
+    const float inv = rsqrtf(__fdiv_rn(v8_block_sum(ss), (float)dim) + eps);
+    float r[8], ss2 = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const float y = __bfloat162float(__float2bfloat16(f[j] * inv * (1.0f + __bfloat162float(wv.h[j]))));
+        const float t = __bfloat162float(__float2bfloat16(y * __bfloat162float(gv.h[j])));
+        rv.h[j] = __float2bfloat16(__bfloat162float(rv.h[j]) + t);
+        r[j] = __bfloat162float(rv.h[j]);
+        ss2 += r[j] * r[j];
+    }
+    *reinterpret_cast<uint4*>(residual + base) = rv.u;
+    const float inv2 = rsqrtf(__fdiv_rn(v8_block_sum(ss2), (float)dim) + eps);
+    Gemma3Ngra ov;
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+        ov.h[j] = __float2bfloat16(r[j] * inv2 * (1.0f + __bfloat162float(sv.h[j]))
+                                   + __bfloat162float(hv.h[j]));
+    *reinterpret_cast<uint4*>(out + base) = ov.u;
+}
+
+void gemma3_norm_gate_residual_ada_v8_bf16(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                                           const __nv_bfloat16* gate, __nv_bfloat16* residual,
+                                           const __nv_bfloat16* mod, __nv_bfloat16* out,
+                                           int rows, int dim, float eps, cudaStream_t stream) {
+    if (rows <= 0 || dim <= 0) return;
+    if (!x || !weight || !gate || !residual || !mod || !out)
+        throw std::runtime_error("gemma3_norm_gate_residual_ada_v8_bf16: null pointer argument");
+    if (dim % 8 != 0)
+        throw std::runtime_error("gemma3_norm_gate_residual_ada_v8_bf16: dim must be a multiple of 8");
+    gemma3_norm_gate_residual_ada_v8_kernel<<<rows, dim / 8, 0, stream>>>(
+        x, weight, gate, residual, mod, out, dim, eps);
 }
 
 void gemma3_norm_gate_residual_v8_bf16(const __nv_bfloat16* x, const __nv_bfloat16* weight,
@@ -1988,7 +2066,7 @@ __global__ void gemma3_rms_norm_nvfp4_kernel(const __nv_bfloat16* __restrict__ x
         f[j] = __bfloat162float(xv.h[j]);
         ss += f[j] * f[j];
     }
-    const float inv = rsqrtf(v8_block_sum(ss) / (float)dim + eps);
+    const float inv = rsqrtf(__fdiv_rn(v8_block_sum(ss), (float)dim) + eps);
     float y[8], a = 0.f;
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
