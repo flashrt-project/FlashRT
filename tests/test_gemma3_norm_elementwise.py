@@ -527,5 +527,96 @@ class TestBiasGeluQuantFp8Rounded:
         assert torch.equal(out.view(torch.uint8), ref.view(torch.uint8))
 
 
+# ── Gemma3 RMSNorm + gated residual ──────────────────────────────────────────
+
+class TestGemma3NormGateResidualV8:
+    """residual = bf16( residual + bf16( bf16(gemma3_norm(x)) * gate ) ).
+
+    Three roundings, one per store. Together with ada_rms_norm this reproduces
+    the caller's fused norm + gate + residual + ada-norm kernel exactly, so the
+    roundings and the reduction order both have to be right.
+    """
+
+    def _ref(self, x, w, gate, res):
+        xf = x.float()
+        inv = torch.rsqrt((xf * xf).mean(-1, keepdim=True) + 1e-6)
+        y = _bf16(xf * inv * (1.0 + w.float()))          # norm rounds
+        t = _bf16(y.float() * gate.float())              # gate multiply rounds
+        return _bf16(res.float() + t.float())            # the add rounds
+
+    @pytest.mark.parametrize("rows,dim", [(10, 1024), (3, 512), (1, 4096), (50, 256)])
+    def test_matches_the_three_rounding_form(self, rows, dim):
+        fvk = _fvk()
+        torch.manual_seed(31)
+        x = _bf16(torch.randn(rows, dim, device="cuda") * 2)
+        w = _bf16(torch.randn(dim, device="cuda") * 0.3)
+        gate = _bf16(torch.randn(dim, device="cuda"))
+        res = _bf16(torch.randn(rows, dim, device="cuda"))
+        got = res.clone()
+        fvk.gemma3_norm_gate_residual_v8_bf16(x.data_ptr(), w.data_ptr(), gate.data_ptr(),
+                                              got.data_ptr(), rows, dim, 1e-6,
+                                              torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        ref = self._ref(x, w, gate, res)
+        frac = (got != ref).float().mean().item()
+        # the sum of squares uses the vectorized order, so allow last-ulp spread
+        assert frac <= _MISMATCH_FRAC, f"{frac:.4f} of elements differ"
+
+    def test_the_gate_is_per_column_not_per_row(self):
+        """A gate indexed per row would still pass a loose check."""
+        fvk = _fvk()
+        rows, dim = 8, 512
+        torch.manual_seed(32)
+        x = _bf16(torch.randn(rows, dim, device="cuda") * 2)
+        w = _bf16(torch.randn(dim, device="cuda") * 0.3)
+        gate = _bf16(torch.randn(dim, device="cuda"))
+        res = _bf16(torch.randn(rows, dim, device="cuda"))
+        got = res.clone()
+        fvk.gemma3_norm_gate_residual_v8_bf16(x.data_ptr(), w.data_ptr(), gate.data_ptr(),
+                                              got.data_ptr(), rows, dim, 1e-6,
+                                              torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        # the same call must give every row the same gate; a per-row read would
+        # wander off the dim-wide vector and produce something else entirely
+        ref = self._ref(x, w, gate, res)
+        assert (got != ref).float().mean().item() <= _MISMATCH_FRAC
+
+    def test_the_intermediate_roundings_are_present(self):
+        """gate_mul_residual's one-rounding form must not pass this."""
+        fvk = _fvk()
+        rows, dim = 64, 512
+        torch.manual_seed(33)
+        x = _bf16(torch.randn(rows, dim, device="cuda") * 2)
+        w = _bf16(torch.randn(dim, device="cuda") * 0.3)
+        gate = _bf16(torch.randn(dim, device="cuda"))
+        res = _bf16(torch.randn(rows, dim, device="cuda"))
+        got = res.clone()
+        fvk.gemma3_norm_gate_residual_v8_bf16(x.data_ptr(), w.data_ptr(), gate.data_ptr(),
+                                              got.data_ptr(), rows, dim, 1e-6,
+                                              torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        xf = x.float()
+        inv = torch.rsqrt((xf * xf).mean(-1, keepdim=True) + 1e-6)
+        normed = _bf16(xf * inv * (1.0 + w.float()))
+        single = _bf16(res.float() + normed.float() * gate.float())   # one rounding
+        assert not torch.equal(single, self._ref(x, w, gate, res)), \
+            "the two forms must differ for this to test anything"
+        assert not torch.equal(got, single), "the intermediate roundings are missing"
+
+    def test_guards(self):
+        fvk = _fvk()
+        x = _bf16(torch.zeros(4, 64, device="cuda"))
+        w = _bf16(torch.zeros(64, device="cuda"))
+        with pytest.raises(RuntimeError, match="null pointer"):
+            fvk.gemma3_norm_gate_residual_v8_bf16(x.data_ptr(), w.data_ptr(), 0,
+                                                  x.data_ptr(), 4, 64, 1e-6,
+                                                  torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        with pytest.raises(RuntimeError, match="multiple of 8"):
+            fvk.gemma3_norm_gate_residual_v8_bf16(x.data_ptr(), w.data_ptr(), w.data_ptr(),
+                                                  x.data_ptr(), 4, 60, 1e-6,
+                                                  torch.cuda.current_stream().cuda_stream)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

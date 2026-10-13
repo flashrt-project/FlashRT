@@ -1863,6 +1863,64 @@ __global__ void gemma3_rms_norm_v8_kernel(const __nv_bfloat16* __restrict__ x, l
 // group, groups group_stride apart, which is what lets a per-head norm run in
 // place on a fused QKV buffer -- so the two differ only in reduction order and
 // a caller picks the one its reference used.
+// Gemma3 RMSNorm followed by a gated residual add, 8 columns per thread:
+//
+//   residual = bf16( residual + bf16( bf16(gemma3_norm(x)) * gate ) )
+//
+// Three roundings, one per store HF performs on this path: the norm rounds, the
+// gate multiply rounds, and the residual add rounds. elementwise.cu's
+// gate_mul_residual is the same shape of operation but takes `x` directly with a
+// single rounding at the end -- it has no norm and no intermediate rounds, so it
+// is not a substitute for this.
+//
+// The reduction is the vectorized one (v8_block_sum), which is what the caller's
+// fused norm+gate+residual kernel uses; composing this with ada_rms_norm
+// reproduces that fused kernel, and using the strided-order norm instead does
+// not.
+//
+// Contiguous rows, one block per row, dim / 8 threads; dim must be a multiple
+// of 8. `x` and `residual` are (rows, dim); `w` and `gate` are per-column, one
+// dim-wide vector shared by every row -- the gate is a modulation, not a
+// per-row mask. `residual` is read and written.
+__global__ void gemma3_norm_gate_residual_v8_kernel(const __nv_bfloat16* __restrict__ x,
+                                                    const __nv_bfloat16* __restrict__ w,
+                                                    const __nv_bfloat16* __restrict__ gate,
+                                                    __nv_bfloat16* __restrict__ residual,
+                                                    int dim, float eps) {
+    union Gemma3Ngr { uint4 u; __nv_bfloat16 h[8]; };
+    const long long base = (long long)blockIdx.x * dim + threadIdx.x * 8;
+    Gemma3Ngr xv, wv, gv, rv;
+    xv.u = *reinterpret_cast<const uint4*>(x + base);
+    wv.u = *reinterpret_cast<const uint4*>(w + threadIdx.x * 8);
+    gv.u = *reinterpret_cast<const uint4*>(gate + threadIdx.x * 8);
+    rv.u = *reinterpret_cast<const uint4*>(residual + base);
+    float f[8], ss = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        f[j] = __bfloat162float(xv.h[j]);
+        ss += f[j] * f[j];
+    }
+    const float inv = rsqrtf(v8_block_sum(ss) / (float)dim + eps);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const float y = __bfloat162float(__float2bfloat16(f[j] * inv * (1.0f + __bfloat162float(wv.h[j]))));
+        const float t = __bfloat162float(__float2bfloat16(y * __bfloat162float(gv.h[j])));
+        rv.h[j] = __float2bfloat16(__bfloat162float(rv.h[j]) + t);
+    }
+    *reinterpret_cast<uint4*>(residual + base) = rv.u;
+}
+
+void gemma3_norm_gate_residual_v8_bf16(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                                       const __nv_bfloat16* gate, __nv_bfloat16* residual,
+                                       int rows, int dim, float eps, cudaStream_t stream) {
+    if (rows <= 0 || dim <= 0) return;
+    if (!x || !weight || !gate || !residual)
+        throw std::runtime_error("gemma3_norm_gate_residual_v8_bf16: null pointer argument");
+    if (dim % 8 != 0)
+        throw std::runtime_error("gemma3_norm_gate_residual_v8_bf16: dim must be a multiple of 8");
+    gemma3_norm_gate_residual_v8_kernel<<<rows, dim / 8, 0, stream>>>(x, weight, gate, residual, dim, eps);
+}
+
 void gemma3_rms_norm_v8_bf16(const __nv_bfloat16* x, long long x_stride,
                              const __nv_bfloat16* weight,
                              __nv_bfloat16* out, long long out_stride,

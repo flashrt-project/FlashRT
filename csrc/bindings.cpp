@@ -904,6 +904,21 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         "Rows may be strided; a non-zero residual is updated with HF's two roundings. "
         "Pass out = 0 or residual = 0 to skip one of the two stores.");
 
+    m.def("gemma3_norm_gate_residual_v8_bf16",
+        [](uintptr_t x, uintptr_t weight, uintptr_t gate, uintptr_t residual,
+           int rows, int dim, float eps, uintptr_t stream) {
+            gemma3_norm_gate_residual_v8_bf16(
+                typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(weight),
+                typed_ptr<__nv_bfloat16>(gate), typed_ptr<__nv_bfloat16>(residual),
+                rows, dim, eps, to_stream(stream));
+        },
+        py::arg("x"), py::arg("weight"), py::arg("gate"), py::arg("residual"),
+        py::arg("rows"), py::arg("dim"), py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "residual = bf16(residual + bf16(bf16(gemma3_norm(x)) * gate)), 8 columns per "
+        "thread and contiguous rows. x and residual are (rows, dim); weight and gate "
+        "are per-column, dim-wide. Three roundings, one per store; gate_mul_residual "
+        "is not a substitute (it takes x directly with a single rounding).");
+
     m.def("gemma3_rms_norm_v8_bf16",
         [](uintptr_t x, long long x_stride, uintptr_t weight,
            uintptr_t out, long long out_stride, uintptr_t residual, long long res_stride,

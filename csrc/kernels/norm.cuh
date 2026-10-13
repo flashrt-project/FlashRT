@@ -244,6 +244,16 @@ void gemma3_rms_norm_bf16(const __nv_bfloat16* x, long long x_stride,
 // different summation order from gemma3_rms_norm_bf16, so the two are not
 // bit-comparable with each other. dim must be a multiple of 8; `residual`, when
 // non-null, is updated with HF's two roundings and `out` may then be null.
+// Gemma3 RMSNorm then a gated residual add, 8 columns per thread:
+//   residual = bf16( residual + bf16( bf16(gemma3_norm(x)) * gate ) )
+// Three roundings, one per store HF performs. Distinct from gate_mul_residual,
+// which takes x directly with a single rounding and has no norm. Contiguous
+// rows, one block per row; dim must be a multiple of 8. `w` and `gate` are
+// per-column (dim-wide, shared by every row); `x` and `residual` are (rows, dim).
+void gemma3_norm_gate_residual_v8_bf16(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                                       const __nv_bfloat16* gate, __nv_bfloat16* residual,
+                                       int rows, int dim, float eps, cudaStream_t stream = 0);
+
 void gemma3_rms_norm_v8_bf16(const __nv_bfloat16* x, long long x_stride,
                              const __nv_bfloat16* weight,
                              __nv_bfloat16* out, long long out_stride,
