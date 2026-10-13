@@ -532,9 +532,13 @@ class TestBiasGeluQuantFp8Rounded:
 class TestGemma3NormGateResidualV8:
     """residual = bf16( residual + bf16( bf16(gemma3_norm(x)) * gate ) ).
 
-    Three roundings, one per store. Together with ada_rms_norm this reproduces
-    the caller's fused norm + gate + residual + ada-norm kernel exactly, so the
-    roundings and the reduction order both have to be right.
+    Three roundings, one per store.
+
+    This does NOT reproduce the caller's fused norm + gate + residual + ada-norm
+    kernel when chained into ada_rms_norm: that kernel reduces its second mean
+    with this family's block shape, and the standalone entry reduces it in the
+    strided order. The two disagree on about one element in ten thousand, which
+    is why the fused form exists; see TestGemma3NormGateResidualAdaV8.
     """
 
     def _ref(self, x, w, gate, res):
@@ -706,3 +710,132 @@ class TestGemma3RmsNormNvfp4:
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+class TestGemma3NormGateResidualAdaV8:
+    """The fused norm + gate + residual + ada-norm, in one pass.
+
+        residual = bf16(residual + bf16(bf16(gemma3_norm(x)) * gate))
+        out      = bf16(residual * rsqrt(mean(residual^2) + eps)
+                        * (1 + mod[:dim]) + mod[dim:])
+
+    This is a single kernel in the caller, not two, and the distinction is
+    load-bearing: chaining gemma3_norm_gate_residual_v8_bf16 into the standalone
+    ada_rms_norm reduces the second mean in a different order over a different
+    block shape, and disagrees on roughly one element in ten thousand -- which
+    the caller runs 680 times per action chunk.
+
+    The gate is a separate argument and `mod` is 2*dim wide, not 3*dim: the
+    caller takes the gate from one modulation vector and the scale and shift
+    from another.
+    """
+
+    def _ref(self, x, w, gate, mod, res, dim):
+        xf = x.float()
+        inv = torch.rsqrt((xf * xf).mean(-1, keepdim=True) + 1e-6)
+        y = _bf16(xf * inv * (1.0 + w.float()))
+        t = _bf16(y.float() * gate.float())
+        r = _bf16(res.float() + t.float())
+        rf = r.float()
+        inv2 = torch.rsqrt((rf * rf).mean(-1, keepdim=True) + 1e-6)
+        out = _bf16(rf * inv2 * (1.0 + mod[:dim].float()) + mod[dim:].float())
+        return r, out
+
+    @pytest.mark.parametrize("rows,dim", [(10, 1024), (3, 512), (1, 4096), (50, 256)])
+    def test_matches_the_documented_form(self, rows, dim):
+        fvk = _fvk()
+        torch.manual_seed(41)
+        x = _bf16(torch.randn(rows, dim, device="cuda") * 2)
+        w = _bf16(torch.randn(dim, device="cuda") * 0.3)
+        gate = _bf16(torch.randn(dim, device="cuda"))
+        mod = _bf16(torch.randn(2 * dim, device="cuda") * 0.5)
+        res = _bf16(torch.randn(rows, dim, device="cuda"))
+        got = res.clone()
+        out = torch.empty(rows, dim, device="cuda", dtype=torch.bfloat16)
+        fvk.gemma3_norm_gate_residual_ada_v8_bf16(
+            x.data_ptr(), w.data_ptr(), gate.data_ptr(), got.data_ptr(),
+            mod.data_ptr(), out.data_ptr(), rows, dim, 1e-6,
+            torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        ref_r, ref_o = self._ref(x, w, gate, mod, res, dim)
+        for name, mine, theirs in (("residual", got, ref_r), ("out", out, ref_o)):
+            frac = (mine != theirs).float().mean().item()
+            assert frac <= _MISMATCH_FRAC, f"{name}: {frac:.4f} of elements differ"
+
+    def test_the_modulation_is_applied_to_the_updated_residual(self):
+        """Modulating the pre-update residual would still look plausible, and is
+        what a two-kernel chain computes when the residual write is reordered."""
+        fvk = _fvk()
+        rows, dim = 8, 512
+        torch.manual_seed(42)
+        x = _bf16(torch.randn(rows, dim, device="cuda") * 2)
+        w = _bf16(torch.randn(dim, device="cuda") * 0.3)
+        gate = _bf16(torch.randn(dim, device="cuda"))
+        mod = _bf16(torch.randn(2 * dim, device="cuda") * 0.5)
+        res = _bf16(torch.randn(rows, dim, device="cuda") * 3.0)
+        got = res.clone()
+        out = torch.empty(rows, dim, device="cuda", dtype=torch.bfloat16)
+        fvk.gemma3_norm_gate_residual_ada_v8_bf16(
+            x.data_ptr(), w.data_ptr(), gate.data_ptr(), got.data_ptr(),
+            mod.data_ptr(), out.data_ptr(), rows, dim, 1e-6,
+            torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        updated = got.float()
+        inv2 = torch.rsqrt((updated * updated).mean(-1, keepdim=True) + 1e-6)
+        from_updated = _bf16(updated * inv2 * (1.0 + mod[:dim].float()) + mod[dim:].float())
+        stale = res.float()
+        inv2s = torch.rsqrt((stale * stale).mean(-1, keepdim=True) + 1e-6)
+        from_stale = _bf16(stale * inv2s * (1.0 + mod[:dim].float()) + mod[dim:].float())
+        assert not torch.equal(from_updated, from_stale), "the fixture does not separate them"
+        assert torch.equal(out, from_updated)
+
+    def test_mod_is_two_dims_and_the_gate_is_its_own_argument(self):
+        """A kernel reading a 3*dim modulation would take the gate from mod[2*dim:]."""
+        fvk = _fvk()
+        rows, dim = 6, 512
+        torch.manual_seed(43)
+        x = _bf16(torch.randn(rows, dim, device="cuda") * 2)
+        w = _bf16(torch.randn(dim, device="cuda") * 0.3)
+        gate = _bf16(torch.randn(dim, device="cuda"))
+        base = _bf16(torch.randn(2 * dim, device="cuda") * 0.5)
+        res = _bf16(torch.randn(rows, dim, device="cuda"))
+        outs = []
+        for mod in (base, torch.cat([base, _bf16(torch.randn(dim, device="cuda"))]).contiguous()):
+            got = res.clone()
+            out = torch.empty(rows, dim, device="cuda", dtype=torch.bfloat16)
+            fvk.gemma3_norm_gate_residual_ada_v8_bf16(
+                x.data_ptr(), w.data_ptr(), gate.data_ptr(), got.data_ptr(),
+                mod.data_ptr(), out.data_ptr(), rows, dim, 1e-6,
+                torch.cuda.current_stream().cuda_stream)
+            torch.cuda.synchronize()
+            outs.append((got.clone(), out.clone()))
+        assert torch.equal(outs[0][0], outs[1][0]), "the residual read past mod[:2*dim]"
+        assert torch.equal(outs[0][1], outs[1][1]), "the out read past mod[:2*dim]"
+
+    def test_guards(self):
+        fvk = _fvk()
+        rows, dim = 4, 256
+        z = lambda *s, dt=torch.bfloat16: torch.zeros(*s, device="cuda", dtype=dt)
+        x, w, gate, mod = z(rows, dim), z(dim), z(dim), z(2 * dim)
+        res, out = z(rows, dim), z(rows, dim)
+        s = torch.cuda.current_stream().cuda_stream
+        with pytest.raises(RuntimeError, match="null pointer"):
+            fvk.gemma3_norm_gate_residual_ada_v8_bf16(
+                x.data_ptr(), w.data_ptr(), gate.data_ptr(), 0, mod.data_ptr(),
+                out.data_ptr(), rows, dim, 1e-6, s)
+        torch.cuda.synchronize()
+        with pytest.raises(RuntimeError, match="multiple of 8"):
+            fvk.gemma3_norm_gate_residual_ada_v8_bf16(
+                x.data_ptr(), w.data_ptr(), gate.data_ptr(), res.data_ptr(),
+                mod.data_ptr(), out.data_ptr(), rows, 255, 1e-6, s)
+        torch.cuda.synchronize()
+
+    def test_empty_shapes_are_a_no_op(self):
+        fvk = _fvk()
+        dim = 256
+        z = lambda *s, dt=torch.bfloat16: torch.zeros(*s, device="cuda", dtype=dt)
+        fvk.gemma3_norm_gate_residual_ada_v8_bf16(
+            z(0, dim).data_ptr(), z(dim).data_ptr(), z(dim).data_ptr(), z(0, dim).data_ptr(),
+            z(2 * dim).data_ptr(), z(0, dim).data_ptr(), 0, dim, 1e-6,
+            torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
