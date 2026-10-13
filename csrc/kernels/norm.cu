@@ -1804,6 +1804,83 @@ __global__ void ada_rms_norm_kernel(const __nv_bfloat16* __restrict__ x,
     }
 }
 
+// Gemma3 RMSNorm over contiguous rows, 8 columns per thread, bf16 output.
+//
+// This is the *same formula* as gemma3_rms_norm_bf16 above and a different
+// summation order: it loads 8 columns per thread and reduces warp-first through
+// shared memory, where that one runs a strided loop and reduces inline. The two
+// can disagree in the last fp32 ulp of the sum of squares, which for a bf16
+// result means an element landing either side of a rounding boundary. A caller
+// reproducing one of them bit for bit has to use that one -- a caller whose
+// fused norm+RoPE kernel uses this order cannot substitute the other.
+//
+// One block per row, dim / 8 threads; dim must be a multiple of 8. `residual`,
+// when non-null, is updated with HF's two roundings as in the strided form.
+__global__ void gemma3_rms_norm_v8_kernel(const __nv_bfloat16* __restrict__ x, long long x_stride,
+                                          const __nv_bfloat16* __restrict__ w,
+                                          __nv_bfloat16* __restrict__ out, long long out_stride,
+                                          __nv_bfloat16* __restrict__ residual, long long res_stride,
+                                          int rows_per_group, long long group_stride,
+                                          int dim, float eps) {
+    union Gemma3V8N { uint4 u; __nv_bfloat16 h[8]; };
+    const int r = blockIdx.x;
+    const long long base = (long long)(r / rows_per_group) * group_stride +
+                           (long long)(r % rows_per_group) * x_stride + threadIdx.x * 8;
+    Gemma3V8N xv, wv;
+    xv.u = *reinterpret_cast<const uint4*>(x + base);
+    wv.u = *reinterpret_cast<const uint4*>(w + threadIdx.x * 8);
+    float f[8], ss = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        f[j] = __bfloat162float(xv.h[j]);
+        ss += f[j] * f[j];
+    }
+    const float inv = rsqrtf(v8_block_sum(ss) / (float)dim + eps);
+    Gemma3V8N yv;
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+        yv.h[j] = __float2bfloat16(f[j] * inv * (1.0f + __bfloat162float(wv.h[j])));
+    if (residual) {
+        const long long rb = (long long)(r / rows_per_group) * group_stride +
+                             (long long)(r % rows_per_group) * res_stride + threadIdx.x * 8;
+        Gemma3V8N rv;
+        rv.u = *reinterpret_cast<const uint4*>(residual + rb);
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            rv.h[j] = __float2bfloat16(__bfloat162float(rv.h[j]) + __bfloat162float(yv.h[j]));
+        *reinterpret_cast<uint4*>(residual + rb) = rv.u;
+    }
+    if (out) {
+        const long long ob = (long long)(r / rows_per_group) * group_stride +
+                             (long long)(r % rows_per_group) * out_stride + threadIdx.x * 8;
+        *reinterpret_cast<uint4*>(out + ob) = yv.u;
+    }
+}
+
+// The block reduction this uses is v8_block_sum, so its sum-of-squares order is
+// the vectorized one; gemma3_rms_norm_bf16 above uses the strided loop's. Same
+// addressing as that kernel -- rows_per_group rows of x_stride inside each
+// group, groups group_stride apart, which is what lets a per-head norm run in
+// place on a fused QKV buffer -- so the two differ only in reduction order and
+// a caller picks the one its reference used.
+void gemma3_rms_norm_v8_bf16(const __nv_bfloat16* x, long long x_stride,
+                             const __nv_bfloat16* weight,
+                             __nv_bfloat16* out, long long out_stride,
+                             __nv_bfloat16* residual, long long res_stride,
+                             int rows, int rows_per_group, long long group_stride,
+                             int dim, float eps, cudaStream_t stream) {
+    if (rows <= 0 || dim <= 0) return;
+    if (!x || !weight || (!out && !residual))
+        throw std::runtime_error("gemma3_rms_norm_v8_bf16: null pointer, or no destination");
+    if (rows_per_group <= 0)
+        throw std::runtime_error("gemma3_rms_norm_v8_bf16: rows_per_group must be positive");
+    if (dim % 8 != 0)
+        throw std::runtime_error("gemma3_rms_norm_v8_bf16: dim must be a multiple of 8");
+    gemma3_rms_norm_v8_kernel<<<rows, dim / 8, 0, stream>>>(
+        x, x_stride, weight, out, out_stride, residual, res_stride,
+        rows_per_group, group_stride, dim, eps);
+}
+
 void ada_rms_norm(const __nv_bfloat16* x, const __nv_bfloat16* mod,
                   __nv_bfloat16* out, int rows, int dim, float eps,
                   cudaStream_t stream) {

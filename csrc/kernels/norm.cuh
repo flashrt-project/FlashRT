@@ -240,6 +240,17 @@ void gemma3_rms_norm_bf16(const __nv_bfloat16* x, long long x_stride,
 // This uses a different summation order from gemma3_rms_norm_bf16 (the
 // vectorized form's block reduction rather than the strided loop), so the two
 // are not bit-comparable with each other.
+// The same norm over contiguous rows with 8 columns per thread: same formula,
+// different summation order from gemma3_rms_norm_bf16, so the two are not
+// bit-comparable with each other. dim must be a multiple of 8; `residual`, when
+// non-null, is updated with HF's two roundings and `out` may then be null.
+void gemma3_rms_norm_v8_bf16(const __nv_bfloat16* x, long long x_stride,
+                             const __nv_bfloat16* weight,
+                             __nv_bfloat16* out, long long out_stride,
+                             __nv_bfloat16* residual, long long res_stride,
+                             int rows, int rows_per_group, long long group_stride,
+                             int dim, float eps, cudaStream_t stream = 0);
+
 void gemma3_rms_norm_fp8_bf16(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                               __nv_fp8_e4m3* out, const float* a_scale,
                               int rows, int dim, float eps, cudaStream_t stream = 0);

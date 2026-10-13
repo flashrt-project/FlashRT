@@ -903,6 +903,26 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         "Rows may be strided; a non-zero residual is updated with HF's two roundings. "
         "Pass out = 0 or residual = 0 to skip one of the two stores.");
 
+    m.def("gemma3_rms_norm_v8_bf16",
+        [](uintptr_t x, long long x_stride, uintptr_t weight,
+           uintptr_t out, long long out_stride, uintptr_t residual, long long res_stride,
+           int rows, int rows_per_group, long long group_stride,
+           int dim, float eps, uintptr_t stream) {
+            gemma3_rms_norm_v8_bf16(typed_ptr<__nv_bfloat16>(x), x_stride,
+                                    typed_ptr<__nv_bfloat16>(weight),
+                                    out ? typed_ptr<__nv_bfloat16>(out) : nullptr, out_stride,
+                                    residual ? typed_ptr<__nv_bfloat16>(residual) : nullptr, res_stride,
+                                    rows, rows_per_group, group_stride, dim, eps, to_stream(stream));
+        },
+        py::arg("x"), py::arg("x_stride"), py::arg("weight"),
+        py::arg("out"), py::arg("out_stride"), py::arg("residual"), py::arg("res_stride"),
+        py::arg("rows"), py::arg("rows_per_group"), py::arg("group_stride"),
+        py::arg("dim"), py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "Gemma3 RMSNorm over contiguous rows, 8 columns per thread. Same formula as "
+        "gemma3_rms_norm_bf16 but a different summation order, so the two are not "
+        "bit-comparable; pass residual = 0 or out = 0 to skip one of the stores. "
+        "dim must be a multiple of 8.");
+
     m.def("gemma3_rms_norm_fp8_bf16",
         [](uintptr_t x, uintptr_t weight, uintptr_t out, uintptr_t a_scale,
            int rows, int dim, float eps, uintptr_t stream) {
@@ -3719,6 +3739,24 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("out_fp8"), py::arg("act_scale"),
         py::arg("M"), py::arg("N"),
         py::arg("stream") = 0);
+
+    m.def("bias_gelu_quantize_fp8_static_bf16_rounded",
+        [](uintptr_t in_bf16, uintptr_t bias_bf16, uintptr_t out_fp8,
+           uintptr_t act_scale, long long M, int N, uintptr_t stream) {
+            flash_rt::quantize::bias_gelu_quantize_fp8_static_bf16_rounded(
+                reinterpret_cast<const __nv_bfloat16*>(to_ptr(in_bf16)),
+                bias_bf16 ? reinterpret_cast<const __nv_bfloat16*>(to_ptr(bias_bf16)) : nullptr,
+                reinterpret_cast<__nv_fp8_e4m3*>(to_ptr(out_fp8)),
+                reinterpret_cast<const float*>(act_scale),
+                M, N, to_stream(stream));
+        },
+        py::arg("in_bf16"), py::arg("bias_bf16"),
+        py::arg("out_fp8"), py::arg("act_scale"),
+        py::arg("M"), py::arg("N"),
+        py::arg("stream") = 0,
+        "bias + GELU(tanh) + static FP8 e4m3, with the activation rounded to bf16 "
+        "before the scale and cast -- matching bias_gelu_bf16 followed by "
+        "quantize_fp8_static. bias_bf16 may be null.");
 
     // G7.15 — Fused 3D RoPE apply (bf16 → fp32) replacing 5-6 Python
     // launches per call with one CUDA kernel.

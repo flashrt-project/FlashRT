@@ -47,7 +47,46 @@ __global__ void bias_gelu_quantize_fp8_static_bf16_kernel(
   out[idx] = __nv_fp8_e4m3(q);
 }
 
+// Same epilogue, but the activated value is rounded to bf16 before the scale and
+// the e4m3 cast.
+//
+// That extra rounding is the whole difference, and it is not cosmetic: it is
+// what running the two kernels this fuses -- `bias_gelu_bf16`, which stores a
+// bf16 activation, then `quantize_fp8_static` over it -- produces. A caller
+// calibrated against that pair therefore rounds here and not in the sibling
+// above, and the two disagree on the elements sitting near an e4m3 boundary
+// (measured: ~2% of a 2048x4304 activation). Kept as a separate entry rather
+// than a flag on the sibling so that neither caller's behaviour moves.
+__global__ void bias_gelu_quantize_fp8_static_bf16_rounded_kernel(
+    const __nv_bfloat16* __restrict__ in,
+    const __nv_bfloat16* __restrict__ bias,   // may be nullptr
+    __nv_fp8_e4m3*       __restrict__ out,
+    const float*          __restrict__ act_scale_ptr,
+    long long total,
+    int N,
+    int has_bias)
+{
+  const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+
+  float v = __bfloat162float(in[idx]);
+  if (has_bias) {
+    int n = (int)(idx % N);
+    v += __bfloat162float(bias[n]);
+  }
+  // the intermediate bf16 round the unfused pair performs
+  float g = __bfloat162float(__float2bfloat16(gelu_tanh(v)));
+  float inv_s = 1.0f / *act_scale_ptr;
+  float q = g * inv_s;
+  q = fminf(fmaxf(q, -kFp8Max), kFp8Max);
+  out[idx] = __nv_fp8_e4m3(q);
+}
+
 }  // namespace
+
+void bias_gelu_quantize_fp8_static_bf16_rounded(
+    const __nv_bfloat16* in, const __nv_bfloat16* bias, __nv_fp8_e4m3* out,
+    const float* act_scale_ptr, long long M, int N, cudaStream_t stream);
 
 void bias_gelu_quantize_fp8_static_bf16(
     const void*  in_bf16,
@@ -68,6 +107,18 @@ void bias_gelu_quantize_fp8_static_bf16(
       reinterpret_cast<__nv_fp8_e4m3*>(out_fp8),
       act_scale,
       total, N, has_bias);
+}
+
+void bias_gelu_quantize_fp8_static_bf16_rounded(
+    const __nv_bfloat16* in, const __nv_bfloat16* bias, __nv_fp8_e4m3* out,
+    const float* act_scale_ptr, long long M, int N, cudaStream_t stream)
+{
+  if (M <= 0 || N <= 0) return;
+  const long long total = M * N;
+  const int block = 256;
+  const int grid = (int)((total + block - 1) / block);
+  bias_gelu_quantize_fp8_static_bf16_rounded_kernel<<<grid, block, 0, stream>>>(
+      in, bias, out, act_scale_ptr, total, N, bias != nullptr ? 1 : 0);
 }
 
 }  // namespace quantize

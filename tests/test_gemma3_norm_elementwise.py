@@ -28,6 +28,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 torch = pytest.importorskip("torch")
 
+BF16 = torch.bfloat16
+
 
 def _fvk():
     if not torch.cuda.is_available():
@@ -375,6 +377,154 @@ class TestAdaRmsNorm:
                              torch.cuda.current_stream().cuda_stream)
         torch.cuda.synchronize()
         assert not torch.equal(oa, ob)
+
+
+# ── The vectorized-order Gemma3 RMSNorm ──────────────────────────────────────
+
+class TestGemma3RmsNormV8:
+    """Same formula as gemma3_rms_norm_bf16, a different summation order.
+
+    Both orders exist in the caller this serves, and which one a call site needs
+    depends on the call site: a fused norm+RoPE kernel that reduces warp-first
+    cannot be reproduced by the strided-loop form, even though the two agree on
+    almost every element.
+    """
+
+    @pytest.mark.parametrize("rows,dim", [(40, 2560), (568, 256), (4, 4096), (7, 512)])
+    def test_matches_the_documented_form(self, rows, dim):
+        fvk = _fvk()
+        torch.manual_seed(21)
+        x = _bf16(torch.randn(rows, dim, device="cuda") * 2)
+        w = _bf16(torch.randn(dim, device="cuda") * 0.3)
+        out = torch.empty(rows, dim, device="cuda", dtype=torch.bfloat16)
+        fvk.gemma3_rms_norm_v8_bf16(x.data_ptr(), dim, w.data_ptr(), out.data_ptr(), dim,
+                                    0, dim, rows, rows, 0, dim, 1e-6,
+                                    torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        ref, _ = _gemma3_reference(x, w, 1e-6)
+        assert (out != ref).float().mean().item() <= _MISMATCH_FRAC
+
+    def test_residual_mode_matches_two_roundings(self):
+        fvk = _fvk()
+        torch.manual_seed(22)
+        rows, dim = 16, 1024
+        x = _bf16(torch.randn(rows, dim, device="cuda") * 2)
+        w = _bf16(torch.randn(dim, device="cuda") * 0.3)
+        res = _bf16(torch.randn(rows, dim, device="cuda"))
+        got_res, got_out = res.clone(), torch.empty_like(x)
+        fvk.gemma3_rms_norm_v8_bf16(x.data_ptr(), dim, w.data_ptr(), got_out.data_ptr(), dim,
+                                    got_res.data_ptr(), dim, rows, rows, 0, dim, 1e-6,
+                                    torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        ref_out, ref_res = _gemma3_reference(x, w, 1e-6, residual=res)
+        assert (got_res != ref_res).float().mean().item() <= _MISMATCH_FRAC
+        assert (got_out != ref_out).float().mean().item() <= _MISMATCH_FRAC
+
+    def test_per_head_group_addressing(self):
+        """rows_per_group/group_stride address head h of row s at s*gs + h*xs."""
+        fvk = _fvk()
+        torch.manual_seed(23)
+        seq, nh, hd = 5, 4, 256
+        dim = nh * hd
+        x = _bf16(torch.randn(seq, dim, device="cuda") * 2)
+        w = _bf16(torch.randn(hd, device="cuda") * 0.3)
+        before = x.clone()
+        fvk.gemma3_rms_norm_v8_bf16(x.data_ptr(), hd, w.data_ptr(), x.data_ptr(), hd,
+                                    0, hd, seq * nh, nh, dim, hd, 1e-6,
+                                    torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        worst = 0.0
+        for h in range(nh):
+            sl = slice(h * hd, (h + 1) * hd)
+            ref, _ = _gemma3_reference(before[:, sl].clone(), w, 1e-6)
+            worst = max(worst, (x[:, sl] != ref).float().mean().item())
+        assert worst <= _MISMATCH_FRAC, f"worst per-head mismatch {worst}"
+
+    def test_guards(self):
+        fvk = _fvk()
+        x = _bf16(torch.zeros(4, 64, device="cuda"))
+        w = _bf16(torch.zeros(64, device="cuda"))
+        with pytest.raises(RuntimeError, match="no destination"):
+            fvk.gemma3_rms_norm_v8_bf16(x.data_ptr(), 64, w.data_ptr(), 0, 64, 0, 64,
+                                        4, 4, 0, 64, 1e-6,
+                                        torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        with pytest.raises(RuntimeError, match="multiple of 8"):
+            fvk.gemma3_rms_norm_v8_bf16(x.data_ptr(), 64, w.data_ptr(), x.data_ptr(), 64,
+                                        0, 64, 4, 4, 0, 60, 1e-6,
+                                        torch.cuda.current_stream().cuda_stream)
+
+
+# ── bias + GELU + FP8, with the activation rounded to bf16 first ─────────────
+
+class TestBiasGeluQuantFp8Rounded:
+    """The rounding is the whole difference from the sibling entry.
+
+    The sibling quantizes the fp32 gelu directly; this one rounds it to bf16
+    first, which is what running bias_gelu_bf16 and then quantize_fp8_static back
+    to back produces. A caller calibrated against that pair needs this one, so
+    the test pins both the agreement with the two-pass form and the
+    disagreement with the one-pass sibling.
+    """
+
+    def _run(self, fvk, rows, cols, rounded, seed=0):
+        torch.manual_seed(seed)
+        h = (torch.randn(rows, cols, device="cuda") * 1.5).to(BF16)
+        b = (torch.randn(cols, device="cuda") * 0.1).to(BF16)
+        sc = torch.tensor([0.02], device="cuda", dtype=torch.float32)
+        out = torch.zeros(rows, cols, device="cuda", dtype=torch.float8_e4m3fn)
+        fn = (fvk.bias_gelu_quantize_fp8_static_bf16_rounded if rounded
+              else fvk.bias_gelu_quantize_fp8_static_bf16)
+        fn(h.data_ptr(), b.data_ptr(), out.data_ptr(), sc.data_ptr(), rows, cols,
+           torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        return h, b, sc, out
+
+    @pytest.mark.parametrize("rows,cols", [(2048, 4304), (2048, 1152), (16, 256)])
+    def test_agrees_with_the_two_pass_form(self, rows, cols):
+        fvk = _fvk()
+        h, b, sc, got = self._run(fvk, rows, cols, rounded=True)
+        # the two passes it replaces, run in order: bias+gelu writes a bf16
+        # activation in place, then quantize_fp8_static reads it back
+        fvk.bias_gelu_bf16(h.data_ptr(), b.data_ptr(), rows, cols,
+                           torch.cuda.current_stream().cuda_stream)
+        ref = torch.zeros_like(got)
+        fvk.quantize_fp8_static(h.data_ptr(), ref.data_ptr(), sc.data_ptr(),
+                                rows * cols, torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        nd = int((got.view(torch.uint8) != ref.view(torch.uint8)).sum().item())
+        assert nd == 0, f"{nd} of {got.numel()} bytes differ from the two-pass form"
+
+    def test_differs_from_the_unrounded_sibling(self):
+        """A copy of the sibling would pass a tolerance check; it must not pass this."""
+        fvk = _fvk()
+        _, _, _, a = self._run(fvk, 2048, 1152, rounded=True, seed=7)
+        _, _, _, c = self._run(fvk, 2048, 1152, rounded=False, seed=7)
+        frac = (a.view(torch.uint8) != c.view(torch.uint8)).float().mean().item()
+        assert frac > 0.005, f"the two entries differ on only {frac:.4f} of bytes"
+
+    def test_a_null_bias_is_a_plain_activation(self):
+        fvk = _fvk()
+        rows, cols = 64, 512
+        torch.manual_seed(8)
+        h = (torch.randn(rows, cols, device="cuda") * 1.5).to(BF16)
+        sc = torch.tensor([0.02], device="cuda", dtype=torch.float32)
+        out = torch.zeros(rows, cols, device="cuda", dtype=torch.float8_e4m3fn)
+        fvk.bias_gelu_quantize_fp8_static_bf16_rounded(
+            h.data_ptr(), 0, out.data_ptr(), sc.data_ptr(), rows, cols,
+            torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        act = h.clone()
+        # a zero bias rather than null: bias_gelu_bf16 takes a real pointer, and
+        # adding 0.0f in fp32 is exact, so this is the same activation
+        zb = torch.zeros(cols, device="cuda", dtype=BF16)
+        fvk.bias_gelu_bf16(act.data_ptr(), zb.data_ptr(), rows, cols,
+                           torch.cuda.current_stream().cuda_stream)
+        ref = torch.zeros_like(out)
+        fvk.quantize_fp8_static(act.data_ptr(), ref.data_ptr(), sc.data_ptr(),
+                                rows * cols, torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        assert torch.equal(out.view(torch.uint8), ref.view(torch.uint8))
 
 
 if __name__ == "__main__":
