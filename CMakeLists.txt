@@ -1679,6 +1679,7 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/norm.cu
   csrc/kernels/linear_f32.cu
   csrc/kernels/resize_norm.cu
+  csrc/kernels/gelu_mul.cu
   csrc/quantize/gelu_mul_quant_nvfp4_swizzled.cu
   csrc/kernels/activation.cu
   csrc/kernels/rope.cu

@@ -994,6 +994,30 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         "rescale and normalize to bf16: (nv, H, W, 3) uint8 HWC in, (nv, 3, OH, OW) "
         "bf16 CHW out, with (x - 127.5) / 127.5.");
 
+    m.def("gelu_mul_bf16",
+        [](uintptr_t gate, uintptr_t up, uintptr_t out, long long n, uintptr_t stream) {
+            flash_rt::kernels::gelu_mul_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(gate),
+                reinterpret_cast<const __nv_bfloat16*>(up),
+                reinterpret_cast<__nv_bfloat16*>(out), n, to_stream(stream));
+        },
+        py::arg("gate"), py::arg("up"), py::arg("out"), py::arg("n"), py::arg("stream") = 0,
+        "out = bf16(bf16(gelu_tanh(gate)) * up): the activation rounds to bf16 before "
+        "the product and the product rounds again.");
+    m.def("gelu_mul_quant_fp8_static_bf16",
+        [](uintptr_t gate, uintptr_t up, uintptr_t act_scale, uintptr_t out,
+           long long n, uintptr_t stream) {
+            flash_rt::kernels::gelu_mul_quant_fp8_static_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(gate),
+                reinterpret_cast<const __nv_bfloat16*>(up),
+                reinterpret_cast<const float*>(act_scale),
+                reinterpret_cast<__nv_fp8_e4m3*>(out), n, to_stream(stream));
+        },
+        py::arg("gate"), py::arg("up"), py::arg("act_scale"), py::arg("out"),
+        py::arg("n"), py::arg("stream") = 0,
+        "The same gated product written straight as a static FP8 e4m3 GEMM input; "
+        "the bf16 product never reaches memory. n must be a multiple of 8.");
+
     m.def("ada_rms_norm",
         [](uintptr_t x, uintptr_t mod, uintptr_t out, int rows, int dim,
            float eps, uintptr_t stream) {
