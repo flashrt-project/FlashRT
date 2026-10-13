@@ -315,6 +315,7 @@ extern "C" void flash_rt_awq_quant_fp8_static_fp16(
 #endif
 #include "quantize/fp8_per_token_block_quant.cuh"
 #include "quantize/bias_gelu_quantize_fp8.cuh"
+#include "quantize/gelu_mul_quant_nvfp4_swizzled.cuh"
 #ifdef FLASHRT_HAVE_MOTUS_VAE_FP8
 #include "quantize/awq_quant_fp8_static_bf16.cuh"
 #endif
@@ -3739,6 +3740,23 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("out_fp8"), py::arg("act_scale"),
         py::arg("M"), py::arg("N"),
         py::arg("stream") = 0);
+
+    m.def("gelu_mul_quant_nvfp4_swizzled",
+        [](uintptr_t gate, uintptr_t up, uintptr_t cap, uintptr_t packed, uintptr_t sf,
+           int rows, int cols, uintptr_t stream) {
+            flash_rt::kernels::gelu_mul_quant_nvfp4_swizzled(
+                to_ptr(gate), to_ptr(up),
+                cap ? reinterpret_cast<const float*>(cap) : nullptr,
+                reinterpret_cast<uint8_t*>(packed), reinterpret_cast<uint8_t*>(sf),
+                rows, cols, to_stream(stream));
+        },
+        py::arg("gate"), py::arg("up"), py::arg("cap"), py::arg("packed"), py::arg("sf"),
+        py::arg("rows"), py::arg("cols"), py::arg("stream") = 0,
+        "Gated GeGLU activation straight into a clipped static NVFP4 GEMM input: "
+        "quant(bf16(bf16(gelu_tanh(gate)) * up)) with per-16 e2m1 values, UE4M3 "
+        "swizzled group scales and a per-group clip from `cap` (null disables).");
+    m.def("gelu_mul_quant_nvfp4_sf_bytes", &flash_rt::kernels::gelu_mul_quant_nvfp4_sf_bytes,
+        py::arg("rows"), py::arg("cols"), "Bytes the caller must allocate for sf.");
 
     m.def("bias_gelu_quantize_fp8_static_bf16_rounded",
         [](uintptr_t in_bf16, uintptr_t bias_bf16, uintptr_t out_fp8,
