@@ -8,6 +8,7 @@
 #include "common.cuh"
 #include "fp8_numeric_conversion.cuh"
 #include <math_constants.h>
+#include <stdexcept>
 
 // ── Gate Multiply + Residual ──
 template<typename T>
@@ -2479,4 +2480,99 @@ __global__ void clamp_inplace_fp16_kernel(__half* x, float limit, int n) {
 
 void clamp_inplace_fp16(__half* x, float limit, int n, cudaStream_t stream) {
     clamp_inplace_fp16_kernel<<<(n + 255) / 256, 256, 0, stream>>>(x, limit, n);
+}
+
+// ── Bias add over a column slice of a strided row ──
+// x[r, 0:cols] += b[0:cols] for rows of leading dimension ld, in place.
+//
+// This is the case add_bias_bf16 does not cover: that one takes a contiguous
+// (rows, cols) buffer whose row width IS the bias width. Here the row is wider
+// than the bias, which is what a fused QKV buffer looks like once only the
+// query third still carries a bias. One fp32 add and one bf16 rounding per
+// element, as add_bias_bf16; the vector width is a throughput choice, not a
+// numeric one.
+//
+// cols must be a multiple of 8: each thread moves 16 bytes.
+__global__ void add_bias_rows_bf16_kernel(__nv_bfloat16* __restrict__ x, long long ld,
+                                          const __nv_bfloat16* __restrict__ b,
+                                          long long rows, int cols) {
+    const long long vpr = cols >> 3;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         i < rows * vpr; i += (long long)gridDim.x * blockDim.x) {
+        const long long r = i / vpr;
+        const long long c = (i - r * vpr) << 3;
+        __nv_bfloat16* xr = x + r * ld + c;
+        uint4 xv = *reinterpret_cast<uint4*>(xr);
+        const uint4 bv = *reinterpret_cast<const uint4*>(b + c);
+        __nv_bfloat16* xh = reinterpret_cast<__nv_bfloat16*>(&xv);
+        const __nv_bfloat16* bh = reinterpret_cast<const __nv_bfloat16*>(&bv);
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            xh[j] = __float2bfloat16(__bfloat162float(xh[j]) + __bfloat162float(bh[j]));
+        *reinterpret_cast<uint4*>(xr) = xv;
+    }
+}
+
+void add_bias_rows_bf16(__nv_bfloat16* x, long long ld, const __nv_bfloat16* b,
+                        long long rows, int cols, cudaStream_t stream) {
+    if (cols <= 0 || cols % 8 != 0)
+        throw std::runtime_error("add_bias_rows_bf16: cols must be a positive multiple of 8");
+    if (ld < cols)
+        throw std::runtime_error("add_bias_rows_bf16: row stride is smaller than cols");
+    if (rows <= 0) return;
+    const long long n = rows * (cols >> 3);
+    int grid = (int)((n + 255) / 256);
+    if (grid > 65535) grid = 65535;
+    add_bias_rows_bf16_kernel<<<grid, 256, 0, stream>>>(x, ld, b, rows, cols);
+}
+
+// ── fp32 flow-matching step ops ──
+// A flow/ODE sampler integrates in fp32: x = x + v * dt. Kept separate from
+// euler_step_bf16_out, which is bf16 in and out.
+__global__ void axpy_f32_kernel(float* __restrict__ x, const float* __restrict__ v, float dt, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = x[i] + v[i] * dt;
+}
+
+void axpy_f32(float* x, const float* v, float dt, int n, cudaStream_t stream) {
+    if (n <= 0) return;
+    axpy_f32_kernel<<<(n + 255) / 256, 256, 0, stream>>>(x, v, dt, n);
+}
+
+// x[r, c] *= m[c] — a per-column scale over a row-major buffer. The scale is
+// usually a 0/1 mask, so this is an exact multiply rather than a blend.
+__global__ void mul_cols_f32_kernel(float* __restrict__ x, const float* __restrict__ m,
+                                    long long rows, int cols) {
+    const long long n = rows * (long long)cols;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         i < n; i += (long long)gridDim.x * blockDim.x)
+        x[i] = x[i] * m[i % cols];
+}
+
+void mul_cols_f32(float* x, const float* m, long long rows, int cols, cudaStream_t stream) {
+    if (rows <= 0 || cols <= 0) return;
+    const long long n = rows * (long long)cols;
+    int grid = (int)((n + 255) / 256);
+    if (grid > 65535) grid = 65535;
+    mul_cols_f32_kernel<<<grid, 256, 0, stream>>>(x, m, rows, cols);
+}
+
+// dst[r, c] = m ? src[r, c] * m[c] : src[r, c] — the same per-column scale
+// applied while copying, for a caller that must keep the unscaled source. A
+// null m is a plain copy.
+__global__ void copy_scaled_cols_f32_kernel(float* __restrict__ dst, const float* __restrict__ src,
+                                            const float* __restrict__ m, long long rows, int cols) {
+    const long long n = rows * (long long)cols;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+         i < n; i += (long long)gridDim.x * blockDim.x)
+        dst[i] = m ? src[i] * m[i % cols] : src[i];
+}
+
+void copy_scaled_cols_f32(float* dst, const float* src, const float* m,
+                          long long rows, int cols, cudaStream_t stream) {
+    if (rows <= 0 || cols <= 0) return;
+    const long long n = rows * (long long)cols;
+    int grid = (int)((n + 255) / 256);
+    if (grid > 65535) grid = 65535;
+    copy_scaled_cols_f32_kernel<<<grid, 256, 0, stream>>>(dst, src, m, rows, cols);
 }

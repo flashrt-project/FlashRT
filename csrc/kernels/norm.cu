@@ -6,6 +6,7 @@
 
 #include "norm.cuh"
 #include "common.cuh"
+#include <stdexcept>
 
 // ── RMSNorm ──
 template<typename T>
@@ -1624,3 +1625,80 @@ void residual_add_rms_norm_int8_rowwise_fp16(
         residual, x, weight, out, scales, seq_len, dim, eps);
 }
 #endif  // FLASHRT_ENABLE_CHAMELEON
+
+// ── Gemma3 RMSNorm: y = bf16( fp32(x) * rsqrt(mean(fp32(x)^2) + eps) * (1 + fp32(w)) ) ──
+//
+// Gemma3 scales by (1 + w) rather than by w, and forms it in fp32 per element.
+// Folding it into the weight ahead of time is not equivalent: bf16 near 1.0 has
+// a 1/128 step, so a pre-rounded (1 + w) is visibly coarser than the fp32
+// product.
+//
+// Rows may be strided, so the per-head q/k norm runs in place on a fused QKV
+// buffer: row r lives at
+//     (r / rows_per_group) * group_stride + (r % rows_per_group) * x_stride
+// For plain contiguous rows pass rows_per_group = rows with group_stride = 0;
+// rows_per_group = 1 would make r % rows_per_group always 0 and read row 0 for
+// every row. See norm.cuh for the full contract.
+//
+// `residual`, when non-null, reproduces HF's ordering for a post-norm residual:
+// the normalized value is rounded to bf16 first, then added to the residual, and
+// the sum is rounded again — `residual = bf16(residual + bf16(norm(x)))`. `out`
+// may be null when only the residual is wanted.
+__device__ __forceinline__ float gemma3_bf(float x) {
+    return __bfloat162float(__float2bfloat16(x));
+}
+
+__global__ void gemma3_rms_norm_kernel(const __nv_bfloat16* __restrict__ x, long long x_stride,
+                                       const __nv_bfloat16* __restrict__ w,
+                                       __nv_bfloat16* __restrict__ out, long long out_stride,
+                                       __nv_bfloat16* __restrict__ residual, long long res_stride,
+                                       int rows_per_group, long long group_stride,
+                                       int dim, float eps) {
+    const int r = blockIdx.x;
+    const long long base_x = (long long)(r / rows_per_group) * group_stride +
+                             (long long)(r % rows_per_group) * x_stride;
+    const __nv_bfloat16* xr = x + base_x;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        const float v = __bfloat162float(xr[i]);
+        ss += v * v;
+    }
+    __shared__ float red[32];
+    for (int o = 16; o; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float t = threadIdx.x < (blockDim.x + 31) / 32 ? red[threadIdx.x] : 0.f;
+        for (int o = 16; o; o >>= 1) t += __shfl_xor_sync(0xffffffffu, t, o);
+        if (threadIdx.x == 0) red[0] = t;
+    }
+    __syncthreads();
+    const float inv = rsqrtf(red[0] / (float)dim + eps);
+    const long long base_o = (long long)(r / rows_per_group) * group_stride +
+                             (long long)(r % rows_per_group) * out_stride;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        const float y = gemma3_bf(__bfloat162float(xr[i]) * inv * (1.0f + __bfloat162float(w[i])));
+        if (residual) {
+            __nv_bfloat16* rr = residual + (long long)r * res_stride;
+            rr[i] = __float2bfloat16(__bfloat162float(rr[i]) + y);
+        }
+        if (out) out[base_o + i] = __float2bfloat16(y);
+    }
+}
+
+void gemma3_rms_norm_bf16(const __nv_bfloat16* x, long long x_stride,
+                          const __nv_bfloat16* weight,
+                          __nv_bfloat16* out, long long out_stride,
+                          __nv_bfloat16* residual, long long res_stride,
+                          int rows, int rows_per_group, long long group_stride,
+                          int dim, float eps, cudaStream_t stream) {
+    if (rows <= 0 || dim <= 0) return;
+    if (rows_per_group <= 0)
+        throw std::runtime_error("gemma3_rms_norm_bf16: rows_per_group must be positive");
+    if (!out && !residual)
+        throw std::runtime_error("gemma3_rms_norm_bf16: give out, residual, or both");
+    const int threads = dim >= 1024 ? 1024 : (dim >= 256 ? 256 : 128);
+    gemma3_rms_norm_kernel<<<rows, threads, 0, stream>>>(
+        x, x_stride, weight, out, out_stride, residual, res_stride,
+        rows_per_group, group_stride, dim, eps);
+}

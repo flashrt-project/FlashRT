@@ -208,3 +208,26 @@ void residual_add_rms_norm_int8_rowwise_fp16(
         int seq_len, int dim, float eps,
         cudaStream_t stream = 0);
 #endif  // FLASHRT_ENABLE_CHAMELEON
+
+// ── Gemma3 RMSNorm ──
+// y = bf16( fp32(x) * rsqrt(mean(fp32(x)^2) + eps) * (1 + fp32(w)) ), with the
+// (1 + w) formed in fp32 per element; pre-rounding it into the weight is not
+// equivalent.
+//
+// Rows may be strided, which is what lets a per-head q/k norm run in place on a
+// fused QKV buffer. Row r starts at
+//   (r / rows_per_group) * group_stride + (r % rows_per_group) * x_stride
+// For plain contiguous rows pass rows_per_group = rows with group_stride = 0.
+// Bear in mind that rows_per_group = 1 does not mean "no grouping": r % 1 is
+// always 0, so every row would read row 0 and the call would quietly compute
+// one row's norm into all of them. Use group_stride = x_stride for one row per
+// group instead.
+//
+// `residual`, when non-null, is updated as bf16(residual + bf16(norm(x))) to
+// match HF's two roundings; `out` may be null when only the residual is wanted.
+void gemma3_rms_norm_bf16(const __nv_bfloat16* x, long long x_stride,
+                          const __nv_bfloat16* weight,
+                          __nv_bfloat16* out, long long out_stride,
+                          __nv_bfloat16* residual, long long res_stride,
+                          int rows, int rows_per_group, long long group_stride,
+                          int dim, float eps, cudaStream_t stream = 0);

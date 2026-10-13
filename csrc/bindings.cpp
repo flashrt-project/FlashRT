@@ -882,6 +882,27 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("x"), py::arg("weight"), py::arg("out"),
        py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f, py::arg("stream") = 0);
 
+    m.def("gemma3_rms_norm_bf16",
+        [](uintptr_t x, long long x_stride, uintptr_t weight,
+           uintptr_t out, long long out_stride,
+           uintptr_t residual, long long res_stride,
+           int rows, int rows_per_group, long long group_stride,
+           int dim, float eps, uintptr_t stream) {
+            gemma3_rms_norm_bf16(
+                typed_ptr<__nv_bfloat16>(x), x_stride, typed_ptr<__nv_bfloat16>(weight),
+                out ? typed_ptr<__nv_bfloat16>(out) : nullptr, out_stride,
+                residual ? typed_ptr<__nv_bfloat16>(residual) : nullptr, res_stride,
+                rows, rows_per_group, group_stride, dim, eps, to_stream(stream));
+        },
+        py::arg("x"), py::arg("x_stride"), py::arg("weight"),
+        py::arg("out"), py::arg("out_stride"),
+        py::arg("residual"), py::arg("res_stride"),
+        py::arg("rows"), py::arg("rows_per_group"), py::arg("group_stride"),
+        py::arg("dim"), py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "Gemma3 RMSNorm: y = bf16(fp32(x) * rsqrt(mean(fp32(x)^2) + eps) * (1 + fp32(w))). "
+        "Rows may be strided; a non-zero residual is updated with HF's two roundings. "
+        "Pass out = 0 or residual = 0 to skip one of the two stores.");
+
     m.def("bias_rms_norm_bf16", [](uintptr_t x, uintptr_t bias, uintptr_t weight,
                                     uintptr_t out, int seq_len, int dim,
                                     float eps, uintptr_t stream) {
@@ -1141,6 +1162,33 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         residual_add(typed_ptr<__nv_bfloat16>(residual),
                      typed_ptr<__nv_bfloat16>(x), n, to_stream(stream));
     }, py::arg("residual"), py::arg("x"), py::arg("n"), py::arg("stream") = 0);
+
+    // Bias add over the leading `cols` columns of a row of stride `ld`. The row
+    // is allowed to be wider than the bias, which add_bias_bf16 does not cover.
+    m.def("add_bias_rows_bf16", [](uintptr_t x, long long ld, uintptr_t bias,
+                                   long long rows, int cols, uintptr_t stream) {
+        add_bias_rows_bf16(typed_ptr<__nv_bfloat16>(x), ld, typed_ptr<__nv_bfloat16>(bias),
+                           rows, cols, to_stream(stream));
+    }, py::arg("x"), py::arg("ld"), py::arg("bias"), py::arg("rows"), py::arg("cols"),
+       py::arg("stream") = 0);
+
+    // fp32 flow/ODE step ops: x += v * dt, x[r,c] *= m[c], and the copying form
+    // of the latter with a nullable mask.
+    m.def("axpy_f32", [](uintptr_t x, uintptr_t v, float dt, int n, uintptr_t stream) {
+        axpy_f32(typed_ptr<float>(x), typed_ptr<float>(v), dt, n, to_stream(stream));
+    }, py::arg("x"), py::arg("v"), py::arg("dt"), py::arg("n"), py::arg("stream") = 0);
+
+    m.def("mul_cols_f32", [](uintptr_t x, uintptr_t m, long long rows, int cols, uintptr_t stream) {
+        mul_cols_f32(typed_ptr<float>(x), typed_ptr<float>(m), rows, cols, to_stream(stream));
+    }, py::arg("x"), py::arg("m"), py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
+
+    m.def("copy_scaled_cols_f32", [](uintptr_t dst, uintptr_t src, uintptr_t m,
+                                     long long rows, int cols, uintptr_t stream) {
+        copy_scaled_cols_f32(typed_ptr<float>(dst), typed_ptr<float>(src),
+                             m ? typed_ptr<float>(m) : nullptr, rows, cols, to_stream(stream));
+    }, py::arg("dst"), py::arg("src"), py::arg("m"), py::arg("rows"), py::arg("cols"),
+       py::arg("stream") = 0,
+       "dst[r, c] = m ? src[r, c] * m[c] : src[r, c]; pass m = 0 for a plain copy.");
 
 #ifdef ENABLE_PI05_SDE
     // Stochastic denoising step: x += a + (*sigma) * eps, bit-identical to

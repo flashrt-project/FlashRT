@@ -457,3 +457,23 @@ void cfg_combine_into_residual_fp16(__half* residual,
 // Symmetric in-place clamp: x = min(max(x, -limit), +limit)
 void clamp_inplace_fp16(__half* x, float limit, int n,
                         cudaStream_t stream = 0);
+
+// ── Bias add over a column slice of a strided row ──
+// x[r, 0:cols] += b[0:cols] in place, for rows of leading dimension ld > cols.
+// cols must be a positive multiple of 8. Unlike add_bias_bf16 the row may be
+// wider than the bias, e.g. a fused QKV buffer whose key and value thirds have
+// had their bias folded away.
+void add_bias_rows_bf16(__nv_bfloat16* x, long long ld, const __nv_bfloat16* b,
+                        long long rows, int cols, cudaStream_t stream = 0);
+
+// ── fp32 flow/ODE step ops ──
+// x = x + v * dt, all fp32.
+void axpy_f32(float* x, const float* v, float dt, int n, cudaStream_t stream = 0);
+
+// x[r, c] *= m[c] over a row-major buffer of `rows` x `cols` fp32 elements.
+void mul_cols_f32(float* x, const float* m, long long rows, int cols,
+                  cudaStream_t stream = 0);
+
+// dst[r, c] = m ? src[r, c] * m[c] : src[r, c]; a null m is a plain copy.
+void copy_scaled_cols_f32(float* dst, const float* src, const float* m,
+                          long long rows, int cols, cudaStream_t stream = 0);
