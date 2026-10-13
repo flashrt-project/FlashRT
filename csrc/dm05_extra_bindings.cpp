@@ -17,6 +17,7 @@
 #include <cuda_fp8.h>
 
 #include "kernels/dm05/dm05_ae_decode_attn.cuh"
+#include "kernels/dm05/dm05_prefix_attn.cuh"
 #include "kernels/dm05/dm05_vit_attn_hd72.cuh"
 
 namespace py = pybind11;
@@ -80,6 +81,27 @@ PYBIND11_MODULE(flash_rt_dm05, m) {
         "tile, so G*T must be an instantiated row count (8, 16, 20, 24, 32). "
         "ns > 1 splits the keys and needs the ws_o/ws_ml/cnt workspaces; ns = 1 "
         "writes the output directly and ignores them.");
+
+    m.def("dm05_prefix_attn",
+        [](uintptr_t q, uintptr_t k, uintptr_t v, uintptr_t out, uintptr_t lim,
+           int S, int NH, int NKV, float scale, uintptr_t stream) {
+            flash_rt::dm05::prefix_attn(
+                reinterpret_cast<const __nv_bfloat16*>(q),
+                reinterpret_cast<const __nv_bfloat16*>(k),
+                reinterpret_cast<const __nv_bfloat16*>(v),
+                reinterpret_cast<__nv_bfloat16*>(out),
+                reinterpret_cast<const int*>(lim),
+                S, NH, NKV, scale, to_stream(stream));
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("out"), py::arg("lim"),
+        py::arg("S"), py::arg("NH"), py::arg("NKV"), py::arg("scale"),
+        py::arg("stream") = 0,
+        "Gemma3 prefix attention with a per-row key limit: row i attends to keys "
+        "[0, lim[i]), which expresses a mask that is causal over text and "
+        "bidirectional within each image block. q/out are [S, NH*256] and k/v are "
+        "[S, NKV*256], with contiguous rows.");
+    m.def("dm05_prefix_attn_smem_bytes", &flash_rt::dm05::prefix_attn_smem_bytes,
+        "Dynamic shared memory the kernel requests per block, in bytes.");
 
     m.def("dm05_ae_decode_attn_supports_r", &flash_rt::dm05::ae_decode_attn_supports_r,
         py::arg("r"), "Whether this build instantiates the G*T row count r.");

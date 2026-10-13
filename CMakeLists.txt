@@ -1382,6 +1382,7 @@ if(FLASHRT_ENABLE_DM05)
   pybind11_add_module(flash_rt_dm05
     csrc/dm05_extra_bindings.cpp
     csrc/kernels/dm05/dm05_ae_decode_attn.cu
+    csrc/kernels/dm05/dm05_prefix_attn.cu
     csrc/kernels/dm05/dm05_vit_attn_hd72.cu)
   set_target_properties(flash_rt_dm05 PROPERTIES
     CUDA_STANDARD 17

@@ -251,5 +251,128 @@ class TestAeDecodeAttn:
                                   T_CHUNK, G_QKV, NKV_HEADS, 64, 4, AHD ** -0.5, _stream())
 
 
+# ── Gemma3 prefix attention with a per-row key limit ─────────────────────────
+
+PFX_HD, PFX_NH, PFX_NKV = 256, 8, 4
+
+
+def _prefix_reference(q, k, v, lim, scale, S):
+    """fp64 reference: row i attends to keys [0, lim[i]) on its key/value head."""
+    g = PFX_NH // PFX_NKV
+    qh = q.double().view(S, PFX_NH, PFX_HD)
+    kh = k.double().view(S, PFX_NKV, PFX_HD)
+    vh = v.double().view(S, PFX_NKV, PFX_HD)
+    cols = torch.arange(S, device=q.device)[None, :]
+    keep = cols < lim[:, None]                     # (S, S) per-row key limit
+    out = torch.zeros(S, PFX_NH, PFX_HD, dtype=torch.float64, device=q.device)
+    for hk in range(PFX_NKV):
+        for gg in range(g):
+            h = hk * g + gg
+            sc = (qh[:, h, :] * scale) @ kh[:, hk, :].T
+            sc = sc.masked_fill(~keep, float("-inf"))
+            out[:, h, :] = torch.softmax(sc, dim=-1) @ vh[:, hk, :]
+    return out.reshape(S, PFX_NH * PFX_HD).float()
+
+
+def _prefix_limits(S, kind, seg=0):
+    """causal (text), block-bidirectional (image), or mixed -- the real shape."""
+    if kind == "causal":
+        return torch.arange(1, S + 1, device="cuda", dtype=torch.int32)
+    lim = torch.empty(S, dtype=torch.int32, device="cuda")
+    if kind == "blocks":
+        for a in range(0, S, seg):
+            lim[a:min(a + seg, S)] = min(a + seg, S)
+    else:                                          # mixed: text then one image block
+        cut = S // 2
+        lim[:cut] = torch.arange(1, cut + 1, device="cuda", dtype=torch.int32)
+        lim[cut:] = S
+    return lim
+
+
+def _run_prefix(m, S, kind, seg=0, seed=0):
+    torch.manual_seed(seed)
+    lim = _prefix_limits(S, kind, seg)
+    q = (torch.randn(S, PFX_NH * PFX_HD, device="cuda") * 0.5).to(torch.bfloat16)
+    k = (torch.randn(S, PFX_NKV * PFX_HD, device="cuda") * 0.5).to(torch.bfloat16)
+    v = (torch.randn(S, PFX_NKV * PFX_HD, device="cuda") * 0.5).to(torch.bfloat16)
+    out = torch.zeros(S, PFX_NH * PFX_HD, device="cuda", dtype=torch.bfloat16)
+    scale = PFX_HD ** -0.5
+    m.dm05_prefix_attn(q.data_ptr(), k.data_ptr(), v.data_ptr(), out.data_ptr(),
+                       lim.data_ptr(), S, PFX_NH, PFX_NKV, scale, _stream())
+    torch.cuda.synchronize()
+    return out, _prefix_reference(q, k, v, lim, scale, S)
+
+
+class TestPrefixAttn:
+    @pytest.mark.parametrize("S,kind,seg", [
+        (568, "mixed", 0),        # the served shape: text then an image block
+        (568, "blocks", 256),
+        (568, "causal", 0),
+        (130, "blocks", 64),      # not a multiple of the 64-row tile
+        (1, "causal", 0),
+    ])
+    def test_matches_fp64_reference(self, S, kind, seg):
+        m = _dm05()
+        out, ref = _run_prefix(m, S, kind, seg)
+        max_abs = (out.float() - ref).abs().max().item()
+        cos = torch.nn.functional.cosine_similarity(
+            out.float().reshape(-1).double(), ref.reshape(-1).double(), dim=0).item()
+        assert max_abs < 0.05, f"max abs error {max_abs}"
+        assert cos > 0.9995, f"cosine {cos}"
+
+    def test_the_key_limit_is_actually_enforced(self):
+        """A kernel ignoring lim would attend to every key and still look right."""
+        m = _dm05()
+        S = 256
+        torch.manual_seed(4)
+        q = (torch.randn(S, PFX_NH * PFX_HD, device="cuda") * 0.5).to(torch.bfloat16)
+        k = (torch.randn(S, PFX_NKV * PFX_HD, device="cuda") * 0.5).to(torch.bfloat16)
+        v = (torch.randn(S, PFX_NKV * PFX_HD, device="cuda") * 0.5).to(torch.bfloat16)
+        scale = PFX_HD ** -0.5
+        outs = []
+        for lim_val in (S, S // 2):
+            lim = torch.full((S,), lim_val, device="cuda", dtype=torch.int32)
+            o = torch.zeros(S, PFX_NH * PFX_HD, device="cuda", dtype=torch.bfloat16)
+            m.dm05_prefix_attn(q.data_ptr(), k.data_ptr(), v.data_ptr(), o.data_ptr(),
+                               lim.data_ptr(), S, PFX_NH, PFX_NKV, scale, _stream())
+            torch.cuda.synchronize()
+            outs.append(o)
+        assert not torch.equal(outs[0], outs[1]), "the key limit changed nothing"
+
+    def test_row_zero_attends_to_exactly_one_key(self):
+        """With lim[0] == 1 the first row's output must equal its own value head."""
+        m = _dm05()
+        S = 128
+        torch.manual_seed(5)
+        lim = _prefix_limits(S, "causal")
+        q = (torch.randn(S, PFX_NH * PFX_HD, device="cuda") * 0.5).to(torch.bfloat16)
+        k = (torch.randn(S, PFX_NKV * PFX_HD, device="cuda") * 0.5).to(torch.bfloat16)
+        v = (torch.randn(S, PFX_NKV * PFX_HD, device="cuda") * 0.5).to(torch.bfloat16)
+        out = torch.zeros(S, PFX_NH * PFX_HD, device="cuda", dtype=torch.bfloat16)
+        m.dm05_prefix_attn(q.data_ptr(), k.data_ptr(), v.data_ptr(), out.data_ptr(),
+                           lim.data_ptr(), S, PFX_NH, PFX_NKV, PFX_HD ** -0.5, _stream())
+        torch.cuda.synchronize()
+        g = PFX_NH // PFX_NKV
+        for hk in range(PFX_NKV):
+            for gg in range(g):
+                h = hk * g + gg
+                want = v[0, hk * PFX_HD:(hk + 1) * PFX_HD]
+                assert torch.equal(out[0, h * PFX_HD:(h + 1) * PFX_HD], want), f"head {h}"
+
+    def test_guards(self):
+        m = _dm05()
+        S = 64
+        q = torch.zeros(S, PFX_NH * PFX_HD, device="cuda", dtype=torch.bfloat16)
+        out = torch.zeros_like(q)
+        lim = torch.zeros(S, device="cuda", dtype=torch.int32)
+        with pytest.raises(RuntimeError, match="null pointer"):
+            m.dm05_prefix_attn(q.data_ptr(), q.data_ptr(), q.data_ptr(), out.data_ptr(),
+                               0, S, PFX_NH, PFX_NKV, 1.0, _stream())
+        torch.cuda.synchronize()
+        with pytest.raises(RuntimeError, match="multiple of NKV"):
+            m.dm05_prefix_attn(q.data_ptr(), q.data_ptr(), q.data_ptr(), out.data_ptr(),
+                               lim.data_ptr(), S, 6, 4, 1.0, _stream())
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
