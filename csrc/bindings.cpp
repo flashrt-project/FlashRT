@@ -703,6 +703,13 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                                M, N, K, to_stream(stream));
         }, py::arg("A"), py::arg("B"), py::arg("D"), py::arg("bias"),
            py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0)
+        .def("bf16_run", [](GemmRunner& self,
+                                 uintptr_t A, uintptr_t B, uintptr_t D,
+                                 int M, int N, int K, uintptr_t stream) {
+            self.bf16_run(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, to_stream(stream));
+        }, py::arg("A"), py::arg("B"), py::arg("D"),
+           py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0,
+           "D = A(M,K) @ B(N,K)^T, no bias epilogue. Same B layout as bf16_nt_bias.")
         .def("bf16_nt_bias", [](GemmRunner& self,
                                  uintptr_t A, uintptr_t B, uintptr_t D, uintptr_t bias,
                                  int M, int N, int K, uintptr_t stream) {
