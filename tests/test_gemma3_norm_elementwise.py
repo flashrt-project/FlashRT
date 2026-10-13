@@ -839,3 +839,45 @@ class TestGemma3NormGateResidualAdaV8:
             z(2 * dim).data_ptr(), z(0, dim).data_ptr(), 0, dim, 1e-6,
             torch.cuda.current_stream().cuda_stream)
         torch.cuda.synchronize()
+
+
+class TestAnAllOnesRowNormalizesToOne:
+    """A row of ones has a sum of squares of exactly `dim` under any reduction
+    order, so with eps = 0 the kernel's argument is exactly 1.0 and the expected
+    output is bf16(1 + w), computable in torch exactly. That makes an exact
+    assertion possible, which the rest of this file cannot use.
+
+    This is a property test. It is NOT a regression test for __fdiv_rn, and was
+    written as one before being measured: reverting the fix in
+    gemma3_rms_norm_v8_kernel, rebuilding, and re-running leaves all five cases
+    passing. Inputs where an approximate and a correctly-rounded division differ
+    are rare -- the original measurement was 1 to 4 elements per 1.5M on random
+    data -- so a constructed input does not land on one, and a random sweep
+    cannot be checked exactly either, because torch's rsqrt and CUDA's rsqrtf
+    are not bit-identical and neither is usable as a reference here.
+
+    What would actually guard it: a direct test of the division itself, or an
+    exact reference for the whole normalization. Neither exists in this suite.
+    Until one does, the six __fdiv_rn sites are held only by the cross-pipeline
+    bit-parity check against the reference build, which lives outside the
+    repository.
+
+    A power-of-two `dim` is included as a control: there the two divisions agree,
+    so it passes either way.
+    """
+
+    @pytest.mark.parametrize("rows,dim", [(8, 2560), (4, 1152), (2, 24), (4, 1024)])
+    def test_an_all_ones_row_normalizes_to_one(self, rows, dim):
+        fvk = _fvk()
+        torch.manual_seed(51)
+        x = torch.ones(rows, dim, device="cuda", dtype=torch.bfloat16)
+        w = _bf16(torch.randn(dim, device="cuda") * 0.3)
+        out = torch.empty(rows, dim, device="cuda", dtype=torch.bfloat16)
+        fvk.gemma3_rms_norm_v8_bf16(x.data_ptr(), dim, w.data_ptr(), out.data_ptr(), dim,
+                                    0, dim, rows, rows, 0, dim, 0.0,
+                                    torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        want = _bf16(torch.ones_like(w.float()) * (1.0 + w.float()))
+        want = want.expand(rows, dim).contiguous()
+        nd = int((out != want).sum().item())
+        assert nd == 0, f"{nd} of {out.numel()} elements differ from bf16(1 + w) at dim={dim}"
