@@ -48,11 +48,31 @@ Measured with the same profiler on the same session as the native control — th
 delivered number was taken on an earlier day on a shared card, so a cross-day
 comparison would not attribute anything.
 
-| Configuration | E2E median | Kernels/predict | GPU busy |
-|---------------|-----------|-----------------|----------|
-| DM05 native pipeline (delivered) | 70.62 ms | 3675 | — |
-| DM05 native pipeline, same-session control | 70.93 ms | 3700 | 0.9945 |
-| **This pipeline** | **70.91 ms** | **3675** | **0.9967** |
+| Configuration | E2E median | Speedup vs PyTorch | Kernels/predict | GPU busy |
+|---------------|-----------|--------------------|-----------------|----------|
+| PyTorch (`inference_config._predict`, unmodified) | 253.0 ms | 1.00x | — | — |
+| DM05 native pipeline (delivered) | 70.62 ms | 3.58x | 3675 | — |
+| DM05 native pipeline, same-session control | 70.93 ms | 3.57x | 3700 | 0.9945 |
+| **This pipeline** | **70.91 ms** | **3.57x** | **3675** | **0.9967** |
+
+Operator provenance, same profiler, same observations:
+
+| | E2E | GPU kernel | Kernels/predict | ATen model math | Triton model math | Graph-external model math |
+|---|---|---|---|---|---|---|
+| PyTorch | 253.02 ms | 225.05 ms | 25543 | 28 | 34 | 922 |
+| This pipeline | 70.91 ms | 70.67 ms | 3675 | 0 | 0 | 0 |
+
+The PyTorch path leaves 922 model-math ops outside the graph and issues 28 ATen and 34
+Triton model-math invocations; this pipeline runs every one of its 3675 kernels inside
+a single CUDA graph replay, with zero framework dispatch. That is where most of the
+3.57x comes from, not from a faster kernel.
+
+The PyTorch row is the runtime's own `_predict` with nothing installed — the same
+object `serve.enable` captures as its reference before replacing it — measured through
+the same profiler on the same observations. It is worth stating because the 106.28 ms
+figure that appears in this model's optimization history is **not** that baseline: it
+is the campaign's own (already-optimized) starting point, and using it here would have
+overstated the speedup by roughly 2.4x.
 
 The port is level with the native control (70.91 against 70.93, inside noise), carries
 five fewer kernels, and sits 0.29 ms from the delivered figure measured on an earlier
@@ -80,6 +100,18 @@ a no-model A/B before being wired in.
 | Median | 0.999921 |
 | Observations below 0.99 | 0 |
 | Action vs native, cosine | 0.99999845 (max abs 6.9e-3) |
+
+Quality against the PyTorch reference, over the same 8 observations:
+
+| | cosine | max abs | rel-L2 |
+|---|---|---|---|
+| This pipeline vs PyTorch | 0.99990916 | 6.855e-2 | 1.351e-2 |
+| Native pipeline vs PyTorch | 0.99991268 | 6.855e-2 | 1.325e-2 |
+
+The two rows are the point: this pipeline deviates from PyTorch by essentially exactly
+what the native pipeline already deviated by. The distance comes from the static
+FP8/NVFP4 quantization the model was calibrated for, not from the port — if the port
+had introduced its own error it would show up as a gap between these rows.
 
 The gate reads identically across every configuration above — the composition, the
 fused kernels and the vectorized kernel all give min 0.990153 / median 0.999921. That
