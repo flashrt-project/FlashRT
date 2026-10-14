@@ -97,6 +97,22 @@ class _Ext:
     def ada_rms_norm(self, x, mod, out, rows, dim, eps, stream):
         fvk.ada_rms_norm(x, mod, out, rows, dim, eps, stream)
 
+    # ---- the action expert's fused gate + residual + adaLN. Same argument order in
+    # both builds, and verified bit-identical at (rows=10, dim=1024) on both outputs.
+    def gate_residual_ada_norm_v8(self, x, w, gate, residual, mod, out, rows, dim, eps, stream):
+        fvk.gemma3_norm_gate_residual_ada_v8_bf16(x, w, gate, residual, mod, out, rows,
+                                                  dim, eps, stream)
+
+    # The non-v8 sibling reduces the same sums in a different order, so it is not the
+    # same kernel and must not be aliased to it. At D=1024 the action expert's ternary
+    # always picks the v8 form, so this is unreachable on the delivered shape; it
+    # raises rather than returning a plausible wrong answer if that ever changes.
+    def gate_residual_ada_norm(self, *a, **k):
+        raise NotImplementedError(
+            "gate_residual_ada_norm is the strided-reduction sibling of "
+            "gate_residual_ada_norm_v8 and has no FlashRT route; it is unreachable at "
+            "D=1024, where the action expert selects the v8 form")
+
     # ---- attention
     def vit_attn_hd72(self, qkv, ld, D, out, o_ld, S, NH, nv, scale, mt, stream,
                       q8=0, q8_scale=0):
