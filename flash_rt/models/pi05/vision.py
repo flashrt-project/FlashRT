@@ -32,7 +32,7 @@ bf16 = torch.bfloat16
 
 def _kn(w: torch.Tensor) -> torch.Tensor:
     """nn.Linear weight (out, in) -> (in, out) contiguous, the bf16_nn B layout."""
-    return w.detach().to(bf16).t().contiguous()
+    return w.detach().to(bf16).contiguous()
 
 
 class NativeVision:
@@ -87,7 +87,9 @@ class NativeVision:
         # (1 + w) per element in fp32. Folding it into a bf16 weight instead would
         # quantise it to 1/128 steps near 1.0.
         self.mm_norm_w = projector.mm_soft_emb_norm.weight.detach().to(bf16).contiguous()
-        self.mm_proj_w = projector.mm_input_projection_weight.detach().to(bf16).contiguous()  # (1152, 2560) = (K, N)
+        # (2560, 1152) = (N, K): the projector weight is the one tensor the checkpoint
+        # already holds (K, N), so it needs the transpose the _kn helper no longer does
+        self.mm_proj_w = projector.mm_input_projection_weight.detach().to(bf16).t().contiguous()
 
         z = lambda *s: torch.empty(*s, dtype=bf16, device=d)
         self.pixels = z(self.nv, 3, self.img, self.img)
@@ -133,7 +135,7 @@ class NativeVision:
         D = self.D
         for w in self.layers:
             b = w["qkv_b"].float()
-            w["o_b"] = (w["o_b"].float() + b[2 * D:] @ w["o_w"].float()).to(w["o_b"].dtype).contiguous()
+            w["o_b"] = (w["o_b"].float() + b[2 * D:] @ w["o_w"].float().t()).to(w["o_b"].dtype).contiguous()
             keep = D if drop_k else 2 * D
             w["qkv_b"] = torch.cat([b[:keep], torch.zeros(3 * D - keep, device=b.device)]).to(w["qkv_b"].dtype).contiguous()
             w["q_b"] = w["qkv_b"][:keep]
@@ -145,7 +147,7 @@ class NativeVision:
         for i in (range(self.L) if layers is None else layers):
             for kind in kinds:
                 wkey, _ = self._DIMS[kind]
-                w_nk = self.layers[i][wkey].t().contiguous()      # stored (K, N) for bf16
+                w_nk = self.layers[i][wkey]                       # already (N, K)
                 self.fp8[(i, kind)] = Fp8Linear(w_nk, self.S, slots=1, name=f"vt.{i}.{kind}")
                 self.layers[i][wkey] = None                          # bf16 copy no longer used
 
@@ -156,7 +158,7 @@ class NativeVision:
         site = self.fp8.get((i, kind))
         if site is None:
             self.ext.gemm_bf16(x.data_ptr(), w[wkey].data_ptr(), out.data_ptr(), w[bkey].data_ptr(),
-                               self.S, n, k, stream)
+                               self.S, n, k, stream, True)
             return False
         if getattr(site, "_prequantized", False):
             site._prequantized = False       # activation already written by the fused kernel
@@ -183,7 +185,7 @@ class NativeVision:
             return self._forward_fused(stream)
         self.ext.patch_im2col_nchw_bf16(p(self.pixels), p(self.patches), self.nv, 3,
                                         self.img, self.img, self.P, stream)
-        mm(p(self.patches), p(self.w_patch), p(self.x), p(self.b_patch), S, D, self.patch_feat, stream)
+        mm(p(self.patches), p(self.w_patch), p(self.x), p(self.b_patch), S, D, self.patch_feat, stream, True)
         fvk.residual_add(p(self.x), p(self.pos), S * D, stream)
         for i, w in enumerate(self.layers):
             fvk.layer_norm(p(self.x), p(w["ln1_w"]), p(w["ln1_b"]), p(self.xn), S, D, self.eps, stream)
@@ -217,7 +219,7 @@ class NativeVision:
         T = self.nv * self.tok_per_view
         self.ext.gemma_rms_norm(p(self.pooled), D, p(self.mm_norm_w), p(self.pooled_n), D, 0, D,
                                 T, T, 0, D, self.proj_eps, stream)
-        mm(p(self.pooled_n), p(self.mm_proj_w), p(self.out), 0, T, self.out_dim, D, stream)
+        mm(p(self.pooled_n), p(self.mm_proj_w), p(self.out), 0, T, self.out_dim, D, stream, True)
 
     def _attention(self, stream: int, o_site=None) -> bool:
         """Returns True when the attention wrote o_site's FP8 input itself."""
@@ -251,7 +253,7 @@ class NativeVision:
         layer_norm."""
         p, S, D, e = self._p, self.S, self.D, self.ext
         e.patch_im2col_nchw_bf16(p(self.pixels), p(self.patches), self.nv, 3, self.img, self.img, self.P, stream)
-        e.gemm_bf16(p(self.patches), p(self.w_patch), p(self.x), p(self.b_patch), S, D, self.patch_feat, stream)
+        e.gemm_bf16(p(self.patches), p(self.w_patch), p(self.x), p(self.b_patch), S, D, self.patch_feat, stream, True)
         fvk.residual_add(p(self.x), p(self.pos), S * D, stream)
         L0 = self.layers[0]
         q0 = self.fp8[(0, "qkv")]
@@ -284,4 +286,4 @@ class NativeVision:
         T = self.nv * self.tok_per_view
         e.gemma_rms_norm(p(self.pooled), D, p(self.mm_norm_w), p(self.pooled_n), D, 0, D, T, T, 0, D,
                          self.proj_eps, stream)
-        e.gemm_bf16(p(self.pooled_n), p(self.mm_proj_w), p(self.out), 0, T, self.out_dim, D, stream)
+        e.gemm_bf16(p(self.pooled_n), p(self.mm_proj_w), p(self.out), 0, T, self.out_dim, D, stream, True)
