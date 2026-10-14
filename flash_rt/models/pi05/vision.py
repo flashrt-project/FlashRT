@@ -197,7 +197,7 @@ class NativeVision:
                 fvk.bias_residual(p(self.x), p(self.tmp), p(w["o_b"]), S, D, stream)
             else:
                 fvk.residual_add(p(self.x), p(self.tmp), S * D, stream)
-            fvk.layer_norm(p(self.x), p(w["ln2_w"]), p(w["ln2_b"]), p(self.xn), S, D, self.eps, stream)
+            fvk.layer_norm(p(self.x), p(w["ln2_w"]), p(w["ln2_b"]), 0, S, D, self.eps, stream)
             fc2 = self.fp8.get((i, "fc2"))
             if self._lin(i, "fc1", self.xn, self.h, self.FF, D, stream, defer_bias=True):
                 if fc2 is not None and fc2.calibrated and not fc2.calibrating:
@@ -257,8 +257,8 @@ class NativeVision:
         fvk.residual_add(p(self.x), p(self.pos), S * D, stream)
         L0 = self.layers[0]
         q0 = self.fp8[(0, "qkv")]
-        e.res_ln_quant(p(self.x), 0, 0, p(L0["ln1_w"]), p(L0["ln1_b"]), 0, p(q0.a8), p(q0.a_scale), S, D,
-                       self.eps, stream)
+        e.res_ln_quant(p(self.x), 0, 0, p(L0["ln1_w"]), p(L0["ln1_b"]), 0, p(q0.a8), p(q0.a_scale),
+                       S, D, self.eps, stream)
         for i, w in enumerate(self.layers):
             sq, so, s1, s2 = (self.fp8[(i, k)] for k in ("qkv", "o", "fc1", "fc2"))
             sq.gemm(self.qkv, S, stream)

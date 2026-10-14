@@ -72,6 +72,13 @@ class _Ext:
     def patch_im2col_nchw_bf16(self, src, dst, nv, C, H, W, P, stream):
         fvk.patch_im2col_nchw_bf16(src, dst, nv, C, H, W, P, stream)
 
+    def resize_norm(self, src, dst, nv, H, W, OH, OW, stream):
+        # uint8 HWC -> bf16 CHW, the OpenCV-compatible resize the raw-view path folds
+        # into the graph. Same coefficient/clamp arithmetic; the only build-dependent
+        # step is the (x - 127.5) / 127.5 rescale, which flash_rt_kernels compiles
+        # with --prec-div=false and therefore needs the rounding pinned explicitly.
+        fvk.resize_norm_u8_hwc_to_bf16_chw(src, dst, nv, H, W, OH, OW, stream)
+
     # ---- projections
     def lin_in_f32_bf16(self, x, w, b, out, T, D, A, stream):
         fvk.linear_f32_in_bf16_out(x, w, b, out, T, D, A, stream)
@@ -135,7 +142,7 @@ class _Ext:
         fvk.gelu_mul_quant_nvfp4_swizzled(gate, up, cap, packed, sf, rows, cols, stream)
 
     def bias_gelu_quant_fp8_v8(self, h, b, scale, out, rows, cols, stream):
-        fvk.bias_gelu_quantize_fp8_static_bf16_rounded(h, b, out, scale, rows, cols, stream)
+        fvk.bias_gelu_quantize_fp8_static_bf16_rounded_v8(h, b, out, scale, rows, cols, stream)
 
     def gemma_rms_norm_quant_v8(self, x, w, qparam, q, sf, rows, dim, eps, mode, stream):
         if mode == 0:
@@ -164,12 +171,13 @@ class _Ext:
     # elements differing in the LayerNorm intermediate because the fused kernel's
     # pair assignment differs. The 444 gate was re-run for that and passes.
     def res_ln_quant(self, r, y, b, w, beta, xn, q, scale, rows, dim, eps, stream):
-        if b:
-            fvk.bias_residual(r, y, b, rows, dim, stream)
-        else:
-            fvk.residual_add(r, y, rows * dim, stream)
-        fvk.layer_norm(r, w, beta, xn, rows, dim, eps, stream)
-        fvk.quantize_fp8_static(xn, q, scale, rows * dim, stream)
+        # One pass, matching the reference: residual add under `if (y)`, LayerNorm, and
+        # the static FP8 quantise, values kept in registers throughout. y == 0 skips the
+        # residual (then b is unused); xn == 0 skips the normalised store, which is what
+        # the vision tower passes -- the reference never materialises it, and the
+        # three-kernel composition this replaces had to write 4.7 MB per call to a
+        # scratch purely because layer_norm and quantize_fp8_static are separate kernels.
+        fvk.res_ln_quant_v8_bf16(r, y, b, w, beta, xn, q, scale, rows, dim, eps, stream)
 
     # qk_norm_rope_v8: per-head (1+w) RMSNorm in place on q and on the k rows already
     # in the cache, then HF rotate-half rope, both at head_dim 256 -- the native
@@ -177,13 +185,12 @@ class _Ext:
     # production shape: 0 of 1269760 q and 0 of 634880 k elements differ.
     def qk_norm_rope_v8(self, q, q_stride, nhq, k, k_stride, nhk, wq, wk, cosT, sinT,
                         seq, eps, stream):
-        HD = 256
-        fvk.gemma3_rms_norm_v8_bf16(q, HD, wq, q, HD, 0, HD, seq * nhq, nhq, q_stride,
-                                    HD, eps, stream)
-        fvk.gemma3_rms_norm_v8_bf16(k, HD, wk, k, HD, 0, HD, seq * nhk, nhk, k_stride,
-                                    HD, eps, stream)
-        fvk.rope_hf_bf16(q, q_stride, nhq, HD, cosT, sinT, seq, stream)
-        fvk.rope_hf_bf16(k, k_stride, nhk, HD, cosT, sinT, seq, stream)
+        # (1+w) RMSNorm + HF rotate-half RoPE over q and the cached k rows, one launch.
+        # FlashRT's csrc/kernels/qk_norm_rope_fused.cu cannot be used here: it is fp16
+        # with a layer norm and laid out for head_dim 128 (the Chameleon shape), while
+        # this is bf16 with a (1+w) RMSNorm at head_dim 256.
+        fvk.gemma3_qk_norm_rope_v8_bf16(q, q_stride, nhq, k, k_stride, nhk, wq, wk,
+                                        cosT, sinT, seq, eps, stream)
 
 
 def load():
