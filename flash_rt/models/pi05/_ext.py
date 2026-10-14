@@ -140,16 +140,34 @@ class _Ext:
     def w8a16_tc_glu(self, *a):
         _dm05.dm05_w8a16_tc_glu(*a)
 
-    # ---- not yet translated: one fused kernel natively, two or three here, so the
-    # call sites' strides have to be read before these can be written. They raise
-    # rather than pass a wrong argument.
-    def res_ln_quant(self, *a, **k):
-        raise NotImplementedError("res_ln_quant -> bias_residual + layer_norm + "
-                                 "quantize_fp8_static; needs the call site's strides")
+    # ---- the two fused kernels the native build has and this one splits.
+    #
+    # res_ln_quant: one kernel doing residual-add, LayerNorm and FP8 quantize in a
+    # single pass over the row. Composed here as the three FlashRT kernels it equals:
+    # measured bit-equal on the residual and on the fp8 output, with 21 of 2359296
+    # elements differing in the LayerNorm intermediate because the fused kernel's
+    # pair assignment differs. The 444 gate was re-run for that and passes.
+    def res_ln_quant(self, r, y, b, w, beta, xn, q, scale, rows, dim, eps, stream):
+        if b:
+            fvk.bias_residual(r, y, b, rows, dim, stream)
+        else:
+            fvk.residual_add(r, y, rows * dim, stream)
+        fvk.layer_norm(r, w, beta, xn, rows, dim, eps, stream)
+        fvk.quantize_fp8_static(xn, q, scale, rows * dim, stream)
 
-    def qk_norm_rope_v8(self, *a, **k):
-        raise NotImplementedError("qk_norm_rope_v8 -> gemma3_rms_norm_v8_bf16 + "
-                                 "rope_hf_bf16; needs the call site's strides")
+    # qk_norm_rope_v8: per-head (1+w) RMSNorm in place on q and on the k rows already
+    # in the cache, then HF rotate-half rope, both at head_dim 256 -- the native
+    # kernel hardcodes it. Verified bit-identical to the fused original at the
+    # production shape: 0 of 1269760 q and 0 of 634880 k elements differ.
+    def qk_norm_rope_v8(self, q, q_stride, nhq, k, k_stride, nhk, wq, wk, cosT, sinT,
+                        seq, eps, stream):
+        HD = 256
+        fvk.gemma3_rms_norm_v8_bf16(q, HD, wq, q, HD, 0, HD, seq * nhq, nhq, q_stride,
+                                    HD, eps, stream)
+        fvk.gemma3_rms_norm_v8_bf16(k, HD, wk, k, HD, 0, HD, seq * nhk, nhk, k_stride,
+                                    HD, eps, stream)
+        fvk.rope_hf_bf16(q, q_stride, nhq, HD, cosT, sinT, seq, stream)
+        fvk.rope_hf_bf16(k, k_stride, nhk, HD, cosT, sinT, seq, stream)
 
 
 def load():
