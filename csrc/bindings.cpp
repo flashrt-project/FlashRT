@@ -973,6 +973,41 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         "bit-comparable; pass residual = 0 or out = 0 to skip one of the stores. "
         "dim must be a multiple of 8.");
 
+    m.def("res_ln_quant_v8_bf16",
+        [](uintptr_t r, uintptr_t y, uintptr_t b, uintptr_t w, uintptr_t beta, uintptr_t xn,
+           uintptr_t q, uintptr_t scale, int rows, int dim, float eps, uintptr_t stream) {
+            res_ln_quant_v8_bf16(typed_ptr<__nv_bfloat16>(r),
+                                 y ? typed_ptr<__nv_bfloat16>(y) : nullptr,
+                                 b ? typed_ptr<__nv_bfloat16>(b) : nullptr,
+                                 typed_ptr<__nv_bfloat16>(w), typed_ptr<__nv_bfloat16>(beta),
+                                 xn ? typed_ptr<__nv_bfloat16>(xn) : nullptr,
+                                 q ? typed_ptr<__nv_fp8_e4m3>(q) : nullptr,
+                                 typed_ptr<float>(scale), rows, dim, eps, to_stream(stream));
+        },
+        py::arg("r"), py::arg("y"), py::arg("b"), py::arg("w"), py::arg("beta"), py::arg("xn"),
+        py::arg("q"), py::arg("scale"), py::arg("rows"), py::arg("dim"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "residual add + LayerNorm + static FP8 quantize, one pass, one rounding per output. "
+        "y == 0 skips the residual (and then b is unused); xn == 0 skips the normalised "
+        "bf16 store; q == 0 skips the quantise.");
+
+    m.def("gemma3_qk_norm_rope_v8_bf16",
+        [](uintptr_t q, long long q_stride, int nhq, uintptr_t k, long long k_stride, int nhk,
+           uintptr_t wq, uintptr_t wk, uintptr_t cosT, uintptr_t sinT,
+           int seq, float eps, uintptr_t stream) {
+            gemma3_qk_norm_rope_v8_bf16(typed_ptr<__nv_bfloat16>(q), q_stride, nhq,
+                                        typed_ptr<__nv_bfloat16>(k), k_stride, nhk,
+                                        typed_ptr<__nv_bfloat16>(wq), typed_ptr<__nv_bfloat16>(wk),
+                                        typed_ptr<__nv_bfloat16>(cosT), typed_ptr<__nv_bfloat16>(sinT),
+                                        seq, eps, to_stream(stream));
+        },
+        py::arg("q"), py::arg("q_stride"), py::arg("nhq"), py::arg("k"), py::arg("k_stride"),
+        py::arg("nhk"), py::arg("wq"), py::arg("wk"), py::arg("cos"), py::arg("sin"),
+        py::arg("seq"), py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "DM05: (1+w) RMSNorm then HF rotate-half RoPE, in place, over q and the cached k "
+        "rows, head_dim 256, one warp per (row, head). Bit-identical to "
+        "gemma3_rms_norm_v8_bf16 x2 + rope_hf_bf16 x2 but one launch instead of four.");
+
     m.def("gemma3_rms_norm_fp8_bf16",
         [](uintptr_t x, uintptr_t weight, uintptr_t out, uintptr_t a_scale,
            int rows, int dim, float eps, uintptr_t stream) {
@@ -3877,6 +3912,25 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         "bias + GELU(tanh) + static FP8 e4m3, with the activation rounded to bf16 "
         "before the scale and cast -- matching bias_gelu_bf16 followed by "
         "quantize_fp8_static. bias_bf16 may be null.");
+
+    m.def("bias_gelu_quantize_fp8_static_bf16_rounded_v8",
+        [](uintptr_t in_bf16, uintptr_t bias_bf16, uintptr_t out_fp8,
+           uintptr_t act_scale, long long M, int N, uintptr_t stream) {
+            flash_rt::quantize::bias_gelu_quantize_fp8_static_bf16_rounded_v8(
+                reinterpret_cast<const __nv_bfloat16*>(to_ptr(in_bf16)),
+                reinterpret_cast<const __nv_bfloat16*>(to_ptr(bias_bf16)),
+                reinterpret_cast<__nv_fp8_e4m3*>(to_ptr(out_fp8)),
+                reinterpret_cast<const float*>(act_scale),
+                M, N, to_stream(stream));
+        },
+        py::arg("in_bf16"), py::arg("bias_bf16"),
+        py::arg("out_fp8"), py::arg("act_scale"),
+        py::arg("M"), py::arg("N"),
+        py::arg("stream") = 0,
+        "Bit-identical to bias_gelu_quantize_fp8_static_bf16_rounded, 8 columns per "
+        "thread instead of one: the sibling's 2-byte-per-thread access pattern runs at "
+        "306 GB/s where this reaches the memory floor. Requires N % 8 == 0 and a "
+        "non-null bias_bf16.");
 
     // G7.15 — Fused 3D RoPE apply (bf16 → fp32) replacing 5-6 Python
     // launches per call with one CUDA kernel.

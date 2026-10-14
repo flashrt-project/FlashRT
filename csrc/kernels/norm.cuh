@@ -286,6 +286,24 @@ void gemma3_rms_norm_fp8_bf16(const __nv_bfloat16* x, const __nv_bfloat16* weigh
                               __nv_fp8_e4m3* out, const float* a_scale,
                               int rows, int dim, float eps, cudaStream_t stream = 0);
 
+// residual add + LayerNorm + static FP8 quantize in one pass. Bit-identical to the
+// reference kernel; the composition it replaces is also bit-identical but costs three
+// launches and materialises an xn the reference never writes. y == 0 skips the
+// residual, xn == 0 skips the normalised store; dim/2 must be <= 1024.
+void res_ln_quant_v8_bf16(__nv_bfloat16* r, const __nv_bfloat16* y, const __nv_bfloat16* b,
+                          const __nv_bfloat16* w, const __nv_bfloat16* beta, __nv_bfloat16* xn,
+                          __nv_fp8_e4m3* q, const float* scale, int rows, int dim, float eps,
+                          cudaStream_t stream = 0);
+
+// (1+w) RMSNorm + HF rotate-half RoPE in one pass over q and the cached k rows,
+// head_dim 256 (DM05). Bit-identical to the two-norm + two-rope composition but
+// one launch instead of four.
+void gemma3_qk_norm_rope_v8_bf16(__nv_bfloat16* q, long long q_stride, int nhq,
+                                 __nv_bfloat16* k, long long k_stride, int nhk,
+                                 const __nv_bfloat16* wq, const __nv_bfloat16* wk,
+                                 const __nv_bfloat16* cosT, const __nv_bfloat16* sinT,
+                                 int seq, float eps, cudaStream_t stream = 0);
+
 // ── Adaptive RMSNorm with one modulation shared by every row ──
 // y = bf16( bf16(x) * rsqrt(mean(fp32(x)^2) + eps) * (1 + scale) + shift ),
 // where `mod` is one 2*dim bf16 vector for all rows: scale at mod[0:dim],

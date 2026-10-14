@@ -132,7 +132,13 @@ __global__ void layer_norm_kernel(const T* __restrict__ x,
         T2 val = x2[i];
         local_sum += to_f32(val.x) + to_f32(val.y);
     }
-    float mean = block_reduce_sum(local_sum, shared) / dim;
+    // __fdiv_rn: this translation unit is built with --prec-div=false, so a plain
+    // `/ dim` is an approximate division. dim is a model width (1152 for the DM05
+    // tower) and not a power of two, so the two disagree in the last ulp -- enough to
+    // move a few normalized values across a bf16 rounding boundary and, downstream, to
+    // flip quantized FP8 activations. The reference these kernels are checked against
+    // divides correctly-rounded. Same treatment as the v8_block_sum family below.
+    float mean = __fdiv_rn(block_reduce_sum(local_sum, shared), (float)dim);
 
     float local_var = 0.0f;
     for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
@@ -140,7 +146,7 @@ __global__ void layer_norm_kernel(const T* __restrict__ x,
         float d0 = to_f32(val.x) - mean, d1 = to_f32(val.y) - mean;
         local_var += d0 * d0 + d1 * d1;
     }
-    float inv_std = rsqrtf(block_reduce_sum(local_var, shared) / dim + eps);
+    float inv_std = rsqrtf(__fdiv_rn(block_reduce_sum(local_var, shared), (float)dim) + eps);
 
     for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
         T2 xv = x2[i], wv = w2[i], bv = b2[i];
@@ -2129,6 +2135,179 @@ void gemma3_rms_norm_v8_bf16(const __nv_bfloat16* x, long long x_stride,
     gemma3_rms_norm_v8_kernel<<<rows, dim / 8, 0, stream>>>(
         x, x_stride, weight, out, out_stride, residual, res_stride,
         rows_per_group, group_stride, dim, eps);
+}
+
+// (1+w) RMSNorm followed by HF rotate-half RoPE, fused over q and the cached k rows
+// in one pass, head_dim 256. One warp per (row, head); lane l holds elements 8l..8l+7,
+// so the rotate-half partner (j +- 128) sits in lane l ^ 16 and needs no extra traffic.
+//
+// The reference emits this as a single kernel. Composing it from two
+// gemma3_rms_norm_v8_bf16 plus two rope_hf_bf16 calls is bit-identical but costs four
+// launches and writes then re-reads every q and k; measured at +1191 launches and
+// +4.8 ms end to end over a full predict, which is the whole of the port's regression.
+//
+// Per-element rounding matches the reference exactly: y = bf(f * inv * (1 + w)), then
+// out = __float2bfloat16(bf(y*cos) + bf(+-yp*sin)). HD is 256, a power of two, so
+// `ss / (float)HD` is exact even under --prec-div=false and needs no __fdiv_rn.
+__global__ void gemma3_qk_norm_rope_v8_kernel(
+        __nv_bfloat16* __restrict__ q, long long q_stride, int nhq,
+        __nv_bfloat16* __restrict__ k, long long k_stride, int nhk,
+        const __nv_bfloat16* __restrict__ wq, const __nv_bfloat16* __restrict__ wk,
+        const __nv_bfloat16* __restrict__ cosT, const __nv_bfloat16* __restrict__ sinT,
+        int seq, float eps) {
+    constexpr int HD = 256;
+    union Gemma3QkRope { uint4 u; __nv_bfloat16 h[8]; };
+    const int lane = threadIdx.x & 31;
+    const long long vec = (long long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const long long nq = (long long)seq * nhq, total = nq + (long long)seq * nhk;
+    if (vec >= total) return;
+    const bool isq = vec < nq;
+    const long long v = isq ? vec : vec - nq;
+    const int nh = isq ? nhq : nhk;
+    const int s = (int)(v / nh), h = (int)(v % nh);
+    __nv_bfloat16* x = (isq ? q + (long long)s * q_stride : k + (long long)s * k_stride)
+                       + (long long)h * HD;
+    const int c = lane * 8;
+    Gemma3QkRope xv, wv, cv, sv;
+    xv.u = *reinterpret_cast<const uint4*>(x + c);
+    wv.u = *reinterpret_cast<const uint4*>((isq ? wq : wk) + c);
+    cv.u = *reinterpret_cast<const uint4*>(cosT + (long long)s * HD + c);
+    sv.u = *reinterpret_cast<const uint4*>(sinT + (long long)s * HD + c);
+    float f[8], ss = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { f[j] = __bfloat162float(xv.h[j]); ss += f[j] * f[j]; }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    const float inv = rsqrtf(ss / (float)HD + eps);
+    const bool lo = lane < 16;
+    Gemma3QkRope ov;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const float y = gemma3_bf(f[j] * inv * (1.0f + __bfloat162float(wv.h[j])));
+        const float yp = __shfl_xor_sync(0xffffffffu, y, 16);
+        const float cc = __bfloat162float(cv.h[j]), sn = __bfloat162float(sv.h[j]);
+        ov.h[j] = __float2bfloat16(gemma3_bf(y * cc) + (lo ? gemma3_bf(-yp * sn) : gemma3_bf(yp * sn)));
+    }
+    *reinterpret_cast<uint4*>(x + c) = ov.u;
+}
+
+void gemma3_qk_norm_rope_v8_bf16(__nv_bfloat16* q, long long q_stride, int nhq,
+                                 __nv_bfloat16* k, long long k_stride, int nhk,
+                                 const __nv_bfloat16* wq, const __nv_bfloat16* wk,
+                                 const __nv_bfloat16* cosT, const __nv_bfloat16* sinT,
+                                 int seq, float eps, cudaStream_t stream) {
+    if (seq <= 0 || nhq <= 0 || nhk <= 0) return;
+    const long long vecs = (long long)seq * (nhq + nhk);
+    const int wpb = 4;                                  // 4 warps = 128 threads per block
+    gemma3_qk_norm_rope_v8_kernel<<<(int)((vecs + wpb - 1) / wpb), wpb * 32, 0, stream>>>(
+        q, q_stride, nhq, k, k_stride, nhk, wq, wk, cosT, sinT, seq, eps);
+}
+
+// residual add + LayerNorm + static FP8 quantize in a single pass -- the reference
+// emits this as one kernel, and composing it from bias_residual + layer_norm +
+// quantize_fp8_static costs three launches and forces the normalised values through
+// DRAM in a scratch the reference never writes (4.7 MB per call, 54 calls per predict).
+//
+// Two details are load-bearing and neither is cosmetic:
+//
+//   * rcp.approx.ftz.f32 and mul.rn.ftz.f32 are pinned in the reference, so they are
+//     pinned here. FlashRT has no equivalent and `1.0f / x` is not the same operation.
+//   * the reduction reproduces frt_block_sum exactly (shfl_down 16..1, then warp 0 over
+//     the per-warp sums). A different tree moves mean/inv_std by an ulp, which is
+//     precisely what made this op fail the 444 gate before the division sites were
+//     pinned -- the two are the same class of error.
+//
+// `dim / 2 <= 256 * MAXP`; D=1152 needs np <= 3, so MAXP=4 covers it. The residual and
+// normalised values stay in v0/v1 registers across the two passes, which is what lets
+// xn stay untouched when the caller passes 0.
+namespace {
+__device__ __forceinline__ float dm05_warp_sum(float v) {
+    v += __shfl_down_sync(0xffffffffu, v, 16);
+    v += __shfl_down_sync(0xffffffffu, v, 8);
+    v += __shfl_down_sync(0xffffffffu, v, 4);
+    v += __shfl_down_sync(0xffffffffu, v, 2);
+    v += __shfl_down_sync(0xffffffffu, v, 1);
+    return v;
+}
+__device__ __forceinline__ float dm05_block_sum(float v, float* sh) {
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    v = dm05_warp_sum(v);
+    if (lane == 0) sh[wid] = v;
+    __syncthreads();
+    const int nw = blockDim.x >> 5;
+    v = (threadIdx.x < nw) ? sh[threadIdx.x] : 0.0f;
+    if (wid == 0) v = dm05_warp_sum(v);
+    if (threadIdx.x == 0) sh[0] = v;
+    __syncthreads();
+    const float r = sh[0];
+    __syncthreads();
+    return r;
+}
+__device__ __forceinline__ float dm05_rcp(float s) {
+    float r; asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(s)); return r;
+}
+__device__ __forceinline__ float dm05_mul(float a, float b) {
+    float r; asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r;
+}
+}  // namespace
+
+template <int MAXP>
+__global__ void __launch_bounds__(256)
+res_ln_quant_v8_bf16_kernel(__nv_bfloat16* __restrict__ r, const __nv_bfloat16* __restrict__ y,
+                            const __nv_bfloat16* __restrict__ b, const __nv_bfloat16* __restrict__ w,
+                            const __nv_bfloat16* __restrict__ beta, __nv_bfloat16* __restrict__ xn,
+                            __nv_fp8_e4m3* __restrict__ q, const float* __restrict__ scale,
+                            int dim, float eps) {
+    __shared__ float sh[32];
+    const int row = blockIdx.x, dim2 = dim >> 1;
+    __nv_bfloat162* r2 = reinterpret_cast<__nv_bfloat162*>(r + (long long)row * dim);
+    float v0[MAXP], v1[MAXP];
+    int np = 0;
+    float ls = 0.f;
+    for (int i = threadIdx.x; i < dim2; i += 256, ++np) {
+        __nv_bfloat162 rv = r2[i];
+        float a0 = __bfloat162float(rv.x), a1 = __bfloat162float(rv.y);
+        if (y) {
+            const __nv_bfloat162 yv = reinterpret_cast<const __nv_bfloat162*>(y + (long long)row * dim)[i];
+            const __nv_bfloat162 bv = reinterpret_cast<const __nv_bfloat162*>(b)[i];
+            a0 = gemma3_bf(a0 + __bfloat162float(yv.x) + __bfloat162float(bv.x));
+            a1 = gemma3_bf(a1 + __bfloat162float(yv.y) + __bfloat162float(bv.y));
+            r2[i] = __floats2bfloat162_rn(a0, a1);
+        }
+        v0[np] = a0; v1[np] = a1;
+        ls += a0 + a1;
+    }
+    const float mean = __fdiv_rn(dm05_block_sum(ls, sh), (float)dim);
+    float lv = 0.f;
+    for (int j = 0; j < np; ++j) {
+        const float d0 = v0[j] - mean, d1 = v1[j] - mean;
+        lv += d0 * d0 + d1 * d1;
+    }
+    const float inv_std = rsqrtf(__fdiv_rn(dm05_block_sum(lv, sh), (float)dim) + eps);
+    const float inv_s = q ? dm05_rcp(scale[0]) : 0.f;
+    int j = 0;
+    for (int i = threadIdx.x; i < dim2; i += 256, ++j) {
+        const __nv_bfloat162 wv = reinterpret_cast<const __nv_bfloat162*>(w)[i];
+        const __nv_bfloat162 bb = reinterpret_cast<const __nv_bfloat162*>(beta)[i];
+        const float o0 = gemma3_bf((v0[j] - mean) * inv_std * __bfloat162float(wv.x) + __bfloat162float(bb.x));
+        const float o1 = gemma3_bf((v1[j] - mean) * inv_std * __bfloat162float(wv.y) + __bfloat162float(bb.y));
+        if (xn) reinterpret_cast<__nv_bfloat162*>(xn + (long long)row * dim)[i] = __floats2bfloat162_rn(o0, o1);
+        if (q) {
+            __nv_fp8_e4m3* qr = q + (long long)row * dim + 2 * i;
+            qr[0] = __nv_fp8_e4m3(fminf(fmaxf(dm05_mul(o0, inv_s), -448.f), 448.f));
+            qr[1] = __nv_fp8_e4m3(fminf(fmaxf(dm05_mul(o1, inv_s), -448.f), 448.f));
+        }
+    }
+}
+
+void res_ln_quant_v8_bf16(__nv_bfloat16* r, const __nv_bfloat16* y, const __nv_bfloat16* b,
+                          const __nv_bfloat16* w, const __nv_bfloat16* beta, __nv_bfloat16* xn,
+                          __nv_fp8_e4m3* q, const float* scale, int rows, int dim, float eps,
+                          cudaStream_t stream) {
+    if (rows <= 0 || dim <= 0) return;
+    if (dim % 2) throw std::runtime_error("res_ln_quant_v8_bf16: dim must be even");
+    if (dim / 2 > 256 * 4) throw std::runtime_error("res_ln_quant_v8_bf16: dim too large for MAXP=4");
+    res_ln_quant_v8_bf16_kernel<4><<<rows, 256, 0, stream>>>(r, y, b, w, beta, xn, q, scale, dim, eps);
 }
 
 void ada_rms_norm(const __nv_bfloat16* x, const __nv_bfloat16* mod,

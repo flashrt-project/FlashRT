@@ -51,5 +51,16 @@ void bias_gelu_quantize_fp8_static_bf16_rounded(
     const float* act_scale_ptr,
     long long M, int N,
     cudaStream_t stream = 0);
+
+// Identical arithmetic to the entry above -- bit-identical output -- but 8 columns
+// per thread, which is what the shape DM05 uses needs to reach the memory floor.
+// Requires N % 8 == 0 and a non-null bias.
+void bias_gelu_quantize_fp8_static_bf16_rounded_v8(
+    const __nv_bfloat16* in,
+    const __nv_bfloat16* bias,
+    __nv_fp8_e4m3* out,
+    const float* act_scale_ptr,
+    long long M, int N,
+    cudaStream_t stream = 0);
 }  // namespace quantize
 }  // namespace flash_rt
