@@ -67,6 +67,12 @@ Triton model-math invocations; this pipeline runs every one of its 3675 kernels 
 a single CUDA graph replay, with zero framework dispatch. That is where most of the
 3.57x comes from, not from a faster kernel.
 
+**Compare against the same-session control, not the delivered figure.** The two native
+rows are the *same configuration* measured on different days and they differ by 0.31 ms,
+which is fifteen times the gap between this pipeline and the native control. That drift
+is why the control exists: without it, cross-day movement would be read as the port's
+cost. The number that answers "did the port make this slower" is 70.91 against 70.93.
+
 The PyTorch row is the runtime's own `_predict` with nothing installed — the same
 object `serve.enable` captures as its reference before replacing it — measured through
 the same profiler on the same observations. It is worth stating because the 106.28 ms
@@ -93,13 +99,19 @@ a no-model A/B before being wired in.
 
 ## Accuracy (444 real LIBERO observations)
 
-| Metric | Value |
-|--------|-------|
-| Minimum cosine | 0.990153 |
-| 1st percentile | 0.996626 |
-| Median | 0.999921 |
-| Observations below 0.99 | 0 |
-| Action vs native, cosine | 0.99999845 (max abs 6.9e-3) |
+The reference is the **unmodified `inference_config._predict`** -- the PyTorch path.
+Verified rather than assumed: running that path over the same 444 observations
+reproduces the gate reference bit for bit (`min cosine 1.000000`), which is what makes
+this gate a PyTorch comparison and not merely a self-consistency check.
+
+Metric is the 6-DoF arm, as in the gate.
+
+| Metric | This pipeline | Native pipeline (delivered) |
+|--------|---------------|------------------------------|
+| Minimum cosine | 0.990153 | 0.990423 |
+| 1st percentile | 0.996626 | -- |
+| Median | 0.999921 | -- |
+| Observations below 0.99 | 0 | 0 |
 
 Quality against the PyTorch reference, over the same 8 observations:
 
@@ -112,6 +124,13 @@ The two rows are the point: this pipeline deviates from PyTorch by essentially e
 what the native pipeline already deviated by. The distance comes from the static
 FP8/NVFP4 quantization the model was calibrated for, not from the port — if the port
 had introduced its own error it would show up as a gap between these rows.
+
+**The gripper dimension is not bit-exact and the gate does not cover it.** Over the 444
+observations no single one matches the PyTorch gripper value exactly (mean absolute
+difference 0.00529). Four flip outright, at a maximum difference of 2.0. The gripper is
+a near-binary signal, so a last-ulp difference in the arm logits can cross its decision
+boundary; the 6-DoF arm metric above is unaffected, which is why the gate uses it. If a
+downstream consumer is sensitive to gripper timing, this is the number to look at.
 
 The gate reads identically across every configuration above — the composition, the
 fused kernels and the vectorized kernel all give min 0.990153 / median 0.999921. That
