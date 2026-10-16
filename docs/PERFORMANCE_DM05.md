@@ -1,4 +1,7 @@
-# DM05-LIBERO FlashRT — Performance Specifications
+# DM05-LIBERO FlashRT — Recorded Performance
+
+These are the author's measurements before the frontend integration follow-up.
+They do not establish numerical parity or latency for the current revision.
 
 RTX 5060 Ti (SM120, 16 GB, 36 SMs, ~387 GB/s measured), CUDA 13.2, driver 595.84,
 PyTorch 2.11.0+cu130, Python 3.12.
@@ -8,16 +11,16 @@ Model: DM05-LIBERO. SigLIP vision tower (27 layers, 448 px, 2 views, head_dim 72
 head_dim 256, 5 full + 29 sliding layers) and an action expert (34 layers, D=1024,
 FF=4096, 8 query / 4 KV heads, head_dim 256, action dim 32, 10 Euler steps).
 
-The pipeline lives in `flash_rt/models/pi05/` — DM05 is the Pi0.5 architecture at
-identical dimensions, so it is a variant pipeline there rather than a separate model
-directory. It reaches its kernels through `_ext`, an adapter over this repository's
-`flash_rt_kernels`.
+The compute pipeline lives in `flash_rt/models/dm05/pipeline_rtx.py`, with a
+dedicated Torch frontend and dispatch entry. DM05's Gemma3 prefix is distinct
+from Pi0.5's PaliGemma prefix; overlapping kernel shapes do not imply identical
+model semantics. `_ext` adapts calls to this repository's compiled kernels.
 
 ## Build Configuration
 
 ```sh
-cmake -DFLASHRT_ENABLE_DM05=ON -DGPU_ARCH=120 ..
-make -j$(nproc) flash_rt_kernels
+cmake -S . -B build -DFLASHRT_ENABLE_DM05=ON -DGPU_ARCH=120
+cmake --build build -j4 --target flash_rt_kernels flash_rt_dm05 flash_rt_fa2
 ```
 
 ## Kernel Modules
@@ -25,20 +28,22 @@ make -j$(nproc) flash_rt_kernels
 | Module | Contents | Gate |
 |--------|----------|------|
 | `flash_rt_kernels` | FP8/NVFP4 GEMM, the norm/quantize family, and the three DM05 fusions below | Always built |
-| `flash_rt_fa2` | FlashAttention2 BF16/FP8 forward | Always built |
+| `flash_rt_fa2` | FlashAttention2 BF16/FP8 forward | RTX attention build |
+| `flash_rt_dm05` | DM05 attention and W8A16 kernels | `FLASHRT_ENABLE_DM05=ON`, SM120 |
 
 ## Entry Point
 
 ```python
-from flash_rt.models.pi05 import serve
-native = serve.enable(inference_config, calibration_state=state)
+from flash_rt import load_model
+model = load_model(checkpoint, config="dm05", hardware="rtx_sm120", use_fp4=True)
+model.pipeline.load_calibration_state(calibration_state)
+actions = model.predict(images=images, prompt=prompt, state=state)
 ```
 
-`serve.enable` builds the pipeline, installs this package's preprocessing, and
-replaces `inference_config._predict` with a host-staged predict whose entire GPU side
-is one CUDA graph replay. Use it rather than wiring the pieces up by hand: the
-preprocessing install and `make_predict` have to come from the same module tree, and
-mixing two copies of `preprocess.py` fails silently (see Precision Notes).
+The frontend owns the checkpoint, preprocessing wrappers, calibration and graph
+capture. No external runtime methods or transform lists are replaced. The public
+API example above is the current integration; the measurements below describe the
+earlier implementation and need a fresh complete-action and latency run.
 
 ## End-to-End Inference
 
@@ -74,7 +79,7 @@ is why the control exists: without it, cross-day movement would be read as the p
 cost. The number that answers "did the port make this slower" is 70.91 against 70.93.
 
 The PyTorch row is the runtime's own `_predict` with nothing installed — the same
-object `serve.enable` captures as its reference before replacing it — measured through
+reference object used by the earlier integration — measured through
 the same profiler on the same observations. It is worth stating because the 106.28 ms
 figure that appears in this model's optimization history is **not** that baseline: it
 is the campaign's own (already-optimized) starting point, and using it here would have
@@ -172,12 +177,9 @@ a handful of elements per 2.36M moved across a bf16 boundary, which at the real
 calibration scales flipped a few quantized FP8 values. A tail effect, never a median
 one — if the median moves, look for a topology error instead.
 
-**Two copies of `preprocess.py` make two distinct `RawAwareTokenization` classes.**
-`install` inserts an instance of whichever copy it was imported from; `make_predict`
-tests with `isinstance` against its own. Mixing the two trees leaves the transform
-stack without a tokenizer and raises a bare `StopIteration` from inside the predict
-path. `serve.enable` exists to keep them on one tree and raises if `install` refuses
-the stack.
+**Preprocessing ownership.** `build_transforms` returns frontend-local image and
+tokenization wrappers. It leaves the model package's transform list unchanged.
+State-bearing prompts rebuild state tokens instead of using a text-only cache hit.
 
 **The reference's fast-math primitives are pinned in the fusions.**
 `rcp.approx.ftz.f32` and `mul.rn.ftz.f32` are reproduced as inline asm in
@@ -192,6 +194,11 @@ FP16 and BF16. The new DM05 fused kernels remain separate additions; this model
 integration does not change existing LayerNorm arithmetic. The measurements above
 are the author's earlier revision records, not a new validation of this follow-up.
 
-Merge remains pending the standard hardware-specific frontend/pipeline routing
-and a complete-action comparison that includes gripper decisions. The existing
-six-dimensional arm gate does not validate the four reported gripper flips.
+The integration now routes `("dm05", "torch", "rtx_sm120")` to its own frontend
+and `models/dm05/pipeline_rtx.py`. The frontend owns loading, input/output
+transforms, calibration and graph capture. The serving example calls the public
+VLA API; it never replaces external runtime methods.
+
+The 444-observation complete-action gate is still pending. In particular, the four
+reported gripper decision flips have not been retested or declared fixed.
+See [the validation procedure](dm05_sm120.md#complete-action-validation).

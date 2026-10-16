@@ -719,3 +719,19 @@ When adding a new model or kernel, read these in order:
    `fvk` kernels grouped by purpose, current production fusion
    patterns, what does and does not fuse, and the catalog of failed
    optimizations (OPT-3 / OPT-5 / v1.5-B2 / v1.5-B4) to avoid.
+
+
+### DM05-LIBERO on RTX SM120
+
+`load_model(checkpoint, config="dm05", framework="torch", hardware="rtx_sm120",
+use_fp4=True, num_views=2)` selects the DM05 frontend and its mixed NVFP4/FP8/INT8
+tier. Existing model defaults are unchanged. DM05 requires its external model
+distribution for loading and IO transforms, and `FLASHRT_ENABLE_DM05=ON` for kernels.
+
+Before `predict(images, prompt=..., state=...)`, load calibrated scales through
+`model.pipeline.load_calibration_state(state_or_path)`, or call
+`model.calibrate(observations, percentile=100.0)` with representative real data.
+The frontend consumes the model package; it does not replace runtime methods.
+LIBERO outputs are `(10, 7)`. Other hardware/frameworks and unimplemented precision
+requests fail explicitly. Full-action numerical and gripper-decision validation
+remains required; see [DM05 validation](dm05_sm120.md#complete-action-validation).

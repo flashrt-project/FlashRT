@@ -22,7 +22,7 @@ import torch
 
 from . import _ext
 from ._release import release
-from ..flash_rt_attention import _bshd_strides, _fwd, _scratch, _PREFIX_SPLIT
+from .attention import _bshd_strides, _fwd, _scratch, _PREFIX_SPLIT
 
 bf16 = torch.bfloat16
 

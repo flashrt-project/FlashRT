@@ -119,6 +119,10 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("spark_x25", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.spark_x25_rtx", "SparkX25TorchFrontendRtx"),
 
+    # DM05 uses its own Gemma3 prefix and action expert; it is not a Pi0.5 checkpoint.
+    ("dm05", "torch", "rtx_sm120"):
+        ("flash_rt.frontends.torch.dm05_rtx", "Dm05TorchFrontendRtx"),
+
     # ── Pi0.5 ──
     ("pi05", "torch", "thor"):
         ("flash_rt.frontends.torch.pi05_thor", "Pi05TorchFrontendThor"),

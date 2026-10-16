@@ -1,7 +1,8 @@
 # DM05-LIBERO FlashRT serving agent
 
-FastAPI wrapper around the DM05-LIBERO pipeline. Loads the checkpoint once, installs
-FlashRT's pipeline over it with `serve.enable`, and serves one prediction per request.
+FastAPI wrapper around the DM05-LIBERO frontend. Loads the model with
+`flash_rt.load_model(config="dm05", use_fp4=True)` and serves `model.predict()`
+once per request. No external runtime methods are replaced.
 
 ## Install
 
@@ -51,8 +52,8 @@ ordered for it, otherwise key order is used.
 ## Notes
 
 - `latency_ms` is measured around the predict call and **includes** host-side
-  preprocessing, because that is what the caller waits for. The equal-scope numbers in
-  `docs/PERFORMANCE_DM05.md` are measured the same way.
+  preprocessing, because that is what the caller waits for. The historical numbers in
+  `docs/PERFORMANCE_DM05.md` precede this frontend integration and must be rechecked.
 - Requests are handled one at a time: the pipeline is a captured CUDA graph over a
   fixed prompt layout, so concurrent calls would contend for the same buffers. Put a
   worker pool in front for more than one in flight, one process per GPU.

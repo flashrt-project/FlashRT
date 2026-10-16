@@ -2,8 +2,8 @@
 
 The served transform chain resizes each 256x256 view to 448x448 on the host
 (albumentations PadToSquare + A.Resize = cv2 INTER_LINEAR on uint8) and then runs the
-Gemma3 image processor (rescale 1/255, normalize 0.5/0.5). ``install`` replaces both
-with a pass-through of the raw uint8 views; ``NativeDM05`` then resizes and normalizes
+Gemma3 image processor (rescale 1/255, normalize 0.5/0.5). The frontend wraps both
+with a pass-through of the raw uint8 views; the DM05 pipeline then resizes and normalizes
 them on device inside its CUDA graph (``dm05_native.resize_norm``), bit-identical to the
 host chain (verified: 0 of 24,084,480 resized bytes differ, and the bf16 pixel tensor is
 equal on all 444 observations of the LIBERO evaluation corpus).
@@ -50,7 +50,7 @@ class RawAwareTokenization(CachedChatTokenization):
             return super().__call__(data)
         key = self._key(data)
         entry = self.cache.get(key)
-        if entry is None or key in self.fallback:
+        if entry is None or key in self.fallback or self.inner.add_state:
             # first request for this prompt: build and verify the token cache through the
             # original path (it needs the resized images), then answer with raw pixels
             from PIL import Image
@@ -74,15 +74,15 @@ class RawAwareTokenization(CachedChatTokenization):
         return self.pixel_transform.transform_pipeline(image=a)["image"]
 
 
-def install(inference_config) -> bool:
-    """Swap the served PixelTransform/ChatTokenization for the native-preprocessing pair."""
-    tr = inference_config.input_transform.transforms
+def build_transforms(transforms):
+    """Build frontend-owned wrappers without changing the source transform list."""
+    tr = list(transforms)
     names = [type(t).__name__ for t in tr]
     if "PixelTransform" not in names or "ChatTokenization" not in names:
-        return False
+        raise ValueError("DM05 needs PixelTransform and ChatTokenization in its input transforms")
     pi, ci = names.index("PixelTransform"), names.index("ChatTokenization")
     pix = tr[pi]
     tok = RawAwareTokenization(tr[ci])
     tok.pixel_transform = pix
     tr[pi], tr[ci] = RawImages(pix), tok
-    return True
+    return tr, tok

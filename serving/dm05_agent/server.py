@@ -17,10 +17,10 @@ The observation shape matches the LIBERO harness, so a client can post what it
 already has. Actions come back as a plain JSON array -- (chunk, action_dim) floats --
 because that is what a robot client can use directly.
 
-The checkpoint is loaded by the model's own runtime and FlashRT's pipeline is
-installed over it by `serve.enable`. Benchmark numbers for this configuration are in
-docs/PERFORMANCE_DM05.md; they are equal-scope E2E, so they include the host-side
-preprocessing this endpoint performs per request.
+The server calls flash_rt.load_model(config="dm05") and model.predict().
+The frontend owns model loading, preprocessing and graph capture. Historical
+measurements are in docs/PERFORMANCE_DM05.md; this integration still needs its
+full-action quality gate and a fresh end-to-end measurement.
 """
 from __future__ import annotations
 
@@ -59,48 +59,19 @@ def _load(checkpoint, calibration, diffusion_steps=10, views=("Head", "Left wris
     global _runtime
     if _runtime is not None:
         return _runtime
-
-    import torch
-
-    from playground.dm05_libero import DM05Exp
-
-    exp = DM05Exp(
-        task="inference",
-        model_config=DM05Exp.__dataclass_fields__["model_config"].default_factory(),
-        data_config=DM05Exp.__dataclass_fields__["data_config"].default_factory(),
-        inference_config=DM05Exp.__dataclass_fields__["inference_config"].default_factory(),
-    )
-    exp.model_config.model_name_or_path = str(checkpoint)
-    exp.model_config.chunk_size = 10
-    exp.model_config.vision_attn_implementation = "sdpa"
-    exp.inference_config.output_action_dim = 7
-    exp.inference_config.image_prompts = list(views)
-    exp._initialize_inference_runtime()
-    ic = exp.inference_config
-    ic.diffusion_steps = diffusion_steps
-
-    from flash_rt.models.pi05 import serve
-
-    state = torch.load(calibration, map_location="cuda", weights_only=False)
-    serve.enable(ic, calibration_state=state, unwrap=_unwrap)
-    log.info("pipeline installed (diffusion_steps=%d, views=%s)", diffusion_steps, list(views))
-    _runtime = (ic, views)
+    from flash_rt import load_model
+    model = load_model(checkpoint, config="dm05", framework="torch", hardware="rtx_sm120",
+                       use_fp4=True, num_views=len(views), num_steps=diffusion_steps)
+    model.pipeline.load_calibration_state(calibration)
+    _runtime = model, views
     return _runtime
-
-
-def _unwrap(model):
-    try:
-        from opendm.model.dm05.dm05_lora import unwrap_dm05_model
-    except ImportError:
-        return model
-    return unwrap_dm05_model(model)
 
 
 def _do_predict(inp: dict) -> dict:
     import torch
     from PIL import Image
 
-    ic, views = _runtime
+    model, views = _runtime
     o = inp["observation"]
 
     # Ordered by the configured view list where the client supplied those names,
@@ -109,14 +80,10 @@ def _do_predict(inp: dict) -> dict:
     images = [Image.open(io.BytesIO(base64.b64decode(o["images"][k]))).convert("RGB")
               for k in names]
 
-    data = ic._prepare_model_input(
-        text=o.get("prompt", ""), images=images,
-        states=o["state"], robot_type=o.get("robot_type"),
-    )
-
+    data = {"images": images, "state": o["state"], "robot_type": o.get("robot_type")}
     t0 = time.perf_counter()
     with torch.no_grad():
-        action = np.asarray(ic._predict(data))
+        action = np.asarray(model.predict(data, prompt=o.get("prompt", "")))
     latency = (time.perf_counter() - t0) * 1000.0
 
     return {"request_id": uuid.uuid4().hex,

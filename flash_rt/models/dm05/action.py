@@ -24,7 +24,7 @@ import torch
 from . import _ext
 from ._release import release
 from .text import _rope_tables
-from ..flash_rt_attention import _bshd_strides, _fwd
+from .attention import _bshd_strides, _fwd
 
 bf16 = torch.bfloat16
 

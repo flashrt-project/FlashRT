@@ -25,7 +25,7 @@ import torch.nn.functional as F
 from flash_rt import flash_rt_kernels as fvk
 
 from . import _ext
-from ..flash_rt_attention import _bshd_strides, _fwd
+from .attention import _bshd_strides, _fwd
 
 bf16 = torch.bfloat16
 
