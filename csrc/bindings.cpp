@@ -66,6 +66,19 @@
 #ifdef FLASHRT_PI05_DECODER_SKINNY_SM120
 #include "kernels/pi05/pi05_decoder_skinny_fp8_sm120.cuh"
 #endif
+#ifdef FLASHRT_PI05_DECODER_FP4_SM120
+#include "kernels/pi05/pi05_decoder_skinny_fp4_sm120.cuh"
+#endif
+#ifdef FLASHRT_NVFP4_SKINNY_SM120
+#include "gemm/fp4/nvfp4_skinny_gemm_sm120.cuh"
+#include "gemm/fp4/nvfp4_skinny_consumers_sm120.cuh"
+#include "gemm/fp4/nvfp4_skinny_attention_sm120.cuh"
+#include "gemm/fp4/cutlass_nvfp4_gemm_bias_res_sm120.cuh"
+#include "gemm/fp4/cutlass_nvfp4_gemm_glu_fp4out_sm120.cuh"
+#include "kernels/nvfp4_prefill_sm120.cuh"
+#include "kernels/fp8_prefill_fp16.cuh"
+#include "kernels/fused_qkv_attention.cuh"
+#endif
 #if defined(ENABLE_CUTLASS_SM120_NVFP4_W4A16) || defined(ENABLE_CUTLASS_SM100_NVFP4_W4A16)
 #include "quantize/nvfp4_sf_reshape_sm120.cuh"
 #endif
@@ -7878,6 +7891,252 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("pdl") = true, py::arg("stream") = 0);
 #endif  // ENABLE_PI05_SDE
 #endif  // FLASHRT_PI05_DECODER_SKINNY_SM120
+
+#ifdef FLASHRT_NVFP4_SKINNY_SM120
+    // Skinny NVFP4 (W4A4) GEMM family (sm_120a): fragment-major packed weights
+    // streamed before the PDL wait, K-split FP32 partials, and fused block
+    // consumers that emit the next NVFP4 operand. See
+    // gemm/fp4/nvfp4_skinny_gemm_sm120.cuh and nvfp4_skinny_consumers_sm120.cuh.
+    m.def("nvfp4_skinny_config_count", []() { return flash_rt::nvfp4_skinny::config_count(); });
+    m.def("nvfp4_skinny_config_k_chunk", [](int cfg) { return flash_rt::nvfp4_skinny::config_k_chunk(cfg); },
+          py::arg("cfg"));
+    m.def("nvfp4_skinny_config_supports", [](int cfg, int N, int K) {
+        return flash_rt::nvfp4_skinny::config_supports(cfg, N, K);
+    }, py::arg("cfg"), py::arg("N"), py::arg("K"));
+    m.def("nvfp4_skinny_gemm", [](uintptr_t A, uintptr_t SFA, uintptr_t W, uintptr_t SFB, uintptr_t partials,
+                                 int M, int N, int K, int cfg, bool pdl, uintptr_t stream) {
+        return flash_rt::nvfp4_skinny::gemm(to_ptr(A), to_ptr(SFA), to_ptr(W), to_ptr(SFB),
+                                            typed_ptr<float>(partials), M, N, K, cfg, pdl, to_stream(stream));
+    }, py::arg("A"), py::arg("SFA"), py::arg("W"), py::arg("SFB"), py::arg("partials"), py::arg("M"),
+       py::arg("N"), py::arg("K"), py::arg("cfg"), py::arg("pdl") = true, py::arg("stream") = 0);
+    m.def("nvfp4_skinny_gemm_bf16_act", [](uintptr_t A, uintptr_t a_gs, uintptr_t W, uintptr_t SFB,
+                                          uintptr_t partials, int M, int N, int K, int cfg, bool pdl,
+                                          uintptr_t stream) {
+        return flash_rt::nvfp4_skinny::gemm_bf16_act(typed_ptr<__nv_bfloat16>(A), typed_ptr<float>(a_gs),
+                                                     to_ptr(W), to_ptr(SFB), typed_ptr<float>(partials),
+                                                     M, N, K, cfg, pdl, to_stream(stream));
+    }, py::arg("A"), py::arg("a_gs"), py::arg("W"), py::arg("SFB"), py::arg("partials"), py::arg("M"),
+       py::arg("N"), py::arg("K"), py::arg("cfg"), py::arg("pdl") = true, py::arg("stream") = 0);
+    m.def("nvfp4_skinny_pack_weight", [](uintptr_t w, uintptr_t sf, uintptr_t w_packed, uintptr_t sf_packed,
+                                        int N, int K, uintptr_t stream) {
+        return flash_rt::nvfp4_skinny::pack_weight(typed_ptr<uint8_t>(w), typed_ptr<uint8_t>(sf),
+                                                  typed_ptr<uint8_t>(w_packed), typed_ptr<uint8_t>(sf_packed),
+                                                  N, K, to_stream(stream));
+    }, py::arg("w"), py::arg("sf"), py::arg("w_packed"), py::arg("sf_packed"), py::arg("N"), py::arg("K"),
+       py::arg("stream") = 0);
+    m.def("nvfp4_skinny_quantize_weight", [](uintptr_t w, uintptr_t gs, uintptr_t out, uintptr_t out_sf,
+                                            int N, int K, uintptr_t stream, int mse_steps) {
+        return flash_rt::nvfp4_skinny::quantize_weight(typed_ptr<__nv_bfloat16>(w), typed_ptr<float>(gs),
+                                                      typed_ptr<uint8_t>(out), typed_ptr<uint8_t>(out_sf),
+                                                      N, K, mse_steps, to_stream(stream));
+    }, py::arg("w"), py::arg("gs"), py::arg("out"), py::arg("out_sf"), py::arg("N"), py::arg("K"),
+       py::arg("stream") = 0, py::arg("mse_steps") = 0);
+    m.def("nvfp4_skinny_layer_norm", [](uintptr_t x, uintptr_t scale, uintptr_t shift, uintptr_t out,
+                                       uintptr_t out_sf, uintptr_t out_gs, uintptr_t out_bf16, int rows, int dim,
+                                       float eps, bool pdl, uintptr_t stream) {
+        return flash_rt::nvfp4_skinny::layer_norm_fp4(
+            typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(scale), typed_ptr<__nv_bfloat16>(shift),
+            typed_ptr<uint8_t>(out), typed_ptr<uint8_t>(out_sf), typed_ptr<float>(out_gs),
+            typed_ptr<__nv_bfloat16>(out_bf16), rows, dim, eps, pdl, to_stream(stream));
+    }, py::arg("x"), py::arg("scale"), py::arg("shift"), py::arg("out"), py::arg("out_sf"), py::arg("out_gs"),
+       py::arg("out_bf16"), py::arg("rows"), py::arg("dim"), py::arg("eps"), py::arg("pdl") = true,
+       py::arg("stream") = 0);
+    m.def("nvfp4_skinny_partials_attention", [](uintptr_t partials, int splits, uintptr_t a_gs, uintptr_t w_gs,
+                                               uintptr_t bias, int n_proj, uintptr_t k_ext, uintptr_t v_ext,
+                                               int kv_ld, int kv_seq, bool kv_static, uintptr_t out, int rows,
+                                               int heads, int hd, float scale, bool pdl, uintptr_t stream) {
+        return flash_rt::nvfp4_skinny::partials_attention(
+            typed_ptr<float>(partials), splits, typed_ptr<float>(a_gs), typed_ptr<float>(w_gs),
+            typed_ptr<__nv_bfloat16>(bias), n_proj, typed_ptr<__nv_bfloat16>(k_ext), typed_ptr<__nv_bfloat16>(v_ext),
+            kv_ld, kv_seq, kv_static, typed_ptr<__nv_bfloat16>(out), rows, heads, hd, scale, pdl, to_stream(stream));
+    }, py::arg("partials"), py::arg("splits"), py::arg("a_gs"), py::arg("w_gs"), py::arg("bias"), py::arg("n_proj"),
+       py::arg("k_ext"), py::arg("v_ext"), py::arg("kv_ld"), py::arg("kv_seq"), py::arg("kv_static"), py::arg("out"),
+       py::arg("rows"), py::arg("heads"), py::arg("hd"), py::arg("scale"), py::arg("pdl") = true,
+       py::arg("stream") = 0);
+    m.def("nvfp4_skinny_sum_bias_residual_norm", [](uintptr_t partials, int splits, uintptr_t a_gs, uintptr_t w_gs,
+                                                   uintptr_t bias, uintptr_t residual, uintptr_t scale,
+                                                   uintptr_t shift, uintptr_t out, uintptr_t out_sf,
+                                                   uintptr_t out_gs, uintptr_t out_bf16, int rows, int dim,
+                                                   float eps, bool pdl, uintptr_t stream) {
+        return flash_rt::nvfp4_skinny::sum_bias_residual_norm(
+            typed_ptr<float>(partials), splits, typed_ptr<float>(a_gs), typed_ptr<float>(w_gs),
+            typed_ptr<__nv_bfloat16>(bias), typed_ptr<__nv_bfloat16>(residual), typed_ptr<__nv_bfloat16>(scale),
+            typed_ptr<__nv_bfloat16>(shift), typed_ptr<uint8_t>(out), typed_ptr<uint8_t>(out_sf),
+            typed_ptr<float>(out_gs), typed_ptr<__nv_bfloat16>(out_bf16), rows, dim, eps, pdl, to_stream(stream));
+    }, py::arg("partials"), py::arg("splits"), py::arg("a_gs"), py::arg("w_gs"), py::arg("bias"),
+       py::arg("residual"), py::arg("scale"), py::arg("shift"), py::arg("out"), py::arg("out_sf"),
+       py::arg("out_gs"), py::arg("out_bf16"), py::arg("rows"), py::arg("dim"), py::arg("eps"),
+       py::arg("pdl") = true, py::arg("stream") = 0);
+    m.def("nvfp4_skinny_sum_bias_gelu", [](uintptr_t partials, int splits, uintptr_t a_gs, uintptr_t w_gs,
+                                          uintptr_t bias, uintptr_t out, uintptr_t out_sf, uintptr_t out_gs,
+                                          int rows, int n, bool pdl, uintptr_t stream) {
+        return flash_rt::nvfp4_skinny::sum_bias_gelu_fp4(
+            typed_ptr<float>(partials), splits, typed_ptr<float>(a_gs), typed_ptr<float>(w_gs),
+            typed_ptr<__nv_bfloat16>(bias), typed_ptr<uint8_t>(out), typed_ptr<uint8_t>(out_sf),
+            typed_ptr<float>(out_gs), rows, n, pdl, to_stream(stream));
+    }, py::arg("partials"), py::arg("splits"), py::arg("a_gs"), py::arg("w_gs"), py::arg("bias"), py::arg("out"),
+       py::arg("out_sf"), py::arg("out_gs"), py::arg("rows"), py::arg("n"), py::arg("pdl") = true,
+       py::arg("stream") = 0);
+    // NVFP4 prefill: CUTLASS block-scaled GEMM with bias + residual source, and the
+    // row kernels producing / routing its operands (swizzled UE4M3 scales).
+    // See gemm/fp4/cutlass_nvfp4_gemm_bias_res_sm120.cuh, kernels/nvfp4_prefill_sm120.cuh.
+    m.def("nvfp4_gemm_bias_res_bf16out", [](uintptr_t A, uintptr_t B, uintptr_t SFA, uintptr_t SFB, uintptr_t bias,
+                                           uintptr_t C, uintptr_t D, int M, int N, int K, uintptr_t alpha,
+                                           float beta, int schedule, uintptr_t stream) {
+        return flash_rt::gemm::nvfp4_gemm_bias_res_bf16out_sm120(to_ptr(A), to_ptr(B), to_ptr(SFA), to_ptr(SFB),
+                                                                to_ptr(bias), to_ptr(C), to_ptr(D), M, N, K,
+                                                                typed_ptr<float>(alpha), beta, schedule,
+                                                                to_stream(stream));
+    }, py::arg("A"), py::arg("B"), py::arg("SFA"), py::arg("SFB"), py::arg("bias"), py::arg("C"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"), py::arg("alpha"), py::arg("beta"), py::arg("schedule") = 0,
+       py::arg("stream") = 0);
+    m.def("nvfp4_sf_bytes", [](int rows, int cols) { return flash_rt::nvfp4_prefill::sf_bytes(rows, cols); },
+          py::arg("rows"), py::arg("cols"));
+    m.def("nvfp4_norm_quant", [](uintptr_t x, uintptr_t weight, uintptr_t bias, int mode, float eps, uintptr_t out,
+                                uintptr_t out_sf, uintptr_t gs, int rows, int dim, uintptr_t stream,
+                                uintptr_t residual) {
+        return flash_rt::nvfp4_prefill::norm_quant(typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(residual),
+                                                   typed_ptr<__nv_bfloat16>(weight), typed_ptr<__nv_bfloat16>(bias),
+                                                   mode, eps, typed_ptr<uint8_t>(out), typed_ptr<uint8_t>(out_sf),
+                                                   typed_ptr<float>(gs), rows, dim, to_stream(stream));
+    }, py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("mode"), py::arg("eps"), py::arg("out"),
+       py::arg("out_sf"), py::arg("gs"), py::arg("rows"), py::arg("dim"), py::arg("stream") = 0,
+       py::arg("residual") = 0);
+    m.def("nvfp4_gemm_bias_gelu_fp4out", [](uintptr_t A, uintptr_t B, uintptr_t SFA, uintptr_t SFB, uintptr_t bias,
+                                           uintptr_t D, uintptr_t SFD, int M, int N, int K, uintptr_t alpha,
+                                           uintptr_t norm_constant, uintptr_t stream) {
+        return flash_rt::gemm::nvfp4_gemm_bias_gelu_fp4out_sm120(to_ptr(A), to_ptr(B), to_ptr(SFA), to_ptr(SFB),
+                                                                to_ptr(bias), to_ptr(D), to_ptr(SFD), M, N, K,
+                                                                typed_ptr<float>(alpha), typed_ptr<float>(norm_constant),
+                                                                to_stream(stream));
+    }, py::arg("A"), py::arg("B"), py::arg("SFA"), py::arg("SFB"), py::arg("bias"), py::arg("D"), py::arg("SFD"),
+       py::arg("M"), py::arg("N"), py::arg("K"), py::arg("alpha"), py::arg("norm_constant"), py::arg("stream") = 0);
+    m.def("nvfp4_gemm_geglu_fold_fp4out", [](uintptr_t A, uintptr_t B_il, uintptr_t SFA, uintptr_t SFB_il,
+                                            uintptr_t D, uintptr_t SFD, int M, int N_il, int K, uintptr_t alpha_gate,
+                                            uintptr_t alpha_up, uintptr_t norm_constant, uintptr_t stream) {
+        return flash_rt::gemm::nvfp4_gemm_geglu_fold_fp4out_sm120(to_ptr(A), to_ptr(B_il), to_ptr(SFA),
+                                                                 to_ptr(SFB_il), to_ptr(D), to_ptr(SFD), M, N_il, K,
+                                                                 typed_ptr<float>(alpha_gate),
+                                                                 typed_ptr<float>(alpha_up),
+                                                                 typed_ptr<float>(norm_constant), to_stream(stream));
+    }, py::arg("A"), py::arg("B_il"), py::arg("SFA"), py::arg("SFB_il"), py::arg("D"), py::arg("SFD"), py::arg("M"),
+       py::arg("N_il"), py::arg("K"), py::arg("alpha_gate"), py::arg("alpha_up"), py::arg("norm_constant"),
+       py::arg("stream") = 0);
+    m.def("nvfp4_quant", [](uintptr_t x, int ld, uintptr_t out, uintptr_t out_sf, uintptr_t gs, int rows, int cols,
+                           uintptr_t stream) {
+        return flash_rt::nvfp4_prefill::quant(typed_ptr<__nv_bfloat16>(x), ld, typed_ptr<uint8_t>(out),
+                                              typed_ptr<uint8_t>(out_sf), typed_ptr<float>(gs), rows, cols,
+                                              to_stream(stream));
+    }, py::arg("x"), py::arg("ld"), py::arg("out"), py::arg("out_sf"), py::arg("gs"), py::arg("rows"),
+       py::arg("cols"), py::arg("stream") = 0);
+    m.def("nvfp4_qk_norm_rope", [](uintptr_t qkv, int ld, int q_off, int k_off, int n_q, int n_k, int hd,
+                                  uintptr_t cos, uintptr_t sin, uintptr_t q_norm, uintptr_t k_norm, float eps, int S,
+                                  uintptr_t stream) {
+        return flash_rt::nvfp4_prefill::qk_norm_rope(typed_ptr<__nv_bfloat16>(qkv), ld, q_off, k_off, n_q, n_k, hd,
+                                                     typed_ptr<float>(cos), typed_ptr<float>(sin),
+                                                     typed_ptr<__nv_bfloat16>(q_norm),
+                                                     typed_ptr<__nv_bfloat16>(k_norm), eps, S, to_stream(stream));
+    }, py::arg("qkv"), py::arg("ld"), py::arg("q_off"), py::arg("k_off"), py::arg("n_q"), py::arg("n_k"),
+       py::arg("hd"), py::arg("cos"), py::arg("sin"), py::arg("q_norm"), py::arg("k_norm"), py::arg("eps"),
+       py::arg("S"), py::arg("stream") = 0);
+    m.def("nvfp4_scatter_add_rows", [](uintptr_t h, uintptr_t src, uintptr_t idx, int n, int dim, uintptr_t stream) {
+        return flash_rt::nvfp4_prefill::scatter_add_rows(typed_ptr<__nv_bfloat16>(h), typed_ptr<__nv_bfloat16>(src),
+                                                         typed_ptr<int64_t>(idx), n, dim, to_stream(stream));
+    }, py::arg("h"), py::arg("src"), py::arg("idx"), py::arg("n"), py::arg("dim"), py::arg("stream") = 0);
+
+    // FP8 prefill on an FP16 residual stream: fused residual / norm / bias /
+    // activation / RoPE producers and consumers around per-tensor FP8 GEMMs.
+    // See kernels/fp8_prefill_fp16.cuh.
+    // Non-causal prefill attention straight from projection rows (bias /
+    // RoPE on load). See kernels/fused_qkv_attention.cuh.
+    m.def("fused_qkv_attention", [](int dtype, uintptr_t q, uintptr_t k, uintptr_t v, int ld, uintptr_t q_bias,
+                                   uintptr_t k_bias, uintptr_t v_bias, uintptr_t cos, uintptr_t sin, uintptr_t out,
+                                   int out_ld, int batches, int S, int heads, int hd, float scale, uintptr_t stream) {
+        return flash_rt::prefill_attention::fused_qkv_attention(
+            dtype, reinterpret_cast<const void*>(q), reinterpret_cast<const void*>(k),
+            reinterpret_cast<const void*>(v), ld, reinterpret_cast<const void*>(q_bias),
+            reinterpret_cast<const void*>(k_bias), reinterpret_cast<const void*>(v_bias),
+            reinterpret_cast<const void*>(cos), reinterpret_cast<const void*>(sin), reinterpret_cast<void*>(out),
+            out_ld, batches, S, heads, hd, scale, to_stream(stream));
+    }, py::arg("dtype"), py::arg("q"), py::arg("k"), py::arg("v"), py::arg("ld"), py::arg("q_bias"),
+       py::arg("k_bias"), py::arg("v_bias"), py::arg("cos"), py::arg("sin"), py::arg("out"), py::arg("out_ld"),
+       py::arg("batches"), py::arg("S"), py::arg("heads"), py::arg("hd"), py::arg("scale"), py::arg("stream") = 0);
+    m.def("fp8_residual_norm_quant", [](uintptr_t x, uintptr_t delta, uintptr_t delta_bias, uintptr_t delta2,
+                                       uintptr_t x_copy, uintptr_t weight, uintptr_t bias, int mode, float eps,
+                                       uintptr_t out_fp8, uintptr_t scale, uintptr_t out_f16, int rows, int dim,
+                                       uintptr_t stream) {
+        return flash_rt::fp8_prefill::residual_norm_quant(
+            typed_ptr<__half>(x), typed_ptr<__half>(delta), typed_ptr<__half>(delta_bias), typed_ptr<__half>(delta2),
+            typed_ptr<__half>(x_copy), typed_ptr<__half>(weight), typed_ptr<__half>(bias), mode, eps,
+            typed_ptr<__nv_fp8_e4m3>(out_fp8), typed_ptr<float>(scale), typed_ptr<__half>(out_f16), rows, dim,
+            to_stream(stream));
+    }, py::arg("x"), py::arg("delta"), py::arg("delta_bias"), py::arg("delta2"), py::arg("x_copy"),
+       py::arg("weight"), py::arg("bias"), py::arg("mode"), py::arg("eps"), py::arg("out_fp8"), py::arg("scale"),
+       py::arg("out_f16"), py::arg("rows"), py::arg("dim"), py::arg("stream") = 0);
+    m.def("fp8_bias_gelu_quant", [](uintptr_t x, int ld, uintptr_t bias, uintptr_t out, uintptr_t scale, int rows,
+                                   int n, uintptr_t stream) {
+        return flash_rt::fp8_prefill::bias_gelu_quant(typed_ptr<__half>(x), ld, typed_ptr<__half>(bias),
+                                                      typed_ptr<__nv_fp8_e4m3>(out), typed_ptr<float>(scale), rows,
+                                                      n, to_stream(stream));
+    }, py::arg("x"), py::arg("ld"), py::arg("bias"), py::arg("out"), py::arg("scale"), py::arg("rows"),
+       py::arg("n"), py::arg("stream") = 0);
+    m.def("fp8_qkv_split", [](uintptr_t q_in, uintptr_t k_in, uintptr_t v_in, int ld, uintptr_t q_bias,
+                             uintptr_t k_bias, uintptr_t v_bias, float k_mul, float v_mul, uintptr_t q_norm,
+                             uintptr_t k_norm, float eps, uintptr_t cos, uintptr_t sin, uintptr_t q_out,
+                             uintptr_t k_out, uintptr_t v_out, bool out_bf16, int S, int n_q, int n_k, int hd,
+                             uintptr_t stream) {
+        return flash_rt::fp8_prefill::qkv_split(
+            typed_ptr<__half>(q_in), typed_ptr<__half>(k_in), typed_ptr<__half>(v_in), ld, typed_ptr<__half>(q_bias),
+            typed_ptr<__half>(k_bias), typed_ptr<__half>(v_bias), k_mul, v_mul, typed_ptr<__half>(q_norm),
+            typed_ptr<__half>(k_norm), eps, typed_ptr<__half>(cos), typed_ptr<__half>(sin),
+            reinterpret_cast<void*>(q_out), reinterpret_cast<void*>(k_out), reinterpret_cast<void*>(v_out), out_bf16,
+            S, n_q, n_k, hd, to_stream(stream));
+    }, py::arg("q_in"), py::arg("k_in"), py::arg("v_in"), py::arg("ld"), py::arg("q_bias"), py::arg("k_bias"),
+       py::arg("v_bias"), py::arg("k_mul"), py::arg("v_mul"), py::arg("q_norm"), py::arg("k_norm"), py::arg("eps"),
+       py::arg("cos"), py::arg("sin"), py::arg("q_out"), py::arg("k_out"), py::arg("v_out"), py::arg("out_bf16"),
+       py::arg("S"), py::arg("n_q"), py::arg("n_k"), py::arg("hd"), py::arg("stream") = 0);
+#endif  // FLASHRT_NVFP4_SKINNY_SM120
+
+#ifdef FLASHRT_PI05_DECODER_FP4_SM120
+    // Pi0.5 action-decoder consumers for the skinny NVFP4 family (sm_120a): they
+    // emit the next GEMM's NVFP4 operand directly. See
+    // kernels/pi05/pi05_decoder_skinny_fp4_sm120.cuh.
+    m.def("pi05_dec_fp4_residual_ada_norm", [](uintptr_t partials, int splits, uintptr_t a_gs, uintptr_t w_gs,
+                                              uintptr_t residual, uintptr_t gate, uintptr_t weight, uintptr_t style,
+                                              uintptr_t out, uintptr_t out_sf, uintptr_t out_gs, uintptr_t gate_out,
+                                              int rows, int dim, float eps, bool pdl, uintptr_t stream) {
+        return flash_rt::pi05_dec_skinny_fp4::residual_ada_norm(
+            typed_ptr<float>(partials), splits, typed_ptr<float>(a_gs), typed_ptr<float>(w_gs),
+            typed_ptr<__nv_bfloat16>(residual), typed_ptr<__nv_bfloat16>(gate), typed_ptr<__nv_bfloat16>(weight),
+            typed_ptr<__nv_bfloat16>(style), typed_ptr<uint8_t>(out), typed_ptr<uint8_t>(out_sf),
+            typed_ptr<float>(out_gs), typed_ptr<__nv_bfloat16>(gate_out), rows, dim, eps, pdl, to_stream(stream));
+    }, py::arg("partials"), py::arg("splits"), py::arg("a_gs"), py::arg("w_gs"), py::arg("residual"),
+       py::arg("gate"), py::arg("weight"), py::arg("style"), py::arg("out"), py::arg("out_sf"), py::arg("out_gs"),
+       py::arg("gate_out"), py::arg("rows"), py::arg("dim"), py::arg("eps"), py::arg("pdl") = true,
+       py::arg("stream") = 0);
+    m.def("pi05_dec_fp4_gate_gelu", [](uintptr_t partials, int splits, uintptr_t a_gs, uintptr_t w_gs,
+                                      uintptr_t out, uintptr_t out_sf, int rows, int half, uintptr_t out_gs,
+                                      bool pdl, uintptr_t stream) {
+        return flash_rt::pi05_dec_skinny_fp4::gate_gelu(
+            typed_ptr<float>(partials), splits, typed_ptr<float>(a_gs), typed_ptr<float>(w_gs),
+            typed_ptr<uint8_t>(out), typed_ptr<uint8_t>(out_sf), rows, half, typed_ptr<float>(out_gs), pdl,
+            to_stream(stream));
+    }, py::arg("partials"), py::arg("splits"), py::arg("a_gs"), py::arg("w_gs"), py::arg("out"),
+       py::arg("out_sf"), py::arg("rows"), py::arg("half"), py::arg("out_gs"), py::arg("pdl") = true,
+       py::arg("stream") = 0);
+    m.def("pi05_dec_fp4_action_in_norm", [](uintptr_t noise, uintptr_t w_in, uintptr_t b_in, uintptr_t x,
+                                           uintptr_t weight, uintptr_t style, uintptr_t out, uintptr_t out_sf,
+                                           uintptr_t gate_out, uintptr_t out_gs, int rows, float eps, bool pdl,
+                                           uintptr_t stream) {
+        return flash_rt::pi05_dec_skinny_fp4::action_in_norm(
+            typed_ptr<__nv_bfloat16>(noise), typed_ptr<__nv_bfloat16>(w_in), typed_ptr<__nv_bfloat16>(b_in),
+            typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(weight), typed_ptr<__nv_bfloat16>(style),
+            typed_ptr<uint8_t>(out), typed_ptr<uint8_t>(out_sf), typed_ptr<__nv_bfloat16>(gate_out),
+            typed_ptr<float>(out_gs), rows, eps, pdl, to_stream(stream));
+    }, py::arg("noise"), py::arg("w_in"), py::arg("b_in"), py::arg("x"), py::arg("weight"), py::arg("style"),
+       py::arg("out"), py::arg("out_sf"), py::arg("gate_out"), py::arg("out_gs"), py::arg("rows"),
+       py::arg("eps"), py::arg("pdl") = true, py::arg("stream") = 0);
+#endif  // FLASHRT_PI05_DECODER_FP4_SM120
 
 #ifdef ENABLE_DECODE_GEMV_M1
     // Dedicated M=1 GEMV (FP8 + BF16), warp-per-output-row, no MMA padding tax.

@@ -49,6 +49,7 @@ from .pipeline_rtx import (
     FP8,
     Pi05Pipeline,
     VIS_D,
+    VIS_SEQ_PER_VIEW,
     VIS_H,
     VIS_L,
     VIS_PATCH_FLAT,
@@ -77,8 +78,8 @@ class Pi05BatchedPipeline(Pi05Pipeline):
             raise ValueError(f"batched backend reports B={self.B}")
         self._attn_ptrs_b2 = self.attn.get_ptrs_b2()
         self._allocate_b2_buffers()
-        if self._nvfp4:
-            self._nvfp4_ensure_scratch(self.B * max(self.vision_seq, self.encoder_seq_len))
+        if self._ffn_fp4:
+            self._ffn_fp4_ensure(self.B * max(self.vision_seq, self.encoder_seq_len))
         if self._skinny:
             self._skinny_ensure_partials(self.B * self.chunk_size)
             if self._skinny_attn:
@@ -417,9 +418,6 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         overflow the parent's B=1 scratch slots.
         """
         fvk = self.fvk
-        if weight_name in self._nvfp4:
-            self._nvfp4_gemm(act_bf16_ptr, weight_name, out_bf16_ptr, M, N, K, stream)
-            return
         w_fp8_ptr, w_scale_ptr = self._weight_fp8(weight_name)
         act_fp8_ptr, _scratch_scale_ptr = self._pick_fp8_scratch_b2(
             weight_name, act_n)
@@ -502,6 +500,17 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         Bb = self.bufs
         ap = self._attn_ptrs_b2
 
+        if self._ffn_fp4 and self._vis_attn_fp4 and use_fp8 and self.fp8_calibrated:
+            x_ptr = Bb["vision_x_b2"].ptr.value
+            self._vision_attn_nvfp4(
+                i, m, x_ptr, Bb["vision_QKV_b2"].ptr.value,
+                lambda: fvk.qkv_split(Bb["vision_QKV_b2"].ptr.value, ap["vis_Q"], ap["vis_K"], ap["vis_V"],
+                                      m, VIS_D, VIS_D, VIS_D, stream=stream),
+                lambda: self.attn.run_batched("siglip", i, q_seq=VIS_L, stream=stream), stream,
+                o_ptr=self.attn._vis_O72_b2.data_ptr(), views=m // VIS_SEQ_PER_VIEW)
+            self._vision_ffn_nvfp4(i, m, x_ptr, stream)
+            return
+
         # Attention LayerNorm → x_norm
         fvk.layer_norm(
             Bb["vision_x_b2"].ptr.value,
@@ -550,6 +559,9 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         fvk.bias_residual(
             Bb["vision_x_b2"].ptr.value, Bb["vision_x_norm_b2"].ptr.value,
             W["vision_attn_o_b"][i], m, VIS_D, stream=stream)
+        if self._ffn_fp4 and use_fp8 and self.fp8_calibrated:
+            self._vision_ffn_nvfp4(i, m, Bb["vision_x_b2"].ptr.value, stream)
+            return
 
         # FFN LayerNorm → x_norm
         fvk.layer_norm(
@@ -650,7 +662,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 per_sample_proj_bytes, 3, stream)
 
         # B1-B5: 18 encoder layers
-        fused = use_fp8 and self.fp8_calibrated and not self._nvfp4
+        fused = use_fp8 and self.fp8_calibrated
         for i in range(ENC_L):
             self._encoder_layer_batched(i, m_seq, seq,
                                          fuse_b1=(i > 0 and fused), stream=stream)
@@ -668,7 +680,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
         W = self.weights
         Bb = self.bufs
         ap = self._attn_ptrs_b2
-        fused = self.use_fp8 and self.fp8_calibrated and not self._nvfp4
+        fused = self.use_fp8 and self.fp8_calibrated
 
         # B1: RMSNorm → QKV GEMM
         if fused:
@@ -763,6 +775,10 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 Bb["encoder_x_norm_b2"].ptr.value,
                 m, ENC_D, ENC_D, stream=stream)
 
+        if fused and self._ffn_fp4:
+            self._encoder_ffn_nvfp4(i, m, Bb["encoder_x_b2"].ptr.value, Bb["encoder_x_norm_b2"].ptr.value, stream)
+            return
+
         # B4: RMSNorm → FFN gate+up
         if fused:
             gu_name = f"encoder_ffn_gate_up_w_{i}"
@@ -818,10 +834,6 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                 Bb["enc_act_fp8_large_b2"].ptr.value, down_name,
                 Bb["encoder_x_norm_b2"].ptr.value,
                 m, ENC_D, ENC_H, act_scale_down, stream)
-        elif self.use_fp8 and f"encoder_ffn_down_w_{i}" in self._nvfp4:
-            self._nvfp4_geglu_down(
-                Bb["encoder_gate_merged_b2"].ptr.value, f"encoder_ffn_down_w_{i}",
-                Bb["encoder_x_norm_b2"].ptr.value, m, ENC_D, ENC_H, stream)
         elif self.use_fp8:
             fvk.gate_geglu_merged(
                 Bb["encoder_gate_merged_b2"].ptr.value,
@@ -1202,7 +1214,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
             m_vis, VIS_D, VIS_PATCH_FLAT)
 
         # Vision FP8 at B*vs
-        if self.use_fp8 and self.fp8_calibrated and not self._nvfp4 and "vision_attn_qkv_w_0" in self.weights.get("fp8", {}):
+        if self.use_fp8 and self.fp8_calibrated and "vision_attn_qkv_w_0" in self.weights.get("fp8", {}):
             for name_prefix, M_val, N_val, K_val, out_key in [
                 ("vision_attn_qkv_w_0", m_vis, 3 * VIS_D, VIS_D, "vision_QKV_b2"),
                 ("vision_attn_o_w_0",   m_vis, VIS_D,     VIS_D, "vision_x_norm_b2"),
@@ -1219,7 +1231,7 @@ class Pi05BatchedPipeline(Pi05Pipeline):
                     M_val, N_val, K_val, act_scale_ptr, w_scale_ptr)
 
         # Encoder FP8 at B*seq
-        if self.use_fp8 and self.fp8_calibrated and not self._nvfp4:
+        if self.use_fp8 and self.fp8_calibrated:
             for name_prefix, M_val, N_val, K_val, out_key in [
                 ("encoder_attn_qkv_w_0",    m_seq, (ENC_NH + 2 * ENC_NKV) * ENC_HD, ENC_D, "encoder_QKV_b2"),
                 ("encoder_attn_o_w_0",      m_seq, ENC_D,      ENC_D, "encoder_x_norm_b2"),

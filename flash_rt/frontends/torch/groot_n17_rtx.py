@@ -80,17 +80,24 @@ class GrootN17TorchFrontendRtx(GrootN17TorchFrontendThor):
             device=self.device,
         )
 
-        # Cross K/V are precomputed by the shared N1.7 frontend as exact-size
-        # tensors.  RTX backend owns padded-to-max slots so pipeline pointers
-        # stay stable; copy the active prefix for each cross block.
+        # The cross blocks read the frontend's own K/V tensors: once the
+        # kernelized cross-KV refresh exists it rewrites those persistent
+        # buffers every frame, so a one-time copy into backend-owned slots
+        # would freeze cross-attention on the set_prompt observation. The
+        # exact-size [S, 1536] tensors view as [S, 32, 48]; attention only
+        # reads the first kv_seq rows of each block.
         for j, (k_src, v_src) in enumerate(zip(self._dit_cross_K, self._dit_cross_V)):
-            attn.dit_cross_K[j].view(attn.dit_cross_K[j].shape[0], -1)[
-                : k_src.shape[0]
-            ].copy_(k_src)
-            attn.dit_cross_V[j].view(attn.dit_cross_V[j].shape[0], -1)[
-                : v_src.shape[0]
-            ].copy_(v_src)
+            attn.dit_cross_K[j] = k_src.view(k_src.shape[0], 32, 48)
+            attn.dit_cross_V[j] = v_src.view(v_src.shape[0], 32, 48)
         self._dit_attn = attn
+
+    def _setup_cross_kv_kernel(self) -> None:
+        fresh = not hasattr(self, "_ck_text_idx")
+        super()._setup_cross_kv_kernel()
+        # The persistent cross K/V buffers replace the set_prompt tensors; a
+        # backend built before them (warmup) must be rebuilt to read them.
+        if fresh and hasattr(self, "_dit_attn"):
+            delattr(self, "_dit_attn")
 
     def _precompute_dit_cross_kv(self) -> None:
         super()._precompute_dit_cross_kv()

@@ -182,6 +182,13 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("groot_n17", "torch", "rtx_sm89"):
         ("flash_rt.frontends.torch.groot_n17_rtx_sm89",
          "GrootN17TorchFrontendRtxSm89"),
+    # Jetson Orin (SM87, Ampere): no FP8/FP4 tensor cores, so the Thor/RTX FP8
+    # tiers have nothing to run on. BF16 backbone + BF16 DiT, with FA2
+    # fwd_bf16_causal for the truncated LLM (native GQA, no head expansion).
+    # See docs/groot_n17_orin_sm87.md.
+    ("groot_n17", "torch", "rtx_sm87"):
+        ("flash_rt.frontends.torch.groot_n17_orin",
+         "GrootN17TorchFrontendOrin"),
     ("groot_n17", "torch", "npu"):
         ("flash_rt.npu.frontends.torch.groot_n17", "GrootN17TorchFrontendNpu"),
     ("groot_n17", "torch", "amd_cdna4"):
@@ -301,6 +308,7 @@ _SM87_ALLOWED = {
     ("chameleon", "torch", "rtx_sm87"),
     ("qwen3_vl", "torch", "rtx_sm87"),
     ("hyvla", "torch", "rtx_sm87"),
+    ("groot_n17", "torch", "rtx_sm87"),
 }
 
 

@@ -243,6 +243,24 @@ the same one); see
 [`training/jax/README.md` § Per-shape FP8 forward microbench](../training/jax/README.md)
 for measured numbers on RTX 5090 SM120.
 
+## 12. SM120 small-row NVFP4 and fused prefill families (`GPU_ARCH=120/121`)
+
+Built into `flash_rt_kernels` on SM120 builds only; the bindings are compiled
+under the same gate, so other architectures do not expose them and the
+frontends keep their FP8 paths there.
+
+| Group | Symbols | What it is |
+|---|---|---|
+| Skinny W4A4 GEMM | `nvfp4_skinny_gemm`, `nvfp4_skinny_gemm_bf16_act`, `nvfp4_skinny_pack_weight`, `nvfp4_skinny_quantize_weight`, `nvfp4_skinny_config_*` | `mma.sync` block-scaled e2m1 GEMM for <= 48 rows per CTA (action decoders, DiT heads); weights prefetched into registers before the programmatic-dependent-launch wait; FP32 K-split partials |
+| Skinny consumers | `nvfp4_skinny_layer_norm`, `nvfp4_skinny_sum_bias_residual_norm`, `nvfp4_skinny_sum_bias_gelu`, `nvfp4_skinny_partials_attention` | Sum the partials and run the next step (bias, residual, LayerNorm / AdaLN, GELU, attention) while emitting the next NVFP4 operand |
+| Prefill NVFP4 | `nvfp4_norm_quant`, `nvfp4_quant`, `nvfp4_qk_norm_rope`, `nvfp4_scatter_add_rows`, `nvfp4_sf_bytes` | Norm / quantize producers writing e2m1 + swizzled UE4M3 scales for the CUTLASS block-scaled GEMMs |
+| CUTLASS NVFP4 epilogues | `nvfp4_gemm_bias_res_bf16out`, `nvfp4_gemm_bias_gelu_fp4out`, `nvfp4_gemm_geglu_fold_fp4out` | W4A4 GEMMs with bias + residual (BF16 out) or GELU / GeGLU straight to the next NVFP4 operand |
+| FP8 prefill (FP16 stream) | `fp8_residual_norm_quant`, `fp8_qkv_split`, `fp8_bias_gelu_quant` | Residual + norm -> FP8, Q/K/V split with bias / q-k RMSNorm / RoPE, bias + GELU -> FP8 around per-tensor FP8 GEMMs |
+| Prefill attention | `fused_qkv_attention` | Non-causal FP16 / BF16 attention reading Q/K/V straight from projection rows (bias / RoPE on load), head_dim 64 / 72 |
+
+Pi0.5's decoder-specific consumers (`pi05_dec_fp4_*`) build only with
+`-DFLASHRT_ENABLE_PI05_NVFP4=ON`.
+
 ---
 
 ## Re-use decision tree

@@ -897,6 +897,10 @@ void GemmRunner::bf16_nn_bias(void* A, void* B, void* D, void* bias,
 //  still fail at matmul time on these shapes.
 void GemmRunner::bf16_nt_bias(void* A, void* B, void* D, void* bias,
                               int M, int N, int K, cudaStream_t stream) {
+    if (M <= 0 || N <= 0 || K <= 0)
+        throw std::invalid_argument("cuBLASLt bf16_nt_bias: M, N and K must be positive");
+    if (!A || !B || !D || !bias)
+        throw std::invalid_argument("cuBLASLt bf16_nt_bias: A, B, D and bias must be non-null");
     cublasLtMatmulDesc_t matmul_desc;
     cublasLtMatrixLayout_t A_desc, B_desc, D_desc;
 
@@ -920,6 +924,12 @@ void GemmRunner::bf16_nt_bias(void* A, void* B, void* D, void* bias,
     CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&preference));
     CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(preference,
         CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size_, sizeof(workspace_size_)));
+
+    // Preserve FP32 accumulation across split-K too: output-type or in-place
+    // reductions would round partial sums to BF16 before the bias epilogue.
+    uint32_t reduction_mask = CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE;
+    CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(preference,
+        CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &reduction_mask, sizeof(reduction_mask)));
 
     int returned_results = 0;
     cublasLtMatmulHeuristicResult_t heuristics[8];

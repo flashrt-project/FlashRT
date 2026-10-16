@@ -216,7 +216,7 @@ model = flash_rt.load_model(
 | `config` | `str` | `"pi05"` | Model architecture config: `"pi05"`, `"pi0"`, `"groot"`, `"groot_n17"`, `"pi0fast"`, `"motus"`, `"wan22_ti2v_5b"`, `"cosmos3_video"`, `"cosmos3_edge"`. Cosmos video/Edge routes use `set_prompt(...)` + `infer(...)`, not the VLA `predict()` convenience API. |
 | `decode_cuda_graph` | `bool` | `False` | **Pi0-FAST only.** Capture action-phase decode as CUDA Graph. Trades startup time for per-token speed. See [Pi0-FAST](#pi0-fast). |
 | `decode_graph_steps` | `int` | `80` | **Pi0-FAST only.** Number of action tokens to capture in the decode graph. Should cover your longest expected action sequence. |
-| `use_fp4` | `bool` | `False` | **Pi0.5 torch + jax on Thor.** Enable NVFP4 quantization on the encoder FFN stack. When `True`, resolves to the production preset (`fp4_layers=tuple(range(17))` + `use_awq=True` + `use_p1_split_gu=True`). Requires SM100+ GPU. Other configs emit a warning and fall back to FP8. See [NVFP4](#nvfp4-pi05-only). |
+| `use_fp4` | `bool` | `False` | NVFP4 tier where one exists. **Pi0.5 torch + jax on Thor**: NVFP4 encoder FFN stack, resolving to the production preset (`fp4_layers=tuple(range(17))` + `use_awq=True` + `use_p1_split_gu=True`); see [NVFP4](#nvfp4-pi05-only). **GROOT N1.7 torch on Thor**: NVFP4 action head (see [GROOT N1.7 (Thor)](#groot-n17-thor)). **RTX SM120**: Pi0.5 torch runs the NVFP4 prefix + decoder tier ([docs](docs/pi05_prefix_nvfp4.md)) and GROOT N1.7 torch the NVFP4 action head ([docs](docs/groot_n17_rtx_nvfp4.md)). Other configs and hardware log a warning and use the FP8 route. |
 | `fp4_layers` | `tuple[int]` \| `None` | `None` | Encoder layer indices to FP4-quantize. `None` → resolved by the `use_fp4` preset. Passing an explicit tuple overrides the preset. Valid live FFN indices are 0-16; `(7,8,9)` and `range(17)`+AWQ are task-level validated. |
 | `use_awq` | `bool` \| `None` | `None` | Activation-aware weight quant. Required for the full 17-layer FP4 scope (without it, cos collapses to ~0.33). `None` → resolved by the `use_fp4` preset. |
 | `awq_alpha` | `float` | `0.5` | AWQ scaling exponent `s[k] = (a[k]/a.mean())^alpha`. |
@@ -622,6 +622,14 @@ The action-head mix is not identical across the two RTX families:
 - `rtx_sm89` keeps FlashRT kernel execution for the SM89 FP8 backbone and
   quantized DiT hot-path GEMMs, while some action-head-adjacent helpers stay
   in the inherited bf16/fp16 route
+
+On `rtx_sm120`, the FP8 backbone runs with fused producers (bias, residual,
+norm, RoPE and activation folded into the kernels that emit the next FP8
+operand; `FLASHRT_GROOT_N17_BB_FUSED=0` keeps the unfused sequence), and
+`use_fp4=True` selects the NVFP4 tier: the DiT and its cross-attention K/V
+projections run on NVFP4 while the backbone stays FP8. See
+[`docs/groot_n17_rtx_nvfp4.md`](docs/groot_n17_rtx_nvfp4.md) for the kernels,
+numbers and switches.
 
 Activation scales follow the FlashRT calibration convention
 ([Calibration](#calibration)): weight scales are baked at load, activation
@@ -1523,9 +1531,12 @@ Max-perf mode is ~1.5s (decode graph capture dominates after cache hit).
 ## NVFP4 (Pi0.5 only)
 
 Optional NVFP4 (Blackwell block-scaled FP4) quantization on the Pi0.5
-encoder FFN stack, enabled via a single flag `use_fp4=True`. It is supported
-for **Pi0.5 torch and JAX on Thor**. Other configs (`pi0` / `groot` /
-`pi0fast`) log a warning and use the FP8 route.
+encoder FFN stack, enabled via a single flag `use_fp4=True`. This section
+covers **Pi0.5 torch and JAX on Thor**. On RTX SM120 the same flag selects a
+different tier (NVFP4 SigLIP, Gemma FFNs and decoder), documented in
+[`docs/pi05_prefix_nvfp4.md`](docs/pi05_prefix_nvfp4.md); GROOT N1.7 has its
+own tiers on Thor and RTX SM120. Other configs (`pi0` / `groot` / `pi0fast`)
+log a warning and use the FP8 route.
 
 ```python
 # Production-recommended — single flag, best-known config:
