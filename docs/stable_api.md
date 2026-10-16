@@ -719,3 +719,12 @@ When adding a new model or kernel, read these in order:
    `fvk` kernels grouped by purpose, current production fusion
    patterns, what does and does not fuse, and the catalog of failed
    optimizations (OPT-3 / OPT-5 / v1.5-B2 / v1.5-B4) to avoid.
+
+## Alpamayo trajectory frontends
+
+Alpamayo produces trajectories and reasoning from camera frames and ego history,
+not VLAModel.predict(images). load_model(config="alpamayo15") and
+load_model(config="alpamayo15_flashdrive") raise an explicit redirect to their
+dedicated Thor frontends. Existing model routes and predict signatures are
+unchanged. See [the consolidated guide](alpamayo15.md) for imports, checkpoint
+selection, reset behavior and four-arm reproduction.

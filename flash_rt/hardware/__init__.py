@@ -264,6 +264,17 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("cosmos3_edge", "torch", "thor"):
         ("flash_rt.frontends.torch.cosmos3_edge_thor", "Cosmos3EdgeTorchFrontendThor"),
 
+    # ── Alpamayo 1.5 (reasoning driving VLA, Thor only) ──
+    # Multi-camera + ego-history inputs and trajectory + reasoning outputs, so
+    # it is constructed directly rather than through load_model's VLAModel
+    # wrapper. Requires -DFLASHRT_ENABLE_ALPAMAYO15=ON; see docs/alpamayo15_thor.md.
+    ("alpamayo15", "torch", "thor"):
+        ("flash_rt.frontends.torch.alpamayo15_thor", "Alpamayo15TorchFrontendThor"),
+    # FlashDrive's streaming / DFlash / W4A8 rollout of Alpamayo 1.5 (z-lab checkpoints) on FlashRT kernels;
+    # needs the flashdrive package. See docs/alpamayo15_flashdrive_thor.md.
+    ("alpamayo15_flashdrive", "torch", "thor"):
+        ("flash_rt.frontends.torch.alpamayo15_flashdrive_thor", "Alpamayo15FlashDriveTorchFrontendThor"),
+
     # ── Nex-N2-mini / Qwen3.6-35B-A3B (qwen3_5_moe) ──
     # Text LLM, not a VLA: GDN linear-attn + full-attn-every-4th + 256-expert
     # NVFP4 MoE. Registered here for discoverability / resolve_pipeline_class,

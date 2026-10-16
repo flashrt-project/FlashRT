@@ -273,6 +273,16 @@ extern "C" void flash_rt_awq_quant_fp8_static_fp16(
 #ifdef FLASHRT_HAVE_COSMOS3_EDGE
 #include "kernels/cosmos3_edge_misc.cuh"
 #endif
+#ifdef FLASHRT_HAVE_ALPAMAYO15
+#include "kernels/alpamayo15_kernels.cuh"
+#include "kernels/alpamayo15_flashdrive_kernels.cuh"
+// csrc/gemm/alpamayo15_flashdrive_w4a8_sm100.cu
+extern "C" int flashrt_fd_w4a8_gemm_sm100_sizes(int M, int N, int K, unsigned long long* workspace_bytes,
+                                                long long* ones_elems);
+extern "C" int flashrt_fd_w4a8_gemm_sm100(const void* xq, const void* w8, const int* sf_group, const int* sf_ones,
+                                          const float* a_scale, void* out, int M, int N, int K, void* workspace,
+                                          unsigned long long workspace_bytes, cudaStream_t stream);
+#endif
 #ifdef FLASHRT_HAVE_COSMOS3_REASONER
 #include "kernels/cosmos3_reasoner_attn.cuh"
 #include "kernels/cosmos3_reasoner_gemv.cuh"
@@ -5342,6 +5352,253 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         },
         py::arg("src"), py::arg("dst"), py::arg("row_indices"),
         py::arg("rows"), py::arg("hidden"), py::arg("stream") = 0);
+#endif
+
+#ifdef FLASHRT_HAVE_ALPAMAYO15
+    m.def("alpamayo15_vision_rope_qk_bf16",
+        [](uintptr_t qkv, uintptr_t cos, uintptr_t sin, int S, int H, int D, uintptr_t stream) {
+            const auto shape = kernel_shape({{"S", S}, {"H", H}, {"D", D}});
+            require_kernel_ptrs("alpamayo15_vision_rope_qk_bf16",
+                {{"qkv", qkv}, {"cos", cos}, {"sin", sin}}, shape);
+            const int rc = flash_rt::kernels::alpamayo15_vision_rope_qk_bf16(
+                reinterpret_cast<void*>(qkv), reinterpret_cast<const float*>(cos),
+                reinterpret_cast<const float*>(sin), S, H, D, to_stream(stream));
+            require_kernel(rc == 0, "alpamayo15_vision_rope_qk_bf16",
+                           "invalid shape or launch failure (rc=" + std::to_string(rc) + ")", shape);
+        },
+        py::arg("qkv"), py::arg("cos"), py::arg("sin"), py::arg("S"), py::arg("H"), py::arg("D"),
+        py::arg("stream") = 0);
+
+    m.def("alpamayo15_res_rms_f32_bf16",
+        [](uintptr_t residual, uintptr_t delta, uintptr_t weight, uintptr_t out,
+           int rows, int dim, float eps, uintptr_t stream) {
+            const auto shape = kernel_shape({{"rows", rows}, {"dim", dim}});
+            require_kernel_ptrs("alpamayo15_res_rms_f32_bf16",
+                {{"residual", residual}, {"weight", weight}, {"out", out}}, shape);
+            const int rc = flash_rt::kernels::alpamayo15_res_rms_f32_bf16(
+                reinterpret_cast<float*>(residual), reinterpret_cast<const void*>(delta),
+                reinterpret_cast<const void*>(weight), reinterpret_cast<void*>(out),
+                rows, dim, eps, to_stream(stream));
+            require_kernel(rc == 0, "alpamayo15_res_rms_f32_bf16",
+                           "invalid shape or launch failure (rc=" + std::to_string(rc) + ")", shape);
+        },
+        py::arg("residual"), py::arg("delta"), py::arg("weight"), py::arg("out"),
+        py::arg("rows"), py::arg("dim"), py::arg("eps"), py::arg("stream") = 0);
+
+    m.def("alpamayo15_expert_qk_prep_bf16",
+        [](uintptr_t qkv, uintptr_t q_norm_w, uintptr_t k_norm_w, uintptr_t cos, uintptr_t sin,
+           uintptr_t q_out, uintptr_t k_out, uintptr_t v_out, uintptr_t slot_ptr, int rows, int Hq, int Hk,
+           int k_row_stride, int rows_per_batch, long long batch_stride, float eps, uintptr_t stream) {
+            const auto shape = kernel_shape({{"rows", rows}, {"Hq", Hq}, {"Hk", Hk},
+                                             {"k_row_stride", k_row_stride}});
+            require_kernel_ptrs("alpamayo15_expert_qk_prep_bf16",
+                {{"qkv", qkv}, {"q_norm_w", q_norm_w}, {"k_norm_w", k_norm_w}, {"cos", cos},
+                 {"sin", sin}, {"q_out", q_out}, {"k_out", k_out}, {"v_out", v_out}}, shape);
+            const int rc = flash_rt::kernels::alpamayo15_expert_qk_prep_bf16(
+                reinterpret_cast<const void*>(qkv), reinterpret_cast<const void*>(q_norm_w),
+                reinterpret_cast<const void*>(k_norm_w), reinterpret_cast<const float*>(cos),
+                reinterpret_cast<const float*>(sin), reinterpret_cast<void*>(q_out),
+                reinterpret_cast<void*>(k_out), reinterpret_cast<void*>(v_out),
+                reinterpret_cast<const long long*>(slot_ptr),
+                rows, Hq, Hk, k_row_stride, rows_per_batch, batch_stride, eps, to_stream(stream));
+            require_kernel(rc == 0, "alpamayo15_expert_qk_prep_bf16",
+                           "invalid shape or launch failure (rc=" + std::to_string(rc) + ")", shape);
+        },
+        py::arg("qkv"), py::arg("q_norm_w"), py::arg("k_norm_w"), py::arg("cos"), py::arg("sin"),
+        py::arg("q_out"), py::arg("k_out"), py::arg("v_out"), py::arg("slot_ptr"), py::arg("rows"),
+        py::arg("Hq"), py::arg("Hk"), py::arg("k_row_stride"), py::arg("rows_per_batch"), py::arg("batch_stride"),
+        py::arg("eps"), py::arg("stream") = 0);
+
+    m.def("alpamayo15_rms_bf16",
+        [](uintptr_t residual, uintptr_t delta, uintptr_t weight, uintptr_t out,
+           int rows, int dim, float eps, uintptr_t stream) {
+            const auto shape = kernel_shape({{"rows", rows}, {"dim", dim}});
+            require_kernel_ptrs("alpamayo15_rms_bf16",
+                {{"residual", residual}, {"weight", weight}, {"out", out}}, shape);
+            const int rc = flash_rt::kernels::alpamayo15_rms_bf16(
+                reinterpret_cast<void*>(residual), reinterpret_cast<const void*>(delta),
+                reinterpret_cast<const void*>(weight), reinterpret_cast<void*>(out),
+                rows, dim, eps, to_stream(stream));
+            require_kernel(rc == 0, "alpamayo15_rms_bf16",
+                           "invalid shape or launch failure (rc=" + std::to_string(rc) + ")", shape);
+        },
+        py::arg("residual"), py::arg("delta"), py::arg("weight"), py::arg("out"),
+        py::arg("rows"), py::arg("dim"), py::arg("eps"), py::arg("stream") = 0);
+
+    m.def("alpamayo15_vlm_qk_prep_bf16",
+        [](uintptr_t qkv, uintptr_t q_norm_w, uintptr_t k_norm_w, uintptr_t cos, uintptr_t sin,
+           uintptr_t q_out, uintptr_t k_cache, uintptr_t v_cache, uintptr_t slot_ptr, int rows,
+           int Hq, int Hk, int kv_row_stride, int rows_per_batch, long long batch_stride, float eps,
+           uintptr_t stream) {
+            const auto shape = kernel_shape({{"rows", rows}, {"Hq", Hq}, {"Hk", Hk},
+                                             {"kv_row_stride", kv_row_stride}});
+            require_kernel_ptrs("alpamayo15_vlm_qk_prep_bf16",
+                {{"qkv", qkv}, {"q_norm_w", q_norm_w}, {"k_norm_w", k_norm_w}, {"cos", cos},
+                 {"sin", sin}, {"q_out", q_out}, {"k_cache", k_cache}, {"v_cache", v_cache}}, shape);
+            const int rc = flash_rt::kernels::alpamayo15_vlm_qk_prep_bf16(
+                reinterpret_cast<const void*>(qkv), reinterpret_cast<const void*>(q_norm_w),
+                reinterpret_cast<const void*>(k_norm_w), reinterpret_cast<const void*>(cos),
+                reinterpret_cast<const void*>(sin), reinterpret_cast<void*>(q_out),
+                reinterpret_cast<void*>(k_cache), reinterpret_cast<void*>(v_cache),
+                reinterpret_cast<const long long*>(slot_ptr), rows, Hq, Hk, kv_row_stride,
+                rows_per_batch, batch_stride, eps, to_stream(stream));
+            require_kernel(rc == 0, "alpamayo15_vlm_qk_prep_bf16",
+                           "invalid shape or launch failure (rc=" + std::to_string(rc) + ")", shape);
+        },
+        py::arg("qkv"), py::arg("q_norm_w"), py::arg("k_norm_w"), py::arg("cos"), py::arg("sin"),
+        py::arg("q_out"), py::arg("k_cache"), py::arg("v_cache"), py::arg("slot_ptr"), py::arg("rows"),
+        py::arg("Hq"), py::arg("Hk"), py::arg("kv_row_stride"), py::arg("rows_per_batch"),
+        py::arg("batch_stride"), py::arg("eps"), py::arg("stream") = 0);
+
+    m.def("alpamayo15_w8a16_gemm_bf16",
+        [](uintptr_t w_frag, uintptr_t scale, uintptr_t x, uintptr_t y, int M, int N, int K, uintptr_t stream) {
+            const auto shape = kernel_shape({{"M", M}, {"N", N}, {"K", K}});
+            require_kernel_ptrs("alpamayo15_w8a16_gemm_bf16",
+                {{"w_frag", w_frag}, {"scale", scale}, {"x", x}, {"y", y}}, shape);
+            const int rc = flash_rt::kernels::alpamayo15_w8a16_gemm_bf16(
+                reinterpret_cast<const void*>(w_frag), reinterpret_cast<const float*>(scale),
+                reinterpret_cast<const void*>(x), reinterpret_cast<void*>(y), M, N, K, to_stream(stream));
+            require_kernel(rc == 0, "alpamayo15_w8a16_gemm_bf16",
+                           "invalid shape/alignment or launch failure (rc=" + std::to_string(rc) + ")", shape);
+        },
+        py::arg("w_frag"), py::arg("scale"), py::arg("x"), py::arg("y"), py::arg("M"), py::arg("N"),
+        py::arg("K"), py::arg("stream") = 0);
+
+    // FlashDrive (Alpamayo 1.5) backend: un-rotated cache maintenance (alpamayo15_flashdrive_kernels.cuh).
+    m.def("flashdrive_qk_prep_bf16",
+        [](uintptr_t q, uintptr_t k, uintptr_t v, int q_ld, int k_ld, int v_ld, uintptr_t q_norm_w,
+           uintptr_t k_norm_w, uintptr_t cos, uintptr_t sin, int fp32_rule, uintptr_t q_out, uintptr_t k_raw,
+           long long kr_rs, long long kr_hs, uintptr_t k_rope, long long k_rs, long long k_hs, uintptr_t v_out,
+           long long v_rs, long long v_hs, uintptr_t row_map, uintptr_t slot_ptr, int rows, int Hq, int Hk,
+           float eps, uintptr_t stream, int f16_in) {
+            const auto shape = kernel_shape({{"rows", rows}, {"Hq", Hq}, {"Hk", Hk}, {"q_ld", q_ld},
+                                             {"k_ld", k_ld}, {"v_ld", v_ld}, {"fp32_rule", fp32_rule},
+                                             {"f16_in", f16_in}});
+            require_kernel_ptrs("flashdrive_qk_prep_bf16",
+                {{"q", q}, {"k", k}, {"v", v}, {"q_norm_w", q_norm_w}, {"k_norm_w", k_norm_w}, {"cos", cos},
+                 {"sin", sin}, {"q_out", q_out}, {"k_raw", k_raw}, {"k_rope", k_rope}, {"v_out", v_out}}, shape);
+            const int rc = flash_rt::kernels::flashdrive_qk_prep_bf16(
+                reinterpret_cast<const void*>(q), reinterpret_cast<const void*>(k), reinterpret_cast<const void*>(v),
+                q_ld, k_ld, v_ld, reinterpret_cast<const void*>(q_norm_w), reinterpret_cast<const void*>(k_norm_w),
+                reinterpret_cast<const void*>(cos), reinterpret_cast<const void*>(sin), fp32_rule, f16_in,
+                reinterpret_cast<void*>(q_out), reinterpret_cast<void*>(k_raw), kr_rs, kr_hs, reinterpret_cast<void*>(k_rope), k_rs, k_hs,
+                reinterpret_cast<void*>(v_out), v_rs, v_hs, reinterpret_cast<const long long*>(row_map),
+                reinterpret_cast<const long long*>(slot_ptr), rows, Hq, Hk, eps, to_stream(stream));
+            require_kernel(rc == 0, "flashdrive_qk_prep_bf16",
+                           "invalid shape/alignment or launch failure (rc=" + std::to_string(rc) + ")", shape);
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("q_ld"), py::arg("k_ld"), py::arg("v_ld"),
+        py::arg("q_norm_w"), py::arg("k_norm_w"), py::arg("cos"), py::arg("sin"), py::arg("fp32_rule"),
+        py::arg("q_out"), py::arg("k_raw"), py::arg("kr_rs"), py::arg("kr_hs"), py::arg("k_rope"), py::arg("k_rs"), py::arg("k_hs"),
+        py::arg("v_out"), py::arg("v_rs"), py::arg("v_hs"), py::arg("row_map"), py::arg("slot_ptr"),
+        py::arg("rows"), py::arg("Hq"), py::arg("Hk"), py::arg("eps"), py::arg("stream") = 0, py::arg("f16_in") = 0);
+
+    m.def("flashdrive_w4a8_gemm_sm100_sizes",
+        [](int M, int N, int K) {
+            unsigned long long ws = 0;
+            long long ones = 0;
+            const int rc = flashrt_fd_w4a8_gemm_sm100_sizes(M, N, K, &ws, &ones);
+            require_kernel(rc == 0, "flashdrive_w4a8_gemm_sm100_sizes", "unsupported shape (M, N, K > 0, K % 128, N % 8)",
+                           kernel_shape({{"M", M}, {"N", N}, {"K", K}}));
+            return py::make_tuple(ws, ones);
+        },
+        py::arg("M"), py::arg("N"), py::arg("K"));
+
+    m.def("flashdrive_w4a8_gemm_sm100",
+        [](uintptr_t xq, uintptr_t w8, uintptr_t sf_group, uintptr_t sf_ones, uintptr_t a_scale, uintptr_t out,
+           int M, int N, int K, uintptr_t workspace, unsigned long long workspace_bytes, uintptr_t stream) {
+            const auto shape = kernel_shape({{"M", M}, {"N", N}, {"K", K}});
+            require_kernel_ptrs("flashdrive_w4a8_gemm_sm100",
+                {{"xq", xq}, {"w8", w8}, {"sf_group", sf_group}, {"sf_ones", sf_ones}, {"a_scale", a_scale},
+                 {"out", out}}, shape);
+            const int rc = flashrt_fd_w4a8_gemm_sm100(
+                reinterpret_cast<const void*>(xq), reinterpret_cast<const void*>(w8),
+                reinterpret_cast<const int*>(sf_group), reinterpret_cast<const int*>(sf_ones),
+                reinterpret_cast<const float*>(a_scale), reinterpret_cast<void*>(out), M, N, K,
+                reinterpret_cast<void*>(workspace), workspace_bytes, to_stream(stream));
+            require_kernel(rc == 0, "flashdrive_w4a8_gemm_sm100",
+                           "invalid shape/alignment/workspace or launch failure (rc=" + std::to_string(rc) + ")", shape);
+        },
+        py::arg("xq"), py::arg("w8"), py::arg("sf_group"), py::arg("sf_ones"), py::arg("a_scale"), py::arg("out"),
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("workspace"), py::arg("workspace_bytes"),
+        py::arg("stream") = 0);
+
+    m.def("flashdrive_rms_f16delta_bf16",
+        [](uintptr_t residual, uintptr_t delta, uintptr_t weight, uintptr_t out, int rows, int dim, float eps,
+           uintptr_t stream) {
+            const auto shape = kernel_shape({{"rows", rows}, {"dim", dim}});
+            require_kernel_ptrs("flashdrive_rms_f16delta_bf16",
+                {{"residual", residual}, {"delta", delta}, {"weight", weight}, {"out", out}}, shape);
+            const int rc = flash_rt::kernels::flashdrive_rms_f16delta_bf16(
+                reinterpret_cast<void*>(residual), reinterpret_cast<const void*>(delta),
+                reinterpret_cast<const void*>(weight), reinterpret_cast<void*>(out), rows, dim, eps, to_stream(stream));
+            require_kernel(rc == 0, "flashdrive_rms_f16delta_bf16",
+                           "invalid shape or launch failure (rc=" + std::to_string(rc) + ")", shape);
+        },
+        py::arg("residual"), py::arg("delta"), py::arg("weight"), py::arg("out"), py::arg("rows"), py::arg("dim"),
+        py::arg("eps"), py::arg("stream") = 0);
+
+    m.def("flashdrive_silu_mul_f16in_bf16",
+        [](uintptr_t gate, uintptr_t up, uintptr_t out, long long n, uintptr_t stream) {
+            const auto shape = kernel_shape({{"n", n}});
+            require_kernel_ptrs("flashdrive_silu_mul_f16in_bf16", {{"gate", gate}, {"up", up}, {"out", out}}, shape);
+            const int rc = flash_rt::kernels::flashdrive_silu_mul_f16in_bf16(
+                reinterpret_cast<const void*>(gate), reinterpret_cast<const void*>(up), reinterpret_cast<void*>(out), n,
+                to_stream(stream));
+            require_kernel(rc == 0, "flashdrive_silu_mul_f16in_bf16",
+                           "invalid shape or launch failure (rc=" + std::to_string(rc) + ")", shape);
+        },
+        py::arg("gate"), py::arg("up"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+
+    m.def("flashdrive_rope_rows",
+        [](uintptr_t src, long long s_rs, long long s_hs, uintptr_t dst, long long d_rs, long long d_hs,
+           uintptr_t cos, uintptr_t sin, int fp32_rule, uintptr_t row_map, long long row0, uintptr_t slot_ptr,
+           uintptr_t n_ptr, int rows, int Hk, uintptr_t stream) {
+            const auto shape = kernel_shape({{"rows", rows}, {"Hk", Hk}, {"fp32_rule", fp32_rule}});
+            require_kernel_ptrs("flashdrive_rope_rows", {{"src", src}, {"dst", dst}, {"cos", cos}, {"sin", sin}}, shape);
+            const int rc = flash_rt::kernels::flashdrive_rope_rows(
+                reinterpret_cast<const void*>(src), s_rs, s_hs, reinterpret_cast<void*>(dst), d_rs, d_hs,
+                reinterpret_cast<const void*>(cos), reinterpret_cast<const void*>(sin), fp32_rule,
+                reinterpret_cast<const long long*>(row_map), row0, reinterpret_cast<const long long*>(slot_ptr),
+                reinterpret_cast<const int*>(n_ptr), rows, Hk, to_stream(stream));
+            require_kernel(rc == 0, "flashdrive_rope_rows",
+                           "invalid shape/alignment or launch failure (rc=" + std::to_string(rc) + ")", shape);
+        },
+        py::arg("src"), py::arg("s_rs"), py::arg("s_hs"), py::arg("dst"), py::arg("d_rs"), py::arg("d_hs"),
+        py::arg("cos"), py::arg("sin"), py::arg("fp32_rule"), py::arg("row_map"), py::arg("row0"),
+        py::arg("slot_ptr"), py::arg("n_ptr"), py::arg("rows"), py::arg("Hk"), py::arg("stream") = 0);
+
+    m.def("flashdrive_w4a8_act_prep",
+        [](uintptr_t x, int ld_x, int rows, int K, const std::vector<uintptr_t>& theta,
+           const std::vector<uintptr_t>& pairs, const std::vector<uintptr_t>& scales, const std::vector<uintptr_t>& igs,
+           const std::vector<uintptr_t>& xr, const std::vector<uintptr_t>& part, const std::vector<uintptr_t>& xq,
+           const std::vector<uintptr_t>& a_scale, uintptr_t stream) {
+            const int n = static_cast<int>(theta.size());
+            const auto shape = kernel_shape({{"rows", rows}, {"K", K}, {"ld_x", ld_x}, {"n_sets", n}});
+            require_kernel(n >= 1 && n <= 3 && pairs.size() == theta.size() && scales.size() == theta.size() &&
+                           igs.size() == theta.size() && xr.size() == theta.size() && part.size() == theta.size() &&
+                           xq.size() == theta.size() && a_scale.size() == theta.size(),
+                           "flashdrive_w4a8_act_prep", "1-3 rotation sets with matching argument lists", shape);
+            require_kernel_ptrs("flashdrive_w4a8_act_prep", {{"x", x}}, shape);
+            std::vector<const void*> th(n), pr(n), sc(n);
+            std::vector<const float*> gs(n);
+            std::vector<void*> q(n), r(n);
+            std::vector<float*> as(n), pt(n);
+            for (int i = 0; i < n; ++i) {
+                th[i] = reinterpret_cast<const void*>(theta[i]); pr[i] = reinterpret_cast<const void*>(pairs[i]);
+                sc[i] = reinterpret_cast<const void*>(scales[i]); gs[i] = reinterpret_cast<const float*>(igs[i]);
+                r[i] = reinterpret_cast<void*>(xr[i]); pt[i] = reinterpret_cast<float*>(part[i]);
+                q[i] = reinterpret_cast<void*>(xq[i]); as[i] = reinterpret_cast<float*>(a_scale[i]);
+            }
+            const int rc = flash_rt::kernels::flashdrive_w4a8_act_prep(
+                reinterpret_cast<const void*>(x), ld_x, rows, K, n, th.data(), pr.data(), sc.data(), gs.data(),
+                r.data(), pt.data(), q.data(), as.data(), to_stream(stream));
+            require_kernel(rc == 0, "flashdrive_w4a8_act_prep",
+                           "invalid shape/alignment or launch failure (rc=" + std::to_string(rc) + ")", shape);
+        },
+        py::arg("x"), py::arg("ld_x"), py::arg("rows"), py::arg("K"), py::arg("theta"), py::arg("pairs"),
+        py::arg("scales"), py::arg("igs"), py::arg("xr"), py::arg("part"), py::arg("xq"), py::arg("a_scale"),
+        py::arg("stream") = 0);
 #endif
 
 #ifdef FLASHRT_HAVE_COSMOS3_REASONER

@@ -183,6 +183,13 @@ option(FLASHRT_ENABLE_COSMOS3_EDGE
        "Build Cosmos3-Edge AV kernels and bindings for Jetson AGX Thor" OFF)
 option(FLASHRT_ENABLE_COSMOS3_REASONER
        "Build Cosmos3 Reasoner kernels and bindings for Jetson AGX Thor" OFF)
+option(FLASHRT_ENABLE_ALPAMAYO15
+       "Build Alpamayo 1.5 kernels and bindings for Jetson AGX Thor" OFF)
+if(FLASHRT_ENABLE_ALPAMAYO15 AND NOT GPU_ARCH STREQUAL "110")
+  message(FATAL_ERROR
+    "Alpamayo 1.5 kernels require GPU_ARCH=110; current GPU_ARCH=${GPU_ARCH}. "
+    "Disable FLASHRT_ENABLE_ALPAMAYO15 for non-Thor builds.")
+endif()
 if((FLASHRT_ENABLE_COSMOS3_EDGE OR FLASHRT_ENABLE_COSMOS3_REASONER) AND
    NOT GPU_ARCH STREQUAL "110")
   message(FATAL_ERROR
@@ -1736,6 +1743,30 @@ if(FLASHRT_ENABLE_COSMOS3_REASONER)
   message(STATUS "Cosmos3 Reasoner kernels: ENABLED (sm_110)")
 else()
   message(STATUS "Cosmos3 Reasoner kernels: DISABLED")
+endif()
+
+if(FLASHRT_ENABLE_ALPAMAYO15)
+  # FlashDrive W4A8 prefill GEMM (CUTLASS sm100 groupwise INT8, tcgen05). No fast-math: the
+  # epilogue reproduces Marlin's int32 -> float -> * scale -> half rounding exactly.
+  add_library(alpamayo15_fd_w4a8_obj OBJECT csrc/gemm/alpamayo15_flashdrive_w4a8_sm100.cu)
+  set_target_properties(alpamayo15_fd_w4a8_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(alpamayo15_fd_w4a8_obj PRIVATE
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(alpamayo15_fd_w4a8_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -O3 ${GPU_GENCODE}>
+  )
+  target_sources(flash_rt_kernels PRIVATE csrc/kernels/alpamayo15_kernels.cu
+                                         csrc/kernels/alpamayo15_flashdrive_kernels.cu
+                                         $<TARGET_OBJECTS:alpamayo15_fd_w4a8_obj>)
+  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_ALPAMAYO15=1)
+  message(STATUS "Alpamayo 1.5 kernels: ENABLED (sm_110)")
+else()
+  message(STATUS "Alpamayo 1.5 kernels: DISABLED")
 endif()
 
 if(FLASHRT_ENABLE_AUDIO_CODEBOOK)

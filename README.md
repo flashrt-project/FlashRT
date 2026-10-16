@@ -344,6 +344,20 @@ the public 1705/911/1263-token text/image/video profile:
 
 **Guide:** [Thor](docs/cosmos3_edge_thor.md).
 
+#### Alpamayo 1.5 reasoning driving VLA
+
+Jetson AGX Thor, full request (frames in host memory -> trajectory) on the
+official example clip (4 cameras x 4 frames, 20 generated tokens), official
+sampler and 10 flow-matching steps:
+
+| Mode | 1 sample | 6 samples | 16 samples | Source |
+|---|---:|---:|---:|---|
+| Official (SDPA, eager expert) | 3.46 s | 12.86 s | 29.87 s | [Alpamayo 1.5 Thor](docs/alpamayo15.md#measured-on-thor) |
+| FlashRT BF16 + CUDA Graphs | **2.31 s** | **2.46 s** | **2.83 s** | [Alpamayo 1.5 Thor](docs/alpamayo15.md#measured-on-thor) |
+| FlashRT, opt-in FP8 decode weights (numerics change) | 1.66 s | 1.82 s | 2.34 s | [FP8 decode tier](docs/alpamayo15.md#fp8-decode-tier) |
+
+z-lab's [FlashDrive](https://github.com/z-lab/flashdrive) streaming rollout (a different inference procedure: streaming windows, DFlash speculation, W4A8) with FlashRT execution, per window over 9 clips x 3 seeds: 956 ms mean / 856 ms median for FlashDrive, **514 ms / 461 ms** with the FlashRT backend ([Alpamayo 1.5 with FlashDrive](docs/alpamayo15.md#measured-on-thor)).
+
 #### Cosmos3-Nano text-to-video
 
 RTX 5090, 480p, 49 frames, 10-step UniPC:

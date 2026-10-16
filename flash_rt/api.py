@@ -562,6 +562,23 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "See docs/qwen3_vl_fp8_sm89.md, docs/qwen3_vl_nvfp4.md, "
             "docs/qwen3_vl_thor.md and docs/qwen3_vl_rtx_bf16.md.")
 
+    # Alpamayo 1.5 takes multi-camera frames plus ego history and returns a
+    # trajectory with reasoning text, not the VLAModel predict(images) surface.
+    if config == "alpamayo15":
+        raise NotImplementedError(
+            "config='alpamayo15' is not served through load_model's VLA wrapper. "
+            "Construct the Thor frontend directly:\n"
+            "    from flash_rt.frontends.torch.alpamayo15_thor import "
+            "Alpamayo15TorchFrontendThor\n"
+            "See docs/alpamayo15.md.")
+    if config == "alpamayo15_flashdrive":
+        raise NotImplementedError(
+            "config='alpamayo15_flashdrive' is a streaming rollout (one call per window) and is not "
+            "served through load_model's VLA wrapper. Construct the Thor frontend directly:\n"
+            "    from flash_rt.frontends.torch.alpamayo15_flashdrive_thor import "
+            "Alpamayo15FlashDriveTorchFrontendThor\n"
+            "See docs/alpamayo15.md.")
+
     if framework == "jetson_pi" and (use_fp4_decoder or use_fa4):
         raise ValueError(
             "use_fp4_decoder/use_fa4 are unsupported with framework="
