@@ -36,4 +36,3 @@ class Int8WLinear:
     def run(self, x: torch.Tensor, out: torch.Tensor, m: int, stream: int) -> None:
         self.ext.w8a16_tc(x.data_ptr(), self.packed.data_ptr(), self.scale.data_ptr(),
                           out.data_ptr(), m, self.N, self.K, self.warps, stream)
-

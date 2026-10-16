@@ -132,13 +132,7 @@ __global__ void layer_norm_kernel(const T* __restrict__ x,
         T2 val = x2[i];
         local_sum += to_f32(val.x) + to_f32(val.y);
     }
-    // __fdiv_rn: this translation unit is built with --prec-div=false, so a plain
-    // `/ dim` is an approximate division. dim is a model width (1152 for the DM05
-    // tower) and not a power of two, so the two disagree in the last ulp -- enough to
-    // move a few normalized values across a bf16 rounding boundary and, downstream, to
-    // flip quantized FP8 activations. The reference these kernels are checked against
-    // divides correctly-rounded. Same treatment as the v8_block_sum family below.
-    float mean = __fdiv_rn(block_reduce_sum(local_sum, shared), (float)dim);
+    float mean = block_reduce_sum(local_sum, shared) / dim;
 
     float local_var = 0.0f;
     for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
@@ -146,7 +140,7 @@ __global__ void layer_norm_kernel(const T* __restrict__ x,
         float d0 = to_f32(val.x) - mean, d1 = to_f32(val.y) - mean;
         local_var += d0 * d0 + d1 * d1;
     }
-    float inv_std = rsqrtf(__fdiv_rn(block_reduce_sum(local_var, shared), (float)dim) + eps);
+    float inv_std = rsqrtf(block_reduce_sum(local_var, shared) / dim + eps);
 
     for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
         T2 xv = x2[i], wv = w2[i], bv = b2[i];

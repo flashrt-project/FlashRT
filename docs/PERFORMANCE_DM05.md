@@ -166,7 +166,7 @@ with `--prec-div=false`; an externally-built reference is compiled with nvcc def
 where division *is* correctly rounded. The two agree exactly when the divisor is a
 power of two and differ by an ulp otherwise. The DM05 path pins the division sites
 with `__fdiv_rn` — in `resize_norm.cu`, in six places in the `v8_block_sum` family, and
-in `layer_norm_kernel`'s mean and inv_std. The last two were found only after a 444
+in the branch revision originally measured, in `layer_norm_kernel`'s mean and inv_std. The last two were found only after a 444
 gate run came back at min 0.989149 against a 0.99 threshold with a median of 0.999922:
 a handful of elements per 2.36M moved across a bf16 boundary, which at the real
 calibration scales flipped a few quantized FP8 values. A tail effect, never a median
@@ -183,3 +183,15 @@ the stack.
 `rcp.approx.ftz.f32` and `mul.rn.ftz.f32` are reproduced as inline asm in
 `res_ln_quant_v8_bf16`; `1.0f / x` is not the same operation. Its reduction likewise
 reproduces `frt_block_sum`'s tree rather than calling `block_reduce_sum`.
+
+
+## Integration follow-up (2026-10-17)
+
+The shared `layer_norm_kernel` template has been restored to current main for both
+FP16 and BF16. The new DM05 fused kernels remain separate additions; this model
+integration does not change existing LayerNorm arithmetic. The measurements above
+are the author's earlier revision records, not a new validation of this follow-up.
+
+Merge remains pending the standard hardware-specific frontend/pipeline routing
+and a complete-action comparison that includes gripper decisions. The existing
+six-dimensional arm gate does not validate the four reported gripper flips.
