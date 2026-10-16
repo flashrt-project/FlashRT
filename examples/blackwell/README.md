@@ -58,22 +58,24 @@ python examples/blackwell/eval_libero.py \
 
 ## VLA latency (RTX 5090)
 
-All RTX 5090 numbers here are pure CUDA Graph replay p50
-(`cuda.Event` around `graph.replay()`), not the end-to-end
-`quickstart.py` wall clock. Replay excludes graph-external work such
-as image normalization, H2D upload, D2H action download, post-process
+Pi0.5 below reports observation-to-final-action wall-clock p50 for the
+fastest verified tiers. The GROOT tables report pure CUDA Graph replay p50
+(`cuda.Event` around `graph.replay()`). Replay excludes graph-external work
+such as image normalization, H2D upload, D2H action download, post-process
 un-normalization, and Python wrapper overhead.
 
 ### Pi0.5
 
-| Views | Latency | Frequency |
+| Mode | Latency | Frequency |
 |-------|---------|-----------|
-| 1 view | **14.48 ms** | 69 Hz |
-| 2 views | **17.58 ms** | 57 Hz |
-| 3 views | **20.00 ms** | 50 Hz |
+| FP8, 2 views (skinny decoder) | **13.10 ms** | **76 Hz** |
+| NVFP4, 2 views (prefix + decoder) | **8.75 ms** | **114 Hz** |
 
-Wall p50 reference: 15.92 ms / 19.58 ms / 23.24 ms for 1/2/3 views.
-Cosine vs FP16 PyTorch reference: **0.998**.
+These are synchronized observation-to-action medians with a fixed text prompt
+without state tokens; loading, calibration and capture are excluded. Both modes
+use the same model, observations, build and runtime. Torch and Orbax loaders use
+the same inference pipeline. See [verification](../../docs/pi05_prefix_nvfp4.md#latest-verified-modes-2026-10-16)
+for measurements and the cuBLASLt 13.1 runtime requirement.
 
 ### GROOT N1.6
 

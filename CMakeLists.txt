@@ -741,7 +741,9 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
     csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_bf16out_sm120.cu
     csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_fp4out_sm120.cu
     csrc/gemm/fp4/cutlass_nvfp4_gemm_dn_streamk_bias_sm120.cu
-    csrc/gemm/fp4/cutlass_nvfp4_dual_gemm_silu_fp4out_sm120.cu)
+    csrc/gemm/fp4/cutlass_nvfp4_dual_gemm_silu_fp4out_sm120.cu
+    csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_res_sm120.cu
+    csrc/gemm/fp4/cutlass_nvfp4_gemm_glu_fp4out_sm120.cu)
   set_target_properties(sm120_nvfp4_ffn_obj PROPERTIES
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
@@ -755,6 +757,30 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
   target_compile_options(sm120_nvfp4_ffn_obj PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
       --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+  # Skinny NVFP4 (W4A4) GEMM family + fused block consumers (mma.kind::mxf4nvf4,
+  # small-row weight-streaming shapes: action decoders and DiT heads).
+  add_library(nvfp4_skinny_sm120_obj OBJECT
+    csrc/gemm/fp4/nvfp4_skinny_gemm_sm120.cu
+    csrc/gemm/fp4/nvfp4_skinny_consumers_sm120.cu
+    csrc/gemm/fp4/nvfp4_skinny_attention_sm120.cu
+    csrc/kernels/nvfp4_prefill_sm120.cu
+    csrc/kernels/fp8_prefill_fp16.cu
+    csrc/kernels/fused_qkv_attention.cu)
+  set_target_properties(nvfp4_skinny_sm120_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(nvfp4_skinny_sm120_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/fp4
+  )
+  target_compile_options(nvfp4_skinny_sm120_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3
+      --ftz=true --prec-div=false --prec-sqrt=false
       ${GPU_GENCODE}
     >
   )
@@ -1980,6 +2006,28 @@ if(FLASHRT_ENABLE_PI05_NVFP4)
   message(STATUS "Pi0.5 NVFP4 prefix kernels: ENABLED (SM120, runtime opt-in)")
   target_sources(flash_rt_kernels PRIVATE csrc/kernels/pi05/pi05_geglu_nvfp4_quant.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_PI05_NVFP4=1)
+  # Skinny NVFP4 (W4A4) decoder family: sm_120a only (mma.kind::mxf4nvf4).
+  add_library(pi05_decoder_skinny_fp4_sm120_obj OBJECT
+    csrc/kernels/pi05/pi05_decoder_skinny_fp4_sm120.cu)
+  set_target_properties(pi05_decoder_skinny_fp4_sm120_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(pi05_decoder_skinny_fp4_sm120_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/fp4
+  )
+  target_compile_options(pi05_decoder_skinny_fp4_sm120_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3
+      --ftz=true --prec-div=false --prec-sqrt=false
+      ${GPU_GENCODE}
+    >
+  )
+  target_sources(flash_rt_kernels PRIVATE
+    $<TARGET_OBJECTS:pi05_decoder_skinny_fp4_sm120_obj>)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    FLASHRT_PI05_DECODER_FP4_SM120=1)
 else()
   message(STATUS "Pi0.5 NVFP4 prefix kernels: DISABLED")
 endif()
@@ -2025,9 +2073,11 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
   target_sources(flash_rt_kernels PRIVATE
     $<TARGET_OBJECTS:cutlass_nvfp4_w4a16_sm120_obj>
     $<TARGET_OBJECTS:sm120_nvfp4_ffn_obj>
+    $<TARGET_OBJECTS:nvfp4_skinny_sm120_obj>
     csrc/quantize/nvfp4_sf_reshape_sm120.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE
-    ENABLE_CUTLASS_SM120_NVFP4_W4A16=1)
+    ENABLE_CUTLASS_SM120_NVFP4_W4A16=1
+    FLASHRT_NVFP4_SKINNY_SM120=1)
   if(FLASHRT_ENABLE_SM120_DEV_KERNELS)
     target_sources(flash_rt_kernels PRIVATE
       $<TARGET_OBJECTS:sm120_nvfp4_dev_obj>)

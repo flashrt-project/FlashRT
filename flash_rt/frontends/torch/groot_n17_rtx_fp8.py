@@ -27,6 +27,7 @@ full-FP16 frontends, the calibration shadow, or any kernel.
 
 from __future__ import annotations
 
+import os
 import warnings
 
 import torch
@@ -36,6 +37,21 @@ from flash_rt.frontends.torch.groot_n17_rtx_fp16 import GrootN17TorchFrontendRtx
 
 _FP16 = torch.float16
 _U8 = torch.uint8
+
+
+def _fused_backbone_available(fvk) -> bool:
+    """SM120 builds carry the fused FP8 prefill producers (fp8_* bindings) and
+    the FA2 causal GQA entry; FLASHRT_GROOT_N17_BB_FUSED=0 keeps the unfused
+    reference sequence."""
+    if os.environ.get("FLASHRT_GROOT_N17_BB_FUSED", "1") == "0":
+        return False
+    if not hasattr(fvk, "fp8_residual_norm_quant"):
+        return False
+    try:
+        from flash_rt import flash_rt_fa2 as fa2
+    except ImportError:
+        return False
+    return hasattr(fa2, "fwd_bf16_causal")
 
 
 class _GrootN17FP8BackboneMixin:
@@ -262,6 +278,8 @@ class _GrootN17FP8BackboneMixin:
     # ── FP8 kernel backbone: ViT → DeepStack → LLM → vlln → VL-self-attn ──
     def _run_kernel_backbone_fp8(self, aux: dict) -> "torch.Tensor":
         import flash_rt.flash_rt_kernels as fvk
+        if _fused_backbone_available(fvk):
+            return self._run_kernel_backbone_fp8_fused(aux)
         from flash_rt.models.groot_n17 import pipeline_rtx_fp8 as P
         from flash_rt.hardware.rtx.attn_backend_groot_n17_backbone import (
             RtxGrootN17BackboneAttn,
@@ -356,11 +374,16 @@ class _GrootN17FP8BackboneMixin:
             return cb
         dcap = [mk_cb(l) for l in tap_layers]
 
+        # Only the DeepStack taps leave the ViT on this path (the LLM input
+        # embeddings arrive in aux), so the layers after the last tap are
+        # skipped: their output has no consumer.
+        vit_layers = range(tap_layers[-1] + 1)
         P.qwen3vl_vit_forward(
             gemm=gemm, fvk=fvkm, bufs=vit_bufs, weights=vw, scales_dev=vit_scales,
             dims={"S": Sv, "D": 1024, "NH": 16, "HD": 64,
                   "ff_inner": 4096, "Sper_view": Sv // nv},
-            attn=attn, deepstack_taps=tap_layers, deepstack_capture=dcap)
+            attn=attn, layers_subset=vit_layers, deepstack_taps=tap_layers,
+            deepstack_capture=dcap)
 
         # ═══ DeepStack (3 mergers) ═══
         Nout = Sv // 4
@@ -515,8 +538,8 @@ class _GrootN17FP8BackboneMixin:
             P.qwen3vl_vit_forward(
                 gemm=gemm, fvk=fvkm, bufs=vit_bufs, weights=vw,
                 scales_dev=vit_scales, dims=vit_dims, attn=attn,
-                deepstack_taps=tap_layers, deepstack_capture=dcap,
-                stream=stream)
+                layers_subset=vit_layers, deepstack_taps=tap_layers,
+                deepstack_capture=dcap, stream=stream)
             P.deepstack_merge_forward(
                 gemm=gemm, fvk=fvkm, bufs=ds_bufs, weights=dsw,
                 scales_dev=ds_scales, dims=ds_dims, stream=stream)
@@ -537,6 +560,198 @@ class _GrootN17FP8BackboneMixin:
                 stream=stream)
             return vlsa_h
 
+        self._kbb_forward = _kbb_forward
+        self._kbb_vit_h = vit_h
+        self._kbb_llm_h = llm_h
+        self._kbb_vlsa_h = vlsa_h
+        return vlsa_h.unsqueeze(0)
+
+    def _run_kernel_backbone_fp8_fused(self, aux: dict) -> "torch.Tensor":
+        """FP8 backbone with fused producers (pipeline_rtx_fp8_fused): same
+        weights, scales and attention slots as the unfused sequence, about a
+        third of the launches. Builds the buffers, runs once, and leaves
+        ``_kbb_forward`` for graph capture."""
+        import flash_rt.flash_rt_kernels as fvk
+        from flash_rt import flash_rt_fa2 as fa2
+        from flash_rt.models.groot_n17 import pipeline_rtx_fp8_fused as P
+        from flash_rt.hardware.rtx.attn_backend_groot_n17_backbone import (
+            RtxGrootN17BackboneAttn,
+        )
+
+        if not hasattr(self, "_gemm"):
+            self._fvk = fvk
+            self._gemm = fvk.GemmRunner()
+        gemm, fvkm = self._gemm, self._fvk
+        dev = self.device
+        Sv, nv, Se = self._S_vit, self._num_vit_views, self.Se
+        num_sms = torch.cuda.get_device_properties(dev).multi_processor_count
+
+        keep: list = []
+        self._kbb_keep = keep
+
+        def K(t):
+            keep.append(t)
+            return t
+
+        def buf(*shape, dtype=_FP16):
+            return K(torch.empty(*shape, dtype=dtype, device=dev))
+
+        def ptr(*shape, dtype=_FP16):
+            return buf(*shape, dtype=dtype).data_ptr()
+
+        def wsc(val):
+            return K(torch.tensor([float(val)], dtype=torch.float32, device=dev)).data_ptr()
+
+        def adv(dev_list):
+            return [t.data_ptr() for t in dev_list]
+
+        attn = RtxGrootN17BackboneAttn(
+            num_vit_views=nv, vit_seq=Sv, llm_seq=Se, vl_self_attn_seq=Se, device=dev)
+        self._kbb_attn = attn
+
+        # ═══ ViT (layers up to the last DeepStack tap) ═══
+        vit_h = buf(Sv, 1024)
+        vit_h.copy_(aux["pixel_features"].to(dev).half().reshape(Sv, 1024))
+        vit_bufs = {"h": vit_h.data_ptr(), "xn_fp8": ptr(Sv, 4096, dtype=_U8),
+                    "qkv": ptr(Sv, 3072), "o_out": ptr(Sv, 1024),
+                    "fc1_out": ptr(Sv, 4096), "fc1_fp8": ptr(Sv, 4096, dtype=_U8)}
+        vw = {k: [] for k in ("norm1_w", "norm1_b", "norm2_w", "norm2_b", "qkv_w", "qkv_b",
+                              "qkv_ws", "o_w", "o_b", "o_ws", "fc1_w", "fc1_b", "fc1_ws",
+                              "fc2_w", "fc2_b", "fc2_ws")}
+        vw["cos"], vw["sin"] = self._vit_cos.data_ptr(), self._vit_sin.data_ptr()
+        tap_layers = (5, 11, 17)
+        vit_layers = range(tap_layers[-1] + 1)
+        for li in vit_layers:
+            vw["norm1_w"].append(self._vit_ln1_w[li].data_ptr())
+            vw["norm1_b"].append(self._vit_ln1_b[li].data_ptr())
+            vw["norm2_w"].append(self._vit_ln2_w[li].data_ptr())
+            vw["norm2_b"].append(self._vit_ln2_b[li].data_ptr())
+            vw["qkv_w"].append(self._vit_qkv_w[li].data_ptr())       # fp8 [1024, 3072]
+            vw["qkv_b"].append(self._vit_qkv_b[li].data_ptr())
+            vw["qkv_ws"].append(wsc(self._vit_alpha[li * 4 + 0]))
+            vw["o_w"].append(self._vit_o_w[li].data_ptr())
+            vw["o_b"].append(self._vit_o_b[li].data_ptr())
+            vw["o_ws"].append(wsc(self._vit_alpha[li * 4 + 1]))
+            vw["fc1_w"].append(self._vit_fc1_w[li].data_ptr())
+            vw["fc1_b"].append(self._vit_fc1_b[li].data_ptr())
+            vw["fc1_ws"].append(wsc(self._vit_alpha[li * 4 + 2]))
+            vw["fc2_w"].append(self._vit_fc2_w[li].data_ptr())
+            vw["fc2_b"].append(self._vit_fc2_b[li].data_ptr())
+            vw["fc2_ws"].append(wsc(self._vit_alpha[li * 4 + 3]))
+        vit_scales = {
+            "act_qkv": adv(self._vit_act_qkv_dev), "act_o": adv(self._vit_act_o_dev),
+            "act_fc1": adv(self._vit_act_fc1_dev), "act_fc2": adv(self._vit_act_fc2_dev)}
+        vit_dims = {"S": Sv, "D": 1024, "NH": 16, "HD": 64, "ff_inner": 4096,
+                    "Sper_view": Sv // nv}
+
+        # ═══ DeepStack mergers: run at their tap, straight off the ViT stream ═══
+        Nout = Sv // 4
+        ds_out = [buf(Nout, 2048) for _ in range(3)]
+        dsw = {k: [] for k in ("norm_w", "norm_b", "fc1_w", "fc1_b", "fc2_w", "fc2_b",
+                                "fc1_ws", "fc2_ws")}
+        for j in range(3):
+            dsw["norm_w"].append(getattr(self, f"_dsm{j}_norm_w").data_ptr())
+            dsw["norm_b"].append(getattr(self, f"_dsm{j}_norm_b").data_ptr())
+            dsw["fc1_w"].append(getattr(self, f"_dsm{j}_fc1_w").data_ptr())
+            dsw["fc1_b"].append(getattr(self, f"_dsm{j}_fc1_b").data_ptr())
+            dsw["fc1_ws"].append(wsc(self._dsm_alpha[j * 2 + 0]))
+            dsw["fc2_w"].append(getattr(self, f"_dsm{j}_fc2_w").data_ptr())
+            dsw["fc2_b"].append(getattr(self, f"_dsm{j}_fc2_b").data_ptr())
+            dsw["fc2_ws"].append(wsc(self._dsm_alpha[j * 2 + 1]))
+        ds_scales = {"act_fc1": adv(self._dsm_act_fc1_dev),
+                     "act_fc2": adv(self._dsm_act_fc2_dev)}
+        ds_bufs = {"fp8_scratch": ptr(Nout, 4096, dtype=_U8), "fc1_out": ptr(Nout, 4096)}
+        ds_dims = {"Nout": Nout, "Dmid": 4096, "Dout": 2048}
+        scell = [0]
+        self._kbb_scell = scell
+
+        def tap_hook(j, h_ptr):
+            P.deepstack_merger_forward(gemm, fvkm, ds_bufs, dsw, ds_dims, ds_scales, j, h_ptr,
+                                       ds_out[j].data_ptr(), stream=scell[0])
+
+        # DeepStack inject buffers (S, D): zero except the visual positions.
+        vis_idx = K(self._visual_pos_masks.reshape(-1).nonzero(as_tuple=True)[0].to(torch.long))
+        injb = [buf(Se, 2048) for _ in range(3)]
+        for ib in injb:
+            ib.zero_()
+
+        # ═══ LLM (16L, causal GQA) ═══
+        llm_h = buf(Se, 2048)
+        llm_h.copy_(aux["llm_input_embeds"].to(dev).half().reshape(Se, 2048))
+        lw = {k: [] for k in ("in_ln_w", "post_ln_w", "q_norm_w", "k_norm_w", "qkv_w", "qkv_ws",
+                              "o_w", "o_ws", "gate_w", "gate_ws", "up_w", "up_ws", "down_w",
+                              "down_ws")}
+        lw["cos"], lw["sin"] = self._mrope_cos.data_ptr(), self._mrope_sin.data_ptr()
+        lw["deepstack_inject"] = [ib.data_ptr() for ib in injb]
+        for li in range(16):
+            lw["in_ln_w"].append(self._llm_input_ln_w[li].data_ptr())
+            lw["post_ln_w"].append(self._llm_post_ln_w[li].data_ptr())
+            lw["q_norm_w"].append(self._llm_q_norm_w[li].data_ptr())
+            lw["k_norm_w"].append(self._llm_k_norm_w[li].data_ptr())
+            lw["qkv_w"].append(self._llm_qkv_w[li].data_ptr())       # fp8 [2048, 4096]
+            lw["qkv_ws"].append(wsc(self._llm_alpha[li * 5 + 0]))
+            lw["o_w"].append(self._llm_o_w[li].data_ptr())
+            lw["o_ws"].append(wsc(self._llm_alpha[li * 5 + 1]))
+            lw["gate_w"].append(self._llm_gate_w[li].data_ptr())
+            lw["gate_ws"].append(wsc(self._llm_alpha[li * 5 + 2]))
+            lw["up_w"].append(self._llm_up_w[li].data_ptr())
+            lw["up_ws"].append(wsc(self._llm_alpha[li * 5 + 3]))
+            lw["down_w"].append(self._llm_down_w[li].data_ptr())
+            lw["down_ws"].append(wsc(self._llm_alpha[li * 5 + 4]))
+        llm_scales = {
+            "act_qkv": adv(self._llm_act_qkv_dev), "act_o": adv(self._llm_act_o_dev),
+            "act_gateup": adv(self._llm_act_gateup_dev), "act_down": adv(self._llm_act_down_dev)}
+        _BF16 = torch.bfloat16
+        llm_bufs = {
+            "h": llm_h.data_ptr(), "xn_fp8": ptr(Se, 6144, dtype=_U8), "qkv": ptr(Se, 4096),
+            "Q": ptr(Se, 16, 128, dtype=_BF16), "K": ptr(Se, 8, 128, dtype=_BF16),
+            "V": ptr(Se, 8, 128, dtype=_BF16), "O": ptr(Se, 16, 128, dtype=_BF16),
+            "lse": ptr(1, 16, (Se + 127) // 128 * 128, dtype=torch.float32),
+            "lse_accum": ptr((Se + 127) // 128, 1, 16, Se, dtype=torch.float32),
+            "o_accum": ptr((Se + 127) // 128, 1, 16, Se, 128, dtype=torch.float32),
+            "o_out": ptr(Se, 2048), "gate_out": ptr(Se, 6144), "up_out": ptr(Se, 6144),
+            "gu_fp8": ptr(Se, 6144, dtype=_U8)}
+        llm_dims = {"S": Se, "D": 2048, "NHQ": 16, "NHKV": 8, "HD": 128, "FF": 6144}
+
+        # ═══ vlln + VL self-attn (4L) ═══
+        vlsa_h = buf(Se, 2048)
+        vsw = {k: [] for k in ("norm1_w", "norm1_b", "norm3_w", "norm3_b", "q_w", "q_b", "k_w",
+                               "k_b", "v_w", "v_b", "o_w", "o_b", "fc1_w", "fc1_b", "fc2_w",
+                               "fc2_b", "q_ws", "k_ws", "v_ws", "o_ws", "fc1_ws", "fc2_ws")}
+        vsw["vlln_w"], vsw["vlln_b"] = self._vlln_w.data_ptr(), self._vlln_b.data_ptr()
+        for li in range(4):
+            for n in ("norm1_w", "norm1_b", "norm3_w", "norm3_b"):
+                vsw[n].append(getattr(self, f"_vlsa_{n}")[li].data_ptr())
+            for i, n in enumerate(("q", "k", "v", "o", "fc1", "fc2")):
+                vsw[f"{n}_w"].append(getattr(self, f"_vlsa_{n}_w")[li].data_ptr())
+                vsw[f"{n}_b"].append(getattr(self, f"_vlsa_{n}_b")[li].data_ptr())
+                vsw[f"{n}_ws"].append(wsc(self._vlsa_alpha[li * 6 + i]))
+        vlsa_scales = {
+            "act_qkv": adv(self._vlsa_act_qkv_dev), "act_o": adv(self._vlsa_act_o_dev),
+            "act_fc1": adv(self._vlsa_act_fc1_dev), "act_fc2": adv(self._vlsa_act_fc2_dev)}
+        vlsa_bufs = {"h": vlsa_h.data_ptr(), "xn_fp8": ptr(Se, 2048, dtype=_U8),
+                     "o_out": ptr(Se, 2048), "fc1_out": ptr(Se, 8192),
+                     "fc1_fp8": ptr(Se, 8192, dtype=_U8)}
+        vlsa_dims = {"T": Se, "D": 2048, "NH": 32, "HD": 64, "ff_inner": 8192}
+
+        def _kbb_forward(stream=0):
+            scell[0] = stream
+            P.qwen3vl_vit_forward(
+                gemm, fvkm, vit_bufs, vw, vit_dims, vit_scales, attn=attn, stream=stream,
+                layers=vit_layers, taps=tap_layers, tap_hook=tap_hook)
+            # rows outside the visual positions stay zero from allocation
+            for j in range(3):
+                injb[j].index_copy_(0, vis_idx, ds_out[j])
+            delta = P.qwen3vl_llm_forward(
+                gemm, fvkm, fa2, llm_bufs, lw, llm_dims, llm_scales, stream=stream,
+                num_sms=num_sms)
+            P.vlln_vl_self_attn_forward(
+                gemm, fvkm, vlsa_bufs, vsw, vlsa_dims, vlsa_scales, attn=attn,
+                llm_h=llm_h.data_ptr(), llm_delta=delta, stream=stream)
+            return vlsa_h
+
+        _kbb_forward(0)
+        torch.cuda.synchronize()
         self._kbb_forward = _kbb_forward
         self._kbb_vit_h = vit_h
         self._kbb_llm_h = llm_h

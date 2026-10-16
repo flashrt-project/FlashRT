@@ -15,7 +15,8 @@ def main():
     parser.add_argument("--observations", required=True,
                         help="NPZ with n, img_i, wrist_i and state_i arrays")
     parser.add_argument("--output", required=True)
-    parser.add_argument("--profile", choices=("default", "skinny", "nvfp4"), default="default")
+    parser.add_argument("--profile", choices=("default", "skinny", "nvfp4", "nvfp4-full"), default="default",
+                        help="nvfp4: NVFP4 prefix tier; nvfp4-full: NVFP4 prefix + decoder (use_fp4=True)")
     parser.add_argument("--prompt", default="pick up the black bowl and place it on the plate")
     parser.add_argument("--warmup", type=int, default=30)
     parser.add_argument("--iterations", type=int, default=200)
@@ -39,8 +40,10 @@ def main():
     options = {"num_views": 2}
     if args.profile != "default":
         options["decoder_kernel"] = "skinny"
-    if args.profile == "nvfp4":
+    if args.profile in ("nvfp4", "nvfp4-full"):
         options["prefix_precision"] = "nvfp4"
+    if args.profile == "nvfp4-full":
+        options["decoder_precision"] = "nvfp4"
     torch.manual_seed(args.seed)
     model = Pi05TorchFrontendRtx(args.checkpoint, **options)
     def set_observation_prompt(observation):

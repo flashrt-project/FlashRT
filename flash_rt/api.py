@@ -885,7 +885,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 "GROOT N1.7 on RTX defaults to FP8; there is no separate "
                 "non-FP16 BF16 fallback. For the non-quantized full-FP16 "
                 "reference pass use_fp16=True, use_fp8=False.")
-        if arch == "rtx_sm120":
+        if arch == "rtx_sm120" and use_fp4:
+            # NVFP4 DiT action head on the skinny W4A4 family (FP8 backbone).
+            from flash_rt.frontends.torch.groot_n17_rtx_fp4 import (
+                GrootN17TorchFrontendRtxFP4,
+            )
+            pipe_cls = GrootN17TorchFrontendRtxFP4
+        elif arch == "rtx_sm120":
             from flash_rt.frontends.torch.groot_n17_rtx_fp8 import (
                 GrootN17TorchFrontendRtxFP8,
             )
@@ -998,6 +1004,15 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
 
     # ── FP4 routing (Pi0.5 torch + Pi0.5 JAX on Thor, HyVLA torch on Thor) ──
     _hyvla_fp4 = False
+    _rtx_nvfp4 = False
+    if use_fp4 and framework == "torch" and arch == "rtx_sm120" \
+            and config in ("pi05", "groot_n17"):
+        # RTX SM120 NVFP4 tiers live in flash_rt_kernels (skinny W4A4 family
+        # and the SM120 block-scaled GEMMs), not in the Thor flash_rt_fp4
+        # extension. GROOT N1.7 was routed to its NVFP4 frontend above; Pi0.5
+        # gets the NVFP4 prefix and decoder tiers on the RTX frontend.
+        _rtx_nvfp4 = True
+        use_fp4 = False
     if use_fp4:
         _fp4_ok = (
             (config == "pi05" and framework in ("torch", "jax") and arch == "thor")
@@ -1019,10 +1034,11 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             else:
                 logger.warning(
                     "use_fp4=True is only supported for config='pi05' with "
-                    "framework in ('torch', 'jax') on Thor, or config='hyvla' "
-                    "with framework='torch' on Thor; got config='%s' "
-                    "framework='%s' hardware='%s'. Falling back to FP8.",
-                    config, framework, arch)
+                    "framework in ('torch', 'jax') on Thor, config='hyvla' "
+                    "with framework='torch' on Thor, or config in ('pi05', "
+                    "'groot_n17') with framework='torch' on RTX SM120; got "
+                    "config='%s' framework='%s' hardware='%s'. Falling back "
+                    "to FP8.", config, framework, arch)
             use_fp4 = False
         else:
             try:
@@ -1090,6 +1106,14 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         kwargs["hardware"] = arch
     if "use_fp8" in sig.parameters:
         kwargs["use_fp8"] = use_fp8
+    if _rtx_nvfp4 and config == "pi05":
+        if "decoder_precision" in sig.parameters and "prefix_precision" in sig.parameters:
+            kwargs["prefix_precision"] = "nvfp4"
+            kwargs["decoder_precision"] = "nvfp4"
+        else:
+            logger.warning(
+                "use_fp4=True: %s has no NVFP4 tier; falling back to FP8.",
+                pipe_cls.__name__)
     # A named tier reaches here only for the Ascend backend, and only as
     # "bf16" or "int8"; everything else was refused before the frontend was
     # chosen. A frontend that cannot take the tier is an error rather than a

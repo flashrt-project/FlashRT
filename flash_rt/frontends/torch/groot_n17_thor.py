@@ -811,12 +811,15 @@ class GrootN17TorchFrontendThor:
             K.gpu_copy(dit_h, self._k_state_feat.data_ptr(), 1536 * 2, s)
             K.gpu_copy(dit_h + 1536 * 2, self._k_ae_out.data_ptr(), T * 1536 * 2, s)
 
-        def _post_fwd(step, s):
+        def _post_fwd(step, s, out_norm_done=False):
             # output projection (AdaLN → proj_out_2) + action_decode + Euler.
+            # out_norm_done: the DiT's last consumer already wrote the output
+            # AdaLN into _k_hmod.
             T = action_horizon
-            K.ada_layer_norm_bf16(dit_h, self._k_oproj_scale[step].data_ptr(),
-                                  self._k_oproj_shift[step].data_ptr(),
-                                  self._k_hmod.data_ptr(), Sa, 1536, 1e-5, s)
+            if not out_norm_done:
+                K.ada_layer_norm_bf16(dit_h, self._k_oproj_scale[step].data_ptr(),
+                                      self._k_oproj_shift[step].data_ptr(),
+                                      self._k_hmod.data_ptr(), Sa, 1536, 1e-5, s)
             mg.bf16_nn(self._k_hmod.data_ptr(), w["po2"].data_ptr(),
                        self._k_hout.data_ptr(), Sa, 1024, 1536, s)
             K.add_bias_bf16(self._k_hout.data_ptr(), w["po2b"].data_ptr(), Sa, 1024, s)
@@ -838,10 +841,15 @@ class GrootN17TorchFrontendThor:
         # quantize. Skipped for the full-FP16 reference (``_DIT_USE_FP8`` off),
         # which keeps the DiT bf16 — dit_forward / _step_fwd fall back to the
         # bf16 path when the FP8 weights are absent from ``step_weights`` / ``bp``.
-        if getattr(self, "_DIT_QUANT", "fp8") == "fp4":
+        dit_quant = getattr(self, "_DIT_QUANT", "fp8")
+        if dit_quant == "fp4":
             # NVFP4 needs no activation calibration (per-16-element dynamic
             # scales); just quantize the weights and splice the pointers.
             self._quantize_dit_fp4(step_weights, bp, action_horizon)
+        elif dit_quant == "nvfp4_skinny":
+            # Skinny NVFP4 DiT (RTX): quantized weights + fused consumers,
+            # dynamic activation scales; see pipeline_rtx_nvfp4.
+            self._prepare_dit_nvfp4_skinny(step_weights, bp, dims, num_inference_timesteps, Sa)
         elif self._DIT_USE_FP8:
             self._calibrate_quantize_dit_ffn(
                 num_inference_timesteps, action_horizon, _state_fwd, _ae_fwd,
@@ -849,6 +857,10 @@ class GrootN17TorchFrontendThor:
 
         def _step_fwd(step, s):
             _ae_fwd(step, s)
+            if dit_quant == "nvfp4_skinny":
+                self._dit_nvfp4_skinny_step(step, step_weights[step], dims, s)
+                _post_fwd(step, s, out_norm_done=True)
+                return
             pipeline_thor.dit_forward(
                 gemm=self._gemm, fvk=K, bufs=bp, weights=step_weights[step],
                 dims=dims, attn=self._dit_attn, stream=s,
