@@ -5,6 +5,7 @@
 
 #include "rope.cuh"
 #include "common.cuh"
+#include <stdexcept>
 
 // ── RoPE ──
 __global__ void rope_kernel(const __nv_bfloat16* __restrict__ rope_weights,
@@ -407,4 +408,63 @@ void qkv_split_rope_kvcache_fp16_devpos(
     qkv_split_rope_kvcache_fp16_devpos_kernel<<<blocks, threads, 0, stream>>>(
         qkv, rope, Q, Kc, Vc, devpos, S, Q_dim, K_dim, HD, qkv_stride,
         kc_offset, kc_stride);
+}
+
+// round to bf16 and back: HF rounds each product before the sum
+__device__ __forceinline__ float rope_hf_bf(float v) {
+    return __bfloat162float(__float2bfloat16(v));
+}
+
+
+// ── HuggingFace rotate_half RoPE, in place, with HF's intermediate roundings ──
+//
+//   x'[d]      = bf16( bf16(x[d]      * cos[d]) + bf16(-x[d+half] * sin[d]) )
+//   x'[d+half] = bf16( bf16(x[d+half] * cos[d+half]) + bf16( x[d]  * sin[d+half]) )
+//
+// Distinct from rope_apply (interleaved d, d+1 pairs) and from
+// rope_neox_qk_bf16 (the same rotate_half convention, but it rounds once after
+// the sum and reads a half-width table). Both of those differences change the
+// result: HF rounds each product to bf16 before adding, and takes a full-width
+// cos/sin table whose two halves are read separately. A caller calibrated
+// against HF's formulation needs this one.
+//
+// Rows are strided by row_stride elements, so the per-head rotation runs in
+// place on a fused QKV buffer; `heads` heads of `dim` (= 2 * half) start at each
+// row's base. cos/sin are [seq, dim] bf16 tables.
+__global__ void rope_hf_bf16_kernel(__nv_bfloat16* __restrict__ x, long long row_stride,
+                                    int heads, int dim,
+                                    const __nv_bfloat16* __restrict__ cosT,
+                                    const __nv_bfloat16* __restrict__ sinT, int seq) {
+    const int half = dim / 2;
+    const long long total = (long long)seq * heads * half;
+    for (long long t = (long long)blockIdx.x * blockDim.x + threadIdx.x; t < total;
+         t += (long long)gridDim.x * blockDim.x) {
+        const int j = (int)(t % half);
+        const int h = (int)((t / half) % heads);
+        const int s = (int)(t / ((long long)half * heads));
+        __nv_bfloat16* xr = x + (long long)s * row_stride + (long long)h * dim;
+        const float x1 = __bfloat162float(xr[j]), x2 = __bfloat162float(xr[j + half]);
+        const float c1 = __bfloat162float(cosT[(long long)s * dim + j]);
+        const float c2 = __bfloat162float(cosT[(long long)s * dim + j + half]);
+        const float s1 = __bfloat162float(sinT[(long long)s * dim + j]);
+        const float s2 = __bfloat162float(sinT[(long long)s * dim + j + half]);
+        xr[j] = __float2bfloat16(rope_hf_bf(x1 * c1) + rope_hf_bf(-x2 * s1));
+        xr[j + half] = __float2bfloat16(rope_hf_bf(x2 * c2) + rope_hf_bf(x1 * s2));
+    }
+}
+
+void rope_hf_bf16(__nv_bfloat16* x, long long row_stride, int heads, int dim,
+                  const __nv_bfloat16* cos_tab, const __nv_bfloat16* sin_tab,
+                  int seq, cudaStream_t stream) {
+    if (seq <= 0 || heads <= 0 || dim <= 0) return;
+    if (!x || !cos_tab || !sin_tab)
+        throw std::runtime_error("rope_hf_bf16: null pointer argument");
+    if (dim % 2 != 0)
+        throw std::runtime_error("rope_hf_bf16: dim must be even");
+    if (row_stride < (long long)heads * dim)
+        throw std::runtime_error("rope_hf_bf16: row stride is smaller than heads * dim");
+    const long long total = (long long)seq * heads * (dim / 2);
+    int grid = (int)((total + 255) / 256);
+    if (grid > 65535) grid = 65535;
+    rope_hf_bf16_kernel<<<grid, 256, 0, stream>>>(x, row_stride, heads, dim, cos_tab, sin_tab, seq);
 }

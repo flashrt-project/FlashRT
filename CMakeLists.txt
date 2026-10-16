@@ -264,6 +264,13 @@ option(FLASHRT_ENABLE_MELBAND_ROFORMER
 # Enable explicitly on a Blackwell (sm_120) build.
 option(FLASHRT_ENABLE_OMNIVOICE
        "Build OmniVoice TTS RTX SM120 fused kernels in flash_rt_omnivoice" OFF)
+# DM05 (LIBERO VLA) — builds flash_rt_dm05.so with the kernels FlashRT has no
+# equivalent for: SigLIP self-attention at head_dim 72, and the head_dim-256
+# grouped-query decode attention of the action expert. Opt-in, and separate
+# from the default flash_rt_kernels target. Enable on a Blackwell (sm_120)
+# build with -DFLASHRT_ENABLE_DM05=ON.
+option(FLASHRT_ENABLE_DM05
+       "Build DM05 RTX SM120 fused kernels in flash_rt_dm05" OFF)
 # Shared delayed-codebook helper used by discrete-audio paths. Kept behind an
 # explicit option so deployment builds that do not serve audio can remove the
 # TU and its binding in lockstep.
@@ -1391,6 +1398,44 @@ else()
   message(STATUS "OmniVoice TTS SM120 kernels: DISABLED")
 endif()
 
+# ── DM05 fused kernels (standalone module, independent of flash_rt_kernels) ──
+if(FLASHRT_ENABLE_DM05)
+  if(NOT GPU_ARCH STREQUAL "120")
+    message(FATAL_ERROR
+      "FLASHRT_ENABLE_DM05 requires GPU_ARCH=120 (Blackwell / sm_120); "
+      "got '${GPU_ARCH}'.")
+  endif()
+  pybind11_add_module(flash_rt_dm05
+    csrc/dm05_extra_bindings.cpp
+    csrc/kernels/dm05/dm05_ae_decode_attn.cu
+    csrc/kernels/dm05/dm05_prefix_attn.cu
+    csrc/kernels/dm05/dm05_w8a16.cu
+    csrc/kernels/dm05/dm05_vit_attn_hd72.cu)
+  set_target_properties(flash_rt_dm05 PROPERTIES
+    CUDA_STANDARD 17
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+  target_include_directories(flash_rt_dm05 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels)
+  # --use_fast_math is deliberately absent. These kernels reproduce a specific
+  # set of roundings, and the places where the reference rounds through a
+  # fast-math instruction spell it out themselves (dm05_common.cuh); leaving
+  # the flag off keeps every other expression IEEE.
+  target_compile_options(flash_rt_dm05 PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3
+      -U__CUDA_NO_BFLOAT16_OPERATORS__
+      -U__CUDA_NO_BFLOAT162_OPERATORS__
+      ${GPU_GENCODE}
+    >)
+  target_link_libraries(flash_rt_dm05 PRIVATE CUDA::cudart)
+  install(TARGETS flash_rt_dm05 LIBRARY DESTINATION flash_rt)
+  message(STATUS "DM05 SM120 kernels: ENABLED")
+else()
+  message(STATUS "DM05 SM120 kernels: DISABLED")
+endif()
+
 # ── MiniMax-Remover fused kernels (standalone module, independent
 #    of flash_rt_kernels) ──
 # Builds flash_rt_minimax_remover.so with MiniMax-specific FP8/NVFP4
@@ -1658,6 +1703,10 @@ endif()
 pybind11_add_module(flash_rt_kernels
   csrc/gemm/gemm_runner.cu
   csrc/kernels/norm.cu
+  csrc/kernels/linear_f32.cu
+  csrc/kernels/resize_norm.cu
+  csrc/kernels/gelu_mul.cu
+  csrc/quantize/gelu_mul_quant_nvfp4_swizzled.cu
   csrc/kernels/activation.cu
   csrc/kernels/rope.cu
   csrc/kernels/quantize.cu

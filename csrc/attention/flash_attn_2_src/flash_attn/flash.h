@@ -7,6 +7,7 @@
 #include "namespace_config.h"
 
 #include <cuda.h>
+#include <cuda_fp8.h>
 #include <vector>
 
 // Vendor patch: replace PyTorch ATen dependency with a minimal POD stub.
@@ -64,6 +65,22 @@ struct Flash_fwd_params : public Qkv_params {
 
     // The O matrix (output).
     void * __restrict__ o_ptr;
+
+    // FlashRT local patch 4: optional FP8 (e4m3) copy of the final attention
+    // output, written from the registers that already feed the bf16 store, so a
+    // consumer GEMM that wants an FP8 activation does not need a second pass over
+    // O. `o_fp8_scale_ptr` is a device scalar holding the static activation scale,
+    // i.e. the same buffer quantize_fp8_static would read. nullptr disables the
+    // whole path and leaves the kernel byte-for-byte as upstream.
+    //
+    // `o_bf16_skip` additionally suppresses the bf16 store for callers whose only
+    // consumer is the FP8 copy.
+    void * __restrict__ o_fp8_ptr;
+    const float * __restrict__ o_fp8_scale_ptr;
+    index_t o_fp8_batch_stride;
+    index_t o_fp8_row_stride;
+    index_t o_fp8_head_stride;
+    bool o_bf16_skip;
     void * __restrict__ oaccum_ptr;
 
     // The stride between rows of O.

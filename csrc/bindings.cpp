@@ -328,6 +328,7 @@ extern "C" void flash_rt_awq_quant_fp8_static_fp16(
 #endif
 #include "quantize/fp8_per_token_block_quant.cuh"
 #include "quantize/bias_gelu_quantize_fp8.cuh"
+#include "quantize/gelu_mul_quant_nvfp4_swizzled.cuh"
 #ifdef FLASHRT_HAVE_MOTUS_VAE_FP8
 #include "quantize/awq_quant_fp8_static_bf16.cuh"
 #endif
@@ -715,6 +716,13 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                                M, N, K, to_stream(stream));
         }, py::arg("A"), py::arg("B"), py::arg("D"), py::arg("bias"),
            py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0)
+        .def("bf16_run", [](GemmRunner& self,
+                                 uintptr_t A, uintptr_t B, uintptr_t D,
+                                 int M, int N, int K, uintptr_t stream) {
+            self.bf16_run(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, to_stream(stream));
+        }, py::arg("A"), py::arg("B"), py::arg("D"),
+           py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0,
+           "D = A(M,K) @ B(N,K)^T, no bias epilogue. Same B layout as bf16_nt_bias.")
         .def("bf16_nt_bias", [](GemmRunner& self,
                                  uintptr_t A, uintptr_t B, uintptr_t D, uintptr_t bias,
                                  int M, int N, int K, uintptr_t stream) {
@@ -903,6 +911,235 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                  typed_ptr<__nv_bfloat16>(out), seq_len, dim, eps, to_stream(stream));
     }, py::arg("x"), py::arg("weight"), py::arg("out"),
        py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+
+    m.def("gemma3_rms_norm_bf16",
+        [](uintptr_t x, long long x_stride, uintptr_t weight,
+           uintptr_t out, long long out_stride,
+           uintptr_t residual, long long res_stride,
+           int rows, int rows_per_group, long long group_stride,
+           int dim, float eps, uintptr_t stream) {
+            gemma3_rms_norm_bf16(
+                typed_ptr<__nv_bfloat16>(x), x_stride, typed_ptr<__nv_bfloat16>(weight),
+                out ? typed_ptr<__nv_bfloat16>(out) : nullptr, out_stride,
+                residual ? typed_ptr<__nv_bfloat16>(residual) : nullptr, res_stride,
+                rows, rows_per_group, group_stride, dim, eps, to_stream(stream));
+        },
+        py::arg("x"), py::arg("x_stride"), py::arg("weight"),
+        py::arg("out"), py::arg("out_stride"),
+        py::arg("residual"), py::arg("res_stride"),
+        py::arg("rows"), py::arg("rows_per_group"), py::arg("group_stride"),
+        py::arg("dim"), py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "Gemma3 RMSNorm: y = bf16(fp32(x) * rsqrt(mean(fp32(x)^2) + eps) * (1 + fp32(w))). "
+        "Rows may be strided; a non-zero residual is updated with HF's two roundings. "
+        "Pass out = 0 or residual = 0 to skip one of the two stores.");
+
+    m.def("gemma3_norm_gate_residual_v8_bf16",
+        [](uintptr_t x, uintptr_t weight, uintptr_t gate, uintptr_t residual,
+           int rows, int dim, float eps, uintptr_t stream) {
+            gemma3_norm_gate_residual_v8_bf16(
+                typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(weight),
+                typed_ptr<__nv_bfloat16>(gate), typed_ptr<__nv_bfloat16>(residual),
+                rows, dim, eps, to_stream(stream));
+        },
+        py::arg("x"), py::arg("weight"), py::arg("gate"), py::arg("residual"),
+        py::arg("rows"), py::arg("dim"), py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "residual = bf16(residual + bf16(bf16(gemma3_norm(x)) * gate)), 8 columns per "
+        "thread and contiguous rows. x and residual are (rows, dim); weight and gate "
+        "are per-column, dim-wide. Three roundings, one per store; gate_mul_residual "
+        "is not a substitute (it takes x directly with a single rounding).");
+
+    m.def("gemma3_norm_gate_residual_ada_v8_bf16",
+        [](uintptr_t x, uintptr_t weight, uintptr_t gate, uintptr_t residual,
+           uintptr_t mod, uintptr_t out, int rows, int dim, float eps, uintptr_t stream) {
+            gemma3_norm_gate_residual_ada_v8_bf16(
+                typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(weight),
+                typed_ptr<__nv_bfloat16>(gate), typed_ptr<__nv_bfloat16>(residual),
+                typed_ptr<__nv_bfloat16>(mod), typed_ptr<__nv_bfloat16>(out),
+                rows, dim, eps, to_stream(stream));
+        },
+        py::arg("x"), py::arg("weight"), py::arg("gate"), py::arg("residual"),
+        py::arg("mod"), py::arg("out"), py::arg("rows"), py::arg("dim"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "residual = bf16(residual + bf16(bf16(norm(x)) * gate)), then "
+        "out = bf16(residual * rsqrt(mean(residual^2) + eps) * (1 + mod[:dim]) + mod[dim:]), "
+        "8 columns per thread over dim / 8 threads. One kernel rather than the "
+        "gate-residual kernel plus ada_rms_norm: the reference reduces the second "
+        "mean with this kernel's block shape, and the standalone entry reduces it "
+        "in the strided order, which differs on a few elements in ten thousand.");
+    m.def("gemma3_rms_norm_v8_bf16",
+        [](uintptr_t x, long long x_stride, uintptr_t weight,
+           uintptr_t out, long long out_stride, uintptr_t residual, long long res_stride,
+           int rows, int rows_per_group, long long group_stride,
+           int dim, float eps, uintptr_t stream) {
+            gemma3_rms_norm_v8_bf16(typed_ptr<__nv_bfloat16>(x), x_stride,
+                                    typed_ptr<__nv_bfloat16>(weight),
+                                    out ? typed_ptr<__nv_bfloat16>(out) : nullptr, out_stride,
+                                    residual ? typed_ptr<__nv_bfloat16>(residual) : nullptr, res_stride,
+                                    rows, rows_per_group, group_stride, dim, eps, to_stream(stream));
+        },
+        py::arg("x"), py::arg("x_stride"), py::arg("weight"),
+        py::arg("out"), py::arg("out_stride"), py::arg("residual"), py::arg("res_stride"),
+        py::arg("rows"), py::arg("rows_per_group"), py::arg("group_stride"),
+        py::arg("dim"), py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "Gemma3 RMSNorm over contiguous rows, 8 columns per thread. Same formula as "
+        "gemma3_rms_norm_bf16 but a different summation order, so the two are not "
+        "bit-comparable; pass residual = 0 or out = 0 to skip one of the stores. "
+        "dim must be a multiple of 8.");
+
+    m.def("res_ln_quant_v8_bf16",
+        [](uintptr_t r, uintptr_t y, uintptr_t b, uintptr_t w, uintptr_t beta, uintptr_t xn,
+           uintptr_t q, uintptr_t scale, int rows, int dim, float eps, uintptr_t stream) {
+            res_ln_quant_v8_bf16(typed_ptr<__nv_bfloat16>(r),
+                                 y ? typed_ptr<__nv_bfloat16>(y) : nullptr,
+                                 b ? typed_ptr<__nv_bfloat16>(b) : nullptr,
+                                 typed_ptr<__nv_bfloat16>(w), typed_ptr<__nv_bfloat16>(beta),
+                                 xn ? typed_ptr<__nv_bfloat16>(xn) : nullptr,
+                                 q ? typed_ptr<__nv_fp8_e4m3>(q) : nullptr,
+                                 typed_ptr<float>(scale), rows, dim, eps, to_stream(stream));
+        },
+        py::arg("r"), py::arg("y"), py::arg("b"), py::arg("w"), py::arg("beta"), py::arg("xn"),
+        py::arg("q"), py::arg("scale"), py::arg("rows"), py::arg("dim"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "residual add + LayerNorm + static FP8 quantize, one pass, one rounding per output. "
+        "y == 0 skips the residual (and then b is unused); xn == 0 skips the normalised "
+        "bf16 store; q == 0 skips the quantise.");
+
+    m.def("gemma3_qk_norm_rope_v8_bf16",
+        [](uintptr_t q, long long q_stride, int nhq, uintptr_t k, long long k_stride, int nhk,
+           uintptr_t wq, uintptr_t wk, uintptr_t cosT, uintptr_t sinT,
+           int seq, float eps, uintptr_t stream) {
+            gemma3_qk_norm_rope_v8_bf16(typed_ptr<__nv_bfloat16>(q), q_stride, nhq,
+                                        typed_ptr<__nv_bfloat16>(k), k_stride, nhk,
+                                        typed_ptr<__nv_bfloat16>(wq), typed_ptr<__nv_bfloat16>(wk),
+                                        typed_ptr<__nv_bfloat16>(cosT), typed_ptr<__nv_bfloat16>(sinT),
+                                        seq, eps, to_stream(stream));
+        },
+        py::arg("q"), py::arg("q_stride"), py::arg("nhq"), py::arg("k"), py::arg("k_stride"),
+        py::arg("nhk"), py::arg("wq"), py::arg("wk"), py::arg("cos"), py::arg("sin"),
+        py::arg("seq"), py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "DM05: (1+w) RMSNorm then HF rotate-half RoPE, in place, over q and the cached k "
+        "rows, head_dim 256, one warp per (row, head). Bit-identical to "
+        "gemma3_rms_norm_v8_bf16 x2 + rope_hf_bf16 x2 but one launch instead of four.");
+
+    m.def("gemma3_rms_norm_fp8_bf16",
+        [](uintptr_t x, uintptr_t weight, uintptr_t out, uintptr_t a_scale,
+           int rows, int dim, float eps, uintptr_t stream) {
+            gemma3_rms_norm_fp8_bf16(typed_ptr<__nv_bfloat16>(x),
+                                     typed_ptr<__nv_bfloat16>(weight),
+                                     typed_ptr<__nv_fp8_e4m3>(out),
+                                     reinterpret_cast<const float*>(a_scale),
+                                     rows, dim, eps, to_stream(stream));
+        },
+        py::arg("x"), py::arg("weight"), py::arg("out"), py::arg("a_scale"),
+        py::arg("rows"), py::arg("dim"), py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "Gemma3 RMSNorm writing a static per-tensor FP8 (e4m3) GEMM input directly. "
+        "Byte-identical to quantize_fp8_static over the bf16 norm output, so the "
+        "bf16 intermediate never has to be written. dim must be a multiple of 8.");
+
+    m.def("linear_f32_in_bf16_out",
+        [](uintptr_t x, uintptr_t W, uintptr_t b, uintptr_t out,
+           int rows, int N, int K, uintptr_t stream) {
+            flash_rt::kernels::linear_f32_in_bf16_out(
+                reinterpret_cast<const float*>(x), reinterpret_cast<const float*>(W),
+                reinterpret_cast<const float*>(b),
+                reinterpret_cast<__nv_bfloat16*>(out), rows, N, K, to_stream(stream));
+        },
+        py::arg("x"), py::arg("W"), py::arg("b"), py::arg("out"),
+        py::arg("rows"), py::arg("N"), py::arg("K"), py::arg("stream") = 0,
+        "out[t, n] = bf16(sum_k x[t, k] * W[n, k] + b[n]), x/W/b fp32 and W stored "
+        "(N, K). fp32 accumulate with no TF32; one thread per output element.");
+
+    m.def("linear_bf16_in_f32_out",
+        [](uintptr_t x, uintptr_t W, uintptr_t b, uintptr_t out,
+           int rows, int N, int K, uintptr_t stream) {
+            flash_rt::kernels::linear_bf16_in_f32_out(
+                reinterpret_cast<const __nv_bfloat16*>(x),
+                reinterpret_cast<const float*>(W), reinterpret_cast<const float*>(b),
+                reinterpret_cast<float*>(out), rows, N, K, to_stream(stream));
+        },
+        py::arg("x"), py::arg("W"), py::arg("b"), py::arg("out"),
+        py::arg("rows"), py::arg("N"), py::arg("K"), py::arg("stream") = 0,
+        "out[t, n] = sum_k fp32(x[t, k]) * W[n, k] + b[n], x bf16 and the output "
+        "fp32. fp32 accumulate with no TF32; one warp per output element.");
+
+    m.def("resize_norm_u8_hwc_to_bf16_chw",
+        [](uintptr_t in, uintptr_t out, int nv, int H, int W, int OH, int OW,
+           uintptr_t stream) {
+            flash_rt::kernels::resize_norm_u8_hwc_to_bf16_chw(
+                reinterpret_cast<const uint8_t*>(in),
+                reinterpret_cast<__nv_bfloat16*>(out), nv, H, W, OH, OW,
+                to_stream(stream));
+        },
+        py::arg("in"), py::arg("out"), py::arg("nv"), py::arg("H"), py::arg("W"),
+        py::arg("OH"), py::arg("OW"), py::arg("stream") = 0,
+        "Bilinear resize of uint8 frames with OpenCV INTER_LINEAR arithmetic, then "
+        "rescale and normalize to bf16: (nv, H, W, 3) uint8 HWC in, (nv, 3, OH, OW) "
+        "bf16 CHW out, with (x - 127.5) / 127.5.");
+
+    m.def("patch_im2col_nchw_bf16",
+        [](uintptr_t in, uintptr_t out, int nv, int C, int H, int W, int P, uintptr_t stream) {
+            patch_im2col_nchw_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(in),
+                reinterpret_cast<__nv_bfloat16*>(out), nv, C, H, W, P, to_stream(stream));
+        },
+        py::arg("input"), py::arg("output"), py::arg("nv"), py::arg("C"),
+        py::arg("H"), py::arg("W"), py::arg("P"), py::arg("stream") = 0,
+        "bf16 NCHW patch im2col: (nv, C, H, W) to (nv*gh*gw, C*P*P), column order "
+        "(c, kh, kw) to match conv.weight.reshape(out_ch, C*P*P), patches row-major. "
+        "H and W must be multiples of P.");
+
+    m.def("gemma3_rms_norm_nvfp4_swizzled",
+        [](uintptr_t x, uintptr_t weight, uintptr_t cap, uintptr_t packed, uintptr_t sf,
+           int rows, int dim, float eps, uintptr_t stream) {
+            gemma3_rms_norm_nvfp4_swizzled(
+                typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(weight),
+                cap ? reinterpret_cast<const float*>(cap) : nullptr,
+                reinterpret_cast<uint8_t*>(packed), reinterpret_cast<uint8_t*>(sf),
+                rows, dim, eps, to_stream(stream));
+        },
+        py::arg("x"), py::arg("weight"), py::arg("cap"), py::arg("packed"), py::arg("sf"),
+        py::arg("rows"), py::arg("dim"), py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "Gemma3 RMSNorm written straight into a clipped static NVFP4 GEMM input: "
+        "e2m1 per 16-element group, UE4M3 swizzled block scales, per-group clip from "
+        "cap (0 disables). dim must be a multiple of 16 with dim/8 <= 1024.");
+    m.def("gemma3_rms_norm_nvfp4_sf_bytes", &gemma3_rms_norm_nvfp4_sf_bytes,
+        py::arg("rows"), py::arg("dim"), "Bytes to allocate for the scale factors.");
+
+    m.def("gelu_mul_bf16",
+        [](uintptr_t gate, uintptr_t up, uintptr_t out, long long n, uintptr_t stream) {
+            flash_rt::kernels::gelu_mul_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(gate),
+                reinterpret_cast<const __nv_bfloat16*>(up),
+                reinterpret_cast<__nv_bfloat16*>(out), n, to_stream(stream));
+        },
+        py::arg("gate"), py::arg("up"), py::arg("out"), py::arg("n"), py::arg("stream") = 0,
+        "out = bf16(bf16(gelu_tanh(gate)) * up): the activation rounds to bf16 before "
+        "the product and the product rounds again.");
+    m.def("gelu_mul_quant_fp8_static_bf16",
+        [](uintptr_t gate, uintptr_t up, uintptr_t act_scale, uintptr_t out,
+           long long n, uintptr_t stream) {
+            flash_rt::kernels::gelu_mul_quant_fp8_static_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(gate),
+                reinterpret_cast<const __nv_bfloat16*>(up),
+                reinterpret_cast<const float*>(act_scale),
+                reinterpret_cast<__nv_fp8_e4m3*>(out), n, to_stream(stream));
+        },
+        py::arg("gate"), py::arg("up"), py::arg("act_scale"), py::arg("out"),
+        py::arg("n"), py::arg("stream") = 0,
+        "The same gated product written straight as a static FP8 e4m3 GEMM input; "
+        "the bf16 product never reaches memory. n must be a multiple of 8.");
+
+    m.def("ada_rms_norm",
+        [](uintptr_t x, uintptr_t mod, uintptr_t out, int rows, int dim,
+           float eps, uintptr_t stream) {
+            ada_rms_norm(typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(mod),
+                         typed_ptr<__nv_bfloat16>(out), rows, dim, eps, to_stream(stream));
+        },
+        py::arg("x"), py::arg("mod"), py::arg("out"), py::arg("rows"), py::arg("dim"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        "Adaptive RMSNorm with one modulation shared by every row: mod is a 2*dim "
+        "bfloat16 vector, scale at [0,dim) and shift at [dim,2*dim). No weight and "
+        "no gate output; ada_rms_norm_style is the per-row styled variant.");
 
     m.def("bias_rms_norm_bf16", [](uintptr_t x, uintptr_t bias, uintptr_t weight,
                                     uintptr_t out, int seq_len, int dim,
@@ -1114,6 +1351,19 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("qkv"), py::arg("Q"), py::arg("K"), py::arg("V"),
        py::arg("seq"), py::arg("q_dim"), py::arg("k_dim"), py::arg("v_dim"), py::arg("stream") = 0);
 
+    m.def("rope_hf_bf16",
+        [](uintptr_t x, long long row_stride, int heads, int dim,
+           uintptr_t cos_tab, uintptr_t sin_tab, int seq, uintptr_t stream) {
+            rope_hf_bf16(typed_ptr<__nv_bfloat16>(x), row_stride, heads, dim,
+                         typed_ptr<__nv_bfloat16>(cos_tab), typed_ptr<__nv_bfloat16>(sin_tab),
+                         seq, to_stream(stream));
+        },
+        py::arg("x"), py::arg("row_stride"), py::arg("heads"), py::arg("dim"),
+        py::arg("cos_table"), py::arg("sin_table"), py::arg("seq"), py::arg("stream") = 0,
+        "HuggingFace rotate_half RoPE in place, with HF's intermediate bf16 roundings "
+        "on each product and full-width [seq, dim] cos/sin tables. Rows may be strided "
+        "so per-head slices of a fused QKV buffer rotate in place.");
+
     m.def("qkv_split_rope", [](uintptr_t qkv, uintptr_t rope_weights,
                                  uintptr_t Q, uintptr_t K, uintptr_t V,
                                  int seq, int q_dim, int k_dim, int v_dim,
@@ -1163,6 +1413,33 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         residual_add(typed_ptr<__nv_bfloat16>(residual),
                      typed_ptr<__nv_bfloat16>(x), n, to_stream(stream));
     }, py::arg("residual"), py::arg("x"), py::arg("n"), py::arg("stream") = 0);
+
+    // Bias add over the leading `cols` columns of a row of stride `ld`. The row
+    // is allowed to be wider than the bias, which add_bias_bf16 does not cover.
+    m.def("add_bias_rows_bf16", [](uintptr_t x, long long ld, uintptr_t bias,
+                                   long long rows, int cols, uintptr_t stream) {
+        add_bias_rows_bf16(typed_ptr<__nv_bfloat16>(x), ld, typed_ptr<__nv_bfloat16>(bias),
+                           rows, cols, to_stream(stream));
+    }, py::arg("x"), py::arg("ld"), py::arg("bias"), py::arg("rows"), py::arg("cols"),
+       py::arg("stream") = 0);
+
+    // fp32 flow/ODE step ops: x += v * dt, x[r,c] *= m[c], and the copying form
+    // of the latter with a nullable mask.
+    m.def("axpy_f32", [](uintptr_t x, uintptr_t v, float dt, int n, uintptr_t stream) {
+        axpy_f32(typed_ptr<float>(x), typed_ptr<float>(v), dt, n, to_stream(stream));
+    }, py::arg("x"), py::arg("v"), py::arg("dt"), py::arg("n"), py::arg("stream") = 0);
+
+    m.def("mul_cols_f32", [](uintptr_t x, uintptr_t m, long long rows, int cols, uintptr_t stream) {
+        mul_cols_f32(typed_ptr<float>(x), typed_ptr<float>(m), rows, cols, to_stream(stream));
+    }, py::arg("x"), py::arg("m"), py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
+
+    m.def("copy_scaled_cols_f32", [](uintptr_t dst, uintptr_t src, uintptr_t m,
+                                     long long rows, int cols, uintptr_t stream) {
+        copy_scaled_cols_f32(typed_ptr<float>(dst), typed_ptr<float>(src),
+                             m ? typed_ptr<float>(m) : nullptr, rows, cols, to_stream(stream));
+    }, py::arg("dst"), py::arg("src"), py::arg("m"), py::arg("rows"), py::arg("cols"),
+       py::arg("stream") = 0,
+       "dst[r, c] = m ? src[r, c] * m[c] : src[r, c]; pass m = 0 for a plain copy.");
 
 #ifdef ENABLE_PI05_SDE
     // Stochastic denoising step: x += a + (*sigma) * eps, bit-identical to
@@ -3614,6 +3891,60 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("M"), py::arg("N"),
         py::arg("stream") = 0);
 
+    m.def("gelu_mul_quant_nvfp4_swizzled",
+        [](uintptr_t gate, uintptr_t up, uintptr_t cap, uintptr_t packed, uintptr_t sf,
+           int rows, int cols, uintptr_t stream) {
+            flash_rt::kernels::gelu_mul_quant_nvfp4_swizzled(
+                to_ptr(gate), to_ptr(up),
+                cap ? reinterpret_cast<const float*>(cap) : nullptr,
+                reinterpret_cast<uint8_t*>(packed), reinterpret_cast<uint8_t*>(sf),
+                rows, cols, to_stream(stream));
+        },
+        py::arg("gate"), py::arg("up"), py::arg("cap"), py::arg("packed"), py::arg("sf"),
+        py::arg("rows"), py::arg("cols"), py::arg("stream") = 0,
+        "Gated GeGLU activation straight into a clipped static NVFP4 GEMM input: "
+        "quant(bf16(bf16(gelu_tanh(gate)) * up)) with per-16 e2m1 values, UE4M3 "
+        "swizzled group scales and a per-group clip from `cap` (null disables).");
+    m.def("gelu_mul_quant_nvfp4_sf_bytes", &flash_rt::kernels::gelu_mul_quant_nvfp4_sf_bytes,
+        py::arg("rows"), py::arg("cols"), "Bytes the caller must allocate for sf.");
+
+    m.def("bias_gelu_quantize_fp8_static_bf16_rounded",
+        [](uintptr_t in_bf16, uintptr_t bias_bf16, uintptr_t out_fp8,
+           uintptr_t act_scale, long long M, int N, uintptr_t stream) {
+            flash_rt::quantize::bias_gelu_quantize_fp8_static_bf16_rounded(
+                reinterpret_cast<const __nv_bfloat16*>(to_ptr(in_bf16)),
+                bias_bf16 ? reinterpret_cast<const __nv_bfloat16*>(to_ptr(bias_bf16)) : nullptr,
+                reinterpret_cast<__nv_fp8_e4m3*>(to_ptr(out_fp8)),
+                reinterpret_cast<const float*>(act_scale),
+                M, N, to_stream(stream));
+        },
+        py::arg("in_bf16"), py::arg("bias_bf16"),
+        py::arg("out_fp8"), py::arg("act_scale"),
+        py::arg("M"), py::arg("N"),
+        py::arg("stream") = 0,
+        "bias + GELU(tanh) + static FP8 e4m3, with the activation rounded to bf16 "
+        "before the scale and cast -- matching bias_gelu_bf16 followed by "
+        "quantize_fp8_static. bias_bf16 may be null.");
+
+    m.def("bias_gelu_quantize_fp8_static_bf16_rounded_v8",
+        [](uintptr_t in_bf16, uintptr_t bias_bf16, uintptr_t out_fp8,
+           uintptr_t act_scale, long long M, int N, uintptr_t stream) {
+            flash_rt::quantize::bias_gelu_quantize_fp8_static_bf16_rounded_v8(
+                reinterpret_cast<const __nv_bfloat16*>(to_ptr(in_bf16)),
+                reinterpret_cast<const __nv_bfloat16*>(to_ptr(bias_bf16)),
+                reinterpret_cast<__nv_fp8_e4m3*>(to_ptr(out_fp8)),
+                reinterpret_cast<const float*>(act_scale),
+                M, N, to_stream(stream));
+        },
+        py::arg("in_bf16"), py::arg("bias_bf16"),
+        py::arg("out_fp8"), py::arg("act_scale"),
+        py::arg("M"), py::arg("N"),
+        py::arg("stream") = 0,
+        "Bit-identical to bias_gelu_quantize_fp8_static_bf16_rounded, 8 columns per "
+        "thread instead of one: the sibling's 2-byte-per-thread access pattern runs at "
+        "306 GB/s where this reaches the memory floor. Requires N % 8 == 0 and a "
+        "non-null bias_bf16.");
+
     // G7.15 — Fused 3D RoPE apply (bf16 → fp32) replacing 5-6 Python
     // launches per call with one CUDA kernel.
     m.def("rope_apply_bf16_to_fp32",
@@ -5191,6 +5522,24 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         },
         py::arg("token_ids"), py::arg("embed"), py::arg("out"),
         py::arg("rows"), py::arg("hidden"), py::arg("stream") = 0);
+
+    m.def("embedding_lookup_merge_bf16",
+        [](uintptr_t token_ids, uintptr_t img_index, uintptr_t embed, uintptr_t img,
+           uintptr_t out, int rows, int hidden, float scale, uintptr_t stream) {
+            flash_rt::kernels::embedding_lookup_merge_bf16(
+                reinterpret_cast<const int64_t*>(token_ids),
+                reinterpret_cast<const int*>(img_index),
+                reinterpret_cast<const __nv_bfloat16*>(embed),
+                reinterpret_cast<const __nv_bfloat16*>(img),
+                reinterpret_cast<__nv_bfloat16*>(out),
+                rows, hidden, scale, to_stream(stream));
+        },
+        py::arg("token_ids"), py::arg("img_index"), py::arg("embed"), py::arg("img"),
+        py::arg("out"), py::arg("rows"), py::arg("hidden"), py::arg("scale"),
+        py::arg("stream") = 0,
+        "Prefix embedding with a multimodal merge. Row r takes img[img_index[r]] when "
+        "img_index[r] >= 0 (a host-computed -1 marks a text row) and "
+        "bf16(embed[token_ids[r]] * scale) otherwise.");
 
 #ifdef FLASHRT_HAVE_AUDIO_CODEBOOK
     m.def("delayed_codebook_argmax_embed_bf16",

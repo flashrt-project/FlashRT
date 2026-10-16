@@ -6,6 +6,8 @@
 
 #include "norm.cuh"
 #include "common.cuh"
+#include <cuda_fp8.h>
+#include <stdexcept>
 
 // ── RMSNorm ──
 template<typename T>
@@ -1624,3 +1626,688 @@ void residual_add_rms_norm_int8_rowwise_fp16(
         residual, x, weight, out, scales, seq_len, dim, eps);
 }
 #endif  // FLASHRT_ENABLE_CHAMELEON
+
+// ── Gemma3 RMSNorm: y = bf16( fp32(x) * rsqrt(mean(fp32(x)^2) + eps) * (1 + fp32(w)) ) ──
+//
+// Gemma3 scales by (1 + w) rather than by w, and forms it in fp32 per element.
+// Folding it into the weight ahead of time is not equivalent: bf16 near 1.0 has
+// a 1/128 step, so a pre-rounded (1 + w) is visibly coarser than the fp32
+// product.
+//
+// Rows may be strided, so the per-head q/k norm runs in place on a fused QKV
+// buffer: row r lives at
+//     (r / rows_per_group) * group_stride + (r % rows_per_group) * x_stride
+// For plain contiguous rows pass rows_per_group = rows with group_stride = 0;
+// rows_per_group = 1 would make r % rows_per_group always 0 and read row 0 for
+// every row. See norm.cuh for the full contract.
+//
+// `residual`, when non-null, reproduces HF's ordering for a post-norm residual:
+// the normalized value is rounded to bf16 first, then added to the residual, and
+// the sum is rounded again — `residual = bf16(residual + bf16(norm(x)))`. `out`
+// may be null when only the residual is wanted.
+__device__ __forceinline__ float gemma3_bf(float x) {
+    return __bfloat162float(__float2bfloat16(x));
+}
+
+__global__ void gemma3_rms_norm_kernel(const __nv_bfloat16* __restrict__ x, long long x_stride,
+                                       const __nv_bfloat16* __restrict__ w,
+                                       __nv_bfloat16* __restrict__ out, long long out_stride,
+                                       __nv_bfloat16* __restrict__ residual, long long res_stride,
+                                       int rows_per_group, long long group_stride,
+                                       int dim, float eps) {
+    const int r = blockIdx.x;
+    const long long base_x = (long long)(r / rows_per_group) * group_stride +
+                             (long long)(r % rows_per_group) * x_stride;
+    const __nv_bfloat16* xr = x + base_x;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        const float v = __bfloat162float(xr[i]);
+        ss += v * v;
+    }
+    __shared__ float red[32];
+    for (int o = 16; o; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float t = threadIdx.x < (blockDim.x + 31) / 32 ? red[threadIdx.x] : 0.f;
+        for (int o = 16; o; o >>= 1) t += __shfl_xor_sync(0xffffffffu, t, o);
+        if (threadIdx.x == 0) red[0] = t;
+    }
+    __syncthreads();
+    const float inv = rsqrtf(__fdiv_rn(red[0], (float)dim) + eps);
+    const long long base_o = (long long)(r / rows_per_group) * group_stride +
+                             (long long)(r % rows_per_group) * out_stride;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        const float y = gemma3_bf(__bfloat162float(xr[i]) * inv * (1.0f + __bfloat162float(w[i])));
+        if (residual) {
+            __nv_bfloat16* rr = residual + (long long)r * res_stride;
+            rr[i] = __float2bfloat16(__bfloat162float(rr[i]) + y);
+        }
+        if (out) out[base_o + i] = __float2bfloat16(y);
+    }
+}
+
+void gemma3_rms_norm_bf16(const __nv_bfloat16* x, long long x_stride,
+                          const __nv_bfloat16* weight,
+                          __nv_bfloat16* out, long long out_stride,
+                          __nv_bfloat16* residual, long long res_stride,
+                          int rows, int rows_per_group, long long group_stride,
+                          int dim, float eps, cudaStream_t stream) {
+    if (rows <= 0 || dim <= 0) return;
+    if (rows_per_group <= 0)
+        throw std::runtime_error("gemma3_rms_norm_bf16: rows_per_group must be positive");
+    if (!out && !residual)
+        throw std::runtime_error("gemma3_rms_norm_bf16: give out, residual, or both");
+    const int threads = dim >= 1024 ? 1024 : (dim >= 256 ? 256 : 128);
+    gemma3_rms_norm_kernel<<<rows, threads, 0, stream>>>(
+        x, x_stride, weight, out, out_stride, residual, res_stride,
+        rows_per_group, group_stride, dim, eps);
+}
+
+// The vectorized form's block reduction: 8 columns per thread, one value per
+// thread, reduced warp-first and then across warps through shared memory.
+//
+// This is a different summation order from the strided-loop kernels'
+// loop above, so the two can disagree in the last fp32 ulp of the sum of
+// squares and a bf16 result can land either side of a rounding boundary. A
+// caller that has to reproduce one of them bit for bit has to use that one;
+// gemma3_rms_norm_bf16 deliberately implements the strided order.
+// NOTE for every kernel below that reproduces a reference build's arithmetic:
+// this target compiles with --prec-div=false, where `a / b` is an approximate
+// division, while the DM05 extension is compiled with nvcc's defaults, where it
+// is correctly rounded. The two agree exactly when the divisor is a power of two
+// and can differ by an ulp otherwise -- enough to push a few elements per
+// million across a bf16 rounding boundary. Every division that feeds an `inv`
+// is therefore written as __fdiv_rn, which pins the reference's semantics
+// regardless of this target's flags.
+__device__ __forceinline__ float v8_block_sum(float v) {
+    __shared__ float red[32];
+    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    __syncthreads();
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = v;
+    __syncthreads();
+    float t = threadIdx.x < (blockDim.x + 31) / 32 ? red[threadIdx.x & 31] : 0.f;
+    if (threadIdx.x < 32)
+        for (int o = 16; o; o >>= 1) t += __shfl_xor_sync(0xffffffffu, t, o);
+    if (threadIdx.x == 0) red[0] = t;
+    __syncthreads();
+    return red[0];
+}
+
+// Gemma3 RMSNorm whose result is consumed straight as a static per-tensor FP8
+// (e4m3) GEMM input: one block per row, dim / 8 threads, 8 columns per thread.
+// The normalized row never reaches memory as bf16, because its only consumer is
+// the quantized GEMM and a bf16 copy would be written and never read.
+//
+// The quantization reproduces what a standalone quantize_fp8_static pass over
+// the bf16 norm output would produce -- round to bf16, then clamp(x / a_scale)
+// to e4m3 -- so the activation written here is byte-identical to the two-pass
+// form's. `a_scale` is the same device scalar that pass reads.
+__global__ void gemma3_rms_norm_fp8_kernel(const __nv_bfloat16* __restrict__ x,
+                                           const __nv_bfloat16* __restrict__ w,
+                                           const float* __restrict__ a_scale,
+                                           __nv_fp8_e4m3* __restrict__ q,
+                                           int dim, float eps) {
+    union Gemma3V8 { uint4 u; __nv_bfloat16 h[8]; };
+    const long long base = (long long)blockIdx.x * dim + threadIdx.x * 8;
+    Gemma3V8 xv, wv;
+    xv.u = *reinterpret_cast<const uint4*>(x + base);
+    wv.u = *reinterpret_cast<const uint4*>(w + threadIdx.x * 8);
+    float f[8], ss = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        f[j] = __bfloat162float(xv.h[j]);
+        ss += f[j] * f[j];
+    }
+    const float inv = rsqrtf(__fdiv_rn(v8_block_sum(ss), (float)dim) + eps);
+    const float qi = 1.0f / a_scale[0];
+    __align__(8) __nv_fp8_e4m3 o[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const float y = __bfloat162float(__float2bfloat16(f[j] * inv * (1.0f + __bfloat162float(wv.h[j]))));
+        o[j] = __nv_fp8_e4m3(fminf(fmaxf(y * qi, -448.f), 448.f));
+    }
+    reinterpret_cast<uint2*>(q + base)[0] = *reinterpret_cast<uint2*>(o);
+}
+
+void gemma3_rms_norm_fp8_bf16(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                              __nv_fp8_e4m3* out, const float* a_scale,
+                              int rows, int dim, float eps, cudaStream_t stream) {
+    if (rows <= 0 || dim <= 0) return;
+    if (dim % 8 != 0)
+        throw std::runtime_error("gemma3_rms_norm_fp8_bf16: dim must be a multiple of 8");
+    gemma3_rms_norm_fp8_kernel<<<rows, dim / 8, 0, stream>>>(x, weight, a_scale, out, dim, eps);
+}
+
+// ── Adaptive RMSNorm with one modulation shared by every row ──
+//   y = bf16( bf16(x) * rsqrt(mean(fp32(x)^2) + eps) * (1 + scale) + shift )
+//
+// `mod` is a single 2*dim bf16 vector held for all rows: scale in mod[0:dim],
+// shift in mod[dim:2*dim]. The product of x and the inverse RMS is carried in
+// fp32 without an intermediate round; only the final sum is rounded.
+//
+// This is not ada_rms_norm_style. That one takes a per-row style of 3*dim
+// (scale, shift, gate), applies a per-channel weight, and writes a gate output.
+// Here the modulation is one shared pair, there is no weight -- the reference
+// does not use one on this path -- and there is no gate. A caller holding a
+// shared modulation cannot reach the styled kernel without materialising a
+// per-row style, and the two also reduce the sum of squares in a different
+// order, so this is the entry for that case rather than a second spelling of
+// the other.
+__global__ void ada_rms_norm_kernel(const __nv_bfloat16* __restrict__ x,
+                                    const __nv_bfloat16* __restrict__ mod,
+                                    __nv_bfloat16* __restrict__ out,
+                                    int dim, float eps) {
+    const __nv_bfloat16* xr = x + (long long)blockIdx.x * dim;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        const float v = __bfloat162float(xr[i]);
+        ss += v * v;
+    }
+    const float inv = rsqrtf(__fdiv_rn(v8_block_sum(ss), (float)dim) + eps);
+    __nv_bfloat16* orow = out + (long long)blockIdx.x * dim;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        const float n = __bfloat162float(xr[i]) * inv;
+        const float sc = __bfloat162float(mod[i]), sh = __bfloat162float(mod[dim + i]);
+        orow[i] = __float2bfloat16(n * (1.0f + sc) + sh);
+    }
+}
+
+// Gemma3 RMSNorm over contiguous rows, 8 columns per thread, bf16 output.
+//
+// This is the *same formula* as gemma3_rms_norm_bf16 above and a different
+// summation order: it loads 8 columns per thread and reduces warp-first through
+// shared memory, where that one runs a strided loop and reduces inline. The two
+// can disagree in the last fp32 ulp of the sum of squares, which for a bf16
+// result means an element landing either side of a rounding boundary. A caller
+// reproducing one of them bit for bit has to use that one -- a caller whose
+// fused norm+RoPE kernel uses this order cannot substitute the other.
+//
+// One block per row, dim / 8 threads; dim must be a multiple of 8. `residual`,
+// when non-null, is updated with HF's two roundings as in the strided form.
+__global__ void gemma3_rms_norm_v8_kernel(const __nv_bfloat16* __restrict__ x, long long x_stride,
+                                          const __nv_bfloat16* __restrict__ w,
+                                          __nv_bfloat16* __restrict__ out, long long out_stride,
+                                          __nv_bfloat16* __restrict__ residual, long long res_stride,
+                                          int rows_per_group, long long group_stride,
+                                          int dim, float eps) {
+    union Gemma3V8N { uint4 u; __nv_bfloat16 h[8]; };
+    const int r = blockIdx.x;
+    const long long base = (long long)(r / rows_per_group) * group_stride +
+                           (long long)(r % rows_per_group) * x_stride + threadIdx.x * 8;
+    Gemma3V8N xv, wv;
+    xv.u = *reinterpret_cast<const uint4*>(x + base);
+    wv.u = *reinterpret_cast<const uint4*>(w + threadIdx.x * 8);
+    float f[8], ss = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        f[j] = __bfloat162float(xv.h[j]);
+        ss += f[j] * f[j];
+    }
+    const float inv = rsqrtf(__fdiv_rn(v8_block_sum(ss), (float)dim) + eps);
+    Gemma3V8N yv;
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+        yv.h[j] = __float2bfloat16(f[j] * inv * (1.0f + __bfloat162float(wv.h[j])));
+    if (residual) {
+        const long long rb = (long long)(r / rows_per_group) * group_stride +
+                             (long long)(r % rows_per_group) * res_stride + threadIdx.x * 8;
+        Gemma3V8N rv;
+        rv.u = *reinterpret_cast<const uint4*>(residual + rb);
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            rv.h[j] = __float2bfloat16(__bfloat162float(rv.h[j]) + __bfloat162float(yv.h[j]));
+        *reinterpret_cast<uint4*>(residual + rb) = rv.u;
+    }
+    if (out) {
+        const long long ob = (long long)(r / rows_per_group) * group_stride +
+                             (long long)(r % rows_per_group) * out_stride + threadIdx.x * 8;
+        *reinterpret_cast<uint4*>(out + ob) = yv.u;
+    }
+}
+
+// The block reduction this uses is v8_block_sum, so its sum-of-squares order is
+// the vectorized one; gemma3_rms_norm_bf16 above uses the strided loop's. Same
+// addressing as that kernel -- rows_per_group rows of x_stride inside each
+// group, groups group_stride apart, which is what lets a per-head norm run in
+// place on a fused QKV buffer -- so the two differ only in reduction order and
+// a caller picks the one its reference used.
+// Gemma3 RMSNorm followed by a gated residual add, 8 columns per thread:
+//
+//   residual = bf16( residual + bf16( bf16(gemma3_norm(x)) * gate ) )
+//
+// Three roundings, one per store HF performs on this path: the norm rounds, the
+// gate multiply rounds, and the residual add rounds. elementwise.cu's
+// gate_mul_residual is the same shape of operation but takes `x` directly with a
+// single rounding at the end -- it has no norm and no intermediate rounds, so it
+// is not a substitute for this.
+//
+// The reduction is the vectorized one (v8_block_sum), which is what the caller's
+// fused norm+gate+residual kernel uses; composing this with ada_rms_norm
+// reproduces that fused kernel, and using the strided-order norm instead does
+// not.
+//
+// Contiguous rows, one block per row, dim / 8 threads; dim must be a multiple
+// of 8. `x` and `residual` are (rows, dim); `w` and `gate` are per-column, one
+// dim-wide vector shared by every row -- the gate is a modulation, not a
+// per-row mask. `residual` is read and written.
+__global__ void gemma3_norm_gate_residual_v8_kernel(const __nv_bfloat16* __restrict__ x,
+                                                    const __nv_bfloat16* __restrict__ w,
+                                                    const __nv_bfloat16* __restrict__ gate,
+                                                    __nv_bfloat16* __restrict__ residual,
+                                                    int dim, float eps) {
+    union Gemma3Ngr { uint4 u; __nv_bfloat16 h[8]; };
+    const long long base = (long long)blockIdx.x * dim + threadIdx.x * 8;
+    Gemma3Ngr xv, wv, gv, rv;
+    xv.u = *reinterpret_cast<const uint4*>(x + base);
+    wv.u = *reinterpret_cast<const uint4*>(w + threadIdx.x * 8);
+    gv.u = *reinterpret_cast<const uint4*>(gate + threadIdx.x * 8);
+    rv.u = *reinterpret_cast<const uint4*>(residual + base);
+    float f[8], ss = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        f[j] = __bfloat162float(xv.h[j]);
+        ss += f[j] * f[j];
+    }
+    const float inv = rsqrtf(__fdiv_rn(v8_block_sum(ss), (float)dim) + eps);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const float y = __bfloat162float(__float2bfloat16(f[j] * inv * (1.0f + __bfloat162float(wv.h[j]))));
+        const float t = __bfloat162float(__float2bfloat16(y * __bfloat162float(gv.h[j])));
+        rv.h[j] = __float2bfloat16(__bfloat162float(rv.h[j]) + t);
+    }
+    *reinterpret_cast<uint4*>(residual + base) = rv.u;
+}
+
+// Gemma3 gate + residual + adaLN norm, fused, bf16 out with the residual updated
+// in place. This is the reference's own fusion and it has to be one kernel: the
+// adaLN tail's own RMSNorm is taken over the updated residual with the same
+// 8-columns-per-thread reduction the first half uses, and `dim / 8` threads. Going
+// through the standalone ada_rms_norm entry instead reduces the same sum in the
+// strided order over a different block size, which moves about one element in
+// ten thousand across a bf16 rounding boundary -- a difference that survives the
+// whole action-expert loop.
+//
+//   y        = bf16(bf16(x * rsqrt(mean(x^2)+eps)) * (1 + w))
+//   residual = bf16(residual + bf16(y * gate))
+//   out      = bf16(residual * rsqrt(mean(residual^2)+eps) * (1 + mod[0:dim]) + mod[dim:2dim])
+//
+// with the two means reduced by v8_block_sum; the modulated norm has no weight,
+// as the reference's does not. `mod` is 2*dim wide here, not 3*dim: the gate is a
+// separate argument because the reference takes it from a different modulation.
+__global__ void gemma3_norm_gate_residual_ada_v8_kernel(
+        const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
+        const __nv_bfloat16* __restrict__ gate, __nv_bfloat16* __restrict__ residual,
+        const __nv_bfloat16* __restrict__ mod, __nv_bfloat16* __restrict__ out,
+        int dim, float eps) {
+    union Gemma3Ngra { uint4 u; __nv_bfloat16 h[8]; };
+    const long long base = (long long)blockIdx.x * dim + threadIdx.x * 8;
+    const int c = threadIdx.x * 8;
+    Gemma3Ngra xv, wv, gv, rv, sv, hv;
+    xv.u = *reinterpret_cast<const uint4*>(x + base);
+    wv.u = *reinterpret_cast<const uint4*>(w + c);
+    gv.u = *reinterpret_cast<const uint4*>(gate + c);
+    rv.u = *reinterpret_cast<const uint4*>(residual + base);
+    sv.u = *reinterpret_cast<const uint4*>(mod + c);
+    hv.u = *reinterpret_cast<const uint4*>(mod + dim + c);
+    float f[8], ss = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        f[j] = __bfloat162float(xv.h[j]);
+        ss += f[j] * f[j];
+    }
+    const float inv = rsqrtf(__fdiv_rn(v8_block_sum(ss), (float)dim) + eps);
+    float r[8], ss2 = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const float y = __bfloat162float(__float2bfloat16(f[j] * inv * (1.0f + __bfloat162float(wv.h[j]))));
+        const float t = __bfloat162float(__float2bfloat16(y * __bfloat162float(gv.h[j])));
+        rv.h[j] = __float2bfloat16(__bfloat162float(rv.h[j]) + t);
+        r[j] = __bfloat162float(rv.h[j]);
+        ss2 += r[j] * r[j];
+    }
+    *reinterpret_cast<uint4*>(residual + base) = rv.u;
+    const float inv2 = rsqrtf(__fdiv_rn(v8_block_sum(ss2), (float)dim) + eps);
+    Gemma3Ngra ov;
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+        ov.h[j] = __float2bfloat16(r[j] * inv2 * (1.0f + __bfloat162float(sv.h[j]))
+                                   + __bfloat162float(hv.h[j]));
+    *reinterpret_cast<uint4*>(out + base) = ov.u;
+}
+
+void gemma3_norm_gate_residual_ada_v8_bf16(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                                           const __nv_bfloat16* gate, __nv_bfloat16* residual,
+                                           const __nv_bfloat16* mod, __nv_bfloat16* out,
+                                           int rows, int dim, float eps, cudaStream_t stream) {
+    if (rows <= 0 || dim <= 0) return;
+    if (!x || !weight || !gate || !residual || !mod || !out)
+        throw std::runtime_error("gemma3_norm_gate_residual_ada_v8_bf16: null pointer argument");
+    if (dim % 8 != 0)
+        throw std::runtime_error("gemma3_norm_gate_residual_ada_v8_bf16: dim must be a multiple of 8");
+    gemma3_norm_gate_residual_ada_v8_kernel<<<rows, dim / 8, 0, stream>>>(
+        x, weight, gate, residual, mod, out, dim, eps);
+}
+
+void gemma3_norm_gate_residual_v8_bf16(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                                       const __nv_bfloat16* gate, __nv_bfloat16* residual,
+                                       int rows, int dim, float eps, cudaStream_t stream) {
+    if (rows <= 0 || dim <= 0) return;
+    if (!x || !weight || !gate || !residual)
+        throw std::runtime_error("gemma3_norm_gate_residual_v8_bf16: null pointer argument");
+    if (dim % 8 != 0)
+        throw std::runtime_error("gemma3_norm_gate_residual_v8_bf16: dim must be a multiple of 8");
+    gemma3_norm_gate_residual_v8_kernel<<<rows, dim / 8, 0, stream>>>(x, weight, gate, residual, dim, eps);
+}
+
+// The conversions below match quantize.cu's; the fused form has to write the
+// same scale factors and packed bytes as the unfused chain it replaces.
+__device__ __forceinline__ uint8_t gemma3_fp4_e2m1(float v) {
+    const float a = fabsf(v);
+    const uint8_t sign = (v < 0.0f) ? 0x8u : 0x0u;
+    return sign | (uint8_t)((a >= 0.25f) + (a >= 0.75f) + (a >= 1.25f) + (a >= 1.75f) +
+                            (a >= 2.5f) + (a >= 3.5f) + (a >= 5.0f));
+}
+
+__device__ __forceinline__ uint8_t gemma3_ue4m3_ceil(float v) {
+    if (v <= 0.0f) return 0;
+    if (v > 240.0f) return 0xFE;
+    const uint32_t bits = __float_as_uint(v);
+    const int float_exp = ((bits >> 23) & 0xFF) - 127;
+    const uint32_t frac = bits & 0x7FFFFF;
+    int ue_exp = float_exp + 7;
+    if (ue_exp <= 0) {
+        int m = (int)ceilf(v * 512.0f);
+        if (m > 7) return (1 << 3) | 0;
+        if (m < 1) m = 1;
+        return (uint8_t)m;
+    }
+    if (ue_exp >= 15) return 0xFE;
+    int m = (int)(frac >> 20);
+    if (frac & 0xFFFFF) m++;
+    if (m >= 8) { m = 0; ue_exp++; }
+    if (ue_exp >= 15) return 0xFE;
+    return (uint8_t)((ue_exp << 3) | m);
+}
+
+__device__ __forceinline__ float gemma3_ue4m3_to_float(uint8_t v) {
+    const int e = (v >> 3) & 0xF, m = v & 0x7;
+    if (e == 0) return ldexpf((float)m / 8.0f, -6);
+    return ldexpf(1.0f + (float)m / 8.0f, e - 7);
+}
+
+// Gemma3 RMSNorm whose bf16 result is written straight into a clipped static
+// NVFP4 GEMM input: e2m1 values per 16-element group with a UE4M3 block scale
+// in the CUTLASS sm120 swizzled layout, the group's amax clamped to `cap`
+// before the scale is formed.
+//
+// Same encoding as quantize_bf16_to_nvfp4_swizzled_clipped, so this equals that
+// quantizer run over the bf16 norm output. Two adjacent threads own one
+// 16-element group: each takes the amax of its 8 columns, they exchange it, and
+// the even thread writes the shared scale factor. One block per row,
+// dim / 8 threads; dim must be a multiple of 16 and at most 8192, and the block
+// must have at least 32 threads for the pair exchange to be defined.
+__global__ void gemma3_rms_norm_nvfp4_kernel(const __nv_bfloat16* __restrict__ x,
+                                             const __nv_bfloat16* __restrict__ w,
+                                             const float* __restrict__ cap,
+                                             uint8_t* __restrict__ q,
+                                             uint8_t* __restrict__ sf,
+                                             int dim, float eps) {
+    union Gemma3Nv { uint4 u; __nv_bfloat16 h[8]; };
+    const int row = blockIdx.x;
+    const int nb = dim / 16, ncb = (nb + 3) / 4;
+    const long long base = (long long)row * dim + threadIdx.x * 8;
+    Gemma3Nv xv, wv;
+    xv.u = *reinterpret_cast<const uint4*>(x + base);
+    wv.u = *reinterpret_cast<const uint4*>(w + threadIdx.x * 8);
+    float f[8], ss = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        f[j] = __bfloat162float(xv.h[j]);
+        ss += f[j] * f[j];
+    }
+    const float inv = rsqrtf(__fdiv_rn(v8_block_sum(ss), (float)dim) + eps);
+    float y[8], a = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        y[j] = __bfloat162float(__float2bfloat16(f[j] * inv * (1.0f + __bfloat162float(wv.h[j]))));
+        a = fmaxf(a, fabsf(y[j]));
+    }
+    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, 1));
+    const int b = threadIdx.x >> 1;
+    float amax = a;
+    const float clip = cap ? cap[b] : 0.0f;
+    if (clip > 0.0f && isfinite(clip)) amax = fminf(amax, clip);
+    const uint8_t ue = gemma3_ue4m3_ceil(amax / 6.0f);
+    const int rb = row / 128, ri = row % 128;
+    if ((threadIdx.x & 1) == 0)
+        sf[(rb * ncb + b / 4) * 512 + (ri % 32) * 16 + (ri / 32) * 4 + b % 4] = ue;
+    const float scale = gemma3_ue4m3_to_float(ue);
+    const float invs = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+    uint32_t r = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const uint8_t lo = gemma3_fp4_e2m1(y[2 * j] * invs);
+        const uint8_t hi = gemma3_fp4_e2m1(y[2 * j + 1] * invs);
+        r |= (uint32_t)(((hi << 4) | (lo & 0x0F)) & 0xFF) << (8 * j);
+    }
+    reinterpret_cast<uint32_t*>(q + (long long)row * (dim / 2))[threadIdx.x] = r;
+}
+
+// Bytes the caller must allocate for the scale factors.
+long long gemma3_rms_norm_nvfp4_sf_bytes(int rows, int dim) {
+    if (rows <= 0 || dim <= 0) return 0;
+    return (long long)((rows + 127) / 128) * (((dim / 16) + 3) / 4) * 512;
+}
+
+void gemma3_rms_norm_nvfp4_swizzled(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                                    const float* cap, uint8_t* packed, uint8_t* sf_swz,
+                                    int rows, int dim, float eps, cudaStream_t stream) {
+    if (rows <= 0 || dim <= 0) return;
+    if (!x || !weight || !packed || !sf_swz)
+        throw std::runtime_error("gemma3_rms_norm_nvfp4_swizzled: null pointer argument");
+    if (dim % 16 != 0)
+        throw std::runtime_error("gemma3_rms_norm_nvfp4_swizzled: dim must be a multiple of 16");
+    if (dim / 8 > 1024)
+        throw std::runtime_error("gemma3_rms_norm_nvfp4_swizzled: dim / 8 must not exceed 1024");
+    gemma3_rms_norm_nvfp4_kernel<<<rows, dim / 8, 0, stream>>>(x, weight, cap, packed, sf_swz, dim, eps);
+}
+
+void gemma3_rms_norm_v8_bf16(const __nv_bfloat16* x, long long x_stride,
+                             const __nv_bfloat16* weight,
+                             __nv_bfloat16* out, long long out_stride,
+                             __nv_bfloat16* residual, long long res_stride,
+                             int rows, int rows_per_group, long long group_stride,
+                             int dim, float eps, cudaStream_t stream) {
+    if (rows <= 0 || dim <= 0) return;
+    if (!x || !weight || (!out && !residual))
+        throw std::runtime_error("gemma3_rms_norm_v8_bf16: null pointer, or no destination");
+    if (rows_per_group <= 0)
+        throw std::runtime_error("gemma3_rms_norm_v8_bf16: rows_per_group must be positive");
+    if (dim % 8 != 0)
+        throw std::runtime_error("gemma3_rms_norm_v8_bf16: dim must be a multiple of 8");
+    gemma3_rms_norm_v8_kernel<<<rows, dim / 8, 0, stream>>>(
+        x, x_stride, weight, out, out_stride, residual, res_stride,
+        rows_per_group, group_stride, dim, eps);
+}
+
+// (1+w) RMSNorm followed by HF rotate-half RoPE, fused over q and the cached k rows
+// in one pass, head_dim 256. One warp per (row, head); lane l holds elements 8l..8l+7,
+// so the rotate-half partner (j +- 128) sits in lane l ^ 16 and needs no extra traffic.
+//
+// The reference emits this as a single kernel. Composing it from two
+// gemma3_rms_norm_v8_bf16 plus two rope_hf_bf16 calls is bit-identical but costs four
+// launches and writes then re-reads every q and k; measured at +1191 launches and
+// +4.8 ms end to end over a full predict, which is the whole of the port's regression.
+//
+// Per-element rounding matches the reference exactly: y = bf(f * inv * (1 + w)), then
+// out = __float2bfloat16(bf(y*cos) + bf(+-yp*sin)). HD is 256, a power of two, so
+// `ss / (float)HD` is exact even under --prec-div=false and needs no __fdiv_rn.
+__global__ void gemma3_qk_norm_rope_v8_kernel(
+        __nv_bfloat16* __restrict__ q, long long q_stride, int nhq,
+        __nv_bfloat16* __restrict__ k, long long k_stride, int nhk,
+        const __nv_bfloat16* __restrict__ wq, const __nv_bfloat16* __restrict__ wk,
+        const __nv_bfloat16* __restrict__ cosT, const __nv_bfloat16* __restrict__ sinT,
+        int seq, float eps) {
+    constexpr int HD = 256;
+    union Gemma3QkRope { uint4 u; __nv_bfloat16 h[8]; };
+    const int lane = threadIdx.x & 31;
+    const long long vec = (long long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const long long nq = (long long)seq * nhq, total = nq + (long long)seq * nhk;
+    if (vec >= total) return;
+    const bool isq = vec < nq;
+    const long long v = isq ? vec : vec - nq;
+    const int nh = isq ? nhq : nhk;
+    const int s = (int)(v / nh), h = (int)(v % nh);
+    __nv_bfloat16* x = (isq ? q + (long long)s * q_stride : k + (long long)s * k_stride)
+                       + (long long)h * HD;
+    const int c = lane * 8;
+    Gemma3QkRope xv, wv, cv, sv;
+    xv.u = *reinterpret_cast<const uint4*>(x + c);
+    wv.u = *reinterpret_cast<const uint4*>((isq ? wq : wk) + c);
+    cv.u = *reinterpret_cast<const uint4*>(cosT + (long long)s * HD + c);
+    sv.u = *reinterpret_cast<const uint4*>(sinT + (long long)s * HD + c);
+    float f[8], ss = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { f[j] = __bfloat162float(xv.h[j]); ss += f[j] * f[j]; }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    const float inv = rsqrtf(ss / (float)HD + eps);
+    const bool lo = lane < 16;
+    Gemma3QkRope ov;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const float y = gemma3_bf(f[j] * inv * (1.0f + __bfloat162float(wv.h[j])));
+        const float yp = __shfl_xor_sync(0xffffffffu, y, 16);
+        const float cc = __bfloat162float(cv.h[j]), sn = __bfloat162float(sv.h[j]);
+        ov.h[j] = __float2bfloat16(gemma3_bf(y * cc) + (lo ? gemma3_bf(-yp * sn) : gemma3_bf(yp * sn)));
+    }
+    *reinterpret_cast<uint4*>(x + c) = ov.u;
+}
+
+void gemma3_qk_norm_rope_v8_bf16(__nv_bfloat16* q, long long q_stride, int nhq,
+                                 __nv_bfloat16* k, long long k_stride, int nhk,
+                                 const __nv_bfloat16* wq, const __nv_bfloat16* wk,
+                                 const __nv_bfloat16* cosT, const __nv_bfloat16* sinT,
+                                 int seq, float eps, cudaStream_t stream) {
+    if (seq <= 0 || nhq <= 0 || nhk <= 0) return;
+    const long long vecs = (long long)seq * (nhq + nhk);
+    const int wpb = 4;                                  // 4 warps = 128 threads per block
+    gemma3_qk_norm_rope_v8_kernel<<<(int)((vecs + wpb - 1) / wpb), wpb * 32, 0, stream>>>(
+        q, q_stride, nhq, k, k_stride, nhk, wq, wk, cosT, sinT, seq, eps);
+}
+
+// residual add + LayerNorm + static FP8 quantize in a single pass -- the reference
+// emits this as one kernel, and composing it from bias_residual + layer_norm +
+// quantize_fp8_static costs three launches and forces the normalised values through
+// DRAM in a scratch the reference never writes (4.7 MB per call, 54 calls per predict).
+//
+// Two details are load-bearing and neither is cosmetic:
+//
+//   * rcp.approx.ftz.f32 and mul.rn.ftz.f32 are pinned in the reference, so they are
+//     pinned here. FlashRT has no equivalent and `1.0f / x` is not the same operation.
+//   * the reduction reproduces frt_block_sum exactly (shfl_down 16..1, then warp 0 over
+//     the per-warp sums). A different tree moves mean/inv_std by an ulp, which is
+//     precisely what made this op fail the 444 gate before the division sites were
+//     pinned -- the two are the same class of error.
+//
+// `dim / 2 <= 256 * MAXP`; D=1152 needs np <= 3, so MAXP=4 covers it. The residual and
+// normalised values stay in v0/v1 registers across the two passes, which is what lets
+// xn stay untouched when the caller passes 0.
+namespace {
+__device__ __forceinline__ float dm05_warp_sum(float v) {
+    v += __shfl_down_sync(0xffffffffu, v, 16);
+    v += __shfl_down_sync(0xffffffffu, v, 8);
+    v += __shfl_down_sync(0xffffffffu, v, 4);
+    v += __shfl_down_sync(0xffffffffu, v, 2);
+    v += __shfl_down_sync(0xffffffffu, v, 1);
+    return v;
+}
+__device__ __forceinline__ float dm05_block_sum(float v, float* sh) {
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    v = dm05_warp_sum(v);
+    if (lane == 0) sh[wid] = v;
+    __syncthreads();
+    const int nw = blockDim.x >> 5;
+    v = (threadIdx.x < nw) ? sh[threadIdx.x] : 0.0f;
+    if (wid == 0) v = dm05_warp_sum(v);
+    if (threadIdx.x == 0) sh[0] = v;
+    __syncthreads();
+    const float r = sh[0];
+    __syncthreads();
+    return r;
+}
+__device__ __forceinline__ float dm05_rcp(float s) {
+    float r; asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(s)); return r;
+}
+__device__ __forceinline__ float dm05_mul(float a, float b) {
+    float r; asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r;
+}
+}  // namespace
+
+template <int MAXP>
+__global__ void __launch_bounds__(256)
+res_ln_quant_v8_bf16_kernel(__nv_bfloat16* __restrict__ r, const __nv_bfloat16* __restrict__ y,
+                            const __nv_bfloat16* __restrict__ b, const __nv_bfloat16* __restrict__ w,
+                            const __nv_bfloat16* __restrict__ beta, __nv_bfloat16* __restrict__ xn,
+                            __nv_fp8_e4m3* __restrict__ q, const float* __restrict__ scale,
+                            int dim, float eps) {
+    __shared__ float sh[32];
+    const int row = blockIdx.x, dim2 = dim >> 1;
+    __nv_bfloat162* r2 = reinterpret_cast<__nv_bfloat162*>(r + (long long)row * dim);
+    float v0[MAXP], v1[MAXP];
+    int np = 0;
+    float ls = 0.f;
+    for (int i = threadIdx.x; i < dim2; i += 256, ++np) {
+        __nv_bfloat162 rv = r2[i];
+        float a0 = __bfloat162float(rv.x), a1 = __bfloat162float(rv.y);
+        if (y) {
+            const __nv_bfloat162 yv = reinterpret_cast<const __nv_bfloat162*>(y + (long long)row * dim)[i];
+            const __nv_bfloat162 bv = reinterpret_cast<const __nv_bfloat162*>(b)[i];
+            a0 = gemma3_bf(a0 + __bfloat162float(yv.x) + __bfloat162float(bv.x));
+            a1 = gemma3_bf(a1 + __bfloat162float(yv.y) + __bfloat162float(bv.y));
+            r2[i] = __floats2bfloat162_rn(a0, a1);
+        }
+        v0[np] = a0; v1[np] = a1;
+        ls += a0 + a1;
+    }
+    const float mean = __fdiv_rn(dm05_block_sum(ls, sh), (float)dim);
+    float lv = 0.f;
+    for (int j = 0; j < np; ++j) {
+        const float d0 = v0[j] - mean, d1 = v1[j] - mean;
+        lv += d0 * d0 + d1 * d1;
+    }
+    const float inv_std = rsqrtf(__fdiv_rn(dm05_block_sum(lv, sh), (float)dim) + eps);
+    const float inv_s = q ? dm05_rcp(scale[0]) : 0.f;
+    int j = 0;
+    for (int i = threadIdx.x; i < dim2; i += 256, ++j) {
+        const __nv_bfloat162 wv = reinterpret_cast<const __nv_bfloat162*>(w)[i];
+        const __nv_bfloat162 bb = reinterpret_cast<const __nv_bfloat162*>(beta)[i];
+        const float o0 = gemma3_bf((v0[j] - mean) * inv_std * __bfloat162float(wv.x) + __bfloat162float(bb.x));
+        const float o1 = gemma3_bf((v1[j] - mean) * inv_std * __bfloat162float(wv.y) + __bfloat162float(bb.y));
+        if (xn) reinterpret_cast<__nv_bfloat162*>(xn + (long long)row * dim)[i] = __floats2bfloat162_rn(o0, o1);
+        if (q) {
+            __nv_fp8_e4m3* qr = q + (long long)row * dim + 2 * i;
+            qr[0] = __nv_fp8_e4m3(fminf(fmaxf(dm05_mul(o0, inv_s), -448.f), 448.f));
+            qr[1] = __nv_fp8_e4m3(fminf(fmaxf(dm05_mul(o1, inv_s), -448.f), 448.f));
+        }
+    }
+}
+
+void res_ln_quant_v8_bf16(__nv_bfloat16* r, const __nv_bfloat16* y, const __nv_bfloat16* b,
+                          const __nv_bfloat16* w, const __nv_bfloat16* beta, __nv_bfloat16* xn,
+                          __nv_fp8_e4m3* q, const float* scale, int rows, int dim, float eps,
+                          cudaStream_t stream) {
+    if (rows <= 0 || dim <= 0) return;
+    if (dim % 2) throw std::runtime_error("res_ln_quant_v8_bf16: dim must be even");
+    if (dim / 2 > 256 * 4) throw std::runtime_error("res_ln_quant_v8_bf16: dim too large for MAXP=4");
+    res_ln_quant_v8_bf16_kernel<4><<<rows, 256, 0, stream>>>(r, y, b, w, beta, xn, q, scale, dim, eps);
+}
+
+void ada_rms_norm(const __nv_bfloat16* x, const __nv_bfloat16* mod,
+                  __nv_bfloat16* out, int rows, int dim, float eps,
+                  cudaStream_t stream) {
+    if (rows <= 0 || dim <= 0) return;
+    const int threads = dim >= 1024 ? 1024 : (dim >= 256 ? 256 : 128);
+    ada_rms_norm_kernel<<<rows, threads, 0, stream>>>(x, mod, out, dim, eps);
+}

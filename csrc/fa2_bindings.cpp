@@ -79,6 +79,42 @@ static auto make_fwd(Fn fn) {
     };
 }
 
+// FlashRT local patch 4: make_fwd sibling for the *_fp8out entries. Adds the FP8
+// destination, its device scale pointer, its strides, and the bf16-skip flag.
+template <typename Fn>
+static auto make_fwd_fp8out(Fn fn) {
+    return [fn](uintptr_t Q, uintptr_t K, uintptr_t V,
+                uintptr_t O, uintptr_t softmax_lse,
+                uintptr_t softmax_lse_accum, uintptr_t o_accum,
+                int batch, int seqlen_q, int seqlen_k,
+                int num_heads_q, int num_heads_kv, int head_dim,
+                py::tuple q_strides, py::tuple k_strides,
+                py::tuple v_strides, py::tuple o_strides,
+                uintptr_t O_fp8, uintptr_t o_fp8_scale, py::tuple o_fp8_strides,
+                bool skip_bf16_output,
+                float softmax_scale, int num_sms, uintptr_t stream) {
+        fn(reinterpret_cast<const void*>(Q),
+           reinterpret_cast<const void*>(K),
+           reinterpret_cast<const void*>(V),
+           reinterpret_cast<void*>(O),
+           reinterpret_cast<void*>(softmax_lse),
+           reinterpret_cast<void*>(softmax_lse_accum),
+           reinterpret_cast<void*>(o_accum),
+           batch, seqlen_q, seqlen_k,
+           num_heads_q, num_heads_kv, head_dim,
+           py::cast<int>(q_strides[0]), py::cast<int>(q_strides[1]), py::cast<int>(q_strides[2]),
+           py::cast<int>(k_strides[0]), py::cast<int>(k_strides[1]), py::cast<int>(k_strides[2]),
+           py::cast<int>(v_strides[0]), py::cast<int>(v_strides[1]), py::cast<int>(v_strides[2]),
+           py::cast<int>(o_strides[0]), py::cast<int>(o_strides[1]), py::cast<int>(o_strides[2]),
+           softmax_scale, num_sms, to_stream(stream),
+           reinterpret_cast<void*>(O_fp8),
+           reinterpret_cast<const void*>(o_fp8_scale),
+           py::cast<int>(o_fp8_strides[0]), py::cast<int>(o_fp8_strides[1]),
+           py::cast<int>(o_fp8_strides[2]),
+           skip_bf16_output ? 1 : 0);
+    };
+}
+
 template <typename Fn>
 static auto make_fwd_window(Fn fn) {
     return [fn](uintptr_t Q, uintptr_t K, uintptr_t V,
@@ -189,6 +225,39 @@ PYBIND11_MODULE(flash_rt_fa2, m) {
         "Hy-VLA small-N FA2 query-tile specialisation (bf16, head_dim<=128). "
         "seqused_k may be 0 for full attention. Same semantics as fwd_bf16 / "
         "fwd_bf16_seqused but with a narrow query tile tuned for short seqlen_q.");
+
+    // FlashRT local patch 4: quantized-output siblings. O_fp8 = 0 makes each identical
+    // to the entry without the suffix.
+    m.def("fwd_bf16_fp8out", make_fwd_fp8out(&fvk_attention_fa2_fwd_bf16_fp8out),
+        py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),
+        py::arg("softmax_lse_accum") = 0, py::arg("o_accum") = 0,
+        py::arg("batch"), py::arg("seqlen_q"), py::arg("seqlen_k"),
+        py::arg("num_heads_q"), py::arg("num_heads_kv"), py::arg("head_dim"),
+        py::arg("q_strides"), py::arg("k_strides"),
+        py::arg("v_strides"), py::arg("o_strides"),
+        py::arg("O_fp8") = 0, py::arg("o_fp8_scale") = 0,
+        py::arg("o_fp8_strides") = py::make_tuple(0, 0, 0),
+        py::arg("skip_bf16_output") = false,
+        py::arg("softmax_scale") = 1.0f, py::arg("num_sms") = 0, py::arg("stream") = 0,
+        "Full-attention bf16 FA2 that also writes a static-FP8 (e4m3) copy of O. "
+        "o_fp8_scale is the device scalar quantize_fp8_static reads; the FP8 values "
+        "match that kernel bit for bit. o_fp8_strides is (batch, row, head) in "
+        "elements. skip_bf16_output drops the bf16 store when the FP8 copy is the "
+        "only consumer. With O_fp8 = 0 this is exactly fwd_bf16.");
+
+    m.def("fwd_bf16_causal_fp8out", make_fwd_fp8out(&fvk_attention_fa2_fwd_bf16_causal_fp8out),
+        py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),
+        py::arg("softmax_lse_accum") = 0, py::arg("o_accum") = 0,
+        py::arg("batch"), py::arg("seqlen_q"), py::arg("seqlen_k"),
+        py::arg("num_heads_q"), py::arg("num_heads_kv"), py::arg("head_dim"),
+        py::arg("q_strides"), py::arg("k_strides"),
+        py::arg("v_strides"), py::arg("o_strides"),
+        py::arg("O_fp8") = 0, py::arg("o_fp8_scale") = 0,
+        py::arg("o_fp8_strides") = py::make_tuple(0, 0, 0),
+        py::arg("skip_bf16_output") = false,
+        py::arg("softmax_scale") = 1.0f, py::arg("num_sms") = 0, py::arg("stream") = 0,
+        "Causal sibling of fwd_bf16_fp8out (bf16, head_dim=256). With O_fp8 = 0 this "
+        "is exactly fwd_bf16_causal.");
 
     m.def("fwd_bf16_seqused_splitkv",
         make_fwd_seqused_splitkv(&fvk_attention_fa2_fwd_bf16_seqused_splitkv),

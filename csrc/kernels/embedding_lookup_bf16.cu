@@ -5,11 +5,49 @@
 
 #include "embedding_lookup_bf16.cuh"
 
+#include <stdexcept>
+
 namespace flash_rt::kernels {
 
 namespace {
 
 constexpr int kThreads = 256;
+
+// Prefix embedding with a multimodal merge. Row r takes either an image feature
+// row or a looked-up token row:
+//   img_index[r] >= 0  -> out[r, :] = img[img_index[r], :]
+//   otherwise          -> out[r, :] = bf16(embed[token_ids[r], :] * scale)
+//
+// The merge is driven by img_index, a per-row table the caller computes on the
+// host (-1 for a text row), so the kernel has no data-dependent control flow
+// and no device-side prefix scan: a row's source is a property of the launch,
+// not of a comparison against a sentinel token id.
+//
+// `scale` is given in bf16 to match a caller that pre-rounds it -- the product
+// is formed in fp32 from the two bf16 operands and rounded once.
+__global__ void embedding_lookup_merge_bf16_kernel(
+    const int64_t* __restrict__ token_ids,
+    const int* __restrict__ img_index,
+    const __nv_bfloat16* __restrict__ embed,
+    const __nv_bfloat16* __restrict__ img,
+    __nv_bfloat16* __restrict__ out,
+    int rows,
+    int hidden,
+    float scale)
+{
+  const int row = blockIdx.y;
+  if (row >= rows) return;
+  const int col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (col >= hidden) return;
+  __nv_bfloat16* dst = out + (int64_t)row * hidden + col;
+  const int ii = img_index[row];
+  if (ii >= 0) {
+    *dst = img[(int64_t)ii * hidden + col];
+  } else {
+    const int64_t tok = token_ids[row];
+    *dst = __float2bfloat16(__bfloat162float(embed[tok * hidden + col]) * scale);
+  }
+}
 
 __global__ void embedding_lookup_bf16_kernel(
     const int64_t* __restrict__ token_ids,
@@ -41,6 +79,32 @@ void embedding_lookup_bf16(
   const dim3 grid((hidden + kThreads - 1) / kThreads, rows);
   embedding_lookup_bf16_kernel<<<grid, block, 0, stream>>>(
       token_ids, embed, out, rows, hidden);
+}
+
+void embedding_lookup_merge_bf16(
+    const int64_t* token_ids,
+    const int* img_index,
+    const __nv_bfloat16* embed,
+    const __nv_bfloat16* img,
+    __nv_bfloat16* out,
+    int rows,
+    int hidden,
+    float scale,
+    cudaStream_t stream)
+{
+  // The index table is read unconditionally per row, so a null one is a
+  // dereference, not a no-op: fail on the host rather than launch a kernel that
+  // takes an illegal memory access and poisons the context for everything
+  // after it.
+  // An empty call is a no-op and needs no pointers: a zero-element tensor can
+  // legitimately report a null data_ptr, so the null check has to come second.
+  if (rows <= 0 || hidden <= 0) return;
+  if (!token_ids || !img_index || !embed || !img || !out)
+    throw std::runtime_error("embedding_lookup_merge_bf16: null pointer argument");
+  const dim3 block(kThreads);
+  const dim3 grid((hidden + kThreads - 1) / kThreads, rows);
+  embedding_lookup_merge_bf16_kernel<<<grid, block, 0, stream>>>(
+      token_ids, img_index, embed, img, out, rows, hidden, scale);
 }
 
 }  // namespace flash_rt::kernels

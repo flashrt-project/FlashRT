@@ -382,7 +382,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         weight_cache: if True (default), cache FP8-quantized weights to disk
             after first load. Only affects JAX.
         config: model config name: "pi05", "pi0", "groot", "groot_n17",
-            "pi0fast", "motus", "wan22_ti2v_5b", "cosmos3_video",
+            "pi0fast", "motus", "dm05", "wan22_ti2v_5b", "cosmos3_video",
             "cosmos3_edge", "ltx25".
             "ltx25" is the LTX-2.5 22B distilled audio+video generator:
             drive it with set_prompt(...) + infer(...), not predict().
@@ -593,12 +593,12 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     elif config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
                       "motus", "wan22_ti2v_5b", "cosmos3_video",
                       "cosmos3_edge", "nexn2", "qwen36_moe", "spark_x25",
-                      "hyvla", "ltx25"):
+                      "hyvla", "ltx25", "dm05"):
         raise ValueError(
             f"Unknown config: {config}. "
             f"Supported: pi05, groot, groot_n17, pi0, pi0fast, motus, "
             f"wan22_ti2v_5b, cosmos3_video, cosmos3_edge, nexn2, "
-            f"qwen36_moe, spark_x25, hyvla, ltx25")
+            f"qwen36_moe, spark_x25, hyvla, ltx25, dm05")
     if framework not in ("torch", "jax", "jetson_pi"):
         raise ValueError(
             f"Unknown framework: {framework}. Supported: torch, jax, jetson_pi")
@@ -714,6 +714,14 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
 
     from flash_rt.hardware import detect_arch, resolve_pipeline_class
     arch = detect_arch() if hardware == "auto" else hardware
+
+    if config == "dm05":
+        if (framework, arch) != ("torch", "rtx_sm120"):
+            raise ValueError("DM05 supports framework='torch', hardware='rtx_sm120' only")
+        if not use_fp4 or not use_fp8 or use_fp16:
+            raise ValueError("DM05 requires its mixed tier: use_fp4=True, use_fp8=True, use_fp16=False")
+        if action_dim not in (None, 7) or action_horizon not in (None, 10):
+            raise ValueError("DM05-LIBERO emits 10-step, 7-component action chunks")
 
     # Precision tier, resolved before any backend import so an impossible
     # request fails the same way on every machine, including one with no
@@ -1002,6 +1010,11 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             logger.info("GROOT N1.7 Thor NVFP4 tier enabled")
         use_fp4 = False  # do not fall through to the Pi0.5 FP4 routing
 
+    # DM05 owns its explicit mixed tier; do not route through the Thor FP4 module.
+    _dm05_fp4 = config == "dm05" and use_fp4
+    if _dm05_fp4:
+        use_fp4 = False
+
     # ── FP4 routing (Pi0.5 torch + Pi0.5 JAX on Thor, HyVLA torch on Thor) ──
     _hyvla_fp4 = False
     _rtx_nvfp4 = False
@@ -1159,6 +1172,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                             ("compile_mode", compile_mode)):
             if value is not None and name in sig.parameters:
                 kwargs[name] = value
+    elif config == "dm05":
+        kwargs["use_fp4"] = _dm05_fp4
+        if num_steps is not None:
+            kwargs["num_steps"] = num_steps
     elif config == "hyvla":
         # The NVFP4 tier must reach the frontend explicitly; the generic
         # kwarg set never forwards use_fp4. It is the RTX SM120 default

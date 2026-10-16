@@ -26,4 +26,25 @@ void embedding_lookup_bf16(
     int hidden,
     cudaStream_t stream);
 
+// Prefix embedding with a multimodal merge: row r is either an image feature
+// row or a scaled token row, selected per row by img_index.
+//
+//   img_index[r] >= 0  -> out[r, :] = img[img_index[r], :]
+//   otherwise          -> out[r, :] = bf16(embed[token_ids[r], :] * scale)
+//
+// img_index is computed on the host (-1 for a text row), so the source of a row
+// is a property of the launch rather than a comparison against a sentinel id,
+// and there is no device-side scan. `scale` is passed in bf16 by callers that
+// pre-round it; the product is formed in fp32 and rounded once.
+void embedding_lookup_merge_bf16(
+    const int64_t* token_ids,
+    const int* img_index,
+    const __nv_bfloat16* embed,
+    const __nv_bfloat16* img,
+    __nv_bfloat16* out,
+    int rows,
+    int hidden,
+    float scale,
+    cudaStream_t stream);
+
 }  // namespace flash_rt::kernels

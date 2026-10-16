@@ -15,6 +15,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BUILD_DIR = Path(os.environ.get("FLASHRT_BUILD_DIR", REPO_ROOT / "build"))
 EXPECTED_RAW_EXPORTS = {
+    "fvk_attention_fa2_fwd_bf16_fp8out",
+    "fvk_attention_fa2_fwd_bf16_causal_fp8out",
     "fvk_attention_fa2_fwd_fp16",
     "fvk_attention_fa2_fwd_bf16",
     "fvk_attention_fa2_fwd_bf16_window",
@@ -172,6 +174,8 @@ def test_built_adapter_chameleon_symbol_matches_build_mode():
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    assert hasattr(module, "fwd_bf16_fp8out")
+    assert hasattr(module, "fwd_bf16_causal_fp8out")
     assert hasattr(module, "fwd_bf16_tile")
     assert hasattr(module, "fwd_fp16_causal") == _cache_bool(
         "FLASHRT_ENABLE_CHAMELEON")
@@ -231,3 +235,21 @@ f(*([None] * 6), 1, 1, 1, 1, 1, int(sys.argv[2]), *([1] * 12), 1.0, 1, None)
     assert result.returncode == -6, result.stderr  # SIGABRT, not a null dereference
     if "bf16" in dtypes:
         assert "not compiled" in result.stderr
+
+
+def test_fp16_only_adapter_rejects_bf16_fp8_output_before_launch():
+    adapter_value = os.environ.get("FLASHRT_FA2_ADAPTER_LIBRARY")
+    if not adapter_value:
+        pytest.skip("set FLASHRT_FA2_ADAPTER_LIBRARY to validate an adapter")
+    if "bf16" in (_cache_value("FA2_DTYPES") or "").split(";"):
+        pytest.skip("requires a FP16-only configured build")
+    spec = importlib.util.spec_from_file_location("flash_rt_fa2", adapter_value)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    # Null device addresses are safe here: the not-built stub must raise
+    # before touching buffers or launching any CUDA work.
+    args = [0] * 7 + [1] * 5 + [256] + [(1, 1, 1)] * 4
+    for name in ("fwd_bf16_fp8out", "fwd_bf16_causal_fp8out"):
+        with pytest.raises(RuntimeError, match="not compiled"):
+            getattr(module, name)(*args)

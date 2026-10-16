@@ -62,3 +62,15 @@ void qkv_split_rope_kvcache_fp16_devpos(
     int S, int Q_dim, int K_dim, int HD, int qkv_stride,
     int kc_offset, int kc_stride,
     cudaStream_t stream = 0);
+
+// HuggingFace rotate_half RoPE applied in place, with HF's intermediate
+// roundings: each product is rounded to bf16 before the pair is summed, and the
+// cos/sin tables are full-width [seq, dim] so the two halves are read
+// separately. Distinct from rope_apply (interleaved pairs) and from
+// rope_neox_qk_bf16 (same convention, one rounding, half-width table).
+//
+// Rows may be strided, so this rotates per-head slices of a fused QKV buffer in
+// place: head h of row s starts at s * row_stride + h * dim.
+void rope_hf_bf16(__nv_bfloat16* x, long long row_stride, int heads, int dim,
+                  const __nv_bfloat16* cos_tab, const __nv_bfloat16* sin_tab,
+                  int seq, cudaStream_t stream = 0);

@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <algorithm>
+#include <stdexcept>
 
 #include "flash_attn_2_src/flash_attn/namespace_config.h"
 #include "flash_attn_2_src/flash_attn/flash.h"
@@ -141,6 +142,13 @@ static void fill_params(
     params.alibi_slopes_batch_stride = 0;
     params.is_seqlens_k_cumulative = true;
     params.rotary_dim = 0;
+    // FlashRT local patch 4: quantized-output epilogue off unless a *_fp8out entry sets it
+    params.o_fp8_ptr = nullptr;
+    params.o_fp8_scale_ptr = nullptr;
+    params.o_fp8_batch_stride = 0;
+    params.o_fp8_row_stride = 0;
+    params.o_fp8_head_stride = 0;
+    params.o_bf16_skip = false;
 }
 
 
@@ -343,6 +351,47 @@ DEFINE_FA2_STUB(fvk_attention_fa2_fwd_fp16,  "fp16")
 
 #ifdef FA2_HAS_BF16
 DEFINE_FA2_ENTRY(fvk_attention_fa2_fwd_bf16, cutlass::bfloat16_t, true)
+
+// FlashRT local patch 4: bf16 full-attention entry that also emits the static-FP8 copy
+// of O. Kept as a separate symbol rather than an extra argument on the existing entry so
+// the published signature of fvk_attention_fa2_fwd_bf16 is untouched.
+extern "C" void fvk_attention_fa2_fwd_bf16_fp8out(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr,
+    void* softmax_lse_accum_ptr, void* o_accum_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream,
+    void* o_fp8_ptr, const void* o_fp8_scale_ptr,
+    int o_fp8_batch_stride, int o_fp8_row_stride, int o_fp8_head_stride,
+    int o_bf16_skip)
+{
+    FLASH_NAMESPACE::Flash_fwd_params params;
+    fill_params(params, /*elem_is_bf16=*/true,
+                q_ptr, k_ptr, v_ptr, o_ptr, softmax_lse_ptr,
+                batch, seqlen_q, seqlen_k,
+                num_heads_q, num_heads_kv, head_dim,
+                q_batch_stride, q_row_stride, q_head_stride,
+                k_batch_stride, k_row_stride, k_head_stride,
+                v_batch_stride, v_row_stride, v_head_stride,
+                o_batch_stride, o_row_stride, o_head_stride,
+                softmax_scale);
+    params.o_fp8_ptr = o_fp8_ptr;
+    params.o_fp8_scale_ptr = reinterpret_cast<const float*>(o_fp8_scale_ptr);
+    params.o_fp8_batch_stride = o_fp8_batch_stride;
+    params.o_fp8_row_stride = o_fp8_row_stride;
+    params.o_fp8_head_stride = o_fp8_head_stride;
+    params.o_bf16_skip = (o_bf16_skip != 0) && (o_fp8_ptr != nullptr);
+    int num_splits = setup_splitkv(params, softmax_lse_accum_ptr, o_accum_ptr,
+                                    num_sms, seqlen_q, seqlen_k,
+                                    head_dim, batch, num_heads_q);
+    dispatch_hdim<cutlass::bfloat16_t>(head_dim, num_splits, params, stream);
+}
+
 DEFINE_FA2_ENTRY_WINDOW(fvk_attention_fa2_fwd_bf16_window, cutlass::bfloat16_t, true)
 
 // seqused_k variant: K/V length is read per-batch from device memory
@@ -457,6 +506,25 @@ extern "C" void fvk_attention_fa2_fwd_bf16_tile(
 }
 
 #else
+extern "C" void fvk_attention_fa2_fwd_bf16_fp8out(
+    const void*, const void*, const void*,
+    void* o_ptr, void* softmax_lse_ptr,
+    void* softmax_lse_accum_ptr, void* o_accum_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream,
+    void* o_fp8_ptr, const void* o_fp8_scale_ptr,
+    int o_fp8_batch_stride, int o_fp8_row_stride, int o_fp8_head_stride,
+    int o_bf16_skip)
+{
+    throw std::runtime_error(
+        "fvk_attention_fa2_fwd_bf16_fp8out: bf16 entry was not compiled. "
+        "Rebuild with -DFA2_DTYPES=\"fp16;bf16\" to enable it.");
+}
 DEFINE_FA2_STUB(fvk_attention_fa2_fwd_bf16,  "bf16")
 DEFINE_FA2_STUB_WINDOW(fvk_attention_fa2_fwd_bf16_window, "bf16")
 extern "C" void fvk_attention_fa2_fwd_bf16_seqused(
