@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """BF16 GEMM with a fused bias epilogue over the (N,K) weight layout.
 
-`bf16_nn_bias` computes D = A @ B(K,N)^T + bias from a (K,N) B. This covers the
+`bf16_nn_bias` computes D = A @ B(K,N) + bias from a (K,N) B. This covers the
 other convention, an nn.Linear weight kept as stored at (N,K), which is what a
 caller holding the checkpoint layout has in hand and what `bf16_run` already
 accepts without a bias.
@@ -87,11 +87,45 @@ class TestBf16NtBias:
         W = torch.zeros(16, 8, device="cuda", dtype=BF16)
         D = torch.zeros(4, 16, device="cuda", dtype=BF16)
         import ctypes
-        with pytest.raises(Exception):
+        with pytest.raises(ValueError, match="bf16_nt_bias.*non-null"):
             fvk.GemmRunner().bf16_nt_bias(
                 A.data_ptr(), W.data_ptr(), D.data_ptr(), 0, 4, 16, 8,
                 torch.cuda.current_stream().cuda_stream)
             torch.cuda.synchronize()
+
+    @pytest.mark.parametrize("shape", [(0, 16, 8), (4, -1, 8), (4, 16, 0)])
+    def test_invalid_dimensions_rejected_before_launch(self, shape):
+        fvk = _fvk()
+        with pytest.raises(ValueError, match="bf16_nt_bias.*positive"):
+            fvk.GemmRunner().bf16_nt_bias(0, 0, 0, 0, *shape, 0)
+
+    def test_graph_replay_reads_refreshed_inputs(self):
+        fvk = _fvk()
+        M, N, K = 16, 64, 32
+        A = torch.randn(M, K, device="cuda", dtype=BF16)
+        W = torch.randn(N, K, device="cuda", dtype=BF16)
+        b = torch.randn(N, device="cuda", dtype=BF16)
+        D = torch.empty(M, N, device="cuda", dtype=BF16)
+        runner = fvk.GemmRunner()
+        def launch():
+            runner.bf16_nt_bias(A.data_ptr(), W.data_ptr(), D.data_ptr(), b.data_ptr(),
+                               M, N, K, torch.cuda.current_stream().cuda_stream)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                launch()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            launch()
+        for offset in (0.0, 0.25):
+            A.add_(offset)
+            b.add_(offset)
+            graph.replay()
+            torch.cuda.synchronize()
+            ref = (A.float() @ W.float().t() + b.float()).to(BF16)
+            assert (D != ref).float().mean().item() <= 0.01
 
     def test_row_order_path_is_the_one_that_fails(self):
         """Informational: records whether bf16_nn_bias covers these shapes here."""
