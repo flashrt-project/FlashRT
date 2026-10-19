@@ -32,6 +32,7 @@ def _detect_with(monkeypatch, *, torch_npu_importable, npu_available,
 
     monkeypatch.setattr(torch, "npu", _FakeNpu(npu_available), raising=False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda_available)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
     real_import = builtins.__import__
 
     def fake_import(name, *args, **kwargs):
@@ -63,7 +64,7 @@ def test_absent_torch_npu_falls_through_rather_than_raising(monkeypatch):
     pytest.importorskip("torch")
     detect = _detect_with(monkeypatch, torch_npu_importable=False,
                           npu_available=False, cuda_available=False)
-    with pytest.raises(RuntimeError, match="CUDA- or ROCm-capable"):
+    with pytest.raises(RuntimeError, match="accelerator"):
         detect()
 
 
@@ -71,7 +72,7 @@ def test_installed_torch_npu_with_no_device_does_not_claim_the_box(monkeypatch):
     pytest.importorskip("torch")
     detect = _detect_with(monkeypatch, torch_npu_importable=True,
                           npu_available=False, cuda_available=False)
-    with pytest.raises(RuntimeError, match="CUDA- or ROCm-capable"):
+    with pytest.raises(RuntimeError, match="accelerator"):
         detect()
 
 

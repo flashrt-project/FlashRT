@@ -30,7 +30,7 @@ from __future__ import annotations
 
 
 def detect_arch() -> str:
-    """Return a short string identifier for the current CUDA device.
+    """Return a short string identifier for the current accelerator.
 
     Supported:
         ``"npu"``       — Huawei Ascend via torch_npu (CANN 7/8, 910/A2+)
@@ -41,6 +41,7 @@ def detect_arch() -> str:
         ``"amd_cdna3"`` — AMD Instinct MI300 series, ROCm (gfx942)
         ``"amd_cdna4"`` — AMD Instinct MI350 series, ROCm (gfx950)
         ``"amd_rdna35"`` — AMD RDNA 3.5 (gfx1151 / Radeon 8060S)
+        ``"apple_mps"`` — Apple Silicon via PyTorch MPS (Pi0.5 BF16)
 
     Raises RuntimeError if no supported accelerator is available or the
     card has an unsupported SM level. Deliberately strict: silently
@@ -72,9 +73,14 @@ def detect_arch() -> str:
     if npu_available:
         return "npu"
     if not torch.cuda.is_available():
+        import platform
+        mps = getattr(torch.backends, "mps", None)
+        if (platform.system() == "Darwin" and platform.machine() == "arm64"
+                and mps is not None and mps.is_available()):
+            return "apple_mps"
         raise RuntimeError(
-            "FlashRT requires a CUDA- or ROCm-capable GPU "
-            "(torch.cuda.is_available()==False)")
+            "FlashRT requires a supported CUDA, ROCm, Ascend, or Apple Silicon "
+            "MPS accelerator; none is available")
     if getattr(torch.version, "hip", None):
         # ROCm build: route by the gfx architecture name, not the CUDA
         # cc tuple (which ROCm fills with unrelated values).
@@ -135,6 +141,8 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
          "Pi05TorchFrontendAmdRdna35"),
     ("pi05", "torch", "npu"):
         ("flash_rt.npu.frontends.torch.pi05", "Pi05TorchFrontendNpu"),
+    ("pi05", "torch", "apple_mps"):
+        ("flash_rt.frontends.torch.pi05_mps", "Pi05TorchFrontendMps"),
     ("pi05", "torch", "rtx_sm89"):
         ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
     ("pi05", "jax", "thor"):

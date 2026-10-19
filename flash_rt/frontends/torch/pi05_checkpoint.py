@@ -246,7 +246,7 @@ def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict
 
 
 def _embed_prompt(prompt_text: str, embedding_weight: torch.Tensor,
-                  max_len: int = 48, state=None) -> tuple[torch.Tensor, int]:
+                  max_len: int = 48, state=None, *, device="cuda") -> tuple[torch.Tensor, int]:
     """Tokenise + embed via PaliGemma embedding table (device, bf16)."""
     # PaliGemma tokenizer resolution — see
     # `flash_rt.utils.paligemma_tokenizer` for the search order and
@@ -259,7 +259,7 @@ def _embed_prompt(prompt_text: str, embedding_weight: torch.Tensor,
         tokens_np, mask_np = tokenizer.tokenize(prompt_text, state=state)
         prompt_len = int(mask_np.sum())
         token_ids = torch.tensor(
-            tokens_np[:prompt_len], dtype=torch.long, device="cuda")
+            tokens_np[:prompt_len], dtype=torch.long, device=device)
     except (ImportError, FileNotFoundError, OSError, RuntimeError):
         # Fallback: locate the SentencePiece model directly via the
         # FlashRT helper (clear error if not found — never silent
@@ -275,11 +275,11 @@ def _embed_prompt(prompt_text: str, embedding_weight: torch.Tensor,
         else:
             tokens = sp.Encode(format_pi05_prompt(prompt_text, state),
                                add_bos=True)
-        token_ids = torch.tensor(tokens, dtype=torch.long, device="cuda")
+        token_ids = torch.tensor(tokens, dtype=torch.long, device=device)
         prompt_len = len(token_ids)
 
-    if embedding_weight.device.type != "cuda":
-        embedding_weight = embedding_weight.to(device="cuda")
+    if embedding_weight.device.type != torch.device(device).type:
+        embedding_weight = embedding_weight.to(device=device)
 
     embeds = F.embedding(token_ids, embedding_weight)
     embeds = embeds * float(embeds.shape[-1] ** 0.5)

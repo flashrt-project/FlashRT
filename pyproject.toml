@@ -31,6 +31,7 @@ dependencies = [
 
 [project.optional-dependencies]
 torch = ["torch", "safetensors", "sentencepiece"]
+apple = ["torch>=2.5", "safetensors", "sentencepiece"]
 chameleon = ["torch", "safetensors", "transformers>=4.43,<4.56", "Pillow"]
 jax = ["jax", "jaxlib", "ml_dtypes", "orbax-checkpoint", "flax"]
 server = ["fastapi", "uvicorn"]

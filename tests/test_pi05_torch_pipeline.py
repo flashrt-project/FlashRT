@@ -94,6 +94,83 @@ def test_shared_pipeline_decoder_only_reuses_last_encoder_cache(small_model, com
     torch.testing.assert_close(cached, full, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize('device', ['cpu', 'mps'])
+@pytest.mark.parametrize('views', [2, 3])
+@pytest.mark.parametrize('compact', [False, True])
+def test_apple_provider_full_pipeline_parity(small_model, device, views, compact):
+    from flash_rt.hardware.mps.attention import MpsAttentionBackend
+    if device == 'mps' and not torch.backends.mps.is_available():
+        pytest.skip('MPS unavailable')
+    arguments = dict(num_views=views, max_prompt_len=5, chunk_size=3,
+                     num_steps=2, compact_encoder=compact)
+    reference = model.Pi05TorchPipeline(
+        small_model.weights, TorchTensorOps(), TorchGemmBackend(),
+        TorchAttentionBackend(2), device='cpu', **arguments)
+    target = model.Pi05TorchPipeline(
+        {key: value.to(device) for key, value in small_model.weights.items()},
+        TorchTensorOps(), TorchGemmBackend(), MpsAttentionBackend(2),
+        device=device, **arguments)
+    images = small_model.rand(views, 224, 224, 3)
+    noise = small_model.rand(3, 4)
+    # Reuse the plan across changing prompt lengths to catch stale prefix rows.
+    for length in (3, 1, 5):
+        prompt = small_model.rand(length, 8)
+        expected = reference.forward_with_inputs(images, prompt, length, noise).clone()
+        actual = target.forward_with_inputs(
+            images.to(device), prompt.to(device), length, noise.to(device))
+        torch.testing.assert_close(actual.cpu(), expected, rtol=.03, atol=.003)
+        assert torch.isfinite(actual).all()
+
+
+def test_apple_frontend_predict_and_fixed_noise(small_model, monkeypatch, tmp_path):
+    import json
+    import numpy as np
+    from flash_rt import load_model
+    from flash_rt.frontends.torch import pi05_mps as pi05
+    from flash_rt.hardware.mps.attention import MpsAttentionBackend
+    from flash_rt.models.pi05 import pipeline_mps
+    from flash_rt.core.utils.actions import unnormalize_actions
+    if not torch.backends.mps.is_available():
+        pytest.skip('MPS unavailable')
+    pi05.require_mps()
+    for key in ('DEC_D', 'ENC_D', 'ACTION_DIM'):
+        monkeypatch.setattr(pi05, key, small_model.dims[key])
+    source = {key: value.clone() for key, value in small_model.weights.items()}
+    source['vision_patch_embedding_w'] = source['vision_patch_embedding_w'].permute(2, 3, 1, 0)
+    for stage in ('encoder', 'decoder'):
+        source[f'{stage}_ffn_gate_w'], source[f'{stage}_ffn_up_w'] = source.pop(f'{stage}_ffn_gate_up_w').chunk(2, -1)
+    source['embedding_weight'] = torch.zeros(110, 8).bfloat16()
+    monkeypatch.setattr(pi05, 'convert_pi05_safetensors', lambda path: dict(source))
+    monkeypatch.setattr(pipeline_mps, 'MpsAttentionBackend', lambda: MpsAttentionBackend(2))
+    stats = {'actions': {'q01': [-2.] * 4, 'q99': [2.] * 4}}
+    monkeypatch.setattr(pi05, 'load_norm_stats', lambda *args, **kwargs: stats)
+    prompt = small_model.rand(3, 8)
+    monkeypatch.setattr(pi05, '_embed_prompt', lambda *args, **kwargs: (prompt, 3))
+    (tmp_path / 'model.safetensors').touch()
+    (tmp_path / 'config.json').write_text(json.dumps({'action_horizon': 3}))
+    public = load_model(tmp_path, hardware='apple_mps', use_fp8=False,
+                        precision='bf16', num_steps=2, action_dim=3)
+    images = [np.zeros((224, 224, 3), dtype=np.uint8) for _ in range(2)]
+    assert public.predict(images, prompt='pick').shape == (3, 3)
+    frontend = public.pipeline
+    assert frontend.weights['vision_attn_qkv_w'].device.type == 'mps'
+    assert frontend._embedding_weight.device.type == 'cpu'
+    noise = small_model.rand(3, 4)
+    result = frontend.infer({'images': images}, noise=noise.float().numpy(), debug=True)
+    weights = pi05._prepare_weights(dict(source), 2)
+    reference = model.Pi05TorchPipeline(
+        weights, TorchTensorOps(), TorchGemmBackend(), TorchAttentionBackend(2),
+        num_views=2, max_prompt_len=200, chunk_size=3, num_steps=2, device='cpu')
+    expected = reference.forward_with_inputs(
+        torch.full((2, 224, 224, 3), -1., dtype=torch.bfloat16), prompt, 3, noise)
+    np.testing.assert_allclose(result['raw_actions'], expected[0].float().numpy(), rtol=.03, atol=.003)
+    np.testing.assert_allclose(result['actions'],
+                               unnormalize_actions(result['raw_actions'], stats)[:, :3])
+    assert frontend.get_latency_stats()['count'] == 2
+    with pytest.raises(ValueError, match='graphs'):
+        frontend.forward_with_fixed_noise(frontend._image_buf, frontend._noise_buf, use_graph=True)
+
+
 def test_rdna_binding_has_no_model_traversal():
     from flash_rt.amd.models.pi05_rdna35.pipeline import Pi05PipelineRdna35
     assert Pi05PipelineRdna35._vision is model.Pi05TorchPipeline._vision

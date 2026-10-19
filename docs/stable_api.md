@@ -35,7 +35,7 @@ def load_model(
     decode_cuda_graph: bool = False,
     decode_graph_steps: int = 80,
     max_decode_steps: int = 256,
-    hardware: str = "auto",         # "auto" | "thor" | "rtx_sm120" | "rtx_sm89" | "rtx_sm87" | "amd_cdna4" | "amd_rdna35"
+    hardware: str = "auto",         # "auto" | "thor" | "rtx_sm120" | "rtx_sm89" | "rtx_sm87" | "amd_cdna4" | "amd_rdna35" | "apple_mps"
     # GROOT-specific:
     embodiment_tag: str | None = None,
     action_horizon: int | None = None,
@@ -62,7 +62,8 @@ def load_model(
     use_fp8: bool = True,
     # Pi0.5 torch RTX SM120/SM89 opt-in:
     use_fp16: bool = False,
-    # Robot output schema (RDNA Pi0.5 / Jetson Pi):
+    precision: str = "auto",        # Backend-specific: "auto" | "bf16" | "int8" | "fp8"
+    # Robot output schema (Apple/RDNA Pi0.5 / Jetson Pi):
     action_dim: int | None = None,
 ) -> VLAModel
 ```
@@ -70,7 +71,7 @@ def load_model(
 Returns a `VLAModel` wrapping the appropriate frontend for the detected
 (or explicitly specified) GPU architecture.
 
-- `action_dim` declares the robot output width for RDNA Pi0.5 (1..32).
+- `action_dim` declares the robot output width for Apple/RDNA Pi0.5 (1..32).
   If omitted, this backend requires `output_action_dim` in checkpoint
   `config.json`; it never infers padding from constant normalization statistics.
   Constant final action channels are retained. Other existing hardware routes
@@ -137,6 +138,20 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   `calibrate` / `infer` with both `state_prompt_mode` graphs; the RL and
   CFG-batched extensions raise `NotImplementedError`. Build and usage:
   `docs/deployment_amd.md`.
+- `hardware="apple_mps"` (auto-detected on Apple Silicon when MPS is
+  available and CUDA/Ascend are unavailable) supports only `config="pi05"`,
+  `framework="torch"`. Execution is BF16 eager with `precision="auto"` or
+  `precision="bf16"`; the historical `use_fp8=True` default emits a warning
+  and selects BF16. Explicit FP8/INT8 precision, FP4, FP16 and FA4 requests
+  raise. This route requires no CUDA/HIP extension, calibration or graph
+  capture; `autotune` has no effect and `cache_frames` must be 1 (or `None`).
+  It uses exact prompt lengths, so fixed state-prompt graph options raise.
+  Images must be two or three RGB uint8 arrays of shape `(224, 224, 3)`;
+  state supplied to `predict()`/`set_prompt()` must already be normalized
+  with the checkpoint's state statistics. Set `action_dim` or declare
+  `output_action_dim` in checkpoint `config.json`. Setup, real-input smoke
+  results and the limitations of the CPU comparison are documented in
+  [Apple deployment](deployment_apple.md).
 - `use_fp8=False` disables FP8 where the selected frontend exposes a
   BF16 fallback; unsupported frontends ignore it. GROOT N1.7 on RTX/Thor
   is stricter: the default route is FP8, and `use_fp8=False` alone

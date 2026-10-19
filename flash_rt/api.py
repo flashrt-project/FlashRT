@@ -31,8 +31,8 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-# Precision tiers load_model() accepts. Only the Ascend NPU backend interprets
-# anything but "auto" today; see the resolution in load_model for why a generic
+# Precision tiers load_model() accepts. Ascend selects BF16/INT8, and Apple
+# accepts BF16 only; see load_model for why a generic
 # selector cannot simply be bolted on ahead of the other backends' routing.
 _PRECISION_TIERS = ("auto", "bf16", "int8", "fp8")
 
@@ -412,11 +412,12 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
               gfx942 (MI300 series) → ``flash_rt.amd.*`` (CDNA3)
               gfx950 (MI350 series) → ``flash_rt.amd.*`` (CDNA4)
               gfx1151 (Radeon 8060S) → ``flash_rt.amd.*`` (RDNA 3.5 BF16)
+              Apple Silicon        → ``flash_rt.hardware.mps.*`` (experimental Pi0.5 BF16)
             Pass ``"thor"`` / ``"rtx_sm120"`` / ``"rtx_sm89"`` /
             ``"rtx_sm87"`` / ``"amd_cdna3"`` / ``"amd_cdna4"`` /
-            ``"amd_rdna35"`` explicitly to force a specific backend (useful
+            ``"amd_rdna35"`` / ``"apple_mps"`` explicitly to force a backend (useful
             for cross-hardware debugging).
-        action_dim: Explicit robot output dimension for the RDNA Pi0.5 and
+        action_dim: Explicit robot output dimension for the Apple/RDNA Pi0.5 and
             Jetson Pi frontends. RDNA may instead read output_action_dim from
             checkpoint config.json; normalization statistics are not a schema.
         embodiment_tag: GROOT only. Per-embodiment MLP slot to load. Passing
@@ -482,8 +483,9 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         decoder_gate_up_variant: Cutlass NVFP4 decoder Gate+Up GEMM variant
             (production default ``10``).
         precision: Execution tier, one of ``"auto"``, ``"bf16"``, ``"int8"``
-            or ``"fp8"``. **Interpreted by the Ascend NPU backend only**; on
-            every other arch anything but ``"auto"`` raises, because those
+            or ``"fp8"``. Apple MPS accepts ``"auto"`` / ``"bf16"``.
+            Ascend accepts ``"auto"`` / ``"bf16"`` / ``"int8"``. On
+            other architectures anything but ``"auto"`` raises, because those
             backends select their tier through ``use_fp8``/``use_fp4``/
             ``use_fp16`` while the frontend class is being chosen. On Ascend,
             ``"fp8"`` raises (910/A2 parts have no FP8 tensor hardware), and
@@ -719,7 +721,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     # request fails the same way on every machine, including one with no
     # accelerator of that kind installed.
     #
-    # Scope is deliberately the Ascend backend only. The other backends choose
+    # Ascend and Apple interpret named precision tiers. Other backends choose
     # their tier through use_fp8 / use_fp4 / use_fp16, and those are consulted
     # while the frontend class is being chosen, well before this point: a
     # generic tier arriving afterwards could not change the routing it was
@@ -730,6 +732,25 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     if precision not in _PRECISION_TIERS:
         raise ValueError(
             f"precision must be one of {sorted(_PRECISION_TIERS)}, got {precision!r}")
+    if arch == "apple_mps":
+        if precision not in ("auto", "bf16"):
+            raise ValueError("Apple MPS currently supports precision='bf16' only")
+        if (use_fp4 or use_fp16 or use_fa4 or use_fp4_decoder
+                or use_fp4_encoder_attn or use_fp4_siglip_ffn):
+            raise ValueError("Apple MPS supports BF16 only; FP4, FP16 and FA4 options are unavailable")
+        if state_prompt_mode != "exact" or state_prompt_fixed_max_len is not None:
+            raise ValueError("Apple MPS uses eager execution and exact prompt lengths")
+        if cache_frames not in (None, 1):
+            raise ValueError("Apple MPS currently requires cache_frames=1")
+        if use_fp8:
+            logger.warning("Apple MPS uses BF16; disabling the default use_fp8 option")
+        pipe_cls = resolve_pipeline_class(config, framework, arch)
+        kwargs = {"num_views": num_views, "action_dim": action_dim}
+        if num_steps is not None:
+            kwargs["num_steps"] = num_steps
+        # MPS uses torch operators directly and needs no CUDA/HIP extension,
+        # calibration, autotuning, or CUDA graph capture.
+        return VLAModel(pipe_cls(checkpoint, **kwargs), framework)
     if precision != "auto" and arch != "npu":
         raise ValueError(
             f"precision={precision!r} is implemented for the Ascend NPU "

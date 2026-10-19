@@ -13,6 +13,19 @@ Auto-detects GPU (SM110 → Thor backend, SM120 → Blackwell backend) and runs 
 
 ## Hardware-Specific Examples
 
+### Apple Silicon (experimental MPS BF16)
+
+```bash
+python examples/apple/pi05.py \
+    --checkpoint /Volumes/SSD/FlashRT/models/pi05-libero-pytorch \
+    --tokenizer /Volumes/SSD/FlashRT/tokenizers/paligemma_tokenizer.model \
+    --output /Volumes/SSD/FlashRT/runs/apple_mps_pi05 \
+    --cpu-reference
+```
+
+Runs Pi0.5 on real camera/state fixtures and saves fixed-noise actions and
+latency measurements. See [Apple setup and downloads](../docs/deployment_apple.md).
+
 ### Thor (Jetson AGX Thor, SM110)
 
 Run inside Docker container (`<your_container>`):
