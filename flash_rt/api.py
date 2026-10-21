@@ -363,7 +363,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                decoder_gate_up_variant=10,
                attention=None,
                fuse=None,
-               compile_mode=None):
+               compile_mode=None,
+               use_graph=False):
     """Load a FlashRT model.
 
     Args:
@@ -372,6 +373,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             - jax: Orbax checkpoint directory
         framework: "torch" or "jax"
         num_views: number of camera views (default 2)
+        use_graph: opt in to full-model HIP Graph for XR-1 torch/gfx1151.
+            Default False. Captures lazily and rebuilds on metadata changes.
         autotune: CUDA Graph autotune intensity.
             0 or False = off (fastest startup, ~2ms slower inference risk)
             3 = default (Torch finds fast graph on trial 0-1)
@@ -382,7 +385,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         weight_cache: if True (default), cache FP8-quantized weights to disk
             after first load. Only affects JAX.
         config: model config name: "pi05", "pi0", "groot", "groot_n17",
-            "pi0fast", "motus", "dm05", "wan22_ti2v_5b", "cosmos3_video",
+            "pi0fast", "motus", "dm05", "xr1", "wan22_ti2v_5b", "cosmos3_video",
             "cosmos3_edge", "ltx25".
             "ltx25" is the LTX-2.5 22B distilled audio+video generator:
             drive it with set_prompt(...) + infer(...), not predict().
@@ -416,10 +419,12 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             ``"rtx_sm87"`` / ``"amd_cdna3"`` / ``"amd_cdna4"`` /
             ``"amd_rdna35"`` explicitly to force a specific backend (useful
             for cross-hardware debugging).
-        action_dim: Explicit robot output dimension for the RDNA Pi0.5 and
+        action_dim: XR-1 output width (default 7 for RoboCasa, 60 for 5B).
+            Also explicit robot output dimension for the RDNA Pi0.5 and
             Jetson Pi frontends. RDNA may instead read output_action_dim from
             checkpoint config.json; normalization statistics are not a schema.
-        embodiment_tag: GROOT only. Per-embodiment MLP slot to load. Passing
+        embodiment_tag: XR-1 robot normalization entry (defaults to the sole
+            checkpoint entry). For GROOT: Per-embodiment MLP slot to load. Passing
             ``None`` uses the backend default (``"new_embodiment"`` — unfit
             for the base 3B checkpoint demo; see below). The GR00T-N1.6-3B
             base checkpoint is only actually trained on a subset of its 32
@@ -579,6 +584,11 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "Alpamayo15FlashDriveTorchFrontendThor\n"
             "See docs/alpamayo15.md.")
 
+    if not isinstance(use_graph, bool):
+        raise ValueError("use_graph must be a boolean")
+    if use_graph and (config != "xr1" or framework != "torch"):
+        raise ValueError("use_graph=True supports XR-1 torch/gfx1151 only")
+
     if framework == "jetson_pi" and (use_fp4_decoder or use_fa4):
         raise ValueError(
             "use_fp4_decoder/use_fa4 are unsupported with framework="
@@ -610,12 +620,12 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     elif config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
                       "motus", "wan22_ti2v_5b", "cosmos3_video",
                       "cosmos3_edge", "nexn2", "qwen36_moe", "spark_x25",
-                      "hyvla", "ltx25", "dm05"):
+                      "hyvla", "ltx25", "dm05", "xr1"):
         raise ValueError(
             f"Unknown config: {config}. "
             f"Supported: pi05, groot, groot_n17, pi0, pi0fast, motus, "
             f"wan22_ti2v_5b, cosmos3_video, cosmos3_edge, nexn2, "
-            f"qwen36_moe, spark_x25, hyvla, ltx25, dm05")
+            f"qwen36_moe, spark_x25, hyvla, ltx25, dm05, xr1")
     if framework not in ("torch", "jax", "jetson_pi"):
         raise ValueError(
             f"Unknown framework: {framework}. Supported: torch, jax, jetson_pi")
@@ -732,6 +742,14 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     from flash_rt.hardware import detect_arch, resolve_pipeline_class
     arch = detect_arch() if hardware == "auto" else hardware
 
+    if config == "xr1":
+        if (framework, arch) != ("torch", "amd_rdna35"):
+            raise ValueError("XR-1 supports framework='torch', hardware='amd_rdna35' only")
+        if use_fp4 or use_fp16:
+            raise ValueError("XR-1 currently supports BF16 only")
+        if action_horizon is not None:
+            raise ValueError("XR-1 action horizon is defined by the checkpoint processor")
+
     if config == "dm05":
         if (framework, arch) != ("torch", "rtx_sm120"):
             raise ValueError("DM05 supports framework='torch', hardware='rtx_sm120' only")
@@ -784,6 +802,9 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 f"-DGPU_ARCH={'gfx942' if arch == 'amd_cdna3' else 'gfx950'} && "
                 "cmake --build build-amd -j\n"
                 "See docs/deployment_amd.md.") from exc
+    elif arch == "amd_rdna35" and config == "xr1":
+        # XR-1 reference needs no extension; native adapters validate it on load.
+        use_fp8 = False
     elif arch == "amd_rdna35":
         try:
             import flash_rt.amd.flash_rt_amd_kernels  # noqa: F401
@@ -1189,6 +1210,20 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                             ("compile_mode", compile_mode)):
             if value is not None and name in sig.parameters:
                 kwargs[name] = value
+    elif config == "xr1":
+        kwargs["use_fp8"] = False
+        if use_graph:
+            kwargs["use_graph"] = True
+        if num_steps is not None:
+            kwargs["num_steps"] = num_steps
+        if embodiment_tag is not None:
+            kwargs["embodiment_tag"] = embodiment_tag
+        if action_dim is not None:
+            kwargs["action_dim"] = action_dim
+        if attention is not None:
+            kwargs["attention"] = attention
+        if fuse is not None:
+            kwargs["fuse"] = fuse
     elif config == "dm05":
         kwargs["use_fp4"] = _dm05_fp4
         if num_steps is not None:

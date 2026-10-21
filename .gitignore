@@ -54,3 +54,6 @@ ge_check_op.json
 # Local tutorial environments and results
 .reference/
 results/
+
+# XR-1 local runtime environment
+.venv-xr1*/

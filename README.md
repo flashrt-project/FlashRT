@@ -880,6 +880,8 @@ and the expected results. Build times, FA2 slim-build flags and ccache are in
 
 ## Supported Models
 
+- **Xiaomi-Robotics-1** (`config="xr1"`) — gfx1151 BF16 reference and native HIP paths for the published 5B and RoboCasa checkpoints; [installation, inference, and validation](docs/xr1_gfx1151.md).
+
 - **Pi0.5** (`config="pi05"`) — [quickstart](#quick-start), [API reference](USAGE.md#api-reference), [NVFP4 notes](USAGE.md#nvfp4-pi05-only), [Thor example](examples/thor/README.md), [RTX 5090 example](examples/blackwell/README.md)
 - **Pi0** (`config="pi0"`) — [API snippets](#api-snippets), [usage guide](USAGE.md#api-reference)
 - **GROOT N1.6** (`config="groot"`) — [API snippets](#api-snippets), [GROOT embodiment slots](#groot-n16-embodiment-slots)
@@ -916,6 +918,7 @@ have been built and tested, and the dispatch map that selects them.
 |---|---:|---|---|
 | Jetson AGX Thor | SM110 | Production target | Pi0, Pi0.5, GROOT N1.6 and N1.7, Pi0-FAST, LingBot-VLA, Hy-Embodied-0.5-VLA, Alpamayo 1.5 (full request and FlashDrive streaming), Cosmos3-Edge AV / Reasoner, Qwen3.6, and Qwen3-VL BF16 with opt-in W8/W4 decode; reproduction guides for [π0.5](docs/thor/pi05.md) and [GR00T N1.7](docs/thor/groot-n17.md). |
 | RTX 5090 | SM120 | Production target | Pi0/Pi0.5/GROOT/Pi0-FAST RTX paths, Qwen3.6, Qwen3-8B, Qwen3-VL, Higgs Audio v3 FP8, Motus, Wan2.2, Cosmos3-Nano, and HF Kernel Hub package validation; see [RTX 5090 latency](examples/blackwell/README.md#vla-latency-rtx-5090). |
+| AMD Radeon / Ryzen AI Max+ | gfx1151 (RDNA 3.5) | Supported | Pi0.5 BF16 and XR-1 5B/RoboCasa BF16 inference; [XR-1 deployment](docs/xr1_gfx1151.md). |
 | AMD Instinct MI350X | gfx950 (CDNA4) | Supported | Pi0.5 at **16.4 ms** FP8 and GROOT N1.7 at **16.0 ms** full-frame, on a standalone ROCm/HIP backend: hand-written HIP kernels, hipBLASLt FP8 GEMM, MFMA attention, HIP graph capture. Uses the gfx950 source set, checked at build and runtime. See [AMD deployment](docs/deployment_amd.md) and [Pi0.5 on MI350X](docs/deployment_amd_pi05.md). |
 | AMD Instinct MI300X | gfx942 (CDNA3) | Supported | Architecture-specific BF16/FP8 FNUZ kernels and HIP graphs. See [AMD deployment](docs/deployment_amd.md), [π0.5](docs/deployment_amd_pi05.md), and [GR00T N1.7](docs/deployment_amd_groot_n17.md). |
 | Ascend 910B4 | Ascend NPU | Supported | Pi0.5 and GR00T N1.7 backend with native AscendC kernels and NPU graphs. See [π0.5 deployment](docs/deployment_npu.md) and [GR00T N1.7 deployment](docs/deployment_npu_groot_n17.md). |

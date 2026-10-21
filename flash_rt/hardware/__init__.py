@@ -123,6 +123,9 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("dm05", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.dm05_rtx", "Dm05TorchFrontendRtx"),
 
+    ("xr1", "torch", "amd_rdna35"):
+        ("flash_rt.amd.frontends.torch.xr1_rdna35", "XR1TorchFrontendAmdRdna35"),
+
     # ── Pi0.5 ──
     ("pi05", "torch", "thor"):
         ("flash_rt.frontends.torch.pi05_thor", "Pi05TorchFrontendThor"),

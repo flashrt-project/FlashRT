@@ -31,6 +31,7 @@ dependencies = [
 
 [project.optional-dependencies]
 torch = ["torch", "safetensors", "sentencepiece"]
+xr1 = ["transformers==4.57.1", "accelerate", "safetensors", "Pillow", "einops"]
 chameleon = ["torch", "safetensors", "transformers>=4.43,<4.56", "Pillow"]
 jax = ["jax", "jaxlib", "ml_dtypes", "orbax-checkpoint", "flax"]
 server = ["fastapi", "uvicorn"]
@@ -87,4 +88,5 @@ flash_rt = [
     "**/*.yaml", "**/*.model", "**/*.json",
     "**/*.cu", "**/*.cuh", "**/*.cpp", "**/*.h",
     "py.typed",
+    "amd/models/xr1/upstream/LICENSE", "amd/models/xr1/upstream/README.md",
 ]
