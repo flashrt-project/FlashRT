@@ -1,0 +1,147 @@
+{
+  "model_identity": "Qwen/Qwen3-4B",
+  "platform": "thor",
+  "arch": "thor",
+  "specialization": {
+    "seq": 128,
+    "dtype": "bf16"
+  },
+  "weights": "random_shared_state_dict",
+  "cosine_floor": 0.999,
+  "s1": {
+    "cosine_full": 0.9995748400688171,
+    "cosine_last": 0.9995558261871338
+  },
+  "hf_e2e_ms": 82.23512420654296,
+  "candidates": {
+    "default_hf_parity": {
+      "flags": {
+        "use_hf_norm": false,
+        "use_hf_qkn_rope": true,
+        "use_sep_gateup": false,
+        "use_sep_qkv": true,
+        "use_torch_qkv": true,
+        "use_sdpa": true
+      },
+      "e2e_ms": 49.362989044189455,
+      "speedup_vs_hf": 1.6659267560342945,
+      "speedup_vs_default": 1.0,
+      "cosine_full": 0.9995181560516357,
+      "cosine_last": 0.9994390606880188,
+      "cosine_ok": true,
+      "verdict": "baseline"
+    },
+    "all_fvk": {
+      "flags": {
+        "use_hf_norm": false,
+        "use_hf_qkn_rope": false,
+        "use_sep_gateup": false,
+        "use_sep_qkv": false,
+        "use_torch_qkv": false,
+        "use_sdpa": true
+      },
+      "e2e_ms": 40.27205123901367,
+      "speedup_vs_hf": 2.0419899577123464,
+      "speedup_vs_default": 1.225738136635288,
+      "cosine_full": 0.9992172718048096,
+      "cosine_last": 0.9989902377128601,
+      "cosine_ok": true,
+      "verdict": "accepted"
+    },
+    "fvk_qkn_rope": {
+      "flags": {
+        "use_hf_norm": false,
+        "use_hf_qkn_rope": false,
+        "use_sep_gateup": false,
+        "use_sep_qkv": true,
+        "use_torch_qkv": true,
+        "use_sdpa": true
+      },
+      "e2e_ms": 41.741824340820315,
+      "speedup_vs_hf": 1.9700893649280034,
+      "speedup_vs_default": 1.1825786204537356,
+      "cosine_full": 0.9992178678512573,
+      "cosine_last": 0.9990229606628418,
+      "cosine_ok": true,
+      "verdict": "accepted"
+    },
+    "fused_qkv": {
+      "flags": {
+        "use_hf_norm": false,
+        "use_hf_qkn_rope": true,
+        "use_sep_gateup": false,
+        "use_sep_qkv": false,
+        "use_torch_qkv": false,
+        "use_sdpa": true
+      },
+      "e2e_ms": 48.33975067138672,
+      "speedup_vs_hf": 1.7011904915599743,
+      "speedup_vs_default": 1.0211676386119304,
+      "cosine_full": 0.9994432926177979,
+      "cosine_last": 0.9993153214454651,
+      "cosine_ok": true,
+      "verdict": "accepted"
+    }
+  },
+  "kernel_flags": {
+    "use_hf_norm": false,
+    "use_hf_qkn_rope": true,
+    "use_sep_gateup": false,
+    "use_sep_qkv": true,
+    "use_torch_qkv": true,
+    "use_sdpa": true
+  },
+  "provenance": {
+    "selected": "default_hf_parity",
+    "reason": "user chose default for precision (S=800 all_fvk fails 0.999 cosine floor)",
+    "notes": "Thor: use_sdpa=True (no FA2). Random shared weights vs HF."
+  },
+  "elapsed_sec": 70.313405752182,
+  "default_summary": {
+    "model": "Qwen/Qwen3-4B (dense CausalLM, NOT Qwen3.5)",
+    "geometry": "H=2560 L=36 GQA 32q/8kv hd=128 inter=9728 BF16",
+    "flags": {
+      "use_hf_norm": false,
+      "use_hf_qkn_rope": true,
+      "use_sep_gateup": false,
+      "use_sep_qkv": true,
+      "use_torch_qkv": true,
+      "use_sdpa": true
+    },
+    "precision": {
+      "S8": {
+        "cos_full": 0.999561,
+        "cos_last": 0.999544,
+        "max_abs": 0.1465,
+        "mean_abs": 0.023801,
+        "gate": "PASS"
+      },
+      "S128": {
+        "cos_full": 0.999518,
+        "cos_last": 0.999439,
+        "max_abs": 0.1914,
+        "mean_abs": 0.024961,
+        "gate": "PASS"
+      },
+      "S800": {
+        "cos_full": 0.999386,
+        "cos_last": 0.999243,
+        "max_abs": 0.2344,
+        "mean_abs": 0.028162,
+        "gate": "PASS"
+      }
+    },
+    "latency_e2e_ms": {
+      "S128": {
+        "hf": 69.785,
+        "flashrt_default": 49.621,
+        "speedup": 1.41
+      },
+      "S800": {
+        "hf": 138.035,
+        "flashrt_default": 118.062,
+        "speedup": 1.17
+      }
+    }
+  }
+}

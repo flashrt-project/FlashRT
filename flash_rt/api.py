@@ -610,12 +610,12 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     elif config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
                       "motus", "wan22_ti2v_5b", "cosmos3_video",
                       "cosmos3_edge", "nexn2", "qwen36_moe", "spark_x25",
-                      "hyvla", "ltx25", "dm05"):
+                      "hyvla", "ltx25", "dm05", "qwen3_4b"):
         raise ValueError(
             f"Unknown config: {config}. "
             f"Supported: pi05, groot, groot_n17, pi0, pi0fast, motus, "
             f"wan22_ti2v_5b, cosmos3_video, cosmos3_edge, nexn2, "
-            f"qwen36_moe, spark_x25, hyvla, ltx25, dm05")
+            f"qwen36_moe, spark_x25, hyvla, ltx25, dm05, qwen3_4b")
     if framework not in ("torch", "jax", "jetson_pi"):
         raise ValueError(
             f"Unknown framework: {framework}. Supported: torch, jax, jetson_pi")
@@ -728,6 +728,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "    from flash_rt.frontends.torch.spark_x25_rtx import "
             "SparkX25TorchFrontendRtx\n"
             "See docs/spark_x25_usage.md.")
+    if config == "qwen3_4b":
+        raise NotImplementedError(
+            "config='qwen3_4b' is a text LLM and is not served through "
+            "load_model's VLA wrapper. Construct it directly:\n"
+            "    from flash_rt.frontends.torch.qwen3_4b_rtx import "
+            "Qwen3_4BTorchFrontendRtx\n"
+            "See docs/qwen3_4b_bf16.md and docs/qwen3_4b_thor.md.")
 
     from flash_rt.hardware import detect_arch, resolve_pipeline_class
     arch = detect_arch() if hardware == "auto" else hardware

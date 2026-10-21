@@ -65,6 +65,33 @@ class Qwen3Dims:
     rms_norm_eps: float = 1e-6
 
 
+@dataclass
+class Qwen3_4BDims:
+    """Static dim contract for HuggingFace Qwen/Qwen3-4B (dense BF16).
+
+    Matches https://huggingface.co/Qwen/Qwen3-4B — same GQA geometry as
+    Qwen3-8B (32q/8kv/hd=128) but hidden=2560 / intermediate=9728.
+    Used by the BF16 text frontend ``Qwen3_4BTorchFrontendRtx``.
+    """
+
+    # Top-level
+    hidden: int = 2560
+    num_layers: int = 36
+    vocab_size: int = 151_936
+    intermediate: int = 9728
+
+    # Attention
+    num_q_heads: int = 32
+    num_kv_heads: int = 8           # GQA 4:1
+    head_dim: int = 128
+    rotary_dim: int = 128           # full RoPE (rotary_dim == head_dim)
+    rope_theta: float = 1_000_000.0
+    max_pos: int = 32_768
+
+    # Norm
+    rms_norm_eps: float = 1e-6
+
+
 class Qwen3Pipeline:
     """Framework-agnostic Qwen3 pipeline placeholder.
 
