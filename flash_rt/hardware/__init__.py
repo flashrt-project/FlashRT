@@ -220,6 +220,19 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("cosmos3_video", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.cosmos3_video_rtx", "Cosmos3VideoTorchFrontendRtx"),
 
+    # ── Qwen3-4B dense text (HuggingFace Qwen/Qwen3-4B, BF16) ──
+    # Text LLM surface (forward_prefill -> logits), not VLA. Used for HF
+    # cosine parity and BF16 inference. Same semantic frontend on SM89 /
+    # SM120 / Thor: RTX uses FA2 via RtxFlashAttnBackendQwen3; Thor (no
+    # FA2) auto-selects SDPA and allocates via ThorAttnBackendQwen3.
+    # See docs/qwen3_4b_bf16.md and docs/qwen3_4b_thor.md.
+    ("qwen3_4b", "torch", "rtx_sm120"):
+        ("flash_rt.frontends.torch.qwen3_4b_rtx", "Qwen3_4BTorchFrontendRtx"),
+    ("qwen3_4b", "torch", "rtx_sm89"):
+        ("flash_rt.frontends.torch.qwen3_4b_rtx", "Qwen3_4BTorchFrontendRtx"),
+    ("qwen3_4b", "torch", "thor"):
+        ("flash_rt.frontends.torch.qwen3_4b_rtx", "Qwen3_4BTorchFrontendRtx"),
+
     # ── Qwen3-VL (multimodal Qwen3-VL-8B, NVFP4 + FP8 paths) ──
     # VLM with chat-style API (generate(messages) -> str), not VLA
     # predict(images). Requires the gated kernel build
