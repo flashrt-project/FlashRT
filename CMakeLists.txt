@@ -1533,6 +1533,43 @@ else()
   message(STATUS "Spark-X2.5-4B kernels: DISABLED (set FLASHRT_ENABLE_SPARK_X25=ON on sm_120)")
 endif()
 
+# ── Flint (RecursiveSI/flint) official NVFP4 W4A16 kernels ──
+# Separate module so iterating on the model kernels never rebuilds the shared
+# library. sm_120 only: the decode kernels use the e2m1/e4m3 hardware converts
+# and BF16 mma.sync, and their tiles are sized for the RTX shared-memory budget.
+# Compiled without fast-math on purpose: the softmax/sigmoid/SiLU rounding
+# contract uses IEEE division and precise expf (see docs/flint_usage.md).
+option(FLASHRT_ENABLE_FLINT "Build Flint SM120 NVFP4 W4A16 model kernels" OFF)
+if(FLASHRT_ENABLE_FLINT AND NOT GPU_ARCH STREQUAL "120")
+  message(FATAL_ERROR "FLASHRT_ENABLE_FLINT requires GPU_ARCH=120")
+endif()
+if(FLASHRT_ENABLE_FLINT)
+  pybind11_add_module(flash_rt_flint
+    csrc/flint_bindings.cpp
+    csrc/kernels/flint/flint_repack.cu
+    csrc/kernels/flint/flint_decode.cu
+    csrc/kernels/flint/flint_attention.cu
+    csrc/kernels/flint/flint_gemm.cu
+    csrc/kernels/flint/flint_prefill.cu)
+  set_target_properties(flash_rt_flint PROPERTIES
+    CUDA_STANDARD 17
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+  target_include_directories(flash_rt_flint PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels)
+  target_compile_options(flash_rt_flint PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3
+      ${GPU_GENCODE}
+    >)
+  target_link_libraries(flash_rt_flint PRIVATE CUDA::cudart)
+  install(TARGETS flash_rt_flint LIBRARY DESTINATION flash_rt)
+  message(STATUS "Flint kernels: ENABLED (separate module flash_rt_flint)")
+else()
+  message(STATUS "Flint kernels: DISABLED (set FLASHRT_ENABLE_FLINT=ON on sm_120)")
+endif()
+
 if(FLASHRT_BUILD_QWEN3_VL)
   # SM120 (RTX 5090): NVFP4/FP8 ViT helpers. SM89 (Ada): native FP8 block-128
   # GEMM/GEMV + fused act/norm-quant + QK norm-rope kernels for the official
