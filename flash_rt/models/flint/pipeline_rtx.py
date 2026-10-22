@@ -293,7 +293,7 @@ class FlintRuntime:
         self.full_attn_warps = 8
         # (pos upper bound, attention splits, attention warps, (qkv rows, qkv warps, o rows, o warps)):
         # the wider GEMV shapes win below ~48K context and lose at 100K (measured A/B/A).
-        g_short, g_long = (4, 8, 2, 8), (4, 4, 2, 4)
+        g_short, g_long = (4, 8, 2, 8), (8, 4, 4, 4)
         self.attn_buckets = ((512, 1, 4, g_short), (12288, 8, 8, g_short), (49152, 16, 8, g_short),
                              (1 << 30, 16, 8, g_long))
         import os as _os

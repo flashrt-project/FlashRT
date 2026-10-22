@@ -38,6 +38,7 @@ __device__ __forceinline__ void norm_prologue(const uint16_t* __restrict__ x, co
                                               uint16_t* __restrict__ xs, float* __restrict__ red) {
   constexpr int PER = kH / THREADS;      // values per thread (multiple of 8)
   constexpr int NV = PER / 8;
+  static_assert(PER % 8 == 0 && NV > 0, "norm_prologue: kH must be a multiple of 8 * THREADS (at most 256 threads)");
   const int tid = threadIdx.x;
   float s[PER];
 #pragma unroll
@@ -265,7 +266,7 @@ void add_rmsnorm_pdl_bf16(const void* x, const void* res_in, const float* w, flo
 // ---------------------------------------------------------------------------
 // Launch shapes of the MoE decode kernels (selected at runtime from a measured search).
 // ---------------------------------------------------------------------------
-static MoeLaunchConfig g_moe_cfg = {8, 1, 4, 1, 4, 4};   // measured shape search (trio -9%)
+static MoeLaunchConfig g_moe_cfg = {8, 1, 8, 1, 8, 4};   // RTX 5090 decode shape search
 
 void set_moe_launch_config(const MoeLaunchConfig& c) { g_moe_cfg = c; }
 MoeLaunchConfig get_moe_launch_config() { return g_moe_cfg; }
@@ -482,6 +483,7 @@ void moe_gate_up_pdl_bf16(const void* xn, const int* ids, const void* ecodes, co
     return;                                                                                                      \
   }
   FLINT_GU(8, 2) FLINT_GU(8, 1) FLINT_GU(4, 2) FLINT_GU(4, 1) FLINT_GU(4, 4) FLINT_GU(8, 4) FLINT_GU(2, 2) FLINT_GU(2, 4)
+  FLINT_GU(16, 1) FLINT_GU(16, 2)
 #undef FLINT_GU
   launch_pdl(moe_gate_up_pdl_kernel<8, 2>, dim3((kTop * kEI + kSI) / 16), dim3(256), 0, s, static_cast<const uint16_t*>(xn),
              ids, static_cast<const uint8_t*>(ecodes), static_cast<const uint8_t*>(escales), egs,
@@ -603,6 +605,7 @@ void moe_down_combine_pdl_bf16(const void* act, const int* ids, const float* tw,
     return;                                                                                                      \
   }
   FLINT_DN(8, 2) FLINT_DN(8, 1) FLINT_DN(4, 2) FLINT_DN(4, 1) FLINT_DN(4, 4) FLINT_DN(8, 4) FLINT_DN(2, 2) FLINT_DN(2, 4)
+  FLINT_DN(16, 1) FLINT_DN(16, 2) FLINT_DN(16, 4) FLINT_DN(8, 8)
 #undef FLINT_DN
   launch_pdl(moe_down_combine_pdl_kernel<8, 2>, dim3(kH / 16), dim3(256), 0, s, static_cast<const uint16_t*>(act), ids, tw,
              static_cast<const uint8_t*>(ecodes), static_cast<const uint8_t*>(escales), egs,
