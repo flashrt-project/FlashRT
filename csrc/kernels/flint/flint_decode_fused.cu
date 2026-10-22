@@ -746,6 +746,105 @@ void moe_down_combine2_bf16(const void* act, const int* ids, const float* tw, co
 }
 
 // ---------------------------------------------------------------------------
+// MoE down + combine, lane-grouped layout: one warp per output row; lanes 4j..4j+3
+// cover routed expert j's 512 inputs (64 B of codes each), lanes 24..31 the shared
+// expert's 1024 inputs. All seven partial sums reduce together in 2-3 shuffle
+// steps instead of seven full warp reductions. Weights (and the final ids) are
+// loaded before pdl_wait, as in moe_down_combine2.
+// ---------------------------------------------------------------------------
+template <int WARPS, int RPW>
+__global__ void __launch_bounds__(WARPS * 32)
+moe_down_combine3_kernel(const uint16_t* __restrict__ act, const int* __restrict__ ids, const float* __restrict__ tw,
+                         const uint8_t* __restrict__ ecodes, const uint8_t* __restrict__ escales,
+                         const float* __restrict__ egs, const uint8_t* __restrict__ scodes,
+                         const uint8_t* __restrict__ sscales, float sgs, uint16_t* __restrict__ out) {
+  constexpr int kAct = kTop * kEI + kSI;
+  __shared__ __align__(16) uint16_t xs[kAct];
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int n0 = (blockIdx.x * WARPS + warp) * RPW;
+  const bool shared_lane = lane >= 24;
+  const int j = lane >> 2;                       // expert slot for routed lanes
+  const int seg = shared_lane ? (lane - 24) : (lane & 3);
+  const int e = shared_lane ? 0 : __ldcg(ids + j);
+  // codes: routed row = 256 B (4 lanes x 64 B), shared row = 512 B (8 lanes x 64 B); scales 32 / 64 B
+  const uint8_t* cbase = shared_lane ? scodes : ecodes + static_cast<size_t>(e) * kH * 256;
+  const uint8_t* sbase = shared_lane ? sscales : escales + static_cast<size_t>(e) * kH * 32;
+  const int crow = shared_lane ? 512 : 256, srow = shared_lane ? 64 : 32;
+  uint4 wv[RPW][4];
+  uint2 sv[RPW];
+#pragma unroll
+  for (int r = 0; r < RPW; ++r) {
+    const uint8_t* cp = cbase + static_cast<size_t>(n0 + r) * crow + seg * 64;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) wv[r][q] = ldg_nc_v4(cp + 16 * q);
+    sv[r] = ldg_nc_v2(sbase + static_cast<size_t>(n0 + r) * srow + seg * 8);
+  }
+  pdl_wait();
+  for (int i = threadIdx.x; i < kAct / 8; i += WARPS * 32)
+    reinterpret_cast<uint4*>(xs)[i] = reinterpret_cast<const uint4*>(act)[i];
+  __syncthreads();
+  pdl_launch();
+  // this lane's 128 activations: routed slot j elements [128*seg, +128), shared [3072 + 128*seg, +128)
+  const uint16_t* xp0 = xs + (shared_lane ? (kTop * kEI) : (j * kEI)) + seg * 128;
+  const float gsv = shared_lane ? sgs : egs[e];
+  float twj[kTop];
+#pragma unroll
+  for (int jj = 0; jj < kTop; ++jj) twj[jj] = tw[jj];
+  float res_r[RPW];
+#pragma unroll
+  for (int r = 0; r < RPW; ++r) {
+    float acc = 0.f;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {       // 32 elements per uint4 of codes, 2 scale bytes
+      const uint4* xq = reinterpret_cast<const uint4*>(xp0 + 32 * q);
+      const uint4 x0 = xq[0], x1 = xq[1], x2 = xq[2], x3 = xq[3];
+      const uint32_t xa[4] = {x0.x, x0.y, x0.z, x0.w}, xb[4] = {x1.x, x1.y, x1.z, x1.w};
+      const uint32_t xc[4] = {x2.x, x2.y, x2.z, x2.w}, xd[4] = {x3.x, x3.y, x3.z, x3.w};
+      const uint32_t sb = (q < 2 ? sv[r].x : sv[r].y) >> (16 * (q & 1));
+      const uint32_t s0 = e4m3_to_f16x2(sb & 0xff), s1 = e4m3_to_f16x2((sb >> 8) & 0xff);
+      acc = dot8_e2m1_bf16(wv[r][q].x, s0, xa, acc);
+      acc = dot8_e2m1_bf16(wv[r][q].y, s0, xb, acc);
+      acc = dot8_e2m1_bf16(wv[r][q].z, s1, xc, acc);
+      acc = dot8_e2m1_bf16(wv[r][q].w, s1, xd, acc);
+    }
+    // reduce within the 4-lane (routed) / 8-lane (shared) group
+    acc += __shfl_xor_sync(0xffffffffu, acc, 1);
+    acc += __shfl_xor_sync(0xffffffffu, acc, 2);
+    const float acc4 = __shfl_xor_sync(0xffffffffu, acc, 4);
+    if (shared_lane) acc += acc4;      // lanes 24..31: full 8-lane sum
+    // y = bf16(acc * gs); routed = sum_j tw_j * y_j with the same fmaf chain (slot order) as the reference rule
+    const float yv = round_bf16(acc * gsv);
+    float routed = 0.f;
+#pragma unroll
+    for (int jj = 0; jj < kTop; ++jj) routed = fmaf(twj[jj], __shfl_sync(0xffffffffu, yv, 4 * jj), routed);
+    const float shv = __shfl_sync(0xffffffffu, yv, 24);
+    res_r[r] = round_bf16(routed) + shv;
+  }
+  if (lane == 0) {
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) out[n0 + r] = f32_to_bf16_bits(res_r[r]);
+  }
+}
+
+void moe_down_combine3_bf16(const void* act, const int* ids, const float* tw, const void* ecodes, const void* escales,
+                            const float* egs, const void* scodes, const void* sscales, float sgs, void* out,
+                            int warps, int rows, cudaStream_t s) {
+#define FLINT_DN3(WW, RR)                                                                                        \
+  if (warps == WW && rows == RR) {                                                                               \
+    launch_pdl(moe_down_combine3_kernel<WW, RR>, dim3(kH / (WW * RR)), dim3(WW * 32), 0, s,                       \
+               static_cast<const uint16_t*>(act), ids, tw, static_cast<const uint8_t*>(ecodes),                    \
+               static_cast<const uint8_t*>(escales), egs, static_cast<const uint8_t*>(scodes),                     \
+               static_cast<const uint8_t*>(sscales), sgs, static_cast<uint16_t*>(out));                            \
+    return;                                                                                                      \
+  }
+  FLINT_DN3(4, 1) FLINT_DN3(4, 2) FLINT_DN3(4, 4) FLINT_DN3(8, 1) FLINT_DN3(8, 2) FLINT_DN3(2, 4) FLINT_DN3(8, 4)
+#undef FLINT_DN3
+  launch_pdl(moe_down_combine3_kernel<4, 2>, dim3(kH / 8), dim3(128), 0, s, static_cast<const uint16_t*>(act), ids, tw,
+             static_cast<const uint8_t*>(ecodes), static_cast<const uint8_t*>(escales), egs,
+             static_cast<const uint8_t*>(scodes), static_cast<const uint8_t*>(sscales), sgs, static_cast<uint16_t*>(out));
+}
+
+// ---------------------------------------------------------------------------
 // Embedding at the device position (PDL).
 // ---------------------------------------------------------------------------
 __global__ void embed2_kernel(const int* __restrict__ tokens, const int* __restrict__ pos,

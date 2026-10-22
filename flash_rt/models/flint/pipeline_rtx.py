@@ -66,6 +66,8 @@ class _Layer:
     sh_gate_up: Optional[_Mat] = None
     sh_down: Optional[_Mat] = None
     cache: object = None
+    pf_ranges: object = None
+    pf_n: int = 0
 
 
 class FlintRuntime:
@@ -282,6 +284,19 @@ class FlintRuntime:
         import os as _os
         self.l2_warm = _os.environ.get("FLINT_L2WARM", "0") == "1"   # bulk L2 warm-up of MoE down weights: measured negative, off
         self.router_shared = _os.environ.get("FLINT_ROUTER_SHARED", "0") == "1"   # router+shared fusion: measured +4%, off
+        # L2 warm-up of each layer's o_proj/router/shared-expert weights from the attention kernel when the
+        # attention moves little data (sliding layers; global layers in short-context buckets).
+        self.attn_l2_prefetch = _os.environ.get("FLINT_ATTN_PF", "1") != "0"
+        self.attn_pf_max_splits = 8
+        for L in self.layers:
+            rng = []
+            for t in (L.o.codes, L.o.scales):
+                rng += [t.data_ptr(), t.numel()]
+            if L.router is not None:
+                for t in (L.router, L.sh_gate_up.codes, L.sh_gate_up.scales, L.sh_down.codes, L.sh_down.scales):
+                    rng += [t.data_ptr(), t.numel() * t.element_size()]
+            L.pf_ranges = torch.tensor(rng, dtype=torch.int64, device=self.dev)
+            L.pf_n = len(rng) // 2
         self.attn_buckets = ((512, 1, 4), (12288, 8, 8), (1 << 30, 16, 8))   # (pos upper bound, splits, warps)
         # Prefill (chunk of up to prefill_chunk tokens).
         C, T = self.prefill_chunk, cfg.num_experts_per_tok
@@ -482,6 +497,7 @@ class FlintRuntime:
                            self.qkv_buf.data_ptr(), q.rows, q.k, q.gs, 0, s)
             site += 1
             ring = self.ring if L.sliding else 0
+            pf = self.attn_l2_prefetch and (L.sliding or splits <= self.attn_pf_max_splits) and L.pf_n > 0
             fl.decode_attention_fused_bf16(self.qkv_buf.data_ptr(), L.q_norm.data_ptr(), L.k_norm.data_ptr(),
                                            self.rope_cos.data_ptr(), self.rope_sin.data_ptr(), self.pos.data_ptr(),
                                            L.cache.data_ptr(), ring, cfg.sliding_window if L.sliding else 0,
@@ -489,7 +505,8 @@ class FlintRuntime:
                                            (self.swa_attn[0] if L.sliding else splits), self.o_part.data_ptr(),
                                            self.ml_part.data_ptr(), self.attn_counters.data_ptr(),
                                            self.attn_out.data_ptr(), s,
-                                           self.swa_attn[1] if L.sliding else full_warps)
+                                           self.swa_attn[1] if L.sliding else full_warps,
+                                           L.pf_ranges.data_ptr() if pf else 0, L.pf_n if pf else 0)
             o = L.o
             fl.gemv2_w4a16(o.codes.data_ptr(), o.scales.data_ptr(), self.attn_out.data_ptr(), 0, 0, 0, 0, eps,
                            self.x_attn.data_ptr(), o.rows, o.k, o.gs, 0, s)

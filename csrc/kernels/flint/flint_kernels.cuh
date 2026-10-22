@@ -99,12 +99,17 @@ void moe_gate_up2_bf16(const void* xn, const int* ids, const void* ecodes, const
 void moe_down_combine2_bf16(const void* act, const int* ids, const float* tw, const void* ecodes, const void* escales,
                             const float* egs, const void* scodes, const void* sscales, float sgs, void* out,
                             cudaStream_t s);
+// Lane-grouped down/combine (one warp per output row; 4 lanes per routed expert, 8 for the shared expert).
+void moe_down_combine3_bf16(const void* act, const int* ids, const float* tw, const void* ecodes, const void* escales,
+                            const float* egs, const void* scodes, const void* sscales, float sgs, void* out,
+                            int warps, int rows, cudaStream_t s);
 void embed2_bf16(const int* tokens, const int* pos, const void* table, void* out, cudaStream_t s);
 // warps in {4, 8, 16}; returns non-zero for an unsupported warp count.
 int decode_attention_fused_bf16(const void* qkv, const float* q_norm_w, const float* k_norm_w, const float* cos_t,
                                 const float* sin_t, const int* pos, void* cache, int ring, int window, int rope,
                                 float eps, const float* sinks, float scale, int n_split, int warps, float* o_part,
-                                float* ml_part, unsigned* counters, void* out, cudaStream_t s);
+                                float* ml_part, unsigned* counters, void* out, cudaStream_t s,
+                                const unsigned long long* pf_ranges = nullptr, int n_pf = 0);
 
 }  // namespace flint
 }  // namespace flash_rt

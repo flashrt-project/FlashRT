@@ -579,3 +579,22 @@ def test_router_shared_matches_separate():
         assert ctr.item() == 0
     for a, b in zip(outs[0], outs[1]):
         assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize("warps,rows", [(4, 1), (4, 2), (8, 2)])
+def test_down_combine3_matches_v2(warps, rows):
+    torch.manual_seed(11)
+    E, H = 256, 2048
+    d_c, d_s = repack_dev(rand_blocks(E * H, 512, 80))
+    sh_c, sh_s = repack_dev(rand_blocks(H, 1024, 81))
+    egs = torch.rand(E, device=DEV) * 1e-3 + 1e-4
+    act = bf16(torch.randn(4096, device=DEV))
+    ids = torch.tensor([17, 200, 3, 255, 128, 64], dtype=torch.int32, device=DEV)
+    tw = bf16(torch.rand(6, device=DEV) / 3).float()
+    a = torch.empty(H, dtype=torch.bfloat16, device=DEV); b = torch.empty_like(a)
+    fl.moe_down_combine2_bf16(act.data_ptr(), ids.data_ptr(), tw.data_ptr(), d_c.data_ptr(), d_s.data_ptr(), egs.data_ptr(),
+                              sh_c.data_ptr(), sh_s.data_ptr(), 9e-4, a.data_ptr(), _stream())
+    fl.moe_down_combine3_bf16(act.data_ptr(), ids.data_ptr(), tw.data_ptr(), d_c.data_ptr(), d_s.data_ptr(), egs.data_ptr(),
+                              sh_c.data_ptr(), sh_s.data_ptr(), 9e-4, b.data_ptr(), warps, rows, _stream())
+    assert _frac_equal(a, b) > 0.99
+    close_bf16(b, a.double(), "down3", rel=2.0 ** -7)

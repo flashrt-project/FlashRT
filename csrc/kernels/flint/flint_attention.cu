@@ -234,7 +234,8 @@ decode_attn_fused_kernel(const uint16_t* __restrict__ qkv, const float* __restri
                          const float* __restrict__ cos_t, const float* __restrict__ sin_t, const int* __restrict__ pos_p,
                          uint16_t* __restrict__ cache, int ring, int window, int rope, float eps,
                          const float* __restrict__ sinks, float scale, float* __restrict__ o_part,
-                         float* __restrict__ ml_part, unsigned* __restrict__ counters, uint16_t* __restrict__ out) {
+                         float* __restrict__ ml_part, unsigned* __restrict__ counters, uint16_t* __restrict__ out,
+                         const unsigned long long* __restrict__ pf_ranges, int n_pf) {
   constexpr int NT = WARPS * 32;
   constexpr int DPT = (kGroup * kD) / NT;          // output dims per thread in the merges
   constexpr int TPH = kD / DPT;                    // threads per head
@@ -295,6 +296,18 @@ decode_attn_fused_kernel(const uint16_t* __restrict__ qkv, const float* __restri
   const int tile0 = b0 + warp * 16;
   bool have = false;
   if (tile0 < b1 && tile0 + 16 <= pos) { load_tile(tile0); have = true; }
+  // Optional L2 warm-up of the layer's upcoming static weights (o_proj, router, shared expert):
+  // this kernel moves little data on short windows, so HBM is otherwise idle here.
+  if (threadIdx.x < n_pf) {
+    const unsigned long long base = pf_ranges[2 * threadIdx.x], bytes = pf_ranges[2 * threadIdx.x + 1];
+    const unsigned nblk = gridDim.x * gridDim.y, bid = blockIdx.y * gridDim.x + blockIdx.x;
+    const unsigned long long sl = ((bytes / nblk) + 15) & ~15ull;
+    const unsigned long long off = sl * bid;
+    if (off < bytes) {
+      const unsigned long long len = (off + sl <= bytes ? sl : bytes - off) & ~15ull;
+      if (len) prefetch_l2_bulk(reinterpret_cast<const void*>(base + off), static_cast<uint32_t>(len));
+    }
+  }
 
   pdl_wait();
 
@@ -464,7 +477,7 @@ template <int WARPS>
 static void launch_attn_fused(const void* qkv, const float* qw, const float* kw, const float* cos_t, const float* sin_t,
                               const int* pos, void* cache, int ring, int window, int rope, float eps, const float* sinks,
                               float scale, int n_split, float* o_part, float* ml_part, unsigned* counters, void* out,
-                              cudaStream_t s) {
+                              cudaStream_t s, const unsigned long long* pf_ranges, int n_pf) {
   constexpr size_t smem = kGroup * kD * 2 + WARPS * kGroup * kD * 4 + 2 * WARPS * kGroup * 4;
   static bool init = false;
   if (!init) {
@@ -473,17 +486,18 @@ static void launch_attn_fused(const void* qkv, const float* qw, const float* kw,
   }
   launch_pdl(decode_attn_fused_kernel<WARPS>, dim3(n_split, 4), dim3(WARPS * 32), smem, s,
              static_cast<const uint16_t*>(qkv), qw, kw, cos_t, sin_t, pos, static_cast<uint16_t*>(cache), ring, window,
-             rope, eps, sinks, scale, o_part, ml_part, counters, static_cast<uint16_t*>(out));
+             rope, eps, sinks, scale, o_part, ml_part, counters, static_cast<uint16_t*>(out), pf_ranges, n_pf);
 }
 
 int decode_attention_fused_bf16(const void* qkv, const float* q_norm_w, const float* k_norm_w, const float* cos_t,
                                 const float* sin_t, const int* pos, void* cache, int ring, int window, int rope,
                                 float eps, const float* sinks, float scale, int n_split, int warps, float* o_part,
-                                float* ml_part, unsigned* counters, void* out, cudaStream_t s) {
+                                float* ml_part, unsigned* counters, void* out, cudaStream_t s,
+                                const unsigned long long* pf_ranges, int n_pf) {
 #define FLINT_ATTN_W(W)                                                                                              \
   if (warps == W) {                                                                                                  \
     launch_attn_fused<W>(qkv, q_norm_w, k_norm_w, cos_t, sin_t, pos, cache, ring, window, rope, eps, sinks, scale,  \
-                         n_split, o_part, ml_part, counters, out, s);                                                \
+                         n_split, o_part, ml_part, counters, out, s, pf_ranges, n_pf);                               \
     return 0;                                                                                                        \
   }
   FLINT_ATTN_W(4)
