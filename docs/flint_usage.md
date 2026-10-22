@@ -193,25 +193,26 @@ at ubatch 2048, generation of 128 tokens at a populated KV depth. FlashRT
 figures are the forward path on real prompts of the stated length: prefill is
 GPU time from the first token to the first generated token; decode is the
 steady CUDA-graph step including the LM head and on-device argmax, over 256
-generated tokens after that prompt. FlashRT figures are medians of three
-processes run interleaved with the previous FlashRT build in one session; the
-llama.cpp figures come from a separate `llama-bench` sweep on the same machine.
+generated tokens after that prompt. FlashRT figures are medians of six
+measurements (three processes x two repetitions) run interleaved with an earlier
+FlashRT build in one session; the llama.cpp figures come from a separate
+`llama-bench` sweep on the same machine.
 
 | context | prefill | llama.cpp | | decode | llama.cpp | |
 |---:|---:|---:|---:|---:|---:|---:|
-| 58 | **11.0 ms** | | | **680 tok/s** | 245.5 | 2.8x |
-| 1 K | **41.0 ms** | 102.8 ms | 2.5x | **681 tok/s** | 238.5 | 2.9x |
-| 4 K | **132 ms** | 341 ms | 2.6x | **627 tok/s** | 228.4 | 2.7x |
-| 8 K | **271 ms** | 690 ms | 2.5x | **604 tok/s** | 226.8 | 2.7x |
-| 16 K | **643 ms** | 1445 ms | 2.2x | **554 tok/s** | 218.5 | 2.5x |
-| 32 K | **1.62 s** | 3.18 s | 2.0x | **479 tok/s** | 205.1 | 2.3x |
-| 64 K | **4.57 s** | 7.59 s | 1.7x | **374 tok/s** | 182.3 | 2.1x |
-| 100 K | **9.15 s** | 14.04 s | 1.5x | **308 tok/s** | 162.7 | 1.9x |
+| 58 | **10.9 ms** | | | **679 tok/s** | 245.5 | 2.8x |
+| 1 K | **40.8 ms** | 102.8 ms | 2.5x | **680 tok/s** | 238.5 | 2.9x |
+| 4 K | **131 ms** | 341 ms | 2.6x | **616 tok/s** | 228.4 | 2.7x |
+| 8 K | **267 ms** | 690 ms | 2.6x | **587 tok/s** | 226.8 | 2.6x |
+| 16 K | **634 ms** | 1445 ms | 2.3x | **554 tok/s** | 218.5 | 2.5x |
+| 32 K | **1.60 s** | 3.18 s | 2.0x | **479 tok/s** | 205.1 | 2.3x |
+| 64 K | **4.52 s** | 7.59 s | 1.7x | **374 tok/s** | 182.3 | 2.1x |
+| 100 K | **9.07 s** | 14.04 s | 1.5x | **308 tok/s** | 162.7 | 1.9x |
 
 Decode at 4 K and 8 K settles at one of two levels about 3% apart from one
-process to the next (identical output tokens; e.g. 1.58 or 1.62 ms per token at
-4 K); other depths vary by under 1%. The table is the interleaved median. Where
-the time goes:
+process to the next (identical output tokens: 1.58 or 1.62 ms per token at 4 K,
+1.655 or 1.70 ms at 8 K); in the run above both medians sit on the slower level.
+Other depths vary by under 0.3%. Where the time goes:
 
 - decode at short context is the per-layer dependency chain (QKV, attention,
   o_proj, router, gate/up, down) with each kernel's weight loads issued before
@@ -222,13 +223,14 @@ the time goes:
   half of the step (129 us per layer, ~93% of the measured streaming peak);
 - prefill GEMMs run at 190-215 TFLOPS on large chunks (the bf16 `mma.sync`
   peak measured on this card is 259 TFLOPS); attention at ~190 TFLOPS, which is
-  70% of a 100 K prefill; a short prompt is bound by streaming the routed
-  experts' weights (~1.6 TB/s).
+  70% of a 100 K prefill; at 58 tokens the routed-expert GEMMs, which stream
+  the selected experts' weights with mostly empty 16-row tiles, take 69% of
+  the time.
 
 GPU memory with a 110,592-token context (device total from `nvidia-smi`; the KV
-cache is preallocated): 26.9 GiB idle and after a 100 K request (+30 MiB of
+cache is preallocated): 26.9 GiB idle and after a 100 K request (+24 MiB of
 cached prefill graphs, at most ~150 MiB for 64 shapes), against 24.6 GiB for
-llama-server with the same context. The
+llama-server with the same context (25.3 GiB with `-ub 2048`). The
 difference is mostly the 16 Ki-slot rings of the 35 sliding-window layers
 (1.1 GiB; llama.cpp keeps window-sized caches there) and the preallocated
 prefill workspace for 8192-token chunks.
@@ -238,26 +240,34 @@ flags, `-np 1`), the same OpenAI streaming client for both: chat messages with
 the prompts' tool definitions, greedy, `ignore_eos`, 128 tokens, prompt caching
 off. TTFT is measured by the client (request sent to first streamed token,
 including templating and tokenization); decode is each server's own rate.
+llama-server runs with its default batch sizes (ubatch 512); the second
+llama-server column is a run with `-b 2048 -ub 2048`, the prompt-processing
+setting of the forward comparison.
 
-| prompt tokens | TTFT | llama-server | decode | llama-server |
-|---:|---:|---:|---:|---:|
-| 58 | **12.2 ms** | 57.7 ms | **686 tok/s** | 232 tok/s |
-| 1,022 | **45.2 ms** | 227 ms | **683 tok/s** | 225 tok/s |
-| 4,089 | **137 ms** | 686 ms | **617 tok/s** | 217 tok/s |
-| 8,188 | **280 ms** | 1,317 ms | **596 tok/s** | 216 tok/s |
-| 16,371 | **655 ms** | 2,597 ms | **555 tok/s** | 210 tok/s |
-| 32,765 | **1.63 s** | 5.42 s | **475 tok/s** | 197 tok/s |
-| 65,515 | **4.59 s** | 12.18 s | **374 tok/s** | 176 tok/s |
-| 99,986 | **9.17 s** | 21.46 s | **308 tok/s** | 159 tok/s |
+| prompt tokens | TTFT | llama-server | `-ub 2048` | decode | llama-server |
+|---:|---:|---:|---:|---:|---:|
+| 58 | **11.9 ms** | 57.1 ms | 57.8 ms | **689 tok/s** | 226 tok/s |
+| 1,022 | **43.8 ms** | 225 ms | 183 ms | **682 tok/s** | 224 tok/s |
+| 4,089 | **135 ms** | 686 ms | 435 ms | **617 tok/s** | 218 tok/s |
+| 8,188 | **274 ms** | 1,317 ms | 793 ms | **588 tok/s** | 216 tok/s |
+| 16,371 | **646 ms** | 2,594 ms | 1,546 ms | **542 tok/s** | 209 tok/s |
+| 32,765 | **1.61 s** | 5.42 s | 3.27 s | **475 tok/s** | 195 tok/s |
+| 65,515 | **4.55 s** | 12.16 s | 7.68 s | **374 tok/s** | 174 tok/s |
+| 99,986 | **9.10 s** | 21.43 s | 14.09 s | **308 tok/s** | 156 tok/s |
 
 Other shapes, same setup:
 
 | scenario | FlashRT | llama-server |
 |---|---:|---:|
-| 8,192 new tokens on 91,794 tokens of existing KV (forward; llama-bench `pp8192 @ d91808`) | **1.25 s** | 1.72 s |
-| follow-up turn on an 8 K conversation, TTFT with prefix reuse / full prefill | **21 / 303 ms** | 128 / 1,359 ms |
-| two concurrent 8 K requests (batch 1, queued), TTFT first / second | **289 / 779 ms** | 1,323 / 3,213 ms |
-| 1,024-token reply to the 8 K prompt, request time | **2.02 s** | 6.01 s |
+| 8,192 new tokens on 91,794 tokens of existing KV (forward; llama-bench `pp8192 @ d91808`) | **1.24 s** | 1.72 s |
+| follow-up turn on an 8 K conversation, TTFT with prefix reuse / full prefill | **20 / 298 ms** | 127 / 1,357 ms |
+| two concurrent 8 K requests (batch 1, queued), TTFT first / second | **283 / 769 ms** | 1,320 / 3,214 ms |
+| 1,024-token reply to the 8 K prompt, request time | **1.99 s** | 6.03 s |
+
+In the follow-up turn FlashRT reuses the previous prompt and reply from its KV
+cache and prefills the 23 new tokens; llama-server's cache matches the first
+8,188 tokens of its rendering of the conversation and it processes the remaining
+~117, so the two reuse figures cover different amounts of work.
 
 ## Limitations
 
