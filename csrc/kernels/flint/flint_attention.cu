@@ -315,7 +315,12 @@ decode_attn_fused_kernel(const uint16_t* __restrict__ qkv, const float* __restri
     }
   }
 
-  pdl_wait();
+  uint32_t dep = static_cast<uint32_t>(pos) ^ __float_as_uint(qwv[3]) ^ __float_as_uint(kwv[3]);
+  if (have) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) dep ^= kr[0][4 * i] ^ kr[1][4 * i] ^ vr[i][0] ^ vr[i][4];
+  }
+  pdl_wait_after(dep);
   qkv = after_wait(qkv);
   cache = after_wait(cache);
   o_part = after_wait(o_part);

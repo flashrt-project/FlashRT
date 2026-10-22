@@ -290,7 +290,12 @@ router_norm_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict__ 
   for (int r = 0; r < RPW; ++r)
 #pragma unroll
     for (int c = 0; c < 8; ++c) wv[r][c] = ldg_nc_v4(wr + static_cast<size_t>(e0 + r) * kH + c * 256 + lane * 8);
-  pdl_wait();
+  uint32_t dep = 0;
+#pragma unroll
+  for (int r = 0; r < RPW; ++r)
+#pragma unroll
+    for (int c = 0; c < 8; ++c) dep ^= wv[r][c].x;
+  pdl_wait_after(dep);
   x = after_wait(x);
   res_in = after_wait(res_in);
   res_out = after_wait(res_out);
@@ -413,8 +418,15 @@ moe_gate_up2_kernel(const uint16_t* __restrict__ xn, const int* __restrict__ ids
         sv[c][r] = ldg_nc_u16(sb + static_cast<size_t>(row) * 128 + c * 64 + lane * 2);
       }
   };
-  if (!routed) load_w(scodes, sscales);
-  pdl_wait();
+  uint32_t dep = 0;
+  if (!routed) {
+    load_w(scodes, sscales);
+#pragma unroll
+    for (int c = 0; c < 2; ++c)
+#pragma unroll
+      for (int r = 0; r < 2 * ARPW; ++r) dep ^= wv[c][r].x ^ sv[c][r];
+  }
+  pdl_wait_after(dep);
   xn = after_wait(xn);
   ids = after_wait(ids);
   act = after_wait(act);
@@ -515,7 +527,14 @@ moe_down_combine2_kernel(const uint16_t* __restrict__ act, const int* __restrict
       rw[r][j] = ldg_nc_v2(ecodes + rowi * 256 + lane * 8);
       rs[r][j] = ldg_nc_u8(escales + rowi * 32 + lane);
     }
-  pdl_wait();
+  uint32_t dep = 0;
+#pragma unroll
+  for (int r = 0; r < RPW; ++r) {
+    dep ^= shw[r].x ^ shs[r];
+#pragma unroll
+    for (int j = 0; j < kTop; ++j) dep ^= rw[r][j].x ^ rs[r][j];
+  }
+  pdl_wait_after(dep);
   act = after_wait(act);
   tw = after_wait(tw);
   out = after_wait(out);

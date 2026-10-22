@@ -165,6 +165,16 @@ __device__ __forceinline__ void prefetch_l2_bulk(const void* p, uint32_t bytes) 
 
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 
+// pdl_wait() ordered after the loads that produced `dep` (fold one word of every pre-wait load into it).
+// ptxas otherwise schedules griddepcontrol.wait ahead of independent pre-wait loads, which then miss the
+// overlap with the previous kernel. Storing `dep` to a shared scratch word right before the wait (one asm
+// block) keeps those loads in front of the wait; the stored value is never read.
+__device__ __forceinline__ void pdl_wait_after(uint32_t dep) {
+  __shared__ uint32_t pdl_sink;
+  asm volatile("{\n\tst.shared.u32 [%0], %1;\n\tgriddepcontrol.wait;\n\t}"
+               :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&pdl_sink))), "r"(dep) : "memory");
+}
+
 // Pointer launder for data produced or consumed by other grids. A "memory" clobber on
 // griddepcontrol.wait does not stop the compiler from hoisting loads through
 // const __restrict__ pointers above it (restrict promises nobody else writes the data
