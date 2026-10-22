@@ -56,7 +56,7 @@ void qk_norm_rope_kv_rows_bf16(const void* qkv, int n, const float* qw, const fl
                                float eps, cudaStream_t s);
 void prefill_attention_bf16(const void* q, int n, const void* cache, const int* pos, int ring, int window,
                             const float* sinks, float scale, void* out, cudaStream_t s);
-// v2 (variant 0..6 = PKV/stages 32/2, 32/3, 64/2, 64/3, 32/4, and 32/2, 32/3 at two CTAs per SM); n_split > 1 needs o_part/ml_part/counters
+// v2 (variant 0..4 = PKV/stages 32/2, 32/3, 64/2, 64/3, 32/4); n_split > 1 needs o_part/ml_part/counters
 // sized for ceil(n/16) * 4 units (counters zeroed once; they self-reset). Returns non-zero on bad args.
 int prefill_attention2_bf16(const void* q, int n, const void* cache, const int* pos, int ring, int window,
                             const float* sinks, float scale, void* out, int n_split, float* o_part, float* ml_part,

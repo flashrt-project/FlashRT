@@ -584,7 +584,7 @@ def test_prefill_attention2(pos0, n, ring, window, variant, n_split):
         v1 = torch.empty_like(out)
         fl.prefill_attention_bf16(q.data_ptr(), n, cache.data_ptr(), pos.data_ptr(), ring, window, sinks.data_ptr(),
                                   1 / math.sqrt(128), v1.data_ptr(), _stream())
-        if variant in (0, 1, 4):
+        if variant in (0, 1, 4):  # 32-key tiles: same accumulation order as v1
             assert torch.equal(out, v1)
 
 

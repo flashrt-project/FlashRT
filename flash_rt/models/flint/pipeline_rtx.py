@@ -74,7 +74,7 @@ class FlintRuntime:
     """Owns every device buffer and launches the Flint kernel sequence."""
 
     def __init__(self, gguf_path: str, max_seq: int = 32768, sliding_ring: int = 16384,
-                 attn_splits: int = 16, prefill_chunk: int = 8192, device: int = 0):
+                 attn_splits: int = 16, prefill_chunk: Optional[int] = None, device: int = 0):
         import torch
         self.torch = torch
         self.fl = _require_kernels()
@@ -87,11 +87,17 @@ class FlintRuntime:
         self.max_seq = int(max_seq)
         self.ring = int(sliding_ring)
         self.attn_splits = int(attn_splits)
+        self.dev = torch.device("cuda", device)
+        torch.cuda.set_device(self.dev)
+        if prefill_chunk is None:
+            # Largest chunk <= 8192 whose attention units (16-token blocks x 4 KV heads) fill whole waves:
+            # chunk a multiple of lcm(16, 4 * SMs).
+            sms = torch.cuda.get_device_properties(self.dev).multi_processor_count
+            q = math.lcm(16, 4 * sms)
+            prefill_chunk = 8192 // q * q if q <= 4096 else 8192
         self.prefill_chunk = int(prefill_chunk)
         if self.prefill_chunk + self.cfg.sliding_window > sliding_ring:
             raise ValueError("prefill_chunk + sliding_window must fit in sliding_ring")
-        self.dev = torch.device("cuda", device)
-        torch.cuda.set_device(self.dev)
         self.stream = torch.cuda.Stream(self.dev)
         self._anchors: List[object] = []
         self._load_weights()

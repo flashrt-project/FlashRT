@@ -772,8 +772,8 @@ prefill_attn_kernel(const uint16_t* __restrict__ q, int n, const uint16_t* __res
 // row sum) are merged together with the sink by the last CTA of the unit (counters self-reset).
 // grid (n_qb * n_split, 4), 256 threads, dynamic smem ST * PKV * 512 B.
 // o_part f32 [n_qb * 4][n_split][128][128], ml_part f32 [n_qb * 4][n_split][128][2], counters [n_qb * 4].
-template <int PKV, int ST, int MINB>
-__global__ void __launch_bounds__(256, MINB)
+template <int PKV, int ST>
+__global__ void __launch_bounds__(256)
 prefill_attn2_kernel(const uint16_t* __restrict__ q, int n, const uint16_t* __restrict__ cache,
                      const int* __restrict__ pos_p, int ring, int window, const float* __restrict__ sinks,
                      float scale, uint16_t* __restrict__ out, int n_split, float* __restrict__ o_part,
@@ -987,18 +987,18 @@ prefill_attn2_kernel(const uint16_t* __restrict__ q, int n, const uint16_t* __re
   }
 }
 
-template <int PKV, int ST, int MINB = 1>
+template <int PKV, int ST>
 void launch_prefill_attn2(const void* q, int n, const void* cache, const int* pos, int ring, int window,
                           const float* sinks, float scale, void* out, int n_split, float* o_part, float* ml_part,
                           unsigned* counters, cudaStream_t s) {
   constexpr int smem = ST * PKV * kD * 2 * 2;
   static bool attr = false;
   if (!attr) {
-    cudaFuncSetAttribute(reinterpret_cast<const void*>(prefill_attn2_kernel<PKV, ST, MINB>),
+    cudaFuncSetAttribute(reinterpret_cast<const void*>(prefill_attn2_kernel<PKV, ST>),
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     attr = true;
   }
-  prefill_attn2_kernel<PKV, ST, MINB><<<dim3(((n + PQ - 1) / PQ) * n_split, 4), 256, smem, s>>>(
+  prefill_attn2_kernel<PKV, ST><<<dim3(((n + PQ - 1) / PQ) * n_split, 4), 256, smem, s>>>(
       static_cast<const uint16_t*>(q), n, static_cast<const uint16_t*>(cache), pos, ring, window, sinks, scale,
       static_cast<uint16_t*>(out), n_split, o_part, ml_part, counters);
 }
@@ -1007,19 +1007,17 @@ int prefill_attention2_bf16(const void* q, int n, const void* cache, const int* 
                             const float* sinks, float scale, void* out, int n_split, float* o_part, float* ml_part,
                             unsigned* counters, int variant, cudaStream_t s) {
   if (n_split < 1 || (n_split > 1 && (o_part == nullptr || ml_part == nullptr || counters == nullptr))) return 1;
-#define FLINT_PA2(V, PKV, ST, MINB)                                                                          \
+#define FLINT_PA2(V, PKV, ST)                                                                                \
   case V:                                                                                                    \
-    launch_prefill_attn2<PKV, ST, MINB>(q, n, cache, pos, ring, window, sinks, scale, out, n_split, o_part,   \
-                                        ml_part, counters, s);                                               \
+    launch_prefill_attn2<PKV, ST>(q, n, cache, pos, ring, window, sinks, scale, out, n_split, o_part, ml_part, \
+                                  counters, s);                                                              \
     return 0;
   switch (variant) {
-    FLINT_PA2(0, 32, 2, 1)
-    FLINT_PA2(1, 32, 3, 1)
-    FLINT_PA2(2, 64, 2, 1)
-    FLINT_PA2(3, 64, 3, 1)
-    FLINT_PA2(4, 32, 4, 1)
-    FLINT_PA2(5, 32, 2, 2)
-    FLINT_PA2(6, 32, 3, 2)
+    FLINT_PA2(0, 32, 2)
+    FLINT_PA2(1, 32, 3)
+    FLINT_PA2(2, 64, 2)
+    FLINT_PA2(3, 64, 3)
+    FLINT_PA2(4, 32, 4)
     default: return 1;
   }
 #undef FLINT_PA2
