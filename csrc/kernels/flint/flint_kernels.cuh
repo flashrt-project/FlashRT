@@ -80,12 +80,16 @@ int gemm_w4a16_grouped(const void* A, const int* gather, int lda, const int* til
 // Search hook: non-zero bm overrides the default dense / grouped configuration.
 void set_gemm_override(const GemmConfig& dense, const GemmConfig& grouped);
 // Many-token router on tensor cores (wr = router [256, 2048] bf16); adds selections to counts[256].
-void router_topk_rows_bf16(const void* xn, int n, const void* wr, int* ids, float* tw, int* counts, cudaStream_t s);
+// pos / n_end (device ints, may be null): rows at positions >= *n_end -- the padding of a chunk launched with
+// more rows than tokens -- are selected but neither counted here nor placed by moe_scan_place.
+void router_topk_rows_bf16(const void* xn, int n, const void* wr, int* ids, float* tw, int* counts, const int* pos,
+                           const int* n_end, cudaStream_t s);
 // counts (from router_topk_rows_bf16, re-zeroed) -> expert offsets, grouped-GEMM tile list
 // (expert, first sorted slot, rows) x n_tiles, and the (token, slot) scatter: sorted_tok[slot] = token,
-// inv[token * 6 + j] = slot. Slot order inside an expert is unspecified (results do not depend on it).
+// inv[token * 6 + j] = slot (0 for padding rows). Slot order inside an expert is unspecified (results do not
+// depend on it).
 void moe_scan_place(const int* ids, int n, int tile_rows, int* counts, int* sorted_tok, int* inv, int* tiles,
-                    int* n_tiles, cudaStream_t s);
+                    int* n_tiles, const int* pos, const int* n_end, cudaStream_t s);
 void moe_combine_rows_bf16(const void* y, const int* inv, const float* tw, const void* shared, void* out, int n,
                            cudaStream_t s);
 void advance_pos(int* pos, int n, cudaStream_t s);

@@ -183,16 +183,18 @@ PYBIND11_MODULE(flash_rt_flint, m) {
   });
 
   m.def("router_topk_rows_bf16",
-        [](uintptr_t xn, int n, uintptr_t wr, uintptr_t ids, uintptr_t tw, uintptr_t counts, uintptr_t stream) {
+        [](uintptr_t xn, int n, uintptr_t wr, uintptr_t ids, uintptr_t tw, uintptr_t counts, uintptr_t pos,
+           uintptr_t n_end, uintptr_t stream) {
           fl::router_topk_rows_bf16(ptr<const void>(xn), n, ptr<const void>(wr), ptr<int>(ids), ptr<float>(tw),
-                                    ptr<int>(counts), to_stream(stream));
+                                    ptr<int>(counts), ptr<const int>(pos), ptr<const int>(n_end), to_stream(stream));
         });
 
   m.def("moe_scan_place",
         [](uintptr_t ids, int n, int tile_rows, uintptr_t counts, uintptr_t sorted_tok, uintptr_t inv, uintptr_t tiles,
-           uintptr_t n_tiles, uintptr_t stream) {
+           uintptr_t n_tiles, uintptr_t pos, uintptr_t n_end, uintptr_t stream) {
           fl::moe_scan_place(ptr<const int>(ids), n, tile_rows, ptr<int>(counts), ptr<int>(sorted_tok), ptr<int>(inv),
-                             ptr<int>(tiles), ptr<int>(n_tiles), to_stream(stream));
+                             ptr<int>(tiles), ptr<int>(n_tiles), ptr<const int>(pos), ptr<const int>(n_end),
+                             to_stream(stream));
         });
 
   m.def("moe_combine_rows_bf16",

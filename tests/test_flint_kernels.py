@@ -403,7 +403,7 @@ def test_grouped_tile_rows(tile_rows, override):
     max_tiles = n * 6 // tile_rows + E
     tiles = torch.zeros(3 * max_tiles, dtype=torch.int32, device=DEV); ntiles = torch.zeros(1, dtype=torch.int32, device=DEV)
     fl.moe_scan_place(ids.data_ptr(), n, tile_rows, counts.data_ptr(), sorted_tok.data_ptr(), inv.data_ptr(),
-                      tiles.data_ptr(), ntiles.data_ptr(), _stream())
+                      tiles.data_ptr(), ntiles.data_ptr(), 0, 0, _stream())
     d_c, d_s = repack_dev(rand_blocks(8 * H, I, 70))  # only experts 0..7 are routed
     gs = torch.rand(E, device=DEV) * 1e-3 + 1e-4
     a = bf16(torch.randn(n * 6, I, device=DEV))
@@ -432,14 +432,14 @@ def test_router_place_and_grouped_gemm():
     tw = torch.empty(n, 6, device=DEV)
     counts = torch.zeros(E, dtype=torch.int32, device=DEV)
     fl.router_topk_rows_bf16(xn.data_ptr(), n, wr.data_ptr(), ids.data_ptr(), tw.data_ptr(), counts.data_ptr(),
-                             _stream())
+                             0, 0, _stream())
     sorted_tok = torch.empty(n * 6, dtype=torch.int32, device=DEV)
     inv = torch.empty(n * 6, dtype=torch.int32, device=DEV)
     max_tiles = n * 6 // 64 + E
     tiles = torch.zeros(3 * max_tiles, dtype=torch.int32, device=DEV)
     ntiles = torch.zeros(1, dtype=torch.int32, device=DEV)
     fl.moe_scan_place(ids.data_ptr(), n, 64, counts.data_ptr(), sorted_tok.data_ptr(), inv.data_ptr(),
-                      tiles.data_ptr(), ntiles.data_ptr(), _stream())
+                      tiles.data_ptr(), ntiles.data_ptr(), 0, 0, _stream())
     idl, st, iv = ids.view(-1).cpu(), sorted_tok.cpu(), inv.cpu()
     # grouped gate/up (routed SwiGLU rule) on the sorted slots
     eg = rand_blocks(E * I, H, 50); eu = rand_blocks(E * I, H, 51)
@@ -469,7 +469,7 @@ def test_router_topk_rows_and_scan_place(n):
     tw = torch.empty(n, 6, device=DEV)
     counts = torch.zeros(E, dtype=torch.int32, device=DEV)
     fl.router_topk_rows_bf16(xn.data_ptr(), n, wr.data_ptr(), ids.data_ptr(), tw.data_ptr(), counts.data_ptr(),
-                             _stream())
+                             0, 0, _stream())
     lg = bf16(xn.double() @ wr.double().t()).double().cpu()
     srt = torch.sort(lg, dim=1, descending=True, stable=True)
     got = ids.cpu().long()
@@ -488,7 +488,7 @@ def test_router_topk_rows_and_scan_place(n):
     tl_ = torch.zeros(3 * max_tiles, dtype=torch.int32, device=DEV)
     nt_ = torch.zeros(1, dtype=torch.int32, device=DEV)
     fl.moe_scan_place(ids.data_ptr(), n, 64, counts.data_ptr(), st_.data_ptr(), iv_.data_ptr(), tl_.data_ptr(),
-                      nt_.data_ptr(), _stream())
+                      nt_.data_ptr(), 0, 0, _stream())
     assert int(counts.abs().sum().item()) == 0
     cnt = torch.bincount(got.view(-1), minlength=E).tolist()
     want, off = [], 0
@@ -506,6 +506,41 @@ def test_router_topk_rows_and_scan_place(n):
     assert torch.equal(e_of_slot, torch.sort(e_of_slot).values)
 
 
+
+@pytest.mark.parametrize("n", [37, 3000])   # cluster path, wide path
+def test_padding_rows_are_not_routed(n):
+    torch.manual_seed(10)
+    E, H, valid = 256, 2048, n - 7
+    xn = bf16(torch.randn(n, H, device=DEV))
+    wr = bf16(torch.randn(E, H, device=DEV) * 0.02)
+    pos = torch.tensor([100], dtype=torch.int32, device=DEV)
+    n_end = torch.tensor([100 + valid], dtype=torch.int32, device=DEV)
+    out = []
+    for p, q in ((0, 0), (pos.data_ptr(), n_end.data_ptr())):
+        ids = torch.empty(n, 6, dtype=torch.int32, device=DEV)
+        tw = torch.empty(n, 6, device=DEV)
+        counts = torch.zeros(E, dtype=torch.int32, device=DEV)
+        fl.router_topk_rows_bf16(xn.data_ptr(), n, wr.data_ptr(), ids.data_ptr(), tw.data_ptr(), counts.data_ptr(),
+                                 p, q, _stream())
+        out.append((ids, tw, counts))
+    (ids_a, tw_a, _), (ids, tw, counts) = out
+    assert torch.equal(ids, ids_a) and torch.equal(tw, tw_a)
+    cnt = torch.bincount(ids[:valid].reshape(-1).long(), minlength=E).int()
+    assert torch.equal(counts, cnt)
+    max_tiles = n * 6 // 64 + E
+    st_ = torch.empty(n * 6, dtype=torch.int32, device=DEV)
+    iv_ = torch.full((n * 6,), -1, dtype=torch.int32, device=DEV)
+    tl_ = torch.zeros(3 * max_tiles, dtype=torch.int32, device=DEV)
+    nt_ = torch.zeros(1, dtype=torch.int32, device=DEV)
+    fl.moe_scan_place(ids.data_ptr(), n, 64, counts.data_ptr(), st_.data_ptr(), iv_.data_ptr(), tl_.data_ptr(),
+                      nt_.data_ptr(), pos.data_ptr(), n_end.data_ptr(), _stream())
+    iv, st = iv_.cpu(), st_.cpu()
+    assert int(nt_.item()) == sum(-(-c // 64) for c in cnt.tolist())
+    assert torch.equal(iv[valid * 6:], torch.zeros(7 * 6, dtype=torch.int32))
+    assert torch.equal(torch.sort(iv[:valid * 6]).values, torch.arange(valid * 6, dtype=torch.int32))
+    assert all(st[iv[i]].item() == i // 6 for i in range(valid * 6))
+
+
 def test_router_cluster_path_matches_wide_path():
     torch.manual_seed(8)
     E, H, n = 256, 2048, 12000  # 375 token blocks: wide path; the first 37 rows alone: cluster path
@@ -517,7 +552,7 @@ def test_router_cluster_path_matches_wide_path():
         tw = torch.empty(rows, 6, device=DEV)
         counts = torch.zeros(E, dtype=torch.int32, device=DEV)
         fl.router_topk_rows_bf16(xn.data_ptr(), rows, wr.data_ptr(), ids.data_ptr(), tw.data_ptr(), counts.data_ptr(),
-                                 _stream())
+                                 0, 0, _stream())
         res.append((ids[:37].cpu(), tw[:37].cpu()))
         assert int(counts.sum().item()) == rows * 6
     assert torch.equal(res[0][0], res[1][0]) and torch.equal(res[0][1], res[1][1])

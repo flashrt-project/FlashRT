@@ -431,7 +431,8 @@ class FlintRuntime:
     def launch_prefill_chunk(self, m: int, pos0: int = 0):
         """Enqueue the layers for ``m`` prompt tokens starting at device position ``pos`` (== ``pos0`` on host).
 
-        Leaves the final hidden state of the chunk in (pf_x + pf_res) and advances ``pos`` by m.
+        Leaves the final hidden state of the chunk in (pf_x + pf_res) and advances ``pos`` by m. Rows at
+        positions >= ``n_prompt_dev`` (padding up to a graph shape) are not routed to any expert.
         """
         fl, cfg, s = self.fl, self.cfg, self.stream.cuda_stream
         eps, H = cfg.rms_norm_eps, cfg.hidden_size
@@ -471,10 +472,11 @@ class FlintRuntime:
                 self._gemm(self.pf_sh_act, m, cfg.shared_intermediate_size, L.sh_down, self.pf_sh, H,
                            fl.EPI_BF16, s)
                 fl.router_topk_rows_bf16(self.pf_xn.data_ptr(), m, L.router.data_ptr(), self.pf_ids.data_ptr(),
-                                         self.pf_tw.data_ptr(), self.pf_counts.data_ptr(), s)
+                                         self.pf_tw.data_ptr(), self.pf_counts.data_ptr(), self.pos.data_ptr(),
+                                         self.n_prompt_dev.data_ptr(), s)
                 fl.moe_scan_place(self.pf_ids.data_ptr(), m, tile_rows, self.pf_counts.data_ptr(),
                                   self.pf_sorted.data_ptr(), self.pf_inv.data_ptr(), self.pf_tiles.data_ptr(),
-                                  self.pf_ntiles.data_ptr(), s)
+                                  self.pf_ntiles.data_ptr(), self.pos.data_ptr(), self.n_prompt_dev.data_ptr(), s)
                 g = L.exp_gate_up
                 fl.gemm_w4a16_grouped(self.pf_xn.data_ptr(), self.pf_sorted.data_ptr(), H, self.pf_tiles.data_ptr(),
                                       self.pf_ntiles.data_ptr(), max_tiles, g.codes.data_ptr(),
@@ -492,7 +494,8 @@ class FlintRuntime:
     def _pf_rows(self, m: int, pos0: int) -> int:
         """Rows launched for an m-token chunk: m rounded up to 16 so that graphs are shared across nearby
         lengths. Padded rows only write KV past the chunk, which decode overwrites before any query reads it
-        (attention reads positions <= the query's own), and each valid row's result is independent of them."""
+        (attention reads positions <= the query's own), take no expert slots, and each valid row's result is
+        independent of them."""
         b = -(-m // 16) * 16
         return b if b <= self.pf_capacity and pos0 + b <= self.max_seq else m
 

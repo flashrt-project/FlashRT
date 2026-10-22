@@ -90,11 +90,12 @@ void qk_norm_rope_kv_rows_bf16(const void* qkv, int n, const float* qw, const fl
 // Expert offsets from the router's per-expert counts (re-zeroed here for the next layer), the grouped
 // GEMM tile list, and the scatter of (token, slot) pairs into expert order. Slot order inside an expert
 // is arbitrary: every GEMM row and the combine depend only on their own token, so results are exact
-// and deterministic regardless of the placement order.
+// and deterministic regardless of the placement order. Rows at positions >= *n_end (padding of a
+// graph-shaped chunk, not counted by the router) are not placed; their slots point at slot 0.
 __global__ void __launch_bounds__(1024)
 moe_scan_place_kernel(const int* __restrict__ ids, int n, int tile_rows, int* __restrict__ counts,
                       int* __restrict__ sorted_tok, int* __restrict__ inv, int* __restrict__ tiles,
-                      int* __restrict__ n_tiles) {
+                      int* __restrict__ n_tiles, const int* __restrict__ pos, const int* __restrict__ n_end) {
   __shared__ int off[kExperts], cur[kExperts], wsum[2][kExperts / 32];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   int c = 0, nt = 0;
@@ -124,7 +125,9 @@ moe_scan_place_kernel(const int* __restrict__ ids, int n, int tile_rows, int* __
     }
   }
   __syncthreads();
+  const int placed = (pos != nullptr ? min(n, *n_end - *pos) : n) * kTopK;
   for (int i = tid; i < n * kTopK; i += blockDim.x) {
+    if (i >= placed) { inv[i] = 0; continue; }
     const int e = ids[i];
     const int slot = off[e] + atomicAdd(&cur[e], 1);
     sorted_tok[slot] = i / kTopK;
@@ -133,8 +136,8 @@ moe_scan_place_kernel(const int* __restrict__ ids, int n, int tile_rows, int* __
 }
 
 void moe_scan_place(const int* ids, int n, int tile_rows, int* counts, int* sorted_tok, int* inv, int* tiles,
-                    int* n_tiles, cudaStream_t s) {
-  moe_scan_place_kernel<<<1, 1024, 0, s>>>(ids, n, tile_rows, counts, sorted_tok, inv, tiles, n_tiles);
+                    int* n_tiles, const int* pos, const int* n_end, cudaStream_t s) {
+  moe_scan_place_kernel<<<1, 1024, 0, s>>>(ids, n, tile_rows, counts, sorted_tok, inv, tiles, n_tiles, pos, n_end);
 }
 
 // out[t] = bf16( bf16(sum_j tw[t,j] * y[inv[t,j]]) + shared[t] )  (y already bf16(acc * gs_e))

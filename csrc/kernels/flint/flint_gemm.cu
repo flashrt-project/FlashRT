@@ -308,7 +308,8 @@ gemm_grouped_kernel(const uint16_t* __restrict__ A, const int* __restrict__ gath
 // ---- many-token router: bf16 tensor-core logits + top-6 ----
 // 32 tokens per CTA, all 256 experts (warp w owns experts [32w, 32w + 32)); logits are rounded to
 // bf16 and selected with the decode rule (top-6, ties to the lower id, sigmoid, renormalize, bf16
-// weights). Selected experts are counted into counts[256] for moe_scan_place.
+// weights). Selected experts are counted into counts[256] for moe_scan_place, except for rows at positions
+// >= *n_end (padding rows of a graph-shaped chunk; pos/n_end may be null: every row counts).
 constexpr int RT_M = 32, RT_STAGES = 2, RT_EXPERTS = 256, RT_K = 2048, RT_TOPK = 6;
 
 struct RouterStage {
@@ -319,7 +320,8 @@ constexpr size_t kRouterSmem = sizeof(RouterStage) * RT_STAGES;
 static_assert(kRouterSmem >= RT_M * RT_EXPERTS * sizeof(float), "logit tile must fit in the stage buffers");
 
 // Top-6 of one token's 256 bf16-rounded logits held 8 per lane (lane l: experts 8l..8l+7), the decode rule
-// (ties to the lower id, sigmoid, renormalize, bf16 weights); lane 0 stores and counts the selections.
+// (ties to the lower id, sigmoid, renormalize, bf16 weights); lane 0 stores the selections and counts them
+// unless counts is null.
 __device__ __forceinline__ void router_select_row(float (&v)[8], int lane, int row, int* __restrict__ ids,
                                                   float* __restrict__ tw, int* __restrict__ counts) {
   float sv[RT_TOPK];
@@ -349,14 +351,15 @@ __device__ __forceinline__ void router_select_row(float (&v)[8], int lane, int r
     for (int k = 0; k < RT_TOPK; ++k) {
       ids[row * RT_TOPK + k] = si[k];
       tw[row * RT_TOPK + k] = round_bf16(__fdiv_rn(sg[k], den));
-      atomicAdd(counts + si[k], 1);
+      if (counts != nullptr) atomicAdd(counts + si[k], 1);
     }
   }
 }
 
 __global__ void __launch_bounds__(THREADS)
 router_mma_kernel(const uint16_t* __restrict__ xn, int n, const uint16_t* __restrict__ wr, int* __restrict__ ids,
-                  float* __restrict__ tw, int* __restrict__ counts) {
+                  float* __restrict__ tw, int* __restrict__ counts, const int* __restrict__ pos,
+                  const int* __restrict__ n_end) {
   extern __shared__ __align__(16) uint8_t smem_raw[];
   RouterStage* st = reinterpret_cast<RouterStage*>(smem_raw);
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
@@ -429,11 +432,12 @@ router_mma_kernel(const uint16_t* __restrict__ xn, int n, const uint16_t* __rest
       for (int e = 0; e < 4; ++e)
         lg[mt * 16 + g + 8 * (e >> 1)][warp * 32 + nt * 8 + 2 * t + (e & 1)] = round_bf16(acc[mt][nt][e]);
   __syncthreads();
+  const int valid = pos != nullptr ? min(n, *n_end - *pos) : n;
   for (int rr = warp; rr < nr; rr += THREADS / 32) {
     float v[8];
 #pragma unroll
     for (int j = 0; j < 8; ++j) v[j] = lg[rr][lane * 8 + j];
-    router_select_row(v, lane, r0 + rr, ids, tw, counts);
+    router_select_row(v, lane, r0 + rr, ids, tw, r0 + rr < valid ? counts : nullptr);
   }
 }
 
@@ -449,7 +453,8 @@ constexpr size_t kRouterSmemC = sizeof(RouterStageC) * RC_STAGES;
 
 __global__ void __cluster_dims__(RC, 1, 1) __launch_bounds__(THREADS)
 router_mma_cluster_kernel(const uint16_t* __restrict__ xn, int n, const uint16_t* __restrict__ wr,
-                          int* __restrict__ ids, float* __restrict__ tw, int* __restrict__ counts) {
+                          int* __restrict__ ids, float* __restrict__ tw, int* __restrict__ counts,
+                          const int* __restrict__ pos, const int* __restrict__ n_end) {
   extern __shared__ __align__(16) uint8_t smem_raw[];
   __shared__ __align__(16) float lg[RT_M][RC_E];
   cg::cluster_group cluster = cg::this_cluster();
@@ -517,7 +522,8 @@ router_mma_cluster_kernel(const uint16_t* __restrict__ xn, int n, const uint16_t
     const float* src = cluster.map_shared_rank(&lg[0][0], lane >> 3) + rr * RC_E + (lane & 7) * 8;
     const float4 x0 = reinterpret_cast<const float4*>(src)[0], x1 = reinterpret_cast<const float4*>(src)[1];
     float v[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
-    router_select_row(v, lane, r0 + rr, ids, tw, counts);
+    const int valid = pos != nullptr ? min(n, *n_end - *pos) : n;
+    router_select_row(v, lane, r0 + rr, ids, tw, r0 + rr < valid ? counts : nullptr);
   }
   cluster.sync();
 }
@@ -634,7 +640,8 @@ void set_gemm_override(const GemmConfig& dense, const GemmConfig& grouped) {
   g_grouped_override = grouped;
 }
 
-void router_topk_rows_bf16(const void* xn, int n, const void* wr, int* ids, float* tw, int* counts, cudaStream_t s) {
+void router_topk_rows_bf16(const void* xn, int n, const void* wr, int* ids, float* tw, int* counts, const int* pos,
+                           const int* n_end, cudaStream_t s) {
   static int sms = 0;
   if (sms == 0) {
     cudaFuncSetAttribute(reinterpret_cast<const void*>(router_mma_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -648,10 +655,10 @@ void router_topk_rows_bf16(const void* xn, int n, const void* wr, int* ids, floa
   const int blocks = (n + RT_M - 1) / RT_M;
   if (blocks * RC <= 2 * sms) {  // few token blocks: spread the experts over a cluster
     router_mma_cluster_kernel<<<blocks * RC, THREADS, kRouterSmemC, s>>>(
-        static_cast<const uint16_t*>(xn), n, static_cast<const uint16_t*>(wr), ids, tw, counts);
+        static_cast<const uint16_t*>(xn), n, static_cast<const uint16_t*>(wr), ids, tw, counts, pos, n_end);
   } else {
     router_mma_kernel<<<blocks, THREADS, kRouterSmem, s>>>(
-        static_cast<const uint16_t*>(xn), n, static_cast<const uint16_t*>(wr), ids, tw, counts);
+        static_cast<const uint16_t*>(xn), n, static_cast<const uint16_t*>(wr), ids, tw, counts, pos, n_end);
   }
 }
 
