@@ -174,6 +174,14 @@ inline bool pdl_enabled() {
   return on;
 }
 
+inline bool attn_cluster_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("FLINT_ATTN_CLUSTER");
+    return !(v && v[0] == '0');
+  }();
+  return on;
+}
+
 template <typename... KArgs, typename... Args>
 inline void launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t s,
                        Args&&... args) {

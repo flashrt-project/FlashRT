@@ -12,6 +12,9 @@
 #include "flint_common.cuh"
 #include "flint_kernels.cuh"
 
+#include <cooperative_groups.h>
+namespace cg = cooperative_groups;
+
 #include <cfloat>
 
 namespace flash_rt {
@@ -228,7 +231,7 @@ void decode_attention_bf16(const void* q, const void* cache, const int* pos, int
 // token (older tokens are immutable); the token's own K/V row is written by the
 // split that owns it, after the wait.
 // ===========================================================================
-template <int WARPS>
+template <int WARPS, bool CLUSTER>
 __global__ void __launch_bounds__(WARPS * 32)
 decode_attn_fused_kernel(const uint16_t* __restrict__ qkv, const float* __restrict__ qw, const float* __restrict__ kw,
                          const float* __restrict__ cos_t, const float* __restrict__ sin_t, const int* __restrict__ pos_p,
@@ -435,6 +438,40 @@ decode_attn_fused_kernel(const uint16_t* __restrict__ qkv, const float* __restri
     pdl_launch();
     return;
   }
+  if (CLUSTER) {
+    // Cluster of the n_split CTAs of this KV head: publish the CTA partial in shared memory,
+    // then rank r merges query head(s) r, r + n_split, ... reading its peers through DSMEM.
+    float (*cp_o)[kD] = reinterpret_cast<float (*)[kD]>(&sm_o[0][0][0]);   // reuse: [8][128] partial
+    float* cp_m = &sm_m[0][0];
+    float* cp_l = &sm_l[0][0];
+    __syncthreads();   // everyone finished reading sm_o/sm_m/sm_l of the warp merge
+#pragma unroll
+    for (int i = 0; i < DPT; ++i) cp_o[hh][d0 + i] = acc[i];
+    if ((threadIdx.x % TPH) == 0) { cp_m[hh] = (mm == -FLT_MAX) ? -FLT_MAX : mm * c; cp_l[hh] = ll; }
+    cg::cluster_group cl = cg::this_cluster();
+    cl.sync();
+    const int rank = static_cast<int>(cl.block_rank());
+    for (int h2 = rank; h2 < kGroup; h2 += n_split) {
+      const int hd = kvh * kGroup + h2;
+      const float sk2 = sinks[hd] * kLog2e;
+      for (int d = threadIdx.x; d < kD; d += NT) {
+        float M = sk2;
+        for (int q = 0; q < n_split; ++q) M = fmaxf(M, *cl.map_shared_rank(cp_m + h2, q));
+        float den = exp2f(sk2 - M), num = 0.f;
+        for (int q = 0; q < n_split; ++q) {
+          const float mq = *cl.map_shared_rank(cp_m + h2, q);
+          if (mq == -FLT_MAX) continue;
+          const float f = exp2f(mq - M);
+          den += *cl.map_shared_rank(cp_l + h2, q) * f;
+          num += *cl.map_shared_rank(&cp_o[h2][d], q) * f;
+        }
+        out[hd * kD + d] = f32_to_bf16_bits(num / den);
+      }
+    }
+    pdl_launch();
+    cl.sync();         // keep shared memory alive until every peer has read it
+    return;
+  }
   {
     float* op = o_part + (static_cast<size_t>(split) * 32 + head) * kD + d0;
 #pragma unroll
@@ -481,12 +518,36 @@ static void launch_attn_fused(const void* qkv, const float* qw, const float* kw,
   constexpr size_t smem = kGroup * kD * 2 + WARPS * kGroup * kD * 4 + 2 * WARPS * kGroup * 4;
   static bool init = false;
   if (!init) {
-    cudaFuncSetAttribute(decode_attn_fused_kernel<WARPS>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
+    cudaFuncSetAttribute(decode_attn_fused_kernel<WARPS, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(smem));
+    cudaFuncSetAttribute(decode_attn_fused_kernel<WARPS, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(smem));
     init = true;
   }
-  launch_pdl(decode_attn_fused_kernel<WARPS>, dim3(n_split, 4), dim3(WARPS * 32), smem, s,
-             static_cast<const uint16_t*>(qkv), qw, kw, cos_t, sin_t, pos, static_cast<uint16_t*>(cache), ring, window,
-             rope, eps, sinks, scale, o_part, ml_part, counters, static_cast<uint16_t*>(out), pf_ranges, n_pf);
+  const bool cluster = n_split >= 2 && n_split <= 8 && attn_cluster_enabled();
+  if (!cluster) {
+    launch_pdl(decode_attn_fused_kernel<WARPS, false>, dim3(n_split, 4), dim3(WARPS * 32), smem, s,
+               static_cast<const uint16_t*>(qkv), qw, kw, cos_t, sin_t, pos, static_cast<uint16_t*>(cache), ring, window,
+               rope, eps, sinks, scale, o_part, ml_part, counters, static_cast<uint16_t*>(out), pf_ranges, n_pf);
+    return;
+  }
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(n_split, 4);
+  cfg.blockDim = dim3(WARPS * 32);
+  cfg.dynamicSmemBytes = smem;
+  cfg.stream = s;
+  cudaLaunchAttribute attr[2];
+  attr[0].id = cudaLaunchAttributeClusterDimension;
+  attr[0].val.clusterDim.x = n_split;
+  attr[0].val.clusterDim.y = 1;
+  attr[0].val.clusterDim.z = 1;
+  attr[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[1].val.programmaticStreamSerializationAllowed = pdl_enabled() ? 1 : 0;
+  cfg.attrs = attr;
+  cfg.numAttrs = 2;
+  cudaLaunchKernelEx(&cfg, decode_attn_fused_kernel<WARPS, true>, static_cast<const uint16_t*>(qkv), qw, kw, cos_t,
+                     sin_t, pos, static_cast<uint16_t*>(cache), ring, window, rope, eps, sinks, scale, o_part, ml_part,
+                     counters, static_cast<uint16_t*>(out), pf_ranges, n_pf);
 }
 
 int decode_attention_fused_bf16(const void* qkv, const float* q_norm_w, const float* k_norm_w, const float* cos_t,
