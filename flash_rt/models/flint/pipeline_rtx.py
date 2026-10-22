@@ -281,6 +281,11 @@ class FlintRuntime:
         # sliding layers (513 keys): 8 splits x 8 warps; global layers by position bucket.
         self.swa_attn = (8, 8)
         self.full_attn_warps = 8
+        # (pos upper bound, attention splits, attention warps, (qkv rows, qkv warps, o rows, o warps)):
+        # the wider GEMV shapes win below ~48K context and lose at 100K (measured A/B/A).
+        g_short, g_long = (4, 8, 2, 8), (4, 4, 2, 4)
+        self.attn_buckets = ((512, 1, 4, g_short), (12288, 8, 8, g_short), (49152, 16, 8, g_short),
+                             (1 << 30, 16, 8, g_long))
         import os as _os
         self.l2_warm = _os.environ.get("FLINT_L2WARM", "0") == "1"   # bulk L2 warm-up of MoE down weights: measured negative, off
         self.router_shared = _os.environ.get("FLINT_ROUTER_SHARED", "0") == "1"   # router+shared fusion: measured +4%, off
@@ -290,13 +295,13 @@ class FlintRuntime:
         self.attn_pf_max_splits = 8
         bcfg = _os.environ.get("FLINT_ATTN_BUCKETS")      # "ub:splits:warps;..." (search/bisect hook)
         if bcfg:
-            self.attn_buckets = tuple(tuple(int(v) for v in b.split(":")) for b in bcfg.split(";"))
+            self.attn_buckets = tuple((*[int(v) for v in b.split(":")[:3]], (4, 4, 2, 4)) for b in bcfg.split(";"))
         scfg = _os.environ.get("FLINT_SWA_ATTN")          # "splits:warps"
         if scfg:
             self.swa_attn = tuple(int(v) for v in scfg.split(":"))
         gcfg = _os.environ.get("FLINT_GEMV_CFG")          # "qkv_rows,qkv_warps,o_rows,o_warps" (search hook)
         if gcfg:
-            self.fl.set_gemv_launch_config(*[int(v) for v in gcfg.split(",")])
+            self.fl.set_gemv_launch_config(*[int(v) for v in gcfg.replace("_", ",").split(",")])
         mcfg = _os.environ.get("FLINT_MOE_CFG")           # 6 ints, see set_moe_launch_config (search hook)
         if mcfg:
             self.fl.set_moe_launch_config(*[int(v) for v in mcfg.replace("_", ",").split(",")])
@@ -309,7 +314,6 @@ class FlintRuntime:
                     rng += [t.data_ptr(), t.numel() * t.element_size()]
             L.pf_ranges = torch.tensor(rng, dtype=torch.int64, device=self.dev)
             L.pf_n = len(rng) // 2
-        self.attn_buckets = ((512, 1, 4), (12288, 8, 8), (1 << 30, 16, 8))   # (pos upper bound, splits, warps)
         # Prefill (chunk of up to prefill_chunk tokens).
         C, T = self.prefill_chunk, cfg.num_experts_per_tok
         self.pf_x = torch.zeros((C, H), dtype=bf, device=self.dev)
@@ -585,17 +589,20 @@ class FlintRuntime:
         The fused step is captured once per attention bucket (``attn_buckets``); ``replay``
         picks the graph from the host-tracked position. ``attn_splits`` forces one graph.
         """
+        import os
         torch = self.torch
         if fused is None:
-            import os
             fused = os.environ.get("FLINT_DECODE", "fused") != "basic"
         if fused and attn_splits is None:
-            configs = [(ub, sp, w) for ub, sp, w in self.attn_buckets]
+            configs = list(self.attn_buckets)
         else:
-            configs = [(1 << 30, attn_splits or self.attn_splits, self.full_attn_warps)]
+            configs = [(1 << 30, attn_splits or self.attn_splits, self.full_attn_warps, None)]
         saved = (self.pos.clone(), self.tokens.clone())
         self.graphs = []
-        for ub, sp, w in configs:
+        gemv_env = os.environ.get("FLINT_GEMV_CFG")
+        for ub, sp, w, gcfg in configs:
+            if gcfg is not None and not gemv_env:
+                self.fl.set_gemv_launch_config(*gcfg)   # captured into this bucket's graph
             if fused:
                 step = lambda sp=sp, w=w: self.launch_step_fused(attn_splits=sp, attn_warps=w)  # noqa: E731
             else:
@@ -626,7 +633,9 @@ class FlintRuntime:
         if os.environ.get("FLINT_EAGER") == "1":     # debugging aid: launch the step without a graph
             with self.torch.cuda.stream(self.stream):
                 for _ in range(n):
-                    ub, sp, w = next(b for b in self.attn_buckets if self.host_pos < b[0])
+                    ub, sp, w, gcfg = next(b for b in self.attn_buckets if self.host_pos < b[0])
+                    if gcfg is not None:
+                        self.fl.set_gemv_launch_config(*gcfg)
                     self.launch_step_fused(attn_splits=sp, attn_warps=w)
                     self.host_pos += 1
             return
