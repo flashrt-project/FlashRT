@@ -600,8 +600,8 @@ router_mma_cluster_kernel(const uint16_t* __restrict__ xn, int n, const uint16_t
 
 template <typename Kernel>
 void set_smem_attr(Kernel fn, size_t bytes) {
-  cudaFuncSetAttribute(reinterpret_cast<const void*>(fn), cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       static_cast<int>(bytes));
+  check_cuda(cudaFuncSetAttribute(reinterpret_cast<const void*>(fn), cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       static_cast<int>(bytes)), "cudaFuncSetAttribute");
 }
 
 template <int BM, int ST, int KB, int EPI>
@@ -621,8 +621,8 @@ void launch_dense(const void* A, int M, int lda, const void* codes, const void* 
     attr[0].val.clusterDim.x = 1; attr[0].val.clusterDim.y = 1; attr[0].val.clusterDim.z = split;
     cfg.attrs = attr; cfg.numAttrs = 1;
   }
-  cudaLaunchKernelEx(&cfg, kern, static_cast<const uint16_t*>(A), M, lda, static_cast<const uint8_t*>(codes),
-                     static_cast<const uint8_t*>(scales), K, gs, C, ldc, qa);
+  check_cuda(cudaLaunchKernelEx(&cfg, kern, static_cast<const uint16_t*>(A), M, lda, static_cast<const uint8_t*>(codes),
+                     static_cast<const uint8_t*>(scales), K, gs, C, ldc, qa), "cudaLaunchKernelEx");
 }
 
 template <int BM, int ST, int KB, int EPI>
@@ -643,8 +643,8 @@ void launch_grouped(const void* A, const int* gather, int lda, const int* tiles,
     attr[0].val.clusterDim.x = 1; attr[0].val.clusterDim.y = 1; attr[0].val.clusterDim.z = split;
     cfg.attrs = attr; cfg.numAttrs = 1;
   }
-  cudaLaunchKernelEx(&cfg, kern, static_cast<const uint16_t*>(A), gather, lda, tiles, n_tiles,
-                     static_cast<const uint8_t*>(codes), static_cast<const uint8_t*>(scales), N, K, gs_e, C, ldc);
+  check_cuda(cudaLaunchKernelEx(&cfg, kern, static_cast<const uint16_t*>(A), gather, lda, tiles, n_tiles,
+                     static_cast<const uint8_t*>(codes), static_cast<const uint8_t*>(scales), N, K, gs_e, C, ldc), "cudaLaunchKernelEx");
 }
 
 // Default dense configuration for a shape (RTX 5090 search over the Flint matrices, M 16..8192):
@@ -733,13 +733,13 @@ void router_topk_rows_bf16(const void* xn, int n, const void* wr, int* ids, floa
                            const int* n_end, cudaStream_t s) {
   static int sms = 0;
   if (sms == 0) {
-    cudaFuncSetAttribute(reinterpret_cast<const void*>(router_mma_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         static_cast<int>(kRouterSmem));
-    cudaFuncSetAttribute(reinterpret_cast<const void*>(router_mma_cluster_kernel),
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kRouterSmemC));
+    check_cuda(cudaFuncSetAttribute(reinterpret_cast<const void*>(router_mma_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(kRouterSmem)), "cudaFuncSetAttribute");
+    check_cuda(cudaFuncSetAttribute(reinterpret_cast<const void*>(router_mma_cluster_kernel),
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kRouterSmemC)), "cudaFuncSetAttribute");
     int dev = 0;
-    cudaGetDevice(&dev);
-    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    check_cuda(cudaGetDevice(&dev), "cudaGetDevice");
+    check_cuda(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), "cudaDeviceGetAttribute");
   }
   const int blocks = (n + RT_M - 1) / RT_M;
   if (blocks * RC <= 2 * sms) {  // few token blocks: spread the experts over a cluster

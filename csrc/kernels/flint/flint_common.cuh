@@ -14,9 +14,17 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include <stdexcept>
+#include <string>
 
 namespace flash_rt {
 namespace flint {
+
+inline void check_cuda(cudaError_t status, const char* operation) {
+  if (status != cudaSuccess)
+    throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
+}
+
 
 __device__ __forceinline__ float bf16_to_f32(uint16_t b) {
   return __uint_as_float(static_cast<uint32_t>(b) << 16);
@@ -220,7 +228,7 @@ inline void launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t s
   attr[0].val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = attr;
   cfg.numAttrs = 1;
-  cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...);
+  check_cuda(cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...), "cudaLaunchKernelEx");
 }
 
 }  // namespace flint

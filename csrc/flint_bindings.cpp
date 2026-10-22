@@ -45,13 +45,15 @@ PYBIND11_MODULE(flash_rt_flint, m) {
   m.def("embed_at_pos_bf16", [](uintptr_t tokens, uintptr_t pos, uintptr_t table, uintptr_t out, uintptr_t stream) {
     fl::embed_at_pos_bf16(ptr<const int>(tokens), ptr<const int>(pos), ptr<const void>(table), ptr<void>(out),
                           to_stream(stream));
-  });
+          check_launch("embed_at_pos_bf16");
+        });
 
   m.def("add_rmsnorm_bf16",
         [](uintptr_t x, uintptr_t residual, uintptr_t w, uintptr_t out, int rows, float eps, int first,
            uintptr_t stream, int write_res) {
           fl::add_rmsnorm_bf16(ptr<const void>(x), ptr<void>(residual), ptr<const float>(w), ptr<void>(out),
                                rows, eps, first, to_stream(stream), write_res);
+          check_launch("add_rmsnorm_bf16");
         },
         py::arg("x"), py::arg("residual"), py::arg("w"), py::arg("out"), py::arg("rows"), py::arg("eps"),
         py::arg("first"), py::arg("stream"), py::arg("write_res") = 1);
@@ -63,6 +65,7 @@ PYBIND11_MODULE(flash_rt_flint, m) {
                              ptr<void>(out), N, K, gs, epilogue, to_stream(stream)) != 0)
             throw std::invalid_argument("gemv_w4a16: unsupported K=" + std::to_string(K) +
                                         " epilogue=" + std::to_string(epilogue));
+          check_launch("gemv_w4a16");
         });
 
   m.def("qk_norm_rope_kv_bf16",
@@ -72,6 +75,7 @@ PYBIND11_MODULE(flash_rt_flint, m) {
           fl::qk_norm_rope_kv_bf16(ptr<const void>(qkv), ptr<const float>(qw), ptr<const float>(kw),
                                    ptr<const float>(cos_t), ptr<const float>(sin_t), ptr<const int>(pos),
                                    ptr<void>(q_out), ptr<void>(cache), ring, rope, eps, to_stream(stream));
+          check_launch("qk_norm_rope_kv_bf16");
         });
 
   m.def("decode_attention_bf16",
@@ -82,6 +86,7 @@ PYBIND11_MODULE(flash_rt_flint, m) {
           fl::decode_attention_bf16(ptr<const void>(q), ptr<const void>(cache), ptr<const int>(pos), ring,
                                     window, ptr<const float>(sinks), scale, n_split, ptr<float>(o_part),
                                     ptr<float>(ml_part), ptr<void>(out), to_stream(stream));
+          check_launch("decode_attention_bf16");
         });
 
   m.def("router_topk_bf16",
@@ -89,6 +94,7 @@ PYBIND11_MODULE(flash_rt_flint, m) {
            uintptr_t stream) {
           fl::router_topk_bf16(ptr<const void>(xn), ptr<const void>(wr), ptr<float>(logits),
                                ptr<unsigned>(counter), ptr<int>(ids), ptr<float>(tw), to_stream(stream));
+          check_launch("router_topk_bf16");
         });
 
   m.def("moe_gate_up_bf16",
@@ -97,6 +103,7 @@ PYBIND11_MODULE(flash_rt_flint, m) {
           fl::moe_gate_up_bf16(ptr<const void>(xn), ptr<const int>(ids), ptr<const void>(ecodes),
                                ptr<const void>(escales), ptr<const float>(egs), ptr<const void>(scodes),
                                ptr<const void>(sscales), sgs, ptr<void>(act), to_stream(stream));
+          check_launch("moe_gate_up_bf16");
         });
 
   m.def("moe_down_combine_bf16",
@@ -106,6 +113,7 @@ PYBIND11_MODULE(flash_rt_flint, m) {
                                     ptr<const void>(ecodes), ptr<const void>(escales), ptr<const float>(egs),
                                     ptr<const void>(scodes), ptr<const void>(sscales), sgs, ptr<void>(out),
                                     to_stream(stream));
+          check_launch("moe_down_combine_bf16");
         });
 
   m.def("argmax_next_f32",
@@ -114,6 +122,7 @@ PYBIND11_MODULE(flash_rt_flint, m) {
           fl::argmax_next_f32(ptr<const float>(logits), n, ptr<float>(cand_v), ptr<int>(cand_i),
                               ptr<unsigned>(counter), ptr<int>(tokens), ptr<int>(pos), ptr<const int>(n_prompt),
                               to_stream(stream));
+          check_launch("argmax_next_f32");
         });
 
   m.attr("EPI_BF16") = fl::kEpiBf16;
@@ -124,7 +133,8 @@ PYBIND11_MODULE(flash_rt_flint, m) {
   m.def("embed_rows_bf16", [](uintptr_t tokens, uintptr_t pos, int n, uintptr_t table, uintptr_t out, uintptr_t stream) {
     fl::embed_rows_bf16(ptr<const int>(tokens), ptr<const int>(pos), n, ptr<const void>(table), ptr<void>(out),
                         to_stream(stream));
-  });
+          check_launch("embed_rows_bf16");
+        });
 
   m.def("qk_norm_rope_kv_rows_bf16",
         [](uintptr_t qkv, int n, uintptr_t qw, uintptr_t kw, uintptr_t cos_t, uintptr_t sin_t, uintptr_t pos,
@@ -133,6 +143,7 @@ PYBIND11_MODULE(flash_rt_flint, m) {
           fl::qk_norm_rope_kv_rows_bf16(ptr<const void>(qkv), n, ptr<const float>(qw), ptr<const float>(kw),
                                         ptr<const float>(cos_t), ptr<const float>(sin_t), ptr<const int>(pos),
                                         ptr<void>(q_out), ptr<void>(cache), ring, rope, eps, to_stream(stream));
+          check_launch("qk_norm_rope_kv_rows_bf16");
         });
 
   m.def("prefill_attention_bf16",
@@ -145,6 +156,7 @@ PYBIND11_MODULE(flash_rt_flint, m) {
                                           ptr<float>(o_part), ptr<float>(ml_part), ptr<unsigned>(counters), variant,
                                           to_stream(stream)) != 0)
             throw std::invalid_argument("prefill_attention_bf16: bad variant/split arguments");
+          check_launch("prefill_attention_bf16");
         });
 
   m.def("gemm_w4a16_qkrope",
@@ -157,6 +169,7 @@ PYBIND11_MODULE(flash_rt_flint, m) {
                                     ring, rope, eps, to_stream(stream)) != 0)
             throw std::invalid_argument("gemm_w4a16_qkrope: unsupported N=" + std::to_string(N) + " K=" +
                                         std::to_string(K));
+          check_launch("gemm_w4a16_qkrope");
         });
   m.def("gemm_w4a16",
         [](uintptr_t A, int M, int lda, uintptr_t codes, uintptr_t scales, int N, int K, float gs, uintptr_t C, int ldc,
@@ -165,6 +178,7 @@ PYBIND11_MODULE(flash_rt_flint, m) {
                              ptr<void>(C), ldc, epilogue, to_stream(stream)) != 0)
             throw std::invalid_argument("gemm_w4a16: unsupported N=" + std::to_string(N) + " K=" + std::to_string(K) +
                                         " epilogue=" + std::to_string(epilogue));
+          check_launch("gemm_w4a16");
         });
 
   m.def("gemm_w4a16_grouped",
@@ -178,6 +192,7 @@ PYBIND11_MODULE(flash_rt_flint, m) {
             throw std::invalid_argument("gemm_w4a16_grouped: unsupported N=" + std::to_string(N) + " K=" +
                                         std::to_string(K) + " epilogue=" + std::to_string(epilogue) +
                                         " tile_rows=" + std::to_string(tile_rows));
+          check_launch("gemm_w4a16_grouped");
         });
 
   m.def("gemm_w4a16_cfg",
@@ -187,6 +202,7 @@ PYBIND11_MODULE(flash_rt_flint, m) {
                                  ptr<void>(C), ldc, epilogue, fl::GemmConfig{bm, stages, split, kb},
                                  to_stream(stream)) != 0)
             throw std::invalid_argument("gemm_w4a16_cfg: unsupported configuration");
+          check_launch("gemm_w4a16_cfg");
         });
 
   m.def("set_gemm_override", [](int bm, int stages, int split, int kb, int gbm, int gstages, int gsplit, int gkb) {
@@ -198,6 +214,7 @@ PYBIND11_MODULE(flash_rt_flint, m) {
            uintptr_t n_end, uintptr_t stream) {
           fl::router_topk_rows_bf16(ptr<const void>(xn), n, ptr<const void>(wr), ptr<int>(ids), ptr<float>(tw),
                                     ptr<int>(counts), ptr<const int>(pos), ptr<const int>(n_end), to_stream(stream));
+          check_launch("router_topk_rows_bf16");
         });
 
   m.def("moe_scan_place",
@@ -206,12 +223,14 @@ PYBIND11_MODULE(flash_rt_flint, m) {
           fl::moe_scan_place(ptr<const int>(ids), n, tile_rows, ptr<int>(counts), ptr<int>(sorted_tok), ptr<int>(inv),
                              ptr<int>(tiles), ptr<int>(n_tiles), ptr<const int>(pos), ptr<const int>(n_end),
                              to_stream(stream));
+          check_launch("moe_scan_place");
         });
 
   m.def("moe_combine_rows_bf16",
         [](uintptr_t y, uintptr_t inv, uintptr_t tw, uintptr_t shared, uintptr_t out, int n, uintptr_t stream) {
           fl::moe_combine_rows_bf16(ptr<const void>(y), ptr<const int>(inv), ptr<const float>(tw),
                                     ptr<const void>(shared), ptr<void>(out), n, to_stream(stream));
+          check_launch("moe_combine_rows_bf16");
         });
 
   m.def("moe_combine_norm_rows_bf16",
@@ -220,9 +239,12 @@ PYBIND11_MODULE(flash_rt_flint, m) {
           fl::moe_combine_norm_rows_bf16(ptr<const void>(y), ptr<const int>(inv), ptr<const float>(tw),
                                          ptr<const void>(shared), ptr<void>(residual), ptr<const float>(w),
                                          ptr<void>(out), n, eps, to_stream(stream));
+          check_launch("moe_combine_norm_rows_bf16");
         });
 
-  m.def("advance_pos", [](uintptr_t pos, int n, uintptr_t stream) { fl::advance_pos(ptr<int>(pos), n, to_stream(stream)); });
+  m.def("advance_pos", [](uintptr_t pos, int n, uintptr_t stream) { fl::advance_pos(ptr<int>(pos), n, to_stream(stream));
+          check_launch("advance_pos");
+        });
 
   // ---- fused decode step (PDL) ----
   m.def("gemv_fused_w4a16",
@@ -233,11 +255,13 @@ PYBIND11_MODULE(flash_rt_flint, m) {
                               ptr<void>(out), N, K, gs, epilogue, to_stream(stream)) != 0)
             throw std::invalid_argument("gemv_fused_w4a16: unsupported K=" + std::to_string(K) + " epilogue=" +
                                         std::to_string(epilogue) + (norm_w ? " (fused norm)" : ""));
+          check_launch("gemv_fused_w4a16");
         });
   m.def("add_rmsnorm_pdl_bf16",
         [](uintptr_t x, uintptr_t res_in, uintptr_t w, float eps, uintptr_t res_out, uintptr_t out, uintptr_t stream) {
           fl::add_rmsnorm_pdl_bf16(ptr<const void>(x), ptr<const void>(res_in), ptr<const float>(w), eps, ptr<void>(res_out),
                                 ptr<void>(out), to_stream(stream));
+          check_launch("add_rmsnorm_pdl_bf16");
         });
   m.def("lm_head_greedy_w4a16",
         [](uintptr_t codes, uintptr_t scales, uintptr_t x, uintptr_t res_in, uintptr_t res_out, uintptr_t norm_w,
@@ -249,6 +273,7 @@ PYBIND11_MODULE(flash_rt_flint, m) {
                                        ptr<unsigned>(counter), ptr<int>(tokens), ptr<int>(pos),
                                        ptr<const int>(n_prompt), to_stream(stream)) != 0)
             throw std::invalid_argument("lm_head_greedy_w4a16: unsupported rows per warp or candidate buffer too small");
+          check_launch("lm_head_greedy_w4a16");
         });
   m.def("router_norm_bf16",
         [](uintptr_t x, uintptr_t res_in, uintptr_t nw, float eps, uintptr_t res_out, uintptr_t xn_out, uintptr_t wr,
@@ -256,6 +281,7 @@ PYBIND11_MODULE(flash_rt_flint, m) {
           fl::router_norm_bf16(ptr<const void>(x), ptr<const void>(res_in), ptr<const float>(nw), eps, ptr<void>(res_out),
                                ptr<void>(xn_out), ptr<const void>(wr), ptr<float>(logits), ptr<unsigned>(counter),
                                ptr<int>(ids), ptr<float>(tw), to_stream(stream));
+          check_launch("router_norm_bf16");
         });
   m.def("moe_gate_up_pdl_bf16",
         [](uintptr_t xn, uintptr_t ids, uintptr_t ecodes, uintptr_t escales, uintptr_t egs, uintptr_t scodes,
@@ -263,6 +289,7 @@ PYBIND11_MODULE(flash_rt_flint, m) {
           fl::moe_gate_up_pdl_bf16(ptr<const void>(xn), ptr<const int>(ids), ptr<const void>(ecodes), ptr<const void>(escales),
                                 ptr<const float>(egs), ptr<const void>(scodes), ptr<const void>(sscales), sgs,
                                 ptr<void>(act), to_stream(stream));
+          check_launch("moe_gate_up_pdl_bf16");
         });
   m.def("moe_down_combine_pdl_bf16",
         [](uintptr_t act, uintptr_t ids, uintptr_t tw, uintptr_t ecodes, uintptr_t escales, uintptr_t egs,
@@ -271,10 +298,12 @@ PYBIND11_MODULE(flash_rt_flint, m) {
                                      ptr<const void>(ecodes), ptr<const void>(escales), ptr<const float>(egs),
                                      ptr<const void>(scodes), ptr<const void>(sscales), sgs, ptr<void>(out),
                                      to_stream(stream));
+          check_launch("moe_down_combine_pdl_bf16");
         });
   m.def("embed_pdl_bf16", [](uintptr_t tokens, uintptr_t pos, uintptr_t table, uintptr_t out, uintptr_t stream) {
     fl::embed_pdl_bf16(ptr<const int>(tokens), ptr<const int>(pos), ptr<const void>(table), ptr<void>(out), to_stream(stream));
-  });
+          check_launch("embed_pdl_bf16");
+        });
   m.def("decode_attention_fused_bf16",
         [](uintptr_t qkv, uintptr_t qw, uintptr_t kw, uintptr_t cos_t, uintptr_t sin_t, uintptr_t pos, uintptr_t cache,
            int ring, int window, int rope, float eps, uintptr_t sinks, float scale, int n_split, uintptr_t o_part,
@@ -289,6 +318,7 @@ PYBIND11_MODULE(flash_rt_flint, m) {
                                               ptr<unsigned>(counters), ptr<void>(out), to_stream(stream),
                                               ptr<const unsigned long long>(pf_ranges), n_pf, kv_slots) != 0)
             throw std::invalid_argument("decode_attention_fused_bf16: warps must be 4, 8 or 16");
+          check_launch("decode_attention_fused_bf16");
         },
         py::arg("qkv"), py::arg("qw"), py::arg("kw"), py::arg("cos_t"), py::arg("sin_t"), py::arg("pos"), py::arg("cache"),
         py::arg("ring"), py::arg("window"), py::arg("rope"), py::arg("eps"), py::arg("sinks"), py::arg("scale"),

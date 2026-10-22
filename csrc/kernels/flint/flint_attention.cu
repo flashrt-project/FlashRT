@@ -533,10 +533,10 @@ static void launch_attn_fused(const void* qkv, const float* qw, const float* kw,
   constexpr size_t smem = kGroup * kD * 2 + WARPS * kGroup * kD * 4 + 2 * WARPS * kGroup * 4;
   static bool init = false;
   if (!init) {
-    cudaFuncSetAttribute(decode_attn_fused_kernel<WARPS, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         static_cast<int>(smem));
-    cudaFuncSetAttribute(decode_attn_fused_kernel<WARPS, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         static_cast<int>(smem));
+    check_cuda(cudaFuncSetAttribute(decode_attn_fused_kernel<WARPS, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(smem)), "cudaFuncSetAttribute");
+    check_cuda(cudaFuncSetAttribute(decode_attn_fused_kernel<WARPS, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(smem)), "cudaFuncSetAttribute");
     init = true;
   }
   const bool cluster = n_split >= 2 && n_split <= 8 && attn_cluster_enabled();
@@ -561,9 +561,9 @@ static void launch_attn_fused(const void* qkv, const float* qw, const float* kw,
   attr[1].val.programmaticStreamSerializationAllowed = pdl_enabled() ? 1 : 0;
   cfg.attrs = attr;
   cfg.numAttrs = 2;
-  cudaLaunchKernelEx(&cfg, decode_attn_fused_kernel<WARPS, true>, static_cast<const uint16_t*>(qkv), qw, kw, cos_t,
+  check_cuda(cudaLaunchKernelEx(&cfg, decode_attn_fused_kernel<WARPS, true>, static_cast<const uint16_t*>(qkv), qw, kw, cos_t,
                      sin_t, pos, static_cast<uint16_t*>(cache), ring, window, rope, eps, sinks, scale, o_part, ml_part,
-                     counters, static_cast<uint16_t*>(out), pf_ranges, n_pf, slot_stride, head_stride, v_off);
+                     counters, static_cast<uint16_t*>(out), pf_ranges, n_pf, slot_stride, head_stride, v_off), "cudaLaunchKernelEx");
 }
 
 int decode_attention_fused_bf16(const void* qkv, const float* q_norm_w, const float* k_norm_w, const float* cos_t,
@@ -847,8 +847,8 @@ void launch_prefill_attn(const void* q, int n, const void* cache, const int* pos
   constexpr int smem = ST * PKV * kD * 2 * 2;
   static bool attr = false;
   if (!attr) {
-    cudaFuncSetAttribute(reinterpret_cast<const void*>(prefill_attn_kernel<PKV, ST>),
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    check_cuda(cudaFuncSetAttribute(reinterpret_cast<const void*>(prefill_attn_kernel<PKV, ST>),
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem), "cudaFuncSetAttribute");
     attr = true;
   }
   prefill_attn_kernel<PKV, ST><<<dim3(((n + PQ - 1) / PQ) * n_split, 4), 256, smem, s>>>(

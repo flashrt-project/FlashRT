@@ -77,6 +77,8 @@ def deq_ref(codes, scales):
 def close_bf16(got, want, name, rel=2.0 ** -7, abs_frac=1e-3):
     got = got.double().cpu()
     want = want.double().cpu()
+    assert bool(torch.isfinite(got).all()), f"{name}: non-finite output"
+    assert bool(torch.isfinite(want).all()), f"{name}: non-finite reference"
     tol = rel * want.abs() + abs_frac * want.abs().max()
     bad = (got - want).abs() > tol
     assert not bool(bad.any()), f"{name}: {int(bad.sum())} elements out of tolerance, max|diff|={(got - want).abs().max():.3e}"

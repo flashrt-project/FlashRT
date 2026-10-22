@@ -19,6 +19,13 @@ flash_rt.load_model    # → VLAModel
 flash_rt.VLAModel      # inference wrapper
 ```
 
+Text-only Flint is an opt-in, model-specific entry point:
+`flash_rt.frontends.torch.flint_rtx.FlintTorchFrontendRtx`. It supports torch on
+SM120 with the official NVFP4 GGUF, batch 1 and greedy decoding. It is outside
+the VLA `load_model` / `predict` surface; `config="flint"` raises with a pointer
+to the direct frontend. See [Flint usage](flint_usage.md). Existing stable
+signatures and routing defaults are unchanged.
+
 ### `flash_rt.load_model(...)`
 
 ```python

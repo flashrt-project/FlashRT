@@ -150,6 +150,8 @@ def load_config(gguf: GGUFFile) -> FlintConfig:
 def _validate(cfg: FlintConfig) -> None:
     """Shape assumptions the Flint kernels are specialized for."""
     expect = {
+        "num_layers": 49, "num_dense_layers": 2, "dense_intermediate_size": 6144,
+        "sliding_window": 513,
         "hidden_size": 2048, "num_heads": 32, "num_kv_heads": 4, "head_dim": 128,
         "num_experts": 256, "num_experts_per_tok": 6, "expert_intermediate_size": 512,
         "shared_intermediate_size": 1024,

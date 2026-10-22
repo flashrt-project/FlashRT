@@ -69,6 +69,7 @@ class FlintEngine:
         """Async iterator of ('text', str) events, then ('done', finish_reason, usage, timings)."""
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
+        finished = loop.create_future()
         eog = self.fe.eog
 
         def worker():
@@ -103,14 +104,25 @@ class FlintEngine:
                 loop.call_soon_threadsafe(queue.put_nowait, ('done', finish, usage, timings))
             except Exception as exc:  # surface errors to the request
                 loop.call_soon_threadsafe(queue.put_nowait, ('error', repr(exc)))
+            finally:
+                loop.call_soon_threadsafe(finished.set_result, None)
 
         async with self.lock:
             threading.Thread(target=worker, daemon=True).start()
-            while True:
-                ev = await queue.get()
-                yield ev
-                if ev[0] in ('done', 'error'):
-                    return
+            try:
+                while True:
+                    ev = await queue.get()
+                    yield ev
+                    if ev[0] in ('done', 'error'):
+                        return
+            finally:
+                # A disconnected client must not let another request overwrite
+                # the worker's live buffers. Preserve cancellation after drain.
+                while not finished.done():
+                    try:
+                        await asyncio.shield(finished)
+                    except asyncio.CancelledError:
+                        continue
 
 
 def build_app(engine: FlintEngine):

@@ -9,7 +9,7 @@ CUDA graph and replayed per token. GGUF is only the weight container; no
 llama.cpp code is involved.
 
     from flash_rt.frontends.torch.flint_rtx import FlintTorchFrontendRtx
-    fe = FlintTorchFrontendRtx("/models/flint-nvfp4.gguf", max_seq=131072)
+    fe = FlintTorchFrontendRtx("<path-to-flint-nvfp4.gguf>", max_seq=131072)
     text = fe.chat([{"role": "user", "content": "Write a quicksort in Python."}], max_new_tokens=512)
 
 Constructed directly rather than through ``load_model`` (a text decoder has no
@@ -23,7 +23,7 @@ from typing import Dict, Iterator, List, Optional, Sequence
 import torch
 
 from flash_rt.models.flint.config import FlintConfig
-from flash_rt.models.flint.pipeline_rtx import FlintRuntime
+from flash_rt.frontends.torch._flint_rtx_runtime import FlintRuntime
 from flash_rt.models.flint.tokenizer import FlintTokenizer
 
 __all__ = ["FlintTorchFrontendRtx"]
@@ -34,6 +34,8 @@ class FlintTorchFrontendRtx:
 
     def __init__(self, gguf_path: str, max_seq: int = 32768, prefill_chunk: Optional[int] = None,
                  attn_splits: int = 16, device: int = 0, check_block: int = 16):
+        if check_block < 1:
+            raise ValueError("check_block must be positive")
         self.rt = FlintRuntime(gguf_path, max_seq=max_seq, prefill_chunk=prefill_chunk,
                                attn_splits=attn_splits, device=device)
         self.cfg: FlintConfig = self.rt.cfg
@@ -55,6 +57,12 @@ class FlintTorchFrontendRtx:
 
         ``reuse_prefix``: keep the KV cache of the longest common prefix with the previous sequence (its
         prompt and generated tokens) and prefill only the rest."""
+        if not prompt_ids:
+            raise ValueError("prompt_ids must be non-empty")
+        if max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be positive")
+        if any(t < 0 or t >= self.cfg.vocab_size for t in prompt_ids):
+            raise ValueError("prompt token id outside the checkpoint vocabulary")
         n = len(prompt_ids)
         if n + max_new_tokens + 2 * self.check_block > self.rt.max_seq:
             raise ValueError(f"prompt {n} + {max_new_tokens} new tokens exceeds max_seq {self.rt.max_seq}")
