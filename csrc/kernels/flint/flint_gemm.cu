@@ -16,12 +16,16 @@
 #include "flint_common.cuh"
 #include "flint_kernels.cuh"
 
+#include <cfloat>
+#include <cooperative_groups.h>
+namespace cg = cooperative_groups;
+
 namespace flash_rt {
 namespace flint {
 
 namespace {
 
-constexpr int BN = 128, BK = 64, STAGES = 3, THREADS = 256;
+constexpr int BN = 128, BK = 64, THREADS = 256;  // BK: router k-tile
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(p));
@@ -63,46 +67,76 @@ __device__ __forceinline__ uint32_t dq_byte_bf16x2(uint32_t byte, uint32_t s2) {
   return out;
 }
 
-struct SmemStage {
-  uint16_t a[128 * BK];        // BM <= 128 rows x 64 bf16, 16B chunks XOR-swizzled by row
-  uint8_t w[BN * BK / 2];      // 128 rows x 32 code bytes
-  uint8_t s[BN * BK / 16];     // 128 rows x 4 scale bytes
+// One pipeline stage covers KB sub-tiles of 64 k (32 * KB code bytes per weight row: whole DRAM
+// sectors per row for KB >= 2, which is what makes streaming-bound shapes reach full bandwidth).
+template <int BM, int ST, int KB>
+struct GemmSmem {
+  uint16_t a[ST][BM * 64 * KB];    // BM rows x 64*KB bf16; 16B chunks XOR-swizzled by row within groups of 8
+  uint8_t w[ST][BN * 32 * KB];     // 128 rows x 32*KB code bytes; 16B chunks XOR-swizzled by row
+  uint8_t s[ST][BN * 4 * KB];      // 128 rows x 4*KB scale bytes
 };
 
-// Shared main loop. a_src(r) returns the global address of A row r (nullptr = zero row).
-template <int BM, int EPI, typename ARow>
-__device__ __forceinline__ void gemm_body(ARow a_row, int m_rows, const uint8_t* __restrict__ W,
-                                          const uint8_t* __restrict__ S, int K, int n0, float gs,
-                                          void* __restrict__ C, int c_row0, int ldc) {
-  constexpr int WM = BM / 64;           // warps along M
-  constexpr int WN = 8 / WM;            // warps along N
-  constexpr int NT = (BN / WN) / 8;     // n-tiles per warp
-  constexpr int MT = 4;                 // m-tiles per warp (64 rows)
+// Dynamic shared memory of a configuration: the stage ring, or the fp32 split-K exchange tile.
+template <int BM, int ST, int KB>
+constexpr size_t gemm_smem_bytes(int split) {
+  return split > 1 && static_cast<size_t>(BM) * BN * 4 > sizeof(GemmSmem<BM, ST, KB>)
+             ? static_cast<size_t>(BM) * BN * 4
+             : sizeof(GemmSmem<BM, ST, KB>);
+}
+
+__device__ __forceinline__ int a_chunk(int r, int ch) { return (ch & ~7) | ((ch ^ r) & 7); }
+template <int KB>
+__device__ __forceinline__ int w_chunk(int r, int ch) { return ch ^ (r & (2 * KB - 1)); }
+
+template <int BYTES>
+__device__ __forceinline__ void cp_async_small(uint32_t dst, const void* src) {
+  if constexpr (BYTES == 16)
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(src));
+  else
+    asm volatile("cp.async.ca.shared.global [%0], [%1], %2;" ::"r"(dst), "l"(src), "n"(BYTES));
+}
+
+// Shared main loop over stages [kt0, kt0 + nkt) (stage = 64*KB k). arow[i] is the global address of the
+// A row loaded by this thread's i-th chunk group (nullptr = zero row). split > 1: the CTAs of a (1, 1, split)
+// cluster each reduce a K slice; rank 0 sums the fp32 partials in rank order through DSMEM and stores.
+// Warp layout: BM = 128 -> 2 x 4 warps (64 x 32 each); BM <= 64 -> 1 x 8 warps (BM x 16 each).
+template <int BM, int ST, int KB, int EPI>
+__device__ __forceinline__ void gemm_body(const uint16_t* const* arow, int m_rows, const uint8_t* __restrict__ W,
+                                          const uint8_t* __restrict__ S, int K, int kt0, int nkt, int split, int n0,
+                                          float gs, void* __restrict__ C, int c_row0, int ldc) {
+  constexpr int WM = BM >= 128 ? 2 : 1;  // warps along M
+  constexpr int WN = 8 / WM;             // warps along N
+  constexpr int MT = BM / (16 * WM);     // m-tiles per warp
+  constexpr int NT = BN / (WN * 8);      // n-tiles per warp
+  constexpr int ACH = 8 * KB;            // 16B chunks per A row per stage
+  constexpr int AI = (BM * ACH + THREADS - 1) / THREADS;
+  constexpr int SK = 64 * KB;            // k per stage
   extern __shared__ __align__(16) uint8_t smem_raw[];
-  SmemStage* st = reinterpret_cast<SmemStage*>(smem_raw);
+  GemmSmem<BM, ST, KB>& sm = *reinterpret_cast<GemmSmem<BM, ST, KB>*>(smem_raw);
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int g = lane >> 2, t = lane & 3;
-  const int wm0 = (warp / WN) * 64, wn0 = (warp % WN) * (BN / WN);
-  const int KT = K / BK;
+  const int wm0 = (warp / WN) * (MT * 16), wn0 = (warp % WN) * (BN / WN);
 
   auto load_stage = [&](int stage, int kt) {
-    SmemStage& sm = st[stage];
-    // A: BM rows x 8 chunks
 #pragma unroll
-    for (int i = 0; i < (BM * 8) / THREADS; ++i) {
+    for (int i = 0; i < AI; ++i) {
       const int c = tid + i * THREADS;
-      const int r = c >> 3, ch = c & 7;
-      const uint16_t* src = (r < m_rows) ? a_row(r) : nullptr;
-      const bool ok = src != nullptr;
-      cp_async16(smem_u32(sm.a + r * BK + ((ch ^ (r & 7)) << 3)),
-                 ok ? static_cast<const void*>(src + kt * BK + ch * 8) : static_cast<const void*>(W), ok);
+      if (BM * ACH % THREADS == 0 || c < BM * ACH) {
+        const int r = c / ACH, ch = c % ACH;
+        const bool ok = arow[i] != nullptr;
+        cp_async16(smem_u32(sm.a[stage] + r * SK + (a_chunk(r, ch) << 3)),
+                   ok ? static_cast<const void*>(arow[i] + kt * SK + ch * 8) : static_cast<const void*>(W), ok);
+      }
     }
-    // W codes: 128 rows x 2 chunks
-    {
-      const int r = tid >> 1, ch = tid & 1;
-      cp_async16(smem_u32(sm.w + r * 32 + ch * 16), W + static_cast<size_t>(n0 + r) * (K / 2) + kt * 32 + ch * 16, true);
+#pragma unroll
+    for (int i = 0; i < KB; ++i) {  // 128 rows x 2*KB chunks
+      const int c = tid + i * THREADS, r = c / (2 * KB), ch = c % (2 * KB);
+      cp_async16(smem_u32(sm.w[stage] + r * 32 * KB + (w_chunk<KB>(r, ch) << 4)),
+                 W + static_cast<size_t>(n0 + r) * (K / 2) + kt * 32 * KB + ch * 16, true);
     }
-    if (tid < BN) cp_async4(smem_u32(sm.s + tid * 4), S + static_cast<size_t>(n0 + tid) * (K / 16) + kt * 4, true);
+    if (tid < BN)
+      cp_async_small<4 * KB>(smem_u32(sm.s[stage] + tid * 4 * KB),
+                             S + static_cast<size_t>(n0 + tid) * (K / 16) + kt * 4 * KB);
   };
 
   float acc[MT][NT][4];
@@ -112,48 +146,78 @@ __device__ __forceinline__ void gemm_body(ARow a_row, int m_rows, const uint8_t*
     for (int j = 0; j < NT; ++j) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
 
 #pragma unroll
-  for (int s = 0; s < STAGES - 1; ++s) {
-    if (s < KT) load_stage(s, s);
+  for (int s = 0; s < ST - 1; ++s) {
+    if (s < nkt) load_stage(s, kt0 + s);
     cp_commit();
   }
-  for (int kt = 0; kt < KT; ++kt) {
-    cp_wait<STAGES - 2>();
+  for (int j = 0; j < nkt; ++j) {
+    cp_wait<ST - 2>();
     __syncthreads();
-    if (kt + STAGES - 1 < KT) load_stage((kt + STAGES - 1) % STAGES, kt + STAGES - 1);
+    if (j + ST - 1 < nkt) load_stage((j + ST - 1) % ST, kt0 + j + ST - 1);
     cp_commit();
-    const SmemStage& sm = st[kt % STAGES];
-    // B operands for all n-tiles of this k-tile (4 k-steps).
-    uint32_t bw[NT][8];
-    uint32_t bs[NT];
+    const int stg = j % ST;
 #pragma unroll
-    for (int nt = 0; nt < NT; ++nt) {
-      const int r = wn0 + nt * 8 + g;
-      const uint4 w0 = *reinterpret_cast<const uint4*>(sm.w + r * 32);
-      const uint4 w1 = *reinterpret_cast<const uint4*>(sm.w + r * 32 + 16);
-      bw[nt][0] = w0.x; bw[nt][1] = w0.y; bw[nt][2] = w0.z; bw[nt][3] = w0.w;
-      bw[nt][4] = w1.x; bw[nt][5] = w1.y; bw[nt][6] = w1.z; bw[nt][7] = w1.w;
-      bs[nt] = *reinterpret_cast<const uint32_t*>(sm.s + r * 4);
-    }
-#pragma unroll
-    for (int ks = 0; ks < 4; ++ks) {
-      uint32_t af[MT][4];
-#pragma unroll
-      for (int mt = 0; mt < MT; ++mt) {
-        const int r = wm0 + mt * 16 + (lane & 15);
-        const int ch = ks * 2 + (lane >> 4);
-        ldmatrix_x4(af[mt], smem_u32(sm.a + r * BK + ((ch ^ (r & 7)) << 3)));
-      }
+    for (int sub = 0; sub < KB; ++sub) {
+      uint32_t bw[NT][8];
+      uint32_t bs[NT];
 #pragma unroll
       for (int nt = 0; nt < NT; ++nt) {
-        const uint32_t s2 = e4m3_to_f16x2((bs[nt] >> (8 * ks)) & 0xff);
-        const uint32_t b0 = dq_byte_bf16x2((bw[nt][2 * ks] >> (8 * t)) & 0xff, s2);
-        const uint32_t b1 = dq_byte_bf16x2((bw[nt][2 * ks + 1] >> (8 * t)) & 0xff, s2);
+        const int r = wn0 + nt * 8 + g;
+        const uint8_t* wr = sm.w[stg] + r * 32 * KB;
+        const uint4 w0 = *reinterpret_cast<const uint4*>(wr + (w_chunk<KB>(r, 2 * sub) << 4));
+        const uint4 w1 = *reinterpret_cast<const uint4*>(wr + (w_chunk<KB>(r, 2 * sub + 1) << 4));
+        bw[nt][0] = w0.x; bw[nt][1] = w0.y; bw[nt][2] = w0.z; bw[nt][3] = w0.w;
+        bw[nt][4] = w1.x; bw[nt][5] = w1.y; bw[nt][6] = w1.z; bw[nt][7] = w1.w;
+        bs[nt] = *reinterpret_cast<const uint32_t*>(sm.s[stg] + r * 4 * KB + sub * 4);
+      }
 #pragma unroll
-        for (int mt = 0; mt < MT; ++mt) mma16816(acc[mt][nt], af[mt], b0, b1);
+      for (int ks = 0; ks < 4; ++ks) {
+        uint32_t af[MT][4];
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt) {
+          const int r = wm0 + mt * 16 + (lane & 15);
+          const int ch = sub * 8 + ks * 2 + (lane >> 4);
+          ldmatrix_x4(af[mt], smem_u32(sm.a[stg] + r * SK + (a_chunk(r, ch) << 3)));
+        }
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+          const uint32_t s2 = e4m3_to_f16x2((bs[nt] >> (8 * ks)) & 0xff);
+          const uint32_t b0 = dq_byte_bf16x2((bw[nt][2 * ks] >> (8 * t)) & 0xff, s2);
+          const uint32_t b1 = dq_byte_bf16x2((bw[nt][2 * ks + 1] >> (8 * t)) & 0xff, s2);
+#pragma unroll
+          for (int mt = 0; mt < MT; ++mt) mma16816(acc[mt][nt], af[mt], b0, b1);
+        }
       }
     }
   }
   cp_wait<0>();
+
+  if (split > 1) {
+    cg::cluster_group cluster = cg::this_cluster();
+    __syncthreads();
+    float* red = reinterpret_cast<float*>(smem_raw);
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+      for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) red[((mt * NT + nt) * 4 + e) * THREADS + tid] = acc[mt][nt][e];
+    cluster.sync();
+    const bool leader = cluster.block_rank() == 0;
+    if (leader) {
+      for (int r = 1; r < split; ++r) {
+        const float* rem = cluster.map_shared_rank(red, r);
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+          for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[mt][nt][e] += rem[((mt * NT + nt) * 4 + e) * THREADS + tid];
+      }
+    }
+    cluster.sync();
+    if (!leader) return;
+  }
 
   // ---- epilogue ----
 #pragma unroll
@@ -198,82 +262,324 @@ __device__ __forceinline__ void gemm_body(ARow a_row, int m_rows, const uint8_t*
   }
 }
 
-template <int BM, int EPI>
+template <int BM, int KB>
+__device__ __forceinline__ int a_row_of(int i) {
+  return (threadIdx.x + i * THREADS) / (8 * KB);
+}
+
+// grid (ceil(M / BM), N / BN, split); split > 1 is launched as (1, 1, split) clusters.
+template <int BM, int ST, int KB, int EPI>
 __global__ void __launch_bounds__(THREADS)
 gemm_dense_kernel(const uint16_t* __restrict__ A, int M, int lda, const uint8_t* __restrict__ W,
                   const uint8_t* __restrict__ S, int K, float gs, void* __restrict__ C, int ldc) {
+  constexpr int AI = (BM * 8 * KB + THREADS - 1) / THREADS;
   const int m0 = blockIdx.x * BM, n0 = blockIdx.y * BN;
-  auto a_row = [&](int r) -> const uint16_t* { return A + static_cast<size_t>(m0 + r) * lda; };
-  gemm_body<BM, EPI>(a_row, min(BM, M - m0), W, S, K, n0, gs, C, m0, ldc);
+  const int rows = min(BM, M - m0);
+  const uint16_t* arow[AI];
+#pragma unroll
+  for (int i = 0; i < AI; ++i) {
+    const int r = a_row_of<BM, KB>(i);
+    arow[i] = r < rows ? A + static_cast<size_t>(m0 + r) * lda : nullptr;
+  }
+  const int split = gridDim.z, nkt = K / (64 * KB) / split;
+  gemm_body<BM, ST, KB, EPI>(arow, rows, W, S, K, blockIdx.z * nkt, nkt, split, n0, gs, C, m0, ldc);
 }
 
-// Grouped: tile i covers sorted rows [row0, row0 + rows) of expert e.
-// A rows are gathered: A + gather[row] * lda (gather == nullptr: row itself).
-template <int BM, int EPI>
+// Grouped: tile i covers sorted rows [row0, row0 + rows) of expert e (rows <= BM).
+// A rows are gathered: A + gather[row] * lda (gather == nullptr: row itself). grid (max_tiles, N / BN, split).
+template <int BM, int ST, int KB, int EPI>
 __global__ void __launch_bounds__(THREADS)
 gemm_grouped_kernel(const uint16_t* __restrict__ A, const int* __restrict__ gather, int lda,
                     const int* __restrict__ tiles, const int* __restrict__ n_tiles, const uint8_t* __restrict__ W,
                     const uint8_t* __restrict__ S, int N, int K, const float* __restrict__ gs_e,
                     void* __restrict__ C, int ldc) {
-  if (static_cast<int>(blockIdx.x) >= *n_tiles) return;
+  constexpr int AI = (BM * 8 * KB + THREADS - 1) / THREADS;
+  if (static_cast<int>(blockIdx.x) >= *n_tiles) return;  // whole clusters exit together (cluster spans z)
   const int e = tiles[3 * blockIdx.x], row0 = tiles[3 * blockIdx.x + 1], rows = tiles[3 * blockIdx.x + 2];
   const int n0 = blockIdx.y * BN;
+  const uint16_t* arow[AI];
+#pragma unroll
+  for (int i = 0; i < AI; ++i) {
+    const int r = a_row_of<BM, KB>(i);
+    arow[i] = r < rows ? A + static_cast<size_t>(gather ? gather[row0 + r] : row0 + r) * lda : nullptr;
+  }
   const uint8_t* We = W + static_cast<size_t>(e) * N * (K / 2);
   const uint8_t* Se = S + static_cast<size_t>(e) * N * (K / 16);
-  auto a_row = [&](int r) -> const uint16_t* {
-    const int rr = row0 + r;
-    return A + static_cast<size_t>(gather ? gather[rr] : rr) * lda;
-  };
-  gemm_body<BM, EPI>(a_row, rows, We, Se, K, n0, gs_e[e], C, row0, ldc);
+  const int split = gridDim.z, nkt = K / (64 * KB) / split;
+  gemm_body<BM, ST, KB, EPI>(arow, rows, We, Se, K, blockIdx.z * nkt, nkt, split, n0, gs_e[e], C, row0, ldc);
 }
 
-constexpr size_t kSmem = sizeof(SmemStage) * STAGES;
+// ---- many-token router: bf16 tensor-core logits + top-6 ----
+// 32 tokens per CTA, all 256 experts (warp w owns experts [32w, 32w + 32)); logits are rounded to
+// bf16 and selected with the decode rule (top-6, ties to the lower id, sigmoid, renormalize, bf16
+// weights). Selected experts are counted into counts[256] for moe_scan_place.
+constexpr int RT_M = 32, RT_STAGES = 2, RT_EXPERTS = 256, RT_K = 2048, RT_TOPK = 6;
 
-template <int BM, int EPI>
-void set_smem_attr(const void* fn) {
-  static bool done = false;  // set once per instantiation, before graph capture
-  if (!done) {
-    cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSmem));
-    done = true;
+struct RouterStage {
+  uint16_t a[RT_M * BK];
+  uint16_t b[RT_EXPERTS * BK];
+};
+constexpr size_t kRouterSmem = sizeof(RouterStage) * RT_STAGES;
+static_assert(kRouterSmem >= RT_M * RT_EXPERTS * sizeof(float), "logit tile must fit in the stage buffers");
+
+__global__ void __launch_bounds__(THREADS)
+router_mma_kernel(const uint16_t* __restrict__ xn, int n, const uint16_t* __restrict__ wr, int* __restrict__ ids,
+                  float* __restrict__ tw, int* __restrict__ counts) {
+  extern __shared__ __align__(16) uint8_t smem_raw[];
+  RouterStage* st = reinterpret_cast<RouterStage*>(smem_raw);
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int g = lane >> 2, t = lane & 3;
+  const int r0 = blockIdx.x * RT_M, nr = min(RT_M, n - r0);
+  constexpr int KT = RT_K / BK;
+
+  auto load_stage = [&](int stage, int kt) {
+    RouterStage& sm = st[stage];
+    {
+      const int r = tid >> 3, ch = tid & 7;
+      const bool ok = r < nr;
+      cp_async16(smem_u32(sm.a + r * BK + ((ch ^ (r & 7)) << 3)),
+                 ok ? static_cast<const void*>(xn + static_cast<size_t>(r0 + r) * RT_K + kt * BK + ch * 8)
+                    : static_cast<const void*>(xn), ok);
+    }
+#pragma unroll
+    for (int i = 0; i < (RT_EXPERTS * 8) / THREADS; ++i) {
+      const int c = tid + i * THREADS, r = c >> 3, ch = c & 7;
+      cp_async16(smem_u32(sm.b + r * BK + ((ch ^ (r & 7)) << 3)), wr + static_cast<size_t>(r) * RT_K + kt * BK + ch * 8,
+                 true);
+    }
+  };
+
+  float acc[2][4][4];
+#pragma unroll
+  for (int i = 0; i < 2; ++i)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
+#pragma unroll
+  for (int s = 0; s < RT_STAGES - 1; ++s) {
+    load_stage(s, s);
+    cp_commit();
+  }
+  for (int kt = 0; kt < KT; ++kt) {
+    cp_wait<RT_STAGES - 2>();
+    __syncthreads();
+    if (kt + RT_STAGES - 1 < KT) load_stage((kt + RT_STAGES - 1) % RT_STAGES, kt + RT_STAGES - 1);
+    cp_commit();
+    const RouterStage& sm = st[kt % RT_STAGES];
+#pragma unroll
+    for (int ks = 0; ks < 4; ++ks) {
+      uint32_t af[2][4];
+#pragma unroll
+      for (int mt = 0; mt < 2; ++mt) {
+        const int r = mt * 16 + (lane & 15), ch = ks * 2 + (lane >> 4);
+        ldmatrix_x4(af[mt], smem_u32(sm.a + r * BK + ((ch ^ (r & 7)) << 3)));
+      }
+#pragma unroll
+      for (int np = 0; np < 2; ++np) {  // pairs of 8-expert n-tiles
+        uint32_t b[4];
+        const int r = warp * 32 + np * 16 + (lane & 7) + ((lane >> 4) << 3), ch = ks * 2 + ((lane >> 3) & 1);
+        ldmatrix_x4(b, smem_u32(sm.b + r * BK + ((ch ^ (r & 7)) << 3)));
+#pragma unroll
+        for (int mt = 0; mt < 2; ++mt) {
+          mma16816(acc[mt][2 * np], af[mt], b[0], b[1]);
+          mma16816(acc[mt][2 * np + 1], af[mt], b[2], b[3]);
+        }
+      }
+    }
+  }
+  cp_wait<0>();
+  __syncthreads();
+  float (*lg)[RT_EXPERTS] = reinterpret_cast<float (*)[RT_EXPERTS]>(smem_raw);
+#pragma unroll
+  for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt)
+#pragma unroll
+      for (int e = 0; e < 4; ++e)
+        lg[mt * 16 + g + 8 * (e >> 1)][warp * 32 + nt * 8 + 2 * t + (e & 1)] = round_bf16(acc[mt][nt][e]);
+  __syncthreads();
+  for (int rr = warp; rr < nr; rr += THREADS / 32) {
+    float v[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) v[j] = lg[rr][lane * 8 + j];
+    float sv[RT_TOPK];
+    int si[RT_TOPK];
+#pragma unroll
+    for (int k = 0; k < RT_TOPK; ++k) {
+      float bv = -FLT_MAX;
+      int bi = 0x7fffffff;
+#pragma unroll
+      for (int j = 0; j < 8; ++j)
+        if (v[j] > bv) { bv = v[j]; bi = lane * 8 + j; }
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+      }
+      sv[k] = bv; si[k] = bi;
+      if ((bi >> 3) == lane) v[bi & 7] = -FLT_MAX;
+    }
+    if (lane == 0) {
+      float sg[RT_TOPK], sum = 0.f;
+#pragma unroll
+      for (int k = 0; k < RT_TOPK; ++k) { sg[k] = __fdiv_rn(1.0f, 1.0f + expf(-sv[k])); sum += sg[k]; }
+      const float den = sum + 1e-20f;
+      const int row = r0 + rr;
+#pragma unroll
+      for (int k = 0; k < RT_TOPK; ++k) {
+        ids[row * RT_TOPK + k] = si[k];
+        tw[row * RT_TOPK + k] = round_bf16(__fdiv_rn(sg[k], den));
+        atomicAdd(counts + si[k], 1);
+      }
+    }
   }
 }
+
+template <typename Kernel>
+void set_smem_attr(Kernel fn, size_t bytes) {
+  cudaFuncSetAttribute(reinterpret_cast<const void*>(fn), cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       static_cast<int>(bytes));
+}
+
+template <int BM, int ST, int KB, int EPI>
+void launch_dense(const void* A, int M, int lda, const void* codes, const void* scales, int N, int K, float gs,
+                  void* C, int ldc, int split, cudaStream_t s) {
+  auto kern = gemm_dense_kernel<BM, ST, KB, EPI>;
+  static bool smem_set = false;  // once per instantiation, before graph capture
+  if (!smem_set) { set_smem_attr(kern, gemm_smem_bytes<BM, ST, KB>(8)); smem_set = true; }
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3((M + BM - 1) / BM, N / BN, split);
+  cfg.blockDim = dim3(THREADS);
+  cfg.dynamicSmemBytes = gemm_smem_bytes<BM, ST, KB>(split);
+  cfg.stream = s;
+  cudaLaunchAttribute attr[1];
+  if (split > 1) {
+    attr[0].id = cudaLaunchAttributeClusterDimension;
+    attr[0].val.clusterDim.x = 1; attr[0].val.clusterDim.y = 1; attr[0].val.clusterDim.z = split;
+    cfg.attrs = attr; cfg.numAttrs = 1;
+  }
+  cudaLaunchKernelEx(&cfg, kern, static_cast<const uint16_t*>(A), M, lda, static_cast<const uint8_t*>(codes),
+                     static_cast<const uint8_t*>(scales), K, gs, C, ldc);
+}
+
+template <int BM, int ST, int KB, int EPI>
+void launch_grouped(const void* A, const int* gather, int lda, const int* tiles, const int* n_tiles, int max_tiles,
+                    const void* codes, const void* scales, int N, int K, const float* gs_e, void* C, int ldc,
+                    int split, cudaStream_t s) {
+  auto kern = gemm_grouped_kernel<BM, ST, KB, EPI>;
+  static bool smem_set = false;
+  if (!smem_set) { set_smem_attr(kern, gemm_smem_bytes<BM, ST, KB>(8)); smem_set = true; }
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(max_tiles, N / BN, split);
+  cfg.blockDim = dim3(THREADS);
+  cfg.dynamicSmemBytes = gemm_smem_bytes<BM, ST, KB>(split);
+  cfg.stream = s;
+  cudaLaunchAttribute attr[1];
+  if (split > 1) {
+    attr[0].id = cudaLaunchAttributeClusterDimension;
+    attr[0].val.clusterDim.x = 1; attr[0].val.clusterDim.y = 1; attr[0].val.clusterDim.z = split;
+    cfg.attrs = attr; cfg.numAttrs = 1;
+  }
+  cudaLaunchKernelEx(&cfg, kern, static_cast<const uint16_t*>(A), gather, lda, tiles, n_tiles,
+                     static_cast<const uint8_t*>(codes), static_cast<const uint8_t*>(scales), N, K, gs_e, C, ldc);
+}
+
+// Default dense configuration for a shape (RTX 5090 search over the Flint matrices, M 16..8192):
+// small M is weight-streaming bound -> narrow tiles, 128/256-k stages (whole sectors per weight row) and
+// split-K for enough CTAs; large M -> BM 64 / 3 stages (two CTAs per SM); deep K keeps a 2-way split.
+GemmConfig default_dense_config(int M, int N, int K) {
+  const bool deep = K >= 4096;
+  if (M <= 16) return {16, 4, deep ? 4 : (N >= 8192 ? 1 : 2), 2};
+  if (M <= 64) return {16, 3, (N >= 4096 && !deep) ? 1 : 2, 4};
+  if (M <= 128) return {32, 2, deep ? 2 : 1, 4};
+  if (M <= 256) return {32, 2, 1, 4};
+  if (M <= 1024) return {64, 3, 1, 1};
+  return {64, 3, deep && M <= 4096 ? 2 : 1, 1};
+}
+
+// Grouped (MoE) configuration from the tile height and the mean routed rows per expert.
+GemmConfig default_grouped_config(int tile_rows, int mean_rows) {
+  if (tile_rows <= 16) return {16, 3, 1, 4};
+  if (tile_rows <= 32) return {32, 2, 1, 4};
+  return mean_rows <= 64 ? GemmConfig{64, 3, 1, 2} : GemmConfig{64, 2, 1, 1};
+}
+
+GemmConfig g_dense_override = {0, 0, 0, 0};
+GemmConfig g_grouped_override = {0, 0, 0, 0};
 
 }  // namespace
 
-int gemm_w4a16(const void* A, int M, int lda, const void* codes, const void* scales, int N, int K, float gs,
-               void* C, int ldc, int epilogue, cudaStream_t s) {
-  if (K % BK || N % BN) return 1;
-  const dim3 grid((M + 127) / 128, N / BN);
-#define FLINT_GEMM_CASE(EPI)                                                                              \
-  if (epilogue == EPI) {                                                                                  \
-    set_smem_attr<128, EPI>(reinterpret_cast<const void*>(gemm_dense_kernel<128, EPI>));                  \
-    gemm_dense_kernel<128, EPI><<<grid, THREADS, kSmem, s>>>(                                              \
-        static_cast<const uint16_t*>(A), M, lda, static_cast<const uint8_t*>(codes),                     \
-        static_cast<const uint8_t*>(scales), K, gs, C, ldc);                                              \
-    return 0;                                                                                             \
+int gemm_w4a16_cfg(const void* A, int M, int lda, const void* codes, const void* scales, int N, int K, float gs,
+                   void* C, int ldc, int epilogue, GemmConfig c, cudaStream_t s) {
+  if (c.kb != 1 && c.kb != 2 && c.kb != 4) return 1;
+  if (N % BN || c.split < 1 || c.split > 8 || K % (64 * c.kb * c.split)) return 1;
+#define FLINT_GEMM_CASE(BM_, ST_, KB_, EPI_)                                                                \
+  if (c.bm == BM_ && c.stages == ST_ && c.kb == KB_ && epilogue == EPI_) {                                  \
+    launch_dense<BM_, ST_, KB_, EPI_>(A, M, lda, codes, scales, N, K, gs, C, ldc, c.split, s);              \
+    return 0;                                                                                               \
   }
-  FLINT_GEMM_CASE(kEpiBf16)
-  FLINT_GEMM_CASE(kEpiF32)
-  FLINT_GEMM_CASE(kEpiSwigluDense)
+#define FLINT_GEMM_EPIS(BM_, ST_, KB_)                                                    \
+  FLINT_GEMM_CASE(BM_, ST_, KB_, kEpiBf16) FLINT_GEMM_CASE(BM_, ST_, KB_, kEpiF32) \
+  FLINT_GEMM_CASE(BM_, ST_, KB_, kEpiSwigluDense)
+  FLINT_GEMM_EPIS(16, 4, 1)
+  FLINT_GEMM_EPIS(16, 4, 2)
+  FLINT_GEMM_EPIS(16, 3, 4)
+  FLINT_GEMM_EPIS(32, 4, 1)
+  FLINT_GEMM_EPIS(32, 3, 2)
+  FLINT_GEMM_EPIS(32, 2, 4)
+  FLINT_GEMM_EPIS(64, 3, 1)
+  FLINT_GEMM_EPIS(64, 3, 2)
+  FLINT_GEMM_EPIS(128, 2, 1)
+  FLINT_GEMM_EPIS(128, 3, 1)
+#undef FLINT_GEMM_EPIS
 #undef FLINT_GEMM_CASE
   return 1;
 }
 
+int gemm_w4a16(const void* A, int M, int lda, const void* codes, const void* scales, int N, int K, float gs,
+               void* C, int ldc, int epilogue, cudaStream_t s) {
+  GemmConfig c = g_dense_override.bm ? g_dense_override : default_dense_config(M, N, K);
+  return gemm_w4a16_cfg(A, M, lda, codes, scales, N, K, gs, C, ldc, epilogue, c, s);
+}
+
+void set_gemm_override(const GemmConfig& dense, const GemmConfig& grouped) {
+  g_dense_override = dense;
+  g_grouped_override = grouped;
+}
+
+void router_topk_rows_bf16(const void* xn, int n, const void* wr, int* ids, float* tw, int* counts, cudaStream_t s) {
+  static bool attr = false;
+  if (!attr) {
+    cudaFuncSetAttribute(reinterpret_cast<const void*>(router_mma_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(kRouterSmem));
+    attr = true;
+  }
+  router_mma_kernel<<<(n + RT_M - 1) / RT_M, THREADS, kRouterSmem, s>>>(
+      static_cast<const uint16_t*>(xn), n, static_cast<const uint16_t*>(wr), ids, tw, counts);
+}
+
 int gemm_w4a16_grouped(const void* A, const int* gather, int lda, const int* tiles, const int* n_tiles,
                        int max_tiles, const void* codes, const void* scales, int N, int K, const float* gs_e,
-                       void* C, int ldc, int epilogue, cudaStream_t s) {
-  if (K % BK || N % BN) return 1;
-  const dim3 grid(max_tiles, N / BN);
-#define FLINT_GG_CASE(EPI)                                                                                \
-  if (epilogue == EPI) {                                                                                  \
-    set_smem_attr<64, EPI>(reinterpret_cast<const void*>(gemm_grouped_kernel<64, EPI>));                  \
-    gemm_grouped_kernel<64, EPI><<<grid, THREADS, kSmem, s>>>(                                             \
-        static_cast<const uint16_t*>(A), gather, lda, tiles, n_tiles, static_cast<const uint8_t*>(codes), \
-        static_cast<const uint8_t*>(scales), N, K, gs_e, C, ldc);                                         \
-    return 0;                                                                                             \
+                       void* C, int ldc, int epilogue, int tile_rows, int mean_rows, cudaStream_t s) {
+  const GemmConfig c = g_grouped_override.bm ? g_grouped_override : default_grouped_config(tile_rows, mean_rows);
+  if (c.bm < tile_rows || N % BN || c.split < 1 || c.split > 8 || K % (64 * c.kb * c.split)) return 1;
+#define FLINT_GG_CASE(BM_, ST_, KB_, EPI_)                                                                  \
+  if (c.bm == BM_ && c.stages == ST_ && c.kb == KB_ && epilogue == EPI_) {                                  \
+    launch_grouped<BM_, ST_, KB_, EPI_>(A, gather, lda, tiles, n_tiles, max_tiles, codes, scales, N, K, gs_e, \
+                                        C, ldc, c.split, s);                                                \
+    return 0;                                                                                               \
   }
-  FLINT_GG_CASE(kEpiBf16)
-  FLINT_GG_CASE(kEpiSwigluRouted)
+#define FLINT_GG_EPIS(BM_, ST_, KB_) FLINT_GG_CASE(BM_, ST_, KB_, kEpiBf16) FLINT_GG_CASE(BM_, ST_, KB_, kEpiSwigluRouted)
+  FLINT_GG_EPIS(16, 4, 1)
+  FLINT_GG_EPIS(16, 4, 2)
+  FLINT_GG_EPIS(16, 3, 4)
+  FLINT_GG_EPIS(32, 4, 1)
+  FLINT_GG_EPIS(32, 3, 2)
+  FLINT_GG_EPIS(32, 2, 4)
+  FLINT_GG_EPIS(64, 2, 1)
+  FLINT_GG_EPIS(64, 3, 1)
+  FLINT_GG_EPIS(64, 3, 2)
+#undef FLINT_GG_EPIS
 #undef FLINT_GG_CASE
   return 1;
 }

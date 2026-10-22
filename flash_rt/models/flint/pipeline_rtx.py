@@ -73,8 +73,8 @@ class _Layer:
 class FlintRuntime:
     """Owns every device buffer and launches the Flint kernel sequence."""
 
-    def __init__(self, gguf_path: str, max_seq: int = 32768, sliding_ring: int = 4096,
-                 attn_splits: int = 16, prefill_chunk: int = 2048, device: int = 0):
+    def __init__(self, gguf_path: str, max_seq: int = 32768, sliding_ring: int = 16384,
+                 attn_splits: int = 16, prefill_chunk: int = 8192, device: int = 0):
         import torch
         self.torch = torch
         self.fl = _require_kernels()
@@ -327,13 +327,25 @@ class FlintRuntime:
         self.pf_tw = torch.zeros((C, T), dtype=f32, device=self.dev)
         self.pf_sorted = torch.zeros(C * T, dtype=i32, device=self.dev)
         self.pf_inv = torch.zeros(C * T, dtype=i32, device=self.dev)
-        self.pf_max_tiles = (C * T) // 64 + cfg.num_experts
-        self.pf_tiles = torch.zeros(3 * self.pf_max_tiles, dtype=i32, device=self.dev)
+        self.pf_tiles = torch.zeros(3 * ((C * T) // 16 + cfg.num_experts), dtype=i32, device=self.dev)
         self.pf_ntiles = torch.zeros(1, dtype=i32, device=self.dev)
+        self.pf_counts = torch.zeros(cfg.num_experts, dtype=i32, device=self.dev)   # re-zeroed by moe_scan_place
+        self.pf_router_v1 = _os.environ.get("FLINT_PF_ROUTER") == "v1"
         self.pf_act_s = torch.zeros((C * T, cfg.expert_intermediate_size), dtype=bf, device=self.dev)
         self.pf_y_s = torch.zeros((C * T, H), dtype=bf, device=self.dev)
         self.pf_sh_act = torch.zeros((C, cfg.shared_intermediate_size), dtype=bf, device=self.dev)
         self.pf_sh = torch.zeros((C, H), dtype=bf, device=self.dev)
+        # Prefill attention: KV splits (host-chosen per chunk) with partials merged in-kernel.
+        self.sm_count = torch.cuda.get_device_properties(self.dev).multi_processor_count
+        self.pf_attn_v1 = _os.environ.get("FLINT_PF_ATTN") == "v1"
+        self.pf_attn_variant = int(_os.environ.get("FLINT_PF_ATTN_VARIANT", "0"))
+        self.pf_attn_pkv = 64 if self.pf_attn_variant in (2, 3) else 32
+        self.pf_split_max = int(_os.environ.get("FLINT_PF_SPLIT_MAX", "4"))
+        units = (C + 15) // 16 * 4
+        self.pf_split_units = 2048            # partial buffers hold units * splits <= this (128 MiB)
+        self.pf_opart = torch.empty(self.pf_split_units * 128 * 128, dtype=f32, device=self.dev)
+        self.pf_ml = torch.empty(self.pf_split_units * 128 * 2, dtype=f32, device=self.dev)
+        self.pf_attn_ctr = torch.zeros(units, dtype=i32, device=self.dev)
 
     # ------------------------------------------------------------------ decode step
     def _gemv(self, m: _Mat, x, out, epilogue, s):
@@ -395,8 +407,17 @@ class FlintRuntime:
         self.fl.gemm_w4a16(A.data_ptr(), m, lda, mat.codes.data_ptr(), mat.scales.data_ptr(), mat.rows, mat.k,
                            mat.gs, C.data_ptr(), ldc, epi, s)
 
-    def launch_prefill_chunk(self, m: int):
-        """Enqueue the layers for ``m`` prompt tokens starting at device position ``pos``.
+    def _pf_attn_splits(self, m: int, pos0: int, window: int) -> int:
+        """KV splits per (16-token block, kv head) unit: enough CTAs to fill the GPU several times over."""
+        units = (m + 15) // 16 * 4
+        keys = min(pos0 + m, window + 15) if window else pos0 + m
+        tiles = -(-keys // self.pf_attn_pkv)
+        want = -(-8 * self.sm_count // units)
+        cap = min(self.pf_split_max, self.pf_split_units // units)
+        return max(1, min(want, cap, tiles // 32))   # >= ~32 tiles per split: merge traffic stays small
+
+    def launch_prefill_chunk(self, m: int, pos0: int = 0):
+        """Enqueue the layers for ``m`` prompt tokens starting at device position ``pos`` (== ``pos0`` on host).
 
         Leaves the final hidden state of the chunk in (pf_x + pf_res) and advances ``pos`` by m.
         """
@@ -404,6 +425,11 @@ class FlintRuntime:
         eps, H = cfg.rms_norm_eps, cfg.hidden_size
         scale = 1.0 / math.sqrt(cfg.head_dim)
         T, I = cfg.num_experts_per_tok, cfg.expert_intermediate_size
+        splits = (self._pf_attn_splits(m, pos0, 0), self._pf_attn_splits(m, pos0, cfg.sliding_window))
+        # Rows per grouped-GEMM tile from the mean routed rows per expert (small chunks -> small tiles).
+        mean_rows = -(-m * T // cfg.num_experts)
+        tile_rows = 16 if mean_rows <= 12 else 32 if mean_rows <= 24 else 64
+        max_tiles = (m * T) // tile_rows + cfg.num_experts
         fl.embed_rows_bf16(self.tokens.data_ptr(), self.pos.data_ptr(), m, self.embed.data_ptr(),
                            self.pf_x.data_ptr(), s)
         for il, L in enumerate(self.layers):
@@ -415,9 +441,16 @@ class FlintRuntime:
                                          self.rope_cos.data_ptr(), self.rope_sin.data_ptr(), self.pos.data_ptr(),
                                          self.pf_q.data_ptr(), L.cache.data_ptr(), ring, 1 if L.sliding else 0,
                                          eps, s)
-            fl.prefill_attention_bf16(self.pf_q.data_ptr(), m, L.cache.data_ptr(), self.pos.data_ptr(), ring,
-                                      cfg.sliding_window if L.sliding else 0, L.sinks.data_ptr(), scale,
-                                      self.pf_att.data_ptr(), s)
+            window = cfg.sliding_window if L.sliding else 0
+            if self.pf_attn_v1:
+                fl.prefill_attention_bf16(self.pf_q.data_ptr(), m, L.cache.data_ptr(), self.pos.data_ptr(), ring,
+                                          window, L.sinks.data_ptr(), scale, self.pf_att.data_ptr(), s)
+            else:
+                fl.prefill_attention2_bf16(self.pf_q.data_ptr(), m, L.cache.data_ptr(), self.pos.data_ptr(), ring,
+                                           window, L.sinks.data_ptr(), scale, self.pf_att.data_ptr(),
+                                           splits[1 if L.sliding else 0], self.pf_opart.data_ptr(),
+                                           self.pf_ml.data_ptr(), self.pf_attn_ctr.data_ptr(),
+                                           self.pf_attn_variant, s)
             self._gemm(self.pf_att, m, cfg.q_dim, L.o, self.pf_x, H, fl.EPI_BF16, s)
             fl.add_rmsnorm_bf16(self.pf_x.data_ptr(), self.pf_res.data_ptr(), L.ffn_norm.data_ptr(),
                                 self.pf_xn.data_ptr(), m, eps, 0, s)
@@ -426,20 +459,27 @@ class FlintRuntime:
                            fl.EPI_SWIGLU_DENSE, s)
                 self._gemm(self.pf_act, m, cfg.dense_intermediate_size, L.down, self.pf_x, H, fl.EPI_BF16, s)
             else:
-                fl.router_rows_bf16(self.pf_xn.data_ptr(), m, L.router_t.data_ptr(), self.pf_ids.data_ptr(),
-                                    self.pf_tw.data_ptr(), s)
-                fl.moe_sort(self.pf_ids.data_ptr(), m, 64, self.pf_sorted.data_ptr(), self.pf_inv.data_ptr(),
-                            self.pf_tiles.data_ptr(), self.pf_ntiles.data_ptr(), s)
+                if self.pf_router_v1:
+                    fl.router_rows_bf16(self.pf_xn.data_ptr(), m, L.router_t.data_ptr(), self.pf_ids.data_ptr(),
+                                        self.pf_tw.data_ptr(), s)
+                    fl.moe_sort(self.pf_ids.data_ptr(), m, tile_rows, self.pf_sorted.data_ptr(),
+                                self.pf_inv.data_ptr(), self.pf_tiles.data_ptr(), self.pf_ntiles.data_ptr(), s)
+                else:
+                    fl.router_topk_rows_bf16(self.pf_xn.data_ptr(), m, L.router.data_ptr(), self.pf_ids.data_ptr(),
+                                             self.pf_tw.data_ptr(), self.pf_counts.data_ptr(), s)
+                    fl.moe_scan_place(self.pf_ids.data_ptr(), m, tile_rows, self.pf_counts.data_ptr(),
+                                      self.pf_sorted.data_ptr(), self.pf_inv.data_ptr(), self.pf_tiles.data_ptr(),
+                                      self.pf_ntiles.data_ptr(), s)
                 g = L.exp_gate_up
                 fl.gemm_w4a16_grouped(self.pf_xn.data_ptr(), self.pf_sorted.data_ptr(), H, self.pf_tiles.data_ptr(),
-                                      self.pf_ntiles.data_ptr(), self.pf_max_tiles, g.codes.data_ptr(),
+                                      self.pf_ntiles.data_ptr(), max_tiles, g.codes.data_ptr(),
                                       g.scales.data_ptr(), 2 * I, H, g.gs_dev.data_ptr(), self.pf_act_s.data_ptr(),
-                                      I, fl.EPI_SWIGLU_ROUTED, s)
+                                      I, fl.EPI_SWIGLU_ROUTED, tile_rows, mean_rows, s)
                 d = L.exp_down
                 fl.gemm_w4a16_grouped(self.pf_act_s.data_ptr(), 0, I, self.pf_tiles.data_ptr(),
-                                      self.pf_ntiles.data_ptr(), self.pf_max_tiles, d.codes.data_ptr(),
+                                      self.pf_ntiles.data_ptr(), max_tiles, d.codes.data_ptr(),
                                       d.scales.data_ptr(), H, I, d.gs_dev.data_ptr(), self.pf_y_s.data_ptr(), H,
-                                      fl.EPI_BF16, s)
+                                      fl.EPI_BF16, tile_rows, mean_rows, s)
                 self._gemm(self.pf_xn, m, H, L.sh_gate_up, self.pf_sh_act, cfg.shared_intermediate_size,
                            fl.EPI_SWIGLU_DENSE, s)
                 self._gemm(self.pf_sh_act, m, cfg.shared_intermediate_size, L.sh_down, self.pf_sh, H,
@@ -484,7 +524,7 @@ class FlintRuntime:
         with torch.cuda.stream(self.stream):
             for c0 in range(0, n, C):
                 m = min(C, n - c0)
-                self.launch_prefill_chunk(m)
+                self.launch_prefill_chunk(m, c0)
                 if logits_cb is not None:
                     if buf is None:
                         buf = torch.empty((C, self.cfg.vocab_size), dtype=torch.float32, device=self.dev)

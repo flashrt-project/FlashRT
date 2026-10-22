@@ -56,15 +56,37 @@ void qk_norm_rope_kv_rows_bf16(const void* qkv, int n, const float* qw, const fl
                                float eps, cudaStream_t s);
 void prefill_attention_bf16(const void* q, int n, const void* cache, const int* pos, int ring, int window,
                             const float* sinks, float scale, void* out, cudaStream_t s);
+// v2 (variant 0..6 = PKV/stages 32/2, 32/3, 64/2, 64/3, 32/4, and 32/2, 32/3 at two CTAs per SM); n_split > 1 needs o_part/ml_part/counters
+// sized for ceil(n/16) * 4 units (counters zeroed once; they self-reset). Returns non-zero on bad args.
+int prefill_attention2_bf16(const void* q, int n, const void* cache, const int* pos, int ring, int window,
+                            const float* sinks, float scale, void* out, int n_split, float* o_part, float* ml_part,
+                            unsigned* counters, int variant, cudaStream_t s);
 // Returns non-zero for unsupported shapes / epilogues (K % 64, N % 128).
+// W4A16 GEMM launch configuration: BM rows per CTA (16/32/64/128), cp.async stages, split-K CTAs per
+// (1, 1, split) cluster (partials reduced in rank order through DSMEM), kb = 64-k sub-tiles per stage (1/2/4).
+struct GemmConfig {
+  int bm, stages, split, kb;
+};
 int gemm_w4a16(const void* A, int M, int lda, const void* codes, const void* scales, int N, int K, float gs, void* C,
                int ldc, int epilogue, cudaStream_t s);
+int gemm_w4a16_cfg(const void* A, int M, int lda, const void* codes, const void* scales, int N, int K, float gs,
+                   void* C, int ldc, int epilogue, GemmConfig c, cudaStream_t s);
+// tile_rows: rows per tile of the tile list (from moe_scan_place); mean_rows: mean routed rows per expert
+// (picks the default configuration, BM >= tile_rows).
 int gemm_w4a16_grouped(const void* A, const int* gather, int lda, const int* tiles, const int* n_tiles, int max_tiles,
                        const void* codes, const void* scales, int N, int K, const float* gs_e, void* C, int ldc,
-                       int epilogue, cudaStream_t s);
+                       int epilogue, int tile_rows, int mean_rows, cudaStream_t s);
+// Search hook: non-zero bm overrides the default dense / grouped configuration.
+void set_gemm_override(const GemmConfig& dense, const GemmConfig& grouped);
 void router_rows_bf16(const void* xn, int n, const void* wt, int* ids, float* tw, cudaStream_t s);
 void moe_sort(const int* ids, int n, int tile_rows, int* sorted_tok, int* inv, int* tiles, int* n_tiles,
               cudaStream_t s);
+// Many-token router on tensor cores (wr = router [256, 2048] bf16); adds selections to counts[256].
+void router_topk_rows_bf16(const void* xn, int n, const void* wr, int* ids, float* tw, int* counts, cudaStream_t s);
+// counts (from router_topk_rows_bf16, re-zeroed) -> offsets, tile list, scatter. Same outputs as moe_sort
+// up to the order of slots inside an expert.
+void moe_scan_place(const int* ids, int n, int tile_rows, int* counts, int* sorted_tok, int* inv, int* tiles,
+                    int* n_tiles, cudaStream_t s);
 void moe_combine_rows_bf16(const void* y, const int* inv, const float* tw, const void* shared, void* out, int n,
                            cudaStream_t s);
 void advance_pos(int* pos, int n, cudaStream_t s);

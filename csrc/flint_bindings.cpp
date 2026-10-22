@@ -143,6 +143,18 @@ PYBIND11_MODULE(flash_rt_flint, m) {
                                      ptr<const float>(sinks), scale, ptr<void>(out), to_stream(stream));
         });
 
+  m.def("prefill_attention2_bf16",
+        [](uintptr_t q, int n, uintptr_t cache, uintptr_t pos, int ring, int window, uintptr_t sinks, float scale,
+           uintptr_t out, int n_split, uintptr_t o_part, uintptr_t ml_part, uintptr_t counters, int variant,
+           uintptr_t stream) {
+          if (ring & (ring - 1)) throw std::invalid_argument("prefill_attention2_bf16: ring must be a power of two");
+          if (fl::prefill_attention2_bf16(ptr<const void>(q), n, ptr<const void>(cache), ptr<const int>(pos), ring,
+                                          window, ptr<const float>(sinks), scale, ptr<void>(out), n_split,
+                                          ptr<float>(o_part), ptr<float>(ml_part), ptr<unsigned>(counters), variant,
+                                          to_stream(stream)) != 0)
+            throw std::invalid_argument("prefill_attention2_bf16: bad variant/split arguments");
+        });
+
   m.def("gemm_w4a16",
         [](uintptr_t A, int M, int lda, uintptr_t codes, uintptr_t scales, int N, int K, float gs, uintptr_t C, int ldc,
            int epilogue, uintptr_t stream) {
@@ -154,13 +166,29 @@ PYBIND11_MODULE(flash_rt_flint, m) {
 
   m.def("gemm_w4a16_grouped",
         [](uintptr_t A, uintptr_t gather, int lda, uintptr_t tiles, uintptr_t n_tiles, int max_tiles, uintptr_t codes,
-           uintptr_t scales, int N, int K, uintptr_t gs_e, uintptr_t C, int ldc, int epilogue, uintptr_t stream) {
+           uintptr_t scales, int N, int K, uintptr_t gs_e, uintptr_t C, int ldc, int epilogue, int tile_rows,
+           int mean_rows, uintptr_t stream) {
           if (fl::gemm_w4a16_grouped(ptr<const void>(A), ptr<const int>(gather), lda, ptr<const int>(tiles),
                                      ptr<const int>(n_tiles), max_tiles, ptr<const void>(codes), ptr<const void>(scales),
-                                     N, K, ptr<const float>(gs_e), ptr<void>(C), ldc, epilogue, to_stream(stream)) != 0)
+                                     N, K, ptr<const float>(gs_e), ptr<void>(C), ldc, epilogue, tile_rows,
+                                     mean_rows, to_stream(stream)) != 0)
             throw std::invalid_argument("gemm_w4a16_grouped: unsupported N=" + std::to_string(N) + " K=" +
-                                        std::to_string(K) + " epilogue=" + std::to_string(epilogue));
+                                        std::to_string(K) + " epilogue=" + std::to_string(epilogue) +
+                                        " tile_rows=" + std::to_string(tile_rows));
         });
+
+  m.def("gemm_w4a16_cfg",
+        [](uintptr_t A, int M, int lda, uintptr_t codes, uintptr_t scales, int N, int K, float gs, uintptr_t C, int ldc,
+           int epilogue, int bm, int stages, int split, int kb, uintptr_t stream) {
+          if (fl::gemm_w4a16_cfg(ptr<const void>(A), M, lda, ptr<const void>(codes), ptr<const void>(scales), N, K, gs,
+                                 ptr<void>(C), ldc, epilogue, fl::GemmConfig{bm, stages, split, kb},
+                                 to_stream(stream)) != 0)
+            throw std::invalid_argument("gemm_w4a16_cfg: unsupported configuration");
+        });
+
+  m.def("set_gemm_override", [](int bm, int stages, int split, int kb, int gbm, int gstages, int gsplit, int gkb) {
+    fl::set_gemm_override(fl::GemmConfig{bm, stages, split, kb}, fl::GemmConfig{gbm, gstages, gsplit, gkb});
+  });
 
   m.def("router_rows_bf16", [](uintptr_t xn, int n, uintptr_t wt, uintptr_t ids, uintptr_t tw, uintptr_t stream) {
     fl::router_rows_bf16(ptr<const void>(xn), n, ptr<const void>(wt), ptr<int>(ids), ptr<float>(tw), to_stream(stream));
@@ -171,6 +199,19 @@ PYBIND11_MODULE(flash_rt_flint, m) {
            uintptr_t stream) {
           fl::moe_sort(ptr<const int>(ids), n, tile_rows, ptr<int>(sorted_tok), ptr<int>(inv), ptr<int>(tiles),
                        ptr<int>(n_tiles), to_stream(stream));
+        });
+
+  m.def("router_topk_rows_bf16",
+        [](uintptr_t xn, int n, uintptr_t wr, uintptr_t ids, uintptr_t tw, uintptr_t counts, uintptr_t stream) {
+          fl::router_topk_rows_bf16(ptr<const void>(xn), n, ptr<const void>(wr), ptr<int>(ids), ptr<float>(tw),
+                                    ptr<int>(counts), to_stream(stream));
+        });
+
+  m.def("moe_scan_place",
+        [](uintptr_t ids, int n, int tile_rows, uintptr_t counts, uintptr_t sorted_tok, uintptr_t inv, uintptr_t tiles,
+           uintptr_t n_tiles, uintptr_t stream) {
+          fl::moe_scan_place(ptr<const int>(ids), n, tile_rows, ptr<int>(counts), ptr<int>(sorted_tok), ptr<int>(inv),
+                             ptr<int>(tiles), ptr<int>(n_tiles), to_stream(stream));
         });
 
   m.def("moe_combine_rows_bf16",

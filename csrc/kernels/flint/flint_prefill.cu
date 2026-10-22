@@ -209,6 +209,56 @@ void moe_sort(const int* ids, int n, int tile_rows, int* sorted_tok, int* inv, i
   moe_sort_kernel<<<1, 1024, 0, s>>>(ids, n, tile_rows, sorted_tok, inv, tiles, n_tiles);
 }
 
+// Expert offsets from the router's per-expert counts (re-zeroed here for the next layer), the grouped
+// GEMM tile list, and the scatter of (token, slot) pairs into expert order. Slot order inside an expert
+// is arbitrary: every GEMM row and the combine depend only on their own token, so results are exact
+// and deterministic regardless of the placement order.
+__global__ void __launch_bounds__(1024)
+moe_scan_place_kernel(const int* __restrict__ ids, int n, int tile_rows, int* __restrict__ counts,
+                      int* __restrict__ sorted_tok, int* __restrict__ inv, int* __restrict__ tiles,
+                      int* __restrict__ n_tiles) {
+  __shared__ int off[kExperts], cur[kExperts], wsum[2][kExperts / 32];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  int c = 0, nt = 0;
+  if (tid < kExperts) {
+    c = counts[tid];
+    counts[tid] = 0;
+    nt = (c + tile_rows - 1) / tile_rows;
+    cur[tid] = 0;
+  }
+  int sc = c, st = nt;
+#pragma unroll
+  for (int o = 1; o < 32; o <<= 1) {
+    const int a = __shfl_up_sync(0xffffffffu, sc, o), b = __shfl_up_sync(0xffffffffu, st, o);
+    if (lane >= o) { sc += a; st += b; }
+  }
+  if (tid < kExperts && lane == 31) { wsum[0][warp] = sc; wsum[1][warp] = st; }
+  __syncthreads();
+  if (tid < kExperts) {
+    int bc = 0, bt = 0;
+    for (int w = 0; w < warp; ++w) { bc += wsum[0][w]; bt += wsum[1][w]; }
+    const int o = bc + sc - c, to = bt + st - nt;
+    off[tid] = o;
+    if (tid == kExperts - 1) *n_tiles = bt + st;
+    for (int k = 0; k < nt; ++k) {
+      const int ti = to + k;
+      tiles[3 * ti] = tid; tiles[3 * ti + 1] = o + k * tile_rows; tiles[3 * ti + 2] = min(tile_rows, c - k * tile_rows);
+    }
+  }
+  __syncthreads();
+  for (int i = tid; i < n * kTopK; i += blockDim.x) {
+    const int e = ids[i];
+    const int slot = off[e] + atomicAdd(&cur[e], 1);
+    sorted_tok[slot] = i / kTopK;
+    inv[i] = slot;
+  }
+}
+
+void moe_scan_place(const int* ids, int n, int tile_rows, int* counts, int* sorted_tok, int* inv, int* tiles,
+                    int* n_tiles, cudaStream_t s) {
+  moe_scan_place_kernel<<<1, 1024, 0, s>>>(ids, n, tile_rows, counts, sorted_tok, inv, tiles, n_tiles);
+}
+
 // out[t] = bf16( bf16(sum_j tw[t,j] * y[inv[t,j]]) + shared[t] )  (y already bf16(acc * gs_e))
 __global__ void moe_combine_rows_kernel(const uint16_t* __restrict__ y, const int* __restrict__ inv,
                                         const float* __restrict__ tw, const uint16_t* __restrict__ shared,

@@ -766,6 +766,265 @@ prefill_attn_kernel(const uint16_t* __restrict__ q, int n, const uint16_t* __res
   }
 }
 
+// v2: PKV-key tiles through an ST-stage cp.async ring (one barrier per tile), masks only on tiles that
+// touch a row-dependent bound, heaviest q-blocks first, and optional KV splits: unit (q-block, kv head)
+// is cut into n_split contiguous tile ranges whose partials (fp32 O relative to the split max, row max,
+// row sum) are merged together with the sink by the last CTA of the unit (counters self-reset).
+// grid (n_qb * n_split, 4), 256 threads, dynamic smem ST * PKV * 512 B.
+// o_part f32 [n_qb * 4][n_split][128][128], ml_part f32 [n_qb * 4][n_split][128][2], counters [n_qb * 4].
+template <int PKV, int ST, int MINB>
+__global__ void __launch_bounds__(256, MINB)
+prefill_attn2_kernel(const uint16_t* __restrict__ q, int n, const uint16_t* __restrict__ cache,
+                     const int* __restrict__ pos_p, int ring, int window, const float* __restrict__ sinks,
+                     float scale, uint16_t* __restrict__ out, int n_split, float* __restrict__ o_part,
+                     float* __restrict__ ml_part, unsigned* __restrict__ counters) {
+  extern __shared__ __align__(16) uint8_t smem_raw[];
+  __shared__ int s_last;
+  uint16_t* ks = reinterpret_cast<uint16_t*>(smem_raw);
+  uint16_t* vs = ks + ST * PKV * kD;
+  constexpr int NT = PKV / 8, KS = PKV / 16;
+  const int n_qb = (n + PQ - 1) / PQ;
+  const int qb = n_qb - 1 - static_cast<int>(blockIdx.x) / n_split;
+  const int split = static_cast<int>(blockIdx.x) % n_split;
+  const int kvh = blockIdx.y, q0 = qb * PQ;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+  const int head = kvh * kGroup + warp;
+  const int pos0 = *pos_p;
+  const int qlast = min(n, q0 + PQ) - 1;
+  const int kv_end = pos0 + qlast + 1;
+  const int kv_beg = window > 0 ? max(0, pos0 + q0 - window + 1) : 0;
+  const int nt_all = (kv_end - kv_beg + PKV - 1) / PKV;
+  const int it0 = static_cast<int>(static_cast<long long>(nt_all) * split / n_split);
+  const int it1 = static_cast<int>(static_cast<long long>(nt_all) * (split + 1) / n_split);
+  const int lo_all = pos0 + q0;                                   // keys <= lo_all are causal for every row
+  const int hi_all = window > 0 ? pos0 + qlast - window + 1 : 0;  // keys >= hi_all are in every row's window
+  const float c = scale * kLog2e;
+
+  uint32_t qa[8][4];
+  {
+    const int r0 = q0 + g, r1 = q0 + g + 8;
+    const uint16_t* p0 = q + (static_cast<size_t>(min(r0, n - 1)) * 32 + head) * kD;
+    const uint16_t* p1 = q + (static_cast<size_t>(min(r1, n - 1)) * 32 + head) * kD;
+#pragma unroll
+    for (int k8 = 0; k8 < 8; ++k8) {
+      qa[k8][0] = *reinterpret_cast<const uint32_t*>(p0 + 16 * k8 + 2 * t);
+      qa[k8][1] = *reinterpret_cast<const uint32_t*>(p1 + 16 * k8 + 2 * t);
+      qa[k8][2] = *reinterpret_cast<const uint32_t*>(p0 + 16 * k8 + 8 + 2 * t);
+      qa[k8][3] = *reinterpret_cast<const uint32_t*>(p1 + 16 * k8 + 8 + 2 * t);
+    }
+  }
+  const int pq[2] = {pos0 + q0 + g, pos0 + q0 + g + 8};
+  float o[16][4];
+#pragma unroll
+  for (int i = 0; i < 16; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
+  const float sk = sinks[head] * kLog2e;
+  const bool own_sink = n_split == 1;
+  float m2[2] = {own_sink ? sk : -FLT_MAX, own_sink ? sk : -FLT_MAX};
+  float l[2] = {own_sink && t == 0 ? 1.f : 0.f, own_sink && t == 0 ? 1.f : 0.f};
+
+  auto load_tile = [&](int stg, int it) {
+    const int kb = kv_beg + it * PKV;
+#pragma unroll
+    for (int i = 0; i < PKV / 8; ++i) {
+      const int idx = threadIdx.x + i * 256;
+      const int r = idx >> 5, cc = idx & 31, isv = cc >> 4, ch = cc & 15;
+      const int p = kb + r;
+      const bool ok = p < kv_end;
+      const int slot = ring > 0 ? (p & (ring - 1)) : p;
+      const uint16_t* src = cache + static_cast<size_t>(ok ? slot : 0) * kSlotElems + isv * 512 + kvh * kD + ch * 8;
+      cpa16(smem_addr((isv ? vs : ks) + stg * PKV * kD + kv_off(r, ch)), src, ok);
+    }
+  };
+
+#pragma unroll
+  for (int s0 = 0; s0 < ST - 1; ++s0) {
+    if (it0 + s0 < it1) load_tile(s0, it0 + s0);
+    asm volatile("cp.async.commit_group;");
+  }
+  for (int it = it0; it < it1; ++it) {
+    const int j = it - it0;
+    asm volatile("cp.async.wait_group %0;" ::"n"(ST - 2));
+    __syncthreads();
+    if (it + ST - 1 < it1) load_tile((j + ST - 1) % ST, it + ST - 1);
+    asm volatile("cp.async.commit_group;");
+    const uint16_t* kt = ks + (j % ST) * PKV * kD;
+    const uint16_t* vt = vs + (j % ST) * PKV * kD;
+    const int kb = kv_beg + it * PKV;
+    float s[NT][4];
+#pragma unroll
+    for (int jn = 0; jn < NT; ++jn) {
+      s[jn][0] = s[jn][1] = s[jn][2] = s[jn][3] = 0.f;
+#pragma unroll
+      for (int k2 = 0; k2 < 4; ++k2) {
+        uint32_t b[4];
+        const int r = 8 * jn + (lane & 7), ch = 4 * k2 + (lane >> 3);
+        ldsm_x4(b, smem_addr(kt + kv_off(r, ch)));
+        mma_bf16_16816(s[jn], qa[2 * k2][0], qa[2 * k2][1], qa[2 * k2][2], qa[2 * k2][3], b[0], b[1]);
+        mma_bf16_16816(s[jn], qa[2 * k2 + 1][0], qa[2 * k2 + 1][1], qa[2 * k2 + 1][2], qa[2 * k2 + 1][3], b[2], b[3]);
+      }
+    }
+    const bool masked = kb + PKV - 1 > lo_all || kb < hi_all || kb + PKV > kv_end;
+    float rmax[2] = {-FLT_MAX, -FLT_MAX};
+    if (masked) {
+#pragma unroll
+      for (int jn = 0; jn < NT; ++jn)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          const int h = e >> 1, key = kb + 8 * jn + 2 * t + (e & 1), qp = pq[h];
+          const bool ok = key < kv_end && key <= qp && (window <= 0 || qp - key < window);
+          s[jn][e] = ok ? s[jn][e] * c : -FLT_MAX;
+          rmax[h] = fmaxf(rmax[h], s[jn][e]);
+        }
+    } else {
+#pragma unroll
+      for (int jn = 0; jn < NT; ++jn)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          s[jn][e] *= c;
+          rmax[e >> 1] = fmaxf(rmax[e >> 1], s[jn][e]);
+        }
+    }
+    float alpha[2];
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      rmax[h] = fmaxf(rmax[h], __shfl_xor_sync(0xffffffffu, rmax[h], 1));
+      rmax[h] = fmaxf(rmax[h], __shfl_xor_sync(0xffffffffu, rmax[h], 2));
+      const float mn = fmaxf(m2[h], rmax[h]);
+      alpha[h] = exp2f(m2[h] - mn);
+      m2[h] = mn;
+      l[h] *= alpha[h];
+    }
+    uint32_t pa[KS][4];
+#pragma unroll
+    for (int jn = 0; jn < NT; ++jn) {
+      float p[4];
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        p[e] = s[jn][e] == -FLT_MAX ? 0.f : exp2f(s[jn][e] - m2[e >> 1]);
+        l[e >> 1] += p[e];
+      }
+      pa[jn >> 1][(jn & 1) * 2 + 0] = pack_bf16x2(p[0], p[1]);
+      pa[jn >> 1][(jn & 1) * 2 + 1] = pack_bf16x2(p[2], p[3]);
+    }
+#pragma unroll
+    for (int i = 0; i < 16; ++i) { o[i][0] *= alpha[0]; o[i][1] *= alpha[0]; o[i][2] *= alpha[1]; o[i][3] *= alpha[1]; }
+#pragma unroll
+    for (int kk = 0; kk < KS; ++kk) {
+#pragma unroll
+      for (int d2 = 0; d2 < 8; ++d2) {
+        uint32_t b[4];
+        const int r = 16 * kk + (lane & 7) + ((lane >> 3) & 1) * 8, ch = 2 * d2 + (lane >> 4);
+        ldsm_x4_t(b, smem_addr(vt + kv_off(r, ch)));
+        mma_bf16_16816(o[2 * d2], pa[kk][0], pa[kk][1], pa[kk][2], pa[kk][3], b[0], b[1]);
+        mma_bf16_16816(o[2 * d2 + 1], pa[kk][0], pa[kk][1], pa[kk][2], pa[kk][3], b[2], b[3]);
+      }
+    }
+  }
+  asm volatile("cp.async.wait_group 0;");
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    l[h] += __shfl_xor_sync(0xffffffffu, l[h], 1);
+    l[h] += __shfl_xor_sync(0xffffffffu, l[h], 2);
+  }
+  if (own_sink) {
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const int r = q0 + g + 8 * h;
+      if (r >= n) continue;
+      const float inv = 1.f / l[h];
+      uint16_t* dst = out + (static_cast<size_t>(r) * 32 + head) * kD;
+#pragma unroll
+      for (int i = 0; i < 16; ++i)
+        *reinterpret_cast<uint32_t*>(dst + 8 * i + 2 * t) = pack_bf16x2(o[i][2 * h] * inv, o[i][2 * h + 1] * inv);
+    }
+    return;
+  }
+  const int unit = qb * 4 + kvh;
+  const size_t pbase = (static_cast<size_t>(unit) * n_split + split) * 128 + warp * 16;
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    float* dst = o_part + (pbase + g + 8 * h) * kD;
+#pragma unroll
+    for (int i = 0; i < 16; ++i)
+      __stcg(reinterpret_cast<float2*>(dst + 8 * i + 2 * t), make_float2(o[i][2 * h], o[i][2 * h + 1]));
+    if (t == 0) __stcg(reinterpret_cast<float2*>(ml_part + (pbase + g + 8 * h) * 2), make_float2(m2[h], l[h]));
+  }
+  __threadfence();
+  __syncthreads();
+  if (threadIdx.x == 0) s_last = atomicAdd(counters + unit, 1u) == static_cast<unsigned>(n_split - 1);
+  __syncthreads();
+  if (!s_last) return;
+  __threadfence();
+  if (threadIdx.x == 0) counters[unit] = 0;
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    const int r = q0 + g + 8 * h;
+    if (r >= n) continue;
+    const size_t row0 = static_cast<size_t>(unit) * n_split * 128 + warp * 16 + g + 8 * h;
+    float mx = sk;
+    for (int sp = 0; sp < n_split; ++sp) mx = fmaxf(mx, __ldcg(ml_part + (row0 + sp * 128) * 2));
+    float den = exp2f(sk - mx);
+    float acc[16][2];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) acc[i][0] = acc[i][1] = 0.f;
+    for (int sp = 0; sp < n_split; ++sp) {
+      const float2 ml = __ldcg(reinterpret_cast<const float2*>(ml_part + (row0 + sp * 128) * 2));
+      const float w = exp2f(ml.x - mx);
+      den += w * ml.y;
+      const float* src = o_part + (row0 + sp * 128) * kD;
+#pragma unroll
+      for (int i = 0; i < 16; ++i) {
+        const float2 v = __ldcg(reinterpret_cast<const float2*>(src + 8 * i + 2 * t));
+        acc[i][0] = fmaf(w, v.x, acc[i][0]);
+        acc[i][1] = fmaf(w, v.y, acc[i][1]);
+      }
+    }
+    const float inv = 1.f / den;
+    uint16_t* dst = out + (static_cast<size_t>(r) * 32 + head) * kD;
+#pragma unroll
+    for (int i = 0; i < 16; ++i)
+      *reinterpret_cast<uint32_t*>(dst + 8 * i + 2 * t) = pack_bf16x2(acc[i][0] * inv, acc[i][1] * inv);
+  }
+}
+
+template <int PKV, int ST, int MINB = 1>
+void launch_prefill_attn2(const void* q, int n, const void* cache, const int* pos, int ring, int window,
+                          const float* sinks, float scale, void* out, int n_split, float* o_part, float* ml_part,
+                          unsigned* counters, cudaStream_t s) {
+  constexpr int smem = ST * PKV * kD * 2 * 2;
+  static bool attr = false;
+  if (!attr) {
+    cudaFuncSetAttribute(reinterpret_cast<const void*>(prefill_attn2_kernel<PKV, ST, MINB>),
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    attr = true;
+  }
+  prefill_attn2_kernel<PKV, ST, MINB><<<dim3(((n + PQ - 1) / PQ) * n_split, 4), 256, smem, s>>>(
+      static_cast<const uint16_t*>(q), n, static_cast<const uint16_t*>(cache), pos, ring, window, sinks, scale,
+      static_cast<uint16_t*>(out), n_split, o_part, ml_part, counters);
+}
+
+int prefill_attention2_bf16(const void* q, int n, const void* cache, const int* pos, int ring, int window,
+                            const float* sinks, float scale, void* out, int n_split, float* o_part, float* ml_part,
+                            unsigned* counters, int variant, cudaStream_t s) {
+  if (n_split < 1 || (n_split > 1 && (o_part == nullptr || ml_part == nullptr || counters == nullptr))) return 1;
+#define FLINT_PA2(V, PKV, ST, MINB)                                                                          \
+  case V:                                                                                                    \
+    launch_prefill_attn2<PKV, ST, MINB>(q, n, cache, pos, ring, window, sinks, scale, out, n_split, o_part,   \
+                                        ml_part, counters, s);                                               \
+    return 0;
+  switch (variant) {
+    FLINT_PA2(0, 32, 2, 1)
+    FLINT_PA2(1, 32, 3, 1)
+    FLINT_PA2(2, 64, 2, 1)
+    FLINT_PA2(3, 64, 3, 1)
+    FLINT_PA2(4, 32, 4, 1)
+    FLINT_PA2(5, 32, 2, 2)
+    FLINT_PA2(6, 32, 3, 2)
+    default: return 1;
+  }
+#undef FLINT_PA2
+}
+
 void prefill_attention_bf16(const void* q, int n, const void* cache, const int* pos, int ring, int window,
                             const float* sinks, float scale, void* out, cudaStream_t s) {
   prefill_attn_kernel<<<dim3((n + PQ - 1) / PQ, 4), 256, 0, s>>>(

@@ -32,7 +32,7 @@ __all__ = ["FlintTorchFrontendRtx"]
 class FlintTorchFrontendRtx:
     """Greedy generation over the native Flint runtime (batch 1)."""
 
-    def __init__(self, gguf_path: str, max_seq: int = 32768, prefill_chunk: int = 2048,
+    def __init__(self, gguf_path: str, max_seq: int = 32768, prefill_chunk: int = 8192,
                  attn_splits: int = 16, device: int = 0, check_block: int = 16):
         self.rt = FlintRuntime(gguf_path, max_seq=max_seq, prefill_chunk=prefill_chunk,
                                attn_splits=attn_splits, device=device)

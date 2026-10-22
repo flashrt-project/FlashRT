@@ -369,6 +369,60 @@ def test_gemm_dense_epilogues(M):
     close_bf16(act, g / (1 + torch.exp(-g)) * u, "gemm swiglu")
 
 
+GEMM_CFGS = [(16, 4, 1, 1), (16, 4, 8, 1), (16, 4, 2, 2), (16, 3, 2, 4), (32, 4, 4, 1), (32, 3, 2, 2), (32, 2, 1, 4),
+             (64, 3, 1, 1), (64, 3, 2, 1), (64, 3, 1, 2), (128, 2, 1, 1), (128, 3, 1, 1)]
+
+
+@pytest.mark.parametrize("bm,stages,split,kb", GEMM_CFGS)
+@pytest.mark.parametrize("M", [5, 77])
+def test_gemm_configs_match_reference(bm, stages, split, kb, M):
+    N, K = 256, 2048
+    codes, scales = repack_dev(rand_blocks(N, K, 60 + M))
+    A = bf16(torch.randn(M, K, device=DEV))
+    ref = (A.double().cpu() @ deq_ref(codes, scales).T) * 0.003
+    out32 = torch.empty(M, N, dtype=torch.float32, device=DEV)
+    fl.gemm_w4a16_cfg(A.data_ptr(), M, K, codes.data_ptr(), scales.data_ptr(), N, K, 0.003, out32.data_ptr(), N,
+                      fl.EPI_F32, bm, stages, split, kb, _stream())
+    assert torch.allclose(out32.double().cpu(), ref, rtol=1e-5, atol=1e-5 * ref.abs().max().item())
+    if split == 1:  # the k-order of a CTA does not depend on BM / stages: bit-identical across configs
+        base = torch.empty_like(out32)
+        fl.gemm_w4a16_cfg(A.data_ptr(), M, K, codes.data_ptr(), scales.data_ptr(), N, K, 0.003, base.data_ptr(), N,
+                          fl.EPI_F32, 128, 3, 1, 1, _stream())
+        assert torch.equal(out32, base)
+
+
+@pytest.mark.parametrize("tile_rows,override", [(16, None), (32, None), (64, None), (16, (16, 3, 2, 4)),
+                                               (32, (32, 4, 4, 1)), (64, (64, 3, 2, 2))])
+def test_grouped_tile_rows(tile_rows, override):
+    torch.manual_seed(tile_rows)
+    n, E, H, I = 50, 256, 2048, 512
+    xn = bf16(torch.randn(n, H, device=DEV))
+    ids = torch.stack([torch.randperm(8, device=DEV)[:6] for _ in range(n)]).int()  # 8 hot experts: multi-tile
+    counts = torch.bincount(ids.view(-1).long(), minlength=E).int()
+    sorted_tok = torch.empty(n * 6, dtype=torch.int32, device=DEV); inv = torch.empty_like(sorted_tok)
+    max_tiles = n * 6 // tile_rows + E
+    tiles = torch.zeros(3 * max_tiles, dtype=torch.int32, device=DEV); ntiles = torch.zeros(1, dtype=torch.int32, device=DEV)
+    fl.moe_scan_place(ids.data_ptr(), n, tile_rows, counts.data_ptr(), sorted_tok.data_ptr(), inv.data_ptr(),
+                      tiles.data_ptr(), ntiles.data_ptr(), _stream())
+    d_c, d_s = repack_dev(rand_blocks(8 * H, I, 70))  # only experts 0..7 are routed
+    gs = torch.rand(E, device=DEV) * 1e-3 + 1e-4
+    a = bf16(torch.randn(n * 6, I, device=DEV))
+    y = torch.zeros(n * 6, H, dtype=torch.bfloat16, device=DEV)
+    if override:
+        fl.set_gemm_override(0, 0, 0, 0, *override)
+    try:
+        fl.gemm_w4a16_grouped(a.data_ptr(), 0, I, tiles.data_ptr(), ntiles.data_ptr(), max_tiles, d_c.data_ptr(),
+                              d_s.data_ptr(), H, I, gs.data_ptr(), y.data_ptr(), H, fl.EPI_BF16, tile_rows, tile_rows,
+                              _stream())
+    finally:
+        fl.set_gemm_override(0, 0, 0, 0, 0, 0, 0, 0)
+    e_of = ids.view(-1).cpu()[torch.argsort(inv.cpu())]
+    for slot in (0, 17, n * 6 - 1):
+        e = e_of[slot].item()
+        W = deq_ref(d_c[e * H:(e + 1) * H], d_s[e * H:(e + 1) * H])
+        close_bf16(y[slot], (W @ a[slot].double().cpu()) * gs[e].item(), f"tile_rows {tile_rows} slot {slot}")
+
+
 def test_router_rows_and_sort_and_grouped_gemm():
     torch.manual_seed(5)
     n, E, H, I = 37, 256, 2048, 512
@@ -404,13 +458,62 @@ def test_router_rows_and_sort_and_grouped_gemm():
     act = torch.zeros(n * 6, I, dtype=torch.bfloat16, device=DEV)
     fl.gemm_w4a16_grouped(xn.data_ptr(), sorted_tok.data_ptr(), H, tiles.data_ptr(), ntiles.data_ptr(), max_tiles,
                           gu_c.data_ptr(), gu_s.data_ptr(), 2 * I, H, gs.data_ptr(), act.data_ptr(), I,
-                          fl.EPI_SWIGLU_ROUTED, _stream())
+                          fl.EPI_SWIGLU_ROUTED, 64, 64, _stream())
     for slot in (0, 5, n * 6 - 1):
         tok = st[slot].item(); e = idl[torch.argsort(iv)][slot].item()
         W = deq_ref(gu_c[e * 2 * I:(e + 1) * 2 * I], gu_s[e * 2 * I:(e + 1) * 2 * I])
         y = ((W @ xn[tok].double().cpu()) * gs[e].item()).view(I // 8, 2, 8)
         gg, uu = y[:, 0].reshape(-1), y[:, 1].reshape(-1)
         close_bf16(act[slot], gg / (1 + torch.exp(-gg)) * uu, f"grouped slot {slot}", rel=2.0 ** -6)
+
+
+@pytest.mark.parametrize("n", [37, 300])
+def test_router_topk_rows_and_scan_place(n):
+    torch.manual_seed(6)
+    E, H = 256, 2048
+    xn = bf16(torch.randn(n, H, device=DEV))
+    wr = bf16(torch.randn(E, H, device=DEV) * 0.02)
+    ids = torch.empty(n, 6, dtype=torch.int32, device=DEV)
+    tw = torch.empty(n, 6, device=DEV)
+    counts = torch.zeros(E, dtype=torch.int32, device=DEV)
+    fl.router_topk_rows_bf16(xn.data_ptr(), n, wr.data_ptr(), ids.data_ptr(), tw.data_ptr(), counts.data_ptr(),
+                             _stream())
+    lg = bf16(xn.double() @ wr.double().t()).double().cpu()
+    srt = torch.sort(lg, dim=1, descending=True, stable=True)
+    got = ids.cpu().long()
+    ulp = srt.values[:, 5].abs() * 2.0 ** -7
+    clear = (srt.values[:, 5] - srt.values[:, 6]) > ulp  # selection not decided by one bf16 ulp
+    assert clear.float().mean() > 0.5
+    assert torch.equal(got[clear], srt.indices[clear, :6])
+    sg = torch.sigmoid(srt.values[:, :6])
+    want = bf16(sg / (sg.sum(1, keepdim=True) + 1e-20)).float()
+    assert torch.allclose(tw.cpu()[clear], want[clear], rtol=2.0 ** -7, atol=0)
+    assert torch.equal(counts.cpu(), torch.bincount(got.view(-1), minlength=E).int())
+    # scan/place: same tile list as the single-block sort, same expert grouping, counts re-zeroed
+    max_tiles = n * 6 // 64 + E
+    out = {}
+    for name in ("sort", "place"):
+        st_ = torch.empty(n * 6, dtype=torch.int32, device=DEV)
+        iv_ = torch.empty(n * 6, dtype=torch.int32, device=DEV)
+        tl_ = torch.zeros(3 * max_tiles, dtype=torch.int32, device=DEV)
+        nt_ = torch.zeros(1, dtype=torch.int32, device=DEV)
+        if name == "sort":
+            fl.moe_sort(ids.data_ptr(), n, 64, st_.data_ptr(), iv_.data_ptr(), tl_.data_ptr(), nt_.data_ptr(), _stream())
+        else:
+            fl.moe_scan_place(ids.data_ptr(), n, 64, counts.data_ptr(), st_.data_ptr(), iv_.data_ptr(), tl_.data_ptr(),
+                              nt_.data_ptr(), _stream())
+        out[name] = (st_.cpu(), iv_.cpu(), tl_.cpu(), int(nt_.item()))
+    assert int(counts.abs().sum().item()) == 0
+    assert out["sort"][3] == out["place"][3]
+    k = out["sort"][3]
+    assert torch.equal(out["sort"][2][:3 * k], out["place"][2][:3 * k])
+    idl = ids.view(-1).cpu()
+    st, iv = out["place"][0], out["place"][1]
+    for i in range(n * 6):
+        assert st[iv[i]].item() == i // 6
+    assert torch.equal(torch.sort(iv).values, torch.arange(n * 6, dtype=torch.int32))
+    e_of_slot = idl[torch.argsort(iv)]
+    assert torch.equal(e_of_slot, out["sort"][0].new_tensor(idl[torch.argsort(out["sort"][1])]))
 
 
 def test_qk_rows_match_decode():
@@ -450,6 +553,39 @@ def test_prefill_attention(pos0, n, ring, window):
         ref = attn_ref(q[r], cache, pos0 + r, ring, window, sinks.cpu())
         err = ((out[r].double().cpu() - ref).abs().max() / ref.abs().max()).item()
         assert err < 8e-3, (r, err)
+
+
+@pytest.mark.parametrize("pos0,n,ring,window", [(0, 50, 0, 0), (300, 70, 0, 0), (0, 40, 1024, 513),
+                                                (900, 130, 1024, 513), (5000, 33, 1024, 513), (2000, 200, 0, 0)])
+@pytest.mark.parametrize("variant", [0, 1, 2, 3, 4])
+@pytest.mark.parametrize("n_split", [1, 3])
+def test_prefill_attention2(pos0, n, ring, window, variant, n_split):
+    torch.manual_seed(pos0 + n)
+    slots = ring if ring else pos0 + n
+    cache = bf16(torch.randn(slots, 1024, device=DEV))
+    q = bf16(torch.randn(n, 32, 128, device=DEV))
+    sinks = torch.randn(32, device=DEV) * 3
+    pos = torch.tensor([pos0], dtype=torch.int32, device=DEV)
+    out = torch.empty(n, 32, 128, dtype=torch.bfloat16, device=DEV)
+    units = (n + 15) // 16 * 4
+    o_part = torch.empty(units * n_split * 128 * 128, device=DEV)
+    ml = torch.empty(units * n_split * 128 * 2, device=DEV)
+    counters = torch.zeros(units, dtype=torch.int32, device=DEV)
+    for _ in range(2):  # counters self-reset
+        fl.prefill_attention2_bf16(q.data_ptr(), n, cache.data_ptr(), pos.data_ptr(), ring, window, sinks.data_ptr(),
+                                   1 / math.sqrt(128), out.data_ptr(), n_split, o_part.data_ptr(), ml.data_ptr(),
+                                   counters.data_ptr(), variant, _stream())
+    assert int(counters.abs().sum().item()) == 0
+    for r in (0, n // 2, n - 1):
+        ref = attn_ref(q[r], cache, pos0 + r, ring, window, sinks.cpu())
+        err = ((out[r].double().cpu() - ref).abs().max() / ref.abs().max()).item()
+        assert err < 8e-3, (r, err)
+    if n_split == 1:  # same accumulation order as v1 except for the tile size
+        v1 = torch.empty_like(out)
+        fl.prefill_attention_bf16(q.data_ptr(), n, cache.data_ptr(), pos.data_ptr(), ring, window, sinks.data_ptr(),
+                                  1 / math.sqrt(128), v1.data_ptr(), _stream())
+        if variant in (0, 1, 4):
+            assert torch.equal(out, v1)
 
 
 def test_moe_combine_rows():
