@@ -54,11 +54,12 @@ void embed_rows_bf16(const int* tokens, const int* pos, int n, const void* table
 void qk_norm_rope_kv_rows_bf16(const void* qkv, int n, const float* qw, const float* kw, const float* cos_t,
                                const float* sin_t, const int* pos, void* q_out, void* cache, int ring, int rope,
                                float eps, cudaStream_t s);
-void prefill_attention_bf16(const void* q, int n, const void* cache, const int* pos, int ring, int window,
-                            const float* sinks, float scale, void* out, cudaStream_t s);
-// v2 (variant 0..4 = PKV/stages 32/2, 32/3, 64/2, 64/3, 32/4); n_split > 1 needs o_part/ml_part/counters
-// sized for ceil(n/16) * 4 units (counters zeroed once; they self-reset). Returns non-zero on bad args.
-int prefill_attention2_bf16(const void* q, int n, const void* cache, const int* pos, int ring, int window,
+// Prefill attention for n query rows at positions *pos.. (causal; window > 0: sliding window over a ring
+// cache when ring > 0). Units of 16 tokens x 8 query heads per KV head, each cut into n_split KV ranges
+// merged with the sink in-kernel; n_split > 1 needs o_part [units * n_split * 128 * 128], ml_part
+// [units * n_split * 128 * 2] and counters [units] (zeroed once; they self-reset), units = ceil(n / 16) * 4.
+// variant 0..4 = KV tile / stages 32/2 (default), 32/3, 64/2, 64/3, 32/4. Returns non-zero on bad arguments.
+int prefill_attention_bf16(const void* q, int n, const void* cache, const int* pos, int ring, int window,
                             const float* sinks, float scale, void* out, int n_split, float* o_part, float* ml_part,
                             unsigned* counters, int variant, cudaStream_t s);
 // Returns non-zero for unsupported shapes / epilogues (K % 64, N % 128).
@@ -78,13 +79,11 @@ int gemm_w4a16_grouped(const void* A, const int* gather, int lda, const int* til
                        int epilogue, int tile_rows, int mean_rows, cudaStream_t s);
 // Search hook: non-zero bm overrides the default dense / grouped configuration.
 void set_gemm_override(const GemmConfig& dense, const GemmConfig& grouped);
-void router_rows_bf16(const void* xn, int n, const void* wt, int* ids, float* tw, cudaStream_t s);
-void moe_sort(const int* ids, int n, int tile_rows, int* sorted_tok, int* inv, int* tiles, int* n_tiles,
-              cudaStream_t s);
 // Many-token router on tensor cores (wr = router [256, 2048] bf16); adds selections to counts[256].
 void router_topk_rows_bf16(const void* xn, int n, const void* wr, int* ids, float* tw, int* counts, cudaStream_t s);
-// counts (from router_topk_rows_bf16, re-zeroed) -> offsets, tile list, scatter. Same outputs as moe_sort
-// up to the order of slots inside an expert.
+// counts (from router_topk_rows_bf16, re-zeroed) -> expert offsets, grouped-GEMM tile list
+// (expert, first sorted slot, rows) x n_tiles, and the (token, slot) scatter: sorted_tok[slot] = token,
+// inv[token * 6 + j] = slot. Slot order inside an expert is unspecified (results do not depend on it).
 void moe_scan_place(const int* ids, int n, int tile_rows, int* counts, int* sorted_tok, int* inv, int* tiles,
                     int* n_tiles, cudaStream_t s);
 void moe_combine_rows_bf16(const void* y, const int* inv, const float* tw, const void* shared, void* out, int n,
@@ -112,25 +111,13 @@ int gemv2_w4a16(const void* codes, const void* scales, const void* x, const void
                 cudaStream_t s);
 void add_rmsnorm2_bf16(const void* x, const void* res_in, const float* w, float eps, void* res_out, void* out,
                        cudaStream_t s);
-// Optional L2 warm-ups (nullptr disables): router -> shared-down weights, gate/up -> selected experts' down weights.
 void router_norm_bf16(const void* x, const void* res_in, const float* nw, float eps, void* res_out, void* xn_out,
-                      const void* wr, float* logits, unsigned* counter, int* ids, float* tw, cudaStream_t s,
-                      const void* sh_down_codes = nullptr, const void* sh_down_scales = nullptr);
-// Router + shared-expert gate/up in one launch; pair with moe_gate_up2_bf16(..., scodes = nullptr) (routed only).
-void router_shared_bf16(const void* x, const void* res_in, const float* nw, float eps, void* res_out, void* xn_out,
-                        const void* wr, float* logits, unsigned* counter, int* ids, float* tw, const void* scodes,
-                        const void* sscales, float sgs, void* act, cudaStream_t s);
-// scodes == nullptr: routed experts only (shared expert computed by router_shared_bf16).
+                      const void* wr, float* logits, unsigned* counter, int* ids, float* tw, cudaStream_t s);
 void moe_gate_up2_bf16(const void* xn, const int* ids, const void* ecodes, const void* escales, const float* egs,
-                       const void* scodes, const void* sscales, float sgs, void* act, cudaStream_t s,
-                       const void* down_codes = nullptr, const void* down_scales = nullptr);
+                       const void* scodes, const void* sscales, float sgs, void* act, cudaStream_t s);
 void moe_down_combine2_bf16(const void* act, const int* ids, const float* tw, const void* ecodes, const void* escales,
                             const float* egs, const void* scodes, const void* sscales, float sgs, void* out,
                             cudaStream_t s);
-// Lane-grouped down/combine (one warp per output row; 4 lanes per routed expert, 8 for the shared expert).
-void moe_down_combine3_bf16(const void* act, const int* ids, const float* tw, const void* ecodes, const void* escales,
-                            const float* egs, const void* scodes, const void* sscales, float sgs, void* out,
-                            int warps, int rows, cudaStream_t s);
 void embed2_bf16(const int* tokens, const int* pos, const void* table, void* out, cudaStream_t s);
 // warps in {4, 8, 16}; returns non-zero for an unsupported warp count.
 int decode_attention_fused_bf16(const void* qkv, const float* q_norm_w, const float* k_norm_w, const float* cos_t,

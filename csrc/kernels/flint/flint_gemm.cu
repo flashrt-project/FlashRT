@@ -35,10 +35,6 @@ __device__ __forceinline__ void cp_async16(uint32_t dst, const void* src, bool v
   const int sz = valid ? 16 : 0;
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src), "r"(sz));
 }
-__device__ __forceinline__ void cp_async4(uint32_t dst, const void* src, bool valid) {
-  const int sz = valid ? 4 : 0;
-  asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(dst), "l"(src), "r"(sz));
-}
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;"); }
 template <int N>
 __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N)); }

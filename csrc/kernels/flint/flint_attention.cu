@@ -239,7 +239,7 @@ decode_attn_fused_kernel(const uint16_t* __restrict__ qkv, const float* __restri
                          const float* __restrict__ sinks, float scale, float* __restrict__ o_part,
                          float* __restrict__ ml_part, unsigned* __restrict__ counters, uint16_t* __restrict__ out,
                          const unsigned long long* __restrict__ pf_ranges, int n_pf, int slot_stride, int head_stride,
-                         int v_off, int prewait) {
+                         int v_off) {
   constexpr int NT = WARPS * 32;
   constexpr int DPT = (kGroup * kD) / NT;          // output dims per thread in the merges
   constexpr int TPH = kD / DPT;                    // threads per head
@@ -255,10 +255,7 @@ decode_attn_fused_kernel(const uint16_t* __restrict__ qkv, const float* __restri
   float qwv[4], kwv[4];
 #pragma unroll
   for (int j = 0; j < 4; ++j) { qwv[j] = qw[lane + 32 * j]; kwv[j] = kw[lane + 32 * j]; }
-  if (!prewait) {
-    pdl_wait();
-    pos_p = after_wait(pos_p);
-  }
+  // The position is final before this kernel starts (written two launches back): read it before the wait.
   const int pos = __ldcg(pos_p);
   const int kstart = window > 0 ? max(0, pos - window + 1) : 0;
   const int klen = pos + 1 - kstart;
@@ -304,7 +301,7 @@ decode_attn_fused_kernel(const uint16_t* __restrict__ qkv, const float* __restri
   };
   const int tile0 = b0 + warp * 16;
   bool have = false;
-  if (prewait && tile0 < b1 && tile0 + 16 <= pos) { load_tile(tile0); have = true; }
+  if (tile0 < b1 && tile0 + 16 <= pos) { load_tile(tile0); have = true; }
   // Optional L2 warm-up of the layer's upcoming static weights (o_proj, router, shared expert):
   // this kernel moves little data on short windows, so HBM is otherwise idle here.
   if (threadIdx.x < n_pf) {
@@ -539,10 +536,10 @@ static void launch_attn_fused(const void* qkv, const float* qw, const float* kw,
   }
   const bool cluster = n_split >= 2 && n_split <= 8 && attn_cluster_enabled();
   if (!cluster) {
-    launch_pdl_kind(2, decode_attn_fused_kernel<WARPS, false>, dim3(n_split, 4), dim3(WARPS * 32), smem, s,
+    launch_pdl(decode_attn_fused_kernel<WARPS, false>, dim3(n_split, 4), dim3(WARPS * 32), smem, s,
                static_cast<const uint16_t*>(qkv), qw, kw, cos_t, sin_t, pos, static_cast<uint16_t*>(cache), ring, window,
                rope, eps, sinks, scale, o_part, ml_part, counters, static_cast<uint16_t*>(out), pf_ranges, n_pf,
-               slot_stride, head_stride, v_off, prewait_flags() & 1);
+               slot_stride, head_stride, v_off);
     return;
   }
   cudaLaunchConfig_t cfg = {};
@@ -556,13 +553,12 @@ static void launch_attn_fused(const void* qkv, const float* qw, const float* kw,
   attr[0].val.clusterDim.y = 1;
   attr[0].val.clusterDim.z = 1;
   attr[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attr[1].val.programmaticStreamSerializationAllowed = (pdl_enabled() && pdl_kind_enabled(2)) ? 1 : 0;
+  attr[1].val.programmaticStreamSerializationAllowed = pdl_enabled() ? 1 : 0;
   cfg.attrs = attr;
   cfg.numAttrs = 2;
   cudaLaunchKernelEx(&cfg, decode_attn_fused_kernel<WARPS, true>, static_cast<const uint16_t*>(qkv), qw, kw, cos_t,
                      sin_t, pos, static_cast<uint16_t*>(cache), ring, window, rope, eps, sinks, scale, o_part, ml_part,
-                     counters, static_cast<uint16_t*>(out), pf_ranges, n_pf, slot_stride, head_stride, v_off,
-                     prewait_flags() & 1);
+                     counters, static_cast<uint16_t*>(out), pf_ranges, n_pf, slot_stride, head_stride, v_off);
 }
 
 int decode_attention_fused_bf16(const void* qkv, const float* q_norm_w, const float* k_norm_w, const float* cos_t,
@@ -597,7 +593,7 @@ int decode_attention_fused_bf16(const void* qkv, const float* q_norm_w, const fl
 // ===========================================================================
 namespace {
 
-constexpr int PQ = 16, PKV = 32, PSTAGES = 2;
+constexpr int PQ = 16;  // query tokens per prefill attention unit
 
 __device__ __forceinline__ uint32_t smem_addr(const void* p) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(p));
@@ -618,155 +614,7 @@ __device__ __forceinline__ int kv_off(int r, int c) { return r * kD + ((c ^ (r &
 
 }  // namespace
 
-__global__ void __launch_bounds__(256)
-prefill_attn_kernel(const uint16_t* __restrict__ q, int n, const uint16_t* __restrict__ cache,
-                    const int* __restrict__ pos_p, int ring, int window, const float* __restrict__ sinks,
-                    float scale, uint16_t* __restrict__ out) {
-  __shared__ __align__(16) uint16_t ks[PSTAGES][PKV * kD];
-  __shared__ __align__(16) uint16_t vs[PSTAGES][PKV * kD];
-  const int kvh = blockIdx.y, q0 = blockIdx.x * PQ;
-  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
-  const int head = kvh * kGroup + warp;
-  const int pos0 = *pos_p;
-  const int qlast = min(n, q0 + PQ) - 1;                   // last valid query row
-  const int kv_end = pos0 + qlast + 1;                     // exclusive
-  const int kv_beg = window > 0 ? max(0, pos0 + q0 - window + 1) : 0;
-  const float c = scale * kLog2e;
-
-  // Q fragments (rows g, g+8 = tokens q0+g, q0+8+g)
-  uint32_t qa[8][4];
-  {
-    const int r0 = q0 + g, r1 = q0 + g + 8;
-    const uint16_t* p0 = q + (static_cast<size_t>(min(r0, n - 1)) * 32 + head) * kD;
-    const uint16_t* p1 = q + (static_cast<size_t>(min(r1, n - 1)) * 32 + head) * kD;
-#pragma unroll
-    for (int k8 = 0; k8 < 8; ++k8) {
-      qa[k8][0] = *reinterpret_cast<const uint32_t*>(p0 + 16 * k8 + 2 * t);
-      qa[k8][1] = *reinterpret_cast<const uint32_t*>(p1 + 16 * k8 + 2 * t);
-      qa[k8][2] = *reinterpret_cast<const uint32_t*>(p0 + 16 * k8 + 8 + 2 * t);
-      qa[k8][3] = *reinterpret_cast<const uint32_t*>(p1 + 16 * k8 + 8 + 2 * t);
-    }
-  }
-  const int pq[2] = {pos0 + q0 + g, pos0 + q0 + g + 8};
-
-  float o[16][4];
-#pragma unroll
-  for (int i = 0; i < 16; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
-  const float sk = sinks[head] * kLog2e;
-  float m2[2] = {sk, sk};                                  // running max (log2 units), sink included
-  float l[2] = {t == 0 ? 1.f : 0.f, t == 0 ? 1.f : 0.f};   // sink contributes exp2(sk - m) = 1 once per row
-
-  auto load_tile = [&](int st, int kb) {
-    // 32 keys x (16 K chunks + 16 V chunks) = 1024 chunks / 256 threads
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const int idx = threadIdx.x + i * 256;
-      const int r = idx >> 5, cc = idx & 31, isv = cc >> 4, ch = cc & 15;
-      const int p = kb + r;
-      const bool ok = p < kv_end;
-      const int slot = ring > 0 ? (p & (ring - 1)) : p;
-      const uint16_t* src = cache + static_cast<size_t>(ok ? slot : 0) * kSlotElems + isv * 512 + kvh * kD + ch * 8;
-      uint16_t* dst = (isv ? vs[st] : ks[st]) + kv_off(r, ch);
-      cpa16(smem_addr(dst), src, ok);
-    }
-    asm volatile("cp.async.commit_group;");
-  };
-
-  const int ntiles = (kv_end - kv_beg + PKV - 1) / PKV;
-  if (ntiles > 0) load_tile(0, kv_beg);
-  for (int it = 0; it < ntiles; ++it) {
-    const int kb = kv_beg + it * PKV, st = it & 1;
-    if (it + 1 < ntiles) {
-      load_tile(st ^ 1, kb + PKV);
-      asm volatile("cp.async.wait_group 1;");
-    } else {
-      asm volatile("cp.async.wait_group 0;");
-    }
-    __syncthreads();
-    // ---- S = Q K^T : 4 n-tiles of 8 keys ----
-    float s[4][4];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.f;
-#pragma unroll
-      for (int k2 = 0; k2 < 4; ++k2) {  // pairs of k-steps (32 dims)
-        uint32_t b[4];
-        const int r = 8 * j + (lane & 7), ch = 4 * k2 + (lane >> 3);
-        ldsm_x4(b, smem_addr(ks[st] + kv_off(r, ch)));
-        mma_bf16_16816(s[j], qa[2 * k2][0], qa[2 * k2][1], qa[2 * k2][2], qa[2 * k2][3], b[0], b[1]);
-        mma_bf16_16816(s[j], qa[2 * k2 + 1][0], qa[2 * k2 + 1][1], qa[2 * k2 + 1][2], qa[2 * k2 + 1][3], b[2], b[3]);
-      }
-    }
-    // ---- mask + online softmax (rows g, g+8) ----
-    float rmax[2] = {-FLT_MAX, -FLT_MAX};
-#pragma unroll
-    for (int j = 0; j < 4; ++j)
-#pragma unroll
-      for (int e = 0; e < 4; ++e) {
-        const int h = e >> 1, key = kb + 8 * j + 2 * t + (e & 1);
-        const int qp = pq[h];
-        const bool ok = key < kv_end && key <= qp && (window <= 0 || qp - key < window);
-        s[j][e] = ok ? s[j][e] * c : -FLT_MAX;
-        rmax[h] = fmaxf(rmax[h], s[j][e]);
-      }
-    float alpha[2];
-#pragma unroll
-    for (int h = 0; h < 2; ++h) {
-      rmax[h] = fmaxf(rmax[h], __shfl_xor_sync(0xffffffffu, rmax[h], 1));
-      rmax[h] = fmaxf(rmax[h], __shfl_xor_sync(0xffffffffu, rmax[h], 2));
-      const float mn = fmaxf(m2[h], rmax[h]);
-      alpha[h] = exp2f(m2[h] - mn);
-      m2[h] = mn;
-      l[h] *= alpha[h];
-    }
-    uint32_t pa[2][4];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      float p[4];
-#pragma unroll
-      for (int e = 0; e < 4; ++e) {
-        p[e] = s[j][e] == -FLT_MAX ? 0.f : exp2f(s[j][e] - m2[e >> 1]);
-        l[e >> 1] += p[e];
-      }
-      // k-step kk = j/2 (16 keys = n-tiles 2kk, 2kk+1)
-      pa[j >> 1][(j & 1) * 2 + 0] = pack_bf16x2(p[0], p[1]);
-      pa[j >> 1][(j & 1) * 2 + 1] = pack_bf16x2(p[2], p[3]);
-    }
-#pragma unroll
-    for (int i = 0; i < 16; ++i) { o[i][0] *= alpha[0]; o[i][1] *= alpha[0]; o[i][2] *= alpha[1]; o[i][3] *= alpha[1]; }
-    // ---- O += P V : 2 k-steps (16 keys) x 16 n-tiles (8 dims) ----
-#pragma unroll
-    for (int kk = 0; kk < 2; ++kk) {
-#pragma unroll
-      for (int d2 = 0; d2 < 8; ++d2) {  // pairs of dim n-tiles
-        uint32_t b[4];
-        const int r = 16 * kk + (lane & 7) + ((lane >> 3) & 1) * 8, ch = 2 * d2 + (lane >> 4);
-        ldsm_x4_t(b, smem_addr(vs[st] + kv_off(r, ch)));
-        // A layout: a0 row g keys 2t.., a1 row g+8, a2 row g keys 8+2t.., a3 row g+8
-        mma_bf16_16816(o[2 * d2], pa[kk][0], pa[kk][1], pa[kk][2], pa[kk][3], b[0], b[1]);
-        mma_bf16_16816(o[2 * d2 + 1], pa[kk][0], pa[kk][1], pa[kk][2], pa[kk][3], b[2], b[3]);
-      }
-    }
-    __syncthreads();
-  }
-#pragma unroll
-  for (int h = 0; h < 2; ++h) {
-    l[h] += __shfl_xor_sync(0xffffffffu, l[h], 1);
-    l[h] += __shfl_xor_sync(0xffffffffu, l[h], 2);
-  }
-#pragma unroll
-  for (int h = 0; h < 2; ++h) {
-    const int r = q0 + g + 8 * h;
-    if (r >= n) continue;
-    const float inv = 1.f / l[h];
-    uint16_t* dst = out + (static_cast<size_t>(r) * 32 + head) * kD;
-#pragma unroll
-    for (int i = 0; i < 16; ++i)
-      *reinterpret_cast<uint32_t*>(dst + 8 * i + 2 * t) = pack_bf16x2(o[i][2 * h] * inv, o[i][2 * h + 1] * inv);
-  }
-}
-
-// v2: PKV-key tiles through an ST-stage cp.async ring (one barrier per tile), masks only on tiles that
+// PKV-key tiles through an ST-stage cp.async ring (one barrier per tile), masks only on tiles that
 // touch a row-dependent bound, heaviest q-blocks first, and optional KV splits: unit (q-block, kv head)
 // is cut into n_split contiguous tile ranges whose partials (fp32 O relative to the split max, row max,
 // row sum) are merged together with the sink by the last CTA of the unit (counters self-reset).
@@ -774,7 +622,7 @@ prefill_attn_kernel(const uint16_t* __restrict__ q, int n, const uint16_t* __res
 // o_part f32 [n_qb * 4][n_split][128][128], ml_part f32 [n_qb * 4][n_split][128][2], counters [n_qb * 4].
 template <int PKV, int ST>
 __global__ void __launch_bounds__(256)
-prefill_attn2_kernel(const uint16_t* __restrict__ q, int n, const uint16_t* __restrict__ cache,
+prefill_attn_kernel(const uint16_t* __restrict__ q, int n, const uint16_t* __restrict__ cache,
                      const int* __restrict__ pos_p, int ring, int window, const float* __restrict__ sinks,
                      float scale, uint16_t* __restrict__ out, int n_split, float* __restrict__ o_part,
                      float* __restrict__ ml_part, unsigned* __restrict__ counters) {
@@ -988,47 +836,41 @@ prefill_attn2_kernel(const uint16_t* __restrict__ q, int n, const uint16_t* __re
 }
 
 template <int PKV, int ST>
-void launch_prefill_attn2(const void* q, int n, const void* cache, const int* pos, int ring, int window,
+void launch_prefill_attn(const void* q, int n, const void* cache, const int* pos, int ring, int window,
                           const float* sinks, float scale, void* out, int n_split, float* o_part, float* ml_part,
                           unsigned* counters, cudaStream_t s) {
   constexpr int smem = ST * PKV * kD * 2 * 2;
   static bool attr = false;
   if (!attr) {
-    cudaFuncSetAttribute(reinterpret_cast<const void*>(prefill_attn2_kernel<PKV, ST>),
+    cudaFuncSetAttribute(reinterpret_cast<const void*>(prefill_attn_kernel<PKV, ST>),
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     attr = true;
   }
-  prefill_attn2_kernel<PKV, ST><<<dim3(((n + PQ - 1) / PQ) * n_split, 4), 256, smem, s>>>(
+  prefill_attn_kernel<PKV, ST><<<dim3(((n + PQ - 1) / PQ) * n_split, 4), 256, smem, s>>>(
       static_cast<const uint16_t*>(q), n, static_cast<const uint16_t*>(cache), pos, ring, window, sinks, scale,
       static_cast<uint16_t*>(out), n_split, o_part, ml_part, counters);
 }
 
-int prefill_attention2_bf16(const void* q, int n, const void* cache, const int* pos, int ring, int window,
+int prefill_attention_bf16(const void* q, int n, const void* cache, const int* pos, int ring, int window,
                             const float* sinks, float scale, void* out, int n_split, float* o_part, float* ml_part,
                             unsigned* counters, int variant, cudaStream_t s) {
   if (n_split < 1 || (n_split > 1 && (o_part == nullptr || ml_part == nullptr || counters == nullptr))) return 1;
-#define FLINT_PA2(V, PKV, ST)                                                                                \
+#define FLINT_PA(V, PKV, ST)                                                                                \
   case V:                                                                                                    \
-    launch_prefill_attn2<PKV, ST>(q, n, cache, pos, ring, window, sinks, scale, out, n_split, o_part, ml_part, \
+    launch_prefill_attn<PKV, ST>(q, n, cache, pos, ring, window, sinks, scale, out, n_split, o_part, ml_part, \
                                   counters, s);                                                              \
     return 0;
   switch (variant) {
-    FLINT_PA2(0, 32, 2)
-    FLINT_PA2(1, 32, 3)
-    FLINT_PA2(2, 64, 2)
-    FLINT_PA2(3, 64, 3)
-    FLINT_PA2(4, 32, 4)
+    FLINT_PA(0, 32, 2)
+    FLINT_PA(1, 32, 3)
+    FLINT_PA(2, 64, 2)
+    FLINT_PA(3, 64, 3)
+    FLINT_PA(4, 32, 4)
     default: return 1;
   }
-#undef FLINT_PA2
+#undef FLINT_PA
 }
 
-void prefill_attention_bf16(const void* q, int n, const void* cache, const int* pos, int ring, int window,
-                            const float* sinks, float scale, void* out, cudaStream_t s) {
-  prefill_attn_kernel<<<dim3((n + PQ - 1) / PQ, 4), 256, 0, s>>>(
-      static_cast<const uint16_t*>(q), n, static_cast<const uint16_t*>(cache), pos, ring, window, sinks, scale,
-      static_cast<uint16_t*>(out));
-}
 
 }  // namespace flint
 }  // namespace flash_rt

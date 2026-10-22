@@ -61,7 +61,6 @@ class _Layer:
     gate_up: Optional[_Mat] = None       # dense layers
     down: Optional[_Mat] = None
     router: object = None                # MoE layers (bf16 [256, 2048])
-    router_t: object = None              # same, K-major [2048, 256] (prefill)
     exp_gate_up: Optional[_Mat] = None
     exp_down: Optional[_Mat] = None
     sh_gate_up: Optional[_Mat] = None
@@ -240,7 +239,6 @@ class FlintRuntime:
             else:
                 S = cfg.shared_intermediate_size
                 L.router = self._bf16(p + "ffn_gate_inp.weight")
-                L.router_t = L.router.t().contiguous()   # K-major copy for the many-token router
                 L.exp_gate_up = self._experts_gate_up(p + "ffn_gate_exps.weight", p + "ffn_up_exps.weight")
                 L.exp_down = self._experts_down(p + "ffn_down_exps.weight")
                 L.sh_gate_up = self._gate_up(p + "ffn_gate_shexp.weight", p + "ffn_up_shexp.weight", S, H)
@@ -299,11 +297,8 @@ class FlintRuntime:
         self.attn_buckets = ((512, 1, 4, g_short), (12288, 8, 8, g_short), (49152, 16, 8, g_short),
                              (1 << 30, 16, 8, g_long))
         import os as _os
-        self.l2_warm = _os.environ.get("FLINT_L2WARM", "0") == "1"   # bulk L2 warm-up of MoE down weights: measured negative, off
-        self.router_shared = _os.environ.get("FLINT_ROUTER_SHARED", "0") == "1"   # router+shared fusion: measured +4%, off
         # L2 warm-up of each layer's o_proj/router/shared-expert weights from the attention kernel when the
         # attention moves little data (sliding layers; global layers in short-context buckets).
-        self.attn_l2_prefetch = _os.environ.get("FLINT_ATTN_PF", "1") != "0"
         self.attn_pf_max_splits = 8
         bcfg = _os.environ.get("FLINT_ATTN_BUCKETS")      # "ub:splits:warps;..." (search/bisect hook)
         if bcfg:
@@ -342,14 +337,12 @@ class FlintRuntime:
         self.pf_tiles = torch.zeros(3 * ((C * T) // 16 + cfg.num_experts), dtype=i32, device=self.dev)
         self.pf_ntiles = torch.zeros(1, dtype=i32, device=self.dev)
         self.pf_counts = torch.zeros(cfg.num_experts, dtype=i32, device=self.dev)   # re-zeroed by moe_scan_place
-        self.pf_router_v1 = _os.environ.get("FLINT_PF_ROUTER") == "v1"
         self.pf_act_s = torch.zeros((C * T, cfg.expert_intermediate_size), dtype=bf, device=self.dev)
         self.pf_y_s = torch.zeros((C * T, H), dtype=bf, device=self.dev)
         self.pf_sh_act = torch.zeros((C, cfg.shared_intermediate_size), dtype=bf, device=self.dev)
         self.pf_sh = torch.zeros((C, H), dtype=bf, device=self.dev)
         # Prefill attention: KV splits (host-chosen per chunk) with partials merged in-kernel.
         self.sm_count = torch.cuda.get_device_properties(self.dev).multi_processor_count
-        self.pf_attn_v1 = _os.environ.get("FLINT_PF_ATTN") == "v1"
         self.pf_attn_variant = int(_os.environ.get("FLINT_PF_ATTN_VARIANT", "0"))
         self.pf_attn_pkv = 64 if self.pf_attn_variant in (2, 3) else 32
         self.pf_split_max = int(_os.environ.get("FLINT_PF_SPLIT_MAX", "4"))
@@ -459,15 +452,10 @@ class FlintRuntime:
                                          self.pf_q.data_ptr(), L.cache.data_ptr(), ring, 1 if L.sliding else 0,
                                          eps, s)
             window = cfg.sliding_window if L.sliding else 0
-            if self.pf_attn_v1:
-                fl.prefill_attention_bf16(self.pf_q.data_ptr(), m, L.cache.data_ptr(), self.pos.data_ptr(), ring,
-                                          window, L.sinks.data_ptr(), scale, self.pf_att.data_ptr(), s)
-            else:
-                fl.prefill_attention2_bf16(self.pf_q.data_ptr(), m, L.cache.data_ptr(), self.pos.data_ptr(), ring,
-                                           window, L.sinks.data_ptr(), scale, self.pf_att.data_ptr(),
-                                           splits[1 if L.sliding else 0], self.pf_opart.data_ptr(),
-                                           self.pf_ml.data_ptr(), self.pf_attn_ctr.data_ptr(),
-                                           self.pf_attn_variant, s)
+            fl.prefill_attention_bf16(self.pf_q.data_ptr(), m, L.cache.data_ptr(), self.pos.data_ptr(), ring, window,
+                                      L.sinks.data_ptr(), scale, self.pf_att.data_ptr(), splits[1 if L.sliding else 0],
+                                      self.pf_opart.data_ptr(), self.pf_ml.data_ptr(), self.pf_attn_ctr.data_ptr(),
+                                      self.pf_attn_variant, s)
             self._gemm(self.pf_att, m, cfg.q_dim, L.o, self.pf_x, H, fl.EPI_BF16, s)
             fl.add_rmsnorm_bf16(self.pf_x.data_ptr(), self.pf_res.data_ptr(), L.ffn_norm.data_ptr(),
                                 self.pf_xn.data_ptr(), m, eps, 0, s)
@@ -487,17 +475,11 @@ class FlintRuntime:
                            fl.EPI_BF16, ss)
                 if side is not None:
                     self._pf_join[il].record(side)
-                if self.pf_router_v1:
-                    fl.router_rows_bf16(self.pf_xn.data_ptr(), m, L.router_t.data_ptr(), self.pf_ids.data_ptr(),
-                                        self.pf_tw.data_ptr(), s)
-                    fl.moe_sort(self.pf_ids.data_ptr(), m, tile_rows, self.pf_sorted.data_ptr(),
-                                self.pf_inv.data_ptr(), self.pf_tiles.data_ptr(), self.pf_ntiles.data_ptr(), s)
-                else:
-                    fl.router_topk_rows_bf16(self.pf_xn.data_ptr(), m, L.router.data_ptr(), self.pf_ids.data_ptr(),
-                                             self.pf_tw.data_ptr(), self.pf_counts.data_ptr(), s)
-                    fl.moe_scan_place(self.pf_ids.data_ptr(), m, tile_rows, self.pf_counts.data_ptr(),
-                                      self.pf_sorted.data_ptr(), self.pf_inv.data_ptr(), self.pf_tiles.data_ptr(),
-                                      self.pf_ntiles.data_ptr(), s)
+                fl.router_topk_rows_bf16(self.pf_xn.data_ptr(), m, L.router.data_ptr(), self.pf_ids.data_ptr(),
+                                         self.pf_tw.data_ptr(), self.pf_counts.data_ptr(), s)
+                fl.moe_scan_place(self.pf_ids.data_ptr(), m, tile_rows, self.pf_counts.data_ptr(),
+                                  self.pf_sorted.data_ptr(), self.pf_inv.data_ptr(), self.pf_tiles.data_ptr(),
+                                  self.pf_ntiles.data_ptr(), s)
                 g = L.exp_gate_up
                 fl.gemm_w4a16_grouped(self.pf_xn.data_ptr(), self.pf_sorted.data_ptr(), H, self.pf_tiles.data_ptr(),
                                       self.pf_ntiles.data_ptr(), max_tiles, g.codes.data_ptr(),
@@ -590,7 +572,7 @@ class FlintRuntime:
                            self.qkv_buf.data_ptr(), q.rows, q.k, q.gs, 0, s)
             site += 1
             ring = self.ring if L.sliding else 0
-            pf = self.attn_l2_prefetch and (L.sliding or splits <= self.attn_pf_max_splits) and L.pf_n > 0
+            pf = (L.sliding or splits <= self.attn_pf_max_splits) and L.pf_n > 0
             fl.decode_attention_fused_bf16(self.qkv_buf.data_ptr(), L.q_norm.data_ptr(), L.k_norm.data_ptr(),
                                            self.rope_cos.data_ptr(), self.rope_sin.data_ptr(), self.pos.data_ptr(),
                                            L.cache.data_ptr(), ring, cfg.sliding_window if L.sliding else 0,
@@ -612,26 +594,14 @@ class FlintRuntime:
                 fl.gemv2_w4a16(d.codes.data_ptr(), d.scales.data_ptr(), self.act.data_ptr(), 0, 0, 0, 0, eps,
                                self.x.data_ptr(), d.rows, d.k, d.gs, 0, s)
             else:
-                l2 = self.l2_warm
-                if self.router_shared:
-                    fl.router_shared_bf16(self.x_attn.data_ptr(), res[site & 1], L.ffn_norm.data_ptr(), eps,
-                                          res[(site + 1) & 1], self.xn.data_ptr(), L.router.data_ptr(),
-                                          self.router_logits.data_ptr(), self.router_counter.data_ptr(),
-                                          self.ids.data_ptr(), self.tw.data_ptr(), L.sh_gate_up.codes.data_ptr(),
-                                          L.sh_gate_up.scales.data_ptr(), L.sh_gate_up.gs, self.act.data_ptr(), s)
-                else:
-                    fl.router_norm_bf16(self.x_attn.data_ptr(), res[site & 1], L.ffn_norm.data_ptr(), eps,
-                                        res[(site + 1) & 1], self.xn.data_ptr(), L.router.data_ptr(),
-                                        self.router_logits.data_ptr(), self.router_counter.data_ptr(),
-                                        self.ids.data_ptr(), self.tw.data_ptr(), s,
-                                        L.sh_down.codes.data_ptr() if l2 else 0, L.sh_down.scales.data_ptr() if l2 else 0)
-                sh = not self.router_shared
+                fl.router_norm_bf16(self.x_attn.data_ptr(), res[site & 1], L.ffn_norm.data_ptr(), eps,
+                                    res[(site + 1) & 1], self.xn.data_ptr(), L.router.data_ptr(),
+                                    self.router_logits.data_ptr(), self.router_counter.data_ptr(),
+                                    self.ids.data_ptr(), self.tw.data_ptr(), s)
                 fl.moe_gate_up2_bf16(self.xn.data_ptr(), self.ids.data_ptr(), L.exp_gate_up.codes.data_ptr(),
                                      L.exp_gate_up.scales.data_ptr(), L.exp_gate_up.gs_dev.data_ptr(),
-                                     L.sh_gate_up.codes.data_ptr() if sh else 0,
-                                     L.sh_gate_up.scales.data_ptr() if sh else 0, L.sh_gate_up.gs,
-                                     self.act.data_ptr(), s, L.exp_down.codes.data_ptr() if l2 else 0,
-                                     L.exp_down.scales.data_ptr() if l2 else 0)
+                                     L.sh_gate_up.codes.data_ptr(), L.sh_gate_up.scales.data_ptr(), L.sh_gate_up.gs,
+                                     self.act.data_ptr(), s)
                 fl.moe_down_combine2_bf16(self.act.data_ptr(), self.ids.data_ptr(), self.tw.data_ptr(),
                                           L.exp_down.codes.data_ptr(), L.exp_down.scales.data_ptr(),
                                           L.exp_down.gs_dev.data_ptr(), L.sh_down.codes.data_ptr(),

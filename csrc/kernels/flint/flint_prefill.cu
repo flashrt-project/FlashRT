@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Flint prefill row kernels (many tokens per launch): embedding, Q/K norm +
-// RoPE + KV write, router + top-6, deterministic expert sort with the grouped
-// GEMM tile list, and the weighted MoE combine. Numerics match the decode
-// kernels row for row.
+// RoPE + KV write, expert placement with the grouped GEMM tile list, and the
+// weighted MoE combine. Numerics match the decode kernels row for row.
 
 #include "flint_common.cuh"
 #include "flint_kernels.cuh"
@@ -86,131 +85,6 @@ void qk_norm_rope_kv_rows_bf16(const void* qkv, int n, const float* qw, const fl
   qk_norm_rope_kv_rows_kernel<<<n, 256, 0, s>>>(
       static_cast<const uint16_t*>(qkv), qw, kw, cos_t, sin_t, pos, static_cast<uint16_t*>(q_out),
       static_cast<uint16_t*>(cache), ring, rope, eps);
-}
-
-// Router for 8 tokens per block: thread e computes logit[e] for the block's tokens from the
-// K-major router copy wt [2048][256]; one warp per token then selects top-6 (same rule as decode).
-__global__ void __launch_bounds__(256)
-router_rows_kernel(const uint16_t* __restrict__ xn, int n, const uint16_t* __restrict__ wt,
-                   int* __restrict__ ids, float* __restrict__ tw) {
-  __shared__ __align__(16) uint16_t xs[8][kHidden];
-  __shared__ float lg[8][kExperts];
-  const int r0 = blockIdx.x * 8;
-  const int nr = min(8, n - r0);
-  for (int i = threadIdx.x; i < 8 * kHidden / 8; i += 256) {
-    const int rr = i / (kHidden / 8), c = i % (kHidden / 8);
-    reinterpret_cast<uint4*>(xs[rr])[c] =
-        rr < nr ? reinterpret_cast<const uint4*>(xn + static_cast<size_t>(r0 + rr) * kHidden)[c] : make_uint4(0, 0, 0, 0);
-  }
-  __syncthreads();
-  const int e = threadIdx.x;
-  float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-  for (int k = 0; k < kHidden; k += 2) {
-    const float w0 = bf16_to_f32(wt[static_cast<size_t>(k) * kExperts + e]);
-    const float w1 = bf16_to_f32(wt[static_cast<size_t>(k + 1) * kExperts + e]);
-#pragma unroll
-    for (int rr = 0; rr < 8; ++rr) {
-      const uint32_t xv = *reinterpret_cast<const uint32_t*>(&xs[rr][k]);
-      acc[rr] = fmaf(w0, bf16lo(xv), acc[rr]);
-      acc[rr] = fmaf(w1, bf16hi(xv), acc[rr]);
-    }
-  }
-#pragma unroll
-  for (int rr = 0; rr < 8; ++rr) lg[rr][e] = round_bf16(acc[rr]);
-  __syncthreads();
-  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  if (warp >= nr) return;
-  float v[8];
-#pragma unroll
-  for (int j = 0; j < 8; ++j) v[j] = lg[warp][lane * 8 + j];
-  float sv[kTopK];
-  int si[kTopK];
-#pragma unroll
-  for (int k = 0; k < kTopK; ++k) {
-    float bv = -FLT_MAX; int bi = 0x7fffffff;
-#pragma unroll
-    for (int j = 0; j < 8; ++j)
-      if (v[j] > bv) { bv = v[j]; bi = lane * 8 + j; }
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-      const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
-      const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
-      if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
-    }
-    sv[k] = bv; si[k] = bi;
-    if ((bi >> 3) == lane) v[bi & 7] = -FLT_MAX;
-  }
-  if (lane == 0) {
-    float sg[kTopK], sum = 0.f;
-#pragma unroll
-    for (int k = 0; k < kTopK; ++k) { sg[k] = __fdiv_rn(1.0f, 1.0f + expf(-sv[k])); sum += sg[k]; }
-    const float den = sum + 1e-20f;
-    const int row = r0 + warp;
-#pragma unroll
-    for (int k = 0; k < kTopK; ++k) {
-      ids[row * kTopK + k] = si[k];
-      tw[row * kTopK + k] = round_bf16(__fdiv_rn(sg[k], den));
-    }
-  }
-}
-
-void router_rows_bf16(const void* xn, int n, const void* wt, int* ids, float* tw, cudaStream_t s) {
-  router_rows_kernel<<<(n + 7) / 8, 256, 0, s>>>(static_cast<const uint16_t*>(xn), n,
-                                                 static_cast<const uint16_t*>(wt), ids, tw);
-}
-
-// Single-block sort of the n*6 (token, slot) pairs by expert.
-//   sorted_tok[i]  : token row of sorted slot i;  inv[t*6+j] : sorted slot of (t, j)
-//   tiles[3*k]     : (expert, first sorted slot, rows) for the grouped GEMM, tile_rows per tile
-//   n_tiles[0]     : number of tiles
-// Within an expert, slots keep (token, j) order, so the layout is deterministic.
-__global__ void __launch_bounds__(1024)
-moe_sort_kernel(const int* __restrict__ ids, int n, int tile_rows, int* __restrict__ sorted_tok,
-                int* __restrict__ inv, int* __restrict__ tiles, int* __restrict__ n_tiles) {
-  __shared__ int cnt[kExperts], off[kExperts], toff[kExperts];
-  const int tid = threadIdx.x, total = n * kTopK;
-  if (tid < kExperts) cnt[tid] = 0;
-  __syncthreads();
-  for (int i = tid; i < total; i += blockDim.x) atomicAdd(&cnt[ids[i]], 1);
-  __syncthreads();
-  if (tid == 0) {
-    int a = 0, b = 0;
-    for (int e = 0; e < kExperts; ++e) {
-      off[e] = a; toff[e] = b;
-      a += cnt[e];
-      b += (cnt[e] + tile_rows - 1) / tile_rows;
-    }
-    *n_tiles = b;
-  }
-  __syncthreads();
-  if (tid < kExperts) {
-    const int e = tid, c = cnt[e];
-    for (int k = 0; k * tile_rows < c; ++k) {
-      const int ti = toff[e] + k;
-      tiles[3 * ti] = e; tiles[3 * ti + 1] = off[e] + k * tile_rows; tiles[3 * ti + 2] = min(tile_rows, c - k * tile_rows);
-    }
-  }
-  // Stable scatter: each expert's slots in increasing (token, j) order. One warp per expert group of 8.
-  const int warp = tid >> 5, lane = tid & 31;
-  for (int e = warp; e < kExperts; e += blockDim.x >> 5) {
-    int base = off[e];
-    for (int i0 = 0; i0 < total; i0 += 32) {
-      const int i = i0 + lane;
-      const bool hit = i < total && ids[i] == e;
-      const unsigned m = __ballot_sync(0xffffffffu, hit);
-      if (hit) {
-        const int slot = base + __popc(m & ((1u << lane) - 1u));
-        sorted_tok[slot] = i / kTopK;
-        inv[i] = slot;
-      }
-      base += __popc(m);
-    }
-  }
-}
-
-void moe_sort(const int* ids, int n, int tile_rows, int* sorted_tok, int* inv, int* tiles, int* n_tiles,
-              cudaStream_t s) {
-  moe_sort_kernel<<<1, 1024, 0, s>>>(ids, n, tile_rows, sorted_tok, inv, tiles, n_tiles);
 }
 
 // Expert offsets from the router's per-expert counts (re-zeroed here for the next layer), the grouped

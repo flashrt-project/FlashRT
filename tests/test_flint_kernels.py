@@ -423,32 +423,24 @@ def test_grouped_tile_rows(tile_rows, override):
         close_bf16(y[slot], (W @ a[slot].double().cpu()) * gs[e].item(), f"tile_rows {tile_rows} slot {slot}")
 
 
-def test_router_rows_and_sort_and_grouped_gemm():
+def test_router_place_and_grouped_gemm():
     torch.manual_seed(5)
     n, E, H, I = 37, 256, 2048, 512
     xn = bf16(torch.randn(n, H, device=DEV))
     wr = bf16(torch.randn(E, H, device=DEV) * 0.02)
     ids = torch.empty(n, 6, dtype=torch.int32, device=DEV)
     tw = torch.empty(n, 6, device=DEV)
-    fl.router_rows_bf16(xn.data_ptr(), n, wr.t().contiguous().data_ptr(), ids.data_ptr(), tw.data_ptr(), _stream())
-    # the many-token router must agree with the decode router row by row
-    lg_s = torch.empty(256, device=DEV); ctr = torch.zeros(1, dtype=torch.int32, device=DEV)
-    i1 = torch.empty(6, dtype=torch.int32, device=DEV); t1 = torch.empty(6, device=DEV)
-    for r in (0, 17, 36):
-        fl.router_topk_bf16(xn[r].data_ptr(), wr.data_ptr(), lg_s.data_ptr(), ctr.data_ptr(), i1.data_ptr(),
-                            t1.data_ptr(), _stream())
-        assert torch.equal(ids[r], i1) and torch.equal(tw[r], t1)
+    counts = torch.zeros(E, dtype=torch.int32, device=DEV)
+    fl.router_topk_rows_bf16(xn.data_ptr(), n, wr.data_ptr(), ids.data_ptr(), tw.data_ptr(), counts.data_ptr(),
+                             _stream())
     sorted_tok = torch.empty(n * 6, dtype=torch.int32, device=DEV)
     inv = torch.empty(n * 6, dtype=torch.int32, device=DEV)
     max_tiles = n * 6 // 64 + E
     tiles = torch.zeros(3 * max_tiles, dtype=torch.int32, device=DEV)
     ntiles = torch.zeros(1, dtype=torch.int32, device=DEV)
-    fl.moe_sort(ids.data_ptr(), n, 64, sorted_tok.data_ptr(), inv.data_ptr(), tiles.data_ptr(), ntiles.data_ptr(),
-                _stream())
+    fl.moe_scan_place(ids.data_ptr(), n, 64, counts.data_ptr(), sorted_tok.data_ptr(), inv.data_ptr(),
+                      tiles.data_ptr(), ntiles.data_ptr(), _stream())
     idl, st, iv = ids.view(-1).cpu(), sorted_tok.cpu(), inv.cpu()
-    for i in range(n * 6):  # inv/sorted are a consistent permutation grouped by expert
-        assert st[iv[i]].item() == i // 6
-    assert torch.equal(torch.sort(idl[torch.argsort(iv)]).values, idl[torch.argsort(iv)])
     # grouped gate/up (routed SwiGLU rule) on the sorted slots
     eg = rand_blocks(E * I, H, 50); eu = rand_blocks(E * I, H, 51)
     gu_c = torch.empty(E * 2 * I, H // 2, dtype=torch.uint8, device=DEV)
@@ -489,31 +481,29 @@ def test_router_topk_rows_and_scan_place(n):
     want = bf16(sg / (sg.sum(1, keepdim=True) + 1e-20)).float()
     assert torch.allclose(tw.cpu()[clear], want[clear], rtol=2.0 ** -7, atol=0)
     assert torch.equal(counts.cpu(), torch.bincount(got.view(-1), minlength=E).int())
-    # scan/place: same tile list as the single-block sort, same expert grouping, counts re-zeroed
+    # scan/place: tile list from the counts, expert-grouped permutation, counts re-zeroed
     max_tiles = n * 6 // 64 + E
-    out = {}
-    for name in ("sort", "place"):
-        st_ = torch.empty(n * 6, dtype=torch.int32, device=DEV)
-        iv_ = torch.empty(n * 6, dtype=torch.int32, device=DEV)
-        tl_ = torch.zeros(3 * max_tiles, dtype=torch.int32, device=DEV)
-        nt_ = torch.zeros(1, dtype=torch.int32, device=DEV)
-        if name == "sort":
-            fl.moe_sort(ids.data_ptr(), n, 64, st_.data_ptr(), iv_.data_ptr(), tl_.data_ptr(), nt_.data_ptr(), _stream())
-        else:
-            fl.moe_scan_place(ids.data_ptr(), n, 64, counts.data_ptr(), st_.data_ptr(), iv_.data_ptr(), tl_.data_ptr(),
-                              nt_.data_ptr(), _stream())
-        out[name] = (st_.cpu(), iv_.cpu(), tl_.cpu(), int(nt_.item()))
+    st_ = torch.empty(n * 6, dtype=torch.int32, device=DEV)
+    iv_ = torch.empty(n * 6, dtype=torch.int32, device=DEV)
+    tl_ = torch.zeros(3 * max_tiles, dtype=torch.int32, device=DEV)
+    nt_ = torch.zeros(1, dtype=torch.int32, device=DEV)
+    fl.moe_scan_place(ids.data_ptr(), n, 64, counts.data_ptr(), st_.data_ptr(), iv_.data_ptr(), tl_.data_ptr(),
+                      nt_.data_ptr(), _stream())
     assert int(counts.abs().sum().item()) == 0
-    assert out["sort"][3] == out["place"][3]
-    k = out["sort"][3]
-    assert torch.equal(out["sort"][2][:3 * k], out["place"][2][:3 * k])
-    idl = ids.view(-1).cpu()
-    st, iv = out["place"][0], out["place"][1]
+    cnt = torch.bincount(got.view(-1), minlength=E).tolist()
+    want, off = [], 0
+    for e in range(E):
+        for k in range(0, cnt[e], 64):
+            want += [e, off + k, min(64, cnt[e] - k)]
+        off += cnt[e]
+    assert int(nt_.item()) == len(want) // 3
+    assert tl_.cpu()[:len(want)].tolist() == want
+    idl, st, iv = ids.view(-1).cpu(), st_.cpu(), iv_.cpu()
     for i in range(n * 6):
         assert st[iv[i]].item() == i // 6
     assert torch.equal(torch.sort(iv).values, torch.arange(n * 6, dtype=torch.int32))
     e_of_slot = idl[torch.argsort(iv)]
-    assert torch.equal(e_of_slot, out["sort"][0].new_tensor(idl[torch.argsort(out["sort"][1])]))
+    assert torch.equal(e_of_slot, torch.sort(e_of_slot).values)
 
 
 def test_router_cluster_path_matches_wide_path():
@@ -555,28 +545,10 @@ def test_qk_rows_match_decode():
 
 
 @pytest.mark.parametrize("pos0,n,ring,window", [(0, 50, 0, 0), (300, 70, 0, 0), (0, 40, 1024, 513),
-                                                (900, 130, 1024, 513), (5000, 33, 1024, 513)])
-def test_prefill_attention(pos0, n, ring, window):
-    torch.manual_seed(pos0 + n)
-    slots = ring if ring else pos0 + n
-    cache = bf16(torch.randn(slots, 1024, device=DEV))
-    q = bf16(torch.randn(n, 32, 128, device=DEV))
-    sinks = torch.randn(32, device=DEV) * 3
-    pos = torch.tensor([pos0], dtype=torch.int32, device=DEV)
-    out = torch.empty(n, 32, 128, dtype=torch.bfloat16, device=DEV)
-    fl.prefill_attention_bf16(q.data_ptr(), n, cache.data_ptr(), pos.data_ptr(), ring, window, sinks.data_ptr(),
-                              1 / math.sqrt(128), out.data_ptr(), _stream())
-    for r in (0, n // 2, n - 1):
-        ref = attn_ref(q[r], cache, pos0 + r, ring, window, sinks.cpu())
-        err = ((out[r].double().cpu() - ref).abs().max() / ref.abs().max()).item()
-        assert err < 8e-3, (r, err)
-
-
-@pytest.mark.parametrize("pos0,n,ring,window", [(0, 50, 0, 0), (300, 70, 0, 0), (0, 40, 1024, 513),
                                                 (900, 130, 1024, 513), (5000, 33, 1024, 513), (2000, 200, 0, 0)])
 @pytest.mark.parametrize("variant", [0, 1, 2, 3, 4])
 @pytest.mark.parametrize("n_split", [1, 3])
-def test_prefill_attention2(pos0, n, ring, window, variant, n_split):
+def test_prefill_attention(pos0, n, ring, window, variant, n_split):
     torch.manual_seed(pos0 + n)
     slots = ring if ring else pos0 + n
     cache = bf16(torch.randn(slots, 1024, device=DEV))
@@ -589,7 +561,7 @@ def test_prefill_attention2(pos0, n, ring, window, variant, n_split):
     ml = torch.empty(units * n_split * 128 * 2, device=DEV)
     counters = torch.zeros(units, dtype=torch.int32, device=DEV)
     for _ in range(2):  # counters self-reset
-        fl.prefill_attention2_bf16(q.data_ptr(), n, cache.data_ptr(), pos.data_ptr(), ring, window, sinks.data_ptr(),
+        fl.prefill_attention_bf16(q.data_ptr(), n, cache.data_ptr(), pos.data_ptr(), ring, window, sinks.data_ptr(),
                                    1 / math.sqrt(128), out.data_ptr(), n_split, o_part.data_ptr(), ml.data_ptr(),
                                    counters.data_ptr(), variant, _stream())
     assert int(counters.abs().sum().item()) == 0
@@ -597,12 +569,12 @@ def test_prefill_attention2(pos0, n, ring, window, variant, n_split):
         ref = attn_ref(q[r], cache, pos0 + r, ring, window, sinks.cpu())
         err = ((out[r].double().cpu() - ref).abs().max() / ref.abs().max()).item()
         assert err < 8e-3, (r, err)
-    if n_split == 1:  # same accumulation order as v1 except for the tile size
-        v1 = torch.empty_like(out)
+    if variant in (1, 4):  # 32-key tiles with other pipelines: same accumulation order as variant 0
+        base = torch.empty_like(out)
         fl.prefill_attention_bf16(q.data_ptr(), n, cache.data_ptr(), pos.data_ptr(), ring, window, sinks.data_ptr(),
-                                  1 / math.sqrt(128), v1.data_ptr(), _stream())
-        if variant in (0, 1, 4):  # 32-key tiles: same accumulation order as v1
-            assert torch.equal(out, v1)
+                                  1 / math.sqrt(128), base.data_ptr(), n_split, o_part.data_ptr(), ml.data_ptr(),
+                                  counters.data_ptr(), 0, _stream())
+        assert torch.equal(out, base)
 
 
 def test_moe_combine_rows():
@@ -701,53 +673,3 @@ def test_decode_attention_fused_matches_unfused(pos, ring, window, rope, n_split
     close_bf16(out_b, out_a.double(), "fused attn", rel=2.0 ** -7)
     ref = attn_ref(q.view(32, 128), cache_a, pos, ring, window, sinks.cpu())
     assert ((out_b.double().cpu() - ref).abs().max() / ref.abs().max()).item() < 8e-3
-
-
-def test_router_shared_matches_separate():
-    torch.manual_seed(9)
-    E, H = 256, 2048
-    x = bf16(torch.randn(H, device=DEV)); res = bf16(torch.randn(H, device=DEV) * 4)
-    w = torch.rand(H, device=DEV) + 0.5
-    wr = bf16(torch.randn(E, H, device=DEV) * 0.02)
-    sh_c = torch.empty(2048, 1024, dtype=torch.uint8, device=DEV); sh_s = torch.empty(2048, 128, dtype=torch.uint8, device=DEV)
-    repack_dev(rand_blocks(1024, 2048, 70), 8, 16, 0, (sh_c, sh_s)); repack_dev(rand_blocks(1024, 2048, 71), 8, 16, 8, (sh_c, sh_s))
-    lg = torch.empty(E, device=DEV); ctr = torch.zeros(1, dtype=torch.int32, device=DEV)
-    outs = []
-    for fused in (False, True):
-        ids = torch.empty(6, dtype=torch.int32, device=DEV); tw = torch.empty(6, device=DEV)
-        res_o = torch.zeros_like(x); xn = torch.zeros_like(x); act = torch.zeros(4096, dtype=torch.bfloat16, device=DEV)
-        if fused:
-            fl.router_shared_bf16(x.data_ptr(), res.data_ptr(), w.data_ptr(), EPS, res_o.data_ptr(), xn.data_ptr(),
-                                  wr.data_ptr(), lg.data_ptr(), ctr.data_ptr(), ids.data_ptr(), tw.data_ptr(),
-                                  sh_c.data_ptr(), sh_s.data_ptr(), 7e-4, act.data_ptr(), _stream())
-        else:
-            fl.router_norm_bf16(x.data_ptr(), res.data_ptr(), w.data_ptr(), EPS, res_o.data_ptr(), xn.data_ptr(),
-                                wr.data_ptr(), lg.data_ptr(), ctr.data_ptr(), ids.data_ptr(), tw.data_ptr(), _stream())
-            dummy = torch.zeros(256 * 1024, 1024, dtype=torch.uint8, device=DEV)
-            # shared part only: routed blocks read expert 0.. of a zero matrix, shared blocks are what we compare
-            fl.moe_gate_up2_bf16(xn.data_ptr(), ids.data_ptr(), dummy.data_ptr(), dummy[:, :128].contiguous().data_ptr(),
-                                 torch.zeros(256, device=DEV).data_ptr(), sh_c.data_ptr(), sh_s.data_ptr(), 7e-4,
-                                 act.data_ptr(), _stream())
-        outs.append((ids.clone(), tw.clone(), res_o.clone(), xn.clone(), act[3072:].clone()))
-        assert ctr.item() == 0
-    for a, b in zip(outs[0], outs[1]):
-        assert torch.equal(a, b)
-
-
-@pytest.mark.parametrize("warps,rows", [(4, 1), (4, 2), (8, 2)])
-def test_down_combine3_matches_v2(warps, rows):
-    torch.manual_seed(11)
-    E, H = 256, 2048
-    d_c, d_s = repack_dev(rand_blocks(E * H, 512, 80))
-    sh_c, sh_s = repack_dev(rand_blocks(H, 1024, 81))
-    egs = torch.rand(E, device=DEV) * 1e-3 + 1e-4
-    act = bf16(torch.randn(4096, device=DEV))
-    ids = torch.tensor([17, 200, 3, 255, 128, 64], dtype=torch.int32, device=DEV)
-    tw = bf16(torch.rand(6, device=DEV) / 3).float()
-    a = torch.empty(H, dtype=torch.bfloat16, device=DEV); b = torch.empty_like(a)
-    fl.moe_down_combine2_bf16(act.data_ptr(), ids.data_ptr(), tw.data_ptr(), d_c.data_ptr(), d_s.data_ptr(), egs.data_ptr(),
-                              sh_c.data_ptr(), sh_s.data_ptr(), 9e-4, a.data_ptr(), _stream())
-    fl.moe_down_combine3_bf16(act.data_ptr(), ids.data_ptr(), tw.data_ptr(), d_c.data_ptr(), d_s.data_ptr(), egs.data_ptr(),
-                              sh_c.data_ptr(), sh_s.data_ptr(), 9e-4, b.data_ptr(), warps, rows, _stream())
-    assert _frac_equal(a, b) > 0.99
-    close_bf16(b, a.double(), "down3", rel=2.0 ** -7)

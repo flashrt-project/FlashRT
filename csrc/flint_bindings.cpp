@@ -137,22 +137,14 @@ PYBIND11_MODULE(flash_rt_flint, m) {
 
   m.def("prefill_attention_bf16",
         [](uintptr_t q, int n, uintptr_t cache, uintptr_t pos, int ring, int window, uintptr_t sinks, float scale,
-           uintptr_t out, uintptr_t stream) {
-          if (ring & (ring - 1)) throw std::invalid_argument("prefill_attention_bf16: ring must be a power of two");
-          fl::prefill_attention_bf16(ptr<const void>(q), n, ptr<const void>(cache), ptr<const int>(pos), ring, window,
-                                     ptr<const float>(sinks), scale, ptr<void>(out), to_stream(stream));
-        });
-
-  m.def("prefill_attention2_bf16",
-        [](uintptr_t q, int n, uintptr_t cache, uintptr_t pos, int ring, int window, uintptr_t sinks, float scale,
            uintptr_t out, int n_split, uintptr_t o_part, uintptr_t ml_part, uintptr_t counters, int variant,
            uintptr_t stream) {
-          if (ring & (ring - 1)) throw std::invalid_argument("prefill_attention2_bf16: ring must be a power of two");
-          if (fl::prefill_attention2_bf16(ptr<const void>(q), n, ptr<const void>(cache), ptr<const int>(pos), ring,
+          if (ring & (ring - 1)) throw std::invalid_argument("prefill_attention_bf16: ring must be a power of two");
+          if (fl::prefill_attention_bf16(ptr<const void>(q), n, ptr<const void>(cache), ptr<const int>(pos), ring,
                                           window, ptr<const float>(sinks), scale, ptr<void>(out), n_split,
                                           ptr<float>(o_part), ptr<float>(ml_part), ptr<unsigned>(counters), variant,
                                           to_stream(stream)) != 0)
-            throw std::invalid_argument("prefill_attention2_bf16: bad variant/split arguments");
+            throw std::invalid_argument("prefill_attention_bf16: bad variant/split arguments");
         });
 
   m.def("gemm_w4a16",
@@ -189,17 +181,6 @@ PYBIND11_MODULE(flash_rt_flint, m) {
   m.def("set_gemm_override", [](int bm, int stages, int split, int kb, int gbm, int gstages, int gsplit, int gkb) {
     fl::set_gemm_override(fl::GemmConfig{bm, stages, split, kb}, fl::GemmConfig{gbm, gstages, gsplit, gkb});
   });
-
-  m.def("router_rows_bf16", [](uintptr_t xn, int n, uintptr_t wt, uintptr_t ids, uintptr_t tw, uintptr_t stream) {
-    fl::router_rows_bf16(ptr<const void>(xn), n, ptr<const void>(wt), ptr<int>(ids), ptr<float>(tw), to_stream(stream));
-  });
-
-  m.def("moe_sort",
-        [](uintptr_t ids, int n, int tile_rows, uintptr_t sorted_tok, uintptr_t inv, uintptr_t tiles, uintptr_t n_tiles,
-           uintptr_t stream) {
-          fl::moe_sort(ptr<const int>(ids), n, tile_rows, ptr<int>(sorted_tok), ptr<int>(inv), ptr<int>(tiles),
-                       ptr<int>(n_tiles), to_stream(stream));
-        });
 
   m.def("router_topk_rows_bf16",
         [](uintptr_t xn, int n, uintptr_t wr, uintptr_t ids, uintptr_t tw, uintptr_t counts, uintptr_t stream) {
@@ -239,26 +220,18 @@ PYBIND11_MODULE(flash_rt_flint, m) {
         });
   m.def("router_norm_bf16",
         [](uintptr_t x, uintptr_t res_in, uintptr_t nw, float eps, uintptr_t res_out, uintptr_t xn_out, uintptr_t wr,
-           uintptr_t logits, uintptr_t counter, uintptr_t ids, uintptr_t tw, uintptr_t stream, uintptr_t shd_c,
-           uintptr_t shd_s) {
+           uintptr_t logits, uintptr_t counter, uintptr_t ids, uintptr_t tw, uintptr_t stream) {
           fl::router_norm_bf16(ptr<const void>(x), ptr<const void>(res_in), ptr<const float>(nw), eps, ptr<void>(res_out),
                                ptr<void>(xn_out), ptr<const void>(wr), ptr<float>(logits), ptr<unsigned>(counter),
-                               ptr<int>(ids), ptr<float>(tw), to_stream(stream), ptr<const void>(shd_c),
-                               ptr<const void>(shd_s));
-        },
-        py::arg("x"), py::arg("res_in"), py::arg("nw"), py::arg("eps"), py::arg("res_out"), py::arg("xn_out"),
-        py::arg("wr"), py::arg("logits"), py::arg("counter"), py::arg("ids"), py::arg("tw"), py::arg("stream"),
-        py::arg("sh_down_codes") = 0, py::arg("sh_down_scales") = 0);
+                               ptr<int>(ids), ptr<float>(tw), to_stream(stream));
+        });
   m.def("moe_gate_up2_bf16",
         [](uintptr_t xn, uintptr_t ids, uintptr_t ecodes, uintptr_t escales, uintptr_t egs, uintptr_t scodes,
-           uintptr_t sscales, float sgs, uintptr_t act, uintptr_t stream, uintptr_t down_c, uintptr_t down_s) {
+           uintptr_t sscales, float sgs, uintptr_t act, uintptr_t stream) {
           fl::moe_gate_up2_bf16(ptr<const void>(xn), ptr<const int>(ids), ptr<const void>(ecodes), ptr<const void>(escales),
                                 ptr<const float>(egs), ptr<const void>(scodes), ptr<const void>(sscales), sgs,
-                                ptr<void>(act), to_stream(stream), ptr<const void>(down_c), ptr<const void>(down_s));
-        },
-        py::arg("xn"), py::arg("ids"), py::arg("ecodes"), py::arg("escales"), py::arg("egs"), py::arg("scodes"),
-        py::arg("sscales"), py::arg("sgs"), py::arg("act"), py::arg("stream"), py::arg("down_codes") = 0,
-        py::arg("down_scales") = 0);
+                                ptr<void>(act), to_stream(stream));
+        });
   m.def("moe_down_combine2_bf16",
         [](uintptr_t act, uintptr_t ids, uintptr_t tw, uintptr_t ecodes, uintptr_t escales, uintptr_t egs,
            uintptr_t scodes, uintptr_t sscales, float sgs, uintptr_t out, uintptr_t stream) {
@@ -297,25 +270,6 @@ PYBIND11_MODULE(flash_rt_flint, m) {
     const auto c = fl::get_moe_launch_config();
     return py::make_tuple(c.router_warps, c.router_rows, c.gu_warps, c.gu_rows, c.dn_warps, c.dn_rows);
   });
-
-  m.def("router_shared_bf16",
-        [](uintptr_t x, uintptr_t res_in, uintptr_t nw, float eps, uintptr_t res_out, uintptr_t xn_out, uintptr_t wr,
-           uintptr_t logits, uintptr_t counter, uintptr_t ids, uintptr_t tw, uintptr_t scodes, uintptr_t sscales,
-           float sgs, uintptr_t act, uintptr_t stream) {
-          fl::router_shared_bf16(ptr<const void>(x), ptr<const void>(res_in), ptr<const float>(nw), eps,
-                                 ptr<void>(res_out), ptr<void>(xn_out), ptr<const void>(wr), ptr<float>(logits),
-                                 ptr<unsigned>(counter), ptr<int>(ids), ptr<float>(tw), ptr<const void>(scodes),
-                                 ptr<const void>(sscales), sgs, ptr<void>(act), to_stream(stream));
-        });
-
-  m.def("moe_down_combine3_bf16",
-        [](uintptr_t act, uintptr_t ids, uintptr_t tw, uintptr_t ecodes, uintptr_t escales, uintptr_t egs,
-           uintptr_t scodes, uintptr_t sscales, float sgs, uintptr_t out, int warps, int rows, uintptr_t stream) {
-          fl::moe_down_combine3_bf16(ptr<const void>(act), ptr<const int>(ids), ptr<const float>(tw),
-                                     ptr<const void>(ecodes), ptr<const void>(escales), ptr<const float>(egs),
-                                     ptr<const void>(scodes), ptr<const void>(sscales), sgs, ptr<void>(out), warps, rows,
-                                     to_stream(stream));
-        });
 
   m.def("set_gemv_launch_config", [](int qr, int qw, int orr, int ow) {
     fl::set_gemv_launch_config(fl::GemvLaunchConfig{qr, qw, orr, ow});
