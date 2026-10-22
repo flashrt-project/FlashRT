@@ -158,6 +158,11 @@ __device__ __forceinline__ float silu_mul_routed(float g, float u) {
 namespace flash_rt {
 namespace flint {
 
+// Bulk prefetch of a contiguous global range into L2 (size multiple of 16 bytes).
+__device__ __forceinline__ void prefetch_l2_bulk(const void* p, uint32_t bytes) {
+  asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(p), "r"(bytes) : "memory");
+}
+
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 __device__ __forceinline__ void pdl_launch() { asm volatile("griddepcontrol.launch_dependents;" :::); }
 

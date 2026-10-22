@@ -198,18 +198,26 @@ PYBIND11_MODULE(flash_rt_flint, m) {
         });
   m.def("router_norm_bf16",
         [](uintptr_t x, uintptr_t res_in, uintptr_t nw, float eps, uintptr_t res_out, uintptr_t xn_out, uintptr_t wr,
-           uintptr_t logits, uintptr_t counter, uintptr_t ids, uintptr_t tw, uintptr_t stream) {
+           uintptr_t logits, uintptr_t counter, uintptr_t ids, uintptr_t tw, uintptr_t stream, uintptr_t shd_c,
+           uintptr_t shd_s) {
           fl::router_norm_bf16(ptr<const void>(x), ptr<const void>(res_in), ptr<const float>(nw), eps, ptr<void>(res_out),
                                ptr<void>(xn_out), ptr<const void>(wr), ptr<float>(logits), ptr<unsigned>(counter),
-                               ptr<int>(ids), ptr<float>(tw), to_stream(stream));
-        });
+                               ptr<int>(ids), ptr<float>(tw), to_stream(stream), ptr<const void>(shd_c),
+                               ptr<const void>(shd_s));
+        },
+        py::arg("x"), py::arg("res_in"), py::arg("nw"), py::arg("eps"), py::arg("res_out"), py::arg("xn_out"),
+        py::arg("wr"), py::arg("logits"), py::arg("counter"), py::arg("ids"), py::arg("tw"), py::arg("stream"),
+        py::arg("sh_down_codes") = 0, py::arg("sh_down_scales") = 0);
   m.def("moe_gate_up2_bf16",
         [](uintptr_t xn, uintptr_t ids, uintptr_t ecodes, uintptr_t escales, uintptr_t egs, uintptr_t scodes,
-           uintptr_t sscales, float sgs, uintptr_t act, uintptr_t stream) {
+           uintptr_t sscales, float sgs, uintptr_t act, uintptr_t stream, uintptr_t down_c, uintptr_t down_s) {
           fl::moe_gate_up2_bf16(ptr<const void>(xn), ptr<const int>(ids), ptr<const void>(ecodes), ptr<const void>(escales),
                                 ptr<const float>(egs), ptr<const void>(scodes), ptr<const void>(sscales), sgs,
-                                ptr<void>(act), to_stream(stream));
-        });
+                                ptr<void>(act), to_stream(stream), ptr<const void>(down_c), ptr<const void>(down_s));
+        },
+        py::arg("xn"), py::arg("ids"), py::arg("ecodes"), py::arg("escales"), py::arg("egs"), py::arg("scodes"),
+        py::arg("sscales"), py::arg("sgs"), py::arg("act"), py::arg("stream"), py::arg("down_codes") = 0,
+        py::arg("down_scales") = 0);
   m.def("moe_down_combine2_bf16",
         [](uintptr_t act, uintptr_t ids, uintptr_t tw, uintptr_t ecodes, uintptr_t escales, uintptr_t egs,
            uintptr_t scodes, uintptr_t sscales, float sgs, uintptr_t out, uintptr_t stream) {
@@ -238,4 +246,22 @@ PYBIND11_MODULE(flash_rt_flint, m) {
         py::arg("ring"), py::arg("window"), py::arg("rope"), py::arg("eps"), py::arg("sinks"), py::arg("scale"),
         py::arg("n_split"), py::arg("o_part"), py::arg("ml_part"), py::arg("counters"), py::arg("out"), py::arg("stream"),
         py::arg("warps") = 4);
+
+  m.def("set_moe_launch_config", [](int rw, int rr, int gw, int gr, int dw, int dr) {
+    fl::set_moe_launch_config(fl::MoeLaunchConfig{rw, rr, gw, gr, dw, dr});
+  });
+  m.def("get_moe_launch_config", []() {
+    const auto c = fl::get_moe_launch_config();
+    return py::make_tuple(c.router_warps, c.router_rows, c.gu_warps, c.gu_rows, c.dn_warps, c.dn_rows);
+  });
+
+  m.def("router_shared_bf16",
+        [](uintptr_t x, uintptr_t res_in, uintptr_t nw, float eps, uintptr_t res_out, uintptr_t xn_out, uintptr_t wr,
+           uintptr_t logits, uintptr_t counter, uintptr_t ids, uintptr_t tw, uintptr_t scodes, uintptr_t sscales,
+           float sgs, uintptr_t act, uintptr_t stream) {
+          fl::router_shared_bf16(ptr<const void>(x), ptr<const void>(res_in), ptr<const float>(nw), eps,
+                                 ptr<void>(res_out), ptr<void>(xn_out), ptr<const void>(wr), ptr<float>(logits),
+                                 ptr<unsigned>(counter), ptr<int>(ids), ptr<float>(tw), ptr<const void>(scodes),
+                                 ptr<const void>(sscales), sgs, ptr<void>(act), to_stream(stream));
+        });
 }

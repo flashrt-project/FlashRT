@@ -548,3 +548,34 @@ def test_decode_attention_fused_matches_unfused(pos, ring, window, rope, n_split
     close_bf16(out_b, out_a.double(), "fused attn", rel=2.0 ** -7)
     ref = attn_ref(q.view(32, 128), cache_a, pos, ring, window, sinks.cpu())
     assert ((out_b.double().cpu() - ref).abs().max() / ref.abs().max()).item() < 8e-3
+
+
+def test_router_shared_matches_separate():
+    torch.manual_seed(9)
+    E, H = 256, 2048
+    x = bf16(torch.randn(H, device=DEV)); res = bf16(torch.randn(H, device=DEV) * 4)
+    w = torch.rand(H, device=DEV) + 0.5
+    wr = bf16(torch.randn(E, H, device=DEV) * 0.02)
+    sh_c = torch.empty(2048, 1024, dtype=torch.uint8, device=DEV); sh_s = torch.empty(2048, 128, dtype=torch.uint8, device=DEV)
+    repack_dev(rand_blocks(1024, 2048, 70), 8, 16, 0, (sh_c, sh_s)); repack_dev(rand_blocks(1024, 2048, 71), 8, 16, 8, (sh_c, sh_s))
+    lg = torch.empty(E, device=DEV); ctr = torch.zeros(1, dtype=torch.int32, device=DEV)
+    outs = []
+    for fused in (False, True):
+        ids = torch.empty(6, dtype=torch.int32, device=DEV); tw = torch.empty(6, device=DEV)
+        res_o = torch.zeros_like(x); xn = torch.zeros_like(x); act = torch.zeros(4096, dtype=torch.bfloat16, device=DEV)
+        if fused:
+            fl.router_shared_bf16(x.data_ptr(), res.data_ptr(), w.data_ptr(), EPS, res_o.data_ptr(), xn.data_ptr(),
+                                  wr.data_ptr(), lg.data_ptr(), ctr.data_ptr(), ids.data_ptr(), tw.data_ptr(),
+                                  sh_c.data_ptr(), sh_s.data_ptr(), 7e-4, act.data_ptr(), _stream())
+        else:
+            fl.router_norm_bf16(x.data_ptr(), res.data_ptr(), w.data_ptr(), EPS, res_o.data_ptr(), xn.data_ptr(),
+                                wr.data_ptr(), lg.data_ptr(), ctr.data_ptr(), ids.data_ptr(), tw.data_ptr(), _stream())
+            dummy = torch.zeros(256 * 1024, 1024, dtype=torch.uint8, device=DEV)
+            # shared part only: routed blocks read expert 0.. of a zero matrix, shared blocks are what we compare
+            fl.moe_gate_up2_bf16(xn.data_ptr(), ids.data_ptr(), dummy.data_ptr(), dummy[:, :128].contiguous().data_ptr(),
+                                 torch.zeros(256, device=DEV).data_ptr(), sh_c.data_ptr(), sh_s.data_ptr(), 7e-4,
+                                 act.data_ptr(), _stream())
+        outs.append((ids.clone(), tw.clone(), res_o.clone(), xn.clone(), act[3072:].clone()))
+        assert ctr.item() == 0
+    for a, b in zip(outs[0], outs[1]):
+        assert torch.equal(a, b)

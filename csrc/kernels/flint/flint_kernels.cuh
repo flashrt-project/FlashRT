@@ -69,6 +69,14 @@ void moe_combine_rows_bf16(const void* y, const int* inv, const float* tw, const
                            cudaStream_t s);
 void advance_pos(int* pos, int n, cudaStream_t s);
 
+// Launch shapes of the MoE decode kernels: warps per block and rows per warp for the
+// router, the gate/up kernel (act rows) and the down/combine kernel (output rows).
+struct MoeLaunchConfig {
+  int router_warps, router_rows, gu_warps, gu_rows, dn_warps, dn_rows;
+};
+void set_moe_launch_config(const MoeLaunchConfig& c);
+MoeLaunchConfig get_moe_launch_config();
+
 // Fused decode step (PDL). Residual stream ping-pongs: a norm site reads res_in and block 0 writes res_out.
 // gemv2: norm_w != nullptr fuses residual add + RMSNorm of x (K == 2048) into the GEMV prologue.
 int gemv2_w4a16(const void* codes, const void* scales, const void* x, const void* res_in, void* res_out,
@@ -76,10 +84,18 @@ int gemv2_w4a16(const void* codes, const void* scales, const void* x, const void
                 cudaStream_t s);
 void add_rmsnorm2_bf16(const void* x, const void* res_in, const float* w, float eps, void* res_out, void* out,
                        cudaStream_t s);
+// Optional L2 warm-ups (nullptr disables): router -> shared-down weights, gate/up -> selected experts' down weights.
 void router_norm_bf16(const void* x, const void* res_in, const float* nw, float eps, void* res_out, void* xn_out,
-                      const void* wr, float* logits, unsigned* counter, int* ids, float* tw, cudaStream_t s);
+                      const void* wr, float* logits, unsigned* counter, int* ids, float* tw, cudaStream_t s,
+                      const void* sh_down_codes = nullptr, const void* sh_down_scales = nullptr);
+// Router + shared-expert gate/up in one launch; pair with moe_gate_up2_bf16(..., scodes = nullptr) (routed only).
+void router_shared_bf16(const void* x, const void* res_in, const float* nw, float eps, void* res_out, void* xn_out,
+                        const void* wr, float* logits, unsigned* counter, int* ids, float* tw, const void* scodes,
+                        const void* sscales, float sgs, void* act, cudaStream_t s);
+// scodes == nullptr: routed experts only (shared expert computed by router_shared_bf16).
 void moe_gate_up2_bf16(const void* xn, const int* ids, const void* ecodes, const void* escales, const float* egs,
-                       const void* scodes, const void* sscales, float sgs, void* act, cudaStream_t s);
+                       const void* scodes, const void* sscales, float sgs, void* act, cudaStream_t s,
+                       const void* down_codes = nullptr, const void* down_scales = nullptr);
 void moe_down_combine2_bf16(const void* act, const int* ids, const float* tw, const void* ecodes, const void* escales,
                             const float* egs, const void* scodes, const void* sscales, float sgs, void* out,
                             cudaStream_t s);

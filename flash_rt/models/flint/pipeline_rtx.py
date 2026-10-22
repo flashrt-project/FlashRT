@@ -279,6 +279,9 @@ class FlintRuntime:
         # sliding layers (513 keys): 8 splits x 8 warps; global layers by position bucket.
         self.swa_attn = (8, 8)
         self.full_attn_warps = 8
+        import os as _os
+        self.l2_warm = _os.environ.get("FLINT_L2WARM", "0") == "1"   # bulk L2 warm-up of MoE down weights: measured negative, off
+        self.router_shared = _os.environ.get("FLINT_ROUTER_SHARED", "0") == "1"   # router+shared fusion: measured +4%, off
         self.attn_buckets = ((512, 1, 4), (12288, 8, 8), (1 << 30, 16, 8))   # (pos upper bound, splits, warps)
         # Prefill (chunk of up to prefill_chunk tokens).
         C, T = self.prefill_chunk, cfg.num_experts_per_tok
@@ -499,14 +502,26 @@ class FlintRuntime:
                 fl.gemv2_w4a16(d.codes.data_ptr(), d.scales.data_ptr(), self.act.data_ptr(), 0, 0, 0, 0, eps,
                                self.x.data_ptr(), d.rows, d.k, d.gs, 0, s)
             else:
-                fl.router_norm_bf16(self.x_attn.data_ptr(), res[site & 1], L.ffn_norm.data_ptr(), eps,
-                                    res[(site + 1) & 1], self.xn.data_ptr(), L.router.data_ptr(),
-                                    self.router_logits.data_ptr(), self.router_counter.data_ptr(), self.ids.data_ptr(),
-                                    self.tw.data_ptr(), s)
+                l2 = self.l2_warm
+                if self.router_shared:
+                    fl.router_shared_bf16(self.x_attn.data_ptr(), res[site & 1], L.ffn_norm.data_ptr(), eps,
+                                          res[(site + 1) & 1], self.xn.data_ptr(), L.router.data_ptr(),
+                                          self.router_logits.data_ptr(), self.router_counter.data_ptr(),
+                                          self.ids.data_ptr(), self.tw.data_ptr(), L.sh_gate_up.codes.data_ptr(),
+                                          L.sh_gate_up.scales.data_ptr(), L.sh_gate_up.gs, self.act.data_ptr(), s)
+                else:
+                    fl.router_norm_bf16(self.x_attn.data_ptr(), res[site & 1], L.ffn_norm.data_ptr(), eps,
+                                        res[(site + 1) & 1], self.xn.data_ptr(), L.router.data_ptr(),
+                                        self.router_logits.data_ptr(), self.router_counter.data_ptr(),
+                                        self.ids.data_ptr(), self.tw.data_ptr(), s,
+                                        L.sh_down.codes.data_ptr() if l2 else 0, L.sh_down.scales.data_ptr() if l2 else 0)
+                sh = not self.router_shared
                 fl.moe_gate_up2_bf16(self.xn.data_ptr(), self.ids.data_ptr(), L.exp_gate_up.codes.data_ptr(),
                                      L.exp_gate_up.scales.data_ptr(), L.exp_gate_up.gs_dev.data_ptr(),
-                                     L.sh_gate_up.codes.data_ptr(), L.sh_gate_up.scales.data_ptr(), L.sh_gate_up.gs,
-                                     self.act.data_ptr(), s)
+                                     L.sh_gate_up.codes.data_ptr() if sh else 0,
+                                     L.sh_gate_up.scales.data_ptr() if sh else 0, L.sh_gate_up.gs,
+                                     self.act.data_ptr(), s, L.exp_down.codes.data_ptr() if l2 else 0,
+                                     L.exp_down.scales.data_ptr() if l2 else 0)
                 fl.moe_down_combine2_bf16(self.act.data_ptr(), self.ids.data_ptr(), self.tw.data_ptr(),
                                           L.exp_down.codes.data_ptr(), L.exp_down.scales.data_ptr(),
                                           L.exp_down.gs_dev.data_ptr(), L.sh_down.codes.data_ptr(),
