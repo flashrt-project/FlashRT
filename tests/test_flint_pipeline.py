@@ -12,7 +12,9 @@ because the launch switches are read once per process.
 * chunked prefill + decode must agree with stepping the prompt through the
   decode graph;
 * a follow-up request that reuses the cached prefix must continue like a full
-  prefill of the same tokens.
+  prefill of the same tokens;
+* prefill chunks replayed from CUDA graphs (rows padded to the graph shape) must
+  give the same tokens as eager launches of the exact chunk.
 """
 from __future__ import annotations
 
@@ -87,3 +89,8 @@ def test_prefix_reuse_matches_full_prefill():
     full = _generate({}, "follow_full")
     assert reuse[-1] >= 64          # the cached prompt + first reply were reused
     assert reuse[:16] == full[:16]
+
+
+def test_prefill_graphs_match_eager_launches():
+    for mode in ("prefill", "reuse"):
+        assert _generate({"FLINT_PF_GRAPH": "1"}, mode) == _generate({"FLINT_PF_GRAPH": "0"}, mode)

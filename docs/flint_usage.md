@@ -3,8 +3,9 @@
 FlashRT runs the official NVFP4 GGUF of Flint (`RecursiveSI/flint-nvfp4-gguf`)
 natively on SM120: an independent GGUF reader and a lossless NVFP4 repack feed
 FlashRT's own W4A16 kernels, the decode step is one captured CUDA graph, and
-prefill is a chunked native pipeline. Python only builds buffers, captures the
-graphs and issues launches; no tensor work runs through PyTorch on the hot path.
+prefill runs in chunks whose launch sequences are captured as CUDA graphs too.
+Python only builds buffers, captures the graphs and replays them; no tensor work
+runs through PyTorch on the hot path.
 The GGUF is a weight container here -- nothing from llama.cpp is linked or
 called at run time.
 
@@ -115,6 +116,8 @@ tuning hooks for other SM120 parts; none changes the arithmetic.
 
 - `FLINT_DECODE=basic` -- unfused reference decode step (default `fused`).
 - `FLINT_EAGER=1` -- launch decode steps without the CUDA graph.
+- `FLINT_PF_GRAPH=0` -- launch prefill chunks eagerly instead of replaying
+  their CUDA graphs.
 - `FLINT_PDL=0` -- no programmatic dependent launch between decode kernels.
 - `FLINT_ATTN_CLUSTER=0` -- merge decode-attention splits through global
   memory instead of a thread-block cluster.
@@ -142,7 +145,8 @@ repacked weights (and configurations of one kernel against each other where they
 are bit-identical by construction). The checkpoint tests check that programmatic
 dependent launch does not change tokens, that the fused and unfused decode steps
 agree, that chunked prefill agrees with stepping the prompt through the decode
-graph, and that prefix reuse continues exactly like a full prefill.
+graph, that prefix reuse continues exactly like a full prefill, and that prefill
+chunks replayed from CUDA graphs match eager launches token for token.
 
 ### Accuracy
 
@@ -152,7 +156,7 @@ FP32 activations, attention and KV, TF32 off):
 
 | executor | KL to FP32 | top-1 | PPL (FP32 1.2070) |
 |---|---:|---:|---:|
-| FlashRT decode path | 0.00218 | 98.5% | 1.2086 |
+| FlashRT decode path | 0.00192 | 98.6% | 1.2072 |
 | FlashRT prefill path | 0.00201 | 98.9% | 1.2085 |
 | llama.cpp (official executor), decode | 0.00253 | | |
 | llama.cpp (official executor), prefill | 0.00234 | 98.4% | 1.2073 |
@@ -171,8 +175,8 @@ small rounding differences move individual distributions a lot (two FlashRT
 prefill configurations differ by as much as from FP32), so the mean KL is a
 sensitivity band; the median and NLL are the stable figures.
 
-HumanEval (greedy, 8192-token budget): FlashRT 157/164, llama.cpp 155/164; exact
-McNemar p = 0.75.
+HumanEval (greedy, 8192-token budget): FlashRT 158/164, llama.cpp 155/164; exact
+McNemar p = 0.375.
 
 ## RTX 5090 numbers
 
@@ -204,8 +208,9 @@ is the interleaved median. Where the time goes:
 - decode at short context is the per-layer dependency chain (QKV, attention,
   o_proj, router, gate/up, down) with each kernel's weight loads issued before
   its programmatic-dependent-launch wait (a dependent-launch boundary costs about
-  0.8 us on this card, less than an in-kernel grid barrier, so a persistent
-  kernel would not help); at 100 K the 14 full-attention layers take more than
+  0.8 us on this card against 1.3 us for an all-to-all grid barrier inside a
+  persistent kernel, so merging the stages behind such barriers would not
+  help); at 100 K the 14 full-attention layers take more than
   half of the step (131 us per layer, ~93% of the measured streaming peak);
 - prefill GEMMs run at 190-215 TFLOPS on large chunks (the bf16 `mma.sync`
   peak measured on this card is 259 TFLOPS); attention at ~190 TFLOPS, which is
@@ -250,6 +255,7 @@ Other shapes, same setup:
 - Text only; batch size 1; greedy decoding only (no sampling, no beams).
 - SM120 only; the kernels assume the Flint geometry and the checks above refuse
   anything else.
-- Prefill is issued eagerly (one launch sequence per chunk); only the decode
-  step is CUDA-graph captured.
+- A prefill chunk graph is captured the first time its shape (rows rounded up
+  to 16, attention split counts) occurs, about 1 ms once; up to 64 shapes are
+  kept.
 - One cached sequence for prefix reuse.

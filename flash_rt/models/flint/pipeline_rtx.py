@@ -4,7 +4,8 @@ Python here only prepares buffers and launches kernels that take raw device
 pointers; the steady-state decode step is a fixed kernel sequence that reads
 the position and the token from device memory, so it is captured once into a
 CUDA graph and replayed for every step (prompt tokens and generated tokens
-alike). PyTorch is used as the allocator and for graph capture only.
+alike). Prefill chunks are captured per launch shape on first use and replayed
+as well. PyTorch is used as the allocator and for graph capture only.
 
 Numerics follow the official W4A16 contract: exact NVFP4 dequantization, BF16
 activations and residual stream, fp32 accumulation, BF16 KV cache, fp32 logits.
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import math
 import warnings
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -351,6 +353,11 @@ class FlintRuntime:
         self.pf_opart = torch.empty(self.pf_split_units * 128 * 128, dtype=f32, device=self.dev)
         self.pf_ml = torch.empty(self.pf_split_units * 128 * 2, dtype=f32, device=self.dev)
         self.pf_attn_ctr = torch.zeros(units, dtype=i32, device=self.dev)
+        # Prefill chunks replay CUDA graphs captured on first use per launch shape (LRU-bounded).
+        self.pf_graph_on = _os.environ.get("FLINT_PF_GRAPH", "1") != "0"
+        self.pf_graph_max = 64
+        self.pf_graphs: "OrderedDict[tuple, object]" = OrderedDict()
+        self._pf_pool = None
 
     # ------------------------------------------------------------------ decode step
     def _gemv(self, m: _Mat, x, out, epilogue, s):
@@ -482,6 +489,43 @@ class FlintRuntime:
                                          self.pf_sh.data_ptr(), self.pf_x.data_ptr(), m, s)
         fl.advance_pos(self.pos.data_ptr(), m, s)
 
+    def _pf_rows(self, m: int, pos0: int) -> int:
+        """Rows launched for an m-token chunk: m rounded up to 16 so that graphs are shared across nearby
+        lengths. Padded rows only write KV past the chunk, which decode overwrites before any query reads it
+        (attention reads positions <= the query's own), and each valid row's result is independent of them."""
+        b = -(-m // 16) * 16
+        return b if b <= self.pf_capacity and pos0 + b <= self.max_seq else m
+
+    def _pf_graph(self, b: int, pos0: int):
+        """CUDA graph of ``launch_prefill_chunk(b)``. Positions come from device memory, so the only host
+        inputs are b and the attention split counts (a function of pos0): one graph per such key."""
+        torch, cfg = self.torch, self.cfg
+        key = (b, self._pf_attn_splits(b, pos0, 0), self._pf_attn_splits(b, pos0, cfg.sliding_window))
+        g = self.pf_graphs.pop(key, None)
+        if g is None:
+            if self._pf_pool is None:
+                self._pf_pool = torch.cuda.graph_pool_handle()
+            if len(self.pf_graphs) >= self.pf_graph_max:
+                self.pf_graphs.popitem(last=False)
+            g = torch.cuda.CUDAGraph()
+            g.capture_begin(pool=self._pf_pool, capture_error_mode="thread_local")
+            try:
+                self.launch_prefill_chunk(b, pos0)
+            finally:
+                g.capture_end()
+        self.pf_graphs[key] = g
+        return g
+
+    def run_prefill_chunk(self, m: int, pos0: int):
+        """Enqueue one chunk on the current stream (graph replay unless FLINT_PF_GRAPH=0); advances ``pos`` by m."""
+        if not self.pf_graph_on:
+            self.launch_prefill_chunk(m, pos0)
+            return
+        b = self._pf_rows(m, pos0)
+        self._pf_graph(b, pos0).replay()
+        if b != m:
+            self.fl.advance_pos(self.pos.data_ptr(), m - b, self.stream.cuda_stream)
+
     def launch_prefill_logits(self, m: int, logits_out=None):
         """Final norm + LM head for a finished chunk.
 
@@ -534,7 +578,7 @@ class FlintRuntime:
         with torch.cuda.stream(self.stream):
             c0 = start
             for m in self.chunk_plan(n - start):
-                self.launch_prefill_chunk(m, c0)
+                self.run_prefill_chunk(m, c0)
                 if logits_cb is not None:
                     if buf is None:
                         buf = torch.empty((self.pf_capacity, self.cfg.vocab_size), dtype=torch.float32,
