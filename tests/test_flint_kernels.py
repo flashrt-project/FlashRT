@@ -516,6 +516,23 @@ def test_router_topk_rows_and_scan_place(n):
     assert torch.equal(e_of_slot, out["sort"][0].new_tensor(idl[torch.argsort(out["sort"][1])]))
 
 
+def test_router_cluster_path_matches_wide_path():
+    torch.manual_seed(8)
+    E, H, n = 256, 2048, 12000  # 375 token blocks: wide path; the first 37 rows alone: cluster path
+    xn = bf16(torch.randn(n, H, device=DEV))
+    wr = bf16(torch.randn(E, H, device=DEV) * 0.02)
+    res = []
+    for rows in (n, 37):
+        ids = torch.empty(rows, 6, dtype=torch.int32, device=DEV)
+        tw = torch.empty(rows, 6, device=DEV)
+        counts = torch.zeros(E, dtype=torch.int32, device=DEV)
+        fl.router_topk_rows_bf16(xn.data_ptr(), rows, wr.data_ptr(), ids.data_ptr(), tw.data_ptr(), counts.data_ptr(),
+                                 _stream())
+        res.append((ids[:37].cpu(), tw[:37].cpu()))
+        assert int(counts.sum().item()) == rows * 6
+    assert torch.equal(res[0][0], res[1][0]) and torch.equal(res[0][1], res[1][1])
+
+
 def test_qk_rows_match_decode():
     n, ring = 5, 1024
     qkv = bf16(torch.randn(n, 5120, device=DEV) * 3)

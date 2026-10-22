@@ -90,13 +90,16 @@ class FlintRuntime:
         self.dev = torch.device("cuda", device)
         torch.cuda.set_device(self.dev)
         if prefill_chunk is None:
-            # Largest chunk <= 8192 whose attention units (16-token blocks x 4 KV heads) fill whole waves:
-            # chunk a multiple of lcm(16, 4 * SMs).
+            # Buffers hold up to 8192 tokens; full chunks are the largest multiple of lcm(16, 4 * SMs) within
+            # that, so a chunk's attention units (16-token blocks x 4 KV heads) fill whole waves.
             sms = torch.cuda.get_device_properties(self.dev).multi_processor_count
             q = math.lcm(16, 4 * sms)
+            self.pf_capacity = 8192
             prefill_chunk = 8192 // q * q if q <= 4096 else 8192
+        else:
+            self.pf_capacity = int(prefill_chunk)
         self.prefill_chunk = int(prefill_chunk)
-        if self.prefill_chunk + self.cfg.sliding_window > sliding_ring:
+        if self.pf_capacity + self.cfg.sliding_window > sliding_ring:
             raise ValueError("prefill_chunk + sliding_window must fit in sliding_ring")
         self.stream = torch.cuda.Stream(self.dev)
         self._anchors: List[object] = []
@@ -321,7 +324,7 @@ class FlintRuntime:
             L.pf_ranges = torch.tensor(rng, dtype=torch.int64, device=self.dev)
             L.pf_n = len(rng) // 2
         # Prefill (chunk of up to prefill_chunk tokens).
-        C, T = self.prefill_chunk, cfg.num_experts_per_tok
+        C, T = self.pf_capacity, cfg.num_experts_per_tok
         self.pf_x = torch.zeros((C, H), dtype=bf, device=self.dev)
         self.pf_res = torch.zeros((C, H), dtype=bf, device=self.dev)
         self.pf_xn = torch.zeros((C, H), dtype=bf, device=self.dev)
@@ -517,6 +520,16 @@ class FlintRuntime:
                                 self.pf_xn.data_ptr(), m, cfg.rms_norm_eps, 0, s, 0)
             self._gemm(self.pf_xn, m, H, self.lm_head, logits_out, cfg.vocab_size, fl.EPI_F32, s)
 
+    def chunk_plan(self, n: int) -> List[int]:
+        """Chunk sizes for an n-token prompt: one chunk if it fits the buffers, else wave-aligned full chunks
+        and the remainder (measured: a short last chunk costs less than splitting the tail evenly)."""
+        cap, full, out = self.pf_capacity, self.prefill_chunk, []
+        while n > cap:
+            out.append(full)
+            n -= full
+        out.append(n)
+        return out
+
     def prefill(self, prompt_tokens: List[int], logits_cb=None):
         """Run the prompt through the chunked prefill path and pick the first generated token.
 
@@ -525,18 +538,19 @@ class FlintRuntime:
         torch = self.torch
         self.reset(prompt_tokens)
         n = len(prompt_tokens)
-        C = self.prefill_chunk
         buf = None
         with torch.cuda.stream(self.stream):
-            for c0 in range(0, n, C):
-                m = min(C, n - c0)
+            c0 = 0
+            for m in self.chunk_plan(n):
                 self.launch_prefill_chunk(m, c0)
                 if logits_cb is not None:
                     if buf is None:
-                        buf = torch.empty((C, self.cfg.vocab_size), dtype=torch.float32, device=self.dev)
+                        buf = torch.empty((self.pf_capacity, self.cfg.vocab_size), dtype=torch.float32,
+                                          device=self.dev)
                     self.launch_prefill_logits(m, buf)
                     self.stream.synchronize()
                     logits_cb(c0, m, buf[:m])
+                c0 += m
             self.launch_prefill_logits(m)
         self.host_pos = n
         return n

@@ -322,6 +322,42 @@ struct RouterStage {
 constexpr size_t kRouterSmem = sizeof(RouterStage) * RT_STAGES;
 static_assert(kRouterSmem >= RT_M * RT_EXPERTS * sizeof(float), "logit tile must fit in the stage buffers");
 
+// Top-6 of one token's 256 bf16-rounded logits held 8 per lane (lane l: experts 8l..8l+7), the decode rule
+// (ties to the lower id, sigmoid, renormalize, bf16 weights); lane 0 stores and counts the selections.
+__device__ __forceinline__ void router_select_row(float (&v)[8], int lane, int row, int* __restrict__ ids,
+                                                  float* __restrict__ tw, int* __restrict__ counts) {
+  float sv[RT_TOPK];
+  int si[RT_TOPK];
+#pragma unroll
+  for (int k = 0; k < RT_TOPK; ++k) {
+    float bv = -FLT_MAX;
+    int bi = 0x7fffffff;
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+      if (v[j] > bv) { bv = v[j]; bi = lane * 8 + j; }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+      const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+      const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+      if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    }
+    sv[k] = bv; si[k] = bi;
+    if ((bi >> 3) == lane) v[bi & 7] = -FLT_MAX;
+  }
+  if (lane == 0) {
+    float sg[RT_TOPK], sum = 0.f;
+#pragma unroll
+    for (int k = 0; k < RT_TOPK; ++k) { sg[k] = __fdiv_rn(1.0f, 1.0f + expf(-sv[k])); sum += sg[k]; }
+    const float den = sum + 1e-20f;
+#pragma unroll
+    for (int k = 0; k < RT_TOPK; ++k) {
+      ids[row * RT_TOPK + k] = si[k];
+      tw[row * RT_TOPK + k] = round_bf16(__fdiv_rn(sg[k], den));
+      atomicAdd(counts + si[k], 1);
+    }
+  }
+}
+
 __global__ void __launch_bounds__(THREADS)
 router_mma_kernel(const uint16_t* __restrict__ xn, int n, const uint16_t* __restrict__ wr, int* __restrict__ ids,
                   float* __restrict__ tw, int* __restrict__ counts) {
@@ -401,38 +437,93 @@ router_mma_kernel(const uint16_t* __restrict__ xn, int n, const uint16_t* __rest
     float v[8];
 #pragma unroll
     for (int j = 0; j < 8; ++j) v[j] = lg[rr][lane * 8 + j];
-    float sv[RT_TOPK];
-    int si[RT_TOPK];
-#pragma unroll
-    for (int k = 0; k < RT_TOPK; ++k) {
-      float bv = -FLT_MAX;
-      int bi = 0x7fffffff;
-#pragma unroll
-      for (int j = 0; j < 8; ++j)
-        if (v[j] > bv) { bv = v[j]; bi = lane * 8 + j; }
-#pragma unroll
-      for (int o = 16; o > 0; o >>= 1) {
-        const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
-        const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
-        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
-      }
-      sv[k] = bv; si[k] = bi;
-      if ((bi >> 3) == lane) v[bi & 7] = -FLT_MAX;
+    router_select_row(v, lane, r0 + rr, ids, tw, counts);
+  }
+}
+
+// Small batches: a (4, 1, 1) cluster per 32 tokens; rank r computes experts [64r, 64r + 64) with the same
+// k order as router_mma_kernel (bit-identical logits) from a quarter of the router weights, the logit tiles
+// are exchanged through DSMEM and each rank selects for 8 of the 32 tokens.
+constexpr int RC = 4, RC_E = RT_EXPERTS / RC, RC_STAGES = 4;
+struct RouterStageC {
+  uint16_t a[RT_M * BK];
+  uint16_t b[RC_E * BK];
+};
+constexpr size_t kRouterSmemC = sizeof(RouterStageC) * RC_STAGES;
+
+__global__ void __cluster_dims__(RC, 1, 1) __launch_bounds__(THREADS)
+router_mma_cluster_kernel(const uint16_t* __restrict__ xn, int n, const uint16_t* __restrict__ wr,
+                          int* __restrict__ ids, float* __restrict__ tw, int* __restrict__ counts) {
+  extern __shared__ __align__(16) uint8_t smem_raw[];
+  __shared__ __align__(16) float lg[RT_M][RC_E];
+  cg::cluster_group cluster = cg::this_cluster();
+  RouterStageC* st = reinterpret_cast<RouterStageC*>(smem_raw);
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int g = lane >> 2, t = lane & 3;
+  const int rank = static_cast<int>(cluster.block_rank());
+  const int r0 = (blockIdx.x / RC) * RT_M, nr = min(RT_M, n - r0), e0 = rank * RC_E;
+  const int wm = warp >> 2, wn = warp & 3;  // 2 x 4 warps: 16 tokens x 16 experts each
+  constexpr int KT = RT_K / BK;
+
+  auto load_stage = [&](int stage, int kt) {
+    RouterStageC& sm = st[stage];
+    {
+      const int r = tid >> 3, ch = tid & 7;
+      const bool ok = r < nr;
+      cp_async16(smem_u32(sm.a + r * BK + ((ch ^ (r & 7)) << 3)),
+                 ok ? static_cast<const void*>(xn + static_cast<size_t>(r0 + r) * RT_K + kt * BK + ch * 8)
+                    : static_cast<const void*>(xn), ok);
     }
-    if (lane == 0) {
-      float sg[RT_TOPK], sum = 0.f;
 #pragma unroll
-      for (int k = 0; k < RT_TOPK; ++k) { sg[k] = __fdiv_rn(1.0f, 1.0f + expf(-sv[k])); sum += sg[k]; }
-      const float den = sum + 1e-20f;
-      const int row = r0 + rr;
+    for (int i = 0; i < (RC_E * 8) / THREADS; ++i) {
+      const int c = tid + i * THREADS, r = c >> 3, ch = c & 7;
+      cp_async16(smem_u32(sm.b + r * BK + ((ch ^ (r & 7)) << 3)),
+                 wr + static_cast<size_t>(e0 + r) * RT_K + kt * BK + ch * 8, true);
+    }
+  };
+
+  float acc[2][4];
 #pragma unroll
-      for (int k = 0; k < RT_TOPK; ++k) {
-        ids[row * RT_TOPK + k] = si[k];
-        tw[row * RT_TOPK + k] = round_bf16(__fdiv_rn(sg[k], den));
-        atomicAdd(counts + si[k], 1);
+  for (int j = 0; j < 2; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.f;
+#pragma unroll
+  for (int s = 0; s < RC_STAGES - 1; ++s) {
+    load_stage(s, s);
+    cp_commit();
+  }
+  for (int kt = 0; kt < KT; ++kt) {
+    cp_wait<RC_STAGES - 2>();
+    __syncthreads();
+    if (kt + RC_STAGES - 1 < KT) load_stage((kt + RC_STAGES - 1) % RC_STAGES, kt + RC_STAGES - 1);
+    cp_commit();
+    const RouterStageC& sm = st[kt % RC_STAGES];
+#pragma unroll
+    for (int ks = 0; ks < 4; ++ks) {
+      uint32_t af[4], b[4];
+      {
+        const int r = wm * 16 + (lane & 15), ch = ks * 2 + (lane >> 4);
+        ldmatrix_x4(af, smem_u32(sm.a + r * BK + ((ch ^ (r & 7)) << 3)));
       }
+      const int r = wn * 16 + (lane & 7) + ((lane >> 4) << 3), ch = ks * 2 + ((lane >> 3) & 1);
+      ldmatrix_x4(b, smem_u32(sm.b + r * BK + ((ch ^ (r & 7)) << 3)));
+      mma16816(acc[0], af, b[0], b[1]);
+      mma16816(acc[1], af, b[2], b[3]);
     }
   }
+  cp_wait<0>();
+#pragma unroll
+  for (int j = 0; j < 2; ++j)
+#pragma unroll
+    for (int e = 0; e < 4; ++e)
+      lg[wm * 16 + g + 8 * (e >> 1)][wn * 16 + j * 8 + 2 * t + (e & 1)] = round_bf16(acc[j][e]);
+  cluster.sync();
+  const int rr = rank * (RT_M / RC) + warp;  // 8 tokens per rank, one warp each
+  if (rr < nr) {
+    const float* src = cluster.map_shared_rank(&lg[0][0], lane >> 3) + rr * RC_E + (lane & 7) * 8;
+    const float4 x0 = reinterpret_cast<const float4*>(src)[0], x1 = reinterpret_cast<const float4*>(src)[1];
+    float v[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+    router_select_row(v, lane, r0 + rr, ids, tw, counts);
+  }
+  cluster.sync();
 }
 
 template <typename Kernel>
@@ -548,14 +639,24 @@ void set_gemm_override(const GemmConfig& dense, const GemmConfig& grouped) {
 }
 
 void router_topk_rows_bf16(const void* xn, int n, const void* wr, int* ids, float* tw, int* counts, cudaStream_t s) {
-  static bool attr = false;
-  if (!attr) {
+  static int sms = 0;
+  if (sms == 0) {
     cudaFuncSetAttribute(reinterpret_cast<const void*>(router_mma_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(kRouterSmem));
-    attr = true;
+    cudaFuncSetAttribute(reinterpret_cast<const void*>(router_mma_cluster_kernel),
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kRouterSmemC));
+    int dev = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
   }
-  router_mma_kernel<<<(n + RT_M - 1) / RT_M, THREADS, kRouterSmem, s>>>(
-      static_cast<const uint16_t*>(xn), n, static_cast<const uint16_t*>(wr), ids, tw, counts);
+  const int blocks = (n + RT_M - 1) / RT_M;
+  if (blocks * RC <= 2 * sms) {  // few token blocks: spread the experts over a cluster
+    router_mma_cluster_kernel<<<blocks * RC, THREADS, kRouterSmemC, s>>>(
+        static_cast<const uint16_t*>(xn), n, static_cast<const uint16_t*>(wr), ids, tw, counts);
+  } else {
+    router_mma_kernel<<<blocks, THREADS, kRouterSmem, s>>>(
+        static_cast<const uint16_t*>(xn), n, static_cast<const uint16_t*>(wr), ids, tw, counts);
+  }
 }
 
 int gemm_w4a16_grouped(const void* A, const int* gather, int lda, const int* tiles, const int* n_tiles,
