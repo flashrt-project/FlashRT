@@ -119,10 +119,13 @@ tuning hooks for other SM120 parts; none changes the arithmetic.
 - `FLINT_PF_GRAPH=0` -- launch prefill chunks eagerly instead of replaying
   their CUDA graphs.
 - `FLINT_PDL=0` -- no programmatic dependent launch between decode kernels.
+- `FLINT_LM_GREEDY=0` -- final norm, LM head and argmax as three kernels
+  instead of one.
 - `FLINT_ATTN_CLUSTER=0` -- merge decode-attention splits through global
   memory instead of a thread-block cluster.
-- `FLINT_ATTN_BUCKETS`, `FLINT_SWA_ATTN`, `FLINT_GEMV_CFG`, `FLINT_MOE_CFG` --
-  decode launch shapes (context buckets, split counts, warps, rows per warp).
+- `FLINT_ATTN_BUCKETS`, `FLINT_SWA_ATTN`, `FLINT_GEMV_CFG`, `FLINT_MOE_CFG`,
+  `FLINT_LM_ROWS` -- decode launch shapes (context buckets, split counts, warps,
+  rows per warp).
 - `FLINT_PF_ATTN_VARIANT` (0-4), `FLINT_PF_SPLIT_MAX` -- prefill attention tile
   and KV-split limits.
 

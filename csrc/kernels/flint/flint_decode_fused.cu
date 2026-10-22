@@ -11,6 +11,9 @@
 //   moe_gate_up     : routed + shared gate/up GEMV with SwiGLU
 //   moe_down_combine: routed + shared down GEMV with the weighted combine
 //
+// and after the last layer one lm_head_greedy kernel: final residual add + RMSNorm + LM head (fp32 logits)
+// + greedy next token (per-CTA candidates, the last CTA picks and advances the position).
+//
 // PDL contract: before pdl_wait() a kernel only loads static data (weights,
 // scales, norm weights); every global write happens after it. The residual
 // stream ping-pongs between two buffers so the CTAs of one kernel never race
@@ -87,17 +90,34 @@ __device__ __forceinline__ void norm_prologue(const uint16_t* __restrict__ x, co
   }
 }
 
+// Greedy selection state for the LM head (EPI 3): per-CTA candidates, the last CTA's counter ticket,
+// and the device-side sequence (same contract as argmax_next_f32).
+struct GreedyArgs {
+  float* cand_v;
+  int* cand_i;
+  unsigned* counter;
+  int* tokens;
+  int* pos;
+  const int* n_prompt;
+};
+
+__device__ __forceinline__ void better_of(float& bv, int& bi, float v, int i) {
+  if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
 // GEMV (M = 1) with optional fused residual add + RMSNorm prologue (K == 2048 only).
-// Same lane/row layout and epilogues as gemv_w4a16 (EPI 0 bf16, 1 f32, 2 gate|up SwiGLU).
+// Same lane/row layout and epilogues as gemv_w4a16 (EPI 0 bf16, 1 f32, 2 gate|up SwiGLU), plus
+// EPI 3: fp32 logits and the greedy argmax over all N outputs (ties -> lowest index); the last CTA
+// writes tokens[pos + 1] (unless still inside the prompt) and advances pos, like argmax_next_f32.
 // ---------------------------------------------------------------------------
 template <int K, int RPW, int WARPS, int EPI, bool NORM>
 __global__ void __launch_bounds__(WARPS * 32)
 gemv_fused_kernel(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales, const uint16_t* __restrict__ x,
              const uint16_t* __restrict__ res_in, uint16_t* __restrict__ res_out, const float* __restrict__ nw,
-             int first, float eps, void* __restrict__ out, int N, float gs) {
+             int first, float eps, void* __restrict__ out, int N, float gs, GreedyArgs ga) {
   constexpr int NCH = K / 1024;
   static_assert(!NORM || K == kH, "the fused norm prologue is for the hidden size");
   __shared__ __align__(16) uint16_t xs[K];
@@ -128,6 +148,11 @@ gemv_fused_kernel(const uint8_t* __restrict__ codes, const uint8_t* __restrict__
         wv[c][r] = ldg_nc_v4(codes + static_cast<size_t>(row) * (K / 2) + c * 512 + lane * 16);
         sv[c][r] = ldg_nc_u16(scales + static_cast<size_t>(row) * (K / 16) + c * 64 + lane * 2);
       }
+  } else if (EPI == 3) {   // idle warps still take part in the block-wide selection
+#pragma unroll
+    for (int c = 0; c < NCH; ++c)
+#pragma unroll
+      for (int r = 0; r < RPW; ++r) { wv[c][r] = make_uint4(0u, 0u, 0u, 0u); sv[c][r] = 0u; }
   }
   pdl_wait();
   x = after_wait(x);
@@ -142,7 +167,7 @@ gemv_fused_kernel(const uint8_t* __restrict__ codes, const uint8_t* __restrict__
   }
   __syncthreads();
   pdl_launch();
-  if (!active) return;
+  if (EPI != 3 && !active) return;
   float acc[RPW];
 #pragma unroll
   for (int r = 0; r < RPW; ++r) acc[r] = 0.f;
@@ -163,12 +188,12 @@ gemv_fused_kernel(const uint8_t* __restrict__ codes, const uint8_t* __restrict__
   }
 #pragma unroll
   for (int r = 0; r < RPW; ++r) acc[r] = warp_sum(acc[r]);
-  if (lane == 0) {
+  if (lane == 0 && active) {
     if (EPI == 0) {
 #pragma unroll
       for (int r = 0; r < RPW; ++r)
         if (rows[r] < N) static_cast<uint16_t*>(out)[rows[r]] = f32_to_bf16_bits(acc[r] * gs);
-    } else if (EPI == 1) {
+    } else if (EPI == 1 || EPI == 3) {
 #pragma unroll
       for (int r = 0; r < RPW; ++r)
         if (rows[r] < N) static_cast<float*>(out)[rows[r]] = acc[r] * gs;
@@ -182,17 +207,64 @@ gemv_fused_kernel(const uint8_t* __restrict__ codes, const uint8_t* __restrict__
         }
     }
   }
+  if (EPI == 3) {
+    __shared__ float cv[WARPS];
+    __shared__ int ci[WARPS];
+    __shared__ bool last;
+    if (lane == 0) {
+      float bv = -FLT_MAX;
+      int bi = 0x7fffffff;
+#pragma unroll
+      for (int r = 0; r < RPW; ++r)
+        if (active && rows[r] < N) better_of(bv, bi, acc[r] * gs, rows[r]);
+      cv[warp] = bv; ci[warp] = bi;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      float bv = cv[0];
+      int bi = ci[0];
+      for (int w = 1; w < WARPS; ++w) better_of(bv, bi, cv[w], ci[w]);
+      ga.cand_v[blockIdx.x] = bv; ga.cand_i[blockIdx.x] = bi;
+      __threadfence();
+      last = atomicAdd(ga.counter, 1u) == gridDim.x - 1;
+    }
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    float bv = -FLT_MAX;
+    int bi = 0x7fffffff;
+    for (int b = threadIdx.x; b < static_cast<int>(gridDim.x); b += WARPS * 32)
+      better_of(bv, bi, __ldcg(ga.cand_v + b), __ldcg(ga.cand_i + b));
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+      better_of(bv, bi, __shfl_xor_sync(0xffffffffu, bv, o), __shfl_xor_sync(0xffffffffu, bi, o));
+    if (lane == 0) { cv[warp] = bv; ci[warp] = bi; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      for (int w = 0; w < WARPS; ++w) better_of(bv, bi, cv[w], ci[w]);
+      const int idx = *ga.pos + 1;
+      if (ga.n_prompt == nullptr || idx >= *ga.n_prompt) ga.tokens[idx] = bi;
+      *ga.pos = idx;
+      *ga.counter = 0u;
+    }
+  }
+}
+
+template <int RPW, int WARPS, int EPI>
+static int gemv_fused_blocks(int N) {
+  const int rows_per_block = (EPI == 2) ? WARPS * RPW / 2 : WARPS * RPW;
+  const int n_out = (EPI == 2) ? N / 2 : N;
+  return (n_out + rows_per_block - 1) / rows_per_block;
 }
 
 template <int K, int RPW, int WARPS, int EPI, bool NORM>
 static void launch_gemv_fused(const void* codes, const void* scales, const void* x, const void* res_in, void* res_out,
-                         const float* nw, int first, float eps, void* out, int N, float gs, cudaStream_t s) {
-  const int rows_per_block = (EPI == 2) ? WARPS * RPW / 2 : WARPS * RPW;
-  const int n_out = (EPI == 2) ? N / 2 : N;
-  const int blocks = (n_out + rows_per_block - 1) / rows_per_block;
+                         const float* nw, int first, float eps, void* out, int N, float gs, cudaStream_t s,
+                         GreedyArgs ga = GreedyArgs{}) {
+  const int blocks = gemv_fused_blocks<RPW, WARPS, EPI>(N);
   launch_pdl(gemv_fused_kernel<K, RPW, WARPS, EPI, NORM>, dim3(blocks), dim3(WARPS * 32), 0, s,
              static_cast<const uint8_t*>(codes), static_cast<const uint8_t*>(scales), static_cast<const uint16_t*>(x),
-             static_cast<const uint16_t*>(res_in), static_cast<uint16_t*>(res_out), nw, first, eps, out, N, gs);
+             static_cast<const uint16_t*>(res_in), static_cast<uint16_t*>(res_out), nw, first, eps, out, N, gs, ga);
 }
 
 static GemvLaunchConfig g_gemv_cfg = {4, 4, 2, 4};
@@ -237,6 +309,27 @@ int gemv_fused_w4a16(const void* codes, const void* scales, const void* x, const
   FLINT_G2(2048, 4, 1, false)   // lm_head (fp32 logits)
   FLINT_G2(2048, 4, 0, false)
 #undef FLINT_G2
+  return 1;
+}
+
+// LM head with the final norm and the greedy pick: 8 warps per block (the norm prologue then sums in the same
+// order as add_rmsnorm_pdl_bf16), rows per warp from a measured search.
+static int g_lm_rows = 4;
+
+void set_lm_head_rows(int rows) { g_lm_rows = rows; }
+
+int lm_head_greedy_w4a16(const void* codes, const void* scales, const void* x, const void* res_in, void* res_out,
+                         const float* norm_w, float eps, float* logits, int N, float gs, float* cand_v, int* cand_i,
+                         int cand_cap, unsigned* counter, int* tokens, int* pos, const int* n_prompt, cudaStream_t s) {
+  const GreedyArgs ga{cand_v, cand_i, counter, tokens, pos, n_prompt};
+#define FLINT_LM(RR)                                                                                          \
+  if (g_lm_rows == RR) {                                                                                      \
+    if (gemv_fused_blocks<RR, 8, 3>(N) > cand_cap) return 1;                                                  \
+    launch_gemv_fused<2048, RR, 8, 3, true>(codes, scales, x, res_in, res_out, norm_w, 0, eps, logits, N, gs, s, ga); \
+    return 0;                                                                                                 \
+  }
+  FLINT_LM(2) FLINT_LM(4) FLINT_LM(8)
+#undef FLINT_LM
   return 1;
 }
 

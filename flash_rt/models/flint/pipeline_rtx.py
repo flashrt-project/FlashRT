@@ -314,6 +314,10 @@ class FlintRuntime:
         mcfg = _os.environ.get("FLINT_MOE_CFG")           # 6 ints, see set_moe_launch_config (search hook)
         if mcfg:
             self.fl.set_moe_launch_config(*[int(v) for v in mcfg.replace("_", ",").split(",")])
+        # Decode tail: final norm + LM head + greedy pick in one kernel (0: three kernels).
+        self.lm_greedy = _os.environ.get("FLINT_LM_GREEDY", "1") != "0"
+        if _os.environ.get("FLINT_LM_ROWS"):              # rows per warp of that kernel (search hook)
+            self.fl.set_lm_head_rows(int(_os.environ["FLINT_LM_ROWS"]))
         for L in self.layers:
             rng = []
             for t in (L.o.codes, L.o.scales):
@@ -358,6 +362,9 @@ class FlintRuntime:
         self.pf_graph_max = 64
         self.pf_graphs: "OrderedDict[tuple, object]" = OrderedDict()
         self._pf_pool = None
+        # LM-head greedy candidates (one per block); allocated last so earlier buffers keep their placement.
+        self.lm_cand_v = torch.zeros(-(-cfg.vocab_size // 16), dtype=f32, device=self.dev)
+        self.lm_cand_i = torch.zeros(-(-cfg.vocab_size // 16), dtype=i32, device=self.dev)
 
     # ------------------------------------------------------------------ decode step
     def _gemv(self, m: _Mat, x, out, epilogue, s):
@@ -647,9 +654,16 @@ class FlintRuntime:
                                           L.exp_down.gs_dev.data_ptr(), L.sh_down.codes.data_ptr(),
                                           L.sh_down.scales.data_ptr(), L.sh_down.gs, self.x.data_ptr(), s)
             site += 1
+        lm = self.lm_head
+        if self.lm_greedy:
+            fl.lm_head_greedy_w4a16(lm.codes.data_ptr(), lm.scales.data_ptr(), self.x.data_ptr(), res[site & 1],
+                                    res[(site + 1) & 1], self.out_norm.data_ptr(), eps, self.logits.data_ptr(),
+                                    lm.rows, lm.gs, self.lm_cand_v.data_ptr(), self.lm_cand_i.data_ptr(),
+                                    self.lm_cand_v.numel(), self.argmax_counter.data_ptr(), self.tokens.data_ptr(),
+                                    self.pos.data_ptr(), self.n_prompt_dev.data_ptr(), s)
+            return
         fl.add_rmsnorm_pdl_bf16(self.x.data_ptr(), res[site & 1], self.out_norm.data_ptr(), eps, res[(site + 1) & 1],
                              self.xn.data_ptr(), s)
-        lm = self.lm_head
         fl.gemv_fused_w4a16(lm.codes.data_ptr(), lm.scales.data_ptr(), self.xn.data_ptr(), 0, 0, 0, 0, eps,
                        self.logits.data_ptr(), lm.rows, lm.k, lm.gs, 1, s)
         fl.argmax_next_f32(self.logits.data_ptr(), cfg.vocab_size, self.cand_v.data_ptr(), self.cand_i.data_ptr(),

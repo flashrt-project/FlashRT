@@ -220,6 +220,17 @@ PYBIND11_MODULE(flash_rt_flint, m) {
           fl::add_rmsnorm_pdl_bf16(ptr<const void>(x), ptr<const void>(res_in), ptr<const float>(w), eps, ptr<void>(res_out),
                                 ptr<void>(out), to_stream(stream));
         });
+  m.def("lm_head_greedy_w4a16",
+        [](uintptr_t codes, uintptr_t scales, uintptr_t x, uintptr_t res_in, uintptr_t res_out, uintptr_t norm_w,
+           float eps, uintptr_t logits, int N, float gs, uintptr_t cand_v, uintptr_t cand_i, int cand_cap,
+           uintptr_t counter, uintptr_t tokens, uintptr_t pos, uintptr_t n_prompt, uintptr_t stream) {
+          if (fl::lm_head_greedy_w4a16(ptr<const void>(codes), ptr<const void>(scales), ptr<const void>(x),
+                                       ptr<const void>(res_in), ptr<void>(res_out), ptr<const float>(norm_w), eps,
+                                       ptr<float>(logits), N, gs, ptr<float>(cand_v), ptr<int>(cand_i), cand_cap,
+                                       ptr<unsigned>(counter), ptr<int>(tokens), ptr<int>(pos),
+                                       ptr<const int>(n_prompt), to_stream(stream)) != 0)
+            throw std::invalid_argument("lm_head_greedy_w4a16: unsupported rows per warp or candidate buffer too small");
+        });
   m.def("router_norm_bf16",
         [](uintptr_t x, uintptr_t res_in, uintptr_t nw, float eps, uintptr_t res_out, uintptr_t xn_out, uintptr_t wr,
            uintptr_t logits, uintptr_t counter, uintptr_t ids, uintptr_t tw, uintptr_t stream) {
@@ -273,6 +284,7 @@ PYBIND11_MODULE(flash_rt_flint, m) {
     return py::make_tuple(c.router_warps, c.router_rows, c.gu_warps, c.gu_rows, c.dn_warps, c.dn_rows);
   });
 
+  m.def("set_lm_head_rows", [](int rows) { fl::set_lm_head_rows(rows); });
   m.def("set_gemv_launch_config", [](int qr, int qw, int orr, int ow) {
     fl::set_gemv_launch_config(fl::GemvLaunchConfig{qr, qw, orr, ow});
   });

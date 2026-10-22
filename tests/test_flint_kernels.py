@@ -670,6 +670,62 @@ def test_router_norm_matches_unfused():
     assert torch.equal(ids_b, ids_a) and torch.equal(tw_b, tw_a) and ctr.item() == 0
 
 
+@pytest.mark.parametrize("rows", [2, 4, 8])
+def test_lm_head_greedy_matches_three_kernels(rows):
+    torch.manual_seed(9)
+    N, K, gs = 4001, 2048, 0.25          # a partial last block exercises idle warps
+    codes, scales = repack_dev(rand_blocks(N, K, 61))
+    x = bf16(torch.randn(K, device=DEV) * 2)
+    res = bf16(torch.randn(K, device=DEV) * 8)
+    w = torch.rand(K, device=DEV) + 0.5
+
+    def seq():   # tokens, pos, n_prompt: pos 3 -> 4 keeps the prompt token, then 5 and 6 are written
+        return (torch.full((16,), 7, dtype=torch.int32, device=DEV), torch.tensor([3], dtype=torch.int32, device=DEV),
+                torch.tensor([5], dtype=torch.int32, device=DEV))
+
+    def three(tokens, pos, n_prompt):
+        res_o, xn, lg = torch.zeros_like(x), torch.empty_like(x), torch.empty(N, device=DEV)
+        cv = torch.empty(fl.ARGMAX_BLOCKS, device=DEV)
+        ci = torch.empty(fl.ARGMAX_BLOCKS, dtype=torch.int32, device=DEV)
+        ctr = torch.zeros(1, dtype=torch.int32, device=DEV)
+        for _ in range(3):
+            fl.add_rmsnorm_pdl_bf16(x.data_ptr(), res.data_ptr(), w.data_ptr(), EPS, res_o.data_ptr(), xn.data_ptr(),
+                                    _stream())
+            fl.gemv_fused_w4a16(codes.data_ptr(), scales.data_ptr(), xn.data_ptr(), 0, 0, 0, 0, EPS, lg.data_ptr(), N, K,
+                                gs, 1, _stream())
+            fl.argmax_next_f32(lg.data_ptr(), N, cv.data_ptr(), ci.data_ptr(), ctr.data_ptr(), tokens.data_ptr(),
+                               pos.data_ptr(), n_prompt.data_ptr(), _stream())
+        return lg, res_o, ctr
+
+    def fused(tokens, pos, n_prompt):
+        res_o, lg = torch.zeros_like(x), torch.empty(N, device=DEV)
+        cap = -(-N // 16)
+        cv = torch.empty(cap, device=DEV)
+        ci = torch.empty(cap, dtype=torch.int32, device=DEV)
+        ctr = torch.zeros(1, dtype=torch.int32, device=DEV)
+        fl.set_lm_head_rows(rows)
+        try:
+            for _ in range(3):
+                fl.lm_head_greedy_w4a16(codes.data_ptr(), scales.data_ptr(), x.data_ptr(), res.data_ptr(),
+                                        res_o.data_ptr(), w.data_ptr(), EPS, lg.data_ptr(), N, gs, cv.data_ptr(),
+                                        ci.data_ptr(), cap, ctr.data_ptr(), tokens.data_ptr(), pos.data_ptr(),
+                                        n_prompt.data_ptr(), _stream())
+        finally:
+            fl.set_lm_head_rows(4)
+        return lg, res_o, ctr
+
+    win = int(three(*seq())[0].argmax())
+    lo = win // 3                        # an exact tie in another block: the lower index must win
+    codes[lo] = codes[win]
+    scales[lo] = scales[win]
+    sa, sb = seq(), seq()
+    lg_a, res_a, ctr_a = three(*sa)
+    lg_b, res_b, ctr_b = fused(*sb)
+    assert torch.equal(lg_b, lg_a) and torch.equal(res_b, res_a)
+    assert sb[1].item() == 6 and ctr_b.item() == 0
+    assert sb[0].tolist() == sa[0].tolist() == [7] * 5 + [lo, lo] + [7] * 9
+
+
 @pytest.mark.parametrize("pos,ring,window,rope,n_split,warps", [
     (0, 0, 0, 0, 4, 4), (777, 0, 0, 0, 16, 4), (5000, 1024, 513, 1, 4, 4), (300, 1024, 513, 1, 4, 8),
     (20000, 0, 0, 0, 64, 4), (5000, 1024, 513, 1, 1, 16), (1500, 0, 0, 0, 1, 8), (9000, 0, 0, 0, 24, 8),

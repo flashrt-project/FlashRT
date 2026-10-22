@@ -115,6 +115,13 @@ int gemv_fused_w4a16(const void* codes, const void* scales, const void* x, const
                 cudaStream_t s);
 void add_rmsnorm_pdl_bf16(const void* x, const void* res_in, const float* w, float eps, void* res_out, void* out,
                        cudaStream_t s);
+// Final residual add + RMSNorm + LM head (fp32 logits) + greedy next token in one kernel (K == 2048).
+// cand_v/cand_i hold one candidate per block (cand_cap entries); returns non-zero if they are too small or
+// the rows-per-warp setting is unsupported. set_lm_head_rows: 2, 4 or 8 rows per warp (8 warps per block).
+int lm_head_greedy_w4a16(const void* codes, const void* scales, const void* x, const void* res_in, void* res_out,
+                         const float* norm_w, float eps, float* logits, int N, float gs, float* cand_v, int* cand_i,
+                         int cand_cap, unsigned* counter, int* tokens, int* pos, const int* n_prompt, cudaStream_t s);
+void set_lm_head_rows(int rows);
 void router_norm_bf16(const void* x, const void* res_in, const float* nw, float eps, void* res_out, void* xn_out,
                       const void* wr, float* logits, unsigned* counter, int* ids, float* tw, cudaStream_t s);
 void moe_gate_up_pdl_bf16(const void* xn, const int* ids, const void* ecodes, const void* escales, const float* egs,
