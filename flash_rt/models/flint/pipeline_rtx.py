@@ -351,10 +351,6 @@ class FlintRuntime:
         self.pf_opart = torch.empty(self.pf_split_units * 128 * 128, dtype=f32, device=self.dev)
         self.pf_ml = torch.empty(self.pf_split_units * 128 * 2, dtype=f32, device=self.dev)
         self.pf_attn_ctr = torch.zeros(units, dtype=i32, device=self.dev)
-        # Side stream + fork/join events per layer for the shared expert (FLINT_PF_SIDE=0 disables).
-        self.pf_side = torch.cuda.Stream(self.dev) if _os.environ.get("FLINT_PF_SIDE", "1") == "1" else None
-        self._pf_fork = [torch.cuda.Event() for _ in self.layers]
-        self._pf_join = [torch.cuda.Event() for _ in self.layers]
 
     # ------------------------------------------------------------------ decode step
     def _gemv(self, m: _Mat, x, out, epilogue, s):
@@ -435,7 +431,6 @@ class FlintRuntime:
         scale = 1.0 / math.sqrt(cfg.head_dim)
         T, I = cfg.num_experts_per_tok, cfg.expert_intermediate_size
         splits = (self._pf_attn_splits(m, pos0, 0), self._pf_attn_splits(m, pos0, cfg.sliding_window))
-        side = self.pf_side
         # Rows per grouped-GEMM tile from the mean routed rows per expert (small chunks -> small tiles).
         mean_rows = -(-m * T // cfg.num_experts)
         tile_rows = 16 if mean_rows <= 12 else 32 if mean_rows <= 24 else 64
@@ -464,17 +459,10 @@ class FlintRuntime:
                            fl.EPI_SWIGLU_DENSE, s)
                 self._gemm(self.pf_act, m, cfg.dense_intermediate_size, L.down, self.pf_x, H, fl.EPI_BF16, s)
             else:
-                # Shared expert on the side stream (overlaps the router, expert sort and routed GEMMs).
-                ss = s if side is None else side.cuda_stream
-                if side is not None:
-                    self._pf_fork[il].record(self.stream)
-                    side.wait_event(self._pf_fork[il])
                 self._gemm(self.pf_xn, m, H, L.sh_gate_up, self.pf_sh_act, cfg.shared_intermediate_size,
-                           fl.EPI_SWIGLU_DENSE, ss)
+                           fl.EPI_SWIGLU_DENSE, s)
                 self._gemm(self.pf_sh_act, m, cfg.shared_intermediate_size, L.sh_down, self.pf_sh, H,
-                           fl.EPI_BF16, ss)
-                if side is not None:
-                    self._pf_join[il].record(side)
+                           fl.EPI_BF16, s)
                 fl.router_topk_rows_bf16(self.pf_xn.data_ptr(), m, L.router.data_ptr(), self.pf_ids.data_ptr(),
                                          self.pf_tw.data_ptr(), self.pf_counts.data_ptr(), s)
                 fl.moe_scan_place(self.pf_ids.data_ptr(), m, tile_rows, self.pf_counts.data_ptr(),
@@ -490,8 +478,6 @@ class FlintRuntime:
                                       self.pf_ntiles.data_ptr(), max_tiles, d.codes.data_ptr(),
                                       d.scales.data_ptr(), H, I, d.gs_dev.data_ptr(), self.pf_y_s.data_ptr(), H,
                                       fl.EPI_BF16, tile_rows, mean_rows, s)
-                if side is not None:
-                    self.stream.wait_event(self._pf_join[il])
                 fl.moe_combine_rows_bf16(self.pf_y_s.data_ptr(), self.pf_inv.data_ptr(), self.pf_tw.data_ptr(),
                                          self.pf_sh.data_ptr(), self.pf_x.data_ptr(), m, s)
         fl.advance_pos(self.pos.data_ptr(), m, s)
