@@ -4,13 +4,13 @@ FlashRT runs the official NVFP4 GGUF of Flint (`RecursiveSI/flint-nvfp4-gguf`)
 natively on SM120: an independent GGUF reader and a lossless NVFP4 repack feed
 FlashRT's own W4A16 kernels, the decode step is one captured CUDA graph, and
 prefill runs in chunks whose launch sequences are captured as CUDA graphs too.
-Python only builds buffers, captures the graphs and replays them; no tensor work
-runs through PyTorch on the hot path.
+The captured compute paths call native kernels. The torch frontend owns weight
+loading, buffers, graph capture and replay; prompt upload/reset and token
+readback remain outside the graphs.
 The GGUF is a weight container here -- nothing from llama.cpp is linked or
 called at run time.
 
-The arithmetic follows the official vLLM implementation of the same GGUF
-(W4A16): exact NVFP4 dequantization, BF16 activations and KV cache, FP32
+The W4A16 arithmetic contract is: exact NVFP4 dequantization, BF16 activations and KV cache, FP32
 accumulation (see *Numerics*).
 
 ## Requirements
@@ -19,13 +19,15 @@ accumulation (see *Numerics*).
 |---|---|
 | Checkpoint | `RecursiveSI/flint-nvfp4-gguf`, the single NVFP4 GGUF (22,863,084,160 bytes) |
 | Hardware | SM120 (RTX 5090 class), 32 GB |
-| Framework | PyTorch (control plane only); `fastapi` + `uvicorn` for the example server |
+| Framework | PyTorch for buffer/graph ownership; `tokenizers` + `jinja2` for chat; `fastapi` + `uvicorn` only for the example server |
+| Validated toolchain | Linux, Python 3.10.12, PyTorch 2.14.1+cu130, CUDA 13.0.88, driver 580.178.04, GCC 11.4 |
 | Build flag | `FLASHRT_ENABLE_FLINT=ON` (default OFF; requires `GPU_ARCH=120`) |
 
 ```bash
-cmake -S . -B build -DGPU_ARCH=120 -DFLASHRT_ENABLE_FLINT=ON
+# Follow docs/INSTALL.md for the CUDA toolchain and CUTLASS setup first.
+pip install -e ".[flint]"
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGPU_ARCH=120 -DFLASHRT_ENABLE_FLINT=ON
 cmake --build build -j --target flash_rt_flint
-pip install -e ".[torch]"
 ```
 
 The kernels build into their own module, `flash_rt_flint`; no other target
@@ -39,7 +41,7 @@ division and precise `expf`.
 ```python
 from flash_rt.frontends.torch.flint_rtx import FlintTorchFrontendRtx
 
-fe = FlintTorchFrontendRtx("/models/flint-nvfp4.gguf", max_seq=32768)
+fe = FlintTorchFrontendRtx("<path-to-flint-nvfp4.gguf>", max_seq=32768)
 print(fe.chat([{"role": "user", "content": "Write a CUDA reduction checklist."}], max_new_tokens=512))
 ```
 
@@ -65,7 +67,7 @@ the VLA-style `predict()` API does not fit a text LLM.
 
 ```bash
 pip install fastapi uvicorn
-python examples/flint_openai_server.py --gguf /models/flint-nvfp4.gguf --port 8000 --max-seq 131072
+python examples/flint_openai_server.py --gguf "<path-to-flint-nvfp4.gguf>" --port 8000 --max-seq 131072
 ```
 
 `/v1/chat/completions` (stream and non-stream), `/v1/models`, `/health`.
@@ -78,7 +80,7 @@ Extensions: `ignore_eos` (generate exactly `max_tokens`), `cache_prompt`
 
 The GGUF reader (`flash_rt/models/flint/gguf.py`) is independent of llama.cpp
 and maps the file read-only. Before allocating GPU memory the runtime checks the
-exact Flint geometry: 49 layers, hidden 2048, 32 query / 4 KV heads of 128,
+supported Flint geometry: 49 layers, hidden 2048, 32 query / 4 KV heads of 128,
 two dense SwiGLU layers (6144), 47 MoE layers (256 experts, top-6, expert 512,
 one ungated shared expert of 1024), the 14 full-attention NoPE layers and 35
 sliding-window RoPE layers (window 513), per-head sinks and Q/K RMSNorm, and the
@@ -94,7 +96,7 @@ holds for every layer of the official file (checked at load).
 
 ## Numerics
 
-Matches the official vLLM W4A16 path for this GGUF:
+W4A16 contract for this GGUF:
 
 - weights dequantized exactly (`e2m1 * e4m3`), BF16 activations, FP32
   accumulation, global scale on the FP32 accumulator, one rounding to BF16;
@@ -142,8 +144,9 @@ that fits 8192 tokens is one chunk.
 ### Tests
 
 ```bash
+PYTHONPATH=. pytest -q tests/test_flint_contracts.py                   # CPU contracts, no checkpoint
 PYTHONPATH=. pytest -q tests/test_flint_kernels.py                     # synthetic, no checkpoint
-FLASHRT_FLINT_GGUF=/models/flint-nvfp4.gguf PYTHONPATH=. pytest -q tests/test_flint_pipeline.py
+FLASHRT_FLINT_GGUF="<path-to-flint-nvfp4.gguf>" PYTHONPATH=. pytest -q tests/test_flint_pipeline.py
 ```
 
 The kernel tests compare every kernel against FP64 references built from the
@@ -154,7 +157,74 @@ agree, that chunked prefill agrees with stepping the prompt through the decode
 graph, that prefix reuse continues exactly like a full prefill, and that prefill
 chunks replayed from CUDA graphs match eager launches token for token.
 
+### Reproduce forward timings
+
+After building FlashRT above, create the public token fixtures once. The model
+tokenizer encodes this exact text: a fixed instruction followed by the pinned
+README; the token sequence is repeated and truncated. Both drivers consume
+these same files, and the native JSON reports their SHA256 fingerprints.
+
+```bash
+git show 1fbe995089af4148bacd10ead61764d0aeb80f7a:README.md > build/flint-corpus.txt
+PYTHONPATH=. python examples/flint_benchmark.py \
+    --gguf "<path-to-flint-nvfp4.gguf>" \
+    --make-tokens build/flint-tokens --corpus build/flint-corpus.txt
+```
+
+Build the optional reference driver against the pinned upstream executor.
+It is used only for comparison and is not linked into FlashRT.
+
+```bash
+LLAMA_DIR=build/llama.cpp-reference
+git clone https://github.com/ggml-org/llama.cpp.git "$LLAMA_DIR"
+git -C "$LLAMA_DIR" checkout --detach 1b44e30775dcb2f93952116b05f89e5bd797fb00
+git -C "$LLAMA_DIR" fetch origin pull/30929/head
+git -C "$LLAMA_DIR" cherry-pick --no-commit FETCH_HEAD
+cmake -S "$LLAMA_DIR" -B "$LLAMA_DIR/build" -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 \
+    -DLLAMA_CURL=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF \
+    -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_OPENSSL=OFF
+cmake --build "$LLAMA_DIR/build" -j --target llama-bench
+g++ -O3 -std=c++17 examples/flint_llama_benchmark.cpp \
+    -I "$LLAMA_DIR/include" -I "$LLAMA_DIR/ggml/include" \
+    -L "$LLAMA_DIR/build/bin" -Wl,-rpath,"$(realpath "$LLAMA_DIR/build/bin")" \
+    -lllama -lggml -o build/flint-llama-benchmark
+```
+
+Run the following commands in four fresh processes, in reference / native /
+native / reference order. Keep all fixture files in the same order so the
+requested context allocation is identical. The drivers emit every measured
+repetition; pool the two runs of each executor by prompt length, then take the
+median of the four repetitions. Use the `*_wall_*` fields for this comparison;
+the native driver's CUDA-event fields are separate diagnostics.
+
+```bash
+prompts=()
+for n in 58 1024 4096 8192 16384 32768 65536 102400; do
+    prompts+=("build/flint-tokens/prompt-$n.i32")
+done
+# Reference: 256 decode steps, one warmup, two measured repetitions.
+CUDA_VISIBLE_DEVICES=0 build/flint-llama-benchmark \
+    "<path-to-flint-nvfp4.gguf>" 256 1 2 "${prompts[@]}"
+# Native: the same protocol.
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python examples/flint_benchmark.py \
+    --gguf "<path-to-flint-nvfp4.gguf>" --tokens "${prompts[@]}" \
+    --n-gen 256 --warmup 1 --reps 2
+```
+
+Corpus SHA256: `3c91b20122fd59d895dfd4493572e005026d92ef04c911012d39f01000c3a605`.
+The reference driver explicitly enables backend greedy sampling and window-sized
+SWA caches, and reserves one output. The low-level llama.cpp API otherwise
+defaults to full-length SWA allocation and batch-sized output capacity, which
+is not the single-sequence CLI configuration used here.
+
 ### Accuracy
+
+The full quality figures below come from the frozen numerical core, before
+publication cleanup. Kernel arithmetic and launch order are unchanged; this
+cleanup reran 150 numerical kernel tests, 26 CPU/interface contracts, the
+serving ownership test and all five checkpoint pipeline tests. A fresh
+teacher-forced FP32 probe has KL **0.000670**, top-1 **99.22%**.
 
 Teacher-forced next-token distributions on eight real coding/agent prompts
 (1753 positions) against an FP32 reference of the same weights (exact dequant,
@@ -186,89 +256,62 @@ McNemar p = 0.375.
 
 ## RTX 5090 numbers
 
-One RTX 5090 (170 SMs, driver 580), the official GGUF on both sides. llama.cpp
-is the official executor at the commit that added Flint, run with its serving
-flags (f16 KV cache, flash attention) through `llama-bench`: prompt processing
-at ubatch 2048, generation of 128 tokens at a populated KV depth. FlashRT
-figures are the forward path on real prompts of the stated length: prefill is
-GPU time from the first token to the first generated token; decode is the
-steady CUDA-graph step including the LM head and on-device argmax, over 256
-generated tokens after that prompt. FlashRT figures are medians of six
-measurements (three processes x two repetitions) run interleaved with an earlier
-FlashRT build in one session; the llama.cpp figures come from a separate
-`llama-bench` sweep on the same machine.
+One RTX 5090 (170 SMs, 32 GB), CUDA 13.0.88, driver 580.178.04,
+Python 3.10.12, PyTorch 2.14.1+cu130, tokenizers 0.23.3 and Jinja2 3.1.6.
+Both executors read the same official NVFP4 GGUF and identical int32 token
+files generated from the public README at FlashRT `1fbe995`. This is a fixed
+text workload, repeated/truncated to the exact lengths below; accuracy is
+evaluated separately on coding prompts.
 
-| context | prefill | llama.cpp | | decode | llama.cpp | |
-|---:|---:|---:|---:|---:|---:|---:|
-| 58 | **10.9 ms** | | | **679 tok/s** | 245.5 | 2.8x |
-| 1 K | **40.8 ms** | 102.8 ms | 2.5x | **680 tok/s** | 238.5 | 2.9x |
-| 4 K | **131 ms** | 341 ms | 2.6x | **616 tok/s** | 228.4 | 2.7x |
-| 8 K | **267 ms** | 690 ms | 2.6x | **587 tok/s** | 226.8 | 2.6x |
-| 16 K | **634 ms** | 1445 ms | 2.3x | **554 tok/s** | 218.5 | 2.5x |
-| 32 K | **1.60 s** | 3.18 s | 2.0x | **479 tok/s** | 205.1 | 2.3x |
-| 64 K | **4.52 s** | 7.59 s | 1.7x | **374 tok/s** | 182.3 | 2.1x |
-| 100 K | **9.07 s** | 14.04 s | 1.5x | **308 tok/s** | 162.7 | 1.9x |
+The reference is stock llama.cpp CUDA at
+`1b44e30775dcb2f93952116b05f89e5bd797fb00` with the Jinja-only fix from
+PR #30929, without a FlashRT overlay. Both runs are single-sequence greedy
+generation, flash attention, default CUDA graphs and requested context capacity
+`102720` (longest prompt + 256 + 64). llama.cpp uses 8 CPU threads,
+`n_batch=n_ubatch=2048`, one output, sliding-window KV allocation and backend
+greedy sampling. FlashRT uses its default 8192-token prefill capacity / 8160-token
+full chunk. Runtime precision differs: FlashRT is W4A16 with BF16 activations/KV;
+llama.cpp uses its stock NVFP4 CUDA path with F16 KV. These are executor results,
+with separate correctness evidence, rather than an identical-arithmetic kernel A/B.
 
-Decode at 4 K and 8 K runs at one of two levels about 3% apart (1.58 or 1.62 ms
-per token at 4 K, 1.655 or 1.70 ms at 8 K); the level can change between
-processes and also within one process, while the generated tokens checked (the
-first 16 of each run) stay identical. In the run above both medians sit on the
-slower level. Other depths vary by under 0.3%. Where the time goes:
+Fresh process order: llama.cpp / FlashRT / FlashRT / llama.cpp. Each process
+warms each prompt once, then measures it twice. Tables pool all four measured
+repetitions per executor and report the median. Prefill is wall time from
+prompt reset/upload through the first greedy token. Decode is wall time for
+256 additional steps, including the LM head and greedy selection; throughput
+is `1000 / median_ms_per_step`. Initial loading/capture, tokenization, HTTP and
+text rendering are excluded from both. Results measured 2026-10-23 (UTC+8).
 
-- decode at short context is the per-layer dependency chain (QKV, attention,
-  o_proj, router, gate/up, down) with each kernel's weight loads issued before
-  its programmatic-dependent-launch wait (a dependent-launch boundary costs about
-  0.8 us on this card against 1.3 us for an all-to-all grid barrier inside a
-  persistent kernel, so merging the stages behind such barriers would not
-  help); at 100 K the 14 full-attention layers take more than
-  half of the step (129 us per layer, ~93% of the measured streaming peak);
-- prefill GEMMs run at 190-215 TFLOPS on large chunks (the bf16 `mma.sync`
-  peak measured on this card is 259 TFLOPS); attention at ~190 TFLOPS, which is
-  70% of a 100 K prefill; at 58 tokens the routed-expert GEMMs, which stream
-  the selected experts' weights with mostly empty 16-row tiles, take 69% of
-  the time.
+### Decode
 
-GPU memory with a 110,592-token context (device total from `nvidia-smi`; the KV
-cache is preallocated): 26.9 GiB idle and after a 100 K request (+24 MiB of
-cached prefill graphs, at most ~150 MiB for 64 shapes), against 24.6 GiB for
-llama-server with the same context (25.3 GiB with `-ub 2048`). The
-difference is mostly the 16 Ki-slot rings of the 35 sliding-window layers
-(1.1 GiB; llama.cpp keeps window-sized caches there) and the preallocated
-prefill workspace for 8192-token chunks.
+| Context tokens | llama.cpp tok/s | FlashRT tok/s | Speedup | Throughput increase |
+|---:|---:|---:|---:|---:|
+| 58 | 241.8 | **677.0** | **2.80×** | +180.0% |
+| 1,024 | 234.8 | **683.6** | **2.91×** | +191.1% |
+| 4,096 | 219.3 | **632.1** | **2.88×** | +188.3% |
+| 8,192 | 217.9 | **603.0** | **2.77×** | +176.8% |
+| 16,384 | 210.7 | **554.0** | **2.63×** | +163.0% |
+| 32,768 | 197.7 | **478.9** | **2.42×** | +142.3% |
+| 65,536 | 176.2 | **374.3** | **2.12×** | +112.4% |
+| 102,400 | 157.8 | **303.8** | **1.93×** | +92.5% |
 
-Served through `examples/flint_openai_server.py` and `llama-server` (official
-flags, `-np 1`), the same OpenAI streaming client for both: chat messages with
-the prompts' tool definitions, greedy, `ignore_eos`, 128 tokens, prompt caching
-off. TTFT is measured by the client (request sent to first streamed token,
-including templating and tokenization); decode is each server's own rate.
-llama-server runs with its default batch sizes (ubatch 512); the second
-llama-server column is a run with `-b 2048 -ub 2048`, the prompt-processing
-setting of the forward comparison.
+### Prefill
 
-| prompt tokens | TTFT | llama-server | `-ub 2048` | decode | llama-server |
-|---:|---:|---:|---:|---:|---:|
-| 58 | **11.9 ms** | 57.1 ms | 57.8 ms | **689 tok/s** | 226 tok/s |
-| 1,022 | **43.8 ms** | 225 ms | 183 ms | **682 tok/s** | 224 tok/s |
-| 4,089 | **135 ms** | 686 ms | 435 ms | **617 tok/s** | 218 tok/s |
-| 8,188 | **274 ms** | 1,317 ms | 793 ms | **588 tok/s** | 216 tok/s |
-| 16,371 | **646 ms** | 2,594 ms | 1,546 ms | **542 tok/s** | 209 tok/s |
-| 32,765 | **1.61 s** | 5.42 s | 3.27 s | **475 tok/s** | 195 tok/s |
-| 65,515 | **4.55 s** | 12.16 s | 7.68 s | **374 tok/s** | 174 tok/s |
-| 99,986 | **9.10 s** | 21.43 s | 14.09 s | **308 tok/s** | 156 tok/s |
+| Prompt tokens | llama.cpp ms | FlashRT ms | Speedup | Latency reduction |
+|---:|---:|---:|---:|---:|
+| 58 | 36.8 | **10.8** | **3.40×** | 70.6% |
+| 1,024 | 105.0 | **41.4** | **2.54×** | 60.6% |
+| 4,096 | 342.3 | **131.2** | **2.61×** | 61.7% |
+| 8,192 | 681.4 | **267.9** | **2.54×** | 60.7% |
+| 16,384 | 1,425.7 | **637.3** | **2.24×** | 55.3% |
+| 32,768 | 3,126.0 | **1,603.2** | **1.95×** | 48.7% |
+| 65,536 | 7,517.5 | **4,551.5** | **1.65×** | 39.5% |
+| 102,400 | 14,410.5 | **9,476.2** | **1.52×** | 34.2% |
 
-Other shapes, same setup:
-
-| scenario | FlashRT | llama-server |
-|---|---:|---:|
-| 8,192 new tokens on 91,794 tokens of existing KV (forward; llama-bench `pp8192 @ d91808`) | **1.24 s** | 1.72 s |
-| follow-up turn on an 8 K conversation, TTFT with prefix reuse / full prefill | **20 / 298 ms** | 127 / 1,357 ms |
-| two concurrent 8 K requests (batch 1, queued), TTFT first / second | **283 / 769 ms** | 1,320 / 3,214 ms |
-| 1,024-token reply to the 8 K prompt, request time | **1.99 s** | 6.03 s |
-
-In the follow-up turn FlashRT reuses the previous prompt and reply from its KV
-cache and prefills the 23 new tokens; llama-server's cache matches the first
-8,188 tokens of its rendering of the conversation and it processes the remaining
-~117, so the two reuse figures cover different amounts of work.
+Fresh native decode samples span under 0.3% at every length. The widest
+reference prefill range is 334.3–349.8 ms at 4096 tokens (median 342.3 ms).
+Earlier sessions observed two native decode levels about 3% apart at 4K/8K;
+the tables use all samples of the new matched run and do not pool older data.
 
 ## Limitations
 
@@ -279,3 +322,23 @@ cache and prefills the 23 new tokens; llama-server's cache matches the first
   to 16, attention split counts) occurs, about 1 ms once; up to 64 shapes are
   kept.
 - One cached sequence for prefix reuse.
+
+## Ownership and references
+
+- [Flint model](https://huggingface.co/RecursiveSI/flint) and
+  [official NVFP4 GGUF](https://huggingface.co/RecursiveSI/flint-nvfp4-gguf):
+  checkpoint, architecture, tokenizer and embedded chat template. The evaluated
+  GGUF revision is `6ec43e19b565fc8d560e2d04985d7724f20673bf`, SHA256
+  `97cc8009ff9b132d5cf3c488e6767962bb5a5dc158a90ed661bbbddf876b8bde`.
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) supplies the external
+  executor reference and GGUF format conventions; its
+  [Jinja fix](https://github.com/ggml-org/llama.cpp/pull/30929) is included in
+  the reference build. This module does not link or execute llama.cpp.
+- FlashRT owns `flash_rt_flint` / `flash_rt::flint` kernels and the model-local
+  launch plan. `_flint_rtx_runtime.py` in the torch frontend owns GGUF loading,
+  persistent allocations and CUDA Graph lifecycle. `pipeline_rtx.py` composes
+  already-owned raw pointers and handles. Python kernel names are private to
+  the dedicated model module; they do not modify `flash_rt_kernels`.
+- W4A16 uses the checkpoint's stored block and global scales, without
+  calibration or an on-disk repack cache. Each runtime instance owns its
+  weights and graphs; loading another checkpoint creates a new instance.
