@@ -187,3 +187,26 @@ def test_failed_calibration_cannot_reuse_a_previously_valid_graph():
         frontend.calibrate([{}], percentile=100.0)
     assert not frontend.calibrated and not frontend._calibrating
     assert not frontend._graphs
+
+
+def test_infer_passes_state_as_a_python_list():
+    """The model distribution's _prepare_model_input documents a JSON array."""
+    from PIL import Image
+
+    frontend = object.__new__(Dm05TorchFrontendRtx)
+    frontend.calibrated = True
+    frontend._calibrating = False
+    frontend._prompt = "pick up the block"
+    frontend._native = SimpleNamespace(vision=SimpleNamespace(nv=1))
+    seen = {}
+
+    def prepare_model_input(**kwargs):
+        seen["states"] = kwargs["states"]
+        raise RuntimeError("stop after state conversion")
+
+    frontend._runtime = SimpleNamespace(_prepare_model_input=prepare_model_input)
+    image = Image.new("RGB", (8, 8))
+    with pytest.raises(RuntimeError, match="stop after state conversion"):
+        frontend.infer({"images": [image], "state": np.array([0.0, 1.0], dtype=np.float32)})
+    assert isinstance(seen["states"], list)
+    assert seen["states"] == [0.0, 1.0]
