@@ -59,6 +59,11 @@ greedy decoding until an end-of-generation token. Lower-level entry points:
 
 `max_seq` sizes the full-attention KV cache and is allocated up front; the 35
 sliding-window layers use a 16 Ki-slot ring regardless of `max_seq`.
+Prefix reuse requires the entire historical sliding window at the continuation
+position to remain resident. If an earlier request has overwritten it, the
+frontend automatically recomputes the full prompt (`last_reused == 0`). Cache
+lifetime tracking includes padded prefill rows and queued decode lookahead,
+even when those tokens are discarded at an early stop.
 
 `flash_rt.load_model(config="flint")` is refused with a pointer to this class:
 the VLA-style `predict()` API does not fit a text LLM.

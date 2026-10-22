@@ -43,7 +43,7 @@ class FlintTorchFrontendRtx:
         self.eog = set(self.cfg.eog_token_ids)
         self.check_block = int(check_block)
         self._host_tokens = None
-        self._kv_ids: List[int] = []     # token ids whose KV is valid in the cache (prefix reuse)
+        self._kv_ids: List[int] = []     # logical prefix; runtime tracks which sliding KV is still resident
         self.min_reuse = 64             # shorter common prefixes are recomputed
         self.last_reused = 0
         self.rt.capture()
@@ -56,7 +56,8 @@ class FlintTorchFrontendRtx:
         back, so the GPU does not wait for the host; a stop discards at most one extra block.
 
         ``reuse_prefix``: keep the KV cache of the longest common prefix with the previous sequence (its
-        prompt and generated tokens) and prefill only the rest."""
+        prompt and generated tokens) and prefill only the rest. If the sliding-window history needed at
+        the reuse position has been overwritten, recompute the full prompt."""
         if not prompt_ids:
             raise ValueError("prompt_ids must be non-empty")
         if max_new_tokens < 1:
@@ -75,7 +76,8 @@ class FlintTorchFrontendRtx:
         start = 0
         if reuse_prefix and self._kv_ids:
             start = min(self.common_prefix(ids), n - 1)
-            if start < self.min_reuse:
+            history_start = max(0, start - self.cfg.sliding_window + 1)
+            if start < self.min_reuse or history_start < rt.swa_kv_start:
                 start = 0
         self._kv_ids = []                        # invalid until this request finishes
         rt.prefill(ids, start=start)             # writes tokens[n] (first generated token)

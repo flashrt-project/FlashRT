@@ -142,6 +142,9 @@ class FlintRuntime(FlintPipeline):
             raise ValueError(f"max_seq {max_seq} exceeds checkpoint context {self.cfg.context_length}")
         self.max_seq = int(max_seq)
         self.ring = int(sliding_ring)
+        # Oldest absolute position still resident in every sliding KV ring. Track physical writes,
+        # including padded prefill rows and decode lookahead, rather than the logical token prefix.
+        self.swa_kv_start = 0
         self.attn_splits = int(attn_splits)
         self.dev = torch.device("cuda", device)
         capability = torch.cuda.get_device_capability(self.dev)
@@ -458,10 +461,11 @@ class FlintRuntime(FlintPipeline):
 
     def run_prefill_chunk(self, m: int, pos0: int):
         """Enqueue one chunk on the current stream (graph replay unless FLINT_PF_GRAPH=0); advances ``pos`` by m."""
+        b = self._pf_rows(m, pos0) if self.pf_graph_on else m
+        self.swa_kv_start = max(self.swa_kv_start, pos0 + b - self.ring)
         if not self.pf_graph_on:
             self.launch_prefill_chunk(m, pos0)
             return
-        b = self._pf_rows(m, pos0)
         self._pf_graph(b, pos0).replay()
         if b != m:
             self.fl.advance_pos(self.pos.data_ptr(), m - b, self.stream.cuda_stream)
@@ -488,6 +492,8 @@ class FlintRuntime(FlintPipeline):
         n = len(prompt_tokens)
         if not 0 <= start < n:
             raise ValueError(f"prefill start {start} outside [0, {n})")
+        if start and max(0, start - self.cfg.sliding_window + 1) < self.swa_kv_start:
+            raise ValueError("sliding KV history was overwritten; prefill the full prompt with start=0")
         if start == 0:
             self.reset(prompt_tokens)
         else:
@@ -536,6 +542,7 @@ class FlintRuntime(FlintPipeline):
         self.n_prompt_dev.fill_(n)
         self.host_pos = 0
         torch.cuda.synchronize(self.dev)
+        self.swa_kv_start = 0
 
     def capture(self, attn_splits: Optional[int] = None, fused: Optional[bool] = None):
         """Capture the decode step into CUDA graphs (call after load).
@@ -587,6 +594,7 @@ class FlintRuntime(FlintPipeline):
         """Replay n decode steps; each step processes the token at host_pos and advances it."""
         if n < 0 or self.host_pos + n > self.max_seq:
             raise ValueError(f"decode range [{self.host_pos}, {self.host_pos + n}) exceeds max_seq {self.max_seq}")
+        self.swa_kv_start = max(self.swa_kv_start, self.host_pos + n - self.ring)
         import os
         if os.environ.get("FLINT_EAGER") == "1":     # debugging aid: launch the step without a graph
             with self.torch.cuda.stream(self.stream):

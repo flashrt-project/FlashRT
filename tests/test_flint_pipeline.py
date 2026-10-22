@@ -38,9 +38,9 @@ PROMPT = [{"role": "user", "content": "Write a Python function that returns the 
 _CHILD = r"""
 import json, os, sys
 from flash_rt.frontends.torch.flint_rtx import FlintTorchFrontendRtx
-fe = FlintTorchFrontendRtx(sys.argv[1], max_seq=2048)
-ids = fe.tokenizer.encode(fe.tokenizer.apply_chat_template(json.loads(sys.argv[2])))
 mode = sys.argv[3]
+fe = FlintTorchFrontendRtx(sys.argv[1], max_seq=32768 if mode == "reuse_long_fork" else 2048)
+ids = fe.tokenizer.encode(fe.tokenizer.apply_chat_template(json.loads(sys.argv[2])))
 if mode == "stepwise":
     rt = fe.rt
     rt.reset(ids)
@@ -61,6 +61,17 @@ elif mode == "follow_full":
     first = fe.generate(ids, max_new_tokens=64, stop_ids=[])
     follow = ids + first + fe.tokenizer.encode(" Now add memoization.")
     out = fe.generate(follow, max_new_tokens=32, stop_ids=[]) + [0]
+elif mode == "reuse_long_fork":
+    import torch
+    old = (ids * (20000 // len(ids) + 1))[:20000]
+    fe.generate(old, max_new_tokens=8, stop_ids=())
+    retained_start = fe.rt.swa_kv_start
+    follow = old[:1000] + fe.tokenizer.encode(" Instead, explain binary search.")
+    cached = [t for block in fe.stream(follow, 32, stop_ids=(), reuse_prefix=True) for t in block]
+    reused = fe.last_reused
+    logits = fe.rt.logits.clone()
+    full = fe.generate(follow, max_new_tokens=32, stop_ids=())
+    out = [retained_start > 0, reused, cached == full, torch.equal(logits, fe.rt.logits)]
 else:
     out = fe.generate(ids, max_new_tokens=48, stop_ids=[])
 print(json.dumps(out))
@@ -96,6 +107,11 @@ def test_prefix_reuse_matches_full_prefill():
     full = _generate({}, "follow_full")
     assert reuse[-1] >= 64          # the cached prompt + first reply were reused
     assert reuse[:16] == full[:16]
+
+
+@pytest.mark.parametrize("graphs", ["0", "1"])
+def test_long_request_early_fork_recomputes_evicted_history(graphs):
+    assert _generate({"FLINT_PF_GRAPH": graphs}, "reuse_long_fork") == [True, 0, True, True]
 
 
 def test_prefill_graphs_match_eager_launches():
