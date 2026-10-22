@@ -31,55 +31,59 @@ void embed_rows_bf16(const int* tokens, const int* pos, int n, const void* table
                                              static_cast<uint16_t*>(out));
 }
 
-// grid (n rows, 40 heads), 32 threads. Row r is at position *pos + r.
-__global__ void qk_norm_rope_kv_rows_kernel(const uint16_t* __restrict__ qkv, const float* __restrict__ qw,
-                                            const float* __restrict__ kw, const float* __restrict__ cos_t,
-                                            const float* __restrict__ sin_t, const int* __restrict__ pos_p,
-                                            uint16_t* __restrict__ q_out, uint16_t* __restrict__ cache, int ring,
-                                            int rope, float eps) {
-  const int r = blockIdx.x, head = blockIdx.y, lane = threadIdx.x;
+// grid (n rows), 256 threads: warp w handles heads w, w + 8, ... of the 40 (32 Q, 4 K, 4 V); each head is
+// one warp-wide pass (lane holds dims lane + 32j). Row r is at position *pos + r.
+__global__ void __launch_bounds__(256)
+qk_norm_rope_kv_rows_kernel(const uint16_t* __restrict__ qkv, const float* __restrict__ qw,
+                            const float* __restrict__ kw, const float* __restrict__ cos_t,
+                            const float* __restrict__ sin_t, const int* __restrict__ pos_p,
+                            uint16_t* __restrict__ q_out, uint16_t* __restrict__ cache, int ring, int rope,
+                            float eps) {
+  const int r = blockIdx.x, lane = threadIdx.x & 31;
   const int pos = *pos_p + r;
   const int slot = ring > 0 ? (pos & (ring - 1)) : pos;
   const uint16_t* row = qkv + static_cast<size_t>(r) * (kQHeads + 2 * kKVHeads) * kHeadDim;
-  const uint16_t* src;
-  uint16_t* dst;
-  const float* w = nullptr;
-  if (head < kQHeads) {
-    src = row + head * kHeadDim; dst = q_out + (static_cast<size_t>(r) * kQHeads + head) * kHeadDim; w = qw;
-  } else if (head < kQHeads + kKVHeads) {
-    const int h = head - kQHeads;
-    src = row + (kQHeads + h) * kHeadDim; dst = cache + static_cast<size_t>(slot) * 1024 + h * kHeadDim; w = kw;
-  } else {
-    const int h = head - kQHeads - kKVHeads;
-    src = row + (kQHeads + kKVHeads + h) * kHeadDim; dst = cache + static_cast<size_t>(slot) * 1024 + 512 + h * kHeadDim;
-  }
-  float v[4] = {bf16_to_f32(src[lane]), bf16_to_f32(src[lane + 32]), bf16_to_f32(src[lane + 64]),
-                bf16_to_f32(src[lane + 96])};
-  if (w != nullptr) {
-    float ss = warp_sum(v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3]);
-    const float rs = rsqrtf(ss / kHeadDim + eps);
+  for (int head = threadIdx.x >> 5; head < kQHeads + 2 * kKVHeads; head += 8) {
+    const uint16_t* src;
+    uint16_t* dst;
+    const float* w = nullptr;
+    if (head < kQHeads) {
+      src = row + head * kHeadDim; dst = q_out + (static_cast<size_t>(r) * kQHeads + head) * kHeadDim; w = qw;
+    } else if (head < kQHeads + kKVHeads) {
+      const int h = head - kQHeads;
+      src = row + (kQHeads + h) * kHeadDim; dst = cache + static_cast<size_t>(slot) * 1024 + h * kHeadDim; w = kw;
+    } else {
+      const int h = head - kQHeads - kKVHeads;
+      src = row + (kQHeads + kKVHeads + h) * kHeadDim; dst = cache + static_cast<size_t>(slot) * 1024 + 512 + h * kHeadDim;
+    }
+    float v[4] = {bf16_to_f32(src[lane]), bf16_to_f32(src[lane + 32]), bf16_to_f32(src[lane + 64]),
+                  bf16_to_f32(src[lane + 96])};
+    if (w != nullptr) {
+      float ss = warp_sum(v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3]);
+      const float rs = rsqrtf(ss / kHeadDim + eps);
 #pragma unroll
-    for (int j = 0; j < 4; ++j) v[j] = round_bf16(v[j] * rs * w[lane + 32 * j]);
-    if (rope) {
-      const float* ct = cos_t + static_cast<size_t>(pos) * 64;
-      const float* st = sin_t + static_cast<size_t>(pos) * 64;
+      for (int j = 0; j < 4; ++j) v[j] = round_bf16(v[j] * rs * w[lane + 32 * j]);
+      if (rope) {
+        const float* ct = cos_t + static_cast<size_t>(pos) * 64;
+        const float* st = sin_t + static_cast<size_t>(pos) * 64;
 #pragma unroll
-      for (int j = 0; j < 2; ++j) {
-        const int d = lane + 32 * j;
-        const float c = ct[d], sn = st[d], n1 = v[j], n2 = v[j + 2];
-        v[j] = fmaf(n1, c, -(n2 * sn));
-        v[j + 2] = fmaf(n2, c, n1 * sn);
+        for (int j = 0; j < 2; ++j) {
+          const int d = lane + 32 * j;
+          const float c = ct[d], sn = st[d], n1 = v[j], n2 = v[j + 2];
+          v[j] = fmaf(n1, c, -(n2 * sn));
+          v[j + 2] = fmaf(n2, c, n1 * sn);
+        }
       }
     }
-  }
 #pragma unroll
-  for (int j = 0; j < 4; ++j) dst[lane + 32 * j] = f32_to_bf16_bits(v[j]);
+    for (int j = 0; j < 4; ++j) dst[lane + 32 * j] = f32_to_bf16_bits(v[j]);
+  }
 }
 
 void qk_norm_rope_kv_rows_bf16(const void* qkv, int n, const float* qw, const float* kw, const float* cos_t,
                                const float* sin_t, const int* pos, void* q_out, void* cache, int ring, int rope,
                                float eps, cudaStream_t s) {
-  qk_norm_rope_kv_rows_kernel<<<dim3(n, kQHeads + 2 * kKVHeads), 32, 0, s>>>(
+  qk_norm_rope_kv_rows_kernel<<<n, 256, 0, s>>>(
       static_cast<const uint16_t*>(qkv), qw, kw, cos_t, sin_t, pos, static_cast<uint16_t*>(q_out),
       static_cast<uint16_t*>(cache), ring, rope, eps);
 }
