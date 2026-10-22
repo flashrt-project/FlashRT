@@ -188,23 +188,25 @@ with the reference build.
 
 | context | prefill | llama.cpp | | decode | llama.cpp | |
 |---:|---:|---:|---:|---:|---:|---:|
-| 58 | **11.9 ms** | | | **659 tok/s** | 245.5 | 2.7x |
-| 1 K | **42.2 ms** | 102.8 ms | 2.4x | **661 tok/s** | 238.5 | 2.8x |
-| 4 K | **133 ms** | 341 ms | 2.6x | **601 tok/s** | 228.4 | 2.6x |
-| 8 K | **272 ms** | 690 ms | 2.5x | **587 tok/s** | 226.8 | 2.6x |
-| 16 K | **647 ms** | 1445 ms | 2.2x | **538 tok/s** | 218.5 | 2.5x |
-| 32 K | **1.62 s** | 3.18 s | 2.0x | **461 tok/s** | 205.1 | 2.2x |
-| 64 K | **4.58 s** | 7.59 s | 1.7x | **361 tok/s** | 182.3 | 2.0x |
-| 100 K | **9.17 s** | 14.04 s | 1.5x | **298 tok/s** | 162.7 | 1.8x |
+| 58 | **11.6 ms** | | | **684 tok/s** | 245.5 | 2.8x |
+| 1 K | **42.0 ms** | 102.8 ms | 2.4x | **683 tok/s** | 238.5 | 2.9x |
+| 4 K | **133 ms** | 341 ms | 2.6x | **634 tok/s** | 228.4 | 2.8x |
+| 8 K | **272 ms** | 690 ms | 2.5x | **603 tok/s** | 226.8 | 2.7x |
+| 16 K | **647 ms** | 1445 ms | 2.2x | **555 tok/s** | 218.5 | 2.5x |
+| 32 K | **1.62 s** | 3.18 s | 2.0x | **479 tok/s** | 205.1 | 2.3x |
+| 64 K | **4.58 s** | 7.59 s | 1.7x | **374 tok/s** | 182.3 | 2.1x |
+| 100 K | **9.17 s** | 14.04 s | 1.5x | **308 tok/s** | 162.7 | 1.9x |
 
 Decode at a given depth varies by up to ~2% between processes with identical
-output tokens (8 K settles at either 1.705 or 1.75 ms per token); the table is
-the interleaved median. Where the time goes:
+output tokens (8 K has been seen to settle at two levels ~2.5% apart); the table
+is the interleaved median. Where the time goes:
 
 - decode at short context is the per-layer dependency chain (QKV, attention,
   o_proj, router, gate/up, down) with each kernel's weight loads issued before
-  its programmatic-dependent-launch wait; at 100 K the 14 full-attention layers
-  take 54% of the step (131 us per layer);
+  its programmatic-dependent-launch wait (a dependent-launch boundary costs about
+  0.8 us on this card, less than an in-kernel grid barrier, so a persistent
+  kernel would not help); at 100 K the 14 full-attention layers take more than
+  half of the step (131 us per layer, ~93% of the measured streaming peak);
 - prefill GEMMs run at 190-215 TFLOPS on large chunks (the bf16 `mma.sync`
   peak measured on this card is 259 TFLOPS); attention at ~190 TFLOPS, which is
   71% of a 100 K prefill; a short prompt is bound by streaming the routed
@@ -225,23 +227,23 @@ including templating and tokenization); decode is each server's own rate.
 
 | prompt tokens | TTFT | llama-server | decode | llama-server |
 |---:|---:|---:|---:|---:|
-| 58 | **13.1 ms** | 57.6 ms | **665 tok/s** | 226 tok/s |
-| 1,022 | **44.1 ms** | 227 ms | **662 tok/s** | 216 tok/s |
-| 4,089 | **136 ms** | 686 ms | **602 tok/s** | 211 tok/s |
-| 8,188 | **278 ms** | 1,319 ms | **573 tok/s** | 216 tok/s |
-| 16,371 | **657 ms** | 2,596 ms | **525 tok/s** | 210 tok/s |
-| 32,765 | **1.64 s** | 5.43 s | **461 tok/s** | 197 tok/s |
-| 65,515 | **4.59 s** | 12.19 s | **361 tok/s** | 174 tok/s |
-| 99,986 | **9.18 s** | 21.49 s | **297 tok/s** | 156 tok/s |
+| 58 | **13.2 ms** | 57.6 ms | **685 tok/s** | 232 tok/s |
+| 1,022 | **44.3 ms** | 227 ms | **682 tok/s** | 219 tok/s |
+| 4,089 | **136 ms** | 688 ms | **617 tok/s** | 215 tok/s |
+| 8,188 | **278 ms** | 1,316 ms | **605 tok/s** | 214 tok/s |
+| 16,371 | **657 ms** | 2,596 ms | **549 tok/s** | 207 tok/s |
+| 32,765 | **1.64 s** | 5.43 s | **470 tok/s** | 196 tok/s |
+| 65,515 | **4.59 s** | 12.19 s | **374 tok/s** | 172 tok/s |
+| 99,986 | **9.18 s** | 21.50 s | **308 tok/s** | 156 tok/s |
 
 Other shapes, same setup:
 
 | scenario | FlashRT | llama-server |
 |---|---:|---:|
 | 8,192 new tokens on 91,794 tokens of existing KV (forward; llama-bench `pp8192 @ d91808`) | **1.25 s** | 1.72 s |
-| follow-up turn on an 8 K conversation, TTFT with prefix reuse / full prefill | **21.5 / 306 ms** | 129 / 1,358 ms |
-| two concurrent 8 K requests (batch 1, queued), TTFT first / second | **285 / 780 ms** | 1,323 / 3,218 ms |
-| 1,024-token reply to the 8 K prompt, request time | **2.08 s** | 6.05 s |
+| follow-up turn on an 8 K conversation, TTFT with prefix reuse / full prefill | **20 / 305 ms** | 128 / 1,358 ms |
+| two concurrent 8 K requests (batch 1, queued), TTFT first / second | **289 / 781 ms** | 1,324 / 3,218 ms |
+| 1,024-token reply to the 8 K prompt, request time | **2.01 s** | 6.06 s |
 
 ## Limitations
 
