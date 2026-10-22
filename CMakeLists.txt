@@ -1548,6 +1548,7 @@ if(FLASHRT_ENABLE_FLINT)
     csrc/flint_bindings.cpp
     csrc/kernels/flint/flint_repack.cu
     csrc/kernels/flint/flint_decode.cu
+    csrc/kernels/flint/flint_decode_fused.cu
     csrc/kernels/flint/flint_attention.cu
     csrc/kernels/flint/flint_gemm.cu
     csrc/kernels/flint/flint_prefill.cu)

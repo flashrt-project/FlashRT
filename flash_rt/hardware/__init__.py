@@ -124,6 +124,9 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     # -- the kernels build into a separate module gated on GPU_ARCH 120.
     ("spark_x25", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.spark_x25_rtx", "SparkX25TorchFrontendRtx"),
+    # Flint (RecursiveSI/flint) official NVFP4 GGUF: text LLM, constructed directly (see flash_rt/api.py).
+    ("flint", "torch", "rtx_sm120"):
+        ("flash_rt.frontends.torch.flint_rtx", "FlintTorchFrontendRtx"),
 
     # DM05 uses its own Gemma3 prefix and action expert; it is not a Pi0.5 checkpoint.
     ("dm05", "torch", "rtx_sm120"):

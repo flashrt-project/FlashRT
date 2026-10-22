@@ -217,6 +217,283 @@ void decode_attention_bf16(const void* q, const void* cache, const int* pos, int
 
 
 // ===========================================================================
+// Fused decode attention (PDL): Q/K RMSNorm + RoPE + current-token KV write +
+// split-KV attention with sinks. grid (n_split, 4), WARPS warps per CTA.
+//  * n_split == 1: the CTA merges its warps and writes the output directly.
+//  * n_split  > 1: partials go to global memory; the last CTA of each KV head
+//    (self-resetting counter) merges them, so the kernel is graph-replay safe.
+// Before pdl_wait the kernel reads the position (final for the whole step: the
+// step's first kernel starts only after the previous argmax completed) and
+// prefetches its first K/V tile when that tile lies entirely before the current
+// token (older tokens are immutable); the token's own K/V row is written by the
+// split that owns it, after the wait.
+// ===========================================================================
+template <int WARPS>
+__global__ void __launch_bounds__(WARPS * 32)
+decode_attn_fused_kernel(const uint16_t* __restrict__ qkv, const float* __restrict__ qw, const float* __restrict__ kw,
+                         const float* __restrict__ cos_t, const float* __restrict__ sin_t, const int* __restrict__ pos_p,
+                         uint16_t* __restrict__ cache, int ring, int window, int rope, float eps,
+                         const float* __restrict__ sinks, float scale, float* __restrict__ o_part,
+                         float* __restrict__ ml_part, unsigned* __restrict__ counters, uint16_t* __restrict__ out) {
+  constexpr int NT = WARPS * 32;
+  constexpr int DPT = (kGroup * kD) / NT;          // output dims per thread in the merges
+  constexpr int TPH = kD / DPT;                    // threads per head
+  const int split = blockIdx.x, n_split = gridDim.x, kvh = blockIdx.y;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int g = lane >> 2, t = lane & 3;
+  extern __shared__ __align__(16) uint8_t dsm[];
+  uint16_t (*qs)[kD] = reinterpret_cast<uint16_t (*)[kD]>(dsm);                      // [8][128] bf16
+  float (*sm_o)[kGroup][kD] = reinterpret_cast<float (*)[kGroup][kD]>(dsm + kGroup * kD * 2);  // [WARPS][8][128]
+  float (*sm_m)[kGroup] = reinterpret_cast<float (*)[kGroup]>(dsm + kGroup * kD * 2 + WARPS * kGroup * kD * 4);
+  float (*sm_l)[kGroup] = sm_m + WARPS;
+
+  float qwv[4], kwv[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) { qwv[j] = qw[lane + 32 * j]; kwv[j] = kw[lane + 32 * j]; }
+  const int pos = __ldcg(pos_p);
+  const int kstart = window > 0 ? max(0, pos - window + 1) : 0;
+  const int klen = pos + 1 - kstart;
+  const int per = (((klen + n_split - 1) / n_split) + 15) & ~15;
+  const int b0 = kstart + split * per;
+  const int b1 = min(b0 + per, pos + 1);
+  const float c = scale * kLog2e;
+  const int kv_off_k = kvh * kD, kv_off_v = 512 + kvh * kD;
+
+  uint32_t kr[2][16], vr[4][8];
+  auto load_tile = [&](int tile) {
+#pragma unroll
+    for (int nt = 0; nt < 2; ++nt) {
+      const int p = tile + nt * 8 + g;
+      if (p < b1) {
+        const int slot = ring > 0 ? (p & (ring - 1)) : p;
+        const uint4* kp = reinterpret_cast<const uint4*>(cache + static_cast<size_t>(slot) * kSlotElems + kv_off_k + 32 * t);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const uint4 v = kp[i];
+          kr[nt][4 * i] = v.x; kr[nt][4 * i + 1] = v.y; kr[nt][4 * i + 2] = v.z; kr[nt][4 * i + 3] = v.w;
+        }
+      } else {
+#pragma unroll
+        for (int i = 0; i < 16; ++i) kr[nt][i] = 0u;
+      }
+    }
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      const int p = tile + (r >> 1) * 8 + 2 * t + (r & 1);
+      if (p < b1) {
+        const int slot = ring > 0 ? (p & (ring - 1)) : p;
+        const uint4* vp = reinterpret_cast<const uint4*>(cache + static_cast<size_t>(slot) * kSlotElems + kv_off_v + 16 * g);
+        const uint4 v0 = vp[0], v1 = vp[1];
+        vr[r][0] = v0.x; vr[r][1] = v0.y; vr[r][2] = v0.z; vr[r][3] = v0.w;
+        vr[r][4] = v1.x; vr[r][5] = v1.y; vr[r][6] = v1.z; vr[r][7] = v1.w;
+      } else {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) vr[r][i] = 0u;
+      }
+    }
+  };
+  const int tile0 = b0 + warp * 16;
+  bool have = false;
+  if (tile0 < b1 && tile0 + 16 <= pos) { load_tile(tile0); have = true; }
+
+  pdl_wait();
+
+  auto norm_rope = [&](const uint16_t* src, const float (&w)[4], float (&v)[4]) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) v[j] = bf16_to_f32(src[lane + 32 * j]);
+    const float ss = warp_sum(v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3]);
+    const float rs = rsqrtf(ss / kD + eps);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) v[j] = round_bf16(v[j] * rs * w[j]);
+    if (rope) {
+      const float* ct = cos_t + static_cast<size_t>(pos) * 64;
+      const float* st = sin_t + static_cast<size_t>(pos) * 64;
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        const int d = lane + 32 * j;
+        const float cs = ct[d], sn = st[d], n1 = v[j], n2 = v[j + 2];
+        v[j] = fmaf(n1, cs, -(n2 * sn));
+        v[j + 2] = fmaf(n2, cs, n1 * sn);
+      }
+    }
+  };
+  for (int h = warp; h < kGroup; h += WARPS) {
+    float v[4];
+    norm_rope(qkv + (kvh * kGroup + h) * kD, qwv, v);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) qs[h][lane + 32 * j] = f32_to_bf16_bits(v[j]);
+  }
+  if (b0 <= pos && pos < b1 && warp >= WARPS - 2) {   // last two warps: often idle in the tile loop
+    const int kvsel = warp - (WARPS - 2);            // 0 = K, 1 = V
+    const int slot = ring > 0 ? (pos & (ring - 1)) : pos;
+    uint16_t* dst = cache + static_cast<size_t>(slot) * kSlotElems + kvsel * 512 + kvh * kD;
+    const uint16_t* src = qkv + (32 + kvsel * 4 + kvh) * kD;
+    if (kvsel == 0) {
+      float v[4];
+      norm_rope(src, kwv, v);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) dst[lane + 32 * j] = f32_to_bf16_bits(v[j]);
+    } else {
+#pragma unroll
+      for (int j = 0; j < 4; ++j) dst[lane + 32 * j] = src[lane + 32 * j];
+    }
+  }
+  __syncthreads();
+
+  uint32_t qa[8][2];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    qa[j][0] = *reinterpret_cast<const uint32_t*>(&qs[g][32 * t + 4 * j]);
+    qa[j][1] = *reinterpret_cast<const uint32_t*>(&qs[g][32 * t + 4 * j + 2]);
+  }
+  float o[16][4];
+#pragma unroll
+  for (int i = 0; i < 16; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
+  float m = -FLT_MAX, l = 0.f;
+  for (int tile = tile0; tile < b1; tile += 16 * WARPS) {
+    if (!have) load_tile(tile);
+    have = false;
+    float s[2][4];
+#pragma unroll
+    for (int nt = 0; nt < 2; ++nt) {
+      s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.f;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) mma_bf16_16816(s[nt], qa[j][0], 0u, qa[j][1], 0u, kr[nt][2 * j], kr[nt][2 * j + 1]);
+    }
+    float sc[4] = {s[0][0], s[0][1], s[1][0], s[1][1]};
+    const int tok[4] = {tile + 2 * t, tile + 2 * t + 1, tile + 8 + 2 * t, tile + 9 + 2 * t};
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      if (tok[i] >= b1) sc[i] = -FLT_MAX;
+    float tmax = fmaxf(fmaxf(sc[0], sc[1]), fmaxf(sc[2], sc[3]));
+    tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, 1));
+    tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, 2));
+    const float m_new = fmaxf(m, tmax);
+    const float alpha = exp2f((m - m_new) * c);
+    float pr[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) pr[i] = (tok[i] < b1) ? exp2f((sc[i] - m_new) * c) : 0.f;
+    l = l * alpha + (pr[0] + pr[1] + pr[2] + pr[3]);
+    m = m_new;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) { o[i][0] *= alpha; o[i][1] *= alpha; }
+    const uint32_t pa0 = pack_bf16x2(pr[0], pr[1]);
+    const uint32_t pa2 = pack_bf16x2(pr[2], pr[3]);
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      const uint32_t bb0 = pick_bf16(vr[0], i) | (pick_bf16(vr[1], i) << 16);
+      const uint32_t bb1 = pick_bf16(vr[2], i) | (pick_bf16(vr[3], i) << 16);
+      mma_bf16_16816(o[i], pa0, 0u, pa2, 0u, bb0, bb1);
+    }
+  }
+  l += __shfl_xor_sync(0xffffffffu, l, 1);
+  l += __shfl_xor_sync(0xffffffffu, l, 2);
+  if (t == 0) { sm_m[warp][g] = m; sm_l[warp][g] = l; }
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    sm_o[warp][g][32 * t + i] = o[i][0];
+    sm_o[warp][g][32 * t + 16 + i] = o[i][1];
+  }
+  __syncthreads();
+  const int hh = threadIdx.x / TPH, d0 = (threadIdx.x % TPH) * DPT;
+  const int head = kvh * kGroup + hh;
+  float mm = -FLT_MAX;
+#pragma unroll
+  for (int w = 0; w < WARPS; ++w) mm = fmaxf(mm, sm_m[w][hh]);
+  float ll = 0.f, acc[DPT];
+#pragma unroll
+  for (int i = 0; i < DPT; ++i) acc[i] = 0.f;
+#pragma unroll
+  for (int w = 0; w < WARPS; ++w) {
+    const float f = (sm_m[w][hh] == -FLT_MAX) ? 0.f : exp2f((sm_m[w][hh] - mm) * c);
+    ll += sm_l[w][hh] * f;
+#pragma unroll
+    for (int i = 0; i < DPT; ++i) acc[i] += sm_o[w][hh][d0 + i] * f;
+  }
+  const float sk = sinks[head] * kLog2e;
+  if (n_split == 1) {
+    // single split: fold the sink and normalize here
+    const float m2 = (mm == -FLT_MAX) ? sk : fmaxf(mm * c, sk);
+    const float fo = (mm == -FLT_MAX) ? 0.f : exp2f(mm * c - m2);
+    const float inv = 1.f / (ll * fo + exp2f(sk - m2));
+#pragma unroll
+    for (int i = 0; i < DPT; i += 2)
+      *reinterpret_cast<uint32_t*>(out + head * kD + d0 + i) = pack_bf16x2(acc[i] * fo * inv, acc[i + 1] * fo * inv);
+    pdl_launch();
+    return;
+  }
+  {
+    float* op = o_part + (static_cast<size_t>(split) * 32 + head) * kD + d0;
+#pragma unroll
+    for (int i = 0; i < DPT; ++i) op[i] = acc[i];
+    if ((threadIdx.x % TPH) == 0) {
+      ml_part[(split * 32 + head) * 2] = (mm == -FLT_MAX) ? -FLT_MAX : mm * c;
+      ml_part[(split * 32 + head) * 2 + 1] = ll;
+    }
+  }
+  __threadfence();
+  __syncthreads();
+  pdl_launch();
+  __shared__ bool last;
+  if (threadIdx.x == 0) last = (atomicAdd(&counters[kvh], 1u) == static_cast<unsigned>(n_split - 1));
+  __syncthreads();
+  if (!last) return;
+  __threadfence();
+  float M = sk;
+  for (int sp = 0; sp < n_split; ++sp) M = fmaxf(M, __ldcg(ml_part + (sp * 32 + head) * 2));
+  float den = exp2f(sk - M), num[DPT];
+#pragma unroll
+  for (int i = 0; i < DPT; ++i) num[i] = 0.f;
+  for (int sp = 0; sp < n_split; ++sp) {
+    const float ms = __ldcg(ml_part + (sp * 32 + head) * 2);
+    if (ms == -FLT_MAX) continue;
+    const float f = exp2f(ms - M);
+    den += __ldcg(ml_part + (sp * 32 + head) * 2 + 1) * f;
+    const float* op = o_part + (static_cast<size_t>(sp) * 32 + head) * kD + d0;
+#pragma unroll
+    for (int i = 0; i < DPT; ++i) num[i] += __ldcg(op + i) * f;
+  }
+  const float inv = 1.f / den;
+#pragma unroll
+  for (int i = 0; i < DPT; i += 2)
+    *reinterpret_cast<uint32_t*>(out + head * kD + d0 + i) = pack_bf16x2(num[i] * inv, num[i + 1] * inv);
+  if (threadIdx.x == 0) counters[kvh] = 0u;
+}
+
+template <int WARPS>
+static void launch_attn_fused(const void* qkv, const float* qw, const float* kw, const float* cos_t, const float* sin_t,
+                              const int* pos, void* cache, int ring, int window, int rope, float eps, const float* sinks,
+                              float scale, int n_split, float* o_part, float* ml_part, unsigned* counters, void* out,
+                              cudaStream_t s) {
+  constexpr size_t smem = kGroup * kD * 2 + WARPS * kGroup * kD * 4 + 2 * WARPS * kGroup * 4;
+  static bool init = false;
+  if (!init) {
+    cudaFuncSetAttribute(decode_attn_fused_kernel<WARPS>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
+    init = true;
+  }
+  launch_pdl(decode_attn_fused_kernel<WARPS>, dim3(n_split, 4), dim3(WARPS * 32), smem, s,
+             static_cast<const uint16_t*>(qkv), qw, kw, cos_t, sin_t, pos, static_cast<uint16_t*>(cache), ring, window,
+             rope, eps, sinks, scale, o_part, ml_part, counters, static_cast<uint16_t*>(out));
+}
+
+int decode_attention_fused_bf16(const void* qkv, const float* q_norm_w, const float* k_norm_w, const float* cos_t,
+                                const float* sin_t, const int* pos, void* cache, int ring, int window, int rope,
+                                float eps, const float* sinks, float scale, int n_split, int warps, float* o_part,
+                                float* ml_part, unsigned* counters, void* out, cudaStream_t s) {
+#define FLINT_ATTN_W(W)                                                                                              \
+  if (warps == W) {                                                                                                  \
+    launch_attn_fused<W>(qkv, q_norm_w, k_norm_w, cos_t, sin_t, pos, cache, ring, window, rope, eps, sinks, scale,  \
+                         n_split, o_part, ml_part, counters, out, s);                                                \
+    return 0;                                                                                                        \
+  }
+  FLINT_ATTN_W(4)
+  FLINT_ATTN_W(8)
+  FLINT_ATTN_W(16)
+#undef FLINT_ATTN_W
+  return 1;
+}
+
+// ===========================================================================
 // Prefill attention (many query tokens), FlashAttention-2 style with GQA packing.
 // grid (ceil(n/16), 4 kv heads), 256 threads: warp w handles q head kvh*8 + w for the
 // CTA's 16 query tokens; all 8 warps share each K/V tile staged in shared memory.

@@ -464,3 +464,87 @@ def test_moe_combine_rows():
     routed = (yy * tw.double().cpu()[:, :, None]).sum(1)
     want = bf16(bf16(routed).double() + sh.double().cpu())
     close_bf16(out, want, "combine", rel=2.0 ** -7, abs_frac=0)
+
+
+# ---------------------------------------------------------------------------
+# Fused decode step kernels vs the unfused composition
+# ---------------------------------------------------------------------------
+def _frac_equal(a, b):
+    return (a == b).float().mean().item()
+
+
+def test_gemv2_fused_norm_matches_unfused():
+    torch.manual_seed(7)
+    N, K = 5120, 2048
+    codes, scales = repack_dev(rand_blocks(N, K, 60))
+    x = bf16(torch.randn(K, device=DEV) * 2)
+    res = bf16(torch.randn(K, device=DEV) * 8)
+    w = torch.rand(K, device=DEV) + 0.5
+    res_a = res.clone(); xn = torch.empty_like(x); out_a = torch.empty(N, dtype=torch.bfloat16, device=DEV)
+    fl.add_rmsnorm_bf16(x.data_ptr(), res_a.data_ptr(), w.data_ptr(), xn.data_ptr(), 1, EPS, 0, _stream())
+    fl.gemv_w4a16(codes.data_ptr(), scales.data_ptr(), xn.data_ptr(), out_a.data_ptr(), N, K, 0.002, 0, _stream())
+    res_out = torch.zeros_like(x); out_b = torch.empty_like(out_a)
+    fl.gemv2_w4a16(codes.data_ptr(), scales.data_ptr(), x.data_ptr(), res.data_ptr(), res_out.data_ptr(), w.data_ptr(),
+                   0, EPS, out_b.data_ptr(), N, K, 0.002, 0, _stream())
+    assert torch.equal(res_out, res_a)
+    assert _frac_equal(out_a, out_b) > 0.99
+    close_bf16(out_b, out_a.double(), "gemv2 norm", rel=2.0 ** -7)
+
+
+def test_router_norm_matches_unfused():
+    torch.manual_seed(8)
+    x = bf16(torch.randn(2048, device=DEV)); res = bf16(torch.randn(2048, device=DEV) * 4)
+    w = torch.rand(2048, device=DEV) + 0.5
+    wr = bf16(torch.randn(256, 2048, device=DEV) * 0.02)
+    lg = torch.empty(256, device=DEV); ctr = torch.zeros(1, dtype=torch.int32, device=DEV)
+    ids_a = torch.empty(6, dtype=torch.int32, device=DEV); tw_a = torch.empty(6, device=DEV)
+    res_a = res.clone(); xn_a = torch.empty_like(x)
+    fl.add_rmsnorm_bf16(x.data_ptr(), res_a.data_ptr(), w.data_ptr(), xn_a.data_ptr(), 1, EPS, 0, _stream())
+    fl.router_topk_bf16(xn_a.data_ptr(), wr.data_ptr(), lg.data_ptr(), ctr.data_ptr(), ids_a.data_ptr(), tw_a.data_ptr(),
+                        _stream())
+    ids_b = torch.empty_like(ids_a); tw_b = torch.empty_like(tw_a); res_b = torch.zeros_like(x); xn_b = torch.empty_like(x)
+    for _ in range(2):
+        fl.router_norm_bf16(x.data_ptr(), res.data_ptr(), w.data_ptr(), EPS, res_b.data_ptr(), xn_b.data_ptr(),
+                            wr.data_ptr(), lg.data_ptr(), ctr.data_ptr(), ids_b.data_ptr(), tw_b.data_ptr(), _stream())
+    assert torch.equal(res_b, res_a) and torch.equal(xn_b, xn_a)
+    assert torch.equal(ids_b, ids_a) and torch.equal(tw_b, tw_a) and ctr.item() == 0
+
+
+@pytest.mark.parametrize("pos,ring,window,rope,n_split,warps", [
+    (0, 0, 0, 0, 4, 4), (777, 0, 0, 0, 16, 4), (5000, 1024, 513, 1, 4, 4), (300, 1024, 513, 1, 4, 8),
+    (20000, 0, 0, 0, 64, 4), (5000, 1024, 513, 1, 1, 16), (1500, 0, 0, 0, 1, 8), (9000, 0, 0, 0, 24, 8),
+    (3, 0, 0, 0, 1, 4)])
+def test_decode_attention_fused_matches_unfused(pos, ring, window, rope, n_split, warps):
+    torch.manual_seed(pos + 1)
+    slots = ring if ring else pos + 1
+    cache0 = bf16(torch.randn(slots, 1024, device=DEV))
+    qkv = bf16(torch.randn(5120, device=DEV) * 3)
+    qw = torch.rand(128, device=DEV) + 0.5; kw = torch.rand(128, device=DEV) + 0.5
+    cos_t, sin_t = rope_tables(max(pos + 1, 16))
+    sinks = torch.randn(32, device=DEV) * 2
+    p = torch.tensor([pos], dtype=torch.int32, device=DEV)
+    o_part = torch.empty(n_split, 32, 128, device=DEV); ml = torch.empty(n_split, 32, 2, device=DEV)
+    # unfused
+    cache_a = cache0.clone(); q = torch.empty(4096, dtype=torch.bfloat16, device=DEV)
+    fl.qk_norm_rope_kv_bf16(qkv.data_ptr(), qw.data_ptr(), kw.data_ptr(), cos_t.data_ptr(), sin_t.data_ptr(),
+                            p.data_ptr(), q.data_ptr(), cache_a.data_ptr(), ring, rope, EPS, _stream())
+    out_a = torch.empty(32, 128, dtype=torch.bfloat16, device=DEV)
+    fl.decode_attention_bf16(q.data_ptr(), cache_a.data_ptr(), p.data_ptr(), ring, window, sinks.data_ptr(),
+                             1 / math.sqrt(128), n_split, o_part.data_ptr(), ml.data_ptr(), out_a.data_ptr(), _stream())
+    # fused (run twice: counters must self-reset)
+    cache_b = cache0.clone(); out_b = torch.empty_like(out_a)
+    ctr = torch.zeros(4, dtype=torch.int32, device=DEV)
+    for _ in range(2):
+        fl.decode_attention_fused_bf16(qkv.data_ptr(), qw.data_ptr(), kw.data_ptr(), cos_t.data_ptr(), sin_t.data_ptr(),
+                                       p.data_ptr(), cache_b.data_ptr(), ring, window, rope, EPS, sinks.data_ptr(),
+                                       1 / math.sqrt(128), n_split, o_part.data_ptr(), ml.data_ptr(), ctr.data_ptr(),
+                                       out_b.data_ptr(), _stream(), warps)
+    assert torch.equal(cache_b, cache_a)
+    assert torch.count_nonzero(ctr).item() == 0
+    # P is rounded to bf16 relative to each warp's running max, so a different warp/split layout
+    # legitimately changes last bits; bit-equality is only expected for the same layout.
+    if warps == 4:
+        assert _frac_equal(out_a, out_b) > 0.99, _frac_equal(out_a, out_b)
+    close_bf16(out_b, out_a.double(), "fused attn", rel=2.0 ** -7)
+    ref = attn_ref(q.view(32, 128), cache_a, pos, ring, window, sinks.cpu())
+    assert ((out_b.double().cpu() - ref).abs().max() / ref.abs().max()).item() < 8e-3

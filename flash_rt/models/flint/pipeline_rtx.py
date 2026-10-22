@@ -271,6 +271,15 @@ class FlintRuntime:
         self.tokens = torch.zeros(self.max_seq + 1, dtype=i32, device=self.dev)
         self.pos = torch.zeros(1, dtype=i32, device=self.dev)
         self.n_prompt_dev = torch.zeros(1, dtype=i32, device=self.dev)
+        # Fused decode step: ping-pong residual, branch outputs, attention counters.
+        self.res2 = torch.zeros((2, H), dtype=bf, device=self.dev)
+        self.x_attn = torch.zeros(H, dtype=bf, device=self.dev)
+        self.attn_counters = torch.zeros(cfg.num_kv_heads, dtype=i32, device=self.dev)
+        # Decode attention launch configs (measured split/warp search on SM120, HBM-bound KV):
+        # sliding layers (513 keys): 8 splits x 8 warps; global layers by position bucket.
+        self.swa_attn = (8, 8)
+        self.full_attn_warps = 8
+        self.attn_buckets = ((512, 1, 4), (12288, 8, 8), (1 << 30, 16, 8))   # (pos upper bound, splits, warps)
         # Prefill (chunk of up to prefill_chunk tokens).
         C, T = self.prefill_chunk, cfg.num_experts_per_tok
         self.pf_x = torch.zeros((C, H), dtype=bf, device=self.dev)
@@ -449,7 +458,68 @@ class FlintRuntime:
                     self.stream.synchronize()
                     logits_cb(c0, m, buf[:m])
             self.launch_prefill_logits(m)
+        self.host_pos = n
         return n
+
+    def launch_step_fused(self, attn_splits: Optional[int] = None, attn_warps: Optional[int] = None):
+        """Fused decode step (6 kernels per MoE layer, PDL). Same contract as ``launch_step``."""
+        fl, cfg, s = self.fl, self.cfg, self.stream.cuda_stream
+        eps = cfg.rms_norm_eps
+        splits = attn_splits or self.attn_splits
+        full_warps = attn_warps or self.full_attn_warps
+        scale = 1.0 / math.sqrt(cfg.head_dim)
+        H = cfg.hidden_size
+        res = [self.res2[0].data_ptr(), self.res2[1].data_ptr()]
+        site = 0   # norm site k reads res[k & 1], block 0 writes res[(k + 1) & 1]
+        fl.embed2_bf16(self.tokens.data_ptr(), self.pos.data_ptr(), self.embed.data_ptr(), self.x.data_ptr(), s)
+        for il, L in enumerate(self.layers):
+            q = L.qkv
+            fl.gemv2_w4a16(q.codes.data_ptr(), q.scales.data_ptr(), self.x.data_ptr(), res[site & 1],
+                           res[(site + 1) & 1], L.attn_norm.data_ptr(), 1 if il == 0 else 0, eps,
+                           self.qkv_buf.data_ptr(), q.rows, q.k, q.gs, 0, s)
+            site += 1
+            ring = self.ring if L.sliding else 0
+            fl.decode_attention_fused_bf16(self.qkv_buf.data_ptr(), L.q_norm.data_ptr(), L.k_norm.data_ptr(),
+                                           self.rope_cos.data_ptr(), self.rope_sin.data_ptr(), self.pos.data_ptr(),
+                                           L.cache.data_ptr(), ring, cfg.sliding_window if L.sliding else 0,
+                                           1 if L.sliding else 0, eps, L.sinks.data_ptr(), scale,
+                                           (self.swa_attn[0] if L.sliding else splits), self.o_part.data_ptr(),
+                                           self.ml_part.data_ptr(), self.attn_counters.data_ptr(),
+                                           self.attn_out.data_ptr(), s,
+                                           self.swa_attn[1] if L.sliding else full_warps)
+            o = L.o
+            fl.gemv2_w4a16(o.codes.data_ptr(), o.scales.data_ptr(), self.attn_out.data_ptr(), 0, 0, 0, 0, eps,
+                           self.x_attn.data_ptr(), o.rows, o.k, o.gs, 0, s)
+            if L.router is None:
+                g = L.gate_up
+                fl.gemv2_w4a16(g.codes.data_ptr(), g.scales.data_ptr(), self.x_attn.data_ptr(), res[site & 1],
+                               res[(site + 1) & 1], L.ffn_norm.data_ptr(), 0, eps, self.act.data_ptr(), g.rows, g.k,
+                               g.gs, 2, s)
+                d = L.down
+                fl.gemv2_w4a16(d.codes.data_ptr(), d.scales.data_ptr(), self.act.data_ptr(), 0, 0, 0, 0, eps,
+                               self.x.data_ptr(), d.rows, d.k, d.gs, 0, s)
+            else:
+                fl.router_norm_bf16(self.x_attn.data_ptr(), res[site & 1], L.ffn_norm.data_ptr(), eps,
+                                    res[(site + 1) & 1], self.xn.data_ptr(), L.router.data_ptr(),
+                                    self.router_logits.data_ptr(), self.router_counter.data_ptr(), self.ids.data_ptr(),
+                                    self.tw.data_ptr(), s)
+                fl.moe_gate_up2_bf16(self.xn.data_ptr(), self.ids.data_ptr(), L.exp_gate_up.codes.data_ptr(),
+                                     L.exp_gate_up.scales.data_ptr(), L.exp_gate_up.gs_dev.data_ptr(),
+                                     L.sh_gate_up.codes.data_ptr(), L.sh_gate_up.scales.data_ptr(), L.sh_gate_up.gs,
+                                     self.act.data_ptr(), s)
+                fl.moe_down_combine2_bf16(self.act.data_ptr(), self.ids.data_ptr(), self.tw.data_ptr(),
+                                          L.exp_down.codes.data_ptr(), L.exp_down.scales.data_ptr(),
+                                          L.exp_down.gs_dev.data_ptr(), L.sh_down.codes.data_ptr(),
+                                          L.sh_down.scales.data_ptr(), L.sh_down.gs, self.x.data_ptr(), s)
+            site += 1
+        fl.add_rmsnorm2_bf16(self.x.data_ptr(), res[site & 1], self.out_norm.data_ptr(), eps, res[(site + 1) & 1],
+                             self.xn.data_ptr(), s)
+        lm = self.lm_head
+        fl.gemv2_w4a16(lm.codes.data_ptr(), lm.scales.data_ptr(), self.xn.data_ptr(), 0, 0, 0, 0, eps,
+                       self.logits.data_ptr(), lm.rows, lm.k, lm.gs, 1, s)
+        fl.argmax_next_f32(self.logits.data_ptr(), cfg.vocab_size, self.cand_v.data_ptr(), self.cand_i.data_ptr(),
+                           self.argmax_counter.data_ptr(), self.tokens.data_ptr(), self.pos.data_ptr(),
+                           self.n_prompt_dev.data_ptr(), s)
 
     # ------------------------------------------------------------------ control
     def reset(self, prompt_tokens: List[int]):
@@ -462,24 +532,52 @@ class FlintRuntime:
         self.tokens[:n].copy_(torch.tensor(prompt_tokens, dtype=torch.int32))
         self.pos.zero_()
         self.n_prompt_dev.fill_(n)
+        self.host_pos = 0
         torch.cuda.synchronize(self.dev)
 
-    def capture(self, attn_splits: Optional[int] = None):
-        """Capture one decode step into a CUDA graph (call after load)."""
+    def capture(self, attn_splits: Optional[int] = None, fused: Optional[bool] = None):
+        """Capture the decode step into CUDA graphs (call after load).
+
+        The fused step is captured once per attention bucket (``attn_buckets``); ``replay``
+        picks the graph from the host-tracked position. ``attn_splits`` forces one graph.
+        """
         torch = self.torch
+        if fused is None:
+            import os
+            fused = os.environ.get("FLINT_DECODE", "fused") != "basic"
+        if fused and attn_splits is None:
+            configs = [(ub, sp, w) for ub, sp, w in self.attn_buckets]
+        else:
+            configs = [(1 << 30, attn_splits or self.attn_splits, self.full_attn_warps)]
         saved = (self.pos.clone(), self.tokens.clone())
-        with torch.cuda.stream(self.stream):
-            self.launch_step(attn_splits=attn_splits)   # warm-up (lazy module/kernel init)
-        self.stream.synchronize()
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g, stream=self.stream):
-            self.launch_step(attn_splits=attn_splits)
-        self.stream.synchronize()
-        self.pos.copy_(saved[0]); self.tokens.copy_(saved[1])
+        self.graphs = []
+        for ub, sp, w in configs:
+            if fused:
+                step = lambda sp=sp, w=w: self.launch_step_fused(attn_splits=sp, attn_warps=w)  # noqa: E731
+            else:
+                step = lambda sp=sp: self.launch_step(attn_splits=sp)  # noqa: E731
+            with torch.cuda.stream(self.stream):
+                step()   # warm-up (lazy module/kernel init, smem attributes)
+            self.stream.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, stream=self.stream):
+                step()
+            self.stream.synchronize()
+            self.pos.copy_(saved[0]); self.tokens.copy_(saved[1])
+            self.graphs.append((ub, g))
         torch.cuda.synchronize(self.dev)
-        self.graph = g
-        return g
+        self.graph = self.graphs[-1][1]
+        self.host_pos = 0
+        return self.graphs
+
+    def _graph_for(self, pos: int):
+        for ub, g in self.graphs:
+            if pos < ub:
+                return g
+        return self.graphs[-1][1]
 
     def replay(self, n: int = 1):
+        """Replay n decode steps; each step processes the token at host_pos and advances it."""
         for _ in range(n):
-            self.graph.replay()
+            self._graph_for(self.host_pos).replay()
+            self.host_pos += 1

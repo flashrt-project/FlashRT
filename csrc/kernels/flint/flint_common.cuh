@@ -144,3 +144,50 @@ __device__ __forceinline__ float silu_mul_routed(float g, float u) {
 
 }  // namespace flint
 }  // namespace flash_rt
+
+// ---------------------------------------------------------------------------
+// Programmatic dependent launch (PDL). Kernels launched with launch_pdl may
+// start while the previous kernel in the stream is still running; each kernel
+// therefore only reads static data (weights, scales) before pdl_wait() and
+// performs no global writes before it. pdl_wait() is a no-op for kernels
+// launched without the attribute.
+// ---------------------------------------------------------------------------
+#include <cstdlib>
+#include <utility>
+
+namespace flash_rt {
+namespace flint {
+
+__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+__device__ __forceinline__ void pdl_launch() { asm volatile("griddepcontrol.launch_dependents;" :::); }
+
+inline bool pdl_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("FLINT_PDL");
+    return !(v && v[0] == '0');
+  }();
+  return on;
+}
+
+template <typename... KArgs, typename... Args>
+inline void launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t s,
+                       Args&&... args) {
+  if (!pdl_enabled()) {
+    kernel<<<grid, block, smem, s>>>(std::forward<Args>(args)...);
+    return;
+  }
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = grid;
+  cfg.blockDim = block;
+  cfg.dynamicSmemBytes = smem;
+  cfg.stream = s;
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attr;
+  cfg.numAttrs = 1;
+  cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...);
+}
+
+}  // namespace flint
+}  // namespace flash_rt

@@ -180,4 +180,62 @@ PYBIND11_MODULE(flash_rt_flint, m) {
         });
 
   m.def("advance_pos", [](uintptr_t pos, int n, uintptr_t stream) { fl::advance_pos(ptr<int>(pos), n, to_stream(stream)); });
+
+  // ---- fused decode step (PDL) ----
+  m.def("gemv2_w4a16",
+        [](uintptr_t codes, uintptr_t scales, uintptr_t x, uintptr_t res_in, uintptr_t res_out, uintptr_t norm_w,
+           int first, float eps, uintptr_t out, int N, int K, float gs, int epilogue, uintptr_t stream) {
+          if (fl::gemv2_w4a16(ptr<const void>(codes), ptr<const void>(scales), ptr<const void>(x),
+                              ptr<const void>(res_in), ptr<void>(res_out), ptr<const float>(norm_w), first, eps,
+                              ptr<void>(out), N, K, gs, epilogue, to_stream(stream)) != 0)
+            throw std::invalid_argument("gemv2_w4a16: unsupported K=" + std::to_string(K) + " epilogue=" +
+                                        std::to_string(epilogue) + (norm_w ? " (fused norm)" : ""));
+        });
+  m.def("add_rmsnorm2_bf16",
+        [](uintptr_t x, uintptr_t res_in, uintptr_t w, float eps, uintptr_t res_out, uintptr_t out, uintptr_t stream) {
+          fl::add_rmsnorm2_bf16(ptr<const void>(x), ptr<const void>(res_in), ptr<const float>(w), eps, ptr<void>(res_out),
+                                ptr<void>(out), to_stream(stream));
+        });
+  m.def("router_norm_bf16",
+        [](uintptr_t x, uintptr_t res_in, uintptr_t nw, float eps, uintptr_t res_out, uintptr_t xn_out, uintptr_t wr,
+           uintptr_t logits, uintptr_t counter, uintptr_t ids, uintptr_t tw, uintptr_t stream) {
+          fl::router_norm_bf16(ptr<const void>(x), ptr<const void>(res_in), ptr<const float>(nw), eps, ptr<void>(res_out),
+                               ptr<void>(xn_out), ptr<const void>(wr), ptr<float>(logits), ptr<unsigned>(counter),
+                               ptr<int>(ids), ptr<float>(tw), to_stream(stream));
+        });
+  m.def("moe_gate_up2_bf16",
+        [](uintptr_t xn, uintptr_t ids, uintptr_t ecodes, uintptr_t escales, uintptr_t egs, uintptr_t scodes,
+           uintptr_t sscales, float sgs, uintptr_t act, uintptr_t stream) {
+          fl::moe_gate_up2_bf16(ptr<const void>(xn), ptr<const int>(ids), ptr<const void>(ecodes), ptr<const void>(escales),
+                                ptr<const float>(egs), ptr<const void>(scodes), ptr<const void>(sscales), sgs,
+                                ptr<void>(act), to_stream(stream));
+        });
+  m.def("moe_down_combine2_bf16",
+        [](uintptr_t act, uintptr_t ids, uintptr_t tw, uintptr_t ecodes, uintptr_t escales, uintptr_t egs,
+           uintptr_t scodes, uintptr_t sscales, float sgs, uintptr_t out, uintptr_t stream) {
+          fl::moe_down_combine2_bf16(ptr<const void>(act), ptr<const int>(ids), ptr<const float>(tw),
+                                     ptr<const void>(ecodes), ptr<const void>(escales), ptr<const float>(egs),
+                                     ptr<const void>(scodes), ptr<const void>(sscales), sgs, ptr<void>(out),
+                                     to_stream(stream));
+        });
+  m.def("embed2_bf16", [](uintptr_t tokens, uintptr_t pos, uintptr_t table, uintptr_t out, uintptr_t stream) {
+    fl::embed2_bf16(ptr<const int>(tokens), ptr<const int>(pos), ptr<const void>(table), ptr<void>(out), to_stream(stream));
+  });
+  m.def("decode_attention_fused_bf16",
+        [](uintptr_t qkv, uintptr_t qw, uintptr_t kw, uintptr_t cos_t, uintptr_t sin_t, uintptr_t pos, uintptr_t cache,
+           int ring, int window, int rope, float eps, uintptr_t sinks, float scale, int n_split, uintptr_t o_part,
+           uintptr_t ml_part, uintptr_t counters, uintptr_t out, uintptr_t stream, int warps) {
+          if (ring & (ring - 1)) throw std::invalid_argument("decode_attention_fused_bf16: ring must be a power of two");
+          if (n_split < 1 || n_split > 1024) throw std::invalid_argument("decode_attention_fused_bf16: bad n_split");
+          if (fl::decode_attention_fused_bf16(ptr<const void>(qkv), ptr<const float>(qw), ptr<const float>(kw),
+                                              ptr<const float>(cos_t), ptr<const float>(sin_t), ptr<const int>(pos),
+                                              ptr<void>(cache), ring, window, rope, eps, ptr<const float>(sinks), scale,
+                                              n_split, warps, ptr<float>(o_part), ptr<float>(ml_part),
+                                              ptr<unsigned>(counters), ptr<void>(out), to_stream(stream)) != 0)
+            throw std::invalid_argument("decode_attention_fused_bf16: warps must be 4, 8 or 16");
+        },
+        py::arg("qkv"), py::arg("qw"), py::arg("kw"), py::arg("cos_t"), py::arg("sin_t"), py::arg("pos"), py::arg("cache"),
+        py::arg("ring"), py::arg("window"), py::arg("rope"), py::arg("eps"), py::arg("sinks"), py::arg("scale"),
+        py::arg("n_split"), py::arg("o_part"), py::arg("ml_part"), py::arg("counters"), py::arg("out"), py::arg("stream"),
+        py::arg("warps") = 4);
 }
