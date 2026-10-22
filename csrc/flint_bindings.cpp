@@ -233,7 +233,7 @@ PYBIND11_MODULE(flash_rt_flint, m) {
         [](uintptr_t qkv, uintptr_t qw, uintptr_t kw, uintptr_t cos_t, uintptr_t sin_t, uintptr_t pos, uintptr_t cache,
            int ring, int window, int rope, float eps, uintptr_t sinks, float scale, int n_split, uintptr_t o_part,
            uintptr_t ml_part, uintptr_t counters, uintptr_t out, uintptr_t stream, int warps, uintptr_t pf_ranges,
-           int n_pf) {
+           int n_pf, int kv_slots) {
           if (ring & (ring - 1)) throw std::invalid_argument("decode_attention_fused_bf16: ring must be a power of two");
           if (n_split < 1 || n_split > 1024) throw std::invalid_argument("decode_attention_fused_bf16: bad n_split");
           if (fl::decode_attention_fused_bf16(ptr<const void>(qkv), ptr<const float>(qw), ptr<const float>(kw),
@@ -241,13 +241,13 @@ PYBIND11_MODULE(flash_rt_flint, m) {
                                               ptr<void>(cache), ring, window, rope, eps, ptr<const float>(sinks), scale,
                                               n_split, warps, ptr<float>(o_part), ptr<float>(ml_part),
                                               ptr<unsigned>(counters), ptr<void>(out), to_stream(stream),
-                                              ptr<const unsigned long long>(pf_ranges), n_pf) != 0)
+                                              ptr<const unsigned long long>(pf_ranges), n_pf, kv_slots) != 0)
             throw std::invalid_argument("decode_attention_fused_bf16: warps must be 4, 8 or 16");
         },
         py::arg("qkv"), py::arg("qw"), py::arg("kw"), py::arg("cos_t"), py::arg("sin_t"), py::arg("pos"), py::arg("cache"),
         py::arg("ring"), py::arg("window"), py::arg("rope"), py::arg("eps"), py::arg("sinks"), py::arg("scale"),
         py::arg("n_split"), py::arg("o_part"), py::arg("ml_part"), py::arg("counters"), py::arg("out"), py::arg("stream"),
-        py::arg("warps") = 4, py::arg("pf_ranges") = 0, py::arg("n_pf") = 0);
+        py::arg("warps") = 4, py::arg("pf_ranges") = 0, py::arg("n_pf") = 0, py::arg("kv_slots") = 0);
 
   m.def("set_moe_launch_config", [](int rw, int rr, int gw, int gr, int dw, int dr) {
     fl::set_moe_launch_config(fl::MoeLaunchConfig{rw, rr, gw, gr, dw, dr});
@@ -275,4 +275,8 @@ PYBIND11_MODULE(flash_rt_flint, m) {
                                      ptr<const void>(scodes), ptr<const void>(sscales), sgs, ptr<void>(out), warps, rows,
                                      to_stream(stream));
         });
+
+  m.def("set_gemv_launch_config", [](int qr, int qw, int orr, int ow) {
+    fl::set_gemv_launch_config(fl::GemvLaunchConfig{qr, qw, orr, ow});
+  });
 }

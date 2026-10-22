@@ -288,6 +288,18 @@ class FlintRuntime:
         # attention moves little data (sliding layers; global layers in short-context buckets).
         self.attn_l2_prefetch = _os.environ.get("FLINT_ATTN_PF", "1") != "0"
         self.attn_pf_max_splits = 8
+        bcfg = _os.environ.get("FLINT_ATTN_BUCKETS")      # "ub:splits:warps;..." (search/bisect hook)
+        if bcfg:
+            self.attn_buckets = tuple(tuple(int(v) for v in b.split(":")) for b in bcfg.split(";"))
+        scfg = _os.environ.get("FLINT_SWA_ATTN")          # "splits:warps"
+        if scfg:
+            self.swa_attn = tuple(int(v) for v in scfg.split(":"))
+        gcfg = _os.environ.get("FLINT_GEMV_CFG")          # "qkv_rows,qkv_warps,o_rows,o_warps" (search hook)
+        if gcfg:
+            self.fl.set_gemv_launch_config(*[int(v) for v in gcfg.split(",")])
+        mcfg = _os.environ.get("FLINT_MOE_CFG")           # 6 ints, see set_moe_launch_config (search hook)
+        if mcfg:
+            self.fl.set_moe_launch_config(*[int(v) for v in mcfg.replace("_", ",").split(",")])
         for L in self.layers:
             rng = []
             for t in (L.o.codes, L.o.scales):
@@ -610,6 +622,14 @@ class FlintRuntime:
 
     def replay(self, n: int = 1):
         """Replay n decode steps; each step processes the token at host_pos and advances it."""
+        import os
+        if os.environ.get("FLINT_EAGER") == "1":     # debugging aid: launch the step without a graph
+            with self.torch.cuda.stream(self.stream):
+                for _ in range(n):
+                    ub, sp, w = next(b for b in self.attn_buckets if self.host_pos < b[0])
+                    self.launch_step_fused(attn_splits=sp, attn_warps=w)
+                    self.host_pos += 1
+            return
         for _ in range(n):
             self._graph_for(self.host_pos).replay()
             self.host_pos += 1

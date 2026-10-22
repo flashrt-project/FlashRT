@@ -238,7 +238,8 @@ decode_attn_fused_kernel(const uint16_t* __restrict__ qkv, const float* __restri
                          uint16_t* __restrict__ cache, int ring, int window, int rope, float eps,
                          const float* __restrict__ sinks, float scale, float* __restrict__ o_part,
                          float* __restrict__ ml_part, unsigned* __restrict__ counters, uint16_t* __restrict__ out,
-                         const unsigned long long* __restrict__ pf_ranges, int n_pf) {
+                         const unsigned long long* __restrict__ pf_ranges, int n_pf, int slot_stride, int head_stride,
+                         int v_off, int prewait) {
   constexpr int NT = WARPS * 32;
   constexpr int DPT = (kGroup * kD) / NT;          // output dims per thread in the merges
   constexpr int TPH = kD / DPT;                    // threads per head
@@ -254,6 +255,10 @@ decode_attn_fused_kernel(const uint16_t* __restrict__ qkv, const float* __restri
   float qwv[4], kwv[4];
 #pragma unroll
   for (int j = 0; j < 4; ++j) { qwv[j] = qw[lane + 32 * j]; kwv[j] = kw[lane + 32 * j]; }
+  if (!prewait) {
+    pdl_wait();
+    pos_p = after_wait(pos_p);
+  }
   const int pos = __ldcg(pos_p);
   const int kstart = window > 0 ? max(0, pos - window + 1) : 0;
   const int klen = pos + 1 - kstart;
@@ -261,7 +266,8 @@ decode_attn_fused_kernel(const uint16_t* __restrict__ qkv, const float* __restri
   const int b0 = kstart + split * per;
   const int b1 = min(b0 + per, pos + 1);
   const float c = scale * kLog2e;
-  const int kv_off_k = kvh * kD, kv_off_v = 512 + kvh * kD;
+  // cache element address of (slot, kv head, K/V, dim) = kvh*head_stride + slot*slot_stride (+ v_off) + dim
+  const int kv_off_k = kvh * head_stride, kv_off_v = kvh * head_stride + v_off;
 
   uint32_t kr[2][16], vr[4][8];
   auto load_tile = [&](int tile) {
@@ -270,7 +276,7 @@ decode_attn_fused_kernel(const uint16_t* __restrict__ qkv, const float* __restri
       const int p = tile + nt * 8 + g;
       if (p < b1) {
         const int slot = ring > 0 ? (p & (ring - 1)) : p;
-        const uint4* kp = reinterpret_cast<const uint4*>(cache + static_cast<size_t>(slot) * kSlotElems + kv_off_k + 32 * t);
+        const uint4* kp = reinterpret_cast<const uint4*>(cache + static_cast<size_t>(slot) * slot_stride + kv_off_k + 32 * t);
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
           const uint4 v = kp[i];
@@ -286,7 +292,7 @@ decode_attn_fused_kernel(const uint16_t* __restrict__ qkv, const float* __restri
       const int p = tile + (r >> 1) * 8 + 2 * t + (r & 1);
       if (p < b1) {
         const int slot = ring > 0 ? (p & (ring - 1)) : p;
-        const uint4* vp = reinterpret_cast<const uint4*>(cache + static_cast<size_t>(slot) * kSlotElems + kv_off_v + 16 * g);
+        const uint4* vp = reinterpret_cast<const uint4*>(cache + static_cast<size_t>(slot) * slot_stride + kv_off_v + 16 * g);
         const uint4 v0 = vp[0], v1 = vp[1];
         vr[r][0] = v0.x; vr[r][1] = v0.y; vr[r][2] = v0.z; vr[r][3] = v0.w;
         vr[r][4] = v1.x; vr[r][5] = v1.y; vr[r][6] = v1.z; vr[r][7] = v1.w;
@@ -298,7 +304,7 @@ decode_attn_fused_kernel(const uint16_t* __restrict__ qkv, const float* __restri
   };
   const int tile0 = b0 + warp * 16;
   bool have = false;
-  if (tile0 < b1 && tile0 + 16 <= pos) { load_tile(tile0); have = true; }
+  if (prewait && tile0 < b1 && tile0 + 16 <= pos) { load_tile(tile0); have = true; }
   // Optional L2 warm-up of the layer's upcoming static weights (o_proj, router, shared expert):
   // this kernel moves little data on short windows, so HBM is otherwise idle here.
   if (threadIdx.x < n_pf) {
@@ -313,6 +319,12 @@ decode_attn_fused_kernel(const uint16_t* __restrict__ qkv, const float* __restri
   }
 
   pdl_wait();
+  qkv = after_wait(qkv);
+  cache = after_wait(cache);
+  o_part = after_wait(o_part);
+  ml_part = after_wait(ml_part);
+  counters = after_wait(counters);
+  out = after_wait(out);
 
   auto norm_rope = [&](const uint16_t* src, const float (&w)[4], float (&v)[4]) {
 #pragma unroll
@@ -342,7 +354,7 @@ decode_attn_fused_kernel(const uint16_t* __restrict__ qkv, const float* __restri
   if (b0 <= pos && pos < b1 && warp >= WARPS - 2) {   // last two warps: often idle in the tile loop
     const int kvsel = warp - (WARPS - 2);            // 0 = K, 1 = V
     const int slot = ring > 0 ? (pos & (ring - 1)) : pos;
-    uint16_t* dst = cache + static_cast<size_t>(slot) * kSlotElems + kvsel * 512 + kvh * kD;
+    uint16_t* dst = cache + static_cast<size_t>(slot) * slot_stride + kvh * head_stride + kvsel * v_off;
     const uint16_t* src = qkv + (32 + kvsel * 4 + kvh) * kD;
     if (kvsel == 0) {
       float v[4];
@@ -514,7 +526,8 @@ template <int WARPS>
 static void launch_attn_fused(const void* qkv, const float* qw, const float* kw, const float* cos_t, const float* sin_t,
                               const int* pos, void* cache, int ring, int window, int rope, float eps, const float* sinks,
                               float scale, int n_split, float* o_part, float* ml_part, unsigned* counters, void* out,
-                              cudaStream_t s, const unsigned long long* pf_ranges, int n_pf) {
+                              cudaStream_t s, const unsigned long long* pf_ranges, int n_pf, int slot_stride,
+                              int head_stride, int v_off) {
   constexpr size_t smem = kGroup * kD * 2 + WARPS * kGroup * kD * 4 + 2 * WARPS * kGroup * 4;
   static bool init = false;
   if (!init) {
@@ -526,9 +539,10 @@ static void launch_attn_fused(const void* qkv, const float* qw, const float* kw,
   }
   const bool cluster = n_split >= 2 && n_split <= 8 && attn_cluster_enabled();
   if (!cluster) {
-    launch_pdl(decode_attn_fused_kernel<WARPS, false>, dim3(n_split, 4), dim3(WARPS * 32), smem, s,
+    launch_pdl_kind(2, decode_attn_fused_kernel<WARPS, false>, dim3(n_split, 4), dim3(WARPS * 32), smem, s,
                static_cast<const uint16_t*>(qkv), qw, kw, cos_t, sin_t, pos, static_cast<uint16_t*>(cache), ring, window,
-               rope, eps, sinks, scale, o_part, ml_part, counters, static_cast<uint16_t*>(out), pf_ranges, n_pf);
+               rope, eps, sinks, scale, o_part, ml_part, counters, static_cast<uint16_t*>(out), pf_ranges, n_pf,
+               slot_stride, head_stride, v_off, prewait_flags() & 1);
     return;
   }
   cudaLaunchConfig_t cfg = {};
@@ -542,23 +556,29 @@ static void launch_attn_fused(const void* qkv, const float* qw, const float* kw,
   attr[0].val.clusterDim.y = 1;
   attr[0].val.clusterDim.z = 1;
   attr[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attr[1].val.programmaticStreamSerializationAllowed = pdl_enabled() ? 1 : 0;
+  attr[1].val.programmaticStreamSerializationAllowed = (pdl_enabled() && pdl_kind_enabled(2)) ? 1 : 0;
   cfg.attrs = attr;
   cfg.numAttrs = 2;
   cudaLaunchKernelEx(&cfg, decode_attn_fused_kernel<WARPS, true>, static_cast<const uint16_t*>(qkv), qw, kw, cos_t,
                      sin_t, pos, static_cast<uint16_t*>(cache), ring, window, rope, eps, sinks, scale, o_part, ml_part,
-                     counters, static_cast<uint16_t*>(out), pf_ranges, n_pf);
+                     counters, static_cast<uint16_t*>(out), pf_ranges, n_pf, slot_stride, head_stride, v_off,
+                     prewait_flags() & 1);
 }
 
 int decode_attention_fused_bf16(const void* qkv, const float* q_norm_w, const float* k_norm_w, const float* cos_t,
                                 const float* sin_t, const int* pos, void* cache, int ring, int window, int rope,
                                 float eps, const float* sinks, float scale, int n_split, int warps, float* o_part,
                                 float* ml_part, unsigned* counters, void* out, cudaStream_t s,
-                                const unsigned long long* pf_ranges, int n_pf) {
+                                const unsigned long long* pf_ranges, int n_pf, int kv_slots) {
+  // kv_slots == 0: interleaved [slot][K 4x128 | V 4x128]; > 0: head-major [kv head][kv_slots][K 128 | V 128]
+  const int slot_stride = kv_slots > 0 ? 2 * kD : kSlotElems;
+  const int head_stride = kv_slots > 0 ? kv_slots * 2 * kD : kD;
+  const int v_off = kv_slots > 0 ? kD : 512;
 #define FLINT_ATTN_W(W)                                                                                              \
   if (warps == W) {                                                                                                  \
     launch_attn_fused<W>(qkv, q_norm_w, k_norm_w, cos_t, sin_t, pos, cache, ring, window, rope, eps, sinks, scale,  \
-                         n_split, o_part, ml_part, counters, out, s, pf_ranges, n_pf);                               \
+                         n_split, o_part, ml_part, counters, out, s, pf_ranges, n_pf, slot_stride, head_stride,      \
+                         v_off);                                                                                     \
     return 0;                                                                                                        \
   }
   FLINT_ATTN_W(4)

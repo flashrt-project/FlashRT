@@ -164,6 +164,18 @@ __device__ __forceinline__ void prefetch_l2_bulk(const void* p, uint32_t bytes) 
 }
 
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+
+// Pointer launder for data produced or consumed by other grids. A "memory" clobber on
+// griddepcontrol.wait does not stop the compiler from hoisting loads through
+// const __restrict__ pointers above it (restrict promises nobody else writes the data
+// during the kernel, which PDL deliberately violates). Every pointer to such data is
+// passed through this opaque move right after pdl_wait(), so its loads/stores depend on
+// a value that only exists after the wait.
+template <typename T>
+__device__ __forceinline__ T* after_wait(T* p) {
+  asm volatile("mov.b64 %0, %0;" : "+l"(p)::"memory");
+  return p;
+}
 __device__ __forceinline__ void pdl_launch() { asm volatile("griddepcontrol.launch_dependents;" :::); }
 
 inline bool pdl_enabled() {
@@ -174,6 +186,16 @@ inline bool pdl_enabled() {
   return on;
 }
 
+// Bit 0: decode attention reads the position / prefetches K/V before pdl_wait.
+// Bit 1: MoE down/combine reads the expert ids / routed weights before pdl_wait.
+inline int prewait_flags() {
+  static const int f = [] {
+    const char* v = std::getenv("FLINT_PREWAIT");
+    return v ? std::atoi(v) : 3;
+  }();
+  return f;
+}
+
 inline bool attn_cluster_enabled() {
   static const bool on = [] {
     const char* v = std::getenv("FLINT_ATTN_CLUSTER");
@@ -182,10 +204,29 @@ inline bool attn_cluster_enabled() {
   return on;
 }
 
+// Per-kernel-kind PDL mask (debugging/bisection aid): bit k enables PDL for launch kind k.
+inline bool pdl_kind_enabled(int kind) {
+  static const unsigned mask = [] {
+    const char* v = std::getenv("FLINT_PDL_MASK");
+    return v ? static_cast<unsigned>(std::strtoul(v, nullptr, 0)) : 0xffffffffu;
+  }();
+  return kind < 0 || ((mask >> kind) & 1u);
+}
+
+template <typename... KArgs, typename... Args>
+inline void launch_pdl_kind(int kind, void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t s,
+                            Args&&... args);
+
 template <typename... KArgs, typename... Args>
 inline void launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t s,
                        Args&&... args) {
-  if (!pdl_enabled()) {
+  launch_pdl_kind(-1, kernel, grid, block, smem, s, std::forward<Args>(args)...);
+}
+
+template <typename... KArgs, typename... Args>
+inline void launch_pdl_kind(int kind, void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t s,
+                            Args&&... args) {
+  if (!pdl_enabled() || !pdl_kind_enabled(kind)) {
     kernel<<<grid, block, smem, s>>>(std::forward<Args>(args)...);
     return;
   }

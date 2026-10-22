@@ -130,6 +130,10 @@ gemv2_kernel(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scal
       }
   }
   pdl_wait();
+  x = after_wait(x);
+  res_in = after_wait(res_in);
+  res_out = after_wait(res_out);
+  out = after_wait(out);
   if (NORM) {
     norm_prologue<WARPS * 32>(x, res_in, first, nw, eps, res_out, nullptr, xs, red);
   } else {
@@ -186,15 +190,40 @@ static void launch_gemv2(const void* codes, const void* scales, const void* x, c
   const int rows_per_block = (EPI == 2) ? WARPS * RPW / 2 : WARPS * RPW;
   const int n_out = (EPI == 2) ? N / 2 : N;
   const int blocks = (n_out + rows_per_block - 1) / rows_per_block;
-  launch_pdl(gemv2_kernel<K, RPW, WARPS, EPI, NORM>, dim3(blocks), dim3(WARPS * 32), 0, s,
+  launch_pdl_kind(1, gemv2_kernel<K, RPW, WARPS, EPI, NORM>, dim3(blocks), dim3(WARPS * 32), 0, s,
              static_cast<const uint8_t*>(codes), static_cast<const uint8_t*>(scales), static_cast<const uint16_t*>(x),
              static_cast<const uint16_t*>(res_in), static_cast<uint16_t*>(res_out), nw, first, eps, out, N, gs);
 }
+
+static GemvLaunchConfig g_gemv_cfg = {4, 4, 2, 4};
+
+void set_gemv_launch_config(const GemvLaunchConfig& c) { g_gemv_cfg = c; }
 
 int gemv2_w4a16(const void* codes, const void* scales, const void* x, const void* res_in, void* res_out,
                 const float* norm_w, int first, float eps, void* out, int N, int K, float gs, int epilogue,
                 cudaStream_t s) {
   const bool norm = norm_w != nullptr;
+  // Tuned shapes for the two per-layer GEMVs (QKV with fused norm, o_proj).
+  if (K == 2048 && epilogue == 0 && norm) {
+    const int R = g_gemv_cfg.qkv_rows, W = g_gemv_cfg.qkv_warps;
+#define FLINT_GQ(RR, WW)                                                                                     \
+    if (R == RR && W == WW) {                                                                                \
+      launch_gemv2<2048, RR, WW, 0, true>(codes, scales, x, res_in, res_out, norm_w, first, eps, out, N, gs, s); \
+      return 0;                                                                                              \
+    }
+    FLINT_GQ(4, 4) FLINT_GQ(2, 4) FLINT_GQ(8, 4) FLINT_GQ(4, 8) FLINT_GQ(2, 8) FLINT_GQ(1, 8) FLINT_GQ(8, 2) FLINT_GQ(4, 2)
+#undef FLINT_GQ
+  }
+  if (K == 4096 && epilogue == 0 && !norm) {
+    const int R = g_gemv_cfg.o_rows, W = g_gemv_cfg.o_warps;
+#define FLINT_GO(RR, WW)                                                                                     \
+    if (R == RR && W == WW) {                                                                                \
+      launch_gemv2<4096, RR, WW, 0, false>(codes, scales, x, res_in, res_out, norm_w, first, eps, out, N, gs, s); \
+      return 0;                                                                                              \
+    }
+    FLINT_GO(2, 4) FLINT_GO(1, 4) FLINT_GO(4, 4) FLINT_GO(2, 8) FLINT_GO(1, 8) FLINT_GO(4, 2) FLINT_GO(1, 2)
+#undef FLINT_GO
+  }
 #define FLINT_G2(KK, RPW, EPI, NORM)                                                                 \
   if (K == KK && epilogue == EPI && norm == NORM) {                                                  \
     launch_gemv2<KK, RPW, 4, EPI, NORM>(codes, scales, x, res_in, res_out, norm_w, first, eps, out, N, \
@@ -220,13 +249,17 @@ __global__ void __launch_bounds__(256) add_rmsnorm2_kernel(const uint16_t* __res
   __shared__ __align__(16) uint16_t xs[kH];
   __shared__ float red[8];
   pdl_wait();
+  x = after_wait(x);
+  res_in = after_wait(res_in);
+  res_out = after_wait(res_out);
+  out = after_wait(out);
   norm_prologue<256>(x, res_in, 0, w, eps, res_out, out, xs, red);
   pdl_launch();
 }
 
 void add_rmsnorm2_bf16(const void* x, const void* res_in, const float* w, float eps, void* res_out, void* out,
                        cudaStream_t s) {
-  launch_pdl(add_rmsnorm2_kernel, dim3(1), dim3(256), 0, s, static_cast<const uint16_t*>(x),
+  launch_pdl_kind(6, add_rmsnorm2_kernel, dim3(1), dim3(256), 0, s, static_cast<const uint16_t*>(x),
              static_cast<const uint16_t*>(res_in), w, eps, static_cast<uint16_t*>(res_out), static_cast<uint16_t*>(out));
 }
 
@@ -266,6 +299,14 @@ router_norm_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict__ 
     prefetch_l2_bulk(sh_down_scales + blockIdx.x * ss, ss & ~15u);
   }
   pdl_wait();
+  x = after_wait(x);
+  res_in = after_wait(res_in);
+  res_out = after_wait(res_out);
+  xn_out = after_wait(xn_out);
+  logits = after_wait(logits);
+  counter = after_wait(counter);
+  ids = after_wait(ids);
+  tw = after_wait(tw);
   norm_prologue<WARPS * 32>(x, res_in, 0, nw, eps, res_out, xn_out, xs, red);
   __syncthreads();
 #pragma unroll
@@ -330,7 +371,7 @@ void router_norm_bf16(const void* x, const void* res_in, const float* nw, float 
   const int W = g_moe_cfg.router_warps, R = g_moe_cfg.router_rows;
 #define FLINT_RT(WW, RR)                                                                                        \
   if (W == WW && R == RR) {                                                                                     \
-    launch_pdl(router_norm_kernel<WW, RR>, dim3(kE / (WW * RR)), dim3(WW * 32), 0, s,                            \
+    launch_pdl_kind(3, router_norm_kernel<WW, RR>, dim3(kE / (WW * RR)), dim3(WW * 32), 0, s,                            \
                static_cast<const uint16_t*>(x), static_cast<const uint16_t*>(res_in), nw, eps,                   \
                static_cast<uint16_t*>(res_out), static_cast<uint16_t*>(xn_out), static_cast<const uint16_t*>(wr), \
                logits, counter, ids, tw, static_cast<const uint8_t*>(sh_down_codes),                              \
@@ -339,7 +380,7 @@ void router_norm_bf16(const void* x, const void* res_in, const float* nw, float 
   }
   FLINT_RT(8, 1) FLINT_RT(4, 1) FLINT_RT(2, 1) FLINT_RT(8, 2) FLINT_RT(4, 2) FLINT_RT(2, 2) FLINT_RT(4, 4)
 #undef FLINT_RT
-  launch_pdl(router_norm_kernel<8, 1>, dim3(kE / 8), dim3(256), 0, s, static_cast<const uint16_t*>(x),
+  launch_pdl_kind(3, router_norm_kernel<8, 1>, dim3(kE / 8), dim3(256), 0, s, static_cast<const uint16_t*>(x),
              static_cast<const uint16_t*>(res_in), nw, eps, static_cast<uint16_t*>(res_out),
              static_cast<uint16_t*>(xn_out), static_cast<const uint16_t*>(wr), logits, counter, ids, tw,
              static_cast<const uint8_t*>(sh_down_codes), static_cast<const uint8_t*>(sh_down_scales));
@@ -379,6 +420,9 @@ router_shared_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict_
       }
     pdl_launch();   // do not hold back the routed gate/up launch (it still waits for this whole grid)
     pdl_wait();
+    x = after_wait(x);
+    res_in = after_wait(res_in);
+    act = after_wait(act);
     // recompute the post-attention norm (no global writes from these blocks)
     {
       constexpr int PER = kH / (WARPS * 32), NV = PER / 8;
@@ -456,6 +500,14 @@ router_shared_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict_
 #pragma unroll
     for (int c = 0; c < 8; ++c) wv[r][c] = ldg_nc_v4(wr + static_cast<size_t>(e0 + r) * kH + c * 256 + lane * 8);
   pdl_wait();
+  x = after_wait(x);
+  res_in = after_wait(res_in);
+  res_out = after_wait(res_out);
+  xn_out = after_wait(xn_out);
+  logits = after_wait(logits);
+  counter = after_wait(counter);
+  ids = after_wait(ids);
+  tw = after_wait(tw);
   norm_prologue<WARPS * 32>(x, res_in, 0, nw, eps, res_out, xn_out, xs, red);
   __syncthreads();
 #pragma unroll
@@ -566,6 +618,9 @@ moe_gate_up2_kernel(const uint16_t* __restrict__ xn, const int* __restrict__ ids
   };
   if (!routed) load_w(scodes, sscales);
   pdl_wait();
+  xn = after_wait(xn);
+  ids = after_wait(ids);
+  act = after_wait(act);
   if (threadIdx.x < kTop && down_codes != nullptr) {
     const int e = ids[threadIdx.x];
     constexpr uint32_t kCodeBytes = kH * (kEI / 2), kScaleBytes = kH * (kEI / 16);
@@ -619,7 +674,7 @@ void moe_gate_up2_bf16(const void* xn, const int* ids, const void* ecodes, const
   const int W = g_moe_cfg.gu_warps, A = g_moe_cfg.gu_rows;
 #define FLINT_GU(WW, AA)                                                                                         \
   if (W == WW && A == AA) {                                                                                      \
-    launch_pdl(moe_gate_up2_kernel<WW, AA>, dim3((kTop * kEI + (scodes ? kSI : 0)) / (WW * AA)), dim3(WW * 32), 0, s, \
+    launch_pdl_kind(4, moe_gate_up2_kernel<WW, AA>, dim3((kTop * kEI + (scodes ? kSI : 0)) / (WW * AA)), dim3(WW * 32), 0, s, \
                static_cast<const uint16_t*>(xn), ids, static_cast<const uint8_t*>(ecodes),                        \
                static_cast<const uint8_t*>(escales), egs, static_cast<const uint8_t*>(scodes),                     \
                static_cast<const uint8_t*>(sscales), sgs, static_cast<uint16_t*>(act),                             \
@@ -628,7 +683,7 @@ void moe_gate_up2_bf16(const void* xn, const int* ids, const void* ecodes, const
   }
   FLINT_GU(8, 2) FLINT_GU(8, 1) FLINT_GU(4, 2) FLINT_GU(4, 1) FLINT_GU(4, 4) FLINT_GU(8, 4) FLINT_GU(2, 2) FLINT_GU(2, 4)
 #undef FLINT_GU
-  launch_pdl(moe_gate_up2_kernel<8, 2>, dim3((kTop * kEI + kSI) / 16), dim3(256), 0, s, static_cast<const uint16_t*>(xn),
+  launch_pdl_kind(4, moe_gate_up2_kernel<8, 2>, dim3((kTop * kEI + kSI) / 16), dim3(256), 0, s, static_cast<const uint16_t*>(xn),
              ids, static_cast<const uint8_t*>(ecodes), static_cast<const uint8_t*>(escales), egs,
              static_cast<const uint8_t*>(scodes), static_cast<const uint8_t*>(sscales), sgs, static_cast<uint16_t*>(act),
              static_cast<const uint8_t*>(down_codes), static_cast<const uint8_t*>(down_scales));
@@ -644,11 +699,12 @@ __global__ void __launch_bounds__(WARPS * 32)
 moe_down_combine2_kernel(const uint16_t* __restrict__ act, const int* __restrict__ ids, const float* __restrict__ tw,
                          const uint8_t* __restrict__ ecodes, const uint8_t* __restrict__ escales,
                          const float* __restrict__ egs, const uint8_t* __restrict__ scodes,
-                         const uint8_t* __restrict__ sscales, float sgs, uint16_t* __restrict__ out) {
+                         const uint8_t* __restrict__ sscales, float sgs, uint16_t* __restrict__ out, int prewait) {
   constexpr int kAct = kTop * kEI + kSI;
   __shared__ __align__(16) uint16_t xs[kAct];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int n0 = (blockIdx.x * WARPS + warp) * RPW;
+  if (!prewait) pdl_wait();
   uint4 shw[RPW];
   uint32_t shs[RPW];
 #pragma unroll
@@ -674,6 +730,9 @@ moe_down_combine2_kernel(const uint16_t* __restrict__ act, const int* __restrict
       rs[r][j] = ldg_nc_u8(escales + rowi * 32 + lane);
     }
   pdl_wait();
+  act = after_wait(act);
+  tw = after_wait(tw);
+  out = after_wait(out);
   for (int i = threadIdx.x; i < kAct / 8; i += WARPS * 32)
     reinterpret_cast<uint4*>(xs)[i] = reinterpret_cast<const uint4*>(act)[i];
   __syncthreads();
@@ -732,17 +791,18 @@ void moe_down_combine2_bf16(const void* act, const int* ids, const float* tw, co
   const int W = g_moe_cfg.dn_warps, R = g_moe_cfg.dn_rows;
 #define FLINT_DN(WW, RR)                                                                                         \
   if (W == WW && R == RR) {                                                                                      \
-    launch_pdl(moe_down_combine2_kernel<WW, RR>, dim3(kH / (WW * RR)), dim3(WW * 32), 0, s,                       \
+    launch_pdl_kind(5, moe_down_combine2_kernel<WW, RR>, dim3(kH / (WW * RR)), dim3(WW * 32), 0, s,                       \
                static_cast<const uint16_t*>(act), ids, tw, static_cast<const uint8_t*>(ecodes),                    \
                static_cast<const uint8_t*>(escales), egs, static_cast<const uint8_t*>(scodes),                     \
-               static_cast<const uint8_t*>(sscales), sgs, static_cast<uint16_t*>(out));                            \
+               static_cast<const uint8_t*>(sscales), sgs, static_cast<uint16_t*>(out), (prewait_flags() >> 1) & 1); \
     return;                                                                                                      \
   }
   FLINT_DN(8, 2) FLINT_DN(8, 1) FLINT_DN(4, 2) FLINT_DN(4, 1) FLINT_DN(4, 4) FLINT_DN(8, 4) FLINT_DN(2, 2) FLINT_DN(2, 4)
 #undef FLINT_DN
-  launch_pdl(moe_down_combine2_kernel<8, 2>, dim3(kH / 16), dim3(256), 0, s, static_cast<const uint16_t*>(act), ids, tw,
+  launch_pdl_kind(5, moe_down_combine2_kernel<8, 2>, dim3(kH / 16), dim3(256), 0, s, static_cast<const uint16_t*>(act), ids, tw,
              static_cast<const uint8_t*>(ecodes), static_cast<const uint8_t*>(escales), egs,
-             static_cast<const uint8_t*>(scodes), static_cast<const uint8_t*>(sscales), sgs, static_cast<uint16_t*>(out));
+             static_cast<const uint8_t*>(scodes), static_cast<const uint8_t*>(sscales), sgs, static_cast<uint16_t*>(out),
+             (prewait_flags() >> 1) & 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -780,6 +840,9 @@ moe_down_combine3_kernel(const uint16_t* __restrict__ act, const int* __restrict
     sv[r] = ldg_nc_v2(sbase + static_cast<size_t>(n0 + r) * srow + seg * 8);
   }
   pdl_wait();
+  act = after_wait(act);
+  tw = after_wait(tw);
+  out = after_wait(out);
   for (int i = threadIdx.x; i < kAct / 8; i += WARPS * 32)
     reinterpret_cast<uint4*>(xs)[i] = reinterpret_cast<const uint4*>(act)[i];
   __syncthreads();
@@ -850,6 +913,9 @@ void moe_down_combine3_bf16(const void* act, const int* ids, const float* tw, co
 __global__ void embed2_kernel(const int* __restrict__ tokens, const int* __restrict__ pos,
                               const uint16_t* __restrict__ table, uint16_t* __restrict__ out) {
   pdl_wait();
+  tokens = after_wait(tokens);
+  pos = after_wait(pos);
+  out = after_wait(out);
   const int t = tokens[*pos];
   reinterpret_cast<uint4*>(out)[threadIdx.x] =
       reinterpret_cast<const uint4*>(table + static_cast<size_t>(t) * kH)[threadIdx.x];
@@ -857,7 +923,7 @@ __global__ void embed2_kernel(const int* __restrict__ tokens, const int* __restr
 }
 
 void embed2_bf16(const int* tokens, const int* pos, const void* table, void* out, cudaStream_t s) {
-  launch_pdl(embed2_kernel, dim3(1), dim3(kH / 8), 0, s, tokens, pos, static_cast<const uint16_t*>(table),
+  launch_pdl_kind(0, embed2_kernel, dim3(1), dim3(kH / 8), 0, s, tokens, pos, static_cast<const uint16_t*>(table),
              static_cast<uint16_t*>(out));
 }
 

@@ -77,6 +77,12 @@ struct MoeLaunchConfig {
 void set_moe_launch_config(const MoeLaunchConfig& c);
 MoeLaunchConfig get_moe_launch_config();
 
+// Launch shapes (rows per warp, warps per block) of the QKV (fused norm) and o_proj decode GEMVs.
+struct GemvLaunchConfig {
+  int qkv_rows, qkv_warps, o_rows, o_warps;
+};
+void set_gemv_launch_config(const GemvLaunchConfig& c);
+
 // Fused decode step (PDL). Residual stream ping-pongs: a norm site reads res_in and block 0 writes res_out.
 // gemv2: norm_w != nullptr fuses residual add + RMSNorm of x (K == 2048) into the GEMV prologue.
 int gemv2_w4a16(const void* codes, const void* scales, const void* x, const void* res_in, void* res_out,
@@ -109,7 +115,7 @@ int decode_attention_fused_bf16(const void* qkv, const float* q_norm_w, const fl
                                 const float* sin_t, const int* pos, void* cache, int ring, int window, int rope,
                                 float eps, const float* sinks, float scale, int n_split, int warps, float* o_part,
                                 float* ml_part, unsigned* counters, void* out, cudaStream_t s,
-                                const unsigned long long* pf_ranges = nullptr, int n_pf = 0);
+                                const unsigned long long* pf_ranges = nullptr, int n_pf = 0, int kv_slots = 0);
 
 }  // namespace flint
 }  // namespace flash_rt
