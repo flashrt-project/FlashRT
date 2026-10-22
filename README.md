@@ -260,6 +260,24 @@ plain in the same process, emitting the same tokens as greedy decoding. See
 
 **Guide:** [Thor](docs/qwen36_moe_usage.md#jetson-agx-thor-numbers) · [RTX 5090](docs/qwen36_moe_usage.md).
 
+#### Flint (official NVFP4 GGUF)
+
+RTX 5090, against the official llama.cpp executor on the same card and GGUF
+(its serving flags: f16 KV cache, flash attention; `llama-bench` prompt
+processing at ubatch 2048, generation at populated KV depth):
+
+| Context | Prefill | Decode | Source |
+|---|---:|---:|---|
+| 1 K | **42.2 ms** (102.8) | **661 tok/s** (238.5) | [Flint usage](docs/flint_usage.md#rtx-5090-numbers) |
+| 8 K | **272 ms** (690) | **587 tok/s** (226.8) | [Flint usage](docs/flint_usage.md#rtx-5090-numbers) |
+| 32 K | **1.62 s** (3.18) | **461 tok/s** (205.1) | [Flint usage](docs/flint_usage.md#rtx-5090-numbers) |
+| 100 K | **9.17 s** (14.04) | **298 tok/s** (162.7) | [Flint usage](docs/flint_usage.md#rtx-5090-numbers) |
+
+Native W4A16 kernels with the official vLLM numerics (exact NVFP4 dequant, BF16
+activations and KV); the GGUF is only read, never executed by llama.cpp.
+
+**Guide:** [RTX 5090](docs/flint_usage.md).
+
 #### Qwen3-8B
 
 | Hardware | Mode | Prefill | Decode | Source |

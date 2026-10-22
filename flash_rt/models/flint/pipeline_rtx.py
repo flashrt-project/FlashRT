@@ -557,10 +557,10 @@ class FlintRuntime:
         H = cfg.hidden_size
         res = [self.res2[0].data_ptr(), self.res2[1].data_ptr()]
         site = 0   # norm site k reads res[k & 1], block 0 writes res[(k + 1) & 1]
-        fl.embed2_bf16(self.tokens.data_ptr(), self.pos.data_ptr(), self.embed.data_ptr(), self.x.data_ptr(), s)
+        fl.embed_pdl_bf16(self.tokens.data_ptr(), self.pos.data_ptr(), self.embed.data_ptr(), self.x.data_ptr(), s)
         for il, L in enumerate(self.layers):
             q = L.qkv
-            fl.gemv2_w4a16(q.codes.data_ptr(), q.scales.data_ptr(), self.x.data_ptr(), res[site & 1],
+            fl.gemv_fused_w4a16(q.codes.data_ptr(), q.scales.data_ptr(), self.x.data_ptr(), res[site & 1],
                            res[(site + 1) & 1], L.attn_norm.data_ptr(), 1 if il == 0 else 0, eps,
                            self.qkv_buf.data_ptr(), q.rows, q.k, q.gs, 0, s)
             site += 1
@@ -576,34 +576,34 @@ class FlintRuntime:
                                            self.swa_attn[1] if L.sliding else full_warps,
                                            L.pf_ranges.data_ptr() if pf else 0, L.pf_n if pf else 0)
             o = L.o
-            fl.gemv2_w4a16(o.codes.data_ptr(), o.scales.data_ptr(), self.attn_out.data_ptr(), 0, 0, 0, 0, eps,
+            fl.gemv_fused_w4a16(o.codes.data_ptr(), o.scales.data_ptr(), self.attn_out.data_ptr(), 0, 0, 0, 0, eps,
                            self.x_attn.data_ptr(), o.rows, o.k, o.gs, 0, s)
             if L.router is None:
                 g = L.gate_up
-                fl.gemv2_w4a16(g.codes.data_ptr(), g.scales.data_ptr(), self.x_attn.data_ptr(), res[site & 1],
+                fl.gemv_fused_w4a16(g.codes.data_ptr(), g.scales.data_ptr(), self.x_attn.data_ptr(), res[site & 1],
                                res[(site + 1) & 1], L.ffn_norm.data_ptr(), 0, eps, self.act.data_ptr(), g.rows, g.k,
                                g.gs, 2, s)
                 d = L.down
-                fl.gemv2_w4a16(d.codes.data_ptr(), d.scales.data_ptr(), self.act.data_ptr(), 0, 0, 0, 0, eps,
+                fl.gemv_fused_w4a16(d.codes.data_ptr(), d.scales.data_ptr(), self.act.data_ptr(), 0, 0, 0, 0, eps,
                                self.x.data_ptr(), d.rows, d.k, d.gs, 0, s)
             else:
                 fl.router_norm_bf16(self.x_attn.data_ptr(), res[site & 1], L.ffn_norm.data_ptr(), eps,
                                     res[(site + 1) & 1], self.xn.data_ptr(), L.router.data_ptr(),
                                     self.router_logits.data_ptr(), self.router_counter.data_ptr(),
                                     self.ids.data_ptr(), self.tw.data_ptr(), s)
-                fl.moe_gate_up2_bf16(self.xn.data_ptr(), self.ids.data_ptr(), L.exp_gate_up.codes.data_ptr(),
+                fl.moe_gate_up_pdl_bf16(self.xn.data_ptr(), self.ids.data_ptr(), L.exp_gate_up.codes.data_ptr(),
                                      L.exp_gate_up.scales.data_ptr(), L.exp_gate_up.gs_dev.data_ptr(),
                                      L.sh_gate_up.codes.data_ptr(), L.sh_gate_up.scales.data_ptr(), L.sh_gate_up.gs,
                                      self.act.data_ptr(), s)
-                fl.moe_down_combine2_bf16(self.act.data_ptr(), self.ids.data_ptr(), self.tw.data_ptr(),
+                fl.moe_down_combine_pdl_bf16(self.act.data_ptr(), self.ids.data_ptr(), self.tw.data_ptr(),
                                           L.exp_down.codes.data_ptr(), L.exp_down.scales.data_ptr(),
                                           L.exp_down.gs_dev.data_ptr(), L.sh_down.codes.data_ptr(),
                                           L.sh_down.scales.data_ptr(), L.sh_down.gs, self.x.data_ptr(), s)
             site += 1
-        fl.add_rmsnorm2_bf16(self.x.data_ptr(), res[site & 1], self.out_norm.data_ptr(), eps, res[(site + 1) & 1],
+        fl.add_rmsnorm_pdl_bf16(self.x.data_ptr(), res[site & 1], self.out_norm.data_ptr(), eps, res[(site + 1) & 1],
                              self.xn.data_ptr(), s)
         lm = self.lm_head
-        fl.gemv2_w4a16(lm.codes.data_ptr(), lm.scales.data_ptr(), self.xn.data_ptr(), 0, 0, 0, 0, eps,
+        fl.gemv_fused_w4a16(lm.codes.data_ptr(), lm.scales.data_ptr(), self.xn.data_ptr(), 0, 0, 0, 0, eps,
                        self.logits.data_ptr(), lm.rows, lm.k, lm.gs, 1, s)
         fl.argmax_next_f32(self.logits.data_ptr(), cfg.vocab_size, self.cand_v.data_ptr(), self.cand_i.data_ptr(),
                            self.argmax_counter.data_ptr(), self.tokens.data_ptr(), self.pos.data_ptr(),

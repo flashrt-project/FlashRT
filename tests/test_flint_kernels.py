@@ -598,7 +598,7 @@ def _frac_equal(a, b):
     return (a == b).float().mean().item()
 
 
-def test_gemv2_fused_norm_matches_unfused():
+def test_gemv_fused_norm_matches_unfused():
     torch.manual_seed(7)
     N, K = 5120, 2048
     codes, scales = repack_dev(rand_blocks(N, K, 60))
@@ -609,11 +609,11 @@ def test_gemv2_fused_norm_matches_unfused():
     fl.add_rmsnorm_bf16(x.data_ptr(), res_a.data_ptr(), w.data_ptr(), xn.data_ptr(), 1, EPS, 0, _stream())
     fl.gemv_w4a16(codes.data_ptr(), scales.data_ptr(), xn.data_ptr(), out_a.data_ptr(), N, K, 0.002, 0, _stream())
     res_out = torch.zeros_like(x); out_b = torch.empty_like(out_a)
-    fl.gemv2_w4a16(codes.data_ptr(), scales.data_ptr(), x.data_ptr(), res.data_ptr(), res_out.data_ptr(), w.data_ptr(),
+    fl.gemv_fused_w4a16(codes.data_ptr(), scales.data_ptr(), x.data_ptr(), res.data_ptr(), res_out.data_ptr(), w.data_ptr(),
                    0, EPS, out_b.data_ptr(), N, K, 0.002, 0, _stream())
     assert torch.equal(res_out, res_a)
     assert _frac_equal(out_a, out_b) > 0.99
-    close_bf16(out_b, out_a.double(), "gemv2 norm", rel=2.0 ** -7)
+    close_bf16(out_b, out_a.double(), "gemv_fused norm", rel=2.0 ** -7)
 
 
 def test_router_norm_matches_unfused():

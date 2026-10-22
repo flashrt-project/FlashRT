@@ -261,6 +261,21 @@ frontends keep their FP8 paths there.
 Pi0.5's decoder-specific consumers (`pi05_dec_fp4_*`) build only with
 `-DFLASHRT_ENABLE_PI05_NVFP4=ON`.
 
+## 13. Flint (`flash_rt_flint`, `-DFLASHRT_ENABLE_FLINT=ON`, `GPU_ARCH=120`)
+
+A separate module for the Flint official NVFP4 GGUF (W4A16: NVFP4 weights,
+BF16 activations); nothing builds into `flash_rt_kernels`. Shapes are Flint's
+(hidden 2048, 32/4 heads of 128, 256 experts top-6); the runtime only calls them with
+those, and the GEMM / GEMV launchers reject unsupported N / K.
+
+| Group | Symbols | What it is |
+|---|---|---|
+| Load | `repack_nvfp4` | GGUF type-40 blocks -> row-major e2m1 codes + UE4M3 scales, bit-exact, with interleaved / grouped row placement |
+| Decode step (PDL, graph-captured) | `embed_pdl_bf16`, `gemv_fused_w4a16`, `decode_attention_fused_bf16`, `router_norm_bf16`, `moe_gate_up_pdl_bf16`, `moe_down_combine_pdl_bf16`, `add_rmsnorm_pdl_bf16`, `argmax_next_f32` | Six kernels per MoE layer: residual-RMSNorm + QKV GEMV, Q/K norm + RoPE + KV write + split attention with sinks (cluster merge), o_proj GEMV, norm + router + top-6, routed + shared SwiGLU, down + weighted combine; static weights loaded before the dependency wait |
+| Decode reference | `embed_at_pos_bf16`, `add_rmsnorm_bf16`, `gemv_w4a16`, `qk_norm_rope_kv_bf16`, `decode_attention_bf16`, `router_topk_bf16`, `moe_gate_up_bf16`, `moe_down_combine_bf16` | Unfused step (`FLINT_DECODE=basic`), the tests' reference for the fused one |
+| Prefill | `embed_rows_bf16`, `qk_norm_rope_kv_rows_bf16`, `prefill_attention_bf16`, `gemm_w4a16`, `gemm_w4a16_grouped`, `router_topk_rows_bf16`, `moe_scan_place`, `moe_combine_rows_bf16`, `advance_pos` | W4A16 tensor-core GEMM (exact dequant into `mma.sync` fragments, 16-128-row tiles, cluster split-K) for dense and expert-grouped matrices, tensor-core router with top-6, expert placement, split-KV causal / sliding attention with sinks |
+| Tuning hooks | `gemm_w4a16_cfg`, `set_gemm_override`, `set_gemv_launch_config`, `set_moe_launch_config`, `get_moe_launch_config` | Explicit launch shapes for searches; defaults need none |
+
 ---
 
 ## Re-use decision tree

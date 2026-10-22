@@ -94,7 +94,7 @@ __device__ __forceinline__ void norm_prologue(const uint16_t* __restrict__ x, co
 // ---------------------------------------------------------------------------
 template <int K, int RPW, int WARPS, int EPI, bool NORM>
 __global__ void __launch_bounds__(WARPS * 32)
-gemv2_kernel(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales, const uint16_t* __restrict__ x,
+gemv_fused_kernel(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales, const uint16_t* __restrict__ x,
              const uint16_t* __restrict__ res_in, uint16_t* __restrict__ res_out, const float* __restrict__ nw,
              int first, float eps, void* __restrict__ out, int N, float gs) {
   constexpr int NCH = K / 1024;
@@ -184,12 +184,12 @@ gemv2_kernel(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scal
 }
 
 template <int K, int RPW, int WARPS, int EPI, bool NORM>
-static void launch_gemv2(const void* codes, const void* scales, const void* x, const void* res_in, void* res_out,
+static void launch_gemv_fused(const void* codes, const void* scales, const void* x, const void* res_in, void* res_out,
                          const float* nw, int first, float eps, void* out, int N, float gs, cudaStream_t s) {
   const int rows_per_block = (EPI == 2) ? WARPS * RPW / 2 : WARPS * RPW;
   const int n_out = (EPI == 2) ? N / 2 : N;
   const int blocks = (n_out + rows_per_block - 1) / rows_per_block;
-  launch_pdl(gemv2_kernel<K, RPW, WARPS, EPI, NORM>, dim3(blocks), dim3(WARPS * 32), 0, s,
+  launch_pdl(gemv_fused_kernel<K, RPW, WARPS, EPI, NORM>, dim3(blocks), dim3(WARPS * 32), 0, s,
              static_cast<const uint8_t*>(codes), static_cast<const uint8_t*>(scales), static_cast<const uint16_t*>(x),
              static_cast<const uint16_t*>(res_in), static_cast<uint16_t*>(res_out), nw, first, eps, out, N, gs);
 }
@@ -198,7 +198,7 @@ static GemvLaunchConfig g_gemv_cfg = {4, 4, 2, 4};
 
 void set_gemv_launch_config(const GemvLaunchConfig& c) { g_gemv_cfg = c; }
 
-int gemv2_w4a16(const void* codes, const void* scales, const void* x, const void* res_in, void* res_out,
+int gemv_fused_w4a16(const void* codes, const void* scales, const void* x, const void* res_in, void* res_out,
                 const float* norm_w, int first, float eps, void* out, int N, int K, float gs, int epilogue,
                 cudaStream_t s) {
   const bool norm = norm_w != nullptr;
@@ -207,7 +207,7 @@ int gemv2_w4a16(const void* codes, const void* scales, const void* x, const void
     const int R = g_gemv_cfg.qkv_rows, W = g_gemv_cfg.qkv_warps;
 #define FLINT_GQ(RR, WW)                                                                                     \
     if (R == RR && W == WW) {                                                                                \
-      launch_gemv2<2048, RR, WW, 0, true>(codes, scales, x, res_in, res_out, norm_w, first, eps, out, N, gs, s); \
+      launch_gemv_fused<2048, RR, WW, 0, true>(codes, scales, x, res_in, res_out, norm_w, first, eps, out, N, gs, s); \
       return 0;                                                                                              \
     }
     FLINT_GQ(4, 4) FLINT_GQ(2, 4) FLINT_GQ(8, 4) FLINT_GQ(4, 8) FLINT_GQ(2, 8) FLINT_GQ(1, 8) FLINT_GQ(8, 2) FLINT_GQ(4, 2)
@@ -217,7 +217,7 @@ int gemv2_w4a16(const void* codes, const void* scales, const void* x, const void
     const int R = g_gemv_cfg.o_rows, W = g_gemv_cfg.o_warps;
 #define FLINT_GO(RR, WW)                                                                                     \
     if (R == RR && W == WW) {                                                                                \
-      launch_gemv2<4096, RR, WW, 0, false>(codes, scales, x, res_in, res_out, norm_w, first, eps, out, N, gs, s); \
+      launch_gemv_fused<4096, RR, WW, 0, false>(codes, scales, x, res_in, res_out, norm_w, first, eps, out, N, gs, s); \
       return 0;                                                                                              \
     }
     FLINT_GO(2, 4) FLINT_GO(1, 4) FLINT_GO(4, 4) FLINT_GO(2, 8) FLINT_GO(1, 8) FLINT_GO(4, 2) FLINT_GO(1, 2)
@@ -225,7 +225,7 @@ int gemv2_w4a16(const void* codes, const void* scales, const void* x, const void
   }
 #define FLINT_G2(KK, RPW, EPI, NORM)                                                                 \
   if (K == KK && epilogue == EPI && norm == NORM) {                                                  \
-    launch_gemv2<KK, RPW, 4, EPI, NORM>(codes, scales, x, res_in, res_out, norm_w, first, eps, out, N, \
+    launch_gemv_fused<KK, RPW, 4, EPI, NORM>(codes, scales, x, res_in, res_out, norm_w, first, eps, out, N, \
                                         gs, s);                                                       \
     return 0;                                                                                         \
   }
@@ -242,7 +242,7 @@ int gemv2_w4a16(const void* codes, const void* scales, const void* x, const void
 // ---------------------------------------------------------------------------
 // Standalone residual add + RMSNorm with PDL (final norm before the LM head).
 // ---------------------------------------------------------------------------
-__global__ void __launch_bounds__(256) add_rmsnorm2_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict__ res_in,
+__global__ void __launch_bounds__(256) add_rmsnorm_pdl_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict__ res_in,
                                                            const float* __restrict__ w, float eps,
                                                            uint16_t* __restrict__ res_out, uint16_t* __restrict__ out) {
   __shared__ __align__(16) uint16_t xs[kH];
@@ -256,9 +256,9 @@ __global__ void __launch_bounds__(256) add_rmsnorm2_kernel(const uint16_t* __res
   pdl_launch();
 }
 
-void add_rmsnorm2_bf16(const void* x, const void* res_in, const float* w, float eps, void* res_out, void* out,
+void add_rmsnorm_pdl_bf16(const void* x, const void* res_in, const float* w, float eps, void* res_out, void* out,
                        cudaStream_t s) {
-  launch_pdl(add_rmsnorm2_kernel, dim3(1), dim3(256), 0, s, static_cast<const uint16_t*>(x),
+  launch_pdl(add_rmsnorm_pdl_kernel, dim3(1), dim3(256), 0, s, static_cast<const uint16_t*>(x),
              static_cast<const uint16_t*>(res_in), w, eps, static_cast<uint16_t*>(res_out), static_cast<uint16_t*>(out));
 }
 
@@ -387,7 +387,7 @@ void router_norm_bf16(const void* x, const void* res_in, const float* nw, float 
 // ---------------------------------------------------------------------------
 template <int WARPS, int ARPW>
 __global__ void __launch_bounds__(WARPS * 32)
-moe_gate_up2_kernel(const uint16_t* __restrict__ xn, const int* __restrict__ ids, const uint8_t* __restrict__ ecodes,
+moe_gate_up_pdl_kernel(const uint16_t* __restrict__ xn, const int* __restrict__ ids, const uint8_t* __restrict__ ecodes,
                     const uint8_t* __restrict__ escales, const float* __restrict__ egs,
                     const uint8_t* __restrict__ scodes, const uint8_t* __restrict__ sscales, float sgs,
                     uint16_t* __restrict__ act) {
@@ -470,12 +470,12 @@ moe_gate_up2_kernel(const uint16_t* __restrict__ xn, const int* __restrict__ ids
   }
 }
 
-void moe_gate_up2_bf16(const void* xn, const int* ids, const void* ecodes, const void* escales, const float* egs,
+void moe_gate_up_pdl_bf16(const void* xn, const int* ids, const void* ecodes, const void* escales, const float* egs,
                        const void* scodes, const void* sscales, float sgs, void* act, cudaStream_t s) {
   const int W = g_moe_cfg.gu_warps, A = g_moe_cfg.gu_rows;
 #define FLINT_GU(WW, AA)                                                                                         \
   if (W == WW && A == AA) {                                                                                      \
-    launch_pdl(moe_gate_up2_kernel<WW, AA>, dim3((kTop * kEI + kSI) / (WW * AA)), dim3(WW * 32), 0, s,  \
+    launch_pdl(moe_gate_up_pdl_kernel<WW, AA>, dim3((kTop * kEI + kSI) / (WW * AA)), dim3(WW * 32), 0, s,  \
                static_cast<const uint16_t*>(xn), ids, static_cast<const uint8_t*>(ecodes),                        \
                static_cast<const uint8_t*>(escales), egs, static_cast<const uint8_t*>(scodes),                     \
                static_cast<const uint8_t*>(sscales), sgs, static_cast<uint16_t*>(act));                           \
@@ -483,7 +483,7 @@ void moe_gate_up2_bf16(const void* xn, const int* ids, const void* ecodes, const
   }
   FLINT_GU(8, 2) FLINT_GU(8, 1) FLINT_GU(4, 2) FLINT_GU(4, 1) FLINT_GU(4, 4) FLINT_GU(8, 4) FLINT_GU(2, 2) FLINT_GU(2, 4)
 #undef FLINT_GU
-  launch_pdl(moe_gate_up2_kernel<8, 2>, dim3((kTop * kEI + kSI) / 16), dim3(256), 0, s, static_cast<const uint16_t*>(xn),
+  launch_pdl(moe_gate_up_pdl_kernel<8, 2>, dim3((kTop * kEI + kSI) / 16), dim3(256), 0, s, static_cast<const uint16_t*>(xn),
              ids, static_cast<const uint8_t*>(ecodes), static_cast<const uint8_t*>(escales), egs,
              static_cast<const uint8_t*>(scodes), static_cast<const uint8_t*>(sscales), sgs, static_cast<uint16_t*>(act));
 }
@@ -495,7 +495,7 @@ void moe_gate_up2_bf16(const void* xn, const int* ids, const void* ecodes, const
 // ---------------------------------------------------------------------------
 template <int WARPS, int RPW>
 __global__ void __launch_bounds__(WARPS * 32)
-moe_down_combine2_kernel(const uint16_t* __restrict__ act, const int* __restrict__ ids, const float* __restrict__ tw,
+moe_down_combine_pdl_kernel(const uint16_t* __restrict__ act, const int* __restrict__ ids, const float* __restrict__ tw,
                          const uint8_t* __restrict__ ecodes, const uint8_t* __restrict__ escales,
                          const float* __restrict__ egs, const uint8_t* __restrict__ scodes,
                          const uint8_t* __restrict__ sscales, float sgs, uint16_t* __restrict__ out) {
@@ -590,13 +590,13 @@ moe_down_combine2_kernel(const uint16_t* __restrict__ act, const int* __restrict
   }
 }
 
-void moe_down_combine2_bf16(const void* act, const int* ids, const float* tw, const void* ecodes, const void* escales,
+void moe_down_combine_pdl_bf16(const void* act, const int* ids, const float* tw, const void* ecodes, const void* escales,
                             const float* egs, const void* scodes, const void* sscales, float sgs, void* out,
                             cudaStream_t s) {
   const int W = g_moe_cfg.dn_warps, R = g_moe_cfg.dn_rows;
 #define FLINT_DN(WW, RR)                                                                                         \
   if (W == WW && R == RR) {                                                                                      \
-    launch_pdl(moe_down_combine2_kernel<WW, RR>, dim3(kH / (WW * RR)), dim3(WW * 32), 0, s,                       \
+    launch_pdl(moe_down_combine_pdl_kernel<WW, RR>, dim3(kH / (WW * RR)), dim3(WW * 32), 0, s,                       \
                static_cast<const uint16_t*>(act), ids, tw, static_cast<const uint8_t*>(ecodes),                    \
                static_cast<const uint8_t*>(escales), egs, static_cast<const uint8_t*>(scodes),                     \
                static_cast<const uint8_t*>(sscales), sgs, static_cast<uint16_t*>(out));                          \
@@ -604,7 +604,7 @@ void moe_down_combine2_bf16(const void* act, const int* ids, const float* tw, co
   }
   FLINT_DN(8, 2) FLINT_DN(8, 1) FLINT_DN(4, 2) FLINT_DN(4, 1) FLINT_DN(4, 4) FLINT_DN(8, 4) FLINT_DN(2, 2) FLINT_DN(2, 4)
 #undef FLINT_DN
-  launch_pdl(moe_down_combine2_kernel<8, 2>, dim3(kH / 16), dim3(256), 0, s, static_cast<const uint16_t*>(act), ids, tw,
+  launch_pdl(moe_down_combine_pdl_kernel<8, 2>, dim3(kH / 16), dim3(256), 0, s, static_cast<const uint16_t*>(act), ids, tw,
              static_cast<const uint8_t*>(ecodes), static_cast<const uint8_t*>(escales), egs,
              static_cast<const uint8_t*>(scodes), static_cast<const uint8_t*>(sscales), sgs, static_cast<uint16_t*>(out));
 }
@@ -612,7 +612,7 @@ void moe_down_combine2_bf16(const void* act, const int* ids, const float* tw, co
 // ---------------------------------------------------------------------------
 // Embedding at the device position (PDL).
 // ---------------------------------------------------------------------------
-__global__ void embed2_kernel(const int* __restrict__ tokens, const int* __restrict__ pos,
+__global__ void embed_pdl_kernel(const int* __restrict__ tokens, const int* __restrict__ pos,
                               const uint16_t* __restrict__ table, uint16_t* __restrict__ out) {
   pdl_wait();
   tokens = after_wait(tokens);
@@ -624,8 +624,8 @@ __global__ void embed2_kernel(const int* __restrict__ tokens, const int* __restr
   pdl_launch();
 }
 
-void embed2_bf16(const int* tokens, const int* pos, const void* table, void* out, cudaStream_t s) {
-  launch_pdl(embed2_kernel, dim3(1), dim3(kH / 8), 0, s, tokens, pos, static_cast<const uint16_t*>(table),
+void embed_pdl_bf16(const int* tokens, const int* pos, const void* table, void* out, cudaStream_t s) {
+  launch_pdl(embed_pdl_kernel, dim3(1), dim3(kH / 8), 0, s, tokens, pos, static_cast<const uint16_t*>(table),
              static_cast<uint16_t*>(out));
 }
 

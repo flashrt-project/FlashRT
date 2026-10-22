@@ -204,18 +204,18 @@ PYBIND11_MODULE(flash_rt_flint, m) {
   m.def("advance_pos", [](uintptr_t pos, int n, uintptr_t stream) { fl::advance_pos(ptr<int>(pos), n, to_stream(stream)); });
 
   // ---- fused decode step (PDL) ----
-  m.def("gemv2_w4a16",
+  m.def("gemv_fused_w4a16",
         [](uintptr_t codes, uintptr_t scales, uintptr_t x, uintptr_t res_in, uintptr_t res_out, uintptr_t norm_w,
            int first, float eps, uintptr_t out, int N, int K, float gs, int epilogue, uintptr_t stream) {
-          if (fl::gemv2_w4a16(ptr<const void>(codes), ptr<const void>(scales), ptr<const void>(x),
+          if (fl::gemv_fused_w4a16(ptr<const void>(codes), ptr<const void>(scales), ptr<const void>(x),
                               ptr<const void>(res_in), ptr<void>(res_out), ptr<const float>(norm_w), first, eps,
                               ptr<void>(out), N, K, gs, epilogue, to_stream(stream)) != 0)
-            throw std::invalid_argument("gemv2_w4a16: unsupported K=" + std::to_string(K) + " epilogue=" +
+            throw std::invalid_argument("gemv_fused_w4a16: unsupported K=" + std::to_string(K) + " epilogue=" +
                                         std::to_string(epilogue) + (norm_w ? " (fused norm)" : ""));
         });
-  m.def("add_rmsnorm2_bf16",
+  m.def("add_rmsnorm_pdl_bf16",
         [](uintptr_t x, uintptr_t res_in, uintptr_t w, float eps, uintptr_t res_out, uintptr_t out, uintptr_t stream) {
-          fl::add_rmsnorm2_bf16(ptr<const void>(x), ptr<const void>(res_in), ptr<const float>(w), eps, ptr<void>(res_out),
+          fl::add_rmsnorm_pdl_bf16(ptr<const void>(x), ptr<const void>(res_in), ptr<const float>(w), eps, ptr<void>(res_out),
                                 ptr<void>(out), to_stream(stream));
         });
   m.def("router_norm_bf16",
@@ -225,23 +225,23 @@ PYBIND11_MODULE(flash_rt_flint, m) {
                                ptr<void>(xn_out), ptr<const void>(wr), ptr<float>(logits), ptr<unsigned>(counter),
                                ptr<int>(ids), ptr<float>(tw), to_stream(stream));
         });
-  m.def("moe_gate_up2_bf16",
+  m.def("moe_gate_up_pdl_bf16",
         [](uintptr_t xn, uintptr_t ids, uintptr_t ecodes, uintptr_t escales, uintptr_t egs, uintptr_t scodes,
            uintptr_t sscales, float sgs, uintptr_t act, uintptr_t stream) {
-          fl::moe_gate_up2_bf16(ptr<const void>(xn), ptr<const int>(ids), ptr<const void>(ecodes), ptr<const void>(escales),
+          fl::moe_gate_up_pdl_bf16(ptr<const void>(xn), ptr<const int>(ids), ptr<const void>(ecodes), ptr<const void>(escales),
                                 ptr<const float>(egs), ptr<const void>(scodes), ptr<const void>(sscales), sgs,
                                 ptr<void>(act), to_stream(stream));
         });
-  m.def("moe_down_combine2_bf16",
+  m.def("moe_down_combine_pdl_bf16",
         [](uintptr_t act, uintptr_t ids, uintptr_t tw, uintptr_t ecodes, uintptr_t escales, uintptr_t egs,
            uintptr_t scodes, uintptr_t sscales, float sgs, uintptr_t out, uintptr_t stream) {
-          fl::moe_down_combine2_bf16(ptr<const void>(act), ptr<const int>(ids), ptr<const float>(tw),
+          fl::moe_down_combine_pdl_bf16(ptr<const void>(act), ptr<const int>(ids), ptr<const float>(tw),
                                      ptr<const void>(ecodes), ptr<const void>(escales), ptr<const float>(egs),
                                      ptr<const void>(scodes), ptr<const void>(sscales), sgs, ptr<void>(out),
                                      to_stream(stream));
         });
-  m.def("embed2_bf16", [](uintptr_t tokens, uintptr_t pos, uintptr_t table, uintptr_t out, uintptr_t stream) {
-    fl::embed2_bf16(ptr<const int>(tokens), ptr<const int>(pos), ptr<const void>(table), ptr<void>(out), to_stream(stream));
+  m.def("embed_pdl_bf16", [](uintptr_t tokens, uintptr_t pos, uintptr_t table, uintptr_t out, uintptr_t stream) {
+    fl::embed_pdl_bf16(ptr<const int>(tokens), ptr<const int>(pos), ptr<const void>(table), ptr<void>(out), to_stream(stream));
   });
   m.def("decode_attention_fused_bf16",
         [](uintptr_t qkv, uintptr_t qw, uintptr_t kw, uintptr_t cos_t, uintptr_t sin_t, uintptr_t pos, uintptr_t cache,

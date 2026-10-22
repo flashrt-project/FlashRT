@@ -105,20 +105,20 @@ struct GemvLaunchConfig {
 void set_gemv_launch_config(const GemvLaunchConfig& c);
 
 // Fused decode step (PDL). Residual stream ping-pongs: a norm site reads res_in and block 0 writes res_out.
-// gemv2: norm_w != nullptr fuses residual add + RMSNorm of x (K == 2048) into the GEMV prologue.
-int gemv2_w4a16(const void* codes, const void* scales, const void* x, const void* res_in, void* res_out,
+// gemv_fused: norm_w != nullptr fuses residual add + RMSNorm of x (K == 2048) into the GEMV prologue.
+int gemv_fused_w4a16(const void* codes, const void* scales, const void* x, const void* res_in, void* res_out,
                 const float* norm_w, int first, float eps, void* out, int N, int K, float gs, int epilogue,
                 cudaStream_t s);
-void add_rmsnorm2_bf16(const void* x, const void* res_in, const float* w, float eps, void* res_out, void* out,
+void add_rmsnorm_pdl_bf16(const void* x, const void* res_in, const float* w, float eps, void* res_out, void* out,
                        cudaStream_t s);
 void router_norm_bf16(const void* x, const void* res_in, const float* nw, float eps, void* res_out, void* xn_out,
                       const void* wr, float* logits, unsigned* counter, int* ids, float* tw, cudaStream_t s);
-void moe_gate_up2_bf16(const void* xn, const int* ids, const void* ecodes, const void* escales, const float* egs,
+void moe_gate_up_pdl_bf16(const void* xn, const int* ids, const void* ecodes, const void* escales, const float* egs,
                        const void* scodes, const void* sscales, float sgs, void* act, cudaStream_t s);
-void moe_down_combine2_bf16(const void* act, const int* ids, const float* tw, const void* ecodes, const void* escales,
+void moe_down_combine_pdl_bf16(const void* act, const int* ids, const float* tw, const void* ecodes, const void* escales,
                             const float* egs, const void* scodes, const void* sscales, float sgs, void* out,
                             cudaStream_t s);
-void embed2_bf16(const int* tokens, const int* pos, const void* table, void* out, cudaStream_t s);
+void embed_pdl_bf16(const int* tokens, const int* pos, const void* table, void* out, cudaStream_t s);
 // warps in {4, 8, 16}; returns non-zero for an unsupported warp count.
 int decode_attention_fused_bf16(const void* qkv, const float* q_norm_w, const float* k_norm_w, const float* cos_t,
                                 const float* sin_t, const int* pos, void* cache, int ring, int window, int rope,
