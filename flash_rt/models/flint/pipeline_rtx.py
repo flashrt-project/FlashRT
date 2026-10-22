@@ -503,16 +503,16 @@ class FlintRuntime:
         key = (b, self._pf_attn_splits(b, pos0, 0), self._pf_attn_splits(b, pos0, cfg.sliding_window))
         g = self.pf_graphs.pop(key, None)
         if g is None:
-            if self._pf_pool is None:
+            if not self.pf_graphs:   # the graphs share one (empty) memory pool, released with the last of them
                 self._pf_pool = torch.cuda.graph_pool_handle()
-            if len(self.pf_graphs) >= self.pf_graph_max:
-                self.pf_graphs.popitem(last=False)
             g = torch.cuda.CUDAGraph()
             g.capture_begin(pool=self._pf_pool, capture_error_mode="thread_local")
             try:
                 self.launch_prefill_chunk(b, pos0)
             finally:
                 g.capture_end()
+            if len(self.pf_graphs) >= self.pf_graph_max:
+                self.pf_graphs.popitem(last=False)
         self.pf_graphs[key] = g
         return g
 

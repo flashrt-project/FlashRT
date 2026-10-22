@@ -50,6 +50,13 @@ elif mode == "reuse":
     first = fe.generate(ids, max_new_tokens=64, stop_ids=[])
     follow = ids + first + fe.tokenizer.encode(" Now add memoization.")
     out = [int(t) for b in fe.stream(follow, 32, stop_ids=(), reuse_prefix=True) for t in b] + [fe.last_reused]
+elif mode == "evict":   # three graph shapes through a 2-entry cache, then a cleared cache
+    fe.rt.pf_graph_max = 2
+    out = []
+    for rep in (1, 2, 3, 1):
+        out += fe.generate(ids * rep, max_new_tokens=4, stop_ids=[])
+    fe.rt.pf_graphs.clear()
+    out += fe.generate(ids * 2, max_new_tokens=4, stop_ids=[])
 elif mode == "follow_full":
     first = fe.generate(ids, max_new_tokens=64, stop_ids=[])
     follow = ids + first + fe.tokenizer.encode(" Now add memoization.")
@@ -92,5 +99,5 @@ def test_prefix_reuse_matches_full_prefill():
 
 
 def test_prefill_graphs_match_eager_launches():
-    for mode in ("prefill", "reuse"):
+    for mode in ("prefill", "reuse", "evict"):
         assert _generate({"FLINT_PF_GRAPH": "1"}, mode) == _generate({"FLINT_PF_GRAPH": "0"}, mode)
