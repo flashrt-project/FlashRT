@@ -118,6 +118,9 @@ tuning hooks for other SM120 parts; none changes the arithmetic.
 - `FLINT_EAGER=1` -- launch decode steps without the CUDA graph.
 - `FLINT_PF_GRAPH=0` -- launch prefill chunks eagerly instead of replaying
   their CUDA graphs.
+- `FLINT_PF_FUSE=0` -- separate prefill kernels for the Q/K norm + RoPE + KV
+  write and for the norm after the MoE combine (default: fused into the QKV
+  GEMM epilogue and the combine).
 - `FLINT_PDL=0` -- no programmatic dependent launch between decode kernels.
 - `FLINT_LM_GREEDY=0` -- final norm, LM head and argmax as three kernels
   instead of one.

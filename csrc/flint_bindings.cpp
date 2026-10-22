@@ -147,6 +147,17 @@ PYBIND11_MODULE(flash_rt_flint, m) {
             throw std::invalid_argument("prefill_attention_bf16: bad variant/split arguments");
         });
 
+  m.def("gemm_w4a16_qkrope",
+        [](uintptr_t A, int M, int lda, uintptr_t codes, uintptr_t scales, int N, int K, float gs, uintptr_t q_norm,
+           uintptr_t k_norm, uintptr_t cos_t, uintptr_t sin_t, uintptr_t pos, uintptr_t q_out, uintptr_t cache, int ring,
+           int rope, float eps, uintptr_t stream) {
+          if (fl::gemm_w4a16_qkrope(ptr<const void>(A), M, lda, ptr<const void>(codes), ptr<const void>(scales), N, K,
+                                    gs, ptr<const float>(q_norm), ptr<const float>(k_norm), ptr<const float>(cos_t),
+                                    ptr<const float>(sin_t), ptr<const int>(pos), ptr<void>(q_out), ptr<void>(cache),
+                                    ring, rope, eps, to_stream(stream)) != 0)
+            throw std::invalid_argument("gemm_w4a16_qkrope: unsupported N=" + std::to_string(N) + " K=" +
+                                        std::to_string(K));
+        });
   m.def("gemm_w4a16",
         [](uintptr_t A, int M, int lda, uintptr_t codes, uintptr_t scales, int N, int K, float gs, uintptr_t C, int ldc,
            int epilogue, uintptr_t stream) {
@@ -201,6 +212,14 @@ PYBIND11_MODULE(flash_rt_flint, m) {
         [](uintptr_t y, uintptr_t inv, uintptr_t tw, uintptr_t shared, uintptr_t out, int n, uintptr_t stream) {
           fl::moe_combine_rows_bf16(ptr<const void>(y), ptr<const int>(inv), ptr<const float>(tw),
                                     ptr<const void>(shared), ptr<void>(out), n, to_stream(stream));
+        });
+
+  m.def("moe_combine_norm_rows_bf16",
+        [](uintptr_t y, uintptr_t inv, uintptr_t tw, uintptr_t shared, uintptr_t residual, uintptr_t w, uintptr_t out,
+           int n, float eps, uintptr_t stream) {
+          fl::moe_combine_norm_rows_bf16(ptr<const void>(y), ptr<const int>(inv), ptr<const float>(tw),
+                                         ptr<const void>(shared), ptr<void>(residual), ptr<const float>(w),
+                                         ptr<void>(out), n, eps, to_stream(stream));
         });
 
   m.def("advance_pos", [](uintptr_t pos, int n, uintptr_t stream) { fl::advance_pos(ptr<int>(pos), n, to_stream(stream)); });

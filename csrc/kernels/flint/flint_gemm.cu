@@ -27,6 +27,19 @@ namespace {
 
 constexpr int BN = 128, BK = 64, THREADS = 256;  // BK: router k-tile
 
+// Epilogue inputs of kEpiQkRope (unused by the other epilogues).
+struct QkRopeArgs {
+  const float* q_norm;
+  const float* k_norm;
+  const float* cos_t;
+  const float* sin_t;
+  const int* pos;
+  uint16_t* q_out;
+  uint16_t* cache;
+  int ring, rope;
+  float eps;
+};
+
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(p));
 }
@@ -99,7 +112,8 @@ __device__ __forceinline__ void cp_async_small(uint32_t dst, const void* src) {
 template <int BM, int ST, int KB, int EPI>
 __device__ __forceinline__ void gemm_body(const uint16_t* const* arow, int m_rows, const uint8_t* __restrict__ W,
                                           const uint8_t* __restrict__ S, int K, int kt0, int nkt, int split, int n0,
-                                          float gs, void* __restrict__ C, int c_row0, int ldc) {
+                                          float gs, void* __restrict__ C, int c_row0, int ldc,
+                                          const QkRopeArgs& qa = QkRopeArgs{}) {
   constexpr int WM = BM >= 128 ? 2 : 1;  // warps along M
   constexpr int WN = 8 / WM;             // warps along N
   constexpr int MT = BM / (16 * WM);     // m-tiles per warp
@@ -216,6 +230,62 @@ __device__ __forceinline__ void gemm_body(const uint16_t* const* arow, int m_row
   }
 
   // ---- epilogue ----
+  if (EPI == kEpiQkRope) {
+    // Stage the bf16 head tile (BM x 128) in shared memory, then one warp per row does exactly what
+    // qk_norm_rope_kv_rows_kernel does for this head (lane holds dims lane + 32j).
+    constexpr int kQ = 32, kKV = 4, kD = BN;
+    __syncthreads();
+    uint16_t* tile = reinterpret_cast<uint16_t*>(smem_raw);
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int r = wm0 + mt * 16 + g + 8 * h;
+        if (r >= m_rows) continue;
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt)
+          *reinterpret_cast<uint32_t*>(tile + r * kD + wn0 + nt * 8 + 2 * t) =
+              pack_bf16x2(acc[mt][nt][2 * h] * gs, acc[mt][nt][2 * h + 1] * gs);
+      }
+    __syncthreads();
+    const int head = n0 / kD;
+    for (int r = warp; r < m_rows; r += THREADS / 32) {
+      const int row = c_row0 + r, p = *qa.pos + row;
+      const int slot = qa.ring > 0 ? (p & (qa.ring - 1)) : p;
+      uint16_t* dst;
+      const float* w = nullptr;
+      if (head < kQ) {
+        dst = qa.q_out + (static_cast<size_t>(row) * kQ + head) * kD; w = qa.q_norm;
+      } else if (head < kQ + kKV) {
+        dst = qa.cache + static_cast<size_t>(slot) * 1024 + (head - kQ) * kD; w = qa.k_norm;
+      } else {
+        dst = qa.cache + static_cast<size_t>(slot) * 1024 + 512 + (head - kQ - kKV) * kD;
+      }
+      const uint16_t* src = tile + r * kD;
+      float v[4] = {bf16_to_f32(src[lane]), bf16_to_f32(src[lane + 32]), bf16_to_f32(src[lane + 64]),
+                    bf16_to_f32(src[lane + 96])};
+      if (w != nullptr) {
+        const float ss = warp_sum(v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3]);
+        const float rs = rsqrtf(ss / kD + qa.eps);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) v[j] = round_bf16(v[j] * rs * w[lane + 32 * j]);
+        if (qa.rope) {
+          const float* ct = qa.cos_t + static_cast<size_t>(p) * 64;
+          const float* st = qa.sin_t + static_cast<size_t>(p) * 64;
+#pragma unroll
+          for (int j = 0; j < 2; ++j) {
+            const int d = lane + 32 * j;
+            const float c = ct[d], sn = st[d], n1 = v[j], n2 = v[j + 2];
+            v[j] = fmaf(n1, c, -(n2 * sn));
+            v[j + 2] = fmaf(n2, c, n1 * sn);
+          }
+        }
+      }
+#pragma unroll
+      for (int j = 0; j < 4; ++j) dst[lane + 32 * j] = f32_to_bf16_bits(v[j]);
+    }
+    return;
+  }
 #pragma unroll
   for (int mt = 0; mt < MT; ++mt) {
 #pragma unroll
@@ -267,7 +337,7 @@ __device__ __forceinline__ int a_row_of(int i) {
 template <int BM, int ST, int KB, int EPI>
 __global__ void __launch_bounds__(THREADS)
 gemm_dense_kernel(const uint16_t* __restrict__ A, int M, int lda, const uint8_t* __restrict__ W,
-                  const uint8_t* __restrict__ S, int K, float gs, void* __restrict__ C, int ldc) {
+                  const uint8_t* __restrict__ S, int K, float gs, void* __restrict__ C, int ldc, QkRopeArgs qa) {
   constexpr int AI = (BM * 8 * KB + THREADS - 1) / THREADS;
   const int m0 = blockIdx.x * BM, n0 = blockIdx.y * BN;
   const int rows = min(BM, M - m0);
@@ -278,7 +348,7 @@ gemm_dense_kernel(const uint16_t* __restrict__ A, int M, int lda, const uint8_t*
     arow[i] = r < rows ? A + static_cast<size_t>(m0 + r) * lda : nullptr;
   }
   const int split = gridDim.z, nkt = K / (64 * KB) / split;
-  gemm_body<BM, ST, KB, EPI>(arow, rows, W, S, K, blockIdx.z * nkt, nkt, split, n0, gs, C, m0, ldc);
+  gemm_body<BM, ST, KB, EPI>(arow, rows, W, S, K, blockIdx.z * nkt, nkt, split, n0, gs, C, m0, ldc, qa);
 }
 
 // Grouped: tile i covers sorted rows [row0, row0 + rows) of expert e (rows <= BM).
@@ -536,7 +606,7 @@ void set_smem_attr(Kernel fn, size_t bytes) {
 
 template <int BM, int ST, int KB, int EPI>
 void launch_dense(const void* A, int M, int lda, const void* codes, const void* scales, int N, int K, float gs,
-                  void* C, int ldc, int split, cudaStream_t s) {
+                  void* C, int ldc, int split, cudaStream_t s, QkRopeArgs qa = QkRopeArgs{}) {
   auto kern = gemm_dense_kernel<BM, ST, KB, EPI>;
   static bool smem_set = false;  // once per instantiation, before graph capture
   if (!smem_set) { set_smem_attr(kern, gemm_smem_bytes<BM, ST, KB>(8)); smem_set = true; }
@@ -552,7 +622,7 @@ void launch_dense(const void* A, int M, int lda, const void* codes, const void* 
     cfg.attrs = attr; cfg.numAttrs = 1;
   }
   cudaLaunchKernelEx(&cfg, kern, static_cast<const uint16_t*>(A), M, lda, static_cast<const uint8_t*>(codes),
-                     static_cast<const uint8_t*>(scales), K, gs, C, ldc);
+                     static_cast<const uint8_t*>(scales), K, gs, C, ldc, qa);
 }
 
 template <int BM, int ST, int KB, int EPI>
@@ -633,6 +703,25 @@ int gemm_w4a16(const void* A, int M, int lda, const void* codes, const void* sca
                void* C, int ldc, int epilogue, cudaStream_t s) {
   GemmConfig c = g_dense_override.bm ? g_dense_override : default_dense_config(M, N, K);
   return gemm_w4a16_cfg(A, M, lda, codes, scales, N, K, gs, C, ldc, epilogue, c, s);
+}
+
+int gemm_w4a16_qkrope(const void* A, int M, int lda, const void* codes, const void* scales, int N, int K, float gs,
+                      const float* q_norm, const float* k_norm, const float* cos_t, const float* sin_t, const int* pos,
+                      void* q_out, void* cache, int ring, int rope, float eps, cudaStream_t s) {
+  const GemmConfig c = g_dense_override.bm ? g_dense_override : default_dense_config(M, N, K);
+  if (N != 40 * BN || c.split < 1 || c.split > 8 || K % (64 * c.kb * c.split)) return 1;
+  const QkRopeArgs qa{q_norm, k_norm, cos_t, sin_t, pos, static_cast<uint16_t*>(q_out), static_cast<uint16_t*>(cache),
+                      ring, rope, eps};
+#define FLINT_QK_CASE(BM_, ST_, KB_)                                                                         \
+  if (c.bm == BM_ && c.stages == ST_ && c.kb == KB_) {                                                       \
+    launch_dense<BM_, ST_, KB_, kEpiQkRope>(A, M, lda, codes, scales, N, K, gs, nullptr, 0, c.split, s, qa); \
+    return 0;                                                                                                \
+  }
+  FLINT_QK_CASE(16, 4, 1) FLINT_QK_CASE(16, 4, 2) FLINT_QK_CASE(16, 3, 4) FLINT_QK_CASE(32, 4, 1)
+  FLINT_QK_CASE(32, 3, 2) FLINT_QK_CASE(32, 2, 4) FLINT_QK_CASE(64, 3, 1) FLINT_QK_CASE(64, 3, 2)
+  FLINT_QK_CASE(128, 2, 1) FLINT_QK_CASE(128, 3, 1)
+#undef FLINT_QK_CASE
+  return 1;
 }
 
 void set_gemm_override(const GemmConfig& dense, const GemmConfig& grouped) {

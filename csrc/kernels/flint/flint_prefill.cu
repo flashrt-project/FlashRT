@@ -173,6 +173,70 @@ void moe_combine_rows_bf16(const void* y, const int* inv, const float* tw, const
                                                    static_cast<const uint16_t*>(shared), static_cast<uint16_t*>(out));
 }
 
+// The combine above followed by the next layer's input norm (add_rmsnorm_bf16 with the same 256 x 8 thread
+// layout and reduction order, so both outputs are bit-identical to the two-kernel sequence):
+//   x = combine(t); s = x + residual[t]; residual[t] = bf16(s); out[t] = bf16(s * rsqrt(mean(s^2) + eps) * w)
+__global__ void moe_combine_norm_rows_kernel(const uint16_t* __restrict__ y, const int* __restrict__ inv,
+                                             const float* __restrict__ tw, const uint16_t* __restrict__ shared,
+                                             uint16_t* __restrict__ residual, const float* __restrict__ w,
+                                             uint16_t* __restrict__ out, float eps) {
+  const int t = blockIdx.x, c0 = threadIdx.x * 8;
+  float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int j = 0; j < kTopK; ++j) {
+    const float wj = tw[t * kTopK + j];
+    const uint4 v = *reinterpret_cast<const uint4*>(y + static_cast<size_t>(inv[t * kTopK + j]) * kHidden + c0);
+    const uint32_t vw[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      acc[2 * q] = fmaf(wj, bf16lo(vw[q]), acc[2 * q]);
+      acc[2 * q + 1] = fmaf(wj, bf16hi(vw[q]), acc[2 * q + 1]);
+    }
+  }
+  const uint4 sh = *reinterpret_cast<const uint4*>(shared + static_cast<size_t>(t) * kHidden + c0);
+  const uint4 rv = *reinterpret_cast<const uint4*>(residual + static_cast<size_t>(t) * kHidden + c0);
+  const uint32_t sw[4] = {sh.x, sh.y, sh.z, sh.w}, rw[4] = {rv.x, rv.y, rv.z, rv.w};
+  float s[8];
+#pragma unroll
+  for (int q = 0; q < 4; ++q) {
+    const uint32_t x = pack_bf16x2(round_bf16(acc[2 * q]) + bf16lo(sw[q]), round_bf16(acc[2 * q + 1]) + bf16hi(sw[q]));
+    s[2 * q] = bf16lo(x) + bf16lo(rw[q]);
+    s[2 * q + 1] = bf16hi(x) + bf16hi(rw[q]);
+  }
+  float ss = 0.f;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) ss = fmaf(s[j], s[j], ss);
+  ss = warp_sum(ss);
+  __shared__ float red[8];
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = ss;
+  __syncthreads();
+  float tot = 0.f;
+#pragma unroll
+  for (int k = 0; k < 8; ++k) tot += red[k];
+  const float rs = rsqrtf(tot / kHidden + eps);
+  const float4 w0 = reinterpret_cast<const float4*>(w + c0)[0];
+  const float4 w1 = reinterpret_cast<const float4*>(w + c0)[1];
+  const float wv[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+  uint4 ro, oo;
+  uint32_t* rp = reinterpret_cast<uint32_t*>(&ro);
+  uint32_t* op = reinterpret_cast<uint32_t*>(&oo);
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    rp[j] = pack_bf16x2(s[2 * j], s[2 * j + 1]);
+    op[j] = pack_bf16x2(s[2 * j] * rs * wv[2 * j], s[2 * j + 1] * rs * wv[2 * j + 1]);
+  }
+  *reinterpret_cast<uint4*>(residual + static_cast<size_t>(t) * kHidden + c0) = ro;
+  *reinterpret_cast<uint4*>(out + static_cast<size_t>(t) * kHidden + c0) = oo;
+}
+
+void moe_combine_norm_rows_bf16(const void* y, const int* inv, const float* tw, const void* shared, void* residual,
+                                const float* w, void* out, int n, float eps, cudaStream_t s) {
+  moe_combine_norm_rows_kernel<<<n, kHidden / 8, 0, s>>>(static_cast<const uint16_t*>(y), inv, tw,
+                                                        static_cast<const uint16_t*>(shared),
+                                                        static_cast<uint16_t*>(residual), w,
+                                                        static_cast<uint16_t*>(out), eps);
+}
+
 // *pos += n (device-side position advance after a prefill chunk)
 __global__ void advance_pos_kernel(int* pos, int n) { *pos += n; }
 void advance_pos(int* pos, int n, cudaStream_t s) { advance_pos_kernel<<<1, 1, 0, s>>>(pos, n); }

@@ -359,6 +359,8 @@ class FlintRuntime:
         self.pf_attn_ctr = torch.zeros(units, dtype=i32, device=self.dev)
         # Prefill chunks replay CUDA graphs captured on first use per launch shape (LRU-bounded).
         self.pf_graph_on = _os.environ.get("FLINT_PF_GRAPH", "1") != "0"
+        # Prefill epilogue fusions (MoE combine + next input norm; QKV GEMM + Q/K norm + RoPE + KV write).
+        self.pf_fuse = _os.environ.get("FLINT_PF_FUSE", "1") != "0"
         self.pf_graph_max = 64
         self.pf_graphs: "OrderedDict[tuple, object]" = OrderedDict()
         self._pf_pool = None
@@ -452,15 +454,25 @@ class FlintRuntime:
         max_tiles = (m * T) // tile_rows + cfg.num_experts
         fl.embed_rows_bf16(self.tokens.data_ptr(), self.pos.data_ptr(), m, self.embed.data_ptr(),
                            self.pf_x.data_ptr(), s)
+        normed = False   # pf_xn / pf_res already hold this layer's normed input (fused into the MoE combine)
         for il, L in enumerate(self.layers):
-            fl.add_rmsnorm_bf16(self.pf_x.data_ptr(), self.pf_res.data_ptr(), L.attn_norm.data_ptr(),
-                                self.pf_xn.data_ptr(), m, eps, 1 if il == 0 else 0, s)
-            self._gemm(self.pf_xn, m, H, L.qkv, self.pf_qkv, cfg.qkv_dim, fl.EPI_BF16, s)
+            if not normed:
+                fl.add_rmsnorm_bf16(self.pf_x.data_ptr(), self.pf_res.data_ptr(), L.attn_norm.data_ptr(),
+                                    self.pf_xn.data_ptr(), m, eps, 1 if il == 0 else 0, s)
+            normed = False
             ring = self.ring if L.sliding else 0
-            fl.qk_norm_rope_kv_rows_bf16(self.pf_qkv.data_ptr(), m, L.q_norm.data_ptr(), L.k_norm.data_ptr(),
-                                         self.rope_cos.data_ptr(), self.rope_sin.data_ptr(), self.pos.data_ptr(),
-                                         self.pf_q.data_ptr(), L.cache.data_ptr(), ring, 1 if L.sliding else 0,
-                                         eps, s)
+            if self.pf_fuse:   # Q/K norm + RoPE + KV write in the QKV GEMM epilogue
+                q = L.qkv
+                fl.gemm_w4a16_qkrope(self.pf_xn.data_ptr(), m, H, q.codes.data_ptr(), q.scales.data_ptr(), q.rows,
+                                     q.k, q.gs, L.q_norm.data_ptr(), L.k_norm.data_ptr(), self.rope_cos.data_ptr(),
+                                     self.rope_sin.data_ptr(), self.pos.data_ptr(), self.pf_q.data_ptr(),
+                                     L.cache.data_ptr(), ring, 1 if L.sliding else 0, eps, s)
+            else:
+                self._gemm(self.pf_xn, m, H, L.qkv, self.pf_qkv, cfg.qkv_dim, fl.EPI_BF16, s)
+                fl.qk_norm_rope_kv_rows_bf16(self.pf_qkv.data_ptr(), m, L.q_norm.data_ptr(), L.k_norm.data_ptr(),
+                                             self.rope_cos.data_ptr(), self.rope_sin.data_ptr(), self.pos.data_ptr(),
+                                             self.pf_q.data_ptr(), L.cache.data_ptr(), ring, 1 if L.sliding else 0,
+                                             eps, s)
             window = cfg.sliding_window if L.sliding else 0
             fl.prefill_attention_bf16(self.pf_q.data_ptr(), m, L.cache.data_ptr(), self.pos.data_ptr(), ring, window,
                                       L.sinks.data_ptr(), scale, self.pf_att.data_ptr(), splits[1 if L.sliding else 0],
@@ -494,8 +506,15 @@ class FlintRuntime:
                                       self.pf_ntiles.data_ptr(), max_tiles, d.codes.data_ptr(),
                                       d.scales.data_ptr(), H, I, d.gs_dev.data_ptr(), self.pf_y_s.data_ptr(), H,
                                       fl.EPI_BF16, tile_rows, mean_rows, s)
-                fl.moe_combine_rows_bf16(self.pf_y_s.data_ptr(), self.pf_inv.data_ptr(), self.pf_tw.data_ptr(),
-                                         self.pf_sh.data_ptr(), self.pf_x.data_ptr(), m, s)
+                if il + 1 < len(self.layers) and self.pf_fuse:
+                    fl.moe_combine_norm_rows_bf16(self.pf_y_s.data_ptr(), self.pf_inv.data_ptr(),
+                                                  self.pf_tw.data_ptr(), self.pf_sh.data_ptr(),
+                                                  self.pf_res.data_ptr(), self.layers[il + 1].attn_norm.data_ptr(),
+                                                  self.pf_xn.data_ptr(), m, eps, s)
+                    normed = True
+                else:
+                    fl.moe_combine_rows_bf16(self.pf_y_s.data_ptr(), self.pf_inv.data_ptr(), self.pf_tw.data_ptr(),
+                                             self.pf_sh.data_ptr(), self.pf_x.data_ptr(), m, s)
         fl.advance_pos(self.pos.data_ptr(), m, s)
 
     def _pf_rows(self, m: int, pos0: int) -> int:

@@ -18,6 +18,7 @@ constexpr int kEpiBf16 = 0;          // bf16(acc * gs)
 constexpr int kEpiF32 = 1;           // acc * gs (fp32)
 constexpr int kEpiSwigluDense = 2;   // gate|up interleaved-by-8: bf16(silu(bf16(g)) * bf16(u)) (precise)
 constexpr int kEpiSwigluRouted = 3;  // routed experts: bf16(silu_approx(g) * u), fp32 g/u
+constexpr int kEpiQkRope = 4;        // QKV projection: Q/K RMSNorm + RoPE + KV-cache write (gemm_w4a16_qkrope)
 
 // Loading.
 void repack_nvfp4(const void* src, long long rows, int K, void* codes, void* scales, long long group_rows,
@@ -72,6 +73,12 @@ int gemm_w4a16(const void* A, int M, int lda, const void* codes, const void* sca
                int ldc, int epilogue, cudaStream_t s);
 int gemm_w4a16_cfg(const void* A, int M, int lda, const void* codes, const void* scales, int N, int K, float gs,
                    void* C, int ldc, int epilogue, GemmConfig c, cudaStream_t s);
+// QKV projection with the qk_norm_rope_kv_rows_bf16 work in the epilogue (each 128-column tile is one head):
+// Q heads -> q_out [M, 32 * 128] (normed + RoPE), K heads -> cache (normed + RoPE), V heads -> cache, all at
+// positions *pos + row; bit-identical to gemm_w4a16 + qk_norm_rope_kv_rows_bf16. N must be 40 * 128.
+int gemm_w4a16_qkrope(const void* A, int M, int lda, const void* codes, const void* scales, int N, int K, float gs,
+                      const float* q_norm, const float* k_norm, const float* cos_t, const float* sin_t, const int* pos,
+                      void* q_out, void* cache, int ring, int rope, float eps, cudaStream_t s);
 // tile_rows: rows per tile of the tile list (from moe_scan_place); mean_rows: mean routed rows per expert
 // (picks the default configuration, BM >= tile_rows).
 int gemm_w4a16_grouped(const void* A, const int* gather, int lda, const int* tiles, const int* n_tiles, int max_tiles,
@@ -92,6 +99,10 @@ void moe_scan_place(const int* ids, int n, int tile_rows, int* counts, int* sort
                     int* n_tiles, const int* pos, const int* n_end, cudaStream_t s);
 void moe_combine_rows_bf16(const void* y, const int* inv, const float* tw, const void* shared, void* out, int n,
                            cudaStream_t s);
+// moe_combine_rows_bf16 followed by add_rmsnorm_bf16(out, residual, w) in one pass (bit-identical); the combined
+// row itself is not stored.
+void moe_combine_norm_rows_bf16(const void* y, const int* inv, const float* tw, const void* shared, void* residual,
+                                const float* w, void* out, int n, float eps, cudaStream_t s);
 void advance_pos(int* pos, int n, cudaStream_t s);
 
 // Launch shapes of the MoE decode kernels: warps per block and rows per warp for the

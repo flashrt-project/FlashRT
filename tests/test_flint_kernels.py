@@ -626,6 +626,60 @@ def test_moe_combine_rows():
     close_bf16(out, want, "combine", rel=2.0 ** -7, abs_frac=0)
 
 
+
+
+
+def test_moe_combine_norm_rows_matches_two_kernels():
+    torch.manual_seed(11)
+    n = 37
+    y = bf16(torch.randn(n * 6, 2048, device=DEV))
+    inv = torch.randperm(n * 6, device=DEV).to(torch.int32)
+    tw = bf16(torch.rand(n, 6, device=DEV)).float()
+    sh = bf16(torch.randn(n, 2048, device=DEV))
+    res = bf16(torch.randn(n, 2048, device=DEV) * 4)
+    w = torch.rand(2048, device=DEV) + 0.5
+    x = torch.empty(n, 2048, dtype=torch.bfloat16, device=DEV)
+    res_a, out_a = res.clone(), torch.empty_like(x)
+    fl.moe_combine_rows_bf16(y.data_ptr(), inv.data_ptr(), tw.data_ptr(), sh.data_ptr(), x.data_ptr(), n, _stream())
+    fl.add_rmsnorm_bf16(x.data_ptr(), res_a.data_ptr(), w.data_ptr(), out_a.data_ptr(), n, EPS, 0, _stream(), 1)
+    res_b, out_b = res.clone(), torch.empty_like(x)
+    fl.moe_combine_norm_rows_bf16(y.data_ptr(), inv.data_ptr(), tw.data_ptr(), sh.data_ptr(), res_b.data_ptr(),
+                                  w.data_ptr(), out_b.data_ptr(), n, EPS, _stream())
+    assert torch.equal(res_b, res_a) and torch.equal(out_b, out_a)
+
+
+@pytest.mark.parametrize("override", [None, (16, 4, 2, 2), (32, 2, 1, 4), (64, 3, 2, 1), (128, 2, 1, 1)])
+@pytest.mark.parametrize("M,ring,rope", [(5, 1024, 1), (77, 0, 0), (300, 1024, 1)])
+def test_gemm_qkrope_matches_gemm_plus_rows(M, ring, rope, override):
+    torch.manual_seed(12)
+    N, K = 5120, 2048
+    codes, scales = repack_dev(rand_blocks(N, K, 62))
+    a = bf16(torch.randn(M, K, device=DEV))
+    qw = torch.rand(128, device=DEV) + 0.5
+    kw = torch.rand(128, device=DEV) + 0.5
+    cos_t, sin_t = rope_tables(4096)
+    pos = torch.tensor([700], dtype=torch.int32, device=DEV)
+    slots = ring if ring else 2048
+    if override:
+        fl.set_gemm_override(*override, 0, 0, 0, 0)
+    try:
+        qkv = torch.empty(M, N, dtype=torch.bfloat16, device=DEV)
+        fl.gemm_w4a16(a.data_ptr(), M, K, codes.data_ptr(), scales.data_ptr(), N, K, 0.01, qkv.data_ptr(), N,
+                      fl.EPI_BF16, _stream())
+        q_a = torch.empty(M, 4096, dtype=torch.bfloat16, device=DEV)
+        c_a = torch.zeros(slots, 1024, dtype=torch.bfloat16, device=DEV)
+        fl.qk_norm_rope_kv_rows_bf16(qkv.data_ptr(), M, qw.data_ptr(), kw.data_ptr(), cos_t.data_ptr(),
+                                     sin_t.data_ptr(), pos.data_ptr(), q_a.data_ptr(), c_a.data_ptr(), ring, rope, EPS,
+                                     _stream())
+        q_b = torch.empty_like(q_a)
+        c_b = torch.zeros_like(c_a)
+        fl.gemm_w4a16_qkrope(a.data_ptr(), M, K, codes.data_ptr(), scales.data_ptr(), N, K, 0.01, qw.data_ptr(),
+                             kw.data_ptr(), cos_t.data_ptr(), sin_t.data_ptr(), pos.data_ptr(), q_b.data_ptr(),
+                             c_b.data_ptr(), ring, rope, EPS, _stream())
+    finally:
+        fl.set_gemm_override(0, 0, 0, 0, 0, 0, 0, 0)
+    assert torch.equal(q_b, q_a) and torch.equal(c_b, c_a)
+
 # ---------------------------------------------------------------------------
 # Fused decode step kernels vs the unfused composition
 # ---------------------------------------------------------------------------
