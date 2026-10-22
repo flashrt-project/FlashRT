@@ -529,18 +529,25 @@ class FlintRuntime:
         out.append(n)
         return out
 
-    def prefill(self, prompt_tokens: List[int], logits_cb=None):
+    def prefill(self, prompt_tokens: List[int], logits_cb=None, start: int = 0):
         """Run the prompt through the chunked prefill path and pick the first generated token.
 
-        ``logits_cb(chunk_start, m, logits)`` (evaluation only) receives fp32 logits for every prompt row.
+        ``start`` > 0 continues a sequence whose KV cache already holds positions [0, start) of these same
+        tokens (e.g. the previous request's prompt and output): only positions >= start are processed.
+        ``logits_cb(chunk_start, m, logits)`` (evaluation only) receives fp32 logits for every processed row.
         """
         torch = self.torch
-        self.reset(prompt_tokens)
         n = len(prompt_tokens)
+        if not 0 <= start < n:
+            raise ValueError(f"prefill start {start} outside [0, {n})")
+        if start == 0:
+            self.reset(prompt_tokens)
+        else:
+            self._load_suffix(prompt_tokens, start)
         buf = None
         with torch.cuda.stream(self.stream):
-            c0 = 0
-            for m in self.chunk_plan(n):
+            c0 = start
+            for m in self.chunk_plan(n - start):
                 self.launch_prefill_chunk(m, c0)
                 if logits_cb is not None:
                     if buf is None:
@@ -617,6 +624,19 @@ class FlintRuntime:
                            self.n_prompt_dev.data_ptr(), s)
 
     # ------------------------------------------------------------------ control
+    def _load_suffix(self, prompt_tokens: List[int], start: int):
+        """Write tokens [start, n) after a cached prefix and point the device position at ``start``."""
+        torch = self.torch
+        n = len(prompt_tokens)
+        if n > self.max_seq:
+            raise ValueError(f"prompt length {n} exceeds max_seq {self.max_seq}")
+        self.tokens[start:].zero_()
+        self.tokens[start:n].copy_(torch.tensor(prompt_tokens[start:], dtype=torch.int32))
+        self.pos.fill_(start)
+        self.n_prompt_dev.fill_(n)
+        self.host_pos = start
+        torch.cuda.synchronize(self.dev)
+
     def reset(self, prompt_tokens: List[int]):
         """Load a prompt into the device token buffer and rewind the position."""
         torch = self.torch

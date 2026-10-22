@@ -10,7 +10,9 @@ because the launch switches are read once per process.
   tokens as the same step without PDL (catches PDL ordering bugs);
 * the fused step must agree with the unfused reference step;
 * chunked prefill + decode must agree with stepping the prompt through the
-  decode graph.
+  decode graph;
+* a follow-up request that reuses the cached prefix must continue like a full
+  prefill of the same tokens.
 """
 from __future__ import annotations
 
@@ -42,6 +44,14 @@ if mode == "stepwise":
     rt.reset(ids)
     rt.replay(len(ids) + 47)
     out = rt.tokens[len(ids):len(ids) + 48].tolist()
+elif mode == "reuse":
+    first = fe.generate(ids, max_new_tokens=64, stop_ids=[])
+    follow = ids + first + fe.tokenizer.encode(" Now add memoization.")
+    out = [int(t) for b in fe.stream(follow, 32, stop_ids=(), reuse_prefix=True) for t in b] + [fe.last_reused]
+elif mode == "follow_full":
+    first = fe.generate(ids, max_new_tokens=64, stop_ids=[])
+    follow = ids + first + fe.tokenizer.encode(" Now add memoization.")
+    out = fe.generate(follow, max_new_tokens=32, stop_ids=[]) + [0]
 else:
     out = fe.generate(ids, max_new_tokens=48, stop_ids=[])
 print(json.dumps(out))
@@ -70,3 +80,10 @@ def test_fused_step_matches_basic_step():
 
 def test_prefill_matches_stepwise_prompt():
     assert _generate({}, "prefill")[:16] == _generate({}, "stepwise")[:16]
+
+
+def test_prefix_reuse_matches_full_prefill():
+    reuse = _generate({}, "reuse")
+    full = _generate({}, "follow_full")
+    assert reuse[-1] >= 64          # the cached prompt + first reply were reused
+    assert reuse[:16] == full[:16]

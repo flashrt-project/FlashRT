@@ -41,14 +41,20 @@ class FlintTorchFrontendRtx:
         self.eog = set(self.cfg.eog_token_ids)
         self.check_block = int(check_block)
         self._host_tokens = None
+        self._kv_ids: List[int] = []     # token ids whose KV is valid in the cache (prefix reuse)
+        self.min_reuse = 64             # shorter common prefixes are recomputed
+        self.last_reused = 0
         self.rt.capture()
 
     def stream(self, prompt_ids: Sequence[int], max_new_tokens: int = 256,
-               stop_ids: Optional[Sequence[int]] = None) -> Iterator[List[int]]:
+               stop_ids: Optional[Sequence[int]] = None, reuse_prefix: bool = False) -> Iterator[List[int]]:
         """Greedy continuation of ``prompt_ids`` as it is produced: the first token right after prefill,
         then blocks of up to ``check_block`` tokens. Stops after an end-of-generation token (included);
         ``stop_ids=()`` disables stopping. The next decode block is queued before the current one is read
-        back, so the GPU does not wait for the host; a stop discards at most one extra block."""
+        back, so the GPU does not wait for the host; a stop discards at most one extra block.
+
+        ``reuse_prefix``: keep the KV cache of the longest common prefix with the previous sequence (its
+        prompt and generated tokens) and prefill only the rest."""
         n = len(prompt_ids)
         if n + max_new_tokens + 2 * self.check_block > self.rt.max_seq:
             raise ValueError(f"prompt {n} + {max_new_tokens} new tokens exceeds max_seq {self.rt.max_seq}")
@@ -57,7 +63,15 @@ class FlintTorchFrontendRtx:
         if self._host_tokens is None or self._host_tokens.numel() < rt.max_seq:
             self._host_tokens = torch.empty(rt.max_seq, dtype=torch.int32, pin_memory=True)
         host = self._host_tokens
-        rt.prefill(list(prompt_ids))           # writes tokens[n] (first generated token)
+        ids = list(prompt_ids)
+        start = 0
+        if reuse_prefix and self._kv_ids:
+            start = min(self.common_prefix(ids), n - 1)
+            if start < self.min_reuse:
+                start = 0
+        self._kv_ids = []                        # invalid until this request finishes
+        rt.prefill(ids, start=start)             # writes tokens[n] (first generated token)
+        self.last_reused = start
         blocks = []                              # (lo, hi, event) queued read-backs, oldest first
 
         def enqueue_readback(lo, hi):
@@ -66,6 +80,7 @@ class FlintTorchFrontendRtx:
             ev.record(rt.stream)
             blocks.append((lo, hi, ev))
 
+        generated: List[int] = []
         with torch.cuda.stream(rt.stream):
             enqueue_readback(n, n + 1)
             produced = 1
@@ -81,11 +96,23 @@ class FlintTorchFrontendRtx:
                 new = host[lo:hi].tolist()
                 for i, t in enumerate(new):
                     if t in stop or done + i + 1 >= max_new_tokens:
-                        yield new[:i + 1]
                         rt.stream.synchronize()
+                        # KV holds the prompt and every generated token except the last one
+                        self._kv_ids = ids + generated + new[:i]
+                        yield new[:i + 1]
                         return
                 done += len(new)
+                generated.extend(new)
                 yield new
+
+    def common_prefix(self, ids: Sequence[int]) -> int:
+        """Length of the common prefix of ``ids`` and the sequence whose KV is cached."""
+        kv = self._kv_ids
+        n = min(len(kv), len(ids))
+        i = 0
+        while i < n and kv[i] == ids[i]:
+            i += 1
+        return i
 
     def generate(self, prompt_ids: Sequence[int], max_new_tokens: int = 256,
                  stop_ids: Optional[Sequence[int]] = None) -> List[int]:

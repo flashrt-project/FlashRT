@@ -10,12 +10,14 @@ Surface (v1):
   * Tools are rendered into the prompt by the model's chat template; tool calls come back as text.
   * Greedy decoding only (temperature 0); the runtime picks tokens with an on-device argmax.
   * ``ignore_eos: true`` (extension) generates exactly ``max_tokens`` tokens, for fixed-length benchmarks.
+  * ``cache_prompt`` (extension, default true): reuse the KV cache of the longest common prefix with the
+    previous request's prompt and output (one cached sequence), so a follow-up turn only prefills what is
+    new. ``timings.cache_n`` reports the reused tokens.
   * Responses carry a ``timings`` extension: prompt tokens, time to first token and decode rate measured
     inside the server.
 
 Limits (v1):
   * Batch size 1: requests are serialised behind one lock.
-  * No prefix cache: every request prefills its full prompt.
 
 Usage::
 
@@ -63,7 +65,7 @@ class FlintEngine:
         msgs = [{**m, 'content': ''} if m.get('content') is None else m for m in messages]
         return self.tok.encode(self.tok.apply_chat_template(msgs, tools=tools or None, add_generation_prompt=True))
 
-    async def generate(self, ids: List[int], max_tokens: int, ignore_eos: bool):
+    async def generate(self, ids: List[int], max_tokens: int, ignore_eos: bool, cache_prompt: bool):
         """Async iterator of ('text', str) events, then ('done', finish_reason, usage, timings)."""
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
@@ -76,7 +78,8 @@ class FlintEngine:
             emitted = ''
             finish = 'length'
             try:
-                for block in self.fe.stream(ids, max_tokens, stop_ids=() if ignore_eos else None):
+                for block in self.fe.stream(ids, max_tokens, stop_ids=() if ignore_eos else None,
+                                            reuse_prefix=cache_prompt):
                     now = time.perf_counter()
                     if t_first is None:
                         t_first = now
@@ -92,7 +95,8 @@ class FlintEngine:
                         emitted = text
                 t1 = time.perf_counter()
                 n = len(out)
-                timings = {'prompt_n': len(ids), 'ttft_ms': (t_first - t0) * 1e3, 'predicted_n': n,
+                timings = {'prompt_n': len(ids), 'cache_n': self.fe.last_reused, 'ttft_ms': (t_first - t0) * 1e3,
+                           'predicted_n': n,
                            'predicted_ms': (t1 - t_first) * 1e3,
                            'predicted_per_second': (n - 1) / (t1 - t_first) if n > 1 and t1 > t_first else None}
                 usage = {'prompt_tokens': len(ids), 'completion_tokens': n, 'total_tokens': len(ids) + n}
@@ -141,6 +145,7 @@ def build_app(engine: FlintEngine):
         if temperature != 0.0:
             raise HTTPException(400, 'only greedy decoding (temperature 0) is supported')
         ignore_eos = bool(req.get('ignore_eos', False))
+        cache_prompt = bool(req.get('cache_prompt', True))
         stream = bool(req.get('stream', False))
         ids = engine.prompt_ids(messages, tools)
         if len(ids) + max_tokens + 2 * engine.fe.check_block > engine.fe.rt.max_seq:
@@ -152,7 +157,7 @@ def build_app(engine: FlintEngine):
 
         if not stream:
             parts: List[str] = []
-            async for ev in engine.generate(ids, max_tokens, ignore_eos):
+            async for ev in engine.generate(ids, max_tokens, ignore_eos, cache_prompt):
                 if ev[0] == 'text':
                     parts.append(ev[1])
                 elif ev[0] == 'error':
@@ -166,7 +171,7 @@ def build_app(engine: FlintEngine):
 
         async def events():
             first = True
-            async for ev in engine.generate(ids, max_tokens, ignore_eos):
+            async for ev in engine.generate(ids, max_tokens, ignore_eos, cache_prompt):
                 if ev[0] == 'text':
                     delta = {'content': ev[1]}
                     if first:
