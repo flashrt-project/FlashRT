@@ -209,10 +209,11 @@ FlashRT build in one session; the llama.cpp figures come from a separate
 | 64 K | **4.52 s** | 7.59 s | 1.7x | **374 tok/s** | 182.3 | 2.1x |
 | 100 K | **9.07 s** | 14.04 s | 1.5x | **308 tok/s** | 162.7 | 1.9x |
 
-Decode at 4 K and 8 K settles at one of two levels about 3% apart from one
-process to the next (identical output tokens: 1.58 or 1.62 ms per token at 4 K,
-1.655 or 1.70 ms at 8 K); in the run above both medians sit on the slower level.
-Other depths vary by under 0.3%. Where the time goes:
+Decode at 4 K and 8 K runs at one of two levels about 3% apart (1.58 or 1.62 ms
+per token at 4 K, 1.655 or 1.70 ms at 8 K); the level can change between
+processes and also within one process, while the generated tokens checked (the
+first 16 of each run) stay identical. In the run above both medians sit on the
+slower level. Other depths vary by under 0.3%. Where the time goes:
 
 - decode at short context is the per-layer dependency chain (QKV, attention,
   o_proj, router, gate/up, down) with each kernel's weight loads issued before
