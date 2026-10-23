@@ -293,6 +293,10 @@ See the [Tensor operator contract](docs/native_nvfp4_api.md) for build flags,
 precision and the paired serving setup. This route requires a pinned Flint
 vLLM host patch and is qualified separately from the standalone frontend.
 
+An earlier RTX 5090 paired measurement recorded **up to 21% higher batch-8
+decode throughput (1.21×)**. This is the historical 2026-10-23 BF16 KV result,
+not a current-build remeasurement; see the [measurement and its configuration](https://github.com/flashrt-project/FlashRT-Structures/blob/feat/flint-w4a8-lm-head/docs/flint_vllm.md#historical-batch-8-decode-result).
+
 #### Qwen3-8B
 
 | Hardware | Mode | Prefill | Decode | Source |
