@@ -287,8 +287,8 @@ llama.cpp F16 KV. [Protocol, accuracy and reproduction](docs/flint_usage.md).
 
 **Guide:** [RTX 5090 setup and limits](docs/flint_usage.md).
 
-**Flint inside vLLM:** optional W4A8 decode and FP8/FP4 prefill producers
-attach through [FlashRT Structures](https://github.com/flashrt-project/FlashRT-Structures).
+**vLLM + FlashRT for Flint:** FlashRT accelerates decode with W4A8
+and prefill with FP8/FP4 operators, integrated through [FlashRT Structures](https://github.com/flashrt-project/FlashRT-Structures).
 See the [Tensor operator contract](docs/native_nvfp4_api.md) for build flags,
 precision and the paired serving setup. This route requires a pinned Flint
 vLLM host patch and is qualified separately from the standalone frontend.
