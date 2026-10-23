@@ -48,6 +48,10 @@ y = projection(x)
 
 ABI 1 and the hardware/profile metadata live in `flash_rt_flint.TENSOR_API_METADATA`.
 The Python producer validates all required symbols before the first execution.
+`Linear`, `DenseFfn`, `LmHead` and `RoutedSharedFfn` reject calls unless the
+activation and every weight tensor share the same CUDA device. Routed/shared
+per-expert global scales and scratch must also be on that device. Device
+mismatches raise `ValueError` before entering CUDA execution.
 Input owners, packed weights and graph buffers must outlive every replay.
 Sharing scratch supports one sequential execution lane; independent concurrent
 lanes require separate scratch. Packing and dynamic activation quantization

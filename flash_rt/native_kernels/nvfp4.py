@@ -354,6 +354,13 @@ def _activation(x, width):
     _tensor(x, torch.bfloat16, x.shape, x.device, "activation")
 
 
+def _same_device(x, operation, *tensors):
+    if any(tensor.device != x.device for tensor in tensors):
+        raise ValueError(
+            f"{operation}: all tensors must share a device with activation"
+        )
+
+
 def _quant_a8(x):
     """bf16 [M, K] -> (int8 [M, K] in the kernel's block-permuted order, fp32 [M, K/32])."""
     ext = _EXTENSION
@@ -789,8 +796,7 @@ def _linear(
     x: torch.Tensor, codes: torch.Tensor, scales: torch.Tensor, global_scale: float
 ) -> torch.Tensor:
     _activation(x, codes.shape[1] * 2)
-    if codes.device != x.device or scales.device != x.device:
-        raise ValueError("linear: weights and activation must share a device")
+    _same_device(x, "linear", codes, scales)
     out = x.new_empty((x.shape[0], codes.shape[0]))
     with torch.cuda.device(x.device):
         _gemm(x, codes, scales, global_scale, out, 0)
@@ -813,6 +819,7 @@ def _dense_ffn(
     down_global: float,
 ) -> torch.Tensor:
     _activation(x, gu_codes.shape[1] * 2)
+    _same_device(x, "dense FFN", gu_codes, gu_scales, down_codes, down_scales)
     intermediate = x.new_empty((x.shape[0], gu_codes.shape[0] // 2))
     out = x.new_empty((x.shape[0], down_codes.shape[0]))
     with torch.cuda.device(x.device):
@@ -832,6 +839,7 @@ def _lm_head(
 ) -> torch.Tensor:
     """fp32 logits = x @ W^T of an NVFP4 vocabulary projection (global scale left to the caller)."""
     _activation(x, codes.shape[1] * 2)
+    _same_device(x, "LM head", codes, scales)
     out = torch.empty(
         (x.shape[0], codes.shape[0]), dtype=torch.float32, device=x.device
     )
@@ -1436,6 +1444,22 @@ def _routed_shared_ffn(
         raise ValueError(f"routed/shared FFN rows {m} exceed capacity {capacity}")
     if len(scratch) != 14:
         raise ValueError("routed/shared FFN needs its declared scratch layout")
+    _same_device(
+        x,
+        "routed/shared FFN",
+        router,
+        egc,
+        egs,
+        egg,
+        edc,
+        eds,
+        edg,
+        sgc,
+        sgs,
+        sdc,
+        sds,
+        *scratch,
+    )
     ext = _EXTENSION
     if ext is None:
         raise RuntimeError("native artifact was not loaded before execution")
