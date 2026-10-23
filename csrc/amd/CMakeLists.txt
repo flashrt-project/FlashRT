@@ -1,7 +1,7 @@
 # ================================================================
 # FlashRT AMD — standalone HIP build (never wired into root CMake).
 #
-#   cmake -B build-amd -S csrc/amd -DGPU_ARCH=gfx942|gfx950|gfx1151
+#   cmake -B build-amd -S csrc/amd -DGPU_ARCH=gfx942|gfx950|gfx1151|gfx1201
 #   cmake --build build-amd -j 8
 #
 # Output: flash_rt/amd/flash_rt_amd_kernels*.so
@@ -43,11 +43,12 @@ option(FLASHRT_AMD_ALLOW_ARCH
 if(NOT GPU_ARCH_BASE STREQUAL "gfx942"
    AND NOT GPU_ARCH_BASE STREQUAL "gfx950"
    AND NOT GPU_ARCH_BASE STREQUAL "gfx1151"
+   AND NOT GPU_ARCH_BASE STREQUAL "gfx1201"
    AND NOT FLASHRT_AMD_ALLOW_ARCH)
   message(FATAL_ERROR
     "GPU_ARCH=${GPU_ARCH} has no FlashRT AMD source set; use gfx942, "
-    "gfx950, or gfx1151 (or opt in with FLASHRT_AMD_ALLOW_ARCH for "
-    "porting work)")
+    "gfx950, gfx1151, or gfx1201 (or opt in with FLASHRT_AMD_ALLOW_ARCH "
+    "for porting work)")
 endif()
 message(STATUS "flash_rt_amd: GPU_ARCH=${GPU_ARCH_BASE}")
 
@@ -67,8 +68,11 @@ find_package(pybind11 CONFIG REQUIRED)
 
 # ── Architecture-selected kernel module ──
 # Keep the source files in the existing directories. RDNA variants carry an
-# `_rdna` filename suffix; gfx1151 must never compile the wave64/MFMA files.
-if(GPU_ARCH_BASE STREQUAL "gfx1151")
+# `_rdna` filename suffix; wave32 RDNA targets must never compile the
+# wave64/MFMA CDNA files. gfx1201 (RDNA 4 / R9700) shares the gfx1151 BF16
+# wave32 sources; FLASHRT_AMD_RDNA4 selects the gfx12 WMMA fragment layout.
+# Runtime still requires a matching build.
+if(GPU_ARCH_BASE STREQUAL "gfx1151" OR GPU_ARCH_BASE STREQUAL "gfx1201")
   set(FLASHRT_AMD_SOURCES
     bindings_rdna.cpp
     kernels/norm_rdna.hip
@@ -120,6 +124,9 @@ if(GPU_ARCH_BASE STREQUAL "gfx942")
 elseif(GPU_ARCH_BASE STREQUAL "gfx950")
   target_compile_definitions(flash_rt_amd_kernels PRIVATE
     FLASHRT_AMD_CDNA4=1)
+elseif(GPU_ARCH_BASE STREQUAL "gfx1201")
+  target_compile_definitions(flash_rt_amd_kernels PRIVATE
+    FLASHRT_AMD_RDNA4=1)
 endif()
 target_compile_options(flash_rt_amd_kernels PRIVATE
   $<$<COMPILE_LANGUAGE:HIP>:-O3 -ffp-contract=fast>)

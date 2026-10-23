@@ -8,16 +8,18 @@ Per-model deployment guides:
 
 | Model | Guide | Status |
 |---|---|---|
-| Pi0.5 | [deployment_amd_pi05.md](deployment_amd_pi05.md) | CDNA4 FP8/BF16; RDNA 3.5 BF16 |
+| Pi0.5 | [deployment_amd_pi05.md](deployment_amd_pi05.md) | CDNA4 FP8/BF16; RDNA 3.5/4 BF16 |
 | GROOT N1.7 | [deployment_amd_groot_n17.md](deployment_amd_groot_n17.md) | FP8 backbone + bf16 DiT |
 
 ## Supported hardware
 
 The native HIP extension has architecture-selected source sets for gfx942
-(CDNA3 / MI300), gfx950 (CDNA4 / MI350), and gfx1151 (RDNA 3.5 / Radeon
-8060S). RDNA implementations remain in the existing `csrc/amd` layout and
-use an `_rdna` filename suffix; they do not compile or reuse the CDNA
-wave64/MFMA kernels.
+(CDNA3 / MI300), gfx950 (CDNA4 / MI350), gfx1151 (RDNA 3.5 / Radeon
+8060S), and gfx1201 (RDNA 4 / Radeon AI PRO R9700). RDNA implementations
+remain in the existing `csrc/amd` layout and use an `_rdna` filename
+suffix; they do not compile or reuse the CDNA wave64/MFMA kernels.
+gfx1201 reuses the same wave32 BF16 RDNA source set as gfx1151; the
+`FLASHRT_AMD_RDNA4` build definition selects the gfx12 WMMA fragment layout.
 
 The extension is built for exactly one architecture. CDNA3 uses E4M3 FNUZ
 (maximum finite value 240), CDNA4 uses OCP E4M3 (maximum finite value 448),
@@ -26,9 +28,9 @@ wrong results rather than a slow fallback, so the restriction is enforced at
 build time and frontend initialization:
 
 - **At build time** — `scripts/amd/build_amd.sh` accepts the exact gfx942,
-  gfx950, and gfx1151 source sets and rejects other `GPU_ARCH` values. Set
-  `FLASHRT_AMD_ALLOW_ARCH=1` to override when bringing up a port to a
-  future architecture.
+  gfx950, gfx1151, and gfx1201 source sets and rejects other `GPU_ARCH`
+  values. Set `FLASHRT_AMD_ALLOW_ARCH=1` to override when bringing up a
+  port to a future architecture.
 - **At CDNA frontend init** — the frontend reads the extension's
   `device_arch()` (the running device's `gcnArchName`, e.g.
   `gfx950:sramecc+:xnack-`) and `build_info()["gpu_arch"]` (the
@@ -37,9 +39,10 @@ build time and frontend initialization:
   an explicit AMD hardware target on the other generation fails immediately instead
   of computing garbage.
 - **At RDNA frontend init** — the Pi0.5 frontend requires an extension whose
-  `build_info()` reports the RDNA source set, wave32, and gfx1151, and also
-  requires the visible device to be gfx1151. A CDNA extension cannot be
-  loaded through the RDNA route, or vice versa.
+  `build_info()` reports the RDNA source set and wave32, with `gpu_arch`
+  matching the visible device (`gfx1151` for `amd_rdna35`, `gfx1201` for
+  `amd_rdna4`). A CDNA extension cannot be loaded through the RDNA route,
+  or vice versa.
 
 ## Build
 
@@ -53,6 +56,8 @@ bash scripts/amd/build_amd.sh gfx950
 bash scripts/amd/build_amd.sh gfx942
 # or, on RDNA 3.5:
 PYTHON=.venv/bin/python bash scripts/amd/build_amd.sh gfx1151
+# or, on RDNA 4 (R9700):
+PYTHON=.venv/bin/python bash scripts/amd/build_amd.sh gfx1201
 ```
 
 Output: `flash_rt/amd/flash_rt_amd_kernels*.so`. CMake selects the source
@@ -65,7 +70,7 @@ Dependencies:
   measurements before HIP Graph capture.
 - **No vendored third-party code.** There is no CUTLASS/CK checkout to
   manage; everything else is HIP C++ plus compiler MFMA intrinsics on CDNA4
-  or WMMA builtins on RDNA 3.5.
+  or WMMA builtins on RDNA 3.5 and RDNA 4.
 - **aiter** (strongly recommended for CDNA4) — AMD's assembly flash-attention
   library. When importable it serves the attention sites; otherwise the
   backend falls back to torch SDPA. Attention is the largest kernel
@@ -112,7 +117,8 @@ decoder-only frames that reuse the last encoded K/V prefix.
 ## Hardware routing
 
 Auto-detection uses the device's `gcnArchName`: gfx942 maps to `amd_cdna3`,
-gfx950 maps to `amd_cdna4`, and gfx1151 maps to `amd_rdna35`. An unregistered
+gfx950 maps to `amd_cdna4`, gfx1151 maps to `amd_rdna35`, and gfx1201 maps
+to `amd_rdna4`. An unregistered
 ROCm architecture raises rather than falling through to an NVIDIA table entry.
 
 ```python
@@ -176,9 +182,9 @@ python -m pytest tests/test_amd_routing.py tests/test_amd_extension.py \
 | `test_amd_hip_graph.py` | buffer round-trips with pattern data, capture → instantiate → replay, byte-identical repeat replays | no ROCm device or extension |
 | `test_amd_kernel_parity.py` | numerical parity of the kernel surface against torch references on real-distribution inputs, including FP8 byte-exactness and the seqused fixed-shape attention path | no ROCm device or extension |
 | `test_amd_pi05_model.py` | end-to-end model load, graph capture, pinned-noise determinism, exact/fixed prompt modes, FP8 and BF16 | no checkpoint (see the per-model guide for the environment variables) |
-| `test_amd_rdna35_routing.py` | gfx1151 routing, lazy imports, BF16/profile contracts, and CDNA/Triton isolation | torch unavailable; hardware-only cases require gfx1151 |
-| `test_amd_rdna35_ops.py` | RDNA native-kernel parity, validation, graph replay, and library fallbacks | no gfx1151 ROCm device or RDNA extension |
-| `test_amd_rdna35_model.py` | RDNA Pi0.5 finite output, determinism, full-graph parity, and optimized/fallback parity | no gfx1151 checkpoint |
+| `test_amd_rdna35_routing.py` | gfx1151 and gfx1201 routing, lazy imports, BF16/profile contracts, and CDNA/Triton isolation | torch unavailable; hardware-only cases require gfx1151 or gfx1201 |
+| `test_amd_rdna35_ops.py` | RDNA native-kernel parity, validation, graph replay, and library fallbacks | no gfx1151 or gfx1201 ROCm device or RDNA extension |
+| `test_amd_rdna35_model.py` | RDNA Pi0.5 finite output, determinism, full-graph parity, optimized/fallback parity, and shipped LIBERO frames | no gfx1151 or gfx1201 checkpoint |
 | `test_amd_groot_routing.py` | GROOT N1.7 pipeline-map entry, precision-tier contracts, attention-backend site/layer validation | extension-dependent cases skip without the `.so` |
 | `test_amd_groot_model.py` | GROOT N1.7 end-to-end: kernel backbone, finite actions, pinned-noise determinism, optional reference cosine | no checkpoint |
 

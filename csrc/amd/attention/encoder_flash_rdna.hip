@@ -1,5 +1,5 @@
 // ================================================================
-// FlashRT AMD -- fused BF16 encoder GQA attention (RDNA 3.5, wave32)
+// FlashRT AMD -- fused BF16 encoder GQA attention (RDNA 3.5 / RDNA 4, wave32)
 //
 // BF16 GQA contract:
 //   Q [S, Hq, 256] BF16, S <= 4096, Hq <= 16
@@ -7,7 +7,8 @@
 //   O [S, Hq, 256] BF16, bidirectional and unmasked inside the valid prefix
 //
 // The kernel is an online-softmax flash-attention implementation built from
-// gfx11 wave32 BF16 WMMA instructions. A wave pair owns a 16-row Q tile: its
+// wave32 BF16 WMMA instructions; wmma_rdna.h maps the gfx11 and gfx12
+// fragment layouts. A wave pair owns a 16-row Q tile: its
 // leader computes QK and softmax, and the two waves split the 256 output
 // columns. Several pairs share one V tile inside a workgroup:
 //
@@ -32,19 +33,12 @@
 // ================================================================
 
 #include "../kernels/common_hip_rdna.h"
+#include "../kernels/wmma_rdna.h"
 
 #include <cfloat>
 #include <stdexcept>
 
 namespace {
-
-using Bf16x16EncoderRdna = __bf16 __attribute__((ext_vector_type(16)));
-using Floatx8EncoderRdna = float __attribute__((ext_vector_type(8)));
-
-union Bf16EncoderFragmentRdna {
-  Bf16x16EncoderRdna values;
-  unsigned long long words[4];
-};
 
 constexpr int kEncoderHeads = 8;
 constexpr int kEncoderDim = 256;
@@ -66,11 +60,6 @@ struct EncoderAttentionLdsRdna {
   float inverse_sum[5][kEncoderWaveQueryTile];
 };
 
-__device__ __forceinline__ int encoder_accumulator_row_rdna(int lane,
-                                                            int item) {
-  return 2 * item + (lane >> 4);
-}
-
 __device__ __forceinline__ float encoder_row_reduce_max_rdna(float value) {
 #pragma unroll
   for (int offset = 1; offset <= 8; offset <<= 1) {
@@ -85,17 +74,6 @@ __device__ __forceinline__ float encoder_row_reduce_sum_rdna(float value) {
     value += __shfl_xor(value, offset, FLASHRT_RDNA_WAVE_SIZE);
   }
   return value;
-}
-
-__device__ __forceinline__ Bf16x16EncoderRdna
-load_encoder_fragment_rdna(const __bf16 *source) {
-  Bf16EncoderFragmentRdna fragment;
-#pragma unroll
-  for (int index = 0; index < 4; ++index) {
-    fragment.words[index] =
-        reinterpret_cast<const unsigned long long *>(source)[index];
-  }
-  return fragment.values;
 }
 
 template <int QueryTilesPerHead, int HeadsPerGroup, bool RuntimeHeadStride>
@@ -127,11 +105,11 @@ __global__ __launch_bounds__(QueryTilesPerHead * HeadsPerGroup *
   const int query_start = blockIdx.x * query_tile +
                           query_tile_in_head * kEncoderWaveQueryTile;
 
-  Floatx8EncoderRdna output_accumulator[kEncoderDimTilesPerWave];
+  RdnaWmmaAccumulator output_accumulator[kEncoderDimTilesPerWave];
 #pragma unroll
   for (int tile = 0; tile < kEncoderDimTilesPerWave; ++tile) {
     output_accumulator[tile] =
-        (Floatx8EncoderRdna){0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        (RdnaWmmaAccumulator){0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
   }
   float running_max[8];
   float running_sum[8];
@@ -175,8 +153,8 @@ __global__ __launch_bounds__(QueryTilesPerHead * HeadsPerGroup *
     // Only the first wave in each pair computes QK and online softmax. The
     // second wave receives probabilities and correction factors through LDS.
     if (output_wave == 0) {
-      Floatx8EncoderRdna score_accumulator =
-          (Floatx8EncoderRdna){0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+      RdnaWmmaAccumulator score_accumulator =
+          (RdnaWmmaAccumulator){0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
       const int query_row = min(query_start + fragment_row, query_rows - 1);
       const int key_row = key_start + min(fragment_row, key_count - 1);
       const __bf16 *query_head = reinterpret_cast<const __bf16 *>(
@@ -186,9 +164,9 @@ __global__ __launch_bounds__(QueryTilesPerHead * HeadsPerGroup *
           key + static_cast<size_t>(key_row) * kEncoderDim);
 #pragma unroll
       for (int dim = 0; dim < kEncoderDim; dim += 16) {
-        score_accumulator = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(
-            load_encoder_fragment_rdna(query_head + dim),
-            load_encoder_fragment_rdna(key_head + dim), score_accumulator);
+        score_accumulator = rdna_wmma_bf16(
+            rdna_wmma_load_fragment(query_head + dim, lane),
+            rdna_wmma_load_fragment(key_head + dim, lane), score_accumulator);
       }
 
       float probability[8];
@@ -210,7 +188,7 @@ __global__ __launch_bounds__(QueryTilesPerHead * HeadsPerGroup *
         const float tile_sum = encoder_row_reduce_sum_rdna(unnormalized);
         running_sum[item] = fmaf(running_sum[item], correction, tile_sum);
         running_max[item] = next_max[item];
-        const int row = encoder_accumulator_row_rdna(lane, item);
+        const int row = rdna_wmma_accumulator_row(lane, item);
         lds.probability[wave_pair][row][fragment_row] =
             __float2bfloat16(unnormalized);
         if (fragment_row == 0) {
@@ -226,15 +204,15 @@ __global__ __launch_bounds__(QueryTilesPerHead * HeadsPerGroup *
     for (int tile = 0; tile < kEncoderDimTilesPerWave; ++tile) {
 #pragma unroll
       for (int item = 0; item < 8; ++item) {
-        const int row = encoder_accumulator_row_rdna(lane, item);
+        const int row = rdna_wmma_accumulator_row(lane, item);
         output_accumulator[tile][item] *= lds.output_scale[wave_pair][row];
       }
       const int dim_tile = output_wave * kEncoderDimTilesPerWave + tile;
-      output_accumulator[tile] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(
-          load_encoder_fragment_rdna(
-              &lds.probability[wave_pair][fragment_row][0]),
-          load_encoder_fragment_rdna(
-              &lds.value_transposed[dim_tile * 16 + fragment_row][0]),
+      output_accumulator[tile] = rdna_wmma_bf16(
+          rdna_wmma_load_fragment(
+              &lds.probability[wave_pair][fragment_row][0], lane),
+          rdna_wmma_load_fragment(
+              &lds.value_transposed[dim_tile * 16 + fragment_row][0], lane),
           output_accumulator[tile]);
     }
     // Consumers must finish before the next KV tile overwrites the LDS slots.
@@ -244,7 +222,7 @@ __global__ __launch_bounds__(QueryTilesPerHead * HeadsPerGroup *
   if (output_wave == 0 && fragment_row == 0) {
 #pragma unroll
     for (int item = 0; item < 8; ++item) {
-      const int row = encoder_accumulator_row_rdna(lane, item);
+      const int row = rdna_wmma_accumulator_row(lane, item);
       lds.inverse_sum[wave_pair][row] =
           1.0f / fmaxf(running_sum[item], 1.0e-30f);
     }
@@ -255,7 +233,7 @@ __global__ __launch_bounds__(QueryTilesPerHead * HeadsPerGroup *
   for (int tile = 0; tile < kEncoderDimTilesPerWave; ++tile) {
 #pragma unroll
     for (int item = 0; item < 8; ++item) {
-      const int query_in_tile = encoder_accumulator_row_rdna(lane, item);
+      const int query_in_tile = rdna_wmma_accumulator_row(lane, item);
       const int query_row = query_start + query_in_tile;
       const int dim =
           (output_wave * kEncoderDimTilesPerWave + tile) * 16 + fragment_row;

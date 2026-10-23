@@ -16,6 +16,15 @@ class Rdna35AttentionBackend:
         self.hip_encoder_gqa = (
             os.getenv("FLASHRT_RDNA35_HIP_ENCODER_ATTN", "1") == "1"
         )
+        build_info = getattr(kernels, "build_info", None)
+        arch = (
+            str(dict(build_info()).get("gpu_arch", ""))
+            if callable(build_info) else ""
+        )
+        # On gfx12 SDPA beats the native encoder kernel on dense prefixes
+        # (66 vs 263 us at 661 rows on R9700); the native loop still wins
+        # when it can skip padded K/V rows (239 vs 602 us at 712/661).
+        self.hip_dense_encoder_gqa = not arch.startswith("gfx12")
         self.hip_gqa = os.getenv("FLASHRT_RDNA35_HIP_GQA", "1") == "1"
         self.hip_gqa_split_key = (
             os.getenv("FLASHRT_RDNA35_HIP_GQA_SPLIT_KEY", "1") == "1"
@@ -102,6 +111,7 @@ class Rdna35AttentionBackend:
             # AOTriton SDPA. Large padded inputs with a short valid prefix do
             # benefit from the native loop, which skips invalid K/V rows.
             and (q.shape[0] <= 1024 or valid_prefix <= 640)
+            and (self.hip_dense_encoder_gqa or valid_prefix < k.shape[0])
             and q.shape[0] == k.shape[0]
             and (
                 valid_prefix == k.shape[0]

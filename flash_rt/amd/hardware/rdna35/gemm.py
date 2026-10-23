@@ -54,10 +54,10 @@ class Rdna35GemmBackend:
             x.shape[1], self._stream(x))
 
     def prepare_smallm_weight(self, weight: torch.Tensor) -> None:
-        """Create the persistent N-by-K layout consumed by gfx11 WMMA.
+        """Create the persistent N-by-K layout consumed by RDNA WMMA.
 
-        Only the measured decoder action projection is currently routed, so
-        enabling this adds 64 KiB rather than duplicating all model weights.
+        Each prepared weight keeps an extra transposed copy, so callers route
+        only projections whose small-M speedup was measured on the target.
         Preparation happens before graph capture and never on the hot path.
         """
         if not self.hip_smallm:
@@ -66,12 +66,34 @@ class Rdna35GemmBackend:
             weight.device.type != "cuda"
             or weight.dtype != self.dtype
             or weight.ndim != 2
-            or weight.shape != (1024, 32)
+            or weight.shape[0] % 16 != 0
+            or weight.shape[1] % 16 != 0
             or not weight.is_contiguous()
         ):
             raise ValueError("unsupported RDNA 3.5 small-M weight")
         self._smallm_weights[weight.data_ptr()] = (
             weight, weight.t().contiguous())
+
+    def _prepared_weight_nt(self, weight: torch.Tensor):
+        """Return the prepared N-by-K copy of exactly this weight, if any.
+
+        Stacked per-layer weights are indexed into fresh views on every call,
+        so the match is by storage, offset, shape, and stride, not identity.
+        The prepared view keeps its storage alive, so the address cannot be
+        reused by a different tensor while the entry exists.
+        """
+        packed = self._smallm_weights.get(weight.data_ptr())
+        if packed is None:
+            return None
+        prepared, weight_nt = packed
+        if (
+            prepared.shape != weight.shape
+            or prepared.stride() != weight.stride()
+            or prepared.untyped_storage().data_ptr()
+            != weight.untyped_storage().data_ptr()
+        ):
+            return None
+        return weight_nt
 
     def linear(self, out, x, weight, bias=None):
         tensors = (out, x, weight) if bias is None else (
@@ -115,12 +137,7 @@ class Rdna35GemmBackend:
             bias.shape != (out2.shape[1],) or not bias.is_contiguous()
         ):
             raise ValueError("unsupported RDNA 3.5 GEMM bias")
-        packed = self._smallm_weights.get(weight.data_ptr())
-        weight_nt = (
-            packed[1]
-            if packed is not None and packed[0] is weight
-            else None
-        )
+        weight_nt = self._prepared_weight_nt(weight)
         if (
             weight_nt is not None
             and x2.shape[0] <= 48
@@ -170,12 +187,7 @@ class Rdna35GemmBackend:
             return False
         x2 = x.reshape(-1, x.shape[-1])
         out2 = out.reshape(-1, out.shape[-1])
-        packed = self._smallm_weights.get(weight.data_ptr())
-        weight_nt = (
-            packed[1]
-            if packed is not None and packed[0] is weight
-            else None
-        )
+        weight_nt = self._prepared_weight_nt(weight)
         if (
             weight_nt is None
             or x2.shape[0] > 48

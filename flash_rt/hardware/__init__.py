@@ -41,6 +41,7 @@ def detect_arch() -> str:
         ``"amd_cdna3"`` — AMD Instinct MI300 series, ROCm (gfx942)
         ``"amd_cdna4"`` — AMD Instinct MI350 series, ROCm (gfx950)
         ``"amd_rdna35"`` — AMD RDNA 3.5 (gfx1151 / Radeon 8060S)
+        ``"amd_rdna4"``  — AMD RDNA 4 (gfx1201 / Radeon AI PRO R9700)
         ``"apple_mps"`` — Apple Silicon via PyTorch MPS (Pi0.5 BF16)
 
     Raises RuntimeError if no supported accelerator is available or the
@@ -92,11 +93,14 @@ def detect_arch() -> str:
             return "amd_cdna4"
         if base_arch == "gfx1151":
             return "amd_rdna35"
+        if base_arch == "gfx1201":
+            return "amd_rdna4"
         raise RuntimeError(
             f"FlashRT: unsupported ROCm GPU arch {gcn!r}. "
             "Supported: gfx942 (MI300 series / CDNA3), "
-            "gfx950 (MI350 series / CDNA4), or gfx1151 "
-            "(Radeon 8060S / Ryzen AI Max+ 395).")
+            "gfx950 (MI350 series / CDNA4), gfx1151 "
+            "(Radeon 8060S / Ryzen AI Max+ 395), or gfx1201 "
+            "(Radeon AI PRO R9700 / RDNA 4).")
     major, minor = torch.cuda.get_device_capability()
     if (major, minor) == (11, 0):
         return "thor"
@@ -144,6 +148,9 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("pi05", "torch", "amd_cdna3"):
         ("flash_rt.amd.frontends.torch.pi05", "Pi05TorchFrontendAmd"),
     ("pi05", "torch", "amd_rdna35"):
+        ("flash_rt.amd.frontends.torch.pi05_rdna35",
+         "Pi05TorchFrontendAmdRdna35"),
+    ("pi05", "torch", "amd_rdna4"):
         ("flash_rt.amd.frontends.torch.pi05_rdna35",
          "Pi05TorchFrontendAmdRdna35"),
     ("pi05", "torch", "npu"):

@@ -290,16 +290,79 @@ model.set_prompt("pick up the object", state=state_vector)
 actions = model.predict(images=[base_image, wrist_image])
 ```
 
-`hardware="auto"` maps only the exact gfx1151 ISA to this backend. The
+`hardware="auto"` maps the exact gfx1151 ISA to `amd_rdna35`. The
 frontend also verifies that the extension was built from the RDNA source set,
 uses wave32, and targets gfx1151 before loading the checkpoint.
 
+## Pi0.5 on AMD RDNA 4 (gfx1201 / R9700)
+
+RDNA 4 reuses the same wave32 BF16 Pi0.5 frontend and HIP source set as
+RDNA 3.5. The public hardware key is `amd_rdna4`. Build and load with the
+matching ISA:
+
+```bash
+PYTHON=.venv/bin/python bash scripts/amd/build_amd.sh gfx1201
+```
+
+```python
+model = flash_rt.load_model(
+    "<checkpoint-dir>",
+    config="pi05",
+    framework="torch",
+    hardware="amd_rdna4",  # optional on a gfx1201 machine
+    action_dim=7,
+    num_views=2,
+    cache_frames=1,
+    use_fp8=False,
+)
+```
+
+`hardware="auto"` maps only the exact gfx1201 ISA to this backend. The
+frontend requires a gfx1201-built RDNA extension and a visible gfx1201
+device before loading the checkpoint.
+
+The WMMA kernels share one source with gfx1151; `csrc/amd/kernels/wmma_rdna.h`
+maps the gfx12 fragment layout, where each lane carries half of a 16-element
+K block instead of a replicated full block. Routing differs from gfx1151 where
+R9700 measurements differ:
+
+- With `chunk_size <= 16`, the decoder QKV, output, merged gate/up, and down
+  projections use a streamed split-K small-M kernel instead of hipBLASLt.
+  These projections stream about 0.6 GB of weights per denoise step, so they
+  are bandwidth bound. Measured with cold weights at M=10, the four
+  projections take 14.4 ms per inference instead of 18.5 ms. The transposed
+  weight copies add 0.58 GiB.
+- Dense encoder prefixes stay on SDPA, which takes 66 us at 661 rows against
+  263 us for the native kernel. The native kernel is used for padded prefixes
+  (`FLASHRT_RDNA35_COMPACT_ENCODER=0`), where it takes 239 us against 602 us
+  for masked SDPA.
+
+The RDNA operator and model suites accept a visible gfx1201 device.
+`test_optimized_path_matches_aten_fallback`
+and `test_real_libero_frames_are_deterministic_and_match_aten_fallback`
+compare the loaded path with the PyTorch fallback on fixed noise.
+The LIBERO test reads the eight real observations in
+`examples/thor/assets/pi05_libero.npz`.
+
+End-to-end latency on R9700 follows the gfx1151 protocol: `infer` median
+after warmup, BF16, 2 views, horizon 10, 10 denoise steps:
+
+| Input | `cache_frames` | Median | p95 |
+|---|---:|---:|---:|
+| Synthetic 224² views, prompt length 149 | 1 | 54.8 ms | 54.9 ms |
+| Synthetic 224² views, prompt length 149 | 2 | 38.3 ms (decoder-only frames ~21.8 ms) | 54.8 ms |
+| Eight LIBERO observations, prompt length 150 | 1 | 54.9 ms | 55.2 ms |
+
+Routing the decoder projections through hipBLASLt instead measures 60.0 ms
+for the same `cache_frames=1` input.
+
 ## Precision tier
 
-The RDNA 3.5 backend supports BF16 weights and activations only. It does not
-route through the CDNA4 FP8 kernels, packed MFMA layouts, aiter provider, or
-wave64 helpers. `load_model()` converts its historical `use_fp8=True` default
-to BF16 with a warning; direct frontend construction rejects `use_fp8=True`.
+The RDNA 3.5 / RDNA 4 backends support BF16 weights and activations only. They
+do not route through the CDNA4 FP8 kernels, packed MFMA layouts, aiter
+provider, or wave64 helpers. `load_model()` converts its historical
+`use_fp8=True` default to BF16 with a warning; direct frontend construction
+rejects `use_fp8=True`.
 
 ## Observation contract
 
@@ -349,8 +412,8 @@ same-process parity and performance comparisons:
 | `FLASHRT_RDNA35_HIP_DECODER` | `1` | decoder normalization, activation, and residual fusions |
 | `FLASHRT_RDNA35_HIP_GQA` | `1` | wave32 decoder GQA for queries up to 16 rows; row-owned K/V up to 1024 |
 | `FLASHRT_RDNA35_HIP_GQA_SPLIT_KEY` | `1` | split-key decoder GQA with K/V up to 2048 |
-| `FLASHRT_RDNA35_HIP_ENCODER_ATTN` | `1` | native encoder GQA up to 4096 rows and 16 query heads; dense inputs above 1024 use SDPA when faster |
-| `FLASHRT_RDNA35_HIP_SMALLM` | `1` | WMMA action projection for M up to 48 |
+| `FLASHRT_RDNA35_HIP_ENCODER_ATTN` | `1` | native encoder GQA up to 4096 rows and 16 query heads; dense inputs above 1024 use SDPA when faster, and gfx1201 keeps every dense prefix on SDPA |
+| `FLASHRT_RDNA35_HIP_SMALLM` | `1` | WMMA action projection for M up to 48; on gfx1201 with `chunk_size <= 16`, also the decoder QKV, output, gate/up, and down projections |
 | `FLASHRT_RDNA35_HIP_FFN_GATE_UP` | `1` | merged decoder gate/up dataflow |
 | `FLASHRT_RDNA35_HIP_ENCODER_FFN` | `1` | merged encoder gate/up dataflow |
 | `FLASHRT_RDNA35_HIP_LARGE_OPS` | `1` | shape-specialized vision/encoder normalization and residual kernels |
@@ -395,10 +458,12 @@ FLASH_RT_PI05_RDNA35_CKPT="<checkpoint-dir>" \
 .venv/bin/python -m pytest tests/test_amd*.py -q
 ```
 
-Operator tests compare every native family with a PyTorch reference. The
-checkpoint-gated tests cover finite outputs, fixed-noise determinism, HIP
-Graph parity, and the optimized-versus-library fallback. Profile any extra
-local benchmark from an ignored build directory; benchmark harnesses are not
+Operator tests compare every native family with a PyTorch reference on both
+gfx1151 and gfx1201. The checkpoint-gated tests cover finite
+outputs, fixed-noise determinism, HIP Graph parity, the
+optimized-versus-library fallback, and the eight real LIBERO observations
+shipped in `examples/thor/assets/pi05_libero.npz`. Profile any extra local
+benchmark from an ignored build directory; benchmark harnesses are not
 part of the source distribution.
 
 

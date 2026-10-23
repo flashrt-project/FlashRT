@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build flash_rt_amd_kernels in a ROCm environment (GPU visible or not).
-#   bash scripts/amd/build_amd.sh [gfx942|gfx950|gfx1151]
+#   bash scripts/amd/build_amd.sh [gfx942|gfx950|gfx1151|gfx1201]
 #
 # CMake owns the architecture-specific source set. Output:
 # flash_rt/amd/flash_rt_amd_kernels*.so
@@ -12,7 +12,7 @@ if [[ $# -gt 0 ]]; then
 else
   GPU_ARCH="$(rocminfo 2>/dev/null | grep -om1 'gfx[0-9a-f]\+' || true)"
   if [[ -z "${GPU_ARCH}" ]]; then
-    echo "error: pass gfx942, gfx950, or gfx1151 when no AMD GPU is visible" >&2
+    echo "error: pass gfx942, gfx950, gfx1151, or gfx1201 when no AMD GPU is visible" >&2
     exit 1
   fi
 fi
@@ -22,9 +22,10 @@ fi
 GPU_ARCH_BASE="${GPU_ARCH%%:*}"
 if [[ "${GPU_ARCH_BASE}" != "gfx942" && "${GPU_ARCH_BASE}" != "gfx950" \
       && "${GPU_ARCH_BASE}" != "gfx1151" \
+      && "${GPU_ARCH_BASE}" != "gfx1201" \
       && "${FLASHRT_AMD_ALLOW_ARCH:-0}" != "1" ]]; then
   echo "error: GPU_ARCH='${GPU_ARCH}' has no FlashRT AMD source set." >&2
-  echo "       Pass gfx942/gfx950/gfx1151, or set FLASHRT_AMD_ALLOW_ARCH=1." >&2
+  echo "       Pass gfx942/gfx950/gfx1151/gfx1201, or set FLASHRT_AMD_ALLOW_ARCH=1." >&2
   exit 1
 fi
 

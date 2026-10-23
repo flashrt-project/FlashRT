@@ -412,11 +412,12 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
               gfx942 (MI300 series) → ``flash_rt.amd.*`` (CDNA3)
               gfx950 (MI350 series) → ``flash_rt.amd.*`` (CDNA4)
               gfx1151 (Radeon 8060S) → ``flash_rt.amd.*`` (RDNA 3.5 BF16)
+              gfx1201 (Radeon AI PRO R9700) → ``flash_rt.amd.*`` (RDNA 4 BF16)
               Apple Silicon        → ``flash_rt.hardware.mps.*`` (experimental Pi0.5 BF16)
             Pass ``"thor"`` / ``"rtx_sm120"`` / ``"rtx_sm89"`` /
             ``"rtx_sm87"`` / ``"amd_cdna3"`` / ``"amd_cdna4"`` /
-            ``"amd_rdna35"`` / ``"apple_mps"`` explicitly to force a backend (useful
-            for cross-hardware debugging).
+            ``"amd_rdna35"`` / ``"amd_rdna4"`` / ``"apple_mps"`` explicitly to
+            force a backend (useful for cross-hardware debugging).
         action_dim: Explicit robot output dimension for the Apple/RDNA Pi0.5 and
             Jetson Pi frontends. RDNA may instead read output_action_dim from
             checkpoint config.json; normalization statistics are not a schema.
@@ -812,24 +813,26 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 f"-DGPU_ARCH={'gfx942' if arch == 'amd_cdna3' else 'gfx950'} && "
                 "cmake --build build-amd -j\n"
                 "See docs/deployment_amd.md.") from exc
-    elif arch == "amd_rdna35":
+    elif arch in ("amd_rdna35", "amd_rdna4"):
+        rdna_gfx = "gfx1151" if arch == "amd_rdna35" else "gfx1201"
+        rdna_label = "RDNA 3.5" if arch == "amd_rdna35" else "RDNA 4"
         try:
             import flash_rt.amd.flash_rt_amd_kernels  # noqa: F401
         except ImportError as exc:
             raise ImportError(
                 "flash_rt.amd.flash_rt_amd_kernels is not built for the "
-                "AMD RDNA 3.5 backend. Build it with:\n"
-                "    bash scripts/amd/build_amd.sh gfx1151\n"
-                "See the RDNA 3.5 section in docs/deployment_amd_pi05.md."
+                f"AMD {rdna_label} backend. Build it with:\n"
+                f"    bash scripts/amd/build_amd.sh {rdna_gfx}\n"
+                "See the RDNA sections in docs/deployment_amd_pi05.md."
             ) from exc
-        # The first RDNA 3.5 tier is intentionally BF16. load_model's
-        # historical default is use_fp8=True; coerce that default explicitly
-        # rather than routing to the gfx950 FP8 kernels.
+        # RDNA wave32 tiers are intentionally BF16. load_model's historical
+        # default is use_fp8=True; coerce that default explicitly rather than
+        # routing to the gfx950 FP8 kernels.
         if use_fp8:
             use_fp8 = False
             logger.warning(
-                "AMD RDNA 3.5 backend currently supports BF16 only; "
-                "disabling use_fp8.")
+                "AMD %s backend currently supports BF16 only; "
+                "disabling use_fp8.", rdna_label)
     elif arch == "npu":
         # Ascend NPU backend runs on torch_npu ops (aclnn) plus this repo's own
         # CCE kernels. No root CMake target and no PyTorch C++ extension is
@@ -1158,7 +1161,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         from types import SimpleNamespace
         sig = SimpleNamespace(parameters=parameters)
     kwargs: dict = {"num_views": num_views}
-    if arch == "amd_rdna35" and "action_dim" in sig.parameters and action_dim is not None:
+    if (arch in ("amd_rdna35", "amd_rdna4")
+            and "action_dim" in sig.parameters and action_dim is not None):
         kwargs["action_dim"] = action_dim
     if "hardware" in sig.parameters:
         kwargs["hardware"] = arch

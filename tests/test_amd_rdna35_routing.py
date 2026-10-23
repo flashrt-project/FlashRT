@@ -71,11 +71,41 @@ def test_detect_arch_maps_gfx1151(monkeypatch, arch):
     assert detect_arch() == "amd_rdna35"
 
 
+@pytest.mark.parametrize("arch", ["gfx1201", "gfx1201:sramecc-:xnack-"])
+def test_detect_arch_maps_gfx1201(monkeypatch, arch):
+    from flash_rt.hardware import detect_arch
+
+    _patch_rocm(monkeypatch, arch)
+    assert detect_arch() == "amd_rdna4"
+
+
 def test_rdna35_does_not_alias_cdna4(monkeypatch):
     from flash_rt.hardware import detect_arch
 
     _patch_rocm(monkeypatch, "gfx1151")
     assert detect_arch() != "amd_cdna4"
+
+
+@pytest.mark.parametrize(
+    ("arch", "hardware"),
+    [("gfx1151", "amd_rdna35"), ("gfx1201", "amd_rdna4")],
+)
+def test_shared_rdna_frontend_records_the_loaded_isa(arch, hardware):
+    from flash_rt.amd.frontends.torch.pi05_rdna35 import _public_rdna_hardware
+
+    assert _public_rdna_hardware(arch) == hardware
+
+
+def test_rdna4_pipeline_registration_is_lazy():
+    from flash_rt.hardware import _PIPELINE_MAP, resolve_pipeline_class
+
+    key = ("pi05", "torch", "amd_rdna4")
+    assert _PIPELINE_MAP[key] == (
+        "flash_rt.amd.frontends.torch.pi05_rdna35",
+        "Pi05TorchFrontendAmdRdna35",
+    )
+    cls = resolve_pipeline_class(*key)
+    assert cls.__name__ == "Pi05TorchFrontendAmdRdna35"
 
 
 def test_rdna35_frontend_import_does_not_require_native_extension(monkeypatch):
@@ -132,23 +162,25 @@ def test_rdna35_reference_fallback_does_not_import_triton(monkeypatch):
     assert not attention.hip_encoder_gqa
 
 
-def test_load_model_rdna35_defaults_to_bf16_before_checkpoint(caplog):
+def test_load_model_rdna_wave32_defaults_to_bf16_before_checkpoint(caplog):
     import torch
     import flash_rt
 
     if not torch.cuda.is_available() or getattr(torch.version, "hip", None) is None:
-        pytest.skip("requires a visible gfx1151 ROCm device")
-    props = torch.cuda.get_device_properties(0)
-    if getattr(props, "gcnArchName", "").split(":", 1)[0] != "gfx1151":
-        pytest.skip("requires a visible gfx1151 ROCm device")
+        pytest.skip("requires a visible gfx1151 or gfx1201 ROCm device")
+    arch = getattr(
+        torch.cuda.get_device_properties(0), "gcnArchName", "").split(":", 1)[0]
+    hardware = {"gfx1151": "amd_rdna35", "gfx1201": "amd_rdna4"}.get(arch)
+    if hardware is None:
+        pytest.skip("requires a visible gfx1151 or gfx1201 ROCm device")
 
     with caplog.at_level(logging.WARNING, logger="flash_rt.api"):
         with pytest.raises(FileNotFoundError, match="safetensors"):
             flash_rt.load_model(
-                "/nonexistent/flashrt-rdna35-checkpoint",
+                "/nonexistent/flashrt-rdna-checkpoint",
                 framework="torch",
                 config="pi05",
-                hardware="amd_rdna35",
+                hardware=hardware,
             )
     assert any("supports BF16 only" in record.getMessage()
                for record in caplog.records)

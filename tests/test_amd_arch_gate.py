@@ -77,11 +77,12 @@ def test_build_script_rejects_unsupported_arch(arch):
     assert proc.returncode != 0, (
         f"build script accepted GPU_ARCH={arch}")
     output = proc.stderr + proc.stdout
-    assert all(arch in output for arch in ("gfx942", "gfx950", "gfx1151")), (
-        "the rejection message should name every supported architecture")
+    assert all(
+        arch in output for arch in ("gfx942", "gfx950", "gfx1151", "gfx1201")
+    ), ("the rejection message should name every supported architecture")
 
 
 @pytest.mark.skipif(not _BUILD.exists(), reason="build script not present")
 def test_build_script_documents_all_supported_targets():
     text = _BUILD.read_text()
-    assert "gfx942|gfx950|gfx1151" in text
+    assert "gfx942|gfx950|gfx1151|gfx1201" in text
