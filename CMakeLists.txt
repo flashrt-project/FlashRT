@@ -1551,12 +1551,6 @@ if(FLASHRT_ENABLE_FLINT)
     csrc/kernels/flint/flint_decode_fused.cu
     csrc/kernels/flint/flint_attention.cu
     csrc/kernels/flint/flint_gemm.cu
-    csrc/kernels/flint/flint_gemm_s8.cu
-    csrc/kernels/flint/flint_gemv_mma.cu
-    csrc/kernels/flint/flint_gemm_stream.cu
-    csrc/kernels/flint/flint_gemm_resident.cu
-    csrc/kernels/flint/flint_gemm_s8r.cu
-    csrc/kernels/flint/flint_attention_paged.cu
     csrc/kernels/flint/flint_prefill.cu)
   set_target_properties(flash_rt_flint PROPERTIES
     CUDA_STANDARD 17

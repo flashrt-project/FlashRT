@@ -196,16 +196,6 @@ __device__ __forceinline__ T* after_wait(T* p) {
 }
 __device__ __forceinline__ void pdl_launch() { asm volatile("griddepcontrol.launch_dependents;" :::); }
 
-// FLINT_EARLY_TRIGGER=1: decode kernels call griddepcontrol.launch_dependents right after their own wait, so the
-// next kernel's static-weight prologue overlaps this kernel (A/B knob).
-inline bool early_trigger_enabled() {
-  static const bool on = [] {
-    const char* v = std::getenv("FLINT_EARLY_TRIGGER");
-    return v && v[0] == '1';
-  }();
-  return on;
-}
-
 inline bool pdl_enabled() {
   static const bool on = [] {
     const char* v = std::getenv("FLINT_PDL");

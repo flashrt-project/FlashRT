@@ -18,9 +18,7 @@ constexpr int kEpiBf16 = 0;          // bf16(acc * gs)
 constexpr int kEpiF32 = 1;           // acc * gs (fp32)
 constexpr int kEpiSwigluDense = 2;   // gate|up interleaved-by-8: bf16(silu(bf16(g)) * bf16(u)) (precise)
 constexpr int kEpiSwigluRouted = 3;  // routed experts: bf16(silu_approx(g) * u), fp32 g/u
-constexpr int kEpiQkRope = 4;
-constexpr int kEpiSwigluRoutedQ8 = 5;
-constexpr int kEpiF32Part = 6;        // split-K slice z: fp32 acc*gs to C + z * gridDim.x * BM * ldc (no cluster)  // routed experts: int8 act (per-32 fp32 scales, block-permuted K order)        // QKV projection: Q/K RMSNorm + RoPE + KV-cache write (gemm_w4a16_qkrope)
+constexpr int kEpiQkRope = 4;        // QKV projection: Q/K RMSNorm + RoPE + KV-cache write (gemm_w4a16_qkrope)
 
 // Loading.
 void repack_nvfp4(const void* src, long long rows, int K, void* codes, void* scales, long long group_rows,
@@ -75,11 +73,6 @@ int gemm_w4a16(const void* A, int M, int lda, const void* codes, const void* sca
                int ldc, int epilogue, cudaStream_t s);
 int gemm_w4a16_cfg(const void* A, int M, int lda, const void* codes, const void* scales, int N, int K, float gs,
                    void* C, int ldc, int epilogue, GemmConfig c, cudaStream_t s);
-// Split-K through global fp32 partials: c.split independent K slices (no cluster) store acc*gs to
-// part[c.split][ceil(M/BM)*BM][N]; a drain kernel sums the slices in slice order and applies the epilogue
-// (kEpiBf16 or kEpiSwigluDense) into C. part must hold c.split * roundup(M, c.bm) * N floats.
-int gemm_w4a16_splitk(const void* A, int M, int lda, const void* codes, const void* scales, int N, int K, float gs,
-                      float* part, void* C, int ldc, int epilogue, GemmConfig c, cudaStream_t s);
 // QKV projection with the qk_norm_rope_kv_rows_bf16 work in the epilogue (each 128-column tile is one head):
 // Q heads -> q_out [M, 32 * 128] (normed + RoPE), K heads -> cache (normed + RoPE), V heads -> cache, all at
 // positions *pos + row; bit-identical to gemm_w4a16 + qk_norm_rope_kv_rows_bf16. N must be 40 * 128.
@@ -92,10 +85,6 @@ int gemm_w4a16_grouped(const void* A, const int* gather, int lda, const int* til
                        const void* codes, const void* scales, int N, int K, const float* gs_e, void* C, int ldc,
                        int epilogue, int tile_rows, int mean_rows, cudaStream_t s);
 // Search hook: non-zero bm overrides the default dense / grouped configuration.
-// As gemm_w4a16_grouped with the kEpiSwigluRoutedQ8 epilogue: C = int8 act [rows, ldc], sq = fp32 [rows, ldc / 32].
-int gemm_w4a16_grouped_q8(const void* A, const int* gather, int lda, const int* tiles, const int* n_tiles,
-                          int max_tiles, const void* codes, const void* scales, int N, int K, const float* gs_e,
-                          void* C, int ldc, float* sq, int tile_rows, int mean_rows, cudaStream_t s);
 void set_gemm_override(const GemmConfig& dense, const GemmConfig& grouped);
 // Many-token router on tensor cores (wr = router [256, 2048] bf16); adds selections to counts[256].
 // pos / n_end (device ints, may be null): rows at positions >= *n_end -- the padding of a chunk launched with
@@ -137,9 +126,6 @@ int gemv_fused_w4a16(const void* codes, const void* scales, const void* x, const
                 cudaStream_t s);
 void add_rmsnorm_pdl_bf16(const void* x, const void* res_in, const float* w, float eps, void* res_out, void* out,
                        cudaStream_t s);
-// Batched (M rows, stride 2048): out = rmsnorm(x + res_in) * w, res_out = bf16(x + res_in); res_in null = no add.
-void add_rmsnorm_rows_bf16(const void* x, const void* res_in, const float* w, float eps, void* res_out, void* out, int M,
-                           cudaStream_t s);
 // Final residual add + RMSNorm + LM head (fp32 logits) + greedy next token in one kernel (K == 2048).
 // cand_v/cand_i hold one candidate per block (cand_cap entries); returns non-zero if they are too small or
 // the rows-per-warp setting is unsupported. set_lm_head_rows: 2, 4 or 8 rows per warp (8 warps per block).
@@ -161,75 +147,6 @@ int decode_attention_fused_bf16(const void* qkv, const float* q_norm_w, const fl
                                 float eps, const float* sinks, float scale, int n_split, int warps, float* o_part,
                                 float* ml_part, unsigned* counters, void* out, cudaStream_t s,
                                 const unsigned long long* pf_ranges = nullptr, int n_pf = 0, int kv_slots = 0);
-
-// NVFP4 V shadow cache (kv_mode 2): E2M1 codes [block][token][head][64 B] and E4M3 scales [..][8 B], byte strides.
-struct V4Shadow {
-  const void* codes;
-  const void* scales;
-  long long cb, ct, ch, sb, st, sh;
-};
-// ---- W4A8 (int8 activations, per-32 fp32 scales; flint_gemm_s8.cu) ----
-// bf16 rows [M, K] (row stride ldx elements) -> int8 [M, K] in the block-permuted K order + fp32 [M, K/32].
-void quant_rows_s8(const void* x, int M, int K, int ldx, void* q, float* s, cudaStream_t st);
-void quant_rows_s8_perrow(const void* x, int M, int K, int ldx, void* q, float* s, cudaStream_t st);
-// Same contracts as gemm_w4a16 / gemm_w4a16_grouped with (A, AS) from quant_rows_s8 (A row stride K).
-int gemm_w4a8(const void* A, const void* AS, int M, const void* codes, const void* scales, int N, int K, float gs,
-              void* C, int ldc, int epilogue, cudaStream_t s);
-int gemm_w4a8_cfg(const void* A, const void* AS, int M, const void* codes, const void* scales, int N, int K,
-                  float gs, void* C, int ldc, int epilogue, GemmConfig c, cudaStream_t s);
-int gemm_w4a8_grouped(const void* A, const void* AS, const int* gather, const int* tiles, const int* n_tiles,
-                      int max_tiles, const void* codes, const void* scales, int N, int K, const float* gs_e, void* C,
-                      int ldc, int epilogue, int tile_rows, int mean_rows, cudaStream_t s);
-int gemm_w4a8_narrow(const void* A, const void* AS, int M, const void* codes, const void* scales, int N, int K,
-                     float gs, void* C, int ldc, int epilogue, cudaStream_t s);
-void set_gemm_s8_override(const GemmConfig& dense, const GemmConfig& grouped);
-// Fused form: Q/K RMSNorm (fp32 weights [128], eps) + NeoX RoPE (cos_sin fp32 [max_pos, 128], nullptr = none) from
-// the projection output qkv [n_seq, qkv_stride] (q 32x128 | k 4x128 | v 4x128), the current token's K/V written
-// into the paged cache, then the split-KV attention of decode_attention_paged_bf16.
-void decode_attention_paged_qkv_bf16(const void* qkv, long long qkv_stride, const long long* positions,
-                                     const float* q_w, const float* k_w, const float* cos_sin, long long cs_stride,
-                                     float eps, const void* k_cache, const void* v_cache, long long stride_block,
-                                     long long stride_token, long long stride_head, int block_size,
-                                     const int* block_tables, int bt_stride, const int* seq_lens, int n_seq,
-                                     int window, const float* sinks, float scale, int n_split, float* o_part,
-                                     float* ml_part, void* out, cudaStream_t s, int kv_mode = 0, const V4Shadow* v4 = nullptr);
-// Router for n <= 32 rows: logits fp32 scratch [n, 256] (bf16-rounded), then router_topk_rows_bf16 semantics
-// (ids, tw, counts += selections). Non-zero if n is out of range.
-int router_topk_small_bf16(const void* xn, int n, const void* wr, float* logits, int* ids, float* tw, int* counts,
-                           cudaStream_t s);
-// Paged-KV split-KV decode attention for n_seq single-token queries (flint_attention_paged.cu). q / out bf16
-// [n_seq, 32, 128]; K/V views [blocks, block_size, 4, 128] with element strides; block_tables int32
-// [n_seq, bt_stride]; seq_lens int32 [n_seq] (tokens including the current one); window > 0 = sliding window;
-// o_part f32 [n_seq * n_split * 32 * 128], ml_part f32 [n_seq * n_split * 32 * 2]. kv_fp8: the cache holds E4M3
-// bytes (unit scale; strides then count bytes).
-void decode_attention_paged_bf16(const void* q, const void* k_cache, const void* v_cache, long long stride_block,
-                                 long long stride_token, long long stride_head, int block_size,
-                                 const int* block_tables, int bt_stride, const int* seq_lens, int n_seq, int window,
-                                 const float* sinks, float scale, int n_split, float* o_part, float* ml_part,
-                                 void* out, cudaStream_t s, int kv_mode = 0, const V4Shadow* v4 = nullptr);
-// Tensor-core GEMV for 1 <= M <= 32 rows (flint_gemv_mma.cu), x bf16 [M, K] contiguous; same epilogues as gemv_w4a16.
-int gemv_mma_w4a16(const void* codes, const void* scales, const void* x, int M, void* out, int N, int K, float gs,
-                   int epilogue, cudaStream_t s);
-// gemv_mma_w4a16 with residual add + RMSNorm fused into the activation load (K == 2048, epilogue 0/2); block 0
-// stores res_out = bf16(x + res_in) (res_in may be null).
-int gemv_mma_norm_w4a16(const void* codes, const void* scales, const void* x, const void* res_in, void* res_out,
-                        const float* norm_w, float eps, int M, void* out, int N, int K, float gs, int epilogue,
-                        cudaStream_t s);
-// Weight-streaming few-row GEMM (1 <= M <= 32, N % 16 == 0, K % 512 == 0): one CTA per 16-column strip, deep
-// cp.async ring; same numerics as gemv_mma_w4a16. epilogue 0 bf16 / 1 fp32 / 2 interleaved gate|up SwiGLU.
-int gemm_stream_w4a16(const void* codes, const void* scales, const void* x, int M, void* out, int N, int K, float gs,
-                      int epilogue, cudaStream_t s, unsigned long long* dbg = nullptr);
-// Resident-activation GEMM for 16..128 rows: K slices of KS with the f16 activation slice in smem, weight strips
-// streamed, fp32 partials (part: (K/KS)*M*N floats) drained in slice order. N % 64 == 0 (128 for gate|up).
-int gemm_resident_w4a16(const void* x, int M, int K, const void* codes, const void* scales, int N, int KS, float gs,
-                        float* part, void* C, int ldc, int epilogue, cudaStream_t s);
-// W4A8 variant for 32..128 rows: (A, AS) from quant_rows_s8, int8 slice resident, bf16 partials (part: (K/KS)*M*N).
-int gemm_s8_resident(const void* A, const void* AS, int M, int K, const void* codes, const void* scales, int N, int KS,
-                     float gs, void* part, void* C, int ldc, int epilogue, cudaStream_t s,
-                     unsigned long long* dbg = nullptr);
-// Few-row GEMV (1 <= M <= 8), x bf16 [M, K] contiguous, out [M, N] ([M, N/2] for epilogue 2). Non-zero if unsupported.
-int gemv_w4a16_rows(const void* codes, const void* scales, const void* x, int M, void* out, int N, int K,
-                    float gs, int epilogue, cudaStream_t s);
 
 }  // namespace flint
 }  // namespace flash_rt
