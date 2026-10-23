@@ -389,12 +389,13 @@ gemm_s8_grouped_kernel(const int8_t* __restrict__ A, const float* __restrict__ A
   constexpr int AI = (BM * 4 * KB + THREADS - 1) / THREADS;
   constexpr int ASI = (BM * as_pieces<KB>() + THREADS - 1) / THREADS;
   pdl_wait();
-  // grid (N / BN, tiles, split): the column tiles of one row tile are adjacent in launch order, so the gathered
-  // A rows and the expert's weight slabs are re-read from L2 rather than DRAM (prefill-sized expert slices)
-  const int t = blockIdx.y;
+  // 128-row (prefill-sized) tiles launch as grid (N / BN, tiles, split) so the column tiles of one row tile are
+  // adjacent in launch order (A rows and the expert's weight slabs re-read from L2); the decode tile sizes keep
+  // the original (tiles, N / BN, split) order
+  const int t = BM >= 128 ? blockIdx.y : blockIdx.x;
   if (t >= *n_tiles) return;
   const int e = tiles[3 * t], row0 = tiles[3 * t + 1], rows = tiles[3 * t + 2];
-  const int n0 = blockIdx.x * BN;
+  const int n0 = (BM >= 128 ? blockIdx.x : blockIdx.y) * BN;
   const int8_t* arow[AI];
   const float* asrow[ASI];
 #pragma unroll
@@ -548,7 +549,7 @@ void launch_s8_grouped(const void* A, const void* AS, const int* gather, const i
   static bool smem_set = false;
   if (!smem_set) { set_smem_attr(kern, gemm_s8_smem_bytes<BM, ST, KB>(8)); smem_set = true; }
   cudaLaunchConfig_t cfg = {};
-  cfg.gridDim = dim3(N / BN, max_tiles, split);
+  cfg.gridDim = BM >= 128 ? dim3(N / BN, max_tiles, split) : dim3(max_tiles, N / BN, split);
   cfg.blockDim = dim3(THREADS);
   cfg.dynamicSmemBytes = gemm_s8_smem_bytes<BM, ST, KB>(split);
   cfg.stream = s;
