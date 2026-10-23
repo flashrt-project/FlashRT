@@ -7,9 +7,10 @@
 // (third_party/cutlass/examples/87_blackwell_geforce_gemm_blockwise/
 //  87b_blackwell_geforce_fp8_bf16_gemm_groupwise.cu).
 //
-// Two GEMM instantiations are kept live and dispatched by M:
-//   * Pingpong (TileShape 64 x 128 x 128) — M <= 64
-//   * Cooperative (TileShape 128 x 128 x 128) — M > 64
+// Two GEMM instantiations are kept live and dispatched by grid size:
+//   * Pingpong (TileShape 64 x 128 x 128) — M <= 64, or when its grid
+//     needs at most 7/4 the waves of the 128-row grid
+//   * Cooperative (TileShape 128 x 128 x 128) — otherwise
 //
 // Per-shape Arguments + workspace are cached in two thread-safe maps.
 // The kernel itself is fused (no dequant intermediate), removing the
@@ -170,6 +171,21 @@ void* get_workspace(int M, int N, int K, size_t needed) {
   return w.ptr;
 }
 
+// SM count of the current device, queried once per device.
+int num_sms() {
+  static std::mutex mu;
+  static std::unordered_map<int, int> counts;
+  int device = 0;
+  cudaGetDevice(&device);
+  std::lock_guard<std::mutex> lk(mu);
+  auto it = counts.find(device);
+  if (it != counts.end()) return it->second;
+  int sms = 0;
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+  counts[device] = sms;
+  return sms;
+}
+
 template <class Gemm>
 cutlass::Status run_gemm(
     const void* A_fp8, const void* B_fp8, void* D_bf16,
@@ -249,9 +265,22 @@ void fp8_block128_gemm_cutlass_sm120_bf16out(
 {
   // Schedule selection: small M -> Pingpong (better latency at low
   // arithmetic intensity); large M -> Cooperative (better throughput
-  // when there are enough M-tiles to fill the SMs).
+  // when there are enough M-tiles to fill the SMs). A larger M also takes
+  // Pingpong when its 64-row grid needs at most 7/4 the waves of the
+  // 128-row grid: a 64-row tile takes about 1/1.75 of a 128-row tile's
+  // time, so an under-filled 128-row grid (a tail wave, or under one wave)
+  // finishes sooner as 64-row tiles. Each output element accumulates the
+  // same K blocks in the same order in both, so the result is
+  // bit-identical. The 7/4 is measured on an RTX 5090 (170 SMs) over 1180
+  // shapes: no shape is slower than Cooperative, 609 are faster (median
+  // 1.52x); e.g. at M = 512, N = 2560, K = 9728 121 -> 72 us.
+  const int sms = num_sms();
+  const int n_tiles = (N + 127) / 128;
+  const int waves_128 = (((M + 127) / 128) * n_tiles + sms - 1) / sms;
+  const int waves_64 = (((M + 63) / 64) * n_tiles + sms - 1) / sms;
+  const bool pingpong = M <= 64 || 4 * waves_64 <= 7 * waves_128;
   cutlass::Status status;
-  if (M <= 64) {
+  if (pingpong) {
     status = run_gemm<PingpongGemm>(
         A_fp8, B_fp8, D_bf16, M, N, K,
         act_block_scale, w_block_scale, stream);
