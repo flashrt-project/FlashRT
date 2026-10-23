@@ -178,7 +178,8 @@ class Dm05TorchFrontendRtx:
         if observation.get("history_images") is not None:
             raise NotImplementedError("DM05 history images are not supported")
         data = self._runtime._prepare_model_input(text=prompt, images=images,
-                    states=np.asarray(observation["state"]).copy(), robot_type=observation.get("robot_type"))
+                    states=np.asarray(observation["state"]).copy().tolist(),
+                    robot_type=observation.get("robot_type"))
         with torch.no_grad():
             return {"actions": self._predict_data(data, noise=noise)}
 
