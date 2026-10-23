@@ -1,0 +1,13 @@
+SageAttention2-derived attention components
+Copyright (c) 2024 SageAttention team
+
+Selected helper components derived from FlashInfer
+Copyright (c) 2023 FlashInfer team
+
+Registration macros derived from vLLM (Apache-2.0)
+https://github.com/vllm-project/vllm
+
+FlashRT adaptations: causal-prefix offsets, log-sum-exp output,
+BF16/GQA wrappers and standalone producer integration.
+
+Per-file notices identify the inherited components. See LICENSE for Apache-2.0.

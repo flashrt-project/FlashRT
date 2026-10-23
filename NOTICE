@@ -8,3 +8,7 @@ subject to their applicable licenses and attribution notices.
 
 This NOTICE is informational and does not modify the Apache License, Version
 2.0.
+
+The SageAttention2-derived components under csrc/sage2 retain their upstream
+SageAttention and FlashInfer notices. Registration macros derive from vLLM.
+See csrc/sage2/VENDOR.md, NOTICE and LICENSE for provenance and modifications.

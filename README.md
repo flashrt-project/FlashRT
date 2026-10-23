@@ -287,6 +287,12 @@ llama.cpp F16 KV. [Protocol, accuracy and reproduction](docs/flint_usage.md).
 
 **Guide:** [RTX 5090 setup and limits](docs/flint_usage.md).
 
+**Flint inside vLLM:** optional W4A8 decode and FP8/FP4 prefill producers
+attach through [FlashRT Structures](https://github.com/flashrt-project/FlashRT-Structures).
+See the [Tensor operator contract](docs/native_nvfp4_api.md) for build flags,
+precision and the paired serving setup. This route requires a pinned Flint
+vLLM host patch and is qualified separately from the standalone frontend.
+
 #### Qwen3-8B
 
 | Hardware | Mode | Prefill | Decode | Source |
@@ -1034,7 +1040,8 @@ Work on execution-state checkpoint and restore should also cite:
 FlashRT builds on [CUTLASS](https://github.com/NVIDIA/cutlass) (GEMM
 templates), [FlashAttention](https://github.com/Dao-AILab/flash-attention) and
 [FlashInfer](https://github.com/flashinfer-ai/flashinfer) (attention kernels),
-and [vLLM](https://github.com/vllm-project/vllm) (Marlin). Sources, licenses
+[SageAttention](https://github.com/thu-ml/SageAttention) (adapted quantized
+attention cores), and [vLLM](https://github.com/vllm-project/vllm) (Marlin and serving). Sources, licenses
 and local changes are recorded in file headers and directory-local `VENDOR.md`
 files.
 
@@ -1042,6 +1049,7 @@ FlashRT accelerates models released by their authors. Thank you to:
 
 | Models | Authors |
 |---|---|
+| Flint | [RecursiveSI](https://huggingface.co/RecursiveSI/flint) |
 | π0, π0.5, π0-FAST | [Physical Intelligence](https://github.com/Physical-Intelligence/openpi) |
 | GR00T N1.6, N1.7 | [NVIDIA Isaac GR00T](https://github.com/NVIDIA/Isaac-GR00T) |
 | Alpamayo 1.5 | [NVIDIA](https://github.com/NVlabs/alpamayo1.5); streaming: [FlashDrive](https://github.com/z-lab/flashdrive) (z-lab) |
