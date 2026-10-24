@@ -1,0 +1,29 @@
+# FlashRT — X-VLA configuration (metadata; runtime dims are code constants).
+# Checkpoint: lerobot/xvla-libero
+name: xvla
+arch: florence2_davit_bart
+vision_type: davit_l                   # 4 stages, dims 256/512/1024/2048, depths 1/1/9/1
+backbone: bart_encoder                 # 12 layers, 1024 d, 16 heads, learned positions
+action_model: soft_prompted_transformer
+vlm_layers: 12
+expert_layers: 24                      # flow-matching action transformer
+expert_hidden: 1024
+expert_mlp: 4096
+num_heads: 16
+head_dim: 64
+norm: layernorm_eps_1e-5
+  # BART encoder is post-norm; the action transformer is pre-norm.
+activation_encoder: gelu_erf
+activation_vision: gelu_erf
+activation_action: gelu_tanh
+attention: flash_rt_fa2               # full (unmasked), head_dim 64
+soft_prompts: 32                       # per-domain prompt hub, LIBERO domain 3
+domain_aware_head: true
+num_domains: 30
+decoder_steps: 10                      # flow-matching Euler steps, t = i/steps descending
+action_mode: ee6d                      # 20 channels; gripper idx (9, 19), sigmoid out
+action_dim: 20
+state_dim: 20                          # observation.state[8] zero-padded
+chunk_size: 30
+image_views: 3                         # 2 real 256x256 cameras + 1 configured empty camera
+image_size: 224

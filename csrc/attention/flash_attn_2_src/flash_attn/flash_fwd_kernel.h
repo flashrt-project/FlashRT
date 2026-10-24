@@ -23,6 +23,45 @@
 
 namespace FLASH_NAMESPACE {
 
+// NVFP4 encode helpers for the fused O quantize (the epilogue below). Both are
+// branchless: the epilogue runs one thread per 16-element group, so the 8-way
+// if-else of float_to_fp4_e2m1 and the exponent early-returns of
+// float_to_ue4m3_ceil would diverge and serialize inside the warp. The results
+// are identical to the branchy versions in csrc/kernels/nvfp4_convert.cuh, which
+// is what the standalone quantize_bf16_to_nvfp4_swizzled chain uses.
+CUTLASS_DEVICE uint8_t nf_e2m1(float v) {
+    float a = fabsf(v);
+    uint8_t sign = (v < 0.0f) ? 0x8u : 0x0u;
+    uint8_t mag = (uint8_t)((a >= 0.25f) + (a >= 0.75f) + (a >= 1.25f)
+                          + (a >= 1.75f) + (a >= 2.5f)  + (a >= 3.5f)
+                          + (a >= 5.0f));
+    return uint8_t(sign | mag);
+}
+
+CUTLASS_DEVICE uint8_t nf_ue4m3_ceil(float v) {
+    uint32_t bits = __float_as_uint(v);
+    int fe = int((bits >> 23) & 0xFFu) - 127;
+    uint32_t frac = bits & 0x7FFFFFu;
+    int ue = fe + 7;
+    int m = int(frac >> 20) + ((frac & 0xFFFFFu) != 0u ? 1 : 0);
+    if (m >= 8) { m = 0; ++ue; }
+    uint8_t normal = uint8_t((uint32_t(ue) << 3) | uint32_t(m));
+    // subnormal range: ceil(v * 512), clamped to [1, 8] (8 = smallest normal)
+    int sub = int(ceilf(v * 512.0f));
+    sub = sub < 1 ? 1 : (sub > 8 ? 8 : sub);
+    uint8_t out = (ue <= 0) ? uint8_t(sub) : normal;
+    out = (ue >= 15) ? 0xFEu : out;
+    out = (v <= 0.0f) ? 0u : out;
+    return (v > 240.0f) ? 0xFEu : out;
+}
+
+CUTLASS_DEVICE float nf_ue4m3_to_float(uint8_t v) {
+    int e = (v >> 3) & 0xF;
+    int m = v & 0x7;
+    if (e == 0) return ldexpf((float)m / 8.0f, -6);
+    return ldexpf(1.0f + (float)m / 8.0f, e - 7);
+}
+
 using namespace cute;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -99,7 +138,7 @@ inline __device__ void write_o_fp8(const Params &params, const TensorO &tOrO, co
     }
 }
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, bool SkipDeadTail, typename Params>
 inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -353,6 +392,12 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     constexpr int n_masking_steps = (!Is_causal && !Is_local)
         ? 1
         : ((Is_even_MN && Is_causal) ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
+    // A warp whose 16 query rows all lie past seqlen_q skips its MMAs: those
+    // rows are never written, and every other row is computed unchanged. The
+    // dead-tail path is a per-instantiation opt-in; the default instantiations
+    // compile the unmodified upstream MMA sequence.
+    [[maybe_unused]] const bool warp_live = !SkipDeadTail || Is_even_MN
+        || m_block * kBlockM + (tidx / 32) * 16 < binfo.actual_seqlen_q;
     #pragma unroll
     for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
@@ -371,10 +416,28 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
         cute::cp_async_fence();
 
-        FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
-            acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
-            smem_thr_copy_Q, smem_thr_copy_K
-        );
+        // Keys left in this (possibly partial) KV tile, in 16-key steps; only
+        // the non-causal, non-local, ragged-N case trims the tile (see
+        // gemm_ncap). The default instantiations keep the full tile.
+        [[maybe_unused]] const int kv_left16 =
+            (SkipDeadTail && !Is_causal && !Is_local && !Is_even_MN && masking_step == 0)
+            ? cute::ceil_div(binfo.actual_seqlen_k - n_block * kBlockN, 16) : kBlockN / 16;
+        if constexpr (!SkipDeadTail) {
+            FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
+                acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+                smem_thr_copy_Q, smem_thr_copy_K
+            );
+        } else if (kv_left16 >= kBlockN / 16 && warp_live) {
+            FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
+                acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+                smem_thr_copy_Q, smem_thr_copy_K
+            );
+        } else if (warp_live) {
+            FLASH_NAMESPACE::gemm_ncap</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
+                acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+                smem_thr_copy_Q, smem_thr_copy_K, kv_left16 * 2
+            );
+        }
         // if (cute::thread0()) { print(acc_s); }
         if constexpr (Is_softcap){
             FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
@@ -419,7 +482,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
         // if (cute::thread0()) { print(tOrP); }
-        FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        if constexpr (!SkipDeadTail) {
+            FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        } else if (kv_left16 >= kBlockN / 16 && warp_live) {
+            FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        } else if (warp_live) {
+            FLASH_NAMESPACE::gemm_rs_kcap(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V,
+                                          smem_thr_copy_V, kv_left16);
+        }
         // if (cute::thread0()) { print(scores); }
 
         // This check is at the end of the loop since we always have at least 1 iteration
@@ -438,10 +508,17 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
         cute::cp_async_fence();
 
-        FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
-            acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
-            smem_thr_copy_Q, smem_thr_copy_K
-        );
+        if constexpr (!SkipDeadTail) {
+            FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
+                acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+                smem_thr_copy_Q, smem_thr_copy_K
+            );
+        } else if (warp_live) {
+            FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
+                acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+                smem_thr_copy_Q, smem_thr_copy_K
+            );
+        }
         if constexpr (Is_softcap){
             FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
         }
@@ -480,7 +557,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
-        FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        if constexpr (!SkipDeadTail) {
+            FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        } else if (warp_live) {
+            FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        }
     }
 
     // Epilogue
@@ -542,14 +623,62 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         #pragma unroll
         for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d; }
     }
-    // Clear_OOB_K must be false since we don't want to write zeros to gmem
-    if (!params.o_bf16_skip) {
+    // Clear_OOB_K must be false since we don't want to write zeros to gmem.
+    // A caller that only consumes the fused NVFP4/FP8 output may pass a null
+    // O pointer (or set o_bf16_skip); the bf16 tile is then dead traffic and
+    // is not written.
+    if (!params.o_bf16_skip && params.o_ptr != nullptr) {
         FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
             gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
         );
     }
     write_o_fp8<Is_even_K>(params, tOrO, tOcO, tOpO, bidb, bidh, m_block * kBlockM,
                            binfo.actual_seqlen_q - m_block * kBlockM);
+
+    if (params.quantize_o != 0 && params.o_packed_ptr != nullptr) {
+        // Fused NVFP4 quantize of this head's slice of the O tile, out of the
+        // copy already staged in shared memory. It replaces one standalone
+        // quantize_bf16_to_nvfp4_swizzled launch per attention call and writes
+        // exactly the buffer that quantizer would have.
+        const int hd = params.d_rounded;   // the head width actually used
+        if (hd > 0 && hd % 16 == 0) {
+            const int groups = hd / 16;    // 16-element groups per row
+            const int row0 = m_block * kBlockM;
+            const int col0 = bidh * hd;
+            uint8_t* pk = reinterpret_cast<uint8_t*>(params.o_packed_ptr);
+            uint8_t* sf = reinterpret_cast<uint8_t*>(params.o_sfa_ptr);
+            for (int idx = tidx; idx < kBlockM * groups;
+                 idx += Kernel_traits::kNThreads) {
+                const int r = idx / groups, g = idx % groups;
+                const int row = row0 + r;
+                if (row >= binfo.actual_seqlen_q) { continue; }
+                float v[16];
+                float amax = 0.f;
+                #pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    v[i] = float(sO(r, g * 16 + i));
+                    amax = fmaxf(amax, fabsf(v[i]));
+                }
+                const uint8_t ue = nf_ue4m3_ceil(amax / 6.0f);
+                const float dq = nf_ue4m3_to_float(ue);
+                const float inv = dq > 0.f ? 1.0f / dq : 0.f;
+                // one 8-byte store per group instead of eight byte stores
+                uint64_t packed = 0;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    packed |= uint64_t(nf_e2m1(v[2 * j + 1] * inv)) << (8 * j + 4);
+                    packed |= uint64_t(nf_e2m1(v[2 * j] * inv)) << (8 * j);
+                }
+                *reinterpret_cast<uint64_t*>(
+                    pk + (size_t)row * params.o_packed_row_bytes
+                       + (size_t)(col0 / 2) + (size_t)g * 8) = packed;
+                const int b = (col0 + g * 16) / 16;
+                const int rb = row / 128, ri = row % 128;
+                sf[((size_t)rb * params.o_sfa_n_col_blocks + b / 4) * 512
+                   + (ri % 32) * 16 + (ri / 32) * 4 + (b % 4)] = ue;
+            }
+        }
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1131,7 +1260,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, bool SkipDeadTail, typename Params>
 inline __device__ void compute_attn(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
@@ -1147,7 +1276,7 @@ inline __device__ void compute_attn(const Params &params) {
     // the attention matrix. This way, as long as we have the batch, head, and the location of
     // the 16 x 32 block within the attention matrix, we can generate the exact same dropout pattern.
 
-    FLASH_NAMESPACE::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params, bidb, bidh, m_block);
+    FLASH_NAMESPACE::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax, SkipDeadTail>(params, bidb, bidh, m_block);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

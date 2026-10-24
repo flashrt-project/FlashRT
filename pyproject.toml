@@ -33,6 +33,9 @@ dependencies = [
 torch = ["torch", "safetensors", "sentencepiece"]
 flint = ["flash-rt[torch]", "tokenizers>=0.21", "jinja2>=3.1"]
 apple = ["torch>=2.5", "safetensors", "sentencepiece"]
+# X-VLA RTX frontend: the BART tokenizer (facebook/bart-large) is loaded
+# lazily by set_prompt; the kernel path itself needs only torch/safetensors.
+xvla = ["torch", "safetensors", "transformers>=4.43"]
 chameleon = ["torch", "safetensors", "transformers>=4.43,<4.56", "Pillow"]
 jax = ["jax", "jaxlib", "ml_dtypes", "orbax-checkpoint", "flax"]
 server = ["fastapi", "uvicorn"]
@@ -64,7 +67,7 @@ flash-attn = ["flash-attn"]
 # (flash_rt/hardware/thor/fa4_backend.py) sets CUTE_DSL_ARCH=sm_101a.
 # Requires an editable / source-tree install (pip install -e). pip install ".[thor-fa4]".
 thor-fa4 = ["nvidia-cutlass-dsl==4.5.1", "quack-kernels==0.4.1"]
-all = ["flash-rt[torch,jax,server,eval,minimax-remover,motus,chameleon]"]
+all = ["flash-rt[torch,jax,server,eval,minimax-remover,motus,chameleon,xvla]"]
 
 [project.urls]
 Homepage = "https://github.com/flashrt-project/FlashRT"

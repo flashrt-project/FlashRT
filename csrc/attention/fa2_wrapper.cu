@@ -15,6 +15,7 @@
 // ================================================================
 
 #include <cuda_runtime.h>
+#include "../kernels/pdl_switch.cuh"
 #include <cuda_fp16.h>
 #include <cutlass/numeric_types.h>    // cutlass::half_t, cutlass::bfloat16_t
 
@@ -37,6 +38,11 @@ void run_mha_fwd_splitkv_dispatch(Flash_fwd_params& params, cudaStream_t stream)
 // Short-query FA2 tile specialisation (flash_fwd_smallq_bf16_sm80.cu).
 void run_mha_fwd_smallq_bf16(int head_dim, Flash_fwd_params& params,
                              cudaStream_t stream);
+
+// head_dim 64 tile set (flash_fwd_tile64_bf16_sm80.cu).
+void run_mha_fwd_tile64_bf16(Flash_fwd_params& params, cudaStream_t stream);
+void run_mha_fwd_tile64m32_bf16(Flash_fwd_params& params, cudaStream_t stream);
+void run_mha_fwd_tile64m32w2_bf16(Flash_fwd_params& params, cudaStream_t stream);
 }
 
 static inline int round_up_128(int x) { return ((x + 127) / 128) * 128; }
@@ -86,6 +92,7 @@ static void fill_params(
 {
     params = {};
     params.is_bf16 = elem_is_bf16;
+    params.pdl = flash_rt::pdl::flag() ? 1 : 0;
 
     params.q_ptr = const_cast<void*>(q_ptr);
     params.k_ptr = const_cast<void*>(k_ptr);
@@ -505,6 +512,190 @@ extern "C" void fvk_attention_fa2_fwd_bf16_tile(
 #endif
 }
 
+// head_dim 64 tile entries. Same parameter surface as fwd_bf16_tile but the
+// template head width matches the model's (64, not 96) and the tile is chosen
+// explicitly: _tile64 is <64,64,64,4> and _tile64m32 is <64,32,64,4>. Only
+// head_dim == 64 is accepted; the caller keeps fwd_bf16_tile for anything else.
+#define DEFINE_FA2_TILE64_ENTRY(NAME, LAUNCH)                                    \
+extern "C" void NAME(                                                            \
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,                     \
+    void* o_ptr, void* softmax_lse_ptr, const void* seqused_k_ptr,               \
+    int batch, int seqlen_q, int seqlen_k,                                       \
+    int num_heads_q, int num_heads_kv, int head_dim,                             \
+    int q_batch_stride, int q_row_stride, int q_head_stride,                     \
+    int k_batch_stride, int k_row_stride, int k_head_stride,                     \
+    int v_batch_stride, int v_row_stride, int v_head_stride,                     \
+    int o_batch_stride, int o_row_stride, int o_head_stride,                     \
+    float softmax_scale, int /*num_sms*/, cudaStream_t stream)                   \
+{                                                                                \
+    if (head_dim != 64) {                                                        \
+        std::fprintf(stderr,                                                     \
+            "[flash_rt_fa2] %s: head_dim=%d requires exactly 64; use "           \
+            "fwd_bf16_tile instead.\n", #NAME, head_dim);                       \
+        std::abort();                                                            \
+    }                                                                            \
+    FLASH_NAMESPACE::Flash_fwd_params params;                                    \
+    fill_params(params, true, q_ptr, k_ptr, v_ptr, o_ptr, softmax_lse_ptr,       \
+                batch, seqlen_q, seqlen_k, num_heads_q, num_heads_kv, head_dim,  \
+                q_batch_stride, q_row_stride, q_head_stride,                     \
+                k_batch_stride, k_row_stride, k_head_stride,                     \
+                v_batch_stride, v_row_stride, v_head_stride,                     \
+                o_batch_stride, o_row_stride, o_head_stride, softmax_scale);     \
+    params.seqused_k = seqused_k_ptr                                             \
+        ? reinterpret_cast<int*>(const_cast<void*>(seqused_k_ptr)) : nullptr;    \
+    params.num_splits = 1;                                                       \
+    params.softmax_lseaccum_ptr = nullptr;                                       \
+    params.oaccum_ptr = nullptr;                                                 \
+    LAUNCH(params, stream);                                                      \
+}
+
+#ifdef FA2_HAS_TILE64_BF16
+DEFINE_FA2_TILE64_ENTRY(fvk_attention_fa2_fwd_bf16_tile64,
+                        FLASH_NAMESPACE::run_mha_fwd_tile64_bf16)
+DEFINE_FA2_TILE64_ENTRY(fvk_attention_fa2_fwd_bf16_tile64m32,
+                        FLASH_NAMESPACE::run_mha_fwd_tile64m32_bf16)
+
+// The same tile with a fused NVFP4 quantize of the O tile, written out of the
+// epilogue that already holds it in shared memory. Replaces one standalone
+// quantize_bf16_to_nvfp4_swizzled launch per attention call; o_packed/o_sfa are
+// static caller-owned buffers in that quantizer's layout, and nulls fall back
+// to the plain tile.
+// Process-wide programmatic-dependent-launch switch for this module's
+// forward entries (csrc/kernels/pdl_switch.cuh).
+extern "C" void fvk_attention_fa2_set_pdl(int enabled) {
+    flash_rt::pdl::flag() = enabled != 0;
+}
+
+DEFINE_FA2_TILE64_ENTRY(fvk_attention_fa2_fwd_bf16_tile64m32w2,
+                        FLASH_NAMESPACE::run_mha_fwd_tile64m32w2_bf16)
+
+using Fa2TileLaunch = void (*)(FLASH_NAMESPACE::Flash_fwd_params&, cudaStream_t);
+
+static void fa2_tile64_qnvfp4(
+    Fa2TileLaunch launch, const char* name,
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr, const void* seqused_k_ptr,
+    void* o_packed_ptr, void* o_sfa_ptr,
+    int o_packed_row_bytes, int o_sfa_n_col_blocks,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, cudaStream_t stream)
+{
+    if (head_dim != 64) {
+        std::fprintf(stderr,
+            "[flash_rt_fa2] %s: head_dim=%d requires exactly "
+            "64; use fwd_bf16_tile instead.\n", name, head_dim);
+        std::abort();
+    }
+    FLASH_NAMESPACE::Flash_fwd_params params;
+    fill_params(params, true, q_ptr, k_ptr, v_ptr, o_ptr, softmax_lse_ptr,
+                batch, seqlen_q, seqlen_k, num_heads_q, num_heads_kv, head_dim,
+                q_batch_stride, q_row_stride, q_head_stride,
+                k_batch_stride, k_row_stride, k_head_stride,
+                v_batch_stride, v_row_stride, v_head_stride,
+                o_batch_stride, o_row_stride, o_head_stride, softmax_scale);
+    params.seqused_k = seqused_k_ptr
+        ? reinterpret_cast<int*>(const_cast<void*>(seqused_k_ptr)) : nullptr;
+    params.num_splits = 1;
+    params.softmax_lseaccum_ptr = nullptr;
+    params.oaccum_ptr = nullptr;
+    params.o_packed_ptr = o_packed_ptr;
+    params.o_sfa_ptr = o_sfa_ptr;
+    params.o_packed_row_bytes = o_packed_row_bytes;
+    params.o_sfa_n_col_blocks = o_sfa_n_col_blocks;
+    params.quantize_o = 1;
+    launch(params, stream);
+}
+
+extern "C" void fvk_attention_fa2_fwd_bf16_tile64_qnvfp4(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr, const void* seqused_k_ptr,
+    void* o_packed_ptr, void* o_sfa_ptr,
+    int o_packed_row_bytes, int o_sfa_n_col_blocks,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int /*num_sms*/, cudaStream_t stream)
+{
+    if (o_packed_ptr == nullptr || o_sfa_ptr == nullptr) {
+        fvk_attention_fa2_fwd_bf16_tile64(
+            q_ptr, k_ptr, v_ptr, o_ptr, softmax_lse_ptr, seqused_k_ptr,
+            batch, seqlen_q, seqlen_k, num_heads_q, num_heads_kv, head_dim,
+            q_batch_stride, q_row_stride, q_head_stride,
+            k_batch_stride, k_row_stride, k_head_stride,
+            v_batch_stride, v_row_stride, v_head_stride,
+            o_batch_stride, o_row_stride, o_head_stride, softmax_scale, 0,
+            stream);
+        return;
+    }
+    fa2_tile64_qnvfp4(FLASH_NAMESPACE::run_mha_fwd_tile64_bf16, "fwd_bf16_tile64_qnvfp4",
+        q_ptr, k_ptr, v_ptr, o_ptr, softmax_lse_ptr, seqused_k_ptr,
+        o_packed_ptr, o_sfa_ptr, o_packed_row_bytes, o_sfa_n_col_blocks,
+        batch, seqlen_q, seqlen_k, num_heads_q, num_heads_kv, head_dim,
+        q_batch_stride, q_row_stride, q_head_stride,
+        k_batch_stride, k_row_stride, k_head_stride,
+        v_batch_stride, v_row_stride, v_head_stride,
+        o_batch_stride, o_row_stride, o_head_stride, softmax_scale, stream);
+}
+
+// The two-warp 32-row tile with the same fused quantize (see
+// fa2_tile_inst/flash_fwd_tile64_bf16_sm80.cu for why the rows are identical).
+extern "C" void fvk_attention_fa2_fwd_bf16_tile64m32w2_qnvfp4(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr, const void* seqused_k_ptr,
+    void* o_packed_ptr, void* o_sfa_ptr,
+    int o_packed_row_bytes, int o_sfa_n_col_blocks,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int /*num_sms*/, cudaStream_t stream)
+{
+    if (o_packed_ptr == nullptr || o_sfa_ptr == nullptr) {
+        fvk_attention_fa2_fwd_bf16_tile64m32w2(
+            q_ptr, k_ptr, v_ptr, o_ptr, softmax_lse_ptr, seqused_k_ptr,
+            batch, seqlen_q, seqlen_k, num_heads_q, num_heads_kv, head_dim,
+            q_batch_stride, q_row_stride, q_head_stride,
+            k_batch_stride, k_row_stride, k_head_stride,
+            v_batch_stride, v_row_stride, v_head_stride,
+            o_batch_stride, o_row_stride, o_head_stride, softmax_scale, 0,
+            stream);
+        return;
+    }
+    fa2_tile64_qnvfp4(FLASH_NAMESPACE::run_mha_fwd_tile64m32w2_bf16, "fwd_bf16_tile64m32w2_qnvfp4",
+        q_ptr, k_ptr, v_ptr, o_ptr, softmax_lse_ptr, seqused_k_ptr,
+        o_packed_ptr, o_sfa_ptr, o_packed_row_bytes, o_sfa_n_col_blocks,
+        batch, seqlen_q, seqlen_k, num_heads_q, num_heads_kv, head_dim,
+        q_batch_stride, q_row_stride, q_head_stride,
+        k_batch_stride, k_row_stride, k_head_stride,
+        v_batch_stride, v_row_stride, v_head_stride,
+        o_batch_stride, o_row_stride, o_head_stride, softmax_scale, stream);
+}
+#else
+DEFINE_FA2_TILE64_ENTRY(fvk_attention_fa2_fwd_bf16_tile64, fa2_not_built("tile64", 64))
+DEFINE_FA2_TILE64_ENTRY(fvk_attention_fa2_fwd_bf16_tile64m32, fa2_not_built("tile64m32", 64))
+extern "C" void fvk_attention_fa2_fwd_bf16_tile64_qnvfp4(
+    const void*, const void*, const void*, void*, void*, const void*,
+    void*, void*, int, int, int, int, int, int, int, int, int, int, int, int,
+    int, int, int, int, int, int, float, int, cudaStream_t)
+{ std::abort(); }
+DEFINE_FA2_TILE64_ENTRY(fvk_attention_fa2_fwd_bf16_tile64m32w2, fa2_not_built("tile64m32w2", 64))
+extern "C" void fvk_attention_fa2_fwd_bf16_tile64m32w2_qnvfp4(
+    const void*, const void*, const void*, void*, void*, const void*,
+    void*, void*, int, int, int, int, int, int, int, int, int, int, int, int,
+    int, int, int, int, int, int, float, int, cudaStream_t)
+{ std::abort(); }
+#endif
+
 #else
 extern "C" void fvk_attention_fa2_fwd_bf16_fp8out(
     const void*, const void*, const void*,
@@ -539,6 +730,16 @@ extern "C" void fvk_attention_fa2_fwd_bf16_seqused_splitkv(
     int, int, int, int, int, int, float, int, cudaStream_t)
 { std::abort(); }
 extern "C" void fvk_attention_fa2_fwd_bf16_tile(
+    const void*, const void*, const void*, void*, void*, const void*,
+    int, int, int, int, int, int, int, int, int, int, int, int,
+    int, int, int, int, int, int, float, int, cudaStream_t)
+{ std::abort(); }
+extern "C" void fvk_attention_fa2_fwd_bf16_tile64(
+    const void*, const void*, const void*, void*, void*, const void*,
+    int, int, int, int, int, int, int, int, int, int, int, int,
+    int, int, int, int, int, int, float, int, cudaStream_t)
+{ std::abort(); }
+extern "C" void fvk_attention_fa2_fwd_bf16_tile64m32(
     const void*, const void*, const void*, void*, void*, const void*,
     int, int, int, int, int, int, int, int, int, int, int, int,
     int, int, int, int, int, int, float, int, cudaStream_t)
