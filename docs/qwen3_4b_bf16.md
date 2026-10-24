@@ -25,6 +25,7 @@ entry, and a frontend refuses any other device.
 | target | frontend | attention | build |
 |---|---|---|---|
 | `rtx_sm120` (RTX 50-series) | `qwen3_4b_rtx.Qwen3_4BTorchFrontendRtx` | FA2 causal (`flash_rt_fa2.fwd_bf16_causal`, split-KV heuristic) | `GPU_ARCH=120`: `flash_rt_kernels`, `flash_rt_fa2` |
+| `thor` (Jetson AGX Thor) | `qwen3_4b_thor.Qwen3_4BTorchFrontendThor` | FlashAttention-4 forward (`hardware/thor/fa4_backend.py`) | `GPU_ARCH=110`: `flash_rt_kernels`; FA4 runtime deps from the `thor-fa4` extra |
 
 The norm, RoPE and SiLU kernels launch with programmatic dependent launch.
 
@@ -36,12 +37,13 @@ error there, never a fallback to another implementation.
 ## Usage
 
 ```bash
-cmake -B build -S . -DGPU_ARCH=120
-cmake --build build --target flash_rt_kernels flash_rt_fa2 -j
+cmake -B build -S . -DGPU_ARCH=120          # 110 on Thor
+cmake --build build --target flash_rt_kernels flash_rt_fa2 -j   # Thor: flash_rt_kernels
 ```
 
 ```python
 from flash_rt.frontends.torch.qwen3_4b_rtx import Qwen3_4BTorchFrontendRtx
+# Thor: from flash_rt.frontends.torch.qwen3_4b_thor import Qwen3_4BTorchFrontendThor
 
 fe = Qwen3_4BTorchFrontendRtx("<Qwen3-4B checkpoint dir>", device="cuda:0", max_seq=2048)
 logits = fe.forward_prefill(input_ids)                    # [S, vocab] bf16, new tensor
@@ -90,7 +92,8 @@ Every stage except attention reproduces the HF result bit for bit:
   `"bf16"` matches a model cast with `.to(torch.bfloat16)`, which rounds the
   `inv_freq` buffer and moves every angle at long positions.
 * **Attention** is the one stage that is close to rather than equal to the
-  reference: FA2 with the split-KV heuristic of torch's flash SDPA.
+  reference: FA2 with the split-KV heuristic of torch's flash SDPA on SM120,
+  FA4 on Thor.
 
 Declared HF baseline: `Qwen3ForCausalLM.from_pretrained(path, dtype=torch.bfloat16)`
 moved to the device with `.to()`, default attention implementation (`sdpa`,
@@ -117,28 +120,30 @@ QWEN3_4B_CHECKPOINT=<dir> PYTHONPATH=. pytest -q tests/test_qwen3_4b_hf_checkpoi
 
 Full-logits cosine vs HF, CUDA graphs on:
 
-| S | SM120 random | SM120 ckpt |
-|---:|---:|---:|
-| 1 | 1.000000 | 1.000000 |
-| 8 | 0.999910 | 0.999848 |
-| 64 | 0.999652 | 0.999668 |
-| 256 | 0.999511 | 0.999832 |
-| 1024 | 0.999532 | 0.999837 |
-| 2048 | 0.999517 | 0.999708 |
+| S | SM120 random | SM120 ckpt | Thor random | Thor ckpt |
+|---:|---:|---:|---:|---:|
+| 1 | 1.000000 | 1.000000 | 1.000000 | 1.000000 |
+| 8 | 0.999910 | 0.999848 | 0.999717 | 0.999851 |
+| 64 | 0.999652 | 0.999668 | 0.999587 | 0.999764 |
+| 256 | 0.999511 | 0.999832 | 0.999378 | 0.999847 |
+| 1024 | 0.999532 | 0.999837 | 0.999209 | 0.999826 |
+| 2048 | 0.999517 | 0.999708 | 0.999171 | 0.999721 |
 
 Random: `Qwen3ForCausalLM(config).to(bf16)`, seed 0, random token ids
 (`rope_inv_freq="bf16"`), minimum over 3 id draws. Checkpoint:
 Qwen/Qwen3-4B, natural-text prompts (`rope_inv_freq="fp32"`), minimum over
 2 prompts. Each length is captured once and replayed for the later draws;
-replay equals eager bit for bit. S=1 is bit-identical to HF.
+replay equals eager bit for bit. S=1 is bit-identical to HF. The Thor margin
+at long prompts is FA4's: with every other stage exact, the cosine equals that
+of HF with only its attention replaced by FA4.
 
-| | SM120 |
-|---|---|
-| GPU | GeForce RTX 5090 |
-| PyTorch | 2.9.0a0 (CUDA 13.0) |
-| transformers | 5.3.0 |
-| cuBLASLt (in process) | 13.1.0 |
-| build | `GPU_ARCH=120` |
+| | SM120 | Thor |
+|---|---|---|
+| GPU | GeForce RTX 5090 | Jetson AGX Thor (L4T R39.2.1) |
+| PyTorch | 2.9.0a0 (CUDA 13.0) | 2.14.0+cu130 |
+| transformers | 5.3.0 | 4.55.4 |
+| cuBLASLt (in process) | 13.1.0 | 13.1.1 (PyTorch wheel) |
+| build | `GPU_ARCH=120` | `GPU_ARCH=110`; FA4: nvidia-cutlass-dsl 4.5.1, quack-kernels 0.4.1 |
 
 ## Performance
 
@@ -148,19 +153,25 @@ median of 20 after 5 warm-up calls, ms.
 
 HF / FlashRT with the default (strict) GEMMs, speedup:
 
-| S | RTX 5090 (SM120) |
-|---:|---:|
-| 8 | 12.95 / 7.87 (1.64x) |
-| 128 | 13.49 / 7.32 (1.84x) |
-| 512 | 28.71 / 21.73 (1.32x) |
-| 1024 | 52.43 / 43.70 (1.20x) |
-| 2048 | 101.20 / 87.01 (1.16x) |
+| S | RTX 5090 (SM120) | Jetson Thor |
+|---:|---:|---:|
+| 8 | 12.95 / 7.87 (1.64x) | 39.68 / 33.95 (1.17x) |
+| 128 | 13.49 / 7.32 (1.84x) | 50.01 / 38.45 (1.30x) |
+| 512 | 28.71 / 21.73 (1.32x) | 82.19 / 49.55 (1.66x) |
+| 1024 | 52.43 / 43.70 (1.20x) | 165.21 / 94.35 (1.75x) |
+| 2048 | 101.20 / 87.01 (1.16x) | 338.41 / 163.92 (2.06x) |
 
-Where the time goes: from S=512 the GEMMs run at ~200 TFLOPS, so the prefill
-is GEMM-bound and both sides run the same GEMM algorithms. Below that the
-GEMMs stream weights at cuBLAS's small-M efficiency; FlashRT's gain there is
-the fused norm / RoPE / SiLU kernels, FA2's split-KV and graph replay.
-`autotune_gemms=True` changes nothing measurable here. The norm, RoPE and
-SiLU kernels launch with programmatic dependent launch; the GEMMs they follow
-(cuBLASLt) expose no PDL trigger, so the overlap it buys is within
-run-to-run noise here.
+With `autotune_gemms=True`, Jetson Thor runs 33.90 / 38.09 / 50.68 / 73.88 /
+162.33 ms at S = 8 / 128 / 512 / 1024 / 2048 (2.24x HF at S=1024).
+
+Where the time goes: from S=512 on SM120 the GEMMs run at ~200 TFLOPS, so
+the prefill is GEMM-bound and both sides run the same GEMM algorithms. Below
+that the GEMMs stream weights at cuBLAS's small-M efficiency; FlashRT's gain
+there is the fused norm / RoPE / SiLU kernels, FA2's split-KV and graph
+replay, and `autotune_gemms=True` changes nothing measurable. On Thor, FA4
+halves attention time at long prompts and the norm and SiLU passes run at
+Thor's DRAM bandwidth; cuBLASLt's first choice around S=1024 runs at ~104
+TFLOPS, which `autotune_gemms=True` lifts to ~141 TFLOPS with probe-checked
+rather than guaranteed GEMM bits. The norm, RoPE and SiLU kernels launch with
+programmatic dependent launch; the GEMMs they follow (cuBLASLt) expose no PDL
+trigger, so the overlap it buys is within run-to-run noise here.

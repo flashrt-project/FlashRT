@@ -2,7 +2,7 @@
 
 Shipped:
   * Qwen3-8B-Instruct-2512-SFT-NVFP4 (RTX SM120) — ``Qwen3Dims``
-  * Qwen/Qwen3-4B BF16 prefill (RTX SM120) — ``Qwen3_4BDims``,
+  * Qwen/Qwen3-4B BF16 prefill (RTX SM120, Jetson Thor) — ``Qwen3_4BDims``,
     shared sequence in ``prefill_bf16``
 
 Public re-exports keep the model-namespace surface in line with the
