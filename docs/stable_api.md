@@ -36,7 +36,7 @@ def load_model(
     autotune: int = 3,              # 0=off, 3=default, 5+=thorough
     recalibrate: bool = False,
     weight_cache: bool = True,      # JAX only
-    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "groot_n17" | "pi0fast" | "motus" | "wan22_ti2v_5b" | "cosmos3_video" | "cosmos3_edge" | "chameleon" | "hyvla"
+    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "groot_n17" | "pi0fast" | "motus" | "wan22_ti2v_5b" | "cosmos3_video" | "cosmos3_edge" | "chameleon" | "hyvla" | "xvla"
     device=None,                    # reserved
     # Pi0-FAST-specific:
     decode_cuda_graph: bool = False,
@@ -70,6 +70,8 @@ def load_model(
     # Pi0.5 torch RTX SM120/SM89 opt-in:
     use_fp16: bool = False,
     precision: str = "auto",        # Backend-specific: "auto" | "bf16" | "int8" | "fp8"
+    # X-VLA torch RTX only:
+    xvla_precision: str = "nvfp4",  # "nvfp4" | "fp8" | "bf16"
     # Robot output schema (Apple/RDNA Pi0.5 / Jetson Pi):
     action_dim: int | None = None,
 ) -> VLAModel
@@ -222,6 +224,14 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   `use_fp4_expert=True` promotes the expert tower to NVFP4 (opt-in,
   below the 0.999 precision gate). See `docs/hyvla05_thor_sm110.md`,
   `docs/hyvla05_orin_sm87.md`, and `docs/hyvla05_rtx_sm120.md`.
+- `config="xvla"` (`lerobot/xvla-libero`) is registered for
+  `framework="torch"` on `hardware="rtx_sm120"` (the detected arch for
+  SM120 and SM121).
+  `xvla_precision` selects `"nvfp4"` (default), `"fp8"`, or `"bf16"` for
+  the action transformer and encoder; the DaViT tower runs NVFP4 W4A4.
+  `predict(images, prompt, state)` is supported; `num_views=2` (or 3 when
+  the caller includes the configured empty slot). See
+  `docs/xvla_rtx_sm120.md`.
 
 ### Pi0.5 optimized Thor decoder
 

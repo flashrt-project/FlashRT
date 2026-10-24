@@ -345,6 +345,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                state_prompt_mode="exact",
                state_prompt_fixed_max_len=None,
                precision="auto",
+               xvla_precision="nvfp4",
                *,
                mmproj_path=None,
                backend="cpu",
@@ -383,7 +384,9 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             after first load. Only affects JAX.
         config: model config name: "pi05", "pi0", "groot", "groot_n17",
             "pi0fast", "motus", "dm05", "wan22_ti2v_5b", "cosmos3_video",
-            "cosmos3_edge", "ltx25".
+            "cosmos3_edge", "xvla", "ltx25".
+            "xvla" is lerobot/xvla-libero on RTX SM120/SM121 (torch only;
+            see ``xvla_precision``).
             "ltx25" is the LTX-2.5 22B distilled audio+video generator:
             drive it with set_prompt(...) + infer(...), not predict().
             "cosmos3_video" is a non-VLA text2video denoise model: drive it with
@@ -493,6 +496,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             ``"int8"`` selects the frozen static INT8 tier whose scales are
             set at setup: give it real observations through
             :meth:`VLAModel.calibrate` before the first ``predict()``.
+        xvla_precision: X-VLA torch RTX only. One of ``"nvfp4"`` (default),
+            ``"fp8"`` or ``"bf16"``; selects the action-transformer and
+            encoder weight/activation precision. The DaViT tower runs
+            NVFP4 W4A4.
         use_fp8: Enable FP8 execution where the selected frontend supports
             an FP8/BF16 switch. Defaults to True to preserve existing
             performance-oriented behavior.
@@ -613,12 +620,12 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     elif config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
                       "motus", "wan22_ti2v_5b", "cosmos3_video",
                       "cosmos3_edge", "nexn2", "qwen36_moe", "spark_x25",
-                      "flint", "hyvla", "ltx25", "dm05", "qwen3_4b"):
+                      "flint", "hyvla", "xvla", "ltx25", "dm05", "qwen3_4b"):
         raise ValueError(
             f"Unknown config: {config}. "
             f"Supported: pi05, groot, groot_n17, pi0, pi0fast, motus, "
             f"wan22_ti2v_5b, cosmos3_video, cosmos3_edge, nexn2, "
-            f"qwen36_moe, spark_x25, flint, hyvla, ltx25, dm05, qwen3_4b")
+            f"qwen36_moe, spark_x25, flint, hyvla, xvla, ltx25, dm05, qwen3_4b")
     if framework not in ("torch", "jax", "jetson_pi"):
         raise ValueError(
             f"Unknown framework: {framework}. Supported: torch, jax, jetson_pi")
@@ -1171,6 +1178,12 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         from types import SimpleNamespace
         sig = SimpleNamespace(parameters=parameters)
     kwargs: dict = {"num_views": num_views}
+    if config == "xvla":
+        if xvla_precision not in ("bf16", "fp8", "nvfp4"):
+            raise ValueError(
+                f"xvla_precision must be one of bf16/fp8/nvfp4; got {xvla_precision!r}"
+            )
+        kwargs["precision"] = xvla_precision
     if (arch in ("amd_rdna35", "amd_rdna4")
             and "action_dim" in sig.parameters and action_dim is not None):
         kwargs["action_dim"] = action_dim

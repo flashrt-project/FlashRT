@@ -180,6 +180,10 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("pi0", "jax", "rtx_sm89"):
         ("flash_rt.frontends.jax.pi0_rtx", "Pi0JaxFrontendRtx"),
 
+    # ── X-VLA (Florence-2 DaViT + BART + soft-prompted flow matching) ──
+    ("xvla", "torch", "rtx_sm120"):
+        ("flash_rt.frontends.torch.xvla_rtx", "XVLATorchFrontendRtx"),
+
     # ── Hy-Embodied-0.5-VLA (HunYuan MoT dual-tower + flow matching) ──
     ("hyvla", "torch", "thor"):
         ("flash_rt.frontends.torch.hyvla_thor", "HyVLATorchFrontendThor"),
