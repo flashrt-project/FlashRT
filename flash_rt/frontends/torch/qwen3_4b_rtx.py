@@ -16,12 +16,18 @@ A text decoder, so it is constructed directly rather than through
 from __future__ import annotations
 
 from flash_rt.frontends.torch._qwen3_4b_bf16_runtime import Qwen3_4BBf16Frontend
-from flash_rt.models.qwen3.pipeline_rtx import QWEN3_4B_RTX_SM120
+from flash_rt.models.qwen3.pipeline_rtx import QWEN3_4B_RTX_SM89, QWEN3_4B_RTX_SM120
 
-__all__ = ["Qwen3_4BTorchFrontendRtx"]
+__all__ = ["Qwen3_4BTorchFrontendRtx", "Qwen3_4BTorchFrontendRtxSm89"]
 
 
 class Qwen3_4BTorchFrontendRtx(Qwen3_4BBf16Frontend):
     """Qwen3-4B BF16 prefill on RTX 50-series (SM120), FA2 attention."""
 
     TARGET = QWEN3_4B_RTX_SM120
+
+
+class Qwen3_4BTorchFrontendRtxSm89(Qwen3_4BBf16Frontend):
+    """Qwen3-4B BF16 prefill on RTX 40-series (SM89), FA2 attention."""
+
+    TARGET = QWEN3_4B_RTX_SM89

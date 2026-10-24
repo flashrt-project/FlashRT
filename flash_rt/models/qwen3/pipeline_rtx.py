@@ -98,6 +98,8 @@ class Qwen3Pipeline:
 # The layer sequence is models/qwen3/prefill_bf16.py, shared by every target;
 # an RTX target only fixes the device generation and binds FA2 causal
 # attention.
+# Each target is its own entry: SM120 and SM89 run different FA2 code objects
+# and were validated separately, so one does not stand in for the other.
 
 QWEN3_4B_RTX_SM120 = Qwen3Bf16Target(
     name="rtx_sm120",
@@ -107,5 +109,18 @@ QWEN3_4B_RTX_SM120 = Qwen3Bf16Target(
     make_attention=Fa2CausalAttention,
     build_hint=(
         "Build with: cmake -B build -S . -DGPU_ARCH=120 && "
+        "cmake --build build --target flash_rt_kernels flash_rt_fa2"),
+)
+
+QWEN3_4B_RTX_SM89 = Qwen3Bf16Target(
+    name="rtx_sm89",
+    compute_capability=(8, 9),
+    attention="fa2",
+    # griddepcontrol needs SM90; Ada launches without programmatic
+    # dependencies.
+    pdl=False,
+    make_attention=Fa2CausalAttention,
+    build_hint=(
+        "Build with: cmake -B build -S . -DGPU_ARCH=89 && "
         "cmake --build build --target flash_rt_kernels flash_rt_fa2"),
 )

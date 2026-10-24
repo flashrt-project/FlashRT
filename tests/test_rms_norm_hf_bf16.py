@@ -39,6 +39,11 @@ def _fvk():
     return fvk
 
 
+def _skip_pdl_below_sm90(pdl):
+    if pdl and torch.cuda.get_device_capability() < (9, 0):
+        pytest.skip("programmatic dependent launch needs SM90+")
+
+
 def _tree():
     from flash_rt.models.qwen3.prefill_bf16 import torch_reduce_tree
     return torch_reduce_tree()
@@ -67,6 +72,7 @@ ROWS = [1, 2, 3, 7, 8, 15, 16, 17, 255, 1024]
 @pytest.mark.parametrize("dim", [1000, 2560, 4096])
 def test_rms_norm_matches_hf(rows, dim, pdl):
     fvk = _fvk()
+    _skip_pdl_below_sm90(pdl)
     torch.manual_seed(rows * 31 + dim)
     x = (torch.randn(rows, dim, device="cuda") * torch.rand(rows, 1, device="cuda") * 8).to(BF16)
     d = (torch.randn(rows, dim, device="cuda") * 2).to(BF16)
@@ -97,6 +103,7 @@ def _rope_tables(seq, hd=128, theta=1e6):
 @pytest.mark.parametrize("seq", [1, 2, 8, 255, 1024])
 def test_qk_norm_rope_matches_hf(seq, pdl):
     fvk = _fvk()
+    _skip_pdl_below_sm90(pdl)
     nq, nk, hd = 32, 8, 128
     torch.manual_seed(seq)
     q = (torch.randn(seq, nq * hd, device="cuda") * 3).to(BF16)
@@ -119,6 +126,7 @@ def test_qk_norm_rope_matches_hf(seq, pdl):
 @pytest.mark.parametrize("n", [8, 9728 * 8, 9728 * 1024])
 def test_silu_mul_matches_hf(n, pdl):
     fvk = _fvk()
+    _skip_pdl_below_sm90(pdl)
     torch.manual_seed(n % 997)
     g = (torch.randn(n, device="cuda") * 4).to(BF16)
     u = (torch.randn(n, device="cuda") * 2).to(BF16)
