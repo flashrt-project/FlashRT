@@ -87,3 +87,46 @@ class Fa2CausalAttention:
             q_strides=(S * qd, qd, hd), k_strides=(S * kd, kd, hd),
             v_strides=(S * kd, kd, hd), o_strides=(S * qd, qd, hd),
             softmax_scale=self._scale, num_sms=self._num_sms, stream=stream)
+
+
+class Fa4CausalAttention:
+    """FlashAttention-4 (CuTe-DSL) forward through ``hardware.thor.fa4_backend``.
+
+    FA4 launches on torch's current stream, which is the stream the runtime
+    runs the prefill on; ``run`` takes ``stream`` only for the common
+    signature. GQA is packed by FA4 itself.
+    """
+
+    name = "fa4"
+
+    def __init__(self, dims: Any, max_seq: int, q: torch.Tensor,
+                 k: torch.Tensor, v: torch.Tensor, o: torch.Tensor,
+                 device: torch.device) -> None:
+        from flash_rt.hardware.thor import fa4_backend
+        if not fa4_backend.is_available():
+            raise RuntimeError(
+                "Qwen3 BF16 prefill on Thor needs the vendored FA4 forward "
+                f"(nvidia-cutlass-dsl + quack-kernels): {fa4_backend.status()}")
+        self._fwd = fa4_backend.fa4_fwd()
+        self._nq, self._nkv, self._hd = (
+            dims.num_q_heads, dims.num_kv_heads, dims.head_dim)
+        self._scale = dims.head_dim ** -0.5
+        self._q, self._k, self._v, self._o = q, k, v, o
+        self._views: dict[int, tuple[torch.Tensor, ...]] = {}
+        self.run(1, torch.cuda.current_stream(device).cuda_stream)
+        torch.cuda.synchronize(device)
+
+    def _view(self, S: int) -> tuple[torch.Tensor, ...]:
+        views = self._views.get(S)
+        if views is None:
+            nq, nkv, hd = self._nq, self._nkv, self._hd
+            views = (self._q[:S * nq * hd].view(1, S, nq, hd),
+                     self._k[:S * nkv * hd].view(1, S, nkv, hd),
+                     self._v[:S * nkv * hd].view(1, S, nkv, hd),
+                     self._o[:S * nq * hd].view(1, S, nq, hd))
+            self._views[S] = views
+        return views
+
+    def run(self, S: int, stream: int) -> None:
+        q, k, v, o = self._view(S)
+        self._fwd(q, k, v, softmax_scale=self._scale, causal=True, out=o)

@@ -34,9 +34,11 @@ SEQS = [8, 256, 1024]
 def test_pipeline_map_binds_one_frontend_per_target():
     from flash_rt.hardware import resolve_pipeline_class
     from flash_rt.frontends.torch.qwen3_4b_rtx import Qwen3_4BTorchFrontendRtx
+    from flash_rt.frontends.torch.qwen3_4b_thor import Qwen3_4BTorchFrontendThor
 
     expected = {
         "rtx_sm120": (Qwen3_4BTorchFrontendRtx, (12, 0), "fa2", True),
+        "thor": (Qwen3_4BTorchFrontendThor, (11, 0), "fa4", True),
     }
     for arch, (cls, cc, attention, pdl) in expected.items():
         resolved = resolve_pipeline_class("qwen3_4b", "torch", arch)
@@ -169,6 +171,18 @@ def test_input_forms(random_pair):
         fe.forward_prefill(list(range(fe.max_seq + 1)))
 
 
+def test_refuses_other_targets_device():
+    cls = frontend_cls()
+    from flash_rt.frontends.torch.qwen3_4b_rtx import Qwen3_4BTorchFrontendRtx
+    from flash_rt.frontends.torch.qwen3_4b_thor import Qwen3_4BTorchFrontendThor
+
+    for other in (Qwen3_4BTorchFrontendRtx, Qwen3_4BTorchFrontendThor):
+        if other is cls:
+            continue
+        with pytest.raises(RuntimeError, match="validated on"):
+            other(None, state_dict={}, config={})
+
+
 def test_refuses_a_build_without_the_kernels(monkeypatch):
     cls = frontend_cls()
     import types
@@ -190,8 +204,12 @@ def test_attention_backend_is_required(monkeypatch):
     dims = Qwen3_4BDims()
     buf = torch.empty(16 * 32 * 128, device="cuda", dtype=torch.bfloat16)
     make = cls.TARGET.make_attention
-    import flash_rt
-    monkeypatch.delattr(flash_rt, "flash_rt_fa2", raising=False)
-    monkeypatch.setitem(sys.modules, "flash_rt.flash_rt_fa2", None)
+    if cls.TARGET.attention == "fa2":
+        import flash_rt
+        monkeypatch.delattr(flash_rt, "flash_rt_fa2", raising=False)
+        monkeypatch.setitem(sys.modules, "flash_rt.flash_rt_fa2", None)
+    else:
+        from flash_rt.hardware.thor import fa4_backend
+        monkeypatch.setattr(fa4_backend, "is_available", lambda: False)
     with pytest.raises(RuntimeError):
         make(dims, 16, buf, buf, buf, buf, torch.device("cuda"))
