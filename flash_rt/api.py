@@ -743,6 +743,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "load_model's VLA wrapper. Construct it directly:\n"
             "    from flash_rt.frontends.torch.qwen3_4b_rtx import "
             "Qwen3_4BTorchFrontendRtx    # RTX SM120\n"
+            "    # (Qwen3_4BTorchFrontendRtxSm89 from the same module on SM89)\n"
             "    from flash_rt.frontends.torch.qwen3_4b_thor import "
             "Qwen3_4BTorchFrontendThor   # Jetson Thor SM110\n"
             "See docs/qwen3_4b_bf16.md.")

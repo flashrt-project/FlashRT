@@ -33,11 +33,13 @@ SEQS = [8, 256, 1024]
 
 def test_pipeline_map_binds_one_frontend_per_target():
     from flash_rt.hardware import resolve_pipeline_class
-    from flash_rt.frontends.torch.qwen3_4b_rtx import Qwen3_4BTorchFrontendRtx
+    from flash_rt.frontends.torch.qwen3_4b_rtx import (
+        Qwen3_4BTorchFrontendRtx, Qwen3_4BTorchFrontendRtxSm89)
     from flash_rt.frontends.torch.qwen3_4b_thor import Qwen3_4BTorchFrontendThor
 
     expected = {
         "rtx_sm120": (Qwen3_4BTorchFrontendRtx, (12, 0), "fa2", True),
+        "rtx_sm89": (Qwen3_4BTorchFrontendRtxSm89, (8, 9), "fa2", False),
         "thor": (Qwen3_4BTorchFrontendThor, (11, 0), "fa4", True),
     }
     for arch, (cls, cc, attention, pdl) in expected.items():
@@ -188,10 +190,12 @@ def test_input_forms(random_pair):
 
 def test_refuses_other_targets_device():
     cls = frontend_cls()
-    from flash_rt.frontends.torch.qwen3_4b_rtx import Qwen3_4BTorchFrontendRtx
+    from flash_rt.frontends.torch.qwen3_4b_rtx import (
+        Qwen3_4BTorchFrontendRtx, Qwen3_4BTorchFrontendRtxSm89)
     from flash_rt.frontends.torch.qwen3_4b_thor import Qwen3_4BTorchFrontendThor
 
-    for other in (Qwen3_4BTorchFrontendRtx, Qwen3_4BTorchFrontendThor):
+    for other in (Qwen3_4BTorchFrontendRtx, Qwen3_4BTorchFrontendRtxSm89,
+                  Qwen3_4BTorchFrontendThor):
         if other is cls:
             continue
         with pytest.raises(RuntimeError, match="validated on"):
