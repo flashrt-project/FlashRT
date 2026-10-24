@@ -915,6 +915,7 @@ and the expected results. Build times, FA2 slim-build flags and ccache are in
 - **Hy-Embodied-0.5-VLA** (`config="hyvla"`) — Jetson Thor SM110, Jetson Orin SM87, and RTX SM120 (SM120 block-128 FP8 with a default NVFP4 ViT + VLM-prefill tier, expert tower on FP8); [RTX SM120 usage](docs/hyvla05_rtx_sm120.md), [Thor notes](docs/hyvla05_thor_sm110.md), [Orin SM87 notes](docs/hyvla05_orin_sm87.md)
 - **Alpamayo 1.5** — the official full request and the FlashDrive streaming procedure on Jetson AGX Thor; [Alpamayo 1.5 on Thor](docs/alpamayo15.md)
 - **LingBot-VLA** — [LingBot usage](docs/lingbot_usage.md), [Thor latency](docs/lingbot_usage.md#5-accuracy--latency-thor-sm_110-cuda-graph-replay)
+- **X-VLA** (`config="xvla"`) — RTX SM120/SM121, torch only; NVFP4 default with FP8/BF16 tiers; [RTX SM120 usage](docs/xvla_rtx_sm120.md)
 - **Motus Stage3 RTX beta** (`config="motus"`) — [Motus usage](docs/motus_usage_beta.md), [legacy async chunk runner](docs/rtc_lite_design.md)
 - **Wan2.2 TI2V-5B** (`config="wan22_ti2v_5b"`) — [Wan2.2 usage](docs/wan22_usage.md)
 - **Cosmos3-Nano text-to-video** (`config="cosmos3_video"`) — RTX 5090 BF16/FP8 denoise and complete benchmark workflow; [usage and performance](docs/cosmos3_video_usage.md)

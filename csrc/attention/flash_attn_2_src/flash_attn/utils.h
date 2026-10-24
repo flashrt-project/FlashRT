@@ -183,6 +183,60 @@ __forceinline__ __device__ void gemm_rs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tC
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// The partial-KV-tile forms of gemm / gemm_rs: only the first n_cap N atoms of
+// S (resp. the first k_cap K slices of P.V) are issued. The skipped S columns
+// are keys at or past seqlen_k, which apply_mask overwrites with -inf, and the
+// skipped P.V slices multiply P == 0 exactly, so the accumulators are
+// unchanged; the partial tile simply stops paying for its padding.
+template<bool A_in_regs=false, typename Tensor0, typename Tensor1, typename Tensor2,
+         typename Tensor3, typename Tensor4, typename TiledMma, typename TiledCopyA,
+         typename TiledCopyB, typename ThrCopyA, typename ThrCopyB>
+__forceinline__ __device__ void gemm_ncap(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsA,
+                                 Tensor4 const& tCsB, TiledMma tiled_mma,
+                                 TiledCopyA smem_tiled_copy_A, TiledCopyB smem_tiled_copy_B,
+                                 ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B, int n_cap) {
+    Tensor tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);
+    Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
+    if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, _0{}), tCrA_copy_view(_, _, _0{})); }
+    cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
+    #pragma unroll
+    for (int i = 0; i < size<2>(tCrA); ++i) {
+        if (i < size<2>(tCrA) - 1) {
+            if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, i + 1), tCrA_copy_view(_, _, i + 1)); }
+            cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
+        }
+        #pragma unroll
+        for (int n = 0; n < size<1>(tCrB); ++n) {
+            if (n < n_cap) {
+                #pragma unroll
+                for (int m = 0; m < size<1>(tCrA); ++m) {
+                    cute::gemm(tiled_mma, tCrA(_, m, i), tCrB(_, n, i), acc(_, m, n));
+                }
+            }
+        }
+    }
+}
+
+template<typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
+         typename TiledMma, typename TiledCopy, typename ThrCopy>
+__forceinline__ __device__ void gemm_rs_kcap(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsB,
+                                    TiledMma tiled_mma, TiledCopy smem_tiled_copy_B,
+                                    ThrCopy smem_thr_copy_B, int k_cap) {
+    Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
+    cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
+    #pragma unroll
+    for (int i = 0; i < size<2>(tCrA); ++i) {
+        if (i < k_cap) {
+            if (i + 1 < k_cap && i < size<2>(tCrA) - 1) {
+                cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
+            }
+            cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // Convert acc_layout from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
 template<typename Layout>
 __forceinline__ __device__ auto convert_layout_acc_rowcol(Layout acc_layout) {

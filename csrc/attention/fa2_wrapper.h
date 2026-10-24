@@ -95,6 +95,79 @@ FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_bf16_tile(
     int o_batch_stride, int o_row_stride, int o_head_stride,
     float softmax_scale, int num_sms, cudaStream_t stream);
 
+// The head_dim-64 tile entries below are internal to the Python adapter and
+// are intentionally not part of the native C API export allow-list
+// (csrc/attention/fa2_native_exports.map).
+
+// head_dim 64 tile <64,32,64,4> (head_dim must be exactly 64).
+void fvk_attention_fa2_fwd_bf16_tile64m32(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr, const void* seqused_k_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream);
+
+// head_dim 64 tile <64,32,64,2>: 32 query rows on two warps (head_dim 64).
+void fvk_attention_fa2_fwd_bf16_tile64m32w2(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr, const void* seqused_k_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream);
+
+// head_dim 64 tile <64,64,64,4> (head_dim must be exactly 64).
+void fvk_attention_fa2_fwd_bf16_tile64(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr, const void* seqused_k_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream);
+
+// Programmatic dependent launch for this module's forward entries; off by
+// default (see csrc/kernels/pdl_switch.cuh).
+FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_set_pdl(int enabled);
+
+// head_dim 64 tile with a fused NVFP4 quantize of the O tile (head_dim must be 64;
+// null o_packed/o_sfa falls back to fvk_attention_fa2_fwd_bf16_tile64).
+void fvk_attention_fa2_fwd_bf16_tile64_qnvfp4(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr, const void* seqused_k_ptr,
+    void* o_packed_ptr, void* o_sfa_ptr,
+    int o_packed_row_bytes, int o_sfa_n_col_blocks,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream);
+
+// Same with the two-warp 32-row tile.
+void fvk_attention_fa2_fwd_bf16_tile64m32w2_qnvfp4(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr, const void* seqused_k_ptr,
+    void* o_packed_ptr, void* o_sfa_ptr,
+    int o_packed_row_bytes, int o_sfa_n_col_blocks,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream);
+
 FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_bf16_causal(
     const void* q_ptr, const void* k_ptr, const void* v_ptr,
     void* o_ptr, void* softmax_lse_ptr,
