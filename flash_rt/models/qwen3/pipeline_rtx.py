@@ -37,6 +37,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from flash_rt.models.qwen3._bf16_attention import Fa2CausalAttention
+from flash_rt.models.qwen3.prefill_bf16 import Qwen3Bf16Target
+
 
 @dataclass
 class Qwen3Dims:
@@ -88,3 +91,21 @@ class Qwen3Pipeline:
     @property
     def hidden(self) -> int:
         return int(self.weights.ptrs.get('hidden', self.DIMS.hidden))
+
+
+# ── Qwen/Qwen3-4B dense BF16 prefill (RTX) ──
+#
+# The layer sequence is models/qwen3/prefill_bf16.py, shared by every target;
+# an RTX target only fixes the device generation and binds FA2 causal
+# attention.
+
+QWEN3_4B_RTX_SM120 = Qwen3Bf16Target(
+    name="rtx_sm120",
+    compute_capability=(12, 0),
+    attention="fa2",
+    pdl=True,
+    make_attention=Fa2CausalAttention,
+    build_hint=(
+        "Build with: cmake -B build -S . -DGPU_ARCH=120 && "
+        "cmake --build build --target flash_rt_kernels flash_rt_fa2"),
+)

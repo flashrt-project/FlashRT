@@ -1,0 +1,36 @@
+# FlashRT — Qwen3-4B (HuggingFace Qwen/Qwen3-4B)
+# Dense decoder-only CausalLM. BF16 batch-1 prefill -> logits, matching HF
+# Qwen3ForCausalLM in BF16. Metadata only: the frontends read config.json.
+#
+# Distinct from qwen35vla (hybrid GDN + ViT) and from the Qwen3-8B NVFP4
+# path (hidden=4096). See docs/qwen3_4b_bf16.md.
+name: qwen3_4b
+
+backbone_type: qwen3_dense
+backbone_hidden: 2560
+
+llm:
+  type: qwen3
+  model_type: qwen3
+  hidden_dim: 2560
+  num_layers: 36
+  vocab_size: 151936
+  intermediate_dim: 9728
+  activation: silu
+
+  # GQA attention (all 36 layers full_attention)
+  num_attention_heads: 32
+  num_key_value_heads: 8
+  head_dim: 128
+  rope_theta: 1000000.0
+  max_position_embeddings: 40960
+  rms_norm_eps: 1.0e-6
+  tie_word_embeddings: true
+
+quant:
+  weights: bf16
+  activations: bf16
+
+prefill:
+  batch: 1
+  max_seq_default: 2048

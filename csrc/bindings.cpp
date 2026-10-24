@@ -265,6 +265,8 @@ extern "C" void flash_rt_awq_quant_fp8_static_fp16(
 #include "kernels/rms_norm_gated_silu_qwen36.cuh"
 #endif
 #include "kernels/silu_mul_qwen36.cuh"
+#include "kernels/rms_norm_hf_bf16.cuh"
+#include "kernels/bf16_matmul_cublaslt_ref.cuh"
 #include "kernels/act_bf16.cuh"
 #include "kernels/embedding_lookup_bf16.cuh"
 #ifdef FLASHRT_HAVE_AUDIO_CODEBOOK
@@ -7118,6 +7120,94 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         },
         py::arg("merged"), py::arg("out"),
         py::arg("seq"), py::arg("half_dim"), py::arg("stream") = 0);
+
+    // HF-parity BF16 RMSNorm / q-k RMSNorm + RoPE / SiLU gate: same rounding
+    // points and fp32 reduction order as PyTorch eager, so outputs equal the
+    // HuggingFace reference bit for bit. torch_reduce: 0 = PyTorch <= 2.9,
+    // 1 = PyTorch >= 2.10 reduction tree. `pdl` launches with programmatic
+    // stream serialization (SM90+; pass false on SM8x).
+    m.def("rms_norm_hf_bf16",
+        [](uintptr_t x, uintptr_t weight, uintptr_t out, int rows, int dim,
+           float eps, int torch_reduce, bool pdl, uintptr_t stream) {
+            flash_rt::kernels::rms_norm_hf_bf16(
+                typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(weight),
+                typed_ptr<__nv_bfloat16>(out), rows, dim, eps, torch_reduce,
+                pdl, to_stream(stream));
+        },
+        py::arg("x"), py::arg("weight"), py::arg("out"), py::arg("rows"),
+        py::arg("dim"), py::arg("eps"), py::arg("torch_reduce"),
+        py::arg("pdl") = false, py::arg("stream") = 0,
+        "w * bf16(x * rsqrt(mean(x^2) + eps)) per row, torch's reduction "
+        "order. dim % 4 == 0 and dim > 128; out must not alias x.");
+
+    m.def("residual_add_rms_norm_hf_bf16",
+        [](uintptr_t residual, uintptr_t delta, uintptr_t weight, uintptr_t out,
+           int rows, int dim, float eps, int torch_reduce, bool pdl,
+           uintptr_t stream) {
+            flash_rt::kernels::residual_add_rms_norm_hf_bf16(
+                typed_ptr<__nv_bfloat16>(residual),
+                typed_ptr<__nv_bfloat16>(delta),
+                typed_ptr<__nv_bfloat16>(weight),
+                typed_ptr<__nv_bfloat16>(out), rows, dim, eps, torch_reduce,
+                pdl, to_stream(stream));
+        },
+        py::arg("residual"), py::arg("delta"), py::arg("weight"),
+        py::arg("out"), py::arg("rows"), py::arg("dim"), py::arg("eps"),
+        py::arg("torch_reduce"), py::arg("pdl") = false, py::arg("stream") = 0,
+        "residual = bf16(residual + delta) in place, then "
+        "out = rms_norm_hf_bf16(residual).");
+
+    m.def("qk_rms_norm_rope_hf_bf16",
+        [](uintptr_t q, long long q_row_stride, int q_heads,
+           uintptr_t k, long long k_row_stride, int k_heads,
+           uintptr_t q_weight, uintptr_t k_weight,
+           uintptr_t cos_half, uintptr_t sin_half,
+           int seq, int head_dim, float eps, int torch_reduce, bool pdl,
+           uintptr_t stream) {
+            flash_rt::kernels::qk_rms_norm_rope_hf_bf16(
+                typed_ptr<__nv_bfloat16>(q), q_row_stride, q_heads,
+                typed_ptr<__nv_bfloat16>(k), k_row_stride, k_heads,
+                typed_ptr<__nv_bfloat16>(q_weight),
+                typed_ptr<__nv_bfloat16>(k_weight),
+                typed_ptr<__nv_bfloat16>(cos_half),
+                typed_ptr<__nv_bfloat16>(sin_half),
+                seq, head_dim, eps, torch_reduce, pdl, to_stream(stream));
+        },
+        py::arg("q"), py::arg("q_row_stride"), py::arg("q_heads"),
+        py::arg("k"), py::arg("k_row_stride"), py::arg("k_heads"),
+        py::arg("q_weight"), py::arg("k_weight"),
+        py::arg("cos_half"), py::arg("sin_half"),
+        py::arg("seq"), py::arg("head_dim"), py::arg("eps"),
+        py::arg("torch_reduce"), py::arg("pdl") = false, py::arg("stream") = 0,
+        "Per-head RMSNorm then rotate-half RoPE over q and k, in place, "
+        "head_dim 128; cos_half/sin_half are [seq, head_dim / 2] bf16.");
+
+    m.def("bf16_matmul_cublaslt_ref_bf16",
+        [](uintptr_t x, uintptr_t W, uintptr_t out, int M, int N, int K,
+           bool tuned, uintptr_t stream) {
+            flash_rt::kernels::bf16_matmul_cublaslt_ref_bf16(
+                typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(W),
+                typed_ptr<__nv_bfloat16>(out), M, N, K, tuned,
+                to_stream(stream));
+        },
+        py::arg("x"), py::arg("W"), py::arg("out"), py::arg("M"), py::arg("N"),
+        py::arg("K"), py::arg("tuned") = false, py::arg("stream") = 0,
+        "out[M,N] = x[M,K] @ W[N,K]^T on cuBLASLt's heuristic first choice -- "
+        "the algorithm torch's matmul runs, so its bits. tuned=True may run a "
+        "faster candidate that matched the first choice on random probe "
+        "operands (an empirical check, not a guarantee).");
+
+    m.def("silu_mul_hf_bf16",
+        [](uintptr_t gate, uintptr_t up, uintptr_t out, long long n, bool pdl,
+           uintptr_t stream) {
+            flash_rt::kernels::silu_mul_hf_bf16(
+                typed_ptr<__nv_bfloat16>(gate), typed_ptr<__nv_bfloat16>(up),
+                typed_ptr<__nv_bfloat16>(out), n, pdl, to_stream(stream));
+        },
+        py::arg("gate"), py::arg("up"), py::arg("out"), py::arg("n"),
+        py::arg("pdl") = false, py::arg("stream") = 0,
+        "out = bf16(bf16(silu(gate)) * up); n % 8 == 0, 16-byte aligned, "
+        "out may alias gate.");
 
     m.def("sigmoid_mul_qwen36_bf16",
         [](uintptr_t gate, uintptr_t x, uintptr_t out,

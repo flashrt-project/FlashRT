@@ -231,6 +231,13 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("cosmos3_video", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.cosmos3_video_rtx", "Cosmos3VideoTorchFrontendRtx"),
 
+    # ── Qwen3-4B dense text (HuggingFace Qwen/Qwen3-4B, BF16) ──
+    # Batch-1 prefill -> logits, not VLA: discovery only, constructed
+    # directly. One layer sequence (models/qwen3/prefill_bf16.py), one
+    # frontend per validated target: FA2 on SM120. See docs/qwen3_4b_bf16.md.
+    ("qwen3_4b", "torch", "rtx_sm120"):
+        ("flash_rt.frontends.torch.qwen3_4b_rtx", "Qwen3_4BTorchFrontendRtx"),
+
     # ── Qwen3-VL (multimodal Qwen3-VL-8B, NVFP4 + FP8 paths) ──
     # VLM with chat-style API (generate(messages) -> str), not VLA
     # predict(images). Requires the gated kernel build
