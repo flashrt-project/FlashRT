@@ -165,6 +165,12 @@ over 10 seeds (5000 episodes; [protocol](docs/pi05_prefix_nvfp4.md#libero-10-clo
 
 **Guide:** [Thor](examples/thor/README.md) · [RTX 5090](examples/blackwell/README.md).
 
+#### GROOT N1.5
+
+| Hardware | Mode | Latency | Source |
+|---|---|---:|---|
+| RTX 4090 | bf16 torch CUDA Graph (no FP8 kernels), 3-view, `get_action` | **~46–50 ms** (eager ~70–80 ms) | [GROOT N1.5 SM89](docs/groot_n15_rtx_sm89.md) |
+
 #### GROOT N1.7
 
 | Hardware | Mode | Latency | Throughput | Source |

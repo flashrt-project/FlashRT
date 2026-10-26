@@ -36,7 +36,7 @@ def load_model(
     autotune: int = 3,              # 0=off, 3=default, 5+=thorough
     recalibrate: bool = False,
     weight_cache: bool = True,      # JAX only
-    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "groot_n17" | "pi0fast" | "motus" | "wan22_ti2v_5b" | "cosmos3_video" | "cosmos3_edge" | "chameleon" | "hyvla"
+    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "groot_n15" | "groot_n17" | "pi0fast" | "motus" | "wan22_ti2v_5b" | "cosmos3_video" | "cosmos3_edge" | "chameleon" | "hyvla"
     device=None,                    # reserved
     # Pi0-FAST-specific:
     decode_cuda_graph: bool = False,
@@ -191,6 +191,12 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   establishes the end-to-end reference; the fixture-backed FlashRT backend
   validates and benchmarks the optimized denoise boundary. See
   `docs/cosmos3_edge_thor.md`.
+- `config="groot_n15"` is registered for `framework="torch"` on
+  `hardware="rtx_sm89"` only: a torch-level bf16 CUDA-Graph tier over the
+  upstream Isaac-GR00T `Gr00tPolicy` (set `$GROOT_N15_ROOT` and
+  `$GROOT_N15_DATA_CONFIG`, or pass `groot_root=`/`data_config=` to the
+  frontend). It does not need `flash_rt_kernels`; `predict(...)` returns the
+  GR00T per-key action dict. See `docs/groot_n15_rtx_sm89.md`.
 - `config="groot_n17"` is registered for `framework="torch"` on
   `hardware in {"thor", "rtx_sm120", "rtx_sm89", "amd_cdna4", "npu"}`. On RTX,
   `rtx_sm120` resolves through the historical shared RTX registration and
