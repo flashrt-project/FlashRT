@@ -144,37 +144,49 @@ def merger_forward(gemm, fvk, lk, B, M, x, rows_in, dim_in, post_norm, out, st, 
     _mm(gemm, prec, s8, f16, M, "fc2", out, n, 2048, D4, st)
 
 
-def qwen_vit_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8"):
+def _site_prec(prec, fp8_sites, cal):
+    """Per-GEMM-site precision: sites in ``fp8_sites`` run static FP8 ("cal"
+    while calibrating) inside a 16-bit stage."""
+    def sp(name):
+        if name in fp8_sites:
+            return "cal" if cal else "fp8"
+        return prec
+    return sp
+
+
+def qwen_vit_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8", fp8_sites=(), cal=False):
     """Patch embedding + 24 ViT layers + DeepStack mergers at the taps + the
     final merger. B["ds_out"][j] / B["merger_out"] receive [S/4, 2048] rows
-    (fc2 bias pending)."""
+    (fc2 bias pending). ``fp8_sites`` (qkv / o / fc1 / fc2) run FP8 in a
+    16-bit tower."""
     S, nv = int(dims["S"]), int(dims["views"])
     Sper, D, NH, HD, FF = S // nv, 1024, 16, 64, 4096
     st = int(stream)
     h, x8, qkv = B["h"], B["x8"], B["qkv"]
     Q, K, V, O, lse = B["Q"], B["K"], B["V"], B["O"], B["lse"]
     o_out, fc1, f16 = B["o_out"], B["fc1"], B["f16"]
-    bf = prec not in _F16
+    sp = _site_prec(prec, fp8_sites, cal)
+    p_qkv, p_o, p_fc1, p_fc2 = sp("qkv"), sp("o"), sp("fc1"), sp("fc2")
     gemm.fp16_nn_bias(B["patch"], W["patch_w"], h, W["patch_b"], S, D, 768, st)
     pend = (W["pos"], 0)
     for li in range(24):
         L = W["layers"][li]
-        _norm8(fvk, h, pend[0], pend[1], 0, L["n1_w"], L["n1_b"], 0, EPS_VIT, x8, L["a_qkv"], S, D, st, prec, f16)
-        _mm(gemm, prec, x8, f16, L, "qkv", qkv, S, 3 * D, D, st)
+        _norm8(fvk, h, pend[0], pend[1], 0, L["n1_w"], L["n1_b"], 0, EPS_VIT, x8, L["a_qkv"], S, D, st, p_qkv, f16)
+        _mm(gemm, p_qkv, x8, f16, L, "qkv", qkv, S, 3 * D, D, st)
         qb = L["qkv_b"]
         _ck(fvk.fp8_qkv_split(qkv, qkv + 2 * D, qkv + 4 * D, 3 * D, qb, qb + 2 * D, qb + 4 * D, 1.0, 1.0, 0, 0,
-                              1e-6, W["cos"], W["sin"], Q, K, V, bf, S, NH, NH, HD, st), "vit qkv")
-        _attn(fa2, fvk, Q, K, V, O, lse, x8, L["a_o"], batch=nv, seq=Sper, heads=NH, hd=HD, st=st, prec=prec)
-        _mm(gemm, prec, x8, O, L, "o", o_out, S, D, D, st)
-        _norm8(fvk, h, o_out, L["o_b"], 0, L["n2_w"], L["n2_b"], 0, EPS_VIT, x8, L["a_fc1"], S, D, st, prec, f16)
-        if prec == "f16acc":
+                              1e-6, W["cos"], W["sin"], Q, K, V, p_o not in _F16, S, NH, NH, HD, st), "vit qkv")
+        _attn(fa2, fvk, Q, K, V, O, lse, x8, L["a_o"], batch=nv, seq=Sper, heads=NH, hd=HD, st=st, prec=p_o)
+        _mm(gemm, p_o, x8, O, L, "o", o_out, S, D, D, st)
+        _norm8(fvk, h, o_out, L["o_b"], 0, L["n2_w"], L["n2_b"], 0, EPS_VIT, x8, L["a_fc1"], S, D, st, p_fc1, f16)
+        if p_fc1 == "f16acc" and p_fc2 == "f16acc":
             # fc1 bias + tanh-GELU in the GEMM epilogue; fc2 reads it directly
             _ck(_LK.gemm_f16acc(f16, L["fc1_w16"], fc1, L["fc1_b"], S, FF, D, True, st), "vit fc1 gelu")
-            _mm(gemm, prec, x8, fc1, L, "fc2", o_out, S, D, FF, st)
+            _mm(gemm, p_fc2, x8, fc1, L, "fc2", o_out, S, D, FF, st)
         else:
-            _mm(gemm, prec, x8, f16, L, "fc1", fc1, S, FF, D, st)
-            _gelu8(lk, fvk, fc1, FF, L["fc1_b"], x8, L["a_fc2"], S, FF, st, prec, f16, tanh=True)
-            _mm(gemm, prec, x8, f16, L, "fc2", o_out, S, D, FF, st)
+            _mm(gemm, p_fc1, x8, f16, L, "fc1", fc1, S, FF, D, st)
+            _gelu8(lk, fvk, fc1, FF, L["fc1_b"], x8, L["a_fc2"], S, FF, st, p_fc2, f16, tanh=True)
+            _mm(gemm, p_fc2, x8, f16, L, "fc2", o_out, S, D, FF, st)
         pend = (o_out, L["fc2_b"])
         if li in VIT_TAPS:
             _ck(fvk.fp8_residual_norm_quant(h, pend[0], pend[1], 0, 0, 0, 0, 0, 0.0, 0, 0, 0, S, D, st), "vit res")
@@ -189,7 +201,8 @@ def qwen_vit_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8"):
 # Qwen3-VL language model (16 layers kept by LaWAM) + final RMSNorm
 # ─────────────────────────────────────────────────────────────────────────
 
-def qwen_llm_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8", num_sms=0, out_prec="fp8"):
+def qwen_llm_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8", num_sms=0, out_prec="fp8",
+                     fp8_sites=(), cal=False):
     """Embedding assembly, 16 decoder layers (fused QKV, q/k RMSNorm + M-RoPE,
     causal GQA FA2, SwiGLU, DeepStack adds after layers 0..2) and the final
     RMSNorm: B["vlm"] gets the FP16 VLM states, B["vlm8"] their FP8 copy (the
@@ -207,11 +220,13 @@ def qwen_llm_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8", nu
     for j in range(3):
         _ck(lk.scatter_rows(B["ds_out"][j], W["ds_b"][j], W["vis_idx"], B["inject"][j], n_vis, D, st),
             "deepstack scatter")
+    sp = _site_prec(prec, fp8_sites, cal)
+    p_qkv, p_o, p_gu, p_dn = sp("qkv"), sp("o"), sp("gateup"), sp("down")
     pend, pend2 = 0, 0
     for li in range(16):
         L = W["layers"][li]
-        _norm8(fvk, h, pend, 0, pend2, L["in_ln_w"], 0, 1, EPS_LLM, x8, L["a_qkv"], S, D, st, prec, f16)
-        _mm(gemm, prec, x8, f16, L, "qkv", qkv, S, NQKV, D, st)
+        _norm8(fvk, h, pend, 0, pend2, L["in_ln_w"], 0, 1, EPS_LLM, x8, L["a_qkv"], S, D, st, p_qkv, f16)
+        _mm(gemm, p_qkv, x8, f16, L, "qkv", qkv, S, NQKV, D, st)
         _ck(fvk.fp8_qkv_split(qkv, qkv + 2 * NHQ * HD, qkv + 2 * (NHQ + NHKV) * HD, NQKV, 0, 0, 0, 1.0, 1.0,
                               L["q_norm_w"], L["k_norm_w"], 1e-6, W["cos"], W["sin"], Q, K, V, True, S,
                               NHQ, NHKV, HD, st), "llm qkv")
@@ -220,27 +235,31 @@ def qwen_llm_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8", nu
              q_strides=(S * NHQ * HD, NHQ * HD, HD), k_strides=(S * NHKV * HD, NHKV * HD, HD),
              v_strides=(S * NHKV * HD, NHKV * HD, HD), o_strides=(S * NHQ * HD, NHQ * HD, HD),
              softmax_scale=HD ** -0.5, num_sms=num_sms, stream=st)
-        if prec == "cal":
+        if p_o == "cal":
             fvk.quantize_fp8_device(O, x8, L["a_o"], S * NHQ * HD, st)
-        elif prec == "fp8":
+        elif p_o == "fp8":
             fvk.quantize_fp8_static(O, x8, L["a_o"], S * NHQ * HD, st)
         else:
             fvk.cast_bf16_to_fp16(O, f16, S * NHQ * HD, st)
-        _mm(gemm, prec, x8, f16, L, "o", o_out, S, D, NHQ * HD, st)
-        _norm8(fvk, h, o_out, 0, 0, L["post_ln_w"], 0, 1, EPS_LLM, x8, L["a_gate"], S, D, st, prec, f16)
-        if prec in _F16:
+        _mm(gemm, p_o, x8, f16, L, "o", o_out, S, D, NHQ * HD, st)
+        _norm8(fvk, h, o_out, 0, 0, L["post_ln_w"], 0, 1, EPS_LLM, x8, L["a_gate"], S, D, st, p_gu, f16)
+        if p_gu in _F16:
             # gate | up as one [K, 2 FF] GEMM, SwiGLU reads both halves of the row
-            _mm(gemm, prec, x8, f16, L, "gateup", gate, S, 2 * FF, D, st)
-            _ck(lk.silu_mul(gate, gate + FF * 2, 2 * FF, f16, S, FF, st), "llm silu")
+            _mm(gemm, p_gu, x8, f16, L, "gateup", gate, S, 2 * FF, D, st)
+            g_ptr, u_ptr, g_ld = gate, gate + FF * 2, 2 * FF
         else:
-            _mm(gemm, prec, x8, f16, L, "gate", gate, S, FF, D, st)
-            _mm(gemm, prec, x8, f16, L, "up", up, S, FF, D, st)
-            if prec == "fp8":
-                fvk.silu_mul_split_fp8_fp16(gate, up, x8, S * FF, L["a_down"], st)
-            else:
-                _ck(lk.silu_mul(gate, up, FF, f16, S, FF, st), "llm silu")
+            _mm(gemm, p_gu, x8, f16, L, "gate", gate, S, FF, D, st)
+            _mm(gemm, p_gu, x8, f16, L, "up", up, S, FF, D, st)
+            g_ptr, u_ptr, g_ld = gate, up, FF
+        if p_dn == "fp8" and g_ld == FF:
+            fvk.silu_mul_split_fp8_fp16(gate, up, x8, S * FF, L["a_down"], st)
+        else:
+            _ck(lk.silu_mul(g_ptr, u_ptr, g_ld, f16, S, FF, st), "llm silu")
+            if p_dn == "cal":
                 _quant_f16(fvk, f16, x8, L["a_down"], S * FF, st)
-        _mm(gemm, prec, x8, f16, L, "down", o_out, S, D, FF, st)
+            elif p_dn == "fp8":
+                fvk.quantize_fp8_static_fp16(f16, x8, L["a_down"], S * FF, st)
+        _mm(gemm, p_dn, x8, f16, L, "down", o_out, S, D, FF, st)
         pend = o_out
         pend2 = B["inject"][li] if li < 3 else 0
     # final RMSNorm -> FP16 VLM states (+ the FP8 enc_vlm operand when the

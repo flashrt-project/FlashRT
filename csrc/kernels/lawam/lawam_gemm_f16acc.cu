@@ -22,8 +22,8 @@ struct Plan {
 
 struct Ctx {
     cublasLtHandle_t handle = nullptr;
-    void* workspace = nullptr;
     size_t ws_bytes = 32u << 20;
+    std::map<cudaStream_t, void*> stream_ws;    // concurrent graph branches must not share one
     std::map<std::tuple<int, int, int, int>, Plan> plans;
     std::mutex mu;
     bool autotune = false;
@@ -32,6 +32,16 @@ struct Ctx {
 Ctx& ctx() {
     static Ctx c;
     return c;
+}
+
+// Workspace of ``stream`` (allocated on its first, uncaptured, use).
+void* workspace_for(Ctx& c, cudaStream_t stream) {
+    auto it = c.stream_ws.find(stream);
+    if (it != c.stream_ws.end()) return it->second;
+    void* w = nullptr;
+    if (cudaMalloc(&w, c.ws_bytes) != cudaSuccess) return nullptr;
+    c.stream_ws[stream] = w;
+    return w;
 }
 
 }  // namespace
@@ -43,8 +53,9 @@ int gemm_f16acc(const __half* A, const __half* B, __half* D, const __half* bias,
     std::lock_guard<std::mutex> lock(c.mu);
     if (c.handle == nullptr) {
         if (cublasLtCreate(&c.handle) != CUBLAS_STATUS_SUCCESS) return static_cast<int>(cudaErrorUnknown);
-        if (cudaMalloc(&c.workspace, c.ws_bytes) != cudaSuccess) return static_cast<int>(cudaErrorMemoryAllocation);
     }
+    void* ws = workspace_for(c, stream);
+    if (ws == nullptr) return static_cast<int>(cudaErrorMemoryAllocation);
     const int ep_kind = gelu ? 2 : (bias != nullptr ? 1 : 0);
     const auto key = std::make_tuple(M, N, K, ep_kind);
     auto it = c.plans.find(key);
@@ -99,12 +110,12 @@ int gemm_f16acc(const __half* A, const __half* B, __half* D, const __half* bias,
                 bool ok = true;
                 for (int r = 0; r < 3 && ok; ++r)   // warm-up
                     ok = cublasLtMatmul(c.handle, p.op, &one, B, p.a, A, p.b, &zero, D, p.d, D, p.d, &cand[i].algo,
-                                        c.workspace, c.ws_bytes, stream) == CUBLAS_STATUS_SUCCESS;
+                                        ws, c.ws_bytes, stream) == CUBLAS_STATUS_SUCCESS;
                 if (!ok) continue;
                 cudaEventRecord(e0, stream);
                 for (int r = 0; r < 10; ++r)
                     cublasLtMatmul(c.handle, p.op, &one, B, p.a, A, p.b, &zero, D, p.d, D, p.d, &cand[i].algo,
-                                   c.workspace, c.ws_bytes, stream);
+                                   ws, c.ws_bytes, stream);
                 cudaEventRecord(e1, stream);
                 cudaEventSynchronize(e1);
                 float ms = 0.f;
@@ -125,7 +136,7 @@ int gemm_f16acc(const __half* A, const __half* B, __half* D, const __half* bias,
         cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias));
     const __half one = __float2half(1.0f), zero = __float2half(0.0f);
     const cublasStatus_t st = cublasLtMatmul(c.handle, p.op, &one, B, p.a, A, p.b, &zero, D, p.d, D, p.d, &p.algo,
-                                             c.workspace, c.ws_bytes, stream);
+                                             ws, c.ws_bytes, stream);
     return st == CUBLAS_STATUS_SUCCESS ? 0 : static_cast<int>(cudaErrorUnknown);
 }
 
@@ -141,8 +152,9 @@ int gemm_bf16_f32out(const __nv_bfloat16* A, const __nv_bfloat16* W, float* D, i
     std::lock_guard<std::mutex> lock(c.mu);
     if (c.handle == nullptr) {
         if (cublasLtCreate(&c.handle) != CUBLAS_STATUS_SUCCESS) return static_cast<int>(cudaErrorUnknown);
-        if (cudaMalloc(&c.workspace, c.ws_bytes) != cudaSuccess) return static_cast<int>(cudaErrorMemoryAllocation);
     }
+    void* ws = workspace_for(c, stream);
+    if (ws == nullptr) return static_cast<int>(cudaErrorMemoryAllocation);
     const auto key = std::make_tuple(M, N, K, 16);
     auto it = c.plans.find(key);
     if (it == c.plans.end()) {
@@ -172,7 +184,7 @@ int gemm_bf16_f32out(const __nv_bfloat16* A, const __nv_bfloat16* W, float* D, i
     Plan& p = it->second;
     const float one = 1.0f, zero = 0.0f;
     const cublasStatus_t st = cublasLtMatmul(c.handle, p.op, &one, W, p.a, A, p.b, &zero, D, p.d, D, p.d, &p.algo,
-                                             c.workspace, c.ws_bytes, stream);
+                                             ws, c.ws_bytes, stream);
     return st == CUBLAS_STATUS_SUCCESS ? 0 : static_cast<int>(cudaErrorUnknown);
 }
 

@@ -74,7 +74,7 @@ class LawamTorchFrontendRtx:
 
     def __init__(self, checkpoint_path: str, *, processor_path: str | None = None, device: str = "cuda:0",
                  num_views: int = 2, dit_cfg: dict | None = None, calibration_dir: str | None = None,
-                 precision: dict | None = None):
+                 precision: dict | None = None, fp8_sites: dict | None = None):
         import flash_rt.flash_rt_kernels as fvk
         from flash_rt import flash_rt_fa2 as fa2
         try:
@@ -85,6 +85,13 @@ class LawamTorchFrontendRtx:
         self.fvk, self.fa2, self.lk = fvk, fa2, lk
         self.gemm = fvk.GemmRunner()
         self.device = torch.device(device)
+        # DINOv3 depends on the camera frame only: it runs on a side branch of
+        # the graph, concurrently with the Qwen3-VL towers (own GEMM runner,
+        # cuBLASLt workspace and scratch).
+        self.gemm_side = fvk.GemmRunner()
+        self._side = torch.cuda.Stream(self.device)
+        self._ev_frames = torch.cuda.Event()
+        self._ev_dino = torch.cuda.Event()
         self.checkpoint_path = str(checkpoint_path)
         self.num_views = int(num_views)
         if self.num_views != 2:
@@ -100,6 +107,9 @@ class LawamTorchFrontendRtx:
         self.precision = {"vit": "f16acc", "llm": "f16acc", "dino": "f16acc", "lam": "f16acc", "enc": "f16acc",
                           "dit": "w8a16"}
         self.precision.update(precision or {})
+        # GEMM sites of a 16-bit tower that run static FP8 instead
+        # (vit: qkv / o / fc1 / fc2, llm: qkv / o / gateup / down)
+        self.fp8_sites = {k: frozenset(v) for k, v in (fp8_sites or {}).items()}
         self.num_sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         ckpt = pathlib.Path(self.checkpoint_path)
         self.config = json.loads((ckpt / "config.json").read_text())
@@ -135,7 +145,8 @@ class LawamTorchFrontendRtx:
         self.graph = None
         self.Se = None
         self.task = None
-        self.calibrated = all(v in ("fp16", "f16acc") for k, v in self.precision.items() if k != "dit")
+        self.calibrated = (all(v in ("fp16", "f16acc") for k, v in self.precision.items() if k != "dit")
+                           and not any(self.fp8_sites.values()))
 
     # ── small helpers ───────────────────────────────────────────────
     def _k(self, t: torch.Tensor) -> int:
@@ -167,10 +178,13 @@ class LawamTorchFrontendRtx:
         q = (w / s).clamp(-448.0, 448.0).t().contiguous().to(torch.float8_e4m3fn).view(_U8)
         return self._k(q), self._k(s.reshape(1))
 
-    def _lin(self, L: dict, name: str, w_nk: torch.Tensor) -> None:
+    def _lin(self, L: dict, name: str, w_nk: torch.Tensor, *, block: bool = True) -> None:
         """Store a GEMM weight in the precision of the stage being loaded:
-        FP8 [K, N] + weight scale, or FP16 [K, N] ("fp16" stages)."""
-        if self.precision[self._stage] in ("fp16", "f16acc"):
+        FP8 [K, N] + weight scale, or FP16 [K, N] ("fp16" stages). ``block``
+        sites may be listed in ``fp8_sites``."""
+        sites = self.fp8_sites.get(self._stage, ()) if block else ()
+        fp8_site = name in sites or (name in ("gate", "up") and "gateup" in sites)
+        if self.precision[self._stage] in ("fp16", "f16acc") and not fp8_site:
             L[name + "_w16"] = self._h(w_nk.to(self.device, _F32).t())
         else:
             L[name + "_w"], L[name + "_ws"] = self._fp8(w_nk)
@@ -252,8 +266,8 @@ class LawamTorchFrontendRtx:
             M = {"norm_w": self._h(g(prefix + "norm.weight")), "norm_b": self._h(g(prefix + "norm.bias")),
                  "fc1_b": self._h(g(prefix + "linear_fc1.bias")),
                  "a_fc1": self._slot(tag + ".fc1"), "a_fc2": self._slot(tag + ".fc2")}
-            self._lin(M, "fc1", g(prefix + "linear_fc1.weight"))
-            self._lin(M, "fc2", g(prefix + "linear_fc2.weight"))
+            self._lin(M, "fc1", g(prefix + "linear_fc1.weight"), block=False)
+            self._lin(M, "fc2", g(prefix + "linear_fc2.weight"), block=False)
             return M, self._h(g(prefix + "linear_fc2.bias"))
 
         self.vit["ds"], self.ds_b = [], []
@@ -277,7 +291,7 @@ class LawamTorchFrontendRtx:
             self._lin(L, "o", g(b + "self_attn.o_proj.weight"))
             # gate and up share their input; FP8 keeps separate weight scales,
             # the 16-bit path runs them as one [K, 2 FF] GEMM
-            if self.precision["llm"] in ("fp16", "f16acc"):
+            if self.precision["llm"] in ("fp16", "f16acc") and "gateup" not in self.fp8_sites.get("llm", ()):
                 self._lin(L, "gateup", torch.cat([g(b + "mlp.gate_proj.weight"), g(b + "mlp.up_proj.weight")], 0))
             else:
                 self._lin(L, "gate", g(b + "mlp.gate_proj.weight"))
@@ -591,7 +605,7 @@ class LawamTorchFrontendRtx:
         B["dino"] = {"patch": b(256, 768), "h": b(261, 768), "x8": b(261, 3072, dtype=_U8), "qkv": b(261, 2304),
                      "Q": b(261, 768, dtype=_BF16), "K": b(261, 768, dtype=_BF16), "V": b(261, 768, dtype=_BF16),
                      "O": b(261, 768, dtype=_BF16), "lse": b(1, 12, 384, dtype=_F32), "o_out": b(261, 768),
-                     "fc1": b(261, 3072), "f16": f16, "ht8": b(256, 768, dtype=_U8), "ht16": b(256, 768),
+                     "fc1": b(261, 3072), "f16": b(261 * 3072), "ht8": b(256, 768, dtype=_U8), "ht16": b(256, 768),
                      "img_kv_in": img_kv_in}
         B["lam"] = {"x": b(256, 1024), "x8": b(256, 4096, dtype=_U8), "qkv": b(256, 3072),
                     "Q": b(256, 1024, dtype=_BF16), "K": b(256, 1024, dtype=_BF16), "V": b(256, 1024, dtype=_BF16),
@@ -632,13 +646,20 @@ class LawamTorchFrontendRtx:
         if host_io:
             _ck(lk.memcpy_async(B["frames"], self.frames_host.data_ptr(), self.frames_host.numel(), st), "frames h2d")
         _ck(lk.preprocess_u8(B["frames"], nv, B["vit"]["patch"], B["dino"]["patch"], st), "preprocess")
+        main = torch.cuda.ExternalStream(st)
+        self._ev_frames.record(main)
+        self._side.wait_event(self._ev_frames)
+        P.dino_forward(self.gemm_side, fvk, lk, fa2, B["dino"], self.dino, stream=self._side.cuda_stream,
+                       prec=prec["dino"], out_prec=prec["lam"])
+        self._ev_dino.record(self._side)
         P.qwen_vit_forward(gemm, fvk, lk, fa2, B["vit"], self.vit, {"S": 256 * nv, "views": nv}, stream=st,
-                           prec=prec["vit"])
+                           prec=prec["vit"], fp8_sites=self.fp8_sites.get("vit", ()), cal=cal)
         P.qwen_llm_forward(gemm, fvk, lk, fa2, B["llm"], self.llm, {"S": self.Se, "n_vis": self.n_vis}, stream=st,
-                           prec=prec["llm"], num_sms=self.num_sms, out_prec=prec["enc"])
+                           prec=prec["llm"], num_sms=self.num_sms, out_prec=prec["enc"],
+                           fp8_sites=self.fp8_sites.get("llm", ()), cal=cal)
         _ck(lk.qformer_latent(B["llm"]["vlm"], self._act_idx, self.n_act, 2048, 32, 8, 1024, self.qformer,
                               B["q"]["scratch"], B["q"]["latent"], B["q"]["cond_silu"], st), "qformer")
-        P.dino_forward(gemm, fvk, lk, fa2, B["dino"], self.dino, stream=st, prec=prec["dino"], out_prec=prec["lam"])
+        main.wait_event(self._ev_dino)
         P.lam_decoder_forward(gemm, fvk, lk, fa2, B["lam"], self.lam, stream=st, prec=prec["lam"])
         P.flow_condition_forward(gemm, fvk, lk, B["flow"], self.flow, {"S": self.Se}, stream=st, prec=prec["enc"])
         D = B["dit"]
@@ -682,6 +703,7 @@ class LawamTorchFrontendRtx:
             h.update(f.read(1 << 16))
         h.update(str(os.path.getsize(p)).encode())
         h.update(json.dumps(self.precision, sort_keys=True).encode())
+        h.update(json.dumps({k: sorted(v) for k, v in self.fp8_sites.items()}, sort_keys=True).encode())
         return self.calibration_dir / f"{h.hexdigest()[:16]}_lawam.json"
 
     def _load_calibration(self) -> None:
