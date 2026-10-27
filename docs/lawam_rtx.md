@@ -73,9 +73,11 @@ The LeRobot policy runs Qwen3-VL on `inputs_embeds` only, so Qwen3-VL uses
 sequential (1-D) rotary positions for every token; the frontend matches it.
 
 The FP16-accumulate GEMMs run CUTLASS SM80 tensor-op tiles with the bias /
-GELU / SwiGLU epilogues fused; the tile and serial split-K count are timed per
-shape on the first call. `flash_rt.models.lawam.pipeline_rtx.F16ACC_SPLIT =
-"cublas"` (set before the graph is captured) uses the split of the cuBLASLt
+GELU / SwiGLU epilogues fused. The tile and serial split-K count of every
+production shape come from `pipeline_rtx.F16ACC_PLANS` (measured on RTX 5060
+Ti), so every process forms the same FP16 sums; other shapes are timed on their
+first call. `flash_rt.models.lawam.pipeline_rtx.F16ACC_SPLIT = "timed"` times
+every shape, `"cublas"` (set before the graph is captured) uses the split of the cuBLASLt
 `COMPUTE_16F` plan instead, so the GEMMs form the same FP16 sums as
 `lawam.gemm_f16acc` (the erf-GELU and SwiGLU epilogues then reproduce the
 separate passes bit for bit, the ViT's tanh-GELU epilogue differs from

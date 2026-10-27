@@ -57,15 +57,49 @@ _F16 = ("fp16", "f16acc")
 
 # "f16acc" GEMM kernel: "cutlass" (lawam.gemm_f16acc_act: CUTLASS tiles, bias +
 # GELU / SwiGLU fused into the epilogue) or "cublas" (lawam.gemm_f16acc).
-# F16ACC_SPLIT: serial split-K of the CUTLASS GEMMs, "timed" (the fastest
-# plan per shape) or "cublas" (the cuBLASLt plan's split: the same FP16 sums).
+# F16ACC_SPLIT: tile / serial split-K of the CUTLASS GEMMs: "tuned" (the
+# F16ACC_PLANS table measured on RTX 5060 Ti for the production shapes, so every
+# process runs the same plans and FP16 sums; other shapes are timed on their
+# first call), "timed" (time every shape) or "cublas" (the cuBLASLt plan's
+# split: the same FP16 sums as lawam.gemm_f16acc).
 F16ACC_KERNEL = "cutlass"
-F16ACC_SPLIT = "timed"
+F16ACC_SPLIT = "tuned"
 _F16ACC_SPLIT = {}
+
+# (ceil(M / 64), N, K, act or "swiglu", bias) -> (tile, split)
+F16ACC_PLANS = {
+    (2, 2048, 4096, 0, False): (1, 1),
+    (4, 768, 1024, 0, False): (3, 1),
+    (4, 768, 2048, 0, False): (3, 1),
+    (4, 1024, 768, 0, False): (3, 1),
+    (4, 1024, 1024, 0, False): (1, 1),
+    (4, 1024, 4096, 0, False): (3, 1),
+    (4, 2048, 2048, 0, False): (0, 1),
+    (4, 2048, 6144, 0, False): (2, 1),
+    (4, 3072, 1024, 0, False): (3, 1),
+    (4, 4096, 2048, 0, False): (5, 1),
+    (5, 768, 768, 0, False): (1, 1),
+    (5, 768, 3072, 0, False): (3, 1),
+    (5, 2304, 768, 0, False): (1, 1),
+    (8, 1024, 1024, 0, False): (2, 1),
+    (8, 1024, 4096, 0, False): (2, 1),
+    (8, 3072, 1024, 0, False): (2, 1),
+    (8, 4096, 1024, 1, True): (5, 1),
+    (2, 4096, 4096, 2, True): (3, 1),
+    (4, 4096, 1024, 2, True): (6, 1),
+    (5, 3072, 768, 2, True): (5, 1),
+    (4, 6144, 2048, 'swiglu', False): (0, 2),
+}
+
+
+def _plan_for(M, N, K, act, bias):
+    if F16ACC_SPLIT != "tuned":
+        return None
+    return F16ACC_PLANS.get(((M + 63) // 64, N, K, act, bool(bias)))
 
 
 def _split_for(key):
-    if F16ACC_SPLIT == "timed":
+    if F16ACC_SPLIT in ("tuned", "timed"):
         return 0
     split = _F16ACC_SPLIT.get(key)
     if split is None:
@@ -81,6 +115,10 @@ def _f16acc(a, w, out, bias, M, N, K, act, st):
         _ck(_LK.gemm_f16acc(a, w, out, bias if act < 2 else 0, M, N, K, act == 1, st), "f16acc gemm")
         if act == 2:
             _ck(_LK.bias_gelu_erf(out, N, bias, 0, 0, out, M, N, st), "gelu")
+        return
+    plan = _plan_for(M, N, K, act, bias)
+    if plan is not None:
+        _ck(_LK.gemm_f16acc_act_cfg(a, w, out, bias, M, N, K, act, plan[0], plan[1], st), "f16acc gemm")
         return
     split = _split_for((M, N, K, bool(bias) and act < 2, act == 1))
     _ck(_LK.gemm_f16acc_act(a, w, out, bias, M, N, K, act, split, st), "f16acc gemm")
@@ -130,6 +168,11 @@ def _f16acc_swiglu(a, w, gu, out, M, FF, K, st):
     if F16ACC_KERNEL == "cublas":
         _f16acc(a, w, gu, 0, M, 2 * FF, K, 0, st)
         _ck(_LK.silu_mul(gu, gu + FF * 2, 2 * FF, out, M, FF, st), "llm silu")
+        return
+    plan = _plan_for(M, FF, K, "swiglu", False)
+    if plan is not None:
+        _ck(_LK.gemm_f16acc_swiglu_cfg(a, w, w + FF * 2, 2 * FF, gu, gu + FF * 2, 2 * FF, out, M, FF, K, plan[0],
+                                       plan[1], st), "llm swiglu")
         return
     split = _split_for((M, 2 * FF, K, False, False))
     _ck(_LK.gemm_f16acc_swiglu(a, w, w + FF * 2, 2 * FF, gu, gu + FF * 2, 2 * FF, out, M, FF, K, split, st),
