@@ -55,6 +55,28 @@ def _quant_f16(fvk, src, out8, scale, n, st):
 # In "cal" / "fp16" / "f16acc" the FP16 operand lives in the stage's ``f16`` scratch.
 _F16 = ("fp16", "f16acc")
 
+# "f16acc" GEMM kernel: "cutlass" (lawam.gemm_f16acc_act: CUTLASS tiles with the
+# serial split-K of the cuBLASLt plan, so the same FP16 sums, and bias + GELU
+# fused into the epilogue) or "cublas" (lawam.gemm_f16acc).
+F16ACC_KERNEL = "cutlass"
+_F16ACC_SPLIT = {}
+
+
+def _f16acc(a, w, out, bias, M, N, K, act, st):
+    """out [M, N] = act(a @ w + bias), FP16 accumulation; act 0 identity, 1
+    tanh-GELU, 2 erf-GELU (the reference GEMM has no bias for act 2: its bias +
+    GELU ran as a separate pass on the FP16 GEMM output)."""
+    if F16ACC_KERNEL == "cublas":
+        _ck(_LK.gemm_f16acc(a, w, out, bias if act < 2 else 0, M, N, K, act == 1, st), "f16acc gemm")
+        if act == 2:
+            _ck(_LK.bias_gelu_erf(out, N, bias, 0, 0, out, M, N, st), "gelu")
+        return
+    key = (M, N, K, bool(bias) and act < 2, act == 1)
+    split = _F16ACC_SPLIT.get(key)
+    if split is None:
+        split = _F16ACC_SPLIT[key] = max(1, _LK.gemm_f16acc_split(*key))
+    _ck(_LK.gemm_f16acc_act(a, w, out, bias, M, N, K, act, split, st), "f16acc gemm")
+
 def _norm8(fvk, x, delta, bias, delta2, w, b, mode, eps, out8, scale, rows, dim, st, prec, scratch):
     """fp8_residual_norm_quant producing the operand of the next GEMM."""
     if prec == "fp8":
@@ -93,12 +115,40 @@ def _gelu8(lk, fvk, x, ld, bias, out8, scale, rows, n, st, prec, scratch, *, tan
         _quant_f16(fvk, scratch, out8, scale, rows * n, st)
 
 
+def _f16acc_swiglu(a, w, gu, out, M, FF, K, st):
+    """out [M, FF] = silu(a @ w[:, :FF]) * (a @ w[:, FF:]) (w [K, 2 FF], gate |
+    up sums in gu [M, 2 FF]): the "cutlass" f16acc kernel runs it as one dual
+    GEMM with the gate|up GEMM's split-K (same FP16 sums), "cublas" as the
+    gate|up GEMM + silu_mul. ``out`` must not alias ``a``."""
+    if F16ACC_KERNEL == "cublas":
+        _f16acc(a, w, gu, 0, M, 2 * FF, K, 0, st)
+        _ck(_LK.silu_mul(gu, gu + FF * 2, 2 * FF, out, M, FF, st), "llm silu")
+        return
+    key = (M, 2 * FF, K, False, False)
+    split = _F16ACC_SPLIT.get(key)
+    if split is None:
+        split = _F16ACC_SPLIT[key] = max(1, _LK.gemm_f16acc_split(*key))
+    _ck(_LK.gemm_f16acc_swiglu(a, w, w + FF * 2, 2 * FF, gu, gu + FF * 2, 2 * FF, out, M, FF, K, split, st),
+        "llm swiglu")
+
+
+def _fc1_gelu(gemm, lk, fvk, prec, x8, x16, L, fc1, scale, M, N, K, st, scratch):
+    """fc1 (+bias, erf-GELU); returns the FP16 operand of fc2 (fp8 / cal: also
+    written to x8). f16acc runs the bias and GELU in the GEMM epilogue."""
+    if prec == "f16acc":
+        _f16acc(x16, L["fc1_w16"], fc1, L["fc1_b"], M, N, K, 2, st)
+        return fc1
+    _mm(gemm, prec, x8, x16, L, "fc1", fc1, M, N, K, st)
+    _gelu8(lk, fvk, fc1, N, L["fc1_b"], x8, scale, M, N, st, prec, scratch)
+    return scratch
+
+
 def _mm(gemm, prec, x8, x16, L, name, out, M, N, K, st):
     """out [M, N] FP16 = operand @ W (FP8 descale GEMM, or an FP16 GEMM)."""
     if prec == "fp16":
         gemm.fp16_nn(x16, L[name + "_w16"], out, M, N, K, st)
     elif prec == "f16acc":
-        _ck(_LK.gemm_f16acc(x16, L[name + "_w16"], out, 0, M, N, K, False, st), "f16acc gemm")
+        _f16acc(x16, L[name + "_w16"], out, 0, M, N, K, 0, st)
     else:
         gemm.fp8_descale_fp16(x8, L[name + "_w"], out, M, N, K, L["a_" + name], L[name + "_ws"], st)
 
@@ -139,9 +189,8 @@ def merger_forward(gemm, fvk, lk, B, M, x, rows_in, dim_in, post_norm, out, st, 
     s8, fc1, f16 = B["m_fp8"], B["m_fc1"], B["m_f16"]
     rows, dim = (n, D4) if post_norm else (rows_in, dim_in)
     _norm8(fvk, x, 0, 0, 0, M["norm_w"], M["norm_b"], 0, 1e-6, s8, M["a_fc1"], rows, dim, st, prec, f16)
-    _mm(gemm, prec, s8, f16, M, "fc1", fc1, n, D4, D4, st)
-    _gelu8(lk, fvk, fc1, D4, M["fc1_b"], s8, M["a_fc2"], n, D4, st, prec, f16)
-    _mm(gemm, prec, s8, f16, M, "fc2", out, n, 2048, D4, st)
+    h16 = _fc1_gelu(gemm, lk, fvk, prec, s8, f16, M, fc1, M["a_fc2"], n, D4, D4, st, f16)
+    _mm(gemm, prec, s8, h16, M, "fc2", out, n, 2048, D4, st)
 
 
 def _site_prec(prec, fp8_sites, cal):
@@ -181,7 +230,7 @@ def qwen_vit_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8", fp
         _norm8(fvk, h, o_out, L["o_b"], 0, L["n2_w"], L["n2_b"], 0, EPS_VIT, x8, L["a_fc1"], S, D, st, p_fc1, f16)
         if p_fc1 == "f16acc" and p_fc2 == "f16acc":
             # fc1 bias + tanh-GELU in the GEMM epilogue; fc2 reads it directly
-            _ck(_LK.gemm_f16acc(f16, L["fc1_w16"], fc1, L["fc1_b"], S, FF, D, True, st), "vit fc1 gelu")
+            _f16acc(f16, L["fc1_w16"], fc1, L["fc1_b"], S, FF, D, 1, st)
             _mm(gemm, p_fc2, x8, fc1, L, "fc2", o_out, S, D, FF, st)
         else:
             _mm(gemm, p_fc1, x8, f16, L, "fc1", fc1, S, FF, D, st)
@@ -247,6 +296,13 @@ def qwen_llm_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8", nu
             fvk.cast_bf16_to_fp16(O, f16, S * NHQ * HD, st)
         _mm(gemm, p_o, x8, O if f16_attn else f16, L, "o", o_out, S, D, NHQ * HD, st)
         _norm8(fvk, h, o_out, 0, 0, L["post_ln_w"], 0, 1, EPS_LLM, x8, L["a_gate"], S, D, st, p_gu, f16)
+        if p_gu == "f16acc" and p_dn in _F16:
+            # SwiGLU in the gate|up GEMM; down reads its output
+            _f16acc_swiglu(f16, L["gateup_w16"], gate, up, S, FF, D, st)
+            _mm(gemm, p_dn, x8, up, L, "down", o_out, S, D, FF, st)
+            pend = o_out
+            pend2 = B["inject"][li] if li < 3 else 0
+            continue
         if p_gu in _F16:
             # gate | up as one [K, 2 FF] GEMM, SwiGLU reads both halves of the row
             _mm(gemm, p_gu, x8, f16, L, "gateup", gate, S, 2 * FF, D, st)
@@ -309,9 +365,8 @@ def dino_forward(gemm, fvk, lk, fa2, B, W, *, stream=0, prec="fp8", out_prec="fp
         _attn(fa2, fvk, Q, K, V, O, lse, x8, L["a_o"], batch=1, seq=T, heads=NH, hd=HD, st=st, prec=prec)
         _mm(gemm, prec, x8, O, L, "o", o_out, T, D, D, st)
         _norm8(fvk, h, o_out, L["o_b"], 0, L["n2_w"], L["n2_b"], 0, EPS_DINO, x8, L["a_fc1"], T, D, st, prec, f16)
-        _mm(gemm, prec, x8, f16, L, "fc1", fc1, T, FF, D, st)
-        _gelu8(lk, fvk, fc1, FF, L["fc1_b"], x8, L["a_fc2"], T, FF, st, prec, f16)
-        _mm(gemm, prec, x8, f16, L, "fc2", o_out, T, D, FF, st)
+        h16 = _fc1_gelu(gemm, lk, fvk, prec, x8, f16, L, fc1, L["a_fc2"], T, FF, D, st, f16)
+        _mm(gemm, prec, x8, h16, L, "fc2", o_out, T, D, FF, st)
         pend = (o_out, L["fc2_b"])
     off = DINO_PREFIX * D * 2
     # latent norm -> BF16 flow tokens + the LAM decoder operand in its precision (``out_prec``)
@@ -353,9 +408,8 @@ def lam_decoder_forward(gemm, fvk, lk, fa2, B, W, *, stream=0, prec="fp8"):
         _mm(gemm, prec, x8, O, L, "o", o_out, T, D, D, st)
         _gnorm8(lk, fvk, x, o_out, L["o_b"], gate_msa, 0, 0, EPS_LAM, 0, 0, scale_mlp, shift_mlp, x8, L["a_fc1"],
                 T, D, st, prec, f16)
-        _mm(gemm, prec, x8, f16, L, "fc1", fc1, T, FF, D, st)
-        _gelu8(lk, fvk, fc1, FF, L["fc1_b"], x8, L["a_fc2"], T, FF, st, prec, f16)
-        _mm(gemm, prec, x8, f16, L, "fc2", o_out, T, D, FF, st)
+        h16 = _fc1_gelu(gemm, lk, fvk, prec, x8, f16, L, fc1, L["a_fc2"], T, FF, D, st, f16)
+        _mm(gemm, prec, x8, h16, L, "fc2", o_out, T, D, FF, st)
         pend = (o_out, L["fc2_b"], gate_mlp, 0)
     _gnorm8(lk, fvk, x, pend[0], pend[1], pend[2], 0, 2, 0.0, 0, 0, 0, 0, x8, W["a_pout"], T, D, st, prec, f16)
     _mm(gemm, prec, x8, f16, W, "pout", B["pout"], T, 768, D, st)

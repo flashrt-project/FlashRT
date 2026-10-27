@@ -154,5 +154,28 @@ int dit_sum_bias_bf16(const float* partials, int splits, const float* a_gs, cons
 int dit_sum_bias_euler(const float* partials, int splits, const float* a_gs, const float* w_gs,
                        const float* bias, float* x, float dt, int rows, int n, bool pdl, cudaStream_t stream);
 
+// D[M,N] = act(fp16(A @ B) + bias) with FP16 accumulation (CUTLASS SM80 tiles,
+// lawam_gemm_f16acc_act.cu); A [M,K], B [K,N], D row-major FP16; act 0 identity (bias
+// optional), 1 tanh-GELU, 2 erf-GELU, computed in FP32 as bias_gelu does. split
+// fixes the serial split-K count (each K slice accumulates its own FP16 sum;
+// gemm_f16acc_split gives the one gemm_f16acc uses, i.e. its exact numerics),
+// split <= 0 times it too. The tile is timed on the first call per shape
+// (outside graph capture); _cfg forces a tile (0..7) and split (1..8).
+int gemm_f16acc_act(const __half* A, const __half* B, __half* D, const __half* bias, int M, int N, int K, int act,
+                    int split, cudaStream_t stream);
+// SwiGLU as one dual GEMM (FP16 accumulation, serial split-K split):
+// Dg = A @ Bg, Du = A @ Bu (FP16 [M, N] slices / sums, leading dim ldd; Bg, Bu
+// [K, N] with leading dim ldb) and D [M, N] = silu(Dg) * Du in FP32, as
+// gemm_f16acc on [Bg | Bu] followed by silu_mul. The tile is timed per shape
+// on the first call (outside graph capture); _cfg forces tile 0..3.
+int gemm_f16acc_swiglu(const __half* A, const __half* Bg, const __half* Bu, int ldb, __half* Dg, __half* Du, int ldd,
+                       __half* D, int M, int N, int K, int split, cudaStream_t stream);
+int gemm_f16acc_swiglu_cfg(const __half* A, const __half* Bg, const __half* Bu, int ldb, __half* Dg, __half* Du,
+                           int ldd, __half* D, int M, int N, int K, int tile, int split, cudaStream_t stream);
+// Serial split-K count of the cuBLASLt plan gemm_f16acc runs for this shape (-1: none).
+int gemm_f16acc_split(int M, int N, int K, bool bias, bool gelu);
+int gemm_f16acc_act_cfg(const __half* A, const __half* B, __half* D, const __half* bias, int M, int N, int K, int act,
+                        int tile, int split, cudaStream_t stream);
+
 }  // namespace lawam
 }  // namespace flash_rt

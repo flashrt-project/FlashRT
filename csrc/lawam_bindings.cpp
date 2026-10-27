@@ -259,4 +259,47 @@ PYBIND11_MODULE(flash_rt_lawam, m) {
         py::arg("partials"), py::arg("splits"), py::arg("a_gs"), py::arg("w_gs"), py::arg("bias"), py::arg("x"),
         py::arg("dt"), py::arg("rows"), py::arg("n"), py::arg("pdl") = true, py::arg("stream") = 0,
         "FP32 x += dt * (skinny GEMM sum + bias).");
+
+    m.def("gemm_f16acc_act",
+        [](uintptr_t A, uintptr_t B, uintptr_t D, uintptr_t bias, int M, int N, int K, int act, int split,
+           uintptr_t stream) {
+            return L::gemm_f16acc_act(ptr<const __half>(A), ptr<const __half>(B), ptr<__half>(D),
+                                      ptr<const __half>(bias), M, N, K, act, split, to_stream(stream));
+        },
+        py::arg("A"), py::arg("B"), py::arg("D"), py::arg("bias"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("act"), py::arg("split") = 0, py::arg("stream") = 0,
+        "D[M,N] = act(A[M,K] @ B[K,N] + bias) FP16 accumulate, fused epilogue (act 0 identity, bias optional; 1 tanh-GELU; 2 erf-GELU).");
+    m.def("gemm_f16acc_split", &L::gemm_f16acc_split, py::arg("M"), py::arg("N"), py::arg("K"),
+          py::arg("bias") = false, py::arg("gelu") = false,
+          "Serial split-K count of the cuBLASLt plan gemm_f16acc runs for this shape (-1: no plan).");
+    m.def("gemm_f16acc_act_cfg",
+        [](uintptr_t A, uintptr_t B, uintptr_t D, uintptr_t bias, int M, int N, int K, int act, int tile, int split,
+           uintptr_t stream) {
+            return L::gemm_f16acc_act_cfg(ptr<const __half>(A), ptr<const __half>(B), ptr<__half>(D),
+                                          ptr<const __half>(bias), M, N, K, act, tile, split, to_stream(stream));
+        },
+        py::arg("A"), py::arg("B"), py::arg("D"), py::arg("bias"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("act"), py::arg("tile"), py::arg("split") = 1, py::arg("stream") = 0,
+        "gemm_f16acc_act with a fixed tile configuration and serial split-K count.");
+
+    m.def("gemm_f16acc_swiglu",
+        [](uintptr_t A, uintptr_t Bg, uintptr_t Bu, int ldb, uintptr_t Dg, uintptr_t Du, int ldd, uintptr_t D, int M,
+           int N, int K, int split, uintptr_t stream) {
+            return L::gemm_f16acc_swiglu(ptr<const __half>(A), ptr<const __half>(Bg), ptr<const __half>(Bu), ldb,
+                                         ptr<__half>(Dg), ptr<__half>(Du), ldd, ptr<__half>(D), M, N, K, split,
+                                         to_stream(stream));
+        },
+        py::arg("A"), py::arg("Bg"), py::arg("Bu"), py::arg("ldb"), py::arg("Dg"), py::arg("Du"), py::arg("ldd"),
+        py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"), py::arg("split") = 1, py::arg("stream") = 0,
+        "D = silu(A @ Bg) * (A @ Bu): one FP16-accumulate dual GEMM (serial split-K), gate / up sums in Dg / Du.");
+    m.def("gemm_f16acc_swiglu_cfg",
+        [](uintptr_t A, uintptr_t Bg, uintptr_t Bu, int ldb, uintptr_t Dg, uintptr_t Du, int ldd, uintptr_t D, int M,
+           int N, int K, int tile, int split, uintptr_t stream) {
+            return L::gemm_f16acc_swiglu_cfg(ptr<const __half>(A), ptr<const __half>(Bg), ptr<const __half>(Bu), ldb,
+                                             ptr<__half>(Dg), ptr<__half>(Du), ldd, ptr<__half>(D), M, N, K, tile,
+                                             split, to_stream(stream));
+        },
+        py::arg("A"), py::arg("Bg"), py::arg("Bu"), py::arg("ldb"), py::arg("Dg"), py::arg("Du"), py::arg("ldd"),
+        py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"), py::arg("tile"), py::arg("split") = 1,
+        py::arg("stream") = 0, "gemm_f16acc_swiglu with a fixed tile configuration.");
 }

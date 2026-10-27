@@ -14,9 +14,9 @@ cmake --build build -j$(( $(nproc) / 2 )) --target flash_rt_kernels flash_rt_fa2
 
 `flash_rt_lawam` holds the kernels FlashRT had no equivalent for (camera
 patchification for the two vision towers, the gated AdaLN rows of the LAM
-decoder, the VLM-to-latent QFormer, FP16-accumulate GEMM plans, the skinny
-weight-only INT8 DiT GEMM, and the positional-embedding consumers of the
-skinny DiT). The tokenizer is
+decoder, the VLM-to-latent QFormer, FP16-accumulate GEMMs with fused bias /
+GELU / SwiGLU epilogues on the vendored CUTLASS, the skinny weight-only INT8
+DiT GEMM, and the positional-embedding consumers of the skinny DiT). The tokenizer is
 loaded with `transformers` (`AutoProcessor` of the checkpoint's `base_vlm`,
 or `processor_path=`) at `set_prompt` time only.
 
@@ -51,12 +51,12 @@ One CUDA graph per prompt holds the whole policy step:
 | stage | kernels | precision |
 |---|---|---|
 | camera frames -> patch rows | `lawam.preprocess_u8` | FP16 |
-| Qwen3-VL ViT (24 layers, DeepStack 5/11/17, mergers) | `lawam.gemm_f16acc`, `fp8_residual_norm_quant`, `fp8_qkv_split`, FA2 | FP16, FP16 accumulation |
-| Qwen3-VL LLM (16 layers kept by LaWAM) | same, causal GQA FA2 | FP16, FP16 accumulation |
+| Qwen3-VL ViT (24 layers, DeepStack 5/11/17, mergers) | `lawam.gemm_f16acc_act` (fc1 + bias + GELU in one GEMM), `fp8_residual_norm_quant`, `fp8_qkv_split`, FA2 | FP16, FP16 accumulation |
+| Qwen3-VL LLM (16 layers kept by LaWAM) | same, `lawam.gemm_f16acc_swiglu` (gate / up / SwiGLU in one dual GEMM), causal GQA FA2 | FP16, FP16 accumulation |
 | VLM -> latent QFormer + LAM conditioning | `lawam.qformer_latent` | FP32 |
-| DINOv3 ViT-B/16 (11 layers used), concurrent graph branch | `lawam.gemm_f16acc`, FA2 | FP16, FP16 accumulation |
-| LAM decoder (12 AdaLN blocks) | `lawam.gemm_f16acc`, `lawam.gated_residual_norm`, `lawam.gemv_i8w` (modulation) | FP16, FP16 accumulation; INT8 weight-only GEMV |
-| flow conditioning (enc_vlm, cross K/V of 8 blocks) | `lawam.gemm_f16acc`, BF16 GEMMs | FP16 / BF16 |
+| DINOv3 ViT-B/16 (11 layers used), concurrent graph branch | `lawam.gemm_f16acc_act`, FA2 | FP16, FP16 accumulation |
+| LAM decoder (12 AdaLN blocks) | `lawam.gemm_f16acc_act`, `lawam.gated_residual_norm`, `lawam.gemv_i8w` (modulation) | FP16, FP16 accumulation; INT8 weight-only GEMV |
+| flow conditioning (enc_vlm, cross K/V of 8 blocks) | `lawam.gemm_f16acc_act`, BF16 GEMMs | FP16 / BF16 |
 | flow DiT x 10 (16 blocks) | `lawam.w8a16_skinny_gemm`, `nvfp4_skinny_partials_attention`, `lawam.dit_*` consumers, FA2 small-query tile for the 512 image keys | INT8 weight-only, BF16 activations |
 | Euler update, unnormalization | `lawam.dit_sum_bias_euler`, `lawam.unnormalize_actions` | FP32 |
 
@@ -71,6 +71,15 @@ temporal patch copies are folded into the Qwen3-VL patch-embedding weight.
 
 The LeRobot policy runs Qwen3-VL on `inputs_embeds` only, so Qwen3-VL uses
 sequential (1-D) rotary positions for every token; the frontend matches it.
+
+The FP16-accumulate GEMMs run CUTLASS SM80 tensor-op tiles (timed per shape
+on the first call) with the serial split-K of the cuBLASLt `COMPUTE_16F` plan
+for the same shape, so they form the same FP16 sums as `lawam.gemm_f16acc`;
+the erf-GELU and SwiGLU epilogues reproduce the separate passes bit for bit,
+the ViT's tanh-GELU epilogue differs from cuBLASLt's by at most one FP16 ulp.
+`flash_rt.models.lawam.pipeline_rtx.F16ACC_KERNEL = "cublas"` (set before the
+graph is captured) selects the cuBLASLt plans with stand-alone epilogue
+kernels instead.
 
 ## Precision policy
 

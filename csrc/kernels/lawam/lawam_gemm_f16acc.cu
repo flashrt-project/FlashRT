@@ -140,6 +140,49 @@ int gemm_f16acc(const __half* A, const __half* B, __half* D, const __half* bias,
     return st == CUBLAS_STATUS_SUCCESS ? 0 : static_cast<int>(cudaErrorUnknown);
 }
 
+int gemm_f16acc_split(int M, int N, int K, bool bias, bool gelu) {
+    Ctx& c = ctx();
+    std::lock_guard<std::mutex> lock(c.mu);
+    if (c.handle == nullptr) {
+        if (cublasLtCreate(&c.handle) != CUBLAS_STATUS_SUCCESS) return -1;
+    }
+    // the descriptor gemm_f16acc builds for this shape, first heuristic candidate
+    cublasLtMatmulDesc_t op = nullptr;
+    cublasLtMatrixLayout_t a = nullptr, b = nullptr, d = nullptr;
+    if (cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_16F, CUDA_R_16F) != CUBLAS_STATUS_SUCCESS) return -1;
+    cublasOperation_t opn = CUBLAS_OP_N;
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &opn, sizeof(opn));
+    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &opn, sizeof(opn));
+    if (bias) {
+        cublasLtEpilogue_t ep = gelu ? CUBLASLT_EPILOGUE_GELU_BIAS : CUBLASLT_EPILOGUE_BIAS;
+        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_EPILOGUE, &ep, sizeof(ep));
+        cudaDataType_t bt = CUDA_R_16F;
+        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bt, sizeof(bt));
+    }
+    cublasLtMatrixLayoutCreate(&a, CUDA_R_16F, N, K, N);
+    cublasLtMatrixLayoutCreate(&b, CUDA_R_16F, K, M, K);
+    cublasLtMatrixLayoutCreate(&d, CUDA_R_16F, N, M, N);
+    cublasLtMatmulPreference_t pref;
+    cublasLtMatmulPreferenceCreate(&pref);
+    cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &c.ws_bytes,
+                                         sizeof(c.ws_bytes));
+    cublasLtMatmulHeuristicResult_t res{};
+    int n = 0;
+    const cublasStatus_t st = cublasLtMatmulAlgoGetHeuristic(c.handle, op, a, b, d, d, pref, 1, &res, &n);
+    int split = -1;
+    if (st == CUBLAS_STATUS_SUCCESS && n > 0) {
+        split = 1;
+        size_t sz = 0;
+        cublasLtMatmulAlgoConfigGetAttribute(&res.algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &split, sizeof(split), &sz);
+    }
+    cublasLtMatmulPreferenceDestroy(pref);
+    cublasLtMatrixLayoutDestroy(a);
+    cublasLtMatrixLayoutDestroy(b);
+    cublasLtMatrixLayoutDestroy(d);
+    cublasLtMatmulDescDestroy(op);
+    return split;
+}
+
 void gemm_f16acc_set_autotune(bool enable) {
     Ctx& c = ctx();
     std::lock_guard<std::mutex> lock(c.mu);
