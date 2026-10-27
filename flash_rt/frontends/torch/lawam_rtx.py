@@ -8,18 +8,18 @@ all denoising steps, unnormalization and both host copies) replayed as one
 CUDA graph. See :mod:`flash_rt.models.lawam.pipeline_rtx` for the kernel
 sequence.
 
-Precision (default): Qwen3-VL ViT and LLM on FP16 GEMMs with FP16
-accumulation; DINOv3, the LAM decoder and the flow conditioning on FP8
-(e4m3, per-tensor) GEMMs with static activation scales from a calibration
-pass over real frames (cached on disk); the flow DiT on NVFP4 W4A4 skinny
-GEMMs with dynamic per-16 activation block scales. Residual streams are
+Precision (default): Qwen3-VL ViT / LLM, DINOv3, the LAM decoder and the
+flow conditioning on FP16 GEMMs with FP16 accumulation; the flow DiT on
+skinny weight-only INT8 GEMMs (per-channel scales, BF16 activations).
+Optional tiers per stage: static per-tensor FP8 with a real-frame
+calibration pass (cached on disk) and NVFP4 / BF16 DiT. Residual streams are
 FP16 (vision / language / LAM) and BF16 (DiT).
 
 Usage::
 
     fe = LawamTorchFrontendRtx("/path/to/lawam-pretrain-lerobot")
     fe.set_prompt("put the bowl on the plate")
-    fe.calibrate([(frames, task), ...])     # real frames, once; cached on disk
+    fe.calibrate([(frames, task), ...])     # FP8 tiers only: real frames, once; cached
     actions = fe.infer(frames)["actions"]   # frames uint8 [2, 256, 256, 3]
 """
 
@@ -44,12 +44,23 @@ _DEFAULT_PROMPTS = (
     "Then use observations and the inferred motion to produce the robot policy actions.",
 )
 # Skinny NVFP4 tile configuration per (N, K) at the action-row count.
+# Coordinate-descent sweep of the captured 10-step loop on RTX 5060 Ti.
 DIT_SKINNY_CFG = {
-    (3 * 1024, 1024): 11,
-    (1024, 1024): 7,
-    (4096, 1024): 3,
-    (1024, 4096): 11,
+    (3 * 1024, 1024): 19,
+    (1024, 1024): 11,
+    (4096, 1024): 5,
+    (1024, 4096): 3,
     (32, 1024): 9,
+}
+
+
+# Skinny W8A16 tile configuration (lawam.w8a16_skinny_gemm cfg) per (N, K).
+DIT_W8A16_CFG = {
+    (3 * 1024, 1024): 0,
+    (1024, 1024): 0,
+    (4096, 1024): 2,
+    (1024, 4096): 4,
+    (32, 1024): 0,
 }
 
 
@@ -79,11 +90,15 @@ class LawamTorchFrontendRtx:
         if self.num_views != 2:
             raise ValueError("the LaWAM checkpoint is trained on one primary + one wrist view")
         self.dit_cfg = dict(DIT_SKINNY_CFG if dit_cfg is None else dit_cfg)
-        # Per-stage GEMM precision: "fp8" (static per-tensor, calibrated),
-        # "fp16" or "f16acc" (FP16 with FP16 accumulation). Per-tensor FP8 in
-        # the Qwen3-VL towers moves the flow's action chunks measurably on
-        # real frames, so they stay 16-bit by default.
-        self.precision = {"vit": "f16acc", "llm": "f16acc", "dino": "fp8", "lam": "fp8", "enc": "fp8"}
+        # Per-stage GEMM precision. Towers: "f16acc" (FP16 with FP16
+        # accumulation), "fp16" (FP32 accumulation) or "fp8" (static per-tensor,
+        # calibrated). DiT: "w8a16" (INT8 weight-only), "bf16" or "nvfp4".
+        # The flow's action chunks bifurcate under small numeric changes on a
+        # few real frames; per-tensor FP8 anywhere upstream and NVFP4 DiT weights
+        # push measurably past the reference's own precision noise floor, the
+        # default stays at it.
+        self.precision = {"vit": "f16acc", "llm": "f16acc", "dino": "f16acc", "lam": "f16acc", "enc": "f16acc",
+                          "dit": "w8a16"}
         self.precision.update(precision or {})
         self.num_sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         ckpt = pathlib.Path(self.checkpoint_path)
@@ -113,13 +128,14 @@ class LawamTorchFrontendRtx:
             calibration_dir or os.path.expanduser("~/.flash_rt/calibration"))
         self._keep: list = []
         self._scales = torch.zeros(1024, dtype=_F32, device=self.device)   # activation scale slots
+        self._one_ptr = self._k(torch.ones(1, dtype=_F32, device=self.device))
         self._scale_names: list = []
         self._load_weights()
         self._build_step_tables()
         self.graph = None
         self.Se = None
         self.task = None
-        self.calibrated = all(v in ("fp16", "f16acc") for v in self.precision.values())
+        self.calibrated = all(v in ("fp16", "f16acc") for k, v in self.precision.items() if k != "dit")
 
     # ── small helpers ───────────────────────────────────────────────
     def _k(self, t: torch.Tensor) -> int:
@@ -163,7 +179,18 @@ class LawamTorchFrontendRtx:
         return self._k(t.to(self.device, _FP16))
 
     def _nvfp4(self, w_nk: torch.Tensor, bias: torch.Tensor | None, mse_steps: int = 4) -> dict:
-        """BF16 [N, K] weight -> packed skinny NVFP4 site (w, sf, gs, b)."""
+        """[N, K] DiT weight -> GEMM site in the DiT precision: packed skinny
+        NVFP4 (w, sf, gs) or BF16 (w16, gs = 1), plus the bias."""
+        b = torch.zeros(w_nk.shape[0]) if bias is None else bias
+        if self.precision["dit"] == "w8a16":
+            w = w_nk.to(self.device, _F32)
+            ws = (w.abs().amax(dim=1) / 127.0).clamp_min(1e-12)
+            q = (w / ws[:, None]).round().clamp(-127, 127).to(torch.int8)
+            return {"w8": self._k(q), "ws": self._k(ws), "gs": self._one_ptr,
+                    "b": self._k(b.to(self.device, _BF16)), "b32": self._k(b.to(self.device, _F32))}
+        if self.precision["dit"] == "bf16":
+            return {"w16": self._k(w_nk.to(self.device, _BF16)), "gs": self._one_ptr,
+                    "b": self._k(b.to(self.device, _BF16)), "b32": self._k(b.to(self.device, _F32))}
         fvk = self.fvk
         w = w_nk.to(self.device, _BF16).contiguous()
         N, K = w.shape
@@ -175,7 +202,6 @@ class LawamTorchFrontendRtx:
                                              mse_steps), f"nvfp4 quantize [{N}, {K}]")
         _ck(fvk.nvfp4_skinny_pack_weight(q.data_ptr(), sf.data_ptr(), packed.data_ptr(), sf_packed.data_ptr(), N,
                                          K, 0), f"nvfp4 pack [{N}, {K}]")
-        b = torch.zeros(N) if bias is None else bias
         return {"w": self._k(packed), "sf": self._k(sf_packed), "gs": self._k(gs),
                 "b": self._k(b.to(self.device, _BF16)), "b32": self._k(b.to(self.device, _F32))}
 
@@ -249,9 +275,13 @@ class LawamTorchFrontendRtx:
             qkv = torch.cat([g(b + f"self_attn.{n}_proj.weight") for n in ("q", "k", "v")], dim=0)
             self._lin(L, "qkv", qkv)
             self._lin(L, "o", g(b + "self_attn.o_proj.weight"))
-            # gate and up share their input scale; quantized with separate weight scales
-            self._lin(L, "gate", g(b + "mlp.gate_proj.weight"))
-            self._lin(L, "up", g(b + "mlp.up_proj.weight"))
+            # gate and up share their input; FP8 keeps separate weight scales,
+            # the 16-bit path runs them as one [K, 2 FF] GEMM
+            if self.precision["llm"] in ("fp16", "f16acc"):
+                self._lin(L, "gateup", torch.cat([g(b + "mlp.gate_proj.weight"), g(b + "mlp.up_proj.weight")], 0))
+            else:
+                self._lin(L, "gate", g(b + "mlp.gate_proj.weight"))
+                self._lin(L, "up", g(b + "mlp.up_proj.weight"))
             self._lin(L, "down", g(b + "mlp.down_proj.weight"))
             for n in ("qkv", "o", "gate", "down"):
                 L["a_" + n] = self._slot(f"llm{li}.{n}")
@@ -337,7 +367,9 @@ class LawamTorchFrontendRtx:
             for n in ("qkv", "o", "fc1", "fc2"):
                 L["a_" + n] = self._slot(f"lam{li}.{n}")
             self.lam["layers"].append(L)
-        self.lam["mod_w"] = self._h(torch.cat(mod_w, dim=0).t())         # [1024, 12 * 6144]
+        # AdaLN modulation of all 12 blocks as one FP16 GEMV weight [1024, 12 * 6144]
+        # (FP8 weights here measurably move the action chunks)
+        self.lam["mod_w"] = self._h(torch.cat(mod_w, dim=0).t())
         self.lam["mod_b"] = self._h(torch.cat(mod_b, dim=0))
         self._lin(self.lam, "pout", g(Dd + "project_output.weight"))
         self.lam["pout_b"] = self._h(g(Dd + "project_output.bias"))
@@ -400,6 +432,8 @@ class LawamTorchFrontendRtx:
         bd1 = g(F + "action_decoder.layer1.b")[e].double()
         W["head1"] = self._nvfp4((wd1.t() @ wp2).float(), (bp2 @ wd1 + bd1).float())
         W["head2"] = self._nvfp4(g(F + "action_decoder.layer2.W")[e].t(), g(F + "action_decoder.layer2.b")[e])
+        W["mode"] = self.precision["dit"]
+        W["w8_cfg"] = dict(DIT_W8A16_CFG)
         self.dit_w = W
         # step-invariant conditioning precompute inputs
         self._t_lin1_w = g(F + "DiT.timestep_encoder.timestep_embedder.linear_1.weight").double()
@@ -530,6 +564,11 @@ class LawamTorchFrontendRtx:
         self.noise_host = torch.empty(self.horizon, 32, dtype=_F32).pin_memory()
         self.actions_host = torch.empty(self.horizon, self.action_dim, dtype=_F32).pin_memory()
         self._prompt_keep += [self.frames_host, self.noise_host, self.actions_host]
+        # numpy views of the pinned staging buffers: the per-call host work is
+        # plain memcpy into / out of them, no framework dispatch
+        self._frames_np = self.frames_host.numpy()
+        self._noise_np = self.noise_host.numpy()
+        self._actions_np = self.actions_host.numpy()
         self.B = B = {}
         B["frames"] = b(nv, 256, 256, 3, dtype=_U8)
         B["vit"] = {"patch": b(Sv, 768), "h": b(Sv, 1024), "x8": b(Sv, 4096, dtype=_U8), "qkv": b(Sv, 3072),
@@ -543,7 +582,7 @@ class LawamTorchFrontendRtx:
                     "Q": b(S, 2048, dtype=_BF16), "K": b(S, 1024, dtype=_BF16), "V": b(S, 1024, dtype=_BF16),
                     "O": b(S, 2048, dtype=_BF16), "lse": b(1, 16, nsplit * 128, dtype=_F32),
                     "lse_acc": b(nsplit, 1, 16, S, dtype=_F32), "o_acc": b(nsplit, 1, 16, S, 128, dtype=_F32),
-                    "o_out": b(S, 2048), "gate": b(S, 6144), "up": b(S, 6144), "f16": f16,
+                    "o_out": b(S, 2048), "gate": b(S, 2 * 6144), "up": b(S, 6144), "f16": f16,
                     "inject": [b(S, 2048, zero=True) for _ in range(3)],
                     "merger_out": B["vit"]["merger_out"], "ds_out": B["vit"]["ds_out"],
                     "vlm": b(S, 2048), "vlm8": b(S, 2048, dtype=_U8)}
@@ -566,6 +605,11 @@ class LawamTorchFrontendRtx:
         rows = self.horizon
         part_floats = max(k // self.fvk.nvfp4_skinny_config_k_chunk(c) * rows * n
                           for (n, k), c in self.dit_cfg.items())
+        if self.precision["dit"] == "bf16":
+            part_floats = rows * 4096
+        elif self.precision["dit"] == "w8a16":
+            part_floats = max(k // self.lk.w8a16_skinny_config_k_chunk(c) * rows * n
+                              for (n, k), c in DIT_W8A16_CFG.items())
         one = torch.ones(1, dtype=_F32, device=self.device)
         self._prompt_keep.append(one)
         B["dit"] = {"h": b(rows, 1024, dtype=_BF16), "xn": b(rows, 512, dtype=_U8), "xn_sf": b(rows, 64, dtype=_U8),
@@ -573,6 +617,7 @@ class LawamTorchFrontendRtx:
                     "part": b(part_floats, dtype=_F32), "one": one.data_ptr(), "O": b(rows, 1024, dtype=_BF16),
                     "hmod": b(rows, 1024, dtype=_BF16), "ae": b(rows, 1024, dtype=_BF16),
                     "x": b(rows, 32, dtype=_F32), "q_bf16": b(rows, 1024, dtype=_BF16),
+                    "xb": b(rows, 1024, dtype=_BF16), "hb": b(rows, 4096, dtype=_BF16),
                     "lse": b(1, 16, 128, dtype=_F32), "kv_text": B["flow"]["kv_text"], "kv_img": B["flow"]["kv_img"]}
         B["actions"] = b(rows, self.action_dim, dtype=_F32)
         self.seed = torch.zeros(1, dtype=torch.int64, device=self.device)
@@ -580,7 +625,7 @@ class LawamTorchFrontendRtx:
 
     # ── the policy step ─────────────────────────────────────────────
     def _forward(self, stream: int, *, cal: bool = False, host_io: bool = True, noise_from_host: bool = True):
-        prec = {k: ("cal" if cal and v == "fp8" else v) for k, v in self.precision.items()}
+        prec = {k: ("cal" if cal and v == "fp8" else v) for k, v in self.precision.items() if k != "dit"}
         fvk, lk, fa2, gemm, B = self.fvk, self.lk, self.fa2, self.gemm, self.B
         st = int(stream)
         nv = self.num_views
@@ -611,18 +656,23 @@ class LawamTorchFrontendRtx:
                 "actions d2h")
 
     def _capture(self) -> None:
+        """Capture the policy step twice: with the initial flow sample copied
+        from the host (``infer(noise=...)``) and drawn on device (default)."""
         stream = torch.cuda.Stream(self.device)
         with torch.cuda.stream(stream):
             for _ in range(2):
                 self._forward(stream.cuda_stream)
         stream.synchronize()
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.stream(stream):
-            g.capture_begin()
-            self._forward(stream.cuda_stream)
-            g.capture_end()
-        stream.synchronize()
-        self.graph, self._graph_stream = g, stream
+        graphs = {}
+        for host_noise in (True, False):
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.stream(stream):
+                g.capture_begin()
+                self._forward(stream.cuda_stream, noise_from_host=host_noise)
+                g.capture_end()
+            stream.synchronize()
+            graphs[host_noise] = g
+        self.graph, self._graph_rng, self._graph_stream = graphs[True], graphs[False], stream
 
     # ── calibration ─────────────────────────────────────────────────
     def _calibration_path(self) -> pathlib.Path:
@@ -708,16 +758,17 @@ class LawamTorchFrontendRtx:
         """One policy step. ``obs``: observation dict or uint8 frames [views,
         256, 256, 3]; ``noise``: optional FP32 [horizon (or chunk), 32]
         initial flow sample (rows past the horizon are ignored, as in the
-        reference), drawn from N(0, 1) otherwise. Returns ``{"actions":
-        [horizon, action_dim]}`` (unnormalized)."""
+        reference), drawn from N(0, 1) on device otherwise. Returns
+        ``{"actions": [horizon, action_dim]}`` (unnormalized)."""
         if self.graph is None:
             raise RuntimeError("set_prompt() and calibrate() before infer()")
-        self.frames_host.copy_(torch.from_numpy(self._frames(obs)))
+        np.copyto(self._frames_np, self._frames(obs))
         if noise is None:
-            self.noise_host.normal_()
+            graph = self._graph_rng
         else:
-            self.noise_host.copy_(torch.as_tensor(noise, dtype=_F32).reshape(-1, 32)[:self.horizon])
+            np.copyto(self._noise_np, np.asarray(noise, dtype=np.float32).reshape(-1, 32)[:self.horizon])
+            graph = self.graph
         with torch.cuda.stream(self._graph_stream):
-            self.graph.replay()
+            graph.replay()
         self._graph_stream.synchronize()
-        return {"actions": self.actions_host.numpy().copy()}
+        return {"actions": self._actions_np.copy()}

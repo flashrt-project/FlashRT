@@ -153,14 +153,38 @@ PYBIND11_MODULE(flash_rt_lawam, m) {
         py::arg("x"), py::arg("ld"), py::arg("lo"), py::arg("hi"), py::arg("out"), py::arg("rows"),
         py::arg("out_dim"), py::arg("stream") = 0, "MIN_MAX unnormalization of the first out_dim columns.");
 
+    m.def("gemm_f16acc_set_autotune", &L::gemm_f16acc_set_autotune, py::arg("enable"),
+        "Time the heuristic's non-split-K candidates for plans created afterwards (default off).");
+
     m.def("gemm_f16acc",
-        [](uintptr_t A, uintptr_t B, uintptr_t D, uintptr_t bias, int M, int N, int K, uintptr_t stream) {
+        [](uintptr_t A, uintptr_t B, uintptr_t D, uintptr_t bias, int M, int N, int K, bool gelu, uintptr_t stream) {
             return L::gemm_f16acc(ptr<const __half>(A), ptr<const __half>(B), ptr<__half>(D), ptr<const __half>(bias),
-                                  M, N, K, to_stream(stream));
+                                  M, N, K, gelu, to_stream(stream));
         },
         py::arg("A"), py::arg("B"), py::arg("D"), py::arg("bias"), py::arg("M"), py::arg("N"), py::arg("K"),
-        py::arg("stream") = 0,
-        "FP16 GEMM with FP16 accumulation: D[M,N] = A[M,K] @ B[K,N] (+ bias). Plan cached per shape.");
+        py::arg("gelu") = false, py::arg("stream") = 0,
+        "FP16 GEMM with FP16 accumulation: D[M,N] = A[M,K] @ B[K,N] (+ bias, optionally tanh-GELU). "
+        "Plan cached per shape.");
+
+    m.def("gemm_bf16_f32out",
+        [](uintptr_t A, uintptr_t W, uintptr_t D, int M, int N, int K, uintptr_t stream) {
+            return L::gemm_bf16_f32out(ptr<const __nv_bfloat16>(A), ptr<const __nv_bfloat16>(W), ptr<float>(D), M, N,
+                                       K, to_stream(stream));
+        },
+        py::arg("A"), py::arg("W"), py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0,
+        "D[M,N] FP32 = A[M,K] @ W[N,K]^T (BF16 operands, nn.Linear weight layout). Plan cached per shape.");
+
+    m.def("w8a16_skinny_config_count", &L::w8a16_skinny_config_count);
+    m.def("w8a16_skinny_config_k_chunk", &L::w8a16_skinny_config_k_chunk, py::arg("cfg"));
+    m.def("w8a16_skinny_gemm",
+        [](uintptr_t A, uintptr_t W, uintptr_t w_scale, uintptr_t partials, int M, int N, int K, int cfg, bool pdl,
+           uintptr_t stream) {
+            return L::w8a16_skinny_gemm(ptr<const __nv_bfloat16>(A), ptr<const int8_t>(W), ptr<const float>(w_scale),
+                                        ptr<float>(partials), M, N, K, cfg, pdl, to_stream(stream));
+        },
+        py::arg("A"), py::arg("W"), py::arg("w_scale"), py::arg("partials"), py::arg("M"), py::arg("N"),
+        py::arg("K"), py::arg("cfg"), py::arg("pdl") = true, py::arg("stream") = 0,
+        "Skinny W8A16 GEMM (M <= 32): FP32 K-split partials of A (BF16 [M,K]) @ W (INT8 [N,K], per-channel scales)^T.");
 
     m.def("dit_layer_norm",
         [](uintptr_t x, uintptr_t scale, uintptr_t shift, uintptr_t pos, uintptr_t out, uintptr_t out_sf,
@@ -194,15 +218,16 @@ PYBIND11_MODULE(flash_rt_lawam, m) {
 
     m.def("dit_sum_bias_act",
         [](uintptr_t partials, int splits, uintptr_t a_gs, uintptr_t w_gs, uintptr_t bias, int act, uintptr_t out,
-           uintptr_t out_sf, uintptr_t out_gs, int rows, int n, bool pdl, uintptr_t stream) {
+           uintptr_t out_sf, uintptr_t out_gs, uintptr_t out_bf16, int rows, int n, bool pdl, uintptr_t stream) {
             return L::dit_sum_bias_act(ptr<const float>(partials), splits, ptr<const float>(a_gs),
                                        ptr<const float>(w_gs), ptr<const __nv_bfloat16>(bias), act,
-                                       ptr<uint8_t>(out), ptr<uint8_t>(out_sf), ptr<const float>(out_gs), rows, n,
-                                       pdl, to_stream(stream));
+                                       ptr<uint8_t>(out), ptr<uint8_t>(out_sf), ptr<const float>(out_gs),
+                                       ptr<__nv_bfloat16>(out_bf16), rows, n, pdl, to_stream(stream));
         },
         py::arg("partials"), py::arg("splits"), py::arg("a_gs"), py::arg("w_gs"), py::arg("bias"), py::arg("act"),
-        py::arg("out"), py::arg("out_sf"), py::arg("out_gs"), py::arg("rows"), py::arg("n"),
-        py::arg("pdl") = true, py::arg("stream") = 0, "NVFP4 act(sum + bias); act 0 identity, 1 ReLU.");
+        py::arg("out"), py::arg("out_sf"), py::arg("out_gs"), py::arg("out_bf16"), py::arg("rows"), py::arg("n"),
+        py::arg("pdl") = true, py::arg("stream") = 0,
+        "act(sum + bias) -> NVFP4 or BF16 (out_bf16); act 0 identity, 1 ReLU, 2 tanh-GELU.");
 
     m.def("dit_sum_bias_bf16",
         [](uintptr_t partials, int splits, uintptr_t a_gs, uintptr_t w_gs, uintptr_t bias, uintptr_t out, int rows,

@@ -98,7 +98,7 @@ def _mm(gemm, prec, x8, x16, L, name, out, M, N, K, st):
     if prec == "fp16":
         gemm.fp16_nn(x16, L[name + "_w16"], out, M, N, K, st)
     elif prec == "f16acc":
-        _ck(_LK.gemm_f16acc(x16, L[name + "_w16"], out, 0, M, N, K, st), "f16acc gemm")
+        _ck(_LK.gemm_f16acc(x16, L[name + "_w16"], out, 0, M, N, K, False, st), "f16acc gemm")
     else:
         gemm.fp8_descale_fp16(x8, L[name + "_w"], out, M, N, K, L["a_" + name], L[name + "_ws"], st)
 
@@ -167,9 +167,14 @@ def qwen_vit_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8"):
         _attn(fa2, fvk, Q, K, V, O, lse, x8, L["a_o"], batch=nv, seq=Sper, heads=NH, hd=HD, st=st, prec=prec)
         _mm(gemm, prec, x8, O, L, "o", o_out, S, D, D, st)
         _norm8(fvk, h, o_out, L["o_b"], 0, L["n2_w"], L["n2_b"], 0, EPS_VIT, x8, L["a_fc1"], S, D, st, prec, f16)
-        _mm(gemm, prec, x8, f16, L, "fc1", fc1, S, FF, D, st)
-        _gelu8(lk, fvk, fc1, FF, L["fc1_b"], x8, L["a_fc2"], S, FF, st, prec, f16, tanh=True)
-        _mm(gemm, prec, x8, f16, L, "fc2", o_out, S, D, FF, st)
+        if prec == "f16acc":
+            # fc1 bias + tanh-GELU in the GEMM epilogue; fc2 reads it directly
+            _ck(_LK.gemm_f16acc(f16, L["fc1_w16"], fc1, L["fc1_b"], S, FF, D, True, st), "vit fc1 gelu")
+            _mm(gemm, prec, x8, fc1, L, "fc2", o_out, S, D, FF, st)
+        else:
+            _mm(gemm, prec, x8, f16, L, "fc1", fc1, S, FF, D, st)
+            _gelu8(lk, fvk, fc1, FF, L["fc1_b"], x8, L["a_fc2"], S, FF, st, prec, f16, tanh=True)
+            _mm(gemm, prec, x8, f16, L, "fc2", o_out, S, D, FF, st)
         pend = (o_out, L["fc2_b"])
         if li in VIT_TAPS:
             _ck(fvk.fp8_residual_norm_quant(h, pend[0], pend[1], 0, 0, 0, 0, 0, 0.0, 0, 0, 0, S, D, st), "vit res")
@@ -223,13 +228,17 @@ def qwen_llm_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8", nu
             fvk.cast_bf16_to_fp16(O, f16, S * NHQ * HD, st)
         _mm(gemm, prec, x8, f16, L, "o", o_out, S, D, NHQ * HD, st)
         _norm8(fvk, h, o_out, 0, 0, L["post_ln_w"], 0, 1, EPS_LLM, x8, L["a_gate"], S, D, st, prec, f16)
-        _mm(gemm, prec, x8, f16, L, "gate", gate, S, FF, D, st)
-        _mm(gemm, prec, x8, f16, L, "up", up, S, FF, D, st)
-        if prec == "fp8":
-            fvk.silu_mul_split_fp8_fp16(gate, up, x8, S * FF, L["a_down"], st)
+        if prec in _F16:
+            # gate | up as one [K, 2 FF] GEMM, SwiGLU reads both halves of the row
+            _mm(gemm, prec, x8, f16, L, "gateup", gate, S, 2 * FF, D, st)
+            _ck(lk.silu_mul(gate, gate + FF * 2, 2 * FF, f16, S, FF, st), "llm silu")
         else:
-            _ck(lk.silu_mul(gate, up, FF, f16, S, FF, st), "llm silu")
-            if prec == "cal":
+            _mm(gemm, prec, x8, f16, L, "gate", gate, S, FF, D, st)
+            _mm(gemm, prec, x8, f16, L, "up", up, S, FF, D, st)
+            if prec == "fp8":
+                fvk.silu_mul_split_fp8_fp16(gate, up, x8, S * FF, L["a_down"], st)
+            else:
+                _ck(lk.silu_mul(gate, up, FF, f16, S, FF, st), "llm silu")
                 _quant_f16(fvk, f16, x8, L["a_down"], S * FF, st)
         _mm(gemm, prec, x8, f16, L, "down", o_out, S, D, FF, st)
         pend = o_out
@@ -363,31 +372,59 @@ def dit_step_forward(fvk, lk, fa2, B, W, T, dims, *, step, stream=0, pdl=True, c
     self-attention over the action rows, even blocks cross-attention to the
     text (li % 4 == 0) or image tokens), output AdaLN, the folded
     proj_out_2 / decoder layer 1 (+ReLU), decoder layer 2 and the FP32 update
-    of B["x"]. T holds the per-step AdaLN tables, W the step-invariant NVFP4
-    sites (w, sf, gs, bias)."""
+    of B["x"]. T holds the per-step AdaLN tables, W the step-invariant GEMM
+    sites (w, sf / w16, gs, bias).
+
+    W["mode"] "nvfp4": skinny W4A4 GEMMs with K-split FP32 partials, block
+    inputs quantized to NVFP4 by the consumers. "w8a16": skinny weight-only
+    INT8 GEMMs (per-channel scales) on BF16 block inputs, same partial layout
+    (alpha = 1). "bf16": BF16 weights, FP32-output cuBLASLt GEMMs whose result
+    the consumers read as a single partial."""
     rows, S_text = int(dims["rows"]), int(dims["S"])
     D, FF = D_DIT, FF_DIT
     st = int(stream)
-    h, xn, xn_sf = B["h"], B["xn"], B["xn_sf"]
-    hid, hid_sf, part, one = B["hid"], B["hid_sf"], B["part"], B["one"]
+    mode = W["mode"]
+    bf = mode in ("bf16", "w8a16")                 # BF16 block inputs
+    h, part, one = B["h"], B["part"], B["one"]
     O, hmod, ae = B["O"], B["hmod"], B["ae"]
+    if bf:
+        xn, xn_sf, xb = 0, 0, B["xb"]           # block input as BF16
+        hid, hid_sf, hb = 0, 0, B["hb"]
+        gs_out = 0
+    else:
+        xn, xn_sf, xb = B["xn"], B["xn_sf"], 0
+        hid, hid_sf, hb = B["hid"], B["hid_sf"], 0
+        gs_out = one
     scale, shift = T["scale"][step], T["shift"][step]
     pos = T["pos"]
+
+    def gemm(a, a_sf, a_bf16, site, n, k, what, bf16_act=False):
+        if mode == "w8a16":
+            c = W["w8_cfg"][(n, k)]
+            _ck(lk.w8a16_skinny_gemm(a_bf16, site["w8"], site["ws"], part, rows, n, k, c, pdl, st), what)
+            return k // lk.w8a16_skinny_config_k_chunk(c)
+        if mode == "bf16":
+            _ck(lk.gemm_bf16_f32out(a_bf16, site["w16"], part, rows, n, k, st), what)
+            return 1
+        if bf16_act:
+            return _skinny(fvk, a_bf16, 0, site, part, rows, n, k, cfg, pdl, st, what, bf16_act=True, one=one)
+        return _skinny(fvk, a, a_sf, site, part, rows, n, k, cfg, pdl, st, what)
+
     _ck(lk.action_encode(B["x"], W["ae_w1"], W["ae_b1"], ae, rows, 32, D, st), "action encode")
     site = W["ae2"]
-    sp = _skinny(fvk, ae, 0, site, part, rows, D, D, cfg, pdl, st, "action enc w2", bf16_act=True, one=one)
+    sp = gemm(0, 0, ae, site, D, D, "action enc w2", bf16_act=True)
     _ck(lk.dit_sum_bias_residual_norm(part, sp, one, site["gs"], site["b"], h, False, scale[0], shift[0], pos, xn,
-                                      xn_sf, one, 0, rows, D, EPS_LN, pdl, st), "dit in-norm")
+                                      xn_sf, gs_out, xb, rows, D, EPS_LN, pdl, st), "dit in-norm")
     for li in range(LAYERS_DIT):
         if li % 2 == 1:
             site = W["qkv"][li // 2]
-            sp = _skinny(fvk, xn, xn_sf, site, part, rows, 3 * D, D, cfg, pdl, st, "self qkv")
+            sp = gemm(xn, xn_sf, xb, site, 3 * D, D, "self qkv")
             _ck(fvk.nvfp4_skinny_partials_attention(part, sp, one, site["gs"], site["b"], 3 * D, 0, 0, 0, rows,
                                                     False, O, rows, HEADS_DIT, HD_DIT, HD_DIT ** -0.5, pdl, st),
                 "self attention")
         else:
             site = W["q"][li // 2]
-            sp = _skinny(fvk, xn, xn_sf, site, part, rows, D, D, cfg, pdl, st, "cross q")
+            sp = gemm(xn, xn_sf, xb, site, D, D, "cross q")
             g = li // 4
             if li % 4 == 0:
                 kv = B["kv_text"] + g * 2 * D * 2
@@ -407,27 +444,32 @@ def dit_step_forward(fvk, lk, fa2, B, W, T, dims, *, step, stream=0, pdl=True, c
                                   o_strides=(rows * D, D, HD_DIT), softmax_scale=HD_DIT ** -0.5, num_sms=0,
                                   stream=st)
         site = W["o"][li]
-        sp = _skinny(fvk, O, 0, site, part, rows, D, D, cfg, pdl, st, "o proj", bf16_act=True, one=one)
-        _ck(lk.dit_sum_bias_residual_norm(part, sp, one, site["gs"], site["b"], h, True, 0, 0, 0, xn, xn_sf, one, 0,
-                                          rows, D, EPS_LN, pdl, st), "o residual norm")
+        sp = gemm(0, 0, O, site, D, D, "o proj", bf16_act=True)
+        _ck(lk.dit_sum_bias_residual_norm(part, sp, one, site["gs"], site["b"], h, True, 0, 0, 0, xn, xn_sf, gs_out,
+                                          xb, rows, D, EPS_LN, pdl, st), "o residual norm")
         site = W["ff_up"][li]
-        sp = _skinny(fvk, xn, xn_sf, site, part, rows, FF, D, cfg, pdl, st, "ffn up")
-        _ck(fvk.nvfp4_skinny_sum_bias_gelu(part, sp, one, site["gs"], site["b"], hid, hid_sf, one, rows, FF, pdl,
-                                           st), "ffn gelu")
+        sp = gemm(xn, xn_sf, xb, site, FF, D, "ffn up")
+        if bf:
+            _ck(lk.dit_sum_bias_act(part, sp, one, site["gs"], site["b"], 2, 0, 0, 0, hb, rows, FF, pdl, st),
+                "ffn gelu")
+        else:
+            _ck(fvk.nvfp4_skinny_sum_bias_gelu(part, sp, one, site["gs"], site["b"], hid, hid_sf, one, rows, FF,
+                                               pdl, st), "ffn gelu")
         site = W["ff_down"][li]
-        sp = _skinny(fvk, hid, hid_sf, site, part, rows, D, FF, cfg, pdl, st, "ffn down")
+        sp = gemm(hid, hid_sf, hb, site, D, FF, "ffn down")
         if li < LAYERS_DIT - 1:
             _ck(lk.dit_sum_bias_residual_norm(part, sp, one, site["gs"], site["b"], h, True, scale[li + 1],
-                                              shift[li + 1], pos, xn, xn_sf, one, 0, rows, D, EPS_LN, pdl, st),
+                                              shift[li + 1], pos, xn, xn_sf, gs_out, xb, rows, D, EPS_LN, pdl, st),
                 "ffn residual adaln")
         else:
             _ck(lk.dit_sum_bias_residual_norm(part, sp, one, site["gs"], site["b"], h, True, T["out_scale"][step],
                                               T["out_shift"][step], 0, 0, 0, 0, hmod, rows, D, 1e-6, pdl, st),
                 "ffn residual out-norm")
     site = W["head1"]
-    sp = _skinny(fvk, hmod, 0, site, part, rows, D, D, cfg, pdl, st, "head fold", bf16_act=True, one=one)
-    _ck(lk.dit_sum_bias_act(part, sp, one, site["gs"], site["b"], 1, hid, hid_sf, one, rows, D, pdl, st), "head relu")
+    sp = gemm(0, 0, hmod, site, D, D, "head fold", bf16_act=True)
+    _ck(lk.dit_sum_bias_act(part, sp, one, site["gs"], site["b"], 1, hid, hid_sf, gs_out, hb, rows, D, pdl, st),
+        "head relu")
     site = W["head2"]
-    sp = _skinny(fvk, hid, hid_sf, site, part, rows, 32, D, cfg, pdl, st, "head out")
+    sp = gemm(hid, hid_sf, hb, site, 32, D, "head out")
     _ck(lk.dit_sum_bias_euler(part, sp, one, site["gs"], site["b32"], B["x"], float(dims["dt"]), rows, 32, pdl, st),
         "euler")

@@ -1518,7 +1518,8 @@ if(FLASHRT_ENABLE_LAWAM)
     csrc/lawam_bindings.cpp
     csrc/kernels/lawam/lawam_kernels.cu
     csrc/kernels/lawam/lawam_dit_sm120.cu
-    csrc/kernels/lawam/lawam_gemm_f16acc.cu)
+    csrc/kernels/lawam/lawam_gemm_f16acc.cu
+    csrc/kernels/lawam/lawam_w8a16_skinny_sm120.cu)
   set_target_properties(flash_rt_lawam PROPERTIES
     CUDA_STANDARD 17
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt

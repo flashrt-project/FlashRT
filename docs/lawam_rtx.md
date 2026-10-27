@@ -14,8 +14,9 @@ cmake --build build -j$(( $(nproc) / 2 )) --target flash_rt_kernels flash_rt_fa2
 
 `flash_rt_lawam` holds the kernels FlashRT had no equivalent for (camera
 patchification for the two vision towers, the gated AdaLN rows of the LAM
-decoder, the VLM-to-latent QFormer, FP16-accumulate GEMM plans, and the
-positional-embedding consumers of the skinny NVFP4 DiT). The tokenizer is
+decoder, the VLM-to-latent QFormer, FP16-accumulate GEMM plans, the skinny
+weight-only INT8 DiT GEMM, and the positional-embedding consumers of the
+skinny DiT). The tokenizer is
 loaded with `transformers` (`AutoProcessor` of the checkpoint's `base_vlm`,
 or `processor_path=`) at `set_prompt` time only.
 
@@ -53,10 +54,10 @@ One CUDA graph per prompt holds the whole policy step:
 | Qwen3-VL ViT (24 layers, DeepStack 5/11/17, mergers) | `lawam.gemm_f16acc`, `fp8_residual_norm_quant`, `fp8_qkv_split`, FA2 | FP16, FP16 accumulation |
 | Qwen3-VL LLM (16 layers kept by LaWAM) | same, causal GQA FA2 | FP16, FP16 accumulation |
 | VLM -> latent QFormer + LAM conditioning | `lawam.qformer_latent` | FP32 |
-| DINOv3 ViT-B/16 (11 layers used) | FP8 descale GEMMs, FA2 with FP8 output | FP8 (static scales) |
-| LAM decoder (12 AdaLN blocks) | FP8 GEMMs, `lawam.gated_residual_norm` | FP8 (static scales) |
-| flow conditioning (enc_vlm, cross K/V of 8 blocks) | FP8 GEMM, BF16 GEMMs | FP8 / BF16 |
-| flow DiT x 10 (16 blocks) | `nvfp4_skinny_gemm`, `nvfp4_skinny_partials_attention`, `lawam.dit_*` consumers, FA2 small-query tile for the 512 image keys | NVFP4 W4A4 |
+| DINOv3 ViT-B/16 (11 layers used) | `lawam.gemm_f16acc`, FA2 | FP16, FP16 accumulation |
+| LAM decoder (12 AdaLN blocks) | `lawam.gemm_f16acc`, `lawam.gated_residual_norm` | FP16, FP16 accumulation |
+| flow conditioning (enc_vlm, cross K/V of 8 blocks) | `lawam.gemm_f16acc`, BF16 GEMMs | FP16 / BF16 |
+| flow DiT x 10 (16 blocks) | `lawam.w8a16_skinny_gemm`, `nvfp4_skinny_partials_attention`, `lawam.dit_*` consumers, FA2 small-query tile for the 512 image keys | INT8 weight-only, BF16 activations |
 | Euler update, unnormalization | `lawam.dit_sum_bias_euler`, `lawam.unnormalize_actions` | FP32 |
 
 Exact rewrites of the reference: tokens past the effective horizon never
@@ -71,17 +72,24 @@ temporal patch copies are folded into the Qwen3-VL patch-embedding weight.
 The LeRobot policy runs Qwen3-VL on `inputs_embeds` only, so Qwen3-VL uses
 sequential (1-D) rotary positions for every token; the frontend matches it.
 
-## Calibration
-
-`calibrate()` runs each real observation once with dynamic per-tensor FP8
-at every FP8 site, records amax / 448 into the site's scale slot, and keeps
-the 99.9th percentile across observations as the static scale (cached under
-`~/.flash_rt/calibration/<ckpt>_lawam.json`, keyed by the precision policy).
-The NVFP4 DiT needs no activation calibration.
-
 ## Precision policy
 
-`precision={"vit", "llm", "dino", "lam", "enc"}` selects `"fp8"`, `"fp16"`
-or `"f16acc"` per stage. Per-tensor FP8 in the Qwen3-VL towers measurably
-moves the action chunks on real LIBERO frames, so they default to FP16
-GEMMs; DINOv3 / LAM / flow conditioning default to FP8.
+`precision={"vit", "llm", "dino", "lam", "enc"}` selects `"f16acc"` (default),
+`"fp16"` or `"fp8"` per stage; `precision["dit"]` selects `"w8a16"`
+(default), `"bf16"` or `"nvfp4"`.
+
+LaWAM's flow lands in a different action mode on a few real frames under
+small numeric changes: the reference policy itself moves 4 of 64 held-out
+LIBERO frames when its VLM runs FP16 instead of BF16 (aggregate action
+cosine 0.997). The default policy sits at that floor (0.997, same 64 frames);
+per-tensor FP8 in any tower (0.87-0.99) and NVFP4 DiT weights (W4A16 or
+W4A4) fall measurably below it, so they are opt-in tiers.
+
+## Calibration
+
+The default policy has no activation quantization (the DiT INT8 weights use
+per-channel scales fixed at load). With an FP8 tier, `calibrate()` runs each
+real observation once with dynamic per-tensor FP8 at every FP8 site, records
+amax / 448 into the site's scale slot, and keeps the 99.9th percentile across
+observations as the static scale (cached under
+`~/.flash_rt/calibration/<ckpt>_lawam.json`, keyed by the precision policy).

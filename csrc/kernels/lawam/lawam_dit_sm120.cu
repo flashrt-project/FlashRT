@@ -125,7 +125,7 @@ __global__ void __launch_bounds__(256)
 sum_bias_act_kernel(const float* __restrict__ partials, int splits, const float* __restrict__ a_gs,
                     const float* __restrict__ w_gs, const __nv_bfloat16* __restrict__ bias, int act,
                     uint8_t* __restrict__ out, uint8_t* __restrict__ out_sf, const float* __restrict__ out_gs,
-                    int rows, int n) {
+                    __nv_bfloat16* __restrict__ out_bf16, int rows, int n) {
     if constexpr (PDL) pdl_prologue();
     const int quads = n >> 2;
     const int raw = blockIdx.x * blockDim.x + threadIdx.x;
@@ -145,6 +145,15 @@ sum_bias_act_kernel(const float* __restrict__ partials, int splits, const float*
     if (act == 1) {
         y0 = make_float2(fmaxf(y0.x, 0.f), fmaxf(y0.y, 0.f));
         y1 = make_float2(fmaxf(y1.x, 0.f), fmaxf(y1.y, 0.f));
+    } else if (act == 2) {
+        y0 = make_float2(nvfp4_skinny::tanh_gelu(y0.x), nvfp4_skinny::tanh_gelu(y0.y));
+        y1 = make_float2(nvfp4_skinny::tanh_gelu(y1.x), nvfp4_skinny::tanh_gelu(y1.y));
+    }
+    if (out_bf16 != nullptr) {
+        if (valid)
+            *reinterpret_cast<uint2*>(out_bf16 + static_cast<size_t>(row) * n + c0) =
+                make_uint2(pack_bf2(y0.x, y0.y), pack_bf2(y1.x, y1.y));
+        return;
     }
     const float inv_gs = 1.0f / (*out_gs);
     uint16_t scratch = 0;
@@ -221,12 +230,14 @@ int dit_sum_bias_residual_norm(const float* partials, int splits, const float* a
 
 int dit_sum_bias_act(const float* partials, int splits, const float* a_gs, const float* w_gs,
                      const __nv_bfloat16* bias, int act, uint8_t* out, uint8_t* out_sf, const float* out_gs,
-                     int rows, int n, bool pdl, cudaStream_t stream) {
-    if (rows < 1 || n % 16 != 0 || act < 0 || act > 1) return static_cast<int>(cudaErrorInvalidValue);
+                     __nv_bfloat16* out_bf16, int rows, int n, bool pdl, cudaStream_t stream) {
+    if (rows < 1 || n % 16 != 0 || act < 0 || act > 2 ||
+        (out_bf16 == nullptr && (out == nullptr || out_sf == nullptr || out_gs == nullptr)))
+        return static_cast<int>(cudaErrorInvalidValue);
     const int total = rows * (n >> 2);
     const void* fn = pdl ? (const void*)sum_bias_act_kernel<true> : (const void*)sum_bias_act_kernel<false>;
     return launch_ex(fn, dim3((total + 255) / 256), dim3(256), stream, pdl, partials, splits, a_gs, w_gs, bias,
-                     act, out, out_sf, out_gs, rows, n);
+                     act, out, out_sf, out_gs, out_bf16, rows, n);
 }
 
 int dit_sum_bias_bf16(const float* partials, int splits, const float* a_gs, const float* w_gs,

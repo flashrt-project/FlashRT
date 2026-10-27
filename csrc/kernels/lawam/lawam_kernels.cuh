@@ -88,10 +88,30 @@ int unnormalize_actions(const float* x, int ld, const float* lo, const float* hi
                         int out_dim, cudaStream_t stream);
 
 // D[M, N] = A[M, K] @ B[K, N] (+ bias[N]), FP16 operands and FP16 accumulation
-// (cuBLASLt CUBLAS_COMPUTE_16F; row-major, B as [K, N]). Plans are cached per
+// (cuBLASLt CUBLAS_COMPUTE_16F; row-major, B as [K, N]); gelu applies the
+// tanh-approximated GELU after the bias (requires bias). Plans are cached per
 // shape on first use: call once before graph capture.
-int gemm_f16acc(const __half* A, const __half* B, __half* D, const __half* bias, int M, int N, int K,
+int gemm_f16acc(const __half* A, const __half* B, __half* D, const __half* bias, int M, int N, int K, bool gelu,
                 cudaStream_t stream);
+// Plans created after enable=true time the heuristic's non-split-K candidates
+// and keep the fastest (default: the heuristic's first choice).
+void gemm_f16acc_set_autotune(bool enable);
+
+// D[M, N] (FP32) = A[M, K] @ W[N, K]^T, BF16 operands (W an nn.Linear weight
+// as stored), FP32 accumulation. D is a single-split partial for the DiT
+// consumers below (splits = 1, alpha = 1).
+int gemm_bf16_f32out(const __nv_bfloat16* A, const __nv_bfloat16* W, float* D, int M, int N, int K,
+                     cudaStream_t stream);
+
+// Skinny weight-only INT8 GEMM for the DiT (M <= 32): partials[s][m][n] =
+// w_scale[n] * sum_{k in split s} A[m][k] * W[n][k], A BF16 [M, K], W INT8
+// [N, K] with per-output-channel scales, partials FP32 [K / KC][M][N] (the
+// skinny NVFP4 layout; consumers use alpha = 1). Weights are prefetched
+// before the programmatic-dependent-launch wait.
+int w8a16_skinny_config_count();
+int w8a16_skinny_config_k_chunk(int cfg);
+int w8a16_skinny_gemm(const __nv_bfloat16* A, const int8_t* W, const float* w_scale, float* partials, int M, int N,
+                      int K, int cfg, bool pdl, cudaStream_t stream);
 
 // ── Skinny NVFP4 consumers for the flow DiT (sm_120a) ──
 // Same partial layout, numerics and output formats as
@@ -113,10 +133,11 @@ int dit_layer_norm(const __nv_bfloat16* x, const __nv_bfloat16* scale, const __n
                    const __nv_bfloat16* pos, uint8_t* out, uint8_t* out_sf, const float* out_gs,
                    __nv_bfloat16* out_bf16, int rows, int dim, float eps, bool pdl, cudaStream_t stream);
 
-// out = nvfp4(act(bf16(bf16(alpha * sum partials) + bias))), act 0 identity, 1 ReLU.
+// y = act(bf16(bf16(alpha * sum partials) + bias)), act 0 identity, 1 ReLU,
+// 2 tanh-GELU, into NVFP4 (out, out_sf, *out_gs) or BF16 out_bf16 [rows, n].
 int dit_sum_bias_act(const float* partials, int splits, const float* a_gs, const float* w_gs,
                      const __nv_bfloat16* bias, int act, uint8_t* out, uint8_t* out_sf, const float* out_gs,
-                     int rows, int n, bool pdl, cudaStream_t stream);
+                     __nv_bfloat16* out_bf16, int rows, int n, bool pdl, cudaStream_t stream);
 
 // out = bf16(bf16(alpha * sum partials) + bias) (BF16 [rows, n]): a projection
 // consumed by a regular attention kernel.
