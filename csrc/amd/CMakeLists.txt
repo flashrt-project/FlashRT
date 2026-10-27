@@ -1,7 +1,7 @@
 # ================================================================
 # FlashRT AMD — standalone HIP build (never wired into root CMake).
 #
-#   cmake -B build-amd -S csrc/amd -DGPU_ARCH=gfx942|gfx950|gfx1151|gfx1201
+#   cmake -B build-amd -S csrc/amd -DGPU_ARCH=gfx942|gfx950|gfx1100|gfx1151|gfx1201
 #   cmake --build build-amd -j 8
 #
 # Output: flash_rt/amd/flash_rt_amd_kernels*.so
@@ -42,16 +42,21 @@ option(FLASHRT_AMD_ALLOW_ARCH
   "Allow an unregistered AMD ISA while bringing up a new source set" OFF)
 if(NOT GPU_ARCH_BASE STREQUAL "gfx942"
    AND NOT GPU_ARCH_BASE STREQUAL "gfx950"
+   AND NOT GPU_ARCH_BASE STREQUAL "gfx1100"
    AND NOT GPU_ARCH_BASE STREQUAL "gfx1151"
    AND NOT GPU_ARCH_BASE STREQUAL "gfx1201"
    AND NOT FLASHRT_AMD_ALLOW_ARCH)
   message(FATAL_ERROR
     "GPU_ARCH=${GPU_ARCH} has no FlashRT AMD source set; use gfx942, "
-    "gfx950, gfx1151, or gfx1201 (or opt in with FLASHRT_AMD_ALLOW_ARCH "
+    "gfx950, gfx1100, gfx1151, or gfx1201 (or opt in with FLASHRT_AMD_ALLOW_ARCH "
     "for porting work)")
 endif()
 message(STATUS "flash_rt_amd: GPU_ARCH=${GPU_ARCH_BASE}")
 
+# Allow explicit RDNA builds on hosts without a visible GPU.
+if(GPU_ARCH_BASE MATCHES "^(gfx1100|gfx1151|gfx1201)$")
+  set(CMAKE_HIP_ARCHITECTURES "${GPU_ARCH_BASE}")
+endif()
 enable_language(HIP)
 set(CMAKE_HIP_ARCHITECTURES "${GPU_ARCH_BASE}")
 set(CMAKE_HIP_STANDARD 17)
@@ -69,10 +74,10 @@ find_package(pybind11 CONFIG REQUIRED)
 # ── Architecture-selected kernel module ──
 # Keep the source files in the existing directories. RDNA variants carry an
 # `_rdna` filename suffix; wave32 RDNA targets must never compile the
-# wave64/MFMA CDNA files. gfx1201 (RDNA 4 / R9700) shares the gfx1151 BF16
-# wave32 sources; FLASHRT_AMD_RDNA4 selects the gfx12 WMMA fragment layout.
+# wave64/MFMA CDNA files. gfx1100/gfx1151 share the gfx11 WMMA layout;
+# FLASHRT_AMD_RDNA4 selects the gfx12 fragment layout for gfx1201.
 # Runtime still requires a matching build.
-if(GPU_ARCH_BASE STREQUAL "gfx1151" OR GPU_ARCH_BASE STREQUAL "gfx1201")
+if(GPU_ARCH_BASE MATCHES "^(gfx1100|gfx1151|gfx1201)$")
   set(FLASHRT_AMD_SOURCES
     bindings_rdna.cpp
     kernels/norm_rdna.hip
@@ -124,6 +129,9 @@ if(GPU_ARCH_BASE STREQUAL "gfx942")
 elseif(GPU_ARCH_BASE STREQUAL "gfx950")
   target_compile_definitions(flash_rt_amd_kernels PRIVATE
     FLASHRT_AMD_CDNA4=1)
+elseif(GPU_ARCH_BASE STREQUAL "gfx1100")
+  target_compile_definitions(flash_rt_amd_kernels PRIVATE
+    FLASHRT_AMD_RDNA3=1)
 elseif(GPU_ARCH_BASE STREQUAL "gfx1201")
   target_compile_definitions(flash_rt_amd_kernels PRIVATE
     FLASHRT_AMD_RDNA4=1)

@@ -4,7 +4,7 @@
 // Each call is one 16x16x16 BF16 WMMA with FP32 accumulation. The two RDNA
 // ISA families distribute the operands differently:
 //
-//   gfx11 (gfx1151): every lane carries the full 16-element K fragment of
+//   gfx11 (gfx1100/gfx1151): every lane carries the full 16-element K fragment of
 //     row/column lane % 16; lanes 16..31 replicate lanes 0..15.
 //     Accumulator element e of lane l holds row 2 * e + l / 16.
 //   gfx12 (gfx1201): lane l carries K elements [8 * (l / 16), +8) of

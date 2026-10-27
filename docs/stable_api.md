@@ -42,7 +42,7 @@ def load_model(
     decode_cuda_graph: bool = False,
     decode_graph_steps: int = 80,
     max_decode_steps: int = 256,
-    hardware: str = "auto",         # "auto" | "thor" | "rtx_sm120" | "rtx_sm89" | "rtx_sm87" | "amd_cdna4" | "amd_rdna35" | "amd_rdna4" | "apple_mps"
+    hardware: str = "auto",         # "auto" | "thor" | "rtx_sm120" | "rtx_sm89" | "rtx_sm87" | "amd_cdna4" | "amd_rdna3" | "amd_rdna35" | "amd_rdna4" | "apple_mps"
     # GROOT-specific:
     embodiment_tag: str | None = None,
     action_horizon: int | None = None,

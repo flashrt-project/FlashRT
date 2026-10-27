@@ -230,9 +230,12 @@ is a judging protocol, not a deployment setting.
 Cross-run medians can move with host scheduling and hipBLASLt algorithm
 selection; compare arms under the same affinity and data protocol.
 
-# Pi0.5 on AMD RDNA 3.5 (gfx1151)
+# Pi0.5 on AMD RDNA (3 / 3.5 / 4)
 
-This is the BF16 Pi0.5 backend for the integrated Radeon 8060S GPU in
+The shared BF16 Pi0.5 frontend supports W7900D (`gfx1100` / `amd_rdna3`),
+Radeon 8060S (`gfx1151` / `amd_rdna35`) and R9700 (`gfx1201` / `amd_rdna4`).
+
+The RDNA 3.5 target is the integrated Radeon 8060S GPU in
 Ryzen AI Max+ 395 (the GPUs in AMD Ryzen™ AI Embedded X100 Series processors
 share the same RDNA 3.5 architecture). Its public hardware key is
 `amd_rdna35`; `gfx1151` is used only for build-time and runtime hardware
@@ -293,6 +296,136 @@ actions = model.predict(images=[base_image, wrist_image])
 `hardware="auto"` maps the exact gfx1151 ISA to `amd_rdna35`. The
 frontend also verifies that the extension was built from the RDNA source set,
 uses wave32, and targets gfx1151 before loading the checkpoint.
+
+### RDNA container quick start
+
+Build the image for your target using
+[`docker/Dockerfile.rocm.rdna`](../docker/Dockerfile.rocm.rdna), as described in the
+[AMD build guide](deployment_amd.md#rdna-container). The same ROCm 10.1.0,
+PyTorch 2.14.0, torchvision and Triton environment supports all three RDNA
+targets; each image contains an extension for one exact ISA.
+
+Keep checkpoints and the PaliGemma tokenizer outside the image. Select an
+available render device and mount both resources read-only:
+
+```bash
+docker run --rm -it \
+  --device /dev/kfd --device /dev/dri/renderD128 --shm-size=8g \
+  -v /path/to/pi05-checkpoint:/models/pi05:ro \
+  -v /path/to/paligemma_tokenizer.model:/models/tokenizer.model:ro \
+  -e FLASH_RT_PI05_RDNA_CKPT=/models/pi05 \
+  -e FLASH_RT_PALIGEMMA_TOKENIZER=/models/tokenizer.model \
+  -e FLASH_RT_PI05_ACTION_DIM=7 -e OMP_NUM_THREADS=8 \
+  flashrt:rocm-gfx1100 \
+  python -m pytest tests/test_amd_rdna_ops.py tests/test_amd_rdna_model.py -q -ra
+```
+
+Adjust the image tag, render device and action dimension for your deployment.
+Omit the final Python command for an interactive shell. Check the summary
+for skipped checkpoint/reference tests; a successful image build alone does
+not validate GPU execution or model accuracy. The Python examples below run
+inside the same container with checkpoint directory `/models/pi05`.
+
+## Pi0.5 on AMD RDNA 3 (gfx1100 / W7900D)
+
+W7900D uses the shared RDNA frontend and the gfx11 wave32 BF16 WMMA
+fragment layout. The exact public hardware key is `amd_rdna3`:
+
+```bash
+PYTHON=.venv/bin/python bash scripts/amd/build_amd.sh gfx1100
+```
+
+```python
+model = flash_rt.load_model(
+    "<checkpoint-dir>", config="pi05", framework="torch",
+    hardware="amd_rdna3",  # optional on a gfx1100 machine
+    action_dim=7, num_views=2, cache_frames=1, use_fp8=False,
+)
+actions = model.predict(images=[base_image, wrist_image],
+                        prompt="pick up the object", state=state_vector)
+```
+
+The [RDNA container](#rdna-container-quick-start) provides the ROCm 10.1.0 /
+PyTorch 2.14.0 build and runtime environment for this target. W7900D passes
+the native operator and model suites, including fixed-noise Graph/eager
+parity and independent OpenPI comparisons of raw and public actions on
+all eight bundled LIBERO observations.
+
+The target keeps hipBLASLt for general GEMMs and SDPA for vision attention.
+For `chunk_size <= 16`, the decoder QKV, output, merged gate/up and down
+projections use streamed split-K WMMA with gfx1100-specific launch choices.
+The standard decoder uses fixed (K, N) shapes: (1024, 2560), (2048, 1024),
+(1024, 8192) and (4096, 1024). Other supported shapes with prepared weights
+retain the generic WMMA path; unprepared projections use hipBLASLt.
+Weights are transposed once before capture, adding 0.58 GiB for the standard
+18-layer decoder. Larger horizons retain the existing library projection
+path; the action projection retains its native M <= 48 path. Setting
+`FLASHRT_RDNA35_HIP_SMALLM=0` disables these prepared projections.
+
+Dense encoder prefixes use SDPA; padded prefixes retain the native kernel.
+Native decoder GQA, normalization, RoPE, activation and residual fusions
+remain enabled.
+The gfx1151 and gfx1201 dispatch policies are preserved.
+
+The performance validation workload uses `Fisher-Wang/pi05-libero-pytorch` revision
+`ab107fbe6661e8abfec0f13dc27bfd3fafe24c69`, batch 1, two 224x224 RGB views,
+10 denoising steps, horizon 10, action dimension 7, `cache_frames=1`,
+seed 17, zero eight-dimensional state and prompt `pick up the object`
+(143 tokens, encoder length 655).
+The state is zero-padded to 32 dimensions, discretized and included in the
+`Task / State / Action` prompt template. The 143 tokens are valid prompt
+tokens, not token padding; the two images contribute another 512 tokens.
+
+| W7900D path | Public `predict` P50 | Full Graph replay P50 |
+|---|---:|---:|
+| gfx1100 BF16 with streamed projections and dense-prefix SDPA | 80.51 ms | 78.12 ms |
+
+The table reports the mean of per-process P50 values across 12 independent
+processes. Use `OMP_NUM_THREADS=8`, default GEMM autotuning, 30 warmups and
+100 synchronized measurements per process.
+`predict` uses the public eager path, including input handling, Python
+dispatch, transfers and CPU output. Replay uses a separately captured GPU
+Graph; the difference between these metrics is not just input/output cost.
+Setup, tuning and capture are excluded from both. A gfx1100 tuning comparison
+must use an untuned gfx1100-enabled baseline; the revision without gfx1100
+support cannot run this target. Run operator, fixed-noise Graph/eager,
+library-reference and LIBERO parity tests alongside performance measurements.
+
+To reproduce the public-API timing in a prepared environment, set
+`CHECKPOINT` and `FLASH_RT_PALIGEMMA_TOKENIZER` to local resources, then run
+this on each checkout. The existing `examples/quickstart.py` remains useful
+for smoke tests; its state-free input is a different workload.
+
+```bash
+OMP_NUM_THREADS=8 python - <<'PYBENCH'
+import os, time
+import numpy as np
+import torch
+import flash_rt
+
+torch.manual_seed(17)
+model = flash_rt.load_model(
+    os.environ["CHECKPOINT"], config="pi05", framework="torch",
+    num_views=2, num_steps=10, action_dim=7, cache_frames=1, use_fp8=False)
+rng = np.random.default_rng(17)
+images = [rng.integers(0, 256, (224, 224, 3), dtype=np.uint8) for _ in range(2)]
+state = np.zeros(8, dtype=np.float32)
+def predict():
+    return model.predict(images=images, prompt="pick up the object", state=state)
+predict()  # setup
+for _ in range(30):
+    predict()
+samples = []
+for _ in range(100):
+    torch.cuda.synchronize()
+    started = time.perf_counter()
+    actions = predict()
+    torch.cuda.synchronize()
+    samples.append((time.perf_counter() - started) * 1000)
+assert actions.shape == (10, 7) and np.isfinite(actions).all()
+print("predict P50/P95 ms:", np.percentile(samples, [50, 95]))
+PYBENCH
+```
 
 ## Pi0.5 on AMD RDNA 4 (gfx1201 / R9700)
 
@@ -358,7 +491,7 @@ for the same `cache_frames=1` input.
 
 ## Precision tier
 
-The RDNA 3.5 / RDNA 4 backends support BF16 weights and activations only. They
+The RDNA 3 / 3.5 / 4 targets support BF16 weights and activations only. They
 do not route through the CDNA4 FP8 kernels, packed MFMA layouts, aiter
 provider, or wave64 helpers. `load_model()` converts its historical
 `use_fp8=True` default to BF16 with a warning; direct frontend construction
@@ -412,8 +545,8 @@ same-process parity and performance comparisons:
 | `FLASHRT_RDNA35_HIP_DECODER` | `1` | decoder normalization, activation, and residual fusions |
 | `FLASHRT_RDNA35_HIP_GQA` | `1` | wave32 decoder GQA for queries up to 16 rows; row-owned K/V up to 1024 |
 | `FLASHRT_RDNA35_HIP_GQA_SPLIT_KEY` | `1` | split-key decoder GQA with K/V up to 2048 |
-| `FLASHRT_RDNA35_HIP_ENCODER_ATTN` | `1` | native encoder GQA up to 4096 rows and 16 query heads; dense inputs above 1024 use SDPA when faster, and gfx1201 keeps every dense prefix on SDPA |
-| `FLASHRT_RDNA35_HIP_SMALLM` | `1` | WMMA action projection for M up to 48; on gfx1201 with `chunk_size <= 16`, also the decoder QKV, output, gate/up, and down projections |
+| `FLASHRT_RDNA35_HIP_ENCODER_ATTN` | `1` | native encoder GQA up to 4096 rows and 16 query heads; dense inputs above 1024 use SDPA when faster, and gfx1100/gfx1201 keep dense prefixes on SDPA |
+| `FLASHRT_RDNA35_HIP_SMALLM` | `1` | WMMA action projection for M up to 48; on gfx1100/gfx1201 with `chunk_size <= 16`, also the decoder QKV, output, gate/up, and down projections |
 | `FLASHRT_RDNA35_HIP_FFN_GATE_UP` | `1` | merged decoder gate/up dataflow |
 | `FLASHRT_RDNA35_HIP_ENCODER_FFN` | `1` | merged encoder gate/up dataflow |
 | `FLASHRT_RDNA35_HIP_LARGE_OPS` | `1` | shape-specialized vision/encoder normalization and residual kernels |
@@ -426,9 +559,17 @@ same-process parity and performance comparisons:
 No generated algorithm CSV is shipped and no process-global PyTorch
 TunableOp state is modified. Triton is not a runtime dependency.
 
+For performance comparisons, use the same environment and workload, warm up
+each process, and interleave repeated baseline/candidate runs. Timed GEMM
+selection can choose different hipBLASLt algorithms even for identical source;
+record an unchanged-source control when investigating small latency differences.
+`FLASHRT_RDNA35_GEMM_AUTOTUNE=0` uses the library heuristic and can help isolate
+selection variance, but it changes the execution plan. Report that diagnostic
+separately from default-autotune deployment timings.
+
 ## Feature matrix
 
-| Surface | RDNA 3.5 BF16 |
+| Surface | RDNA 3 / 3.5 / 4 BF16 |
 |---|---|
 | `set_prompt` / `infer` / `get_latency_stats` | ✅ |
 | 2/3 views, dynamic prompt, horizon, and denoise steps | ✅ |
@@ -448,18 +589,20 @@ trajectories. The RDNA backend does not enable an asynchronous serving pipeline.
 
 ```bash
 .venv/bin/python -m pytest \
-  tests/test_amd_rdna35_routing.py \
-  tests/test_amd_rdna35_ops.py -q
+  tests/test_amd_rdna_routing.py \
+  tests/test_amd_rdna_ops.py -q
 
 FLASH_RT_PI05_ACTION_DIM=7 \
-FLASH_RT_PI05_RDNA35_CKPT="<checkpoint-dir>" \
-  .venv/bin/python -m pytest tests/test_amd_rdna35_model.py -q
+FLASH_RT_PI05_RDNA_CKPT="<checkpoint-dir>" \
+  .venv/bin/python -m pytest tests/test_amd_rdna_model.py -q
 
 .venv/bin/python -m pytest tests/test_amd*.py -q
 ```
 
-Operator tests compare every native family with a PyTorch reference on both
-gfx1151 and gfx1201. The checkpoint-gated tests cover finite
+`FLASH_RT_PI05_RDNA35_CKPT` remains an alias for the checkpoint variable.
+
+Operator tests compare every native family with a PyTorch reference on
+gfx1100, gfx1151 and gfx1201. The checkpoint-gated tests cover finite
 outputs, fixed-noise determinism, HIP Graph parity, the
 optimized-versus-library fallback, and the eight real LIBERO observations
 shipped in `examples/thor/assets/pi05_libero.npz`. Profile any extra local
@@ -474,10 +617,15 @@ semantics: vision layers, prefix encoding, decoder layers and denoising steps.
 It accepts tensor-operation, GEMM and attention providers. The RDNA module is
 only a constructor binding; it contains no model traversal. Native operation
 selection lives in `flash_rt.amd.hardware.rdna35.ops`, `gemm` and `attention`.
+`capabilities_rdna.py` validates the exact ISA and selects the `rdna3`, `rdna35`
+or `rdna4` providers at setup. The shared frontend is `frontends/torch/pi05_rdna.py`
+and its thin model binding is `models/pi05_rdna/pipeline.py`.
+The shared providers remain in `hardware/rdna35/`, with generation-specific
+bindings in `rdna3/` and `rdna4/`. Public hardware keys, extension
+`build_info()` labels and `FLASHRT_RDNA35_*` controls remain supported.
 The explicit portable torch provider runs the same model pipeline in CPU contract
 tests. It is a refactor regression tool, not an independent model oracle.
-Existing legacy RTX/Thor/CDNA production pipelines retain their routes; this
-change does not claim to migrate all legacy implementations.
+RTX, Thor and CDNA use their own production pipelines.
 
 Safetensors conversion and prompt embedding are shared by the CDNA and RDNA
 frontends through `flash_rt.frontends.torch.pi05_checkpoint`. Importing them
@@ -499,22 +647,44 @@ Required NPZ entries:
   `producer_revision`, `checkpoint_sha256`, `num_steps`, `action_dim`, and
   `action_horizon`.
 - `images`: uint8 `(num_views, 224, 224, 3)`, `prompt`: scalar string,
-  `state`: the exact state passed to prompt tokenization, and `noise`: float32
+  optional `state`: the exact state passed to prompt tokenization, and `noise`: float32
   `(action_horizon, 32)` used by both producers (BF16-representable values avoid
   different initial rounding).
 - `raw_actions`: float32 `(action_horizon, 32)` in normalized model space;
   `actions`: float32 `(action_horizon, action_dim)` after the independent
   reference's quantile unnormalization and explicit robot slicing.
 
+The official `pi05_libero` configuration uses `discrete_state_input=False`.
+Its fixtures omit `state` so FlashRT also uses a state-free prompt; the original
+robot state is retained separately as `observation_state`. Fixtures for a
+discrete-state prompt must include the exact tokenization state instead.
+
 Use an independent OpenPI run to generate these arrays; never export expected
 outputs from this pipeline or its fallback provider. Save arrays with
-`numpy.savez` and keep fixtures out of the source distribution. Run with:
+`numpy.savez` and keep fixtures out of the source distribution.
+
+Generate reference data in a separate, pinned OpenPI PyTorch environment
+using the official `pi05_libero` policy and the same checkpoint and inputs
+used by FlashRT. Follow
+[OpenPI's PyTorch setup](https://github.com/Physical-Intelligence/openpi#pytorch-support)
+for its dependencies and `transformers_replace` files. Reuse the resulting
+NPZ fixtures across RDNA targets; OpenPI is not required in the RDNA container.
+
+The validated fixture producer uses OpenPI revision
+`15a9616a00943ada6c20a0f158e3adb39df2ccac` with Transformers 4.53.2 and
+safetensors 0.7.0. Reference inference on RTX 5090 retains OpenPI's mixed
+BF16/FP32 parameter policy, disables compilation and TF32, and uses full
+FP32 matmul precision. The same eight fixtures pass on gfx1100, gfx1151
+and gfx1201 with the bounds above.
+
+`FLASH_RT_PI05_REFERENCE` accepts one NPZ file or a directory of NPZ fixtures.
+Run the numerical checks with:
 
 ```bash
 FLASH_RT_PI05_ACTION_DIM=7 \
-FLASH_RT_PI05_RDNA35_CKPT="<checkpoint-dir>" \
-FLASH_RT_PI05_REFERENCE="<openpi-fixture.npz>" \
-  python -m pytest tests/test_amd_rdna35_model.py -k independent_reference -q
+FLASH_RT_PI05_RDNA_CKPT="<checkpoint-dir>" \
+FLASH_RT_PI05_REFERENCE="<openpi-fixtures-dir>" \
+  python -m pytest tests/test_amd_rdna_model.py -k independent_reference -q
 ```
 
-No independent fixture was executed as part of this source-only restructuring.
+A skipped reference test does not establish parity with OpenPI.

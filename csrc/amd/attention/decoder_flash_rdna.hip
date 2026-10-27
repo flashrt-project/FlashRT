@@ -1,5 +1,5 @@
 // ================================================================
-// FlashRT AMD -- fused BF16 decoder GQA (RDNA 3.5, wave32)
+// FlashRT AMD -- fused BF16 decoder GQA (RDNA, wave32)
 // Portions of the split-key online-softmax variant are adapted from Comfy
 // Kitchen's Apache-2.0 HIP flash-decode implementation.
 //
@@ -207,7 +207,10 @@ __launch_bounds__(kAttentionThreads) void attention_decoder_gqa_rdna_kernel(
 
   __shared__ float query_lds[kAttentionDim];
   __shared__ float scores[kAttentionRowMaxKv];
-  __shared__ float wave_values[kAttentionMaxWaves];
+  // Block reductions broadcast without a trailing barrier. Keep their
+  // scratch separate so a faster wave cannot overwrite unread maxima.
+  __shared__ float wave_maxima[kAttentionMaxWaves];
+  __shared__ float wave_sums[kAttentionMaxWaves];
 
   query_lds[tid] = __bfloat162float(
       query[(static_cast<size_t>(query_row) * query_heads + head) *
@@ -258,7 +261,7 @@ __launch_bounds__(kAttentionThreads) void attention_decoder_gqa_rdna_kernel(
   for (int kv_row = tid; kv_row < kv_rows; kv_row += kAttentionThreads) {
     local_maximum = fmaxf(local_maximum, scores[kv_row]);
   }
-  const float maximum = rdna_block_reduce_max(local_maximum, wave_values);
+  const float maximum = rdna_block_reduce_max(local_maximum, wave_maxima);
 
   float local_sum = 0.0f;
   for (int kv_row = tid; kv_row < kv_rows; kv_row += kAttentionThreads) {
@@ -266,7 +269,7 @@ __launch_bounds__(kAttentionThreads) void attention_decoder_gqa_rdna_kernel(
     scores[kv_row] = probability;
     local_sum += probability;
   }
-  const float denominator = rdna_block_reduce_sum(local_sum, wave_values);
+  const float denominator = rdna_block_reduce_sum(local_sum, wave_sums);
   const float inverse_denominator = 1.0f / denominator;
 
   float acc0 = 0.0f;

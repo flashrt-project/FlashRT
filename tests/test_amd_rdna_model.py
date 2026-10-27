@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 _ARCH_TO_HARDWARE = {
+    "gfx1100": "amd_rdna3",
     "gfx1151": "amd_rdna35",
     "gfx1201": "amd_rdna4",
 }
@@ -19,7 +20,8 @@ _LIBERO_PROMPT = "pick up the black bowl and place it on the plate"
 
 
 def _checkpoint():
-    path = os.environ.get("FLASH_RT_PI05_RDNA35_CKPT")
+    path = (os.environ.get("FLASH_RT_PI05_RDNA_CKPT")
+            or os.environ.get("FLASH_RT_PI05_RDNA35_CKPT"))
     if not path:
         pytest.skip("set FLASH_RT_PI05_RDNA35_CKPT for the RDNA E2E test")
     if not os.path.isfile(os.path.join(path, "model.safetensors")):
@@ -34,7 +36,7 @@ def _visible_rdna_arch():
     arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
     base = arch.split(":", 1)[0]
     if base not in _ARCH_TO_HARDWARE:
-        pytest.skip("requires gfx1151 or gfx1201")
+        pytest.skip("requires gfx1100, gfx1151 or gfx1201")
     return base
 
 
@@ -60,11 +62,16 @@ def test_frontend_hardware_matches_visible_isa(model):
     assert model.pipeline.hardware == _ARCH_TO_HARDWARE[_visible_rdna_arch()]
 
 
-def test_rdna4_routes_decoder_projections_to_smallm(model):
-    if _visible_rdna_arch() != "gfx1201":
-        pytest.skip("decoder small-M routing is gfx1201-only")
+def test_smallm_weight_preparation_matches_the_rdna_target(model):
     frontend = model.pipeline
     gemm = frontend.pipeline.gemm
+    prepare_decoder = (
+        _visible_rdna_arch() in ("gfx1100", "gfx1201")
+        and frontend.chunk_size <= 16 and gemm.hip_smallm
+    )
+    action_weight = frontend.weights["decoder_action_out_proj_w"]
+    assert (gemm._prepared_weight_nt(action_weight) is not None) == gemm.hip_smallm
+    expected_count = int(gemm.hip_smallm)
     for name in (
         "decoder_attn_qkv_w",
         "decoder_attn_o_w",
@@ -73,8 +80,11 @@ def test_rdna4_routes_decoder_projections_to_smallm(model):
     ):
         stacked = frontend.weights[name]
         for index in range(stacked.shape[0]):
-            assert gemm._prepared_weight_nt(stacked[index]) is not None, (
+            assert (gemm._prepared_weight_nt(stacked[index]) is not None) == prepare_decoder, (
                 name, index)
+            expected_count += int(prepare_decoder)
+    # In particular, Halo must retain only its original action projection.
+    assert len(gemm._smallm_weights) == expected_count
 
 
 def test_actions_are_finite_and_match_checkpoint_profile(model):
@@ -406,37 +416,66 @@ def test_real_libero_frames_are_deterministic_and_match_aten_fallback(model):
             "pick up the object", state=np.zeros(8, dtype=np.float32))
 
 
-def test_independent_reference_fixture(model):
-    """Optional independent oracle; same-pipeline fallback tests are not an oracle."""
+def _reference_fixtures():
+    value = os.environ.get("FLASH_RT_PI05_REFERENCE")
+    if not value:
+        return [None]
+    path = pathlib.Path(value)
+    if not path.is_dir():
+        return [path]
+    fixtures = sorted(path.glob("*.npz"))
+    if not fixtures:
+        raise ValueError(f"no independent reference NPZ fixtures in {path}")
+    return fixtures
+
+
+@pytest.fixture(scope="module")
+def reference_checkpoint_sha256(model):
+    if not os.environ.get("FLASH_RT_PI05_REFERENCE"):
+        return None
     import hashlib
+    digest = hashlib.sha256()
+    with pathlib.Path(model.pipeline._checkpoint_path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+@pytest.mark.parametrize("reference_path", _reference_fixtures(),
+                         ids=lambda path: path.stem if path else "unavailable")
+def test_independent_reference_fixture(model, reference_path,
+                                       reference_checkpoint_sha256, record_property):
+    """Optional independent oracle; same-pipeline fallback tests are not an oracle."""
     import json
-    from pathlib import Path
-    fixture_path = os.environ.get('FLASH_RT_PI05_REFERENCE')
-    if not fixture_path:
+    if reference_path is None:
         pytest.skip('set FLASH_RT_PI05_REFERENCE to an independently generated NPZ fixture')
     frontend = model.pipeline
-    with np.load(fixture_path, allow_pickle=False) as fixture:
+    with np.load(reference_path, allow_pickle=False) as fixture:
         metadata = json.loads(str(fixture['metadata'].item()))
         assert metadata['producer'] == 'openpi', 'fixture must come from independent OpenPI'
         revision = metadata['producer_revision']
         assert len(revision) == 40 and all(c in '0123456789abcdef' for c in revision)
-        digest = hashlib.sha256()
-        with Path(frontend._checkpoint_path).open('rb') as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b''):
-                digest.update(chunk)
-        assert metadata['checkpoint_sha256'] == digest.hexdigest()
+        assert metadata['checkpoint_sha256'] == reference_checkpoint_sha256
         assert metadata['num_steps'] == frontend.num_steps
         assert metadata['action_dim'] == frontend.action_dim
         assert metadata['action_horizon'] == frontend.chunk_size
         prompt = str(fixture['prompt'].item())
-        frontend.set_prompt(prompt, state=fixture['state'])
+        # Official pi05_libero omits state from the prompt. Older fixtures may
+        # provide the exact state used for discrete-state tokenization.
+        state = fixture['state'] if 'state' in fixture else None
+        assert metadata.get('discrete_state_input', state is not None) == (state is not None)
+        frontend.set_prompt(prompt, state=state)
         result = frontend.infer({'images': list(fixture['images'])}, debug=True, noise=fixture['noise'])
         for key in ('raw_actions', 'actions'):
             actual, expected = result[key], fixture[key]
             assert actual.shape == expected.shape
             assert np.isfinite(actual).all() and np.isfinite(expected).all()
-            # BF16 end-to-end acceptance bounds; do not loosen them based on a failing run.
-            np.testing.assert_allclose(actual, expected, atol=.1, rtol=.03)
             x, y = actual.astype(np.float64).ravel(), expected.astype(np.float64).ravel()
             denom = np.linalg.norm(x) * np.linalg.norm(y)
-            assert denom > 0 and np.dot(x, y) / denom >= .999
+            assert denom > 0
+            cosine = float(np.dot(x, y) / denom)
+            record_property(f'{key}_cosine', cosine)
+            record_property(f'{key}_max_abs_error', float(np.max(np.abs(x - y))))
+            # BF16 end-to-end acceptance bounds; do not loosen them based on a failing run.
+            np.testing.assert_allclose(actual, expected, atol=.1, rtol=.03)
+            assert cosine >= .999

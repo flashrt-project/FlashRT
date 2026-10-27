@@ -10,7 +10,7 @@ from flash_rt.models.pi05.torch_pipeline import (
 from flash_rt.amd.hardware.rdna35.ops import Rdna35TensorOps
 
 
-class Pi05PipelineRdna35(Pi05TorchPipeline):
+class Pi05PipelineRdna(Pi05TorchPipeline):
     def __init__(
         self, weights, kernels, gemm, attn, *, num_views=3,
         max_prompt_len=200, chunk_size=10, num_steps=10,

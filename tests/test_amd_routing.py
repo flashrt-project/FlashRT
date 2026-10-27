@@ -134,7 +134,7 @@ def test_detect_arch_maps_gfx942_to_amd_cdna3(monkeypatch, gcn):
 
 @pytest.mark.parametrize("gcn", [
     "gfx90a",                   # MI200
-    "gfx1100",                  # RDNA3
+    "gfx11000",                 # RDNA3 prefix trap
     "gfx9500",                  # prefix trap: startswith() would wrongly pass
 ])
 def test_detect_arch_refuses_unregistered_rocm(monkeypatch, gcn):

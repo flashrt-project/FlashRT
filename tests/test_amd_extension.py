@@ -63,7 +63,7 @@ def test_build_info_gpu_arch_is_supported_when_stamped():
     if "gpu_arch" not in info:
         pytest.skip("build lacks the FLASHRT_AMD_GPU_ARCH stamp")
     arch = str(info["gpu_arch"]).split(":", 1)[0]
-    assert arch in {"gfx942", "gfx950", "gfx1151", "gfx1201"}, (
+    assert arch in {"gfx942", "gfx950", "gfx1100", "gfx1151", "gfx1201"}, (
         f"AMD module built for unsupported architecture {info['gpu_arch']!r}")
     if arch == "gfx942":
         assert info["hardware"] == "amd_cdna3"

@@ -1,6 +1,6 @@
 """BF16 Pi0.5 torch frontend for AMD RDNA wave32 targets.
 
-Supports gfx1151 (``amd_rdna35``) and gfx1201 (``amd_rdna4`` / R9700). The
+Supports gfx1100, gfx1151 and gfx1201 through explicit RDNA targets. The
 backend loads the RDNA extension once, then passes it directly to the
 pipeline, attention provider, and instance-local hipBLASLt BF16 runner. ATen
 and SDPA remain available as correctness fallbacks.
@@ -24,40 +24,25 @@ from flash_rt.frontends.torch.pi05_checkpoint import (
     _embed_prompt,
     convert_pi05_safetensors,
 )
-from flash_rt.amd.hardware.rdna35 import (
-    Rdna35AttentionBackend,
-    Rdna35GemmBackend,
+from flash_rt.amd.hardware.capabilities_rdna import (
+    SUPPORTED_HARDWARE,
+    load_capabilities,
 )
-from flash_rt.amd.models.pi05_rdna35.pipeline import (
+from flash_rt.amd.models.pi05_rdna.pipeline import (
     DEC_D,
     ENC_D,
-    Pi05PipelineRdna35,
+    Pi05PipelineRdna,
 )
 from flash_rt.core.utils.actions import unnormalize_actions
 from flash_rt.core.utils.norm_stats import load_norm_stats, pi05_candidates
 
-# Public hardware key → exact ISA base target required at load time.
-_RDNA_HARDWARE_ARCH = {
-    "amd_rdna35": "gfx1151",
-    "amd_rdna4": "gfx1201",
-}
-
-# Per-layer decoder projections routed to small-M WMMA on gfx1201.
-_RDNA4_SMALLM_DECODER_WEIGHTS = (
+# Per-layer decoder projections for targets that enable streamed small-M.
+_SMALLM_DECODER_WEIGHTS = (
     "decoder_attn_qkv_w",
     "decoder_attn_o_w",
     "decoder_ffn_gate_up_w",
     "decoder_ffn_down_w",
 )
-
-
-def _public_rdna_hardware(expected_arch: str) -> str:
-    """Return the public hardware key for an ISA this frontend already accepted."""
-    for key, arch in _RDNA_HARDWARE_ARCH.items():
-        if arch == expected_arch:
-            return key
-    raise RuntimeError(
-        f"no public RDNA hardware key for architecture {expected_arch!r}")
 
 
 def _build_time_embeddings(num_steps: int) -> torch.Tensor:
@@ -87,8 +72,8 @@ def _build_time_embeddings(num_steps: int) -> torch.Tensor:
     return torch.stack(rows)
 
 
-class Pi05TorchFrontendAmdRdna35:
-    """Correctness-first Pi0.5 frontend for AMD RDNA wave32 (3.5 / 4)."""
+class Pi05TorchFrontendAmdRdna:
+    """Correctness-first Pi0.5 frontend for AMD RDNA wave32 (3 / 3.5 / 4)."""
 
     _VIEW_KEYS = ("image", "wrist_image", "wrist_image_right")
 
@@ -104,10 +89,10 @@ class Pi05TorchFrontendAmdRdna35:
         hardware: Optional[str] = None,
         action_dim: Optional[int] = None,
     ):
-        if hardware is not None and hardware not in _RDNA_HARDWARE_ARCH:
+        if hardware is not None and hardware not in SUPPORTED_HARDWARE:
             raise ValueError(
-                "Pi05TorchFrontendAmdRdna35 requires hardware in "
-                f"{sorted(_RDNA_HARDWARE_ARCH)}, got {hardware!r}")
+                f"unsupported RDNA hardware {hardware!r}; "
+                f"expected one of {SUPPORTED_HARDWARE} or None for auto-detection")
         if use_fp8:
             raise ValueError(
                 "AMD RDNA Pi0.5 backends currently support BF16 only")
@@ -116,36 +101,9 @@ class Pi05TorchFrontendAmdRdna35:
                 "AMD RDNA Pi0.5 requires a ROCm build of PyTorch")
         device_arch = str(
             getattr(torch.cuda.get_device_properties(0), "gcnArchName", "unknown"))
-        device_base = device_arch.split(":", 1)[0]
-        if hardware is None:
-            if device_base not in _RDNA_HARDWARE_ARCH.values():
-                raise RuntimeError(
-                    "Pi05TorchFrontendAmdRdna35 requires gfx1151 or gfx1201; "
-                    f"running device architecture is {device_arch!r}")
-            expected_arch = device_base
-        else:
-            expected_arch = _RDNA_HARDWARE_ARCH[hardware]
-            if device_base != expected_arch:
-                raise RuntimeError(
-                    f"hardware={hardware!r} requires {expected_arch}; "
-                    f"running device architecture is {device_arch!r}")
-
         from flash_rt.amd import flash_rt_amd_kernels as fvk
 
-        build_info = dict(fvk.build_info())
-        build_arch = str(build_info.get("gpu_arch", "")).split(":", 1)[0]
-        extension_device_arch = str(fvk.device_arch()).split(":", 1)[0]
-        if (
-            build_info.get("backend") != "rdna35"
-            or build_info.get("wave_size") != 32
-        ):
-            raise RuntimeError(
-                "flash_rt_amd_kernels was not built with the RDNA source set")
-        if build_arch != expected_arch or extension_device_arch != expected_arch:
-            raise RuntimeError(
-                "RDNA HIP kernels require a matching build and device: "
-                f"expected={expected_arch!r} build={build_arch!r} "
-                f"device={extension_device_arch!r}")
+        caps = load_capabilities(fvk, device_arch, hardware)
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         checkpoint = checkpoint_dir / "model.safetensors"
         if not checkpoint.is_file():
@@ -181,7 +139,7 @@ class Pi05TorchFrontendAmdRdna35:
         if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size < 1:
             raise ValueError(f"chunk_size must be positive, got {chunk_size}")
 
-        self.hardware = _public_rdna_hardware(expected_arch)
+        self.hardware = caps.hardware
         self.num_views = int(num_views)
         self.num_steps = int(num_steps)
         self.max_prompt_len = int(max_prompt_len)
@@ -232,21 +190,20 @@ class Pi05TorchFrontendAmdRdna35:
         }
         del cpu_weights
 
-        gemm = Rdna35GemmBackend(fvk, self.dtype)
+        gemm, attention = caps.make_backends(fvk, self.dtype)
         gemm.prepare_smallm_weight(
             self.weights["decoder_action_out_proj_w"])
-        if expected_arch == "gfx1201" and self.chunk_size <= 16:
-            # On R9700 the streamed small-M kernel beats hipBLASLt on these
-            # weight-bandwidth-bound projections. The transposed copies add
-            # about 0.6 GB.
-            for name in _RDNA4_SMALLM_DECODER_WEIGHTS:
+        if self.chunk_size <= caps.streamed_smallm_max_rows:
+            # Prepare persistent transposes for streamed decoder projections
+            # before graph capture.
+            for name in _SMALLM_DECODER_WEIGHTS:
                 for layer_weight in self.weights[name]:
                     gemm.prepare_smallm_weight(layer_weight)
-        self.pipeline = Pi05PipelineRdna35(
+        self.pipeline = Pi05PipelineRdna(
             self.weights,
             fvk,
             gemm,
-            Rdna35AttentionBackend(fvk),
+            attention,
             num_views=self.num_views,
             max_prompt_len=self.max_prompt_len,
             chunk_size=self.chunk_size,
