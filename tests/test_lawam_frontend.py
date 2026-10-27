@@ -204,3 +204,22 @@ def test_qkv_rope_split_matches_flashrt_qkv_split():
                              cos.data_ptr(), sin.data_ptr(), *[t.data_ptr() for t in out], False, S, H, H, 64, 0) == 0
     for r, o in zip(ref, out):
         torch.testing.assert_close(o, r, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("M,N,K", [(219, 2048, 6144), (219, 12288, 2048)])
+def test_cutlass_f16acc_streamk_tile_matches_fp32_reference(M, N, K):
+    # stream-K partial tiles meet in a fixed order: FP16 sums, reproducible run to run
+    lk = _lawam()
+    torch.manual_seed(0)
+    a = torch.randn(M, K, device="cuda").half()
+    w = (torch.randn(K, N, device="cuda") / K ** 0.5).half()
+    out, again = torch.empty(M, N, device="cuda").half(), torch.empty(M, N, device="cuda").half()
+    assert lk.gemm_f16acc_act_cfg(a.data_ptr(), w.data_ptr(), out.data_ptr(), 0, M, N, K, 0, 8, 1, 0) == 0
+    assert lk.gemm_f16acc_act_cfg(a.data_ptr(), w.data_ptr(), again.data_ptr(), 0, M, N, K, 0, 8, 1, 0) == 0
+    ref = a.float() @ w.float()
+    dp = torch.empty(M, N, device="cuda").half()   # data-parallel FP16-accumulate tile for scale
+    assert lk.gemm_f16acc_act_cfg(a.data_ptr(), w.data_ptr(), dp.data_ptr(), 0, M, N, K, 0, 0, 1, 0) == 0
+    err = ((out.float() - ref).norm() / ref.norm()).item()
+    err_dp = ((dp.float() - ref).norm() / ref.norm()).item()
+    assert err <= 1.05 * err_dp   # shorter FP16 accumulation chains than the data-parallel tile
+    torch.testing.assert_close(again, out, rtol=0, atol=0)
