@@ -64,6 +64,11 @@ DIT_W8A16_CFG = {
 }
 
 
+# Key slices (CTAs per head and query tile) of the cross-attention over the
+# 512 image tokens (lawam.dit_cross_attention); 0 runs FA2's small-query tile.
+DIT_IMG_KV_SLICES = 4
+
+
 def _ck(rc, what):
     if rc:
         raise RuntimeError(f"LaWAM {what} failed (status {rc})")
@@ -463,6 +468,7 @@ class LawamTorchFrontendRtx:
         W["mode"] = self.precision["dit"]
         W["ffn_mode"] = self.precision.get("dit_ffn")
         W["w8_cfg"] = dict(DIT_W8A16_CFG)
+        W["img_slices"] = DIT_IMG_KV_SLICES
         self.dit_w = W
         # step-invariant conditioning precompute inputs
         self._t_lin1_w = g(F + "DiT.timestep_encoder.timestep_embedder.linear_1.weight").double()
@@ -650,7 +656,10 @@ class LawamTorchFrontendRtx:
                     "hmod": b(rows, 1024, dtype=_BF16), "ae": b(rows, 1024, dtype=_BF16),
                     "x": b(rows, 32, dtype=_F32), "q_bf16": b(rows, 1024, dtype=_BF16),
                     "xb": b(rows, 1024, dtype=_BF16), "hb": b(rows, 4096, dtype=_BF16),
-                    "lse": b(1, 16, 128, dtype=_F32), "kv_text": B["flow"]["kv_text"], "kv_img": B["flow"]["kv_img"]}
+                    "lse": b(1, 16, 128, dtype=_F32), "kv_text": B["flow"]["kv_text"], "kv_img": B["flow"]["kv_img"],
+                    "xattn_state": b(self.lk.dit_cross_attention_state_floats(rows, 16, max(1, self.dit_w["img_slices"])),
+                                     dtype=_F32),
+                    "xattn_cnt": b(16 * ((rows + 15) // 16), dtype=torch.int32, zero=True)}
         B["actions"] = b(rows, self.action_dim, dtype=_F32)
         self.seed = torch.zeros(1, dtype=torch.int64, device=self.device)
         self._prompt_keep.append(self.seed)

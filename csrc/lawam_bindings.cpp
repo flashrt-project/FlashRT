@@ -302,4 +302,22 @@ PYBIND11_MODULE(flash_rt_lawam, m) {
         py::arg("A"), py::arg("Bg"), py::arg("Bu"), py::arg("ldb"), py::arg("Dg"), py::arg("Du"), py::arg("ldd"),
         py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"), py::arg("tile"), py::arg("split") = 1,
         py::arg("stream") = 0, "gemm_f16acc_swiglu with a fixed tile configuration.");
+
+    m.def("dit_cross_attention_state_floats", &L::dit_cross_attention_state_floats, py::arg("rows"),
+          py::arg("heads"), py::arg("kv_slices"));
+    m.def("dit_cross_attention",
+        [](uintptr_t partials, int splits, uintptr_t a_gs, uintptr_t w_gs, uintptr_t bias, uintptr_t k, uintptr_t v,
+           int kv_ld, int kv_seq, int kv_slices, uintptr_t out, int rows, int heads, int hd, float scale,
+           uintptr_t state, uintptr_t counters, bool pdl, uintptr_t stream) {
+            return L::dit_cross_attention(ptr<const float>(partials), splits, ptr<const float>(a_gs),
+                                          ptr<const float>(w_gs), ptr<const __nv_bfloat16>(bias),
+                                          ptr<const __nv_bfloat16>(k), ptr<const __nv_bfloat16>(v), kv_ld, kv_seq,
+                                          kv_slices, ptr<__nv_bfloat16>(out), rows, heads, hd, scale,
+                                          ptr<float>(state), ptr<unsigned>(counters), pdl, to_stream(stream));
+        },
+        py::arg("partials"), py::arg("splits"), py::arg("a_gs"), py::arg("w_gs"), py::arg("bias"), py::arg("k"),
+        py::arg("v"), py::arg("kv_ld"), py::arg("kv_seq"), py::arg("kv_slices"), py::arg("out"), py::arg("rows"),
+        py::arg("heads"), py::arg("hd"), py::arg("scale"), py::arg("state"), py::arg("counters"),
+        py::arg("pdl") = true, py::arg("stream") = 0,
+        "Action-row cross-attention over a long static K / V, Q from skinny-GEMM partials, keys split over CTAs.");
 }

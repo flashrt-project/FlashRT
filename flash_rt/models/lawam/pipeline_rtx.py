@@ -514,9 +514,16 @@ def dit_step_forward(fvk, lk, fa2, B, W, T, dims, *, step, stream=0, pdl=True, c
                 _ck(fvk.nvfp4_skinny_partials_attention(part, sp, one, site["gs"], site["b"], D, kv, kv + D * 2,
                                                         KV_LD, S_text, True, O, rows, HEADS_DIT, HD_DIT,
                                                         HD_DIT ** -0.5, pdl, st), "cross attention")
-            else:
+            elif W.get("img_slices"):
                 # 512 image keys exceed the partials-attention shared-memory
-                # budget: BF16 Q, then the small-query FA2 tile kernel
+                # budget: key slices over CTAs (merged by the last), Q read
+                # from the partials like the partials attention
+                kv = B["kv_img"] + g * 2 * D * 2
+                _ck(lk.dit_cross_attention(part, sp, one, site["gs"], site["b"], kv, kv + D * 2, KV_LD, 512,
+                                           W["img_slices"], O, rows, HEADS_DIT, HD_DIT, HD_DIT ** -0.5,
+                                           B["xattn_state"], B["xattn_cnt"], pdl, st), "image cross attention")
+            else:
+                # or a BF16 Q store, then the small-query FA2 tile kernel
                 kv = B["kv_img"] + g * 2 * D * 2
                 _ck(lk.dit_sum_bias_bf16(part, sp, one, site["gs"], site["b"], B["q_bf16"], rows, D, pdl, st),
                     "cross q store")

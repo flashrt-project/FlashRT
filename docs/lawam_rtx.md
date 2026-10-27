@@ -57,7 +57,7 @@ One CUDA graph per prompt holds the whole policy step:
 | DINOv3 ViT-B/16 (11 layers used), concurrent graph branch | `lawam.gemm_f16acc_act`, FA2 | FP16, FP16 accumulation |
 | LAM decoder (12 AdaLN blocks) | `lawam.gemm_f16acc_act`, `lawam.gated_residual_norm`, `lawam.gemv_i8w` (modulation) | FP16, FP16 accumulation; INT8 weight-only GEMV |
 | flow conditioning (enc_vlm, cross K/V of 8 blocks) | `lawam.gemm_f16acc_act`, BF16 GEMMs | FP16 / BF16 |
-| flow DiT x 10 (16 blocks) | `lawam.w8a16_skinny_gemm`, `nvfp4_skinny_partials_attention`, `lawam.dit_*` consumers, FA2 small-query tile for the 512 image keys | INT8 weight-only, BF16 activations |
+| flow DiT x 10 (16 blocks) | `lawam.w8a16_skinny_gemm`, `nvfp4_skinny_partials_attention` (self / text), `lawam.dit_cross_attention` (512 image keys split over 4 CTAs per head), `lawam.dit_*` consumers | INT8 weight-only, BF16 activations |
 | Euler update, unnormalization | `lawam.dit_sum_bias_euler`, `lawam.unnormalize_actions` | FP32 |
 
 Exact rewrites of the reference: tokens past the effective horizon never

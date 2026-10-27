@@ -177,5 +177,17 @@ int gemm_f16acc_split(int M, int N, int K, bool bias, bool gelu);
 int gemm_f16acc_act_cfg(const __half* A, const __half* B, __half* D, const __half* bias, int M, int N, int K, int act,
                         int tile, int split, cudaStream_t stream);
 
+// Cross-attention of the DiT action rows over a long static K / V
+// (lawam_dit_cross_attention_sm120.cu): Q = alpha * sum of the q-projection's
+// K-split partials [splits][rows][heads * hd] + bias, K / V [kv_seq] rows of
+// leading dim kv_ld (BF16), keys split over kv_slices CTAs per (head, 16-row
+// tile) and merged by the last one. state: dit_cross_attention_state_floats
+// FP32, counters: heads * ceil(rows / 16) zeroed words (left zeroed). hd 64.
+size_t dit_cross_attention_state_floats(int rows, int heads, int kv_slices);
+int dit_cross_attention(const float* partials, int splits, const float* a_gs, const float* w_gs,
+                        const __nv_bfloat16* bias, const __nv_bfloat16* k_ext, const __nv_bfloat16* v_ext, int kv_ld,
+                        int kv_seq, int kv_slices, __nv_bfloat16* out, int rows, int heads, int hd, float scale,
+                        float* state, unsigned* counters, bool pdl, cudaStream_t stream);
+
 }  // namespace lawam
 }  // namespace flash_rt

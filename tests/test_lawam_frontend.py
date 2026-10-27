@@ -122,3 +122,27 @@ def test_cutlass_swiglu_dual_gemm_matches_gateup_and_silu_mul():
                                  sums.data_ptr() + 2 * FF, 2 * FF, out.data_ptr(), M, FF, K, split, 0) == 0
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
     torch.testing.assert_close(sums, gu, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("slices", [2, 4])
+def test_dit_cross_attention_matches_softmax_attention(slices):
+    lk = _lawam()
+    torch.manual_seed(0)
+    rows, heads, hd, keys, splits, ld = 24, 16, 64, 512, 4, 8192
+    d = heads * hd
+    part = torch.randn(splits, rows, d, device="cuda") * 0.5
+    bias = (torch.randn(d, device="cuda") * 0.1).bfloat16()
+    one = torch.ones(1, device="cuda")
+    kv = torch.randn(keys, ld, device="cuda").bfloat16()
+    k, v = kv[:, :d], kv[:, d:2 * d]
+    out = torch.empty(rows, d, dtype=torch.bfloat16, device="cuda")
+    state = torch.empty(lk.dit_cross_attention_state_floats(rows, heads, slices), device="cuda")
+    counters = torch.zeros(heads * 2, dtype=torch.int32, device="cuda")
+    assert lk.dit_cross_attention(part.data_ptr(), splits, one.data_ptr(), one.data_ptr(), bias.data_ptr(),
+                                  k.data_ptr(), v.data_ptr(), ld, keys, slices, out.data_ptr(), rows, heads, hd,
+                                  hd ** -0.5, state.data_ptr(), counters.data_ptr(), False, 0) == 0
+    q = (part.sum(0) + bias.float()).view(rows, heads, hd).transpose(0, 1)
+    att = torch.softmax(q @ k.float().view(keys, heads, hd).permute(1, 2, 0) * hd ** -0.5, -1)
+    ref = (att @ v.float().view(keys, heads, hd).transpose(0, 1)).transpose(0, 1).reshape(rows, d)
+    torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=1e-2)
+    assert int(counters.abs().sum()) == 0
