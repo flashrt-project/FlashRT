@@ -24,6 +24,7 @@ EXTENSIONS = {
     "flash_rt_kernels": "core kernels — every native frontend needs these",
     "flash_rt_fa2": "FlashAttention-2, the RTX attention path",
     "flash_rt_qwen3_vl_kernels": "Qwen3-VL SM89 FP8 kernels",
+    "flash_rt_groot_n15": "GR00T N1.5 RTX SM89 kernels",
 }
 
 #: model family → the CMake switch that builds its kernels and nothing
@@ -31,6 +32,7 @@ EXTENSIONS = {
 BUILD_SWITCHES = {
     "xvla": "FLASHRT_BUILD_XVLA",
     "dm05": "FLASHRT_ENABLE_DM05",
+    "groot_n15": "FLASHRT_ENABLE_GROOT_N15",
     "lingbot": "FLASHRT_ENABLE_LINGBOT",
     "motus": "FLASHRT_ENABLE_MOTUS",
     "qwen3_5_moe": "FLASHRT_ENABLE_QWEN35MOE",

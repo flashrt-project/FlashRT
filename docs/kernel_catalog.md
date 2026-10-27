@@ -296,6 +296,21 @@ sources or bindings.
 | DaViT tower | `xvla_vision_resize`, `xvla_vision_im2col`, `xvla_vision_add_bias`, `xvla_vision_dwconv3x3_res`, `xvla_vision_window_attn`, `xvla_vision_window_qkv_pad[_fill]`, `xvla_vision_window_out_unpad_to_nvfp4`, `xvla_vision_channel_attn`, `xvla_vision_gelu_erf_to_nvfp4`, `xvla_vision_projector_pack` | Florence-2 DaViT-L tower at the four static stage shapes |
 | FA2 tile set | `fa2.fwd_bf16_tile64m32w2[_qnvfp4]` (`<64,32,64,2>`) and the internal `<64,64,64,4>` / `<64,32,64,4>` entries | Additive head_dim-64 instantiations of the vendored FA2 templates; see `csrc/attention/flash_attn_2_src/VENDOR.md` |
 
+## 14. GR00T N1.5 (`flash_rt_groot_n15`, `-DFLASHRT_ENABLE_GROOT_N15=ON`, `GPU_ARCH=89`)
+
+A separate module for GR00T N1.5 on RTX 4090; nothing builds into
+`flash_rt_kernels`. The forward also uses the shared `patch_im2col_nchw_bf16`,
+`embedding_lookup_bf16`, `bf16_matmul_cublaslt_ref_bf16`, the `*_hf_bf16`
+Qwen3 kernels, `GemmRunner.fp8_nt_dev` and `flash_rt_fa2`. See
+`docs/groot_n15_rtx_sm89.md`.
+
+| Group | Symbols | What it is |
+|---|---|---|
+| Torch-algorithm GEMMs | `groot_n15_linear_bias_bf16`, `groot_n15_bmm_bf16` | `x @ W^T + b` on the cuBLASLt bias-epilogue algorithm torch's addmm runs; `x @ W` on the strided-batched cuBLAS call torch.bmm makes for one batch -- both bitwise equal to PyTorch 2.5 (the release the reference pins) |
+| Norms | `groot_n15_layer_norm_bf16`, `groot_n15_layer_norm_to_f32`, `groot_n15_residual_layer_norm_f32`, `groot_n15_residual_add_f32_to_bf16`, `groot_n15_ada_layer_norm_bf16` | Residual add + LayerNorm on bf16 or fp32 residual streams, AdaLayerNorm with bf16 `(1 + scale)` / `shift` tables, rounded where the bf16-autocast reference rounds; dim <= 2048 |
+| Elementwise | `groot_n15_add_rows_bf16`, `groot_n15_bias_act_bf16`, `groot_n15_concat_bias_bf16`, `groot_n15_gelu_tanh_bf16`, `groot_n15_actions_init`, `groot_n15_euler_step` | Bias / position add, bias + ReLU / swish, action-encoder concat, GELU (tanh), flow-matching state |
+| FP8 tier | `groot_n15_quant_rows_fp8`, `groot_n15_rescale_rows_bf16` | Per-token E4M3 activation quantization; token x channel dequantization + bias after a unit-scale FP8 GEMM |
+
 ## Re-use decision tree
 
 When evaluating FlashRT for a new model, walk this checklist:

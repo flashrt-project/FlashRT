@@ -286,6 +286,14 @@ option(FLASHRT_ENABLE_OMNIVOICE
 # build with -DFLASHRT_ENABLE_DM05=ON.
 option(FLASHRT_ENABLE_DM05
        "Build DM05 RTX SM120 fused kernels in flash_rt_dm05" OFF)
+# GR00T N1.5 (Eagle2.5 + flow-matching DiT) on RTX SM89 — builds
+# flash_rt_groot_n15.so with the projections, norms and elementwise ops the
+# shared modules do not provide (torch-algorithm BF16 GEMMs, autocast-faithful
+# LayerNorm/AdaLayerNorm variants, embodiment-MLP activations, Euler update).
+# Opt-in, and separate from the default flash_rt_kernels target. Enable on an
+# Ada (sm_89) build with -DFLASHRT_ENABLE_GROOT_N15=ON.
+option(FLASHRT_ENABLE_GROOT_N15
+       "Build GR00T N1.5 RTX SM89 kernels in flash_rt_groot_n15" OFF)
 # Shared delayed-codebook helper used by discrete-audio paths. Kept behind an
 # explicit option so deployment builds that do not serve audio can remove the
 # TU and its binding in lockstep.
@@ -1454,6 +1462,40 @@ if(FLASHRT_ENABLE_DM05)
   message(STATUS "DM05 SM120 kernels: ENABLED")
 else()
   message(STATUS "DM05 SM120 kernels: DISABLED")
+endif()
+
+# ── GR00T N1.5 kernels (standalone module, independent of flash_rt_kernels) ──
+if(FLASHRT_ENABLE_GROOT_N15)
+  if(NOT GPU_ARCH STREQUAL "89")
+    message(FATAL_ERROR
+      "FLASHRT_ENABLE_GROOT_N15 requires GPU_ARCH=89 (Ada / sm_89); "
+      "got '${GPU_ARCH}'.")
+  endif()
+  pybind11_add_module(flash_rt_groot_n15
+    csrc/groot_n15_bindings.cpp
+    csrc/kernels/groot_n15/groot_n15_gemm.cu
+    csrc/kernels/groot_n15/groot_n15_ops.cu)
+  set_target_properties(flash_rt_groot_n15 PROPERTIES
+    CUDA_STANDARD 17
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+  target_include_directories(flash_rt_groot_n15 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels)
+  # No --use_fast_math: the ops reproduce the reference's roundings and spell
+  # each one out with an _rn intrinsic.
+  target_compile_options(flash_rt_groot_n15 PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3
+      -U__CUDA_NO_BFLOAT16_OPERATORS__
+      -U__CUDA_NO_BFLOAT162_OPERATORS__
+      ${GPU_GENCODE}
+    >)
+  target_link_libraries(flash_rt_groot_n15 PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt)
+  install(TARGETS flash_rt_groot_n15 LIBRARY DESTINATION flash_rt)
+  message(STATUS "GR00T N1.5 SM89 kernels: ENABLED")
+else()
+  message(STATUS "GR00T N1.5 SM89 kernels: DISABLED")
 endif()
 
 # ── MiniMax-Remover fused kernels (standalone module, independent
