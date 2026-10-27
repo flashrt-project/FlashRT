@@ -24,7 +24,9 @@
 // weights. E2M1 x UE4M3 and INT8 are exact in FP16; the MMAs accumulate in
 // FP16 over one 256 (NVFP4) / 128 (INT8)-wide k unit, with exact power-of-two
 // prescales keeping the sums in range, and in FP32 across units. The FP16 A
-// operand of the CTA's k range is resident in shared memory (cp.async).
+// operand of the CTA's k range is resident in shared memory: cp.async copies
+// arriving on one mbarrier per 256-column chunk, so the MMAs start on the
+// first chunk.
 // Epilogues apply the weight scale, bias, residual, activation, Q pre-scaling
 // or the Euler update with the rounding points of the per-kernel chain, and
 // write the per-row (sum, sum of squares) of a residual update for the next
@@ -62,7 +64,8 @@ constexpr int kABytes = kRows * kALd * 2;         // 50688: A operand, then spli
 constexpr int kMaxSites = 72;
 constexpr int kOpVecs = sizeof(DitOp) / 16;   // 16-byte pieces of an op descriptor
 constexpr int kRowPartOff = 8192;   // floats into the A region: per-tile row statistics (after the split partials)
-constexpr int kSmem = kSlots * kUnit + kABytes + 256 + 2 * kSlots * 8 + kMaxSites * 16 + 2 * static_cast<int>(sizeof(DitOp));
+constexpr int kSmem = kSlots * kUnit + kABytes + 256 + 2 * kSlots * 8 + (kKMax / kChunk) * 8 + kMaxSites * 16 +
+                      2 * static_cast<int>(sizeof(DitOp));
 static_assert(kSmem + 1024 <= 101376, "dynamic shared memory budget (sm_120: 99 KB per block)");
 
 enum OpKind { OP_GEMM = 0, OP_ATTN = 1, OP_AE = 2, OP_KVT = 3, OP_UNNORM = 4, OP_LN = 5 };
@@ -187,7 +190,8 @@ __device__ __forceinline__ uint4 ldcg16(const void* p) { return __ldcg(reinterpr
 constexpr int kOffA = kSlots * kUnit;
 constexpr int kOffStats = kOffA + kABytes;
 constexpr int kOffBars = kOffStats + 256;
-constexpr int kOffSites = kOffBars + 2 * kSlots * 8;
+constexpr int kAChunks = kKMax / kChunk;   // A operand chunks, each landing on its own mbarrier
+constexpr int kOffSites = kOffBars + 2 * kSlots * 8 + kAChunks * 8;
 constexpr int kOffOps = kOffSites + kMaxSites * 16;
 extern __shared__ __align__(128) unsigned char g_dyn[];
 
@@ -198,6 +202,7 @@ struct Smem {
     __device__ __forceinline__ float* stats() const { return reinterpret_cast<float*>(g_dyn + kOffStats); }
     __device__ __forceinline__ uint64_t* full() const { return reinterpret_cast<uint64_t*>(g_dyn + kOffBars); }
     __device__ __forceinline__ uint64_t* empty() const { return full() + kSlots; }
+    __device__ __forceinline__ uint64_t* achunk() const { return full() + 2 * kSlots; }
     __device__ __forceinline__ int4* sites() const { return reinterpret_cast<int4*>(g_dyn + kOffSites); }
     __device__ __forceinline__ DitOp* opbuf() const { return reinterpret_cast<DitOp*>(g_dyn + kOffOps); }
 };
@@ -246,16 +251,27 @@ __device__ __forceinline__ void cp_async16(void* dst, const void* src) {
 }
 __device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_all;\n" ::: "memory"); }
 
-// A = FP16 buffer [24, K] columns [col0, col0 + kc) into the resident operand (cp.async).
+// A = FP16 buffer [24, K] columns [col0, col0 + kc) into the resident operand (cp.async; the
+// weight ring owns the bulk-copy engine): every consumer thread's copies of a 256-column chunk
+// arrive on the chunk's mbarrier, so the MMAs of a chunk start as soon as it lands (wait_chunk).
 __device__ __forceinline__ void stage_buf(const DitOp& op, const Smem& sm, int col0, int kc) {
     const int K = op.i[DIT_I_K];
     const __half* src = reinterpret_cast<const __half*>(op.p[DIT_P_ABUF]);
-    const int segs = kc / 8, total = kRows * segs;
+    constexpr int segs = kChunk / 8, total = kRows * segs;
+    const int nch = kc / kChunk;
 #pragma unroll 1
-    for (int seg = threadIdx.x; seg < total; seg += kConsumers)
-        cp_async16(sm.abuf() + (seg / segs) * kALd + (seg % segs) * 8, src + (seg / segs) * K + col0 + (seg % segs) * 8);
-    cp_async_wait_all();
+    for (int c = 0; c < nch; ++c) {
+#pragma unroll 1
+        for (int seg = threadIdx.x; seg < total; seg += kConsumers) {
+            const int r = seg / segs, o = c * kChunk + (seg % segs) * 8;
+            cp_async16(sm.abuf() + r * kALd + o, src + r * K + col0 + o);
+        }
+        asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" ::"r"(smem_u32(&sm.achunk()[c]))
+                     : "memory");
+    }
 }
+
+__device__ __forceinline__ void wait_chunk(const Smem& sm, int c, unsigned parity) { mbar_wait(&sm.achunk()[c], parity); }
 
 // Epilogue operands of one lane (issued before the MMA loop): weight scale,
 // bias and residual / flow state of its 12 outputs.
@@ -493,7 +509,7 @@ __device__ __forceinline__ void warp_run(int U, int w, int& start, int& cnt) {
     start = w * q + min(w, a);
 }
 
-__device__ void gemm_phase(const DitOp& op, const Smem& sm, unsigned& ucount) {
+__device__ void gemm_phase(const DitOp& op, const Smem& sm, unsigned& ucount, unsigned& astage) {
     const Site st = site_s(sm, op.i[DIT_I_SITE]);
     if (st.tiles == 0) return;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -504,13 +520,14 @@ __device__ void gemm_phase(const DitOp& op, const Smem& sm, unsigned& ucount) {
     const int T = st.tiles, U = T * nk;
 
     stage_buf(op, sm, st.kc0 * kChunk, nk * kChunk);
+    const unsigned apar = astage;   // phase bit of each chunk barrier
+    astage ^= (1u << nk) - 1u;
     // epilogue tiles: tile `warp`; a tile kCW (T = kCW + 1) is split by row block over the
-    // last three warps (the shortest MMA runs). Operands land during the MMAs.
+    // last three warps (the shortest MMA runs). Operands land during the MMAs (A chunk by chunk).
     EpiPre pre, pre2;
     const bool extra = T > kCW && warp >= kCW - 3;
     if (warp < T) epi_prefetch(op, st.tile0 + warp, pre);
     if (extra) epi_prefetch(op, st.tile0 + kCW, pre2);
-    consumer_sync();
 
     int start, cnt;
     warp_run(U, warp, start, cnt);
@@ -535,6 +552,7 @@ __device__ void gemm_phase(const DitOp& op, const Smem& sm, unsigned& ucount) {
         }
         const unsigned si = static_cast<unsigned>(r < q ? r * kCW + warp : q * kCW + warp);
         const __nv_bfloat16* a = sm.abuf() + c * kChunk;
+        wait_chunk(sm, c, (apar >> c) & 1u);
         if (wtype == 0) {
             const unsigned ri = ucount + si;
             wait_unit(sm, ri);
@@ -1023,6 +1041,7 @@ dit_flow_kernel(const DitOp* __restrict__ ops, int n_ops, const int* __restrict_
             mbar_init(&sm.full()[i], 1);
             mbar_init(&sm.empty()[i], 1);
         }
+        for (int i = 0; i < kAChunks; ++i) mbar_init(&sm.achunk()[i], kConsumers);
         asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
     }
     __syncthreads();
@@ -1046,7 +1065,7 @@ dit_flow_kernel(const DitOp* __restrict__ ops, int n_ops, const int* __restrict_
         return;
     }
 
-    unsigned ucount = 0, bars = 0;
+    unsigned ucount = 0, bars = 0, astage = 0;
     for (int oi = 0; oi < n_ops; ++oi) {
         const DitOp& op = sm.opbuf()[oi & 1];
         // the next descriptor lands in the other buffer during this op
@@ -1054,7 +1073,7 @@ dit_flow_kernel(const DitOp* __restrict__ ops, int n_ops, const int* __restrict_
             cp_async16(reinterpret_cast<uint4*>(&sm.opbuf()[(oi + 1) & 1]) + threadIdx.x,
                        reinterpret_cast<const uint4*>(ops + oi + 1) + threadIdx.x);
         switch (op.i[DIT_I_KIND]) {
-            case OP_GEMM: gemm_phase(op, sm, ucount); break;
+            case OP_GEMM: gemm_phase(op, sm, ucount, astage); break;
             case OP_ATTN: attn_phase(op, sm); break;
             case OP_AE: ae_phase(op, ncta); break;
             case OP_KVT: kvt_phase(op, sm, ncta); break;
