@@ -331,4 +331,16 @@ PYBIND11_MODULE(flash_rt_lawam, m) {
         py::arg("x"), py::arg("w"), py::arg("sf"), py::arg("gs"), py::arg("bias"), py::arg("out"), py::arg("N"),
         py::arg("K"), py::arg("stream") = 0,
         "out[N] = NVFP4 weights (E2M1 pairs, UE4M3 per-16 block scales, FP32 global scale) @ x[K] + bias.");
+
+    m.def("w4a16_skinny_config_count", &L::w4a16_skinny_config_count);
+    m.def("w4a16_skinny_config_k_chunk", &L::w4a16_skinny_config_k_chunk, py::arg("cfg"));
+    m.def("w4a16_skinny_gemm",
+        [](uintptr_t A, uintptr_t W, uintptr_t sf, uintptr_t partials, int M, int N, int K, int cfg, bool pdl,
+           uintptr_t stream) {
+            return L::w4a16_skinny_gemm(ptr<const __nv_bfloat16>(A), ptr<const uint8_t>(W), ptr<const uint8_t>(sf),
+                                        ptr<float>(partials), M, N, K, cfg, pdl, to_stream(stream));
+        },
+        py::arg("A"), py::arg("W"), py::arg("sf"), py::arg("partials"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("cfg"), py::arg("pdl") = true, py::arg("stream") = 0,
+        "Skinny W4A16 GEMM (M <= 32): FP32 K-split partials of A (BF16 [M,K]) @ NVFP4 W (E2M1 + UE4M3 block scales)^T.");
 }

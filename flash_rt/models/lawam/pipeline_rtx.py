@@ -467,8 +467,8 @@ def dit_step_forward(fvk, lk, fa2, B, W, T, dims, *, step, stream=0, pdl=True, c
     D, FF = D_DIT, FF_DIT
     st = int(stream)
     mode = W["mode"]
-    bf = mode in ("bf16", "w8a16")                 # BF16 block inputs
-    ffn4 = W.get("ffn_mode") == "nvfp4"            # FFN on skinny NVFP4 inside a w8a16 DiT
+    bf = mode in ("bf16", "w8a16", "w4a16")        # BF16 block inputs
+    ffn4 = W.get("ffn_mode") == "nvfp4"            # FFN on skinny NVFP4 (W4A4) inside a w8a16 DiT
     h, part, one = B["h"], B["part"], B["one"]
     O, hmod, ae = B["O"], B["hmod"], B["ae"]
     if bf:
@@ -483,7 +483,11 @@ def dit_step_forward(fvk, lk, fa2, B, W, T, dims, *, step, stream=0, pdl=True, c
     pos = T["pos"]
 
     def gemm(a, a_sf, a_bf16, site, n, k, what, bf16_act=False):
-        if "w8" not in site:      # NVFP4 site (FFN of the mixed tier)
+        if "w4" in site:          # NVFP4 weight-only site (BF16 block inputs)
+            c = W["w4_cfg"][(n, k)]
+            _ck(lk.w4a16_skinny_gemm(a_bf16, site["w4"], site["sf4"], part, rows, n, k, c, pdl, st), what)
+            return k // lk.w4a16_skinny_config_k_chunk(c)
+        if "w" in site and mode != "nvfp4":   # NVFP4 site (FFN of the mixed tier)
             return _skinny(fvk, a, a_sf, site, part, rows, n, k, cfg, pdl, st, what)
         if mode == "w8a16":
             c = W["w8_cfg"][(n, k)]

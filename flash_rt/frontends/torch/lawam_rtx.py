@@ -64,6 +64,15 @@ DIT_W8A16_CFG = {
 }
 
 
+# Skinny W4A16 tile configuration (lawam.w4a16_skinny_gemm cfg) per (N, K).
+DIT_W4A16_CFG = {
+    (3 * 1024, 1024): 2,
+    (1024, 1024): 2,
+    (4096, 1024): 2,
+    (1024, 4096): 2,
+    (32, 1024): 0,
+}
+
 # Key slices (CTAs per head and query tile) of the cross-attention over the
 # 512 image tokens (lawam.dit_cross_attention); 0 runs FA2's small-query tile.
 DIT_IMG_KV_SLICES = 4
@@ -124,8 +133,9 @@ class LawamTorchFrontendRtx:
         self.dit_cfg = dict(DIT_SKINNY_CFG if dit_cfg is None else dit_cfg)
         # Per-stage GEMM precision. Towers: "f16acc" (FP16 with FP16
         # accumulation), "fp16" (FP32 accumulation) or "fp8" (static per-tensor,
-        # calibrated). DiT: "w8a16" (INT8 weight-only), "bf16" or "nvfp4";
-        # "dit_ffn": "nvfp4" runs the w8a16 DiT's FFN on skinny NVFP4. LAM AdaLN
+        # calibrated). DiT: "w8a16" (INT8 weight-only), "w4a16" (NVFP4
+        # weight-only), "bf16" or "nvfp4"; "dit_ffn" overrides the FFN GEMMs:
+        # "w4a16" (NVFP4 weight-only, BF16 activations) or "nvfp4" (W4A4). LAM AdaLN
         # modulation GEMV: "nvfp4" (weight-only, per-16 block scales), "int8"
         # (per-channel weight-only) or "fp16". LLM
         # attention operands: "fp16" (no cast before the o projection) or "bf16"
@@ -135,7 +145,7 @@ class LawamTorchFrontendRtx:
         # push measurably past the reference's own precision noise floor, the
         # default stays at it.
         self.precision = {"vit": "f16acc", "llm": "f16acc", "dino": "f16acc", "lam": "f16acc", "enc": "f16acc",
-                          "dit": "w8a16", "lam_mod": "nvfp4", "llm_attn": "fp16"}
+                          "dit": "w8a16", "dit_ffn": "w4a16", "lam_mod": "nvfp4", "llm_attn": "fp16"}
         self.precision.update(precision or {})
         # GEMM sites of a 16-bit tower that run static FP8 instead
         # (vit: qkv / o / fc1 / fc2, llm: qkv / o / gateup / down)
@@ -229,6 +239,10 @@ class LawamTorchFrontendRtx:
         NVFP4 (w, sf, gs) or BF16 (w16, gs = 1), plus the bias."""
         b = torch.zeros(w_nk.shape[0]) if bias is None else bias
         mode = mode or self.precision["dit"]
+        if mode == "w4a16":
+            w4, sf, gs = _nvfp4_weight_only(w_nk.to(self.device, _F32))
+            return {"w4": self._k(w4), "sf4": self._k(sf), "gs": self._k(gs),
+                    "b": self._k(b.to(self.device, _BF16)), "b32": self._k(b.to(self.device, _F32))}
         if mode == "w8a16":
             w = w_nk.to(self.device, _F32)
             ws = (w.abs().amax(dim=1) / 127.0).clamp_min(1e-12)
@@ -493,6 +507,7 @@ class LawamTorchFrontendRtx:
         W["mode"] = self.precision["dit"]
         W["ffn_mode"] = self.precision.get("dit_ffn")
         W["w8_cfg"] = dict(DIT_W8A16_CFG)
+        W["w4_cfg"] = dict(DIT_W4A16_CFG)
         W["img_slices"] = DIT_IMG_KV_SLICES
         self.dit_w = W
         # step-invariant conditioning precompute inputs
@@ -667,9 +682,11 @@ class LawamTorchFrontendRtx:
                           for (n, k), c in self.dit_cfg.items())
         if self.precision["dit"] == "bf16":
             part_floats = rows * 4096
-        elif self.precision["dit"] == "w8a16":
-            part_floats = max(k // self.lk.w8a16_skinny_config_k_chunk(c) * rows * n
-                              for (n, k), c in DIT_W8A16_CFG.items())
+        elif self.precision["dit"] in ("w8a16", "w4a16"):
+            part_floats = max(max(k // self.lk.w8a16_skinny_config_k_chunk(c) * rows * n
+                                  for (n, k), c in DIT_W8A16_CFG.items()),
+                              max(k // self.lk.w4a16_skinny_config_k_chunk(c) * rows * n
+                                  for (n, k), c in DIT_W4A16_CFG.items()))
             if self.precision.get("dit_ffn") == "nvfp4":
                 part_floats = max(part_floats, max(k // self.fvk.nvfp4_skinny_config_k_chunk(c) * rows * n
                                                    for (n, k), c in self.dit_cfg.items()))

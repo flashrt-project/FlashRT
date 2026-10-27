@@ -164,3 +164,22 @@ def test_gemv_nvfp4w_matches_dequantized_weights():
     assert lk.gemv_nvfp4w(x.data_ptr(), w4.data_ptr(), sf.data_ptr(), gs.data_ptr(), b.data_ptr(), out.data_ptr(),
                           N, K, 0) == 0
     torch.testing.assert_close(out.float(), deq @ x.float() + b.float(), rtol=2e-3, atol=2e-3)
+
+
+def test_w4a16_skinny_gemm_matches_dequantized_matmul():
+    lk = _lawam()
+    from flash_rt.frontends.torch.lawam_rtx import _nvfp4_weight_only
+    torch.manual_seed(0)
+    M, N, K = 24, 1024, 4096
+    a = torch.randn(M, K, device="cuda").bfloat16()
+    w4, sf, gs = _nvfp4_weight_only(torch.randn(N, K, device="cuda") * 0.02)
+    lut = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, 0, -.5, -1, -1.5, -2, -3, -4, -6], device="cuda")
+    q = torch.stack([lut[(w4 & 15).long()], lut[(w4 >> 4).long()]], -1).view(N, K)
+    ref = a.float() @ (q * sf.view(torch.float8_e4m3fn).float().repeat_interleave(16, 1)).t()
+    for cfg in range(lk.w4a16_skinny_config_count()):
+        kc = lk.w4a16_skinny_config_k_chunk(cfg)
+        part = torch.empty(K // kc, M, N, device="cuda")
+        assert lk.w4a16_skinny_gemm(a.data_ptr(), w4.data_ptr(), sf.data_ptr(), part.data_ptr(),
+                                    M, N, K, cfg, False, 0) == 0
+        # partials exclude the per-tensor scale (the consumers' alpha)
+        torch.testing.assert_close(part.sum(0) * gs, ref * gs, rtol=1e-4, atol=1e-4)

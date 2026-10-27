@@ -116,6 +116,15 @@ void gemm_f16acc_set_autotune(bool enable);
 int gemm_bf16_f32out(const __nv_bfloat16* A, const __nv_bfloat16* W, float* D, int M, int N, int K,
                      cudaStream_t stream);
 
+// Skinny weight-only NVFP4 GEMM (lawam_w4a16_skinny_sm120.cu): FP32 K-split
+// partials [K / kc][M][N] of A (BF16 [M, K], M <= 32) @ (E2M1 W [N, K / 2] *
+// UE4M3 sf [N, K / 16])^T, without the per-tensor scale (the consumers' alpha).
+int w4a16_skinny_config_count();
+int w4a16_skinny_config_k_chunk(int cfg);
+int w4a16_skinny_gemm(const __nv_bfloat16* A, const uint8_t* W, const uint8_t* sf, float* partials, int M, int N,
+                      int K, int cfg, bool pdl, cudaStream_t stream);
+
+
 // Skinny weight-only INT8 GEMM for the DiT (M <= 32): partials[s][m][n] =
 // w_scale[n] * sum_{k in split s} A[m][k] * W[n][k], A BF16 [M, K], W INT8
 // [N, K] with per-output-channel scales, partials FP32 [K / KC][M][N] (the

@@ -57,7 +57,7 @@ One CUDA graph per prompt holds the whole policy step:
 | DINOv3 ViT-B/16 (11 layers used), concurrent graph branch | `lawam.gemm_f16acc_act`, FA2 | FP16, FP16 accumulation |
 | LAM decoder (12 AdaLN blocks) | `lawam.gemm_f16acc_act`, `lawam.gated_residual_norm`, `lawam.gemv_nvfp4w` (modulation) | FP16, FP16 accumulation; NVFP4 weight-only GEMV |
 | flow conditioning (enc_vlm, cross K/V of 8 blocks) | `lawam.gemm_f16acc_act`, BF16 GEMMs | FP16 / BF16 |
-| flow DiT x 10 (16 blocks) | `lawam.w8a16_skinny_gemm`, `nvfp4_skinny_partials_attention` (self / text), `lawam.dit_cross_attention` (512 image keys split over 4 CTAs per head), `lawam.dit_*` consumers | INT8 weight-only, BF16 activations |
+| flow DiT x 10 (16 blocks) | `lawam.w4a16_skinny_gemm` (FFN), `lawam.w8a16_skinny_gemm` (attention projections), `nvfp4_skinny_partials_attention` (self / text), `lawam.dit_cross_attention` (512 image keys split over 4 CTAs per head), `lawam.dit_*` consumers | NVFP4 / INT8 weight-only, BF16 activations |
 | Euler update, unnormalization | `lawam.dit_sum_bias_euler`, `lawam.unnormalize_actions` | FP32 |
 
 Exact rewrites of the reference: tokens past the effective horizon never
@@ -85,8 +85,9 @@ kernels instead.
 
 `precision={"vit", "llm", "dino", "lam", "enc"}` selects `"f16acc"` (default),
 `"fp16"` or `"fp8"` per stage; `precision["dit"]` selects `"w8a16"`
-(default), `"bf16"` or `"nvfp4"`; `precision["dit_ffn"] = "nvfp4"` runs only
-the DiT FFNs on NVFP4; `precision["lam_mod"]` is `"nvfp4"` (default,
+(default), `"w4a16"` (NVFP4 weight-only), `"bf16"` or `"nvfp4"` (W4A4);
+`precision["dit_ffn"]` overrides the DiT FFNs: `"w4a16"` (default, NVFP4
+weight-only with BF16 activations) or `"nvfp4"` (W4A4); `precision["lam_mod"]` is `"nvfp4"` (default,
 weight-only E2M1 with per-16 UE4M3 block scales), `"int8"` (per-channel) or
 `"fp16"` for the LAM AdaLN modulation GEMV; `precision["llm_attn"]` is `"fp16"`
 (default, FP16 causal FA2, no cast before the o projection) or `"bf16"` (the
@@ -99,15 +100,17 @@ small numeric changes: the reference policy itself moves 4 of 64 held-out
 LIBERO frames when its VLM runs FP16 instead of BF16 (aggregate action
 cosine 0.997). The default policy sits at that floor (0.997, same 64 frames);
 per-tensor FP8 in any tower (0.87-0.99), even on single GEMM groups
-(0.974-0.977), and NVFP4 DiT weights (all blocks, or only the FFNs: 0.995 on
-one held-out set, 0.988 on another) fall measurably below it, so they are
-opt-in tiers.
+(0.974-0.977), NVFP4 activations in the DiT FFNs (W4A4: 0.995 on one held-out
+set, 0.988 on another) and NVFP4 weights on the DiT attention projections
+(0.990 / 4 frames lost) fall measurably below it, so they are opt-in tiers.
+NVFP4 weights with BF16 activations on the DiT FFNs (0.996 / 0.997) and on the
+LAM modulation stay at the floor and are the default.
 
 ## Calibration
 
 The default policy has no activation quantization (the DiT INT8 weights use
-per-channel scales, the LAM modulation NVFP4 weights per-16 block scales,
-both fixed at load). With an FP8 tier, `calibrate()` runs each
+per-channel scales, the DiT FFN and LAM modulation NVFP4 weights per-16 block
+scales, all fixed at load). With an FP8 tier, `calibrate()` runs each
 real observation once with dynamic per-tensor FP8 at every FP8 site, records
 amax / 448 into the site's scale slot, and keeps the 99.9th percentile across
 observations as the static scale (cached under
