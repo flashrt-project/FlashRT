@@ -156,6 +156,15 @@ PYBIND11_MODULE(flash_rt_lawam, m) {
     m.def("gemm_f16acc_set_autotune", &L::gemm_f16acc_set_autotune, py::arg("enable"),
         "Time the heuristic's non-split-K candidates for plans created afterwards (default off).");
 
+    m.def("gemv_i8w",
+        [](uintptr_t x, uintptr_t w, uintptr_t w_scale, uintptr_t bias, uintptr_t out, int N, int K, uintptr_t stream) {
+            return L::gemv_i8w(ptr<const __half>(x), ptr<const int8_t>(w), ptr<const float>(w_scale),
+                               ptr<const __half>(bias), ptr<__half>(out), N, K, to_stream(stream));
+        },
+        py::arg("x"), py::arg("w"), py::arg("w_scale"), py::arg("bias"), py::arg("out"), py::arg("N"), py::arg("K"),
+        py::arg("stream") = 0,
+        "out[n] = w_scale[n] * sum_k int8 w[n,k] * x[k] + bias[n] (FP16 x / out, per-channel scales).");
+
     m.def("gemm_f16acc",
         [](uintptr_t A, uintptr_t B, uintptr_t D, uintptr_t bias, int M, int N, int K, bool gelu, uintptr_t stream) {
             return L::gemm_f16acc(ptr<const __half>(A), ptr<const __half>(B), ptr<__half>(D), ptr<const __half>(bias),

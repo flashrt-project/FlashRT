@@ -87,6 +87,12 @@ int gaussian_noise(float* x, unsigned long long* seed, int count, cudaStream_t s
 int unnormalize_actions(const float* x, int ld, const float* lo, const float* hi, float* actions, int rows,
                         int out_dim, cudaStream_t stream);
 
+// out[n] = w_scale[n] * sum_k w[n, k] * x[k] + bias[n]: one-row GEMV with INT8
+// weights [N, K] (per-output-channel scales), FP16 input / output, FP32
+// accumulation. K % 512 == 0, K <= 12288.
+int gemv_i8w(const __half* x, const int8_t* w, const float* w_scale, const __half* bias, __half* out, int N, int K,
+             cudaStream_t stream);
+
 // D[M, N] = A[M, K] @ B[K, N] (+ bias[N]), FP16 operands and FP16 accumulation
 // (cuBLASLt CUBLAS_COMPUTE_16F; row-major, B as [K, N]); gelu applies the
 // tanh-approximated GELU after the bias (requires bias). Plans are cached per

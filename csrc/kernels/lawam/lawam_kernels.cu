@@ -417,6 +417,29 @@ __global__ void unnormalize_kernel(const float* __restrict__ x, int ld, const fl
     out[i] = (x[r * ld + c] + 1.0f) * 0.5f * (hi[c] - lo[c]) + lo[c];
 }
 
+// One warp per output row; every lane streams 16 INT8 weights per 512-wide
+// K chunk with one 16-byte load, x staged in shared memory as FP32.
+__global__ void __launch_bounds__(256)
+gemv_i8w_kernel(const __half* __restrict__ x, const int8_t* __restrict__ w, const float* __restrict__ w_scale,
+                const __half* __restrict__ bias, __half* __restrict__ out, int N, int K) {
+    extern __shared__ float xs[];
+    for (int k = threadIdx.x; k < K; k += blockDim.x) xs[k] = __half2float(x[k]);
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= N) return;
+    const int8_t* wr = w + static_cast<size_t>(row) * K;
+    float acc = 0.f;
+    for (int k0 = lane * 16; k0 < K; k0 += 512) {
+        const uint4 u = __ldg(reinterpret_cast<const uint4*>(wr + k0));
+        const int8_t* b = reinterpret_cast<const int8_t*>(&u);
+#pragma unroll
+        for (int i = 0; i < 16; ++i) acc += static_cast<float>(b[i]) * xs[k0 + i];
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) out[row] = __float2half(acc * w_scale[row] + (bias != nullptr ? __half2float(bias[row]) : 0.f));
+}
+
 inline int last_error() { return static_cast<int>(cudaGetLastError()); }
 
 }  // namespace
@@ -493,6 +516,13 @@ int action_encode(const float* x, const float* w1, const float* b1, __nv_bfloat1
 int gaussian_noise(float* x, unsigned long long* seed, int count, cudaStream_t stream) {
     if (count < 1) return static_cast<int>(cudaErrorInvalidValue);
     gaussian_noise_kernel<<<1, 1024, 0, stream>>>(x, seed, count);
+    return last_error();
+}
+
+int gemv_i8w(const __half* x, const int8_t* w, const float* w_scale, const __half* bias, __half* out, int N, int K,
+             cudaStream_t stream) {
+    if (N < 1 || K % 512 != 0 || K > 12288) return static_cast<int>(cudaErrorInvalidValue);
+    gemv_i8w_kernel<<<(N + 7) / 8, 256, K * sizeof(float), stream>>>(x, w, w_scale, bias, out, N, K);
     return last_error();
 }
 

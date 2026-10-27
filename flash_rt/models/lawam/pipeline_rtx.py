@@ -328,7 +328,10 @@ def lam_decoder_forward(gemm, fvk, lk, fa2, B, W, *, stream=0, prec="fp8"):
     x, x8, qkv = B["x"], B["x8"], B["qkv"]
     Q, K, V, O, lse = B["Q"], B["K"], B["V"], B["O"], B["lse"]
     o_out, fc1, f16, mods = B["o_out"], B["fc1"], B["f16"], B["mods"]
-    gemm.fp16_nn_bias(B["cond_silu"], W["mod_w"], mods, W["mod_b"], 1, 12 * 6 * D, D, st)
+    if "mod_w8" in W:
+        _ck(lk.gemv_i8w(B["cond_silu"], W["mod_w8"], W["mod_ws"], W["mod_b"], mods, 12 * 6 * D, D, st), "lam adaln gemv")
+    else:
+        gemm.fp16_nn_bias(B["cond_silu"], W["mod_w"], mods, W["mod_b"], 1, 12 * 6 * D, D, st)
     _mm(gemm, prec, B["ht8"], B["ht16"], W, "pin", x, T, D, 768, st)
     pend = (0, 0, 0, W["pos_b"])   # delta, bias, gate, delta2
     for li in range(12):
@@ -404,6 +407,7 @@ def dit_step_forward(fvk, lk, fa2, B, W, T, dims, *, step, stream=0, pdl=True, c
     st = int(stream)
     mode = W["mode"]
     bf = mode in ("bf16", "w8a16")                 # BF16 block inputs
+    ffn4 = W.get("ffn_mode") == "nvfp4"            # FFN on skinny NVFP4 inside a w8a16 DiT
     h, part, one = B["h"], B["part"], B["one"]
     O, hmod, ae = B["O"], B["hmod"], B["ae"]
     if bf:
@@ -418,6 +422,8 @@ def dit_step_forward(fvk, lk, fa2, B, W, T, dims, *, step, stream=0, pdl=True, c
     pos = T["pos"]
 
     def gemm(a, a_sf, a_bf16, site, n, k, what, bf16_act=False):
+        if "w8" not in site:      # NVFP4 site (FFN of the mixed tier)
+            return _skinny(fvk, a, a_sf, site, part, rows, n, k, cfg, pdl, st, what)
         if mode == "w8a16":
             c = W["w8_cfg"][(n, k)]
             _ck(lk.w8a16_skinny_gemm(a_bf16, site["w8"], site["ws"], part, rows, n, k, c, pdl, st), what)
@@ -464,18 +470,28 @@ def dit_step_forward(fvk, lk, fa2, B, W, T, dims, *, step, stream=0, pdl=True, c
                                   stream=st)
         site = W["o"][li]
         sp = gemm(0, 0, O, site, D, D, "o proj", bf16_act=True)
-        _ck(lk.dit_sum_bias_residual_norm(part, sp, one, site["gs"], site["b"], h, True, 0, 0, 0, xn, xn_sf, gs_out,
-                                          xb, rows, D, EPS_LN, pdl, st), "o residual norm")
-        site = W["ff_up"][li]
-        sp = gemm(xn, xn_sf, xb, site, FF, D, "ffn up")
-        if bf:
-            _ck(lk.dit_sum_bias_act(part, sp, one, site["gs"], site["b"], 2, 0, 0, 0, hb, rows, FF, pdl, st),
-                "ffn gelu")
+        if ffn4:
+            _ck(lk.dit_sum_bias_residual_norm(part, sp, one, site["gs"], site["b"], h, True, 0, 0, 0, B["xn"],
+                                              B["xn_sf"], one, 0, rows, D, EPS_LN, pdl, st), "o residual norm")
+            site = W["ff_up"][li]
+            sp = gemm(B["xn"], B["xn_sf"], 0, site, FF, D, "ffn up")
+            _ck(fvk.nvfp4_skinny_sum_bias_gelu(part, sp, one, site["gs"], site["b"], B["hid"], B["hid_sf"], one, rows,
+                                               FF, pdl, st), "ffn gelu")
+            site = W["ff_down"][li]
+            sp = gemm(B["hid"], B["hid_sf"], 0, site, D, FF, "ffn down")
         else:
-            _ck(fvk.nvfp4_skinny_sum_bias_gelu(part, sp, one, site["gs"], site["b"], hid, hid_sf, one, rows, FF,
-                                               pdl, st), "ffn gelu")
-        site = W["ff_down"][li]
-        sp = gemm(hid, hid_sf, hb, site, D, FF, "ffn down")
+            _ck(lk.dit_sum_bias_residual_norm(part, sp, one, site["gs"], site["b"], h, True, 0, 0, 0, xn, xn_sf,
+                                              gs_out, xb, rows, D, EPS_LN, pdl, st), "o residual norm")
+            site = W["ff_up"][li]
+            sp = gemm(xn, xn_sf, xb, site, FF, D, "ffn up")
+            if bf:
+                _ck(lk.dit_sum_bias_act(part, sp, one, site["gs"], site["b"], 2, 0, 0, 0, hb, rows, FF, pdl, st),
+                    "ffn gelu")
+            else:
+                _ck(fvk.nvfp4_skinny_sum_bias_gelu(part, sp, one, site["gs"], site["b"], hid, hid_sf, one, rows, FF,
+                                                   pdl, st), "ffn gelu")
+            site = W["ff_down"][li]
+            sp = gemm(hid, hid_sf, hb, site, D, FF, "ffn down")
         if li < LAYERS_DIT - 1:
             _ck(lk.dit_sum_bias_residual_norm(part, sp, one, site["gs"], site["b"], h, True, scale[li + 1],
                                               shift[li + 1], pos, xn, xn_sf, gs_out, xb, rows, D, EPS_LN, pdl, st),

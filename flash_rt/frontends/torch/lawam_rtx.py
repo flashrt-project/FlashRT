@@ -99,13 +99,15 @@ class LawamTorchFrontendRtx:
         self.dit_cfg = dict(DIT_SKINNY_CFG if dit_cfg is None else dit_cfg)
         # Per-stage GEMM precision. Towers: "f16acc" (FP16 with FP16
         # accumulation), "fp16" (FP32 accumulation) or "fp8" (static per-tensor,
-        # calibrated). DiT: "w8a16" (INT8 weight-only), "bf16" or "nvfp4".
+        # calibrated). DiT: "w8a16" (INT8 weight-only), "bf16" or "nvfp4";
+        # "dit_ffn": "nvfp4" runs the w8a16 DiT's FFN on skinny NVFP4. LAM AdaLN
+        # modulation GEMV: "int8" (per-channel weight-only) or "fp16".
         # The flow's action chunks bifurcate under small numeric changes on a
         # few real frames; per-tensor FP8 anywhere upstream and NVFP4 DiT weights
         # push measurably past the reference's own precision noise floor, the
         # default stays at it.
         self.precision = {"vit": "f16acc", "llm": "f16acc", "dino": "f16acc", "lam": "f16acc", "enc": "f16acc",
-                          "dit": "w8a16"}
+                          "dit": "w8a16", "lam_mod": "int8"}
         self.precision.update(precision or {})
         # GEMM sites of a 16-bit tower that run static FP8 instead
         # (vit: qkv / o / fc1 / fc2, llm: qkv / o / gateup / down)
@@ -145,7 +147,8 @@ class LawamTorchFrontendRtx:
         self.graph = None
         self.Se = None
         self.task = None
-        self.calibrated = (all(v in ("fp16", "f16acc") for k, v in self.precision.items() if k != "dit")
+        self.calibrated = (all(v in ("fp16", "f16acc") for k, v in self.precision.items()
+                               if k not in ("dit", "dit_ffn", "lam_mod"))
                            and not any(self.fp8_sites.values()))
 
     # ── small helpers ───────────────────────────────────────────────
@@ -192,17 +195,19 @@ class LawamTorchFrontendRtx:
     def _h(self, t: torch.Tensor) -> int:
         return self._k(t.to(self.device, _FP16))
 
-    def _nvfp4(self, w_nk: torch.Tensor, bias: torch.Tensor | None, mse_steps: int = 4) -> dict:
+    def _nvfp4(self, w_nk: torch.Tensor, bias: torch.Tensor | None, mse_steps: int = 4, *,
+               mode: str | None = None) -> dict:
         """[N, K] DiT weight -> GEMM site in the DiT precision: packed skinny
         NVFP4 (w, sf, gs) or BF16 (w16, gs = 1), plus the bias."""
         b = torch.zeros(w_nk.shape[0]) if bias is None else bias
-        if self.precision["dit"] == "w8a16":
+        mode = mode or self.precision["dit"]
+        if mode == "w8a16":
             w = w_nk.to(self.device, _F32)
             ws = (w.abs().amax(dim=1) / 127.0).clamp_min(1e-12)
             q = (w / ws[:, None]).round().clamp(-127, 127).to(torch.int8)
             return {"w8": self._k(q), "ws": self._k(ws), "gs": self._one_ptr,
                     "b": self._k(b.to(self.device, _BF16)), "b32": self._k(b.to(self.device, _F32))}
-        if self.precision["dit"] == "bf16":
+        if mode == "bf16":
             return {"w16": self._k(w_nk.to(self.device, _BF16)), "gs": self._one_ptr,
                     "b": self._k(b.to(self.device, _BF16)), "b32": self._k(b.to(self.device, _F32))}
         fvk = self.fvk
@@ -381,9 +386,15 @@ class LawamTorchFrontendRtx:
             for n in ("qkv", "o", "fc1", "fc2"):
                 L["a_" + n] = self._slot(f"lam{li}.{n}")
             self.lam["layers"].append(L)
-        # AdaLN modulation of all 12 blocks as one FP16 GEMV weight [1024, 12 * 6144]
-        # (FP8 weights here measurably move the action chunks)
-        self.lam["mod_w"] = self._h(torch.cat(mod_w, dim=0).t())
+        # AdaLN modulation of all 12 blocks as one GEMV [12 * 6144, 1024]: INT8
+        # weights with per-channel scales ("lam_mod": "int8"), or FP16
+        mw = torch.cat(mod_w, dim=0).to(self.device, _F32)
+        if self.precision.get("lam_mod", "fp16") == "int8":
+            ms = (mw.abs().amax(dim=1) / 127.0).clamp_min(1e-12)
+            self.lam["mod_w8"] = self._k((mw / ms[:, None]).round().clamp(-127, 127).to(torch.int8))
+            self.lam["mod_ws"] = self._k(ms)
+        else:
+            self.lam["mod_w"] = self._h(mw.t())
         self.lam["mod_b"] = self._h(torch.cat(mod_b, dim=0))
         self._lin(self.lam, "pout", g(Dd + "project_output.weight"))
         self.lam["pout_b"] = self._h(g(Dd + "project_output.bias"))
@@ -434,8 +445,9 @@ class LawamTorchFrontendRtx:
             else:
                 W["q"].append(self._nvfp4(blk(li, "attn1.to_q.weight"), blk(li, "attn1.to_q.bias")))
             W["o"].append(self._nvfp4(blk(li, "attn1.to_out.0.weight"), blk(li, "attn1.to_out.0.bias")))
-            W["ff_up"].append(self._nvfp4(blk(li, "ff.net.0.proj.weight"), blk(li, "ff.net.0.proj.bias")))
-            W["ff_down"].append(self._nvfp4(blk(li, "ff.net.2.weight"), blk(li, "ff.net.2.bias")))
+            ffm = self.precision.get("dit_ffn")
+            W["ff_up"].append(self._nvfp4(blk(li, "ff.net.0.proj.weight"), blk(li, "ff.net.0.proj.bias"), mode=ffm))
+            W["ff_down"].append(self._nvfp4(blk(li, "ff.net.2.weight"), blk(li, "ff.net.2.bias"), mode=ffm))
         W["ae_w1"] = self._k(g(F + "action_encoder.W1.W")[e].to(self.device, _F32))     # [32, 1024]
         W["ae_b1"] = self._k(g(F + "action_encoder.W1.b")[e].to(self.device, _F32))
         W["ae2"] = self._nvfp4(g(F + "action_encoder.W2.W")[e].t(), g(F + "action_encoder.W2.b")[e])
@@ -447,6 +459,7 @@ class LawamTorchFrontendRtx:
         W["head1"] = self._nvfp4((wd1.t() @ wp2).float(), (bp2 @ wd1 + bd1).float())
         W["head2"] = self._nvfp4(g(F + "action_decoder.layer2.W")[e].t(), g(F + "action_decoder.layer2.b")[e])
         W["mode"] = self.precision["dit"]
+        W["ffn_mode"] = self.precision.get("dit_ffn")
         W["w8_cfg"] = dict(DIT_W8A16_CFG)
         self.dit_w = W
         # step-invariant conditioning precompute inputs
@@ -624,6 +637,9 @@ class LawamTorchFrontendRtx:
         elif self.precision["dit"] == "w8a16":
             part_floats = max(k // self.lk.w8a16_skinny_config_k_chunk(c) * rows * n
                               for (n, k), c in DIT_W8A16_CFG.items())
+            if self.precision.get("dit_ffn") == "nvfp4":
+                part_floats = max(part_floats, max(k // self.fvk.nvfp4_skinny_config_k_chunk(c) * rows * n
+                                                   for (n, k), c in self.dit_cfg.items()))
         one = torch.ones(1, dtype=_F32, device=self.device)
         self._prompt_keep.append(one)
         B["dit"] = {"h": b(rows, 1024, dtype=_BF16), "xn": b(rows, 512, dtype=_U8), "xn_sf": b(rows, 64, dtype=_U8),
@@ -639,7 +655,8 @@ class LawamTorchFrontendRtx:
 
     # ── the policy step ─────────────────────────────────────────────
     def _forward(self, stream: int, *, cal: bool = False, host_io: bool = True, noise_from_host: bool = True):
-        prec = {k: ("cal" if cal and v == "fp8" else v) for k, v in self.precision.items() if k != "dit"}
+        prec = {k: ("cal" if cal and v == "fp8" else v) for k, v in self.precision.items()
+                if k not in ("dit", "dit_ffn", "lam_mod")}
         fvk, lk, fa2, gemm, B = self.fvk, self.lk, self.fa2, self.gemm, self.B
         st = int(stream)
         nv = self.num_views
