@@ -194,6 +194,17 @@ int gemm_f16acc_split(int M, int N, int K, bool bias, bool gelu);
 int gemm_f16acc_act_cfg(const __half* A, const __half* B, __half* D, const __half* bias, int M, int N, int K, int act,
                         int tile, int split, cudaStream_t stream);
 
+// Persistent FP16-accumulate GEMM (lawam_gemm_persistent_sm120.cu): one CTA
+// per SM over a static data-parallel + stream-K schedule of output tiles,
+// D [M, out] (leading dim ldd) = act(A[M,K] @ B[K,N] + bias): act 0 identity
+// (bias optional), 1 tanh-GELU, 2 erf-GELU, 3 SwiGLU over B columns
+// interleaved in blocks of 8 (gate block, up block; out = N / 2 columns).
+// cfg: tile 0 224x128, 1 96x128, 2 128x256, 3 64x256, 4 128x128 (k 64),
+// 5 256x128; sched 0 hybrid, 1 data-parallel, 2 stream-K. The first call of
+// a shape / stream allocates its schedule and workspace (outside a capture).
+int gemm_f16acc_persistent(const __half* A, const __half* B, __half* D, const __half* bias, int M, int N, int K,
+                           int ldd, int act, int cfg, int sched, cudaStream_t stream);
+
 // Cross-attention of the DiT action rows over a long static K / V
 // (lawam_dit_cross_attention_sm120.cu): Q = alpha * sum of the q-projection's
 // K-split partials [splits][rows][heads * hd] + bias, K / V [kv_seq] rows of

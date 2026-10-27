@@ -223,3 +223,45 @@ def test_cutlass_f16acc_streamk_tile_matches_fp32_reference(M, N, K):
     err_dp = ((dp.float() - ref).norm() / ref.norm()).item()
     assert err <= 1.05 * err_dp   # shorter FP16 accumulation chains than the data-parallel tile
     torch.testing.assert_close(again, out, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("M,N,K,act,cfg,sched", [(219, 4096, 2048, 0, 0, 0), (261, 3072, 768, 2, 1, 2),
+                                                 (512, 4096, 1024, 1, 2, 1), (256, 1024, 4096, 0, 4, 0)])
+def test_persistent_f16acc_gemm_matches_fp32_reference(M, N, K, act, cfg, sched):
+    # data-parallel + stream-K schedule: split tiles summed in k order, reproducible run to run
+    lk = _lawam()
+    torch.manual_seed(0)
+    a = torch.randn(M, K, device="cuda").half()
+    w = (torch.randn(K, N, device="cuda") / K ** 0.5).half()
+    bias = torch.randn(N, device="cuda").half() if act else None
+    bp = bias.data_ptr() if act else 0
+    out, again = torch.empty(M, N, device="cuda").half(), torch.empty(M, N, device="cuda").half()
+    for o in (out, again):
+        assert lk.gemm_f16acc_persistent(a.data_ptr(), w.data_ptr(), o.data_ptr(), bp, M, N, K, N, act, cfg, sched,
+                                         0) == 0
+    ref = a.float() @ w.float() + (bias.float() if act else 0)
+    if act:
+        ref = torch.nn.functional.gelu(ref, approximate="tanh" if act == 1 else "none")
+    dp = torch.empty(M, N, device="cuda").half()   # CUTLASS data-parallel FP16-accumulate tile for scale
+    assert lk.gemm_f16acc_act_cfg(a.data_ptr(), w.data_ptr(), dp.data_ptr(), bp, M, N, K, act, 0, 1, 0) == 0
+    err = ((out.float() - ref).norm() / ref.norm()).item()
+    err_dp = ((dp.float() - ref).norm() / ref.norm()).item()
+    assert err <= 1.1 * err_dp
+    torch.testing.assert_close(again, out, rtol=0, atol=0)
+
+
+def test_persistent_swiglu_matches_gateup_and_silu_mul():
+    from flash_rt.models.lawam import pipeline_rtx as P
+
+    lk = _lawam()
+    torch.manual_seed(0)
+    M, FF, K = 219, 6144, 2048
+    a = torch.randn(M, K, device="cuda").half()
+    w = (torch.randn(K, 2 * FF, device="cuda") / K ** 0.5).half()
+    out = torch.empty(M, FF, device="cuda").half()
+    wi = P.interleave_gate_up(w)
+    assert lk.gemm_f16acc_persistent(a.data_ptr(), wi.data_ptr(), out.data_ptr(), 0, M, 2 * FF, K, FF, 3, 0, 0,
+                                     0) == 0
+    gu = a.float() @ w.float()
+    ref = torch.nn.functional.silu(gu[:, :FF]) * gu[:, FF:]
+    torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)

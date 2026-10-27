@@ -1531,6 +1531,7 @@ if(FLASHRT_ENABLE_LAWAM)
     csrc/kernels/lawam/lawam_w8a16_skinny_sm120.cu
     csrc/kernels/lawam/lawam_w4a16_skinny_sm120.cu
     csrc/kernels/lawam/lawam_gemm_f16acc_act.cu
+    csrc/kernels/lawam/lawam_gemm_persistent_sm120.cu
     csrc/kernels/lawam/lawam_dit_cross_attention_sm120.cu
     csrc/kernels/lawam/lawam_dit_persistent_sm120.cu)
   set_target_properties(flash_rt_lawam PROPERTIES

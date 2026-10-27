@@ -68,8 +68,10 @@ F16ACC_KERNEL = "cutlass"
 F16ACC_SPLIT = "tuned"
 _F16ACC_SPLIT = {}
 
-# (ceil(M / 64), N, K, act or "swiglu" / "gateup", bias) -> (tile, split); tiles 8.. are
-# stream-K (split ignored), "gateup" runs the LLM gate | up as one GEMM + silu_mul.
+# (ceil(M / 64), N, K, act or "swiglu" / "gateup" / "pswiglu", bias) -> (tile, split); tiles
+# 8..10 are CUTLASS stream-K (split ignored), "gateup" runs the LLM gate | up as one GEMM +
+# silu_mul; tiles 16.. are lawam.gemm_f16acc_persistent configurations (tile - 16, split =
+# schedule), "pswiglu" its SwiGLU epilogue over the 8-column interleaved gate | up weight.
 F16ACC_PLANS = {
     (2, 2048, 4096, 0, False): (1, 1),
     (4, 768, 1024, 0, False): (3, 1),
@@ -93,6 +95,7 @@ F16ACC_PLANS = {
     (5, 3072, 768, 2, True): (5, 1),
     (4, 6144, 2048, 'swiglu', False): (0, 2),
     (4, 6144, 2048, 'gateup', False): (8, 1),
+    (4, 6144, 2048, 'pswiglu', False): (16, 0),
 }
 
 
@@ -121,6 +124,9 @@ def _f16acc(a, w, out, bias, M, N, K, act, st):
             _ck(_LK.bias_gelu_erf(out, N, bias, 0, 0, out, M, N, st), "gelu")
         return
     plan = _plan_for(M, N, K, act, bias)
+    if plan is not None and plan[0] >= 16:
+        _ck(_LK.gemm_f16acc_persistent(a, w, out, bias, M, N, K, N, act, plan[0] - 16, plan[1], st), "f16acc gemm")
+        return
     if plan is not None:
         _ck(_LK.gemm_f16acc_act_cfg(a, w, out, bias, M, N, K, act, plan[0], plan[1], st), "f16acc gemm")
         return
@@ -165,10 +171,30 @@ def _gelu8(lk, fvk, x, ld, bias, out8, scale, rows, n, st, prec, scratch, *, tan
         _quant_f16(fvk, scratch, out8, scale, rows * n, st)
 
 
-def _f16acc_swiglu(a, w, gu, out, M, FF, K, st):
+def swiglu_interleaved(FF, K):
+    """Whether the f16acc SwiGLU of [K, 2 FF] runs the persistent kernel's
+    epilogue, which reads the gate | up weight interleaved in blocks of 8
+    columns (interleave_gate_up)."""
+    return (F16ACC_KERNEL == "cutlass" and F16ACC_SPLIT == "tuned" and
+            any(k[1:4] == (FF, K, "pswiglu") for k in F16ACC_PLANS))
+
+
+def interleave_gate_up(w):
+    """[K, 2 FF] gate | up weight -> [K, 2 FF] with 8-column blocks alternating gate, up."""
+    K, F2 = w.shape
+    return w.view(K, 2, F2 // 16, 8).transpose(1, 2).reshape(K, F2).contiguous()
+
+
+def _f16acc_swiglu(a, w, gu, out, M, FF, K, st, interleaved=False):
     """out [M, FF] = silu(a @ w[:, :FF]) * (a @ w[:, FF:]) (w [K, 2 FF], gate |
     up sums in gu [M, 2 FF]): the "cutlass" f16acc kernel runs it as one dual
-    GEMM, "cublas" as the gate|up GEMM + silu_mul. ``out`` must not alias ``a``."""
+    GEMM, "cublas" as the gate|up GEMM + silu_mul. ``out`` must not alias ``a``.
+    ``interleaved``: w is the interleave_gate_up weight and the persistent
+    GEMM writes out directly (gu unused)."""
+    if interleaved:
+        plan = _plan_for(M, FF, K, "pswiglu", False) or (16, 0)
+        _ck(_LK.gemm_f16acc_persistent(a, w, out, 0, M, 2 * FF, K, FF, 3, plan[0] - 16, plan[1], st), "llm swiglu")
+        return
     if F16ACC_KERNEL == "cublas":
         _f16acc(a, w, gu, 0, M, 2 * FF, K, 0, st)
         _ck(_LK.silu_mul(gu, gu + FF * 2, 2 * FF, out, M, FF, st), "llm silu")
@@ -355,7 +381,7 @@ def qwen_llm_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8", nu
         _norm8(fvk, h, o_out, 0, 0, L["post_ln_w"], 0, 1, EPS_LLM, x8, L["a_gate"], S, D, st, p_gu, f16)
         if p_gu == "f16acc" and p_dn in _F16:
             # SwiGLU in the gate|up GEMM; down reads its output
-            _f16acc_swiglu(f16, L["gateup_w16"], gate, up, S, FF, D, st)
+            _f16acc_swiglu(f16, L["gateup_w16"], gate, up, S, FF, D, st, interleaved=L.get("gateup_il", False))
             _mm(gemm, p_dn, x8, up, L, "down", o_out, S, D, FF, st)
             pend = o_out
             pend2 = B["inject"][li] if li < 3 else 0

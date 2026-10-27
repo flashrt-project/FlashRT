@@ -52,7 +52,7 @@ One CUDA graph per prompt holds the whole policy step:
 |---|---|---|
 | camera frames -> patch rows | `lawam.preprocess_u8` | FP16 |
 | Qwen3-VL ViT (24 layers, DeepStack 5/11/17, mergers) | `lawam.gemm_f16acc_act` (fc1 + bias + GELU in one GEMM), `fp8_residual_norm_quant`, `lawam.qkv_rope_split`, FA2 | FP16, FP16 accumulation |
-| Qwen3-VL LLM (16 layers kept by LaWAM) | same, gate \| up as one stream-K `lawam.gemm_f16acc_act` + `lawam.silu_mul`, causal GQA FA2 | FP16, FP16 accumulation |
+| Qwen3-VL LLM (16 layers kept by LaWAM) | same, gate \| up + SwiGLU as one persistent `lawam.gemm_f16acc_persistent`, causal GQA FA2 | FP16, FP16 accumulation |
 | VLM -> latent QFormer + LAM conditioning | `lawam.qformer_latent` | FP32 |
 | DINOv3 ViT-B/16 (11 layers used), concurrent graph branch | `lawam.gemm_f16acc_act`, FA2 | FP16, FP16 accumulation |
 | LAM decoder (12 AdaLN blocks) | `lawam.gemm_f16acc_act`, `lawam.gated_residual_norm`, `lawam.gemv_nvfp4w` (modulation) | FP16, FP16 accumulation; NVFP4 weight-only GEMV |
@@ -90,7 +90,15 @@ production shape come from `pipeline_rtx.F16ACC_PLANS` (measured on RTX 5060
 Ti), so every process forms the same FP16 sums; other shapes are timed on their
 first call. Tiles 8-10 are stream-K (the K iterations of the output tiles spread
 over the 36 SMs, partial tiles reduced in fixed order); the LLM down projection
-and the concatenated gate | up GEMM run on them.
+runs on them. Tiles 16.. select `lawam.gemm_f16acc_persistent`
+(`lawam_gemm_persistent_sm120.cu`): one CTA per SM walks a static schedule of
+data-parallel tiles and stream-K segments with one continuous cp.async pipeline,
+split tiles are summed in k order by the last segment to arrive (no CTA waits on
+another, so concurrent graph branches cannot deadlock), and the epilogue writes
+16-byte rows through the shared-memory stage the last k-tile consumed. The LLM
+gate | up GEMM runs it with a 224-row tile (all Se rows in one tile row) and a
+SwiGLU epilogue; its weight is stored with gate and up interleaved in blocks of 8
+columns (`pipeline_rtx.interleave_gate_up`).
 `flash_rt.models.lawam.pipeline_rtx.F16ACC_SPLIT = "timed"` times
 every shape, `"cublas"` (set before the graph is captured) uses the split of the cuBLASLt
 `COMPUTE_16F` plan instead, so the GEMMs form the same FP16 sums as

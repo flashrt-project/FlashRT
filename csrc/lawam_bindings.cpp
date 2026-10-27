@@ -282,6 +282,18 @@ PYBIND11_MODULE(flash_rt_lawam, m) {
         py::arg("act"), py::arg("tile"), py::arg("split") = 1, py::arg("stream") = 0,
         "gemm_f16acc_act with a fixed tile configuration and serial split-K count.");
 
+    m.def("gemm_f16acc_persistent",
+        [](uintptr_t A, uintptr_t B, uintptr_t D, uintptr_t bias, int M, int N, int K, int ldd, int act, int cfg,
+           int sched, uintptr_t stream) {
+            return L::gemm_f16acc_persistent(ptr<const __half>(A), ptr<const __half>(B), ptr<__half>(D),
+                                             ptr<const __half>(bias), M, N, K, ldd, act, cfg, sched,
+                                             to_stream(stream));
+        },
+        py::arg("A"), py::arg("B"), py::arg("D"), py::arg("bias"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("ldd"), py::arg("act"), py::arg("cfg"), py::arg("sched") = 0, py::arg("stream") = 0,
+        "Persistent FP16-accumulate GEMM (data-parallel + stream-K schedule); act 3 = SwiGLU over 8-column "
+        "interleaved gate | up weights.");
+
     m.def("gemm_f16acc_swiglu",
         [](uintptr_t A, uintptr_t Bg, uintptr_t Bu, int ldb, uintptr_t Dg, uintptr_t Du, int ldd, uintptr_t D, int M,
            int N, int K, int split, uintptr_t stream) {

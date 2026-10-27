@@ -355,7 +355,13 @@ class LawamTorchFrontendRtx:
             # gate and up share their input; FP8 keeps separate weight scales,
             # the 16-bit path runs them as one [K, 2 FF] GEMM
             if self.precision["llm"] in ("fp16", "f16acc") and "gateup" not in self.fp8_sites.get("llm", ()):
-                self._lin(L, "gateup", torch.cat([g(b + "mlp.gate_proj.weight"), g(b + "mlp.up_proj.weight")], 0))
+                gu = torch.cat([g(b + "mlp.gate_proj.weight"), g(b + "mlp.up_proj.weight")], 0)
+                if self.precision["llm"] == "f16acc" and P.swiglu_interleaved(gu.shape[0] // 2, gu.shape[1]):
+                    # the persistent GEMM's SwiGLU epilogue reads 8-column gate / up blocks
+                    L["gateup_w16"] = self._h(P.interleave_gate_up(gu.to(self.device, _F32).t()))
+                    L["gateup_il"] = True
+                else:
+                    self._lin(L, "gateup", gu)
             else:
                 self._lin(L, "gate", g(b + "mlp.gate_proj.weight"))
                 self._lin(L, "up", g(b + "mlp.up_proj.weight"))
