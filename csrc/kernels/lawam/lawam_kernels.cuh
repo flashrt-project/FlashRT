@@ -179,7 +179,8 @@ int dit_sum_bias_euler(const float* partials, int splits, const float* a_gs, con
 // (outside graph capture); _cfg forces a tile (0..7) and split (1..8).
 int gemm_f16acc_act(const __half* A, const __half* B, __half* D, const __half* bias, int M, int N, int K, int act,
                     int split, cudaStream_t stream);
-// SwiGLU as one dual GEMM (FP16 accumulation, serial split-K split):
+// SwiGLU as one dual GEMM (FP16 accumulation, serial split-K split; split
+// <= 0 times it with the tile):
 // Dg = A @ Bg, Du = A @ Bu (FP16 [M, N] slices / sums, leading dim ldd; Bg, Bu
 // [K, N] with leading dim ldb) and D [M, N] = silu(Dg) * Du in FP32, as
 // gemm_f16acc on [Bg | Bu] followed by silu_mul. The tile is timed per shape

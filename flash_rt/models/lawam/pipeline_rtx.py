@@ -55,11 +55,22 @@ def _quant_f16(fvk, src, out8, scale, n, st):
 # In "cal" / "fp16" / "f16acc" the FP16 operand lives in the stage's ``f16`` scratch.
 _F16 = ("fp16", "f16acc")
 
-# "f16acc" GEMM kernel: "cutlass" (lawam.gemm_f16acc_act: CUTLASS tiles with the
-# serial split-K of the cuBLASLt plan, so the same FP16 sums, and bias + GELU
-# fused into the epilogue) or "cublas" (lawam.gemm_f16acc).
+# "f16acc" GEMM kernel: "cutlass" (lawam.gemm_f16acc_act: CUTLASS tiles, bias +
+# GELU / SwiGLU fused into the epilogue) or "cublas" (lawam.gemm_f16acc).
+# F16ACC_SPLIT: serial split-K of the CUTLASS GEMMs, "timed" (the fastest
+# plan per shape) or "cublas" (the cuBLASLt plan's split: the same FP16 sums).
 F16ACC_KERNEL = "cutlass"
+F16ACC_SPLIT = "timed"
 _F16ACC_SPLIT = {}
+
+
+def _split_for(key):
+    if F16ACC_SPLIT == "timed":
+        return 0
+    split = _F16ACC_SPLIT.get(key)
+    if split is None:
+        split = _F16ACC_SPLIT[key] = max(1, _LK.gemm_f16acc_split(*key))
+    return split
 
 
 def _f16acc(a, w, out, bias, M, N, K, act, st):
@@ -71,10 +82,7 @@ def _f16acc(a, w, out, bias, M, N, K, act, st):
         if act == 2:
             _ck(_LK.bias_gelu_erf(out, N, bias, 0, 0, out, M, N, st), "gelu")
         return
-    key = (M, N, K, bool(bias) and act < 2, act == 1)
-    split = _F16ACC_SPLIT.get(key)
-    if split is None:
-        split = _F16ACC_SPLIT[key] = max(1, _LK.gemm_f16acc_split(*key))
+    split = _split_for((M, N, K, bool(bias) and act < 2, act == 1))
     _ck(_LK.gemm_f16acc_act(a, w, out, bias, M, N, K, act, split, st), "f16acc gemm")
 
 def _norm8(fvk, x, delta, bias, delta2, w, b, mode, eps, out8, scale, rows, dim, st, prec, scratch):
@@ -118,16 +126,12 @@ def _gelu8(lk, fvk, x, ld, bias, out8, scale, rows, n, st, prec, scratch, *, tan
 def _f16acc_swiglu(a, w, gu, out, M, FF, K, st):
     """out [M, FF] = silu(a @ w[:, :FF]) * (a @ w[:, FF:]) (w [K, 2 FF], gate |
     up sums in gu [M, 2 FF]): the "cutlass" f16acc kernel runs it as one dual
-    GEMM with the gate|up GEMM's split-K (same FP16 sums), "cublas" as the
-    gate|up GEMM + silu_mul. ``out`` must not alias ``a``."""
+    GEMM, "cublas" as the gate|up GEMM + silu_mul. ``out`` must not alias ``a``."""
     if F16ACC_KERNEL == "cublas":
         _f16acc(a, w, gu, 0, M, 2 * FF, K, 0, st)
         _ck(_LK.silu_mul(gu, gu + FF * 2, 2 * FF, out, M, FF, st), "llm silu")
         return
-    key = (M, 2 * FF, K, False, False)
-    split = _F16ACC_SPLIT.get(key)
-    if split is None:
-        split = _F16ACC_SPLIT[key] = max(1, _LK.gemm_f16acc_split(*key))
+    split = _split_for((M, 2 * FF, K, False, False))
     _ck(_LK.gemm_f16acc_swiglu(a, w, w + FF * 2, 2 * FF, gu, gu + FF * 2, 2 * FF, out, M, FF, K, split, st),
         "llm swiglu")
 

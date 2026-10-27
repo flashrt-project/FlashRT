@@ -72,14 +72,15 @@ temporal patch copies are folded into the Qwen3-VL patch-embedding weight.
 The LeRobot policy runs Qwen3-VL on `inputs_embeds` only, so Qwen3-VL uses
 sequential (1-D) rotary positions for every token; the frontend matches it.
 
-The FP16-accumulate GEMMs run CUTLASS SM80 tensor-op tiles (timed per shape
-on the first call) with the serial split-K of the cuBLASLt `COMPUTE_16F` plan
-for the same shape, so they form the same FP16 sums as `lawam.gemm_f16acc`;
-the erf-GELU and SwiGLU epilogues reproduce the separate passes bit for bit,
-the ViT's tanh-GELU epilogue differs from cuBLASLt's by at most one FP16 ulp.
-`flash_rt.models.lawam.pipeline_rtx.F16ACC_KERNEL = "cublas"` (set before the
-graph is captured) selects the cuBLASLt plans with stand-alone epilogue
-kernels instead.
+The FP16-accumulate GEMMs run CUTLASS SM80 tensor-op tiles with the bias /
+GELU / SwiGLU epilogues fused; the tile and serial split-K count are timed per
+shape on the first call. `flash_rt.models.lawam.pipeline_rtx.F16ACC_SPLIT =
+"cublas"` (set before the graph is captured) uses the split of the cuBLASLt
+`COMPUTE_16F` plan instead, so the GEMMs form the same FP16 sums as
+`lawam.gemm_f16acc` (the erf-GELU and SwiGLU epilogues then reproduce the
+separate passes bit for bit, the ViT's tanh-GELU epilogue differs from
+cuBLASLt's by at most one FP16 ulp), and `F16ACC_KERNEL = "cublas"` the cuBLASLt
+plans with stand-alone epilogue kernels.
 
 ## Precision policy
 

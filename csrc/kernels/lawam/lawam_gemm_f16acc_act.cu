@@ -349,17 +349,17 @@ int gemm_f16acc_act_cfg(const __half* A, const __half* B, __half* D, const __hal
 int gemm_f16acc_swiglu(const __half* A, const __half* Bg, const __half* Bu, int ldb, __half* Dg, __half* Du, int ldd,
                        __half* D, int M, int N, int K, int split, cudaStream_t stream) {
     if (A == nullptr || Bg == nullptr || Bu == nullptr || Dg == nullptr || Du == nullptr || D == nullptr || M < 1 ||
-        N % 8 != 0 || K % 8 != 0 || ldb % 8 != 0 || ldd % 8 != 0 || split < 1 || split > kMaxSplit || split * 64 > K)
+        N % 8 != 0 || K % 8 != 0 || ldb % 8 != 0 || ldd % 8 != 0 || split > kMaxSplit || split * 64 > K)
         return static_cast<int>(cudaErrorInvalidValue);
     Ctx& c = ctx();
-    const auto key = std::make_tuple(M, N, K, -split);
-    int tile = -1;
+    const auto key = std::make_tuple(M, N, K, -1 - (split > 0 ? split : 0));
+    int plan = -1;
     {
         std::lock_guard<std::mutex> lock(c.mu);
         const auto it = c.plan.find(key);
-        if (it != c.plan.end()) tile = it->second;
+        if (it != c.plan.end()) plan = it->second;
     }
-    if (tile < 0) {
+    if (plan < 0) {
         cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
         cudaStreamIsCapturing(stream, &cap);
         if (cap != cudaStreamCaptureStatusNone) return static_cast<int>(cudaErrorStreamCaptureUnsupported);
@@ -368,28 +368,31 @@ int gemm_f16acc_swiglu(const __half* A, const __half* Bg, const __half* Bu, int 
         cudaEventCreate(&e1);
         float best = 1e30f;
         for (int t = 0; t < kDualTiles; ++t) {
-            bool ok = true;
-            for (int r = 0; r < 3 && ok; ++r)
-                ok = run_dual_tile(t, split, A, Bg, Bu, ldb, Dg, Du, ldd, D, M, N, K, stream) == 0;
-            if (!ok) continue;
-            cudaEventRecord(e0, stream);
-            for (int r = 0; r < 10; ++r) run_dual_tile(t, split, A, Bg, Bu, ldb, Dg, Du, ldd, D, M, N, K, stream);
-            cudaEventRecord(e1, stream);
-            cudaEventSynchronize(e1);
-            float ms = 0.f;
-            cudaEventElapsedTime(&ms, e0, e1);
-            if (ms < best) {
-                best = ms;
-                tile = t;
+            for (int sp = 1; sp <= kMaxSplit; ++sp) {
+                if ((split > 0 && sp != split) || sp * 64 > K) continue;
+                bool ok = true;
+                for (int r = 0; r < 3 && ok; ++r)
+                    ok = run_dual_tile(t, sp, A, Bg, Bu, ldb, Dg, Du, ldd, D, M, N, K, stream) == 0;
+                if (!ok) continue;
+                cudaEventRecord(e0, stream);
+                for (int r = 0; r < 10; ++r) run_dual_tile(t, sp, A, Bg, Bu, ldb, Dg, Du, ldd, D, M, N, K, stream);
+                cudaEventRecord(e1, stream);
+                cudaEventSynchronize(e1);
+                float ms = 0.f;
+                cudaEventElapsedTime(&ms, e0, e1);
+                if (ms < best) {
+                    best = ms;
+                    plan = t * 16 + sp;
+                }
             }
         }
         cudaEventDestroy(e0);
         cudaEventDestroy(e1);
-        if (tile < 0) return static_cast<int>(cudaErrorNotSupported);
+        if (plan < 0) return static_cast<int>(cudaErrorNotSupported);
         std::lock_guard<std::mutex> lock(c.mu);
-        c.plan[key] = tile;
+        c.plan[key] = plan;
     }
-    return run_dual_tile(tile, split, A, Bg, Bu, ldb, Dg, Du, ldd, D, M, N, K, stream);
+    return run_dual_tile(plan / 16, plan % 16, A, Bg, Bu, ldb, Dg, Du, ldd, D, M, N, K, stream);
 }
 
 int gemm_f16acc_swiglu_cfg(const __half* A, const __half* Bg, const __half* Bu, int ldb, __half* Dg, __half* Du,

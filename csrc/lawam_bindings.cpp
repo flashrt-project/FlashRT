@@ -290,7 +290,7 @@ PYBIND11_MODULE(flash_rt_lawam, m) {
                                          to_stream(stream));
         },
         py::arg("A"), py::arg("Bg"), py::arg("Bu"), py::arg("ldb"), py::arg("Dg"), py::arg("Du"), py::arg("ldd"),
-        py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"), py::arg("split") = 1, py::arg("stream") = 0,
+        py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"), py::arg("split") = 0, py::arg("stream") = 0,
         "D = silu(A @ Bg) * (A @ Bu): one FP16-accumulate dual GEMM (serial split-K), gate / up sums in Dg / Du.");
     m.def("gemm_f16acc_swiglu_cfg",
         [](uintptr_t A, uintptr_t Bg, uintptr_t Bu, int ldb, uintptr_t Dg, uintptr_t Du, int ldd, uintptr_t D, int M,
