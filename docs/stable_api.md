@@ -777,6 +777,16 @@ LIBERO outputs are `(10, 7)`. Other hardware/frameworks and unimplemented precis
 requests fail explicitly. Full-action numerical and gripper-decision validation
 remains required; see [DM05 validation](dm05_sm120.md#complete-action-validation).
 
+### LaWAM on RTX SM120
+
+`load_model(checkpoint, config="lawam", framework="torch", hardware="rtx_sm120")`
+selects `LawamTorchFrontendRtx` for the LeRobot LaWAM checkpoint; it needs
+`FLASHRT_ENABLE_LAWAM=ON` for `flash_rt_lawam`. `predict([primary, wrist],
+prompt=task)` takes two uint8 256x256 RGB views and returns the unnormalized
+`(action_horizon, 7)` chunk; `infer(frames, noise=...)` accepts the initial flow
+sample for reproducible comparisons. Other hardware/frameworks fail explicitly.
+Precision tiers and validation: [LaWAM on RTX SM120](lawam_rtx.md).
+
 ## Alpamayo trajectory frontends
 
 Alpamayo produces trajectories and reasoning from camera frames and ego history,
