@@ -294,6 +294,15 @@ option(FLASHRT_ENABLE_DM05
 # Ada (sm_89) build with -DFLASHRT_ENABLE_GROOT_N15=ON.
 option(FLASHRT_ENABLE_GROOT_N15
        "Build GR00T N1.5 RTX SM89 kernels in flash_rt_groot_n15" OFF)
+
+# LaWAM (latent world action model VLA) — builds flash_rt_lawam.so with the
+# kernels FlashRT has no equivalent for: camera patchification for the Qwen3-VL
+# and DINOv3 towers, the gated AdaLN rows of the LAM decoder, the VLM-to-latent
+# QFormer, and the positional-embedding consumers of the skinny NVFP4 flow DiT.
+# Opt-in, separate from flash_rt_kernels; enable on a Blackwell (sm_120) build
+# with -DFLASHRT_ENABLE_LAWAM=ON.
+option(FLASHRT_ENABLE_LAWAM
+       "Build LaWAM RTX SM120 fused kernels in flash_rt_lawam" OFF)
 # Shared delayed-codebook helper used by discrete-audio paths. Kept behind an
 # explicit option so deployment builds that do not serve audio can remove the
 # TU and its binding in lockstep.
@@ -1496,6 +1505,37 @@ if(FLASHRT_ENABLE_GROOT_N15)
   message(STATUS "GR00T N1.5 SM89 kernels: ENABLED")
 else()
   message(STATUS "GR00T N1.5 SM89 kernels: DISABLED")
+endif()
+
+# ── LaWAM fused kernels (standalone module, independent of flash_rt_kernels) ──
+if(FLASHRT_ENABLE_LAWAM)
+  if(NOT GPU_ARCH STREQUAL "120")
+    message(FATAL_ERROR
+      "FLASHRT_ENABLE_LAWAM requires GPU_ARCH=120 (Blackwell / sm_120); "
+      "got '${GPU_ARCH}'.")
+  endif()
+  pybind11_add_module(flash_rt_lawam
+    csrc/lawam_bindings.cpp
+    csrc/kernels/lawam/lawam_kernels.cu
+    csrc/kernels/lawam/lawam_dit_sm120.cu
+    csrc/kernels/lawam/lawam_gemm_f16acc.cu)
+  set_target_properties(flash_rt_lawam PROPERTIES
+    CUDA_STANDARD 17
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+  target_include_directories(flash_rt_lawam PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels)
+  target_compile_options(flash_rt_lawam PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3
+      ${GPU_GENCODE}
+    >)
+  target_link_libraries(flash_rt_lawam PRIVATE CUDA::cudart CUDA::cublasLt)
+  install(TARGETS flash_rt_lawam LIBRARY DESTINATION flash_rt)
+  message(STATUS "LaWAM SM120 kernels: ENABLED")
+else()
+  message(STATUS "LaWAM SM120 kernels: DISABLED")
 endif()
 
 # ── MiniMax-Remover fused kernels (standalone module, independent

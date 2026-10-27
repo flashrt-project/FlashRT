@@ -139,6 +139,10 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("dm05", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.dm05_rtx", "Dm05TorchFrontendRtx"),
 
+    # LaWAM (LeRobot checkpoint): Qwen3-VL + latent action model + flow DiT.
+    ("lawam", "torch", "rtx_sm120"):
+        ("flash_rt.frontends.torch.lawam_rtx", "LawamTorchFrontendRtx"),
+
     # ── Pi0.5 ──
     ("pi05", "torch", "thor"):
         ("flash_rt.frontends.torch.pi05_thor", "Pi05TorchFrontendThor"),
