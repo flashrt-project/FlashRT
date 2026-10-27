@@ -169,7 +169,8 @@ over 10 seeds (5000 episodes; [protocol](docs/pi05_prefix_nvfp4.md#libero-10-clo
 
 | Hardware | Mode | Latency | Source |
 |---|---|---:|---|
-| RTX 4090 | bf16 torch CUDA Graph (no FP8 kernels), 3-view, `get_action` | **~46–50 ms** (eager ~70–80 ms) | [GROOT N1.5 SM89](docs/groot_n15_rtx_sm89.md) |
+| RTX 4090 | FP8 (default), 3-view, `infer` / graph replay | **30.8 ms** / 21.2 ms (upstream eager 81.2 ms) | [GROOT N1.5 SM89](docs/groot_n15_rtx_sm89.md) |
+| RTX 4090 | BF16, 3-view, `infer` / graph replay | **35.0 ms** / 24.9 ms | [GROOT N1.5 SM89](docs/groot_n15_rtx_sm89.md) |
 
 #### GROOT N1.7
 

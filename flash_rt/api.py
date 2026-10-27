@@ -881,9 +881,6 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             logger.warning(
                 "Ascend NPU backend: FP8 is not available on 910/A2 parts "
                 "(no FP8 tensor hardware); falling back to the BF16 tier.")
-    elif config == "groot_n15":
-        # Torch-level CUDA-Graph tier (no flash_rt_kernels, no calibration).
-        pass
     else:
         from flash_rt import _extensions
         _extensions.require(config=config)

@@ -1,21 +1,26 @@
 # FlashRT — GR00T N1.5 model configuration (metadata only; runtime dimensions
-# come from the checkpoint and the Isaac-GR00T data config).
+# come from the checkpoint config, the Eagle2.5 config shipped with the
+# upstream gr00t package and the Isaac-GR00T data config).
 name: groot_n15
 display_name: "NVIDIA GR00T-N1.5-3B"
 
 backbone:
-  family: eagle2_5          # SigLIP2 vision tower + Qwen3 LLM
-  llm_layers: 12            # truncated; persisted in the checkpoint
+  family: eagle2_5          # SigLIP vision tower + Qwen3 language model
+  vision_layers: 27
+  llm_layers: 12            # select_layer; the checkpoint is truncated
   image_size: 224
-  tokens_per_image: 256
+  tokens_per_image: 256     # no pixel shuffle, one-layer mlp1 connector
 
 action_head:
   type: flow_matching_dit
+  vl_self_attention_layers: 4
+  dit_layers: 16            # cross-attention on even layers, self on odd
   num_inference_timesteps: 4
   action_horizon: 16
 
 runtime:
   framework: torch
   hardware: rtx_sm89        # RTX 4090
-  precision: bf16           # CUDA Graph; no FP8 calibration
-  attention: sdpa
+  precision: fp8            # default tier; use_fp8=False selects bf16
+  attention: fa2
+  build_flag: FLASHRT_ENABLE_GROOT_N15

@@ -204,7 +204,7 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("groot", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.groot_rtx", "GrootTorchFrontendRtx"),
 
-    # ── GROOT N1.5 (torch CUDA-Graph bf16 tier, RTX 4090) ──
+    # ── GROOT N1.5 (RTX 4090; FP8 default, BF16 with use_fp8=False) ──
     ("groot_n15", "torch", "rtx_sm89"):
         ("flash_rt.frontends.torch.groot_n15_rtx_sm89",
          "GrootN15TorchFrontendRtxSm89"),

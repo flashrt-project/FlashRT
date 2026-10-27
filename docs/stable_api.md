@@ -194,10 +194,13 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   validates and benchmarks the optimized denoise boundary. See
   `docs/cosmos3_edge_thor.md`.
 - `config="groot_n15"` is registered for `framework="torch"` on
-  `hardware="rtx_sm89"` only: a torch-level bf16 CUDA-Graph tier over the
-  upstream Isaac-GR00T `Gr00tPolicy` (set `$GROOT_N15_ROOT` and
-  `$GROOT_N15_DATA_CONFIG`, or pass `groot_root=`/`data_config=` to the
-  frontend). It does not need `flash_rt_kernels`; `predict(...)` returns the
+  `hardware="rtx_sm89"` only, as FlashRT kernels in one CUDA graph per prompt
+  length: FP8 by default, BF16 (the reference's algorithms) with
+  `use_fp8=False`. It needs `flash_rt_kernels`, `flash_rt_fa2` and
+  `flash_rt_groot_n15` (`-DFLASHRT_ENABLE_GROOT_N15=ON`) and the upstream
+  Isaac-GR00T `gr00t` package for the observation / action transforms (set
+  `$GROOT_N15_ROOT` and `$GROOT_N15_DATA_CONFIG`, or pass
+  `groot_root=` / `data_config=` to the frontend); `predict(...)` returns the
   GR00T per-key action dict. See `docs/groot_n15_rtx_sm89.md`.
 - `config="groot_n17"` is registered for `framework="torch"` on
   `hardware in {"thor", "rtx_sm120", "rtx_sm89", "amd_cdna4", "npu"}`. On RTX,
