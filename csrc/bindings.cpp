@@ -33,6 +33,7 @@
 #include "gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_fp4out_sm120.cuh"
 #include "gemm/fp4/cutlass_nvfp4_dual_gemm_silu_fp4out_sm120.cuh"
 #include "gemm/fp4/cutlass_nvfp4_gemm_dn_streamk_bias_sm120.cuh"
+#include "kernels/xvla_fp4_gemm_sm120.cuh"
 #ifdef FLASHRT_HAVE_SM120_NVFP4_DEV
 #include "gemm/fp4/cutlass_nvfp4_w4a16_tilesweep_sm120.cuh"
 #include "gemm/fp4/normfold/cutlass_nvfp4_normfold_probe_sm120.cuh"
@@ -247,6 +248,16 @@ extern "C" void flash_rt_awq_quant_fp8_static_fp16(
 #include "kernels/gated_deltanet_qwen36.cuh"
 #endif
 #include "kernels/qwen3_qkv_post_proc.cuh"
+#ifdef ENABLE_CUTLASS_SM120_NVFP4_W4A16
+#include "kernels/xvla_rtx.cuh"
+#endif
+#include "kernels/pdl_switch.cuh"
+#include "kernels/pdl_shared.cuh"
+#include "kernels/xvla_quantize_pdl.cuh"
+#include "kernels/xvla_fp8_quant_pdl.cuh"
+#ifdef ENABLE_CUTLASS_SM120_NVFP4_W4A16
+#include "kernels/xvla_vision_sm120.cuh"
+#endif
 #if defined(FLASHRT_HAVE_HYVLA_THOR) || defined(FLASHRT_HAVE_HYVLA_ORIN)
 #include "kernels/hyvla_fused_thor.cuh"
 #include "kernels/hyvla_vit_fuse.cuh"
@@ -11231,7 +11242,7 @@ stages in {2,3}. M in 1..48; K%64==0; (K/64)%kg==0; N%cols==0.
         py::arg("nt"), py::arg("C"), py::arg("stream") = 0,
         "Hy-VLA prefix scatter: buf[dest[j], :] = merged[j, :].");
 
-    m.def("hyvla_vit_add_layer_norm_to_fp8_block128_bf16",
+m.def("hyvla_vit_add_layer_norm_to_fp8_block128_bf16",
         [](uintptr_t residual, uintptr_t x_add, uintptr_t ln_weight,
            uintptr_t ln_bias, uintptr_t out_fp8, uintptr_t scale,
            int rows, int dim, float eps, uintptr_t stream) {
@@ -11491,5 +11502,326 @@ stages in {2,3}. M in 1..48; K%64==0; (K/64)%kg==0; N%cols==0.
         py::arg("SFA"), py::arg("SFB"),
         py::arg("alpha") = 1.0f, py::arg("N"), py::arg("K"),
         py::arg("stream") = 0);
+
+#ifdef FLASHRT_BUILD_XVLA
+    // X-VLA small-M NVFP4 GEMMs (csrc/kernels/xvla_fp4_gemm_sm120.cu, same
+    // GPU_ARCH 120/121 block). Same operands and arguments as the cutlass
+    // entries they replace, bit-identical outputs; return 0 on success.
+    m.def("xvla_fp4_gemm_bias_bf16out",
+        [](uintptr_t A_packed, uintptr_t B_packed, uintptr_t D, uintptr_t bias,
+           int M, int N, int K, uintptr_t SFA, uintptr_t SFB, float alpha,
+           uintptr_t stream) -> int {
+          return flash_rt::xvla::fp4_gemm_bias_bf16out(
+              to_ptr(A_packed), to_ptr(B_packed), to_ptr(D), to_ptr(bias),
+              M, N, K, to_ptr(SFA), to_ptr(SFB), alpha, to_stream(stream));
+        },
+        py::arg("A_packed"), py::arg("B_packed"), py::arg("D"),
+        py::arg("bias"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("SFA"), py::arg("SFB"),
+        py::arg("alpha") = 1.0f, py::arg("stream") = 0);
+    m.def("xvla_fp4_gemm_bias_gelu_fp4out",
+        [](uintptr_t A_packed, uintptr_t B_packed, uintptr_t SFA, uintptr_t SFB,
+           uintptr_t bias, uintptr_t D_packed, uintptr_t SFD, int M, int N, int K,
+           float alpha, uintptr_t stream) -> int {
+          return flash_rt::xvla::fp4_gemm_bias_gelu_fp4out(
+              to_ptr(A_packed), to_ptr(B_packed), to_ptr(SFA), to_ptr(SFB),
+              to_ptr(bias), to_ptr(D_packed), to_ptr(SFD), M, N, K, alpha,
+              to_stream(stream));
+        },
+        py::arg("A_packed"), py::arg("B_packed"), py::arg("SFA"),
+        py::arg("SFB"), py::arg("bias"), py::arg("D_packed"), py::arg("SFD"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("alpha") = 1.0f, py::arg("stream") = 0);
+#endif  // FLASHRT_BUILD_XVLA
 #endif  // ENABLE_CUTLASS_SM120_NVFP4_W4A16
+
+#if defined(ENABLE_CUTLASS_SM120_NVFP4_W4A16) && defined(FLASHRT_BUILD_XVLA)
+    // ── X-VLA (soft-prompted flow-matching VLA) graph-safe bf16 helpers ──
+    m.def("xvla_add2_bf16", [](uintptr_t a, uintptr_t b, uintptr_t out, int n,
+                               uintptr_t stream) {
+        flash_rt::xvla::add2_bf16(typed_ptr<__nv_bfloat16>(a),
+                                  typed_ptr<__nv_bfloat16>(b),
+                                  typed_ptr<__nv_bfloat16>(out), n, to_stream(stream));
+    }, py::arg("a"), py::arg("b"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+    m.def("xvla_flow_step_bf16",
+          [](uintptr_t x1, uintptr_t prev, uintptr_t act_tok, uintptr_t time,
+             double t, int rows, int dim, int stride, int g0, int g1, int toff,
+             int time_dim, uintptr_t stream) {
+        flash_rt::xvla::flow_step_bf16(
+            typed_ptr<__nv_bfloat16>(x1), typed_ptr<__nv_bfloat16>(prev),
+            typed_ptr<__nv_bfloat16>(act_tok), typed_ptr<__nv_bfloat16>(time),
+            static_cast<float>(t), rows, dim, stride, g0, g1, toff, time_dim,
+            to_stream(stream));
+    }, py::arg("x1"), py::arg("prev"), py::arg("act_tok"), py::arg("time"),
+       py::arg("t"), py::arg("rows"), py::arg("dim"), py::arg("stride"),
+       py::arg("g0"), py::arg("g1"), py::arg("toff"), py::arg("time_dim"),
+       py::arg("stream") = 0);
+    m.def("xvla_action_decoder_gemv",
+          [](uintptr_t x, uintptr_t w, uintptr_t bias, uintptr_t out,
+             int M, int N, int K, uintptr_t stream) {
+        flash_rt::xvla::action_decoder_gemv_bf16(
+            typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(w),
+            typed_ptr<__nv_bfloat16>(bias), typed_ptr<__nv_bfloat16>(out),
+            M, N, K, to_stream(stream));
+    }, py::arg("x"), py::arg("w"), py::arg("bias"), py::arg("out"),
+       py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+
+    m.def("xvla_proprio_bf16",
+          [](uintptr_t state, uintptr_t act_tok, int rows, int stride, int poff,
+             int dim_proprio, int n_state, int g0, int g1, uintptr_t stream) {
+        flash_rt::xvla::proprio_bf16(
+            typed_ptr<float>(state), typed_ptr<__nv_bfloat16>(act_tok), rows,
+            stride, poff, dim_proprio, n_state, g0, g1, to_stream(stream));
+    }, py::arg("state"), py::arg("act_tok"), py::arg("rows"), py::arg("stride"),
+       py::arg("poff"), py::arg("dim_proprio"), py::arg("n_state"),
+       py::arg("g0"), py::arg("g1"), py::arg("stream") = 0);
+    m.def("xvla_finalize_bf16",
+          [](uintptr_t in, uintptr_t out, int rows, int dim, int stride, int g0,
+             int g1, uintptr_t stream) {
+        flash_rt::xvla::finalize_bf16(typed_ptr<__nv_bfloat16>(in),
+                                      typed_ptr<float>(out), rows, dim, stride,
+                                      g0, g1, to_stream(stream));
+    }, py::arg("in"), py::arg("out"), py::arg("rows"), py::arg("dim"),
+       py::arg("stride"), py::arg("g0"), py::arg("g1"), py::arg("stream") = 0);
+    m.def("xvla_cast_f16_to_bf16", [](uintptr_t in, uintptr_t out, int n,
+                                      uintptr_t stream) {
+        flash_rt::xvla::cast_f16_to_bf16(typed_ptr<__half>(in),
+                                         typed_ptr<__nv_bfloat16>(out), n,
+                                         to_stream(stream));
+    }, py::arg("in"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+    m.def("xvla_copy_f16", [](uintptr_t in, uintptr_t out, int n, uintptr_t stream) {
+        flash_rt::xvla::copy_f16(typed_ptr<__half>(in), typed_ptr<__half>(out), n,
+                                 to_stream(stream));
+    }, py::arg("in"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+    m.def("xvla_copy_bf16", [](uintptr_t in, uintptr_t out, int n, uintptr_t stream) {
+        flash_rt::xvla::copy_bf16(typed_ptr<__nv_bfloat16>(in),
+                                  typed_ptr<__nv_bfloat16>(out), n, to_stream(stream));
+    }, py::arg("in"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+    m.def("xvla_ln_quant_bf16_nt256",
+          [](uintptr_t x, uintptr_t w, uintptr_t b, uintptr_t packed,
+             uintptr_t sf, int rows, int cols, float eps, uintptr_t stream) {
+        flash_rt::xvla::ln_quant_bf16_nt256(typed_ptr<__nv_bfloat16>(x),
+                                            typed_ptr<__nv_bfloat16>(w),
+                                            typed_ptr<__nv_bfloat16>(b),
+                                            reinterpret_cast<uint8_t*>(packed),
+                                            reinterpret_cast<uint8_t*>(sf), rows,
+                                            cols, eps, to_stream(stream));
+    }, py::arg("x"), py::arg("ln_weight"), py::arg("ln_bias"), py::arg("packed"),
+       py::arg("scale_factors"), py::arg("rows"), py::arg("cols"),
+       py::arg("eps") = 1e-5f, py::arg("stream") = 0);
+    m.def("xvla_ln_bf16",
+        [](uintptr_t x, uintptr_t out, uintptr_t w, uintptr_t b, int64_t rows,
+           int64_t cols, double eps, uintptr_t stream) {
+            flash_rt::xvla::ln_bf16((const __nv_bfloat16*)to_ptr(x),
+                                    (__nv_bfloat16*)to_ptr(out),
+                                    (const __nv_bfloat16*)to_ptr(w),
+                                    (const __nv_bfloat16*)to_ptr(b),
+                                    (int)rows, (int)cols, (float)eps,
+                                    to_stream(stream));
+        },
+        py::arg("x"), py::arg("out"), py::arg("w"), py::arg("b"),
+        py::arg("rows"), py::arg("cols"), py::arg("eps"), py::arg("stream") = 0);
+    m.def("xvla_ln_quant_bf16",
+          [](uintptr_t x, uintptr_t w, uintptr_t b, uintptr_t packed,
+             uintptr_t sf, int rows, int cols, float eps, uintptr_t stream) {
+        flash_rt::xvla::ln_quant_bf16(typed_ptr<__nv_bfloat16>(x),
+                                      typed_ptr<__nv_bfloat16>(w),
+                                      typed_ptr<__nv_bfloat16>(b),
+                                      reinterpret_cast<uint8_t*>(packed),
+                                      reinterpret_cast<uint8_t*>(sf), rows, cols,
+                                      eps, to_stream(stream));
+    }, py::arg("x"), py::arg("ln_weight"), py::arg("ln_bias"), py::arg("packed"),
+       py::arg("scale_factors"), py::arg("rows"), py::arg("cols"),
+       py::arg("eps") = 1e-5f, py::arg("stream") = 0);
+    py::class_<flash_rt::pdl::Scope>(m, "xvla_pdl_scope")
+        .def(py::init<bool>(), py::arg("enabled"))
+        .def("__enter__", [](flash_rt::pdl::Scope& scope) -> flash_rt::pdl::Scope& {
+            scope.enter(); return scope;
+        }, py::return_value_policy::reference_internal)
+        .def("__exit__", [](flash_rt::pdl::Scope& scope, py::object, py::object, py::object) {
+            scope.leave();
+        });
+
+    m.def("xvla_add_ln_quant_bf16",
+          [](uintptr_t residual, uintptr_t h, uintptr_t w, uintptr_t b,
+             uintptr_t packed, uintptr_t sf, int rows, int cols, float eps,
+             uintptr_t stream) {
+        flash_rt::xvla::add_ln_quant_bf16(typed_ptr<__nv_bfloat16>(residual),
+                                          typed_ptr<__nv_bfloat16>(h),
+                                          typed_ptr<__nv_bfloat16>(w),
+                                          typed_ptr<__nv_bfloat16>(b),
+                                          reinterpret_cast<uint8_t*>(packed),
+                                          reinterpret_cast<uint8_t*>(sf), rows, cols,
+                                          eps, to_stream(stream));
+    }, py::arg("residual"), py::arg("h"), py::arg("ln_weight"), py::arg("ln_bias"),
+       py::arg("packed"), py::arg("scale_factors"), py::arg("rows"),
+       py::arg("cols"), py::arg("eps") = 1e-5f, py::arg("stream") = 0);
+    m.def("xvla_add_ln_quant_norm_bf16",
+          [](uintptr_t residual, uintptr_t h, uintptr_t norm_out, uintptr_t w,
+             uintptr_t b, uintptr_t packed, uintptr_t sf, int rows, int cols,
+             float eps, uintptr_t stream) {
+        flash_rt::xvla::add_ln_quant_norm_bf16(
+            typed_ptr<__nv_bfloat16>(residual), typed_ptr<__nv_bfloat16>(h),
+            typed_ptr<__nv_bfloat16>(norm_out), typed_ptr<__nv_bfloat16>(w),
+            typed_ptr<__nv_bfloat16>(b), reinterpret_cast<uint8_t*>(packed),
+            reinterpret_cast<uint8_t*>(sf), rows, cols, eps, to_stream(stream));
+    }, py::arg("residual"), py::arg("h"), py::arg("norm_out"), py::arg("ln_weight"),
+       py::arg("ln_bias"), py::arg("packed"), py::arg("scale_factors"),
+       py::arg("rows"), py::arg("cols"), py::arg("eps") = 1e-5f,
+       py::arg("stream") = 0);
+
+    // ── X-VLA / Florence-2 DaViT vision tower ──
+    // ── X-VLA / Florence-2 DaViT vision tower (bf16 + fp16) ──
+    m.def("xvla_vision_ln_f16_bf16",
+          [](uintptr_t x, uintptr_t w, uintptr_t b, uintptr_t out, int rows,
+             int dim, double eps, uintptr_t stream) {
+        flash_rt::xvla::vision_ln_f16_bf16(
+            typed_ptr<__half>(x), typed_ptr<__half>(w), typed_ptr<__half>(b),
+            typed_ptr<__nv_bfloat16>(out), rows, dim, static_cast<float>(eps),
+            to_stream(stream));
+    }, py::arg("x"), py::arg("w"), py::arg("b"), py::arg("out"), py::arg("rows"),
+       py::arg("dim"), py::arg("eps"), py::arg("stream") = 0);
+    m.def("xvla_vision_resize", [](uintptr_t src, uintptr_t dst, int n, int cin,
+                                   int hin, int win_, int hout, int wout, bool h,
+                                   uintptr_t stream) {
+        flash_rt::xvla::vision_resize_bilinear_f32(to_ptr(dst), typed_ptr<float>(src),
+                                                   n, cin, hin, win_, hout, wout, h,
+                                                   to_stream(stream));
+    }, py::arg("src"), py::arg("dst"), py::arg("n"), py::arg("cin"), py::arg("hin"),
+       py::arg("win"), py::arg("hout"), py::arg("wout"), py::arg("half"),
+       py::arg("stream") = 0);
+    m.def("xvla_vision_im2col", [](uintptr_t x, uintptr_t col, int H, int W, int cin,
+                                   int k, int stride, int pad, int out_h, int out_w,
+                                   int batch, bool h, uintptr_t stream) {
+        flash_rt::xvla::vision_im2col(to_ptr(col), to_ptr(x), H, W, cin, k, stride,
+                                      pad, out_h, out_w, batch, h, to_stream(stream));
+    }, py::arg("x"), py::arg("col"), py::arg("H"), py::arg("W"), py::arg("cin"),
+       py::arg("k"), py::arg("stride"), py::arg("pad"), py::arg("out_h"),
+       py::arg("out_w"), py::arg("batch"), py::arg("half"),
+       py::arg("stream") = 0);
+    m.def("xvla_vision_add_bias", [](uintptr_t x, uintptr_t bias, int rows, int cols,
+                                     bool h, uintptr_t stream) {
+        flash_rt::xvla::vision_add_bias(to_ptr(x), to_ptr(bias), rows, cols, h,
+                                        to_stream(stream));
+    }, py::arg("x"), py::arg("bias"), py::arg("rows"), py::arg("cols"),
+       py::arg("half"), py::arg("stream") = 0);
+    m.def("xvla_vision_dwconv3x3_res", [](uintptr_t x, uintptr_t w, uintptr_t bias,
+                                          uintptr_t out, int H, int W, int C,
+                                          int batch, bool h, uintptr_t stream) {
+        flash_rt::xvla::vision_dwconv3x3_res(to_ptr(out), to_ptr(x), to_ptr(w),
+                                             to_ptr(bias), H, W, C, batch, h,
+                                             to_stream(stream));
+    }, py::arg("x"), py::arg("w"), py::arg("bias"), py::arg("out"), py::arg("H"),
+       py::arg("W"), py::arg("C"), py::arg("batch"), py::arg("half"),
+       py::arg("stream") = 0);
+    m.def("xvla_vision_window_attn", [](uintptr_t qkv, uintptr_t out, int nw, int ws,
+                                        int C, int heads, bool h, uintptr_t stream) {
+        flash_rt::xvla::vision_window_attn(to_ptr(out), to_ptr(qkv), nw, ws, C, heads,
+                                           h, to_stream(stream));
+    }, py::arg("qkv"), py::arg("out"), py::arg("nw"), py::arg("ws"), py::arg("C"),
+       py::arg("heads"), py::arg("half"), py::arg("stream") = 0);
+    m.def("xvla_vision_window_qkv_pad",
+          [](uintptr_t qkv, uintptr_t bias, uintptr_t q, uintptr_t k, uintptr_t v,
+             int H, int W, int ws, int C, int heads, int nwin, int batch, bool h,
+             uintptr_t stream) {
+        flash_rt::xvla::vision_window_qkv_pad(to_ptr(q), to_ptr(k), to_ptr(v),
+                                              to_ptr(qkv), to_ptr(bias), H, W, ws,
+                                              C, heads, nwin, batch, h,
+                                              to_stream(stream));
+    }, py::arg("qkv"), py::arg("bias"), py::arg("q"), py::arg("k"), py::arg("v"),
+       py::arg("H"), py::arg("W"), py::arg("ws"), py::arg("C"), py::arg("heads"),
+       py::arg("nwin"), py::arg("batch"), py::arg("half"), py::arg("stream") = 0);
+    m.def("xvla_vision_window_qkv_pad_fill",
+          [](uintptr_t q, uintptr_t k, uintptr_t v, uintptr_t bias, int nw,
+             int ws, int C, int heads, bool h, uintptr_t stream) {
+        flash_rt::xvla::vision_window_qkv_pad_fill(to_ptr(q), to_ptr(k), to_ptr(v),
+                                                   to_ptr(bias), nw, ws, C, heads,
+                                                   h, to_stream(stream));
+    }, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("bias"), py::arg("nw"),
+       py::arg("ws"), py::arg("C"), py::arg("heads"), py::arg("half"),
+       py::arg("stream") = 0);
+    m.def("xvla_vision_window_out_unpad_to_nvfp4",
+        [](uintptr_t packed, uintptr_t sf, uintptr_t o, int H, int W, int ws,
+           int C, int heads, int batch, bool half, uintptr_t stream) {
+            flash_rt::xvla::vision_window_out_unpad_to_nvfp4(
+                to_ptr(packed), to_ptr(sf), to_ptr(o), H, W, ws, C, heads, batch,
+                half, to_stream(stream));
+        },
+        py::arg("packed"), py::arg("scale_factors"), py::arg("o"),
+        py::arg("H"), py::arg("W"), py::arg("window"), py::arg("C"),
+        py::arg("heads"), py::arg("batch"), py::arg("half"),
+        py::arg("stream") = 0);
+    m.def("xvla_vision_channel_attn", [](uintptr_t qkv, uintptr_t out, uintptr_t ws_f,
+                                         int N, int C, int groups, int batch, bool h,
+                                         uintptr_t stream) {
+        flash_rt::xvla::vision_channel_attn(to_ptr(out), to_ptr(qkv),
+                                            typed_ptr<float>(ws_f), N, C, groups,
+                                            batch, h, to_stream(stream));
+    }, py::arg("qkv"), py::arg("out"), py::arg("attn_ws"), py::arg("N"), py::arg("C"),
+       py::arg("groups"), py::arg("batch"), py::arg("half"), py::arg("stream") = 0);
+    m.def("xvla_vision_gelu_erf_to_nvfp4",
+        [](uintptr_t x, uintptr_t packed, uintptr_t sf, int rows, int cols,
+           uintptr_t stream) {
+            flash_rt::xvla::vision_gelu_erf_to_nvfp4(
+                to_ptr(x), to_ptr(packed), to_ptr(sf), rows, cols,
+                to_stream(stream));
+        },
+        py::arg("x"), py::arg("packed"), py::arg("scale_factors"),
+        py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
+    m.def("xvla_vision_projector_pack",
+          [](uintptr_t feat, uintptr_t pos, uintptr_t temporal, uintptr_t out,
+             int rows, int dim, bool h, uintptr_t stream) {
+        flash_rt::xvla::vision_projector_pack(to_ptr(out), to_ptr(feat), to_ptr(pos),
+                                              to_ptr(temporal), rows, dim, h,
+                                              to_stream(stream));
+    }, py::arg("feat"), py::arg("pos"), py::arg("temporal"), py::arg("out"),
+       py::arg("rows"), py::arg("dim"), py::arg("half"), py::arg("stream") = 0);
+
+    // Additive opt-in entries used by the X-VLA pipeline.  The existing
+    // add_bias_bf16 / residual_add / layer_norm / quantize_..._v2 /
+    // fp8_per_token_block128_quant_bf16 bindings above are unchanged.
+    m.def("add_bias_bf16_pdl",
+          [](uintptr_t x, uintptr_t b, int S, int D, uintptr_t stream) {
+              add_bias_bf16_pdl(typed_ptr<__nv_bfloat16>(x),
+                                typed_ptr<__nv_bfloat16>(b), S, D,
+                                to_stream(stream));
+          }, py::arg("x"), py::arg("b"), py::arg("S"), py::arg("D"),
+             py::arg("stream") = 0);
+    m.def("residual_add_pdl",
+          [](uintptr_t residual, uintptr_t x, int n, uintptr_t stream) {
+              residual_add_pdl(typed_ptr<__nv_bfloat16>(residual),
+                               typed_ptr<__nv_bfloat16>(x), n,
+                               to_stream(stream));
+          }, py::arg("residual"), py::arg("x"), py::arg("n"),
+             py::arg("stream") = 0);
+    m.def("layer_norm_pdl",
+          [](uintptr_t x, uintptr_t weight, uintptr_t bias, uintptr_t out,
+             int seq_len, int dim, float eps, uintptr_t stream) {
+              layer_norm_pdl(typed_ptr<__nv_bfloat16>(x),
+                             typed_ptr<__nv_bfloat16>(weight),
+                             typed_ptr<__nv_bfloat16>(bias),
+                             typed_ptr<__nv_bfloat16>(out), seq_len, dim, eps,
+                             to_stream(stream));
+          }, py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("out"),
+             py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-5f,
+             py::arg("stream") = 0);
+    m.def("quantize_bf16_to_nvfp4_swizzled_v3",
+          [](uintptr_t input, uintptr_t fp4_data, uintptr_t scale_factors,
+             int rows, int cols, uintptr_t stream) {
+              quantize_bf16_to_nvfp4_swizzled_v3(
+                  typed_ptr<__nv_bfloat16>(input),
+                  reinterpret_cast<uint8_t*>(fp4_data),
+                  reinterpret_cast<uint8_t*>(scale_factors), rows, cols,
+                  to_stream(stream));
+          }, py::arg("input"), py::arg("fp4_data"), py::arg("scale_factors"),
+             py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
+    m.def("fp8_per_token_block128_quant_bf16_v2",
+          [](uintptr_t input, uintptr_t output_fp8, uintptr_t output_scale,
+             int M, int K, uintptr_t stream) {
+              flash_rt::quantize::fp8_per_token_block128_quant_bf16_v2(
+                  to_ptr(input), to_ptr(output_fp8),
+                  typed_ptr<float>(output_scale), M, K, to_stream(stream));
+          }, py::arg("input"), py::arg("output_fp8"), py::arg("output_scale"),
+             py::arg("M"), py::arg("K"), py::arg("stream") = 0);
+#endif  // ENABLE_CUTLASS_SM120_NVFP4_W4A16 + FLASHRT_BUILD_XVLA
 }

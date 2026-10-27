@@ -345,6 +345,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                state_prompt_mode="exact",
                state_prompt_fixed_max_len=None,
                precision="auto",
+               xvla_precision="nvfp4",
                *,
                mmproj_path=None,
                backend="cpu",
@@ -383,7 +384,9 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             after first load. Only affects JAX.
         config: model config name: "pi05", "pi0", "groot", "groot_n15", "groot_n17",
             "pi0fast", "motus", "dm05", "wan22_ti2v_5b", "cosmos3_video",
-            "cosmos3_edge", "ltx25".
+            "cosmos3_edge", "xvla", "ltx25".
+            "xvla" is lerobot/xvla-libero on RTX SM120/SM121 (torch only;
+            see ``xvla_precision``).
             "ltx25" is the LTX-2.5 22B distilled audio+video generator:
             drive it with set_prompt(...) + infer(...), not predict().
             "cosmos3_video" is a non-VLA text2video denoise model: drive it with
@@ -411,12 +414,14 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                                      via Orin env flags)
               gfx942 (MI300 series) → ``flash_rt.amd.*`` (CDNA3)
               gfx950 (MI350 series) → ``flash_rt.amd.*`` (CDNA4)
+              gfx1100 (Radeon Pro W7900D) → ``flash_rt.amd.*`` (RDNA 3 BF16)
               gfx1151 (Radeon 8060S) → ``flash_rt.amd.*`` (RDNA 3.5 BF16)
               gfx1201 (Radeon AI PRO R9700) → ``flash_rt.amd.*`` (RDNA 4 BF16)
               Apple Silicon        → ``flash_rt.hardware.mps.*`` (experimental Pi0.5 BF16)
             Pass ``"thor"`` / ``"rtx_sm120"`` / ``"rtx_sm89"`` /
             ``"rtx_sm87"`` / ``"amd_cdna3"`` / ``"amd_cdna4"`` /
-            ``"amd_rdna35"`` / ``"amd_rdna4"`` / ``"apple_mps"`` explicitly to
+            ``"amd_rdna3"`` / ``"amd_rdna35"`` / ``"amd_rdna4"`` /
+            ``"apple_mps"`` explicitly to
             force a backend (useful for cross-hardware debugging).
         action_dim: Explicit robot output dimension for the Apple/RDNA Pi0.5 and
             Jetson Pi frontends. RDNA may instead read output_action_dim from
@@ -493,6 +498,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             ``"int8"`` selects the frozen static INT8 tier whose scales are
             set at setup: give it real observations through
             :meth:`VLAModel.calibrate` before the first ``predict()``.
+        xvla_precision: X-VLA torch RTX only. One of ``"nvfp4"`` (default),
+            ``"fp8"`` or ``"bf16"``; selects the action-transformer and
+            encoder weight/activation precision. The DaViT tower runs
+            NVFP4 W4A4.
         use_fp8: Enable FP8 execution where the selected frontend supports
             an FP8/BF16 switch. Defaults to True to preserve existing
             performance-oriented behavior.
@@ -510,7 +519,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         vision_num_layers: Pi0.5 torch RTX/Orin only. Number of SigLIP vision
             layers to execute; valid range is 1-27. ``None`` keeps the
             frontend default.
-        cache_frames: Pi0.5 torch RTX/Orin and AMD CDNA4/RDNA 3.5 only.
+        cache_frames: Pi0.5 torch RTX/Orin and AMD CDNA4/RDNA only.
             Temporal K/V reuse period.
             1 runs the full vision+encoder+decoder path on every frame; 2
             alternates full and decoder-only frames. ``None`` keeps the
@@ -614,12 +623,12 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                       "pi0fast",
                       "motus", "wan22_ti2v_5b", "cosmos3_video",
                       "cosmos3_edge", "nexn2", "qwen36_moe", "spark_x25",
-                      "flint", "hyvla", "ltx25", "dm05", "qwen3_4b"):
+                      "flint", "hyvla", "xvla", "ltx25", "dm05", "qwen3_4b"):
         raise ValueError(
             f"Unknown config: {config}. "
             f"Supported: pi05, groot, groot_n15, groot_n17, pi0, pi0fast, motus, "
             f"wan22_ti2v_5b, cosmos3_video, cosmos3_edge, nexn2, "
-            f"qwen36_moe, spark_x25, flint, hyvla, ltx25, dm05, qwen3_4b")
+            f"qwen36_moe, spark_x25, flint, hyvla, xvla, ltx25, dm05, qwen3_4b")
     if framework not in ("torch", "jax", "jetson_pi"):
         raise ValueError(
             f"Unknown framework: {framework}. Supported: torch, jax, jetson_pi")
@@ -824,9 +833,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 f"-DGPU_ARCH={'gfx942' if arch == 'amd_cdna3' else 'gfx950'} && "
                 "cmake --build build-amd -j\n"
                 "See docs/deployment_amd.md.") from exc
-    elif arch in ("amd_rdna35", "amd_rdna4"):
-        rdna_gfx = "gfx1151" if arch == "amd_rdna35" else "gfx1201"
-        rdna_label = "RDNA 3.5" if arch == "amd_rdna35" else "RDNA 4"
+    elif arch in ("amd_rdna3", "amd_rdna35", "amd_rdna4"):
+        rdna_gfx, rdna_label = {
+            "amd_rdna3": ("gfx1100", "RDNA 3"),
+            "amd_rdna35": ("gfx1151", "RDNA 3.5"),
+            "amd_rdna4": ("gfx1201", "RDNA 4"),
+        }[arch]
+        import torch  # initialize ROCm wheel libraries before the HIP extension
         try:
             import flash_rt.amd.flash_rt_amd_kernels  # noqa: F401
         except ImportError as exc:
@@ -1175,7 +1188,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         from types import SimpleNamespace
         sig = SimpleNamespace(parameters=parameters)
     kwargs: dict = {"num_views": num_views}
-    if (arch in ("amd_rdna35", "amd_rdna4")
+    if config == "xvla":
+        if xvla_precision not in ("bf16", "fp8", "nvfp4"):
+            raise ValueError(
+                f"xvla_precision must be one of bf16/fp8/nvfp4; got {xvla_precision!r}"
+            )
+        kwargs["precision"] = xvla_precision
+    if (arch in ("amd_rdna3", "amd_rdna35", "amd_rdna4")
             and "action_dim" in sig.parameters and action_dim is not None):
         kwargs["action_dim"] = action_dim
     if "hardware" in sig.parameters:

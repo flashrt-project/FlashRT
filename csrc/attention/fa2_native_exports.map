@@ -9,6 +9,12 @@
     fvk_attention_fa2_fwd_bf16_tile;
     fvk_attention_fa2_fwd_bf16_fp8out;
     fvk_attention_fa2_fwd_bf16_causal_fp8out;
+    fvk_attention_fa2_fwd_bf16_tile64;
+    fvk_attention_fa2_fwd_bf16_tile64m32;
+    fvk_attention_fa2_fwd_bf16_tile64m32w2;
+    fvk_attention_fa2_fwd_bf16_tile64_qnvfp4;
+    fvk_attention_fa2_fwd_bf16_tile64m32w2_qnvfp4;
+    fvk_attention_fa2_has_xvla_tile64;
   local:
     *;
 };

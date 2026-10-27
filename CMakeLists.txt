@@ -260,6 +260,14 @@ option(FLASHRT_BUILD_QWEN3_VL
        "Build Qwen3-VL kernels into a separate flash_rt_qwen3_vl_kernels module" OFF)
 option(FLASHRT_ENABLE_QWEN3_VL_DEV_KERNELS
        "Expose Qwen3-VL bench/probe pybind symbols for kernel development" OFF)
+# X-VLA RTX SM120/SM121 model kernels.  Additive and OFF by default so the
+# default build's source/symbol surface stays unchanged.
+option(FLASHRT_BUILD_XVLA
+       "Build X-VLA RTX SM120/SM121 kernels and bindings" OFF)
+if(FLASHRT_BUILD_XVLA AND NOT (GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121"))
+  message(FATAL_ERROR
+    "FLASHRT_BUILD_XVLA requires GPU_ARCH=120 or 121; current GPU_ARCH=${GPU_ARCH}.")
+endif()
 # MelBandRoformer audio source separation kernels (FP8 fused kernels for
 # BF16-in / FP8-out norm, QKV+RoPE, gated attention quant, residual+norm).
 # OFF by default; enable with -DFLASHRT_ENABLE_MELBAND_ROFORMER=ON.
@@ -1104,6 +1112,14 @@ if(ENABLE_FA2 AND
   # Short-query FA2 tile (bf16, head_dim <= 128) for models with a short
   # seqlen_q. Additive: a separate TU with its own traits, so the upstream
   # dispatch is untouched.
+  # head_dim 64 tile set (see fa2_tile_inst/flash_fwd_tile64_bf16_sm80.cu).
+  set(FA2_HAS_TILE64_BF16 OFF)
+  if(FLASHRT_BUILD_XVLA AND "bf16" IN_LIST FA2_DTYPES AND "64" IN_LIST FA2_HDIMS)
+    set(FA2_HAS_TILE64_BF16 ON)
+    list(APPEND FA2_SRCS
+      csrc/attention/fa2_tile_inst/flash_fwd_tile64_bf16_sm80.cu
+    )
+  endif()
   set(FA2_HAS_SMALLQ_BF16 OFF)
   if("bf16" IN_LIST FA2_DTYPES AND
      ("96" IN_LIST FA2_HDIMS OR "128" IN_LIST FA2_HDIMS))
@@ -1138,15 +1154,9 @@ if(ENABLE_FA2 AND
       csrc/attention/fa2_causal_inst/flash_fwd_split_hdim128_fp16_sm80_causal.cu
     )
   endif()
-  if(FLASHRT_ENABLE_NATIVE_CPP)
-    # The native C boundary has a stable five-symbol surface. Its causal
-    # wrapper contains native-only fail-fast dispatch for a slim matrix.
-    list(APPEND FA2_SRCS csrc/attention/fa2_wrapper_causal.cu)
-  elseif(("bf16" IN_LIST FA2_DTYPES OR "fp16" IN_LIST FA2_DTYPES) AND
-         ("128" IN_LIST FA2_HDIMS OR "256" IN_LIST FA2_HDIMS))
-    # Preserve the existing Python-only source matrix exactly by default.
-    list(APPEND FA2_SRCS csrc/attention/fa2_wrapper_causal.cu)
-  endif()
+  # The adapter references causal entries in every matrix. This wrapper also
+  # supplies their not-built stubs for FP16-only and head-dim-64 slim builds.
+  list(APPEND FA2_SRCS csrc/attention/fa2_wrapper_causal.cu)
 
   add_library(fa2_vendor_obj OBJECT ${FA2_SRCS})
   set_target_properties(fa2_vendor_obj PROPERTIES
@@ -1280,6 +1290,9 @@ if(ENABLE_FA2 AND
   # head_dim <= 128 branch stubs out at compile time so no
   # run_mha_fwd_<..., 128, ...> symbol is referenced from wrapper.cu
   # (which would otherwise break linking).
+  if(FA2_HAS_TILE64_BF16)
+    target_compile_definitions(fa2_vendor_obj PRIVATE FA2_HAS_TILE64_BF16=1)
+  endif()
   if(FA2_HAS_SMALLQ_BF16)
     target_compile_definitions(fa2_vendor_obj PRIVATE FA2_HAS_SMALLQ_BF16=1)
   endif()
@@ -2217,6 +2230,22 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
   target_compile_definitions(flash_rt_kernels PRIVATE
     ENABLE_CUTLASS_SM120_NVFP4_W4A16=1
     FLASHRT_NVFP4_SKINNY_SM120=1)
+  if(FLASHRT_BUILD_XVLA)
+    # X-VLA model kernels and the additive opt-in shared entries.  The
+    # existing shared symbols (common.cuh, act_bf16, dit_bf16, elementwise,
+    # norm, quantize, fp8_per_token_block_quant and the CUTLASS wrappers) are
+    # not modified.  The X-VLA pipeline calls only the *_pdl / *_v3 / *_v2
+    # entries below; the old models keep the old entries.
+    target_sources(flash_rt_kernels PRIVATE
+      csrc/kernels/xvla_fp4_gemm_sm120.cu
+      csrc/kernels/xvla_rtx.cu
+      csrc/kernels/xvla_vision_sm120.cu
+      csrc/kernels/pdl_shared.cu
+      csrc/kernels/xvla_quantize_pdl.cu
+      csrc/kernels/xvla_fp8_quant_pdl.cu)
+    target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_BUILD_XVLA=1)
+    message(STATUS "X-VLA RTX SM120 kernels: ENABLED")
+  endif()
   if(FLASHRT_ENABLE_SM120_DEV_KERNELS)
     target_sources(flash_rt_kernels PRIVATE
       $<TARGET_OBJECTS:sm120_nvfp4_dev_obj>)

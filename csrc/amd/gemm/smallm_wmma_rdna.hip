@@ -1,5 +1,5 @@
 // ================================================================
-// FlashRT AMD -- small-M BF16 WMMA GEMM (RDNA 3.5 / RDNA 4, wave32)
+// FlashRT AMD -- small-M BF16 WMMA GEMM (RDNA 3 / 3.5 / 4, wave32)
 //
 // Computes D[M,N] = A[M,K] @ W_nt[N,K]^T + bias[N], where M <= 48.
 // W_nt is a persistent row-major transpose of the checkpoint's (K,N) weight.
@@ -18,9 +18,9 @@
 //   aligned 16-byte global loads. Each wave owns 16 output columns and reuses
 //   the staged A tile, reducing repeated A traffic for wider projections.
 //
-// gfx12 (RDNA 4) routes M <= 16 to a third, streamed split-K variant that
-// keeps several contiguous weight loads in flight per lane; see
-// dispatch_smallm_wmma_bf16_stream_rdna. gfx11 dispatch is unchanged.
+// gfx1100 and gfx12 route selected M <= 16 shapes to a streamed split-K
+// variant that keeps contiguous weight loads in flight per lane; see
+// dispatch_smallm_wmma_bf16_stream_rdna. gfx1151 dispatch is unchanged.
 //
 // The gfx11 WMMA fragment and accumulator mapping follows the public wave32
 // description used by Comfy Kitchen (Apache-2.0). The gfx12 mapping and the
@@ -255,13 +255,14 @@ void launch_smallm_wmma_bf16_rdna(const __hip_bfloat16 *input,
           input, weight_nt, bias, output, rows, columns, inner, accumulate);
 }
 
-#if defined(FLASHRT_AMD_RDNA4)
-// ── Streamed split-K implementation for M <= 16 (gfx12) ──
+#if defined(FLASHRT_AMD_RDNA3) || defined(FLASHRT_AMD_RDNA4)
+// ── Streamed split-K implementation for M <= 16 (gfx1100/gfx12) ──
 //
 // Decoder projections are weight-bandwidth bound, so each lane issues Unroll
 // WMMA steps from one contiguous run before consuming them. Lanes 0..15 take
 // the first 8 * Unroll elements of a 16 * Unroll K block and lanes 16..31 the
-// second. A and W use the same K assignment, so every product pairs the same
+// second on gfx12. gfx11 replicates the full 16 * Unroll block in both lane
+// halves. A and W use the same K assignment, so every product pairs the same
 // K index; only the FP32 accumulation order differs from natural K order.
 // Waves own disjoint K slices of one 16-column tile and reduce through LDS in
 // fixed wave order.
@@ -281,7 +282,11 @@ __launch_bounds__(Waves *FLASHRT_RDNA_WAVE_SIZE) void smallm_wmma_bf16_stream_rd
   const int fragment_row = lane & 15;
   const int column = blockIdx.x * 16 + fragment_row;
   const int segment = inner / Waves;
+#if defined(FLASHRT_AMD_RDNA3)
+  const int run = rdna_wmma_lane_k(lane) * Unroll;
+#else
   const int run = (lane >> 4) * FLASHRT_RDNA_WMMA_LANE_K * Unroll;
+#endif
   const int input_row = fragment_row < rows ? fragment_row : 0;
   const __bf16 *input_base = reinterpret_cast<const __bf16 *>(
       input + static_cast<size_t>(input_row) * inner + wave * segment + run);
@@ -360,6 +365,25 @@ bool dispatch_smallm_wmma_bf16_stream_rdna(const __hip_bfloat16 *input,
                                            int columns, int inner,
                                            bool accumulate,
                                            hipStream_t stream) {
+#if defined(FLASHRT_AMD_RDNA3)
+  // Specialize the decoder projection shapes for gfx1100. Other shapes
+  // retain the existing gfx11 dispatch.
+  if (inner == 1024 && columns == 2560) {
+    launch_smallm_wmma_bf16_stream_rdna<8, 2>(
+        input, weight_nt, bias, output, rows, columns, inner, accumulate,
+        stream);
+  } else if ((inner == 2048 || inner == 4096) && columns == 1024) {
+    launch_smallm_wmma_bf16_stream_rdna<16, 2>(
+        input, weight_nt, bias, output, rows, columns, inner, accumulate,
+        stream);
+  } else if (inner == 1024 && columns == 8192) {
+    launch_smallm_wmma_bf16_stream_rdna<16, 4>(
+        input, weight_nt, bias, output, rows, columns, inner, accumulate,
+        stream);
+  } else {
+    return false;
+  }
+#else
   const int column_tiles = columns / 16;
   if (column_tiles >= 256 && inner % 512 == 0) {
     launch_smallm_wmma_bf16_stream_rdna<16, 2>(
@@ -388,6 +412,7 @@ bool dispatch_smallm_wmma_bf16_stream_rdna(const __hip_bfloat16 *input,
   } else {
     return false;
   }
+#endif
   return true;
 }
 #endif
@@ -442,7 +467,7 @@ void smallm_wmma_bf16_rdna_impl(const __hip_bfloat16 *input,
     throw std::runtime_error(
         "smallm_wmma_bf16_rdna: require M in [1,48] and N/K multiples of 16");
   }
-#if defined(FLASHRT_AMD_RDNA4)
+#if defined(FLASHRT_AMD_RDNA3) || defined(FLASHRT_AMD_RDNA4)
   if (rows <= 16 &&
       dispatch_smallm_wmma_bf16_stream_rdna(input, weight_nt, bias, output,
                                             rows, columns, inner, accumulate,

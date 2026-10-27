@@ -95,6 +95,27 @@ struct Flash_fwd_params : public Qkv_params {
     void * __restrict__ softmax_lse_ptr;
     void * __restrict__ softmax_lseaccum_ptr;
 
+    // Optional fused NVFP4 quantize of the O tile, run inside the epilogue that
+    // already holds the tile. Null on every existing caller, which leaves the
+    // epilogue bit-identical to upstream. Contract: quantize_o != 0 means this
+    // head's d_rounded columns of each row are written as
+    //   o_packed_ptr : (total_q, num_heads_q * d_rounded / 2) u8 row-major, at
+    //                  (row, bidh * d_rounded / 2)
+    //   o_sfa_ptr    : swizzled (total_q, d_rounded / 16) ue4m3 scales, the atom
+    //                  layout quantize_bf16_to_nvfp4_swizzled emits
+    // using the same batch/row/head strides the bf16 O write uses.
+    void * __restrict__ o_packed_ptr;
+    void * __restrict__ o_sfa_ptr;
+    int o_packed_row_bytes;
+    int o_sfa_n_col_blocks;
+    int quantize_o;
+
+    // Launch with a programmatic dependency on the previous graph node
+    // (cudaLaunchAttributeProgrammaticStreamSerialization). The forward kernel
+    // executes griddepcontrol.wait before its first global access, which is a
+    // no-op for an ordinary launch, so 0 -- every existing caller -- is upstream.
+    int pdl;
+
     // The dimensions.
     int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim, total_q;
 

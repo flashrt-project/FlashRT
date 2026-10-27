@@ -1,0 +1,62 @@
+# FlashRT Pi0.5 BF16 on RDNA, linux/amd64.
+# GPU_ARCH targets:
+#   gfx1100: Radeon PRO W7900D
+#   gfx1151: Strix Halo (Radeon 8060S)
+#   gfx1201: Radeon AI PRO R9700
+# Build from the repository root; no GPU is needed to build:
+#   docker build -f docker/Dockerfile.rocm.rdna --build-arg GPU_ARCH=gfx1100 -t flashrt:rocm-gfx1100 .
+# Use --target environment for the shared development environment.
+FROM rocm/dev-ubuntu-24.04:10.1.0-full@sha256:5ed1362ea542a928651e4c710b44024ebe98870f74159cb70f0265aec8ef0abe AS environment
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+      build-essential cmake git pkg-config python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV UV_PYTHON_INSTALL_DIR=/opt/python
+# The AMD wheels below use Python 3.13; keep them in a dedicated environment.
+RUN python3 -m venv /opt/uv \
+    && /opt/uv/bin/python -m pip install --no-cache-dir "uv==0.13.0" \
+    && /opt/uv/bin/uv python install 3.13.13 \
+    && /opt/uv/bin/uv venv --python 3.13.13 --seed /opt/venv \
+    && ln -s /opt/uv/bin/uv /usr/local/bin/uv
+
+ENV VIRTUAL_ENV=/opt/venv \
+    ROCM_PATH=/opt/rocm \
+    PATH=/opt/venv/bin:/opt/rocm/bin:${PATH} \
+    LD_LIBRARY_PATH=/opt/rocm/lib
+
+RUN python -m pip install --no-cache-dir \
+      --index-url https://stable.repo.amd.com/rocm/whl-next \
+      "torch[device-all]==2.14.0+rocm10.1.0" \
+      "triton==3.8.0+git669b31ac.rocm10.1.0"
+
+RUN python -m pip install --no-cache-dir \
+      "setuptools==81.0.0" "wheel==0.48.0" "ninja==1.13.2" \
+      "pybind11==3.1.0" "numpy==2.5.4" "PyYAML==6.0.3" \
+      "safetensors==0.8.0" "sentencepiece==0.2.2" "pillow==13.0.0" \
+      "pytest==9.1.1" "ml_dtypes==0.6.0"
+
+RUN python -m pip install --no-cache-dir \
+      --index-url https://stable.repo.amd.com/rocm/whl-next \
+      "torchvision[device-all]==0.29.0a0+rocm10.1.0" \
+    && python -m pip check \
+    && python -c "import torch, torchvision, triton"
+
+WORKDIR /workspace/FlashRT
+CMD ["bash"]
+
+FROM environment AS flashrt
+ARG GPU_ARCH
+ARG BUILD_JOBS=8
+COPY . .
+RUN case "${GPU_ARCH}" in gfx1100|gfx1151|gfx1201) ;; \
+      *) echo "GPU_ARCH must be gfx1100, gfx1151 or gfx1201" >&2; exit 2 ;; esac \
+    && python -m pip install --no-cache-dir --no-deps --no-build-isolation -e . \
+    && SLURM_CPUS_PER_TASK="${BUILD_JOBS}" bash scripts/amd/build_amd.sh "${GPU_ARCH}"
+
+ARG SOURCE_REVISION=unknown
+LABEL org.opencontainers.image.title="FlashRT ROCm RDNA" \
+      org.opencontainers.image.source="https://github.com/flashrt-project/FlashRT" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}" \
+      com.flashrt.gpu-arch="${GPU_ARCH}"

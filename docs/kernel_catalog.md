@@ -278,6 +278,24 @@ those, and the GEMM / GEMV launchers reject unsupported N / K.
 
 ---
 
+## 13. X-VLA RTX SM120 helpers (`GPU_ARCH=120/121`)
+
+Model-specific kernels for `lerobot/xvla-libero`; compiled into
+`flash_rt_kernels` only when `FLASHRT_BUILD_XVLA=ON` and GPU_ARCH is 120/121,
+and their pybind entries are under the same option plus
+`ENABLE_CUTLASS_SM120_NVFP4_W4A16`. Other architectures do not inherit these
+sources or bindings.
+
+| Group | Symbols | What it is |
+|---|---|---|
+| Opt-in shared entries | `add_bias_bf16_pdl`, `residual_add_pdl`, `layer_norm_pdl`, `quantize_bf16_to_nvfp4_swizzled_v3`, `fp8_per_token_block128_quant_bf16_v2` | Distinctly named PDL/vectorized siblings used only by the X-VLA pipeline; the existing shared symbols are unchanged |
+| Small-M NVFP4 GEMM | `xvla_fp4_gemm_bias_bf16out`, `xvla_fp4_gemm_bias_gelu_fp4out` | TMA producer + `mma.sync` block-scaled e2m1 consumers, 32-112-row M tiles for M=262/100/30; bias/BF16 out or bias+GELU+NVFP4+SF out |
+| Flow / decoder helpers | `xvla_flow_step_bf16`, `xvla_action_decoder_gemv`, `xvla_add2_bf16`, `xvla_proprio_bf16`, `xvla_finalize_bf16` | Euler step, decoder GEMV, prefix/proprio add, action postprocess |
+| Fold / norm helpers | `xvla_add_ln_quant_bf16`, `xvla_add_ln_quant_norm_bf16`, `xvla_ln_quant_bf16`, `xvla_ln_quant_bf16_nt256`, `xvla_ln_bf16` | Residual + LayerNorm + NVFP4 pack (denoise and encoder variants) |
+| Copy / cast | `xvla_copy_bf16`, `xvla_copy_f16`, `xvla_cast_f16_to_bf16` | Graph-safe staging helpers |
+| DaViT tower | `xvla_vision_resize`, `xvla_vision_im2col`, `xvla_vision_add_bias`, `xvla_vision_dwconv3x3_res`, `xvla_vision_window_attn`, `xvla_vision_window_qkv_pad[_fill]`, `xvla_vision_window_out_unpad_to_nvfp4`, `xvla_vision_channel_attn`, `xvla_vision_gelu_erf_to_nvfp4`, `xvla_vision_projector_pack` | Florence-2 DaViT-L tower at the four static stage shapes |
+| FA2 tile set | `fa2.fwd_bf16_tile64m32w2[_qnvfp4]` (`<64,32,64,2>`) and the internal `<64,64,64,4>` / `<64,32,64,4>` entries | Additive head_dim-64 instantiations of the vendored FA2 templates; see `csrc/attention/flash_attn_2_src/VENDOR.md` |
+
 ## Re-use decision tree
 
 When evaluating FlashRT for a new model, walk this checklist:

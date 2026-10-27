@@ -54,10 +54,16 @@ namespace FLASH_NAMESPACE {
 template<typename Kernel_traits, __VA_ARGS__> \
 __global__ void kernelName(KERNEL_PARAM_MODIFIER const Flash_fwd_params params)
 
-DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_kernel, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax) {
+DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_kernel, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, bool SkipDeadTail) {
     #if defined(ARCH_SUPPORTS_FLASH)
+        #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+        // Programmatic dependent launch (params.pdl): no global access before
+        // the previous grid has completed; no-op for an ordinary launch.
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+        #endif
         static_assert(!(Is_causal && Is_local)); // Enforce constraints
-        FLASH_NAMESPACE::compute_attn<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params);
+        FLASH_NAMESPACE::compute_attn<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax, SkipDeadTail>(params);
     #else
         FLASH_UNSUPPORTED_ARCH
     #endif
@@ -76,7 +82,7 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_combine_kernel, int kBlockM, int L
     FLASH_NAMESPACE::combine_attn_seqk_parallel<Kernel_traits, kBlockM, Log_max_splits, Is_even_K>(params);
 }
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool SkipDeadTail = false>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr size_t smem_size = Kernel_traits::kSmemSize;
     // printf("smem_size = %d\n", smem_size);
@@ -101,7 +107,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                             // If return_softmax, set IsEvenMNConst to false to reduce number of templates
                             // If head dim > 128, set IsEvenMNConst to false to reduce number of templates
                             // If Is_local, set Is_causal to false
-                            auto kernel = &flash_fwd_kernel<Kernel_traits, Is_dropout && !Is_softcap, Is_causal, Is_local && !Is_causal, Has_alibi, IsEvenMNConst && IsEvenKConst && !Is_local && !ReturnSoftmaxConst && Kernel_traits::kHeadDim <= 128, IsEvenKConst, Is_softcap, ReturnSoftmaxConst && Is_dropout && !Is_softcap>;
+                            auto kernel = &flash_fwd_kernel<Kernel_traits, Is_dropout && !Is_softcap, Is_causal, Is_local && !Is_causal, Has_alibi, IsEvenMNConst && IsEvenKConst && !Is_local && !ReturnSoftmaxConst && Kernel_traits::kHeadDim <= 128, IsEvenKConst, Is_softcap, ReturnSoftmaxConst && Is_dropout && !Is_softcap, SkipDeadTail>;
                             // auto kernel = &flash_fwd_kernel<Kernel_traits, false, Is_causal, false, false, true, true, false>;
                             // printf("IsEvenMNConst = %d, IsEvenKConst = %d, Is_local = %d, Is_causal = %d, ReturnSoftmaxConst = %d, Is_dropout = %d\n", int(IsEvenMNConst), int(IsEvenKConst), int(Is_local), int(Is_causal), int(ReturnSoftmaxConst), int(Is_dropout));
                             // auto kernel = &flash_fwd_kernel<Kernel_traits, false, Is_causal, false, true, true, false>;
@@ -113,7 +119,21 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                             // cudaError status_ = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                             //     &ctas_per_sm, kernel, Kernel_traits::kNThreads, smem_size);
                             // printf("smem_size = %d, CTAs per SM = %d\n", int(smem_size), ctas_per_sm);
-                            kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
+                            if (params.pdl) {
+                                cudaLaunchConfig_t cfg = {};
+                                cfg.gridDim = grid;
+                                cfg.blockDim = dim3(Kernel_traits::kNThreads);
+                                cfg.dynamicSmemBytes = smem_size;
+                                cfg.stream = stream;
+                                cudaLaunchAttribute attr[1];
+                                attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+                                attr[0].val.programmaticStreamSerializationAllowed = 1;
+                                cfg.attrs = attr;
+                                cfg.numAttrs = 1;
+                                C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, params));
+                            } else {
+                                kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
+                            }
                             C10_CUDA_KERNEL_LAUNCH_CHECK();
                         });
                     });

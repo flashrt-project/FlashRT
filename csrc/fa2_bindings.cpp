@@ -171,6 +171,61 @@ static auto make_fwd_seqused(
 }
 
 
+static auto make_fwd_seqused_pdl(
+    void (*fn)(const void*, const void*, const void*, void*, void*, const void*,
+               int, int, int, int, int, int, int, int, int, int, int, int,
+               int, int, int, int, int, int, float, int, cudaStream_t, int)) {
+    return [fn](uintptr_t Q, uintptr_t K, uintptr_t V, uintptr_t O,
+                uintptr_t softmax_lse, uintptr_t seqused_k,
+                int batch, int seqlen_q, int seqlen_k,
+                int num_heads_q, int num_heads_kv, int head_dim,
+                py::tuple q_strides, py::tuple k_strides,
+                py::tuple v_strides, py::tuple o_strides,
+                float softmax_scale, int num_sms, uintptr_t stream, bool enable_pdl) {
+        fn(reinterpret_cast<const void*>(Q), reinterpret_cast<const void*>(K),
+           reinterpret_cast<const void*>(V), reinterpret_cast<void*>(O),
+           reinterpret_cast<void*>(softmax_lse),
+           reinterpret_cast<const void*>(seqused_k),
+           batch, seqlen_q, seqlen_k, num_heads_q, num_heads_kv, head_dim,
+           py::cast<int>(q_strides[0]), py::cast<int>(q_strides[1]), py::cast<int>(q_strides[2]),
+           py::cast<int>(k_strides[0]), py::cast<int>(k_strides[1]), py::cast<int>(k_strides[2]),
+           py::cast<int>(v_strides[0]), py::cast<int>(v_strides[1]), py::cast<int>(v_strides[2]),
+           py::cast<int>(o_strides[0]), py::cast<int>(o_strides[1]), py::cast<int>(o_strides[2]),
+           softmax_scale, num_sms, to_stream(stream), enable_pdl ? 1 : 0);
+    };
+}
+
+
+static auto make_fwd_seqused_qnvfp4(
+    void (*fn)(const void*, const void*, const void*, void*, void*, const void*,
+               void*, void*, int, int,
+               int, int, int, int, int, int, int, int, int, int, int, int,
+               int, int, int, int, int, int, float, int, cudaStream_t, int)) {
+    return [fn](uintptr_t Q, uintptr_t K, uintptr_t V, uintptr_t O,
+                uintptr_t softmax_lse, uintptr_t seqused_k,
+                uintptr_t o_packed, uintptr_t o_sfa,
+                int o_packed_row_bytes, int o_sfa_n_col_blocks,
+                int batch, int seqlen_q, int seqlen_k,
+                int num_heads_q, int num_heads_kv, int head_dim,
+                py::tuple q_strides, py::tuple k_strides,
+                py::tuple v_strides, py::tuple o_strides,
+                float softmax_scale, int num_sms, uintptr_t stream, bool enable_pdl) {
+        fn(reinterpret_cast<const void*>(Q), reinterpret_cast<const void*>(K),
+           reinterpret_cast<const void*>(V), reinterpret_cast<void*>(O),
+           reinterpret_cast<void*>(softmax_lse),
+           reinterpret_cast<const void*>(seqused_k),
+           reinterpret_cast<void*>(o_packed), reinterpret_cast<void*>(o_sfa),
+           o_packed_row_bytes, o_sfa_n_col_blocks,
+           batch, seqlen_q, seqlen_k, num_heads_q, num_heads_kv, head_dim,
+           py::cast<int>(q_strides[0]), py::cast<int>(q_strides[1]), py::cast<int>(q_strides[2]),
+           py::cast<int>(k_strides[0]), py::cast<int>(k_strides[1]), py::cast<int>(k_strides[2]),
+           py::cast<int>(v_strides[0]), py::cast<int>(v_strides[1]), py::cast<int>(v_strides[2]),
+           py::cast<int>(o_strides[0]), py::cast<int>(o_strides[1]), py::cast<int>(o_strides[2]),
+           softmax_scale, num_sms, to_stream(stream), enable_pdl ? 1 : 0);
+    };
+}
+
+
 static auto make_fwd_seqused_splitkv(
     void (*fn)(const void*, const void*, const void*, void*, void*, const void*,
                void*, void*,
@@ -202,6 +257,8 @@ static auto make_fwd_seqused_splitkv(
 
 PYBIND11_MODULE(flash_rt_fa2, m) {
     m.doc() = "FlashRT — vendored Flash-Attention 2 forward (fp16 + bf16).";
+
+    m.def("has_xvla_tile64", [] { return fvk_attention_fa2_has_xvla_tile64() != 0; });
 
     m.def("fwd_bf16_seqused", make_fwd_seqused(&fvk_attention_fa2_fwd_bf16_seqused),
         py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),
@@ -245,6 +302,18 @@ PYBIND11_MODULE(flash_rt_fa2, m) {
         "elements. skip_bf16_output drops the bf16 store when the FP8 copy is the "
         "only consumer. With O_fp8 = 0 this is exactly fwd_bf16.");
 
+    m.def("fwd_bf16_tile64", make_fwd_seqused_pdl(&fvk_attention_fa2_fwd_bf16_tile64),
+        py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),
+        py::arg("seqused_k"),
+        py::arg("batch"), py::arg("seqlen_q"), py::arg("seqlen_k"),
+        py::arg("num_heads_q"), py::arg("num_heads_kv"), py::arg("head_dim"),
+        py::arg("q_strides"), py::arg("k_strides"),
+        py::arg("v_strides"), py::arg("o_strides"),
+        py::arg("softmax_scale") = 1.0f, py::arg("num_sms") = 0,
+        py::arg("stream") = 0, py::arg("enable_pdl") = false,
+        "head_dim-64 tile <64,64,64,4>: the template head width matches the model's "
+        "64 (the short-query dispatch uses 96) and the KV tile is 64 wide instead of 32.");
+
     m.def("fwd_bf16_causal_fp8out", make_fwd_fp8out(&fvk_attention_fa2_fwd_bf16_causal_fp8out),
         py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),
         py::arg("softmax_lse_accum") = 0, py::arg("o_accum") = 0,
@@ -258,6 +327,63 @@ PYBIND11_MODULE(flash_rt_fa2, m) {
         py::arg("softmax_scale") = 1.0f, py::arg("num_sms") = 0, py::arg("stream") = 0,
         "Causal sibling of fwd_bf16_fp8out (bf16, head_dim=256). With O_fp8 = 0 this "
         "is exactly fwd_bf16_causal.");
+
+    m.def("fwd_bf16_tile64m32", make_fwd_seqused_pdl(&fvk_attention_fa2_fwd_bf16_tile64m32),
+        py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),
+        py::arg("seqused_k"),
+        py::arg("batch"), py::arg("seqlen_q"), py::arg("seqlen_k"),
+        py::arg("num_heads_q"), py::arg("num_heads_kv"), py::arg("head_dim"),
+        py::arg("q_strides"), py::arg("k_strides"),
+        py::arg("v_strides"), py::arg("o_strides"),
+        py::arg("softmax_scale") = 1.0f, py::arg("num_sms") = 0,
+        py::arg("stream") = 0, py::arg("enable_pdl") = false,
+        "head_dim-64 tile <64,32,64,4>: half-width query tiles, so the denoise shape "
+        "schedules 144 CTAs over 36 SMs instead of 80.");
+
+    m.def("fwd_bf16_tile64_qnvfp4",
+        make_fwd_seqused_qnvfp4(&fvk_attention_fa2_fwd_bf16_tile64_qnvfp4),
+        py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),
+        py::arg("seqused_k"),
+        py::arg("o_packed"), py::arg("o_sfa"),
+        py::arg("o_packed_row_bytes"), py::arg("o_sfa_n_col_blocks"),
+        py::arg("batch"), py::arg("seqlen_q"), py::arg("seqlen_k"),
+        py::arg("num_heads_q"), py::arg("num_heads_kv"), py::arg("head_dim"),
+        py::arg("q_strides"), py::arg("k_strides"),
+        py::arg("v_strides"), py::arg("o_strides"),
+        py::arg("softmax_scale") = 1.0f, py::arg("num_sms") = 0,
+        py::arg("stream") = 0, py::arg("enable_pdl") = false,
+        "head_dim-64 tile plus a fused NVFP4 quantize of the O tile written from the "
+        "epilogue that already holds it in shared memory. o_packed is (M, H*hd/2) u8 and "
+        "o_sfa its swizzled ue4m3 scales, both static and caller-owned, in exactly the "
+        "layout quantize_bf16_to_nvfp4_swizzled emits; nulls fall back to the plain tile.");
+
+    m.def("fwd_bf16_tile64m32w2_qnvfp4",
+        make_fwd_seqused_qnvfp4(&fvk_attention_fa2_fwd_bf16_tile64m32w2_qnvfp4),
+        py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),
+        py::arg("seqused_k"),
+        py::arg("o_packed"), py::arg("o_sfa"),
+        py::arg("o_packed_row_bytes"), py::arg("o_sfa_n_col_blocks"),
+        py::arg("batch"), py::arg("seqlen_q"), py::arg("seqlen_k"),
+        py::arg("num_heads_q"), py::arg("num_heads_kv"), py::arg("head_dim"),
+        py::arg("q_strides"), py::arg("k_strides"),
+        py::arg("v_strides"), py::arg("o_strides"),
+        py::arg("softmax_scale") = 1.0f, py::arg("num_sms") = 0,
+        py::arg("stream") = 0, py::arg("enable_pdl") = false,
+        "fwd_bf16_tile64_qnvfp4 on the two-warp 32-row tile <64,32,64,2>: every output "
+        "row is computed identically; the grid has twice the query tiles.");
+
+    m.def("fwd_bf16_tile64m32w2", make_fwd_seqused_pdl(&fvk_attention_fa2_fwd_bf16_tile64m32w2),
+        py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),
+        py::arg("seqused_k"),
+        py::arg("batch"), py::arg("seqlen_q"), py::arg("seqlen_k"),
+        py::arg("num_heads_q"), py::arg("num_heads_kv"), py::arg("head_dim"),
+        py::arg("q_strides"), py::arg("k_strides"),
+        py::arg("v_strides"), py::arg("o_strides"),
+        py::arg("softmax_scale") = 1.0f, py::arg("num_sms") = 0,
+        py::arg("stream") = 0, py::arg("enable_pdl") = false,
+        "head_dim-64 tile <64,32,64,2>: 32 query rows on two warps, rows computed "
+        "exactly as by fwd_bf16_tile64.");
+
 
     m.def("fwd_bf16_seqused_splitkv",
         make_fwd_seqused_splitkv(&fvk_attention_fa2_fwd_bf16_seqused_splitkv),

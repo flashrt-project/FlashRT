@@ -1,4 +1,4 @@
-"""Parity checks for the correctness-first RDNA 3.5 providers."""
+"""Parity checks for the shared RDNA wave32 providers."""
 
 from __future__ import annotations
 
@@ -102,7 +102,7 @@ class _Rdna35TestKernels:
             x.shape[1], self._stream(x))
 
 
-_WAVE32_ARCHS = frozenset({"gfx1151", "gfx1201"})
+_WAVE32_ARCHS = frozenset({"gfx1100", "gfx1151", "gfx1201"})
 
 
 def _require_wave32_device():
@@ -113,21 +113,18 @@ def _require_wave32_device():
         pytest.skip("requires a visible ROCm device")
     arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
     if arch.split(":", 1)[0] not in _WAVE32_ARCHS:
-        pytest.skip("requires gfx1151 or gfx1201")
+        pytest.skip("requires gfx1100, gfx1151 or gfx1201")
     return torch
 
 
 def _require_rdna35_hip():
     torch = _require_wave32_device()
-    try:
-        from flash_rt.amd import flash_rt_amd_kernels as fvk
+    from flash_rt.amd import flash_rt_amd_kernels as fvk
+    from flash_rt.amd.hardware.capabilities_rdna import load_capabilities
 
-        info = dict(fvk.build_info())
-        if info.get("backend") != "rdna35" or info.get("wave_size") != 32:
-            raise RuntimeError("extension is not an RDNA 3.5 build")
-        kernels = _Rdna35TestKernels(fvk, torch)
-    except (ImportError, RuntimeError) as exc:
-        pytest.skip(f"RDNA 3.5 HIP extension is not available: {exc}")
+    arch = torch.cuda.get_device_properties(0).gcnArchName
+    load_capabilities(fvk, arch)
+    kernels = _Rdna35TestKernels(fvk, torch)
     return torch, kernels
 
 
@@ -477,6 +474,57 @@ def test_hip_decoder_gqa_matches_sdpa(
     torch.testing.assert_close(output, reference, atol=3e-2, rtol=3e-2)
 
 
+def test_row_owned_decoder_is_repeatable_with_padded_kv():
+    torch, kernels = _require_rdna35_hip()
+    generator = torch.Generator(device="cuda").manual_seed(1277)
+    query = torch.randn(15, 8, 256, generator=generator, device="cuda",
+                        dtype=torch.bfloat16)
+    key = torch.randn(727, 1, 256, generator=generator, device="cuda",
+                      dtype=torch.bfloat16)
+    value = torch.randn(727, 1, 256, generator=generator, device="cuda",
+                        dtype=torch.bfloat16)
+    scores = query.float().transpose(0, 1) @ key[:, 0].float().T / 16
+    scores[:, :, 527:712] = float("-inf")
+    reference = (scores.softmax(dim=-1) @ value[:, 0].float()).transpose(0, 1)
+    reference = reference.reshape(15, 2048).to(torch.bfloat16)
+
+    # Uneven masked work exposed reuse of reduction scratch before all waves
+    # had read it. Repeated launches must agree, including the first launch.
+    outputs = torch.empty(256, 15, 2048, device="cuda", dtype=torch.bfloat16)
+    for output in outputs:
+        kernels.decoder_gqa(output, query, key, value, 527, 712, split_key=False)
+    torch.testing.assert_close(
+        outputs, reference.expand_as(outputs), atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(
+        outputs, outputs[:1].expand_as(outputs), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("width", [1000, 1024, 2048, 4096])
+def test_generic_layer_norm_is_repeatable(width):
+    torch, kernels = _require_rdna35_hip()
+    import torch.nn.functional as F
+
+    generator = torch.Generator(device="cuda").manual_seed(width)
+    x = torch.randn(512, width, generator=generator, device="cuda",
+                    dtype=torch.bfloat16) * 3 + 1
+    weight = torch.randn(width, generator=generator, device="cuda",
+                         dtype=torch.bfloat16)
+    bias = torch.randn(width, generator=generator, device="cuda",
+                       dtype=torch.bfloat16)
+    reference = F.layer_norm(
+        x.float(), (width,), weight.float(), bias.float()).to(torch.bfloat16)
+
+    # Widths other than 1152 use the generic kernel, whose variance reduction
+    # must not overwrite mean scratch that another wave has not read yet.
+    outputs = torch.empty(64, 512, width, device="cuda", dtype=torch.bfloat16)
+    for output in outputs:
+        kernels.layer_norm(output, x, weight, bias, 1e-6)
+    torch.testing.assert_close(
+        outputs, reference.expand_as(outputs), atol=8e-3, rtol=3e-2)
+    torch.testing.assert_close(
+        outputs, outputs[:1].expand_as(outputs), atol=0, rtol=0)
+
+
 @pytest.mark.parametrize(
     "rows,valid_kv_rows,query_heads",
     [
@@ -618,8 +666,9 @@ def test_encoder_backend_keeps_dense_extended_shape_on_sdpa(monkeypatch):
     ("rows", "valid_prefix", "expected"),
     [(661, 661, "sdpa"), (712, 661, "native")],
 )
-def test_gfx12_encoder_keeps_dense_prefix_on_sdpa(
-    monkeypatch, rows, valid_prefix, expected,
+@pytest.mark.parametrize("arch", ["gfx1100", "gfx1201"])
+def test_discrete_rdna_encoder_keeps_dense_prefix_on_sdpa(
+    monkeypatch, rows, valid_prefix, expected, arch,
 ):
     torch, _kernels = _require_rdna35_hip()
     import torch.nn.functional as F
@@ -627,10 +676,10 @@ def test_gfx12_encoder_keeps_dense_prefix_on_sdpa(
 
     launched = []
 
-    class Gfx12Kernels:
+    class TargetKernels:
         @staticmethod
         def build_info():
-            return {"gpu_arch": "gfx1201"}
+            return {"gpu_arch": arch}
 
         @staticmethod
         def attention_encoder_gqa_rdna(*_args):
@@ -645,7 +694,10 @@ def test_gfx12_encoder_keeps_dense_prefix_on_sdpa(
     query = torch.zeros(rows, 8, 256, device="cuda", dtype=torch.bfloat16)
     key = torch.zeros(rows, 1, 256, device="cuda", dtype=torch.bfloat16)
 
-    Rdna35AttentionBackend(Gfx12Kernels()).gqa(
+    from flash_rt.amd.hardware.rdna3 import Rdna3AttentionBackend
+
+    backend = Rdna3AttentionBackend if arch == "gfx1100" else Rdna35AttentionBackend
+    backend(TargetKernels()).gqa(
         query, key, torch.zeros_like(key),
         valid_prefix=valid_prefix, prefix_capacity=rows)
     assert launched == [expected]
@@ -977,4 +1029,44 @@ def test_gemm_backend_fuses_prepared_action_residual(monkeypatch, rows):
 
     projected = torch.addmm(bias, x, weight).to(torch.bfloat16)
     reference = (residual.float() + projected.float()).to(torch.bfloat16)
+    torch.testing.assert_close(output, reference, atol=7e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("rows", [1, 10, 16, 17, 48])
+@pytest.mark.parametrize("inner,columns", [(1024, 2560), (2048, 1024), (1024, 8192), (4096, 1024)])
+def test_decoder_projection_shapes_preserve_bf16_residual_rounding(rows, inner, columns):
+    torch, kernels = _require_rdna35_hip()
+    generator = torch.Generator(device="cuda").manual_seed(rows + inner + columns)
+    x = torch.randn(rows, inner, device="cuda", dtype=torch.bfloat16, generator=generator)
+    weight_nt = torch.randn(columns, inner, device="cuda", dtype=torch.bfloat16, generator=generator)
+    bias = torch.randn(columns, device="cuda", dtype=torch.bfloat16, generator=generator)
+    projection = torch.empty(rows, columns, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn(rows, columns, device="cuda", dtype=torch.bfloat16, generator=generator)
+    output = residual.clone()
+
+    kernels.smallm_gemm(projection, x, weight_nt, bias)
+    reference = (x.float() @ weight_nt.float().t() + bias.float()).bfloat16()
+    torch.testing.assert_close(projection, reference, atol=7e-2, rtol=3e-2)
+    kernels.smallm_gemm(output, x, weight_nt, bias, accumulate=True)
+    torch.testing.assert_close(output, projection + residual, atol=0, rtol=0)
+
+
+def test_streamed_projection_replays_updated_inputs():
+    torch, kernels = _require_rdna35_hip()
+    x = torch.randn(10, 1024, device="cuda", dtype=torch.bfloat16)
+    weight_nt = torch.randn(2560, 1024, device="cuda", dtype=torch.bfloat16)
+    output = torch.empty(10, 2560, device="cuda", dtype=torch.bfloat16)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        kernels.smallm_gemm(output, x, weight_nt)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        kernels.smallm_gemm(output, x, weight_nt)
+    x.normal_()
+    graph.replay()
+    torch.cuda.synchronize()
+    reference = (x.float() @ weight_nt.float().t()).bfloat16()
     torch.testing.assert_close(output, reference, atol=7e-2, rtol=3e-2)

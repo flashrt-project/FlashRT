@@ -1,5 +1,5 @@
 // ================================================================
-// FlashRT AMD -- BF16 normalization kernels (RDNA 3.5, wave32)
+// FlashRT AMD -- BF16 normalization kernels (RDNA, wave32)
 //
 // Covers the normalization surface used by the RDNA Pi0.5 pipeline:
 //   LayerNorm, RMSNorm, AdaRMSNorm, residual+RMSNorm, and
@@ -192,7 +192,10 @@ __global__ __launch_bounds__(kNormThreads) void layer_norm_rdna_kernel(
     const __hip_bfloat16 *__restrict__ weight,
     const __hip_bfloat16 *__restrict__ bias,
     __hip_bfloat16 *__restrict__ output, int width, float epsilon) {
+  // Block reductions broadcast without a trailing barrier; keep the mean and
+  // variance scratch separate, as in the fixed-width kernel above.
   __shared__ float wave_sums[kMaxWaves];
+  __shared__ float wave_square_sums[kMaxWaves];
   const int row = blockIdx.x;
   const int row_start = row * width;
 
@@ -208,7 +211,7 @@ __global__ __launch_bounds__(kNormThreads) void layer_norm_rdna_kernel(
     local_variance += centered * centered;
   }
   const float variance =
-      rdna_block_reduce_sum(local_variance, wave_sums) / width;
+      rdna_block_reduce_sum(local_variance, wave_square_sums) / width;
   const float inverse_std = rsqrtf(variance + epsilon);
 
   for (int column = threadIdx.x; column < width; column += blockDim.x) {

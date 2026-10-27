@@ -20,7 +20,7 @@ def env():
     if not getattr(torch.version, "hip", None) or not torch.cuda.is_available():
         pytest.skip("requires a visible ROCm device")
     ext = importlib.import_module("flash_rt.amd.flash_rt_amd_kernels")
-    if dict(ext.build_info())["hardware"] != "amd_cdna3":
+    if dict(ext.build_info()).get("hardware") != "amd_cdna3":
         pytest.skip("gfx942-specific parity gate")
     return torch, ext
 

@@ -137,11 +137,13 @@ inv = _load_inventory()
 def test_qwen3_vl_owns_shared_sm120_dense_gemm():
     """Qwen3-VL must not require enabling the unrelated qwen3_5_moe bundle."""
     cmake = (REPO_ROOT / "CMakeLists.txt").read_text()
+    # #169 moved the Qwen3-VL arm to the explicit NVFP4 gate; keep this
+    # expectation in sync with CMakeLists.txt.
     shared_start = cmake.index(
-        "if((FLASHRT_BUILD_QWEN3_VL OR FLASHRT_ENABLE_QWEN35MOE) "
-        "AND ENABLE_NVFP4)")
+        "if((FLASHRT_BUILD_QWEN3_VL AND ENABLE_NVFP4) OR\n"
+        "   FLASHRT_ENABLE_QWEN35MOE_CORE)")
     moe_start = cmake.index(
-        "if(FLASHRT_ENABLE_QWEN35MOE AND ENABLE_NVFP4)", shared_start)
+        "if(FLASHRT_ENABLE_QWEN35MOE_CORE)", shared_start)
     shared = cmake[shared_start:moe_start]
     assert "csrc/kernels/w16a16_gemm_sm120.cu" in shared
     assert "FLASHRT_HAVE_W16A16_SM120=1" in shared

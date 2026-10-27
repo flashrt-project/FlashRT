@@ -44,15 +44,20 @@ The raw library has no Python dependency. Its declarations live in
 of maintaining a second set of declarations. Existing `fvk_*` signatures are
 unchanged.
 
-The raw library exports exactly five `fvk_attention_fa2_fwd_*` C symbols. Its
-causal entry remains present for a slim native matrix and fails explicitly for
-an unsupported dtype/head dimension. The default Python-only source matrix and
-failure behavior remain unchanged.
+The raw library exports exactly the FA2 C symbols in
+`csrc/attention/fa2_native_exports.map` (the allow-list). Its causal entry
+remains present for a slim native matrix and fails explicitly for an
+unsupported dtype/head dimension. The head_dim-64 tile entries and `fvk_attention_fa2_has_xvla_tile64` profile
+query are included for the X-VLA adapter. Disabled dtype/profile builds retain
+throwing tile stubs, so the adapter imports in FP16-only and slim builds too.
+New tile calls take an explicit PDL argument; existing entry signatures and
+launch behavior are unchanged. The tile implementation is built only with
+`FLASHRT_BUILD_XVLA=ON`, BF16 enabled and head dimension 64 selected.
 
 ## Validation
 
 - the default adapter directly contains FA2 objects and has no raw dependency;
-- the raw library exports exactly the five documented C symbols;
+- the raw library exports exactly the documented allow-list;
 - it has no unresolved Python or `fvk_*` symbols;
 - the opt-in thin Python adapter has a dynamic dependency on the raw library;
 - native-mode adapter and raw-library runtime search paths are `$ORIGIN`;
