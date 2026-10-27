@@ -213,7 +213,7 @@ FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_bf16_causal_fp8out(
     int o_fp8_batch_stride, int o_fp8_row_stride, int o_fp8_head_stride,
     int o_bf16_skip);
 
-#ifdef FLASHRT_ENABLE_CHAMELEON
+#ifdef FLASHRT_FA2_FP16_CAUSAL
 FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_fp16_causal(
     const void* q_ptr, const void* k_ptr, const void* v_ptr,
     void* o_ptr, void* softmax_lse_ptr,

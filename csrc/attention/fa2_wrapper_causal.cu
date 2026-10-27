@@ -331,9 +331,9 @@ extern "C" void fvk_attention_fa2_fwd_bf16_causal_fp8out(
 #endif
 
 // FP16 causal sibling. Only head_dim=128 is instantiated (Chameleon-7B
-// on Orin SM87 is the consumer; bf16 covers the head_dim=256 shapes
+// on Orin SM87 and the LaWAM Qwen3-VL prefix on SM120 are the consumers; bf16 covers the head_dim=256 shapes
 // used by Qwen3.6 chunked prefill).
-#if defined(FLASHRT_ENABLE_CHAMELEON) && defined(FA2_HAS_FP16) && defined(FA2_HAS_HDIM_128)
+#if defined(FLASHRT_FA2_FP16_CAUSAL) && defined(FA2_HAS_FP16) && defined(FA2_HAS_HDIM_128)
 extern "C" void fvk_attention_fa2_fwd_fp16_causal(
     const void* q_ptr, const void* k_ptr, const void* v_ptr,
     void* o_ptr, void* softmax_lse_ptr,
@@ -377,4 +377,4 @@ extern "C" void fvk_attention_fa2_fwd_fp16_causal(
         FLASH_NAMESPACE::run_mha_fwd_<cutlass::half_t, 128, true>(params, stream);
     }
 }
-#endif  // FLASHRT_ENABLE_CHAMELEON && FA2_HAS_FP16 && FA2_HAS_HDIM_128
+#endif  // FLASHRT_FA2_FP16_CAUSAL && FA2_HAS_FP16 && FA2_HAS_HDIM_128

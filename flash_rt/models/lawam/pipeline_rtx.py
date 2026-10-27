@@ -202,7 +202,7 @@ def qwen_vit_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8", fp
 # ─────────────────────────────────────────────────────────────────────────
 
 def qwen_llm_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8", num_sms=0, out_prec="fp8",
-                     fp8_sites=(), cal=False):
+                     fp8_sites=(), cal=False, attn_dtype="bf16"):
     """Embedding assembly, 16 decoder layers (fused QKV, q/k RMSNorm + M-RoPE,
     causal GQA FA2, SwiGLU, DeepStack adds after layers 0..2) and the final
     RMSNorm: B["vlm"] gets the FP16 VLM states, B["vlm8"] their FP8 copy (the
@@ -222,15 +222,19 @@ def qwen_llm_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8", nu
             "deepstack scatter")
     sp = _site_prec(prec, fp8_sites, cal)
     p_qkv, p_o, p_gu, p_dn = sp("qkv"), sp("o"), sp("gateup"), sp("down")
+    # BF16 attention operands (the reference rounding) with the output cast to
+    # FP16 for a 16-bit o projection, or FP16 operands end to end ("fp16")
+    f16_attn = p_o in _F16 and attn_dtype == "fp16"
+    attn = fa2.fwd_fp16_causal if f16_attn else fa2.fwd_bf16_causal
     pend, pend2 = 0, 0
     for li in range(16):
         L = W["layers"][li]
         _norm8(fvk, h, pend, 0, pend2, L["in_ln_w"], 0, 1, EPS_LLM, x8, L["a_qkv"], S, D, st, p_qkv, f16)
         _mm(gemm, p_qkv, x8, f16, L, "qkv", qkv, S, NQKV, D, st)
         _ck(fvk.fp8_qkv_split(qkv, qkv + 2 * NHQ * HD, qkv + 2 * (NHQ + NHKV) * HD, NQKV, 0, 0, 0, 1.0, 1.0,
-                              L["q_norm_w"], L["k_norm_w"], 1e-6, W["cos"], W["sin"], Q, K, V, True, S,
+                              L["q_norm_w"], L["k_norm_w"], 1e-6, W["cos"], W["sin"], Q, K, V, not f16_attn, S,
                               NHQ, NHKV, HD, st), "llm qkv")
-        fa2.fwd_bf16_causal(Q=Q, K=K, V=V, O=O, softmax_lse=lse, softmax_lse_accum=B["lse_acc"], o_accum=B["o_acc"],
+        attn(Q=Q, K=K, V=V, O=O, softmax_lse=lse, softmax_lse_accum=B["lse_acc"], o_accum=B["o_acc"],
              batch=1, seqlen_q=S, seqlen_k=S, num_heads_q=NHQ, num_heads_kv=NHKV, head_dim=HD,
              q_strides=(S * NHQ * HD, NHQ * HD, HD), k_strides=(S * NHKV * HD, NHKV * HD, HD),
              v_strides=(S * NHKV * HD, NHKV * HD, HD), o_strides=(S * NHQ * HD, NHQ * HD, HD),
@@ -239,9 +243,9 @@ def qwen_llm_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8", nu
             fvk.quantize_fp8_device(O, x8, L["a_o"], S * NHQ * HD, st)
         elif p_o == "fp8":
             fvk.quantize_fp8_static(O, x8, L["a_o"], S * NHQ * HD, st)
-        else:
+        elif not f16_attn:
             fvk.cast_bf16_to_fp16(O, f16, S * NHQ * HD, st)
-        _mm(gemm, p_o, x8, f16, L, "o", o_out, S, D, NHQ * HD, st)
+        _mm(gemm, p_o, x8, O if f16_attn else f16, L, "o", o_out, S, D, NHQ * HD, st)
         _norm8(fvk, h, o_out, 0, 0, L["post_ln_w"], 0, 1, EPS_LLM, x8, L["a_gate"], S, D, st, p_gu, f16)
         if p_gu in _F16:
             # gate | up as one [K, 2 FF] GEMM, SwiGLU reads both halves of the row

@@ -8,7 +8,7 @@ on Blackwell consumer GPUs (`GPU_ARCH=120`).
 ## Build
 
 ```bash
-cmake -B build -S . -DGPU_ARCH=120 -DFLASHRT_ENABLE_LAWAM=ON
+cmake -B build -S . -DGPU_ARCH=120 -DFLASHRT_ENABLE_LAWAM=ON   # also builds FA2 FP16 causal (hdim 128)
 cmake --build build -j$(( $(nproc) / 2 )) --target flash_rt_kernels flash_rt_fa2 flash_rt_lawam
 ```
 
@@ -78,7 +78,10 @@ sequential (1-D) rotary positions for every token; the frontend matches it.
 `"fp16"` or `"fp8"` per stage; `precision["dit"]` selects `"w8a16"`
 (default), `"bf16"` or `"nvfp4"`; `precision["dit_ffn"] = "nvfp4"` runs only
 the DiT FFNs on NVFP4; `precision["lam_mod"]` is `"int8"` (default) or
-`"fp16"` for the LAM AdaLN modulation GEMV. `fp8_sites={"vit": [...],
+`"fp16"` for the LAM AdaLN modulation GEMV; `precision["llm_attn"]` is `"fp16"`
+(default, FP16 causal FA2, no cast before the o projection) or `"bf16"` (the
+reference's attention rounding: aggregate 0.997 vs 0.992 on the 64 held-out
+frames, 0.05 ms slower). `fp8_sites={"vit": [...],
 "llm": [...]}` moves individual tower GEMMs to calibrated FP8.
 
 LaWAM's flow lands in a different action mode on a few real frames under

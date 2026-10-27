@@ -184,8 +184,8 @@ def test_built_adapter_chameleon_symbol_matches_build_mode():
     assert hasattr(module, "fwd_bf16_fp8out")
     assert hasattr(module, "fwd_bf16_causal_fp8out")
     assert hasattr(module, "fwd_bf16_tile")
-    assert hasattr(module, "fwd_fp16_causal") == _cache_bool(
-        "FLASHRT_ENABLE_CHAMELEON")
+    assert hasattr(module, "fwd_fp16_causal") == (
+        _cache_bool("FLASHRT_ENABLE_CHAMELEON") or _cache_bool("FLASHRT_ENABLE_LAWAM"))
 
 
 def test_chameleon_fa2_compile_contract_is_consistent():
@@ -200,9 +200,13 @@ def test_chameleon_fa2_compile_contract_is_consistent():
 
     assert "target_compile_definitions(fa2_vendor_obj PRIVATE\n      FLASHRT_ENABLE_CHAMELEON=1)" in cmake
     assert "target_compile_definitions(flash_rt_fa2 PRIVATE\n        FLASHRT_ENABLE_CHAMELEON=1)" in cmake
-    assert "defined(FLASHRT_ENABLE_CHAMELEON) && defined(FA2_HAS_FP16)" in wrapper
-    assert "#ifdef FLASHRT_ENABLE_CHAMELEON\nFLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_fp16_causal" in header
-    assert "#ifdef FLASHRT_ENABLE_CHAMELEON\n    // FP16 causal sibling" in bindings
+    # the FP16 causal entry is shared by Chameleon and LaWAM through one gate
+    assert "(FLASHRT_ENABLE_CHAMELEON OR FLASHRT_ENABLE_LAWAM)" in cmake
+    assert "target_compile_definitions(fa2_vendor_obj PRIVATE FLASHRT_FA2_FP16_CAUSAL=1)" in cmake
+    assert "target_compile_definitions(flash_rt_fa2 PRIVATE FLASHRT_FA2_FP16_CAUSAL=1)" in cmake
+    assert "defined(FLASHRT_FA2_FP16_CAUSAL) && defined(FA2_HAS_FP16)" in wrapper
+    assert "#ifdef FLASHRT_FA2_FP16_CAUSAL\nFLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_fp16_causal" in header
+    assert "#ifdef FLASHRT_FA2_FP16_CAUSAL\n    // FP16 causal sibling" in bindings
 
 
 def test_unused_fp8_bias_autotune_api_is_absent():

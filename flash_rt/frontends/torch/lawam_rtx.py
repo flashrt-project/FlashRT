@@ -101,13 +101,15 @@ class LawamTorchFrontendRtx:
         # accumulation), "fp16" (FP32 accumulation) or "fp8" (static per-tensor,
         # calibrated). DiT: "w8a16" (INT8 weight-only), "bf16" or "nvfp4";
         # "dit_ffn": "nvfp4" runs the w8a16 DiT's FFN on skinny NVFP4. LAM AdaLN
-        # modulation GEMV: "int8" (per-channel weight-only) or "fp16".
+        # modulation GEMV: "int8" (per-channel weight-only) or "fp16". LLM
+        # attention operands: "fp16" (no cast before the o projection) or "bf16"
+        # (the reference's rounding; closest to the LeRobot outputs).
         # The flow's action chunks bifurcate under small numeric changes on a
         # few real frames; per-tensor FP8 anywhere upstream and NVFP4 DiT weights
         # push measurably past the reference's own precision noise floor, the
         # default stays at it.
         self.precision = {"vit": "f16acc", "llm": "f16acc", "dino": "f16acc", "lam": "f16acc", "enc": "f16acc",
-                          "dit": "w8a16", "lam_mod": "int8"}
+                          "dit": "w8a16", "lam_mod": "int8", "llm_attn": "fp16"}
         self.precision.update(precision or {})
         # GEMM sites of a 16-bit tower that run static FP8 instead
         # (vit: qkv / o / fc1 / fc2, llm: qkv / o / gateup / down)
@@ -148,7 +150,7 @@ class LawamTorchFrontendRtx:
         self.Se = None
         self.task = None
         self.calibrated = (all(v in ("fp16", "f16acc") for k, v in self.precision.items()
-                               if k not in ("dit", "dit_ffn", "lam_mod"))
+                               if k not in ("dit", "dit_ffn", "lam_mod", "llm_attn"))
                            and not any(self.fp8_sites.values()))
 
     # ── small helpers ───────────────────────────────────────────────
@@ -656,7 +658,7 @@ class LawamTorchFrontendRtx:
     # ── the policy step ─────────────────────────────────────────────
     def _forward(self, stream: int, *, cal: bool = False, host_io: bool = True, noise_from_host: bool = True):
         prec = {k: ("cal" if cal and v == "fp8" else v) for k, v in self.precision.items()
-                if k not in ("dit", "dit_ffn", "lam_mod")}
+                if k not in ("dit", "dit_ffn", "lam_mod", "llm_attn")}
         fvk, lk, fa2, gemm, B = self.fvk, self.lk, self.fa2, self.gemm, self.B
         st = int(stream)
         nv = self.num_views
@@ -673,7 +675,8 @@ class LawamTorchFrontendRtx:
                            prec=prec["vit"], fp8_sites=self.fp8_sites.get("vit", ()), cal=cal)
         P.qwen_llm_forward(gemm, fvk, lk, fa2, B["llm"], self.llm, {"S": self.Se, "n_vis": self.n_vis}, stream=st,
                            prec=prec["llm"], num_sms=self.num_sms, out_prec=prec["enc"],
-                           fp8_sites=self.fp8_sites.get("llm", ()), cal=cal)
+                           fp8_sites=self.fp8_sites.get("llm", ()), cal=cal,
+                           attn_dtype=self.precision.get("llm_attn", "bf16"))
         _ck(lk.qformer_latent(B["llm"]["vlm"], self._act_idx, self.n_act, 2048, 32, 8, 1024, self.qformer,
                               B["q"]["scratch"], B["q"]["latent"], B["q"]["cond_silu"], st), "qformer")
         main.wait_event(self._ev_dino)

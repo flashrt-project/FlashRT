@@ -1164,8 +1164,11 @@ if(ENABLE_FA2 AND
       csrc/attention/fa2_causal_inst/flash_fwd_split_hdim256_bf16_sm80_causal.cu
     )
   endif()
-  # fp16 hdim=128 serves Chameleon-7B causal prefill/decode on Orin SM87.
-  if(FLASHRT_ENABLE_CHAMELEON AND "128" IN_LIST FA2_HDIMS AND "fp16" IN_LIST FA2_DTYPES)
+  # fp16 hdim=128 serves Chameleon-7B causal prefill/decode on Orin SM87 and
+  # the LaWAM Qwen3-VL prefix (FP16 operands end to end) on SM120.
+  set(FA2_FP16_CAUSAL OFF)
+  if((FLASHRT_ENABLE_CHAMELEON OR FLASHRT_ENABLE_LAWAM) AND "128" IN_LIST FA2_HDIMS AND "fp16" IN_LIST FA2_DTYPES)
+    set(FA2_FP16_CAUSAL ON)
     list(APPEND FA2_SRCS
       csrc/attention/fa2_causal_inst/flash_fwd_hdim128_fp16_sm80_causal.cu
       csrc/attention/fa2_causal_inst/flash_fwd_split_hdim128_fp16_sm80_causal.cu
@@ -1324,6 +1327,9 @@ if(ENABLE_FA2 AND
     target_compile_definitions(fa2_vendor_obj PRIVATE
       FLASHRT_ENABLE_CHAMELEON=1)
   endif()
+  if(FA2_FP16_CAUSAL)
+    target_compile_definitions(fa2_vendor_obj PRIVATE FLASHRT_FA2_FP16_CAUSAL=1)
+  endif()
 
   string(REPLACE ";" "," _FA2_H "${FA2_BUILT_HDIMS}")
   string(REPLACE ";" "," _FA2_D "${FA2_BUILT_DTYPES}")
@@ -1376,6 +1382,9 @@ if(ENABLE_FA2 AND
     if(FLASHRT_ENABLE_CHAMELEON)
       target_compile_definitions(flash_rt_fa2 PRIVATE
         FLASHRT_ENABLE_CHAMELEON=1)
+    endif()
+    if(FA2_FP16_CAUSAL)
+      target_compile_definitions(flash_rt_fa2 PRIVATE FLASHRT_FA2_FP16_CAUSAL=1)
     endif()
     if(FLASHRT_ENABLE_NATIVE_CPP)
       target_compile_definitions(flash_rt_fa2 PRIVATE
