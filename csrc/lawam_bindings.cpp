@@ -320,4 +320,15 @@ PYBIND11_MODULE(flash_rt_lawam, m) {
         py::arg("heads"), py::arg("hd"), py::arg("scale"), py::arg("state"), py::arg("counters"),
         py::arg("pdl") = true, py::arg("stream") = 0,
         "Action-row cross-attention over a long static K / V, Q from skinny-GEMM partials, keys split over CTAs.");
+
+    m.def("gemv_nvfp4w",
+        [](uintptr_t x, uintptr_t w, uintptr_t sf, uintptr_t gs, uintptr_t bias, uintptr_t out, int N, int K,
+           uintptr_t stream) {
+            return L::gemv_nvfp4w(ptr<const __half>(x), ptr<const uint8_t>(w), ptr<const uint8_t>(sf),
+                                  ptr<const float>(gs), ptr<const __half>(bias), ptr<__half>(out), N, K,
+                                  to_stream(stream));
+        },
+        py::arg("x"), py::arg("w"), py::arg("sf"), py::arg("gs"), py::arg("bias"), py::arg("out"), py::arg("N"),
+        py::arg("K"), py::arg("stream") = 0,
+        "out[N] = NVFP4 weights (E2M1 pairs, UE4M3 per-16 block scales, FP32 global scale) @ x[K] + bias.");
 }

@@ -146,3 +146,21 @@ def test_dit_cross_attention_matches_softmax_attention(slices):
     ref = (att @ v.float().view(keys, heads, hd).transpose(0, 1)).transpose(0, 1).reshape(rows, d)
     torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=1e-2)
     assert int(counters.abs().sum()) == 0
+
+
+def test_gemv_nvfp4w_matches_dequantized_weights():
+    lk = _lawam()
+    from flash_rt.frontends.torch.lawam_rtx import _nvfp4_weight_only
+    torch.manual_seed(0)
+    N, K = 4096, 1024
+    w = torch.randn(N, K, device="cuda") * 0.02
+    x, b = torch.randn(K, device="cuda").half(), (torch.randn(N, device="cuda") * 0.1).half()
+    w4, sf, gs = _nvfp4_weight_only(w)
+    lut = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, 0, -.5, -1, -1.5, -2, -3, -4, -6], device="cuda")
+    q = torch.stack([lut[(w4 & 15).long()], lut[(w4 >> 4).long()]], -1).view(N, K)
+    deq = q * sf.view(torch.float8_e4m3fn).float().repeat_interleave(16, 1) * gs
+    assert ((deq - w).norm() / w.norm()).item() < 0.12
+    out = torch.empty(N, dtype=torch.half, device="cuda")
+    assert lk.gemv_nvfp4w(x.data_ptr(), w4.data_ptr(), sf.data_ptr(), gs.data_ptr(), b.data_ptr(), out.data_ptr(),
+                          N, K, 0) == 0
+    torch.testing.assert_close(out.float(), deq @ x.float() + b.float(), rtol=2e-3, atol=2e-3)

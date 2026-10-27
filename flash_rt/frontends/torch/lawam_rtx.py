@@ -69,6 +69,26 @@ DIT_W8A16_CFG = {
 DIT_IMG_KV_SLICES = 4
 
 
+def _nvfp4_weight_only(w: torch.Tensor):
+    """Round-to-nearest NVFP4 of w [N, K] (K % 16 == 0) for lawam.gemv_nvfp4w:
+    E2M1 pairs [N, K / 2] (element 2j in the low nibble), UE4M3 block scales
+    [N, K / 16] under one FP32 global scale (amax / (6 * 448))."""
+    N, K = w.shape
+    gs = (w.abs().amax() / (6.0 * 448.0)).clamp_min(1e-12)
+    blocks = w.view(N, K // 16, 16)
+    sf = (blocks.abs().amax(-1) / 6.0 / gs).clamp(max=448.0).to(torch.float8_e4m3fn)
+    scale = sf.float().clamp_min(2.0 ** -9) * gs
+    grid = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=w.device)
+    idx = torch.empty(N, K // 16, 16, dtype=torch.uint8, device=w.device)
+    for r in range(0, N, 8192):   # bounded temporaries
+        x = blocks[r:r + 8192] / scale[r:r + 8192, :, None]
+        code = (x.abs()[..., None] - grid).abs().argmin(-1).to(torch.uint8)
+        idx[r:r + 8192] = code | ((x < 0) & (code > 0)).to(torch.uint8) << 3
+    idx = idx.view(N, K // 2, 2)
+    packed = idx[..., 0] | (idx[..., 1] << 4)
+    return packed.contiguous(), sf.view(torch.uint8).contiguous(), gs.reshape(1).float().contiguous()
+
+
 def _ck(rc, what):
     if rc:
         raise RuntimeError(f"LaWAM {what} failed (status {rc})")
@@ -106,7 +126,8 @@ class LawamTorchFrontendRtx:
         # accumulation), "fp16" (FP32 accumulation) or "fp8" (static per-tensor,
         # calibrated). DiT: "w8a16" (INT8 weight-only), "bf16" or "nvfp4";
         # "dit_ffn": "nvfp4" runs the w8a16 DiT's FFN on skinny NVFP4. LAM AdaLN
-        # modulation GEMV: "int8" (per-channel weight-only) or "fp16". LLM
+        # modulation GEMV: "nvfp4" (weight-only, per-16 block scales), "int8"
+        # (per-channel weight-only) or "fp16". LLM
         # attention operands: "fp16" (no cast before the o projection) or "bf16"
         # (the reference's rounding; closest to the LeRobot outputs).
         # The flow's action chunks bifurcate under small numeric changes on a
@@ -114,7 +135,7 @@ class LawamTorchFrontendRtx:
         # push measurably past the reference's own precision noise floor, the
         # default stays at it.
         self.precision = {"vit": "f16acc", "llm": "f16acc", "dino": "f16acc", "lam": "f16acc", "enc": "f16acc",
-                          "dit": "w8a16", "lam_mod": "int8", "llm_attn": "fp16"}
+                          "dit": "w8a16", "lam_mod": "nvfp4", "llm_attn": "fp16"}
         self.precision.update(precision or {})
         # GEMM sites of a 16-bit tower that run static FP8 instead
         # (vit: qkv / o / fc1 / fc2, llm: qkv / o / gateup / down)
@@ -393,10 +414,14 @@ class LawamTorchFrontendRtx:
             for n in ("qkv", "o", "fc1", "fc2"):
                 L["a_" + n] = self._slot(f"lam{li}.{n}")
             self.lam["layers"].append(L)
-        # AdaLN modulation of all 12 blocks as one GEMV [12 * 6144, 1024]: INT8
-        # weights with per-channel scales ("lam_mod": "int8"), or FP16
+        # AdaLN modulation of all 12 blocks as one GEMV [12 * 6144, 1024]: NVFP4
+        # weights ("lam_mod": "nvfp4", per-16 block scales), INT8 weights with
+        # per-channel scales ("int8"), or FP16
         mw = torch.cat(mod_w, dim=0).to(self.device, _F32)
-        if self.precision.get("lam_mod", "fp16") == "int8":
+        if self.precision.get("lam_mod", "fp16") == "nvfp4":
+            w4, sf, gs = _nvfp4_weight_only(mw)
+            self.lam["mod_w4"], self.lam["mod_sf"], self.lam["mod_gs"] = self._k(w4), self._k(sf), self._k(gs)
+        elif self.precision.get("lam_mod", "fp16") == "int8":
             ms = (mw.abs().amax(dim=1) / 127.0).clamp_min(1e-12)
             self.lam["mod_w8"] = self._k((mw / ms[:, None]).round().clamp(-127, 127).to(torch.int8))
             self.lam["mod_ws"] = self._k(ms)

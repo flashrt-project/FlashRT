@@ -90,6 +90,13 @@ int unnormalize_actions(const float* x, int ld, const float* lo, const float* hi
 // out[n] = w_scale[n] * sum_k w[n, k] * x[k] + bias[n]: one-row GEMV with INT8
 // weights [N, K] (per-output-channel scales), FP16 input / output, FP32
 // accumulation. K % 512 == 0, K <= 12288.
+// out[n] = gs * sum_k e2m1(w[n, k]) * sf[n, k / 16] * x[k] + bias[n]: one-row GEMV
+// with NVFP4 weights (w [N, K / 2] bytes, element 2j in the low nibble; sf
+// [N, K / 16] UE4M3 block scales; gs one FP32 global scale), FP16 input /
+// output, FP32 accumulation. K == 1024.
+int gemv_nvfp4w(const __half* x, const uint8_t* w, const uint8_t* sf, const float* gs, const __half* bias,
+                __half* out, int N, int K, cudaStream_t stream);
+
 int gemv_i8w(const __half* x, const int8_t* w, const float* w_scale, const __half* bias, __half* out, int N, int K,
              cudaStream_t stream);
 

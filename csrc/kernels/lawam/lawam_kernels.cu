@@ -4,6 +4,8 @@
 
 #include <curand_kernel.h>
 
+#include <algorithm>
+
 namespace flash_rt {
 namespace lawam {
 namespace {
@@ -440,6 +442,72 @@ gemv_i8w_kernel(const __half* __restrict__ x, const int8_t* __restrict__ w, cons
     if (lane == 0) out[row] = __float2half(acc * w_scale[row] + (bias != nullptr ? __half2float(bias[row]) : 0.f));
 }
 
+// NVFP4-weight GEMV, K = 1024: lane l always owns k in [32 l, 32 l + 32) (one
+// 16-byte load of E2M1 pairs + its two UE4M3 block scales per row), keeps that
+// slice of x in registers and walks rows with four loads in flight; E2M1 pairs
+// convert in hardware (cvt.rn.f16x2.e2m1x2), products accumulate in FP32.
+constexpr int kNvfp4GemvK = 1024;
+constexpr int kNvfp4GemvRows = 4;
+
+__device__ __forceinline__ float2 e2m1x2_to_float2(uint32_t byte) {
+    uint32_t h2;
+    asm("{\n .reg .b8 b;\n cvt.u8.u32 b, %1;\n cvt.rn.f16x2.e2m1x2 %0, b;\n}\n" : "=r"(h2) : "r"(byte));
+    return __half22float2(*reinterpret_cast<const __half2*>(&h2));
+}
+
+__global__ void __launch_bounds__(256)
+gemv_nvfp4w_kernel(const __half* __restrict__ x, const uint8_t* __restrict__ w, const uint8_t* __restrict__ sf,
+                   const float* __restrict__ gs, const __half* __restrict__ bias, __half* __restrict__ out, int N) {
+    constexpr int K = kNvfp4GemvK;
+    const int lane = threadIdx.x & 31;
+    float xr[32];
+#pragma unroll
+    for (int i = 0; i < 32; i += 8) {
+        const uint4 u = __ldg(reinterpret_cast<const uint4*>(x + lane * 32 + i));
+        const __half2* h = reinterpret_cast<const __half2*>(&u);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 f = __half22float2(h[j]);
+            xr[i + 2 * j] = f.x;
+            xr[i + 2 * j + 1] = f.y;
+        }
+    }
+    const float g = *gs;
+    const int warps = gridDim.x * (blockDim.x >> 5);
+    for (int r0 = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * kNvfp4GemvRows; r0 < N;
+         r0 += warps * kNvfp4GemvRows) {
+        uint4 u[kNvfp4GemvRows];
+        uint32_t s2[kNvfp4GemvRows];
+#pragma unroll
+        for (int r = 0; r < kNvfp4GemvRows; ++r) {
+            const int row = min(r0 + r, N - 1);
+            u[r] = __ldg(reinterpret_cast<const uint4*>(w + static_cast<size_t>(row) * (K / 2) + lane * 16));
+            s2[r] = __ldg(reinterpret_cast<const uint16_t*>(sf + static_cast<size_t>(row) * (K / 16) + lane * 2));
+        }
+#pragma unroll
+        for (int r = 0; r < kNvfp4GemvRows; ++r) {
+            const uint32_t wv[4] = {u[r].x, u[r].y, u[r].z, u[r].w};
+            float acc = 0.f;
+#pragma unroll
+            for (int blk = 0; blk < 2; ++blk) {
+                float a = 0.f;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const float2 v = e2m1x2_to_float2((wv[blk * 2 + i / 4] >> (8 * (i % 4))) & 0xffu);
+                    a = fmaf(v.x, xr[blk * 16 + 2 * i], a);
+                    a = fmaf(v.y, xr[blk * 16 + 2 * i + 1], a);
+                }
+                const uint8_t sb = static_cast<uint8_t>(s2[r] >> (8 * blk));
+                acc = fmaf(a, static_cast<float>(*reinterpret_cast<const __nv_fp8_e4m3*>(&sb)), acc);
+            }
+            acc = warp_sum(acc);
+            const int row = r0 + r;
+            if (lane == 0 && row < N)
+                out[row] = __float2half(acc * g + (bias != nullptr ? __half2float(bias[row]) : 0.f));
+        }
+    }
+}
+
 inline int last_error() { return static_cast<int>(cudaGetLastError()); }
 
 }  // namespace
@@ -523,6 +591,20 @@ int gemv_i8w(const __half* x, const int8_t* w, const float* w_scale, const __hal
              cudaStream_t stream) {
     if (N < 1 || K % 512 != 0 || K > 12288) return static_cast<int>(cudaErrorInvalidValue);
     gemv_i8w_kernel<<<(N + 7) / 8, 256, K * sizeof(float), stream>>>(x, w, w_scale, bias, out, N, K);
+    return last_error();
+}
+
+int gemv_nvfp4w(const __half* x, const uint8_t* w, const uint8_t* sf, const float* gs, const __half* bias,
+                __half* out, int N, int K, cudaStream_t stream) {
+    if (N < 1 || K != kNvfp4GemvK || x == nullptr || w == nullptr || sf == nullptr || gs == nullptr ||
+        out == nullptr)
+        return static_cast<int>(cudaErrorInvalidValue);
+    int dev = 0, sms = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    const int rows_per_cta = 8 * kNvfp4GemvRows;
+    const int blocks = std::min((N + rows_per_cta - 1) / rows_per_cta, sms * 8);
+    gemv_nvfp4w_kernel<<<blocks, 256, 0, stream>>>(x, w, sf, gs, bias, out, N);
     return last_error();
 }
 

@@ -55,7 +55,7 @@ One CUDA graph per prompt holds the whole policy step:
 | Qwen3-VL LLM (16 layers kept by LaWAM) | same, `lawam.gemm_f16acc_swiglu` (gate / up / SwiGLU in one dual GEMM), causal GQA FA2 | FP16, FP16 accumulation |
 | VLM -> latent QFormer + LAM conditioning | `lawam.qformer_latent` | FP32 |
 | DINOv3 ViT-B/16 (11 layers used), concurrent graph branch | `lawam.gemm_f16acc_act`, FA2 | FP16, FP16 accumulation |
-| LAM decoder (12 AdaLN blocks) | `lawam.gemm_f16acc_act`, `lawam.gated_residual_norm`, `lawam.gemv_i8w` (modulation) | FP16, FP16 accumulation; INT8 weight-only GEMV |
+| LAM decoder (12 AdaLN blocks) | `lawam.gemm_f16acc_act`, `lawam.gated_residual_norm`, `lawam.gemv_nvfp4w` (modulation) | FP16, FP16 accumulation; NVFP4 weight-only GEMV |
 | flow conditioning (enc_vlm, cross K/V of 8 blocks) | `lawam.gemm_f16acc_act`, BF16 GEMMs | FP16 / BF16 |
 | flow DiT x 10 (16 blocks) | `lawam.w8a16_skinny_gemm`, `nvfp4_skinny_partials_attention` (self / text), `lawam.dit_cross_attention` (512 image keys split over 4 CTAs per head), `lawam.dit_*` consumers | INT8 weight-only, BF16 activations |
 | Euler update, unnormalization | `lawam.dit_sum_bias_euler`, `lawam.unnormalize_actions` | FP32 |
@@ -86,7 +86,8 @@ kernels instead.
 `precision={"vit", "llm", "dino", "lam", "enc"}` selects `"f16acc"` (default),
 `"fp16"` or `"fp8"` per stage; `precision["dit"]` selects `"w8a16"`
 (default), `"bf16"` or `"nvfp4"`; `precision["dit_ffn"] = "nvfp4"` runs only
-the DiT FFNs on NVFP4; `precision["lam_mod"]` is `"int8"` (default) or
+the DiT FFNs on NVFP4; `precision["lam_mod"]` is `"nvfp4"` (default,
+weight-only E2M1 with per-16 UE4M3 block scales), `"int8"` (per-channel) or
 `"fp16"` for the LAM AdaLN modulation GEMV; `precision["llm_attn"]` is `"fp16"`
 (default, FP16 causal FA2, no cast before the o projection) or `"bf16"` (the
 reference's attention rounding: aggregate 0.997 vs 0.992 on the 64 held-out
@@ -105,7 +106,8 @@ opt-in tiers.
 ## Calibration
 
 The default policy has no activation quantization (the DiT INT8 weights use
-per-channel scales fixed at load). With an FP8 tier, `calibrate()` runs each
+per-channel scales, the LAM modulation NVFP4 weights per-16 block scales,
+both fixed at load). With an FP8 tier, `calibrate()` runs each
 real observation once with dynamic per-tensor FP8 at every FP8 site, records
 amax / 448 into the site's scale slot, and keeps the 99.9th percentile across
 observations as the static scale (cached under

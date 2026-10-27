@@ -387,7 +387,10 @@ def lam_decoder_forward(gemm, fvk, lk, fa2, B, W, *, stream=0, prec="fp8"):
     x, x8, qkv = B["x"], B["x8"], B["qkv"]
     Q, K, V, O, lse = B["Q"], B["K"], B["V"], B["O"], B["lse"]
     o_out, fc1, f16, mods = B["o_out"], B["fc1"], B["f16"], B["mods"]
-    if "mod_w8" in W:
+    if "mod_w4" in W:
+        _ck(lk.gemv_nvfp4w(B["cond_silu"], W["mod_w4"], W["mod_sf"], W["mod_gs"], W["mod_b"], mods, 12 * 6 * D, D,
+                           st), "lam adaln gemv")
+    elif "mod_w8" in W:
         _ck(lk.gemv_i8w(B["cond_silu"], W["mod_w8"], W["mod_ws"], W["mod_b"], mods, 12 * 6 * D, D, st), "lam adaln gemv")
     else:
         gemm.fp16_nn_bias(B["cond_silu"], W["mod_w"], mods, W["mod_b"], 1, 12 * 6 * D, D, st)
