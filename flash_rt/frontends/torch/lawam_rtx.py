@@ -135,7 +135,8 @@ class LawamTorchFrontendRtx:
         # accumulation), "fp16" (FP32 accumulation) or "fp8" (static per-tensor,
         # calibrated). DiT: "w8a16" (INT8 weight-only), "w4a16" (NVFP4
         # weight-only), "bf16" or "nvfp4"; "dit_ffn" overrides the FFN GEMMs:
-        # "w4a16" (NVFP4 weight-only, BF16 activations) or "nvfp4" (W4A4). LAM AdaLN
+        # "w4a16" (NVFP4 weight-only, BF16 activations) or "nvfp4" (W4A4),
+        # "dit_qkv" the self-attention QKV projection ("w4a16"). LAM AdaLN
         # modulation GEMV: "nvfp4" (weight-only, per-16 block scales), "int8"
         # (per-channel weight-only) or "fp16". LLM
         # attention operands: "fp16" (no cast before the o projection) or "bf16"
@@ -145,7 +146,8 @@ class LawamTorchFrontendRtx:
         # push measurably past the reference's own precision noise floor, the
         # default stays at it.
         self.precision = {"vit": "f16acc", "llm": "f16acc", "dino": "f16acc", "lam": "f16acc", "enc": "f16acc",
-                          "dit": "w8a16", "dit_ffn": "w4a16", "lam_mod": "nvfp4", "llm_attn": "fp16"}
+                          "dit": "w8a16", "dit_ffn": "w4a16", "dit_qkv": "w4a16", "lam_mod": "nvfp4",
+                          "llm_attn": "fp16"}
         self.precision.update(precision or {})
         # GEMM sites of a 16-bit tower that run static FP8 instead
         # (vit: qkv / o / fc1 / fc2, llm: qkv / o / gateup / down)
@@ -186,7 +188,7 @@ class LawamTorchFrontendRtx:
         self.Se = None
         self.task = None
         self.calibrated = (all(v in ("fp16", "f16acc") for k, v in self.precision.items()
-                               if k not in ("dit", "dit_ffn", "lam_mod", "llm_attn"))
+                               if k not in ("dit", "dit_ffn", "dit_qkv", "lam_mod", "llm_attn"))
                            and not any(self.fp8_sites.values()))
 
     # ── small helpers ───────────────────────────────────────────────
@@ -487,7 +489,7 @@ class LawamTorchFrontendRtx:
             if li % 2 == 1:
                 w = torch.cat([blk(li, f"attn1.to_{n}.weight") for n in ("q", "k", "v")], dim=0)
                 b = torch.cat([blk(li, f"attn1.to_{n}.bias") for n in ("q", "k", "v")], dim=0)
-                W["qkv"].append(self._nvfp4(w, b))
+                W["qkv"].append(self._nvfp4(w, b, mode=self.precision.get("dit_qkv")))
             else:
                 W["q"].append(self._nvfp4(blk(li, "attn1.to_q.weight"), blk(li, "attn1.to_q.bias")))
             W["o"].append(self._nvfp4(blk(li, "attn1.to_out.0.weight"), blk(li, "attn1.to_out.0.bias")))
@@ -709,7 +711,7 @@ class LawamTorchFrontendRtx:
     # ── the policy step ─────────────────────────────────────────────
     def _forward(self, stream: int, *, cal: bool = False, host_io: bool = True, noise_from_host: bool = True):
         prec = {k: ("cal" if cal and v == "fp8" else v) for k, v in self.precision.items()
-                if k not in ("dit", "dit_ffn", "lam_mod", "llm_attn")}
+                if k not in ("dit", "dit_ffn", "dit_qkv", "lam_mod", "llm_attn")}
         fvk, lk, fa2, gemm, B = self.fvk, self.lk, self.fa2, self.gemm, self.B
         st = int(stream)
         nv = self.num_views
