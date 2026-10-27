@@ -66,7 +66,8 @@ F16ACC_KERNEL = "cutlass"
 F16ACC_SPLIT = "tuned"
 _F16ACC_SPLIT = {}
 
-# (ceil(M / 64), N, K, act or "swiglu", bias) -> (tile, split)
+# (ceil(M / 64), N, K, act or "swiglu" / "gateup", bias) -> (tile, split); tiles 8.. are
+# stream-K (split ignored), "gateup" runs the LLM gate | up as one GEMM + silu_mul.
 F16ACC_PLANS = {
     (2, 2048, 4096, 0, False): (1, 1),
     (4, 768, 1024, 0, False): (3, 1),
@@ -75,7 +76,7 @@ F16ACC_PLANS = {
     (4, 1024, 1024, 0, False): (1, 1),
     (4, 1024, 4096, 0, False): (3, 1),
     (4, 2048, 2048, 0, False): (0, 1),
-    (4, 2048, 6144, 0, False): (2, 1),
+    (4, 2048, 6144, 0, False): (8, 1),
     (4, 3072, 1024, 0, False): (3, 1),
     (4, 4096, 2048, 0, False): (5, 1),
     (5, 768, 768, 0, False): (1, 1),
@@ -89,6 +90,7 @@ F16ACC_PLANS = {
     (4, 4096, 1024, 2, True): (6, 1),
     (5, 3072, 768, 2, True): (5, 1),
     (4, 6144, 2048, 'swiglu', False): (0, 2),
+    (4, 6144, 2048, 'gateup', False): (8, 1),
 }
 
 
@@ -167,6 +169,12 @@ def _f16acc_swiglu(a, w, gu, out, M, FF, K, st):
     GEMM, "cublas" as the gate|up GEMM + silu_mul. ``out`` must not alias ``a``."""
     if F16ACC_KERNEL == "cublas":
         _f16acc(a, w, gu, 0, M, 2 * FF, K, 0, st)
+        _ck(_LK.silu_mul(gu, gu + FF * 2, 2 * FF, out, M, FF, st), "llm silu")
+        return
+    plan = _plan_for(M, FF, K, "gateup", False)
+    if plan is not None:
+        # gate | up as one (stream-K) GEMM over the concatenated weight, then silu_mul
+        _ck(_LK.gemm_f16acc_act_cfg(a, w, gu, 0, M, 2 * FF, K, 0, plan[0], plan[1], st), "llm gate|up")
         _ck(_LK.silu_mul(gu, gu + FF * 2, 2 * FF, out, M, FF, st), "llm silu")
         return
     plan = _plan_for(M, FF, K, "swiglu", False)

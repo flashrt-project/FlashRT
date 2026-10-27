@@ -24,6 +24,8 @@
 #include "cutlass/epilogue/thread/linear_combination.h"
 #include "cutlass/epilogue/thread/linear_combination_generic.h"
 #include "cutlass/gemm/device/gemm.h"
+#include "cutlass/gemm/device/gemm_universal.h"
+#include "cutlass/gemm/threadblock/threadblock_swizzle_streamk.h"
 
 #include "45_dual_gemm/device/dual_gemm.h"
 
@@ -90,6 +92,17 @@ using GemmT = cutlass::gemm::device::Gemm<half_t, Row, half_t, Row, half_t, Row,
                                           cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, Stages, 8, 8,
                                           /*SplitKSerial=*/true>;
 
+// Stream-K tiles: the K iterations of the output tiles spread evenly over the
+// SMs (36 on the RTX 5060 Ti, where the data-parallel grids of the M ~ 219 and
+// 512 shapes leave SMs idle in the last wave); partial tiles meet in a
+// workspace in fixed (turnstile) order, so results are reproducible.
+template <template <typename> class Act, bool kBias, class TB, class Warp, int Stages>
+using GemmSK = cutlass::gemm::device::GemmUniversal<half_t, Row, half_t, Row, half_t, Row, half_t,
+                                                    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80, TB, Warp,
+                                                    GemmShape<16, 8, 16>, Epilogue<Act, kBias>,
+                                                    cutlass::gemm::threadblock::ThreadblockSwizzleStreamK, Stages, 8,
+                                                    8>;
+
 // Serial split-K semaphores: one zeroed buffer per stream (every slice
 // sequence leaves its tile semaphore at 0 again).
 constexpr size_t kSemaphoreBytes = 1 << 16;
@@ -153,8 +166,49 @@ int run(const __half* A, const __half* B, __half* D, const __half* bias, int M, 
     return op->run(stream) == cutlass::Status::kSuccess ? 0 : static_cast<int>(cudaErrorLaunchFailure);
 }
 
-// Tile configurations (threadblock M x N x K, warp tile, stages).
-constexpr int kTiles = 8;
+// Stream-K operator of each (shape, stream): initialized once outside a
+// capture (workspace allocated and zeroed; the barriers reset themselves after
+// every run), later calls rebind the pointers.
+template <class G>
+int run_sk(const __half* A, const __half* B, __half* D, const __half* bias, int M, int N, int K, cudaStream_t stream) {
+    const half_t* src = reinterpret_cast<const half_t*>(bias != nullptr ? bias : D);
+    typename G::Arguments args(cutlass::gemm::GemmUniversalMode::kGemm, {M, N, K}, 1, {1.0f, 0.0f},
+                               reinterpret_cast<const half_t*>(A), reinterpret_cast<const half_t*>(B), src,
+                               reinterpret_cast<half_t*>(D), 0, 0, 0, 0, K, N, bias != nullptr ? 0 : N, N);
+    struct Slot {
+        std::unique_ptr<G> op;
+        void* ws = nullptr;
+    };
+    static std::mutex mu;
+    static std::map<std::tuple<int, int, int, cudaStream_t>, Slot> ops;
+    G* op = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        auto& slot = ops[std::make_tuple(M, N, K, stream)];
+        if (!slot.op) {
+            cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+            cudaStreamIsCapturing(stream, &cap);
+            if (cap != cudaStreamCaptureStatusNone) return static_cast<int>(cudaErrorStreamCaptureUnsupported);
+            auto fresh = std::make_unique<G>();
+            if (fresh->can_implement(args) != cutlass::Status::kSuccess) return static_cast<int>(cudaErrorInvalidValue);
+            const size_t bytes = G::get_workspace_size(args);
+            if (bytes > 0) {
+                if (cudaMalloc(&slot.ws, bytes) != cudaSuccess) return static_cast<int>(cudaErrorMemoryAllocation);
+                if (cudaMemset(slot.ws, 0, bytes) != cudaSuccess) return static_cast<int>(cudaErrorUnknown);
+            }
+            if (fresh->initialize(args, slot.ws, stream) != cutlass::Status::kSuccess)
+                return static_cast<int>(cudaErrorUnknown);
+            slot.op = std::move(fresh);
+        } else if (slot.op->update(args) != cutlass::Status::kSuccess) {
+            return static_cast<int>(cudaErrorUnknown);
+        }
+        op = slot.op.get();
+    }
+    return op->run(stream) == cutlass::Status::kSuccess ? 0 : static_cast<int>(cudaErrorLaunchFailure);
+}
+
+// Tile configurations (threadblock M x N x K, warp tile, stages); 8.. stream-K.
+constexpr int kTiles = 11;
 constexpr int kMaxSplit = 8;
 
 template <template <typename> class Act, bool kBias>
@@ -168,7 +222,10 @@ int run_tile(int tile, int split, const __half* A, const __half* B, __half* D, c
         case 4: return run<GemmT<Act, kBias, GemmShape<64, 64, 64>, GemmShape<32, 32, 64>, 5>>(A, B, D, bias, M, N, K, split, stream);
         case 5: return run<GemmT<Act, kBias, GemmShape<128, 256, 32>, GemmShape<64, 64, 32>, 3>>(A, B, D, bias, M, N, K, split, stream);
         case 6: return run<GemmT<Act, kBias, GemmShape<256, 128, 32>, GemmShape<64, 64, 32>, 3>>(A, B, D, bias, M, N, K, split, stream);
-        default: return run<GemmT<Act, kBias, GemmShape<64, 256, 32>, GemmShape<32, 64, 32>, 4>>(A, B, D, bias, M, N, K, split, stream);
+        case 7: return run<GemmT<Act, kBias, GemmShape<64, 256, 32>, GemmShape<32, 64, 32>, 4>>(A, B, D, bias, M, N, K, split, stream);
+        case 8: return run_sk<GemmSK<Act, kBias, GemmShape<128, 128, 32>, GemmShape<64, 64, 32>, 5>>(A, B, D, bias, M, N, K, stream);
+        case 9: return run_sk<GemmSK<Act, kBias, GemmShape<128, 256, 32>, GemmShape<64, 64, 32>, 3>>(A, B, D, bias, M, N, K, stream);
+        default: return run_sk<GemmSK<Act, kBias, GemmShape<128, 128, 64>, GemmShape<64, 64, 64>, 3>>(A, B, D, bias, M, N, K, stream);
     }
 }
 
@@ -314,7 +371,7 @@ int gemm_f16acc_act(const __half* A, const __half* B, __half* D, const __half* b
         float best = 1e30f;
         for (int tile = 0; tile < kTiles; ++tile) {
             for (int sp = 1; sp <= kMaxSplit; ++sp) {
-                if ((split > 0 && sp != split) || sp * 64 > K) continue;
+                if ((split > 0 && sp != split) || sp * 64 > K || (tile >= 8 && sp > 1)) continue;
                 bool ok = true;
                 for (int r = 0; r < 3 && ok; ++r) ok = run_act(act, tile, sp, A, B, D, bias, M, N, K, stream) == 0;
                 if (!ok) continue;
