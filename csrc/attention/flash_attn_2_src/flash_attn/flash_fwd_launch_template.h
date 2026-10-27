@@ -239,8 +239,16 @@ void run_mha_fwd_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
             // 128x64 = 1.185 ms vs 128x128 = 1.216 ms vs 128x32 = 1.241 ms
             // (benchmarks/sm89_vision_attn), so use 128x64 for sm8x non-causal.
             // Keep the upstream 128x128 default for causal / non-SM8x.
+            //
+            // Short non-causal sequences on sm12x (LaWAM's Qwen3-VL / DINOv3 /
+            // LAM towers: 256-261 tokens per image) fill the 36-48 SMs of a
+            // GeForce Blackwell part with only 1-2 waves of 128-row tiles; a
+            // 64-row tile with the same 128-key blocks doubles the CTAs and
+            // keeps every row's reduction order (bit-identical output).
             if (is_sm8x && !Is_causal) {
                 run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            } else if (cc_major == 12 && !Is_causal && params.seqlen_q <= 512) {
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 128, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
             } else {
                 run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
             }
