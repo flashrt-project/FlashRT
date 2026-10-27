@@ -23,6 +23,8 @@ and weights (accuracy reference / fallback for a stage).
 
 from __future__ import annotations
 
+import numpy as np
+
 EPS_VIT = 1e-6
 EPS_LLM = 1e-6
 EPS_DINO = 1e-5
@@ -635,3 +637,209 @@ def dit_step_forward(fvk, lk, fa2, B, W, T, dims, *, step, stream=0, pdl=True, c
     sp = gemm(hid, hid_sf, hb, site, 32, D, "head out")
     _ck(lk.dit_sum_bias_euler(part, sp, one, site["gs"], site["b32"], B["x"], float(dims["dt"]), rows, 32, pdl, st),
         "euler")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Flow loop as one persistent kernel (lawam_dit_persistent_sm120.cu)
+# ─────────────────────────────────────────────────────────────────────────
+
+DIT_UNIT = 2304          # packed weight unit / ring slot (bytes)
+DIT_WARPS = 7            # consumer warps of the persistent kernel
+DIT_CHUNK = 256          # packed NVFP4 unit (k)
+_OP_GEMM, _OP_ATTN, _OP_AE, _OP_KVT, _OP_UNNORM, _OP_LN = range(6)
+_A_BUF, _A_LN = range(2)     # host-side only: an LN GEMM input becomes an OP_LN into xa + a buffer GEMM
+_EP_RESID_INIT, _EP_RESID, _EP_GELU, _EP_RELU, _EP_QKV, _EP_Q, _EP_EULER, _EP_PARTIAL = range(8)
+(_I_KIND, _I_BAR, _I_SITE, _I_WTYPE, _I_N, _I_K, _I_EP, _I_KVLEN, _I_KLD, _I_VTLD, _I_KSPLIT,
+ _I_OWNERS) = range(12)
+_F_EPS, _F_DT, _F_QSCALE = range(3)
+(_P_ABUF, _P_LNSC, _P_LNSH, _P_POS, _P_BIAS, _P_BIAS32, _P_GS, _P_WS, _P_OUT0, _P_OUT1, _P_OUT2, _P_Q, _P_K,
+ _P_VT, _P_PART, _P_STATS) = range(16)
+DIT_KSPLIT_FC2 = 4       # ffn down (K 4096): 4 k groups of 1024 x column groups, partials summed by the next LN
+
+
+def dit_sites(W):
+    """GEMM sites of one flow step in stream order: ae2, (in-proj, o, fc1, fc2) x 16, head1, head2."""
+    sites = [W["ae2"]]
+    for li in range(LAYERS_DIT):
+        sites += [W["qkv"][li // 2] if li % 2 == 1 else W["q"][li // 2], W["o"][li], W["ff_up"][li], W["ff_down"][li]]
+    return sites + [W["head1"], W["head2"]]
+
+
+def _w4_units(torch, w4, sf, N, K):
+    """NVFP4 weight-only site -> [N / 16, K / 256, 2304] units (fragment-ordered E2M1 pairs + UE4M3 scales)."""
+    dev = w4.device
+    b = torch.arange(2048, device=dev)
+    lane, byte = (b % 512) // 16, b % 16
+    G, s, which = 2 * (b // 512) + byte // 8, (byte % 8) // 4, byte % 4
+    g, t = lane // 4, lane % 4
+    row = g + 8 * (which & 1)
+    k = 32 * G + 8 * t + 4 * s + 2 * (which >> 1)
+    tiles, chunks = N // 16, K // DIT_CHUNK
+    frag = w4.view(tiles, 16, chunks, DIT_CHUNK // 2)[:, row, :, k // 2]          # [2048, tiles, chunks]
+    scales = sf.view(tiles, 16, chunks, DIT_CHUNK // 16).permute(0, 2, 1, 3).reshape(tiles, chunks, 256)
+    return torch.cat([frag.permute(1, 2, 0), scales], dim=2).contiguous()
+
+
+def _w8_units(torch, w8, N, K):
+    """INT8 weight-only site -> [N / 16, K / 256, 2, 2304] units (two 128-wide k halves per chunk)."""
+    dev = w8.device
+    b = torch.arange(2048, device=dev)
+    lane, byte = (b % 512) // 16, b % 16
+    G, s, which, e = b // 512, byte // 8, (byte % 8) // 2, byte % 2
+    g, t = lane // 4, lane % 4
+    row = g + 8 * (which & 1)
+    k = 32 * G + 8 * t + 4 * s + 2 * (which >> 1) + e
+    tiles = N // 16
+    frag = w8.view(torch.uint8).view(tiles, 16, K // 128, 128)[:, row, :, k]      # [2048, tiles, K / 128]
+    units = torch.zeros(tiles, K // 128, DIT_UNIT, dtype=torch.uint8, device=dev)
+    units[:, :, :2048] = frag.permute(1, 2, 0)
+    return units.view(tiles, K // DIT_CHUNK, 2, DIT_UNIT)
+
+
+def dit_site_ksplit(si):
+    """K groups of GEMM site si (the ffn down projections are split 4 ways)."""
+    return DIT_KSPLIT_FC2 if 1 <= si <= 4 * LAYERS_DIT and (si - 1) % 4 == 3 else 1
+
+
+def _run_order(U, warps=7):
+    """Stream order of a CTA's U GEMM units: contiguous runs per warp (the
+    first U % warps take one more), interleaved round by round."""
+    q, a = divmod(U, warps)
+    runs = [(w * q + min(w, a), q + (1 if w < a else 0)) for w in range(warps)]
+    return [s0 + r for r in range(q + (1 if a else 0)) for s0, n in runs if r < n]
+
+
+def pack_dit_persistent(torch, W, num_ctas, device):
+    """Pack the step-invariant DiT GEMM sites for the persistent flow kernel.
+
+    Every site's 16-column tiles are split over the CTAs (or, for a K-split
+    site, over the column groups of num_ctas / ksplit CTAs, CTA c taking k
+    group c % ksplit) in contiguous ranges, the remainder tiles rotating from
+    site to site; each CTA's units are laid out in consumption order (site,
+    k chunk, tile[, k half]). Returns (stream [num_ctas, units, 2304] uint8,
+    site table int32 [sites, num_ctas, 4], units per CTA int32 [num_ctas])."""
+    sites = dit_sites(W)
+    per_cta = [[] for _ in range(num_ctas)]
+    count = [0] * num_ctas
+    tab = np.zeros((len(sites), num_ctas, 4), dtype=np.int32)
+    rot = 0
+    for si, site in enumerate(sites):
+        N, K = int(site["N"]), int(site["K"])
+        if "w4" in site:
+            units = _w4_units(torch, site["w4_t"], site["sf4_t"], N, K)                # [tiles, chunks, U]
+        else:
+            units = _w8_units(torch, site["w8_t"].contiguous(), N, K)                   # [tiles, chunks, 2, U]
+        ks = dit_site_ksplit(si)
+        groups = num_ctas // ks
+        nk = K // DIT_CHUNK // ks
+        tiles = N // 16
+        base, rem = divmod(tiles, groups)
+        for c in range(num_ctas):
+            grp, kg = divmod(c, ks)
+            r = (grp - rot) % groups
+            n = base + (1 if r < rem else 0)
+            t0 = r * base + min(r, rem)
+            tab[si, c] = (t0, n, count[c], kg * nk)
+            if n:
+                u = units[t0:t0 + n, kg * nk:(kg + 1) * nk].reshape(n * nk, -1, DIT_UNIT)   # u = tile * nk + chunk
+                u = u[torch.as_tensor(_run_order(n * nk, DIT_WARPS), device=u.device)].reshape(-1, DIT_UNIT)
+                per_cta[c].append(u)
+                count[c] += u.shape[0]
+        rot = (rot + rem) % groups
+    stream = torch.zeros(num_ctas, max(count), DIT_UNIT, dtype=torch.uint8, device=device)
+    for c in range(num_ctas):
+        stream[c, :count[c]] = torch.cat(per_cta[c])
+    return stream, tab, np.asarray(count, dtype=np.int32)
+
+
+def dit_persistent_ops(W, T, B, dims, *, num_steps, lo, hi, action_dim):
+    """Op table of the persistent flow kernel: [n_ops, 224] uint8 (DitOp)."""
+    S = int(dims["S"])
+    spad = int(dims["spad"])
+    ops = []
+
+    def op(kind, bar=1, i=None, f=None, p=None):
+        e = (np.zeros(16, np.int32), np.zeros(8, np.float32), np.zeros(16, np.uint64))
+        e[0][_I_KIND], e[0][_I_BAR] = kind, bar
+        for k, v in (i or {}).items():
+            e[0][k] = v
+        for k, v in (f or {}).items():
+            e[1][k] = v
+        for k, v in (p or {}).items():
+            e[2][k] = int(v)
+        ops.append(e)
+
+    D, qscale = D_DIT, HD_DIT ** -0.5 * 1.4426950408889634
+    kvt, kvi = B["kv_text"], B["kv_img"]
+    op(_OP_KVT, 0, {_I_KVLEN: S, _I_VTLD: spad, _I_KLD: KV_LD}, p={0: kvt, 1: B["vt_text"]})
+    op(_OP_KVT, 0, {_I_KVLEN: 512, _I_VTLD: 512, _I_KLD: KV_LD}, p={0: kvi, 1: B["vt_img"]})
+
+    # owners of the residual columns (row statistics partials) after the previous residual update,
+    # or the K-split GEMM site whose partials are still to be added into the residual
+    owners = {"n": 0, "pending": None}
+
+    def gemm(si, site, wtype, N, K, amode, ep, abuf, out0, *, eps=0.0, sc=0, sh=0, pos=0, out1=0, out2=0, dt=0.0):
+        if amode == _A_LN:
+            # the block-input LayerNorm runs once (distributed) into the FP16 operand xa
+            pend = owners["pending"]
+            if pend is not None:
+                assert "w4" in pend[1], "the deferred K-split residual update expects an NVFP4 site"
+                op(_OP_LN, 1, {_I_KSPLIT: dit_site_ksplit(pend[0])}, {_F_EPS: eps},
+                   {_P_LNSC: sc, _P_LNSH: sh, _P_POS: pos, _P_OUT0: B["xa"], _P_OUT1: abuf, _P_PART: B["part"],
+                    _P_GS: pend[1]["gs"], _P_BIAS: pend[1]["b"]})
+                owners["pending"] = None
+            else:
+                op(_OP_LN, 1, {_I_OWNERS: owners["n"]}, {_F_EPS: eps},
+                   {_P_ABUF: abuf, _P_LNSC: sc, _P_LNSH: sh, _P_POS: pos, _P_OUT0: B["xa"], _P_STATS: B["rowstat"]})
+            amode, abuf = _A_BUF, B["xa"]
+        if ep == _EP_RESID and dit_site_ksplit(si) > 1:
+            ep = _EP_PARTIAL                      # residual update deferred to the next LayerNorm phase
+            owners["pending"] = (si, site)
+        p = {_P_ABUF: abuf, _P_LNSC: 0, _P_LNSH: 0, _P_POS: 0, _P_BIAS: site["b"], _P_BIAS32: site["b32"],
+             _P_OUT0: out0, _P_OUT1: out1, _P_OUT2: out2, _P_STATS: B["rowstat"]}
+        if ep in (_EP_RESID, _EP_RESID_INIT):
+            owners["n"] = B["num_ctas"] // dit_site_ksplit(si)
+        if ep == _EP_PARTIAL:
+            p[_P_PART] = B["part"]
+        if wtype == 0:
+            p[_P_GS] = site["gs"]
+        else:
+            p[_P_WS] = site["ws"]
+        ks = dit_site_ksplit(si)
+        assert ks == 1 or ep == _EP_PARTIAL, "a K-split site defers its residual update to the next LayerNorm"
+        op(_OP_GEMM, 1, {_I_SITE: si, _I_WTYPE: wtype, _I_N: N, _I_K: K, _I_EP: ep, _I_KSPLIT: ks},
+           {_F_EPS: eps, _F_DT: dt, _F_QSCALE: qscale}, p)
+
+    sites = dit_sites(W)
+    wt = lambda s: 0 if "w4" in s else 1   # noqa: E731
+    for s in range(num_steps):
+        op(_OP_AE, 1, {_I_N: 24, _I_K: 32}, p={0: B["x"], 1: W["ae_w1"], 2: W["ae_b1"], 3: B["ae"]})
+        gemm(0, sites[0], 1, D, D, _A_BUF, _EP_RESID_INIT, B["ae"], B["h"])
+        for li in range(LAYERS_DIT):
+            si = 1 + 4 * li
+            ln = dict(eps=EPS_LN, sc=T["scale"][s][li], sh=T["shift"][s][li], pos=T["pos"])
+            if li % 2 == 1:
+                gemm(si, sites[si], wt(sites[si]), 3 * D, D, _A_LN, _EP_QKV, B["h"], B["Qs"], out1=B["Ks"],
+                     out2=B["Vts"], **ln)
+                op(_OP_ATTN, 1, {_I_KVLEN: 24, _I_KLD: 1024, _I_VTLD: 32},
+                   p={_P_Q: B["Qs"], _P_K: B["Ks"], _P_VT: B["Vts"], _P_OUT0: B["O"]})
+            else:
+                gemm(si, sites[si], wt(sites[si]), D, D, _A_LN, _EP_Q, B["h"], B["Qs"], **ln)
+                g = li // 4
+                if li % 4 == 0:
+                    op(_OP_ATTN, 1, {_I_KVLEN: S, _I_KLD: KV_LD, _I_VTLD: spad},
+                       p={_P_Q: B["Qs"], _P_K: kvt + g * 2 * D * 2, _P_VT: B["vt_text"] + g * D * spad * 2,
+                          _P_OUT0: B["O"]})
+                else:
+                    op(_OP_ATTN, 1, {_I_KVLEN: 512, _I_KLD: KV_LD, _I_VTLD: 512},
+                       p={_P_Q: B["Qs"], _P_K: kvi + g * 2 * D * 2, _P_VT: B["vt_img"] + g * D * 512 * 2,
+                          _P_OUT0: B["O"]})
+            gemm(si + 1, sites[si + 1], wt(sites[si + 1]), D, D, _A_BUF, _EP_RESID, B["O"], B["h"])
+            gemm(si + 2, sites[si + 2], wt(sites[si + 2]), FF_DIT, D, _A_LN, _EP_GELU, B["h"], B["hb"], eps=EPS_LN)
+            gemm(si + 3, sites[si + 3], wt(sites[si + 3]), D, FF_DIT, _A_BUF, _EP_RESID, B["hb"], B["h"])
+        gemm(65, sites[65], wt(sites[65]), D, D, _A_LN, _EP_RELU, B["h"], B["hb"], eps=1e-6,
+             sc=T["out_scale"][s], sh=T["out_shift"][s])
+        gemm(66, sites[66], wt(sites[66]), 32, D, _A_BUF, _EP_EULER, B["hb"], B["x"], dt=1.0 / num_steps)
+    op(_OP_UNNORM, 0, {_I_N: 24, _I_K: 32, _I_KVLEN: action_dim}, p={0: B["x"], 1: lo, 2: hi, 3: B["actions"]})
+    rows = [np.concatenate([e[0].view(np.uint8), e[1].view(np.uint8), e[2].view(np.uint8)]) for e in ops]
+    return np.stack(rows)

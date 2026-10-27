@@ -357,4 +357,18 @@ PYBIND11_MODULE(flash_rt_lawam, m) {
         py::arg("v_mul"), py::arg("cos"), py::arg("sin"), py::arg("q_out"), py::arg("k_out"), py::arg("v_out"),
         py::arg("out_bf16"), py::arg("S"), py::arg("n_q"), py::arg("n_k"), py::arg("hd"), py::arg("stream") = 0,
         "Fused-qkv split + bias + K/V scale + rotate-half RoPE (head dim 64), FP16 / BF16 out.");
+
+    m.def("dit_flow_smem_bytes", &L::dit_flow_smem_bytes);
+    m.def("dit_flow_persistent",
+        [](uintptr_t ops, int n_ops, uintptr_t site_tab, int n_sites, uintptr_t cta_units, int n_steps,
+           uintptr_t stream_units, long long cta_stride, uintptr_t counter, int num_ctas, uintptr_t stream) {
+            return L::dit_flow_persistent(ptr<const L::DitOp>(ops), n_ops, ptr<const int>(site_tab), n_sites,
+                                          ptr<const int>(cta_units), n_steps, ptr<const uint8_t>(stream_units),
+                                          cta_stride, ptr<unsigned>(counter), num_ctas, to_stream(stream));
+        },
+        py::arg("ops"), py::arg("n_ops"), py::arg("site_tab"), py::arg("n_sites"), py::arg("cta_units"),
+        py::arg("n_steps"), py::arg("stream_units"), py::arg("cta_stride"),
+        py::arg("counter"), py::arg("num_ctas"), py::arg("stream") = 0,
+        "The flow loop (DiT steps, action encoder / decoder, Euler, unnormalize) as one persistent cooperative "
+        "kernel over a host-built op table and per-CTA packed weight units.");
 }

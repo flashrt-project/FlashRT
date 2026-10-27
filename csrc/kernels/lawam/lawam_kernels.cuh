@@ -213,5 +213,32 @@ int qkv_rope_split(const __half* qkv, int ld, const __half* q_bias, const __half
                    float k_mul, float v_mul, const __half* cos, const __half* sin, void* q_out, void* k_out,
                    void* v_out, bool out_bf16, int S, int n_q, int n_k, int hd, cudaStream_t stream);
 
+// The flow loop as one persistent cooperative kernel
+// (lawam_dit_persistent_sm120.cu). ops: device table of DitOp built by the
+// frontend (kind, GEMM site / mode / scalars, raw pointers); site_tab: int32
+// [sites][num_ctas][4] (first 16-column tile, tile count, first packed unit,
+// first 256-wide k chunk) of every GEMM site; stream: each CTA's weight units
+// of one flow step packed in consumption order (unit stride 2304 bytes, CTA
+// stride cta_stride; cta_units[c] units, replayed for every one of n_steps
+// steps). counter: one word (zeroed by the call). num_ctas: one CTA per SM.
+struct DitOp {
+    int32_t i[16];
+    float f[8];
+    uint64_t p[16];
+};
+static_assert(sizeof(DitOp) == 224, "DitOp layout is mirrored by the frontend");
+enum DitOpField {
+    DIT_I_KIND = 0, DIT_I_BAR = 1, DIT_I_SITE = 2, DIT_I_WTYPE = 3, DIT_I_N = 4, DIT_I_K = 5, DIT_I_EP = 6,
+    DIT_I_KVLEN = 7, DIT_I_KLD = 8, DIT_I_VTLD = 9, DIT_I_KSPLIT = 10, DIT_I_OWNERS = 11,
+    DIT_F_EPS = 0, DIT_F_DT = 1, DIT_F_QSCALE = 2,
+    DIT_P_ABUF = 0, DIT_P_LNSC = 1, DIT_P_LNSH = 2, DIT_P_POS = 3, DIT_P_BIAS = 4, DIT_P_BIAS32 = 5, DIT_P_GS = 6,
+    DIT_P_WS = 7, DIT_P_OUT0 = 8, DIT_P_OUT1 = 9, DIT_P_OUT2 = 10, DIT_P_Q = 11, DIT_P_K = 12, DIT_P_VT = 13,
+    DIT_P_PART = 14, DIT_P_STATS = 15,
+};
+int dit_flow_smem_bytes();
+int dit_flow_persistent(const DitOp* ops, int n_ops, const int* site_tab, int n_sites, const int* cta_units,
+                        int n_steps, const uint8_t* stream, long long cta_stride, unsigned* counter, int num_ctas,
+                        cudaStream_t stream_);
+
 }  // namespace lawam
 }  // namespace flash_rt

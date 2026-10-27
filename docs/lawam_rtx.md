@@ -52,13 +52,12 @@ One CUDA graph per prompt holds the whole policy step:
 |---|---|---|
 | camera frames -> patch rows | `lawam.preprocess_u8` | FP16 |
 | Qwen3-VL ViT (24 layers, DeepStack 5/11/17, mergers) | `lawam.gemm_f16acc_act` (fc1 + bias + GELU in one GEMM), `fp8_residual_norm_quant`, `lawam.qkv_rope_split`, FA2 | FP16, FP16 accumulation |
-| Qwen3-VL LLM (16 layers kept by LaWAM) | same, `lawam.gemm_f16acc_swiglu` (gate / up / SwiGLU in one dual GEMM), causal GQA FA2 | FP16, FP16 accumulation |
+| Qwen3-VL LLM (16 layers kept by LaWAM) | same, gate \| up as one stream-K `lawam.gemm_f16acc_act` + `lawam.silu_mul`, causal GQA FA2 | FP16, FP16 accumulation |
 | VLM -> latent QFormer + LAM conditioning | `lawam.qformer_latent` | FP32 |
 | DINOv3 ViT-B/16 (11 layers used), concurrent graph branch | `lawam.gemm_f16acc_act`, FA2 | FP16, FP16 accumulation |
 | LAM decoder (12 AdaLN blocks) | `lawam.gemm_f16acc_act`, `lawam.gated_residual_norm`, `lawam.gemv_nvfp4w` (modulation) | FP16, FP16 accumulation; NVFP4 weight-only GEMV |
 | flow conditioning (enc_vlm, cross K/V of 8 blocks) | `lawam.gemm_f16acc_act`, BF16 GEMMs | FP16 / BF16 |
-| flow DiT x 10 (16 blocks) | `lawam.w4a16_skinny_gemm` (FFN, self-attention QKV), `lawam.w8a16_skinny_gemm` (other projections), `nvfp4_skinny_partials_attention` (self / text), `lawam.dit_cross_attention` (512 image keys split over 4 CTAs per head), `lawam.dit_*` consumers | NVFP4 / INT8 weight-only, BF16 activations |
-| Euler update, unnormalization | `lawam.dit_sum_bias_euler`, `lawam.unnormalize_actions` | FP32 |
+| flow DiT x 10 (16 blocks), Euler updates, unnormalization | `lawam.dit_flow_persistent`: one cooperative kernel for the whole loop (below) | NVFP4 (FFN, self-attention QKV) / INT8 (other projections) weight-only, FP16 operands, FP16 accumulation per 256 / 128-wide k unit |
 
 Exact rewrites of the reference: tokens past the effective horizon never
 influence the first 24 action rows (keys are masked, outputs discarded), so
@@ -69,6 +68,19 @@ skipped and its LayerScale folded into the projections; proj_out_2 and the
 first action-decoder layer are folded into one GEMM; the still frame's two
 temporal patch copies are folded into the Qwen3-VL patch-embedding weight.
 
+The flow loop is latency bound (every GEMM has 24 rows), so
+`lawam.dit_flow_persistent` runs it as one persistent cooperative kernel (one
+CTA per SM) over an op table built by `pipeline_rtx.dit_persistent_ops`: grid
+barriers separate dependent ops, a producer warp streams the step's weights
+(packed at load time by `pipeline_rtx.pack_dit_persistent` into the kernel's
+fragment order, per CTA in consumption order) into a shared-memory ring ahead
+of the consumers, block-input LayerNorms run once per op distributed over the
+CTAs, and the ffn down projection is split over 4 k groups whose partials the
+next LayerNorm adds into the residual. `precision={"dit_impl": "chain"}`
+selects the per-kernel chain (`pipeline_rtx.dit_step_forward`: skinny W4A16 /
+W8A16 GEMMs with FP32 accumulation, `nvfp4_skinny_partials_attention`,
+`lawam.dit_cross_attention`, the `lawam.dit_*` consumers).
+
 The LeRobot policy runs Qwen3-VL on `inputs_embeds` only, so Qwen3-VL uses
 sequential (1-D) rotary positions for every token; the frontend matches it.
 
@@ -76,7 +88,10 @@ The FP16-accumulate GEMMs run CUTLASS SM80 tensor-op tiles with the bias /
 GELU / SwiGLU epilogues fused. The tile and serial split-K count of every
 production shape come from `pipeline_rtx.F16ACC_PLANS` (measured on RTX 5060
 Ti), so every process forms the same FP16 sums; other shapes are timed on their
-first call. `flash_rt.models.lawam.pipeline_rtx.F16ACC_SPLIT = "timed"` times
+first call. Tiles 8-10 are stream-K (the K iterations of the output tiles spread
+over the 36 SMs, partial tiles reduced in fixed order); the LLM down projection
+and the concatenated gate | up GEMM run on them.
+`flash_rt.models.lawam.pipeline_rtx.F16ACC_SPLIT = "timed"` times
 every shape, `"cublas"` (set before the graph is captured) uses the split of the cuBLASLt
 `COMPUTE_16F` plan instead, so the GEMMs form the same FP16 sums as
 `lawam.gemm_f16acc` (the erf-GELU and SwiGLU epilogues then reproduce the
@@ -96,7 +111,8 @@ weight-only E2M1 with per-16 UE4M3 block scales), `"int8"` (per-channel) or
 `"fp16"` for the LAM AdaLN modulation GEMV; `precision["llm_attn"]` is `"fp16"`
 (default, FP16 causal FA2, no cast before the o projection) or `"bf16"` (the
 reference's attention rounding: aggregate 0.997 vs 0.992 on the 64 held-out
-frames, 0.05 ms slower). `fp8_sites={"vit": [...],
+frames, 0.05 ms slower); `precision["dit_impl"]` is `"persistent"` (default,
+the W8A16 / W4A16 tier only) or `"chain"`. `fp8_sites={"vit": [...],
 "llm": [...]}` moves individual tower GEMMs to calibrated FP8.
 
 LaWAM's flow lands in a different action mode on a few real frames under

@@ -140,14 +140,17 @@ class LawamTorchFrontendRtx:
         # modulation GEMV: "nvfp4" (weight-only, per-16 block scales), "int8"
         # (per-channel weight-only) or "fp16". LLM
         # attention operands: "fp16" (no cast before the o projection) or "bf16"
-        # (the reference's rounding; closest to the LeRobot outputs).
+        # (the reference's rounding; closest to the LeRobot outputs). Flow
+        # loop: "persistent" (one cooperative kernel for all denoising steps,
+        # the W8A16 / W4A16 tier with FP16 accumulation per 128 / 256-wide k
+        # unit) or "chain" (the per-kernel chain of pipeline_rtx.dit_step_forward).
         # The flow's action chunks bifurcate under small numeric changes on a
         # few real frames; per-tensor FP8 anywhere upstream and NVFP4 DiT weights
         # push measurably past the reference's own precision noise floor, the
         # default stays at it.
         self.precision = {"vit": "f16acc", "llm": "f16acc", "dino": "f16acc", "lam": "f16acc", "enc": "f16acc",
                           "dit": "w8a16", "dit_ffn": "w4a16", "dit_qkv": "w4a16", "lam_mod": "nvfp4",
-                          "llm_attn": "fp16"}
+                          "llm_attn": "fp16", "dit_impl": "persistent"}
         self.precision.update(precision or {})
         # GEMM sites of a 16-bit tower that run static FP8 instead
         # (vit: qkv / o / fc1 / fc2, llm: qkv / o / gateup / down)
@@ -184,11 +187,20 @@ class LawamTorchFrontendRtx:
         self._scale_names: list = []
         self._load_weights()
         self._build_step_tables()
+        self._dit_persistent = self.precision["dit_impl"] == "persistent"
+        if self._dit_persistent:
+            if (self.horizon != 24 or self.precision["dit"] != "w8a16" or self.precision.get("dit_ffn") != "w4a16"
+                    or self.precision.get("dit_qkv") != "w4a16"):
+                raise ValueError("the persistent flow kernel runs the 24-row W8A16 / W4A16 DiT tier")
+            stream, tab, units = P.pack_dit_persistent(torch, self.dit_w, self.num_sms, self.device)
+            self._dit_stream = stream
+            self._dit_tab = torch.from_numpy(tab).to(self.device)
+            self._dit_units = torch.from_numpy(units).to(self.device)
         self.graph = None
         self.Se = None
         self.task = None
         self.calibrated = (all(v in ("fp16", "f16acc") for k, v in self.precision.items()
-                               if k not in ("dit", "dit_ffn", "dit_qkv", "lam_mod", "llm_attn"))
+                               if k not in ("dit", "dit_ffn", "dit_qkv", "lam_mod", "llm_attn", "dit_impl"))
                            and not any(self.fp8_sites.values()))
 
     # ── small helpers ───────────────────────────────────────────────
@@ -243,13 +255,15 @@ class LawamTorchFrontendRtx:
         mode = mode or self.precision["dit"]
         if mode == "w4a16":
             w4, sf, gs = _nvfp4_weight_only(w_nk.to(self.device, _F32))
-            return {"w4": self._k(w4), "sf4": self._k(sf), "gs": self._k(gs),
+            return {"w4": self._k(w4), "sf4": self._k(sf), "gs": self._k(gs), "w4_t": w4, "sf4_t": sf,
+                    "N": w_nk.shape[0], "K": w_nk.shape[1],
                     "b": self._k(b.to(self.device, _BF16)), "b32": self._k(b.to(self.device, _F32))}
         if mode == "w8a16":
             w = w_nk.to(self.device, _F32)
             ws = (w.abs().amax(dim=1) / 127.0).clamp_min(1e-12)
             q = (w / ws[:, None]).round().clamp(-127, 127).to(torch.int8)
-            return {"w8": self._k(q), "ws": self._k(ws), "gs": self._one_ptr,
+            return {"w8": self._k(q), "ws": self._k(ws), "gs": self._one_ptr, "w8_t": q,
+                    "N": w_nk.shape[0], "K": w_nk.shape[1],
                     "b": self._k(b.to(self.device, _BF16)), "b32": self._k(b.to(self.device, _F32))}
         if mode == "bf16":
             return {"w16": self._k(w_nk.to(self.device, _BF16)), "gs": self._one_ptr,
@@ -705,13 +719,27 @@ class LawamTorchFrontendRtx:
                                      dtype=_F32),
                     "xattn_cnt": b(16 * ((rows + 15) // 16), dtype=torch.int32, zero=True)}
         B["actions"] = b(rows, self.action_dim, dtype=_F32)
+        if self._dit_persistent:
+            D = B["dit"]
+            spad = (S + 31) // 32 * 32
+            D.update({"Qs": b(32, 1024, dtype=_BF16, zero=True), "Ks": b(32, 1024, dtype=_BF16, zero=True),
+                      "Vts": b(1024, 32, dtype=_BF16, zero=True), "vt_text": b(4, 1024, spad, dtype=_BF16, zero=True),
+                      "vt_img": b(4, 1024, 512, dtype=_BF16, zero=True), "actions": B["actions"],
+                      "counter": b(4, dtype=torch.int32, zero=True),
+                      "part": b(P.DIT_KSPLIT_FC2, rows, 1024, dtype=_F32),
+                      "rowstat": b(self.num_sms, rows, 2, dtype=_F32), "num_ctas": self.num_sms,
+                      "xa": b(rows, 1024, dtype=_FP16)})
+            ops = P.dit_persistent_ops(self.dit_w, self.tables, D, {"S": S, "spad": spad}, num_steps=self.num_steps,
+                                       lo=self._act_lo, hi=self._act_hi, action_dim=self.action_dim)
+            self._dit_ops = torch.from_numpy(ops).to(self.device)
+            self._prompt_keep.append(self._dit_ops)
         self.seed = torch.zeros(1, dtype=torch.int64, device=self.device)
         self._prompt_keep.append(self.seed)
 
     # ── the policy step ─────────────────────────────────────────────
     def _forward(self, stream: int, *, cal: bool = False, host_io: bool = True, noise_from_host: bool = True):
         prec = {k: ("cal" if cal and v == "fp8" else v) for k, v in self.precision.items()
-                if k not in ("dit", "dit_ffn", "dit_qkv", "lam_mod", "llm_attn")}
+                if k not in ("dit", "dit_ffn", "dit_qkv", "lam_mod", "llm_attn", "dit_impl")}
         fvk, lk, fa2, gemm, B = self.fvk, self.lk, self.fa2, self.gemm, self.B
         st = int(stream)
         nv = self.num_views
@@ -740,11 +768,18 @@ class LawamTorchFrontendRtx:
             _ck(lk.memcpy_async(D["x"], self.noise_host.data_ptr(), self.noise_host.numel() * 4, st), "noise h2d")
         else:
             _ck(lk.gaussian_noise(D["x"], self.seed.data_ptr(), self.horizon * 32, st), "noise")
-        dims = {"rows": self.horizon, "S": self.Se, "dt": 1.0 / self.num_steps}
-        for s in range(self.num_steps):
-            P.dit_step_forward(fvk, lk, fa2, D, self.dit_w, self.tables, dims, step=s, stream=st, cfg=self.dit_cfg)
-        _ck(lk.unnormalize_actions(D["x"], 32, self._act_lo, self._act_hi, B["actions"], self.horizon,
-                                   self.action_dim, st), "unnormalize")
+        if self._dit_persistent:
+            _ck(lk.dit_flow_persistent(self._dit_ops.data_ptr(), self._dit_ops.shape[0], self._dit_tab.data_ptr(),
+                                       self._dit_tab.shape[0], self._dit_units.data_ptr(), self.num_steps,
+                                       self._dit_stream.data_ptr(), self._dit_stream.stride(0), D["counter"],
+                                       self.num_sms, st), "flow (persistent)")
+        else:
+            dims = {"rows": self.horizon, "S": self.Se, "dt": 1.0 / self.num_steps}
+            for s in range(self.num_steps):
+                P.dit_step_forward(fvk, lk, fa2, D, self.dit_w, self.tables, dims, step=s, stream=st,
+                                   cfg=self.dit_cfg)
+            _ck(lk.unnormalize_actions(D["x"], 32, self._act_lo, self._act_hi, B["actions"], self.horizon,
+                                       self.action_dim, st), "unnormalize")
         if host_io:
             _ck(lk.memcpy_async(self.actions_host.data_ptr(), B["actions"], self.actions_host.numel() * 4, st),
                 "actions d2h")
