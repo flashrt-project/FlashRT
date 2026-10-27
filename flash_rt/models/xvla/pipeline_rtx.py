@@ -207,9 +207,7 @@ class XVLARTXPipeline:
         self.dims = XVLADims(img=img, vision=vision_stage_shapes(img))
         self.smallm_fp4 = USE_SMALLM_FP4_GEMM and hasattr(fvk, "xvla_fp4_gemm_bias_bf16out")
         self.fa2_m32 = USE_FA2_M32 and hasattr(fa2, "fwd_bf16_tile64m32w2_qnvfp4")
-        if USE_PDL and hasattr(fvk, "set_pdl") and hasattr(fa2, "set_pdl"):
-            fvk.set_pdl(True)
-            fa2.set_pdl(True)
+        self.use_pdl = USE_PDL
         self._allocate()
         self._graph = None
         self._graph_stream = None
@@ -576,7 +574,7 @@ class XVLARTXPipeline:
                 base, base + HIDDEN * 2, base + HIDDEN * 4, 0, self._p(lse), 0,
                 self._p(packed), self._p(sfa), cols // 2, (cols // 16 + 3) // 4,
                 1, seq if q_rows is None else q_rows, seq, heads, heads, hd,
-                qs, qs, qs, qs_o, hd ** -0.5, self.num_sms, self._st(),
+                qs, qs, qs, qs_o, hd ** -0.5, self.num_sms, self._st(), enable_pdl=self.use_pdl,
             )
             return
         attn(
@@ -584,6 +582,7 @@ class XVLARTXPipeline:
             1, seq, seq, heads, heads, hd,
             qs, qs, qs, (seq * HIDDEN, HIDDEN, hd),
             hd ** -0.5, self.num_sms, self._st(),
+            **({"enable_pdl": self.use_pdl} if hd == 64 else {}),
         )
 
     # ── stage 2: BART encoder ────────────────────────────────────────────
@@ -885,7 +884,8 @@ class XVLARTXPipeline:
                                    self._p(B["v_op"]),
                                    self._p(B["v_wlse"]), 0, nw,
                                    WINDOW * WINDOW, WINDOW * WINDOW, heads, heads, 64,
-                                   stq, stq, stq, stq, 32 ** -0.5, self.num_sms, st)
+                                   stq, stq, stq, stq, 32 ** -0.5, self.num_sms, st,
+                                   enable_pdl=self.use_pdl)
             # The unpad packs the NVFP4 operand itself: the row is staged in
             # shared memory rather than written out and read back.
             fvk.xvla_vision_window_out_unpad_to_nvfp4(
@@ -998,6 +998,10 @@ class XVLARTXPipeline:
     # ── driver ───────────────────────────────────────────────────────────
 
     def run(self) -> torch.Tensor:
+        with self.fvk.xvla_pdl_scope(self.use_pdl):
+            return self._run()
+
+    def _run(self) -> torch.Tensor:
         self.vision_forward()
         self.encode_assemble()
         self.encode_forward()

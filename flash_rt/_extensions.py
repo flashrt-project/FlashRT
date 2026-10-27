@@ -29,6 +29,7 @@ EXTENSIONS = {
 #: model family → the CMake switch that builds its kernels and nothing
 #: else. Pair any of these with ``-DFLASHRT_SLIM_BUILD=ON``.
 BUILD_SWITCHES = {
+    "xvla": "FLASHRT_BUILD_XVLA",
     "dm05": "FLASHRT_ENABLE_DM05",
     "lingbot": "FLASHRT_ENABLE_LINGBOT",
     "motus": "FLASHRT_ENABLE_MOTUS",

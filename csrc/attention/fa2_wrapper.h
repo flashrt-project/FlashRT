@@ -95,12 +95,11 @@ FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_bf16_tile(
     int o_batch_stride, int o_row_stride, int o_head_stride,
     float softmax_scale, int num_sms, cudaStream_t stream);
 
-// The head_dim-64 tile entries below are internal to the Python adapter and
-// are intentionally not part of the native C API export allow-list
-// (csrc/attention/fa2_native_exports.map).
+// X-VLA tile entries are exported by the raw library for its Python adapter.
+// PDL is explicit per call; existing FA2 entry signatures are unchanged.
 
 // head_dim 64 tile <64,32,64,4> (head_dim must be exactly 64).
-void fvk_attention_fa2_fwd_bf16_tile64m32(
+FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_bf16_tile64m32(
     const void* q_ptr, const void* k_ptr, const void* v_ptr,
     void* o_ptr, void* softmax_lse_ptr, const void* seqused_k_ptr,
     int batch, int seqlen_q, int seqlen_k,
@@ -109,10 +108,10 @@ void fvk_attention_fa2_fwd_bf16_tile64m32(
     int k_batch_stride, int k_row_stride, int k_head_stride,
     int v_batch_stride, int v_row_stride, int v_head_stride,
     int o_batch_stride, int o_row_stride, int o_head_stride,
-    float softmax_scale, int num_sms, cudaStream_t stream);
+    float softmax_scale, int num_sms, cudaStream_t stream, int enable_pdl);
 
 // head_dim 64 tile <64,32,64,2>: 32 query rows on two warps (head_dim 64).
-void fvk_attention_fa2_fwd_bf16_tile64m32w2(
+FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_bf16_tile64m32w2(
     const void* q_ptr, const void* k_ptr, const void* v_ptr,
     void* o_ptr, void* softmax_lse_ptr, const void* seqused_k_ptr,
     int batch, int seqlen_q, int seqlen_k,
@@ -121,10 +120,10 @@ void fvk_attention_fa2_fwd_bf16_tile64m32w2(
     int k_batch_stride, int k_row_stride, int k_head_stride,
     int v_batch_stride, int v_row_stride, int v_head_stride,
     int o_batch_stride, int o_row_stride, int o_head_stride,
-    float softmax_scale, int num_sms, cudaStream_t stream);
+    float softmax_scale, int num_sms, cudaStream_t stream, int enable_pdl);
 
 // head_dim 64 tile <64,64,64,4> (head_dim must be exactly 64).
-void fvk_attention_fa2_fwd_bf16_tile64(
+FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_bf16_tile64(
     const void* q_ptr, const void* k_ptr, const void* v_ptr,
     void* o_ptr, void* softmax_lse_ptr, const void* seqused_k_ptr,
     int batch, int seqlen_q, int seqlen_k,
@@ -133,15 +132,12 @@ void fvk_attention_fa2_fwd_bf16_tile64(
     int k_batch_stride, int k_row_stride, int k_head_stride,
     int v_batch_stride, int v_row_stride, int v_head_stride,
     int o_batch_stride, int o_row_stride, int o_head_stride,
-    float softmax_scale, int num_sms, cudaStream_t stream);
+    float softmax_scale, int num_sms, cudaStream_t stream, int enable_pdl);
 
-// Programmatic dependent launch for this module's forward entries; off by
-// default (see csrc/kernels/pdl_switch.cuh).
-FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_set_pdl(int enabled);
 
 // head_dim 64 tile with a fused NVFP4 quantize of the O tile (head_dim must be 64;
 // null o_packed/o_sfa falls back to fvk_attention_fa2_fwd_bf16_tile64).
-void fvk_attention_fa2_fwd_bf16_tile64_qnvfp4(
+FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_bf16_tile64_qnvfp4(
     const void* q_ptr, const void* k_ptr, const void* v_ptr,
     void* o_ptr, void* softmax_lse_ptr, const void* seqused_k_ptr,
     void* o_packed_ptr, void* o_sfa_ptr,
@@ -152,10 +148,10 @@ void fvk_attention_fa2_fwd_bf16_tile64_qnvfp4(
     int k_batch_stride, int k_row_stride, int k_head_stride,
     int v_batch_stride, int v_row_stride, int v_head_stride,
     int o_batch_stride, int o_row_stride, int o_head_stride,
-    float softmax_scale, int num_sms, cudaStream_t stream);
+    float softmax_scale, int num_sms, cudaStream_t stream, int enable_pdl);
 
 // Same with the two-warp 32-row tile.
-void fvk_attention_fa2_fwd_bf16_tile64m32w2_qnvfp4(
+FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_bf16_tile64m32w2_qnvfp4(
     const void* q_ptr, const void* k_ptr, const void* v_ptr,
     void* o_ptr, void* softmax_lse_ptr, const void* seqused_k_ptr,
     void* o_packed_ptr, void* o_sfa_ptr,
@@ -166,7 +162,7 @@ void fvk_attention_fa2_fwd_bf16_tile64m32w2_qnvfp4(
     int k_batch_stride, int k_row_stride, int k_head_stride,
     int v_batch_stride, int v_row_stride, int v_head_stride,
     int o_batch_stride, int o_row_stride, int o_head_stride,
-    float softmax_scale, int num_sms, cudaStream_t stream);
+    float softmax_scale, int num_sms, cudaStream_t stream, int enable_pdl);
 
 FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_bf16_causal(
     const void* q_ptr, const void* k_ptr, const void* v_ptr,
@@ -230,6 +226,9 @@ FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_fp16_causal(
     int o_batch_stride, int o_row_stride, int o_head_stride,
     float softmax_scale, int num_sms, cudaStream_t stream);
 #endif
+
+// True only when the opt-in BF16 head-dim-64 X-VLA tile profile is compiled.
+FLASHRT_FA2_NATIVE_API int fvk_attention_fa2_has_xvla_tile64();
 
 #ifdef __cplusplus
 }

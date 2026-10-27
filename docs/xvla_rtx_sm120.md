@@ -45,7 +45,8 @@ option is ON and GPU_ARCH is 120/121. The existing shared symbols
 the CUTLASS wrappers and `common.cuh`) are unchanged; other models keep their
 current launch/build behavior. The X-VLA pipeline calls the distinctly named
 `*_pdl`/`*_v3`/`*_v2` siblings. The FA2 head_dim-64 tile set is built when
-`ENABLE_FA2` and `bf16` are enabled; it is additive to the upstream dispatch.
+`FLASHRT_BUILD_XVLA=ON`, `ENABLE_FA2`, BF16 and head dimension 64 are enabled;
+it is additive to the upstream dispatch.
 
 ## Usage
 
@@ -209,3 +210,27 @@ opt-in and skips unless `XVLA_CKPT` (and optionally `XVLA_REF_ACTIONS`) is set.
 - No Thor (SM110), Orin (SM87), Ada (SM89), or AMD backend.
 - The third configured camera slot is an empty camera and is not a caller
   input; `num_views` is 2 (or 3 when the caller includes the empty slot).
+
+
+## Build and isolation follow-up (2026-10-27)
+
+The frontend checks required core symbols and the FA2 tile64 profile before
+reading checkpoint files or allocating model weights. A missing/default build
+reports `FLASHRT_BUILD_XVLA=ON`, BF16 and the required head-dimension selection
+instead of failing later with an attribute error.
+
+`device` must name the current CUDA device (or be `cuda`, which resolves to it).
+Architecture and SM-count queries use that device. Requests for a different device
+are rejected before loading; changing the current device after construction also
+raises before prompt setup, capture or inference. Select the desired CUDA device
+before constructing the frontend.
+
+PDL is no longer a process-wide setting enabled at initialization. X-VLA core
+launches use a thread-local context during `pipeline.run()` and restore it on
+normal return or exceptions. The new FA2 tile entries accept `enable_pdl` per
+call; existing FA2 entries always initialize it to false. Other models do not
+inherit X-VLA's launch policy.
+
+The native raw library exports the complete adapter surface. FP16-only and
+disabled-tile builds keep all five new tile symbols as throwing stubs;
+`has_xvla_tile64()` distinguishes those stubs from an enabled profile.

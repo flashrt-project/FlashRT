@@ -5,10 +5,6 @@ import inspect
 import pytest
 
 pytest.importorskip("flash_rt")
-try:
-    from flash_rt import flash_rt_fa2, flash_rt_kernels  # noqa: F401
-except ImportError:
-    pytest.skip("FlashRT kernel extensions are not built", allow_module_level=True)
 
 from flash_rt.frontends.torch.xvla_rtx import XVLATorchFrontendRtx
 

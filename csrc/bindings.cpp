@@ -11633,11 +11633,15 @@ m.def("hyvla_vit_add_layer_norm_to_fp8_block128_bf16",
     }, py::arg("x"), py::arg("ln_weight"), py::arg("ln_bias"), py::arg("packed"),
        py::arg("scale_factors"), py::arg("rows"), py::arg("cols"),
        py::arg("eps") = 1e-5f, py::arg("stream") = 0);
-    m.def("set_pdl", [](bool enabled) { flash_rt::pdl::flag() = enabled; },
-          py::arg("enabled"),
-          "Launch the PDL-aware X-VLA kernels (the fused norms/elementwise "
-          "entries and the NVFP4 small-M GEMMs) with a programmatic dependency "
-          "on the previous stream node. Process-wide, off by default.");
+    py::class_<flash_rt::pdl::Scope>(m, "xvla_pdl_scope")
+        .def(py::init<bool>(), py::arg("enabled"))
+        .def("__enter__", [](flash_rt::pdl::Scope& scope) -> flash_rt::pdl::Scope& {
+            scope.enter(); return scope;
+        }, py::return_value_policy::reference_internal)
+        .def("__exit__", [](flash_rt::pdl::Scope& scope, py::object, py::object, py::object) {
+            scope.leave();
+        });
+
     m.def("xvla_add_ln_quant_bf16",
           [](uintptr_t residual, uintptr_t h, uintptr_t w, uintptr_t b,
              uintptr_t packed, uintptr_t sf, int rows, int cols, float eps,

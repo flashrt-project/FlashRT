@@ -70,8 +70,8 @@ On top of the upstream pin above, the X-VLA RTX path adds:
    `run_mha_fwd_tile64m32w2_bf16` (`<64,32,64,2>`). Additive: the upstream
    dispatch in `flash_fwd_launch_template.h` keeps its existing tiles; the new
    entries are reached only through the internal
-   `fvk_attention_fa2_fwd_bf16_tile64*` Python bindings (not part of the
-   native C API export allow-list).
+   `fvk_attention_fa2_fwd_bf16_tile64*` bindings. The raw-library allow-list
+   exports these symbols so the native-mode Python adapter can resolve them.
 2. `flash_fwd_kernel.h` / `utils.h` — the ragged-tail path, enabled by the
    `SkipDeadTail` compile-time flag on `run_flash_fwd` / `flash_fwd_kernel`.
    The three X-VLA tile instantiations pass `true`; every existing entry

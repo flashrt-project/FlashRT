@@ -1114,7 +1114,7 @@ if(ENABLE_FA2 AND
   # dispatch is untouched.
   # head_dim 64 tile set (see fa2_tile_inst/flash_fwd_tile64_bf16_sm80.cu).
   set(FA2_HAS_TILE64_BF16 OFF)
-  if("bf16" IN_LIST FA2_DTYPES)
+  if(FLASHRT_BUILD_XVLA AND "bf16" IN_LIST FA2_DTYPES AND "64" IN_LIST FA2_HDIMS)
     set(FA2_HAS_TILE64_BF16 ON)
     list(APPEND FA2_SRCS
       csrc/attention/fa2_tile_inst/flash_fwd_tile64_bf16_sm80.cu
@@ -1154,15 +1154,9 @@ if(ENABLE_FA2 AND
       csrc/attention/fa2_causal_inst/flash_fwd_split_hdim128_fp16_sm80_causal.cu
     )
   endif()
-  if(FLASHRT_ENABLE_NATIVE_CPP)
-    # The native C boundary has a stable five-symbol surface. Its causal
-    # wrapper contains native-only fail-fast dispatch for a slim matrix.
-    list(APPEND FA2_SRCS csrc/attention/fa2_wrapper_causal.cu)
-  elseif(("bf16" IN_LIST FA2_DTYPES OR "fp16" IN_LIST FA2_DTYPES) AND
-         ("128" IN_LIST FA2_HDIMS OR "256" IN_LIST FA2_HDIMS))
-    # Preserve the existing Python-only source matrix exactly by default.
-    list(APPEND FA2_SRCS csrc/attention/fa2_wrapper_causal.cu)
-  endif()
+  # The adapter references causal entries in every matrix. This wrapper also
+  # supplies their not-built stubs for FP16-only and head-dim-64 slim builds.
+  list(APPEND FA2_SRCS csrc/attention/fa2_wrapper_causal.cu)
 
   add_library(fa2_vendor_obj OBJECT ${FA2_SRCS})
   set_target_properties(fa2_vendor_obj PROPERTIES

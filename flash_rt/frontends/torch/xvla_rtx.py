@@ -31,8 +31,6 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from flash_rt import flash_rt_fa2 as fa2
-from flash_rt import flash_rt_kernels as fvk
 from flash_rt.core.context import FvkContext
 from flash_rt.models.xvla.pipeline_rtx import (
     ACTION_DIM,
@@ -55,6 +53,66 @@ _VENDOR = "model.vlm."
 _LM = "model.vlm.language_model.model.encoder."
 _VT = "model.vlm.vision_tower."
 _AT = "model.transformer."
+
+_REQUIRED_CORE = (
+    'FvkContext',
+    'GemmRunner',
+    'add_bias_bf16_pdl',
+    'bf16_weight_to_nvfp4_swizzled',
+    'fp4_w4a16_gemm_bias_gelu_bf16out_sm120',
+    'fp4_w4a16_gemm_bias_gelu_fp4out_sm120',
+    'fp4_w4a16_gemm_sm120_bf16out_pingpong_bias',
+    'fp8_block128_gemm_cutlass_sm120_bf16out_bias',
+    'fp8_per_token_block128_quant_bf16_v2',
+    'gelu_erf_bf16',
+    'gelu_inplace',
+    'layer_norm_pdl',
+    'nvfp4_sf_swizzled_bytes',
+    'quantize_bf16_to_nvfp4_swizzled_v3',
+    'residual_add_pdl',
+    'splitk_b128_fp8_gemm_32x64x128_w4',
+    'tq_cutlass_bf16_gemm',
+    'xvla_action_decoder_gemv',
+    'xvla_add2_bf16',
+    'xvla_add_ln_quant_bf16',
+    'xvla_add_ln_quant_norm_bf16',
+    'xvla_copy_bf16',
+    'xvla_finalize_bf16',
+    'xvla_flow_step_bf16',
+    'xvla_fp4_gemm_bias_bf16out',
+    'xvla_fp4_gemm_bias_gelu_fp4out',
+    'xvla_ln_bf16',
+    'xvla_ln_quant_bf16',
+    'xvla_ln_quant_bf16_nt256',
+    'xvla_pdl_scope',
+    'xvla_proprio_bf16',
+    'xvla_vision_channel_attn',
+    'xvla_vision_dwconv3x3_res',
+    'xvla_vision_gelu_erf_to_nvfp4',
+    'xvla_vision_im2col',
+    'xvla_vision_projector_pack',
+    'xvla_vision_resize',
+    'xvla_vision_window_out_unpad_to_nvfp4',
+    'xvla_vision_window_qkv_pad',
+    'xvla_vision_window_qkv_pad_fill',
+)
+_REQUIRED_FA2 = ("fwd_bf16_tile", "fwd_bf16_tile64", "fwd_bf16_tile64m32w2_qnvfp4",
+                 "fwd_bf16_tile64_qnvfp4", "has_xvla_tile64")
+
+
+def _require_kernels():
+    from flash_rt import _extensions
+    core = _extensions.require(config="xvla")
+    attention = _extensions.require("flash_rt_fa2", config="xvla")
+    missing = ["flash_rt_kernels." + name for name in _REQUIRED_CORE if not hasattr(core, name)]
+    missing += ["flash_rt_fa2." + name for name in _REQUIRED_FA2 if not hasattr(attention, name)]
+    if missing or not attention.has_xvla_tile64():
+        detail = ", ".join(missing) if missing else "FA2 X-VLA BF16 tile64 profile"
+        raise RuntimeError(
+            "X-VLA kernels are not built: " + detail + ". Rebuild with "
+            "-DFLASHRT_BUILD_XVLA=ON -DFA2_DTYPES=bf16 -DFA2_HDIMS='64;96;128;256'.")
+    return core, attention
+
 
 MIN_TORCH_BF16 = True
 
@@ -117,12 +175,14 @@ class XVLATorchFrontendRtx:
                 "X-VLA has two real camera views plus one configured empty camera; "
                 f"num_views must be 2 (or 3 when the caller includes the empty slot), got {num_views}"
             )
-        self._require_arch()
+        self.device = self._resolve_device(device)
+        self._require_arch(self.device)
+        global fvk, fa2
+        fvk, fa2 = _require_kernels()
         self.checkpoint_dir = str(checkpoint_dir)
         path = Path(self.checkpoint_dir) / "model.safetensors"
         if not path.is_file():
             raise FileNotFoundError(f"model.safetensors not found in {self.checkpoint_dir}")
-        self.device = torch.device(device)
         self.num_views = num_views
         self.precision = precision
         self._tokenizer = None
@@ -138,7 +198,7 @@ class XVLATorchFrontendRtx:
 
         ctx = FvkContext()
         self.gemm = ctx.gemm
-        self.num_sms = num_sms or torch.cuda.get_device_properties(0).multi_processor_count
+        self.num_sms = num_sms or torch.cuda.get_device_properties(self.device).multi_processor_count
 
         self.W = self._load_weights(path, precision)
         use_fp8, use_fp4 = precision == "fp8", precision == "nvfp4"
@@ -155,15 +215,29 @@ class XVLATorchFrontendRtx:
         self._prompt_set = False
 
     @staticmethod
-    def _require_arch() -> None:
+    def _require_arch(device) -> None:
         if not torch.cuda.is_available():
             raise RuntimeError("X-VLA RTX requires a CUDA device (SM120/SM121)")
-        major, minor = torch.cuda.get_device_capability(0)
+        major, minor = torch.cuda.get_device_capability(device)
         if (major, minor) not in ((12, 0), (12, 1)):
             raise RuntimeError(
                 f"X-VLA RTX is validated on SM120/SM121; found sm_{major}{minor}. "
                 "There is no fallback path for this model."
             )
+
+    @staticmethod
+    def _resolve_device(device):
+        if not torch.cuda.is_available():
+            raise RuntimeError("X-VLA RTX requires CUDA")
+        selected = torch.device(device)
+        current = torch.cuda.current_device()
+        if selected.type != "cuda" or selected.index not in (None, current):
+            raise ValueError("X-VLA device must be the current CUDA device; select it before constructing the frontend")
+        return torch.device("cuda", current)
+
+    def _require_current_device(self):
+        if torch.cuda.current_device() != self.device.index:
+            raise RuntimeError("X-VLA current CUDA device changed; restore the frontend's device before inference")
 
     # ── checkpoint mapping ───────────────────────────────────────────────
 
@@ -401,6 +475,7 @@ class XVLATorchFrontendRtx:
 
     def set_prompt(self, prompt: str | torch.Tensor, images=None, state=None) -> None:
         """Embed a fixed instruction (string or pre-tokenised 50-token ids)."""
+        self._require_current_device()
         if isinstance(prompt, str):
             ids = self._tokenize(prompt)
             self._prompt_text = prompt
@@ -415,6 +490,7 @@ class XVLATorchFrontendRtx:
     # ── graph capture ────────────────────────────────────────────────────
 
     def capture(self, warmup: int = 3) -> None:
+        self._require_current_device()
         if self._graph is not None:
             return
         if not self._prompt_set:
@@ -459,6 +535,7 @@ class XVLATorchFrontendRtx:
         ``state``. A string ``prompt``/``task`` rebinds the instruction when
         it changes; otherwise ``set_prompt`` must have been called first.
         """
+        self._require_current_device()
         task = obs.get("prompt") or obs.get("task")
         if isinstance(task, str) and task != self._prompt_text:
             self.set_prompt(task)
@@ -496,6 +573,7 @@ class XVLATorchFrontendRtx:
 
         Only the staging copies run per call; all model math is inside the graph.
         """
+        self._require_current_device()
         n = self.W["n_state"]
         self.B["images"].copy_(images)
         self.B["state_in"][:n].copy_(state.reshape(-1)[:n])

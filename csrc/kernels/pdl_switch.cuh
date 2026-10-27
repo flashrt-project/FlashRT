@@ -11,20 +11,39 @@
 //  griddepcontrol.launch_dependents right after, so the next node's launch and
 //  prologue overlap the current node's tail inside the CUDA graph.
 //
-//  Off by default and process-wide (one flag per shared object: the inline
-//  function's static is merged by the linker across translation units).
+//  Disabled outside an explicit, thread-local X-VLA execution scope.
 // ============================================================================
 #pragma once
 #include <cuda_runtime.h>
 #include <utility>
+#include <stdexcept>
 
 namespace flash_rt {
 namespace pdl {
 
 inline bool& flag() {
-  static bool enabled = false;
+  static thread_local bool enabled = false;
   return enabled;
 }
+
+class Scope {
+ public:
+  explicit Scope(bool enabled) : enabled_(enabled) {}
+  Scope(const Scope&) = delete;
+  Scope& operator=(const Scope&) = delete;
+  ~Scope() { leave(); }
+  void enter() {
+    if (active_) throw std::logic_error("X-VLA PDL scope is already active");
+    previous_ = flag();
+    flag() = enabled_;
+    active_ = true;
+  }
+  void leave() noexcept {
+    if (active_) { flag() = previous_; active_ = false; }
+  }
+ private:
+  bool enabled_, previous_ = false, active_ = false;
+};
 
 template <typename... KArgs, typename... Args>
 inline cudaError_t launch(void (*kernel)(KArgs...), dim3 grid, dim3 block,
