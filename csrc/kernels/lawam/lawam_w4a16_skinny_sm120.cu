@@ -7,8 +7,10 @@
 // the low nibble) with UE4M3 block scales sf [N, K / 16]; the per-tensor FP32
 // scale is left to the consumers (their alpha = a_gs * w_gs), so the partials
 // have the layout and meaning of lawam_w8a16_skinny_sm120.cu. Every E2M1 value
-// times its UE4M3 scale is exact in BF16, the reduction runs on BF16 mma.sync
-// (m16n8k16, FP32 accumulate).
+// times its UE4M3 scale is exact in FP16 (one hardware E2M1 conversion and one
+// half2 multiply per pair), the BF16 activations are staged as FP16 (exact for
+// the DiT's range) and the reduction runs on FP16 mma.sync (m16n8k16, FP32
+// accumulate).
 //
 // Each CTA owns BN weight rows x KC of K, loaded into registers before the
 // programmatic-dependent-launch wait. Within every 128-wide K block lane quad t
@@ -32,18 +34,17 @@ constexpr int kRows = 32;            // two m16 tiles
 __device__ __forceinline__ void mma_bf16(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                          uint32_t b1) {
     asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
         "{%0,%1,%2,%3};\n"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-// One E2M1 pair (a byte) times a block scale -> packed BF16 pair (exact).
-__device__ __forceinline__ uint32_t e2m1x2_bf16x2(uint32_t byte, float scale) {
+// One E2M1 pair (a byte) times a block scale (FP16 pair) -> packed FP16 pair (exact).
+__device__ __forceinline__ uint32_t e2m1x2_f16x2(uint32_t byte, __half2 scale) {
     uint32_t h2;
     asm("{\n .reg .b8 b;\n cvt.u8.u32 b, %1;\n cvt.rn.f16x2.e2m1x2 %0, b;\n}\n" : "=r"(h2) : "r"(byte));
-    const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h2));
-    const __nv_bfloat162 v = __floats2bfloat162_rn(f.x * scale, f.y * scale);
+    const __half2 v = __hmul2(*reinterpret_cast<const __half2*>(&h2), scale);
     return *reinterpret_cast<const uint32_t*>(&v);
 }
 
@@ -72,8 +73,8 @@ w4a16_skinny_kernel(const __nv_bfloat16* __restrict__ A, const uint8_t* __restri
                     const uint8_t* __restrict__ sf, float* __restrict__ partials, int M, int N, int K) {
     constexpr int kTiles = BN / (kWarps * 8);   // n8 tiles per warp
     constexpr int kBlocks = KC / 128;           // 128-wide K blocks per CTA
-    constexpr int kLd = KC + 8;                 // padded smem row (bf16)
-    __shared__ __align__(16) __nv_bfloat16 sa[kRows * kLd];
+    constexpr int kLd = KC + 8;                 // padded smem row (fp16)
+    __shared__ __align__(16) __half sa[kRows * kLd];
 
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int g = lane >> 2, t = lane & 3;
@@ -103,7 +104,18 @@ w4a16_skinny_kernel(const __nv_bfloat16* __restrict__ A, const uint8_t* __restri
     for (int i = threadIdx.x; i < kRows * (KC / 8); i += kWarps * 32) {
         const int r = i / (KC / 8), c = (i % (KC / 8)) * 8;
         uint4 v = make_uint4(0, 0, 0, 0);
-        if (r < M) v = *reinterpret_cast<const uint4*>(A + static_cast<size_t>(r) * K + k_cta + c);
+        if (r < M) {
+            // BF16 -> FP16 (exact for the DiT's |x| < 65504 above the FP16 subnormal range)
+            const uint4 u = *reinterpret_cast<const uint4*>(A + static_cast<size_t>(r) * K + k_cta + c);
+            const uint32_t uw[4] = {u.x, u.y, u.z, u.w};
+            uint32_t hw[4];
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const __half2 h = __float22half2_rn(__bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&uw[q])));
+                hw[q] = *reinterpret_cast<const uint32_t*>(&h);
+            }
+            v = make_uint4(hw[0], hw[1], hw[2], hw[3]);
+        }
         *reinterpret_cast<uint4*>(sa + r * kLd + c) = v;
     }
     __syncthreads();
@@ -124,7 +136,7 @@ w4a16_skinny_kernel(const __nv_bfloat16* __restrict__ A, const uint8_t* __restri
             uint32_t ar[4][8];
 #pragma unroll
             for (int rr = 0; rr < 4; ++rr) {
-                const __nv_bfloat16* p = sa + (g + 8 * rr) * kLd + 128 * b + 32 * t + 16 * h;
+                const __half* p = sa + (g + 8 * rr) * kLd + 128 * b + 32 * t + 16 * h;
                 const uint4 v0 = *reinterpret_cast<const uint4*>(p);
                 const uint4 v1 = *reinterpret_cast<const uint4*>(p + 8);
                 ar[rr][0] = v0.x; ar[rr][1] = v0.y; ar[rr][2] = v0.z; ar[rr][3] = v0.w;
@@ -135,13 +147,13 @@ w4a16_skinny_kernel(const __nv_bfloat16* __restrict__ A, const uint8_t* __restri
                 // the half's 16 k = 8 E2M1 pairs = word pair (2h, 2h + 1), scale byte h
                 const uint32_t w0 = h ? wreg[j][b].z : wreg[j][b].x;
                 const uint32_t w1 = h ? wreg[j][b].w : wreg[j][b].y;
-                const float sc = ue4m3(sreg[j][b] >> (8 * h));
+                const __half2 sc = __float2half2_rn(ue4m3(sreg[j][b] >> (8 * h)));
 #pragma unroll
                 for (int s = 0; s < 4; ++s) {
                     // physical k 16h + 4s + {0,1} (b0) and {2,3} (b1): bytes 2s, 2s+1 of the half
                     const uint32_t word = s < 2 ? w0 : w1;
-                    const uint32_t b0 = e2m1x2_bf16x2((word >> (16 * (s & 1))) & 0xffu, sc);
-                    const uint32_t b1 = e2m1x2_bf16x2((word >> (16 * (s & 1) + 8)) & 0xffu, sc);
+                    const uint32_t b0 = e2m1x2_f16x2((word >> (16 * (s & 1))) & 0xffu, sc);
+                    const uint32_t b1 = e2m1x2_f16x2((word >> (16 * (s & 1) + 8)) & 0xffu, sc);
 #pragma unroll
                     for (int mt = 0; mt < 2; ++mt)
                         mma_bf16(acc[j][mt], ar[2 * mt][2 * s], ar[2 * mt + 1][2 * s], ar[2 * mt][2 * s + 1],
