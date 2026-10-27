@@ -183,3 +183,24 @@ def test_w4a16_skinny_gemm_matches_dequantized_matmul():
                                     M, N, K, cfg, False, 0) == 0
         # partials exclude the per-tensor scale (the consumers' alpha)
         torch.testing.assert_close(part.sum(0) * gs, ref * gs, rtol=1e-4, atol=1e-4)
+
+
+def test_qkv_rope_split_matches_flashrt_qkv_split():
+    lk = _lawam()
+    fvk = pytest.importorskip("flash_rt.flash_rt_kernels")
+    torch.manual_seed(0)
+    S, H = 512, 16
+    D = H * 64
+    qkv = torch.randn(S, 3 * D, device="cuda").half()
+    b = (torch.randn(3 * D, device="cuda") * 0.1).half()
+    cos, sin = torch.randn(S, 64, device="cuda").half(), torch.randn(S, 64, device="cuda").half()
+    ref = [torch.empty(S, D, device="cuda").half() for _ in range(3)]
+    out = [torch.empty(S, D, device="cuda").half() for _ in range(3)]
+    p = qkv.data_ptr()
+    assert fvk.fp8_qkv_split(p, p + 2 * D, p + 4 * D, 3 * D, b.data_ptr(), b.data_ptr() + 2 * D, b.data_ptr() + 4 * D,
+                             1.0, 1.0, 0, 0, 1e-6, cos.data_ptr(), sin.data_ptr(), *[t.data_ptr() for t in ref],
+                             False, S, H, H, 64, 0) == 0
+    assert lk.qkv_rope_split(p, 3 * D, b.data_ptr(), b.data_ptr() + 2 * D, b.data_ptr() + 4 * D, 1.0, 1.0,
+                             cos.data_ptr(), sin.data_ptr(), *[t.data_ptr() for t in out], False, S, H, H, 64, 0) == 0
+    for r, o in zip(ref, out):
+        torch.testing.assert_close(o, r, rtol=0, atol=0)

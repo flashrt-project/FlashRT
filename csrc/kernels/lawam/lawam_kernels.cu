@@ -508,6 +508,89 @@ gemv_nvfp4w_kernel(const __half* __restrict__ x, const uint8_t* __restrict__ w, 
     }
 }
 
+// Q / K / V split of a fused qkv GEMM output with bias, K / V scale and
+// rotate-half RoPE on Q, K (head dim 64): the arithmetic of the FlashRT
+// fp8_prefill qkv_split (without its QK norm), each thread owning 4
+// consecutive dims of the first half and their partners (8-byte accesses).
+template <bool BF16>
+__device__ __forceinline__ void store4(void* base, size_t i, const float* v) {
+    if constexpr (BF16) {
+        const __nv_bfloat162 a = __floats2bfloat162_rn(v[0], v[1]), b = __floats2bfloat162_rn(v[2], v[3]);
+        *reinterpret_cast<uint2*>(reinterpret_cast<__nv_bfloat16*>(base) + i) =
+            make_uint2(*reinterpret_cast<const uint32_t*>(&a), *reinterpret_cast<const uint32_t*>(&b));
+    } else {
+        const __half2 a = __floats2half2_rn(v[0], v[1]), b = __floats2half2_rn(v[2], v[3]);
+        *reinterpret_cast<uint2*>(reinterpret_cast<__half*>(base) + i) =
+            make_uint2(*reinterpret_cast<const uint32_t*>(&a), *reinterpret_cast<const uint32_t*>(&b));
+    }
+}
+
+__device__ __forceinline__ void load4(const __half* p, float* v) {
+    const uint2 u = *reinterpret_cast<const uint2*>(p);
+    const float2 a = __half22float2(*reinterpret_cast<const __half2*>(&u.x));
+    const float2 b = __half22float2(*reinterpret_cast<const __half2*>(&u.y));
+    v[0] = a.x; v[1] = a.y; v[2] = b.x; v[3] = b.y;
+}
+
+template <bool BF16>
+__global__ void __launch_bounds__(256)
+qkv_rope_split_kernel(const __half* __restrict__ qkv, int ld, const __half* __restrict__ q_bias,
+                      const __half* __restrict__ k_bias, const __half* __restrict__ v_bias, float k_mul, float v_mul,
+                      const __half* __restrict__ cos, const __half* __restrict__ sin, void* q_out, void* k_out,
+                      void* v_out, int n_q, int n_k) {
+    constexpr int HD = 64, H2 = 32;
+    const int s = blockIdx.x;
+    const int head = blockIdx.y * 32 + (threadIdx.x >> 3);
+    const int d0 = (threadIdx.x & 7) * 4;
+    if (head >= n_q + 2 * n_k) return;
+    const __half* bias;
+    void* dst;
+    float mul;
+    bool rope;
+    int hh, orow;
+    if (head < n_q) {
+        hh = head; bias = q_bias; dst = q_out; mul = 1.f; rope = true; orow = n_q;
+    } else if (head < n_q + n_k) {
+        hh = head - n_q; bias = k_bias; dst = k_out; mul = k_mul; rope = true; orow = n_k;
+    } else {
+        hh = head - n_q - n_k; bias = v_bias; dst = v_out; mul = v_mul; rope = false; orow = n_k;
+    }
+    rope = rope && cos != nullptr;
+    const __half* p = qkv + static_cast<size_t>(s) * ld + head * HD;
+    float lo[4], hi[4];
+    load4(p + d0, lo);
+    load4(p + d0 + H2, hi);
+    if (bias != nullptr) {
+        float bl[4], bh[4];
+        load4(bias + hh * HD + d0, bl);
+        load4(bias + hh * HD + d0 + H2, bh);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            lo[e] += bl[e];
+            hi[e] += bh[e];
+        }
+    }
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        lo[e] *= mul;
+        hi[e] *= mul;
+    }
+    if (rope) {
+        float c[4], sn[4];
+        load4(cos + static_cast<size_t>(s) * HD + d0, c);
+        load4(sin + static_cast<size_t>(s) * HD + d0, sn);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const float a = lo[e], b = hi[e];
+            lo[e] = fmaf(a, c[e], -__fmul_rn(b, sn[e]));   // the contraction of the FlashRT kernel
+            hi[e] = fmaf(b, c[e], __fmul_rn(a, sn[e]));
+        }
+    }
+    const size_t o = (static_cast<size_t>(s) * orow + hh) * HD + d0;
+    store4<BF16>(dst, o, lo);
+    store4<BF16>(dst, o + H2, hi);
+}
+
 inline int last_error() { return static_cast<int>(cudaGetLastError()); }
 
 }  // namespace
@@ -605,6 +688,22 @@ int gemv_nvfp4w(const __half* x, const uint8_t* w, const uint8_t* sf, const floa
     const int rows_per_cta = 8 * kNvfp4GemvRows;
     const int blocks = std::min((N + rows_per_cta - 1) / rows_per_cta, sms * 8);
     gemv_nvfp4w_kernel<<<blocks, 256, 0, stream>>>(x, w, sf, gs, bias, out, N);
+    return last_error();
+}
+
+int qkv_rope_split(const __half* qkv, int ld, const __half* q_bias, const __half* k_bias, const __half* v_bias,
+                   float k_mul, float v_mul, const __half* cos, const __half* sin, void* q_out, void* k_out,
+                   void* v_out, bool out_bf16, int S, int n_q, int n_k, int hd, cudaStream_t stream) {
+    if (qkv == nullptr || q_out == nullptr || k_out == nullptr || v_out == nullptr || S < 1 || hd != 64 ||
+        ld % 4 != 0 || (cos == nullptr) != (sin == nullptr))
+        return static_cast<int>(cudaErrorInvalidValue);
+    const dim3 grid(S, (n_q + 2 * n_k + 31) / 32);
+    if (out_bf16)
+        qkv_rope_split_kernel<true><<<grid, 256, 0, stream>>>(qkv, ld, q_bias, k_bias, v_bias, k_mul, v_mul, cos,
+                                                              sin, q_out, k_out, v_out, n_q, n_k);
+    else
+        qkv_rope_split_kernel<false><<<grid, 256, 0, stream>>>(qkv, ld, q_bias, k_bias, v_bias, k_mul, v_mul, cos,
+                                                               sin, q_out, k_out, v_out, n_q, n_k);
     return last_error();
 }
 

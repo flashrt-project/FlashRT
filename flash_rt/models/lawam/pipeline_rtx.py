@@ -227,8 +227,8 @@ def qwen_vit_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8", fp
         _norm8(fvk, h, pend[0], pend[1], 0, L["n1_w"], L["n1_b"], 0, EPS_VIT, x8, L["a_qkv"], S, D, st, p_qkv, f16)
         _mm(gemm, p_qkv, x8, f16, L, "qkv", qkv, S, 3 * D, D, st)
         qb = L["qkv_b"]
-        _ck(fvk.fp8_qkv_split(qkv, qkv + 2 * D, qkv + 4 * D, 3 * D, qb, qb + 2 * D, qb + 4 * D, 1.0, 1.0, 0, 0,
-                              1e-6, W["cos"], W["sin"], Q, K, V, p_o not in _F16, S, NH, NH, HD, st), "vit qkv")
+        _ck(lk.qkv_rope_split(qkv, 3 * D, qb, qb + 2 * D, qb + 4 * D, 1.0, 1.0, W["cos"], W["sin"], Q, K,
+                              V, p_o not in _F16, S, NH, NH, HD, st), "vit qkv")
         _attn(fa2, fvk, Q, K, V, O, lse, x8, L["a_o"], batch=nv, seq=Sper, heads=NH, hd=HD, st=st, prec=p_o)
         _mm(gemm, p_o, x8, O, L, "o", o_out, S, D, D, st)
         _norm8(fvk, h, o_out, L["o_b"], 0, L["n2_w"], L["n2_b"], 0, EPS_VIT, x8, L["a_fc1"], S, D, st, p_fc1, f16)
@@ -364,8 +364,8 @@ def dino_forward(gemm, fvk, lk, fa2, B, W, *, stream=0, prec="fp8", out_prec="fp
         _norm8(fvk, h, pend[0], pend[1], 0, L["n1_w"], L["n1_b"], 0, EPS_DINO, x8, L["a_qkv"], T, D, st, prec, f16)
         _mm(gemm, prec, x8, f16, L, "qkv", qkv, T, 3 * D, D, st)
         qb = L["qkv_b"]
-        _ck(fvk.fp8_qkv_split(qkv, qkv + 2 * D, qkv + 4 * D, 3 * D, qb, 0, qb + 4 * D, 1.0, 1.0, 0, 0, 1e-6,
-                              W["cos"], W["sin"], Q, K, V, prec not in _F16, T, NH, NH, HD, st), "dino qkv")
+        _ck(lk.qkv_rope_split(qkv, 3 * D, qb, 0, qb + 4 * D, 1.0, 1.0, W["cos"], W["sin"], Q, K,
+                              V, prec not in _F16, T, NH, NH, HD, st), "dino qkv")
         _attn(fa2, fvk, Q, K, V, O, lse, x8, L["a_o"], batch=1, seq=T, heads=NH, hd=HD, st=st, prec=prec)
         _mm(gemm, prec, x8, O, L, "o", o_out, T, D, D, st)
         _norm8(fvk, h, o_out, L["o_b"], 0, L["n2_w"], L["n2_b"], 0, EPS_DINO, x8, L["a_fc1"], T, D, st, prec, f16)
@@ -409,8 +409,8 @@ def lam_decoder_forward(gemm, fvk, lk, fa2, B, W, *, stream=0, prec="fp8"):
                 L["a_qkv"], T, D, st, prec, f16)
         _mm(gemm, prec, x8, f16, L, "qkv", qkv, T, 3 * D, D, st)
         qb = L["qkv_b"]
-        _ck(fvk.fp8_qkv_split(qkv, qkv + 2 * D, qkv + 4 * D, 3 * D, qb, qb + 2 * D, qb + 4 * D, 1.0, 1.0, 0, 0,
-                              1e-6, 0, 0, Q, K, V, prec not in _F16, T, NH, NH, HD, st), "lam qkv")
+        _ck(lk.qkv_rope_split(qkv, 3 * D, qb, qb + 2 * D, qb + 4 * D, 1.0, 1.0, 0, 0, Q, K,
+                              V, prec not in _F16, T, NH, NH, HD, st), "lam qkv")
         _attn(fa2, fvk, Q, K, V, O, lse, x8, L["a_o"], batch=1, seq=T, heads=NH, hd=HD, st=st, prec=prec)
         _mm(gemm, prec, x8, O, L, "o", o_out, T, D, D, st)
         _gnorm8(lk, fvk, x, o_out, L["o_b"], gate_msa, 0, 0, EPS_LAM, 0, 0, scale_mlp, shift_mlp, x8, L["a_fc1"],

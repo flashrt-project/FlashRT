@@ -51,7 +51,7 @@ One CUDA graph per prompt holds the whole policy step:
 | stage | kernels | precision |
 |---|---|---|
 | camera frames -> patch rows | `lawam.preprocess_u8` | FP16 |
-| Qwen3-VL ViT (24 layers, DeepStack 5/11/17, mergers) | `lawam.gemm_f16acc_act` (fc1 + bias + GELU in one GEMM), `fp8_residual_norm_quant`, `fp8_qkv_split`, FA2 | FP16, FP16 accumulation |
+| Qwen3-VL ViT (24 layers, DeepStack 5/11/17, mergers) | `lawam.gemm_f16acc_act` (fc1 + bias + GELU in one GEMM), `fp8_residual_norm_quant`, `lawam.qkv_rope_split`, FA2 | FP16, FP16 accumulation |
 | Qwen3-VL LLM (16 layers kept by LaWAM) | same, `lawam.gemm_f16acc_swiglu` (gate / up / SwiGLU in one dual GEMM), causal GQA FA2 | FP16, FP16 accumulation |
 | VLM -> latent QFormer + LAM conditioning | `lawam.qformer_latent` | FP32 |
 | DINOv3 ViT-B/16 (11 layers used), concurrent graph branch | `lawam.gemm_f16acc_act`, FA2 | FP16, FP16 accumulation |

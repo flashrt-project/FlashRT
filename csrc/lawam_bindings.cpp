@@ -343,4 +343,18 @@ PYBIND11_MODULE(flash_rt_lawam, m) {
         py::arg("A"), py::arg("W"), py::arg("sf"), py::arg("partials"), py::arg("M"), py::arg("N"), py::arg("K"),
         py::arg("cfg"), py::arg("pdl") = true, py::arg("stream") = 0,
         "Skinny W4A16 GEMM (M <= 32): FP32 K-split partials of A (BF16 [M,K]) @ NVFP4 W (E2M1 + UE4M3 block scales)^T.");
+
+    m.def("qkv_rope_split",
+        [](uintptr_t qkv, int ld, uintptr_t q_bias, uintptr_t k_bias, uintptr_t v_bias, float k_mul, float v_mul,
+           uintptr_t cos, uintptr_t sin, uintptr_t q_out, uintptr_t k_out, uintptr_t v_out, bool out_bf16, int S,
+           int n_q, int n_k, int hd, uintptr_t stream) {
+            return L::qkv_rope_split(ptr<const __half>(qkv), ld, ptr<const __half>(q_bias), ptr<const __half>(k_bias),
+                                     ptr<const __half>(v_bias), k_mul, v_mul, ptr<const __half>(cos),
+                                     ptr<const __half>(sin), ptr<void>(q_out), ptr<void>(k_out), ptr<void>(v_out),
+                                     out_bf16, S, n_q, n_k, hd, to_stream(stream));
+        },
+        py::arg("qkv"), py::arg("ld"), py::arg("q_bias"), py::arg("k_bias"), py::arg("v_bias"), py::arg("k_mul"),
+        py::arg("v_mul"), py::arg("cos"), py::arg("sin"), py::arg("q_out"), py::arg("k_out"), py::arg("v_out"),
+        py::arg("out_bf16"), py::arg("S"), py::arg("n_q"), py::arg("n_k"), py::arg("hd"), py::arg("stream") = 0,
+        "Fused-qkv split + bias + K/V scale + rotate-half RoPE (head dim 64), FP16 / BF16 out.");
 }
