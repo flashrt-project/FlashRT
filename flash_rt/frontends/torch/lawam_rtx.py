@@ -761,6 +761,15 @@ class LawamTorchFrontendRtx:
         main = torch.cuda.ExternalStream(st)
         self._ev_frames.record(main)
         self._side.wait_event(self._ev_frames)
+        # off the critical path: the flow's initial sample (and the persistent kernel's barrier
+        # counter) on the DINOv3 branch, which the LAM waits for; the flow runs after the LAM
+        D, side = B["dit"], self._side.cuda_stream
+        if noise_from_host:
+            _ck(lk.memcpy_async(D["x"], self.noise_host.data_ptr(), self.noise_host.numel() * 4, side), "noise h2d")
+        else:
+            _ck(lk.gaussian_noise(D["x"], self.seed.data_ptr(), self.horizon * 32, side), "noise")
+        if self._dit_persistent:
+            _ck(lk.memset_async(D["counter"], 0, 4, side), "flow counter")
         P.dino_forward(self.gemm_side, fvk, lk, fa2, B["dino"], self.dino, stream=self._side.cuda_stream,
                        prec=prec["dino"], out_prec=prec["lam"])
         self._ev_dino.record(self._side)
@@ -775,16 +784,11 @@ class LawamTorchFrontendRtx:
         main.wait_event(self._ev_dino)
         P.lam_decoder_forward(gemm, fvk, lk, fa2, B["lam"], self.lam, stream=st, prec=prec["lam"])
         P.flow_condition_forward(gemm, fvk, lk, B["flow"], self.flow, {"S": self.Se}, stream=st, prec=prec["enc"])
-        D = B["dit"]
-        if noise_from_host:
-            _ck(lk.memcpy_async(D["x"], self.noise_host.data_ptr(), self.noise_host.numel() * 4, st), "noise h2d")
-        else:
-            _ck(lk.gaussian_noise(D["x"], self.seed.data_ptr(), self.horizon * 32, st), "noise")
         if self._dit_persistent:
             _ck(lk.dit_flow_persistent(self._dit_ops.data_ptr(), self._dit_ops.shape[0], self._dit_tab.data_ptr(),
                                        self._dit_tab.shape[0], self._dit_units.data_ptr(), self.num_steps,
                                        self._dit_stream.data_ptr(), self._dit_stream.stride(0), D["counter"],
-                                       self.num_sms, st), "flow (persistent)")
+                                       self.num_sms, st, False), "flow (persistent)")
         else:
             dims = {"rows": self.horizon, "S": self.Se, "dt": 1.0 / self.num_steps}
             for s in range(self.num_steps):

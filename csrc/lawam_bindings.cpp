@@ -45,6 +45,12 @@ PYBIND11_MODULE(flash_rt_lawam, m) {
         py::arg("dst"), py::arg("src"), py::arg("nbytes"), py::arg("stream") = 0,
         "cudaMemcpyAsync with cudaMemcpyDefault (device or pinned host pointers); graph-capturable.");
 
+    m.def("memset_async",
+        [](uintptr_t dst, int value, size_t nbytes, uintptr_t stream) {
+            return static_cast<int>(cudaMemsetAsync(reinterpret_cast<void*>(dst), value, nbytes, to_stream(stream)));
+        },
+        py::arg("dst"), py::arg("value"), py::arg("nbytes"), py::arg("stream") = 0, "cudaMemsetAsync; graph-capturable.");
+
     m.def("preprocess_u8",
         [](uintptr_t frames, int num_views, uintptr_t qwen, uintptr_t dino, uintptr_t stream) {
             return L::preprocess_u8(ptr<const uint8_t>(frames), num_views, ptr<__half>(qwen), ptr<__half>(dino),
@@ -381,14 +387,16 @@ PYBIND11_MODULE(flash_rt_lawam, m) {
     m.def("dit_flow_smem_bytes", &L::dit_flow_smem_bytes);
     m.def("dit_flow_persistent",
         [](uintptr_t ops, int n_ops, uintptr_t site_tab, int n_sites, uintptr_t cta_units, int n_steps,
-           uintptr_t stream_units, long long cta_stride, uintptr_t counter, int num_ctas, uintptr_t stream) {
+           uintptr_t stream_units, long long cta_stride, uintptr_t counter, int num_ctas, uintptr_t stream,
+           bool reset_counter) {
             return L::dit_flow_persistent(ptr<const L::DitOp>(ops), n_ops, ptr<const int>(site_tab), n_sites,
                                           ptr<const int>(cta_units), n_steps, ptr<const uint8_t>(stream_units),
-                                          cta_stride, ptr<unsigned>(counter), num_ctas, to_stream(stream));
+                                          cta_stride, ptr<unsigned>(counter), num_ctas, to_stream(stream),
+                                          reset_counter);
         },
         py::arg("ops"), py::arg("n_ops"), py::arg("site_tab"), py::arg("n_sites"), py::arg("cta_units"),
         py::arg("n_steps"), py::arg("stream_units"), py::arg("cta_stride"),
-        py::arg("counter"), py::arg("num_ctas"), py::arg("stream") = 0,
+        py::arg("counter"), py::arg("num_ctas"), py::arg("stream") = 0, py::arg("reset_counter") = true,
         "The flow loop (DiT steps, action encoder / decoder, Euler, unnormalize) as one persistent cooperative "
         "kernel over a host-built op table and per-CTA packed weight units.");
 }

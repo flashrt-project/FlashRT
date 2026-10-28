@@ -251,7 +251,7 @@ enum DitOpField {
 int dit_flow_smem_bytes();
 int dit_flow_persistent(const DitOp* ops, int n_ops, const int* site_tab, int n_sites, const int* cta_units,
                         int n_steps, const uint8_t* stream, long long cta_stride, unsigned* counter, int num_ctas,
-                        cudaStream_t stream_);
+                        cudaStream_t st, bool reset_counter = true);
 
 }  // namespace lawam
 }  // namespace flash_rt

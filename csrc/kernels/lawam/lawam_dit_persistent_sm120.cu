@@ -1177,7 +1177,7 @@ int dit_flow_smem_bytes() { return kSmem; }
 
 int dit_flow_persistent(const DitOp* ops, int n_ops, const int* site_tab, int n_sites, const int* cta_units,
                         int n_steps, const uint8_t* stream, long long cta_stride, unsigned* counter, int num_ctas,
-                        cudaStream_t st) {
+                        cudaStream_t st, bool reset_counter) {
     if (ops == nullptr || site_tab == nullptr || stream == nullptr || counter == nullptr || num_ctas < 1 ||
         cta_stride % 16 != 0 || n_sites < 1 || n_sites > kMaxSites)
         return static_cast<int>(cudaErrorInvalidValue);
@@ -1188,7 +1188,8 @@ int dit_flow_persistent(const DitOp* ops, int n_ops, const int* site_tab, int n_
         if (e != cudaSuccess) return static_cast<int>(e);
         opted = true;
     }
-    cudaError_t e = cudaMemsetAsync(counter, 0, sizeof(unsigned), st);
+    // the grid barrier counter starts at 0 (the caller may clear it earlier in the graph instead)
+    cudaError_t e = reset_counter ? cudaMemsetAsync(counter, 0, sizeof(unsigned), st) : cudaSuccess;
     if (e != cudaSuccess) return static_cast<int>(e);
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = dim3(num_ctas);
