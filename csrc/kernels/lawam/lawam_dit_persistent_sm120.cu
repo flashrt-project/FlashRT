@@ -868,17 +868,44 @@ __device__ void ln_resid_phase(const DitOp& op, const Smem& sm, int ncta) {
     const __nv_bfloat16* pos = reinterpret_cast<const __nv_bfloat16*>(op.p[DIT_P_POS]);
     const int r0 = s0 >> 7, nrows = ((s1 - 1) >> 7) - r0 + 1;   // <= 2
     float* rows = reinterpret_cast<float*>(sm.abuf());             // [nrows][1024] new residual
-    // new residual of the whole rows: thread -> 4 consecutive columns
-    for (int i = threadIdx.x; i < nrows * 256; i += kConsumers) {
-        const int rr = i >> 8, c = (i & 255) * 4, r = r0 + rr;
-        float4 acc = __ldcg(reinterpret_cast<const float4*>(part + r * 1024 + c));
-        for (int k = 1; k < ks; ++k) {
-            const float4 v = __ldcg(reinterpret_cast<const float4*>(part + (k * kRows + r) * 1024 + c));
-            acc.x += v.x; acc.y += v.y; acc.z += v.z; acc.w += v.w;
+    // the step-invariant norm operands of this thread's output segment, in flight from the start
+    const int seg = s0 + threadIdx.x;
+    const bool mine = seg < s1;
+    const int row = seg >> 7, col = (seg & 127) * 8;
+    uint4 sc = make_uint4(0, 0, 0, 0), sh = sc, pv = sc;
+    if (mine) {
+        if (scale != nullptr) {
+            sc = ldg16(scale + col);
+            sh = ldg16(shift + col);
         }
-        const uint2 hb = __ldcg(reinterpret_cast<const uint2*>(h + r * 1024 + c));
-        const uint2 bb = __ldg(reinterpret_cast<const uint2*>(rbias + c));
-        const float2 h0 = bf2f(hb.x), h1 = bf2f(hb.y), b0 = bf2f(bb.x), b1 = bf2f(bb.y);
+        if (pos != nullptr) pv = ldg16(pos + row * 1024 + col);
+    }
+    // new residual of the whole rows: thread -> 4 consecutive columns of each row (all loads issued first)
+    static_assert(kConsumers == 256, "one 4-column item per thread and row");
+    constexpr int kMaxSplit = 4;   // k groups of a K-split site (pipeline_rtx.DIT_KSPLIT_FC2)
+    float4 pa[2][kMaxSplit];
+    uint2 hb[2], bb;
+    const int c = threadIdx.x * 4;
+    bb = __ldg(reinterpret_cast<const uint2*>(rbias + c));
+#pragma unroll
+    for (int rr = 0; rr < 2; ++rr) {
+        if (rr >= nrows) break;
+        const int r = r0 + rr;
+#pragma unroll
+        for (int k = 0; k < kMaxSplit; ++k)
+            if (k < ks) pa[rr][k] = __ldcg(reinterpret_cast<const float4*>(part + (k * kRows + r) * 1024 + c));
+        hb[rr] = __ldcg(reinterpret_cast<const uint2*>(h + r * 1024 + c));
+    }
+#pragma unroll
+    for (int rr = 0; rr < 2; ++rr) {
+        if (rr >= nrows) break;
+        float4 acc = pa[rr][0];
+#pragma unroll
+        for (int k = 1; k < kMaxSplit; ++k) {
+            if (k >= ks) break;
+            acc.x += pa[rr][k].x; acc.y += pa[rr][k].y; acc.z += pa[rr][k].z; acc.w += pa[rr][k].w;
+        }
+        const float2 h0 = bf2f(hb[rr].x), h1 = bf2f(hb[rr].y), b0 = bf2f(bb.x), b1 = bf2f(bb.y);
         float* d = rows + rr * 1024 + c;
         d[0] = bfr(h0.x + bfr(bfr(acc.x * alpha) + b0.x));
         d[1] = bfr(h0.y + bfr(bfr(acc.y * alpha) + b0.y));
@@ -901,17 +928,10 @@ __device__ void ln_resid_phase(const DitOp& op, const Smem& sm, int ncta) {
         }
     }
     consumer_sync();
-    const int seg = s0 + threadIdx.x;
-    if (seg >= s1) return;
-    const int row = seg >> 7, col = (seg & 127) * 8, rr = row - r0;
+    if (!mine) return;
+    const int rr = row - r0;
     const float mean = sm.stats()[2 * rr], inv = sm.stats()[2 * rr + 1];
     const float* rp = rows + rr * 1024 + col;
-    uint4 sc = make_uint4(0, 0, 0, 0), sh = sc, pv = sc;
-    if (scale != nullptr) {
-        sc = ldg16(scale + col);
-        sh = ldg16(shift + col);
-    }
-    if (pos != nullptr) pv = ldg16(pos + row * 1024 + col);
     const uint32_t scw[4] = {sc.x, sc.y, sc.z, sc.w}, shw[4] = {sh.x, sh.y, sh.z, sh.w};
     const uint32_t psw[4] = {pv.x, pv.y, pv.z, pv.w};
     uint32_t o[4], hn[4];

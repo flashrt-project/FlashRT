@@ -690,6 +690,7 @@ _F_EPS, _F_DT, _F_QSCALE = range(3)
 (_P_ABUF, _P_LNSC, _P_LNSH, _P_POS, _P_BIAS, _P_BIAS32, _P_GS, _P_WS, _P_OUT0, _P_OUT1, _P_OUT2, _P_Q, _P_K,
  _P_VT, _P_PART, _P_STATS) = range(16)
 DIT_KSPLIT_FC2 = 4       # ffn down (K 4096): 4 k groups of 1024 x column groups, partials summed by the next LN
+assert DIT_KSPLIT_FC2 <= 4, "the flow kernel's LayerNorm phase sums at most 4 K-split partials"
 
 
 def dit_sites(W):
