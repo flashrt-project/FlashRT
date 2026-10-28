@@ -271,13 +271,12 @@ __device__ __forceinline__ int units_per_chunk(int wtype) { return wtype == 0 ? 
 __device__ __forceinline__ void grid_sync(unsigned* counter, unsigned target) {
     consumer_sync();
     if (threadIdx.x == 0) {
-        __threadfence();
-        atomicAdd(counter, 1u);
+        // release (cumulative over the CTA's writes ordered by the bar.sync) / acquire
+        asm volatile("red.release.gpu.global.add.u32 [%0], 1;\n" ::"l"(counter) : "memory");
         unsigned v;
         do {
             asm volatile("ld.acquire.gpu.global.u32 %0, [%1];\n" : "=r"(v) : "l"(counter) : "memory");
         } while (v < target);
-        __threadfence();
     }
     consumer_sync();
 }
