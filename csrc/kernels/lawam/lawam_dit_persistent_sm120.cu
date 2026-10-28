@@ -227,7 +227,7 @@ __device__ __forceinline__ void prefetch_unit_l2(unsigned u) {
     asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(p), "r"(kUnit) : "memory");
 }
 
-__device__ __forceinline__ void fill_unit(const Smem& sm, unsigned u) {
+__device__ __noinline__ void fill_unit(const Smem& sm, unsigned u) {
     const unsigned slot = u % kSlots;
     prefetch_unit_l2(u + kPf);
     mbar_expect_tx(&sm.full()[slot], kUnit);
