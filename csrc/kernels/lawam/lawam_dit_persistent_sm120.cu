@@ -548,6 +548,12 @@ __device__ __forceinline__ void warp_run(int U, int w, int& start, int& cnt) {
     start = w * q + min(w, a);
 }
 
+// The warp whose run holds unit u (u < U).
+__device__ __forceinline__ int warp_of(int U, int u) {
+    const int q = U / kCW, a = U % kCW, big = a * (q + 1);
+    return u < big ? u / (q + 1) : a + (u - big) / q;
+}
+
 __device__ void gemm_phase(const DitOp& op, const Smem& sm, unsigned& ucount, unsigned& astage) {
     const Site st = site_s(sm, op.i[DIT_I_SITE]);
     if (st.tiles == 0) return;
@@ -627,17 +633,17 @@ __device__ void gemm_phase(const DitOp& op, const Smem& sm, unsigned& ucount, un
         }
     }
     consumer_sync();
-    // tile tt: segments of the runs that cover its chunks, in warp order
+    // tile tt: segments of the runs that cover its chunks [tt * nk, tt * nk + nk), in warp order
+    // (a run that starts inside the tile holds it as its first segment, else as its second)
     auto tile_sum = [&](int tt, float (&sum)[3][4]) {
 #pragma unroll
         for (int j = 0; j < 3; ++j) sum[j][0] = sum[j][1] = sum[j][2] = sum[j][3] = 0.f;
-        for (int w = 0; w < kCW; ++w) {
+        const int u0 = tt * nk;
+        const int wl = warp_of(U, u0 + nk - 1);
+        for (int w = warp_of(U, u0); w <= wl; ++w) {
             int s0, n0;
             warp_run(U, w, s0, n0);
-            if (n0 == 0) continue;
-            const int f = s0 / nk, l = (s0 + n0 - 1) / nk;
-            if (tt < f || tt > l) continue;
-            const float* sp = red + ((2 * w + (tt == f ? 0 : 1)) * 32 + lane) * 12;
+            const float* sp = red + ((2 * w + (s0 >= u0 ? 0 : 1)) * 32 + lane) * 12;
 #pragma unroll
             for (int j = 0; j < 3; ++j) {
                 const float4 v = *reinterpret_cast<const float4*>(sp + 4 * j);
