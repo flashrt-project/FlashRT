@@ -74,6 +74,7 @@ _F16ACC_SPLIT = {}
 # schedule), "pswiglu" its SwiGLU epilogue over the 8-column interleaved gate | up weight.
 F16ACC_PLANS = {
     (2, 2048, 4096, 0, False): (1, 1),
+    (4, 768, 768, 0, True): (1, 1),
     (4, 768, 1024, 0, False): (3, 1),
     (4, 768, 2048, 0, False): (3, 1),
     (4, 1024, 768, 0, False): (3, 1),
@@ -87,6 +88,7 @@ F16ACC_PLANS = {
     (5, 768, 768, 0, False): (1, 1),
     (5, 768, 3072, 0, False): (1, 1),
     (5, 2304, 768, 0, False): (1, 1),
+    (8, 1024, 768, 0, True): (0, 1),
     (8, 1024, 1024, 0, False): (2, 1),
     (8, 1024, 4096, 0, False): (2, 1),
     (8, 3072, 1024, 0, False): (2, 1),
@@ -302,7 +304,10 @@ def qwen_vit_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8", fp
     o_out, fc1, f16 = B["o_out"], B["fc1"], B["f16"]
     sp = _site_prec(prec, fp8_sites, cal)
     p_qkv, p_o, p_fc1, p_fc2 = sp("qkv"), sp("o"), sp("fc1"), sp("fc2")
-    gemm.fp16_nn_bias(B["patch"], W["patch_w"], h, W["patch_b"], S, D, 768, st)
+    if prec == "f16acc":   # FP16 accumulation like the tower GEMMs (cuBLASLt accumulates in FP32 at half rate)
+        _f16acc(B["patch"], W["patch_w"], h, W["patch_b"], S, D, 768, 0, st)
+    else:
+        gemm.fp16_nn_bias(B["patch"], W["patch_w"], h, W["patch_b"], S, D, 768, st)
     pend = (W["pos"], 0)
     for li in range(24):
         L = W["layers"][li]
@@ -439,7 +444,10 @@ def dino_forward(gemm, fvk, lk, fa2, B, W, *, stream=0, prec="fp8", out_prec="fp
     Q, K, V, O, lse = B["Q"], B["K"], B["V"], B["O"], B["lse"]
     o_out, fc1, f16 = B["o_out"], B["fc1"], B["f16"]
     fvk.gpu_copy(h, W["prefix"], DINO_PREFIX * D * 2, st)
-    gemm.fp16_nn_bias(B["patch"], W["patch_w"], h + DINO_PREFIX * D * 2, W["patch_b"], P, D, 768, st)
+    if prec == "f16acc":
+        _f16acc(B["patch"], W["patch_w"], h + DINO_PREFIX * D * 2, W["patch_b"], P, D, 768, 0, st)
+    else:
+        gemm.fp16_nn_bias(B["patch"], W["patch_w"], h + DINO_PREFIX * D * 2, W["patch_b"], P, D, 768, st)
     pend = (0, 0)
     for li in range(DINO_LAYERS):
         L = W["layers"][li]
