@@ -217,8 +217,19 @@ struct Ring {
 };
 __shared__ Ring s_ring;
 
+// L2 prefetch of the CTA's weight stream kPf units ahead of the ring: the DRAM reads of a
+// GEMM phase start during the preceding norm / attention / barrier phases
+constexpr unsigned kPf = 24;
+
+__device__ __forceinline__ void prefetch_unit_l2(unsigned u) {
+    if (u >= s_ring.end) return;
+    const unsigned char* p = s_ring.base + static_cast<size_t>(u % s_ring.per) * kUnit;
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(p), "r"(kUnit) : "memory");
+}
+
 __device__ __forceinline__ void fill_unit(const Smem& sm, unsigned u) {
     const unsigned slot = u % kSlots;
+    prefetch_unit_l2(u + kPf);
     mbar_expect_tx(&sm.full()[slot], kUnit);
     bulk_g2s(sm.ring() + slot * kUnit, s_ring.base + static_cast<size_t>(u % s_ring.per) * kUnit, kUnit,
              &sm.full()[slot], s_ring.policy);
@@ -1077,6 +1088,7 @@ dit_flow_kernel(const DitOp* __restrict__ ops, int n_ops, const int* __restrict_
         s_ring.per = static_cast<unsigned>(cta_units[blockIdx.x]);
         s_ring.end = s_ring.per * static_cast<unsigned>(n_steps);
         s_ring.policy = policy;
+        for (unsigned u = kSlots; u < kPf; ++u) prefetch_unit_l2(u);
         for (unsigned u = 0; u < kSlots; ++u) {
             s_ring.issued[u] = 0;
             if (u < s_ring.end) fill_unit(sm, u);
