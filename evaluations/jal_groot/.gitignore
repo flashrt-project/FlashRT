@@ -1,0 +1,10 @@
+vendor/
+artifacts/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+.venv/
+
+# Checked-in publication evidence; overrides the parent results/ ignore.
+!results/
+!results/**

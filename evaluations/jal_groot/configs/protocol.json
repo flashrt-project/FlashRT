@@ -1,0 +1,120 @@
+{
+  "format_version": 1,
+  "scope": "JAL-aligned offline action accuracy and synchronized full-call latency",
+  "reference": "official-gr00t-pytorch-eager",
+  "baseline": "jal-tensorrt-optimized-mixed_nvfp4",
+  "candidate": "flashrt-fp8-backbone-nvfp4-action-head",
+  "sources": {
+    "gr00t_commit": "9c7e746b2cd37a810070a98ef41d290a07e806c2",
+    "jal_patch_sha256": "6a818bfcbb149c0f0efa8567ecc0fd6909613bc53e00e08f66bb81c8c601d5a3",
+    "flashrt_commit": "e4bd9277521d137fcded8fa5ccb6091c05f5cd4b",
+    "flashrt_image": "ghcr.io/flashrt-project/flashrt-thor@sha256:87ad7bce8635207425ac5e90a61d3d83c0ba1042fa28eef7d067474fee872c5c",
+    "groot_weights_revision": "2ea293aa20ba7cf5bbf3ba17a5fbcb1a01cbfe21",
+    "cosmos_weights_revision": "9ce19a195e423419c349abfc86fd07178b230561",
+    "calibration_dataset_revision": "e1a223d30b896c1613f270a2bfc63d382b3de7e1"
+  },
+  "input": {
+    "camera_keys": [
+      "image"
+    ],
+    "batch_size": 1,
+    "num_inference_timesteps": 4,
+    "internal_action_horizon": 40,
+    "noise_shape": [
+      1,
+      40,
+      132
+    ],
+    "returned_action_horizon": 16,
+    "execution_horizon": 8
+  },
+  "action_order": [
+    "x",
+    "y",
+    "z",
+    "roll",
+    "pitch",
+    "yaw",
+    "gripper"
+  ],
+  "evaluation": {
+    "trajectory_ids": [
+      1,
+      2,
+      3,
+      4,
+      22
+    ],
+    "max_steps_per_trajectory": 300,
+    "noise_seed": 20261026,
+    "noise_precision": "bfloat16-rounded float32 shared by every backend",
+    "dataset": "IPEC-COMMUNITY/libero_10_no_noops_1.0.0_lerobot@e1a223d30b896c1613f270a2bfc63d382b3de7e1"
+  },
+  "timing": {
+    "warmup_per_prompt": 20,
+    "iterations_per_prompt": 100,
+    "boundary": "raw observation through CPU physical actions; synchronized wall clock",
+    "exclude_setup": true,
+    "exclude_noise_generation": true,
+    "include_noise_transfer": true,
+    "report_setup_separately": true
+  },
+  "accuracy": {
+    "metrics": [
+      "mae",
+      "rmse",
+      "max_abs",
+      "cosine",
+      "per_dimension",
+      "gripper_disagreement"
+    ],
+    "acceptance_thresholds": null,
+    "note": "No claim of equivalent task success from offline metrics. Acceptance margins must be agreed before any publication-level pass/fail claim."
+  },
+  "closed_loop": {
+    "status": "not_implemented",
+    "note": "This offline protocol does not measure LIBERO task success."
+  },
+  "jal_reproduction": {
+    "trajectory_ids": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "dataset": "pinned Isaac-GR00T demo_data/libero_demo",
+    "calibration_overlap": "episode0 frames0..9 are also TensorRT calibration; do not label this independent accuracy"
+  },
+  "calibration": {
+    "trt": {
+      "size": 10,
+      "episode_ids": [
+        0
+      ],
+      "frame_indices": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "selection": "unchanged JAL sequential calibration loader"
+    },
+    "flashrt": {
+      "episode_ids": [
+        18,
+        5,
+        34
+      ],
+      "selection": "first exported observation per task prompt, frozen before evaluation",
+      "samples_per_prompt": 1
+    },
+    "note": "Calibration algorithms remain backend-specific; primary heldout cohort excludes both methods calibration episodes."
+  }
+}

@@ -1,0 +1,125 @@
+{
+  "scope": "task_subset",
+  "note": "Descriptive matched pilot; no full-suite or accuracy-equivalence claim",
+  "matched_initial_states_and_processed_observations": true,
+  "protocol": {
+    "scope": "task_subset",
+    "suite": "libero_10",
+    "isaac_revision": "9c7e746b2cd37a810070a98ef41d290a07e806c2",
+    "libero_revision": "8f1084e3132a39270c3a13ebe37270a43ece2a01",
+    "wrapper_sha256": {
+      "gr00t/eval/sim/LIBERO/libero_env.py": "49a8017517f1f21b7c21bf5f599244189720c83785763e4ab05a3cd0292cf5b1",
+      "gr00t/eval/sim/wrapper/multistep_wrapper.py": "8b2e7b8dea5399c1e1b51e9d9419aa32309aa9b46aaad88223d8dae6b3e56237",
+      "gr00t/policy/gr00t_policy.py": "ad1183a3ce1ebed6cace4a9cb8c5a123e823a0760ebf46f3694639a5ad1521ec",
+      "gr00t/eval/_horizon_contract.py": "8ac5b52a4133d5957ce0fae28edc71d23ab8f05c8466936c11d873fd59e0d43a"
+    },
+    "manifest_sha256": "81abdc651370cc828422ce8c4948fac0b931582193b3da57c24101a0e1631489",
+    "protocol_sha256": "e04a938e6b66342b1f909d21d9f8c617ec97ca4543cd005c389946ca57212bb2",
+    "weight_manifest_sha256": "9f2f593e52aafd16b1f22137a85d51d4079890e5e8ee879a75700ed20dfc24ed",
+    "checkpoint_config_sha256": "bdf8ab9ad482c2956f164f818a5f364d2515fa0a961c68cf4860769c93c995b5",
+    "processor_config_sha256": "bfd748e353203cdb6de1500fda9515c3126eb6384251ae7e42bbb3bc16c0bf88",
+    "initialization": "LIBERO fixed .pruned_init; 5 raw zero-action settling steps",
+    "settling_steps_excluded_from_budget": 5,
+    "execution_horizon": 8,
+    "max_episode_steps": 720,
+    "seed": 20261026,
+    "initial_state_start": 0,
+    "episodes_per_task": 1,
+    "batch_size": 1,
+    "render_backend": "osmesa",
+    "selected_tasks": [
+      {
+        "task_id": 4,
+        "name": "LIVING_ROOM_SCENE5_put_the_white_mug_on_the_left_plate_and_put_the_yellow_and_white_mug_on_the_right_plate",
+        "prompt": "put the white mug on the left plate and put the yellow and white mug on the right plate"
+      },
+      {
+        "task_id": 6,
+        "name": "LIVING_ROOM_SCENE6_put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate",
+        "prompt": "put the white mug on the plate and put the chocolate pudding to the right of the plate"
+      },
+      {
+        "task_id": 9,
+        "name": "KITCHEN_SCENE6_put_the_yellow_and_white_mug_in_the_microwave_and_close_it",
+        "prompt": "put the yellow and white mug in the microwave and close it"
+      }
+    ]
+  },
+  "results": {
+    "torch": {
+      "successes": 0,
+      "episodes": 3,
+      "success_rate": 0.0,
+      "cases": [
+        {
+          "task_id": 4,
+          "state_index": 0,
+          "success": false,
+          "environment_steps": 720
+        },
+        {
+          "task_id": 6,
+          "state_index": 0,
+          "success": false,
+          "environment_steps": 720
+        },
+        {
+          "task_id": 9,
+          "state_index": 0,
+          "success": false,
+          "environment_steps": 720
+        }
+      ]
+    },
+    "trt": {
+      "successes": 0,
+      "episodes": 3,
+      "success_rate": 0.0,
+      "cases": [
+        {
+          "task_id": 4,
+          "state_index": 0,
+          "success": false,
+          "environment_steps": 720
+        },
+        {
+          "task_id": 6,
+          "state_index": 0,
+          "success": false,
+          "environment_steps": 720
+        },
+        {
+          "task_id": 9,
+          "state_index": 0,
+          "success": false,
+          "environment_steps": 720
+        }
+      ]
+    },
+    "flashrt": {
+      "successes": 0,
+      "episodes": 3,
+      "success_rate": 0.0,
+      "cases": [
+        {
+          "task_id": 4,
+          "state_index": 0,
+          "success": false,
+          "environment_steps": 720
+        },
+        {
+          "task_id": 6,
+          "state_index": 0,
+          "success": false,
+          "environment_steps": 720
+        },
+        {
+          "task_id": 9,
+          "state_index": 0,
+          "success": false,
+          "environment_steps": 720
+        }
+      ]
+    }
+  }
+}

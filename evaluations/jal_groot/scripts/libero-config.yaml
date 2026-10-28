@@ -1,0 +1,5 @@
+benchmark_root: /comparison/vendor/Isaac-GR00T/external_dependencies/LIBERO/libero/libero
+bddl_files: /comparison/vendor/Isaac-GR00T/external_dependencies/LIBERO/libero/libero/bddl_files
+init_states: /comparison/vendor/Isaac-GR00T/external_dependencies/LIBERO/libero/libero/init_files
+assets: /comparison/vendor/Isaac-GR00T/external_dependencies/LIBERO/libero/libero/assets
+datasets: /comparison/vendor/Isaac-GR00T/external_dependencies/LIBERO/libero/datasets

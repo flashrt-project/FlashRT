@@ -1,0 +1,4 @@
+# Keep the report readable in reviews; the raw evidence remains available.
+results/action-predictions.csv linguist-generated=true
+results/latency-samples.json linguist-generated=true
+results/observations.json linguist-generated=true

@@ -1,0 +1,156 @@
+{
+  "format_version": 1,
+  "experiment_date": "2026-10-26",
+  "upstream_sources": {
+    "Isaac-GR00T": "9c7e746b2cd37a810070a98ef41d290a07e806c2",
+    "FlashRT": "e4bd9277521d137fcded8fa5ccb6091c05f5cd4b"
+  },
+  "measured_jal_image_id": "sha256:671e9a94483bbc453f8c4b9394328690906a51d35f858a4ccb8cd17cc9dd164e",
+  "measured_flashrt_image": "ghcr.io/flashrt-project/flashrt-thor@sha256:87ad7bce8635207425ac5e90a61d3d83c0ba1042fa28eef7d067474fee872c5c",
+  "report_sha256": "04475480782d5f2c82e14b403c30f3be2303c1eac0c496427d473eb63021c9f0",
+  "pilot_report_sha256": "59ad6f9634dff0da67a661a6bb06f19332e04e376f6743c555ca2a3d9d46655a",
+  "measured_code_files": [
+    {
+      "path": "configs/protocol.json",
+      "sha256": "e04a938e6b66342b1f909d21d9f8c617ec97ca4543cd005c389946ca57212bb2"
+    },
+    {
+      "path": "groot_compare/__init__.py",
+      "sha256": "f80d0e9723b7928c38109af21909d01aaa50e2f89baef22cf970933b630e03c7"
+    },
+    {
+      "path": "groot_compare/backends/__init__.py",
+      "sha256": "0d715f5f5ff10b032124a1568b2e51b4b51bd4d6dd93ecb55dc5b5854aa0b420"
+    },
+    {
+      "path": "groot_compare/backends/flashrt.py",
+      "sha256": "f0af9b17da3b7e637fc209b76a8b1f10c0a87862b9296b06c3df5e32db7bb978"
+    },
+    {
+      "path": "groot_compare/backends/jal.py",
+      "sha256": "7e15e6482f1ea12b74ec69d2b94d29f07694d16b4620acfa2aafe5a9bb4b59a8"
+    },
+    {
+      "path": "groot_compare/closed_loop.py",
+      "sha256": "7398e1503a3090e7013c5267e8447b05b73eaa73bca2068f2fc8414d7b3f5233"
+    },
+    {
+      "path": "groot_compare/closed_loop_report.py",
+      "sha256": "ba6d2f356ffe78022e7ac1f6c4383c267895ae3556778fd66b1a353167c2018d"
+    },
+    {
+      "path": "groot_compare/common.py",
+      "sha256": "9c1abdbed44aebf8cc7c38036b71963988c5d2a0923b6ba9f83cde26f9da5bf8"
+    },
+    {
+      "path": "groot_compare/dataset.py",
+      "sha256": "43025f548a750e459291c0c2b37d285530cb490564532cafe6e523377e7b5fdd"
+    },
+    {
+      "path": "groot_compare/metrics.py",
+      "sha256": "b727f9ed2804f0e789ea30df43f7ebcda3af8a2296088b3712799f4f0f37a0aa"
+    },
+    {
+      "path": "groot_compare/report.py",
+      "sha256": "54bf6999fb00d9c39adc9fcc009f040e23219b98f12bdc949b12328dac889d20"
+    },
+    {
+      "path": "groot_compare/run.py",
+      "sha256": "9bea8b766b0919abf8a2f6fc403be3d7a11e74cdccd1eebd62771812a4cbd6dd"
+    },
+    {
+      "path": "scripts/Dockerfile.jal",
+      "sha256": "6aca91176cb5a56ff8810f2753054c6d82da26b0e6c8ba9e48944488f0d5f786"
+    },
+    {
+      "path": "scripts/Dockerfile.jal-repro",
+      "sha256": "c416c0c9445fc77c4556f70e3b2d5e84a83f7fa32179a01bd8485359f734af91"
+    },
+    {
+      "path": "scripts/Dockerfile.libero",
+      "sha256": "dc39a03626dd96a1d93d8fd7ffe8d7b31fa5b8388dc9211d314ec27361230047"
+    },
+    {
+      "path": "scripts/check_simulator_imports.py",
+      "sha256": "90b1d29ad19382cc1d269f7901979e199daff7d13437f210a0874380d291d878"
+    },
+    {
+      "path": "scripts/container.py",
+      "sha256": "9e576608f6a5dd13faef83076936ee4c3a0f715d120f8213a94af15f8e6b309f"
+    },
+    {
+      "path": "scripts/install_libero_runtime.py",
+      "sha256": "96eb5110adcae789e1a597093b638bd1e7324d87f5573c7fd1cf63be3279e981"
+    },
+    {
+      "path": "scripts/restore_services.py",
+      "sha256": "bd53bd32628293c2f77975045c3453ace10698707d5f1de9100e0c2efcb14c5e"
+    },
+    {
+      "path": "scripts/run_latency.py",
+      "sha256": "d8ca0eb4b81c255d9e13c341002324845bac1d326a048a04d36eb0014811413f"
+    },
+    {
+      "path": "scripts/select_calibration.py",
+      "sha256": "b2e3c412dcb0018d38837ad8a3f1168e098024b3f1f75263ab4c6511f4e37bd7"
+    },
+    {
+      "path": "scripts/simulator.py",
+      "sha256": "ba83e1a77653b50244b2c196d99094c323ffd628aa87079ba2a380df5cdd5d55"
+    }
+  ],
+  "original_completed_run_files": [
+    {
+      "path": "artifacts/runs/heldout-torch-accuracy/run.json",
+      "sha256": "7cb93cd71424a5d8b63210ae5c9c0d30aa6ccb7b7e4f195a083d79df3dde0a6c"
+    },
+    {
+      "path": "artifacts/runs/heldout-trt-accuracy-v2/run.json",
+      "sha256": "45a70d6439209c74de2ac0aec1556dcd3e1f5f3893a909b203508802c4be07f4"
+    },
+    {
+      "path": "artifacts/runs/heldout-flashrt-accuracy/run.json",
+      "sha256": "9ebd14f292ff132d8ce73d5327b18305f1d35c31d0d440327b4cae1d1a7c72ca"
+    },
+    {
+      "path": "artifacts/runs/heldout-trt-timing-r1/run.json",
+      "sha256": "795baad43750207be627abd444ab8ea39f2c9cdd5e6e39b54a0d50c29fa667a9"
+    },
+    {
+      "path": "artifacts/runs/heldout-flashrt-timing-r1/run.json",
+      "sha256": "108f4774fe52e91d1c0fb4a17fb226e0de0de4da7400730eff97204602148967"
+    },
+    {
+      "path": "artifacts/runs/heldout-flashrt-timing-r2/run.json",
+      "sha256": "e589337235d94470ec5b3a1c2224ff664fb1b24e66af2a9c34c00651396a5ace"
+    },
+    {
+      "path": "artifacts/runs/heldout-trt-timing-r2/run.json",
+      "sha256": "8c1639db28a5466514cbec7fb5f541a91dfe226066a83a59dbdc632038c1c0e5"
+    },
+    {
+      "path": "artifacts/runs/heldout-trt-timing-r3/run.json",
+      "sha256": "f94ca17a1c80727ed7c412de32bfbb68852dd7dbb24502dde71f5bc3ea434a76"
+    },
+    {
+      "path": "artifacts/runs/heldout-flashrt-timing-r3/run.json",
+      "sha256": "f5512d99226f9c8adaa9ac9b14237e144b2bda32c5e06ee2439281deaaced812"
+    }
+  ],
+  "export": {
+    "action_predictions": "Nine significant decimal digits preserve each float32 output exactly when read back as float32. All 16 actions are retained per observation. Ground-truth columns are present only for the 1,410 executed action steps; blank means not scored, not zero.",
+    "latency_samples": "All 1,800 measured calls copied without rounding or filtering from six completed timing runs.",
+    "observations": "Selected identifiers, public LIBERO prompts and paired input hashes; no image tensors or private machine service inventory.",
+    "summaries": "comparison.json and closed-loop-pilot.json are byte-identical to the completed experiment reports.",
+    "excluded": [
+      "model weights",
+      "dataset images/videos",
+      "TensorRT engine binaries",
+      "calibration tensors",
+      "host application inventories",
+      "raw build logs",
+      "incomplete runs"
+    ],
+    "runtime_reconstruction": "The supplied standalone JAL Dockerfile was not built or used to generate these results; measured runtime identity and package constraints are recorded separately."
+  }
+}

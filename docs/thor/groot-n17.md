@@ -209,3 +209,12 @@ has not yet been run alongside FlashRT on the same device, so these instructions
 do not claim a measured same-device TensorRT speedup.
 
 To build this same image yourself, see [Docker](../../docker/README.md#thor).
+
+## Independent comparison with the JAL TensorRT recipe
+
+The [paired Thor evaluation](../../evaluations/jal_groot/README.md) records
+complete-call latency and held-out numerical errors for FlashRT, the JAL
+TensorRT recipe and an official PyTorch reference. It includes the comparison
+harness, measured data and reproduction instructions, with the one-camera
+configuration and inconclusive simulation pilot stated explicitly. Results
+apply to the pinned revisions and settings in that report.

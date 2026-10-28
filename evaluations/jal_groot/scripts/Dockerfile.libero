@@ -1,0 +1,19 @@
+# Runtime-only LIBERO layer; model and preprocessing packages stay at base versions.
+ARG BASE_IMAGE=groot-comparison-jal:local
+FROM ${BASE_IMAGE}
+USER root
+ARG SIM_PYTHON=/opt/gr00t-venv/bin/python
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libegl1 libgl1 libglvnd0 libgles2 libosmesa6 libosmesa6-dev \
+        libglfw3 libxrandr2 libxinerama1 libxcursor1 libxi6 \
+    && rm -rf /var/lib/apt/lists/*
+COPY install_libero_runtime.py /opt/libero/install_runtime.py
+RUN "${SIM_PYTHON}" /opt/libero/install_runtime.py
+COPY libero-config.yaml /opt/libero/config.yaml
+ENV LIBERO_CONFIG_PATH=/opt/libero \
+    MUJOCO_GL=osmesa \
+    PYOPENGL_PLATFORM=osmesa \
+    NVIDIA_DRIVER_CAPABILITIES=graphics,utility,compute \
+    PYTHONPATH=/comparison/vendor/Isaac-GR00T:/comparison/vendor/Isaac-GR00T/external_dependencies/LIBERO:/comparison:/opt/FlashRT
+WORKDIR /comparison
