@@ -66,8 +66,13 @@ struct GeluTanh<cutlass::Array<float, N>> {
         cutlass::Array<float, N> y;
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < N; ++i) {
+            // 0.5 x (1 + tanh(u)) = x / (1 + exp(-2u)): one exp and one reciprocal instead of tanhf
             const float x = v[i];
-            y[i] = 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x)));
+#if defined(__CUDA_ARCH__)
+            y[i] = __fdividef(x, 1.0f + __expf(-1.5957691216f * (x + 0.044715f * x * x * x)));
+#else
+            y[i] = x / (1.0f + expf(-1.5957691216f * (x + 0.044715f * x * x * x)));
+#endif
         }
         return y;
     }
