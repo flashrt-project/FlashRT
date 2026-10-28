@@ -269,15 +269,26 @@ VIT_TAPS = (5, 11, 17)
 VIT_ROPE_INPLACE = True
 
 
-def merger_forward(gemm, fvk, lk, B, M, x, rows_in, dim_in, post_norm, out, st, prec):
+def merger_forward(gemm, fvk, lk, B, M, x, rows_in, dim_in, post_norm, out, st, prec, *, side=None):
     """Qwen3-VL patch merger on ``x`` [rows_in, dim_in] (2x2 merge groups are
     4 consecutive rows): LayerNorm (before or after the 4-row shuffle) -> fc1
     (+bias, erf-GELU) -> fc2 -> ``out`` [rows_in / 4, 2048] without the fc2
-    bias (added where the rows are scattered)."""
+    bias (added where the rows are scattered). ``side`` = (stream, fork, bufs)
+    (FP16 precisions): the LayerNorm runs on ``st`` into the private
+    bufs["in16"], ``fork()`` orders the side stream after it and the GEMMs
+    (DRAM bound) run there on bufs["fc1"]."""
     n = rows_in // 4
     D4 = 4 * dim_in
     s8, fc1, f16 = B["m_fp8"], B["m_fc1"], B["m_f16"]
     rows, dim = (n, D4) if post_norm else (rows_in, dim_in)
+    if side is not None:
+        assert prec in _F16
+        side_st, fork, bufs = side
+        _norm8(fvk, x, 0, 0, 0, M["norm_w"], M["norm_b"], 0, 1e-6, 0, 0, rows, dim, st, prec, bufs["in16"])
+        fork()
+        h16 = _fc1_gelu(gemm, lk, fvk, prec, 0, bufs["in16"], M, bufs["fc1"], 0, n, D4, D4, side_st, 0)
+        _mm(gemm, prec, 0, h16, M, "fc2", out, n, 2048, D4, side_st)
+        return
     _norm8(fvk, x, 0, 0, 0, M["norm_w"], M["norm_b"], 0, 1e-6, s8, M["a_fc1"], rows, dim, st, prec, f16)
     h16 = _fc1_gelu(gemm, lk, fvk, prec, s8, f16, M, fc1, M["a_fc2"], n, D4, D4, st, f16)
     _mm(gemm, prec, s8, h16, M, "fc2", out, n, 2048, D4, st)
@@ -293,11 +304,14 @@ def _site_prec(prec, fp8_sites, cal):
     return sp
 
 
-def qwen_vit_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8", fp8_sites=(), cal=False):
+def qwen_vit_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8", fp8_sites=(), cal=False,
+                     ds_side=None):
     """Patch embedding + 24 ViT layers + DeepStack mergers at the taps + the
     final merger. B["ds_out"][j] / B["merger_out"] receive [S/4, 2048] rows
     (fc2 bias pending). ``fp8_sites`` (qkv / o / fc1 / fc2) run FP8 in a
-    16-bit tower."""
+    16-bit tower. ``ds_side`` = (stream, fork(j), join()): the GEMMs of the
+    DeepStack mergers run on that stream next to the following layers (their
+    outputs are first read by the LLM); join() precedes the final merger."""
     S, nv = int(dims["S"]), int(dims["views"])
     Sper, D, NH, HD, FF = S // nv, 1024, 16, 64, 4096
     st = int(stream)
@@ -342,8 +356,13 @@ def qwen_vit_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8", fp
             _ck(fvk.fp8_residual_norm_quant(h, pend[0], pend[1], 0, 0, 0, 0, 0, 0.0, 0, 0, 0, S, D, st), "vit res")
             pend = (0, 0)
             j = VIT_TAPS.index(li)
-            merger_forward(gemm, fvk, lk, B, W["ds"][j], h, S, D, True, B["ds_out"][j], st, prec)
+            side = None
+            if ds_side is not None:
+                side = (ds_side[0], lambda: ds_side[1](j), {"in16": B["ds_in16"][j], "fc1": B["ds_fc1"]})
+            merger_forward(gemm, fvk, lk, B, W["ds"][j], h, S, D, True, B["ds_out"][j], st, prec, side=side)
     _ck(fvk.fp8_residual_norm_quant(h, pend[0], pend[1], 0, 0, 0, 0, 0, 0.0, 0, 0, 0, S, D, st), "vit res")
+    if ds_side is not None:
+        ds_side[2]()
     merger_forward(gemm, fvk, lk, B, W["merger"], h, S, D, False, B["merger_out"], st, prec)
 
 

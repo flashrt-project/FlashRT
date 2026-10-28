@@ -154,6 +154,10 @@ class LawamTorchFrontendRtx:
         self._mod_groups = [(1, 2), (2, 12)]
         self._mod_ctas = 36
         self._ev_mod = [torch.cuda.Event() for _ in self._mod_groups]
+        # the GEMMs of the DeepStack mergers (DRAM bound) on a side branch next to the ViT layers
+        self._ev_tap = [torch.cuda.Event() for _ in range(3)]
+        self._ev_ds = torch.cuda.Event()
+        self._ds_side = True
         self.checkpoint_path = str(checkpoint_path)
         self.num_views = int(num_views)
         if self.num_views != 2:
@@ -710,7 +714,9 @@ class LawamTorchFrontendRtx:
                     "O": b(Sv, 1024, dtype=_BF16), "lse": b(nv, 16, 256, dtype=_F32),
                     "o_out": b(Sv, 1024), "fc1": b(Sv, 4096), "f16": f16,
                     "m_fp8": b(Sv, 4096, dtype=_U8), "m_fc1": b(Sv // 4, 4096), "m_f16": f16,
-                    "ds_out": [b(Sv // 4, 2048) for _ in range(3)], "merger_out": b(Sv // 4, 2048)}
+                    "ds_out": [b(Sv // 4, 2048) for _ in range(3)], "merger_out": b(Sv // 4, 2048),
+                    # DeepStack mergers on the side branch: per-tap normalized input, shared fc1 output
+                    "ds_in16": [b(Sv // 4, 4096) for _ in range(3)], "ds_fc1": b(Sv // 4, 4096)}
         nsplit = (S + 127) // 128
         B["llm"] = {"h": b(S, 2048), "x8": b(S, 6144, dtype=_U8), "qkv": b(S, 4096),
                     "Q": b(S, 2048, dtype=_BF16), "K": b(S, 1024, dtype=_BF16), "V": b(S, 1024, dtype=_BF16),
@@ -815,8 +821,19 @@ class LawamTorchFrontendRtx:
         if split_kv:
             P.flow_condition_img(self.gemm_side, lk, B["flow"], self.flow, 0, 256, stream=side)
         self._ev_dino.record(self._side)
+        ds_side = None
+        if self._ds_side and prec["vit"] in P._F16 and not self.fp8_sites.get("vit"):
+            def fork(j):
+                self._ev_tap[j].record(main)
+                self._side2.wait_event(self._ev_tap[j])
+
+            def join():
+                self._ev_ds.record(self._side2)
+                main.wait_event(self._ev_ds)
+
+            ds_side = (self._side2.cuda_stream, fork, join)
         P.qwen_vit_forward(gemm, fvk, lk, fa2, B["vit"], self.vit, {"S": 256 * nv, "views": nv}, stream=st,
-                           prec=prec["vit"], fp8_sites=self.fp8_sites.get("vit", ()), cal=cal)
+                           prec=prec["vit"], fp8_sites=self.fp8_sites.get("vit", ()), cal=cal, ds_side=ds_side)
         main.wait_event(self._ev_embeds)
         P.qwen_llm_forward(gemm, fvk, lk, fa2, B["llm"], self.llm, {"S": self.Se, "n_vis": self.n_vis}, stream=st,
                            prec=prec["llm"], num_sms=self.num_sms, out_prec=prec["enc"],
