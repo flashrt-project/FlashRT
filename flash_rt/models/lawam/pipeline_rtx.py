@@ -670,7 +670,7 @@ def dit_step_forward(fvk, lk, fa2, B, W, T, dims, *, step, stream=0, pdl=True, c
 # ─────────────────────────────────────────────────────────────────────────
 
 DIT_UNIT = 2304          # packed weight unit / ring slot (bytes)
-DIT_WARPS = 7            # consumer warps of the persistent kernel
+DIT_WARPS = 8            # warps of the persistent kernel
 DIT_CHUNK = 256          # packed NVFP4 unit (k)
 _OP_GEMM, _OP_ATTN, _OP_AE, _OP_KVT, _OP_UNNORM, _OP_LN = range(6)
 _A_BUF, _A_LN = range(2)     # host-side only: an LN GEMM input becomes an OP_LN into xa + a buffer GEMM

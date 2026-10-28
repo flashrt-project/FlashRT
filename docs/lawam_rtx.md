@@ -71,12 +71,14 @@ temporal patch copies are folded into the Qwen3-VL patch-embedding weight.
 The flow loop is latency bound (every GEMM has 24 rows), so
 `lawam.dit_flow_persistent` runs it as one persistent cooperative kernel (one
 CTA per SM) over an op table built by `pipeline_rtx.dit_persistent_ops`: grid
-barriers separate dependent ops, a producer warp streams the step's weights
-(packed at load time by `pipeline_rtx.pack_dit_persistent` into the kernel's
-fragment order, per CTA in consumption order) into a shared-memory ring ahead
-of the consumers, block-input LayerNorms run once per op distributed over the
-CTAs, and the ffn down projection is split over 4 k groups whose partials the
-next LayerNorm adds into the residual. `precision={"dit_impl": "chain"}`
+barriers separate dependent ops, the step's weights (packed at load time by
+`pipeline_rtx.pack_dit_persistent` into the kernel's fragment order, per CTA in
+consumption order) stream into a shared-memory ring that every MMA warp refills
+behind itself, each GEMM's activation operand lands chunk by chunk (one
+mbarrier per 256 columns), block-input LayerNorms run once per op distributed
+over the CTAs, and the ffn down projection is split over 4 k groups whose
+partials the next LayerNorm adds into the residual (written into the other of
+two residual buffers: the phase reads whole old rows). `precision={"dit_impl": "chain"}`
 selects the per-kernel chain (`pipeline_rtx.dit_step_forward`: skinny W4A16 /
 W8A16 GEMMs with FP32 accumulation, `nvfp4_skinny_partials_attention`,
 `lawam.dit_cross_attention`, the `lawam.dit_*` consumers).

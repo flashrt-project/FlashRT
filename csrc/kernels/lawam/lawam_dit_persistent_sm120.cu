@@ -8,9 +8,10 @@
 // GEMM of the DiT works on 24 action rows. Here one CTA per SM walks a
 // host-built op table (descriptor of the next op prefetched into shared
 // memory); a grid barrier (one counter, release / acquire) separates dependent
-// ops, and the step-invariant weights stream into a shared-memory ring through
-// a producer warp (cp.async.bulk, mbarrier-tracked, L2 evict-first) that runs
-// ahead of the consumer warps across barriers, attention and norms.
+// ops, and the step-invariant weights stream into a shared-memory ring
+// (cp.async.bulk, mbarrier-tracked, L2 evict-first): the warp that consumed a
+// unit refills its slot with the unit kSlots ahead, so the stream runs ahead of
+// the eight MMA warps across barriers, attention and norms.
 //
 // GEMMs (out[m][n] = sum_k A[m][k] W[n][k], m < 24): each CTA owns a
 // contiguous range of 16-column tiles (the ffn down projection: a range of a
@@ -51,9 +52,9 @@ namespace flash_rt {
 namespace lawam {
 namespace {
 
-constexpr int kCW = 7;                   // consumer warps (+ 1 producer warp: 2 per SM sub-partition, 255 registers)
+constexpr int kCW = 8;                   // warps (2 per SM sub-partition, 255 registers); each refills the ring slots it frees
 constexpr int kConsumers = kCW * 32;
-constexpr int kThreads = kConsumers + 32;
+constexpr int kThreads = kConsumers;
 constexpr int kRows = 24;                // action rows (three n8 operands)
 constexpr int kChunk = 256;              // k per packed W4 unit / unit chunk
 constexpr int kKMax = 1024;              // resident A columns per CTA
@@ -64,7 +65,7 @@ constexpr int kABytes = kRows * kALd * 2;         // 50688: A operand, then spli
 constexpr int kMaxSites = 72;
 constexpr int kOpVecs = sizeof(DitOp) / 16;   // 16-byte pieces of an op descriptor
 constexpr int kRowPartOff = 8192;   // floats into the A region: per-tile row statistics (after the split partials)
-constexpr int kSmem = kSlots * kUnit + kABytes + 256 + 2 * kSlots * 8 + (kKMax / kChunk) * 8 + kMaxSites * 16 +
+constexpr int kSmem = kSlots * kUnit + kABytes + 256 + kSlots * 8 + (kKMax / kChunk) * 8 + kMaxSites * 16 +
                       2 * static_cast<int>(sizeof(DitOp));
 static_assert(kSmem + 1024 <= 101376, "dynamic shared memory budget (sm_120: 99 KB per block)");
 
@@ -186,12 +187,12 @@ __device__ __forceinline__ uint4 ldg16(const void* p) { return *reinterpret_cast
 
 // L2 loads for data other CTAs wrote in this launch (L1 is not coherent across SMs)
 __device__ __forceinline__ uint4 ldcg16(const void* p) { return __ldcg(reinterpret_cast<const uint4*>(p)); }
-// Shared memory: ring | A operand (partials / attention merge) | stats | flag | mbarriers | sites | op buffers.
+// Shared memory: ring | A operand (partials / attention merge) | stats | ring / A-chunk mbarriers | sites | op buffers.
 constexpr int kOffA = kSlots * kUnit;
 constexpr int kOffStats = kOffA + kABytes;
 constexpr int kOffBars = kOffStats + 256;
 constexpr int kAChunks = kKMax / kChunk;   // A operand chunks, each landing on its own mbarrier
-constexpr int kOffSites = kOffBars + 2 * kSlots * 8 + kAChunks * 8;
+constexpr int kOffSites = kOffBars + kSlots * 8 + kAChunks * 8;
 constexpr int kOffOps = kOffSites + kMaxSites * 16;
 extern __shared__ __align__(128) unsigned char g_dyn[];
 
@@ -201,20 +202,41 @@ struct Smem {
     __device__ __forceinline__ __nv_bfloat16* abuf() const { return reinterpret_cast<__nv_bfloat16*>(g_dyn + kOffA); }
     __device__ __forceinline__ float* stats() const { return reinterpret_cast<float*>(g_dyn + kOffStats); }
     __device__ __forceinline__ uint64_t* full() const { return reinterpret_cast<uint64_t*>(g_dyn + kOffBars); }
-    __device__ __forceinline__ uint64_t* empty() const { return full() + kSlots; }
-    __device__ __forceinline__ uint64_t* achunk() const { return full() + 2 * kSlots; }
+    __device__ __forceinline__ uint64_t* achunk() const { return full() + kSlots; }
     __device__ __forceinline__ int4* sites() const { return reinterpret_cast<int4*>(g_dyn + kOffSites); }
     __device__ __forceinline__ DitOp* opbuf() const { return reinterpret_cast<DitOp*>(g_dyn + kOffOps); }
 };
 
-// Fill index (unit / kSlots) the producer last issued into each ring slot.
-__shared__ unsigned s_issued[kSlots];
+// The CTA's weight stream: its per-step units in consumption order, replayed every step. The warp
+// that consumed ring unit r refills the slot with unit r + kSlots (lane 0, after the warp's reads).
+struct Ring {
+    const unsigned char* base;
+    unsigned per, end;
+    uint64_t policy;
+    unsigned issued[kSlots];   // fill index (unit / kSlots) last issued into each slot
+};
+__shared__ Ring s_ring;
 
-// Wait for ring unit r (filled by the producer warp). Its fill must have been issued before the
-// phase parity identifies it: a warp may reach unit r while the slot's previous unit is in flight.
+__device__ __forceinline__ void fill_unit(const Smem& sm, unsigned u) {
+    const unsigned slot = u % kSlots;
+    mbar_expect_tx(&sm.full()[slot], kUnit);
+    bulk_g2s(sm.ring() + slot * kUnit, s_ring.base + static_cast<size_t>(u % s_ring.per) * kUnit, kUnit,
+             &sm.full()[slot], s_ring.policy);
+    *reinterpret_cast<volatile unsigned*>(&s_ring.issued[slot]) = u / kSlots;
+}
+
+__device__ __forceinline__ void release_unit(const Smem& sm, unsigned r) {
+    // every lane's reads of the slot are ordered before the async-proxy refill
+    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    __syncwarp();
+    if ((threadIdx.x & 31) == 0 && r + kSlots < s_ring.end) fill_unit(sm, r + kSlots);
+}
+
+// Wait for ring unit r. Its fill must have been issued (the slot's previous unit consumed) before
+// the phase parity identifies it: a warp may reach unit r while that unit is still in flight.
 __device__ __forceinline__ void wait_unit(const Smem& sm, unsigned r) {
     const unsigned slot = r % kSlots, k = r / kSlots;
-    while (*reinterpret_cast<volatile unsigned*>(&s_issued[slot]) < k) {
+    while (*reinterpret_cast<volatile unsigned*>(&s_ring.issued[slot]) < k) {
     }
     mbar_wait(&sm.full()[slot], k & 1);
 }
@@ -564,16 +586,14 @@ __device__ void gemm_phase(const DitOp& op, const Smem& sm, unsigned& ucount, un
             const unsigned ri = ucount + si;
             wait_unit(sm, ri);
             mma_w4(sm.ring() + (ri % kSlots) * kUnit, a, acc);
-            __syncwarp();
-            if (lane == 0) mbar_arrive(&sm.empty()[ri % kSlots]);
+            release_unit(sm, ri);
         } else {
 #pragma unroll
             for (int half = 0; half < 2; ++half) {
                 const unsigned ri = ucount + 2 * si + half;
                 wait_unit(sm, ri);
                 mma_w8(sm.ring() + (ri % kSlots) * kUnit, a + half * 128, acc);
-                __syncwarp();
-                if (lane == 0) mbar_arrive(&sm.empty()[ri % kSlots]);
+                release_unit(sm, ri);
             }
         }
     }
@@ -1048,35 +1068,21 @@ dit_flow_kernel(const DitOp* __restrict__ ops, int n_ops, const int* __restrict_
         reinterpret_cast<uint4*>(sm.opbuf())[threadIdx.x] = reinterpret_cast<const uint4*>(ops)[threadIdx.x];
 
     if (threadIdx.x == 0) {
-        for (int i = 0; i < kSlots; ++i) {
-            mbar_init(&sm.full()[i], 1);
-            mbar_init(&sm.empty()[i], 1);
-            s_issued[i] = 0;
-        }
+        for (int i = 0; i < kSlots; ++i) mbar_init(&sm.full()[i], 1);
         for (int i = 0; i < kAChunks; ++i) mbar_init(&sm.achunk()[i], kConsumers);
         asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+        uint64_t policy;
+        asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(policy));
+        s_ring.base = stream + cta_stride * blockIdx.x;
+        s_ring.per = static_cast<unsigned>(cta_units[blockIdx.x]);
+        s_ring.end = s_ring.per * static_cast<unsigned>(n_steps);
+        s_ring.policy = policy;
+        for (unsigned u = 0; u < kSlots; ++u) {
+            s_ring.issued[u] = 0;
+            if (u < s_ring.end) fill_unit(sm, u);
+        }
     }
     __syncthreads();
-
-    if (threadIdx.x >= kConsumers) {
-        // producer warp (one lane): the CTA's per-step units in consumption order, every step
-        if (threadIdx.x == kConsumers) {
-            uint64_t policy;
-            asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(policy));
-            const unsigned char* base = stream + cta_stride * blockIdx.x;
-            const unsigned per = static_cast<unsigned>(cta_units[blockIdx.x]);
-            const unsigned end = per * static_cast<unsigned>(n_steps);
-            for (unsigned u = 0; u < end; ++u) {
-                const unsigned slot = u % kSlots;
-                mbar_wait(&sm.empty()[slot], ((u / kSlots) & 1) ^ 1);
-                mbar_expect_tx(&sm.full()[slot], kUnit);
-                bulk_g2s(sm.ring() + slot * kUnit, base + static_cast<size_t>(u % per) * kUnit, kUnit,
-                         &sm.full()[slot], policy);
-                *reinterpret_cast<volatile unsigned*>(&s_issued[slot]) = u / kSlots;
-            }
-        }
-        return;
-    }
 
     unsigned ucount = 0, bars = 0, astage = 0;
     for (int oi = 0; oi < n_ops; ++oi) {
