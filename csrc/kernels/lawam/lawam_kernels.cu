@@ -693,35 +693,44 @@ int gemv_nvfp4w(const __half* x, const uint8_t* w, const uint8_t* sf, const floa
 
 // Rotate-half RoPE (head dim 64) in place on the first n_qk heads (Q | K) of a fused [S, ld] QKV
 // buffer whose bias the GEMM epilogue added: attention reads Q / K / V from it through row strides.
+// Four threads per head (8 columns of each half, 16-byte accesses), 256 / (4 n_qk) rows per block.
 __global__ void __launch_bounds__(256)
 qk_rope_inplace_kernel(__half* __restrict__ qkv, int ld, const __half* __restrict__ cos,
-                       const __half* __restrict__ sin, int n_qk) {
+                       const __half* __restrict__ sin, int S, int n_qk) {
     constexpr int HD = 64, H2 = 32;
-    const int s = blockIdx.x;
-    const int head = blockIdx.y * 32 + (threadIdx.x >> 3);
-    const int d0 = (threadIdx.x & 7) * 4;
-    if (head >= n_qk) return;
+    const int per_row = 4 * n_qk, rows = blockDim.x / per_row;
+    const int s = blockIdx.x * rows + threadIdx.x / per_row;
+    const int t = threadIdx.x % per_row, head = t >> 2, d0 = (t & 3) * 8;
+    if (s >= S || threadIdx.x >= rows * per_row) return;
     __half* p = qkv + static_cast<size_t>(s) * ld + head * HD;
-    float lo[4], hi[4], c[4], sn[4];
-    load4(p + d0, lo);
-    load4(p + d0 + H2, hi);
-    load4(cos + static_cast<size_t>(s) * HD + d0, c);
-    load4(sin + static_cast<size_t>(s) * HD + d0, sn);
+    const uint4 ul = *reinterpret_cast<const uint4*>(p + d0), uh = *reinterpret_cast<const uint4*>(p + d0 + H2);
+    const uint4 uc = __ldg(reinterpret_cast<const uint4*>(cos + static_cast<size_t>(s) * HD + d0));
+    const uint4 us = __ldg(reinterpret_cast<const uint4*>(sin + static_cast<size_t>(s) * HD + d0));
+    const __half2* hl = reinterpret_cast<const __half2*>(&ul);
+    const __half2* hh = reinterpret_cast<const __half2*>(&uh);
+    const __half2* hc = reinterpret_cast<const __half2*>(&uc);
+    const __half2* hs = reinterpret_cast<const __half2*>(&us);
+    uint4 ol, oh;
+    __half2* pl = reinterpret_cast<__half2*>(&ol);
+    __half2* ph = reinterpret_cast<__half2*>(&oh);
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
-        const float a = lo[e], b = hi[e];
-        lo[e] = fmaf(a, c[e], -__fmul_rn(b, sn[e]));
-        hi[e] = fmaf(b, c[e], __fmul_rn(a, sn[e]));
+        const float2 a = __half22float2(hl[e]), b = __half22float2(hh[e]);
+        const float2 c = __half22float2(hc[e]), sn = __half22float2(hs[e]);
+        pl[e] = __floats2half2_rn(fmaf(a.x, c.x, -__fmul_rn(b.x, sn.x)), fmaf(a.y, c.y, -__fmul_rn(b.y, sn.y)));
+        ph[e] = __floats2half2_rn(fmaf(b.x, c.x, __fmul_rn(a.x, sn.x)), fmaf(b.y, c.y, __fmul_rn(a.y, sn.y)));
     }
-    store4<false>(p, d0, lo);
-    store4<false>(p, d0 + H2, hi);
+    *reinterpret_cast<uint4*>(p + d0) = ol;
+    *reinterpret_cast<uint4*>(p + d0 + H2) = oh;
 }
 
 int qk_rope_inplace(__half* qkv, int ld, const __half* cos, const __half* sin, int S, int n_qk, int hd,
                     cudaStream_t stream) {
     if (qkv == nullptr || cos == nullptr || sin == nullptr || S < 1 || hd != 64 || ld % 4 != 0 || n_qk < 1)
         return static_cast<int>(cudaErrorInvalidValue);
-    qk_rope_inplace_kernel<<<dim3(S, (n_qk + 31) / 32), 256, 0, stream>>>(qkv, ld, cos, sin, n_qk);
+    if (4 * n_qk > 256) return static_cast<int>(cudaErrorInvalidValue);
+    const int rows = 256 / (4 * n_qk);
+    qk_rope_inplace_kernel<<<(S + rows - 1) / rows, 256, 0, stream>>>(qkv, ld, cos, sin, S, n_qk);
     return last_error();
 }
 
