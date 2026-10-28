@@ -56,19 +56,20 @@ int cast_f16_bf16(const __half* in, __nv_bfloat16* out, int n, cudaStream_t stre
 // LAM decoder conditioning: reads the act-query rows idx[0..nq) of the FP16
 // VLM states [*, vdim], writes the latent (FP32 [code]) and
 // silu(action_in_proj(latent)) (FP16 [ctx]) consumed by the AdaLN modulation.
-// FP32 weights in nn.Module layout; scratch FP32 of at least nq * 2 * code.
+// FP32 weights; wk / wv in nn.Module layout [out, in], the head projections
+// transposed (_t: [in, out]). vdim 2048; scratch FP32 of at least nq * 2 * code.
 struct QFormerWeights {
     const float* query;       // [code]
     const float* norm_q_w; const float* norm_q_b;     // [code]
     const float* norm_kv_w; const float* norm_kv_b;   // [vdim]
-    const float* wq; const float* wk; const float* wv; // [code, code], [code, vdim] x2
+    const float* wq_t; const float* wk; const float* wv; // [code, code], [code, vdim] x2
     const float* in_bias;     // [3 * code] (q, k, v)
-    const float* wo; const float* bo;                 // [code, code], [code]
+    const float* wo_t; const float* bo;               // [code, code], [code]
     const float* ffn_ln_w; const float* ffn_ln_b;     // [code]
-    const float* w1; const float* b1;                 // [4 code, code], [4 code]
-    const float* w2; const float* b2;                 // [code, 4 code], [code]
+    const float* w1_t; const float* b1;               // [code, 4 code], [4 code]
+    const float* w2_t; const float* b2;               // [4 code, code], [code]
     const float* final_w; const float* final_b;       // [code]
-    const float* act_w; const float* act_b;           // [ctx, code], [ctx]
+    const float* act_w_t; const float* act_b;         // [code, ctx], [ctx]
 };
 int qformer_latent(const __half* vlm, const int* idx, int nq, int vdim, int code, int heads, int ctx,
                    const QFormerWeights& w, float* scratch, float* latent, __half* cond_silu, cudaStream_t stream);
@@ -93,9 +94,11 @@ int unnormalize_actions(const float* x, int ld, const float* lo, const float* hi
 // out[n] = gs * sum_k e2m1(w[n, k]) * sf[n, k / 16] * x[k] + bias[n]: one-row GEMV
 // with NVFP4 weights (w [N, K / 2] bytes, element 2j in the low nibble; sf
 // [N, K / 16] UE4M3 block scales; gs one FP32 global scale), FP16 input /
-// output, FP32 accumulation. K == 1024.
+// output, FP32 accumulation. K == 1024. max_ctas > 0 caps the grid (a GEMV
+// running next to other kernels leaves them thread slots); rows are computed
+// the same way for any grid.
 int gemv_nvfp4w(const __half* x, const uint8_t* w, const uint8_t* sf, const float* gs, const __half* bias,
-                __half* out, int N, int K, cudaStream_t stream);
+                __half* out, int N, int K, cudaStream_t stream, int max_ctas = 0);
 
 int gemv_i8w(const __half* x, const int8_t* w, const float* w_scale, const __half* bias, __half* out, int N, int K,
              cudaStream_t stream);

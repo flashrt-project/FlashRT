@@ -166,6 +166,58 @@ def test_gemv_nvfp4w_matches_dequantized_weights():
     torch.testing.assert_close(out.float(), deq @ x.float() + b.float(), rtol=2e-3, atol=2e-3)
 
 
+def test_gemv_nvfp4w_row_ranges_and_grid_cap_are_bit_identical():
+    lk = _lawam()
+    from flash_rt.frontends.torch.lawam_rtx import _nvfp4_weight_only
+    torch.manual_seed(0)
+    N, K, R = 3 * 6144, 1024, 6144
+    w4, sf, gs = _nvfp4_weight_only(torch.randn(N, K, device="cuda") * 0.02)
+    x, b = torch.randn(K, device="cuda").half(), (torch.randn(N, device="cuda") * 0.1).half()
+    ref, out = (torch.empty(N, dtype=torch.half, device="cuda") for _ in range(2))
+    assert lk.gemv_nvfp4w(x.data_ptr(), w4.data_ptr(), sf.data_ptr(), gs.data_ptr(), b.data_ptr(), ref.data_ptr(),
+                          N, K, 0) == 0
+    for r0, cap in ((0, 0), (R, 36), (2 * R, 5)):   # one launch per row range, as the LAM modulation
+        assert lk.gemv_nvfp4w(x.data_ptr(), w4[r0:].data_ptr(), sf[r0:].data_ptr(), gs.data_ptr(), b[r0:].data_ptr(),
+                              out[r0:].data_ptr(), R, K, 0, cap) == 0
+    assert torch.equal(out, ref)
+
+
+def test_qformer_latent_matches_torch():
+    lk = _lawam()
+    F = torch.nn.functional
+    torch.manual_seed(0)
+    nq, vdim, code, heads, ctx, S = 8, 2048, 32, 8, 1024, 40
+    r = lambda *s, sc=0.05: torch.randn(*s, device="cuda") * sc   # noqa: E731
+    w = {"query": r(code, sc=1.0), "norm_q_w": 1 + r(code), "norm_q_b": r(code), "norm_kv_w": 1 + r(vdim),
+         "norm_kv_b": r(vdim), "wq": r(code, code), "wk": r(code, vdim, sc=0.02), "wv": r(code, vdim, sc=0.02),
+         "in_bias": r(3 * code), "wo": r(code, code), "bo": r(code), "ffn_ln_w": 1 + r(code), "ffn_ln_b": r(code),
+         "w1": r(4 * code, code), "b1": r(4 * code), "w2": r(code, 4 * code), "b2": r(code),
+         "final_w": 1 + r(code), "final_b": r(code), "act_w": r(ctx, code), "act_b": r(ctx)}
+    vlm = r(S, vdim, sc=1.0).half()
+    idx = torch.arange(3, 3 + nq, device="cuda", dtype=torch.int32)
+    dev = {k: v.contiguous() for k, v in w.items()}
+    for k in ("wq", "wo", "w1", "w2", "act_w"):
+        dev[k + "_t"] = dev.pop(k).t().contiguous()
+    scratch = torch.empty(nq * 2 * code, device="cuda")
+    latent = torch.empty(code, device="cuda")
+    cond = torch.empty(ctx, dtype=torch.half, device="cuda")
+    assert lk.qformer_latent(vlm.data_ptr(), idx.data_ptr(), nq, vdim, code, heads, ctx,
+                             {k: v.data_ptr() for k, v in dev.items()}, scratch.data_ptr(), latent.data_ptr(),
+                             cond.data_ptr(), 0) == 0
+    kvn = F.layer_norm(vlm[idx.long()].float(), (vdim,), w["norm_kv_w"], w["norm_kv_b"], 1e-5)
+    k_, v_ = kvn @ w["wk"].t() + w["in_bias"][code:2 * code], kvn @ w["wv"].t() + w["in_bias"][2 * code:]
+    q = F.layer_norm(w["query"], (code,), w["norm_q_w"], w["norm_q_b"], 1e-5) @ w["wq"].t() + w["in_bias"][:code]
+    hd = code // heads
+    p = torch.softmax((q.view(heads, 1, hd) @ k_.view(nq, heads, hd).permute(1, 2, 0)) * hd ** -0.5, -1)
+    o = (p @ v_.view(nq, heads, hd).transpose(0, 1)).reshape(code)
+    h = w["query"] + o @ w["wo"].t() + w["bo"]
+    f = F.gelu(F.layer_norm(h, (code,), w["ffn_ln_w"], w["ffn_ln_b"], 1e-5) @ w["w1"].t() + w["b1"])
+    h = h + f @ w["w2"].t() + w["b2"]
+    lat = F.layer_norm(h, (code,), w["final_w"], w["final_b"], 1e-5)
+    torch.testing.assert_close(latent, lat, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(cond.float(), F.silu(lat @ w["act_w"].t() + w["act_b"]), rtol=2e-3, atol=2e-3)
+
+
 def test_w4a16_skinny_gemm_matches_dequantized_matmul():
     lk = _lawam()
     from flash_rt.frontends.torch.lawam_rtx import _nvfp4_weight_only

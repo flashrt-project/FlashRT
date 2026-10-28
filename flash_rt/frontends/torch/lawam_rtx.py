@@ -144,6 +144,16 @@ class LawamTorchFrontendRtx:
         self._ev_frames = torch.cuda.Event()
         self._ev_dino = torch.cuda.Event()
         self._ev_embeds = torch.cuda.Event()
+        # after the VLM: the LAM modulation GEMV (DRAM bound) of blocks 1..11 and the text
+        # conditioning of the flow run on side branches, next to the compute-bound LAM blocks
+        self.gemm_side2 = fvk.GemmRunner()
+        self._side2 = torch.cuda.Stream(self.device)
+        self._ev_cond = torch.cuda.Event()
+        self._ev_q = torch.cuda.Event()
+        # modulation launches of the side branch (block ranges; block li waits for its range)
+        self._mod_groups = [(1, 2), (2, 12)]
+        self._mod_ctas = 36
+        self._ev_mod = [torch.cuda.Event() for _ in self._mod_groups]
         self.checkpoint_path = str(checkpoint_path)
         self.num_views = int(num_views)
         if self.num_views != 2:
@@ -494,18 +504,19 @@ class LawamTorchFrontendRtx:
         # QFormer (FP32, tiny) + the decoder conditioning projection
         Q = "vlm_to_lam."
         f = lambda t: self._k(t.to(self.device, _F32))   # noqa: E731
+        ft = lambda t: f(t.t().contiguous())                # noqa: E731  [in, out]: coalesced head projections
         self.qformer = {
             "query": f(g(Q + "query").reshape(-1)),
             "norm_q_w": f(g(Q + "norm_qs.0.weight")), "norm_q_b": f(g(Q + "norm_qs.0.bias")),
             "norm_kv_w": f(g(Q + "norm_kvs.0.weight")), "norm_kv_b": f(g(Q + "norm_kvs.0.bias")),
-            "wq": f(g(Q + "cross_attns.0.q_proj_weight")), "wk": f(g(Q + "cross_attns.0.k_proj_weight")),
+            "wq_t": ft(g(Q + "cross_attns.0.q_proj_weight")), "wk": f(g(Q + "cross_attns.0.k_proj_weight")),
             "wv": f(g(Q + "cross_attns.0.v_proj_weight")), "in_bias": f(g(Q + "cross_attns.0.in_proj_bias")),
-            "wo": f(g(Q + "cross_attns.0.out_proj.weight")), "bo": f(g(Q + "cross_attns.0.out_proj.bias")),
+            "wo_t": ft(g(Q + "cross_attns.0.out_proj.weight")), "bo": f(g(Q + "cross_attns.0.out_proj.bias")),
             "ffn_ln_w": f(g(Q + "ffns.0.0.weight")), "ffn_ln_b": f(g(Q + "ffns.0.0.bias")),
-            "w1": f(g(Q + "ffns.0.1.weight")), "b1": f(g(Q + "ffns.0.1.bias")),
-            "w2": f(g(Q + "ffns.0.4.weight")), "b2": f(g(Q + "ffns.0.4.bias")),
+            "w1_t": ft(g(Q + "ffns.0.1.weight")), "b1": f(g(Q + "ffns.0.1.bias")),
+            "w2_t": ft(g(Q + "ffns.0.4.weight")), "b2": f(g(Q + "ffns.0.4.bias")),
             "final_w": f(g(Q + "final_norm.weight")), "final_b": f(g(Q + "final_norm.bias")),
-            "act_w": f(g(Dd + "action_in_proj.weight")), "act_b": f(g(Dd + "action_in_proj.bias")),
+            "act_w_t": ft(g(Dd + "action_in_proj.weight")), "act_b": f(g(Dd + "action_in_proj.bias")),
         }
 
     def _load_flow(self) -> None:
@@ -797,6 +808,12 @@ class LawamTorchFrontendRtx:
         self._ev_embeds.record(self._side)
         P.dino_forward(self.gemm_side, fvk, lk, fa2, B["dino"], self.dino, stream=self._side.cuda_stream,
                        prec=prec["dino"], out_prec=prec["lam"])
+        # frame-only consumers of the DINOv3 latents: the LAM input projection and the
+        # flow image K / V of those 256 tokens
+        P.lam_input_forward(self.gemm_side, B["lam"], self.lam, stream=side, prec=prec["lam"])
+        split_kv = "kv_text_w16" in self.flow
+        if split_kv:
+            P.flow_condition_img(self.gemm_side, lk, B["flow"], self.flow, 0, 256, stream=side)
         self._ev_dino.record(self._side)
         P.qwen_vit_forward(gemm, fvk, lk, fa2, B["vit"], self.vit, {"S": 256 * nv, "views": nv}, stream=st,
                            prec=prec["vit"], fp8_sites=self.fp8_sites.get("vit", ()), cal=cal)
@@ -807,9 +824,30 @@ class LawamTorchFrontendRtx:
                            attn_dtype=self.precision.get("llm_attn", "bf16"), embeds_ready=True)
         _ck(lk.qformer_latent(B["llm"]["vlm"], self._act_idx, self.n_act, 2048, 32, 8, 1024, self.qformer,
                               B["q"]["scratch"], B["q"]["latent"], B["q"]["cond_silu"], st), "qformer")
+        # AdaLN modulation (DRAM bound): block 0 on the critical path, blocks 1..11 on a side branch
+        # with a capped grid next to the compute-bound LAM blocks (each block waits for its rows only),
+        # then the flow's text conditioning (VLM only) on the same branch
+        self._ev_q.record(main)
+        side2 = self._side2.cuda_stream
+        self._side2.wait_event(self._ev_q)
+        for i, (b0, b1) in enumerate(self._mod_groups):
+            P.lam_modulation(self.gemm_side2, lk, B["lam"], self.lam, b0, b1, stream=side2, max_ctas=self._mod_ctas)
+            self._ev_mod[i].record(self._side2)
+        P.flow_condition_text(self.gemm_side2, lk, B["flow"], self.flow, {"S": self.Se}, stream=side2,
+                              prec=prec["enc"])
+        self._ev_cond.record(self._side2)
+        P.lam_modulation(gemm, lk, B["lam"], self.lam, 0, self._mod_groups[0][0], stream=st)
         main.wait_event(self._ev_dino)
-        P.lam_decoder_forward(gemm, fvk, lk, fa2, B["lam"], self.lam, stream=st, prec=prec["lam"])
-        P.flow_condition_forward(gemm, fvk, lk, B["flow"], self.flow, {"S": self.Se}, stream=st, prec=prec["enc"])
+        mod_wait = {b0: i for i, (b0, _) in enumerate(self._mod_groups)}
+
+        def before_block(li):
+            if li in mod_wait:
+                main.wait_event(self._ev_mod[mod_wait[li]])
+
+        P.lam_decoder_forward(gemm, fvk, lk, fa2, B["lam"], self.lam, stream=st, prec=prec["lam"], inputs=False,
+                              before_block=before_block)
+        P.flow_condition_img(gemm, lk, B["flow"], self.flow, 256 if split_kv else 0, 512, stream=st)
+        main.wait_event(self._ev_cond)
         if self._dit_persistent:
             _ck(lk.dit_flow_persistent(self._dit_ops.data_ptr(), self._dit_ops.shape[0], self._dit_tab.data_ptr(),
                                        self._dit_tab.shape[0], self._dit_units.data_ptr(), self.num_steps,

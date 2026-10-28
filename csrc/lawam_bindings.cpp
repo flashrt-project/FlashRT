@@ -146,9 +146,9 @@ PYBIND11_MODULE(flash_rt_lawam, m) {
            uintptr_t scratch, uintptr_t latent, uintptr_t cond_silu, uintptr_t stream) {
             auto f = [&](const char* k) { return ptr<const float>(w[k].cast<uintptr_t>()); };
             L::QFormerWeights q{f("query"), f("norm_q_w"), f("norm_q_b"), f("norm_kv_w"), f("norm_kv_b"),
-                                f("wq"), f("wk"), f("wv"), f("in_bias"), f("wo"), f("bo"), f("ffn_ln_w"),
-                                f("ffn_ln_b"), f("w1"), f("b1"), f("w2"), f("b2"), f("final_w"), f("final_b"),
-                                f("act_w"), f("act_b")};
+                                f("wq_t"), f("wk"), f("wv"), f("in_bias"), f("wo_t"), f("bo"), f("ffn_ln_w"),
+                                f("ffn_ln_b"), f("w1_t"), f("b1"), f("w2_t"), f("b2"), f("final_w"), f("final_b"),
+                                f("act_w_t"), f("act_b")};
             return L::qformer_latent(ptr<const __half>(vlm), ptr<const int>(idx), nq, vdim, code, heads, ctx, q,
                                      ptr<float>(scratch), ptr<float>(latent), ptr<__half>(cond_silu),
                                      to_stream(stream));
@@ -157,7 +157,8 @@ PYBIND11_MODULE(flash_rt_lawam, m) {
         py::arg("ctx"), py::arg("weights"), py::arg("scratch"), py::arg("latent"), py::arg("cond_silu"),
         py::arg("stream") = 0,
         "VLMToLAMQFormer over the act-query rows idx of the FP16 VLM states; writes the FP32 latent and "
-        "silu(action_in_proj(latent)) FP16. `weights` maps names to FP32 device pointers.");
+        "silu(action_in_proj(latent)) FP16. `weights` maps names to FP32 device pointers (the head "
+        "projections wq_t / wo_t / w1_t / w2_t / act_w_t transposed to [in, out]).");
 
     m.def("action_encode",
         [](uintptr_t x, uintptr_t w1, uintptr_t b1, uintptr_t out, int rows, int n, int h, uintptr_t stream) {
@@ -373,14 +374,15 @@ PYBIND11_MODULE(flash_rt_lawam, m) {
 
     m.def("gemv_nvfp4w",
         [](uintptr_t x, uintptr_t w, uintptr_t sf, uintptr_t gs, uintptr_t bias, uintptr_t out, int N, int K,
-           uintptr_t stream) {
+           uintptr_t stream, int max_ctas) {
             return L::gemv_nvfp4w(ptr<const __half>(x), ptr<const uint8_t>(w), ptr<const uint8_t>(sf),
                                   ptr<const float>(gs), ptr<const __half>(bias), ptr<__half>(out), N, K,
-                                  to_stream(stream));
+                                  to_stream(stream), max_ctas);
         },
         py::arg("x"), py::arg("w"), py::arg("sf"), py::arg("gs"), py::arg("bias"), py::arg("out"), py::arg("N"),
-        py::arg("K"), py::arg("stream") = 0,
-        "out[N] = NVFP4 weights (E2M1 pairs, UE4M3 per-16 block scales, FP32 global scale) @ x[K] + bias.");
+        py::arg("K"), py::arg("stream") = 0, py::arg("max_ctas") = 0,
+        "out[N] = NVFP4 weights (E2M1 pairs, UE4M3 per-16 block scales, FP32 global scale) @ x[K] + bias; "
+        "max_ctas > 0 caps the grid.");
 
     m.def("w4a16_skinny_config_count", &L::w4a16_skinny_config_count);
     m.def("w4a16_skinny_config_k_chunk", &L::w4a16_skinny_config_k_chunk, py::arg("cfg"));

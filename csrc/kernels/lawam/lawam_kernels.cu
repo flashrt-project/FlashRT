@@ -266,36 +266,66 @@ __global__ void cast_kernel(const __half* __restrict__ in, __nv_bfloat16* __rest
 
 // ── VLM -> latent action QFormer ──
 
-// K / V projections of the normalized act-query rows: one CTA per row.
+// K / V projections of the normalized act-query rows. One warp per act row,
+// kQfOutsPerCta outputs per CTA. Lane l owns columns l + 32 k, and the row
+// statistics and dot products are summed in the order of a 256-thread CTA per
+// row (thread t: columns t + 256 j, then the two-level warp / CTA tree).
+constexpr int kQfVdim = 2048, kQfOutsPerCta = 2;
+
 __global__ void __launch_bounds__(256)
-qformer_kv_kernel(const __half* __restrict__ vlm, const int* __restrict__ idx, int vdim, int code,
-                  QFormerWeights w, float* __restrict__ kv) {
-    extern __shared__ float row[];
-    __shared__ float red[32];
-    const __half* src = vlm + static_cast<size_t>(idx[blockIdx.x]) * vdim;
-    float s = 0.f;
-    for (int c = threadIdx.x; c < vdim; c += blockDim.x) {
-        const float v = __half2float(src[c]);
-        row[c] = v;
-        s += v;
+qformer_kv_kernel(const __half* __restrict__ vlm, const int* __restrict__ idx, int nq, int code, QFormerWeights w,
+                  float* __restrict__ kv) {
+    constexpr int V = kQfVdim, PER = V / 32;
+    const int lane = threadIdx.x & 31, r = threadIdx.x >> 5;
+    if (r >= nq) return;
+    const __half* src = vlm + static_cast<size_t>(idx[r]) * V;
+    float x[PER];
+#pragma unroll
+    for (int k = 0; k < PER; ++k) x[k] = __half2float(src[lane + 32 * k]);
+    // reduction of the 256-thread form: thread (warp g, lane l) sums columns l + 32 g + 256 j
+    auto tree = [&](const float* part) {
+        float red = 0.f;
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            const float t = warp_sum(part[g]);
+            if (lane == g) red = t;
+        }
+        return warp_sum(red);
+    };
+    float part[8];
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+        float s = 0.f;
+#pragma unroll
+        for (int j = 0; j < PER / 8; ++j) s += x[g + 8 * j];
+        part[g] = s;
     }
-    const float mean = block_sum(s, red) / vdim;
-    float ss = 0.f;
-    for (int c = threadIdx.x; c < vdim; c += blockDim.x) {
-        const float d = row[c] - mean;
-        ss += d * d;
+    const float mean = tree(part) / V;
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+        float ss = 0.f;
+#pragma unroll
+        for (int j = 0; j < PER / 8; ++j) {
+            const float d = x[g + 8 * j] - mean;
+            ss += d * d;
+        }
+        part[g] = ss;
     }
-    const float inv = rsqrtf(block_sum(ss, red) / vdim + 1e-5f);
-    for (int c = threadIdx.x; c < vdim; c += blockDim.x)
-        row[c] = (row[c] - mean) * inv * w.norm_kv_w[c] + w.norm_kv_b[c];
-    __syncthreads();
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
-    for (int o = warp; o < 2 * code; o += nw) {
-        const float* wr = (o < code ? w.wk + static_cast<size_t>(o) * vdim : w.wv + static_cast<size_t>(o - code) * vdim);
+    const float inv = rsqrtf(tree(part) / V + 1e-5f);
+#pragma unroll
+    for (int k = 0; k < PER; ++k) {
+        const int c = lane + 32 * k;
+        x[k] = (x[k] - mean) * inv * w.norm_kv_w[c] + w.norm_kv_b[c];
+    }
+    for (int i = 0; i < kQfOutsPerCta; ++i) {
+        const int o = blockIdx.x * kQfOutsPerCta + i;
+        if (o >= 2 * code) break;
+        const float* wr = (o < code ? w.wk + static_cast<size_t>(o) * V : w.wv + static_cast<size_t>(o - code) * V);
         float acc = 0.f;
-        for (int c = lane; c < vdim; c += 32) acc += wr[c] * row[c];
+#pragma unroll
+        for (int k = 0; k < PER; ++k) acc += wr[lane + 32 * k] * x[k];
         acc = warp_sum(acc);
-        if (lane == 0) kv[blockIdx.x * 2 * code + o] = acc + w.in_bias[code + o];
+        if (lane == 0) kv[r * 2 * code + o] = acc + w.in_bias[code + o];
     }
 }
 
@@ -309,7 +339,8 @@ __device__ float small_layer_norm(const float* x, int i, int n, const float* g, 
 }
 
 // Query path, attention over the act rows, FFN, final norm and the LAM
-// conditioning projection: one CTA.
+// conditioning projection: one CTA, one thread per output of each projection
+// (transposed weights: the threads of a warp read consecutive addresses).
 __global__ void __launch_bounds__(1024)
 qformer_head_kernel(const float* __restrict__ kv, int nq, int code, int heads, int ctx, QFormerWeights w,
                     float* __restrict__ latent, __half* __restrict__ cond_silu) {
@@ -323,7 +354,7 @@ qformer_head_kernel(const float* __restrict__ kv, int nq, int code, int heads, i
     __syncthreads();
     if (t < code) {
         float acc = w.in_bias[t];
-        for (int c = 0; c < code; ++c) acc += w.wq[t * code + c] * qn[c];
+        for (int c = 0; c < code; ++c) acc += w.wq_t[c * code + t] * qn[c];
         q[t] = acc * rsqrtf(static_cast<float>(hd));
     }
     __syncthreads();
@@ -356,7 +387,7 @@ qformer_head_kernel(const float* __restrict__ kv, int nq, int code, int heads, i
     __syncthreads();
     if (t < code) {
         float acc = w.bo[t];
-        for (int c = 0; c < code; ++c) acc += w.wo[t * code + c] * o[c];
+        for (int c = 0; c < code; ++c) acc += w.wo_t[c * code + t] * o[c];
         h[t] = w.query[t] + acc;   // queries + attention
     }
     __syncthreads();
@@ -366,13 +397,13 @@ qformer_head_kernel(const float* __restrict__ kv, int nq, int code, int heads, i
     const int hid = 4 * code;
     if (t < hid) {
         float acc = w.b1[t];
-        for (int c = 0; c < code; ++c) acc += w.w1[t * code + c] * qn[c];
+        for (int c = 0; c < code; ++c) acc += w.w1_t[c * hid + t] * qn[c];
         f[t] = gelu_erf(acc);
     }
     __syncthreads();
     if (t < code) {
         float acc = w.b2[t];
-        for (int c = 0; c < hid; ++c) acc += w.w2[t * hid + c] * f[c];
+        for (int c = 0; c < hid; ++c) acc += w.w2_t[c * code + t] * f[c];
         h[t] += acc;
     }
     __syncthreads();
@@ -384,7 +415,7 @@ qformer_head_kernel(const float* __restrict__ kv, int nq, int code, int heads, i
     __syncthreads();
     for (int j = t; j < ctx; j += blockDim.x) {
         float acc = w.act_b[j];
-        for (int c = 0; c < code; ++c) acc += w.act_w[j * code + c] * qn[c];
+        for (int c = 0; c < code; ++c) acc += w.act_w_t[c * ctx + j] * qn[c];
         cond_silu[j] = __float2half(silu(acc));
     }
 }
@@ -650,10 +681,11 @@ int cast_f16_bf16(const __half* in, __nv_bfloat16* out, int n, cudaStream_t stre
 
 int qformer_latent(const __half* vlm, const int* idx, int nq, int vdim, int code, int heads, int ctx,
                    const QFormerWeights& w, float* scratch, float* latent, __half* cond_silu, cudaStream_t stream) {
-    if (nq < 1 || nq > 8 || code > 64 || code % heads != 0 || 4 * code > 256 || vdim % 8 != 0)
+    if (nq < 1 || nq > 8 || code > 64 || code % heads != 0 || 4 * code > 256 || vdim != kQfVdim)
         return static_cast<int>(cudaErrorInvalidValue);
-    qformer_kv_kernel<<<nq, 256, vdim * sizeof(float), stream>>>(vlm, idx, vdim, code, w, scratch);
-    qformer_head_kernel<<<1, 256, 0, stream>>>(scratch, nq, code, heads, ctx, w, latent, cond_silu);
+    qformer_kv_kernel<<<(2 * code + kQfOutsPerCta - 1) / kQfOutsPerCta, 256, 0, stream>>>(vlm, idx, nq, code, w,
+                                                                                        scratch);
+    qformer_head_kernel<<<1, 1024, 0, stream>>>(scratch, nq, code, heads, ctx, w, latent, cond_silu);
     return last_error();
 }
 
@@ -678,7 +710,7 @@ int gemv_i8w(const __half* x, const int8_t* w, const float* w_scale, const __hal
 }
 
 int gemv_nvfp4w(const __half* x, const uint8_t* w, const uint8_t* sf, const float* gs, const __half* bias,
-                __half* out, int N, int K, cudaStream_t stream) {
+                __half* out, int N, int K, cudaStream_t stream, int max_ctas) {
     if (N < 1 || K != kNvfp4GemvK || x == nullptr || w == nullptr || sf == nullptr || gs == nullptr ||
         out == nullptr)
         return static_cast<int>(cudaErrorInvalidValue);
@@ -686,7 +718,13 @@ int gemv_nvfp4w(const __half* x, const uint8_t* w, const uint8_t* sf, const floa
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
     const int rows_per_cta = 8 * kNvfp4GemvRows;
-    const int blocks = std::min((N + rows_per_cta - 1) / rows_per_cta, sms * 8);
+    int blocks = std::min((N + rows_per_cta - 1) / rows_per_cta, sms * 8);
+    if (max_ctas > 0) blocks = std::min(blocks, max_ctas);
+    // the shared-memory carveout of the GEMMs this GEMV runs next to: an SM configured for
+    // less shared memory cannot take their CTAs until it drains
+    static const cudaError_t carve = cudaFuncSetAttribute(
+        gemv_nvfp4w_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+    if (carve != cudaSuccess) return static_cast<int>(carve);
     gemv_nvfp4w_kernel<<<blocks, 256, 0, stream>>>(x, w, sf, gs, bias, out, N);
     return last_error();
 }

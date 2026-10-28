@@ -485,25 +485,51 @@ def dino_forward(gemm, fvk, lk, fa2, B, W, *, stream=0, prec="fp8", out_prec="fp
 # LAM decoder: 12 AdaLN blocks conditioned on the predicted latent action
 # ─────────────────────────────────────────────────────────────────────────
 
-def lam_decoder_forward(gemm, fvk, lk, fa2, B, W, *, stream=0, prec="fp8"):
+LAM_BLOCKS, LAM_MOD_ROWS = 12, 6 * 1024   # AdaLN modulation rows per block (shift / scale / gate x 2)
+
+
+def lam_modulation(gemm, lk, B, W, b0, b1, *, stream=0, max_ctas=0):
+    """AdaLN modulation rows of LAM blocks [b0, b1): GEMV of silu(c)
+    (B["cond_silu"], from qformer_latent). Every row is computed the same way
+    whatever the range, so the blocks can be split over launches; the FP16
+    weight path runs all blocks at b0 == 0. ``max_ctas`` caps the NVFP4 GEMV's
+    grid (a background launch next to the LAM blocks)."""
+    st, D, r0, n = int(stream), 1024, b0 * LAM_MOD_ROWS, (b1 - b0) * LAM_MOD_ROWS
+    mods = B["mods"] + r0 * 2
+    if "mod_w4" in W:
+        _ck(lk.gemv_nvfp4w(B["cond_silu"], W["mod_w4"] + r0 * D // 2, W["mod_sf"] + r0 * D // 16, W["mod_gs"],
+                           W["mod_b"] + r0 * 2, mods, n, D, st, max_ctas), "lam adaln gemv")
+    elif "mod_w8" in W:
+        _ck(lk.gemv_i8w(B["cond_silu"], W["mod_w8"] + r0 * D, W["mod_ws"] + r0 * 4, W["mod_b"] + r0 * 2, mods, n, D,
+                        st), "lam adaln gemv")
+    elif b0 == 0:
+        gemm.fp16_nn_bias(B["cond_silu"], W["mod_w"], B["mods"], W["mod_b"], 1, LAM_BLOCKS * LAM_MOD_ROWS, D, st)
+
+
+def lam_input_forward(gemm, B, W, *, stream=0, prec="fp8"):
+    """project_input of the DINOv3 latents (B["x"]; the positional table and
+    its bias are added by the first block's norm). Frame-only: it can run on
+    the DINOv3 branch."""
+    _mm(gemm, prec, B["ht8"], B["ht16"], W, "pin", B["x"], 256, 1024, 768, int(stream))
+
+
+def lam_decoder_forward(gemm, fvk, lk, fa2, B, W, *, stream=0, prec="fp8", inputs=True, before_block=None):
     """h_t1 = last_ln(project_output(blocks(project_input(h_t) + pos, c))) into
-    B["img_kv_in"][256:] (BF16). The AdaLN modulation of all 12 blocks is one
-    GEMV of silu(c) (B["cond_silu"], from qformer_latent)."""
+    B["img_kv_in"][256:] (BF16). ``inputs=False``: the caller ran
+    lam_modulation and lam_input_forward (``before_block(li)`` orders block li
+    after its modulation rows)."""
     T, D, NH, HD, FF = 256, 1024, 16, 64, 4096
     st = int(stream)
     x, x8, qkv = B["x"], B["x8"], B["qkv"]
     Q, K, V, O, lse = B["Q"], B["K"], B["V"], B["O"], B["lse"]
     o_out, fc1, f16, mods = B["o_out"], B["fc1"], B["f16"], B["mods"]
-    if "mod_w4" in W:
-        _ck(lk.gemv_nvfp4w(B["cond_silu"], W["mod_w4"], W["mod_sf"], W["mod_gs"], W["mod_b"], mods, 12 * 6 * D, D,
-                           st), "lam adaln gemv")
-    elif "mod_w8" in W:
-        _ck(lk.gemv_i8w(B["cond_silu"], W["mod_w8"], W["mod_ws"], W["mod_b"], mods, 12 * 6 * D, D, st), "lam adaln gemv")
-    else:
-        gemm.fp16_nn_bias(B["cond_silu"], W["mod_w"], mods, W["mod_b"], 1, 12 * 6 * D, D, st)
-    _mm(gemm, prec, B["ht8"], B["ht16"], W, "pin", x, T, D, 768, st)
+    if inputs:
+        lam_modulation(gemm, lk, B, W, 0, LAM_BLOCKS, stream=st)
+        lam_input_forward(gemm, B, W, stream=st, prec=prec)
     pend = (0, 0, 0, W["pos_b"])   # delta, bias, gate, delta2
-    for li in range(12):
+    for li in range(LAM_BLOCKS):
+        if before_block is not None:
+            before_block(li)
         L = W["layers"][li]
         m = mods + li * 6 * D * 2
         shift_msa, scale_msa, gate_msa = m, m + 2 * D, m + 4 * D
@@ -547,6 +573,13 @@ KV_TILE = 1               # lawam.gemm_f16acc_bf16out tile (128 x 256)
 def flow_condition_forward(gemm, fvk, lk, B, W, dims, *, stream=0, prec="fp8"):
     """enc_vlm (FP8 GEMM + LayerNorm) of the VLM states, then the K / V of the
     four text and four image cross blocks (BF16 [rows, KV_LD])."""
+    flow_condition_text(gemm, lk, B, W, dims, stream=stream, prec=prec)
+    flow_condition_img(gemm, lk, B, W, 0, 512, stream=stream)
+
+
+def flow_condition_text(gemm, lk, B, W, dims, *, stream=0, prec="fp8"):
+    """enc_vlm of the VLM states and the K / V of the four text cross blocks
+    (depends on the VLM only)."""
     S = int(dims["S"])
     st = int(stream)
     _mm(gemm, prec, B["vlm8"], B["vlm"], W, "enc", B["enc_out"], S, 768, 2048, st)
@@ -557,13 +590,24 @@ def flow_condition_forward(gemm, fvk, lk, B, W, dims, *, stream=0, prec="fp8"):
                                    0, 0, 0, B["cond16"], 0, S, 768, st), "enc_vlm ln")
         _ck(lk.gemm_f16acc_bf16out(B["cond16"], W["kv_text_w16"], B["kv_text"], W["kv_text_b"], S, KV_LD, 768,
                                    KV_TILE, st), "kv text")
-        _ck(lk.gemm_f16acc_bf16out(B["img16"], W["kv_img_w16"], B["kv_img"], W["kv_img_b"], 512, KV_LD, 768,
-                                   KV_TILE, st), "kv img")
         return
     _ck(lk.gated_residual_norm(B["enc_out"], 0, W["enc_b"], 0, 0, 0, EPS_LN, W["enc_ln_w"], W["enc_ln_b"], 0, 0, 0,
                                0, 0, B["cond_vlm"], S, 768, st), "enc_vlm ln")
     gemm.bf16_nt_bias(B["cond_vlm"], W["kv_text_w"], B["kv_text"], W["kv_text_b"], S, KV_LD, 768, st)
-    gemm.bf16_nt_bias(B["img_kv_in"], W["kv_img_w"], B["kv_img"], W["kv_img_b"], 512, KV_LD, 768, st)
+
+
+def flow_condition_img(gemm, lk, B, W, r0, r1, *, stream=0):
+    """K / V of the four image cross blocks for image tokens [r0, r1) (0..255
+    DINOv3 latents, 256..511 the LAM prediction). The FP16-accumulate GEMM
+    computes every row the same way for any row range (whole 128-row tiles);
+    the BF16 path runs all 512 rows at once only."""
+    st = int(stream)
+    if "kv_text_w16" in W:
+        assert r0 % 128 == 0 and r1 % 128 == 0
+        _ck(lk.gemm_f16acc_bf16out(B["img16"] + r0 * 768 * 2, W["kv_img_w16"], B["kv_img"] + r0 * KV_LD * 2,
+                                   W["kv_img_b"], r1 - r0, KV_LD, 768, KV_TILE, st), "kv img")
+    elif (r0, r1) == (0, 512):
+        gemm.bf16_nt_bias(B["img_kv_in"], W["kv_img_w"], B["kv_img"], W["kv_img_b"], 512, KV_LD, 768, st)
 
 
 def _skinny(fvk, a, a_sf, site, part, rows, n, k, cfg, pdl, st, what, *, bf16_act=False, one=0):
