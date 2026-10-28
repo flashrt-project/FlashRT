@@ -286,8 +286,8 @@ def merger_forward(gemm, fvk, lk, B, M, x, rows_in, dim_in, post_norm, out, st, 
 def _site_prec(prec, fp8_sites, cal):
     """Per-GEMM-site precision: sites in ``fp8_sites`` run static FP8 ("cal"
     while calibrating) inside a 16-bit stage."""
-    def sp(name):
-        if name in fp8_sites:
+    def sp(name, layer=None):
+        if name in fp8_sites or (layer is not None and f"{name}@{layer}" in fp8_sites):
             return "cal" if cal else "fp8"
         return prec
     return sp
@@ -313,6 +313,7 @@ def qwen_vit_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8", fp
     pend = (W["pos"], 0)
     for li in range(24):
         L = W["layers"][li]
+        p_qkv, p_o, p_fc1, p_fc2 = sp("qkv", li), sp("o", li), sp("fc1", li), sp("fc2", li)
         _norm8(fvk, h, pend[0], pend[1], 0, L["n1_w"], L["n1_b"], 0, EPS_VIT, x8, L["a_qkv"], S, D, st, p_qkv, f16)
         if p_qkv == "f16acc" and p_o == "f16acc" and VIT_ROPE_INPLACE:
             # bias in the GEMM epilogue, RoPE in place on Q | K, attention reads Q / K / V through strides
@@ -375,11 +376,12 @@ def qwen_llm_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8", nu
     p_qkv, p_o, p_gu, p_dn = sp("qkv"), sp("o"), sp("gateup"), sp("down")
     # BF16 attention operands (the reference rounding) with the output cast to
     # FP16 for a 16-bit o projection, or FP16 operands end to end ("fp16")
-    f16_attn = p_o in _F16 and attn_dtype == "fp16"
-    attn = fa2.fwd_fp16_causal if f16_attn else fa2.fwd_bf16_causal
     pend, pend2 = 0, 0
     for li in range(16):
         L = W["layers"][li]
+        p_qkv, p_o, p_gu, p_dn = sp("qkv", li), sp("o", li), sp("gateup", li), sp("down", li)
+        f16_attn = p_o in _F16 and attn_dtype == "fp16"
+        attn = fa2.fwd_fp16_causal if f16_attn else fa2.fwd_bf16_causal
         _norm8(fvk, h, pend, 0, pend2, L["in_ln_w"], 0, 1, EPS_LLM, x8, L["a_qkv"], S, D, st, p_qkv, f16)
         _mm(gemm, p_qkv, x8, f16, L, "qkv", qkv, S, NQKV, D, st)
         _ck(fvk.fp8_qkv_split(qkv, qkv + 2 * NHQ * HD, qkv + 2 * (NHQ + NHKV) * HD, NQKV, 0, 0, 0, 1.0, 1.0,

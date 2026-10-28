@@ -103,6 +103,23 @@ def _ck(rc, what):
         raise RuntimeError(f"LaWAM {what} failed (status {rc})")
 
 
+def _expand_sites(sites) -> set:
+    """FP8 site tokens: "name" (every layer), "name@i" or "name@a-b" (those layers)."""
+    out = set()
+    for tok in sites:
+        name, _, rng = str(tok).partition("@")
+        if not rng:
+            out.add(name)
+            continue
+        lo, _, hi = rng.partition("-")
+        out.update(f"{name}@{i}" for i in range(int(lo), int(hi or lo) + 1))
+    return out
+
+
+def _site_on(sites, name, layer) -> bool:
+    return name in sites or (layer is not None and f"{name}@{layer}" in sites)
+
+
 class LawamTorchFrontendRtx:
     """LaWAM inference on RTX SM120 (one CUDA graph per prompt)."""
 
@@ -155,7 +172,9 @@ class LawamTorchFrontendRtx:
         self.precision.update(precision or {})
         # GEMM sites of a 16-bit tower that run static FP8 instead
         # (vit: qkv / o / fc1 / fc2, llm: qkv / o / gateup / down)
-        self.fp8_sites = {k: frozenset(v) for k, v in (fp8_sites or {}).items()}
+        # (a site may be limited to layers: "site@3" or "site@0-7"; expanded to "site@<layer>")
+        self.fp8_sites = {k: frozenset(_expand_sites(v)) for k, v in (fp8_sites or {}).items()}
+        self._layer = None
         self.num_sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         ckpt = pathlib.Path(self.checkpoint_path)
         self.config = json.loads((ckpt / "config.json").read_text())
@@ -239,7 +258,7 @@ class LawamTorchFrontendRtx:
         FP8 [K, N] + weight scale, or FP16 [K, N] ("fp16" stages). ``block``
         sites may be listed in ``fp8_sites``."""
         sites = self.fp8_sites.get(self._stage, ()) if block else ()
-        fp8_site = name in sites or (name in ("gate", "up") and "gateup" in sites)
+        fp8_site = any(_site_on(sites, n, self._layer) for n in ((name, "gateup") if name in ("gate", "up") else (name,)))
         if self.precision[self._stage] in ("fp16", "f16acc") and not fp8_site:
             L[name + "_w16"] = self._h(w_nk.to(self.device, _F32).t())
         else:
@@ -314,6 +333,7 @@ class LawamTorchFrontendRtx:
         self.vit = {"patch_w": self._h(pe.t()), "patch_b": self._h(g(V + "patch_embed.proj.bias")), "layers": []}
         self._vit_pos_table = g(V + "pos_embed.weight").float()
         for li in range(24):
+            self._layer = li
             b = V + f"blocks.{li}."
             L = {"n1_w": self._h(g(b + "norm1.weight")), "n1_b": self._h(g(b + "norm1.bias")),
                  "n2_w": self._h(g(b + "norm2.weight")), "n2_b": self._h(g(b + "norm2.bias")),
@@ -345,6 +365,7 @@ class LawamTorchFrontendRtx:
         T = "vlm.model.language_model."
         self.llm = {"layers": [], "norm_w": self._h(g(T + "norm.weight")), "a_enc": self._slot("enc_vlm")}
         for li in range(16):
+            self._layer = li
             b = T + f"layers.{li}."
             L = {"in_ln_w": self._h(g(b + "input_layernorm.weight")),
                  "post_ln_w": self._h(g(b + "post_attention_layernorm.weight")),
@@ -355,7 +376,7 @@ class LawamTorchFrontendRtx:
             self._lin(L, "o", g(b + "self_attn.o_proj.weight"))
             # gate and up share their input; FP8 keeps separate weight scales,
             # the 16-bit path runs them as one [K, 2 FF] GEMM
-            if self.precision["llm"] in ("fp16", "f16acc") and "gateup" not in self.fp8_sites.get("llm", ()):
+            if self.precision["llm"] in ("fp16", "f16acc") and not _site_on(self.fp8_sites.get("llm", ()), "gateup", li):
                 gu = torch.cat([g(b + "mlp.gate_proj.weight"), g(b + "mlp.up_proj.weight")], 0)
                 if self.precision["llm"] == "f16acc" and P.swiglu_interleaved(gu.shape[0] // 2, gu.shape[1]):
                     # the persistent GEMM's SwiGLU epilogue reads 8-column gate / up blocks
