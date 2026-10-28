@@ -1011,16 +1011,30 @@ __device__ void ln_phase(const DitOp& op, const Smem& sm, int ncta) {
 // ─────────────────────────────────────────────────────────────────────────
 __device__ __forceinline__ float silu(float x) { return x / (1.0f + expf(-x)); }
 
-__device__ void ae_phase(const DitOp& op, int ncta) {
+template <int N>
+__device__ __forceinline__ float ae_dot(const float* xr, const float* w1, int j, int n, float acc) {
+    if (N > 0) {
+#pragma unroll
+        for (int k = 0; k < N; ++k) acc += xr[k] * w1[k * 1024 + j];
+    } else {
+        for (int k = 0; k < n; ++k) acc += xr[k] * w1[k * 1024 + j];
+    }
+    return acc;
+}
+
+__device__ void ae_phase(const DitOp& op, const Smem& sm, int ncta) {
     const float* x = reinterpret_cast<const float*>(op.p[0]);
     const float* w1 = reinterpret_cast<const float*>(op.p[1]);
     const float* b1 = reinterpret_cast<const float*>(op.p[2]);
     __nv_bfloat16* out = reinterpret_cast<__nv_bfloat16*>(op.p[3]);
     const int rows = op.i[DIT_I_N], n = op.i[DIT_I_K], hdim = 1024;
+    // x (other CTAs' Euler update, L2) staged once per CTA (aliases the A operand, free between ops)
+    float* xs = reinterpret_cast<float*>(sm.abuf());
+    for (int i = threadIdx.x; i < rows * n; i += kConsumers) xs[i] = __ldcg(x + i);
+    consumer_sync();
     for (int i = blockIdx.x * kConsumers + threadIdx.x; i < rows * hdim; i += ncta * kConsumers) {
         const int r = i / hdim, j = i % hdim;
-        float acc = b1[j];
-        for (int k = 0; k < n; ++k) acc += __ldcg(x + r * n + k) * w1[k * hdim + j];   // x: other CTAs' Euler update
+        const float acc = n == 32 ? ae_dot<32>(xs + r * n, w1, j, n, b1[j]) : ae_dot<0>(xs + r * n, w1, j, n, b1[j]);
         reinterpret_cast<__half*>(out)[i] = __float2half_rn(bfr(silu(acc)));   // FP16 operand of the BF16-rounded value
     }
 }
@@ -1111,7 +1125,7 @@ dit_flow_kernel(const DitOp* __restrict__ ops, int n_ops, const int* __restrict_
         switch (op.i[DIT_I_KIND]) {
             case OP_GEMM: gemm_phase(op, sm, ucount, astage); break;
             case OP_ATTN: attn_phase(op, sm); break;
-            case OP_AE: ae_phase(op, ncta); break;
+            case OP_AE: ae_phase(op, sm, ncta); break;
             case OP_KVT: kvt_phase(op, sm, ncta); break;
             case OP_LN: ln_phase(op, sm, ncta); break;
             default:
