@@ -253,12 +253,12 @@ def _attn(fa2, fvk, Q, K, V, O, lse, out8, scale, *, batch, seq, heads, hd, st, 
               k_strides=in_strides, v_strides=in_strides, o_strides=strides, softmax_scale=hd ** -0.5, num_sms=0,
               stream=st)
     if prec in _F16:
-        fa2.fwd_fp16(**kw)
+        fa2.lawam_fwd_fp16(**kw)
     elif prec == "cal":
-        fa2.fwd_bf16(**kw)
+        fa2.lawam_fwd_bf16(**kw)
         fvk.quantize_fp8_device(O, out8, scale, batch * seq * ld, st)
     else:
-        fa2.fwd_bf16_fp8out(**kw, O_fp8=out8, o_fp8_scale=scale, o_fp8_strides=strides, skip_bf16_output=True)
+        fa2.lawam_fwd_bf16_fp8out(**kw, O_fp8=out8, o_fp8_scale=scale, o_fp8_strides=strides, skip_bf16_output=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -400,7 +400,7 @@ def qwen_llm_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8", nu
         L = W["layers"][li]
         p_qkv, p_o, p_gu, p_dn = sp("qkv", li), sp("o", li), sp("gateup", li), sp("down", li)
         f16_attn = p_o in _F16 and attn_dtype == "fp16"
-        attn = fa2.fwd_fp16_causal if f16_attn else fa2.fwd_bf16_causal
+        attn = fa2.lawam_fwd_fp16_causal if f16_attn else fa2.lawam_fwd_bf16_causal
         _norm8(fvk, h, pend, 0, pend2, L["in_ln_w"], 0, 1, EPS_LLM, x8, L["a_qkv"], S, D, st, p_qkv, f16)
         _mm(gemm, p_qkv, x8, f16, L, "qkv", qkv, S, NQKV, D, st)
         _ck(fvk.fp8_qkv_split(qkv, qkv + 2 * NHQ * HD, qkv + 2 * (NHQ + NHKV) * HD, NQKV, 0, 0, 0, 1.0, 1.0,
@@ -842,6 +842,18 @@ def _run_order(U, warps=7):
     return [s0 + r for r in range(q + (1 if a else 0)) for s0, n in runs if r < n]
 
 
+def validate_dit_num_ctas(num_ctas):
+    # 24 rows / two-row residual scratch, four-way K splits, and a
+    # 64-owner warp reduction define the supported persistent-grid profile.
+    if not isinstance(num_ctas, int) or isinstance(num_ctas, bool) or not 24 <= num_ctas <= 64 or num_ctas % 4:
+        raise ValueError("LaWAM persistent DiT needs 24..64 CTAs in multiples of 4")
+    return num_ctas
+
+
+def select_dit_num_ctas(num_sms):
+    return validate_dit_num_ctas(min(int(num_sms), 64) // 4 * 4)
+
+
 def pack_dit_persistent(torch, W, num_ctas, device):
     """Pack the step-invariant DiT GEMM sites for the persistent flow kernel.
 
@@ -851,6 +863,7 @@ def pack_dit_persistent(torch, W, num_ctas, device):
     site to site; each CTA's units are laid out in consumption order (site,
     k chunk, tile[, k half]). Returns (stream [num_ctas, units, 2304] uint8,
     site table int32 [sites, num_ctas, 4], units per CTA int32 [num_ctas])."""
+    validate_dit_num_ctas(num_ctas)
     sites = dit_sites(W)
     per_cta = [[] for _ in range(num_ctas)]
     count = [0] * num_ctas

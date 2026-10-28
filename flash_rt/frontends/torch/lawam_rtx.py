@@ -147,6 +147,8 @@ class LawamTorchFrontendRtx:
     def __init__(self, checkpoint_path: str, *, processor_path: str | None = None, device: str = "cuda:0",
                  num_views: int = 2, dit_cfg: dict | None = None, calibration_dir: str | None = None,
                  precision: dict | None = None, fp8_sites: dict | None = None):
+        if int(num_views) != 2:
+            raise ValueError("the LaWAM checkpoint is trained on one primary + one wrist view")
         # Check the model extension first: it is the one a default build is
         # most likely to be missing, and the message names the build flag.
         try:
@@ -157,6 +159,12 @@ class LawamTorchFrontendRtx:
         _check_lawam_symbols(lk)
         import flash_rt.flash_rt_kernels as fvk
         from flash_rt import flash_rt_fa2 as fa2
+        required_fa2 = ("lawam_fwd_fp16", "lawam_fwd_bf16", "lawam_fwd_bf16_fp8out",
+                        "lawam_fwd_fp16_causal", "lawam_fwd_bf16_causal")
+        missing = [name for name in required_fa2 if not hasattr(fa2, name)]
+        if missing:
+            raise RuntimeError(f"flash_rt_fa2 is missing {missing}; rebuild with "
+                               "-DGPU_ARCH=120 -DFLASHRT_ENABLE_LAWAM=ON")
         self.fvk, self.fa2, self.lk = fvk, fa2, lk
         self.gemm = fvk.GemmRunner()
         self.device = torch.device(device)
@@ -184,8 +192,6 @@ class LawamTorchFrontendRtx:
         self._ds_side = True
         self.checkpoint_path = str(checkpoint_path)
         self.num_views = int(num_views)
-        if self.num_views != 2:
-            raise ValueError("the LaWAM checkpoint is trained on one primary + one wrist view")
         self.dit_cfg = dict(DIT_SKINNY_CFG if dit_cfg is None else dit_cfg)
         # Per-stage GEMM precision. Towers: "f16acc" (FP16 with FP16
         # accumulation), "fp16" (FP32 accumulation) or "fp8" (static per-tensor,
@@ -212,13 +218,15 @@ class LawamTorchFrontendRtx:
         # (vit: qkv / o / fc1 / fc2, llm: qkv / o / gateup / down)
         # (a site may be limited to layers: "site@3" or "site@0-7"; expanded to "site@<layer>")
         self.fp8_sites = {k: frozenset(_expand_sites(v)) for k, v in (fp8_sites or {}).items()}
-        if self.precision.get("llm_attn", "fp16") == "fp16" and not hasattr(self.fa2, "fwd_fp16_causal"):
+        if self.precision.get("llm_attn", "fp16") == "fp16" and not hasattr(self.fa2, "lawam_fwd_fp16_causal"):
             raise RuntimeError(
-                "LaWAM needs flash_rt_fa2.fwd_fp16_causal (head_dim 128, fp16): "
+                "LaWAM needs flash_rt_fa2.lawam_fwd_fp16_causal (head_dim 128, fp16): "
                 "rebuild flash_rt_fa2 with 128 in -DFA2_HDIMS and fp16 in "
                 "-DFA2_DTYPES, or pass precision={'llm_attn': 'bf16'}")
         self._layer = None
         self.num_sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        self.dit_num_ctas = (P.select_dit_num_ctas(self.num_sms)
+                             if self.precision["dit_impl"] == "persistent" else self.num_sms)
         ckpt = pathlib.Path(self.checkpoint_path)
         self.config = json.loads((ckpt / "config.json").read_text())
         cfg = self.config
@@ -255,7 +263,7 @@ class LawamTorchFrontendRtx:
             if (self.horizon != 24 or self.precision["dit"] != "w8a16" or self.precision.get("dit_ffn") != "w4a16"
                     or self.precision.get("dit_qkv") != "w4a16"):
                 raise ValueError("the persistent flow kernel runs the 24-row W8A16 / W4A16 DiT tier")
-            stream, tab, units = P.pack_dit_persistent(torch, self.dit_w, self.num_sms, self.device)
+            stream, tab, units = P.pack_dit_persistent(torch, self.dit_w, self.dit_num_ctas, self.device)
             self._dit_stream = stream
             self._dit_tab = torch.from_numpy(tab).to(self.device)
             self._dit_units = torch.from_numpy(units).to(self.device)
@@ -351,6 +359,9 @@ class LawamTorchFrontendRtx:
     def _load_weights(self) -> None:
         from safetensors import safe_open
         path = os.path.join(self.checkpoint_path, "model.safetensors")
+        if self._uses_fp8():
+            from flash_rt.models.lawam.cache_identity import file_sha256
+            self._weight_fingerprint = file_sha256(path)
         with torch.no_grad(), safe_open(path, framework="pt", device=str(self.device)) as st:
             self._st = st
             self._load_qwen()
@@ -808,7 +819,7 @@ class LawamTorchFrontendRtx:
                       "vt_img": b(4, 1024, 512, dtype=_BF16, zero=True), "actions": B["actions"],
                       "counter": b(4, dtype=torch.int32, zero=True),
                       "part": b(P.DIT_KSPLIT_FC2, rows, 1024, dtype=_F32),
-                      "rowstat": b(self.num_sms, rows, 2, dtype=_F32), "num_ctas": self.num_sms,
+                      "rowstat": b(self.dit_num_ctas, rows, 2, dtype=_F32), "num_ctas": self.dit_num_ctas,
                       "h2": b(rows, 1024, dtype=_BF16),
                       "xa": b(rows, 1024, dtype=_FP16)})
             ops = P.dit_persistent_ops(self.dit_w, self.tables, D, {"S": S, "spad": spad}, num_steps=self.num_steps,
@@ -900,7 +911,7 @@ class LawamTorchFrontendRtx:
             _ck(lk.dit_flow_persistent(self._dit_ops.data_ptr(), self._dit_ops.shape[0], self._dit_tab.data_ptr(),
                                        self._dit_tab.shape[0], self._dit_units.data_ptr(), self.num_steps,
                                        self._dit_stream.data_ptr(), self._dit_stream.stride(0), D["counter"],
-                                       self.num_sms, st, False), "flow (persistent)")
+                                       self.dit_num_ctas, st, False), "flow (persistent)")
         else:
             dims = {"rows": self.horizon, "S": self.Se, "dt": 1.0 / self.num_steps}
             for s in range(self.num_steps):
@@ -932,23 +943,29 @@ class LawamTorchFrontendRtx:
         self.graph, self._graph_rng, self._graph_stream = graphs[True], graphs[False], stream
 
     # ── calibration ─────────────────────────────────────────────────
+    def _uses_fp8(self):
+        return any(v == "fp8" for v in self.precision.values()) or any(self.fp8_sites.values())
+
     def _calibration_path(self) -> pathlib.Path:
-        """Cache key: the weight file's head + size, the checkpoint / processor
-        configs, the precision policy, the FP8 sites and the device capability."""
-        h = hashlib.sha256()
-        p = os.path.join(self.checkpoint_path, "model.safetensors")
-        with open(p, "rb") as f:
-            h.update(f.read(1 << 16))
-        h.update(str(os.path.getsize(p)).encode())
-        for name in ("config.json", "policy_preprocessor.json"):
-            q = os.path.join(self.checkpoint_path, name)
-            if os.path.exists(q):
-                h.update(open(q, "rb").read())
-        h.update(str(self.processor_path).encode())
-        h.update(json.dumps(self.precision, sort_keys=True).encode())
-        h.update(json.dumps({k: sorted(v) for k, v in self.fp8_sites.items()}, sort_keys=True).encode())
-        h.update(str(torch.cuda.get_device_capability(self.device)).encode())
-        return self.calibration_dir / f"{h.hexdigest()[:16]}_lawam.json"
+        """Versioned content identity of the actual checkpoint and processor."""
+        from flash_rt.models.lawam.cache_identity import file_sha256, processor_sha256
+        ckpt = pathlib.Path(self.checkpoint_path)
+        weights = getattr(self, "_weight_fingerprint", None)
+        if weights is None:
+            weights = file_sha256(ckpt / "model.safetensors")
+        if not hasattr(self, "_processor"):
+            raise RuntimeError("LaWAM processor must be loaded before calibration cache lookup")
+        identity = {
+            "schema": 2, "weights": weights,
+            "processor": processor_sha256(self._processor),
+            "configs": {name: file_sha256(ckpt/name) if (ckpt/name).is_file() else None
+                        for name in ("config.json", "policy_preprocessor.json")},
+            "precision": self.precision,
+            "sites": {k: sorted(v) for k, v in self.fp8_sites.items()},
+            "capability": torch.cuda.get_device_capability(self.device),
+        }
+        digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+        return self.calibration_dir / f"{digest}_lawam_v2.json"
 
     def _load_calibration(self) -> None:
         if self.calibrated:

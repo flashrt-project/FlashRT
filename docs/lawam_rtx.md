@@ -121,7 +121,7 @@ temporal patch copies are folded into the Qwen3-VL patch-embedding weight.
 
 The flow loop is latency bound (every GEMM has 24 rows), so
 `lawam.dit_flow_persistent` runs it as one persistent cooperative kernel (one
-CTA per SM) over an op table built by `pipeline_rtx.dit_persistent_ops`: grid
+CTA per selected SM, 24–64 CTAs in multiples of four) over an op table built by `pipeline_rtx.dit_persistent_ops`: grid
 barriers separate dependent ops, the step's weights (packed at load time by
 `pipeline_rtx.pack_dit_persistent` into the kernel's fragment order, per CTA in
 consumption order) stream into a shared-memory ring that every MMA warp refills
@@ -133,6 +133,13 @@ two residual buffers: the phase reads whole old rows). `precision={"dit_impl": "
 selects the per-kernel chain (`pipeline_rtx.dit_step_forward`: skinny W4A16 /
 W8A16 GEMMs with FP32 accumulation, `nvfp4_skinny_partials_attention`,
 `lawam.dit_cross_attention`, the `lawam.dit_*` consumers).
+
+The persistent grid uses `min(SM count, 64)` rounded down to a multiple of four.
+The 36-SM configuration is unchanged; a 170-SM GPU uses 64 CTAs. Packing and
+the native launch reject unsupported counts, and the launch checks cooperative
+residency. The current LayerNorm owner reduction supports at most 64 owners.
+LaWAM uses dedicated `lawam_fwd_*` FA2 entries for short-tile tuning; the
+existing FA2 entries retain their original dispatch even in a LaWAM build.
 
 Besides the DINOv3 branch, the graph moves work that is off the critical path
 onto side branches: the GEMMs of the three DeepStack mergers (DRAM bound, read
@@ -163,11 +170,12 @@ SwiGLU epilogue; its weight is stored with gate and up interleaved in blocks of 
 columns (`pipeline_rtx.interleave_gate_up`).
 `flash_rt.models.lawam.pipeline_rtx.F16ACC_SPLIT = "timed"` times
 every shape, `"cublas"` (set before the graph is captured) uses the split of the cuBLASLt
-`COMPUTE_16F` plan instead, so the GEMMs form the same FP16 sums as
-`lawam.gemm_f16acc` (the erf-GELU and SwiGLU epilogues then reproduce the
-separate passes bit for bit, the ViT's tanh-GELU epilogue differs from
-cuBLASLt's by at most one FP16 ulp), and `F16ACC_KERNEL = "cublas"` the cuBLASLt
-plans with stand-alone epilogue kernels.
+`COMPUTE_16F` plan instead. Matching the split does not guarantee identical
+FP16 sums across CUTLASS and cuBLASLt algorithms or GPU configurations. The
+GEMM regression compares both results with an FP32 reference (relative L2
+error below 0.003 and maximum absolute error below 0.04 for its normalized
+random inputs). `F16ACC_KERNEL = "cublas"` uses cuBLASLt plans with stand-alone
+epilogue kernels.
 
 ## Performance
 
@@ -262,9 +270,12 @@ scales, all fixed at load). With an FP8 tier, `calibrate()` runs each
 real observation once with dynamic per-tensor FP8 at every FP8 site, records
 amax / 448 into the site's scale slot, and keeps the 99.9th percentile across
 observations as the static scale. The result is cached under
-`~/.flash_rt/calibration/<sha256[:16]>_lawam.json`, keyed by the weight file
-(head + size), `config.json` / `policy_preprocessor.json`, the processor path,
-the precision policy, `fp8_sites` and the device capability (pass
+`~/.flash_rt/calibration/<sha256>_lawam_v2.json`, keyed by the complete weight
+file SHA-256, `config.json` / `policy_preprocessor.json` contents, the serialized
+loaded processor (including vocabulary, special tokens, image settings and chat
+template), the precision policy, `fp8_sites` and the device capability. Version 2
+does not reuse the earlier partial-file cache. The weight digest is computed
+once when FP8 weights are loaded, outside inference and graph capture (pass
 `calibration_dir=` to move the cache).
 
 ## Limitations

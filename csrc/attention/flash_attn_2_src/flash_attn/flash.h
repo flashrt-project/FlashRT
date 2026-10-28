@@ -178,6 +178,7 @@ struct Flash_fwd_params : public Qkv_params {
     uint64_t * rng_state;
 
     bool is_bf16;
+    bool lawam_short_tiles;  // Explicit model-local tile opt-in; zero for legacy entries.
     bool is_causal;
 
     // If is_seqlens_k_cumulative, then seqlen_k is cu_seqlens_k[bidb + 1] - cu_seqlens_k[bidb].

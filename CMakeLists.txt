@@ -1331,8 +1331,8 @@ if(ENABLE_FA2 AND
   if(FA2_FP16_CAUSAL)
     target_compile_definitions(fa2_vendor_obj PRIVATE FLASHRT_FA2_FP16_CAUSAL=1)
   endif()
-  # LaWAM's short (<= 512 query) SM120 towers select the 64-row tiles. Keep
-  # that dispatch opt-in so other SM120 models keep the upstream tiling.
+  # Compile LaWAM's optional short tiles. Only the dedicated LaWAM entries
+  # set lawam_short_tiles; existing entries keep the upstream dispatch.
   if(FLASHRT_ENABLE_LAWAM)
     target_compile_definitions(fa2_vendor_obj PRIVATE
       FLASHRT_FA2_SM12X_SHORT_TILES=1)

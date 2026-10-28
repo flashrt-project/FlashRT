@@ -248,7 +248,7 @@ static void dispatch_hdim(int head_dim, int num_splits,
 }
 
 
-#define DEFINE_FA2_ENTRY(NAME, ELEM_T, IS_BF16)                                  \
+#define DEFINE_FA2_ENTRY(NAME, ELEM_T, IS_BF16, SHORT_TILES)                                  \
 extern "C" void NAME(                                                            \
     const void* q_ptr, const void* k_ptr, const void* v_ptr,                     \
     void* o_ptr, void* softmax_lse_ptr,                                          \
@@ -271,6 +271,7 @@ extern "C" void NAME(                                                           
                 v_batch_stride, v_row_stride, v_head_stride,                     \
                 o_batch_stride, o_row_stride, o_head_stride,                     \
                 softmax_scale);                                                  \
+    params.lawam_short_tiles = SHORT_TILES;                                  \
     int num_splits = setup_splitkv(params, softmax_lse_accum_ptr, o_accum_ptr,   \
                                     num_sms, seqlen_q, seqlen_k,                 \
                                     head_dim, batch, num_heads_q);               \
@@ -350,18 +351,18 @@ extern "C" void NAME(                                                           
 }
 
 #ifdef FA2_HAS_FP16
-DEFINE_FA2_ENTRY(fvk_attention_fa2_fwd_fp16, cutlass::half_t,    false)
+DEFINE_FA2_ENTRY(fvk_attention_fa2_fwd_fp16, cutlass::half_t, false, false)
 #else
 DEFINE_FA2_STUB(fvk_attention_fa2_fwd_fp16,  "fp16")
 #endif
 
 #ifdef FA2_HAS_BF16
-DEFINE_FA2_ENTRY(fvk_attention_fa2_fwd_bf16, cutlass::bfloat16_t, true)
+DEFINE_FA2_ENTRY(fvk_attention_fa2_fwd_bf16, cutlass::bfloat16_t, true, false)
 
 // FlashRT local patch 4: bf16 full-attention entry that also emits the static-FP8 copy
 // of O. Kept as a separate symbol rather than an extra argument on the existing entry so
 // the published signature of fvk_attention_fa2_fwd_bf16 is untouched.
-extern "C" void fvk_attention_fa2_fwd_bf16_fp8out(
+static void fvk_attention_fa2_fwd_bf16_fp8out_impl(
     const void* q_ptr, const void* k_ptr, const void* v_ptr,
     void* o_ptr, void* softmax_lse_ptr,
     void* softmax_lse_accum_ptr, void* o_accum_ptr,
@@ -374,7 +375,7 @@ extern "C" void fvk_attention_fa2_fwd_bf16_fp8out(
     float softmax_scale, int num_sms, cudaStream_t stream,
     void* o_fp8_ptr, const void* o_fp8_scale_ptr,
     int o_fp8_batch_stride, int o_fp8_row_stride, int o_fp8_head_stride,
-    int o_bf16_skip)
+    int o_bf16_skip, bool short_tiles)
 {
     FLASH_NAMESPACE::Flash_fwd_params params;
     fill_params(params, /*elem_is_bf16=*/true,
@@ -392,11 +393,61 @@ extern "C" void fvk_attention_fa2_fwd_bf16_fp8out(
     params.o_fp8_row_stride = o_fp8_row_stride;
     params.o_fp8_head_stride = o_fp8_head_stride;
     params.o_bf16_skip = (o_bf16_skip != 0) && (o_fp8_ptr != nullptr);
+    params.lawam_short_tiles = short_tiles;
     int num_splits = setup_splitkv(params, softmax_lse_accum_ptr, o_accum_ptr,
                                     num_sms, seqlen_q, seqlen_k,
                                     head_dim, batch, num_heads_q);
     dispatch_hdim<cutlass::bfloat16_t>(head_dim, num_splits, params, stream);
 }
+extern "C" void fvk_attention_fa2_fwd_bf16_fp8out(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr,
+    void* softmax_lse_accum_ptr, void* o_accum_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream,
+    void* o_fp8_ptr, const void* o_fp8_scale_ptr,
+    int o_fp8_batch_stride, int o_fp8_row_stride, int o_fp8_head_stride,
+    int o_bf16_skip)
+{
+    fvk_attention_fa2_fwd_bf16_fp8out_impl(
+        q_ptr, k_ptr, v_ptr, o_ptr, softmax_lse_ptr,
+        softmax_lse_accum_ptr, o_accum_ptr, batch, seqlen_q, seqlen_k,
+        num_heads_q, num_heads_kv, head_dim, q_batch_stride, q_row_stride,
+        q_head_stride, k_batch_stride, k_row_stride, k_head_stride, v_batch_stride,
+        v_row_stride, v_head_stride, o_batch_stride, o_row_stride, o_head_stride,
+        softmax_scale, num_sms, stream, o_fp8_ptr, o_fp8_scale_ptr,
+        o_fp8_batch_stride, o_fp8_row_stride, o_fp8_head_stride, o_bf16_skip, false);
+}
+extern "C" void fvk_attention_fa2_lawam_fwd_bf16_fp8out(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr,
+    void* softmax_lse_accum_ptr, void* o_accum_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream,
+    void* o_fp8_ptr, const void* o_fp8_scale_ptr,
+    int o_fp8_batch_stride, int o_fp8_row_stride, int o_fp8_head_stride,
+    int o_bf16_skip)
+{
+    fvk_attention_fa2_fwd_bf16_fp8out_impl(
+        q_ptr, k_ptr, v_ptr, o_ptr, softmax_lse_ptr,
+        softmax_lse_accum_ptr, o_accum_ptr, batch, seqlen_q, seqlen_k,
+        num_heads_q, num_heads_kv, head_dim, q_batch_stride, q_row_stride,
+        q_head_stride, k_batch_stride, k_row_stride, k_head_stride, v_batch_stride,
+        v_row_stride, v_head_stride, o_batch_stride, o_row_stride, o_head_stride,
+        softmax_scale, num_sms, stream, o_fp8_ptr, o_fp8_scale_ptr,
+        o_fp8_batch_stride, o_fp8_row_stride, o_fp8_head_stride, o_bf16_skip, true);
+}
+
 
 DEFINE_FA2_ENTRY_WINDOW(fvk_attention_fa2_fwd_bf16_window, cutlass::bfloat16_t, true)
 
@@ -845,3 +896,55 @@ extern "C" int fvk_attention_fa2_has_xvla_tile64() {
     return 0;
 #endif
 }
+
+#ifdef FA2_HAS_FP16
+DEFINE_FA2_ENTRY(fvk_attention_fa2_lawam_fwd_fp16, cutlass::half_t, false, true)
+#else
+extern "C" void fvk_attention_fa2_lawam_fwd_fp16(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr,
+    void* softmax_lse_accum_ptr, void* o_accum_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream)
+{ throw std::runtime_error("LaWAM FA2 fp16 entry not compiled"); }
+#endif
+
+#ifdef FA2_HAS_BF16
+DEFINE_FA2_ENTRY(fvk_attention_fa2_lawam_fwd_bf16, cutlass::bfloat16_t, true, true)
+#else
+extern "C" void fvk_attention_fa2_lawam_fwd_bf16(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr,
+    void* softmax_lse_accum_ptr, void* o_accum_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream)
+{ throw std::runtime_error("LaWAM FA2 bf16 entry not compiled"); }
+#endif
+
+#ifndef FA2_HAS_BF16
+extern "C" void fvk_attention_fa2_lawam_fwd_bf16_fp8out(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr,
+    void* softmax_lse_accum_ptr, void* o_accum_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream,
+    void* o_fp8_ptr, const void* o_fp8_scale_ptr,
+    int o_fp8_batch_stride, int o_fp8_row_stride, int o_fp8_head_stride,
+    int o_bf16_skip)
+{ throw std::runtime_error("LaWAM FA2 BF16 FP8-output entry not compiled"); }
+#endif

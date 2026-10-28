@@ -250,7 +250,7 @@ void run_mha_fwd_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
             if (is_sm8x && !Is_causal) {
                 run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
 #if defined(FLASHRT_FA2_SM12X_SHORT_TILES)
-            } else if (cc_major == 12 && !Is_causal && params.seqlen_q <= 512) {
+            } else if (params.lawam_short_tiles && cc_major == 12 && !Is_causal && params.seqlen_q <= 512) {
                 run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 128, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
 #endif
             } else {
@@ -302,7 +302,7 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
                     run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
                 }
 #if defined(FLASHRT_FA2_SM12X_SHORT_TILES)
-            } else if (cc_major == 12 && Is_causal && params.seqlen_q <= 512) {
+            } else if (params.lawam_short_tiles && cc_major == 12 && Is_causal && params.seqlen_q <= 512) {
                 // short causal prefixes on sm12x (LaWAM's Qwen3-VL LLM, ~220 tokens): 64-row tiles
                 // double the CTAs over the same 64-key blocks (bit-identical output)
                 run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);

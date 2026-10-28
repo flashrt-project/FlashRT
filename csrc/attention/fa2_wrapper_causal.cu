@@ -180,7 +180,7 @@ static int setup_splitkv_causal(FLASH_NAMESPACE::Flash_fwd_params& params,
 }
 
 #ifdef FA2_HAS_BF16
-extern "C" void fvk_attention_fa2_fwd_bf16_causal(
+static void fvk_attention_fa2_fwd_bf16_causal_impl(
     const void* q_ptr, const void* k_ptr, const void* v_ptr,
     void* o_ptr, void* softmax_lse_ptr,
     void* softmax_lse_accum_ptr, void* o_accum_ptr,
@@ -190,7 +190,7 @@ extern "C" void fvk_attention_fa2_fwd_bf16_causal(
     int k_batch_stride, int k_row_stride, int k_head_stride,
     int v_batch_stride, int v_row_stride, int v_head_stride,
     int o_batch_stride, int o_row_stride, int o_head_stride,
-    float softmax_scale, int num_sms, cudaStream_t stream)
+    float softmax_scale, int num_sms, cudaStream_t stream, bool short_tiles)
 {
     bool supported = false;
 #if defined(FA2_HAS_BF16) && defined(FA2_HAS_HDIM_128)
@@ -216,6 +216,7 @@ extern "C" void fvk_attention_fa2_fwd_bf16_causal(
                        o_batch_stride, o_row_stride, o_head_stride,
                        softmax_scale);
 
+    params.lawam_short_tiles = short_tiles;
     int num_splits = setup_splitkv_causal(params, softmax_lse_accum_ptr, o_accum_ptr,
                                           num_sms, seqlen_q, seqlen_k,
                                           head_dim, batch, num_heads_q);
@@ -248,6 +249,47 @@ extern "C" void fvk_attention_fa2_fwd_bf16_causal(
                 " not built in this FA2 matrix.");
     }
 }
+extern "C" void fvk_attention_fa2_fwd_bf16_causal(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr,
+    void* softmax_lse_accum_ptr, void* o_accum_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream)
+{
+    fvk_attention_fa2_fwd_bf16_causal_impl(
+        q_ptr, k_ptr, v_ptr, o_ptr, softmax_lse_ptr,
+        softmax_lse_accum_ptr, o_accum_ptr, batch, seqlen_q, seqlen_k,
+        num_heads_q, num_heads_kv, head_dim, q_batch_stride, q_row_stride,
+        q_head_stride, k_batch_stride, k_row_stride, k_head_stride, v_batch_stride,
+        v_row_stride, v_head_stride, o_batch_stride, o_row_stride, o_head_stride,
+        softmax_scale, num_sms, stream, false);
+}
+extern "C" void fvk_attention_fa2_lawam_fwd_bf16_causal(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr,
+    void* softmax_lse_accum_ptr, void* o_accum_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream)
+{
+    fvk_attention_fa2_fwd_bf16_causal_impl(
+        q_ptr, k_ptr, v_ptr, o_ptr, softmax_lse_ptr,
+        softmax_lse_accum_ptr, o_accum_ptr, batch, seqlen_q, seqlen_k,
+        num_heads_q, num_heads_kv, head_dim, q_batch_stride, q_row_stride,
+        q_head_stride, k_batch_stride, k_row_stride, k_head_stride, v_batch_stride,
+        v_row_stride, v_head_stride, o_batch_stride, o_row_stride, o_head_stride,
+        softmax_scale, num_sms, stream, true);
+}
+
 #else  // !FA2_HAS_BF16
 extern "C" void fvk_attention_fa2_fwd_bf16_causal(
     const void*, const void*, const void*, void*, void*,
@@ -334,7 +376,7 @@ extern "C" void fvk_attention_fa2_fwd_bf16_causal_fp8out(
 // on Orin SM87 and the LaWAM Qwen3-VL prefix on SM120 are the consumers; bf16 covers the head_dim=256 shapes
 // used by Qwen3.6 chunked prefill).
 #if defined(FLASHRT_FA2_FP16_CAUSAL) && defined(FA2_HAS_FP16) && defined(FA2_HAS_HDIM_128)
-extern "C" void fvk_attention_fa2_fwd_fp16_causal(
+static void fvk_attention_fa2_fwd_fp16_causal_impl(
     const void* q_ptr, const void* k_ptr, const void* v_ptr,
     void* o_ptr, void* softmax_lse_ptr,
     void* softmax_lse_accum_ptr, void* o_accum_ptr,
@@ -344,7 +386,7 @@ extern "C" void fvk_attention_fa2_fwd_fp16_causal(
     int k_batch_stride, int k_row_stride, int k_head_stride,
     int v_batch_stride, int v_row_stride, int v_head_stride,
     int o_batch_stride, int o_row_stride, int o_head_stride,
-    float softmax_scale, int num_sms, cudaStream_t stream)
+    float softmax_scale, int num_sms, cudaStream_t stream, bool short_tiles)
 {
     if (head_dim != 128) {
         throw std::runtime_error(
@@ -368,6 +410,7 @@ extern "C" void fvk_attention_fa2_fwd_fp16_causal(
     // fill_params_causal hardcodes is_bf16=true; flip it for the fp16 path.
     params.is_bf16 = false;
 
+    params.lawam_short_tiles = short_tiles;
     int num_splits = setup_splitkv_causal(params, softmax_lse_accum_ptr, o_accum_ptr,
                                           num_sms, seqlen_q, seqlen_k,
                                           head_dim, batch, num_heads_q);
@@ -377,4 +420,75 @@ extern "C" void fvk_attention_fa2_fwd_fp16_causal(
         FLASH_NAMESPACE::run_mha_fwd_<cutlass::half_t, 128, true>(params, stream);
     }
 }
+extern "C" void fvk_attention_fa2_fwd_fp16_causal(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr,
+    void* softmax_lse_accum_ptr, void* o_accum_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream)
+{
+    fvk_attention_fa2_fwd_fp16_causal_impl(
+        q_ptr, k_ptr, v_ptr, o_ptr, softmax_lse_ptr,
+        softmax_lse_accum_ptr, o_accum_ptr, batch, seqlen_q, seqlen_k,
+        num_heads_q, num_heads_kv, head_dim, q_batch_stride, q_row_stride,
+        q_head_stride, k_batch_stride, k_row_stride, k_head_stride, v_batch_stride,
+        v_row_stride, v_head_stride, o_batch_stride, o_row_stride, o_head_stride,
+        softmax_scale, num_sms, stream, false);
+}
+extern "C" void fvk_attention_fa2_lawam_fwd_fp16_causal(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr,
+    void* softmax_lse_accum_ptr, void* o_accum_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream)
+{
+    fvk_attention_fa2_fwd_fp16_causal_impl(
+        q_ptr, k_ptr, v_ptr, o_ptr, softmax_lse_ptr,
+        softmax_lse_accum_ptr, o_accum_ptr, batch, seqlen_q, seqlen_k,
+        num_heads_q, num_heads_kv, head_dim, q_batch_stride, q_row_stride,
+        q_head_stride, k_batch_stride, k_row_stride, k_head_stride, v_batch_stride,
+        v_row_stride, v_head_stride, o_batch_stride, o_row_stride, o_head_stride,
+        softmax_scale, num_sms, stream, true);
+}
+
 #endif  // FLASHRT_FA2_FP16_CAUSAL && FA2_HAS_FP16 && FA2_HAS_HDIM_128
+
+#if !defined(FA2_HAS_BF16)
+extern "C" void fvk_attention_fa2_lawam_fwd_bf16_causal(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr,
+    void* softmax_lse_accum_ptr, void* o_accum_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream)
+{ throw std::runtime_error("LaWAM FA2 bf16 causal entry not compiled"); }
+#endif
+
+#if !defined(FLASHRT_FA2_FP16_CAUSAL) || !defined(FA2_HAS_FP16) || !defined(FA2_HAS_HDIM_128)
+extern "C" void fvk_attention_fa2_lawam_fwd_fp16_causal(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr,
+    void* softmax_lse_accum_ptr, void* o_accum_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream)
+{ throw std::runtime_error("LaWAM FA2 fp16 causal entry not compiled"); }
+#endif
