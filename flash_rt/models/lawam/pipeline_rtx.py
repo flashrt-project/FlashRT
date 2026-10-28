@@ -92,6 +92,7 @@ F16ACC_PLANS = {
     (8, 1024, 1024, 0, False): (2, 1),
     (8, 1024, 4096, 0, False): (2, 1),
     (8, 3072, 1024, 0, False): (2, 1),
+    (8, 3072, 1024, 0, True): (2, 1),
     (8, 4096, 1024, 1, True): (5, 1),
     (2, 4096, 4096, 2, True): (3, 1),
     (4, 4096, 1024, 2, True): (6, 1),
@@ -265,6 +266,7 @@ def _attn(fa2, fvk, Q, K, V, O, lse, out8, scale, *, batch, seq, heads, hd, st, 
 # ─────────────────────────────────────────────────────────────────────────
 
 VIT_TAPS = (5, 11, 17)
+VIT_ROPE_INPLACE = True
 
 
 def merger_forward(gemm, fvk, lk, B, M, x, rows_in, dim_in, post_norm, out, st, prec):
@@ -312,11 +314,18 @@ def qwen_vit_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8", fp
     for li in range(24):
         L = W["layers"][li]
         _norm8(fvk, h, pend[0], pend[1], 0, L["n1_w"], L["n1_b"], 0, EPS_VIT, x8, L["a_qkv"], S, D, st, p_qkv, f16)
-        _mm(gemm, p_qkv, x8, f16, L, "qkv", qkv, S, 3 * D, D, st)
-        qb = L["qkv_b"]
-        _ck(lk.qkv_rope_split(qkv, 3 * D, qb, qb + 2 * D, qb + 4 * D, 1.0, 1.0, W["cos"], W["sin"], Q, K,
-                              V, p_o not in _F16, S, NH, NH, HD, st), "vit qkv")
-        _attn(fa2, fvk, Q, K, V, O, lse, x8, L["a_o"], batch=nv, seq=Sper, heads=NH, hd=HD, st=st, prec=p_o)
+        if p_qkv == "f16acc" and p_o == "f16acc" and VIT_ROPE_INPLACE:
+            # bias in the GEMM epilogue, RoPE in place on Q | K, attention reads Q / K / V through strides
+            _f16acc(f16, L["qkv_w16"], qkv, L["qkv_b"], S, 3 * D, D, 0, st)
+            _ck(lk.qk_rope_inplace(qkv, 3 * D, W["cos"], W["sin"], S, 2 * NH, HD, st), "vit rope")
+            _attn(fa2, fvk, qkv, qkv + 2 * D, qkv + 4 * D, O, lse, x8, L["a_o"], batch=nv, seq=Sper, heads=NH, hd=HD,
+                  st=st, prec=p_o, qkv_ld=3 * D)
+        else:
+            _mm(gemm, p_qkv, x8, f16, L, "qkv", qkv, S, 3 * D, D, st)
+            qb = L["qkv_b"]
+            _ck(lk.qkv_rope_split(qkv, 3 * D, qb, qb + 2 * D, qb + 4 * D, 1.0, 1.0, W["cos"], W["sin"], Q, K,
+                                  V, p_o not in _F16, S, NH, NH, HD, st), "vit qkv")
+            _attn(fa2, fvk, Q, K, V, O, lse, x8, L["a_o"], batch=nv, seq=Sper, heads=NH, hd=HD, st=st, prec=p_o)
         _mm(gemm, p_o, x8, O, L, "o", o_out, S, D, D, st)
         _norm8(fvk, h, o_out, L["o_b"], 0, L["n2_w"], L["n2_b"], 0, EPS_VIT, x8, L["a_fc1"], S, D, st, p_fc1, f16)
         if p_fc1 == "f16acc" and p_fc2 == "f16acc":

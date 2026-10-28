@@ -394,6 +394,13 @@ PYBIND11_MODULE(flash_rt_lawam, m) {
         py::arg("cfg"), py::arg("pdl") = true, py::arg("stream") = 0,
         "Skinny W4A16 GEMM (M <= 32): FP32 K-split partials of A (BF16 [M,K]) @ NVFP4 W (E2M1 + UE4M3 block scales)^T.");
 
+    m.def("qk_rope_inplace",
+        [](uintptr_t qkv, int ld, uintptr_t cos, uintptr_t sin, int S, int n_qk, int hd, uintptr_t stream) {
+            return L::qk_rope_inplace(ptr<__half>(qkv), ld, ptr<const __half>(cos), ptr<const __half>(sin), S, n_qk,
+                                      hd, to_stream(stream));
+        },
+        py::arg("qkv"), py::arg("ld"), py::arg("cos"), py::arg("sin"), py::arg("S"), py::arg("n_qk"), py::arg("hd"),
+        py::arg("stream") = 0, "Rotate-half RoPE (head dim 64) in place on the Q | K heads of a fused QKV buffer.");
     m.def("qkv_rope_split",
         [](uintptr_t qkv, int ld, uintptr_t q_bias, uintptr_t k_bias, uintptr_t v_bias, float k_mul, float v_mul,
            uintptr_t cos, uintptr_t sin, uintptr_t q_out, uintptr_t k_out, uintptr_t v_out, bool out_bf16, int S,

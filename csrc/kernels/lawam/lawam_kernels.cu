@@ -691,6 +691,40 @@ int gemv_nvfp4w(const __half* x, const uint8_t* w, const uint8_t* sf, const floa
     return last_error();
 }
 
+// Rotate-half RoPE (head dim 64) in place on the first n_qk heads (Q | K) of a fused [S, ld] QKV
+// buffer whose bias the GEMM epilogue added: attention reads Q / K / V from it through row strides.
+__global__ void __launch_bounds__(256)
+qk_rope_inplace_kernel(__half* __restrict__ qkv, int ld, const __half* __restrict__ cos,
+                       const __half* __restrict__ sin, int n_qk) {
+    constexpr int HD = 64, H2 = 32;
+    const int s = blockIdx.x;
+    const int head = blockIdx.y * 32 + (threadIdx.x >> 3);
+    const int d0 = (threadIdx.x & 7) * 4;
+    if (head >= n_qk) return;
+    __half* p = qkv + static_cast<size_t>(s) * ld + head * HD;
+    float lo[4], hi[4], c[4], sn[4];
+    load4(p + d0, lo);
+    load4(p + d0 + H2, hi);
+    load4(cos + static_cast<size_t>(s) * HD + d0, c);
+    load4(sin + static_cast<size_t>(s) * HD + d0, sn);
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        const float a = lo[e], b = hi[e];
+        lo[e] = fmaf(a, c[e], -__fmul_rn(b, sn[e]));
+        hi[e] = fmaf(b, c[e], __fmul_rn(a, sn[e]));
+    }
+    store4<false>(p, d0, lo);
+    store4<false>(p, d0 + H2, hi);
+}
+
+int qk_rope_inplace(__half* qkv, int ld, const __half* cos, const __half* sin, int S, int n_qk, int hd,
+                    cudaStream_t stream) {
+    if (qkv == nullptr || cos == nullptr || sin == nullptr || S < 1 || hd != 64 || ld % 4 != 0 || n_qk < 1)
+        return static_cast<int>(cudaErrorInvalidValue);
+    qk_rope_inplace_kernel<<<dim3(S, (n_qk + 31) / 32), 256, 0, stream>>>(qkv, ld, cos, sin, n_qk);
+    return last_error();
+}
+
 int qkv_rope_split(const __half* qkv, int ld, const __half* q_bias, const __half* k_bias, const __half* v_bias,
                    float k_mul, float v_mul, const __half* cos, const __half* sin, void* q_out, void* k_out,
                    void* v_out, bool out_bf16, int S, int n_q, int n_k, int hd, cudaStream_t stream) {

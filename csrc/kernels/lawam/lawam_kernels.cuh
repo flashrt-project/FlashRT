@@ -222,6 +222,8 @@ int dit_cross_attention(const float* partials, int splits, const float* a_gs, co
 // Q / K / V of a fused [S, ld] qkv GEMM output (Q | K | V heads of 64):
 // + bias, K / V scale, rotate-half RoPE (cos / sin [S, 64]) on Q and K, into
 // [S, heads, 64] FP16 / BF16 (the FlashRT qkv_split arithmetic without QK norm).
+int qk_rope_inplace(__half* qkv, int ld, const __half* cos, const __half* sin, int S, int n_qk, int hd,
+                    cudaStream_t stream);
 int qkv_rope_split(const __half* qkv, int ld, const __half* q_bias, const __half* k_bias, const __half* v_bias,
                    float k_mul, float v_mul, const __half* cos, const __half* sin, void* q_out, void* k_out,
                    void* v_out, bool out_bf16, int S, int n_q, int n_k, int hd, cudaStream_t stream);
