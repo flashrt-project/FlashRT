@@ -109,6 +109,8 @@ int gemm_f16acc(const __half* A, const __half* B, __half* D, const __half* bias,
 // Plans created after enable=true time the heuristic's non-split-K candidates
 // and keep the fastest (default: the heuristic's first choice).
 void gemm_f16acc_set_autotune(bool enable);
+int gemm_f16acc_bf16out(const __half* A, const __half* B, __nv_bfloat16* D, const __nv_bfloat16* bias, int M, int N,
+                        int K, int tile, cudaStream_t stream);
 
 // D[M, N] (FP32) = A[M, K] @ W[N, K]^T, BF16 operands (W an nn.Linear weight
 // as stored), FP32 accumulation. D is a single-split partial for the DiT

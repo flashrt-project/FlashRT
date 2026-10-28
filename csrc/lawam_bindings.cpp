@@ -153,6 +153,14 @@ PYBIND11_MODULE(flash_rt_lawam, m) {
         py::arg("x"), py::arg("ld"), py::arg("lo"), py::arg("hi"), py::arg("out"), py::arg("rows"),
         py::arg("out_dim"), py::arg("stream") = 0, "MIN_MAX unnormalization of the first out_dim columns.");
 
+    m.def("gemm_f16acc_bf16out",
+        [](uintptr_t A, uintptr_t B, uintptr_t D, uintptr_t bias, int M, int N, int K, int tile, uintptr_t stream) {
+            return L::gemm_f16acc_bf16out(ptr<const __half>(A), ptr<const __half>(B), ptr<__nv_bfloat16>(D),
+                                          ptr<const __nv_bfloat16>(bias), M, N, K, tile, to_stream(stream));
+        },
+        py::arg("A"), py::arg("B"), py::arg("D"), py::arg("bias"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("tile") = 0, py::arg("stream") = 0,
+        "D[M,N] (BF16) = A[M,K] @ B[K,N] (FP16, FP16 accumulation) + bias[N] (BF16).");
     m.def("gemm_f16acc_set_autotune", &L::gemm_f16acc_set_autotune, py::arg("enable"),
         "Time the heuristic's non-split-K candidates for plans created afterwards (default off).");
 

@@ -504,6 +504,10 @@ class LawamTorchFrontendRtx:
                 bs += [blk(li, "attn1.to_k.bias"), blk(li, "attn1.to_v.bias")]
             self.flow[f"kv_{kind}_w"] = self._k(torch.cat(ws, dim=0).to(_BF16))      # [8192, 768]
             self.flow[f"kv_{kind}_b"] = self._k(torch.cat(bs, dim=0).to(_BF16))
+            if self.precision["enc"] == "f16acc" and self.precision["lam"] != "fp8":
+                # FP16 [768, 8192] for the FP16-accumulating projection (BF16 output); its DINOv3
+                # rows are the LAM's FP16 input operand (not written by an FP8 LAM)
+                self.flow[f"kv_{kind}_w16"] = self._h(torch.cat(ws, dim=0).to(self.device, _F32).t())
         W = {"qkv": [], "q": [], "o": [], "ff_up": [], "ff_down": []}
         for li in range(P.LAYERS_DIT):
             if li % 2 == 1:
@@ -685,19 +689,20 @@ class LawamTorchFrontendRtx:
                     "vlm": b(S, 2048), "vlm8": b(S, 2048, dtype=_U8)}
         B["q"] = {"scratch": b(8 * 64, dtype=_F32), "latent": b(32, dtype=_F32), "cond_silu": b(1, 1024)}
         img_kv_in = b(512, 768, dtype=_BF16)
+        img16 = b(512, 768)   # FP16 image tokens: DINOv3 latents (the LAM input) | LAM prediction
         B["dino"] = {"patch": b(256, 768), "h": b(261, 768), "x8": b(261, 3072, dtype=_U8), "qkv": b(261, 2304),
                      "Q": b(261, 768, dtype=_BF16), "K": b(261, 768, dtype=_BF16), "V": b(261, 768, dtype=_BF16),
                      "O": b(261, 768, dtype=_BF16), "lse": b(1, 12, 384, dtype=_F32), "o_out": b(261, 768),
-                     "fc1": b(261, 3072), "f16": b(261 * 3072), "ht8": b(256, 768, dtype=_U8), "ht16": b(256, 768),
+                     "fc1": b(261, 3072), "f16": b(261 * 3072), "ht8": b(256, 768, dtype=_U8), "ht16": img16,
                      "img_kv_in": img_kv_in}
         B["lam"] = {"x": b(256, 1024), "x8": b(256, 4096, dtype=_U8), "qkv": b(256, 3072),
                     "Q": b(256, 1024, dtype=_BF16), "K": b(256, 1024, dtype=_BF16), "V": b(256, 1024, dtype=_BF16),
                     "O": b(256, 1024, dtype=_BF16), "lse": b(1, 16, 256, dtype=_F32), "o_out": b(256, 1024),
                     "fc1": b(256, 4096), "f16": f16, "mods": b(12 * 6144), "ht8": B["dino"]["ht8"],
                     "ht16": B["dino"]["ht16"],
-                    "cond_silu": B["q"]["cond_silu"], "pout": b(256, 768), "img_kv_in": img_kv_in}
+                    "cond_silu": B["q"]["cond_silu"], "pout": b(256, 768), "img_kv_in": img_kv_in, "img16": img16}
         B["flow"] = {"vlm8": B["llm"]["vlm8"], "vlm": B["llm"]["vlm"], "enc_out": b(S, 768), "cond_vlm": b(S, 768, dtype=_BF16),
-                     "img_kv_in": img_kv_in, "kv_text": b(S, P.KV_LD, dtype=_BF16),
+                     "cond16": b(S, 768), "img_kv_in": img_kv_in, "img16": img16, "kv_text": b(S, P.KV_LD, dtype=_BF16),
                      "kv_img": b(512, P.KV_LD, dtype=_BF16)}
         rows = self.horizon
         part_floats = max(k // self.fvk.nvfp4_skinny_config_k_chunk(c) * rows * n

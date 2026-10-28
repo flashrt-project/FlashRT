@@ -508,8 +508,10 @@ def lam_decoder_forward(gemm, fvk, lk, fa2, B, W, *, stream=0, prec="fp8"):
         pend = (o_out, L["fc2_b"], gate_mlp, 0)
     _gnorm8(lk, fvk, x, pend[0], pend[1], pend[2], 0, 2, 0.0, 0, 0, 0, 0, x8, W["a_pout"], T, D, st, prec, f16)
     _mm(gemm, prec, x8, f16, W, "pout", B["pout"], T, 768, D, st)
-    _ck(lk.gated_residual_norm(B["pout"], 0, W["pout_b"], 0, 0, 0, EPS_LN, W["last_w"], W["last_b"], 0, 0, 0, 0, 0,
-                               B["img_kv_in"] + 256 * 768 * 2, T, 768, st), "lam last_ln")
+    # BF16 flow image tokens, and their FP16 copy for the FP16-accumulating K / V projection
+    _ck(lk.gated_residual_norm(B["pout"], 0, W["pout_b"], 0, 0, 0, EPS_LN, W["last_w"], W["last_b"], 0, 0, 0, 0,
+                               B["img16"] + 256 * 768 * 2 if "img16" in B else 0, B["img_kv_in"] + 256 * 768 * 2, T,
+                               768, st), "lam last_ln")
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -518,6 +520,7 @@ def lam_decoder_forward(gemm, fvk, lk, fa2, B, W, *, stream=0, prec="fp8"):
 
 D_DIT, FF_DIT, LAYERS_DIT, HEADS_DIT, HD_DIT = 1024, 4096, 16, 16, 64
 KV_LD = 4 * 2 * D_DIT     # 4 cross blocks per token kind, K | V each
+KV_TILE = 1               # lawam.gemm_f16acc_bf16out tile (128 x 256)
 
 
 def flow_condition_forward(gemm, fvk, lk, B, W, dims, *, stream=0, prec="fp8"):
@@ -526,6 +529,16 @@ def flow_condition_forward(gemm, fvk, lk, B, W, dims, *, stream=0, prec="fp8"):
     S = int(dims["S"])
     st = int(stream)
     _mm(gemm, prec, B["vlm8"], B["vlm"], W, "enc", B["enc_out"], S, 768, 2048, st)
+    if "kv_text_w16" in W:
+        # FP16 operands with FP16 accumulation (the BF16 path accumulates in FP32 at half the
+        # tensor rate on sm_120), BF16 K / V out
+        _ck(lk.gated_residual_norm(B["enc_out"], 0, W["enc_b"], 0, 0, 0, EPS_LN, W["enc_ln_w"], W["enc_ln_b"], 0,
+                                   0, 0, 0, B["cond16"], 0, S, 768, st), "enc_vlm ln")
+        _ck(lk.gemm_f16acc_bf16out(B["cond16"], W["kv_text_w16"], B["kv_text"], W["kv_text_b"], S, KV_LD, 768,
+                                   KV_TILE, st), "kv text")
+        _ck(lk.gemm_f16acc_bf16out(B["img16"], W["kv_img_w16"], B["kv_img"], W["kv_img_b"], 512, KV_LD, 768,
+                                   KV_TILE, st), "kv img")
+        return
     _ck(lk.gated_residual_norm(B["enc_out"], 0, W["enc_b"], 0, 0, 0, EPS_LN, W["enc_ln_w"], W["enc_ln_b"], 0, 0, 0,
                                0, 0, B["cond_vlm"], S, 768, st), "enc_vlm ln")
     gemm.bf16_nt_bias(B["cond_vlm"], W["kv_text_w"], B["kv_text"], W["kv_text_b"], S, KV_LD, 768, st)

@@ -345,7 +345,43 @@ bool args_ok(const __half* A, const __half* B, __half* D, const __half* bias, in
            M >= 1 && N % 8 == 0 && K % 8 == 0;
 }
 
+
+// FP16 operands, FP16 accumulation, BF16 output with a BF16 row bias (the
+// source operand with a zero row stride): the flow head's cross K / V
+// projections, whose consumers read BF16.
+using bf16_t = cutlass::bfloat16_t;
+template <class TB, class Warp, int Stages>
+using GemmBf16Out = cutlass::gemm::device::Gemm<
+    half_t, Row, half_t, Row, bf16_t, Row, half_t, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80, TB, Warp,
+    GemmShape<16, 8, 16>, cutlass::epilogue::thread::LinearCombination<bf16_t, 8, half_t, float, ScaleType::NoBetaScaling>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, Stages, 8, 8>;
+
+template <class G>
+int run_bf16out(const __half* A, const __half* B, __nv_bfloat16* D, const __nv_bfloat16* bias, int M, int N, int K,
+                cudaStream_t stream) {
+    typename G::Arguments args({M, N, K}, {reinterpret_cast<const half_t*>(A), K},
+                               {reinterpret_cast<const half_t*>(B), N}, {reinterpret_cast<const bf16_t*>(bias), 0},
+                               {reinterpret_cast<bf16_t*>(D), N}, {1.0f, 0.0f});
+    G op;
+    if (op.can_implement(args) != cutlass::Status::kSuccess) return static_cast<int>(cudaErrorInvalidValue);
+    if (op.initialize(args, nullptr, stream) != cutlass::Status::kSuccess) return static_cast<int>(cudaErrorUnknown);
+    return op.run(stream) == cutlass::Status::kSuccess ? 0 : static_cast<int>(cudaErrorLaunchFailure);
+}
+
 }  // namespace
+
+int gemm_f16acc_bf16out(const __half* A, const __half* B, __nv_bfloat16* D, const __nv_bfloat16* bias, int M, int N,
+                        int K, int tile, cudaStream_t stream) {
+    if (A == nullptr || B == nullptr || D == nullptr || bias == nullptr || M < 1 || N % 8 != 0 || K % 8 != 0)
+        return static_cast<int>(cudaErrorInvalidValue);
+    switch (tile) {
+        case 0: return run_bf16out<GemmBf16Out<GemmShape<128, 128, 32>, GemmShape<64, 64, 32>, 5>>(A, B, D, bias, M, N, K, stream);
+        case 1: return run_bf16out<GemmBf16Out<GemmShape<128, 256, 32>, GemmShape<64, 64, 32>, 3>>(A, B, D, bias, M, N, K, stream);
+        case 2: return run_bf16out<GemmBf16Out<GemmShape<64, 256, 32>, GemmShape<32, 64, 32>, 4>>(A, B, D, bias, M, N, K, stream);
+        case 3: return run_bf16out<GemmBf16Out<GemmShape<128, 128, 64>, GemmShape<64, 64, 64>, 3>>(A, B, D, bias, M, N, K, stream);
+        default: return static_cast<int>(cudaErrorInvalidValue);
+    }
+}
 
 int gemm_f16acc_act(const __half* A, const __half* B, __half* D, const __half* bias, int M, int N, int K, int act,
                     int split, cudaStream_t stream) {
