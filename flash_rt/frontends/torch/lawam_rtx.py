@@ -734,6 +734,7 @@ class LawamTorchFrontendRtx:
                       "counter": b(4, dtype=torch.int32, zero=True),
                       "part": b(P.DIT_KSPLIT_FC2, rows, 1024, dtype=_F32),
                       "rowstat": b(self.num_sms, rows, 2, dtype=_F32), "num_ctas": self.num_sms,
+                      "h2": b(rows, 1024, dtype=_BF16),
                       "xa": b(rows, 1024, dtype=_FP16)})
             ops = P.dit_persistent_ops(self.dit_w, self.tables, D, {"S": S, "spad": spad}, num_steps=self.num_steps,
                                        lo=self._act_lo, hi=self._act_hi, action_dim=self.action_dim)

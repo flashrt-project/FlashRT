@@ -803,6 +803,9 @@ def dit_persistent_ops(W, T, B, dims, *, num_steps, lo, hi, action_dim):
     # owners of the residual columns (row statistics partials) after the previous residual update,
     # or the K-split GEMM site whose partials are still to be added into the residual
     owners = {"n": 0, "pending": None}
+    # the residual stream alternates between h and h2: the K-split residual update of an LN phase
+    # reads whole old rows while other CTAs write their new segments
+    hb_ = {"cur": B["h"], "alt": B["h2"]}
 
     def gemm(si, site, wtype, N, K, amode, ep, abuf, out0, *, eps=0.0, sc=0, sh=0, pos=0, out1=0, out2=0, dt=0.0):
         if amode == _A_LN:
@@ -810,9 +813,11 @@ def dit_persistent_ops(W, T, B, dims, *, num_steps, lo, hi, action_dim):
             pend = owners["pending"]
             if pend is not None:
                 assert "w4" in pend[1], "the deferred K-split residual update expects an NVFP4 site"
+                assert abuf == hb_["cur"]
                 op(_OP_LN, 1, {_I_KSPLIT: dit_site_ksplit(pend[0])}, {_F_EPS: eps},
-                   {_P_LNSC: sc, _P_LNSH: sh, _P_POS: pos, _P_OUT0: B["xa"], _P_OUT1: abuf, _P_PART: B["part"],
-                    _P_GS: pend[1]["gs"], _P_BIAS: pend[1]["b"]})
+                   {_P_LNSC: sc, _P_LNSH: sh, _P_POS: pos, _P_OUT0: B["xa"], _P_OUT1: abuf, _P_OUT2: hb_["alt"],
+                    _P_PART: B["part"], _P_GS: pend[1]["gs"], _P_BIAS: pend[1]["b"]})
+                hb_["cur"], hb_["alt"] = hb_["alt"], hb_["cur"]
                 owners["pending"] = None
             else:
                 op(_OP_LN, 1, {_I_OWNERS: owners["n"]}, {_F_EPS: eps},
@@ -840,17 +845,17 @@ def dit_persistent_ops(W, T, B, dims, *, num_steps, lo, hi, action_dim):
     wt = lambda s: 0 if "w4" in s else 1   # noqa: E731
     for s in range(num_steps):
         op(_OP_AE, 1, {_I_N: 24, _I_K: 32}, p={0: B["x"], 1: W["ae_w1"], 2: W["ae_b1"], 3: B["ae"]})
-        gemm(0, sites[0], 1, D, D, _A_BUF, _EP_RESID_INIT, B["ae"], B["h"])
+        gemm(0, sites[0], 1, D, D, _A_BUF, _EP_RESID_INIT, B["ae"], hb_["cur"])
         for li in range(LAYERS_DIT):
             si = 1 + 4 * li
             ln = dict(eps=EPS_LN, sc=T["scale"][s][li], sh=T["shift"][s][li], pos=T["pos"])
             if li % 2 == 1:
-                gemm(si, sites[si], wt(sites[si]), 3 * D, D, _A_LN, _EP_QKV, B["h"], B["Qs"], out1=B["Ks"],
+                gemm(si, sites[si], wt(sites[si]), 3 * D, D, _A_LN, _EP_QKV, hb_["cur"], B["Qs"], out1=B["Ks"],
                      out2=B["Vts"], **ln)
                 op(_OP_ATTN, 1, {_I_KVLEN: 24, _I_KLD: 1024, _I_VTLD: 32},
                    p={_P_Q: B["Qs"], _P_K: B["Ks"], _P_VT: B["Vts"], _P_OUT0: B["O"]})
             else:
-                gemm(si, sites[si], wt(sites[si]), D, D, _A_LN, _EP_Q, B["h"], B["Qs"], **ln)
+                gemm(si, sites[si], wt(sites[si]), D, D, _A_LN, _EP_Q, hb_["cur"], B["Qs"], **ln)
                 g = li // 4
                 if li % 4 == 0:
                     op(_OP_ATTN, 1, {_I_KVLEN: S, _I_KLD: KV_LD, _I_VTLD: spad},
@@ -860,10 +865,10 @@ def dit_persistent_ops(W, T, B, dims, *, num_steps, lo, hi, action_dim):
                     op(_OP_ATTN, 1, {_I_KVLEN: 512, _I_KLD: KV_LD, _I_VTLD: 512},
                        p={_P_Q: B["Qs"], _P_K: kvi + g * 2 * D * 2, _P_VT: B["vt_img"] + g * D * 512 * 2,
                           _P_OUT0: B["O"]})
-            gemm(si + 1, sites[si + 1], wt(sites[si + 1]), D, D, _A_BUF, _EP_RESID, B["O"], B["h"])
-            gemm(si + 2, sites[si + 2], wt(sites[si + 2]), FF_DIT, D, _A_LN, _EP_GELU, B["h"], B["hb"], eps=EPS_LN)
-            gemm(si + 3, sites[si + 3], wt(sites[si + 3]), D, FF_DIT, _A_BUF, _EP_RESID, B["hb"], B["h"])
-        gemm(65, sites[65], wt(sites[65]), D, D, _A_LN, _EP_RELU, B["h"], B["hb"], eps=1e-6,
+            gemm(si + 1, sites[si + 1], wt(sites[si + 1]), D, D, _A_BUF, _EP_RESID, B["O"], hb_["cur"])
+            gemm(si + 2, sites[si + 2], wt(sites[si + 2]), FF_DIT, D, _A_LN, _EP_GELU, hb_["cur"], B["hb"], eps=EPS_LN)
+            gemm(si + 3, sites[si + 3], wt(sites[si + 3]), D, FF_DIT, _A_BUF, _EP_RESID, B["hb"], hb_["cur"])
+        gemm(65, sites[65], wt(sites[65]), D, D, _A_LN, _EP_RELU, hb_["cur"], B["hb"], eps=1e-6,
              sc=T["out_scale"][s], sh=T["out_shift"][s])
         gemm(66, sites[66], wt(sites[66]), 32, D, _A_BUF, _EP_EULER, B["hb"], B["x"], dt=1.0 / num_steps)
     op(_OP_UNNORM, 0, {_I_N: 24, _I_K: 32, _I_KVLEN: action_dim}, p={0: B["x"], 1: lo, 2: hi, 3: B["actions"]})

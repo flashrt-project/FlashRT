@@ -207,9 +207,16 @@ struct Smem {
     __device__ __forceinline__ DitOp* opbuf() const { return reinterpret_cast<DitOp*>(g_dyn + kOffOps); }
 };
 
-// Wait for ring unit r (filled by the producer warp).
+// Fill index (unit / kSlots) the producer last issued into each ring slot.
+__shared__ unsigned s_issued[kSlots];
+
+// Wait for ring unit r (filled by the producer warp). Its fill must have been issued before the
+// phase parity identifies it: a warp may reach unit r while the slot's previous unit is in flight.
 __device__ __forceinline__ void wait_unit(const Smem& sm, unsigned r) {
-    mbar_wait(&sm.full()[r % kSlots], (r / kSlots) & 1);
+    const unsigned slot = r % kSlots, k = r / kSlots;
+    while (*reinterpret_cast<volatile unsigned*>(&s_issued[slot]) < k) {
+    }
+    mbar_wait(&sm.full()[slot], k & 1);
 }
 
 // Tile range of a GEMM site for this CTA: first 16-column tile, tile count,
@@ -802,8 +809,9 @@ __device__ __noinline__ void attn_phase(const DitOp& op, const Smem& sm) {
 // ─────────────────────────────────────────────────────────────────────────
 // With a pending K-split residual update (i[KSPLIT] = k groups): the CTA
 // first rebuilds the full new residual rows of its range in shared memory,
-// h = bf16(h + bf16(bf16(alpha * sum_k part[k]) + bias)), two-pass statistics
-// over them, and writes back only its own segments of h.
+// h' = bf16(h + bf16(bf16(alpha * sum_k part[k]) + bias)), two-pass statistics
+// over them, and writes its own segments of h' into the other residual buffer
+// (p[OUT2]; the residual stream alternates between two buffers).
 __device__ void ln_resid_phase(const DitOp& op, const Smem& sm, int ncta) {
     constexpr int kSegs = kRows * 128;
     const int per = (kSegs + ncta - 1) / ncta;
@@ -811,7 +819,10 @@ __device__ void ln_resid_phase(const DitOp& op, const Smem& sm, int ncta) {
     if (s0 >= s1) return;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int ks = op.i[DIT_I_KSPLIT];
-    __nv_bfloat16* h = reinterpret_cast<__nv_bfloat16*>(op.p[DIT_P_OUT1]);
+    // old residual rows (read whole, also the segments other CTAs update in this phase) and the
+    // buffer receiving the new residual: never the same, so the rebuilt rows do not race
+    const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(op.p[DIT_P_OUT1]);
+    __nv_bfloat16* h_new = reinterpret_cast<__nv_bfloat16*>(op.p[DIT_P_OUT2]);
     const float* part = reinterpret_cast<const float*>(op.p[DIT_P_PART]);
     // NVFP4 site: global scale, times the 2^12 prescale of the FP16-accumulating MMA
     const float alpha = *reinterpret_cast<const float*>(op.p[DIT_P_GS]) * 4096.0f;
@@ -885,7 +896,7 @@ __device__ void ln_resid_phase(const DitOp& op, const Smem& sm, int ncta) {
         }
         o[e] = bf2h(f2bf(n0, n1));
     }
-    *reinterpret_cast<uint4*>(h + row * 1024 + col) = make_uint4(hn[0], hn[1], hn[2], hn[3]);
+    *reinterpret_cast<uint4*>(h_new + row * 1024 + col) = make_uint4(hn[0], hn[1], hn[2], hn[3]);
     *reinterpret_cast<uint4*>(reinterpret_cast<__half*>(op.p[DIT_P_OUT0]) + row * 1024 + col) =
         make_uint4(o[0], o[1], o[2], o[3]);
 }
@@ -973,7 +984,7 @@ __device__ void ae_phase(const DitOp& op, int ncta) {
     for (int i = blockIdx.x * kConsumers + threadIdx.x; i < rows * hdim; i += ncta * kConsumers) {
         const int r = i / hdim, j = i % hdim;
         float acc = b1[j];
-        for (int k = 0; k < n; ++k) acc += x[r * n + k] * w1[k * hdim + j];
+        for (int k = 0; k < n; ++k) acc += __ldcg(x + r * n + k) * w1[k * hdim + j];   // x: other CTAs' Euler update
         reinterpret_cast<__half*>(out)[i] = __float2half_rn(bfr(silu(acc)));   // FP16 operand of the BF16-rounded value
     }
 }
@@ -1040,6 +1051,7 @@ dit_flow_kernel(const DitOp* __restrict__ ops, int n_ops, const int* __restrict_
         for (int i = 0; i < kSlots; ++i) {
             mbar_init(&sm.full()[i], 1);
             mbar_init(&sm.empty()[i], 1);
+            s_issued[i] = 0;
         }
         for (int i = 0; i < kAChunks; ++i) mbar_init(&sm.achunk()[i], kConsumers);
         asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
@@ -1060,6 +1072,7 @@ dit_flow_kernel(const DitOp* __restrict__ ops, int n_ops, const int* __restrict_
                 mbar_expect_tx(&sm.full()[slot], kUnit);
                 bulk_g2s(sm.ring() + slot * kUnit, base + static_cast<size_t>(u % per) * kUnit, kUnit,
                          &sm.full()[slot], policy);
+                *reinterpret_cast<volatile unsigned*>(&s_issued[slot]) = u / kSlots;
             }
         }
         return;
