@@ -82,6 +82,7 @@ F16ACC_PLANS = {
     (4, 2048, 2048, 0, False): (0, 1),
     (4, 2048, 6144, 0, False): (8, 1),
     (4, 3072, 1024, 0, False): (3, 1),
+    (4, 3072, 1024, 0, True): (3, 1),
     (4, 4096, 2048, 0, False): (5, 1),
     (5, 768, 768, 0, False): (1, 1),
     (5, 768, 3072, 0, False): (1, 1),
@@ -236,15 +237,17 @@ def _mm(gemm, prec, x8, x16, L, name, out, M, N, K, st):
         gemm.fp8_descale_fp16(x8, L[name + "_w"], out, M, N, K, L["a_" + name], L[name + "_ws"], st)
 
 
-def _attn(fa2, fvk, Q, K, V, O, lse, out8, scale, *, batch, seq, heads, hd, st, prec):
+def _attn(fa2, fvk, Q, K, V, O, lse, out8, scale, *, batch, seq, heads, hd, st, prec, qkv_ld=0):
     """Non-causal self-attention over [batch, seq, heads, hd] operands written
-    by fp8_qkv_split (BF16, FP16 in "fp16"); O -> the o-projection operand:
+    by fp8_qkv_split (BF16, FP16 in "fp16"), or read in place from a fused
+    [seq, qkv_ld] QKV GEMM output (``qkv_ld``); O -> the o-projection operand:
     FP8 (fused FA2 epilogue / dynamic quantize) or FP16 in O itself."""
     ld = heads * hd
     strides = (seq * ld, ld, hd)
+    in_strides = (seq * qkv_ld, qkv_ld, hd) if qkv_ld else strides
     kw = dict(Q=Q, K=K, V=V, O=O, softmax_lse=lse, softmax_lse_accum=0, o_accum=0, batch=batch, seqlen_q=seq,
-              seqlen_k=seq, num_heads_q=heads, num_heads_kv=heads, head_dim=hd, q_strides=strides,
-              k_strides=strides, v_strides=strides, o_strides=strides, softmax_scale=hd ** -0.5, num_sms=0,
+              seqlen_k=seq, num_heads_q=heads, num_heads_kv=heads, head_dim=hd, q_strides=in_strides,
+              k_strides=in_strides, v_strides=in_strides, o_strides=strides, softmax_scale=hd ** -0.5, num_sms=0,
               stream=st)
     if prec in _F16:
         fa2.fwd_fp16(**kw)
@@ -486,11 +489,17 @@ def lam_decoder_forward(gemm, fvk, lk, fa2, B, W, *, stream=0, prec="fp8"):
         shift_mlp, scale_mlp, gate_mlp = m + 6 * D, m + 8 * D, m + 10 * D
         _gnorm8(lk, fvk, x, pend[0], pend[1], pend[2], pend[3], 0, EPS_LAM, 0, 0, scale_msa, shift_msa, x8,
                 L["a_qkv"], T, D, st, prec, f16)
-        _mm(gemm, prec, x8, f16, L, "qkv", qkv, T, 3 * D, D, st)
-        qb = L["qkv_b"]
-        _ck(lk.qkv_rope_split(qkv, 3 * D, qb, qb + 2 * D, qb + 4 * D, 1.0, 1.0, 0, 0, Q, K,
-                              V, prec not in _F16, T, NH, NH, HD, st), "lam qkv")
-        _attn(fa2, fvk, Q, K, V, O, lse, x8, L["a_o"], batch=1, seq=T, heads=NH, hd=HD, st=st, prec=prec)
+        if prec == "f16acc":
+            # bias in the GEMM epilogue (the same FP16 rounding as the split); attention reads Q / K / V in place
+            _f16acc(f16, L["qkv_w16"], qkv, L["qkv_b"], T, 3 * D, D, 0, st)
+            _attn(fa2, fvk, qkv, qkv + 2 * D, qkv + 4 * D, O, lse, x8, L["a_o"], batch=1, seq=T, heads=NH, hd=HD,
+                  st=st, prec=prec, qkv_ld=3 * D)
+        else:
+            _mm(gemm, prec, x8, f16, L, "qkv", qkv, T, 3 * D, D, st)
+            qb = L["qkv_b"]
+            _ck(lk.qkv_rope_split(qkv, 3 * D, qb, qb + 2 * D, qb + 4 * D, 1.0, 1.0, 0, 0, Q, K,
+                                  V, prec not in _F16, T, NH, NH, HD, st), "lam qkv")
+            _attn(fa2, fvk, Q, K, V, O, lse, x8, L["a_o"], batch=1, seq=T, heads=NH, hd=HD, st=st, prec=prec)
         _mm(gemm, prec, x8, O, L, "o", o_out, T, D, D, st)
         _gnorm8(lk, fvk, x, o_out, L["o_b"], gate_msa, 0, 0, EPS_LAM, 0, 0, scale_mlp, shift_mlp, x8, L["a_fc1"],
                 T, D, st, prec, f16)
