@@ -121,7 +121,7 @@ temporal patch copies are folded into the Qwen3-VL patch-embedding weight.
 
 The flow loop is latency bound (every GEMM has 24 rows), so
 `lawam.dit_flow_persistent` runs it as one persistent cooperative kernel (one
-CTA per selected SM, 24–64 CTAs in multiples of four) over an op table built by `pipeline_rtx.dit_persistent_ops`: grid
+CTA per selected SM, 32–64 CTAs in multiples of four) over an op table built by `pipeline_rtx.dit_persistent_ops`: grid
 barriers separate dependent ops, the step's weights (packed at load time by
 `pipeline_rtx.pack_dit_persistent` into the kernel's fragment order, per CTA in
 consumption order) stream into a shared-memory ring that every MMA warp refills
@@ -137,7 +137,8 @@ W8A16 GEMMs with FP32 accumulation, `nvfp4_skinny_partials_attention`,
 The persistent grid uses `min(SM count, 64)` rounded down to a multiple of four.
 The 36-SM configuration is unchanged; a 170-SM GPU uses 64 CTAs. Packing and
 the native launch reject unsupported counts, and the launch checks cooperative
-residency. The current LayerNorm owner reduction supports at most 64 owners.
+residency. Attention requires 32 CTAs to cover all 16 heads and both query tiles;
+the LayerNorm owner reduction supports at most 64 owners.
 LaWAM uses dedicated `lawam_fwd_*` FA2 entries for short-tile tuning; the
 existing FA2 entries retain their original dispatch even in a LaWAM build.
 

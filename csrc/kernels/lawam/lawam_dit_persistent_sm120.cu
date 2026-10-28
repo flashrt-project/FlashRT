@@ -1179,7 +1179,7 @@ int dit_flow_persistent(const DitOp* ops, int n_ops, const int* site_tab, int n_
                         int n_steps, const uint8_t* stream, long long cta_stride, unsigned* counter, int num_ctas,
                         cudaStream_t st, bool reset_counter) {
     if (ops == nullptr || site_tab == nullptr || stream == nullptr || counter == nullptr || cta_units == nullptr || n_ops < 1 || n_steps < 1 ||
-        num_ctas < 24 || num_ctas > 64 || num_ctas % 4 != 0 || cta_stride <= 0 ||
+        num_ctas < 32 || num_ctas > 64 || num_ctas % 4 != 0 || cta_stride <= 0 ||
         cta_stride % 16 != 0 || n_sites < 1 || n_sites > kMaxSites)
         return static_cast<int>(cudaErrorInvalidValue);
     static bool opted = false;

@@ -843,10 +843,10 @@ def _run_order(U, warps=7):
 
 
 def validate_dit_num_ctas(num_ctas):
-    # 24 rows / two-row residual scratch, four-way K splits, and a
-    # 64-owner warp reduction define the supported persistent-grid profile.
-    if not isinstance(num_ctas, int) or isinstance(num_ctas, bool) or not 24 <= num_ctas <= 64 or num_ctas % 4:
-        raise ValueError("LaWAM persistent DiT needs 24..64 CTAs in multiples of 4")
+    # Attention needs 16 heads x two query tiles; four-way K splits and
+    # the 64-owner LN reduction define the remaining grid constraints.
+    if not isinstance(num_ctas, int) or isinstance(num_ctas, bool) or not 32 <= num_ctas <= 64 or num_ctas % 4:
+        raise ValueError("LaWAM persistent DiT needs 32..64 CTAs in multiples of 4")
     return num_ctas
 
 

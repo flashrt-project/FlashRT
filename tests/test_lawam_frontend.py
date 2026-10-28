@@ -427,7 +427,7 @@ def test_checkpoint_smoke_is_deterministic():
     assert np.array_equal(a, b)
 
 
-@pytest.mark.parametrize("num_ctas", [24, 36, 64])
+@pytest.mark.parametrize("num_ctas", [32, 36, 64])
 def test_persistent_layernorm_legal_cta_profiles(num_ctas):
     """Exercise the actual cooperative LN reduction, including the 5090 default."""
     import numpy as np
@@ -467,3 +467,41 @@ def test_persistent_layernorm_legal_cta_profiles(num_ctas):
         torch.testing.assert_close(out, expected, rtol=0, atol=0.015625)
     # A device-sized launch must be rejected before it reaches the 64-owner reduction.
     assert lk.dit_flow_persistent(*args, 170, 0, True) != 0
+
+
+@pytest.mark.parametrize("num_ctas", [32, 36, 64])
+@pytest.mark.parametrize("keys", [24, 219, 512])
+def test_persistent_attention_covers_every_head_and_query_tile(num_ctas, keys):
+    import numpy as np
+    from flash_rt.models.lawam import pipeline_rtx as P
+    lk = _lawam()
+    if torch.cuda.get_device_properties(0).multi_processor_count < num_ctas:
+        pytest.skip("profile needs more resident SMs")
+    torch.manual_seed(23)
+    q = (torch.randn(24,16,64,device="cuda") / 8).bfloat16()
+    k = torch.randn(keys,16,64,device="cuda").bfloat16()
+    v = torch.randn(keys,16,64,device="cuda").bfloat16()
+    padded_keys = (keys + 15) // 16 * 16
+    vt = torch.zeros(16,64,padded_keys,device="cuda",dtype=torch.bfloat16)
+    vt[:,:,:keys] = v.permute(1,2,0)
+    out = torch.full((24,16,64),float("nan"),device="cuda",dtype=torch.float16)
+    i, f, p = np.zeros(16,np.int32), np.zeros(8,np.float32), np.zeros(16,np.uint64)
+    i[P._I_KIND], i[P._I_BAR] = P._OP_ATTN, 1
+    i[P._I_KVLEN], i[P._I_KLD], i[P._I_VTLD] = keys, 1024, padded_keys
+    p[P._P_Q], p[P._P_K], p[P._P_VT], p[P._P_OUT0] = q.data_ptr(), k.data_ptr(), vt.data_ptr(), out.data_ptr()
+    desc = torch.from_numpy(np.concatenate([i.view(np.uint8),f.view(np.uint8),p.view(np.uint8)])).cuda()
+    tab = torch.zeros(num_ctas,4,device="cuda",dtype=torch.int32)
+    units = torch.zeros(num_ctas,device="cuda",dtype=torch.int32)
+    stream = torch.zeros(num_ctas,16,device="cuda",dtype=torch.uint8)
+    counter = torch.zeros(4,device="cuda",dtype=torch.int32)
+    args = (desc.data_ptr(),1,tab.data_ptr(),1,units.data_ptr(),1,stream.data_ptr(),16,counter.data_ptr())
+    for invalid in (24,28):
+        assert lk.dit_flow_persistent(*args,invalid,0,True) != 0
+    assert torch.isnan(out).all()
+    assert lk.dit_flow_persistent(*args,num_ctas,0,True) == 0
+    assert torch.isfinite(out).all(), "attention left at least one output element unwritten"
+    # Q already includes the base-2 softmax scale; convert logits back to
+    # natural-log units for the PyTorch reference.
+    ref = torch.nn.functional.scaled_dot_product_attention(
+        q.permute(1,0,2).float(),k.permute(1,0,2).float(),v.permute(1,0,2).float(),scale=0.6931471805599453).permute(1,0,2)
+    torch.testing.assert_close(out.float(),ref,rtol=0.02,atol=0.015)

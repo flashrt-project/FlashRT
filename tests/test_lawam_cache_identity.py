@@ -5,13 +5,13 @@ import pytest
 from flash_rt.models.lawam.cache_identity import file_sha256, processor_sha256
 from flash_rt.models.lawam.pipeline_rtx import select_dit_num_ctas, validate_dit_num_ctas
 
-@pytest.mark.parametrize("sms,expected", [(24,24),(36,36),(64,64),(68,64),(170,64)])
+@pytest.mark.parametrize("sms,expected", [(32,32),(36,36),(64,64),(68,64),(170,64)])
 def test_cta_profile(sms, expected):
     assert select_dit_num_ctas(sms) == expected
 
-@pytest.mark.parametrize("ctas", [0,20,25,65,170,True])
+@pytest.mark.parametrize("ctas", [0,20,24,28,31,33,65,170,True])
 def test_invalid_cta_profile(ctas):
-    with pytest.raises(ValueError, match="24..64"):
+    with pytest.raises(ValueError, match="32..64"):
         validate_dit_num_ctas(ctas)
 
 def test_weight_identity_covers_bytes_after_header(tmp_path):
@@ -64,3 +64,16 @@ def test_calibration_key_uses_weight_and_processor_contents(tmp_path, monkeypatc
     frontend._processor.vocab["new"] = 2
     assert frontend._calibration_path() != after_weights
     assert before.name.endswith("_lawam_v2.json")
+
+
+@pytest.mark.parametrize("sms", [24,28,31])
+def test_device_below_attention_cta_minimum_is_rejected(sms):
+    with pytest.raises(ValueError, match="32..64"):
+        select_dit_num_ctas(sms)
+
+
+@pytest.mark.parametrize("ctas", [24,28])
+def test_packing_rejects_incomplete_attention_grid(ctas):
+    from flash_rt.models.lawam.pipeline_rtx import pack_dit_persistent
+    with pytest.raises(ValueError, match="32..64"):
+        pack_dit_persistent(None, {}, ctas, "cuda")
