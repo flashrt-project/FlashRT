@@ -72,6 +72,10 @@ residual_norm_quant_kernel(__half* __restrict__ x, const __half* __restrict__ de
     const int c0 = threadIdx.x * 8;
     float v[8];
     load8(x + off, v);
+    // the norm's weight / bias are independent of the row: in flight with the residual loads
+    uint4 wq = make_uint4(0, 0, 0, 0), bq = wq;
+    if (weight != nullptr) wq = *reinterpret_cast<const uint4*>(weight + c0);
+    if (bias != nullptr) bq = *reinterpret_cast<const uint4*>(bias + c0);
     if (delta != nullptr || delta_bias != nullptr || delta2 != nullptr) {
         float t[8];
         if (delta != nullptr) {
@@ -92,9 +96,17 @@ residual_norm_quant_kernel(__half* __restrict__ x, const __half* __restrict__ de
         const uint4 u = pack8(v);
         *reinterpret_cast<uint4*>(x + off) = u;
         // the norm reads the stored (FP16-rounded) residual row
-        load8(x + off, v);
+        const __half2* h = reinterpret_cast<const __half2*>(&u);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float2 f = __half22float2(h[k]);
+            v[2 * k] = f.x;
+            v[2 * k + 1] = f.y;
+        }
+        if (x_copy != nullptr) *reinterpret_cast<uint4*>(x_copy + off) = u;
+    } else if (x_copy != nullptr) {
+        *reinterpret_cast<uint4*>(x_copy + off) = pack8(v);
     }
-    if (x_copy != nullptr) *reinterpret_cast<uint4*>(x_copy + off) = *reinterpret_cast<const uint4*>(x + off);
     if (out_fp8 == nullptr && out_f16 == nullptr) return;
 
     if (mode == 0) {
@@ -108,16 +120,23 @@ residual_norm_quant_kernel(__half* __restrict__ x, const __half* __restrict__ de
     const float inv = rsqrtf(block_sum(ss, red) / dim + eps);
 #pragma unroll
     for (int k = 0; k < 8; ++k) v[k] *= inv;
-    float t[8];
     if (weight != nullptr) {
-        load8(weight + c0, t);
+        const __half2* h = reinterpret_cast<const __half2*>(&wq);
 #pragma unroll
-        for (int k = 0; k < 8; ++k) v[k] *= t[k];
+        for (int k = 0; k < 4; ++k) {
+            const float2 f = __half22float2(h[k]);
+            v[2 * k] *= f.x;
+            v[2 * k + 1] *= f.y;
+        }
     }
     if (bias != nullptr) {
-        load8(bias + c0, t);
+        const __half2* h = reinterpret_cast<const __half2*>(&bq);
 #pragma unroll
-        for (int k = 0; k < 8; ++k) v[k] += t[k];
+        for (int k = 0; k < 4; ++k) {
+            const float2 f = __half22float2(h[k]);
+            v[2 * k] += f.x;
+            v[2 * k + 1] += f.y;
+        }
     }
     if (out_f16 != nullptr) *reinterpret_cast<uint4*>(out_f16 + off) = pack8(v);
     if (out_fp8 != nullptr)
