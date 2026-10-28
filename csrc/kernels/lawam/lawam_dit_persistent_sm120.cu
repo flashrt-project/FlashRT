@@ -604,7 +604,7 @@ __device__ void gemm_phase(const DitOp& op, const Smem& sm, unsigned& ucount, un
             mma_w4(sm.ring() + (ri % kSlots) * kUnit, a, acc);
             release_unit(sm, ri);
         } else {
-#pragma unroll
+#pragma unroll 1
             for (int half = 0; half < 2; ++half) {
                 const unsigned ri = ucount + 2 * si + half;
                 wait_unit(sm, ri);
