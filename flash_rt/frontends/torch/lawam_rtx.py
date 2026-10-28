@@ -126,6 +126,7 @@ class LawamTorchFrontendRtx:
         self._side = torch.cuda.Stream(self.device)
         self._ev_frames = torch.cuda.Event()
         self._ev_dino = torch.cuda.Event()
+        self._ev_embeds = torch.cuda.Event()
         self.checkpoint_path = str(checkpoint_path)
         self.num_views = int(num_views)
         if self.num_views != 2:
@@ -770,15 +771,19 @@ class LawamTorchFrontendRtx:
             _ck(lk.gaussian_noise(D["x"], self.seed.data_ptr(), self.horizon * 32, side), "noise")
         if self._dit_persistent:
             _ck(lk.memset_async(D["counter"], 0, 4, side), "flow counter")
+        # the LLM's prompt-template embeddings (static) into its residual stream
+        fvk.gpu_copy(B["llm"]["h"], self.llm["embeds"], self.Se * 2048 * 2, side)
+        self._ev_embeds.record(self._side)
         P.dino_forward(self.gemm_side, fvk, lk, fa2, B["dino"], self.dino, stream=self._side.cuda_stream,
                        prec=prec["dino"], out_prec=prec["lam"])
         self._ev_dino.record(self._side)
         P.qwen_vit_forward(gemm, fvk, lk, fa2, B["vit"], self.vit, {"S": 256 * nv, "views": nv}, stream=st,
                            prec=prec["vit"], fp8_sites=self.fp8_sites.get("vit", ()), cal=cal)
+        main.wait_event(self._ev_embeds)
         P.qwen_llm_forward(gemm, fvk, lk, fa2, B["llm"], self.llm, {"S": self.Se, "n_vis": self.n_vis}, stream=st,
                            prec=prec["llm"], num_sms=self.num_sms, out_prec=prec["enc"],
                            fp8_sites=self.fp8_sites.get("llm", ()), cal=cal,
-                           attn_dtype=self.precision.get("llm_attn", "bf16"))
+                           attn_dtype=self.precision.get("llm_attn", "bf16"), embeds_ready=True)
         _ck(lk.qformer_latent(B["llm"]["vlm"], self._act_idx, self.n_act, 2048, 32, 8, 1024, self.qformer,
                               B["q"]["scratch"], B["q"]["latent"], B["q"]["cond_silu"], st), "qformer")
         main.wait_event(self._ev_dino)

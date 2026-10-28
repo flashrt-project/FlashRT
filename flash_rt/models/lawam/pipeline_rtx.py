@@ -342,7 +342,7 @@ def qwen_vit_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8", fp
 # ─────────────────────────────────────────────────────────────────────────
 
 def qwen_llm_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8", num_sms=0, out_prec="fp8",
-                     fp8_sites=(), cal=False, attn_dtype="bf16"):
+                     fp8_sites=(), cal=False, attn_dtype="bf16", embeds_ready=False):
     """Embedding assembly, 16 decoder layers (fused QKV, q/k RMSNorm + M-RoPE,
     causal GQA FA2, SwiGLU, DeepStack adds after layers 0..2) and the final
     RMSNorm: B["vlm"] gets the FP16 VLM states, B["vlm8"] their FP8 copy (the
@@ -354,8 +354,10 @@ def qwen_llm_forward(gemm, fvk, lk, fa2, B, W, dims, *, stream=0, prec="fp8", nu
     h, x8, qkv = B["h"], B["x8"], B["qkv"]
     Q, K, V, O, lse = B["Q"], B["K"], B["V"], B["O"], B["lse"]
     o_out, gate, up, f16 = B["o_out"], B["gate"], B["up"], B["f16"]
-    # inputs_embeds: prompt template (text + query rows), image rows from the merger
-    fvk.gpu_copy(h, W["embeds"], S * D * 2, st)
+    # inputs_embeds: prompt template (text + query rows; copied by the caller when ``embeds_ready``),
+    # image rows from the merger
+    if not embeds_ready:
+        fvk.gpu_copy(h, W["embeds"], S * D * 2, st)
     _ck(lk.scatter_rows(B["merger_out"], W["merger_b"], W["vis_idx"], h, n_vis, D, st), "embed scatter")
     for j in range(3):
         _ck(lk.scatter_rows(B["ds_out"][j], W["ds_b"][j], W["vis_idx"], B["inject"][j], n_vis, D, st),
