@@ -913,13 +913,18 @@ class LawamTorchFrontendRtx:
         ``{"actions": [horizon, action_dim]}`` (unnormalized)."""
         if self.graph is None:
             raise RuntimeError("set_prompt() and calibrate() before infer()")
-        np.copyto(self._frames_np, self._frames(obs))
+        frames = np.ascontiguousarray(self._frames(obs))
+        out = np.empty_like(self._actions_np)
         if noise is None:
-            graph = self._graph_rng
+            graph, nz, nz_bytes = self._graph_rng, None, 0
         else:
-            np.copyto(self._noise_np, np.asarray(noise, dtype=np.float32).reshape(-1, 32)[:self.horizon])
-            graph = self.graph
-        with torch.cuda.stream(self._graph_stream):
-            graph.replay()
-        self._graph_stream.synchronize()
-        return {"actions": self._actions_np.copy()}
+            nz = np.ascontiguousarray(np.asarray(noise, dtype=np.float32).reshape(-1, 32)[:self.horizon])
+            if nz.shape != self._noise_np.shape:
+                raise ValueError(f"noise must have at least {self.horizon} rows of 32")
+            graph, nz_bytes = self.graph, nz.nbytes
+        # one native call: stage the host inputs, replay the graph, wait, copy the actions out
+        _ck(self.lk.graph_step(graph.raw_cuda_graph_exec(), self._graph_stream.cuda_stream, frames.ctypes.data,
+                               self.frames_host.data_ptr(), frames.nbytes, 0 if nz is None else nz.ctypes.data,
+                               self.noise_host.data_ptr(), nz_bytes, self.actions_host.data_ptr(), out.ctypes.data,
+                               out.nbytes), "policy step")
+        return {"actions": out}

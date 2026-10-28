@@ -12,6 +12,8 @@
 
 #include <pybind11/pybind11.h>
 
+#include <cstring>
+
 #include <cstdint>
 #include <utility>
 #include <cuda_runtime.h>
@@ -44,6 +46,28 @@ PYBIND11_MODULE(flash_rt_lawam, m) {
         },
         py::arg("dst"), py::arg("src"), py::arg("nbytes"), py::arg("stream") = 0,
         "cudaMemcpyAsync with cudaMemcpyDefault (device or pinned host pointers); graph-capturable.");
+
+    m.def("graph_step",
+        [](uintptr_t graph_exec, uintptr_t stream, uintptr_t in0, uintptr_t in0_pinned, size_t in0_bytes,
+           uintptr_t in1, uintptr_t in1_pinned, size_t in1_bytes, uintptr_t out_pinned, uintptr_t out,
+           size_t out_bytes) {
+            // one policy step from host buffers: stage the inputs into the pinned buffers the graph
+            // copies from, replay the graph, wait for it and hand the pinned outputs back
+            py::gil_scoped_release nogil;
+            if (in0 != 0 && in0 != in0_pinned)
+                std::memcpy(reinterpret_cast<void*>(in0_pinned), reinterpret_cast<const void*>(in0), in0_bytes);
+            if (in1 != 0 && in1 != in1_pinned)
+                std::memcpy(reinterpret_cast<void*>(in1_pinned), reinterpret_cast<const void*>(in1), in1_bytes);
+            cudaError_t e = cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(graph_exec), to_stream(stream));
+            if (e == cudaSuccess) e = cudaStreamSynchronize(to_stream(stream));
+            if (e == cudaSuccess && out != 0 && out != out_pinned)
+                std::memcpy(reinterpret_cast<void*>(out), reinterpret_cast<const void*>(out_pinned), out_bytes);
+            return static_cast<int>(e);
+        },
+        py::arg("graph_exec"), py::arg("stream"), py::arg("in0"), py::arg("in0_pinned"), py::arg("in0_bytes"),
+        py::arg("in1"), py::arg("in1_pinned"), py::arg("in1_bytes"), py::arg("out_pinned"), py::arg("out"),
+        py::arg("out_bytes"),
+        "Host inputs -> pinned staging, cudaGraphLaunch, wait, pinned outputs -> host (GIL released).");
 
     m.def("memset_async",
         [](uintptr_t dst, int value, size_t nbytes, uintptr_t stream) {
