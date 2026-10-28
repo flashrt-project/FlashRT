@@ -83,6 +83,15 @@ selects the per-kernel chain (`pipeline_rtx.dit_step_forward`: skinny W4A16 /
 W8A16 GEMMs with FP32 accumulation, `nvfp4_skinny_partials_attention`,
 `lawam.dit_cross_attention`, the `lawam.dit_*` consumers).
 
+Besides the DINOv3 branch, the graph moves work that is off the critical path
+onto side branches: the GEMMs of the three DeepStack mergers (DRAM bound, read
+first by the LLM) run next to the following ViT layers; the LAM input
+projection and the flow image K / V of the DINOv3 tokens run on the DINOv3
+branch; after the VLM, the AdaLN modulation GEMV of LAM blocks 1..11 (capped
+grid, so the LAM GEMMs stay resident next to it; each block waits for its own
+rows) and the flow's text conditioning run next to the LAM decoder. Every
+split computes each output row the same way as the unsplit kernels.
+
 The LeRobot policy runs Qwen3-VL on `inputs_embeds` only, so Qwen3-VL uses
 sequential (1-D) rotary positions for every token; the frontend matches it.
 
