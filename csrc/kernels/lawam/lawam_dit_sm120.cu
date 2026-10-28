@@ -203,17 +203,6 @@ bool row_dim_ok(int dim) { return dim % 128 == 0 && dim >= 128 && dim <= 4096; }
 
 }  // namespace
 
-int dit_layer_norm(const __nv_bfloat16* x, const __nv_bfloat16* scale, const __nv_bfloat16* shift,
-                   const __nv_bfloat16* pos, uint8_t* out, uint8_t* out_sf, const float* out_gs,
-                   __nv_bfloat16* out_bf16, int rows, int dim, float eps, bool pdl, cudaStream_t stream) {
-    if (rows < 1 || !row_dim_ok(dim) || ((scale == nullptr) != (shift == nullptr)) ||
-        (out_bf16 == nullptr && (out == nullptr || out_sf == nullptr || out_gs == nullptr)))
-        return static_cast<int>(cudaErrorInvalidValue);
-    const void* fn = pdl ? (const void*)layer_norm_kernel<true> : (const void*)layer_norm_kernel<false>;
-    return launch_ex(fn, dim3(rows), dim3(dim / 4), stream, pdl, x, scale, shift, pos, out, out_sf, out_gs,
-                     out_bf16, dim, eps);
-}
-
 int dit_sum_bias_residual_norm(const float* partials, int splits, const float* a_gs, const float* w_gs,
                                const __nv_bfloat16* bias, __nv_bfloat16* residual, bool accumulate,
                                const __nv_bfloat16* scale, const __nv_bfloat16* shift, const __nv_bfloat16* pos,

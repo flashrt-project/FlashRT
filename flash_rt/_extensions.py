@@ -33,6 +33,7 @@ BUILD_SWITCHES = {
     "xvla": "FLASHRT_BUILD_XVLA",
     "dm05": "FLASHRT_ENABLE_DM05",
     "groot_n15": "FLASHRT_ENABLE_GROOT_N15",
+    "lawam": "FLASHRT_ENABLE_LAWAM",
     "lingbot": "FLASHRT_ENABLE_LINGBOT",
     "motus": "FLASHRT_ENABLE_MOTUS",
     "qwen3_5_moe": "FLASHRT_ENABLE_QWEN35MOE",

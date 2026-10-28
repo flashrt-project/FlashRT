@@ -137,7 +137,10 @@ def test_built_raw_library_has_exact_export_surface():
         errors="replace",
     )
     exports = {line.split()[-1] for line in output.splitlines() if line.split()}
-    assert exports == EXPECTED_RAW_EXPORTS
+    expected = set(EXPECTED_RAW_EXPORTS)
+    if _cache_bool("FLASHRT_ENABLE_CHAMELEON") or _cache_bool("FLASHRT_ENABLE_LAWAM"):
+        expected.add("fvk_attention_fa2_fwd_fp16_causal")
+    assert exports == expected
 
     dynamic = _readelf_dynamic(raw)
     assert "libpython" not in dynamic
@@ -184,8 +187,14 @@ def test_built_adapter_chameleon_symbol_matches_build_mode():
     assert hasattr(module, "fwd_bf16_fp8out")
     assert hasattr(module, "fwd_bf16_causal_fp8out")
     assert hasattr(module, "fwd_bf16_tile")
-    assert hasattr(module, "fwd_fp16_causal") == (
-        _cache_bool("FLASHRT_ENABLE_CHAMELEON") or _cache_bool("FLASHRT_ENABLE_LAWAM"))
+    # the FP16 causal entry is only instantiated for head_dim 128 with FP16
+    # enabled, and only by Chameleon or LaWAM
+    hdims = (_cache_value("FA2_HDIMS") or "").split(";")
+    dtypes = (_cache_value("FA2_DTYPES") or "").split(";")
+    fp16_causal = ((_cache_bool("FLASHRT_ENABLE_CHAMELEON")
+                    or _cache_bool("FLASHRT_ENABLE_LAWAM"))
+                   and "128" in hdims and "fp16" in dtypes)
+    assert hasattr(module, "fwd_fp16_causal") == fp16_causal
 
 
 def test_chameleon_fa2_compile_contract_is_consistent():

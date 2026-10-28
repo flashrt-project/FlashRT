@@ -120,19 +120,43 @@ def _site_on(sites, name, layer) -> bool:
     return name in sites or (layer is not None and f"{name}@{layer}" in sites)
 
 
+#: One entry from every kernel group the pipeline calls. A stale
+#: flash_rt_lawam (or one built from an older tree) fails here with a build
+#: hint instead of an AttributeError midway through CUDA-graph capture.
+_REQUIRED_LAWAM = (
+    "graph_step", "memcpy_async", "memset_async",
+    "preprocess_u8", "gated_residual_norm", "qformer_latent", "scatter_rows",
+    "gemm_f16acc", "gemm_f16acc_act", "gemm_f16acc_persistent",
+    "gemv_nvfp4w", "w8a16_skinny_gemm", "w4a16_skinny_gemm",
+    "dit_flow_persistent", "dit_cross_attention",
+    "dit_sum_bias_residual_norm", "qkv_rope_split", "qk_rope_inplace",
+)
+
+
+def _check_lawam_symbols(lk) -> None:
+    missing = [name for name in _REQUIRED_LAWAM if not hasattr(lk, name)]
+    if missing:
+        raise RuntimeError(
+            f"flash_rt_lawam is missing {missing}; rebuild it with "
+            "-DGPU_ARCH=120 -DFLASHRT_ENABLE_LAWAM=ON")
+
+
 class LawamTorchFrontendRtx:
     """LaWAM inference on RTX SM120 (one CUDA graph per prompt)."""
 
     def __init__(self, checkpoint_path: str, *, processor_path: str | None = None, device: str = "cuda:0",
                  num_views: int = 2, dit_cfg: dict | None = None, calibration_dir: str | None = None,
                  precision: dict | None = None, fp8_sites: dict | None = None):
-        import flash_rt.flash_rt_kernels as fvk
-        from flash_rt import flash_rt_fa2 as fa2
+        # Check the model extension first: it is the one a default build is
+        # most likely to be missing, and the message names the build flag.
         try:
             from flash_rt import flash_rt_lawam as lk
         except ImportError as e:
             raise RuntimeError("LaWAM needs flash_rt_lawam: build with -DGPU_ARCH=120 "
                                "-DFLASHRT_ENABLE_LAWAM=ON") from e
+        _check_lawam_symbols(lk)
+        import flash_rt.flash_rt_kernels as fvk
+        from flash_rt import flash_rt_fa2 as fa2
         self.fvk, self.fa2, self.lk = fvk, fa2, lk
         self.gemm = fvk.GemmRunner()
         self.device = torch.device(device)
@@ -188,6 +212,11 @@ class LawamTorchFrontendRtx:
         # (vit: qkv / o / fc1 / fc2, llm: qkv / o / gateup / down)
         # (a site may be limited to layers: "site@3" or "site@0-7"; expanded to "site@<layer>")
         self.fp8_sites = {k: frozenset(_expand_sites(v)) for k, v in (fp8_sites or {}).items()}
+        if self.precision.get("llm_attn", "fp16") == "fp16" and not hasattr(self.fa2, "fwd_fp16_causal"):
+            raise RuntimeError(
+                "LaWAM needs flash_rt_fa2.fwd_fp16_causal (head_dim 128, fp16): "
+                "rebuild flash_rt_fa2 with 128 in -DFA2_HDIMS and fp16 in "
+                "-DFA2_DTYPES, or pass precision={'llm_attn': 'bf16'}")
         self._layer = None
         self.num_sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         ckpt = pathlib.Path(self.checkpoint_path)
@@ -233,9 +262,11 @@ class LawamTorchFrontendRtx:
         self.graph = None
         self.Se = None
         self.task = None
-        self.calibrated = (all(v in ("fp16", "f16acc") for k, v in self.precision.items()
-                               if k not in ("dit", "dit_ffn", "dit_qkv", "lam_mod", "llm_attn", "dit_impl"))
-                           and not any(self.fp8_sites.values()))
+        # Static FP8 scales are only meaningful for an "fp8" stage or an
+        # explicit fp8_sites selection; the default tier is calibration-free.
+        self._needs_calibration = (any(v == "fp8" for v in self.precision.values())
+                                   or any(self.fp8_sites.values()))
+        self.calibrated = not self._needs_calibration
 
     # ── small helpers ───────────────────────────────────────────────
     def _k(self, t: torch.Tensor) -> int:
@@ -902,13 +933,21 @@ class LawamTorchFrontendRtx:
 
     # ── calibration ─────────────────────────────────────────────────
     def _calibration_path(self) -> pathlib.Path:
+        """Cache key: the weight file's head + size, the checkpoint / processor
+        configs, the precision policy, the FP8 sites and the device capability."""
         h = hashlib.sha256()
         p = os.path.join(self.checkpoint_path, "model.safetensors")
         with open(p, "rb") as f:
             h.update(f.read(1 << 16))
         h.update(str(os.path.getsize(p)).encode())
+        for name in ("config.json", "policy_preprocessor.json"):
+            q = os.path.join(self.checkpoint_path, name)
+            if os.path.exists(q):
+                h.update(open(q, "rb").read())
+        h.update(str(self.processor_path).encode())
         h.update(json.dumps(self.precision, sort_keys=True).encode())
         h.update(json.dumps({k: sorted(v) for k, v in self.fp8_sites.items()}, sort_keys=True).encode())
+        h.update(str(torch.cuda.get_device_capability(self.device)).encode())
         return self.calibration_dir / f"{h.hexdigest()[:16]}_lawam.json"
 
     def _load_calibration(self) -> None:
@@ -934,6 +973,8 @@ class LawamTorchFrontendRtx:
         NVFP4 DiT uses dynamic block scales with no calibration). The scales do
         not depend on the prompt length, so one calibration serves every task.
         The current prompt's graph is (re)captured afterwards."""
+        if not self._needs_calibration:
+            return {}   # no FP8 site: the default tier needs no calibration pass
         from flash_rt.core.calibration import accumulate_amax
         n = len(self._scale_names)
         current = self.task

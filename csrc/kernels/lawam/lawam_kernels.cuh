@@ -49,9 +49,6 @@ int silu_mul(const __half* gate, const __half* up, int ld, __half* out, int rows
 int scatter_rows(const __half* src, const __half* bias, const int* idx, __half* dst, int n, int dim,
                  cudaStream_t stream);
 
-// out[i] = in[i] for FP16 -> BF16 (n % 8 == 0).
-int cast_f16_bf16(const __half* in, __nv_bfloat16* out, int n, cudaStream_t stream);
-
 // VLM -> latent action head (VLMToLAMQFormer, one query, one layer) and the
 // LAM decoder conditioning: reads the act-query rows idx[0..nq) of the FP16
 // VLM states [*, vdim], writes the latent (FP32 [code]) and
@@ -155,10 +152,6 @@ int dit_sum_bias_residual_norm(const float* partials, int splits, const float* a
                                uint8_t* out, uint8_t* out_sf, const float* out_gs, __nv_bfloat16* out_bf16,
                                int rows, int dim, float eps, bool pdl, cudaStream_t stream);
 
-// LayerNorm(x) * (1 + scale) + shift + pos[row] of a BF16 residual into NVFP4 / BF16.
-int dit_layer_norm(const __nv_bfloat16* x, const __nv_bfloat16* scale, const __nv_bfloat16* shift,
-                   const __nv_bfloat16* pos, uint8_t* out, uint8_t* out_sf, const float* out_gs,
-                   __nv_bfloat16* out_bf16, int rows, int dim, float eps, bool pdl, cudaStream_t stream);
 
 // y = act(bf16(bf16(alpha * sum partials) + bias)), act 0 identity, 1 ReLU,
 // 2 tanh-GELU, into NVFP4 (out, out_sf, *out_gs) or BF16 out_bf16 [rows, n].

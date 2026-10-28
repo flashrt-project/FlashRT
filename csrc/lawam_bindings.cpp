@@ -135,12 +135,6 @@ PYBIND11_MODULE(flash_rt_lawam, m) {
         py::arg("src"), py::arg("bias"), py::arg("idx"), py::arg("dst"), py::arg("n"), py::arg("dim"),
         py::arg("stream") = 0, "dst[idx[i]] = src[i] + bias (FP16 rows, int32 idx).");
 
-    m.def("cast_f16_bf16",
-        [](uintptr_t in, uintptr_t out, int n, uintptr_t stream) {
-            return L::cast_f16_bf16(ptr<const __half>(in), ptr<__nv_bfloat16>(out), n, to_stream(stream));
-        },
-        py::arg("in_"), py::arg("out"), py::arg("n"), py::arg("stream") = 0, "FP16 -> BF16 (n % 8 == 0).");
-
     m.def("qformer_latent",
         [](uintptr_t vlm, uintptr_t idx, int nq, int vdim, int code, int heads, int ctx, py::dict w,
            uintptr_t scratch, uintptr_t latent, uintptr_t cond_silu, uintptr_t stream) {
@@ -222,8 +216,10 @@ PYBIND11_MODULE(flash_rt_lawam, m) {
         py::arg("A"), py::arg("W"), py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0,
         "D[M,N] FP32 = A[M,K] @ W[N,K]^T (BF16 operands, nn.Linear weight layout). Plan cached per shape.");
 
-    m.def("w8a16_skinny_config_count", &L::w8a16_skinny_config_count);
-    m.def("w8a16_skinny_config_k_chunk", &L::w8a16_skinny_config_k_chunk, py::arg("cfg"));
+    m.def("w8a16_skinny_config_count", &L::w8a16_skinny_config_count,
+          "Number of weight-only W8A16 tile configs (M <= 32).");
+    m.def("w8a16_skinny_config_k_chunk", &L::w8a16_skinny_config_k_chunk, py::arg("cfg"),
+          "K columns per FP32 partial of config cfg: partials [K / k_chunk][M][N].");
     m.def("w8a16_skinny_gemm",
         [](uintptr_t A, uintptr_t W, uintptr_t w_scale, uintptr_t partials, int M, int N, int K, int cfg, bool pdl,
            uintptr_t stream) {
@@ -233,19 +229,6 @@ PYBIND11_MODULE(flash_rt_lawam, m) {
         py::arg("A"), py::arg("W"), py::arg("w_scale"), py::arg("partials"), py::arg("M"), py::arg("N"),
         py::arg("K"), py::arg("cfg"), py::arg("pdl") = true, py::arg("stream") = 0,
         "Skinny W8A16 GEMM (M <= 32): FP32 K-split partials of A (BF16 [M,K]) @ W (INT8 [N,K], per-channel scales)^T.");
-
-    m.def("dit_layer_norm",
-        [](uintptr_t x, uintptr_t scale, uintptr_t shift, uintptr_t pos, uintptr_t out, uintptr_t out_sf,
-           uintptr_t out_gs, uintptr_t out_bf16, int rows, int dim, float eps, bool pdl, uintptr_t stream) {
-            return L::dit_layer_norm(ptr<const __nv_bfloat16>(x), ptr<const __nv_bfloat16>(scale),
-                                     ptr<const __nv_bfloat16>(shift), ptr<const __nv_bfloat16>(pos),
-                                     ptr<uint8_t>(out), ptr<uint8_t>(out_sf), ptr<const float>(out_gs),
-                                     ptr<__nv_bfloat16>(out_bf16), rows, dim, eps, pdl, to_stream(stream));
-        },
-        py::arg("x"), py::arg("scale"), py::arg("shift"), py::arg("pos"), py::arg("out"), py::arg("out_sf"),
-        py::arg("out_gs"), py::arg("out_bf16"), py::arg("rows"), py::arg("dim"), py::arg("eps"),
-        py::arg("pdl") = true, py::arg("stream") = 0,
-        "LayerNorm(x) * (1 + scale) + shift + pos[row] -> NVFP4 skinny operand or BF16.");
 
     m.def("dit_sum_bias_residual_norm",
         [](uintptr_t partials, int splits, uintptr_t a_gs, uintptr_t w_gs, uintptr_t bias, uintptr_t residual,
@@ -355,7 +338,8 @@ PYBIND11_MODULE(flash_rt_lawam, m) {
         py::arg("stream") = 0, "gemm_f16acc_swiglu with a fixed tile configuration.");
 
     m.def("dit_cross_attention_state_floats", &L::dit_cross_attention_state_floats, py::arg("rows"),
-          py::arg("heads"), py::arg("kv_slices"));
+          py::arg("heads"), py::arg("kv_slices"),
+          "Floats of the cross-attention combine workspace for rows, heads and kv_slices.");
     m.def("dit_cross_attention",
         [](uintptr_t partials, int splits, uintptr_t a_gs, uintptr_t w_gs, uintptr_t bias, uintptr_t k, uintptr_t v,
            int kv_ld, int kv_seq, int kv_slices, uintptr_t out, int rows, int heads, int hd, float scale,
@@ -384,8 +368,10 @@ PYBIND11_MODULE(flash_rt_lawam, m) {
         "out[N] = NVFP4 weights (E2M1 pairs, UE4M3 per-16 block scales, FP32 global scale) @ x[K] + bias; "
         "max_ctas > 0 caps the grid.");
 
-    m.def("w4a16_skinny_config_count", &L::w4a16_skinny_config_count);
-    m.def("w4a16_skinny_config_k_chunk", &L::w4a16_skinny_config_k_chunk, py::arg("cfg"));
+    m.def("w4a16_skinny_config_count", &L::w4a16_skinny_config_count,
+          "Number of NVFP4 weight-only W4A16 tile configs (M <= 32).");
+    m.def("w4a16_skinny_config_k_chunk", &L::w4a16_skinny_config_k_chunk, py::arg("cfg"),
+          "K columns per FP32 partial of config cfg: partials [K / k_chunk][M][N].");
     m.def("w4a16_skinny_gemm",
         [](uintptr_t A, uintptr_t W, uintptr_t sf, uintptr_t partials, int M, int N, int K, int cfg, bool pdl,
            uintptr_t stream) {
@@ -417,7 +403,8 @@ PYBIND11_MODULE(flash_rt_lawam, m) {
         py::arg("out_bf16"), py::arg("S"), py::arg("n_q"), py::arg("n_k"), py::arg("hd"), py::arg("stream") = 0,
         "Fused-qkv split + bias + K/V scale + rotate-half RoPE (head dim 64), FP16 / BF16 out.");
 
-    m.def("dit_flow_smem_bytes", &L::dit_flow_smem_bytes);
+    m.def("dit_flow_smem_bytes", &L::dit_flow_smem_bytes,
+          "Dynamic shared-memory bytes the persistent flow kernel requests.");
     m.def("dit_flow_persistent",
         [](uintptr_t ops, int n_ops, uintptr_t site_tab, int n_sites, uintptr_t cta_units, int n_steps,
            uintptr_t stream_units, long long cta_stride, uintptr_t counter, int num_ctas, uintptr_t stream,

@@ -256,14 +256,6 @@ __global__ void scatter_rows_kernel(const __half* __restrict__ src, const __half
     *reinterpret_cast<uint4*>(dst + static_cast<size_t>(idx[r]) * dim + c) = pack8(v);
 }
 
-__global__ void cast_kernel(const __half* __restrict__ in, __nv_bfloat16* __restrict__ out, int n8) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n8) return;
-    float v[8];
-    load8(in + static_cast<size_t>(i) * 8, v);
-    *reinterpret_cast<uint4*>(out + static_cast<size_t>(i) * 8) = pack8_bf16(v);
-}
-
 // ── VLM -> latent action QFormer ──
 
 // K / V projections of the normalized act-query rows. One warp per act row,
@@ -670,12 +662,6 @@ int scatter_rows(const __half* src, const __half* bias, const int* idx, __half* 
     if (n < 1 || dim % 8 != 0) return static_cast<int>(cudaErrorInvalidValue);
     const int total = n * (dim / 8);
     scatter_rows_kernel<<<(total + 255) / 256, 256, 0, stream>>>(src, bias, idx, dst, n, dim);
-    return last_error();
-}
-
-int cast_f16_bf16(const __half* in, __nv_bfloat16* out, int n, cudaStream_t stream) {
-    if (n < 8 || n % 8 != 0) return static_cast<int>(cudaErrorInvalidValue);
-    cast_kernel<<<(n / 8 + 255) / 256, 256, 0, stream>>>(in, out, n / 8);
     return last_error();
 }
 

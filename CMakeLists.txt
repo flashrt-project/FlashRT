@@ -303,6 +303,7 @@ option(FLASHRT_ENABLE_GROOT_N15
 # with -DFLASHRT_ENABLE_LAWAM=ON.
 option(FLASHRT_ENABLE_LAWAM
        "Build LaWAM RTX SM120 fused kernels in flash_rt_lawam" OFF)
+
 # Shared delayed-codebook helper used by discrete-audio paths. Kept behind an
 # explicit option so deployment builds that do not serve audio can remove the
 # TU and its binding in lockstep.
@@ -1330,6 +1331,12 @@ if(ENABLE_FA2 AND
   if(FA2_FP16_CAUSAL)
     target_compile_definitions(fa2_vendor_obj PRIVATE FLASHRT_FA2_FP16_CAUSAL=1)
   endif()
+  # LaWAM's short (<= 512 query) SM120 towers select the 64-row tiles. Keep
+  # that dispatch opt-in so other SM120 models keep the upstream tiling.
+  if(FLASHRT_ENABLE_LAWAM)
+    target_compile_definitions(fa2_vendor_obj PRIVATE
+      FLASHRT_FA2_SM12X_SHORT_TILES=1)
+  endif()
 
   string(REPLACE ";" "," _FA2_H "${FA2_BUILT_HDIMS}")
   string(REPLACE ";" "," _FA2_D "${FA2_BUILT_DTYPES}")
@@ -1385,6 +1392,10 @@ if(ENABLE_FA2 AND
     endif()
     if(FA2_FP16_CAUSAL)
       target_compile_definitions(flash_rt_fa2 PRIVATE FLASHRT_FA2_FP16_CAUSAL=1)
+    endif()
+    if(FLASHRT_ENABLE_LAWAM)
+      target_compile_definitions(flash_rt_fa2 PRIVATE
+        FLASHRT_FA2_SM12X_SHORT_TILES=1)
     endif()
     if(FLASHRT_ENABLE_NATIVE_CPP)
       target_compile_definitions(flash_rt_fa2 PRIVATE
@@ -1522,6 +1533,12 @@ if(FLASHRT_ENABLE_LAWAM)
     message(FATAL_ERROR
       "FLASHRT_ENABLE_LAWAM requires GPU_ARCH=120 (Blackwell / sm_120); "
       "got '${GPU_ARCH}'.")
+  endif()
+  if(NOT FA2_FP16_CAUSAL)
+    message(FATAL_ERROR
+      "FLASHRT_ENABLE_LAWAM requires the FA2 FP16 causal head-dim-128 entry "
+      "(the Qwen3-VL LLM prefix). Build with ENABLE_FA2, 128 in FA2_HDIMS and "
+      "fp16 in FA2_DTYPES.")
   endif()
   pybind11_add_module(flash_rt_lawam
     csrc/lawam_bindings.cpp

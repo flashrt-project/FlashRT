@@ -37,6 +37,9 @@ apple = ["torch>=2.5", "safetensors", "sentencepiece"]
 # lazily by set_prompt; the kernel path itself needs only torch/safetensors.
 xvla = ["torch", "safetensors", "transformers>=4.43"]
 chameleon = ["torch", "safetensors", "transformers>=4.43,<4.56", "Pillow"]
+# LaWAM (LeRobot lawam-pretrain-lerobot) on RTX SM120: torch + safetensors
+# weights, the Qwen3-VL processor at set_prompt time, and PIL frames for it.
+lawam = ["flash-rt[torch]", "transformers>=4.57", "Pillow"]
 jax = ["jax", "jaxlib", "ml_dtypes", "orbax-checkpoint", "flax"]
 server = ["fastapi", "uvicorn"]
 eval = ["opencv-python", "tqdm"]

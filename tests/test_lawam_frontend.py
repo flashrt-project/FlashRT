@@ -317,3 +317,105 @@ def test_persistent_swiglu_matches_gateup_and_silu_mul():
     gu = a.float() @ w.float()
     ref = torch.nn.functional.silu(gu[:, :FF]) * gu[:, FF:]
     torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
+
+
+def test_build_gate_is_opt_in_and_owned_by_the_lawam_module():
+    """The module is not part of the default build: its sources exist only in
+    the FLASHRT_ENABLE_LAWAM block and the option defaults to OFF."""
+    from pathlib import Path
+
+    cmake = (Path(__file__).resolve().parents[1] / "CMakeLists.txt").read_text()
+    assert ('option(FLASHRT_ENABLE_LAWAM\n'
+            '       "Build LaWAM RTX SM120 fused kernels in flash_rt_lawam" OFF)') in cmake
+    gate = cmake.index("if(FLASHRT_ENABLE_LAWAM)")
+    block = cmake[gate:cmake.index("# ── MiniMax-Remover", gate)]
+    assert "pybind11_add_module(flash_rt_lawam" in block
+    assert "message(STATUS \"LaWAM SM120 kernels: ENABLED\")" in block
+    for src in ("csrc/lawam_bindings.cpp",
+                "csrc/kernels/lawam/lawam_dit_persistent_sm120.cu"):
+        assert src in block
+        assert src not in cmake[:gate]
+    # the config-time prerequisites and the opt-in FA2 short-tile dispatch
+    assert "FLASHRT_ENABLE_LAWAM requires the FA2 FP16 causal" in cmake
+    assert cmake.count("FLASHRT_FA2_SM12X_SHORT_TILES=1") == 2
+    header = (Path(__file__).resolve().parents[1] /
+              "csrc/attention/flash_attn_2_src/flash_attn/flash_fwd_launch_template.h").read_text()
+    assert header.count("#if defined(FLASHRT_FA2_SM12X_SHORT_TILES)") == 2
+
+
+def test_missing_module_fails_fast(monkeypatch):
+    """Without -DFLASHRT_ENABLE_LAWAM=ON the frontend names the build flag
+    instead of surfacing a bare ModuleNotFoundError after loading weights."""
+    import sys
+
+    from flash_rt.frontends.torch import lawam_rtx
+
+    monkeypatch.delattr(sys.modules["flash_rt"], "flash_rt_lawam", raising=False)
+    monkeypatch.setitem(sys.modules, "flash_rt.flash_rt_lawam", None)
+    with pytest.raises(RuntimeError, match="FLASHRT_ENABLE_LAWAM=ON"):
+        lawam_rtx.LawamTorchFrontendRtx("/nonexistent")
+
+
+def test_required_symbols_fail_fast():
+    """A stale flash_rt_lawam names the missing entries instead of raising
+    AttributeError midway through graph capture."""
+    from flash_rt.frontends.torch.lawam_rtx import _check_lawam_symbols
+
+    class _Empty:
+        pass
+
+    with pytest.raises(RuntimeError) as ei:
+        _check_lawam_symbols(_Empty())
+    assert "FLASHRT_ENABLE_LAWAM" in str(ei.value)
+    assert "dit_flow_persistent" in str(ei.value)
+
+
+def test_frames_shape_and_dtype_guard():
+    import numpy as np
+    from types import SimpleNamespace
+
+    from flash_rt.frontends.torch.lawam_rtx import LawamTorchFrontendRtx
+
+    fe = SimpleNamespace(num_views=2)          # _frames only reads num_views
+    with pytest.raises(ValueError, match="uint8 frames"):
+        LawamTorchFrontendRtx._frames(fe, np.zeros((2, 224, 224, 3), np.uint8))
+    with pytest.raises(ValueError, match="uint8 frames"):
+        LawamTorchFrontendRtx._frames(fe, np.zeros((2, 256, 256, 3), np.float32))
+    assert LawamTorchFrontendRtx._frames(fe, np.zeros((2, 256, 256, 3), np.uint8)).shape == (2, 256, 256, 3)
+
+
+def test_constructor_rejects_view_counts():
+    _lawam()
+    from flash_rt.frontends.torch.lawam_rtx import LawamTorchFrontendRtx
+    with pytest.raises(ValueError, match="primary \\+ one wrist"):
+        LawamTorchFrontendRtx("/nonexistent", num_views=1)
+
+
+def test_model_packages_import_without_the_extension():
+    import importlib
+    assert importlib.import_module("flash_rt.models.lawam") is not None
+    assert importlib.import_module("flash_rt.models.lawam.pipeline_rtx") is not None
+    assert importlib.import_module("flash_rt.frontends.torch.lawam_rtx") is not None
+
+
+def test_checkpoint_smoke_is_deterministic():
+    """Local smoke, skipped in CI: set FLASHRT_LAWAM_CHECKPOINT to the LeRobot
+    checkpoint. Checks the documented predict path, finite output and that a
+    fixed flow sample reproduces bit-identically."""
+    import os
+    import numpy as np
+
+    ckpt = os.environ.get("FLASHRT_LAWAM_CHECKPOINT")
+    if not ckpt:
+        pytest.skip("set FLASHRT_LAWAM_CHECKPOINT=<lawam-pretrain-lerobot> for the checkpoint smoke")
+    from flash_rt.frontends.torch.lawam_rtx import LawamTorchFrontendRtx
+
+    fe = LawamTorchFrontendRtx(ckpt)
+    fe.set_prompt("put the bowl on the plate")
+    frames = np.zeros((2, 256, 256, 3), np.uint8)
+    noise = np.zeros((fe.horizon, 32), np.float32)
+    a = fe.infer(frames, noise=noise)["actions"]
+    b = fe.infer(frames, noise=noise)["actions"]
+    assert a.shape == (fe.horizon, fe.action_dim)
+    assert np.isfinite(a).all()
+    assert np.array_equal(a, b)

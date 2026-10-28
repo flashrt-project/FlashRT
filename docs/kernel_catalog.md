@@ -54,12 +54,16 @@ implementation.
 ```python
 from flash_rt import flash_rt_kernels as fvk       # 87 kernels, always built (pybind, PyTorch)
 from flash_rt import flash_rt_fa2     as fa2       # 2 entries, RTX only (SM80/86/89/120)
+from flash_rt import flash_rt_lawam   as lk        # 41 entries, opt-in (FLASHRT_ENABLE_LAWAM, SM120)
 # JAX side (training + inference): consumed via ctypes + jax.ffi
 #   <repo>/flash_rt/flash_rt_jax_ffi.so             # 2 XLA FFI handlers, optional
 ```
 
 `flash_rt_fa2` is skipped on Thor SM110 (Thor uses `fvk.attention_qkv_fp16`
 cuBLAS-decomposed attention — hand-tuned for Thor's unified LPDDR).
+`flash_rt_lawam` is the opt-in LaWAM (LeRobot) module built by
+`-DFLASHRT_ENABLE_LAWAM=ON` on SM120; its entries are grouped by pipeline
+stage in [LaWAM on RTX SM120](lawam_rtx.md).
 `flash_rt_jax_ffi.so` is built only when JAX + the XLA FFI header are
 importable at configure time; it carries **zero new compute kernels**
 — each handler delegates to an existing entry in `flash_rt_kernels`

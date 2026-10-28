@@ -245,10 +245,14 @@ void run_mha_fwd_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
             // GeForce Blackwell part with only 1-2 waves of 128-row tiles; a
             // 64-row tile with the same 128-key blocks doubles the CTAs and
             // keeps every row's reduction order (bit-identical output).
+            // Opt-in (FLASHRT_FA2_SM12X_SHORT_TILES) so other SM120 models
+            // keep the upstream tiling.
             if (is_sm8x && !Is_causal) {
                 run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+#if defined(FLASHRT_FA2_SM12X_SHORT_TILES)
             } else if (cc_major == 12 && !Is_causal && params.seqlen_q <= 512) {
                 run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 128, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+#endif
             } else {
                 run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
             }
@@ -297,10 +301,12 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
                 } else {
                     run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
                 }
+#if defined(FLASHRT_FA2_SM12X_SHORT_TILES)
             } else if (cc_major == 12 && Is_causal && params.seqlen_q <= 512) {
                 // short causal prefixes on sm12x (LaWAM's Qwen3-VL LLM, ~220 tokens): 64-row tiles
                 // double the CTAs over the same 64-key blocks (bit-identical output)
                 run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+#endif
             } else {
                 run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
             }

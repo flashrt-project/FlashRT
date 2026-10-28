@@ -454,8 +454,9 @@ PYBIND11_MODULE(flash_rt_fa2, m) {
         kDocstring);
 
 #ifdef FLASHRT_FA2_FP16_CAUSAL
-    // FP16 causal sibling — head_dim=128 only. Used by Chameleon-7B
-    // causal self-attention (32 layers MHA 32x128) on Orin SM87.
+    // FP16 causal sibling — head_dim=128 only. Used by Chameleon-7B causal
+    // self-attention (32 layers MHA 32x128) on Orin SM87 and by the LaWAM
+    // Qwen3-VL prefix (FP16 operands on SM120).
     m.def("fwd_fp16_causal", make_fwd(&fvk_attention_fa2_fwd_fp16_causal),
         py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),
         py::arg("softmax_lse_accum") = 0, py::arg("o_accum") = 0,
