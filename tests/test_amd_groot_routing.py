@@ -50,7 +50,7 @@ def _amd_cdna_ext_importable() -> bool:
     try:
         from flash_rt.amd import flash_rt_amd_kernels
 
-        return flash_rt_amd_kernels.build_info().get("backend") != "rdna35"
+        return flash_rt_amd_kernels.build_info().get("backend") != "rdna"
     except ImportError:
         return False
 

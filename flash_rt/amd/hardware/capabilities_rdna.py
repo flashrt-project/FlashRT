@@ -42,8 +42,8 @@ def load_capabilities(kernels, device_arch: str, expected_hardware=None):
     info = dict(kernels.build_info())
     build = str(info.get("gpu_arch", "")).split(":", 1)[0]
     extension_device = str(kernels.device_arch()).split(":", 1)[0]
-    # All three targets retain the upstream RDNA source-set metadata/ABI.
-    if (info.get("backend") != "rdna35" or info.get("wave_size") != 32
+    if (info.get("backend") != "rdna" or info.get("wave_size") != 32
+            or info.get("hardware") != target.hardware
             or (build, extension_device) != (target.gpu_arch,) * 2):
         raise RuntimeError(
             f"{target.hardware} requires matching {target.gpu_arch} RDNA kernels "

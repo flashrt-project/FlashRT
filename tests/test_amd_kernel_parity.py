@@ -72,7 +72,7 @@ def env():
         ext = importlib.import_module("flash_rt.amd.flash_rt_amd_kernels")
     except ImportError as exc:
         pytest.skip(f"flash_rt_amd_kernels not importable: {exc}")
-    if ext.build_info().get("backend") == "rdna35":
+    if ext.build_info().get("backend") == "rdna":
         pytest.skip("requires the CDNA4 AMD extension source set")
     torch = pytest.importorskip("torch")
     if not getattr(torch.version, "hip", None):

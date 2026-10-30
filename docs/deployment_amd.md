@@ -43,8 +43,9 @@ build time and frontend initialization:
   `build_info()` reports the RDNA source set and wave32, with `gpu_arch`
   matching the PyTorch device and extension device (`gfx1100` for `amd_rdna3`,
   `gfx1151` for `amd_rdna35`, `gfx1201` for `amd_rdna4`). Required native
-  entry points are checked before loading weights. For compatibility,
-  `build_info()["backend"]` reports `"rdna35"` for all three targets.
+  entry points are checked before loading weights. `build_info()["backend"]`
+  reports `"rdna"` for all three targets, and `build_info()["hardware"]` must
+  match the hardware ID associated with the compiled ISA.
   A CDNA extension cannot be loaded through the RDNA route, or vice versa.
 
 ## Build
@@ -93,7 +94,7 @@ Dependencies:
 ### RDNA container
 
 [`docker/Dockerfile.rocm.rdna`](../docker/Dockerfile.rocm.rdna) provides a shared
-Ubuntu 24.04 / ROCm 10.1.0 environment with Python 3.13.13, AMD PyTorch
+Ubuntu 24.04 / ROCm 10.1.0 environment with Ubuntu's Python 3.12, AMD PyTorch
 2.14.0, matching torchvision and Triton. It includes the dependencies for
 building, testing and running Pi0.5 BF16 on gfx1100, gfx1151 and gfx1201.
 For CDNA setup, follow the instructions above.
@@ -138,11 +139,17 @@ flash_rt/amd/
   frontends/torch/pi05_rdna.py
 ```
 
-RDNA builds retain `build_info()["backend"] == "rdna35"` as the shared
-source-set label, including gfx1100 and gfx1201. Use `build_info()["gpu_arch"]`
-to identify the compiled ISA. Public hardware IDs remain `amd_rdna3`,
-`amd_rdna35` and `amd_rdna4`; `flash_rt.load_model()` selects the shared RDNA
-frontend and the corresponding target providers.
+RDNA builds report `build_info()["backend"] == "rdna"` for the shared
+source set. `build_info()["hardware"]` identifies the compiled target:
+`amd_rdna3` for `gfx1100`, `amd_rdna35` for `gfx1151`, and `amd_rdna4` for
+`gfx1201`. `build_info()["gpu_arch"]` identifies the compiled ISA;
+`device_arch()` queries the current device. `flash_rt.load_model()` selects
+the shared RDNA frontend and the corresponding target providers.
+
+Rebuild the RDNA extension when updating from a version that reports
+`backend="rdna35"`; the frontend rejects extensions with the old metadata.
+External scripts checking the backend family should use `"rdna"` and use
+`hardware` or `gpu_arch` when selecting a specific target.
 
 The pybind entry points keep the same `uintptr_t` pointer + stream ABI as the
 CUDA module. RDNA-only entries carry an `_rdna` suffix so they cannot be
