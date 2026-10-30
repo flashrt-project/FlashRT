@@ -182,6 +182,10 @@ class Pi05TorchPipeline:
         ).reshape_as(value)
 
     def _vision(self, images_nhwc: torch.Tensor) -> None:
+        self._vision_patch(images_nhwc)
+        self._vision_blocks()
+
+    def _vision_patch(self, images_nhwc: torch.Tensor) -> None:
         b = self.buf
         patch = F.conv2d(
             images_nhwc.permute(0, 3, 1, 2),
@@ -194,56 +198,53 @@ class Pi05TorchPipeline:
             b["vision_x"], patch, self.w["vision_position_embedding"]
         )
 
+    def _vision_blocks(self) -> None:
         for index in range(VIS_L):
-            self.ops.layer_norm(
-                b["vision_norm"],
-                b["vision_x"],
-                self.w["vision_pre_attn_norm_w"][index],
-                self.w["vision_pre_attn_norm_b"][index],
-            )
-            self.gemm.linear(
-                b["vision_qkv"],
-                b["vision_norm"],
-                self.w["vision_attn_qkv_w"][index],
-                self.w["vision_attn_qkv_b"][index],
-            )
-            context = self.attn.vision(b["vision_qkv"], out=b["vision_norm"])
-            self.gemm.linear(
-                b["vision_attn"], context, self.w["vision_attn_o_w"][index],
-                self.w["vision_attn_o_b"][index],
-            )
-            self.ops.residual(b["vision_x"], b["vision_attn"], b["vision_x"])
-            self.ops.layer_norm(
-                b["vision_norm"],
-                b["vision_x"],
-                self.w["vision_pre_ffn_norm_w"][index],
-                self.w["vision_pre_ffn_norm_b"][index],
-            )
-            self.gemm.linear(
-                b["vision_hidden"], b["vision_norm"],
-                self.w["vision_ffn_up_w"][index],
-                self.w["vision_ffn_up_b"][index],
-            )
-            self.ops.gelu(b["vision_hidden"], b["vision_hidden"])
-            self.gemm.linear(
-                b["vision_out"], b["vision_hidden"],
-                self.w["vision_ffn_down_w"][index],
-                self.w["vision_ffn_down_b"][index],
-            )
-            self.ops.residual(b["vision_x"], b["vision_out"], b["vision_x"])
-            if index in (0, 13, 26):
-                self._save(f"vision_l{index}", b["vision_x"])
+            self._vision_block(index)
 
-    def _encoder(
-        self,
-        prompt_embeds: torch.Tensor,
-        prompt_len: int,
-        encoder_k: torch.Tensor | None = None,
-        encoder_v: torch.Tensor | None = None,
-    ) -> int:
+    def _vision_block(self, index: int) -> None:
         b = self.buf
-        encoder_k = b["encoder_k"] if encoder_k is None else encoder_k
-        encoder_v = b["encoder_v"] if encoder_v is None else encoder_v
+        self.ops.layer_norm(
+            b["vision_norm"],
+            b["vision_x"],
+            self.w["vision_pre_attn_norm_w"][index],
+            self.w["vision_pre_attn_norm_b"][index],
+        )
+        self.gemm.linear(
+            b["vision_qkv"],
+            b["vision_norm"],
+            self.w["vision_attn_qkv_w"][index],
+            self.w["vision_attn_qkv_b"][index],
+        )
+        context = self.attn.vision(b["vision_qkv"], out=b["vision_norm"])
+        self.gemm.linear(
+            b["vision_attn"], context, self.w["vision_attn_o_w"][index],
+            self.w["vision_attn_o_b"][index],
+        )
+        self.ops.residual(b["vision_x"], b["vision_attn"], b["vision_x"])
+        self.ops.layer_norm(
+            b["vision_norm"],
+            b["vision_x"],
+            self.w["vision_pre_ffn_norm_w"][index],
+            self.w["vision_pre_ffn_norm_b"][index],
+        )
+        self.gemm.linear(
+            b["vision_hidden"], b["vision_norm"],
+            self.w["vision_ffn_up_w"][index],
+            self.w["vision_ffn_up_b"][index],
+        )
+        self.ops.gelu(b["vision_hidden"], b["vision_hidden"])
+        self.gemm.linear(
+            b["vision_out"], b["vision_hidden"],
+            self.w["vision_ffn_down_w"][index],
+            self.w["vision_ffn_down_b"][index],
+        )
+        self.ops.residual(b["vision_x"], b["vision_out"], b["vision_x"])
+        if index in (0, 13, 26):
+            self._save(f"vision_l{index}", b["vision_x"])
+
+    def _vision_project(self) -> None:
+        b = self.buf
         self.ops.layer_norm(
             b["vision_norm"],
             b["vision_x"],
@@ -261,6 +262,18 @@ class Pi05TorchPipeline:
             self.w["encoder_multi_modal_projector_b"],
         )
         self._save("projector", projected)
+
+    def _encoder(
+        self,
+        prompt_embeds: torch.Tensor,
+        prompt_len: int,
+        encoder_k: torch.Tensor | None = None,
+        encoder_v: torch.Tensor | None = None,
+    ) -> int:
+        b = self.buf
+        encoder_k = b["encoder_k"] if encoder_k is None else encoder_k
+        encoder_v = b["encoder_v"] if encoder_v is None else encoder_v
+        self._vision_project()
         image_tokens = self.num_views * PATCHES_PER_VIEW
         if not self.compact_encoder:
             b["encoder_x"][image_tokens:].zero_()

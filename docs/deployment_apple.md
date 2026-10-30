@@ -9,8 +9,15 @@ depend on SDPA's CUDA-specific `enable_gqa` implementation.
 This is a correctness-first starting point. Full checkpoint action accuracy,
 LIBERO success rates and latency need qualification on each Mac. Existing
 CUDA/HIP FP8/NVFP4 kernels and graph capture do not port directly to Metal.
-There are no custom Metal kernels, MLX runtime, JAX frontend, temporal frame
-caching or support for other model families in this initial backend.
+The default frontend does not use custom Metal model kernels. MLX runtime,
+JAX frontend, temporal frame caching and other model families are unsupported.
+
+The [Apple native pipeline](../cpp/apple/README.md) is the opt-in accelerated
+route: one BF16 Metal ICB covers patch embedding, vision, prefix and all decode
+steps, with persistent shared buffers and explicit residency. Use
+`examples/apple/pi05.py --native-pipeline`; the default Torch MPS route remains
+the correctness reference. The superseded vision-only and FP32 mixed pipelines
+have been removed.
 
 ## Python environment with uv
 
@@ -167,3 +174,45 @@ stages. Benchmark only after warmup and report the Mac model, OS, PyTorch,
 view count, prompt length, action horizon and denoising step count. Custom
 Metal/MLX kernels should follow measured bottlenecks and a checkpoint parity
 gate.
+
+### Fixed-shape native pipeline
+
+`examples/apple/pi05.py --native-pipeline` enables a BF16 TensorOps ICB for
+patch embedding, vision blocks, projector, prefix and every denoising step.
+`infer()` writes CPU camera/prompt/noise inputs directly into shared native
+buffers and returns CPU actions without an MPS round trip. The fixed-noise
+MPS tensor API remains available for compatibility. Set the prompt before building: its exact token count fixes
+prefix M. New input contents reuse persistent buffers; a different token count
+requires a new plan. The CLI rebuilds after prompt changes, outside model timing.
+
+The low-level API is `frontend.pipeline.enable_native_pipeline(prompt_len)`.
+Model traversal is shared with the reference; native providers record an
+immutable dispatch plan. See [native plan details](../cpp/apple/README.md#fixed-vision--prefix--decoder-replay).
+Model assembly belongs to `flash_rt/models/pi05/native_plan_mps.py`; generic
+recording and native providers belong to `flash_rt/hardware/apple_native`.
+The [native build guide](../cpp/apple/README.md#build-and-validate) documents
+the opt-in CMake flags, SDK-only alternative and mandatory export checks.
+`--native-pipeline --cpu-reference` rebuilds CPU reference images from the
+same observation and uses the cached CPU prompt embeddings, so it does not
+depend on MPS staging buffers being populated by native inference.
+
+Run `bash scripts/apple/validate_pipeline.sh --checkpoint PATH --tokenizer PATH
+--output DIR` for Metal validation and the PyTorch / complete ICB comparison. Benchmark `--prompt-length 10` selects a synthetic
+M=522 profile from the fixture; omit it to validate the complete prompt.
+Use `--trace-only --no-parity --iters 3` only in a separate Instruments run.
+Use `--modes full-icb --schedule serial --iters 200 --no-parity` for sustained
+native latency, and the default alternating modes to diagnose provider-switch
+effects. Every measured sample is saved with a UTC timestamp in `samples.jsonl`.
+Native timing separates host encode/commit, commit-to-GPU-start, GPU execution,
+and GPU-end-to-host-return. Instrumented runs are labeled separately.
+Fixed native plans keep buffers/ICB in an explicit residency set until closed,
+avoiding repeated driver memory wiring. `--no-residency` is a diagnostic A/B
+switch. Release unused plans with `disable_native_pipeline()`.
+`--profile-kernels` adds isolated kernel diagnostics after normal timing;
+`--compare-gqa` compares decode attention variants in warmed full-model ABBA
+blocks. The default small-M kernel parallelizes KV tiles and merges FP32 partials.
+Encoder gate/up already use one concatenated GEMM by default.
+`--compare-encoder-ffn` measures split/merged/merged/split full-model blocks;
+`--split-encoder-ffn` selects the split diagnostic path. Both write the same
+BF16 intermediate layout and use the same activation, with no extra copies.
+Provider parity does not establish independent OpenPI or robot task success.
