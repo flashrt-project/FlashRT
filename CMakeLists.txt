@@ -1,4 +1,12 @@
 cmake_minimum_required(VERSION 3.24)
+option(FLASHRT_BUILD_APPLE_NATIVE "Build only the native Apple Metal pipeline" OFF)
+if(FLASHRT_BUILD_APPLE_NATIVE)
+  message(STATUS "FLASHRT_BUILD_APPLE_NATIVE=ON: native Metal targets only (CUDA disabled)")
+  project(flashrt_apple_native LANGUAGES CXX OBJCXX)
+  include(CTest)
+  add_subdirectory(cpp/apple)
+  return()
+endif()
 project(flash_rt CUDA CXX)
 
 set(CMAKE_CUDA_STANDARD 17)

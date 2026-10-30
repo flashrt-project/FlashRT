@@ -120,6 +120,7 @@ class Pi05TorchFrontendMps:
             chunk_size=self.chunk_size, num_steps=num_steps,
         )
         self._prompt_buf = torch.empty(max_prompt_len, ENC_D, dtype=self.dtype, device="mps")
+        self._prompt_cpu = None
         self._image_buf = torch.empty(num_views, IMG_HW, IMG_HW, 3, dtype=self.dtype, device="mps")
         self._noise_buf = torch.empty(self.chunk_size, ACTION_DIM, dtype=self.dtype, device="mps")
 
@@ -133,6 +134,7 @@ class Pi05TorchFrontendMps:
         if not 0 < length <= self.max_prompt_len:
             raise ValueError(f"Prompt length {length} exceeds capacity {self.max_prompt_len}")
         self._prompt_buf[:length].copy_(embeds)
+        self._prompt_cpu = embeds.detach().cpu().contiguous()
         self._prompt_len, self._prompt_text = length, prompt_text
 
     @torch.inference_mode()
@@ -164,19 +166,32 @@ class Pi05TorchFrontendMps:
             if (not isinstance(image, np.ndarray) or image.dtype != np.uint8
                     or image.shape != (IMG_HW, IMG_HW, 3)):
                 raise ValueError("Images must be (224, 224, 3) RGB uint8 numpy arrays")
-        torch.mps.synchronize()
+        native = self.pipeline._native_pipeline
+        if native is not None and native.prompt_len != self._prompt_len:
+            raise ValueError("Native prompt length changed; rebuild with enable_native_pipeline")
+        if native is None:
+            torch.mps.synchronize()
         started = time.perf_counter()
-        for index, image in enumerate(images):
-            self._image_buf[index].copy_(torch.from_numpy(image.astype(np.float32) / 127.5 - 1.0))
-        if noise is None:
-            self._noise_buf.normal_()
-        else:
-            value = torch.as_tensor(noise)
+        if native is not None:
+            # Camera pixels and prompt embeddings originate on the CPU. Write
+            # shared Metal inputs directly; do not bounce through Torch MPS.
+            normalized = np.stack(images).astype(np.float32) / 127.5 - 1.0
+            value = torch.randn(self.chunk_size, ACTION_DIM, dtype=self.dtype) if noise is None else torch.as_tensor(noise)
             if value.shape != self._noise_buf.shape:
                 raise ValueError(f"Noise must have shape {tuple(self._noise_buf.shape)}")
-            self._noise_buf.copy_(value)
-        raw = self.forward_with_fixed_noise(self._image_buf, self._noise_buf)[0]
-        raw_actions = raw.float().cpu().numpy()
+            raw_actions = self.pipeline.forward_native(normalized, self._prompt_cpu[:self._prompt_len], value)
+        else:
+            for index, image in enumerate(images):
+                self._image_buf[index].copy_(torch.from_numpy(image.astype(np.float32) / 127.5 - 1.0))
+            if noise is None:
+                self._noise_buf.normal_()
+            else:
+                value = torch.as_tensor(noise)
+                if value.shape != self._noise_buf.shape:
+                    raise ValueError(f"Noise must have shape {tuple(self._noise_buf.shape)}")
+                self._noise_buf.copy_(value)
+            raw = self.forward_with_fixed_noise(self._image_buf, self._noise_buf)[0]
+            raw_actions = raw.float().cpu().numpy()
         latency_ms = (time.perf_counter() - started) * 1000
         self.latency_records.append(latency_ms)
         result = {"actions": unnormalize_actions(raw_actions, self.norm_stats)[:, :self.action_dim]}

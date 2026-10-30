@@ -94,6 +94,29 @@ def test_shared_pipeline_decoder_only_reuses_last_encoder_cache(small_model, com
     torch.testing.assert_close(cached, full, rtol=0, atol=0)
 
 
+def test_apple_stage_labels_preserve_shared_traversal(small_model):
+    from flash_rt.models.pi05.pipeline_mps import Pi05PipelineMps
+    # Run the Apple orchestration on CPU providers, independently of GPU access.
+    target = Pi05PipelineMps.__new__(Pi05PipelineMps)
+    target._stage_profiler = None
+    target._native_pipeline = None
+    args = dict(num_views=2, max_prompt_len=5, chunk_size=3, num_steps=2, device="cpu")
+    model.Pi05TorchPipeline.__init__(target, small_model.weights, TorchTensorOps(), TorchGemmBackend(),
+                                    TorchAttentionBackend(2), **args)
+    reference = model.Pi05TorchPipeline(small_model.weights, TorchTensorOps(), TorchGemmBackend(),
+                                       TorchAttentionBackend(2), **args)
+    inputs = (small_model.rand(2, 224, 224, 3), small_model.rand(3, 8), 3, small_model.rand(3, 4))
+    expected = reference.forward_with_inputs(*inputs).clone()
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as trace:
+        with target.profile(signposts=False, mps_ops=False):
+            actual = target.forward_with_inputs(*inputs).clone()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    labels = {event.key for event in trace.key_averages()}
+    assert {"vision.patch_and_blocks", "vision.patch", "vision.blocks", "vision.layer.0",
+            "vision.layer.1", "vision.project", "prefix.with_vision_projection", "action.denoise"} <= labels
+    assert target._stage_profiler is None
+
+
 @pytest.mark.parametrize('device', ['cpu', 'mps'])
 @pytest.mark.parametrize('views', [2, 3])
 @pytest.mark.parametrize('compact', [False, True])
@@ -169,6 +192,27 @@ def test_apple_frontend_predict_and_fixed_noise(small_model, monkeypatch, tmp_pa
     assert frontend.get_latency_stats()['count'] == 2
     with pytest.raises(ValueError, match='graphs'):
         frontend.forward_with_fixed_noise(frontend._image_buf, frontend._noise_buf, use_graph=True)
+
+    # Native frontend must consume the original CPU inputs and return CPU
+    # actions without synchronizing/staging through the MPS compatibility API.
+    from types import SimpleNamespace
+    def native_forward(images, embeds, fixed_noise):
+        assert isinstance(images, np.ndarray) and images.shape == (2, 224, 224, 3)
+        np.testing.assert_array_equal(images, -np.ones_like(images))
+        assert embeds.device.type == fixed_noise.device.type == 'cpu'
+        torch.testing.assert_close(embeds, prompt)
+        return expected[0].float().numpy().copy()
+    def forbidden_sync():
+        raise AssertionError('Native CPU frontend unexpectedly used MPS synchronization')
+    with monkeypatch.context() as patch:
+        patch.setattr(frontend.pipeline, '_native_pipeline', SimpleNamespace(prompt_len=3))
+        patch.setattr(frontend.pipeline, 'forward_native', native_forward)
+        patch.setattr(torch.mps, 'synchronize', forbidden_sync)
+        result = frontend.infer({'images': images}, noise=noise.float().numpy(), debug=True)
+        np.testing.assert_array_equal(result['raw_actions'], expected[0].float().numpy())
+        patch.setattr(frontend.pipeline, '_native_pipeline', SimpleNamespace(prompt_len=4))
+        with pytest.raises(ValueError, match='prompt length changed'):
+            frontend.infer({'images': images}, noise=noise)
 
 
 def test_rdna_binding_has_no_model_traversal():
