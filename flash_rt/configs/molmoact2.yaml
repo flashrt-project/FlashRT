@@ -1,0 +1,75 @@
+# FlashRT — MolmoAct2 (allenai) VLA
+#
+# Single-stream VLA: a SigLIP-style vision tower, a pooling adapter over two
+# ViT feature layers, a Qwen2.5-style VLM text tower that produces the
+# per-layer K/V context, and a flow-matching action expert that denoises a
+# 30x14 action chunk over a fixed Euler schedule. The RTX SM120 path keeps the
+# whole pipeline (including the flow loop) in one CUDA Graph.
+#
+# This YAML is metadata only (logging / introspection). Runtime dimensions
+# come from the constants in flash_rt/models/molmoact2/pipeline_rtx.py and from
+# the checkpoint's config.json / norm_stats.json.
+name: molmoact2
+family: molmoact2
+framework: torch
+hardware: rtx_sm120               # SM120/SM121; needs FLASHRT_ENABLE_MOLMOACT2
+
+# ── Observation / prompt ──
+observation:
+  num_views: 3                    # top, left, right (BimanualYAM order)
+  image_height: 360
+  image_width: 640
+  resize_tile: 378                # square processor target
+  state_dim: 14
+  action_horizon: 30
+  action_dim: 14
+  action_pad_dim: 32              # masked trajectory width in the flow loop
+
+# ── Vision tower ──
+vision:
+  hidden_dim: 1152
+  num_layers: 25
+  num_heads: 16
+  head_dim: 72
+  patch_size: 14
+  grid: 27                        # 378 / 14
+  num_patches: 729                # 27 x 27, causal-free ViT attention
+  ffn_hidden: 4304                # padded to 4352 for the NVFP4 GEMM atom
+  feature_layers: [24, 18]        # concatenated for the pooling adapter
+  pool_size: 2                    # 2x2 masked mean window
+  pooled_tokens: 196              # 14 x 14 per view
+  adapter_dim: 2304               # 2 x 1152 feature concatenation
+
+# ── VLM text tower (Qwen2.5-style, GQA) ──
+text:
+  hidden_dim: 2560
+  num_layers: 36
+  num_heads: 32
+  num_kv_heads: 8
+  head_dim: 128
+  ffn_hidden: 9728
+  rope_theta: 5000000
+  prompt_tokens: 692              # production task + state + 3x196 image tokens
+
+# ── Action expert (flow matching) ──
+action_expert:
+  hidden_dim: 768
+  num_layers: 36
+  num_heads: 8
+  head_dim: 96
+  ffn_hidden: 3072
+  context_dim: 1024               # text K/V width (8 heads x 128)
+  flow_steps: 10                  # checkpoint flow_matching_num_steps
+  modulation: adaLN               # per-step bias/scale tables, precomputed
+
+# ── Quantization (delivered default) ──
+quant:
+  precision: nvfp4                # NVFP4 scope "tvp" + FP8 elsewhere
+  nvfp4_scope: tvp                # text GEMMs + vision w1/qkv + adapter
+  fp8: true                       # e4m3 block-128 for the remaining GEMMs
+  bf16_sites:                     # alignment-excluded / precision-sensitive
+    - vis_patch_embed
+    - act_embed
+    - act_final
+  calibration: static             # real observations, frozen before capture
+  nvfp4_block: [16, 16]

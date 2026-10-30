@@ -91,6 +91,16 @@ public:
                  int M, int N, int K,
                  cudaStream_t stream = 0);
 
+    // BF16 GEMM with a fused FP32 bias epilogue (PyTorch addmm equivalent).
+    void bf16_nn_bias_f32(void* A, void* B, void* D, void* bias,
+                          int M, int N, int K, cudaStream_t stream = 0);
+
+    // BF16 inputs with an FP32 output.  Used to reproduce a fused-bias
+    // epilogue exactly: accumulate in FP32, add the bias, round once.
+    void bf16_nn_fp32(void* A, void* B, void* D,
+                      int M, int N, int K,
+                      cudaStream_t stream = 0);
+
     // FP16: D = A(M,K) @ B(K,N)  (row-major, no transpose)
     void fp16_nn(void* A, void* B, void* D,
                  int M, int N, int K,
@@ -229,7 +239,8 @@ private:
 
     // ── GEMM descriptor + algorithm cache ──
     enum GemmType { BF16_NN = 0, BF16_NN_RES = 1, FP8_NN_DEV = 2,
-                    FP8_NT_DEV = 5, FP16_NN = 4, FP8_NN_DEV_FP16 = 6
+                    FP8_NT_DEV = 5, FP16_NN = 4, FP8_NN_DEV_FP16 = 6,
+                    BF16_NN_FP32 = 7
 #ifdef ENABLE_NVFP4
         , FP4_NN_DEV = 3
 #endif

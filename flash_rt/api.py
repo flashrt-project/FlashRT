@@ -623,12 +623,14 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                       "pi0fast",
                       "motus", "wan22_ti2v_5b", "cosmos3_video",
                       "cosmos3_edge", "nexn2", "qwen36_moe", "spark_x25",
-                      "flint", "hyvla", "xvla", "ltx25", "dm05", "qwen3_4b", "lawam"):
+                      "flint", "hyvla", "xvla", "ltx25", "dm05", "qwen3_4b", "lawam",
+                      "molmoact2"):
         raise ValueError(
             f"Unknown config: {config}. "
             f"Supported: pi05, groot, groot_n15, groot_n17, pi0, pi0fast, motus, "
             f"wan22_ti2v_5b, cosmos3_video, cosmos3_edge, nexn2, "
-            f"qwen36_moe, spark_x25, flint, hyvla, xvla, ltx25, dm05, qwen3_4b, lawam")
+            f"qwen36_moe, spark_x25, flint, hyvla, xvla, ltx25, dm05, qwen3_4b, "
+            f"lawam, molmoact2")
     if framework not in ("torch", "jax", "jetson_pi"):
         raise ValueError(
             f"Unknown framework: {framework}. Supported: torch, jax, jetson_pi")
@@ -727,6 +729,26 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "    from flash_rt.frontends.torch.nexn2_rtx import "
             "Nexn2TorchFrontendRtx\n"
             "See docs/nexn2_usage.md.")
+    # MolmoAct2 is a VLA, but its observation is (3 fixed views, 14-dim robot
+    # state, optional flow noise) and its CUDA Graph must be calibrated on
+    # real observations before capture, so it does not fit the predict(images,
+    # prompt) wrapper. Registered in _PIPELINE_MAP for discoverability;
+    # constructed directly (checked before GPU detection so the redirect
+    # fires on any machine).
+    if config == "molmoact2":
+        raise NotImplementedError(
+            "config='molmoact2' needs the robot state on every call and a "
+            "real-observation calibration before graph capture, so it is not "
+            "served through load_model's predict(images, prompt) wrapper. "
+            "Construct it directly:\n"
+            "    from flash_rt.frontends.torch.molmoact2_rtx import "
+            "MolmoAct2TorchFrontendRtx\n"
+            "    fe = MolmoAct2TorchFrontendRtx(ckpt, precision='nvfp4')\n"
+            "    fe.set_prompt(task)\n"
+            "    fe.calibrate(samples)       # real (images, state) pairs\n"
+            "    fe.record_infer_graph()\n"
+            "    actions = fe.infer(images, state)['actions']\n"
+            "See docs/molmoact2_usage.md.")
     if config == "qwen36_moe":
         raise NotImplementedError(
             "config='qwen36_moe' is a text LLM and is not served through "

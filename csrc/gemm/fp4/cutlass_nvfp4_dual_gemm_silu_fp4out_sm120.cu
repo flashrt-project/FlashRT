@@ -182,7 +182,8 @@ void fp4_w4a16_dual_gemm_silu_fp4out_sm120(
     int M, int N, int K,
     float alpha_gate,
     float alpha_up,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    bool ceil_sf)
 {
   using StrideA = typename Gemm::GemmKernel::StrideA;
   using StrideB = typename Gemm::GemmKernel::StrideB;
@@ -225,6 +226,7 @@ void fp4_w4a16_dual_gemm_silu_fp4out_sm120(
   args.epilogue.thread.norm_constant_ptr = norm_const_dev;
   args.epilogue.thread.alpha_gate = alpha_gate;
   args.epilogue.thread.alpha_up = alpha_up;
+  args.epilogue.thread.ceil_sf = ceil_sf ? 1 : 0;
 
   Gemm gemm;
   size_t ws_size = Gemm::get_workspace_size(args);

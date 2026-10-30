@@ -36,7 +36,7 @@ def load_model(
     autotune: int = 3,              # 0=off, 3=default, 5+=thorough
     recalibrate: bool = False,
     weight_cache: bool = True,      # JAX only
-    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "groot_n15" | "groot_n17" | "pi0fast" | "motus" | "wan22_ti2v_5b" | "cosmos3_video" | "cosmos3_edge" | "chameleon" | "hyvla" | "xvla" | "lawam"
+    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "groot_n15" | "groot_n17" | "pi0fast" | "motus" | "wan22_ti2v_5b" | "cosmos3_video" | "cosmos3_edge" | "chameleon" | "hyvla" | "xvla" | "lawam" | "molmoact2"
     device=None,                    # reserved
     # Pi0-FAST-specific:
     decode_cuda_graph: bool = False,
@@ -241,6 +241,15 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   `predict(images, prompt, state)` is supported; `num_views=2` (or 3 when
   the caller includes the configured empty slot). See
   `docs/xvla_rtx_sm120.md`.
+- `config="molmoact2"` (allenai MolmoAct2) is registered for
+  `framework="torch"` on `hardware="rtx_sm120"` (SM120/SM121). It is not
+  served through the `predict(images, prompt)` wrapper: every call carries
+  the 14-dim robot state, and the graph must be calibrated on real
+  observations before capture. Calling `load_model(config="molmoact2")`
+  raises `NotImplementedError` with direct-construction instructions
+  (`MolmoAct2TorchFrontendRtx`; `set_prompt`, `calibrate`,
+  `record_infer_graph`, `infer`). Requires
+  `-DFLASHRT_ENABLE_MOLMOACT2=ON`. See `docs/molmoact2_usage.md`.
 
 ### Pi0.5 optimized Thor decoder
 
