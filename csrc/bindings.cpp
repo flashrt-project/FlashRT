@@ -7,6 +7,7 @@
 #include <pybind11/stl.h>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <initializer_list>
 #include <sstream>
 #include <stdexcept>
@@ -75,6 +76,8 @@
 #include "gemm/fp4/nvfp4_skinny_consumers_sm120.cuh"
 #include "gemm/fp4/nvfp4_skinny_attention_sm120.cuh"
 #include "gemm/fp4/cutlass_nvfp4_gemm_bias_res_sm120.cuh"
+#include "gemm/fp4/cutlass_nvfp4_gemm_bias_res_k128_sm120.cuh"
+#include "gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_fp8out_k128_sm120.cuh"
 #include "gemm/fp4/cutlass_nvfp4_gemm_glu_fp4out_sm120.cuh"
 #include "kernels/nvfp4_prefill_sm120.cuh"
 #include "kernels/fp8_prefill_fp16.cuh"
@@ -280,6 +283,11 @@ extern "C" void flash_rt_awq_quant_fp8_static_fp16(
 #include "kernels/bf16_matmul_cublaslt_ref.cuh"
 #include "kernels/act_bf16.cuh"
 #include "kernels/embedding_lookup_bf16.cuh"
+#ifdef FLASHRT_HAVE_MOLMOACT2
+#include "kernels/molmoact2_kernels.cuh"
+#include "kernels/molmoact2_action_mk_sm120.cuh"
+#include "kernels/molmo_smallm_gemm_sm120.cuh"
+#endif
 #ifdef FLASHRT_HAVE_AUDIO_CODEBOOK
 #include "kernels/delayed_codebook_kernels.cuh"
 #endif
@@ -390,6 +398,9 @@ extern "C" int flashrt_fd_w4a8_gemm_sm100(const void* xq, const void* w8, const 
 #endif
 #ifdef ENABLE_QWEN3_FP8_PREFILL_ATTN
 #include "attention/fmha_fp8_causal_gqa_sm120.cuh"
+#endif
+#ifdef FLASHRT_HAVE_MOLMOACT2
+#include "attention/molmo_vit_attn_bf16_sm120.cuh"
 #endif
 
 namespace py = pybind11;
@@ -738,6 +749,20 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                             uintptr_t A, uintptr_t B, uintptr_t D,
                             int M, int N, int K, uintptr_t stream) {
             self.bf16_nn(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, to_stream(stream));
+        }, py::arg("A"), py::arg("B"), py::arg("D"),
+           py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0)
+        .def("bf16_nn_bias_f32", [](GemmRunner& self,
+                                     uintptr_t A, uintptr_t B, uintptr_t D,
+                                     uintptr_t bias, int M, int N, int K,
+                                     uintptr_t stream) {
+            self.bf16_nn_bias_f32(to_ptr(A), to_ptr(B), to_ptr(D), to_ptr(bias),
+                                  M, N, K, to_stream(stream));
+        }, py::arg("A"), py::arg("B"), py::arg("D"), py::arg("bias"),
+           py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0)
+        .def("bf16_nn_fp32", [](GemmRunner& self,
+                                 uintptr_t A, uintptr_t B, uintptr_t D,
+                                 int M, int N, int K, uintptr_t stream) {
+            self.bf16_nn_fp32(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, to_stream(stream));
         }, py::arg("A"), py::arg("B"), py::arg("D"),
            py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0)
         .def("bf16_nn_res", [](GemmRunner& self,
@@ -1196,6 +1221,499 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("weight"), py::arg("x"),
        py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f, py::arg("stream") = 0);
 
+#ifdef FLASHRT_HAVE_MOLMOACT2
+    // ── MolmoAct2 model-specific helpers (see csrc/kernels/molmoact2_kernels.cu) ──
+    m.def("molmo_mul_bf16", [](uintptr_t a, uintptr_t b, uintptr_t out, int n,
+                                uintptr_t stream, uintptr_t of8,
+                                uintptr_t fscale) {
+        return flash_rt::molmoact2::mul_bf16_out(
+            to_ptr(a), to_ptr(b), to_ptr(out), n, to_stream(stream),
+            to_ptr(of8), to_ptr(fscale));
+    }, py::arg("a"), py::arg("b"), py::arg("out"), py::arg("n"),
+       py::arg("stream") = 0, py::arg("of8") = 0,
+       py::arg("fscale") = 0);
+
+    m.def("molmo_rms_norm768_heads96",
+          [](uintptr_t x, uintptr_t out, int rows, float eps, float eps_head,
+             uintptr_t stream, int hm_rows, int hm_stride) {
+        return flash_rt::molmoact2::rms_norm768_heads96(
+            to_ptr(x), to_ptr(out), rows, eps, eps_head, to_stream(stream),
+            hm_rows, hm_stride);
+    }, py::arg("x"), py::arg("out"), py::arg("rows"), py::arg("eps"),
+       py::arg("eps_head"), py::arg("stream") = 0, py::arg("hm_rows") = 0,
+       py::arg("hm_stride") = 0);
+    m.def("molmo_rms_norm768_ctx_warp",
+          [](uintptr_t x, uintptr_t out, int rows, float eps, float eps_head,
+             int heads, int hm_rows, int hm_stride, uintptr_t stream) {
+        return flash_rt::molmoact2::rms_norm768_ctx_warp(
+            to_ptr(x), to_ptr(out), rows, eps, eps_head, heads, hm_rows,
+            hm_stride, to_stream(stream));
+    }, py::arg("x"), py::arg("out"), py::arg("rows"), py::arg("eps"),
+       py::arg("eps_head"), py::arg("heads"), py::arg("hm_rows") = 0,
+       py::arg("hm_stride") = 0, py::arg("stream") = 0);
+    m.def("molmo_rms_norm768_headmajor",
+          [](uintptr_t x, uintptr_t out, int rows, float eps, int hm_rows,
+             int hm_stride, uintptr_t stream) {
+        return flash_rt::molmoact2::rms_norm768_headmajor(
+            to_ptr(x), to_ptr(out), rows, eps, hm_rows, hm_stride,
+            to_stream(stream));
+    }, py::arg("x"), py::arg("out"), py::arg("rows"), py::arg("eps"),
+       py::arg("hm_rows"), py::arg("hm_stride"), py::arg("stream") = 0);
+    m.def("molmo_rms_norm_bf16",
+          [](uintptr_t x, uintptr_t w, uintptr_t out, int rows, int dim,
+             float eps, uintptr_t stream) {
+        return flash_rt::molmoact2::rms_norm_bf16(
+            to_ptr(x), to_ptr(w), to_ptr(out), rows, dim, eps,
+            to_stream(stream));
+    }, py::arg("x"), py::arg("w"), py::arg("out"), py::arg("rows"),
+       py::arg("dim"), py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+
+    m.def("molmo_gate_residual_bf16",
+          [](uintptr_t res, uintptr_t x, uintptr_t gate, int rows, int dim,
+             uintptr_t stream) {
+        return flash_rt::molmoact2::gate_residual_bf16(
+            to_ptr(res), to_ptr(x), to_ptr(gate), rows, dim,
+            to_stream(stream));
+    }, py::arg("res"), py::arg("x"), py::arg("gate"), py::arg("rows"),
+       py::arg("dim"), py::arg("stream") = 0);
+
+    m.def("molmo_bias_rms_norm_bf16",
+          [](uintptr_t x, uintptr_t bias, uintptr_t w, uintptr_t out,
+             int rows, int heads, int hd, float eps, uintptr_t stream) {
+              return flash_rt::molmoact2::bias_rms_norm_bf16(
+                  reinterpret_cast<const void*>(x),
+                  reinterpret_cast<const void*>(bias),
+                  reinterpret_cast<const void*>(w),
+                  reinterpret_cast<void*>(out), rows, heads, hd, eps,
+                  reinterpret_cast<cudaStream_t>(stream));
+          }, py::arg("x"), py::arg("bias"), py::arg("w"), py::arg("out"),
+             py::arg("rows"), py::arg("heads"), py::arg("hd"), py::arg("eps"),
+             py::arg("stream") = 0);
+    m.def("molmo_skinny_qkv_split_bias",
+          [](uintptr_t p, int splits, uintptr_t ags, uintptr_t wgs,
+             uintptr_t bias, uintptr_t Q, uintptr_t K, uintptr_t V, int rows,
+             int qd, int kd, int vd, uintptr_t stream) {
+        return flash_rt::molmoact2::skinny_qkv_split_bias(
+            to_ptr(p), splits, to_ptr(ags), to_ptr(wgs), to_ptr(bias),
+            to_ptr(Q), to_ptr(K), to_ptr(V), rows, qd, kd, vd,
+            to_stream(stream));
+    }, py::arg("partials"), py::arg("splits"), py::arg("ags"),
+       py::arg("wgs"), py::arg("bias"), py::arg("q"), py::arg("k"),
+       py::arg("v"), py::arg("rows"), py::arg("qd"), py::arg("kd"),
+       py::arg("vd"), py::arg("stream") = 0);
+    m.def("molmo_skinny_gate_residual",
+          [](uintptr_t p, int splits, uintptr_t ags, uintptr_t wgs,
+             uintptr_t bias, uintptr_t res, uintptr_t gate, int rows, int dim,
+             uintptr_t stream) {
+        return flash_rt::molmoact2::skinny_gate_residual(
+            to_ptr(p), splits, to_ptr(ags), to_ptr(wgs), to_ptr(bias),
+            to_ptr(res), to_ptr(gate), rows, dim, to_stream(stream));
+    }, py::arg("partials"), py::arg("splits"), py::arg("ags"),
+       py::arg("wgs"), py::arg("bias"), py::arg("res"), py::arg("gate"),
+       py::arg("rows"), py::arg("dim"), py::arg("stream") = 0);
+    m.def("molmo_skinny_bias_rms_norm",
+          [](uintptr_t p, int splits, uintptr_t ags, uintptr_t wgs,
+             uintptr_t bias, uintptr_t out, int rows, int heads, int hd,
+             float eps, uintptr_t stream) {
+        return flash_rt::molmoact2::skinny_bias_rms_norm(
+            to_ptr(p), splits, to_ptr(ags), to_ptr(wgs), to_ptr(bias),
+            to_ptr(out), rows, heads, hd, eps, to_stream(stream));
+    }, py::arg("partials"), py::arg("splits"), py::arg("ags"),
+       py::arg("wgs"), py::arg("bias"), py::arg("out"), py::arg("rows"),
+       py::arg("heads"), py::arg("hd"), py::arg("eps") = 1e-6f,
+       py::arg("stream") = 0);
+    m.def("molmo_skinny_silu_mul",
+          [](uintptr_t pg, int sg, uintptr_t ags_g, uintptr_t wgs_g,
+             uintptr_t pu, int su, uintptr_t ags_u, uintptr_t wgs_u,
+             uintptr_t bg, uintptr_t bu, uintptr_t out, int rows, int dim,
+             uintptr_t stream) {
+        return flash_rt::molmoact2::skinny_silu_mul(
+            to_ptr(pg), sg, to_ptr(ags_g), to_ptr(wgs_g), to_ptr(pu), su,
+            to_ptr(ags_u), to_ptr(wgs_u), to_ptr(bg), to_ptr(bu),
+            to_ptr(out), rows, dim, to_stream(stream));
+    }, py::arg("pg"), py::arg("splits_g"), py::arg("ags_g"),
+       py::arg("wgs_g"), py::arg("pu"), py::arg("splits_u"),
+       py::arg("ags_u"), py::arg("wgs_u"), py::arg("bg"), py::arg("bu"),
+       py::arg("out"), py::arg("rows"), py::arg("dim"),
+       py::arg("stream") = 0);
+    m.def("molmo_layer_norm_quant_fp8",
+          [](uintptr_t x, uintptr_t w, uintptr_t b, uintptr_t out,
+             uintptr_t scale, int rows, int dim, float eps,
+             uintptr_t stream) {
+        return flash_rt::molmoact2::layer_norm_quant_fp8(
+            to_ptr(x), to_ptr(w), to_ptr(b), to_ptr(out), to_ptr(scale),
+            rows, dim, eps, to_stream(stream));
+    }, py::arg("x"), py::arg("w"), py::arg("b"), py::arg("out"),
+       py::arg("scale"), py::arg("rows"), py::arg("dim"),
+       py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+    m.def("molmo_reciprocal_f32",
+          [](uintptr_t src, uintptr_t dst, int n, uintptr_t stream) {
+        return flash_rt::molmoact2::reciprocal_f32(to_ptr(src), to_ptr(dst), n,
+                                                   to_stream(stream));
+    }, py::arg("src"), py::arg("dst"), py::arg("n"), py::arg("stream") = 0);
+    m.def("molmo_bias_gelu_quant_fp8_vec",
+          [](uintptr_t x, uintptr_t b, uintptr_t out, uintptr_t scale,
+             int rows, int dim, uintptr_t stream) {
+        return flash_rt::molmoact2::bias_gelu_quant_fp8_vec(
+            to_ptr(x), to_ptr(b), to_ptr(out), to_ptr(scale), rows, dim,
+            to_stream(stream));
+    }, py::arg("x"), py::arg("b"), py::arg("out"), py::arg("scale"),
+       py::arg("rows"), py::arg("dim"), py::arg("stream") = 0);
+    m.def("molmo_bias_gelu_quant_fp8",
+          [](uintptr_t x, uintptr_t b, uintptr_t out, uintptr_t scale,
+             int rows, int dim, uintptr_t stream) {
+        return flash_rt::molmoact2::bias_gelu_quant_fp8(
+            to_ptr(x), to_ptr(b), to_ptr(out), to_ptr(scale), rows, dim,
+            to_stream(stream));
+    }, py::arg("x"), py::arg("b"), py::arg("out"), py::arg("scale"),
+       py::arg("rows"), py::arg("dim"), py::arg("stream") = 0);
+    m.def("molmo_qkv_split_bias_norm_rope",
+          [](uintptr_t qkv, uintptr_t bias, uintptr_t qw, uintptr_t kw,
+             uintptr_t cos_t, uintptr_t sin_t, uintptr_t Q, uintptr_t K,
+             uintptr_t V, int rows, int qd, int kd, int vd, int nq, int nk,
+             int hd, float eps, int has_bias, int has_rope,
+             uintptr_t kf8, uintptr_t vf8, uintptr_t kscale,
+             uintptr_t vscale, uintptr_t qf8, uintptr_t qscale,
+             uintptr_t stream) {
+        return flash_rt::molmoact2::qkv_split_bias_norm_rope(
+            to_ptr(qkv), to_ptr(bias), to_ptr(qw), to_ptr(kw), to_ptr(cos_t),
+            to_ptr(sin_t), to_ptr(Q), to_ptr(K), to_ptr(V), rows, qd, kd,
+            vd, nq, nk, hd, eps, has_bias, has_rope, to_ptr(kf8),
+            to_ptr(vf8), to_ptr(kscale), to_ptr(vscale), to_ptr(qf8),
+            to_ptr(qscale), to_stream(stream));
+    }, py::arg("qkv"), py::arg("bias"), py::arg("qw"), py::arg("kw"),
+       py::arg("cos_t"), py::arg("sin_t"), py::arg("q"), py::arg("k"),
+       py::arg("v"), py::arg("rows"), py::arg("qd"), py::arg("kd"),
+       py::arg("vd"), py::arg("nq"), py::arg("nk"), py::arg("hd"),
+       py::arg("eps") = 1e-6f, py::arg("has_bias") = 1,
+       py::arg("has_rope") = 1, py::arg("kf8") = 0, py::arg("vf8") = 0,
+       py::arg("kscale") = 0, py::arg("vscale") = 0, py::arg("qf8") = 0,
+       py::arg("qscale") = 0, py::arg("stream") = 0);
+    m.def("molmo_qkv_norm_rope_fp8_hd128",
+          [](uintptr_t qkv, uintptr_t qw, uintptr_t kw, uintptr_t cos_t,
+             uintptr_t sin_t, uintptr_t qf8, uintptr_t kf8, uintptr_t vf8,
+             uintptr_t qscale, uintptr_t kscale, uintptr_t vscale, int rows,
+             int nq, int nk, int vd, float eps, uintptr_t stream) {
+        return flash_rt::molmoact2::qkv_norm_rope_fp8_hd128(
+            to_ptr(qkv), to_ptr(qw), to_ptr(kw), to_ptr(cos_t), to_ptr(sin_t),
+            to_ptr(qf8), to_ptr(kf8), to_ptr(vf8), to_ptr(qscale),
+            to_ptr(kscale), to_ptr(vscale), rows, nq, nk, vd, eps,
+            to_stream(stream));
+    }, py::arg("qkv"), py::arg("qw"), py::arg("kw"), py::arg("cos_t"),
+       py::arg("sin_t"), py::arg("qf8"), py::arg("kf8"), py::arg("vf8"),
+       py::arg("qscale"), py::arg("kscale"), py::arg("vscale"),
+       py::arg("rows"), py::arg("nq"), py::arg("nk"), py::arg("vd"),
+       py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+    m.def("molmo_qkv_split_vec",
+          [](uintptr_t qkv, uintptr_t Q, uintptr_t K, uintptr_t V, int rows,
+             int qd, int kd, int vd, uintptr_t stream) {
+        return flash_rt::molmoact2::qkv_split_vec(
+            to_ptr(qkv), to_ptr(Q), to_ptr(K), to_ptr(V), rows, qd, kd, vd,
+            to_stream(stream));
+    }, py::arg("qkv"), py::arg("q"), py::arg("k"), py::arg("v"),
+       py::arg("rows"), py::arg("qd"), py::arg("kd"), py::arg("vd"),
+       py::arg("stream") = 0);
+    m.def("molmo_qkv_split_bias",
+          [](uintptr_t qkv, uintptr_t bias, uintptr_t Q, uintptr_t K,
+             uintptr_t V, int seq, int qd, int kd, int vd, uintptr_t stream) {
+        return flash_rt::molmoact2::qkv_split_bias(
+            to_ptr(qkv), to_ptr(bias), to_ptr(Q), to_ptr(K), to_ptr(V),
+            seq, qd, kd, vd, to_stream(stream));
+    }, py::arg("qkv"), py::arg("bias"), py::arg("Q"), py::arg("K"),
+       py::arg("V"), py::arg("seq"), py::arg("qd"), py::arg("kd"),
+       py::arg("vd"), py::arg("stream") = 0);
+
+    m.def("molmo_smallm_gemm_bias_res_bf16out",
+        [](uintptr_t A, uintptr_t SFA, uintptr_t B, uintptr_t SFB,
+           uintptr_t bias, uintptr_t C, uintptr_t D, int M, int N, int K,
+           uintptr_t alpha, float beta, uintptr_t stream) {
+            return flash_rt::kernels::molmo_smallm_gemm_bias_res_bf16out(
+                to_ptr(A), to_ptr(SFA), to_ptr(B), to_ptr(SFB), to_ptr(bias),
+                to_ptr(C), to_ptr(D), M, N, K, to_ptr(alpha), beta,
+                to_stream(stream));
+        },
+        py::arg("A"), py::arg("SFA"), py::arg("B"), py::arg("SFB"),
+        py::arg("bias"), py::arg("C"), py::arg("D"),
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("alpha"),
+        py::arg("beta") = 0.0f, py::arg("stream") = 0);
+    m.def("molmo_skinny_gate_residual_mod_rms768_quant_fp8",
+        [](uintptr_t partials, int splits, uintptr_t ags, uintptr_t wgs,
+           uintptr_t bias, uintptr_t res, uintptr_t gate, uintptr_t scale,
+           uintptr_t shift, uintptr_t out, uintptr_t qscale, int rows,
+           float eps, uintptr_t stream) {
+            return flash_rt::molmoact2::skinny_gate_residual_mod_rms768_quant_fp8(
+                to_ptr(partials), splits, to_ptr(ags), to_ptr(wgs),
+                to_ptr(bias), to_ptr(res), to_ptr(gate), to_ptr(scale),
+                to_ptr(shift), to_ptr(out), to_ptr(qscale), rows, eps,
+                to_stream(stream));
+        },
+        py::arg("partials"), py::arg("splits"), py::arg("ags"),
+        py::arg("wgs"), py::arg("bias"), py::arg("res"), py::arg("gate"),
+        py::arg("scale"), py::arg("shift"), py::arg("out"),
+        py::arg("qscale"), py::arg("rows"), py::arg("eps") = 1e-6f,
+        py::arg("stream") = 0);
+    m.def("molmo_mod_rms_norm_rows768_quant_fp8_exact",
+        [](uintptr_t x, uintptr_t scale, uintptr_t shift, uintptr_t out,
+           uintptr_t qscale, int rows, float eps, uintptr_t stream) {
+            return flash_rt::molmoact2::mod_rms_norm_rows768_quant_fp8_exact(
+                to_ptr(x), to_ptr(scale), to_ptr(shift), to_ptr(out),
+                to_ptr(qscale), rows, eps, to_stream(stream));
+        },
+        py::arg("x"), py::arg("scale"), py::arg("shift"), py::arg("out"),
+        py::arg("qscale"), py::arg("rows"), py::arg("eps"),
+        py::arg("stream") = 0);
+    m.def("molmo_mod_rms_norm_rows768_exact",
+        [](uintptr_t x, uintptr_t scale, uintptr_t shift, uintptr_t out,
+           int rows, float eps, uintptr_t stream) {
+            return flash_rt::molmoact2::mod_rms_norm_rows768_exact(
+                to_ptr(x), to_ptr(scale), to_ptr(shift), to_ptr(out), rows,
+                eps, to_stream(stream));
+        },
+        py::arg("x"), py::arg("scale"), py::arg("shift"), py::arg("out"),
+        py::arg("rows"), py::arg("eps"), py::arg("stream") = 0);
+    m.def("molmo_bias_rms_norm_rows96_exact",
+        [](uintptr_t x, uintptr_t bias, uintptr_t out, int rows, int heads,
+           float eps, uintptr_t stream) {
+            return flash_rt::molmoact2::bias_rms_norm_rows96_exact(
+                to_ptr(x), to_ptr(bias), to_ptr(out), rows, heads, eps,
+                to_stream(stream));
+        },
+        py::arg("x"), py::arg("bias"), py::arg("out"), py::arg("rows"),
+        py::arg("heads"), py::arg("eps"), py::arg("stream") = 0);
+    m.def("molmo_rms_norm_rows96_exact",
+          [](uintptr_t x, uintptr_t out, int rows, float eps, uintptr_t stream) {
+        return flash_rt::molmoact2::rms_norm_rows96_exact(
+            to_ptr(x), to_ptr(out), rows, eps, to_stream(stream));
+    }, py::arg("x"), py::arg("out"), py::arg("rows"), py::arg("eps"),
+       py::arg("stream") = 0);
+    m.def("molmo_rms_norm_rows_bf16",
+          [](uintptr_t x, uintptr_t w, uintptr_t out, int rows, int dim,
+             float eps, uintptr_t stream) {
+        return flash_rt::molmoact2::rms_norm_rows_bf16(
+            to_ptr(x), to_ptr(w), to_ptr(out), rows, dim, eps,
+            to_stream(stream));
+    }, py::arg("x"), py::arg("w"), py::arg("out"), py::arg("rows"),
+       py::arg("dim"), py::arg("eps"), py::arg("stream") = 0);
+    m.def("molmo_silu_mul_bias",
+          [](uintptr_t g, uintptr_t u, uintptr_t bg, uintptr_t bu,
+             uintptr_t out, int rows, int dim, uintptr_t stream) {
+        return flash_rt::molmoact2::silu_mul_bias(
+            to_ptr(g), to_ptr(u), to_ptr(bg), to_ptr(bu), to_ptr(out),
+            rows, dim, to_stream(stream));
+    }, py::arg("g"), py::arg("u"), py::arg("bg"), py::arg("bu"),
+       py::arg("out"), py::arg("rows"), py::arg("dim"),
+       py::arg("stream") = 0);
+
+    m.def("action_swiglu_fp8",
+          [](uintptr_t A, uintptr_t Wu, uintptr_t Wg, uintptr_t bu,
+             uintptr_t bg, uintptr_t out, int M, int K, int N,
+             float alpha_u, float alpha_g, uintptr_t stream) {
+        return flash_rt::molmoact2::action_swiglu_fp8(
+            to_ptr(A), to_ptr(Wu), to_ptr(Wg), to_ptr(bu), to_ptr(bg),
+            to_ptr(out), M, K, N, alpha_u, alpha_g, to_stream(stream));
+    }, py::arg("A"), py::arg("Wu"), py::arg("Wg"), py::arg("bu"),
+       py::arg("bg"), py::arg("out"), py::arg("M"), py::arg("K"),
+       py::arg("N"), py::arg("alpha_u"), py::arg("alpha_g"),
+       py::arg("stream") = 0);
+
+    // Action-expert persistent layer kernel. `params` holds the raw bytes of
+    // flash_rt::molmoact2::ActionMkParams (built by the MolmoAct2 pipeline).
+    m.def("molmo_action_mk_layers",
+          [](py::bytes params, int grid, uintptr_t stream) {
+        const std::string raw = params;
+        if (raw.size() != sizeof(flash_rt::molmoact2::ActionMkParams)) return -1;
+        flash_rt::molmoact2::ActionMkParams p;
+        std::memcpy(&p, raw.data(), sizeof(p));
+        return flash_rt::molmoact2::action_mk_layers(p, grid, to_stream(stream));
+    }, py::arg("params"), py::arg("grid"), py::arg("stream") = 0);
+
+    m.def("molmo_action_mk_struct_sizes", []() {
+        return py::make_tuple(
+            sizeof(flash_rt::molmoact2::ActionMkLayer),
+            sizeof(flash_rt::molmoact2::ActionMkScales),
+            sizeof(flash_rt::molmoact2::ActionMkParams),
+            flash_rt::molmoact2::action_mk_smem_bytes());
+    });
+
+    m.def("molmo_action_mk_pack_fp8",
+          [](uintptr_t w, uintptr_t out, int N, int K, int kn, uintptr_t stream) {
+        return flash_rt::molmoact2::action_mk_pack_fp8(
+            to_ptr(w), to_ptr(out), N, K, kn, to_stream(stream));
+    }, py::arg("w"), py::arg("out"), py::arg("N"), py::arg("K"),
+       py::arg("kn"), py::arg("stream") = 0);
+
+    m.def("molmo_gate_residual_bias",
+          [](uintptr_t res, uintptr_t x, uintptr_t gate, uintptr_t bias,
+             int rows, int dim, uintptr_t stream) {
+        return flash_rt::molmoact2::gate_residual_bias(
+            to_ptr(res), to_ptr(x), to_ptr(gate), to_ptr(bias), rows, dim,
+            to_stream(stream));
+    }, py::arg("res"), py::arg("x"), py::arg("gate"), py::arg("bias"),
+       py::arg("rows"), py::arg("dim"), py::arg("stream") = 0);
+
+    m.def("molmo_mod_rms_norm_quant_fp8",
+          [](uintptr_t x, uintptr_t w, uintptr_t scale, uintptr_t shift,
+             uintptr_t out, uintptr_t qscale, int rows, int dim, float eps,
+             uintptr_t stream) {
+        return flash_rt::molmoact2::mod_rms_norm_quant_fp8(
+            to_ptr(x), to_ptr(w), to_ptr(scale), to_ptr(shift), to_ptr(out),
+            to_ptr(qscale), rows, dim, eps, to_stream(stream));
+    }, py::arg("x"), py::arg("w"), py::arg("scale"), py::arg("shift"),
+       py::arg("out"), py::arg("qscale"), py::arg("rows"), py::arg("dim"),
+       py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+
+    m.def("molmo_silu_mul_quant_fp8",
+          [](uintptr_t g, uintptr_t u, uintptr_t bg, uintptr_t bu,
+             uintptr_t out, uintptr_t qscale, int rows, int dim,
+             uintptr_t stream) {
+        return flash_rt::molmoact2::silu_mul_quant_fp8(
+            to_ptr(g), to_ptr(u), to_ptr(bg), to_ptr(bu), to_ptr(out),
+            to_ptr(qscale), rows, dim, to_stream(stream));
+    }, py::arg("g"), py::arg("u"), py::arg("bg"), py::arg("bu"),
+       py::arg("out"), py::arg("qscale"), py::arg("rows"), py::arg("dim"),
+       py::arg("stream") = 0);
+
+    m.def("molmo_cast_bf16_to_fp16",
+          [](uintptr_t src, uintptr_t dst, int n, uintptr_t stream) {
+        return flash_rt::molmoact2::cast_bf16_to_fp16(
+            to_ptr(src), to_ptr(dst), n, to_stream(stream));
+    }, py::arg("src"), py::arg("dst"), py::arg("n"), py::arg("stream") = 0);
+
+    m.def("molmo_cast_fp16_to_bf16",
+          [](uintptr_t src, uintptr_t dst, int n, uintptr_t stream) {
+        return flash_rt::molmoact2::cast_fp16_to_bf16(
+            to_ptr(src), to_ptr(dst), n, to_stream(stream));
+    }, py::arg("src"), py::arg("dst"), py::arg("n"), py::arg("stream") = 0);
+
+    m.def("molmo_silu_mul_bf16",
+          [](uintptr_t g, uintptr_t u, uintptr_t out, int n, uintptr_t stream) {
+        return flash_rt::molmoact2::silu_mul_bf16(
+            to_ptr(g), to_ptr(u), to_ptr(out), n, to_stream(stream));
+    }, py::arg("g"), py::arg("u"), py::arg("out"), py::arg("n"),
+       py::arg("stream") = 0);
+
+    m.def("molmo_bias_round_bf16",
+          [](uintptr_t acc, uintptr_t bias, uintptr_t out, int rows, int dim,
+             uintptr_t stream) {
+        return flash_rt::molmoact2::bias_round_bf16(
+            to_ptr(acc), to_ptr(bias), to_ptr(out), rows, dim,
+            to_stream(stream));
+    }, py::arg("acc"), py::arg("bias"), py::arg("out"), py::arg("rows"),
+       py::arg("dim"), py::arg("stream") = 0);
+
+    m.def("molmo_add_bias_bf16",
+          [](uintptr_t x, uintptr_t bias, int rows, int dim, uintptr_t stream) {
+        return flash_rt::molmoact2::add_bias_bf16(
+            to_ptr(x), to_ptr(bias), rows, dim, to_stream(stream));
+    }, py::arg("x"), py::arg("bias"), py::arg("rows"), py::arg("dim"),
+       py::arg("stream") = 0);
+
+    m.def("molmo_action_denorm_bf16",
+          [](uintptr_t traj, uintptr_t out, uintptr_t q01, uintptr_t q99,
+             uintptr_t mask, int rows, int stride, int act_dim,
+             uintptr_t stream) {
+        return flash_rt::molmoact2::action_denorm_bf16(
+            to_ptr(traj), to_ptr(out), to_ptr(q01), to_ptr(q99),
+            to_ptr(mask), rows, stride, act_dim, to_stream(stream));
+    }, py::arg("traj"), py::arg("out"), py::arg("q01"), py::arg("q99"),
+       py::arg("mask"), py::arg("rows"), py::arg("stride"),
+       py::arg("act_dim"), py::arg("stream") = 0);
+
+    m.def("molmo_qk_norm_rope_bf16",
+          [](uintptr_t x, uintptr_t w, uintptr_t cos_t, uintptr_t sin_t,
+             int S, int NH, int HD, float eps, int has_weight,
+             uintptr_t stream) {
+        return flash_rt::molmoact2::qk_norm_rope_bf16(
+            to_ptr(x), to_ptr(w), to_ptr(cos_t), to_ptr(sin_t), S, NH, HD,
+            eps, has_weight, to_stream(stream));
+    }, py::arg("x"), py::arg("w"), py::arg("cos_table"),
+       py::arg("sin_table"), py::arg("S"), py::arg("NH"), py::arg("HD"),
+       py::arg("eps") = 1e-6f, py::arg("has_weight") = 1,
+       py::arg("stream") = 0);
+
+    m.def("molmo_pool_mean_bf16",
+          [](uintptr_t feats, uintptr_t idx, uintptr_t out, int P, int I, int D,
+             uintptr_t stream, uintptr_t of8, uintptr_t fscale) {
+        return flash_rt::molmoact2::pool_mean_bf16(
+            to_ptr(feats), to_ptr(idx), to_ptr(out), P, I, D,
+            to_stream(stream), to_ptr(of8), to_ptr(fscale));
+    }, py::arg("feats"), py::arg("idx"), py::arg("out"),
+       py::arg("P"), py::arg("I"), py::arg("D"), py::arg("stream") = 0,
+       py::arg("of8") = 0, py::arg("fscale") = 0);
+
+    m.def("molmo_pool_attn_bf16",
+          [](uintptr_t q, uintptr_t k, uintptr_t v, uintptr_t idx,
+             uintptr_t out, int P, int I, int NH, int HD, float scale,
+             uintptr_t stream, uintptr_t of8, uintptr_t fscale) {
+        return flash_rt::molmoact2::pool_attn_bf16(
+            to_ptr(q), to_ptr(k), to_ptr(v), to_ptr(idx), to_ptr(out),
+            P, I, NH, HD, scale, to_stream(stream), to_ptr(of8),
+            to_ptr(fscale));
+    }, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("idx"),
+       py::arg("out"), py::arg("P"), py::arg("I"), py::arg("NH"),
+       py::arg("HD"), py::arg("scale"), py::arg("stream") = 0,
+       py::arg("of8") = 0, py::arg("fscale") = 0);
+    m.def("molmo_concat2_quant_fp8",
+          [](uintptr_t a, uintptr_t b, uintptr_t out, int rows, int cols_a,
+             int cols_b, uintptr_t stream, uintptr_t of8,
+             uintptr_t fscale) {
+        return flash_rt::molmoact2::concat2_quant_fp8(
+            to_ptr(a), to_ptr(b), to_ptr(out), rows, cols_a, cols_b,
+            to_stream(stream), to_ptr(of8), to_ptr(fscale));
+    }, py::arg("a"), py::arg("b"), py::arg("out"), py::arg("rows"),
+       py::arg("cols_a"), py::arg("cols_b"), py::arg("stream") = 0,
+       py::arg("of8") = 0, py::arg("fscale") = 0);
+
+    m.def("molmo_mod_rms_norm_bf16",
+          [](uintptr_t x, uintptr_t w, uintptr_t scale, uintptr_t shift,
+             uintptr_t out, int rows, int dim, float eps, uintptr_t stream) {
+        return flash_rt::molmoact2::mod_rms_norm_bf16(
+            to_ptr(x), to_ptr(w), to_ptr(scale), to_ptr(shift), to_ptr(out),
+            rows, dim, eps, to_stream(stream));
+    }, py::arg("x"), py::arg("w"), py::arg("scale"), py::arg("shift"),
+       py::arg("out"), py::arg("rows"), py::arg("dim"),
+       py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+
+    m.def("molmo_state_discretize_f32",
+          [](uintptr_t state, uintptr_t q01, uintptr_t q99, uintptr_t mask,
+             uintptr_t zero_mask, uintptr_t ids, int D, int num_tokens,
+             int base_id, uintptr_t stream) {
+        return flash_rt::molmoact2::state_discretize_f32(
+            to_ptr(state), to_ptr(q01), to_ptr(q99), to_ptr(mask),
+            to_ptr(zero_mask), to_ptr(ids), D, num_tokens, base_id,
+            to_stream(stream));
+    }, py::arg("state"), py::arg("q01"), py::arg("q99"),
+       py::arg("mask"), py::arg("zero_mask"), py::arg("ids"),
+       py::arg("D"), py::arg("num_tokens"), py::arg("base_id"),
+       py::arg("stream") = 0);
+
+    m.def("molmo_mask_dims_bf16",
+          [](uintptr_t x, int rows, int dim, int valid, uintptr_t stream) {
+        return flash_rt::molmoact2::mask_dims_bf16(
+            to_ptr(x), rows, dim, valid, to_stream(stream));
+    }, py::arg("x"), py::arg("rows"), py::arg("dim"), py::arg("valid"),
+       py::arg("stream") = 0);
+
+    m.def("molmo_bias_round_add_bf16",
+          [](uintptr_t acc, uintptr_t bias, uintptr_t add, uintptr_t out,
+             int rows, int dim, uintptr_t stream) {
+        return flash_rt::molmoact2::bias_round_add_bf16(
+            to_ptr(acc), to_ptr(bias), to_ptr(add), to_ptr(out), rows, dim,
+            to_stream(stream));
+    }, py::arg("acc"), py::arg("bias"), py::arg("add"), py::arg("out"),
+       py::arg("rows"), py::arg("dim"), py::arg("stream") = 0);
+    m.def("molmo_resize_patchify_bf16",
+          [](uintptr_t img, uintptr_t out, int H, int W, int C, int OH,
+             int OW, int patch, uintptr_t stream, int out_stride) {
+        return flash_rt::molmoact2::resize_patchify_bf16(
+            to_ptr(img), to_ptr(out), H, W, C, OH, OW, patch,
+            to_stream(stream), out_stride);
+    }, py::arg("img"), py::arg("out"), py::arg("H"), py::arg("W"),
+       py::arg("C"), py::arg("OH"), py::arg("OW"), py::arg("patch"),
+       py::arg("stream") = 0, py::arg("out_stride") = 0);
+
+    // MolmoAct2 bindings are compiled only with -DFLASHRT_ENABLE_MOLMOACT2=ON.
+#endif  // FLASHRT_HAVE_MOLMOACT2
     m.def("layer_norm", [](uintptr_t x, uintptr_t weight, uintptr_t bias,
                             uintptr_t out, int seq_len, int dim, float eps, uintptr_t stream) {
         layer_norm(typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(weight),
@@ -4983,6 +5501,114 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("out_fp4"), py::arg("out_sf"),
         py::arg("Lq"), py::arg("Lk"), py::arg("Hq"), py::arg("Hkv"),
         py::arg("softmax_scale"), py::arg("stream") = 0);
+#endif
+
+#ifdef FLASHRT_HAVE_MOLMOACT2
+    // MolmoAct2 text prefill: the 64x64 FP8 causal GQA tile and its
+    // two-producer-warp sibling. Implemented in the shared SM120 FP8 prefill
+    // object (FLASHRT_ENABLE_QWEN3_FP8_PREFILL, which the MolmoAct2 gate
+    // enables).
+#if defined(ENABLE_QWEN3_FP8_PREFILL_ATTN)
+    m.def("fmha_fp8_causal_gqa_q64_nhd_d128_fp4out_wsp",
+        [](uintptr_t q_fp8, uintptr_t k_fp8, uintptr_t v_fp8,
+           uintptr_t out_fp4, uintptr_t out_sf,
+           int Lq, int Lk, int Hq, int Hkv,
+           float softmax_scale, uintptr_t stream) {
+            return flash_rt::attention::fmha_fp8_causal_gqa_q64_nhd_d128_fp4out_wsp(
+                to_ptr(q_fp8), to_ptr(k_fp8), to_ptr(v_fp8),
+                to_ptr(out_fp4), to_ptr(out_sf), Lq, Lk, Hq, Hkv,
+                softmax_scale, to_stream(stream));
+        },
+        py::arg("q_fp8"), py::arg("k_fp8"), py::arg("v_fp8"),
+        py::arg("out_fp4"), py::arg("out_sf"),
+        py::arg("Lq"), py::arg("Lk"), py::arg("Hq"), py::arg("Hkv"),
+        py::arg("softmax_scale"), py::arg("stream") = 0);
+    m.def("fmha_fp8_causal_gqa_q64_nhd_d128_fp4out",
+        [](uintptr_t q_fp8, uintptr_t k_fp8, uintptr_t v_fp8,
+           uintptr_t out_fp4, uintptr_t out_sf,
+           int Lq, int Lk, int Hq, int Hkv,
+           float softmax_scale, uintptr_t stream) {
+            return flash_rt::attention::fmha_fp8_causal_gqa_q64_nhd_d128_fp4out(
+                to_ptr(q_fp8), to_ptr(k_fp8), to_ptr(v_fp8),
+                to_ptr(out_fp4), to_ptr(out_sf), Lq, Lk, Hq, Hkv,
+                softmax_scale, to_stream(stream));
+        },
+        py::arg("q_fp8"), py::arg("k_fp8"), py::arg("v_fp8"),
+        py::arg("out_fp4"), py::arg("out_sf"),
+        py::arg("Lq"), py::arg("Lk"), py::arg("Hq"), py::arg("Hkv"),
+        py::arg("softmax_scale"), py::arg("stream") = 0);
+#endif  // ENABLE_QWEN3_FP8_PREFILL_ATTN
+
+    // MolmoAct2 vision-tower BF16 attention (head_dim 72, 16 heads,
+    // non-causal). Returns non-zero for an unsupported shape.
+    m.def("molmo_vit_attn_bf16",
+        [](uintptr_t q, uintptr_t k, uintptr_t v, uintptr_t out,
+           int batch, int seqlen, int heads, int head_dim,
+           int qkv_row_stride, int out_row_stride,
+           float softmax_scale, uintptr_t stream) {
+            return flash_rt::attention::molmo_vit_attn_bf16(
+                to_ptr(q), to_ptr(k), to_ptr(v), to_ptr(out),
+                batch, seqlen, heads, head_dim,
+                qkv_row_stride, out_row_stride, softmax_scale,
+                to_stream(stream));
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("out"),
+        py::arg("batch"), py::arg("seqlen"), py::arg("heads"),
+        py::arg("head_dim"), py::arg("qkv_row_stride"),
+        py::arg("out_row_stride"), py::arg("softmax_scale"),
+        py::arg("stream") = 0);
+
+    m.def("molmo_vit_attn_bf16_fp8out",
+        [](uintptr_t q, uintptr_t k, uintptr_t v, uintptr_t out_fp8,
+           uintptr_t out_scale, int batch, int seqlen, int heads,
+           int head_dim, int qkv_row_stride, int out_row_stride,
+           float softmax_scale, uintptr_t stream) {
+            return flash_rt::attention::molmo_vit_attn_bf16_fp8out(
+                to_ptr(q), to_ptr(k), to_ptr(v), to_ptr(out_fp8),
+                reinterpret_cast<const float*>(out_scale),
+                batch, seqlen, heads, head_dim,
+                qkv_row_stride, out_row_stride, softmax_scale,
+                to_stream(stream));
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("out_fp8"),
+        py::arg("out_scale"), py::arg("batch"), py::arg("seqlen"),
+        py::arg("heads"), py::arg("head_dim"), py::arg("qkv_row_stride"),
+        py::arg("out_row_stride"), py::arg("softmax_scale"),
+        py::arg("stream") = 0);
+
+    m.def("molmo_vit_attn_f16pv",
+        [](uintptr_t q, uintptr_t k, uintptr_t v, uintptr_t out,
+           int batch, int seqlen, int heads, int head_dim,
+           int qkv_row_stride, int out_row_stride,
+           float softmax_scale, uintptr_t stream) {
+            return flash_rt::attention::molmo_vit_attn_f16pv(
+                to_ptr(q), to_ptr(k), to_ptr(v), to_ptr(out),
+                batch, seqlen, heads, head_dim,
+                qkv_row_stride, out_row_stride, softmax_scale,
+                to_stream(stream));
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("out"),
+        py::arg("batch"), py::arg("seqlen"), py::arg("heads"),
+        py::arg("head_dim"), py::arg("qkv_row_stride"),
+        py::arg("out_row_stride"), py::arg("softmax_scale"),
+        py::arg("stream") = 0);
+
+    m.def("molmo_vit_attn_bf16_persist",
+        [](uintptr_t q, uintptr_t k, uintptr_t v, uintptr_t out,
+           int batch, int seqlen, int heads, int head_dim,
+           int qkv_row_stride, int out_row_stride,
+           float softmax_scale, int blocks, uintptr_t stream) {
+            return flash_rt::attention::molmo_vit_attn_bf16_persist(
+                to_ptr(q), to_ptr(k), to_ptr(v), to_ptr(out),
+                batch, seqlen, heads, head_dim,
+                qkv_row_stride, out_row_stride, softmax_scale, blocks,
+                to_stream(stream));
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("out"),
+        py::arg("batch"), py::arg("seqlen"), py::arg("heads"),
+        py::arg("head_dim"), py::arg("qkv_row_stride"),
+        py::arg("out_row_stride"), py::arg("softmax_scale"),
+        py::arg("blocks") = 72, py::arg("stream") = 0);
 #endif
 
     m.def("quant_per_block_int8_bf16_d128",
@@ -8932,6 +9558,28 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                                                      M, N, K, cfg, pdl, to_stream(stream));
     }, py::arg("A"), py::arg("a_gs"), py::arg("W"), py::arg("SFB"), py::arg("partials"), py::arg("M"),
        py::arg("N"), py::arg("K"), py::arg("cfg"), py::arg("pdl") = true, py::arg("stream") = 0);
+    m.def("nvfp4_skinny_gemm_gate_residual_fused",
+          [](uintptr_t A, uintptr_t a_gs, uintptr_t W, uintptr_t SFB,
+             uintptr_t partials, uintptr_t ags, uintptr_t wgs, uintptr_t bias,
+             uintptr_t res, uintptr_t gate, uintptr_t counters,
+             int M, int N, int K, int cfg, uintptr_t stream) {
+        flash_rt::nvfp4_skinny::SkinnyFusedEpilogue fg;
+        fg.ags = reinterpret_cast<const float*>(ags);
+        fg.wgs = reinterpret_cast<const float*>(wgs);
+        fg.bias = reinterpret_cast<const __nv_bfloat16*>(bias);
+        fg.res = reinterpret_cast<__nv_bfloat16*>(res);
+        fg.gate = reinterpret_cast<const __nv_bfloat16*>(gate);
+        fg.counters = reinterpret_cast<int*>(counters);
+        return flash_rt::nvfp4_skinny::gemm_gate_residual_fused(
+            reinterpret_cast<const __nv_bfloat16*>(A),
+            reinterpret_cast<const float*>(a_gs),
+            to_ptr(W), to_ptr(SFB), reinterpret_cast<float*>(partials), &fg,
+            M, N, K, cfg, to_stream(stream));
+    }, py::arg("A"), py::arg("a_gs"), py::arg("W"), py::arg("SFB"),
+       py::arg("partials"), py::arg("ags"), py::arg("wgs"), py::arg("bias"),
+       py::arg("res"), py::arg("gate"), py::arg("counters"),
+       py::arg("M"), py::arg("N"), py::arg("K"), py::arg("cfg"),
+       py::arg("stream") = 0);
     m.def("nvfp4_skinny_pack_weight", [](uintptr_t w, uintptr_t sf, uintptr_t w_packed, uintptr_t sf_packed,
                                         int N, int K, uintptr_t stream) {
         return flash_rt::nvfp4_skinny::pack_weight(typed_ptr<uint8_t>(w), typed_ptr<uint8_t>(sf),
@@ -9005,18 +9653,56 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("A"), py::arg("B"), py::arg("SFA"), py::arg("SFB"), py::arg("bias"), py::arg("C"), py::arg("D"),
        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("alpha"), py::arg("beta"), py::arg("schedule") = 0,
        py::arg("stream") = 0);
+    m.def("nvfp4_gemm_bias_res_k128_bf16out", [](uintptr_t A, uintptr_t B2, uintptr_t SFA, uintptr_t SFB, uintptr_t bias,
+                                                uintptr_t C, uintptr_t D, int M, int N, int K, uintptr_t alpha,
+                                                float beta, int schedule, uintptr_t stream) {
+        return flash_rt::gemm::nvfp4_gemm_bias_res_k128_bf16out_sm120(to_ptr(A), to_ptr(B2), to_ptr(SFA), to_ptr(SFB),
+                                                                      to_ptr(bias), to_ptr(C), to_ptr(D), M, N, K,
+                                                                      typed_ptr<float>(alpha), beta, schedule,
+                                                                      to_stream(stream));
+    }, py::arg("A"), py::arg("B"), py::arg("SFA"), py::arg("SFB"), py::arg("bias"), py::arg("C"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"), py::arg("alpha"), py::arg("beta"), py::arg("schedule") = 0,
+       py::arg("stream") = 0);
+    m.def("nvfp4_gemm_bias_gelu_fp8out_k128", [](uintptr_t A, uintptr_t B2, uintptr_t SFA, uintptr_t SFB,
+                                                uintptr_t bias, uintptr_t D, int M, int N, int K,
+                                                uintptr_t alpha, uintptr_t inv_scale, uintptr_t stream) {
+        return flash_rt::gemm::nvfp4_gemm_bias_gelu_fp8out_k128_sm120(
+            to_ptr(A), to_ptr(B2), to_ptr(SFA), to_ptr(SFB), to_ptr(bias), to_ptr(D), M, N, K,
+            typed_ptr<float>(alpha), typed_ptr<float>(inv_scale), to_stream(stream));
+    }, py::arg("A"), py::arg("B"), py::arg("SFA"), py::arg("SFB"), py::arg("bias"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"), py::arg("alpha"), py::arg("inv_scale"),
+       py::arg("stream") = 0);
     m.def("nvfp4_sf_bytes", [](int rows, int cols) { return flash_rt::nvfp4_prefill::sf_bytes(rows, cols); },
           py::arg("rows"), py::arg("cols"));
     m.def("nvfp4_norm_quant", [](uintptr_t x, uintptr_t weight, uintptr_t bias, int mode, float eps, uintptr_t out,
                                 uintptr_t out_sf, uintptr_t gs, int rows, int dim, uintptr_t stream,
-                                uintptr_t residual) {
+                                uintptr_t residual, uintptr_t residual_bias) {
         return flash_rt::nvfp4_prefill::norm_quant(typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(residual),
                                                    typed_ptr<__nv_bfloat16>(weight), typed_ptr<__nv_bfloat16>(bias),
                                                    mode, eps, typed_ptr<uint8_t>(out), typed_ptr<uint8_t>(out_sf),
-                                                   typed_ptr<float>(gs), rows, dim, to_stream(stream));
+                                                   typed_ptr<float>(gs), rows, dim, to_stream(stream),
+                                                   typed_ptr<__nv_bfloat16>(residual_bias));
     }, py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("mode"), py::arg("eps"), py::arg("out"),
        py::arg("out_sf"), py::arg("gs"), py::arg("rows"), py::arg("dim"), py::arg("stream") = 0,
-       py::arg("residual") = 0);
+       py::arg("residual") = 0, py::arg("residual_bias") = 0);
+    m.def("nvfp4_norm_quant_warp", [](uintptr_t x, uintptr_t weight, uintptr_t bias, int mode, float eps, uintptr_t out,
+                                uintptr_t out_sf, uintptr_t gs, int rows, int dim, uintptr_t stream,
+                                uintptr_t residual, uintptr_t residual_bias, int mw_wpr) {
+        return flash_rt::nvfp4_prefill::norm_quant_warp(typed_ptr<__nv_bfloat16>(x), typed_ptr<__nv_bfloat16>(residual),
+                                                   typed_ptr<__nv_bfloat16>(weight), typed_ptr<__nv_bfloat16>(bias),
+                                                   mode, eps, typed_ptr<uint8_t>(out), typed_ptr<uint8_t>(out_sf),
+                                                   typed_ptr<float>(gs), rows, dim, to_stream(stream),
+                                                   typed_ptr<__nv_bfloat16>(residual_bias), mw_wpr);
+    }, py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("mode"), py::arg("eps"), py::arg("out"),
+       py::arg("out_sf"), py::arg("gs"), py::arg("rows"), py::arg("dim"), py::arg("stream") = 0,
+       py::arg("residual") = 0, py::arg("residual_bias") = 0, py::arg("mw_wpr") = 0);
+    m.def("nvfp4_gelu_mul_quant", [](uintptr_t a, uintptr_t b, uintptr_t out, uintptr_t out_sf, uintptr_t gs,
+                                     int rows, int cols, uintptr_t stream) {
+        return flash_rt::nvfp4_prefill::gelu_mul_quant(typed_ptr<__nv_bfloat16>(a), typed_ptr<__nv_bfloat16>(b),
+                                                       typed_ptr<uint8_t>(out), typed_ptr<uint8_t>(out_sf),
+                                                       typed_ptr<float>(gs), rows, cols, to_stream(stream));
+    }, py::arg("a"), py::arg("b"), py::arg("out"), py::arg("out_sf"), py::arg("gs"), py::arg("rows"),
+       py::arg("cols"), py::arg("stream") = 0);
     m.def("nvfp4_gemm_bias_gelu_fp4out", [](uintptr_t A, uintptr_t B, uintptr_t SFA, uintptr_t SFB, uintptr_t bias,
                                            uintptr_t D, uintptr_t SFD, int M, int N, int K, uintptr_t alpha,
                                            uintptr_t norm_constant, uintptr_t stream) {
@@ -9540,21 +10226,21 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
            uintptr_t D_packed, uintptr_t SFD,
            int M, int N, int K,
            float alpha_gate, float alpha_up,
-           uintptr_t stream) {
+           uintptr_t stream, bool ceil_sf) {
             flash_rt::gemm::fp4_w4a16_dual_gemm_silu_fp4out_sm120(
                 to_ptr(A_packed), to_ptr(Bgate_packed), to_ptr(Bup_packed),
                 to_ptr(SFA), to_ptr(SFBgate), to_ptr(SFBup),
                 to_ptr(D_packed), to_ptr(SFD),
                 M, N, K,
                 alpha_gate, alpha_up,
-                to_stream(stream));
+                to_stream(stream), ceil_sf);
         },
         py::arg("A_packed"), py::arg("Bgate_packed"), py::arg("Bup_packed"),
         py::arg("SFA"), py::arg("SFBgate"), py::arg("SFBup"),
         py::arg("D_packed"), py::arg("SFD"),
         py::arg("M"), py::arg("N"), py::arg("K"),
         py::arg("alpha_gate") = 1.0f, py::arg("alpha_up") = 1.0f,
-        py::arg("stream") = 0);
+        py::arg("stream") = 0, py::arg("ceil_sf") = false);
 
     // Even-column compaction of the SwiGLU epilogue-fold FP4 output
     // ([M,inter] dup'd bytes -> [M,inter/2] packed NVFP4). SFD passes through.
@@ -10171,6 +10857,19 @@ stages in {2,3}. M in 1..48; K%64==0; (K/64)%kg==0; N%cols==0.
            uintptr_t packed, uintptr_t sf_swz,
            int rows, int cols, uintptr_t stream) -> int {
             return flash_rt::kernels::silu_mul_merged_to_nvfp4_swizzled_bf16(
+                to_ptr(merged_gate_up),
+                to_ptr(packed), to_ptr(sf_swz),
+                rows, cols, to_stream(stream));
+        },
+        py::arg("merged_gate_up"),
+        py::arg("packed"), py::arg("sf_swz"),
+        py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
+
+    m.def("silu_mul_merged_to_nvfp4_swizzled_vec_bf16",
+        [](uintptr_t merged_gate_up,
+           uintptr_t packed, uintptr_t sf_swz,
+           int rows, int cols, uintptr_t stream) -> int {
+            return flash_rt::kernels::silu_mul_merged_to_nvfp4_swizzled_vec_bf16(
                 to_ptr(merged_gate_up),
                 to_ptr(packed), to_ptr(sf_swz),
                 rows, cols, to_stream(stream));

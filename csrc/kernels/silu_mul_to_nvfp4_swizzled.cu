@@ -409,6 +409,131 @@ __global__ void silu_mul_merged_to_nvfp4_swizzled_grouped32_kernel(
   }
 }
 
+// 8-wide vectorized replica of silu_mul_merged_to_nvfp4_swizzled_kernel.
+// Same per-element arithmetic (fp32 silu via expf, bf16 round-trip, bf16
+// product), same 16-element block scales and same packed/SF bytes: the
+// block amax is order-independent and every 8-element vector lies inside
+// one 16-element scale block, so the result is byte-identical. Global
+// loads become 16-byte vectors, the smem intermediate moves in 16-byte
+// chunks, and the amax atomics drop from cols to cols/8.
+__global__ void silu_mul_merged_to_nvfp4_swizzled_vec_kernel(
+    const __nv_bfloat16* __restrict__ merged_gate_up,
+    uint8_t* __restrict__ packed,
+    uint8_t* __restrict__ sf_swz,
+    int cols,
+    int num_blocks,
+    int n_col_blocks) {
+  int row = blockIdx.x;
+  const __nv_bfloat16* gate_row =
+      merged_gate_up + (size_t)row * (2 * cols);
+  const __nv_bfloat16* up_row = gate_row + cols;
+  uint8_t* packed_row = packed + (size_t)row * (cols / 2);
+
+  extern __shared__ __align__(16) uint8_t smem_raw[];
+  float* smem_scales = reinterpret_cast<float*>(smem_raw);
+  const size_t vals_off = ((num_blocks * sizeof(float)) + 15) & ~size_t(15);
+  __nv_bfloat16* smem_silu_mul = reinterpret_cast<__nv_bfloat16*>(
+      smem_raw + vals_off);
+
+  for (int b = threadIdx.x; b < num_blocks; b += blockDim.x) {
+    smem_scales[b] = 0.0f;
+  }
+  __syncthreads();
+
+  const int nvec = cols >> 3;
+  for (int v = threadIdx.x; v < nvec; v += blockDim.x) {
+    const int i = v << 3;
+    uint4 gp = *reinterpret_cast<const uint4*>(gate_row + i);
+    uint4 uq = *reinterpret_cast<const uint4*>(up_row + i);
+    const __nv_bfloat16* gs = reinterpret_cast<const __nv_bfloat16*>(&gp);
+    const __nv_bfloat16* us = reinterpret_cast<const __nv_bfloat16*>(&uq);
+    uint4 sm;
+    __nv_bfloat16* ss = reinterpret_cast<__nv_bfloat16*>(&sm);
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      float g = __bfloat162float(gs[j]);
+      float u = __bfloat162float(us[j]);
+      float silu_g = silu_f32(g);
+      float silu_g_bf = static_cast<float>(__float2bfloat16(silu_g));
+      __nv_bfloat16 silu_mul_bf = __float2bfloat16(silu_g_bf * u);
+      ss[j] = silu_mul_bf;
+      amax = fmaxf(amax, fabsf(static_cast<float>(silu_mul_bf)));
+    }
+    *reinterpret_cast<uint4*>(smem_silu_mul + i) = sm;
+    atomicMax(reinterpret_cast<int*>(&smem_scales[i >> 4]),
+              __float_as_int(amax));
+  }
+  // Tail (cols not a multiple of 8): same arithmetic as the scalar kernel.
+  for (int i = (nvec << 3) + threadIdx.x; i < cols; i += blockDim.x) {
+    float g = __bfloat162float(gate_row[i]);
+    float u = __bfloat162float(up_row[i]);
+    float silu_g = silu_f32(g);
+    float silu_g_bf = static_cast<float>(__float2bfloat16(silu_g));
+    __nv_bfloat16 silu_mul_bf = __float2bfloat16(silu_g_bf * u);
+    smem_silu_mul[i] = silu_mul_bf;
+    float val = fabsf(static_cast<float>(silu_mul_bf));
+    atomicMax(reinterpret_cast<int*>(&smem_scales[i >> 4]),
+              __float_as_int(val));
+  }
+  __syncthreads();
+
+  int rb = row / 128;
+  int ri = row % 128;
+  for (int b = threadIdx.x; b < num_blocks; b += blockDim.x) {
+    float amax = __int_as_float(*reinterpret_cast<int*>(&smem_scales[b]));
+    float scale = amax / 6.0f;
+    uint8_t ue_scale = float_to_ue4m3_ceil(scale);
+    int cb = b / 4;
+    int ci = b % 4;
+    int out_idx = (rb * n_col_blocks + cb) * 512
+                + (ri % 32) * 16 + (ri / 32) * 4 + ci;
+    sf_swz[out_idx] = ue_scale;
+    smem_scales[b] = ue4m3_to_float(ue_scale);
+  }
+  __syncthreads();
+
+  // One full 16-element scale block per iteration: no intra-pair block
+  // boundary case and 8 packed bytes per iteration.
+  const int nblk = cols >> 4;
+  for (int v = threadIdx.x; v < nblk; v += blockDim.x) {
+    const int i = v << 4;
+    float scale = smem_scales[v];
+    float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+    const __nv_bfloat16* s = smem_silu_mul + i;
+    uint2 out;
+    uint8_t* ob = reinterpret_cast<uint8_t*>(&out);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      float v0 = __bfloat162float(s[2 * j]) * inv_scale;
+      float v1 = __bfloat162float(s[2 * j + 1]) * inv_scale;
+      uint8_t lo = float_to_fp4_e2m1(v0);
+      uint8_t hi = float_to_fp4_e2m1(v1);
+      ob[j] = (uint8_t)((hi << 4) | (lo & 0x0F));
+    }
+    *reinterpret_cast<uint2*>(packed_row + (i >> 1)) = out;
+  }
+  // Tail pairs (cols not a multiple of 16), mirroring the scalar kernel.
+  int half_cols = cols >> 1;
+  for (int p = (nblk << 3) + threadIdx.x; p < half_cols; p += blockDim.x) {
+    int i = p * 2;
+    int blk = i >> 4;
+    float scale = smem_scales[blk];
+    float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+    float v0 = __bfloat162float(smem_silu_mul[i]) * inv_scale;
+    float v1 = __bfloat162float(smem_silu_mul[i + 1]) * inv_scale;
+    int blk1 = (i + 1) >> 4;
+    if (blk1 != blk) {
+      float scale1 = smem_scales[blk1];
+      float inv1 = (scale1 > 0.0f) ? (1.0f / scale1) : 0.0f;
+      v1 = __bfloat162float(smem_silu_mul[i + 1]) * inv1;
+    }
+    uint8_t fp4_lo = float_to_fp4_e2m1(v0);
+    uint8_t fp4_hi = float_to_fp4_e2m1(v1);
+    packed_row[p] = (uint8_t)((fp4_hi << 4) | (fp4_lo & 0x0F));
+  }
+}
+
 }  // namespace
 
 int silu_mul_to_nvfp4_swizzled_bf16(
@@ -467,6 +592,36 @@ int silu_mul_merged_to_nvfp4_swizzled_bf16(
         100 * 1024);
   }
   silu_mul_merged_to_nvfp4_swizzled_kernel<<<
+      rows, threads, smem_size, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(merged_gate_up),
+      reinterpret_cast<uint8_t*>(packed),
+      reinterpret_cast<uint8_t*>(sf_swz),
+      cols, num_blocks, n_col_blocks);
+  return 0;
+}
+
+int silu_mul_merged_to_nvfp4_swizzled_vec_bf16(
+    const void* merged_gate_up,
+    void*       packed,
+    void*       sf_swz,
+    int         rows,
+    int         cols,
+    cudaStream_t stream) {
+  if (!merged_gate_up || !packed || !sf_swz) return 1;
+  if (rows <= 0 || cols <= 0 || (cols & 0xF) != 0) return 2;
+
+  int num_blocks = (cols + 15) / 16;
+  int n_col_blocks = (num_blocks + 3) / 4;
+  int threads = 256;
+  size_t vals_off = ((num_blocks * sizeof(float)) + 15) & ~size_t(15);
+  size_t smem_size = vals_off + cols * sizeof(__nv_bfloat16);
+  if (smem_size > 48 * 1024) {
+    cudaFuncSetAttribute(
+        silu_mul_merged_to_nvfp4_swizzled_vec_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        100 * 1024);
+  }
+  silu_mul_merged_to_nvfp4_swizzled_vec_kernel<<<
       rows, threads, smem_size, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(merged_gate_up),
       reinterpret_cast<uint8_t*>(packed),
