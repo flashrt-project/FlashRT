@@ -113,6 +113,55 @@ int main() { try {
     rejects([&] { other.pipeline({node}); });
     node.bindings[0].buffer = other.buffer(a.size());
     rejects([&] { context.pipeline({node}); });
+    // Blits before, between and after compute spans must preserve snapshots
+    // even when later dispatches overwrite the original output.
+    auto snapshot = context.buffer(8);
+    auto copied = context.program({
+        BufferCopy{{padded, 4}, {a, 4, Access::write}, 4, "input"},
+        Dispatch{kernel, {{a, 4}, {b, 4, Access::write}, {parameters}}, {1}, {1}, "first"},
+        BufferCopy{{b, 4}, {snapshot, 4, Access::write}, 4, "snapshot"},
+        BufferCopy{{b, 4}, {padded, 4, Access::write}, 4, "feedback"},
+        Dispatch{kernel, {{padded, 4}, {b, 4, Access::write}, {parameters}}, {1}, {1}, "second"},
+        BufferCopy{{b, 4}, {a, 4, Access::write}, 4, "output"},
+    });
+    check(copied.dispatch_count() == 2, "blits counted as shader dispatches");
+    for (auto mode : {Execution::direct, Execution::icb}) {
+        padded.write(pair, sizeof(pair));
+        snapshot.write(pair, sizeof(pair));
+        copied.run(mode);
+        float value = 0;
+        snapshot.read(&value, 4, 4);
+        check(value == 7, "snapshot did not preserve the intermediate output");
+        a.read(&value, 4, 4);
+        check(value == 22, "compute/blit dependency failed");
+        snapshot.read(&value, 4);
+        check(value == -99, "blit destination prefix corrupted");
+    }
+    BufferCopy copy{{a}, {b, 0, Access::write}, 4, "bounds"};
+    copy.bytes = 0;
+    rejects([&] { context.program({copy}); });
+    copy.bytes = 8;
+    copy.source.offset = a.size() - 4;
+    rejects([&] { context.program({copy}); });
+    copy.source.offset = 0;
+    copy.destination.offset = b.size() - 4;
+    rejects([&] { context.program({copy}); });
+    copy.destination = {a, 4, Access::write};
+    rejects([&] { context.program({copy}); });
+    copy.destination = {other.buffer(8), 0, Access::write};
+    rejects([&] { context.program({copy}); });
+    copy.destination = {b, 0, Access::write};
+    copy.source.buffer = other.buffer(8);
+    rejects([&] { context.program({copy}); });
+    auto retained_copy = [] {
+        Context local;
+        auto x = local.buffer(4), y = local.buffer(4);
+        float value = 2;
+        x.write(&value, 4);
+        return local.program({BufferCopy{{x}, {y, 0, Access::write}, 4, "retained copy"}});
+    }();
+    retained_copy.run(Execution::direct);
+    retained_copy.run(Execution::icb);
     // Destroy the public context and every public resource before launching.
     auto retained = [] {
         Context local;
@@ -125,7 +174,7 @@ int main() { try {
     }();
     retained.run(Execution::direct);
     retained.run(Execution::icb);
-    std::cout << "bounds, ownership, context isolation: PASS\n";
+    std::cout << "compute/blit ordering, bounds, ownership, context isolation: PASS\n";
     return 0;
 } catch (const std::exception& error) {
     std::cerr << "FAIL: " << error.what() << '\n';

@@ -15,6 +15,7 @@ def recording_plan():
     plan = Plan.__new__(Plan)
     plan.handle = object()
     plan.dispatch = Mock()
+    plan.copy_buffer = Mock()
     plan.allocate = Mock(side_effect=AssertionError("Unexpected scratch allocation"))
     return plan
 
@@ -29,6 +30,55 @@ def test_binding_rejects_foreign_plan_even_with_same_buffer_id(strided):
     foreign = tensor(other, (2, 4), stride=(8, 1) if strided else None)
     with pytest.raises(ValueError, match="another plan"):
         owner.bind(foreign, allow_strided=strided)
+
+
+def test_copy_elides_exact_aliases_created_as_separate_views():
+    plan = recording_plan()
+    storage = tensor(plan, (4, 4))
+    source, target = storage[1:3], storage[1:3].view(2, 4)
+    assert source is not target
+    assert target.copy_(source) is target
+    plan.dispatch.assert_not_called()
+    plan.copy_buffer.assert_not_called()
+
+
+@pytest.mark.parametrize("case,exception,match", [
+    ("foreign", ValueError, "another plan"),
+    ("closed", RuntimeError, "closed"),
+    ("shape", ValueError, "matching contiguous"),
+    ("dtype", ValueError, "matching contiguous"),
+    ("strided", ValueError, "Noncontiguous|matching contiguous"),
+])
+def test_copy_validates_descriptors_before_alias_elision(case, exception, match):
+    plan = recording_plan()
+    source, target = tensor(plan, (2, 4)), tensor(plan, (2, 4))
+    if case == "foreign":
+        source = tensor(recording_plan(), source.shape)
+    elif case == "closed":
+        plan.handle = None
+    elif case == "shape":
+        target = tensor(plan, (4, 2))
+    elif case == "dtype":
+        source.itemsize = target.itemsize = 4
+    elif case == "strided":
+        source.stride = target.stride = (5, 1)
+    with pytest.raises(exception, match=match):
+        target.copy_(source)
+    plan.dispatch.assert_not_called()
+    plan.copy_buffer.assert_not_called()
+
+
+@pytest.mark.parametrize("different", ["offset", "buffer"])
+def test_copy_preserves_distinct_storage(different):
+    plan = recording_plan()
+    source, target = tensor(plan, (4,)), tensor(plan, (4,))
+    if different == "offset":
+        target.offset = 8
+    else:
+        target.buffer = 1
+    target.copy_(source)
+    plan.copy_buffer.assert_called_once()
+    plan.dispatch.assert_not_called()
 
 
 @pytest.mark.parametrize("case", ["channels", "sequence", "rank", "output", "missing_output",

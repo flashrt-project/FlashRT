@@ -24,14 +24,18 @@ struct Node {
     std::shared_ptr<Kernel> kernel;
     std::vector<std::shared_ptr<Buffer>> buffers;
     std::vector<std::size_t> offsets;
-    MTLSize groups, threads;
+    MTLSize groups{}, threads{};
+    std::size_t copy_bytes = 0;
 };
+struct Batch { std::size_t begin, count, icb_begin; bool copy; };
 struct Pipeline {
     NSString* label = nil;
     std::shared_ptr<Context> context;
     std::vector<Node> nodes;
+    std::vector<Batch> batches;
+    std::size_t dispatch_count = 0;
     std::map<id<MTLBuffer>, MTLResourceUsage> resources;
-    id<MTLIndirectCommandBuffer> icb;
+    id<MTLIndirectCommandBuffer> icb = nil;
     id<MTLResidencySet> residency API_AVAILABLE(macos(15.0)) = nil;
     ~Pipeline() {
         if (@available(macOS 15.0, *)) {
@@ -180,9 +184,9 @@ Kernel Context::kernel(const std::string& source, const std::string& entry_point
     }
 }
 Pipeline Context::pipeline(const std::vector<Dispatch>& dispatches) const {
-    return program(dispatches);
+    return program(std::vector<Operation>(dispatches.begin(), dispatches.end()));
 }
-Pipeline Context::program(const std::vector<Dispatch>& operations, const std::string& label) const {
+Pipeline Context::program(const std::vector<Operation>& operations, const std::string& label) const {
     require(!operations.empty(), "pipeline must contain at least one operation");
     require(operations.size() <= UINT32_MAX, "too many operations");
     @autoreleasepool {
@@ -190,61 +194,90 @@ Pipeline Context::program(const std::vector<Dispatch>& operations, const std::st
         p->context = impl_;
         p->label = [NSString stringWithUTF8String:label.c_str()];
         std::size_t max_bindings = 0;
-        for (const auto& d : operations) {
-            require(d.kernel.impl_->context == impl_, "kernel belongs to another context");
-            require(d.bindings.size() <= 31, "Metal supports at most 31 buffer arguments");
+        for (const auto& operation : operations) {
             detail::Node node;
-            node.label = [NSString stringWithUTF8String:d.label.c_str()];
-            node.kernel = d.kernel.impl_;
-            node.groups = dimensions(d.threadgroups);
-            node.threads = dimensions(d.threads_per_threadgroup);
-            auto limit = node.kernel->value.maxTotalThreadsPerThreadgroup;
-            auto axis = impl_->device.maxThreadsPerThreadgroup;
-            require(node.threads.width <= axis.width && node.threads.height <= axis.height &&
-                    node.threads.depth <= axis.depth, "threadgroup axis exceeds device limit");
-            require(node.threads.width <= limit / node.threads.height &&
-                    node.threads.width * node.threads.height <= limit / node.threads.depth,
-                    "threadgroup exceeds kernel limit");
-            for (const auto& b : d.bindings) {
-                require(b.buffer.impl_->context == impl_, "buffer belongs to another context");
-                require(b.offset < b.buffer.size() && b.offset % 4 == 0,
-                        "buffer binding offset must be in bounds and 4-byte aligned");
-                MTLResourceUsage usage;
-                switch (b.access) {
-                    case Access::read: usage = MTLResourceUsageRead; break;
-                    case Access::write: usage = MTLResourceUsageWrite; break;
-                    case Access::read_write: usage = MTLResourceUsageRead | MTLResourceUsageWrite; break;
-                    default: throw std::invalid_argument("invalid buffer access");
+            if (const auto* copy = std::get_if<BufferCopy>(&operation)) {
+                require(copy->bytes > 0, "buffer copy must be nonempty");
+                const auto& src = copy->source;
+                const auto& dst = copy->destination;
+                require(src.buffer.impl_->context == impl_ && dst.buffer.impl_->context == impl_,
+                        "copy buffer belongs to another context");
+                range(src.buffer.size(), src.offset, copy->bytes);
+                range(dst.buffer.size(), dst.offset, copy->bytes);
+                require(src.buffer.impl_ != dst.buffer.impl_ ||
+                        src.offset + copy->bytes <= dst.offset ||
+                        dst.offset + copy->bytes <= src.offset, "buffer copy ranges overlap");
+                node.label = [NSString stringWithUTF8String:copy->label.c_str()];
+                node.copy_bytes = copy->bytes;
+                node.buffers = {src.buffer.impl_, dst.buffer.impl_};
+                node.offsets = {src.offset, dst.offset};
+                p->resources[src.buffer.impl_->value] |= MTLResourceUsageRead;
+                p->resources[dst.buffer.impl_->value] |= MTLResourceUsageWrite;
+            } else {
+                const auto& d = std::get<Dispatch>(operation);
+                require(d.kernel.impl_->context == impl_, "kernel belongs to another context");
+                require(d.bindings.size() <= 31, "Metal supports at most 31 buffer arguments");
+                node.label = [NSString stringWithUTF8String:d.label.c_str()];
+                node.kernel = d.kernel.impl_;
+                node.groups = dimensions(d.threadgroups);
+                node.threads = dimensions(d.threads_per_threadgroup);
+                auto limit = node.kernel->value.maxTotalThreadsPerThreadgroup;
+                auto axis = impl_->device.maxThreadsPerThreadgroup;
+                require(node.threads.width <= axis.width && node.threads.height <= axis.height &&
+                        node.threads.depth <= axis.depth, "threadgroup axis exceeds device limit");
+                require(node.threads.width <= limit / node.threads.height &&
+                        node.threads.width * node.threads.height <= limit / node.threads.depth,
+                        "threadgroup exceeds kernel limit");
+                for (const auto& b : d.bindings) {
+                    require(b.buffer.impl_->context == impl_, "buffer belongs to another context");
+                    require(b.offset < b.buffer.size() && b.offset % 4 == 0,
+                            "buffer binding offset must be in bounds and 4-byte aligned");
+                    MTLResourceUsage usage;
+                    switch (b.access) {
+                        case Access::read: usage = MTLResourceUsageRead; break;
+                        case Access::write: usage = MTLResourceUsageWrite; break;
+                        case Access::read_write: usage = MTLResourceUsageRead | MTLResourceUsageWrite; break;
+                        default: throw std::invalid_argument("invalid buffer access");
+                    }
+                    node.buffers.push_back(b.buffer.impl_);
+                    node.offsets.push_back(b.offset);
+                    p->resources[b.buffer.impl_->value] |= usage;
                 }
-                node.buffers.push_back(b.buffer.impl_);
-                node.offsets.push_back(b.offset);
-                p->resources[b.buffer.impl_->value] |= usage;
+                max_bindings = std::max(max_bindings, d.bindings.size());
             }
-            max_bindings = std::max(max_bindings, d.bindings.size());
+            const bool copy = node.copy_bytes != 0;
+            if (p->batches.empty() || p->batches.back().copy != copy)
+                p->batches.push_back({p->nodes.size(), 0, p->dispatch_count, copy});
+            ++p->batches.back().count;
+            if (!copy) ++p->dispatch_count;
             p->nodes.push_back(std::move(node));
         }
-        MTLIndirectCommandBufferDescriptor* descriptor = [MTLIndirectCommandBufferDescriptor new];
-        descriptor.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
-        descriptor.inheritPipelineState = NO;
-        descriptor.inheritBuffers = NO;
-        descriptor.maxKernelBufferBindCount = max_bindings;
-        p->icb = [impl_->device newIndirectCommandBufferWithDescriptor:descriptor
-            maxCommandCount:p->nodes.size() options:0];
-        if (!p->icb) throw failure("create indirect command buffer", nil);
-        p->icb.label = p->label;
-        for (std::size_t i = 0; i < p->nodes.size(); ++i) {
-            const auto& n = p->nodes[i];
-            id<MTLIndirectComputeCommand> command = [p->icb indirectComputeCommandAtIndex:i];
-            if (i) [command setBarrier];
-            [command setComputePipelineState:n.kernel->value];
-            for (std::size_t j = 0; j < n.buffers.size(); ++j)
-                [command setKernelBuffer:n.buffers[j]->value offset:n.offsets[j] atIndex:j];
-            [command concurrentDispatchThreadgroups:n.groups threadsPerThreadgroup:n.threads];
+        if (p->dispatch_count) {
+            MTLIndirectCommandBufferDescriptor* descriptor = [MTLIndirectCommandBufferDescriptor new];
+            descriptor.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
+            descriptor.inheritPipelineState = NO;
+            descriptor.inheritBuffers = NO;
+            descriptor.maxKernelBufferBindCount = max_bindings;
+            p->icb = [impl_->device newIndirectCommandBufferWithDescriptor:descriptor
+                maxCommandCount:p->dispatch_count options:0];
+            if (!p->icb) throw failure("create indirect command buffer", nil);
+            p->icb.label = p->label;
+            std::size_t command_index = 0;
+            for (std::size_t i = 0; i < p->nodes.size(); ++i) {
+                const auto& n = p->nodes[i];
+                if (n.copy_bytes) continue;
+                id<MTLIndirectComputeCommand> command = [p->icb indirectComputeCommandAtIndex:command_index++];
+                if (i && !p->nodes[i - 1].copy_bytes) [command setBarrier];
+                [command setComputePipelineState:n.kernel->value];
+                for (std::size_t j = 0; j < n.buffers.size(); ++j)
+                    [command setKernelBuffer:n.buffers[j]->value offset:n.offsets[j] atIndex:j];
+                [command concurrentDispatchThreadgroups:n.groups threadsPerThreadgroup:n.threads];
+            }
         }
         return Pipeline(std::move(p));
     }
 }
-std::size_t Pipeline::dispatch_count() const { return impl_->nodes.size(); }
+std::size_t Pipeline::dispatch_count() const { return impl_->dispatch_count; }
 Timing Pipeline::run(Execution mode) const {
     require(mode == Execution::direct || mode == Execution::icb, "invalid execution mode");
     std::lock_guard<std::mutex> lock(impl_->context->mutex);
@@ -254,32 +287,44 @@ Timing Pipeline::run(Execution mode) const {
         if (!command) throw failure("create command buffer", nil);
         command.label = [impl_->label stringByAppendingString:
                          mode == Execution::icb ? @" / ICB" : @" / direct"];
-        id<MTLComputeCommandEncoder> encoder = nil;
-        auto begin_encoder = [&] {
-            encoder = [command computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        // Batches are fixed at construction. The production compute-only plan
+        // still executes one ICB range in one encoder; snapshots add blit passes.
+        for (const auto& batch : impl_->batches) {
+            if (batch.copy) {
+                id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
+                if (!blit) throw failure("create blit encoder", nil);
+                blit.label = @"FlashRT buffer copies";
+                for (std::size_t i = batch.begin; i < batch.begin + batch.count; ++i) {
+                    const auto& n = impl_->nodes[i];
+                    [blit copyFromBuffer:n.buffers[0]->value sourceOffset:n.offsets[0]
+                        toBuffer:n.buffers[1]->value destinationOffset:n.offsets[1] size:n.copy_bytes];
+                }
+                [blit endEncoding];
+                continue;
+            }
+            id<MTLComputeCommandEncoder> encoder =
+                [command computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
             if (!encoder) throw failure("create compute encoder", nil);
             encoder.label = impl_->label;
-        };
-        if (mode == Execution::icb) {
-            begin_encoder();
-            for (const auto& resource : impl_->resources)
-                [encoder useResource:resource.first usage:resource.second];
-            [encoder useResource:impl_->icb usage:MTLResourceUsageRead];
-            [encoder executeCommandsInBuffer:impl_->icb withRange:NSMakeRange(0, impl_->nodes.size())];
-        } else {
-            for (std::size_t i = 0; i < impl_->nodes.size(); ++i) {
-                const auto& n = impl_->nodes[i];
-                if (encoder) [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                else begin_encoder();
-                if (n.label.length) [encoder pushDebugGroup:n.label];
-                [encoder setComputePipelineState:n.kernel->value];
-                for (std::size_t j = 0; j < n.buffers.size(); ++j)
-                    [encoder setBuffer:n.buffers[j]->value offset:n.offsets[j] atIndex:j];
-                [encoder dispatchThreadgroups:n.groups threadsPerThreadgroup:n.threads];
-                if (n.label.length) [encoder popDebugGroup];
+            if (mode == Execution::icb) {
+                for (const auto& resource : impl_->resources)
+                    [encoder useResource:resource.first usage:resource.second];
+                [encoder useResource:impl_->icb usage:MTLResourceUsageRead];
+                [encoder executeCommandsInBuffer:impl_->icb withRange:NSMakeRange(batch.icb_begin, batch.count)];
+            } else {
+                for (std::size_t i = batch.begin; i < batch.begin + batch.count; ++i) {
+                    const auto& n = impl_->nodes[i];
+                    if (i != batch.begin) [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    if (n.label.length) [encoder pushDebugGroup:n.label];
+                    [encoder setComputePipelineState:n.kernel->value];
+                    for (std::size_t j = 0; j < n.buffers.size(); ++j)
+                        [encoder setBuffer:n.buffers[j]->value offset:n.offsets[j] atIndex:j];
+                    [encoder dispatchThreadgroups:n.groups threadsPerThreadgroup:n.threads];
+                    if (n.label.length) [encoder popDebugGroup];
+                }
             }
+            [encoder endEncoding];
         }
-        if (encoder) [encoder endEncoding];
         const auto encoded = Clock::now();
         const double submitted = host_seconds();
         [command commit];

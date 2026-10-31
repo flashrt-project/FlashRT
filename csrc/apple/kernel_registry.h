@@ -9,7 +9,6 @@
 #include "gemm/bf16_tensor_ops.h"
 #include "kernels/ada_rms_norm_bf16.h"
 #include "kernels/bias_bf16.h"
-#include "kernels/copy_bf16.h"
 #include "kernels/gelu_bf16.h"
 #include "kernels/gelu_mul_bf16.h"
 #include "kernels/layer_norm_bf16.h"
@@ -46,7 +45,6 @@ inline constexpr KernelSource kernel_registry[] = {
     {"tr_patch_pack", "tr_patch_pack", patch_pack_bf16_source},
     {"tr_patch_probe", "tr_patch_probe", patch_probe_bf16_source},
     {"tr_patch_position", "tr_patch_position", position_add_bf16_source},
-    {"tr_copy", "tr_copy", copy_bf16_source},
     {"norm_bf16", "norm_bf16", layer_norm_bf16_source},
     {"tr_rms", "tr_rms", rms_norm_bf16_source},
     {"tr_adarms", "tr_adarms", ada_rms_norm_bf16_source},

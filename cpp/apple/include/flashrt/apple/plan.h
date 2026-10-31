@@ -14,6 +14,8 @@ FRT_APPLE_PLAN_API int frt_apple_plan_write(void*, uint32_t buffer, size_t offse
 FRT_APPLE_PLAN_API int frt_apple_plan_read(void*, uint32_t buffer, size_t offset, void*, size_t bytes);
 // Borrowed shared-memory mapping. Caller serializes access with run/destroy.
 FRT_APPLE_PLAN_API void* frt_apple_plan_data(void*, uint32_t buffer, size_t offset, size_t bytes);
+FRT_APPLE_PLAN_API int frt_apple_plan_copy(void*, uint32_t source, size_t source_offset,
+    uint32_t destination, size_t destination_offset, size_t bytes);
 FRT_APPLE_PLAN_API int frt_apple_plan_dispatch(void*, const char* kernel, const uint32_t* buffers,
     const size_t* offsets, const uint32_t* access, size_t count,
     const size_t* groups, size_t threads, const char* label);
@@ -25,7 +27,7 @@ typedef struct frt_apple_plan_timing {
     double submit_host_s, gpu_start_s, gpu_end_s, return_host_s;
 } frt_apple_plan_timing;
 FRT_APPLE_PLAN_API int frt_apple_plan_run_timed(void*, uint32_t execution, frt_apple_plan_timing*);
-// Diagnostic only: one synchronous command buffer per dispatch, in plan order.
+// Diagnostic only: one synchronous command buffer per operation, in plan order.
 FRT_APPLE_PLAN_API int frt_apple_plan_profile(void*, frt_apple_plan_timing*, size_t count);
 #ifdef __cplusplus
 }

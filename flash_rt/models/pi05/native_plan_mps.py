@@ -4,7 +4,7 @@ import threading
 import time
 
 from flash_rt.hardware.apple_native.plan import Attention, Plan, Weight
-from flash_rt.models.pi05.torch_pipeline import Pi05TorchPipeline
+from flash_rt.models.pi05.torch_pipeline import PATCHES_PER_VIEW, Pi05TorchPipeline
 
 
 class NativePi05Plan:
@@ -45,7 +45,13 @@ class NativePi05Plan:
                 "precompute_modulation",
             ):
                 setattr(model, key, getattr(source, key))
-            model.buf = {k: self.plan.allocate(v.shape) for k, v in source.buf.items()}
+            # Host inputs go straight to their mutable compute storage. Separate
+            # prompt/noise staging allocations would require replay copy kernels.
+            model.buf = {
+                k: self.plan.allocate(v.shape)
+                for k, v in source.buf.items()
+                if k not in ("input_prompt", "input_noise")
+            }
             model.w = {k: Weight(v, k) for k, v in source.w.items()}
             model._rope_cos = Weight(source._rope_cos, "rope.cos")
             model._rope_sin = Weight(source._rope_sin, "rope.sin")
@@ -68,10 +74,9 @@ class NativePi05Plan:
 
             model._save = save
             self.input_images = model.buf["input_images"]
-            self.input_noise = model.buf["input_noise"]
-            self.input_prompt = self.plan.allocate((prompt_len, 2048))
-            self.output = model.buf["noise"]
-            model.buf["noise"].copy_(self.input_noise)
+            self.input_noise = self.output = model.buf["noise"]
+            image_tokens = source.num_views * PATCHES_PER_VIEW
+            self.input_prompt = model.buf["encoder_x"][image_tokens:image_tokens + prompt_len]
             self.plan.stage = "patch"
             patch = self.plan.patch(
                 model.buf["vision_x"],
@@ -107,6 +112,21 @@ class NativePi05Plan:
         with self._lock:
             self.plan.close()
 
+    def _write_inputs(self, images, prompt, noise):
+        # Call under _lock: both prompt and noise are overwritten by execution.
+        self.plan.write(self.input_images, images)
+        self.plan.write(self.input_prompt, prompt)
+        self.plan.write(self.input_noise, noise)
+
+    def profile(self, images, prompt, noise):
+        """Restore inputs, profile each dispatch and return an owned output."""
+        with self._lock:
+            if self.plan.handle is None:
+                raise RuntimeError("Native plan is closed")
+            self._write_inputs(images, prompt, noise)
+            timings = self.plan.profile()
+            return self.plan.read(self.output), timings
+
     def forward(self, images, prompt, noise, *, execution="icb", capture_probes=False):
         with self._lock:
             if self.plan.handle is None:
@@ -114,9 +134,7 @@ class NativePi05Plan:
             if capture_probes and not self.probes:
                 raise ValueError("Plan was built without probes")
             start = time.perf_counter()
-            self.plan.write(self.input_images, images)
-            self.plan.write(self.input_prompt, prompt)
-            self.plan.write(self.input_noise, noise)
+            self._write_inputs(images, prompt, noise)
             uploaded = time.perf_counter()
             t = self.plan.run(execution)
             executed = time.perf_counter()

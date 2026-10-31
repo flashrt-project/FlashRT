@@ -26,7 +26,7 @@ def compare(plan, out, expected, tolerance=0.01):
     actual = plan.read(out)
     np.testing.assert_array_equal(actual, direct)
     profile = plan.profile()
-    assert len(profile) == plan.dispatch_count
+    assert len(profile) == plan.dispatch_count + plan.copy_count
     assert all(row["gpu_us"] >= 0 for row in profile)
     np.testing.assert_array_equal(plan.read(out), actual)
     ref = expected.float().numpy()
@@ -236,6 +236,82 @@ def test_plan_mapping_rejects_closed_owner():
     np.testing.assert_array_equal(actual, np.ones(10, np.float32))
     with pytest.raises(RuntimeError, match="closed"):
         p.read(a)
+
+
+@pytest.mark.parametrize("same_buffer", [False, True])
+def test_native_blit_handles_bf16_offsets_and_byte_counts(same_buffer):
+    p = Plan()
+    try:
+        source = p.allocate((8,))
+        target = source if same_buffer else p.allocate((8,))
+        values = torch.arange(8, dtype=torch.bfloat16)
+        p.write(source, values)
+        if not same_buffer:
+            p.write(target, torch.full((8,), -9, dtype=torch.bfloat16))
+        # A two-byte source offset and six-byte payload require no copy shader.
+        out = target[4:7]
+        out.copy_(source[1:4])
+        assert p.dispatch_count == 0 and p.copy_count == 1
+        compare(p, out, values[1:4], 0.000001)
+        actual = p.read(target)
+        np.testing.assert_array_equal(actual[:4], values[:4].float().numpy() if same_buffer else -9)
+        assert actual[7] == (7 if same_buffer else -9)
+    finally:
+        p.close()
+
+
+@pytest.mark.parametrize("capture_probes", [False, True])
+def test_native_replay_and_profiler_restore_mutated_inputs(capture_probes):
+    import threading
+    from flash_rt.models.pi05.native_plan_mps import NativePi05Plan
+
+    # Small real Metal graph with the model's destructive prompt/noise inputs.
+    native = NativePi05Plan.__new__(NativePi05Plan)
+    native.plan = p = Plan()
+    native._lock = threading.Lock()
+    native.probes = {}
+    native.last_timing = None
+    try:
+        native.input_images = p.allocate((2, 32))
+        prompt_storage = p.allocate((4, 32))
+        p.write(prompt_storage, torch.full((4, 32), 31, dtype=torch.bfloat16))
+        native.input_prompt = prompt_storage[1:3]
+        native.input_noise = native.output = p.allocate((2, 32))
+        p.ops.residual(native.input_prompt, native.input_images, native.input_prompt)
+        p.ops.residual(native.output, native.input_prompt, native.input_noise)
+        if capture_probes:
+            snapshot = p.allocate((2, 32))
+            snapshot.copy_(native.output)
+            native.probes["snapshot"] = snapshot
+        p.finish()
+        p.set_resident(True)
+        assert p.copy_count == int(capture_probes)
+        assert p.dispatch_count == 2
+        saved = None
+        for seed in (0, 1, 0):
+            images = torch.full((2, 32), seed + 1, dtype=torch.bfloat16)
+            prompt = torch.full((2, 32), seed + 2, dtype=torch.bfloat16)
+            noise = torch.full((2, 32), seed + 3, dtype=torch.bfloat16)
+            expected = (images + prompt + noise).float().numpy()
+            for execution in ("direct", "icb"):
+                actual, probes = native.forward(images, prompt, noise,
+                    execution=execution, capture_probes=capture_probes)
+                np.testing.assert_array_equal(actual, expected)
+                if capture_probes:
+                    np.testing.assert_array_equal(probes["snapshot"], expected)
+                    if saved is None:
+                        saved = probes["snapshot"]
+            for _ in range(2):
+                actual, timings = native.profile(images, prompt, noise)
+                np.testing.assert_array_equal(actual, expected)
+                assert len(timings) == p.dispatch_count + p.copy_count
+            np.testing.assert_array_equal(p.read(prompt_storage)[[0, 3]], 31)
+        if saved is not None:
+            np.testing.assert_array_equal(saved, 6)
+    finally:
+        native.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        native.profile(images, prompt, noise)
 
 
 @pytest.mark.parametrize("rows", [10, 67])

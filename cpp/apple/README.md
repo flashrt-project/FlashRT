@@ -65,7 +65,7 @@ Run timing without Metal validation or Instruments; use a separate process
 for tracing. No CMake or offline shader compiler is required by the build script.
 
 Both build paths hide C++ implementation symbols and use the same Mach-O
-allowlists: [`plan.exports`](plan.exports) (12 private plan C entry points)
+allowlists: [`plan.exports`](plan.exports) (13 private plan C entry points)
 and [`signpost.exports`](signpost.exports) (2 tracing entry points). Every link
 runs [`check_exports.sh`](../../scripts/apple/check_exports.sh), which fails
 on missing or extra exports. These are Apple adapter interfaces, separate
@@ -110,9 +110,14 @@ prompt embeddings and noise directly into persistent shared Metal buffers.
 It returns owned CPU action arrays after one completion wait; no MPS input/output
 round trip is needed. `forward_with_fixed_noise()` retains its MPS tensor contract
 and therefore still stages MPS inputs and copies the action back to MPS.
+Prompt embeddings are written directly into the text slice of the encoder input;
+initial noise is written directly into the denoising state. Exact self-copies are
+elided during recording, so production plans contain no buffer-copy operations.
 There are no host transfers or Python dispatches between vision, prefix or
 individual decode steps. `capture_probes=True` when building creates explicit
-snapshot dispatches; benchmark a separate plan without those snapshots.
+snapshots using native Metal blit copies between compute spans; benchmark a
+separate plan without those snapshots. Production replay remains one ICB range
+in one compute encoder. There is no copy shader or copy kernel registry entry.
 
 `examples/apple/pi05.py --native-pipeline` enables this path. The CLI builds
 or rebuilds the specialization after setting the prompt, outside model timing.
@@ -159,6 +164,11 @@ model order after normal replay timing. Diagnostics use isolated synchronous
 submissions, include per-command GPU overhead, and must not be summed as model
 latency. The profiler verifies that the final output exactly matches ICB replay.
 Reports group by stage, kernel and shape; this is the priority list for tuning.
+The model adapter's `profile(images, prompt, noise)` restores all inputs before
+each diagnostic replay and returns an owned output with dispatch timings. Use it
+instead of calling `native.plan.profile()` directly: execution overwrites the
+prompt/noise storage. Probe snapshots use separate buffers and native blit copies
+so later layers cannot overwrite the captured values.
 
 `--compare-gqa` performs a warmed unsplit/split/split/unsplit comparison of the
 complete model, rebuilding between blocks and keeping only one native plan

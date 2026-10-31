@@ -12,7 +12,7 @@ struct Plan {
     std::mutex mutex;
     std::vector<Buffer> buffers;
     std::map<std::string,Kernel> kernels;
-    std::vector<Dispatch> operations;
+    std::vector<Operation> operations;
     std::unique_ptr<Pipeline> pipeline;
     std::vector<Pipeline> profiles;
 };
@@ -64,6 +64,14 @@ int frt_apple_plan_dispatch(void* p,const char* name,const uint32_t* ids,const s
             {threads},label});
     });
 }
+int frt_apple_plan_copy(void* p,uint32_t source,size_t source_offset,
+    uint32_t destination,size_t destination_offset,size_t bytes) {
+    return guard([&]{auto& x=checked(p);std::lock_guard<std::mutex> lock(x.mutex);
+        require(!x.pipeline,"plan already sealed");
+        x.operations.push_back(BufferCopy{{x.buffers.at(source),source_offset,Access::read},
+            {x.buffers.at(destination),destination_offset,Access::write},bytes,"buffer copy"});
+    });
+}
 int frt_apple_plan_finish(void* p) {return guard([&]{auto& x=checked(p);std::lock_guard<std::mutex> lock(x.mutex);
     require(!x.pipeline,"plan already sealed");x.pipeline=std::make_unique<Pipeline>(x.context.program(x.operations,"FlashRT fixed Metal plan"));});}
 int frt_apple_plan_residency(void* p,uint32_t enabled) {
@@ -83,7 +91,8 @@ int frt_apple_plan_profile(void* p,frt_apple_plan_timing* timing,size_t count) {
         require(x.pipeline && timing && count==x.operations.size(),"invalid profile output");
         if(x.profiles.empty()) {
             std::vector<Pipeline> profiles;
-            for(const auto& op:x.operations) profiles.push_back(x.context.program({op},op.label));
+            for(const auto& op:x.operations) profiles.push_back(x.context.program({op},
+                std::visit([](const auto& value){return value.label;},op)));
             x.profiles=std::move(profiles);
         }
         for(size_t i=0;i<count;++i) {

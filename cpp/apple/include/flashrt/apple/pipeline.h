@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace flashrt::apple {
@@ -47,6 +48,13 @@ struct Dispatch {
     Size threads_per_threadgroup;
     std::string label;
 };
+struct BufferCopy {
+    Binding source;
+    Binding destination;
+    std::size_t bytes;
+    std::string label;
+};
+using Operation = std::variant<Dispatch, BufferCopy>;
 enum class Execution { direct, icb };
 struct Timing {
     double encode_us = 0;
@@ -66,7 +74,8 @@ struct Timing {
 class Pipeline {
 public:
     // Immutable bindings and geometry; buffer contents may change between runs.
-    // Sequential dependencies are enforced between every pair of dispatches.
+    // Sequential dependencies are enforced between operations. Buffer copies
+    // use blit encoders; compute spans reuse ranges of the recorded ICB.
     Timing run(Execution mode = Execution::direct) const;
     // Keep this fixed plan's resources resident between submissions (macOS 15+).
     void set_resident(bool enabled) const;
@@ -87,7 +96,7 @@ public:
                   bool tensor_ops = false) const;
     // Owns all referenced resources; ICB is recorded once at construction.
     Pipeline pipeline(const std::vector<Dispatch>& dispatches) const;
-    Pipeline program(const std::vector<Dispatch>& operations,
+    Pipeline program(const std::vector<Operation>& operations,
                      const std::string& label = "FlashRT Apple") const;
 private:
     std::shared_ptr<detail::Context> impl_;

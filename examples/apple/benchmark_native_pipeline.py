@@ -248,6 +248,8 @@ def main():
                     result = dict(
                         index=index,
                         prefix_m=512 + f._prompt_len,
+                        snapshot_copy_count=p._native_pipeline.plan.copy_count,
+                        diagnostic_dispatch_count=p._native_pipeline.plan.dispatch_count,
                         robot=robot,
                         probes=checks,
                         repeat_equal=bool(np.array_equal(actual, repeat)),
@@ -295,10 +297,13 @@ def main():
                 merged_encoder_ffn=not args.split_encoder_ffn,
             )
             native = p._native_pipeline
+            if native.plan.copy_count:
+                raise AssertionError("Production native plan contains buffer copies")
             report.update(
                 build_seconds=time.perf_counter() - start,
                 dispatch_count=native.plan.dispatch_count,
                 native_weight_bytes=native.plan.weight_bytes,
+                copy_count=native.plan.copy_count,
             )
 
             @contextmanager
@@ -368,10 +373,13 @@ def main():
                     )
                 with select("full-icb"):
                     expected = cpu(run(images))
-                    runs = [native.plan.profile() for _ in range(3)]
-                    np.testing.assert_array_equal(
-                        native.plan.read(native.output), expected
-                    )
+                    runs = []
+                    for _ in range(3):
+                        actual, timings = native.profile(
+                            host_images, f._prompt_cpu[:f._prompt_len], host_noise
+                        )
+                        np.testing.assert_array_equal(actual, expected)
+                        runs.append(timings)
                     operations = []
                     groups = {}
                     for index, meta in enumerate(native.plan.dispatches):
@@ -386,6 +394,7 @@ def main():
                     report["kernel_profile"] = dict(
                         scope="Isolated synchronous dispatches in model order; includes submission GPU overhead. Do not sum as model latency.",
                         output_equal=True,
+                        input_reset_each_run=True,
                         operations=operations,
                         groups=sorted(
                             groups.values(), key=lambda x: -x["total_gpu_us"]

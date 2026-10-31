@@ -25,7 +25,6 @@ kernels/
   bias_bf16.h
   residual_bf16.h
   rope_bf16.h
-  copy_bf16.h
   position_add_bf16.h
 kernel_registry.h                dispatch name -> source builder / entry point
 ```

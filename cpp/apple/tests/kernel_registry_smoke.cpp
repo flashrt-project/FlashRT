@@ -17,7 +17,7 @@ int main() {
             const auto& resolved=shaders::find_kernel_source(source.name);
             auto kernel=context.kernel(resolved.build_source(),resolved.entry,true);
         }
-        for (const char* unknown : {"tr_unknown", "gemm_fp8"}) {
+        for (const char* unknown : {"tr_unknown", "gemm_fp8", "tr_copy"}) {
             bool rejected=false;
             try { (void)shaders::find_kernel_source(unknown); }
             catch (const std::invalid_argument&) { rejected=true; }

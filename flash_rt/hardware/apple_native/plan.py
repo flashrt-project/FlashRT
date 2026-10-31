@@ -108,6 +108,10 @@ class Tensor:
         return Tensor(self.plan, shape, self.buffer, off, tuple(stride), self.itemsize)
 
     def copy_(self, source):
+        # Validate ownership/lifetime even when matching buffer IDs suggest an
+        # alias: buffer IDs are local to each plan.
+        self.plan.bind(self)
+        source = self.plan.bind(source)
         if (
             self.shape != source.shape
             or self.itemsize != 2
@@ -116,9 +120,13 @@ class Tensor:
             or not source.contiguous()
         ):
             raise ValueError("Native copy requires matching contiguous tensors")
-        self.plan.dispatch(
-            "tr_copy", [source, self], {1}, [self.numel()], ((self.numel() + 63) // 64,)
-        )
+        if (
+            self.buffer == source.buffer
+            and self.offset == source.offset
+            and self.stride == source.stride
+        ):
+            return self
+        self.plan.copy_buffer(source, self)
         return self
 
     def add_(self, update):
@@ -157,6 +165,7 @@ class Plan:
                 C.c_int,
             ),
             "data": ([C.c_void_p, C.c_uint32, C.c_size_t, C.c_size_t], C.c_void_p),
+            "copy": ([C.c_void_p, C.c_uint32, C.c_size_t, C.c_uint32, C.c_size_t, C.c_size_t], C.c_int),
             "dispatch": (
                 [
                     C.c_void_p,
@@ -188,7 +197,9 @@ class Plan:
         )
         self.weights = {}
         self.dispatch_count = 0
+        self.copy_count = 0
         self.dispatches = []
+        self.operations = []
         self.stage = "setup"
         self.weight_bytes = 0
         self.ops = Ops(self)
@@ -340,15 +351,28 @@ class Plan:
             )
         )
         self.dispatch_count += 1
-        self.dispatches.append(
-            dict(
-                kernel=name,
-                stage=self.stage,
-                params=list(params),
-                groups=list(groups),
-                threads=threads,
-            )
+        meta = dict(
+            kind="dispatch",
+            kernel=name,
+            stage=self.stage,
+            params=list(params),
+            groups=list(groups),
+            threads=threads,
         )
+        self.dispatches.append(meta)
+        self.operations.append(meta)
+
+    def copy_buffer(self, source, destination):
+        source, destination = self.bind(source), self.bind(destination)
+        if source.shape != destination.shape or source.itemsize != destination.itemsize:
+            raise ValueError("Native buffer copy requires matching storage")
+        size = source.numel() * source.itemsize
+        self.check(self.lib.frt_apple_plan_copy(
+            self.handle, source.buffer, source.offset,
+            destination.buffer, destination.offset, size,
+        ))
+        self.copy_count += 1
+        self.operations.append(dict(kind="copy", stage=self.stage, bytes=size))
 
     def linear(self, out, x, w, bias=None):
         out = self.bind(out, allow_strided=True)
@@ -424,10 +448,10 @@ class Plan:
         self.check(self.lib.frt_apple_plan_residency(self.handle, int(enabled)))
 
     def profile(self):
-        timings = (_PlanTiming * self.dispatch_count)()
+        timings = (_PlanTiming * len(self.operations))()
         self.check(self.lib.frt_apple_plan_profile(self.handle, timings, len(timings)))
         return [
-            dict(**meta, **t.as_dict()) for meta, t in zip(self.dispatches, timings)
+            dict(**meta, **t.as_dict()) for meta, t in zip(self.operations, timings)
         ]
 
     def run(self, execution="icb"):
