@@ -56,6 +56,16 @@ def _f32(buf_ptr: int) -> float:
     return float(out[0])
 
 
+def _select_grid(fvk, prefetch):
+    grid = int(fvk.molmo_action_mk_max_grid())
+    if grid < 0:
+        raise RuntimeError(f"MolmoAct2 cooperative grid query failed (CUDA error {-grid})")
+    if not 32 + prefetch <= grid <= 64:
+        raise RuntimeError("MolmoAct2 action kernel needs at least 32 resident compute "
+                           f"CTAs plus {prefetch} prefetch CTA(s); available grid={grid}")
+    return grid
+
+
 class ActionLayerKernel:
     """Static state of the persistent action-expert kernel for one pipeline."""
 
@@ -64,6 +74,7 @@ class ActionLayerKernel:
     def __init__(self, pipe, *, layers: int, d: int, hid: int, eps: float,
                  ctx_stride: int):
         self.fvk = pipe.fvk
+        self.grid = _select_grid(self.fvk, self.PREFETCH_CTAS)
         sizes = tuple(self.fvk.molmo_action_mk_struct_sizes())
         want = (ctypes.sizeof(_Layer), ctypes.sizeof(_Scales),
                 ctypes.sizeof(_Params))
@@ -160,10 +171,6 @@ class ActionLayerKernel:
             "counters": CudaBuffer.device_zeros(16, np.uint32),
             "bar": CudaBuffer.device_zeros(64, np.uint32),
         }
-        sms = ctypes.c_int()
-        ctypes.CDLL("libcudart.so").cudaDeviceGetAttribute(
-            ctypes.byref(sms), 16, 0)   # cudaDevAttrMultiProcessorCount
-        self.grid = int(sms.value)
         per_step = layers * 3 * d * 2
         self.params: list[bytes] = []
         for step in range(pipe.num_steps):

@@ -111,6 +111,8 @@ struct ActionMkParams {
 // Returns 0 on success.
 int action_mk_layers(const ActionMkParams& params, int grid,
                      cudaStream_t stream);
+// Maximum legal cooperative grid on the current device (negative CUDA error on failure).
+int action_mk_max_grid();
 // Dynamic shared memory per CTA.
 int action_mk_smem_bytes();
 // Repack an e4m3 weight ([N, K], or [K, N] with kn != 0) into the

@@ -1,4 +1,4 @@
-"""FlashRT — MolmoAct2 torch frontend for RTX consumer GPUs (SM120/SM89).
+"""FlashRT — MolmoAct2 torch frontend for RTX consumer GPUs (SM120/SM121).
 
 Loads ``allenai/MolmoAct2`` safetensors directly, builds the static prompt for
 a fixed task, precomputes the flow-matching modulation tables, and drives
@@ -45,6 +45,7 @@ fvk_mod = fvk
 _MOLMO_KERNELS = (
     "molmo_action_denorm_bf16", "molmo_action_mk_layers",
     "molmo_action_mk_pack_fp8", "molmo_action_mk_struct_sizes",
+    "molmo_action_mk_max_grid",
     "molmo_add_bias_bf16", "molmo_bias_gelu_quant_fp8_vec",
     "molmo_bias_rms_norm_rows96_exact", "molmo_bias_round_add_bf16",
     "molmo_bias_round_bf16", "molmo_concat2_quant_fp8",
@@ -300,7 +301,7 @@ class MolmoAct2TorchFrontendRtx:
         self._host_state = torch.empty(
             self._state_dim, dtype=torch.float32, pin_memory=True)
         horizon = int(self._stats["action_horizon"])
-        self._host_noise = torch.empty(
+        self._host_noise = torch.zeros(
             horizon, ACT_MAX_DIM, dtype=torch.int16, pin_memory=True)
         self._host_actions = torch.empty(
             horizon, int(self._stats["action_q01"].shape[0]),
@@ -919,7 +920,11 @@ class MolmoAct2TorchFrontendRtx:
     # ══════════════════════════════════════════════════════════════════
     def set_prompt(self, task: str, *, state: Optional[np.ndarray] = None,
                    norm_tag: Optional[str] = None) -> None:
-        """Build the static prompt for ``task`` and instantiate the pipeline."""
+        """Build a new pipeline; calibration and graph capture must be repeated."""
+        self._calibrated = False
+        self.graph_recorded = False
+        self.actions = None
+        self.pipeline = None
         if norm_tag is not None and norm_tag != self.norm_tag:
             self.norm_tag = str(norm_tag)
             self._stats = self._load_stats()
@@ -974,7 +979,7 @@ class MolmoAct2TorchFrontendRtx:
     def upload_observations(self, images_u8: np.ndarray,
                             state: np.ndarray,
                             noise: Optional[np.ndarray] = None) -> None:
-        """Fill the pinned staging buffers (cheap CPU copies)."""
+        """Fill staging buffers. None restores fixed zero noise for this call."""
         img = np.ascontiguousarray(images_u8, dtype=np.uint8).reshape(-1)
         if img.size != self._host_images.numel():
             raise ValueError(
@@ -986,7 +991,9 @@ class MolmoAct2TorchFrontendRtx:
             raise ValueError(
                 f"expected state dim {self._state_dim}, got {st.size}")
         self._host_state_np[:] = st
-        if noise is not None:
+        if noise is None:
+            self._host_noise_np.fill(0)
+        else:
             import ml_dtypes
             nz = np.asarray(noise)
             if nz.shape != (self.pipeline.horizon, ACT_MAX_DIM):

@@ -64,14 +64,21 @@ Configure-time errors are explicit: `FLASHRT_ENABLE_MOLMOACT2=ON` on a non-
 SM120/121 target fails at configure time instead of producing kernels that
 would trap at run time.
 
+The persistent action kernel uses at most 64 resident CTAs (32 compute CTAs
+minimum plus one prefetch CTA). Its grid is queried from the current CUDA
+device's occupancy; RTX 5090 uses 64 rather than its full 170 SM count, and
+RTX 5060 Ti retains its 36-CTA grid when resident. Insufficient residency is
+reported before packing weights, and the native launch checks the same limit.
+
 ## 2. Install
 
 ```bash
-pip install -e ".[torch]"
+pip install -e ".[molmoact2]"
 ```
 
-The frontend needs `tokenizers` (shipped with `transformers`) to build the
-prompt, and `ml_dtypes` only when a caller supplies explicit flow noise.
+The model extra includes `tokenizers` for prompt construction and `ml_dtypes`
+for BF16 precomputation and explicit noise conversion, in addition to the torch
+extra. Both are required by this frontend.
 
 ## 3. Quickstart
 
@@ -282,10 +289,33 @@ fail-fast test asserts the actionable error.
   action dimension changes the static buffers.
 * `precision="fp8"`/`"nvfp4"` require real-observation calibration before
   capture; there is no random-input calibration path.
-* One prompt/graph per frontend instance, batch size 1. The flow noise is
-  fixed by the pipeline (pass `noise=` to `infer` to reproduce a specific
-  trajectory).
+* One prompt/graph per frontend instance, batch size 1. Every `set_prompt()`
+  rebuilds the pipeline and invalidates calibration and graph capture: run
+  `calibrate(samples)` again for FP8/NVFP4, then `record_infer_graph()`.
+* `noise=None` uses fixed all-zero BF16 noise, including on the first call.
+  Explicit `noise=` applies to that call only; the next omitted noise restores
+  zeros. Padded action dimensions are zeroed for explicit noise as well.
 * The `norm_tag` must exist in the checkpoint's `norm_stats.json`; the
   validated tag is the BimanualYAM one.
 * Not wired into `load_model` / the `predict()` VLA API (see the redirect at
   the top).
+
+
+## Focused runtime regressions
+
+The control-flow tests need no checkpoint or compiled extensions:
+
+```bash
+python -m pytest tests/test_molmoact2_runtime_state.py -q
+```
+
+The standalone SM120 action-kernel launch/residency check also needs no
+checkpoint. It uses a zero-layer launch to test grid validation and graph
+replay, not model numerical correctness:
+
+```bash
+nvcc -O3 -std=c++17 -gencode arch=compute_120a,code=sm_120a \
+  -I csrc/kernels tests/molmoact2_action_grid_sm120.cu \
+  csrc/kernels/molmoact2_action_mk_sm120.cu -o molmoact2_grid_test
+./molmoact2_grid_test
+```

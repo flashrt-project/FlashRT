@@ -1,4 +1,4 @@
-"""FlashRT — MolmoAct2 RTX (consumer Blackwell SM120 / Ada SM89) pipeline.
+"""FlashRT — MolmoAct2 RTX (consumer Blackwell SM120 / SM121) pipeline.
 
 Native-kernel execution plan for ``allenai/MolmoAct2`` continuous action
 inference.  The complete steady-state graph is:

@@ -1194,6 +1194,23 @@ __global__ void pack_fp8_kernel(const uint8_t* __restrict__ w, uint8_t* __restri
 
 int action_mk_smem_bytes() { return SM_TOTAL; }
 
+int action_mk_max_grid() {
+    int device = 0, blocks_per_sm = 0;
+    cudaDeviceProp prop{};
+    cudaError_t e = cudaGetDevice(&device);
+    if (e != cudaSuccess) return -static_cast<int>(e);
+    e = cudaGetDeviceProperties(&prop, device);
+    if (e != cudaSuccess) return -static_cast<int>(e);
+    e = cudaFuncSetAttribute(action_mk_kernel,
+                            cudaFuncAttributeMaxDynamicSharedMemorySize, SM_TOTAL);
+    if (e != cudaSuccess) return -static_cast<int>(e);
+    e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks_per_sm, action_mk_kernel, THREADS, SM_TOTAL);
+    if (e != cudaSuccess) return -static_cast<int>(e);
+    const int resident = blocks_per_sm * prop.multiProcessorCount;
+    return resident < 64 ? resident : 64;
+}
+
 int action_mk_layers(const ActionMkParams& params, int grid, cudaStream_t stream) {
     // every phase's work split assumes at least 32 compute CTAs (one per
     // cross-attention (head, split) unit, <= 12 warps of tiles per CTA)
@@ -1203,13 +1220,9 @@ int action_mk_layers(const ActionMkParams& params, int grid, cudaStream_t stream
     if (params.ctx_len < 1 || params.ctx_len > XSPLITS * XCHUNK ||
         params.ctx_rows < XSPLITS * XCHUNK)
         return 2;
-    static bool attr = false;
-    if (!attr) {
-        if (cudaFuncSetAttribute(action_mk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 SM_TOTAL) != cudaSuccess)
-            return 3;
-        attr = true;
-    }
+    const int max_grid = action_mk_max_grid();
+    if (max_grid < 0) return -max_grid;
+    if (grid > max_grid) return static_cast<int>(cudaErrorCooperativeLaunchTooLarge);
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = dim3(grid);
     cfg.blockDim = dim3(THREADS);

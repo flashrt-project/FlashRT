@@ -1527,6 +1527,8 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         return flash_rt::molmoact2::action_mk_layers(p, grid, to_stream(stream));
     }, py::arg("params"), py::arg("grid"), py::arg("stream") = 0);
 
+    m.def("molmo_action_mk_max_grid", &flash_rt::molmoact2::action_mk_max_grid);
+
     m.def("molmo_action_mk_struct_sizes", []() {
         return py::make_tuple(
             sizeof(flash_rt::molmoact2::ActionMkLayer),

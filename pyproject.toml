@@ -40,6 +40,8 @@ chameleon = ["torch", "safetensors", "transformers>=4.43,<4.56", "Pillow"]
 # LaWAM (LeRobot lawam-pretrain-lerobot) on RTX SM120: torch + safetensors
 # weights, the Qwen3-VL processor at set_prompt time, and PIL frames for it.
 lawam = ["flash-rt[torch]", "transformers>=4.57", "Pillow"]
+# MolmoAct2 prompt tokenizer and BF16 precomputation/noise conversion.
+molmoact2 = ["flash-rt[torch]", "tokenizers>=0.21", "ml_dtypes"]
 jax = ["jax", "jaxlib", "ml_dtypes", "orbax-checkpoint", "flax"]
 server = ["fastapi", "uvicorn"]
 eval = ["opencv-python", "tqdm"]
