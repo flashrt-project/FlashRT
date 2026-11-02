@@ -364,10 +364,19 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                decoder_gate_up_variant=10,
                attention=None,
                fuse=None,
-               compile_mode=None):
+               compile_mode=None,
+               fuse_image_embeds=None,
+               use_backbone_graph=None):
     """Load a FlashRT model.
 
     Args:
+        fuse_image_embeds: GR00T N1.7 on RDNA only. True builds image/text
+            embeddings internally from raw patches or frames; False consumes
+            projected aux. None preserves the RDNA default (False).
+            Other routes reject an explicit value.
+        use_backbone_graph: GR00T N1.7 on RDNA only. Optional backbone
+            graph control, independent of infer(use_dit_graph=...). None keeps
+            the frontend default.
         checkpoint: path to checkpoint directory.
             - torch: safetensors directory
             - jax: Orbax checkpoint directory
@@ -556,6 +565,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     Returns:
         VLAModel instance with .predict() method.
     """
+    for name, value in (("fuse_image_embeds", fuse_image_embeds),
+                        ("use_backbone_graph", use_backbone_graph)):
+        if value is not None:
+            if not isinstance(value, bool):
+                raise TypeError(f"{name} must be a bool or None")
+            if (config, framework) != ("groot_n17", "torch"):
+                raise ValueError(f"{name} only supports GR00T N1.7 torch on RDNA")
     # Qwen3-VL is a chat-style VLM, not a VLA predict(images, ...) model. It
     # is registered in _PIPELINE_MAP for resolve_pipeline_class/discovery, but
     # load_model's VLAModel wrapper would expose the wrong runtime surface.
@@ -783,6 +799,14 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
 
     from flash_rt.hardware import detect_arch, resolve_pipeline_class
     arch = detect_arch() if hardware == "auto" else hardware
+    if config == "groot_n17" and arch in ("amd_rdna3", "amd_rdna35", "amd_rdna4"):
+        if use_fp4 or use_fp16:
+            raise ValueError(
+                "GR00T N1.7 on RDNA supports BF16 only; "
+                "leave use_fp4/use_fp16 disabled")
+    if (fuse_image_embeds is not None or use_backbone_graph is not None) and arch not in (
+            "amd_rdna3", "amd_rdna35", "amd_rdna4"):
+        raise ValueError("fuse_image_embeds/use_backbone_graph only support GR00T N1.7 on RDNA")
 
     if config == "lawam" and (framework, arch) != ("torch", "rtx_sm120"):
         raise ValueError("LaWAM supports framework='torch', hardware='rtx_sm120' only")
@@ -1210,6 +1234,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         from types import SimpleNamespace
         sig = SimpleNamespace(parameters=parameters)
     kwargs: dict = {"num_views": num_views}
+    for name, value in (("fuse_image_embeds", fuse_image_embeds),
+                        ("use_backbone_graph", use_backbone_graph)):
+        if value is None:
+            continue
+        if config != "groot_n17" or framework != "torch" or name not in sig.parameters:
+            raise ValueError(f"{name} is not supported by {pipe_cls.__name__}")
+        kwargs[name] = value
     if config == "xvla":
         if xvla_precision not in ("bf16", "fp8", "nvfp4"):
             raise ValueError(
