@@ -35,31 +35,94 @@ class Rdna35TensorOps:
             qkv.data_ptr(), rope_cos.data_ptr(), rope_sin.data_ptr(),
             qkv.shape[0], position_start, self._stream(qkv))
 
-    def layer_norm(self, out, x, weight, bias, eps=1e-6) -> None:
-        if self.fused_large_ops and x.shape[-1] == 1152:
+    def _normalize(self, out, x, weight=None, bias=None, *, kind, eps,
+                   weight_offset=0.0, round_affine=False, fused=False,
+                   residual=None, out_sum=None):
+        """Common norm math; affine rounding is an explicit numerical contract.
+
+        ``round_affine`` rounds the normalized value, offset weight and product
+        to the input dtype. Otherwise reduction and affine arithmetic stay FP32
+        until the output store. A residual sum is always rounded first.
+        """
+        if fused:
+            from ..rdna.normalization import normalize
+            normalize(x, weight, bias, kind=kind, eps=eps,
+                      weight_offset=weight_offset, round_affine=round_affine,
+                      residual=residual, out=out, out_sum=out_sum)
+            return
+        if residual is not None:
+            x = x + residual
+            out_sum.copy_(x)
+        if kind == "layer" and not round_affine:
+            # ATen accumulates BF16 LayerNorm in FP32, including the affine.
+            # Avoid separate input/parameter casts and their graph nodes.
+            value = F.layer_norm(x, (x.shape[-1],), weight, bias, eps)
+        else:
+            xf = x.float()
+            value = (F.layer_norm(xf, (x.shape[-1],), eps=eps)
+                     if kind == "layer" else
+                     xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps))
+            if round_affine:
+                value = value.to(x.dtype)
+            if weight is not None:
+                scale = weight if round_affine else weight.float()
+                if weight_offset:
+                    scale = weight_offset + scale
+                value = value * scale
+            if bias is not None:
+                value = value + (bias if round_affine else bias.float())
+        value = value.to(self.dtype)
+        return value if out is None else out.copy_(value)
+
+    def layer_norm(self, out, x, weight=None, bias=None, eps=1e-6):
+        """LayerNorm with optional destination; allocate only when ``out=None``."""
+        if (self.fused_large_ops and x.shape[-1] == 1152
+                and weight is not None and bias is not None):
+            if out is None:
+                out = torch.empty_like(x)
             width = x.shape[-1]
             self.fvk.layer_norm_rdna(
                 out.data_ptr(), x.data_ptr(), weight.data_ptr(),
                 bias.data_ptr(), x.numel() // width, width, eps,
                 self._stream(x))
-            return
-        value = F.layer_norm(
-            x.float(), (x.shape[-1],), weight.float(), bias.float(), eps)
-        out.copy_(value.to(self.dtype))
+            return out
+        return self._normalize(out, x, weight, bias, kind="layer", eps=eps)
 
-    def rms_norm(self, out, x, weight=None, eps=1e-6) -> None:
+    def rms_norm(self, out, x, weight=None, eps=1e-6, *,
+                 weight_offset=1.0, round_affine=False, fused=False) -> None:
+        """RMSNorm; legacy callers retain FP32 affine with ``1 + weight``."""
         if self.fused_large_ops and weight is None and x.shape[-1] == 2048:
             width = x.shape[-1]
             self.fvk.rms_norm_rdna(
                 out.data_ptr(), x.data_ptr(), x.numel() // width, width, eps,
                 self._stream(x))
             return
-        xf = x.float()
-        value = xf * torch.rsqrt(
-            xf.square().mean(dim=-1, keepdim=True) + eps)
-        if weight is not None:
-            value = value * (1.0 + weight.float())
-        out.copy_(value.to(self.dtype))
+        self._normalize(out, x, weight, kind="rms", eps=eps,
+                        weight_offset=weight_offset,
+                        round_affine=round_affine, fused=fused)
+
+    def ada_layer_norm(self, out, x, scale, shift, eps=1e-5, *, fused=True):
+        """Centered LayerNorm with dtype-rounded ``norm * (1 + scale) + shift``."""
+        self._normalize(out, x, scale, shift, kind="layer", eps=eps,
+                        weight_offset=1.0, round_affine=True, fused=fused)
+
+    def residual_layer_norm(self, out, out_sum, update, residual,
+                            scale=None, shift=None, eps=1e-5, *, fused=True):
+        self._normalize(out, update, scale, shift, kind="layer", eps=eps,
+                        weight_offset=1.0, round_affine=True, fused=fused,
+                        residual=residual, out_sum=out_sum)
+
+    @staticmethod
+    def rotate_half(out, x, cos, sin, *, fused=True):
+        """SHD rotate-half with FP32 products, unlike adjacent-pair QKV RoPE."""
+        if fused:
+            from ..rdna.normalization import rope
+            rope(x, cos, sin, out=out)
+            return
+        first, second = x.float().chunk(2, dim=-1)
+        rotated = torch.cat((-second, first), dim=-1)
+        out.copy_((x.float() * cos[:, None].float()
+                   + rotated * sin[:, None].float()).to(x.dtype))
 
     def adarms(
         self, out, x, cond, weight, bias, eps=1e-6, modulation=None,
@@ -78,11 +141,8 @@ class Rdna35TensorOps:
                 x.numel() // width, width, eps, self._stream(x))
             return modulation[:, 2 * width:]
         scale, shift, gate = modulation.chunk(3, dim=-1)
-        xf = x.float()
-        value = xf * torch.rsqrt(
-            xf.square().mean(dim=-1, keepdim=True) + eps)
-        value = value * (1.0 + scale.float()) + shift.float()
-        out.copy_(value.to(self.dtype))
+        self._normalize(out, x, scale, shift, kind="rms", eps=eps,
+                        weight_offset=1.0)
         return gate.to(self.dtype)
 
     def gelu(self, out, x) -> None:
