@@ -22,11 +22,26 @@ size_t sf_bytes(int rows, int cols);
 // Row normalization straight to NVFP4: mode 0 = LayerNorm (weight / bias
 // optional), mode 1 = RMSNorm (weight optional, y = x * rsqrt(mean x^2 + eps) * w).
 // With residual (nullable) the row is first updated in place, x += residual
-// (BF16), and the norm reads the updated row. dim % 128 == 0, dim <= 4096;
-// one CTA per row.
+// (BF16), and the norm reads the updated row. With residual_bias (nullable,
+// BF16 [dim]) the residual term is bf16(residual + residual_bias) — the
+// projection bias of the producing GEMM folded into the update. dim % 128 == 0,
+// dim <= 4096; one CTA per row.
 int norm_quant(__nv_bfloat16* x, const __nv_bfloat16* residual, const __nv_bfloat16* weight,
                const __nv_bfloat16* bias, int mode, float eps, uint8_t* out, uint8_t* out_sf, const float* gs,
-               int rows, int dim, cudaStream_t stream);
+               int rows, int dim, cudaStream_t stream, const __nv_bfloat16* residual_bias = nullptr);
+
+// Same contract and output bytes as norm_quant, one warp per row (no CTA
+// barriers) for dim in {1024, 1152, 2048, 2560, 4096}; other dims fall back.
+int norm_quant_warp(__nv_bfloat16* x, const __nv_bfloat16* residual, const __nv_bfloat16* weight,
+                    const __nv_bfloat16* bias, int mode, float eps, uint8_t* out, uint8_t* out_sf,
+                    const float* gs, int rows, int dim, cudaStream_t stream,
+                    const __nv_bfloat16* residual_bias = nullptr,
+                    int mw_wpr = 0);   // 3 (dim 1152) / 4 (dim 2560): warps per row
+
+// NVFP4(bf16(bf16(gelu_tanh(a)) * b)) for BF16 [rows, cols] a, b: the
+// gelu_inplace + mul + quant sequence in one pass. cols % 128 == 0.
+int gelu_mul_quant(const __nv_bfloat16* a, const __nv_bfloat16* b, uint8_t* out, uint8_t* out_sf,
+                   const float* gs, int rows, int cols, cudaStream_t stream);
 
 // BF16 [rows, cols] (row stride ld elements) -> NVFP4. cols % 128 == 0.
 int quant(const __nv_bfloat16* x, int ld, uint8_t* out, uint8_t* out_sf, const float* gs, int rows, int cols,

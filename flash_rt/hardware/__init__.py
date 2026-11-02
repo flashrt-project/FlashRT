@@ -125,6 +125,14 @@ def detect_arch() -> str:
 # drag in every backend. External plugins may add entries to this dict
 # to register new models — see ``docs/plugin_model_template.md``.
 _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
+    # ── MolmoAct2 (allenai) VLA ──
+    # Native-kernel RTX SM120 path: ViT + pooled adapter + Qwen2.5-style
+    # VLM prefill + per-layer-KV flow-matching action expert, captured as
+    # one CUDA Graph. See flash_rt/models/molmoact2/pipeline_rtx.py.
+    ("molmoact2", "torch", "rtx_sm120"):
+        ("flash_rt.frontends.torch.molmoact2_rtx",
+         "MolmoAct2TorchFrontendRtx"),
+
     # ── Spark-X2.5-4B ──
     # Discovery only, like qwen3_vl: this is a text decoder, not a VLA, so it is
     # constructed directly rather than through load_model's wrapper. SM120 only

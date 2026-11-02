@@ -95,6 +95,16 @@ GemmRunner::CachedGemm& GemmRunner::get_or_create_cached(GemmType type, int M, i
         CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(entry.B_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
         CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.D_desc, CUDA_R_16BF, M, N, N));
         CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(entry.D_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
+    } else if (type == BF16_NN_FP32) {
+        CUBLAS_CHECK(cublasLtMatmulDescCreate(&entry.matmul_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_N, sizeof(op_N)));
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_N, sizeof(op_N)));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.A_desc, CUDA_R_16BF, M, K, K));
+        CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(entry.A_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.B_desc, CUDA_R_16BF, K, N, N));
+        CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(entry.B_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.D_desc, CUDA_R_32F, M, N, N));
+        CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(entry.D_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
     } else if (type == FP16_NN) {
         // FP16 no-transpose: D(M,N) = A(M,K) @ B(K,N)
         CUBLAS_CHECK(cublasLtMatmulDescCreate(&entry.matmul_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
@@ -752,6 +762,16 @@ void GemmRunner::fp16_nn(void* A, void* B, void* D,
 //  Uses beta=1 to accumulate matmul result into D in FP32, avoiding
 //  a BF16 round-trip that separate matmul+residual_add would cause.
 // ================================================================
+void GemmRunner::bf16_nn_fp32(void* A, void* B, void* D,
+                              int M, int N, int K, cudaStream_t stream) {
+    auto& entry = get_or_create_cached(BF16_NN_FP32, M, N, K);
+    float alpha = 1.0f, beta = 0.0f;
+    CUBLAS_CHECK(cublasLtMatmul(handle_, entry.matmul_desc,
+        &alpha, A, entry.A_desc, B, entry.B_desc,
+        &beta, D, entry.D_desc, D, entry.D_desc,
+        &entry.algo, workspace_, workspace_size_, stream));
+}
+
 void GemmRunner::bf16_nn_res(void* A, void* B, void* D,
                               int M, int N, int K, cudaStream_t stream) {
     auto& entry = get_or_create_cached(BF16_NN_RES, M, N, K);
@@ -960,6 +980,58 @@ void GemmRunner::bf16_nt_bias(void* A, void* B, void* D, void* bias,
 //  BF16 GEMM + BIAS + GELU epilogue: D(M,N) = GELU(A(M,K) @ B(K,N) + bias(N))
 //  Fuses GEMM + bias + GELU into single cuBLASLt launch.
 // ================================================================
+// ================================================================
+//  BF16 GEMM + fused FP32-bias epilogue.  The epilogue adds the bias to
+//  the FP32 accumulator and rounds once, which is PyTorch's linear path.
+// ================================================================
+void GemmRunner::bf16_nn_bias_f32(void* A, void* B, void* D, void* bias,
+                                  int M, int N, int K, cudaStream_t stream) {
+    GemmKey key{108, M, N, K};
+    auto it = gemm_cache_.find(key);
+    if (it == gemm_cache_.end()) {
+        CachedGemm entry;
+        cublasLtOrder_t row_order = CUBLASLT_ORDER_ROW;
+        cublasOperation_t op_N = CUBLAS_OP_N;
+        CUBLAS_CHECK(cublasLtMatmulDescCreate(&entry.matmul_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_N, sizeof(op_N)));
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_N, sizeof(op_N)));
+        cublasLtEpilogue_t epi = CUBLASLT_EPILOGUE_BIAS;
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epi, sizeof(epi)));
+        cudaDataType_t btype = CUDA_R_32F;
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &btype, sizeof(btype)));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.A_desc, CUDA_R_16BF, M, K, K));
+        CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(entry.A_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.B_desc, CUDA_R_16BF, K, N, N));
+        CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(entry.B_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.D_desc, CUDA_R_16BF, M, N, N));
+        CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(entry.D_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
+        cublasLtMatmulPreference_t pref;
+        CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&pref));
+        CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size_, sizeof(workspace_size_)));
+        cublasLtMatmulHeuristicResult_t result; int ret = 0;
+        CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(handle_, entry.matmul_desc, entry.A_desc, entry.B_desc, entry.D_desc, entry.D_desc, pref, 1, &result, &ret));
+        if (ret == 0) {
+            cublasLtMatmulPreferenceDestroy(pref);
+            cublasLtMatrixLayoutDestroy(entry.A_desc);
+            cublasLtMatrixLayoutDestroy(entry.B_desc);
+            cublasLtMatrixLayoutDestroy(entry.D_desc);
+            cublasLtMatmulDescDestroy(entry.matmul_desc);
+            throw std::runtime_error("cuBLASLt bf16_nn_bias_f32: no algorithm found");
+        }
+        entry.algo = result.algo;
+        cublasLtMatmulPreferenceDestroy(pref);
+        it = gemm_cache_.emplace(key, entry).first;
+    }
+    CachedGemm& entry = it->second;
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc,
+        CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+    float alpha = 1.0f, beta = 0.0f;
+    CUBLAS_CHECK(cublasLtMatmul(handle_, entry.matmul_desc,
+        &alpha, A, entry.A_desc, B, entry.B_desc,
+        &beta, D, entry.D_desc, D, entry.D_desc,
+        &entry.algo, workspace_, workspace_size_, stream));
+}
+
 void GemmRunner::bf16_nn_bias_gelu(void* A, void* B, void* D, void* bias,
                                     int M, int N, int K, cudaStream_t stream) {
     cublasLtMatmulDesc_t matmul_desc;

@@ -51,8 +51,9 @@ using TileShape = Shape<_128, _128, _256>;
 using ClusterShape = Shape<_1, _1, _1>;
 using Sm1xxBlkScaledConfig = cutlass::detail::Sm1xxBlockScaledConfig<16>;
 
-template <class Fusion>
+template <class Fusion, class TS = TileShape>
 struct Kernel {
+    using TileShape = TS;
     using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
         cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp, TileShape, ClusterShape,
         cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementCompute,
@@ -73,6 +74,9 @@ struct Kernel {
 using GeluFusion = cutlass::epilogue::fusion::LinCombPerColBiasEltActBlockScaleFactor<
     cutlass::epilogue::thread::GELU_taylor, 16, ElementD, ElementCompute, ElementSFD, LayoutSFDTag, ElementBias>;
 using GeluGemm = Kernel<GeluFusion>::Gemm;
+// 128-deep K tile: for K % 256 == 128 (e.g. K = 1152) the 256-deep tile wastes
+// half of its last k-block.
+using GeluGemmK128 = Kernel<GeluFusion, Shape<_128, _128, _128>>::Gemm;
 
 // GeGLU over interleaved gate|up columns: scale vector 32 on the interleaved
 // width == 16 outputs after the 2 -> 1 collapse.
@@ -144,6 +148,14 @@ int nvfp4_gemm_bias_gelu_fp4out_sm120(const void* A, const void* B, const void* 
                                       const float* alpha, const float* norm_constant, cudaStream_t stream) {
     if (!A || !B || !SFA || !SFB || !bias || !D_packed || !SFD || !alpha || !norm_constant || !shape_ok(M, N, K))
         return static_cast<int>(cutlass::Status::kErrorInvalidProblem);
+    if (K % 256 == 128) {
+        auto args = make_args<GeluGemmK128>(A, B, SFA, SFB, D_packed, M, N, K);
+        args.epilogue.thread.alpha_ptr = alpha;
+        args.epilogue.thread.bias_ptr = reinterpret_cast<ElementBias const*>(bias);
+        args.epilogue.thread.block_scale_factor_ptr = reinterpret_cast<ElementSFD*>(SFD);
+        args.epilogue.thread.norm_constant_ptr = norm_constant;
+        return launch<GeluGemmK128>(args, M, N, K, 2, stream);
+    }
     auto args = make_args<GeluGemm>(A, B, SFA, SFB, D_packed, M, N, K);
     args.epilogue.thread.alpha_ptr = alpha;
     args.epilogue.thread.bias_ptr = reinterpret_cast<ElementBias const*>(bias);

@@ -7,12 +7,21 @@ namespace flash_rt {
 namespace nvfp4_skinny {
 namespace {
 
+__device__ __forceinline__ float b2f(__nv_bfloat16 v) {
+    return __bfloat162float(v);
+}
+__device__ __forceinline__ __nv_bfloat16 f2b(float v) {
+    __nv_bfloat16 r;
+    asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(*(unsigned short*)&r) : "f"(v));
+    return r;
+}
+
 // One CTA: BN weight rows x KC of K for MT 16-row tiles (blockIdx.z picks the row group).
-template <int BN, int KC, int NW, int MT, bool ABF16, bool PDL>
+template <int BN, int KC, int NW, int MT, bool ABF16, bool PDL, bool FGATE = false>
 __global__ void __launch_bounds__(NW * 32)
 gemm_kernel(const void* __restrict__ A_, const uint8_t* __restrict__ SFA, const float* __restrict__ a_gs,
             const uint8_t* __restrict__ W, const uint8_t* __restrict__ SFB, float* __restrict__ partials, int M,
-            int N, int K) {
+            int N, int K, SkinnyFusedEpilogue fg = {}) {
     constexpr int THREADS = NW * 32;
     constexpr int NT = BN / 8;
     constexpr int NTW = NT / NW;
@@ -140,6 +149,35 @@ gemm_kernel(const void* __restrict__ A_, const uint8_t* __restrict__ SFA, const 
                 *reinterpret_cast<float2*>(base + static_cast<size_t>(row0 + 8) * N + col) =
                     make_float2(acc[mt][t][2], acc[mt][t][3]);
         }
+
+    if constexpr (FGATE) {
+        // Release this CTA's partials, count arrivals, and let the last CTA
+        // of the group reduce them and run the gate+residual sequence.
+        __threadfence();
+        __shared__ int is_last;
+        const int gidx = blockIdx.z * gridDim.x + blockIdx.x;
+        if (tid == 0)
+            is_last = (atomicAdd(&fg.counters[gidx], 1) == (int)gridDim.y - 1);
+        __syncthreads();
+        if (!is_last) return;
+        __threadfence();
+        const float alpha = (*fg.ags) * (*fg.wgs);
+        for (int idx = tid; idx < ROWS * BN; idx += THREADS) {
+            const int row = m0 + idx / BN, col = n0 + idx % BN;
+            if (row >= M) continue;
+            float sum = 0.f;
+            for (int t = 0; t < (int)gridDim.y; ++t)
+                sum += partials[static_cast<size_t>(t) * M * N +
+                                static_cast<size_t>(row) * N + col];
+            const float ss = b2f(f2b(sum * alpha));
+            const float a = b2f(f2b(ss + b2f(fg.bias[col])));
+            const float p = b2f(f2b(a * b2f(fg.gate[col])));
+            const size_t o = static_cast<size_t>(row) * N + col;
+            fg.res[o] = f2b(b2f(fg.res[o]) + p);
+        }
+        __syncthreads();
+        if (tid == 0) fg.counters[gidx] = 0;
+    }
 }
 
 // One thread per (8-column tile, 128-wide K chunk, lane): gathers the lane's
@@ -241,7 +279,8 @@ int launch_mt(const void* A, const uint8_t* SFA, const float* a_gs, const uint8_
     const dim3 grid(N / BN, K / KC, (M + 16 * MT - 1) / (16 * MT));
     const void* fn = pdl ? (const void*)gemm_kernel<BN, KC, NW, MT, ABF16, true>
                          : (const void*)gemm_kernel<BN, KC, NW, MT, ABF16, false>;
-    return launch_ex(fn, grid, dim3(NW * 32), stream, pdl, A, SFA, a_gs, W, SFB, partials, M, N, K);
+    return launch_ex(fn, grid, dim3(NW * 32), stream, pdl, A, SFA, a_gs, W, SFB, partials, M, N, K,
+                     SkinnyFusedEpilogue{});
 }
 
 template <int BN, int KC, int NW, bool ABF16>
@@ -289,7 +328,36 @@ int dispatch_gemm(const void* A, const void* SFA, const float* a_gs, const void*
 #undef CASE
 }
 
+template <int BN, int KC, int NW, int MT>
+int launch_mt_fused(const void* A, const float* a_gs, const uint8_t* W, const uint8_t* SFB,
+                    float* partials, const SkinnyFusedEpilogue* fg, int M, int N, int K,
+                    cudaStream_t stream) {
+    const dim3 grid(N / BN, K / KC, (M + 16 * MT - 1) / (16 * MT));
+    return launch_ex((const void*)gemm_kernel<BN, KC, NW, MT, true, false, true>, grid,
+                     dim3(NW * 32), stream, false, A, static_cast<const uint8_t*>(nullptr), a_gs, W, SFB,
+                     partials, M, N, K, *fg);
+}
+
+template <int BN, int KC, int NW>
+int launch_gemm_fused(const void* A, const float* a_gs, const void* W, const void* SFB,
+                      float* partials, const SkinnyFusedEpilogue* fg, int M, int N, int K,
+                      cudaStream_t stream) {
+    if (M < 1 || M > 32 || N % BN != 0 || K % KC != 0)
+        return static_cast<int>(cudaErrorInvalidValue);
+    return launch_mt_fused<BN, KC, NW, 2>(
+        A, a_gs, static_cast<const uint8_t*>(W), static_cast<const uint8_t*>(SFB), partials, fg,
+        M, N, K, stream);
+}
+
 }  // namespace
+
+int gemm_gate_residual_fused(const __nv_bfloat16* A, const float* a_gs, const void* W,
+                             const void* SFB, float* partials,
+                             const SkinnyFusedEpilogue* fg, int M, int N, int K, int cfg,
+                             cudaStream_t stream) {
+    if (cfg != 6) return static_cast<int>(cudaErrorInvalidValue);
+    return launch_gemm_fused<128, 256, 8>(A, a_gs, W, SFB, partials, fg, M, N, K, stream);
+}
 
 int config_count() { return kNumCfgs; }
 

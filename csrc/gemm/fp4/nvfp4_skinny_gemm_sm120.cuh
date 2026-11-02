@@ -48,6 +48,24 @@ int gemm_bf16_act(const __nv_bfloat16* A, const float* a_gs, const void* W, cons
 int pack_weight(const uint8_t* w, const uint8_t* sf, uint8_t* w_packed, uint8_t* sf_packed, int N, int K,
                 cudaStream_t stream);
 
+// Fused K-split reduction: the last CTA of each (n-tile, m-tile) group
+// sums the FP32 partials and applies the action gate+residual sequence, so
+// no separate consumer launch is needed. `counters` holds one zero-initialised
+// int per group; the last CTA resets it for the next launch.
+struct SkinnyFusedEpilogue {
+    const float* ags;
+    const float* wgs;
+    const __nv_bfloat16* bias;
+    __nv_bfloat16* res;
+    const __nv_bfloat16* gate;
+    int* counters;
+};
+int gemm_gate_residual_fused(const __nv_bfloat16* A, const float* a_gs,
+                             const void* W, const void* SFB,
+                             float* partials, const SkinnyFusedEpilogue* fg,
+                             int M, int N, int K, int cfg,
+                             cudaStream_t stream);
+
 // Setup time: BF16 [N, K] -> natural NVFP4 with global scale *gs
 // (scales ue4m3_ceil(amax16 / (6 gs))). mse_steps > 0 additionally tries that
 // many smaller UE4M3 scale codes per block and keeps the one with the least

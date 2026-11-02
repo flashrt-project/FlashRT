@@ -55,5 +55,41 @@ int fmha_fp8_causal_gqa_nhd_d128_fp4out(
     float        softmax_scale,
     cudaStream_t stream);
 
+// 64-row / 64-key tile (4 warps, two CTAs per SM). Same layout contract;
+// Lq must be a multiple of 64. Finer online-softmax tiling: 98.3 vs
+// 114.7 us/layer at L=768, cosine 0.99996 against the 128-row tile.
+int fmha_fp8_causal_gqa_q64_nhd_d128(
+    const void*  q_fp8,
+    const void*  k_fp8,
+    const void*  v_fp8,
+    void*        out_bf16,
+    int          Lq,
+    int          Lk,
+    int          num_q_heads,
+    int          num_kv_heads,
+    float        softmax_scale,
+    cudaStream_t stream);
+
+// Same 64x64 tile with two producer warps that transpose the V tile while
+// the four compute warps run QK; math and output are unchanged.
+int fmha_fp8_causal_gqa_q64_nhd_d128_fp4out_wsp(
+    const void* q_fp8, const void* k_fp8, const void* v_fp8,
+    void* out_fp4, void* out_sf,
+    int Lq, int Lk, int num_q_heads, int num_kv_heads,
+    float softmax_scale, cudaStream_t stream);
+
+int fmha_fp8_causal_gqa_q64_nhd_d128_fp4out(
+    const void*  q_fp8,
+    const void*  k_fp8,
+    const void*  v_fp8,
+    void*        out_fp4,
+    void*        out_sf,
+    int          Lq,
+    int          Lk,
+    int          num_q_heads,
+    int          num_kv_heads,
+    float        softmax_scale,
+    cudaStream_t stream);
+
 }  // namespace attention
 }  // namespace flash_rt

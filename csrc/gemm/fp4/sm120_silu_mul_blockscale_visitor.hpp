@@ -63,6 +63,9 @@ struct Sm120SiluMulBlockScaleFactorRowStore {
     NormalConstStrideMNL norm_constant_stride = {};
     ElementCompute alpha_gate = ElementCompute(1);
     ElementCompute alpha_up = ElementCompute(1);
+    // Round each block scale up to the next UE4M3 value instead of to
+    // nearest, so the block maximum never saturates (amax / sf <= 6).
+    int ceil_sf = 0;
   };
 
   using Params = Arguments;
@@ -383,6 +386,13 @@ struct Sm120SiluMulBlockScaleFactorRowStore {
 
         ElementCompute pvscale = mul(amax, norm_constant_scaled_down);
         UnderlyingElementBlockScaleFactor qpvscale = NumericConverter<UnderlyingElementBlockScaleFactor, ElementCompute>{}(pvscale);
+        if constexpr (cute::is_same_v<UnderlyingElementBlockScaleFactor, float_ue4m3_t>) {
+          if (params_ptr->ceil_sf &&
+              NumericConverter<ElementCompute, UnderlyingElementBlockScaleFactor>{}(qpvscale) < pvscale &&
+              qpvscale.storage < 0x7E) {
+            qpvscale.storage += 1;   // next representable value (monotonic code)
+          }
+        }
         tC_rSFD_flt(coord) = qpvscale;
 
         //
@@ -556,6 +566,7 @@ struct FusionCallbacks<
     // SwiGLU per-projection scales (applied in visit()).
     ElementCompute alpha_gate = ElementCompute(1);
     ElementCompute alpha_up   = ElementCompute(1);
+    int ceil_sf = 0;
 
     operator typename Impl::Arguments() const {
       return
@@ -572,7 +583,7 @@ struct FusionCallbacks<
           },
           // store-node args: ptr_scale_factor, norm_constant_ptr,
           // norm_constant_stride, alpha_gate, alpha_up
-          {block_scale_factor_ptr, norm_constant_ptr, dNormConst, alpha_gate, alpha_up}
+          {block_scale_factor_ptr, norm_constant_ptr, dNormConst, alpha_gate, alpha_up, ceil_sf}
         };
     }
   };

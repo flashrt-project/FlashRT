@@ -49,7 +49,8 @@ void fp4_w4a16_dual_gemm_silu_fp4out_sm120(
     int M, int N, int K,
     float        alpha_gate,
     float        alpha_up,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    bool         ceil_sf = false);   // round block scales up (no saturation)
 
 }  // namespace gemm
 }  // namespace flash_rt

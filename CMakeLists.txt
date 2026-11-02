@@ -212,6 +212,21 @@ option(FLASHRT_ENABLE_LINGBOT
        "Build LingBot-VLA Thor (sm_110) model kernels and bindings" ON)
 option(FLASHRT_ENABLE_MOTUS
        "Build Motus-specific RTX SM120 kernels and bindings" ON)
+# MolmoAct2 (allenai) VLA RTX kernels: the model-specific helper/producer set,
+# the persistent action-expert layer kernel, the small-M NVFP4 GEMM, and the
+# 72-deep vision attention. All of them need sm_120a/sm_121a (block-scaled
+# NVFP4 MMA and bulk async copies), so this is both a model and a hardware
+# gate. OFF by default: unrelated builds pay no compile/link/symbol cost.
+# Enable with -DFLASHRT_ENABLE_MOLMOACT2=ON on GPU_ARCH=120/121.
+option(FLASHRT_ENABLE_MOLMOACT2
+       "Build MolmoAct2 RTX SM120 VLA kernels and bindings" OFF)
+if(FLASHRT_ENABLE_MOLMOACT2 AND NOT (GPU_ARCH STREQUAL "120" OR
+                                      GPU_ARCH STREQUAL "121"))
+  message(FATAL_ERROR
+    "FLASHRT_ENABLE_MOLMOACT2 requires GPU_ARCH=120 or 121; current "
+    "GPU_ARCH=${GPU_ARCH}. The MolmoAct2 kernels use block-scaled NVFP4 MMA "
+    "and bulk async copies that only sm_120a/sm_121a provide.")
+endif()
 # qwen3_5_moe family (Nex-N2-mini / Qwen3.5-3.6-35B-A3B) kernels, split into
 # three tiers by the hardware each tier actually requires. All are OFF by
 # default so they never enter the flash_rt_kernels build for models that do
@@ -783,6 +798,7 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
     csrc/gemm/fp4/cutlass_nvfp4_gemm_dn_streamk_bias_sm120.cu
     csrc/gemm/fp4/cutlass_nvfp4_dual_gemm_silu_fp4out_sm120.cu
     csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_res_sm120.cu
+    csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_res_k128_sm120.cu
     csrc/gemm/fp4/cutlass_nvfp4_gemm_glu_fp4out_sm120.cu)
   set_target_properties(sm120_nvfp4_ffn_obj PROPERTIES
     CUDA_STANDARD 17
@@ -797,6 +813,30 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
   target_compile_options(sm120_nvfp4_ffn_obj PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
       --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+  # Fused NVFP4 GEMM -> bias + tanh-GELU -> static FP8 epilogue. A generic
+  # epilogue (first used by MolmoAct2's vision MLP), so it stays with the
+  # shared SM120 NVFP4 FFN object rather than a model gate. Built with the
+  # flash_rt_kernels math flags (no --use_fast_math) so its tanhf and
+  # roundings match the standalone FP8 producers byte for byte.
+  add_library(sm120_nvfp4_gelu_fp8_obj OBJECT
+    csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_fp8out_k128_sm120.cu)
+  set_target_properties(sm120_nvfp4_gelu_fp8_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(sm120_nvfp4_gelu_fp8_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/fp4
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(sm120_nvfp4_gelu_fp8_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3
+      --ftz=true --prec-div=false --prec-sqrt=false
       ${GPU_GENCODE}
     >
   )
@@ -950,6 +990,16 @@ endif()
 # different model (Spark-X2.5, Qwen3.6) drop the group along with its bindings.
 option(FLASHRT_ENABLE_QWEN3_FP8_PREFILL
        "Build Qwen3 SM120 FP8 prefill attention (sage2 + fmha)" ON)
+# MolmoAct2's text prefill and its 64x64 tile are entries in this object, so
+# the model gate implies it. Keep the dependency explicit instead of letting a
+# MolmoAct2 build produce bindings whose implementation was gated out.
+if(FLASHRT_ENABLE_MOLMOACT2 AND NOT FLASHRT_ENABLE_QWEN3_FP8_PREFILL)
+  message(STATUS
+    "MolmoAct2 requires the SM120 FP8 prefill attention: enabling "
+    "FLASHRT_ENABLE_QWEN3_FP8_PREFILL")
+  set(FLASHRT_ENABLE_QWEN3_FP8_PREFILL ON CACHE BOOL
+      "Build Qwen3 SM120 FP8 prefill attention (sage2 + fmha)" FORCE)
+endif()
 if((GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
    AND FLASHRT_ENABLE_QWEN3_FP8_PREFILL)
   add_library(qwen3_prefill_sm120_obj OBJECT
@@ -972,6 +1022,58 @@ if((GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
       ${GPU_GENCODE}
     >
   )
+endif()
+
+# ── MolmoAct2 VLA SM120 kernels (model + hardware gated) ──
+# Two object libraries: the MolmoAct2 helper/producer set keeps the
+# flash_rt_kernels math flags (no --use_fast_math) so its tanh-GELU, silu and
+# static-FP8 producers round exactly as the shared kernels they replace; the
+# 72-deep vision attention follows the FA2/attention convention and builds
+# with --use_fast_math. The vendored FA2 kernel_traits assert
+# kHeadDim % 32 == 0, so a 72-deep head would be dispatched to the 96-deep
+# kernel; the native kernel uses the bf16 MMA depth (72 -> 80 for QK, exactly
+# 72 for P*V).
+if(FLASHRT_ENABLE_MOLMOACT2)
+  add_library(molmoact2_sm120_obj OBJECT
+    csrc/kernels/molmoact2_kernels.cu
+    csrc/kernels/molmoact2_action_mk_sm120.cu
+    csrc/kernels/molmo_smallm_gemm_sm120.cu)
+  set_target_properties(molmoact2_sm120_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(molmoact2_sm120_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/fp4
+  )
+  target_compile_options(molmoact2_sm120_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3
+      --ftz=true --prec-div=false --prec-sqrt=false
+      ${GPU_GENCODE}
+    >
+  )
+
+  add_library(molmo_vit_attn_sm120_obj OBJECT
+    csrc/attention/molmo_vit_attn_bf16_sm120.cu)
+  set_target_properties(molmo_vit_attn_sm120_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(molmo_vit_attn_sm120_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+  )
+  target_compile_options(molmo_vit_attn_sm120_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+  message(STATUS "MolmoAct2 RTX SM120 kernels: ENABLED")
+else()
+  message(STATUS "MolmoAct2 RTX SM120 kernels: DISABLED (set FLASHRT_ENABLE_MOLMOACT2=ON on GPU_ARCH=120/121)")
 endif()
 
 # ── Motus beta SM120 kernels ──
@@ -2336,11 +2438,20 @@ if((GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
     ENABLE_QWEN3_FP8_PREFILL_ATTN=1)
 endif()
 
+if(FLASHRT_ENABLE_MOLMOACT2)
+  target_sources(flash_rt_kernels PRIVATE
+    $<TARGET_OBJECTS:molmoact2_sm120_obj>
+    $<TARGET_OBJECTS:molmo_vit_attn_sm120_obj>)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    FLASHRT_HAVE_MOLMOACT2=1)
+endif()
+
 # SM120a CUTLASS NVFP4 W4A16 GEMM (Qwen3.6 NVFP4 ckpt path).
 if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
   target_sources(flash_rt_kernels PRIVATE
     $<TARGET_OBJECTS:cutlass_nvfp4_w4a16_sm120_obj>
     $<TARGET_OBJECTS:sm120_nvfp4_ffn_obj>
+    $<TARGET_OBJECTS:sm120_nvfp4_gelu_fp8_obj>
     $<TARGET_OBJECTS:nvfp4_skinny_sm120_obj>
     csrc/quantize/nvfp4_sf_reshape_sm120.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE

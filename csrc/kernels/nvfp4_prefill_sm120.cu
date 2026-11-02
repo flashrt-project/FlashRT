@@ -42,13 +42,18 @@ __global__ void __launch_bounds__(1024)
 norm_quant_kernel(__nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ residual,
                   const __nv_bfloat16* __restrict__ weight, const __nv_bfloat16* __restrict__ bias, int mode,
                   float eps, uint8_t* __restrict__ out, uint8_t* __restrict__ out_sf, const float* __restrict__ gs,
-                  int dim) {
+                  int dim, const __nv_bfloat16* __restrict__ residual_bias) {
     __shared__ float red[32];
     const int row = blockIdx.x, c0 = threadIdx.x * 4;
     uint2* xp = reinterpret_cast<uint2*>(x + static_cast<size_t>(row) * dim + c0);
     uint2 xv = *xp;
     if (residual != nullptr) {   // x += residual, BF16 residual stream updated in place
-        const uint2 rv = *reinterpret_cast<const uint2*>(residual + static_cast<size_t>(row) * dim + c0);
+        uint2 rv = *reinterpret_cast<const uint2*>(residual + static_cast<size_t>(row) * dim + c0);
+        if (residual_bias != nullptr) {
+            const uint2 bv = *reinterpret_cast<const uint2*>(residual_bias + c0);
+            const float2 r0 = bf2(rv.x), r1 = bf2(rv.y), b0 = bf2(bv.x), b1 = bf2(bv.y);
+            rv = make_uint2(pack_bf2(r0.x + b0.x, r0.y + b0.y), pack_bf2(r1.x + b1.x, r1.y + b1.y));
+        }
         const float2 a = bf2(xv.x), b = bf2(xv.y), ra = bf2(rv.x), rb = bf2(rv.y);
         xv = make_uint2(pack_bf2(a.x + ra.x, a.y + ra.y), pack_bf2(b.x + rb.x, b.y + rb.y));
         *xp = xv;
@@ -76,6 +81,218 @@ norm_quant_kernel(__nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict
     const float ig = 1.0f / (*gs);
     quant_quad4_swz(v[0] * ig, v[1] * ig, v[2] * ig, v[3] * ig, out + (static_cast<size_t>(row) * dim + c0) / 2,
                     out_sf, row, c0 / 16, (dim / 16 + 3) / 4, (threadIdx.x & 3) == 0);
+}
+
+// Warp-per-row replica of norm_quant_kernel for dim = 128 * NW: lane l plays
+// threads l + 32 j (j < NW) of the dim / 4-thread CTA, so every 4-element
+// partial, each warp's butterfly and the final cross-warp warp_sum run in
+// the same order and the bytes are identical, without the CTA barriers.
+template <int NW>
+__global__ void __launch_bounds__(256)
+norm_quant_warp_kernel(__nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ residual,
+                       const __nv_bfloat16* __restrict__ weight, const __nv_bfloat16* __restrict__ bias, int mode,
+                       float eps, uint8_t* __restrict__ out, uint8_t* __restrict__ out_sf,
+                       const float* __restrict__ gs, int rows, const __nv_bfloat16* __restrict__ residual_bias) {
+    constexpr int dim = NW * 128;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= rows) return;
+    // the CTA reduction: per-warp butterflies, then lane w < NW sums warp w
+    auto row_sum = [&](float (&p)[NW]) {
+        float r = 0.f;
+#pragma unroll
+        for (int j = 0; j < NW; ++j) {
+            p[j] = warp_sum(p[j]);
+            if (lane == j) r = p[j];
+        }
+        return warp_sum(r);
+    };
+    float v[NW][4];
+#pragma unroll
+    for (int j = 0; j < NW; ++j) {
+        const int c0 = 4 * (lane + 32 * j);
+        uint2* xp = reinterpret_cast<uint2*>(x + static_cast<size_t>(row) * dim + c0);
+        uint2 xv = *xp;
+        if (residual != nullptr) {
+            uint2 rv = *reinterpret_cast<const uint2*>(residual + static_cast<size_t>(row) * dim + c0);
+            if (residual_bias != nullptr) {
+                const uint2 bv = *reinterpret_cast<const uint2*>(residual_bias + c0);
+                const float2 r0 = bf2(rv.x), r1 = bf2(rv.y), b0 = bf2(bv.x), b1 = bf2(bv.y);
+                rv = make_uint2(pack_bf2(r0.x + b0.x, r0.y + b0.y), pack_bf2(r1.x + b1.x, r1.y + b1.y));
+            }
+            const float2 a = bf2(xv.x), b = bf2(xv.y), ra = bf2(rv.x), rb = bf2(rv.y);
+            xv = make_uint2(pack_bf2(a.x + ra.x, a.y + ra.y), pack_bf2(b.x + rb.x, b.y + rb.y));
+            *xp = xv;
+        }
+        const float2 a = bf2(xv.x), b = bf2(xv.y);
+        v[j][0] = a.x; v[j][1] = a.y; v[j][2] = b.x; v[j][3] = b.y;
+    }
+    float p[NW];
+    if (mode == 0) {
+#pragma unroll
+        for (int j = 0; j < NW; ++j) p[j] = v[j][0] + v[j][1] + v[j][2] + v[j][3];
+        const float mean = row_sum(p) / dim;
+#pragma unroll
+        for (int j = 0; j < NW; ++j)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) v[j][i] -= mean;
+    }
+#pragma unroll
+    for (int j = 0; j < NW; ++j)
+        p[j] = v[j][0] * v[j][0] + v[j][1] * v[j][1] + v[j][2] * v[j][2] + v[j][3] * v[j][3];
+    const float inv = rsqrtf(row_sum(p) / dim + eps);
+    const float ig = 1.0f / (*gs);
+#pragma unroll
+    for (int j = 0; j < NW; ++j) {
+        const int c0 = 4 * (lane + 32 * j);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) v[j][i] *= inv;
+        if (weight != nullptr) {
+            const uint2 wv = *reinterpret_cast<const uint2*>(weight + c0);
+            const float2 w0 = bf2(wv.x), w1 = bf2(wv.y);
+            v[j][0] *= w0.x; v[j][1] *= w0.y; v[j][2] *= w1.x; v[j][3] *= w1.y;
+        }
+        if (bias != nullptr) {
+            const uint2 bv = *reinterpret_cast<const uint2*>(bias + c0);
+            const float2 b0 = bf2(bv.x), b1 = bf2(bv.y);
+            v[j][0] += b0.x; v[j][1] += b0.y; v[j][2] += b1.x; v[j][3] += b1.y;
+        }
+        quant_quad4_swz(v[j][0] * ig, v[j][1] * ig, v[j][2] * ig, v[j][3] * ig,
+                        out + (static_cast<size_t>(row) * dim + c0) / 2, out_sf, row, c0 / 16,
+                        (dim / 16 + 3) / 4, (lane & 3) == 0);
+    }
+}
+
+// Flat form of quant_kernel: one thread per 4-element quad over all rows
+// (cols % 128 == 0, so a warp never straddles rows). Same bytes.
+// Multi-warp form for long rows: WPR warps share a row, warp q owning the
+// virtual warps j = q, q + WPR, ...; the per-virtual-warp sums meet in
+// shared memory before the same final lane-ordered butterfly, so the bytes
+// still match norm_quant_kernel.
+template <int NW, int WPR>
+__global__ void __launch_bounds__(256)
+norm_quant_mw_kernel(__nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ residual,
+                     const __nv_bfloat16* __restrict__ weight, const __nv_bfloat16* __restrict__ bias, int mode,
+                     float eps, uint8_t* __restrict__ out, uint8_t* __restrict__ out_sf,
+                     const float* __restrict__ gs, int rows, const __nv_bfloat16* __restrict__ residual_bias) {
+    static_assert(NW % WPR == 0, "virtual warps split evenly");
+    constexpr int dim = NW * 128, VJ = NW / WPR, RPC = 8 / WPR;
+    __shared__ float vsum[RPC][32];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int rl = warp / WPR, q = warp % WPR;
+    const int row = blockIdx.x * RPC + rl;
+    const bool live = row < rows;   // no early return: the CTA barriers below
+    auto row_sum = [&](float (&p)[VJ]) {
+#pragma unroll
+        for (int t = 0; t < VJ; ++t) {
+            p[t] = warp_sum(p[t]);
+            if (lane == 0) vsum[rl][q + WPR * t] = p[t];
+        }
+        __syncthreads();
+        const float r = warp_sum(lane < NW ? vsum[rl][lane] : 0.f);
+        __syncthreads();   // vsum is reused by the next reduction
+        return r;
+    };
+    float v[VJ][4];
+#pragma unroll
+    for (int t = 0; t < VJ; ++t) {
+        const int c0 = 4 * (lane + 32 * (q + WPR * t));
+        uint2 xv = make_uint2(0u, 0u);
+        if (live) {
+            uint2* xp = reinterpret_cast<uint2*>(x + static_cast<size_t>(row) * dim + c0);
+            xv = *xp;
+            if (residual != nullptr) {
+                uint2 rv = *reinterpret_cast<const uint2*>(residual + static_cast<size_t>(row) * dim + c0);
+                if (residual_bias != nullptr) {
+                    const uint2 bv = *reinterpret_cast<const uint2*>(residual_bias + c0);
+                    const float2 r0 = bf2(rv.x), r1 = bf2(rv.y), b0 = bf2(bv.x), b1 = bf2(bv.y);
+                    rv = make_uint2(pack_bf2(r0.x + b0.x, r0.y + b0.y), pack_bf2(r1.x + b1.x, r1.y + b1.y));
+                }
+                const float2 a = bf2(xv.x), b = bf2(xv.y), ra = bf2(rv.x), rb = bf2(rv.y);
+                xv = make_uint2(pack_bf2(a.x + ra.x, a.y + ra.y), pack_bf2(b.x + rb.x, b.y + rb.y));
+                *xp = xv;
+            }
+        }
+        const float2 a = bf2(xv.x), b = bf2(xv.y);
+        v[t][0] = a.x; v[t][1] = a.y; v[t][2] = b.x; v[t][3] = b.y;
+    }
+    float p[VJ];
+    if (mode == 0) {
+#pragma unroll
+        for (int t = 0; t < VJ; ++t) p[t] = v[t][0] + v[t][1] + v[t][2] + v[t][3];
+        const float mean = row_sum(p) / dim;
+#pragma unroll
+        for (int t = 0; t < VJ; ++t)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) v[t][i] -= mean;
+    }
+#pragma unroll
+    for (int t = 0; t < VJ; ++t)
+        p[t] = v[t][0] * v[t][0] + v[t][1] * v[t][1] + v[t][2] * v[t][2] + v[t][3] * v[t][3];
+    const float inv = rsqrtf(row_sum(p) / dim + eps);
+    if (!live) return;
+    const float ig = 1.0f / (*gs);
+#pragma unroll
+    for (int t = 0; t < VJ; ++t) {
+        const int c0 = 4 * (lane + 32 * (q + WPR * t));
+#pragma unroll
+        for (int i = 0; i < 4; ++i) v[t][i] *= inv;
+        if (weight != nullptr) {
+            const uint2 wv = *reinterpret_cast<const uint2*>(weight + c0);
+            const float2 w0 = bf2(wv.x), w1 = bf2(wv.y);
+            v[t][0] *= w0.x; v[t][1] *= w0.y; v[t][2] *= w1.x; v[t][3] *= w1.y;
+        }
+        if (bias != nullptr) {
+            const uint2 bv = *reinterpret_cast<const uint2*>(bias + c0);
+            const float2 b0 = bf2(bv.x), b1 = bf2(bv.y);
+            v[t][0] += b0.x; v[t][1] += b0.y; v[t][2] += b1.x; v[t][3] += b1.y;
+        }
+        quant_quad4_swz(v[t][0] * ig, v[t][1] * ig, v[t][2] * ig, v[t][3] * ig,
+                        out + (static_cast<size_t>(row) * dim + c0) / 2, out_sf, row, c0 / 16,
+                        (dim / 16 + 3) / 4, (lane & 3) == 0);
+    }
+}
+
+__global__ void __launch_bounds__(256)
+quant_flat_kernel(const __nv_bfloat16* __restrict__ x, int ld, uint8_t* __restrict__ out,
+                  uint8_t* __restrict__ out_sf, const float* __restrict__ gs, int cols, long quads) {
+    const long g = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (g >= quads) return;   // quads % 32 == 0: whole warps exit together
+    const int q4 = cols / 4;
+    const int row = static_cast<int>(g / q4), c0 = static_cast<int>(g % q4) * 4;
+    const float ig = 1.0f / (*gs);
+    const uint2 xv = *reinterpret_cast<const uint2*>(x + static_cast<size_t>(row) * ld + c0);
+    const float2 a = bf2(xv.x), b = bf2(xv.y);
+    quant_quad4_swz(a.x * ig, a.y * ig, b.x * ig, b.y * ig, out + (static_cast<size_t>(row) * cols + c0) / 2,
+                    out_sf, row, c0 / 16, (cols / 16 + 3) / 4, (threadIdx.x & 3) == 0);
+}
+
+// gelu_inplace (tanh form) on a, the bf16 product with b, then quant: the
+// three-pass adapter GeGLU tail in one pass with the same roundings.
+__global__ void __launch_bounds__(256)
+gelu_mul_quant_kernel(const __nv_bfloat16* __restrict__ a, const __nv_bfloat16* __restrict__ b,
+                      uint8_t* __restrict__ out, uint8_t* __restrict__ out_sf,
+                      const float* __restrict__ gs, int cols, long quads) {
+    const long g = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (g >= quads) return;   // quads % 32 == 0
+    const int q4 = cols / 4;
+    const int row = static_cast<int>(g / q4), c0 = static_cast<int>(g % q4) * 4;
+    const size_t e = static_cast<size_t>(row) * cols + c0;
+    const uint2 av = *reinterpret_cast<const uint2*>(a + e);
+    const uint2 bv = *reinterpret_cast<const uint2*>(b + e);
+    const float2 a0 = bf2(av.x), a1 = bf2(av.y), b0 = bf2(bv.x), b1 = bf2(bv.y);
+    const float ain[4] = {a0.x, a0.y, a1.x, a1.y}, bin[4] = {b0.x, b0.y, b1.x, b1.y};
+    float m[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float v = ain[i];
+        const float t = tanhf(0.7978845608f * (v + 0.044715f * v * v * v));
+        const float gl = __bfloat162float(__float2bfloat16(v * 0.5f * (1.0f + t)));
+        m[i] = __bfloat162float(__float2bfloat16(gl * bin[i]));
+    }
+    const float ig = 1.0f / (*gs);
+    quant_quad4_swz(m[0] * ig, m[1] * ig, m[2] * ig, m[3] * ig, out + e / 2, out_sf, row, c0 / 16,
+                    (cols / 16 + 3) / 4, (threadIdx.x & 3) == 0);
 }
 
 __global__ void __launch_bounds__(256)
@@ -144,18 +361,71 @@ size_t sf_bytes(int rows, int cols) {
 
 int norm_quant(__nv_bfloat16* x, const __nv_bfloat16* residual, const __nv_bfloat16* weight,
                const __nv_bfloat16* bias, int mode, float eps, uint8_t* out, uint8_t* out_sf, const float* gs,
-               int rows, int dim, cudaStream_t stream) {
-    if (rows < 1 || dim % 128 != 0 || dim > 4096 || (mode != 0 && mode != 1) || (mode == 1 && bias != nullptr))
+               int rows, int dim, cudaStream_t stream, const __nv_bfloat16* residual_bias) {
+    if (rows < 1 || dim % 128 != 0 || dim > 4096 || (mode != 0 && mode != 1) || (mode == 1 && bias != nullptr) ||
+        (residual_bias != nullptr && residual == nullptr))
         return static_cast<int>(cudaErrorInvalidValue);
-    norm_quant_kernel<<<rows, dim / 4, 0, stream>>>(x, residual, weight, bias, mode, eps, out, out_sf, gs, dim);
+    norm_quant_kernel<<<rows, dim / 4, 0, stream>>>(x, residual, weight, bias, mode, eps, out, out_sf, gs, dim,
+                                                    residual_bias);
+    return static_cast<int>(cudaGetLastError());
+}
+
+int norm_quant_warp(__nv_bfloat16* x, const __nv_bfloat16* residual, const __nv_bfloat16* weight,
+                    const __nv_bfloat16* bias, int mode, float eps, uint8_t* out, uint8_t* out_sf,
+                    const float* gs, int rows, int dim, cudaStream_t stream,
+                    const __nv_bfloat16* residual_bias, int mw_wpr) {
+    if (rows < 1 || (mode != 0 && mode != 1) || (mode == 1 && bias != nullptr) ||
+        (residual_bias != nullptr && residual == nullptr))
+        return static_cast<int>(cudaErrorInvalidValue);
+    constexpr int kRowsPerCta = 8;
+    const dim3 grid((rows + kRowsPerCta - 1) / kRowsPerCta);
+#define FLASHRT_NQW(NW)                                                                              \
+    case NW * 128:                                                                                  \
+        norm_quant_warp_kernel<NW><<<grid, kRowsPerCta * 32, 0, stream>>>(                          \
+            x, residual, weight, bias, mode, eps, out, out_sf, gs, rows, residual_bias);             \
+        return static_cast<int>(cudaGetLastError());
+#define FLASHRT_NQMW(NW, WPR)                                                                        \
+    case NW * 128:                                                                                  \
+        norm_quant_mw_kernel<NW, WPR><<<(rows + 8 / WPR - 1) / (8 / WPR), (8 / WPR) * WPR * 32, 0, stream>>>( \
+            x, residual, weight, bias, mode, eps, out, out_sf, gs, rows, residual_bias);             \
+        return static_cast<int>(cudaGetLastError());
+    if (mw_wpr == 3 || mw_wpr == 4) {
+        switch (dim) {
+            FLASHRT_NQMW(9, 3)
+            FLASHRT_NQMW(20, 4)
+            default:
+                break;
+        }
+    }
+#undef FLASHRT_NQMW
+    switch (dim) {
+        FLASHRT_NQW(8)
+        FLASHRT_NQW(9)
+        FLASHRT_NQW(16)
+        FLASHRT_NQW(20)
+        FLASHRT_NQW(32)
+        default:
+            return norm_quant(x, residual, weight, bias, mode, eps, out, out_sf, gs, rows, dim, stream,
+                              residual_bias);
+    }
+#undef FLASHRT_NQW
+}
+
+int gelu_mul_quant(const __nv_bfloat16* a, const __nv_bfloat16* b, uint8_t* out, uint8_t* out_sf,
+                   const float* gs, int rows, int cols, cudaStream_t stream) {
+    if (rows < 1 || cols % 128 != 0) return static_cast<int>(cudaErrorInvalidValue);
+    const long quads = static_cast<long>(rows) * (cols / 4);
+    gelu_mul_quant_kernel<<<static_cast<unsigned>((quads + 255) / 256), 256, 0, stream>>>(a, b, out, out_sf, gs,
+                                                                                          cols, quads);
     return static_cast<int>(cudaGetLastError());
 }
 
 int quant(const __nv_bfloat16* x, int ld, uint8_t* out, uint8_t* out_sf, const float* gs, int rows, int cols,
           cudaStream_t stream) {
     if (rows < 1 || cols % 128 != 0 || ld < cols || ld % 4 != 0) return static_cast<int>(cudaErrorInvalidValue);
-    const int threads = cols / 4 < 256 ? cols / 4 : 256;
-    quant_kernel<<<rows, threads, 0, stream>>>(x, ld, out, out_sf, gs, cols);
+    const long quads = static_cast<long>(rows) * (cols / 4);
+    quant_flat_kernel<<<static_cast<unsigned>((quads + 255) / 256), 256, 0, stream>>>(x, ld, out, out_sf, gs,
+                                                                                      cols, quads);
     return static_cast<int>(cudaGetLastError());
 }
 
