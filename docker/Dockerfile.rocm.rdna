@@ -6,6 +6,7 @@
 # Build from the repository root; no GPU is needed to build:
 #   docker build -f docker/Dockerfile.rocm.rdna --build-arg GPU_ARCH=gfx1100 -t flashrt:rocm-gfx1100 .
 # Use --target environment for the shared development environment.
+# Add --target groot for GR00T N1.7 BF16 and its official observation processor.
 FROM rocm/dev-ubuntu-24.04:10.1.0-full@sha256:5ed1362ea542a928651e4c710b44024ebe98870f74159cb70f0265aec8ef0abe AS environment
 
 RUN apt-get update \
@@ -41,6 +42,39 @@ RUN python -m pip install --no-cache-dir \
 WORKDIR /workspace/FlashRT
 CMD ["bash"]
 
+FROM environment AS groot-environment
+ARG GROOT_REPOSITORY=https://github.com/NVIDIA/Isaac-GR00T.git
+ARG GROOT_REVISION=9c7e746b2cd37a810070a98ef41d290a07e806c2
+ARG PIP_INDEX_URL=https://pypi.org/simple
+
+# Keep processor dependencies separate from the Pi0.5 runtime. The official
+# training package pins CUDA dependencies; only its processor source is used.
+RUN git init /opt/Isaac-GR00T \
+    && git -C /opt/Isaac-GR00T remote add origin "${GROOT_REPOSITORY}" \
+    && git -C /opt/Isaac-GR00T fetch --depth 1 --filter=blob:none origin "${GROOT_REVISION}" \
+    && git -C /opt/Isaac-GR00T sparse-checkout set --no-cone /gr00t/ /LICENSE /ATTRIBUTIONS.md \
+    && git -C /opt/Isaac-GR00T checkout --detach FETCH_HEAD \
+    && rm -rf /opt/Isaac-GR00T/.git \
+    && python -m venv /opt/groot-venv \
+    && runtime_site="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')" \
+    && groot_site="$(/opt/groot-venv/bin/python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')" \
+    && printf 'import site; site.addsitedir("%s")\n' "$runtime_site" \
+       > "$groot_site/rocm-runtime.pth"
+
+# GR00T observation processor dependencies; reuse the base AMD Torch stack.
+RUN /opt/groot-venv/bin/python -m pip install --no-cache-dir \
+      "transformers==4.57.3" "tokenizers==0.22.2" \
+      "huggingface-hub==0.36.0" "safetensors==0.8.0" \
+      "albumentations==1.4.18" "diffusers==0.35.1" "dm-tree==0.1.10" \
+      "lmdb==1.7.5" "msgpack==1.1.0" "msgpack-numpy==0.4.8" \
+      "pandas==2.2.3" "peft==0.17.1" "termcolor==3.2.0" \
+      "datasets==3.6.0" "einops==0.8.1" "jsonlines==4.0.0" \
+      "gymnasium==1.2.2" "omegaconf==2.3.0" "wandb==0.23.0" \
+      "pyzmq==27.0.1" "tyro==0.9.17" "opencv-python-headless==4.11.0.86" \
+      "pytz==2026.2" "python-dateutil==2.9.0.post0" \
+      "torchcodec==0.12.0" "av==19.0.0" "draccus==0.10.0" \
+      "accelerate==1.11.0" "rich==14.0.0" "scipy==1.18.1"
+
 FROM environment AS flashrt
 ARG GPU_ARCH
 ARG BUILD_JOBS=8
@@ -55,3 +89,16 @@ LABEL org.opencontainers.image.title="FlashRT ROCm RDNA" \
       org.opencontainers.image.source="https://github.com/flashrt-project/FlashRT" \
       org.opencontainers.image.revision="${SOURCE_REVISION}" \
       com.flashrt.gpu-arch="${GPU_ARCH}"
+
+FROM flashrt AS groot
+COPY --from=groot-environment /opt/groot-venv /opt/groot-venv
+COPY --from=groot-environment /opt/Isaac-GR00T /opt/Isaac-GR00T
+ENV VIRTUAL_ENV=/opt/groot-venv \
+    PATH=/opt/groot-venv/bin:${PATH} \
+    PYTHONPATH=/opt/Isaac-GR00T \
+    NO_ALBUMENTATIONS_UPDATE=1
+RUN cd /tmp && python -m pip check \
+    && python -c "import flash_rt, torch, torchvision, triton; from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor"
+
+# Preserve the existing default image; GR00T dependencies are opt-in.
+FROM flashrt AS default

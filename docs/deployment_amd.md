@@ -9,7 +9,7 @@ Per-model deployment guides:
 | Model | Guide | Status |
 |---|---|---|
 | Pi0.5 | [deployment_amd_pi05.md](deployment_amd_pi05.md) | CDNA4 FP8/BF16; RDNA 3/3.5/4 BF16 |
-| GROOT N1.7 | [deployment_amd_groot_n17.md](deployment_amd_groot_n17.md) | FP8 backbone + bf16 DiT |
+| GR00T N1.7 | [deployment_amd_groot_n17.md](deployment_amd_groot_n17.md) | CDNA FP8 backbone + BF16 DiT; RDNA 3/3.5/4 BF16 |
 
 ## Supported hardware
 
@@ -97,6 +97,7 @@ Dependencies:
 Ubuntu 24.04 / ROCm 10.1.0 environment with Ubuntu's Python 3.12, AMD PyTorch
 2.14.0, matching torchvision and Triton. It includes the dependencies for
 building, testing and running Pi0.5 BF16 on gfx1100, gfx1151 and gfx1201.
+The optional `--target groot` stage adds [GR00T N1.7 BF16](deployment_amd_groot_n17.md#gr00t-n17-bf16-on-amd-rdna) and its official observation processor.
 For CDNA setup, follow the instructions above.
 
 Build from the repository root, choosing exactly one RDNA target:

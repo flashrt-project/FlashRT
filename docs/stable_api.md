@@ -74,6 +74,9 @@ def load_model(
     xvla_precision: str = "nvfp4",  # "nvfp4" | "fp8" | "bf16"
     # Robot output schema (Apple/RDNA Pi0.5 / Jetson Pi):
     action_dim: int | None = None,
+    # Keyword-only, GR00T N1.7 RDNA input and graph controls:
+    fuse_image_embeds: bool | None = None,
+    use_backbone_graph: bool | None = None,
 ) -> VLAModel
 ```
 
@@ -203,7 +206,8 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   `groot_root=` / `data_config=` to the frontend); `predict(...)` returns the
   GR00T per-key action dict. See `docs/groot_n15_rtx_sm89.md`.
 - `config="groot_n17"` is registered for `framework="torch"` on
-  `hardware in {"thor", "rtx_sm120", "rtx_sm89", "amd_cdna4", "npu"}`. On RTX,
+  `hardware in {"thor", "rtx_sm120", "rtx_sm89", "rtx_sm87", "amd_cdna3",
+  "amd_cdna4", "amd_rdna3", "amd_rdna35", "amd_rdna4", "npu"}`. On RTX,
   `rtx_sm120` resolves through the historical shared RTX registration and
   `load_model()` refines that default route to the FP8 production
   frontend; `rtx_sm89` resolves directly to its dedicated SM89 frontend.
@@ -217,6 +221,35 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   caller, so it is driven through `model.pipeline` —
   `set_prompt(aux=...)`, `normalize_state`, `infer`,
   `denormalize_action` — rather than through `VLAModel.predict`.
+  RDNA (`gfx1100`, `gfx1151`, `gfx1201`) runs BF16. As with other RDNA models,
+  `load_model` converts `use_fp8=True` (including the loader default) to BF16
+  with a warning; pass `use_fp8=False` to select it explicitly. FP4/FP16 requests
+  fail before backend loading. Direct RDNA frontend construction rejects FP8.
+  Its default `fuse_image_embeds=False` accepts the existing projected
+  observation bundle (`pixel_features`, `llm_input_embeds`, `grid_thw`,
+  `visual_pos_masks`, `rope_cos`, `rope_sin`). Explicit
+  `fuse_image_embeds=True` selects Orin's raw-patch/token-ID contract and
+  enables `infer(state_normalized, frames=...)`. Extra dictionary fields never
+  select a different mode. Projected inputs include model computation performed
+  by the caller and must match the checkpoint and observation.
+  `load_model(fuse_image_embeds=None, use_backbone_graph=None)` preserves
+  frontend defaults. On RDNA, fusion defaults off and backbone graphs default
+  on. Explicit values must be bools and are supported only for N1.7 torch on
+  RDNA; other routes retain their existing construction interfaces.
+  `use_dit_graph` remains an independent inference argument. RDNA provides an
+  optional processor-only `prepare_observation` helper and `set_hf_processor`
+  injection for offline use.
+  `frames` accepts ordered RGB uint8 arrays/tensors or a sequence of images,
+  including every history frame in time-then-camera order. It cannot accompany
+  `aux['pixel_values']` and does not replace prompt setup or state normalization.
+  `flash_rt.amd.frontends.torch.groot_n17_rdna.frames_from_observation(observation,
+  camera_order)` packs batch-one video arrays in this order; use the checkpoint's
+  video modality keys for `camera_order`.
+  RDNA uses the checkpoint's official host image transforms, including
+  non-square images; device frames incur a host transfer. Processing stays
+  outside the HIP graph. Input/output semantics remain the normalized-state
+  `infer` and explicit physical action decoding workflow.
+  See [AMD GR00T deployment](deployment_amd_groot_n17.md#gr00t-n17-bf16-on-amd-rdna).
 - `config="chameleon"` is a chat-style VLM and is not served through
   `load_model`'s VLA wrapper. Calling `load_model(config="chameleon")`
   raises `NotImplementedError` with direct-construction instructions.
@@ -311,6 +344,19 @@ class VLAModel:
   mask, RoPE tables, and tensor shapes established by `set_prompt()`. Omitting
   `aux` reuses the eager backbone features without capturing the optional graph.
 
+  RDNA accepts the same `num_inference_timesteps`, `action_horizon`,
+  `num_timestep_buckets`, `initial_noise`, and `use_dit_graph` keywords.
+  Omitted schedule values use checkpoint/construction defaults; explicit
+  positive values reconfigure the schedule and invalidate affected graphs.
+  `action_horizon` cannot exceed the checkpoint horizon. Omitting `aux` reuses
+  the most recently supplied observation (initially the setup observation).
+  Supply fresh aux for every new camera observation. `use_dit_graph=False`
+  disables DiT capture; the backbone may still use its graph. The RDNA
+  frontend's `use_backbone_graph` constructor flag controls that stage;
+  `use_graph=False` on `infer` selects fully eager execution. The default fresh
+  observation path captures both stages in one graph. Frontend `predict` is
+  an alias of normalized-state `infer`, as on CUDA/CDNA.
+
 - `predict(images, prompt, state)` — run one inference step.
   `images`: list of `(224,224,3)` uint8 numpy arrays, or a dict with
   `"image"` / `"wrist_image"` / `"wrist_image_right"` keys.
@@ -397,7 +443,8 @@ Lazily imports and returns the concrete frontend class for the given
 Motus beta is registered for `(config="motus", framework="torch",
 arch="rtx_sm120")`.
 GROOT N1.7 is registered for `(config="groot_n17", framework="torch",
-arch in {"thor", "rtx_sm120", "rtx_sm89", "amd_cdna4", "npu"})`. On RTX, `rtx_sm120`
+arch in {"thor", "rtx_sm120", "rtx_sm89", "rtx_sm87", "amd_cdna3",
+"amd_cdna4", "amd_rdna3", "amd_rdna35", "amd_rdna4", "npu"})`. On RTX, `rtx_sm120`
 keeps the shared-base registration and `load_model()` refines that
 resolved class to the FP8 default or the explicit RTX reference frontend
 based on `use_fp8` / `use_fp16`; `rtx_sm89` resolves directly to the
