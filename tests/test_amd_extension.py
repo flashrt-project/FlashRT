@@ -74,7 +74,10 @@ def test_build_info_gpu_arch_is_supported_when_stamped():
         assert info["fp8_format"] == "e4m3fn"
         assert info["fp8_max_finite"] == 448.0
     else:
-        assert info.get("backend") == "rdna35"
+        assert info.get("backend") == "rdna"
+        assert info["hardware"] == {
+            "gfx1100": "amd_rdna3", "gfx1151": "amd_rdna35", "gfx1201": "amd_rdna4",
+        }[arch]
         assert info.get("wave_size") == 32
 
 
@@ -180,7 +183,7 @@ _REQUIRED_RDNA_GEMM_METHODS = [
 
 
 def _is_rdna_module(module) -> bool:
-    return module.build_info().get("backend") == "rdna35"
+    return module.build_info().get("backend") == "rdna"
 
 # GemmRunner methods the pi05 pipeline dispatches on by name.
 _REQUIRED_GEMM_METHODS = [

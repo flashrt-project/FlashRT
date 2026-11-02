@@ -13,13 +13,8 @@ RUN apt-get update \
       build-essential cmake git pkg-config python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
-ENV UV_PYTHON_INSTALL_DIR=/opt/python
-# The AMD wheels below use Python 3.13; keep them in a dedicated environment.
-RUN python3 -m venv /opt/uv \
-    && /opt/uv/bin/python -m pip install --no-cache-dir "uv==0.13.0" \
-    && /opt/uv/bin/uv python install 3.13.13 \
-    && /opt/uv/bin/uv venv --python 3.13.13 --seed /opt/venv \
-    && ln -s /opt/uv/bin/uv /usr/local/bin/uv
+# Use Ubuntu's Python 3.12 in an isolated environment.
+RUN python3 -m venv /opt/venv
 
 ENV VIRTUAL_ENV=/opt/venv \
     ROCM_PATH=/opt/rocm \

@@ -621,8 +621,8 @@ selection lives in `flash_rt.amd.hardware.rdna35.ops`, `gemm` and `attention`.
 or `rdna4` providers at setup. The shared frontend is `frontends/torch/pi05_rdna.py`
 and its thin model binding is `models/pi05_rdna/pipeline.py`.
 The shared providers remain in `hardware/rdna35/`, with generation-specific
-bindings in `rdna3/` and `rdna4/`. Public hardware keys, extension
-`build_info()` labels and `FLASHRT_RDNA35_*` controls remain supported.
+bindings in `rdna3/` and `rdna4/`. Public hardware keys and
+`FLASHRT_RDNA35_*` controls remain supported.
 The explicit portable torch provider runs the same model pipeline in CPU contract
 tests. It is a refactor regression tool, not an independent model oracle.
 RTX, Thor and CDNA use their own production pipelines.

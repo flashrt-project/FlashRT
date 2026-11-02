@@ -327,8 +327,10 @@ def test_public_actions_keep_constant_last_channel(monkeypatch, tmp_path):
 
 
 def _rdna_extension(arch):
+    hardware = {"gfx1100": "amd_rdna3", "gfx1151": "amd_rdna35", "gfx1201": "amd_rdna4"}
     return SimpleNamespace(
-        build_info=lambda: dict(backend="rdna35", gpu_arch=arch, wave_size=32),
+        build_info=lambda: dict(backend="rdna", gpu_arch=arch, wave_size=32,
+                                hardware=hardware.get(arch.split(":", 1)[0])),
         device_arch=lambda: arch,
         **{name: lambda *args: None for name in (
             "RdnaGemmRunner", "attention_encoder_gqa_rdna",
@@ -347,7 +349,8 @@ def test_rdna3_detection_and_lazy_registration(monkeypatch, arch):
 
 
 @pytest.mark.parametrize("arch", ["gfx1100", "gfx1151", "gfx1201"])
-@pytest.mark.parametrize("fault", ["build", "device", "wave", "backend", "symbol", "request"])
+@pytest.mark.parametrize("fault", ["build", "device", "wave", "backend", "hardware",
+                                  "missing_hardware", "symbol", "request"])
 def test_rdna_target_rejects_mismatched_extension(arch, fault):
     from flash_rt.amd.hardware.capabilities_rdna import load_capabilities
 
@@ -363,12 +366,29 @@ def test_rdna_target_rejects_mismatched_extension(arch, fault):
         info["wave_size"] = 64
     elif fault == "backend":
         info["backend"] = "cdna4"
+    elif fault == "hardware":
+        info["hardware"] = "amd_rdna4" if arch != "gfx1201" else "amd_rdna3"
+    elif fault == "missing_hardware":
+        del info["hardware"]
     elif fault == "symbol":
         del extension.smallm_wmma_bf16_rdna
     else:
         requested = "amd_cdna4"
     with pytest.raises((RuntimeError, ValueError)):
         load_capabilities(extension, arch, requested)
+
+
+@pytest.mark.parametrize("arch,hardware", [
+    ("gfx1100", "amd_rdna3"), ("gfx1151", "amd_rdna35"), ("gfx1201", "amd_rdna4"),
+])
+@pytest.mark.parametrize("suffix", ["", ":sramecc-:xnack-"])
+def test_rdna_target_accepts_matching_identity(arch, hardware, suffix):
+    from flash_rt.amd.hardware.capabilities_rdna import load_capabilities
+
+    extension = _rdna_extension(arch)
+    extension.device_arch = lambda: arch + suffix
+    target = load_capabilities(extension, arch + suffix, hardware)
+    assert (target.hardware, target.gpu_arch) == (hardware, arch)
 
 
 @pytest.mark.parametrize("arch", ["gfx11000", "gfx11510", "gfx12010", "gfx1200"])

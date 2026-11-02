@@ -90,7 +90,7 @@ def amd_env():
             "flash_rt.amd.flash_rt_amd_kernels")
     except ImportError as exc:
         pytest.skip(f"flash_rt_amd_kernels not importable: {exc}")
-    if extension.build_info().get("backend") == "rdna35":
+    if extension.build_info().get("backend") == "rdna":
         pytest.skip("requires the CDNA4 AMD extension source set")
     try:
         # Pulls in the Thor base and its third-party helpers (declared

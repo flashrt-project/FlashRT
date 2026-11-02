@@ -1,5 +1,5 @@
 // ================================================================
-// FlashRT AMD -- pybind11 bindings for RDNA 3.5 BF16 kernels
+// FlashRT AMD -- pybind11 bindings for RDNA 3 / 3.5 / 4 BF16 kernels
 //
 // The Python-facing names include `_rdna` so a caller cannot accidentally
 // route an RDNA implementation through a CDNA capability check. Like the
@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 #include "gemm/hipblaslt_runner_rdna.h"
 
@@ -109,17 +110,24 @@ void smallm_wmma_bf16_residual_rdna(const __hip_bfloat16 *input,
                                     int columns, int inner, hipStream_t stream);
 
 PYBIND11_MODULE(flash_rt_amd_kernels, module) {
-  module.doc() = "FlashRT AMD RDNA 3.5 BF16 kernels (raw-pointer ABI)";
+  module.doc() = "FlashRT AMD RDNA BF16 kernels (raw-pointer ABI)";
 
   // ── Runtime/build identity ──
 
   module.def("build_info", []() {
     py::dict info;
     info["platform"] = "hip";
-    info["backend"] = "rdna35";
+    info["backend"] = "rdna";
     info["wave_size"] = 32;
 #ifdef FLASHRT_AMD_GPU_ARCH
-    info["gpu_arch"] = FLASHRT_AMD_GPU_ARCH;
+    constexpr std::string_view gpu_arch = FLASHRT_AMD_GPU_ARCH;
+    static_assert(gpu_arch == "gfx1100" || gpu_arch == "gfx1151" ||
+                      gpu_arch == "gfx1201",
+                  "Unsupported RDNA build target");
+    info["gpu_arch"] = std::string(gpu_arch);
+    info["hardware"] = gpu_arch == "gfx1100" ? "amd_rdna3"
+                       : gpu_arch == "gfx1151" ? "amd_rdna35"
+                                               : "amd_rdna4";
 #endif
     int runtime_version = 0;
     (void)hipRuntimeGetVersion(&runtime_version);
