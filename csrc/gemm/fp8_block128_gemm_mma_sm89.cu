@@ -34,7 +34,7 @@ namespace block128_sm89 {
 
 namespace {
 
-template <int BM, int BN, int W, int STAGES, int MIN_BLK>
+template <int BM, int BN, int W, int STAGES, int MIN_BLK, bool EXACT = false>
 int launch_(const void* A, const void* B, void* D,
             int M, int N, int K, const float* act_scale,
             const float* w_scale, cudaStream_t s)
@@ -50,10 +50,10 @@ int launch_(const void* A, const void* B, void* D,
                    + (BM * SCALE_KTILE + SCALE_KTILE) * (int)sizeof(float);
     if (smem_bytes > 48 * 1024) {
         cudaFuncSetAttribute(
-            (const void*)&fp8_bs_gemm_kernel<BM, BN, W, STAGES, MIN_BLK, false>,
+            (const void*)&fp8_bs_gemm_kernel<BM, BN, W, STAGES, MIN_BLK, false, EXACT>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     }
-    fp8_bs_gemm_kernel<BM, BN, W, STAGES, MIN_BLK, false><<<grid, block, smem_bytes, s>>>(
+    fp8_bs_gemm_kernel<BM, BN, W, STAGES, MIN_BLK, false, EXACT><<<grid, block, smem_bytes, s>>>(
         reinterpret_cast<const __nv_fp8_e4m3*>(A),
         reinterpret_cast<const __nv_fp8_e4m3*>(B),
         act_scale, w_scale,
@@ -203,6 +203,19 @@ DEFINE(fp8_block128_gemm_bs_sm89_128x128x128_w8_s1, 128, 128, 8, 1, 2)
 
 #undef DEFINE
 
+// Guard-free specialisation for shapes divisible by the tile (video stream:
+// M=256, N and K multiples of 128). Same arithmetic, no per-chunk bounds
+// checks and no epilogue guards.
+#define DEFINE_EXACT(NAME, BM, BN, W, S, MB)                                  \
+  int NAME(const void* A, const void* B, void* D, int M, int N, int K,        \
+           const float* act_scale, const float* w_scale, cudaStream_t s) {    \
+    return launch_<BM, BN, W, S, MB, true>(A, B, D, M, N, K, act_scale,       \
+                                           w_scale, s);                       \
+  }
+DEFINE_EXACT(fp8_bs_exact_64x64x128_w4_s1, 64, 64, 4, 1, 4)
+DEFINE_EXACT(fp8_bs_exact_64x64x128_w4_s2, 64, 64, 4, 2, 4)
+#undef DEFINE_EXACT
+
 // Residual-fold variants for the down-proj prefill tiles (see dispatcher
 // below): the 2B/8B down-proj selects 64x64_s1 (8B) / 64x64 (2B small-M) /
 // 32x64 (small-M) at the S ranges Phase-0 measured. Defined additively; the
@@ -282,6 +295,16 @@ int fp8_block128_gemm_blockscaled_sm89_bf16out(
         return fp8_block128_gemm_bs_sm89_16x64x128_w4(
             A, B, D, M, N, K, act_scale, w_scale, stream);
     }
+    // Narrow-M regime (M<=32). Measured on RTX 4060 Ti over the Wan2.2-TI2V-5B
+    // production shapes (N=K=3072) with the shipped kernels, 300 iters, events:
+    // 32x64_w4 0.0187 / 0.0192 ms and 16x64_w4 0.0130 / 0.0164 ms at M=16 / M=32
+    // -- 1.44x and 1.17x in favour of the 16x64 tile. The heuristic above was
+    // fitted on Qwen3-VL-8B shapes and never saw a narrow-M wide-N site; the
+    // 32-row tile halves grid_m (24 blocks at M=16) and leaves the SMs idle.
+    // Scoped to M<=32 so nothing upstream of the old M<128 branch moves.
+    if (M <= 32)
+        return fp8_block128_gemm_bs_sm89_16x64x128_w4(
+            A, B, D, M, N, K, act_scale, w_scale, stream);
     if (M < 128)
         return fp8_block128_gemm_bs_sm89_32x64x128_w4(
             A, B, D, M, N, K, act_scale, w_scale, stream);
@@ -308,6 +331,12 @@ int fp8_block128_gemm_blockscaled_sm89_bf16out(
             A, B, D, M, N, K, act_scale, w_scale, stream);
     if (N == 2048 && M < 1024)
         return fp8_block128_gemm_bs_sm89_64x64x128_w4(
+            A, B, D, M, N, K, act_scale, w_scale, stream);
+    // Video stream (M=256 and any M multiple of the 64-row tile): the guard-free
+    // specialisation is bit-identical and 1.0-1.4% faster on all four production
+    // shapes (M % 64 == 0 and N % 128 == 0 are checked by the caller above).
+    if ((M % 64) == 0)
+        return fp8_bs_exact_64x64x128_w4_s1(
             A, B, D, M, N, K, act_scale, w_scale, stream);
     return fp8_block128_gemm_bs_sm89_64x64x128_w4_s1(
         A, B, D, M, N, K, act_scale, w_scale, stream);

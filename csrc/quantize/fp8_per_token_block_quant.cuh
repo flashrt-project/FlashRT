@@ -100,5 +100,15 @@ void gelu_erf_bias_to_fp8_block128_bf16(
     int M, int K,
     cudaStream_t stream);
 
+void gelu_tanh_bias_to_fp8_block128_bf16(
+    const void* input, const void* bias, void* output_fp8, float* output_scale,
+    int M, int K, cudaStream_t stream);
+
+// Warp-per-scale-group form of the per-token block-128 quantizer. Bit-exact with
+// `fp8_per_token_block128_quant_bf16`, measured 1.8x faster at M=256/K=14336.
+void fp8_per_token_block128_quant_warp_bf16(
+    const void* input, void* output_fp8, float* output_scale,
+    int M, int K, cudaStream_t stream);
+
 }  // namespace quantize
 }  // namespace flash_rt

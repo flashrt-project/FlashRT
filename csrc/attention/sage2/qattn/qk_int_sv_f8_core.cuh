@@ -15,6 +15,7 @@
  */
 
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_pipeline_primitives.h>
 
 #include "../cp_async.cuh"
@@ -47,7 +48,11 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
                       const uint32_t stride_bz_k, const uint32_t stride_seq_k, const uint32_t stride_h_k,
                       const uint32_t stride_bz_v, const uint32_t stride_h_v, const uint32_t stride_d_v,
                       const uint32_t stride_bz_o, const uint32_t stride_seq_o, const uint32_t stride_h_o,
-                      float sm_scale)
+                      float sm_scale, float pad_extra = 0.0f, bool pad_exact = false,
+                      int8_t *__restrict__ O_fp8 = nullptr, float *__restrict__ O_fp8_scale = nullptr,
+                      bool scale_per_head = false,
+                      const int *__restrict__ ring_origin = nullptr, uint32_t ring_R = 0,
+                      uint32_t ring_start = 0)
 {
   // compile time check
   static_assert(DTypeQK == DataType::kInt8 || DTypeQK == DataType::kInt4, "DTypeQK must be int8 or int4");
@@ -126,7 +131,15 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
     k_scale_idx = batch_id * (num_qo_heads / num_kv_groups) * (num_warp_block_k * 4) + (head_id / num_kv_groups) * (num_warp_block_k * 4) + get_warp_idx_k<num_warps_q, num_warps_k>() * 4 + lane_id % 4;
   }
 
-  constexpr uint32_t k_scale_advance_offset = (K_GRAN == QuantGranularity::kPerBlock) ? 1 : (K_GRAN == QuantGranularity::kPerWarp) ? (CTA_K / WARP_K) : (CTA_K / WARP_K) * 4;
+  constexpr uint32_t k_scale_advance_offset_g = (K_GRAN == QuantGranularity::kPerBlock) ? 1 : (K_GRAN == QuantGranularity::kPerWarp) ? (CTA_K / WARP_K) : (CTA_K / WARP_K) * 4;
+  // scale_per_head: Q_scale and K_scale are [num_heads] static per-head scales
+  // (one per head for every query/key block), instead of the granular layout.
+  if (scale_per_head)
+  {
+    q_scale_idx = head_id;
+    k_scale_idx = head_id / num_kv_groups;
+  }
+  const uint32_t k_scale_advance_offset = scale_per_head ? 0u : k_scale_advance_offset_g;
 
   // initialize o, m, d
 #pragma unroll
@@ -198,6 +211,25 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
   int8_t *K_lane_base_ptr = K + batch_id * stride_bz_k + (head_id / num_kv_groups) * stride_h_k + (CTA_K / num_warps * warp_id + lane_id / global_to_shared_line_lanes_QK) * stride_seq_k + (lane_id % global_to_shared_line_lanes_QK) * PACK_SIZE_QK;
   //                                                                for fp16: CTA_K / num_warps * warp_id * stride_seq_v + lane_id / global_to_shared_line_lanes_V * stride_seq_v
   int8_t *V_lane_base_ptr = V + batch_id * stride_bz_v + (head_id / num_kv_groups) * stride_h_v + head_dim / num_warps * warp_id * stride_d_v + lane_id / global_to_shared_line_lanes_V * stride_d_v + (lane_id % global_to_shared_line_lanes_V) * PACK_SIZE_V;
+  // K ring (ring_R > 0): key j of this call is K row
+  // (ring_origin[0] + ring_start + j) mod ring_R. The writers mirror rows
+  // [0, CTA_K) at [ring_R, ring_R + CTA_K), so a tile that straddles the end is
+  // read linearly, and the tile pointer steps back by ring_R rows once it passes
+  // it. Every K tile load below advances by exactly CTA_K rows. V is not a ring:
+  // the caller's V pointer is the window start, as without the ring.
+  uint32_t ring_k = 0;
+  if (ring_R)
+  {
+    ring_k = (static_cast<uint32_t>(ring_origin[0]) + ring_start) % ring_R;
+    K_lane_base_ptr += ring_k * stride_seq_k;
+  }
+  auto ring_step_k = [&]() {
+    if (ring_R)
+    {
+      ring_k += CTA_K;
+      if (ring_k >= ring_R) { ring_k -= ring_R; K_lane_base_ptr -= ring_R * stride_seq_k; }
+    }
+  };
   uint32_t Q_smem_offset_load = smem_Q.get_permuted_offset(warp_id * global_to_shared_copy_lines_per_warp_QK * Q_smem_iters_col + lane_id / global_to_shared_line_lanes_QK, lane_id % global_to_shared_line_lanes_QK);
   uint32_t K_smem_offset_load = smem_K.get_permuted_offset(warp_id * global_to_shared_copy_lines_per_warp_QK * K_smem_iters_col + lane_id / global_to_shared_line_lanes_QK, lane_id % global_to_shared_line_lanes_QK);
   uint32_t V_smem_offset_load = smem_V.get_permuted_offset(warp_id * global_to_shared_copy_lines_per_warp_V * V_smem_iters_col + lane_id / global_to_shared_line_lanes_V, lane_id % global_to_shared_line_lanes_V);
@@ -244,6 +276,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
   // load K with predicate
   load_global_to_share<global_to_shared_line_lanes_QK, global_to_shared_copy_lines_per_warp_QK, QK_smem_iters_row, K_smem_iters_col, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_K>(
     &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K, K_load_idx_lane_base, kv_len);
+  ring_step_k();
   cp_async::commit_group();
 
   float q_scale = Q_scale[q_scale_idx];
@@ -326,6 +359,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
     // load K without predicate
     load_global_to_share<global_to_shared_line_lanes_QK, global_to_shared_copy_lines_per_warp_QK, QK_smem_iters_row, K_smem_iters_col, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_K>(
       &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K);
+    ring_step_k();
     cp_async::commit_group();
 
     dequant_scale = q_scale * K_scale[k_scale_idx + iter * k_scale_advance_offset];
@@ -428,6 +462,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
     // load K with predicate
     load_global_to_share<global_to_shared_line_lanes_QK, global_to_shared_copy_lines_per_warp_QK, QK_smem_iters_row, K_smem_iters_col, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_K>(
       &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K, K_load_idx_lane_base, kv_len);
+    ring_step_k();
     cp_async::commit_group();
 
     dequant_scale = q_scale * K_scale[k_scale_idx + (num_iterations - 1) * k_scale_advance_offset];
@@ -500,6 +535,8 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
       apply_causal_mask<num_tiles_q, num_tiles_k>(Q_idx_lane_base, K_idx_lane_base, RS_f32);
     }
     apply_out_of_bound_mask<num_tiles_q, num_tiles_k>(K_idx_lane_base, RS_f32, kv_len);
+    // tile-local index of the last key (the pad key when pad_extra > 0)
+    const uint32_t pad_col = (kv_len - 1) - (K_idx_lane_base - 2 * (lane_id % 4));
     K_idx_lane_base += CTA_K;
 
     if constexpr (std::is_same<DTypeSVAccum, float>::value)
@@ -516,12 +553,88 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
       accumulate_d<num_tiles_q, num_tiles_k, ComputeUnit::kCudaCore>(RS_f32, d);
     }
 
+    // Collapsed key multiplicity. When the last key stands for pad_extra + 1
+    // identical keys (equal K and V rows), its probability and value enter
+    // pad_extra more times: P (after the max shift, and its e4m3 rounding for
+    // the PV product) is that of a single copy, so the extra copies add
+    // pad_extra * P to the denominator and pad_extra * P8 * V8 to RO -- what
+    // the uncollapsed tiles would have accumulated, up to fp32 summation order.
+    float pad_p32[num_tiles_q][2], pad_p8[num_tiles_q][2];
+    const bool has_pad = pad_extra > 0.0f && pad_col < CTA_K;
+    if (has_pad)
+    {
+#pragma unroll
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+      {
+#pragma unroll
+        for (uint32_t h = 0; h < 2; h++)
+        {
+          float v = 0.0f;
+#pragma unroll
+          for (uint32_t fk = 0; fk < num_tiles_k; fk++)
+          {
+#pragma unroll
+            for (uint32_t k = 0; k < 8; k++)
+            {
+              if (((k >> 1) & 1) != h) continue;
+              const uint32_t col = fk * 16 + 8 * (k / 4) + 2 * (lane_id % 4) + k % 2;
+              if (col == pad_col) v = RS_f32[fq][fk][k];
+            }
+          }
+          const float p = __shfl_sync(0xffffffff, v, (lane_id & ~3u) | ((pad_col % 8) / 2));
+          pad_p32[fq][h] = p;
+          pad_p8[fq][h] = __half2float(__half(__nv_cvt_fp8_to_halfraw(
+              __nv_cvt_float_to_fp8(p, __NV_SATFINITE, __NV_E4M3), __NV_E4M3)));
+          // d is a per-lane partial sum (normalize_d reduces it over the quad):
+          // only the lane holding the pad column adds the extra copies.
+          if ((lane_id % 4) == (pad_col % 8) / 2)
+            d[fq][h] += pad_extra * ((DenominatorAccumUnit == ComputeUnit::kCudaCore) ? p : pad_p8[fq][h]);
+        }
+      }
+    }
+
     uint32_t RS_f8[num_tiles_q][num_tiles_k / 2][4];
     RS_32_to_8<num_tiles_q, num_tiles_k>(RS_f32, RS_f8);
 
     if constexpr (DenominatorAccumUnit == ComputeUnit::kTensorCore)
     {
       accumulate_d_f8<num_tiles_q, num_tiles_k>(RS_f8, d);
+    }
+
+    if (has_pad)
+    {
+      // Numerator weight of the collapsed key. PAD_EXACT: all 1 + pad_extra
+      // copies at the fp32 probability the denominator uses (the in-tile copy
+      // entered the PV product at its e4m3 rounding, so add the difference);
+      // otherwise the extra copies at that e4m3 rounding, as the uncollapsed
+      // tiles would have.
+      float pad_w[num_tiles_q][2];
+#pragma unroll
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+#pragma unroll
+        for (uint32_t h = 0; h < 2; h++)
+          pad_w[fq][h] = pad_exact ? pad_extra * pad_p32[fq][h] + (pad_p32[fq][h] - pad_p8[fq][h])
+                                   : pad_extra * pad_p8[fq][h];
+      // V is stored [d][key] per head with each 16-key group in the fp8 MMA
+      // order (v_fp8_mma_pos of the writers): physical slot of key j is
+      // (j & ~15) + ((j & 1) | ((j >> 3) & 1) << 1 | ((j >> 1) & 3) << 2).
+      const uint32_t pk = kv_len - 1;
+      const uint32_t pk_phys = (pk & ~15u) + ((pk & 1u) | (((pk >> 3) & 1u) << 1) | (((pk >> 1) & 3u) << 2));
+      const int8_t* vp = V + batch_id * stride_bz_v + (head_id / num_kv_groups) * stride_h_v + pk_phys;
+#pragma unroll
+      for (uint32_t fv = 0; fv < num_tiles_v; fv++)
+      {
+#pragma unroll
+        for (uint32_t k = 0; k < 8; k++)
+        {
+          const uint32_t c = fv * 16 + 8 * (k / 4) + 2 * (lane_id % 4) + k % 2;
+          const __nv_fp8_storage_t vb = static_cast<__nv_fp8_storage_t>(vp[c * stride_d_v]);
+          const float v8 = __half2float(__half(__nv_cvt_fp8_to_halfraw(vb, __NV_E4M3)));
+#pragma unroll
+          for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+            RO[fq][fv][k] += pad_w[fq][(k >> 1) & 1] * v8;
+        }
+      }
     }
 
     // ensure V is ready
@@ -648,6 +761,70 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
   uint32_t offset_O = smem_O.get_permuted_offset(get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q + lane_id / global_to_shared_line_lanes_O, lane_id % global_to_shared_line_lanes_O);
   uint32_t O_load_idx_lane_base = bx * CTA_Q + CTA_Q / num_warps * warp_id + lane_id / global_to_shared_line_lanes_O;
 
+  bool fp8_emitted = false;
+  if constexpr (O_SMEM_STRIDE == 128 && global_to_shared_line_lanes_O == 8)
+  if (O_fp8 != nullptr)
+  {
+    fp8_emitted = true;
+    // Emit the output already quantised to FP8 with one scale per (row, head):
+    // head_dim = 128 is exactly one 128-wide block of the [rows, heads*128]
+    // activation, so this is fp8_per_token_block128_quant_warp_bf16 applied to
+    // the bf16 values staged in smem_O, with its arithmetic (amax over the
+    // block, s = max(amax/448, 1e-12), q = clamp(v / s, +-448)). The eight
+    // lanes that share a row hold its 128 values across O_smem_iters_row chunks.
+    int8_t *O8_lane_ptr = O_fp8 + batch_id * stride_bz_o + head_id * stride_h_o + (bx * CTA_Q + WARP_Q * get_warp_idx_q<num_warps_q, num_warps_k>() + lane_id / global_to_shared_line_lanes_O) * stride_seq_o + lane_id % global_to_shared_line_lanes_O * PACK_SIZE_O;
+#pragma unroll
+    for (uint32_t i = 0; i < O_smem_iters_col; i++)
+    {
+      uint4 chunk[O_smem_iters_row];
+      float amax = 0.0f;
+      uint32_t off = offset_O;
+#pragma unroll
+      for (uint32_t j = 0; j < O_smem_iters_row; j++)
+      {
+        chunk[j] = *reinterpret_cast<const uint4*>(smem_O.base + off);
+        const nv_bfloat162 *h2 = reinterpret_cast<const nv_bfloat162*>(&chunk[j]);
+#pragma unroll
+        for (uint32_t e = 0; e < 4; e++)
+        {
+          const float2 f = __bfloat1622float2(h2[e]);
+          amax = fmaxf(amax, fmaxf(fabsf(f.x), fabsf(f.y)));
+        }
+        off = smem_O.advance_offset_by_column<global_to_shared_line_lanes_O>(off);
+      }
+#pragma unroll
+      for (uint32_t o = global_to_shared_line_lanes_O / 2; o > 0; o >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+      const float sc = fmaxf(amax / 448.0f, 1.0e-12f);
+      if (O_load_idx_lane_base < qo_len)
+      {
+#pragma unroll
+        for (uint32_t j = 0; j < O_smem_iters_row; j++)
+        {
+          const nv_bfloat162 *h2 = reinterpret_cast<const nv_bfloat162*>(&chunk[j]);
+          uint32_t packed[2];
+#pragma unroll
+          for (uint32_t e = 0; e < 4; e++)
+          {
+            const float2 f = __bfloat1622float2(h2[e]);
+            const float q0 = fminf(fmaxf(f.x / sc, -448.0f), 448.0f);
+            const float q1 = fminf(fmaxf(f.y / sc, -448.0f), 448.0f);
+            const uint32_t b0 = __nv_fp8_e4m3(q0).__x, b1 = __nv_fp8_e4m3(q1).__x;
+            const uint32_t pair = b0 | (b1 << 8);
+            if (e & 1) packed[e >> 1] |= pair << 16; else packed[e >> 1] = pair;
+          }
+          *reinterpret_cast<uint2*>(O8_lane_ptr + j * global_to_shared_line_lanes_O * PACK_SIZE_O) =
+              make_uint2(packed[0], packed[1]);
+        }
+        if (lane_id % global_to_shared_line_lanes_O == 0)
+          O_fp8_scale[(size_t)(batch_id * qo_len + O_load_idx_lane_base) * num_qo_heads + head_id] = sc;
+      }
+      offset_O = smem_O.advance_offset_by_row<global_to_shared_copy_lines_per_warp_O>(offset_O);
+      O8_lane_ptr += global_to_shared_copy_lines_per_warp_O * stride_seq_o;
+      O_load_idx_lane_base += global_to_shared_copy_lines_per_warp_O;
+    }
+  }
+  if (!fp8_emitted)
 #pragma unroll
   for (uint32_t i = 0; i < O_smem_iters_col; i++)
   {
@@ -667,9 +844,8 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
     O_load_idx_lane_base += global_to_shared_copy_lines_per_warp_O;
   }
 
-  if constexpr (return_lse)
+  if constexpr (return_lse && num_tiles_q == 2)
   {
-    // ! this only works for num_tiles_q = 2
     uint32_t lse_idx = bx * CTA_Q + lane_id / 4 + 8 * (lane_id % 4) + WARP_Q * get_warp_idx_q<num_warps_q, num_warps_k>();
     float *lse_lane_ptr = Lse + batch_id * (qo_len * num_qo_heads) + head_id * qo_len + lse_idx;
     uint32_t fq = (lane_id % 4) / 2;
@@ -678,6 +854,21 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
     if (lse_idx < qo_len)
     {
       lse_lane_ptr[0] = (math::ptx_log2(d[fq][k]) + m[fq][k] - S_FP8_OFFSET);
+    }
+  }
+  else if constexpr (return_lse && num_tiles_q == 1)
+  {
+    // 16-row warps: each quad holds rows lane/4 and lane/4 + 8; two of its
+    // lanes write them.
+    if ((lane_id % 4) < 2)
+    {
+      uint32_t k = lane_id % 4;
+      uint32_t lse_idx = bx * CTA_Q + lane_id / 4 + 8 * k + WARP_Q * get_warp_idx_q<num_warps_q, num_warps_k>();
+      float *lse_lane_ptr = Lse + batch_id * (qo_len * num_qo_heads) + head_id * qo_len + lse_idx;
+      if (lse_idx < qo_len)
+      {
+        lse_lane_ptr[0] = (math::ptx_log2(d[0][k]) + m[0][k] - S_FP8_OFFSET);
+      }
     }
   }
 }

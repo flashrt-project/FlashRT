@@ -6,6 +6,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <cstdint>
 #include <cuda_runtime.h>
 #include <stdexcept>
 
@@ -511,6 +512,112 @@ __global__ void gelu_erf_bias_to_fp8_block128_kernel(
   output[idx] = __nv_fp8_e4m3(q);
 }
 
+__device__ __forceinline__ float gelu_tanh_f32(float x) {
+  return x * 0.5f * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x)));
+}
+
+template <int VPT>
+__global__ void gelu_tanh_bias_to_fp8_block128_warp_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ bias,
+    __nv_fp8_e4m3* __restrict__ output, float* __restrict__ scale, int K)
+{
+  const int nkb = K >> 7;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int kb = blockIdx.x * (blockDim.x >> 5) + warp;
+  if (kb >= nkb) return;
+  const int m = blockIdx.y;
+  const size_t row = (size_t)m * K;
+  const int base = (kb << 7) + lane * VPT;
+  float v[VPT];
+  float amax = 0.0f;
+  // the VPT inputs and biases of a lane are contiguous: load them together
+  __nv_bfloat16 xin[VPT], bin[VPT];
+  if constexpr (VPT == 4) {
+    *reinterpret_cast<uint2*>(xin) = *reinterpret_cast<const uint2*>(input + row + base);
+    *reinterpret_cast<uint2*>(bin) = *reinterpret_cast<const uint2*>(bias + base);
+  } else {
+#pragma unroll
+    for (int i = 0; i < VPT; ++i) { xin[i] = input[row + base + i]; bin[i] = bias[base + i]; }
+  }
+#pragma unroll
+  for (int i = 0; i < VPT; ++i) {
+    const float b = __bfloat162float(__float2bfloat16(
+        __bfloat162float(xin[i]) + __bfloat162float(bin[i])));
+    const float g = __bfloat162float(__float2bfloat16(gelu_tanh_f32(b)));
+    v[i] = g;
+    amax = fmaxf(amax, fabsf(g));
+  }
+#pragma unroll
+  for (int off = 16; off; off >>= 1)
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+  const float sc = fmaxf(amax / kFp8Max, 1.0e-12f);
+  if (lane == 0) scale[(size_t)m * nkb + kb] = sc;
+  __nv_fp8_e4m3 qo[VPT];
+#pragma unroll
+  for (int i = 0; i < VPT; ++i) {
+    float q = v[i] / sc;
+    q = fminf(fmaxf(q, -kFp8Max), kFp8Max);
+    qo[i] = __nv_fp8_e4m3(q);
+  }
+  if constexpr (VPT == 4) {
+    *reinterpret_cast<uint32_t*>(output + row + base) = *reinterpret_cast<const uint32_t*>(qo);
+  } else {
+#pragma unroll
+    for (int i = 0; i < VPT; ++i) output[row + base + i] = qo[i];
+  }
+}
+
+// Warp-per-scale-group per-token block-128 quantizer.
+//
+// The kernel above puts one 128-element scale group in a 128-thread block with one
+// element per thread and ends in a __syncthreads()-gated shared-memory reduction.
+// Measured against a warp-per-group form that keeps VPT elements per thread and
+// reduces with shuffles only, that shape costs 40.14 us at M=256/K=14336 where a
+// kernel doing *more* work (bias + gelu + quantize) costs 22.49 us. This is the same
+// quantizer in that shape.
+//
+// Bit-exact with `fp8_per_token_block_quant_kernel`: max is order-independent, and
+// `sc = fmaxf(amax/kFp8Max, 1e-12f)` and `q = v / sc` are unchanged, so the emitted
+// scale and every fp8 byte are identical.
+template <int VPT>
+__global__ void fp8_per_token_block_quant_warp_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    __nv_fp8_e4m3* __restrict__ output,
+    float* __restrict__ scale,
+    int K)
+{
+  const int nkb = K >> 7;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int kb = blockIdx.x * (blockDim.x >> 5) + warp;
+  if (kb >= nkb) return;
+  const int m = blockIdx.y;
+  const size_t row = (size_t)m * K;
+  const int base = (kb << 7) + lane * VPT;
+
+  float v[VPT];
+  float amax = 0.0f;
+#pragma unroll
+  for (int i = 0; i < VPT; ++i) {
+    const float x = __bfloat162float(input[row + base + i]);
+    v[i] = x;
+    amax = fmaxf(amax, fabsf(x));
+  }
+#pragma unroll
+  for (int off = 16; off; off >>= 1)
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+  const float sc = fmaxf(amax / kFp8Max, 1.0e-12f);
+  if (lane == 0) scale[(size_t)m * nkb + kb] = sc;
+#pragma unroll
+  for (int i = 0; i < VPT; ++i) {
+    float q = v[i] / sc;
+    q = fminf(fmaxf(q, -kFp8Max), kFp8Max);
+    output[row + base + i] = __nv_fp8_e4m3(q);
+  }
+}
+
 }  // namespace
 
 void fp8_per_token_block128_quant_bf16(
@@ -709,6 +816,39 @@ void gelu_erf_bias_to_fp8_block128_bf16(
       reinterpret_cast<const __nv_bfloat16*>(bias),
       reinterpret_cast<__nv_fp8_e4m3*>(output_fp8),
       output_scale, K);
+}
+
+void gelu_tanh_bias_to_fp8_block128_bf16(
+    const void* input, const void* bias, void* output_fp8, float* output_scale,
+    int M, int K, cudaStream_t stream)
+{
+  if ((K % kBlock) != 0) throw std::runtime_error("needs K multiple of 128");
+  constexpr int VPT = 4;
+  const int nkb = K / kBlock;
+  const int w = 4;
+  dim3 block(w * 32);
+  dim3 grid((nkb + w - 1) / w, M);
+  gelu_tanh_bias_to_fp8_block128_warp_kernel<VPT><<<grid, block, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(input),
+      reinterpret_cast<const __nv_bfloat16*>(bias),
+      reinterpret_cast<__nv_fp8_e4m3*>(output_fp8), output_scale, K);
+}
+
+void fp8_per_token_block128_quant_warp_bf16(
+    const void* input, void* output_fp8, float* output_scale,
+    int M, int K, cudaStream_t stream)
+{
+  if ((K % kBlock) != 0)
+    throw std::runtime_error(
+        "fp8_per_token_block128_quant_warp_bf16 requires K multiple of 128");
+  constexpr int VPT = 4;
+  const int nkb = K / kBlock;
+  const int w = 4;
+  dim3 block(w * 32);
+  dim3 grid((nkb + w - 1) / w, M);
+  fp8_per_token_block_quant_warp_kernel<VPT><<<grid, block, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(input),
+      reinterpret_cast<__nv_fp8_e4m3*>(output_fp8), output_scale, K);
 }
 
 }  // namespace quantize

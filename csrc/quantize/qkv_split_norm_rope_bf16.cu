@@ -864,5 +864,155 @@ void qkv_split_joint3_cat_bf16(
           eps_v, eps_a, eps_u);
 }
 
+__global__ void qkv_split_bias_norm_rope_v_cat2_bf16_kernel(
+    const __nv_bfloat16* __restrict__ packed_qkv,
+    const __nv_bfloat16* __restrict__ qkv_bias,
+    const __nv_bfloat16* __restrict__ norm_q_w,
+    const __nv_bfloat16* __restrict__ norm_k_w,
+    const float* __restrict__ freqs_re,
+    const float* __restrict__ freqs_im,
+    __nv_bfloat16* __restrict__ q_cat_out,
+    __nv_bfloat16* __restrict__ k_cat_out,
+    __nv_bfloat16* __restrict__ v_cat_out,
+    int Lq, int off_q, int Lkv, int off_kv, int L, int N, int D_h,
+    int seq_len, float eps) {
+  const int row = blockIdx.x;
+  const int b = blockIdx.y;
+  const int t = row % L;
+  const int dim = N * D_h;
+  const int dim2 = dim >> 1;
+  const long long row_off = ((long long)b * L + row) * 3 * dim;
+  // q lands in a [B*L, dim] activation buffer; k and v land directly in the
+  // KV cache, whose rows are [B*W, dim] with the write cursor as row offset.
+  // Writing the cache from the projection removes the intermediate kh/vh
+  // buffers and the copy that moved them into it.
+  const long long out_q  = ((long long)b * Lq  + off_q  + row) * dim;
+  const long long out_kv = ((long long)b * Lkv + off_kv + row) * dim;
+  const long long fr_row = (long long)t * (D_h >> 1);
+  const __nv_bfloat162* qkv2 =
+      reinterpret_cast<const __nv_bfloat162*>(packed_qkv + row_off);
+  const __nv_bfloat162* bias2 =
+      reinterpret_cast<const __nv_bfloat162*>(qkv_bias);
+
+  __shared__ float reduce_pad[33];
+  float sq = 0.f, sk = 0.f;
+  for (int i = threadIdx.x; i < dim2; i += blockDim.x) {
+    __nv_bfloat162 qv = qkv2[i];
+    __nv_bfloat162 kv = qkv2[dim2 + i];
+    __nv_bfloat162 bq = bias2[i];
+    __nv_bfloat162 bk = bias2[dim2 + i];
+    const float q0 = __bfloat162float(qv.x) + __bfloat162float(bq.x);
+    const float q1 = __bfloat162float(qv.y) + __bfloat162float(bq.y);
+    const float k0 = __bfloat162float(kv.x) + __bfloat162float(bk.x);
+    const float k1 = __bfloat162float(kv.y) + __bfloat162float(bk.y);
+    sq += q0 * q0 + q1 * q1;
+    sk += k0 * k0 + k1 * k1;
+  }
+  for (int o = 16; o > 0; o >>= 1) {
+    sq += __shfl_xor_sync(0xffffffffu, sq, o);
+    sk += __shfl_xor_sync(0xffffffffu, sk, o);
+  }
+  const int lane = threadIdx.x & 31;
+  const int wid = threadIdx.x >> 5;
+  if (!lane) { reduce_pad[wid] = sq; reduce_pad[16 + wid] = sk; }
+  __syncthreads();
+  if (!wid) {
+    sq = (lane < (blockDim.x >> 5)) ? reduce_pad[lane] : 0.f;
+    sk = (lane < (blockDim.x >> 5)) ? reduce_pad[16 + lane] : 0.f;
+    for (int o = 16; o > 0; o >>= 1) {
+      sq += __shfl_xor_sync(0xffffffffu, sq, o);
+      sk += __shfl_xor_sync(0xffffffffu, sk, o);
+    }
+  }
+  __syncthreads();
+  if (!threadIdx.x) {
+    reduce_pad[32] = sq;
+    reduce_pad[31] = sk;
+  }
+  __syncthreads();
+  const float inv_q = rsqrtf(reduce_pad[32] / (float)dim + eps);
+  const float inv_k = rsqrtf(reduce_pad[31] / (float)dim + eps);
+  const int dh2 = D_h >> 1;
+  const bool apply_rope = (t < seq_len);
+
+  for (int p = threadIdx.x; p < dim2; p += blockDim.x) {
+    const int n = p / dh2;
+    const int c_pair = p - n * dh2;
+    const int c0 = n * D_h + 2 * c_pair;
+    const int c1 = c0 + 1;
+
+    __nv_bfloat162 qv = qkv2[p];
+    __nv_bfloat162 kv = qkv2[dim2 + p];
+    __nv_bfloat162 vv = qkv2[2 * dim2 + p];
+    __nv_bfloat162 bq = bias2[p];
+    __nv_bfloat162 bk = bias2[dim2 + p];
+    __nv_bfloat162 bv = bias2[2 * dim2 + p];
+    __nv_bfloat162 wq = reinterpret_cast<const __nv_bfloat162*>(norm_q_w)[p];
+    __nv_bfloat162 wk = reinterpret_cast<const __nv_bfloat162*>(norm_k_w)[p];
+
+    const float qre_n = (__bfloat162float(qv.x) + __bfloat162float(bq.x))
+        * inv_q * __bfloat162float(wq.x);
+    const float qim_n = (__bfloat162float(qv.y) + __bfloat162float(bq.y))
+        * inv_q * __bfloat162float(wq.y);
+    const float kre_n = (__bfloat162float(kv.x) + __bfloat162float(bk.x))
+        * inv_k * __bfloat162float(wk.x);
+    const float kim_n = (__bfloat162float(kv.y) + __bfloat162float(bk.y))
+        * inv_k * __bfloat162float(wk.y);
+
+    float qre_out, qim_out, kre_out, kim_out;
+    if (apply_rope) {
+      const float fr = freqs_re[fr_row + c_pair];
+      const float fi = freqs_im[fr_row + c_pair];
+      qre_out = qre_n * fr - qim_n * fi;
+      qim_out = qre_n * fi + qim_n * fr;
+      kre_out = kre_n * fr - kim_n * fi;
+      kim_out = kre_n * fi + kim_n * fr;
+    } else {
+      qre_out = qre_n; qim_out = qim_n;
+      kre_out = kre_n; kim_out = kim_n;
+    }
+
+    q_cat_out[out_q + c0] = __float2bfloat16(qre_out);
+    q_cat_out[out_q + c1] = __float2bfloat16(qim_out);
+    k_cat_out[out_kv + c0] = __float2bfloat16(kre_out);
+    k_cat_out[out_kv + c1] = __float2bfloat16(kim_out);
+    reinterpret_cast<__nv_bfloat162*>(v_cat_out + out_kv)[p] =
+        __halves2bfloat162(
+            __float2bfloat16(__bfloat162float(vv.x) + __bfloat162float(bv.x)),
+            __float2bfloat16(__bfloat162float(vv.y) + __bfloat162float(bv.y)));
+  }
+}
+
+// Same as `qkv_split_bias_norm_rope_v_cat_bf16` but with independent addressing for
+// q and for k/v, so the projections can write the KV cache directly instead of into
+// a staging buffer that a second copy then moves. Pure data movement: the arithmetic
+// and every bf16 rounding are identical to the variant above.
+void qkv_split_bias_norm_rope_v_cat2_bf16(
+    const void*  packed_qkv,
+    const void*  qkv_bias,
+    const void*  norm_q_w,
+    const void*  norm_k_w,
+    const float* freqs_re,
+    const float* freqs_im,
+    void*        q_out,
+    void*        k_out,
+    void*        v_out,
+    int B, int Lq, int off_q, int Lkv, int off_kv, int L_v,
+    int N, int D_h, int seq_len, float eps,
+    cudaStream_t stream)
+{
+  if (B <= 0 || Lq <= 0 || Lkv <= 0 || L_v <= 0 || N <= 0 || D_h <= 0) return;
+  qkv_split_bias_norm_rope_v_cat2_bf16_kernel<<<dim3(L_v, B, 1), 256, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(packed_qkv),
+      reinterpret_cast<const __nv_bfloat16*>(qkv_bias),
+      reinterpret_cast<const __nv_bfloat16*>(norm_q_w),
+      reinterpret_cast<const __nv_bfloat16*>(norm_k_w),
+      freqs_re, freqs_im,
+      reinterpret_cast<__nv_bfloat16*>(q_out),
+      reinterpret_cast<__nv_bfloat16*>(k_out),
+      reinterpret_cast<__nv_bfloat16*>(v_out),
+      Lq, off_q, Lkv, off_kv, L_v, N, D_h, seq_len, eps);
+}
+
 }  // namespace quantize
 }  // namespace flash_rt
