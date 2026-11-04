@@ -1,0 +1,155 @@
+binding: ltx25_video_pipeline
+structure: video_generation_pipeline
+
+# Joint audio+video DiT host. The distilled checkpoint's official recipe is
+# a single pass per step: every guidance/modality scale is 1.0, so no
+# classifier-free or modality-isolation passes exist on the hot path. A
+# binding that re-enables them changes the program being measured, not a
+# knob on the same program.
+recipe:
+  guidance_scale: 1.0
+  audio_guidance_scale: 1.0
+  modality_scale: 1.0
+  audio_modality_scale: 1.0
+  phases:
+    - {name: stage1, steps: 8}
+    - {name: stage2, steps: 3, after: latent_upsample}
+
+# Sites the checkpoint family itself quantizes; a scheme refuses to adopt
+# outside this list unless explicitly overridden. The last six transformer
+# blocks, every adaptive-norm single, the modality connectors, and the
+# patchify/proj_out boundary stay at host precision.
+quantization:
+  adopt_blocks: "0-41"
+  adopt_modules:
+    - "attn1"
+    - "attn2"
+    - "audio_attn1"
+    - "audio_attn2"
+    - "audio_to_video_attn"
+    - "video_to_audio_attn"
+    - "ff"
+    - "audio_ff"
+  adopt_leaves:
+    attention: ["to_q", "to_k", "to_v", "to_out.0"]
+    feed_forward: ["net.0.proj", "net.2"]
+
+stages:
+  condition_encode:
+    seam: "text encoder and per-modality connectors"
+    capture: eager_or_offloaded
+    residency: staged    # encoder weights leave the device before denoise
+  latent_prepare:
+    seam: "video/audio latent initialization from the request seed"
+    capture: eager
+  denoise:
+    seam: "joint transformer forward under the ancestral solver loop"
+    loop_steps: "@recipe.phases"
+    capture: host_dependent
+  decode:
+    seam: "video VAE decode and audio vocoder"
+    capture: eager
+    tiling_budget: resident_aware    # decode tiling must be sized against
+                                     # memory the resident transformer holds
+
+coverage:
+  contract: complete_hot_path
+  hot_path:
+    - prompt_encode
+    - modality_connectors
+    - latent_initialization
+    - denoise_control
+    - adaptive_norm_tables
+    - per_head_gating
+    - qk_norm_rope
+    - video_self_attention
+    - video_cross_attention
+    - audio_attention
+    - cross_modal_attention
+    - video_ffn
+    - audio_ffn
+    - attention_projections
+    - latent_upsample
+    - scheduler_update
+    - vae_decode
+  segments:
+    - name: prompt_encode
+      stage: condition_encode
+      classification: host_stage
+      seam: "text encoder forward"
+    - name: modality_connectors
+      stage: condition_encode
+      classification: host_stage
+      seam: "per-modality connector projections over encoder output"
+    - name: latent_initialization
+      stage: latent_prepare
+      classification: state_region
+      seam: "seeded video/audio latents and their patchified views"
+    - name: denoise_control
+      stage: denoise
+      classification: control
+      seam: "two-phase ancestral Euler schedule, single pass per step"
+    - name: adaptive_norm_tables
+      stage: denoise
+      classification: host_stage
+      seam: "per-token scale/shift/gate table lookups around every block"
+    - name: per_head_gating
+      stage: denoise
+      classification: host_stage
+      seam: "sigmoid per-head gate on attention outputs"
+    - name: qk_norm_rope
+      stage: denoise
+      classification: host_stage
+      seam: "per-head Q/K RMSNorm and rotary application"
+    - name: video_self_attention
+      stage: denoise
+      classification: structure
+      seam: "video branch attn1, dense unmasked, head_dim 128"
+      structures: [attention_core]
+    - name: video_cross_attention
+      stage: denoise
+      classification: structure
+      seam: "video branch attn2 over connector tokens, head_dim 128"
+      structures: [attention_core]
+    - name: audio_attention
+      stage: denoise
+      classification: host_stage
+      seam: "audio branch attention, head_dim 64 — outside the measured
+             net-win band of the claimed attention forms"
+    - name: cross_modal_attention
+      stage: denoise
+      classification: host_stage
+      seam: "audio-to-video and video-to-audio attention"
+    - name: video_ffn
+      stage: denoise
+      classification: structure
+      seam: "video branch feed-forward, tanh-GELU"
+      structures: [vision_ffn]
+    - name: audio_ffn
+      stage: denoise
+      classification: host_stage
+      seam: "audio branch feed-forward — small-M band measured net-negative
+             for the W4A4 form, retained on the host"
+    - name: attention_projections
+      stage: denoise
+      classification: structure
+      seam: "Q/K/V/O and feed-forward projections on the checkpoint's own
+             quantization whitelist"
+      structures: [linear_proj]
+    - name: latent_upsample
+      stage: denoise
+      classification: host_stage
+      seam: "latent upsampler between the two distilled phases"
+    - name: scheduler_update
+      stage: denoise
+      classification: state_region
+      seam: "ancestral solver latent update"
+    - name: vae_decode
+      stage: decode
+      classification: host_stage
+      seam: "tiled video VAE decode and audio vocoder"
+
+hosts:
+  diffusers:
+    module_path: "diffusers.LTX2VideoTransformer3DModel"
+    versions: ">=0.40"
