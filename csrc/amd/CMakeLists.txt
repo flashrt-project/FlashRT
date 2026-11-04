@@ -81,8 +81,6 @@ if(GPU_ARCH_BASE MATCHES "^(gfx1100|gfx1151|gfx1201)$")
   set(FLASHRT_AMD_SOURCES
     bindings_rdna.cpp
     kernels/norm_rdna.hip
-    kernels/normalization_affine_rdna.hip
-    attention/attention_bshd_rdna.hip
     kernels/activation_rdna.hip
     kernels/elementwise_rdna.hip
     kernels/rope_rdna.hip
@@ -145,6 +143,3 @@ target_link_libraries(flash_rt_amd_kernels PRIVATE hip::host roc::hipblaslt)
 set_target_properties(flash_rt_amd_kernels PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../../flash_rt/amd"
   BUILD_RPATH "${ROCM_PATH}/lib")
-
-# Preserve materialized BF16 multiply/add boundaries (including rotate-half).
-set_source_files_properties(kernels/normalization_affine_rdna.hip PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")

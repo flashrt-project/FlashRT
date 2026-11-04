@@ -246,25 +246,3 @@ def test_shared_layer_norm_destinations_and_fp32_reference(width, affine):
     returned = ops.layer_norm(out, x, weight, bias)
     assert returned is out
     torch.testing.assert_close(out, ops.layer_norm(None, x, weight, bias), atol=0, rtol=0)
-
-
-@pytest.mark.parametrize("dtype_cos,dtype_sin", [(torch.bfloat16,torch.float32),(torch.float32,torch.bfloat16)])
-def test_rope_mixed_table_dtypes(dtype_cos,dtype_sin):
-    from flash_rt.amd.hardware.rdna.normalization import rope
-    x=torch.randn(17,4,48,device="cuda",dtype=torch.bfloat16)
-    c=torch.randn(17,48,device="cuda",dtype=dtype_cos)
-    s=torch.randn(17,48,device="cuda",dtype=dtype_sin)
-    a,b=x.float().chunk(2,-1)
-    reference=(x.float()*c.float()[:,None]+torch.cat((-b,a),-1)*s.float()[:,None]).bfloat16()
-    assert torch.equal(rope(x,c,s),reference)
-
-
-def test_normalization_sum_can_alias_input():
-    from flash_rt.amd.hardware.rdna.normalization import normalize
-    x=torch.randn(13,1536,device="cuda",dtype=torch.bfloat16)
-    residual=torch.randn_like(x)
-    summed=x+residual
-    reference=torch.nn.functional.layer_norm(summed,(1536,),eps=1e-5)
-    actual,total=normalize(x,residual=residual,kind="layer",eps=1e-5,round_affine=True,out_sum=x)
-    assert torch.equal(total,summed)
-    torch.testing.assert_close(actual,reference,atol=0.032,rtol=0.016)

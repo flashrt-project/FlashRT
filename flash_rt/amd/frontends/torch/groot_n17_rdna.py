@@ -281,8 +281,6 @@ class GrootN17TorchFrontendAmdRdna:
             self._caps = load_capabilities(kernels, props.gcnArchName, hardware)
             self.hardware = self._caps.hardware
             self.ops = _make_transformer_ops(kernels, self._caps)
-            from flash_rt.amd.hardware.rdna._native import kernels as require_native_ops
-            require_native_ops()
             weights = self._load_weights()
             self.pipeline = GrootN17PipelineRdna(
                 weights, self.config, self.ops, device=self.device,

@@ -20,7 +20,6 @@
 #include <string_view>
 
 #include "gemm/hipblaslt_runner_rdna.h"
-#include "kernels/transformer_ops_rdna.h"
 
 namespace py = pybind11;
 
@@ -111,39 +110,6 @@ void smallm_wmma_bf16_residual_rdna(const __hip_bfloat16 *input,
                                     int columns, int inner, hipStream_t stream);
 
 PYBIND11_MODULE(flash_rt_amd_kernels, module) {
-  module.def("attention_bshd_bf16_rdna",
-             [](uintptr_t q, uintptr_t k, uintptr_t v, uintptr_t out, int b,
-                int sq, int sk, int hq, int hk, int d, int64_t qb, int64_t qr,
-                int64_t qh, int64_t kb, int64_t kr, int64_t kh, int64_t vb,
-                int64_t vr, int64_t vh, bool causal, uintptr_t stream) {
-               attention_bshd_bf16_rdna(const_typed_ptr<__hip_bfloat16>(q),
-                                        const_typed_ptr<__hip_bfloat16>(k),
-                                        const_typed_ptr<__hip_bfloat16>(v),
-                                        typed_ptr<__hip_bfloat16>(out), b, sq,
-                                        sk, hq, hk, d, qb, qr, qh, kb, kr, kh,
-                                        vb, vr, vh, causal, to_stream(stream));
-             });
-  module.def("normalize_bf16_rdna", [](uintptr_t x, uintptr_t w, uintptr_t bias,
-                                       uintptr_t residual, uintptr_t out,
-                                       uintptr_t sum, int rows, int width,
-                                       float eps, bool center, float offset,
-                                       bool round_affine, uintptr_t stream) {
-    normalize_bf16_rdna(
-        const_typed_ptr<__hip_bfloat16>(x), const_typed_ptr<__hip_bfloat16>(w),
-        const_typed_ptr<__hip_bfloat16>(bias),
-        const_typed_ptr<__hip_bfloat16>(residual),
-        typed_ptr<__hip_bfloat16>(out), typed_ptr<__hip_bfloat16>(sum), rows,
-        width, eps, center, offset, round_affine, to_stream(stream));
-  });
-  module.def("rope_bf16_rdna", [](uintptr_t x, uintptr_t cos, uintptr_t sin,
-                                  uintptr_t out, int64_t size, int heads,
-                                  int dim, int64_t xs, int64_t xh, int64_t cs,
-                                  int64_t ss, bool cos_fp32, bool sin_fp32,
-                                  uintptr_t stream) {
-    rope_bf16_rdna(const_typed_ptr<__hip_bfloat16>(x), to_ptr(cos), to_ptr(sin),
-                   typed_ptr<__hip_bfloat16>(out), size, heads, dim, xs, xh, cs,
-                   ss, cos_fp32, sin_fp32, to_stream(stream));
-  });
   module.doc() = "FlashRT AMD RDNA BF16 kernels (raw-pointer ABI)";
 
   // ── Runtime/build identity ──
