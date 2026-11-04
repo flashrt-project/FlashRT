@@ -5,39 +5,7 @@ including RMSNorm's weight multiplication and AdaLayerNorm's affine steps.
 """
 
 import torch
-import triton
-import triton.language as tl
-
-
-@triton.jit
-def _norm(X, W, B, R, O, SUM, WIDTH: tl.constexpr, EPS: tl.constexpr,
-          CENTER: tl.constexpr, HAS_WEIGHT: tl.constexpr, HAS_BIAS: tl.constexpr,
-          WEIGHT_OFFSET: tl.constexpr, ROUND_AFFINE: tl.constexpr,
-          RESIDUAL: tl.constexpr, BLOCK: tl.constexpr):
-    col = tl.arange(0, BLOCK)
-    row = tl.program_id(0)
-    x = tl.load(X + row * WIDTH + col, col < WIDTH, 0).to(tl.float32)
-    if RESIDUAL:
-        r = tl.load(R + row * WIDTH + col, col < WIDTH, 0).to(tl.float32)
-        x = (x + r).to(tl.bfloat16).to(tl.float32)
-        tl.store(SUM + row * WIDTH + col, x, col < WIDTH)
-    if CENTER:
-        mean = tl.sum(x, 0) / WIDTH
-        x = tl.where(col < WIDTH, x - mean, 0.0)
-    variance = tl.sum(x * x, 0) / WIDTH
-    y = x * tl.rsqrt(variance + EPS)
-    if ROUND_AFFINE:
-        y = y.to(tl.bfloat16).to(tl.float32)
-    if HAS_WEIGHT:
-        scale = tl.load(W + col, col < WIDTH, 0).to(tl.float32) + WEIGHT_OFFSET
-        if ROUND_AFFINE:
-            scale = scale.to(tl.bfloat16).to(tl.float32)
-        y = y * scale
-        if ROUND_AFFINE:
-            y = y.to(tl.bfloat16).to(tl.float32)
-    if HAS_BIAS:
-        y += tl.load(B + col, col < WIDTH, 0).to(tl.float32)
-    tl.store(O + row * WIDTH + col, y, col < WIDTH)
+from ._native import kernels
 
 
 def _check_output(out, x):
@@ -78,29 +46,13 @@ def normalize(x, weight=None, shift=None, *, residual=None, kind="rms", eps=1e-5
     _check_output(summed, x)
     if residual is not None and out.data_ptr() == summed.data_ptr():
         raise ValueError("normalized output and residual sum must use distinct buffers")
-    _norm[(x.numel() // width,)](
-        x, weight, shift, residual, out, summed, width, eps, kind == "layer",
-        weight is not None, shift is not None, weight_offset, round_affine,
-        residual is not None, triton.next_power_of_2(width),
-        num_warps=4, enable_fp_fusion=False)
+    ptr = lambda value: 0 if value is None else value.data_ptr()
+    with torch.cuda.device(x.device):
+        kernels().normalize_bf16_rdna(
+            x.data_ptr(), ptr(weight), ptr(shift), ptr(residual), out.data_ptr(),
+            summed.data_ptr(), x.numel() // width, width, eps, kind == "layer",
+            weight_offset, round_affine, torch.cuda.current_stream(x.device).cuda_stream)
     return out, summed
-
-
-@triton.jit
-def _rope(X, C, S, O, SIZE: tl.constexpr, HEADS: tl.constexpr, DIM: tl.constexpr,
-          XS: tl.constexpr, XH: tl.constexpr, CS: tl.constexpr, SS: tl.constexpr,
-          BLOCK: tl.constexpr):
-    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    channel = index % DIM
-    head = index // DIM % HEADS
-    row = index // (DIM * HEADS)
-    offset = row * XS + head * XH
-    value = tl.load(X + offset + channel, index < SIZE, 0).to(tl.float32)
-    other = tl.load(X + offset + (channel + DIM // 2) % DIM, index < SIZE, 0).to(tl.float32)
-    other = tl.where(channel < DIM // 2, -other, other)
-    cos = tl.load(C + row * CS + channel, index < SIZE, 0).to(tl.float32)
-    sin = tl.load(S + row * SS + channel, index < SIZE, 0).to(tl.float32)
-    tl.store(O + index, value * cos + other * sin, index < SIZE)
 
 
 def rope(x, cos, sin, *, out=None):
@@ -116,8 +68,10 @@ def rope(x, cos, sin, *, out=None):
     # The kernel reads both halves; an overlapping write could race another CTA.
     if out.untyped_storage().data_ptr() == x.untyped_storage().data_ptr():
         raise ValueError("rotate-half output must not alias the input")
-    _rope[(triton.cdiv(x.numel(), 256),)](
-        x, cos, sin, out, x.numel(), x.shape[1], x.shape[2],
-        x.stride(0), x.stride(1), cos.stride(0), sin.stride(0), 256,
-        num_warps=4, enable_fp_fusion=False)
+    with torch.cuda.device(x.device):
+        kernels().rope_bf16_rdna(
+            x.data_ptr(), cos.data_ptr(), sin.data_ptr(), out.data_ptr(),
+            x.numel(), x.shape[1], x.shape[2], x.stride(0), x.stride(1),
+            cos.stride(0), sin.stride(0), cos.dtype == torch.float32,
+            sin.dtype == torch.float32, torch.cuda.current_stream(x.device).cuda_stream)
     return out

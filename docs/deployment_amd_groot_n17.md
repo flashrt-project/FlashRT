@@ -600,7 +600,7 @@ The RDNA frontend owns weights, observation preprocessing, target selection and 
 | Primitive | Shared implementation and numerical contract |
 |---|---|
 | GEMM | Existing `Rdna35GemmBackend`, extended with explicit N-by-K weights via `weight_transposed=True` and Torch dispatch. Default K-by-N/native behavior is preserved; layout is prepared once by the model loader. |
-| Attention | Shared Torch SDPA supports MHA/GQA, causal attention and boolean padding masks. Pi0.5 retains its packed-vision and prefix/suffix adapters and native D=256 attention. GR00T's tiled D=48/64/128 attention is a separate shape specialization selected during setup. |
+| Attention | Shared Torch SDPA supports MHA/GQA, causal attention and boolean padding masks. Pi0.5 retains its packed-vision and prefix/suffix adapters and native D=256 attention. GR00T's HIP WMMA D=48/64/128 attention is a separate shape specialization selected during setup. |
 | LayerNorm | Existing `Rdna35TensorOps`, extended to optional affine parameters. Pi0.5's native width-1152 fast path is retained. |
 | RMSNorm | One tensor-provider interface selects direct weight or `weight_offset=1`. Qwen rounds the normalized value before its learned BF16 weight multiply; Pi0.5 retains FP32 affine arithmetic until the final store. |
 | Adaptive normalization | Centered AdaLayerNorm and uncentered AdaRMS share normalization/affine math. Explicit intermediate rounding preserves DiT's BF16 modulation and Pi0.5's FP32 modulation. Pi0.5's fused residual/AdaRMS kernels remain specialized fast paths. |
@@ -632,3 +632,33 @@ python -m pytest -q tests/test_amd_rdna_ops.py tests/test_amd_rdna_model.py \
 ```
 
 Model semantics follow [NVIDIA Isaac-GR00T](https://github.com/NVIDIA/Isaac-GR00T/tree/9c7e746b2cd37a810070a98ef41d290a07e806c2) and Transformers 4.57.3. In particular, BF16 intermediate rounding is retained in rotary buffers, weighted RMSNorm, AdaLayerNorm and embodiment-conditioned projections.
+
+
+### Native RDNA operator implementation
+
+The GR00T attention, generic affine normalization and rotate-half RoPE providers
+now dispatch raw pointers to HIP kernels under `csrc/amd`; they do not define
+Triton kernels. Attention reuses the existing wave32 WMMA fragment helpers for
+gfx11/gfx12 and supports BF16 BSHD MHA/GQA with head widths 48, 64 and 128,
+including square causal prefill and strided projection views. Normalization
+reuses the RDNA reduction helpers and retains the explicit intermediate BF16
+rounds required by each model. RoPE keeps separate multiply/add rounding and
+accepts BF16 or FP32 cosine/sine tables independently.
+
+Rebuild the matching RDNA extension after updating. The frontend checks the
+new native symbols before loading checkpoint weights. Existing Pi0.5
+specialized normalization and attention kernels are unchanged, and CDNA build
+source lists do not include the new files.
+
+The earlier hardware results in this document precede this implementation
+migration. The HIP version must be compiled and rerun on gfx1100, gfx1151 and
+gfx1201 before treating those results as validation of the new implementation:
+
+```bash
+python -m pytest tests/test_amd_rdna_groot_ops.py tests/test_amd_rdna_ops.py -q
+```
+
+These cover FP32 references, BF16 rounding boundaries, residual sums, strided
+RoPE/attention and graph input updates. Follow with the checkpoint comparison
+and latency commands above. The migration follow-up itself ran CPU routing and
+contract tests only; no ROCm compiler or AMD GPU was available.
