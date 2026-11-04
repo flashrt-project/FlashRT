@@ -240,6 +240,12 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
          "GrootN17TorchFrontendOrin"),
     ("groot_n17", "torch", "npu"):
         ("flash_rt.npu.frontends.torch.groot_n17", "GrootN17TorchFrontendNpu"),
+    ("groot_n17", "torch", "amd_rdna3"):
+        ("flash_rt.amd.frontends.torch.groot_n17_rdna", "GrootN17TorchFrontendAmdRdna"),
+    ("groot_n17", "torch", "amd_rdna35"):
+        ("flash_rt.amd.frontends.torch.groot_n17_rdna", "GrootN17TorchFrontendAmdRdna"),
+    ("groot_n17", "torch", "amd_rdna4"):
+        ("flash_rt.amd.frontends.torch.groot_n17_rdna", "GrootN17TorchFrontendAmdRdna"),
     ("groot_n17", "torch", "amd_cdna4"):
         ("flash_rt.amd.frontends.torch.groot_n17",
          "GrootN17TorchFrontendAmd"),

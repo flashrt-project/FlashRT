@@ -10,15 +10,16 @@ import torch
 class Rdna35GemmBackend:
     """Run BF16 GEMMs through an instance-local hipBLASLt algorithm cache."""
 
-    def __init__(self, kernels, dtype: torch.dtype = torch.bfloat16):
+    def __init__(self, kernels, dtype: torch.dtype = torch.bfloat16, *, autotune=None):
         if dtype is not torch.bfloat16:
             raise TypeError(f"RDNA 3.5 GEMM supports BF16 only, got {dtype}")
         self.dtype = dtype
         self.fvk = kernels
         self._runner = kernels.RdnaGemmRunner()
-        self.autotune = (
-            os.getenv("FLASHRT_RDNA35_GEMM_AUTOTUNE", "1") == "1"
-        )
+        # Targets may require a fixed heuristic for numerical reproducibility.
+        # Existing callers retain the environment-controlled tuning policy.
+        self.autotune = (os.getenv("FLASHRT_RDNA35_GEMM_AUTOTUNE", "1") == "1"
+                         if autotune is None else autotune)
         if self.autotune:
             try:
                 pool = int(os.getenv("FLASHRT_RDNA35_GEMM_ALGOS", "16"))
@@ -95,7 +96,13 @@ class Rdna35GemmBackend:
             return None
         return weight_nt
 
-    def linear(self, out, x, weight, bias=None):
+    def linear(self, out, x, weight, bias=None, *, weight_transposed=False):
+        """BF16 linear with K-by-N weights, or explicit N-by-K Torch layout.
+
+        The latter preserves the materialized nn.Linear weight layout and
+        Torch's GEMM dispatch. Existing K-by-N callers retain their native
+        hipBLASLt/small-M policy. Packing belongs to caller setup, never here.
+        """
         tensors = (out, x, weight) if bias is None else (
             out, x, weight, bias)
         if any(t.device.type != "cuda" for t in tensors):
@@ -116,8 +123,9 @@ class Rdna35GemmBackend:
         if weight.stride(1) != 1:
             raise ValueError(
                 "RDNA 3.5 GEMM weight must be row-major with unit column stride")
-        expected = (*x.shape[:-1], weight.shape[1])
-        if x.shape[-1] != weight.shape[0] or out.shape != expected:
+        inner, columns = weight.shape[::-1] if weight_transposed else weight.shape
+        expected = (*x.shape[:-1], columns)
+        if x.shape[-1] != inner or out.shape != expected:
             raise ValueError(
                 f"unsupported linear shape: x={tuple(x.shape)} "
                 f"weight={tuple(weight.shape)} out={tuple(out.shape)}")
@@ -137,6 +145,12 @@ class Rdna35GemmBackend:
             bias.shape != (out2.shape[1],) or not bias.is_contiguous()
         ):
             raise ValueError("unsupported RDNA 3.5 GEMM bias")
+        if weight_transposed:
+            if bias is None:
+                torch.mm(x2, weight.t(), out=out2)
+            else:
+                torch.addmm(bias, x2, weight.t(), out=out2)
+            return
         weight_nt = self._prepared_weight_nt(weight)
         if (
             weight_nt is not None

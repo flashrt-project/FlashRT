@@ -8,6 +8,19 @@ import torch
 import torch.nn.functional as F
 
 
+def sdpa(q, k, v, *, causal=False, mask=None):
+    """BSHD attention shared by RDNA providers, including grouped KV heads.
+
+    Return a BSHD view; callers that flatten heads or require contiguous output
+    materialize that layout at their own boundary. ``mask`` follows Torch SDPA
+    semantics (True means attend), including broadcast over batch and heads.
+    """
+    value = F.scaled_dot_product_attention(
+        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+        attn_mask=mask, is_causal=causal, enable_gqa=q.shape[2] != k.shape[2])
+    return value.transpose(1, 2)
+
+
 class Rdna35AttentionBackend:
     """BF16 attention backend with shape-specialized RDNA 3.5 kernels."""
 
@@ -55,9 +68,7 @@ class Rdna35AttentionBackend:
             raise ValueError(f"unsupported vision QKV shape: {tuple(qkv.shape)}")
         views, seq, _ = qkv.shape
         q, k, v = qkv.view(views, seq, 3, 16, 72).unbind(dim=2)
-        value = F.scaled_dot_product_attention(
-            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
-        value = value.transpose(1, 2).reshape(views, seq, 1152)
+        value = sdpa(q, k, v).reshape(views, seq, 1152)
         if out is None:
             return value
         self._check_bf16(qkv, out)
@@ -162,14 +173,8 @@ class Rdna35AttentionBackend:
                 q.shape[0], k.shape[0], dtype=torch.bool, device=q.device)
             mask[:, :valid_prefix] = True
             mask[:, prefix_capacity:] = True
-        value = F.scaled_dot_product_attention(
-            q.transpose(0, 1).unsqueeze(0),
-            k.transpose(0, 1).unsqueeze(0),
-            v.transpose(0, 1).unsqueeze(0),
-            attn_mask=mask,
-            enable_gqa=True,
-        )
-        value = value.squeeze(0).transpose(0, 1).reshape(
+        value = sdpa(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), mask=mask)
+        value = value.squeeze(0).reshape(
             q.shape[0], q.shape[1] * 256)
         if out is None:
             return value
