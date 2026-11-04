@@ -176,8 +176,16 @@ option(FLASHRT_ENABLE_NATIVE_CPP
        "Build Python-free operation libraries for native C++ consumers" OFF)
 option(FLASHRT_BUILD_FA2_PYTHON_ADAPTER
        "Build the vendored FA2 Python adapter when FA2 is available" ON)
+option(FLASHRT_ENABLE_LINGBOT_VA_SM89
+       "Build LingBot-VA SM89 kernel additions (no model frontend)" OFF)
+if(FLASHRT_ENABLE_LINGBOT_VA_SM89 AND NOT GPU_ARCH STREQUAL "89")
+  message(FATAL_ERROR "FLASHRT_ENABLE_LINGBOT_VA_SM89 requires GPU_ARCH=89")
+endif()
 option(FLASHRT_FA2_LINGBOT_SLIM
        "Build only the LingBot FA2 entries (bf16 hdim128 non-causal + smallq tile)" OFF)
+if(FLASHRT_FA2_LINGBOT_SLIM AND NOT FLASHRT_ENABLE_LINGBOT_VA_SM89)
+  message(FATAL_ERROR "FLASHRT_FA2_LINGBOT_SLIM requires FLASHRT_ENABLE_LINGBOT_VA_SM89=ON")
+endif()
 
 # Cosmos3 deployment kernels are model- and architecture-specific. Keep them
 # out of the shared modules unless the corresponding Thor path is requested.
@@ -1084,7 +1092,6 @@ endif()
 # runtime kernel libraries.
 if(FLASHRT_ENABLE_MOTUS AND GPU_ARCH STREQUAL "120")
   add_library(motus_aux_sm120_obj OBJECT
-    csrc/attention/sage2/sage2_attn_raw.cu
     csrc/conv/fp8_conv2d_3x3_sm120_v1.cu
     csrc/conv/fp8_conv3d_sm120_v17.cu
     csrc/conv/fp8_conv3d_sm120_v18.cu
@@ -1855,6 +1862,17 @@ if(FLASHRT_BUILD_QWEN3_VL)
     csrc/kernels/bias_epilogue_bf16.cu)
 
   if(GPU_ARCH STREQUAL "120")
+    if(FLASHRT_ENABLE_LINGBOT_VA_SM89)
+      list(APPEND QWEN3_VL_SOURCES
+        csrc/gemm/fp8_bs_gemm_cutlass_sm89.cu
+        csrc/gemm/fp8_bs_gemm_gelu_sm89.cu
+        csrc/gemm/fp4_bs_gemm_sm89.cu
+        csrc/gemm/fp4_bs_gemm_splitk_sm89.cu
+        csrc/gemm/fp4_stream_m16_sm89.cu
+        csrc/gemm/fp4_stream_m128_sm89.cu
+        csrc/gemm/conv3d_f16acc_sm89.cu
+      )
+    endif()
     list(APPEND QWEN3_VL_SOURCES
       csrc/kernels/norm_act_to_fp8_block128.cu)
   elseif(GPU_ARCH STREQUAL "89")
@@ -1865,17 +1883,21 @@ if(FLASHRT_BUILD_QWEN3_VL)
     # quantiser only with that library's float flags (see the file comment).
     set_source_files_properties(csrc/gemm/fp8_bs_gemm_gelu_sm89.cu PROPERTIES
       COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--ftz=true;--prec-div=false;--prec-sqrt=false>")
+    if(FLASHRT_ENABLE_LINGBOT_VA_SM89)
+      list(APPEND QWEN3_VL_SOURCES
+        csrc/gemm/fp8_bs_gemm_cutlass_sm89.cu
+        csrc/gemm/fp8_bs_gemm_gelu_sm89.cu
+        csrc/gemm/fp4_bs_gemm_sm89.cu
+        csrc/gemm/fp4_bs_gemm_splitk_sm89.cu
+        csrc/gemm/fp4_stream_m16_sm89.cu
+        csrc/gemm/fp4_stream_m128_sm89.cu
+        csrc/gemm/conv3d_f16acc_sm89.cu
+      )
+    endif()
     list(APPEND QWEN3_VL_SOURCES
       csrc/kernels/norm_act_to_fp8_block128.cu
       csrc/gemm/fp8_block128_gemm_mma_sm89.cu
-      csrc/gemm/fp8_bs_gemm_cutlass_sm89.cu
-      csrc/gemm/fp8_bs_gemm_gelu_sm89.cu
-      csrc/gemm/fp4_bs_gemm_sm89.cu
-      csrc/gemm/fp4_bs_gemm_splitk_sm89.cu
-      csrc/gemm/fp4_stream_m16_sm89.cu
-      csrc/gemm/fp4_stream_m128_sm89.cu
       csrc/gemm/fp8_gemv_m1_sm89.cu
-      csrc/gemm/conv3d_f16acc_sm89.cu
       csrc/quantize/fp8_per_token_block_quant.cu
       csrc/kernels/qwen3_qkv_post_proc.cu
       csrc/kernels/bf16_matmul_bf16.cu)
@@ -1946,7 +1968,7 @@ if(FLASHRT_BUILD_QWEN3_VL)
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
     # bs_mma_multistage.h / fp8_bs_gemm_cutlass_sm89.cu: vendored CUTLASS.
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass/include)
+    ${CUTLASS_INCLUDE})
   target_compile_options(flash_rt_qwen3_vl_kernels PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
       --expt-relaxed-constexpr -O3
@@ -2023,7 +2045,6 @@ endif()
 pybind11_add_module(flash_rt_kernels
   csrc/gemm/gemm_runner.cu
   csrc/kernels/norm.cu
-  csrc/kernels/wan_adaln_fp8.cu
   csrc/kernels/linear_f32.cu
   csrc/kernels/resize_norm.cu
   csrc/kernels/gelu_mul.cu
@@ -2042,10 +2063,6 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/decoder_fused.cu
   csrc/kernels/dit_bf16.cu
   csrc/kernels/attention_dit_bf16.cu
-  csrc/attention/sage2/sage2_attn_raw.cu
-  csrc/attention/sage2/sage2_tail_merge.cu
-  csrc/kernels/flow_euler_window.cu
-  csrc/kernels/xattn_probs.cu
   csrc/quantize/fp8_block128_dequant.cu
   csrc/quantize/fp8_per_token_block_quant.cu
   csrc/quantize/tq_dequant_kv.cu
@@ -2054,7 +2071,6 @@ pybind11_add_module(flash_rt_kernels
   csrc/quantize/ada_layer_norm_fp8.cu
   csrc/quantize/bias_gelu_quantize_fp8.cu
   csrc/quantize/qkv_split_norm_rope_bf16.cu
-  csrc/quantize/qkv_split_norm_rope_sage.cu
   csrc/quantize/rope_apply_bf16.cu
   csrc/gemm/fp8_block128_gemm.cu
   csrc/kernels/silu_mul_qwen36.cu
@@ -2185,8 +2201,6 @@ if(NOT FLASHRT_SLIM_BUILD)
   target_sources(flash_rt_kernels PRIVATE
     csrc/quantize/awq_quant_fp8_static_bf16.cu
     csrc/quantize/bf16_ndhwc_to_ncdhw_transpose.cu
-    csrc/quantize/bf16_norm_tail_ncdhw.cu
-    csrc/quantize/bf16_avgdown3d_ndhwc.cu
     csrc/quantize/bf16_quant_fp8_ncdhw_to_ndhwc.cu
     csrc/quantize/bf16_rms_silu_ncdhw.cu
     csrc/quantize/bf16_rms_silu_quant_fp8_ncdhw_to_ndhwc_v4.cu)
@@ -2263,11 +2277,10 @@ endif()
 # has_nvfp4()). Gating the sources requires guarding their bindings + includes
 # in lockstep; FLASHRT_HAVE_NVFP4_SWIZZLE drives that guard and is defined on
 # the same "NOT slim OR ENABLE_NVFP4" condition.
-if(NOT FLASHRT_SLIM_BUILD OR ENABLE_NVFP4)
+if(NOT FLASHRT_SLIM_BUILD OR ENABLE_NVFP4 OR FLASHRT_ENABLE_LINGBOT_VA_SM89)
   target_sources(flash_rt_kernels PRIVATE
     csrc/quantize/fp8_block128_to_nvfp4_swizzled.cu
     csrc/quantize/bf16_weight_to_nvfp4_swizzled.cu
-    csrc/quantize/nvfp4_pack_tile_major.cu
     csrc/kernels/silu_mul_to_nvfp4_swizzled.cu
     csrc/kernels/fp4_swiglu_compact_sm120.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_NVFP4_SWIZZLE=1)
@@ -2866,4 +2879,23 @@ if(FLASHRT_ENABLE_PI05_THOR)
   target_include_directories(flash_rt_pi05_thor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/csrc)
   target_link_libraries(flash_rt_pi05_thor PRIVATE CUDA::cudart)
   set_target_properties(flash_rt_pi05_thor PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+endif()
+
+# LingBot-VA kernel-only delivery: no source or export enters default builds.
+if(FLASHRT_ENABLE_LINGBOT_VA_SM89)
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/wan_adaln_fp8.cu
+    csrc/attention/sage2/sage2_attn_raw.cu
+    csrc/attention/sage2/sage2_tail_merge.cu
+    csrc/kernels/flow_euler_window.cu
+    csrc/kernels/xattn_probs.cu
+    csrc/quantize/qkv_split_norm_rope_sage.cu
+    csrc/quantize/bf16_norm_tail_ncdhw.cu
+    csrc/quantize/bf16_avgdown3d_ndhwc.cu
+    csrc/quantize/nvfp4_pack_tile_major.cu
+    csrc/kernels/lingbot_va_norm_sm89.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_ENABLE_LINGBOT_VA_SM89=1)
+  if(TARGET flash_rt_qwen3_vl_kernels)
+    target_compile_definitions(flash_rt_qwen3_vl_kernels PRIVATE FLASHRT_ENABLE_LINGBOT_VA_SM89=1)
+  endif()
 endif()

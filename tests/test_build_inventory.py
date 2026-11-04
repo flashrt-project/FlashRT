@@ -30,19 +30,11 @@ BUILD_DIR = Path(os.environ.get("FLASHRT_BUILD_DIR", REPO_ROOT / "build"))
 # build-mode aware: it reads FLASHRT_SLIM_BUILD from the configured build dir's
 # CMakeCache.txt and asserts the matching surface.
 #
-#   compat default (FLASHRT_SLIM_BUILD=OFF): 74 direct TUs.
-#   slim SM89   (FLASHRT_SLIM_BUILD=ON):     47 direct TUs (-27):
-#       -5 Motus VAE FP8 (Unit 1), -10 Qwen3.6/linear-attn (Unit 2),
-#       -8 SM120/NVFP4-named (Unit 3), -4 elsewhere.
-# The direct-source breakdowns below are SM89-specific; other arches add/remove
-# arch-owned sources (for example SM120 adds nvfp4_sf_reshape_sm120.cu), so the
-# direct-count/category asserts are limited to SM89.
-# Re-measured on this branch merged with main (f4ddc906) plus the LingBot model
-# path: main alone is 65 compat / 41 slim; this PR adds +9 compat / +6 slim
-# (wan_adaln_fp8.cu and the LingBot kernel group). The counts are reproduced by
-# `scripts/build_inventory.py --build <dir>` in both configurations.
-COMPAT_KERNELS_TU = 74
-SLIM_SM89_KERNELS_TU = 47
+# SM89 baseline with LingBot additions OFF: 65 compat / 41 slim.
+# The opt-in delivery adds ten core TUs; slim additionally enables four
+# existing packing helpers needed by the new exports. Default counts do not grow.
+COMPAT_KERNELS_TU = 65
+SLIM_SM89_KERNELS_TU = 41
 
 # Per-group breakdown of flash_rt_kernels (mirrors AGENTS.md "Current Build
 # Layout"). categorize() drops empty groups, so slim omits sm120_nvfp4_named.
@@ -51,19 +43,19 @@ COMPAT_KERNELS_CATEGORIES = {
     "qwen36_linear_attention": 12,
     "sm120_nvfp4_named": 8,
     "motus_video_fp8_history": 7,
-    "dit_video": 3,
+    "dit_video": 2,
     "qwen3_family": 2,
     "audio_codebook": 1,
-    "other": 26,
+    "other": 18,
 }
 SLIM_SM89_KERNELS_CATEGORIES = {
     "generic_shared": 15,
     "qwen36_linear_attention": 2,
     "motus_video_fp8_history": 2,
-    "dit_video": 3,
+    "dit_video": 2,
     "qwen3_family": 2,
     "audio_codebook": 1,
-    "other": 22,
+    "other": 17,
 }
 
 
@@ -115,12 +107,19 @@ def _target_build_rules(target: str) -> str:
 
 def _expected_tu() -> int:
     expected = SLIM_SM89_KERNELS_TU if _is_slim() else COMPAT_KERNELS_TU
+    if _cache_bool("FLASHRT_ENABLE_LINGBOT_VA_SM89"):
+        expected += 14 if _is_slim() else 10
     return expected if _audio_codebook_enabled() else expected - 1
 
 
 def _expected_categories() -> dict:
     expected = dict(SLIM_SM89_KERNELS_CATEGORIES if _is_slim()
                     else COMPAT_KERNELS_CATEGORIES)
+    if _cache_bool("FLASHRT_ENABLE_LINGBOT_VA_SM89"):
+        expected["dit_video"] += 1
+        expected["other"] += 9
+        if _is_slim():
+            expected["sm120_nvfp4_named"] = 4
     if not _audio_codebook_enabled():
         expected.pop("audio_codebook", None)
     return expected
@@ -191,7 +190,7 @@ def test_inventory_script_imports_and_collects():
 def test_kernels_baseline_tu_count():
     """flash_rt_kernels direct-source surface matches the recorded baseline.
 
-    Mode-aware: compat default expects 74, slim SM89 expects 47. A change means
+    Mode-aware: LingBot-OFF expects 65 compat / 41 slim; opting in adds ten. A change means
     a unit added/removed a TU from that mode's build; if intended, update the
     matching constant in the same commit.
     """
@@ -277,3 +276,17 @@ def test_object_libraries_counted_in_total():
         assert fa2["object_tu_count"] >= 1
         assert fa2["total_tu_count"] == fa2["count"] + fa2["object_tu_count"]
         assert fa2["total_tu_count"] > fa2["count"]
+
+
+def test_lingbot_sources_follow_model_gate():
+    _require_build_dir()
+    enabled = _cache_bool("FLASHRT_ENABLE_LINGBOT_VA_SM89")
+    assert not enabled or _is_sm89()
+    core = _target_build_rules("flash_rt_kernels")
+    qwen = _target_build_rules("flash_rt_qwen3_vl_kernels")
+    for source in ("wan_adaln_fp8.cu", "lingbot_va_norm_sm89.cu", "sage2_tail_merge.cu",
+                   "qkv_split_norm_rope_sage.cu", "bf16_norm_tail_ncdhw.cu"):
+        assert (source in core) == enabled
+    for source in ("fp8_bs_gemm_cutlass_sm89.cu", "conv3d_f16acc_sm89.cu", "fp4_stream_m128_sm89.cu"):
+        assert (source in qwen) == (enabled and _cache_bool("FLASHRT_BUILD_QWEN3_VL"))
+    assert ("FLASHRT_ENABLE_LINGBOT_VA_SM89" in core) == enabled

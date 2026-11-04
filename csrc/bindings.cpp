@@ -13,7 +13,9 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
 #include "kernels/wan_adaln.cuh"
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 #include "context.h"
 #include "gemm/gemm_runner.h"
 #include "gemm/fp8_block128_gemm.cuh"
@@ -370,10 +372,14 @@ extern "C" int flashrt_fd_w4a8_gemm_sm100(const void* xq, const void* w8, const 
 #include "quantize/fp8_block128_dequant.cuh"
 #ifdef FLASHRT_HAVE_NVFP4_SWIZZLE
 #include "quantize/fp8_block128_to_nvfp4_swizzled.cuh"
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
 #include "quantize/nvfp4_pack_tile_major.cuh"
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 #include "quantize/bf16_weight_to_nvfp4_swizzled.cuh"
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
 #include "quantize/bf16_norm_tail_ncdhw.cuh"
 #include "quantize/bf16_avgdown3d_ndhwc.cuh"
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 #endif
 #include "quantize/fp8_per_token_block_quant.cuh"
 #include "quantize/bias_gelu_quantize_fp8.cuh"
@@ -390,9 +396,11 @@ extern "C" int flashrt_fd_w4a8_gemm_sm100(const void* xq, const void* w8, const 
 #include "quantize/bf16_quant_fp8_ncdhw_to_ndhwc.cuh"
 #endif
 #include "quantize/qkv_split_norm_rope_bf16.cuh"
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
 #include "attention/sage2/sage2_attn_raw.cuh"
 #include "kernels/flow_euler_window.cuh"
 #include "kernels/xattn_probs.cuh"
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 #ifdef FLASHRT_HAVE_THOR_VLA_KERNELS
 #include "kernels/qk_norm_rope_rotate_half_bf16.cuh"
 #endif
@@ -690,6 +698,61 @@ void attention_mha_bf16_masked(cublasHandle_t, const __nv_bfloat16*,
 #endif  // FLASHRT_HAVE_THOR_VLA_KERNELS
 
 PYBIND11_MODULE(flash_rt_kernels, m) {
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
+    m.def("bf16_norm_tail_ncdhw",
+        [](uintptr_t x_bf16, uintptr_t nrm_fp32, uintptr_t gamma_bf16,
+           uintptr_t bias_bf16, uintptr_t y_bf16, int B, int C, int T, int H,
+           int W, float scale, uintptr_t stream) {
+            return flash_rt::quantize::bf16_norm_tail_ncdhw(
+                to_ptr(x_bf16), to_ptr(nrm_fp32), to_ptr(gamma_bf16),
+                bias_bf16 ? to_ptr(bias_bf16) : nullptr,
+                to_ptr(y_bf16), B, C, T, H, W, scale, to_stream(stream));
+        },
+        py::arg("x_bf16"), py::arg("nrm_fp32"), py::arg("gamma_bf16"),
+        py::arg("bias_bf16"), py::arg("y_bf16"),
+        py::arg("B"), py::arg("C"), py::arg("T"), py::arg("H"), py::arg("W"),
+        py::arg("scale"), py::arg("stream") = 0);
+
+    m.def("bf16_norm_tail_ndhwc",
+        [](uintptr_t x_bf16, uintptr_t nrm_fp32, uintptr_t gamma_bf16,
+           uintptr_t bias_bf16, uintptr_t y_bf16, int B, int C, int T, int H,
+           int W, float scale, uintptr_t stream) {
+            return flash_rt::quantize::bf16_norm_tail_ndhwc(
+                to_ptr(x_bf16), to_ptr(nrm_fp32), to_ptr(gamma_bf16),
+                bias_bf16 ? to_ptr(bias_bf16) : nullptr,
+                to_ptr(y_bf16), B, C, T, H, W, scale, to_stream(stream));
+        },
+        py::arg("x_bf16"), py::arg("nrm_fp32"), py::arg("gamma_bf16"),
+        py::arg("bias_bf16"), py::arg("y_bf16"),
+        py::arg("B"), py::arg("C"), py::arg("T"), py::arg("H"), py::arg("W"),
+        py::arg("scale"), py::arg("stream") = 0);
+
+    m.def("bf16_avgdown3d_ndhwc",
+        [](uintptr_t x, uintptr_t y, int B, int C, int T, int H, int W, int ft, int fs,
+           int out_ch, int order, uintptr_t stream) {
+            return flash_rt::quantize::bf16_avgdown3d_ndhwc(
+                to_ptr(x), to_ptr(y), B, C, T, H, W, ft, fs, out_ch, order, to_stream(stream));
+        },
+        py::arg("x"), py::arg("y"), py::arg("B"), py::arg("C"), py::arg("T"), py::arg("H"),
+        py::arg("W"), py::arg("ft"), py::arg("fs"), py::arg("out_ch"), py::arg("order") = 0,
+        py::arg("stream") = 0);
+
+    m.def("bf16_norm_tail_ndhwc_v8",
+        [](uintptr_t x_bf16, uintptr_t nrm_fp32, uintptr_t gamma_bf16,
+           uintptr_t bias_bf16, uintptr_t y_bf16, int B, int C, int T, int H,
+           int W, float scale, int silu, uintptr_t stream) {
+            return flash_rt::quantize::bf16_norm_tail_ndhwc_v8(
+                to_ptr(x_bf16), to_ptr(nrm_fp32), to_ptr(gamma_bf16),
+                bias_bf16 ? to_ptr(bias_bf16) : nullptr,
+                to_ptr(y_bf16), B, C, T, H, W, scale, silu, to_stream(stream));
+        },
+        py::arg("x_bf16"), py::arg("nrm_fp32"), py::arg("gamma_bf16"),
+        py::arg("bias_bf16"), py::arg("y_bf16"),
+        py::arg("B"), py::arg("C"), py::arg("T"), py::arg("H"), py::arg("W"),
+        py::arg("scale"), py::arg("silu"), py::arg("stream") = 0);
+
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
+
     m.doc() = "FlashRT C++/CUDA inference kernels";
 
     // ── FvkContext: per-instance cuBLAS handle ──
@@ -1221,6 +1284,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("x"), py::arg("bias"), py::arg("weight"), py::arg("out"),
        py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f, py::arg("stream") = 0);
 
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
     m.def("bias_rms_norm_bf16_q8", [](uintptr_t x, uintptr_t bias, uintptr_t weight,
                                       uintptr_t out, uintptr_t out_q8,
                                       int seq_len, int dim, float eps, float scale,
@@ -1245,6 +1309,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("n"), py::arg("scale") = 1.0f, py::arg("stream") = 0);
 
 
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
     m.def("rms_norm_inplace", [](uintptr_t weight, uintptr_t x,
                                   int seq_len, int dim, float eps, uintptr_t stream) {
         rms_norm_inplace(typed_ptr<__nv_bfloat16>(weight),
@@ -1754,6 +1819,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                    seq_len, dim, eps, to_stream(stream));
     }, py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("out"),
        py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
 
     m.def("gated_residual_sstp_layer_norm_fp8_block128",
         [](uintptr_t residual, uintptr_t x, uintptr_t xbias, uintptr_t gate_ss_row,
@@ -1787,6 +1853,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        "LayerNorm emitting FP8 with 128-wide per-token scales in one launch, "
        "bit-identical to layer_norm followed by "
        "fp8_per_token_block128_quant_bf16.");
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 
     m.def("ada_rms_norm_style", [](uintptr_t x, uintptr_t weight, uintptr_t style,
                                     uintptr_t out, uintptr_t gate_out,
@@ -3839,6 +3906,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("x"), py::arg("b"), py::arg("S"), py::arg("D"),
        py::arg("stream") = 0);
 
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
     // ── Wan2.2 / LingBot-VA AdaLN (arch-neutral) ──
     m.def("wan_adaln_ln_fp8", [](uintptr_t x, uintptr_t ss_table, uintptr_t tproj,
                                   uintptr_t out_fp8, uintptr_t act_scale,
@@ -3954,6 +4022,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        "As wan_gated_residual_bf16, with the producer's bias folded in before the "
        "gate multiply. bias_bf16 is [D] and may be 0.");
 
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
     m.def("cast_fp16_to_bf16",
           [](uintptr_t in, uintptr_t out, int n, uintptr_t stream) {
         extern void cast_fp16_to_bf16(
@@ -4099,6 +4168,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("w_fp8"), py::arg("w_block_scale_fp32"),
         py::arg("nvfp4_packed"), py::arg("nvfp4_sf_swizzled"),
         py::arg("scratch_global_amax"), py::arg("out_global_scale"),
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
         py::arg("N"), py::arg("K"), py::arg("stream") = 0);
 
     // Per-128 scale-factor variant (see the header). Same payload and SF
@@ -4158,6 +4228,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                     "of 128");
         },
         py::arg("nvfp4_packed"), py::arg("nvfp4_packed_tile_major"),
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
         py::arg("N"), py::arg("K"), py::arg("stream") = 0);
 
     // Single-shot BF16 weight -> NVFP4 (swizzled SF + per-tensor global).
@@ -4602,6 +4673,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("input"), py::arg("output_fp8"),
         py::arg("output_scale"),
         py::arg("M"), py::arg("K"), py::arg("stream") = 0);
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
 
     m.def("fp8_per_token_block128_quant_warp_bf16",
         [](uintptr_t input, uintptr_t output_fp8, uintptr_t output_scale,
@@ -4625,6 +4697,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("input"), py::arg("bias"), py::arg("output_fp8"),
         py::arg("output_scale"), py::arg("M"), py::arg("K"),
         py::arg("stream") = 0);
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 
     // Fused RMSNorm / residual-add+RMSNorm / SwiGLU -> block-128 FP8 quant.
     // Each writes the FP8 activation + per-128-K-block scale consumed directly
@@ -5400,58 +5473,6 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("B"), py::arg("C"), py::arg("T"), py::arg("H"), py::arg("W"),
         py::arg("eps") = 1e-6f, py::arg("stream") = 0);
 
-    m.def("bf16_norm_tail_ncdhw",
-        [](uintptr_t x_bf16, uintptr_t nrm_fp32, uintptr_t gamma_bf16,
-           uintptr_t bias_bf16, uintptr_t y_bf16, int B, int C, int T, int H,
-           int W, float scale, uintptr_t stream) {
-            return flash_rt::quantize::bf16_norm_tail_ncdhw(
-                to_ptr(x_bf16), to_ptr(nrm_fp32), to_ptr(gamma_bf16),
-                bias_bf16 ? to_ptr(bias_bf16) : nullptr,
-                to_ptr(y_bf16), B, C, T, H, W, scale, to_stream(stream));
-        },
-        py::arg("x_bf16"), py::arg("nrm_fp32"), py::arg("gamma_bf16"),
-        py::arg("bias_bf16"), py::arg("y_bf16"),
-        py::arg("B"), py::arg("C"), py::arg("T"), py::arg("H"), py::arg("W"),
-        py::arg("scale"), py::arg("stream") = 0);
-
-    m.def("bf16_norm_tail_ndhwc",
-        [](uintptr_t x_bf16, uintptr_t nrm_fp32, uintptr_t gamma_bf16,
-           uintptr_t bias_bf16, uintptr_t y_bf16, int B, int C, int T, int H,
-           int W, float scale, uintptr_t stream) {
-            return flash_rt::quantize::bf16_norm_tail_ndhwc(
-                to_ptr(x_bf16), to_ptr(nrm_fp32), to_ptr(gamma_bf16),
-                bias_bf16 ? to_ptr(bias_bf16) : nullptr,
-                to_ptr(y_bf16), B, C, T, H, W, scale, to_stream(stream));
-        },
-        py::arg("x_bf16"), py::arg("nrm_fp32"), py::arg("gamma_bf16"),
-        py::arg("bias_bf16"), py::arg("y_bf16"),
-        py::arg("B"), py::arg("C"), py::arg("T"), py::arg("H"), py::arg("W"),
-        py::arg("scale"), py::arg("stream") = 0);
-
-    m.def("bf16_avgdown3d_ndhwc",
-        [](uintptr_t x, uintptr_t y, int B, int C, int T, int H, int W, int ft, int fs,
-           int out_ch, int order, uintptr_t stream) {
-            return flash_rt::quantize::bf16_avgdown3d_ndhwc(
-                to_ptr(x), to_ptr(y), B, C, T, H, W, ft, fs, out_ch, order, to_stream(stream));
-        },
-        py::arg("x"), py::arg("y"), py::arg("B"), py::arg("C"), py::arg("T"), py::arg("H"),
-        py::arg("W"), py::arg("ft"), py::arg("fs"), py::arg("out_ch"), py::arg("order") = 0,
-        py::arg("stream") = 0);
-
-    m.def("bf16_norm_tail_ndhwc_v8",
-        [](uintptr_t x_bf16, uintptr_t nrm_fp32, uintptr_t gamma_bf16,
-           uintptr_t bias_bf16, uintptr_t y_bf16, int B, int C, int T, int H,
-           int W, float scale, int silu, uintptr_t stream) {
-            return flash_rt::quantize::bf16_norm_tail_ndhwc_v8(
-                to_ptr(x_bf16), to_ptr(nrm_fp32), to_ptr(gamma_bf16),
-                bias_bf16 ? to_ptr(bias_bf16) : nullptr,
-                to_ptr(y_bf16), B, C, T, H, W, scale, silu, to_stream(stream));
-        },
-        py::arg("x_bf16"), py::arg("nrm_fp32"), py::arg("gamma_bf16"),
-        py::arg("bias_bf16"), py::arg("y_bf16"),
-        py::arg("B"), py::arg("C"), py::arg("T"), py::arg("H"), py::arg("W"),
-        py::arg("scale"), py::arg("silu"), py::arg("stream") = 0);
-
     m.def("bf16_pack_t1_cache3_nchw_channels_last",
         [](uintptr_t prev_cache_bf16, uintptr_t cur_bf16, uintptr_t out_bf16,
            int C, int H, int W, uintptr_t stream) {
@@ -5536,6 +5557,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("L_v"), py::arg("N"), py::arg("D_h"),
         py::arg("seq_len"), py::arg("eps") = 1e-6f,
         py::arg("stream") = 0);
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
 
     m.def("qkv_split_bias_norm_rope_v_cat2_bf16",
         [](uintptr_t packed_qkv, uintptr_t qkv_bias,
@@ -5874,6 +5896,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         "Sage2 SM89 self-attention (int8 QK, fp16 V), explicit batch strides "
         "so the KV cache's fixed-capacity prefix can be used in place.");
 
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 
     m.def("qkv_split_norm2_bf16",
         [](uintptr_t packed_a, uintptr_t norm_a_q_w, uintptr_t norm_a_k_w,

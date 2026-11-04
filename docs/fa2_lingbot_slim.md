@@ -6,6 +6,7 @@ the default build keeps the generic matrix.
 
 ```bash
 cmake -S . -B build -DGPU_ARCH=89 \
+  -DFLASHRT_ENABLE_LINGBOT_VA_SM89=ON \
   -DFLASHRT_FA2_LINGBOT_SLIM=ON -DFA2_ARCH_NATIVE_ONLY=ON
 cmake --build build --target flash_rt_fa2 -j
 ```
@@ -38,3 +39,22 @@ fixed, so the fatbin contains one cubin instead of the full template matrix.
   on machines without CUDA.
 - With the flag OFF (default), the build, bindings, and module are unchanged.
   Model integration is outside this module.
+
+
+All LingBot-VA kernel additions are controlled by
+`FLASHRT_ENABLE_LINGBOT_VA_SM89` (default OFF, requires `GPU_ARCH=89`).
+This gates the Wan/AdaLN, Sage2, streaming-VAE helpers, new fused norm and
+QKV/quantization entries, and the SM89 GEMM/conv additions in the Qwen3-VL
+module. Enable `FLASHRT_BUILD_QWEN3_VL=ON` when those GEMM/conv entries are
+needed. The slim FA2 module additionally requires its own opt-in flag.
+Slim core builds also enable the four existing NVFP4 packing-helper sources
+required by the delivery; this does not change LingBot-OFF builds.
+Legacy normalization remains in the original translation unit; the new fused
+profiles have a separate source file. Invalid slim-entry arguments raise an
+exception rather than terminating the process.
+
+The bundle was removed by the author before this follow-up. This PR supplies
+kernel/build support only; it does not deliver a native model frontend or
+claim that the external model integration follows this repository's pipeline
+contract. The published end-to-end measurements are from that external
+integration and were not rerun in this build-isolation follow-up.

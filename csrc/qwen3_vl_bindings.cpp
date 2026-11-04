@@ -50,13 +50,17 @@
 
 #ifdef ENABLE_SM89_BLOCK_FP8_GEMM
 #include "gemm/fp8_block128_gemm_mma_sm89.cuh"
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
 #include "gemm/fp8_bs_gemm_cutlass_sm89.cuh"
 #include "gemm/fp4_bs_gemm_sm89.cuh"
 #include "gemm/fp4_bs_gemm_splitk_sm89.cuh"
 #include "gemm/fp4_stream_m16_sm89.cuh"
 #include "gemm/fp4_stream_m128_sm89.cuh"
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 #include "gemm/fp8_gemv_m1_sm89.cuh"
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
 #include "gemm/conv3d_f16acc_sm89.cuh"
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 #include "quantize/fp8_per_token_block_quant.cuh"
 #endif
 
@@ -312,6 +316,7 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
         py::arg("act_block_scale"), py::arg("w_block_scale"),
         py::arg("stream") = 0);
 
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
     // Block-128-scaled FP8 GEMM on the CUTLASS 2.x SM89 pipeline. Same
     // operands, scales and output as fp8_block128_gemm_blockscaled_sm89_bf16out.
     m.def("fp8_bs_gemm_cutlass_sm89",
@@ -785,6 +790,9 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
         py::arg("stream") = 0);
 
 
+#else
+    // GeGLU silu-fold (production entry, env-gated by the caller): fuses the
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
     // gate_up GEMM + silu_mul + per-token block-128 FP8 quant into one launch.
     // This is a NEW binding (no legacy alias replaced). Argument shapes:
     //   A         : [M, K]        FP8 e4m3 row-major   (per-token quantized act)
@@ -904,6 +912,7 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
     BIND_BLOCK128_GEMV_M1_BF16IN(gemv_fp8_block128_m1_bf16in_w16);
 
 #undef BIND_BLOCK128_GEMV_M1_BF16IN
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
 
     // Wan VAE causal conv3d (NDHWC) on the FP16-accumulating MMA.
     m.def("conv3d_ndhwc_f16acc_bf16out",
@@ -930,6 +939,7 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
         },
         py::arg("cache"), py::arg("Tc"), py::arg("x"), py::arg("Tx"), py::arg("out"),
         py::arg("N"), py::arg("frame"), py::arg("stream") = 0);
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 
 #endif  // ENABLE_SM89_BLOCK_FP8_GEMM
 

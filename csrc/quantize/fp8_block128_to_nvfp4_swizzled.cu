@@ -209,6 +209,7 @@ __global__ void weight_quantize_pass2_kernel(
     }
 }
 
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
 // Pass 2, per-128 variant: one thread per 128-wide K block (one FP8 block).
 // The scale is the block amax/6, written as the same UE4M3 byte to all eight
 // 16-wide sub-block SF slots, so the existing expansion reconstructs a weight
@@ -288,6 +289,7 @@ __global__ void weight_quantize_pass2_sf128_kernel(
     }
 }
 
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 }  // namespace
 
 void fp8_block128_to_nvfp4_swizzled_bf16(
@@ -333,6 +335,7 @@ void fp8_block128_to_nvfp4_swizzled_bf16(
     }
 }
 
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
 void fp8_block128_to_nvfp4_sf128_swizzled_bf16(
     const void* w_fp8,
     const float* w_block_scale_fp32,
@@ -406,5 +409,6 @@ void fp8_block128_to_nvfp4_sf128_plain_bf16(
     }
 }
 
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 }  // namespace quantize
 }  // namespace flash_rt

@@ -24,7 +24,7 @@
 #include <cutlass/numeric_types.h>
 
 #include <cstdint>
-#include <cstdio>
+#include <stdexcept>
 
 #include "flash_attn_2_src/flash_attn/namespace_config.h"
 #include "flash_attn_2_src/flash_attn/flash.h"
@@ -120,16 +120,10 @@ extern "C" void fvk_attention_fa2_fwd_bf16(
     float softmax_scale, int /*num_sms*/, cudaStream_t stream)
 {
     if (head_dim != 128) {
-        std::fprintf(stderr,
-            "[flash_rt_fa2:slim] fwd_bf16 build supports head_dim=128 only, "
-            "got %d\n", head_dim);
-        std::abort();
+        throw std::invalid_argument("LingBot slim FA2 requires head_dim=128 and no split-KV");
     }
     if (softmax_lse_accum_ptr != nullptr || o_accum_ptr != nullptr) {
-        std::fprintf(stderr,
-            "[flash_rt_fa2:slim] fwd_bf16 build does not include split-KV; "
-            "pass softmax_lse_accum=0 and o_accum=0\n");
-        std::abort();
+        throw std::invalid_argument("LingBot slim FA2 requires head_dim=128 and no split-KV");
     }
 
     FLASH_NAMESPACE::Flash_fwd_params params;
@@ -161,10 +155,7 @@ extern "C" void fvk_attention_fa2_fwd_bf16_tile(
     float softmax_scale, int /*num_sms*/, cudaStream_t stream)
 {
     if (head_dim != 128) {
-        std::fprintf(stderr,
-            "[flash_rt_fa2:slim] fwd_bf16_tile build supports head_dim=128 "
-            "only, got %d\n", head_dim);
-        std::abort();
+        throw std::invalid_argument("LingBot slim FA2 requires head_dim=128 and no split-KV");
     }
 
     FLASH_NAMESPACE::Flash_fwd_params params;

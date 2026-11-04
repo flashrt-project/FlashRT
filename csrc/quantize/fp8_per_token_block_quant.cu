@@ -6,7 +6,9 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
 #include <cstdint>
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 #include <cuda_runtime.h>
 #include <stdexcept>
 
@@ -512,6 +514,7 @@ __global__ void gelu_erf_bias_to_fp8_block128_kernel(
   output[idx] = __nv_fp8_e4m3(q);
 }
 
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
 __device__ __forceinline__ float gelu_tanh_f32(float x) {
   return x * 0.5f * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x)));
 }
@@ -618,6 +621,7 @@ __global__ void fp8_per_token_block_quant_warp_kernel(
   }
 }
 
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 }  // namespace
 
 void fp8_per_token_block128_quant_bf16(
@@ -818,6 +822,7 @@ void gelu_erf_bias_to_fp8_block128_bf16(
       output_scale, K);
 }
 
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
 void gelu_tanh_bias_to_fp8_block128_bf16(
     const void* input, const void* bias, void* output_fp8, float* output_scale,
     int M, int K, cudaStream_t stream)
@@ -851,5 +856,6 @@ void fp8_per_token_block128_quant_warp_bf16(
       reinterpret_cast<__nv_fp8_e4m3*>(output_fp8), output_scale, K);
 }
 
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 }  // namespace quantize
 }  // namespace flash_rt

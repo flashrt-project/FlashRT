@@ -864,6 +864,7 @@ void qkv_split_joint3_cat_bf16(
           eps_v, eps_a, eps_u);
 }
 
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
 __global__ void qkv_split_bias_norm_rope_v_cat2_bf16_kernel(
     const __nv_bfloat16* __restrict__ packed_qkv,
     const __nv_bfloat16* __restrict__ qkv_bias,
@@ -1014,5 +1015,6 @@ void qkv_split_bias_norm_rope_v_cat2_bf16(
       Lq, off_q, Lkv, off_kv, L_v, N, D_h, seq_len, eps);
 }
 
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 }  // namespace quantize
 }  // namespace flash_rt

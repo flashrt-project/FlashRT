@@ -39,7 +39,8 @@ def test_slim_surface_has_only_the_two_entries():
     assert not (_NAMES & GENERIC_ONLY), _NAMES & GENERIC_ONLY
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 9),
+                    reason="numerical validation requires the declared SM89 target")
 @pytest.mark.parametrize("seqlen_q,entry", [(128, "fwd_bf16"), (16, "fwd_bf16_tile")])
 def test_forward_matches_sdpa(seqlen_q: int, entry: str):
     device = torch.device("cuda")
@@ -76,3 +77,11 @@ def test_forward_matches_sdpa(seqlen_q: int, entry: str):
     cos = torch.nn.functional.cosine_similarity(
         out.float().flatten(), ref.float().flatten(), dim=0).item()
     assert cos > 0.999, (entry, cos)
+
+
+@pytest.mark.parametrize("entry",["fwd_bf16","fwd_bf16_tile"])
+def test_invalid_head_width_raises_instead_of_aborting(entry):
+    strides=(2048,128,128,1)
+    prefix=(0,0,0,0,0,0) if entry=="fwd_bf16_tile" else (0,0,0,0,0,0,0)
+    with pytest.raises(ValueError,match="head_dim=128"):
+        getattr(fa2,entry)(*prefix,1,16,16,1,1,64,strides,strides,strides,strides,0.125,0,0)
