@@ -37,5 +37,4 @@ fixed, so the fatbin contains one cubin instead of the full template matrix.
   entries, and compares with PyTorch SDPA; it skips on the generic module and
   on machines without CUDA.
 - With the flag OFF (default), the build, bindings, and module are unchanged.
-  Model integration is outside this module; the LingBot bundle is published on
-  FlashHub.
+  Model integration is outside this module.
