@@ -17,6 +17,8 @@ sha256sum --check results/SHA256SUMS
 
 The verifier checks original report and measured-code hashes, recomputes all offline error metrics from `results/action-predictions.csv`, and checks latency medians/p95 against the 1,800 individual samples in `results/latency-samples.json`. CSV values round-trip the original float32 predictions; there are 16 predicted actions per observation for every backend. Ground-truth columns are populated only for the 1,410 executed action steps. A blank ground-truth cell means the step was not scored, not a zero action. The CSV contains physical action outputs, not camera images or model parameters.
 
+The original verifier also checks measured adapter-code hashes. Run it on the original report revision (`fd053d3426f2318b9f106c99998df71578e9917f`); the two-camera follow-up does not rewrite those historical hashes. Use `python3 results/verify_libero_counts.py` for the new ten-round count table.
+
 This verifies the published data's internal consistency. It does not independently re-execute the models or replay the simulation pilot. Continue below to prepare a new hardware experiment.
 
 ## What has and has not been reproduced
@@ -212,4 +214,4 @@ Round orders are TRT → FlashRT, FlashRT → TRT, TRT → FlashRT. Each round u
 
 Timing covers raw observations through decoded physical actions on the CPU, with GPU synchronization. Preprocessing, transfers and decoding are included; disk loading, noise generation, model loading, calibration, graph capture and warmup are excluded. The noise transfer is included. This boundary differs from JAL's sum of separately timed stages. The two optimized backends must be compared using this same runner.
 
-For the separate pilot, continue with [SIMULATOR.md](SIMULATOR.md). Neither offline numerical closeness nor the small, non-discriminating 0/3 pilot establishes full-suite task-success equivalence. There is no agreed numerical acceptance margin; the reports state raw errors rather than accuracy pass/fail.
+For the two-camera full-suite task evaluation, commands and checks, continue with [SIMULATOR.md](SIMULATOR.md#full-suite-run-and-check). Neither offline numerical closeness nor the small, non-discriminating 0/3 pilot establishes full-suite task-success equivalence. There is no agreed numerical acceptance margin; the reports state raw errors rather than accuracy pass/fail.

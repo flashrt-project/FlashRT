@@ -1,0 +1,171 @@
+{
+  "model": "nvidia/GR00T-N1.7-LIBERO/libero_10",
+  "episodes_per_round_per_backend": 500,
+  "rounds_per_backend": 10,
+  "total_episodes": 15000,
+  "protocol": {
+    "cameras": [
+      "image",
+      "wrist_image"
+    ],
+    "history_frames_per_camera": 1,
+    "denoising_steps": 4,
+    "internal_horizon": 40,
+    "returned_actions": 16,
+    "execute_actions": 8,
+    "settling_steps": 5,
+    "control_step_limit": 720,
+    "initial_states_per_task": 50,
+    "task_ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+    ],
+    "warmup_calls_per_task_backend": 20,
+    "cpu_threads": 2,
+    "renderer": "egl",
+    "calibration": "Frozen: FlashRT one reserved non-scored observation per task; JAL 10 official demo observations, optimized mixed NVFP4 recipe."
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "seed": 20261026,
+      "successes": {
+        "torch": 450,
+        "trt": 443,
+        "flashrt": 440
+      }
+    },
+    {
+      "round": 2,
+      "seed": 20261027,
+      "successes": {
+        "torch": 451,
+        "trt": 444,
+        "flashrt": 442
+      }
+    },
+    {
+      "round": 3,
+      "seed": 20261028,
+      "successes": {
+        "torch": 439,
+        "trt": 445,
+        "flashrt": 440
+      }
+    },
+    {
+      "round": 4,
+      "seed": 20261029,
+      "successes": {
+        "torch": 442,
+        "trt": 448,
+        "flashrt": 443
+      }
+    },
+    {
+      "round": 5,
+      "seed": 20261030,
+      "successes": {
+        "torch": 446,
+        "trt": 431,
+        "flashrt": 451
+      }
+    },
+    {
+      "round": 6,
+      "seed": 20261102,
+      "successes": {
+        "torch": 452,
+        "trt": 451,
+        "flashrt": 449
+      }
+    },
+    {
+      "round": 7,
+      "seed": 20261103,
+      "successes": {
+        "torch": 456,
+        "trt": 440,
+        "flashrt": 453
+      }
+    },
+    {
+      "round": 8,
+      "seed": 20261104,
+      "successes": {
+        "torch": 452,
+        "trt": 446,
+        "flashrt": 447
+      }
+    },
+    {
+      "round": 9,
+      "seed": 20261105,
+      "successes": {
+        "torch": 432,
+        "trt": 445,
+        "flashrt": 445
+      }
+    },
+    {
+      "round": 10,
+      "seed": 20261106,
+      "successes": {
+        "torch": 437,
+        "trt": 448,
+        "flashrt": 453
+      }
+    }
+  ],
+  "aggregate": {
+    "torch": {
+      "episodes": 5000,
+      "successes": 4457,
+      "success_percent": 89.14,
+      "run_to_run_sample_std_pp": 1.5692885861646564
+    },
+    "trt": {
+      "episodes": 5000,
+      "successes": 4441,
+      "success_percent": 88.82,
+      "run_to_run_sample_std_pp": 1.1013123484683565
+    },
+    "flashrt": {
+      "episodes": 5000,
+      "successes": 4463,
+      "success_percent": 89.26,
+      "run_to_run_sample_std_pp": 1.0112698288125992
+    }
+  },
+  "provenance": {
+    "contributor": "FlashRT maintainer follow-up; separate from the original NVIDIA one-camera experiment",
+    "runtime_a": {
+      "torch": "2.12.0a0+5aff3928d8.nv26.5.50603568",
+      "tensorrt": "10.16.1.11",
+      "numpy": "1.26.4",
+      "transformers": "4.57.3",
+      "mujoco": "3.1.6",
+      "robosuite": "1.4.1"
+    },
+    "runtime_b": {
+      "torch": "2.9.0a0+50eac811a6.nv25.09",
+      "tensorrt": "10.16.1.11",
+      "numpy": "1.26.4",
+      "transformers": "4.57.3"
+    },
+    "allocation": "Rounds 1-5: all backends on Thor A. Rounds 6-8: Torch/TRT on Thor B, FlashRT on Thor A. Rounds 9-10: all backends on Thor A. Existing device-specific runtimes retained.",
+    "jal_calibration_dataset": "Existing Isaac-GR00T libero_demo, 10 observations; differs from the original NVIDIA IPEC calibration cohort.",
+    "weights": "All seven checkpoint files matched the original NVIDIA weight manifest.",
+    "validation": "Per-round validators checked 500 unique task/state keys per backend, finite action traces and paired noise/state/input fingerprints where co-located.",
+    "rendering": "Sparse one-LSB EGL image differences were recorded and bounded by validators; pixel arrays were not universally bit-identical.",
+    "scope": "The same 500 task/state cases are reused over ten seeds; 5000 episodes per backend, not 5000 distinct initial states. Raw rollout traces retained by contributor; this file publishes per-round counts."
+  }
+}

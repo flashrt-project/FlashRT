@@ -31,6 +31,8 @@ def compare(paths):
     for run in runs:
         for key in SETTINGS:
             if run[key]!=reference[key]:raise ValueError(f'Rollout protocol differs: {key}')
+        for key in ('camera_keys', 'camera_ablation'):
+            if run.get(key)!=reference.get(key):raise ValueError(f'Rollout protocol differs: {key}')
         groups={g['task_id']:(g['state_file_sha256'],g['bddl_sha256']) for g in run['groups']}
         if groups!=first_groups:raise ValueError('Task assets or initial-state files differ')
         cases={(e['task_id'],e['state_index']):e for e in run['episodes']}
@@ -50,9 +52,11 @@ def compare(paths):
         results[run['backend']]={'successes':wins,'episodes':len(cases),'success_rate':wins/len(cases),
                                 'cases':[{'task_id':key[0],'state_index':key[1],'success':e['success'],
                                           'environment_steps':e['environment_steps']} for key,e in cases.items()]}
+    protocol={k:reference[k] for k in SETTINGS}
+    protocol.update({k:reference[k] for k in ('camera_keys','camera_ablation') if k in reference})
     return {'scope':reference['scope'],'note':'Descriptive matched pilot; no full-suite or accuracy-equivalence claim',
             'matched_initial_states_and_processed_observations':True,
-            'protocol':{k:reference[k] for k in SETTINGS},'results':results}
+            'protocol':protocol,'results':results}
 
 
 def main():

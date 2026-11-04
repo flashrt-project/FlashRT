@@ -26,16 +26,17 @@ CAPTURE_SCHEMA = "groot-comparison-calibration-v1"
 
 
 def _observation_prompt(observation: dict) -> str:
-    """Enforce the single-camera, single-observation LIBERO I/O contract."""
+    """Validate one LIBERO observation with one or both checkpoint cameras."""
     if set(observation) != {"video", "state", "language"}:
         raise ValueError("Expected the official video/state/language observation")
-    if set(observation["video"]) != {"image"}:
-        raise ValueError("This comparison requires exactly the image camera")
-    image = np.asarray(observation["video"]["image"])
-    if image.ndim != 5 or image.shape[:2] != (1, 1) or image.shape[-1] != 3:
-        raise ValueError("Expected RGB image shape (1, 1, height, width, 3)")
-    if image.dtype != np.uint8:
-        raise ValueError("Raw camera images must be uint8")
+    if set(observation["video"]) not in ({"image"}, {"image", "wrist_image"}):
+        raise ValueError("Expected image, optionally with wrist_image")
+    for key, value in observation["video"].items():
+        image = np.asarray(value)
+        if image.ndim != 5 or image.shape[:2] != (1, 1) or image.shape[-1] != 3:
+            raise ValueError(f"Expected {key} RGB shape (1, 1, height, width, 3)")
+        if image.dtype != np.uint8:
+            raise ValueError(f"Raw camera {key} must be uint8")
     if set(observation["state"]) != set(ACTION_KEYS):
         raise ValueError("Expected LIBERO x/y/z/roll/pitch/yaw/gripper state")
     for key, value in observation["state"].items():
@@ -209,7 +210,7 @@ def capture_calibration(checkpoint: str, observation: dict, output_path: str,
 
 
 class FlashRTBackend:
-    """One-camera, batch-one, four-step GR00T with frozen prompt/calibration."""
+    """Checkpoint-configured cameras, batch one, four steps and frozen calibration."""
 
     noise_shape = NOISE_SHAPE
 
@@ -246,6 +247,8 @@ class FlashRTBackend:
         if meta["checkpoint_identity"] != _checkpoint_identity(checkpoint):
             raise ValueError("Calibration capture belongs to a different checkpoint/configuration")
         self._prompt = _observation_prompt(capture["inputs"])
+        self._camera_keys = tuple(key for key in ("image", "wrist_image")
+                                  if key in capture["inputs"]["video"])
         if self._prompt != meta["prompt"]:
             raise ValueError("Calibration prompt metadata mismatch")
         if observation_sha256(capture["inputs"]) != meta["observation_sha256"]:
@@ -262,7 +265,7 @@ class FlashRTBackend:
         try:
             self._model = flash_rt.load_model(
                 checkpoint, config="groot_n17", framework="torch", hardware="thor",
-                num_views=1, embodiment_tag="libero_sim", use_fp4=use_fp4,
+                num_views=len(self._camera_keys), embodiment_tag="libero_sim", use_fp4=use_fp4,
                 device=device,
             )
             self._frontend = self._model.pipeline
@@ -284,8 +287,8 @@ class FlashRTBackend:
             self._prep.processor, self._prep.embodiment_tag = self._processor, tag
             self._prep.modality_configs = self._processor.get_modality_configs()[tag.value]
             self._prep.language_key = self._prep.modality_configs["language"].modality_keys[0]
-            if list(self._prep.modality_configs["video"].modality_keys) != ["image"]:
-                raise ValueError("Checkpoint processor must use the single image camera")
+            if tuple(self._prep.modality_configs["video"].modality_keys) != self._camera_keys:
+                raise ValueError("Checkpoint cameras differ from the calibration capture")
             if len(self._prep.modality_configs["action"].delta_indices) != 16:
                 raise ValueError("Checkpoint processor must decode 16 action steps")
             # Verify processor parity on setup data only; held-out pixels may change.
@@ -302,6 +305,7 @@ class FlashRTBackend:
                 "calibration_observation_sha256": meta["observation_sha256"],
                 "calibration_samples": 1,
                 "calibration_frozen": True,
+                "camera_keys": list(self._camera_keys),
                 "calibration_cache_policy": "recomputed from the dedicated capture before graph construction",
                 "prompt": self._prompt,
                 "image_grid_thw": self._expected_grid.tolist(),
@@ -350,6 +354,8 @@ class FlashRTBackend:
             raise RuntimeError("FlashRT backend is closed")
         if _observation_prompt(observation) != self._prompt:
             raise ValueError("Changed instruction; construct a new FlashRT backend")
+        if set(observation["video"]) != set(self._camera_keys):
+            raise ValueError("Observation cameras differ from the calibration capture")
         with self._torch.inference_mode():
             processed = self._prepare(observation)
             self._validate_prompt_grid(processed)
@@ -368,6 +374,8 @@ class FlashRTBackend:
             raise RuntimeError("FlashRT backend is closed")
         if _observation_prompt(observation) != self._prompt:
             raise ValueError("Changed instruction; construct a new FlashRT backend")
+        if set(observation["video"]) != set(self._camera_keys):
+            raise ValueError("Observation cameras differ from the calibration capture")
         noise = np.asarray(noise, dtype=np.float32)
         if noise.shape != self.noise_shape or not np.isfinite(noise).all():
             raise ValueError(f"Expected finite diffusion noise of shape {self.noise_shape}")

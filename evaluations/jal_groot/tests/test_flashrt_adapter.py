@@ -88,6 +88,7 @@ def backend():
     model._device = "cuda:0"
     model._frontend = Frontend()
     model._prompt = "pick up the mug"
+    model._camera_keys = ("image",)
     model._expected_tokens = Tensor([[1, 2]])
     model._expected_grid = Tensor([[1, 2, 2]])
     model._pixel_shape = (1, 1)
@@ -161,14 +162,53 @@ class FlashRTAdapterContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "finite diffusion noise"):
                 backend().get_action(observation(), noise)
 
-    def test_one_camera_contract_and_calibration_identity(self):
+    def test_camera_contract_and_calibration_identity(self):
         obs = observation()
         original = observation_sha256(obs)
         obs["state"]["x"][0, 0, 0] += 1
         self.assertNotEqual(original, observation_sha256(obs))
-        obs["video"]["wrist_image"] = obs["video"]["image"]
-        with self.assertRaisesRegex(ValueError, "exactly the image camera"):
+        obs["video"]["wrist_image"] = obs["video"]["image"].copy()
+        self.assertEqual(_observation_prompt(obs), "pick up the mug")
+        original = observation_sha256(obs)
+        obs["video"]["wrist_image"][0, 0, 0, 0, 0] += 1
+        self.assertNotEqual(original, observation_sha256(obs))
+        obs["video"]["extra_camera"] = obs["video"]["image"]
+        with self.assertRaisesRegex(ValueError, "optionally with wrist_image"):
             _observation_prompt(obs)
+
+    def test_wrist_shape_and_dtype_are_validated(self):
+        for image in (np.zeros((1, 8, 8, 3), np.uint8),
+                      np.zeros((1, 1, 8, 8, 3), np.float32)):
+            obs = observation()
+            obs["video"]["wrist_image"] = image
+            with self.assertRaisesRegex(ValueError, "wrist_image"):
+                _observation_prompt(obs)
+
+    def test_two_camera_backend_rejects_missing_wrist_before_processing(self):
+        model = backend()
+        model._camera_keys = ("image", "wrist_image")
+        for call in (lambda: model.get_action(observation(), np.zeros(NOISE_SHAPE)),
+                     lambda: model.input_fingerprints(observation())):
+            with self.assertRaisesRegex(ValueError, "Observation cameras differ"):
+                call()
+        self.assertEqual(model._frontend.received, [])
+
+    def test_two_camera_calls_consume_new_wrist_pixels(self):
+        model = backend()
+        model._camera_keys = ("image", "wrist_image")
+        original_prepare = model._prepare
+        def prepare(obs):
+            result = original_prepare(obs)
+            result["pixel_values"].value += obs["video"]["wrist_image"][0, 0, 0, 0, 0]
+            return result
+        model._prepare = prepare
+        obs = observation()
+        obs["video"]["wrist_image"] = np.full_like(obs["video"]["image"], 2)
+        first = model.get_action(obs, np.full(NOISE_SHAPE, 3, np.float32))
+        obs["video"]["wrist_image"].fill(7)
+        second = model.get_action(obs, np.full(NOISE_SHAPE, 3, np.float32))
+        np.testing.assert_array_equal(first["x"], 10)
+        np.testing.assert_array_equal(second["x"], 15)
 
     def test_cleanup_releases_graphs_and_model_after_cuda_error(self):
         model = backend()

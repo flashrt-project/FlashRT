@@ -126,8 +126,9 @@ class _JalBackend:
             1, int(self.action_head.config.action_horizon), int(self.action_head.action_dim)
         )
         video = self.policy.modality_configs["video"]
-        if list(video.modality_keys) != ["image"] or list(video.delta_indices) != [0]:
-            raise ValueError("Use the shared single-camera checkpoint overlay: image, frame [0]")
+        cameras = list(video.modality_keys)
+        if cameras not in (["image"], ["image", "wrist_image"]) or list(video.delta_indices) != [0]:
+            raise ValueError("Expected image or image/wrist_image cameras, frame [0]")
         if set(self.policy.modality_configs["action"].modality_keys) != set(ACTION_KEYS):
             raise ValueError("This adapter requires the seven LIBERO physical-action keys")
         self.output_horizon = len(self.policy.modality_configs["action"].delta_indices)
@@ -140,7 +141,7 @@ class _JalBackend:
             "denoising_steps": steps,
             "noise_shape": list(self.noise_shape),
             "decoded_action_shape": [1, self.output_horizon, len(ACTION_KEYS)],
-            "camera_keys": ["image"],
+            "camera_keys": cameras,
             "noise_contract": "caller float32 rounded to BF16 before each backend",
             "io_boundary": "official policy.get_action: raw observations to decoded CPU actions",
         }

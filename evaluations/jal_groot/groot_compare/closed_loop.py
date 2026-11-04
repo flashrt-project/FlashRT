@@ -19,7 +19,7 @@ import time
 import numpy as np
 
 from .common import file_sha256, shared_noise, validate_manifest, write_json
-from .dataset import _content_digest
+from .dataset import _content_digest, _read_modality_configs
 from .metrics import ACTION_KEYS, action_array
 from .run import _backend, prompt_key
 
@@ -27,6 +27,19 @@ ISAAC_REVISION = "9c7e746b2cd37a810070a98ef41d290a07e806c2"
 LIBERO_REVISION = "8f1084e3132a39270c3a13ebe37270a43ece2a01"
 EXECUTION_HORIZON = 8
 SETTLING_STEPS = 5
+
+
+def task_camera_keys(checkpoint, allow_camera_ablation=False):
+    """Task validation preserves the checkpoint's two-camera observation by default."""
+    video = _read_modality_configs(checkpoint, "libero_sim")["video"]
+    keys = tuple(video["modality_keys"])
+    if keys not in (("image",), ("image", "wrist_image")) or video["delta_indices"] != [0]:
+        raise ValueError("Expected LIBERO image or image/wrist_image cameras, frame [0]")
+    if keys == ("image",) and not allow_camera_ablation:
+        raise ValueError("Task validation requires image and wrist_image. Use the two-camera "
+                         "checkpoint, or explicitly select --allow-camera-ablation for a "
+                         "one-camera diagnostic.")
+    return keys
 
 
 def array_fingerprint(value):
@@ -242,6 +255,7 @@ def _verify_sources(source_dir, libero_dir):
 def run(args):
     manifest_path = Path(args.manifest).resolve()
     manifest = validate_manifest(manifest_path)
+    camera_keys = task_camera_keys(args.checkpoint, args.allow_camera_ablation)
     source_dir = Path(args.source_dir).resolve()
     libero_dir = Path(args.libero_dir or source_dir / "external_dependencies" / "LIBERO").resolve()
     _verify_sources(source_dir, libero_dir)
@@ -280,6 +294,7 @@ def run(args):
               "execution_horizon": EXECUTION_HORIZON, "max_episode_steps": args.max_episode_steps,
               "seed": args.seed, "initial_state_start": args.state_start,
               "episodes_per_task": args.episodes, "batch_size": 1,
+              "camera_keys": list(camera_keys), "camera_ablation": camera_keys == ("image",),
               "render_backend": os.environ["MUJOCO_GL"], "latency_benchmark": False,
               "selected_tasks": [{"task_id": i, "name": t.name, "prompt": t.language} for i, t in tasks],
               "groups": [], "episodes": []}
@@ -349,6 +364,8 @@ def main():
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--backend", choices=("torch", "trt", "flashrt"), required=True)
+    parser.add_argument("--allow-camera-ablation", action="store_true",
+                        help="Explicitly allow a one-camera diagnostic instead of default two-camera task validation")
     parser.add_argument("--engine-dir")
     parser.add_argument("--capture-dir")
     parser.add_argument("--source-dir", default=str(Path(__file__).resolve().parents[1] / "vendor" / "Isaac-GR00T"))

@@ -1,10 +1,6 @@
-# Fixed-state LIBERO pilot
+# Two-camera LIBERO-10 task evaluation
 
-`groot_compare.closed_loop` adds closed-loop task-success evaluation using the pinned Isaac-GR00T policy/environment wrappers and pinned LIBERO assets. It is separate from the offline accuracy and latency experiment. Its elapsed episode times are not inference latency measurements.
-
-The default is the **three tasks whose prompts occur in the shared manifest**, one official fixed initial state per task, eight executed actions per policy call, and at most 720 environment steps per episode. The 720-step budget follows GR00T’s rollout default; native LIBERO’s default is 600. This is a pilot task subset, not a full LIBERO-10 score. `--full-suite` refuses to run until every task has a separate calibration record. `--episodes N --state-start K` selects distinct fixed state indices K through K+N-1; it never wraps indices.
-
-The simulator images used for the original pilot were built and run. A new layer built on the proposed standalone JAL reconstruction remains unverified until that reconstruction and this pilot are rerun. The checked-in results remain separate from all new `artifacts/` output.
+Use the checkpoint's `image` **and** `wrist_image` cameras. The original one-camera pilot is historical; its latency and offline results stay unchanged. This follow-up runs all ten tasks, 50 official initial states each, over ten seeds. Episode wall time is not inference latency.
 
 ## Isolated simulator images
 
@@ -31,53 +27,96 @@ python3 scripts/simulator.py --cpu-only flashrt -- scripts/check_simulator_impor
 
 The CPU checks import the simulator and policy wrappers, enumerate the ten tasks, and assert CUDA was not initialized. They do not construct a simulator or load a model. The launcher disables GPU access with the `runc` runtime for these checks. Runtime network access is disabled in all launches. Simulator rendering defaults to OSMesa software rendering; this avoids renderer GPU competition but makes episode wall time unsuitable for inference performance claims.
 
-## Run the paired pilot after offline checks
+## Preserve both checkpoint cameras
 
-Prepare the shared observations, matching calibration captures and JAL engines using [REPRODUCE.md](REPRODUCE.md) first. Run backends sequentially, with identical seed, state indices, step budget and rendering mode. Use new output directories for repeats.
-
-```bash
-python3 scripts/simulator.py jal -- -m groot_compare.closed_loop \
-  --backend torch \
-  --manifest /comparison/artifacts/observations/heldout/manifest.json \
-  --checkpoint /comparison/artifacts/models/groot-libero-onecam \
-  --episodes 1 --state-start 0 --seed 20261026 --cpu-threads 2 \
-  --render-backend osmesa \
-  --output /comparison/artifacts/closed_loop/torch-pilot
-
-python3 scripts/simulator.py jal -- -m groot_compare.closed_loop \
-  --backend trt \
-  --engine-dir /comparison/artifacts/jal_trt_optimized_mixed_nvfp4/engines \
-  --manifest /comparison/artifacts/observations/heldout/manifest.json \
-  --checkpoint /comparison/artifacts/models/groot-libero-onecam \
-  --episodes 1 --state-start 0 --seed 20261026 --cpu-threads 2 \
-  --render-backend osmesa \
-  --output /comparison/artifacts/closed_loop/trt-pilot
-
-python3 scripts/simulator.py flashrt -- -m groot_compare.closed_loop \
-  --backend flashrt --capture-dir /comparison/artifacts/captures/heldout \
-  --manifest /comparison/artifacts/observations/heldout/manifest.json \
-  --checkpoint /comparison/artifacts/models/groot-libero-onecam \
-  --episodes 1 --state-start 0 --seed 20261026 --cpu-threads 2 \
-  --render-backend osmesa \
-  --output /comparison/artifacts/closed_loop/flashrt-pilot
-```
-
-`--task-ids` explicitly selects task indices if a smaller smoke test is needed. `--max-episode-steps` is a protocol change and is recorded. A shortened smoke test cannot establish standard task success.
-
-## Pairing evidence
-
-The runner uses LIBERO submodule `8f1084e3132a39270c3a13ebe37270a43ece2a01`, official `.pruned_init` state files, and the five raw zero-action settling steps from the pinned benchmark evaluator before the official history wrapper initializes. Image rotation, state representation, gripper normalization and gripper inversion remain in the official wrappers. The one-camera processor configuration selects the camera from those observations.
-
-Each `closed_loop.json` records task prompts and IDs, source revisions and wrapper hashes, selected and settled initial-state hashes, BDDL/state-file hashes, initial processed-input fingerprints, exact noise and observation hashes per decision, actual executed steps and success. Physical action chunks are stored in adjacent NPZ files. Noise is deterministic by seed/task/state/decision and shared across backends; observations diverge naturally after different actions.
-
-Before comparing success, require completed runs with the same selected tasks, seed, state indices, initialization/settling, render mode, step budget, configurations and initial fingerprints. A mismatch invalidates a paired comparison. Three episodes total per backend only establishes pilot behavior; it does not estimate full-suite accuracy reliably.
-
-The comparison command enforces those initial-state, preprocessing, asset, protocol and shared-noise checks:
+Reuse the model files, local backbone, dataset and inference runtimes prepared in [REPRODUCE.md](REPRODUCE.md); no second weight download is needed. From `evaluations/jal_groot`, create a separate metadata overlay that preserves both cameras:
 
 ```bash
-.venv/bin/python -m groot_compare.closed_loop_report \
-  --runs artifacts/closed_loop/torch-pilot artifacts/closed_loop/trt-pilot artifacts/closed_loop/flashrt-pilot \
-  --output artifacts/reports/closed-loop-pilot.json
+python3 - <<'PY'
+import json, os
+from pathlib import Path
+models = Path('artifacts/models')
+source = models / 'GR00T-N1.7-LIBERO/libero_10'
+overlay = models / 'groot-libero-twocam'
+overlay.mkdir()  # Refuse to overwrite an existing experiment configuration.
+(models / 'nvidia').mkdir(exist_ok=True)
+backbone = models / 'nvidia/Cosmos-Reason2-2B'
+if not backbone.exists():
+    backbone.symlink_to('../Cosmos-Reason2-2B', target_is_directory=True)
+for path in source.iterdir():
+    if path.name not in {'config.json', 'processor_config.json', '.cache'}:
+        (overlay / path.name).symlink_to(os.path.relpath(path, overlay), target_is_directory=path.is_dir())
+local_backbone = '/comparison/artifacts/models/nvidia/Cosmos-Reason2-2B'
+config = json.loads((source / 'config.json').read_text())
+assert config['num_inference_timesteps'] == 4
+config['model_name'] = local_backbone
+(overlay / 'config.json').write_text(json.dumps(config, indent=2))
+processor = json.loads((source / 'processor_config.json').read_text())
+video = processor['processor_kwargs']['modality_configs']['libero_sim']['video']
+assert video['modality_keys'] == ['image', 'wrist_image']
+assert video['delta_indices'] == [0]
+processor['processor_kwargs']['model_name'] = local_backbone
+(overlay / 'processor_config.json').write_text(json.dumps(processor, indent=2))
+PY
 ```
 
-The frozen offline input protocol remains unchanged so completed runs keep their original hashes. The pilot records its separate rollout settings, task subset, state indices and completion status in each `closed_loop.json`.
+## Build two-camera JAL engines
+
+Keep the two-camera overlay above. One-camera engines and calibration captures cannot be reused. To match the follow-up calibration recipe, use ten observations from the bundled official `libero_demo` (rather than the original report's IPEC calibration cohort):
+
+```bash
+python3 scripts/container.py jal -- \
+  vendor/Isaac-GR00T/scripts/deployment/build_trt_pipeline.py \
+  --model-path /comparison/artifacts/models/groot-libero-twocam \
+  --dataset-path /comparison/vendor/Isaac-GR00T/demo_data/libero_demo \
+  --embodiment-tag LIBERO_PANDA \
+  --output-dir /comparison/artifacts/jal_trt_twocam \
+  --execution-profile optimized --quantization mixed_nvfp4 \
+  --calib-size 10 --batch-size 1 --steps export,build
+```
+
+## Full-suite run and check
+
+Run from `evaluations/jal_groot`, with the simulator images and assets prepared above. The runner uses the pinned official policy/environment wrappers for images, state and gripper handling. It captures one separate, non-scored raw initial-state observation per task for FlashRT calibration, then reuses those ten captures for every round. JAL scales are already frozen in its engines; these captures only provide its warmup inputs.
+
+```bash
+checkpoint=/comparison/artifacts/models/groot-libero-twocam
+source=/comparison/vendor/Isaac-GR00T
+captures=/comparison/artifacts/captures/libero-suite
+runs=/comparison/artifacts/libero-suite
+engines=/comparison/artifacts/jal_trt_twocam/engines
+
+python3 scripts/simulator.py flashrt -- -m groot_compare.libero_suite calibrate \
+  --output "$runs/setup" --checkpoint "$checkpoint" --source-dir "$source" \
+  --calibration-dir "$captures" --seed 20261026
+
+for seed in 20261026 20261027 20261028 20261029 20261030 \
+            20261102 20261103 20261104 20261105 20261106; do
+  for task in {0..9}; do
+    for backend in torch trt flashrt; do
+      runtime=jal
+      [ "$backend" = flashrt ] && runtime=flashrt
+      python3 scripts/simulator.py "$runtime" -- -m groot_compare.libero_suite \
+        "$backend" "$task" --output "$runs/seed-$seed" --seed "$seed" \
+        --checkpoint "$checkpoint" --source-dir "$source" \
+        --calibration-dir "$captures" --engine-dir "$engines" --render-backend egl
+    done
+  done
+  python3 scripts/simulator.py --cpu-only flashrt -- -m groot_compare.verify_suite \
+    "$runs/seed-$seed" "$seed"
+done
+```
+
+Run on an idle GPU, or serialize these commands with your existing GPU lock. Keep all three backends for a given seed together. For two devices, split the seed list into disjoint groups; do not evaluate the same seed twice. Capture calibration once and reuse the same files and frozen engines on both devices.
+
+Each backend/task performs **20 warmup calls**, then scores all 50 provided `.pruned_init` states. Settings are batch one, two cameras with one current frame each, **four denoising steps**, 16 returned actions with **eight executed per decision**, **five zero-action settling steps**, and **720 control steps** per episode. Settling is outside the control budget. State/decision-derived BF16-rounded noise is shared across backends; weights and calibration are fixed.
+
+Each seed must produce `verified-summary.json` with `verified: true`, **1,500 episodes**, and **500 unique task/state keys per backend**. The verifier recomputes noise hashes, checks finite saved actions and paired initial states/processed inputs, and records bounded one-LSB EGL rendering differences. A task failure counts as a scored failure; a setup/runtime error prevents completion. An interrupted task can resume from saved episodes; completed tasks are not silently rerun. No videos are saved.
+
+## Check the published ten-round counts without a GPU
+
+```bash
+python3 results/verify_libero_counts.py
+```
+
+This recomputes totals and sample standard deviations from [libero-ten-rounds.json](results/libero-ten-rounds.json). It checks the published counts, not the private raw rollout traces. The file also records device/runtime allocation and calibration provenance. Our measured follow-up used existing PyTorch 2.12/2.9 and TensorRT 10.16 environments, not the original NVIDIA PyTorch 2.10/TensorRT 10.15 environment; fresh-image equivalence is still a separate validation.

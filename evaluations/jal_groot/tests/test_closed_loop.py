@@ -1,5 +1,8 @@
 """CPU contracts for paired task selection, initialization, and episode accounting."""
 from types import ModuleType, SimpleNamespace
+import json
+from pathlib import Path
+import tempfile
 import sys
 import unittest
 from unittest.mock import patch
@@ -8,7 +11,7 @@ import numpy as np
 
 from groot_compare.closed_loop import (
     ACTION_KEYS, _batch_sim_observation, array_fingerprint, case_seed,
-    make_fixed_state_env, noise_record_id, run_episode, select_tasks,
+    make_fixed_state_env, noise_record_id, run_episode, select_tasks, task_camera_keys,
 )
 from groot_compare.common import shared_noise
 
@@ -50,6 +53,24 @@ class FakeEnv:
 
 
 class ClosedLoopTests(unittest.TestCase):
+    def test_task_validation_preserves_both_cameras_and_requires_explicit_ablation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "processor_config.json"
+            def config(keys, frames=None):
+                path.write_text(json.dumps({"processor_kwargs": {"modality_configs": {
+                    "libero_sim": {"video": {"modality_keys": keys,
+                                             "delta_indices": [0] if frames is None else frames}}
+                }}}))
+            config(["image", "wrist_image"])
+            self.assertEqual(task_camera_keys(directory), ("image", "wrist_image"))
+            config(["image"])
+            with self.assertRaisesRegex(ValueError, "allow-camera-ablation"):
+                task_camera_keys(directory)
+            self.assertEqual(task_camera_keys(directory, True), ("image",))
+            config(["image", "wrist_image"], [-1, 0])
+            with self.assertRaisesRegex(ValueError, "frame"):
+                task_camera_keys(directory)
+
     def test_default_task_subset_and_missing_full_suite_calibration(self):
         tasks = [SimpleNamespace(language=p, name=p) for p in ("a", "b", "c", "d")]
         suite = SimpleNamespace(get_num_tasks=lambda: 4, get_task=lambda i: tasks[i])

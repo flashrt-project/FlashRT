@@ -43,3 +43,11 @@ def test_rejects_unmatched_noise(tmp_path):
 def test_rejects_missing_case(tmp_path):
     a=sample('trt');b=sample('flashrt');b['episodes']=[]
     with pytest.raises(ValueError,match='cases'):compare(files(tmp_path,a,b))
+
+
+@pytest.mark.parametrize('field,value', [('camera_keys',['image']), ('camera_ablation',True)])
+def test_rejects_mixed_camera_protocols(tmp_path,field,value):
+    a=sample('trt');b=sample('flashrt')
+    for run in (a,b):run.update(camera_keys=['image','wrist_image'],camera_ablation=False)
+    b[field]=value
+    with pytest.raises(ValueError,match=field):compare(files(tmp_path,a,b))

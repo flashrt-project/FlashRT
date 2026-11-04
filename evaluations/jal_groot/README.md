@@ -2,7 +2,7 @@
 
 This independent evaluation compares FlashRT with the [Jetson AI Lab (JAL) GR00T N1.7 TensorRT recipe](https://www.jetson-ai-lab.com/tutorials/groot_n17_on_thor/) on the same Thor. Measurements were collected on **October 26, 2026**. JAL supplies the deployment baseline; this is not an official FlashRT result or a standardized accuracy certification.
 
-**FlashRT completed the matched inference call in 29.39 ms versus 33.36 ms for JAL TensorRT: 3.96 ms saved, 11.9% lower latency, or 1.135× speedup.** FlashRT also had lower average offline action deviation from the official PyTorch reference on the selected observations. The small simulation pilot did not establish task-success equivalence.
+**FlashRT completed the matched inference call in 29.39 ms versus 33.36 ms for JAL TensorRT: 3.96 ms saved, 11.9% lower latency, or 1.135× speedup.** FlashRT also had lower average offline action deviation from the official PyTorch reference on the selected observations. The original one-camera pilot is retained below; a subsequent two-camera full-suite evaluation is reported separately.
 
 ## Measured results
 
@@ -99,6 +99,22 @@ At the [FlashRT revision tested](https://github.com/flashrt-project/FlashRT/blob
 
 The guide's numerical check uses one bundled observation and a combined-action cosine pass threshold of 0.999. This experiment measures pooled cosine across 178 held-out observations with separate calibration data. Its 0.98992 FlashRT cosine is a different test and aggregation; it neither reproduces nor directly invalidates that single-example check. Neither numerical check establishes robot task success.
 
+## Two-camera LIBERO-10 follow-up
+
+The FlashRT maintainer completed **ten full LIBERO-10 rounds per backend** with the checkpoint's intended **two cameras**, `image` and `wrist_image`. Each round covers all ten tasks and all 50 official initial states per task, with a different seed. The same initial-state set is reused between rounds.
+
+| Backend | Successful / evaluated episodes | Mean task success ± run-to-run SD |
+|---|---:|---:|
+| Official PyTorch | 4,457 / 5,000 | **89.14% ± 1.57 pp** |
+| JAL TensorRT | 4,441 / 5,000 | **88.82% ± 1.10 pp** |
+| FlashRT | 4,463 / 5,000 | **89.26% ± 1.01 pp** |
+
+All ten rounds are included. SD is the sample standard deviation of the ten round success rates, in percentage points. See [per-round counts and runtime details](results/libero-ten-rounds.json); run and verify the full suite with [SIMULATOR.md](SIMULATOR.md#full-suite-run-and-check).
+
+Restoring both views resolved the earlier 0/3 failure in a local camera check: official PyTorch changed from 0/3 with one view to 3/3 with both; JAL and FlashRT also completed those three two-camera cases. The ten-round follow-up uses four denoising steps, eight executed actions per decision, five settling steps and a 720-step budget. Calibration stays frozen during evaluation.
+
+These are follow-up task results, separate from the original one-camera latency and offline-action measurements above. Runs used existing Thor environments (PyTorch 2.12 on one device and 2.9 on the other, TensorRT 10.16); JAL used ten official demo observations for calibration. Exact allocation and differences from the original NVIDIA environment are recorded with the counts.
+
 ## Fixed-state simulation pilot
 
 A separate LIBERO-10 pilot tested task IDs **4, 6 and 9**, one episode per task, using fixed initial state index 0. The official fixed `.pruned_init` state and five zero-action settling steps were followed by a 720-step GR00T budget and execution horizon 8. Initial simulator states, initial processed observations and supplied per-decision noise matched across backends.
@@ -135,4 +151,4 @@ The original JAL run used a locally derived runtime image. An independent public
 
 The completed comparison harness passed 45 CPU checks and ran the offline accuracy evaluation, all three timing rounds and the simulation pilot on Thor. Only complete matched runs enter the published report. An early TensorRT adapter buffer-update failure was fixed before the complete accuracy run and every timing round; incomplete debug output is excluded. ViT and LLM engines were rebuilt after stopping automatically restarted applications to ensure isolated builds.
 
-The evidence supports a modest steady-state latency advantage and lower average offline action deviation for FlashRT on this cohort. A claim of preserved standard task accuracy needs a broader task-success evaluation with the intended camera configuration and a predeclared acceptance margin. Review of the FlashRT adapter, prompt preparation and calibration choices is welcome before extending that claim.
+The evidence supports a modest steady-state latency advantage and lower average offline action deviation for FlashRT on this cohort. The two-camera follow-up above adds full-suite task-success evidence for the tested rollout settings. Review of the FlashRT adapter, prompt preparation and calibration choices is welcome before extending that claim.
