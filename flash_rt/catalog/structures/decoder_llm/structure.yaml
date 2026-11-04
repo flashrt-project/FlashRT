@@ -1,0 +1,36 @@
+structure: decoder_llm
+version: 1
+description: >
+  Whole decoder stack: inputs_embeds -> transformer layers -> final norm
+  -> hidden states. The NVFP4 backend fuses the per-layer chain
+  (norm -> qkv -> qk-norm+RoPE -> FA2 -> o -> residual+norm -> gate/up ->
+  SiLU -> down -> residual) into fp4 GEMMs plus fused kernels with
+  whole-step CUDA graph capture, in the PR-175 tiering (hub artifact
+  first, local native build second, host floor).
+
+reference:
+  module: decoder_llm.reference
+  entrypoint: decoder_llm_ref
+
+boundary:
+  symbolic_dims: [B, S, D]
+  inputs:
+    - {name: inputs_embeds, dims: [B, S, D], dtype: "@binding"}
+  outputs:
+    - {name: hidden_states, dims: [B, S, D], dtype: "@binding"}
+
+# weights are bound in place from the host stack (layers/embed/norm/rope)
+weights: []
+
+variants: {}
+
+calibration: {}
+
+gates:
+  parity:
+    metrics: [cosine, max_abs, p99_abs]
+    data: real_distribution
+  latency:
+    baselines: [torch_compile, unfused_chain]
+    rule: net_positive_including_boundary
+    per_shape: true
