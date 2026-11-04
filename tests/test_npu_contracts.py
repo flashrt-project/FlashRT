@@ -255,8 +255,8 @@ def test_a_named_tier_is_refused_on_the_backends_that_do_not_read_it(arch, tier)
     reworked."""
     from flash_rt.api import load_model
 
-    with pytest.raises(ValueError, match="Ascend NPU backend only"):
-        load_model("unused", hardware=arch, precision=tier)
+    with pytest.raises(ValueError, match="precision=.*is unavailable"):
+        load_model("unused", config="pi0", hardware=arch, precision=tier)
 
 
 def test_auto_leaves_every_other_backend_exactly_as_it_was():
