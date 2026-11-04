@@ -149,9 +149,14 @@ int qk_int8_sv_f8_bf16_nhd_d128(
       stride_bz_k, stride_seq_k, stride_h_k,
       stride_bz_v, stride_h_v, stride_d_v,
       stride_bz_o, stride_seq_o, stride_h_o,
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
       softmax_scale, 0.0f, false, nullptr, nullptr, false, nullptr, 0u, 0u);
+#else
+      softmax_scale);
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 
   return static_cast<int>(cudaGetLastError());
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
 }
 
 namespace {
@@ -491,6 +496,7 @@ int qk_int8_sv_f8_bf16_nhd_d128_strided_lse(
                                   k_batch_stride, v_padded_k, o_batch_stride,
                                   stream, 0.0f, false, nullptr, nullptr,
                                   scale_per_head, lse);
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 }
 
 int qk_int8_sv_f16_bf16_nhd_d128(
@@ -590,6 +596,7 @@ int qk_int8_sv_f16_bf16_nhd_d128(
       stride_bz_o, stride_seq_o, stride_h_o,
       softmax_scale);
 
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
   return static_cast<int>(cudaGetLastError());
 }
 
@@ -684,6 +691,7 @@ int qk_int8_sv_f16_bf16_nhd_d128_strided(
       static_cast<uint32_t>(v_batch_stride), stride_seq_v, stride_h_v,
       static_cast<uint32_t>(o_batch_stride), stride_seq_o, stride_h_o,
       softmax_scale);
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
   return static_cast<int>(cudaGetLastError());
 }
 
@@ -901,7 +909,11 @@ int qk_int8_sv_f8_bf16_gqa_nhd_d256(
       stride_bz_k, stride_seq_k, stride_h_k,
       stride_bz_v, stride_h_v, stride_d_v,
       stride_bz_o, stride_seq_o, stride_h_o,
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
       softmax_scale, 0.0f, false, nullptr, nullptr, false, nullptr, 0u, 0u);
+#else
+      softmax_scale);
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 
   return static_cast<int>(cudaGetLastError());
 }

@@ -101,7 +101,15 @@ def _target_build_rules(target: str) -> str:
             chunks.append(path.read_text(errors="replace"))
     ninja = BUILD_DIR / "build.ninja"
     if ninja.is_file():
-        chunks.append(ninja.read_text(errors="replace"))
+        import re
+        blocks = re.split(r"\n(?=build )", ninja.read_text(errors="replace"))
+        # Inspect this target's edges, not the entire graph: another model's
+        # source must not make an ownership assertion pass accidentally.
+        for block in blocks:
+            line = block.split("\n", 1)[0]
+            if (line.startswith(f"build CMakeFiles/{target}.dir/") or
+                    re.search(r": .*_LIBRARY_LINKER__" + re.escape(target) + r"_", line)):
+                chunks.append(block)
     return "\n".join(chunks)
 
 
@@ -290,3 +298,16 @@ def test_lingbot_sources_follow_model_gate():
     for source in ("fp8_bs_gemm_cutlass_sm89.cu", "conv3d_f16acc_sm89.cu", "fp4_stream_m128_sm89.cu"):
         assert (source in qwen) == (enabled and _cache_bool("FLASHRT_BUILD_QWEN3_VL"))
     assert ("FLASHRT_ENABLE_LINGBOT_VA_SM89" in core) == enabled
+
+
+def test_motus_sage2_implementation_and_binding_have_the_same_owner():
+    _require_build_dir()
+    enabled = _cache_bool("FLASHRT_ENABLE_MOTUS") and _is_arch_sm120()
+    motus = _target_build_rules("motus_aux_sm120_obj")
+    core = _target_build_rules("flash_rt_kernels")
+    assert ("sage2_attn_raw.cu" in motus) == enabled
+    assert ("ENABLE_MOTUS_SAGE2_RAW" in core) == enabled
+
+
+def _is_arch_sm120():
+    return (_cache_value("GPU_ARCH") or "").strip() == "120"

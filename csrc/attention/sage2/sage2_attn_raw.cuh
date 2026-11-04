@@ -18,6 +18,7 @@ int qk_int8_sv_f8_bf16_nhd_d128(
     int num_heads,
     float softmax_scale,
     cudaStream_t stream);
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
 
 // Same contract, but with explicit batch strides in elements. The engine's
 // KV cache is a fixed-capacity [B, total, H, D] buffer whose live window is a
@@ -198,6 +199,7 @@ int sage2_tail_merge_fp8(const void* q8, const void* k8, const void* v16,
                          float sm_scale, int groups, int group_rows, int num_heads,
                          void* out_fp8, float* out_scale, void* out_bf16,
                          cudaStream_t stream, int rs_reduce = 0);
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 
 int qk_int8_sv_f16_bf16_nhd_d128(
     const void* q_int8,

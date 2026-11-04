@@ -15,7 +15,9 @@
  */
 
 #include <cuda_fp16.h>
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
 #include <cuda_fp8.h>
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 #include <cuda_pipeline_primitives.h>
 
 #include "../cp_async.cuh"
@@ -48,11 +50,15 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
                       const uint32_t stride_bz_k, const uint32_t stride_seq_k, const uint32_t stride_h_k,
                       const uint32_t stride_bz_v, const uint32_t stride_h_v, const uint32_t stride_d_v,
                       const uint32_t stride_bz_o, const uint32_t stride_seq_o, const uint32_t stride_h_o,
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
                       float sm_scale, float pad_extra = 0.0f, bool pad_exact = false,
                       int8_t *__restrict__ O_fp8 = nullptr, float *__restrict__ O_fp8_scale = nullptr,
                       bool scale_per_head = false,
                       const int *__restrict__ ring_origin = nullptr, uint32_t ring_R = 0,
                       uint32_t ring_start = 0)
+#else
+                      float sm_scale)
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 {
   // compile time check
   static_assert(DTypeQK == DataType::kInt8 || DTypeQK == DataType::kInt4, "DTypeQK must be int8 or int4");
@@ -131,6 +137,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
     k_scale_idx = batch_id * (num_qo_heads / num_kv_groups) * (num_warp_block_k * 4) + (head_id / num_kv_groups) * (num_warp_block_k * 4) + get_warp_idx_k<num_warps_q, num_warps_k>() * 4 + lane_id % 4;
   }
 
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
   constexpr uint32_t k_scale_advance_offset_g = (K_GRAN == QuantGranularity::kPerBlock) ? 1 : (K_GRAN == QuantGranularity::kPerWarp) ? (CTA_K / WARP_K) : (CTA_K / WARP_K) * 4;
   // scale_per_head: Q_scale and K_scale are [num_heads] static per-head scales
   // (one per head for every query/key block), instead of the granular layout.
@@ -140,6 +147,9 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
     k_scale_idx = head_id / num_kv_groups;
   }
   const uint32_t k_scale_advance_offset = scale_per_head ? 0u : k_scale_advance_offset_g;
+#else
+  constexpr uint32_t k_scale_advance_offset = (K_GRAN == QuantGranularity::kPerBlock) ? 1 : (K_GRAN == QuantGranularity::kPerWarp) ? (CTA_K / WARP_K) : (CTA_K / WARP_K) * 4;
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 
   // initialize o, m, d
 #pragma unroll
@@ -211,6 +221,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
   int8_t *K_lane_base_ptr = K + batch_id * stride_bz_k + (head_id / num_kv_groups) * stride_h_k + (CTA_K / num_warps * warp_id + lane_id / global_to_shared_line_lanes_QK) * stride_seq_k + (lane_id % global_to_shared_line_lanes_QK) * PACK_SIZE_QK;
   //                                                                for fp16: CTA_K / num_warps * warp_id * stride_seq_v + lane_id / global_to_shared_line_lanes_V * stride_seq_v
   int8_t *V_lane_base_ptr = V + batch_id * stride_bz_v + (head_id / num_kv_groups) * stride_h_v + head_dim / num_warps * warp_id * stride_d_v + lane_id / global_to_shared_line_lanes_V * stride_d_v + (lane_id % global_to_shared_line_lanes_V) * PACK_SIZE_V;
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
   // K ring (ring_R > 0): key j of this call is K row
   // (ring_origin[0] + ring_start + j) mod ring_R. The writers mirror rows
   // [0, CTA_K) at [ring_R, ring_R + CTA_K), so a tile that straddles the end is
@@ -230,6 +241,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
       if (ring_k >= ring_R) { ring_k -= ring_R; K_lane_base_ptr -= ring_R * stride_seq_k; }
     }
   };
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
   uint32_t Q_smem_offset_load = smem_Q.get_permuted_offset(warp_id * global_to_shared_copy_lines_per_warp_QK * Q_smem_iters_col + lane_id / global_to_shared_line_lanes_QK, lane_id % global_to_shared_line_lanes_QK);
   uint32_t K_smem_offset_load = smem_K.get_permuted_offset(warp_id * global_to_shared_copy_lines_per_warp_QK * K_smem_iters_col + lane_id / global_to_shared_line_lanes_QK, lane_id % global_to_shared_line_lanes_QK);
   uint32_t V_smem_offset_load = smem_V.get_permuted_offset(warp_id * global_to_shared_copy_lines_per_warp_V * V_smem_iters_col + lane_id / global_to_shared_line_lanes_V, lane_id % global_to_shared_line_lanes_V);
@@ -276,7 +288,9 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
   // load K with predicate
   load_global_to_share<global_to_shared_line_lanes_QK, global_to_shared_copy_lines_per_warp_QK, QK_smem_iters_row, K_smem_iters_col, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_K>(
     &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K, K_load_idx_lane_base, kv_len);
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
   ring_step_k();
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
   cp_async::commit_group();
 
   float q_scale = Q_scale[q_scale_idx];
@@ -359,7 +373,9 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
     // load K without predicate
     load_global_to_share<global_to_shared_line_lanes_QK, global_to_shared_copy_lines_per_warp_QK, QK_smem_iters_row, K_smem_iters_col, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_K>(
       &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K);
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
     ring_step_k();
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
     cp_async::commit_group();
 
     dequant_scale = q_scale * K_scale[k_scale_idx + iter * k_scale_advance_offset];
@@ -462,7 +478,9 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
     // load K with predicate
     load_global_to_share<global_to_shared_line_lanes_QK, global_to_shared_copy_lines_per_warp_QK, QK_smem_iters_row, K_smem_iters_col, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_K>(
       &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K, K_load_idx_lane_base, kv_len);
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
     ring_step_k();
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
     cp_async::commit_group();
 
     dequant_scale = q_scale * K_scale[k_scale_idx + (num_iterations - 1) * k_scale_advance_offset];
@@ -535,8 +553,10 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
       apply_causal_mask<num_tiles_q, num_tiles_k>(Q_idx_lane_base, K_idx_lane_base, RS_f32);
     }
     apply_out_of_bound_mask<num_tiles_q, num_tiles_k>(K_idx_lane_base, RS_f32, kv_len);
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
     // tile-local index of the last key (the pad key when pad_extra > 0)
     const uint32_t pad_col = (kv_len - 1) - (K_idx_lane_base - 2 * (lane_id % 4));
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
     K_idx_lane_base += CTA_K;
 
     if constexpr (std::is_same<DTypeSVAccum, float>::value)
@@ -553,6 +573,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
       accumulate_d<num_tiles_q, num_tiles_k, ComputeUnit::kCudaCore>(RS_f32, d);
     }
 
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
     // Collapsed key multiplicity. When the last key stands for pad_extra + 1
     // identical keys (equal K and V rows), its probability and value enter
     // pad_extra more times: P (after the max shift, and its e4m3 rounding for
@@ -593,12 +614,14 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
       }
     }
 
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
     uint32_t RS_f8[num_tiles_q][num_tiles_k / 2][4];
     RS_32_to_8<num_tiles_q, num_tiles_k>(RS_f32, RS_f8);
 
     if constexpr (DenominatorAccumUnit == ComputeUnit::kTensorCore)
     {
       accumulate_d_f8<num_tiles_q, num_tiles_k>(RS_f8, d);
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
     }
 
     if (has_pad)
@@ -635,6 +658,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
             RO[fq][fv][k] += pad_w[fq][(k >> 1) & 1] * v8;
         }
       }
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
     }
 
     // ensure V is ready
@@ -761,6 +785,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
   uint32_t offset_O = smem_O.get_permuted_offset(get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q + lane_id / global_to_shared_line_lanes_O, lane_id % global_to_shared_line_lanes_O);
   uint32_t O_load_idx_lane_base = bx * CTA_Q + CTA_Q / num_warps * warp_id + lane_id / global_to_shared_line_lanes_O;
 
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
   bool fp8_emitted = false;
   if constexpr (O_SMEM_STRIDE == 128 && global_to_shared_line_lanes_O == 8)
   if (O_fp8 != nullptr)
@@ -825,6 +850,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
     }
   }
   if (!fp8_emitted)
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 #pragma unroll
   for (uint32_t i = 0; i < O_smem_iters_col; i++)
   {
@@ -844,8 +870,16 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
     O_load_idx_lane_base += global_to_shared_copy_lines_per_warp_O;
   }
 
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
   if constexpr (return_lse && num_tiles_q == 2)
+#else
+  if constexpr (return_lse)
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
   {
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
+#else
+    // ! this only works for num_tiles_q = 2
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
     uint32_t lse_idx = bx * CTA_Q + lane_id / 4 + 8 * (lane_id % 4) + WARP_Q * get_warp_idx_q<num_warps_q, num_warps_k>();
     float *lse_lane_ptr = Lse + batch_id * (qo_len * num_qo_heads) + head_id * qo_len + lse_idx;
     uint32_t fq = (lane_id % 4) / 2;
@@ -856,6 +890,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
       lse_lane_ptr[0] = (math::ptx_log2(d[fq][k]) + m[fq][k] - S_FP8_OFFSET);
     }
   }
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
   else if constexpr (return_lse && num_tiles_q == 1)
   {
     // 16-row warps: each quad holds rows lane/4 and lane/4 + 8; two of its
@@ -871,4 +906,5 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
       }
     }
   }
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 }

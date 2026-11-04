@@ -1100,6 +1100,7 @@ endif()
 # runtime kernel libraries.
 if(FLASHRT_ENABLE_MOTUS AND GPU_ARCH STREQUAL "120")
   add_library(motus_aux_sm120_obj OBJECT
+    csrc/attention/sage2/sage2_attn_raw.cu
     csrc/conv/fp8_conv2d_3x3_sm120_v1.cu
     csrc/conv/fp8_conv3d_sm120_v17.cu
     csrc/conv/fp8_conv3d_sm120_v18.cu
