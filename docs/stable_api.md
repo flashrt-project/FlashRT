@@ -251,6 +251,14 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   `record_infer_graph`, `infer`). Requires
   `-DFLASHRT_ENABLE_MOLMOACT2=ON`. See `docs/molmoact2_usage.md`.
 
+### Pi0.5 Thor BF16
+
+Jetson AGX Thor (SM110) has an opt-in BF16/FP32 mode for the OpenPI Pi0.5
+LIBERO PyTorch checkpoint. The mode accepts one `224 × 224` RGB `uint8` image,
+a text-only prompt, and returns a `10 × 7` action chunk. Build with
+`-DFLASHRT_ENABLE_PI05_THOR_BF16=ON` and pass `precision="bf16"`, `num_views=1`,
+and `use_fp8=False`. See the [single-view Thor guide](pi05_thor_bf16.md).
+
 ### Pi0.5 optimized Thor decoder
 
 For the optimized torch/Thor full NVFP4 path, build with
