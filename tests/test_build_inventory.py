@@ -30,15 +30,15 @@ BUILD_DIR = Path(os.environ.get("FLASHRT_BUILD_DIR", REPO_ROOT / "build"))
 # build-mode aware: it reads FLASHRT_SLIM_BUILD from the configured build dir's
 # CMakeCache.txt and asserts the matching surface.
 #
-#   compat default (FLASHRT_SLIM_BUILD=OFF): 57 direct TUs, unchanged.
-#   slim SM89   (FLASHRT_SLIM_BUILD=ON):     34 direct TUs (-22):
+#   compat default (FLASHRT_SLIM_BUILD=OFF): 65 direct TUs, unchanged.
+#   slim SM89   (FLASHRT_SLIM_BUILD=ON):     41 direct TUs (-24):
 #       -5 Motus VAE FP8 (Unit 1), -10 Qwen3.6/linear-attn (Unit 2),
-#       -7 SM120/NVFP4-named (Unit 3).
+#       -8 SM120/NVFP4-named (Unit 3), -1 elsewhere.
 # The direct-source breakdowns below are SM89-specific; other arches add/remove
 # arch-owned sources (for example SM120 adds nvfp4_sf_reshape_sm120.cu), so the
 # direct-count/category asserts are limited to SM89.
-COMPAT_KERNELS_TU = 57
-SLIM_SM89_KERNELS_TU = 34
+COMPAT_KERNELS_TU = 65
+SLIM_SM89_KERNELS_TU = 41
 
 # Per-group breakdown of flash_rt_kernels (mirrors AGENTS.md "Current Build
 # Layout"). categorize() drops empty groups, so slim omits sm120_nvfp4_named.
@@ -50,7 +50,7 @@ COMPAT_KERNELS_CATEGORIES = {
     "dit_video": 2,
     "qwen3_family": 2,
     "audio_codebook": 1,
-    "other": 10,
+    "other": 18,
 }
 SLIM_SM89_KERNELS_CATEGORIES = {
     "generic_shared": 15,
@@ -59,7 +59,7 @@ SLIM_SM89_KERNELS_CATEGORIES = {
     "dit_video": 2,
     "qwen3_family": 2,
     "audio_codebook": 1,
-    "other": 10,
+    "other": 17,
 }
 
 
@@ -187,7 +187,7 @@ def test_inventory_script_imports_and_collects():
 def test_kernels_baseline_tu_count():
     """flash_rt_kernels direct-source surface matches the recorded baseline.
 
-    Mode-aware: compat default expects 55, slim SM89 expects 33. A change means
+    Mode-aware: compat default expects 65, slim SM89 expects 41. A change means
     a unit added/removed a TU from that mode's build; if intended, update the
     matching constant in the same commit.
     """

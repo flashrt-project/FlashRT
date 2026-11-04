@@ -1214,6 +1214,11 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("x"), py::arg("bias"), py::arg("weight"), py::arg("out"),
        py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f, py::arg("stream") = 0);
 
+    
+
+    
+
+
     m.def("rms_norm_inplace", [](uintptr_t weight, uintptr_t x,
                                   int seq_len, int dim, float eps, uintptr_t stream) {
         rms_norm_inplace(typed_ptr<__nv_bfloat16>(weight),
@@ -1723,6 +1728,10 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                    seq_len, dim, eps, to_stream(stream));
     }, py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("out"),
        py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+
+    
+
+    
 
     m.def("ada_rms_norm_style", [](uintptr_t x, uintptr_t weight, uintptr_t style,
                                     uintptr_t out, uintptr_t gate_out,
@@ -3775,6 +3784,23 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("x"), py::arg("b"), py::arg("S"), py::arg("D"),
        py::arg("stream") = 0);
 
+    // ── Wan2.2 / LingBot-VA AdaLN (arch-neutral) ──
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
     m.def("cast_fp16_to_bf16",
           [](uintptr_t in, uintptr_t out, int n, uintptr_t stream) {
         extern void cast_fp16_to_bf16(
@@ -3921,6 +3947,18 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("nvfp4_packed"), py::arg("nvfp4_sf_swizzled"),
         py::arg("scratch_global_amax"), py::arg("out_global_scale"),
         py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+
+    // Per-128 scale-factor variant (see the header). Same payload and SF
+    // layouts; only the e2m1 codebook scale granularity changes, so the
+    // delivered GEMM reconstructs it without any kernel change.
+    
+
+    
+
+    // Pure permutation of the NVFP4 payload into the GEMM's tile-major image
+    // (see csrc/quantize/nvfp4_pack_tile_major.cuh). Values, SF and global
+    // scale are unchanged; only the packed-weight address pattern improves.
+    
 
     // Single-shot BF16 weight -> NVFP4 (swizzled SF + per-tensor global).
     // For weights that arrive as plain BF16 (e.g. the 30% of Qwen3.6
@@ -4364,6 +4402,10 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("input"), py::arg("output_fp8"),
         py::arg("output_scale"),
         py::arg("M"), py::arg("K"), py::arg("stream") = 0);
+
+    
+
+    
 
     // Fused RMSNorm / residual-add+RMSNorm / SwiGLU -> block-128 FP8 quant.
     // Each writes the FP8 activation + per-128-K-block scale consumed directly
@@ -5139,6 +5181,14 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("B"), py::arg("C"), py::arg("T"), py::arg("H"), py::arg("W"),
         py::arg("eps") = 1e-6f, py::arg("stream") = 0);
 
+    
+
+    
+
+    
+
+    
+
     m.def("bf16_pack_t1_cache3_nchw_channels_last",
         [](uintptr_t prev_cache_bf16, uintptr_t cur_bf16, uintptr_t out_bf16,
            int C, int H, int W, uintptr_t stream) {
@@ -5223,6 +5273,35 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("L_v"), py::arg("N"), py::arg("D_h"),
         py::arg("seq_len"), py::arg("eps") = 1e-6f,
         py::arg("stream") = 0);
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
+    
+
 
     m.def("qkv_split_norm2_bf16",
         [](uintptr_t packed_a, uintptr_t norm_a_q_w, uintptr_t norm_a_k_w,
