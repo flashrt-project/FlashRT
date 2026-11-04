@@ -829,10 +829,21 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         # MPS uses torch operators directly and needs no CUDA/HIP extension,
         # calibration, autotuning, or CUDA graph capture.
         return VLAModel(pipe_cls(checkpoint, **kwargs), framework)
+    if (config, framework, arch, precision) == ("pi05", "torch", "thor", "bf16"):
+        if (use_fp8 or use_fp4 or use_fp16 or use_fa4 or use_fp4_decoder
+                or use_fp4_encoder_attn or use_fp4_siglip_ffn):
+            raise ValueError("Pi0.5 Thor BF16 requires use_fp8=False and no FP4/FP16/FA4 options")
+        if (num_views != 1 or num_steps not in (None, 10) or action_horizon not in (None, 10)
+                or action_dim not in (None, 7) or state_prompt_mode != "exact"
+                or state_prompt_fixed_max_len is not None or cache_frames not in (None, 1)):
+            raise ValueError("Pi0.5 Thor BF16 requires one view, text-only input, and 10x7 LIBERO actions")
+        from flash_rt.frontends.torch.pi05_thor_bf16 import Pi05TorchFrontendThorBf16
+
+        return VLAModel(Pi05TorchFrontendThorBf16(checkpoint), framework)
     if precision != "auto" and arch != "npu":
         raise ValueError(
-            f"precision={precision!r} is implemented for the Ascend NPU "
-            f"backend only; on arch {arch!r} the tier is selected by "
+            f"precision={precision!r} is unavailable for config={config!r}, "
+            f"framework={framework!r}, arch={arch!r}. Other GPU tiers are selected by "
             "use_fp8 / use_fp4 / use_fp16. Pass precision='auto'.")
     if arch == "npu" and precision == "fp8":
         raise ValueError(

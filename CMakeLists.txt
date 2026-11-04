@@ -1,4 +1,12 @@
 cmake_minimum_required(VERSION 3.24)
+option(FLASHRT_BUILD_APPLE_NATIVE "Build only the native Apple Metal pipeline" OFF)
+if(FLASHRT_BUILD_APPLE_NATIVE)
+  message(STATUS "FLASHRT_BUILD_APPLE_NATIVE=ON: native Metal targets only (CUDA disabled)")
+  project(flashrt_apple_native LANGUAGES CXX OBJCXX)
+  include(CTest)
+  add_subdirectory(cpp/apple)
+  return()
+endif()
 project(flash_rt CUDA CXX)
 
 set(CMAKE_CUDA_STANDARD 17)
@@ -2898,4 +2906,34 @@ if(FLASHRT_ENABLE_LINGBOT_VA_SM89)
   if(TARGET flash_rt_qwen3_vl_kernels)
     target_compile_definitions(flash_rt_qwen3_vl_kernels PRIVATE FLASHRT_ENABLE_LINGBOT_VA_SM89=1)
   endif()
+endif()
+
+option(FLASHRT_ENABLE_PI05_THOR_BF16 "Build the opt-in Pi0.5 SM110 BF16 frontend" OFF)
+if(FLASHRT_ENABLE_PI05_THOR_BF16)
+  if(NOT GPU_ARCH STREQUAL "110")
+    message(FATAL_ERROR "FLASHRT_ENABLE_PI05_THOR_BF16 requires GPU_ARCH=110")
+  endif()
+  find_path(PI05_CUDNN_INCLUDE_DIR cudnn.h HINTS ${CUDAToolkit_INCLUDE_DIRS} REQUIRED)
+  find_library(PI05_CUDNN_LIBRARY cudnn HINTS ${CUDAToolkit_LIBRARY_DIR} REQUIRED)
+
+  pybind11_add_module(pi05_bf16_native_ext csrc/kernels/pi05/thor/bf16_native.cu)
+  pybind11_add_module(pi05_bf16_fa2_ext csrc/kernels/pi05/thor/bf16_vision.cu)
+  foreach(target IN ITEMS pi05_bf16_native_ext pi05_bf16_fa2_ext)
+    set_target_properties(${target} PROPERTIES CUDA_STANDARD 17 CUDA_ARCHITECTURES 110-real
+      LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+    target_link_libraries(${target} PRIVATE CUDA::cudart)
+    target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+  endforeach()
+  target_include_directories(pi05_bf16_native_ext PRIVATE ${PI05_CUDNN_INCLUDE_DIR})
+  target_link_libraries(pi05_bf16_native_ext PRIVATE CUDA::cublas CUDA::cublasLt ${PI05_CUDNN_LIBRARY})
+  target_compile_options(pi05_bf16_native_ext PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+
+  set(PI05_BF16_FA2_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/flash_attn_2_src)
+  target_include_directories(pi05_bf16_fa2_ext PRIVATE ${PI05_BF16_FA2_ROOT}
+    ${PI05_BF16_FA2_ROOT}/flash_attn ${PI05_BF16_FA2_ROOT}/cutlass/include)
+  target_compile_definitions(pi05_bf16_fa2_ext PRIVATE UNFUSE_FMA FLASH_NAMESPACE=pi05_native_vision_fa2)
+  target_compile_options(pi05_bf16_fa2_ext PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
+    --expt-relaxed-constexpr --expt-extended-lambda
+    -U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__
+    -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__>)
 endif()

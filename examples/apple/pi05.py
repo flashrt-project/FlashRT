@@ -14,6 +14,16 @@ import time
 import numpy as np
 
 
+def _cpu_reference_inputs(frontend, observation):
+    """Prepare the same two-view observation without relying on MPS staging."""
+    import torch
+
+    pixels = np.stack((observation["image"], observation["wrist_image"]))
+    images = torch.from_numpy(pixels.astype(np.float32) / 127.5 - 1.0).to(frontend.dtype)
+    prompt = frontend._prompt_cpu[:frontend._prompt_len].clone()
+    return images, prompt
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -27,6 +37,7 @@ def main():
     parser.add_argument("--samples", type=int, default=8)
     parser.add_argument("--seed", type=int, default=20261019)
     parser.add_argument("--cpu-reference", action="store_true", help="Compare one sample to the shared CPU BF16 pipeline using FP32 GEMM accumulation")
+    parser.add_argument("--native-pipeline", action="store_true", help="Fixed-shape BF16 ICB for patch, vision, prefix and decode with CPU input/output")
     args = parser.parse_args()
     if args.steps < 1 or args.warmup < 0 or args.iters < 1 or args.samples < 1:
         parser.error("steps, iters and samples must be positive; warmup must be nonnegative")
@@ -47,6 +58,7 @@ def main():
     torch.mps.synchronize()
     load_seconds = time.perf_counter() - started
     frontend = model.pipeline
+    native_setup_seconds = 0.0
     print(f"Loaded in {load_seconds:.2f}s; MPS tensors {torch.mps.current_allocated_memory() / 2**30:.2f} GiB", flush=True)
     with np.load(args.input, allow_pickle=False) as data:
         observations = [dict(image=data[f"img_{index}"].copy(),
@@ -59,12 +71,20 @@ def main():
     noise = rng.standard_normal((frontend.chunk_size, 32)).astype(np.float32)
 
     def set_prompt(observation):
+        nonlocal native_setup_seconds
         state = observation["state"]
         stats = frontend.norm_stats["state"]
         q01 = np.asarray(stats["q01"], dtype=np.float32)[:state.size]
         q99 = np.asarray(stats["q99"], dtype=np.float32)[:state.size]
         normalized = 2 * (state - q01) / (q99 - q01 + 1e-6) - 1
         model.set_prompt(args.prompt, state=normalized)
+        if args.native_pipeline:
+            plan = frontend.pipeline._native_pipeline
+            if plan is None or plan.prompt_len != frontend._prompt_len:
+                frontend.pipeline.disable_native_pipeline()
+                started = time.perf_counter()
+                frontend.pipeline.enable_native_pipeline(frontend._prompt_len)
+                native_setup_seconds += time.perf_counter() - started
 
     def run(observation):
         result = model.infer(observation, noise=noise, debug=True)
@@ -103,7 +123,8 @@ def main():
         raise AssertionError("Different observations produced identical fixed-noise outputs")
     report = dict(
         timestamp_utc=datetime.now(timezone.utc).isoformat(),
-        backend="apple_mps", dtype="bfloat16", python=platform.python_version(),
+        backend="apple_mps_native_pipeline" if args.native_pipeline else "apple_mps",
+        dtype="bfloat16", python=platform.python_version(),
         torch=torch.__version__, macos=platform.mac_ver()[0],
         chip=subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"], text=True).strip(),
         memory_bytes=int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True)),
@@ -111,6 +132,8 @@ def main():
         prompt=args.prompt, num_views=2, num_steps=args.steps, action_horizon=frontend.chunk_size,
         action_dim=7, shape=list(np.stack(actions).shape), seed=args.seed,
         prompt_lengths=prompt_lengths, load_seconds=load_seconds,
+        native_pipeline_setup_seconds=native_setup_seconds,
+        native_pipeline=args.native_pipeline,
         first_inference_ms=first["latency_ms"], warmup=args.warmup, iterations=args.iters,
         latency_ms=dict(p50=float(np.median(latency)), p95=float(np.percentile(latency, 95)),
                         mean=float(np.mean(latency)), samples=latency),
@@ -147,9 +170,9 @@ def main():
 
         set_prompt(observations[0])
         mps_raw = run(observations[0])["raw_actions"].copy()
-        images = frontend._image_buf.cpu()
-        prompt = frontend._prompt_buf[:frontend._prompt_len].cpu()
+        images, prompt = _cpu_reference_inputs(frontend, observations[0])
         print("Comparing one sample against the shared CPU BF16 pipeline...", flush=True)
+        frontend.pipeline.disable_native_pipeline()
         started = time.perf_counter()
         # Keep one copy of model weights: move them to CPU in place after all
         # GPU measurements. Both frontend and pipeline share this dictionary.
