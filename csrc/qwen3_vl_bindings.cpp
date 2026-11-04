@@ -50,7 +50,17 @@
 
 #ifdef ENABLE_SM89_BLOCK_FP8_GEMM
 #include "gemm/fp8_block128_gemm_mma_sm89.cuh"
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
+#include "gemm/fp8_bs_gemm_cutlass_sm89.cuh"
+#include "gemm/fp4_bs_gemm_sm89.cuh"
+#include "gemm/fp4_bs_gemm_splitk_sm89.cuh"
+#include "gemm/fp4_stream_m16_sm89.cuh"
+#include "gemm/fp4_stream_m128_sm89.cuh"
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 #include "gemm/fp8_gemv_m1_sm89.cuh"
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
+#include "gemm/conv3d_f16acc_sm89.cuh"
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 #include "quantize/fp8_per_token_block_quant.cuh"
 #endif
 
@@ -306,7 +316,483 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
         py::arg("act_block_scale"), py::arg("w_block_scale"),
         py::arg("stream") = 0);
 
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
+    // Block-128-scaled FP8 GEMM on the CUTLASS 2.x SM89 pipeline. Same
+    // operands, scales and output as fp8_block128_gemm_blockscaled_sm89_bf16out.
+    m.def("fp8_bs_gemm_cutlass_sm89",
+        [](uintptr_t A, uintptr_t B, uintptr_t D,
+           int M, int N, int K,
+           uintptr_t act_scale, uintptr_t w_scale, uintptr_t stream) {
+            int rc = flash_rt::gemm::bs_cutlass_sm89::fp8_bs_gemm_cutlass_sm89(
+                to_ptr(A), to_ptr(B), to_ptr(D), M, N, K,
+                reinterpret_cast<const float*>(act_scale),
+                reinterpret_cast<const float*>(w_scale), to_stream(stream));
+            if (rc != 0)
+                throw std::runtime_error("fp8_bs_gemm_cutlass_sm89 launch failed");
+        },
+        py::arg("A"), py::arg("B"), py::arg("D"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("act_block_scale"), py::arg("w_block_scale"),
+        py::arg("stream") = 0);
+
+    // FP16 block-sum variant: B quantized to |w| <= 1 per 128x128 tile.
+    m.def("fp8_bs_gemm_cutlass_f16blk_sm89",
+        [](uintptr_t A, uintptr_t B, uintptr_t D,
+           int M, int N, int K,
+           uintptr_t act_scale, uintptr_t w_scale, uintptr_t stream) {
+            int rc = flash_rt::gemm::bs_cutlass_sm89::fp8_bs_gemm_cutlass_f16blk_sm89(
+                to_ptr(A), to_ptr(B), to_ptr(D), M, N, K,
+                reinterpret_cast<const float*>(act_scale),
+                reinterpret_cast<const float*>(w_scale), to_stream(stream));
+            if (rc != 0)
+                throw std::runtime_error("fp8_bs_gemm_cutlass_f16blk_sm89 launch failed");
+        },
+        py::arg("A"), py::arg("B"), py::arg("D"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("act_block_scale"), py::arg("w_block_scale"),
+        py::arg("stream") = 0);
+
+    // Same contract on a 64-deep K tile (fold every two K iterations).
+    m.def("fp8_bs_gemm_cutlass_f16blk_k64_sm89",
+        [](uintptr_t A, uintptr_t B, uintptr_t D,
+           int M, int N, int K,
+           uintptr_t act_scale, uintptr_t w_scale, uintptr_t stream) {
+            int rc = flash_rt::gemm::bs_cutlass_sm89::fp8_bs_gemm_cutlass_f16blk_k64_sm89(
+                to_ptr(A), to_ptr(B), to_ptr(D), M, N, K,
+                reinterpret_cast<const float*>(act_scale),
+                reinterpret_cast<const float*>(w_scale), to_stream(stream));
+            if (rc != 0)
+                throw std::runtime_error("fp8_bs_gemm_cutlass_f16blk_k64_sm89 launch failed");
+        },
+        py::arg("A"), py::arg("B"), py::arg("D"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("act_block_scale"), py::arg("w_block_scale"),
+        py::arg("stream") = 0);
+
+    // Output projection with the (gated) residual update fused into the epilogue.
+    m.def("fp8_bs_gemm_cutlass_f16blk_k64_residual_sm89",
+        [](uintptr_t A, uintptr_t B, int M, int N, int K, uintptr_t act_scale,
+           uintptr_t w_scale, uintptr_t residual, uintptr_t bias, uintptr_t ss_row,
+           uintptr_t tp, int tp_bcast, uintptr_t stream) {
+            int rc = flash_rt::gemm::bs_cutlass_sm89::fp8_bs_gemm_cutlass_f16blk_k64_residual_sm89(
+                to_ptr(A), to_ptr(B), M, N, K, reinterpret_cast<const float*>(act_scale),
+                reinterpret_cast<const float*>(w_scale), to_ptr(residual), to_ptr(bias),
+                reinterpret_cast<const float*>(ss_row), reinterpret_cast<const float*>(tp),
+                tp_bcast, to_stream(stream));
+            if (rc != 0)
+                throw std::runtime_error("fp8_bs_gemm_cutlass_f16blk_k64_residual_sm89 failed (rc=" +
+                                         std::to_string(rc) + ")");
+        },
+        py::arg("A"), py::arg("B"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("act_block_scale"), py::arg("w_block_scale"), py::arg("residual"),
+        py::arg("bias") = 0, py::arg("ss_row") = 0, py::arg("tp") = 0,
+        py::arg("tp_bcast") = 0, py::arg("stream") = 0);
+
+    // FFN up projection with bias + gelu-tanh + FP8 block-128 quantiser fused.
+    m.def("fp8_bs_gemm_cutlass_f16blk_k64_gelu_fp8_sm89",
+        [](uintptr_t A, uintptr_t B, uintptr_t bias, uintptr_t out, uintptr_t out_scale,
+           int M, int N, int K, uintptr_t act_scale, uintptr_t w_scale, uintptr_t stream) {
+            int rc = flash_rt::gemm::bs_cutlass_sm89::fp8_bs_gemm_cutlass_f16blk_k64_gelu_fp8_sm89(
+                to_ptr(A), to_ptr(B), to_ptr(bias), to_ptr(out),
+                reinterpret_cast<float*>(out_scale), M, N, K,
+                reinterpret_cast<const float*>(act_scale),
+                reinterpret_cast<const float*>(w_scale), to_stream(stream));
+            if (rc != 0)
+                throw std::runtime_error("fp8_bs_gemm_cutlass_f16blk_k64_gelu_fp8_sm89 failed (rc=" +
+                                         std::to_string(rc) + ")");
+        },
+        py::arg("A"), py::arg("B"), py::arg("bias"), py::arg("out"), py::arg("out_scale"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("act_block_scale"), py::arg("w_block_scale"),
+        py::arg("stream") = 0);
+
+    // Stage-depth variants of the block-scaled CUTLASS kernel (2 and 4 stages).
+    m.def("fp8_bs_gemm_cutlass_sm89_s2",
+        [](uintptr_t A, uintptr_t B, uintptr_t D,
+           int M, int N, int K,
+           uintptr_t act_scale, uintptr_t w_scale, uintptr_t stream) {
+            int rc = flash_rt::gemm::bs_cutlass_sm89::fp8_bs_gemm_cutlass_sm89_s2(
+                to_ptr(A), to_ptr(B), to_ptr(D), M, N, K,
+                reinterpret_cast<const float*>(act_scale),
+                reinterpret_cast<const float*>(w_scale), to_stream(stream));
+            if (rc != 0)
+                throw std::runtime_error("fp8_bs_gemm_cutlass_sm89_s2 launch failed");
+        },
+        py::arg("A"), py::arg("B"), py::arg("D"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("act_block_scale"), py::arg("w_block_scale"),
+        py::arg("stream") = 0);
+
+    m.def("fp8_bs_gemm_cutlass_sm89_s4",
+        [](uintptr_t A, uintptr_t B, uintptr_t D,
+           int M, int N, int K,
+           uintptr_t act_scale, uintptr_t w_scale, uintptr_t stream) {
+            int rc = flash_rt::gemm::bs_cutlass_sm89::fp8_bs_gemm_cutlass_sm89_s4(
+                to_ptr(A), to_ptr(B), to_ptr(D), M, N, K,
+                reinterpret_cast<const float*>(act_scale),
+                reinterpret_cast<const float*>(w_scale), to_stream(stream));
+            if (rc != 0)
+                throw std::runtime_error("fp8_bs_gemm_cutlass_sm89_s4 launch failed");
+        },
+        py::arg("A"), py::arg("B"), py::arg("D"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("act_block_scale"), py::arg("w_block_scale"),
+        py::arg("stream") = 0);
+
+    // Same GEMM with the weight operand stored NVFP4 instead of FP8 e4m3.
+    // Aimed at narrow-M sites, where the tensor core is idle and the pass is
+    // pure weight bandwidth, so a 1.83x cut in weight bytes is the whole win.
+    // The weight was NVFP4-quantized *from* the FP8 block-128 weight by
+    // fp8_block128_to_nvfp4_swizzled_bf16, so `w_block_scale` and its fold are
+    // identical to the FP8 sibling's.
+    //   Bq     : [N, K/2]   packed e2m1, low nibble = even k
+    //   Bsf    : UE4M3 scale factors, Sm1xxBlockScaledConfig<16> order
+    //   gscale : [1]        fp32 per-tensor global scale
+    m.def("fp4_bs_gemm_blockscaled_sm89_bf16out",
+        [](uintptr_t A, uintptr_t Bq, uintptr_t Bsf, uintptr_t gscale,
+           uintptr_t D, int M, int N, int K,
+           uintptr_t act_scale, uintptr_t w_scale,
+           uintptr_t stream) {
+            int rc = flash_rt::gemm::block128_sm89::fp4_bs_gemm_sm89_x64(
+                to_ptr(A), to_ptr(Bq), to_ptr(Bsf),
+                reinterpret_cast<const float*>(gscale),
+                reinterpret_cast<const float*>(act_scale),
+                reinterpret_cast<const float*>(w_scale),
+                to_ptr(D), M, N, K, to_stream(stream));
+            if (rc != 0)
+                throw std::runtime_error(
+                    "fp4_bs_gemm_blockscaled_sm89_bf16out launch failed");
+        },
+        py::arg("A"), py::arg("Bq"), py::arg("Bsf"), py::arg("gscale"),
+        py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("act_block_scale"), py::arg("w_block_scale"),
+        py::arg("stream") = 0);
+
+    // Tile variants of the NVFP4-weight GEMM, for tuning at production shapes.
+    m.def("fp4_bs_gemm_blockscaled_sm89_bf16out_tile",
+        [](uintptr_t A, uintptr_t Bq, uintptr_t Bsf, uintptr_t gscale,
+           uintptr_t D, int M, int N, int K,
+           uintptr_t act_scale, uintptr_t w_scale, int tile, uintptr_t stream) {
+            using namespace flash_rt::gemm::block128_sm89;
+            const void* a_p = to_ptr(A);
+            const void* bq_p = to_ptr(Bq);
+            const void* sf_p = to_ptr(Bsf);
+            const float* gs_p = reinterpret_cast<const float*>(gscale);
+            const float* as_p = reinterpret_cast<const float*>(act_scale);
+            const float* ws_p = reinterpret_cast<const float*>(w_scale);
+            void* d_p = to_ptr(D);
+            cudaStream_t st = to_stream(stream);
+            int rc = 0;
+            switch (tile) {
+                case 0: rc = fp4_bs_gemm_sm89_x64(a_p, bq_p, sf_p, gs_p, as_p,
+                        ws_p, d_p, M, N, K, st); break;
+                case 1: rc = fp4_bs_gemm_sm89_x64_s1(a_p, bq_p, sf_p, gs_p, as_p,
+                        ws_p, d_p, M, N, K, st); break;
+                case 2: rc = fp4_bs_gemm_sm89_x128(a_p, bq_p, sf_p, gs_p, as_p,
+                        ws_p, d_p, M, N, K, st); break;
+                case 3: rc = fp4_bs_gemm_sm89_x32(a_p, bq_p, sf_p, gs_p, as_p,
+                        ws_p, d_p, M, N, K, st); break;
+                case 4: rc = fp4_bs_gemm_sm89_x64_s4(a_p, bq_p, sf_p, gs_p, as_p,
+                        ws_p, d_p, M, N, K, st); break;
+                case 5: rc = fp4_bs_gemm_sm89_x64_s3(a_p, bq_p, sf_p, gs_p, as_p,
+                        ws_p, d_p, M, N, K, st); break;
+                case 6: rc = fp4_bs_gemm_sm89_m64(a_p, bq_p, sf_p, gs_p, as_p,
+                        ws_p, d_p, M, N, K, st); break;
+                case 7: rc = fp4_bs_gemm_sm89_m64n128(a_p, bq_p, sf_p, gs_p, as_p,
+                        ws_p, d_p, M, N, K, st); break;
+                default: throw std::runtime_error("unknown fp4 tile variant");
+            }
+            if (rc != 0)
+                throw std::runtime_error("fp4_bs_gemm tile variant launch failed");
+        },
+        py::arg("A"), py::arg("Bq"), py::arg("Bsf"), py::arg("gscale"),
+        py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("act_block_scale"), py::arg("w_block_scale"),
+        py::arg("tile"), py::arg("stream") = 0);
+
+    // Split-K variant of the NVFP4-weight GEMM: the k-loop is split across
+    // blockIdx.z, each split writes an fp32 partial to Dpart, and a reduction
+    // kernel sums them and rounds once to bf16. Adds CTAs at the narrow-N
+    // shapes (N=3072 -> 48 CTAs unsplit), measured at M=16 vs the FP8 kernel:
+    // 1.15x at the three N=K=3072 shapes (splits=2) and 1.08-1.10x at ffn
+    // down (K=14336, splits=8).
+    // `splits` must divide ceil(K/128); Dpart is [splits, M, N] fp32 caller-owned.
+    m.def("fp4_bs_gemm_splitk_blockscaled_sm89_bf16out",
+        [](uintptr_t A, uintptr_t Bq, uintptr_t Bsf, uintptr_t gscale,
+           uintptr_t D, uintptr_t Dpart, int M, int N, int K,
+           uintptr_t act_scale, uintptr_t w_scale, int splits,
+           uintptr_t stream) {
+            int rc = flash_rt::gemm::block128_sm89::fp4_bs_gemm_splitk_sm89(
+                to_ptr(A), to_ptr(Bq), to_ptr(Bsf),
+                reinterpret_cast<const float*>(gscale),
+                reinterpret_cast<const float*>(act_scale),
+                reinterpret_cast<const float*>(w_scale),
+                to_ptr(D), to_ptr(Dpart), M, N, K, splits, to_stream(stream));
+            if (rc != 0)
+                throw std::runtime_error(
+                    "fp4_bs_gemm_splitk_blockscaled_sm89_bf16out launch failed");
+        },
+        py::arg("A"), py::arg("Bq"), py::arg("Bsf"), py::arg("gscale"),
+        py::arg("D"), py::arg("Dpart"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("act_block_scale"), py::arg("w_block_scale"),
+        py::arg("splits"), py::arg("stream") = 0);
+
+    // Tile-major packed-weight variants. Bq is the [N/64, K/128, 64, 64] image
+    // written by nvfp4_pack_tile_major: the same bytes and the same GEMM, with
+    // each on-GEMM 4 KB weight tile contiguous. The row-major form streams at
+    // 188 GB/s on Ada (64-byte segments at a K/2 stride); this one reaches the
+    // 274 GB/s ceiling. Output is bit-identical to the row-major kernel.
+    m.def("fp4_bs_gemm_blockscaled_sm89_bf16out_tm",
+        [](uintptr_t A, uintptr_t Bq, uintptr_t Bsf, uintptr_t gscale,
+           uintptr_t D, int M, int N, int K,
+           uintptr_t act_scale, uintptr_t w_scale, uintptr_t stream) {
+            int rc = flash_rt::gemm::block128_sm89::fp4_bs_gemm_sm89_x64_tm(
+                to_ptr(A), to_ptr(Bq), to_ptr(Bsf),
+                reinterpret_cast<const float*>(gscale),
+                reinterpret_cast<const float*>(act_scale),
+                reinterpret_cast<const float*>(w_scale),
+                to_ptr(D), M, N, K, to_stream(stream));
+            if (rc != 0)
+                throw std::runtime_error(
+                    "fp4_bs_gemm_blockscaled_sm89_bf16out_tm launch failed");
+        },
+        py::arg("A"), py::arg("Bq"), py::arg("Bsf"), py::arg("gscale"),
+        py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("act_block_scale"), py::arg("w_block_scale"),
+        py::arg("stream") = 0);
+
+    m.def("fp4_bs_gemm_blockscaled_sm89_bf16out_tile_tm",
+        [](uintptr_t A, uintptr_t Bq, uintptr_t Bsf, uintptr_t gscale,
+           uintptr_t D, int M, int N, int K,
+           uintptr_t act_scale, uintptr_t w_scale, int tile, uintptr_t stream) {
+            using namespace flash_rt::gemm::block128_sm89;
+            const void* a_p = to_ptr(A);
+            const void* bq_p = to_ptr(Bq);
+            const void* sf_p = to_ptr(Bsf);
+            const float* gs_p = reinterpret_cast<const float*>(gscale);
+            const float* as_p = reinterpret_cast<const float*>(act_scale);
+            const float* ws_p = reinterpret_cast<const float*>(w_scale);
+            void* d_p = to_ptr(D);
+            cudaStream_t st = to_stream(stream);
+            int rc = 0;
+            switch (tile) {
+                case 0: rc = fp4_bs_gemm_sm89_x64_tm(a_p, bq_p, sf_p, gs_p,
+                        as_p, ws_p, d_p, M, N, K, st); break;
+                case 1: rc = fp4_bs_gemm_sm89_x64_s1_tm(a_p, bq_p, sf_p, gs_p,
+                        as_p, ws_p, d_p, M, N, K, st); break;
+                case 2: rc = fp4_bs_gemm_sm89_x128_tm(a_p, bq_p, sf_p, gs_p,
+                        as_p, ws_p, d_p, M, N, K, st); break;
+                case 3: rc = fp4_bs_gemm_sm89_x32_tm(a_p, bq_p, sf_p, gs_p,
+                        as_p, ws_p, d_p, M, N, K, st); break;
+                default: throw std::runtime_error("unknown fp4 tile-major variant");
+            }
+            if (rc != 0)
+                throw std::runtime_error(
+                    "fp4_bs_gemm tile-major variant launch failed");
+        },
+        py::arg("A"), py::arg("Bq"), py::arg("Bsf"), py::arg("gscale"),
+        py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("act_block_scale"), py::arg("w_block_scale"),
+        py::arg("tile"), py::arg("stream") = 0);
+
+    m.def("fp4_bs_gemm_splitk_blockscaled_sm89_bf16out_tm",
+        [](uintptr_t A, uintptr_t Bq, uintptr_t Bsf, uintptr_t gscale,
+           uintptr_t D, uintptr_t Dpart, int M, int N, int K,
+           uintptr_t act_scale, uintptr_t w_scale, int splits,
+           uintptr_t stream) {
+            int rc = flash_rt::gemm::block128_sm89::fp4_bs_gemm_splitk_sm89_tm(
+                to_ptr(A), to_ptr(Bq), to_ptr(Bsf),
+                reinterpret_cast<const float*>(gscale),
+                reinterpret_cast<const float*>(act_scale),
+                reinterpret_cast<const float*>(w_scale),
+                to_ptr(D), to_ptr(Dpart), M, N, K, splits, to_stream(stream));
+            if (rc != 0)
+                throw std::runtime_error(
+                    "fp4_bs_gemm_splitk_blockscaled_sm89_bf16out_tm launch failed");
+        },
+        py::arg("A"), py::arg("Bq"), py::arg("Bsf"), py::arg("gscale"),
+        py::arg("D"), py::arg("Dpart"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("act_block_scale"), py::arg("w_block_scale"),
+        py::arg("splits"), py::arg("stream") = 0);
+
+    // Per-128 SF variants: Bsf is a [N/128, K/128, 128] u8 image (one UE4M3
+    // byte per row and 128-K block). Payload, tiles and numerics identical to
+    // the per-16 packing with the scale duplicated, with 8x fewer SF reads.
+    m.def("fp4_bs_gemm_splitk_blockscaled_sm89_bf16out_tm_sf128",
+        [](uintptr_t A, uintptr_t Bq, uintptr_t Bsf, uintptr_t gscale,
+           uintptr_t D, uintptr_t Dpart, int M, int N, int K,
+           uintptr_t act_scale, uintptr_t w_scale, int splits,
+           uintptr_t stream) {
+            int rc = flash_rt::gemm::block128_sm89::fp4_bs_gemm_splitk_sm89_tm_sf128(
+                to_ptr(A), to_ptr(Bq), to_ptr(Bsf),
+                reinterpret_cast<const float*>(gscale),
+                reinterpret_cast<const float*>(act_scale),
+                reinterpret_cast<const float*>(w_scale),
+                to_ptr(D), to_ptr(Dpart), M, N, K, splits, to_stream(stream));
+            if (rc != 0)
+                throw std::runtime_error(
+                    "fp4_bs_gemm_splitk_blockscaled_sm89_bf16out_tm_sf128 launch failed");
+        },
+        py::arg("A"), py::arg("Bq"), py::arg("Bsf"), py::arg("gscale"),
+        py::arg("D"), py::arg("Dpart"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("act_block_scale"), py::arg("w_block_scale"),
+        py::arg("splits"), py::arg("stream") = 0);
+
+    m.def("fp4_bs_gemm_splitk_blockscaled_sm89_bf16out_tm_sf128_res",
+        [](uintptr_t A, uintptr_t Bq, uintptr_t Bsf, uintptr_t gscale,
+           uintptr_t Dpart, uintptr_t residual, uintptr_t bias,
+           int M, int N, int K, uintptr_t act_scale, uintptr_t w_scale,
+           int splits, uintptr_t stream) {
+            int rc = flash_rt::gemm::block128_sm89::fp4_bs_gemm_splitk_sm89_tm_sf128_res(
+                to_ptr(A), to_ptr(Bq), to_ptr(Bsf),
+                reinterpret_cast<const float*>(gscale),
+                reinterpret_cast<const float*>(act_scale),
+                reinterpret_cast<const float*>(w_scale), to_ptr(Dpart),
+                to_ptr(residual), to_ptr(bias), M, N, K, splits,
+                to_stream(stream));
+            if (rc != 0)
+                throw std::runtime_error(
+                    "fp4_bs_gemm_splitk_blockscaled_sm89_bf16out_tm_sf128_res launch failed");
+        },
+        py::arg("A"), py::arg("Bq"), py::arg("Bsf"), py::arg("gscale"),
+        py::arg("Dpart"), py::arg("residual"), py::arg("bias"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("act_block_scale"), py::arg("w_block_scale"),
+        py::arg("splits"), py::arg("stream") = 0);
+
+    // M=16 register-direct NVFP4 weight stream (fp4_stream_m16_sm89.cuh).
+    // Bit-identical to the SF128 shared-memory kernels; `splits` reproduces
+    // the split-K summation order without a partial buffer or reduce launch.
+    m.def("fp4_stream_m16_sm89_bf16out",
+        [](uintptr_t A, uintptr_t Wf, uintptr_t Bsf, uintptr_t gscale,
+           uintptr_t D, uintptr_t residual, uintptr_t bias,
+           int M, int N, int K, uintptr_t act_scale, uintptr_t w_scale,
+           int splits, int a_smem, int depth, int warps, uintptr_t stream) {
+            int rc = flash_rt::gemm::block128_sm89::fp4_stream_m16_sm89(
+                to_ptr(A), to_ptr(Wf), to_ptr(Bsf),
+                reinterpret_cast<const float*>(gscale),
+                reinterpret_cast<const float*>(act_scale),
+                reinterpret_cast<const float*>(w_scale), to_ptr(D),
+                to_ptr(residual), to_ptr(bias), M, N, K, splits, a_smem,
+                depth, warps, to_stream(stream));
+            if (rc != 0)
+                throw std::runtime_error(
+                    "fp4_stream_m16_sm89_bf16out launch failed (rc=" +
+                    std::to_string(rc) + ")");
+        },
+        py::arg("A"), py::arg("Wf"), py::arg("Bsf"), py::arg("gscale"),
+        py::arg("D"), py::arg("residual"), py::arg("bias"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("act_block_scale"), py::arg("w_block_scale"),
+        py::arg("splits"), py::arg("a_smem"), py::arg("depth"), py::arg("warps"),
+        py::arg("stream") = 0);
+
+    // M=128 NVFP4 weight GEMM on the same fragment-major payload
+    // (fp4_stream_m128_sm89.cuh); f16acc=1 is the FP16 block accumulation.
+    m.def("fp4_stream_m128_sm89_bf16out",
+        [](uintptr_t A, uintptr_t Wf, uintptr_t Bsf, uintptr_t gscale,
+           uintptr_t D, int M, int N, int K, uintptr_t act_scale,
+           uintptr_t w_scale, int cfg, int f16acc, uintptr_t stream) {
+            int rc = flash_rt::gemm::block128_sm89::fp4_stream_m128_sm89(
+                to_ptr(A), to_ptr(Wf), to_ptr(Bsf),
+                reinterpret_cast<const float*>(gscale),
+                reinterpret_cast<const float*>(act_scale),
+                reinterpret_cast<const float*>(w_scale), to_ptr(D), M, N, K,
+                cfg, f16acc, to_stream(stream));
+            if (rc != 0)
+                throw std::runtime_error(
+                    "fp4_stream_m128_sm89_bf16out launch failed (rc=" +
+                    std::to_string(rc) + ")");
+        },
+        py::arg("A"), py::arg("Wf"), py::arg("Bsf"), py::arg("gscale"),
+        py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("act_block_scale"), py::arg("w_block_scale"),
+        py::arg("cfg") = 0, py::arg("f16acc") = 1, py::arg("stream") = 0);
+
+    m.def("nvfp4_m128_lut_build",
+        [](uintptr_t Bsf, uintptr_t gscale, uintptr_t w_scale, uintptr_t lut,
+           int N, int K, uintptr_t stream) {
+            int rc = flash_rt::gemm::block128_sm89::nvfp4_m128_lut_build(
+                to_ptr(Bsf), reinterpret_cast<const float*>(gscale),
+                reinterpret_cast<const float*>(w_scale), to_ptr(lut), N, K,
+                to_stream(stream));
+            if (rc != 0)
+                throw std::runtime_error(
+                    "nvfp4_m128_lut_build launch failed (rc=" + std::to_string(rc) + ")");
+        },
+        py::arg("Bsf"), py::arg("gscale"), py::arg("w_block_scale"), py::arg("lut"),
+        py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+
+    // fp4_stream_m128_sm89_bf16out (f16acc = 1) on the precomputed LUT image.
+    m.def("fp4_stream_m128_lut_sm89_bf16out",
+        [](uintptr_t A, uintptr_t Wf, uintptr_t lut, uintptr_t D, int M, int N, int K,
+           uintptr_t act_scale, int cfg, uintptr_t stream) {
+            int rc = flash_rt::gemm::block128_sm89::fp4_stream_m128_lut_sm89(
+                to_ptr(A), to_ptr(Wf), to_ptr(lut),
+                reinterpret_cast<const float*>(act_scale), to_ptr(D), M, N, K, cfg,
+                to_stream(stream));
+            if (rc != 0)
+                throw std::runtime_error(
+                    "fp4_stream_m128_lut_sm89_bf16out launch failed (rc=" +
+                    std::to_string(rc) + ")");
+        },
+        py::arg("A"), py::arg("Wf"), py::arg("lut"), py::arg("D"), py::arg("M"),
+        py::arg("N"), py::arg("K"), py::arg("act_block_scale"), py::arg("cfg") = 0,
+        py::arg("stream") = 0);
+
+    m.def("nvfp4_pack_frag_m16",
+        [](uintptr_t packed, uintptr_t frag, int N, int K, uintptr_t stream) {
+            int rc = flash_rt::gemm::block128_sm89::nvfp4_pack_frag_m16(
+                to_ptr(packed), to_ptr(frag), N, K, to_stream(stream));
+            if (rc != 0)
+                throw std::runtime_error(
+                    "nvfp4_pack_frag_m16: N must be a multiple of 8 and K of 128");
+        },
+        py::arg("nvfp4_packed"), py::arg("frag"), py::arg("N"), py::arg("K"),
+        py::arg("stream") = 0);
+
+    m.def("fp4_bs_gemm_blockscaled_sm89_bf16out_s2_sf128",
+        [](uintptr_t A, uintptr_t Bq, uintptr_t Bsf, uintptr_t gscale,
+           uintptr_t D, int M, int N, int K,
+           uintptr_t act_scale, uintptr_t w_scale, uintptr_t stream) {
+            int rc = flash_rt::gemm::block128_sm89::fp4_bs_gemm_sm89_x64_sf128(
+                to_ptr(A), to_ptr(Bq), to_ptr(Bsf),
+                reinterpret_cast<const float*>(gscale),
+                reinterpret_cast<const float*>(act_scale),
+                reinterpret_cast<const float*>(w_scale),
+                to_ptr(D), M, N, K, to_stream(stream));
+            if (rc != 0)
+                throw std::runtime_error(
+                    "fp4_bs_gemm_blockscaled_sm89_bf16out_s2_sf128 launch failed");
+        },
+        py::arg("A"), py::arg("Bq"), py::arg("Bsf"), py::arg("gscale"),
+        py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("act_block_scale"), py::arg("w_block_scale"),
+        py::arg("stream") = 0);
+
+    m.def("fp4_bs_gemm_blockscaled_sm89_bf16out_s1_sf128",
+        [](uintptr_t A, uintptr_t Bq, uintptr_t Bsf, uintptr_t gscale,
+           uintptr_t D, int M, int N, int K,
+           uintptr_t act_scale, uintptr_t w_scale, uintptr_t stream) {
+            int rc = flash_rt::gemm::block128_sm89::fp4_bs_gemm_sm89_x64_s1_sf128(
+                to_ptr(A), to_ptr(Bq), to_ptr(Bsf),
+                reinterpret_cast<const float*>(gscale),
+                reinterpret_cast<const float*>(act_scale),
+                reinterpret_cast<const float*>(w_scale),
+                to_ptr(D), M, N, K, to_stream(stream));
+            if (rc != 0)
+                throw std::runtime_error(
+                    "fp4_bs_gemm_blockscaled_sm89_bf16out_s1_sf128 launch failed");
+        },
+        py::arg("A"), py::arg("Bq"), py::arg("Bsf"), py::arg("gscale"),
+        py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("act_block_scale"), py::arg("w_block_scale"),
+        py::arg("stream") = 0);
+
+
+#else
     // GeGLU silu-fold (production entry, env-gated by the caller): fuses the
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
     // gate_up GEMM + silu_mul + per-token block-128 FP8 quant into one launch.
     // This is a NEW binding (no legacy alias replaced). Argument shapes:
     //   A         : [M, K]        FP8 e4m3 row-major   (per-token quantized act)
@@ -426,6 +912,34 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
     BIND_BLOCK128_GEMV_M1_BF16IN(gemv_fp8_block128_m1_bf16in_w16);
 
 #undef BIND_BLOCK128_GEMV_M1_BF16IN
+#ifdef FLASHRT_ENABLE_LINGBOT_VA_SM89
+
+    // Wan VAE causal conv3d (NDHWC) on the FP16-accumulating MMA.
+    m.def("conv3d_ndhwc_f16acc_bf16out",
+        [](uintptr_t x, uintptr_t w, uintptr_t bias, uintptr_t y, int N, int D, int H, int W,
+           int C, int Ko, int T, int R, int pad, uintptr_t stream) {
+            int rc = flash_rt::gemm::conv3d_sm89::conv3d_ndhwc_f16acc_bf16out(
+                to_ptr(x), to_ptr(w), to_ptr(bias), to_ptr(y), N, D, H, W, C, Ko, T, R, pad,
+                to_stream(stream));
+            if (rc != 0)
+                throw std::runtime_error("conv3d_ndhwc_f16acc_bf16out failed (rc=" +
+                                         std::to_string(rc) + ")");
+        },
+        py::arg("x"), py::arg("w"), py::arg("bias"), py::arg("y"), py::arg("N"), py::arg("D"),
+        py::arg("H"), py::arg("W"), py::arg("C"), py::arg("Ko"), py::arg("T"), py::arg("R"),
+        py::arg("pad"), py::arg("stream") = 0);
+    m.def("ndhwc_time_cat_bf16_to_f16",
+        [](uintptr_t cache, int Tc, uintptr_t x, int Tx, uintptr_t out, int N, long long frame,
+           uintptr_t stream) {
+            int rc = flash_rt::gemm::conv3d_sm89::ndhwc_time_cat_bf16_to_f16(
+                to_ptr(cache), Tc, to_ptr(x), Tx, to_ptr(out), N, frame, to_stream(stream));
+            if (rc != 0)
+                throw std::runtime_error("ndhwc_time_cat_bf16_to_f16 failed (rc=" +
+                                         std::to_string(rc) + ")");
+        },
+        py::arg("cache"), py::arg("Tc"), py::arg("x"), py::arg("Tx"), py::arg("out"),
+        py::arg("N"), py::arg("frame"), py::arg("stream") = 0);
+#endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 
 #endif  // ENABLE_SM89_BLOCK_FP8_GEMM
 

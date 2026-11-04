@@ -101,6 +101,7 @@ CATEGORIES: dict[str, tuple[str, ...]] = {
     "dit_video": (
         "csrc/kernels/dit_bf16.cu",
         "csrc/kernels/attention_dit_bf16.cu",
+        "csrc/kernels/wan_adaln_fp8.cu",
     ),
     "qwen3_family": (
         "csrc/kernels/rope_qwen3.cu",

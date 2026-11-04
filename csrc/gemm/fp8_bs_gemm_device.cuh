@@ -80,7 +80,7 @@ __device__ __forceinline__ float silu_f32(float x) {
 // When RESID=false, `resid` is unused and the `if constexpr (RESID)` branch
 // is dead-stripped at compile time, so the baseline kernel is byte-identical.
 template <int BLOCK_M, int BLOCK_N, int NUM_WARPS, int STAGES,
-          int MIN_BLOCKS_PER_SM, bool RESID = false>
+          int MIN_BLOCKS_PER_SM, bool RESID = false, bool EXACT = false>
 __global__ __launch_bounds__(NUM_WARPS * 32, MIN_BLOCKS_PER_SM)
 void fp8_bs_gemm_kernel(
     const __nv_fp8_e4m3* __restrict__ A,
@@ -175,9 +175,14 @@ void fp8_bs_gemm_kernel(
             int chunk_a = idx % NUM_CHUNKS_PER_ROW;
             int m_glob = m_base + row_a;
             int k_glob = k_base + chunk_a * 16;
-            const uint8_t* a_src = nullptr;
-            if (m_glob < M && k_glob < K) {
+            const uint8_t* a_src;
+            if constexpr (EXACT) {
                 a_src = reinterpret_cast<const uint8_t*>(&A[(size_t)m_glob * K + k_glob]);
+            } else {
+                a_src = nullptr;
+                if (m_glob < M && k_glob < K) {
+                    a_src = reinterpret_cast<const uint8_t*>(&A[(size_t)m_glob * K + k_glob]);
+                }
             }
             int csw = chunk_a ^ (row_a & SWIZZLE_MASK);
             cp_async_16(
@@ -194,9 +199,14 @@ void fp8_bs_gemm_kernel(
             int chunk_b = idx % NUM_CHUNKS_PER_ROW;
             int n_glob = n_base + row_b;
             int k_glob = k_base + chunk_b * 16;
-            const uint8_t* b_src = nullptr;
-            if (n_glob < N && k_glob < K) {
+            const uint8_t* b_src;
+            if constexpr (EXACT) {
                 b_src = reinterpret_cast<const uint8_t*>(&B[(size_t)n_glob * K + k_glob]);
+            } else {
+                b_src = nullptr;
+                if (n_glob < N && k_glob < K) {
+                    b_src = reinterpret_cast<const uint8_t*>(&B[(size_t)n_glob * K + k_glob]);
+                }
             }
             int csw = chunk_b ^ (row_b & SWIZZLE_MASK);
             cp_async_16(
@@ -356,6 +366,12 @@ void fp8_bs_gemm_kernel(
                         D[(size_t)row1 * N + n_pair_base + 1] = __float2bfloat16(
                             acc[mi][ni][3] + __bfloat162float(resid[(size_t)row1 * N + n_pair_base + 1]));
                 }
+            } else if constexpr (EXACT) {
+                static_assert(!RESID, "EXACT is only defined for the plain epilogue");
+                *reinterpret_cast<__nv_bfloat162*>(&D[(size_t)row0 * N + n_pair_base]) =
+                    __floats2bfloat162_rn(acc[mi][ni][0], acc[mi][ni][1]);
+                *reinterpret_cast<__nv_bfloat162*>(&D[(size_t)row1 * N + n_pair_base]) =
+                    __floats2bfloat162_rn(acc[mi][ni][2], acc[mi][ni][3]);
             } else {
                 // Emit one 32-bit bfloat162 store per row instead of two scalar
                 // 16-bit stores (NCU's top store-pattern bottleneck after C1).

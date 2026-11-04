@@ -25,6 +25,20 @@ void bias_rms_norm_bf16(const __nv_bfloat16* x,
                         int seq_len, int dim, float eps,
                         cudaStream_t stream = 0);
 
+// Same kernel, additionally emitting a signed-int8 copy with a static scale
+// (for the Sage2 cross-attention Q operand).
+void bias_rms_norm_bf16_q8(const __nv_bfloat16* x,
+                           const __nv_bfloat16* bias,
+                           const __nv_bfloat16* weight,
+                           __nv_bfloat16* out,
+                           int8_t* out_q8,
+                           int seq_len, int dim, float eps, float scale,
+                           cudaStream_t stream = 0);
+
+// Elementwise int8 K / fp16 V copies of the hoisted cross-attention tensors.
+void quantize_i8_f16(const void* k, const void* v, void* k8, void* v16,
+                     long n, float scale, cudaStream_t stream = 0);
+
 void rms_norm_fp16(const __half* x, const __half* weight,
                     __half* out, int seq_len, int dim, float eps,
                     cudaStream_t stream = 0);
@@ -44,6 +58,20 @@ void layer_norm_fp16(const __half* x, const __half* weight,
                       int seq_len, int dim, float eps, cudaStream_t stream = 0);
 
 // ── LayerNorm → FP8 (fused, no scale — direct cast) ──
+
+// LayerNorm emitting FP8 with 128-wide per-token scales (see norm.cu).
+// Wan gated residual (sstp form, xbias folded) then layer_norm_fp8_block128 of
+// the updated residual, in one launch; bit-identical to the two launches.
+void gated_residual_sstp_layer_norm_fp8_block128(
+    __nv_bfloat16* residual, const __nv_bfloat16* x, const __nv_bfloat16* xbias,
+    const float* gate_ss_row, const float* gate_tp, const __nv_bfloat16* weight,
+    const __nv_bfloat16* bias, __nv_fp8_e4m3* out, float* out_scale,
+    int seq_len, int dim, float eps, cudaStream_t stream);
+void layer_norm_fp8_block128(const __nv_bfloat16* x,
+                              const __nv_bfloat16* weight,
+                              const __nv_bfloat16* bias,
+                              __nv_fp8_e4m3* out, float* out_scale,
+                              int seq_len, int dim, float eps, cudaStream_t stream);
 
 void layer_norm_fp8(const __half* x, __nv_fp8_e4m3* out,
                      const __half* gamma, const __half* beta,

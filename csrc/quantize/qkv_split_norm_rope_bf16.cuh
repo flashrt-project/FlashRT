@@ -144,5 +144,57 @@ void qkv_split_joint3_cat_bf16(
     float eps_v, float eps_a, float eps_u,
     cudaStream_t stream);
 
+void qkv_split_bias_norm_rope_v_cat2_bf16(
+    const void* packed_qkv, const void* qkv_bias, const void* norm_q_w,
+    const void* norm_k_w, const float* freqs_re, const float* freqs_im,
+    void* q_out, void* k_out, void* v_out,
+    int B, int Lq, int off_q, int Lkv, int off_kv, int L_v,
+    int N, int D_h, int seq_len, float eps, cudaStream_t stream);
+
+// Sage2 output variant: q/k as signed int8 with static per-tensor scales
+// (absmax/127), v as fp16. Same arithmetic before the store.
+// fp16 -> fp8 e4m3 transpose+quantize into the Sage V layout [B, D, H, PAD].
+void v_transpose_f8(const void* src, void* dst, long total,
+                    int H, int D, int LT, int off, int PAD, float scale,
+                    cudaStream_t stream = 0);
+
+// Coalesced 32x32-tile variant; same contract, requires `off` 16-aligned.
+// In-place window shift of one layer's Sage cache: K [B, total, row_bytes]
+// rows [drop, drop+keep) -> [0, keep), and the transposed fp8 V
+// [B*row_bytes rows, pad] columns likewise. One pass, exact data movement;
+// keep/drop/pad multiples of 16, keep <= 3072; k == nullptr shifts V only.
+// Returns 0 on success.
+int kv_window_shift_sage(void* k, void* vt, int B, int total, int row_bytes,
+                         int pad, int keep, int drop, cudaStream_t stream);
+
+void v_transpose_f8_tile(const void* src, void* dst,
+                         int B, int H, int D, int LT, int off, int PAD,
+                         float scale, cudaStream_t stream = 0);
+
+// K-ring window move: origin = (origin + drop) mod ring_R (one int32 on the
+// device), the data-free counterpart of kv_window_shift_sage's K pass.
+int kv_ring_advance(void* origin, int drop, int ring_R, cudaStream_t stream);
+
+void qkv_split_bias_norm_rope_v_cat2_sage(
+    const void*  packed_qkv,
+    const void*  qkv_bias,
+    const void*  norm_q_w,
+    const void*  norm_k_w,
+    const float* freqs_re,
+    const float* freqs_im,
+    void*        q_out,
+    void*        k_out,
+    void*        v_out,
+    int B, int Lq, int off_q, int Lkv, int off_kv, int L_v,
+    int N, int D_h, int seq_len, float eps,
+    float q_scale, float k_scale,
+    int v_out_rows, int off_v,
+    cudaStream_t stream = 0,
+    const float* q_scale_h = nullptr,   // optional [N] per-head scales
+    const float* k_scale_h = nullptr,
+    // optional K ring: K row (ring_origin[0] + off_kv + row) mod ring_R, rows
+    // [0, 64) mirrored at [ring_R, ring_R + 64) (Lkv >= ring_R + 64)
+    const int* ring_origin = nullptr, int ring_R = 0);
+
 }  // namespace quantize
 }  // namespace flash_rt

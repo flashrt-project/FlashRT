@@ -58,5 +58,36 @@ void fp8_block128_to_nvfp4_swizzled_bf16(
     int N, int K,
     cudaStream_t stream);
 
+// Per-128 scale-factor variant: the e2m1 codebook is scaled by the amax of
+// the full 128-wide K block (which is exactly one FP8 block) instead of one
+// 16-wide sub-block, and that single scale is written to all eight sub-block
+// SF slots. The payload layout and the GEMM are unchanged, so the existing
+// kernel reconstructs the coarser quantization exactly. Built to measure
+// whether the per-16 SF image (0.0625 B/param) can be dropped: a later kernel
+// only needs one SF byte per 128 block, cutting ~9% of the action weight
+// traffic.
+// Plain-layout twin of the entry above: same payload and same SF bytes, but
+// sf128_plain is [N/128, K/128, 128] u8 (one byte per row and 128-K block),
+// the layout the SF128 GEMM variant reads.
+void fp8_block128_to_nvfp4_sf128_plain_bf16(
+    const void* w_fp8,
+    const float* w_block_scale_fp32,
+    uint8_t* nvfp4_packed,
+    uint8_t* sf128_plain,
+    float* scratch_global_amax,
+    float* out_global_scale,
+    int N, int K,
+    cudaStream_t stream);
+
+void fp8_block128_to_nvfp4_sf128_swizzled_bf16(
+    const void* w_fp8,
+    const float* w_block_scale_fp32,
+    uint8_t* nvfp4_packed,
+    uint8_t* nvfp4_sf_swizzled,
+    float* scratch_global_amax,
+    float* out_global_scale,
+    int N, int K,
+    cudaStream_t stream);
+
 }  // namespace quantize
 }  // namespace flash_rt

@@ -30,15 +30,11 @@ BUILD_DIR = Path(os.environ.get("FLASHRT_BUILD_DIR", REPO_ROOT / "build"))
 # build-mode aware: it reads FLASHRT_SLIM_BUILD from the configured build dir's
 # CMakeCache.txt and asserts the matching surface.
 #
-#   compat default (FLASHRT_SLIM_BUILD=OFF): 57 direct TUs, unchanged.
-#   slim SM89   (FLASHRT_SLIM_BUILD=ON):     34 direct TUs (-22):
-#       -5 Motus VAE FP8 (Unit 1), -10 Qwen3.6/linear-attn (Unit 2),
-#       -7 SM120/NVFP4-named (Unit 3).
-# The direct-source breakdowns below are SM89-specific; other arches add/remove
-# arch-owned sources (for example SM120 adds nvfp4_sf_reshape_sm120.cu), so the
-# direct-count/category asserts are limited to SM89.
-COMPAT_KERNELS_TU = 57
-SLIM_SM89_KERNELS_TU = 34
+# SM89 baseline with LingBot additions OFF: 65 compat / 41 slim.
+# The opt-in delivery adds ten core TUs; slim additionally enables four
+# existing packing helpers needed by the new exports. Default counts do not grow.
+COMPAT_KERNELS_TU = 65
+SLIM_SM89_KERNELS_TU = 41
 
 # Per-group breakdown of flash_rt_kernels (mirrors AGENTS.md "Current Build
 # Layout"). categorize() drops empty groups, so slim omits sm120_nvfp4_named.
@@ -50,7 +46,7 @@ COMPAT_KERNELS_CATEGORIES = {
     "dit_video": 2,
     "qwen3_family": 2,
     "audio_codebook": 1,
-    "other": 10,
+    "other": 18,
 }
 SLIM_SM89_KERNELS_CATEGORIES = {
     "generic_shared": 15,
@@ -59,7 +55,7 @@ SLIM_SM89_KERNELS_CATEGORIES = {
     "dit_video": 2,
     "qwen3_family": 2,
     "audio_codebook": 1,
-    "other": 10,
+    "other": 17,
 }
 
 
@@ -105,18 +101,33 @@ def _target_build_rules(target: str) -> str:
             chunks.append(path.read_text(errors="replace"))
     ninja = BUILD_DIR / "build.ninja"
     if ninja.is_file():
-        chunks.append(ninja.read_text(errors="replace"))
+        import re
+        blocks = re.split(r"\n(?=build )", ninja.read_text(errors="replace"))
+        # Inspect this target's edges, not the entire graph: another model's
+        # source must not make an ownership assertion pass accidentally.
+        for block in blocks:
+            line = block.split("\n", 1)[0]
+            if (line.startswith(f"build CMakeFiles/{target}.dir/") or
+                    re.search(r": .*_LIBRARY_LINKER__" + re.escape(target) + r"_", line)):
+                chunks.append(block)
     return "\n".join(chunks)
 
 
 def _expected_tu() -> int:
     expected = SLIM_SM89_KERNELS_TU if _is_slim() else COMPAT_KERNELS_TU
+    if _cache_bool("FLASHRT_ENABLE_LINGBOT_VA_SM89"):
+        expected += 14 if _is_slim() else 10
     return expected if _audio_codebook_enabled() else expected - 1
 
 
 def _expected_categories() -> dict:
     expected = dict(SLIM_SM89_KERNELS_CATEGORIES if _is_slim()
                     else COMPAT_KERNELS_CATEGORIES)
+    if _cache_bool("FLASHRT_ENABLE_LINGBOT_VA_SM89"):
+        expected["dit_video"] += 1
+        expected["other"] += 9
+        if _is_slim():
+            expected["sm120_nvfp4_named"] = 4
     if not _audio_codebook_enabled():
         expected.pop("audio_codebook", None)
     return expected
@@ -187,7 +198,7 @@ def test_inventory_script_imports_and_collects():
 def test_kernels_baseline_tu_count():
     """flash_rt_kernels direct-source surface matches the recorded baseline.
 
-    Mode-aware: compat default expects 55, slim SM89 expects 33. A change means
+    Mode-aware: LingBot-OFF expects 65 compat / 41 slim; opting in adds ten. A change means
     a unit added/removed a TU from that mode's build; if intended, update the
     matching constant in the same commit.
     """
@@ -273,3 +284,30 @@ def test_object_libraries_counted_in_total():
         assert fa2["object_tu_count"] >= 1
         assert fa2["total_tu_count"] == fa2["count"] + fa2["object_tu_count"]
         assert fa2["total_tu_count"] > fa2["count"]
+
+
+def test_lingbot_sources_follow_model_gate():
+    _require_build_dir()
+    enabled = _cache_bool("FLASHRT_ENABLE_LINGBOT_VA_SM89")
+    assert not enabled or _is_sm89()
+    core = _target_build_rules("flash_rt_kernels")
+    qwen = _target_build_rules("flash_rt_qwen3_vl_kernels")
+    for source in ("wan_adaln_fp8.cu", "lingbot_va_norm_sm89.cu", "sage2_tail_merge.cu",
+                   "qkv_split_norm_rope_sage.cu", "bf16_norm_tail_ncdhw.cu"):
+        assert (source in core) == enabled
+    for source in ("fp8_bs_gemm_cutlass_sm89.cu", "conv3d_f16acc_sm89.cu", "fp4_stream_m128_sm89.cu"):
+        assert (source in qwen) == (enabled and _cache_bool("FLASHRT_BUILD_QWEN3_VL"))
+    assert ("FLASHRT_ENABLE_LINGBOT_VA_SM89" in core) == enabled
+
+
+def test_motus_sage2_implementation_and_binding_have_the_same_owner():
+    _require_build_dir()
+    enabled = _cache_bool("FLASHRT_ENABLE_MOTUS") and _is_arch_sm120()
+    motus = _target_build_rules("motus_aux_sm120_obj")
+    core = _target_build_rules("flash_rt_kernels")
+    assert ("sage2_attn_raw.cu" in motus) == enabled
+    assert ("ENABLE_MOTUS_SAGE2_RAW" in core) == enabled
+
+
+def _is_arch_sm120():
+    return (_cache_value("GPU_ARCH") or "").strip() == "120"
