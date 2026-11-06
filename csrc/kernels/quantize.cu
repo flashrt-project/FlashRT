@@ -5,6 +5,8 @@
 // ================================================================
 
 #include "quantize.cuh"
+#include "kernel_policy.h"
+#include "pdl_launch.cuh"
 #include "common.cuh"
 #include "norm.cuh"
 #include "activation.cuh"
@@ -579,6 +581,58 @@ __global__ void quantize_bf16_to_nvfp4_swizzled_v2_kernel(
     }
 }
 
+// ── v3: warp-per-row, register-cached ────────────────────────────────
+// One warp per row, EPL = cols/32 contiguous elements per lane, so every
+// 16-element quant block is owned by a single lane (its amax is lane-local)
+// and the row is read once into registers. Same scale/pack math as v2.
+template <int EPL>
+__global__ void quantize_bf16_to_nvfp4_swizzled_v3_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    uint8_t* __restrict__ fp4_data,
+    uint8_t* __restrict__ scale_factors,
+    int cols, int n_col_blocks, int rows)
+{
+    flash_rt::pdl::pdl_trigger();
+    flash_rt::pdl::pdl_wait();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (row >= rows) return;
+    const int base0 = lane * EPL;
+    const __nv_bfloat16* row_in = input + (size_t)row * cols;
+    uint8_t* row_fp4 = fp4_data + (size_t)row * cols / 2;
+    const int rb = row >> 7, ri = row & 127;
+
+    uint4 raw[EPL / 8];
+#pragma unroll
+    for (int k = 0; k < EPL / 8; ++k)
+        raw[k] = reinterpret_cast<const uint4*>(row_in + base0)[k];
+    const __nv_bfloat16* v = reinterpret_cast<const __nv_bfloat16*>(raw);
+
+#pragma unroll
+    for (int b = 0; b < EPL / 16; ++b) {
+        float vals[16];
+        float amax = 0.f;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            vals[j] = __bfloat162float(v[b * 16 + j]);
+            amax = fmaxf(amax, fabsf(vals[j]));
+        }
+        const uint8_t ue = float_to_ue4m3_ceil(amax / 6.0f);
+        const float fscale = ue4m3_to_float(ue);
+        const float inv = (fscale > 0.f) ? (1.f / fscale) : 0.f;
+        uint8_t pk[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            pk[j] = float2_to_fp4_e2m1x2_exact(vals[2 * j] * inv, vals[2 * j + 1] * inv);
+        *reinterpret_cast<uint2*>(row_fp4 + (base0 + b * 16) / 2) =
+            *reinterpret_cast<const uint2*>(pk);
+        const int blk = (base0 + b * 16) >> 4;
+        const int cb = blk / 4, ci = blk % 4;
+        scale_factors[(rb * n_col_blocks + cb) * 512 + (ri % 32) * 16
+                      + (ri / 32) * 4 + ci] = ue;
+    }
+}
+
 void quantize_bf16_to_nvfp4_swizzled_v2(const __nv_bfloat16* input, uint8_t* fp4_data,
                                         uint8_t* scale_factors, int rows, int cols,
                                         cudaStream_t stream) {
@@ -586,6 +640,34 @@ void quantize_bf16_to_nvfp4_swizzled_v2(const __nv_bfloat16* input, uint8_t* fp4
     int n_row_blocks = (rows + 127) / 128;
     int n_col_blocks = (num_blocks + 3) / 4;
     int threads = 256;
+    // v3: one warp per row, row cached in registers, whole 16-element quant
+    // blocks lane-local. Same amax/scale/pack math as v2 (bit-identical
+    // output); the v2 path's single-CTA-per-row scalar loads cap it at
+    // ~230 GB/s on the tower shapes. FLASHRT_QUANT_V3=0 forces v2 for A/B.
+    // The environment override is immutable for the process; the model
+    // policy stays live so a frontend can opt in before its first capture.
+    static const int v3_env = [] {
+        const char* e = std::getenv("FLASHRT_QUANT_V3");
+        return e ? std::atoi(e) : -1;
+    }();
+    const bool use_v3 = v3_env >= 0 ? v3_env != 0
+                                    : flash_rt::kernels::fast_producers();
+    if (use_v3 && cols % 512 == 0 && cols <= 2048) {
+        const int warps = 8;
+        const int grid = (rows + warps - 1) / warps;
+        if (cols == 1024) {
+            flash_rt::pdl::launch(quantize_bf16_to_nvfp4_swizzled_v3_kernel<32>, dim3(grid),
+                                  dim3(warps * 32), 0, stream, flash_rt::pdl::enabled(),
+                                  input, fp4_data, scale_factors, cols, n_col_blocks, rows);
+            return;
+        }
+        if (cols == 2048) {
+            flash_rt::pdl::launch(quantize_bf16_to_nvfp4_swizzled_v3_kernel<64>, dim3(grid),
+                                  dim3(warps * 32), 0, stream, flash_rt::pdl::enabled(),
+                                  input, fp4_data, scale_factors, cols, n_col_blocks, rows);
+            return;
+        }
+    }
     if (cols > 16 * threads) {  // prefetch covers cols<=16*threads; else fall back
         quantize_bf16_to_nvfp4_swizzled(input, fp4_data, scale_factors, rows, cols, stream);
         return;
@@ -1240,7 +1322,7 @@ void bias_gelu_quant_bf16_to_nvfp4_swizzled(
 // write is a contiguous 8-byte store. Bit-identical output to the atomic
 // kernel above (same gelu/scale/rounding helpers). Requires cols % 8 == 0 and
 // a 16-byte-aligned input base, which the ViT fc2 producer satisfies.
-template <bool UseAwq>
+template <bool UseAwq, bool RoundBf16 = false>
 __global__ void bias_gelu_quant_bf16_to_nvfp4_swizzled_v2_kernel(
     const __nv_bfloat16* __restrict__ input,
     const __nv_bfloat16* __restrict__ bias,
@@ -1264,6 +1346,13 @@ __global__ void bias_gelu_quant_bf16_to_nvfp4_swizzled_v2_kernel(
     for (int j = 0; j < 16; ++j) {
         float x = __bfloat162float(row_in[j]) + __bfloat162float(bia[j]);
         x = gelu_tanh_nvfp4(x);
+        if constexpr (RoundBf16) {
+            // Match the two-launch chain exactly: bias_gelu_inplace_bf16
+            // stores the GELU result as bf16, and the standalone quantizer
+            // consumes those rounded values. Round-trip through bf16 here
+            // before amax/scale selection so the packed bytes are identical.
+            x = __bfloat162float(__float2bfloat16(x));
+        }
         if constexpr (UseAwq) {
             x *= __bfloat162float(inv_s[b * 16 + j]);
         }
@@ -1310,6 +1399,33 @@ void bias_gelu_quant_bf16_to_nvfp4_swizzled_v2(
     int threads = 256;
     int blocks = (int)((total + threads - 1) / threads);
     bias_gelu_quant_bf16_to_nvfp4_swizzled_v2_kernel<false>
+        <<<blocks, threads, 0, stream>>>(
+            input, bias, nullptr, fp4_data, scale_factors, rows, cols,
+            num_blocks, n_col_blocks);
+}
+
+void bias_gelu_quant_bf16_to_nvfp4_swizzled_v2_bf16round(
+    const __nv_bfloat16* input,
+    const __nv_bfloat16* bias,
+    uint8_t* fp4_data,
+    uint8_t* scale_factors,
+    int rows, int cols,
+    cudaStream_t stream) {
+    // Bit-identical to [bias_gelu_inplace_bf16 -> quantize_bf16_to_nvfp4_swizzled_v2]
+    // while removing the intermediate bf16 store and its re-read. The caller
+    // guarantees cols % 8 == 0 (the ViT fc2 shape); the rare fallback keeps
+    // the fused fp32 path, which is correct but not byte-identical.
+    if (rows <= 0 || cols <= 0 || (cols & 7) != 0) {
+        bias_gelu_quant_bf16_to_nvfp4_swizzled(
+            input, bias, fp4_data, scale_factors, rows, cols, stream);
+        return;
+    }
+    int num_blocks = (cols + 15) / 16;
+    int n_col_blocks = (num_blocks + 3) / 4;
+    long long total = (long long)rows * num_blocks;
+    int threads = 256;
+    int blocks = (int)((total + threads - 1) / threads);
+    bias_gelu_quant_bf16_to_nvfp4_swizzled_v2_kernel<false, true>
         <<<blocks, threads, 0, stream>>>(
             input, bias, nullptr, fp4_data, scale_factors, rows, cols,
             num_blocks, n_col_blocks);
@@ -1523,7 +1639,7 @@ __global__ void bias_gelu_quant_cached_bf16_to_nvfp4_swizzled_kernel(
     int rb = row / 128;
     int ri = row % 128;
     for (int b = threadIdx.x; b < num_blocks; b += blockDim.x) {
-        float amax = __int_as_float(*(int*)&sf_smem[b]);
+        float amax = sf_smem[b];
         float scale = amax / 6.0f;
         uint8_t ue_scale = float_to_ue4m3_ceil(scale);
 
@@ -1957,6 +2073,7 @@ void rms_norm_to_nvfp4_swizzled_bf16_v2(
 // accumulation regroups (contiguous 8-chunks per thread instead of
 // column-strided singles), so the fp32 sum can differ from v2 in the
 // last ulp — same trade the v3 norm+RoPE kernels made.
+template <bool Exact>
 __global__ void rms_norm_to_nvfp4_swizzled_bf16_v3_kernel(
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ rms_weight,
@@ -1972,6 +2089,8 @@ __global__ void rms_norm_to_nvfp4_swizzled_bf16_v3_kernel(
     extern __shared__ float smem_dyn[];
     float* warp_red = smem_dyn;
     __nv_bfloat16* normed = reinterpret_cast<__nv_bfloat16*>(warp_red + 32);
+    flash_rt::pdl::pdl_trigger();
+    flash_rt::pdl::pdl_wait();
 
     // ── Phase 1: uint4 (8 x bf16) row loads, sum of squares ──
     constexpr int VEC = 8;
@@ -2046,13 +2165,145 @@ __global__ void rms_norm_to_nvfp4_swizzled_bf16_v3_kernel(
         uint8_t pk[8];
         #pragma unroll
         for (int j = 0; j < 8; ++j) {
-            uint8_t lo = float_to_fp4_e2m1_branchless(vals[2 * j]     * inv_scale);
-            uint8_t hi = float_to_fp4_e2m1_branchless(vals[2 * j + 1] * inv_scale);
-            pk[j] = (hi << 4) | (lo & 0x0F);
+            if constexpr (Exact) {
+                pk[j] = float2_to_fp4_e2m1x2_exact(
+                    vals[2 * j] * inv_scale, vals[2 * j + 1] * inv_scale);
+            } else {
+                uint8_t lo = float_to_fp4_e2m1_branchless(vals[2 * j] * inv_scale);
+                uint8_t hi = float_to_fp4_e2m1_branchless(vals[2 * j + 1] * inv_scale);
+                pk[j] = (hi << 4) | (lo & 0x0F);
+            }
         }
         *reinterpret_cast<uint2*>(row_fp4 + base / 2) =
             *reinterpret_cast<const uint2*>(pk);
     }
+}
+
+// ── v3, register-resident (bit-identical to the 256-thread kernel) ──
+// The row stays in registers from load to pack (no smem staging, one
+// barrier), and R warps serve a row (R = 8 is the v3 geometry; fewer warps
+// trade per-thread work for residency, measured slower at 2048 columns).
+// Real warp r plays the v3 warps w = r, r+R, ... (lane l of it the v3
+// threads l + 32*w). Each owns the same 8-element
+// chunks and forms the same per-thread partial sums; the shfl_down tree runs
+// inside every virtual warp and the 8 warp sums go through block_reduce_sum's
+// zero-padded second-level tree, so rms -- and with it every packed byte and
+// scale -- matches v3 bit for bit. A 16-element block spans the chunks of an
+// even/odd lane pair, which swap amax halves and each pack their own 4 bytes.
+template <int R, int ROWS>
+__global__ void __launch_bounds__(32 * R * ROWS)
+rms_norm_to_nvfp4_swizzled_bf16_v3_rows_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ rms_weight,
+    uint8_t* __restrict__ packed,
+    uint8_t* __restrict__ sf_swz,
+    int rows, int cols, int n_col_blocks, float eps)
+{
+    constexpr int VEC = 8;
+    constexpr int NW = 8;                       // warps of the v3 CTA
+    constexpr int PER = NW / R;                 // virtual warps per real warp
+    __shared__ float wsum[ROWS][NW];
+    const int lane = threadIdx.x & 31;
+    const int r = (threadIdx.x >> 5) % R;
+    const int lr = threadIdx.x / (32 * R);
+    const int row = blockIdx.x * ROWS + lr;
+    const int n_chunks = cols / VEC;            // <= 256
+    flash_rt::pdl::pdl_trigger();
+    // the norm weight is constant: fetch it before the dependency wait
+    uint4 wr[PER];
+    #pragma unroll
+    for (int k = 0; k < PER; ++k) {
+        const int c = lane + 32 * (r + R * k);
+        if (c < n_chunks) wr[k] = reinterpret_cast<const uint4*>(rms_weight)[c];
+    }
+    flash_rt::pdl::pdl_wait();
+    const bool live = row < rows;
+    const __nv_bfloat16* row_in = x + (size_t)(live ? row : 0) * cols;
+
+    uint4 xr[PER];
+    #pragma unroll
+    for (int k = 0; k < PER; ++k) {
+        const int c = lane + 32 * (r + R * k);
+        if (live && c < n_chunks) xr[k] = reinterpret_cast<const uint4*>(row_in)[c];
+    }
+    #pragma unroll
+    for (int k = 0; k < PER; ++k) {
+        float local_ssq = 0.f;
+        const int c = lane + 32 * (r + R * k);
+        if (live && c < n_chunks) {
+            const __nv_bfloat16* v = reinterpret_cast<const __nv_bfloat16*>(&xr[k]);
+            #pragma unroll
+            for (int j = 0; j < VEC; ++j) {
+                float f = __bfloat162float(v[j]);
+                local_ssq += f * f;
+            }
+        }
+        float val = local_ssq;                  // warp_reduce_sum
+        val += __shfl_down_sync(0xffffffff, val, 16);
+        val += __shfl_down_sync(0xffffffff, val, 8);
+        val += __shfl_down_sync(0xffffffff, val, 4);
+        val += __shfl_down_sync(0xffffffff, val, 2);
+        val += __shfl_down_sync(0xffffffff, val, 1);
+        if (lane == 0) wsum[lr][r + R * k] = val;
+    }
+    __syncthreads();
+    if (!live) return;
+    // second level on {s0..s7, 0, ...}: the +0 steps are exact, leaving
+    // ((s0+s4)+(s2+s6)) + ((s1+s5)+(s3+s7)).
+    const float* ws = wsum[lr];
+    const float ssq = ((ws[0] + ws[4]) + (ws[2] + ws[6]))
+                    + ((ws[1] + ws[5]) + (ws[3] + ws[7]));
+    const float rms = rsqrtf(ssq / cols + eps);
+
+    uint8_t* row_fp4 = packed + (size_t)row * cols / 2;
+    const int rb = row / 128;
+    const int ri = row % 128;
+    const bool odd = lane & 1;
+    #pragma unroll
+    for (int k = 0; k < PER; ++k) {
+        const int c = lane + 32 * (r + R * k);  // chunk; block b = c / 2
+        if (32 * (r + R * k) >= n_chunks) break;  // warp-uniform
+        const __nv_bfloat16* v = reinterpret_cast<const __nv_bfloat16*>(&xr[k]);
+        const __nv_bfloat16* wt = reinterpret_cast<const __nv_bfloat16*>(&wr[k]);
+        float vals[VEC];
+        float amax = 0.f;
+        #pragma unroll
+        for (int j = 0; j < VEC; ++j) {
+            const __nv_bfloat16 nb = __float2bfloat16(
+                __bfloat162float(v[j]) * rms * __bfloat162float(wt[j]));
+            vals[j] = __bfloat162float(nb);
+            amax = fmaxf(amax, fabsf(vals[j]));
+        }
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1));
+        if (c >= n_chunks) continue;
+        const float scale = amax / 6.0f;
+        const uint8_t ue_scale = float_to_ue4m3_ceil(scale);
+        const int b = c >> 1;
+        if (!odd) {
+            const int cb = b / 4;
+            const int ci = b % 4;
+            sf_swz[(rb * n_col_blocks + cb) * 512 + (ri % 32) * 16 + (ri / 32) * 4 + ci] =
+                ue_scale;
+        }
+        const float fscale = ue4m3_to_float(ue_scale);
+        const float inv_scale = (fscale > 0.f) ? (1.f / fscale) : 0.f;
+        uint8_t pk[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+            pk[j] = float2_to_fp4_e2m1x2_exact(vals[2 * j] * inv_scale, vals[2 * j + 1] * inv_scale);
+        *reinterpret_cast<uint32_t*>(row_fp4 + c * 4) =
+            *reinterpret_cast<const uint32_t*>(pk);
+    }
+}
+
+template <int R, int ROWS>
+static void launch_rms_rows(const __nv_bfloat16* x, const __nv_bfloat16* w, uint8_t* packed,
+                            uint8_t* sf, int rows, int cols, int n_col_blocks, float eps,
+                            cudaStream_t stream) {
+    flash_rt::pdl::launch(rms_norm_to_nvfp4_swizzled_bf16_v3_rows_kernel<R, ROWS>,
+                          dim3((rows + ROWS - 1) / ROWS), dim3(32 * R * ROWS), 0, stream,
+                          flash_rt::pdl::enabled(),
+                          x, w, packed, sf, rows, cols, n_col_blocks, eps);
 }
 
 void rms_norm_to_nvfp4_swizzled_bf16_v3(
@@ -2072,9 +2323,35 @@ void rms_norm_to_nvfp4_swizzled_bf16_v3(
                                            rows, cols, eps, stream);
         return;
     }
+    // Rows the 256-thread kernel covers in a single chunk (cols <= 2048) take
+    // its register-resident twin (no smem staging, the norm weight fetched
+    // before the dependency wait): 3.70 vs 4.75 us at 256 x 2048, identical
+    // bytes. FLASHRT_RMS_NVFP4_ROWS=0 keeps the staged kernel for A/B work.
+    static const int rows_env = [] {
+        const char* e = std::getenv("FLASHRT_RMS_NVFP4_ROWS");
+        return e ? std::atoi(e) : -1;
+    }();
+    const bool rows_kernel = rows_env >= 0 ? rows_env != 0
+                                           : flash_rt::kernels::fast_producers();
+    if (rows_kernel && cols % 256 == 0 && cols <= 8 * threads) {
+        launch_rms_rows<8, 1>(x, rms_weight, packed, sf_swz, rows, cols, n_col_blocks, eps,
+                              stream);
+        return;
+    }
     size_t smem_size = 32 * sizeof(float) + cols * sizeof(__nv_bfloat16);
-    rms_norm_to_nvfp4_swizzled_bf16_v3_kernel<<<rows, threads, smem_size, stream>>>(
-        x, rms_weight, packed, sf_swz, cols, num_blocks, n_col_blocks, eps);
+    // The exact encoder is a model-scoped precision choice (VLA opts in);
+    // every other caller keeps the upstream branchless encoder.
+    if (flash_rt::kernels::fast_producers()) {
+        flash_rt::pdl::launch(rms_norm_to_nvfp4_swizzled_bf16_v3_kernel<true>,
+                          dim3(rows), dim3(threads),
+                          smem_size, stream, flash_rt::pdl::enabled(),
+                          x, rms_weight, packed, sf_swz, cols, num_blocks, n_col_blocks, eps);
+    } else {
+        flash_rt::pdl::launch(rms_norm_to_nvfp4_swizzled_bf16_v3_kernel<false>,
+                          dim3(rows), dim3(threads),
+                          smem_size, stream, flash_rt::pdl::enabled(),
+                          x, rms_weight, packed, sf_swz, cols, num_blocks, n_col_blocks, eps);
+    }
 }
 
 // ================================================================
@@ -2119,20 +2396,26 @@ __global__ void layer_norm_to_nvfp4_swizzled_bf16_kernel(
     float var = block_reduce_sum(local_var, warp_red);
     const float inv_std = rsqrtf(var / cols + eps);
 
-    for (int b = threadIdx.x; b < num_blocks; b += blockDim.x)
-        sf_smem[b] = 0.f;
-    __syncthreads();
-
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
-        float xv = __bfloat162float(row_in[i]);
-        float wv = __bfloat162float(weight[i]);
-        float bv = __bfloat162float(bias[i]);
-        float n_fp32 = (xv - mean) * inv_std * wv + bv;
-        __nv_bfloat16 nb = __float2bfloat16(n_fp32);
-        normed[i] = nb;
-        float n_bf16 = __bfloat162float(nb);
-        int blk = i >> 4;
-        atomicMax((int*)&sf_smem[blk], __float_as_int(fabsf(n_bf16)));
+    // One thread per 16-element quant block: the block amax is a sequential
+    // max over the thread's own 16 values (order-independent, so the result is
+    // identical to the atomicMax form) and it needs no shared-memory atomics or
+    // extra barrier -- the atomics made this kernel ~10x slower than its
+    // bandwidth floor.
+    for (int b = threadIdx.x; b < num_blocks; b += blockDim.x) {
+        float amax = 0.f;
+        const int i0 = b << 4;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const int i = i0 + j;
+            float xv = __bfloat162float(row_in[i]);
+            float wv = __bfloat162float(weight[i]);
+            float bv = __bfloat162float(bias[i]);
+            float n_fp32 = (xv - mean) * inv_std * wv + bv;
+            __nv_bfloat16 nb = __float2bfloat16(n_fp32);
+            normed[i] = nb;
+            amax = fmaxf(amax, fabsf(__bfloat162float(nb)));
+        }
+        sf_smem[b] = amax;
     }
     __syncthreads();
 
@@ -2165,6 +2448,276 @@ __global__ void layer_norm_to_nvfp4_swizzled_bf16_kernel(
     }
 }
 
+// ── v2: same math, warp-per-128-column chunks ──────────────────────────
+// One CTA per row, one warp per cols/nwarps chunk. The two LayerNorm
+// reductions become warp shuffles plus one 8-partial fold (three barriers in
+// total instead of six), each 16-element quant block is owned by one 4-lane
+// group (amax via a 2-step shuffle, no shared-memory atomics), and the row is
+// read once per pass from L2. Not bit-identical to v1: the reduction tree is
+// different, so the mean/variance differ in the last ulp.
+__global__ void layer_norm_to_nvfp4_swizzled_bf16_v2_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ bias,
+    uint8_t* __restrict__ packed,
+    uint8_t* __restrict__ sf_swz,
+    int cols, int num_blocks, int n_col_blocks,
+    float eps)
+{
+    const int row = blockIdx.x;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int nwarps = blockDim.x >> 5;
+    const int chunk = cols / nwarps;                 // multiple of 128
+    const int c0 = warp * chunk;
+    const __nv_bfloat16* row_in = x + (size_t)row * cols;
+    uint8_t* row_fp4 = packed + (size_t)row * cols / 2;
+
+    extern __shared__ float smem_dyn[];
+    float* part = smem_dyn;                          // [nwarps]
+    float* sfs = smem_dyn + nwarps;                  // [num_blocks] scales
+    __nv_bfloat16* normed = reinterpret_cast<__nv_bfloat16*>(sfs + num_blocks);
+
+    float s = 0.f;
+    for (int k = 0; k < chunk; k += 128) {
+        const int base = c0 + k + lane * 4;
+        const float4 raw = *reinterpret_cast<const float4*>(row_in + base);
+        const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&raw);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) s += __bfloat162float(h[j]);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffffu, s, off);
+    if (lane == 0) part[warp] = s;
+    __syncthreads();
+    if (warp == 0) {
+        float t = (lane < nwarps) ? part[lane] : 0.f;
+        for (int off = nwarps >> 1; off > 0; off >>= 1)
+            t += __shfl_xor_sync(0xffffffffu, t, off);
+        if (lane == 0) part[0] = t / (float)cols;
+    }
+    __syncthreads();
+    const float mean = part[0];
+    // `part` is reused below for the variance fold: every thread must have
+    // read the mean before warp 0 overwrites part[0].
+    __syncthreads();
+
+    float v = 0.f;
+    for (int k = 0; k < chunk; k += 128) {
+        const int base = c0 + k + lane * 4;
+        const float4 raw = *reinterpret_cast<const float4*>(row_in + base);
+        const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&raw);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float d = __bfloat162float(h[j]) - mean;
+            v += d * d;
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
+    if (lane == 0) part[warp] = v;
+    __syncthreads();
+    if (warp == 0) {
+        float t = (lane < nwarps) ? part[lane] : 0.f;
+        for (int off = nwarps >> 1; off > 0; off >>= 1)
+            t += __shfl_xor_sync(0xffffffffu, t, off);
+        if (lane == 0) part[0] = rsqrtf(t / (float)cols + eps);
+    }
+    __syncthreads();
+    const float inv_std = part[0];
+
+    // normalize through bf16, per-16-block amax inside a 4-lane group
+    for (int k = 0; k < chunk; k += 128) {
+        const int base = c0 + k + lane * 4;
+        float amax = 0.f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int i = base + j;
+            const float xv = __bfloat162float(row_in[i]);
+            const float wv = __bfloat162float(weight[i]);
+            const float bv = __bfloat162float(bias[i]);
+            const __nv_bfloat16 nb =
+                __float2bfloat16((xv - mean) * inv_std * wv + bv);
+            normed[i] = nb;
+            amax = fmaxf(amax, fabsf(__bfloat162float(nb)));
+        }
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+        const uint8_t ue = float_to_ue4m3_ceil(amax / 6.0f);
+        const float scale = (ue4m3_to_float(ue) > 0.f) ? ue4m3_to_float(ue) : 0.f;
+        const int blk = (base >> 4);
+        if ((lane & 3) == 0) {
+            const int cb = blk / 4, ci = blk % 4;
+            const int rb = row / 128, ri = row % 128;
+            sf_swz[(rb * n_col_blocks + cb) * 512 + (ri % 32) * 16
+                   + (ri / 32) * 4 + ci] = ue;
+        }
+        // pack this lane's 4 values with the group's scale
+        const float inv = (scale > 0.f) ? (1.f / scale) : 0.f;
+        const uint32_t two =
+            (uint32_t)float2_to_fp4_e2m1x2_exact(__bfloat162float(normed[base + 0]) * inv,
+                                                 __bfloat162float(normed[base + 1]) * inv) |
+            ((uint32_t)float2_to_fp4_e2m1x2_exact(__bfloat162float(normed[base + 2]) * inv,
+                                                  __bfloat162float(normed[base + 3]) * inv) << 8);
+        *reinterpret_cast<uint16_t*>(row_fp4 + (base >> 1)) = (uint16_t)two;
+    }
+}
+
+// ── v3: warp-per-row, register-cached ────────────────────────────────
+// One warp per row, EPL = cols/32 contiguous elements per lane: the row is
+// read once into registers, the mean/variance reductions are warp shuffles
+// (no block barrier and no second pass over the row), and each lane owns
+// whole 16-element quant blocks. The reduction tree differs from v2 in the
+// last ulp (same trade v2 made against v1). Same scale/pack math as v2.
+//
+// RES: the row is first rebuilt as residual = residual + x_add + add_bias
+// (fp32 sum in that order, one bf16 rounding -- the same math as the
+// standalone residual_add_bias_bf16 kernel), written back, and normalized
+// from those bf16 values, so the fused form is bit-identical to
+// [residual_add_bias_bf16 -> layer_norm_to_nvfp4_swizzled_bf16].
+// MERGE > 1: the operand is consumed as the spatially merged [rows/MERGE,
+// MERGE*cols] matrix (same row-major bytes); only the block-scale swizzle
+// coordinates change.
+template <int EPL, bool RES = false, int MERGE = 1, bool Exact = false>
+__global__ void layer_norm_to_nvfp4_swizzled_bf16_v3_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ bias,
+    uint8_t* __restrict__ packed,
+    uint8_t* __restrict__ sf_swz,
+    int cols, int n_col_blocks, float eps, int rows,
+    const __nv_bfloat16* __restrict__ x_add = nullptr,
+    const __nv_bfloat16* __restrict__ add_bias = nullptr,
+    __nv_bfloat16* res_out = nullptr)
+{
+    flash_rt::pdl::pdl_trigger();
+    flash_rt::pdl::pdl_wait();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (row >= rows) return;
+    const int base0 = lane * EPL;
+    const __nv_bfloat16* row_in = x + (size_t)row * cols;
+    const __nv_bfloat16* wrow = weight + base0;
+    const __nv_bfloat16* brow = bias + base0;
+    uint8_t* row_fp4 = packed + (size_t)row * cols / 2;
+    const int mrow = row / MERGE;
+    const int rb = mrow >> 7, ri = mrow & 127;
+    const int blk_off = (row % MERGE) * (cols >> 4);
+
+    uint4 raw[EPL / 8];
+#pragma unroll
+    for (int k = 0; k < EPL / 8; ++k)
+        raw[k] = reinterpret_cast<const uint4*>(row_in + base0)[k];
+    if constexpr (RES) {
+        const __nv_bfloat16* add_row = x_add + (size_t)row * cols + base0;
+#pragma unroll
+        for (int k = 0; k < EPL / 8; ++k) {
+            const uint4 ar = reinterpret_cast<const uint4*>(add_row)[k];
+            const uint4 br = reinterpret_cast<const uint4*>(add_bias + base0)[k];
+            __nv_bfloat16* r = reinterpret_cast<__nv_bfloat16*>(&raw[k]);
+            const __nv_bfloat16* a = reinterpret_cast<const __nv_bfloat16*>(&ar);
+            const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&br);
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                r[j] = __float2bfloat16(__bfloat162float(r[j]) + __bfloat162float(a[j])
+                                        + __bfloat162float(b[j]));
+            reinterpret_cast<uint4*>(res_out + (size_t)row * cols + base0)[k] = raw[k];
+        }
+    }
+    const __nv_bfloat16* v = reinterpret_cast<const __nv_bfloat16*>(raw);
+
+    float s = 0.f;
+#pragma unroll
+    for (int i = 0; i < EPL; ++i) s += __bfloat162float(v[i]);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffffu, s, off);
+    const float mean = s / (float)cols;
+
+    float vr = 0.f;
+#pragma unroll
+    for (int i = 0; i < EPL; ++i) {
+        const float d = __bfloat162float(v[i]) - mean;
+        vr += d * d;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) vr += __shfl_xor_sync(0xffffffffu, vr, off);
+    const float inv_std = rsqrtf(vr / (float)cols + eps);
+
+#pragma unroll
+    for (int b = 0; b < EPL / 16; ++b) {
+        uint4 wr0 = reinterpret_cast<const uint4*>(wrow + b * 16)[0];
+        uint4 wr1 = reinterpret_cast<const uint4*>(wrow + b * 16)[1];
+        uint4 br0 = reinterpret_cast<const uint4*>(brow + b * 16)[0];
+        uint4 br1 = reinterpret_cast<const uint4*>(brow + b * 16)[1];
+        const __nv_bfloat16* w = reinterpret_cast<const __nv_bfloat16*>(&wr0);
+        const __nv_bfloat16* w2 = reinterpret_cast<const __nv_bfloat16*>(&wr1);
+        const __nv_bfloat16* bi = reinterpret_cast<const __nv_bfloat16*>(&br0);
+        const __nv_bfloat16* bi2 = reinterpret_cast<const __nv_bfloat16*>(&br1);
+        float vals[16];
+        float amax = 0.f;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const float wv = (j < 8) ? __bfloat162float(w[j])
+                                     : __bfloat162float(w2[j - 8]);
+            const float bv = (j < 8) ? __bfloat162float(bi[j])
+                                     : __bfloat162float(bi2[j - 8]);
+            const __nv_bfloat16 nb = __float2bfloat16(
+                (__bfloat162float(v[b * 16 + j]) - mean) * inv_std * wv + bv);
+            vals[j] = __bfloat162float(nb);
+            amax = fmaxf(amax, fabsf(vals[j]));
+        }
+        const uint8_t ue = float_to_ue4m3_ceil(amax / 6.0f);
+        const float fscale = ue4m3_to_float(ue);
+        const float inv = (fscale > 0.f) ? (1.f / fscale) : 0.f;
+        uint8_t pk[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            if constexpr (Exact) {
+                pk[j] = float2_to_fp4_e2m1x2_exact(
+                    vals[2 * j] * inv, vals[2 * j + 1] * inv);
+            } else {
+                uint8_t lo = float_to_fp4_e2m1_branchless(vals[2 * j] * inv);
+                uint8_t hi = float_to_fp4_e2m1_branchless(vals[2 * j + 1] * inv);
+                pk[j] = (hi << 4) | (lo & 0x0F);
+            }
+        }
+        *reinterpret_cast<uint2*>(row_fp4 + (base0 + b * 16) / 2) =
+            *reinterpret_cast<const uint2*>(pk);
+        const int blk = blk_off + ((base0 + b * 16) >> 4);
+        const int cb = blk / 4, ci = blk % 4;
+        sf_swz[(rb * n_col_blocks * MERGE + cb) * 512 + (ri % 32) * 16
+               + (ri / 32) * 4 + ci] = ue;
+    }
+}
+
+int residual_add_bias_layer_norm_to_nvfp4_swizzled_bf16(
+    __nv_bfloat16* residual,
+    const __nv_bfloat16* x_add,
+    const __nv_bfloat16* add_bias,
+    const __nv_bfloat16* weight,
+    const __nv_bfloat16* bias,
+    uint8_t* packed,
+    uint8_t* sf_swz,
+    int rows, int cols, float eps,
+    cudaStream_t stream, int merge)
+{
+    // the register-cached v3 body is instantiated for the 1024-wide tower rows
+    if (cols != 1024 || rows <= 0 || (merge != 1 && merge != 4) || rows % merge)
+        return static_cast<int>(cudaErrorInvalidValue);
+    const int n_col_blocks = (cols / 16 + 3) / 4;
+    const int warps = 8;
+    const bool exact = flash_rt::kernels::fast_producers();
+    auto kern = merge == 4
+        ? (exact ? layer_norm_to_nvfp4_swizzled_bf16_v3_kernel<32, true, 4, true>
+                 : layer_norm_to_nvfp4_swizzled_bf16_v3_kernel<32, true, 4, false>)
+        : (exact ? layer_norm_to_nvfp4_swizzled_bf16_v3_kernel<32, true, 1, true>
+                 : layer_norm_to_nvfp4_swizzled_bf16_v3_kernel<32, true, 1, false>);
+    return static_cast<int>(flash_rt::pdl::launch(
+        kern, dim3((rows + warps - 1) / warps),
+        dim3(warps * 32), 0, stream, flash_rt::pdl::enabled(),
+        static_cast<const __nv_bfloat16*>(residual), weight, bias, packed, sf_swz, cols,
+        n_col_blocks, eps, rows, x_add, add_bias, residual));
+}
+
 void layer_norm_to_nvfp4_swizzled_bf16(
     const __nv_bfloat16* x,
     const __nv_bfloat16* weight,
@@ -2177,6 +2730,48 @@ void layer_norm_to_nvfp4_swizzled_bf16(
     int num_blocks = (cols + 15) / 16;
     int n_col_blocks = (num_blocks + 3) / 4;
     int threads = 256;
+    const int nwarps = threads / 32;
+    static const int v3_env = [] {
+        const char* e = std::getenv("FLASHRT_LN_QUANT_V3");
+        return e ? std::atoi(e) : -1;
+    }();
+    const bool use_v3 = v3_env >= 0 ? v3_env != 0
+                                    : flash_rt::kernels::fast_producers();
+    // Measured at the production shapes: 1024 cols 7.19 -> 5.36 us; 2048 cols
+    // regresses (7.06 -> 8.91 us, register pressure), so v3 takes only the
+    // tower width and the wider rows keep the v2 chain.
+    if (use_v3 && cols == 1024) {
+        const int warps = 8;
+        const int grid = (rows + warps - 1) / warps;
+        if (use_v3) {
+            flash_rt::pdl::launch(
+                layer_norm_to_nvfp4_swizzled_bf16_v3_kernel<32, false, 1, true>,
+                dim3(grid), dim3(warps * 32), 0, stream,
+                flash_rt::pdl::enabled(), x, weight, bias, packed, sf_swz,
+                cols, n_col_blocks, eps, rows,
+                static_cast<const __nv_bfloat16*>(nullptr),
+                static_cast<const __nv_bfloat16*>(nullptr),
+                static_cast<__nv_bfloat16*>(nullptr));
+        } else {
+            flash_rt::pdl::launch(
+                layer_norm_to_nvfp4_swizzled_bf16_v3_kernel<32, false, 1, false>,
+                dim3(grid), dim3(warps * 32), 0, stream,
+                flash_rt::pdl::enabled(), x, weight, bias, packed, sf_swz,
+                cols, n_col_blocks, eps, rows,
+                static_cast<const __nv_bfloat16*>(nullptr),
+                static_cast<const __nv_bfloat16*>(nullptr),
+                static_cast<__nv_bfloat16*>(nullptr));
+        }
+        return;
+    }
+    if (cols % (128 * nwarps) == 0) {
+        // v2: warp-per-128-column chunks, three barriers, no atomics.
+        size_t smem_v2 = (nwarps + num_blocks) * sizeof(float)
+                         + cols * sizeof(__nv_bfloat16);
+        layer_norm_to_nvfp4_swizzled_bf16_v2_kernel<<<rows, threads, smem_v2, stream>>>(
+            x, weight, bias, packed, sf_swz, cols, num_blocks, n_col_blocks, eps);
+        return;
+    }
     size_t smem_size = 32 * sizeof(float)
                        + num_blocks * sizeof(float)
                        + cols * sizeof(__nv_bfloat16);

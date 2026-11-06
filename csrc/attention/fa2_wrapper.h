@@ -95,6 +95,19 @@ FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_bf16_tile(
     int o_batch_stride, int o_row_stride, int o_head_stride,
     float softmax_scale, int num_sms, cudaStream_t stream);
 
+// VLA-only smallq entry: same contract as fwd_bf16_tile, with the
+// target-validated hd64 tile enabled. Other callers keep fwd_bf16_tile.
+FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_bf16_tile_vla(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr, const void* seqused_k_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream);
+
 // X-VLA tile entries are exported by the raw library for its Python adapter.
 // PDL is explicit per call; existing FA2 entry signatures are unchanged.
 
@@ -135,6 +148,19 @@ FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_bf16_tile64(
     float softmax_scale, int num_sms, cudaStream_t stream, int enable_pdl);
 
 
+// Target-validated smallq tile with the NVFP4 O epilogue: packed e2m1 +
+// swizzled UE4M3 scales, head_dim 64, contiguous [batch*seqlen, heads*64] O.
+FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_bf16_tile_fp4out(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_fp4_ptr, void* o_sf_ptr, void* softmax_lse_ptr,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, cudaStream_t stream);
+
 // head_dim 64 tile with a fused NVFP4 quantize of the O tile (head_dim must be 64;
 // null o_packed/o_sfa falls back to fvk_attention_fa2_fwd_bf16_tile64).
 FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_bf16_tile64_qnvfp4(
@@ -142,6 +168,22 @@ FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_bf16_tile64_qnvfp4(
     void* o_ptr, void* softmax_lse_ptr, const void* seqused_k_ptr,
     void* o_packed_ptr, void* o_sfa_ptr,
     int o_packed_row_bytes, int o_sfa_n_col_blocks,
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads_q, int num_heads_kv, int head_dim,
+    int q_batch_stride, int q_row_stride, int q_head_stride,
+    int k_batch_stride, int k_row_stride, int k_head_stride,
+    int v_batch_stride, int v_row_stride, int v_head_stride,
+    int o_batch_stride, int o_row_stride, int o_head_stride,
+    float softmax_scale, int num_sms, cudaStream_t stream, int enable_pdl);
+
+// Batched variant: per-batch packed/SF operands are contiguous and the
+// caller passes their byte strides. Zero strides = the entry above.
+FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_bf16_tile64_qnvfp4_batched(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr,
+    void* o_ptr, void* softmax_lse_ptr, const void* seqused_k_ptr,
+    void* o_packed_ptr, void* o_sfa_ptr,
+    int o_packed_row_bytes, int o_sfa_n_col_blocks,
+    int o_packed_batch_stride, int o_sfa_batch_stride,
     int batch, int seqlen_q, int seqlen_k,
     int num_heads_q, int num_heads_kv, int head_dim,
     int q_batch_stride, int q_row_stride, int q_head_stride,

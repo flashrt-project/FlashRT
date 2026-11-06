@@ -25,7 +25,8 @@ namespace attention {
 
 // Returns 0 on success; non-zero when the shape is outside the kernel's
 // support envelope (caller should fall back to FA2):
-//   Lq == Lk, Lq a multiple of 128, Hq == 32, Hkv == 8, head_dim == 128.
+//   Lq == Lk, Lq a multiple of 128, (Hq, Hkv) in {(32, 8), (16, 8)},
+//   head_dim == 128.
 int fmha_fp8_causal_gqa_nhd_d128(
     const void*  q_fp8,
     const void*  k_fp8,
@@ -90,6 +91,28 @@ int fmha_fp8_causal_gqa_q64_nhd_d128_fp4out(
     int          num_kv_heads,
     float        softmax_scale,
     cudaStream_t stream);
+
+// VLA-JEPA 16 Q / 8 KV fp4-out entry ported from the production target
+// (4 warps x 16 rows, two CTAs per SM; target-validated bit-identical
+// 64-row schedule). New symbol; the upstream q64 entries are unchanged.
+int fmha_fp8_causal_gqa_q64_fp4out_vla(
+    const void* q_fp8, const void* k_fp8, const void* v_fp8,
+    void* out_fp4, void* out_sf,
+    int Lq, int Lk, int num_q_heads, int num_kv_heads,
+    float softmax_scale, cudaStream_t stream);
+
+// VLA-JEPA 16 Q / 8 KV variants of the 64x64 tile. Additive; the 32/8
+// entries above are unchanged.
+int fmha_fp8_causal_gqa_q64_nhd_d128_16_8(
+    const void* q_fp8, const void* k_fp8, const void* v_fp8, void* out_bf16,
+    int Lq, int Lk, int num_q_heads, int num_kv_heads,
+    float softmax_scale, cudaStream_t stream);
+
+int fmha_fp8_causal_gqa_q64_nhd_d128_fp4out_16_8(
+    const void* q_fp8, const void* k_fp8, const void* v_fp8,
+    void* out_fp4, void* out_sf,
+    int Lq, int Lk, int num_q_heads, int num_kv_heads,
+    float softmax_scale, cudaStream_t stream);
 
 }  // namespace attention
 }  // namespace flash_rt

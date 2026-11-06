@@ -29,6 +29,7 @@
 #include "cutlass/util/packed_stride.hpp"
 
 #include "sm120_silu_mul_blockscale_visitor.hpp"
+#include "../../kernels/pdl_launch.cuh"
 
 #include <cstdio>
 #include <mutex>
@@ -245,7 +246,7 @@ void fp4_w4a16_dual_gemm_silu_fp4out_sm120(
         "M=%d N=%d K=%d status=%d\n", M, N, K, int(status));
     return;
   }
-  status = gemm.run(stream);
+  status = gemm.run(stream, nullptr, flash_rt::pdl::enabled());
   if (status != cutlass::Status::kSuccess) {
     std::fprintf(stderr,
         "[fp4_w4a16_dual_gemm_silu_fp4out_sm120] run FAIL status=%d\n",

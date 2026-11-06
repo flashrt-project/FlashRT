@@ -283,7 +283,7 @@ void bias_residual_out_bf16(const __nv_bfloat16* residual,
 // ── Residual Add ──
 template<typename T>
 __global__ void res_add_kernel(T* __restrict__ residual,
-                               const T* __restrict__ x, int n) {
+                               const T* __restrict__ x, int n, int tail) {
     using T2 = typename packed2<T>::type;
     T2* res2 = reinterpret_cast<T2*>(residual);
     const T2* x2 = reinterpret_cast<const T2*>(x);
@@ -294,21 +294,33 @@ __global__ void res_add_kernel(T* __restrict__ residual,
         res2[idx] = make_packed2<T>(
             from_f32<T>(to_f32(rv.x) + to_f32(xv.x)),
             from_f32<T>(to_f32(rv.y) + to_f32(xv.y)));
+    } else if (tail && idx == n2 && (n & 1)) {
+        // Odd tail: the vectorized body covers 2*n2 = n-1 elements, so the
+        // last element needs its own scalar add (n = 49 for a 7x7 action
+        // chunk would otherwise leave the final element unwritten).
+        const int i = n - 1;
+        residual[i] = from_f32<T>(to_f32(residual[i]) + to_f32(x[i]));
     }
 }
 
-template __global__ void res_add_kernel<__half>(__half*, const __half*, int);
-template __global__ void res_add_kernel<__nv_bfloat16>(__nv_bfloat16*, const __nv_bfloat16*, int);
+template __global__ void res_add_kernel<__half>(__half*, const __half*, int, int);
+template __global__ void res_add_kernel<__nv_bfloat16>(__nv_bfloat16*, const __nv_bfloat16*, int, int);
 
 void residual_add(__nv_bfloat16* residual, const __nv_bfloat16* x, int n,
-                  cudaStream_t stream) {
+                  cudaStream_t stream, bool include_tail) {
     int n2 = n >> 1;
-    res_add_kernel<__nv_bfloat16><<<(n2 + 255) / 256, 256, 0, stream>>>(residual, x, n);
+    // The tail thread is opt-in: existing callers keep the original
+    // vector-only launch and therefore the original behaviour.
+    int threads = n2 + ((include_tail && (n & 1)) ? 1 : 0);
+    res_add_kernel<__nv_bfloat16><<<(threads + 255) / 256, 256, 0, stream>>>(
+        residual, x, n, include_tail ? 1 : 0);
 }
 void residual_add_fp16(__half* residual, const __half* x, int n,
-                       cudaStream_t stream) {
+                       cudaStream_t stream, bool include_tail) {
     int n2 = n >> 1;
-    res_add_kernel<__half><<<(n2 + 255) / 256, 256, 0, stream>>>(residual, x, n);
+    int threads = n2 + ((include_tail && (n & 1)) ? 1 : 0);
+    res_add_kernel<__half><<<(threads + 255) / 256, 256, 0, stream>>>(
+        residual, x, n, include_tail ? 1 : 0);
 }
 
 template<typename T>

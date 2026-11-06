@@ -261,7 +261,8 @@ void fp8_block128_gemm_cutlass_sm120_bf16out(
     int M, int N, int K,
     const float* act_block_scale,
     const float* w_block_scale,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    int schedule)
 {
   // Schedule selection: small M -> Pingpong (better latency at low
   // arithmetic intensity); large M -> Cooperative (better throughput
@@ -278,7 +279,12 @@ void fp8_block128_gemm_cutlass_sm120_bf16out(
   const int n_tiles = (N + 127) / 128;
   const int waves_128 = (((M + 127) / 128) * n_tiles + sms - 1) / sms;
   const int waves_64 = (((M + 63) / 64) * n_tiles + sms - 1) / sms;
-  const bool pingpong = M <= 64 || 4 * waves_64 <= 7 * waves_128;
+  // Optional explicit schedule: -1 keeps the measured automatic heuristic,
+  // 0 forces Cooperative, 1 forces Pingpong. The VLA-JEPA DeepStack merger
+  // runs on a low-priority graph branch where the 64-row Pingpong tile is not
+  // replay-deterministic; it passes 0 explicitly. Other models keep -1.
+  const bool pingpong = M <= 64 || schedule == 1 ||
+                        (schedule != 0 && 4 * waves_64 <= 7 * waves_128);
   cutlass::Status status;
   if (pingpong) {
     status = run_gemm<PingpongGemm>(

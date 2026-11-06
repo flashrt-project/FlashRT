@@ -3,6 +3,7 @@
 // Fused q_norm/k_norm + RoPE + Q_buf/KV cache write.
 // See qwen3_qkv_post_proc.cuh for design notes.
 
+#include "pdl_launch.cuh"
 #include "qwen3_qkv_post_proc.cuh"
 
 #include <assert.h>
@@ -669,6 +670,29 @@ __device__ __forceinline__ void norm_rope_warp4_fp8_direct(
   *reinterpret_cast<__nv_fp8x4_e4m3*>(dst8 + 4 * lane) = packed;
 }
 
+// norm_rope_warp4_fp8_direct with the head's values, the norm weights and
+// the RoPE row already in registers (callers hoist those loads so a warp's
+// heads have their global latencies in flight together). Same arithmetic.
+__device__ __forceinline__ void norm_rope_regs_fp8(
+    float v0, float v1, float v2, float v3, float w0, float w1, float w2, float w3,
+    float c0, float c1, float c2, float c3, float s0, float s1, float s2, float s3,
+    __nv_fp8_e4m3* dst8, int lane, float eps) {
+  float sq = v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3;
+  #pragma unroll
+  for (int off = 16; off > 0; off >>= 1) sq += __shfl_xor_sync(0xffffffff, sq, off);
+  float rstd = rsqrtf(sq / float(HEAD_DIM) + eps);
+  float n0 = v0 * rstd * w0, n1 = v1 * rstd * w1, n2 = v2 * rstd * w2, n3 = v3 * rstd * w3;
+  float pn0 = __shfl_xor_sync(0xffffffff, n0, 16);
+  float pn1 = __shfl_xor_sync(0xffffffff, n1, 16);
+  float pn2 = __shfl_xor_sync(0xffffffff, n2, 16);
+  float pn3 = __shfl_xor_sync(0xffffffff, n3, 16);
+  float sgn = (lane < 16) ? -1.f : 1.f;
+  float o0 = n0 * c0 + sgn * pn0 * s0, o1 = n1 * c1 + sgn * pn1 * s1;
+  float o2 = n2 * c2 + sgn * pn2 * s2, o3 = n3 * c3 + sgn * pn3 * s3;
+  __nv_fp8x4_e4m3 packed(make_float4(o0, o1, o2, o3));
+  *reinterpret_cast<__nv_fp8x4_e4m3*>(dst8 + 4 * lane) = packed;
+}
+
 __global__ void q_norm_rope_qstage_prefill_v3_fp8_direct_kernel(
     const __nv_bfloat16* __restrict__ q_pre, const __nv_bfloat16* __restrict__ q_norm_w,
     const __nv_bfloat16* __restrict__ cos_v, const __nv_bfloat16* __restrict__ sin_v,
@@ -705,22 +729,134 @@ __global__ void k_norm_rope_kvwrite_prefill_v3_fp8_direct_kernel(
   for (int head = warp; head < n_kv; head += n_warps) {
     norm_rope_warp4_fp8_direct(
         k_pre + (size_t)row * in_row_stride + head * HEAD_DIM, k_norm_w, cos_r, sin_r,
-        k_cache + (size_t)row * cache_row_stride + head * HEAD_DIM,
+        k_cache == nullptr
+            ? nullptr
+            : k_cache + (size_t)row * cache_row_stride + head * HEAD_DIM,
         k8 + ((size_t)row * n_kv + head) * HEAD_DIM, lane, eps);
-    // V: copy bf16 -> v_cache (decode path) AND cast -> e4m3 for the
-    // all-fp8 prefill attention.
+    // V: cast -> e4m3 for the all-fp8 prefill attention, plus the optional
+    // bf16 cache write the bf16-attention route needs (null in the fp8 route).
     const __nv_bfloat16* v_row = v_pre + (size_t)row * in_row_stride + head * HEAD_DIM;
-    __nv_bfloat16* vdst = v_cache + (size_t)row * cache_row_stride + head * HEAD_DIM;
     float a0, a1, a2, a3;
     load4_bf16(v_row + 4 * lane, a0, a1, a2, a3);
-    store4_bf16(vdst + 4 * lane, a0, a1, a2, a3);
+    if (v_cache != nullptr) {
+      __nv_bfloat16* vdst = v_cache + (size_t)row * cache_row_stride + head * HEAD_DIM;
+      store4_bf16(vdst + 4 * lane, a0, a1, a2, a3);
+    }
     __nv_fp8x4_e4m3 packed(make_float4(a0, a1, a2, a3));
     *reinterpret_cast<__nv_fp8x4_e4m3*>(
         v8 + ((size_t)row * n_kv + head) * HEAD_DIM + 4 * lane) = packed;
   }
 }
 
+// Single-launch Q + K/V producer for the all-fp8 prefill route. grid.y = 0
+// executes exactly the Q-stage blocks and grid.y = 1 exactly the K/V-write
+// blocks of the two standalone kernels (same device function, same thread
+// mapping), so the outputs are identical; the two independent launches merge
+// into one and neither writes cache-shaped bf16 scratch the fp8 route never
+// reads.
+__global__ void qk_norm_rope_prefill_v3_fp8_direct_kernel(
+    const __nv_bfloat16* __restrict__ q_pre,
+    const __nv_bfloat16* __restrict__ k_pre,
+    const __nv_bfloat16* __restrict__ v_pre,
+    const __nv_bfloat16* __restrict__ q_norm_w,
+    const __nv_bfloat16* __restrict__ k_norm_w,
+    const __nv_bfloat16* __restrict__ cos_v,
+    const __nv_bfloat16* __restrict__ sin_v,
+    __nv_fp8_e4m3* __restrict__ q8,
+    __nv_fp8_e4m3* __restrict__ k8,
+    __nv_fp8_e4m3* __restrict__ v8,
+    int n_q, int n_kv, int S, int in_row_stride, float eps) {
+  flash_rt::pdl::pdl_trigger();
+  flash_rt::pdl::pdl_wait();
+  int row = blockIdx.x;
+  if (row >= S) return;
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  int n_warps = blockDim.x >> 5;
+  const __nv_bfloat16* cos_r = cos_v + (size_t)row * HALF;
+  const __nv_bfloat16* sin_r = sin_v + (size_t)row * HALF;
+  if (blockIdx.y == 0 && n_q == 2 * n_warps) {
+    // Q stage, two heads per warp: every global load of both heads (values,
+    // norm weights, RoPE row) is issued before any reduction.
+    const int h0 = warp, h1 = warp + n_warps;
+    const __nv_bfloat16* r = q_pre + (size_t)row * in_row_stride + 4 * lane;
+    float a0, a1, a2, a3, b0, b1, b2, b3, w0, w1, w2, w3, c0, c1, c2, c3, s0, s1, s2, s3;
+    load4_bf16(r + h0 * HEAD_DIM, a0, a1, a2, a3);
+    load4_bf16(r + h1 * HEAD_DIM, b0, b1, b2, b3);
+    load4_bf16(q_norm_w + 4 * lane, w0, w1, w2, w3);
+    const int ci = 4 * (lane & 15);
+    load4_bf16(cos_r + ci, c0, c1, c2, c3);
+    load4_bf16(sin_r + ci, s0, s1, s2, s3);
+    norm_rope_regs_fp8(a0, a1, a2, a3, w0, w1, w2, w3, c0, c1, c2, c3, s0, s1, s2, s3,
+                       q8 + ((size_t)row * n_q + h0) * HEAD_DIM, lane, eps);
+    norm_rope_regs_fp8(b0, b1, b2, b3, w0, w1, w2, w3, c0, c1, c2, c3, s0, s1, s2, s3,
+                       q8 + ((size_t)row * n_q + h1) * HEAD_DIM, lane, eps);
+  } else if (blockIdx.y == 0) {
+    for (int head = warp; head < n_q; head += n_warps) {
+      norm_rope_warp4_fp8_direct(
+          q_pre + (size_t)row * in_row_stride + head * HEAD_DIM, q_norm_w,
+          cos_r, sin_r, nullptr,
+          q8 + ((size_t)row * n_q + head) * HEAD_DIM, lane, eps);
+    }
+  } else if (n_kv == n_warps) {
+    // K/V stage, one head per warp: the K values, V values, norm weights and
+    // RoPE row are all requested before the K reduction.
+    const int head = warp;
+    float a0, a1, a2, a3, v0, v1, v2, v3, w0, w1, w2, w3, c0, c1, c2, c3, s0, s1, s2, s3;
+    load4_bf16(k_pre + (size_t)row * in_row_stride + head * HEAD_DIM + 4 * lane, a0, a1, a2, a3);
+    load4_bf16(v_pre + (size_t)row * in_row_stride + head * HEAD_DIM + 4 * lane, v0, v1, v2, v3);
+    load4_bf16(k_norm_w + 4 * lane, w0, w1, w2, w3);
+    const int ci = 4 * (lane & 15);
+    load4_bf16(cos_r + ci, c0, c1, c2, c3);
+    load4_bf16(sin_r + ci, s0, s1, s2, s3);
+    norm_rope_regs_fp8(a0, a1, a2, a3, w0, w1, w2, w3, c0, c1, c2, c3, s0, s1, s2, s3,
+                       k8 + ((size_t)row * n_kv + head) * HEAD_DIM, lane, eps);
+    __nv_fp8x4_e4m3 packed(make_float4(v0, v1, v2, v3));
+    *reinterpret_cast<__nv_fp8x4_e4m3*>(
+        v8 + ((size_t)row * n_kv + head) * HEAD_DIM + 4 * lane) = packed;
+  } else {
+    for (int head = warp; head < n_kv; head += n_warps) {
+      norm_rope_warp4_fp8_direct(
+          k_pre + (size_t)row * in_row_stride + head * HEAD_DIM, k_norm_w,
+          cos_r, sin_r, nullptr,
+          k8 + ((size_t)row * n_kv + head) * HEAD_DIM, lane, eps);
+      // V: cast -> e4m3 for the all-fp8 prefill attention.
+      const __nv_bfloat16* v_row =
+          v_pre + (size_t)row * in_row_stride + head * HEAD_DIM;
+      float a0, a1, a2, a3;
+      load4_bf16(v_row + 4 * lane, a0, a1, a2, a3);
+      __nv_fp8x4_e4m3 packed(make_float4(a0, a1, a2, a3));
+      *reinterpret_cast<__nv_fp8x4_e4m3*>(
+          v8 + ((size_t)row * n_kv + head) * HEAD_DIM + 4 * lane) = packed;
+    }
+  }
+}
+
 }  // namespace
+
+int qwen3_qk_norm_rope_prefill_v3_fp8_direct(
+    const void* q_pre, const void* k_pre, const void* v_pre,
+    const void* q_norm_w, const void* k_norm_w, const void* cos, const void* sin,
+    void* q8_dst, void* k8_dst, void* v8_dst,
+    int n_q_heads, int n_kv_heads, int S, int in_row_stride, float eps,
+    cudaStream_t stream) {
+  if (!q_pre || !k_pre || !v_pre || !q_norm_w || !k_norm_w || !cos || !sin
+      || !q8_dst || !k8_dst || !v8_dst) return 1;
+  if (n_q_heads <= 0 || n_kv_heads <= 0 || S <= 0) return 2;
+  flash_rt::pdl::launch(qk_norm_rope_prefill_v3_fp8_direct_kernel, dim3(S, 2), dim3(256), 0,
+      stream, flash_rt::pdl::enabled(),
+      reinterpret_cast<const __nv_bfloat16*>(q_pre),
+      reinterpret_cast<const __nv_bfloat16*>(k_pre),
+      reinterpret_cast<const __nv_bfloat16*>(v_pre),
+      reinterpret_cast<const __nv_bfloat16*>(q_norm_w),
+      reinterpret_cast<const __nv_bfloat16*>(k_norm_w),
+      reinterpret_cast<const __nv_bfloat16*>(cos),
+      reinterpret_cast<const __nv_bfloat16*>(sin),
+      reinterpret_cast<__nv_fp8_e4m3*>(q8_dst),
+      reinterpret_cast<__nv_fp8_e4m3*>(k8_dst),
+      reinterpret_cast<__nv_fp8_e4m3*>(v8_dst),
+      n_q_heads, n_kv_heads, S, in_row_stride, eps);
+  return 0;
+}
 
 int qwen3_q_norm_rope_qstage_prefill_v3_fp8(
     const void* q_pre, const void* q_norm_w, const void* cos, const void* sin,
@@ -792,8 +928,10 @@ int qwen3_k_norm_rope_kvwrite_prefill_v3_fp8_direct(
     void* k8_dst, void* v8_dst,
     int n_kv_heads, int S, int in_row_stride, int cache_row_stride, float eps,
     cudaStream_t stream) {
-  if (!k_pre || !v_pre || !k_norm_w || !cos || !sin || !k_cache_dst
-      || !v_cache_dst || !k8_dst || !v8_dst) return 1;
+  // k_cache_dst / v_cache_dst are the bf16-attention route's cache-shaped
+  // scratch and may be null: the all-fp8 route consumes only k8/v8, and the
+  // kernel skips the dead bf16 stores when they are null.
+  if (!k_pre || !v_pre || !k_norm_w || !cos || !sin || !k8_dst || !v8_dst) return 1;
   if (n_kv_heads <= 0 || S <= 0) return 2;
   k_norm_rope_kvwrite_prefill_v3_fp8_direct_kernel<<<dim3(S), dim3(256), 0, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(k_pre),

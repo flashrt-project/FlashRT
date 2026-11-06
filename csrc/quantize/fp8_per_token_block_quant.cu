@@ -3,6 +3,7 @@
 // Per-token x per-128 FP8 e4m3 quantization. See header for spec.
 
 #include "fp8_per_token_block_quant.cuh"
+#include "kernels/kernel_policy.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -10,7 +11,11 @@
 #include <cstdint>
 #endif  // FLASHRT_ENABLE_LINGBOT_VA_SM89
 #include <cuda_runtime.h>
+#include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
+
+#include "kernels/pdl_launch.cuh"
 
 namespace flash_rt {
 namespace quantize {
@@ -164,6 +169,50 @@ __global__ void fp8_per_token_block_quant_kernel(
     q = fminf(fmaxf(q, -kFp8Max), kFp8Max);
     output[m * K + k] = __nv_fp8_e4m3(q);
   }
+}
+
+// Vectorized form: one warp per 128-element scale block, 4 contiguous bf16 per
+// lane (one 8-byte load, one 4-byte store) and a warp-shuffle-only amax, so
+// there is no shared memory and no __syncthreads. Bit-identical to the
+// 128-thread form above: max is order-independent and the per-element
+// arithmetic (scale, clamp, e4m3 conversion) is unchanged. One CTA covers
+// kWarpsPerCta consecutive blocks, which for a row-major [M, K] input is
+// contiguous memory across the CTA.
+__global__ void fp8_per_token_block_quant_warp_kernel(
+    const __nv_bfloat16* __restrict__ input,
+    __nv_fp8_e4m3* __restrict__ output,
+    float* __restrict__ scale,
+    int M, int K)
+{
+  constexpr int kWarpsPerCta = 8;
+  const int kb_per_row = K / kBlock;
+  const int lane = threadIdx.x & 31;
+  const int b = blockIdx.x * kWarpsPerCta + (threadIdx.x >> 5);
+  if (b >= M * kb_per_row) return;
+  const int m = b / kb_per_row;
+  const int kb = b - m * kb_per_row;
+  const size_t base = static_cast<size_t>(m) * K + kb * kBlock + lane * 4;
+
+  const __nv_bfloat162 p0 = *reinterpret_cast<const __nv_bfloat162*>(input + base);
+  const __nv_bfloat162 p1 = *reinterpret_cast<const __nv_bfloat162*>(input + base + 2);
+  const float v0 = __bfloat162float(p0.x), v1 = __bfloat162float(p0.y);
+  const float v2 = __bfloat162float(p1.x), v3 = __bfloat162float(p1.y);
+
+  float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+  }
+  const float s = fmaxf(amax / kFp8Max, 1.0e-12f);
+  if (lane == 0) scale[static_cast<size_t>(m) * kb_per_row + kb] = s;
+  const float inv_s = 1.0f / s;
+
+  uchar4 q;
+  q.x = __nv_fp8_e4m3(fminf(fmaxf(v0 * inv_s, -kFp8Max), kFp8Max)).__x;
+  q.y = __nv_fp8_e4m3(fminf(fmaxf(v1 * inv_s, -kFp8Max), kFp8Max)).__x;
+  q.z = __nv_fp8_e4m3(fminf(fmaxf(v2 * inv_s, -kFp8Max), kFp8Max)).__x;
+  q.w = __nv_fp8_e4m3(fminf(fmaxf(v3 * inv_s, -kFp8Max), kFp8Max)).__x;
+  *reinterpret_cast<uchar4*>(output + base) = q;
 }
 
 __global__ void fp8_per_token_block_quant_linear_kernel(
@@ -475,6 +524,53 @@ __global__ void silu_mul_merged_to_fp8_block128_kernel(
   output[out_idx] = __nv_fp8_e4m3(q);
 }
 
+// Warp-per-block twin of silu_mul_merged_to_fp8_block128_kernel: each lane
+// takes 4 consecutive elements (8-byte gate/up loads, one 4-byte store) and
+// the block amax is a warp max (order-free), so the scale and every e4m3 byte
+// are those of the thread-per-element kernel; 8 blocks per 256-thread CTA.
+__global__ void __launch_bounds__(256) silu_mul_merged_to_fp8_block128_warp_kernel(
+    const __nv_bfloat16* __restrict__ gate_up,
+    __nv_fp8_e4m3* __restrict__ output,
+    float* __restrict__ scale,
+    int M, int K)
+{
+  flash_rt::pdl::pdl_trigger();
+  flash_rt::pdl::pdl_wait();
+  const int nkb = K / kBlock;
+  const int blk = blockIdx.x * 8 + (threadIdx.x >> 5);
+  if (blk >= M * nkb) return;
+  const int m = blk / nkb, kb = blk % nkb;
+  const int lane = threadIdx.x & 31;
+  const int k = kb * kBlock + lane * 4;
+  const __nv_bfloat16* grow = gate_up + (size_t)m * (2 * K) + k;
+  const uint2 gr = *reinterpret_cast<const uint2*>(grow);
+  const uint2 ur = *reinterpret_cast<const uint2*>(grow + K);
+  const __nv_bfloat16* gh = reinterpret_cast<const __nv_bfloat16*>(&gr);
+  const __nv_bfloat16* uh = reinterpret_cast<const __nv_bfloat16*>(&ur);
+  float v[4];
+  float a = 0.f;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const float silu_g = silu_f32(__bfloat162float(gh[j]));
+    const float silu_bf = __bfloat162float(__float2bfloat16(silu_g));
+    v[j] = __bfloat162float(__float2bfloat16(silu_bf * __bfloat162float(uh[j])));
+    a = fmaxf(a, fabsf(v[j]));
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+  const float sc = fmaxf(a / kFp8Max, 1.0e-12f);
+  if (lane == 0) scale[m * nkb + kb] = sc;
+  __nv_fp8_e4m3 q[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    float x = v[j] / sc;
+    x = fminf(fmaxf(x, -kFp8Max), kFp8Max);
+    q[j] = __nv_fp8_e4m3(x);
+  }
+  *reinterpret_cast<uint32_t*>(output + (size_t)m * K + k) =
+      *reinterpret_cast<const uint32_t*>(q);
+}
+
 __device__ __forceinline__ float gelu_erf_f32(float x) {
   return 0.5f * x * (1.0f + erff(x * 0.7071067811865476f));
 }
@@ -634,6 +730,29 @@ void fp8_per_token_block128_quant_bf16(
   if ((K % kBlock) != 0)
     throw std::runtime_error(
         "fp8_per_token_block128_quant_bf16 requires K multiple of 128");
+  // Vectorized warp-per-block path (K is a multiple of 128, so the 8-byte
+  // bf16 loads and 4-byte fp8 stores are aligned and no scale block is
+  // partial); it measured 2.5x the 128-thread form at the ViT shapes.
+  // Model-scoped: the process policy is off by default and
+  // FLASHRT_FP8_QUANT_WARP=1/0 is an explicit override.
+  static const int warp_env = [] {
+    const char* e = std::getenv("FLASHRT_FP8_QUANT_WARP");
+    return e ? std::atoi(e) : -1;
+  }();
+  const bool warp_blocks = warp_env >= 0 ? warp_env != 0
+                                         : flash_rt::kernels::fast_producers();
+  if (warp_blocks) {
+    constexpr int kWarpsPerCta = 8;
+    const int nblocks = M * (K / kBlock);
+    const int cta = kWarpsPerCta * 32;
+    fp8_per_token_block_quant_warp_kernel<<<(nblocks + kWarpsPerCta - 1) / kWarpsPerCta,
+                                            cta, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(input),
+        reinterpret_cast<__nv_fp8_e4m3*>(output_fp8),
+        output_scale,
+        M, K);
+    return;
+  }
   dim3 block(kBlock);
   if (M <= 65535) {
     dim3 grid(K / kBlock, M);
@@ -794,6 +913,20 @@ void silu_mul_merged_to_fp8_block128_bf16(
   if ((K % kBlock) != 0)
     throw std::runtime_error(
         "silu_mul_merged_to_fp8_block128_bf16 requires K multiple of 128");
+  static const int warp_env = [] {
+    const char* e = std::getenv("FLASHRT_SILU_FP8_WARP");
+    return e ? std::atoi(e) : -1;
+  }();
+  const bool warp_blocks = warp_env >= 0 ? warp_env != 0
+                                         : flash_rt::kernels::fast_producers();
+  if (warp_blocks) {
+    const int nblk = M * (K / kBlock);
+    flash_rt::pdl::launch(silu_mul_merged_to_fp8_block128_warp_kernel, dim3((nblk + 7) / 8),
+                          dim3(256), 0, stream, flash_rt::pdl::enabled(),
+                          reinterpret_cast<const __nv_bfloat16*>(gate_up),
+                          reinterpret_cast<__nv_fp8_e4m3*>(output_fp8), output_scale, M, K);
+    return;
+  }
   dim3 block(kBlock);
   dim3 grid(K / kBlock, M);
   silu_mul_merged_to_fp8_block128_kernel<<<grid, block, 0, stream>>>(

@@ -286,8 +286,59 @@ __global__ void add_bias_bf16_kernel(__nv_bfloat16* x, const __nv_bfloat16* b,
     }
 }
 
+// 8 elements per thread with 16-byte accesses; same per-element math.
+__global__ void add_bias_bf16_vec8_kernel(__nv_bfloat16* x, const __nv_bfloat16* b,
+                                          int S, int D) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;   // 8-element unit
+    if (i * 8 >= S * D) return;
+    uint4 xv = reinterpret_cast<uint4*>(x)[i];
+    const uint4 bv = *reinterpret_cast<const uint4*>(b + (i * 8) % D);
+    __nv_bfloat16* xh = reinterpret_cast<__nv_bfloat16*>(&xv);
+    const __nv_bfloat16* bh = reinterpret_cast<const __nv_bfloat16*>(&bv);
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+        xh[j] = __float2bfloat16(__bfloat162float(xh[j]) + __bfloat162float(bh[j]));
+    reinterpret_cast<uint4*>(x)[i] = xv;
+}
+
+// x = bf16(bf16(x + b[col]) + r): add_bias_bf16 followed by residual_add of r
+// in one pass (same two roundings).
+__global__ void add_bias_add_bf16_vec8_kernel(__nv_bfloat16* x, const __nv_bfloat16* b,
+                                              const __nv_bfloat16* r, int S, int D) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i * 8 >= S * D) return;
+    uint4 xv = reinterpret_cast<uint4*>(x)[i];
+    const uint4 bv = *reinterpret_cast<const uint4*>(b + (i * 8) % D);
+    const uint4 rv = reinterpret_cast<const uint4*>(r)[i];
+    __nv_bfloat16* xh = reinterpret_cast<__nv_bfloat16*>(&xv);
+    const __nv_bfloat16* bh = reinterpret_cast<const __nv_bfloat16*>(&bv);
+    const __nv_bfloat16* rh = reinterpret_cast<const __nv_bfloat16*>(&rv);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const __nv_bfloat16 t = __float2bfloat16(__bfloat162float(xh[j]) + __bfloat162float(bh[j]));
+        xh[j] = __float2bfloat16(__bfloat162float(t) + __bfloat162float(rh[j]));
+    }
+    reinterpret_cast<uint4*>(x)[i] = xv;
+}
+
+int add_bias_add_bf16(__nv_bfloat16* x, const __nv_bfloat16* b, const __nv_bfloat16* r,
+                      int S, int D, cudaStream_t stream) {
+    if (D % 8 != 0 || ((reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(b) |
+                        reinterpret_cast<uintptr_t>(r)) & 15) != 0)
+        return static_cast<int>(cudaErrorInvalidValue);
+    const int units = S * D / 8;
+    add_bias_add_bf16_vec8_kernel<<<(units + 255) / 256, 256, 0, stream>>>(x, b, r, S, D);
+    return static_cast<int>(cudaGetLastError());
+}
+
 void add_bias_bf16(__nv_bfloat16* x, const __nv_bfloat16* b,
                     int S, int D, cudaStream_t stream) {
+    if (D % 8 == 0 && (reinterpret_cast<uintptr_t>(x) & 15) == 0 &&
+        (reinterpret_cast<uintptr_t>(b) & 15) == 0) {
+        const int units = S * D / 8;
+        add_bias_bf16_vec8_kernel<<<(units + 255) / 256, 256, 0, stream>>>(x, b, S, D);
+        return;
+    }
     add_bias_bf16_kernel<<<(S * D + 255) / 256, 256, 0, stream>>>(x, b, S, D);
 }
 

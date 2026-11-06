@@ -144,9 +144,28 @@ __device__ __forceinline__ void quant_quad4(float v0, float v1, float v2, float 
 
 // Sum of the K-split partials for one element pair, scaled by alpha and
 // rounded to BF16 (the value an unfused GEMM would have written).
+// Up to kSumPairUnroll splits are loaded before any addition (all the loads
+// in flight together); the adds keep the even/odd split order below, so the
+// value is the same for any split count.
+constexpr int kSumPairUnroll = 8;
 __device__ __forceinline__ float2 sum_pair(const float* __restrict__ partials, int splits, size_t elements,
                                            size_t pair, float alpha) {
     float2 s0 = make_float2(0.f, 0.f), s1 = make_float2(0.f, 0.f);
+    if (splits <= kSumPairUnroll) {
+        float2 p[kSumPairUnroll];
+#pragma unroll
+        for (int s = 0; s < kSumPairUnroll; ++s)
+            if (s < splits) p[s] = *reinterpret_cast<const float2*>(partials + s * elements + 2 * pair);
+#pragma unroll
+        for (int s = 0; s + 1 < kSumPairUnroll; s += 2) {
+            if (s + 1 < splits) {
+                s0.x += p[s].x; s0.y += p[s].y; s1.x += p[s + 1].x; s1.y += p[s + 1].y;
+            } else if (s < splits) {
+                s0.x += p[s].x; s0.y += p[s].y;
+            }
+        }
+        return __bfloat1622float2(__floats2bfloat162_rn((s0.x + s1.x) * alpha, (s0.y + s1.y) * alpha));
+    }
     int s = 0;
     for (; s + 1 < splits; s += 2) {
         const float2 p0 = *reinterpret_cast<const float2*>(partials + s * elements + 2 * pair);

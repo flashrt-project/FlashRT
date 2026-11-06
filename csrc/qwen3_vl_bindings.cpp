@@ -80,6 +80,13 @@ void rope_neox_qk_bf16(
     __nv_bfloat16* q_out, __nv_bfloat16* k_out,
     int rows, int q_heads, int k_heads, int head_dim, cudaStream_t stream);
 
+void qkv_split_bias_rope_bf16(
+    const __nv_bfloat16* packed_qkv, const __nv_bfloat16* bias,
+    const __nv_bfloat16* cos_tab, const __nv_bfloat16* sin_tab,
+    __nv_bfloat16* q_out, __nv_bfloat16* k_out, __nv_bfloat16* v_out,
+    int rows, int q_heads, int k_heads, int v_heads, int head_dim,
+    cudaStream_t stream);
+
 #ifdef ENABLE_QWEN3_VL_BF16_GEMV_M1
 void qwen3_vl_bf16_gemv_m1(
     const __nv_bfloat16* x, const __nv_bfloat16* W, __nv_bfloat16* out,
@@ -97,6 +104,20 @@ void gelu_tanh_to_fp8_block128_bf16(
     int rows, int dim, cudaStream_t stream);
 
 void gelu_tanh_bias_to_fp8_block128_bf16(
+    const __nv_bfloat16* x, const __nv_bfloat16* bias, __nv_fp8_e4m3* out,
+    float* scale, int rows, int dim, cudaStream_t stream);
+
+// Vectorized sibling entries (model-local opt-in; old paths unchanged).
+void layer_norm_to_fp8_block128_bf16_v2(
+    const __nv_bfloat16* x, const __nv_bfloat16* gamma,
+    const __nv_bfloat16* beta, __nv_fp8_e4m3* out, float* scale,
+    int rows, int dim, float eps, cudaStream_t stream);
+
+void gelu_tanh_to_fp8_block128_bf16_v2(
+    const __nv_bfloat16* x, __nv_fp8_e4m3* out, float* scale,
+    int rows, int dim, cudaStream_t stream);
+
+void gelu_tanh_bias_to_fp8_block128_bf16_v2(
     const __nv_bfloat16* x, const __nv_bfloat16* bias, __nv_fp8_e4m3* out,
     float* scale, int rows, int dim, cudaStream_t stream);
 #endif
@@ -146,6 +167,28 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
         py::arg("q_heads"), py::arg("k_heads"), py::arg("head_dim"),
         py::arg("stream") = 0);
 
+    // Fused qkv split (+per-head bias) + rotate_half RoPE + V write: one
+    // launch instead of [qkv_split_bias_bf16 -> rope_neox_qk_bf16].
+    m.def(
+        "qkv_split_bias_rope_bf16",
+        [](uintptr_t packed_qkv, uintptr_t bias, uintptr_t cos, uintptr_t sin,
+           uintptr_t q_out, uintptr_t k_out, uintptr_t v_out, int rows,
+           int q_heads, int k_heads, int v_heads, int head_dim,
+           uintptr_t stream) {
+            flash_rt::kernels::qkv_split_bias_rope_bf16(
+                as_ptr<const __nv_bfloat16>(packed_qkv),
+                as_ptr<const __nv_bfloat16>(bias),
+                as_ptr<const __nv_bfloat16>(cos),
+                as_ptr<const __nv_bfloat16>(sin),
+                as_ptr<__nv_bfloat16>(q_out), as_ptr<__nv_bfloat16>(k_out),
+                as_ptr<__nv_bfloat16>(v_out), rows, q_heads, k_heads,
+                v_heads, head_dim, to_stream(stream));
+        },
+        py::arg("packed_qkv"), py::arg("bias"), py::arg("cos"), py::arg("sin"),
+        py::arg("q_out"), py::arg("k_out"), py::arg("v_out"), py::arg("rows"),
+        py::arg("q_heads"), py::arg("k_heads"), py::arg("v_heads"),
+        py::arg("head_dim"), py::arg("stream") = 0);
+
 #ifdef ENABLE_QWEN3_VL_FP8_ACT
     m.def(
         "layer_norm_to_fp8_block128_bf16",
@@ -178,6 +221,45 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
         [](uintptr_t x, uintptr_t bias, uintptr_t out, uintptr_t scale,
            int rows, int dim, uintptr_t stream) {
             flash_rt::kernels::gelu_tanh_bias_to_fp8_block128_bf16(
+                as_ptr<const __nv_bfloat16>(x),
+                as_ptr<const __nv_bfloat16>(bias), as_ptr<__nv_fp8_e4m3>(out),
+                as_ptr<float>(scale), rows, dim, to_stream(stream));
+        },
+        py::arg("x"), py::arg("bias"), py::arg("out"), py::arg("scale"),
+        py::arg("rows"), py::arg("dim"), py::arg("stream") = 0);
+
+    // Additive vectorized entries; only model call sites that opt in use them.
+    m.def(
+        "layer_norm_to_fp8_block128_bf16_v2",
+        [](uintptr_t x, uintptr_t gamma, uintptr_t beta, uintptr_t out,
+           uintptr_t scale, int rows, int dim, float eps, uintptr_t stream) {
+            flash_rt::kernels::layer_norm_to_fp8_block128_bf16_v2(
+                as_ptr<const __nv_bfloat16>(x),
+                as_ptr<const __nv_bfloat16>(gamma),
+                as_ptr<const __nv_bfloat16>(beta),
+                as_ptr<__nv_fp8_e4m3>(out), as_ptr<float>(scale),
+                rows, dim, eps, to_stream(stream));
+        },
+        py::arg("x"), py::arg("gamma"), py::arg("beta"), py::arg("out"),
+        py::arg("scale"), py::arg("rows"), py::arg("dim"), py::arg("eps"),
+        py::arg("stream") = 0);
+
+    m.def(
+        "gelu_tanh_to_fp8_block128_bf16_v2",
+        [](uintptr_t x, uintptr_t out, uintptr_t scale, int rows, int dim,
+           uintptr_t stream) {
+            flash_rt::kernels::gelu_tanh_to_fp8_block128_bf16_v2(
+                as_ptr<const __nv_bfloat16>(x), as_ptr<__nv_fp8_e4m3>(out),
+                as_ptr<float>(scale), rows, dim, to_stream(stream));
+        },
+        py::arg("x"), py::arg("out"), py::arg("scale"), py::arg("rows"),
+        py::arg("dim"), py::arg("stream") = 0);
+
+    m.def(
+        "gelu_tanh_bias_to_fp8_block128_bf16_v2",
+        [](uintptr_t x, uintptr_t bias, uintptr_t out, uintptr_t scale,
+           int rows, int dim, uintptr_t stream) {
+            flash_rt::kernels::gelu_tanh_bias_to_fp8_block128_bf16_v2(
                 as_ptr<const __nv_bfloat16>(x),
                 as_ptr<const __nv_bfloat16>(bias), as_ptr<__nv_fp8_e4m3>(out),
                 as_ptr<float>(scale), rows, dim, to_stream(stream));

@@ -20,6 +20,7 @@
 #include "mask.h"
 #include "dropout.h"
 #include "rotary.h"
+#include "kernels/nvfp4_convert.cuh"
 
 namespace FLASH_NAMESPACE {
 
@@ -635,6 +636,54 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     write_o_fp8<Is_even_K>(params, tOrO, tOcO, tOpO, bidb, bidh, m_block * kBlockM,
                            binfo.actual_seqlen_q - m_block * kBlockM);
 
+    if (params.o_fp4_ptr != nullptr) {
+        // Target-validated smallq NVFP4 epilogue: quantize the bf16 O tile
+        // staged in sO into the o-projection's operand. Same amax / ceil-
+        // UE4M3 scale / exact-e2m1 encode as the standalone quantizer, so
+        // the bytes equal [bf16 O -> quantize]. Null for every existing
+        // caller, which leaves the upstream epilogue untouched.
+        constexpr int kBlk16 = kHeadDim / 16;
+        const index_t width = params.o_row_stride;
+        const int n_col_blocks = static_cast<int>((width / 16 + 3) / 4);
+        const index_t base = binfo.q_offset(params.o_batch_stride,
+                                            params.o_row_stride, bidb)
+                             + bidh * params.o_head_stride;
+        uint8_t* fp4 = reinterpret_cast<uint8_t*>(params.o_fp4_ptr);
+        uint8_t* sf = reinterpret_cast<uint8_t*>(params.o_sf_ptr);
+        const int rows_here = binfo.actual_seqlen_q - m_block * kBlockM;
+        for (int u = tidx; u < kBlockM * kBlk16;
+             u += Kernel_traits::kNThreads) {
+            const int r = u / kBlk16, b = u % kBlk16;
+            if (r >= rows_here) continue;
+            float vals[16];
+            float amax = 0.f;
+            #pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                vals[j] = static_cast<float>(sO(r, b * 16 + j));
+                amax = fmaxf(amax, fabsf(vals[j]));
+            }
+            const uint8_t ue = float_to_ue4m3_ceil(amax / 6.0f);
+            const float fscale = ue4m3_to_float(ue);
+            const float inv = (fscale > 0.f) ? (1.f / fscale) : 0.f;
+            uint8_t pk[8];
+            #pragma unroll
+            for (int j = 0; j < 8; ++j)
+                pk[j] = float2_to_fp4_e2m1x2_exact(
+                    vals[2 * j] * inv, vals[2 * j + 1] * inv);
+            const index_t off = base
+                + (index_t)(m_block * kBlockM + r) * params.o_row_stride
+                + b * 16;
+            const index_t row = off / width, col = off % width;
+            *reinterpret_cast<uint2*>(fp4 + row * (width / 2) + col / 2) =
+                *reinterpret_cast<const uint2*>(pk);
+            const int blk = static_cast<int>(col >> 4);
+            const int rb = static_cast<int>(row >> 7);
+            const int ri = static_cast<int>(row & 127);
+            sf[(rb * n_col_blocks + blk / 4) * 512 + (ri % 32) * 16
+               + (ri / 32) * 4 + blk % 4] = ue;
+        }
+    }
+
     if (params.quantize_o != 0 && params.o_packed_ptr != nullptr) {
         // Fused NVFP4 quantize of this head's slice of the O tile, out of the
         // copy already staged in shared memory. It replaces one standalone
@@ -647,6 +696,15 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             const int col0 = bidh * hd;
             uint8_t* pk = reinterpret_cast<uint8_t*>(params.o_packed_ptr);
             uint8_t* sf = reinterpret_cast<uint8_t*>(params.o_sfa_ptr);
+            // Optional batched layout: the caller lays the per-view operands
+            // out contiguously and passes the byte strides. Zero keeps the
+            // original (single-batch) addressing for every existing caller.
+            if (params.o_packed_batch_stride != 0) {
+                pk += (size_t)bidb * params.o_packed_batch_stride;
+            }
+            if (params.o_sfa_batch_stride != 0) {
+                sf += (size_t)bidb * params.o_sfa_batch_stride;
+            }
             for (int idx = tidx; idx < kBlockM * groups;
                  idx += Kernel_traits::kNThreads) {
                 const int r = idx / groups, g = idx % groups;
