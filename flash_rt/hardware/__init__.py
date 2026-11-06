@@ -151,6 +151,13 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("lawam", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.lawam_rtx", "LawamTorchFrontendRtx"),
 
+    # ── VLA-JEPA (LeRobot) ──
+    # Registered for discovery. The policy takes the 8-dim robot state on every
+    # call and needs a real-observation NVFP4 calibration before graph capture,
+    # so load_model redirects to the direct frontend (docs/vla_jepa_rtx.md).
+    ("vla_jepa", "torch", "rtx_sm120"):
+        ("flash_rt.frontends.torch.vla_jepa_rtx", "VlaJepaTorchFrontendRtx"),
+
     # ── Pi0.5 ──
     ("pi05", "torch", "thor"):
         ("flash_rt.frontends.torch.pi05_thor", "Pi05TorchFrontendThor"),

@@ -36,7 +36,7 @@ def load_model(
     autotune: int = 3,              # 0=off, 3=default, 5+=thorough
     recalibrate: bool = False,
     weight_cache: bool = True,      # JAX only
-    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "groot_n15" | "groot_n17" | "pi0fast" | "motus" | "wan22_ti2v_5b" | "cosmos3_video" | "cosmos3_edge" | "chameleon" | "hyvla" | "xvla" | "lawam" | "molmoact2"
+    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "groot_n15" | "groot_n17" | "pi0fast" | "motus" | "wan22_ti2v_5b" | "cosmos3_video" | "cosmos3_edge" | "chameleon" | "hyvla" | "xvla" | "lawam" | "molmoact2" | "dm05" | "vla_jepa"
     device=None,                    # reserved
     # Pi0-FAST-specific:
     decode_cuda_graph: bool = False,
@@ -465,6 +465,9 @@ Chameleon-7B is registered for `(config="chameleon", framework="torch",
 arch in {"rtx_sm87", "thor"})`.
 Hy-Embodied-0.5-VLA is registered for `(config="hyvla",
 framework="torch", arch in {"thor", "rtx_sm87", "rtx_sm120"})`.
+VLA-JEPA is registered for `(config="vla_jepa", framework="torch",
+arch="rtx_sm120")` for discovery; `load_model` raises an explicit redirect
+to `VlaJepaTorchFrontendRtx` (per-call state and real-data calibration).
 
 ### `_PIPELINE_MAP`
 
@@ -852,6 +855,17 @@ prompt=task)` takes two uint8 256x256 RGB views and returns the unnormalized
 `(action_horizon, 7)` chunk; `infer(frames, noise=...)` accepts the initial flow
 sample for reproducible comparisons. Other hardware/frameworks fail explicitly.
 Precision tiers and validation: [LaWAM on RTX SM120](lawam_rtx.md).
+
+### VLA-JEPA (LeRobot) on RTX SM120
+
+`load_model(checkpoint, config="vla_jepa", framework="torch", hardware="rtx_sm120")`
+raises an explicit redirect: the policy takes the 8-dim robot state on every
+call and its NVFP4 block/layer selection is calibrated on real observations
+before capture, so it is constructed directly as
+`VlaJepaTorchFrontendRtx`. It is registered in `_PIPELINE_MAP` for discovery.
+The model-specific preprocessing kernels require `-DFLASHRT_ENABLE_VLA_JEPA=ON`.
+Other hardware, frameworks and precision tiers outside the documented RTX
+SM120/SM121 path fail explicitly. See [VLA-JEPA usage](vla_jepa_rtx.md).
 
 ## Alpamayo trajectory frontends
 

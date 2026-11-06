@@ -393,9 +393,12 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             after first load. Only affects JAX.
         config: model config name: "pi05", "pi0", "groot", "groot_n15", "groot_n17",
             "pi0fast", "motus", "dm05", "wan22_ti2v_5b", "cosmos3_video",
-            "cosmos3_edge", "xvla", "ltx25", "lawam".
+            "cosmos3_edge", "xvla", "ltx25", "lawam", "vla_jepa".
             "xvla" is lerobot/xvla-libero on RTX SM120/SM121 (torch only;
             see ``xvla_precision``).
+            "vla_jepa" is registered for discovery only: load_model raises a
+            redirect to VlaJepaTorchFrontendRtx (per-call state + real-data
+            calibration; see docs/vla_jepa_rtx.md).
             "ltx25" is the LTX-2.5 22B distilled audio+video generator:
             drive it with set_prompt(...) + infer(...), not predict().
             "cosmos3_video" is a non-VLA text2video denoise model: drive it with
@@ -640,16 +643,35 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                       "motus", "wan22_ti2v_5b", "cosmos3_video",
                       "cosmos3_edge", "nexn2", "qwen36_moe", "spark_x25",
                       "flint", "hyvla", "xvla", "ltx25", "dm05", "qwen3_4b", "lawam",
-                      "molmoact2"):
+                      "molmoact2", "vla_jepa"):
         raise ValueError(
             f"Unknown config: {config}. "
             f"Supported: pi05, groot, groot_n15, groot_n17, pi0, pi0fast, motus, "
             f"wan22_ti2v_5b, cosmos3_video, cosmos3_edge, nexn2, "
             f"qwen36_moe, spark_x25, flint, hyvla, xvla, ltx25, dm05, qwen3_4b, "
-            f"lawam, molmoact2")
+            f"lawam, molmoact2, vla_jepa")
     if framework not in ("torch", "jax", "jetson_pi"):
         raise ValueError(
             f"Unknown framework: {framework}. Supported: torch, jax, jetson_pi")
+
+    # VLA-JEPA (LeRobot) takes the 8-dim robot state on every call and its
+    # NVFP4 block/layer selection is calibrated on real observations before
+    # capture, so it does not fit load_model's predict(images, prompt)
+    # wrapper. Registered in _PIPELINE_MAP for discoverability; constructed
+    # directly. Checked before GPU detection so the redirect fires anywhere.
+    if config == "vla_jepa":
+        raise NotImplementedError(
+            "config='vla_jepa' needs the robot state on every call and a "
+            "real-observation NVFP4 calibration before graph capture, so it "
+            "is not served through load_model's predict(images, prompt) "
+            "wrapper. Construct it directly:\n"
+            "    from flash_rt.frontends.torch.vla_jepa_rtx import "
+            "VlaJepaTorchFrontendRtx\n"
+            "    fe = VlaJepaTorchFrontendRtx(ckpt, llm_precision='nvfp4')\n"
+            "    fe.set_prompt(task, observation_frame)\n"
+            "    fe.calibrate(samples)      # real (frames, state) pairs\n"
+            "    actions = fe.infer(frames, state)\n"
+            "See docs/vla_jepa_rtx.md.")
 
     # Drives the Jetson-PI provider through frt_model_runtime_v1 via ctypes.
     # No torch/jax or GPU architecture detection is involved. The action chunk

@@ -52,7 +52,9 @@ class RtxFlashAttnBackendQwen3:
                  num_kv_heads: int | None = None,
                  head_dim: int | None = None,
                  device: str = "cuda",
-                 use_int8_kv: bool = False):
+                 use_int8_kv: bool = False,
+                 prefill_attention: str | None = None,
+                 prefill_tile: str | None = None):
         import os
 
         import torch
@@ -178,65 +180,138 @@ class RtxFlashAttnBackendQwen3:
             from flash_attn import flash_attn_func
             self._flash_attn_func = flash_attn_func
 
-        # fp8-QK prefill attention (env-gated, additive). Quantizes Q/K to e4m3
-        # (per-warp / per-block-64) and casts V to fp16, then runs the sage2
-        # fp8-QK / fp16-PV causal-GQA kernel. Only fires for q_seq a multiple of
-        # 128 (the kernel's per-warp scale stride is ceil(Lq/128)*4 — matched by
-        # the quant only at that alignment); FA2 handles every other case.
-        self._fp8_prefill = (
-            os.environ.get("FLASH_RT_QWEN3_FP8_ATTN", "0") == "1"
-            and self._max_q_seq >= 128
-        )
-        self._fp8_attn_fn = None
-        if self._fp8_prefill:
-            from flash_rt import flash_rt_kernels as _fvk
-            fn = getattr(
-                _fvk, "sage2_qk_f8_sv_f16_bf16_gqa_nhd_d128_causal", None)
-            if fn is None or not hasattr(_fvk, "quant_per_token_fp8_bf16_d128"):
-                self._fp8_prefill = False
-            else:
-                self._fvk = _fvk
-                self._fp8_attn_fn = fn
-                sp = ((self._max_q_seq + 127) // 128) * 128
-                self._fp8_sp_max = sp
-                hq, hkv, hd = self.NUM_Q_HEADS, self.NUM_KV_HEADS, self.HEAD_DIM
-                self._fp8_q8 = torch.zeros(
-                    1, sp, hq, hd, dtype=torch.float8_e4m3fn, device=d)
-                self._fp8_k8 = torch.zeros(
-                    1, sp, hkv, hd, dtype=torch.float8_e4m3fn, device=d)
-                self._fp8_vf = torch.zeros(
-                    1, sp, hkv, hd, dtype=torch.float16, device=d)
-                # per-token scales: one per (token, head).
-                self._fp8_qs = torch.zeros(hq * sp, dtype=torch.float32, device=d)
-                self._fp8_ks = torch.zeros(hkv * sp, dtype=torch.float32, device=d)
+        # ── Prefill attention route ──
+        # An explicit model policy wins over the process environment; None
+        # keeps the pre-existing env-gated policy so other callers see the
+        # same behavior as before.
+        if prefill_attention is not None and prefill_attention not in (
+                "fa2", "fp8", "fp8_fp4out", "sage2"):
+            raise ValueError(
+                "prefill_attention must be 'fa2', 'fp8', 'fp8_fp4out', "
+                f"'sage2' or None, got {prefill_attention!r}")
+        self.prefill_attention = prefill_attention
+        explicit_route = prefill_attention is not None
+        if prefill_tile not in (None, "auto", "64", "128"):
+            raise ValueError(
+                "prefill_tile must be None, 'auto', '64' or '128', got "
+                f"{prefill_tile!r}")
+        self.prefill_tile = prefill_tile
 
-        # All-fp8 prefill attention (env-gated, additive): raw e4m3 Q/K/V from
-        # the direct-cast norm_rope fold, single all-fp8 causal-GQA kernel (no
-        # per-token scales — post-norm Q/K sit inside e4m3's dynamic range).
-        # Takes precedence over FLASH_RT_QWEN3_FP8_ATTN when both are set.
+        # fp8-QK prefill attention: quantizes Q/K to e4m3 (per-warp /
+        # per-block-64) and casts V to fp16, then runs the sage2 fp8-QK /
+        # fp16-PV causal-GQA kernel. Only fires for q_seq a multiple of 128
+        # (the kernel's per-warp scale stride is ceil(Lq/128)*4 — matched by
+        # the quant only at that alignment); FA2 handles every other case.
+        self._fp8_prefill = False
+        self._fp8_attn_fn = None
+        if (prefill_attention == "sage2"
+                or (prefill_attention is None
+                    and os.environ.get("FLASH_RT_QWEN3_FP8_ATTN", "0") == "1")):
+            if self._max_q_seq < 128:
+                if explicit_route:
+                    raise ValueError(
+                        "prefill_attention='sage2' requires max_q_seq >= 128")
+            else:
+                from flash_rt import flash_rt_kernels as _fvk
+                fn = getattr(
+                    _fvk, "sage2_qk_f8_sv_f16_bf16_gqa_nhd_d128_causal", None)
+                if fn is None or not hasattr(
+                        _fvk, "quant_per_token_fp8_bf16_d128"):
+                    if explicit_route:
+                        raise RuntimeError(
+                            "prefill_attention='sage2' requires "
+                            "sage2_qk_f8_sv_f16_bf16_gqa_nhd_d128_causal and "
+                            "quant_per_token_fp8_bf16_d128 in "
+                            "flash_rt_kernels")
+                else:
+                    self._fvk = _fvk
+                    self._fp8_attn_fn = fn
+                    self._fp8_prefill = True
+                    sp = ((self._max_q_seq + 127) // 128) * 128
+                    self._fp8_sp_max = sp
+                    hq, hkv, hd = (
+                        self.NUM_Q_HEADS, self.NUM_KV_HEADS, self.HEAD_DIM)
+                    self._fp8_q8 = torch.zeros(
+                        1, sp, hq, hd, dtype=torch.float8_e4m3fn, device=d)
+                    self._fp8_k8 = torch.zeros(
+                        1, sp, hkv, hd, dtype=torch.float8_e4m3fn, device=d)
+                    self._fp8_vf = torch.zeros(
+                        1, sp, hkv, hd, dtype=torch.float16, device=d)
+                    # per-token scales: one per (token, head).
+                    self._fp8_qs = torch.zeros(
+                        hq * sp, dtype=torch.float32, device=d)
+                    self._fp8_ks = torch.zeros(
+                        hkv * sp, dtype=torch.float32, device=d)
+
+        # All-fp8 prefill attention: raw e4m3 Q/K/V from the direct-cast
+        # norm_rope fold, single all-fp8 causal-GQA kernel (no per-token
+        # scales — post-norm Q/K sit inside e4m3's dynamic range). Takes
+        # precedence over the sage2 route when both are available.
         self._fp8_direct = False
-        if (os.environ.get("FLASH_RT_QWEN3_FP8_FMHA", "1") == "1"
-                and self._max_q_seq >= 128):
+        self._fp8_fp4out = False
+        want_direct = (prefill_attention in ("fp8", "fp8_fp4out")
+                       or (prefill_attention is None
+                           and os.environ.get("FLASH_RT_QWEN3_FP8_FMHA",
+                                              "1") == "1"))
+        if want_direct and self._max_q_seq >= 128:
             from flash_rt import flash_rt_kernels as _fvk
             fn = getattr(_fvk, "fmha_fp8_causal_gqa_nhd_d128", None)
             have_quant = (
                 hasattr(_fvk, "qwen3_q_norm_rope_qstage_prefill_v3_fp8_direct")
                 and hasattr(_fvk, "qwen3_k_norm_rope_kvwrite_prefill_v3_fp8_direct"))
-            if fn is not None and have_quant:
+            if fn is None or not have_quant:
+                if explicit_route:
+                    raise RuntimeError(
+                        "prefill_attention='fp8'/'fp8_fp4out' requires "
+                        "fmha_fp8_causal_gqa_nhd_d128 and the direct-e4m3 "
+                        "norm+RoPE producers in flash_rt_kernels")
+            else:
                 self._fvk = _fvk
                 self._fp8_direct = True
                 self._fp8_prefill = True
                 self._fp8_attn_fn = fn
                 # fp4-out epilogue: O emitted directly as the o_proj GEMM's
                 # NVFP4 A-operand (skips the bf16 O + quantize launch). The
-                # frontend hands the packed/SF scratch pointers before run().
+                # caller hands the packed/SF scratch pointers before run().
                 self._fp8_fp4out_fn = getattr(
                     _fvk, "fmha_fp8_causal_gqa_nhd_d128_fp4out", None)
+                # None (every pre-existing caller) keeps the upstream
+                # behavior: the epilogue runs whenever the caller supplied
+                # the packed/SF pointers. An explicit route chooses it.
+                self._fp8_fp4out = (prefill_attention is None
+                                    or prefill_attention == "fp8_fp4out")
+                if prefill_attention == "fp8_fp4out" and self._fp8_fp4out_fn is None:
+                    raise RuntimeError(
+                        "prefill_attention='fp8_fp4out' requires "
+                        "fmha_fp8_causal_gqa_nhd_d128_fp4out in "
+                        "flash_rt_kernels")
                 self._fp8_o_fp4 = 0
                 self._fp8_o_sf = 0
+                # Model-local tile choice. The default (None) keeps the
+                # 128-row fp4-out entry used by every existing caller.
+                if (prefill_tile == "64"
+                        and (self.NUM_Q_HEADS, self.NUM_KV_HEADS) == (16, 8)):
+                    # Prefer the target-validated VLA port; fall back to
+                    # the upstream q64 16/8 instantiation.
+                    q64_fn = getattr(
+                        _fvk, "fmha_fp8_causal_gqa_q64_fp4out_vla", None)
+                    if q64_fn is None:
+                        q64_fn = getattr(
+                            _fvk,
+                            "fmha_fp8_causal_gqa_q64_nhd_d128_fp4out_16_8",
+                            None)
+                    if q64_fn is None:
+                        raise RuntimeError(
+                            "prefill_tile='64' requires "
+                            "fmha_fp8_causal_gqa_q64_fp4out_vla or "
+                            "fmha_fp8_causal_gqa_q64_nhd_d128_fp4out_16_8 "
+                            "in flash_rt_kernels (build with "
+                            "-DFLASHRT_ENABLE_VLA_JEPA=ON)")
+                    self._fp8_fp4out_fn = q64_fn
                 sp = ((self._max_q_seq + 127) // 128) * 128
                 self._fp8_sp_max = sp
-                hq, hkv, hd = self.NUM_Q_HEADS, self.NUM_KV_HEADS, self.HEAD_DIM
+                hq, hkv, hd = (
+                    self.NUM_Q_HEADS, self.NUM_KV_HEADS, self.HEAD_DIM)
                 self._fp8_q8 = torch.zeros(
                     1, sp, hq, hd, dtype=torch.float8_e4m3fn, device=d)
                 self._fp8_k8 = torch.zeros(
@@ -289,6 +364,60 @@ class RtxFlashAttnBackendQwen3:
             "kv_layer_stride_bytes": self.kv_layer_stride_bytes,
             "kv_row_stride_bytes": self.kv_row_stride_bytes,
         }
+
+    # ── Prefill route introspection ──
+
+    @property
+    def prefill_route(self) -> str:
+        """The route ``run(q_seq>1, causal=True)`` takes."""
+        if self._fp8_direct:
+            return "fp8_fp4out" if self._fp8_fp4out else "fp8"
+        if self._fp8_prefill:
+            return "sage2"
+        return "fa2"
+
+    def prefill_operands(self) -> dict | None:
+        """Tensors the fused norm+RoPE producer writes for this route.
+
+        ``None`` when the bf16 FA2 route is active (the producers write the
+        backend's Q/K/V buffers directly). The fp8 routes return the e4m3
+        Q/K plus either e4m3 V (all-fp8) or fp16 V with per-token scales
+        (sage2). The buffers are allocated once, so their pointers are
+        stable across CUDA Graph capture and replay.
+        """
+        if not self._fp8_prefill:
+            return None
+        out = {"q_fp8": self._fp8_q8, "k_fp8": self._fp8_k8}
+        if self._fp8_direct:
+            out["v_fp8"] = self._fp8_v8
+        else:
+            out.update({"v_fp16": self._fp8_vf,
+                        "q_scale": self._fp8_qs,
+                        "k_scale": self._fp8_ks})
+        return out
+
+    def prefill_operand_ptrs(self) -> dict | None:
+        """Device pointers matching :meth:`prefill_operands`."""
+        ops = self.prefill_operands()
+        return None if ops is None else {
+            name: tensor.data_ptr() for name, tensor in ops.items()}
+
+    def set_o_fp4(self, out_fp4: int, out_sf: int) -> None:
+        """Route the attention output into the o-projection's NVFP4 operand.
+
+        Only valid on the ``fp8_fp4out`` route; the kernel writes the packed
+        e2m1 payload and swizzled block scales directly, skipping the bf16 O
+        buffer and the standalone quantizer launch.
+        """
+        if not self._fp8_fp4out:
+            raise RuntimeError(
+                "set_o_fp4 requires prefill_attention='fp8_fp4out'")
+        self._fp8_o_fp4 = int(out_fp4)
+        self._fp8_o_sf = int(out_sf)
+
+    def clear_o_fp4(self) -> None:
+        self._fp8_o_fp4 = 0
+        self._fp8_o_sf = 0
 
     def reset_cache(self) -> None:
         self.K_cache.zero_()
@@ -471,7 +600,8 @@ class RtxFlashAttnBackendQwen3:
         Sp = q_seq
         if self._fp8_direct:
             # All-fp8 path: raw e4m3 Q/K/V, no scales.
-            if self._fp8_fp4out_fn is not None and self._fp8_o_fp4:
+            if (self._fp8_fp4out and self._fp8_fp4out_fn is not None
+                    and self._fp8_o_fp4):
                 rc = self._fp8_fp4out_fn(
                     q_fp8=self._fp8_q8.data_ptr(),
                     k_fp8=self._fp8_k8.data_ptr(),
