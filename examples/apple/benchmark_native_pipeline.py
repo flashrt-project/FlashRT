@@ -216,6 +216,7 @@ def main():
                         start = time.perf_counter()
                         p.enable_native_pipeline(
                             f._prompt_len,
+                            dynamic_prompt=False,
                             capture_probes=True,
                             residency=not args.no_residency,
                             split_decode=not args.no_split_gqa,
@@ -292,6 +293,7 @@ def main():
             start = time.perf_counter()
             p.enable_native_pipeline(
                 f._prompt_len,
+                dynamic_prompt=False,
                 residency=not args.no_residency,
                 split_decode=not args.no_split_gqa,
                 merged_encoder_ffn=not args.split_encoder_ffn,
@@ -418,6 +420,7 @@ def main():
                     options[option] = enabled
                     p.enable_native_pipeline(
                         f._prompt_len,
+                        dynamic_prompt=False,
                         residency=not args.no_residency,
                         **options,
                     )

@@ -276,6 +276,9 @@ def test_native_replay_and_profiler_restore_mutated_inputs(capture_probes):
         prompt_storage = p.allocate((4, 32))
         p.write(prompt_storage, torch.full((4, 32), 31, dtype=torch.bfloat16))
         native.input_prompt = prompt_storage[1:3]
+        native.prompt_len = native.prompt_capacity = 2
+        native.pad_prompt = False
+        native._valid_prefix = None
         native.input_noise = native.output = p.allocate((2, 32))
         p.ops.residual(native.input_prompt, native.input_images, native.input_prompt)
         p.ops.residual(native.output, native.input_prompt, native.input_noise)

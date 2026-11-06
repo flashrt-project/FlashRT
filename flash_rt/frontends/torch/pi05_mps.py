@@ -167,8 +167,8 @@ class Pi05TorchFrontendMps:
                     or image.shape != (IMG_HW, IMG_HW, 3)):
                 raise ValueError("Images must be (224, 224, 3) RGB uint8 numpy arrays")
         native = self.pipeline._native_pipeline
-        if native is not None and native.prompt_len != self._prompt_len:
-            raise ValueError("Native prompt length changed; rebuild with enable_native_pipeline")
+        if native is not None and not native.accepts_prompt_length(self._prompt_len):
+            raise ValueError("Native prompt length changed beyond the plan's declared capacity")
         if native is None:
             torch.mps.synchronize()
         started = time.perf_counter()

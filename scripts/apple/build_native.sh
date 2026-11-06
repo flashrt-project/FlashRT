@@ -2,6 +2,15 @@
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 build="${1:-$root/.cache/apple-native}"
+experiment="${2:-}"
+if (( $# > 2 )) || [[ -n "$experiment" && "$experiment" != --int8-experiment ]]; then
+  echo "Usage: $0 [build-directory] [--int8-experiment]" >&2
+  exit 1
+fi
+precision_flags=(-UFLASHRT_APPLE_INT8_EXPERIMENT)
+if [[ "$experiment" == --int8-experiment ]]; then
+  precision_flags=(-DFLASHRT_APPLE_INT8_EXPERIMENT=1)
+fi
 if [[ "$(uname -s)" != Darwin || "$(uname -m)" != arm64 ]]; then
   echo "Apple Silicon macOS is required" >&2
   exit 1
@@ -21,7 +30,7 @@ xcrun clang++ -std=c++17 -O2 -fobjc-arc -mmacosx-version-min=14.0 \
 xcrun ar rcs "$build/libflashrt_apple.a" "$build/pipeline.o"
 xcrun clang++ -std=c++17 -O2 -mmacosx-version-min=14.0 \
   -fvisibility=hidden -fvisibility-inlines-hidden \
-  -I "$root/cpp/apple/include" -I "$root/csrc/apple" -dynamiclib "$root/cpp/apple/src/plan.cpp" "$build/pipeline.o" \
+  "${precision_flags[@]}" -I "$root/cpp/apple/include" -I "$root/csrc/apple" -dynamiclib "$root/cpp/apple/src/plan.cpp" "$build/pipeline.o" \
   "-Wl,-exported_symbols_list,$root/cpp/apple/plan.exports" \
   -framework Foundation -framework Metal \
   -o "$build/libflashrt_apple_plan.dylib"
@@ -43,7 +52,7 @@ xcrun clang++ -std=c++17 -O2 -mmacosx-version-min=14.0 \
   "$build/libflashrt_apple.a" -framework Foundation -framework Metal \
   -o "$build/flashrt_apple_gemm_tune"
 xcrun clang++ -std=c++17 -O2 -mmacosx-version-min=14.0 \
-  -I "$root/cpp/apple/include" -I "$root/csrc/apple" "$root/cpp/apple/tests/kernel_registry_smoke.cpp" \
+  "${precision_flags[@]}" -I "$root/cpp/apple/include" -I "$root/csrc/apple" "$root/cpp/apple/tests/kernel_registry_smoke.cpp" \
   "$build/libflashrt_apple.a" -framework Foundation -framework Metal \
   -o "$build/flashrt_apple_kernel_registry_smoke"
 echo "Built host libraries and smoke executables in $build (Metal shaders compile at runtime)"

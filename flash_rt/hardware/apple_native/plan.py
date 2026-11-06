@@ -1,4 +1,4 @@
-"""Build fixed-shape native Metal plans from hardware operation providers.
+"""Build bounded native Metal plans from hardware operation providers.
 
 Tensor views below are build-time descriptors, not eager tensor operations.
 Replay updates input contents and invokes one prebuilt native command plan.
@@ -11,6 +11,7 @@ from pathlib import Path
 import weakref
 import numpy as np
 import torch
+from .dimensions import Dimension, evaluate, resolve, uniform_key
 
 
 class _PlanTiming(C.Structure):
@@ -98,6 +99,15 @@ class Tensor:
                 off += i * s * self.itemsize
             elif isinstance(i, slice):
                 a, b, step = i.indices(n)
+                if isinstance(n, Dimension) and i.stop is None:
+                    b = n
+                for value in (i.start, i.stop):
+                    if isinstance(value, Dimension) and not 0 <= int(value) <= int(n):
+                        raise ValueError("Dynamic slice outside allocated capacity")
+                if isinstance(i.start, Dimension):
+                    a = i.start
+                if isinstance(i.stop, Dimension):
+                    b = i.stop
                 if step != 1 or b <= a:
                     raise ValueError("Native views require nonempty unit slices")
                 off += a * s * self.itemsize
@@ -122,7 +132,7 @@ class Tensor:
             raise ValueError("Native copy requires matching contiguous tensors")
         if (
             self.buffer == source.buffer
-            and self.offset == source.offset
+            and uniform_key(self.offset) == uniform_key(source.offset)
             and self.stride == source.stride
         ):
             return self
@@ -132,6 +142,44 @@ class Tensor:
     def add_(self, update):
         self.plan.ops.residual(self, update, self)
         return self
+
+
+class UIntParameter:
+    """Bounded host-updated uniform; update only between synchronous replays."""
+
+    def __init__(self, plan, value, *, minimum, maximum):
+        if (not all(isinstance(v, int) for v in (value, minimum, maximum))
+                or not 0 <= minimum <= value <= maximum <= 0xFFFFFFFF):
+            raise ValueError("Invalid uint32 parameter bounds")
+        self.plan, self.value = plan, value
+        self.minimum, self.maximum = minimum, maximum
+        self._bindings = []
+        self._expressions = []
+
+    def dimension(self):
+        return Dimension(self)
+
+    def set(self, value):
+        if self.plan.handle is None:
+            raise RuntimeError("Native plan is closed")
+        if not isinstance(value, int) or not self.minimum <= value <= self.maximum:
+            raise ValueError("Uniform value outside declared bounds")
+        if value == self.value:
+            return
+        data = C.c_uint32(value)
+        for bid, offset in self._bindings:
+            self.plan.check(self.plan.lib.frt_apple_plan_write(
+                self.plan.handle, bid, offset, C.addressof(data), 4,
+            ))
+        for bid, offset, expression in self._expressions:
+            resolved = evaluate(expression, value)
+            if not 0 <= resolved <= 0xFFFFFFFF:
+                raise ValueError("Resolved uniform outside uint32 range")
+            data.value = resolved
+            self.plan.check(self.plan.lib.frt_apple_plan_write(
+                self.plan.handle, bid, offset, C.addressof(data), 4,
+            ))
+        self.value = value
 
 
 class Weight:
@@ -207,6 +255,7 @@ class Plan:
         self._uniform_buffer = None
         self._uniform_offset = 65536
         self._mappings = {}
+        self._parameter_sources = []
 
     def check(self, status):
         if status:
@@ -224,17 +273,18 @@ class Plan:
             raise RuntimeError("Native plan is closed")
         if t.plan is not self or not t.contiguous() or t.itemsize != 2:
             raise ValueError("Expected a contiguous tensor owned by this plan")
-        key = (t.buffer, t.offset, t.numel())
+        offset, count = resolve(t.offset), resolve(t.numel())
+        key = (t.buffer, offset, count)
         if key not in self._mappings:
             address = self.lib.frt_apple_plan_data(
-                self.handle, t.buffer, t.offset, t.numel() * 2
+                self.handle, t.buffer, offset, count * 2
             )
             if not address:
                 self.check(-1)
             self._mappings[key] = np.ctypeslib.as_array(
-                (C.c_uint16 * t.numel()).from_address(address)
+                (C.c_uint16 * count).from_address(address)
             )
-        return self._mappings[key].reshape(t.shape)
+        return self._mappings[key].reshape(tuple(resolve(n) for n in t.shape))
 
     def allocate(self, shape, *, itemsize=2):
         if itemsize not in (2, 4):
@@ -262,7 +312,7 @@ class Plan:
                 bits = f.view(np.uint32)
                 v = ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16).astype(np.uint16)
         v = np.ascontiguousarray(v)
-        if v.shape != t.shape or not t.contiguous():
+        if v.shape != tuple(resolve(n) for n in t.shape) or not t.contiguous():
             raise ValueError("Native upload shape mismatch")
         np.copyto(self._host_view(t), v)
 
@@ -301,10 +351,22 @@ class Plan:
         return t
 
     def dispatch(self, name, tensors, writes, params, groups, threads=64, *, strided=()):
+        for value in params:
+            parameter = value.parameter if isinstance(value, Dimension) else value
+            if isinstance(parameter, UIntParameter) and parameter.plan is not self:
+                raise ValueError("Uniform belongs to another plan")
         bound = [self.bind(t, allow_strided=i in strided) for i, t in enumerate(tensors)]
+        if any(isinstance(t.offset, Dimension) for t in bound):
+            raise ValueError("Dynamic offsets require an operation with explicit offset uniforms")
         # Uniform buffers are raw uint32, padded for uint3 alignment.
-        values = np.asarray(list(params) + [0] * ((-len(params)) % 4), dtype=np.uint32)
-        key = tuple(values)
+        # Parameter identity is part of the key: a mutable block must never
+        # alias an equal-valued constant or a different mutable parameter.
+        padded = tuple(params) + (0,) * ((-len(params)) % 4)
+        key = tuple(uniform_key(v) for v in padded)
+        values = np.asarray(
+            [v.value if isinstance(v, UIntParameter) else resolve(v) for v in padded],
+            dtype=np.uint32,
+        )
         if key not in self.uniforms:
             if self._uniform_offset + values.nbytes > 65536:
                 self._uniform_buffer = self.lib.frt_apple_plan_buffer(
@@ -324,6 +386,11 @@ class Plan:
                 )
             )
             self.uniforms[key] = (bid, parameter_offset)
+            for i, value in enumerate(params):
+                if isinstance(value, UIntParameter):
+                    value._bindings.append((bid, parameter_offset + i * 4))
+                elif isinstance(value, Dimension):
+                    value.parameter._expressions.append((bid, parameter_offset + i * 4, value.expression))
             self._uniform_offset += values.nbytes
         bid, parameter_offset = self.uniforms[key]
         n = len(bound) + 1
@@ -355,15 +422,24 @@ class Plan:
             kind="dispatch",
             kernel=name,
             stage=self.stage,
-            params=list(params),
+            params=values[:len(params)].tolist(),
             groups=list(groups),
             threads=threads,
         )
         self.dispatches.append(meta)
+        self._parameter_sources.append(tuple(params))
         self.operations.append(meta)
+
+    def resolved_dispatches(self):
+        """Diagnostic snapshot of actual extents, independent of launch capacity."""
+        return [dict(meta, params=[v.value if isinstance(v, UIntParameter) else resolve(v)
+                                   for v in params])
+                for meta, params in zip(self.dispatches, self._parameter_sources)]
 
     def copy_buffer(self, source, destination):
         source, destination = self.bind(source), self.bind(destination)
+        if isinstance(source.offset, Dimension) or isinstance(destination.offset, Dimension):
+            raise ValueError("Native blit copies require fixed offsets")
         if source.shape != destination.shape or source.itemsize != destination.itemsize:
             raise ValueError("Native buffer copy requires matching storage")
         size = source.numel() * source.itemsize
@@ -450,8 +526,10 @@ class Plan:
     def profile(self):
         timings = (_PlanTiming * len(self.operations))()
         self.check(self.lib.frt_apple_plan_profile(self.handle, timings, len(timings)))
+        dispatches = iter(self.resolved_dispatches())
         return [
-            dict(**meta, **t.as_dict()) for meta, t in zip(self.operations, timings)
+            dict(**(next(dispatches) if meta["kind"] == "dispatch" else meta), **t.as_dict())
+            for meta, t in zip(self.operations, timings)
         ]
 
     def run(self, execution="icb"):
@@ -567,11 +645,28 @@ class Ops:
 
     def qkv_rope(self, q, k, v, qkv, cos, sin, position):
         rows, heads, dim = q.shape
+        parameter = position.parameter if isinstance(position, Dimension) else position
+        maximum = int(position) if isinstance(position, Dimension) else getattr(position, "maximum", position)
+        if isinstance(parameter, UIntParameter) and (
+            parameter.plan is not self.p
+            or len(cos.shape) != 2 or cos.shape != sin.shape
+            or cos.shape[1] != dim // 2
+            or maximum + rows > cos.shape[0]
+        ):
+            raise ValueError("Dynamic RoPE position requires same-plan bounds within the table capacity")
+        params = [rows, heads, dim, position]
+        offsets = isinstance(k.offset, Dimension) or isinstance(v.offset, Dimension)
+        if offsets:
+            self.p.bind(k)
+            self.p.bind(v)
+            params += [k.offset // 2, v.offset // 2]
+            k = Tensor(self.p, k.shape, k.buffer, stride=k.stride)
+            v = Tensor(self.p, v.shape, v.buffer, stride=v.stride)
         self.p.dispatch(
-            "tr_rope",
+            "tr_rope_offsets" if offsets else "tr_rope",
             [qkv, q, k, v, cos, sin],
             {1, 2, 3},
-            [rows, heads, dim, position],
+            params,
             ((rows * (heads + 1) * (dim // 2) + 63) // 64,),
         )
 
@@ -624,15 +719,21 @@ class Attention:
         if len(q.shape) != 3:
             raise ValueError(f"Native GQA requires q=[rows,heads,256]; got {q.shape}")
         rows, heads, dim = q.shape
+        dynamic = isinstance(valid_prefix, UIntParameter)
+        prefix = valid_prefix.value if dynamic else valid_prefix
+        storage_prefix = prefix_capacity if dynamic else prefix
         if (
             dim != 256
             or k.shape[1:] != (1, 256)
             or k.shape != v.shape
-            or not 0 <= valid_prefix <= prefix_capacity
-            or k.shape[0] not in (valid_prefix, valid_prefix + rows)
+            or not 0 <= prefix <= prefix_capacity
+            or (dynamic and (valid_prefix.plan is not self.p
+                             or valid_prefix.minimum <= 0
+                             or valid_prefix.maximum > prefix_capacity))
+            or k.shape[0] not in (storage_prefix, storage_prefix + rows)
         ):
             raise ValueError(
-                f"Native GQA requires compact unmasked D256 attention; "
+                f"Native GQA requires compact or bounded padded D256 attention; "
                 f"q={q.shape}, k={k.shape}, v={v.shape}, "
                 f"prefix={valid_prefix}, capacity={prefix_capacity}"
             )
@@ -640,6 +741,9 @@ class Attention:
             raise ValueError(
                 f"Native GQA requires out={(rows, heads * dim)} or {q.shape}; got {out.shape}"
             )
+        params = [rows, k.shape[0], heads, dim]
+        if dynamic:
+            params += [valid_prefix, prefix_capacity]
         if self.split_decode and rows <= 16 and k.shape[0] > 128:
             keys = k.shape[0]
             splits = (keys + 127) // 128
@@ -651,10 +755,10 @@ class Attention:
                 )
             partial, stats = self.workspaces[shape]
             self.p.dispatch(
-                "tr_gqa_split",
+                "tr_gqa_split_masked" if dynamic else "tr_gqa_split",
                 [q, k, v, partial, stats],
                 {3, 4},
-                [rows, keys, heads, dim],
+                params,
                 (1, heads, splits),
                 128,
             )
@@ -668,10 +772,10 @@ class Attention:
             )
             return out
         self.p.dispatch(
-            "tr_gqa",
+            "tr_gqa_masked" if dynamic else "tr_gqa",
             [q, k, v, out],
             {3},
-            [rows, k.shape[0], heads, dim],
+            params,
             ((rows + 15) // 16, heads),
             128,
         )

@@ -19,17 +19,21 @@ class Pi05PipelineMps(Pi05TorchPipeline):
         self._stage_profiler = None
 
     def enable_native_pipeline(self, prompt_len, *, library=None, capture_probes=False, residency=True,
-                               split_decode=True, merged_encoder_ffn=True):
+                               split_decode=True, merged_encoder_ffn=True, dynamic_prompt=True,
+                               pad_prompt=False):
         """Build one ICB for patch + blocks + projector + prefix + denoising.
 
-        Shape specialization occurs here, outside replay. Use forward_native
+        By default all prompt lengths up to max_prompt_len reuse this compact plan.
+        pad_prompt=True explicitly selects capacity-sized prefix computation.
+        Set dynamic_prompt=False for exact-shape diagnostics. Use forward_native
         for CPU inputs and CPU actions without MPS input/output staging.
         """
         from flash_rt.models.pi05.native_plan_mps import NativePi05Plan
         native = NativePi05Plan(self, prompt_len, library=library,
                                capture_probes=capture_probes, residency=residency,
                                split_decode=split_decode,
-                               merged_encoder_ffn=merged_encoder_ffn)
+                               merged_encoder_ffn=merged_encoder_ffn,
+                               dynamic_prompt=dynamic_prompt, pad_prompt=pad_prompt)
         previous = self._native_pipeline
         self._native_pipeline = native
         if previous is not None:
@@ -66,8 +70,8 @@ class Pi05PipelineMps(Pi05TorchPipeline):
         self._validate_inputs(images_nhwc, prompt_embeds, prompt_len, noise)
         if use_graph:
             raise ValueError("Use native ICB replay directly, not CUDA graph mode")
-        if prompt_len != self._native_pipeline.prompt_len:
-            raise ValueError("Native plan prompt length changed; call enable_native_pipeline with the new length")
+        if not self._native_pipeline.accepts_prompt_length(prompt_len):
+            raise ValueError("Native prompt length changed beyond the plan's declared capacity")
         if capture_probes and not self._native_pipeline.probes:
             raise ValueError("Build the native plan with capture_probes=True for diagnostic output")
         self._capture_probes = capture_probes

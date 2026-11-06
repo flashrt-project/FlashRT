@@ -2,13 +2,26 @@
 #include "common/source.h"
 
 namespace flashrt::apple::shaders {
-inline std::string rope_bf16_source() {
-    return std::string(metal_preamble) + R"MSL(
-struct Rope {uint rows,heads,dim,position;};
-kernel void tr_rope(device const bfloat* x [[buffer(0)]],device bfloat* q [[buffer(1)]],
+inline std::string rope_bf16_source(bool offsets = false) {
+    return std::string(metal_preamble) +
+        (offsets ? "\n#define FRT_ROPE_OFFSETS 1\n" : "\n#define FRT_ROPE_OFFSETS 0\n") + R"MSL(
+struct Rope {uint rows,heads,dim,position;
+#if FRT_ROPE_OFFSETS
+    uint key_offset,value_offset;
+#endif
+};
+#if FRT_ROPE_OFFSETS
+#define ROPE_ENTRY tr_rope_offsets
+#else
+#define ROPE_ENTRY tr_rope
+#endif
+kernel void ROPE_ENTRY(device const bfloat* x [[buffer(0)]],device bfloat* q [[buffer(1)]],
     device bfloat* k [[buffer(2)]],device bfloat* v [[buffer(3)]],
     device const bfloat* cs [[buffer(4)]],device const bfloat* sn [[buffer(5)]],
     constant Rope& p [[buffer(6)]],uint i [[thread_position_in_grid]]) {
+#if FRT_ROPE_OFFSETS
+    k+=p.key_offset;v+=p.value_offset;
+#endif
     uint pairs=p.dim/2;
     if(i>=p.rows*(p.heads+1)*pairs)return;
     uint pair=i%pairs,h=(i/pairs)%(p.heads+1),r=i/(pairs*(p.heads+1));
