@@ -29,17 +29,15 @@
 //   0b111 = 6.0   (E=3, M=1)
 
 __device__ __forceinline__ uint8_t float_to_fp4_e2m1(float v) {
-    uint8_t sign = (v < 0.0f) ? 0x8u : 0x0u;
-    float a = fabsf(v);
-    uint8_t mag;
-    if      (a < 0.25f)  mag = 0;  // -> 0.0
-    else if (a < 0.75f)  mag = 1;  // -> 0.5
-    else if (a < 1.25f)  mag = 2;  // -> 1.0
-    else if (a < 1.75f)  mag = 3;  // -> 1.5
-    else if (a < 2.5f)   mag = 4;  // -> 2.0
-    else if (a < 3.5f)   mag = 5;  // -> 3.0
-    else if (a < 5.0f)   mag = 6;  // -> 4.0
-    else                 mag = 7;  // -> 6.0
+    // Threshold count, predicated rather than an 8-way if-else chain (which
+    // diverges across a warp and serializes the hot per-element encode).
+    // Same codes for every input: thresholds are the round-half-up
+    // midpoints, and NaN (no comparison true) still maps to magnitude 7.
+    const float a = fabsf(v);
+    const uint8_t sign = (v < 0.0f) ? 0x8u : 0x0u;
+    const uint8_t mag = (uint8_t)((a >= 0.25f) + (a >= 0.75f) + (a >= 1.25f)
+                                + (a >= 1.75f) + (a >= 2.5f)  + (a >= 3.5f)
+                                + (a >= 5.0f) + 7 * (a != a));
     return sign | mag;
 }
 
@@ -54,6 +52,30 @@ __device__ __forceinline__ uint8_t float_to_fp4_e2m1_branchless(float v) {
                           + (a >= 1.75f) + (a >= 2.5f)  + (a >= 3.5f)
                           + (a >= 5.0f));
     return sign | mag;
+}
+
+// Two values -> one packed byte (lo in the low nibble) with the codes of
+// float_to_fp4_e2m1_branchless: one hardware round-to-nearest-even
+// conversion, plus the four midpoints (0.25, 1.25, 2.5, 5) where RNE picks the
+// even code and the threshold encoders round half up, plus their (v < 0) sign
+// rule. Equal to two branchless calls on every non-NaN fp32 input (checked
+// exhaustively under --ftz=true); sm_100a / sm_120a only.
+__device__ __forceinline__ uint8_t float2_to_fp4_e2m1x2_exact(float lo, float hi) {
+#if defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM100_ALL) || \
+    defined(__CUDA_ARCH_FEAT_SM121_ALL)
+    uint16_t r;
+    asm("{\n.reg .b8 b;\ncvt.rn.satfinite.e2m1x2.f32 b, %2, %1;\ncvt.u16.u8 %0, b;\n}"
+        : "=h"(r) : "f"(lo), "f"(hi));
+    const float al = fabsf(lo), ah = fabsf(hi);
+    uint32_t c = r;
+    c += ((al == 0.25f) | (al == 1.25f) | (al == 2.5f) | (al == 5.0f))
+         + (((ah == 0.25f) | (ah == 1.25f) | (ah == 2.5f) | (ah == 5.0f)) << 4);
+    c = (c & 0x77u) | (lo < 0.0f ? 0x8u : 0u) | (hi < 0.0f ? 0x80u : 0u);
+    return static_cast<uint8_t>(c);
+#else
+    return static_cast<uint8_t>((float_to_fp4_e2m1_branchless(hi) << 4)
+                                | (float_to_fp4_e2m1_branchless(lo) & 0x0F));
+#endif
 }
 
 __device__ __forceinline__ float fp4_e2m1_to_float(uint8_t v) {
@@ -105,8 +127,10 @@ __device__ __forceinline__ uint8_t float_to_ue4m3_ceil(float v) {
 }
 
 __device__ __forceinline__ float ue4m3_to_float(uint8_t v) {
+    // exact: normals (1 + m/8) * 2^(e-7) assembled as fp32 bits, subnormals
+    // m * 2^-9 (what the ldexpf forms compute, without the libm calls)
     int e = (v >> 3) & 0xF;
     int m = v & 0x7;
-    if (e == 0) return ldexpf((float)m / 8.0f, -6);
-    return ldexpf(1.0f + (float)m / 8.0f, e - 7);
+    if (e == 0) return (float)m * 0.001953125f;
+    return __uint_as_float((uint32_t)(e + 120) << 23 | (uint32_t)m << 20);
 }

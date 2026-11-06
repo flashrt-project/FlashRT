@@ -42,6 +42,8 @@ chameleon = ["torch", "safetensors", "transformers>=4.43,<4.56", "Pillow"]
 lawam = ["flash-rt[torch]", "transformers>=4.57", "Pillow"]
 # MolmoAct2 prompt tokenizer and BF16 precomputation/noise conversion.
 molmoact2 = ["flash-rt[torch]", "tokenizers>=0.21", "ml_dtypes"]
+# VLA-JEPA (LeRobot) uses the Qwen3-VL AutoProcessor at set_prompt time.
+vla_jepa = ["flash-rt[torch]", "transformers>=4.57"]
 jax = ["jax", "jaxlib", "ml_dtypes", "orbax-checkpoint", "flax"]
 server = ["fastapi", "uvicorn"]
 eval = ["opencv-python", "tqdm"]
@@ -72,7 +74,7 @@ flash-attn = ["flash-attn"]
 # (flash_rt/hardware/thor/fa4_backend.py) sets CUTE_DSL_ARCH=sm_101a.
 # Requires an editable / source-tree install (pip install -e). pip install ".[thor-fa4]".
 thor-fa4 = ["nvidia-cutlass-dsl==4.5.1", "quack-kernels==0.4.1"]
-all = ["flash-rt[torch,jax,server,eval,minimax-remover,motus,chameleon,xvla]"]
+all = ["flash-rt[torch,jax,server,eval,minimax-remover,motus,chameleon,xvla,vla_jepa]"]
 
 [project.urls]
 Homepage = "https://github.com/flashrt-project/FlashRT"

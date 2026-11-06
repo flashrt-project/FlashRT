@@ -16,6 +16,7 @@
 // straight through to the down GEMM unchanged.
 
 #include "fp4_swiglu_compact_sm120.cuh"
+#include "pdl_launch.cuh"
 
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -71,6 +72,10 @@ __global__ void swiglu_even_col_compact_v2_kernel(
     const int out_cols = inter >> 1;     // output bytes per row (packed)
     const long row_chunks = in_cols >> 4;          // 16 input bytes / chunk
     const long total = (long)M * row_chunks;
+    // PDL: the down GEMM may stage its prologue while this pass runs; the
+    // fused GEMM's output is read only after the grid-dependency wait.
+    flash_rt::pdl::pdl_trigger();
+    flash_rt::pdl::pdl_wait();
     for (long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
          idx < total; idx += (long)gridDim.x * blockDim.x) {
         long row = idx / row_chunks;
@@ -100,9 +105,10 @@ void fp4_swiglu_even_col_compact_v2(
     const int threads = 256;
     int blocks = (int)((total + threads - 1) / threads);
     if (blocks > 65535) blocks = 65535;
-    swiglu_even_col_compact_v2_kernel<<<blocks, threads, 0, stream>>>(
-        reinterpret_cast<const uint8_t*>(in_packed),
-        reinterpret_cast<uint8_t*>(out_packed), M, inter);
+    flash_rt::pdl::launch(swiglu_even_col_compact_v2_kernel, dim3(blocks), dim3(threads), 0,
+                          stream, flash_rt::pdl::enabled(),
+                          reinterpret_cast<const uint8_t*>(in_packed),
+                          reinterpret_cast<uint8_t*>(out_packed), M, inter);
 }
 
 }  // namespace kernels

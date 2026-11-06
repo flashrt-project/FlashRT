@@ -66,6 +66,12 @@ struct Flash_fwd_params : public Qkv_params {
     // The O matrix (output).
     void * __restrict__ o_ptr;
 
+    // Optional fused NVFP4 O epilogue (target smallq path): packed e2m1 +
+    // swizzled UE4M3 scales for the next GEMM's A operand. Null on every
+    // unrelated caller; the epilogue is skipped entirely.
+    void * __restrict__ o_fp4_ptr;
+    void * __restrict__ o_sf_ptr;
+
     // FlashRT local patch 4: optional FP8 (e4m3) copy of the final attention
     // output, written from the registers that already feed the bf16 store, so a
     // consumer GEMM that wants an FP8 activation does not need a second pass over
@@ -108,6 +114,10 @@ struct Flash_fwd_params : public Qkv_params {
     void * __restrict__ o_sfa_ptr;
     int o_packed_row_bytes;
     int o_sfa_n_col_blocks;
+    // Optional per-batch offsets for the fused NVFP4 output. Zero (every
+    // existing caller) keeps the original single-batch-addressing path.
+    index_t o_packed_batch_stride;
+    index_t o_sfa_batch_stride;
     int quantize_o;
 
     // Launch with a programmatic dependency on the previous graph node

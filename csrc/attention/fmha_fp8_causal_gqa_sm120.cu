@@ -22,6 +22,9 @@
 
 #include "fmha_fp8_causal_gqa_sm120.cuh"
 
+#include "../kernels/nvfp4_convert.cuh"
+#include "../kernels/pdl_launch.cuh"
+
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cstdint>
@@ -31,8 +34,6 @@ namespace attention {
 namespace {
 
 constexpr int kHeadDim = 128;      // d
-constexpr int kQHeads  = 32;       // Hq
-constexpr int kKVHeads = 8;        // Hkv (GQA 4:1)
 constexpr int kDBlk    = kHeadDim / 8;
 constexpr float kPScale = 64.f;    // P e4m3 requantisation scale
 
@@ -109,7 +110,7 @@ __device__ __forceinline__ float ue4m3_decode(uint8_t v) {
 //   bf16 O round-trip and the standalone quantize launch. Values round
 //   through bf16 in-register first, so packed/SF bytes are identical to
 //   the [bf16 O write + quantize kernel] chain.
-template <bool Fp4Out, int QT, int KT, int WARPS, int MINBLK, bool WSP = false>
+template <int QHeads, int KVHeads, bool Fp4Out, int QT, int KT, int WARPS, int MINBLK, bool WSP = false>
 __global__ void __launch_bounds__((WSP ? WARPS + 2 : WARPS) * 32, MINBLK)
 fmha_fp8_kernel(const __nv_fp8_e4m3* __restrict__ Q,
                 const __nv_fp8_e4m3* __restrict__ K,
@@ -131,7 +132,7 @@ fmha_fp8_kernel(const __nv_fp8_e4m3* __restrict__ Q,
   // 1..Lq/QT KV blocks). Results are unchanged; only the schedule differs.
   const int head = blockIdx.x;
   const int qt = gridDim.y - 1 - blockIdx.y;
-  const int kvh = head / (kQHeads / kKVHeads);
+  const int kvh = head / (QHeads / KVHeads);
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31, g = lane >> 2, tt = lane & 3;
   const int q_base = qt * QT;
   // Optional warp specialization: warps 0..WARPS-1 compute, the last two
@@ -154,7 +155,7 @@ fmha_fp8_kernel(const __nv_fp8_e4m3* __restrict__ Q,
     // are never consumed, but the values must stay finite (no NaN in the MMA).
     const int gr = (q_base + r) < L ? (q_base + r) : (L - 1);
     ((uint4*)Qs)[r * (kHeadDim / 16) + (c ^ (r & 7))] = *(const uint4*)&(
-        (const uint8_t*)Q)[(size_t)gr * kQHeads * kHeadDim + head * kHeadDim + c * 16];
+        (const uint8_t*)Q)[(size_t)gr * QHeads * kHeadDim + head * kHeadDim + c * 16];
   }
   const int qrow0 = warp * 16;
   float Oc[kDBlk][4];
@@ -172,9 +173,9 @@ fmha_fp8_kernel(const __nv_fp8_e4m3* __restrict__ Q,
     for (int j = idx; j < KT * kHeadDim / 16; j += stride) {
       int k = j / (kHeadDim / 16), c = j % (kHeadDim / 16);
       cp_async16(&Ks[buf][k * kHeadDim + ((c ^ (k & 7)) << 4)],
-                 &((const uint8_t*)K)[(size_t)(kb + k) * kKVHeads * kHeadDim + kvh * kHeadDim + c * 16]);
+                 &((const uint8_t*)K)[(size_t)(kb + k) * KVHeads * kHeadDim + kvh * kHeadDim + c * 16]);
       cp_async16(&Vraw[k * kHeadDim + c * 16],
-                 &((const uint8_t*)V)[(size_t)(kb + k) * kKVHeads * kHeadDim + kvh * kHeadDim + c * 16]);
+                 &((const uint8_t*)V)[(size_t)(kb + k) * KVHeads * kHeadDim + kvh * kHeadDim + c * 16]);
     }
   };
   // Kraw -> swizzled Ks (16B chunks); Vraw -> transposed Vt via a 4x4
@@ -318,8 +319,8 @@ fmha_fp8_kernel(const __nv_fp8_e4m3* __restrict__ Q,
 #pragma unroll
     for (int nb = 0; nb < kDBlk; nb++) {
       int d = nb * 8;
-      size_t r0 = (size_t)(q_base + qrow0 + g) * kQHeads * kHeadDim + head * kHeadDim + d;
-      size_t r1 = (size_t)(q_base + qrow0 + g + 8) * kQHeads * kHeadDim + head * kHeadDim + d;
+      size_t r0 = (size_t)(q_base + qrow0 + g) * QHeads * kHeadDim + head * kHeadDim + d;
+      size_t r1 = (size_t)(q_base + qrow0 + g + 8) * QHeads * kHeadDim + head * kHeadDim + d;
       O[r0 + 2 * tt + 0] = __float2bfloat16(Oc[nb][0] * ip0);
       O[r0 + 2 * tt + 1] = __float2bfloat16(Oc[nb][1] * ip0);
       O[r1 + 2 * tt + 0] = __float2bfloat16(Oc[nb][2] * ip1);
@@ -331,7 +332,7 @@ fmha_fp8_kernel(const __nv_fp8_e4m3* __restrict__ Q,
     // 2tt/2tt+1, nb=2b+1 holds 8+2tt/8+2tt+1. amax and the 8 packed bytes
     // assemble with two quad shuffles each; the tt==0 lane stores the
     // 8-byte block and its swizzled SF byte.
-    constexpr int kK = kQHeads * kHeadDim;          // o_proj K = 4096
+    constexpr int kK = QHeads * kHeadDim;          // o_proj K = 4096
     constexpr int kNColBlocks = (kK / 16 + 3) / 4;  // SF swizzle col groups
 #pragma unroll
     for (int half = 0; half < 2; ++half) {          // rows m0, m1
@@ -371,15 +372,15 @@ fmha_fp8_kernel(const __nv_fp8_e4m3* __restrict__ Q,
   }
 }
 
-template <bool Fp4Out, int QT, int KT, int WARPS, int MINBLK, bool WSP = false>
+template <int QHeads, int KVHeads, bool Fp4Out, int QT, int KT, int WARPS, int MINBLK, bool WSP = false>
 int launch_fmha(const void* q_fp8, const void* k_fp8, const void* v_fp8,
                 void* out_bf16, void* out_fp4, void* out_sf,
                 int Lq, int Lk, int num_q_heads, int num_kv_heads,
                 float softmax_scale, cudaStream_t stream) {
   if (Lq != Lk || Lq <= 0) return 1;
-  if (num_q_heads != kQHeads || num_kv_heads != kKVHeads) return 1;
-  dim3 grid(kQHeads, (Lq + QT - 1) / QT);
-  fmha_fp8_kernel<Fp4Out, QT, KT, WARPS, MINBLK, WSP>
+  if (num_q_heads != QHeads || num_kv_heads != KVHeads) return 1;
+  dim3 grid(QHeads, (Lq + QT - 1) / QT);
+  fmha_fp8_kernel<QHeads, KVHeads, Fp4Out, QT, KT, WARPS, MINBLK, WSP>
       <<<grid, (WSP ? WARPS + 2 : WARPS) * 32, 0, stream>>>(
           (const __nv_fp8_e4m3*)q_fp8, (const __nv_fp8_e4m3*)k_fp8,
           (const __nv_fp8_e4m3*)v_fp8, (__nv_bfloat16*)out_bf16,
@@ -388,13 +389,32 @@ int launch_fmha(const void* q_fp8, const void* k_fp8, const void* v_fp8,
   return err == cudaSuccess ? 0 : 1;
 }
 
+
+template <bool Fp4Out, int QT, int KT, int WARPS, int MINBLK, bool WSP = false>
+int launch_fmha_heads(const void* q_fp8, const void* k_fp8, const void* v_fp8,
+                      void* out_bf16, void* out_fp4, void* out_sf,
+                      int Lq, int Lk, int num_q_heads, int num_kv_heads,
+                      float softmax_scale, cudaStream_t stream) {
+  if (num_q_heads == 16 && num_kv_heads == 8) {
+    return launch_fmha<16, 8, Fp4Out, QT, KT, WARPS, MINBLK, WSP>(
+        q_fp8, k_fp8, v_fp8, out_bf16, out_fp4, out_sf, Lq, Lk,
+        num_q_heads, num_kv_heads, softmax_scale, stream);
+  }
+  if (num_q_heads == 32 && num_kv_heads == 8) {
+    return launch_fmha<32, 8, Fp4Out, QT, KT, WARPS, MINBLK, WSP>(
+        q_fp8, k_fp8, v_fp8, out_bf16, out_fp4, out_sf, Lq, Lk,
+        num_q_heads, num_kv_heads, softmax_scale, stream);
+  }
+  return 1;
+}
+
 }  // namespace
 
 int fmha_fp8_causal_gqa_nhd_d128(
     const void* q_fp8, const void* k_fp8, const void* v_fp8, void* out_bf16,
     int Lq, int Lk, int num_q_heads, int num_kv_heads,
     float softmax_scale, cudaStream_t stream) {
-  return launch_fmha<false, 128, 128, 8, 1>(
+  return launch_fmha_heads<false, 128, 128, 8, 1>(
       q_fp8, k_fp8, v_fp8, out_bf16, nullptr, nullptr, Lq, Lk,
       num_q_heads, num_kv_heads, softmax_scale, stream);
 }
@@ -404,7 +424,7 @@ int fmha_fp8_causal_gqa_nhd_d128_fp4out(
     void* out_fp4, void* out_sf,
     int Lq, int Lk, int num_q_heads, int num_kv_heads,
     float softmax_scale, cudaStream_t stream) {
-  return launch_fmha<true, 128, 128, 8, 1>(
+  return launch_fmha_heads<true, 128, 128, 8, 1>(
       q_fp8, k_fp8, v_fp8, nullptr, out_fp4, out_sf, Lq, Lk,
       num_q_heads, num_kv_heads, softmax_scale, stream);
 }
@@ -416,7 +436,7 @@ int fmha_fp8_causal_gqa_q64_nhd_d128(
     const void* q_fp8, const void* k_fp8, const void* v_fp8, void* out_bf16,
     int Lq, int Lk, int num_q_heads, int num_kv_heads,
     float softmax_scale, cudaStream_t stream) {
-  return launch_fmha<false, 64, 64, 4, 2>(
+  return launch_fmha<32, 8, false, 64, 64, 4, 2>(
       q_fp8, k_fp8, v_fp8, out_bf16, nullptr, nullptr, Lq, Lk,
       num_q_heads, num_kv_heads, softmax_scale, stream);
 }
@@ -426,7 +446,7 @@ int fmha_fp8_causal_gqa_q64_nhd_d128_fp4out_wsp(
     void* out_fp4, void* out_sf,
     int Lq, int Lk, int num_q_heads, int num_kv_heads,
     float softmax_scale, cudaStream_t stream) {
-  return launch_fmha<true, 64, 64, 4, 2, true>(
+  return launch_fmha<32, 8, true, 64, 64, 4, 2, true>(
       q_fp8, k_fp8, v_fp8, nullptr, out_fp4, out_sf, Lq, Lk,
       num_q_heads, num_kv_heads, softmax_scale, stream);
 }
@@ -436,9 +456,290 @@ int fmha_fp8_causal_gqa_q64_nhd_d128_fp4out(
     void* out_fp4, void* out_sf,
     int Lq, int Lk, int num_q_heads, int num_kv_heads,
     float softmax_scale, cudaStream_t stream) {
-  return launch_fmha<true, 64, 64, 4, 2>(
+  return launch_fmha<32, 8, true, 64, 64, 4, 2>(
       q_fp8, k_fp8, v_fp8, nullptr, out_fp4, out_sf, Lq, Lk,
       num_q_heads, num_kv_heads, softmax_scale, stream);
+}
+
+// VLA-JEPA decoder shape (16 Q / 8 KV): the same 64x64 tile, exposed as a
+// separate entry so the MolmoAct2 32/8 entries above keep their original
+// instantiations. Gated at the binding by VLA-JEPA. The bf16-out sibling is
+// used by the numerical test and as a fallback.
+int fmha_fp8_causal_gqa_q64_nhd_d128_16_8(
+    const void* q_fp8, const void* k_fp8, const void* v_fp8, void* out_bf16,
+    int Lq, int Lk, int num_q_heads, int num_kv_heads,
+    float softmax_scale, cudaStream_t stream) {
+  if (num_q_heads != 16 || num_kv_heads != 8) return 1;
+  return launch_fmha<16, 8, false, 64, 64, 4, 2>(
+      q_fp8, k_fp8, v_fp8, out_bf16, nullptr, nullptr, Lq, Lk,
+      num_q_heads, num_kv_heads, softmax_scale, stream);
+}
+
+int fmha_fp8_causal_gqa_q64_nhd_d128_fp4out_16_8(
+    const void* q_fp8, const void* k_fp8, const void* v_fp8,
+    void* out_fp4, void* out_sf,
+    int Lq, int Lk, int num_q_heads, int num_kv_heads,
+    float softmax_scale, cudaStream_t stream) {
+  if (num_q_heads != 16 || num_kv_heads != 8) return 1;
+  return launch_fmha<16, 8, true, 64, 64, 4, 2>(
+      q_fp8, k_fp8, v_fp8, nullptr, out_fp4, out_sf, Lq, Lk,
+      num_q_heads, num_kv_heads, softmax_scale, stream);
+}
+
+namespace {
+
+
+// ── Target-validated 16/8 64-row fp4-out tile (VLA-only port) ───────────
+// This is the kernel that the campaign's production target used for the
+// 16 Q / 8 KV decoder: same per-row math as the 128-row fp4-out kernel
+// (bit-identical in the target's own A/B), but 4 warps x 16 rows and two
+// CTAs per SM. Kept as a separate symbol so the upstream 32/8 q64 entries
+// and every other model's routing are untouched.
+constexpr int kVLAQ64 = 64;
+constexpr int kVLAQ64Warps = 4;
+constexpr int kVLAQ64Threads = kVLAQ64Warps * 32;
+constexpr int kVLAKTile = 128;
+constexpr int kVLAVtPad = kVLAKTile + 8;
+constexpr int kVLANBlk = kVLAKTile / 8;
+constexpr size_t kVLAQ64Smem = size_t(kVLAQ64) * kHeadDim +
+                               size_t(kVLAKTile) * kHeadDim +
+                               size_t(kHeadDim) * kVLAVtPad +
+                               size_t(kVLAQ64) * kVLAKTile;
+
+template <int QHeads, int KVHeads>
+__global__ void __launch_bounds__(kVLAQ64Threads, 2)
+fmha_fp8_q64_fp4out_kernel(const __nv_fp8_e4m3* __restrict__ Q,
+                           const __nv_fp8_e4m3* __restrict__ K,
+                           const __nv_fp8_e4m3* __restrict__ V,
+                           uint8_t* __restrict__ o_fp4,
+                           uint8_t* __restrict__ o_sf, float scale, int n_qt) {
+  extern __shared__ __align__(16) uint8_t q64_smem[];
+  uint8_t* Qs = q64_smem;
+  uint8_t* Ks = Qs + kVLAQ64 * kHeadDim;
+  uint8_t* Vt = Ks + kVLAKTile * kHeadDim;
+  uint8_t* Ps = Vt + kHeadDim * kVLAVtPad;
+  flash_rt::pdl::pdl_trigger();
+  flash_rt::pdl::pdl_wait();
+  // heavy-first order: the q tiles that need the most KV tiles come first
+  const int heavy = n_qt / 2;                     // q tiles with qt >= n_qt / 2
+  int qt, head;
+  {
+    const int i = blockIdx.x;
+    const int nh = heavy * QHeads;
+    if (i < nh) { head = i / heavy; qt = n_qt - heavy + i % heavy; }
+    else { const int j = i - nh; head = j / (n_qt - heavy); qt = j % (n_qt - heavy); }
+  }
+  const int kvh = head / (QHeads / KVHeads);
+  const int t = threadIdx.x, warp = t >> 5, lane = t & 31, g = lane >> 2, tt = lane & 3;
+  const int q_base = qt * kVLAQ64;
+  const int last = (q_base + kVLAQ64 - 1) / kVLAKTile;
+
+  const int qrow0 = warp * 16;
+  float Oc[kDBlk][4];
+  float mi0 = -1e30f, mi1 = -1e30f, li0 = 0, li1 = 0;
+#pragma unroll
+  for (int nb = 0; nb < kDBlk; nb++) { Oc[nb][0] = Oc[nb][1] = Oc[nb][2] = Oc[nb][3] = 0; }
+
+  for (int j = t; j < kVLAQ64 * kHeadDim / 16; j += kVLAQ64Threads) {
+    int r = j / (kHeadDim / 16), c = j % (kHeadDim / 16);
+    cp_async16(&((uint4*)Qs)[r * (kHeadDim / 16) + (c ^ (r & 7))],
+               &((const uint8_t*)Q)[(size_t)(q_base + r) * QHeads * kHeadDim + head * kHeadDim + c * 16]);
+  }
+  for (int kv = 0; kv <= last; ++kv) {
+    const int kb = kv * kVLAKTile;
+    if (kv > 0) __syncthreads();                  // previous tile's QK / PV done
+    for (int j = t; j < kVLAKTile * kHeadDim / 16; j += kVLAQ64Threads) {
+      int k = j / (kHeadDim / 16), c = j % (kHeadDim / 16);
+      cp_async16(&((uint4*)Ks)[k * (kHeadDim / 16) + (c ^ (k & 7))],
+                 &((const uint8_t*)K)[(size_t)(kb + k) * KVHeads * kHeadDim + kvh * kHeadDim + c * 16]);
+    }
+    asm volatile("cp.async.commit_group;\n");
+    // V: 4x4 byte blocks straight from global, transposed in registers
+    constexpr int kVBlk = (kVLAKTile / 4) * (kHeadDim / 4) / kVLAQ64Threads;   // 8
+    uint32_t vr[kVBlk][4];
+#pragma unroll
+    for (int u = 0; u < kVBlk; ++u) {
+      const int j = t + u * kVLAQ64Threads;
+      const int k0 = (j / (kHeadDim / 4)) * 4, d0 = (j % (kHeadDim / 4)) * 4;
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+        vr[u][i] = *reinterpret_cast<const uint32_t*>(
+            &((const uint8_t*)V)[(size_t)(kb + k0 + i) * KVHeads * kHeadDim + kvh * kHeadDim + d0]);
+    }
+#pragma unroll
+    for (int u = 0; u < kVBlk; ++u) {
+      const int j = t + u * kVLAQ64Threads;
+      const int k0 = (j / (kHeadDim / 4)) * 4, d0 = (j % (kHeadDim / 4)) * 4;
+      const uint32_t r0 = vr[u][0], r1 = vr[u][1], r2 = vr[u][2], r3 = vr[u][3];
+      uint32_t c0 = (r0 & 0xFF) | ((r1 & 0xFF) << 8) | ((r2 & 0xFF) << 16) | ((r3 & 0xFF) << 24);
+      uint32_t c1 = ((r0 >> 8) & 0xFF) | (((r1 >> 8) & 0xFF) << 8) | (((r2 >> 8) & 0xFF) << 16) | (((r3 >> 8) & 0xFF) << 24);
+      uint32_t c2 = ((r0 >> 16) & 0xFF) | (((r1 >> 16) & 0xFF) << 8) | (((r2 >> 16) & 0xFF) << 16) | (((r3 >> 16) & 0xFF) << 24);
+      uint32_t c3 = ((r0 >> 24) & 0xFF) | (((r1 >> 24) & 0xFF) << 8) | (((r2 >> 24) & 0xFF) << 16) | (((r3 >> 24) & 0xFF) << 24);
+      *(uint32_t*)&Vt[(d0 + 0) * kVLAVtPad + ((((k0 >> 4) ^ ((d0 + 0) & 7)) << 4) + (k0 & 15))] = c0;
+      *(uint32_t*)&Vt[(d0 + 1) * kVLAVtPad + ((((k0 >> 4) ^ ((d0 + 1) & 7)) << 4) + (k0 & 15))] = c1;
+      *(uint32_t*)&Vt[(d0 + 2) * kVLAVtPad + ((((k0 >> 4) ^ ((d0 + 2) & 7)) << 4) + (k0 & 15))] = c2;
+      *(uint32_t*)&Vt[(d0 + 3) * kVLAVtPad + ((((k0 >> 4) ^ ((d0 + 3) & 7)) << 4) + (k0 & 15))] = c3;
+    }
+    asm volatile("cp.async.wait_all;\n");
+    __syncthreads();
+
+    float C[kVLANBlk][4];
+#pragma unroll
+    for (int nb = 0; nb < kVLANBlk; nb++) { C[nb][0] = C[nb][1] = C[nb][2] = C[nb][3] = 0; }
+#pragma unroll
+    for (int ks = 0; ks < kHeadDim / 32; ks++) {
+      int ko = ks * 32;
+      uint32_t a0 = *(const uint32_t*)&Qs[sw(qrow0 + g, ko + tt * 4)];
+      uint32_t a1 = *(const uint32_t*)&Qs[sw(qrow0 + g + 8, ko + tt * 4)];
+      uint32_t a2 = *(const uint32_t*)&Qs[sw(qrow0 + g, ko + 16 + tt * 4)];
+      uint32_t a3 = *(const uint32_t*)&Qs[sw(qrow0 + g + 8, ko + 16 + tt * 4)];
+#pragma unroll
+      for (int nb = 0; nb < kVLANBlk; nb++) {
+        int n = nb * 8;
+        uint32_t b0 = *(const uint32_t*)&Ks[sw(n + g, ko + tt * 4)];
+        uint32_t b1 = *(const uint32_t*)&Ks[sw(n + g, ko + 16 + tt * 4)];
+        mma_fp8_k32(C[nb], a0, a1, a2, a3, b0, b1);
+      }
+    }
+    if (kv == last) {  // diagonal tile: mask key > query row (absolute positions)
+      int gr0 = q_base + qrow0 + g - kb, gr1 = gr0 + 8;
+#pragma unroll
+      for (int nb = 0; nb < kVLANBlk; nb++) {
+        int c0 = nb * 8 + 2 * tt, c1 = c0 + 1;
+        if (c0 > gr0) C[nb][0] = -1e30f;
+        if (c1 > gr0) C[nb][1] = -1e30f;
+        if (c0 > gr1) C[nb][2] = -1e30f;
+        if (c1 > gr1) C[nb][3] = -1e30f;
+      }
+    }
+    float mt0 = -1e30f, mt1 = -1e30f;
+#pragma unroll
+    for (int nb = 0; nb < kVLANBlk; nb++) {
+      mt0 = fmaxf(mt0, fmaxf(C[nb][0], C[nb][1]));
+      mt1 = fmaxf(mt1, fmaxf(C[nb][2], C[nb][3]));
+    }
+    mt0 *= scale; mt1 *= scale;
+    mt0 = fmaxf(mt0, __shfl_xor_sync(~0u, mt0, 1)); mt0 = fmaxf(mt0, __shfl_xor_sync(~0u, mt0, 2));
+    mt1 = fmaxf(mt1, __shfl_xor_sync(~0u, mt1, 1)); mt1 = fmaxf(mt1, __shfl_xor_sync(~0u, mt1, 2));
+    float mn0 = fmaxf(mi0, mt0), mn1 = fmaxf(mi1, mt1);
+    float corr0 = __expf(mi0 - mn0), corr1 = __expf(mi1 - mn1);
+    float lt0 = 0, lt1 = 0;
+#pragma unroll
+    for (int nb = 0; nb < kVLANBlk; nb++) {
+      C[nb][0] = __expf(C[nb][0] * scale - mn0); C[nb][1] = __expf(C[nb][1] * scale - mn0);
+      lt0 += C[nb][0] + C[nb][1];
+      C[nb][2] = __expf(C[nb][2] * scale - mn1); C[nb][3] = __expf(C[nb][3] * scale - mn1);
+      lt1 += C[nb][2] + C[nb][3];
+    }
+    lt0 += __shfl_xor_sync(~0u, lt0, 1); lt0 += __shfl_xor_sync(~0u, lt0, 2);
+    lt1 += __shfl_xor_sync(~0u, lt1, 1); lt1 += __shfl_xor_sync(~0u, lt1, 2);
+    li0 = li0 * corr0 + lt0; li1 = li1 * corr1 + lt1; mi0 = mn0; mi1 = mn1;
+#pragma unroll
+    for (int nb = 0; nb < kDBlk; nb++) {
+      Oc[nb][0] *= corr0; Oc[nb][1] *= corr0; Oc[nb][2] *= corr1; Oc[nb][3] *= corr1;
+    }
+    // each warp's P rows are its own: a warp-level barrier is enough
+    __syncwarp();
+#pragma unroll
+    for (int nb = 0; nb < kVLANBlk; nb++) {
+      int n = nb * 8;
+      *reinterpret_cast<uint16_t*>(&Ps[sw(qrow0 + g, n + 2 * tt)]) = static_cast<uint16_t>(
+          __nv_fp8_e4m3(C[nb][0] * kPScale).__x | (__nv_fp8_e4m3(C[nb][1] * kPScale).__x << 8));
+      *reinterpret_cast<uint16_t*>(&Ps[sw(qrow0 + g + 8, n + 2 * tt)]) = static_cast<uint16_t>(
+          __nv_fp8_e4m3(C[nb][2] * kPScale).__x | (__nv_fp8_e4m3(C[nb][3] * kPScale).__x << 8));
+    }
+    __syncwarp();
+#pragma unroll
+    for (int ks = 0; ks < kVLAKTile / 32; ks++) {
+      int ko = ks * 32;
+      uint32_t a0 = *(const uint32_t*)&Ps[sw(qrow0 + g, ko + tt * 4)];
+      uint32_t a1 = *(const uint32_t*)&Ps[sw(qrow0 + g + 8, ko + tt * 4)];
+      uint32_t a2 = *(const uint32_t*)&Ps[sw(qrow0 + g, ko + 16 + tt * 4)];
+      uint32_t a3 = *(const uint32_t*)&Ps[sw(qrow0 + g + 8, ko + 16 + tt * 4)];
+#pragma unroll
+      for (int nb = 0; nb < kDBlk; nb++) {
+        int n = nb * 8;
+        uint32_t b0 = *(const uint32_t*)&Vt[(n + g) * kVLAVtPad + ((((ko + tt * 4) >> 4) ^ ((n + g) & 7)) << 4) + ((ko + tt * 4) & 15)];
+        uint32_t b1 = *(const uint32_t*)&Vt[(n + g) * kVLAVtPad + ((((ko + 16 + tt * 4) >> 4) ^ ((n + g) & 7)) << 4) + ((ko + 16 + tt * 4) & 15)];
+        mma_fp8_k32(Oc[nb], a0, a1, a2, a3, b0, b1);
+      }
+    }
+  }
+  float ip0 = 1.f / (li0 * kPScale), ip1 = 1.f / (li1 * kPScale);
+  // NVFP4 epilogue as in fmha_fp8_kernel<..., true>, the bf16 tile staged in Ks
+  constexpr int kK = QHeads * kHeadDim;
+  constexpr int kNColBlocks = (kK / 16 + 3) / 4;
+  __syncthreads();
+  __nv_bfloat16* Os = reinterpret_cast<__nv_bfloat16*>(Ks);
+#pragma unroll
+  for (int nb = 0; nb < kDBlk; nb++) {
+    const int d = nb * 8 + 2 * tt;
+    *reinterpret_cast<__nv_bfloat162*>(&Os[(qrow0 + g) * kHeadDim + d]) =
+        __floats2bfloat162_rn(Oc[nb][0] * ip0, Oc[nb][1] * ip0);
+    *reinterpret_cast<__nv_bfloat162*>(&Os[(qrow0 + g + 8) * kHeadDim + d]) =
+        __floats2bfloat162_rn(Oc[nb][2] * ip1, Oc[nb][3] * ip1);
+  }
+  __syncthreads();
+  constexpr int kBlocks = kVLAQ64 * (kHeadDim / 16);
+#pragma unroll
+  for (int i = t; i < kBlocks; i += kVLAQ64Threads) {
+    const int r = i / (kHeadDim / 16), b = i % (kHeadDim / 16);
+    const __nv_bfloat16* src = Os + r * kHeadDim + b * 16;
+    uint4 raw[2];
+    raw[0] = reinterpret_cast<const uint4*>(src)[0];
+    raw[1] = reinterpret_cast<const uint4*>(src)[1];
+    const __nv_bfloat16* hv = reinterpret_cast<const __nv_bfloat16*>(raw);
+    float v[16];
+    float amax = 0.f;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+      v[j] = __bfloat162float(hv[j]);
+      amax = fmaxf(amax, fabsf(v[j]));
+    }
+    const uint8_t ue = ue4m3_ceil_encode(amax / 6.0f);
+    const float fscale = ue4m3_decode(ue);
+    const float inv = (fscale > 0.f) ? (1.f / fscale) : 0.f;
+    uint32_t pk[2] = {0u, 0u};
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+      pk[j >> 2] |= (uint32_t)float2_to_fp4_e2m1x2_exact(v[2 * j] * inv, v[2 * j + 1] * inv)
+                    << (8 * (j & 3));
+    const int row = q_base + r;
+    *reinterpret_cast<uint2*>(&o_fp4[(size_t)row * (kK / 2) + head * (kHeadDim / 2) + 8 * b]) =
+        make_uint2(pk[0], pk[1]);
+    const int gb = head * (kHeadDim / 16) + b;
+    const int rb = row / 128, ri = row % 128;
+    o_sf[(size_t)(rb * kNColBlocks + gb / 4) * 512 + (ri % 32) * 16 + (ri / 32) * 4 + gb % 4] = ue;
+  }
+}
+
+
+}  // namespace
+
+// VLA-JEPA-only 16/8 fp4-out entry, ported from the production target.
+int fmha_fp8_causal_gqa_q64_fp4out_vla(
+    const void* q_fp8, const void* k_fp8, const void* v_fp8,
+    void* out_fp4, void* out_sf,
+    int Lq, int Lk, int num_q_heads, int num_kv_heads,
+    float softmax_scale, cudaStream_t stream) {
+  if (Lq != Lk || Lq <= 0 || (Lq % kVLAQ64) != 0 ||
+      (Lq % kVLAKTile) != 0) return 1;
+  if (num_q_heads != 16 || num_kv_heads != 8) return 1;
+  static bool attr = false;
+  if (!attr) {
+    cudaFuncSetAttribute(fmha_fp8_q64_fp4out_kernel<16, 8>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(kVLAQ64Smem));
+    attr = true;
+  }
+  const int n_qt = Lq / kVLAQ64;
+  flash_rt::pdl::launch(fmha_fp8_q64_fp4out_kernel<16, 8>,
+      dim3(n_qt * 16), dim3(kVLAQ64Threads), kVLAQ64Smem, stream,
+      flash_rt::pdl::enabled(),
+      (const __nv_fp8_e4m3*)q_fp8, (const __nv_fp8_e4m3*)k_fp8,
+      (const __nv_fp8_e4m3*)v_fp8, (uint8_t*)out_fp4,
+      (uint8_t*)out_sf, softmax_scale, n_qt);
+  return 0;
 }
 
 }  // namespace attention

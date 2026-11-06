@@ -7,12 +7,15 @@
     fvk_attention_fa2_fwd_bf16_seqused_splitkv;
     fvk_attention_fa2_fwd_bf16_causal;
     fvk_attention_fa2_fwd_bf16_tile;
+    fvk_attention_fa2_fwd_bf16_tile_vla;
     fvk_attention_fa2_fwd_bf16_fp8out;
     fvk_attention_fa2_fwd_bf16_causal_fp8out;
     fvk_attention_fa2_fwd_bf16_tile64;
     fvk_attention_fa2_fwd_bf16_tile64m32;
     fvk_attention_fa2_fwd_bf16_tile64m32w2;
     fvk_attention_fa2_fwd_bf16_tile64_qnvfp4;
+    fvk_attention_fa2_fwd_bf16_tile_fp4out;
+    fvk_attention_fa2_fwd_bf16_tile64_qnvfp4_batched;
     fvk_attention_fa2_fwd_bf16_tile64m32w2_qnvfp4;
     fvk_attention_fa2_has_xvla_tile64;
     fvk_attention_fa2_fwd_fp16_causal;

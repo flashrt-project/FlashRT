@@ -34,8 +34,10 @@ namespace gemm {
 //
 // Internally selects a Cooperative or Pingpong CUTLASS schedule
 // based on M (Pingpong is faster when M is small, e.g. decode
-// step or short prefill). Caller does not provide scratch buffers
-// (the kernel is fused, no dequant intermediates needed).
+// step or short prefill). ``schedule`` overrides the selection:
+// -1 = automatic, 0 = Cooperative, 1 = Pingpong. Callers on a
+// low-priority graph branch may force Cooperative. Caller does not provide
+// scratch buffers (the kernel is fused, no dequant intermediates needed).
 //
 // Stream-safe; per-shape arguments + workspace cached internally.
 void fp8_block128_gemm_cutlass_sm120_bf16out(
@@ -45,7 +47,8 @@ void fp8_block128_gemm_cutlass_sm120_bf16out(
     int M, int N, int K,
     const float* act_block_scale,
     const float* w_block_scale,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    int schedule = -1);
 
 }  // namespace gemm
 }  // namespace flash_rt
