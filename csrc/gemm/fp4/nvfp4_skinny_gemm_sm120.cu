@@ -270,6 +270,9 @@ constexpr Cfg kCfgs[] = {
     {32, 256, 4},  {32, 128, 4},  {64, 128, 8},  {128, 128, 8},
     {32, 2048, 4}, {64, 2048, 8}, {128, 2048, 8}, {256, 1024, 8},
     {64, 1024, 8}, {32, 1024, 2},
+    // whole-K chunks for K = 768 (the DiT-B projections): one split, so the
+    // fused consumers read a single partial
+    {64, 768, 4},  {128, 768, 8}, {32, 768, 4}, {256, 768, 8},
 };
 constexpr int kNumCfgs = sizeof(kCfgs) / sizeof(kCfgs[0]);
 
@@ -323,6 +326,10 @@ int dispatch_gemm(const void* A, const void* SFA, const float* a_gs, const void*
         CASE(19, 256, 1024, 8);
         CASE(20, 64, 1024, 8);
         CASE(21, 32, 1024, 2);
+        CASE(22, 64, 768, 4);
+        CASE(23, 128, 768, 8);
+        CASE(24, 32, 768, 4);
+        CASE(25, 256, 768, 8);
         default: return static_cast<int>(cudaErrorInvalidValue);
     }
 #undef CASE

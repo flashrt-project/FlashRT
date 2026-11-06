@@ -58,4 +58,28 @@ void bf16_matmul_cublaslt_bf16(
     cudaStream_t stream,
     int max_algos = 0);
 
+// out = x @ W^T + bias in one cuBLASLt call (bias epilogue; one bf16
+// rounding of the biased result, nn.Linear's addmm form). Same plan cache
+// and autotune as bf16_matmul_cublaslt_bf16.
+void bf16_matmul_cublaslt_bias_bf16(
+    const __nv_bfloat16* x,
+    const __nv_bfloat16* W,
+    const __nv_bfloat16* bias,
+    __nv_bfloat16* out,
+    int M, int N, int K,
+    cudaStream_t stream,
+    int max_algos = 0);
+
+// bf16_matmul_cublaslt_bias_bf16 with an optional ReLU in the epilogue
+// (relu(x @ W^T + bias), still one bf16 rounding) and an output row stride
+// ldo >= N (0: N), e.g. to write one half of a concatenated row.
+void bf16_matmul_cublaslt_bias_ex_bf16(
+    const __nv_bfloat16* x,
+    const __nv_bfloat16* W,
+    const __nv_bfloat16* bias,
+    __nv_bfloat16* out,
+    int M, int N, int K, int ldo, bool relu,
+    cudaStream_t stream,
+    int max_algos = 0);
+
 }  // namespace flash_rt::kernels

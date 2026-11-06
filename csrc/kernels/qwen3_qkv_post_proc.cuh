@@ -203,6 +203,16 @@ int qwen3_k_norm_rope_kvwrite_prefill_v3_fp8_direct(
     int n_kv_heads, int S, int in_row_stride, int cache_row_stride, float eps,
     cudaStream_t stream);
 
+// Single-launch form of the two direct producers above for the all-fp8 route
+// (grid.y selects Q vs K/V; no cache-shaped bf16 scratch is written).
+int qwen3_qk_norm_rope_prefill_v3_fp8_direct(
+    const void* q_pre, const void* k_pre, const void* v_pre,
+    const void* q_norm_w, const void* k_norm_w,
+    const void* cos, const void* sin,
+    void* q8_dst, void* k8_dst, void* v8_dst,
+    int n_q_heads, int n_kv_heads, int S, int in_row_stride, float eps,
+    cudaStream_t stream);
+
 // Device-position variant: cache slot = K_cache_base + (*cur_pos) * row_elems,
 // so one captured graph serves every decode position (host bumps *cur_pos
 // before each replay). row_elems = n_kv * 128. Returns 0 on success.

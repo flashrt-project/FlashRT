@@ -7,7 +7,9 @@
 //   third_party/cutlass/test/unit/gemm/device/
 //     sm120_blockscaled_tensorop_gemm/sm120_bs_gemm_nvf4_nvf4_f32_bf16.cu
 // (one config: TileShape <128,128,256>, ClusterShape <1,1,1>,
-//  KernelTmaWarpSpecializedCooperative, OpClassBlockScaledTensorOp).
+//  KernelTmaWarpSpecializedCooperative, OpClassBlockScaledTensorOp). A
+//  VLA-JEPA model-scoped <128,128,128> twin is exposed through the *_k128
+//  entries; the default and every existing caller stay on <128,128,256>.
 //
 // Why this is the "vendor-best" path (not hand-written):
 //   * Uses CUTLASS 4.x's `CollectiveBuilder` for SM120 BlockScaled
@@ -20,6 +22,7 @@
 // hot-path is launch-only.
 
 #include "cutlass_nvfp4_w4a16_gemm_sm120.cuh"
+#include "../../kernels/pdl_launch.cuh"
 
 #include "cute/tensor.hpp"
 #include "cute/atom/mma_atom.hpp"
@@ -76,7 +79,6 @@ constexpr int AlignmentB = 16 * 8 / cutlass::sizeof_bits<ElementB>::value;  // 3
 constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;     // 8
 constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;     // 8
 
-using TileShape    = Shape<_128, _128, _256>;
 using ClusterShape = Shape<_1, _1, _1>;
 
 // SF tensor layout helper. Vector size = 16 (NVFP4 group) per ckpt.
@@ -85,54 +87,66 @@ using ClusterShape = Shape<_1, _1, _1>;
 // must produce SF in this exact layout (transformed once).
 using Sm1xxBlkScaledConfig = cutlass::detail::Sm1xxBlockScaledConfig<16>;
 
-using CollectiveEpilogue =
-    typename cutlass::epilogue::collective::CollectiveBuilder<
-        cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp,
-        TileShape, ClusterShape,
-        cutlass::epilogue::collective::EpilogueTileAuto,
-        ElementAccumulator, ElementCompute,
-        ElementC, LayoutC, AlignmentC,
-        ElementD, LayoutD, AlignmentD,
-        cutlass::epilogue::collective::EpilogueScheduleAuto
-    >::CollectiveOp;
+// Tile types for the default (cooperative) kernel family. The default keeps
+// the upstream/unit-test <128,128,256> tile; the <128,128,128> twin is a
+// VLA-JEPA model-scoped variant reached only through the *_k128 entries.
+// The half-size K stage doubles the pipeline depth that fits next to the
+// epilogue carveout, which the short-K (<= 6144) shapes are bound by; it is
+// a schedule choice, not a different computation.
+template <class TileShape>
+struct DefaultTile {
+  using CollectiveEpilogue =
+      typename cutlass::epilogue::collective::CollectiveBuilder<
+          cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp,
+          TileShape, ClusterShape,
+          cutlass::epilogue::collective::EpilogueTileAuto,
+          ElementAccumulator, ElementCompute,
+          ElementC, LayoutC, AlignmentC,
+          ElementD, LayoutD, AlignmentD,
+          cutlass::epilogue::collective::EpilogueScheduleAuto
+      >::CollectiveOp;
 
-using CollectiveMainloop =
-    typename cutlass::gemm::collective::CollectiveBuilder<
-        cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
-        ElementPairA, LayoutA, AlignmentA,
-        ElementPairB, LayoutB, AlignmentB,
-        ElementAccumulator,
-        TileShape, ClusterShape,
-        cutlass::gemm::collective::StageCountAutoCarveout<
-            static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-        cutlass::gemm::KernelTmaWarpSpecializedCooperative
-    >::CollectiveOp;
+  using CollectiveMainloop =
+      typename cutlass::gemm::collective::CollectiveBuilder<
+          cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
+          ElementPairA, LayoutA, AlignmentA,
+          ElementPairB, LayoutB, AlignmentB,
+          ElementAccumulator,
+          TileShape, ClusterShape,
+          cutlass::gemm::collective::StageCountAutoCarveout<
+              static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+          cutlass::gemm::KernelTmaWarpSpecializedCooperative
+      >::CollectiveOp;
 
-using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-    Shape<int, int, int, int>,
-    CollectiveMainloop,
-    CollectiveEpilogue,
-    cutlass::gemm::PersistentScheduler>;
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      Shape<int, int, int, int>,
+      CollectiveMainloop,
+      CollectiveEpilogue,
+      cutlass::gemm::PersistentScheduler>;
 
-using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
-// ── Per-column bias epilogue variant (D = alpha*A*B + bias[n]) ─────
-using LinCombBias = cutlass::epilogue::fusion::LinCombPerColBias<
-    ElementD, ElementCompute, ElementD>;
-using CollectiveEpilogueBias =
-    typename cutlass::epilogue::collective::CollectiveBuilder<
-        cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp,
-        TileShape, ClusterShape,
-        cutlass::epilogue::collective::EpilogueTileAuto,
-        ElementAccumulator, ElementCompute,
-        ElementC, LayoutC, AlignmentC,
-        ElementD, LayoutD, AlignmentD,
-        cutlass::epilogue::collective::EpilogueScheduleAuto,
-        LinCombBias>::CollectiveOp;
-using GemmKernelBias = cutlass::gemm::kernel::GemmUniversal<
-    Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogueBias,
-    cutlass::gemm::PersistentScheduler>;
-using GemmBias = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelBias>;
+  // ── Per-column bias epilogue variant (D = alpha*A*B + bias[n]) ─────
+  using LinCombBias = cutlass::epilogue::fusion::LinCombPerColBias<
+      ElementD, ElementCompute, ElementD>;
+  using CollectiveEpilogueBias =
+      typename cutlass::epilogue::collective::CollectiveBuilder<
+          cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp,
+          TileShape, ClusterShape,
+          cutlass::epilogue::collective::EpilogueTileAuto,
+          ElementAccumulator, ElementCompute,
+          ElementC, LayoutC, AlignmentC,
+          ElementD, LayoutD, AlignmentD,
+          cutlass::epilogue::collective::EpilogueScheduleAuto,
+          LinCombBias>::CollectiveOp;
+  using GemmKernelBias = cutlass::gemm::kernel::GemmUniversal<
+      Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogueBias,
+      cutlass::gemm::PersistentScheduler>;
+  using GemmBias = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelBias>;
+};
+
+using Tile256 = DefaultTile<Shape<_128, _128, _256>>;
+using Tile128 = DefaultTile<Shape<_128, _128, _128>>;
 
 // ── Per-shape workspace cache (mirrors FP8 path) ─────────────────
 struct ShapeKey {
@@ -177,6 +191,7 @@ void* get_workspace(int M, int N, int K, size_t needed) {
   return w.ptr;
 }
 
+template <class Types>
 cutlass::Status run_gemm(
     const void* A_packed, const void* B_packed, void* D_bf16,
     int M, int N, int K,
@@ -184,6 +199,7 @@ cutlass::Status run_gemm(
     float alpha,
     cudaStream_t stream)
 {
+  using Gemm = typename Types::Gemm;
   using StrideA = typename Gemm::GemmKernel::StrideA;
   using StrideB = typename Gemm::GemmKernel::StrideB;
   using StrideC = typename Gemm::GemmKernel::StrideC;
@@ -241,7 +257,7 @@ cutlass::Status run_gemm(
         M, N, K, static_cast<int>(status));
     return status;
   }
-  return gemm.run(stream);
+  return gemm.run(stream, nullptr, flash_rt::pdl::enabled());
 }
 
 // Same default tile, but with a per-element residual C addend folded into the
@@ -249,6 +265,7 @@ cutlass::Status run_gemm(
 // (ElementC=bf16) — here we just feed C (beta=1) instead of nullptr (beta=0).
 // Lets o_proj/down fuse their residual add, so the following rms_norm reads ONE
 // tensor (D) instead of two (gemm_out + residual). C must be bf16 (M,N) row-major.
+template <class Types>
 cutlass::Status run_gemm_residual(
     const void* A_packed, const void* B_packed,
     const void* C_residual, void* D_bf16,
@@ -257,6 +274,7 @@ cutlass::Status run_gemm_residual(
     float alpha,
     cudaStream_t stream)
 {
+  using Gemm = typename Types::Gemm;
   using StrideA = typename Gemm::GemmKernel::StrideA;
   using StrideB = typename Gemm::GemmKernel::StrideB;
   using StrideC = typename Gemm::GemmKernel::StrideC;
@@ -302,9 +320,10 @@ cutlass::Status run_gemm_residual(
   }
   status = gemm.initialize(args, ws_ptr, stream);
   if (status != cutlass::Status::kSuccess) return status;
-  return gemm.run(stream);
+  return gemm.run(stream, nullptr, flash_rt::pdl::enabled());
 }
 
+template <class Types>
 cutlass::Status run_gemm_bias(
     const void* A_packed, const void* B_packed, const void* bias, void* D_bf16,
     int M, int N, int K,
@@ -312,6 +331,7 @@ cutlass::Status run_gemm_bias(
     float alpha,
     cudaStream_t stream)
 {
+  using GemmBias = typename Types::GemmBias;
   using StrideA = typename GemmBias::GemmKernel::StrideA;
   using StrideB = typename GemmBias::GemmKernel::StrideB;
   using StrideC = typename GemmBias::GemmKernel::StrideC;
@@ -358,7 +378,7 @@ cutlass::Status run_gemm_bias(
   }
   status = gemm.initialize(args, ws_ptr, stream);
   if (status != cutlass::Status::kSuccess) return status;
-  return gemm.run(stream);
+  return gemm.run(stream, nullptr, flash_rt::pdl::enabled());
 }
 
 }  // namespace
@@ -369,7 +389,7 @@ void fp4_w4a16_gemm_sm120_bf16out_bias(
     const void* SFA, const void* SFB,
     float alpha, cudaStream_t stream)
 {
-  cutlass::Status status = run_gemm_bias(
+  cutlass::Status status = run_gemm_bias<Tile256>(
       A_packed, B_packed, bias, D_bf16, M, N, K, SFA, SFB, alpha, stream);
   if (status != cutlass::Status::kSuccess) {
     std::fprintf(stderr, "[fp4_w4a16_gemm_sm120_bf16out_bias] run FAIL "
@@ -384,7 +404,7 @@ void fp4_w4a16_gemm_residual_sm120_bf16out(
     const void* SFA, const void* SFB,
     float alpha, cudaStream_t stream)
 {
-  cutlass::Status status = run_gemm_residual(
+  cutlass::Status status = run_gemm_residual<Tile256>(
       A_packed, B_packed, C_residual, D_bf16, M, N, K, SFA, SFB, alpha, stream);
   if (status != cutlass::Status::kSuccess) {
     std::fprintf(stderr, "[fp4_w4a16_gemm_residual_sm120_bf16out] run FAIL "
@@ -402,12 +422,63 @@ void fp4_w4a16_gemm_sm120_bf16out(
     float        alpha,
     cudaStream_t stream)
 {
-  cutlass::Status status = run_gemm(
+  cutlass::Status status = run_gemm<Tile256>(
       A_packed, B_packed, D_bf16, M, N, K, SFA, SFB, alpha, stream);
   if (status != cutlass::Status::kSuccess) {
     std::fprintf(stderr,
         "[fp4_w4a16_gemm_sm120_bf16out] run FAIL "
         "M=%d N=%d K=%d (status=%d); D output undefined\n",
+        M, N, K, static_cast<int>(status));
+  }
+}
+
+// ── Model-scoped <128,128,128> twins (VLA-JEPA) ─────────────────────
+// Same CUTLASS template and epilogues, smaller K stage. Additive entries:
+// no existing caller changes tile, and the shared default above stays
+// <128,128,256>.
+void fp4_w4a16_gemm_sm120_bf16out_k128(
+    const void* A_packed, const void* B_packed, void* D_bf16,
+    int M, int N, int K,
+    const void* SFA, const void* SFB,
+    float alpha, cudaStream_t stream)
+{
+  cutlass::Status status = run_gemm<Tile128>(
+      A_packed, B_packed, D_bf16, M, N, K, SFA, SFB, alpha, stream);
+  if (status != cutlass::Status::kSuccess) {
+    std::fprintf(stderr,
+        "[fp4_w4a16_gemm_sm120_bf16out_k128] run FAIL "
+        "M=%d N=%d K=%d (status=%d); D output undefined\n",
+        M, N, K, static_cast<int>(status));
+  }
+}
+
+void fp4_w4a16_gemm_residual_sm120_bf16out_k128(
+    const void* A_packed, const void* B_packed,
+    const void* C_residual, void* D_bf16,
+    int M, int N, int K,
+    const void* SFA, const void* SFB,
+    float alpha, cudaStream_t stream)
+{
+  cutlass::Status status = run_gemm_residual<Tile128>(
+      A_packed, B_packed, C_residual, D_bf16, M, N, K, SFA, SFB, alpha, stream);
+  if (status != cutlass::Status::kSuccess) {
+    std::fprintf(stderr, "[fp4_w4a16_gemm_residual_sm120_bf16out_k128] "
+        "run FAIL M=%d N=%d K=%d (status=%d)\n",
+        M, N, K, static_cast<int>(status));
+  }
+}
+
+void fp4_w4a16_gemm_sm120_bf16out_bias_k128(
+    const void* A_packed, const void* B_packed, void* D_bf16, const void* bias,
+    int M, int N, int K,
+    const void* SFA, const void* SFB,
+    float alpha, cudaStream_t stream)
+{
+  cutlass::Status status = run_gemm_bias<Tile128>(
+      A_packed, B_packed, bias, D_bf16, M, N, K, SFA, SFB, alpha, stream);
+  if (status != cutlass::Status::kSuccess) {
+    std::fprintf(stderr, "[fp4_w4a16_gemm_sm120_bf16out_bias_k128] "
+        "run FAIL M=%d N=%d K=%d (status=%d)\n",
         M, N, K, static_cast<int>(status));
   }
 }
@@ -577,7 +648,7 @@ cutlass::Status run_gemm_widen(
         M, N, K, static_cast<int>(status));
     return status;
   }
-  return gemm.run(stream);
+  return gemm.run(stream, nullptr, flash_rt::pdl::enabled());
 }
 
 }  // namespace widen
@@ -770,7 +841,7 @@ cutlass::Status run_gemm_pingpong(
         M, N, K, static_cast<int>(status));
     return status;
   }
-  return gemm.run(stream);
+  return gemm.run(stream, nullptr, flash_rt::pdl::enabled());
 }
 
 cutlass::Status run_gemm_pingpong_bias(
@@ -832,7 +903,7 @@ cutlass::Status run_gemm_pingpong_bias(
         "M=%d N=%d K=%d (status=%d)\n", M, N, K, static_cast<int>(status));
     return status;
   }
-  return gemm.run(stream);
+  return gemm.run(stream, nullptr, flash_rt::pdl::enabled());
 }
 
 }  // namespace pingpong

@@ -8,6 +8,7 @@
 // and the public symbol name (bf16_matmul_bf16) are neutral now.
 
 #include "bf16_matmul_bf16.cuh"
+#include "kernel_policy.h"
 
 #include <cublasLt.h>
 #include <algorithm>
@@ -54,10 +55,15 @@ struct Bf16LtKey {
     // deterministic pick and one that let the timing loop run must not share
     // whichever plan happened to be built first.
     int max_algos;
+    // 1: column-major formulation with the cuBLASLt bias epilogue;
+    // 2: the same with the ReLU + bias epilogue.
+    int bias;
+    // output row stride of the bias formulation (0: packed, N)
+    int ldo;
 
     bool operator==(const Bf16LtKey& other) const {
         return M == other.M && N == other.N && K == other.K
-            && max_algos == other.max_algos;
+            && max_algos == other.max_algos && bias == other.bias && ldo == other.ldo;
     }
 };
 
@@ -67,6 +73,8 @@ struct Bf16LtKeyHash {
         h = h * 1315423911u + static_cast<size_t>(key.N);
         h = h * 1315423911u + static_cast<size_t>(key.K);
         h = h * 1315423911u + static_cast<size_t>(key.max_algos);
+        h = h * 1315423911u + static_cast<size_t>(key.bias);
+        h = h * 1315423911u + static_cast<size_t>(key.ldo);
         return h;
     }
 };
@@ -104,10 +112,11 @@ static void ensure_bf16_lt() {
 }
 
 static Bf16LtPlan& get_bf16_lt_plan(int M, int N, int K,
-                                    int max_algos) {
+                                    int max_algos, int bias = 0, int ldo = 0) {
     std::lock_guard<std::mutex> lock(g_bf16_mu);
     ensure_bf16_lt();
-    Bf16LtKey key{M, N, K, max_algos};
+    if (ldo == N) ldo = 0;
+    Bf16LtKey key{M, N, K, max_algos, bias, ldo};
     auto it = g_bf16_plans.find(key);
     if (it != g_bf16_plans.end()) return it->second;
 
@@ -118,6 +127,28 @@ static Bf16LtPlan& get_bf16_lt_plan(int M, int N, int K,
 
     FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(
         cublasLtMatmulDescCreate(&plan.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    if (bias) {
+        // out^T (N x M, column-major == row-major out) = W (N x K) * x^T:
+        // the epilogue's bias vector runs along the N rows of out^T, i.e.
+        // one value per output feature, applied before the single bf16
+        // rounding of the result (nn.Linear's addmm form).
+        cublasLtEpilogue_t epi = bias == 2 ? CUBLASLT_EPILOGUE_RELU_BIAS : CUBLASLT_EPILOGUE_BIAS;
+        cudaDataType_t bias_type = CUDA_R_16BF;
+        FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(
+            plan.desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_t, sizeof(op_t)));
+        FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(
+            plan.desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_n, sizeof(op_n)));
+        FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(
+            plan.desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epi, sizeof(epi)));
+        FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(
+            plan.desc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bias_type, sizeof(bias_type)));
+        FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(
+            &plan.a_desc, CUDA_R_16BF, K, N, K));
+        FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(
+            &plan.b_desc, CUDA_R_16BF, K, M, K));
+        FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatrixLayoutCreate(
+            &plan.c_desc, CUDA_R_16BF, N, M, ldo > 0 ? ldo : N));
+    } else {
     FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(
         plan.desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_n, sizeof(op_n)));
     FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(
@@ -140,6 +171,7 @@ static Bf16LtPlan& get_bf16_lt_plan(int M, int N, int K,
     FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatrixLayoutSetAttribute(
         plan.c_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order,
         sizeof(row_order)));
+    }
 
     cublasLtMatmulPreference_t pref;
     FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatmulPreferenceCreate(&pref));
@@ -163,8 +195,8 @@ static Bf16LtPlan& get_bf16_lt_plan(int M, int N, int K,
 
 static void autotune_bf16_lt_plan(
     Bf16LtPlan& plan,
-    const __nv_bfloat16* x,
-    const __nv_bfloat16* W,
+    const __nv_bfloat16* x,   // the plan's A operand
+    const __nv_bfloat16* W,   // the plan's B operand
     __nv_bfloat16* out,
     int M,
     int N,
@@ -214,10 +246,106 @@ static void autotune_bf16_lt_plan(
                                  cudaGetErrorString(err));
     }
 
+    if (!flash_rt::kernels::fast_producers()) {
+        // Legacy autotune: caller stream, 1 warmup + 3 eager timings. This is
+        // the upstream behaviour for every model that has not opted into the
+        // fast-path policy (the default).
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        constexpr int kWarmup = 1;
+        constexpr int kBench = 3;
+        float best_ms = 1.0e30f;
+        int best_idx = -1;
+        for (int i = 0; i < returned; ++i) {
+            bool ok = true;
+            for (int w = 0; w < kWarmup; ++w) {
+                cublasStatus_t st = cublasLtMatmul(
+                    g_bf16_lt, plan.desc, &alpha,
+                    x, plan.a_desc, W, plan.b_desc, &beta,
+                    out, plan.c_desc, out, plan.c_desc,
+                    &heuristics[i].algo, g_bf16_workspace,
+                    g_bf16_workspace_size, stream);
+                if (st != CUBLAS_STATUS_SUCCESS) { ok = false; break; }
+            }
+            if (!ok) continue;
+            err = cudaEventRecord(start, stream);
+            if (err != cudaSuccess) {
+                cudaEventDestroy(start);
+                cudaEventDestroy(stop);
+                throw std::runtime_error(
+                    std::string("cudaEventRecord failed: ") +
+                    cudaGetErrorString(err));
+            }
+            for (int b = 0; b < kBench; ++b) {
+                cublasStatus_t st = cublasLtMatmul(
+                    g_bf16_lt, plan.desc, &alpha,
+                    x, plan.a_desc, W, plan.b_desc, &beta,
+                    out, plan.c_desc, out, plan.c_desc,
+                    &heuristics[i].algo, g_bf16_workspace,
+                    g_bf16_workspace_size, stream);
+                if (st != CUBLAS_STATUS_SUCCESS) { ok = false; break; }
+            }
+            if (!ok) continue;
+            err = cudaEventRecord(stop, stream);
+            if (err != cudaSuccess) {
+                cudaEventDestroy(start);
+                cudaEventDestroy(stop);
+                throw std::runtime_error(
+                    std::string("cudaEventRecord failed: ") +
+                    cudaGetErrorString(err));
+            }
+            err = cudaEventSynchronize(stop);
+            if (err != cudaSuccess) {
+                cudaEventDestroy(start);
+                cudaEventDestroy(stop);
+                throw std::runtime_error(
+                    std::string("cudaEventSynchronize failed: ") +
+                    cudaGetErrorString(err));
+            }
+            float ms = 0.0f;
+            err = cudaEventElapsedTime(&ms, start, stop);
+            if (err != cudaSuccess) {
+                cudaEventDestroy(start);
+                cudaEventDestroy(stop);
+                throw std::runtime_error(
+                    std::string("cudaEventElapsedTime failed: ") +
+                    cudaGetErrorString(err));
+            }
+            ms /= static_cast<float>(kBench);
+            if (ms < best_ms) { best_ms = ms; best_idx = i; }
+        }
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+        if (best_idx >= 0) plan.algo = heuristics[best_idx].algo;
+        plan.autotuned = true;
+        if (best_idx >= 0 && get_bf16_autotune_verbose()) {
+            std::cout << "  bf16_matmul_cublaslt autotune: shape=("
+                      << M << "," << N << "," << K << ") tested="
+                      << returned << " best=" << best_idx << " ("
+                      << best_ms * 1000.0f << " us)" << std::endl;
+        }
+        return;
+    }
+
+    // The candidates run on their own stream after the caller's queued work.
+    err = cudaStreamSynchronize(stream);
+    cudaStream_t tune_stream = nullptr;
+    if (err == cudaSuccess)
+        err = cudaStreamCreateWithFlags(&tune_stream, cudaStreamNonBlocking);
+    if (err != cudaSuccess) {
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+        throw std::runtime_error(std::string("cuBLASLt autotune stream setup failed: ") +
+                                 cudaGetErrorString(err));
+    }
+
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    constexpr int kWarmup = 1;
-    constexpr int kBench = 3;
+    // Enough timed iterations that the event-timer quantum (~0.5 us) is well
+    // below the tie margin at the few-microsecond shapes this tunes.
+    constexpr int kWarmup = 2;
+    constexpr int kBench = 20;
+    constexpr float kTieMargin = 0.05f;   // a later algo must be >5% faster
     float best_ms = 1.0e30f;
     int best_idx = -1;
 
@@ -232,7 +360,7 @@ static void autotune_bf16_lt_plan(
                 out, plan.c_desc,
                 out, plan.c_desc,
                 &heuristics[i].algo, g_bf16_workspace,
-                g_bf16_workspace_size, stream);
+                g_bf16_workspace_size, tune_stream);
             if (st != CUBLAS_STATUS_SUCCESS) {
                 ok = false;
                 break;
@@ -240,14 +368,14 @@ static void autotune_bf16_lt_plan(
         }
         if (!ok) continue;
 
-        err = cudaEventRecord(start, stream);
-        if (err != cudaSuccess) {
-            cudaEventDestroy(start);
-            cudaEventDestroy(stop);
-            throw std::runtime_error(std::string("cudaEventRecord failed: ") +
-                                     cudaGetErrorString(err));
-        }
-        for (int b = 0; b < kBench; ++b) {
+        // Time kBench back-to-back launches replayed from a CUDA graph on a
+        // private stream: at these few-microsecond shapes an eager loop
+        // measures host launch throughput (and any CPU contention) as much
+        // as the kernels, which made the pick vary between processes.
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t exec = nullptr;
+        err = cudaStreamBeginCapture(tune_stream, cudaStreamCaptureModeThreadLocal);
+        for (int b = 0; err == cudaSuccess && b < kBench; ++b) {
             cublasStatus_t st = cublasLtMatmul(
                 g_bf16_lt, plan.desc, &alpha,
                 x, plan.a_desc,
@@ -256,42 +384,42 @@ static void autotune_bf16_lt_plan(
                 out, plan.c_desc,
                 out, plan.c_desc,
                 &heuristics[i].algo, g_bf16_workspace,
-                g_bf16_workspace_size, stream);
-            if (st != CUBLAS_STATUS_SUCCESS) {
-                ok = false;
-                break;
-            }
+                g_bf16_workspace_size, tune_stream);
+            if (st != CUBLAS_STATUS_SUCCESS) ok = false;
+        }
+        if (err == cudaSuccess) err = cudaStreamEndCapture(tune_stream, &graph);
+        if (err == cudaSuccess && ok) err = cudaGraphInstantiate(&exec, graph, 0);
+        if (err == cudaSuccess && ok) err = cudaGraphLaunch(exec, tune_stream);   // warm
+        if (err == cudaSuccess && ok) err = cudaEventRecord(start, tune_stream);
+        if (err == cudaSuccess && ok) err = cudaGraphLaunch(exec, tune_stream);
+        if (err == cudaSuccess && ok) err = cudaEventRecord(stop, tune_stream);
+        if (err == cudaSuccess && ok) err = cudaEventSynchronize(stop);
+        float ms = 0.0f;
+        if (err == cudaSuccess && ok) err = cudaEventElapsedTime(&ms, start, stop);
+        if (exec) cudaGraphExecDestroy(exec);
+        if (graph) cudaGraphDestroy(graph);
+        if (err != cudaSuccess) {
+            cudaEventDestroy(start);
+            cudaEventDestroy(stop);
+            cudaStreamDestroy(tune_stream);
+            throw std::runtime_error(std::string("cuBLASLt autotune timing failed: ") +
+                                     cudaGetErrorString(err));
         }
         if (!ok) continue;
-        err = cudaEventRecord(stop, stream);
-        if (err != cudaSuccess) {
-            cudaEventDestroy(start);
-            cudaEventDestroy(stop);
-            throw std::runtime_error(std::string("cudaEventRecord failed: ") +
-                                     cudaGetErrorString(err));
-        }
-        err = cudaEventSynchronize(stop);
-        if (err != cudaSuccess) {
-            cudaEventDestroy(start);
-            cudaEventDestroy(stop);
-            throw std::runtime_error(std::string("cudaEventSynchronize failed: ") +
-                                     cudaGetErrorString(err));
-        }
-        float ms = 0.0f;
-        err = cudaEventElapsedTime(&ms, start, stop);
-        if (err != cudaSuccess) {
-            cudaEventDestroy(start);
-            cudaEventDestroy(stop);
-            throw std::runtime_error(std::string("cudaEventElapsedTime failed: ") +
-                                     cudaGetErrorString(err));
-        }
         ms /= static_cast<float>(kBench);
-        if (ms < best_ms) {
+        // Candidates are visited in heuristic order; a later one must win by
+        // a clear margin. Near-ties (e.g. two algos at the same event-timer
+        // quantum) would otherwise be decided by run-to-run noise, and since
+        // algorithms differ in reduction order, the selected plan -- and the
+        // GEMM's low bits -- would change from one process to the next.
+        if (best_idx < 0 || ms < best_ms * (1.0f - kTieMargin)) {
             best_ms = ms;
             best_idx = i;
         }
     }
 
+    cudaStreamSynchronize(tune_stream);
+    cudaStreamDestroy(tune_stream);
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
     if (best_idx >= 0) {
@@ -459,6 +587,66 @@ void bf16_matmul_cublaslt_bf16(
         g_bf16_lt, plan.desc, &alpha,
         x, plan.a_desc,
         W, plan.b_desc,
+        &beta,
+        out, plan.c_desc,
+        out, plan.c_desc,
+        &plan.algo, g_bf16_workspace, g_bf16_workspace_size, stream));
+}
+
+void bf16_matmul_cublaslt_bias_bf16(
+    const __nv_bfloat16* x,
+    const __nv_bfloat16* W,
+    const __nv_bfloat16* bias,
+    __nv_bfloat16* out,
+    int M, int N, int K,
+    cudaStream_t stream,
+    int max_algos) {
+    if (M <= 0 || N <= 0 || K <= 0) return;
+    Bf16LtPlan& plan = get_bf16_lt_plan(M, N, K, max_algos, 1);
+    {
+        std::lock_guard<std::mutex> lock(g_bf16_mu);
+        FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(
+            plan.desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+        if (!plan.autotuned)
+            autotune_bf16_lt_plan(plan, W, x, out, M, N, K, stream, max_algos);
+    }
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatmul(
+        g_bf16_lt, plan.desc, &alpha,
+        W, plan.a_desc,
+        x, plan.b_desc,
+        &beta,
+        out, plan.c_desc,
+        out, plan.c_desc,
+        &plan.algo, g_bf16_workspace, g_bf16_workspace_size, stream));
+}
+
+void bf16_matmul_cublaslt_bias_ex_bf16(
+    const __nv_bfloat16* x,
+    const __nv_bfloat16* W,
+    const __nv_bfloat16* bias,
+    __nv_bfloat16* out,
+    int M, int N, int K, int ldo, bool relu,
+    cudaStream_t stream,
+    int max_algos) {
+    if (M <= 0 || N <= 0 || K <= 0) return;
+    if (ldo <= 0) ldo = N;
+    if (ldo < N) throw std::invalid_argument("bf16_matmul_cublaslt_bias_ex_bf16: ldo < N");
+    Bf16LtPlan& plan = get_bf16_lt_plan(M, N, K, max_algos, relu ? 2 : 1, ldo);
+    {
+        std::lock_guard<std::mutex> lock(g_bf16_mu);
+        FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(
+            plan.desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+        if (!plan.autotuned)
+            autotune_bf16_lt_plan(plan, W, x, out, M, N, K, stream, max_algos);
+    }
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    FLASHRT_BF16_MATMUL_CUBLASLT_CHECK(cublasLtMatmul(
+        g_bf16_lt, plan.desc, &alpha,
+        W, plan.a_desc,
+        x, plan.b_desc,
         &beta,
         out, plan.c_desc,
         out, plan.c_desc,

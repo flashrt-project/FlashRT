@@ -172,6 +172,18 @@ void bias_gelu_quant_bf16_to_nvfp4_swizzled_v2(
     int rows, int cols,
     cudaStream_t stream = 0);
 
+// Same contract and launch shape as the v2 producer, but the GELU result is
+// rounded to bf16 before the block amax/scale search, making the output
+// byte-identical to [bias_gelu_inplace_bf16 -> quantize_bf16_to_nvfp4_swizzled_v2]
+// without materializing the intermediate bf16 tensor. Requires cols % 8 == 0.
+void bias_gelu_quant_bf16_to_nvfp4_swizzled_v2_bf16round(
+    const __nv_bfloat16* input,
+    const __nv_bfloat16* bias,
+    uint8_t* fp4_data,
+    uint8_t* scale_factors,
+    int rows, int cols,
+    cudaStream_t stream = 0);
+
 // Diagnostic Motus FP4 rescue helpers:
 //   gather_bf16_cols: out[row, j] = input[row, indices[j]]
 //   add_side_bias_gelu_gather_zero_quant: gelu(main + side + bias), gather
@@ -280,6 +292,24 @@ void layer_norm_to_nvfp4_swizzled_bf16(
     uint8_t* sf_swz,
     int rows, int cols, float eps,
     cudaStream_t stream = 0);
+
+// Fused: residual = residual + x_add + add_bias (one bf16 rounding, written
+// back), then affine LayerNorm(residual, weight, bias) -> nvfp4 packed +
+// swizzled SF. Bit-identical to residual_add_bias_bf16 followed by
+// layer_norm_to_nvfp4_swizzled_bf16 (ViT post-attention / post-MLP residual
+// feeding the next LayerNorm). cols must be 1024; returns a cudaError_t.
+// merge = 4 lays the block scales out for the spatially merged operand
+// [rows/4, 4*cols] (the Qwen-VL patch merger's pre-shuffle norm -> fc1).
+int residual_add_bias_layer_norm_to_nvfp4_swizzled_bf16(
+    __nv_bfloat16* residual,
+    const __nv_bfloat16* x_add,
+    const __nv_bfloat16* add_bias,
+    const __nv_bfloat16* weight,
+    const __nv_bfloat16* bias,
+    uint8_t* packed,
+    uint8_t* sf_swz,
+    int rows, int cols, float eps,
+    cudaStream_t stream = 0, int merge = 1);
 
 // Fused: h_post = h_in + attn_proj; rms_norm(h_post, weight) -> nvfp4
 // packed + swizzled SF. The h_post bf16 buffer is also written to

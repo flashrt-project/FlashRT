@@ -226,6 +226,38 @@ static auto make_fwd_seqused_qnvfp4(
 }
 
 
+static auto make_fwd_seqused_qnvfp4_batched(
+    void (*fn)(const void*, const void*, const void*, void*, void*, const void*,
+               void*, void*, int, int, int, int,
+               int, int, int, int, int, int, int, int, int, int, int, int,
+               int, int, int, int, int, int, float, int, cudaStream_t, int)) {
+    return [fn](uintptr_t Q, uintptr_t K, uintptr_t V, uintptr_t O,
+                uintptr_t softmax_lse, uintptr_t seqused_k,
+                uintptr_t o_packed, uintptr_t o_sfa,
+                int o_packed_row_bytes, int o_sfa_n_col_blocks,
+                int o_packed_batch_stride, int o_sfa_batch_stride,
+                int batch, int seqlen_q, int seqlen_k,
+                int num_heads_q, int num_heads_kv, int head_dim,
+                py::tuple q_strides, py::tuple k_strides,
+                py::tuple v_strides, py::tuple o_strides,
+                float softmax_scale, int num_sms, uintptr_t stream, bool enable_pdl) {
+        fn(reinterpret_cast<const void*>(Q), reinterpret_cast<const void*>(K),
+           reinterpret_cast<const void*>(V), reinterpret_cast<void*>(O),
+           reinterpret_cast<void*>(softmax_lse),
+           reinterpret_cast<const void*>(seqused_k),
+           reinterpret_cast<void*>(o_packed), reinterpret_cast<void*>(o_sfa),
+           o_packed_row_bytes, o_sfa_n_col_blocks,
+           o_packed_batch_stride, o_sfa_batch_stride,
+           batch, seqlen_q, seqlen_k, num_heads_q, num_heads_kv, head_dim,
+           py::cast<int>(q_strides[0]), py::cast<int>(q_strides[1]), py::cast<int>(q_strides[2]),
+           py::cast<int>(k_strides[0]), py::cast<int>(k_strides[1]), py::cast<int>(k_strides[2]),
+           py::cast<int>(v_strides[0]), py::cast<int>(v_strides[1]), py::cast<int>(v_strides[2]),
+           py::cast<int>(o_strides[0]), py::cast<int>(o_strides[1]), py::cast<int>(o_strides[2]),
+           softmax_scale, num_sms, to_stream(stream), enable_pdl ? 1 : 0);
+    };
+}
+
+
 static auto make_fwd_seqused_splitkv(
     void (*fn)(const void*, const void*, const void*, void*, void*, const void*,
                void*, void*,
@@ -283,6 +315,53 @@ PYBIND11_MODULE(flash_rt_fa2, m) {
         "seqused_k may be 0 for full attention. Same semantics as fwd_bf16 / "
         "fwd_bf16_seqused but with a narrow query tile tuned for short seqlen_q.");
 
+    m.def("fwd_bf16_tile_vla", make_fwd_seqused(&fvk_attention_fa2_fwd_bf16_tile_vla),
+        py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),
+        py::arg("seqused_k"),
+        py::arg("batch"), py::arg("seqlen_q"), py::arg("seqlen_k"),
+        py::arg("num_heads_q"), py::arg("num_heads_kv"), py::arg("head_dim"),
+        py::arg("q_strides"), py::arg("k_strides"),
+        py::arg("v_strides"), py::arg("o_strides"),
+        py::arg("softmax_scale") = 1.0f, py::arg("num_sms") = 0,
+        py::arg("stream") = 0,
+        "fwd_bf16_tile with the VLA-only hd64 query tile.");
+
+    m.def("fwd_bf16_tile_fp4out",
+        [](uintptr_t Q, uintptr_t K, uintptr_t V, uintptr_t O_fp4,
+           uintptr_t O_sf, uintptr_t softmax_lse,
+           int batch, int seqlen_q, int seqlen_k,
+           int num_heads_q, int num_heads_kv, int head_dim,
+           py::tuple q_strides, py::tuple k_strides, py::tuple v_strides,
+           py::tuple o_strides, float softmax_scale, uintptr_t stream) {
+            fvk_attention_fa2_fwd_bf16_tile_fp4out(
+                reinterpret_cast<const void*>(Q),
+                reinterpret_cast<const void*>(K),
+                reinterpret_cast<const void*>(V),
+                reinterpret_cast<void*>(O_fp4),
+                reinterpret_cast<void*>(O_sf),
+                reinterpret_cast<void*>(softmax_lse),
+                batch, seqlen_q, seqlen_k, num_heads_q, num_heads_kv,
+                head_dim,
+                py::cast<int>(q_strides[0]), py::cast<int>(q_strides[1]),
+                py::cast<int>(q_strides[2]),
+                py::cast<int>(k_strides[0]), py::cast<int>(k_strides[1]),
+                py::cast<int>(k_strides[2]),
+                py::cast<int>(v_strides[0]), py::cast<int>(v_strides[1]),
+                py::cast<int>(v_strides[2]),
+                py::cast<int>(o_strides[0]), py::cast<int>(o_strides[1]),
+                py::cast<int>(o_strides[2]),
+                softmax_scale, to_stream(stream));
+        },
+        py::arg("Q"), py::arg("K"), py::arg("V"),
+        py::arg("O_fp4"), py::arg("O_sf"), py::arg("softmax_lse"),
+        py::arg("batch"), py::arg("seqlen_q"), py::arg("seqlen_k"),
+        py::arg("num_heads_q"), py::arg("num_heads_kv"), py::arg("head_dim"),
+        py::arg("q_strides"), py::arg("k_strides"), py::arg("v_strides"),
+        py::arg("o_strides"), py::arg("softmax_scale") = 1.0f,
+        py::arg("stream") = 0,
+        "Target-validated smallq tile with the NVFP4 O epilogue: packed e2m1 "
+        "+ swizzled UE4M3 scales (head_dim 64, contiguous O strides).");
+
     // FlashRT local patch 4: quantized-output siblings. O_fp8 = 0 makes each identical
     // to the entry without the suffix.
     m.def("fwd_bf16_fp8out", make_fwd_fp8out(&fvk_attention_fa2_fwd_bf16_fp8out),
@@ -327,7 +406,6 @@ PYBIND11_MODULE(flash_rt_fa2, m) {
         py::arg("softmax_scale") = 1.0f, py::arg("num_sms") = 0, py::arg("stream") = 0,
         "Causal sibling of fwd_bf16_fp8out (bf16, head_dim=256). With O_fp8 = 0 this "
         "is exactly fwd_bf16_causal.");
-
     m.def("fwd_bf16_tile64m32", make_fwd_seqused_pdl(&fvk_attention_fa2_fwd_bf16_tile64m32),
         py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),
         py::arg("seqused_k"),
@@ -356,6 +434,22 @@ PYBIND11_MODULE(flash_rt_fa2, m) {
         "epilogue that already holds it in shared memory. o_packed is (M, H*hd/2) u8 and "
         "o_sfa its swizzled ue4m3 scales, both static and caller-owned, in exactly the "
         "layout quantize_bf16_to_nvfp4_swizzled emits; nulls fall back to the plain tile.");
+
+    m.def("fwd_bf16_tile64_qnvfp4_batched",
+        make_fwd_seqused_qnvfp4_batched(&fvk_attention_fa2_fwd_bf16_tile64_qnvfp4_batched),
+        py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),
+        py::arg("seqused_k"),
+        py::arg("o_packed"), py::arg("o_sfa"),
+        py::arg("o_packed_row_bytes"), py::arg("o_sfa_n_col_blocks"),
+        py::arg("o_packed_batch_stride"), py::arg("o_sfa_batch_stride"),
+        py::arg("batch"), py::arg("seqlen_q"), py::arg("seqlen_k"),
+        py::arg("num_heads_q"), py::arg("num_heads_kv"), py::arg("head_dim"),
+        py::arg("q_strides"), py::arg("k_strides"),
+        py::arg("v_strides"), py::arg("o_strides"),
+        py::arg("softmax_scale") = 1.0f, py::arg("num_sms") = 0,
+        py::arg("stream") = 0, py::arg("enable_pdl") = false,
+        "fwd_bf16_tile64_qnvfp4 with per-batch packed/SF byte strides; zero "
+        "strides reproduce the original single-batch entry.");
 
     m.def("fwd_bf16_tile64m32w2_qnvfp4",
         make_fwd_seqused_qnvfp4(&fvk_attention_fa2_fwd_bf16_tile64m32w2_qnvfp4),

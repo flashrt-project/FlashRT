@@ -48,7 +48,7 @@ void bias_residual_out_bf16(const __nv_bfloat16* residual,
                             cudaStream_t stream = 0);
 
 void residual_add(__nv_bfloat16* residual, const __nv_bfloat16* x, int n,
-                  cudaStream_t stream = 0);
+                  cudaStream_t stream = 0, bool include_tail = false);
 
 void add_bf16_out(const __nv_bfloat16* a, const __nv_bfloat16* b,
                   __nv_bfloat16* out, int n,
@@ -435,7 +435,7 @@ void bias_gate_mul_residual_fp16(__half* residual,
                                  cudaStream_t stream = 0);
 
 void residual_add_fp16(__half* residual, const __half* x, int n,
-                       cudaStream_t stream = 0);
+                       cudaStream_t stream = 0, bool include_tail = false);
 
 // ── Classifier-Free Guidance combine ──
 // In-place: noise[i] += v_uncond[i] + beta * (v_cond[i] - v_uncond[i])

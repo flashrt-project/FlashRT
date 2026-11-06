@@ -45,7 +45,8 @@ constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
 constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
 using Sm1xxBlkScaledConfig = cutlass::detail::Sm1xxBlockScaledConfig<16>;
 
-template <class TileShape, class ClusterShape>
+template <class TileShape, class ClusterShape,
+          class Schedule = cutlass::gemm::KernelTmaWarpSpecializedCooperative>
 struct TileVariant {
   using CollectiveEpilogue =
       typename cutlass::epilogue::collective::CollectiveBuilder<
@@ -66,7 +67,7 @@ struct TileVariant {
           TileShape, ClusterShape,
           cutlass::gemm::collective::StageCountAutoCarveout<
               static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-          cutlass::gemm::KernelTmaWarpSpecializedCooperative
+          Schedule
       >::CollectiveOp;
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
       Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue,
@@ -122,10 +123,14 @@ using C111 = Shape<_1, _1, _1>;
 // BLOCK_{M,N} in {128,256} are valid here.
 using T0 = TileVariant<Shape<_128, _128, _256>, C111>;
 using T1 = TileVariant<Shape<_128, _256, _128>, C111>;  // widen (valid)
+using T2 = TileVariant<Shape<_128, _128, _128>, C111>;  // half-K, deeper pipeline
+using T3 = TileVariant<Shape<_128, _128, _128>, C111,
+                       cutlass::gemm::KernelTmaWarpSpecializedPingpong>;
+using T4 = TileVariant<Shape<_256, _128, _128>, C111>;  // tall
 
 const char* kNames[8] = {
     "128x128x256 (baseline)", "128x256x128 (widen)",
-    "", "", "", "", "", ""};
+    "128x128x128", "128x128x128 pingpong", "256x128x128", "", "", ""};
 
 }  // namespace
 
@@ -136,11 +141,14 @@ int fp4_w4a16_tilesweep_sm120_bf16out(
   switch (v) {
     case 0: return T0::run(A, B, D, M, N, K, SFA, SFB, alpha, stream, g_ws[0], g_ws_cap[0]);
     case 1: return T1::run(A, B, D, M, N, K, SFA, SFB, alpha, stream, g_ws[1], g_ws_cap[1]);
+    case 2: return T2::run(A, B, D, M, N, K, SFA, SFB, alpha, stream, g_ws[2], g_ws_cap[2]);
+    case 3: return T3::run(A, B, D, M, N, K, SFA, SFB, alpha, stream, g_ws[3], g_ws_cap[3]);
+    case 4: return T4::run(A, B, D, M, N, K, SFA, SFB, alpha, stream, g_ws[4], g_ws_cap[4]);
     default: return -99;
   }
 }
 
-int fp4_w4a16_tilesweep_sm120_num_variants() { return 2; }
+int fp4_w4a16_tilesweep_sm120_num_variants() { return 5; }
 const char* fp4_w4a16_tilesweep_sm120_name(int v) {
   return (v >= 0 && v < 8) ? kNames[v] : "<invalid>";
 }

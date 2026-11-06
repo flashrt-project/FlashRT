@@ -355,6 +355,24 @@ if(FLASHRT_ENABLE_MINIMAX_REMOVER AND NOT ENABLE_NVFP4)
 endif()
 option(FLASHRT_ENABLE_SM120_DEV_KERNELS
        "Build SM120 probe/tilesweep tuning kernels and public bindings" OFF)
+# VLA-JEPA (LeRobot) — boundary preprocessing and action post-processing
+# kernels. Model-specific and opt-in: the default flash_rt_kernels build does
+# not compile them. Enable on an SM120/SM121 build with
+# -DFLASHRT_ENABLE_VLA_JEPA=ON; the vla_* bindings are guarded by the same
+# FLASHRT_HAVE_VLA_JEPA compile definition.
+option(FLASHRT_ENABLE_VLA_JEPA
+       "Build VLA-JEPA RTX SM120 preprocessing/action kernels" OFF)
+if(FLASHRT_ENABLE_VLA_JEPA AND NOT (GPU_ARCH STREQUAL "120" OR
+                                    GPU_ARCH STREQUAL "121"))
+  message(FATAL_ERROR
+    "FLASHRT_ENABLE_VLA_JEPA requires GPU_ARCH=120 or 121 (Blackwell / "
+    "sm_120a); current GPU_ARCH=${GPU_ARCH}.")
+endif()
+if(FLASHRT_ENABLE_VLA_JEPA AND NOT FLASHRT_BUILD_QWEN3_VL)
+  message(FATAL_ERROR
+    "FLASHRT_ENABLE_VLA_JEPA requires FLASHRT_BUILD_QWEN3_VL=ON: the "
+    "VLA-JEPA ViT/qkv producers live in flash_rt_qwen3_vl_kernels.")
+endif()
 # ── Slim build for VLA deployments ──
 # OFF by default: the standard build keeps the broad, compatibility-oriented
 # kernel set it has today. Turn ON (-DFLASHRT_SLIM_BUILD=ON) to drop
@@ -803,6 +821,9 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
       ${GPU_GENCODE}
     >
   )
+  # grid-dependency control: the kernels wait on their producer before any
+  # global access, so they can be launched with PDL (csrc/kernels/pdl_launch.cuh)
+  target_compile_definitions(cutlass_nvfp4_w4a16_sm120_obj PRIVATE CUTLASS_ENABLE_GDC_FOR_SM100=1)
   message(STATUS "SM120a CUTLASS NVFP4 W4A16 GEMM: ENABLED")
 endif()
 
@@ -813,6 +834,7 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
   add_library(sm120_nvfp4_ffn_obj OBJECT
     csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_bf16out_sm120.cu
     csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_fp4out_sm120.cu
+    csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_fp4out_k128_sm120.cu
     csrc/gemm/fp4/cutlass_nvfp4_gemm_dn_streamk_bias_sm120.cu
     csrc/gemm/fp4/cutlass_nvfp4_dual_gemm_silu_fp4out_sm120.cu
     csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_res_sm120.cu
@@ -822,6 +844,7 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
   )
+  target_compile_definitions(sm120_nvfp4_ffn_obj PRIVATE CUTLASS_ENABLE_GDC_FOR_SM100=1)
   target_include_directories(sm120_nvfp4_ffn_obj PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/fp4
@@ -1264,7 +1287,10 @@ if(ENABLE_FA2 AND
   # dispatch is untouched.
   # head_dim 64 tile set (see fa2_tile_inst/flash_fwd_tile64_bf16_sm80.cu).
   set(FA2_HAS_TILE64_BF16 OFF)
-  if(FLASHRT_BUILD_XVLA AND "bf16" IN_LIST FA2_DTYPES AND "64" IN_LIST FA2_HDIMS)
+  # VLA-JEPA's ViT attention uses the same hd64 qnvfp4 epilogue; share the
+  # additive tile64 TU instead of maintaining a second vendor patch.
+  if((FLASHRT_BUILD_XVLA OR FLASHRT_ENABLE_VLA_JEPA)
+     AND "bf16" IN_LIST FA2_DTYPES AND "64" IN_LIST FA2_HDIMS)
     set(FA2_HAS_TILE64_BF16 ON)
     list(APPEND FA2_SRCS
       csrc/attention/fa2_tile_inst/flash_fwd_tile64_bf16_sm80.cu
@@ -2037,6 +2063,35 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
     >)
 endif()
 
+# ── VLA-JEPA model kernels (opt-in, linked into flash_rt_kernels) ──
+# The preprocessing/post-processing translation unit is model-specific; it is
+# compiled only when FLASHRT_ENABLE_VLA_JEPA=ON. The bindings in
+# csrc/bindings.cpp use the same FLASHRT_HAVE_VLA_JEPA guard, so a build with
+# the option OFF neither compiles the TU nor exposes the symbols.
+if(FLASHRT_ENABLE_VLA_JEPA)
+  add_library(vla_jepa_sm120_obj OBJECT
+    csrc/kernels/vla_preprocess.cu)
+  set_target_properties(vla_jepa_sm120_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(vla_jepa_sm120_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
+  )
+  target_compile_options(vla_jepa_sm120_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3
+      --ftz=true --prec-div=false --prec-sqrt=false
+      ${GPU_GENCODE}
+    >
+  )
+  message(STATUS "VLA-JEPA RTX SM120 preprocessing kernels: ENABLED")
+else()
+  message(STATUS "VLA-JEPA RTX SM120 preprocessing kernels: DISABLED "
+                 "(set FLASHRT_ENABLE_VLA_JEPA=ON on GPU_ARCH=120/121)")
+endif()
+
 # ── Main module ──
 # flash_rt_kernels is the shared core pybind module. It currently compiles a
 # broad superset of kernels, including several model/architecture-specific
@@ -2519,6 +2574,13 @@ if(FLASHRT_ENABLE_MOLMOACT2)
     $<TARGET_OBJECTS:molmo_vit_attn_sm120_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE
     FLASHRT_HAVE_MOLMOACT2=1)
+endif()
+
+if(FLASHRT_ENABLE_VLA_JEPA)
+  target_sources(flash_rt_kernels PRIVATE
+    $<TARGET_OBJECTS:vla_jepa_sm120_obj>)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    FLASHRT_HAVE_VLA_JEPA=1)
 endif()
 
 # SM120a CUTLASS NVFP4 W4A16 GEMM (Qwen3.6 NVFP4 ckpt path).

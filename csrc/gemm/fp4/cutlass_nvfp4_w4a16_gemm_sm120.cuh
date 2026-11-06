@@ -135,5 +135,42 @@ void fp4_w4a16_gemm_sm120_bf16out_pingpong_bias(
     float        alpha,
     cudaStream_t stream);
 
+// ── Model-scoped <128,128,128> twins ────────────────────────────────
+// Same computation and epilogues as the three entry points above, with the
+// K stage halved (deeper pipeline on short-K shapes). Additive: the shared
+// default tile and every existing caller are unchanged; only VLA-JEPA
+// selects these.
+void fp4_w4a16_gemm_sm120_bf16out_k128(
+    const void*  A_packed,
+    const void*  B_packed,
+    void*        D_bf16,
+    int M, int N, int K,
+    const void*  SFA,
+    const void*  SFB,
+    float        alpha,
+    cudaStream_t stream);
+
+void fp4_w4a16_gemm_residual_sm120_bf16out_k128(
+    const void*  A_packed,
+    const void*  B_packed,
+    const void*  C_residual,
+    void*        D_bf16,
+    int M, int N, int K,
+    const void*  SFA,
+    const void*  SFB,
+    float        alpha,
+    cudaStream_t stream);
+
+void fp4_w4a16_gemm_sm120_bf16out_bias_k128(
+    const void*  A_packed,
+    const void*  B_packed,
+    void*        D_bf16,
+    const void*  bias,
+    int M, int N, int K,
+    const void*  SFA,
+    const void*  SFB,
+    float        alpha,
+    cudaStream_t stream);
+
 }  // namespace gemm
 }  // namespace flash_rt
