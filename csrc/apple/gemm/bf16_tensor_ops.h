@@ -18,6 +18,7 @@ inline std::string gemm_bf16_source(int tile_m=64, int tile_n=64, int simdgroups
 template<bool AddBias, bool RoundBeforeBias=true>
 void gemm_impl(device bfloat* a, device bfloat* b, device bfloat* c,
                constant Gemm& p, uint2 group, device const bfloat* bias, uint output_stride=0) {
+    if(group.y*GEMM_TILE_M>=uint(p.rows) || group.x*GEMM_TILE_N>=uint(p.columns))return;
     using E = dextents<int, 2>;
     tensor<device bfloat, E, tensor_inline> left(a, E(p.inner, p.rows), array<int,2>{1,p.inner});
     tensor<device bfloat, E, tensor_inline> right(b, E(p.columns,p.inner), array<int,2>{1,p.columns});

@@ -181,13 +181,24 @@ gate.
 patch embedding, vision blocks, projector, prefix and every denoising step.
 `infer()` writes CPU camera/prompt/noise inputs directly into shared native
 buffers and returns CPU actions without an MPS round trip. The fixed-noise
-MPS tensor API remains available for compatibility. Set the prompt before building: its exact token count fixes
-prefix M. New input contents reuse persistent buffers; a different token count
-requires a new plan. The CLI rebuilds after prompt changes, outside model timing.
+MPS tensor API remains available for compatibility. Set the prompt before
+building. The default native plan reserves `max_prompt_len` text tokens and
+reuses its buffers, weights and ICB when the actual token count changes within
+that capacity. Kernels compute the actual row counts, and decoder KV storage and RoPE
+positions follow the valid prefix length. Length changes update uniforms;
+weights, compiled kernels and recorded ICB commands are reused. Launch grids
+reserve capacity and surplus threadgroups exit before computation. Empty and over-capacity inputs are rejected.
+The CLI builds the plan once, outside model timing.
 
 The low-level API is `frontend.pipeline.enable_native_pipeline(prompt_len)`.
 Model traversal is shared with the reference; native providers record an
 immutable dispatch plan. See [native plan details](../cpp/apple/README.md#fixed-vision--prefix--decoder-replay).
+`dynamic_prompt=False` explicitly selects a compact, exact-length plan for
+diagnostics and calibration. The native benchmark scripts retain this mode for
+historical shape comparisons; `qualify_int8.py lengths` compares compact and
+bounded replay, including shape-update latency. `pad_prompt=True` selects the separate
+fixed-capacity compute strategy explicitly. Full host length-switch and LIBERO
+results are recorded in the [qualification guide](../cpp/apple/README.md#compact-variable-length-replay).
 Model assembly belongs to `flash_rt/models/pi05/native_plan_mps.py`; generic
 recording and native providers belong to `flash_rt/hardware/apple_native`.
 The [native build guide](../cpp/apple/README.md#build-and-validate) documents

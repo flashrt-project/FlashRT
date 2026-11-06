@@ -269,6 +269,8 @@ class Pi05TorchPipeline:
         prompt_len: int,
         encoder_k: torch.Tensor | None = None,
         encoder_v: torch.Tensor | None = None,
+        *,
+        valid_prefix=None,
     ) -> int:
         b = self.buf
         encoder_k = b["encoder_k"] if encoder_k is None else encoder_k
@@ -278,8 +280,11 @@ class Pi05TorchPipeline:
         if not self.compact_encoder:
             b["encoder_x"][image_tokens:].zero_()
         b["encoder_x"][image_tokens : image_tokens + prompt_len].copy_(prompt_embeds)
-        valid_prefix = image_tokens + prompt_len
-        encoder_rows = valid_prefix if self.compact_encoder else self.prefix_capacity
+        # Recording providers may supply a mutable mask length independently
+        # of the fixed number of rows reserved for prefix computation.
+        if valid_prefix is None:
+            valid_prefix = image_tokens + prompt_len
+        encoder_rows = image_tokens + prompt_len if self.compact_encoder else self.prefix_capacity
         encoder_x = b["encoder_x"][:encoder_rows]
         encoder_norm = b["encoder_norm"][:encoder_rows]
         encoder_qkv = b["encoder_qkv"][:encoder_rows]
@@ -364,14 +369,19 @@ class Pi05TorchPipeline:
         valid_prefix: int,
         encoder_k: torch.Tensor | None = None,
         encoder_v: torch.Tensor | None = None,
+        *,
+        prefix_storage_len=None,
     ) -> None:
         b = self.buf
         encoder_k = b["encoder_k"] if encoder_k is None else encoder_k
         encoder_v = b["encoder_v"] if encoder_v is None else encoder_v
-        positions = self._positions[
+        positions = None if self.ops.fused_rope else self._positions[
             valid_prefix : valid_prefix + self.chunk_size]
         suffix_start = (
             valid_prefix if self.compact_encoder else self.prefix_capacity)
+        if prefix_storage_len is not None:
+            # Physical suffix storage need not coincide with its RoPE position.
+            suffix_start = prefix_storage_len
         kv_end = suffix_start + self.chunk_size
         for step in range(self.num_steps):
             modulations = None

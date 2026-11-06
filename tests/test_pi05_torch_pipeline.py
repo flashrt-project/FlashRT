@@ -205,12 +205,14 @@ def test_apple_frontend_predict_and_fixed_noise(small_model, monkeypatch, tmp_pa
     def forbidden_sync():
         raise AssertionError('Native CPU frontend unexpectedly used MPS synchronization')
     with monkeypatch.context() as patch:
-        patch.setattr(frontend.pipeline, '_native_pipeline', SimpleNamespace(prompt_len=3))
+        patch.setattr(frontend.pipeline, '_native_pipeline', SimpleNamespace(
+            accepts_prompt_length=lambda n: 0 < n <= 5))
         patch.setattr(frontend.pipeline, 'forward_native', native_forward)
         patch.setattr(torch.mps, 'synchronize', forbidden_sync)
         result = frontend.infer({'images': images}, noise=noise.float().numpy(), debug=True)
         np.testing.assert_array_equal(result['raw_actions'], expected[0].float().numpy())
-        patch.setattr(frontend.pipeline, '_native_pipeline', SimpleNamespace(prompt_len=4))
+        patch.setattr(frontend.pipeline, '_native_pipeline', SimpleNamespace(
+            accepts_prompt_length=lambda n: n == 4))
         with pytest.raises(ValueError, match='prompt length changed'):
             frontend.infer({'images': images}, noise=noise)
 

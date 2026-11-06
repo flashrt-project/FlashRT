@@ -80,7 +80,7 @@ def main():
         model.set_prompt(args.prompt, state=normalized)
         if args.native_pipeline:
             plan = frontend.pipeline._native_pipeline
-            if plan is None or plan.prompt_len != frontend._prompt_len:
+            if plan is None or not plan.accepts_prompt_length(frontend._prompt_len):
                 frontend.pipeline.disable_native_pipeline()
                 started = time.perf_counter()
                 frontend.pipeline.enable_native_pipeline(frontend._prompt_len)
