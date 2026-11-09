@@ -4,28 +4,31 @@
 namespace flash_rt {
 namespace kernels {
 
-// Process-wide opt-in for the producer fast paths and programmatic dependent
-// launch. The default is the pre-existing behavior; a model frontend that has
-// validated the faster paths calls set_kernel_fast_paths(true, true) before
-// its first launch. The FLASHRT_* environment variables remain explicit
-// diagnostics/overrides and take precedence over this flag.
-inline bool& fast_producers_flag() {
-  static bool enabled = false;
-  return enabled;
+struct KernelPolicy {
+  bool fast_producers = false;
+  bool pdl = false;
+};
+
+// A launch policy lives only for one synchronous model call on this thread.
+// CUDA graph nodes retain their own launch attributes after capture.
+inline KernelPolicy& current_kernel_policy() {
+  static thread_local KernelPolicy policy;
+  return policy;
 }
 
-inline bool& pdl_flag() {
-  static bool enabled = false;
-  return enabled;
-}
+class ScopedKernelPolicy {
+ public:
+  explicit ScopedKernelPolicy(KernelPolicy policy)
+      : previous_(current_kernel_policy()) { current_kernel_policy() = policy; }
+  ~ScopedKernelPolicy() { current_kernel_policy() = previous_; }
+  ScopedKernelPolicy(const ScopedKernelPolicy&) = delete;
+  ScopedKernelPolicy& operator=(const ScopedKernelPolicy&) = delete;
+ private:
+  KernelPolicy previous_;
+};
 
-inline void set_kernel_fast_paths(bool fast_producers, bool pdl) {
-  fast_producers_flag() = fast_producers;
-  pdl_flag() = pdl;
-}
-
-inline bool fast_producers() { return fast_producers_flag(); }
-inline bool pdl_default() { return pdl_flag(); }
+inline bool fast_producers() { return current_kernel_policy().fast_producers; }
+inline bool pdl_default() { return current_kernel_policy().pdl; }
 
 }  // namespace kernels
 }  // namespace flash_rt

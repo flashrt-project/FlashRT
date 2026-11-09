@@ -33,7 +33,7 @@ __device__ __forceinline__ void pdl_wait() {
 
 // Launch with the PDL attribute. The default is off, preserving the
 // pre-existing stream-serialized behavior; a model frontend that has
-// validated PDL calls set_kernel_fast_paths(..., pdl=true), and
+// validated PDL uses an instance-owned, scoped kernel policy, and
 // FLASHRT_PDL=1/0 remains an explicit override. sm_90+ is required.
 inline bool enabled() {
     static const int env = [] {

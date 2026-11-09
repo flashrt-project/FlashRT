@@ -704,21 +704,22 @@ void attention_mha_bf16_masked(cublasHandle_t, const __nv_bfloat16*,
 #endif  // FLASHRT_HAVE_THOR_VLA_KERNELS
 
 PYBIND11_MODULE(flash_rt_kernels, m) {
-    // Model frontends that have validated the faster producers/PDL opt in
-    // once, before their first launch. The default preserves the previous
-    // behavior for every other model.
-    m.def("set_kernel_fast_paths",
-          [](bool fast_producers, bool pdl) {
-              flash_rt::kernels::set_kernel_fast_paths(fast_producers, pdl);
-          },
-          py::arg("fast_producers") = true, py::arg("pdl") = true,
-          "Opt this process into the validated producer fast paths and PDL. "
-          "FLASHRT_* environment overrides still take precedence.");
+#ifdef FLASHRT_HAVE_VLA_JEPA
+    py::class_<flash_rt::kernels::KernelPolicy>(m, "VlaJepaKernelPolicy")
+        .def(py::init([](bool fast_producers, bool pdl) {
+            return flash_rt::kernels::KernelPolicy{fast_producers, pdl};
+        }), py::arg("fast_producers") = true, py::arg("pdl") = true)
+        .def("run", [](const flash_rt::kernels::KernelPolicy& policy,
+                       py::function function, py::args args, py::kwargs kwargs) {
+            flash_rt::kernels::ScopedKernelPolicy scope(policy);
+            return function(*args, **kwargs);
+        }, "Run one model call with an exception-safe, thread-local launch policy.");
+#endif
     m.def("get_kernel_fast_paths", [] {
               return py::make_tuple(flash_rt::kernels::fast_producers(),
                                     flash_rt::kernels::pdl_default());
           },
-          "Return the process-wide (fast_producers, pdl) kernel policy.");
+          "Return the current call's (fast_producers, pdl) kernel policy.");
     m.def("pdl_enabled", [] { return flash_rt::pdl::enabled(); },
           "Whether PDL launches are enabled after the FLASHRT_PDL/policy checks.");
 
@@ -11051,6 +11052,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     // Model-scoped <128,128,128> twins (VLA-JEPA). Same output as the three
     // entries above; additive names, so existing callers keep the shared
     // <128,128,256> default unchanged.
+#ifdef FLASHRT_HAVE_VLA_JEPA
     m.def("fp4_w4a16_gemm_sm120_bf16out_k128",
         [](uintptr_t A_packed, uintptr_t B_packed, uintptr_t D,
            int M, int N, int K,
@@ -11097,6 +11099,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     // for shapes with very large N (lm_head N=248320: 88% peak BW
     // vs 64% baseline; MLP gate/up N=17408: 66% vs 56%). Slower for
     // small/medium N — caller must dispatch by shape.
+#endif
     m.def("fp4_w4a16_gemm_sm120_bf16out_widen",
         [](uintptr_t A_packed, uintptr_t B_packed, uintptr_t D,
            int M, int N, int K,
@@ -11206,6 +11209,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
 
     // 128-deep K tile used by the VLA-JEPA tower; new symbol so existing
     // callers keep the upstream 256-deep tile above.
+#ifdef FLASHRT_HAVE_VLA_JEPA
     m.def("fp4_w4a16_gemm_bias_gelu_fp4out_sm120_k128",
         [](uintptr_t A_packed, uintptr_t B_packed,
            uintptr_t SFA, uintptr_t SFB,
@@ -11233,6 +11237,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     // M0 scaffold = single projection silu(A@Bgate)->FP4; dual accumulator
     // lands incrementally on this stable interface. See
     // cutlass_nvfp4_dual_gemm_silu_fp4out_sm120.cuh.
+#endif
     m.def("fp4_w4a16_dual_gemm_silu_fp4out_sm120",
         [](uintptr_t A_packed, uintptr_t Bgate_packed, uintptr_t Bup_packed,
            uintptr_t SFA, uintptr_t SFBgate, uintptr_t SFBup,

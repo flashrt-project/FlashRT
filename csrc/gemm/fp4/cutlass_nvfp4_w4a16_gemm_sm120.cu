@@ -146,7 +146,9 @@ struct DefaultTile {
 };
 
 using Tile256 = DefaultTile<Shape<_128, _128, _256>>;
+#ifdef FLASHRT_HAVE_VLA_JEPA
 using Tile128 = DefaultTile<Shape<_128, _128, _128>>;
+#endif
 
 // ── Per-shape workspace cache (mirrors FP8 path) ─────────────────
 struct ShapeKey {
@@ -436,6 +438,7 @@ void fp4_w4a16_gemm_sm120_bf16out(
 // Same CUTLASS template and epilogues, smaller K stage. Additive entries:
 // no existing caller changes tile, and the shared default above stays
 // <128,128,256>.
+#ifdef FLASHRT_HAVE_VLA_JEPA
 void fp4_w4a16_gemm_sm120_bf16out_k128(
     const void* A_packed, const void* B_packed, void* D_bf16,
     int M, int N, int K,
@@ -451,7 +454,10 @@ void fp4_w4a16_gemm_sm120_bf16out_k128(
         M, N, K, static_cast<int>(status));
   }
 }
+#endif
 
+
+#ifdef FLASHRT_HAVE_VLA_JEPA
 void fp4_w4a16_gemm_residual_sm120_bf16out_k128(
     const void* A_packed, const void* B_packed,
     const void* C_residual, void* D_bf16,
@@ -467,7 +473,10 @@ void fp4_w4a16_gemm_residual_sm120_bf16out_k128(
         M, N, K, static_cast<int>(status));
   }
 }
+#endif
 
+
+#ifdef FLASHRT_HAVE_VLA_JEPA
 void fp4_w4a16_gemm_sm120_bf16out_bias_k128(
     const void* A_packed, const void* B_packed, void* D_bf16, const void* bias,
     int M, int N, int K,
@@ -482,6 +491,8 @@ void fp4_w4a16_gemm_sm120_bf16out_bias_k128(
         M, N, K, static_cast<int>(status));
   }
 }
+#endif
+
 
 // ============================================================
 // WIDEN variant: TileShape <128, 256, 128>. Same kernel template

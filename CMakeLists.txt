@@ -834,12 +834,16 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
   add_library(sm120_nvfp4_ffn_obj OBJECT
     csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_bf16out_sm120.cu
     csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_fp4out_sm120.cu
-    csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_fp4out_k128_sm120.cu
     csrc/gemm/fp4/cutlass_nvfp4_gemm_dn_streamk_bias_sm120.cu
     csrc/gemm/fp4/cutlass_nvfp4_dual_gemm_silu_fp4out_sm120.cu
     csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_res_sm120.cu
     csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_res_k128_sm120.cu
     csrc/gemm/fp4/cutlass_nvfp4_gemm_glu_fp4out_sm120.cu)
+  if(FLASHRT_ENABLE_VLA_JEPA)
+    target_sources(sm120_nvfp4_ffn_obj PRIVATE
+      csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_fp4out_k128_sm120.cu)
+    target_compile_definitions(cutlass_nvfp4_w4a16_sm120_obj PRIVATE FLASHRT_HAVE_VLA_JEPA=1)
+  endif()
   set_target_properties(sm120_nvfp4_ffn_obj PROPERTIES
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
