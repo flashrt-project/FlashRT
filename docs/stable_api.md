@@ -157,7 +157,9 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   and selects BF16. Explicit FP8/INT8 precision, FP4, FP16 and FA4 requests
   raise. This route requires no CUDA/HIP extension, calibration or graph
   capture; `autotune` has no effect and `cache_frames` must be 1 (or `None`).
-  It uses exact prompt lengths, so fixed state-prompt graph options raise.
+  The eager route uses exact prompt lengths, so fixed state-prompt graph
+  options raise. The separately enabled experimental native Metal plan can
+  reuse bounded prompt storage across length changes; see the deployment guide.
   Images must be two or three RGB uint8 arrays of shape `(224, 224, 3)`;
   state supplied to `predict()`/`set_prompt()` must already be normalized
   with the checkpoint's state statistics. Set `action_dim` or declare

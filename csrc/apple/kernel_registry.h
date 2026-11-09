@@ -16,6 +16,12 @@
 #include "kernels/residual_bf16.h"
 #include "kernels/rms_norm_bf16.h"
 #include "kernels/rope_bf16.h"
+#ifdef FLASHRT_APPLE_INT8_EXPERIMENT
+#include "gemm/int8_tensor_ops.h"
+#include "quantize/bf16_int8_rowwise.h"
+#include "quantize/amax_channel_bf16.h"
+#include "quantize/gelu_mul_int8_rowwise.h"
+#endif
 #include <stdexcept>
 #include <string_view>
 
@@ -30,6 +36,22 @@ struct KernelSource {
 // No name-prefix inference or fallback to a different precision. Each source
 // contains only its operation family; this table contains no shader bodies.
 inline constexpr KernelSource kernel_registry[] = {
+#ifdef FLASHRT_APPLE_INT8_EXPERIMENT
+    {"int8_gemm", "gemm_int8_bf16", [] { return gemm_int8_source(); }},
+    {"int8_gemm_small", "gemm_int8_bf16", [] { return gemm_int8_source(16,128,4); }},
+    {"int8_gemm_bias", "gemm_int8_bf16", [] { return gemm_int8_source(32,64,2,true); }},
+    {"int8_gemm_small_bias", "gemm_int8_bf16", [] { return gemm_int8_source(16,128,4,true); }},
+    {"int8_gemm_64x64", "gemm_int8_bf16", [] { return gemm_int8_source(64,64,2); }},
+    {"int8_gemm_64x64_bias", "gemm_int8_bf16", [] { return gemm_int8_source(64,64,2,true); }},
+    {"int8_gemm_64x128", "gemm_int8_bf16", [] { return gemm_int8_source(64,128,4); }},
+    {"int8_gemm_64x128_bias", "gemm_int8_bf16", [] { return gemm_int8_source(64,128,4,true); }},
+    {"int8_pack", "quantize_bf16_int8_rowwise", [] { return quantize_bf16_int8_rowwise_source(); }},
+    {"int8_pack_small", "quantize_bf16_int8_rowwise", [] { return quantize_bf16_int8_rowwise_source(true); }},
+    {"int8_pack_smooth", "quantize_bf16_int8_rowwise", [] { return quantize_bf16_int8_rowwise_source(false,true); }},
+    {"int8_pack_small_smooth", "quantize_bf16_int8_rowwise", [] { return quantize_bf16_int8_rowwise_source(true,true); }},
+    {"int8_observe_channels", "amax_channel_bf16", amax_channel_bf16_source},
+    {"int8_gelu_mul_smooth", "gelu_mul_int8_rowwise", [] { return gelu_mul_int8_rowwise_source(); }},
+#endif
     {"gemm_bf16", "gemm_bf16", [] { return gemm_bf16_source(); }},
     {"gemm_bias_bf16", "gemm_bias_bf16", [] { return gemm_bf16_source(); }},
     {"gemm_patch_bf16", "gemm_patch_bf16", [] { return gemm_bf16_source(); }},
@@ -39,8 +61,10 @@ inline constexpr KernelSource kernel_registry[] = {
     {"gemm_small_strided_bf16", "gemm_strided_bf16", [] { return gemm_bf16_source(16); }},
     {"attention_d72_bf16", "attention_d72_bf16", attention_d72_bf16_source},
     {"attention_bf16", "attention_bf16", attention_simd_bf16_source},
-    {"tr_gqa", "tr_gqa", gqa_online_bf16_source},
-    {"tr_gqa_split", "tr_gqa_split", gqa_split_bf16_source},
+    {"tr_gqa", "tr_gqa", [] { return gqa_online_bf16_source(); }},
+    {"tr_gqa_masked", "tr_gqa_masked", [] { return gqa_online_bf16_source(true); }},
+    {"tr_gqa_split", "tr_gqa_split", [] { return gqa_split_bf16_source(); }},
+    {"tr_gqa_split_masked", "tr_gqa_split_masked", [] { return gqa_split_bf16_source(true); }},
     {"tr_gqa_merge", "tr_gqa_merge", gqa_merge_fp32_bf16_source},
     {"tr_patch_pack", "tr_patch_pack", patch_pack_bf16_source},
     {"tr_patch_probe", "tr_patch_probe", patch_probe_bf16_source},
@@ -53,7 +77,8 @@ inline constexpr KernelSource kernel_registry[] = {
     {"tr_gelu_mul", "tr_gelu_mul", gelu_mul_bf16_source},
     {"residual_bf16", "residual_bf16", residual_bf16_source},
     {"tr_residual", "tr_residual", residual_bf16_source},
-    {"tr_rope", "tr_rope", rope_bf16_source},
+    {"tr_rope", "tr_rope", [] { return rope_bf16_source(); }},
+    {"tr_rope_offsets", "tr_rope_offsets", [] { return rope_bf16_source(true); }},
 };
 
 inline const KernelSource& find_kernel_source(std::string_view name) {
