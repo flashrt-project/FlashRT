@@ -1870,6 +1870,13 @@ class VlaJepaRtxPipeline:
             self.gripper_threshold, stream)
 
     def forward(self, stream: int | None = None) -> int:
+        """Run under this pipeline instance's policy; restore on return/error."""
+        kernels = self._kernels()
+        if not hasattr(self, "_kernel_policy"):
+            self._kernel_policy = kernels.VlaJepaKernelPolicy()
+        return self._kernel_policy.run(self._forward, stream=stream)
+
+    def _forward(self, stream: int | None = None) -> int:
         """Run the whole pipeline (raw frames -> delivered chunk); returns the
         delivered action buffer pointer."""
         self._kernels()

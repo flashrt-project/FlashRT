@@ -135,6 +135,7 @@ void fp4_w4a16_gemm_sm120_bf16out_pingpong_bias(
     float        alpha,
     cudaStream_t stream);
 
+#ifdef FLASHRT_HAVE_VLA_JEPA
 // ── Model-scoped <128,128,128> twins ────────────────────────────────
 // Same computation and epilogues as the three entry points above, with the
 // K stage halved (deeper pipeline on short-K shapes). Additive: the shared
@@ -171,6 +172,8 @@ void fp4_w4a16_gemm_sm120_bf16out_bias_k128(
     const void*  SFB,
     float        alpha,
     cudaStream_t stream);
+
+#endif
 
 }  // namespace gemm
 }  // namespace flash_rt

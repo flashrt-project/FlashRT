@@ -43,6 +43,7 @@ EMBODIED_ACTION_TOKEN = "<|embodied_action|>"
 # build without -DFLASHRT_ENABLE_VLA_JEPA=ON fails with an actionable message
 # instead of an AttributeError at the first launch.
 _REQUIRED_KERNELS = (
+    "VlaJepaKernelPolicy",
     "vla_frames_area_resize",
     "vla_frames_bicubic_resize",
     "vla_frames_bicubic_patchify",
@@ -138,25 +139,21 @@ class VlaJepaTorchFrontendRtx:
         self.pre_snap_gripper_action = bool(cfg.get("pre_snap_gripper_action", True))
         self.binarize_gripper_action = bool(cfg.get("binarize_gripper_action", True))
 
-        # This model has validated the register-resident activation producers
-        # and PDL; opt in once, before the first kernel launch (weight packing
-        # below already uses the quantizers). Other models keep the previous
-        # defaults unless they call the same setter.
         from flash_rt import flash_rt_kernels as _fvk
-        if hasattr(_fvk, "set_kernel_fast_paths"):
-            _fvk.set_kernel_fast_paths(True, True)
+        _require_kernels(_fvk)
+        self._kernel_policy = _fvk.VlaJepaKernelPolicy()
 
         # The frontend owns checkpoint IO; the pipeline receives the loaded
         # tensors in its bf16 kernel layout (see _vla_jepa_rtx_spec).
         from flash_rt.frontends.torch._vla_jepa_rtx_spec import load_weights
         qwen_cfg = json.load(open(os.path.join(self.qwen_dir, "config.json")))
-        weights = load_weights(
+        weights = self._kernel_policy.run(load_weights,
             self.qwen_dir, self.action_ckpt, device=device,
             num_llm_layers=int(qwen_cfg["text_config"]["num_hidden_layers"]),
             num_dit_layers=int(cfg.get("action_num_layers", 16)),
             num_inference_steps=self.num_inference_timesteps)
 
-        self.pipe = VlaJepaRtxPipeline(
+        self.pipe = self._kernel_policy.run(VlaJepaRtxPipeline,
             self.qwen_dir, action_ckpt=self.action_ckpt, weights=weights,
             device=device,
             num_views=self.num_views, seq_len=self.seq_len,
@@ -203,8 +200,7 @@ class VlaJepaTorchFrontendRtx:
                                        dtype=torch.uint8, pin_memory=True)
         self._pin_state = torch.empty(self.state_dim, dtype=torch.float32,
                                       pin_memory=True)
-        self._pin_noise = torch.empty(self.chunk_size, self.action_dim,
-                                      dtype=torch.bfloat16, pin_memory=True)
+        self._initialize_noise()
         self._pin_out = torch.empty(self.chunk_size, self.action_dim,
                                     dtype=torch.float32, pin_memory=True)
         self.latency_records: list[float] = []
@@ -372,7 +368,13 @@ class VlaJepaTorchFrontendRtx:
         if not self.use_cuda_graph:
             self._upload_pinned()
 
+    def _initialize_noise(self) -> None:
+        self._pin_noise = torch.empty(self.chunk_size, self.action_dim,
+                                      dtype=torch.bfloat16, pin_memory=True)
+        self.set_noise()
+
     def set_noise(self, noise: np.ndarray | None = None) -> None:
+        """Set reusable noise; None restores the fixed seed-0 Gaussian default."""
         if noise is None:
             noise = np.random.default_rng(0).standard_normal(
                 (self.chunk_size, self.action_dim)).astype(np.float32)
@@ -402,6 +404,9 @@ class VlaJepaTorchFrontendRtx:
         if self.use_cuda_graph:
             self._graph.replay()
         else:
+            # Every decision starts from staged noise, including infer() calls
+            # that reuse the previous observation. The Euler loop mutates actions.
+            self.pipe.actions.copy_(self._pin_noise, non_blocking=True)
             self.pipe.forward()
         torch.cuda.synchronize()
         if self.use_cuda_graph:

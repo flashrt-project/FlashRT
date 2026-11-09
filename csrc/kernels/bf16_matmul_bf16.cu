@@ -60,10 +60,13 @@ struct Bf16LtKey {
     int bias;
     // output row stride of the bias formulation (0: packed, N)
     int ldo;
+    // Timing/autotune policy must not leak between model instances.
+    bool fast_producers;
 
     bool operator==(const Bf16LtKey& other) const {
         return M == other.M && N == other.N && K == other.K
-            && max_algos == other.max_algos && bias == other.bias && ldo == other.ldo;
+            && max_algos == other.max_algos && bias == other.bias && ldo == other.ldo
+            && fast_producers == other.fast_producers;
     }
 };
 
@@ -75,6 +78,7 @@ struct Bf16LtKeyHash {
         h = h * 1315423911u + static_cast<size_t>(key.max_algos);
         h = h * 1315423911u + static_cast<size_t>(key.bias);
         h = h * 1315423911u + static_cast<size_t>(key.ldo);
+        h = h * 1315423911u + static_cast<size_t>(key.fast_producers);
         return h;
     }
 };
@@ -116,7 +120,7 @@ static Bf16LtPlan& get_bf16_lt_plan(int M, int N, int K,
     std::lock_guard<std::mutex> lock(g_bf16_mu);
     ensure_bf16_lt();
     if (ldo == N) ldo = 0;
-    Bf16LtKey key{M, N, K, max_algos, bias, ldo};
+    Bf16LtKey key{M, N, K, max_algos, bias, ldo, flash_rt::kernels::fast_producers()};
     auto it = g_bf16_plans.find(key);
     if (it != g_bf16_plans.end()) return it->second;
 

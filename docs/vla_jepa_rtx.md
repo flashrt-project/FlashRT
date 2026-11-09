@@ -25,10 +25,11 @@ size is 1, the prompt is padded to `seq_len=256`, and the action chunk is
 
 ## 1. Build
 
-The model-specific preprocessing/post-processing translation unit is opt-in.
+The model-specific preprocessing/post-processing and new K128 GEMM variants are opt-in.
 It is compiled only with `FLASHRT_ENABLE_VLA_JEPA=ON` on `GPU_ARCH=120/121`;
 the `vla_*` bindings are compiled under the same `FLASHRT_HAVE_VLA_JEPA`
-definition, so a default build neither compiles the TU nor exposes the symbols.
+definition. The K128 implementation, exports and instance launch-policy class
+follow the same gate; existing shared GEMM interfaces remain available when OFF.
 
 ```bash
 git clone --depth 1 --branch v4.4.2 \
@@ -213,12 +214,12 @@ NVFP4 tiles and fusion folds) is a static calibrated description in
 `flash_rt/frontends/torch/_vla_jepa_rtx_spec.py`; it is not configured through
 environment variables. Model-level choices are constructor arguments (§5).
 
-The frontend opts this process into the register-resident activation producers
-and PDL because this model validated them. That opt-in is explicit and
-model-scoped: other FlashRT models keep the pre-existing producer kernels and
-stream-serialized launches unless they call `set_kernel_fast_paths` too. The
-`FLASHRT_*` variables below remain explicit process-level overrides for A/B
-work and always take precedence over the opt-in:
+The frontend and pipeline own a `VlaJepaKernelPolicy`. It enables the validated
+producers and PDL only while executing that instance's setup/forward call.
+The native scope is thread-local and restores the previous policy on return or
+exception; other models keep their defaults. Captured graph nodes retain their
+launch attributes without leaving a policy enabled between calls.
+The `FLASHRT_*` variables below remain explicit process-level overrides:
 
 | Variable | Default | Effect |
 |---|---|---|
@@ -270,3 +271,11 @@ route used by the decoder.
 | Decoder attention route | `flash_rt/hardware/rtx/attn_backend_qwen3.py` |
 | Boundary preprocessing/post-processing kernels | `csrc/kernels/vla_preprocess.cu` |
 | Routing | `flash_rt/hardware/__init__.py` (`_PIPELINE_MAP`) |
+
+
+Default inference noise is initialized before graph warmup/capture using a
+local NumPy generator with seed 0, rounded to BF16. It is reused across calls
+until `set_noise(noise)`, `infer(noise=...)` or `actions_norm` updates it;
+`set_noise()` restores that fixed Gaussian default. Every eager decision and
+graph replay starts from the staged noise rather than the preceding Euler
+loop's output. No global NumPy or torch RNG state is modified.
