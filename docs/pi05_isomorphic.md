@@ -60,7 +60,7 @@ covers the routing.
 ## Use
 
 ```bash
-# FlashRT-Train, branch policy-loop (the policy schedule, C ABI 10): build its native library for the device, then
+# FlashRT-Train, branch policy-loop (the policy schedule, C ABI 11): build its native library for the device, then
 export PYTHONPATH=<FlashRT>:<FlashRT-Train>
 export FRT_TRAIN_LIB=<FlashRT-Train>/build/libflashrt_train.so
 ```
@@ -98,6 +98,7 @@ updates of the action expert over the kept prefix, rollout again.
 | `max_prompt_len` | text columns of the forward. Every prompt is padded to it under a mask, so the layout does not depend on the other prompts of the batch; shorter is faster (see below) |
 | `denoise_trace`, `sde` | as on the native frontend; the trace holds `x`, `v` and `delta = dt * v` in fp32 |
 | `trainable` | `"none"` serves only; `"expert"` trains the action expert over a frozen prefix; `"lora"` trains the PEFT adapter in `adapter` |
+| `sampler_graph` | the denoising steps as one captured device graph (default on): the same bits; one layout (batch, steps, sampler, trace) is held at a time |
 | `arena_gib` | device memory of the trainer's activation arena |
 | `trainer_kwargs` | further `Trainer` arguments, e.g. `gemm_reference_width` |
 
@@ -112,20 +113,24 @@ rollout and an update, not `predict(images, prompt)`.
 A800 80 GB, same setup as [pi05_sm80.md](pi05_sm80.md), medians of nine
 calls; the whole call including host staging.
 
-| batch | native BF16, per sample | isomorphic (48 text columns), per sample | isomorphic (200 text columns) |
-|---|---|---|---|
-| 1 | 39.5 ms | 96.2 ms | 99.7 ms |
-| 8 | 26.5 ms | 30.2 ms | 33.9 ms |
-| 32 | 26.7 ms | 25.6 ms | |
+| batch | native BF16, per sample | isomorphic (48 text columns), per sample |
+|---|---|---|
+| 1 | 38.8 ms | 90.1 ms |
+| 8 | 26.1 ms | 29.2 ms |
+| 32 | 26.2 ms | 24.9 ms |
 
-At batch 32 the two are level (the isomorphic path 4% ahead); at batch 8 it
-costs 14%; for a single sample it is 2.4× the native pipeline.
-The single-sample cost has three parts, none of them the bit-exactness
-itself: the rollout is not graph-captured (about 500 kernel launches per
-denoising step), the action expert's 50-row GEMMs run the algorithm cuBLASLt
-picks for eight samples' rows (`gemm_reference_width`, the width that costs
-nothing; 8 by default), and its time conditioning is recomputed every step.
-All three are open work in FlashRT-Train.
+At batch 32 the isomorphic path is 5% ahead; at batch 8 it costs 12%; for a
+single sample it is 2.3× the native pipeline. The full 200-column text
+layout adds 3% at batch 1 and 12% at 8.
+
+The denoising steps run as one captured device graph (`sampler_graph=True`,
+the default; the same bits as without it), which is worth 7% of a
+single-sample rollout and less above. The single-sample cost is not
+dispatch and not the bit-exactness itself: a velocity step is about 480
+small kernels where the native pipeline has fused them and precomputed the
+time conditioning, and its 50-row GEMMs run the algorithm cuBLASLt picks
+for eight samples' rows (`gemm_reference_width`, the width that costs
+nothing; 8 by default). Both are open work in FlashRT-Train.
 
 ## Scope
 

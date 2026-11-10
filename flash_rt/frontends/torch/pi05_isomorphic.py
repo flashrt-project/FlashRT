@@ -99,6 +99,8 @@ class Pi05TorchFrontendIsomorphic:
             ``"lora"`` trains the PEFT adapter in ``adapter``. Other forms
             go through ``trainer_kwargs``.
         adapter: PEFT LoRA adapter directory (``trainable="lora"``).
+        sampler_graph: run the denoising steps as one captured device graph
+            (the same bits; a little faster, most at low width).
         arena_gib: device memory the trainer's activation arena takes.
         device: CUDA ordinal.
         trainer_kwargs: further ``flashrt_train.native.Trainer`` arguments.
@@ -115,6 +117,7 @@ class Pi05TorchFrontendIsomorphic:
                  sde: bool = False,
                  trainable: str = "none",
                  adapter: Optional[str] = None,
+                 sampler_graph: bool = True,
                  arena_gib: float = 16.0,
                  device: int = 0,
                  hardware: Optional[str] = None,
@@ -161,6 +164,8 @@ class Pi05TorchFrontendIsomorphic:
         if kwargs.get("gemm_algo") != "invariant":
             raise ValueError("the isomorphic frontend needs gemm_algo='invariant': another choice makes a sample depend on its batch")
         self.trainer = Trainer(str(safetensors_path), **kwargs)
+        if sampler_graph:
+            self.trainer.set_policy_graph(True)
 
         self._prompts: list = []        # (text, state) per slot
         self._tokens: Optional[torch.Tensor] = None   # int64 [B, max_prompt_len] on the device
