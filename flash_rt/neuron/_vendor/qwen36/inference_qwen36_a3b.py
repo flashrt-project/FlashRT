@@ -77,7 +77,8 @@ DEFAULT_PROMPTS = [
 
 
 def _make_neuron_config(
-    tp_degree, seq_len, blockwise_config, spec_decode, tkg_attention_kernel=False
+    tp_degree, seq_len, blockwise_config, spec_decode, tkg_attention_kernel=False,
+    max_prefill_tokens=None,
 ):
     """MoENeuronConfig shared by the target and draft; adds the EAGLE fused-spec
     flags (speculation_length=2 == k=1) when speculating."""
@@ -92,6 +93,8 @@ def _make_neuron_config(
         ctx_batch_size=1,
         tkg_batch_size=1,
         seq_len=seq_len,
+        max_context_length=max_prefill_tokens or seq_len,
+        context_encoding_buckets=[max_prefill_tokens] if max_prefill_tokens else None,
         torch_dtype=torch.bfloat16,
         on_device_sampling_config=OnDeviceSamplingConfig(top_k=1),  # greedy
         enable_bucketing=False,
@@ -123,6 +126,7 @@ def build_inference_config(
     draft_megakernel: bool = False,
     speculation_megakernel: bool = False,
     faithful_numerics: bool = False,
+    max_prefill_tokens=None,
 ) -> Qwen36A3BInferenceConfig:
     """Build the NxDI config from the HF config.json on disk.
 
@@ -168,7 +172,9 @@ def build_inference_config(
     # compilation above seq_len 512. Only the shard-on-block dynamic-while variant exists
     # in this SDK build, and it requires PING_PONG block sharding.
     blockwise_config = {
-        "block_size": 128,
+        # NxDI selects all-experts for T*top_k < block_size. A <=16-token
+        # prefill avoids the 255-block floor while preserving every expert.
+        "block_size": 256 if max_prefill_tokens and max_prefill_tokens <= 16 else 128,
         "use_shard_on_block_dynamic_while": True,
         "block_sharding_strategy": "PING_PONG",
     }
@@ -185,6 +191,7 @@ def build_inference_config(
                 blockwise_config,
                 spec_decode=True,
                 tkg_attention_kernel=tkg_attention_kernel,
+                max_prefill_tokens=max_prefill_tokens,
             ),
             **draft_dict,
         )
@@ -204,6 +211,7 @@ def build_inference_config(
             blockwise_config,
             spec_decode=spec_decode,
             tkg_attention_kernel=tkg_attention_kernel,
+            max_prefill_tokens=max_prefill_tokens,
         ),
         fused_spec_config=fused_spec_config,
         **config_dict,

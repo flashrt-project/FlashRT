@@ -25,7 +25,7 @@ class Qwen36NeuronFrontend:
 
     def __init__(self, checkpoint, compiled_path, *, tp_degree=4, seq_len=128,
                  speculative=False, megakernel=False, layer_kernels=False,
-                 faithful_numerics=True):
+                 faithful_numerics=False, max_prefill_tokens=None):
         if os.environ.get('NEURON_PLATFORM_TARGET_OVERRIDE', 'trn3') != 'trn3':
             raise ValueError('This backend requires the trn3 compilation target')
         os.environ['NEURON_PLATFORM_TARGET_OVERRIDE'] = 'trn3'
@@ -35,6 +35,8 @@ class Qwen36NeuronFrontend:
             raise RuntimeError('Trainium 3 hardware is required')
         if tp_degree < 1 or seq_len < 128 or seq_len % 128:
             raise ValueError('Positive TP and a sequence window divisible by 128 are required')
+        if max_prefill_tokens is not None and not 4 <= max_prefill_tokens <= seq_len:
+            raise ValueError('Prefill limit must be at least four tokens and fit the sequence window')
         if megakernel and not speculative:
             raise ValueError('The fused round megakernel requires speculative=True')
         if any(os.environ.get(name) == '1' for name in ('A3B_BYPASS_ATTN', 'A3B_BYPASS_MOE')):
@@ -62,6 +64,7 @@ class Qwen36NeuronFrontend:
             'tp_degree': tp_degree, 'logical_nc_config': 2, 'seq_len': seq_len,
             'speculative': speculative, 'megakernel': megakernel, 'layer_kernels': layer_kernels,
             'faithful_numerics': faithful_numerics,
+            'max_prefill_tokens': max_prefill_tokens or seq_len,
             'compiler_environment': {name: os.environ.get(name) for name in (
                 'USE_NKILIB_KERNEL', 'USE_NEWTON_RMSNORM', 'USE_PYTHON_RMSNORM',
                 'USE_NKI_FUSED', 'USE_NKI', 'DELTANET_SEQUENTIAL', 'USE_PYTORCH_CHUNK',
@@ -88,7 +91,8 @@ class Qwen36NeuronFrontend:
                                                    tkg_attention_kernel=layer_kernels,
                                                    moe_layer_kernel=layer_kernels,
                                                    speculation_megakernel=megakernel,
-                                                   faithful_numerics=faithful_numerics)
+                                                   faithful_numerics=faithful_numerics,
+                                                   max_prefill_tokens=max_prefill_tokens)
             driver.maybe_compile(str(checkpoint), str(compiled_path), config)
         self.model = driver.load_model(str(compiled_path))
         self.tokenizer = AutoTokenizer.from_pretrained(str(checkpoint), padding_side='right')
@@ -99,7 +103,10 @@ class Qwen36NeuronFrontend:
     def generate(self, prompt, max_new_tokens=32):
         if max_new_tokens < 1:
             raise ValueError('max_new_tokens must be positive')
-        if len(self.tokenizer.encode(prompt)) + max_new_tokens > self.model.neuron_config.seq_len:
+        prompt_len = len(self.tokenizer.encode(prompt))
+        if prompt_len > self.model.neuron_config.max_context_length:
+            raise ValueError('Prompt exceeds the compiled prefill limit')
+        if prompt_len + max_new_tokens > self.model.neuron_config.seq_len:
             raise ValueError('Prompt plus requested generation exceeds the compiled window')
         tokens, text = self.driver.generate(self.model, self.tokenizer, prompt, max_new_tokens)
         return {'token_ids': tokens, 'text': text}

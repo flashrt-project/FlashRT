@@ -22,6 +22,8 @@ def benchmark(frontend, prompt, max_new_tokens, num_runs):
         raise ValueError('Synchronous module timing requires async_mode=False')
     inputs = frontend.tokenizer(prompt, return_tensors='pt')
     prompt_len = inputs.input_ids.shape[1]
+    if prompt_len > model.neuron_config.max_context_length:
+        raise ValueError('Prompt exceeds the compiled prefill limit')
     if prompt_len + max_new_tokens > model.neuron_config.seq_len:
         raise ValueError('Prompt plus requested generation exceeds the compiled window')
     adapter = driver.HuggingFaceGenerationAdapter(model)
