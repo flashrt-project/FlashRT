@@ -568,6 +568,17 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     Returns:
         VLAModel instance with .predict() method.
     """
+    if hardware == "neuron":
+        if framework != "jax" or config not in ("pi0", "pi05"):
+            raise ValueError("Neuron VLA inference requires framework='jax', config='pi0' or 'pi05'")
+        if precision not in ("auto", "bf16") or use_fp4 or use_fp16 or use_fp4_decoder:
+            raise ValueError("Neuron currently supports BF16 inference")
+        if state_prompt_mode != "exact" or state_prompt_fixed_max_len is not None:
+            raise ValueError("Neuron currently supports exact text prompt buckets")
+        from flash_rt.neuron.pi import PiNeuronFrontend
+        return VLAModel(PiNeuronFrontend(checkpoint, config=config,
+                        num_views=num_views, num_steps=num_steps or 10,
+                        action_horizon=action_horizon, device=device), "jax")
     for name, value in (("fuse_image_embeds", fuse_image_embeds),
                         ("use_backbone_graph", use_backbone_graph)):
         if value is not None:
