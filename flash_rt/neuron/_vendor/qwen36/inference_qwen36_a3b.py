@@ -122,6 +122,7 @@ def build_inference_config(
     verify_megakernel: bool = False,
     draft_megakernel: bool = False,
     speculation_megakernel: bool = False,
+    faithful_numerics: bool = False,
 ) -> Qwen36A3BInferenceConfig:
     """Build the NxDI config from the HF config.json on disk.
 
@@ -134,6 +135,9 @@ def build_inference_config(
     text_config = full_config.get("text_config", full_config)
 
     config_dict = dict(text_config)
+    config_dict['flashrt_faithful_numerics'] = faithful_numerics
+    if faithful_numerics and (spec_decode or tkg_attention_kernel or moe_layer_kernel):
+        raise ValueError('Faithful numerics currently supports ordinary greedy decoding')
     config_dict["pad_token_id"] = text_config.get("eos_token_id", 248044)
     if "rope_parameters" in text_config:
         config_dict["rope_theta"] = text_config["rope_parameters"].get(
