@@ -124,7 +124,7 @@ single sample it is 2.3× the native pipeline. The full 200-column text
 layout adds 3% at batch 1 and 12% at 8.
 
 The denoising steps run as one captured device graph (`sampler_graph=True`,
-the default; the same bits as without it), which is worth 7% of a
+the default; the same bits as without it), which is worth 6% of a
 single-sample rollout and less above. The single-sample cost is not
 dispatch and not the bit-exactness itself: a velocity step is about 480
 small kernels where the native pipeline has fused them and precomputed the
