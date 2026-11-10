@@ -234,7 +234,9 @@ class PiNeuronFrontend:
         self.num_views = num_views
         ckpt = Path(checkpoint_dir)
         cfg = json.loads((ckpt/'config.json').read_text()) if (ckpt/'config.json').exists() else {}
-        self.chunk_size = action_horizon or cfg.get('chunk_size', 50)
+        self.chunk_size = cfg.get('chunk_size', 50) if action_horizon is None else action_horizon
+        if min(num_views, num_steps, self.chunk_size) < 1:
+            raise ValueError('num_views, num_steps, and action_horizon must be positive')
         self.device = device or next((d for d in jax.devices() if d.platform == 'neuron'), None)
         if self.device is None or self.device.platform != 'neuron':
             raise RuntimeError('A Neuron PJRT device is required; CPU fallback is disabled')

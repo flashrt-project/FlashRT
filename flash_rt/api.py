@@ -577,7 +577,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             raise ValueError("Neuron currently supports exact text prompt buckets")
         from flash_rt.neuron.pi import PiNeuronFrontend
         return VLAModel(PiNeuronFrontend(checkpoint, config=config,
-                        num_views=num_views, num_steps=num_steps or 10,
+                        num_views=num_views, num_steps=10 if num_steps is None else num_steps,
                         action_horizon=action_horizon, device=device), "jax")
     for name, value in (("fuse_image_embeds", fuse_image_embeds),
                         ("use_backbone_graph", use_backbone_graph)):
