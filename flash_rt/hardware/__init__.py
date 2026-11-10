@@ -38,6 +38,7 @@ def detect_arch() -> str:
         ``"rtx_sm120"`` — RTX 5090 / DGX Spark GB10 Blackwell, SM120/SM121
         ``"rtx_sm89"``  — RTX 4090 / Ada, SM89 (cc 8.9)
         ``"rtx_sm87"``  — Jetson Orin via RTX consumer backend, SM87 (cc 8.7)
+        ``"rtx_sm80"``  — A100 / A800 (datacenter Ampere), SM80 (cc 8.0)
         ``"amd_cdna3"`` — AMD Instinct MI300 series, ROCm (gfx942)
         ``"amd_cdna4"`` — AMD Instinct MI350 series, ROCm (gfx950)
         ``"amd_rdna3"``  — AMD RDNA 3 (gfx1100 / Radeon Pro W7900D)
@@ -111,12 +112,15 @@ def detect_arch() -> str:
         return "rtx_sm120"
     if (major, minor) == (8, 7):
         return "rtx_sm87"
+    if (major, minor) == (8, 0):
+        return "rtx_sm80"
     if (major, minor) == (8, 9):
         return "rtx_sm89"
     raise RuntimeError(
         f"FlashRT: unsupported GPU SM {major}.{minor}. "
         f"Supported architectures: SM110 (Thor), SM120/SM121 (Blackwell), "
-        f"SM89 (RTX 4090), SM87 (Jetson Orin experimental)."
+        f"SM89 (RTX 4090), SM87 (Jetson Orin experimental), "
+        f"SM80 (A100 / A800, Pi0.5 BF16)."
     )
 
 
@@ -165,6 +169,18 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
         ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
     ("pi05", "torch", "rtx_sm87"):
         ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
+    # A100 / A800 (SM80, datacenter Ampere): no FP8 tensor cores, so the
+    # RTX frontend runs its BF16 pipeline. See docs/pi05_sm80.md.
+    ("pi05", "torch", "rtx_sm80"):
+        ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
+    # Pi0.5 on the arithmetic of its trainer (FlashRT-Train's policy
+    # schedule): rollouts the training forward reproduces bit for bit.
+    # Registered for discovery and constructed directly: it takes three
+    # views, any batch width, and carries the trainer. Needs the
+    # flashrt_train package. See docs/pi05_isomorphic.md.
+    ("pi05_isomorphic", "torch", "rtx_sm80"):
+        ("flash_rt.frontends.torch.pi05_isomorphic",
+         "Pi05TorchFrontendIsomorphic"),
     ("pi05", "torch", "amd_cdna4"):
         ("flash_rt.amd.frontends.torch.pi05", "Pi05TorchFrontendAmd"),
     ("pi05", "torch", "amd_cdna3"):
@@ -396,6 +412,13 @@ _SM87_ALLOWED = {
     ("groot_n17", "torch", "rtx_sm87"),
 }
 
+# Same reasoning for datacenter Ampere (A100 / A800): only frontends with a
+# BF16 pipeline validated on SM80 resolve.
+_SM80_ALLOWED = {
+    ("pi05", "torch", "rtx_sm80"),
+    ("pi05_isomorphic", "torch", "rtx_sm80"),
+}
+
 
 def resolve_pipeline_class(config: str, framework: str, arch: str):
     """Resolve (config, framework, arch) to a pipeline class object.
@@ -408,6 +431,13 @@ def resolve_pipeline_class(config: str, framework: str, arch: str):
         supported = sorted({c for (c, f, _) in _SM87_ALLOWED if f == framework})
         raise RuntimeError(
             "FlashRT: Jetson Orin SM87 supports the following configs with "
+            f"framework={framework!r}: {supported}. "
+            f"config={config!r} is not supported yet."
+        )
+    if arch == "rtx_sm80" and key not in _SM80_ALLOWED:
+        supported = sorted({c for (c, f, _) in _SM80_ALLOWED if f == framework})
+        raise RuntimeError(
+            "FlashRT: SM80 (A100 / A800) supports the following configs with "
             f"framework={framework!r}: {supported}. "
             f"config={config!r} is not supported yet."
         )

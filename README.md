@@ -473,6 +473,7 @@ For Jetson Thor: [OpenPI π0.5](docs/thor/pi05.md) · [GR00T N1.7](docs/thor/gro
 | **Train a Pi0.5 LoRA fine-tune (FP8 + LoRA, plain or RECAP/ACP-conditioned, PyTorch *or* JAX)** | [`training/README.md`](training/README.md). JAX companion at [`training/jax/README.md`](training/jax/README.md) |
 | **Run advantage-conditioned (RECAP / π\*0.6) policies with classifier-free guidance** | [`docs/rl_inference.md`](docs/rl_inference.md) — PyTorch + JAX frontends both supported |
 | **Roll out many environments per forward, reproduce a sample, inspect the denoise loop, export prefix features (B=N batching, seeded noise, denoise trace, prefix hidden state)** | [`docs/rl_inference.md`](docs/rl_inference.md#reproducible-sampling-and-denoise-trace-rl-rollouts) — Pi0.5 RTX |
+| **Roll Pi0.5 out for an on-policy trainer on the trainer's own arithmetic (the training forward reproduces every rollout bit for bit, at any batch width; no weight sync between rollout and update)** | [`docs/pi05_isomorphic.md`](docs/pi05_isomorphic.md) — Pi0.5 on SM80 with [FlashRT-Train](https://github.com/LiangSu8899/FlashRT-Train) |
 | **See how FlashRT differs from TensorRT / vLLM / SGLang** | [`docs/inference_engine_differences.md`](docs/inference_engine_differences.md) |
 
 ---
@@ -964,6 +965,7 @@ have been built and tested, and the dispatch map that selects them.
 | RTX 4060 Ti | SM89 | Validated build/run target | Included in current tested hardware list; run local benchmarks before making model-specific latency claims. |
 | NVIDIA L40 | SM89 | Community validated | Pi0.5 FP8 submission; see [Community benchmarks](#community-hardware-benchmarks). |
 | Jetson AGX Orin | SM87 | Community port | Pi0.5 INT8/BF16 paths, Orin tile dispatch, frame-cache inference, and Qwen3-VL BF16 with opt-in INT8/INT4 decode ([docs](docs/qwen3_vl_rtx_bf16.md)); see [deployment_orin.md](docs/deployment_orin.md). |
+| NVIDIA A800 (A100-class) | SM80 | Validated | Pi0.5 BF16 at **39.5 ms** (three views, horizon 50), 26.5 ms per sample at batch 8; and Pi0.5 rollouts on the trainer's arithmetic (`config="pi05_isomorphic"`). See [pi05_sm80.md](docs/pi05_sm80.md) and [pi05_isomorphic.md](docs/pi05_isomorphic.md). |
 | A100 / A10 / RTX 3090 / RTX 3080 / A5000 / A6000 and other SM80/86/89 GPUs | SM80/86/89 | Build target | CMake and FA2 gates cover Ampere/Ada shapes. Treat unlisted cards as expected to build until a benchmark or regression row is submitted. |
 
 Feature notes:

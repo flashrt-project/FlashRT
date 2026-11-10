@@ -424,6 +424,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
               SM87  (Jetson Orin)  → ``flash_rt.hardware.rtx.*`` (experimental,
                                      Pi0.5 torch only; BF16 default, INT8
                                      via Orin env flags)
+              SM80  (A100 / A800)  → ``flash_rt.hardware.rtx.*`` (Pi0.5 torch,
+                                     BF16)
               gfx942 (MI300 series) → ``flash_rt.amd.*`` (CDNA3)
               gfx950 (MI350 series) → ``flash_rt.amd.*`` (CDNA4)
               gfx1100 (Radeon Pro W7900D) → ``flash_rt.amd.*`` (RDNA 3 BF16)
@@ -431,7 +433,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
               gfx1201 (Radeon AI PRO R9700) → ``flash_rt.amd.*`` (RDNA 4 BF16)
               Apple Silicon        → ``flash_rt.hardware.mps.*`` (experimental Pi0.5 BF16)
             Pass ``"thor"`` / ``"rtx_sm120"`` / ``"rtx_sm89"`` /
-            ``"rtx_sm87"`` / ``"amd_cdna3"`` / ``"amd_cdna4"`` /
+            ``"rtx_sm87"`` / ``"rtx_sm80"`` / ``"amd_cdna3"`` / ``"amd_cdna4"`` /
             ``"amd_rdna3"`` / ``"amd_rdna35"`` / ``"amd_rdna4"`` /
             ``"apple_mps"`` explicitly to
             force a backend (useful for cross-hardware debugging).
@@ -643,16 +645,33 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                       "motus", "wan22_ti2v_5b", "cosmos3_video",
                       "cosmos3_edge", "nexn2", "qwen36_moe", "spark_x25",
                       "flint", "hyvla", "xvla", "ltx25", "dm05", "qwen3_4b", "lawam",
-                      "molmoact2", "vla_jepa"):
+                      "molmoact2", "vla_jepa", "pi05_isomorphic"):
         raise ValueError(
             f"Unknown config: {config}. "
             f"Supported: pi05, groot, groot_n15, groot_n17, pi0, pi0fast, motus, "
             f"wan22_ti2v_5b, cosmos3_video, cosmos3_edge, nexn2, "
             f"qwen36_moe, spark_x25, flint, hyvla, xvla, ltx25, dm05, qwen3_4b, "
-            f"lawam, molmoact2, vla_jepa")
+            f"lawam, molmoact2, vla_jepa, pi05_isomorphic")
     if framework not in ("torch", "jax", "jetson_pi"):
         raise ValueError(
             f"Unknown framework: {framework}. Supported: torch, jax, jetson_pi")
+
+    # Pi0.5 on its trainer's arithmetic: rollouts at any batch width with a
+    # recorded trace, and the trainer that updates the same weights. That is
+    # a rollout/update surface, not predict(images, prompt); registered in
+    # _PIPELINE_MAP for discoverability and constructed directly.
+    if config == "pi05_isomorphic":
+        raise NotImplementedError(
+            "config='pi05_isomorphic' serves rollouts for an on-policy trainer "
+            "(any batch width, recorded denoising trace, the trainer attached) "
+            "and is not served through load_model's predict(images, prompt) "
+            "wrapper. Construct it directly:\n"
+            "    from flash_rt.frontends.torch.pi05_isomorphic import "
+            "Pi05TorchFrontendIsomorphic\n"
+            "    fe = Pi05TorchFrontendIsomorphic(ckpt, denoise_trace=True, sde=True, trainable='expert')\n"
+            "    fe.set_prompt_batch(prompts)\n"
+            "    results = fe.infer_batch(observations, sde_sigma=sigma)\n"
+            "See docs/pi05_isomorphic.md.")
 
     # VLA-JEPA (LeRobot) takes the 8-dim robot state on every call and its
     # NVFP4 block/layer selection is calibrated on real observations before
