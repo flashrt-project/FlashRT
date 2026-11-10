@@ -268,26 +268,7 @@ class NewtonRMSNorm(nn.Module):
         return result.to(original_dtype)
 
 
-class OffsetRMSNorm(nn.Module):
-    """Qwen3.5 normalization: add the weight offset and scale in FP32.
-
-    Keep the original BF16 checkpoint weight. Pre-adding one at conversion
-    time loses low bits when NxDI subsequently casts the checkpoint to BF16.
-    """
-    def __init__(self, hidden_size, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.zeros(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, x):
-        z = x.float()
-        z = z * torch.rsqrt(z.square().mean(-1, keepdim=True) + self.variance_epsilon)
-        return (z * (1.0 + self.weight.float())).to(x.dtype)
-
-
-def get_rmsnorm_cls(config=None):
-    if getattr(config, 'flashrt_faithful_numerics', False):
-        return OffsetRMSNorm
+def get_rmsnorm_cls():
     if cpu_mode() or USE_PYTHON_RMSNORM:
         return Qwen3MoeRMSNorm
     return NewtonRMSNorm if USE_NEWTON_RMSNORM else CustomRMSNorm
@@ -319,7 +300,6 @@ class NeuronGatedDeltaNet(nn.Module):
     def __init__(self, config, layer_idx: int):
         super().__init__()
         tc = config
-        self.flashrt_faithful_numerics = getattr(config, 'flashrt_faithful_numerics', False)
 
         self.hidden_size = tc.hidden_size
         self.tp_degree = tc.neuron_config.tp_degree
@@ -428,7 +408,7 @@ class NeuronGatedDeltaNet(nn.Module):
                 self.num_v_heads,
                 self.head_k_dim,
                 self.head_v_dim,
-                dtype=torch.float32 if self.flashrt_faithful_numerics else config.neuron_config.torch_dtype,
+                dtype=config.neuron_config.torch_dtype,
             ),
             requires_grad=False,
         )
@@ -441,14 +421,6 @@ class NeuronGatedDeltaNet(nn.Module):
             ),
             requires_grad=False,
         )
-
-    def _apply(self, fn, recurse=True):
-        result = super()._apply(fn, recurse=recurse)
-        if self.flashrt_faithful_numerics:
-            # NxDI casts the model to its matrix precision after construction.
-            # The reference retains the recurrent state in FP32 between tokens.
-            self.recurrent_state_buffer.data = self.recurrent_state_buffer.data.float()
-        return result
 
     def _dummy_kv(self, batch_size, seq_len, dtype, device):
         """Zero KV placeholders for the KVCacheManager (DeltaNet carries state in
@@ -1815,8 +1787,8 @@ class NeuronQwen36A3BAttention(NeuronAttentionBase):
 
         # Create QK norm modules (will be passed to base class)
         rms_norm_eps = config.rms_norm_eps
-        q_ln = get_rmsnorm_cls(config)(config.head_dim, rms_norm_eps)
-        k_ln = get_rmsnorm_cls(config)(config.head_dim, rms_norm_eps)
+        q_ln = get_rmsnorm_cls()(config.head_dim, rms_norm_eps)
+        k_ln = get_rmsnorm_cls()(config.head_dim, rms_norm_eps)
 
         # Partial RoPE: use standard RotaryEmbedding.
         # For VL with 3D mRoPE positions, cos/sin are pre-computed externally in
@@ -2432,7 +2404,7 @@ class NeuronMTPHead(nn.Module):
         )
         self.layer_type = layer_type
 
-        rms_cls = get_rmsnorm_cls(config)
+        rms_cls = get_rmsnorm_cls()
         h = config.hidden_size
         eps = config.rms_norm_eps
 
@@ -2532,10 +2504,10 @@ class NeuronQwen36A3BDecoderLayer(nn.Module):
 
         self.mlp = NeuronMoEBlock(config)
 
-        self.input_layernorm = get_rmsnorm_cls(config)(
+        self.input_layernorm = get_rmsnorm_cls()(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.post_attention_layernorm = get_rmsnorm_cls(config)(
+        self.post_attention_layernorm = get_rmsnorm_cls()(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -3015,7 +2987,7 @@ class NeuronQwen36A3BModel(NeuronBaseModel):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm = get_rmsnorm_cls(config)(self.hidden_size, eps=config.rms_norm_eps)
+        self.norm = get_rmsnorm_cls()(self.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = TransposedColumnParallelLinear(
             config.hidden_size,
             config.vocab_size,
@@ -3715,8 +3687,6 @@ def convert_qwen36_a3b_hf_to_neuron_state_dict(neuron_state_dict, config):
     norm_keys_to_convert.append("norm.weight")
 
     for nk in norm_keys_to_convert:
-        if getattr(config, 'flashrt_faithful_numerics', False):
-            continue
         if nk in neuron_state_dict:
             old_val = neuron_state_dict[nk]
             neuron_state_dict[nk] = old_val.float() + 1.0

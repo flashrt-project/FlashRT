@@ -29,34 +29,10 @@ from neuronx_distributed_inference.models.config import OnDeviceSamplingConfig  
 
 from flash_rt.neuron._vendor.qwen36.modeling_qwen36_a3b import (  # noqa: E402
     NeuronQwen36A3BForCausalLM,
-    OffsetRMSNorm,
     Qwen36A3BInferenceConfig,
     convert_qwen36_a3b_hf_to_neuron_state_dict,
     reorder_deltanet_qkv_for_tp,
 )
-
-
-def test_offset_norm_preserves_small_bf16_checkpoint_weights():
-    # BF16 cannot retain 1 + 0.001 at conversion time. The Qwen checkpoint
-    # convention applies the offset in FP32 during normalization instead.
-    layer = OffsetRMSNorm(128).bfloat16()
-    layer.weight.data.fill_(0.001)
-    x = torch.linspace(-2, 2, 256).reshape(2, 128).bfloat16()
-    expected = torch.nn.functional.rms_norm(
-        x.float(), (128,), 1 + layer.weight.float(), eps=1e-6
-    ).bfloat16()
-    torch.testing.assert_close(layer(x), expected, rtol=0, atol=0)
-
-
-def test_faithful_converter_retains_raw_norm_offset():
-    cfg = _make_mini_config()
-    cfg.flashrt_faithful_numerics = True
-    state = {'norm.weight': torch.full((cfg.hidden_size,), 0.001, dtype=torch.bfloat16)}
-    # All the other converter paths require the complete mini model fixture.
-    full = _make_mini_state_dict(cfg)
-    full.update(state)
-    converted = convert_qwen36_a3b_hf_to_neuron_state_dict(full, cfg)
-    torch.testing.assert_close(converted['norm.weight'], state['norm.weight'])
 
 
 # ---------------------------------------------------------------------------

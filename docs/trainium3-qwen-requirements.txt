@@ -1,0 +1,9 @@
+--extra-index-url https://pip.repos.neuron.amazonaws.com
+# Qualified together on Python 3.12; use a separate environment from Neuron JAX.
+torch-neuronx==2.9.0.2.15.32035+de43f57c
+neuronx-distributed-inference==0.10.18399+ed62453e
+neuronx-cc==2.26.6360.0+6f180f47
+nki==0.5.0+28631259367.ga768afa6
+transformers==4.57.6
+numpy==2.5.2
+islpy==2023.2.5
