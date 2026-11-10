@@ -42,7 +42,7 @@ class Qwen36NeuronFrontend:
         compiled_path = Path(compiled_path).resolve()
         raw_config = (checkpoint/'config.json').read_bytes()
         model_config = json.loads(raw_config)
-        if model_config.get('text_config', model_config).get('model_type') != 'qwen3_5_moe':
+        if model_config.get('text_config', model_config).get('model_type') not in ('qwen3_5_moe', 'qwen3_5_moe_text'):
             raise ValueError('Expected Qwen3.6-35B-A3B qwen3_5_moe text architecture')
         source = Path(driver.__file__).parent
         implementation = hashlib.sha256()
