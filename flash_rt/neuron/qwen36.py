@@ -87,11 +87,13 @@ class Qwen36NeuronFrontend:
     def generate(self, prompt, max_new_tokens=32):
         if max_new_tokens < 1:
             raise ValueError('max_new_tokens must be positive')
+        if len(self.tokenizer.encode(prompt)) + max_new_tokens > self.model.neuron_config.seq_len:
+            raise ValueError('Prompt plus requested generation exceeds the compiled window')
         tokens, text = self.driver.generate(self.model, self.tokenizer, prompt, max_new_tokens)
         return {'token_ids': tokens, 'text': text}
 
     def benchmark(self, prompt, max_new_tokens=32, num_runs=10):
-        if num_runs < 2 or max_new_tokens < 1:
-            raise ValueError('Benchmark requires at least two runs and a positive token budget')
-        return self.driver.benchmark_device(self.model, self.tokenizer, prompt,
-                                            max_new_tokens, num_runs=num_runs)
+        if num_runs < 2 or max_new_tokens < 2:
+            raise ValueError('Benchmark requires at least two runs and two generated tokens')
+        from flash_rt.neuron.benchmark import benchmark
+        return benchmark(self, prompt, max_new_tokens, num_runs)
