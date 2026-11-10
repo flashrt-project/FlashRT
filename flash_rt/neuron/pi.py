@@ -245,10 +245,11 @@ class PiNeuronFrontend:
         if self.norm_stats is None:
             from safetensors import safe_open
             with safe_open(ckpt/'model.safetensors', framework='pt', device='cpu') as f:
-                self.norm_stats = {
-                    'state': {s: f.get_tensor('normalize_inputs.buffer_observation_state.'+s).float().numpy() for s in ('mean', 'std')},
-                    'actions': {s: f.get_tensor('unnormalize_outputs.buffer_action.'+s).float().numpy() for s in ('mean', 'std')},
-                }
+                if 'unnormalize_outputs.buffer_action.mean' in f.keys():
+                    self.norm_stats = {
+                        'state': {s: f.get_tensor('normalize_inputs.buffer_observation_state.'+s).float().numpy() for s in ('mean', 'std')},
+                        'actions': {s: f.get_tensor('unnormalize_outputs.buffer_action.'+s).float().numpy() for s in ('mean', 'std')},
+                    }
         self.tokens = None
         self.rng = np.random.default_rng()
 
@@ -268,6 +269,8 @@ class PiNeuronFrontend:
         return sample(self.weights, *args, self.times, pi05=self.pi05)
 
     def infer(self, obs):
+        if self.norm_stats is None:
+            raise ValueError('Robot inference requires checkpoint normalization statistics. Provide norm_stats.json; infer_normalized supports tensor-level inference without them.')
         if self.tokens is None:
             raise ValueError('Call set_prompt before infer')
         images = obs.get('images')
