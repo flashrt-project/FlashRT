@@ -28,7 +28,7 @@ training forward in shuffled minibatches of 3):
 
 | rollout by | batch | step elements that differ from the trainer's | relative rms | log-ratio of a recorded transition, rms | ratio range |
 |---|---|---|---|---|---|
-| native BF16 pipeline | 1 | 15 999–16 000 of 16 000 | 5.6e-3 | 0.11–0.24 (by run) | 0.68–1.54 |
+| native BF16 pipeline | 1 | 15 999–16 000 of 16 000 | 5.6e-3 | 0.11–0.24 (by run) | 0.63–1.54 |
 | native BF16 pipeline | 8 | 127 998–128 000 of 128 000 | 5.9e-3 | 0.17 | 0.63–1.47 |
 | native BF16 pipeline | 32 | 511 997–512 000 of 512 000 | 6.0e-3 | 0.20 | 0.49–1.83 |
 | isomorphic | 1, 8, 32 | 0 of 16 000, 128 000, 512 000 | 0 | 0 | 1–1 |
