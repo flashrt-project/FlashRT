@@ -96,6 +96,7 @@ exclude = ["flash_rt.tests*"]
 # No ``*.so``: this distribution carries no compiled artifact. Kernels are
 # built locally (see README).
 flash_rt = [
+    "neuron/_vendor/qwen36/LICENSE", "neuron/_vendor/qwen36/VENDOR.md",
     "**/*.yaml", "**/*.model", "**/*.json",
     "**/*.cu", "**/*.cuh", "**/*.cpp", "**/*.h",
     "py.typed",
