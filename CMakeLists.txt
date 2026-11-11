@@ -2996,7 +2996,7 @@ if(FLASHRT_ENABLE_PI05_THOR_BF16)
   target_compile_options(pi05_bf16_native_ext PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
 
   set(PI05_BF16_FA2_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/flash_attn_2_src)
-  target_include_directories(pi05_bf16_fa2_ext PRIVATE ${PI05_BF16_FA2_ROOT}
+  target_include_directories(pi05_bf16_fa2_ext PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/csrc ${PI05_BF16_FA2_ROOT}
     ${PI05_BF16_FA2_ROOT}/flash_attn ${PI05_BF16_FA2_ROOT}/cutlass/include)
   target_compile_definitions(pi05_bf16_fa2_ext PRIVATE UNFUSE_FMA FLASH_NAMESPACE=pi05_native_vision_fa2)
   target_compile_options(pi05_bf16_fa2_ext PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
