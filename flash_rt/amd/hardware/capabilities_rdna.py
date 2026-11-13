@@ -1,4 +1,4 @@
-"""Exact RDNA BF16 targets and their setup-time provider bindings."""
+"""Exact RDNA targets and their setup-time provider bindings."""
 
 from dataclasses import dataclass
 
@@ -28,8 +28,8 @@ _TARGETS = {target.gpu_arch: target for target in (RDNA3, RDNA35, RDNA4)}
 SUPPORTED_HARDWARE = tuple(target.hardware for target in _TARGETS.values())
 
 
-def load_capabilities(kernels, device_arch: str, expected_hardware=None):
-    """Validate request, PyTorch device, extension device and compiled ISA."""
+def device_capabilities(device_arch: str, expected_hardware=None):
+    """Validate a Torch/Triton device target without requiring HIP bindings."""
     target = _TARGETS.get(device_arch.split(":", 1)[0])
     if target is None:
         raise RuntimeError(
@@ -39,6 +39,12 @@ def load_capabilities(kernels, device_arch: str, expected_hardware=None):
         raise RuntimeError(
             f"RDNA device {device_arch!r} requires hardware={target.hardware!r}, "
             f"got {expected_hardware!r}")
+    return target
+
+
+def load_capabilities(kernels, device_arch: str, expected_hardware=None):
+    """Validate request, PyTorch device, extension device and compiled ISA."""
+    target = device_capabilities(device_arch, expected_hardware)
     info = dict(kernels.build_info())
     build = str(info.get("gpu_arch", "")).split(":", 1)[0]
     extension_device = str(kernels.device_arch()).split(":", 1)[0]
