@@ -4,8 +4,9 @@
 Prefill: wall time from the token upload to the first generated token (every chunk, the final norm and
 LM head of the last position, token selection). Decode: ``--n-gen`` tokens after the prompt with no stop
 token; tokens/s = (n_gen - 1) / (time after the first token). ``greedy`` is the on-device argmax,
-``default`` is temperature 1, top-p 0.95, top-k 20. Every repetition is printed as one JSON line,
-followed by the median per prompt (and sampling mode).
+``default`` is temperature 1, top-p 0.95, top-k 20. ``--lookup R`` adds ``lookup``: greedy decoding with
+verification steps of up to R positions over n-gram draft tokens (the same tokens as ``greedy``). Every
+repetition is printed as one JSON line, followed by the median per prompt (and sampling mode).
 
 Token fixtures are raw little-endian int32 files (``--make-tokens``), so the reference driver
 (``flint_rec_benchmark.py``) consumes exactly the same ids.
@@ -72,6 +73,8 @@ def main():
     ap.add_argument("--reps", type=int, default=2, help="timed decode runs per prompt and sampling mode")
     ap.add_argument("--sampling", nargs="+", choices=tuple(SAMPLING), default=list(SAMPLING))
     ap.add_argument("--max-seq", type=int, help="KV capacity (default: longest prompt + n-gen + 64)")
+    ap.add_argument("--lookup", type=int, default=0, metavar="R",
+                    help="also time greedy decoding with verification steps of up to R (2..4) positions")
     args = ap.parse_args()
     if args.make_tokens:
         return make_tokens(args)
@@ -89,7 +92,8 @@ def main():
 
     from flash_rt.frontends.torch._flint_mps_runtime import FlintRuntime
     longest = max(len(ids) for _, ids, _ in prompts)
-    rt = FlintRuntime(args.mlx_dir, max_seq=args.max_seq or longest + args.n_gen + 64)
+    rt = FlintRuntime(args.mlx_dir, max_seq=args.max_seq or longest + args.n_gen + 64, verify_rows=args.lookup)
+    modes = list(args.sampling) + (["lookup"] if args.lookup else [])
     print(json.dumps({"event": "loaded", "seconds": round(rt.load_seconds, 2), "max_seq": rt.max_seq}), flush=True)
     for path, ids, digest in prompts:
         n = len(ids)
@@ -111,24 +115,39 @@ def main():
         if args.phase == "prefill":
             continue
         state = rt.sliding_state()   # every decode run starts from this prompt state
-        for mode in args.sampling:
+        for mode in modes:
             rates = []
             for rep in range(args.reps):
-                cfg = dict(SAMPLING[mode])
-                if cfg["program"] == "sampled":
-                    cfg["seed"] = 1000 + rep
                 rt.restore_sliding_state(state)
                 token, pos, made = first, n, 1   # every run continues the prompt from its greedy first token
+                extra = {}
                 t0 = time.perf_counter()
-                while made < args.n_gen:
-                    block = rt.decode(token, pos, min(8, args.n_gen - made), **cfg)
-                    made += len(block)
-                    pos += len(block)
-                    token = block[-1]
+                if mode == "lookup":
+                    from flash_rt.models.flint.lookup import lookup_decode
+                    before = list(rt.verify_stats)
+                    produced = [first]
+                    for block in lookup_decode(rt, ids, first, n, args.n_gen - 1, args.lookup):
+                        produced.extend(block)
+                    stats = [a - b for a, b in zip(rt.verify_stats, before)]
+                    extra = {"verify_steps": stats[0], "drafts": stats[1], "accepted": stats[2],
+                             "sha256": hashlib.sha256(np.asarray(produced, dtype="<i4").tobytes()).hexdigest()}
+                else:
+                    cfg = dict(SAMPLING[mode])
+                    if cfg["program"] == "sampled":
+                        cfg["seed"] = 1000 + rep
+                    produced = [first]
+                    while made < args.n_gen:
+                        block = rt.decode(token, pos, min(8, args.n_gen - made), **cfg)
+                        made += len(block)
+                        pos += len(block)
+                        token = block[-1]
+                        produced.extend(block)
+                    if mode == "greedy":
+                        extra = {"sha256": hashlib.sha256(np.asarray(produced, dtype="<i4").tobytes()).hexdigest()}
                 rate = (args.n_gen - 1) / (time.perf_counter() - t0)
                 rates.append(rate)
                 print(json.dumps({"phase": "decode", "context": n, "sampling": mode, "rep": rep,
-                                  "tok_s": round(rate, 2)}), flush=True)
+                                  "tok_s": round(rate, 2), **extra}), flush=True)
             print(json.dumps({"phase": "decode", "context": n, "sampling": mode, "file": str(path),
                               "median_tok_s": round(statistics.median(rates), 2)}), flush=True)
 

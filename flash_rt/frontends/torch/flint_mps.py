@@ -20,6 +20,7 @@ from typing import Dict, Iterator, List, Optional, Sequence
 
 from flash_rt.frontends.torch._flint_mps_runtime import FlintRuntime
 from flash_rt.models.flint.config import FlintConfig
+from flash_rt.models.flint.lookup import lookup_decode
 from flash_rt.models.flint.pipeline_mps import BLOCK
 from flash_rt.models.flint.tokenizer import FlintTokenizer
 
@@ -30,8 +31,12 @@ class FlintTorchFrontendMps:
     """Greedy or top-k/top-p generation over the native Flint Metal runtime (batch 1)."""
 
     def __init__(self, checkpoint_dir: str, max_seq: int = 32768, chat_template: Optional[str] = None,
-                 library: Optional[str] = None):
-        self.rt = FlintRuntime(checkpoint_dir, max_seq=max_seq, library=library)
+                 library: Optional[str] = None, lookup_rows: int = 0):
+        """``lookup_rows`` (2..4; 0: off): allows ``stream(..., lookup=True)``, greedy generation that verifies
+        n-gram draft tokens from the prompt and the generated text in steps of up to this many positions (the
+        same tokens as plain greedy decoding)."""
+        self.rt = FlintRuntime(checkpoint_dir, max_seq=max_seq, library=library, verify_rows=lookup_rows)
+        self.lookup_rows = int(lookup_rows)
         self.cfg: FlintConfig = self.rt.cfg
         self.tokenizer = FlintTokenizer.from_directory(checkpoint_dir, chat_template=chat_template)
         self.eog = set(self.cfg.eog_token_ids)
@@ -55,7 +60,7 @@ class FlintTorchFrontendMps:
 
     def stream(self, prompt_ids: Sequence[int], max_new_tokens: int = 256, stop_ids: Optional[Sequence[int]] = None,
                reuse_prefix: bool = False, temperature: float = 0.0, top_p: float = 1.0, top_k: int = 20,
-               seed: int = 0) -> Iterator[List[int]]:
+               seed: int = 0, lookup: bool = False) -> Iterator[List[int]]:
         """Continuation of ``prompt_ids`` as it is produced, in blocks of up to eight tokens. Stops after an
         end-of-generation token (included); ``stop_ids=()`` disables stopping. ``temperature=0`` is greedy;
         otherwise top-k (1..32, default 20 as in the reference engine) / top-p sampling with Gumbel noise
@@ -65,7 +70,10 @@ class FlintTorchFrontendMps:
         prompt and generated tokens, at least 64 tokens) and prefill only the rest as a continued chunk. If
         the sliding-window history needed at the reuse position has been overwritten, the full prompt is
         recomputed. Reused positions keep the KV they were given (by prefill, or by decode for generated
-        tokens), so the continuation can differ in rounding from a full prefill of the same tokens."""
+        tokens), so the continuation can differ in rounding from a full prefill of the same tokens.
+
+        ``lookup`` (greedy only, needs ``lookup_rows``): verification steps over n-gram draft tokens; the
+        tokens are those of plain greedy decoding, the blocks have 1 to ``lookup_rows`` tokens."""
         if not prompt_ids:
             raise ValueError("prompt_ids must be non-empty")
         if max_new_tokens < 1:
@@ -76,6 +84,8 @@ class FlintTorchFrontendMps:
         if n + max_new_tokens + BLOCK > self.rt.max_seq:
             raise ValueError(f"prompt {n} + {max_new_tokens} new tokens exceeds max_seq {self.rt.max_seq}")
         program, k = self._sample_config(temperature, top_p, top_k)
+        if lookup and (program != "greedy" or self.lookup_rows < 2):
+            raise ValueError("lookup decoding needs greedy generation (temperature 0) and lookup_rows >= 2")
         stop = list(self.eog if stop_ids is None else stop_ids)
         ids = list(prompt_ids)
         start = 0
@@ -94,6 +104,17 @@ class FlintTorchFrontendMps:
             self._kv_ids = ids
             return
         token, position = first, n
+        if lookup:
+            for block in lookup_decode(self.rt, ids, token, position, max_new_tokens - 1, self.lookup_rows,
+                                       eos=stop):
+                generated.extend(block)
+                hit = next((i for i, t in enumerate(block) if t in stop), None)
+                if hit is not None:
+                    yield block[:hit + 1]
+                    break
+                yield block
+            self._kv_ids = ids + generated[:-1]
+            return
         while len(generated) < max_new_tokens:
             steps = min(BLOCK, max_new_tokens - len(generated))
             block = self.rt.decode(token, position, steps, program=program, top_k=k, top_p=top_p,
