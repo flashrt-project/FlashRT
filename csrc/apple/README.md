@@ -37,6 +37,10 @@ kernels/
   rope_bf16.h
   position_add_bf16.h
   gumbel_noise_f32.h              counter-based Gumbel noise rows for sampling
+flint/                            kernels specialized to Flint's geometry (flint_* entries)
+  flint_decode_resident_bf16.h    resident MoE decode step (int4 affine weights)
+  flint_prefill_rows_bf16.h       prefill rows: embedding, RMSNorm, Q/K norm + RoPE, KV ring copies
+  flint_moe_rows_bf16.h           router top-k, expert count / scan / placement / combine
 kernel_registry.h                dispatch name -> source builder / entry point
 ```
 
@@ -65,12 +69,15 @@ The ICB remains unchanged. Whole surplus threadgroups return before GEMM,
 RMSNorm and GQA work; every per-token producer uses the actual row extent.
 Weight packing, buffer allocation and compilation stay in setup.
 
-The w4a16 affine GEMM / row-vector kernels, the GQA-8 prefill attention and the
-Gumbel noise rows are model independent (shape constraints stated in each
-header). The affine kernels keep MLX affine int4 weights and reproduce MLX's
-arithmetic for each operation, including the reduction orders MLX uses for a
-given row count (split-K partitions, vector paths); the headers state the
-reproduced rule.
+Kernels that hard-code one model's geometry live under `flint/` with a `flint_`
+prefix on file, source builder and registry entry, like `csrc/kernels/flint/` in
+the CUDA tree; the Flint runtime checks the checkpoint geometry against them
+before it compiles anything. The w4a16 affine GEMM / row-vector kernels, the
+GQA-8 prefill attention and the Gumbel noise rows are model independent (shape
+constraints stated in each header). Together they keep the exported MLX affine
+int4 weights and reproduce MLX's arithmetic for each operation, including the
+reduction orders MLX uses for a given row count (split-K partitions, vector
+paths); the headers state the reproduced rule. See `docs/flint_apple_usage.md`.
 
 ## Adding a precision or implementation
 
