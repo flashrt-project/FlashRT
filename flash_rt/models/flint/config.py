@@ -1,4 +1,4 @@
-"""Static geometry of Flint (``FlintForCausalLM``), read from GGUF metadata.
+"""Static geometry of Flint (``FlintForCausalLM``), read from GGUF metadata or a checkpoint's config.json.
 
 Flint is a 49-layer MoE decoder: two leading dense SwiGLU layers, then 47 MoE
 layers (256 routed experts, top-6 sigmoid routing with renormalization, plus
@@ -15,7 +15,7 @@ variants are rejected here rather than silently mis-executed.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -142,6 +142,68 @@ def load_config(gguf: GGUFFile) -> FlintConfig:
         bos_token_id=int(gguf.require("tokenizer.ggml.bos_token_id")),
         eos_token_id=eos,
         eog_token_ids=tuple(int(x) for x in eog) if eog is not None else (eos,),
+    )
+    _validate(cfg)
+    return cfg
+
+
+def config_from_json(config: Mapping, generation: Optional[Mapping] = None) -> FlintConfig:
+    """Geometry from a Hugging Face style ``config.json`` (e.g. an MLX affine-quantized export).
+
+    Applies the same refusals as :func:`load_config`: RoPE exactly on the sliding layers, sigmoid
+    gating with renormalized top-k weights, attention sinks, untied embeddings, no rope scaling.
+    """
+    if config.get("model_type") != ARCH:
+        raise FlintConfigError(f"model_type is {config.get('model_type')!r}, expected {ARCH!r}")
+    n_layer = int(config["num_hidden_layers"])
+    layer_types = list(config["layer_types"])
+    if len(layer_types) != n_layer or set(layer_types) - {"sliding_attention", "full_attention"}:
+        raise FlintConfigError("layer_types must list sliding_attention/full_attention for every layer")
+    sliding = tuple(t == "sliding_attention" for t in layer_types)
+    no_rope = set(int(i) for i in config.get("no_rope_layer_indices", ()))
+    if any((i in no_rope) == s for i, s in enumerate(sliding)):
+        raise FlintConfigError("this pipeline implements RoPE exactly on the sliding-window layers")
+    rope = config.get("rope_parameters") or {}
+    if rope.get("rope_type", "default") != "default" or config.get("rope_scaling"):
+        raise FlintConfigError("rope scaling is not supported")
+    if config.get("partial_rotary_factor", 1.0) != 1.0:
+        raise FlintConfigError("partial rotary is not supported")
+    if str(config.get("scoring_func", config.get("router_score_function", ""))).lower() != "sigmoid":
+        raise FlintConfigError("only sigmoid expert gating is supported")
+    if not config.get("norm_topk_prob", False):
+        raise FlintConfigError("top-k weight renormalization is required")
+    if float(config.get("routed_scaling_factor", 1.0)) != 1.0:
+        raise FlintConfigError("routed scaling factor != 1 is not supported")
+    if not config.get("attention_sink", False):
+        raise FlintConfigError("attention sinks are required")
+    if config.get("tie_word_embeddings", False):
+        raise FlintConfigError("tied embeddings are not supported")
+    dense = [int(i) for i in config.get("mlp_only_layers", ())]
+    if dense != list(range(len(dense))):
+        raise FlintConfigError("dense layers must be the leading layers")
+    eos = (generation or {}).get("eos_token_id", config.get("eos_token_id"))
+    eos = [int(e) for e in (eos if isinstance(eos, (list, tuple)) else [eos])]
+    cfg = FlintConfig(
+        num_layers=n_layer,
+        hidden_size=int(config["hidden_size"]),
+        num_heads=int(config["num_attention_heads"]),
+        num_kv_heads=int(config["num_key_value_heads"]),
+        head_dim=int(config["head_dim"]),
+        vocab_size=int(config["vocab_size"]),
+        dense_intermediate_size=int(config["intermediate_size"]),
+        num_dense_layers=len(dense),
+        num_experts=int(config["num_experts"]),
+        num_experts_per_tok=int(config["num_experts_per_tok"]),
+        expert_intermediate_size=int(config["moe_intermediate_size"]),
+        shared_intermediate_size=int(config["shared_expert_intermediate_size"]),
+        rms_norm_eps=float(config["rms_norm_eps"]),
+        rope_theta=float(rope.get("rope_theta", config.get("rope_theta"))),
+        sliding_window=int(config["sliding_window"]),
+        sliding_layers=sliding,
+        context_length=int(config["max_position_embeddings"]),
+        bos_token_id=int(config["bos_token_id"]),
+        eos_token_id=eos[0],
+        eog_token_ids=tuple(eos),
     )
     _validate(cfg)
     return cfg
