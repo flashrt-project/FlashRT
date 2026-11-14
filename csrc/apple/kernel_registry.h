@@ -8,6 +8,9 @@
 #include "attention/gqa_split_bf16.h"
 #include "conv/patch_pack_bf16.h"
 #include "conv/patch_probe_bf16.h"
+#include "flint/flint_decode_resident_bf16.h"
+#include "flint/flint_moe_rows_bf16.h"
+#include "flint/flint_prefill_rows_bf16.h"
 #include "gemm/bf16_tensor_ops.h"
 #include "gemm/w4a16_affine_qmv.h"
 #include "gemm/w4a16_affine_tensor_ops.h"
@@ -127,6 +130,26 @@ inline constexpr KernelSource kernel_registry[] = {
      [] { return gqa8_causal_prefill_mma_bf16_source(); }},
     // Counter-based Gumbel noise rows for sampling.
     {"gumbel_noise_f32", "gumbel_noise_f32", gumbel_noise_f32_source},
+    // Flint chunked prefill: embedding/norm/Q-K rows, sliding-ring copies, and mixture-of-experts
+    // routing, placement and combination.
+    {"flint_embed_affine8_rows_bf16", "flint_embed_affine8_rows_bf16", flint_prefill_rows_bf16_source},
+    {"flint_rms_rows_bf16", "flint_rms_rows_bf16", flint_prefill_rows_bf16_source},
+    {"flint_qk_norm_rope_kv_rows_bf16", "flint_qk_norm_rope_kv_rows_bf16", flint_prefill_rows_bf16_source},
+    {"flint_kv_ring_copy_bf16", "flint_kv_ring_copy_bf16", flint_prefill_rows_bf16_source},
+    {"flint_router_topk_rows_bf16", "flint_router_topk_rows_bf16", flint_moe_rows_bf16_source},
+    {"flint_expert_count", "flint_expert_count", flint_moe_rows_bf16_source},
+    {"flint_expert_scan", "flint_expert_scan", flint_moe_rows_bf16_source},
+    {"flint_expert_place_bf16", "flint_expert_place_bf16", flint_moe_rows_bf16_source},
+    {"flint_expert_combine_rows_bf16", "flint_expert_combine_rows_bf16", flint_moe_rows_bf16_source},
+    // Flint resident decode step (int4 affine g64 weights, BF16 activations/KV): greedy, fused
+    // top-k/top-p sampling, and the reference attention schedule (with the residual-stream trace) used
+    // for bit-exact qualification.
+    {"flint_decode_resident_bf16", "flint_decode_resident_bf16",
+     [] { return flint_decode_resident_bf16_source(); }},
+    {"flint_decode_resident_sampled_bf16", "flint_decode_resident_bf16",
+     [] { FlintDecodeOptions o; o.sampled = true; return flint_decode_resident_bf16_source(o); }},
+    {"flint_decode_resident_reference_bf16", "flint_decode_resident_bf16",
+     [] { FlintDecodeOptions o; o.exact_attention = true; o.trace = true; return flint_decode_resident_bf16_source(o); }},
 };
 
 inline const KernelSource& find_kernel_source(std::string_view name) {
