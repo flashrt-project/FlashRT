@@ -13,7 +13,9 @@ an Apple Silicon Mac and the plan library is built (``scripts/apple/build_native
   boundary equals the full prefill; a follow-up request reuses the cached
   prefix, and a regenerate whose sliding-window history was overwritten recomputes the prompt;
 * seeded sampling is reproducible and depends on the seed;
-* generation stops after a stop token, inside a decode block.
+* generation stops after a stop token, inside a decode block;
+* every row of a verification step equals the greedy decode step at its position, accepted drafts are
+  committed and rejected ones leave no trace; lookup generation equals greedy generation.
 """
 from __future__ import annotations
 
@@ -40,7 +42,7 @@ PROMPT = [{"role": "user", "content": "Write a Python function that returns the 
 @pytest.fixture(scope="module")
 def fe():
     from flash_rt.frontends.torch.flint_mps import FlintTorchFrontendMps
-    return FlintTorchFrontendMps(MLX_DIR, max_seq=8192, library=str(LIBRARY))
+    return FlintTorchFrontendMps(MLX_DIR, max_seq=8192, library=str(LIBRARY), lookup_rows=4)
 
 
 @pytest.fixture(scope="module")
@@ -140,3 +142,42 @@ def test_stop_token_inside_a_block(fe, chat_ids):
     stop = next(t for i, t in enumerate(tokens) if i >= 3 and t not in tokens[:i])
     cut = tokens.index(stop) + 1
     assert fe.generate(chat_ids, max_new_tokens=16, stop_ids=[stop]) == tokens[:cut]
+
+
+@pytest.mark.parametrize("n", [300, 2600])
+def test_verification_step_matches_greedy_steps(fe, n):
+    rt = fe.rt
+    ids = code_ids(fe, n)
+    first = rt.prefill(ids)
+    state = rt.sliding_state()
+    tokens, ref = [first], []
+    for j in range(7):
+        tokens += rt.decode(tokens[-1], n + j, 1)
+        ref.append(rt.logits(0).copy())
+
+    def decode_on(token, position, steps=2):
+        for _ in range(steps):
+            out = rt.decode(token, position, 1)
+            np.testing.assert_array_equal(rt.logits(0), ref[position - n])
+            token, position = out[0], position + 1
+
+    for rows in (2, 3, 4):
+        rt.restore_sliding_state(state)
+        assert rt.verify(tokens[:rows], n) == tokens[1:rows + 1]
+        for r in range(rows):
+            np.testing.assert_array_equal(rt.verify_logits(r), ref[r])
+        decode_on(tokens[rows], n + rows)      # accepted drafts reached the sliding rings
+        rt.restore_sliding_state(state)
+        wrong = list(tokens[:rows])
+        wrong[-1] = (wrong[-1] + 1) % fe.cfg.vocab_size
+        assert rt.verify(wrong, n) == tokens[1:rows]
+        decode_on(tokens[rows - 1], n + rows - 1)   # the rejected row left no trace
+
+
+def test_lookup_generation_matches_greedy(fe):
+    ids = code_ids(fe, 600)
+    plain = fe.generate(ids, max_new_tokens=96, stop_ids=())
+    before = list(fe.rt.verify_stats)
+    looked = fe.generate(ids, max_new_tokens=96, stop_ids=(), lookup=True)
+    assert looked == plain
+    assert fe.rt.verify_stats[2] > before[2]      # drafts were accepted
