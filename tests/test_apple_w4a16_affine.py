@@ -1,4 +1,5 @@
-"""Affine int4 (group 64) kernels and the multi-program plan API on Metal, against a NumPy reference.
+"""Affine int4 (group 64) kernels (row-vector, dense, split-K and expert-grouped products) and the multi-program
+plan API on Metal, against a NumPy reference.
 
 Skipped unless the host is an Apple Silicon Mac with the plan library built (scripts/apple/build_native.sh).
 """
@@ -120,4 +121,59 @@ def test_split_k_product():
     ref = bf16_to_f32(x).astype(np.float64) @ dequantize(m).astype(np.float64).T
     got = bf16_to_f32(plan.read(y, 0, np.uint16, M * N)).reshape(M, N)
     np.testing.assert_allclose(got, ref, rtol=0, atol=2e-2 * np.abs(ref).max())
+    plan.close()
+
+
+@pytest.mark.parametrize("swiglu", [False, True])
+def test_grouped_product(swiglu):
+    """Expert-grouped product with per-expert row counts that reach every block shape (8-row steps of the
+    64-row expert blocks, full blocks, empty experts) and a partial last column tile."""
+    from flash_rt.hardware.apple_native.native import READ, READ_WRITE, NativePlan
+    from flash_rt.models.flint.mlx_checkpoint import AffineMatrix, bf16_to_f32, dequantize, f32_to_bf16
+    from flash_rt.models.flint.pipeline_mps import GEMM_THREADS, GROUPED_TM, TN
+    rng = np.random.default_rng(13)
+    counts = np.array([0, 1, 7, 8, 9, 16, 17, 24, 25, 32, 33, 40, 41, 48, 49, 56, 57, 63, 64, 65, 100, 130, 0, 3, 200])
+    E, N, K = counts.size, 96, 512
+    total = int(counts.sum())
+    assert total >= 1024           # the grouped kernels serve products from 1024 assignments
+    mats = [_affine(rng, E * N, K) for _ in range(2 if swiglu else 1)]
+    x = f32_to_bf16(rng.standard_normal((total, K)).astype(np.float32))
+    plan = NativePlan(LIBRARY)
+    offsets, size = [], 0
+    for m in mats:
+        for array in (m.codes, m.scales, m.biases):
+            offsets.append(size)
+            size += -(-array.nbytes // 256) * 256
+    weights = plan.buffer(size)
+    for offset, array in zip(offsets, [a for m in mats for a in (m.codes, m.scales, m.biases)]):
+        plan.write(weights, offset, array)
+    starts = np.concatenate(([0], np.cumsum(counts))).astype(np.uint32)
+    tiles = np.concatenate(([0], np.cumsum(-(-counts // GROUPED_TM)))).astype(np.uint32)
+    xb, y, sb, tb = plan.buffer(x.nbytes), plan.buffer(total * N * 2), plan.buffer(starts.nbytes), plan.buffer(tiles.nbytes)
+    state, args = plan.buffer(16), plan.buffer(256)
+    plan.write(xb, 0, x)
+    plan.write(sb, 0, starts)
+    plan.write(tb, 0, tiles)
+    plan.write(state, 0, np.array([0, total, 0, total], np.uint32))
+    second = offsets[3:6] if swiglu else offsets[0:3]
+    plan.write(args, 0, np.frombuffer(_block([total, N, K, K, N, E, 0, 1], offsets[0:3] + second), np.uint8))
+    name = "gemm_w4a16_affine_grouped" + ("_swiglu" if swiglu else "")
+    program = plan.program()
+    plan.dispatch(name, [(xb, 0, READ), (weights, 0, READ), (y, 0, READ_WRITE), (args, 0, READ),
+                         (sb, 0, READ), (tb, 0, READ), (state, 0, READ)],
+                  (-(-N // TN), -(-total // GROUPED_TM) + E, 1), GEMM_THREADS)
+    plan.finish(resident=True)
+    plan.run(program)
+    got = bf16_to_f32(plan.read(y, 0, np.uint16, total * N)).reshape(total, N)
+    xf = bf16_to_f32(x).astype(np.float64)
+    ws = [dequantize(m).astype(np.float64).reshape(E, N, K) for m in mats]
+    for e in range(E):
+        rows = slice(int(starts[e]), int(starts[e + 1]))
+        ref = xf[rows] @ ws[0][e].T
+        if swiglu:
+            u = xf[rows] @ ws[1][e].T
+            ref = ref / (1.0 + np.exp(-ref)) * u
+        if ref.size:
+            np.testing.assert_allclose(got[rows], ref, rtol=0, atol=3e-2 * np.abs(ref).max() + 1e-3,
+                                       err_msg=f"expert {e} ({counts[e]} rows)")
     plan.close()
