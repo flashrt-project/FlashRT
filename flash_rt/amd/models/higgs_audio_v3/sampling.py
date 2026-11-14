@@ -29,7 +29,8 @@ def _sample(LOGITS, CODES, V: tl.constexpr, NC: tl.constexpr, DELAY, BOC: tl.con
         weights = tl.exp((values - maximum) / TEMPERATURE)
         target = _uniform(SEED, STEP, cb) * tl.sum(weights, 0)
         cumulative = tl.cumsum(weights, 0)
-        fallback = V - 1
+        # Rounding at the CDF endpoint must not select a zero-mass token.
+        fallback = tl.max(tl.where(weights > 0, index, 0), 0)
         chosen = tl.min(tl.where((cumulative > target) & (index < V), index, fallback), 0)
     else:
         chosen = tl.min(tl.where((values == maximum) & (index < V), index, V - 1), 0)

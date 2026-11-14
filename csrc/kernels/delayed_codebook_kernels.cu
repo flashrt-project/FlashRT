@@ -123,6 +123,9 @@ __global__ void delayed_codebook_sample_kernel(
     float cumulative = 0.0f;
     int selected = codebook_vocab - 1;
     for (int i = 0; i < codebook_vocab; ++i) {
+      // FP32 rounding can put the target at the CDF endpoint. Fall back
+      // to its last positive weight, never an underflowed zero-mass token.
+      if (weights[i] > 0.0f) selected = i;
       cumulative += weights[i];
       if (target < cumulative) {
         selected = i;

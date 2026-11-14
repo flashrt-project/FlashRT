@@ -5,8 +5,8 @@ import torch
 
 
 def _sampling_kernel():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is unavailable")
+    if torch.version.hip or not torch.cuda.is_available():
+        pytest.skip("requires NVIDIA CUDA")
     try:
         from flash_rt import flash_rt_kernels as kernels
     except ImportError:
@@ -72,3 +72,21 @@ def test_sampling_kernel_matches_categorical_frequency():
     p_zero = float((codes == 0).float().mean())
     assert 0.72 < p_zero < 0.78
     assert set(codes.cpu().tolist()) == {0, 1}
+
+
+def test_sampling_cdf_endpoint_uses_last_positive_probability():
+    kernels = _sampling_kernel()
+    # This seed makes the native FP32 uniform round to exactly 1.0. The
+    # finite negative logits underflow to zero without any vocabulary filter.
+    logits = torch.tensor([[0., 0., -200., -200.]], device="cuda", dtype=torch.bfloat16)
+    codebook = torch.arange(4, device="cuda", dtype=torch.bfloat16).reshape(4, 1)
+    codes = torch.empty(1, device="cuda", dtype=torch.long)
+    embed = torch.empty(1, 1, device="cuda", dtype=torch.bfloat16)
+    _sample(kernels, logits, codebook, codes, embed,
+            delay=1, seed=3558559446808474027, step=0)
+    assert codes.item() == 1  # The old fallback incorrectly selected index 3.
+    assert embed.item() == 1
+    kernels.delayed_codebook_argmax_embed_bf16(
+        logits.data_ptr(), codebook.data_ptr(), codes.data_ptr(), embed.data_ptr(),
+        1, 4, 1, 1, 1024, torch.cuda.current_stream().cuda_stream)
+    assert codes.item() == 0  # Greedy still selects the first tied maximum.

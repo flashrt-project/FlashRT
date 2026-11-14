@@ -400,3 +400,18 @@ def test_qk_norm_keeps_bf16_boundary_before_rope():
     assert torch.equal(k.cpu(), expected[:, nq:nq + nk])
     assert torch.equal(v.cpu(), raw[:, nq + nk:])
 
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_sampling_cdf_endpoint_uses_last_positive_probability(dtype):
+    from flash_rt.amd.models.higgs_audio_v3.sampling import delayed_codebook_sample_embed_bf16
+
+    logits = torch.tensor([[0., 0., -200., -200.]], device="cuda", dtype=dtype)
+    table = torch.arange(4, device="cuda", dtype=torch.bfloat16).reshape(4, 1)
+    codes = torch.empty(1, device="cuda", dtype=torch.long)
+    embed = torch.empty(1, 1, device="cuda", dtype=torch.bfloat16)
+    for temperature, expected in ((1.0, 1), (0.0, 0)):
+        delayed_codebook_sample_embed_bf16(
+            logits, table, codes, embed, delay=1, boc=1024,
+            temperature=temperature, seed=3558559446808474027, step=0)
+        assert codes.item() == expected
+        assert embed.item() == expected
