@@ -95,15 +95,16 @@ inline constexpr KernelSource kernel_registry[] = {
     {"gemm_w4a16_affine_swiglu", "gemm_w4a16_affine",
      [] { W4A16Options o; o.epilogue = 2; return gemm_w4a16_affine_source(o); }},
     {"gemm_w4a16_affine_grouped", "gemm_w4a16_affine",
-     [] { W4A16Options o; o.grouped = true; o.simdgroups = 4; return gemm_w4a16_affine_source(o); }},
+     [] { W4A16Options o; o.grouped = true; return gemm_w4a16_affine_source(o); }},
     {"gemm_w4a16_affine_grouped_swiglu", "gemm_w4a16_affine",
-     [] { W4A16Options o; o.grouped = true; o.simdgroups = 4; o.epilogue = 2; return gemm_w4a16_affine_source(o); }},
+     [] { W4A16Options o; o.grouped = true; o.epilogue = 2; return gemm_w4a16_affine_source(o); }},
+    // Split-K partitions (M <= 512 rows) keep the two-SIMD-group threadgroup qualified against MLX.
     {"gemm_w4a16_affine_splitk", "gemm_w4a16_affine",
-     [] { W4A16Options o; o.splitk = true; return gemm_w4a16_affine_source(o); }},
+     [] { W4A16Options o; o.splitk = true; o.simdgroups = 2; return gemm_w4a16_affine_source(o); }},
     {"gemm_w4a16_affine_splitk_residual", "gemm_w4a16_affine",
-     [] { W4A16Options o; o.splitk = true; o.epilogue = 1; return gemm_w4a16_affine_source(o); }},
+     [] { W4A16Options o; o.splitk = true; o.simdgroups = 2; o.epilogue = 1; return gemm_w4a16_affine_source(o); }},
     {"gemm_w4a16_affine_splitk_swiglu", "gemm_w4a16_affine",
-     [] { W4A16Options o; o.splitk = true; o.epilogue = 2; return gemm_w4a16_affine_source(o); }},
+     [] { W4A16Options o; o.splitk = true; o.simdgroups = 2; o.epilogue = 2; return gemm_w4a16_affine_source(o); }},
     // Affine int4 (group 64) matrix x BF16 row vectors (MLX qmv_fast arithmetic): one vector, and the
     // chunk-row variants used where MLX's matmul takes its vector path (plain, residual, SwiGLU, grouped).
     {"qmv_w4a16_affine", "qmv_w4a16_affine", [] { return qmv_w4a16_affine_source(); }},

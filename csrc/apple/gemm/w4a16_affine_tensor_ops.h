@@ -21,7 +21,7 @@ namespace flashrt::apple::shaders {
 // interleaved BF16 accumulators, then in order; 32: FP32). M below `limit` (MLX's vector-path bound) or a
 // GROUPED product below 1024 assignments is left to the row-vector kernel; each variant returns otherwise.
 struct W4A16Options {
-    int tile_m = 64, tile_n = 64, simdgroups = 2;
+    int tile_m = 64, tile_n = 64, simdgroups = 4;   // threadgroup of simdgroups * 32 threads
     int epilogue = 0;      // 0 store, 1 residual add, 2 SwiGLU (gate/up)
     bool grouped = false;
     bool splitk = false;   // the split-K partition path (non-grouped)

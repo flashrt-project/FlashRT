@@ -36,6 +36,7 @@ def _block(uints, ulongs):
 def test_affine_products_and_programs():
     from flash_rt.hardware.apple_native.native import READ, READ_WRITE, WRITE, NativePlan
     from flash_rt.models.flint.mlx_checkpoint import bf16_to_f32, dequantize, f32_to_bf16
+    from flash_rt.models.flint.pipeline_mps import GEMM_THREADS
     rng = np.random.default_rng(7)
     M, N, K = 544, 512, 512          # one partition (no split-K) for the dense product
     m = _affine(rng, N, K)
@@ -61,7 +62,7 @@ def test_affine_products_and_programs():
     second = plan.program()
     plan.dispatch("gemm_w4a16_affine", [(xb, 0, READ), (weights, 0, READ), (ym, 0, READ_WRITE), (args, mat, READ),
                                         (empty, 0, READ), (empty, 0, READ), (state, 0, READ)],
-                  (N // 64, (M + 63) // 64, 1), 64)
+                  (N // 64, (M + 63) // 64, 1), GEMM_THREADS)
     plan.finish(resident=True)
     assert (first, second) == (1, 2)
     with pytest.raises(RuntimeError, match="sealed"):
@@ -87,4 +88,36 @@ def test_affine_products_and_programs():
         plan.run(3)
     with pytest.raises(RuntimeError, match="unknown program"):
         plan.run(0)                  # nothing was recorded before the first program
+    plan.close()
+
+
+def test_split_k_product():
+    """A product of 40 rows, N = 512, K = 1024 in 16 K partitions: MLX's split-K path for a short chunk's
+    K/V projections."""
+    from flash_rt.hardware.apple_native.native import READ, READ_WRITE, NativePlan
+    from flash_rt.models.flint.mlx_checkpoint import bf16_to_f32, dequantize, f32_to_bf16
+    from flash_rt.models.flint.pipeline_mps import SPLITK_ROW_TILES, SPLITK_THREADS, TM, TN
+    rng = np.random.default_rng(11)
+    M, N, K = 40, 512, 1024
+    m = _affine(rng, N, K)
+    x = f32_to_bf16(rng.standard_normal((M, K)).astype(np.float32))
+    plan = NativePlan(LIBRARY)
+    offsets = [0, m.codes.nbytes, m.codes.nbytes + m.scales.nbytes]
+    weights = plan.buffer(offsets[2] + m.biases.nbytes)
+    for offset, array in zip(offsets, (m.codes, m.scales, m.biases)):
+        plan.write(weights, offset, array)
+    xb, y = plan.buffer(x.nbytes), plan.buffer(M * N * 2)
+    state, empty, args = plan.buffer(16), plan.buffer(1024), plan.buffer(256)
+    plan.write(xb, 0, x)
+    plan.write(state, 0, np.array([0, M, 0, M], np.uint32))
+    plan.write(args, 0, np.frombuffer(_block([M, N, K, K, N, 0, 0, 0], offsets * 2), np.uint8))
+    program = plan.program()
+    plan.dispatch("gemm_w4a16_affine_splitk", [(xb, 0, READ), (weights, 0, READ), (y, 0, READ_WRITE),
+                                               (args, 0, READ), (empty, 0, READ), (empty, 0, READ), (state, 0, READ)],
+                  (N // TN, min(-(-M // TM), SPLITK_ROW_TILES), 1), SPLITK_THREADS)
+    plan.finish(resident=True)
+    plan.run(program)
+    ref = bf16_to_f32(x).astype(np.float64) @ dequantize(m).astype(np.float64).T
+    got = bf16_to_f32(plan.read(y, 0, np.uint16, M * N)).reshape(M, N)
+    np.testing.assert_allclose(got, ref, rtol=0, atol=2e-2 * np.abs(ref).max())
     plan.close()
