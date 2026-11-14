@@ -27,6 +27,7 @@ download command spelled out — no hidden failure modes.
 """
 from __future__ import annotations
 
+import functools
 import os
 from pathlib import Path
 from typing import Optional
@@ -124,13 +125,10 @@ def encode_pi05_prompt(sp, prompt: str) -> list[int]:
     return [sp.bos_id()] + sp.Encode(cleaned) + [108]
 
 
-def load_paligemma_sentencepiece():
-    """Return a loaded `sentencepiece.SentencePieceProcessor` for the
-    PaliGemma model. Raises FileNotFoundError with a helpful download
-    command if the model file can't be located.
-    """
+@functools.lru_cache(maxsize=4)
+def _load_sentencepiece(path: str, mtime_ns: int, size: int):
+    # Keyed by file identity: a replaced model file is loaded again.
     import sentencepiece as spm
-    path = resolve_paligemma_tokenizer_path()
     sp = spm.SentencePieceProcessor()
     if not sp.Load(path):
         raise RuntimeError(
@@ -139,3 +137,17 @@ def load_paligemma_sentencepiece():
             f"  curl -L {_DOWNLOAD_URL} -o {path}"
         )
     return sp
+
+
+def load_paligemma_sentencepiece():
+    """Return a loaded `sentencepiece.SentencePieceProcessor` for the
+    PaliGemma model. Raises FileNotFoundError with a helpful download
+    command if the model file can't be located.
+
+    The parsed model is cached per resolved file (path, mtime, size):
+    per-call prompt updates do not re-read the 4 MB model. Callers only
+    encode with it and must not mutate the shared processor.
+    """
+    path = resolve_paligemma_tokenizer_path()
+    info = os.stat(path)
+    return _load_sentencepiece(path, info.st_mtime_ns, info.st_size)

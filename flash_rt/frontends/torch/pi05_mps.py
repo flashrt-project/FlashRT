@@ -121,6 +121,7 @@ class Pi05TorchFrontendMps:
         )
         self._prompt_buf = torch.empty(max_prompt_len, ENC_D, dtype=self.dtype, device="mps")
         self._prompt_cpu = None
+        self._prompt_mps_len = 0
         self._image_buf = torch.empty(num_views, IMG_HW, IMG_HW, 3, dtype=self.dtype, device="mps")
         self._noise_buf = torch.empty(self.chunk_size, ACTION_DIM, dtype=self.dtype, device="mps")
 
@@ -133,9 +134,17 @@ class Pi05TorchFrontendMps:
             state=state, device="cpu")
         if not 0 < length <= self.max_prompt_len:
             raise ValueError(f"Prompt length {length} exceeds capacity {self.max_prompt_len}")
-        self._prompt_buf[:length].copy_(embeds)
+        # Native replay reads the CPU embeddings directly; the MPS copy is made
+        # only when the Torch MPS path consumes it.
         self._prompt_cpu = embeds.detach().cpu().contiguous()
+        self._prompt_mps_len = 0
         self._prompt_len, self._prompt_text = length, prompt_text
+
+    def _prompt_mps(self):
+        if self._prompt_mps_len != self._prompt_len:
+            self._prompt_buf[:self._prompt_len].copy_(self._prompt_cpu[:self._prompt_len])
+            self._prompt_mps_len = self._prompt_len
+        return self._prompt_buf[:self._prompt_len]
 
     @torch.inference_mode()
     def forward_with_fixed_noise(self, images_nhwc, noise, *, capture_probes=False, use_graph=False):
@@ -144,7 +153,7 @@ class Pi05TorchFrontendMps:
         if not self._prompt_len:
             raise RuntimeError("set_prompt must be called before inference")
         return self.pipeline.forward_with_inputs(
-            images_nhwc, self._prompt_buf[:self._prompt_len], self._prompt_len,
+            images_nhwc, self._prompt_mps(), self._prompt_len,
             noise, capture_probes=capture_probes)
 
     @torch.inference_mode()
