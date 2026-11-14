@@ -97,16 +97,17 @@ rows: its row-wise operations (norms, projections, routing, expert products,
 whose values do not depend on the row count above 512 rows) run once over all
 rows, while attention is dispatched per chunk with that chunk's position, rows
 and sliding window, so the result equals separate chunks bit for bit and the
-larger expert blocks make the expert products faster. Per layer: RMSNorm rows, Q/K/V GEMMs, Q/K norm + RoPE with KV
-publication, GQA-8 attention with sinks (sliding layers through a linear
-scratch of the 513 preceding positions), o-proj with residual, router top-6,
-expert counting/placement, expert-grouped gate/up (SwiGLU) and down GEMMs, the
-shared expert and the weighted combination. After the last chunk, the final
-norm and LM head of the last position give the first token's logits. Attention
-runs on SIMD-group matrix multiplies (`gqa8_causal_prefill_mma_bf16`, one SIMD group
-per position's eight query heads); `FlintRuntime(..., prefill_attention="tensor_ops")`
-selects the TensorOps kernel with the same arithmetic. Each program is recorded
-once; a chunk's start, row count and ring layout are read from a state buffer.
+larger expert blocks make the expert products faster. Per layer: RMSNorm rows,
+Q/K/V GEMMs, Q/K norm + RoPE with KV publication, GQA-8 attention with sinks
+(sliding layers through a linear scratch of the 513 preceding positions),
+o-proj with residual, router top-6, expert counting/placement, expert-grouped
+gate/up (SwiGLU) and down GEMMs, the shared expert and the weighted
+combination. After the last chunk, the final norm and LM head of the last
+position give the first token's logits. Attention runs on SIMD-group matrix
+multiplies (`gqa8_causal_prefill_mma_bf16`, one SIMD group per position's eight
+query heads); `FlintRuntime(..., prefill_attention="tensor_ops")` selects the
+TensorOps kernel with the same arithmetic. Each program is recorded once; a
+chunk's start, row count and ring layout are read from a state buffer.
 
 ## Numerics
 
@@ -190,8 +191,10 @@ Setup: Mac mini, M4 Pro (20-core GPU), 64 GB, macOS 26.7.3. Reference engine:
 rec v0.1.1 (release build, MLX 0.32.0, its bundled Python 3.12.12). Both
 engines read the same checkpoint files (revision above) and the same token ids
 (see *Reproduce*), batch 1. Reference engine runs were interleaved with
-FlashRT's (reference, FlashRT, reference) for the prompts up to 8K; the two
-reference values bracket a thermal drift of about 5-8% between passes.
+FlashRT's: reference, FlashRT, reference for the prompts up to 8K (the two
+reference values bracket a thermal drift of about 5-10% between passes); two
+alternating rounds of each engine at 32K; one run of each engine, reference
+first, at 16K, 64K and 128K.
 
 ### Prefill
 
@@ -201,16 +204,17 @@ of 16K tokens and longer: one run.
 
 | Prompt | Reference engine | FlashRT | Speedup |
 |---|---|---|---|
-| 1,024 | 1.11-1.20 s | 1.01 s | 1.10-1.19x |
-| 2,048 | 2.27-2.47 s | 1.79 s | 1.27-1.38x |
-| 4,096 | 5.10-5.27 s | 3.77 s | 1.35-1.40x |
-| 8,192 | 11.33-11.62 s | 8.42 s | 1.35-1.38x |
-| 16,384 | 25.2 s | 19.0 s | 1.33x |
-| 32,768 | 57.3 s | 50.2 s | 1.14x |
-| 65,536 | 175.3 s | 143.3 s | 1.22x |
-| 131,072 | 556.9 s | 472.0 s | 1.18x |
+| 1,024 | 1.11-1.24 s | 1.01 s | 1.10-1.22x |
+| 2,048 | 2.28-2.56 s | 1.81 s | 1.26-1.41x |
+| 4,096 | 5.13-5.41 s | 3.66 s | 1.40-1.48x |
+| 8,192 | 11.62-11.73 s | 7.80 s | 1.49-1.50x |
+| 16,384 | 25.6 s | 18.1 s | 1.41x |
+| 32,768 | 57.0-62.9 s | 47.4-47.9 s | 1.19-1.33x |
+| 65,536 | 174.9 s | 140.1 s | 1.25x |
+| 131,072 | 551.0 s | 457.2 s | 1.21x |
 
-The 16K reference value is from an earlier session on the same machine.
+Single prefill runs of the reference engine at long prompts vary by about 10%
+(32K: 57.0 and 62.9 s in the two rounds), FlashRT's by about 1%.
 
 ### Decode
 
@@ -222,11 +226,14 @@ first token to the last.
 
 | Context | Greedy, reference engine | Greedy, FlashRT | Default, reference engine | Default, FlashRT |
 |---|---|---|---|---|
-| 1K | 133.6 | 137.2 (+3%) | 124.4 | 136.9 (+10%) |
-| 16K | 99.6 | 108.4 (+9%) | 94.9 | 109.4 (+15%) |
-| 32K | 80.2 | 84.9 (+6%) | 75.7 | 84.7 (+12%) |
-| 64K | 54.3 | 66.7 (+23%) | 52.7 | 66.1 (+25%) |
-| 128K | 32.5 | 44.6 (+37%) | 31.5 | 44.0 (+40%) |
+| 1K | 132.9-133.4 | 137.6 (+3%) | 123.9-124.3 | 137.1 (+10-11%) |
+| 2K | 130.0-130.4 | 135.2 (+4%) | 121.4-121.9 | 134.5 (+10-11%) |
+| 4K | 122.3-124.6 | 131.0 (+5-7%) | 113.7-116.7 | 130.4 (+12-15%) |
+| 8K | 112.1-114.6 | 123.3 (+8-10%) | 106.5-108.2 | 122.6 (+13-15%) |
+| 16K | 97.0 | 109.3 (+13%) | 92.9 | 108.6 (+17%) |
+| 32K | 77.3-78.6 | 90.6-90.8 (+15-18%) | 74.6-75.4 | 90.3-90.5 (+20-21%) |
+| 64K | 54.3 | 67.9 (+25%) | 53.2 | 67.8 (+27%) |
+| 128K | 32.8 | 45.1 (+38%) | 32.3 | 44.7 (+39%) |
 
 ### Reproduce
 
