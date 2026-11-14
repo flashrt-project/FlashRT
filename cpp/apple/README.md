@@ -83,7 +83,8 @@ an error), residency covers all of them, and
 program 0 is unknown when nothing was recorded before the first additional
 program. `frt_apple_plan_profile_program` is the per-operation diagnostic of an
 additional program. The torch-free `flash_rt.hardware.apple_native.native.NativePlan`
-binding records only additional programs.
+binding records only additional programs; `tests/test_apple_w4a16_affine.py`
+covers the API and its error paths.
 
 ### Fixed vision + prefix + decoder replay
 
