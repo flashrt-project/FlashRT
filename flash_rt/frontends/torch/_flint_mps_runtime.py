@@ -26,10 +26,12 @@ from flash_rt.models.flint.mlx_checkpoint import AffineMatrix, MLXCheckpoint, bf
 from flash_rt.models.flint.pipeline_mps import (
     ATTENTION, BLOCK, D_BIAS, D_DOWN, D_EMBED, D_FINAL_NORM, D_FLAGS, D_GATE, D_HEAD, D_IN_NORM, D_K, D_K_NORM,
     D_KV, D_KV_CAP, D_O, D_POST_NORM, D_Q, D_Q_NORM, D_ROUTER, D_SH_DOWN, D_SH_GATE, D_SH_UP, D_SINKS, D_UP, D_V,
-    DECODE_KERNELS, DESCRIPTOR, GROUPED_TM, SMALL_ROWS, WORKERS, FlintPipelineMps, FlintPrefillMps, check_geometry)
+    DECODE_KERNELS, DESCRIPTOR, GROUPED_TM, SMALL_ROWS, STATE_WORDS, WORKERS, FlintPipelineMps, FlintPrefillMps,
+    check_geometry)
 
 ALIGN = 256
 MAX_CHUNK = 2048                # prefill chunk limit (router split-K and expert tiling rules assume <= 2048 rows)
+WIDE_CHUNKS = 4                 # prefill chunks whose row-wise operations run as one program
 WORKSPACE = 78848               # BF16 elements: q/k/v, attention output, o, dense gate/up/act, expert outputs
 PARTIALS = 32 * 1024 * 128 // 2  # FP32: per-head partitions x 128 (or BF16 rounded partitions)
 STATISTICS = 32 * 1024 * 2
@@ -62,7 +64,7 @@ _PARAM_LAYOUTS = {
     "rms": (("hidden", "last"), ("w",), ("eps", "pad2")),
     "qmv": (("inner", "columns", "x_stride", "y_stride", "limit", "experts", "per_row", "pad"),
             ("w", "s", "b", "w2", "s2", "b2", "x", "y"), ()),
-    "qk": (("q_heads", "kv_heads", "sliding", "cap", "scratch", "pad0", "pad1", "pad2"), ("q_norm", "k_norm", "kv"),
+    "qk": (("q_heads", "kv_heads", "sliding", "cap", "scratch", "block", "pad1", "pad2"), ("q_norm", "k_norm", "kv"),
            ("eps", "logbase", "pad3", "pad4")),
     "ring": (("kv_heads", "ring", "scratch_cap", "window"), ("ring_kv", "scratch_kv"), ()),
     "attention": (("kv_heads", "cap", "sliding", "window"), ("kv", "sinks"), ("scale", "pad")),
@@ -77,15 +79,20 @@ class FlintRuntime(FlintPipelineMps, FlintPrefillMps):
 
     def __init__(self, checkpoint_dir: str, max_seq: int = 32768, library: Optional[str] = None,
                  prefill_chunk: int = MAX_CHUNK, prefill_layers: int = 0, layer_programs=(),
-                 prefill_attention: Optional[str] = None):
+                 prefill_attention: Optional[str] = None, wide_chunks: int = WIDE_CHUNKS):
         """``prefill_chunk``: rows per prefill chunk (the reference engine uses 2048 on M4 Pro / M4 Max; a
-        different value changes the chunking and hence the rounding). ``prefill_attention``: key of
-        ``pipeline_mps.ATTENTION``. ``prefill_layers`` / ``layer_programs``: diagnostics (prefill only the
-        first layers; extra single-layer programs over the residual stream in ``h``)."""
+        different value changes the chunking and hence the rounding). ``wide_chunks``: up to this many
+        consecutive full chunks run their row-wise operations (products, routing, experts) as one program,
+        with attention still per chunk; the result is the same, the larger expert blocks are faster.
+        ``prefill_attention``: key of ``pipeline_mps.ATTENTION``. ``prefill_layers`` / ``layer_programs``:
+        diagnostics (prefill only the first layers; extra single-layer programs over the residual stream in
+        ``h``)."""
         if max_seq < 1:
             raise ValueError("max_seq must be positive")
         if not 1 <= prefill_chunk <= MAX_CHUNK:
             raise ValueError(f"prefill_chunk must be in [1, {MAX_CHUNK}]")
+        if wide_chunks < 1 or (wide_chunks > 1 and prefill_chunk < SMALL_ROWS):
+            raise ValueError("wide_chunks must be >= 1, and 1 for chunks below the large-row paths")
         if prefill_attention is not None and prefill_attention not in ATTENTION:
             raise ValueError(f"prefill_attention must be one of {sorted(ATTENTION)}")
         self.ckpt = MLXCheckpoint(checkpoint_dir)
@@ -103,18 +110,24 @@ class FlintRuntime(FlintPipelineMps, FlintPrefillMps):
         self.ckpt.close()   # weights now live in the Metal buffer; release the shard mappings
         self._allocate_state()
         self.prefill_chunk = int(prefill_chunk)
-        self._allocate_prefill(self.prefill_chunk)
+        self.wide_chunks = int(wide_chunks)
+        self._allocate_prefill(self.prefill_chunk * self.wide_chunks)
         self.vocab_param = self.param("uint", value=self.cfg.vocab_size)
         self.programs = {name: self.record_decode(kernel) for name, kernel in DECODE_KERNELS.items()}
         self.programs["noise"] = self.record_noise()
         self.programs["prefill"] = self.record_prefill(self.prefill_chunk, prefill_layers)
         self.programs["prefill_small"] = self.record_prefill(self.prefill_chunk, prefill_layers, small=True)
+        if self.wide_chunks > 1:
+            self.programs["prefill_wide"] = self.record_prefill(self.prefill_chunk * self.wide_chunks, prefill_layers,
+                                                                block=self.prefill_chunk)
         self.programs["prefill_head"] = self.record_prefill_head()
         for i in layer_programs:   # single-layer programs over the residual stream in `h` (diagnostics)
             self.programs[f"prefill_layer{i}"] = self.record_prefill(self.prefill_chunk, i + 1, first=i)
         self.plan.write(self.buf["args"], 0, np.frombuffer(bytes(self._param_blob), dtype=np.uint8))
         self.plan.finish(resident=True)
-        self._state = self.plan.view(self.buf["state"], np.uint32, 4)
+        self._state = self.plan.view(self.buf["state"], np.uint32, STATE_WORDS)
+        self._chunk_states = self.plan.view(self.buf["state"], np.uint32, STATE_WORDS * self.wide_chunks,
+                                            offset=4 * STATE_WORDS).reshape(self.wide_chunks, STATE_WORDS)
         self._params = self.plan.view(self.buf["params"], np.uint32, 16)
         self._packet = self.plan.view(self.buf["packet"], np.uint32, 17)
         self._diagnostic = self.plan.view(self.buf["diagnostic"], np.uint32, WORKERS)
@@ -239,7 +252,7 @@ class FlintRuntime(FlintPipelineMps, FlintPrefillMps):
         cfg = self.cfg
         H, W, K = cfg.hidden_size, cfg.sliding_window, cfg.num_experts_per_tok
         sizes = {
-            "tokens": self.max_seq * 4, "state": 16,
+            "tokens": self.max_seq * 4, "state": 4 * STATE_WORDS * (1 + self.wide_chunks),
             "h": C * H * 2, "n": C * H * 2, "qkv": C * cfg.qkv_dim * 2, "qt": C * cfg.q_dim * 2,
             "attn": C * cfg.q_dim * 2, "act": C * cfg.dense_intermediate_size * 2,
             "scratch": 2 * cfg.num_kv_heads * (W + C) * cfg.head_dim * 2,
@@ -296,13 +309,23 @@ class FlintRuntime(FlintPipelineMps, FlintPrefillMps):
             self.swa_kv_start = 0
         pos = start
         timings = []
-        # Every chunk leaves the sliding rings laid out linearly behind its end; the last chunk's layout is
-        # that of an n-token prefill (initial = n), the decode step's slot rule.
+        # Every program leaves the sliding rings laid out linearly behind its end; the last one's layout is
+        # that of an n-token prefill (initial = n), the decode step's slot rule. Consecutive full chunks share
+        # one wide program; a last chunk below SMALL_ROWS rows takes the small-chunk program.
+        chunk = self.prefill_chunk
         while pos < n:
-            rows = min(self.prefill_chunk, n - pos)
+            rows = min(chunk * self.wide_chunks, n - pos)
+            if rows > chunk and SMALL_ROWS > rows % chunk > 0:
+                rows -= rows % chunk
             end = pos + rows
-            self._state[:4] = (pos, rows, self.initial, end)
-            timings.append(self.plan.run(self.programs["prefill_small" if rows < SMALL_ROWS else "prefill"]))
+            self._state[:] = (pos, rows, self.initial, end)
+            if rows > chunk:
+                for c in range(self.wide_chunks):
+                    self._chunk_states[c] = (pos + c * chunk, max(0, min(chunk, rows - c * chunk)), self.initial, end)
+                program = "prefill_wide"
+            else:
+                program = "prefill_small" if rows < SMALL_ROWS else "prefill"
+            timings.append(self.plan.run(self.programs[program]))
             self.swa_kv_start = max(self.swa_kv_start, end - self.cfg.sliding_window)
             self.initial = end
             pos = end

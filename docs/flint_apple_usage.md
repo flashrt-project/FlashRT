@@ -92,7 +92,12 @@ engine's attention schedule, used for bit-exact qualification; it also writes
 the residual stream after every layer, `FlintRuntime.trace`).
 
 Prefill: chunks of up to 2048 positions (the reference engine's chunk size on
-M4 Pro/Max). Per layer: RMSNorm rows, Q/K/V GEMMs, Q/K norm + RoPE with KV
+M4 Pro/Max). Up to four consecutive full chunks share one program of up to 8192
+rows: its row-wise operations (norms, projections, routing, expert products,
+whose values do not depend on the row count above 512 rows) run once over all
+rows, while attention is dispatched per chunk with that chunk's position, rows
+and sliding window, so the result equals separate chunks bit for bit and the
+larger expert blocks make the expert products faster. Per layer: RMSNorm rows, Q/K/V GEMMs, Q/K norm + RoPE with KV
 publication, GQA-8 attention with sinks (sliding layers through a linear
 scratch of the 513 preceding positions), o-proj with residual, router top-6,
 expert counting/placement, expert-grouped gate/up (SwiGLU) and down GEMMs, the

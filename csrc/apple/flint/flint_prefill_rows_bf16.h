@@ -63,12 +63,14 @@ kernel void flint_rms_rows_bf16(const device bfloat* x [[buffer(0)]],const devic
 
 struct QkRows {
     uint q_heads, kv_heads, sliding, cap;   // cap: KV slots per head (global: max_seq; sliding: linear scratch rows)
-    uint scratch, pad0, pad1, pad2;         // sliding: scratch row of position pos0 (== window)
+    uint scratch, block, pad1, pad2;        // sliding: scratch row of position pos0 (== window); block: rows
+                                            // of one attention sub-chunk (0: the whole chunk)
     ulong q_norm, k_norm, kv;               // weight byte offsets; KV element offset of this layer
     float eps, logbase, pad3, pad4;
 };
 // One threadgroup per row: RMSNorm per head (Q and K), NeoX RoPE on sliding layers, Q written KV-head-major
-// [kv_head][row][group][128]; K/V written to the layer's cache (global, slot = position) or to the linear
+// per attention sub-chunk of `block` rows ([sub-chunk][kv_head][row][group][128], each sub-chunk region
+// block * q_heads * 128 long); K/V written to the layer's cache (global, slot = position) or to the linear
 // scratch (sliding, slot = scratch + row). Layout of a KV region: K [kv_heads][cap][128] then V.
 kernel void flint_qk_norm_rope_kv_rows_bf16(const device bfloat* qkv [[buffer(0)]],const device uchar* weights [[buffer(1)]],
     device bfloat* q_out [[buffer(2)]],device bfloat* kv [[buffer(3)]],constant QkRows& p [[buffer(4)]],
@@ -110,7 +112,8 @@ kernel void flint_qk_norm_rope_kv_rows_bf16(const device bfloat* qkv [[buffer(0)
         device bfloat* dst;
         if(head<p.q_heads) {
             uint g=head/group_size,j=head%group_size;
-            dst=q_out+((size_t(g)*rows+row)*group_size+j)*128u;
+            uint block=p.block?p.block:rows,sub=row/block,local=row%block,sub_rows=min(block,rows-sub*block);
+            dst=q_out+size_t(sub)*block*p.q_heads*128u+((size_t(g)*sub_rows+local)*group_size+j)*128u;
         } else if(!is_v) {
             uint kh=head-p.q_heads;
             dst=kv+p.kv+(size_t(kh)*p.cap+slot)*128u;
