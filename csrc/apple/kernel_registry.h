@@ -151,6 +151,14 @@ inline constexpr KernelSource kernel_registry[] = {
      [] { FlintDecodeOptions o; o.sampled = true; return flint_decode_resident_bf16_source(o); }},
     {"flint_decode_resident_reference_bf16", "flint_decode_resident_bf16",
      [] { FlintDecodeOptions o; o.exact_attention = true; o.trace = true; return flint_decode_resident_bf16_source(o); }},
+    // Verification step over 2..4 consecutive positions (the last token plus draft tokens), each row's
+    // arithmetic that of the greedy resident step.
+    {"flint_decode_verify2_bf16", "flint_decode_verify_bf16",
+     [] { FlintDecodeOptions o; o.verify_rows = 2; return flint_decode_resident_bf16_source(o); }},
+    {"flint_decode_verify3_bf16", "flint_decode_verify_bf16",
+     [] { FlintDecodeOptions o; o.verify_rows = 3; return flint_decode_resident_bf16_source(o); }},
+    {"flint_decode_verify4_bf16", "flint_decode_verify_bf16",
+     [] { FlintDecodeOptions o; o.verify_rows = 4; return flint_decode_resident_bf16_source(o); }},
 };
 
 inline const KernelSource& find_kernel_source(std::string_view name) {
