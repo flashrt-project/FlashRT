@@ -190,11 +190,14 @@ so a single reordering moves the 1K KL by about 0.1.
 Setup: Mac mini, M4 Pro (20-core GPU), 64 GB, macOS 26.7.3. Reference engine:
 rec v0.1.1 (release build, MLX 0.32.0, its bundled Python 3.12.12). Both
 engines read the same checkpoint files (revision above) and the same token ids
-(see *Reproduce*), batch 1. Reference engine runs were interleaved with
-FlashRT's: reference, FlashRT, reference for the prompts up to 8K (the two
-reference values bracket a thermal drift of about 5-10% between passes); two
-alternating rounds of each engine at 32K; one run of each engine, reference
-first, at 16K, 64K and 128K.
+(see *Reproduce*), batch 1, both in the foreground at normal priority (as a
+background job at reduced priority, zsh's default for `&` jobs, FlashRT's 4K
+decode was about 7% slower and the reference engine's 2-3%). Reference engine
+runs were interleaved with FlashRT's: reference, FlashRT, reference for the
+prompts up to 8K (the two reference values bracket a thermal drift of up to
+about 10% between passes); the same order at 16K with a two-minute pause before
+each run; three rounds at 32K; one run of each engine, reference first, at 64K
+and 128K.
 
 ### Prefill
 
@@ -204,22 +207,23 @@ of 16K tokens and longer: one run.
 
 | Prompt | Reference engine | FlashRT | Speedup |
 |---|---|---|---|
-| 1,024 | 1.11-1.25 s | 0.99 s | 1.12-1.26x |
-| 2,048 | 2.58-2.61 s | 1.80 s | 1.43-1.45x |
-| 4,096 | 5.38-5.45 s | 3.71 s | 1.45-1.47x |
-| 8,192 | 11.50-11.88 s | 8.01 s | 1.44-1.48x |
-| 16,384 | 26.0 s | 18.3 s | 1.42x |
-| 32,768 | 57.2-64.4 s | 48.4-52.4 s | 1.18-1.23x |
-| 65,536 | 176.4 s | 140.5 s | 1.26x |
-| 131,072 | 561.4 s | 464.2 s | 1.21x |
+| 1,024 | 1.11-1.28 s | 0.96 s | 1.16-1.33x |
+| 2,048 | 2.44-2.67 s | 1.82 s | 1.34-1.46x |
+| 4,096 | 5.39-5.79 s | 3.87 s | 1.39-1.50x |
+| 8,192 | 11.94-12.27 s | 8.18 s | 1.46-1.50x |
+| 16,384 | 22.96-22.98 s | 16.45 s | 1.40x |
+| 32,768 | 58.4-66.1 s | 48.3-50.6 s | 1.19-1.36x |
+| 65,536 | 178.9 s | 145.9 s | 1.23x |
+| 131,072 | 603.1 s | 473.1 s | 1.27x |
 
-Single prefill runs at long prompts vary by up to about 10% within a session
-(32K, two rounds: reference engine 57.2 and 64.4 s, FlashRT 48.4 and 52.4 s),
-so the 32K speedups (prefill and decode) are given per adjacent pair.
-Absolute values of both engines also move by up to about 7% between sessions
-on this machine (128K decode, with unchanged decode kernels: FlashRT 45.1 and
-42.0 tok/s, the reference engine 32.8 and 30.4 tok/s), so compare the engines
-within one session.
+Single runs at long prompts vary by up to about 12% within a session (32K
+prefill, three rounds: reference engine 58.4, 65.5 and 66.1 s, FlashRT 48.3 to
+50.6 s), so the 32K speedups (prefill and decode) are given per adjacent pair.
+The machine's thermal state moves both engines, FlashRT's decode more: at 16K,
+run right after the shorter prompts, the reference engine prefilled in 26.8 s
+and decoded at 91.5 tok/s, FlashRT in 20.4 s and at 96.2 tok/s; after
+two-minute pauses (the table), 23.0 and 16.4 s, 99.4 and 111.4 tok/s. Absolute
+values also move between sessions, so compare the engines within one session.
 
 ### Decode
 
@@ -231,14 +235,14 @@ first token to the last.
 
 | Context | Greedy, reference engine | Greedy, FlashRT | Default, reference engine | Default, FlashRT |
 |---|---|---|---|---|
-| 1K | 132.8-133.4 | 137.3 (+3%) | 123.9-124.2 | 136.5 (+10%) |
-| 2K | 129.1-130.0 | 135.0 (+4-5%) | 121.4 | 134.3 (+11%) |
-| 4K | 121.3-122.6 | 129.8 (+6-7%) | 115.5-116.9 | 128.8 (+10-11%) |
-| 8K | 112.2-113.4 | 122.4 (+8-9%) | 106.0-108.2 | 121.2 (+12-14%) |
-| 16K | 95.7 | 107.8 (+13%) | 91.8 | 106.9 (+16%) |
-| 32K | 72.4-77.1 | 82.4-90.1 (+14-17%) | 67.4-73.9 | 82.7-89.7 (+21-23%) |
-| 64K | 52.6 | 67.7 (+29%) | 53.4 | 67.5 (+26%) |
-| 128K | 30.4 | 42.0 (+38%) | 30.9 | 42.9 (+39%) |
+| 1K | 131.2-133.5 | 137.0 (+3-4%) | 121.2-124.4 | 132.8 (+7-10%) |
+| 2K | 125.9-130.4 | 131.7 (+1-5%) | 118.5-121.6 | 131.5 (+8-11%) |
+| 4K | 119.4-124.2 | 127.9 (+3-7%) | 113.6-116.0 | 127.3 (+10-12%) |
+| 8K | 108.1-111.4 | 120.9 (+9-12%) | 104.6-105.6 | 120.2 (+14-15%) |
+| 16K | 99.4-99.5 | 111.4 (+12%) | 94.7 | 111.0 (+17%) |
+| 32K | 69.1-75.9 | 86.9-89.5 (+18-26%) | 66.5-73.1 | 87.0-88.9 (+22-31%) |
+| 64K | 50.1 | 63.5 (+27%) | 49.3 | 64.0 (+30%) |
+| 128K | 29.7 | 42.0 (+41%) | 29.5 | 41.9 (+42%) |
 
 ### Reproduce
 
@@ -275,9 +279,9 @@ PYTHONPATH=. python examples/apple/flint_benchmark.py --mlx-dir "<path-to-flint-
     --prefill-reps 0 --tokens $P-16384.i32 $P-32768.i32 $P-65536.i32 $P-131072.i32
 ```
 
-Run the two engines in separate processes and alternate them (reference,
-FlashRT, reference) so thermal drift shows up as the spread of the reference
-values. The reference driver replaces the stop tokens with the reserved id
+Run the two engines in separate processes, in the foreground, and alternate
+them (reference, FlashRT, reference) so thermal drift shows up as the spread of
+the reference values. The reference driver replaces the stop tokens with the reserved id
 150143, discards each prompt's first decode run, which pays the prefill, and
 sets `MLX_METAL_FAST_SYNCH=1`, the default of rec's own launcher
 (`--fast-sync`). The FlashRT driver restores the prompt's sliding-window state
