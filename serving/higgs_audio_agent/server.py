@@ -113,10 +113,8 @@ def main():
 
     import uvicorn
 
-    from flash_rt.frontends.torch.higgs_audio_v3_rtx import (
-        HiggsAudioV3TorchFrontendRtx,
-    )
-    fe = HiggsAudioV3TorchFrontendRtx(
+    from flash_rt.models.higgs_audio_v3 import create_frontend
+    fe = create_frontend(
         args.checkpoint, device=args.device, max_seq=args.max_seq,
         fp8=False if args.bf16 else None)   # None: auto-select by GPU
     if args.warmup:                            # capture graph + load codec once

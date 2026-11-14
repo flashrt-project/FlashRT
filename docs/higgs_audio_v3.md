@@ -288,6 +288,14 @@ python examples/higgs_audio_v3_quickstart.py \
 
 ---
 
+### Native sampling CDF endpoint
+
+The categorical sampler falls back to the last positive-probability token when
+FP32 rounding puts its random target at the end of the cumulative distribution.
+Previously it could select the last vocabulary entry even when its computed
+probability had underflowed to zero. This correction changes that rare sampled
+case; the default greedy path does not use the CDF.
+
 ## 8. Notes & limitations
 
 - **FP8 calibration** is per-tensor static (activation `amax/448`), measured
@@ -306,9 +314,9 @@ python examples/higgs_audio_v3_quickstart.py \
   (SM120, where the FP8 prefill GEMM is built) else **BF16 W16A16**. So a 5090
   runs FP8 by default and a 4090 runs BF16 automatically; `fp8=True`/`False`
   force, and forced FP8 falls back to BF16 (with a warning) when its kernels are
-  absent. FP8 stays SM120-only (its prefill GEMM is SM120). The BF16 path is
-  validated on SM120 here; it compiles and configures for sm89 (4090) but is not
-  hardware-validated on that part. A build for an arch outside {sm89, sm120}
+  absent. FP8 stays SM120-only (its prefill GEMM is SM120). Native sampling and
+  generation are validated on RTX 4090 (BF16) and RTX 5090 (BF16/FP8).
+  A build for an arch outside {sm89, sm120}
   (e.g. Orin/Thor) does not compile these kernels, and the frontend raises a
   clear error at construction.
 - Synthesis here is **non-streaming** (the codec decodes the whole clip at the

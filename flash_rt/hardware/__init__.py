@@ -125,6 +125,18 @@ def detect_arch() -> str:
 # drag in every backend. External plugins may add entries to this dict
 # to register new models — see ``docs/plugin_model_template.md``.
 _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
+    # Higgs is TTS, constructed directly through its factory rather than the
+    # VLA wrapper. RDNA capabilities bind precision implementations at setup.
+    ("higgs_audio_v3", "torch", "rtx_sm120"):
+        ("flash_rt.frontends.torch.higgs_audio_v3_rtx", "HiggsAudioV3TorchFrontendRtx"),
+    ("higgs_audio_v3", "torch", "rtx_sm89"):
+        ("flash_rt.frontends.torch.higgs_audio_v3_rtx", "HiggsAudioV3TorchFrontendRtx"),
+    ("higgs_audio_v3", "torch", "amd_rdna3"):
+        ("flash_rt.amd.frontends.torch.higgs_audio_v3_rdna", "HiggsAudioV3TorchFrontendAmdRdna"),
+    ("higgs_audio_v3", "torch", "amd_rdna35"):
+        ("flash_rt.amd.frontends.torch.higgs_audio_v3_rdna", "HiggsAudioV3TorchFrontendAmdRdna"),
+    ("higgs_audio_v3", "torch", "amd_rdna4"):
+        ("flash_rt.amd.frontends.torch.higgs_audio_v3_rdna", "HiggsAudioV3TorchFrontendAmdRdna"),
     # ── MolmoAct2 (allenai) VLA ──
     # Native-kernel RTX SM120 path: ViT + pooled adapter + Qwen2.5-style
     # VLM prefill + per-layer-KV flow-matching action expert, captured as

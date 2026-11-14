@@ -13,6 +13,22 @@ Auto-detects GPU (SM110 → Thor backend, SM120 → Blackwell backend) and runs 
 
 ## Hardware-Specific Examples
 
+### AMD RDNA (W7900D, Radeon 8060S / Halo, R9700)
+
+[Higgs Audio v3 quickstart](amd/higgs_audio_v3_quickstart.py) uses the model's
+`create_frontend()` factory to detect the RDNA device. R9700 defaults to native
+FP8 W8A8; W7900D and Halo use BF16. `--bf16` selects BF16 explicitly.
+
+```bash
+export HIGGS_CHECKPOINT=/path/to/higgs-tts-3-4b
+python examples/amd/higgs_audio_v3_quickstart.py --out auto.wav
+python examples/amd/higgs_audio_v3_quickstart.py --bf16 --out bf16.wav
+```
+
+Use `--hardware amd_rdna3` for W7900D, `amd_rdna35` for Halo, or `amd_rdna4`
+for R9700 to check an explicit target. `--device cuda:N` selects the ROCm device.
+See [Higgs RDNA setup and precision](../docs/deployment_amd_higgs_audio_v3.md).
+
 ### Apple Silicon (experimental MPS BF16)
 
 ```bash

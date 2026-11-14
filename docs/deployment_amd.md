@@ -10,6 +10,7 @@ Per-model deployment guides:
 |---|---|---|
 | Pi0.5 | [deployment_amd_pi05.md](deployment_amd_pi05.md) | CDNA4 FP8/BF16; RDNA 3/3.5/4 BF16 |
 | GR00T N1.7 | [deployment_amd_groot_n17.md](deployment_amd_groot_n17.md) | CDNA FP8 backbone + BF16 DiT; RDNA 3/3.5/4 BF16 |
+| Higgs Audio v3 | [deployment_amd_higgs_audio_v3.md](deployment_amd_higgs_audio_v3.md) | RDNA 3/3.5/4 BF16; RDNA 4 FP8 W8A8 |
 
 ## Supported hardware
 
@@ -24,7 +25,9 @@ gfx1100 and gfx1201 share the wave32 BF16 RDNA source set with gfx1151; the
 
 The extension is built for exactly one architecture. CDNA3 uses E4M3 FNUZ
 (maximum finite value 240), CDNA4 uses OCP E4M3 (maximum finite value 448),
-and the RDNA backend is BF16-only. Using a mismatched source set can produce
+and the native RDNA extension uses BF16. Higgs Audio v3 additionally supports
+FP8 W8A8 on gfx1201 through Triton; gfx1100/gfx1151 use BF16.
+Using a mismatched source set can produce
 wrong results rather than a slow fallback, so the restriction is enforced at
 build time and frontend initialization:
 
