@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""FlashRT — Flint (official NVFP4 GGUF) OpenAI-compatible HTTP server.
+"""FlashRT — Flint OpenAI-compatible HTTP server (RTX 5090 NVFP4 GGUF or Apple Silicon MLX int4).
 
-Serves /v1/chat/completions from the native Flint runtime on SM120 (RTX 5090 class):
-W4A16 kernels, CUDA-graph decode, chunked native prefill.
+Serves /v1/chat/completions from the native Flint runtime: on SM120 (RTX 5090 class) from the official
+NVFP4 GGUF (W4A16 kernels, CUDA-graph decode, chunked native prefill), or on Apple Silicon from the MLX
+affine int4 checkpoint directory (``--mlx-dir``: native Metal plan, resident decode, chunked prefill).
 
 Surface (v1):
   * /v1/chat/completions  (non-stream and stream:true SSE deltas)
   * /v1/models, /health
   * Tools are rendered into the prompt by the model's chat template; tool calls come back as text.
-  * Greedy decoding only (temperature 0); the runtime picks tokens with an on-device argmax.
+  * Greedy decoding (temperature 0); the runtime picks tokens with an on-device argmax. With ``--mlx-dir``
+    also ``temperature`` / ``top_p`` / ``top_k`` (1..32, default 20) / ``seed`` sampling.
   * ``ignore_eos: true`` (extension) generates exactly ``max_tokens`` tokens, for fixed-length benchmarks.
   * ``cache_prompt`` (extension, default true): reuse the KV cache of the longest common prefix with the
     previous request's prompt and output (one cached sequence), so a follow-up turn only prefills what is
@@ -23,6 +25,7 @@ Usage::
 
     pip install fastapi uvicorn
     python examples/flint_openai_server.py --gguf /path/to/flint-nvfp4.gguf --port 8000 --max-seq 131072
+    python examples/flint_openai_server.py --mlx-dir /path/to/flint-int4 --port 8000 --max-seq 131072
 """
 from __future__ import annotations
 
@@ -46,10 +49,15 @@ def _sse(obj: Any) -> str:
 class FlintEngine:
     """Owns the frontend; one generation at a time."""
 
-    def __init__(self, gguf: str, max_seq: int, model_name: str):
-        from flash_rt.frontends.torch.flint_rtx import FlintTorchFrontendRtx
+    def __init__(self, gguf: Optional[str], max_seq: int, model_name: str, mlx_dir: Optional[str] = None):
         t0 = time.perf_counter()
-        self.fe = FlintTorchFrontendRtx(gguf, max_seq=max_seq)
+        if mlx_dir:
+            from flash_rt.frontends.torch.flint_mps import FlintTorchFrontendMps
+            self.fe = FlintTorchFrontendMps(mlx_dir, max_seq=max_seq)
+        else:
+            from flash_rt.frontends.torch.flint_rtx import FlintTorchFrontendRtx
+            self.fe = FlintTorchFrontendRtx(gguf, max_seq=max_seq)
+        self.sampling = bool(mlx_dir)
         log.info('loaded in %.1f s', time.perf_counter() - t0)
         self.tok = self.fe.tokenizer
         self.model_name = model_name
@@ -65,7 +73,8 @@ class FlintEngine:
         msgs = [{**m, 'content': ''} if m.get('content') is None else m for m in messages]
         return self.tok.encode(self.tok.apply_chat_template(msgs, tools=tools or None, add_generation_prompt=True))
 
-    async def generate(self, ids: List[int], max_tokens: int, ignore_eos: bool, cache_prompt: bool):
+    async def generate(self, ids: List[int], max_tokens: int, ignore_eos: bool, cache_prompt: bool,
+                       sampling: Optional[Dict[str, Any]] = None):
         """Async iterator of ('text', str) events, then ('done', finish_reason, usage, timings)."""
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
@@ -80,7 +89,7 @@ class FlintEngine:
             finish = 'length'
             try:
                 for block in self.fe.stream(ids, max_tokens, stop_ids=() if ignore_eos else None,
-                                            reuse_prefix=cache_prompt):
+                                            reuse_prefix=cache_prompt, **(sampling or {})):
                     now = time.perf_counter()
                     if t_first is None:
                         t_first = now
@@ -129,7 +138,7 @@ def build_app(engine: FlintEngine):
     from fastapi import FastAPI, HTTPException
     from fastapi.responses import StreamingResponse
 
-    app = FastAPI(title='FlashRT Flint NVFP4 OpenAI-compatible server')
+    app = FastAPI(title='FlashRT Flint OpenAI-compatible server')
 
     @app.get('/v1/models')
     async def models():
@@ -154,8 +163,22 @@ def build_app(engine: FlintEngine):
             raise HTTPException(400, 'max_tokens / temperature must be numbers') from exc
         if max_tokens < 1:
             raise HTTPException(400, 'max_tokens must be >= 1')
+        sampling: Dict[str, Any] = {}
         if temperature != 0.0:
-            raise HTTPException(400, 'only greedy decoding (temperature 0) is supported')
+            if not engine.sampling:
+                raise HTTPException(400, 'only greedy decoding (temperature 0) is supported')
+            try:
+                sampling = {'temperature': temperature, 'top_p': float(req.get('top_p', 1.0)),
+                            'top_k': int(req.get('top_k', 20)),
+                            'seed': int(req['seed']) if req.get('seed') is not None else uuid.uuid4().int & 0xFFFFFFFF}
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(400, 'top_p / top_k / seed must be numbers') from exc
+            if temperature < 0:
+                raise HTTPException(400, 'temperature must be >= 0')
+            if not 1 <= sampling['top_k'] <= 32:
+                raise HTTPException(400, 'top_k must be in 1..32 (the fused sampler keeps the 32 largest logits)')
+            if not 0 < sampling['top_p'] <= 1:
+                raise HTTPException(400, 'top_p must be in (0, 1]')
         ignore_eos = bool(req.get('ignore_eos', False))
         cache_prompt = bool(req.get('cache_prompt', True))
         stream = bool(req.get('stream', False))
@@ -169,7 +192,7 @@ def build_app(engine: FlintEngine):
 
         if not stream:
             parts: List[str] = []
-            async for ev in engine.generate(ids, max_tokens, ignore_eos, cache_prompt):
+            async for ev in engine.generate(ids, max_tokens, ignore_eos, cache_prompt, sampling):
                 if ev[0] == 'text':
                     parts.append(ev[1])
                 elif ev[0] == 'error':
@@ -183,7 +206,7 @@ def build_app(engine: FlintEngine):
 
         async def events():
             first = True
-            async for ev in engine.generate(ids, max_tokens, ignore_eos, cache_prompt):
+            async for ev in engine.generate(ids, max_tokens, ignore_eos, cache_prompt, sampling):
                 if ev[0] == 'text':
                     delta = {'content': ev[1]}
                     if first:
@@ -208,7 +231,9 @@ def build_app(engine: FlintEngine):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[1])
-    ap.add_argument('--gguf', required=True, help='official Flint NVFP4 GGUF')
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument('--gguf', help='official Flint NVFP4 GGUF (RTX 5090)')
+    src.add_argument('--mlx-dir', help='Flint MLX affine int4 checkpoint directory (Apple Silicon)')
     ap.add_argument('--host', default='127.0.0.1')
     ap.add_argument('--port', type=int, default=8000)
     ap.add_argument('--max-seq', type=int, default=131072, help='context capacity (KV cache) in tokens')
@@ -216,7 +241,7 @@ def main():
     args = ap.parse_args()
 
     import uvicorn
-    engine = FlintEngine(args.gguf, args.max_seq, args.model_name)
+    engine = FlintEngine(args.gguf, args.max_seq, args.model_name, mlx_dir=args.mlx_dir)
     engine.warmup()
     uvicorn.run(build_app(engine), host=args.host, port=args.port, log_level='warning')
 
