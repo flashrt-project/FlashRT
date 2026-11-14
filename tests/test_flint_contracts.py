@@ -249,6 +249,47 @@ def test_apple_wide_prefill_chunking(n, expect):
     assert rt.initial == n
 
 
+def _fake_sampling_runtime():
+    """Prefill runtime with the real first-token rule: the logits favor token 0, the noise program's draw
+    favors token 1."""
+    from flash_rt.models.flint.mlx_checkpoint import f32_to_bf16
+    rt, runs = _fake_prefill_runtime(4)
+    del rt.select
+    logits = np.full(64, -10.0, np.float32)
+    logits[[0, 1]] = [3.0, 2.5]
+    noise = np.zeros(64, np.float32)
+    rt.logits = lambda step: f32_to_bf16(logits)
+    rt.buf['noise'] = 1
+    rt.programs.update(sampled='sampled', noise='noise')
+    rt._params = np.zeros(16, np.uint32)
+    run = rt.plan.run
+
+    def run_with_noise(p):
+        if p == 'noise':
+            noise[1] = 5.0
+        return run(p)
+    rt.plan = SimpleNamespace(write=rt.plan.write, run=run_with_noise, read=lambda b, o, dt, k: noise[:k].copy())
+    return rt, runs, noise
+
+
+@pytest.mark.parametrize('n,last', [(300, 'prefill_small'), (2048, 'prefill'), (5000, 'prefill_wide'),
+                                    (8500, 'prefill_small')])
+def test_apple_prefill_samples_the_first_token(n, last):
+    sampling = dict(top_k=20, top_p=1.0, temperature=1.0)
+    rt, runs, _ = _fake_sampling_runtime()
+    assert rt.prefill(list(range(n)), program='sampled', seed=123, **sampling) == 1
+    assert [p for p, _, _ in runs][-3:] == [last, 'prefill_head', 'noise']
+    assert (rt._params[1], rt._params[2], rt._params[8], rt._params[11]) == (n - 1, 1, 20, n)
+    assert (rt._params[12], rt._params[13], rt._params[14]) == (123, 0, 1)
+    rt, runs, _ = _fake_sampling_runtime()
+    assert rt.prefill(list(range(n)), seed=123, **sampling) == 0                 # greedy ignores the noise
+    assert 'noise' not in [p for p, _, _ in runs]
+    rt, runs, noise = _fake_sampling_runtime()
+    noise[1] = 5.0                                                                  # a row from set_noise
+    assert rt.prefill(list(range(n)), program='sampled', **sampling) == 1
+    assert 'noise' not in [p for p, _, _ in runs]
+
+
 def test_apple_runtime_tracks_resident_sliding_history():
     from flash_rt.frontends.torch._flint_mps_runtime import FlintRuntime
     rt = FlintRuntime.__new__(FlintRuntime)
