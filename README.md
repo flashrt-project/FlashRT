@@ -310,6 +310,10 @@ ids, batch 1; the reference is rec v0.1.1 (MLX).
 | 32,768 | 58.4-66.1 | **48.3-50.6** | 69.1-75.9 | **86.9-89.5** |
 | 131,072 | 603.1 | **473.1** | 29.7 | **42.0** |
 
+Optional greedy lookup decoding (n-gram draft tokens, each verified row
+bit-identical to the greedy step) decodes the same tokens 10-17% faster on
+these code prompts (1K-32K).
+
 #### Qwen3-8B
 
 | Hardware | Mode | Prefill | Decode | Source |
