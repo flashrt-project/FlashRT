@@ -36,6 +36,99 @@ def test_explicit_sm120_routing_only():
                       ('flash_rt.frontends.torch.flint_rtx', 'FlintTorchFrontendRtx')}
 
 
+def _safetensors(path, tensors):
+    header, blobs, offset = {}, [], 0
+    for name, (dtype, array) in tensors.items():
+        raw = np.ascontiguousarray(array).tobytes()
+        header[name] = {'dtype': dtype, 'shape': list(array.shape), 'data_offsets': [offset, offset + len(raw)]}
+        blobs.append(raw)
+        offset += len(raw)
+    meta = json.dumps(header).encode()
+    meta += b' ' * (-len(meta) % 8)
+    path.write_bytes(struct.pack('<Q', len(meta)) + meta + b''.join(blobs))
+
+
+def test_mlx_affine_reader_low_nibble_first(tmp_path):
+    from flash_rt.models.flint.mlx_checkpoint import (AffineMatrix, SafetensorsFile, bf16_to_f32,
+                                                      dequantize, f32_to_bf16, unpack_codes)
+    rng = np.random.default_rng(0)
+    q = rng.integers(0, 16, size=(3, 128), dtype=np.uint8)
+    codes = (q[:, 0::2] | (q[:, 1::2] << 4)).astype(np.uint8)
+    scales = f32_to_bf16(rng.standard_normal((3, 2)).astype(np.float32))
+    biases = f32_to_bf16(rng.standard_normal((3, 2)).astype(np.float32))
+    path = tmp_path / 'm.safetensors'
+    _safetensors(path, {'w.weight': ('U8', codes), 'w.scales': ('BF16', scales), 'w.biases': ('BF16', biases)})
+    f = SafetensorsFile(path)
+    m = AffineMatrix(f.tensor('w.weight'), f.tensor('w.scales'), f.tensor('w.biases'), 4)
+    assert np.array_equal(unpack_codes(m), q)
+    expect = bf16_to_f32(scales).repeat(64, 1) * q + bf16_to_f32(biases).repeat(64, 1)
+    assert np.allclose(dequantize(m), expect, rtol=0, atol=1e-6)
+
+
+def _apple_config():
+    """config.json fields of the Flint MLX int4 export that the reader consults."""
+    full = [0, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 48]
+    return {
+        'model_type': 'flint', 'num_hidden_layers': 49,
+        'layer_types': ['full_attention' if i in full else 'sliding_attention' for i in range(49)],
+        'no_rope_layer_indices': full, 'rope_parameters': {'rope_theta': 10000.0, 'rope_type': 'default'},
+        'scoring_func': 'sigmoid', 'norm_topk_prob': True, 'attention_sink': True, 'tie_word_embeddings': False,
+        'mlp_only_layers': [0, 1], 'hidden_size': 2048, 'num_attention_heads': 32, 'num_key_value_heads': 4,
+        'head_dim': 128, 'vocab_size': 150144, 'intermediate_size': 6144, 'num_experts': 256,
+        'num_experts_per_tok': 6, 'moe_intermediate_size': 512, 'shared_expert_intermediate_size': 1024,
+        'rms_norm_eps': 1e-6, 'sliding_window': 513, 'max_position_embeddings': 262144,
+        'bos_token_id': 150000, 'eos_token_id': [150001, 150003, 150005, 150018],
+        'quantization': {'group_size': 64, 'bits': 4},
+        'mlx_export': {'bits': 4, 'routed_expert_bits': 4, 'embedding_bits': 8},
+    }
+
+
+def test_mlx_config_reader_and_refusals():
+    from flash_rt.models.flint.config import FlintConfigError, config_from_json
+    cfg = config_from_json(_apple_config())
+    assert cfg.eog_token_ids == (150001, 150003, 150005, 150018)
+    assert cfg.sliding_layers[2] and not cfg.sliding_layers[5] and cfg.is_moe(2) and not cfg.is_moe(1)
+    for key, value in [('scoring_func', 'softmax'), ('norm_topk_prob', False), ('attention_sink', False),
+                       ('tie_word_embeddings', True), ('rope_scaling', {'type': 'yarn'}), ('num_experts', 128),
+                       ('no_rope_layer_indices', [0, 1]), ('model_type', 'qwen3')]:
+        with pytest.raises(FlintConfigError):
+            config_from_json({**_apple_config(), key: value})
+
+
+@pytest.mark.parametrize('change', [{'quantization': {'group_size': 32, 'bits': 4}},
+                                    {'quantization': {'group_size': 64, 'bits': 8}},
+                                    {'mlx_export': {'bits': 4, 'routed_expert_bits': 4, 'embedding_bits': 4}}])
+def test_mlx_checkpoint_refuses_other_quantization(tmp_path, change):
+    from flash_rt.models.flint.config import FlintConfigError
+    from flash_rt.models.flint.mlx_checkpoint import MLXCheckpoint
+    (tmp_path / 'config.json').write_text(json.dumps({**_apple_config(), **change}))
+    with pytest.raises(FlintConfigError):
+        MLXCheckpoint(tmp_path)
+
+
+def test_mlx_checkpoint_shape_guards(tmp_path):
+    from flash_rt.models.flint.mlx_checkpoint import MLXCheckpoint
+    (tmp_path / 'config.json').write_text(json.dumps(_apple_config()))
+    with pytest.raises(FileNotFoundError):
+        MLXCheckpoint(tmp_path)
+    codes = np.zeros((4, 64), np.uint8)          # 4 rows x 128 inputs
+    groups = np.zeros((4, 2), np.uint16)
+    _safetensors(tmp_path / 'model-00000.safetensors',
+                 {'m.weight': ('U8', codes), 'm.scales': ('BF16', groups), 'm.biases': ('BF16', groups),
+                  'bad.weight': ('U8', codes), 'bad.scales': ('BF16', groups), 'bad.biases': ('BF16', groups[:, :1])})
+    ck = MLXCheckpoint(tmp_path)
+    assert ck.affine('m', k=128).k == 128
+    with pytest.raises(ValueError):
+        ck.affine('m', k=256)                    # input width the caller expects
+    with pytest.raises(ValueError):
+        ck.affine('m', bits=8)                   # 64 code bytes per row hold 128 4-bit inputs, not 8-bit ones
+    with pytest.raises(ValueError):
+        ck.affine('bad')                         # scales and biases disagree
+    with pytest.raises(KeyError):
+        ck.tensor('missing')
+    ck.close()
+
+
 def test_gguf_readonly_container(tmp_path):
     def string(s):
         data = s.encode()

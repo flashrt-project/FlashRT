@@ -1,4 +1,4 @@
-"""Flint tokenizer and chat template, built from the GGUF metadata.
+"""Flint tokenizer and chat template, built from the GGUF metadata or a checkpoint's tokenizer files.
 
 The GGUF carries the byte-level BPE vocabulary, merges, token types and the
 Jinja chat template. The tokenizer is assembled with the ``tokenizers``
@@ -11,6 +11,7 @@ same ids as the reference executor.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from flash_rt.models.flint.gguf import GGUFFile
@@ -56,6 +57,39 @@ class FlintTokenizer:
         self.chat_template: Optional[str] = gguf.get("tokenizer.chat_template")
         self._tmpl = None
 
+    @classmethod
+    def from_files(cls, tokenizer_json, chat_template=None, bos_id: Optional[int] = None,
+                   eos_id: Optional[int] = None) -> "FlintTokenizer":
+        """Tokenizer from a Hugging Face ``tokenizer.json`` (the form shipped next to safetensors
+        exports) and an optional Jinja chat template file."""
+        try:
+            from tokenizers import Tokenizer
+        except ImportError as e:  # pragma: no cover
+            raise RuntimeError("the Flint tokenizer needs the `tokenizers` package") from e
+        self = cls.__new__(cls)
+        self._tok = Tokenizer.from_file(str(tokenizer_json))
+        self.vocab_size = self._tok.get_vocab_size(with_added_tokens=True)
+        self.bos_id, self.eos_id = bos_id, eos_id
+        self.chat_template = Path(chat_template).read_text() if chat_template else None
+        self._tmpl = None
+        return self
+
+    @classmethod
+    def from_directory(cls, directory, chat_template=None) -> "FlintTokenizer":
+        """``tokenizer.json`` and ``chat_template.jinja`` of a checkpoint directory; ``chat_template``
+        overrides the template file."""
+        directory = Path(directory)
+        if chat_template is not None and not Path(chat_template).is_file():
+            raise FileNotFoundError(f"chat template {chat_template} not found")
+        template = chat_template or (directory / "chat_template.jinja")
+        if not Path(template).is_file():
+            template = None
+        import json
+        cfg = json.loads((directory / "config.json").read_text()) if (directory / "config.json").is_file() else {}
+        eos = cfg.get("eos_token_id")
+        return cls.from_files(directory / "tokenizer.json", template, bos_id=cfg.get("bos_token_id"),
+                              eos_id=eos[0] if isinstance(eos, list) else eos)
+
     def encode(self, text: str) -> List[int]:
         """Tokenize text; special tokens written in the text are recognized (no BOS is added)."""
         return self._tok.encode(text, add_special_tokens=False).ids
@@ -66,7 +100,7 @@ class FlintTokenizer:
     def apply_chat_template(self, messages: List[Dict], tools: Optional[List[Dict]] = None,
                             add_generation_prompt: bool = True) -> str:
         if self.chat_template is None:
-            raise ValueError("GGUF has no tokenizer.chat_template")
+            raise ValueError("no chat template (GGUF tokenizer.chat_template or chat_template.jinja)")
         if self._tmpl is None:
             import json
             from jinja2.sandbox import ImmutableSandboxedEnvironment
