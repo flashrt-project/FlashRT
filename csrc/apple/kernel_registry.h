@@ -12,6 +12,8 @@
 #include "flint/flint_moe_rows_bf16.h"
 #include "flint/flint_prefill_rows_bf16.h"
 #include "gemm/bf16_tensor_ops.h"
+#include "gemm/bf16_tensor_ops_epilogue.h"
+#include "gemm/bf16_tensor_ops_splitk.h"
 #include "gemm/w4a16_affine_qmv.h"
 #include "gemm/w4a16_affine_tensor_ops.h"
 #include "kernels/ada_rms_norm_bf16.h"
@@ -24,6 +26,7 @@
 #include "kernels/residual_bf16.h"
 #include "kernels/rms_norm_bf16.h"
 #include "kernels/rope_bf16.h"
+#include "kernels/splitk_reduce_bf16.h"
 #ifdef FLASHRT_APPLE_INT8_EXPERIMENT
 #include "gemm/int8_tensor_ops.h"
 #include "quantize/bf16_int8_rowwise.h"
@@ -67,6 +70,29 @@ inline constexpr KernelSource kernel_registry[] = {
     {"gemm_small_bf16", "gemm_bf16", [] { return gemm_bf16_source(16); }},
     {"gemm_small_bias_bf16", "gemm_bias_bf16", [] { return gemm_bf16_source(16); }},
     {"gemm_small_strided_bf16", "gemm_strided_bf16", [] { return gemm_bf16_source(16); }},
+    // Geometry-selected tiles and fused epilogues (BF16 boundaries of the separate dispatches kept).
+    // Epilogue entries bind A, B, C[, bias] and the uniforms last.
+    {"gemm_bf16_32x128", "gemm_bf16", [] { return gemm_bf16_source(32, 128, 2); }},
+    {"gemm_bias_bf16_32x128", "gemm_bias_bf16_last", [] { return gemm_bf16_epilogue_source(GemmEpilogue::bias, 32, 128, 2); }},
+    {"gemm_gelu_mul_bf16", "gemm_gelu_mul_bf16", [] { return gemm_bf16_epilogue_source(GemmEpilogue::gelu_mul); }},
+    {"gemm_gelu_mul_bf16_32x128", "gemm_gelu_mul_bf16",
+     [] { return gemm_bf16_epilogue_source(GemmEpilogue::gelu_mul, 32, 128, 2); }},
+    {"gemm_residual_bf16", "gemm_residual_bf16", [] { return gemm_bf16_epilogue_source(GemmEpilogue::residual); }},
+    {"gemm_residual_bf16_32x128", "gemm_residual_bf16",
+     [] { return gemm_bf16_epilogue_source(GemmEpilogue::residual, 32, 128, 2); }},
+    {"gemm_bias_gelu_bf16", "gemm_bias_gelu_bf16", [] { return gemm_bf16_epilogue_source(GemmEpilogue::bias_gelu); }},
+    {"gemm_bias_gelu_bf16_32x128", "gemm_bias_gelu_bf16",
+     [] { return gemm_bf16_epilogue_source(GemmEpilogue::bias_gelu, 32, 128, 2); }},
+    {"gemm_bias_residual_bf16", "gemm_bias_residual_bf16",
+     [] { return gemm_bf16_epilogue_source(GemmEpilogue::bias_residual); }},
+    {"gemm_bias_residual_bf16_32x128", "gemm_bias_residual_bf16",
+     [] { return gemm_bf16_epilogue_source(GemmEpilogue::bias_residual, 32, 128, 2); }},
+    // Few-row (M <= 16) projections: K-partitioned FP32 partials and their reducing consumers.
+    {"gemm_gelu_mul_bf16_16x64", "gemm_gelu_mul_bf16",
+     [] { return gemm_bf16_epilogue_source(GemmEpilogue::gelu_mul, 16, 64, 2); }},
+    {"gemm_splitk_f32_bf16", "gemm_splitk_f32_bf16", [] { return gemm_splitk_bf16_source(); }},
+    {"splitk_rope_bf16", "splitk_rope_bf16", splitk_reduce_bf16_source},
+    {"splitk_residual_adarms_bf16", "splitk_residual_adarms_bf16", splitk_reduce_bf16_source},
     {"attention_d72_bf16", "attention_d72_bf16", attention_d72_bf16_source},
     {"attention_bf16", "attention_bf16", attention_simd_bf16_source},
     {"tr_gqa", "tr_gqa", [] { return gqa_online_bf16_source(); }},

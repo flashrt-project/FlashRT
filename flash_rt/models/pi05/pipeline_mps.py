@@ -20,20 +20,22 @@ class Pi05PipelineMps(Pi05TorchPipeline):
 
     def enable_native_pipeline(self, prompt_len, *, library=None, capture_probes=False, residency=True,
                                split_decode=True, merged_encoder_ffn=True, dynamic_prompt=True,
-                               pad_prompt=False):
+                               pad_prompt=False, fused=True):
         """Build one ICB for patch + blocks + projector + prefix + denoising.
 
         By default all prompt lengths up to max_prompt_len reuse this compact plan.
         pad_prompt=True explicitly selects capacity-sized prefix computation.
         Set dynamic_prompt=False for exact-shape diagnostics. Use forward_native
         for CPU inputs and CPU actions without MPS input/output staging.
+        fused=False selects the original unfused BF16 lowering for A/B checks.
         """
         from flash_rt.models.pi05.native_plan_mps import NativePi05Plan
         native = NativePi05Plan(self, prompt_len, library=library,
                                capture_probes=capture_probes, residency=residency,
                                split_decode=split_decode,
                                merged_encoder_ffn=merged_encoder_ffn,
-                               dynamic_prompt=dynamic_prompt, pad_prompt=pad_prompt)
+                               dynamic_prompt=dynamic_prompt, pad_prompt=pad_prompt,
+                               fused=fused)
         previous = self._native_pipeline
         self._native_pipeline = native
         if previous is not None:

@@ -23,6 +23,7 @@ class NativePi05Plan:
         int8_options=None,
         dynamic_prompt=True,
         pad_prompt=False,
+        fused=True,
     ):
         if not source.compact_encoder or not source.precompute_modulation:
             raise ValueError(
@@ -35,7 +36,12 @@ class NativePi05Plan:
         if dynamic_prompt and int8_options is not None and int8_options.get("observe"):
             raise ValueError("Calibration requires dynamic_prompt=False to observe only real tokens")
         if int8_options is None:
-            self.plan = Plan(library)
+            # fused=False reproduces the original one-dispatch-per-operation lowering.
+            if fused:
+                from flash_rt.hardware.apple_native.fused import FusedPlan
+                self.plan = FusedPlan(library)
+            else:
+                self.plan = Plan(library)
         else:
             from flash_rt.hardware.apple_native.int8 import INT8Plan
             self.plan = INT8Plan(library, **int8_options)

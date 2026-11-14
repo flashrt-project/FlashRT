@@ -1,0 +1,263 @@
+"""BF16 native plan with geometry-selected GEMM tiles and fused GEMM epilogues.
+
+Lowering stays the shared model traversal. During recording only, a GEMM is
+held for one or two operations: when the following dispatches are its sole
+elementwise consumers, they are emitted together.
+
+* Large-row GEMMs (M > 16) fuse GELU multiply of the merged gate/up product,
+  an in-place residual add, or an in-place GELU after bias into the epilogue.
+* Few-row GEMMs (M <= 16, the denoising rows) are split along K into FP32
+  partials so the weight stream keeps enough threadgroups in flight; the
+  partials are summed by the consumer: RoPE with K/V placement, or a (gated)
+  residual add optionally followed by its AdaRMS normalization. The merged
+  gate/up product uses the GELU multiply epilogue directly.
+
+Every fused form keeps the BF16 rounding boundaries of the separate dispatches;
+split-K sums its partials in a fixed order, so replay stays deterministic. Any
+other operation, copy or finish first emits the held work unchanged, so the
+recorded order is the semantic order.
+"""
+
+from __future__ import annotations
+
+import math
+
+import torch
+
+from .dimensions import uniform_key
+from .plan import Plan, Weight
+
+# (tile_m, tile_n, simdgroups) -> registry suffix. The production default tile is 64x64/2.
+TILES = {(64, 64, 2): "", (32, 128, 2): "_32x128", (16, 64, 2): "_16x64"}
+SPLITK_CHUNK = 256
+
+
+def select_tile(m, n, k):
+    """Measured M4 Pro tiles for M > 16 (geometry only, never model names)."""
+    if n >= 8192 or k >= 8192:
+        return 32, 128, 2
+    return 64, 64, 2
+
+
+def _same(a, b):
+    return (a.buffer == b.buffer and uniform_key(a.offset) == uniform_key(b.offset)
+            and tuple(map(uniform_key, a.shape)) == tuple(map(uniform_key, b.shape))
+            and a.contiguous() and b.contiguous())
+
+
+class FusedPlan(Plan):
+    def __init__(self, library=None, *, fuse_epilogues=True, tune_tiles=True):
+        super().__init__(library)
+        self.fuse_epilogues = fuse_epilogues
+        self.tune_tiles = tune_tiles
+        self._pending = None
+        # Repacked weights stay referenced so their storage identity cannot be reused.
+        self._repacked = {}
+        self._workspace = None
+        self.fused = []
+
+    # ------------------------------------------------------------------ recording
+    def linear(self, out, x, w, bias=None):
+        self._flush()
+        m = math.prod(x.shape[:-1])
+        small = m <= 16
+        if (not self.fuse_epilogues and small) or not self.bind(out, allow_strided=True).contiguous():
+            return super().linear(out, x, w, bias)
+        x, out = self.bind(x), self.bind(out)
+        k, n = x.shape[-1], w.shape[-1]
+        if w.shape != (k, n) or out.numel() != m * n:
+            raise ValueError("GEMM shape mismatch")
+        if small and (bias is not None or min(k, n) < 256):
+            return super().linear(out, x, w, bias)
+        self._pending = dict(out=out, x=x, w=w, bias=bias, m=m, n=n, k=k, stage=self.stage, small=small)
+
+    def dispatch(self, name, tensors, writes, params, groups, threads=64, *, strided=()):
+        pending, self._pending = self._pending, None
+        if pending is not None:
+            if pending.get("residual") is not None:
+                norm = self._residual_norm(pending, name, tensors)
+                self._emit_splitk_residual(pending, norm)
+                if norm is not None:
+                    return
+            elif self.fuse_epilogues and self._fuse(pending, name, tensors, params):
+                return  # consumed (or held once more for a following AdaRMS)
+            else:
+                self._emit(pending)
+        return super().dispatch(name, tensors, writes, params, groups, threads, strided=strided)
+
+    def copy_buffer(self, source, destination):
+        self._flush()
+        return super().copy_buffer(source, destination)
+
+    def finish(self):
+        self._flush()
+        return super().finish()
+
+    def _flush(self):
+        pending, self._pending = self._pending, None
+        if pending is not None and pending.get("residual") is not None:
+            self._emit_splitk_residual(pending, None)
+        elif pending is not None:
+            self._emit(pending)
+
+    # ------------------------------------------------------------------ lowering
+    def _tile(self, m, n, k):
+        return select_tile(m, n, k) if self.tune_tiles else (64, 64, 2)
+
+    def _gemm(self, kind, p, out, weight, n_columns, extra=()):
+        tm, tn, sg = self._tile(p["m"], n_columns, p["k"])
+        suffix = TILES[(tm, tn, sg)]
+        current = self.stage
+        try:
+            self.stage = p["stage"]
+            Plan.dispatch(self, f"gemm{kind}_bf16{suffix}", [p["x"], weight, out, *extra],
+                          {2}, [p["m"], n_columns, p["k"]],
+                          ((n_columns + tn - 1) // tn, (p["m"] + tm - 1) // tm), sg * 32)
+        finally:
+            self.stage = current
+        return tm, tn, sg
+
+    def _emit(self, p):
+        if p["small"]:
+            current = self.stage
+            try:
+                self.stage = p["stage"]
+                return super().linear(p["out"], p["x"], p["w"], p["bias"])
+            finally:
+                self.stage = current
+        if p["bias"] is None:
+            self._gemm("", p, p["out"], p["w"], p["n"])
+        else:
+            current = self.stage
+            try:
+                self.stage = p["stage"]
+                tm, tn, sg = self._tile(p["m"], p["n"], p["k"])
+                if (tm, tn, sg) == (64, 64, 2):
+                    # Original bias entry: uniforms bound before bias.
+                    return super().linear(p["out"], p["x"], p["w"], p["bias"])
+                self._gemm("_bias", p, p["out"], p["w"], p["n"], (p["bias"],))
+            finally:
+                self.stage = current
+
+    def _packed_gelu_mul(self, w, block):
+        tensor = w.tensor
+        key = (tensor.untyped_storage().data_ptr(), tensor.storage_offset(), tuple(tensor.shape),
+               tuple(tensor.stride()), block)
+        if key not in self._repacked:
+            k, n2 = tensor.shape
+            source = tensor.detach().to("cpu")
+            gate, up = source[:, : n2 // 2], source[:, n2 // 2:]
+            packed = torch.stack((gate.reshape(k, -1, block), up.reshape(k, -1, block)), 2).reshape(k, n2)
+            self._repacked[key] = Weight(packed.contiguous(), w.name + f".gelu_mul{block}")
+        return self._repacked[key]
+
+    # ------------------------------------------------------------- few-row split-K
+    def _splitk(self, p):
+        """FP32 partials [splits, M, N] of the held few-row GEMM in a shared workspace."""
+        splits = (p["k"] + SPLITK_CHUNK - 1) // SPLITK_CHUNK
+        need = splits * p["m"] * p["n"]
+        if self._workspace is None or self._workspace.numel() < need:
+            self._workspace = self.allocate((need,), itemsize=4)
+        partial = self._workspace if self._workspace.numel() == need else self._workspace[:need]
+        current = self.stage
+        try:
+            self.stage = p["stage"]
+            Plan.dispatch(self, "gemm_splitk_f32_bf16", [p["x"], p["w"], partial], {2},
+                          [p["m"], p["n"], p["k"], SPLITK_CHUNK],
+                          ((p["n"] + 63) // 64, (p["m"] + 15) // 16, splits), 64)
+        finally:
+            self.stage = current
+        return partial, splits
+
+    def _residual_norm(self, p, name, tensors):
+        """The AdaRMS dispatch immediately following a held split-K residual, if it reads that row."""
+        if name != "tr_adarms":
+            return None
+        x, out, mod = (self.bind(t) for t in tensors)
+        return (out, mod) if _same(x, p["residual"][0]) else None
+
+    def _emit_splitk_residual(self, p, norm):
+        partial, splits = self._splitk(p)
+        x, gate, gated = p["residual"]
+        out, mod = norm if norm is not None else (x, x)
+        rows, dim = p["m"], p["n"]
+        self.dispatch_raw("splitk_residual_adarms_bf16", [partial, x, gate, mod, out], {1, 4},
+                          [rows, dim, splits, gated, int(norm is not None)], (rows,), 256, p["stage"])
+        self.fused.append(("splitk_residual" + ("_adarms" if norm is not None else ""), p["stage"],
+                           (p["m"], p["n"], p["k"])))
+
+    def dispatch_raw(self, name, tensors, writes, params, groups, threads, stage):
+        current = self.stage
+        try:
+            self.stage = stage
+            Plan.dispatch(self, name, tensors, writes, params, groups, threads)
+        finally:
+            self.stage = current
+
+    def _fuse_small(self, p, name, tensors, params):
+        if name in ("tr_rope", "tr_rope_offsets"):
+            qkv, q, k, v, cos, sin = (self.bind(t) for t in tensors)
+            if not _same(qkv, p["out"]):
+                return False
+            partial, splits = self._splitk(p)
+            offsets = list(params[4:6]) if name == "tr_rope_offsets" else [0, 0]
+            rows, heads, dim = params[0], params[1], params[2]
+            self.dispatch_raw("splitk_rope_bf16", [partial, q, k, v, cos, sin], {1, 2, 3},
+                              [rows, heads, dim, params[3], *offsets, splits],
+                              ((rows * (heads + 1) * (dim // 2) + 63) // 64,), 64, p["stage"])
+            self.fused.append(("splitk_rope", p["stage"], (p["m"], p["n"], p["k"])))
+            return True
+        if name == "tr_residual" and len(params) == 3:
+            residual, update, out, gate = (self.bind(t) for t in tensors)
+            if not (_same(update, p["out"]) and _same(out, residual)):
+                return False
+            # Hold once more: a following AdaRMS of this row joins the reduction.
+            self._pending = dict(p, residual=(residual, gate, int(params[2])))
+            return True
+        if name == "tr_gelu_mul" and p["n"] % 64 == 0:
+            merged, out = (self.bind(t) for t in tensors)
+            if not _same(merged, p["out"]):
+                return False
+            weight = self._packed_gelu_mul(p["w"], 32)
+            current = self.stage
+            try:
+                self.stage = p["stage"]
+                Plan.dispatch(self, "gemm_gelu_mul_bf16_16x64", [p["x"], weight, out], {2},
+                              [p["m"], p["n"], p["k"]], (p["n"] // 64, (p["m"] + 15) // 16), 64)
+            finally:
+                self.stage = current
+            self.fused.append(("gelu_mul", p["stage"], (p["m"], p["n"], p["k"])))
+            return True
+        return False
+
+    def _fuse(self, p, name, tensors, params):
+        if p["small"]:
+            return self._fuse_small(p, name, tensors, params)
+        if name == "tr_gelu_mul" and p["bias"] is None and p["n"] % 2 == 0:
+            merged, out = (self.bind(t) for t in tensors)
+            if not _same(merged, p["out"]):
+                return False
+            tm, tn, sg = self._tile(p["m"], p["n"], p["k"])
+            if (p["n"] // 2) % (tn // 2):
+                return False
+            weight = self._packed_gelu_mul(p["w"], tn // 2)
+            self._gemm("_gelu_mul", p, out, weight, p["n"])
+            self.fused.append(("gelu_mul", p["stage"], (p["m"], p["n"], p["k"])))
+            return True
+        if name == "tr_residual" and len(params) == 3 and params[2] == 0:
+            residual, update, out = (self.bind(t) for t in tensors[:3])
+            if not (_same(update, p["out"]) and _same(out, residual)):
+                return False
+            kind = "_bias_residual" if p["bias"] is not None else "_residual"
+            extra = (p["bias"],) if p["bias"] is not None else ()
+            self._gemm(kind, p, out, p["w"], p["n"], extra)
+            self.fused.append((kind[1:], p["stage"], (p["m"], p["n"], p["k"])))
+            return True
+        if name == "gelu_bf16" and p["bias"] is not None:
+            (target,) = (self.bind(t) for t in tensors)
+            if not _same(target, p["out"]):
+                return False
+            self._gemm("_bias_gelu", p, target, p["w"], p["n"], (p["bias"],))
+            self.fused.append(("bias_gelu", p["stage"], (p["m"], p["n"], p["k"])))
+            return True
+        return False
