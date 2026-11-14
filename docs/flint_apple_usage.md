@@ -169,7 +169,10 @@ that the production decode program equals the `reference` program below 1024
 keys, that prefill is deterministic for small, single and multi-chunk prompts,
 that chunked prefill agrees with stepping the prompt through the decode step,
 that a prefill continued at a chunk boundary equals the full prefill, prefix
-reuse and its recompute rule, seeded sampling and stop tokens.
+reuse and its recompute rule, seeded sampling and stop tokens, that every row
+of a verification step equals the greedy step at its position (all drafts
+accepted, a draft rejected, decoding on afterwards) and that lookup generation
+equals greedy generation.
 
 ### Equivalence with the reference engine (M4 Pro, macOS 26)
 
