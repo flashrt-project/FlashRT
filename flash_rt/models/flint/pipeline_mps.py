@@ -90,6 +90,8 @@ class FlintPipelineMps:
 
 TM = 64   # dense GEMM tile rows (w4a16 TensorOps kernels)
 TN = 64   # GEMM tile columns
+GEMM_THREADS = 128   # w4a16 TensorOps GEMM threadgroup (four SIMD groups)
+SPLITK_THREADS = 64   # split-K w4a16 GEMM threadgroup (two SIMD groups)
 GROUPED_TM = 64   # expert-grouped GEMM tile rows (expert blocks are tiled by GROUPED_TM rows)
 SMALL_ROWS = 513    # chunks below this many rows take the small-chunk program (split-K / vector paths)
 SPLITK_ROW_TILES = 8   # split-K products only arise for M <= 512 rows
@@ -153,12 +155,13 @@ class FlintPrefillMps:
                      (b["starts"], 0, READ), (b["tiles"], 0, READ), state]
             name = "gemm_w4a16_affine" + ("_grouped" if grouped else "") + epilogue
             groups_y = _ceil(rows, GROUPED_TM) + cfg.num_experts if grouped else _ceil(rows, TM)
-            plan.dispatch(name, binds, (_ceil(n, TN), groups_y, 1), 128 if grouped else 64, label=name)
+            plan.dispatch(name, binds, (_ceil(n, TN), groups_y, 1), GEMM_THREADS, label=name)
             if not small:
                 return
             if not grouped:
                 split = "gemm_w4a16_affine_splitk" + epilogue
-                plan.dispatch(split, binds, (_ceil(n, TN), min(_ceil(rows, TM), SPLITK_ROW_TILES), 1), 64, label=split)
+                plan.dispatch(split, binds, (_ceil(n, TN), min(_ceil(rows, TM), SPLITK_ROW_TILES), 1), SPLITK_THREADS,
+                              label=split)
             vec = self.param("qmv", inner=k, columns=n, x_stride=x_stride, y_stride=y_stride, limit=limit,
                              experts=cfg.num_experts if grouped else 0, per_row=K if grouped else 1, w=w_off, w2=w2)
             name = "qmv_w4a16_affine_rows" + ("_grouped" if grouped else "") + epilogue
