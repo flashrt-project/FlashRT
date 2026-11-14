@@ -875,3 +875,42 @@ load_model(config="alpamayo15_flashdrive") raise an explicit redirect to their
 dedicated Thor frontends. Existing model routes and predict signatures are
 unchanged. See [the consolidated guide](alpamayo15.md) for imports, checkpoint
 selection, reset behavior and four-arm reproduction.
+
+## Higgs Audio v3 TTS
+
+Higgs uses its TTS-specific frontend rather than the VLA `predict()` contract:
+
+```python
+from flash_rt.models.higgs_audio_v3 import create_frontend
+
+fe = create_frontend("/path/to/higgs-tts-3-4b", fp8=False)
+codes = fe.predict("Hello.")                  # CPU int64 [frames, 8]
+waveform = fe.synthesize(codes)                # CPU float32 mono, 24 kHz
+waveform = fe.generate("Hello.", temperature=1.0, seed=1234)
+for packet in fe.generate_stream("Hello."):
+    consume(packet)
+```
+
+`hardware="auto"` preserves the CUDA constructor and selects the RDNA frontend
+on ROCm. Explicit RDNA targets are `amd_rdna3`, `amd_rdna35` and `amd_rdna4`.
+RDNA constructor defaults include `device="cuda:0"`, `max_seq=2048`,
+`max_new_frames=1024`, `max_prefill_tokens=512`, `alloc_own_forward_buffers=True`
+and `fp8=None`. Auto precision selects native FP8 W8A8 on supported RDNA4 and
+BF16 otherwise; unsupported explicit FP8 warns and falls back to BF16.
+
+Both frontends preserve `temperature=0.0` (greedy) and optional `seed` on
+`predict`, `decode_stream`, `generate` and `generate_stream`. A
+`temperature > 1e-5` selects native full-vocabulary categorical sampling. The same
+seed is repeatable within a fixed precision and algorithm selection, not a
+promise of cross-device identical generation.
+
+Streaming defaults to `first_chunk=8, chunk=25, ctx=8, holdback=8`. It waits for
+right context, decodes overlapping codec windows and trims output to committed
+frames. Native generation retains delayed-codebook EOC winddown and the
+repeated-code guard. `max_new_frames` bounds delayed rows; RDNA also stops before
+exceeding `max_seq`. RDNA's `last_finish_reason` reports `eoc`, `repeated_code`,
+`max_new_frames` or `max_seq`. Serialize requests to each frontend; validated
+resident prefix KV can be reused with `prefill(..., cached_tokens=...)` or
+`generate_stream(..., system=...)`.
+
+See [RDNA setup and usage](deployment_amd_higgs_audio_v3.md).
