@@ -29,11 +29,26 @@ print(json.dumps(sorted(n for n in sys.modules if n.split('.')[0] in
     assert json.loads(result.stdout) == []
 
 
-def test_explicit_sm120_routing_only():
+def test_explicit_routing_only():
     from flash_rt.hardware import _PIPELINE_MAP
     routes = {k: v for k, v in _PIPELINE_MAP.items() if k[0] == 'flint'}
     assert routes == {('flint', 'torch', 'rtx_sm120'):
-                      ('flash_rt.frontends.torch.flint_rtx', 'FlintTorchFrontendRtx')}
+                      ('flash_rt.frontends.torch.flint_rtx', 'FlintTorchFrontendRtx'),
+                      ('flint', 'torch', 'apple_mps'):
+                      ('flash_rt.frontends.torch.flint_mps', 'FlintTorchFrontendMps')}
+
+
+def test_apple_runtime_import_is_framework_free():
+    code = '''
+import json, sys
+from flash_rt.frontends.torch._flint_mps_runtime import FlintRuntime
+from flash_rt.models.flint.pipeline_mps import FlintPipelineMps, FlintPrefillMps
+from flash_rt.models.flint.mlx_checkpoint import MLXCheckpoint
+print(json.dumps(sorted(n for n in sys.modules if n.split('.')[0] in
+    {'torch', 'mlx', 'fastapi', 'uvicorn', 'tokenizers', 'jinja2'})))
+'''
+    result = subprocess.run([sys.executable, '-c', code], check=True, capture_output=True, text=True)
+    assert json.loads(result.stdout) == []
 
 
 def _safetensors(path, tensors):
@@ -65,6 +80,27 @@ def test_mlx_affine_reader_low_nibble_first(tmp_path):
     assert np.allclose(dequantize(m), expect, rtol=0, atol=1e-6)
 
 
+def test_apple_vector_path_bounds_follow_mlx():
+    from flash_rt.models.flint.pipeline_mps import qmv_limit
+    assert [qmv_limit(2048, 512), qmv_limit(2048, 4096), qmv_limit(4096, 2048), qmv_limit(2048, 6144),
+            qmv_limit(6144, 2048), qmv_limit(1024, 2048)] == [18, 12, 12, 10, 10, 18]
+
+
+def test_apple_first_token_selection_rule():
+    from flash_rt.frontends.torch._flint_mps_runtime import FlintRuntime
+    from flash_rt.models.flint.mlx_checkpoint import f32_to_bf16
+    logits = np.full(64, -10.0, np.float32)
+    logits[[5, 9, 12]] = [3.0, 3.0, 2.5]
+    noise = np.zeros(64, np.float32)
+    fake = SimpleNamespace(logits=lambda step: f32_to_bf16(logits), buf={'noise': 0},
+                           plan=SimpleNamespace(read=lambda b, o, dt, n: noise[:n].copy()))
+    assert FlintRuntime.select(fake, 'greedy') == 5          # lowest id among equal maxima
+    assert FlintRuntime.select(fake, 'sampled', top_k=1) == 9  # top-k ties rank the larger id first
+    noise[12] = 5.0
+    assert FlintRuntime.select(fake, 'sampled', top_k=3, top_p=1.0) == 12
+    assert FlintRuntime.select(fake, 'sampled', top_k=3, top_p=0.3) == 9   # nucleus keeps the first only
+
+
 def _apple_config():
     """config.json fields of the Flint MLX int4 export that the reader consults."""
     full = [0, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 48]
@@ -93,6 +129,18 @@ def test_mlx_config_reader_and_refusals():
                        ('no_rope_layer_indices', [0, 1]), ('model_type', 'qwen3')]:
         with pytest.raises(FlintConfigError):
             config_from_json({**_apple_config(), key: value})
+
+
+def test_apple_kernel_geometry_guard():
+    from flash_rt.models.flint.config import FlintConfigError, config_from_json
+    from flash_rt.models.flint.pipeline_mps import check_geometry
+    check_geometry(config_from_json(_apple_config()))
+    # Valid Flint geometry that the Apple kernels (which hard-code these) must refuse.
+    for key, value in [('vocab_size', 150016), ('rms_norm_eps', 1e-5),
+                       ('rope_parameters', {'rope_theta': 1e6, 'rope_type': 'default'})]:
+        cfg = config_from_json({**_apple_config(), key: value})
+        with pytest.raises(FlintConfigError, match='Apple Flint kernels'):
+            check_geometry(cfg)
 
 
 @pytest.mark.parametrize('change', [{'quantization': {'group_size': 32, 'bits': 4}},
@@ -128,6 +176,68 @@ def test_mlx_checkpoint_shape_guards(tmp_path):
         ck.tensor('missing')
     ck.close()
 
+
+def test_apple_sampling_arguments():
+    from flash_rt.frontends.torch.flint_mps import FlintTorchFrontendMps
+    config = FlintTorchFrontendMps._sample_config
+    assert config(0.0, 1.0, 0) == ('greedy', 0)
+    assert config(0.7, 0.95, 20) == ('sampled', 20)
+    for args in [(-0.5, 1.0, 20), (1.0, 1.0, 0), (1.0, 1.0, 33), (1.0, 0.0, 20), (1.0, 1.5, 20)]:
+        with pytest.raises(ValueError):
+            config(*args)
+
+
+@pytest.mark.parametrize('logical_end,fork', [
+    (2000, 1000),   # a regenerate after the ring wrapped: the history before the fork is gone
+    (2000, 1999),   # needs [1487, 1999); position 1999 overwrote 1486 only
+    (2000, 1998),   # needs [1486, 1998); 1486's slot holds 1999
+    (2000, 2000),
+    (400, 300),     # fewer positions than the ring: everything is still resident
+    (1000, 63),     # minimum reusable prefix
+    (1000, 64),
+])
+def test_apple_stream_reuses_only_resident_history(logical_end, fork):
+    from flash_rt.frontends.torch.flint_mps import FlintTorchFrontendMps
+    window = 513
+    # Oracle: the ring holds the last `window` written positions (writes are contiguous from 0).
+    resident = all(p >= logical_end - window for p in range(max(0, fork - window + 1), fork))
+    expected = fork if resident and fork >= 64 else 0
+    starts = []
+    fe = FlintTorchFrontendMps.__new__(FlintTorchFrontendMps)
+    fe.cfg = SimpleNamespace(vocab_size=10, sliding_window=window)
+    fe.rt = SimpleNamespace(max_seq=32768, swa_kv_start=max(0, logical_end - window),
+                            prefill=lambda ids, start, **sampling: starts.append(start) or 3)
+    fe._kv_ids = [1] * logical_end
+    fe.min_reuse, fe.last_reused, fe.eog = 64, 0, set()
+    assert list(fe.stream([1] * fork + [2] * 32, 1, reuse_prefix=True)) == [[3]]
+    assert starts == [expected]
+    assert fe.last_reused == expected
+
+
+def test_apple_runtime_tracks_resident_sliding_history():
+    from flash_rt.frontends.torch._flint_mps_runtime import FlintRuntime
+    rt = FlintRuntime.__new__(FlintRuntime)
+    rt.cfg = SimpleNamespace(sliding_window=513)
+    rt.max_seq, rt.prefill_chunk, rt.initial, rt.swa_kv_start = 8192, 2048, 0, 0
+    rt.buf = {'tokens': 0}
+    rt.programs = {name: name for name in ('prefill', 'prefill_small', 'prefill_head', 'greedy')}
+    rt._state = np.zeros(4, np.uint32)
+    runs = []
+    rt.plan = SimpleNamespace(write=lambda *args: None, run=lambda p: runs.append((p, tuple(rt._state))) or {})
+    rt.select = lambda *args, **kwargs: 7
+    assert rt.prefill(list(range(2300))) == 7
+    assert runs == [('prefill', (0, 2048, 0, 2048)), ('prefill_small', (2048, 252, 2048, 2300)),
+                    ('prefill_head', (2048, 252, 2048, 2300))]
+    assert (rt.initial, rt.swa_kv_start) == (2300, 2300 - 513)
+    rt._params, rt._control, rt._diagnostic = np.zeros(16, np.uint32), np.zeros(4, np.uint32), np.zeros(4, np.uint32)
+    rt._packet = np.zeros(17, np.uint32)
+    rt._packet[:6], rt._packet[16] = [7, 8, 8, 9, 9, 10], 3
+    assert rt.decode(7, 2300, 3) == [8, 9, 10]
+    assert rt._params[11] == 2300 and rt.swa_kv_start == 2303 - 513
+    runs.clear()
+    rt.prefill(list(range(100)))   # a new sequence starts over
+    assert (rt.initial, rt.swa_kv_start) == (100, 0)
+    assert runs[0] == ('prefill_small', (0, 100, 0, 100))
 
 def test_gguf_readonly_container(tmp_path):
     def string(s):
