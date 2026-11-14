@@ -43,7 +43,7 @@ def detect_arch() -> str:
         ``"amd_rdna3"``  — AMD RDNA 3 (gfx1100 / Radeon Pro W7900D)
         ``"amd_rdna35"`` — AMD RDNA 3.5 (gfx1151 / Radeon 8060S)
         ``"amd_rdna4"``  — AMD RDNA 4 (gfx1201 / Radeon AI PRO R9700)
-        ``"apple_mps"`` — Apple Silicon via PyTorch MPS (Pi0.5 BF16)
+        ``"apple_mps"`` — Apple Silicon (Pi0.5 BF16 via PyTorch MPS; Flint on the native Metal plan)
 
     Raises RuntimeError if no supported accelerator is available or the
     card has an unsupported SM level. Deliberately strict: silently
@@ -142,6 +142,10 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     # Flint (RecursiveSI/flint) official NVFP4 GGUF: text LLM, constructed directly (see flash_rt/api.py).
     ("flint", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.flint_rtx", "FlintTorchFrontendRtx"),
+    # Flint MLX affine int4 checkpoint (RecursiveSI/flint-int4) on Apple Silicon through the native Metal
+    # plan (no torch at runtime): text LLM, constructed directly (see flash_rt/api.py).
+    ("flint", "torch", "apple_mps"):
+        ("flash_rt.frontends.torch.flint_mps", "FlintTorchFrontendMps"),
 
     # DM05 uses its own Gemma3 prefix and action expert; it is not a Pi0.5 checkpoint.
     ("dm05", "torch", "rtx_sm120"):

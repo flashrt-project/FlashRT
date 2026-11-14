@@ -799,7 +799,9 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "config='flint' is a text LLM and is not served through "
             "load_model's VLA wrapper. Construct it directly:\n"
             "    from flash_rt.frontends.torch.flint_rtx import "
-            "FlintTorchFrontendRtx\n"
+            "FlintTorchFrontendRtx            # RTX 5090, NVFP4 GGUF\n"
+            "    from flash_rt.frontends.torch.flint_mps import "
+            "FlintTorchFrontendMps            # Apple Silicon, MLX int4\n"
             "See docs/flint_usage.md.")
     if config == "spark_x25":
         raise NotImplementedError(
