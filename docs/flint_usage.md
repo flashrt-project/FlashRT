@@ -1,5 +1,7 @@
 # Flint official NVFP4 GGUF on RTX 5090 (SM120)
 
+(Apple Silicon with the MLX int4 checkpoint: see [flint_apple_usage.md](flint_apple_usage.md).)
+
 FlashRT runs the official NVFP4 GGUF of Flint (`RecursiveSI/flint-nvfp4-gguf`)
 natively on SM120: an independent GGUF reader and a lossless NVFP4 repack feed
 FlashRT's own W4A16 kernels, the decode step is one captured CUDA graph, and
