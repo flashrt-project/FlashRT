@@ -12,7 +12,8 @@ an Apple Silicon Mac and the plan library is built (``scripts/apple/build_native
 * a decode repeated from a restored sliding-window state repeats its tokens; a prefill continued at a chunk
   boundary equals the full prefill; a follow-up request reuses the cached
   prefix, and a regenerate whose sliding-window history was overwritten recomputes the prompt;
-* seeded sampling is reproducible and depends on the seed;
+* seeded sampling is reproducible and depends on the seed, from the first token on (small, single and
+  wide prefill);
 * generation stops after a stop token, inside a decode block;
 * every row of a verification step equals the greedy decode step at its position, accepted drafts are
   committed and rejected ones leave no trace; lookup generation equals greedy generation.
@@ -135,6 +136,15 @@ def test_seeded_sampling(fe, chat_ids):
     c = fe.generate(chat_ids, max_new_tokens=48, stop_ids=[], seed=8, **sampling)
     assert a == b
     assert a != c
+
+
+@pytest.mark.parametrize("n", [300, 2048, 2600])
+def test_seeded_first_token(fe, n):
+    ids = code_ids(fe, n)
+    sampling = dict(temperature=50.0, top_p=1.0, top_k=20)
+    first = [fe.generate(ids, max_new_tokens=1, stop_ids=[], seed=s, **sampling)[0] for s in range(8)]
+    assert first == [fe.generate(ids, max_new_tokens=1, stop_ids=[], seed=s, **sampling)[0] for s in range(8)]
+    assert len(set(first)) > 1          # near-uniform over the 20 largest logits, not the greedy token
 
 
 def test_stop_token_inside_a_block(fe, chat_ids):

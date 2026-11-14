@@ -338,10 +338,10 @@ class FlintRuntime(FlintPipelineMps, FlintPrefillMps):
             if rows > chunk:
                 for c in range(self.wide_chunks):
                     self._chunk_states[c] = (pos + c * chunk, max(0, min(chunk, rows - c * chunk)), self.initial, end)
-                program = "prefill_wide"
+                prefill_program = "prefill_wide"
             else:
-                program = "prefill_small" if rows < SMALL_ROWS else "prefill"
-            timings.append(self.plan.run(self.programs[program]))
+                prefill_program = "prefill_small" if rows < SMALL_ROWS else "prefill"
+            timings.append(self.plan.run(self.programs[prefill_program]))
             self.swa_kv_start = max(self.swa_kv_start, end - self.cfg.sliding_window)
             self.initial = end
             pos = end
