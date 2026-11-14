@@ -113,20 +113,34 @@ def qmv_limit(k: int, n: int) -> int:
     return 10
 
 
+STATE_WORDS = 4   # uint32 per state record: position, rows, sliding-ring layout, end
+
+
 class FlintPrefillMps:
     """Records the chunked-prefill programs: KV population for positions [pos0, pos0 + rows) with
     rows <= capacity. The runtime supplies ``plan``, ``buf``, ``param(kind, **fields) -> offset`` and
     the per-layer descriptors; chunk position and row count come from the ``state`` buffer. The small-chunk
     program (``small=True``, rows < SMALL_ROWS) adds the split-K and row-vector product paths that MLX's
-    matmuls take for small M, each kernel returning when its path does not apply."""
+    matmuls take for small M, each kernel returning when its path does not apply.
+
+    ``block`` < ``capacity`` records a program over several consecutive prefill chunks of ``block`` rows:
+    every row-wise operation (norms, products, routing, experts) runs once over all of them, which gives
+    the same values because those operations do not depend on the row count above SMALL_ROWS rows, while
+    attention runs per chunk with the chunk's own state record (``state`` record i + 1), Q/output rows and
+    sliding scratch window, exactly as for separate chunks."""
 
     attention = "mma"   # prefill attention kernel (key of ATTENTION)
 
-    def record_prefill(self, capacity: int, layers: int = 0, first: int = 0, small: bool = False) -> int:
+    def record_prefill(self, capacity: int, layers: int = 0, first: int = 0, small: bool = False,
+                       block: Optional[int] = None) -> int:
         b, cfg, L = self.buf, self.cfg, self.layer_table
         plan = self.plan
         program = plan.program()
         C, H, K = capacity, cfg.hidden_size, cfg.num_experts_per_tok
+        B = block or C
+        if C % B or (small and B != C):
+            raise ValueError("a multi-chunk prefill program needs capacity = whole chunks and the large-row paths")
+        chunks = C // B
         state = (b["state"], 0, READ)
 
         def gemm(epilogue, x, w_off, y, rows, n, k, x_stride, y_stride, y_off=0, w2_off=None, grouped=False):
@@ -181,17 +195,21 @@ class FlintPrefillMps:
                     (b["kv"], 0, READ_WRITE), (b["scratch"], 0, READ_WRITE), (b["args"], ring, READ), state,
                     (b["args"], self.const_zero, READ)], (1, max(C, cfg.sliding_window), 2 * cfg.num_kv_heads), 32)
             qk = self.param("qk", q_heads=cfg.num_heads, kv_heads=cfg.num_kv_heads, sliding=int(sliding), cap=kv_cap,
-                            scratch=cfg.sliding_window, q_norm=int(d[D_Q_NORM]), k_norm=int(d[D_K_NORM]), kv=kv_off,
-                            eps=cfg.rms_norm_eps, logbase=self.logbase)
+                            scratch=cfg.sliding_window, block=B if chunks > 1 else 0, q_norm=int(d[D_Q_NORM]),
+                            k_norm=int(d[D_K_NORM]), kv=kv_off, eps=cfg.rms_norm_eps, logbase=self.logbase)
             plan.dispatch("flint_qk_norm_rope_kv_rows_bf16", [
                 (b["qkv"], 0, READ), (b["weights"], 0, READ), (b["qt"], 0, WRITE), (kv_buf, 0, READ_WRITE),
                 (b["args"], qk, READ), state], (C, 1, 1), 256)
-            att = self.param("attention", kv_heads=cfg.num_kv_heads, cap=kv_cap, sliding=int(sliding),
-                             window=cfg.sliding_window, kv=kv_off, sinks=int(d[D_SINKS]), scale=cfg.head_dim ** -0.5)
             kernel, per_group, threads = ATTENTION[self.attention]
-            plan.dispatch(kernel, [
-                (b["qt"], 0, READ), (kv_buf, 0, READ), (b["weights"], 0, READ), (b["attn"], 0, WRITE),
-                (b["args"], att, READ), state], (_ceil(C, per_group), cfg.num_kv_heads, 1), threads)
+            for c in range(chunks):   # chunk c: its rows of Q and of the output, its window of the scratch
+                att = self.param("attention", kv_heads=cfg.num_kv_heads, cap=kv_cap, sliding=int(sliding),
+                                 window=cfg.sliding_window, kv=kv_off + (c * B * cfg.head_dim if sliding else 0),
+                                 sinks=int(d[D_SINKS]), scale=cfg.head_dim ** -0.5)
+                rows_at = c * B * cfg.q_dim * 2
+                chunk_state = (b["state"], 4 * STATE_WORDS * (c + 1), READ) if chunks > 1 else state
+                plan.dispatch(kernel, [
+                    (b["qt"], rows_at, READ), (kv_buf, 0, READ), (b["weights"], 0, READ), (b["attn"], rows_at, WRITE),
+                    (b["args"], att, READ), chunk_state], (_ceil(B, per_group), cfg.num_kv_heads, 1), threads)
             if sliding:
                 plan.dispatch("flint_kv_ring_copy_bf16", [
                     (b["kv"], 0, READ_WRITE), (b["scratch"], 0, READ_WRITE), (b["args"], ring, READ), state,

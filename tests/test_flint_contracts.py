@@ -214,11 +214,46 @@ def test_apple_stream_reuses_only_resident_history(logical_end, fork):
     assert fe.last_reused == expected
 
 
+def _fake_prefill_runtime(wide_chunks):
+    from flash_rt.frontends.torch._flint_mps_runtime import FlintRuntime
+    rt = FlintRuntime.__new__(FlintRuntime)
+    rt.cfg = SimpleNamespace(sliding_window=513)
+    rt.max_seq, rt.prefill_chunk, rt.wide_chunks, rt.initial, rt.swa_kv_start = 16384, 2048, wide_chunks, 0, 0
+    rt.buf = {'tokens': 0}
+    rt.programs = {name: name for name in ('prefill', 'prefill_small', 'prefill_wide', 'prefill_head', 'greedy')}
+    rt._state = np.zeros(4, np.uint32)
+    rt._chunk_states = np.zeros((wide_chunks, 4), np.uint32)
+    runs = []
+    rt.plan = SimpleNamespace(write=lambda *args: None, run=lambda p: runs.append(
+        (p, tuple(rt._state), [tuple(c[:2]) for c in rt._chunk_states] if p == 'prefill_wide' else None)) or {})
+    rt.select = lambda *args, **kwargs: 7
+    return rt, runs
+
+
+@pytest.mark.parametrize('n,expect', [
+    (9000, [(0, 8192, [(0, 2048), (2048, 2048), (4096, 2048), (6144, 2048)]), (8192, 808, None)]),
+    (8500, [(0, 8192, [(0, 2048), (2048, 2048), (4096, 2048), (6144, 2048)]), (8192, 308, None)]),
+    (5000, [(0, 5000, [(0, 2048), (2048, 2048), (4096, 904), (6144, 0)])]),
+    (4400, [(0, 4096, [(0, 2048), (2048, 2048), (4096, 0), (6144, 0)]), (4096, 304, None)]),
+    (2048, [(0, 2048, None)]),
+])
+def test_apple_wide_prefill_chunking(n, expect):
+    rt, runs = _fake_prefill_runtime(4)
+    rt.prefill(list(range(n)))
+    got = [(state[0], state[1], chunks) for _, state, chunks in runs[:-1]]
+    assert got == expect
+    names = [p for p, _, _ in runs]
+    assert names[-1] == 'prefill_head'
+    assert all(p == ('prefill_wide' if r > 2048 else 'prefill_small' if r < 513 else 'prefill')
+               for p, (_, r, _) in zip(names, got))
+    assert rt.initial == n
+
+
 def test_apple_runtime_tracks_resident_sliding_history():
     from flash_rt.frontends.torch._flint_mps_runtime import FlintRuntime
     rt = FlintRuntime.__new__(FlintRuntime)
     rt.cfg = SimpleNamespace(sliding_window=513)
-    rt.max_seq, rt.prefill_chunk, rt.initial, rt.swa_kv_start = 8192, 2048, 0, 0
+    rt.max_seq, rt.prefill_chunk, rt.wide_chunks, rt.initial, rt.swa_kv_start = 8192, 2048, 1, 0, 0
     rt.buf = {'tokens': 0}
     rt.programs = {name: name for name in ('prefill', 'prefill_small', 'prefill_head', 'greedy')}
     rt._state = np.zeros(4, np.uint32)
