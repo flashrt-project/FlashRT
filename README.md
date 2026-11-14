@@ -294,6 +294,22 @@ llama.cpp F16 KV. [Protocol, accuracy and reproduction](docs/flint_usage.md).
 
 **Guide:** [RTX 5090 setup and limits](docs/flint_usage.md).
 
+#### Flint (MLX int4, Apple Silicon)
+
+Native Metal plan for the `RecursiveSI/flint-int4` checkpoint on M4 Pro / M4
+Max, with the reference engine's precision (affine int4 g64 weights, BF16
+activations and KV). Prefill is bit-identical to rec's, and the `reference`
+decode program to its resident kernel. Same Mac (M4 Pro, 64 GB), same token
+ids, batch 1; the reference is rec v0.1.1 (MLX).
+[Protocol, equivalence and reproduction](docs/flint_apple_usage.md).
+
+| Context tokens | Prefill, rec s | Prefill, FlashRT s | Decode greedy, rec tok/s | Decode greedy, FlashRT tok/s |
+|---:|---:|---:|---:|---:|
+| 1,024 | 1.11-1.20 | **1.01** | 133.6 | **137.2** |
+| 8,192 | 11.33-11.62 | **8.42** | | |
+| 32,768 | 57.3 | **50.2** | 80.2 | **84.9** |
+| 131,072 | 556.9 | **472.0** | 32.5 | **44.6** |
+
 #### Qwen3-8B
 
 | Hardware | Mode | Prefill | Decode | Source |
@@ -958,7 +974,7 @@ have been built and tested, and the dispatch map that selects them.
 | AMD Instinct MI350X | gfx950 (CDNA4) | Supported | Pi0.5 at **16.4 ms** FP8 and GROOT N1.7 at **16.0 ms** full-frame, on a standalone ROCm/HIP backend: hand-written HIP kernels, hipBLASLt FP8 GEMM, MFMA attention, HIP graph capture. Uses the gfx950 source set, checked at build and runtime. See [AMD deployment](docs/deployment_amd.md) and [Pi0.5 on MI350X](docs/deployment_amd_pi05.md). |
 | AMD Instinct MI300X | gfx942 (CDNA3) | Supported | Architecture-specific BF16/FP8 FNUZ kernels and HIP graphs. See [AMD deployment](docs/deployment_amd.md), [π0.5](docs/deployment_amd_pi05.md), and [GR00T N1.7](docs/deployment_amd_groot_n17.md). |
 | Ascend 910B4 | Ascend NPU | Supported | Pi0.5 and GR00T N1.7 backend with native AscendC kernels and NPU graphs. See [π0.5 deployment](docs/deployment_npu.md) and [GR00T N1.7 deployment](docs/deployment_npu_groot_n17.md). |
-| Apple Silicon | Metal / PyTorch MPS | Experimental | Pi0.5 BF16 eager execution using the shared torch pipeline. No CUDA build required; checkpoint accuracy and production latency remain unqualified. See [Apple setup with uv](docs/deployment_apple.md). |
+| Apple Silicon | Metal / PyTorch MPS | Experimental | Pi0.5 BF16 eager execution using the shared torch pipeline. No CUDA build required; checkpoint accuracy and production latency remain unqualified. See [Apple setup with uv](docs/deployment_apple.md). Flint MLX int4 on the native Metal plan (M4 Pro / M4 Max), bit-identical prefill to rec; see [Flint on Apple Silicon](docs/flint_apple_usage.md). |
 | RTX 4090 | SM89 | Validated / supported target | RTX VLA build path and deployment recipe; Higgs BF16 path compiles/configures. See [deployment_rtx4090.md](docs/deployment_rtx4090.md). |
 | RTX 5060 Ti | SM120 | Community validated | Pi0.5 FP8 and LIBERO Spatial submission, Hy-Embodied-0.5-VLA (`config="hyvla"`, SM120 FP8 / NVFP4 ViT+prefill), LaWAM (`config="lawam"`, 18.85 ms E2E), MolmoAct2 (`config="molmoact2"`, 51.0 ms graph replay, 7.87x), and VLA-JEPA (`config="vla_jepa"`, 8.12 ms p50, 8.58x over LeRobot eager); see [Community benchmarks](#community-hardware-benchmarks), [HyVLA RTX notes](docs/hyvla05_rtx_sm120.md), [LaWAM RTX notes](docs/lawam_rtx.md), [MolmoAct2 usage](docs/molmoact2_usage.md), and [VLA-JEPA usage](docs/vla_jepa_rtx.md). |
 | RTX 4060 Ti | SM89 | Validated build/run target | Included in current tested hardware list; run local benchmarks before making model-specific latency claims. |

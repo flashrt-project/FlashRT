@@ -10,7 +10,8 @@ This is a correctness-first starting point. Full checkpoint action accuracy,
 LIBERO success rates and latency need qualification on each Mac. Existing
 CUDA/HIP FP8/NVFP4 kernels and graph capture do not port directly to Metal.
 The default frontend does not use custom Metal model kernels. MLX runtime,
-JAX frontend, temporal frame caching and other model families are unsupported.
+JAX frontend, temporal frame caching and other model families are unsupported
+by this frontend.
 
 The [Apple native pipeline](../cpp/apple/README.md) is the opt-in accelerated
 route: one BF16 Metal ICB covers patch embedding, vision, prefix and all decode
@@ -18,6 +19,10 @@ steps, with persistent shared buffers and explicit residency. Use
 `examples/apple/pi05.py --native-pipeline`; the default Torch MPS route remains
 the correctness reference. The superseded vision-only and FP32 mixed pipelines
 have been removed.
+
+Flint (the text LLM, MLX affine int4 checkpoint) runs on its own native Metal
+path: a resident decode kernel and chunked prefill programs on the same plan
+library, without PyTorch. See [Flint on Apple Silicon](flint_apple_usage.md).
 
 ## Python environment with uv
 
