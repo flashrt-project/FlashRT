@@ -204,17 +204,22 @@ of 16K tokens and longer: one run.
 
 | Prompt | Reference engine | FlashRT | Speedup |
 |---|---|---|---|
-| 1,024 | 1.11-1.24 s | 1.01 s | 1.10-1.22x |
-| 2,048 | 2.28-2.56 s | 1.81 s | 1.26-1.41x |
-| 4,096 | 5.13-5.41 s | 3.66 s | 1.40-1.48x |
-| 8,192 | 11.62-11.73 s | 7.80 s | 1.49-1.50x |
-| 16,384 | 25.6 s | 18.1 s | 1.41x |
-| 32,768 | 57.0-62.9 s | 47.4-47.9 s | 1.19-1.33x |
-| 65,536 | 174.9 s | 140.1 s | 1.25x |
-| 131,072 | 551.0 s | 457.2 s | 1.21x |
+| 1,024 | 1.11-1.25 s | 0.99 s | 1.12-1.26x |
+| 2,048 | 2.58-2.61 s | 1.80 s | 1.43-1.45x |
+| 4,096 | 5.38-5.45 s | 3.71 s | 1.45-1.47x |
+| 8,192 | 11.50-11.88 s | 8.01 s | 1.44-1.48x |
+| 16,384 | 26.0 s | 18.3 s | 1.42x |
+| 32,768 | 57.2-64.4 s | 48.4-52.4 s | 1.18-1.23x |
+| 65,536 | 176.4 s | 140.5 s | 1.26x |
+| 131,072 | 561.4 s | 464.2 s | 1.21x |
 
-Single prefill runs of the reference engine at long prompts vary by about 10%
-(32K: 57.0 and 62.9 s in the two rounds), FlashRT's by about 1%.
+Single prefill runs at long prompts vary by up to about 10% within a session
+(32K, two rounds: reference engine 57.2 and 64.4 s, FlashRT 48.4 and 52.4 s),
+so the 32K speedups (prefill and decode) are given per adjacent pair.
+Absolute values of both engines also move by up to about 7% between sessions
+on this machine (128K decode, with unchanged decode kernels: FlashRT 45.1 and
+42.0 tok/s, the reference engine 32.8 and 30.4 tok/s), so compare the engines
+within one session.
 
 ### Decode
 
@@ -226,14 +231,14 @@ first token to the last.
 
 | Context | Greedy, reference engine | Greedy, FlashRT | Default, reference engine | Default, FlashRT |
 |---|---|---|---|---|
-| 1K | 132.9-133.4 | 137.6 (+3%) | 123.9-124.3 | 137.1 (+10-11%) |
-| 2K | 130.0-130.4 | 135.2 (+4%) | 121.4-121.9 | 134.5 (+10-11%) |
-| 4K | 122.3-124.6 | 131.0 (+5-7%) | 113.7-116.7 | 130.4 (+12-15%) |
-| 8K | 112.1-114.6 | 123.3 (+8-10%) | 106.5-108.2 | 122.6 (+13-15%) |
-| 16K | 97.0 | 109.3 (+13%) | 92.9 | 108.6 (+17%) |
-| 32K | 77.3-78.6 | 90.6-90.8 (+15-18%) | 74.6-75.4 | 90.3-90.5 (+20-21%) |
-| 64K | 54.3 | 67.9 (+25%) | 53.2 | 67.8 (+27%) |
-| 128K | 32.8 | 45.1 (+38%) | 32.3 | 44.7 (+39%) |
+| 1K | 132.8-133.4 | 137.3 (+3%) | 123.9-124.2 | 136.5 (+10%) |
+| 2K | 129.1-130.0 | 135.0 (+4-5%) | 121.4 | 134.3 (+11%) |
+| 4K | 121.3-122.6 | 129.8 (+6-7%) | 115.5-116.9 | 128.8 (+10-11%) |
+| 8K | 112.2-113.4 | 122.4 (+8-9%) | 106.0-108.2 | 121.2 (+12-14%) |
+| 16K | 95.7 | 107.8 (+13%) | 91.8 | 106.9 (+16%) |
+| 32K | 72.4-77.1 | 82.4-90.1 (+14-17%) | 67.4-73.9 | 82.7-89.7 (+21-23%) |
+| 64K | 52.6 | 67.7 (+29%) | 53.4 | 67.5 (+26%) |
+| 128K | 30.4 | 42.0 (+38%) | 30.9 | 42.9 (+39%) |
 
 ### Reproduce
 
