@@ -32,13 +32,17 @@ inline std::string gemm_w4a16_affine_source(const W4A16Options& o = {}) {
         throw std::invalid_argument("w4a16 GEMM tile dimensions must be positive, tile_n a multiple of 32");
     if (o.splitk && o.grouped)
         throw std::invalid_argument("w4a16 GEMM split-K applies to non-grouped products");
+    if (o.grouped && (o.tile_m % o.simdgroups || (o.tile_m / o.simdgroups) % 16))
+        throw std::invalid_argument("grouped w4a16 GEMM sub-tiles (tile_m / simdgroups rows) must be multiples of 16");
+
     return std::string(tensor_ops_preamble) +
         "constant constexpr int TM=" + std::to_string(o.tile_m) + ";\n" +
         "constant constexpr int TN=" + std::to_string(o.tile_n) + ";\n" +
         "constant constexpr int SG=" + std::to_string(o.simdgroups) + ";\n" +
         "#define EPILOGUE " + std::to_string(o.epilogue) + "\n" +
         "#define GROUPED " + std::to_string(o.grouped ? 1 : 0) + "\n" +
-        "#define SPLITK " + std::to_string(o.splitk ? 1 : 0) + "\n" + R"MSL(
+        "#define SPLITK " + std::to_string(o.splitk ? 1 : 0) + "\n" +
+        R"MSL(
 struct AffineGemm {
     uint rows, columns, inner;          // capacity rows (grid), N, K
     uint x_stride, y_stride, experts;   // row strides (elements); experts for GROUPED
@@ -82,10 +86,10 @@ inline float swiglu_f(float g,float u) {
     return rbf(rbf(g*sig)*u);
 }
 #if GROUPED
-// Expert-grouped product: one threadgroup per (64-column tile, block of up to 64 rows of one expert), four
+// Expert-grouped product: one threadgroup per (TN-column tile, block of up to TM rows of one expert), SG
 // SIMD groups. Each 64-input weight slice is dequantized once by all threads; SIMD group g multiplies it
-// into the block's 16-row sub-tile g when that sub-tile holds rows (TensorOps 16 x 64 x 64 per SIMD
-// group), so sparsely filled expert blocks do not pay for empty rows.
+// into the block's (TM / SG)-row sub-tile g when that sub-tile holds rows (TensorOps (TM / SG) x TN x 64
+// per SIMD group), so sparsely filled expert blocks do not pay for empty sub-tiles.
 kernel void gemm_w4a16_affine(const device bfloat* x [[buffer(0)]],const device uchar* weights [[buffer(1)]],
     device bfloat* y [[buffer(2)]],constant AffineGemm& p [[buffer(3)]],
     const device uint* starts [[buffer(4)]],const device uint* tiles [[buffer(5)]],
@@ -102,9 +106,10 @@ kernel void gemm_w4a16_affine(const device bfloat* x [[buffer(0)]],const device 
     const uint expert=e_lo;
     const uint row0=starts[expert]+(group.y-tiles[expert])*uint(TM);
     const uint rows=min(uint(TM),starts[expert+1]-row0);
-    const bool mine=16u*sg<rows;
-    const uint my_rows=mine?min(16u,rows-16u*sg):1u;
-    const uint my_row0=row0+(mine?16u*sg:0u);
+    constexpr uint SUB=uint(TM/SG);          // rows per SIMD group
+    const bool mine=SUB*sg<rows;
+    const uint my_rows=mine?min(SUB,rows-SUB*sg):1u;
+    const uint my_row0=row0+(mine?SUB*sg:0u);
     const uint cols=min(uint(TN),p.columns-n0);
     const ulong expert_codes=ulong(expert)*p.columns*(p.inner/2u);
     const ulong expert_scales=ulong(expert)*p.columns*(p.inner/64u)*2u;
@@ -125,7 +130,8 @@ kernel void gemm_w4a16_affine(const device bfloat* x [[buffer(0)]],const device 
 #endif
     tensor<device bfloat,E,tensor_inline> left((device bfloat*)x+size_t(my_row0)*p.x_stride,E(int(p.inner),int(my_rows)),
                                              array<int,2>{1,int(p.x_stride)});
-    constexpr auto desc=matmul2d_descriptor(16,TN,64,false,true,false,matmul2d_descriptor::mode::multiply_accumulate);
+    constexpr auto desc=matmul2d_descriptor(int(SUB),TN,64,false,true,false,
+                                            matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<desc,execution_simdgroups<1>> op;
     auto acc=op.get_destination_cooperative_tensor<decltype(left),decltype(right),float>();
     for(uint i=0;i<acc.get_capacity();++i)if(acc.is_valid_element(i))acc[i]=0.0f;
@@ -170,9 +176,6 @@ kernel void gemm_w4a16_affine(const device bfloat* x [[buffer(0)]],const device 
     const uint threads=uint(SG)*32u;
     uint n0=group.x*uint(TN);
     if(n0>=p.columns)return;
-#if GROUPED
-    if(state[1]*p.per_row<1024u)return;
-#else
     const uint m_rows=state[1];
     if(m_rows<p.limit)return;
     const uint parts=splitk_parts(m_rows,p.columns,p.inner);
@@ -181,33 +184,18 @@ kernel void gemm_w4a16_affine(const device bfloat* x [[buffer(0)]],const device 
 #else
     if(parts>1u)return;
 #endif
-#endif
-    uint row0,rows_end;
-    ulong expert_codes=0,expert_scales=0;
-#if GROUPED
-    uint e_lo=0,e_hi=p.experts;
-    if(group.y>=tiles[p.experts])return;
-    while(e_lo<e_hi){uint mid=(e_lo+e_hi)/2;if(tiles[mid+1]<=group.y)e_lo=mid+1;else e_hi=mid;}
-    uint expert=e_lo;
-    row0=starts[expert]+(group.y-tiles[expert])*uint(TM);
-    rows_end=starts[expert+1];
-    expert_codes=ulong(expert)*p.columns*(p.inner/2u);
-    expert_scales=ulong(expert)*p.columns*(p.inner/64u)*2u;
-#else
-    row0=group.y*uint(TM);
-    rows_end=m_rows;
-    if(row0>=rows_end)return;
-#endif
-    uint rows=min(uint(TM),rows_end-row0);
-    uint cols=min(uint(TN),p.columns-n0);
-    const device uchar* codes=weights+p.w+expert_codes;
-    const device ushort* scales=(const device ushort*)(weights+p.s+expert_scales);
-    const device ushort* biases=(const device ushort*)(weights+p.b+expert_scales);
+    const uint row0=group.y*uint(TM);
+    if(row0>=m_rows)return;
+    const uint rows=min(uint(TM),m_rows-row0);
+    const uint cols=min(uint(TN),p.columns-n0);
+    const device uchar* codes=weights+p.w;
+    const device ushort* scales=(const device ushort*)(weights+p.s);
+    const device ushort* biases=(const device ushort*)(weights+p.b);
     threadgroup bfloat tile[TN*64];
 #if EPILOGUE==2
-    const device uchar* codes2=weights+p.w2+expert_codes;
-    const device ushort* scales2=(const device ushort*)(weights+p.s2+expert_scales);
-    const device ushort* biases2=(const device ushort*)(weights+p.b2+expert_scales);
+    const device uchar* codes2=weights+p.w2;
+    const device ushort* scales2=(const device ushort*)(weights+p.s2);
+    const device ushort* biases2=(const device ushort*)(weights+p.b2);
     threadgroup bfloat tile2[TN*64];
 #endif
     using E=dextents<int,2>;
